@@ -185,10 +185,11 @@ inbox
                                      └─ blocked → escalated (终态，通知用户)
 ```
 
-**单点 + claim 防重**：claim 粒度是**项目级**（每项目一个 tmux session 一个 claude 进程）。state.json 记录 `tmux_session: ccteam-<slug>`、`claude_pid`、`phase_state: in_flight | idle`。
+**单点 + claim 防重**：claim 粒度是**项目级**（每项目一个 tmux session 一个 claude 进程）。state.json 记录 `tmux_session: ccteam-<slug>`、`claude_pid`、`phase_state: in_flight | idle | fix_locked`。
 
 - `in_flight` = 已 send-keys 注入 phase prompt，等待 progress.jsonl 中出现 `phase_done` 或 `escalate` 事件
 - `idle` = 上一 phase 完成，session 还活着但没在跑——orchestrator 可以注入下一 phase
+- `fix_locked` = 当前在 fix-cycle 中，Stop hook 按 §3.5 的 ralph-loop 范式接管自循环；orchestrator **不**注入新 prompt，直到 progress.jsonl 出现 `phase_done`（测试绿）或 `escalate`（撞 3 次顶）
 
 orchestrator 重启时：`tmux has-session` + `kill -0 <claude_pid>` 双重校验。session 还在 → 续接；进程不在 → 走 §6.1 的"极端情况——session 必须重启"路径用 `--resume` 恢复对话历史。
 
@@ -328,7 +329,21 @@ test-run phase
        │         └─ n = 3 → escalated
 ```
 
-**注意**：所有 fix-cycle 在**同一个 tmux session** 内进行——每次 fix 不是新进程，是 send-keys 一段 fix 指令。这样 fix 1 / fix 2 / fix 3 复用项目 cache，累计成本远低于"每次起 headless"。
+**执行机制（混合模式）**：fix-cycle 不是"orchestrator 反复 send-keys 注入新的 fix prompt"——那样每轮都是一段独立 user 消息进对话历史，污染上下文也丢掉 cache 的近因优势。改用 [`ralph-loop`](https://github.com/anthropics/claude-plugins-official/tree/main/plugins/ralph-loop) 的 Stop hook 拦截范式：
+
+1. **进入 fix-cycle**：orchestrator 写状态文件 `~/projects/<slug>/.ccteam/fix-loop.state.md`，YAML front matter 含 `iteration: 1` / `max_iterations: 3` / `completion_signal: "TESTS_GREEN"`，正文是 fix prompt（**每轮开头先写 `.ccteam/fix-plan-<iteration>.md` 记录本轮诊断与修复方案** → 读 test-report → 改代码 → 重跑测试）。每轮独立的 fix-plan 文件让 escalation 收集（见下文）拿得到三次完整诊断。同时把 state.json 的 `phase_state` 切到 `fix_locked`（见 §3.2）。
+2. **首次注入**：orchestrator send-keys 一次，触发 fix prompt 跑第一轮。然后 orchestrator 完全退出 fix-cycle 的控制路径。
+3. **Stop hook 接管**：claude 想退出时 Stop hook 检查 `fix-loop.state.md`——若存在、未达 `max_iterations`、且最后一次 assistant 输出未含 `TESTS_GREEN`，**输出 `{"decision": "block", "reason": "<同一段 fix prompt>"}` 拦截退出并重喂**；同时 `iteration += 1`。这步直接复用 ralph-loop 的 hook 逻辑，cache 在同 session 内复用,fix 1 / 2 / 3 不会重读 plan 与代码上下文。
+4. **释放控制**：测试通过（claude 输出 `TESTS_GREEN`）或撞 `max_iterations` → Stop hook 删除状态文件、放行退出 → orchestrator 通过 progress.jsonl 上的 `phase_done` / `escalate` 事件感知并接管。
+
+**为什么混合**：phase 切换仍由 orchestrator 主控（因为 phase 间需要 reset context、跨项目调度、注入完全不同的下一段 prompt）；但单 phase 内的 fix-cycle 是"同一段 prompt 反复跑直到收敛"——这正是 ralph-loop 设计的形态。两者职责不冲突：orchestrator 管"phase 之间"，Stop hook 管"phase 内的自愈循环"。
+
+**Stop hook 复用**：直接抄 `~/.claude/plugins/marketplaces/claude-plugins-official/plugins/ralph-loop/hooks/stop-hook.sh`，改三点：
+- 状态文件路径换成 ccteam 约定（`fix-loop.state.md`，避免与 ralph-loop 的 `.claude/ralph-loop.local.md` 冲突）
+- 完成信号从 `<promise>...</promise>` 改成纯文本 `TESTS_GREEN`（约束简单、grep 即得）
+- 计数到顶或主动放弃时把 `escalate` 事件 append 到 `~/.ccteam/progress/<slug>.jsonl`，让 orchestrator 知道
+
+**fix-cycle 决策逻辑只能在一处**：Claude Code 允许一个 Stop hook entry 下挂多个 command（§6.2 settings.json 即如此——同时跑 `parse-phase-end.sh` 和异步的 `progress-append.sh Stop`），这没问题。但**fix-cycle 的"是否拦截退出 + 重喂"决策只能由 `parse-phase-end.sh` 单点输出**——同 entry 内多个 command 的执行顺序虽稳定，但只有第一个 stdout JSON 决策有效，其它 command 必须 `async: true` 仅做 append/log 类副作用。脚本内部判断"现在是不是 fix-cycle 模式"分支处理（fix-cycle → ralph 范式拦截重喂；非 fix-cycle → 解析 `PHASE_DONE` / `ESCALATE`）。
 
 **escalation 触发时**，orchestrator 收集：
 - 最后一次 test-report.md
@@ -793,6 +808,16 @@ orchestrator 通过 `PreToolUse` hook 检测最近一次输入源：若来自人
 | `SubagentStop` | 子 agent 退出（仅 Agent Teams phase 内相关）|
 | `SessionEnd` | claude 进程退出 → orchestrator 知道要么 reset 完成，要么 crash |
 
+**cost-accumulate.sh 工作原理（重要）**：Claude Code **不会**在 hook 输入里直接给 `cost_usd`——必须自己算。流程：
+
+1. hook 通过 stdin 收到 JSON，内含 `transcript_path`（Claude Code 的 session JSONL 路径）。
+2. 脚本 tail 该 JSONL 文件最后一条 `role:assistant` 记录，解析 `message.usage` 字段：`input_tokens` / `cache_read_input_tokens` / `cache_creation_input_tokens` / `output_tokens`（字段名参考 `claude-plugins-official/session-report/skills/session-report/analyze-sessions.mjs`）。
+3. 按当前模型单价（在 `~/.ccteam/config.yml` 维护一张 `model_rates` 表）计算本轮成本增量。
+4. 原子地（`.tmp` + rename）累加到 `state.json.cost_used_usd` 和 `state.json.context_tokens_used`。
+5. 后者直接驱动 §6.9 的 60% 阈值判断。
+
+`async: true` 不能省——同步阻塞会拖慢 PostToolUse 路径。
+
 ### 6.3 Agent Teams（phase 内）
 
 在 `implement` 这种复杂 phase 里启用：
@@ -942,6 +967,12 @@ orchestrator 监听 progress.jsonl 最新事件时间戳：
 
 这条路径的代价：cache 失效一次（一次冷启动）。但在长跑累计成本里可忽略，避免冲到性能崩溃区。
 
+**为什么 reset 不用 `--resume`，而 §6.1 的崩溃恢复用 `--resume`**：两者目标相反——
+- **§6.1 崩溃恢复（被动）**：claude 进程意外死亡，**目的是把对话历史救回来**才能续上未完工作；`--resume` 加载完整历史（cache 仍要冷启动一次，但工作记忆不丢）。
+- **§6.9 主动 reset**：恰恰因为对话历史撑爆 context，**目的是丢弃历史**；`/exit` + 全新 session 是手段本身，CLAUDE.md 桥接代替历史承载关键信息。
+
+不要混用：在该 reset 时用 `--resume` 等于没 reset；在该恢复时用全新 session 等于丢了所有进度。
+
 #### Phase 注入：idle-aware
 
 - **判断 idle**：从 `~/.ccteam/progress/<slug>.jsonl` 末尾读最新事件——`Stop` 或 `Notification:idle_prompt` 表示 claude 当前 idle；其他事件（最近一条是 `PreToolUse` / `PostToolUse`）表示 claude 正在干活。
@@ -968,98 +999,18 @@ fi
 
 ## 7. 里程碑路线图
 
-### M0：单项目 CLI MVP（2-3 周）
+详细任务、依赖、验收门、痛点反向映射、风险登记 → [development-plan.md](./development-plan.md)。本节仅给一句话索引：
 
-**目标**：跑通"一句话需求 → 单项目 → 交付"。
+| 里程碑 | 主目标 | 时长 | 解锁的关键痛点 |
+|---|---|---|---|
+| **M0** | 单项目 CLI MVP——一句话需求自动产出能跑的代码 | 2-3 周 | 1, 2, 3, 4, 7, 8, 9 |
+| **M1** | 多项目并发 + Telegram 入口 | 2 周 | 5, 9（强化） |
+| **M2** | Seed Gate（否决无效想法）+ Score（客观质量门） | 2 周 | 6, 3（强化） |
+| **M3** | 跨项目记忆——项目 N+1 比项目 N 快 | 3 周 | 10 |
+| **M4** | Critic Agent 闭环——超越"测试通过=完成" | 3 周 | 3（深化） |
+| **M5** | 大型软件长跑（对标 Symphony） | 3-6 月 | 长期 |
 
-**交付**：
-- [x] requirements.md（已完成）
-- [x] tech-design.md（已完成）
-- [ ] orchestrator 单文件 Python（asyncio 主循环 + inotify 监听 progress.jsonl）
-- [ ] 4-5 个 phase markdown 模板（先跑通 plan / implement / test / fix / ship）
-- [ ] CLI：`ccteam new`、`ccteam status`、`ccteam start`、`ccteam attach <slug>`、`ccteam resume <slug>`
-- [ ] state.json 状态机 + tmux session 重连恢复
-- [ ] tmux session 启动（**默认 1M 上下文**）+ multi-pane 布局
-- [ ] **idle-aware 注入**：Stop / idle_prompt 事件 → send-keys；否则 `/btw`
-- [ ] hooks（SessionStart / Stop / Notification / Pre&PostToolUse / SessionEnd）写 progress.jsonl
-- [ ] PostToolUse 累加 `context_tokens_used`；> 60% 在 phase 边界做 reset（exit + 新 session + CLAUDE.md 桥接）
-- [ ] stall detection（5/15/30 min 三档软告警，不主动 kill）
-- [ ] 成本累计 + 软告警（不打断）+ 物理上限兜底
-- [ ] fix loop 上限 3 + escalation（同 session 内排队注入）
-- [ ] **不做**：多项目并发、Telegram、Seed 阶段（先固定 PASS）、跨项目记忆、score、`--resume` 兜底（用 reset 替代）
-
-**验收**：
-- 用 CLI 提一个需求 → 关掉所有终端 → 半小时后回来 → 看到一个能跑的项目和测试报告。
-
-### M1：多项目 + Telegram（2 周）
-
-**目标**：摆脱 CLI，用户从 Telegram 扔需求。
-
-**交付**：
-- [ ] Telegram bot 入口（写 inbox + 接 notify）
-- [ ] 多项目并发调度（max_concurrent_projects=3）
-- [ ] inbox / queue / control 文件协议完善
-- [ ] CLAUDE.md 自动生成
-- [ ] 优雅停机 + 重启自恢复
-
-**验收**：
-- 周一在 Telegram 扔 5 个想法 → 周三早上看到 3 个交付 + 2 个还在跑。
-
-### M2：Seed Gate + Score（2 周）
-
-**目标**：否决坏想法，引入客观质量门。
-
-**交付**：
-- [ ] Seed phase（PASS / REJECT / CLARIFY）
-- [ ] CLARIFY 走 Telegram 单问单答
-- [ ] Score phase（6 维 + bug penalty）
-- [ ] golden-rules.py 集成
-- [ ] Critic agent 与 dev 分离
-
-**验收**：
-- 提"AI 菜谱生成器" → Seed 直接 REJECT，附"已有 N 个免费同类工具"。
-
-### M3：跨项目记忆（3 周）
-
-**目标**：项目 N+1 比项目 N 快。
-
-**交付**：
-- [ ] retro phase 自动产出 pattern.md
-- [ ] sqlite + sentence-transformers 向量索引
-- [ ] Seed phase 接 RAG 召回
-- [ ] anti-patterns 库（REJECT 案例沉淀）
-
-**验收**：
-- 第二次提相似项目 → Seed 阶段在 prompt 里出现"上次做过 X，建议复用 Y"。
-
-### M4：Critic Agent 闭环（3 周）
-
-**目标**：摆脱"测试通过 = 万事大吉"，引入更严格的质量审查。
-
-**交付**：
-- [ ] Critic agent（独立子进程）
-- [ ] Anti-leniency 规则
-- [ ] 评审维度（per project 自适应）
-- [ ] WEAK 维度强制 BLOCK + fix-cycle
-
-**验收**：
-- 测试全绿但 critic 发现"接口不优雅" → 自动进 fix-cycle。
-
-### M5：长期对标 Symphony（3-6 个月）
-
-**目标**：能搭大型软件（多模块、多服务、长跑数日）。
-
-**关键挑战**（这些都是 Symphony 也没解决、ccteam 必须自己解决的）：
-- [ ] 任务自动分解：把"做一个交易系统"拆成 N 个独立子项目
-- [ ] DAG 调度（不只是 blocks，还有 produces / consumes）
-- [ ] Milestone 概念（周级别检查点）
-- [ ] 跨子项目的接口契约管理
-- [ ] 长 token 预算的精细化（按子项目独立预算）
-
-**这一阶段才会真正用到**：
-- A2A bridge（多 orchestrator 协作）
-- 外部 tracker adapter（Linear / GitHub Projects）
-- 团队协作（多个用户共享一个 ccteam 实例）
+**任何里程碑修改优先改 development-plan.md**——本节只作目录索引，不维护具体任务。里程碑推进准则在 development-plan.md §1 与 §10 维护。
 
 ---
 
@@ -1091,6 +1042,8 @@ fi
 | **gstack-auto** | Web UI + Conductor 编排 | ccteam 短期对标，**砍掉** Web 和 Conductor，换成守护进程 + git worktree |
 | **OpenAI Symphony** | Linear + Codex orchestrator | ccteam 长期对标，**保留** orchestrator 模式，**替换** 执行层为 Claude Code，**新增** 任务分解 + 跨项目记忆 + critic |
 | **ccteam-creator** | Claude Code 内的多 agent 编排 skill | 完全不同方向：creator = 人在场协作；ccteam = 人不在场交付 |
+| **ralph-loop plugin** | 同 session、Stop hook 拦截退出 + 同 prompt 重喂直到 `<promise>` 命中 | **fix-cycle 直接抄**（见 §3.5）——单 phase 内自循环正合此范式；但**不**用于 phase 流水线（phase 间需 orchestrator 主控 reset / 调度 / 注入不同 prompt） |
+| **Claude Code 内建 `/loop`** | ScheduleWakeup 动态模式（同会话）或 CronCreate 模式（Anthropic 云端调度远程 agent） | **不用**——动态模式依赖会话存活，违反痛点 9；CronCreate 模式虽能脱离会话但引入云端调度依赖，与 ccteam「本地优先 + `--dangerously-skip-permissions` 项目沙盒」模型不兼容（沙盒里跑的代码不该被云端 agent 远程注入）。ccteam 的循环驱动器永远是本地 Python orchestrator |
 | **Conductor / Worktrees IDE** | 多 session IDE | ccteam 用 git worktree 取代，无需 IDE |
 
 ---
@@ -1176,8 +1129,8 @@ ccteam doctor                          # 体检：tmux server / claude 可用性
 ## 11. 本文档的位置
 
 - `requirements.md` 回答 **为什么做** 与 **谁会用**——已确认。
-- 本文档 `tech-design.md` 回答 **怎么做**——本轮交付。
-- 后续 `roadmap.md`（待写）回答 **何时做什么**——把 §7 里程碑细化到周。
+- 本文档 `tech-design.md` 回答 **怎么做**——架构、协议、扩展点。
+- [`development-plan.md`](./development-plan.md) 回答 **何时做什么**——把 §7 里程碑细化到任务级，含痛点反向映射、依赖图、验收门、风险登记。
 - 后续 `interfaces.md`（待写）回答 **每个组件的精确接口**——orchestrator API、phase prompt schema、状态机事件。
 
 所有实现 PR 必须能映射回：
