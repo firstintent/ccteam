@@ -1,13 +1,15 @@
-//! `ccteam` binary entry point. Subcommand groups land in M0 tasks:
-//! M0.3 wires `hook`, M0.6 the orchestrator daemon (`start`), M0.11 the
-//! project management commands.
+//! `ccteam` binary entry point.
 
+mod commands;
+
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use ccteam_core::{CcteamPaths, Orchestrator, OrchestratorConfig};
+use commands::OutputFormat;
 
 #[derive(Parser)]
 #[command(
@@ -39,6 +41,37 @@ enum Command {
         #[arg(long, value_name = "SECONDS", default_value_t = 30)]
         tick_seconds: u64,
     },
+    /// Create a new project from a one-line request.
+    New {
+        /// The request text. Ignored when `--file` is given.
+        request: Option<String>,
+        /// Read the request from a file instead of the positional arg.
+        #[arg(short, long, value_name = "PATH")]
+        file: Option<PathBuf>,
+    },
+    /// List all known projects.
+    Ls {
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
+    /// Show one project's full state, recent events, and artifacts.
+    Show {
+        slug: String,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
+    /// Attach to a project's tmux session (`tmux attach`).
+    Attach { slug: String },
+    /// Capture the project's pane content without attaching.
+    Peek { slug: String },
+    /// Print the project's progress.jsonl, optionally tailing.
+    Progress {
+        slug: String,
+        #[arg(long)]
+        tail: bool,
+    },
+    /// Resume a paused / escalated project (re-arm phase_state=idle).
+    Resume { slug: String },
 }
 
 #[derive(Subcommand)]
@@ -74,6 +107,34 @@ fn main() -> Result<()> {
             foreground: _,
             tick_seconds,
         } => run_start(tick_seconds),
+        Command::New { request, file } => run_new(request, file),
+        Command::Ls { format } => run_ls(format),
+        Command::Show { slug, format } => run_show(&slug, format),
+        Command::Attach { slug } => commands::run_attach(&slug),
+        Command::Peek { slug } => run_peek(&slug),
+        Command::Progress { slug, tail } => {
+            let paths = CcteamPaths::from_env()?;
+            commands::run_progress(&paths, &slug, tail)
+        }
+        Command::Resume { slug } => {
+            let paths = CcteamPaths::from_env()?;
+            commands::run_resume(&paths, &slug)
+        }
+    }
+}
+
+fn run_hook(cmd: HookCommand) -> Result<()> {
+    let paths = CcteamPaths::from_env()?;
+    let stdin: serde_json::Value = serde_json::from_reader(std::io::stdin().lock())
+        .context("parse hook stdin as JSON")?;
+
+    match cmd {
+        HookCommand::ProgressAppend { event_type } => {
+            ccteam_hooks::progress_append(&paths, &event_type, &stdin)
+        }
+        HookCommand::ParsePhaseEnd => ccteam_hooks::parse_phase_end(&paths, &stdin),
+        HookCommand::CostAccumulate => ccteam_hooks::cost_accumulate(&paths, &stdin),
+        HookCommand::LoadContext => ccteam_hooks::load_context(&paths, &stdin),
     }
 }
 
@@ -99,6 +160,45 @@ fn run_start(tick_seconds: u64) -> Result<()> {
     })
 }
 
+fn run_new(request: Option<String>, file: Option<PathBuf>) -> Result<()> {
+    let paths = CcteamPaths::from_env()?;
+    let body = match (file, request) {
+        (Some(path), _) => std::fs::read_to_string(&path)
+            .with_context(|| format!("read {}", path.display()))?,
+        (None, Some(text)) => text,
+        (None, None) => {
+            anyhow::bail!("ccteam new: provide a request as a positional arg or --file PATH")
+        }
+    };
+    let slug = commands::run_new(&paths, body.trim())?;
+    println!("created project {slug}");
+    println!("  spec   : {}", paths.project_ccteam_dir(&slug).join("spec.md").display());
+    println!("  state  : {}", paths.project_state(&slug).display());
+    println!("  config : {}", paths.project_dir(&slug).join(".claude/settings.json").display());
+    println!("\nrun `ccteam start --foreground` (in another terminal) to dispatch the first phase.");
+    Ok(())
+}
+
+fn run_ls(format: OutputFormat) -> Result<()> {
+    let paths = CcteamPaths::from_env()?;
+    let body = commands::run_ls(&paths, format)?;
+    print!("{body}");
+    Ok(())
+}
+
+fn run_show(slug: &str, format: OutputFormat) -> Result<()> {
+    let paths = CcteamPaths::from_env()?;
+    let body = commands::run_show(&paths, slug, format)?;
+    print!("{body}");
+    Ok(())
+}
+
+fn run_peek(slug: &str) -> Result<()> {
+    let body = commands::run_peek(slug)?;
+    print!("{body}");
+    Ok(())
+}
+
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
@@ -106,19 +206,4 @@ fn init_tracing() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,ccteam_core=info")),
         )
         .try_init();
-}
-
-fn run_hook(cmd: HookCommand) -> Result<()> {
-    let paths = CcteamPaths::from_env()?;
-    let stdin: serde_json::Value = serde_json::from_reader(std::io::stdin().lock())
-        .context("parse hook stdin as JSON")?;
-
-    match cmd {
-        HookCommand::ProgressAppend { event_type } => {
-            ccteam_hooks::progress_append(&paths, &event_type, &stdin)
-        }
-        HookCommand::ParsePhaseEnd => ccteam_hooks::parse_phase_end(&paths, &stdin),
-        HookCommand::CostAccumulate => ccteam_hooks::cost_accumulate(&paths, &stdin),
-        HookCommand::LoadContext => ccteam_hooks::load_context(&paths, &stdin),
-    }
 }

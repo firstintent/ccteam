@@ -6,6 +6,7 @@ pub mod orchestrator;
 pub mod paths;
 pub mod phases;
 pub mod progress;
+pub mod projects;
 pub mod state;
 pub mod templates;
 pub mod tmux;
@@ -14,6 +15,7 @@ pub use orchestrator::{
     append_progress_summary, build_progress_summary, decide_tick, is_terminal, next_phase,
     Orchestrator, OrchestratorConfig, TickAction, FIRST_PHASE, M0_PHASE_DAG,
 };
+pub use projects::{bootstrap_project, pick_unused_slug, slugify};
 pub use paths::{slug_from_project_dir, CcteamPaths};
 pub use phases::{
     AgentTeamRole, PhaseHooks, PhaseTemplate, SubSkillSpec, SubSkillTrigger,

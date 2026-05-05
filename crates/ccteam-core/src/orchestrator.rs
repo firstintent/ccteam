@@ -256,13 +256,13 @@ impl Orchestrator {
         Ok(out)
     }
 
-    /// Reset claude's context at a phase boundary (tech-design §6.9):
-    /// append the progress summary to the project's CLAUDE.md, then
-    /// recycle the tmux session so the new claude reads the bridged
-    /// summary instead of the bloated history. M0 implementation kills
-    /// + restarts the tmux session under the same name; same end-state
-    /// as `/exit` followed by re-launch in the same window, but
-    /// simpler to express atomically.
+    /// Reset claude's context at a phase boundary (tech-design §6.9).
+    ///
+    /// Appends a progress summary to the project's CLAUDE.md, then
+    /// recycles the tmux session so the new claude reads the bridged
+    /// summary instead of the bloated history. M0 kills + restarts
+    /// the tmux session under the same name (same end-state as
+    /// `/exit` + re-launch in the same window, simpler to express).
     pub fn reset_context(&self, slug: &str, state: &mut ProjectState) -> Result<()> {
         let project_dir = self.paths.project_dir(slug);
         let claude_md = project_dir.join("CLAUDE.md");

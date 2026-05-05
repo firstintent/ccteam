@@ -77,6 +77,36 @@ pub struct ProjectState {
 }
 
 impl ProjectState {
+    /// Default initial state for a freshly-created project. `current_phase`
+    /// is left empty so the orchestrator's first tick reads it as
+    /// "no phase yet" and dispatches `FIRST_PHASE`.
+    pub fn initial(slug: String) -> Self {
+        let now = Utc::now();
+        Self {
+            tmux_session: format!("ccteam-{slug}"),
+            slug,
+            created_at: now,
+            claude_session_id: None,
+            claude_pid: None,
+            phase_state: PhaseState::Idle,
+            current_phase: String::new(),
+            parallelism: Parallelism::Solo,
+            phase_history: Vec::new(),
+            fix_cycle_count: 0,
+            cost_used_usd: 0.0,
+            soft_warn_threshold_usd: 20.0,
+            hard_kill_threshold_usd: 200.0,
+            context_tokens_used: 0,
+            context_reset_threshold_tokens: 600_000,
+            context_reset_count: 0,
+            last_progress_event_at: None,
+            last_event_type: None,
+            last_user_interaction_at: now,
+            user_attached: false,
+            user_pause_pending: false,
+        }
+    }
+
     /// Atomically persist to `path`. Rotates any existing file to `<path>.bak`
     /// before writing, so a load can recover the prior state if a crash
     /// interleaves with this call.
