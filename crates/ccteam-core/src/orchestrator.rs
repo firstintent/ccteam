@@ -23,6 +23,8 @@ use serde_json::{json, Value};
 use crate::cost::{self, CostLevel};
 use crate::dag::Dag;
 use crate::fix_loop::{self, FixLoopState};
+use crate::inbox::{InboxMessage, SessionMailbox};
+use crate::meta_agent::META_TEAM_NAME;
 use crate::paths::CcteamPaths;
 use crate::phases::PhaseTemplate;
 use crate::progress;
@@ -30,6 +32,12 @@ use crate::stall::{self, StallLevel, StallThresholds};
 use crate::state::{PhaseHistoryEntry, PhaseState, ProjectState};
 use crate::tmux::TmuxSession;
 use crate::tool_surface::{user_claude_dir, ToolSurfaceSnapshot};
+
+/// M1.2: how many regular project sessions can run concurrently. Hard-
+/// coded for M1; M3 may move it to `team.yaml` / global config. The
+/// meta-agent session is **not counted** — it's a permanent fixture in
+/// the User Interaction Layer.
+pub const MAX_CONCURRENT_PROJECTS: usize = 3;
 
 /// Pure decision function: given the current `state` and the last
 /// progress.jsonl event, what should the orchestrator do next?
@@ -222,6 +230,21 @@ impl Orchestrator {
     /// state until claude either runs a tool (PreToolUse arrives) or
     /// the prompt finishes and a Stop fires.
     pub fn dispatch_phase(&self, slug: &str, phase: &str) -> Result<()> {
+        let state_path = self.paths.project_state(slug);
+        let state = ProjectState::load(&state_path)
+            .with_context(|| format!("load state for dispatch {slug}"))?;
+        self.dispatch_phase_with_state(slug, phase, &state)
+    }
+
+    /// Same as `dispatch_phase` but the caller passes the already-loaded
+    /// `ProjectState`. Used inside `process_project` to avoid a redundant
+    /// reload (and so meta-agent paths can pass their bespoke state).
+    pub fn dispatch_phase_with_state(
+        &self,
+        slug: &str,
+        phase: &str,
+        state: &ProjectState,
+    ) -> Result<()> {
         let progress_path = self.paths.progress_jsonl(slug);
         let last = progress::last_event(&progress_path)?;
         let idle = progress::is_idle(last.as_ref());
@@ -229,10 +252,10 @@ impl Orchestrator {
         let prompt = progress::build_phase_prompt(phase);
         let message = progress::idle_aware_message(&prompt, idle);
 
-        let session = TmuxSession::for_slug(slug);
+        let session = TmuxSession::from_name(state.tmux_session.clone());
         session
             .send_keys(&message)
-            .with_context(|| format!("send phase prompt to ccteam-{slug}"))?;
+            .with_context(|| format!("send phase prompt to {}", session.name()))?;
 
         let event = json!({
             "ts": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
@@ -296,7 +319,7 @@ impl Orchestrator {
         append_progress_summary(&claude_md, &summary)
             .with_context(|| format!("bridge progress to {}", claude_md.display()))?;
 
-        let session = TmuxSession::for_slug(slug);
+        let session = TmuxSession::from_name(state.tmux_session.clone());
         let ready = CcteamPaths::project_ready_in(&project_dir);
         if ready.exists() {
             let _ = std::fs::remove_file(&ready);
@@ -346,10 +369,14 @@ impl Orchestrator {
     /// Mutates + persists `state.claude_pid` whenever a new session is
     /// born. Skipped silently for terminal projects.
     pub fn ensure_session(&self, slug: &str, state: &mut ProjectState) -> Result<()> {
-        if self.dag.is_terminal_state(state) {
+        // Meta-agent sessions never reach a terminal phase state and the
+        // dag check below would skip them — guard meta-agent first so it
+        // always tries to come up.
+        let is_meta = state.team == META_TEAM_NAME;
+        if !is_meta && self.dag.is_terminal_state(state) {
             return Ok(());
         }
-        let session = TmuxSession::for_slug(slug);
+        let session = TmuxSession::from_name(state.tmux_session.clone());
         if session.is_alive(state.claude_pid) {
             return Ok(());
         }
@@ -397,7 +424,15 @@ impl Orchestrator {
     /// Apply `decide_tick` to one project, looping the AdvancePhase →
     /// DispatchPhase chain so a phase boundary doesn't take two ticks
     /// to act on. The loop iteration cap is a paranoia guard.
+    ///
+    /// Meta-agent projects (`team == META_TEAM_NAME`) bypass the phase
+    /// DAG entirely — they're event-loop sessions, not phase-DAG ones —
+    /// and only get `ensure_session` lifecycle handling. See
+    /// `process_meta_project` for that path.
     pub fn process_project(&self, slug: &str, mut state: ProjectState) -> Result<ProjectState> {
+        if state.team == META_TEAM_NAME {
+            return self.process_meta_project(slug, state);
+        }
         const MAX_ITERS: u32 = 4;
         let progress_path = self.paths.progress_jsonl(slug);
         let state_path = self.paths.project_state(slug);
@@ -504,6 +539,146 @@ impl Orchestrator {
         Ok(state)
     }
 
+    /// Meta-agent dispatch path: ensure the long-lived tmux session is
+    /// up and process any inbox messages. **Never** injects phase
+    /// prompts — meta-agents drive themselves via NL inside their
+    /// session, and the orchestrator only routes external messages
+    /// (terminal attach / channel layer) into them.
+    ///
+    /// **M1.4 context-reset bridge**: meta-agents have no phase
+    /// boundary, so the regular phase-edge reset (tech-design §6.9)
+    /// can't trigger. Instead, we check the 60% threshold on every
+    /// tick and recycle the session in place when crossed —
+    /// `reset_context` appends a "current progress" snippet to the
+    /// meta-agent's CLAUDE.md so the new claude resumes the conversation
+    /// with continuity. M4.6 will replace this with the full
+    /// claude-mem RAG flow; M1's bare bridge is enough to keep the
+    /// session usable across the 1M ceiling.
+    pub fn process_meta_project(
+        &self,
+        slug: &str,
+        mut state: ProjectState,
+    ) -> Result<ProjectState> {
+        debug_assert_eq!(state.team, META_TEAM_NAME);
+        self.ensure_session(slug, &mut state)?;
+        if let Err(err) = self.process_session_inbox(slug, &state) {
+            tracing::warn!(slug, error = %err, "meta inbox processing failed");
+        }
+        if state.context_tokens_used > state.context_reset_threshold_tokens {
+            tracing::info!(
+                slug,
+                tokens = state.context_tokens_used,
+                threshold = state.context_reset_threshold_tokens,
+                "meta-agent context reset triggered (M1.4)",
+            );
+            if let Err(err) = self.reset_context(slug, &mut state) {
+                tracing::error!(
+                    slug,
+                    error = %err,
+                    "meta context reset failed; conversation continuity may be lost",
+                );
+            }
+        }
+        Ok(state)
+    }
+
+    /// Drain inbox/ for `slug` (M1.1). Each message is read, injected
+    /// via tmux send-keys (idle-aware), and then deleted — exactly
+    /// matching the §3.4.5 protocol. Errors per-file are logged; one
+    /// bad message must not stall the others.
+    pub fn process_session_inbox(
+        &self,
+        slug: &str,
+        state: &ProjectState,
+    ) -> Result<()> {
+        let cc = self.paths.project_ccteam_dir(slug);
+        let mailbox = SessionMailbox::for_ccteam_dir(&cc);
+        let entries = mailbox.list_inbox()?;
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let session = TmuxSession::from_name(state.tmux_session.clone());
+        if !session.exists() {
+            tracing::debug!(
+                slug,
+                session = %session.name(),
+                "skipping inbox drain: tmux session not running yet",
+            );
+            return Ok(());
+        }
+        let progress_path = self.paths.progress_jsonl(slug);
+        for path in entries {
+            let msg = match InboxMessage::load(&path) {
+                Ok(m) => m,
+                Err(err) => {
+                    tracing::warn!(
+                        slug,
+                        file = %path.display(),
+                        error = %err,
+                        "skip malformed inbox file (left in place for inspection)",
+                    );
+                    continue;
+                }
+            };
+            let last = progress::last_event(&progress_path)?;
+            let idle = progress::is_idle(last.as_ref());
+            let body = msg.body.trim();
+            if body.is_empty() {
+                tracing::debug!(slug, file = %path.display(), "skip empty inbox body");
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+            let message = progress::idle_aware_message(body, idle);
+            if let Err(err) = session.send_keys(&message) {
+                tracing::warn!(
+                    slug,
+                    file = %path.display(),
+                    error = %err,
+                    "send-keys failed; leaving inbox file for retry",
+                );
+                continue;
+            }
+            progress::append_event(
+                &progress_path,
+                &json!({
+                    "ts": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                    "event": "inbox_consumed",
+                    "session": session.name(),
+                    "msg_file": path.file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(""),
+                    "source": msg.front.source,
+                    "source_user": msg.front.source_user,
+                    "idle": idle,
+                }),
+            )?;
+            // Idempotent ack: delete after successful delivery.
+            if let Err(err) = std::fs::remove_file(&path) {
+                tracing::warn!(
+                    slug,
+                    file = %path.display(),
+                    error = %err,
+                    "could not delete consumed inbox file; channel adapter may resend",
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Count regular (non-meta) projects whose tmux session is
+    /// currently driving a phase (`InFlight` or `FixLocked`). The
+    /// concurrency gate (`MAX_CONCURRENT_PROJECTS`) compares this to
+    /// the cap so over-the-limit idle projects wait their turn.
+    pub fn count_active_regular(projects: &[(String, ProjectState)]) -> usize {
+        projects
+            .iter()
+            .filter(|(_, s)| s.team != META_TEAM_NAME)
+            .filter(|(_, s)| {
+                matches!(s.phase_state, PhaseState::InFlight | PhaseState::FixLocked)
+            })
+            .count()
+    }
+
     /// Run until `shutdown` resolves. Each tick + each progress event
     /// currently logs at debug level; later M0 tasks fill in the body.
     pub async fn run<F>(&self, shutdown: F) -> Result<()>
@@ -562,24 +737,75 @@ impl Orchestrator {
 
     async fn poll_tick(&self, tick_count: u64) -> Result<()> {
         let projects = self.discover_projects()?;
+        let active_regular = Self::count_active_regular(&projects);
         tracing::debug!(
             tick = tick_count,
             templates = self.templates.len(),
             projects = projects.len(),
+            active_regular,
+            max_concurrent = MAX_CONCURRENT_PROJECTS,
             "orchestrator tick",
         );
         let now = Utc::now();
+
+        // Process meta-agent projects first — they're permanent fixtures
+        // and must not be deferred when the regular concurrency cap is
+        // reached. Then handle regular projects with the cap.
+        let mut regular_dispatch_budget =
+            MAX_CONCURRENT_PROJECTS.saturating_sub(active_regular);
+
         for (slug, state) in projects {
-            // Stall + cost classification first so we observe the
-            // pre-action state. enforce_cost_thresholds may mutate
-            // state and return Some(updated) when it does.
             self.warn_if_stalled(&slug, &state, now);
             let state = match self.enforce_cost_thresholds(&slug, state)? {
                 Some(updated) => updated,
                 None => continue, // hard-kill terminated this project
             };
-            if let Err(err) = self.process_project(&slug, state) {
-                tracing::error!(slug, error = format!("{err:#}"), "project tick failed");
+
+            if state.team == META_TEAM_NAME {
+                if let Err(err) = self.process_project(&slug, state) {
+                    tracing::error!(
+                        slug,
+                        error = format!("{err:#}"),
+                        "meta tick failed",
+                    );
+                }
+                continue;
+            }
+
+            // M1.2 concurrency gate: only let an idle regular project
+            // *start* a new phase if the active count is under the cap.
+            // Already-active projects (InFlight / FixLocked) always run
+            // through process_project so their AdvancePhase / Escalated
+            // transitions still land.
+            let already_active = matches!(
+                state.phase_state,
+                PhaseState::InFlight | PhaseState::FixLocked,
+            );
+            if !already_active && regular_dispatch_budget == 0 {
+                tracing::debug!(
+                    slug,
+                    "regular project queued: max_concurrent_projects ({}) reached",
+                    MAX_CONCURRENT_PROJECTS,
+                );
+                continue;
+            }
+
+            match self.process_project(&slug, state) {
+                Ok(updated) => {
+                    if !already_active
+                        && matches!(
+                            updated.phase_state,
+                            PhaseState::InFlight | PhaseState::FixLocked,
+                        )
+                    {
+                        regular_dispatch_budget = regular_dispatch_budget.saturating_sub(1);
+                    }
+                }
+                Err(err) => tracing::error!(
+                    slug,
+                    error = format!("{err:#}"),
+                    "project tick failed",
+                ),
             }
         }
         Ok(())
@@ -595,6 +821,13 @@ impl Orchestrator {
         slug: &str,
         mut state: ProjectState,
     ) -> Result<Option<ProjectState>> {
+        // Meta-agent sessions are evergreen and don't fit "hard kill on
+        // budget" semantics — their cost is the user's running tab, not
+        // a per-project budget. M1 lets them through; M4 may want a
+        // separate ladder when conversation continuity (M4.6) lands.
+        if state.team == META_TEAM_NAME {
+            return Ok(Some(state));
+        }
         if self.dag.is_terminal_state(&state) {
             return Ok(Some(state));
         }
@@ -619,7 +852,7 @@ impl Orchestrator {
                     cost = state.cost_used_usd,
                     "cost > ${hard}: HARD KILL — terminating tmux session and escalating",
                 );
-                let session = TmuxSession::for_slug(slug);
+                let session = TmuxSession::from_name(state.tmux_session.clone());
                 if let Err(err) = session.kill() {
                     tracing::error!(slug, error = %err, "tmux kill failed during hard-kill");
                 }
@@ -660,6 +893,13 @@ impl Orchestrator {
     }
 
     fn warn_if_stalled(&self, slug: &str, state: &ProjectState, now: chrono::DateTime<Utc>) {
+        // Meta-agent sessions sit idle by design (waiting for the next
+        // NL message) — stall semantics don't apply. dag.is_terminal_state
+        // would also return false for them since they have no phase
+        // history, so guard explicitly.
+        if state.team == META_TEAM_NAME {
+            return;
+        }
         if self.dag.is_terminal_state(state) {
             return;
         }

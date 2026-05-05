@@ -197,15 +197,20 @@ ccteam-control 调 `ccteam new`,起项目 session;再说 5 个不同想法,看�
 
 | # | 任务 | 验收 | 依赖 |
 |---|---|---|---|
-| M1.0 | **meta-agent session 骨架(新)** | `ccteam doctor --install-meta-agent <user-handle>` 命令落地;创建 `~/projects/<user>-meta/` 目录,写 meta-agent role prompt 到 `.ccteam/CLAUDE.md`(含 dispatch 决策树 + dispatcher-not-worker 行为约束,见 strategic doc §7.2.2 / §7.2.3);ln -sf `ccteam-control` skill;orchestrator 把 meta session 当一种特殊"team type"管(常驻、永不 terminal、事件循环);`ccteam start` 自启 meta session;`tmux attach -t ccteam-meta-<user>` 即 NL 对话入口 | M0.5 | tech-design §2.1 / §3.8 / strategic doc §7 |
-| M1.1 | **inbox/outbox 文件协议加固(改)** | `<session>/.ccteam/inbox/msg-<n>.md`(NL markdown + 顶部 YAML 元数据:source channel / timestamp / user)`<session>/.ccteam/outbox/reply-<n>.md`(同 schema);orchestrator inotify watch inbox,触发 send-keys 注入对应 session(idle 直送 / 忙加 `/btw`);interfaces.md 加协议章节。**M1 不实现具体 channel**,只钉协议 | M1.0 | tech-design §2.1.2 / interfaces.md |
-| M1.2 | 多项目并发调度 | `max_concurrent_projects=3` 准入;超出排队;每项目独立 tmux session;meta session 不计入并发上限(它常驻) | M1.0 | tech-design §6.1 |
-| M1.3 | meta-agent dispatch 端到端 | meta session NL 指令 `"做一个 todo cli"` → meta 用 `ccteam-control` 调 `ccteam new` → 项目 session 启动 → meta 在 tmux pane 看到"项目已派,跟踪中"反馈;5 个连续派单测试串行准入 | M1.0、M1.2、M1.8 | strategic §7.2.2 |
-| M1.4 | 项目级 CLAUDE.md 自动生成 | plan phase 后写;reset 时追加"当前进度"节(已在 M0.10 设计,M1 兑现到 meta session 也享受) | M0.10 | tech-design §6.5 / §6.9 |
-| M1.5 | 优雅停机 + 重启自恢复 | `ccteam stop` 不杀 session(包含 meta session);`ccteam start` 自动 reattach 所有活跃 session(meta + 项目) | M1.2 | tech-design §6.1 |
+| M1.0 ✅ | **meta-agent session 骨架(新)** | `ccteam doctor --install-meta-agent <user-handle>` 命令落地;创建 `~/projects/<user>-meta/` 目录,写 meta-agent role prompt 到 `.ccteam/CLAUDE.md`(含 dispatch 决策树 + dispatcher-not-worker 行为约束,见 strategic doc §7.2.2 / §7.2.3);ln -sf `ccteam-control` skill;orchestrator 把 meta session 当一种特殊"team type"管(常驻、永不 terminal、事件循环);`ccteam start` 自启 meta session;`tmux attach -t ccteam-meta-<user>` 即 NL 对话入口 | M0.5 | tech-design §2.1 / §3.8 / strategic doc §7 |
+| M1.1 ✅ | **inbox/outbox 文件协议加固(改)** | `<session>/.ccteam/inbox/msg-<n>.md`(NL markdown + 顶部 YAML 元数据:source channel / timestamp / user)`<session>/.ccteam/outbox/reply-<n>.md`(同 schema);orchestrator inotify watch inbox,触发 send-keys 注入对应 session(idle 直送 / 忙加 `/btw`);interfaces.md 加协议章节。**M1 不实现具体 channel**,只钉协议。**M1 落地为 30s 轮询,inotify 升级留 P2**(WSL2 兼容 + 简洁) | M1.0 | tech-design §2.1.2 / interfaces.md |
+| M1.2 ✅ | 多项目并发调度 | `max_concurrent_projects=3` 准入;超出排队;每项目独立 tmux session;meta session 不计入并发上限(它常驻) | M1.0 | tech-design §6.1 |
+| M1.3 ✅ | meta-agent dispatch 端到端 | meta session NL 指令 `"做一个 todo cli"` → meta 用 `ccteam-control` 调 `ccteam new` → 项目 session 启动 → meta 在 tmux pane 看到"项目已派,跟踪中"反馈;5 个连续派单测试串行准入 | M1.0、M1.2、M1.8 | strategic §7.2.2 |
+| M1.4 ✅ | 项目级 CLAUDE.md 自动生成 | plan phase 后写;reset 时追加"当前进度"节(已在 M0.10 设计,M1 兑现到 meta session 也享受) | M0.10 | tech-design §6.5 / §6.9 |
+| M1.5 ✅ | 优雅停机 + 重启自恢复 | `ccteam stop` 不杀 session(包含 meta session);`ccteam start` 自动 reattach 所有活跃 session(meta + 项目) | M1.2 | tech-design §6.1 |
 | M1.6 | cross-cutting watcher agents(L2 起步) | `cost-watcher` + `scope-watcher` 实现;**Stop hook 触发**(每 phase 边界跑一次,不在 PostToolUse 跑——避免 300+ 次/phase 灌爆);输出 PASS/CONCERN/BLOCK,append `progress.jsonl`;BLOCK 写 `escalation.md` | M1.5 | tech-design §3.6 L2、§6.3 模式 B |
 | M1.7 | **L3 fork 决策走 NL 通道(改)** | watcher BLOCK / fix-loop escalate 时,orchestrator 写 `escalation.md`;meta-agent watcher 检测到 → 在 meta session 用 NL 描述项目卡点 + 备选方案;用户 NL 回复(在 meta session pane 或将来 channel),meta 解析后用 `ccteam-control` 把决策注入对应项目 session 的 inbox。**砍掉旧的 ABC structured push** | M1.6、M1.0 | tech-design §3.6 L3 |
-| M1.8 | `ccteam-control` skill 发行 | binary 内嵌 SKILL.md;`ccteam doctor --install-skill` 写到 `~/.claude/skills/ccteam-control/`;字段约定 + body 必含章节按 interfaces §11 落地;**首要 consumer 是 meta-agent session**(M1.0 自动装);辅助 consumer 是用户自己的 daily-driver claude(用户手动装) | M0.11 | tech-design §3.8、§6.7、interfaces §11 |
+| M1.8 ✅ | `ccteam-control` skill 发行 | binary 内嵌 SKILL.md;`ccteam doctor --install-skill` 写到 `~/.claude/skills/ccteam-control/`;字段约定 + body 必含章节按 interfaces §11 落地;**首要 consumer 是 meta-agent session**(M1.0 自动装);辅助 consumer 是用户自己的 daily-driver claude(用户手动装) | M0.11 | tech-design §3.8、§6.7、interfaces §11 |
+
+> **2026-05-06 M1 Phase 1 完成**(commit `m1/meta-agent-dispatch`):
+> M1.0/1.1/1.2/1.3/1.4/1.5/1.8 一并 ship。M1.6 / M1.7 留作后续 PR——
+> Phase 1 已让 meta-agent NL 派单端到端能跑(终端 attach 即对话),
+> watcher 与 L3 NL 通道是单独的功能集,与 dispatch 主链解耦。
 
 **M1 砍掉 / 推后的任务**:
 - ~~M1.1 Telegram bot 入口~~ → **下沉 M2** Channel Layer(优先复用 Claude Code

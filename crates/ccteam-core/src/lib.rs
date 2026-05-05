@@ -3,9 +3,13 @@
 //! `ccteam-hooks` (hook handlers invoked via `ccteam hook ...`).
 
 pub mod cost;
+pub mod daemon;
 pub mod dag;
 pub mod fix_loop;
+pub mod inbox;
+pub mod meta_agent;
 pub mod orchestrator;
+pub mod skill;
 pub mod paths;
 pub mod phases;
 pub mod progress;
@@ -19,12 +23,31 @@ pub mod tool_surface;
 
 pub use dag::{dev_dag, Dag};
 pub use fix_loop::{FixLoopDecision, FixLoopFrontMatter, FixLoopState};
+pub use inbox::{
+    inbox_filename, outbox_filename, InboxAttachment, InboxFrontMatter, InboxMessage,
+    OutboxEventKind, OutboxFrontMatter, OutboxMessage, OutboxPriority, SessionMailbox,
+    LATEST_SCHEMA_VERSION,
+};
+pub use meta_agent::{
+    bootstrap_meta_project, meta_session_name, meta_slug, render_meta_role_prompt,
+    MetaBootstrapReport, META_SESSION_PREFIX, META_TEAM_NAME,
+};
+pub use skill::{
+    install_ccteam_control_skill, install_into as install_skill_into,
+    InstallSkillOptions, InstallSkillReport, SkillInstallAction,
+    CCTEAM_CONTROL_SKILL_NAME,
+};
+pub use orchestrator::MAX_CONCURRENT_PROJECTS;
 pub use orchestrator::{
     append_progress_summary, build_progress_summary, check_phase_tools, decide_tick,
     decide_tick_from_events, Orchestrator, OrchestratorConfig, TickAction,
 };
 pub use projects::{bootstrap_project, pick_unused_slug, pre_trust_project, slugify};
 pub use cost::{classify as classify_cost, CostLevel, COST_MID_WARN_USD};
+pub use daemon::{
+    pidfile_path, read_pidfile, remove_pidfile, send_sigterm_to_pidfile, write_pidfile,
+    PIDFILE_NAME,
+};
 pub use stall::{
     classify as classify_stall, classify_with_thresholds, silent_seconds, StallLevel,
     StallThresholds, STALL_ESCALATE_SECONDS, STALL_SUSPICIOUS_SECONDS, STALL_WARN_SECONDS,

@@ -91,6 +91,11 @@ enum Command {
     },
     /// Resume a paused / escalated project (re-arm phase_state=idle).
     Resume { slug: String },
+    /// Stop the running orchestrator daemon. Sends SIGTERM via the
+    /// pidfile so the loop drains gracefully. Does **not** kill any
+    /// tmux sessions — `ccteam start` reattaches to them on next launch
+    /// (M1.5).
+    Stop,
     /// Health checks + tool-surface maintenance.
     Doctor {
         /// Backfill ~/.claude/agents/<name>.md symlinks for the eight
@@ -111,6 +116,17 @@ enum Command {
         /// (M0.5.6).
         #[arg(long, default_value_t = false)]
         tool_surface: bool,
+        /// Install the `ccteam-control` skill at
+        /// `~/.claude/skills/ccteam-control/SKILL.md` (M1.8). Idempotent.
+        #[arg(long, default_value_t = false)]
+        install_skill: bool,
+        /// Bootstrap a meta-agent project (M1.0) for the given user
+        /// handle. Creates `~/projects/<handle>-meta/` with the
+        /// dispatcher role prompt + inbox/outbox dirs and (always)
+        /// installs the `ccteam-control` skill. Pass the user handle as
+        /// the value (e.g. `--install-meta-agent rob`).
+        #[arg(long, value_name = "HANDLE")]
+        install_meta_agent: Option<String>,
     },
 }
 
@@ -167,17 +183,39 @@ fn main() -> Result<()> {
             let paths = CcteamPaths::from_env()?;
             commands::run_resume(&paths, &slug)
         }
+        Command::Stop => run_stop(),
         Command::Doctor {
             install_recommended_agents,
             dry_run,
             force,
             tool_surface,
+            install_skill,
+            install_meta_agent,
         } => run_doctor(commands::DoctorOptions {
             install_recommended_agents,
             dry_run,
             force,
             tool_surface,
+            install_skill,
+            install_meta_agent,
         }),
+    }
+}
+
+fn run_stop() -> Result<()> {
+    let paths = CcteamPaths::from_env()?;
+    match ccteam_core::send_sigterm_to_pidfile(&paths)? {
+        Some(pid) => {
+            println!("ccteam stop: SIGTERM sent to orchestrator pid {pid}");
+            println!(
+                "tmux sessions are NOT killed — `ccteam start` will reattach to them.",
+            );
+            Ok(())
+        }
+        None => {
+            println!("ccteam stop: no running orchestrator (pidfile absent or stale).");
+            Ok(())
+        }
     }
 }
 
@@ -239,19 +277,51 @@ fn run_start(tick_seconds: u64, skip_tool_check: bool) -> Result<()> {
         skip_tool_check,
         ..OrchestratorConfig::default()
     };
-    let orchestrator = Orchestrator::new(paths, config)?;
+    // Write the pidfile *before* constructing the orchestrator so a
+    // second `ccteam start` against the same root errors out cleanly
+    // before either side has touched tmux.
+    let pidfile = ccteam_core::write_pidfile(&paths)?;
+    tracing::info!(pidfile = %pidfile.display(), "orchestrator pidfile written");
 
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("build tokio runtime")?;
-    runtime.block_on(async move {
-        let shutdown = async {
-            let _ = tokio::signal::ctrl_c().await;
-            tracing::info!("ctrl+c received");
-        };
-        orchestrator.run(shutdown).await
-    })
+    // We need the paths twice (for orchestrator construction + final
+    // pidfile cleanup), so clone before the move into Orchestrator::new.
+    let cleanup_paths = paths.clone();
+    let result = (|| -> Result<()> {
+        let orchestrator = Orchestrator::new(paths, config)?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("build tokio runtime")?;
+        runtime.block_on(async move {
+            let shutdown = async {
+                #[cfg(unix)]
+                {
+                    use tokio::signal::unix::{signal, SignalKind};
+                    let mut sigterm = match signal(SignalKind::terminate()) {
+                        Ok(s) => s,
+                        Err(err) => {
+                            tracing::warn!(?err, "could not install SIGTERM handler");
+                            let _ = tokio::signal::ctrl_c().await;
+                            tracing::info!("ctrl+c received");
+                            return;
+                        }
+                    };
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => tracing::info!("ctrl+c received"),
+                        _ = sigterm.recv() => tracing::info!("SIGTERM received (ccteam stop)"),
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = tokio::signal::ctrl_c().await;
+                    tracing::info!("ctrl+c received");
+                }
+            };
+            orchestrator.run(shutdown).await
+        })
+    })();
+    ccteam_core::remove_pidfile(&cleanup_paths);
+    result
 }
 
 fn run_new(request: Option<String>, file: Option<PathBuf>, team: String) -> Result<()> {
