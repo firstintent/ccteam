@@ -6,10 +6,16 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-/// Locate the most recent `role: assistant` `message` record in a
-/// transcript JSONL file. Returns the inner `message` object so
-/// callers can read whichever fields they need (`content`, `usage`,
-/// ...). `None` means the transcript has no assistant messages yet.
+/// Locate the most recent assistant message in a transcript JSONL file.
+/// Returns the inner `message` object so callers can read whichever
+/// fields they need (`content`, `usage`, ...). `None` means the
+/// transcript has no assistant messages yet.
+///
+/// **Schema note**: Claude Code 2.x transcripts use a top-level
+/// `type: "assistant"` per turn, with the API-shaped payload nested
+/// under `message`. Earlier prototypes used `type: "message"`, which
+/// our M0.3 parser was originally written against. We accept either
+/// shape here so the hook isn't pinned to one Claude Code release.
 pub fn last_assistant_message(path: &Path) -> Result<Option<serde_json::Value>> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("read transcript {}", path.display()))?;
@@ -19,9 +25,6 @@ pub fn last_assistant_message(path: &Path) -> Result<Option<serde_json::Value>> 
             Ok(v) => v,
             Err(_) => continue,
         };
-        if v.get("type").and_then(|s| s.as_str()) != Some("message") {
-            continue;
-        }
         let Some(msg) = v.get("message") else { continue };
         if msg.get("role").and_then(|s| s.as_str()) != Some("assistant") {
             continue;

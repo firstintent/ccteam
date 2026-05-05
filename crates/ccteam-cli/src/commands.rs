@@ -10,7 +10,8 @@ use chrono::Utc;
 use serde_json::{json, Map, Value};
 
 use ccteam_core::{
-    bootstrap_project, pick_unused_slug, CcteamPaths, PhaseState, ProjectState,
+    bootstrap_project, current_ccteam_bin, pick_unused_slug, write_global_phase_templates,
+    CcteamPaths, PhaseState, ProjectState, PHASE_TEMPLATES,
 };
 use ccteam_core::tmux::TmuxSession;
 
@@ -18,6 +19,77 @@ use ccteam_core::tmux::TmuxSession;
 pub enum OutputFormat {
     Text,
     Json,
+}
+
+/// Options passed from the `ccteam init` argument parser.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InitOptions {
+    /// Overwrite existing global phase templates instead of skipping
+    /// them (default: false, so hand edits stick across re-init).
+    pub force: bool,
+}
+
+/// `ccteam init`. Creates `~/.ccteam/{phases,progress,inbox,control,
+/// queue,memory,state}`, unpacks the embedded phase templates into
+/// `~/.ccteam/phases/`, and runs a quick health check. Returns a
+/// human-readable report.
+pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
+    use std::process::Command;
+
+    for sub in [
+        "phases",
+        "progress",
+        "inbox",
+        "control",
+        "queue",
+        "memory",
+        "state",
+        "log",
+    ] {
+        let dir = paths.root.join(sub);
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("create {}", dir.display()))?;
+    }
+
+    write_global_phase_templates(&paths.root, opts.force)
+        .with_context(|| format!("unpack phase templates to {}", paths.phases_dir().display()))?;
+
+    let bin = current_ccteam_bin().ok();
+
+    let claude = Command::new("claude").arg("--version").output();
+    let tmux = Command::new("tmux").arg("-V").output();
+
+    let mut out = String::new();
+    out.push_str(&format!("✓ created {}\n", paths.root.display()));
+    out.push_str(&format!(
+        "✓ unpacked {} phase templates → {}\n",
+        PHASE_TEMPLATES.len(),
+        paths.phases_dir().display()
+    ));
+    out.push_str("\nhealth check:\n");
+    match &claude {
+        Ok(o) if o.status.success() => out.push_str(&format!(
+            "  claude   : {}\n",
+            String::from_utf8_lossy(&o.stdout).trim()
+        )),
+        _ => out.push_str("  claude   : NOT FOUND on PATH (install: https://claude.com/claude-code)\n"),
+    }
+    match &tmux {
+        Ok(o) if o.status.success() => out.push_str(&format!(
+            "  tmux     : {}\n",
+            String::from_utf8_lossy(&o.stdout).trim()
+        )),
+        _ => out.push_str("  tmux     : NOT FOUND on PATH (apt install tmux / brew install tmux)\n"),
+    }
+    match &bin {
+        Some(p) => out.push_str(&format!("  ccteam   : {}\n", p.display())),
+        None => out.push_str("  ccteam   : current_exe() failed (binary path unresolved)\n"),
+    }
+
+    out.push_str("\nnext:\n");
+    out.push_str("  ccteam new \"<your one-line request>\"\n");
+    out.push_str("  ccteam start --foreground   # in another terminal\n");
+    Ok(out)
 }
 
 /// `ccteam new "request"`. Bootstraps a project on disk and returns
@@ -268,16 +340,28 @@ fn render_ls_text(projects: &[ProjectSummary]) -> String {
     let mut out = String::new();
     out.push_str("SLUG                                     PHASE          STATE       COST   AGE\n");
     for p in projects {
+        let phase = display_phase(&p.state.current_phase);
         out.push_str(&format!(
             "{:<40} {:<14} {:<11} ${:<5.2} {}s\n",
             truncate(&p.state.slug, 40),
-            truncate(&p.state.current_phase, 14),
+            truncate(phase, 14),
             phase_state_str(p.state.phase_state),
             p.state.cost_used_usd,
             p.age_seconds,
         ));
     }
     out
+}
+
+/// `current_phase` is empty between `ccteam new` and the first
+/// dispatch; surface that as `pending` instead of a blank column so
+/// `ls` and `show` are readable on fresh projects.
+fn display_phase(phase: &str) -> &str {
+    if phase.is_empty() {
+        "pending"
+    } else {
+        phase
+    }
 }
 
 fn render_ls_json(projects: &[ProjectSummary]) -> Result<String> {
@@ -323,7 +407,7 @@ fn render_show_text(
 ) -> String {
     let mut out = String::new();
     out.push_str(&format!("# {} ({})\n\n", state.slug, state.tmux_session));
-    out.push_str(&format!("current phase  : {}\n", state.current_phase));
+    out.push_str(&format!("current phase  : {}\n", display_phase(&state.current_phase)));
     out.push_str(&format!(
         "phase state    : {}\n",
         phase_state_str(state.phase_state)
@@ -511,6 +595,37 @@ mod tests {
         assert_eq!(s2.phase_state, PhaseState::Idle);
         assert!(!s2.user_pause_pending);
         assert!(!esc.exists(), "escalation.md should be archived after resume");
+    }
+
+    #[test]
+    fn run_init_creates_global_skeleton_and_unpacks_phases() {
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let report = run_init(&paths, InitOptions::default()).unwrap();
+        for sub in ["phases", "progress", "inbox", "control"] {
+            assert!(
+                paths.root.join(sub).is_dir(),
+                "init must create {}",
+                paths.root.join(sub).display()
+            );
+        }
+        assert!(paths.phases_dir().join("02-plan-eng.md").is_file());
+        assert!(paths.phases_dir().join("09-ship.md").is_file());
+        assert!(report.contains("phase templates"));
+        assert!(report.contains("next"));
+    }
+
+    #[test]
+    fn run_init_is_idempotent_and_preserves_user_edits() {
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        run_init(&paths, InitOptions::default()).unwrap();
+        let path = paths.phases_dir().join("02-plan-eng.md");
+        std::fs::write(&path, "USER EDIT").unwrap();
+        run_init(&paths, InitOptions::default()).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "USER EDIT");
+        run_init(&paths, InitOptions { force: true }).unwrap();
+        assert_ne!(std::fs::read_to_string(&path).unwrap(), "USER EDIT");
     }
 
     #[test]

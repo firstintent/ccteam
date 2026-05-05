@@ -51,10 +51,23 @@ pub fn parse_phase_end(paths: &CcteamPaths, stdin: &Value) -> Result<ParseDecisi
     let slug = slug_from_project_dir(cwd_path)?;
     let progress_path = paths.progress_jsonl(&slug);
 
-    let last_text = last_assistant_message(Path::new(transcript_path))?
-        .as_ref()
-        .and_then(message_text)
-        .unwrap_or_default();
+    // Prefer Claude Code's stdin field — at Stop time, the transcript
+    // file may not yet contain the latest assistant turn (the JSONL
+    // flush races with the hook fire), so reading the file alone misses
+    // PHASE_DONE in real sessions. Fall back to the transcript only when
+    // stdin doesn't carry the message (older Claude Code or other hook
+    // events).
+    let stdin_last = stdin
+        .get("last_assistant_message")
+        .and_then(|s| s.as_str())
+        .map(str::to_string);
+    let last_text = match stdin_last {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => last_assistant_message(Path::new(transcript_path))?
+            .as_ref()
+            .and_then(message_text)
+            .unwrap_or_default(),
+    };
 
     // Step 1: fix-loop drives if the state file is present.
     let fix_loop_path = fix_loop::path_in(cwd_path);
@@ -116,6 +129,15 @@ pub fn parse_phase_end(paths: &CcteamPaths, stdin: &Value) -> Result<ParseDecisi
 
     if let Some(event) = event {
         append_event(&progress_path, &event)?;
+    } else {
+        // Hook fired but found no sigil. Log to stderr at debug level so
+        // the operator can confirm the hook was reached even when no
+        // event was emitted — silent zero-exit is otherwise hard to
+        // diagnose in production runs.
+        eprintln!(
+            "[ccteam parse-phase-end] no PHASE_DONE/ESCALATE in last_text (head: {:?})",
+            last_text.lines().rev().take(3).collect::<Vec<_>>(),
+        );
     }
     Ok(ParseDecision::Continue)
 }

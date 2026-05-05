@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use ccteam_core::{CcteamPaths, Orchestrator, OrchestratorConfig};
-use commands::OutputFormat;
+use commands::{InitOptions, OutputFormat};
 
 #[derive(Parser)]
 #[command(
@@ -24,6 +24,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// One-shot setup: create `~/.ccteam/` skeleton, unpack phase
+    /// templates to `~/.ccteam/phases/`, and run a quick health check
+    /// (claude / tmux / ccteam-on-PATH). Idempotent — safe to re-run.
+    Init {
+        /// Overwrite existing global phase templates (default: skip if
+        /// already on disk so hand-edits stick).
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
     /// Hook handlers invoked by Claude Code per project settings.json.
     /// Each subcommand reads stdin JSON (the Claude Code hook payload)
     /// and performs its side effect; stdout is normally empty.
@@ -102,6 +111,12 @@ fn main() -> Result<()> {
     };
 
     match command {
+        Command::Init { force } => {
+            let paths = CcteamPaths::from_env()?;
+            let report = commands::run_init(&paths, InitOptions { force })?;
+            print!("{report}");
+            Ok(())
+        }
         Command::Hook { cmd } => run_hook(cmd),
         Command::Start {
             foreground: _,
@@ -151,6 +166,24 @@ fn run_hook(cmd: HookCommand) -> Result<()> {
 fn run_start(tick_seconds: u64) -> Result<()> {
     init_tracing();
     let paths = CcteamPaths::from_env()?;
+
+    if !paths.phases_dir().exists() {
+        eprintln!(
+            "ccteam: phases dir {} not found.\n  run `ccteam init` once to unpack templates, then come back.",
+            paths.phases_dir().display()
+        );
+    }
+    if !paths.projects_root.exists()
+        || std::fs::read_dir(&paths.projects_root)
+            .map(|mut it| it.next().is_none())
+            .unwrap_or(true)
+    {
+        eprintln!(
+            "ccteam: no projects under {} yet.\n  start one in another terminal: ccteam new \"<your idea>\"",
+            paths.projects_root.display()
+        );
+    }
+
     let config = OrchestratorConfig {
         tick_interval: Duration::from_secs(tick_seconds.max(1)),
         ..OrchestratorConfig::default()

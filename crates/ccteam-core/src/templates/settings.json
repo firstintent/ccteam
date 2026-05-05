@@ -10,16 +10,16 @@
     "SessionStart": [
       {
         "hooks": [
-          {"type": "command", "command": "ccteam hook load-context", "timeout": 5},
-          {"type": "command", "command": "ccteam hook progress-append session_start", "async": true}
+          {"type": "command", "command": "__CCTEAM_BIN__ hook load-context", "timeout": 5},
+          {"type": "command", "command": "__CCTEAM_BIN__ hook progress-append session_start", "async": true}
         ]
       }
     ],
     "Stop": [
       {
         "hooks": [
-          {"type": "command", "command": "ccteam hook parse-phase-end", "timeout": 10},
-          {"type": "command", "command": "ccteam hook progress-append Stop", "async": true}
+          {"type": "command", "command": "__CCTEAM_BIN__ hook parse-phase-end", "timeout": 10},
+          {"type": "command", "command": "__CCTEAM_BIN__ hook progress-append Stop", "async": true}
         ]
       }
     ],
@@ -27,36 +27,36 @@
       {
         "matcher": "idle_prompt|permission_prompt",
         "hooks": [
-          {"type": "command", "command": "ccteam hook progress-append notification", "async": true}
+          {"type": "command", "command": "__CCTEAM_BIN__ hook progress-append notification", "async": true}
         ]
       }
     ],
     "PreToolUse": [
       {
         "hooks": [
-          {"type": "command", "command": "ccteam hook progress-append PreToolUse", "async": true}
+          {"type": "command", "command": "__CCTEAM_BIN__ hook progress-append PreToolUse", "async": true}
         ]
       }
     ],
     "PostToolUse": [
       {
         "hooks": [
-          {"type": "command", "command": "ccteam hook progress-append PostToolUse", "async": true},
-          {"type": "command", "command": "ccteam hook cost-accumulate", "async": true}
+          {"type": "command", "command": "__CCTEAM_BIN__ hook progress-append PostToolUse", "async": true},
+          {"type": "command", "command": "__CCTEAM_BIN__ hook cost-accumulate", "async": true}
         ]
       }
     ],
     "SubagentStop": [
       {
         "hooks": [
-          {"type": "command", "command": "ccteam hook progress-append SubagentStop", "async": true}
+          {"type": "command", "command": "__CCTEAM_BIN__ hook progress-append SubagentStop", "async": true}
         ]
       }
     ],
     "SessionEnd": [
       {
         "hooks": [
-          {"type": "command", "command": "ccteam hook progress-append SessionEnd", "async": true}
+          {"type": "command", "command": "__CCTEAM_BIN__ hook progress-append SessionEnd", "async": true}
         ]
       }
     ]

@@ -80,9 +80,11 @@ pub fn scan_transcript(path: &Path) -> Result<(f64, u64)> {
         let Ok(v): std::result::Result<Value, _> = serde_json::from_str(line) else {
             continue;
         };
-        if v.get("type").and_then(|s| s.as_str()) != Some("message") {
-            continue;
-        }
+        // Claude Code 2.x records each turn with `type: "assistant"`
+        // (or `type: "user"` etc.) and the API-shaped payload nested
+        // under `message`. Older prototypes used `type: "message"`.
+        // We rely on `message.role` rather than the top-level `type`
+        // so this handler tracks both schemas without churn.
         let Some(msg) = v.get("message") else { continue };
         if msg.get("role").and_then(|s| s.as_str()) != Some("assistant") {
             continue;

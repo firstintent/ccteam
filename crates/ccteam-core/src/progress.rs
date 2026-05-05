@@ -47,6 +47,68 @@ pub fn last_event(path: &Path) -> Result<Option<Value>> {
     Ok(Some(v))
 }
 
+/// Read + parse all events from `path`. Skips empty lines and lines
+/// that fail to deserialize as JSON (defensive: a half-flushed line
+/// shouldn't crash the orchestrator's read).
+pub fn read_all_events(path: &Path) -> Result<Vec<Value>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("read {}", path.display()))?;
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Value>(trimmed) {
+            Ok(v) => out.push(v),
+            Err(_) => continue,
+        }
+    }
+    Ok(out)
+}
+
+/// Walk `events` in reverse and return the most recent `phase_done` /
+/// `escalate` event whose `phase` (for phase_done) matches `current` —
+/// stopping if we hit a `phase_inject` for `current` first (anything
+/// older than that injection belongs to a previous round of the same
+/// phase, e.g. after a context reset).
+///
+/// This is needed because Claude Code emits `Stop` *and* `SubagentStop`
+/// after a turn finishes. If `parse-phase-end` writes `phase_done` and
+/// then a downstream hook appends `SubagentStop`, the *last* event
+/// is no longer `phase_done` — but the phase did finish. Reading just
+/// the last line under-reports completions.
+pub fn latest_terminal_event_for_phase<'a>(
+    events: &'a [Value],
+    current: &str,
+) -> Option<&'a Value> {
+    for event in events.iter().rev() {
+        let kind = event.get("event").and_then(|s| s.as_str()).unwrap_or("");
+        match kind {
+            "phase_done" => {
+                let phase = event.get("phase").and_then(|s| s.as_str()).unwrap_or("");
+                if phase == current {
+                    return Some(event);
+                }
+            }
+            "escalate" => return Some(event),
+            "phase_inject" => {
+                let phase = event.get("phase").and_then(|s| s.as_str()).unwrap_or("");
+                if phase == current {
+                    // Anything before this inject is a stale terminal
+                    // from a prior round of the same phase.
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Idle detection per tech-design §6.9.
 ///
 /// `Stop` / `Notification:idle_prompt` are the canonical "claude is
@@ -139,5 +201,56 @@ mod tests {
         let p = build_phase_prompt("implement");
         assert!(p.contains("PHASE_DONE: implement"));
         assert!(p.contains("ESCALATE"));
+    }
+
+    #[test]
+    fn latest_terminal_event_finds_phase_done_when_subagent_stop_is_last() {
+        // Real Claude Code 2.x event order: parse-phase-end appends
+        // phase_done, then SubagentStop fires later. Naive last-event
+        // lookup returns SubagentStop and the orchestrator never
+        // advances. This helper must walk back past SubagentStop.
+        let events = vec![
+            json!({"event": "phase_inject", "phase": "plan-eng"}),
+            json!({"event": "PostToolUse", "tool": "Write"}),
+            json!({"event": "Stop"}),
+            json!({"event": "phase_done", "phase": "plan-eng"}),
+            json!({"event": "SubagentStop"}),
+        ];
+        let found = latest_terminal_event_for_phase(&events, "plan-eng").unwrap();
+        assert_eq!(found["event"], "phase_done");
+        assert_eq!(found["phase"], "plan-eng");
+    }
+
+    #[test]
+    fn latest_terminal_event_stops_at_phase_inject_for_same_phase() {
+        // After a context reset for plan-eng, an old phase_done from
+        // the prior round should not be picked up — re-injection draws
+        // a new boundary.
+        let events = vec![
+            json!({"event": "phase_done", "phase": "plan-eng"}),
+            json!({"event": "phase_inject", "phase": "plan-eng"}),
+            json!({"event": "PreToolUse"}),
+        ];
+        assert!(latest_terminal_event_for_phase(&events, "plan-eng").is_none());
+    }
+
+    #[test]
+    fn latest_terminal_event_picks_escalate_over_irrelevant_events() {
+        let events = vec![
+            json!({"event": "phase_inject", "phase": "fix"}),
+            json!({"event": "escalate", "reason": "fix-loop cap"}),
+            json!({"event": "Stop"}),
+        ];
+        let e = latest_terminal_event_for_phase(&events, "fix").unwrap();
+        assert_eq!(e["event"], "escalate");
+    }
+
+    #[test]
+    fn latest_terminal_event_skips_phase_done_for_other_phase() {
+        let events = vec![
+            json!({"event": "phase_inject", "phase": "implement"}),
+            json!({"event": "phase_done", "phase": "plan-eng"}), // stale
+        ];
+        assert!(latest_terminal_event_for_phase(&events, "implement").is_none());
     }
 }

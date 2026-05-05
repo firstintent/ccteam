@@ -4,7 +4,10 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use ccteam_core::{CcteamPaths, Orchestrator, OrchestratorConfig};
+use ccteam_core::tmux::{tmux_available, TmuxSession};
+use ccteam_core::{
+    bootstrap_project, CcteamPaths, Orchestrator, OrchestratorConfig, ProjectState,
+};
 use tempfile::TempDir;
 
 fn fresh_paths(tmp: &TempDir) -> CcteamPaths {
@@ -118,6 +121,104 @@ async fn run_returns_when_shutdown_future_resolves() {
 
     let inner = result.expect("orchestrator did not honor the shutdown future");
     inner.expect("orchestrator returned an error during a clean shutdown");
+}
+
+/// `ensure_session` should bring up a tmux session for a fresh
+/// project on demand. Uses a `sh` placeholder for `claude` so the
+/// test doesn't depend on the real CLI; `load-context` writes the
+/// `ready` marker SessionStart would normally produce.
+#[test]
+fn ensure_session_starts_a_missing_session() {
+    if !tmux_available() {
+        eprintln!("[skip] ensure_session_starts_a_missing_session: tmux not on PATH");
+        return;
+    }
+    let tmp = TempDir::new().unwrap();
+    let paths = fresh_paths(&tmp);
+    let slug = format!("ensure-test-{}", std::process::id());
+    bootstrap_project(&paths, &slug, "test request").unwrap();
+
+    let project_dir = paths.project_dir(&slug);
+    let ready = project_dir.join(".ccteam/ready");
+    let argv = vec![
+        "sh".into(),
+        "-c".into(),
+        format!(
+            "touch {} && exec sh -i",
+            ready.to_str().unwrap().replace(' ', r"\ "),
+        ),
+    ];
+
+    let orch = Orchestrator::new(
+        paths.clone(),
+        OrchestratorConfig {
+            claude_argv: argv,
+            ready_timeout: Duration::from_secs(5),
+            post_ready_warmup: Duration::from_millis(0),
+            ..OrchestratorConfig::default()
+        },
+    )
+    .unwrap();
+
+    let mut state = ProjectState::load(&paths.project_state(&slug)).unwrap();
+    let session = TmuxSession::for_slug(&slug);
+    assert!(
+        !session.exists(),
+        "session must be absent before ensure_session",
+    );
+
+    orch.ensure_session(&slug, &mut state).unwrap();
+
+    assert!(
+        session.exists(),
+        "ensure_session must spin up a fresh tmux session",
+    );
+    assert!(state.claude_pid.is_some(), "claude_pid must be recorded");
+    let _ = session.kill();
+}
+
+#[test]
+fn ensure_session_is_no_op_when_session_alive() {
+    if !tmux_available() {
+        eprintln!("[skip] ensure_session_is_no_op_when_session_alive: tmux not on PATH");
+        return;
+    }
+    let tmp = TempDir::new().unwrap();
+    let paths = fresh_paths(&tmp);
+    let slug = format!("ensure-noop-{}", std::process::id());
+    bootstrap_project(&paths, &slug, "test request").unwrap();
+
+    let project_dir = paths.project_dir(&slug);
+    let ready = project_dir.join(".ccteam/ready");
+    std::fs::write(&ready, b"").unwrap();
+
+    let session = TmuxSession::for_slug(&slug);
+    session
+        .start(&project_dir, &["sh", "-c", "sleep 60"])
+        .unwrap();
+    let pid_before = session.pane_pid().unwrap();
+
+    let orch = Orchestrator::new(
+        paths.clone(),
+        OrchestratorConfig {
+            ready_timeout: Duration::from_secs(5),
+            post_ready_warmup: Duration::from_millis(0),
+            ..OrchestratorConfig::default()
+        },
+    )
+    .unwrap();
+    let mut state = ProjectState::load(&paths.project_state(&slug)).unwrap();
+    state.claude_pid = pid_before;
+    state.save(&paths.project_state(&slug)).unwrap();
+
+    orch.ensure_session(&slug, &mut state).unwrap();
+
+    let pid_after = session.pane_pid().unwrap();
+    assert_eq!(
+        pid_before, pid_after,
+        "ensure_session must not recycle a healthy session",
+    );
+    let _ = session.kill();
 }
 
 #[tokio::test]

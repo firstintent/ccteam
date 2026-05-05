@@ -87,6 +87,18 @@ pub enum TickAction {
 }
 
 pub fn decide_tick(state: &ProjectState, last_event: Option<&Value>) -> TickAction {
+    decide_tick_from_events(state, last_event.map(std::slice::from_ref).unwrap_or(&[]))
+}
+
+/// Like `decide_tick` but considers recent events as a slice rather
+/// than just the last one. The slice variant is needed because Claude
+/// Code fires `SubagentStop` after `Stop`, and parse-phase-end's
+/// `phase_done` lands between the two — the literal last event in the
+/// JSONL is `SubagentStop`, but the project did finish.
+///
+/// `events` should be ordered oldest→newest. `decide_tick` continues
+/// to forward a single event for backwards-compat with old call sites.
+pub fn decide_tick_from_events(state: &ProjectState, events: &[Value]) -> TickAction {
     if is_terminal(state) {
         return TickAction::NoOp;
     }
@@ -95,36 +107,36 @@ pub fn decide_tick(state: &ProjectState, last_event: Option<&Value>) -> TickActi
         state.phase_state,
         PhaseState::InFlight | PhaseState::FixLocked
     ) {
-        let Some(e) = last_event else {
+        if events.is_empty() {
             return TickAction::NoOp; // dispatched but no events yet
-        };
-        let kind = e.get("event").and_then(|s| s.as_str()).unwrap_or("");
-        match kind {
-            "phase_done" => {
-                let phase = e.get("phase").and_then(|s| s.as_str()).unwrap_or("");
-                if phase == state.current_phase {
-                    return TickAction::AdvancePhase {
-                        from: state.current_phase.clone(),
-                        to: next_phase(&state.current_phase).map(String::from),
-                    };
-                }
-                // Stale phase_done event (e.g., from a prior phase that
-                // re-ran). Don't act on it.
-                TickAction::NoOp
-            }
-            "escalate" => {
-                let reason = e
-                    .get("reason")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("(no reason given)")
-                    .to_string();
-                TickAction::Escalated {
-                    phase: state.current_phase.clone(),
-                    reason,
-                }
-            }
-            _ => TickAction::NoOp, // still busy
         }
+        if let Some(terminal) =
+            crate::progress::latest_terminal_event_for_phase(events, &state.current_phase)
+        {
+            let kind = terminal
+                .get("event")
+                .and_then(|s| s.as_str())
+                .unwrap_or("");
+            return match kind {
+                "phase_done" => TickAction::AdvancePhase {
+                    from: state.current_phase.clone(),
+                    to: next_phase(&state.current_phase).map(String::from),
+                },
+                "escalate" => {
+                    let reason = terminal
+                        .get("reason")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("(no reason given)")
+                        .to_string();
+                    TickAction::Escalated {
+                        phase: state.current_phase.clone(),
+                        reason,
+                    }
+                }
+                _ => TickAction::NoOp,
+            };
+        }
+        TickAction::NoOp
     } else {
         // Idle: dispatch the current phase, defaulting to FIRST_PHASE.
         let phase = if state.current_phase.is_empty() {
@@ -148,6 +160,13 @@ pub struct OrchestratorConfig {
     /// How long the context-reset routine waits for SessionStart's
     /// ready marker before bailing.
     pub ready_timeout: Duration,
+    /// Extra delay between SessionStart's ready marker landing and the
+    /// first send-keys. The marker fires during claude's CLI bootstrap,
+    /// before the TUI input is actually focused — without this delay the
+    /// first prompt sits in the input box but the Enter never registers.
+    /// Tests with shell stand-ins set this to ~0; production keeps a
+    /// short couple-of-seconds buffer.
+    pub post_ready_warmup: Duration,
 }
 
 impl Default for OrchestratorConfig {
@@ -156,6 +175,7 @@ impl Default for OrchestratorConfig {
             tick_interval: Duration::from_secs(30),
             claude_argv: vec!["claude".into(), "--dangerously-skip-permissions".into()],
             ready_timeout: Duration::from_secs(60),
+            post_ready_warmup: Duration::from_secs(3),
         }
     }
 }
@@ -318,6 +338,65 @@ impl Orchestrator {
         Ok(())
     }
 
+    /// Idempotently ensure `slug`'s tmux session is up before we try to
+    /// `send-keys` into it. Three states:
+    ///
+    /// - alive (`is_alive(claude_pid)` true) → no-op;
+    /// - present-but-pid-mismatched / dead pane → kill + recreate so
+    ///   we don't reattach to a zombie that won't accept keys;
+    /// - missing → fresh `start` + wait for SessionStart's ready marker.
+    ///
+    /// Mutates + persists `state.claude_pid` whenever a new session is
+    /// born. Skipped silently for terminal projects.
+    pub fn ensure_session(&self, slug: &str, state: &mut ProjectState) -> Result<()> {
+        if is_terminal(state) {
+            return Ok(());
+        }
+        let session = TmuxSession::for_slug(slug);
+        if session.is_alive(state.claude_pid) {
+            return Ok(());
+        }
+        // Either the session is missing or the cached PID is stale —
+        // tear down whatever might be left and start clean.
+        if session.exists() {
+            session
+                .kill()
+                .with_context(|| format!("kill stale tmux session for {slug}"))?;
+        }
+        let project_dir = self.paths.project_dir(slug);
+        let ready = CcteamPaths::project_ready_in(&project_dir);
+        if ready.exists() {
+            // Old marker from a previous session — remove so
+            // wait_for_ready measures the *new* SessionStart.
+            let _ = std::fs::remove_file(&ready);
+        }
+        let argv: Vec<&str> = self.config.claude_argv.iter().map(|s| s.as_str()).collect();
+        session
+            .start(&project_dir, &argv)
+            .with_context(|| format!("start tmux session for {slug}"))?;
+        wait_for_ready(&ready, self.config.ready_timeout)
+            .with_context(|| format!("wait for SessionStart ready marker for {slug}"))?;
+        // SessionStart's ready marker fires during claude's CLI bootstrap,
+        // *before* the TUI input field is actually focused. Without a
+        // small warmup, the first phase prompt lands in the input box but
+        // the Enter keypress is silently dropped — the project then sits
+        // forever with the prompt visible but never executed.
+        if !self.config.post_ready_warmup.is_zero() {
+            std::thread::sleep(self.config.post_ready_warmup);
+        }
+        state.claude_pid = session.pane_pid()?;
+        state.last_progress_event_at = Some(Utc::now());
+        state.last_event_type = Some("session_start".into());
+        state.save(&self.paths.project_state(slug))?;
+        tracing::info!(
+            slug,
+            tmux_session = %session.name(),
+            claude_pid = ?state.claude_pid,
+            "tmux session started",
+        );
+        Ok(())
+    }
+
     /// Apply `decide_tick` to one project, looping the AdvancePhase →
     /// DispatchPhase chain so a phase boundary doesn't take two ticks
     /// to act on. The loop iteration cap is a paranoia guard.
@@ -327,8 +406,8 @@ impl Orchestrator {
         let state_path = self.paths.project_state(slug);
 
         for _ in 0..MAX_ITERS {
-            let last = progress::last_event(&progress_path)?;
-            let action = decide_tick(&state, last.as_ref());
+            let events = progress::read_all_events(&progress_path)?;
+            let action = decide_tick_from_events(&state, &events);
             match action {
                 TickAction::NoOp => return Ok(state),
                 TickAction::AdvancePhase { from, to } => {
@@ -392,6 +471,12 @@ impl Orchestrator {
                     return Ok(state);
                 }
                 TickAction::DispatchPhase { phase } => {
+                    // M0.7: orchestrator owns the tmux session lifecycle.
+                    // Without this call, a fresh project's first tick
+                    // (and any tick after a session crash) would error
+                    // out in `dispatch_phase → send_keys` because the
+                    // session simply wouldn't exist.
+                    self.ensure_session(slug, &mut state)?;
                     self.dispatch_phase(slug, &phase)?;
                     let target_state = if phase == FIX_PHASE_NAME {
                         // Stop hook (M0.12) drives the loop; orchestrator

@@ -207,6 +207,106 @@ fn parse_phase_end_emits_escalate_when_sigil_present() {
 }
 
 #[test]
+fn parse_phase_end_uses_stdin_last_assistant_message_when_present() {
+    // Real Claude Code 2.x Stop hooks race against the transcript flush
+    // — by the time we read transcript.jsonl, the final assistant turn
+    // may not be there yet. But Claude Code passes the same text on
+    // stdin as `last_assistant_message`. We must prefer stdin so the
+    // hook never misses PHASE_DONE because of a flush race.
+    let fx = Fixture::new("bookmark-mgr-a3f9");
+    // Transcript has only the *previous* assistant turn (tool_use, no
+    // PHASE_DONE) — simulating the not-yet-flushed final turn.
+    fx.write_transcript(&[json!({
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "name": "Read", "input": {}}],
+        }
+    })]);
+    let stdin = json!({
+        "cwd": fx.project_dir,
+        "transcript_path": fx.transcript_path,
+        "last_assistant_message": "All set.\n\nPHASE_DONE: plan-eng",
+    });
+
+    parse_phase_end(&fx.paths, &stdin).unwrap();
+    let events = fx.read_progress_lines();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["event"], "phase_done");
+    assert_eq!(events[0]["phase"], "plan-eng");
+}
+
+#[test]
+fn parse_phase_end_handles_claude_code_2x_schema() {
+    // Real Claude Code 2.1.x transcripts wrap each turn under
+    // `type: "assistant"` (not the older `type: "message"` shape our
+    // earlier test fixture used). Regressing on this would mean every
+    // production session exits a phase without the orchestrator ever
+    // seeing PHASE_DONE — exactly the bug uncovered during M0 e2e.
+    let fx = Fixture::new("bookmark-mgr-a3f9");
+    let live_shape = json!({
+        "type": "assistant",
+        "message": {
+            "type": "message",
+            "role": "assistant",
+            "content": [{
+                "type": "text",
+                "text": "All set.\n\nPHASE_DONE: ship"
+            }],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        }
+    });
+    fx.write_transcript(&[live_shape]);
+    let stdin = json!({
+        "cwd": fx.project_dir,
+        "transcript_path": fx.transcript_path,
+    });
+
+    parse_phase_end(&fx.paths, &stdin).unwrap();
+    let events = fx.read_progress_lines();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["event"], "phase_done");
+    assert_eq!(events[0]["phase"], "ship");
+}
+
+#[test]
+fn cost_accumulate_handles_claude_code_2x_schema() {
+    // Same regression target on the cost path — pre-fix, scan_transcript
+    // returned (0.0, 0) for every real session because no top-level
+    // `type` matched `"message"`.
+    let fx = Fixture::new("bookmark-mgr-a3f9");
+    let live_shape = json!({
+        "type": "assistant",
+        "message": {
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-opus-4-7",
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cache_read_input_tokens": 1000,
+                "cache_creation_input_tokens": 200
+            }
+        }
+    });
+    fx.write_transcript(&[live_shape]);
+
+    let stdin = json!({
+        "cwd": fx.project_dir,
+        "transcript_path": fx.transcript_path,
+    });
+    cost_accumulate(&fx.paths, &stdin).unwrap();
+    let state = fx.read_state();
+    assert!(
+        state.cost_used_usd > 0.0,
+        "cost must be non-zero after one assistant turn, got: ${}",
+        state.cost_used_usd
+    );
+    assert!(state.context_tokens_used > 0);
+}
+
+#[test]
 fn parse_phase_end_silent_when_no_sigil() {
     let fx = Fixture::new("bookmark-mgr-a3f9");
     fx.write_transcript(&[assistant_message(

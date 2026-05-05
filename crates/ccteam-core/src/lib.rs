@@ -16,10 +16,11 @@ pub mod tmux;
 
 pub use fix_loop::{FixLoopDecision, FixLoopFrontMatter, FixLoopState};
 pub use orchestrator::{
-    append_progress_summary, build_progress_summary, decide_tick, is_terminal, next_phase,
-    Orchestrator, OrchestratorConfig, TickAction, FIRST_PHASE, M0_PHASE_DAG,
+    append_progress_summary, build_progress_summary, decide_tick, decide_tick_from_events,
+    is_terminal, next_phase, Orchestrator, OrchestratorConfig, TickAction, FIRST_PHASE,
+    M0_PHASE_DAG,
 };
-pub use projects::{bootstrap_project, pick_unused_slug, slugify};
+pub use projects::{bootstrap_project, pick_unused_slug, pre_trust_project, slugify};
 pub use cost::{classify as classify_cost, CostLevel, COST_MID_WARN_USD};
 pub use stall::{
     classify as classify_stall, silent_seconds, StallLevel, STALL_ESCALATE_SECONDS,
@@ -30,7 +31,11 @@ pub use phases::{
     AgentTeamRole, PhaseHooks, PhaseTemplate, SubSkillSpec, SubSkillTrigger,
 };
 pub use state::{Parallelism, PhaseHistoryEntry, PhaseState, ProjectState};
-pub use templates::{write_project_settings, PROJECT_SETTINGS_JSON};
+pub use templates::{
+    current_ccteam_bin, project_phase_filename, render_project_settings,
+    write_global_phase_templates, write_project_phase_templates, write_project_settings,
+    SettingsEnv, PHASE_TEMPLATES, PROJECT_SETTINGS_JSON,
+};
 pub use tmux::{pid_is_alive, session_name_for_slug, tmux_available, TmuxSession};
 
 /// Crate version, identical to the workspace package version.
