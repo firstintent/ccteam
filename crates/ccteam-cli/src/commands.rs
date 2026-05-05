@@ -10,10 +10,11 @@ use chrono::Utc;
 use serde_json::{json, Map, Value};
 
 use ccteam_core::{
-    bootstrap_project, current_ccteam_bin, link_recommended_agents, pick_unused_slug,
-    user_claude_dir, write_global_phase_templates, AgentLinkAction, AgentLinkReport,
-    CcteamPaths, LinkOptions, PhaseState, PhaseTemplate, ProjectState, ToolSurfaceSnapshot,
-    BUILTIN_SUBAGENTS, PHASE_TEMPLATES,
+    bootstrap_meta_project, bootstrap_project, current_ccteam_bin, install_ccteam_control_skill,
+    link_recommended_agents, pick_unused_slug, user_claude_dir, write_global_phase_templates,
+    AgentLinkAction, AgentLinkReport, CcteamPaths, InstallSkillOptions, LinkOptions,
+    MetaBootstrapReport, PhaseState, PhaseTemplate, ProjectState, SkillInstallAction,
+    ToolSurfaceSnapshot, BUILTIN_SUBAGENTS, PHASE_TEMPLATES,
 };
 use ccteam_core::tmux::TmuxSession;
 
@@ -234,22 +235,31 @@ pub fn run_resume(paths: &CcteamPaths, slug: &str) -> Result<()> {
     Ok(())
 }
 
-/// `ccteam doctor` flags. M0.5 ships two subcommands gated by flags
-/// rather than a `doctor <subcommand>` because both are read-only or
-/// effectively idempotent — making them top-level keeps the surface
-/// small. M1+ may add `doctor --install-skill` etc.
-#[derive(Debug, Clone, Copy, Default)]
+/// `ccteam doctor` flags. Each mode is a separate boolean / option so
+/// they can be combined (e.g. `--install-meta-agent rob` implies
+/// `--install-skill` automatically).
+#[derive(Debug, Clone, Default)]
 pub struct DoctorOptions {
     pub install_recommended_agents: bool,
     pub dry_run: bool,
     pub force: bool,
     pub tool_surface: bool,
+    /// M1.8: install ~/.claude/skills/ccteam-control/SKILL.md.
+    pub install_skill: bool,
+    /// M1.0: bootstrap a meta-agent project for the given user handle.
+    /// `Some("rob")` ⇒ creates `~/projects/rob-meta/` and triggers
+    /// `install_skill` regardless of its standalone flag.
+    pub install_meta_agent: Option<String>,
 }
 
 /// `ccteam doctor` dispatch. Returns a human-readable report so unit
 /// tests don't need to capture stdout.
 pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
-    if !opts.install_recommended_agents && !opts.tool_surface {
+    let any_mode = opts.install_recommended_agents
+        || opts.tool_surface
+        || opts.install_skill
+        || opts.install_meta_agent.is_some();
+    if !any_mode {
         return Ok(String::from(
             "ccteam doctor: pass at least one mode flag.\n\
              \n\
@@ -257,20 +267,80 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
              --install-recommended-agents [--dry-run] [--force]\n      \
              ln -sf 8 plugin agents into ~/.claude/agents/ (M0.5.5).\n  \
              --tool-surface\n      \
-             cross-check phase templates' tools_required against current reachability (M0.5.6).\n",
+             cross-check phase templates' tools_required against current reachability (M0.5.6).\n  \
+             --install-skill [--force]\n      \
+             write ~/.claude/skills/ccteam-control/SKILL.md (M1.8).\n  \
+             --install-meta-agent <user-handle>\n      \
+             bootstrap a meta-agent project for the given user (M1.0). Implies --install-skill.\n",
         ));
     }
     let mut out = String::new();
     if opts.install_recommended_agents {
-        out.push_str(&render_install_recommended_agents_report(opts)?);
+        out.push_str(&render_install_recommended_agents_report(&opts)?);
     }
     if opts.tool_surface {
         out.push_str(&render_tool_surface_report(paths)?);
     }
+    // --install-meta-agent implies --install-skill so a fresh meta
+    // session has the dispatcher tool list immediately.
+    let install_skill_now = opts.install_skill || opts.install_meta_agent.is_some();
+    if install_skill_now {
+        out.push_str(&render_install_skill_report(&opts)?);
+    }
+    if let Some(handle) = &opts.install_meta_agent {
+        out.push_str(&render_install_meta_agent_report(paths, handle)?);
+    }
     Ok(out)
 }
 
-fn render_install_recommended_agents_report(opts: DoctorOptions) -> Result<String> {
+fn render_install_skill_report(opts: &DoctorOptions) -> Result<String> {
+    let report = install_ccteam_control_skill(InstallSkillOptions {
+        force: opts.force,
+        dry_run: opts.dry_run,
+    })?;
+    let mut out = String::from("ccteam doctor --install-skill\n\n");
+    let label: String = match &report.action {
+        SkillInstallAction::Wrote => "wrote".into(),
+        SkillInstallAction::AlreadyPresent => "already-present (use --force to overwrite)".into(),
+        SkillInstallAction::Replaced => "replaced".into(),
+        SkillInstallAction::DryRun { would_write } => {
+            if *would_write {
+                "would write".into()
+            } else {
+                "no-op (already present)".into()
+            }
+        }
+    };
+    out.push_str(&format!("  ccteam-control  {label}  {}\n", report.target.display()));
+    out.push('\n');
+    Ok(out)
+}
+
+fn render_install_meta_agent_report(paths: &CcteamPaths, user_handle: &str) -> Result<String> {
+    let report: MetaBootstrapReport = bootstrap_meta_project(paths, user_handle)?;
+    let mut out = String::from("ccteam doctor --install-meta-agent\n\n");
+    out.push_str(&format!("  user handle      {user_handle}\n"));
+    out.push_str(&format!("  project slug     {}\n", report.slug));
+    out.push_str(&format!("  project dir      {}\n", report.project_dir.display()));
+    out.push_str(&format!("  role prompt      {}\n", report.claude_md.display()));
+    out.push_str(&format!(
+        "  status           {}\n",
+        if report.already_existed { "refreshed" } else { "created" },
+    ));
+    out.push('\n');
+    out.push_str(&format!(
+        "tmux session     ccteam-meta-{}\n",
+        ccteam_core::meta_slug(user_handle)?.trim_end_matches("-meta"),
+    ));
+    out.push_str(&format!(
+        "attach with      tmux attach -t ccteam-meta-{}\n",
+        ccteam_core::meta_slug(user_handle)?.trim_end_matches("-meta"),
+    ));
+    out.push_str("\nrun `ccteam start --foreground` (in another terminal) to wake the meta session.\n");
+    Ok(out)
+}
+
+fn render_install_recommended_agents_report(opts: &DoctorOptions) -> Result<String> {
     let reports = link_recommended_agents(LinkOptions {
         force: opts.force,
         dry_run: opts.dry_run,
@@ -281,7 +351,7 @@ fn render_install_recommended_agents_report(opts: DoctorOptions) -> Result<Strin
     } else {
         "ccteam doctor --install-recommended-agents\n"
     });
-    out.push_str("\n");
+    out.push('\n');
     let mut all_ok = true;
     for r in &reports {
         out.push_str(&render_agent_link_line(r));
@@ -289,7 +359,7 @@ fn render_install_recommended_agents_report(opts: DoctorOptions) -> Result<Strin
             all_ok = false;
         }
     }
-    out.push_str("\n");
+    out.push('\n');
     if !all_ok {
         out.push_str(
             "some agents skipped — pass --force to overwrite user files, or install \
@@ -355,7 +425,7 @@ fn render_tool_surface_report(paths: &CcteamPaths) -> Result<String> {
     ));
     out.push_str(&format!("skills seen      : {}\n", snap.skills.len()));
     out.push_str(&format!("mcp servers seen : {}\n", snap.mcp.len()));
-    out.push_str("\n");
+    out.push('\n');
 
     if templates.is_empty() {
         out.push_str(
@@ -406,7 +476,7 @@ fn render_tool_surface_report(paths: &CcteamPaths) -> Result<String> {
         }
     }
 
-    out.push_str("\n");
+    out.push('\n');
     if any_missing {
         out.push_str(
             "**Verdict:** at least one phase has a missing tool. \
@@ -937,6 +1007,62 @@ mod tests {
         let body = run_doctor(&paths, DoctorOptions::default()).unwrap();
         assert!(body.contains("install-recommended-agents"));
         assert!(body.contains("tool-surface"));
+        assert!(body.contains("install-skill"));
+        assert!(body.contains("install-meta-agent"));
+    }
+
+    #[test]
+    fn run_doctor_install_meta_agent_creates_project_and_skill() {
+        // M1.0 + M1.8 combo: --install-meta-agent <handle> implies
+        // --install-skill, so a single invocation gets the user a
+        // ready-to-attach session.
+        ensure_isolation();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        // Redirect ~/.claude/ to the tempdir so the skill install
+        // doesn't touch the developer's real ~/.claude/.
+        std::env::set_var("CLAUDE_CONFIG_HOME", tmp.path().to_str().unwrap());
+
+        let opts = DoctorOptions {
+            install_meta_agent: Some("rob".into()),
+            ..DoctorOptions::default()
+        };
+        let report = run_doctor(&paths, opts).unwrap();
+        assert!(report.contains("install-skill"), "skill install report missing");
+        assert!(report.contains("install-meta-agent"), "meta install report missing");
+        assert!(report.contains("rob-meta"), "meta slug should be reported");
+
+        // Project directory exists.
+        assert!(paths.project_dir("rob-meta").is_dir());
+        let state = ProjectState::load(&paths.project_state("rob-meta")).unwrap();
+        assert_eq!(state.team, "meta-agent");
+        assert_eq!(state.tmux_session, "ccteam-meta-rob");
+
+        // Skill landed under the redirected ~/.claude/.
+        let skill_path = tmp.path().join("skills/ccteam-control/SKILL.md");
+        assert!(skill_path.is_file(), "skill SKILL.md not written: {}", skill_path.display());
+
+        std::env::remove_var("CLAUDE_CONFIG_HOME");
+    }
+
+    #[test]
+    fn run_doctor_install_skill_only_lays_down_skill_md() {
+        ensure_isolation();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        std::env::set_var("CLAUDE_CONFIG_HOME", tmp.path().to_str().unwrap());
+
+        let opts = DoctorOptions {
+            install_skill: true,
+            ..DoctorOptions::default()
+        };
+        let report = run_doctor(&paths, opts).unwrap();
+        assert!(report.contains("install-skill"));
+        assert!(!report.contains("install-meta-agent"));
+
+        let skill_path = tmp.path().join("skills/ccteam-control/SKILL.md");
+        assert!(skill_path.is_file());
+        std::env::remove_var("CLAUDE_CONFIG_HOME");
     }
 
     #[test]

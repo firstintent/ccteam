@@ -951,14 +951,26 @@ ccteam kick <slug>                     # 软重启项目 session(claude --resume
 ### 10.6 维护
 
 ```bash
-ccteam memory ls                       # 看跨项目记忆(M3+)
-ccteam memory rebuild                  # 重建索引
-ccteam config edit                     # 改全局配置
-ccteam doctor                          # 体检:tmux server / claude 可用性 / 死 session 检测
-ccteam hook <subcmd>                   # debug:手动跑 hook(读 stdin JSON,写 stdout);
-                                       # subcmd ∈ {progress-append, parse-phase-end,
-                                       # cost-accumulate, load-context, block-push}
+ccteam memory ls                                  # 看跨项目记忆(M3+)
+ccteam memory rebuild                             # 重建索引
+ccteam config edit                                # 改全局配置
+ccteam doctor                                     # 体检:列出可用 mode flags
+ccteam doctor --install-recommended-agents        # M0.5.5 ln -sf 8 个 plugin agent
+ccteam doctor --tool-surface                      # M0.5.6 phase tools_required 交叉表
+ccteam doctor --install-skill                     # M1.8 写 ccteam-control skill
+ccteam doctor --install-meta-agent <user-handle>  # M1.0 创建 meta-agent 项目(含 --install-skill)
+ccteam hook <subcmd>                              # debug:手动跑 hook(读 stdin JSON,写 stdout);
+                                                  # subcmd ∈ {progress-append, parse-phase-end,
+                                                  # cost-accumulate, load-context, block-push}
 ```
+
+#### `ccteam stop` 行为契约(M1.5)
+
+`ccteam stop` 通过 `~/.ccteam/state/orchestrator.pid` 找到正在跑的
+orchestrator,发 SIGTERM。**不杀任何 tmux session**——`ccteam start`
+下次启动时通过 `discover_projects` + `ensure_session` 自动 reattach
+所有活跃 session(meta + 项目)。pidfile 由 `ccteam start` 写入,
+退出时清理;若 pidfile 指向的 PID 已死,`ccteam start` 自动重新认领。
 
 ---
 
@@ -1009,6 +1021,27 @@ M1 时 skill 让 claude 用 Bash 工具 + `--format json` 调 CLI。M2 ccteam-mc
 - skill 仍保留——是 claude 发现"原来可以管 ccteam"的引导层
 - skill body 改为推荐"优先用 mcp__ccteam__* tools,fallback 到 Bash"
 - 老的 Bash 调用方式仍兼容(--format json 永不下线)
+
+### 11.5 Meta-agent role prompt(M1.0)
+
+`ccteam doctor --install-meta-agent <user>` 落地两件事:
+
+1. **项目骨架** `~/projects/<user>-meta/` —— 通过 `bootstrap_project(team=meta-agent)`
+   生成,然后把 `state.json.tmux_session` 改成 `ccteam-meta-<user>`(注:与项目
+   slug 派生的 `ccteam-<slug>` 区分,避免视觉混淆)。
+2. **role prompt** `~/projects/<user>-meta/CLAUDE.md` —— 内嵌模板渲染,
+   `<user>` 与生成时间替换。**必含 7 节**:你是谁 / 决策树 / 克制规则 /
+   派单工具 / 监控规则 / inbox / outbox。
+
+orchestrator 识别 `state.team == "meta-agent"` 走 `process_meta_project` 分支:
+
+- 不跑 phase DAG;`current_phase` 永远空,`phase_state` 永远 `Idle`
+- 仅做 `ensure_session`(常驻 tmux)+ `process_session_inbox`(吸收外部消息)
+- context 超 60% 时仍走 `reset_context` 桥接 CLAUDE.md(M1.4),M4.6 升级为
+  完整 conversation continuity
+
+`MAX_CONCURRENT_PROJECTS = 3`(M1.2 锁定常量)只对常规项目生效;meta session
+**永远不计入并发上限**。
 
 ---
 
