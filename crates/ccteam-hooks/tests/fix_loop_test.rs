@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use tempfile::TempDir;
 
 use ccteam_core::fix_loop::{self, FixLoopState};
-use ccteam_core::{progress, CcteamPaths, Parallelism, PhaseState, ProjectState};
+use ccteam_core::{CcteamPaths, Parallelism, PhaseState, ProjectState};
 use ccteam_hooks::{parse_phase_end, ParseDecision};
 
 struct Fixture {

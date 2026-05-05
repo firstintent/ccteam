@@ -8,6 +8,7 @@ pub mod paths;
 pub mod phases;
 pub mod progress;
 pub mod projects;
+pub mod stall;
 pub mod state;
 pub mod templates;
 pub mod tmux;
@@ -18,6 +19,10 @@ pub use orchestrator::{
     Orchestrator, OrchestratorConfig, TickAction, FIRST_PHASE, M0_PHASE_DAG,
 };
 pub use projects::{bootstrap_project, pick_unused_slug, slugify};
+pub use stall::{
+    classify as classify_stall, silent_seconds, StallLevel, STALL_ESCALATE_SECONDS,
+    STALL_SUSPICIOUS_SECONDS, STALL_WARN_SECONDS,
+};
 pub use paths::{slug_from_project_dir, CcteamPaths};
 pub use phases::{
     AgentTeamRole, PhaseHooks, PhaseTemplate, SubSkillSpec, SubSkillTrigger,

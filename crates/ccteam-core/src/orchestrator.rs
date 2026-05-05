@@ -24,6 +24,7 @@ use crate::fix_loop::{self, FixLoopState};
 use crate::paths::CcteamPaths;
 use crate::phases::PhaseTemplate;
 use crate::progress;
+use crate::stall::{self, StallLevel};
 use crate::state::{PhaseHistoryEntry, PhaseState, ProjectState};
 use crate::tmux::TmuxSession;
 
@@ -481,12 +482,41 @@ impl Orchestrator {
             projects = projects.len(),
             "orchestrator tick",
         );
+        let now = Utc::now();
         for (slug, state) in projects {
+            // Stall detection runs first so it observes the pre-tick
+            // state (the act of dispatching may itself update timestamps).
+            self.warn_if_stalled(&slug, &state, now);
             if let Err(err) = self.process_project(&slug, state) {
                 tracing::error!(slug, error = %err, "project tick failed");
             }
         }
         Ok(())
+    }
+
+    fn warn_if_stalled(&self, slug: &str, state: &ProjectState, now: chrono::DateTime<Utc>) {
+        if is_terminal(state) {
+            return;
+        }
+        let silent = stall::silent_seconds(state, now);
+        match stall::classify(silent) {
+            StallLevel::Ok => {}
+            StallLevel::Warn => tracing::warn!(
+                slug,
+                silent_seconds = silent,
+                "stall ≥5min: project quiet, no progress events",
+            ),
+            StallLevel::Suspicious => tracing::error!(
+                slug,
+                silent_seconds = silent,
+                "stall ≥15min: claude may be hung, consider attaching",
+            ),
+            StallLevel::Escalate => tracing::error!(
+                slug,
+                silent_seconds = silent,
+                "stall ≥30min: ESCALATE territory; M1 telegram should ping user",
+            ),
+        }
     }
 
     async fn handle_progress_event(&self, event: notify::Event) -> Result<()> {
