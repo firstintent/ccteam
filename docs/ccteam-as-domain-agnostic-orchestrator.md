@@ -411,12 +411,38 @@ danger_command_patterns:                  # 替代 dev 的 git push 拦截
 - 优先级:P0(阻塞泛化) / P1(该做但可后置) / P2(边角)
 ```
 
-发现见下文 §4.3。审计完成日期填到日志:**审计完成日期:2026-05-05**。
+审计完成日期:**2026-05-05**。详细发现见 [`docs/dev-coupling-audit.md`](./dev-coupling-audit.md);本文 §4.3 仅给摘要。
 
-### 4.3 审计发现
+### 4.3 审计发现摘要
 
-(由 §B 步骤填入。审计 PR 完成后,B 步可能反过来要求修订本文档 §1 / §2
-某些条目——一致性优先于线性进度。)
+详细审计报告(20 条发现 / 文件:行号 / 解耦方案 / 优先级)→
+**[`docs/dev-coupling-audit.md`](./dev-coupling-audit.md)**(2026-05-05 完成)。
+
+审计覆盖 `crates/ccteam-core/src/`(9 文件)+ `crates/ccteam-cli/src/`
+(2 文件)+ `crates/ccteam-hooks/src/`(5 文件)+ `crates/ccteam-core/src/
+templates/settings.json` + `phases/`(6 文件)+ 顶层 `CLAUDE.md` 与 `docs/`。
+
+按优先级分布:
+
+| 优先级 | 数量 | 编号 | 含义 |
+|---|---|---|---|
+| **P0 阻塞泛化** | 6 | F1, F2, F3, F4, F12, F13 | 不解耦无法跑非 dev 团队;M4.5.1 必须清完 |
+| **P1 该做但可后置** | 10 | F5, F6, F7, F8, F9, F10, F11, F15, F19, F20 | M4.5 中后段或 M4.6 内做完;延后会让命名内外冲突或文档失真 |
+| **P2 边角** | 3 | F16, F17, F18 | 跟 P0/P1 同 PR 顺手做;不阻塞功能 |
+| **N/A 已是领域无关** | 1 | F14 | 显式排除,避免后续误判 |
+
+**P0 关键路径**:F1(`auto_loop` 字段)+ F2(DAG 由 phase 模板推断)+ F3
+(`FIRST_PHASE` 改 DAG entry node)+ F4(`is_terminal` 改 DAG 终点判断)+
+F12(CLI `--team`)+ F13(`state.json.team` 字段)——这 6 条解耦后,
+ccteam-core 即可跑非 dev 团队。
+
+**§B 元发现(对 §A 的反馈)**:`pub use ... M0_PHASE_DAG, FIRST_PHASE`
+在 `crates/ccteam-core/src/lib.rs:21` 把 dev 假设暴露到 lib 接口表面——
+M4.5.1 是一次 lib API breaking change。按 CLAUDE.md §五.3 不写 backwards-
+compat shim,直接换。这条已写进 §6.3 风险表与详审 §F2。
+
+审计过程中**没有发现**需要修订 §1 责任分界表或 §2 团队扩展契约的位置——
+所有发现都能映射到现有分类。这是抽象切对的好信号。
 
 ---
 
