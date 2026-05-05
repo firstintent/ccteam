@@ -216,6 +216,28 @@ mod tests {
     }
 
     #[test]
+    fn render_role_prompt_includes_dev_and_product_research_team_options() {
+        // M3.7: §2 step-2 (team selection) must mention both dev and
+        // product-research so meta-agent's NL dispatch knows the
+        // catalog of options.
+        let body = render_meta_role_prompt("rob");
+        assert!(
+            body.contains("product-research"),
+            "team selection step must mention product-research",
+        );
+        assert!(
+            body.contains("--team=dev") && body.contains("--team=product-research"),
+            "dispatch examples must show both teams' command shapes",
+        );
+        // The decision-tree wording from task M3.7 must be present —
+        // gives meta-agent NL heuristics for picking dev vs research.
+        assert!(
+            body.contains("不确定要不要做") || body.contains("调研下"),
+            "team-selection heuristics must include the unsure-idea / research signal",
+        );
+    }
+
+    #[test]
     fn bootstrap_meta_project_creates_full_skeleton() {
         isolation();
         let tmp = tempfile::TempDir::new().unwrap();
