@@ -295,16 +295,70 @@ tmux 第一个 pane 再发 Enter。orchestrator 已经在用这条路:
 
 ### 2.2 phase markdown 应该怎么"间接"触发它们
 
-**不要直接写斜杠命令**。如果 phase 真需要 reset / reload,正确做法是
-**ESCALATE 给 orchestrator**:
+**纠正前文一个误导**:之前写过"phase 用 ESCALATE 请 orchestrator 做
+`/exit` reset"。这是错的——**orchestrator 是 Rust 程序,没有 agent,
+读 ESCALATE 只能字符串匹配,看不懂自然语言**。所以"请 orchestrator 触发
+context reset"这种文字它压根理解不了。
+
+正确分工是这样的:
+
+#### 2.2.1 通道 2 命令的真正触发源
+
+| 谁触发 | 怎么触发 | 例子 |
+|---|---|---|
+| **orchestrator deterministic 监控** | 读 progress.jsonl 里 PostToolUse hook 累加的 `context_tokens_used` / `cost_used_usd`,跨阈值就 send-keys | context > 60% → `/exit` + 新 session(tech-design §6.9);cost > $200 → 硬终止 |
+| **orchestrator 安装态变化** | 装/卸 plugin 后 send-keys `/reload-plugins` | M2 自动安装 agent 时 |
+| **director-claude(M1+)** | 短命 claude 解读 progress.jsonl,产出结构化决策事件,orchestrator 据事件 send-keys | 决定下 phase 前先 send `/review-pr`(plugin slash command) |
+| **人** | tmux attach 手动键入 | 调试用 |
+
+#### 2.2.2 ESCALATE 的真正用途 — 用户决策回路,不是命令请求
+
+phase 该用 ESCALATE 的场景是**只有人能决定的事**:spec 不清、关键技术
+选型卡住、外部依赖缺失。**不是用来请求 TUI 命令**——那是 orchestrator
+自己的监控职责。
 
 ```
-ESCALATE: 当前 context 已 70%,继续做 fix phase 风险高,请 orchestrator
-触发 context reset 后重新调度 fix。
+✅ ESCALATE: spec.md 仅含 "mdeditor",无法做技术选型。需澄清:
+   (1) 目标平台?(2) 目标用户?(3) 核心场景?(4) 关键约束?
+
+✅ ESCALATE: fix-loop 已撞 3 轮顶,根本原因疑似 plan-eng 阶段技术选型
+   错误,建议人工 review 后回退到 plan-eng 重做。
+
+❌ ESCALATE: 当前 context 已 70%,请 reset
+   (orchestrator 看 context_tokens_used 自决,不需要 phase 请求)
+
+❌ ESCALATE: 请 send-keys /reload-plugins
+   (phase 不该指挥 orchestrator 做哪条命令)
 ```
 
-orchestrator 的 escalate 处理逻辑(M1+)读到这条,做 send-keys `/exit`
-+ 新 session,而不是让长会话内的 Claude 自己尝试。
+#### 2.2.3 ESCALATE 的字符串语法约定
+
+`crates/ccteam-hooks/src/parse_phase_end.rs` 现在认的是:
+
+```
+ESCALATE: <reason — 自由文本>
+```
+
+orchestrator 默认行为(M0):写 escalation event,phase 标 escalated,停掉
+自动调度。**不解析 reason 内容**;reason 是给人看的(M0 inbox / M1
+Telegram)。**M1+ director-claude 才解读 reason 决定下一步路由**——但即
+使解读了,output 也是结构化 `director_decision` 事件,orchestrator 仍
+做的是字符串路由(看 `next_phase` 字段),不解读 reason。
+
+如果未来要给 ESCALATE 加结构化指令通道(让 phase 显式请求"回退到
+plan-eng"),正确做法是**扩协议**:
+
+```
+ESCALATE: REVERT_TO_PHASE plan-eng — fix-loop 撞顶,根因在选型
+ESCALATE: NEED_USER_INPUT — spec 不清,问题:[...]
+ESCALATE: ABORT — 超出 ccteam 当前能力,人工接手
+```
+
+orchestrator 字符串匹配前缀(`REVERT_TO_PHASE` / `NEED_USER_INPUT` /
+`ABORT`)做对应路由——**仍然是 dumb 路由,仍然不需要 LLM 解读**。这
+扩展未来想做时,要同步 update 三处:`parse-phase-end` 解析、`interfaces.md`
+ESCALATE 语法节、phase 模板里的 ESCALATE 写法示例。M0 不需要,先用自由
+文本。
 
 ---
 
