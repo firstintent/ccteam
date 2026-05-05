@@ -355,6 +355,17 @@ mod parse_escalate_tests {
     }
 
     #[test]
+    fn colon_is_not_a_grammar_separator() {
+        // `ABORT:foo` is bare text — the only documented separators
+        // are em-dash, --, and ` - `. A colon is not a word boundary
+        // for the prefix match, so this should fall through to the
+        // bare-text NEED_USER_INPUT branch.
+        let p = ParsedEscalate::from_reason("ABORT:foo");
+        assert_eq!(p.kind, EscalateKind::NeedUserInput);
+        assert_eq!(p.reason, "ABORT:foo");
+    }
+
+    #[test]
     fn revert_without_separator_keeps_phase_only() {
         // No dash → entire tail is the phase name, reason empty.
         let p = ParsedEscalate::from_reason("REVERT_TO_PHASE plan-eng");

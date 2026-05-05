@@ -22,7 +22,7 @@ use tempfile::TempDir;
 use ccteam_core::{
     bootstrap_project, decide_tick_from_events, next_phase, progress, slugify,
     CcteamPaths, Orchestrator, OrchestratorConfig, PhaseState, PhaseTemplate,
-    ProjectState, RecommendedAgent, TickAction, RECOMMENDED_AGENTS,
+    ProjectState, TickAction, RECOMMENDED_AGENTS,
 };
 
 /// Several tests in this file mutate `CLAUDE_CONFIG_HOME`, which is a
@@ -240,8 +240,3 @@ fn missing_code_reviewer_fails_orchestrator_construction_with_fix_hint() {
     );
 }
 
-/// Helper accessor to keep the top-level `use` list short.
-#[allow(dead_code)]
-fn agent_recommended(name: &str) -> Option<RecommendedAgent> {
-    RECOMMENDED_AGENTS.iter().copied().find(|a| a.subagent_type() == name)
-}
