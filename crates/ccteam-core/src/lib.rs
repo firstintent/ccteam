@@ -13,6 +13,7 @@ pub mod stall;
 pub mod state;
 pub mod templates;
 pub mod tmux;
+pub mod tool_surface;
 
 pub use fix_loop::{FixLoopDecision, FixLoopFrontMatter, FixLoopState};
 pub use orchestrator::{
@@ -37,6 +38,11 @@ pub use templates::{
     SettingsEnv, PHASE_TEMPLATES, PROJECT_SETTINGS_JSON,
 };
 pub use tmux::{pid_is_alive, session_name_for_slug, tmux_available, TmuxSession};
+pub use tool_surface::{
+    ensure_skills_placeholders, link_recommended_agents, link_recommended_agents_into,
+    user_claude_dir, AgentLinkAction, AgentLinkReport, LinkOptions, RecommendedAgent,
+    RECOMMENDED_AGENTS,
+};
 
 /// Crate version, identical to the workspace package version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

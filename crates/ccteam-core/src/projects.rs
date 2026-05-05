@@ -11,6 +11,10 @@ use serde_json::{Map, Value};
 use crate::paths::CcteamPaths;
 use crate::state::ProjectState;
 use crate::templates::{write_project_phase_templates, write_project_settings};
+use crate::tool_surface::{
+    ensure_skills_placeholders, link_recommended_agents_into, user_claude_dir,
+    AgentLinkAction, LinkOptions,
+};
 
 /// Slugify a free-text project request: keep `[a-z0-9]`, collapse other
 /// runs to `-`, trim, lower-case, and cap at 40 chars. When the cap
@@ -116,6 +120,22 @@ pub fn bootstrap_project(
         );
     }
 
+    // M0.5.1 / M0.5.2: register plugin agents under ~/.claude/agents/
+    // and pre-create the skills placeholder directories. Both must be
+    // done **before** the orchestrator's ensure_session triggers
+    // `tmux new-session`, since Claude Code scans agents/ once at
+    // session start (per claude-code-tool-surface.md §1.2.5/6) and
+    // attaches the SKILL.md watcher only to dirs that exist at startup
+    // (§1.2.4). bootstrap_project runs in `ccteam new`, well before
+    // the daemon's ensure_session, so we're inside the safe window.
+    if let Err(err) = setup_tool_surface(&project_dir) {
+        tracing::warn!(
+            project_dir = %project_dir.display(),
+            error = %err,
+            "tool-surface setup failed; phase markdown that depends on plugin agents may not work",
+        );
+    }
+
     let claude_md = project_dir.join("CLAUDE.md");
     if !claude_md.exists() {
         let body = format!(
@@ -138,6 +158,45 @@ pub fn pre_trust_project(project_dir: &Path) -> Result<()> {
         .ok_or_else(|| anyhow!("could not resolve home directory for ~/.claude.json"))?;
     let claude_json = home.join(".claude.json");
     write_trust_entry(&claude_json, project_dir)
+}
+
+/// Symlink the `RECOMMENDED_AGENTS` set into `~/.claude/agents/` and
+/// pre-create the global + project-local skills placeholder dirs. See
+/// the call site in `bootstrap_project` for the timing constraint.
+fn setup_tool_surface(project_dir: &Path) -> Result<()> {
+    let claude = user_claude_dir()?;
+    let reports = link_recommended_agents_into(&claude, LinkOptions::default())?;
+    for r in &reports {
+        match &r.action {
+            AgentLinkAction::Linked => tracing::info!(
+                agent = r.agent.filename,
+                target = %r.target.display(),
+                "linked plugin agent into ~/.claude/agents/",
+            ),
+            AgentLinkAction::AlreadyLinked => tracing::debug!(
+                agent = r.agent.filename,
+                "plugin agent symlink already in place",
+            ),
+            AgentLinkAction::SkippedUserFile => tracing::warn!(
+                agent = r.agent.filename,
+                target = %r.target.display(),
+                "user-authored agent file at target; not overwriting (use `ccteam doctor --install-recommended-agents --force` to replace)",
+            ),
+            AgentLinkAction::Replaced { previous_target } => tracing::warn!(
+                agent = r.agent.filename,
+                previous = %previous_target.display(),
+                "agent symlink already pointed elsewhere; not replacing without --force",
+            ),
+            AgentLinkAction::SkippedSourceMissing { source } => tracing::warn!(
+                agent = r.agent.filename,
+                source = %source.display(),
+                "plugin source missing — install claude-plugins-official to enable this agent",
+            ),
+            AgentLinkAction::DryRun { .. } => {}
+        }
+    }
+    ensure_skills_placeholders(&claude, project_dir)?;
+    Ok(())
 }
 
 /// `pre_trust_project` core, factored out for unit testing with an
@@ -332,6 +391,27 @@ mod tests {
         // No prefixed copies — those live in ~/.ccteam/phases/, not the
         // project tree (which is what the phase prompt references).
         assert!(!phases_dir.join("02-plan-eng.md").exists());
+    }
+
+    #[test]
+    fn bootstrap_project_creates_project_local_skills_placeholder() {
+        // M0.5.2: the project-side `<project>/.claude/skills/` dir must
+        // exist at session start so Claude Code's live SKILL.md monitor
+        // attaches there. Independent of the global `~/.claude/skills/`
+        // path (which `setup_tool_surface` also creates but is harder
+        // to assert here without env-var fiddling).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        bootstrap_project(&paths, "demo", "demo request").unwrap();
+        let skills = paths.project_dir("demo").join(".claude/skills");
+        assert!(
+            skills.is_dir(),
+            "expected {} to exist after bootstrap_project",
+            skills.display(),
+        );
     }
 
     #[test]
