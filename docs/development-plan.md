@@ -13,13 +13,14 @@
 | 里程碑 | 时长 | 主目标 | 关键解锁的痛点 |
 |---|---|---|---|
 | **M0** | 2–3 周 | 单项目 CLI MVP——一句话需求 → 自动跑出能用的代码 | 1, 2, 3, 4, 7, 8, 9 |
+| **M0.5** | 1 周 | 工具触发面闭环——让 Claude Code 全套能力在自治模式下真正可调 | 11(地基)、12(地基) |
 | **M1** | 2 周 | 多项目并发 + Telegram 入口 | 5, 9(强化) |
 | **M2** | 2 周 | Seed Gate 否决无效想法 + Score 客观质量门 | 6, 3(强化) |
 | **M3** | 3 周 | 跨项目记忆(差异化护城河) | 10 |
 | **M4** | 3 周 | Critic Agent 闭环——超越"测试通过=完成" | 3(深化) |
 | **M5** | 3–6 月 | 大型软件长跑能力(对标 Symphony) | 长期 |
 
-**累计**:M0–M4 大约 12–13 周,基本覆盖 requirements.md 所有痛点。M5 进入开放探索期。
+**累计**:M0–M4 大约 13–14 周,基本覆盖 requirements.md 所有痛点。M5 进入开放探索期。
 
 ---
 
@@ -27,21 +28,21 @@
 
 每条痛点应能指出"在哪个里程碑被解决到什么程度":
 
-| 痛点 | M0 | M1 | M2 | M3 | M4 |
-|---|---|---|---|---|---|
-| 1. 想法死于"开始" | 跑通端到端 | — | — | — | — |
-| 2. AI 仍要求当 PM | 跑通自治流水线 | — | Seed 不再问"做不做" | — | Critic 不再问"够不够好" |
-| 3. 测试是黑洞 | tests-pass 即终态 | — | golden-rules + 6 维评分 | — | anti-leniency + WEAK BLOCK |
-| 4. bug 修复无限循环 | fix-loop 上限 3 + escalate | — | — | — | — |
-| 5. 想法多全部烂尾 | — | 多项目并发 + 排队 | — | — | — |
-| 6. 不是每个想法都值得做 | — | — | Seed REJECT/CLARIFY | — | — |
-| 7. 进度不透明 | tmux + progress.jsonl | — | — | — | — |
-| 8. 每步都点允许 | `--dangerously-skip-permissions` | — | — | — | — |
-| 9. AI 团队需要主持 | 守护进程 + tmux long session + CLI `--format json` | Telegram 入口替代 CLI + `ccteam-control` skill(用户自带 claude 当入口) | `ccteam-mcp` MCP server | — | — |
-| 10. 每项目从零开始 | — | — | — | RAG 召回 + 反模式 | — |
-| 11. 关键节点不把控 | L1 架构约束(hooks + required_outputs) | cross-cutting watcher 上线 | 单 critic + dev 隔离;L3 telegram fork 决策 | phase 内 audit 矩阵 + 投票共识 | anti-leniency + WEAK BLOCK |
-| 12. 工作流编排 | phase 主干 + `sub_skills` 字段定义(空允许) | — | sub-skill 自动 trigger + 产物接力 | 新插件按 `skill_intent.yaml` 自动挂载 | — |
-| 13. 并行规模 | phase 模板 `parallelism: solo` 字段(只此一档) | — | `parallelism: agent_team` 启用(implement phase 多角色并行) | `parallelism: multi_session` 启用(大项目子模块独立 session) | 自动并行规模识别 |
+| 痛点 | M0 | M0.5 | M1 | M2 | M3 | M4 |
+|---|---|---|---|---|---|---|
+| 1. 想法死于"开始" | 跑通端到端 | — | — | — | — | — |
+| 2. AI 仍要求当 PM | 跑通自治流水线 | — | — | Seed 不再问"做不做" | — | Critic 不再问"够不够好" |
+| 3. 测试是黑洞 | tests-pass 即终态 | — | — | golden-rules + 6 维评分 | — | anti-leniency + WEAK BLOCK |
+| 4. bug 修复无限循环 | fix-loop 上限 3 + escalate | — | — | — | — | — |
+| 5. 想法多全部烂尾 | — | — | 多项目并发 + 排队 | — | — | — |
+| 6. 不是每个想法都值得做 | — | — | — | Seed REJECT/CLARIFY | — | — |
+| 7. 进度不透明 | tmux + progress.jsonl | — | — | — | — | — |
+| 8. 每步都点允许 | `--dangerously-skip-permissions` | — | — | — | — | — |
+| 9. AI 团队需要主持 | 守护进程 + tmux long session + CLI `--format json` | — | Telegram 入口替代 CLI + `ccteam-control` skill | `ccteam-mcp` MCP server | — | — |
+| 10. 每项目从零开始 | — | — | — | — | RAG 召回 + 反模式 | — |
+| 11. 关键节点不把控 | L1 架构约束(hooks + required_outputs) | **L1 扩展:tools_required + 启动期可达性校验**(没工具不准跑 phase) | cross-cutting watcher 上线 | 单 critic + dev 隔离;L3 telegram fork 决策 | phase 内 audit 矩阵 + 投票共识 | anti-leniency + WEAK BLOCK |
+| 12. 工作流编排 | phase 主干 + `sub_skills` 字段定义(空允许) | **plugin agent 注册 + skill 懒注入**(让 sub_skills 真有得调) | — | sub-skill 自动 trigger + 产物接力 | 新插件按 `skill_intent.yaml` 自动挂载 | — |
+| 13. 并行规模 | phase 模板 `parallelism: solo` 字段(只此一档) | — | — | `parallelism: agent_team` 启用 | `parallelism: multi_session` 启用 | 自动并行规模识别 |
 
 **门槛规则**:某个里程碑若未真正解决其声明的痛点,**不许跳到下一个里程碑**——这是质量门,不是日历推进。
 
@@ -97,7 +98,80 @@
 
 ---
 
-## 3. M1 — 多项目 + Telegram(2 周)
+## 2.5. M0.5 — 工具触发面闭环(1 周)
+
+> 本里程碑由 [docs/claude-code-tool-surface.md](./claude-code-tool-surface.md)
+> 的实测结论催生。M0 happy path 跑通后,我们发现"phase markdown 能编排
+> 什么 / orchestrator 能触发什么"的边界一直靠假设没有契约——把契约钉死
+> 是 M1+ 所有"高级编排"功能的地基。
+
+### 2.5.1 本阶段痛点(M0 跑通后才暴露的盲区)
+
+ccteam 定位是"在 Claude Code 之上、不阉割其能力、自动调用其全套工具",
+但 M0 之后实测发现以下**不让 ccteam 真正落地这条定位的硬障碍**:
+
+1. **plugin agent 装了 plugin 仍然 Task 调不到** —— `pr-review-toolkit`
+   等 plugin 里的 `agents/<name>.md` 不进 Task 全局注册表;`Task(subagent_type="code-reviewer")`
+   报 "Agent type not found",Available 列表只有 5 个内置 subagent。M1.6 cross-cutting
+   watcher、M2.6 sub-skill 自动调度全建立在 plugin agent 真的能调上,这条不
+   解决,后续都是空中楼阁。**(实测确认 2026-05-05,详见 tool-surface §1.2.5)**
+2. **agent 文件不热加载** —— `~/.claude/agents/<name>.md` 在会话启动时一次
+   性扫描,中途 `ln -sf` 无效。**bootstrap_project 必须在 `tmux new-session`
+   之前完成 ln -sf**,这条是硬约束。
+3. **skill 实时监听被白白浪费** —— Claude Code 对 SKILL.md 实时监听,中途
+   写文件立即可调,但前提是顶层 skills 目录会话启动时已存在。M0 没占位,
+   未来 director-claude 想"按 phase 懒注入 skill"会撞上这个边角。
+4. **phase 模板没有工具依赖声明** —— phase markdown 里 @ 引用 plugin agent
+   或 Task subagent,运行时才发现工具不存在,silent fail。orchestrator 应该
+   **启动期就校验**,缺工具直接 fail-fast 告诉用户。
+5. **ESCALATE 自由文本被误用** —— phase 写 "ESCALATE: 请 reset",但
+   orchestrator 是 Rust 程序,看不懂自然语言;却又没有结构化指令通道,
+   导致"phase 想跨层指挥 orchestrator"无路可走。
+6. **没有"工具体检"** —— 用户重装机器、ccteam 升级、plugin 改名后,phase
+   模板里某个 subagent_type 还在不在?M0 没有任何体检命令,问题只在运行
+   时第一次撞上才知道。
+
+### 2.5.2 唯一验收
+
+新建一个项目 →`ccteam new "<brief>"` 自动把所需 plugin agent 链好、skills
+目录占位好、`ccteam doctor --tool-surface` 报 `所有 phase 的 tools_required
+全部可达` →`ccteam start` 跑端到端 happy path,过程中 phase markdown 能成
+功 `Task(subagent_type="code-reviewer")` 自调插件级 review,**全过程没有
+人工 ln -sf 也没有 `/reload-plugins`**。
+
+### 2.5.3 任务清单
+
+| # | 任务 | 验收(可执行) | 依赖 | 对应文档 |
+|---|---|---|---|---|
+| M0.5.1 | `bootstrap_project` ln -sf 推荐 plugin agents | `ccteam new` 在写 settings.json 之后、orchestrator `ensure_session` 之前,把 `tool-surface.md §6.2` 列出的 8 个推荐 agent(`code-reviewer` / `code-architect` / `code-explorer` / `code-simplifier` / `silent-failure-hunter` / `pr-test-analyzer` / `type-design-analyzer` / `comment-analyzer`)`ln -sf` 到 `~/.claude/agents/`;首次跑产生新文件、再次跑幂等;ln -sf 之后启动的 claude session 能成功 `Task(subagent_type="code-reviewer")` | M0.15 | tool-surface §1.2.6 |
+| M0.5.2 | `bootstrap_project` 占位 skills 目录 | `mkdir -p ~/.claude/skills/ <project>/.claude/skills/`(即使空也建);verify session 启动后 SKILL.md 写到这两个目录都能立即被 Skill 工具识别 | — | tool-surface §1.2.4 |
+| M0.5.3 | phase YAML 增 `tools_required` 字段 | front matter 加 `tools_required: { subagents: [...], skills: [...], mcp: [...] }`;`ccteam-core` 解析;**启动期校验**——orchestrator init 时枚举 `~/.claude/agents/`、`~/.claude/skills/`、当前 MCP server,与所有 phase 模板 `tools_required` 交叉比对,缺谁报缺谁 + 给出修复命令(如 `ccteam doctor --install-recommended-agents`) | M0.5.1、M0.5.2 | tool-surface §1.1.3、§6 |
+| M0.5.4 | 结构化 ESCALATE 语法 | `parse-phase-end` 识别三档前缀:`ESCALATE: REVERT_TO_PHASE <name> — <reason>` / `NEED_USER_INPUT — <questions>` / `ABORT — <reason>`;无前缀降级为通用 escalation(等价 NEED_USER_INPUT);三档分别走不同 orchestrator 路由(回退 phase / 进 inbox 等用户 / 永久标 failed);interfaces.md 同步增 ESCALATE grammar 章节 | M0.9 | tool-surface §2.2.3 |
+| M0.5.5 | `ccteam doctor --install-recommended-agents` | 命令对当前已有项目补做 M0.5.1 的 ln -sf;支持 `--dry-run`;不破坏用户手工放在 `~/.claude/agents/` 的自定义 agent | M0.5.1 | — |
+| M0.5.6 | `ccteam doctor --tool-surface` 体检 | 跑出报告:每个 phase 模板 `tools_required` 与当前可达性的交叉表;subagent 列表用启动一个 `claude --dangerously-skip-permissions` headless 子进程跑 `Task(subagent_type="probe-XXX")` 拿 Available 列表反推(或读 `~/.claude/agents/` 直接枚举);MCP / skill 同理;输出 markdown 表格,缺项标红 + 给出修复命令 | M0.5.5 | tool-surface §6.6 |
+| M0.5.7 | 实测回归:plugin agent 端到端 | 在 review phase 模板里加一段 "请 `Task(subagent_type="code-reviewer")` 自检",`ccteam new` → 跑通 review → progress.jsonl 出现 `event: "subagent_done", subagent_type: "code-reviewer"` 事件 | M0.5.1–M0.5.6 | tool-surface §1.1.4 |
+
+### 2.5.4 M0.5 不做的事(scope guard)
+
+- **director-claude watcher**(M1+)—— 本阶段只解决 "工具能调" 的地基,
+  "什么时候该调哪个" 是上层决策,留给 M1
+- **phase 内 sub_skills 自动 trigger**(M2.6)—— 本阶段只补 `tools_required`
+  声明 + 启动期校验,运行期自动调度还是 M2 的事
+- **mid-session 装新 plugin** —— 这条 Claude Code 不让做(实测 §1.2.4),
+  ccteam 不挑战这条边界
+- **重写 `build_phase_prompt` 为 LLM 动态生成** —— 这是把 cache 命中位置
+  搬到没缓存位置,违反 tech-design §6.1。本阶段维持死壳子,内容靠 phase
+  markdown 表达
+
+### 2.5.5 M0.5 风险
+
+| 风险 | 触发场景 | 兜底 |
+|---|---|---|
+| `ln -sf` 与用户手工放的同名 agent 冲突 | 用户已在 `~/.claude/agents/code-reviewer.md` 放了自定义版本 | M0.5.1 检测目标已存在且非软链时跳过并告警;`--force` 才覆盖 |
+| `tools_required` 校验过严 fail-fast 阻塞老项目 | 已经在 M0 跑了一半的项目升级 ccteam 后启动报缺工具 | M0.5.3 校验失败给出 `ccteam doctor --install-recommended-agents` 一键修复;`ccteam start --skip-tool-check` 临时跳过 |
+| 推荐 agent 清单跟 plugin 升级失同步 | plugin 改名 / 删除 agent 文件 | M0.5.6 体检跑出来红;CI 加一条 nightly 跑 `--tool-surface` 提前发现 |
+
+
 
 **唯一验收**:周一在 Telegram 扔 5 个想法 → 周三早上看到 3 个交付 + 2 个还在跑。
 
@@ -203,9 +277,13 @@ M0.6 (orchestrator 主循环)
   │                                                         └─→ M0.12 (fix-loop)
   └─→ M0.13 / M0.14 (stall + cost)
 
-M0.15 ─→ M1.1 (telegram) ─→ M1.2 (多项目) ─→ M1.5 (重启恢复) ─┬─→ M1.6 (cross-cutting watcher) ─→ M1.7 (L3 fork 决策)
-                                                              └─→ M2.1 (Seed) ─→ M2.5 (Critic 隔离) ─┬─→ M2.6 (sub-skill 调度)
-                                                                                                    └─→ M2.7 (agent_team 启用)
+M0.15 ─→ M0.5.1 (ln -sf agents) ─→ M0.5.3 (tools_required 校验) ─→ M0.5.7 (端到端回归)
+        ↓                          ↓
+        M0.5.2 (skills 占位)      M0.5.5 / M0.5.6 (doctor)
+        ↓
+M0.5.7 ─→ M1.1 (telegram) ─→ M1.2 (多项目) ─→ M1.5 (重启恢复) ─┬─→ M1.6 (cross-cutting watcher) ─→ M1.7 (L3 fork 决策)
+                                                                └─→ M2.1 (Seed) ─→ M2.5 (Critic 隔离) ─┬─→ M2.6 (sub-skill 调度)
+                                                                                                       └─→ M2.7 (agent_team 启用)
                                                                                                          ├─→ M3.1 (retro)
                                                                                                          ├─→ M3.6 (audit 矩阵) ─→ M3.7 (投票)
                                                                                                          ├─→ M3.8 (新插件自动挂载)
