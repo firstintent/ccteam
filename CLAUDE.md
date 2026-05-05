@@ -85,10 +85,13 @@ tech-design §6.4 已列,按里程碑装:
 
 调用形态:phase prompt 用 `Task` 工具显式 launch,带 `subagent_type`;**并行多个 agent 时单条消息发多 tool call**(最佳实践 §7.2 Writer/Reviewer)。
 
-### 3.5 Agent Teams(同 session 内并行多 agent)
+### 3.5 Multi-agent 编排(L2 自检层 + sub-skill 调度)
 
-- **何时启用**:phase 内并行(如 implement 同时 backend-dev + frontend-dev),**不是**全局调度。Lead 角色仅限 phase 内——全局调度永远是 orchestrator(tech-design §2.2)
-- **如何启用**:`.claude/settings.json` 的 `env` 段设 `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`(§6.1、§6.3);phase markdown front matter `agent_team:` 列角色
+ccteam 用 multi-agent 编排实现痛点 11 的 L2 自检层 + 痛点 12 的工作流编排。三种形态(详见 tech-design §3.6 / §6.3 / §6.10):
+
+- **Phase 内 agent team**(并行短期):`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` + phase front matter `agent_team:` 列角色;Lead 仅限 phase 内,全局调度永远是 orchestrator
+- **Cross-cutting watcher**(后台长期):`cost-watcher` / `scope-watcher` / `drift-detector` 在 **Stop hook 触发**(每 phase 边界一次,**不**在 PostToolUse 跑);M1 上线
+- **Sub-skill 自动调度**(串行接力):phase front matter `sub_skills:` 列要 trigger 的 plugin agent;orchestrator 按 `phase_start` / `phase_done` 自动调用,产物落 `output_to`,自动作为下 phase 的 `@文件引用`;M2 上线
 - **跨 session 协作**(M3+):用 `ccgram-messaging` skill 走 inter-agent message bus
 
 ### 3.6 Hooks(生命周期触发——ccteam 可观测性命脉)

@@ -21,6 +21,8 @@
 | **跨项目沉淀** | 痛点 10：每个新项目从零开始 | 全局 `~/.ccteam/memory/` + RAG 检索，新项目 Seed 阶段自动召回 |
 | **零交互沙盒** | 痛点 8：每一步都点允许 | 项目级 Docker / 容器隔离 + 全放行 settings.json |
 | **决策点 ≤ 3** | 痛点 2：AI 仍要求我当 PM | 只有不可逆决策（架构、scope 大改、API 形态）才走 escalation |
+| **纵深防御替代人值守** | 痛点 11：关键节点不把控 | L1 架构约束（hooks + required_outputs）+ L2 多 agent 互检 + cross-cutting watcher（议事）+ L3 用户兜底（仅 deadlock 弹）；详见 §3.6 |
+| **pipeline 编排 sub-skill** | 痛点 12：工作流插件靠人手动调 | 9 主干 phase + 每 phase front matter `sub_skills` 字段；orchestrator 自动 trigger，产物自动接力；复用 gstack / claude-plugins-official 的 plugin，不重写；详见 §6.10 |
 
 ---
 
@@ -227,6 +229,10 @@ agent_team:                 # 可选：本 phase 内启用 sub-agent
   - role: backend-dev
   - role: frontend-dev
   - role: reviewer
+sub_skills:                 # 替人编排的 sub-skill（痛点 12；详见 §6.10）
+  - skill: "claude-plugins-official:pr-review-toolkit/agents/code-reviewer"
+    trigger: phase_done       # phase_start | phase_done（M0/M2 仅这两档）
+    output_to: .ccteam/code-review.md
 hooks:
   before: scripts/snapshot-git.sh
   after: scripts/run-golden-rules.sh
@@ -366,18 +372,79 @@ test-run phase
 
 **禁止静默重试**：fix loop 撞 3 次顶绝不静默重置——这是 ccteam 区别于"AI 永远说没事"的承诺。
 
-### 3.6 Quality Gate 与评分
+### 3.6 三层防御协议（Defense in Depth）
 
-**短期（M0-M2）**：单维度——测试全绿才 PASS。理由：用户痛点 3 明确说"测试不过不要交给我"，不要在 MVP 引入主观评分。
+替代旧方案中"人持续在场审查"的能力，用三层独立机制保证质量与方向不偏（呼应痛点 11）：
 
-**中期（M3+）**：引入 Critic phase（独立 Claude Code 子进程，传入实现 + 测试报告，输出评分）。借鉴 gstack-auto 的 6 维加权（Functionality 0.30 / Quality 0.20 / Tests 0.15 / UX 0.10 / Speed 0.15 / Docs 0.10）+ bug penalty。
+#### L1 架构约束（deterministic，写死的红线）
 
-**Anti-leniency 规则**（来自 ccteam-creator 的 Anthropic 研究借鉴）：
-- Critic 不能给所有维度都打高分；至少有一维要被指出问题
-- WEAK 维度直接 BLOCK，不给"勉强通过"
-- Critic 与 dev 是不同的 Claude Code 子进程，禁止 dev 自评
+不与 agent 商量、不可绕过。具体形态：
 
-**预置 CI**：每个项目自带 `.ccteam/golden-rules.py`（抄 ccteam-creator 的 5 项检查 + 项目特定补充），phase `after` hook 调用。
+- **phase 模板 `required_outputs`**——本 phase 必产出物，hook 在 Stop 前 verify；缺则不视为 phase_done
+- **危险命令拦截**——`PostToolUse(Bash matcher)` 拦截 `git push.*` / `rm -rf /` / deploy 脚本（详见 §6.2）
+- **scope budget**——超出 plan-eng.md 声明 scope 的实现尝试由 scope-watcher（L2）触发 BLOCK
+- **不可改 invariant**——`.ccteam/` 之外的元数据不许 ccteam 自动改
+
+**M0 落地**：仅 `required_outputs` 校验 + 危险命令拦截（hook 实现，详见 §6.2）。
+**M2 落地**：加 `golden-rules.py`（5 项基础检查 + 项目特定补充），phase `after` hook 调用。
+
+#### L2 多 agent 互检（stochastic 但多视角）
+
+每 phase 启用相关 audit agent，多视角议事——对应痛点 11 "为什么单 agent 抓不住、必须靠团队议事"。两类 agent 并存：
+
+**Phase 内 audit agent**（短期，仅本 phase 活）：
+
+| 角色 | 视角 | 何时启用 |
+|---|---|---|
+| `architect` | 技术方案合理性 | plan-eng / implement |
+| `critic` | 代码品味、边界 case | review |
+| `designer` | UX、交互（前端项目） | plan-eng / review |
+| `security` | OWASP/STRIDE | review / pre-ship |
+| `scope-watcher` | scope drift（每 phase 检查 spec.md 范围） | 每 phase |
+
+实现复用 §6.3 与 CLAUDE.md §三.4：`claude-plugins-official` 的 `pr-review-toolkit/agents/*.md`、`feature-dev/agents/code-architect.md` 等直接 `@文件引用`，不重写。
+
+**Cross-cutting watcher**（长期后台，跨 phase 跑）：
+- `cost-watcher` — token / 预算累计
+- `drift-detector` — 实现是否偏离 plan-eng
+
+**触发频率纪律（关键）**：cross-cutting watcher **在 phase 边界（Stop hook）运行**，**不**在每个 `PostToolUse` 跑——否则一个 1 小时的 implement phase 会有 100+ 次工具调用，3 个 watcher 共 300+ 次启动，progress.jsonl 灌爆 + 成本难看。
+
+**议事结果**：每个 audit agent 输出 `PASS / CONCERN / BLOCK` 三档：
+- 全 PASS → 自动通过
+- 任意 BLOCK → 进入 fix-cycle（§3.5）或转 L3（视严重度）
+- 有 CONCERN 但无 BLOCK → M2 单 critic 模式直接通过；M3+ 进入投票
+
+**里程碑落地**：
+- **M0**：不启用 audit agent，仅靠 L1 + 测试通过
+- **M1**：cross-cutting watcher 上线（cost-watcher / scope-watcher），Stop hook 触发
+- **M2**：单 critic agent + dev 进程隔离（借鉴 gstack-auto 6 维评分简化版：Functionality 0.30 / Quality 0.20 / Tests 0.15 / UX 0.10 / Speed 0.15 / Docs 0.10 + bug penalty）
+- **M3**：phase 内 audit 矩阵 + 投票 + 共识机制
+- **M4**：anti-leniency（每 audit 至少一项 CONCERN，禁止全维度高分）+ WEAK 维度强制 BLOCK
+
+#### L3 用户 fork 决策（last resort）
+
+仅在 L1 PASS + L2 拍不了板时弹出。**不是 first checkpoint，是 last resort**——痛点 11 主路径是 L1+L2，**不是 L3**。
+
+**触发条件**：
+- L2 至少一个 audit BLOCK 且 fix-cycle 无法修复
+- L2 投票分裂（多数 PASS 但有持续 CONCERN）
+- 用户预设 careful 模式且本 phase 列为关键 fork
+
+**形态**：telegram push（项目摘要 + 各 audit 立场 + 2-3 个推荐选项 + 一句话 tweak），24h 不响应自动通过——不阻塞长跑。
+
+**信任档位**（用户 `~/.ccteam/config.yml` 设）：
+- `yolo` — L3 永不弹（仅 L1 BLOCK 时 escalate）
+- `balanced`（默认）— L3 仅在 L2 投票分裂时弹
+- `careful` — 任何 CONCERN 都弹
+
+**里程碑落地**：M1 telegram bot + 简易 ABC 选项；M3+ 信任档位 + tweak 句注入。
+
+#### 顺序约束
+
+L1 → L2 → L3，不并联。L2 启动前 L1 已通过；L3 启动前 L2 已议事完毕但拍不了板。
+
+> **痛点 11 直接对应**：旧方案靠"人持续在场做品味与方向校准"；ccteam 把它分解到三层独立机制——L1 兜系统性偏差、L2 兜单 agent 偏差、L3 兜前两层都拍不了板的偏差。
 
 ### 3.7 Cross-project Memory（差异化护城河）
 
@@ -818,9 +885,13 @@ orchestrator 通过 `PreToolUse` hook 检测最近一次输入源：若来自人
 
 `async: true` 不能省——同步阻塞会拖慢 PostToolUse 路径。
 
-### 6.3 Agent Teams（phase 内）
+### 6.3 Multi-agent 编排（phase 内并行 + cross-cutting watcher）
 
-在 `implement` 这种复杂 phase 里启用：
+ccteam 用 multi-agent 编排实现痛点 11 的 L2 自检层（详见 §3.6 L2）。两种模式并存：
+
+#### 模式 A：Phase 内 agent team（短期，隔离 audit）
+
+在 `implement` / `review` 这种复杂 phase 里启用 Claude Code 的 Agent Teams 实验特性：
 
 ```bash
 CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 claude -p ...
@@ -835,6 +906,29 @@ phase prompt 显式调用：
 > 让他们并行工作。每 2 次工具调用后写 progress.md。
 
 **注意**：在 tmux 长 session 模式下，主 session 的上下文与 cache 跨 phase 持续存在。每个 phase 启动 sub-agent 仍是独立的——上一 phase 的 sub-agent 已退出，本 phase 重新派发。如果某些 sub-agent 应跨 phase 持续（少见），需在 phase prompt 中显式续命。
+
+#### 模式 B：Cross-cutting watcher（长期后台，跨 phase 跑）
+
+不属于任何单 phase，全程监督：
+
+| Watcher | 关注 | 触发频率 |
+|---|---|---|
+| `cost-watcher` | token / 预算累计与阈值 | 每 phase 边界 |
+| `scope-watcher` | 实现 / 计划是否漂出 spec.md | 每 phase 边界 |
+| `drift-detector` | 实际进度与 plan-eng 偏离度 | 每 phase 边界 |
+
+**实现机制（关键纪律）**：watcher **在 Stop hook 触发**，**不**在每个 `PostToolUse` 触发。理由：一个 1 小时 implement phase 有 100+ 次工具调用，3 个 watcher 共 300+ 次启动会灌爆 progress.jsonl + 成本难看。Stop hook 是天然的 phase 边界，每 phase 启动一次 watcher 已经足够。
+
+**输出协议**：watcher 异步子进程跑完后，输出 `PASS / CONCERN / BLOCK`：
+- PASS → 静默
+- CONCERN → append `progress.jsonl` 一条 `watcher_concern` 事件
+- BLOCK → append `watcher_block` 事件 + 写 `escalation.md`，orchestrator 据此决定是否进 L3
+
+#### 与 Sub-skill 调度的边界
+
+agent（本节）= 在 phase 内或后台**并行**跑的 audit；sub-skill（§6.10）= phase 进入/完成时**串行**调用的工作流单元（如 code-reviewer 跑完输出文件给下个 phase）。两者协作但不重叠：
+- 每个 phase 可同时启用 phase 内 agent team（并行 implement）+ sub-skills（串行 review/qa）+ cross-cutting watcher（后台监督）
+- phase 协议 front matter 同时支持 `agent_team` 和 `sub_skills` 两个字段
 
 ### 6.4 MCP servers
 
@@ -994,6 +1088,66 @@ fi
 ```
 
 `/btw`（by the way）是 Claude Code 内建命令——把消息塞到"待办"，不打断当前推理，claude 完成手头的事后会处理。这一条命令就是注入失败的全部解法，**不**做超时重试 / capture-pane 解析 / kill-restart 多层兜底。
+
+### 6.10 Sub-skill 自动调度（替人编排 plugin）
+
+ccteam 不重写 gstack / claude-plugins-official 的 skill；ccteam 的差异化是**替人 orchestrate 它们的调用时机与产物接力**——直接对应痛点 12。
+
+#### Phase front matter 的 `sub_skills` 字段
+
+呼应 §3.3。每个 phase 在 YAML front matter 列本阶段应自动 trigger 的 sub-skills：
+
+```yaml
+sub_skills:
+  - skill: "claude-plugins-official:pr-review-toolkit/agents/code-reviewer"
+    trigger: phase_done
+    output_to: .ccteam/code-review.md
+  - skill: "claude-plugins-official:security-guidance/hooks/security_reminder_hook.py"
+    trigger: phase_start
+    output_to: .ccteam/security-precheck.md
+```
+
+#### Trigger 时机（M0/M2 仅两档，足够）
+
+| Trigger | 何时跑 | 实现 |
+|---|---|---|
+| `phase_start` | phase prompt 注入前 | orchestrator 把 skill 内容前置到 prompt（或异步先跑产出文件供 phase 引用） |
+| `phase_done` | claude 输出 `PHASE_DONE` 后 | orchestrator 在状态机转移前调用 skill，产物落到 `output_to` |
+
+**M0/M2 不引入 `before_done` 之类需 Stop hook 拦截的 trigger**——那等同于再开一条 fix-cycle 复杂度路径。如未来真有用例（例：claude 写完代码主动跑 lint 后再退出），M3+ 再加。
+
+#### 产物接力（自动化的核心价值）
+
+每个 sub-skill 产物按 `output_to` 落到项目 `.ccteam/` 下。orchestrator 在调度下一 phase 时：
+1. 扫上一 phase 的 `sub_skills` 全部 `output_to` 路径
+2. 把这些路径作为下一 phase prompt 的 `@文件引用` 自动追加
+3. 下一 phase claude 自动读到上游 audit / review 产物
+
+**用户视角**：从头到尾不需要手动复制粘贴任何 skill 产物——这就是痛点 12 的落地。
+
+#### 复用粒度（呼应 CLAUDE.md §三.7）
+
+按需选三种粒度之一：
+- **直接 `@文件引用`**（零安装）——phase 模板里 inline 引用 plugin 文件
+- **拷贝到项目**（冻结版本）——`cp` 到 `~/projects/<slug>/.claude/agents/` 后改
+- **整 plugin 安装**（M2/M3 才考虑）——`/plugin install <name>@claude-plugins-official`
+
+`sub_skills` 字段支持三种粒度——`skill:` 路径既可指向官方仓库（自动按粒度 1）、也可指向项目级（粒度 2）、也可是已安装 plugin 的命令（粒度 3）。orchestrator 解析时按路径前缀分发。
+
+#### 新插件如何接入（Phase 协议的可扩展性）
+
+社区出新插件时，作者无须改 ccteam 代码——只需提供：
+1. 一份 `skill_intent.yaml` 描述本 skill 适合的 trigger（`phase_start` / `phase_done`）和典型 output 形态
+2. 推荐的挂载 phase（plan-eng / implement / review / ship 等）
+
+ccteam 在 Seed phase 后扫一次 `~/.claude/plugins/.../skill_intent.yaml`，按推荐挂载点把 skill 加到对应 phase 模板的 `sub_skills` 列表（M3+ 自动化；M0-M2 手动维护 phase 模板）。
+
+#### 与 §6.3 Multi-agent 编排的边界
+
+- **`agent_team`（§6.3）** = phase 内**并行**跑的 audit/dev sub-agent
+- **`sub_skills`（本节）** = phase 进入或完成时**串行**调用的工作流单元，产物落文件给下游用
+
+两个字段在 phase front matter 共存、互不冲突。
 
 ---
 

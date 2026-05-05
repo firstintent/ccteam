@@ -39,6 +39,8 @@
 | 8. 每步都点允许 | `--dangerously-skip-permissions` | — | — | — | — |
 | 9. AI 团队需要主持 | 守护进程 + tmux long session | Telegram 入口替代 CLI | — | — | — |
 | 10. 每项目从零开始 | — | — | — | RAG 召回 + 反模式 | — |
+| 11. 关键节点不把控 | L1 架构约束(hooks + required_outputs) | cross-cutting watcher 上线 | 单 critic + dev 隔离;L3 telegram fork 决策 | phase 内 audit 矩阵 + 投票共识 | anti-leniency + WEAK BLOCK |
+| 12. 工作流编排 | phase 主干 + `sub_skills` 字段定义(空允许) | — | sub-skill 自动 trigger + 产物接力 | 新插件按 `skill_intent.yaml` 自动挂载 | — |
 
 **门槛规则**:某个里程碑若未真正解决其声明的痛点,**不许跳到下一个里程碑**——这是质量门,不是日历推进。
 
@@ -54,12 +56,12 @@
 |---|---|---|---|---|
 | **W1 — Foundation** |
 | M0.1 | 仓库骨架 | `mkdir orchestrator/ phases/ hooks/ cli/ tmux/`;`pyproject.toml` 可 `pip install -e .` | — | §4 目录现状 |
-| M0.2 | 5 个最小 phase 模板 | `phases/{02-plan-eng,03-implement,04-test-author,05-test-run,06-fix,09-ship}.md` 都带 YAML front matter,可被 orchestrator 解析 | — | §3.3 |
+| M0.2 | 5 个最小 phase 模板 | `phases/{02-plan-eng,03-implement,04-test-author,05-test-run,06-fix,09-ship}.md` 都带 YAML front matter(必含 `name` / `required_inputs` / `required_outputs` / `agent_team` / `sub_skills` 字段——M0 `sub_skills` 列表可空),可被 orchestrator 解析 | — | §3.3、§6.10 |
 | M0.3 | 3 个 hook 脚本 | `progress-append.sh` / `parse-phase-end.sh` / `cost-accumulate.sh`;手动喂 stdin JSON 验证输出 | — | §6.2 |
 | M0.4 | 产出项目 settings.json 模板 | 模板渲染后挂到示例项目,`claude` 启动后 SessionStart hook 写出 ready 标记 | M0.3 | §6.2 |
 | **W2 — Orchestrator** |
 | M0.5 | state.json schema + 原子读写 | `.tmp` + rename;启动校验 schema;损坏走 backup | M0.1 | §5.2 |
-| M0.6 | orchestrator 主循环 | `asyncio` 30s 轮询 + inotify 监听 progress.jsonl;`ccteam start --foreground` 跑得起 | M0.5 | §3.2 |
+| M0.6 | orchestrator 主循环 | `asyncio` 30s 轮询 + inotify 监听 progress.jsonl;`ccteam start --foreground` 跑得起;**解析 phase 模板的 `sub_skills` 字段时,空列表 no-op 不报错**(M2 才真正调度) | M0.5 | §3.2、§6.10 |
 | M0.7 | tmux session 启动 + 重连 | 首启用 `tmux new-session -d ... claude`;重启走 `tmux has-session` + `kill -0 pid` 双重校验 | M0.6 | §6.1 |
 | M0.8 | idle-aware 注入 | tail progress.jsonl 末尾事件;`Stop`/`idle_prompt` → `send-keys`;否则 `/btw` | M0.7 | §6.9 |
 | M0.9 | PHASE_DONE/ESCALATE 解析 + 状态机转移 | Stop hook 解析 claude 最后一行;orchestrator 收到事件后按 §3.2 状态机切换 | M0.8 | §3.2、§4.4 |
@@ -105,8 +107,10 @@
 | M1.3 | inbox/queue/control 协议落地 | 用户用 `echo` 写 `control/reject-<slug>` 真生效;`answer-<slug>.md` 接 CLARIFY 回答 | M1.2 |
 | M1.4 | 项目级 CLAUDE.md 自动生成 | plan phase 后写;reset 时追加"当前进度"节 | M0.10 |
 | M1.5 | 优雅停机 + 重启自恢复 | `ccteam stop` 不杀 session;`ccteam start` 自动 reattach 所有活跃 session | M1.2 |
+| M1.6 | cross-cutting watcher agents(L2 起步) | `cost-watcher` + `scope-watcher` 实现;**Stop hook 触发**(每 phase 边界跑一次,不在 PostToolUse 跑——避免 300+ 次/phase 灌爆);输出 PASS/CONCERN/BLOCK,append `progress.jsonl`;BLOCK 写 `escalation.md` | M1.5 | §3.6 L2、§6.3 模式 B |
+| M1.7 | L3 兜底:telegram fork 决策 | watcher BLOCK 或 fix-loop escalate 时,bot push ABC 选项;24h 默认通过;用户 reply A/B/C 注入下一 phase | M1.1、M1.6 | §3.6 L3 |
 
-**M1 不做**:Seed phase、score、跨项目记忆。
+**M1 不做**:Seed phase、score、跨项目记忆、agent 投票/共识(M3)。
 
 ---
 
@@ -121,8 +125,9 @@
 | M2.3 | Score phase + 6 维加权 | 输出 `scorecard.md` 含 Functionality/Quality/Tests/UX/Speed/Docs + bug penalty | M1.5 |
 | M2.4 | golden-rules.py 集成 | 抄 ccteam-creator 5 项 + 项目特定补充;phase `after` hook 调用,失败阻断 ship | M2.3 |
 | M2.5 | Critic 与 dev 进程隔离(M2 简化版) | Score 阶段单独起子进程读 implement 产物,**禁止** dev 自评 | M2.3 |
+| M2.6 | sub-skill 自动调度 | phase front matter `sub_skills` 被 orchestrator 自动 trigger;两档 trigger(`phase_start` / `phase_done`);产物按 `output_to` 落文件,自动作为下 phase prompt 的 `@文件引用`;复用 `claude-plugins-official:pr-review-toolkit/agents/code-reviewer` 验证一次端到端 | M2.5 | §6.10、§3.3 |
 
-**M2 不做**:RAG 召回(M3)、anti-leniency 严格规则(M4)。
+**M2 不做**:RAG 召回(M3)、anti-leniency 严格规则(M4)、phase 内 audit 矩阵 / 投票(M3)。
 
 ---
 
@@ -137,6 +142,9 @@
 | M3.3 | Seed phase 接 RAG 召回 | top-3 patterns 注入 Seed prompt;命中相似失败项目时 verdict 倾向 REJECT/CLARIFY | M3.2、M2.1 |
 | M3.4 | anti-patterns 库 | REJECT 案例独立 namespace;召回时显式标注"不建议" | M3.1 |
 | M3.5 | claude-mem MCP 接入(可选) | 若稳定则替换自建索引;不稳就跳过 | M3.2 |
+| M3.6 | phase 内 audit 矩阵(L2 升级) | `architect` / `critic` / `designer` / `security` / `scope-watcher` 按 phase 启用清单跑;复用 `claude-plugins-official` 现成 agent | M2.5 | §3.6 L2 |
+| M3.7 | agent 投票与共识机制 | M3.6 audit 输出 PASS/CONCERN/BLOCK;按 `yolo`/`balanced`/`careful` 信任档位决定是否上推 L3;分裂时弹用户 | M3.6、M1.7 | §3.6 L2/L3 |
+| M3.8 | 新插件自动挂载(扩展性) | 扫 `~/.claude/plugins/.../skill_intent.yaml`;按推荐 phase 自动加进 phase 模板 `sub_skills` | M2.6 | §6.10 |
 
 **M3 不做**:跨项目接口契约管理(M5)。
 
@@ -185,14 +193,16 @@ M0.6 (orchestrator 主循环)
   │                                                         └─→ M0.12 (fix-loop)
   └─→ M0.13 / M0.14 (stall + cost)
 
-M0.15 ─→ M1.1 (telegram) ─→ M1.2 (多项目) ─→ M1.5 (重启恢复) ─→ M2.1 (Seed) ─→ M2.5 (Critic 隔离)
-                                                                               ├─→ M3.1 (retro)
-                                                                               └─→ M4.1 (Critic agent)
+M0.15 ─→ M1.1 (telegram) ─→ M1.2 (多项目) ─→ M1.5 (重启恢复) ─┬─→ M1.6 (cross-cutting watcher) ─→ M1.7 (L3 fork 决策)
+                                                              └─→ M2.1 (Seed) ─→ M2.5 (Critic 隔离) ─→ M2.6 (sub-skill 调度)
+                                                                                                      ├─→ M3.1 (retro)
+                                                                                                      ├─→ M3.6 (audit 矩阵) ─→ M3.7 (投票)
+                                                                                                      └─→ M3.8 (新插件自动挂载)
 
 M3.1 ─→ M3.2 (向量索引) ─→ M3.3 (Seed 接 RAG)
 ```
 
-不在关键路径上的(可与主线并行):M1.4(项目 CLAUDE.md)、M2.4(golden-rules)、M4.4(评审自适应)、M3.5(claude-mem MCP)。
+不在关键路径上的(可与主线并行):M1.4(项目 CLAUDE.md)、M2.4(golden-rules)、M4.4(评审自适应)、M3.5(claude-mem MCP)、M3.8(新插件挂载)。
 
 ---
 
