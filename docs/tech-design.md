@@ -406,26 +406,57 @@ L1 → L2 → L3，不并联。L2 启动前 L1 已通过；L3 启动前 L2 已�
 
 ### 3.8 用户接口层
 
-**M0：CLI**
+#### claude session 架构层级(全系统视角)
+
+ccteam 全系统 5 类 claude 会出现的位置——明确"哪些是常驻、哪些是短命、哪些根本不在 ccteam 边界内"。完整图见 [user-guide.md](./user-guide.md)。
+
+| 层 | 是 claude 吗 | 常驻 / 短命 / 外包 | 何时出现 |
+|---|---|---|---|
+| **L0 用户交互层** | **不是 ccteam 的 claude**——是**用户自己的 claude session** 或 CLI / Telegram bot | 外包给原生 Claude Code | 用户主动开 |
+| **L1 编排层**(orchestrator daemon) | 不是(Python asyncio) | 常驻 | ccteam start 后 |
+| **L2 项目级 claude**(每项目一个 tmux session) | 是 | 常驻(长 session) | ccteam new 后 |
+| **L3 phase 内 agent team / subagent** | 是(Task 工具启动) | 短命(phase 内,跑完返回总结即销毁) | M2+ |
+| **L4 multi_session 子模块 claude** | 是(每子模块一个完整 session) | 常驻 | M3+ |
+| **L5 横切短命 claude**(cost-watcher / scope-watcher / drift-detector) | 是 | 短命(Stop hook 触发,跑完即退) | M1+ |
+
+**关键论证**:**ccteam 自始至终不自造 AI**——L1 是 Python,L0 外包给原生 claude。这条原则贯彻到底,避免"ccteam 自己加 ccteam 风格的循环引用"(CLAUDE.md §六)。
+
+#### M0:CLI
+
 ```bash
-ccteam new "做一个本地书签管理器"     # 写 inbox
-ccteam status                          # 查所有项目状态
-ccteam status <slug>                   # 详情
-ccteam logs <slug>                     # 实时 tail stream-json
+ccteam new "做一个本地书签管理器"     # 写 inbox(无 LLM,纯薄壳)
+ccteam ls                              # 查所有项目状态
+ccteam show <slug>                     # 详情
+ccteam progress <slug> --tail          # 实时 tail progress.jsonl
 ccteam answer <slug> "用 PWA"          # 回应 clarify 问题
-ccteam reject <slug>                   # 手动否决
-ccteam start                           # 启动 orchestrator
-ccteam stop                            # 优雅停机
+ccteam attach <slug> / peek <slug>     # 介入 / 瞄一眼
+ccteam start / stop                    # orchestrator 生命周期
 ```
 
-**M1：Telegram bot**
-- 复用 ccteam-creator 提到的 telegram skill 或自己起一个 bot
-- 收消息 → 写 inbox
-- 接 notify → 推送 escalation / shipped
+**M0 关键**:CLI 必须输出 LLM 友好的结构化数据——所有查询命令支持 `--format json`(详见 [interfaces.md §10](./interfaces.md#10-cli-命令签名))。理由:让用户自带 claude 通过 Bash 工具调时不用解析表格。
 
-**M2：Web 仪表盘（可选）**
-- 看项目网格、phase 进度、token 累计
-- 抄 gstack-auto 的 Mission Control，但只读、不接管控
+#### M1:Telegram bot + ccteam-control skill
+
+- **Telegram bot**:复用现成 telegram skill 或自起 bot。收消息 → 写 inbox;接 notify → 推送 escalation / shipped
+- **ccteam-control skill**(`~/.claude/skills/ccteam-control/SKILL.md`):描述 ccteam CLI 命令清单 + 典型工作流 + 何时该 attach vs peek。装一次,**用户所有 claude session 都能秒上手调度 ccteam**(详见 [interfaces.md §11](./interfaces.md#11-ccteam-control-skillm1))
+- **CLARIFY 多轮**:Phase 0 CLARIFY 时,inbox 协议支持多轮问答(M0 单轮 + M1 多轮),用户可通过 telegram 或自己的 claude 持续澄清
+
+#### M2+:ccteam-mcp MCP server
+
+把 `ls` / `show` / `new` / `peek` / `progress` 暴露为 MCP structured tool(详见 [interfaces.md §12](./interfaces.md#12-ccteam-mcp-mcp-server-m2)),用户的 claude 通过 MCP 调比 shell parse 更鲁棒。
+
+#### "用户自带 claude 当入口"——为什么不做 ccteam chat
+
+曾考虑过出一个 `ccteam chat` 命令(临时起一个 meta-claude 做 chat 入口)。**否决**——ccteam **自始不是聊天客户端,是被聊的对象**。让用户开自己的 claude session,装 ccteam-control skill / 调 ccteam-mcp MCP,本质上把 chat 体验外包给原生 Claude Code:
+
+- 零新组件成本
+- 用户的 claude 已带他自己的 memory / 偏好,不需要 ccteam 重训
+- 同一 session 内可让 claude 综合 ccteam + `gh pr list` + `git log` 做联合判断
+- 与 §1 设计原则"ccteam 是 Claude Code 之上的元工具"完全自洽——meta 层也外包给原生 claude
+
+#### Web 仪表盘——不在主线
+
+曾考虑过 M2 Web 仪表盘。**剥离主线**——`ccteam ls --format json` + 用户自带 claude 的对话能力已覆盖"用人话汇报"需求。Web 仪表盘永远在 backlog,不进里程碑(参见 §11 / development-plan §2.2)。
 
 ---
 
@@ -695,16 +726,23 @@ agent（本节）= 在 phase 内或后台**并行**跑的 multi-agent；sub-skil
 
 ### 6.4 MCP servers
 
-ccteam 需要的 MCP：
+#### 消费的 MCP(ccteam 不写,只接)
 
 | MCP | 用途 | 出处 |
 |---|---|---|
-| **Telegram bot** | 通知 + 接收用户消息 | 自己写或用现成 |
+| **Telegram bot** | 通知 + 接收用户消息 | M1 自己写或用现成 |
 | **claude-mem** | 跨项目向量记忆 | M3 引入 |
-| **Playwright** | E2E 测试（前端项目） | 已有 |
+| **Playwright** | E2E 测试(前端项目) | 已有 |
 | **GitHub** | PR 创建、issue 管理 | 可选 M4 |
 
-ccteam 自身不需要写 MCP，但会暴露 ccteam 状态查询作为 MCP（让 Claude Code 在 phase 中能查"我在哪个项目里、当前 phase 是什么"）。
+#### 提供的 MCP:`ccteam-mcp`(M2+,ccteam 自己暴露)
+
+把 `ls` / `show` / `new` / `peek` / `progress` 暴露为 MCP structured tool。**两个消费者**:
+
+1. **用户自带的 Claude Code session**(主消费者)——在任意目录开 `claude`,通过 MCP 调度 ccteam,完成"用对话方式管 ccteam"的体验。这是 §3.8"用户自带 claude 当入口"路径的实现层
+2. **项目级 claude**(次要,phase 内查询)——能查"我在哪个项目里、累计 cost、当前 phase 状态",用于 phase prompt 内自检
+
+完整 tool schema 与协议见 [interfaces.md §12](./interfaces.md#12-ccteam-mcp-mcp-server-m2)。**M0 / M1 不上**——M0 用 CLI `--format json` 让用户的 claude 用 Bash 工具调即可;M2 再上 MCP 提升鲁棒性。
 
 ### 6.5 项目级 CLAUDE.md（每项目自动生成）
 
@@ -739,7 +777,9 @@ orchestrator 在 plan phase 后写入：
 
 ### 6.7 Skills 复用（gstack 模式）
 
-ccteam 的 phase prompt 可以以 Claude Code skill 形式分发：
+ccteam 出两个 skill:
+
+#### `ccteam-phases`(phase prompt 分发,非守护模式 fallback)
 
 ```
 ~/.claude/skills/ccteam-phases/
@@ -749,7 +789,24 @@ ccteam 的 phase prompt 可以以 Claude Code skill 形式分发：
     └── ...
 ```
 
-这样未来用户也能在自己的 Claude Code 里手动喊 `/ccteam-seed`，作为非守护进程模式的 fallback。
+用户在自己的 Claude Code 里手动喊 `/ccteam-seed`,跑单 phase——作为不起 daemon 的 fallback。
+
+#### `ccteam-control`(M1+,用户自带 claude 调度 ccteam 的入口)
+
+```
+~/.claude/skills/ccteam-control/
+└── SKILL.md           # CLI 命令清单 + 典型工作流 + 何时 attach vs peek
+```
+
+**用途**:用户在任意目录开 `claude` → skill 自动激活 → claude 知道:
+- 怎么调 `ccteam ls --format json` 看跨项目状态
+- 怎么调 `ccteam new "..."` 立项(并先多轮澄清)
+- 卡住时综合 `ccteam peek <slug>` + `ccteam progress <slug> --tail` 给用户一句可贴的纠偏 prompt
+- 何时该建议用户 `ccteam attach`(自己介入)vs `ccteam pause`(暂停后再决定)
+
+这是 §3.8"用户自带 claude 当入口"路径的 M1 实现。M2+ 升级为 ccteam-mcp MCP server(§6.4),skill 仍保留作为发现 / 引导层。
+
+完整 SKILL.md 内容契约见 [interfaces.md §11](./interfaces.md#11-ccteam-control-skillm1)。
 
 ### 6.8 透明度与可观测性
 

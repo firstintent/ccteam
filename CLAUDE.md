@@ -8,8 +8,9 @@
 2. `docs/tech-design.md` — 怎么做(架构论证、设计权衡——已固化,**不要重新选型**)
 3. `docs/interfaces.md` — 接口确切长什么样(YAML schema、JSON shape、文件路径、事件类型、命令签名——改协议必须同步本文)
 4. `docs/development-plan.md` — 何时做什么(里程碑任务、依赖图、痛点反向映射、验收门——PR 必须挂某条任务编号)
-5. `docs/claude-code-best-practices.md` — Claude Code 官方最佳实践本地副本(下面 §三所有扩展机制都引用此文件具体章节)
-6. 本文件 — 用哪些扩展机制实现 ccteam,以及具体复用哪些 `claude-plugins-official` 件
+5. `docs/user-guide.md` — 产品形态的承诺(用户视角:装、用、看团队、用自带 claude 当入口、定制工作流——实现的体验与本文不符要 escalate)
+6. `docs/claude-code-best-practices.md` — Claude Code 官方最佳实践本地副本(下面 §三所有扩展机制都引用此文件具体章节)
+7. 本文件 — 用哪些扩展机制实现 ccteam,以及具体复用哪些 `claude-plugins-official` 件
 
 ---
 
@@ -19,6 +20,7 @@
 
 - **被编排者**:每个项目一个 Claude Code 长 session,用 tmux 守护、用 hooks 上报、用 MCP 接外部
 - **编排者**:Python orchestrator(M0)、Telegram bot(M1)、跨项目记忆 RAG(M3)
+- **入口/汇报**:**用户自带的 Claude Code session**(M1+ 装 `ccteam-control` skill / M2+ 通过 `ccteam-mcp` MCP)——ccteam **不做 chat 客户端**,chat 体验外包给原生 Claude Code(详见 tech-design §3.8)
 - **结论**:**严格遵守 Claude Code 最佳实践会让 ccteam 系统更高效**——任何与最佳实践冲突的设计选择必须有 tech-design.md 中的明确反对论证。两个层面都适用:
   - **开发 ccteam 本身时**(本仓库):每次写代码、写 prompt、改架构都先翻 `docs/claude-code-best-practices.md`
   - **ccteam 运行时编排下游 Claude**(产出项目):phase 协议、注入策略、context 管理都要落到最佳实践原则上
@@ -57,8 +59,9 @@
 ### 3.2 Skills(可复用知识与可调用工作流)
 
 - `~/.claude/skills/ccteam-phases/`(tech-design §6.7)——9 个 phase 模板打包成 skill,作为非守护进程模式 fallback
+- `~/.claude/skills/ccteam-control/`(M1+,tech-design §6.7、interfaces §11)——**用户自带 claude 调度 ccteam 的入口 skill**,装一次所有 claude session 自动可见;让用户在任意目录开 claude 就能"用对话方式管 ccteam"
 - 已存在的 `.claude/skills/ccgram-messaging/SKILL.md`——agent-to-agent 通讯能力,M3+ 多 orchestrator 协作时复用
-- **Skill vs Plugin 边界**:phase prompt 是 skill(纯文本知识);带 hook+agent+命令的整套是 plugin
+- **Skill vs Plugin 边界**:phase prompt / CLI 引导是 skill(纯文本知识);带 hook+agent+命令的整套是 plugin
 
 ### 3.3 MCP(连接外部服务)
 
@@ -71,7 +74,7 @@ tech-design §6.4 已列,按里程碑装:
 | Playwright | 按需 | 前端 E2E,phase 内调用 |
 | GitHub | M4+ | PR 创建、issue 同步(优先 `gh` CLI——见最佳实践 §4.3) |
 
-**ccteam 自身不写 MCP server,但应暴露 `ccteam status <slug>` 类查询作为 MCP**——让项目内 Claude 能查"我在哪个 phase / 累计 cost"。
+**ccteam 自身出一个 MCP server `ccteam-mcp`(M2+,tech-design §6.4、interfaces §12)**——`ls`/`show`/`new`/`peek`/`progress`/`pause`/`resume` 暴露为 structured tool。**两个消费者**:① 用户自带 claude session(主——"用对话方式管 ccteam"路径);② 项目内 Claude(次——phase 内自查 cost / phase 状态)。M0/M1 先用 CLI `--format json`,M2 再上 MCP。
 
 ### 3.4 Subagents(隔离上下文,返回总结)
 

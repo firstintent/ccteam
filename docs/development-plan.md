@@ -37,7 +37,7 @@
 | 6. 不是每个想法都值得做 | — | — | Seed REJECT/CLARIFY | — | — |
 | 7. 进度不透明 | tmux + progress.jsonl | — | — | — | — |
 | 8. 每步都点允许 | `--dangerously-skip-permissions` | — | — | — | — |
-| 9. AI 团队需要主持 | 守护进程 + tmux long session | Telegram 入口替代 CLI | — | — | — |
+| 9. AI 团队需要主持 | 守护进程 + tmux long session + CLI `--format json` | Telegram 入口替代 CLI + `ccteam-control` skill(用户自带 claude 当入口) | `ccteam-mcp` MCP server | — | — |
 | 10. 每项目从零开始 | — | — | — | RAG 召回 + 反模式 | — |
 | 11. 关键节点不把控 | L1 架构约束(hooks + required_outputs) | cross-cutting watcher 上线 | 单 critic + dev 隔离;L3 telegram fork 决策 | phase 内 audit 矩阵 + 投票共识 | anti-leniency + WEAK BLOCK |
 | 12. 工作流编排 | phase 主干 + `sub_skills` 字段定义(空允许) | — | sub-skill 自动 trigger + 产物接力 | 新插件按 `skill_intent.yaml` 自动挂载 | — |
@@ -68,7 +68,7 @@
 | M0.9 | PHASE_DONE/ESCALATE 解析 + 状态机转移 | Stop hook 解析 claude 最后一行;orchestrator 收到事件后按 §3.2 状态机切换 | M0.8 | §3.2、§4.4 |
 | M0.10 | context 60% 边界 reset | PostToolUse hook 累加 token;在下一个 phase 边界 `/exit` + 新 session + `.ccteam/CLAUDE.md` 桥接 | M0.9 | §6.9 |
 | **W3 — CLI + Fix-loop + 兜底** |
-| M0.11 | 核心 CLI 命令 | `ccteam new` / `status` / `start` / `attach <slug>` / `resume <slug>` 全部可用 | M0.6 | §3.8、§10.1 |
+| M0.11 | 核心 CLI 命令 | `ccteam new` / `ls` / `show` / `start` / `attach <slug>` / `resume <slug>` / `peek` / `progress` 全部可用;**所有查询命令支持 `--format json`**(`ls --format json` / `show --format json` 必出,schema 见 interfaces §10.3)——为"用户自带 claude 当入口"路径打底 | M0.6 | §3.8、§10.1、§10.3 |
 | M0.12 | fix-loop 集成 ralph-loop Stop hook 模式 | 进入 fix phase 时 orchestrator 写 fix-loop 状态文件;Stop hook 检测到则按 ralph-loop 范式拦截退出 + 重喂同一段 fix prompt;3 次未过则清状态文件,orchestrator 接管 escalate | M0.9 | §3.5(改写) |
 | M0.13 | stall 检测三档软告警 | 5/15/30 min 阈值触发不同等级日志(M0 暂用 stderr,M1 接 telegram) | M0.6 | §6.8 |
 | M0.14 | 成本累计 + 软告警 + 物理上限 | hook 读 transcript_path,parse `usage.*` 累加 → state.json;阈值 $20/$50/$200 三档,$200 真 kill | M0.6 | §6.8 |
@@ -110,8 +110,10 @@
 | M1.5 | 优雅停机 + 重启自恢复 | `ccteam stop` 不杀 session;`ccteam start` 自动 reattach 所有活跃 session | M1.2 |
 | M1.6 | cross-cutting watcher agents(L2 起步) | `cost-watcher` + `scope-watcher` 实现;**Stop hook 触发**(每 phase 边界跑一次,不在 PostToolUse 跑——避免 300+ 次/phase 灌爆);输出 PASS/CONCERN/BLOCK,append `progress.jsonl`;BLOCK 写 `escalation.md` | M1.5 | §3.6 L2、§6.3 模式 B |
 | M1.7 | L3 兜底:telegram fork 决策 | watcher BLOCK 或 fix-loop escalate 时,bot push ABC 选项;24h 默认通过;用户 reply A/B/C 注入下一 phase | M1.1、M1.6 | §3.6 L3 |
+| M1.8 | `ccteam-control` skill 发行 | binary 内嵌 SKILL.md;`ccteam doctor --install-skill` 可写到 `~/.claude/skills/ccteam-control/`;字段约定 + body 必含章节按 interfaces §11 落地;装后用户在任意目录开 claude 能正确调用 `ccteam ls --format json` 等 | M0.11 | §3.8、§6.7、interfaces §11 |
+| M1.9 | 多轮 CLARIFY 协议 | inbox 协议支持同一 slug 多次 `answer-<slug>-<n>.md` 追问;Phase 0 prompt 改成"可多轮澄清直到信息足够再 verdict";telegram bot 通道走通(用户连发多条 message 自动归并到当前 CLARIFY) | M1.1、M1.3 | §4.2 |
 
-**M1 不做**:Seed phase、score、跨项目记忆、agent 投票/共识(M3)。
+**M1 不做**:Seed phase 完整(M2)、score、跨项目记忆、agent 投票/共识(M3)、ccteam-mcp MCP server(M2)。
 
 ---
 
@@ -128,8 +130,9 @@
 | M2.5 | Critic 与 dev 进程隔离(M2 简化版) | Score 阶段单独起子进程读 implement 产物,**禁止** dev 自评 | M2.3 |
 | M2.6 | sub-skill 自动调度 | phase front matter `sub_skills` 被 orchestrator 自动 trigger;两档 trigger(`phase_start` / `phase_done`);产物按 `output_to` 落文件,自动作为下 phase prompt 的 `@文件引用`;复用 `claude-plugins-official:pr-review-toolkit/agents/code-reviewer` 验证一次端到端 | M2.5 | §6.10、§3.3 |
 | M2.7 | `parallelism: agent_team` 启用 | implement phase 模板设 `parallelism: agent_team`;orchestrator 启用 `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`;phase prompt 注入 backend-dev / frontend-dev / reviewer 三角色;Lead 协调下产物落 `.ccteam/<role>-output/` | M2.5 | §3.3、§6.3、§6.11 |
+| M2.8 | `ccteam-mcp` MCP server | binary 出 `ccteam mcp-serve` 子命令(stdio 协议);暴露 `ccteam__ls` / `__show` / `__new` / `__peek` / `__progress` / `__pause` / `__resume` 七个 tool;`ccteam doctor --install-mcp` 写 `~/.claude.json`;装后用户自带 claude 通过 MCP 调度 ccteam 比 Bash 工具更鲁棒;ccteam-control skill body 改为推荐"优先 MCP,fallback Bash" | M1.8 | §3.8、§6.4、interfaces §12 |
 
-**M2 不做**:RAG 召回(M3)、anti-leniency 严格规则(M4)、phase 内 audit 矩阵 / 投票(M3)、`parallelism: multi_session`(M3)。
+**M2 不做**:RAG 召回(M3)、anti-leniency 严格规则(M4)、phase 内 audit 矩阵 / 投票(M3)、`parallelism: multi_session`(M3)、ccteam-mcp 写权限扩展(暂只暴露上述七个,attach/start/stop/memory rebuild 不暴露,见 interfaces §12.3)。
 
 ---
 
@@ -209,7 +212,7 @@ M0.15 ─→ M1.1 (telegram) ─→ M1.2 (多项目) ─→ M1.5 (重启恢复) 
 M3.1 ─→ M3.2 (向量索引) ─→ M3.3 (Seed 接 RAG)
 ```
 
-不在关键路径上的(可与主线并行):M1.4(项目 CLAUDE.md)、M2.4(golden-rules)、M4.4(评审自适应)、M3.5(claude-mem MCP)、M3.8(新插件挂载)。
+不在关键路径上的(可与主线并行):M1.4(项目 CLAUDE.md)、M1.8(ccteam-control skill)、M1.9(多轮 CLARIFY)、M2.4(golden-rules)、M2.8(ccteam-mcp MCP server)、M4.4(评审自适应)、M3.5(claude-mem MCP)、M3.8(新插件挂载)。
 
 **关键路径变化**(因 M3.9):M2.7 → M3.9 成为新关键路径终点之一(痛点 13 最终落地);M2.7 卡住整条 multi-agent 速度并行链。
 

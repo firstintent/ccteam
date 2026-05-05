@@ -635,10 +635,64 @@ ccteam new --mode yolo "需求"          # 覆盖默认 trust_mode
 ### 10.3 查询状态
 
 ```bash
-ccteam ls                              # 所有项目状态
+ccteam ls                              # 所有项目状态(human 表格)
+ccteam ls --format json                # JSON 输出(给 LLM / 脚本用)
 ccteam show <slug>                     # 单项目详情(含 session 状态、cost、最近 progress)
+ccteam show <slug> --format json       # JSON 输出
 ccteam progress <slug> --tail          # 实时 tail progress.jsonl
 ccteam progress <slug> --phase implement  # 看特定 phase 事件
+```
+
+**`--format json` 是 M0 强制项**——所有查询命令必须支持,以让"用户自带 claude"路径(详见 [tech-design.md §3.8](./tech-design.md#38-用户接口层))通过 Bash 工具调时无需解析表格。
+
+#### `ccteam ls --format json` schema
+
+```json
+{
+  "projects": [
+    {
+      "slug": "bookmark-mgr-a3f9",
+      "current_phase": "implement",
+      "phase_state": "in_flight",
+      "cost_used_usd": 1.23,
+      "context_tokens_used": 412000,
+      "tmux_session": "ccteam-bookmark-mgr-a3f9",
+      "user_attached": false,
+      "age_seconds": 13500,
+      "last_event_ts": "2026-05-04T15:32:00Z",
+      "stall_level": "ok"
+    }
+  ],
+  "orchestrator": {
+    "running": true,
+    "active_count": 1,
+    "max_concurrent": 3
+  }
+}
+```
+
+#### `ccteam show <slug> --format json` schema
+
+是 §2.1 项目级 state.json 的全量 + 派生字段:
+
+```json
+{
+  "state": { /* §2.1 state.json 全量 */ },
+  "phase_history": [
+    {"phase": "00-seed", "verdict": "PASS", "duration_s": 90, "cost_usd": 0.12},
+    {"phase": "01-plan-ceo", "completed_at": "...", "cost_usd": 0.31}
+  ],
+  "recent_events": [ /* progress.jsonl 末尾 50 条 */ ],
+  "artifacts": {
+    "spec": ".ccteam/spec.md",
+    "plan_eng": ".ccteam/plan-eng.md",
+    "implement_report": ".ccteam/implement-report.md"
+  },
+  "stall": {"level": "ok", "silent_seconds": 23},
+  "recommendations": [
+    "若 cost > $50,考虑 attach 检查"
+  ]
+}
 ```
 
 ### 10.4 进入项目
@@ -672,7 +726,105 @@ ccteam doctor                          # 体检:tmux server / claude 可用性 /
 
 ---
 
-## 11. 关键文件路径速查
+## 11. `ccteam-control` skill(M1+)
+
+让用户在自己的 Claude Code session 里调度 ccteam。架构论证见 [tech-design.md §3.8 / §6.7](./tech-design.md#38-用户接口层)。
+
+### 11.1 安装位置
+
+```
+~/.claude/skills/ccteam-control/
+└── SKILL.md
+```
+
+由 ccteam M1 release 通过 `ccteam doctor --install-skill` 写入,或手动 `cp` from binary unpack。装一次,所有 claude session 自动可见。
+
+### 11.2 SKILL.md 字段约定
+
+```yaml
+---
+name: ccteam-control
+description: |
+  Manage ccteam projects from any Claude Code session.
+  Use when the user asks about ccteam status, wants to start a new ccteam project,
+  needs to inspect / pause / resume an active ccteam project, or asks for advice on
+  how to intervene when a project is stuck.
+allowed-tools: [Bash]
+---
+
+(SKILL body)
+```
+
+`description` 字段必须明确"何时激活"——Claude Code 用 description 做 skill 选择决策。
+
+### 11.3 SKILL body 必含章节
+
+| 章节 | 内容 |
+|---|---|
+| **能力清单** | 所有可调 CLI 命令(从 §10 摘录,标注 `--format json` 是默认偏好) |
+| **典型工作流** | 跨项目汇报 / 立项前多轮澄清 / 卡住诊断三类场景的 step-by-step |
+| **决策原则** | 何时建议 `attach`(用户想介入)vs `peek`(只看不动)vs `pause`(暂停后再决定) |
+| **不能做什么** | 不能替用户 attach(tty 交互);不能直接编辑 `~/projects/<slug>/.ccteam/` 元数据(走 control 文件协议) |
+
+### 11.4 与 ccteam-mcp(M2+)的关系
+
+M1 时 skill 让 claude 用 Bash 工具 + `--format json` 调 CLI。M2 ccteam-mcp 上线后:
+
+- skill 仍保留——是 claude 发现"原来可以管 ccteam"的引导层
+- skill body 改为推荐"优先用 mcp__ccteam__* tools,fallback 到 Bash"
+- 老的 Bash 调用方式仍兼容(--format json 永不下线)
+
+---
+
+## 12. `ccteam-mcp` MCP server(M2+)
+
+把 ccteam 状态查询暴露为 MCP structured tool。架构论证见 [tech-design.md §6.4](./tech-design.md#64-mcp-servers)。
+
+### 12.1 注册方式
+
+```json
+// ~/.claude.json 或 ~/.claude/mcp_servers.json
+{
+  "mcpServers": {
+    "ccteam": {
+      "command": "ccteam",
+      "args": ["mcp-serve"],
+      "env": {}
+    }
+  }
+}
+```
+
+由 `ccteam doctor --install-mcp` 写入(M2 release)。`ccteam mcp-serve` 是 binary 子命令,stdio 协议。
+
+### 12.2 暴露的 tool 清单(M2 起步集)
+
+| Tool 名 | 对应 CLI | 入参 | 返回 |
+|---|---|---|---|
+| `ccteam__ls` | `ccteam ls --format json` | `{}` | §10.3 ls JSON schema |
+| `ccteam__show` | `ccteam show <slug> --format json` | `{slug: string}` | §10.3 show JSON schema |
+| `ccteam__new` | `ccteam new "..."` | `{prompt: string, priority?: "low"\|"normal"\|"high", mode?: "yolo"\|"balanced"\|"careful"}` | `{slug: string, workspace: string}` |
+| `ccteam__peek` | `ccteam peek <slug>` | `{slug: string, lines?: number}` | `{capture: string, ts: string}` |
+| `ccteam__progress` | `ccteam progress <slug>` | `{slug: string, phase?: string, last_n?: number}` | `{events: [...]}` |
+| `ccteam__pause` | `ccteam pause <slug>` | `{slug: string}` | `{ok: bool}` |
+| `ccteam__resume` | `ccteam resume <slug>` | `{slug: string}` | `{ok: bool}` |
+
+### 12.3 不暴露的(M2 显式排除)
+
+- `ccteam attach` — tty 交互,MCP 协议不适合
+- `ccteam start / stop` — orchestrator 生命周期管理是 ops 决策,不让 LLM 误调
+- `ccteam memory rebuild` — 重操作,走 CLI
+
+### 12.4 双消费者
+
+| 消费者 | 用途 | 配置位置 |
+|---|---|---|
+| 用户自带 claude session(主) | 用户在任意目录开 claude → 通过 MCP 管 ccteam(详见 tech-design §3.8) | `~/.claude.json`(全局) |
+| 项目级 claude(次) | phase 内自查"我在哪个 phase / 累计多少 cost" | `~/projects/<slug>/.mcp.json`(项目级) |
+
+---
+
+## 13. 关键文件路径速查
 
 | 路径 | 用途 |
 |---|---|
