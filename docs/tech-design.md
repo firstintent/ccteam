@@ -29,59 +29,90 @@
 
 ## 2. 总体架构
 
-### 2.1 进程拓扑
+### 2.1 三层架构(Channel / Interaction / Orchestration)
+
+> **2026-05-06 重要更新**:原"用户接入层"把 Telegram bot 与 CLI / 文件
+> inbox 平铺。复盘 + Telegram-as-agent-IM 的成熟外部参考(Claude Code 官
+> 方 TG / openclaw / hermes-agent)后,把架构改成三层:**channel 是上层
+> 可插拔适配器,user interaction 在 ccteam-managed 长会话上发生,
+> orchestration 是底层稳态**。M1 完工 = User Interaction Layer 全员;
+> Channel Layer 是 M2+ 才上线的适配器,且很可能直接复用现有开源方案
+> (Claude Code 官方 TG channel / 开源 bot 框架),不在 ccteam 主代码库。
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│  用户接入层（异步、非阻塞）                                       │
-│  ┌──────────────┐  ┌────────────┐  ┌──────────────────────────┐  │
-│  │ Telegram bot │  │ ccteam CLI │  │ 文件 inbox（手动 echo）  │  │
-│  └──────┬───────┘  └─────┬──────┘  └──────────┬───────────────┘  │
-└─────────┼─────────────────┼──────────────────┼──────────────────┘
-          │                 │                  │
-          │ 写入            │ 写入             │ 写入
-          ▼                 ▼                  ▼
-   ┌────────────────────────────────────────────────────┐
-   │  ~/.ccteam/inbox/  （文件即消息队列）              │
-   └─────────────────────┬──────────────────────────────┘
-                         │ 轮询
-                         ▼
-   ┌────────────────────────────────────────────────────┐
-   │  ccteam-orchestrator（守护进程，单点）              │
-   │  - 30s 轮询 inbox                                  │
-   │  - 单 GenServer 状态机：claim / dispatch / release │
-   │  - 项目状态：seeded → planned → coding → ...        │
-   │  - workspace 管理 + git worktree                   │
-   │  - phase 调度 + fix loop 上限                      │
-   └─────────────────────┬──────────────────────────────┘
-                         │ tmux send-keys 注入 phase prompt
-                         ▼
-   ┌────────────────────────────────────────────────────┐
-   │  Claude Code 执行实例（tmux 长 session，每项目一个）│
-   │  tmux new-session -d -s ccteam-<slug>              │
-   │      "claude --dangerously-skip-permissions"       │
-   │  ─ orchestrator 用 send-keys 注入下一 phase prompt  │
-   │  ─ 用户随时 `ccteam attach <slug>` 看 / 介入        │
-   │  ─ 同 session 跨 phase 复用 prompt cache            │
-   │  ─ 内部可启用 Agent Teams（dev / reviewer 等）      │
-   │  ─ Hooks 把结构化进度写 progress.jsonl              │
-   └─────────────────────┬──────────────────────────────┘
-                         │ 文件 + git commit + progress.jsonl
-                         ▼
-   ┌────────────────────────────────────────────────────┐
-   │  持久化层                                          │
-   │  ~/projects/<slug>/    项目工作区（git）           │
-   │  ~/projects/<slug>/.ccteam/  状态、artifacts        │
-   │  ~/.ccteam/memory/     跨项目记忆（RAG 索引）       │
-   │  ~/.ccteam/progress/   每项目结构化事件流（hooks）  │
-   └─────────────────────┬──────────────────────────────┘
-                         │ 完成 / 失败 / 需澄清
-                         ▼
-   ┌────────────────────────────────────────────────────┐
-   │  通知层（Telegram MCP / 邮件 / push）               │
-   │  仅在终态或 escalate 时触发                        │
-   └────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│  Channel Layer  (M2+,可插拔,不在 ccteam 主代码库)       │
+│  ┌───────────┐  ┌────────┐  ┌─────────┐  ┌───────────┐  │
+│  │ Telegram  │  │ Feishu │  │ Slack   │  │ ...       │  │
+│  │ adapter   │  │ adapter│  │ adapter │  │ email/SMS │  │
+│  └─────┬─────┘  └────┬───┘  └────┬────┘  └─────┬─────┘  │
+│        │             │           │             │         │
+│  每个 adapter 都是 dumb router:Channel ↔ inbox/outbox    │
+│  无内嵌 LLM(Symphony 反模式禁止);用现成开源方案,不重写 │
+└────────┼─────────────┼───────────┼─────────────┼────────┘
+         │             │           │             │
+         └─────────────┴─────┬─────┴─────────────┘
+                             │ inbox/outbox 文件协议
+                             ▼
+┌──────────────────────────────────────────────────────────┐
+│  User Interaction Layer  (M1 完工范围)                   │
+│                                                          │
+│  ┌──────────────────────┐  ┌─────────────────────────┐  │
+│  │ meta-agent session   │  │ project sessions(N 条)│  │
+│  │ ccteam-meta-<user>   │  │ ccteam-<slug>           │  │
+│  │ - 常驻、永不 terminal│  │ - 每项目一条独立 tmux   │  │
+│  │ - NL 派单 / 跨项目   │  │ - 独立 progress.jsonl   │  │
+│  │   查询 / 监控         │  │ - 独立 phase DAG        │  │
+│  │ - 跨项目 RAG(M4)    │  │ - 独立 context cache    │  │
+│  │ - tmux attach 即对话 │  │ - tmux attach 即对话    │  │
+│  └──────────────────────┘  └─────────────────────────┘  │
+│                                                          │
+│  接入面契约:                                             │
+│  - ~/projects/<slug>/.ccteam/inbox/  &  outbox/          │
+│  - ~/projects/<user>-meta/.ccteam/inbox/  &  outbox/     │
+│  (NL markdown + JSON 元数据,channel 层翻译外部消息进入) │
+└──────────────────────────┬───────────────────────────────┘
+                           │ tmux send-keys / inbox watcher
+                           ▼
+┌──────────────────────────────────────────────────────────┐
+│  Orchestration Layer  (M0 + M0.5 已完工)                 │
+│  - Rust orchestrator daemon(~/.ccteam/ 状态平面)        │
+│  - progress.jsonl 唯一状态事实来源(§5.5)                │
+│  - hooks(§6.2)/ auto_loop(§3.5)/ context reset(§6.9)│
+│  - cost / stall watchers(§6.8)                          │
+│  - tmux session lifecycle(§6.1)                         │
+│  - team abstraction(M3,§3.3)                           │
+└──────────────────────────────────────────────────────────┘
 ```
+
+#### 2.1.1 三层各自的职责边界
+
+| 层 | 谁负责 | 内嵌 LLM? | 何时落地 |
+|---|---|---|---|
+| Channel | 翻译外部消息系统 ↔ inbox/outbox 文件协议;无业务语义 | ❌(Symphony 反模式禁止) | M2+,首选复用开源方案 |
+| User Interaction | LLM 驱动的对话与决策(meta-agent + 项目 session);**所有 NL 理解、任务调度、记忆调用都发生在这一层** | ✅ 但**只通过 ccteam-managed claude session 落地**,不是适配器进程内的 LLM | M0 项目 session ✓;M1 加 meta-agent 与 inbox 协议 |
+| Orchestration | Rust 编排状态机 / 文件系统状态平面 / 进程生命周期 / hooks 反射 | ❌(永远是 Rust) | M0 + M0.5 ✓ |
+
+#### 2.1.2 这个分层解决了什么
+
+1. **避免 Symphony 反模式**:NL 处理只发生在 ccteam-managed claude session
+   一处,channel 适配器是无脑路由(原架构反复踩这个洞)
+2. **Channel 可插拔**:Telegram / Feishu / Slack 互不影响,新平台加一个
+   adapter 即可;M2+ 选型时直接用现成开源 bot 框架,不在 ccteam 主代码
+   库重写
+3. **meta-agent 可以多 channel 接入**:同一 meta-agent session 同时被终
+   端 `tmux attach` + Telegram 群组 + 未来 web 接入,**LLM 状态只有一份**
+4. **M1 工作量收敛**:M1 不需要落任何具体 channel,只把 meta-agent
+   session 跑起来 + 把 inbox/outbox 协议钉死即可;Telegram bot 实现往
+   M2+ 推
+
+#### 2.1.3 进程视图(实施细节)
+
+上面是逻辑分层。**进程视图**对应 §6.1:每条 tmux 长 session(meta-agent
+session + 每个项目 session)是独立 OS 进程;Rust orchestrator 是另一个
+独立进程;channel adapter 进入 M2+ 后又是若干独立进程。所有进程之间用
+**文件系统协议**通信,**不用共享内存 / sockets / IPC**(§5 与 §3.1)。
+进程崩溃只丢自己的进程内存,文件状态留给重启后恢复。
 
 ### 2.2 关键架构决策
 
@@ -406,20 +437,40 @@ L1 → L2 → L3，不并联。L2 启动前 L1 已通过；L3 启动前 L2 已�
 
 ### 3.8 用户接口层
 
+> **2026-05-06 重要更新**:原架构把"用户接入"等同于"用户自己的 daily-driver
+> claude 会话",这个假设包含了"用户必须坐在电脑前"。复盘 + 现代 agent
+> 产品(openclaw / hermes-agent / Claude Code 官方 TG)实践后,改成
+> **meta-agent session(ccteam 自己 manage 的常驻 claude 会话)+ Channel
+> Layer(M2+ 接 Telegram / Feishu 等)**。详见 §2.1 三层架构。
+
 #### claude session 架构层级(全系统视角)
 
-ccteam 全系统 5 类 claude 会出现的位置——明确"哪些是常驻、哪些是短命、哪些根本不在 ccteam 边界内"。完整图见 [user-guide.md](./user-guide.md)。
+ccteam 全系统 6 类 claude 会出现的位置:
 
 | 层 | 是 claude 吗 | 常驻 / 短命 / 外包 | 何时出现 |
 |---|---|---|---|
-| **L0 用户交互层** | **不是 ccteam 的 claude**——是**用户自己的 claude session** 或 CLI / Telegram bot | 外包给原生 Claude Code | 用户主动开 |
-| **L1 编排层**(orchestrator daemon) | 不是(Python asyncio) | 常驻 | ccteam start 后 |
-| **L2 项目级 claude**(每项目一个 tmux session) | 是 | 常驻(长 session) | ccteam new 后 |
+| **L0 Channel Layer** | **不是**(各 channel 适配器进程,无内嵌 LLM,Symphony 反模式禁止) | 适配器进程随用户配置启动 | M2+,大概率复用开源方案 |
+| **L0.5 meta-agent session** | **是**(ccteam-managed 常驻 tmux + claude) | 常驻、永不 terminal | M1 |
+| **L1 编排层**(orchestrator daemon) | 不是(Rust) | 常驻 | ccteam start 后 |
+| **L2 项目级 claude**(每项目一个 tmux session) | 是 | 常驻(长 session,直到 ship/abort) | ccteam new 后 |
 | **L3 phase 内 agent team / subagent** | 是(Task 工具启动) | 短命(phase 内,跑完返回总结即销毁) | M2+ |
-| **L4 multi_session 子模块 claude** | 是(每子模块一个完整 session) | 常驻 | M3+ |
+| **L4 multi_session 子模块 claude** | 是(每子模块一个完整 session) | 常驻 | M4+(reorder 后) |
 | **L5 横切短命 claude**(cost-watcher / scope-watcher / drift-detector) | 是 | 短命(Stop hook 触发,跑完即退) | M1+ |
 
-**关键论证**:**ccteam 自始至终不自造 AI**——L1 是 Python,L0 外包给原生 claude。这条原则贯彻到底,避免"ccteam 自己加 ccteam 风格的循环引用"(CLAUDE.md §六)。
+**关键原则不变**:**ccteam 不在适配器进程内嵌 LLM**——所有 NL 处理都
+落到 ccteam-managed 长会话(L0.5 / L2 / L4)上,channel 层(L0)是
+dumb router。这条贯彻到底,避免 Symphony 多层 agent 反模式
+(CLAUDE.md §六、tech-design §10)。
+
+**meta-agent session 与项目 session 的差异**:
+
+| 维度 | meta-agent session(L0.5) | 项目 session(L2) |
+|---|---|---|
+| 生命周期 | 永不 terminal,跟用户 ccteam 实例同寿 | ship / abort 即终态 |
+| 行为模式 | 事件循环(等输入→处理→等输入)| phase DAG(plan-eng → ... → ship) |
+| 主要工具 | `ccteam-control` skill(M1.8)/ `ccteam-mcp`(M2.8)/ 跨项目 RAG(M4) | 项目级文件操作 / 内嵌 plugin agents(M0.5 已 ln -sf) |
+| context reset | 60% 阈值时压缩对话历史到 conversation-log.md,新 session 桥接(M4.6) | 60% 阈值时把当前 phase 进度写 CLAUDE.md(已有 M0.10) |
+| 用户 attach | `tmux attach -t ccteam-meta-<user>`,直接 NL 对话 | `tmux attach -t ccteam-<slug>`,可介入项目执行 |
 
 #### M0:CLI
 
@@ -435,24 +486,55 @@ ccteam start / stop                    # orchestrator 生命周期
 
 **M0 关键**:CLI 必须输出 LLM 友好的结构化数据——所有查询命令支持 `--format json`(详见 [interfaces.md §10](./interfaces.md#10-cli-命令签名))。理由:让用户自带 claude 通过 Bash 工具调时不用解析表格。
 
-#### M1:Telegram bot + ccteam-control skill
+#### M1:meta-agent session + inbox/outbox 协议加固 + ccteam-control skill
 
-- **Telegram bot**:复用现成 telegram skill 或自起 bot。收消息 → 写 inbox;接 notify → 推送 escalation / shipped
-- **ccteam-control skill**(`~/.claude/skills/ccteam-control/SKILL.md`):描述 ccteam CLI 命令清单 + 典型工作流 + 何时该 attach vs peek。装一次,**用户所有 claude session 都能秒上手调度 ccteam**(详见 [interfaces.md §11](./interfaces.md#11-ccteam-control-skillm1))
-- **CLARIFY 多轮**:Phase 0 CLARIFY 时,inbox 协议支持多轮问答(M0 单轮 + M1 多轮),用户可通过 telegram 或自己的 claude 持续澄清
+> **2026-05-06 reframe**:原 M1 把"Telegram bot 实现"列为核心任务。现在
+> Telegram bot **下沉到 Channel Layer(M2+)**;M1 只交付能跑 NL 对话
+> 的最小集合:meta-agent 长会话 + inbox/outbox 文件协议 + ccteam-control
+> skill。
 
-#### M2+:ccteam-mcp MCP server
+- **meta-agent session**(M1.0,新):ccteam-managed 常驻 tmux session,
+  跑 `claude --dangerously-skip-permissions`,装 `ccteam-control` skill。
+  用户用 `tmux attach -t ccteam-meta-<user>` 在终端 NL 对话,meta-agent
+  调 ccteam CLI 派单 / 查项目 / 跨项目召回(详见 development-plan §3 M1)
+- **inbox/outbox 文件协议**(M1.1):`<session>/.ccteam/inbox/msg-<n>.md`
+  接收 NL 消息,`outbox/reply-<n>.md` 推回应。orchestrator inotify watch
+  inbox,触发 send-keys 注入到对应 session;session 写 outbox,
+  Channel Layer(M2+)读 outbox 推到对应 channel。**M1 不实现具体
+  channel,只把协议钉死**
+- **ccteam-control skill**(M1.8,继续保留):描述 ccteam CLI 命令清单 +
+  典型工作流。**首要 consumer 是 meta-agent session,次要 consumer
+  是用户自己的 daily-driver claude**(详见 [interfaces.md §11](./interfaces.md#11-ccteam-control-skillm1))
+- **CLARIFY 多轮**(M1.9 → 推至 M2):channel 层落地后再设计;M1 用
+  "tmux attach 直接对话"覆盖
 
-把 `ls` / `show` / `new` / `peek` / `progress` 暴露为 MCP structured tool(详见 [interfaces.md §12](./interfaces.md#12-ccteam-mcp-mcp-server-m2)),用户的 claude 通过 MCP 调比 shell parse 更鲁棒。
+#### M2+:Channel adapters + ccteam-mcp MCP server
 
-#### "用户自带 claude 当入口"——为什么不做 ccteam chat
+- **Channel adapter 实现**:Telegram bot / Feishu bot 等。**强烈倾向直接
+  复用开源方案**(Claude Code 官方 TG channel / python-telegram-bot
+  等),做最薄的 adapter 层:订阅外部消息 → 写到对应 session 的 inbox /
+  从 outbox 推到对应 channel。无内嵌 LLM
+- **`ccteam-mcp` MCP server**:把 `ls` / `show` / `new` / `peek` /
+  `progress` 暴露为 MCP structured tool(详见 [interfaces.md §12](./interfaces.md#12-ccteam-mcp-mcp-server-m2));meta-agent 与用
+  户 daily-driver claude 都受益(MCP 比 shell parse 更鲁棒)
 
-曾考虑过出一个 `ccteam chat` 命令(临时起一个 meta-claude 做 chat 入口)。**否决**——ccteam **自始不是聊天客户端,是被聊的对象**。让用户开自己的 claude session,装 ccteam-control skill / 调 ccteam-mcp MCP,本质上把 chat 体验外包给原生 Claude Code:
+#### 为什么"用户自带 daily-driver claude"不再是核心入口
 
-- 零新组件成本
-- 用户的 claude 已带他自己的 memory / 偏好,不需要 ccteam 重训
-- 同一 session 内可让 claude 综合 ccteam + `gh pr list` + `git log` 做联合判断
-- 与 §1 设计原则"ccteam 是 Claude Code 之上的元工具"完全自洽——meta 层也外包给原生 claude
+历史:M0 / M1 计划假设 meta 层外包给用户自己的 claude session。这个假
+设的隐性前提是**用户必须在电脑前**。复盘后发现:
+
+1. **手机 / 离场场景**用户也想 NL 调度——这要求 ccteam 自己 manage
+   一条常驻 claude 会话,channel 层翻译外部消息进入
+2. **多通道收敛**:用户在终端 attach + 在手机 Telegram + 在公司 Slack
+   三处对话,**不能各起一个 LLM 上下文**——必须收敛到一份 meta-agent
+   session
+3. **不在适配器嵌 LLM** 的红线没动——meta-agent 仍然是**一份** claude
+   session,channel 是 dumb router
+
+**用户自带 daily-driver claude 仍然有用**:用户在自己电脑前已经开了一
+个 claude 处理别的事,装 `ccteam-control` skill 后随时可调度 ccteam,
+这条**作为辅助路径保留**,但不是 ccteam 的核心入口。核心入口是
+meta-agent session + Channel Layer。
 
 #### Web 仪表盘——不在主线
 

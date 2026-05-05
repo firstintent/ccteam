@@ -180,23 +180,50 @@ ccteam 定位是"在 Claude Code 之上、不阉割其能力、自动调用其�
 
 ---
 
-## 3. M1 — 多项目 + Telegram(2 周)
+## 3. M1 — meta-agent + 多项目并发(2 周)
 
-**唯一验收**:周一在 Telegram 扔 5 个想法 → 周三早上看到 3 个交付 + 2 个还在跑。
+> **2026-05-06 reframe**:原 M1 主目标是"Telegram bot + 多项目 + Telegram fork
+> 决策"。复盘 + tech-design §2.1 的三层架构定下后,**Telegram bot 实现下沉
+> 到 Channel Layer(M2+),且优先复用开源方案;M1 的核心交付改为
+> meta-agent session + inbox/outbox 协议 + 多项目调度**。这样 M1 完工 =
+> User Interaction Layer 全员到位,channel 层在不在线都能跑(终端 attach
+> 即对话)。
+
+**唯一验收**:在终端跑 `ccteam start`,然后 `tmux attach -t ccteam-meta-<user>`,
+**用 NL 在 meta-agent claude TUI 里说**"做一个 todo cli";meta-agent 用
+ccteam-control 调 `ccteam new`,起项目 session;再说 5 个不同想法,看到 3 个并
+发跑、2 个排队;关掉所有终端,半小时后回来,3 个跑完,在 meta-agent 里 NL 问
+"你们做完了吗",得到正确摘要回答。**全程不需要 Telegram 或任何外部 channel**。
 
 | # | 任务 | 验收 | 依赖 |
 |---|---|---|---|
-| M1.1 | Telegram bot 入口 | bot 收消息写 `~/.ccteam/inbox/`;接 notify 推送 escalation/shipped | M0.15 |
-| M1.2 | 多项目并发调度 | `max_concurrent_projects=3` 准入;超出排队;每项目独立 tmux session | M1.1 |
-| M1.3 | inbox/queue/control 协议落地 | 用户用 `echo` 写 `control/reject-<slug>` 真生效;`answer-<slug>.md` 接 CLARIFY 回答 | M1.2 |
-| M1.4 | 项目级 CLAUDE.md 自动生成 | plan phase 后写;reset 时追加"当前进度"节 | M0.10 |
-| M1.5 | 优雅停机 + 重启自恢复 | `ccteam stop` 不杀 session;`ccteam start` 自动 reattach 所有活跃 session | M1.2 |
-| M1.6 | cross-cutting watcher agents(L2 起步) | `cost-watcher` + `scope-watcher` 实现;**Stop hook 触发**(每 phase 边界跑一次,不在 PostToolUse 跑——避免 300+ 次/phase 灌爆);输出 PASS/CONCERN/BLOCK,append `progress.jsonl`;BLOCK 写 `escalation.md` | M1.5 | §3.6 L2、§6.3 模式 B |
-| M1.7 | L3 兜底:telegram fork 决策 | watcher BLOCK 或 fix-loop escalate 时,bot push ABC 选项;24h 默认通过;用户 reply A/B/C 注入下一 phase | M1.1、M1.6 | §3.6 L3 |
-| M1.8 | `ccteam-control` skill 发行 | binary 内嵌 SKILL.md;`ccteam doctor --install-skill` 可写到 `~/.claude/skills/ccteam-control/`;字段约定 + body 必含章节按 interfaces §11 落地;装后用户在任意目录开 claude 能正确调用 `ccteam ls --format json` 等 | M0.11 | §3.8、§6.7、interfaces §11 |
-| M1.9 | 多轮 CLARIFY 协议 | inbox 协议支持同一 slug 多次 `answer-<slug>-<n>.md` 追问;Phase 0 prompt 改成"可多轮澄清直到信息足够再 verdict";telegram bot 通道走通(用户连发多条 message 自动归并到当前 CLARIFY) | M1.1、M1.3 | §4.2 |
+| M1.0 | **meta-agent session 骨架(新)** | `ccteam doctor --install-meta-agent <user-handle>` 命令落地;创建 `~/projects/<user>-meta/` 目录,写 meta-agent role prompt 到 `.ccteam/CLAUDE.md`(含 dispatch 决策树 + dispatcher-not-worker 行为约束,见 strategic doc §7.2.2 / §7.2.3);ln -sf `ccteam-control` skill;orchestrator 把 meta session 当一种特殊"team type"管(常驻、永不 terminal、事件循环);`ccteam start` 自启 meta session;`tmux attach -t ccteam-meta-<user>` 即 NL 对话入口 | M0.5 | tech-design §2.1 / §3.8 / strategic doc §7 |
+| M1.1 | **inbox/outbox 文件协议加固(改)** | `<session>/.ccteam/inbox/msg-<n>.md`(NL markdown + 顶部 YAML 元数据:source channel / timestamp / user)`<session>/.ccteam/outbox/reply-<n>.md`(同 schema);orchestrator inotify watch inbox,触发 send-keys 注入对应 session(idle 直送 / 忙加 `/btw`);interfaces.md 加协议章节。**M1 不实现具体 channel**,只钉协议 | M1.0 | tech-design §2.1.2 / interfaces.md |
+| M1.2 | 多项目并发调度 | `max_concurrent_projects=3` 准入;超出排队;每项目独立 tmux session;meta session 不计入并发上限(它常驻) | M1.0 | tech-design §6.1 |
+| M1.3 | meta-agent dispatch 端到端 | meta session NL 指令 `"做一个 todo cli"` → meta 用 `ccteam-control` 调 `ccteam new` → 项目 session 启动 → meta 在 tmux pane 看到"项目已派,跟踪中"反馈;5 个连续派单测试串行准入 | M1.0、M1.2、M1.8 | strategic §7.2.2 |
+| M1.4 | 项目级 CLAUDE.md 自动生成 | plan phase 后写;reset 时追加"当前进度"节(已在 M0.10 设计,M1 兑现到 meta session 也享受) | M0.10 | tech-design §6.5 / §6.9 |
+| M1.5 | 优雅停机 + 重启自恢复 | `ccteam stop` 不杀 session(包含 meta session);`ccteam start` 自动 reattach 所有活跃 session(meta + 项目) | M1.2 | tech-design §6.1 |
+| M1.6 | cross-cutting watcher agents(L2 起步) | `cost-watcher` + `scope-watcher` 实现;**Stop hook 触发**(每 phase 边界跑一次,不在 PostToolUse 跑——避免 300+ 次/phase 灌爆);输出 PASS/CONCERN/BLOCK,append `progress.jsonl`;BLOCK 写 `escalation.md` | M1.5 | tech-design §3.6 L2、§6.3 模式 B |
+| M1.7 | **L3 fork 决策走 NL 通道(改)** | watcher BLOCK / fix-loop escalate 时,orchestrator 写 `escalation.md`;meta-agent watcher 检测到 → 在 meta session 用 NL 描述项目卡点 + 备选方案;用户 NL 回复(在 meta session pane 或将来 channel),meta 解析后用 `ccteam-control` 把决策注入对应项目 session 的 inbox。**砍掉旧的 ABC structured push** | M1.6、M1.0 | tech-design §3.6 L3 |
+| M1.8 | `ccteam-control` skill 发行 | binary 内嵌 SKILL.md;`ccteam doctor --install-skill` 写到 `~/.claude/skills/ccteam-control/`;字段约定 + body 必含章节按 interfaces §11 落地;**首要 consumer 是 meta-agent session**(M1.0 自动装);辅助 consumer 是用户自己的 daily-driver claude(用户手动装) | M0.11 | tech-design §3.8、§6.7、interfaces §11 |
 
-**M1 不做**:Seed phase 完整(M2)、score、跨项目记忆、agent 投票/共识(M3)、ccteam-mcp MCP server(M2)。
+**M1 砍掉 / 推后的任务**:
+- ~~M1.1 Telegram bot 入口~~ → **下沉 M2** Channel Layer(优先复用 Claude Code
+  官方 TG channel / 开源 bot 框架,不在 ccteam 主代码库重写)
+- ~~M1.9 多轮 CLARIFY 协议~~ → **推 M2**;M1 用 "tmux attach 直接 NL 对话"覆盖
+  CLARIFY 场景
+
+**M1 不做**:Seed phase 完整(M2)、score、跨项目记忆、agent 投票/共识(M4)、
+ccteam-mcp MCP server(M2)、具体 channel adapter 实现(M2+ 复用开源)。
+
+**M1 风险**:
+
+| 风险 | 触发 | 应对 |
+|---|---|---|
+| meta session 是新概念,M3 团队抽象未上线时怎么落地 | M1 早于 M3,无 `team.yaml` 体系 | M1.0 把 meta-agent 当作 hardcoded special team(orchestrator 内一个 enum 分支),M3 时再泛化进 `team.yaml` |
+| meta session context 涨爆 | 用户跟 meta 聊几周,1M 上限内 reset 60% 阈值仍要触发 | 沿用项目 session 的 context reset 机制;M4.6 落 conversation continuity 之前,M1 简易版用 `~/projects/<user>-meta/.ccteam/CLAUDE.md` 滚动追加 |
+| meta session 错把项目级请求当问答处理 | NL 解析有概率性 | meta-agent role prompt 显式写"任何项目级动作派单前 ESCALATE 一次确认";风险换可控 |
+| M1.0 写 role prompt 时把行为约束漏一条 | strategic §7.2.3 列了三条,实施时漏一条 | M1.0 验收清单显式对照 strategic §7.2.2/§7.2.3 |
 
 ---
 

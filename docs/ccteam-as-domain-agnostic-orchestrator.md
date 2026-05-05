@@ -586,31 +586,44 @@ team 抽象只会让两件事都做不好。
 
 ## 7. Meta-Agent Pattern — ccteam 的最终使用形态
 
-ccteam 当前是"开发团队的编排层",泛化后是"任意 AI 团队的编排层"。但**用户怎么调度
-这些团队**?如果用户每次都直接 `ccteam new --team=<name> "<brief>"` 在终端里手敲,
-ccteam 就只是一个命令行工具,损失了"对话式驱动 AI 工作流"的体验。
+> **2026-05-06 重要更新**:本节原本写 "meta-agent = 用户自己的 daily-driver
+> Claude Code 会话"。但这个假设暗含"用户必须坐在电脑前"——不符合现代
+> agent 产品(openclaw / hermes / Claude Code 官方 TG)的实践。改成
+> **meta-agent = ccteam-managed 常驻 claude 会话,Channel Layer(M2+)
+> 是其上层适配器**。Symphony 反模式的红线没动:**channel 适配器进程内
+> 不嵌 LLM**,所有 NL 处理都收敛到这一份 meta-agent session。
 
-正确形态是 **meta-agent pattern**:用户的日常 Claude Code 会话本身就是 meta-agent,
-它跟用户聊需求、决定派单 / 不派单、调度多个 ccteam-managed team session 干高密度
-工作、汇总结果再跟用户对话。
+### 7.0 三层架构定位(对应 tech-design.md §2.1)
 
-**关键点**:meta-agent **不是 ccteam 内嵌的另一个 LLM 层** —— 那是 tech-design §10
-显式拒绝的 Symphony 多层 agent 反模式。meta-agent **就是用户自己已经在跑的那个 daily
-driver Claude Code 会话**,装上 ccteam 提供的几个集成件之后,自动具备 meta-agent 角色。
+```
+Channel Layer (M2+)        Telegram / Feishu / Slack adapters
+                                          ↕  inbox/outbox 文件协议
+User Interaction (M1)      meta-agent session  +  N 个 project sessions
+                                          ↕  send-keys / inbox watcher
+Orchestration (M0+M0.5)    Rust orchestrator daemon
+```
+
+meta-agent 是 User Interaction Layer 的成员之一,**和项目 session 同等地位**——
+ccteam-managed 长 tmux 会话,跑 `claude --dangerously-skip-permissions`,装
+ccteam-control skill。差别只在生命周期(永不 terminal)与行为模式(事件循
+环 vs phase DAG)。
 
 ### 7.1 已存在零件的角色对位
 
 | ccteam 设计组件 | 在 meta-agent pattern 里扮演 | 对应里程碑 |
 |---|---|---|
-| `ccteam-control` skill | meta-agent 在任何目录都能调用 ccteam 的"指挥棒" | M1.8 |
-| `ccteam-mcp` MCP server | meta-agent 派单的结构化控制面(`ls` / `show` / `new` / `peek` / `progress` / `pause` / `resume`) | M2.8 |
+| meta-agent 常驻 session(`ccteam-meta-<user>`) | NL 入口 + dispatcher 主体 | **M1.0**(新) |
+| inbox/outbox 文件协议 | meta-agent 与 channel layer / 项目 session 之间的接入面 | **M1.1**(改) |
+| `ccteam-control` skill | meta-agent 调用 ccteam CLI 的"指挥棒" | M1.8 |
+| `ccteam-mcp` MCP server | meta-agent 派单的结构化控制面(替代 shell parse) | M2.8 |
 | 跨项目记忆 RAG / claude-mem MCP | meta-agent "上次相似项目"的长期记忆(项目级) | M4(记忆里程碑;reorder 后) |
+| meta-agent conversation log | meta-agent 对话历史的 reset 桥接 | M4.6(新加;见 §7.2.1) |
+| Channel adapters | meta-agent 跨设备 / 跨平台的输入输出代理 | M2+(优先复用开源) |
 | 长 tmux session per project | dev / research / ... 团队的"高密度施工工地" | M0.7 |
 | 团队抽象(`team.yaml` + `--team` CLI) | meta-agent 派单时选择"派给哪支团队" | M3(本文档对应里程碑) |
 
-**结论**:M3(团队抽象)+ M4(跨项目记忆)+ M2(`ccteam-mcp`)+ M1(`ccteam-control`)
-四件齐备,meta-agent pattern 自动可达。**ccteam 不需要单独立"meta-agent 里程碑"**——
-这四个本来就要做。
+**结论**:M1.0 + M1.1(meta-agent + 协议)+ M2.8(`ccteam-mcp`)+ M3(团队抽象)+
+M4(跨项目记忆 + conversation continuity)五件齐备,meta-agent pattern 完整。
 
 ### 7.2 三块 ccteam 现状没显式覆盖的新机制
 
@@ -622,16 +635,17 @@ driver Claude Code 会话**,装上 ccteam 提供的几个集成件之后,自动�
 
 **候选解法**(M4 实现 RAG 时一并考虑):
 
-- **(a) `claude-mem` MCP 在 user namespace** —— RAG index 加一个 `user/` 命名空间,
+- **(a) `~/projects/<user>-meta/.ccteam/conversation-log.md`** —— 滚动 markdown,
+  meta-agent session 启动时加载,phase context 接近 60% 时压缩为摘要 → 重启
+  session 桥接。沿用项目 session 的 context reset 机制(§6.9)
+- **(b) `claude-mem` MCP 在 user namespace** —— RAG index 加一个 `user/` 命名空间,
   专门存 meta-agent 对话摘要。每轮对话结束后 meta-agent 主动写一条 summary
-- **(b) 主动落 `~/.ccteam/meta/conversation-log.md`** —— 滚动 markdown,每次 meta-agent
-  会话开始时读,结束前追加。简单但会膨胀
-- **(c) user-level CLAUDE.md** —— 让用户的 daily driver claude 在 `~/.claude/CLAUDE.md`
-  自动加一段 ccteam 上下文(当前活跃项目列表 / 最近决策),每次会话启动自动加载
+- **(c) 两者结合**:`conversation-log.md` 是 hot path(当前会话内可读),
+  `claude-mem` user namespace 是 cold storage(reset 后召回历史摘要)
 
-**M4 实施时挑一个**——不要拖到 M5。具体哪个最优依赖于 M4 RAG 实现细节。
+**M4.6 实施时挑一个**(推荐 (c) 组合方案,因为分别覆盖 hot / cold 路径)。
 
-#### 7.2.2 dispatch protocol formalization — meta-agent 该怎么派单
+#### 7.2.2 dispatch protocol — meta-agent 该怎么派单
 
 用户说"做一个 todo app",meta-agent 要做的决策链:
 
@@ -642,63 +656,67 @@ driver Claude Code 会话**,装上 ccteam 提供的几个集成件之后,自动�
    之前**完成,避免"用户说一句 → ccteam 起 session → Seed 再问一遍"的双重澄清
 4. **通过 `ccteam-mcp` 派单** —— `ccteam__new(team="dev", brief="...")`
 5. **后续监控** —— `ccteam__progress` / `ccteam__peek` 看进度,关键事件(escalation /
-   completion)由 telegram bot push 给用户
+   completion)经 inbox/outbox 协议触达用户(终端 attach 直接看 / channel layer 推到
+   外部消息系统)
 
-这套流程是个具体的 **prompt + tool-call 组合**,可以打包成 skill。建议在 M2 完成
-`ccteam-mcp` 之后立项 `ccteam-dispatch` skill(详见 §7.3)。
+这套流程是 meta-agent 的核心行为说明书,**M1.0 必须把它写进 meta-agent 的 role
+prompt**(`~/projects/<user>-meta/.ccteam/CLAUDE.md` 或类似位置)。
 
-#### 7.2.3 default meta-agent behavior preset
+#### 7.2.3 default meta-agent behavior preset — dispatcher not worker
 
-`ccteam-control`(M1.8)是**能力 skill** —— 让用户的 claude **能**调度 ccteam。但只
-有能力不够,还要有**行为约束** —— 当用户提项目级请求时,meta-agent 应该是 dispatcher
-不是 worker:**别自己抄起 Edit 工具开干,先 ccteam_new + 派单**。这是个反直觉点:
-Claude Code 默认行为是"用户问什么我都自己上手做",meta-agent 模式要它**克制**。
+`ccteam-control`(M1.8)是**能力**——meta-agent **能**调度 ccteam。但只有能力
+不够,还要有**行为约束**:meta-agent 应该是 dispatcher 不是 worker——**别自己
+抄起 Edit 工具开干,先 ccteam_new + 派单**。这是反直觉点:Claude Code 默认行
+为是"用户问什么我都自己上手做",meta-agent 模式要它**克制**。
 
-打包成 `ccteam-dispatch` skill,内容包括:
+写在 meta-agent role prompt 里(M1.0 交付的一部分):
 
 - **决策树**(§7.2.2 的形式化)
-- **明文克制规则**:"识别到项目级请求时,默认通过 ccteam-mcp 派单,而不是自己写代码 /
-  自己跑研究 / 自己起草营销文案;只有在用户明确说'你直接帮我写 X'时才走 worker 路径"
-- **对话风格约束**:meta-agent 跟用户对话时**不展示 progress 细节**(那是 ccteam 的
+- **明文克制规则**:"识别到项目级请求时,默认通过 `ccteam new` 派单,**不**自己
+  写代码 / 不自己跑研究 / 不自己起草营销文案;只有在用户明确说'你直接帮我写 X'
+  时才走 worker 路径"
+- **对话风格约束**:meta-agent 跟用户对话时**不展示 progress 细节**(那是 ccteam
   CLI / TUI 的活),只汇报里程碑事件
 
 ### 7.3 ccteam 自身需要承担的两件事
 
-虽然 meta-agent **跑在用户的 claude 而不是 ccteam 内部**,但 ccteam 仍然要负责两件事
-让 meta-agent pattern 真正落地:
+让 meta-agent pattern 真正落地,ccteam 仓库里要有:
 
-1. **打包并发行 meta-agent skill 集** —— `ccteam-control` + `ccteam-dispatch` + 推荐
-   的 `claude-mem` 配置,`ccteam doctor --install-meta-agent` 一键装到用户的
-   `~/.claude/skills/`。降低用户进入 meta-agent 模式的成本
-2. **在文档里把 meta-agent pattern 作为 ccteam 的推荐使用方式显式描述** —— 不是"你也
-   可以这么用",而是"**这是 ccteam 设计意图的最终形态**"。M2 文档化(`ccteam-mcp`
-   发行配套)、M3 完善(团队抽象之后才有完整派单菜单)、M4 收尾(meta-agent
-   conversation continuity 落地)
+1. **meta-agent role prompt 模板**(M1.0 交付)—— 放在 ccteam 内嵌资源中,
+   `bootstrap_project --team meta-agent`(或等价路径)写到
+   `~/projects/<user>-meta/.ccteam/CLAUDE.md`。包含 §7.2.2 决策树 + §7.2.3
+   行为约束
+2. **`ccteam doctor --install-meta-agent`**(M1+)—— 给已有 ccteam 实例创建
+   meta-agent session 的工具。等价于 `ccteam new --team=meta-agent --user-handle=<x>`
+   的一次性配置助手
+3. **在产品文档里把 meta-agent pattern 作为推荐使用方式显式描述** —— 不是
+   "你也可以这么用",而是"**这是 ccteam 设计意图的最终形态**"
 
 ### 7.4 与 §3 显式拒绝清单的一致性
 
 meta-agent pattern **不违反** §3 任何一条:
 
-- 不是"ccteam 内嵌 meta-agent"——meta-agent 跑在用户的 claude 进程里,**与 ccteam
-  orchestrator 完全异进程**
-- 不替领域定 done criteria —— meta-agent 把项目派给团队后,完成判定仍由该团队的
-  `team.yaml.completion_signal` 决定(§2.5)
-- 不引入新的 LLM 编排层 —— meta-agent 是用户已有的 claude,ccteam 只是给它装更好的
-  工具集
+- 不是"ccteam 在适配器进程里嵌 LLM"——meta-agent 是 ccteam-managed 长会话,
+  跟项目 session 同等地位,**channel adapter 进程内仍然没有 LLM**(Symphony
+  反模式的红线没动)
+- 不替领域定 done criteria —— meta-agent 把项目派给团队后,完成判定仍由该团队
+  的 `team.yaml.completion_signal` 决定(§2.5)
+- 不引入新的 LLM 编排层 —— meta-agent 是 ccteam 现有 long session 模式的一个
+  实例,不是新概念
 
-如果将来发现某个 meta-agent 行为约束**必须**靠 ccteam 内嵌某个 LLM 才能实现,那是
-信号:回头审视该约束是不是放错位置了——它可能本来就该是某个 phase 模板的事,而
-不是 meta-agent 的事。
+如果将来发现某个 meta-agent 行为约束**必须**靠 channel 适配器内嵌 LLM 才能实
+现,那是信号:回头审视该约束是不是放错位置了——它该写进 meta-agent 的 role
+prompt,而不是适配器代码。
 
 ### 7.5 落点回到里程碑
 
 | 里程碑 | meta-agent pattern 进展 |
 |---|---|
-| M1 | `ccteam-control` skill 上线 → meta-agent 有了"指挥棒" |
-| M2 | `ccteam-mcp` MCP server 上线 + `ccteam-dispatch` skill 起草 → meta-agent 有了结构化派单工具 |
-| M3 | 团队抽象上线 → meta-agent 派单时能选 `--team` |
-| M4 | 跨项目记忆 + conversation continuity 落地 → meta-agent 有了完整记忆 |
-| M5+ | 多团队协作(research → dev pipeline)→ meta-agent 能编排跨团队工作流 |
+| **M1** | meta-agent session 上线(M1.0)+ inbox/outbox 协议加固(M1.1)+ ccteam-control skill 装好(M1.8)→ **终端 attach 即可 NL 对话**,无 channel 也能跑 |
+| M2 | `ccteam-mcp` MCP server + Channel adapter(Telegram 优先,复用开源)→ meta-agent 有结构化派单工具 + 移动端 NL 通道 |
+| M3 | 团队抽象上线 → meta-agent 派单时能选 `--team`(dev / research / ...) |
+| M4 | 跨项目记忆 + conversation continuity(M4.6)→ meta-agent 有完整 hot+cold 记忆 |
+| M5+ | 多团队协作(research → dev pipeline)+ 多 channel 收敛 → meta-agent 编排跨团队工作流,跨设备访问 |
 
 ---
 

@@ -208,6 +208,132 @@ created_at: 2026-05-04T10:23:00Z
 
 orchestrator 每轮(30s)扫描 `control/`,处理后**删除文件**(确保幂等)。
 
+### 3.4 Per-session Inbox / Outbox(M1.1 — channel layer 接入面契约)
+
+> tech-design §2.1 三层架构里 **Channel Layer ↔ User Interaction Layer** 的
+> 接入面契约。channel adapter(Telegram bot 等,M2+)写入 inbox,session 内
+> 的 claude 处理后写入 outbox,channel adapter 把 outbox 推回外部消息系统。
+> **adapter 进程内不嵌 LLM**——所有 NL 解析都在 session 内的 claude 完成。
+
+#### 3.4.1 目录布局
+
+每条 ccteam-managed long session(meta-agent + 项目 sessions)都有自己的 inbox/outbox:
+
+```
+# meta-agent session(M1.0)
+~/projects/<user>-meta/.ccteam/
+├── inbox/
+│   ├── msg-2026-05-06T103000Z-001.md
+│   └── msg-2026-05-06T104215Z-002.md
+└── outbox/
+    ├── reply-2026-05-06T103045Z-001.md
+    └── reply-2026-05-06T104230Z-002.md
+
+# 项目 session
+~/projects/<slug>/.ccteam/
+├── inbox/                # 同 schema,M1.1 起接受 NL 注入
+└── outbox/               # 同 schema,session 写出可被外部消费的回应
+```
+
+文件名:`{msg|reply}-<ISO-timestamp>-<seq>.md`(timestamp 紧凑去冒号,seq 是
+3 位 zero-padded 序号)。原子写入(`.tmp` 先写再 `mv`)。
+
+#### 3.4.2 Inbox 文件 schema
+
+```markdown
+---
+schema_version: 1                      # 协议演进时升;M1 = 1
+source: telegram                        # telegram | feishu | slack | terminal | cli | <adapter-name>
+source_chat_id: "@rob_personal"         # 可选:外部 channel 的会话标识(用于回推路由)
+source_msg_id: "tg-msg-12345"           # 可选:外部消息 ID(用于回推时引用)
+source_user: rob                        # 必选:外部 channel 上的用户标识
+created_at: 2026-05-06T10:30:00Z        # 必选:消息发起时间(以 channel 为准)
+ingested_at: 2026-05-06T10:30:01Z       # 必选:adapter 写入 inbox 时间
+content_type: text                      # text | markdown | image_url | file_path(M2+)
+attachments:                            # 可选:多媒体附件(M2+)
+  - kind: image_url
+    url: https://...
+---
+
+# NL message body
+
+做一个本地书签管理器,离线可用,按域名归类。
+```
+
+**必选字段**:`schema_version` / `source` / `source_user` / `created_at` /
+`ingested_at` / `content_type`。其它**全部可选**——adapter 知道什么填什么。
+
+#### 3.4.3 Outbox 文件 schema
+
+```markdown
+---
+schema_version: 1
+in_reply_to: msg-2026-05-06T103000Z-001.md   # 可选:对应 inbox 文件名(adapter 用来 thread)
+in_reply_to_source_msg_id: "tg-msg-12345"    # 可选:外部 msg id,adapter reply 时用
+target_channels:                              # 可选:adapter 路由提示(空 = 推回 source)
+  - telegram
+created_at: 2026-05-06T10:30:45Z              # session 写出时间
+priority: normal                              # normal | high(escalation 用 high)
+event_kind: reply                             # reply | progress | escalation | shipped | clarify
+---
+
+# NL reply body
+
+收到了。我已经用 `ccteam new` 派单给 dev 团队,slug = bookmark-mgr-a3f9。
+预计 30 分钟内 plan-eng 完成,有 escalation 我会同步。
+```
+
+`event_kind` 决定 adapter 推送优先级:
+- `reply` — 普通对话回应
+- `progress` — phase 推进里程碑(adapter 可降级为静音通知)
+- `escalation` — 需用户决策(adapter 必须可见提醒)
+- `shipped` — 项目终态(adapter 可绑前缀 emoji)
+- `clarify` — phase 内 CLARIFY 问题(adapter 应保持线程上下文)
+
+#### 3.4.4 Adapter 的责任边界
+
+channel adapter(M2+ 各自实现):
+
+1. **入向**:订阅外部消息,翻译成 §3.4.2 schema,原子写入对应 session 的 inbox
+2. **出向**:轮询(或 inotify watch)对应 session 的 outbox,翻译 §3.4.3 schema
+   推到外部消息系统;**推送成功后删除 outbox 文件**(adapter 负责 ack)
+3. **路由**:adapter 维护"外部 channel 上下文 ↔ session"映射(例:Telegram chat
+   id ↔ slug);**映射状态存 adapter 自己的持久化里**,ccteam 不关心
+4. **错误重试**:外部系统不可达时,outbox 文件保留,adapter 重连后追传
+
+**adapter 不允许做的事**:
+- 解析 inbox/outbox 内容做语义判断(那是 session 内 claude 的活)
+- 写 progress.jsonl 或其他 ccteam 状态文件
+- 起任何 LLM 调用(Symphony 反模式禁止)
+
+#### 3.4.5 Orchestrator 怎么处理 inbox
+
+orchestrator 在 session inbox 上挂 inotify。新文件落地时:
+
+1. 读 inbox 文件,提取 body
+2. 检查对应 session 的 idle 状态(progress.jsonl 末尾事件,见 [tool-surface §2.2.1](./claude-code-tool-surface.md))
+3. **idle**:`tmux send-keys` 直接注入 body
+4. **busy**:用 `/btw <body>` 注入(claude 内部排队,phase 跑完处理)
+5. 处理完成后**删除 inbox 文件**(orchestrator 负责 ack)
+6. 追加事件 `{"event":"inbox_consumed","msg_file":"...","session":"..."}` 到
+   progress.jsonl
+
+#### 3.4.6 Session 内 claude 怎么写 outbox
+
+meta-agent session 与项目 session 的 role prompt(`.ccteam/CLAUDE.md`)显式写
+"产出对外消息时用 Write 工具写到 `outbox/reply-<ts>-<seq>.md`,字段按
+interfaces §3.4.3"。具体写哪些事件:
+
+- meta-agent:每条对用户的 NL 回复
+- 项目 session:phase_done / escalation / cost-watcher 告警(由 phase 模板的
+  `outbox_on_phase_done` 字段控制,M3 团队抽象时可定制 per-team)
+
+#### 3.4.7 与 §3.1 全局 inbox 的关系
+
+§3.1 全局 `~/.ccteam/inbox/<ts>.md` 是 M0 的"提想法"入口,**M1 之后保留作为
+备用路径**——用户可以不通过 meta-agent / channel,直接 `echo` 文件到全局 inbox
+让 orchestrator 起项目。M1+ 推荐路径是通过 meta-agent session 的 inbox。
+
 ---
 
 ## 4. Progress.jsonl 事件流
