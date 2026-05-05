@@ -11,10 +11,11 @@ use serde_json::{json, Map, Value};
 
 use ccteam_core::{
     bootstrap_meta_project, bootstrap_project, current_ccteam_bin, install_ccteam_control_skill,
-    link_recommended_agents, pick_unused_slug, user_claude_dir, write_global_phase_templates,
-    AgentLinkAction, AgentLinkReport, CcteamPaths, InstallSkillOptions, LinkOptions,
-    MetaBootstrapReport, PhaseState, PhaseTemplate, ProjectState, SkillInstallAction,
-    ToolSurfaceSnapshot, BUILTIN_SUBAGENTS, PHASE_TEMPLATES,
+    link_recommended_agents, pick_unused_slug, user_claude_dir, write_global_helper_templates,
+    write_global_phase_templates, AgentLinkAction, AgentLinkReport, CcteamPaths,
+    InstallSkillOptions, LinkOptions, MetaBootstrapReport, PhaseState, PhaseTemplate,
+    ProjectState, SkillInstallAction, ToolSurfaceSnapshot, BUILTIN_SUBAGENTS, HELPER_TEMPLATES,
+    PHASE_TEMPLATES,
 };
 use ccteam_core::tmux::TmuxSession;
 
@@ -41,6 +42,7 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
 
     for sub in [
         "phases",
+        "templates",
         "progress",
         "inbox",
         "control",
@@ -56,6 +58,12 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
 
     write_global_phase_templates(&paths.root, opts.force)
         .with_context(|| format!("unpack phase templates to {}", paths.phases_dir().display()))?;
+    write_global_helper_templates(&paths.root, opts.force).with_context(|| {
+        format!(
+            "unpack helper templates to {}",
+            paths.templates_dir().display()
+        )
+    })?;
 
     let bin = current_ccteam_bin().ok();
 
@@ -68,6 +76,11 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
         "✓ unpacked {} phase templates → {}\n",
         PHASE_TEMPLATES.len(),
         paths.phases_dir().display()
+    ));
+    out.push_str(&format!(
+        "✓ unpacked {} helper templates → {}\n",
+        HELPER_TEMPLATES.len(),
+        paths.templates_dir().display()
     ));
     out.push_str("\nhealth check:\n");
     match &claude {
@@ -956,7 +969,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
         let report = run_init(&paths, InitOptions::default()).unwrap();
-        for sub in ["phases", "progress", "inbox", "control"] {
+        for sub in ["phases", "templates", "progress", "inbox", "control"] {
             assert!(
                 paths.root.join(sub).is_dir(),
                 "init must create {}",
@@ -965,7 +978,17 @@ mod tests {
         }
         assert!(paths.phases_dir().join("02-plan-eng.md").is_file());
         assert!(paths.phases_dir().join("09-ship.md").is_file());
+        // M2.4: helper templates land alongside phase templates.
+        assert!(paths
+            .templates_dir()
+            .join("review-with-user-loop.md")
+            .is_file());
+        assert!(paths
+            .templates_dir()
+            .join("kickoff-reverse-interview.md")
+            .is_file());
         assert!(report.contains("phase templates"));
+        assert!(report.contains("helper templates"));
         assert!(report.contains("next"));
     }
 

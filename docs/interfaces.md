@@ -35,6 +35,9 @@
 │   ├── 07-review.md
 │   ├── 08-score.md
 │   └── 09-ship.md
+├── templates/             # M2.4+: phase 可 @ 引用的 prompt 片段(原生 @,orchestrator 不解析)
+│   ├── review-with-user-loop.md
+│   └── kickoff-reverse-interview.md
 ├── control/               # 用户 → orchestrator 控制信号(详见 §3.3)
 ├── memory/                # 跨项目记忆(M3+)
 │   ├── patterns/
@@ -1190,6 +1193,7 @@ orchestrator 识别 `state.team == "meta-agent"` 走 `process_meta_project` 分�
 | `~/.ccteam/queue/<state>/` | 项目状态分桶 |
 | `~/.ccteam/control/` | 用户 → orchestrator 控制信号(详见 §3.3) |
 | `~/.ccteam/phases/` | phase 模板(详见 §5) |
+| `~/.ccteam/templates/` | M2.4+:phase 可 @ 引用的 prompt 片段(`review-with-user-loop.md` / `kickoff-reverse-interview.md`) |
 | `~/.ccteam/memory/` | 跨项目记忆(M3+) |
 | `~/.ccteam/progress/<slug>.jsonl` | 结构化事件流(详见 §4) |
 | `~/.ccteam/log/<slug>/` | stream-json 归档(可选,调试用) |

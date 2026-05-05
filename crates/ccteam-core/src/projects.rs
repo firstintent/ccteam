@@ -10,7 +10,9 @@ use serde_json::{Map, Value};
 
 use crate::paths::CcteamPaths;
 use crate::state::ProjectState;
-use crate::templates::{write_project_phase_templates, write_project_settings};
+use crate::templates::{
+    write_global_helper_templates, write_project_phase_templates, write_project_settings,
+};
 use crate::tool_surface::{
     link_recommended_agents_into, user_claude_dir, AgentLinkAction, LinkOptions,
 };
@@ -113,6 +115,17 @@ pub fn bootstrap_project(
 
     write_project_settings(&project_dir)?;
     write_project_phase_templates(&project_dir)?;
+    // M2.4: ensure ~/.ccteam/templates/ has the helper templates so
+    // any phase markdown's `@~/.ccteam/templates/<name>.md` reference
+    // resolves. Idempotent — no-ops when files already exist, so this
+    // doesn't fight `ccteam init` if the operator ran it first.
+    if let Err(err) = write_global_helper_templates(&paths.root, false) {
+        tracing::warn!(
+            global_dir = %paths.root.display(),
+            error = %err,
+            "could not stamp helper templates into ~/.ccteam/templates/; phase markdown using @-references may fail",
+        );
+    }
     if let Err(err) = pre_trust_project(&project_dir) {
         // Failing to pre-trust is annoying (next launch shows the
         // "Trust this folder?" prompt) but not fatal — log + continue.
@@ -461,6 +474,49 @@ mod tests {
             "expected {} to exist after bootstrap_project",
             skills.display(),
         );
+    }
+
+    #[test]
+    fn bootstrap_project_writes_helper_templates_to_global_dir() {
+        // M2.4: bootstrap_project ensures ~/.ccteam/templates/ is
+        // populated with the embedded helper templates so phase
+        // markdown's `@~/.ccteam/templates/<name>` reference resolves
+        // even when the user skipped `ccteam init`.
+        ensure_isolation();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        bootstrap_project(&paths, "demo", "demo request", "dev").unwrap();
+        let templates = paths.root.join("templates");
+        assert!(
+            templates.join("review-with-user-loop.md").is_file(),
+            "review-with-user-loop.md missing from {}",
+            templates.display(),
+        );
+        assert!(
+            templates.join("kickoff-reverse-interview.md").is_file(),
+            "kickoff-reverse-interview.md missing",
+        );
+    }
+
+    #[test]
+    fn bootstrap_project_helper_templates_do_not_overwrite_user_edits() {
+        ensure_isolation();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        // First bootstrap stamps fresh templates.
+        bootstrap_project(&paths, "demo", "demo request", "dev").unwrap();
+        let path = paths.root.join("templates/review-with-user-loop.md");
+        std::fs::write(&path, "USER EDIT\n").unwrap();
+        // Second project bootstrap (e.g. user runs `ccteam new` again)
+        // must not clobber the user edit.
+        bootstrap_project(&paths, "demo2", "another request", "dev").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "USER EDIT\n");
     }
 
     #[test]

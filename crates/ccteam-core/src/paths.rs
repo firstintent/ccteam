@@ -48,6 +48,14 @@ impl CcteamPaths {
         self.root.join("phases")
     }
 
+    /// `~/.ccteam/templates/` — global helper templates that phase
+    /// markdown can `@`-reference (M2.4, interfaces §5). Distinct from
+    /// `phases/` because helpers are *prompt fragments*, not whole
+    /// phases — they have no front-matter, no DAG position.
+    pub fn templates_dir(&self) -> PathBuf {
+        self.root.join("templates")
+    }
+
     pub fn project_dir(&self, slug: &str) -> PathBuf {
         self.projects_root.join(slug)
     }

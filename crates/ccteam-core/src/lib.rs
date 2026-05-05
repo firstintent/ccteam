@@ -60,8 +60,9 @@ pub use state::{Parallelism, PhaseHistoryEntry, PhaseState, ProjectState};
 pub use team::{RetroFieldKind, RetroFieldSpec, TeamSpec};
 pub use templates::{
     current_ccteam_bin, project_phase_filename, render_project_settings,
-    write_global_phase_templates, write_project_phase_templates, write_project_settings,
-    SettingsEnv, PHASE_TEMPLATES, PROJECT_SETTINGS_JSON,
+    write_global_helper_templates, write_global_phase_templates,
+    write_project_phase_templates, write_project_settings, SettingsEnv, HELPER_TEMPLATES,
+    PHASE_TEMPLATES, PROJECT_SETTINGS_JSON,
 };
 pub use tmux::{pid_is_alive, session_name_for_slug, tmux_available, TmuxSession};
 pub use tool_surface::{
