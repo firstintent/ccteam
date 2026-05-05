@@ -305,6 +305,12 @@ tools_required:                   # M0.5+:phase 内会调用的工具,orchestrat
     - some-skill
   mcp:                            # `mcp__<server>__<tool>` 引用的 MCP server 名
     - playwright
+auto_loop: false                  # 默认 false。true 时 orchestrator 派发后交棒给 Stop hook,
+                                  # 由 hook 反复重喂 prompt 直到 `completion_signal` 出现或撞 `auto_loop_max_iterations`
+                                  # (M3.1:dev 的 fix phase 设 true,research 的 04-primary 也会设 true;mechanism 与 phase 名无关)
+auto_loop_max_iterations: 3       # 自循环硬上限,默认 3。auto_loop=false 时忽略
+completion_signal: TESTS_GREEN    # 自循环退出信号(子串匹配)。auto_loop=true 时必填且非空,
+                                  # auto_loop=false 时可省略
 hooks:                            # phase 级 hook(项目级 hook 在 settings.json,详见 §6)
   before: scripts/snapshot-git.sh
   after: scripts/run-golden-rules.sh

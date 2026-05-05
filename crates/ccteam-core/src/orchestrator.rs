@@ -30,9 +30,6 @@ use crate::state::{PhaseHistoryEntry, PhaseState, ProjectState};
 use crate::tmux::TmuxSession;
 use crate::tool_surface::{user_claude_dir, ToolSurfaceSnapshot};
 
-const FIX_PHASE_NAME: &str = "fix";
-const FIX_LOOP_MAX_ITERATIONS: u32 = 3;
-
 /// M0 linear phase DAG. M2+ widens to fork on test results, sub-skill
 /// scheduling, and (M3) multi-session fan-out / fan-in.
 pub const M0_PHASE_DAG: &[(&str, Option<&str>)] = &[
@@ -490,15 +487,18 @@ impl Orchestrator {
                     // session simply wouldn't exist.
                     self.ensure_session(slug, &mut state)?;
                     self.dispatch_phase(slug, &phase)?;
-                    let target_state = if phase == FIX_PHASE_NAME {
+                    let template = self.templates.iter().find(|t| t.name == phase);
+                    let target_state = if template.is_some_and(|t| t.auto_loop) {
                         // Stop hook (M0.12) drives the loop; orchestrator
                         // only re-enters on phase_done/escalate.
+                        let t = template.expect("auto_loop branch implies template present");
                         let project_dir = self.paths.project_dir(slug);
                         let prompt = progress::build_phase_prompt(&phase);
                         let fl = FixLoopState::new(
                             slug.to_string(),
                             prompt,
-                            FIX_LOOP_MAX_ITERATIONS,
+                            t.auto_loop_max_iterations,
+                            t.completion_signal.clone(),
                         );
                         fix_loop::write(&fix_loop::path_in(&project_dir), &fl)?;
                         PhaseState::FixLocked

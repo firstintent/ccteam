@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 use crate::state::Parallelism;
 use crate::tool_surface::ToolsRequired;
 
+const DEFAULT_AUTO_LOOP_MAX_ITERATIONS: u32 = 3;
+
 /// Phase-internal multi-role agent (M2+; M0 ignores).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentTeamRole {
@@ -79,6 +81,32 @@ pub struct PhaseTemplate {
 
     #[serde(default)]
     pub hooks: PhaseHooks,
+
+    /// When true, the orchestrator hands the loop to the Stop hook on
+    /// dispatch (ralph-loop pattern, tech-design §3.5). The hook
+    /// re-feeds `prompt` until either the assistant prints
+    /// `completion_signal` or `auto_loop_max_iterations` is reached.
+    /// Mechanism is phase-name-agnostic — dev's `fix` phase sets it
+    /// true, research's `04-primary` data-collection phase will also
+    /// set it true.
+    #[serde(default)]
+    pub auto_loop: bool,
+
+    /// Iteration cap when `auto_loop = true`. Defaults to 3 so existing
+    /// dev `fix` phase markdown keeps the same semantics without
+    /// declaring it.
+    #[serde(default = "default_auto_loop_max_iterations")]
+    pub auto_loop_max_iterations: u32,
+
+    /// Substring the assistant must print to break out of the auto-loop.
+    /// Required (non-empty) when `auto_loop = true`; ignored otherwise.
+    /// Validated by `validate_m0`.
+    #[serde(default)]
+    pub completion_signal: String,
+}
+
+fn default_auto_loop_max_iterations() -> u32 {
+    DEFAULT_AUTO_LOOP_MAX_ITERATIONS
 }
 
 impl PhaseTemplate {
@@ -110,6 +138,18 @@ impl PhaseTemplate {
                 "phase `{}` declares parallelism `{:?}`; M0 only supports `solo` (development-plan §2.1)",
                 self.name,
                 self.parallelism,
+            );
+        }
+        if self.auto_loop && self.completion_signal.trim().is_empty() {
+            bail!(
+                "phase `{}` declares `auto_loop: true` but no `completion_signal` — orchestrator can't tell when the loop is done",
+                self.name,
+            );
+        }
+        if self.auto_loop && self.auto_loop_max_iterations == 0 {
+            bail!(
+                "phase `{}` declares `auto_loop: true` with `auto_loop_max_iterations: 0` — that would never enter the loop",
+                self.name,
             );
         }
         Ok(())
@@ -232,5 +272,79 @@ mod tests {
         );
         let t = PhaseTemplate::parse(src).unwrap();
         assert!(t.tools_required.is_empty());
+    }
+
+    #[test]
+    fn auto_loop_defaults_to_false_when_omitted() {
+        let src = concat!(
+            "---\n",
+            "name: implement\n",
+            "parallelism: solo\n",
+            "---\n",
+            "body\n",
+        );
+        let t = PhaseTemplate::parse(src).unwrap();
+        assert!(!t.auto_loop);
+        assert_eq!(t.auto_loop_max_iterations, 3);
+        assert!(t.completion_signal.is_empty());
+        // M0 validation passes — auto_loop=false ignores the empty signal.
+        t.validate_m0().unwrap();
+    }
+
+    #[test]
+    fn auto_loop_explicit_fields_parse_correctly() {
+        let src = concat!(
+            "---\n",
+            "name: fix\n",
+            "parallelism: solo\n",
+            "auto_loop: true\n",
+            "auto_loop_max_iterations: 5\n",
+            "completion_signal: TESTS_GREEN\n",
+            "---\n",
+            "body\n",
+        );
+        let t = PhaseTemplate::parse(src).unwrap();
+        assert!(t.auto_loop);
+        assert_eq!(t.auto_loop_max_iterations, 5);
+        assert_eq!(t.completion_signal, "TESTS_GREEN");
+        t.validate_m0().unwrap();
+    }
+
+    #[test]
+    fn auto_loop_true_without_completion_signal_fails_validation() {
+        let src = concat!(
+            "---\n",
+            "name: fix\n",
+            "parallelism: solo\n",
+            "auto_loop: true\n",
+            "---\n",
+            "body\n",
+        );
+        let t = PhaseTemplate::parse(src).unwrap();
+        let err = t.validate_m0().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("completion_signal"),
+            "got: {err:#}",
+        );
+    }
+
+    #[test]
+    fn auto_loop_true_with_zero_max_iterations_fails_validation() {
+        let src = concat!(
+            "---\n",
+            "name: fix\n",
+            "parallelism: solo\n",
+            "auto_loop: true\n",
+            "auto_loop_max_iterations: 0\n",
+            "completion_signal: TESTS_GREEN\n",
+            "---\n",
+            "body\n",
+        );
+        let t = PhaseTemplate::parse(src).unwrap();
+        let err = t.validate_m0().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("auto_loop_max_iterations"),
+            "got: {err:#}",
+        );
     }
 }

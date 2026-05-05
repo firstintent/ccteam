@@ -80,6 +80,7 @@ impl Fixture {
             self.slug.clone(),
             "请按 @.ccteam/phases/06-fix.md 完成本阶段...".into(),
             3,
+            "TESTS_GREEN".into(),
         );
         state.front.iteration = iter;
         fix_loop::write(&fix_loop::path_in(&self.project_dir), &state).unwrap();
