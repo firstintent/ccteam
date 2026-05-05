@@ -2,6 +2,7 @@
 //! and hook-shared schemas. Consumed by `ccteam-cli` (binary entry) and
 //! `ccteam-hooks` (hook handlers invoked via `ccteam hook ...`).
 
+pub mod cost;
 pub mod fix_loop;
 pub mod orchestrator;
 pub mod paths;
@@ -19,6 +20,7 @@ pub use orchestrator::{
     Orchestrator, OrchestratorConfig, TickAction, FIRST_PHASE, M0_PHASE_DAG,
 };
 pub use projects::{bootstrap_project, pick_unused_slug, slugify};
+pub use cost::{classify as classify_cost, CostLevel, COST_MID_WARN_USD};
 pub use stall::{
     classify as classify_stall, silent_seconds, StallLevel, STALL_ESCALATE_SECONDS,
     STALL_SUSPICIOUS_SECONDS, STALL_WARN_SECONDS,

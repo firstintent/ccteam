@@ -20,6 +20,7 @@ use chrono::{SecondsFormat, Utc};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde_json::{json, Value};
 
+use crate::cost::{self, CostLevel};
 use crate::fix_loop::{self, FixLoopState};
 use crate::paths::CcteamPaths;
 use crate::phases::PhaseTemplate;
@@ -484,14 +485,93 @@ impl Orchestrator {
         );
         let now = Utc::now();
         for (slug, state) in projects {
-            // Stall detection runs first so it observes the pre-tick
-            // state (the act of dispatching may itself update timestamps).
+            // Stall + cost classification first so we observe the
+            // pre-action state. enforce_cost_thresholds may mutate
+            // state and return Some(updated) when it does.
             self.warn_if_stalled(&slug, &state, now);
+            let state = match self.enforce_cost_thresholds(&slug, state)? {
+                Some(updated) => updated,
+                None => continue, // hard-kill terminated this project
+            };
             if let Err(err) = self.process_project(&slug, state) {
                 tracing::error!(slug, error = %err, "project tick failed");
             }
         }
         Ok(())
+    }
+
+    /// Apply the cost-threshold ladder (tech-design §6.8): log soft /
+    /// mid warnings, hard-kill the tmux session and mark the project
+    /// escalated when `cost_used_usd > hard_kill_threshold_usd`.
+    /// Returns `Ok(None)` when the project was hard-killed (caller
+    /// should skip it for the rest of the tick).
+    fn enforce_cost_thresholds(
+        &self,
+        slug: &str,
+        mut state: ProjectState,
+    ) -> Result<Option<ProjectState>> {
+        if is_terminal(&state) {
+            return Ok(Some(state));
+        }
+        match cost::classify(&state) {
+            CostLevel::Ok => {}
+            CostLevel::SoftWarn => tracing::warn!(
+                slug,
+                cost = state.cost_used_usd,
+                "cost ≥${:.0}: soft-warn threshold crossed",
+                state.soft_warn_threshold_usd,
+            ),
+            CostLevel::MidWarn => tracing::error!(
+                slug,
+                cost = state.cost_used_usd,
+                "cost ≥${:.0}: consider attaching",
+                cost::COST_MID_WARN_USD,
+            ),
+            CostLevel::HardKill => {
+                let hard = state.hard_kill_threshold_usd;
+                tracing::error!(
+                    slug,
+                    cost = state.cost_used_usd,
+                    "cost > ${hard}: HARD KILL — terminating tmux session and escalating",
+                );
+                let session = TmuxSession::for_slug(slug);
+                if let Err(err) = session.kill() {
+                    tracing::error!(slug, error = %err, "tmux kill failed during hard-kill");
+                }
+                state.phase_history.push(PhaseHistoryEntry {
+                    phase: state.current_phase.clone(),
+                    status: "escalated".into(),
+                    duration_s: 0,
+                    cost_usd: state.cost_used_usd,
+                });
+                state.phase_state = PhaseState::Idle;
+                state.user_pause_pending = true;
+                let esc_path = self.paths.project_ccteam_dir(slug).join("escalation.md");
+                if let Some(parent) = esc_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let body = format!(
+                    "# Escalation (cost hard kill)\n\nphase: {}\nreason: cost exceeded ${} hard limit (${:.2} used)\n\nrun `ccteam resume <slug>` only after diagnosing why claude was burning budget.\n",
+                    state.current_phase, hard, state.cost_used_usd,
+                );
+                let _ = std::fs::write(&esc_path, body);
+                state.save(&self.paths.project_state(slug))?;
+                progress::append_event(
+                    &self.paths.progress_jsonl(slug),
+                    &json!({
+                        "ts": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                        "event": "escalate",
+                        "reason": format!(
+                            "cost ${:.2} > hard limit ${}",
+                            state.cost_used_usd, hard,
+                        ),
+                        "kind": "cost_hard_kill",
+                    }),
+                )?;
+                return Ok(None);
+            }
+        }
+        Ok(Some(state))
     }
 
     fn warn_if_stalled(&self, slug: &str, state: &ProjectState, now: chrono::DateTime<Utc>) {

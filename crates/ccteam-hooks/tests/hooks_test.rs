@@ -270,6 +270,68 @@ fn cost_accumulate_updates_context_tokens_from_latest_usage() {
 }
 
 #[test]
+fn cost_accumulate_sums_dollars_across_all_assistant_turns() {
+    use ccteam_hooks::cost::{message_cost_usd, scan_transcript};
+    let fx = Fixture::new("cost-sum");
+    fx.write_transcript(&[
+        json!({
+            "type": "message",
+            "message": {
+                "role": "assistant",
+                "model": "claude-sonnet-4-6",
+                "usage": {
+                    "input_tokens": 1_000,
+                    "output_tokens": 200,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                }
+            }
+        }),
+        json!({
+            "type": "message",
+            "message": {
+                "role": "assistant",
+                "model": "claude-opus-4-7",
+                "usage": {
+                    "input_tokens": 500,
+                    "output_tokens": 100,
+                    "cache_read_input_tokens": 80_000,
+                    "cache_creation_input_tokens": 0,
+                }
+            }
+        }),
+    ]);
+
+    let (total, last_tokens) = scan_transcript(&fx.transcript_path).unwrap();
+    // sonnet turn: 1000 * 3 / 1e6  +  200 * 15 / 1e6  = 0.003 + 0.003 = 0.006
+    // opus turn:   500 * 15 / 1e6  +  100 * 75 / 1e6  +  80000 * 1.5 / 1e6
+    //            = 0.0075 + 0.0075 + 0.12 = 0.135
+    let expected = 0.006 + 0.135;
+    assert!(
+        (total - expected).abs() < 1e-6,
+        "total {total} ≉ expected {expected}",
+    );
+    assert_eq!(last_tokens, 500 + 80_000);
+
+    // Smoke: message_cost_usd on a single message also works
+    let opus_msg = json!({
+        "model": "claude-opus-4-7",
+        "usage": {"input_tokens": 1_000_000, "output_tokens": 0,
+                  "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
+    });
+    assert!((message_cost_usd(&opus_msg) - 15.0).abs() < 1e-6);
+
+    let stdin = json!({
+        "cwd": fx.project_dir,
+        "transcript_path": fx.transcript_path,
+    });
+    cost_accumulate(&fx.paths, &stdin).unwrap();
+    let s = fx.read_state();
+    assert!((s.cost_used_usd - expected).abs() < 1e-6);
+    assert_eq!(s.context_tokens_used, last_tokens);
+}
+
+#[test]
 fn cost_accumulate_no_op_when_no_assistant_message_yet() {
     let fx = Fixture::new("bookmark-mgr-a3f9");
     std::fs::write(&fx.transcript_path, "").unwrap();
