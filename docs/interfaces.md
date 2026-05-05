@@ -311,6 +311,11 @@ auto_loop: false                  # 默认 false。true 时 orchestrator 派发�
 auto_loop_max_iterations: 3       # 自循环硬上限,默认 3。auto_loop=false 时忽略
 completion_signal: TESTS_GREEN    # 自循环退出信号(子串匹配)。auto_loop=true 时必填且非空,
                                   # auto_loop=false 时可省略
+next_on_done: implement           # 可选。`phase_done` 后跳转目标。省略 → 走拓扑序下一相
+                                  # (M3.1 F2:从 PhaseTemplate 列表的文件名顺序推 DAG;
+                                  # 末尾相省略 next_on_done = 终点节点 = is_terminal_phase)
+next_on_escalate: null            # 可选。`escalate` 后静态 revert 目标。省略(null)= 项目终态 escalated
+                                  # (M0.5.4 ESCALATE: REVERT_TO_PHASE 语法在事件 target_phase 字段独立路由)
 hooks:                            # phase 级 hook(项目级 hook 在 settings.json,详见 §6)
   before: scripts/snapshot-git.sh
   after: scripts/run-golden-rules.sh

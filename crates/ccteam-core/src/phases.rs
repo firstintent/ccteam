@@ -103,6 +103,22 @@ pub struct PhaseTemplate {
     /// Validated by `validate_m0`.
     #[serde(default)]
     pub completion_signal: String,
+
+    /// Explicit DAG edge for the "phase passed" branch. When `None`
+    /// (the YAML field is omitted), `Dag::from_templates` falls back
+    /// to the next phase in topological filename order, or treats the
+    /// phase as terminal when it's the last in the list. M3.2 widens
+    /// this to fork on test results.
+    #[serde(default)]
+    pub next_on_done: Option<String>,
+
+    /// Explicit DAG edge for the "phase escalated" branch. When
+    /// `None`, the orchestrator marks the project terminally
+    /// escalated (M0/M1 behavior). The M0.5.4 `REVERT_TO_PHASE`
+    /// ESCALATE grammar continues to route via the event's
+    /// `target_phase` field, independent of this static fallback.
+    #[serde(default)]
+    pub next_on_escalate: Option<String>,
 }
 
 fn default_auto_loop_max_iterations() -> u32 {

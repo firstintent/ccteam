@@ -20,7 +20,7 @@ use serde_json::json;
 use tempfile::TempDir;
 
 use ccteam_core::{
-    bootstrap_project, decide_tick_from_events, next_phase, progress, slugify,
+    bootstrap_project, decide_tick_from_events, dev_dag, progress, slugify,
     CcteamPaths, Orchestrator, OrchestratorConfig, PhaseState, PhaseTemplate,
     ProjectState, TickAction, RECOMMENDED_AGENTS,
 };
@@ -193,12 +193,13 @@ fn implement_phase_advances_when_subagent_done_lands_after_phase_done() {
     }
 
     let read = progress::read_all_events(&progress_path).unwrap();
-    let action = decide_tick_from_events(&state, &read);
+    let dag = dev_dag();
+    let action = decide_tick_from_events(&dag, &state, &read);
     assert_eq!(
         action,
         TickAction::AdvancePhase {
             from: "implement".into(),
-            to: next_phase("implement").map(String::from),
+            to: dag.next_on_done("implement").map(String::from),
         },
         "SubagentStop tail must NOT mask phase_done — orchestrator should still advance",
     );

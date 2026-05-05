@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use ccteam_core::tmux::{tmux_available, TmuxSession};
 use ccteam_core::{
-    progress, CcteamPaths, Orchestrator, OrchestratorConfig, Parallelism, PhaseState, ProjectState,
+    progress, write_global_phase_templates, CcteamPaths, Orchestrator, OrchestratorConfig,
+    Parallelism, PhaseState, ProjectState,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -55,6 +56,10 @@ fn fixture(test_name: &str) -> Option<(TempDir, CcteamPaths, String, ScopedSessi
     let project = paths.project_dir(&slug);
     std::fs::create_dir_all(&project).unwrap();
     std::fs::create_dir_all(paths.project_state(&slug).parent().unwrap()).unwrap();
+    // M3.1 F2: Orchestrator::new now requires phase templates to build
+    // a DAG. Tests that previously got away with empty `~/.ccteam/phases/`
+    // must populate it via the shipped dev templates.
+    write_global_phase_templates(&paths.root, false).unwrap();
     let now = chrono::Utc::now();
     ProjectState {
         slug: slug.clone(),
@@ -100,7 +105,14 @@ fn dispatch_phase_sends_idle_prompt_and_appends_event_when_no_history() {
     else {
         return;
     };
-    let orch = Orchestrator::new(paths.clone(), OrchestratorConfig::default()).unwrap();
+    let orch = Orchestrator::new(
+        paths.clone(),
+        OrchestratorConfig {
+            skip_tool_check: true,
+            ..OrchestratorConfig::default()
+        },
+    )
+    .unwrap();
 
     orch.dispatch_phase(&slug, "implement").unwrap();
 
@@ -124,7 +136,14 @@ fn dispatch_phase_uses_btw_when_busy() {
     )
     .unwrap();
 
-    let orch = Orchestrator::new(paths.clone(), OrchestratorConfig::default()).unwrap();
+    let orch = Orchestrator::new(
+        paths.clone(),
+        OrchestratorConfig {
+            skip_tool_check: true,
+            ..OrchestratorConfig::default()
+        },
+    )
+    .unwrap();
     orch.dispatch_phase(&slug, "implement").unwrap();
 
     let last = progress::last_event(&paths.progress_jsonl(&slug))
@@ -139,7 +158,14 @@ fn dispatch_phase_payload_lands_in_tmux_pane() {
     let Some((_tmp, paths, slug, scoped)) = fixture("payload-in-pane") else {
         return;
     };
-    let orch = Orchestrator::new(paths, OrchestratorConfig::default()).unwrap();
+    let orch = Orchestrator::new(
+        paths,
+        OrchestratorConfig {
+            skip_tool_check: true,
+            ..OrchestratorConfig::default()
+        },
+    )
+    .unwrap();
     let session = TmuxSession::for_slug(&slug);
     assert!(
         session.exists(),

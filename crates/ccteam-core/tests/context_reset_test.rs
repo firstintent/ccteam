@@ -9,8 +9,9 @@ use tempfile::TempDir;
 
 use ccteam_core::tmux::{tmux_available, TmuxSession};
 use ccteam_core::{
-    append_progress_summary, build_progress_summary, CcteamPaths, Orchestrator,
-    OrchestratorConfig, Parallelism, PhaseHistoryEntry, PhaseState, ProjectState,
+    append_progress_summary, build_progress_summary, write_global_phase_templates,
+    CcteamPaths, Orchestrator, OrchestratorConfig, Parallelism, PhaseHistoryEntry,
+    PhaseState, ProjectState,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -114,6 +115,9 @@ fn reset_context_recycles_tmux_and_resets_counter() {
     let slug = unique_slug("recycle");
     let project_dir = paths.project_dir(&slug);
     std::fs::create_dir_all(project_dir.join(".ccteam")).unwrap();
+    // Orchestrator::new now requires a non-empty phase template list
+    // (M3.1 F2: DAG inference replaces M0_PHASE_DAG constant).
+    write_global_phase_templates(&paths.root, false).unwrap();
 
     // Persist initial state with tokens above threshold.
     let mut state = fresh_state(&slug, "test-author");
@@ -133,6 +137,7 @@ fn reset_context_recycles_tmux_and_resets_counter() {
     let config = OrchestratorConfig {
         claude_argv: vec!["sh".into(), "-c".into(), ready_cmd],
         ready_timeout: Duration::from_secs(5),
+        skip_tool_check: true,
         ..OrchestratorConfig::default()
     };
     let orch = Orchestrator::new(paths.clone(), config).unwrap();
@@ -167,6 +172,7 @@ fn reset_context_times_out_when_ready_marker_never_appears() {
     let slug = unique_slug("timeout");
     let project_dir = paths.project_dir(&slug);
     std::fs::create_dir_all(project_dir.join(".ccteam")).unwrap();
+    write_global_phase_templates(&paths.root, false).unwrap();
 
     let mut state = fresh_state(&slug, "implement");
     state.save(&paths.project_state(&slug)).unwrap();
@@ -175,6 +181,7 @@ fn reset_context_times_out_when_ready_marker_never_appears() {
         // pane process does NOT touch ready
         claude_argv: vec!["sh".into(), "-c".into(), "sleep 60".into()],
         ready_timeout: Duration::from_millis(400),
+        skip_tool_check: true,
         ..OrchestratorConfig::default()
     };
     let orch = Orchestrator::new(paths.clone(), config).unwrap();
