@@ -132,9 +132,29 @@ pub fn is_idle(last: Option<&Value>) -> bool {
 /// Short enough to fit comfortably in one tmux send-keys; relies on the
 /// project's `.ccteam/phases/<phase>.md` for the full body.
 pub fn build_phase_prompt(phase: &str) -> String {
-    format!(
+    build_phase_prompt_with_attachments(phase, &[])
+}
+
+/// M2.1: same as `build_phase_prompt` but appends `@<rel>` references
+/// for each `attachment`. Used by the orchestrator to surface prior
+/// phase's `sub_skills` outputs (e.g. `.ccteam/code-review.md`) so the
+/// next phase reads them automatically without having to know which
+/// sub-skills produced them.
+///
+/// `attachments` are project-relative paths (e.g. `.ccteam/code-review.md`).
+/// Empty list yields the same string as `build_phase_prompt`.
+pub fn build_phase_prompt_with_attachments(phase: &str, attachments: &[&str]) -> String {
+    let base = format!(
         "请按 @.ccteam/phases/{phase}.md 完成本阶段。完成后写 .ccteam/{phase}-report.md，并在最后单独输出一行：PHASE_DONE: {phase}（或 ESCALATE: <一句话原因>）。"
-    )
+    );
+    if attachments.is_empty() {
+        return base;
+    }
+    let refs: Vec<String> = attachments
+        .iter()
+        .map(|p| format!("@{p}"))
+        .collect();
+    format!("{base}\n\n上轮 sub-skill 产出可参考: {}", refs.join(" "))
 }
 
 /// `/btw <prompt>` when claude is busy so the message queues without

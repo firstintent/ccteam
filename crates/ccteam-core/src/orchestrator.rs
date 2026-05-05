@@ -26,10 +26,11 @@ use crate::fix_loop::{self, FixLoopState};
 use crate::inbox::{InboxMessage, SessionMailbox};
 use crate::meta_agent::META_TEAM_NAME;
 use crate::paths::CcteamPaths;
-use crate::phases::PhaseTemplate;
+use crate::phases::{PhaseTemplate, SubSkillTrigger};
 use crate::progress;
 use crate::stall::{self, StallLevel, StallThresholds};
 use crate::state::{PhaseHistoryEntry, PhaseState, ProjectState};
+use crate::subskill::{self, ClaudePRunner, SubSkillRunner};
 use crate::tmux::TmuxSession;
 use crate::tool_surface::{user_claude_dir, ToolSurfaceSnapshot};
 
@@ -157,6 +158,12 @@ pub struct OrchestratorConfig {
     /// linked in, and the user wants the orchestrator to come up
     /// anyway so they can run `ccteam doctor --install-recommended-agents`.
     pub skip_tool_check: bool,
+    /// argv for the M2.1 sub-skill runner. Default mirrors the
+    /// production `claude -p ...` shape from `ClaudePRunner::default`;
+    /// tests can override with a shell stub that echoes stdin to
+    /// stdout, so the orchestrator's sub-skill plumbing is exercised
+    /// without spawning a real claude.
+    pub subskill_argv: Option<Vec<String>>,
 }
 
 impl Default for OrchestratorConfig {
@@ -167,6 +174,7 @@ impl Default for OrchestratorConfig {
             ready_timeout: Duration::from_secs(60),
             post_ready_warmup: Duration::from_secs(3),
             skip_tool_check: false,
+            subskill_argv: None,
         }
     }
 }
@@ -249,7 +257,9 @@ impl Orchestrator {
         let last = progress::last_event(&progress_path)?;
         let idle = progress::is_idle(last.as_ref());
 
-        let prompt = progress::build_phase_prompt(phase);
+        let attachments = self.attachments_for_next_phase(slug, state);
+        let attachment_refs: Vec<&str> = attachments.iter().map(String::as_str).collect();
+        let prompt = progress::build_phase_prompt_with_attachments(phase, &attachment_refs);
         let message = progress::idle_aware_message(&prompt, idle);
 
         let session = TmuxSession::from_name(state.tmux_session.clone());
@@ -262,9 +272,77 @@ impl Orchestrator {
             "event": "phase_inject",
             "phase": phase,
             "idle": idle,
+            "attachments": attachments,
         });
         progress::append_event(&progress_path, &event)?;
         Ok(())
+    }
+
+    /// Collect `output_to` paths from the previous phase's `phase_done`
+    /// sub-skills that exist on disk. The orchestrator passes these
+    /// to `build_phase_prompt_with_attachments` so the next phase's
+    /// claude reads them via `@<path>` without the phase markdown
+    /// having to know which sub-skills produced them.
+    ///
+    /// Pure heuristic: previous phase = `phase_history.last()`. If
+    /// the phase template doesn't exist (e.g. dropped from the team)
+    /// or no sub-skills wrote anything, returns an empty vec. Public
+    /// for direct testing (the dispatch path that consumes this is
+    /// hard to drive in unit tests because of the tmux dependency).
+    pub fn attachments_for_next_phase(
+        &self,
+        slug: &str,
+        state: &ProjectState,
+    ) -> Vec<String> {
+        let Some(prev) = state.phase_history.last() else {
+            return Vec::new();
+        };
+        let Some(template) = self.templates.iter().find(|t| t.name == prev.phase) else {
+            return Vec::new();
+        };
+        let project_dir = self.paths.project_dir(slug);
+        template
+            .sub_skills
+            .iter()
+            .filter(|s| s.trigger == SubSkillTrigger::PhaseDone)
+            .filter_map(|s| {
+                let abs = project_dir.join(&s.output_to);
+                abs.exists().then(|| s.output_to.clone())
+            })
+            .collect()
+    }
+
+    /// Construct the configured sub-skill runner. Honors
+    /// `OrchestratorConfig::subskill_argv` so tests can swap a stub.
+    fn build_subskill_runner(&self) -> Box<dyn SubSkillRunner> {
+        match &self.config.subskill_argv {
+            Some(argv) => Box::new(ClaudePRunner::with_argv(argv.clone())),
+            None => Box::<ClaudePRunner>::default(),
+        }
+    }
+
+    /// Run every `phase_start` / `phase_done` sub-skill in `template`.
+    /// The orchestrator calls this directly around `AdvancePhase` and
+    /// `DispatchPhase` transitions in `process_project`.
+    pub fn run_phase_sub_skills(
+        &self,
+        slug: &str,
+        template: &PhaseTemplate,
+        trigger: SubSkillTrigger,
+    ) {
+        if template.sub_skills.is_empty() {
+            return;
+        }
+        let project_dir = self.paths.project_dir(slug);
+        let progress_path = self.paths.progress_jsonl(slug);
+        let runner = self.build_subskill_runner();
+        let _outputs = subskill::run_sub_skills_for_phase(
+            template,
+            trigger,
+            &project_dir,
+            &progress_path,
+            runner.as_ref(),
+        );
     }
 
     /// Scan `~/projects/*/.ccteam/state.json` and return one entry per
@@ -443,6 +521,20 @@ impl Orchestrator {
             match action {
                 TickAction::NoOp => return Ok(state),
                 TickAction::AdvancePhase { from, to } => {
+                    // M2.1: phase_done sub-skills run *before* state
+                    // advance so their output files are on disk by the
+                    // time the next phase prompt is built (the prompt
+                    // builder pulls in @-attachments from the prior
+                    // phase's sub_skills outputs).
+                    if let Some(prev_template) =
+                        self.templates.iter().find(|t| t.name == from)
+                    {
+                        self.run_phase_sub_skills(
+                            &slug.to_string(),
+                            prev_template,
+                            SubSkillTrigger::PhaseDone,
+                        );
+                    }
                     state.phase_history.push(PhaseHistoryEntry {
                         phase: from.clone(),
                         status: "passed".into(),
@@ -509,6 +601,17 @@ impl Orchestrator {
                     // out in `dispatch_phase → send_keys` because the
                     // session simply wouldn't exist.
                     self.ensure_session(slug, &mut state)?;
+                    // M2.1: phase_start sub-skills run *before* the
+                    // phase prompt is injected so their outputs are
+                    // available when the phase begins. Failures land
+                    // in progress.jsonl but never block the phase.
+                    if let Some(template) = self.templates.iter().find(|t| t.name == phase) {
+                        self.run_phase_sub_skills(
+                            slug,
+                            template,
+                            SubSkillTrigger::PhaseStart,
+                        );
+                    }
                     self.dispatch_phase(slug, &phase)?;
                     let template = self.templates.iter().find(|t| t.name == phase);
                     let target_state = if template.is_some_and(|t| t.auto_loop) {

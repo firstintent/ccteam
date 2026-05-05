@@ -160,6 +160,7 @@ OUTBOX
             post_ready_warmup: Duration::from_millis(50),
             skip_tool_check: true,
             tick_interval: Duration::from_millis(100),
+            ..OrchestratorConfig::default()
         },
     )
     .unwrap();

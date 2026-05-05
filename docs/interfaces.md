@@ -350,10 +350,12 @@ interfaces §3.4.3"。具体写哪些事件:
 
 ```jsonl
 {"ts":"2026-05-04T11:23:00Z","event":"session_start","tmux_session":"ccteam-bookmark-mgr-a3f9"}
-{"ts":"...","event":"phase_inject","phase":"implement"}
+{"ts":"...","event":"phase_inject","phase":"implement","attachments":[".ccteam/code-review.md"]}
 {"ts":"...","event":"PreToolUse","tool":"Edit","path":"src/db.ts"}
 {"ts":"...","event":"PostToolUse","tool":"Bash","cmd":"pnpm test","exit_code":0,"duration_ms":4521}
 {"ts":"...","event":"phase_milestone","phase":"implement","note":"完成 schema + migration"}
+{"ts":"...","event":"subskill_started","phase":"implement","skill":"claude-plugins-official:pr-review-toolkit/agents/code-reviewer.md","trigger":"phase_done"}
+{"ts":"...","event":"subskill_done","phase":"implement","skill":"...","output":".ccteam/code-review.md","bytes":4123}
 {"ts":"...","event":"phase_done","phase":"implement","duration_s":4521,"cost_usd":2.13}
 {"ts":"...","event":"escalate","kind":"need_user_input","target_phase":null,"reason":"db migration 不可调和","cycle":3}
 {"ts":"...","event":"escalate","kind":"revert","target_phase":"plan-eng","reason":"fix-loop 撞顶,根因在选型"}
@@ -388,6 +390,7 @@ interfaces §3.4.3"。具体写哪些事件:
 | `session_start` / `phase_inject` | orchestrator(send-keys 前后直接 append) |
 | `PreToolUse` / `PostToolUse` / `phase_milestone` | Claude Code hooks(详见 §6.1) |
 | `phase_done` / `escalate` | Stop hook 解析 claude 最后一行(`PHASE_DONE: <phase>` / `ESCALATE: <reason>`) |
+| `subskill_started` / `subskill_done` / `subskill_skipped` / `subskill_failed` | M2.1 orchestrator 在 phase_start / phase_done 边界跑 sub-skill;`subskill_done` 含 `output` 与 `bytes`,`subskill_skipped` 含 `reason`(`installed:` 前缀等),`subskill_failed` 含 `error` |
 | `user_attach` | PreToolUse hook 检测输入源 |
 | `watcher_concern` / `watcher_block` | Cross-cutting watcher 异步子进程(详见 tech-design §6.3 模式 B) |
 | `SessionEnd` | SessionEnd hook |
