@@ -41,30 +41,83 @@
 
 ### 1.1 `Task` / `Agent` 工具:启动 subagent
 
-子 agent 是 ccteam 调"质量类"命令(`/review` / `/simplify` / 架构方案)的
-首选——它们就是 plugin 里 `agents/<name>.md` 的内容,**装了 plugin 后,
-模型可以通过 `Task(subagent_type=<name>, ...)` 直接调用**,效果等同于
-`/review` 但是模型自发触发的。
+子 agent 是 ccteam 调"质量类"工作(代码审查、架构方案、并行探索)
+的首选——但 **subagent 必须先在全局 / 项目级 agents 目录里注册**,
+模型才能通过 `Task(subagent_type=<name>, ...)` 调到。光装 plugin
+**不够**(见 §1.1.2 实测)。
 
-#### 1.1.1 内置 subagent
+#### 1.1.1 内置 subagent — 经实测确认的 5 个
 
-`general-purpose` 是 Claude Code 默认 always-on 的 subagent,任何会话都能
-直接 `Task(subagent_type="general-purpose", ...)`。**其它 subagent_type
-都来自 plugin / 项目级 `.claude/agents/<name>.md` / 全局
-`~/.claude/agents/<name>.md`,没装就调不动**。
+Claude Code 默认 always-on,**任何会话**都能直接 `Task(subagent_type=...)` 调:
 
-要在长会话里**实测当前可用 subagent 列表**:
+| `subagent_type` | 用途 | 工具面 |
+|---|---|---|
+| `general-purpose` | 兜底:多步研究、跨文件搜索、复杂任务 | 全工具 |
+| `Explore` | 只读快速搜索:`find`、`grep`、定义/引用查找 | 只读 |
+| `Plan` | 软件架构师:产出实现计划 | 只读 + 计划工具 |
+| `claude-code-guide` | 回答 Claude Code / Agent SDK / Anthropic API 用法 | Bash / Read / WebFetch / WebSearch |
+| `statusline-setup` | 配置 status line | Read / Edit |
+
+(2026-05-05 在 Claude Code 长会话里跑 `Task(subagent_type="code-reviewer")`
+得到 "Available agents: claude-code-guide, Explore, general-purpose, Plan,
+statusline-setup" 实测确认。)
+
+#### 1.1.2 plugin agent **不会**自动进 Task 注册表 —— 这是关键陷阱
+
+虽然 `~/.claude/plugins/marketplaces/claude-plugins-official/plugins/<plugin>/agents/<name>.md`
+路径下确实有 `code-reviewer` / `code-architect` / `code-simplifier` 等 agent
+文件,**`/plugin install <plugin>@claude-plugins-official` 之后,模型在长会话
+里调 `Task(subagent_type="code-reviewer")` 仍然会拿到**:
+
+```
+Error: Agent type 'code-reviewer' not found.
+Available agents: claude-code-guide, Explore, general-purpose, Plan, statusline-setup
+```
+
+plugin 里的 agent 是**该 plugin 自己的 slash command body 内部使用的私有
+agent**(`pr-review-toolkit/commands/review-pr.md` 里写 `allowed-tools: [Task, ...]`
+然后由 plugin 的 prompt 引导 Task 去找对应 agent)—— 它们只在那条 slash
+command 触发后的特殊上下文里可调,**不进全局 Task subagent 注册表**。
+
+#### 1.1.3 想让 plugin agent 在 ccteam 长会话里被自治调用 —— 三条路
+
+| 方案 | 怎么做 | 评价 |
+|---|---|---|
+| A. 安装到全局 agents 目录 | `cp <plugin>/agents/code-reviewer.md ~/.claude/agents/` 后,所有 claude session 的 `Task(subagent_type="code-reviewer")` 都能调 | ✅ 推荐;ccteam M1 `bootstrap_project` 应该批量做这件事 |
+| B. `@文件引用` + general-purpose 执行 | phase markdown 里写 "请用 Task(subagent_type='general-purpose'),把 `@~/.claude/plugins/.../agents/code-reviewer.md` 的内容当作 system prompt,review 当前 diff" | ✅ 零安装,但每次都走 general-purpose,损失了 plugin agent 的 model / color / tools 配置 |
+| C. orchestrator send-keys 触发 slash command | tmux send-keys `/review-pr <args>`,plugin 自己的 prompt body 在 TUI 上下文里能调它的私有 agent | ⚠️ 阻塞长会话当前 turn,只适合 phase 边界 |
+
+**ccteam 的设计选择**:M0 用方案 B(零安装,文档先行);M1 在 `bootstrap_project`
+里加方案 A 的批量复制(`ccteam doctor --install-recommended-agents`);方案 C
+留给 director-claude(通道 3)在跨 phase 路由时调用。
+
+#### 1.1.4 验证示例(无需任何 plugin,直接可跑)
 
 ```
 请用 Task 工具,subagent_type="general-purpose",
-prompt="ls ~/.claude/agents/ 和当前项目 .claude/agents/(若存在),
-还有 ~/.claude/plugins/marketplaces/*/plugins/*/agents/ 下所有
-agents 目录,把 name 字段都列出来。"
+description="probe tool surface",
+prompt="列出当前工作目录下所有 .md 文件,统计每个文件的行数。"
 ```
 
-返回的 name 字段就是当前长会话**真实可用**的 `subagent_type` 候选。
-不要凭训练记忆假定 `Explore` / `Plan` / `code-reviewer` 等存在 ——
-这些都得装 plugin。
+#### 1.1.5 验证示例(方案 B,@ 引用 plugin agent prompt)
+
+```
+请用 Task 工具,subagent_type="general-purpose",
+description="run code-reviewer on HEAD diff",
+prompt="读 @~/.claude/plugins/marketplaces/claude-plugins-official/plugins/pr-review-toolkit/agents/code-reviewer.md
+里的 instructions,严格按那份指引,review 当前 git 未暂存 diff,产出
+critical / major / minor 三档问题清单。"
+```
+
+#### 1.1.6 实测当前会话可用 subagent
+
+不放心或换了机器,现场跑:
+
+```
+请用 Task 工具调一个不存在的 subagent_type(如 "probe-test-12345"),
+看返回的 "Available agents: ..." 错误清单,即是当前会话所有可调
+subagent_type。
+```
 
 #### 1.1.2 plugin 提供的 subagent
 
@@ -76,67 +129,48 @@ Task(subagent_type="code-reviewer", description="review HEAD diff",
      prompt="Review the unstaged diff against CLAUDE.md guidelines.")
 ```
 
-ccteam 项目可用的 plugin agent 见 §6 工具清单。
-
-#### 1.1.3 phase markdown 里怎么写(可手动验证示例)
-
-把下面这段贴到 `phases/<name>.md` 的 body,模型读到会**自发**调 Task:
-
-````markdown
-完成实现后,在提交前必须自检:
-
-请使用 `Task` 工具调用 subagent_type="code-reviewer" 的子 agent,
-description="self-review of implement phase",
-prompt 内容:`审查本轮 implement 阶段产生的所有未提交 diff,对照
-@.ccteam/plan-eng.md 检查是否偏离规划;对照 CLAUDE.md 检查代码风格;
-逐文件输出 critical / major / minor 三档问题清单,每档不超过 5 条。`
-
-读取它的返回总结,把 critical 项处理完再 PHASE_DONE。
-````
-
-**验证方法**:在长会话里把上面那段当 prompt 发出去,观察模型是否发出
-`Task(subagent_type=...)` 工具调用。如果看到 Task 调用并拿到结果,说明
-通道 1 通畅。
-
-#### 1.1.4 验证示例(无需任何 plugin 安装,直接可跑)
-
-```
-请用 Task 工具,subagent_type="general-purpose",
-description="probe tool surface",
-prompt="列出当前工作目录下所有 .md 文件,统计每个文件的行数。"
-```
+ccteam 项目用 plugin agent 的步骤见 §6.2(必须先 ln -sf 到 `~/.claude/agents/`
+才能 Task 调,不是装 plugin 就能用)。
 
 ---
 
 ### 1.2 `Skill` 工具:激活 skill
 
-Skill 是 Claude Code 的"可调用知识包" —— 比 subagent 轻,适合"按规程办事"
-的场景(写 commit、生成 release notes 等)。
+Skill 是 Claude Code 的"可调用知识包" —— 适合"按规程办事"的场景。
 
 ```
 Skill(skill="<name>", args="<optional-args>")
 ```
 
-`skill` 必须是当前会话**已加载** skill 列表里的名字(系统会通过
-system-reminder 列出可用 skill)。**不要凭训练记忆猜 skill 名字** ——
-Claude Code 会拒绝并报 InputValidationError。
+#### 1.2.1 关键约束:只调 system-reminder 里列出来的 skill
 
-#### 1.2.1 验证示例
+Claude Code 会在每次会话里通过 system-reminder 列当前可用 skill 名单。
+**不在那张清单里的名字一律不能调 ——** `Skill(skill="X")` 会以
+InputValidationError 失败。不要凭训练记忆或文件路径猜 skill 名字。
 
-ccteam 仓库已装 `ccgram-messaging` skill。在长会话里:
+#### 1.2.2 怎么实测当前会话能调哪些 skill
+
+最稳的探针:
 
 ```
-请用 Skill 工具调用 ccgram-messaging skill,
-args="status" (或它支持的任意参数)。
+请用 Skill 工具调用一个不存在的 skill 名(如 "probe-test-12345"),
+看返回的错误信息或用户可见 skills 列表,确认当前会话真实可调的 skill。
 ```
 
-观察模型是否发出 `Skill(skill="ccgram-messaging", ...)` 调用。
+或:
 
-#### 1.2.2 与自定义 `/<skill>` slash command 的关系
+```
+请用 Bash 工具跑 `ls ~/.claude/skills/ ~/.claude/plugins/marketplaces/*/plugins/*/skills/`,
+列出所有 skill 文件 —— **这只是文件存在性,不代表 Skill 工具可调**;
+最终判定还是看 system-reminder 那张清单。
+```
 
-很多 skill 同时注册成 slash command(用户键入 `/<name>`)。**模型不能
-通过 `/<name>` 触发,只能通过 `Skill` 工具触发**——这是同一个 skill,
-两个入口。phase markdown 让模型走 `Skill` 工具入口即可。
+#### 1.2.3 plugin 的 `commands/<name>.md` 不是 Skill,是 slash command
+
+**非常容易踩**:`pr-review-toolkit/commands/review-pr.md` 不是 skill,
+是 slash command;`Skill(skill="review-pr")` 会报错。slash command
+属于通道 2(TUI-only),要触发只能 orchestrator send-keys。**这是 plugin
+agent 在自治流水线里难用的真正原因**。
 
 ---
 
@@ -248,11 +282,17 @@ orchestrator 的 escalate 处理逻辑(M1+)读到这条,做 send-keys `/exit`
 
 ### 3.3 与通道 1、2 的边界
 
-| 决策类型 | 谁来 |
-|---|---|
-| 当前 phase 里要不要调 code-reviewer / code-simplifier | 通道 1(长会话内 Claude 自决) |
-| 要不要 `/exit` reset / `/reload-plugins` | 通道 2(orchestrator,看 cost / context 阈值机械触发) |
-| 下一 phase 走 fix 还是 ship,要不要 inject `/review` 之类 TUI 命令 | 通道 3(director-claude) |
+| 决策类型 | 谁来 | 前置条件 |
+|---|---|---|
+| 当前 phase 里要不要调 code-reviewer / code-simplifier | 通道 1(长会话内 Claude 自决) | agent 文件已 ln 到 `~/.claude/agents/`(见 §6.2) |
+| 要不要 `/exit` reset / `/reload-plugins` | 通道 2(orchestrator,看 cost / context 阈值机械触发) | — |
+| 下一 phase 走 fix 还是 ship,要不要 inject `/review-pr` 等 TUI 命令 | 通道 3(director-claude) | M1+ |
+
+**重要的架构后果**:Plugin agent 不是"装了 plugin 就能调"——必须额外做一步
+agents 目录注册才进通道 1。这意味着:**ccteam M1 的 `bootstrap_project`
+必须把 §6.2 那段 ln -sf 加进去**,否则所有"phase 让模型自己调 code-reviewer"
+的设计在产出项目里都跑不通,只能 fallback 到通道 3 的 send-keys `/review-pr`。
+这条已记入 development-plan(M1.x)。
 
 ### 3.4 与 sub_skills 的边界(M2)
 
@@ -271,31 +311,55 @@ sub_skills 是 phase front matter 里**声明式**指定的 plugin 触发,固定
 
 ## 工具清单 — phase 模板作者参考
 
-### 6.1 默认可用的 subagent
-
-仅 `general-purpose` 是 Claude Code 内置且永远可用。其余都需要装 plugin
-或在项目本地 `.claude/agents/` 自定义。
+### 6.1 默认可用的 subagent(Task 直接可调)
 
 | `subagent_type` | 来源 | 适用场景 |
 |---|---|---|
 | `general-purpose` | Claude Code 内置 | 兜底,任何复杂任务 |
+| `Explore` | Claude Code 内置 | 只读快速搜索 |
+| `Plan` | Claude Code 内置 | 实现计划设计 |
+| `claude-code-guide` | Claude Code 内置 | Claude Code 用法咨询 |
+| `statusline-setup` | Claude Code 内置 | 配置 status line |
 
-### 6.2 推荐安装的 plugin subagent(claude-plugins-official)
+### 6.2 想做 plugin 级别 review / simplify / 架构方案 — 必须做安装步骤
 
-需要先 `/plugin install <plugin>@claude-plugins-official`(M2 起 ccteam
-自动批量安装到产出项目)。
+`pr-review-toolkit` / `feature-dev` / `code-simplifier` 等 plugin 里的 agent
+**装了 plugin 也不能直接 Task 调**(见 §1.1.2)。要在 ccteam 自治调用,
+需要在 ccteam `bootstrap_project`(或一次性手工)里执行下面这步:
 
-| 来源 plugin | `subagent_type` | 用途 | ccteam 用例 |
-|---|---|---|---|
-| `feature-dev` | `code-architect` | 产出 3 方案 + 推荐架构 | plan-eng |
-| `feature-dev` | `code-explorer` | 并行探索代码库 | 项目延续场景的 plan-eng |
-| `feature-dev` | `code-reviewer` | 代码审查 | implement / review phase |
-| `pr-review-toolkit` | `code-reviewer` | PR 级审查 | review phase |
-| `pr-review-toolkit` | `silent-failure-hunter` | 找静默失败点 | review phase |
-| `pr-review-toolkit` | `pr-test-analyzer` | 测试覆盖分析 | review phase |
-| `pr-review-toolkit` | `type-design-analyzer` | 类型设计审查 | review phase |
-| `pr-review-toolkit` | `comment-analyzer` | 注释质量审查 | review phase |
-| `code-simplifier` | `code-simplifier` | 代码简化 | review 后打磨 |
+```bash
+# 把 plugin agent 文件软链/拷到全局 agents 目录,Claude Code 会扫这里
+# 自动注册成 subagent_type
+mkdir -p ~/.claude/agents
+for src in \
+  ~/.claude/plugins/marketplaces/claude-plugins-official/plugins/pr-review-toolkit/agents/*.md \
+  ~/.claude/plugins/marketplaces/claude-plugins-official/plugins/feature-dev/agents/code-architect.md \
+  ~/.claude/plugins/marketplaces/claude-plugins-official/plugins/feature-dev/agents/code-explorer.md \
+  ~/.claude/plugins/marketplaces/claude-plugins-official/plugins/code-simplifier/agents/code-simplifier.md
+do
+  ln -sf "$src" "$HOME/.claude/agents/$(basename "$src")"
+done
+```
+
+之后用 `Task(subagent_type="probe-XXX")` 探当前可用列表 —— 应该多出
+`code-reviewer`、`code-architect`、`code-explorer`、`code-simplifier`、
+`silent-failure-hunter`、`pr-test-analyzer`、`type-design-analyzer`、
+`comment-analyzer`。
+
+| 来源 plugin | agent 文件 → subagent_type | ccteam 用例 |
+|---|---|---|
+| `feature-dev` | `code-architect` | plan-eng |
+| `feature-dev` | `code-explorer` | 项目延续场景的 plan-eng |
+| `pr-review-toolkit` | `code-reviewer` | implement / review phase |
+| `pr-review-toolkit` | `silent-failure-hunter` | review phase |
+| `pr-review-toolkit` | `pr-test-analyzer` | review phase |
+| `pr-review-toolkit` | `type-design-analyzer` | review phase |
+| `pr-review-toolkit` | `comment-analyzer` | review phase |
+| `code-simplifier` | `code-simplifier` | review 后打磨 |
+
+**ccteam 路线图**:M1 起 `ccteam doctor --install-recommended-agents` 自动
+做上面的 ln -sf;在那之前,phase 模板用 §1.1.3 方案 B(`@文件引用` + Task
+general-purpose)兜底。
 
 ### 6.3 推荐挂的 hook(plugin 提供)
 
@@ -320,7 +384,9 @@ sub_skills 是 phase front matter 里**声明式**指定的 plugin 触发,固定
 |---|---|
 | 引用某个文件让模型读 | `@.ccteam/spec.md` |
 | 引用 plugin 里某个 agent 文件让模型按里面规程办 | `@~/.claude/plugins/marketplaces/claude-plugins-official/plugins/feature-dev/agents/code-architect.md` |
-| 让模型主动 launch subagent | "请使用 Task 工具,subagent_type='code-reviewer',..." |
+| 让模型主动 launch subagent(默认 5 个) | "请使用 Task 工具,subagent_type='general-purpose'/'Explore'/'Plan'/'claude-code-guide'/'statusline-setup',..." |
+| 让模型主动 launch plugin subagent(必须先 §6.2 ln -sf) | "请使用 Task 工具,subagent_type='code-reviewer',..." |
+| 模型按 plugin agent 规程办但不显式调 subagent | "请读 `@~/.claude/plugins/.../agents/code-reviewer.md`,严格按其指引 review 当前 diff" |
 | 让模型用 skill | "请使用 Skill 工具调用 <name> skill" |
 | 让模型用 MCP tool | "请使用 mcp__\<server>__\<tool> 工具,..." |
 | 让 orchestrator 触发 TUI 命令 | 在 phase 末尾 ESCALATE,告诉 orchestrator 该做什么 |
@@ -342,9 +408,10 @@ sub_skills 是 phase front matter 里**声明式**指定的 plugin 触发,固定
 
 | 现象 | 根因 | 对策 |
 |---|---|---|
-| phase markdown 写 "请 `/review`",模型却没有动作 | 模型摸不到 slash command | 改为 "请用 Task 工具调 code-reviewer subagent" |
-| `Task(subagent_type="code-reviewer")` 报 unknown subagent type | plugin 没装到当前会话 | 在产出项目装 plugin(M2 自动 / 现在手动 `/plugin install`) |
-| `Skill(skill="X")` 报 InputValidationError | skill 名字写错 / 没加载 | 看 system-reminder 里的 available-skills 真实列表 |
+| phase markdown 写 "请 `/review`",模型却没有动作 | 模型摸不到 slash command | 改为 "请用 Task 工具调 code-reviewer subagent" + §6.2 安装 |
+| `Task(subagent_type="code-reviewer")` 报 "Agent type not found, Available: general-purpose, Explore, Plan, claude-code-guide, statusline-setup" | **装了 plugin 不等于 Task 能调它的 agent**(plugin agent 文件不进 Task 全局注册表) | 跑 §6.2 那段 ln -sf,把 plugin agent 文件链到 `~/.claude/agents/`;或临时用方案 B(`@文件引用` + Task general-purpose) |
+| `Skill(skill="review-pr")` 报 InputValidationError | `review-pr` 是 plugin 的 slash command 不是 Skill;`commands/<name>.md` 文件不被 Skill 工具识别 | 这条只能走通道 2(orchestrator send-keys `/review-pr`),phase markdown 别让模型自己调 |
+| `Skill(skill="X")` 报 InputValidationError | skill 名字写错 / 当前会话没加载到 system-reminder 列表 | §1.2.2 的探针实测当前可调 skill |
 | `mcp__foo__bar` 报工具不存在 | MCP server 没连 | 检查项目 `.mcp.json` + `ccteam doctor` |
 | 模型在回答里写了 `/exit` 但会话没退 | TUI-only 命令模型摸不到 | 改成 ESCALATE 或让 orchestrator send-keys |
-| 长会话 context 涨到 80% 才发现没 reset | 通道 2 没自动触发 | orchestrator 60% 阈值要在 PostToolUse hook 里检查(已在 §6.9) |
+| 长会话 context 涨到 80% 才发现没 reset | 通道 2 没自动触发 | orchestrator 60% 阈值要在 PostToolUse hook 里检查(已在 tech-design §6.9) |
