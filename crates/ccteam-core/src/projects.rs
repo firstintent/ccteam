@@ -154,13 +154,77 @@ pub fn bootstrap_project(
 /// Pre-mark `project_dir` as trusted in `~/.claude.json` so the first
 /// `claude --dangerously-skip-permissions` launch in this directory
 /// doesn't sit on the "Trust this folder?" prompt waiting for the
-/// keyboard. Honors `$HOME` (and the runner's `dirs::home_dir()`
-/// fallback). No-ops gracefully if `~/.claude.json` is unwritable.
+/// keyboard.
+///
+/// **Test isolation** (two opt-in mechanisms — same shape as
+/// `setup_tool_surface`):
+///
+/// 1. `CCTEAM_DISABLE_TOOL_SURFACE_BOOTSTRAP=1` → no-op entirely.
+///    Tests that exercise `bootstrap_project` for unrelated assertions
+///    set this via `disable_tool_surface_bootstrap_for_tests()` and
+///    don't want either the agent symlinks or the trust entry leaking
+///    into the developer's real home.
+/// 2. `CLAUDE_CONFIG_HOME=<dir>` → write to `<dir>/../.claude.json`
+///    instead of `$HOME/.claude.json`. Mirrors the resolution
+///    `user_claude_dir()` does for the agents/skills surface so a test
+///    setting just `CLAUDE_CONFIG_HOME=<tmp>/.claude` gets full
+///    redirection across the whole tool surface.
+///
+/// Without these guards, every test invoking `bootstrap_project` would
+/// append a `/tmp/.tmpXXXXXX/projects/<slug>` entry to the developer's
+/// real `~/.claude.json`, eventually bloating the file enough to break
+/// Claude login (regression observed 2026-05-06).
+///
+/// No-ops gracefully if the resolved `.claude.json` is unwritable.
 pub fn pre_trust_project(project_dir: &Path) -> Result<()> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| anyhow!("could not resolve home directory for ~/.claude.json"))?;
-    let claude_json = home.join(".claude.json");
+    if std::env::var("CCTEAM_DISABLE_TOOL_SURFACE_BOOTSTRAP")
+        .ok()
+        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+    {
+        tracing::debug!(
+            "CCTEAM_DISABLE_TOOL_SURFACE_BOOTSTRAP set; skipping ~/.claude.json trust entry write",
+        );
+        return Ok(());
+    }
+    let claude_json = resolve_claude_json_path()?;
     write_trust_entry(&claude_json, project_dir)
+}
+
+/// Resolve which `.claude.json` to write the trust entry into.
+///
+/// `CLAUDE_CONFIG_HOME` takes precedence so the production-equivalent
+/// isolation tests (`tool_surface_e2e_test`-style) get a redirected
+/// trust write too. Production sets neither and falls through to
+/// `dirs::home_dir()`.
+fn resolve_claude_json_path() -> Result<PathBuf> {
+    resolve_claude_json_path_from_env(
+        std::env::var("CLAUDE_CONFIG_HOME").ok(),
+        dirs::home_dir(),
+    )
+}
+
+/// Pure resolution helper for `resolve_claude_json_path`. Factored out
+/// so unit tests can exercise the path logic without mutating process
+/// env vars (which would race against parallel tests in the same
+/// binary).
+fn resolve_claude_json_path_from_env(
+    config_home: Option<String>,
+    home: Option<PathBuf>,
+) -> Result<PathBuf> {
+    if let Some(s) = config_home {
+        let claude_dir = PathBuf::from(s);
+        // CLAUDE_CONFIG_HOME points at the `.claude/` dir; `.claude.json`
+        // is its sibling. If the env var has no parent (root path,
+        // weird input), fall back to writing inside it — better than
+        // silently touching the real home.
+        return Ok(match claude_dir.parent() {
+            Some(parent) => parent.join(".claude.json"),
+            None => claude_dir.join(".claude.json"),
+        });
+    }
+    let h = home
+        .ok_or_else(|| anyhow!("could not resolve home directory for ~/.claude.json"))?;
+    Ok(h.join(".claude.json"))
 }
 
 /// Symlink the `RECOMMENDED_AGENTS` set into `~/.claude/agents/` and
@@ -420,6 +484,144 @@ mod tests {
             v["projects"][key]["hasTrustDialogAccepted"],
             Value::Bool(true)
         );
+    }
+
+    // ---- resolution logic: pure-function tests, no env mutation ----
+
+    #[test]
+    fn resolve_claude_json_path_honors_claude_config_home() {
+        // CLAUDE_CONFIG_HOME points at the .claude/ dir; .claude.json is
+        // its sibling. Resolution must redirect there (mirroring
+        // user_claude_dir's CLAUDE_CONFIG_HOME handling).
+        let resolved = resolve_claude_json_path_from_env(
+            Some("/some/test/.claude".to_string()),
+            Some(PathBuf::from("/should/not/be/used")),
+        )
+        .unwrap();
+        assert_eq!(resolved, std::path::Path::new("/some/test/.claude.json"));
+    }
+
+    #[test]
+    fn resolve_claude_json_path_handles_claude_config_home_at_root() {
+        // Defensive: CLAUDE_CONFIG_HOME without a parent (e.g. exactly
+        // "/") falls back to writing inside the dir rather than silently
+        // resolving to "/.claude.json" (which would still be on the
+        // wrong filesystem from the user's perspective).
+        let resolved = resolve_claude_json_path_from_env(
+            Some("/".to_string()),
+            Some(PathBuf::from("/home/rob")),
+        )
+        .unwrap();
+        // "/" has parent = None per std::path semantics, so we expect
+        // the inner-dir join.
+        assert_eq!(resolved, std::path::Path::new("/.claude.json"));
+    }
+
+    #[test]
+    fn resolve_claude_json_path_falls_back_to_home_when_env_unset() {
+        let resolved =
+            resolve_claude_json_path_from_env(None, Some(PathBuf::from("/home/rob"))).unwrap();
+        assert_eq!(resolved, std::path::Path::new("/home/rob/.claude.json"));
+    }
+
+    #[test]
+    fn resolve_claude_json_path_errors_when_neither_available() {
+        let err = resolve_claude_json_path_from_env(None, None).unwrap_err();
+        assert!(format!("{err:#}").contains("home directory"));
+    }
+
+    // ---- side-effect guards: integration-style, but isolated via
+    //      tempdir paths so no real-home dependency. ----
+
+    #[test]
+    fn pre_trust_project_no_ops_when_disable_flag_set() {
+        // Regression (2026-05-06): tests calling bootstrap_project were
+        // leaking /tmp/.tmpXXX/projects/<slug> entries into the
+        // developer's real ~/.claude.json — the file grew to 43k+ and
+        // broke claude login. The disable flag must short-circuit
+        // pre_trust_project the same way it short-circuits the agent
+        // symlink path.
+        //
+        // Verification approach: redirect CLAUDE_CONFIG_HOME to a
+        // tempdir and assert the redirected .claude.json is **not**
+        // created — proving the early-return fired. Using
+        // CLAUDE_CONFIG_HOME (rather than $HOME) keeps the test
+        // independent of dirs::home_dir()'s read of the developer's
+        // real home.
+        ensure_isolation();
+        // ENV_LOCK guards CLAUDE_CONFIG_HOME so other tests in this
+        // binary don't race the read.
+        let _guard = env_lock().lock().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let prior_config_home = std::env::var("CLAUDE_CONFIG_HOME").ok();
+        std::env::set_var("CLAUDE_CONFIG_HOME", &claude_dir);
+
+        let project = tmp.path().join("projects/abc");
+        std::fs::create_dir_all(&project).unwrap();
+        pre_trust_project(&project).unwrap();
+
+        let redirected = tmp.path().join(".claude.json");
+        assert!(
+            !redirected.exists(),
+            "disable flag should short-circuit pre_trust_project entirely; \
+             expected no .claude.json at {} but it was written",
+            redirected.display(),
+        );
+
+        match prior_config_home {
+            Some(v) => std::env::set_var("CLAUDE_CONFIG_HOME", v),
+            None => std::env::remove_var("CLAUDE_CONFIG_HOME"),
+        }
+    }
+
+    #[test]
+    fn pre_trust_project_writes_to_redirected_claude_json_when_config_home_set() {
+        // Production-equivalent path: tool_surface_e2e_test-style tests
+        // that exercise the real trust-write semantics but redirect
+        // CLAUDE_CONFIG_HOME to a tempdir. With the disable flag
+        // explicitly off, the write happens — just at the redirected
+        // location, not the developer's real ~/.claude.json.
+        let _guard = env_lock().lock().unwrap();
+        let prior_disable = std::env::var("CCTEAM_DISABLE_TOOL_SURFACE_BOOTSTRAP").ok();
+        let prior_config_home = std::env::var("CLAUDE_CONFIG_HOME").ok();
+        std::env::remove_var("CCTEAM_DISABLE_TOOL_SURFACE_BOOTSTRAP");
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::env::set_var("CLAUDE_CONFIG_HOME", &claude_dir);
+
+        let project = tmp.path().join("projects/redirect-target");
+        std::fs::create_dir_all(&project).unwrap();
+        pre_trust_project(&project).unwrap();
+
+        let redirected = tmp.path().join(".claude.json");
+        assert!(
+            redirected.exists(),
+            "expected pre_trust_project to write to {} (CLAUDE_CONFIG_HOME parent)",
+            redirected.display(),
+        );
+        let body = std::fs::read_to_string(&redirected).unwrap();
+        assert!(body.contains(project.to_str().unwrap()));
+
+        match prior_disable {
+            Some(v) => std::env::set_var("CCTEAM_DISABLE_TOOL_SURFACE_BOOTSTRAP", v),
+            None => std::env::remove_var("CCTEAM_DISABLE_TOOL_SURFACE_BOOTSTRAP"),
+        }
+        match prior_config_home {
+            Some(v) => std::env::set_var("CLAUDE_CONFIG_HOME", v),
+            None => std::env::remove_var("CLAUDE_CONFIG_HOME"),
+        }
+    }
+
+    /// Mutex guarding env-var mutations in side-effect tests above.
+    /// Two tests both flipping `CLAUDE_CONFIG_HOME` would race
+    /// otherwise.
+    static ENV_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        ENV_LOCK.get_or_init(|| std::sync::Mutex::new(()))
     }
 
     #[test]
