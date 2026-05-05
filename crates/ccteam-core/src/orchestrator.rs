@@ -534,6 +534,85 @@ impl Orchestrator {
                             prev_template,
                             SubSkillTrigger::PhaseDone,
                         );
+
+                        // M2.3 follow-up: golden_rules enforcement.
+                        // Sub-skills have produced their artifacts;
+                        // now check the phase's hard contract before
+                        // declaring it passed. Decision §4.3 (c) —
+                        // orchestrator-owned post-PHASE_DONE check, not
+                        // a phase `after` hook (which would be too
+                        // easy for the phase prompt to bypass) and not
+                        // the Stop hook (which shouldn't do heavy
+                        // work). Violations block the advance and
+                        // route through the same escalation flow as
+                        // ESCALATE: the user fixes, then `ccteam
+                        // resume <slug>` re-arms the phase for retry.
+                        if !prev_template.golden_rules.is_empty() {
+                            let project_dir = self.paths.project_dir(slug);
+                            match crate::golden_rules::enforce(
+                                prev_template,
+                                &project_dir,
+                            ) {
+                                Ok(report) if !report.is_pass() => {
+                                    if let Err(err) = self
+                                        .handle_golden_rules_violation(
+                                            slug,
+                                            &from,
+                                            &report,
+                                            &mut state,
+                                            &state_path,
+                                        )
+                                    {
+                                        tracing::error!(
+                                            slug,
+                                            phase = %from,
+                                            error = %err,
+                                            "golden_rules violation handler failed",
+                                        );
+                                    }
+                                    return Ok(state);
+                                }
+                                Ok(report) => {
+                                    // PASS — log skipped rules so phase
+                                    // author sees malformed regex etc.
+                                    if !report.skipped.is_empty() {
+                                        for s in &report.skipped {
+                                            tracing::warn!(
+                                                slug,
+                                                phase = %from,
+                                                rule = %s.rule_id,
+                                                reason = %s.reason,
+                                                "golden_rule skipped",
+                                            );
+                                        }
+                                    }
+                                    let event = serde_json::json!({
+                                        "event": "golden_rules_check",
+                                        "phase": from,
+                                        "result": "pass",
+                                        "passed": report.passed,
+                                        "skipped": report.skipped,
+                                        "ts": Utc::now().to_rfc3339(),
+                                    });
+                                    let _ = progress::append_event(
+                                        &progress_path,
+                                        &event,
+                                    );
+                                }
+                                Err(err) => {
+                                    // Couldn't even run enforcement —
+                                    // not a phase fault, log and
+                                    // continue. We don't want infra
+                                    // hiccups to block dev work.
+                                    tracing::warn!(
+                                        slug,
+                                        phase = %from,
+                                        error = %err,
+                                        "golden_rules enforce failed; continuing",
+                                    );
+                                }
+                            }
+                        }
                     }
                     state.phase_history.push(PhaseHistoryEntry {
                         phase: from.clone(),
@@ -648,6 +727,80 @@ impl Orchestrator {
     /// session, and the orchestrator only routes external messages
     /// (terminal attach / channel layer) into them.
     ///
+    /// Block phase advance because at least one `golden_rules` rule
+    /// in the just-finished phase reported a violation.
+    ///
+    /// Behaves like the `Escalated` arm of `process_project`: marks
+    /// the phase entry `blocked`, leaves `phase_state` Idle so a
+    /// `ccteam resume <slug>` re-arms it after the user fixes the
+    /// underlying issue, writes a structured `escalation.md`, and
+    /// records a `golden_rules_check` event with `result: fail` for
+    /// the cross-project decisions queue (M1) to pick up.
+    fn handle_golden_rules_violation(
+        &self,
+        slug: &str,
+        from: &str,
+        report: &crate::golden_rules::GoldenRulesReport,
+        state: &mut ProjectState,
+        state_path: &Path,
+    ) -> Result<()> {
+        state.phase_history.push(PhaseHistoryEntry {
+            phase: from.to_string(),
+            status: "blocked".into(),
+            duration_s: 0,
+            cost_usd: 0.0,
+        });
+        state.phase_state = PhaseState::Idle;
+        state.last_progress_event_at = Some(Utc::now());
+        state.last_event_type = Some("golden_rules_check".into());
+
+        let esc_path = self.paths.project_ccteam_dir(slug).join("escalation.md");
+        if let Some(parent) = esc_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
+        let mut body = String::from("# Escalation: golden_rules violation\n\n");
+        body.push_str(&format!("phase: {from}\n\n## Violations\n\n"));
+        for v in &report.violations {
+            body.push_str(&format!(
+                "- **{}** ({:?}): {}\n",
+                v.rule_id, v.kind, v.detail,
+            ));
+        }
+        if !report.skipped.is_empty() {
+            body.push_str("\n## Skipped (could not evaluate)\n\n");
+            for s in &report.skipped {
+                body.push_str(&format!("- **{}**: {}\n", s.rule_id, s.reason));
+            }
+        }
+        body.push_str(
+            "\nfix the underlying issue, then run `ccteam resume <slug>` to retry the phase.\n",
+        );
+        std::fs::write(&esc_path, body)
+            .with_context(|| format!("write {}", esc_path.display()))?;
+
+        let event = serde_json::json!({
+            "event": "golden_rules_check",
+            "phase": from,
+            "result": "fail",
+            "passed": report.passed,
+            "violations": report.violations,
+            "skipped": report.skipped,
+            "ts": Utc::now().to_rfc3339(),
+        });
+        let progress_path = self.paths.progress_jsonl(slug);
+        let _ = progress::append_event(&progress_path, &event);
+
+        state.save(state_path)?;
+        tracing::warn!(
+            slug,
+            phase = %from,
+            violations = report.violations.len(),
+            "phase blocked by golden_rules violation",
+        );
+        Ok(())
+    }
+
     /// **M1.4 context-reset bridge**: meta-agents have no phase
     /// boundary, so the regular phase-edge reset (tech-design §6.9)
     /// can't trigger. Instead, we check the 60% threshold on every

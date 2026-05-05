@@ -27,6 +27,7 @@ chrono = { version = "0.4", default-features = false, features = ["serde", "cloc
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
+regex = { version = "1", default-features = false, features = ["std", "perf"] }
 
 [profile.release]
 lto = true

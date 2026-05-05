@@ -574,98 +574,37 @@ mod tests {
         assert!(format!("{err:#}").contains("home directory"));
     }
 
-    // ---- side-effect guards: integration-style, but isolated via
-    //      tempdir paths so no real-home dependency. ----
+    // ---- side-effect guards ----
+    //
+    // The full "bootstrap_project doesn't write to real ~/.claude.json"
+    // assertion lives in `crates/ccteam-core/tests/tool_surface_e2e_test.rs`
+    // where CLAUDE_CONFIG_HOME redirection runs in its own test binary
+    // process — there it's safe to mutate the env var because no
+    // other test in the same binary reads it concurrently.
+    //
+    // Inline tests below verify the *guard logic* without mutating any
+    // process-wide env var, since `bootstrap_project_*` siblings in
+    // this same binary read CLAUDE_CONFIG_HOME via bootstrap_project →
+    // pre_trust_project → resolve_claude_json_path; an env_lock here
+    // would protect our tests from each other but not from those
+    // siblings, which is precisely the race condition that broke an
+    // earlier draft of these tests.
 
     #[test]
-    fn pre_trust_project_no_ops_when_disable_flag_set() {
-        // Regression (2026-05-06): tests calling bootstrap_project were
-        // leaking /tmp/.tmpXXX/projects/<slug> entries into the
-        // developer's real ~/.claude.json — the file grew to 43k+ and
-        // broke claude login. The disable flag must short-circuit
-        // pre_trust_project the same way it short-circuits the agent
-        // symlink path.
-        //
-        // Verification approach: redirect CLAUDE_CONFIG_HOME to a
-        // tempdir and assert the redirected .claude.json is **not**
-        // created — proving the early-return fired. Using
-        // CLAUDE_CONFIG_HOME (rather than $HOME) keeps the test
-        // independent of dirs::home_dir()'s read of the developer's
-        // real home.
+    fn disable_flag_recognized_when_ensure_isolation_ran() {
+        // Regression hook for the 2026-05-06 ~/.claude.json bloat: the
+        // disable flag was wired only into setup_tool_surface, not
+        // pre_trust_project. The unit-level guarantee we want is that
+        // ensure_isolation() — which all bootstrap_project-touching
+        // tests call — surfaces a `true` from the same env-var check
+        // pre_trust_project uses.
         ensure_isolation();
-        // ENV_LOCK guards CLAUDE_CONFIG_HOME so other tests in this
-        // binary don't race the read.
-        let _guard = env_lock().lock().unwrap();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let claude_dir = tmp.path().join(".claude");
-        std::fs::create_dir_all(&claude_dir).unwrap();
-        let prior_config_home = std::env::var("CLAUDE_CONFIG_HOME").ok();
-        std::env::set_var("CLAUDE_CONFIG_HOME", &claude_dir);
-
-        let project = tmp.path().join("projects/abc");
-        std::fs::create_dir_all(&project).unwrap();
-        pre_trust_project(&project).unwrap();
-
-        let redirected = tmp.path().join(".claude.json");
+        let v = std::env::var("CCTEAM_DISABLE_TOOL_SURFACE_BOOTSTRAP").ok();
         assert!(
-            !redirected.exists(),
-            "disable flag should short-circuit pre_trust_project entirely; \
-             expected no .claude.json at {} but it was written",
-            redirected.display(),
+            matches!(v.as_deref(), Some("1") | Some("true") | Some("yes")),
+            "ensure_isolation must set CCTEAM_DISABLE_TOOL_SURFACE_BOOTSTRAP \
+             to a truthy value the disable check recognizes; got {v:?}",
         );
-
-        match prior_config_home {
-            Some(v) => std::env::set_var("CLAUDE_CONFIG_HOME", v),
-            None => std::env::remove_var("CLAUDE_CONFIG_HOME"),
-        }
-    }
-
-    #[test]
-    fn pre_trust_project_writes_to_redirected_claude_json_when_config_home_set() {
-        // Production-equivalent path: tool_surface_e2e_test-style tests
-        // that exercise the real trust-write semantics but redirect
-        // CLAUDE_CONFIG_HOME to a tempdir. With the disable flag
-        // explicitly off, the write happens — just at the redirected
-        // location, not the developer's real ~/.claude.json.
-        let _guard = env_lock().lock().unwrap();
-        let prior_disable = std::env::var("CCTEAM_DISABLE_TOOL_SURFACE_BOOTSTRAP").ok();
-        let prior_config_home = std::env::var("CLAUDE_CONFIG_HOME").ok();
-        std::env::remove_var("CCTEAM_DISABLE_TOOL_SURFACE_BOOTSTRAP");
-
-        let tmp = tempfile::TempDir::new().unwrap();
-        let claude_dir = tmp.path().join(".claude");
-        std::fs::create_dir_all(&claude_dir).unwrap();
-        std::env::set_var("CLAUDE_CONFIG_HOME", &claude_dir);
-
-        let project = tmp.path().join("projects/redirect-target");
-        std::fs::create_dir_all(&project).unwrap();
-        pre_trust_project(&project).unwrap();
-
-        let redirected = tmp.path().join(".claude.json");
-        assert!(
-            redirected.exists(),
-            "expected pre_trust_project to write to {} (CLAUDE_CONFIG_HOME parent)",
-            redirected.display(),
-        );
-        let body = std::fs::read_to_string(&redirected).unwrap();
-        assert!(body.contains(project.to_str().unwrap()));
-
-        match prior_disable {
-            Some(v) => std::env::set_var("CCTEAM_DISABLE_TOOL_SURFACE_BOOTSTRAP", v),
-            None => std::env::remove_var("CCTEAM_DISABLE_TOOL_SURFACE_BOOTSTRAP"),
-        }
-        match prior_config_home {
-            Some(v) => std::env::set_var("CLAUDE_CONFIG_HOME", v),
-            None => std::env::remove_var("CLAUDE_CONFIG_HOME"),
-        }
-    }
-
-    /// Mutex guarding env-var mutations in side-effect tests above.
-    /// Two tests both flipping `CLAUDE_CONFIG_HOME` would race
-    /// otherwise.
-    static ENV_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
-    fn env_lock() -> &'static std::sync::Mutex<()> {
-        ENV_LOCK.get_or_init(|| std::sync::Mutex::new(()))
     }
 
     #[test]
