@@ -252,6 +252,65 @@ ccteam 服务于「**想做软件、但不想（也不应）成为项目经理**
 
 ---
 
+### 痛点 13：大项目串行慢，并行规模选不对
+
+**场景 A（项目过大，默认串行太慢）：** 提需求"做一个完整的 SaaS：后端 API + 前端 dashboard + 移动 app + 用户文档"。
+
+ccteam 跑了一周——一个 implement phase 串行做完后端，再切前端，再切 mobile，再切文档。我看着进度条想：**这四件事明明可以并行**，加起来三天就够了。
+
+**场景 B（项目太小，默认并行又浪费）：** 提需求"做个 todo list，本地存 SQLite"。
+
+ccteam 主动开了 4 个 tmux session 并行——后端 1 个、前端 1 个、tests 1 个、docs 1 个。结果总 token 翻 4 倍，代码反而更乱（子模块边界过早划开，接口对不齐）。**这点活根本不需要并行**。
+
+**问题的本质：**
+- Claude Code 提供三档并行机制（subagent / Agent Teams / 多 session），粒度从小到大。
+- 用户不该知道何时用哪个——但**必须有人决定**，否则要么慢要么浪费。
+- 默认串行：大项目太慢；粗暴 always-parallel：小项目资源浪费。
+
+**与痛点 11 L2 的区别——质量并行 vs 速度并行（很容易混）**：
+- 痛点 11 L2 = 多 agent **同一输入不同视角议事**（垂直，为正确）——3 个 agent 看同一份 plan 各提意见。
+- 痛点 13 = 多 agent **各做不同事**（水平，为加速）——3 个 agent 各写一份不同代码模块。
+- 同样"多 agent"，但前者并行**审同一件事**，后者并行**做不同事**；不能混用一种机制兼顾两者。
+
+**与痛点 5 的区别——项目内 vs 项目间**：
+- 痛点 5 = 5 个独立项目并发推进（inbox 调度）。
+- 痛点 13 = 1 个大项目内部拆 N 路加速（单项目并行结构）。
+
+**与痛点 12 的区别——并行 vs 串行**：
+- 痛点 12 = 串行 workflow 接力（plan → review → ship，不漏不错）。
+- 痛点 13 = 同一 phase 内不同子任务并行（implement = backend ∥ frontend ∥ mobile）。
+
+**用户真正的诉求：**
+> "我提需求，系统自己评估这事多大、能拆几路、用什么粒度的并行。简单的就串行做，中等的 phase 内并行，大型的开多 session。**我不要知道'subagent vs Agent Teams vs 多 session'是啥——我只要进度合理快、token 不浪费**。"
+
+**关键洞见——三档不是互斥，而是叠加层级**：
+
+很多人误把三档当 either-or 选择。事实上**它们是叠加层级**：
+
+| 项目尺度 | 主框架 | 叠加层 1 | 叠加层 2 |
+|---|---|---|---|
+| 大型（多子模块） | `multi_session`（每子模块独立 session） | `Agent Teams`（每 session 内 phase 多角色） | `subagent`（每 agent 内研究 / 单点 audit） |
+| 中型（单 session 多角色） | `Agent Teams` | `subagent`（每 agent 内研究） | — |
+| 小型（单线） | `solo` | `subagent`（偶尔研究 / 单点 audit） | — |
+
+具体例子：implement phase 启动 Agent Teams，`backend-dev` / `frontend-dev` / `reviewer` 三 agent 并行；**backend-dev 内部**同时用 `Task` 工具启 subagent 研究"我们 codebase 怎么用 SQLAlchemy"。两者**同时发生**，职责互不重叠——Agent Teams 做**横向多角色**，subagent 做**纵向 context 节流**。三档机制可以**逐层嵌套**，不是 either-or。
+
+**ccteam 设计的回应**：
+- **plan-eng 阶段决定主框架并行粒度**——根据 spec 复杂度估算，phase front matter 输出 `parallelism: solo | agent_team | multi_session`。
+- **subagent 不在 phase 协议中声明**——任何 agent 在任何 phase 都可 ad-hoc 启 subagent（`Task` 工具），不需要 phase 协议许可，叠加在主框架之上。
+- **三档实现节奏**：
+  - **solo（M0 默认）**：主线串行，可叠加 ad-hoc subagent。
+  - **agent_team（M2）**：phase 内启 Agent Teams（已规划在 tech-design §6.3），叠加 subagent。
+  - **multi_session（M3）**：同项目开 N 个 tmux session，每 session 跑一个子模块的 phase 流；通过 `.ccteam/sub-modules/<name>/` 隔离；phase 边界 sync（plan-eng 完成后 fan-out，review/ship 前 fan-in）。
+- **资源约束**：`config.yml` 加 `max_sessions_per_project: 4` / `max_subagents_per_phase: 5` 兜底。
+
+**边界——这条不解决什么**：
+- 不解决**自动任务分解**（M5 才碰）——本痛点假设 plan-eng 已能识别"有 N 个独立子模块"。
+- 不解决**子模块接口同步**（API 契约管理也是 M5）。
+- M0/M1 不引入 multi_session per project——默认 solo + 偶尔 subagent 够用。
+
+---
+
 ## 三、用户对"理想体验"的描述
 
 如果让目标用户用一句话描述他想要的工具，他会说：
@@ -268,6 +327,7 @@ ccteam 服务于「**想做软件、但不想（也不应）成为项目经理**
 | **决策频次** | 极低——AI 自检处理大多数；用户上推典型 0-2 次/项目 |
 | **AI 自检层** | 多 agent 互检（architect / critic / designer / security / scope-watcher）+ 架构约束（写死的红线）；agent 议出共识就过——这层处理 95%+ 决策 |
 | **工作流编排** | 系统自己串主干 phase + sub-skill 自动 trigger + 产物自动接力；用户只提需求，不需要触发任何命令、不需要记任何工具放在哪个 phase |
+| **并行规模** | 系统按 spec 复杂度自动选 `parallelism: solo / agent_team / multi_session`；subagent 任何粒度都可叠加；用户不感知"何时用哪档" |
 | **用户兜底层** | agent 议不出共识时 push：摆 2-3 个选项 + 推荐 + 一句话 tweak；24h 不响应默认通过；可调 agent 自信阈值（yolo / balanced / careful） |
 | **失败处理** | AI 自己尝试 N 轮后才来找我，并附"试过什么 / 卡在哪" |
 | **多项目** | 排队执行，自动推进，不需要我手动调度 |
@@ -305,6 +365,7 @@ ccteam 是否成功，**不**由这些指标判断：
 5. **用户做的项目越多，下一个越快**——经验自动沉淀，无需手动整理。
 6. **方向不跑偏**——多 agent 互检拦住绝大多数偏差；agent 议不出共识时，用户 30 秒拍板。终态不出现"交付的不是我要的"。
 7. **零编排负担**——项目从想法到交付，用户不需要 trigger 任何 phase / skill / plugin；新工具出现时，系统自己判断该装到哪个 phase。
+8. **并行规模合理**——大项目自动多 session 加速、小项目串行不浪费；solo / Agent Teams / 多 session / subagent 三层叠加由系统自动决定，用户不感知。
 
 ---
 
@@ -326,6 +387,7 @@ ccteam 的定位是：
 | 想法可行性 | 用户自己判断 | AI 自动评估，否掉无效想法 |
 | 方向校准 | 持续在场把控 | L1 架构约束 + L2 多 agent 互检 + L3 用户兜底（三层纵深防御） |
 | 工作流编排 | 用户手动调命令（知道哪个何时用、产物怎么接） | 系统预编排 phase pipeline + sub-skill 自动 trigger + 产物自动接力；新工具加入由 ccteam 决定挂载点 |
+| 并行规模 | 用户手动决定单线 / 多线、何时开多 session | 系统按 spec 复杂度自动选 `solo / agent_team / multi_session`；三档可叠加 subagent |
 | 经验沉淀 | 项目内文档 | 跨项目自动复用 |
 | 目标用户 | 想当 team-lead 的人 | **不想**当 team-lead 但**仍要在 AI 团队议不出来时拍板**的人 |
 
