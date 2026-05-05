@@ -2,13 +2,24 @@
 //! shutdown contract, and that the loop ticks on a short interval.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use ccteam_core::tmux::{tmux_available, TmuxSession};
 use ccteam_core::{
-    bootstrap_project, CcteamPaths, Orchestrator, OrchestratorConfig, ProjectState,
+    bootstrap_project, disable_tool_surface_bootstrap_for_tests, CcteamPaths, Orchestrator,
+    OrchestratorConfig, ProjectState,
 };
 use tempfile::TempDir;
+
+/// One-time disable of tool-surface mutation for this binary so the
+/// ensure_session tests don't pollute the developer's real
+/// ~/.claude/. Per-test ScopedEnv guards still work for the M0.5.3
+/// validator test that wants an isolated CLAUDE_CONFIG_HOME.
+static DISABLE_TOOL_SURFACE: OnceLock<()> = OnceLock::new();
+fn ensure_isolation() {
+    DISABLE_TOOL_SURFACE.get_or_init(disable_tool_surface_bootstrap_for_tests);
+}
 
 fn fresh_paths(tmp: &TempDir) -> CcteamPaths {
     CcteamPaths {
@@ -223,6 +234,7 @@ fn ensure_session_starts_a_missing_session() {
     let tmp = TempDir::new().unwrap();
     let paths = fresh_paths(&tmp);
     let slug = format!("ensure-test-{}", std::process::id());
+    ensure_isolation();
     bootstrap_project(&paths, &slug, "test request").unwrap();
 
     let project_dir = paths.project_dir(&slug);
@@ -273,6 +285,7 @@ fn ensure_session_is_no_op_when_session_alive() {
     let tmp = TempDir::new().unwrap();
     let paths = fresh_paths(&tmp);
     let slug = format!("ensure-noop-{}", std::process::id());
+    ensure_isolation();
     bootstrap_project(&paths, &slug, "test request").unwrap();
 
     let project_dir = paths.project_dir(&slug);

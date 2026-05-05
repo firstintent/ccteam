@@ -39,10 +39,10 @@ pub use templates::{
 };
 pub use tmux::{pid_is_alive, session_name_for_slug, tmux_available, TmuxSession};
 pub use tool_surface::{
-    ensure_skills_placeholders, link_recommended_agents, link_recommended_agents_into,
-    missing_tools, user_claude_dir, AgentLinkAction, AgentLinkReport, LinkOptions,
-    MissingTool, RecommendedAgent, ToolSurfaceSnapshot, ToolsRequired, BUILTIN_SUBAGENTS,
-    RECOMMENDED_AGENTS,
+    disable_tool_surface_bootstrap_for_tests, ensure_skills_placeholders,
+    link_recommended_agents, link_recommended_agents_into, missing_tools, user_claude_dir,
+    AgentLinkAction, AgentLinkReport, LinkOptions, MissingTool, RecommendedAgent,
+    ToolSurfaceSnapshot, ToolsRequired, BUILTIN_SUBAGENTS, RECOMMENDED_AGENTS,
 };
 
 /// Crate version, identical to the workspace package version.

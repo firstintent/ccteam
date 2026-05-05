@@ -12,8 +12,7 @@ use crate::paths::CcteamPaths;
 use crate::state::ProjectState;
 use crate::templates::{write_project_phase_templates, write_project_settings};
 use crate::tool_surface::{
-    ensure_skills_placeholders, link_recommended_agents_into, user_claude_dir,
-    AgentLinkAction, LinkOptions,
+    link_recommended_agents_into, user_claude_dir, AgentLinkAction, LinkOptions,
 };
 
 /// Slugify a free-text project request: keep `[a-z0-9]`, collapse other
@@ -163,7 +162,32 @@ pub fn pre_trust_project(project_dir: &Path) -> Result<()> {
 /// Symlink the `RECOMMENDED_AGENTS` set into `~/.claude/agents/` and
 /// pre-create the global + project-local skills placeholder dirs. See
 /// the call site in `bootstrap_project` for the timing constraint.
+///
+/// **Test isolation**: tests that call `bootstrap_project` but don't
+/// want to mutate the developer's real `~/.claude/` should set the
+/// env var `CCTEAM_DISABLE_TOOL_SURFACE_BOOTSTRAP=1` (or set
+/// `CLAUDE_CONFIG_HOME` to a tempdir and let it run). Production
+/// never sets the disable flag, so the only way for the symlinks to
+/// land is through bootstrap_project.
+///
+/// The project-local `<project>/.claude/skills/` placeholder is
+/// created unconditionally — it lives under `project_dir` (a
+/// tempdir during tests) and carries no global-pollution risk.
 fn setup_tool_surface(project_dir: &Path) -> Result<()> {
+    // Project-local placeholder always created — see doc comment.
+    let project_skills = project_dir.join(".claude").join("skills");
+    std::fs::create_dir_all(&project_skills)
+        .with_context(|| format!("create {}", project_skills.display()))?;
+
+    if std::env::var("CCTEAM_DISABLE_TOOL_SURFACE_BOOTSTRAP")
+        .ok()
+        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+    {
+        tracing::debug!(
+            "CCTEAM_DISABLE_TOOL_SURFACE_BOOTSTRAP set; skipping global ~/.claude/ tool-surface setup",
+        );
+        return Ok(());
+    }
     let claude = user_claude_dir()?;
     let reports = link_recommended_agents_into(&claude, LinkOptions::default())?;
     for r in &reports {
@@ -177,15 +201,21 @@ fn setup_tool_surface(project_dir: &Path) -> Result<()> {
                 agent = r.agent.filename,
                 "plugin agent symlink already in place",
             ),
+            AgentLinkAction::Replaced { previous_target } => tracing::info!(
+                agent = r.agent.filename,
+                previous = %previous_target.display(),
+                "replaced foreign symlink with plugin source (force=true)",
+            ),
+            AgentLinkAction::Kept { previous_target } => tracing::warn!(
+                agent = r.agent.filename,
+                previous = %previous_target.display(),
+                "agent symlink points elsewhere — `Task(subagent_type=...)` will hit the foreign target. \
+                 run `ccteam doctor --install-recommended-agents --force` to replace.",
+            ),
             AgentLinkAction::SkippedUserFile => tracing::warn!(
                 agent = r.agent.filename,
                 target = %r.target.display(),
                 "user-authored agent file at target; not overwriting (use `ccteam doctor --install-recommended-agents --force` to replace)",
-            ),
-            AgentLinkAction::Replaced { previous_target } => tracing::warn!(
-                agent = r.agent.filename,
-                previous = %previous_target.display(),
-                "agent symlink already pointed elsewhere; not replacing without --force",
             ),
             AgentLinkAction::SkippedSourceMissing { source } => tracing::warn!(
                 agent = r.agent.filename,
@@ -195,7 +225,12 @@ fn setup_tool_surface(project_dir: &Path) -> Result<()> {
             AgentLinkAction::DryRun { .. } => {}
         }
     }
-    ensure_skills_placeholders(&claude, project_dir)?;
+    // Global ~/.claude/skills/ — only when not in test-disable mode
+    // (covered above). Project-local skills dir was already created
+    // unconditionally at function entry.
+    let global_skills = claude.join("skills");
+    std::fs::create_dir_all(&global_skills)
+        .with_context(|| format!("create {}", global_skills.display()))?;
     Ok(())
 }
 
@@ -270,7 +305,15 @@ pub(crate) fn write_trust_entry(claude_json: &Path, project_dir: &Path) -> Resul
 
 #[cfg(test)]
 mod tests {
+    use std::sync::OnceLock;
+
     use super::*;
+
+    static DISABLE_TOOL_SURFACE: OnceLock<()> = OnceLock::new();
+    fn ensure_isolation() {
+        DISABLE_TOOL_SURFACE
+            .get_or_init(crate::tool_surface::disable_tool_surface_bootstrap_for_tests);
+    }
 
     #[test]
     fn slugify_keeps_alphanumeric_lowercase() {
@@ -377,6 +420,7 @@ mod tests {
 
     #[test]
     fn bootstrap_project_writes_phase_templates_into_dot_ccteam_phases() {
+        ensure_isolation();
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = CcteamPaths {
             root: tmp.path().join("home"),
@@ -397,9 +441,10 @@ mod tests {
     fn bootstrap_project_creates_project_local_skills_placeholder() {
         // M0.5.2: the project-side `<project>/.claude/skills/` dir must
         // exist at session start so Claude Code's live SKILL.md monitor
-        // attaches there. Independent of the global `~/.claude/skills/`
-        // path (which `setup_tool_surface` also creates but is harder
-        // to assert here without env-var fiddling).
+        // attaches there. The project-local mkdir runs **before** the
+        // tool-surface gate, so it works even with the disable flag set
+        // (other tests in this binary may have set it).
+        ensure_isolation();
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = CcteamPaths {
             root: tmp.path().join("home"),

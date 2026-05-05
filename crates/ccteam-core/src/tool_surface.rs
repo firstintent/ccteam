@@ -108,15 +108,25 @@ pub const RECOMMENDED_AGENTS: &[RecommendedAgent] = &[
 /// What `link_recommended_agents_into` did for one agent. Surfaced so
 /// `ccteam doctor --install-recommended-agents` can render a per-agent
 /// status line.
+///
+/// The `Kept` vs `Replaced` split matters: a foreign symlink left
+/// in place (Kept) means `Task(subagent_type=…)` will hit the user's
+/// stale target, **not** the plugin source we wanted; only `Replaced`
+/// (force=true) actually leaves the registration in a usable state.
+/// `is_ok` reflects this so the doctor verdict doesn't lie.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentLinkAction {
     /// Created a fresh symlink target → source.
     Linked,
     /// A symlink already pointed at our source; no-op.
     AlreadyLinked,
-    /// Symlink existed but pointed elsewhere; left alone (force=false)
-    /// or replaced (force=true).
+    /// Symlink existed and pointed *elsewhere*. We removed it and
+    /// replaced it with our source (force=true). Now correct.
     Replaced { previous_target: PathBuf },
+    /// Symlink existed and pointed *elsewhere*. force=false, so we
+    /// left it alone. The slot is **not** wired to our plugin source —
+    /// `Task(subagent_type=…)` will still hit the wrong target.
+    Kept { previous_target: PathBuf },
     /// A regular file existed at the target; skipped to preserve user
     /// authorship. `force=true` would replace it instead.
     SkippedUserFile,
@@ -128,17 +138,20 @@ pub enum AgentLinkAction {
 }
 
 impl AgentLinkAction {
-    /// True if this action made (or would make) the symlink correct
-    /// in non-dry-run mode. Used by the `bootstrap` and `doctor` paths
-    /// to decide overall success.
+    /// True if this action made (or would make) the symlink point at
+    /// our plugin source. Used by the `bootstrap` and `doctor` paths
+    /// to decide overall success. **Excludes** `Kept` because that
+    /// leaves a foreign symlink in place.
     pub fn is_ok(&self) -> bool {
-        matches!(
-            self,
+        match self {
             AgentLinkAction::Linked
-                | AgentLinkAction::AlreadyLinked
-                | AgentLinkAction::Replaced { .. }
-                | AgentLinkAction::DryRun { .. }
-        )
+            | AgentLinkAction::AlreadyLinked
+            | AgentLinkAction::Replaced { .. } => true,
+            AgentLinkAction::DryRun { would } => would.is_ok(),
+            AgentLinkAction::Kept { .. }
+            | AgentLinkAction::SkippedUserFile
+            | AgentLinkAction::SkippedSourceMissing { .. } => false,
+        }
     }
 }
 
@@ -215,7 +228,7 @@ fn link_one_agent(
                 previous_target: existing,
             }
         } else {
-            AgentLinkAction::Replaced {
+            AgentLinkAction::Kept {
                 previous_target: existing,
             }
         }
@@ -303,6 +316,18 @@ pub fn user_claude_dir() -> Result<PathBuf> {
 pub fn link_recommended_agents(opts: LinkOptions) -> Result<Vec<AgentLinkReport>> {
     let claude_dir = user_claude_dir()?;
     link_recommended_agents_into(&claude_dir, opts)
+}
+
+/// Test-only helper: set `CCTEAM_DISABLE_TOOL_SURFACE_BOOTSTRAP=1` so
+/// any subsequent `bootstrap_project` call in the same process
+/// no-ops the `~/.claude/` mutation. Use from a once-init at the top
+/// of test files that exercise `bootstrap_project` but don't care
+/// about tool-surface side effects.
+///
+/// Safe across parallel test threads (env var write is atomic on
+/// Linux); idempotent because it's one fixed value.
+pub fn disable_tool_surface_bootstrap_for_tests() {
+    std::env::set_var("CCTEAM_DISABLE_TOOL_SURFACE_BOOTSTRAP", "1");
 }
 
 /// Pre-create both skills directories so Claude Code's live SKILL.md
@@ -496,7 +521,10 @@ impl MissingTool {
                 }
             }
             MissingTool::Skill(name) => format!(
-                "install the `{name}` skill (e.g. `~/.claude/skills/{name}/SKILL.md`) or remove it from `tools_required.skills`"
+                "install the `{name}` skill — drop a SKILL.md at `~/.claude/skills/{name}/`, \
+                 or install a plugin that ships it under \
+                 `~/.claude/plugins/marketplaces/<market>/plugins/<plugin>/skills/{name}/`. \
+                 If the skill is not needed, remove it from `tools_required.skills`."
             ),
             MissingTool::Mcp(name) => format!(
                 "register MCP server `{name}` in ~/.claude.json `mcpServers` section, or remove it from `tools_required.mcp`"

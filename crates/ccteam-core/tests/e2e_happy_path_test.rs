@@ -7,14 +7,27 @@
 //! orchestrator's decision layer + state.json transitions hold up
 //! across all 6 phases without leaks or mis-routes.
 
+use std::sync::OnceLock;
+
 use chrono::{SecondsFormat, Utc};
 use serde_json::json;
 use tempfile::TempDir;
 
 use ccteam_core::{
-    bootstrap_project, decide_tick, is_terminal, next_phase, progress, slugify,
-    CcteamPaths, PhaseHistoryEntry, PhaseState, ProjectState, TickAction, FIRST_PHASE,
+    bootstrap_project, decide_tick, disable_tool_surface_bootstrap_for_tests,
+    is_terminal, next_phase, progress, slugify, CcteamPaths, PhaseHistoryEntry,
+    PhaseState, ProjectState, TickAction, FIRST_PHASE,
 };
+
+/// These tests don't care about the tool-surface side effects of
+/// bootstrap_project — they want it to write project files and
+/// nothing else. Disable the ~/.claude/ mutation for the whole
+/// binary so cargo test doesn't pollute the developer's real
+/// agents/ + skills/ dirs.
+static DISABLE_TOOL_SURFACE: OnceLock<()> = OnceLock::new();
+fn ensure_isolation() {
+    DISABLE_TOOL_SURFACE.get_or_init(disable_tool_surface_bootstrap_for_tests);
+}
 
 const M0_DAG: &[&str] = &[
     "plan-eng",
@@ -60,6 +73,7 @@ fn full_pipeline_advances_through_every_m0_phase() {
     let request = "Build a tiny CLI greeter that prints hello";
 
     let slug = slugify(request);
+    ensure_isolation();
     bootstrap_project(&paths, &slug, request).unwrap();
 
     let state_path = paths.project_state(&slug);
@@ -144,6 +158,7 @@ fn full_pipeline_runs_three_times_without_leaking_state() {
         let tmp = TempDir::new().unwrap();
         let paths = fresh(&tmp);
         let slug = slugify(&format!("smoke {run}"));
+        ensure_isolation();
         bootstrap_project(&paths, &slug, "smoke").unwrap();
         let state_path = paths.project_state(&slug);
 
@@ -197,6 +212,7 @@ fn pipeline_halts_on_escalate_event_mid_dag() {
     let tmp = TempDir::new().unwrap();
     let paths = fresh(&tmp);
     let slug = slugify("escalate-test");
+    ensure_isolation();
     bootstrap_project(&paths, &slug, "escalate test").unwrap();
     let state_path = paths.project_state(&slug);
 

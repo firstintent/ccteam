@@ -238,16 +238,16 @@ impl ParsedEscalate {
 }
 
 /// Strip `<keyword>` from the front of `s` only when it's followed by
-/// a word boundary (whitespace, dash, end of string). Prevents
-/// e.g. `ABORT_LATER` from matching `ABORT`.
+/// a word boundary (whitespace, em dash, or `-`). Prevents e.g.
+/// `ABORTED` matching `ABORT`. Documented separators in
+/// `interfaces.md §4.1.1`: em dash, `--`, and ` - ` (whitespace
+/// bounded). Colon is *not* a separator — `ABORT:foo` is bare text.
 fn strip_grammar_prefix<'a>(s: &'a str, keyword: &str) -> Option<&'a str> {
     let rest = s.strip_prefix(keyword)?;
     let next = rest.chars().next();
     match next {
         None => Some(rest),
-        Some(c) if c.is_whitespace() || c == '-' || c == '\u{2014}' || c == ':' => {
-            Some(rest)
-        }
+        Some(c) if c.is_whitespace() || c == '-' || c == '\u{2014}' => Some(rest),
         _ => None, // word continues — not a real prefix match
     }
 }

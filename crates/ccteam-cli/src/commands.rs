@@ -313,7 +313,10 @@ fn format_action_label(action: &AgentLinkAction) -> String {
         Linked => "linked".into(),
         AlreadyLinked => "already-linked".into(),
         Replaced { previous_target } => {
-            format!("kept (was -> {})", previous_target.display())
+            format!("replaced (was -> {})", previous_target.display())
+        }
+        Kept { previous_target } => {
+            format!("kept foreign link (was -> {}; use --force to replace)", previous_target.display())
         }
         SkippedUserFile => "skipped (user file)".into(),
         SkippedSourceMissing { source } => {
@@ -707,9 +710,21 @@ fn truncate(s: &str, n: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::OnceLock;
+
     use super::*;
-    use ccteam_core::progress;
+    use ccteam_core::{disable_tool_surface_bootstrap_for_tests, progress};
     use tempfile::TempDir;
+
+    /// Disable tool-surface ~/.claude/ mutation for the whole test
+    /// binary. These tests exercise CLI command rendering, not the
+    /// agent symlink chain — that's tested separately in
+    /// crates/ccteam-core/tests/tool_surface_e2e_test.rs with
+    /// CLAUDE_CONFIG_HOME isolation.
+    static DISABLE_TOOL_SURFACE: OnceLock<()> = OnceLock::new();
+    fn ensure_isolation() {
+        DISABLE_TOOL_SURFACE.get_or_init(disable_tool_surface_bootstrap_for_tests);
+    }
 
     fn fresh_paths(tmp: &TempDir) -> CcteamPaths {
         CcteamPaths {
@@ -720,6 +735,7 @@ mod tests {
 
     #[test]
     fn run_new_creates_slug_and_bootstrap_files() {
+        ensure_isolation();
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
         let slug = run_new(&paths, "Build a bookmark manager").unwrap();
@@ -749,6 +765,7 @@ mod tests {
 
     #[test]
     fn run_ls_json_emits_orchestrator_block_with_active_count() {
+        ensure_isolation();
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
         run_new(&paths, "demo one").unwrap();
@@ -763,6 +780,7 @@ mod tests {
 
     #[test]
     fn run_show_json_includes_state_and_artifacts() {
+        ensure_isolation();
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
         let slug = run_new(&paths, "demo").unwrap();
@@ -782,6 +800,7 @@ mod tests {
 
     #[test]
     fn run_resume_archives_escalation_and_resets_phase_state() {
+        ensure_isolation();
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
         let slug = run_new(&paths, "demo").unwrap();
@@ -834,6 +853,7 @@ mod tests {
 
     #[test]
     fn run_progress_emits_existing_events_without_tail() {
+        ensure_isolation();
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
         let slug = run_new(&paths, "demo").unwrap();
