@@ -16,11 +16,17 @@
 | **M0.5** | 1 周 | 工具触发面闭环——让 Claude Code 全套能力在自治模式下真正可调 | 11(地基)、12(地基) |
 | **M1** | 2 周 | 多项目并发 + Telegram 入口 | 5, 9(强化) |
 | **M2** | 2 周 | Seed Gate 否决无效想法 + Score 客观质量门 | 6, 3(强化) |
-| **M3** | 3 周 | 跨项目记忆(差异化护城河) | 10 |
-| **M4** | 3 周 | Critic Agent 闭环——超越"测试通过=完成" | 3(深化) |
-| **M5** | 3–6 月 | 大型软件长跑能力(对标 Symphony) | 长期 |
+| **M3** | 2 周 | Team Abstraction——`ccteam new --team=research` 跑通,dev 路径零回归 | 团队泛化地基 |
+| **M4** | 3 周 | 跨项目记忆(差异化护城河;retro_schema 团队感知) | 10 |
+| **M5** | 3 周 | Critic Agent 闭环——超越"测试通过=完成";critic_dimensions 团队感知 | 3(深化) |
+| **M6** | 3–6 月 | 大型软件长跑能力(对标 Symphony) | 长期 |
 
-**累计**:M0–M4 大约 13–14 周,基本覆盖 requirements.md 所有痛点。M5 进入开放探索期。
+**累计**:M0–M5 大约 15–16 周,基本覆盖 requirements.md 所有痛点。M6 进入开放探索期。
+
+**2026-05-05 reorder**:原 plan M3=记忆 / M4=Critic / M5=Symphony。现 M3=Team Abstraction
+插入到记忆 / Critic 之前——因为 retro_schema(M4)和 critic_dimensions(M5)都需要团
+队抽象作为前提,否则会写死 dev 字段后再被迫推倒重来(详见 `docs/dev-coupling-audit.md`
+F20 / `docs/ccteam-as-domain-agnostic-orchestrator.md` §2.3 / §6)。
 
 ---
 
@@ -28,21 +34,22 @@
 
 每条痛点应能指出"在哪个里程碑被解决到什么程度":
 
-| 痛点 | M0 | M0.5 | M1 | M2 | M3 | M4 |
-|---|---|---|---|---|---|---|
-| 1. 想法死于"开始" | 跑通端到端 | — | — | — | — | — |
-| 2. AI 仍要求当 PM | 跑通自治流水线 | — | — | Seed 不再问"做不做" | — | Critic 不再问"够不够好" |
-| 3. 测试是黑洞 | tests-pass 即终态 | — | — | golden-rules + 6 维评分 | — | anti-leniency + WEAK BLOCK |
-| 4. bug 修复无限循环 | fix-loop 上限 3 + escalate | — | — | — | — | — |
-| 5. 想法多全部烂尾 | — | — | 多项目并发 + 排队 | — | — | — |
-| 6. 不是每个想法都值得做 | — | — | — | Seed REJECT/CLARIFY | — | — |
-| 7. 进度不透明 | tmux + progress.jsonl | — | — | — | — | — |
-| 8. 每步都点允许 | `--dangerously-skip-permissions` | — | — | — | — | — |
-| 9. AI 团队需要主持 | 守护进程 + tmux long session + CLI `--format json` | — | Telegram 入口替代 CLI + `ccteam-control` skill | `ccteam-mcp` MCP server | — | — |
-| 10. 每项目从零开始 | — | — | — | — | RAG 召回 + 反模式 | — |
-| 11. 关键节点不把控 | L1 架构约束(hooks + required_outputs) | **L1 扩展:tools_required + 启动期可达性校验**(没工具不准跑 phase) | cross-cutting watcher 上线 | 单 critic + dev 隔离;L3 telegram fork 决策 | phase 内 audit 矩阵 + 投票共识 | anti-leniency + WEAK BLOCK |
-| 12. 工作流编排 | phase 主干 + `sub_skills` 字段定义(空允许) | **plugin agent 注册 + skill 懒注入**(让 sub_skills 真有得调) | — | sub-skill 自动 trigger + 产物接力 | 新插件按 `skill_intent.yaml` 自动挂载 | — |
-| 13. 并行规模 | phase 模板 `parallelism: solo` 字段(只此一档) | — | — | `parallelism: agent_team` 启用 | `parallelism: multi_session` 启用 | 自动并行规模识别 |
+| 痛点 | M0 | M0.5 | M1 | M2 | M3(team) | M4(memory) | M5(critic) |
+|---|---|---|---|---|---|---|---|
+| 1. 想法死于"开始" | 跑通端到端 | — | — | — | — | — | — |
+| 2. AI 仍要求当 PM | 跑通自治流水线 | — | — | Seed 不再问"做不做" | — | — | Critic 不再问"够不够好" |
+| 3. 测试是黑洞 | tests-pass 即终态 | — | — | golden-rules + 6 维评分 | — | — | anti-leniency + WEAK BLOCK(team-aware critic_dimensions) |
+| 4. bug 修复无限循环 | fix-loop 上限 3 + escalate | — | — | — | — | — | — |
+| 5. 想法多全部烂尾 | — | — | 多项目并发 + 排队 | — | — | — | — |
+| 6. 不是每个想法都值得做 | — | — | — | Seed REJECT/CLARIFY | — | — | — |
+| 7. 进度不透明 | tmux + progress.jsonl | — | — | — | — | — | — |
+| 8. 每步都点允许 | `--dangerously-skip-permissions` | — | — | — | — | — | — |
+| 9. AI 团队需要主持 | 守护进程 + tmux long session + CLI `--format json` | — | Telegram 入口替代 CLI + `ccteam-control` skill | `ccteam-mcp` MCP server | — | meta-agent 跨项目记忆落地 | — |
+| 10. 每项目从零开始 | — | — | — | — | — | RAG 召回 + 反模式(retro_schema 团队感知) | — |
+| 11. 关键节点不把控 | L1 架构约束(hooks + required_outputs) | **L1 扩展:tools_required + 启动期可达性校验** | cross-cutting watcher 上线 | 单 critic + dev 隔离;L3 telegram fork 决策 | — | phase 内 audit 矩阵 + 投票共识 | anti-leniency + WEAK BLOCK |
+| 12. 工作流编排 | phase 主干 + `sub_skills` 字段定义(空允许) | **plugin agent 注册 + skill 懒注入**(让 sub_skills 真有得调) | — | sub-skill 自动 trigger + 产物接力 | 团队抽象解锁多团队 sub_skills 共享 | 新插件按 `skill_intent.yaml` 自动挂载 | — |
+| 13. 并行规模 | phase 模板 `parallelism: solo` 字段(只此一档) | — | — | `parallelism: agent_team` 启用 | — | `parallelism: multi_session` 启用 | 自动并行规模识别 |
+| **新:团队泛化地基** | — | — | — | — | `ccteam new --team=research` 跑通,§B 审计 P0 全清 + team.yaml schema 落地 | retro_schema 团队感知(F20)、critic_dimensions 数据驱动(§A §2.3 invariant 1) | critic_dimensions per-dim anti_leniency_strictness(§A §2.3 invariant 2) |
 
 **门槛规则**:某个里程碑若未真正解决其声明的痛点,**不许跳到下一个里程碑**——这是质量门,不是日历推进。
 
@@ -171,7 +178,9 @@ ccteam 定位是"在 Claude Code 之上、不阉割其能力、自动调用其�
 | `tools_required` 校验过严 fail-fast 阻塞老项目 | 已经在 M0 跑了一半的项目升级 ccteam 后启动报缺工具 | M0.5.3 校验失败给出 `ccteam doctor --install-recommended-agents` 一键修复;`ccteam start --skip-tool-check` 临时跳过 |
 | 推荐 agent 清单跟 plugin 升级失同步 | plugin 改名 / 删除 agent 文件 | M0.5.6 体检跑出来红;CI 加一条 nightly 跑 `--tool-surface` 提前发现 |
 
+---
 
+## 3. M1 — 多项目 + Telegram(2 周)
 
 **唯一验收**:周一在 Telegram 扔 5 个想法 → 周三早上看到 3 个交付 + 2 个还在跑。
 
@@ -210,47 +219,88 @@ ccteam 定位是"在 Claude Code 之上、不阉割其能力、自动调用其�
 
 ---
 
-## 5. M3 — 跨项目记忆(3 周)
+## 5. M3 — Team Abstraction(2 周)
 
-**唯一验收**:第二次提相似项目 → Seed 阶段 prompt 里出现"上次做过 X,建议复用 Y"。
+> 见 [docs/ccteam-as-domain-agnostic-orchestrator.md](./ccteam-as-domain-agnostic-orchestrator.md)
+> §6 落点论证。本里程碑把 ccteam 从"开发团队的编排层"泛化为"任意 AI 团队的编排层",
+> 是 M4 跨项目记忆 / M5 Critic 不写死 dev 假设的前提。
+
+**唯一验收**:`ccteam new --team=research "<topic>"` 能跑通 happy path,产出最终研究
+报告;dev 团队的现有项目零迁移成本(`ccteam new "<brief>"` 默认 `--team=dev` 仍然
+工作)。
 
 | # | 任务 | 验收 | 依赖 |
 |---|---|---|---|
-| M3.1 | retro phase 自动产出 pattern.md | 项目终态(shipped/rejected/escalated)触发;输出固定字段(tech stack/坑/成功设计/不要再做) | M2.5 |
-| M3.2 | 向量索引(sqlite + sentence-transformers) | `~/.ccteam/memory/index.json` + 向量 db;`ccteam memory rebuild` 全量重建 | M3.1 |
-| M3.3 | Seed phase 接 RAG 召回 | top-3 patterns 注入 Seed prompt;命中相似失败项目时 verdict 倾向 REJECT/CLARIFY | M3.2、M2.1 |
-| M3.4 | anti-patterns 库 | REJECT 案例独立 namespace;召回时显式标注"不建议" | M3.1 |
-| M3.5 | claude-mem MCP 接入(可选) | 若稳定则替换自建索引;不稳就跳过 | M3.2 |
-| M3.6 | phase 内 audit 矩阵(L2 升级) | `architect` / `critic` / `designer` / `security` / `scope-watcher` 按 phase 启用清单跑;复用 `claude-plugins-official` 现成 agent | M2.5 | §3.6 L2 |
-| M3.7 | agent 投票与共识机制 | M3.6 audit 输出 PASS/CONCERN/BLOCK;按 `yolo`/`balanced`/`careful` 信任档位决定是否上推 L3;分裂时弹用户 | M3.6、M1.7 | §3.6 L2/L3 |
-| M3.8 | 新插件自动挂载(扩展性) | 扫 `~/.claude/plugins/.../skill_intent.yaml`;按推荐 phase 自动加进 phase 模板 `sub_skills` | M2.6 | §6.10 |
-| M3.9 | `parallelism: multi_session`(大项目加速) | 实现 fan-out / fan-in 协议:plan-eng 输出子模块清单 + interface-contracts.md;orchestrator 起 N 个 sub-session;子模块独立跑 phase;review/ship 在 master fan-in;`max_sessions_per_project=4` 兜底;一次端到端验证(SaaS demo:backend ∥ frontend ∥ docs) | M2.7、M1.5 | §6.11 |
-| M3.10 | ratatui TUI 前端(机会主义,**非关键路径**) | `ccteam tui` 可跑;直接抄 `references/agent-of-empires/` 的 Cargo.toml dep 组合(ratatui / crossterm / tokio)+ 主循环范式(event poll + 状态拉取);数据源走 `ccteam-core` lib API(M2.8 `mcp-serve` 同源 schema),不另起进程;不引入新 LLM 层(前端层 invariant) | M2.8 | §3.8 前端层 |
+| M3.1 | §B 审计的 P0 项目全部修复 | `cargo test` 全绿;dev pipeline happy path 不变;`pub use ... M0_PHASE_DAG, FIRST_PHASE` lib API breaking change 完成(`docs/dev-coupling-audit.md` F1–F4 + F12 + F13 + **F20 升级 P0**) | M0.5 |
+| M3.2 | `team.yaml` schema + 解析 | `ccteam doctor --team dev` 列出 dev 团队当前的 7 件契约都从配置读;phase YAML `tools_required` / `auto_loop` / `completion_signal` / `stall_warn_minutes`(F21)从 phase 模板读,不再依赖常量 | M3.1 |
+| M3.3 | `ccteam new --team <name>` / `start --team <name>` | `--team` 缺省值 `dev`(向后兼容);非 dev team 启动需 team.yaml 存在;`state.json.team` 字段持久化 | M3.2 |
+| M3.4 | `phases-research/` 起草纳入仓库 | 9 个 phase 模板按 `phases-research/` 目录结构入仓(已由 strategic doc §C 起草);research 团队 phase DAG 通过 `validate_team` 校验;ESCALATE 至少含 1 个团队特有前缀(如 `HYPOTHESIS_REJECTED`) | M3.2 |
+| M3.5 | research 团队端到端 happy path | 起一个真实 research 项目跑到 ship,产出 `.ccteam/report.md`;progress.jsonl 完整事件序列含 phase 切换 + auto_loop 触发 + 至少一条 ESCALATE-resume 回路 | M3.1–M3.4 |
+| M3.6 | meta-agent skill 集占位(M2.8 之后顺手) | `ccteam-control` skill body 里加一节"team selection",说明 dispatch 时 `--team` 怎么选;`ccteam-dispatch` skill 起草作为 backlog 不落地 | M3.3、M2.8 | strategic §7 |
 
-**M3 不做**:跨项目接口契约管理(M5)、自动子模块切分(M5)、跨子模块 stop-the-world 重构(M5)。
+**M3 不做**:
+- `phases-marketing/` / `phases-ops/` 起草(M3.5 验证抽象后,M5 之后任意时机做,不阻塞 critical path)
+- 跨项目记忆 namespace 化(留给 M4,因为 M3 还没记忆)
+- meta-agent conversation continuity(留给 M4 RAG 落地一并设计)
+- Critic 维度泛化(留给 M5,但 M3 起草 team.yaml schema 时必须为 critic_dimensions 留好数据形式,不允许 enum 写死)
 
-**M3 风险**:9 条任务对 3 周窗口偏紧(尤其 M3.6/3.7/3.9 都是新机制)。落地时按以下顺序削:M3.5(claude-mem MCP,可选)→ M3.4(anti-patterns,可推 M4)→ M3.8(新插件自动挂载,可推 M4)。M3.9 不可削——它是痛点 13 的最终落地。
+**M3 风险**:
+
+| 风险 | 触发 | 应对 |
+|---|---|---|
+| §B 审计 P0 项过多,M3.1 单条堵住整个里程碑 | 审计发现深层耦合(例:fix-loop 状态机假设 dev 流程) | M3.1 拆为多个子 PR,每条 P0 独立 PR;按 §B 优先级排序逐个清 |
+| dev 团队的 `team-dev.yaml` 反推时和现状不一致 | 写 team-dev.yaml 时发现某些行为靠"巧合"工作,没显式契约 | 反推时逐条对照 strategic doc §1 责任分界表;"没契约的现状"必须先写到 §1 再纳入配置 |
+| research 团队跑通靠的是借用 dev plugin 的能力,而不是真验证了契约 | research phase 模板偷懒,ESCALATE 不用自定义前缀,critic 不用自定义维度 | M3.4 验收时强制要求 research 至少有 1 个自定义 ESCALATE 前缀 + 至少 1 个 dev 没有的 critic 维度 |
+| 显式拒绝清单(strategic doc §3)被 PR 软性绕过 | "为了通用"在 ccteam-core 加 `if team == "research"` | code-review 加规则:`ccteam-core/` 内出现 team 名字符串字面量 = 自动拒收 |
 
 ---
 
-## 6. M4 — Critic Agent 闭环(3 周)
+## 6. M4 — 跨项目记忆(3 周)
+
+**唯一验收**:第二次提相似项目 → Seed 阶段 prompt 里出现"上次做过 X,建议复用 Y";
+research 项目召回不污染 dev 项目的 RAG 索引(team namespace 已落地)。
+
+| # | 任务 | 验收 | 依赖 |
+|---|---|---|---|
+| M4.1 | retro phase 自动产出 pattern.md(team-aware schema) | 项目终态(shipped/rejected/escalated)触发;字段从 `team.yaml.retro_schema[]` 读(F20 解决);dev 输出 tech stack/坑/成功设计/不要再做,research 输出方法学/数据源/假设结果 | M3.2 |
+| M4.2 | 向量索引(sqlite + sentence-transformers) | `~/.ccteam/memory/index.json` + 向量 db;**team namespace 隔离**(`team=dev` 召回不混入 `team=research` 模式);`ccteam memory rebuild` 全量重建 | M4.1 |
+| M4.3 | Seed phase 接 RAG 召回 | top-3 patterns 注入 Seed prompt;命中相似失败项目时 verdict 倾向 REJECT/CLARIFY;**只召回同 team 的 patterns**,anti-patterns 跨 team 共享 | M4.2、M2.1 |
+| M4.4 | anti-patterns 库 | REJECT 案例独立 namespace;召回时显式标注"不建议";跨 team 共享 | M4.1 |
+| M4.5 | claude-mem MCP 接入(可选) | 若稳定则替换自建索引;不稳就跳过 | M4.2 |
+| M4.6 | meta-agent conversation continuity 落地 | `claude-mem` MCP 加 user namespace,或 `~/.ccteam/meta/conversation-log.md` 滚动追加;`ccteam-control` skill 启动时主动读取(strategic doc §7.2.1) | M4.2 | strategic §7.2.1 |
+| M4.7 | phase 内 audit 矩阵(L2 升级) | `architect` / `critic` / `designer` / `security` / `scope-watcher` 按 phase 启用清单跑;复用 `claude-plugins-official` 现成 agent | M2.5 | tech-design §3.6 L2 |
+| M4.8 | agent 投票与共识机制 | M4.7 audit 输出 PASS/CONCERN/BLOCK;按 `yolo`/`balanced`/`careful` 信任档位决定是否上推 L3;分裂时弹用户 | M4.7、M1.7 | tech-design §3.6 L2/L3 |
+| M4.9 | 新插件自动挂载(扩展性) | 扫 `~/.claude/plugins/.../skill_intent.yaml`;按推荐 phase 自动加进 phase 模板 `sub_skills` | M2.6 | tech-design §6.10 |
+| M4.10 | `parallelism: multi_session`(大项目加速) | 实现 fan-out / fan-in 协议:plan-eng 输出子模块清单 + interface-contracts.md;orchestrator 起 N 个 sub-session;子模块独立跑 phase;review/ship 在 master fan-in;`max_sessions_per_project=4` 兜底;一次端到端验证(SaaS demo:backend ∥ frontend ∥ docs) | M2.7、M1.5 | tech-design §6.11 |
+| M4.11 | ratatui TUI 前端(机会主义,**非关键路径**) | `ccteam tui` 可跑;数据源走 `ccteam-core` lib API(M2.8 `mcp-serve` 同源 schema),不另起进程;不引入新 LLM 层(前端层 invariant) | M2.8 | tech-design §3.8 前端层 |
+
+**M4 不做**:跨项目接口契约管理(M6)、自动子模块切分(M6)、跨子模块 stop-the-world 重构(M6)。
+
+**M4 风险**:11 条任务对 3 周窗口偏紧(尤其 M4.7/4.8/4.10 都是新机制)。落地时按以下
+顺序削:M4.5(claude-mem MCP,可选)→ M4.4(anti-patterns,可推 M5)→ M4.9(新插件
+自动挂载,可推 M5)。M4.10 不可削——它是痛点 13 的最终落地。
+
+---
+
+## 7. M5 — Critic Agent 闭环(3 周)
 
 **唯一验收**:测试全绿但 critic 发现"接口不优雅" → 自动进 fix-cycle 而非直接 ship。
+research 项目的 critic 用 `strict` 严格度成功拦下 LLM 主观打高分的 false-pass。
 
 | # | 任务 | 验收 | 依赖 |
 |---|---|---|---|
-| M4.1 | Critic agent 独立子进程 | 复用 `pr-review-toolkit/agents/code-reviewer.md`;不与 implement 共享 session | M2.5 |
-| M4.2 | Anti-leniency 规则 | Critic 必须至少一维指出问题;不允许全维度高分 | M4.1 |
-| M4.3 | WEAK 维度强制 BLOCK | 任一维度 ≤ X 分立即进 fix-cycle,绕过"勉强通过" | M4.2 |
-| M4.4 | 评审维度 per-project 自适应 | 前端项目偏重 UX、CLI 偏重 Docs;由 plan-eng 阶段提示 | M4.1 |
-| M4.5 | Critic 与 dev 切换的 cache 优化 | dev session 跨 phase cache 复用,Critic 单独热;算总成本回报 | M4.1 |
-| M4.6 | web dashboard(机会主义,**非关键路径**) | `ccteam serve --port` 可跑,浏览器开 xterm.js 终端可远程介入项目级 claude(发送 keystroke 直通 tmux,触发 user_attach 自动暂停 phase——前端层 invariant:不在 ccteam 层起新 LLM,用户键入 = `send-keys` 注入 tmux);直接抄 `references/agent-of-empires/` 的 axum ws + xterm.js bridge 范式;参考它的 `docs/guides/web-dashboard.md` | M2.8 | §3.8 前端层 invariant |
+| M5.1 | Critic agent 独立子进程 | 复用 `pr-review-toolkit/agents/code-reviewer.md`;不与 implement 共享 session;`team.yaml.critic_dimensions[]` 数据驱动加载(strategic §A §2.3 invariant 1) | M3.2 |
+| M5.2 | Anti-leniency 规则(per-dim strictness) | `lenient` / `normal` / `strict` 三档,从 `team.yaml.critic_dimensions[].anti_leniency_strictness` 读;research 核心维度用 `strict`(strategic §A §2.3 invariant 2) | M5.1 |
+| M5.3 | WEAK 维度强制 BLOCK | 任一维度 ≤ `weak_threshold`(从 config 读,不是常量;invariant 3) 立即进 fix-cycle,绕过"勉强通过" | M5.2 |
+| M5.4 | 评审维度 per-project 自适应 | 前端项目偏重 UX、CLI 偏重 Docs;由 plan-eng 阶段提示;调权重不是改维度集 | M5.1 |
+| M5.5 | Critic 与 dev 切换的 cache 优化 | dev session 跨 phase cache 复用,Critic 单独热;算总成本回报 | M5.1 |
+| M5.6 | web dashboard(机会主义,**非关键路径**) | `ccteam serve --port` 可跑,浏览器开 xterm.js 终端可远程介入项目级 claude(发送 keystroke 直通 tmux,触发 user_attach 自动暂停 phase——前端层 invariant:不在 ccteam 层起新 LLM,用户键入 = `send-keys` 注入 tmux);直接抄 `references/agent-of-empires/` 的 axum ws + xterm.js bridge 范式 | M2.8 | tech-design §3.8 前端层 invariant |
 
-**M4 不做**:多个 Critic 并行 / 投票(M5)。
+**M5 不做**:多个 Critic 并行 / 投票(M6)。
 
 ---
 
-## 7. M5 — 长期对标 Symphony(3–6 月,开放探索)
+## 8. M6 — 长期对标 Symphony(3–6 月,开放探索)
 
 **目标**:能搭大型软件——多模块、多服务、长跑数日。
 
@@ -265,11 +315,11 @@ ccteam 定位是"在 Claude Code 之上、不阉割其能力、自动调用其�
 - 外部 tracker adapter(Linear / GitHub Projects),作为可选
 - 多用户共享单 ccteam 实例(权限 / 隔离 / 公平调度)
 
-**M5 进入条件**:M0–M4 全部经过至少 5 个真实小项目验证,确认现有协议(progress.jsonl / state.json / phase 模板)能扛住非平凡场景。
+**M6 进入条件**:M0–M5 全部经过至少 5 个真实小项目验证,确认现有协议(progress.jsonl / state.json / phase 模板 / team.yaml)能扛住非平凡场景。
 
 ---
 
-## 8. 跨里程碑依赖(关键路径)
+## 9. 跨里程碑依赖(关键路径)
 
 ```
 M0.6 (orchestrator 主循环)
@@ -284,21 +334,41 @@ M0.15 ─→ M0.5.1 (ln -sf agents) ─→ M0.5.3 (tools_required 校验) ─→
 M0.5.7 ─→ M1.1 (telegram) ─→ M1.2 (多项目) ─→ M1.5 (重启恢复) ─┬─→ M1.6 (cross-cutting watcher) ─→ M1.7 (L3 fork 决策)
                                                                 └─→ M2.1 (Seed) ─→ M2.5 (Critic 隔离) ─┬─→ M2.6 (sub-skill 调度)
                                                                                                        └─→ M2.7 (agent_team 启用)
-                                                                                                         ├─→ M3.1 (retro)
-                                                                                                         ├─→ M3.6 (audit 矩阵) ─→ M3.7 (投票)
-                                                                                                         ├─→ M3.8 (新插件自动挂载)
-                                                                                                         └─→ M3.9 (multi_session)
-
-M3.1 ─→ M3.2 (向量索引) ─→ M3.3 (Seed 接 RAG)
+                                                                                                         ↓
+                                                                                          M3.1 (P0 audit 修复 — 含 F20/F21)
+                                                                                                         ↓
+                                                                                          M3.2 (team.yaml schema) ─→ M3.3 (--team CLI)
+                                                                                                         ↓
+                                                                                          M3.4 (phases-research) ─→ M3.5 (research E2E)
+                                                                                                         ↓
+                                                                  ┌──────────────────────┴──────────────────────┐
+                                                                  ↓                                              ↓
+                                                         M4.1 (team-aware retro)                       M5.1 (Critic data-driven)
+                                                         M4.2 (RAG, namespace)                         M5.2 (anti-leniency strictness)
+                                                         M4.3 (Seed RAG)                               M5.3 (WEAK BLOCK config)
+                                                         M4.6 (meta-agent continuity)                  M5.4 (per-project 自适应)
+                                                         M4.7/4.8 (audit 矩阵 + 投票)                  M5.5 (cache opt)
+                                                         M4.10 (multi_session)
 ```
 
-不在关键路径上的(可与主线并行):M1.4(项目 CLAUDE.md)、M1.8(ccteam-control skill)、M1.9(多轮 CLARIFY)、M2.4(golden-rules)、M2.8(ccteam-mcp MCP server)、M4.4(评审自适应)、M3.5(claude-mem MCP)、M3.8(新插件挂载)、M3.10(ratatui TUI,机会主义)、M4.6(web dashboard,机会主义)。
+**关键变化(2026-05-05 reorder)**:
+- M3 = Team Abstraction(原 M4.5 提案)插入到记忆 / Critic 之前 —— retro_schema 与
+  critic_dimensions 从 day 1 就团队感知,避免 M4 / M5 完工后再被迫推倒重来
+- 旧 M3.1–M3.10 → 新 M4.1–M4.11(顺移,且 M4.1 retro 改为 team-aware schema)
+- 旧 M4.1–M4.6 → 新 M5.1–M5.6(顺移,且 M5.1/5.2/5.3 改为 config-driven)
+- 旧 M5(Symphony)→ 新 M6
 
-**关键路径变化**(因 M3.9):M2.7 → M3.9 成为新关键路径终点之一(痛点 13 最终落地);M2.7 卡住整条 multi-agent 速度并行链。
+不在关键路径上的(可与主线并行):M1.4(项目 CLAUDE.md)、M1.8(ccteam-control skill)、
+M1.9(多轮 CLARIFY)、M2.4(golden-rules)、M2.8(ccteam-mcp MCP server)、M3.6(meta-agent
+skill 集占位)、M4.4(anti-patterns)、M4.5(claude-mem MCP)、M4.9(新插件挂载)、
+M4.11(ratatui TUI,机会主义)、M5.4(评审自适应)、M5.6(web dashboard,机会主义)。
+
+**关键路径终点**(因 M4.10):M2.7 → M4.10 成为新关键路径终点之一(痛点 13 最终落地);
+M2.7 卡住整条 multi-agent 速度并行链。
 
 ---
 
-## 9. 进度风险登记
+## 10. 进度风险登记
 
 | 风险 | 概率 | 影响 | 应对 |
 |---|---|---|---|
@@ -311,13 +381,14 @@ M3.1 ─→ M3.2 (向量索引) ─→ M3.3 (Seed 接 RAG)
 
 ---
 
-## 10. 计划维护纪律
+## 11. 计划维护纪律
 
 1. **每个 PR 描述必须含**:
    - 对应任务编号(`Closes M0.X`)
    - 痛点编号(`requirements.md 痛点 N`)
    - tech-design 章节(`tech-design §X.Y`)
 2. **本文档优先于 tech-design.md §7**——§7 已退化为指针,任何里程碑变化只改本文。
-3. **任务粒度**:M0 详到子任务级(因为活跃);M1–M4 详到任务级;M5 仅高层方向。M0 完成后,把 M1 推进到子任务级。
+3. **任务粒度**:M0 详到子任务级(因为活跃);M1–M5 详到任务级;M6 仅高层方向。M0 完成后,把 M1 推进到子任务级。
 4. **里程碑推进准则**:声明该里程碑解决的痛点必须能在 §1 反向映射表里被一个真实场景验证,**不**靠 checkbox 凑数。
 5. **新工作流入**:不能映射到现有任务的需求 → backlog,不进主线(对应 tech-design §11)。
+6. **里程碑 reorder**:本文档 reorder 必须同步 update `docs/ccteam-as-domain-agnostic-orchestrator.md` §6 里程碑 label / `docs/dev-coupling-audit.md` 里出现的里程碑引用 / `docs/interfaces.md` 里出现的里程碑引用,否则跨文档不一致。2026-05-05 M3 ↔ Team Abstraction 互换是首次执行此规则。
