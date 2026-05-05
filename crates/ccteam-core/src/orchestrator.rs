@@ -18,12 +18,114 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use chrono::{SecondsFormat, Utc};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::paths::CcteamPaths;
 use crate::phases::PhaseTemplate;
 use crate::progress;
+use crate::state::{PhaseHistoryEntry, PhaseState, ProjectState};
 use crate::tmux::TmuxSession;
+
+/// M0 linear phase DAG. M2+ widens to fork on test results, sub-skill
+/// scheduling, and (M3) multi-session fan-out / fan-in.
+pub const M0_PHASE_DAG: &[(&str, Option<&str>)] = &[
+    ("plan-eng", Some("implement")),
+    ("implement", Some("test-author")),
+    ("test-author", Some("test-run")),
+    ("test-run", Some("fix")),
+    ("fix", Some("ship")),
+    ("ship", None),
+];
+
+pub const FIRST_PHASE: &str = "plan-eng";
+
+/// Next phase per M0 DAG, or `None` if `current` is terminal / unknown.
+pub fn next_phase(current: &str) -> Option<&'static str> {
+    M0_PHASE_DAG
+        .iter()
+        .find(|(p, _)| *p == current)
+        .and_then(|(_, n)| *n)
+}
+
+/// True if the project has reached a terminal state — `ship` passed or
+/// any phase escalated. Both block automatic advance until the user
+/// (M0: manual; M1: telegram) decides what to do next.
+pub fn is_terminal(state: &ProjectState) -> bool {
+    state
+        .phase_history
+        .iter()
+        .any(|h| (h.phase == "ship" && h.status == "passed") || h.status == "escalated")
+}
+
+/// Pure decision function: given the current `state` and the last
+/// progress.jsonl event, what should the orchestrator do next?
+/// Side-effecting follow-up lives in `Orchestrator::process_project`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TickAction {
+    /// Nothing to do (still in-flight, or terminal state reached).
+    NoOp,
+    /// claude completed `from`; advance state to `to` (None => DAG end).
+    AdvancePhase {
+        from: String,
+        to: Option<String>,
+    },
+    /// claude printed `ESCALATE: <reason>`. Mark the project escalated.
+    Escalated {
+        phase: String,
+        reason: String,
+    },
+    /// claude is idle; orchestrator should inject the named phase prompt.
+    DispatchPhase {
+        phase: String,
+    },
+}
+
+pub fn decide_tick(state: &ProjectState, last_event: Option<&Value>) -> TickAction {
+    if is_terminal(state) {
+        return TickAction::NoOp;
+    }
+
+    if state.phase_state == PhaseState::InFlight {
+        let Some(e) = last_event else {
+            return TickAction::NoOp; // dispatched but no events yet
+        };
+        let kind = e.get("event").and_then(|s| s.as_str()).unwrap_or("");
+        match kind {
+            "phase_done" => {
+                let phase = e.get("phase").and_then(|s| s.as_str()).unwrap_or("");
+                if phase == state.current_phase {
+                    return TickAction::AdvancePhase {
+                        from: state.current_phase.clone(),
+                        to: next_phase(&state.current_phase).map(String::from),
+                    };
+                }
+                // Stale phase_done event (e.g., from a prior phase that
+                // re-ran). Don't act on it.
+                TickAction::NoOp
+            }
+            "escalate" => {
+                let reason = e
+                    .get("reason")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("(no reason given)")
+                    .to_string();
+                TickAction::Escalated {
+                    phase: state.current_phase.clone(),
+                    reason,
+                }
+            }
+            _ => TickAction::NoOp, // still busy
+        }
+    } else {
+        // Idle: dispatch the current phase, defaulting to FIRST_PHASE.
+        let phase = if state.current_phase.is_empty() {
+            FIRST_PHASE.to_string()
+        } else {
+            state.current_phase.clone()
+        };
+        TickAction::DispatchPhase { phase }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct OrchestratorConfig {
@@ -106,6 +208,116 @@ impl Orchestrator {
         Ok(())
     }
 
+    /// Scan `~/projects/*/.ccteam/state.json` and return one entry per
+    /// loaded project. Directories without a state.json are skipped
+    /// silently; broken state.json files surface as errors.
+    pub fn discover_projects(&self) -> Result<Vec<(String, ProjectState)>> {
+        let dir = &self.paths.projects_root;
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir)
+            .with_context(|| format!("read_dir {}", dir.display()))?
+        {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(slug) = name.to_str() else { continue };
+            let state_path = self.paths.project_state(slug);
+            if !state_path.exists() {
+                continue;
+            }
+            match ProjectState::load(&state_path) {
+                Ok(state) => out.push((slug.to_string(), state)),
+                Err(err) => {
+                    tracing::warn!(
+                        slug,
+                        path = %state_path.display(),
+                        error = %err,
+                        "skip project: state.json failed to load",
+                    );
+                }
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+
+    /// Apply `decide_tick` to one project, looping the AdvancePhase →
+    /// DispatchPhase chain so a phase boundary doesn't take two ticks
+    /// to act on. The loop iteration cap is a paranoia guard.
+    pub fn process_project(&self, slug: &str, mut state: ProjectState) -> Result<ProjectState> {
+        const MAX_ITERS: u32 = 4;
+        let progress_path = self.paths.progress_jsonl(slug);
+        let state_path = self.paths.project_state(slug);
+
+        for _ in 0..MAX_ITERS {
+            let last = progress::last_event(&progress_path)?;
+            let action = decide_tick(&state, last.as_ref());
+            match action {
+                TickAction::NoOp => return Ok(state),
+                TickAction::AdvancePhase { from, to } => {
+                    state.phase_history.push(PhaseHistoryEntry {
+                        phase: from.clone(),
+                        status: "passed".into(),
+                        duration_s: 0,
+                        cost_usd: 0.0,
+                    });
+                    state.phase_state = PhaseState::Idle;
+                    state.current_phase = to.unwrap_or_default();
+                    state.last_progress_event_at = Some(Utc::now());
+                    state.last_event_type = Some("phase_done".into());
+                    state.save(&state_path)?;
+                    tracing::info!(
+                        slug,
+                        from = %from,
+                        to = %state.current_phase,
+                        "phase advanced",
+                    );
+                    // continue the loop so a fresh idle state can
+                    // dispatch the next phase in the same tick.
+                }
+                TickAction::Escalated { phase, reason } => {
+                    state.phase_history.push(PhaseHistoryEntry {
+                        phase: phase.clone(),
+                        status: "escalated".into(),
+                        duration_s: 0,
+                        cost_usd: 0.0,
+                    });
+                    state.phase_state = PhaseState::Idle;
+                    state.last_progress_event_at = Some(Utc::now());
+                    state.last_event_type = Some("escalate".into());
+                    let esc_path =
+                        self.paths.project_ccteam_dir(slug).join("escalation.md");
+                    if let Some(parent) = esc_path.parent() {
+                        std::fs::create_dir_all(parent)
+                            .with_context(|| format!("create {}", parent.display()))?;
+                    }
+                    let body = format!(
+                        "# Escalation\n\nphase: {phase}\nreason: {reason}\n\nrun `ccteam resume <slug>` once the underlying issue is fixed.\n",
+                    );
+                    std::fs::write(&esc_path, body)
+                        .with_context(|| format!("write {}", esc_path.display()))?;
+                    state.save(&state_path)?;
+                    tracing::warn!(slug, phase = %phase, reason = %reason, "project escalated");
+                    return Ok(state);
+                }
+                TickAction::DispatchPhase { phase } => {
+                    self.dispatch_phase(slug, &phase)?;
+                    state.current_phase = phase;
+                    state.phase_state = PhaseState::InFlight;
+                    state.save(&state_path)?;
+                    return Ok(state);
+                }
+            }
+        }
+        tracing::warn!(slug, "process_project hit MAX_ITERS; possible state-machine bug");
+        Ok(state)
+    }
+
     /// Run until `shutdown` resolves. Each tick + each progress event
     /// currently logs at debug level; later M0 tasks fill in the body.
     pub async fn run<F>(&self, shutdown: F) -> Result<()>
@@ -163,15 +375,18 @@ impl Orchestrator {
     }
 
     async fn poll_tick(&self, tick_count: u64) -> Result<()> {
-        // M0.7 will: scan `~/projects/<slug>/.ccteam/state.json` files,
-        // ensure each project's tmux session is alive, dispatch the next
-        // phase via idle-aware send-keys (M0.8), reset on 60% context
-        // (M0.10), warn on stall (M0.13), accumulate cost (M0.14).
+        let projects = self.discover_projects()?;
         tracing::debug!(
             tick = tick_count,
             templates = self.templates.len(),
+            projects = projects.len(),
             "orchestrator tick",
         );
+        for (slug, state) in projects {
+            if let Err(err) = self.process_project(&slug, state) {
+                tracing::error!(slug, error = %err, "project tick failed");
+            }
+        }
         Ok(())
     }
 

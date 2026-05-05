@@ -1,0 +1,224 @@
+//! Pure-logic + integration tests for the M0.9 state machine.
+
+use chrono::Utc;
+use serde_json::json;
+use tempfile::TempDir;
+
+use ccteam_core::{
+    decide_tick, is_terminal, next_phase, progress, CcteamPaths, Orchestrator,
+    OrchestratorConfig, Parallelism, PhaseHistoryEntry, PhaseState, ProjectState, TickAction,
+    FIRST_PHASE,
+};
+
+fn fresh_state(current_phase: &str, phase_state: PhaseState) -> ProjectState {
+    let now = Utc::now();
+    ProjectState {
+        slug: "demo".into(),
+        created_at: now,
+        tmux_session: "ccteam-demo".into(),
+        claude_session_id: None,
+        claude_pid: None,
+        phase_state,
+        current_phase: current_phase.into(),
+        parallelism: Parallelism::Solo,
+        phase_history: Vec::new(),
+        fix_cycle_count: 0,
+        cost_used_usd: 0.0,
+        soft_warn_threshold_usd: 20.0,
+        hard_kill_threshold_usd: 200.0,
+        context_tokens_used: 0,
+        context_reset_threshold_tokens: 600_000,
+        context_reset_count: 0,
+        last_progress_event_at: None,
+        last_event_type: None,
+        last_user_interaction_at: now,
+        user_attached: false,
+        user_pause_pending: false,
+    }
+}
+
+#[test]
+fn next_phase_walks_the_m0_dag() {
+    let chain = ["plan-eng", "implement", "test-author", "test-run", "fix", "ship"];
+    for w in chain.windows(2) {
+        assert_eq!(next_phase(w[0]), Some(w[1]));
+    }
+    assert_eq!(next_phase("ship"), None);
+    assert_eq!(next_phase("not-a-real-phase"), None);
+}
+
+#[test]
+fn decide_tick_dispatches_first_phase_for_fresh_project() {
+    let state = fresh_state("", PhaseState::Idle);
+    assert_eq!(
+        decide_tick(&state, None),
+        TickAction::DispatchPhase {
+            phase: FIRST_PHASE.into()
+        },
+    );
+}
+
+#[test]
+fn decide_tick_advances_when_phase_done_matches() {
+    let state = fresh_state("implement", PhaseState::InFlight);
+    let event = json!({"event": "phase_done", "phase": "implement"});
+    assert_eq!(
+        decide_tick(&state, Some(&event)),
+        TickAction::AdvancePhase {
+            from: "implement".into(),
+            to: Some("test-author".into()),
+        },
+    );
+}
+
+#[test]
+fn decide_tick_advances_to_none_after_ship() {
+    let state = fresh_state("ship", PhaseState::InFlight);
+    let event = json!({"event": "phase_done", "phase": "ship"});
+    assert_eq!(
+        decide_tick(&state, Some(&event)),
+        TickAction::AdvancePhase {
+            from: "ship".into(),
+            to: None,
+        },
+    );
+}
+
+#[test]
+fn decide_tick_ignores_phase_done_for_a_different_phase() {
+    let state = fresh_state("implement", PhaseState::InFlight);
+    let stale = json!({"event": "phase_done", "phase": "plan-eng"});
+    assert_eq!(decide_tick(&state, Some(&stale)), TickAction::NoOp);
+}
+
+#[test]
+fn decide_tick_classifies_busy_events_as_noop() {
+    let state = fresh_state("implement", PhaseState::InFlight);
+    for kind in ["PreToolUse", "PostToolUse", "phase_inject", "SubagentStop"] {
+        let e = json!({"event": kind});
+        assert_eq!(
+            decide_tick(&state, Some(&e)),
+            TickAction::NoOp,
+            "{kind} must be NoOp",
+        );
+    }
+}
+
+#[test]
+fn decide_tick_emits_escalated_on_escalate_event() {
+    let state = fresh_state("fix", PhaseState::InFlight);
+    let e = json!({"event": "escalate", "reason": "fix-cycle 撞 3 顶"});
+    assert_eq!(
+        decide_tick(&state, Some(&e)),
+        TickAction::Escalated {
+            phase: "fix".into(),
+            reason: "fix-cycle 撞 3 顶".into(),
+        },
+    );
+}
+
+#[test]
+fn is_terminal_true_after_ship_passes() {
+    let mut state = fresh_state("ship", PhaseState::Idle);
+    state.phase_history.push(PhaseHistoryEntry {
+        phase: "ship".into(),
+        status: "passed".into(),
+        duration_s: 0,
+        cost_usd: 0.0,
+    });
+    assert!(is_terminal(&state));
+}
+
+#[test]
+fn is_terminal_true_after_any_escalation() {
+    let mut state = fresh_state("implement", PhaseState::Idle);
+    state.phase_history.push(PhaseHistoryEntry {
+        phase: "implement".into(),
+        status: "escalated".into(),
+        duration_s: 0,
+        cost_usd: 0.0,
+    });
+    assert!(is_terminal(&state));
+}
+
+#[test]
+fn process_project_writes_escalation_md_and_marks_history() {
+    let tmp = TempDir::new().unwrap();
+    let paths = CcteamPaths {
+        root: tmp.path().join("home"),
+        projects_root: tmp.path().join("projects"),
+    };
+    let slug = "esc-demo";
+    let project = paths.project_dir(slug);
+    std::fs::create_dir_all(project.join(".ccteam")).unwrap();
+
+    let mut state = fresh_state("fix", PhaseState::InFlight);
+    state.slug = slug.into();
+    state.save(&paths.project_state(slug)).unwrap();
+
+    progress::append_event(
+        &paths.progress_jsonl(slug),
+        &json!({"event": "escalate", "reason": "tests still red after 3 cycles"}),
+    )
+    .unwrap();
+
+    let orch =
+        Orchestrator::new(paths.clone(), OrchestratorConfig::default()).unwrap();
+    let new_state = orch
+        .process_project(slug, ProjectState::load(&paths.project_state(slug)).unwrap())
+        .unwrap();
+
+    assert_eq!(new_state.phase_state, PhaseState::Idle);
+    let last = new_state.phase_history.last().unwrap();
+    assert_eq!(last.phase, "fix");
+    assert_eq!(last.status, "escalated");
+
+    let esc_path = paths.project_ccteam_dir(slug).join("escalation.md");
+    let body = std::fs::read_to_string(&esc_path).unwrap();
+    assert!(body.contains("phase: fix"));
+    assert!(body.contains("tests still red after 3 cycles"));
+
+    // No new dispatch attempt: terminal state. Last progress event
+    // should still be `escalate` (no `phase_inject` appended).
+    let last_event = progress::last_event(&paths.progress_jsonl(slug))
+        .unwrap()
+        .unwrap();
+    assert_eq!(last_event["event"], "escalate");
+}
+
+#[test]
+fn process_project_advances_history_when_phase_done_observed_without_tmux_dispatch() {
+    // Same as above but the new phase would be `ship` — and dispatch
+    // requires tmux. We pre-mark history so the project becomes
+    // terminal immediately after advance, avoiding the dispatch step.
+    let tmp = TempDir::new().unwrap();
+    let paths = CcteamPaths {
+        root: tmp.path().join("home"),
+        projects_root: tmp.path().join("projects"),
+    };
+    let slug = "advance-demo";
+    let project = paths.project_dir(slug);
+    std::fs::create_dir_all(project.join(".ccteam")).unwrap();
+
+    let mut state = fresh_state("ship", PhaseState::InFlight);
+    state.slug = slug.into();
+    state.save(&paths.project_state(slug)).unwrap();
+
+    progress::append_event(
+        &paths.progress_jsonl(slug),
+        &json!({"event": "phase_done", "phase": "ship"}),
+    )
+    .unwrap();
+
+    let orch =
+        Orchestrator::new(paths.clone(), OrchestratorConfig::default()).unwrap();
+    let new_state = orch
+        .process_project(slug, ProjectState::load(&paths.project_state(slug)).unwrap())
+        .unwrap();
+
+    assert_eq!(new_state.phase_state, PhaseState::Idle);
+    assert!(new_state.current_phase.is_empty());
+    let last = new_state.phase_history.last().unwrap();
+    assert_eq!(last.phase, "ship");
+    assert_eq!(last.status, "passed");
+}
