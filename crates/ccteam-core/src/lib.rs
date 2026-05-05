@@ -2,9 +2,11 @@
 //! and hook-shared schemas. Consumed by `ccteam-cli` (binary entry) and
 //! `ccteam-hooks` (hook handlers invoked via `ccteam hook ...`).
 
+pub mod paths;
 pub mod phases;
 pub mod state;
 
+pub use paths::{slug_from_project_dir, CcteamPaths};
 pub use phases::{
     AgentTeamRole, PhaseHooks, PhaseTemplate, SubSkillSpec, SubSkillTrigger,
 };

@@ -1,5 +1,17 @@
-//! ccteam-hooks: Claude Code hook handlers, exposed by `ccteam-cli` as
-//! the `ccteam hook <name>` subcommand group. Each handler reads stdin
-//! JSON and writes either a stdout decision or a side-effecting append
-//! to `~/.ccteam/progress/<slug>.jsonl` / state.json. M0.3 fills in
-//! `progress-append`, `parse-phase-end`, and `cost-accumulate`.
+//! ccteam-hooks: handlers for Claude Code hook events. Each handler
+//! takes the parsed stdin payload (`serde_json::Value`) and the resolved
+//! `CcteamPaths`, performs its side-effecting append / state mutation,
+//! and returns. The `ccteam` binary's `hook` subcommand group reads
+//! stdin once and dispatches to these.
+//!
+//! Wire-up reference: `docs/interfaces.md` §6.1 (settings.json template)
+//! and §6.2 / §6.3 (per-hook responsibilities).
+
+pub mod cost;
+pub mod parse_phase_end;
+pub mod progress;
+pub mod transcript;
+
+pub use cost::cost_accumulate;
+pub use parse_phase_end::parse_phase_end;
+pub use progress::progress_append;
