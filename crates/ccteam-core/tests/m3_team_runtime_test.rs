@@ -1,0 +1,169 @@
+//! M3.3 integration: orchestrator's per-team runtime registry.
+//!
+//! Asserts that `Orchestrator::new` discovers `<root>/teams/<name>/team.yaml`
+//! files, registers a `TeamRuntime` per team with its own DAG, and that
+//! `team_runtime(name)` returns the right templates. Covers both the
+//! happy path (dev + product-research both registered) and the legacy
+//! fallback (only `phases/` present, dev registered implicitly).
+
+use std::sync::OnceLock;
+
+use ccteam_core::{
+    disable_tool_surface_bootstrap_for_tests, write_all_global_team_templates, CcteamPaths,
+    Orchestrator, OrchestratorConfig,
+};
+use tempfile::TempDir;
+
+static DISABLE_TOOL_SURFACE: OnceLock<()> = OnceLock::new();
+fn isolation() {
+    DISABLE_TOOL_SURFACE.get_or_init(disable_tool_surface_bootstrap_for_tests);
+}
+
+fn fresh_paths(tmp: &TempDir) -> CcteamPaths {
+    CcteamPaths {
+        root: tmp.path().join("ccteam-home"),
+        projects_root: tmp.path().join("projects"),
+    }
+}
+
+#[test]
+fn orchestrator_loads_dev_and_product_research_after_init() {
+    isolation();
+    let tmp = TempDir::new().unwrap();
+    let paths = fresh_paths(&tmp);
+    // `ccteam init` equivalent: write all team bundles to ~/.ccteam/.
+    write_all_global_team_templates(&paths.root, false).unwrap();
+
+    let orch = Orchestrator::new(paths, OrchestratorConfig::default()).unwrap();
+
+    let dev = orch
+        .team_runtime("dev")
+        .expect("dev team should be registered after write_all_global_team_templates");
+    assert_eq!(dev.spec.name, "dev");
+    assert_eq!(dev.spec.phase_dir, "phases");
+    assert!(
+        dev.templates.iter().any(|t| t.name == "plan-eng"),
+        "dev pipeline should have the plan-eng phase",
+    );
+    assert!(
+        dev.templates.iter().any(|t| t.name == "ship"),
+        "dev pipeline should have the ship phase",
+    );
+    assert_eq!(dev.dag.entry(), "plan-eng", "dev DAG starts at plan-eng");
+
+    let pr = orch
+        .team_runtime("product-research")
+        .expect("product-research team should be registered after write_all_global_team_templates");
+    assert_eq!(pr.spec.name, "product-research");
+    assert_eq!(pr.spec.phase_dir, "phases-product-research");
+    assert!(
+        pr.templates.iter().any(|t| t.name == "kickoff"),
+        "product-research should have the kickoff phase",
+    );
+    assert!(
+        pr.templates.iter().any(|t| t.name == "verdict"),
+        "product-research should have the verdict phase",
+    );
+    assert_eq!(
+        pr.dag.entry(),
+        "kickoff",
+        "product-research DAG starts at kickoff",
+    );
+    // verdict_schema should list `verdict` so M3.4's verdict-emitting
+    // phase is recognized as such.
+    assert_eq!(
+        pr.spec.verdict_schema,
+        vec!["verdict".to_string()],
+        "product-research declares the verdict phase in verdict_schema",
+    );
+    // 3 team-specific ESCALATE prefixes registered.
+    let prefixes: Vec<&str> = pr
+        .spec
+        .escalate_grammar_extensions
+        .iter()
+        .map(|e| e.prefix.as_str())
+        .collect();
+    assert!(prefixes.contains(&"MARKET_DUPLICATE"));
+    assert!(prefixes.contains(&"INSUFFICIENT_VALIDATION"));
+    assert!(prefixes.contains(&"LOW_DIFFERENTIATION"));
+}
+
+#[test]
+fn orchestrator_legacy_fallback_registers_dev_when_only_phases_dir_present() {
+    // Pre-M3.3 installs only have `~/.ccteam/phases/` populated, no
+    // `~/.ccteam/teams/dev/team.yaml`. The orchestrator must still
+    // register a dev runtime so legacy projects keep dispatching.
+    isolation();
+    let tmp = TempDir::new().unwrap();
+    let paths = fresh_paths(&tmp);
+    let phases_dir = paths.phases_dir();
+    std::fs::create_dir_all(&phases_dir).unwrap();
+    std::fs::write(
+        phases_dir.join("01-step.md"),
+        "---\nname: step\nparallelism: solo\n---\nbody\n",
+    )
+    .unwrap();
+
+    let orch = Orchestrator::new(paths, OrchestratorConfig::default()).unwrap();
+
+    let dev = orch
+        .team_runtime("dev")
+        .expect("legacy dev fallback should register dev");
+    assert_eq!(dev.spec.name, "dev");
+    assert_eq!(dev.templates.len(), 1);
+    assert_eq!(dev.templates[0].name, "step");
+}
+
+#[test]
+fn orchestrator_inert_when_no_phases_or_teams_present() {
+    // Pure empty install. orchestrator stays inert (no panics).
+    let tmp = TempDir::new().unwrap();
+    let paths = fresh_paths(&tmp);
+    let orch = Orchestrator::new(paths, OrchestratorConfig::default()).unwrap();
+    assert!(orch.team_runtime("dev").is_none());
+    assert!(orch.team_runtime("product-research").is_none());
+    assert_eq!(orch.teams().count(), 0);
+    // Backwards-compat accessor still safe (returns empty fallback).
+    assert!(orch.templates().is_empty());
+    assert!(orch.dag().is_empty());
+}
+
+#[test]
+fn orchestrator_skips_team_with_missing_phase_dir() {
+    // A team.yaml that points at a phase_dir not yet on disk should be
+    // logged + skipped, not crash the orchestrator. This matches the
+    // "user runs `ccteam init` partially, then starts" recovery path.
+    isolation();
+    let tmp = TempDir::new().unwrap();
+    let paths = fresh_paths(&tmp);
+    let team_dir = paths.root.join("teams").join("ghost-team");
+    std::fs::create_dir_all(&team_dir).unwrap();
+    std::fs::write(
+        team_dir.join("team.yaml"),
+        "name: ghost-team\nphase_dir: phases-ghost\n",
+    )
+    .unwrap();
+
+    let orch = Orchestrator::new(paths, OrchestratorConfig::default()).unwrap();
+    assert!(
+        orch.team_runtime("ghost-team").is_none(),
+        "ghost-team's phase_dir is missing → not registered",
+    );
+}
+
+#[test]
+fn write_all_global_team_templates_is_idempotent() {
+    // Re-running write_all_global_team_templates(force=false) preserves
+    // any operator hand-edits and doesn't bump file mtimes. Mirrors the
+    // contract write_global_phase_templates already had.
+    isolation();
+    let tmp = TempDir::new().unwrap();
+    let paths = fresh_paths(&tmp);
+    write_all_global_team_templates(&paths.root, false).unwrap();
+    let path = paths.root.join("phases").join("02-plan-eng.md");
+    std::fs::write(&path, "USER EDIT\n").unwrap();
+    write_all_global_team_templates(&paths.root, false).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "USER EDIT\n");
+    write_all_global_team_templates(&paths.root, true).unwrap();
+    assert_ne!(std::fs::read_to_string(&path).unwrap(), "USER EDIT\n");
+}
