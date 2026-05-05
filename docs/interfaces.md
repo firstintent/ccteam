@@ -335,6 +335,8 @@ confidence: 0.0-1.0
 
 ### 6.1 项目 `.claude/settings.json` 完整模板
 
+> **D1 备注**:所有 hook 都是 `ccteam` 单 binary 的子命令(`ccteam hook <name>`),不再是独立 bash/python 脚本——零运行时依赖,与 orchestrator 共享 serde schema。debug 时可手动跑 `ccteam hook <subcmd>` 喂 stdin JSON(详见 §10.6)。
+
 ```json
 {
   "permissions": {
@@ -348,16 +350,16 @@ confidence: 0.0-1.0
     "SessionStart": [
       {
         "hooks": [
-          {"type": "command", "command": "scripts/load-context.sh", "timeout": 5},
-          {"type": "command", "command": "scripts/progress-append.sh session_start", "async": true}
+          {"type": "command", "command": "ccteam hook load-context", "timeout": 5},
+          {"type": "command", "command": "ccteam hook progress-append session_start", "async": true}
         ]
       }
     ],
     "Stop": [
       {
         "hooks": [
-          {"type": "command", "command": "scripts/parse-phase-end.sh", "timeout": 10},
-          {"type": "command", "command": "scripts/progress-append.sh Stop", "async": true}
+          {"type": "command", "command": "ccteam hook parse-phase-end", "timeout": 10},
+          {"type": "command", "command": "ccteam hook progress-append Stop", "async": true}
         ]
       }
     ],
@@ -365,42 +367,42 @@ confidence: 0.0-1.0
       {
         "matcher": "idle_prompt|permission_prompt",
         "hooks": [
-          {"type": "command", "command": "scripts/progress-append.sh notification", "async": true}
+          {"type": "command", "command": "ccteam hook progress-append notification", "async": true}
         ]
       }
     ],
     "PreToolUse": [
       {
         "hooks": [
-          {"type": "command", "command": "scripts/progress-append.sh PreToolUse", "async": true}
+          {"type": "command", "command": "ccteam hook progress-append PreToolUse", "async": true}
         ]
       }
     ],
     "PostToolUse": [
       {
         "hooks": [
-          {"type": "command", "command": "scripts/progress-append.sh PostToolUse", "async": true},
-          {"type": "command", "command": "scripts/cost-accumulate.sh", "async": true}
+          {"type": "command", "command": "ccteam hook progress-append PostToolUse", "async": true},
+          {"type": "command", "command": "ccteam hook cost-accumulate", "async": true}
         ]
       },
       {
         "matcher": "Bash:git push.*",
         "hooks": [
-          {"type": "command", "command": "scripts/block-push.sh"}
+          {"type": "command", "command": "ccteam hook block-push"}
         ]
       }
     ],
     "SubagentStop": [
       {
         "hooks": [
-          {"type": "command", "command": "scripts/progress-append.sh SubagentStop", "async": true}
+          {"type": "command", "command": "ccteam hook progress-append SubagentStop", "async": true}
         ]
       }
     ],
     "SessionEnd": [
       {
         "hooks": [
-          {"type": "command", "command": "scripts/progress-append.sh SessionEnd", "async": true}
+          {"type": "command", "command": "ccteam hook progress-append SessionEnd", "async": true}
         ]
       }
     ]
@@ -422,18 +424,18 @@ confidence: 0.0-1.0
 | `SubagentStop` | 子 agent 退出(仅 Agent Teams phase 内相关) |
 | `SessionEnd` | claude 进程退出 → orchestrator 知道 reset 完成 vs crash |
 
-### 6.3 `cost-accumulate.sh` 工作原理
+### 6.3 `cost-accumulate` 子命令工作原理
 
-Claude Code **不**在 hook 输入直接给 `cost_usd`,必须自算:
+**关键事实**:Claude Code **不**在 hook 输入直接给 `cost_usd`,必须从 `transcript_path` 自算:
 
 1. hook stdin 的 JSON 含 `transcript_path`(Claude Code 的 session JSONL 路径)
-2. 脚本 tail 该 JSONL 最后一条 `role:assistant` 记录
-3. 解析 `message.usage.{input_tokens, cache_read_input_tokens, cache_creation_input_tokens, output_tokens}`
+2. Rust 实现 tail 该 JSONL 最后一条 `role:assistant` 记录(`tokio::fs` + 行级反向扫)
+3. `serde_json` 解析 `message.usage.{input_tokens, cache_read_input_tokens, cache_creation_input_tokens, output_tokens}` 字段
 4. 按 `~/.ccteam/config.yml` 的 `model_rates` 表算成本增量
-5. 原子地累加到 `state.json.cost_used_usd` 与 `state.json.context_tokens_used`
+5. 原子地累加到 `state.json.cost_used_usd` 与 `state.json.context_tokens_used`(`.tmp` + `rename`)
 6. 后者驱动 tech-design §6.9 的 60% reset 阈值
 
-字段名参考 `claude-plugins-official/session-report/skills/session-report/analyze-sessions.mjs`。
+字段名参考 `claude-plugins-official/session-report/skills/session-report/analyze-sessions.mjs`(JS 实现可对照,但 ccteam 落地在 `crates/ccteam-cli` 的 `hook cost-accumulate` 子命令中,纯 Rust)。
 
 `async: true` 必须设——同步阻塞会拖慢 PostToolUse 路径。
 
@@ -622,6 +624,7 @@ ccteam start                           # 启动 orchestrator(前台)
 ccteam start --daemon                  # 启动并 daemonize
 ccteam stop                            # 优雅停机(保留 tmux session)
 ccteam stop --kill-sessions            # 同时关闭所有 tmux session(慎用)
+ccteam mcp-serve                       # M2+:作为 ccteam-mcp 跑 stdio MCP 协议(详见 §12)
 ```
 
 ### 10.2 提交需求
@@ -722,6 +725,9 @@ ccteam memory ls                       # 看跨项目记忆(M3+)
 ccteam memory rebuild                  # 重建索引
 ccteam config edit                     # 改全局配置
 ccteam doctor                          # 体检:tmux server / claude 可用性 / 死 session 检测
+ccteam hook <subcmd>                   # debug:手动跑 hook(读 stdin JSON,写 stdout);
+                                       # subcmd ∈ {progress-append, parse-phase-end,
+                                       # cost-accumulate, load-context, block-push}
 ```
 
 ---
@@ -842,3 +848,67 @@ M1 时 skill 让 claude 用 Bash 工具 + `--format json` 调 CLI。M2 ccteam-mc
 | `~/projects/<slug>/CLAUDE.md` | 自动生成的项目运营手册 |
 | `~/projects/<slug>/.claude/settings.json` | 项目级 Claude Code 配置(详见 §6.1) |
 | `~/projects/<slug>/.ccteam/sub-modules/<name>/` | multi-session 子模块元数据(M3+;详见 §1.3) |
+
+---
+
+## 14. `ccteam-core` lib API 草案(M0 占位)
+
+> **稳定性**:M0 起以 lib crate 提供,API **内部 unstable**——cli / hook / orchestrator 在同一 workspace 共用,可随时改;**M3 ratatui TUI 上线时定为 1.0**(届时被外部前端依赖,需要语义化版本与兼容承诺)。
+>
+> **三种前端共用此 API**:CLI(M0)/ ratatui TUI(M3+)/ web dashboard(M4+)都通过 `ccteam-core` 读写状态——与 §12 `ccteam-mcp` 是**同一套数据模型的两种 wire 方式**(lib API in-process / MCP stdio JSON-RPC)。
+
+### 14.1 核心 API 函数签名
+
+```rust
+// crates/ccteam-core/src/lib.rs(示意签名,实际可调整)
+
+/// 读单项目状态(对应 §2.1 state.json 的全量结构 + 派生字段;§10.3 `ccteam show --format json` 的内核)。
+pub fn get_state(slug: &str) -> Result<ProjectState, CoreError>;
+
+/// 列所有项目摘要(§10.3 `ccteam ls --format json` 的内核)。
+pub fn list_projects() -> Result<Vec<ProjectSummary>, CoreError>;
+
+/// 提交控制信号——写 §3.3 `~/.ccteam/control/` 文件,orchestrator 下一轮扫到生效。
+/// `ControlSignal` 枚举覆盖 reject / pause / resume / answer / boost / fork-reply。
+pub fn submit_control(slug: &str, signal: ControlSignal) -> Result<(), CoreError>;
+
+/// 一次性读取 progress.jsonl 末尾 N 条事件(§10.3 `ccteam progress --tail` 的非流式入口)。
+pub fn tail_progress(slug: &str, last_n: usize) -> Result<Vec<Event>, CoreError>;
+
+/// 流式订阅 progress.jsonl(`tokio` Stream;inotify 监听末尾)。
+/// TUI / web dashboard 实时事件推送的主接口。
+pub fn attach_progress(slug: &str) -> Result<impl Stream<Item = Result<Event, CoreError>>, CoreError>;
+
+/// 提交新需求(对应 §10.2 `ccteam new`),返回分配的 slug 与项目目录。
+pub fn submit_inbox(spec: InboxSpec) -> Result<NewProjectHandle, CoreError>;
+
+/// 一次性 capture 项目 tmux pane 当前屏(§10.4 `ccteam peek` 的内核;不 attach)。
+pub fn peek_pane(slug: &str, lines: Option<usize>) -> Result<PaneCapture, CoreError>;
+```
+
+### 14.2 数据模型与 wire 格式对应
+
+| `ccteam-core` 类型 | wire 格式(CLI `--format json` / MCP tool 返回) | 来源章节 |
+|---|---|---|
+| `ProjectState` | `ccteam show --format json` 全量 | §2.1 + §10.3 |
+| `ProjectSummary` | `ccteam ls --format json` `projects[]` 元素 | §10.3 |
+| `Event` | progress.jsonl 单行 | §4.1 |
+| `ControlSignal` | `~/.ccteam/control/` 文件命名约定 | §3.3 |
+| `InboxSpec` | `~/.ccteam/inbox/*.md` front matter + body | §3.1 |
+
+新增前端**不应**直接读写文件系统——所有状态访问统一走 `ccteam-core`,确保 §6.1 hook 的 schema 与前端读端单一事实来源。
+
+### 14.3 与 `ccteam-mcp` 的关系
+
+§12 `ccteam-mcp` 的每个 tool 都是 `ccteam-core` 函数的 stdio JSON-RPC 包装:
+
+| MCP tool(§12.2) | `ccteam-core` 函数 |
+|---|---|
+| `ccteam__ls` | `list_projects()` |
+| `ccteam__show` | `get_state(slug)` |
+| `ccteam__new` | `submit_inbox(spec)` |
+| `ccteam__peek` | `peek_pane(slug, lines)` |
+| `ccteam__progress` | `tail_progress(slug, last_n)` |
+| `ccteam__pause` / `ccteam__resume` | `submit_control(slug, Pause/Resume)` |
+
+→ M2 实现 `ccteam-mcp` 时是**薄壳**,不复制业务逻辑。

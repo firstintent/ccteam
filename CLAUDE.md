@@ -19,7 +19,7 @@
 **ccteam 不是独立 AI 系统,它是 Claude Code 的编排层。**
 
 - **被编排者**:每个项目一个 Claude Code 长 session,用 tmux 守护、用 hooks 上报、用 MCP 接外部
-- **编排者**:Python orchestrator(M0)、Telegram bot(M1)、跨项目记忆 RAG(M3)
+- **编排者**:Rust orchestrator(M0,Cargo workspace)、Telegram bot(M1)、跨项目记忆 RAG(M3)
 - **入口/汇报**:**用户自带的 Claude Code session**(M1+ 装 `ccteam-control` skill / M2+ 通过 `ccteam-mcp` MCP)——ccteam **不做 chat 客户端**,chat 体验外包给原生 Claude Code(详见 tech-design §3.8)
 - **结论**:**严格遵守 Claude Code 最佳实践会让 ccteam 系统更高效**——任何与最佳实践冲突的设计选择必须有 tech-design.md 中的明确反对论证。两个层面都适用:
   - **开发 ccteam 本身时**(本仓库):每次写代码、写 prompt、改架构都先翻 `docs/claude-code-best-practices.md`
@@ -124,6 +124,8 @@ ccteam 用 multi-agent 同时承担三件事(详见 tech-design §3.3 / §3.6 / 
 
 **默认路径**:`~/.claude/plugins/marketplaces/claude-plugins-official/plugins/`
 
+**项目本地参考**:`references/agent-of-empires/`(Rust + ratatui + axum ws,M3+ TUI / M4+ web dashboard 抄作业;`.gitignore` 屏蔽不入仓)
+
 本机已缓存以下相关 plugin(2026-05 抓取):
 ```
 agent-sdk-dev          claude-md-management   feature-dev          plugin-dev
@@ -169,11 +171,13 @@ ccteam/
 │       └── ccgram-messaging/     ✅ 已装(M3+ 用)
 ├── LICENSE                       ✅
 └── (M0 待建)
-    ├── orchestrator/             ← Python asyncio 主循环
+    ├── Cargo.toml                ← workspace 根(crates/ccteam-core / ccteam-cli / ccteam-hooks)
+    ├── orchestrator/             ← Rust tokio 主循环(`crates/ccteam-core`)
     ├── phases/                   ← 9 个 phase markdown(00-seed.md … 09-ship.md)
     ├── hooks/                    ← progress-append.sh / parse-phase-end.sh / cost-accumulate.sh
-    ├── cli/                      ← ccteam new / status / attach / resume 等
-    └── tmux/                     ← layout 模板
+    ├── cli/                      ← ccteam new / status / attach / resume 等(实现为 `crates/ccteam-cli` binary 子命令,同时承载 `hook` subcommand group)
+    ├── tmux/                     ← layout 模板
+    └── references/               ← .gitignore 屏蔽,本仓库不跟踪;agent-of-empires 等参考实现
 ```
 
 M0 完整任务清单见 `docs/development-plan.md` §2(任务编号 M0.1–M0.15、依赖、可执行验收)。**勾选标准**:每条都能映射回 requirements §二某条痛点。

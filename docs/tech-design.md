@@ -458,6 +458,63 @@ ccteam start / stop                    # orchestrator 生命周期
 
 曾考虑过 M2 Web 仪表盘。**剥离主线**——`ccteam ls --format json` + 用户自带 claude 的对话能力已覆盖"用人话汇报"需求。Web 仪表盘永远在 backlog,不进里程碑(参见 §11 / development-plan §2.2)。
 
+#### 前端层(可插拔)
+
+ccteam 核心(orchestrator + tmux + hooks)是 **headless 状态引擎**——所有 UI 都是可插拔前端,共用 `ccteam-core` lib API。分层关系:
+
+```
++----------------------------------------------------------+
+|  前端层(可插拔,M0 起严格 lib/binary 分离)               |
+|                                                          |
+|  ccteam CLI       ccteam tui (M3+)    ccteam serve (M4+) |
+|  (M0,默认)       ratatui 仪表盘      xterm.js + WS bridge|
+|       \                |                    /            |
+|        \               |                   /             |
+|         v              v                  v              |
+|  +----------------------------------------------------+  |
+|  |          ccteam-core(Rust lib crate)              |  |
+|  |  get_state / list_projects / submit_control /     |  |
+|  |  tail_progress / attach_progress(stream)          |  |
+|  +----------------------------------------------------+  |
+|                       |                                  |
+|                       v                                  |
+|  +----------------------------------------------------+  |
+|  |   orchestrator daemon(L1,常驻 Rust + tokio)       |  |
+|  |   tmux + hooks + progress.jsonl + state.json      |  |
+|  +----------------------------------------------------+  |
++----------------------------------------------------------+
+```
+
+**Warp / iTerm2 / Alacritty 等本地终端 = 用户终端选择,不是 ccteam 集成对象**。`ccteam attach <slug>` 在任何 tmux 兼容终端里行为完全一致——ccteam 透明兼容,无需特殊适配。用户偏好哪个终端就用哪个,与 ccteam 无关。
+
+**前端档位**:
+
+| 前端 | 里程碑 | 性质 | 实现栈 |
+|---|---|---|---|
+| `ccteam` CLI | M0 | 关键路径(默认入口) | clap derive + serde |
+| `ccteam tui` | M3+ | 机会主义,非关键路径 | ratatui + crossterm |
+| `ccteam serve`(web dashboard) | M4+ | 机会主义,非关键路径 | axum + WebSocket + xterm.js |
+
+##### 前端层 invariant(红线)
+
+任何前端(CLI / TUI / web dashboard)**不得**在 ccteam 内引入新 LLM 层。
+
+- ✅ web dashboard 通过 xterm.js + WebSocket 桥**直通到 tmux 内的项目级 claude**——等价于"远程版 `ccteam attach`"。用户在浏览器键入 = 通过 send-keys 注入 tmux,不经任何 ccteam 中介 LLM
+- ✅ web 介入触发 `PreToolUse` hook 检测 user_attach,自动暂停 phase(与本地 attach 语义一致)
+- ❌ 不在 ccteam 层起 meta-claude / 自实现聊天 UI / 翻译用户 prompt(已被否决的 `ccteam chat` 路径复活)
+
+LLM 推理只发生在两处:① **L2 项目级 claude**(tmux 内) ② **L0 用户自带 claude**(机器上的 `claude` 进程)。这条 invariant 与 §3.8 上方"ccteam 自始至终不自造 AI"原则一脉相承——前端层加再多花样,核心 headless 引擎都不让步。
+
+##### 抄作业指针:`references/agent-of-empires/`
+
+M3 ratatui TUI 与 M4 web dashboard 的前端栈实现**直接抄** `references/agent-of-empires/`(已 clone 到本仓库,`.gitignore` 屏蔽不入仓库):
+
+- 栈与 ccteam 完全对齐:Rust + ratatui + crossterm + tokio + axum(ws)
+- 抄的范围:`Cargo.toml` dep 组合 + ratatui 主循环范式 + WebSocket bridge 实现 + 它的 `docs/guides/web-dashboard.md`
+- **不抄核心**:9-phase 编排、Seed Gate、跨项目 RAG、Defense in Depth 是 ccteam 差异化护城河,AoE 没有
+
+详见 development-plan M3.X / M4.X 任务说明。
+
 ---
 
 ## 4. 关键流程
@@ -650,11 +707,15 @@ orchestrator 通过 `PreToolUse` hook 检测最近一次输入源：若来自人
 - ❌ **不**设 `--max-turns`（用户要求长跑，由 stall + 成本上限兜底）
 - ❌ **不**设 `--max-budget-usd`（同上；改用 hooks 累计 + 软告警，见 §6.8）
 
+**实现注**:orchestrator 的 Rust 实现用 `tokio::process::Command` 包装上述所有 tmux 命令(`new-session` / `send-keys` / `split-window` / `has-session` 等),异步 spawn + 收集 stdout/stderr,失败落 tracing 日志——单 binary 零额外运行时依赖。
+
 ### 6.2 Hooks 配置
 
 完整 `settings.json` 模板、Hook 事件用途表、`cost-accumulate.sh` 工作原理 → **[interfaces.md §6](./interfaces.md#6-hooks-配置-schema)**。本节只保留架构论证:
 
 **为什么 hooks 是 ccteam 可观测性命脉**:Claude Code hooks 是 deterministic 的(详见 claude-code-best-practices §4.5)——同一事件触发同一脚本,这是把"AI 的随机推理"转成"系统可处理的事件流"的桥。ccteam 把所有 phase 边界 / 工具调用 / 退出信号都通过 hooks 落到 progress.jsonl,orchestrator 据此做状态转移,完全不解析 tmux 终端文本。
+
+**实现形态**:hook 实现是 `ccteam hook <name>` 子命令(如 `ccteam hook progress-append` / `ccteam hook parse-phase-end` / `ccteam hook cost-accumulate`)——单 binary 分发,与 orchestrator 共享同一份 serde schema(progress.jsonl 事件定义、state.json 字段),不再依赖独立 bash / python 脚本运行时。official plugin 自带的 hook(如 `security_reminder_hook.py`)通过 shell shim 包装挂上,不直接依赖。
 
 **Hook 写作纪律**(实现 PR 必须遵守):
 - append 类必须 `async: true`——别拖慢主流程
@@ -743,6 +804,8 @@ agent（本节）= 在 phase 内或后台**并行**跑的 multi-agent；sub-skil
 2. **项目级 claude**(次要,phase 内查询)——能查"我在哪个项目里、累计 cost、当前 phase 状态",用于 phase prompt 内自检
 
 完整 tool schema 与协议见 [interfaces.md §12](./interfaces.md#12-ccteam-mcp-mcp-server-m2)。**M0 / M1 不上**——M0 用 CLI `--format json` 让用户的 claude 用 Bash 工具调即可;M2 再上 MCP 提升鲁棒性。
+
+**实现形态**:`ccteam-mcp` 与 `ccteam-core` 同 crate(workspace 内 lib + 多 binary),通过 `ccteam mcp-serve` 子命令暴露——读写同一份 state.json / progress.jsonl,**为将来 `ccteam tui`(M3+) / `ccteam serve` web 前端(M4+)预留同一状态读写 API**。三种前端共用 `ccteam-core` lib API(详见 §3.8 前端层小节),MCP 只是把这套 API 套上 MCP wire protocol 给外部 LLM 消费。
 
 ### 6.5 项目级 CLAUDE.md（每项目自动生成）
 

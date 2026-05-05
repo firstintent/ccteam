@@ -15,7 +15,7 @@
 - ccteam 是上层编排——按 9 个 phase 顺序推进、监控成本和进度、卡住时找你
 - **ccteam 不是聊天客户端,它是被聊的对象**:用对话方式管它,**用你自己的 Claude Code session**(详见 §6)
 
-**前提**:`claude` / `tmux` / `bash` / `jq` 能跑(macOS / Linux 标配 + `brew install jq`),可选 `python3`(成本累计 hook 用)。
+**前提**:`claude` / `tmux` / `bash` / `jq` 能跑(macOS / Linux 标配 + `brew install jq`)。**任何 tmux 兼容终端都能 attach**——推荐 [Warp](https://github.com/warpdotdev/warp) / iTerm2 / Alacritty 等做更好的本地终端体验,ccteam 无需特殊集成。
 
 ---
 
@@ -32,7 +32,7 @@ curl -fsSL https://ccteam.dev/install.sh | sh
 cargo install ccteam
 ```
 
-`ccteam --version` 能跑就行。binary 5–10MB,无运行时依赖。
+`ccteam --version` 能跑就行。binary 5–10MB,**单文件、零运行时依赖**(纯 Rust 静态链接)。
 
 ---
 
@@ -47,7 +47,6 @@ $ ccteam init
     claude:        v0.1.42  ✓
     tmux:          v3.3a    ✓
     jq:            v1.7.1   ✓
-    python3:       v3.11.6  ✓ (cost-accumulate hook 依赖)
     telegram_token:  未配置  (M1+ 才用,可后续 ccteam config edit)
 
 下一步:
@@ -323,3 +322,6 @@ rm -rf ~/.ccteam                     # 干净卸载(项目目录 ~/projects/ 不
 
 **Q: 卡住了能直接看 claude 在想什么吗?**
 能,`ccteam attach <slug>` 进去看到的就是原生 Claude Code 终端,模型的 thinking、tool call、输出全可见。
+
+**Q: ccteam 跟 Warp / iTerm2 怎么集成?**
+不需要集成。Warp / iTerm2 / Alacritty 等是用户终端选择,`ccteam attach` 在任何 tmux 兼容终端里行为完全一致——ccteam 自己只输出标准 tmux 协议,不感知终端 emulator。

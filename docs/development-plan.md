@@ -56,9 +56,9 @@
 | # | 任务 | 验收(可执行) | 依赖 | 对应 tech-design 章节 |
 |---|---|---|---|---|
 | **W1 — Foundation** |
-| M0.1 | 仓库骨架 | `mkdir orchestrator/ phases/ hooks/ cli/ tmux/`;`pyproject.toml` 可 `pip install -e .` | — | §4 目录现状 |
+| M0.1 | 仓库骨架(Cargo workspace) | 顶层 `Cargo.toml` workspace + 三 crate:`crates/ccteam-core`(lib,状态/协议/tmux 包装/hook 共享 schema)+ `crates/ccteam-cli`(bin,主入口 `ccteam`,含 `hook` 子命令组)+ `crates/ccteam-hooks`(可独立 lib,也可合并到 cli);`phases/` + `tmux/` 保留独立目录(模板 + tmux layout 不进 Rust crate);`cargo build --release` 出单 binary `ccteam`,`ccteam --version` 能跑 | — | §4 目录现状、§6.1 |
 | M0.2 | 5 个最小 phase 模板 | `phases/{02-plan-eng,03-implement,04-test-author,05-test-run,06-fix,09-ship}.md` 都带 YAML front matter(必含 `name` / `required_inputs` / `required_outputs` / `parallelism` / `agent_team` / `sub_skills` 字段——M0 `parallelism: solo` 写死,`sub_skills` 列表可空),可被 orchestrator 解析 | — | §3.3、§6.10、§6.11 |
-| M0.3 | 3 个 hook 脚本 | `progress-append.sh` / `parse-phase-end.sh` / `cost-accumulate.sh`;手动喂 stdin JSON 验证输出 | — | §6.2 |
+| M0.3 | `ccteam hook` 子命令组(3 个 hook 子命令) | 在 `crates/ccteam-cli` 加 `hook` subcommand group,每个 hook 是一个 fn:`ccteam hook progress-append` / `ccteam hook parse-phase-end` / `ccteam hook cost-accumulate`;手动喂 stdin JSON 验证 stdout 输出符合 interfaces §6 schema | — | §6.2 |
 | M0.4 | 产出项目 settings.json 模板 | 模板渲染后挂到示例项目,`claude` 启动后 SessionStart hook 写出 ready 标记 | M0.3 | §6.2 |
 | **W2 — Orchestrator** |
 | M0.5 | state.json schema + 原子读写 | `.tmp` + rename;启动校验 schema;损坏走 backup | M0.1 | §5.2 |
@@ -151,6 +151,7 @@
 | M3.7 | agent 投票与共识机制 | M3.6 audit 输出 PASS/CONCERN/BLOCK;按 `yolo`/`balanced`/`careful` 信任档位决定是否上推 L3;分裂时弹用户 | M3.6、M1.7 | §3.6 L2/L3 |
 | M3.8 | 新插件自动挂载(扩展性) | 扫 `~/.claude/plugins/.../skill_intent.yaml`;按推荐 phase 自动加进 phase 模板 `sub_skills` | M2.6 | §6.10 |
 | M3.9 | `parallelism: multi_session`(大项目加速) | 实现 fan-out / fan-in 协议:plan-eng 输出子模块清单 + interface-contracts.md;orchestrator 起 N 个 sub-session;子模块独立跑 phase;review/ship 在 master fan-in;`max_sessions_per_project=4` 兜底;一次端到端验证(SaaS demo:backend ∥ frontend ∥ docs) | M2.7、M1.5 | §6.11 |
+| M3.10 | ratatui TUI 前端(机会主义,**非关键路径**) | `ccteam tui` 可跑;直接抄 `references/agent-of-empires/` 的 Cargo.toml dep 组合(ratatui / crossterm / tokio)+ 主循环范式(event poll + 状态拉取);数据源走 `ccteam-core` lib API(M2.8 `mcp-serve` 同源 schema),不另起进程;不引入新 LLM 层(前端层 invariant) | M2.8 | §3.8 前端层 |
 
 **M3 不做**:跨项目接口契约管理(M5)、自动子模块切分(M5)、跨子模块 stop-the-world 重构(M5)。
 
@@ -169,6 +170,7 @@
 | M4.3 | WEAK 维度强制 BLOCK | 任一维度 ≤ X 分立即进 fix-cycle,绕过"勉强通过" | M4.2 |
 | M4.4 | 评审维度 per-project 自适应 | 前端项目偏重 UX、CLI 偏重 Docs;由 plan-eng 阶段提示 | M4.1 |
 | M4.5 | Critic 与 dev 切换的 cache 优化 | dev session 跨 phase cache 复用,Critic 单独热;算总成本回报 | M4.1 |
+| M4.6 | web dashboard(机会主义,**非关键路径**) | `ccteam serve --port` 可跑,浏览器开 xterm.js 终端可远程介入项目级 claude(发送 keystroke 直通 tmux,触发 user_attach 自动暂停 phase——前端层 invariant:不在 ccteam 层起新 LLM,用户键入 = `send-keys` 注入 tmux);直接抄 `references/agent-of-empires/` 的 axum ws + xterm.js bridge 范式;参考它的 `docs/guides/web-dashboard.md` | M2.8 | §3.8 前端层 invariant |
 
 **M4 不做**:多个 Critic 并行 / 投票(M5)。
 
@@ -212,7 +214,7 @@ M0.15 ─→ M1.1 (telegram) ─→ M1.2 (多项目) ─→ M1.5 (重启恢复) 
 M3.1 ─→ M3.2 (向量索引) ─→ M3.3 (Seed 接 RAG)
 ```
 
-不在关键路径上的(可与主线并行):M1.4(项目 CLAUDE.md)、M1.8(ccteam-control skill)、M1.9(多轮 CLARIFY)、M2.4(golden-rules)、M2.8(ccteam-mcp MCP server)、M4.4(评审自适应)、M3.5(claude-mem MCP)、M3.8(新插件挂载)。
+不在关键路径上的(可与主线并行):M1.4(项目 CLAUDE.md)、M1.8(ccteam-control skill)、M1.9(多轮 CLARIFY)、M2.4(golden-rules)、M2.8(ccteam-mcp MCP server)、M4.4(评审自适应)、M3.5(claude-mem MCP)、M3.8(新插件挂载)、M3.10(ratatui TUI,机会主义)、M4.6(web dashboard,机会主义)。
 
 **关键路径变化**(因 M3.9):M2.7 → M3.9 成为新关键路径终点之一(痛点 13 最终落地);M2.7 卡住整条 multi-agent 速度并行链。
 
