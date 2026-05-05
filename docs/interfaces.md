@@ -336,6 +336,8 @@ confidence: 0.0-1.0
 ### 6.1 项目 `.claude/settings.json` 完整模板
 
 > **D1 备注**:所有 hook 都是 `ccteam` 单 binary 的子命令(`ccteam hook <name>`),不再是独立 bash/python 脚本——零运行时依赖,与 orchestrator 共享 serde schema。debug 时可手动跑 `ccteam hook <subcmd>` 喂 stdin JSON(详见 §10.6)。
+>
+> **M0 备注**:M0.4 渲染的模板是下面 JSON 的一个真子集——**不含** `PostToolUse(Bash:git push.*)` 拦截分支(M1+ 才补上 `block-push` 子命令实现)。M0 渲染源在 `crates/ccteam-core/src/templates/settings.json`。
 
 ```json
 {

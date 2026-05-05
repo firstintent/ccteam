@@ -44,6 +44,9 @@ enum HookCommand {
     /// the latest assistant message's `usage.*`. Dollar costs land in
     /// M0.14.
     CostAccumulate,
+    /// SessionStart hook: write the `<project>/.ccteam/ready` marker.
+    /// M0.10 extends this to bridge a pre-reset progress summary.
+    LoadContext,
 }
 
 fn main() -> Result<()> {
@@ -69,5 +72,6 @@ fn run_hook(cmd: HookCommand) -> Result<()> {
         }
         HookCommand::ParsePhaseEnd => ccteam_hooks::parse_phase_end(&paths, &stdin),
         HookCommand::CostAccumulate => ccteam_hooks::cost_accumulate(&paths, &stdin),
+        HookCommand::LoadContext => ccteam_hooks::load_context(&paths, &stdin),
     }
 }

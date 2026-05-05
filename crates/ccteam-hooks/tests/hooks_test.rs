@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use tempfile::TempDir;
 
 use ccteam_core::{CcteamPaths, Parallelism, PhaseState, ProjectState};
-use ccteam_hooks::{cost_accumulate, parse_phase_end, progress_append};
+use ccteam_hooks::{cost_accumulate, load_context, parse_phase_end, progress_append};
 
 struct Fixture {
     _tmp: TempDir,
@@ -281,6 +281,36 @@ fn cost_accumulate_no_op_when_no_assistant_message_yet() {
     cost_accumulate(&fx.paths, &stdin).unwrap();
     let s = fx.read_state();
     assert_eq!(s.context_tokens_used, 0);
+}
+
+#[test]
+fn load_context_writes_ready_marker_under_dot_ccteam() {
+    let fx = Fixture::new("bookmark-mgr-a3f9");
+    let stdin = json!({"cwd": fx.project_dir});
+
+    load_context(&fx.paths, &stdin).unwrap();
+    let ready = fx.project_dir.join(".ccteam").join("ready");
+    assert!(
+        ready.exists(),
+        "load-context must create {} so orchestrator can detect the launched session",
+        ready.display(),
+    );
+}
+
+#[test]
+fn load_context_creates_dot_ccteam_dir_when_missing() {
+    let tmp = TempDir::new().unwrap();
+    let paths = CcteamPaths {
+        root: tmp.path().join("home"),
+        projects_root: tmp.path().join("projects"),
+    };
+    let project = paths.project_dir("brand-new");
+    std::fs::create_dir_all(&project).unwrap();
+    // Note: no `.ccteam/` subdir yet — load-context must create it.
+    let stdin = json!({"cwd": project});
+
+    load_context(&paths, &stdin).unwrap();
+    assert!(project.join(".ccteam/ready").exists());
 }
 
 #[test]
