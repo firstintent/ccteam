@@ -97,6 +97,24 @@ M2.8 之后会切到 `mcp__ccteam__new` / `mcp__ccteam__ls` 等结构化工具�
 
 不要主动 tail progress.jsonl 给用户看——那是嘈音。
 
+## 5.1 决策队列(decisions queue)
+
+ccteam 跨项目聚合所有 `event_kind: clarify | escalation` 的 outbox 文件成一个**决策队列**。命令:
+
+```bash
+ccteam decisions                 # 表格视图
+ccteam decisions --format json   # 结构化,适合你 jq 筛选
+```
+
+**你必须主动用这个**——这是 mode 2(用户离线时)异步决策机制的入口(interfaces.md §5.6.4)。具体规则:
+
+- **session 启动 / context reset 后**:第一件事跑一次 `ccteam decisions --format json`,看有没有用户离开期间堆积的决策。**有则主动汇报**,例:"刚回来发现 3 个项目在等你拍板:bookmark-mgr 问 SQLite 还是 Postgres?todo-cli 报 max_clarify_rounds 撞顶。先处理哪个?"
+- **用户 NL 说"批一下今天的决策" / "看看 pending"**:跑 `ccteam decisions`,逐条 NL 化展示,等用户每条 NL 答复
+- **每次用户答复某条决策后**:用 `ccteam-control` 把答案写到对应 project session 的 inbox(`Bash` 调 `ccteam new`-style 路径,M2.8 后改 `ccteam__send_to_session` MCP 工具)
+- **绝不**主动 tail 单个项目的 outbox —— 用全局 `ccteam decisions` 一站式聚合
+
+**与 mode 1 的关系**:用户已经 `tmux attach` 到具体 project session 时,phase 内 claude 用 AskUserQuestion 直接问,**不**走 outbox 也**不**进决策队列。决策队列只装 mode 2(异步)写出来的 clarify / escalation。
+
 ## 6. inbox 处理
 
 orchestrator 会把外部消息(终端 attach 输入 / 未来 channel adapter)写到 `~/projects/__USER_HANDLE__-meta/.ccteam/inbox/msg-*.md`。
