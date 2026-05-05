@@ -86,6 +86,27 @@ enum Command {
     },
     /// Resume a paused / escalated project (re-arm phase_state=idle).
     Resume { slug: String },
+    /// Health checks + tool-surface maintenance.
+    Doctor {
+        /// Backfill ~/.claude/agents/<name>.md symlinks for the eight
+        /// recommended plugin agents (M0.5.5). Idempotent. User-authored
+        /// agent files are preserved unless --force is given.
+        #[arg(long, default_value_t = false)]
+        install_recommended_agents: bool,
+        /// Print + return what would happen without touching the
+        /// filesystem.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Replace user-authored agent files with the plugin link.
+        /// Use cautiously.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+        /// Cross-check every shipped phase template's tools_required
+        /// against the live tool surface and print a markdown report
+        /// (M0.5.6).
+        #[arg(long, default_value_t = false)]
+        tool_surface: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -141,7 +162,25 @@ fn main() -> Result<()> {
             let paths = CcteamPaths::from_env()?;
             commands::run_resume(&paths, &slug)
         }
+        Command::Doctor {
+            install_recommended_agents,
+            dry_run,
+            force,
+            tool_surface,
+        } => run_doctor(commands::DoctorOptions {
+            install_recommended_agents,
+            dry_run,
+            force,
+            tool_surface,
+        }),
     }
+}
+
+fn run_doctor(opts: commands::DoctorOptions) -> Result<()> {
+    let paths = CcteamPaths::from_env()?;
+    let body = commands::run_doctor(&paths, opts)?;
+    print!("{body}");
+    Ok(())
 }
 
 fn run_hook(cmd: HookCommand) -> Result<()> {

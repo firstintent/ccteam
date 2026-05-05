@@ -10,8 +10,10 @@ use chrono::Utc;
 use serde_json::{json, Map, Value};
 
 use ccteam_core::{
-    bootstrap_project, current_ccteam_bin, pick_unused_slug, write_global_phase_templates,
-    CcteamPaths, PhaseState, ProjectState, PHASE_TEMPLATES,
+    bootstrap_project, current_ccteam_bin, link_recommended_agents, pick_unused_slug,
+    user_claude_dir, write_global_phase_templates, AgentLinkAction, AgentLinkReport,
+    CcteamPaths, LinkOptions, PhaseState, PhaseTemplate, ProjectState, ToolSurfaceSnapshot,
+    BUILTIN_SUBAGENTS, PHASE_TEMPLATES,
 };
 use ccteam_core::tmux::TmuxSession;
 
@@ -224,6 +226,213 @@ pub fn run_resume(paths: &CcteamPaths, slug: &str) -> Result<()> {
         let _ = std::fs::rename(&esc, &archive);
     }
     Ok(())
+}
+
+/// `ccteam doctor` flags. M0.5 ships two subcommands gated by flags
+/// rather than a `doctor <subcommand>` because both are read-only or
+/// effectively idempotent — making them top-level keeps the surface
+/// small. M1+ may add `doctor --install-skill` etc.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DoctorOptions {
+    pub install_recommended_agents: bool,
+    pub dry_run: bool,
+    pub force: bool,
+    pub tool_surface: bool,
+}
+
+/// `ccteam doctor` dispatch. Returns a human-readable report so unit
+/// tests don't need to capture stdout.
+pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
+    if !opts.install_recommended_agents && !opts.tool_surface {
+        return Ok(String::from(
+            "ccteam doctor: pass at least one mode flag.\n\
+             \n\
+             modes:\n  \
+             --install-recommended-agents [--dry-run] [--force]\n      \
+             ln -sf 8 plugin agents into ~/.claude/agents/ (M0.5.5).\n  \
+             --tool-surface\n      \
+             cross-check phase templates' tools_required against current reachability (M0.5.6).\n",
+        ));
+    }
+    let mut out = String::new();
+    if opts.install_recommended_agents {
+        out.push_str(&render_install_recommended_agents_report(opts)?);
+    }
+    if opts.tool_surface {
+        out.push_str(&render_tool_surface_report(paths)?);
+    }
+    Ok(out)
+}
+
+fn render_install_recommended_agents_report(opts: DoctorOptions) -> Result<String> {
+    let reports = link_recommended_agents(LinkOptions {
+        force: opts.force,
+        dry_run: opts.dry_run,
+    })?;
+    let mut out = String::new();
+    out.push_str(if opts.dry_run {
+        "ccteam doctor --install-recommended-agents (dry-run)\n"
+    } else {
+        "ccteam doctor --install-recommended-agents\n"
+    });
+    out.push_str("\n");
+    let mut all_ok = true;
+    for r in &reports {
+        out.push_str(&render_agent_link_line(r));
+        if !r.action.is_ok() {
+            all_ok = false;
+        }
+    }
+    out.push_str("\n");
+    if !all_ok {
+        out.push_str(
+            "some agents skipped — pass --force to overwrite user files, or install \
+             claude-plugins-official for missing sources.\n",
+        );
+    } else if opts.dry_run {
+        out.push_str(
+            "no changes made (--dry-run). drop the flag to apply.\n",
+        );
+    } else {
+        out.push_str("all 8 plugin agents reachable via Task(subagent_type=...)\n");
+    }
+    Ok(out)
+}
+
+fn render_agent_link_line(r: &AgentLinkReport) -> String {
+    let action_label = format_action_label(&r.action);
+    format!(
+        "  {:<28} {:<28} {}\n",
+        r.agent.filename, action_label, r.target.display(),
+    )
+}
+
+fn format_action_label(action: &AgentLinkAction) -> String {
+    use AgentLinkAction::*;
+    match action {
+        Linked => "linked".into(),
+        AlreadyLinked => "already-linked".into(),
+        Replaced { previous_target } => {
+            format!("kept (was -> {})", previous_target.display())
+        }
+        SkippedUserFile => "skipped (user file)".into(),
+        SkippedSourceMissing { source } => {
+            format!("skipped (source missing: {})", source.display())
+        }
+        DryRun { would } => format!("would: {}", format_action_label(would)),
+    }
+}
+
+fn render_tool_surface_report(paths: &CcteamPaths) -> Result<String> {
+    let claude = user_claude_dir()?;
+    let snap = ToolSurfaceSnapshot::scan(&claude)?;
+    let templates = load_local_phase_templates(paths)?;
+
+    let mut out = String::new();
+    out.push_str("ccteam doctor --tool-surface\n");
+    out.push_str(&format!(
+        "\nclaude dir       : {}\n",
+        claude.display()
+    ));
+    out.push_str(&format!(
+        "phase templates  : {} loaded from {}\n",
+        templates.len(),
+        paths.phases_dir().display(),
+    ));
+    out.push_str(&format!(
+        "subagents seen   : {} (incl. {} built-ins)\n",
+        snap.subagents.len(),
+        BUILTIN_SUBAGENTS.len(),
+    ));
+    out.push_str(&format!("skills seen      : {}\n", snap.skills.len()));
+    out.push_str(&format!("mcp servers seen : {}\n", snap.mcp.len()));
+    out.push_str("\n");
+
+    if templates.is_empty() {
+        out.push_str(
+            "no phase templates under ~/.ccteam/phases/ — run `ccteam init` first.\n",
+        );
+        return Ok(out);
+    }
+
+    out.push_str("| phase | kind | name | status | fix |\n");
+    out.push_str("|---|---|---|---|---|\n");
+    let mut any_missing = false;
+    for t in &templates {
+        let req = &t.tools_required;
+        let mut emitted = false;
+        for kind_name in [
+            ("subagent", &req.subagents, &snap.subagents),
+            ("skill", &req.skills, &snap.skills),
+            ("mcp", &req.mcp, &snap.mcp),
+        ] {
+            let (kind, list, set) = kind_name;
+            for name in list {
+                emitted = true;
+                if set.contains(name) {
+                    out.push_str(&format!(
+                        "| {phase} | {kind} | `{name}` | OK | — |\n",
+                        phase = t.name,
+                    ));
+                } else {
+                    any_missing = true;
+                    let m = match kind {
+                        "subagent" => ccteam_core::MissingTool::Subagent(name.clone()),
+                        "skill" => ccteam_core::MissingTool::Skill(name.clone()),
+                        _ => ccteam_core::MissingTool::Mcp(name.clone()),
+                    };
+                    out.push_str(&format!(
+                        "| {phase} | {kind} | `{name}` | **MISSING** | {fix} |\n",
+                        phase = t.name,
+                        fix = m.fix_hint(),
+                    ));
+                }
+            }
+        }
+        if !emitted {
+            out.push_str(&format!(
+                "| {phase} | — | — | none required | — |\n",
+                phase = t.name,
+            ));
+        }
+    }
+
+    out.push_str("\n");
+    if any_missing {
+        out.push_str(
+            "**Verdict:** at least one phase has a missing tool. \
+             `ccteam start` will refuse until they're installed (or pass --skip-tool-check).\n",
+        );
+    } else {
+        out.push_str("**Verdict:** all phase tool dependencies reachable.\n");
+    }
+    Ok(out)
+}
+
+fn load_local_phase_templates(paths: &CcteamPaths) -> Result<Vec<PhaseTemplate>> {
+    let dir = paths.phases_dir();
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut entries: Vec<_> = std::fs::read_dir(&dir)
+        .with_context(|| format!("read_dir {}", dir.display()))?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path()
+                .extension()
+                .is_some_and(|x| x.eq_ignore_ascii_case("md"))
+        })
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+    let mut out = Vec::with_capacity(entries.len());
+    for e in entries {
+        let path = e.path();
+        out.push(
+            PhaseTemplate::load(&path)
+                .with_context(|| format!("load {}", path.display()))?,
+        );
+    }
+    Ok(out)
 }
 
 /// Project metadata with derived fields used by `ls`. Pulled out so
@@ -640,4 +849,20 @@ mod tests {
         assert!(body.contains("session_start"));
     }
 
+    #[test]
+    fn run_doctor_with_no_flags_shows_help_text() {
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let body = run_doctor(&paths, DoctorOptions::default()).unwrap();
+        assert!(body.contains("install-recommended-agents"));
+        assert!(body.contains("tool-surface"));
+    }
+
+    #[test]
+    fn format_action_label_renders_dry_run_clearly() {
+        let label = format_action_label(&AgentLinkAction::DryRun {
+            would: Box::new(AgentLinkAction::Linked),
+        });
+        assert_eq!(label, "would: linked");
+    }
 }
