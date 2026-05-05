@@ -1,0 +1,20 @@
+[package]
+name = "ccteam-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ccteam command-line tool: orchestrator daemon, project management, and hook subcommands."
+
+[[bin]]
+name = "ccteam"
+path = "src/main.rs"
+
+[dependencies]
+ccteam-core.workspace = true
+ccteam-hooks.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true

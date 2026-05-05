@@ -169,15 +169,17 @@ ccteam/
 │   ├── settings.json             ✅ 全权限放行(bypassPermissions),开发本仓库专用
 │   └── skills/
 │       └── ccgram-messaging/     ✅ 已装(M3+ 用)
-├── LICENSE                       ✅
-└── (M0 待建)
-    ├── Cargo.toml                ← workspace 根(crates/ccteam-core / ccteam-cli / ccteam-hooks)
-    ├── orchestrator/             ← Rust tokio 主循环(`crates/ccteam-core`)
-    ├── phases/                   ← 9 个 phase markdown(00-seed.md … 09-ship.md)
-    ├── hooks/                    ← progress-append.sh / parse-phase-end.sh / cost-accumulate.sh
-    ├── cli/                      ← ccteam new / status / attach / resume 等(实现为 `crates/ccteam-cli` binary 子命令,同时承载 `hook` subcommand group)
-    ├── tmux/                     ← layout 模板
-    └── references/               ← .gitignore 屏蔽,本仓库不跟踪;agent-of-empires 等参考实现
+├── Cargo.toml                    ✅ workspace 根(M0.1)
+├── rust-toolchain.toml           ✅ stable(M0.1)
+├── crates/                       ✅ M0.1 — 三 member crate
+│   ├── ccteam-core/              ← lib:状态机 / 协议 / tmux 包装 / hook 共享 schema(M0.5+ 填充)
+│   ├── ccteam-cli/               ← bin `ccteam`:`new` / `ls` / `show` / `start` 等(M0.11)+ `hook` 子命令组(M0.3)
+│   └── ccteam-hooks/             ← lib:progress-append / parse-phase-end / cost-accumulate handler(M0.3)
+├── phases/                       ⏳ M0.2 — 9 个 phase markdown(00-seed.md … 09-ship.md)
+├── tmux/                         ⏳ M0.7 — tmux layout 模板
+├── references/                   ⏸ .gitignore 屏蔽,本仓库不跟踪;agent-of-empires 等参考实现
+├── CLAUDE.md                     ✅ 本文件
+└── LICENSE                       ✅
 ```
 
 M0 完整任务清单见 `docs/development-plan.md` §2(任务编号 M0.1–M0.15、依赖、可执行验收)。**勾选标准**:每条都能映射回 requirements §二某条痛点。
