@@ -2,10 +2,12 @@
 //! M0.3 wires `hook`, M0.6 the orchestrator daemon (`start`), M0.11 the
 //! project management commands.
 
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use ccteam_core::CcteamPaths;
+use ccteam_core::{CcteamPaths, Orchestrator, OrchestratorConfig};
 
 #[derive(Parser)]
 #[command(
@@ -26,6 +28,16 @@ enum Command {
     Hook {
         #[command(subcommand)]
         cmd: HookCommand,
+    },
+    /// Run the orchestrator daemon. M0 only supports `--foreground`
+    /// mode (the flag is accepted for forward compat with M1 daemon
+    /// mode but currently a no-op; `start` always runs in foreground).
+    Start {
+        #[arg(long, default_value_t = false)]
+        foreground: bool,
+        /// Override the polling tick interval (debug / tests only).
+        #[arg(long, value_name = "SECONDS", default_value_t = 30)]
+        tick_seconds: u64,
     },
 }
 
@@ -58,7 +70,41 @@ fn main() -> Result<()> {
 
     match command {
         Command::Hook { cmd } => run_hook(cmd),
+        Command::Start {
+            foreground: _,
+            tick_seconds,
+        } => run_start(tick_seconds),
     }
+}
+
+fn run_start(tick_seconds: u64) -> Result<()> {
+    init_tracing();
+    let paths = CcteamPaths::from_env()?;
+    let config = OrchestratorConfig {
+        tick_interval: Duration::from_secs(tick_seconds.max(1)),
+    };
+    let orchestrator = Orchestrator::new(paths, config)?;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime")?;
+    runtime.block_on(async move {
+        let shutdown = async {
+            let _ = tokio::signal::ctrl_c().await;
+            tracing::info!("ctrl+c received");
+        };
+        orchestrator.run(shutdown).await
+    })
+}
+
+fn init_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,ccteam_core=info")),
+        )
+        .try_init();
 }
 
 fn run_hook(cmd: HookCommand) -> Result<()> {

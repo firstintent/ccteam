@@ -12,6 +12,7 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 chrono.workspace = true
 dirs.workspace = true
+notify.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
