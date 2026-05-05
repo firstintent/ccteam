@@ -131,12 +131,22 @@ pub fn decide_tick(state: &ProjectState, last_event: Option<&Value>) -> TickActi
 pub struct OrchestratorConfig {
     /// How often the main loop ticks in the absence of progress events.
     pub tick_interval: Duration,
+    /// argv for the in-pane process when (re)starting a project's tmux
+    /// session. Default is `claude --dangerously-skip-permissions`;
+    /// tests substitute a sleeping shell so `--dangerously-skip-…`
+    /// doesn't hit the real CLI.
+    pub claude_argv: Vec<String>,
+    /// How long the context-reset routine waits for SessionStart's
+    /// ready marker before bailing.
+    pub ready_timeout: Duration,
 }
 
 impl Default for OrchestratorConfig {
     fn default() -> Self {
         Self {
             tick_interval: Duration::from_secs(30),
+            claude_argv: vec!["claude".into(), "--dangerously-skip-permissions".into()],
+            ready_timeout: Duration::from_secs(60),
         }
     }
 }
@@ -246,6 +256,59 @@ impl Orchestrator {
         Ok(out)
     }
 
+    /// Reset claude's context at a phase boundary (tech-design §6.9):
+    /// append the progress summary to the project's CLAUDE.md, then
+    /// recycle the tmux session so the new claude reads the bridged
+    /// summary instead of the bloated history. M0 implementation kills
+    /// + restarts the tmux session under the same name; same end-state
+    /// as `/exit` followed by re-launch in the same window, but
+    /// simpler to express atomically.
+    pub fn reset_context(&self, slug: &str, state: &mut ProjectState) -> Result<()> {
+        let project_dir = self.paths.project_dir(slug);
+        let claude_md = project_dir.join("CLAUDE.md");
+        let summary = build_progress_summary(state);
+        append_progress_summary(&claude_md, &summary)
+            .with_context(|| format!("bridge progress to {}", claude_md.display()))?;
+
+        let session = TmuxSession::for_slug(slug);
+        let ready = CcteamPaths::project_ready_in(&project_dir);
+        if ready.exists() {
+            let _ = std::fs::remove_file(&ready);
+        }
+        session
+            .kill()
+            .with_context(|| format!("kill tmux session for {slug}"))?;
+
+        let argv: Vec<&str> = self.config.claude_argv.iter().map(|s| s.as_str()).collect();
+        session
+            .start(&project_dir, &argv)
+            .with_context(|| format!("restart tmux session for {slug}"))?;
+
+        wait_for_ready(&ready, self.config.ready_timeout)
+            .with_context(|| format!("wait for SessionStart ready marker for {slug}"))?;
+
+        state.context_tokens_used = 0;
+        state.context_reset_count = state.context_reset_count.saturating_add(1);
+        state.last_event_type = Some("context_reset".into());
+        state.last_progress_event_at = Some(Utc::now());
+        state.save(&self.paths.project_state(slug))?;
+
+        progress::append_event(
+            &self.paths.progress_jsonl(slug),
+            &json!({
+                "ts": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                "event": "context_reset",
+                "reset_count": state.context_reset_count,
+            }),
+        )?;
+        tracing::info!(
+            slug,
+            reset_count = state.context_reset_count,
+            "context reset complete",
+        );
+        Ok(())
+    }
+
     /// Apply `decide_tick` to one project, looping the AdvancePhase →
     /// DispatchPhase chain so a phase boundary doesn't take two ticks
     /// to act on. The loop iteration cap is a paranoia guard.
@@ -277,6 +340,20 @@ impl Orchestrator {
                         to = %state.current_phase,
                         "phase advanced",
                     );
+
+                    // Phase boundary: maybe reset context if the
+                    // 60%-of-1M threshold has been crossed.
+                    if !is_terminal(&state)
+                        && state.context_tokens_used > state.context_reset_threshold_tokens
+                    {
+                        if let Err(err) = self.reset_context(slug, &mut state) {
+                            tracing::error!(
+                                slug,
+                                error = %err,
+                                "context reset failed; continuing without reset",
+                            );
+                        }
+                    }
                     // continue the loop so a fresh idle state can
                     // dispatch the next phase in the same tick.
                 }
@@ -397,6 +474,71 @@ impl Orchestrator {
         tracing::debug!(?event, "progress event");
         Ok(())
     }
+}
+
+/// Compose the "当前进度" summary the orchestrator appends to a
+/// project's CLAUDE.md before recycling the tmux session. Pure: only
+/// reads `state` so it's trivially unit-testable.
+pub fn build_progress_summary(state: &ProjectState) -> String {
+    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let mut s = String::new();
+    s.push_str(&format!("\n## 当前进度 (context reset @ {now})\n\n"));
+    s.push_str(&format!("- 当前 phase: {}\n", state.current_phase));
+    s.push_str(&format!("- 累计 cost: ${:.2}\n", state.cost_used_usd));
+    s.push_str(&format!(
+        "- 已完成 reset 次数: {}\n",
+        state.context_reset_count + 1
+    ));
+    if state.phase_history.is_empty() {
+        s.push_str("- phase 历史: (空)\n");
+    } else {
+        s.push_str("- phase 历史:\n");
+        for h in &state.phase_history {
+            s.push_str(&format!("  - {} ({})\n", h.phase, h.status));
+        }
+    }
+    s.push('\n');
+    s.push_str("> 这一节由 ccteam 在 context 接近上限时自动追加。新 session 启动后请按当前 phase 继续工作。\n");
+    s
+}
+
+/// Append the summary to `claude_md`, creating the file with a header
+/// if it didn't exist.
+pub fn append_progress_summary(claude_md: &Path, summary: &str) -> Result<()> {
+    use std::io::Write;
+    if let Some(parent) = claude_md.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create {}", parent.display()))?;
+    }
+    if !claude_md.exists() {
+        std::fs::write(
+            claude_md,
+            "# CLAUDE.md (auto-managed by ccteam)\n\n本文件由 ccteam 自动维护;不要手改\"当前进度\"节,会被覆盖。\n",
+        )
+        .with_context(|| format!("create {}", claude_md.display()))?;
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(claude_md)
+        .with_context(|| format!("open {}", claude_md.display()))?;
+    f.write_all(summary.as_bytes())?;
+    Ok(())
+}
+
+fn wait_for_ready(ready_path: &Path, timeout: Duration) -> Result<()> {
+    use std::time::Instant;
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if ready_path.exists() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    anyhow::bail!(
+        "timeout after {:?} waiting for {}",
+        timeout,
+        ready_path.display(),
+    );
 }
 
 fn load_phase_templates(dir: &Path) -> Result<Vec<PhaseTemplate>> {

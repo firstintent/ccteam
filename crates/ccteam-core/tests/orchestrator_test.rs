@@ -103,6 +103,7 @@ async fn run_returns_when_shutdown_future_resolves() {
         paths,
         OrchestratorConfig {
             tick_interval: Duration::from_millis(50),
+            ..OrchestratorConfig::default()
         },
     )
     .unwrap();

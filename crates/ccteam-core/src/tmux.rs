@@ -58,9 +58,16 @@ impl TmuxSession {
             .unwrap_or(false)
     }
 
-    /// `tmux new-session -d -s <name> -c <working_dir> <argv...>`.
+    /// `tmux new-session -d -s <name> -c <working_dir> -x 200 -y 50 <argv...>`.
     /// Errors if the session already exists or `tmux` rejects the
     /// invocation (caller can `kill` first if it wants to recreate).
+    ///
+    /// `-x 200 -y 50` sets a default pane size: tmux otherwise defaults
+    /// to 80×24 only when invoked from a controlling TTY; under daemon
+    /// (or test) invocation the pane collapses to 1×1, which silently
+    /// truncates everything send-keys writes. The wider default makes
+    /// long phase prompts visible without truncation; user `tmux
+    /// attach` resizes to the client window automatically.
     pub fn start(&self, working_dir: &Path, argv: &[&str]) -> Result<()> {
         if self.exists() {
             bail!("tmux session already exists: {}", self.name);
@@ -73,7 +80,18 @@ impl TmuxSession {
             .ok_or_else(|| anyhow!("working_dir is not valid UTF-8: {}", working_dir.display()))?;
 
         let mut cmd = Command::new("tmux");
-        cmd.args(["new-session", "-d", "-s", &self.name, "-c", working_dir_str]);
+        cmd.args([
+            "new-session",
+            "-d",
+            "-s",
+            &self.name,
+            "-c",
+            working_dir_str,
+            "-x",
+            "200",
+            "-y",
+            "50",
+        ]);
         cmd.args(argv);
 
         let output = cmd
@@ -83,6 +101,24 @@ impl TmuxSession {
             let stderr = String::from_utf8_lossy(&output.stderr);
             bail!("tmux new-session failed for {}: {}", self.name, stderr);
         }
+
+        // Force the window size again post-creation. With `-d` (detached
+        // start) and no controlling client, tmux otherwise inherits a
+        // server-default that can be as small as 1×1, silently
+        // truncating everything send-keys writes. resize-window is a
+        // no-op when a real client later attaches.
+        let _ = Command::new("tmux")
+            .args([
+                "resize-window",
+                "-t",
+                &format!("{}:0", self.name),
+                "-x",
+                "200",
+                "-y",
+                "50",
+            ])
+            .output();
+
         Ok(())
     }
 

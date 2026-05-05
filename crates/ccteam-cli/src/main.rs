@@ -82,6 +82,7 @@ fn run_start(tick_seconds: u64) -> Result<()> {
     let paths = CcteamPaths::from_env()?;
     let config = OrchestratorConfig {
         tick_interval: Duration::from_secs(tick_seconds.max(1)),
+        ..OrchestratorConfig::default()
     };
     let orchestrator = Orchestrator::new(paths, config)?;
 

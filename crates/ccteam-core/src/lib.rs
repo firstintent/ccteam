@@ -11,8 +11,8 @@ pub mod templates;
 pub mod tmux;
 
 pub use orchestrator::{
-    decide_tick, is_terminal, next_phase, Orchestrator, OrchestratorConfig, TickAction,
-    FIRST_PHASE, M0_PHASE_DAG,
+    append_progress_summary, build_progress_summary, decide_tick, is_terminal, next_phase,
+    Orchestrator, OrchestratorConfig, TickAction, FIRST_PHASE, M0_PHASE_DAG,
 };
 pub use paths::{slug_from_project_dir, CcteamPaths};
 pub use phases::{

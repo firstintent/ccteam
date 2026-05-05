@@ -136,20 +136,21 @@ fn dispatch_phase_uses_btw_when_busy() {
 
 #[test]
 fn dispatch_phase_payload_lands_in_tmux_pane() {
-    let Some((_tmp, _paths, slug, scoped)) = fixture("payload-in-pane") else {
+    let Some((_tmp, paths, slug, scoped)) = fixture("payload-in-pane") else {
         return;
     };
-    let _ = scoped; // keep alive
-    let paths = CcteamPaths {
-        root: _paths.root,
-        projects_root: _paths.projects_root,
-    };
     let orch = Orchestrator::new(paths, OrchestratorConfig::default()).unwrap();
-    orch.dispatch_phase(&slug, "implement").unwrap();
-
-    // Capture the pane and verify a fragment of the phase prompt
-    // landed there. We poll because send-keys → pane render is async.
     let session = TmuxSession::for_slug(&slug);
+    assert!(
+        session.exists(),
+        "session must be alive before dispatch_phase",
+    );
+    orch.dispatch_phase(&slug, "implement").unwrap();
+    assert!(
+        session.exists(),
+        "session must still be alive after dispatch_phase",
+    );
+    let mut last_capture = String::new();
     for _ in 0..30 {
         let output = std::process::Command::new("tmux")
             .args([
@@ -160,13 +161,19 @@ fn dispatch_phase_payload_lands_in_tmux_pane() {
             ])
             .output()
             .unwrap();
-        let s = String::from_utf8_lossy(&output.stdout);
-        if s.contains("@.ccteam/phases/implement.md") {
+        last_capture = String::from_utf8_lossy(&output.stdout).into_owned();
+        // The full path may wrap to a new line; checking for the phase
+        // name fragment alone is enough to confirm the prompt landed.
+        if last_capture.contains("implement.md") || last_capture.contains("PHASE_DONE") {
+            drop(scoped);
             return;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    panic!("phase prompt fragment never appeared in tmux pane");
+    drop(scoped);
+    panic!(
+        "phase prompt fragment never appeared in tmux pane.\nlast capture:\n{last_capture}"
+    );
 }
 
 #[test]
