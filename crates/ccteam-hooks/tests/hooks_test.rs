@@ -40,6 +40,7 @@ impl Fixture {
         let now = Utc::now();
         let state = ProjectState {
             slug: slug.into(),
+            team: "dev".into(),
             created_at: now,
             tmux_session: format!("ccteam-{slug}"),
             claude_session_id: None,

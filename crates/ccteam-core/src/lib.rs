@@ -3,6 +3,7 @@
 //! `ccteam-hooks` (hook handlers invoked via `ccteam hook ...`).
 
 pub mod cost;
+pub mod dag;
 pub mod fix_loop;
 pub mod orchestrator;
 pub mod paths;
@@ -11,15 +12,16 @@ pub mod progress;
 pub mod projects;
 pub mod stall;
 pub mod state;
+pub mod team;
 pub mod templates;
 pub mod tmux;
 pub mod tool_surface;
 
+pub use dag::{dev_dag, Dag};
 pub use fix_loop::{FixLoopDecision, FixLoopFrontMatter, FixLoopState};
 pub use orchestrator::{
     append_progress_summary, build_progress_summary, check_phase_tools, decide_tick,
-    decide_tick_from_events, is_terminal, next_phase, Orchestrator, OrchestratorConfig,
-    TickAction, FIRST_PHASE, M0_PHASE_DAG,
+    decide_tick_from_events, Orchestrator, OrchestratorConfig, TickAction,
 };
 pub use projects::{bootstrap_project, pick_unused_slug, pre_trust_project, slugify};
 pub use cost::{classify as classify_cost, CostLevel, COST_MID_WARN_USD};
@@ -32,6 +34,7 @@ pub use phases::{
     AgentTeamRole, PhaseHooks, PhaseTemplate, SubSkillSpec, SubSkillTrigger,
 };
 pub use state::{Parallelism, PhaseHistoryEntry, PhaseState, ProjectState};
+pub use team::{RetroFieldKind, RetroFieldSpec, TeamSpec};
 pub use templates::{
     current_ccteam_bin, project_phase_filename, render_project_settings,
     write_global_phase_templates, write_project_phase_templates, write_project_settings,

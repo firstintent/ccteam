@@ -8,6 +8,9 @@ soft_cost_warn_usd: 8.0
 stall_warn_minutes: 5
 parallelism: solo
 sub_skills: []
+auto_loop: true
+auto_loop_max_iterations: 3
+completion_signal: TESTS_GREEN
 ---
 
 # 任务:修 bug(fix-cycle)

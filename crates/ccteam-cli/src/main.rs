@@ -62,6 +62,11 @@ enum Command {
         /// Read the request from a file instead of the positional arg.
         #[arg(short, long, value_name = "PATH")]
         file: Option<PathBuf>,
+        /// Team to run this project under. Default `dev` keeps the
+        /// shipped pipeline (plan-eng → implement → … → ship). Other
+        /// teams (research, design, ...) land in M3.4.
+        #[arg(long, default_value = "dev")]
+        team: String,
     },
     /// List all known projects.
     Ls {
@@ -149,7 +154,7 @@ fn main() -> Result<()> {
             tick_seconds,
             skip_tool_check,
         } => run_start(tick_seconds, skip_tool_check),
-        Command::New { request, file } => run_new(request, file),
+        Command::New { request, file, team } => run_new(request, file, team),
         Command::Ls { format } => run_ls(format),
         Command::Show { slug, format } => run_show(&slug, format),
         Command::Attach { slug } => commands::run_attach(&slug),
@@ -249,7 +254,7 @@ fn run_start(tick_seconds: u64, skip_tool_check: bool) -> Result<()> {
     })
 }
 
-fn run_new(request: Option<String>, file: Option<PathBuf>) -> Result<()> {
+fn run_new(request: Option<String>, file: Option<PathBuf>, team: String) -> Result<()> {
     let paths = CcteamPaths::from_env()?;
     let body = match (file, request) {
         (Some(path), _) => std::fs::read_to_string(&path)
@@ -259,8 +264,8 @@ fn run_new(request: Option<String>, file: Option<PathBuf>) -> Result<()> {
             anyhow::bail!("ccteam new: provide a request as a positional arg or --file PATH")
         }
     };
-    let slug = commands::run_new(&paths, body.trim())?;
-    println!("created project {slug}");
+    let slug = commands::run_new(&paths, body.trim(), &team)?;
+    println!("created project {slug} (team: {team})");
     println!("  spec   : {}", paths.project_ccteam_dir(&slug).join("spec.md").display());
     println!("  state  : {}", paths.project_state(&slug).display());
     println!("  config : {}", paths.project_dir(&slug).join(".claude/settings.json").display());

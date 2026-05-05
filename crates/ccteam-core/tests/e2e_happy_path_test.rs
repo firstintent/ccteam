@@ -14,9 +14,8 @@ use serde_json::json;
 use tempfile::TempDir;
 
 use ccteam_core::{
-    bootstrap_project, decide_tick, disable_tool_surface_bootstrap_for_tests,
-    is_terminal, next_phase, progress, slugify, CcteamPaths, PhaseHistoryEntry,
-    PhaseState, ProjectState, TickAction, FIRST_PHASE,
+    bootstrap_project, decide_tick, dev_dag, disable_tool_surface_bootstrap_for_tests,
+    progress, slugify, CcteamPaths, PhaseHistoryEntry, PhaseState, ProjectState, TickAction,
 };
 
 /// These tests don't care about the tool-surface side effects of
@@ -45,13 +44,15 @@ fn fresh(paths: &TempDir) -> CcteamPaths {
     }
 }
 
+/// Pretend the orchestrator dispatched `phase`. `decide_tick` treats
+/// InFlight and FixLocked identically (both block AdvancePhase until
+/// a `phase_done` event lands), so this fixture uses InFlight
+/// uniformly — the FixLocked branch's actual transition is covered
+/// by the orchestrator tests in `state_machine_test.rs` and the
+/// hooks integration tests.
 fn fake_dispatch(state: &mut ProjectState, phase: &str) {
     state.current_phase = phase.into();
-    state.phase_state = if phase == "fix" {
-        PhaseState::FixLocked
-    } else {
-        PhaseState::InFlight
-    };
+    state.phase_state = PhaseState::InFlight;
 }
 
 fn fake_phase_done(paths: &CcteamPaths, slug: &str, phase: &str) {
@@ -74,19 +75,21 @@ fn full_pipeline_advances_through_every_m0_phase() {
 
     let slug = slugify(request);
     ensure_isolation();
-    bootstrap_project(&paths, &slug, request).unwrap();
+    bootstrap_project(&paths, &slug, request, "dev").unwrap();
+
+    let dag = dev_dag();
 
     let state_path = paths.project_state(&slug);
     let state = ProjectState::load(&state_path).unwrap();
     assert!(state.current_phase.is_empty());
     assert_eq!(state.phase_state, PhaseState::Idle);
 
-    // First decision on a fresh project: dispatch FIRST_PHASE.
-    let action = decide_tick(&state, None);
+    // First decision on a fresh project: dispatch the DAG entry node.
+    let action = decide_tick(&dag, &state, None);
     assert_eq!(
         action,
         TickAction::DispatchPhase {
-            phase: FIRST_PHASE.into()
+            phase: dag.entry().into(),
         },
     );
 
@@ -107,8 +110,8 @@ fn full_pipeline_advances_through_every_m0_phase() {
         let last = progress::last_event(&paths.progress_jsonl(&slug))
             .unwrap()
             .unwrap();
-        let action = decide_tick(&s, Some(&last));
-        let expected_to = next_phase(phase).map(String::from);
+        let action = decide_tick(&dag, &s, Some(&last));
+        let expected_to = dag.next_on_done(phase).map(String::from);
         assert_eq!(
             action,
             TickAction::AdvancePhase {
@@ -132,16 +135,17 @@ fn full_pipeline_advances_through_every_m0_phase() {
     }
 
     let final_state = ProjectState::load(&state_path).unwrap();
-    assert!(is_terminal(&final_state), "project must be terminal after ship");
-    assert_eq!(
-        final_state.phase_history.last().unwrap().phase,
-        "ship",
-        "last history entry must be ship",
+    assert!(
+        dag.is_terminal_state(&final_state),
+        "project must be terminal after the DAG endpoint",
     );
-    assert_eq!(
-        final_state.phase_history.last().unwrap().status,
-        "passed",
+    let last_history = final_state.phase_history.last().unwrap();
+    assert!(
+        dag.is_terminal_phase(&last_history.phase),
+        "last history phase must be a DAG endpoint, got {}",
+        last_history.phase,
     );
+    assert_eq!(last_history.status, "passed");
     assert_eq!(
         final_state.phase_history.len(),
         M0_DAG.len(),
@@ -154,12 +158,13 @@ fn full_pipeline_runs_three_times_without_leaking_state() {
     // Per dev-plan, M0 closure requires three e2e passes. Run the
     // walk thrice in fresh tempdirs to confirm reproducibility — no
     // global state leak should produce divergent histories.
+    let dag = dev_dag();
     for run in 1..=3 {
         let tmp = TempDir::new().unwrap();
         let paths = fresh(&tmp);
         let slug = slugify(&format!("smoke {run}"));
         ensure_isolation();
-        bootstrap_project(&paths, &slug, "smoke").unwrap();
+        bootstrap_project(&paths, &slug, "smoke", "dev").unwrap();
         let state_path = paths.project_state(&slug);
 
         for phase in M0_DAG {
@@ -172,8 +177,8 @@ fn full_pipeline_runs_three_times_without_leaking_state() {
             let last = progress::last_event(&paths.progress_jsonl(&slug))
                 .unwrap()
                 .unwrap();
-            let action = decide_tick(&s, Some(&last));
-            let expected_to = next_phase(phase).map(String::from);
+            let action = decide_tick(&dag, &s, Some(&last));
+            let expected_to = dag.next_on_done(phase).map(String::from);
             assert_eq!(
                 action,
                 TickAction::AdvancePhase {
@@ -196,8 +201,8 @@ fn full_pipeline_runs_three_times_without_leaking_state() {
 
         let final_state = ProjectState::load(&state_path).unwrap();
         assert!(
-            is_terminal(&final_state),
-            "run {run}: project must terminate at ship",
+            dag.is_terminal_state(&final_state),
+            "run {run}: project must terminate at the DAG endpoint",
         );
         assert_eq!(
             final_state.phase_history.len(),
@@ -213,8 +218,10 @@ fn pipeline_halts_on_escalate_event_mid_dag() {
     let paths = fresh(&tmp);
     let slug = slugify("escalate-test");
     ensure_isolation();
-    bootstrap_project(&paths, &slug, "escalate test").unwrap();
+    bootstrap_project(&paths, &slug, "escalate test", "dev").unwrap();
     let state_path = paths.project_state(&slug);
+
+    let dag = dev_dag();
 
     // Advance to test-run, then claude escalates.
     for phase in &M0_DAG[..3] {
@@ -231,7 +238,7 @@ fn pipeline_halts_on_escalate_event_mid_dag() {
             cost_usd: 0.0,
         });
         s.phase_state = PhaseState::Idle;
-        s.current_phase = next_phase(phase).unwrap_or("").into();
+        s.current_phase = dag.next_on_done(phase).unwrap_or("").into();
         s.save(&state_path).unwrap();
     }
 
@@ -253,7 +260,7 @@ fn pipeline_halts_on_escalate_event_mid_dag() {
     let last = progress::last_event(&paths.progress_jsonl(&slug))
         .unwrap()
         .unwrap();
-    let action = decide_tick(&s, Some(&last));
+    let action = decide_tick(&dag, &s, Some(&last));
     assert_eq!(
         action,
         TickAction::Escalated {

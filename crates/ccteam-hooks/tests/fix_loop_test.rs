@@ -33,6 +33,7 @@ impl Fixture {
         let now = Utc::now();
         ProjectState {
             slug: slug.into(),
+            team: "dev".into(),
             created_at: now,
             tmux_session: format!("ccteam-{slug}"),
             claude_session_id: None,
@@ -80,6 +81,7 @@ impl Fixture {
             self.slug.clone(),
             "请按 @.ccteam/phases/06-fix.md 完成本阶段...".into(),
             3,
+            "TESTS_GREEN".into(),
         );
         state.front.iteration = iter;
         fix_loop::write(&fix_loop::path_in(&self.project_dir), &state).unwrap();

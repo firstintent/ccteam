@@ -108,6 +108,7 @@
 ```json
 {
   "slug": "bookmark-mgr-a3f9",
+  "team": "dev",
   "created_at": "2026-05-04T10:23:00Z",
   "tmux_session": "ccteam-bookmark-mgr-a3f9",
   "claude_session_id": "abc123-def-456",
@@ -138,6 +139,8 @@
 **`phase_state` 枚举**:`in_flight` / `idle` / `fix_locked`(详见 tech-design §3.2)。
 
 **`parallelism` 枚举**:`solo` / `agent_team` / `multi_session`(详见 §5.1 phase schema)。
+
+**`team` 字段**(M3.1 F13):指定项目跑哪个团队的 phase 集合(默认 `dev`,M3.4 加 `research` 等)。serde 默认值 `"dev"`,所以 M3.1 之前写出的 state.json 自动以 dev 团队加载,无需迁移脚本。
 
 **原子写入**:`.tmp` + `rename`;启动校验 schema,损坏走 backup。
 
@@ -431,6 +434,17 @@ tools_required:                   # M0.5+:phase 内会调用的工具,orchestrat
     - some-skill
   mcp:                            # `mcp__<server>__<tool>` 引用的 MCP server 名
     - playwright
+auto_loop: false                  # 默认 false。true 时 orchestrator 派发后交棒给 Stop hook,
+                                  # 由 hook 反复重喂 prompt 直到 `completion_signal` 出现或撞 `auto_loop_max_iterations`
+                                  # (M3.1:dev 的 fix phase 设 true,research 的 04-primary 也会设 true;mechanism 与 phase 名无关)
+auto_loop_max_iterations: 3       # 自循环硬上限,默认 3。auto_loop=false 时忽略
+completion_signal: TESTS_GREEN    # 自循环退出信号(子串匹配)。auto_loop=true 时必填且非空,
+                                  # auto_loop=false 时可省略
+next_on_done: implement           # 可选。`phase_done` 后跳转目标。省略 → 走拓扑序下一相
+                                  # (M3.1 F2:从 PhaseTemplate 列表的文件名顺序推 DAG;
+                                  # 末尾相省略 next_on_done = 终点节点 = is_terminal_phase)
+next_on_escalate: null            # 可选。`escalate` 后静态 revert 目标。省略(null)= 项目终态 escalated
+                                  # (M0.5.4 ESCALATE: REVERT_TO_PHASE 语法在事件 target_phase 字段独立路由)
 hooks:                            # phase 级 hook(项目级 hook 在 settings.json,详见 §6)
   before: scripts/snapshot-git.sh
   after: scripts/run-golden-rules.sh
@@ -496,6 +510,52 @@ confidence: 0.0-1.0
 实测背景:plugin 装了 plugin 不等于 plugin agent 进 Task 注册表 —— 必须 ln -sf 到 `~/.claude/agents/` 才行(详见 [docs/claude-code-tool-surface.md §1.1.2 / §1.2.5](./claude-code-tool-surface.md))。所以 `tools_required.subagents` 列 `code-reviewer` 而 `~/.claude/agents/code-reviewer.md` 不存在 → orchestrator 拒绝启动并给出 `ccteam doctor --install-recommended-agents` 修复命令。
 
 `bootstrap_project` 已在 §1.2 项目创建路径里自动 ln -sf 八个推荐 agent + 占位 skills 目录,所以 happy path 上模板要的工具默认都有;只有用户手工编辑模板加了非推荐工具时才会触发本节的校验失败。
+
+---
+
+### 5.5 `team.yaml` 团队配置(M3.1+)
+
+每个团队一份 `team.yaml`,M3.4 落到 `~/.ccteam/teams/<name>/team.yaml`。**M3.1 只交付数据形式 + 解析,无运行时调用**——`retro_schema` 字段供 M4.1 retro phase 实现读取,从 day 1 就能写出团队特定字段(避免 RAG 索引重建,详见 dev-coupling-audit.md F20)。
+
+```yaml
+# ~/.ccteam/teams/dev/team.yaml(M3.4 路径)
+name: dev                              # 必填。snake-case [a-z0-9_-]+,与 --team / state.json.team 对齐
+description: Software development team  # 可选。`ccteam ls --teams`(M3.4)显示
+retro_schema:                           # 可选。retro phase 字段定义。空 = 该团队无 retro
+  - field: tech_stack                   # 必填。snake_case;markdown 子节标题 + RAG tag(改名 = 索引失效)
+    description: Languages, frameworks, key libraries used
+    kind: list                          # 默认 list。可选 text(单段叙述)
+  - field: pitfalls
+    description: Mistakes / surprises to avoid next time
+  - field: successful_designs
+    description: Design choices that paid off
+  - field: do_not_do_again
+    description: Anti-patterns observed
+```
+
+**research 团队示例**(对比 dev 字段差异):
+
+```yaml
+name: research
+retro_schema:
+  - field: methodology
+    description: Methods used for data collection / analysis
+  - field: data_sources
+    description: Sources consulted (URLs, papers, datasets)
+  - field: findings
+    description: Top-N conclusions
+  - field: open_questions
+    description: Things needing follow-up
+  - field: summary
+    description: Narrative recap of the research
+    kind: text
+```
+
+**校验**(`TeamSpec::validate` 在 parse 时执行):
+- `name` 非空,只允许 ascii 小写 / 数字 / `-` / `_`
+- `retro_schema[*].field` 非空,**不允许重复**(防 RAG 索引冲突)
+
+**M3.1 实现位置**:`crates/ccteam-core/src/team.rs`(`TeamSpec` / `RetroFieldSpec` / `RetroFieldKind`),通过 `ccteam_core::TeamSpec::load(path)` 暴露。当前 ccteam binary 不读这个文件——**M3.4 加载逻辑、M4.1 retro phase 读 schema**。
 
 ---
 

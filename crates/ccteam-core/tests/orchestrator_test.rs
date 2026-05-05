@@ -235,7 +235,7 @@ fn ensure_session_starts_a_missing_session() {
     let paths = fresh_paths(&tmp);
     let slug = format!("ensure-test-{}", std::process::id());
     ensure_isolation();
-    bootstrap_project(&paths, &slug, "test request").unwrap();
+    bootstrap_project(&paths, &slug, "test request", "dev").unwrap();
 
     let project_dir = paths.project_dir(&slug);
     let ready = project_dir.join(".ccteam/ready");
@@ -286,7 +286,7 @@ fn ensure_session_is_no_op_when_session_alive() {
     let paths = fresh_paths(&tmp);
     let slug = format!("ensure-noop-{}", std::process::id());
     ensure_isolation();
-    bootstrap_project(&paths, &slug, "test request").unwrap();
+    bootstrap_project(&paths, &slug, "test request", "dev").unwrap();
 
     let project_dir = paths.project_dir(&slug);
     let ready = project_dir.join(".ccteam/ready");

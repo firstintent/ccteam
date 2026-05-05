@@ -20,7 +20,7 @@ use serde_json::json;
 use tempfile::TempDir;
 
 use ccteam_core::{
-    bootstrap_project, decide_tick_from_events, next_phase, progress, slugify,
+    bootstrap_project, decide_tick_from_events, dev_dag, progress, slugify,
     CcteamPaths, Orchestrator, OrchestratorConfig, PhaseState, PhaseTemplate,
     ProjectState, TickAction, RECOMMENDED_AGENTS,
 };
@@ -125,7 +125,7 @@ fn fresh_project_passes_tool_surface_validator_for_shipped_implement() {
     write_global_phases_with_implement(&paths.phases_dir());
 
     let slug = slugify("review smoke");
-    bootstrap_project(&paths, &slug, "review smoke").unwrap();
+    bootstrap_project(&paths, &slug, "review smoke", "dev").unwrap();
 
     // Confirm bootstrap actually placed the symlink — this is the
     // M0.5.1 + M0.5.3 contract.
@@ -193,12 +193,13 @@ fn implement_phase_advances_when_subagent_done_lands_after_phase_done() {
     }
 
     let read = progress::read_all_events(&progress_path).unwrap();
-    let action = decide_tick_from_events(&state, &read);
+    let dag = dev_dag();
+    let action = decide_tick_from_events(&dag, &state, &read);
     assert_eq!(
         action,
         TickAction::AdvancePhase {
             from: "implement".into(),
-            to: next_phase("implement").map(String::from),
+            to: dag.next_on_done("implement").map(String::from),
         },
         "SubagentStop tail must NOT mask phase_done — orchestrator should still advance",
     );
@@ -226,7 +227,7 @@ fn missing_code_reviewer_fails_orchestrator_construction_with_fix_hint() {
     // Bootstrap will warn (source missing) but not fail. The
     // orchestrator validator is what we expect to fail loudly.
     let slug = slugify("missing reviewer");
-    bootstrap_project(&paths, &slug, "missing reviewer").unwrap();
+    bootstrap_project(&paths, &slug, "missing reviewer", "dev").unwrap();
 
     let err = Orchestrator::new(paths, OrchestratorConfig::default()).unwrap_err();
     let msg = format!("{err:#}");

@@ -21,6 +21,7 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde_json::{json, Value};
 
 use crate::cost::{self, CostLevel};
+use crate::dag::Dag;
 use crate::fix_loop::{self, FixLoopState};
 use crate::paths::CcteamPaths;
 use crate::phases::PhaseTemplate;
@@ -29,40 +30,6 @@ use crate::stall::{self, StallLevel, StallThresholds};
 use crate::state::{PhaseHistoryEntry, PhaseState, ProjectState};
 use crate::tmux::TmuxSession;
 use crate::tool_surface::{user_claude_dir, ToolSurfaceSnapshot};
-
-const FIX_PHASE_NAME: &str = "fix";
-const FIX_LOOP_MAX_ITERATIONS: u32 = 3;
-
-/// M0 linear phase DAG. M2+ widens to fork on test results, sub-skill
-/// scheduling, and (M3) multi-session fan-out / fan-in.
-pub const M0_PHASE_DAG: &[(&str, Option<&str>)] = &[
-    ("plan-eng", Some("implement")),
-    ("implement", Some("test-author")),
-    ("test-author", Some("test-run")),
-    ("test-run", Some("fix")),
-    ("fix", Some("ship")),
-    ("ship", None),
-];
-
-pub const FIRST_PHASE: &str = "plan-eng";
-
-/// Next phase per M0 DAG, or `None` if `current` is terminal / unknown.
-pub fn next_phase(current: &str) -> Option<&'static str> {
-    M0_PHASE_DAG
-        .iter()
-        .find(|(p, _)| *p == current)
-        .and_then(|(_, n)| *n)
-}
-
-/// True if the project has reached a terminal state — `ship` passed or
-/// any phase escalated. Both block automatic advance until the user
-/// (M0: manual; M1: telegram) decides what to do next.
-pub fn is_terminal(state: &ProjectState) -> bool {
-    state
-        .phase_history
-        .iter()
-        .any(|h| (h.phase == "ship" && h.status == "passed") || h.status == "escalated")
-}
 
 /// Pure decision function: given the current `state` and the last
 /// progress.jsonl event, what should the orchestrator do next?
@@ -87,8 +54,8 @@ pub enum TickAction {
     },
 }
 
-pub fn decide_tick(state: &ProjectState, last_event: Option<&Value>) -> TickAction {
-    decide_tick_from_events(state, last_event.map(std::slice::from_ref).unwrap_or(&[]))
+pub fn decide_tick(dag: &Dag, state: &ProjectState, last_event: Option<&Value>) -> TickAction {
+    decide_tick_from_events(dag, state, last_event.map(std::slice::from_ref).unwrap_or(&[]))
 }
 
 /// Like `decide_tick` but considers recent events as a slice rather
@@ -99,8 +66,16 @@ pub fn decide_tick(state: &ProjectState, last_event: Option<&Value>) -> TickActi
 ///
 /// `events` should be ordered oldest→newest. `decide_tick` continues
 /// to forward a single event for backwards-compat with old call sites.
-pub fn decide_tick_from_events(state: &ProjectState, events: &[Value]) -> TickAction {
-    if is_terminal(state) {
+pub fn decide_tick_from_events(
+    dag: &Dag,
+    state: &ProjectState,
+    events: &[Value],
+) -> TickAction {
+    if dag.is_empty() {
+        // No phases loaded — orchestrator is inert until templates land.
+        return TickAction::NoOp;
+    }
+    if dag.is_terminal_state(state) {
         return TickAction::NoOp;
     }
 
@@ -121,7 +96,7 @@ pub fn decide_tick_from_events(state: &ProjectState, events: &[Value]) -> TickAc
             return match kind {
                 "phase_done" => TickAction::AdvancePhase {
                     from: state.current_phase.clone(),
-                    to: next_phase(&state.current_phase).map(String::from),
+                    to: dag.next_on_done(&state.current_phase).map(String::from),
                 },
                 "escalate" => {
                     let reason = terminal
@@ -139,9 +114,10 @@ pub fn decide_tick_from_events(state: &ProjectState, events: &[Value]) -> TickAc
         }
         TickAction::NoOp
     } else {
-        // Idle: dispatch the current phase, defaulting to FIRST_PHASE.
+        // Idle: dispatch the current phase, defaulting to the DAG's
+        // entry node (e.g. dev's `plan-eng`, research's `00-topic`).
         let phase = if state.current_phase.is_empty() {
-            FIRST_PHASE.to_string()
+            dag.entry().to_string()
         } else {
             state.current_phase.clone()
         };
@@ -192,6 +168,7 @@ pub struct Orchestrator {
     paths: CcteamPaths,
     config: OrchestratorConfig,
     templates: Vec<PhaseTemplate>,
+    dag: Dag,
 }
 
 impl Orchestrator {
@@ -210,20 +187,28 @@ impl Orchestrator {
         } else {
             tracing::warn!("skip_tool_check=true: phase tools_required not validated");
         }
+        let dag = Dag::from_templates(&templates)
+            .context("build phase DAG from loaded templates")?;
         tracing::info!(
             templates = templates.len(),
             phases_dir = %paths.phases_dir().display(),
+            entry_phase = %dag.entry(),
             "orchestrator initialized",
         );
         Ok(Self {
             paths,
             config,
             templates,
+            dag,
         })
     }
 
     pub fn templates(&self) -> &[PhaseTemplate] {
         &self.templates
+    }
+
+    pub fn dag(&self) -> &Dag {
+        &self.dag
     }
 
     pub fn paths(&self) -> &CcteamPaths {
@@ -361,7 +346,7 @@ impl Orchestrator {
     /// Mutates + persists `state.claude_pid` whenever a new session is
     /// born. Skipped silently for terminal projects.
     pub fn ensure_session(&self, slug: &str, state: &mut ProjectState) -> Result<()> {
-        if is_terminal(state) {
+        if self.dag.is_terminal_state(state) {
             return Ok(());
         }
         let session = TmuxSession::for_slug(slug);
@@ -419,7 +404,7 @@ impl Orchestrator {
 
         for _ in 0..MAX_ITERS {
             let events = progress::read_all_events(&progress_path)?;
-            let action = decide_tick_from_events(&state, &events);
+            let action = decide_tick_from_events(&self.dag, &state, &events);
             match action {
                 TickAction::NoOp => return Ok(state),
                 TickAction::AdvancePhase { from, to } => {
@@ -443,7 +428,7 @@ impl Orchestrator {
 
                     // Phase boundary: maybe reset context if the
                     // 60%-of-1M threshold has been crossed.
-                    if !is_terminal(&state)
+                    if !self.dag.is_terminal_state(&state)
                         && state.context_tokens_used > state.context_reset_threshold_tokens
                     {
                         if let Err(err) = self.reset_context(slug, &mut state) {
@@ -490,15 +475,18 @@ impl Orchestrator {
                     // session simply wouldn't exist.
                     self.ensure_session(slug, &mut state)?;
                     self.dispatch_phase(slug, &phase)?;
-                    let target_state = if phase == FIX_PHASE_NAME {
+                    let template = self.templates.iter().find(|t| t.name == phase);
+                    let target_state = if template.is_some_and(|t| t.auto_loop) {
                         // Stop hook (M0.12) drives the loop; orchestrator
                         // only re-enters on phase_done/escalate.
+                        let t = template.expect("auto_loop branch implies template present");
                         let project_dir = self.paths.project_dir(slug);
                         let prompt = progress::build_phase_prompt(&phase);
                         let fl = FixLoopState::new(
                             slug.to_string(),
                             prompt,
-                            FIX_LOOP_MAX_ITERATIONS,
+                            t.auto_loop_max_iterations,
+                            t.completion_signal.clone(),
                         );
                         fix_loop::write(&fix_loop::path_in(&project_dir), &fl)?;
                         PhaseState::FixLocked
@@ -607,7 +595,7 @@ impl Orchestrator {
         slug: &str,
         mut state: ProjectState,
     ) -> Result<Option<ProjectState>> {
-        if is_terminal(&state) {
+        if self.dag.is_terminal_state(&state) {
             return Ok(Some(state));
         }
         match cost::classify(&state) {
@@ -672,7 +660,7 @@ impl Orchestrator {
     }
 
     fn warn_if_stalled(&self, slug: &str, state: &ProjectState, now: chrono::DateTime<Utc>) {
-        if is_terminal(state) {
+        if self.dag.is_terminal_state(state) {
             return;
         }
         let silent = stall::silent_seconds(state, now);

@@ -32,14 +32,19 @@ pub struct FixLoopState {
 }
 
 impl FixLoopState {
-    pub fn new(slug: String, prompt: String, max_iterations: u32) -> Self {
+    pub fn new(
+        slug: String,
+        prompt: String,
+        max_iterations: u32,
+        completion_signal: String,
+    ) -> Self {
         let now = Utc::now();
         Self {
             front: FixLoopFrontMatter {
                 slug,
                 iteration: 1,
                 max_iterations,
-                completion_signal: "TESTS_GREEN".into(),
+                completion_signal,
                 created_at: now,
                 updated_at: now,
             },
@@ -132,6 +137,7 @@ mod tests {
             "demo".into(),
             "fix the broken tests in src/db.rs".into(),
             3,
+            "TESTS_GREEN".into(),
         );
         s.front.iteration = iter;
         s

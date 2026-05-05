@@ -5,15 +5,15 @@ use serde_json::json;
 use tempfile::TempDir;
 
 use ccteam_core::{
-    decide_tick, is_terminal, next_phase, progress, CcteamPaths, Orchestrator,
+    decide_tick, dev_dag, progress, write_global_phase_templates, CcteamPaths, Orchestrator,
     OrchestratorConfig, Parallelism, PhaseHistoryEntry, PhaseState, ProjectState, TickAction,
-    FIRST_PHASE,
 };
 
 fn fresh_state(current_phase: &str, phase_state: PhaseState) -> ProjectState {
     let now = Utc::now();
     ProjectState {
         slug: "demo".into(),
+        team: "dev".into(),
         created_at: now,
         tmux_session: "ccteam-demo".into(),
         claude_session_id: None,
@@ -38,32 +38,37 @@ fn fresh_state(current_phase: &str, phase_state: PhaseState) -> ProjectState {
 }
 
 #[test]
-fn next_phase_walks_the_m0_dag() {
+fn dev_dag_walks_through_every_phase() {
+    let dag = dev_dag();
     let chain = ["plan-eng", "implement", "test-author", "test-run", "fix", "ship"];
     for w in chain.windows(2) {
-        assert_eq!(next_phase(w[0]), Some(w[1]));
+        assert_eq!(dag.next_on_done(w[0]), Some(w[1]));
     }
-    assert_eq!(next_phase("ship"), None);
-    assert_eq!(next_phase("not-a-real-phase"), None);
+    assert_eq!(dag.next_on_done("ship"), None);
+    assert_eq!(dag.next_on_done("not-a-real-phase"), None);
+    assert_eq!(dag.entry(), "plan-eng");
+    assert!(dag.is_terminal_phase("ship"));
 }
 
 #[test]
 fn decide_tick_dispatches_first_phase_for_fresh_project() {
+    let dag = dev_dag();
     let state = fresh_state("", PhaseState::Idle);
     assert_eq!(
-        decide_tick(&state, None),
+        decide_tick(&dag, &state, None),
         TickAction::DispatchPhase {
-            phase: FIRST_PHASE.into()
+            phase: dag.entry().into(),
         },
     );
 }
 
 #[test]
 fn decide_tick_advances_when_phase_done_matches() {
+    let dag = dev_dag();
     let state = fresh_state("implement", PhaseState::InFlight);
     let event = json!({"event": "phase_done", "phase": "implement"});
     assert_eq!(
-        decide_tick(&state, Some(&event)),
+        decide_tick(&dag, &state, Some(&event)),
         TickAction::AdvancePhase {
             from: "implement".into(),
             to: Some("test-author".into()),
@@ -73,10 +78,11 @@ fn decide_tick_advances_when_phase_done_matches() {
 
 #[test]
 fn decide_tick_advances_to_none_after_ship() {
+    let dag = dev_dag();
     let state = fresh_state("ship", PhaseState::InFlight);
     let event = json!({"event": "phase_done", "phase": "ship"});
     assert_eq!(
-        decide_tick(&state, Some(&event)),
+        decide_tick(&dag, &state, Some(&event)),
         TickAction::AdvancePhase {
             from: "ship".into(),
             to: None,
@@ -86,18 +92,20 @@ fn decide_tick_advances_to_none_after_ship() {
 
 #[test]
 fn decide_tick_ignores_phase_done_for_a_different_phase() {
+    let dag = dev_dag();
     let state = fresh_state("implement", PhaseState::InFlight);
     let stale = json!({"event": "phase_done", "phase": "plan-eng"});
-    assert_eq!(decide_tick(&state, Some(&stale)), TickAction::NoOp);
+    assert_eq!(decide_tick(&dag, &state, Some(&stale)), TickAction::NoOp);
 }
 
 #[test]
 fn decide_tick_classifies_busy_events_as_noop() {
+    let dag = dev_dag();
     let state = fresh_state("implement", PhaseState::InFlight);
     for kind in ["PreToolUse", "PostToolUse", "phase_inject", "SubagentStop"] {
         let e = json!({"event": kind});
         assert_eq!(
-            decide_tick(&state, Some(&e)),
+            decide_tick(&dag, &state, Some(&e)),
             TickAction::NoOp,
             "{kind} must be NoOp",
         );
@@ -106,10 +114,11 @@ fn decide_tick_classifies_busy_events_as_noop() {
 
 #[test]
 fn decide_tick_emits_escalated_on_escalate_event() {
+    let dag = dev_dag();
     let state = fresh_state("fix", PhaseState::InFlight);
     let e = json!({"event": "escalate", "reason": "fix-cycle 撞 3 顶"});
     assert_eq!(
-        decide_tick(&state, Some(&e)),
+        decide_tick(&dag, &state, Some(&e)),
         TickAction::Escalated {
             phase: "fix".into(),
             reason: "fix-cycle 撞 3 顶".into(),
@@ -118,7 +127,8 @@ fn decide_tick_emits_escalated_on_escalate_event() {
 }
 
 #[test]
-fn is_terminal_true_after_ship_passes() {
+fn is_terminal_state_true_after_dag_endpoint_passes() {
+    let dag = dev_dag();
     let mut state = fresh_state("ship", PhaseState::Idle);
     state.phase_history.push(PhaseHistoryEntry {
         phase: "ship".into(),
@@ -126,11 +136,12 @@ fn is_terminal_true_after_ship_passes() {
         duration_s: 0,
         cost_usd: 0.0,
     });
-    assert!(is_terminal(&state));
+    assert!(dag.is_terminal_state(&state));
 }
 
 #[test]
-fn is_terminal_true_after_any_escalation() {
+fn is_terminal_state_true_after_any_escalation() {
+    let dag = dev_dag();
     let mut state = fresh_state("implement", PhaseState::Idle);
     state.phase_history.push(PhaseHistoryEntry {
         phase: "implement".into(),
@@ -138,7 +149,23 @@ fn is_terminal_true_after_any_escalation() {
         duration_s: 0,
         cost_usd: 0.0,
     });
-    assert!(is_terminal(&state));
+    assert!(dag.is_terminal_state(&state));
+}
+
+#[test]
+fn is_terminal_state_false_when_non_endpoint_passes() {
+    // After F4: "passed" on a non-endpoint phase is NOT terminal.
+    // Old logic only checked for "ship" string match — this test
+    // guards against regression.
+    let dag = dev_dag();
+    let mut state = fresh_state("implement", PhaseState::Idle);
+    state.phase_history.push(PhaseHistoryEntry {
+        phase: "implement".into(),
+        status: "passed".into(),
+        duration_s: 0,
+        cost_usd: 0.0,
+    });
+    assert!(!dag.is_terminal_state(&state));
 }
 
 #[test]
@@ -162,8 +189,15 @@ fn process_project_writes_escalation_md_and_marks_history() {
     )
     .unwrap();
 
-    let orch =
-        Orchestrator::new(paths.clone(), OrchestratorConfig::default()).unwrap();
+    write_global_phase_templates(&paths.root, false).unwrap();
+    let orch = Orchestrator::new(
+        paths.clone(),
+        OrchestratorConfig {
+            skip_tool_check: true,
+            ..OrchestratorConfig::default()
+        },
+    )
+    .unwrap();
     let new_state = orch
         .process_project(slug, ProjectState::load(&paths.project_state(slug)).unwrap())
         .unwrap();
@@ -210,8 +244,15 @@ fn process_project_advances_history_when_phase_done_observed_without_tmux_dispat
     )
     .unwrap();
 
-    let orch =
-        Orchestrator::new(paths.clone(), OrchestratorConfig::default()).unwrap();
+    write_global_phase_templates(&paths.root, false).unwrap();
+    let orch = Orchestrator::new(
+        paths.clone(),
+        OrchestratorConfig {
+            skip_tool_check: true,
+            ..OrchestratorConfig::default()
+        },
+    )
+    .unwrap();
     let new_state = orch
         .process_project(slug, ProjectState::load(&paths.project_state(slug)).unwrap())
         .unwrap();
