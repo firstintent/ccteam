@@ -213,6 +213,45 @@ ccteam 服务于「**想做软件、但不想（也不应）成为项目经理**
 
 ---
 
+### 痛点 12：工作流插件靠人手动调，效率低还调不全
+
+**场景：** 用了一套像样的 AI 工程辅助工具——比如 [gstack](https://github.com/garrytan/gstack) 的 23-skill 工程团队包，或者 Claude Code 官方 [claude-plugins-official](https://github.com/anthropics/claude-plugins-official) 的几十个 plugin（`feature-dev` / `pr-review-toolkit` / `security-guidance` / `code-modernization` / `code-simplifier` / ...），还能加上社区的若干。
+
+每个工具单独看都很好用：`/plan-ceo-review` 让 AI 站 CEO 视角审；`/plan-eng-review` 站架构师视角审；`/qa` 跑端到端测；`/cso` 做 OWASP + STRIDE 安全审计；`/canary` 灰度发布；`/document-release` 出文档；`security-guidance` 拦危险写文件；`silent-failure-hunter` 揪静默失败……
+
+**接下来发生的：**
+- 做完 plan，**忘了**跑 `/plan-eng-review` → 架构没审就 implement，埋雷。
+- 记得跑 `/qa`，但**忘了** `/cso` → 上线后被人扫到 SQL 注入。
+- 跑了 `/plan-ceo-review`，产物落在某个文件里——**没人**自动喂给 implement 阶段，得我**手动复制粘贴**。
+- 项目临近交付，**没人**提醒跑 `/document-release` → 文档缺失，后续移交困难。
+- 看到一个新插件叫 `/silent-failure-hunter`，挺有用，但**不知道该插在哪个 phase**——干脆不用了。
+- 我加班把所有命令背下来、记每个在哪个 phase 用、记每个产物去哪里……
+
+**等等——这不就是又当了一回 team-lead 吗？**
+
+每个工具都解决一个具体局部问题，**但工具集体留了一个未解决的整体问题：谁来编排它们**。默认答案是"用户编排"——把"协调 agent"换形态变成"调度 plugin"，本质还是用户在做编排劳动。
+
+**与痛点 9 的区别——劳动维度不同**：
+- 痛点 9 关切的是**决策劳动**——team-lead 协调冲突、做最终裁定。
+- 痛点 12 关切的是**流程编排劳动**——orchestrator 决定"何时调谁、产物给谁、有没有漏掉关键 step"。
+- 痛点 9 不解决，人持续在场做**决策**；痛点 12 不解决，人持续做**记忆 + 触发 + 产物搬运**。
+- 两个都是"人的劳动"，但**痛点 9 累在精神，痛点 12 累在记忆与流程**——互不替代。一个 AI 工具可能解决了痛点 9 但完全没碰痛点 12（甚至加剧——给了你 23 个新插件让你记）。
+
+**用户真正的诉求：**
+> "我不想记几十个命令、不想知道哪个在哪个 phase 用、不想手动把 phase A 的产物复制到 phase B 的输入。**整套工作流应该自己串起来——我提需求，系统自己知道下一步该 review、该 qa、该 cso、该 ship，顺序对、覆盖全、产物自动接力**。新插件出来时，系统自己判断该装到哪个 phase——不用我研究文档。"
+
+**生态视角——这个问题只会更严重**：
+- gstack 23 skills 只是开始；claude-plugins-official 几十个、社区还在持续增长。
+- 越多好工具 = 越多需要编排的零件 = 用户编排负担**线性增长**。
+- 不解决这个，就出现"工具越来越好但用户用不起来 / 用不全"的怪现状——好工具变成沉默资产。
+
+**ccteam 设计的回应**：
+- 9 个主干 phase 模板就是预编排好的 workflow 骨架。
+- phase 协议须支持"sub-skill 自动调度"——每个 phase 在 front matter 列出本阶段应 trigger 的 sub-skills（例：ship phase 自动跑 `/cso` + `/document-release` + `/canary`）。
+- ccteam 的差异化**不是**再写一遍那些 skill，**是替人 orchestrate 这些 skill**——复用 gstack / claude-plugins-official / 社区插件，调用时机由 orchestrator 决定。
+
+---
+
 ## 三、用户对"理想体验"的描述
 
 如果让目标用户用一句话描述他想要的工具，他会说：
@@ -228,6 +267,7 @@ ccteam 服务于「**想做软件、但不想（也不应）成为项目经理**
 | **过程参与度** | 几乎为零；仅在 AI 自检拍不了板或系统主动 escalate 时出现 |
 | **决策频次** | 极低——AI 自检处理大多数；用户上推典型 0-2 次/项目 |
 | **AI 自检层** | 多 agent 互检（architect / critic / designer / security / scope-watcher）+ 架构约束（写死的红线）；agent 议出共识就过——这层处理 95%+ 决策 |
+| **工作流编排** | 系统自己串主干 phase + sub-skill 自动 trigger + 产物自动接力；用户只提需求，不需要触发任何命令、不需要记任何工具放在哪个 phase |
 | **用户兜底层** | agent 议不出共识时 push：摆 2-3 个选项 + 推荐 + 一句话 tweak；24h 不响应默认通过；可调 agent 自信阈值（yolo / balanced / careful） |
 | **失败处理** | AI 自己尝试 N 轮后才来找我，并附"试过什么 / 卡在哪" |
 | **多项目** | 排队执行，自动推进，不需要我手动调度 |
@@ -264,6 +304,7 @@ ccteam 是否成功，**不**由这些指标判断：
 4. **失败的想法在投入开发前被识别**，用户不会感到"白做了"。
 5. **用户做的项目越多，下一个越快**——经验自动沉淀，无需手动整理。
 6. **方向不跑偏**——多 agent 互检拦住绝大多数偏差；agent 议不出共识时，用户 30 秒拍板。终态不出现"交付的不是我要的"。
+7. **零编排负担**——项目从想法到交付，用户不需要 trigger 任何 phase / skill / plugin；新工具出现时，系统自己判断该装到哪个 phase。
 
 ---
 
@@ -284,6 +325,7 @@ ccteam 的定位是：
 | 多项目 | 用户手动切换/调度 | 自动排队推进 |
 | 想法可行性 | 用户自己判断 | AI 自动评估，否掉无效想法 |
 | 方向校准 | 持续在场把控 | L1 架构约束 + L2 多 agent 互检 + L3 用户兜底（三层纵深防御） |
+| 工作流编排 | 用户手动调命令（知道哪个何时用、产物怎么接） | 系统预编排 phase pipeline + sub-skill 自动 trigger + 产物自动接力；新工具加入由 ccteam 决定挂载点 |
 | 经验沉淀 | 项目内文档 | 跨项目自动复用 |
 | 目标用户 | 想当 team-lead 的人 | **不想**当 team-lead 但**仍要在 AI 团队议不出来时拍板**的人 |
 
