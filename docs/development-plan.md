@@ -300,15 +300,19 @@ meta-agent 通过 ccteam-mcp 全部 9 个 tool 调度;phase template `@` 引用�
 verdict=REJECT,产出 `verdict.md` + `rationale.md`(列已有 N 个免费同类工具)+
 `next-steps.md`;dev 团队 `ccteam new "<brief>"` 默认 `--team=dev` 零迁移成本仍然工作。
 
+> **现实对照**(2026-05-06 M2 完工后,起 M3 前):main HEAD `5458de9`,
+> `cargo test --workspace` 289 个全绿。下表标 ✅ 是已 ship,🔧 是部分 ship,
+> 空白是未起步。
+
 | # | 任务 | 验收 | 依赖 |
 |---|---|---|---|
-| M3.1 | §B 审计的 P0 项目全部修复 | ✅ **已 ship**(F1/F2/F3/F4/F12/F13/F20,PR #1 @ `4766800`) | M0.5 |
-| M3.2 | `team.yaml` schema 全字段化 | F20 已落 `retro_schema[]`;本任务扩 `critic_dimensions[]` / `escalate_grammar_extensions[]` / `golden_rules[]` / `phase_dir`(默认 `phases/`,product-research 用 `phases-product-research/`)/ `verdict_schema`(产出 verdict 的 phase 列表) | M3.1 |
-| M3.3 | `ccteam new --team <name>` / `start --team <name>` | F12 已落 `--team` flag + state.json team field;本任务扩:非 dev team 启动需 `team.yaml` 存在,`team_dir` 自动 ln agents,`team.yaml` 验证失败 fail-fast | M3.2 |
-| M3.4 | **product-research team 模板入仓** | `phases-product-research/` 起草 6 phase:`kickoff` / `market-survey` / `differentiation-analysis` / `value-proposition` / `feasibility` / `verdict`;phase DAG 通过 `validate_team` 校验;3 个团队特有 ESCALATE 前缀(`MARKET_DUPLICATE` / `INSUFFICIENT_VALIDATION` / `LOW_DIFFERENTIATION`);verdict phase 输出 `verdict: PASS\|CONCERN\|REJECT`(复用 interfaces.md §5.3 schema) | M3.2、M2.4(template @ 引用) |
-| M3.5 | product-research E2E happy path | 起 "AI 菜谱生成器" 真实跑到 verdict=REJECT,产出三件产物;progress.jsonl 完整含 phase 切换 + decision_mode=async 至少一处 + 至少一条团队特有 ESCALATE-resume 回路 | M3.1–M3.4 |
-| M3.6 | `PHASE_DONE_PENDING` 协议扩展 | phase 内 claude 在写完 outbox `event_kind: decision_needed` 后,可 ESCALATE `PHASE_DONE_PENDING { open_decisions: [<msg-file>] }`;orchestrator 切到 `PhaseState::DonePending`;下 phase 启动检查 pending —— 工作不依赖该决策则 proceed,依赖则 block 并自动汇集到 decisions queue;首个使用方:product-research 的 `feasibility` phase | M3.5 | tech-design §3.5、interfaces §4.1.1 |
-| M3.7 | meta-agent skill 集 + dispatch 树扩展 | `ccteam-control` skill body 加 "team selection" 节;meta-agent role prompt 决策树第 2 步("分类团队类型")扩为 dev / product-research 两选项;NL 启发"听起来不确定要做的话先 product-research" | M3.3、M2.5 | strategic §7.2.2 |
+| M3.1 ✅ | §B 审计的 P0 项目全部修复 | F1/F2/F3/F4/F12/F13/F20,PR #1 @ `4766800` | M0.5 |
+| M3.2 | `team.yaml` schema 全字段化 | F20 已落 `retro_schema[]`(`crates/ccteam-core/src/team.rs::TeamSpec`);本任务扩 5 字段:① `critic_dimensions[]`(M5 用,M3 留数据形式);② `escalate_grammar_extensions[]`(团队特有 ESCALATE 前缀);③ `golden_rules[]`(**team-wide 默认**,phase YAML `golden_rules` 优先 — phase 不写时回退到 team.yaml);④ `phase_dir`(默认 `phases/`,product-research 用 `phases-product-research/`);⑤ `verdict_schema`(列出哪些 phase 产 verdict — 复用 interfaces §5.3 schema) | M3.1 |
+| M3.3 🔧 | `ccteam new --team <name>` / `start --team <name>` | **F12 已落 base flag + state.json team field**(`crates/ccteam-cli/src/main.rs` `--team` 参数 + `ProjectState.team`);**本任务扩**:非 dev team 启动需 `team.yaml` 存在;`bootstrap_project` 按 `team_dir`/`phase_dir` 解析 phases;`team.yaml` parse 失败 fail-fast(now silent skip);新 ESCALATE 前缀必须列在 `escalate_grammar_extensions` 才能进 grammar table | M3.2 |
+| M3.4 | **product-research team 模板入仓** | `phases-product-research/` 起草 6 phase:`kickoff` / `market-survey` / `differentiation-analysis` / `value-proposition` / `feasibility` / `verdict`;**所有 phase 用 `parallelism: solo`**(M2.2 enablement 仍 deferred,product-research 不需要 multi-role 并行);phase DAG 通过 `validate_team` 校验;3 个团队特有 ESCALATE 前缀(`MARKET_DUPLICATE` / `INSUFFICIENT_VALIDATION` / `LOW_DIFFERENTIATION`)走 §3.2 的 `escalate_grammar_extensions`;verdict phase 输出 `verdict: PASS\|CONCERN\|REJECT\|CLARIFY`(interfaces §5.3,**已 ship 的通用 schema**);至少 2 phase 用 `decision_mode: async`(`feasibility` 与 `verdict`);用 `@~/.ccteam/templates/kickoff-reverse-interview.md`(**M2.4 已 ship**)做 `kickoff` phase | M3.2、M2.4 |
+| M3.5 | product-research E2E happy path | 真实跑 "AI 菜谱生成器" → verdict=REJECT,产出 `verdict.md` + `rationale.md` + `next-steps.md`;progress.jsonl 完整含 phase 切换 + 至少一条 `decision_mode: async` 写 outbox 路径 + 至少一条团队特有 ESCALATE-resume 回路;**`ccteam decisions`(M1 已 ship)能看到 product-research 项目的决策汇聚** | M3.1–M3.4 |
+| M3.6 | `PHASE_DONE_PENDING` 协议扩展 | **ESCALATE grammar `PHASE_DONE_PENDING` 前缀已在 interfaces §4.1.1**(M2.3 doc commit);**Stop hook 解析未 ship**(parse_phase_end.rs 当前 grammar 表只到 `INSUFFICIENT_CLARIFICATION`);本任务做:① `state.rs` 加 `PhaseState::DonePending { open_decisions: Vec<String> }`(`<msg-file>` 是 outbox 文件名);② Stop hook 识别 `PHASE_DONE_PENDING` 前缀写事件;③ orchestrator transition:DonePending → 下 phase 启动时检查 open_decisions,任一未 resolve 且下 phase 工作依赖它 = block + escalation;④ 首个使用方 product-research 的 `feasibility` phase | M3.5 | tech-design §3.5、interfaces §4.1.1 |
+| M3.7 | meta-agent skill + dispatch 树扩展 | **现有进度**(M1 已 ship):`crates/ccteam-core/src/templates/meta_agent_role.md` §2 决策树 + §5.1 决策队列 + §6/§7 inbox/outbox 都已落地;`ccteam_control_skill.md` 已含 ccteam-control skill body 与 ccteam-mcp(M2.5)推荐路径。**本任务扩**:① meta_agent_role.md §2 决策树第 2 步「团队选择」从「M1 阶段只有 dev 团队」改为 dev / product-research 两选项 + NL 启发「听起来不确定要做的话先 product-research」;② ccteam_control_skill.md 加「team selection」节;③ `ccteam new --team product-research` 路径在 skill body 里有命令样板 | M3.3、M2.5 | strategic §7.2.2 |
 
 **M3 不做**:
 - academic research team(`phases-research/` 学术调研)→ backlog,M5 后任意时机
@@ -316,6 +320,14 @@ verdict=REJECT,产出 `verdict.md` + `rationale.md`(列已有 N 个免费同类�
 - 跨项目记忆 namespace 化(M4)
 - meta-agent conversation continuity(M4 RAG 一并)
 - Critic 维度泛化(M5,但 M3.2 必须为 critic_dimensions 留数据形式)
+- M2.2 agent_team 启用复活(spike 推荐 A 仍生效;Claude Code 释出 first-class
+  Agent Teams CLI 后再重 spike,与 M3 解耦)
+
+**M3 外部依赖**(不算 M3 任务本身,但起 M3 前最好就位):
+- **golden_rules executor**(M2.3 follow-up 独立小 PR):schema 已 ship,执行端
+  落地后 phase 可在 PHASE_DONE 前跑 enforcement。M3.4 product-research 的
+  `verdict` phase 可能用它 enforce 报告必填字段,**不是硬依赖**(phase
+  prompt 也能自查);M3.5 happy-path 验证如果想跑 enforcement,需要先 ship
 
 **M3 风险**:
 
@@ -463,7 +475,8 @@ M1.4(项目 CLAUDE.md)、M1.8(ccteam-control skill,M1.3 依赖但与 M1.0/1.1/1.
 M2.3(phase YAML 三字段,与 sub-skill / agent_team 主链解耦)、
 M2.4(template @ 引用机制,与 sub-skill / agent_team 主链解耦)、
 M2.5(ccteam-mcp,依赖 M1.8 但与 M2.1/M2.2 解耦)、
-M3.6(meta-agent skill 集占位)、M4.4(anti-patterns)、M4.5(claude-mem MCP)、
+M3.7(meta-agent skill + dispatch 树扩展,可与 M3.4/3.5/3.6 并行)、
+M4.4(anti-patterns)、M4.5(claude-mem MCP)、
 M4.9(新插件挂载)、M4.11(ratatui TUI,机会主义)、
 M5.4(评审自适应)、M5.6(web dashboard,机会主义)。
 
@@ -488,7 +501,7 @@ M5.4(评审自适应)、M5.6(web dashboard,机会主义)。
 | ralph-loop Stop hook 范式与 ccteam 自有 Stop hook 互相冲突 | 中 | M0.12 卡住 | 不挂两个 hook,把 ralph 逻辑合到 parse-phase-end.sh(见 §2.3) |
 | context reset 后行为不一致(新 session 把 CLAUDE.md 桥接信息当独立任务做) | 中 | M0.10 不可用 | M0.10 必须包含至少 3 个真实项目的 reset 验证用例 |
 | Channel Layer 适配器(M2+)外部依赖变更或封号 | 低 | 远程入口断,但终端 attach + 文件 inbox 不受影响 | 三层架构已隔离:M1 不依赖任何 channel,channel adapter 是 M2+ 可插拔件,挂一个补一个 |
-| 向量索引方案选错(自建 vs claude-mem) | 中 | M3 阻塞 | M3.2 与 M3.5 并行 spike 1 周,择优 |
+| 向量索引方案选错(自建 vs claude-mem) | 中 | **M4** 阻塞(reorder 后 RAG 在 M4) | M4 启动前 spike 1 周,择优 |
 | 估算偏差累积 | 高 | 整体延期 | 每个里程碑结束做 retro,把实际工时回填本文 |
 
 ---
