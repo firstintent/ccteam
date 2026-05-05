@@ -469,17 +469,31 @@ sub_skills 是 phase front matter 里**声明式**指定的 plugin 触发,固定
 
 ```bash
 # 把 plugin agent 文件软链/拷到全局 agents 目录,Claude Code 会扫这里
-# 自动注册成 subagent_type
+# 自动注册成 subagent_type。
+# 显式列出每个文件 —— **不要用 pr-review-toolkit/agents/*.md 这种 glob**:
+# 该目录下也有 code-simplifier.md,会跟下面 code-simplifier plugin 的同名文
+# 件抢同一个 ~/.claude/agents/code-simplifier.md target,后写盖前写,得到
+# 哪个版本不确定。
 mkdir -p ~/.claude/agents
+PLUGIN_ROOT=~/.claude/plugins/marketplaces/claude-plugins-official/plugins
 for src in \
-  ~/.claude/plugins/marketplaces/claude-plugins-official/plugins/pr-review-toolkit/agents/*.md \
-  ~/.claude/plugins/marketplaces/claude-plugins-official/plugins/feature-dev/agents/code-architect.md \
-  ~/.claude/plugins/marketplaces/claude-plugins-official/plugins/feature-dev/agents/code-explorer.md \
-  ~/.claude/plugins/marketplaces/claude-plugins-official/plugins/code-simplifier/agents/code-simplifier.md
+  "$PLUGIN_ROOT/pr-review-toolkit/agents/code-reviewer.md" \
+  "$PLUGIN_ROOT/pr-review-toolkit/agents/silent-failure-hunter.md" \
+  "$PLUGIN_ROOT/pr-review-toolkit/agents/pr-test-analyzer.md" \
+  "$PLUGIN_ROOT/pr-review-toolkit/agents/type-design-analyzer.md" \
+  "$PLUGIN_ROOT/pr-review-toolkit/agents/comment-analyzer.md" \
+  "$PLUGIN_ROOT/feature-dev/agents/code-architect.md" \
+  "$PLUGIN_ROOT/feature-dev/agents/code-explorer.md" \
+  "$PLUGIN_ROOT/code-simplifier/agents/code-simplifier.md"
 do
   ln -sf "$src" "$HOME/.claude/agents/$(basename "$src")"
 done
 ```
+
+(`code-simplifier` 取自 `code-simplifier` plugin 的版本——它是该 plugin 的
+正主;`pr-review-toolkit` 里的 `code-simplifier.md` 是该 plugin 内部使用的
+副本,生产代码 M0.5.1 实测 reviewer catch 了这个重名 target 冲突,显式枚举
+是正确做法。)
 
 之后用 `Task(subagent_type="probe-XXX")` 探当前可用列表 —— 应该多出
 `code-reviewer`、`code-architect`、`code-explorer`、`code-simplifier`、
