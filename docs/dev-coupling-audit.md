@@ -2,7 +2,7 @@
 
 > 本文是 [ccteam-as-domain-agnostic-orchestrator.md](./ccteam-as-domain-agnostic-orchestrator.md)
 > §B 步骤的产出。审计当前代码,把"假设了 dev 团队"的位置逐条钉死,给
-> M4.5(team abstraction 里程碑)提供修复路线。
+> M3(team abstraction 里程碑;2026-05-05 reorder 前曾标 M4.5)提供修复路线。
 >
 > **审计日期**:2026-05-05
 > **审计基线**:strategic doc §1 责任分界表(domain-agnostic vs team fill 的判定)
@@ -37,7 +37,7 @@ F12(CLI `--team`)+ F13(`state.json.team` 字段)。这 6 条解耦后 ccteam-
 core 才能跑非 dev 团队。
 
 **元发现**:`pub use ... M0_PHASE_DAG, FIRST_PHASE`(`crates/ccteam-core/src/
-lib.rs:21`)把 dev 假设暴露到 lib 接口表面——M4.5.1 是一次 lib API breaking
+lib.rs:21`)把 dev 假设暴露到 lib 接口表面——M3.1 是一次 lib API breaking
 change。按 CLAUDE.md §五.3 "不写 backwards-compat shim",直接换。
 
 **对 §A 的反馈**:审计过程中没有发现需要修订 strategic doc §1 责任分界表
@@ -88,7 +88,7 @@ change。按 CLAUDE.md §五.3 "不写 backwards-compat shim",直接换。
   1. 删除 `M0_PHASE_DAG` 常量;
   2. `Orchestrator::new` 从加载的 `PhaseTemplate[]` 推断 DAG——按文件名前缀
      `NN-` 排序得 happy-path;非线性分叉由新增 front matter 字段 `next_on_done` /
-     `next_on_escalate` 显式声明(M4.5.2);
+     `next_on_escalate` 显式声明(M3.2);
   3. `next_phase()` 函数改成 `&self.dag` 上的查表方法。
 - **优先级**:**P0**——和 F1 一并解耦,是 `--team` 参数能工作的前提。
 
@@ -131,7 +131,7 @@ change。按 CLAUDE.md §五.3 "不写 backwards-compat shim",直接换。
   2. `run_new` 签名加 `team: &str`;
   3. `bootstrap_project` 受 team 参数影响选 phase 模板与 CLAUDE.md(F9/F10);
   4. project state.json 写入 `team: <name>`(F13)。
-- **优先级**:**P0**——M4.5.3 直接产物;F2/F10/F11 都需要这个入口才能生效。
+- **优先级**:**P0**——M3.3 直接产物;F2/F10/F11 都需要这个入口才能生效。
 
 ### F13 — `state.json` 缺 `team` 字段
 
@@ -167,7 +167,7 @@ change。按 CLAUDE.md §五.3 "不写 backwards-compat shim",直接换。
   2. `FixLoopState` → `AutoLoopState` 等;
   3. 状态文件名 `fix-loop.state.md` → `auto-loop.state.md`;
   4. 已存在的 `fix-loop.state.md` 文件由 `ProjectState::load` 做一次性迁移
-     (M4.5.1 实现迁移逻辑)。
+     (M3.1 实现迁移逻辑)。
 - **优先级**:**P1**——纯重命名,机制不变,但延后会让 P0 的 F1/F2 修复后
   代码里出现 "auto_loop_phase 写 fix_loop.state.md" 的命名内外冲突。建议跟
   F1 同 PR 做。
@@ -275,7 +275,7 @@ change。按 CLAUDE.md §五.3 "不写 backwards-compat shim",直接换。
   3. `bootstrap_project` 接收 `team: &TeamSpec` 参数,选对应数组写入;
   4. 将来插件式装新 team 时,不进 binary 而是从 `~/.ccteam/teams/<name>/phases/`
      读盘——核心 binary 永远内嵌至少一个团队(dev)作 zero-config 兜底。
-- **优先级**:**P1**——M4.5.4 直接产物。F10 + F2 共同决定 `--team` 参数能怎么
+- **优先级**:**P1**——M3.4 直接产物。F10 + F2 共同决定 `--team` 参数能怎么
   实现。
 
 ### F11 — phase 目录与文件命名缺 team scope
@@ -288,7 +288,7 @@ change。按 CLAUDE.md §五.3 "不写 backwards-compat shim",直接换。
 - **是否真 dev-specific**:**目录布局上是。** 多团队后必须 `phases-<team>/`
   隔离。
 - **解耦方案**:
-  1. 仓库根 `phases/` → `phases-dev/`(M4.5.1 一次性 git mv);
+  1. 仓库根 `phases/` → `phases-dev/`(M3.1 一次性 git mv);
   2. binary 内嵌 `phases-<team>/<NN>-<phase>.md`;
   3. 用户家目录 `~/.ccteam/phases/<team>/...` 或 `~/.ccteam/teams/<team>/phases/`
      (推荐后者,把 team config 与 phase 模板放一起);
@@ -309,7 +309,7 @@ change。按 CLAUDE.md §五.3 "不写 backwards-compat shim",直接换。
   2. `render_project_settings` 受 team 参数,按 patterns 注入 `PostToolUse`
      的 matcher entry;
   3. 不直接写 `Bash:git push.*` 字面量到模板里。
-- **优先级**:**P1**——M1+ 引入 `block-push` 时一并做;不在 M4.5 关键路径上,
+- **优先级**:**P1**——M1+ 引入 `block-push` 时一并做;不在 M3 关键路径上,
   但把它写进 strategic doc §3.5 拒绝清单可避免 M1 时悄悄硬编码。
 
 ### F19 — CLAUDE.md(顶层)与 docs/* 把 ccteam 描述为"开发团队的编排层"
@@ -327,12 +327,12 @@ change。按 CLAUDE.md §五.3 "不写 backwards-compat shim",直接换。
      有自己的 requirements 文件:`docs/teams/<team>/requirements.md`";
   2. `docs/tech-design.md` 顶部加一句类似免责;
   3. 顶层 `CLAUDE.md` §一 已说"ccteam 是 Claude Code 之上的元工具",但
-     §三所有举例都是 dev——M4.5 启动时加一节"Team 抽象层(M4.5+)"作前置阅
+     §三所有举例都是 dev——M3 启动时加一节"Team 抽象层(M3+)"作前置阅
      读;
   4. 长期看,`docs/` 应分 `docs/core/`(领域无关)+ `docs/teams/<team>/`(领
-     域特定),M4.5.4 一并整理。
+     域特定),M3.4 一并整理。
 - **优先级**:**P1**——文档体系不解耦,新加入 ccteam 项目的人会以为"ccteam
-  只服务 dev 团队"。M4.5 启动 PR 必须同步动文档。
+  只服务 dev 团队"。M3 启动 PR 必须同步动文档。
 
 ### F20 — 跨项目记忆 schema 假设 dev 字段
 
@@ -343,11 +343,11 @@ change。按 CLAUDE.md §五.3 "不写 backwards-compat shim",直接换。
 - **是否真 dev-specific**:**是。** research 项目的 retro 字段不同(方法学 /
   数据源 / 假设结果)。
 - **解耦方案**:同 strategic doc §2.7——team.yaml 的 `retro_schema[]` 决定字
-  段;M3 实现时必须先实现 §2.7(或在 M3 实现时只内嵌 dev schema,M4.5.5 再泛
-  化)。
+  段。**reorder 后顺序明确**:M3(团队抽象)交付 `retro_schema` 数据形式 + 解析,
+  M4.1(retro phase 实现)直接读 schema,从 day 1 就能写出团队特定字段。
 - **优先级**:**P0**(2026-05-05 升级,见下方注解)——本文档 §development-plan
-  reorder 后,跨项目记忆从 M3 移到 M4(团队抽象 M3 之后),F20 自动落在 M3
-  关键路径上,不再是"M3 之后再泛化"的可后置项。
+  reorder 后,跨项目记忆从原 M3 移到 M4(团队抽象 M3 之后),F20 自动落在 M3
+  关键路径上,不再是"M4 实现时再补"的可后置项。
 
 > **2026-05-05 升级注解**:原标 P1。ABC session 完成后用户审视发现:跨项目记
 > 忆(原 M3)在团队抽象(原 M4.5)之前实施时,retro 字段写死成 dev 字段会让
@@ -401,7 +401,7 @@ change。按 CLAUDE.md §五.3 "不写 backwards-compat shim",直接换。
 - **现状**:test fixture 硬编码 dev DAG。
 - **是否真 dev-specific**:**测试本来就 dev-specific**——它们验证的是 dev
   pipeline 的具体语义。
-- **解耦方案**:M4.5.1 把这些测试整体迁到 `tests/team-dev/` 命名空间;新增
+- **解耦方案**:M3.1 把这些测试整体迁到 `tests/team-dev/` 命名空间;新增
   `tests/team-research/` 验证 research DAG 跑通。不强行改测试 fixture 用 team
   配置——单元测试该面向具体场景。
 - **优先级**:**P2**——目录重命名,不阻塞功能。
@@ -437,7 +437,7 @@ change。按 CLAUDE.md §五.3 "不写 backwards-compat shim",直接换。
 
 ---
 
-## 修复顺序建议(M4.5.1 PR 拆分)
+## 修复顺序建议(M3.1 PR 拆分)
 
 按依赖关系排:
 
@@ -468,8 +468,11 @@ change。按 CLAUDE.md §五.3 "不写 backwards-compat shim",直接换。
    - 改成扫 `.ccteam/*.md`
 7. **PR G — 文档解耦(F19)**
    - `docs/` 顶部加免责
-   - 长期 `docs/core/` + `docs/teams/<team>/` 整理(M4.5.4)
-8. **延后(M3 实现时定;M4.5 不动)**:F15(M1+)、F20(M3)。
+   - 长期 `docs/core/` + `docs/teams/<team>/` 整理(M3.4)
+8. **延后**:
+   - F15(M1+ 引入 `block-push` 时一并做)
+   - F21(`stall_warn_minutes` 已 spec 未实现,M0.5.3 顺手或 M1 cross-cutting watcher 上线前)
+   - F20(原 P1 已升 P0,M3 完成 retro_schema 数据形式后,M4.1 retro phase 实现一并处理)
 
 每个 PR 必须有 dev pipeline happy-path 回归测试通过。
 
