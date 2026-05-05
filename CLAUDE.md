@@ -85,14 +85,14 @@ tech-design §6.4 已列,按里程碑装:
 
 调用形态:phase prompt 用 `Task` 工具显式 launch,带 `subagent_type`;**并行多个 agent 时单条消息发多 tool call**(最佳实践 §7.2 Writer/Reviewer)。
 
-### 3.5 Multi-agent 编排(L2 自检层 + sub-skill 调度)
+### 3.5 Multi-agent 编排(质量 + 速度 + 编排)
 
-ccteam 用 multi-agent 编排实现痛点 11 的 L2 自检层 + 痛点 12 的工作流编排。三种形态(详见 tech-design §3.6 / §6.3 / §6.10):
+ccteam 用 multi-agent 同时承担三件事(详见 tech-design §3.3 / §3.6 / §6.3 / §6.10 / §6.11):
 
-- **Phase 内 agent team**(并行短期):`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` + phase front matter `agent_team:` 列角色;Lead 仅限 phase 内,全局调度永远是 orchestrator
-- **Cross-cutting watcher**(后台长期):`cost-watcher` / `scope-watcher` / `drift-detector` 在 **Stop hook 触发**(每 phase 边界一次,**不**在 PostToolUse 跑);M1 上线
-- **Sub-skill 自动调度**(串行接力):phase front matter `sub_skills:` 列要 trigger 的 plugin agent;orchestrator 按 `phase_start` / `phase_done` 自动调用,产物落 `output_to`,自动作为下 phase 的 `@文件引用`;M2 上线
-- **跨 session 协作**(M3+):用 `ccgram-messaging` skill 走 inter-agent message bus
+- **质量并行(痛点 11 L2)**:Phase 内 agent team 看同一份输入多视角议事(`architect` / `critic` / `designer` / `security` / `scope-watcher`)+ cross-cutting watcher(`cost-watcher` / `scope-watcher` / `drift-detector` 在 **Stop hook 触发**,M1 上线)
+- **速度并行(痛点 13)**:phase front matter `parallelism: solo / agent_team / multi_session` 三档,plan-eng 按 spec 复杂度自动选;**三档可叠加 subagent**(任何 agent ad-hoc 启 Task,不在协议中声明);M0 solo / M2 agent_team / M3 multi_session
+- **工作流编排(痛点 12)**:phase front matter `sub_skills:` 列要 trigger 的 plugin agent;orchestrator 按 `phase_start` / `phase_done` 自动调用,产物落 `output_to`,自动作为下 phase 的 `@文件引用`;M2 上线
+- **跨 session 协作**(M3+):multi_session 项目内 fan-out/fan-in;非项目内场景用 `ccgram-messaging` skill 走 inter-agent message bus
 
 ### 3.6 Hooks(生命周期触发——ccteam 可观测性命脉)
 

@@ -23,6 +23,7 @@
 | **决策点 ≤ 3** | 痛点 2：AI 仍要求我当 PM | 只有不可逆决策（架构、scope 大改、API 形态）才走 escalation |
 | **纵深防御替代人值守** | 痛点 11：关键节点不把控 | L1 架构约束（hooks + required_outputs）+ L2 多 agent 互检 + cross-cutting watcher（议事）+ L3 用户兜底（仅 deadlock 弹）；详见 §3.6 |
 | **pipeline 编排 sub-skill** | 痛点 12：工作流插件靠人手动调 | 9 主干 phase + 每 phase front matter `sub_skills` 字段；orchestrator 自动 trigger，产物自动接力；复用 gstack / claude-plugins-official 的 plugin，不重写；详见 §6.10 |
+| **并行规模自适应** | 痛点 13：大项目串行慢、并行规模选不对 | plan-eng 按 spec 复杂度选 `parallelism: solo / agent_team / multi_session`；subagent 任何粒度可叠加（ad-hoc，不在协议中声明）；三档叠加层级，不是互斥；详见 §3.3、§6.3、§6.11 |
 
 ---
 
@@ -225,7 +226,10 @@ required_outputs:
   - .ccteam/implement-report.md
 soft_cost_warn_usd: 5.0    # 仅告警，不打断
 stall_warn_minutes: 5       # 5 分钟无 hook event 第一次软告警
-agent_team:                 # 可选：本 phase 内启用 sub-agent
+parallelism: solo           # 主框架并行粒度（痛点 13；详见 §6.11）
+                            #   solo（M0 默认）         | agent_team（M2）        | multi_session（M3）
+                            # subagent 不在此声明——任何 agent 都可 ad-hoc 通过 Task 工具启动，叠加在主框架之上
+agent_team:                 # 可选：本 phase 内启用 sub-agent（仅 parallelism: agent_team 时生效）
   - role: backend-dev
   - role: frontend-dev
   - role: reviewer
@@ -887,9 +891,18 @@ orchestrator 通过 `PreToolUse` hook 检测最近一次输入源：若来自人
 
 ### 6.3 Multi-agent 编排（phase 内并行 + cross-cutting watcher）
 
-ccteam 用 multi-agent 编排实现痛点 11 的 L2 自检层（详见 §3.6 L2）。两种模式并存：
+ccteam 用 multi-agent 编排同时承担两个不同目标——**质量**（痛点 11 L2，多视角议事）与**速度**（痛点 13 L 加速，多角色并行）。两个目标用同一个 Agent Teams 机制实现，但 phase prompt 中表达不同：
 
-#### 模式 A：Phase 内 agent team（短期，隔离 audit）
+| 目标 | 多 agent 干啥 | 典型 phase | 痛点 |
+|---|---|---|---|
+| **质量**（垂直） | 看同一份输入，各视角审 | review、plan-eng | 痛点 11 |
+| **速度**（水平） | 各做不同事 | implement | 痛点 13 |
+
+两个目标的 multi-agent **可同 phase 共存**——例如 implement phase 启 `backend-dev`/`frontend-dev`（速度）+ `reviewer` 旁路审产物（质量）。
+
+下面三种模式并存：
+
+#### 模式 A：Phase 内 agent team（短期，隔离 audit / 加速）
 
 在 `implement` / `review` 这种复杂 phase 里启用 Claude Code 的 Agent Teams 实验特性：
 
@@ -924,11 +937,17 @@ phase prompt 显式调用：
 - CONCERN → append `progress.jsonl` 一条 `watcher_concern` 事件
 - BLOCK → append `watcher_block` 事件 + 写 `escalation.md`，orchestrator 据此决定是否进 L3
 
+#### Subagent 与 Agent Teams 的叠加（不互斥）
+
+Agent Teams 是 phase 内的横向多角色编排，subagent 是任何 agent 内的纵向 context 节流。两者职责正交、可叠加：
+- 例：implement phase 启 Agent Teams（`backend-dev` ∥ `frontend-dev` ∥ `reviewer`），**backend-dev 内部**同时用 `Task(subagent_type=code-explorer)` 启 subagent 研究"我们 codebase 怎么用 SQLAlchemy"——主线写代码，subagent 跑研究后返回结构化总结，不污染 backend-dev 自己的 context
+- subagent **不在 phase 协议中声明**——任何 agent 在任何时刻都可 ad-hoc 启动；只受 `max_subagents_per_phase` 资源约束（详见 §6.11）
+
 #### 与 Sub-skill 调度的边界
 
-agent（本节）= 在 phase 内或后台**并行**跑的 audit；sub-skill（§6.10）= phase 进入/完成时**串行**调用的工作流单元（如 code-reviewer 跑完输出文件给下个 phase）。两者协作但不重叠：
+agent（本节）= 在 phase 内或后台**并行**跑的 multi-agent；sub-skill（§6.10）= phase 进入/完成时**串行**调用的工作流单元（如 code-reviewer 跑完输出文件给下个 phase）。两者协作但不重叠：
 - 每个 phase 可同时启用 phase 内 agent team（并行 implement）+ sub-skills（串行 review/qa）+ cross-cutting watcher（后台监督）
-- phase 协议 front matter 同时支持 `agent_team` 和 `sub_skills` 两个字段
+- phase 协议 front matter 同时支持 `parallelism` / `agent_team` / `sub_skills` 三个字段
 
 ### 6.4 MCP servers
 
@@ -1148,6 +1167,86 @@ ccteam 在 Seed phase 后扫一次 `~/.claude/plugins/.../skill_intent.yaml`，�
 - **`sub_skills`（本节）** = phase 进入或完成时**串行**调用的工作流单元，产物落文件给下游用
 
 两个字段在 phase front matter 共存、互不冲突。
+
+### 6.11 Multi-session per project（痛点 13 大项目加速；M3）
+
+适用：plan-eng 在分析 spec 时识别出"≥3 个独立子模块且接口稳定"——例如 SaaS 拆 backend-api / frontend-dashboard / mobile-app / docs。**M3 才上线**；M0/M1/M2 默认 `parallelism: solo` 或 `agent_team`。
+
+#### 与 §6.3 Agent Teams 的关键区别
+
+| 维度 | `parallelism: agent_team`（§6.3 模式 A） | `parallelism: multi_session`（本节） |
+|---|---|---|
+| 进程模型 | 1 session N agent | N session（独立 claude 进程） |
+| Context | 共享 1M 主 session 上下文 | 每 session 独立 1M context |
+| Cache | 高效复用主 session prompt cache | 各自独立，不共享 |
+| 适用 | 中型项目，phase 内多角色 | 大型项目，子模块独立度高、接口稳定 |
+| 开销 | 中（共享进程） | 大（N 进程 × 1M context） |
+| 取舍 | 优化 token 成本 | 优化墙钟时间 |
+
+#### 工作区结构
+
+```
+~/projects/<slug>/
+├── .ccteam/
+│   ├── state.json                   # master state（项目级）
+│   ├── parallelism: multi_session
+│   ├── sub-modules/
+│   │   ├── backend-api/
+│   │   │   ├── state.json           # 子模块 state（独立 phase 进度）
+│   │   │   └── progress.jsonl
+│   │   ├── frontend-dashboard/
+│   │   ├── mobile-app/
+│   │   └── docs/
+│   └── interface-contracts.md       # 子模块间接口契约（fan-out 时定下，fan-in 时验证）
+├── backend-api/                     # 实际代码（独立目录）
+├── frontend-dashboard/
+├── mobile-app/
+└── docs/
+```
+
+#### Tmux session 命名
+
+```
+ccteam-<slug>                        # master session（编排）
+ccteam-<slug>--backend-api           # 子模块 session
+ccteam-<slug>--frontend-dashboard
+ccteam-<slug>--mobile-app
+ccteam-<slug>--docs
+```
+
+#### Fan-out / Fan-in 协议
+
+主流程：
+1. `plan-eng` phase（master session 跑）→ 输出 `interface-contracts.md` + 子模块清单
+2. **Fan-out**：master orchestrator 起 N 个 tmux 子 session，每 session 喂自己的子模块 spec + 共享 contracts
+3. 各子模块独立跑 implement / test / fix → phase 边界写各自 `progress.jsonl`
+4. **Fan-in**：所有子模块都到达 review phase 时，master session 起来跑 review（读所有子模块产物 + 验证 contracts 满足）
+5. `ship` phase 在 master session 跑（统一打包/发布）
+
+#### 状态管理
+
+- **master `state.json`**：项目级 phase（plan / fan-out / fan-in / review / ship）+ 子模块状态摘要
+- **sub-module `state.json`**：本子模块的 phase 进度（与单 session 项目协议一致）
+- master orchestrator 通过 inotify 监听**所有** sub-module `progress.jsonl`，决定何时 fan-in
+
+#### 资源约束
+
+- `~/.ccteam/config.yml` 加 `max_sessions_per_project: 4`（默认；可项目级覆盖）
+- 总 token 预算按 master + sum(sub-modules) 累加；硬上限触发 fan-in escalate
+- context reset：每个 sub-session 独立按 60% 阈值 reset，不互相影响（§6.9）
+
+#### 三档叠加体现
+
+multi_session 项目内每个 sub-session 仍可独立选 `parallelism: agent_team`（嵌套）或叠加 subagent。例如：
+- master `plan-eng` 用 `agent_team` 启 architect / scope-watcher 议事
+- backend-api session 的 `implement` phase 用 `agent_team` 启 api-impl / db-impl 并行
+- 每个 agent 内仍可 ad-hoc 启 subagent 做局部研究
+
+#### 边界（M3 不解决的）
+
+- **自动子模块切分** = M5（本节假设 plan-eng 已能识别"有 N 个独立子模块"）
+- **子模块接口契约的形式化验证** = M5（M3 仅靠 review phase 跑测试 + 人审 contracts.md 满足度）
+- **跨子模块的 stop-the-world 重构** = M5（impl 中发现 contract 错时只能 escalate）
 
 ---
 
