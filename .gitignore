@@ -1,0 +1,12 @@
+# References cloned for inspiration (not vendored).
+# See CLAUDE.md §3.7: 参考实现不是依赖,不进 ccteam 仓库。
+/references/
+
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Editor / OS noise
+.DS_Store
+*.swp
+*~
