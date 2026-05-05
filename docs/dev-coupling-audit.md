@@ -22,12 +22,12 @@
 
 ## 摘要
 
-20 条发现,分布:
+21 条发现(2026-05-05 加 F21、升级 F20 P1→P0,共增 1 条),分布:
 
 | 优先级 | 数量 | 编号 |
 |---|---|---|
-| **P0 阻塞泛化** | 6 | F1, F2, F3, F4, F12, F13 |
-| **P1 该做但可后置** | 10 | F5, F6, F7, F8, F9, F10, F11, F15, F19, F20 |
+| **P0 阻塞泛化** | 7 | F1, F2, F3, F4, F12, F13, F20(2026-05-05 升级) |
+| **P1 该做但可后置** | 10 | F5, F6, F7, F8, F9, F10, F11, F15, F19, F21 |
 | **P2 边角** | 3 | F16, F17, F18 |
 | **N/A 已是领域无关** | 1 | F14 |
 
@@ -345,8 +345,39 @@ change。按 CLAUDE.md §五.3 "不写 backwards-compat shim",直接换。
 - **解耦方案**:同 strategic doc §2.7——team.yaml 的 `retro_schema[]` 决定字
   段;M3 实现时必须先实现 §2.7(或在 M3 实现时只内嵌 dev schema,M4.5.5 再泛
   化)。
-- **优先级**:**P1**——M3 实现时定字段,如果不预留泛化点,M4.5 时改 RAG
-  索引会很贵。
+- **优先级**:**P0**(2026-05-05 升级,见下方注解)——本文档 §development-plan
+  reorder 后,跨项目记忆从 M3 移到 M4(团队抽象 M3 之后),F20 自动落在 M3
+  关键路径上,不再是"M3 之后再泛化"的可后置项。
+
+> **2026-05-05 升级注解**:原标 P1。ABC session 完成后用户审视发现:跨项目记
+> 忆(原 M3)在团队抽象(原 M4.5)之前实施时,retro 字段写死成 dev 字段会让
+> 后续 RAG 索引重建。`development-plan.md` 已 reorder M3 ↔ M4(团队抽象前
+> 置),F20 现在阻塞新 M4 启动 —— 升级为 P0。
+
+### F21 — `stall_warn_minutes` phase YAML 字段已 spec 但 orchestrator 未读取
+
+- **文件:行号**:`docs/interfaces.md §5.1` 已声明 phase YAML 有
+  `stall_warn_minutes` 字段;`crates/ccteam-core/src/stall.rs` 的 `STALL_WARN_SECONDS`
+  / `STALL_SUSPICIOUS_SECONDS` / `STALL_ESCALATE_SECONDS` 是常量,**与 phase 模板
+  无关**。
+- **现状**:phase 模板写 `stall_warn_minutes: 60` 不生效——orchestrator 永远
+  按 5 / 15 / 30 分钟三档来 warn。
+- **是否真 dev-specific**:**部分是。** dev 团队的 plan-eng / implement / fix
+  阶段 5 分钟 warn 还合理(LLM 应该已经在出 token);但 research 团队 04-primary
+  data-collection phase **正常就要等用户回 inbox 数据**,可能持续小时级
+  ——5 分钟 warn 完全错配语义。
+- **解耦方案**:
+  1. `stall.rs` 改为接受 `&PhaseTemplate`,从 `template.stall_warn_minutes`
+     字段读阈值;`STALL_*` 常量退回为"phase 没声明时的默认值"
+  2. `phases.rs` 解析时把字段填进 `PhaseTemplate` 结构体(可能已有,需 verify)
+  3. 文档 `interfaces.md §5.1` 明确说"3 档阈值的具体倍数"——M0 是 1×/3×/6×
+     `stall_warn_minutes`,即 phase 写 60 → 60/180/360 分钟三档
+- **优先级**:**P1**——M0.5.3 顺手做最经济(已经在动 phases.rs 解析逻辑);
+  否则 M1 cross-cutting watcher 上线就会撞上(per-phase 阈值是 watcher 调度
+  的核心条件)
+- **审计漏报原因**:本条是"已 spec 未实现"的半完成态——schema 写在 interfaces.md
+  里、orchestrator 假装支持(没崩),但实际行为不一致。常规审计扫现状代码
+  vs 文档断言,容易漏掉这种"文档说有、代码静默忽略"的隐性债
 
 ---
 
