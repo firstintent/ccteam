@@ -12,6 +12,7 @@ pub mod progress;
 pub mod projects;
 pub mod stall;
 pub mod state;
+pub mod team;
 pub mod templates;
 pub mod tmux;
 pub mod tool_surface;
@@ -33,6 +34,7 @@ pub use phases::{
     AgentTeamRole, PhaseHooks, PhaseTemplate, SubSkillSpec, SubSkillTrigger,
 };
 pub use state::{Parallelism, PhaseHistoryEntry, PhaseState, ProjectState};
+pub use team::{RetroFieldKind, RetroFieldSpec, TeamSpec};
 pub use templates::{
     current_ccteam_bin, project_phase_filename, render_project_settings,
     write_global_phase_templates, write_project_phase_templates, write_project_settings,

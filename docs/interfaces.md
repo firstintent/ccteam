@@ -387,6 +387,52 @@ confidence: 0.0-1.0
 
 ---
 
+### 5.5 `team.yaml` 团队配置(M3.1+)
+
+每个团队一份 `team.yaml`,M3.4 落到 `~/.ccteam/teams/<name>/team.yaml`。**M3.1 只交付数据形式 + 解析,无运行时调用**——`retro_schema` 字段供 M4.1 retro phase 实现读取,从 day 1 就能写出团队特定字段(避免 RAG 索引重建,详见 dev-coupling-audit.md F20)。
+
+```yaml
+# ~/.ccteam/teams/dev/team.yaml(M3.4 路径)
+name: dev                              # 必填。snake-case [a-z0-9_-]+,与 --team / state.json.team 对齐
+description: Software development team  # 可选。`ccteam ls --teams`(M3.4)显示
+retro_schema:                           # 可选。retro phase 字段定义。空 = 该团队无 retro
+  - field: tech_stack                   # 必填。snake_case;markdown 子节标题 + RAG tag(改名 = 索引失效)
+    description: Languages, frameworks, key libraries used
+    kind: list                          # 默认 list。可选 text(单段叙述)
+  - field: pitfalls
+    description: Mistakes / surprises to avoid next time
+  - field: successful_designs
+    description: Design choices that paid off
+  - field: do_not_do_again
+    description: Anti-patterns observed
+```
+
+**research 团队示例**(对比 dev 字段差异):
+
+```yaml
+name: research
+retro_schema:
+  - field: methodology
+    description: Methods used for data collection / analysis
+  - field: data_sources
+    description: Sources consulted (URLs, papers, datasets)
+  - field: findings
+    description: Top-N conclusions
+  - field: open_questions
+    description: Things needing follow-up
+  - field: summary
+    description: Narrative recap of the research
+    kind: text
+```
+
+**校验**(`TeamSpec::validate` 在 parse 时执行):
+- `name` 非空,只允许 ascii 小写 / 数字 / `-` / `_`
+- `retro_schema[*].field` 非空,**不允许重复**(防 RAG 索引冲突)
+
+**M3.1 实现位置**:`crates/ccteam-core/src/team.rs`(`TeamSpec` / `RetroFieldSpec` / `RetroFieldKind`),通过 `ccteam_core::TeamSpec::load(path)` 暴露。当前 ccteam binary 不读这个文件——**M3.4 加载逻辑、M4.1 retro phase 读 schema**。
+
+---
+
 ## 6. Hooks 配置 schema
 
 ### 6.1 项目 `.claude/settings.json` 完整模板
