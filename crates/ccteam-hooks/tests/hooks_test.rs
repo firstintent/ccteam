@@ -204,6 +204,69 @@ fn parse_phase_end_emits_escalate_when_sigil_present() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0]["event"], "escalate");
     assert_eq!(events[0]["reason"], "fix-cycle 已 3 轮未通过");
+    // M0.5.4: bare text → kind="need_user_input", target_phase=null
+    assert_eq!(events[0]["kind"], "need_user_input");
+    assert!(events[0]["target_phase"].is_null());
+}
+
+#[test]
+fn parse_phase_end_emits_revert_kind_with_target_phase() {
+    let fx = Fixture::new("bookmark-mgr-a3f9");
+    fx.write_transcript(&[assistant_message(
+        "Plan-eng tech choice was wrong.\nESCALATE: REVERT_TO_PHASE plan-eng \u{2014} fix-loop 撞顶,根因在选型",
+        None,
+    )]);
+    let stdin = json!({
+        "cwd": fx.project_dir,
+        "transcript_path": fx.transcript_path,
+    });
+
+    parse_phase_end(&fx.paths, &stdin).unwrap();
+    let events = fx.read_progress_lines();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["event"], "escalate");
+    assert_eq!(events[0]["kind"], "revert");
+    assert_eq!(events[0]["target_phase"], "plan-eng");
+    assert_eq!(events[0]["reason"], "fix-loop 撞顶,根因在选型");
+}
+
+#[test]
+fn parse_phase_end_emits_abort_kind_for_abort_prefix() {
+    let fx = Fixture::new("bookmark-mgr-a3f9");
+    fx.write_transcript(&[assistant_message(
+        "Out of options.\nESCALATE: ABORT \u{2014} ccteam capability exceeded",
+        None,
+    )]);
+    let stdin = json!({
+        "cwd": fx.project_dir,
+        "transcript_path": fx.transcript_path,
+    });
+
+    parse_phase_end(&fx.paths, &stdin).unwrap();
+    let events = fx.read_progress_lines();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["kind"], "abort");
+    assert!(events[0]["target_phase"].is_null());
+    assert_eq!(events[0]["reason"], "ccteam capability exceeded");
+}
+
+#[test]
+fn parse_phase_end_emits_need_user_input_for_explicit_prefix() {
+    let fx = Fixture::new("bookmark-mgr-a3f9");
+    fx.write_transcript(&[assistant_message(
+        "spec is too thin.\nESCALATE: NEED_USER_INPUT \u{2014} (1) platform? (2) audience?",
+        None,
+    )]);
+    let stdin = json!({
+        "cwd": fx.project_dir,
+        "transcript_path": fx.transcript_path,
+    });
+
+    parse_phase_end(&fx.paths, &stdin).unwrap();
+    let events = fx.read_progress_lines();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["kind"], "need_user_input");
+    assert_eq!(events[0]["reason"], "(1) platform? (2) audience?");
 }
 
 #[test]

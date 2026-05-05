@@ -223,12 +223,29 @@ orchestrator 每轮(30s)扫描 `control/`,处理后**删除文件**(确保幂等
 {"ts":"...","event":"PostToolUse","tool":"Bash","cmd":"pnpm test","exit_code":0,"duration_ms":4521}
 {"ts":"...","event":"phase_milestone","phase":"implement","note":"完成 schema + migration"}
 {"ts":"...","event":"phase_done","phase":"implement","duration_s":4521,"cost_usd":2.13}
-{"ts":"...","event":"escalate","reason":"db migration 不可调和","cycle":3}
+{"ts":"...","event":"escalate","kind":"need_user_input","target_phase":null,"reason":"db migration 不可调和","cycle":3}
+{"ts":"...","event":"escalate","kind":"revert","target_phase":"plan-eng","reason":"fix-loop 撞顶,根因在选型"}
+{"ts":"...","event":"escalate","kind":"abort","target_phase":null,"reason":"超出 ccteam 当前能力,人工接手"}
 {"ts":"...","event":"user_attach","detected_by":"PreToolUse-input-source"}
 {"ts":"...","event":"watcher_concern","watcher":"scope-watcher","note":"添加了云同步,超出 spec"}
 {"ts":"...","event":"watcher_block","watcher":"cost-watcher","note":"项目累计 $200 触发硬上限"}
 {"ts":"...","event":"SessionEnd","reason":"context_reset"}
 ```
+
+### 4.1.1 ESCALATE grammar(M0.5.4)
+
+`Stop` hook 在 claude 最后一行匹配前缀,解析为下面三档之一,落 `event: "escalate"` 时附带 `kind` 与可选 `target_phase`。**纯字符串前缀匹配,orchestrator 不读自然语言**(详见 [docs/claude-code-tool-surface.md §2.2.3](./claude-code-tool-surface.md))。
+
+| ESCALATE 末行 | `kind` | `target_phase` | orchestrator 行为(M0/M1) |
+|---|---|---|---|
+| `ESCALATE: REVERT_TO_PHASE <phase> — <reason>` | `revert` | `<phase>` | M1+:set current_phase=`<phase>`,phase_state=Idle,re-dispatch;M0 仍走通用 escalation(写 escalation.md,等用户) |
+| `ESCALATE: NEED_USER_INPUT — <questions>` | `need_user_input` | `null` | 写 escalation.md,inbox 等用户 |
+| `ESCALATE: ABORT — <reason>` | `abort` | `null` | 项目永久标 escalated,M0 等同 NEED_USER_INPUT |
+| `ESCALATE: <free text>`(无前缀) | `need_user_input` | `null` | 等同显式 NEED_USER_INPUT,reason 是整段文本 |
+
+分隔符:em dash `—`(U+2014)、`--`、` - `(单 dash 必须前后有空格——这是为了不切碎 `plan-eng` 这类 phase 名)。
+
+**phase 模板作者写 ESCALATE 的原则**:能用前缀就用前缀(orchestrator 路由更精确);不确定就裸写文本(降级为 NEED_USER_INPUT)。**不要**把 ESCALATE 当成 RPC 通道来请求 `/exit`、`/reload-plugins` 等 TUI 命令——那是 orchestrator 的监控职责(详见 [docs/claude-code-tool-surface.md §2.2.2](./claude-code-tool-surface.md))。
 
 ### 4.2 写入责任
 

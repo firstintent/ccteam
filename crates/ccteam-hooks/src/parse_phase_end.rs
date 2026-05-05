@@ -118,11 +118,14 @@ pub fn parse_phase_end(paths: &CcteamPaths, stdin: &Value) -> Result<ParseDecisi
             "phase": phase.trim(),
         }))
     } else {
-        last_line.strip_prefix("ESCALATE:").map(|reason| {
+        last_line.strip_prefix("ESCALATE:").map(|raw_reason| {
+            let parsed = ParsedEscalate::from_reason(raw_reason);
             json!({
                 "ts": now_rfc3339(),
                 "event": "escalate",
-                "reason": reason.trim(),
+                "kind": parsed.kind.as_str(),
+                "reason": parsed.reason,
+                "target_phase": parsed.target_phase,
             })
         })
     };
@@ -140,6 +143,232 @@ pub fn parse_phase_end(paths: &CcteamPaths, stdin: &Value) -> Result<ParseDecisi
         );
     }
     Ok(ParseDecision::Continue)
+}
+
+/// M0.5.4 structured ESCALATE grammar. Three explicit prefixes route
+/// to different orchestrator behavior; bare text degrades to
+/// `NEED_USER_INPUT` so old phase markdown keeps working.
+///
+/// Grammar (everything after `ESCALATE:` whitespace-trimmed):
+///
+/// - `REVERT_TO_PHASE <name> — <reason>` → `kind="revert"`,
+///   `target_phase="<name>"`. Em dash (`—`) preferred but plain `-` /
+///   `--` accepted.
+/// - `NEED_USER_INPUT — <questions>` → `kind="need_user_input"`,
+///   `target_phase=null`. The reason carries the clarifying questions.
+/// - `ABORT — <reason>` → `kind="abort"`, `target_phase=null`. Project
+///   marked terminally failed; user must `ccteam new` from scratch.
+/// - Anything else → `kind="need_user_input"`, `target_phase=null`,
+///   `reason=<the whole tail>`. Equivalent to NEED_USER_INPUT for
+///   M0/M1 routing — orchestrator just stops the auto loop and waits
+///   for user.
+///
+/// Pure string-prefix matching, no LLM. Orchestrator is a dumb Rust
+/// program and stays that way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EscalateKind {
+    Revert,
+    NeedUserInput,
+    Abort,
+}
+
+impl EscalateKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EscalateKind::Revert => "revert",
+            EscalateKind::NeedUserInput => "need_user_input",
+            EscalateKind::Abort => "abort",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedEscalate {
+    pub kind: EscalateKind,
+    /// For REVERT_TO_PHASE: the target phase name. None otherwise.
+    pub target_phase: Option<String>,
+    /// Free-text reason for the user. For REVERT_TO_PHASE this is the
+    /// text after the separator; for NEED_USER_INPUT / ABORT this is
+    /// the text after the prefix's separator; for bare text it's the
+    /// whole tail.
+    pub reason: String,
+}
+
+impl ParsedEscalate {
+    /// Parse the substring *after* `ESCALATE:` (caller has already
+    /// stripped the prefix). Whitespace is trimmed off the input.
+    pub fn from_reason(raw: &str) -> Self {
+        let trimmed = raw.trim();
+
+        if let Some(rest) = strip_grammar_prefix(trimmed, "REVERT_TO_PHASE") {
+            // Expect: `<phase> — <reason>` or `<phase> - <reason>`.
+            let (phase, reason) = split_on_dash(rest);
+            return Self {
+                kind: EscalateKind::Revert,
+                target_phase: Some(phase.to_string()),
+                reason: reason.to_string(),
+            };
+        }
+        if let Some(rest) = strip_grammar_prefix(trimmed, "NEED_USER_INPUT") {
+            // The dash separator is optional — `NEED_USER_INPUT — what?`
+            // and `NEED_USER_INPUT what?` should both work.
+            let reason = trim_leading_dash(rest);
+            return Self {
+                kind: EscalateKind::NeedUserInput,
+                target_phase: None,
+                reason: reason.to_string(),
+            };
+        }
+        if let Some(rest) = strip_grammar_prefix(trimmed, "ABORT") {
+            let reason = trim_leading_dash(rest);
+            return Self {
+                kind: EscalateKind::Abort,
+                target_phase: None,
+                reason: reason.to_string(),
+            };
+        }
+
+        // No grammar prefix → treat as legacy free-text NEED_USER_INPUT.
+        Self {
+            kind: EscalateKind::NeedUserInput,
+            target_phase: None,
+            reason: trimmed.to_string(),
+        }
+    }
+}
+
+/// Strip `<keyword>` from the front of `s` only when it's followed by
+/// a word boundary (whitespace, dash, end of string). Prevents
+/// e.g. `ABORT_LATER` from matching `ABORT`.
+fn strip_grammar_prefix<'a>(s: &'a str, keyword: &str) -> Option<&'a str> {
+    let rest = s.strip_prefix(keyword)?;
+    let next = rest.chars().next();
+    match next {
+        None => Some(rest),
+        Some(c) if c.is_whitespace() || c == '-' || c == '\u{2014}' || c == ':' => {
+            Some(rest)
+        }
+        _ => None, // word continues — not a real prefix match
+    }
+}
+
+/// Split `<phase> <separator> <reason>`. Separators tried in priority
+/// order: em dash, `--`, then ` - ` (single dash *with* whitespace on
+/// both sides) — the whitespace guard keeps phase names like `plan-eng`
+/// from splitting in the middle. When no separator, the trimmed input
+/// is treated as the phase name and the reason is empty.
+fn split_on_dash(s: &str) -> (&str, &str) {
+    let s = s.trim();
+    for sep in ["\u{2014}", "--"] {
+        if let Some((head, tail)) = s.split_once(sep) {
+            return (head.trim(), tail.trim());
+        }
+    }
+    if let Some((head, tail)) = s.split_once(" - ") {
+        return (head.trim(), tail.trim());
+    }
+    (s, "")
+}
+
+/// Drop a leading em dash / `--` / `-` (with surrounding whitespace)
+/// from `s`, if present. Used after the grammar prefix to strip the
+/// optional separator before the human-readable reason.
+fn trim_leading_dash(s: &str) -> &str {
+    let s = s.trim_start();
+    for sep in ["\u{2014}", "--", "-"] {
+        if let Some(rest) = s.strip_prefix(sep) {
+            return rest.trim_start();
+        }
+    }
+    s
+}
+
+#[cfg(test)]
+mod parse_escalate_tests {
+    use super::*;
+
+    #[test]
+    fn revert_to_phase_with_em_dash() {
+        let p = ParsedEscalate::from_reason(
+            " REVERT_TO_PHASE plan-eng \u{2014} fix-loop 撞顶,根因在选型",
+        );
+        assert_eq!(p.kind, EscalateKind::Revert);
+        assert_eq!(p.target_phase.as_deref(), Some("plan-eng"));
+        assert_eq!(p.reason, "fix-loop 撞顶,根因在选型");
+    }
+
+    #[test]
+    fn revert_to_phase_with_double_dash() {
+        let p = ParsedEscalate::from_reason("REVERT_TO_PHASE plan-eng -- need redesign");
+        assert_eq!(p.kind, EscalateKind::Revert);
+        assert_eq!(p.target_phase.as_deref(), Some("plan-eng"));
+        assert_eq!(p.reason, "need redesign");
+    }
+
+    #[test]
+    fn revert_to_phase_with_single_dash() {
+        let p = ParsedEscalate::from_reason("REVERT_TO_PHASE implement - context drift");
+        assert_eq!(p.kind, EscalateKind::Revert);
+        assert_eq!(p.target_phase.as_deref(), Some("implement"));
+        assert_eq!(p.reason, "context drift");
+    }
+
+    #[test]
+    fn need_user_input_with_dash_separator() {
+        let p = ParsedEscalate::from_reason(
+            " NEED_USER_INPUT \u{2014} (1) target platform? (2) target user?",
+        );
+        assert_eq!(p.kind, EscalateKind::NeedUserInput);
+        assert_eq!(p.target_phase, None);
+        assert_eq!(p.reason, "(1) target platform? (2) target user?");
+    }
+
+    #[test]
+    fn need_user_input_without_separator() {
+        let p = ParsedEscalate::from_reason("NEED_USER_INPUT spec.md only has 'mdeditor'");
+        assert_eq!(p.kind, EscalateKind::NeedUserInput);
+        assert_eq!(p.reason, "spec.md only has 'mdeditor'");
+    }
+
+    #[test]
+    fn abort_with_reason() {
+        let p = ParsedEscalate::from_reason("ABORT \u{2014} ccteam capability exceeded");
+        assert_eq!(p.kind, EscalateKind::Abort);
+        assert_eq!(p.target_phase, None);
+        assert_eq!(p.reason, "ccteam capability exceeded");
+    }
+
+    #[test]
+    fn bare_text_degrades_to_need_user_input() {
+        let p = ParsedEscalate::from_reason(" fix-cycle 已 3 轮未通过 ");
+        assert_eq!(p.kind, EscalateKind::NeedUserInput);
+        assert_eq!(p.target_phase, None);
+        assert_eq!(p.reason, "fix-cycle 已 3 轮未通过");
+    }
+
+    #[test]
+    fn keyword_must_have_word_boundary() {
+        // ABORTED is not a real ABORT prefix.
+        let p = ParsedEscalate::from_reason("ABORTED a misnomer");
+        assert_eq!(p.kind, EscalateKind::NeedUserInput);
+        assert_eq!(p.reason, "ABORTED a misnomer");
+    }
+
+    #[test]
+    fn revert_without_separator_keeps_phase_only() {
+        // No dash → entire tail is the phase name, reason empty.
+        let p = ParsedEscalate::from_reason("REVERT_TO_PHASE plan-eng");
+        assert_eq!(p.kind, EscalateKind::Revert);
+        assert_eq!(p.target_phase.as_deref(), Some("plan-eng"));
+        assert_eq!(p.reason, "");
+    }
+
+    #[test]
+    fn empty_reason_after_prefix_is_handled() {
+        let p = ParsedEscalate::from_reason("ABORT");
+        assert_eq!(p.kind, EscalateKind::Abort);
+        assert_eq!(p.reason, "");
+    }
 }
 
 fn now_rfc3339() -> String {
