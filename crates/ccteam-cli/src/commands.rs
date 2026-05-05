@@ -263,6 +263,8 @@ pub struct DoctorOptions {
     /// `Some("rob")` ⇒ creates `~/projects/rob-meta/` and triggers
     /// `install_skill` regardless of its standalone flag.
     pub install_meta_agent: Option<String>,
+    /// M2.5: register `mcpServers.ccteam` in `~/.claude.json`.
+    pub install_mcp: bool,
 }
 
 /// `ccteam doctor` dispatch. Returns a human-readable report so unit
@@ -271,7 +273,8 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
     let any_mode = opts.install_recommended_agents
         || opts.tool_surface
         || opts.install_skill
-        || opts.install_meta_agent.is_some();
+        || opts.install_meta_agent.is_some()
+        || opts.install_mcp;
     if !any_mode {
         return Ok(String::from(
             "ccteam doctor: pass at least one mode flag.\n\
@@ -284,7 +287,9 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
              --install-skill [--force]\n      \
              write ~/.claude/skills/ccteam-control/SKILL.md (M1.8).\n  \
              --install-meta-agent <user-handle>\n      \
-             bootstrap a meta-agent project for the given user (M1.0). Implies --install-skill.\n",
+             bootstrap a meta-agent project for the given user (M1.0). Implies --install-skill.\n  \
+             --install-mcp\n      \
+             register `mcpServers.ccteam` in ~/.claude.json so daily-driver claude + meta-agent see the 9-tool MCP server (M2.5).\n",
         ));
     }
     let mut out = String::new();
@@ -303,6 +308,22 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
     if let Some(handle) = &opts.install_meta_agent {
         out.push_str(&render_install_meta_agent_report(paths, handle)?);
     }
+    if opts.install_mcp {
+        out.push_str(&render_install_mcp_report()?);
+    }
+    Ok(out)
+}
+
+fn render_install_mcp_report() -> Result<String> {
+    let path = crate::mcp_serve::install_mcp()?;
+    let mut out = String::from("ccteam doctor --install-mcp\n\n");
+    out.push_str(&format!("  registered ccteam MCP server in {}\n", path.display()));
+    out.push_str("  tools surface : 9 (interfaces §12.2)\n");
+    out.push_str("  consumers     : daily-driver claude + meta-agent\n");
+    out.push('\n');
+    out.push_str(
+        "open a new claude session to pick up the change; existing sessions need /reload-mcp.\n",
+    );
     Ok(out)
 }
 
@@ -580,7 +601,7 @@ pub fn collect_projects(paths: &CcteamPaths) -> Result<Vec<ProjectSummary>> {
     Ok(out)
 }
 
-fn collect_recent_events(
+pub fn collect_recent_events(
     paths: &CcteamPaths,
     slug: &str,
     n: usize,

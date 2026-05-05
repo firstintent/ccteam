@@ -1053,6 +1053,7 @@ ccteam doctor --install-recommended-agents        # M0.5.5 ln -sf 8 个 plugin a
 ccteam doctor --tool-surface                      # M0.5.6 phase tools_required 交叉表
 ccteam doctor --install-skill                     # M1.8 写 ccteam-control skill
 ccteam doctor --install-meta-agent <user-handle>  # M1.0 创建 meta-agent 项目(含 --install-skill)
+ccteam doctor --install-mcp                       # M2.5 在 ~/.claude.json 注册 mcpServers.ccteam(详见 §12)
 ccteam hook <subcmd>                              # debug:手动跑 hook(读 stdin JSON,写 stdout);
                                                   # subcmd ∈ {progress-append, parse-phase-end,
                                                   # cost-accumulate, load-context, block-push}
@@ -1160,23 +1161,34 @@ orchestrator 识别 `state.team == "meta-agent"` 走 `process_meta_project` 分�
 
 由 `ccteam doctor --install-mcp` 写入(M2 release)。`ccteam mcp-serve` 是 binary 子命令,stdio 协议。
 
-### 12.2 暴露的 tool 清单(M2 起步集)
+### 12.2 暴露的 tool 清单(M2.5 起,9 tool)
 
-| Tool 名 | 对应 CLI | 入参 | 返回 |
+| Tool 名 | 对应 CLI / 行为 | 入参 | 返回 |
 |---|---|---|---|
-| `ccteam__ls` | `ccteam ls --format json` | `{}` | §10.3 ls JSON schema |
+| `ccteam__ls` | `ccteam ls --format json` | `{}` | §10.3 ls JSON schema(扩 `team`) |
 | `ccteam__show` | `ccteam show <slug> --format json` | `{slug: string}` | §10.3 show JSON schema |
-| `ccteam__new` | `ccteam new "..."` | `{prompt: string, priority?: "low"\|"normal"\|"high", mode?: "yolo"\|"balanced"\|"careful"}` | `{slug: string, workspace: string}` |
-| `ccteam__peek` | `ccteam peek <slug>` | `{slug: string, lines?: number}` | `{capture: string, ts: string}` |
-| `ccteam__progress` | `ccteam progress <slug>` | `{slug: string, phase?: string, last_n?: number}` | `{events: [...]}` |
-| `ccteam__pause` | `ccteam pause <slug>` | `{slug: string}` | `{ok: bool}` |
-| `ccteam__resume` | `ccteam resume <slug>` | `{slug: string}` | `{ok: bool}` |
+| `ccteam__new` | `ccteam new "..."` | `{prompt: string, team?: string}` | `{slug: string, workspace: string}` |
+| `ccteam__peek` | `ccteam peek <slug>` | `{slug: string}` | tmux capture-pane stdout 字符串 |
+| `ccteam__progress` | `ccteam progress <slug>` | `{slug: string, last_n?: number}` | `{events: [...]}` |
+| `ccteam__pause` | 设 `state.user_pause_pending=true` | `{slug: string}` | `{ok: bool, slug: string, user_pause_pending: bool}` |
+| `ccteam__resume` | `ccteam resume <slug>` | `{slug: string}` | `{ok: bool, slug: string}` |
+| `ccteam__send_to_session`(M2.5 新)| 原子写 `<session>/.ccteam/inbox/msg-<ts>-NNN.md`(§3.4.2)| `{session: string, body: string, content_type?: "text"\|"markdown"}` | `{ok: bool, session: string, inbox_file: string}` |
+| `ccteam__inject_decision`(M2.5 新)| 构造 ESCALATE-shape payload(§4.1.1),走 `send_to_session` 落 inbox | `{slug: string, escalate_kind: "revert_to_phase"\|"need_user_input"\|"abort"\|"insufficient_clarification"\|"phase_done_pending", args?: {target_phase?: string, reason?: string}}` | `{ok: bool, slug: string, inbox_file: string}` |
+
+`send_to_session` / `inject_decision` 是 M2.5 增量(meta-agent 主消费者):
+让 meta-agent 把用户的回复 / 决策推送回项目 session,**adapter 进程内不做
+任何 NL 解析 / LLM 调用**,Symphony 反模式禁止(tech-design §3.1)。
+
+`ccteam__inject_decision` 内部是 `send_to_session` 的 thin wrapper —— 把
+`escalate_kind` 翻成 markdown payload(显式标记 `**META-AGENT DECISION**`
++ ESCALATE shape),然后走同一条 inbox 路径。
 
 ### 12.3 不暴露的(M2 显式排除)
 
 - `ccteam attach` — tty 交互,MCP 协议不适合
 - `ccteam start / stop` — orchestrator 生命周期管理是 ops 决策,不让 LLM 误调
 - `ccteam memory rebuild` — 重操作,走 CLI
+- `ccteam doctor --install-*` — 单机配置变更,走 CLI(避免 MCP server 给 LLM 改 ~/.claude.json 的能力)
 
 ### 12.4 双消费者
 

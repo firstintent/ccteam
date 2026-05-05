@@ -1,6 +1,7 @@
 //! `ccteam` binary entry point.
 
 mod commands;
+mod mcp_serve;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -91,6 +92,11 @@ enum Command {
     },
     /// Resume a paused / escalated project (re-arm phase_state=idle).
     Resume { slug: String },
+    /// M2.5: run the ccteam MCP server (stdio JSON-RPC). Wired into
+    /// `~/.claude.json` `mcpServers.ccteam` by `ccteam doctor
+    /// --install-mcp` so daily-driver claude sessions and the meta
+    /// agent both see the 9-tool surface (interfaces §12).
+    McpServe,
     /// Stop the running orchestrator daemon. Sends SIGTERM via the
     /// pidfile so the loop drains gracefully. Does **not** kill any
     /// tmux sessions — `ccteam start` reattaches to them on next launch
@@ -127,6 +133,12 @@ enum Command {
         /// the value (e.g. `--install-meta-agent rob`).
         #[arg(long, value_name = "HANDLE")]
         install_meta_agent: Option<String>,
+        /// M2.5: register `mcpServers.ccteam` in `~/.claude.json` so
+        /// daily-driver claude + meta-agent both see the ccteam MCP
+        /// server (9 tools, interfaces §12). Idempotent — overwrites
+        /// any prior `ccteam` server entry but preserves other servers.
+        #[arg(long, default_value_t = false)]
+        install_mcp: bool,
     },
 }
 
@@ -183,6 +195,15 @@ fn main() -> Result<()> {
             let paths = CcteamPaths::from_env()?;
             commands::run_resume(&paths, &slug)
         }
+        Command::McpServe => {
+            init_tracing();
+            let paths = CcteamPaths::from_env()?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("build tokio runtime for mcp-serve")?;
+            runtime.block_on(mcp_serve::run_mcp_serve(paths))
+        }
         Command::Stop => run_stop(),
         Command::Doctor {
             install_recommended_agents,
@@ -191,6 +212,7 @@ fn main() -> Result<()> {
             tool_surface,
             install_skill,
             install_meta_agent,
+            install_mcp,
         } => run_doctor(commands::DoctorOptions {
             install_recommended_agents,
             dry_run,
@@ -198,6 +220,7 @@ fn main() -> Result<()> {
             tool_surface,
             install_skill,
             install_meta_agent,
+            install_mcp,
         }),
     }
 }
