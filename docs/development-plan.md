@@ -358,40 +358,62 @@ M0.15 ─→ M0.5.1 (ln -sf agents) ─→ M0.5.3 (tools_required 校验) ─→
         ↓                          ↓
         M0.5.2 (skills 占位)      M0.5.5 / M0.5.6 (doctor)
         ↓
-M0.5.7 ─→ M1.1 (telegram) ─→ M1.2 (多项目) ─→ M1.5 (重启恢复) ─┬─→ M1.6 (cross-cutting watcher) ─→ M1.7 (L3 fork 决策)
-                                                                └─→ M2.1 (Seed) ─→ M2.5 (Critic 隔离) ─┬─→ M2.6 (sub-skill 调度)
-                                                                                                       └─→ M2.7 (agent_team 启用)
-                                                                                                         ↓
-                                                                                          M3.1 (P0 audit 修复 — 含 F20/F21)
-                                                                                                         ↓
-                                                                                          M3.2 (team.yaml schema) ─→ M3.3 (--team CLI)
-                                                                                                         ↓
-                                                                                          M3.4 (phases-research) ─→ M3.5 (research E2E)
-                                                                                                         ↓
-                                                                  ┌──────────────────────┴──────────────────────┐
-                                                                  ↓                                              ↓
-                                                         M4.1 (team-aware retro)                       M5.1 (Critic data-driven)
-                                                         M4.2 (RAG, namespace)                         M5.2 (anti-leniency strictness)
-                                                         M4.3 (Seed RAG)                               M5.3 (WEAK BLOCK config)
-                                                         M4.6 (meta-agent continuity)                  M5.4 (per-project 自适应)
-                                                         M4.7/4.8 (audit 矩阵 + 投票)                  M5.5 (cache opt)
-                                                         M4.10 (multi_session)
+M0.5.7 ─→ M1.0 (meta-agent 骨架) ─┬─→ M1.1 (inbox/outbox 协议加固)
+                                  │
+                                  ├─→ M1.2 (多项目并发) ─→ M1.5 (重启恢复) ─┬─→ M1.6 (watcher) ─→ M1.7 (L3 NL 通道)
+                                  │                                          │
+                                  │                                          └─→ M2.1 (Seed) ─→ M2.5 (Critic 隔离) ─┬─→ M2.6 (sub-skill)
+                                  │                                                                                  └─→ M2.7 (agent_team)
+                                  └─→ M1.4 (项目 CLAUDE.md 兑现到 meta)                                                  ↓
+                                                                                                              M3.1 (P0 audit 修复)
+M0.11 ─→ M1.8 (ccteam-control skill)                                                                                     ↓
+                                                                                                               M3.2 (team.yaml schema) ─→ M3.3 (--team CLI)
+              M1.3 (meta dispatch E2E) ← 汇合 {M1.0, M1.1, M1.8}                                                          ↓
+              (M1 acceptance gate,不阻塞 M2)                                                                    M3.4 (phases-research) ─→ M3.5 (research E2E)
+                                                                                                                          ↓
+                                                                                                                          ├──────────────────────┐
+                                                                                                                          ↓                      ↓
+                                                                                                                M4.1 (team-aware retro)  M5.1 (Critic data-driven)
+                                                                                                                M4.2 (RAG, namespace)    M5.2 (anti-leniency)
+                                                                                                                M4.3 (Seed RAG)          M5.3 (WEAK BLOCK config)
+                                                                                                                M4.6 (meta continuity)   M5.4 (per-project 自适应)
+                                                                                                                M4.7/4.8 (audit + 投票)  M5.5 (cache opt)
+                                                                                                                M4.10 (multi_session)
 ```
 
-**关键变化(2026-05-05 reorder)**:
-- M3 = Team Abstraction(原 M4.5 提案)插入到记忆 / Critic 之前 —— retro_schema 与
-  critic_dimensions 从 day 1 就团队感知,避免 M4 / M5 完工后再被迫推倒重来
-- 旧 M3.1–M3.10 → 新 M4.1–M4.11(顺移,且 M4.1 retro 改为 team-aware schema)
-- 旧 M4.1–M4.6 → 新 M5.1–M5.6(顺移,且 M5.1/5.2/5.3 改为 config-driven)
-- 旧 M5(Symphony)→ 新 M6
+**关键变化(按时间倒序)**:
 
-不在关键路径上的(可与主线并行):M1.4(项目 CLAUDE.md)、M1.8(ccteam-control skill)、
-M1.9(多轮 CLARIFY)、M2.4(golden-rules)、M2.8(ccteam-mcp MCP server)、M3.6(meta-agent
-skill 集占位)、M4.4(anti-patterns)、M4.5(claude-mem MCP)、M4.9(新插件挂载)、
+- **2026-05-06 M1 reframe**(三层架构落定后):
+  - 旧 M1.1(Telegram bot 入口)下沉到 M2+ Channel Layer,优先复用开源方案,**不在 ccteam 主代码库**
+  - 新 M1.0(meta-agent session 骨架)成为 M1 的根节点,所有 M1 任务都从此分叉
+  - 新 M1.1(inbox/outbox 协议加固)是 channel layer 接入面契约,与 M1.2/M1.3 并联
+  - M1.3(meta dispatch E2E)汇合 M1.0 + M1.1 + M1.8,作为 **M1 acceptance gate**,但**不阻塞 M2 启动**
+  - M1.7 改"L3 fork ABC structured push" → "L3 fork 走 NL 通道"(经 meta-agent NL 解析,见 M1 §3.7)
+  - 旧 M1.9(多轮 CLARIFY)→ 推 M2,M1 用 "tmux attach 直接 NL 对话"覆盖
+
+- **2026-05-05 milestone reorder**:
+  - M3 = Team Abstraction(原 M4.5 提案)插入到记忆 / Critic 之前 —— retro_schema 与
+    critic_dimensions 从 day 1 就团队感知,避免 M4 / M5 完工后再被迫推倒重来
+  - 旧 M3.1–M3.10 → 新 M4.1–M4.11(顺移,且 M4.1 retro 改为 team-aware schema)
+  - 旧 M4.1–M4.6 → 新 M5.1–M5.6(顺移,且 M5.1/5.2/5.3 改为 config-driven)
+  - 旧 M5(Symphony)→ 新 M6
+
+**不在关键路径上的(可与主线并行)**:M1.3(M1 acceptance gate,不阻塞 M2)、
+M1.4(项目 CLAUDE.md)、M1.8(ccteam-control skill,M1.3 依赖但与 M1.0/1.1/1.2 主链并行)、
+M2.4(golden-rules)、M2.8(ccteam-mcp MCP server)、M3.6(meta-agent skill 集占位)、
+M4.4(anti-patterns)、M4.5(claude-mem MCP)、M4.9(新插件挂载)、
 M4.11(ratatui TUI,机会主义)、M5.4(评审自适应)、M5.6(web dashboard,机会主义)。
 
 **关键路径终点**(因 M4.10):M2.7 → M4.10 成为新关键路径终点之一(痛点 13 最终落地);
 M2.7 卡住整条 multi-agent 速度并行链。
+
+**M1 内部依赖说明**(图中无法完整呈现的边):
+
+- M1.3 = `merge(M1.0, M1.1, M1.8)` —— meta-agent 骨架 + 协议 + 控制 skill 三齐才能跑端到端 NL 派单
+- M1.5 仅依赖 M1.2(重启恢复是多项目调度的扩展能力)
+- M1.6 仅依赖 M1.5(watcher 跑在已经能 reattach 的 session 上)
+- M1.7 依赖 M1.6 + M1.0(L3 NL 通道既要 watcher 报警,也要 meta-agent 解析 NL 回复)
+- **关键路径(M1 → M2)**:M1.0 → M1.2 → M1.5 → M2.1。M1.1 / M1.3 / M1.6 / M1.7 / M1.8 都是 M1 内部完成度要求,不卡 M2 启动
 
 ---
 
@@ -402,7 +424,7 @@ M2.7 卡住整条 multi-agent 速度并行链。
 | Claude Code 协议变更(hook 字段、CLI flag) | 中 | M0 整体阻塞 | 锁定测试过的 `claude --version`;CI 新版本 smoke test |
 | ralph-loop Stop hook 范式与 ccteam 自有 Stop hook 互相冲突 | 中 | M0.12 卡住 | 不挂两个 hook,把 ralph 逻辑合到 parse-phase-end.sh(见 §2.3) |
 | context reset 后行为不一致(新 session 把 CLAUDE.md 桥接信息当独立任务做) | 中 | M0.10 不可用 | M0.10 必须包含至少 3 个真实项目的 reset 验证用例 |
-| Telegram bot 平台变更或封号 | 低 | M1 入口断 | 双通道 fallback:邮件 + 文件 inbox(已在 §3.8) |
+| Channel Layer 适配器(M2+)外部依赖变更或封号 | 低 | 远程入口断,但终端 attach + 文件 inbox 不受影响 | 三层架构已隔离:M1 不依赖任何 channel,channel adapter 是 M2+ 可插拔件,挂一个补一个 |
 | 向量索引方案选错(自建 vs claude-mem) | 中 | M3 阻塞 | M3.2 与 M3.5 并行 spike 1 周,择优 |
 | 估算偏差累积 | 高 | 整体延期 | 每个里程碑结束做 retro,把实际工时回填本文 |
 
