@@ -193,17 +193,21 @@ Claude Code 对 `~/.claude/skills/`、项目 `.claude/skills/`、`--add-dir`
 - Agent 文件(`~/.claude/agents/<name>.md`)文档没明说是否实时监听 ——
   **需要实测**,见下面探针。
 
-#### 1.2.5 实测结果:agent **不**热加载
+#### 1.2.5 实测结果:agent **不**热加载,但 startup 时 ln 进去就能用
 
-**已验证(2026-05-05)**:
+**完整验证链(2026-05-05,真长会话实测)**:
 
-1. 长会话里 `Task(subagent_type="code-reviewer")` → `Agent type 'code-reviewer' not found. Available agents: claude-code-guide, Explore, general-purpose, Plan, statusline-setup`
-2. 在另一终端 `ln -sf ~/.claude/plugins/.../pr-review-toolkit/agents/code-reviewer.md ~/.claude/agents/code-reviewer.md`
-3. 回长会话(**未退出 / 未 /reload-plugins**),再次 `Task(subagent_type="code-reviewer")` → **仍然** `Agent type 'code-reviewer' not found`,Available agents 列表没变
+| 步骤 | 状态 | 结果 |
+|---|---|---|
+| ① 仅装 plugin,长会话调 `Task(subagent_type="code-reviewer")` | ❌ | `Agent type 'code-reviewer' not found. Available agents: claude-code-guide, Explore, general-purpose, Plan, statusline-setup` |
+| ② 不退出会话,另一终端 `ln -sf <plugin>/agents/code-reviewer.md ~/.claude/agents/` | — | 软链已建,但当前会话不感知 |
+| ③ 同会话(未 `/exit`、未 `/reload-plugins`),重跑 Task 调用 | ❌ | 仍然 `Agent type 'code-reviewer' not found`,Available 列表没变 |
+| ④ `/exit` 长会话 + 重新启动 claude(此时 `~/.claude/agents/code-reviewer.md` 已就位) | — | — |
+| ⑤ 重启后会话再调 `Task(subagent_type="code-reviewer")` | ✅ | code-reviewer 正常初始化、执行、返回响应 |
 
-**结论与 skill 不同**:
-- Skill 的 SKILL.md 文件实时监听,中途加生效
-- `~/.claude/agents/<name>.md` **在会话启动时一次性扫描**,中途加文件不生效
+**最终结论**:
+- Skill 的 SKILL.md 文件**实时监听**,中途加生效(§1.2.4)
+- `~/.claude/agents/<name>.md` **会话启动时一次性扫描**,**中途加不生效**;但 startup 时已存在的 agent 文件**正常被识别**——所以 M1 `bootstrap_project` 在 `tmux new-session` 之前 ln -sf 这条路**完全可行**(已实测确认)
 
 #### 1.2.6 给 ccteam M1 `bootstrap_project` 的强约束
 
