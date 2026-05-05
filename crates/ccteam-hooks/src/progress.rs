@@ -1,14 +1,15 @@
 //! `ccteam hook progress-append <event-type>` — append one event line
-//! to `~/.ccteam/progress/<slug>.jsonl`.
+//! to `~/.ccteam/progress/<slug>.jsonl`. The actual JSONL append lives
+//! in `ccteam_core::progress::append_event`; this module only handles
+//! Claude Code → ccteam event-shape translation.
 
-use std::io::Write;
 use std::path::Path;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use chrono::{SecondsFormat, Utc};
 use serde_json::{json, Value};
 
-use ccteam_core::{slug_from_project_dir, CcteamPaths};
+use ccteam_core::{progress::append_event, slug_from_project_dir, CcteamPaths};
 
 pub fn progress_append(paths: &CcteamPaths, event_type: &str, stdin: &Value) -> Result<()> {
     let cwd = stdin
@@ -47,18 +48,5 @@ pub fn progress_append(paths: &CcteamPaths, event_type: &str, stdin: &Value) -> 
         event["exit_code"] = json!(exit);
     }
 
-    let line = serde_json::to_string(&event)? + "\n";
-    let progress_path = paths.progress_jsonl(&slug);
-    if let Some(parent) = progress_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
-    }
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&progress_path)
-        .with_context(|| format!("open {}", progress_path.display()))?;
-    f.write_all(line.as_bytes())
-        .with_context(|| format!("append to {}", progress_path.display()))?;
-    Ok(())
+    append_event(&paths.progress_jsonl(&slug), &event)
 }

@@ -4,14 +4,13 @@
 //! `phase_done` / `escalate` event to progress.jsonl. M0.12 layers the
 //! ralph-loop block-decision behavior on top.
 
-use std::io::Write;
 use std::path::Path;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use chrono::{SecondsFormat, Utc};
 use serde_json::{json, Value};
 
-use ccteam_core::{slug_from_project_dir, CcteamPaths};
+use ccteam_core::{progress::append_event, slug_from_project_dir, CcteamPaths};
 
 use crate::transcript::{last_assistant_message, message_text};
 
@@ -29,10 +28,10 @@ pub fn parse_phase_end(paths: &CcteamPaths, stdin: &Value) -> Result<()> {
     let progress_path = paths.progress_jsonl(&slug);
 
     let Some(msg) = last_assistant_message(Path::new(transcript_path))? else {
-        return Ok(()); // no assistant message yet
+        return Ok(());
     };
     let Some(text) = message_text(&msg) else {
-        return Ok(()); // assistant message had no text block
+        return Ok(());
     };
 
     let last_line = text
@@ -58,19 +57,9 @@ pub fn parse_phase_end(paths: &CcteamPaths, stdin: &Value) -> Result<()> {
         })
     };
 
-    let Some(event) = event else { return Ok(()) };
-
-    if let Some(parent) = progress_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+    if let Some(event) = event {
+        append_event(&progress_path, &event)?;
     }
-    let line = serde_json::to_string(&event)? + "\n";
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&progress_path)
-        .with_context(|| format!("open {}", progress_path.display()))?;
-    f.write_all(line.as_bytes())?;
     Ok(())
 }
 

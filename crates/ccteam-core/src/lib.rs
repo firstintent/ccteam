@@ -5,6 +5,7 @@
 pub mod orchestrator;
 pub mod paths;
 pub mod phases;
+pub mod progress;
 pub mod state;
 pub mod templates;
 pub mod tmux;

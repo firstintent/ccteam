@@ -16,10 +16,14 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use chrono::{SecondsFormat, Utc};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use serde_json::json;
 
 use crate::paths::CcteamPaths;
 use crate::phases::PhaseTemplate;
+use crate::progress;
+use crate::tmux::TmuxSession;
 
 #[derive(Debug, Clone)]
 pub struct OrchestratorConfig {
@@ -71,6 +75,35 @@ impl Orchestrator {
 
     pub fn paths(&self) -> &CcteamPaths {
         &self.paths
+    }
+
+    /// Inject `phase`'s prompt into `slug`'s tmux session, picking
+    /// `send-keys` vs `/btw` based on the last progress event
+    /// (tech-design §6.9 idle-aware injection). Appends a
+    /// `phase_inject` event so the next idle-check sees a non-idle
+    /// state until claude either runs a tool (PreToolUse arrives) or
+    /// the prompt finishes and a Stop fires.
+    pub fn dispatch_phase(&self, slug: &str, phase: &str) -> Result<()> {
+        let progress_path = self.paths.progress_jsonl(slug);
+        let last = progress::last_event(&progress_path)?;
+        let idle = progress::is_idle(last.as_ref());
+
+        let prompt = progress::build_phase_prompt(phase);
+        let message = progress::idle_aware_message(&prompt, idle);
+
+        let session = TmuxSession::for_slug(slug);
+        session
+            .send_keys(&message)
+            .with_context(|| format!("send phase prompt to ccteam-{slug}"))?;
+
+        let event = json!({
+            "ts": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            "event": "phase_inject",
+            "phase": phase,
+            "idle": idle,
+        });
+        progress::append_event(&progress_path, &event)?;
+        Ok(())
     }
 
     /// Run until `shutdown` resolves. Each tick + each progress event
