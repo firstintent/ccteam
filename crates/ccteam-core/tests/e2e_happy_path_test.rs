@@ -75,7 +75,7 @@ fn full_pipeline_advances_through_every_m0_phase() {
 
     let slug = slugify(request);
     ensure_isolation();
-    bootstrap_project(&paths, &slug, request).unwrap();
+    bootstrap_project(&paths, &slug, request, "dev").unwrap();
 
     let dag = dev_dag();
 
@@ -164,7 +164,7 @@ fn full_pipeline_runs_three_times_without_leaking_state() {
         let paths = fresh(&tmp);
         let slug = slugify(&format!("smoke {run}"));
         ensure_isolation();
-        bootstrap_project(&paths, &slug, "smoke").unwrap();
+        bootstrap_project(&paths, &slug, "smoke", "dev").unwrap();
         let state_path = paths.project_state(&slug);
 
         for phase in M0_DAG {
@@ -218,7 +218,7 @@ fn pipeline_halts_on_escalate_event_mid_dag() {
     let paths = fresh(&tmp);
     let slug = slugify("escalate-test");
     ensure_isolation();
-    bootstrap_project(&paths, &slug, "escalate test").unwrap();
+    bootstrap_project(&paths, &slug, "escalate test", "dev").unwrap();
     let state_path = paths.project_state(&slug);
 
     let dag = dev_dag();

@@ -12,6 +12,7 @@ fn sample_state() -> ProjectState {
     let t0 = Utc.with_ymd_and_hms(2026, 5, 4, 10, 23, 0).unwrap();
     ProjectState {
         slug: "bookmark-mgr-a3f9".into(),
+        team: "dev".into(),
         created_at: t0,
         tmux_session: "ccteam-bookmark-mgr-a3f9".into(),
         claude_session_id: Some("abc123-def-456".into()),

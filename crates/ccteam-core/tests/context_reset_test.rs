@@ -26,6 +26,7 @@ fn fresh_state(slug: &str, current_phase: &str) -> ProjectState {
     let now = Utc::now();
     ProjectState {
         slug: slug.into(),
+        team: "dev".into(),
         created_at: now,
         tmux_session: TmuxSession::for_slug(slug).name().into(),
         claude_session_id: None,

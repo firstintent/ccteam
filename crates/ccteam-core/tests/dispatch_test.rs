@@ -63,6 +63,7 @@ fn fixture(test_name: &str) -> Option<(TempDir, CcteamPaths, String, ScopedSessi
     let now = chrono::Utc::now();
     ProjectState {
         slug: slug.clone(),
+        team: "dev".into(),
         created_at: now,
         tmux_session: TmuxSession::for_slug(&slug).name().to_string(),
         claude_session_id: None,

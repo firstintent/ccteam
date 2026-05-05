@@ -42,6 +42,7 @@ mod tests {
         let now = Utc::now();
         ProjectState {
             slug: "demo".into(),
+            team: "dev".into(),
             created_at: now,
             tmux_session: "ccteam-demo".into(),
             claude_session_id: None,

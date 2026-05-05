@@ -94,14 +94,20 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
     Ok(out)
 }
 
-/// `ccteam new "request"`. Bootstraps a project on disk and returns
-/// the chosen slug. Side effects: creates `~/projects/<slug>/...`.
-pub fn run_new(paths: &CcteamPaths, request: &str) -> Result<String> {
+/// `ccteam new "request" --team <name>`. Bootstraps a project on disk
+/// and returns the chosen slug. Side effects: creates
+/// `~/projects/<slug>/...`. `team` is recorded in state.json so the
+/// orchestrator can route this project through the matching phase set
+/// (M3.1 F12/F13 — non-dev teams land in M3.4).
+pub fn run_new(paths: &CcteamPaths, request: &str, team: &str) -> Result<String> {
     if request.trim().is_empty() {
         bail!("ccteam new: request must be non-empty");
     }
+    if team.trim().is_empty() {
+        bail!("ccteam new: --team must be non-empty");
+    }
     let slug = pick_unused_slug(paths, request)?;
-    bootstrap_project(paths, &slug, request)?;
+    bootstrap_project(paths, &slug, request, team)?;
     Ok(slug)
 }
 
@@ -738,7 +744,7 @@ mod tests {
         ensure_isolation();
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
-        let slug = run_new(&paths, "Build a bookmark manager").unwrap();
+        let slug = run_new(&paths, "Build a bookmark manager", "dev").unwrap();
         assert!(slug.starts_with("build-a-bookmark-manager"));
         let project = paths.project_dir(&slug);
         assert!(project.join(".ccteam/spec.md").exists());
@@ -751,8 +757,63 @@ mod tests {
     fn run_new_rejects_empty_request() {
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
-        let err = run_new(&paths, "   \n\t").unwrap_err();
+        let err = run_new(&paths, "   \n\t", "dev").unwrap_err();
         assert!(format!("{err:#}").contains("non-empty"));
+    }
+
+    #[test]
+    fn run_new_rejects_empty_team() {
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let err = run_new(&paths, "build something", "  ").unwrap_err();
+        assert!(format!("{err:#}").contains("--team"));
+    }
+
+    #[test]
+    fn run_new_records_team_in_state_json() {
+        // M3.1 F12/F13: --team must persist into state.json so the
+        // orchestrator can route this project's phase set.
+        ensure_isolation();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let slug = run_new(&paths, "research project", "research").unwrap();
+        let state = ProjectState::load(&paths.project_state(&slug)).unwrap();
+        assert_eq!(state.team, "research");
+    }
+
+    #[test]
+    fn legacy_state_json_without_team_field_loads_as_dev() {
+        // F13 backwards-compat: state.json files written by pre-M3.1
+        // ccteam don't have a `team` field; serde default kicks in.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("state.json");
+        // Hand-rolled JSON missing the `team` key:
+        let body = r#"{
+            "slug": "legacy",
+            "created_at": "2026-05-01T00:00:00Z",
+            "tmux_session": "ccteam-legacy",
+            "claude_session_id": null,
+            "claude_pid": null,
+            "phase_state": "idle",
+            "current_phase": "",
+            "parallelism": "solo",
+            "phase_history": [],
+            "fix_cycle_count": 0,
+            "cost_used_usd": 0.0,
+            "soft_warn_threshold_usd": 20.0,
+            "hard_kill_threshold_usd": 200.0,
+            "context_tokens_used": 0,
+            "context_reset_threshold_tokens": 600000,
+            "context_reset_count": 0,
+            "last_progress_event_at": null,
+            "last_event_type": null,
+            "last_user_interaction_at": "2026-05-01T00:00:00Z",
+            "user_attached": false,
+            "user_pause_pending": false
+        }"#;
+        std::fs::write(&path, body).unwrap();
+        let s = ProjectState::load(&path).unwrap();
+        assert_eq!(s.team, "dev");
     }
 
     #[test]
@@ -768,8 +829,8 @@ mod tests {
         ensure_isolation();
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
-        run_new(&paths, "demo one").unwrap();
-        run_new(&paths, "demo two").unwrap();
+        run_new(&paths, "demo one", "dev").unwrap();
+        run_new(&paths, "demo two", "dev").unwrap();
 
         let body = run_ls(&paths, OutputFormat::Json).unwrap();
         let v: Value = serde_json::from_str(&body).unwrap();
@@ -783,7 +844,7 @@ mod tests {
         ensure_isolation();
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
-        let slug = run_new(&paths, "demo").unwrap();
+        let slug = run_new(&paths, "demo", "dev").unwrap();
         let body = run_show(&paths, &slug, OutputFormat::Json).unwrap();
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["state"]["slug"], slug);
@@ -803,7 +864,7 @@ mod tests {
         ensure_isolation();
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
-        let slug = run_new(&paths, "demo").unwrap();
+        let slug = run_new(&paths, "demo", "dev").unwrap();
         // simulate an escalated state
         let state_path = paths.project_state(&slug);
         let mut state = ProjectState::load(&state_path).unwrap();
@@ -856,7 +917,7 @@ mod tests {
         ensure_isolation();
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
-        let slug = run_new(&paths, "demo").unwrap();
+        let slug = run_new(&paths, "demo", "dev").unwrap();
         progress::append_event(
             &paths.progress_jsonl(&slug),
             &json!({"event": "session_start", "ts": "2026-05-05T00:00:00Z"}),

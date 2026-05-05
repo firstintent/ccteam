@@ -81,15 +81,19 @@ pub fn pick_unused_slug(paths: &CcteamPaths, base: &str) -> Result<String> {
 
 /// Write the bootstrap files for a fresh project:
 /// - `<project>/.ccteam/spec.md` ← `request`
-/// - `<project>/.ccteam/state.json` ← `ProjectState::initial`
+/// - `<project>/.ccteam/state.json` ← `ProjectState::initial_for_team(slug, team)`
 /// - `<project>/.claude/settings.json` ← M0.4 template
 /// - `<project>/CLAUDE.md` ← header + spec link
+///
+/// `team` lands in state.json so the orchestrator can route this
+/// project through the matching phase set (M3.1 F12/F13).
 ///
 /// Returns the full project directory path.
 pub fn bootstrap_project(
     paths: &CcteamPaths,
     slug: &str,
     request: &str,
+    team: &str,
 ) -> Result<PathBuf> {
     let project_dir = paths.project_dir(slug);
     let ccteam_dir = paths.project_ccteam_dir(slug);
@@ -99,12 +103,12 @@ pub fn bootstrap_project(
     let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
     let spec_path = ccteam_dir.join("spec.md");
     let spec_body = format!(
-        "---\nslug: {slug}\ncreated_at: {now}\n---\n\n# 用户需求\n\n{request}\n",
+        "---\nslug: {slug}\ncreated_at: {now}\nteam: {team}\n---\n\n# 用户需求\n\n{request}\n",
     );
     std::fs::write(&spec_path, spec_body)
         .with_context(|| format!("write {}", spec_path.display()))?;
 
-    let state = ProjectState::initial(slug.to_string());
+    let state = ProjectState::initial_for_team(slug.to_string(), team.to_string());
     state.save(&paths.project_state(slug))?;
 
     write_project_settings(&project_dir)?;
@@ -427,7 +431,7 @@ mod tests {
             projects_root: tmp.path().join("projects"),
         };
         let slug = "demo";
-        bootstrap_project(&paths, slug, "demo request").unwrap();
+        bootstrap_project(&paths, slug, "demo request", "dev").unwrap();
         let phases_dir = paths.project_dir(slug).join(".ccteam/phases");
         assert!(phases_dir.join("plan-eng.md").exists());
         assert!(phases_dir.join("implement.md").exists());
@@ -450,7 +454,7 @@ mod tests {
             root: tmp.path().join("home"),
             projects_root: tmp.path().join("projects"),
         };
-        bootstrap_project(&paths, "demo", "demo request").unwrap();
+        bootstrap_project(&paths, "demo", "demo request", "dev").unwrap();
         let skills = paths.project_dir("demo").join(".claude/skills");
         assert!(
             skills.is_dir(),
@@ -466,7 +470,7 @@ mod tests {
             root: tmp.path().join("home"),
             projects_root: tmp.path().join("projects"),
         };
-        bootstrap_project(&paths, "demo", "demo request").unwrap();
+        bootstrap_project(&paths, "demo", "demo request", "dev").unwrap();
         let settings = paths.project_dir("demo").join(".claude/settings.json");
         let body = std::fs::read_to_string(&settings).unwrap();
         let v: Value = serde_json::from_str(&body).unwrap();

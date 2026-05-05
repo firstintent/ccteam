@@ -125,7 +125,7 @@ fn fresh_project_passes_tool_surface_validator_for_shipped_implement() {
     write_global_phases_with_implement(&paths.phases_dir());
 
     let slug = slugify("review smoke");
-    bootstrap_project(&paths, &slug, "review smoke").unwrap();
+    bootstrap_project(&paths, &slug, "review smoke", "dev").unwrap();
 
     // Confirm bootstrap actually placed the symlink — this is the
     // M0.5.1 + M0.5.3 contract.
@@ -227,7 +227,7 @@ fn missing_code_reviewer_fails_orchestrator_construction_with_fix_hint() {
     // Bootstrap will warn (source missing) but not fail. The
     // orchestrator validator is what we expect to fail loudly.
     let slug = slugify("missing reviewer");
-    bootstrap_project(&paths, &slug, "missing reviewer").unwrap();
+    bootstrap_project(&paths, &slug, "missing reviewer", "dev").unwrap();
 
     let err = Orchestrator::new(paths, OrchestratorConfig::default()).unwrap_err();
     let msg = format!("{err:#}");

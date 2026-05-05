@@ -54,6 +54,12 @@ pub struct PhaseHistoryEntry {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectState {
     pub slug: String,
+    /// Team this project runs under — selects which phase template
+    /// set the orchestrator uses (M3.1 F13). serde-default `"dev"`
+    /// keeps state.json files written before M3.1 loadable as the
+    /// dev team, no migration script needed.
+    #[serde(default = "default_team")]
+    pub team: String,
     pub created_at: DateTime<Utc>,
     pub tmux_session: String,
     pub claude_session_id: Option<String>,
@@ -76,15 +82,27 @@ pub struct ProjectState {
     pub user_pause_pending: bool,
 }
 
+fn default_team() -> String {
+    "dev".into()
+}
+
 impl ProjectState {
     /// Default initial state for a freshly-created project. `current_phase`
     /// is left empty so the orchestrator's first tick reads it as
-    /// "no phase yet" and dispatches `FIRST_PHASE`.
+    /// "no phase yet" and dispatches the DAG entry node.
     pub fn initial(slug: String) -> Self {
+        Self::initial_for_team(slug, default_team())
+    }
+
+    /// Like `initial` but lets the caller pin the team. Used by
+    /// `bootstrap_project` so `ccteam new --team <name>` carries
+    /// through to state.json.
+    pub fn initial_for_team(slug: String, team: String) -> Self {
         let now = Utc::now();
         Self {
             tmux_session: format!("ccteam-{slug}"),
             slug,
+            team,
             created_at: now,
             claude_session_id: None,
             claude_pid: None,

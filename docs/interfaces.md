@@ -108,6 +108,7 @@
 ```json
 {
   "slug": "bookmark-mgr-a3f9",
+  "team": "dev",
   "created_at": "2026-05-04T10:23:00Z",
   "tmux_session": "ccteam-bookmark-mgr-a3f9",
   "claude_session_id": "abc123-def-456",
@@ -138,6 +139,8 @@
 **`phase_state` 枚举**:`in_flight` / `idle` / `fix_locked`(详见 tech-design §3.2)。
 
 **`parallelism` 枚举**:`solo` / `agent_team` / `multi_session`(详见 §5.1 phase schema)。
+
+**`team` 字段**(M3.1 F13):指定项目跑哪个团队的 phase 集合(默认 `dev`,M3.4 加 `research` 等)。serde 默认值 `"dev"`,所以 M3.1 之前写出的 state.json 自动以 dev 团队加载,无需迁移脚本。
 
 **原子写入**:`.tmp` + `rename`;启动校验 schema,损坏走 backup。
 
