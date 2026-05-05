@@ -17,9 +17,9 @@ pub mod tool_surface;
 
 pub use fix_loop::{FixLoopDecision, FixLoopFrontMatter, FixLoopState};
 pub use orchestrator::{
-    append_progress_summary, build_progress_summary, decide_tick, decide_tick_from_events,
-    is_terminal, next_phase, Orchestrator, OrchestratorConfig, TickAction, FIRST_PHASE,
-    M0_PHASE_DAG,
+    append_progress_summary, build_progress_summary, check_phase_tools, decide_tick,
+    decide_tick_from_events, is_terminal, next_phase, Orchestrator, OrchestratorConfig,
+    TickAction, FIRST_PHASE, M0_PHASE_DAG,
 };
 pub use projects::{bootstrap_project, pick_unused_slug, pre_trust_project, slugify};
 pub use cost::{classify as classify_cost, CostLevel, COST_MID_WARN_USD};
@@ -40,7 +40,8 @@ pub use templates::{
 pub use tmux::{pid_is_alive, session_name_for_slug, tmux_available, TmuxSession};
 pub use tool_surface::{
     ensure_skills_placeholders, link_recommended_agents, link_recommended_agents_into,
-    user_claude_dir, AgentLinkAction, AgentLinkReport, LinkOptions, RecommendedAgent,
+    missing_tools, user_claude_dir, AgentLinkAction, AgentLinkReport, LinkOptions,
+    MissingTool, RecommendedAgent, ToolSurfaceSnapshot, ToolsRequired, BUILTIN_SUBAGENTS,
     RECOMMENDED_AGENTS,
 };
 

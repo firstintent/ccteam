@@ -279,6 +279,13 @@ sub_skills:                       # 替人编排的 sub-skill(详见 §7)
   - skill: "claude-plugins-official:pr-review-toolkit/agents/code-reviewer"
     trigger: phase_done           # phase_start | phase_done(M0/M2 仅这两档)
     output_to: .ccteam/code-review.md
+tools_required:                   # M0.5+:phase 内会调用的工具,orchestrator 启动期校验(详见 §5.4)
+  subagents:                      # `Task(subagent_type="...")` 调到的 subagent 名
+    - code-reviewer               # 内置五个不必列(general-purpose / Explore / Plan / claude-code-guide / statusline-setup)
+  skills:                         # `Skill(skill="...")` 调到的 skill 名
+    - some-skill
+  mcp:                            # `mcp__<server>__<tool>` 引用的 MCP server 名
+    - playwright
 hooks:                            # phase 级 hook(项目级 hook 在 settings.json,详见 §6)
   before: scripts/snapshot-git.sh
   after: scripts/run-golden-rules.sh
@@ -328,6 +335,22 @@ confidence: 0.0-1.0
 - REJECT 时:列举具体理由(已有 X、成本不可持续、用户量级 < N)
 - CLARIFY 时:**只**提一个问题(prompt 显式约束;`24h` 无回答 → 自动归档)
 ```
+
+---
+
+### 5.4 `tools_required` 字段语义(M0.5+)
+
+声明 phase 模板里会用到的工具,orchestrator 启动时枚举本机可达项 + 交叉比对,缺谁报谁 + 给修复命令(`ccteam start` 直接 fail-fast,除非加 `--skip-tool-check`)。
+
+| 子字段 | 名字来源 | "可达"判定 |
+|---|---|---|
+| `subagents` | `Task(subagent_type="<name>")` | `~/.claude/agents/<name>.md` 存在(不要列内置五个,但列了无害) |
+| `skills` | `Skill(skill="<name>")` | `~/.claude/skills/<name>/SKILL.md` 或 `~/.claude/plugins/marketplaces/*/plugins/*/skills/<name>/SKILL.md` 存在 |
+| `mcp` | `mcp__<name>__<tool>` 工具前缀 | `~/.claude.json` 或 `~/.claude/mcp_servers.json` 的 `mcpServers` 含此 key |
+
+实测背景:plugin 装了 plugin 不等于 plugin agent 进 Task 注册表 —— 必须 ln -sf 到 `~/.claude/agents/` 才行(详见 [docs/claude-code-tool-surface.md §1.1.2 / §1.2.5](./claude-code-tool-surface.md))。所以 `tools_required.subagents` 列 `code-reviewer` 而 `~/.claude/agents/code-reviewer.md` 不存在 → orchestrator 拒绝启动并给出 `ccteam doctor --install-recommended-agents` 修复命令。
+
+`bootstrap_project` 已在 §1.2 项目创建路径里自动 ln -sf 八个推荐 agent + 占位 skills 目录,所以 happy path 上模板要的工具默认都有;只有用户手工编辑模板加了非推荐工具时才会触发本节的校验失败。
 
 ---
 

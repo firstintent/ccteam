@@ -98,6 +98,93 @@ fn orchestrator_accepts_empty_sub_skills_no_op() {
     Orchestrator::new(paths, OrchestratorConfig::default()).unwrap();
 }
 
+/// M0.5.3: phase that asks for an unreachable subagent must fail
+/// orchestrator startup with a fix hint. We point CLAUDE_CONFIG_HOME
+/// at an empty tempdir so only the five built-in subagents are
+/// reachable; `code-reviewer` is then guaranteed missing.
+#[test]
+fn orchestrator_fails_fast_when_phase_requests_missing_subagent() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fresh_paths(&tmp);
+    write_template(
+        &paths.phases_dir(),
+        "03-implement.md",
+        concat!(
+            "---\n",
+            "name: implement\n",
+            "parallelism: solo\n",
+            "tools_required:\n",
+            "  subagents: [code-reviewer]\n",
+            "---\n",
+            "body\n",
+        ),
+    );
+
+    // Isolated empty ~/.claude/ — only built-in subagents are reachable.
+    let fake_claude = tmp.path().join("claude-empty");
+    std::fs::create_dir_all(&fake_claude).unwrap();
+    let _guard = ScopedEnv::set("CLAUDE_CONFIG_HOME", fake_claude.to_str().unwrap());
+
+    let err = Orchestrator::new(paths, OrchestratorConfig::default()).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("code-reviewer"), "got: {msg}");
+    assert!(msg.contains("ccteam doctor"), "fix hint missing: {msg}");
+}
+
+#[test]
+fn orchestrator_skip_tool_check_bypasses_validator() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fresh_paths(&tmp);
+    write_template(
+        &paths.phases_dir(),
+        "03-implement.md",
+        concat!(
+            "---\n",
+            "name: implement\n",
+            "parallelism: solo\n",
+            "tools_required:\n",
+            "  subagents: [definitely-not-installed]\n",
+            "---\n",
+            "body\n",
+        ),
+    );
+
+    Orchestrator::new(
+        paths,
+        OrchestratorConfig {
+            skip_tool_check: true,
+            ..OrchestratorConfig::default()
+        },
+    )
+    .unwrap();
+}
+
+/// Tiny RAII helper for mutating a process-global env var inside a
+/// single test without leaking state to siblings. Tests that use this
+/// must serialize via Rust's default test serial pool — fine for our
+/// tiny number of CLAUDE_CONFIG_HOME consumers.
+struct ScopedEnv {
+    key: &'static str,
+    prior: Option<String>,
+}
+
+impl ScopedEnv {
+    fn set(key: &'static str, value: &str) -> Self {
+        let prior = std::env::var(key).ok();
+        std::env::set_var(key, value);
+        Self { key, prior }
+    }
+}
+
+impl Drop for ScopedEnv {
+    fn drop(&mut self) {
+        match &self.prior {
+            Some(v) => std::env::set_var(self.key, v),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
 #[tokio::test]
 async fn run_returns_when_shutdown_future_resolves() {
     let tmp = TempDir::new().unwrap();

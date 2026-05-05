@@ -28,6 +28,7 @@ use crate::progress;
 use crate::stall::{self, StallLevel};
 use crate::state::{PhaseHistoryEntry, PhaseState, ProjectState};
 use crate::tmux::TmuxSession;
+use crate::tool_surface::{user_claude_dir, ToolSurfaceSnapshot};
 
 const FIX_PHASE_NAME: &str = "fix";
 const FIX_LOOP_MAX_ITERATIONS: u32 = 3;
@@ -167,6 +168,11 @@ pub struct OrchestratorConfig {
     /// Tests with shell stand-ins set this to ~0; production keeps a
     /// short couple-of-seconds buffer.
     pub post_ready_warmup: Duration,
+    /// Skip the M0.5.3 startup `tools_required` check. Useful when an
+    /// older project on disk references plugin agents that aren't yet
+    /// linked in, and the user wants the orchestrator to come up
+    /// anyway so they can run `ccteam doctor --install-recommended-agents`.
+    pub skip_tool_check: bool,
 }
 
 impl Default for OrchestratorConfig {
@@ -176,6 +182,7 @@ impl Default for OrchestratorConfig {
             claude_argv: vec!["claude".into(), "--dangerously-skip-permissions".into()],
             ready_timeout: Duration::from_secs(60),
             post_ready_warmup: Duration::from_secs(3),
+            skip_tool_check: false,
         }
     }
 }
@@ -197,6 +204,11 @@ impl Orchestrator {
         for t in &templates {
             t.validate_m0()
                 .with_context(|| format!("phase template `{}` failed M0 validation", t.name))?;
+        }
+        if !config.skip_tool_check {
+            check_phase_tools(&templates)?;
+        } else {
+            tracing::warn!("skip_tool_check=true: phase tools_required not validated");
         }
         tracing::info!(
             templates = templates.len(),
@@ -756,6 +768,50 @@ fn wait_for_ready(ready_path: &Path, timeout: Duration) -> Result<()> {
         timeout,
         ready_path.display(),
     );
+}
+
+/// M0.5.3: refuse to start when any shipped phase template asks for a
+/// tool (subagent, skill, or MCP server) that isn't reachable on this
+/// machine. The error message lists every miss with a concrete fix
+/// command so the operator doesn't have to guess what's broken.
+///
+/// Pulled out of `Orchestrator::new` so tests and `ccteam doctor
+/// --tool-surface` can share the cross-check.
+pub fn check_phase_tools(templates: &[PhaseTemplate]) -> Result<()> {
+    let snap = match user_claude_dir() {
+        Ok(dir) => ToolSurfaceSnapshot::scan(&dir).unwrap_or_default(),
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "could not resolve ~/.claude/ for tool-surface check; only built-ins available",
+            );
+            ToolSurfaceSnapshot::default()
+        }
+    };
+    let mut all_missing: Vec<(String, crate::tool_surface::MissingTool)> = Vec::new();
+    for t in templates {
+        for m in t.missing_tools_against(&snap) {
+            all_missing.push((t.name.clone(), m));
+        }
+    }
+    if all_missing.is_empty() {
+        return Ok(());
+    }
+    let mut msg = String::from(
+        "phase template tool surface check failed — at least one phase requires a tool that is not reachable:\n",
+    );
+    for (phase, m) in &all_missing {
+        msg.push_str(&format!(
+            "  - phase `{phase}` needs {kind} `{name}` — {hint}\n",
+            kind = m.kind(),
+            name = m.name(),
+            hint = m.fix_hint(),
+        ));
+    }
+    msg.push_str(
+        "\nrun `ccteam doctor --tool-surface` for the full report, or pass `--skip-tool-check` to start anyway.",
+    );
+    Err(anyhow::anyhow!(msg))
 }
 
 fn load_phase_templates(dir: &Path) -> Result<Vec<PhaseTemplate>> {

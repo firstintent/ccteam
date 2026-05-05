@@ -12,6 +12,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::state::Parallelism;
+use crate::tool_surface::ToolsRequired;
 
 /// Phase-internal multi-role agent (M2+; M0 ignores).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,6 +71,12 @@ pub struct PhaseTemplate {
     #[serde(default)]
     pub sub_skills: Vec<SubSkillSpec>,
 
+    /// Tools the phase markdown invokes via Task / Skill / MCP. Validated
+    /// against the live tool surface at orchestrator startup; any missing
+    /// entry fails fast (M0.5.3). Schema in `docs/interfaces.md` §5.1.
+    #[serde(default)]
+    pub tools_required: ToolsRequired,
+
     #[serde(default)]
     pub hooks: PhaseHooks,
 }
@@ -106,6 +113,15 @@ impl PhaseTemplate {
             );
         }
         Ok(())
+    }
+
+    /// Cross-check `self.tools_required` against `snap`. Returns the
+    /// list of unmet dependencies — empty means the phase is callable.
+    pub fn missing_tools_against(
+        &self,
+        snap: &crate::tool_surface::ToolSurfaceSnapshot,
+    ) -> Vec<crate::tool_surface::MissingTool> {
+        crate::tool_surface::missing_tools(&self.tools_required, snap)
     }
 }
 
@@ -184,5 +200,37 @@ mod tests {
         let src = "no front matter here\n";
         let err = PhaseTemplate::parse(src).unwrap_err();
         assert!(format!("{err:#}").contains("front matter"));
+    }
+
+    #[test]
+    fn parses_tools_required_with_subagents_skills_mcp() {
+        let src = concat!(
+            "---\n",
+            "name: implement\n",
+            "parallelism: solo\n",
+            "tools_required:\n",
+            "  subagents: [code-reviewer, code-architect]\n",
+            "  skills: [some-skill]\n",
+            "  mcp: [playwright]\n",
+            "---\n",
+            "body\n",
+        );
+        let t = PhaseTemplate::parse(src).unwrap();
+        assert_eq!(t.tools_required.subagents, vec!["code-reviewer", "code-architect"]);
+        assert_eq!(t.tools_required.skills, vec!["some-skill"]);
+        assert_eq!(t.tools_required.mcp, vec!["playwright"]);
+    }
+
+    #[test]
+    fn tools_required_defaults_to_empty_when_omitted() {
+        let src = concat!(
+            "---\n",
+            "name: implement\n",
+            "parallelism: solo\n",
+            "---\n",
+            "body\n",
+        );
+        let t = PhaseTemplate::parse(src).unwrap();
+        assert!(t.tools_required.is_empty());
     }
 }

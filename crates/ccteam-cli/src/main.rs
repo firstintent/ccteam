@@ -49,6 +49,11 @@ enum Command {
         /// Override the polling tick interval (debug / tests only).
         #[arg(long, value_name = "SECONDS", default_value_t = 30)]
         tick_seconds: u64,
+        /// Skip the M0.5.3 phase tools_required check at startup.
+        /// Use when an old project on disk needs `ccteam doctor
+        /// --install-recommended-agents` first.
+        #[arg(long, default_value_t = false)]
+        skip_tool_check: bool,
     },
     /// Create a new project from a one-line request.
     New {
@@ -121,7 +126,8 @@ fn main() -> Result<()> {
         Command::Start {
             foreground: _,
             tick_seconds,
-        } => run_start(tick_seconds),
+            skip_tool_check,
+        } => run_start(tick_seconds, skip_tool_check),
         Command::New { request, file } => run_new(request, file),
         Command::Ls { format } => run_ls(format),
         Command::Show { slug, format } => run_show(&slug, format),
@@ -163,7 +169,7 @@ fn run_hook(cmd: HookCommand) -> Result<()> {
     }
 }
 
-fn run_start(tick_seconds: u64) -> Result<()> {
+fn run_start(tick_seconds: u64, skip_tool_check: bool) -> Result<()> {
     init_tracing();
     let paths = CcteamPaths::from_env()?;
 
@@ -186,6 +192,7 @@ fn run_start(tick_seconds: u64) -> Result<()> {
 
     let config = OrchestratorConfig {
         tick_interval: Duration::from_secs(tick_seconds.max(1)),
+        skip_tool_check,
         ..OrchestratorConfig::default()
     };
     let orchestrator = Orchestrator::new(paths, config)?;

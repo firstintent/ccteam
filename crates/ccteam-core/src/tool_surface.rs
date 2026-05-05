@@ -19,9 +19,11 @@
 //!
 //! Pure-ish: file-system mutations only; no orchestrator side effects.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
+use serde::{Deserialize, Serialize};
 
 /// One recommended plugin agent we link into `~/.claude/agents/`.
 ///
@@ -316,6 +318,248 @@ pub fn ensure_skills_placeholders(claude_dir: &Path, project_dir: &Path) -> Resu
     Ok(())
 }
 
+/// Tools a phase markdown declares it needs at runtime. Validated
+/// against [`ToolSurfaceSnapshot`] at orchestrator startup so a phase
+/// that asks for `Task(subagent_type="code-reviewer")` fails fast if
+/// the agent file is missing under `~/.claude/agents/`.
+///
+/// Schema: `docs/interfaces.md` §5.1.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolsRequired {
+    /// `subagent_type` strings (e.g. `code-reviewer`, `general-purpose`).
+    /// Five built-ins are always reachable and don't need to be listed,
+    /// but listing them is harmless.
+    #[serde(default)]
+    pub subagents: Vec<String>,
+    /// Skill names callable via the `Skill` tool. Resolved against
+    /// `~/.claude/skills/<name>/SKILL.md` and any installed plugin's
+    /// `skills/<name>/SKILL.md`.
+    #[serde(default)]
+    pub skills: Vec<String>,
+    /// MCP server names from `~/.claude.json` `mcpServers` keys
+    /// (and any plugin `.mcp.json` once M2 lands plugin-aware
+    /// MCP discovery).
+    #[serde(default)]
+    pub mcp: Vec<String>,
+}
+
+impl ToolsRequired {
+    /// True when no tools are declared.
+    pub fn is_empty(&self) -> bool {
+        self.subagents.is_empty() && self.skills.is_empty() && self.mcp.is_empty()
+    }
+}
+
+/// `subagent_type` strings always reachable in any Claude Code session
+/// without registration (per `docs/claude-code-tool-surface.md` §1.1.1).
+/// Treated as built-in by [`ToolSurfaceSnapshot::scan`] so phase
+/// templates can list them without forcing extra setup.
+pub const BUILTIN_SUBAGENTS: &[&str] = &[
+    "general-purpose",
+    "Explore",
+    "Plan",
+    "claude-code-guide",
+    "statusline-setup",
+];
+
+/// What's actually reachable on the current machine. Built once at
+/// orchestrator startup and used to validate every phase template's
+/// `tools_required`.
+#[derive(Debug, Clone, Default)]
+pub struct ToolSurfaceSnapshot {
+    pub subagents: BTreeSet<String>,
+    pub skills: BTreeSet<String>,
+    pub mcp: BTreeSet<String>,
+}
+
+impl ToolSurfaceSnapshot {
+    /// Production entry point — resolve `~/.claude/` then scan.
+    pub fn from_user_claude() -> Result<Self> {
+        let dir = user_claude_dir()?;
+        Self::scan(&dir)
+    }
+
+    /// Build a snapshot by reading the filesystem under `claude_dir`
+    /// (`~/.claude/`). MCP servers come from `<claude_dir>/.claude.json`
+    /// or `<claude_dir>/mcp_servers.json` when present. Plugin-supplied
+    /// skills are pulled from
+    /// `<claude_dir>/plugins/marketplaces/*/plugins/*/skills/<name>/`.
+    pub fn scan(claude_dir: &Path) -> Result<Self> {
+        let mut subagents: BTreeSet<String> = BUILTIN_SUBAGENTS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let mut skills: BTreeSet<String> = BTreeSet::new();
+        let mut mcp: BTreeSet<String> = BTreeSet::new();
+
+        // ~/.claude/agents/<name>.md → subagent_type "<name>"
+        let agents_dir = claude_dir.join("agents");
+        if let Ok(entries) = std::fs::read_dir(&agents_dir) {
+            for e in entries.flatten() {
+                let path = e.path();
+                if path.extension().is_some_and(|x| x == "md") {
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        subagents.insert(stem.to_string());
+                    }
+                }
+            }
+        }
+
+        // ~/.claude/skills/<name>/SKILL.md → skill "<name>"
+        let skills_dir = claude_dir.join("skills");
+        collect_skills_from(&skills_dir, &mut skills);
+
+        // Plugin-shipped skills:
+        // ~/.claude/plugins/marketplaces/<market>/plugins/<plugin>/skills/<name>/SKILL.md
+        let marketplaces = claude_dir.join("plugins").join("marketplaces");
+        if let Ok(market_entries) = std::fs::read_dir(&marketplaces) {
+            for market in market_entries.flatten() {
+                let plugins = market.path().join("plugins");
+                if let Ok(plugin_entries) = std::fs::read_dir(&plugins) {
+                    for plugin in plugin_entries.flatten() {
+                        let p_skills = plugin.path().join("skills");
+                        collect_skills_from(&p_skills, &mut skills);
+                    }
+                }
+            }
+        }
+
+        // MCP servers from a few well-known locations. Order:
+        //   1. ~/.claude.json (parent of ~/.claude/), top-level mcpServers
+        //   2. ~/.claude/mcp_servers.json
+        if let Some(parent) = claude_dir.parent() {
+            collect_mcp_from(&parent.join(".claude.json"), &mut mcp);
+        }
+        collect_mcp_from(&claude_dir.join("mcp_servers.json"), &mut mcp);
+
+        Ok(Self {
+            subagents,
+            skills,
+            mcp,
+        })
+    }
+
+    /// True if `name` is reachable as a `subagent_type` in this
+    /// snapshot. Comparison is case-sensitive — Claude Code's built-ins
+    /// include `Explore` / `Plan` with leading capitals.
+    pub fn has_subagent(&self, name: &str) -> bool {
+        self.subagents.contains(name)
+    }
+
+    pub fn has_skill(&self, name: &str) -> bool {
+        self.skills.contains(name)
+    }
+
+    pub fn has_mcp(&self, name: &str) -> bool {
+        self.mcp.contains(name)
+    }
+}
+
+/// One missing tool, used by [`missing_tools`] to drive both the
+/// orchestrator's fail-fast error and the doctor command's table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MissingTool {
+    Subagent(String),
+    Skill(String),
+    Mcp(String),
+}
+
+impl MissingTool {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            MissingTool::Subagent(_) => "subagent",
+            MissingTool::Skill(_) => "skill",
+            MissingTool::Mcp(_) => "mcp",
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            MissingTool::Subagent(s)
+            | MissingTool::Skill(s)
+            | MissingTool::Mcp(s) => s.as_str(),
+        }
+    }
+
+    /// One-line CLI hint to fix this missing tool. Used by
+    /// `ccteam doctor --tool-surface` and the orchestrator's startup
+    /// error message.
+    pub fn fix_hint(&self) -> String {
+        match self {
+            MissingTool::Subagent(name) => {
+                if RECOMMENDED_AGENTS.iter().any(|a| a.subagent_type() == name) {
+                    "run `ccteam doctor --install-recommended-agents` to symlink the plugin agent".into()
+                } else {
+                    format!(
+                        "drop `{name}.md` into ~/.claude/agents/ (custom agent), or remove it from `tools_required.subagents`"
+                    )
+                }
+            }
+            MissingTool::Skill(name) => format!(
+                "install the `{name}` skill (e.g. `~/.claude/skills/{name}/SKILL.md`) or remove it from `tools_required.skills`"
+            ),
+            MissingTool::Mcp(name) => format!(
+                "register MCP server `{name}` in ~/.claude.json `mcpServers` section, or remove it from `tools_required.mcp`"
+            ),
+        }
+    }
+}
+
+/// Cross-check `req` against `snap` and return any tools that aren't
+/// reachable. Empty result means the phase template is good to go.
+pub fn missing_tools(req: &ToolsRequired, snap: &ToolSurfaceSnapshot) -> Vec<MissingTool> {
+    let mut out = Vec::new();
+    for s in &req.subagents {
+        if !snap.has_subagent(s) {
+            out.push(MissingTool::Subagent(s.clone()));
+        }
+    }
+    for s in &req.skills {
+        if !snap.has_skill(s) {
+            out.push(MissingTool::Skill(s.clone()));
+        }
+    }
+    for s in &req.mcp {
+        if !snap.has_mcp(s) {
+            out.push(MissingTool::Mcp(s.clone()));
+        }
+    }
+    out
+}
+
+fn collect_skills_from(dir: &Path, out: &mut BTreeSet<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let path = e.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let skill_md = path.join("SKILL.md");
+        if !skill_md.is_file() {
+            continue;
+        }
+        if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+            out.insert(name.to_string());
+        }
+    }
+}
+
+fn collect_mcp_from(path: &Path, out: &mut BTreeSet<String>) {
+    let Ok(bytes) = std::fs::read(path) else {
+        return;
+    };
+    let Ok(v): std::result::Result<serde_json::Value, _> = serde_json::from_slice(&bytes) else {
+        return;
+    };
+    if let Some(servers) = v.get("mcpServers").and_then(|x| x.as_object()) {
+        for k in servers.keys() {
+            out.insert(k.clone());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,5 +719,102 @@ mod tests {
         ensure_skills_placeholders(&claude, &project).unwrap();
         ensure_skills_placeholders(&claude, &project).unwrap();
         assert!(claude.join("skills").is_dir());
+    }
+
+    #[test]
+    fn snapshot_collects_builtin_subagents_even_in_empty_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let claude = tmp.path().join(".claude");
+        let snap = ToolSurfaceSnapshot::scan(&claude).unwrap();
+        for s in BUILTIN_SUBAGENTS {
+            assert!(snap.has_subagent(s), "missing built-in subagent `{s}`");
+        }
+        assert!(!snap.has_subagent("code-reviewer"));
+    }
+
+    #[test]
+    fn snapshot_picks_up_user_agents_and_plugin_skills() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let claude = tmp.path().join(".claude");
+        // user-authored agent
+        std::fs::create_dir_all(claude.join("agents")).unwrap();
+        std::fs::write(claude.join("agents/code-reviewer.md"), "# stub").unwrap();
+        // user-authored skill
+        std::fs::create_dir_all(claude.join("skills/my-skill")).unwrap();
+        std::fs::write(claude.join("skills/my-skill/SKILL.md"), "# stub").unwrap();
+        // plugin-shipped skill
+        let plugin_skill = claude
+            .join("plugins/marketplaces/x/plugins/foo/skills/plug-skill");
+        std::fs::create_dir_all(&plugin_skill).unwrap();
+        std::fs::write(plugin_skill.join("SKILL.md"), "# stub").unwrap();
+
+        let snap = ToolSurfaceSnapshot::scan(&claude).unwrap();
+        assert!(snap.has_subagent("code-reviewer"));
+        assert!(snap.has_skill("my-skill"));
+        assert!(snap.has_skill("plug-skill"));
+    }
+
+    #[test]
+    fn snapshot_reads_mcp_from_claude_json() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Layout: <home>/.claude/ for claude_dir, <home>/.claude.json sibling
+        let claude = tmp.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(
+            tmp.path().join(".claude.json"),
+            r#"{"mcpServers": {"playwright": {"command": "..."}, "ccteam": {"command": "..."}}}"#,
+        )
+        .unwrap();
+        let snap = ToolSurfaceSnapshot::scan(&claude).unwrap();
+        assert!(snap.has_mcp("playwright"));
+        assert!(snap.has_mcp("ccteam"));
+    }
+
+    #[test]
+    fn missing_tools_returns_each_unmet_dependency() {
+        let snap = ToolSurfaceSnapshot {
+            subagents: ["general-purpose"].iter().map(|s| s.to_string()).collect(),
+            skills: BTreeSet::new(),
+            mcp: BTreeSet::new(),
+        };
+        let req = ToolsRequired {
+            subagents: vec!["general-purpose".into(), "code-reviewer".into()],
+            skills: vec!["x-skill".into()],
+            mcp: vec!["nope".into()],
+        };
+        let miss = missing_tools(&req, &snap);
+        assert_eq!(miss.len(), 3);
+        assert_eq!(miss[0], MissingTool::Subagent("code-reviewer".into()));
+        assert_eq!(miss[1], MissingTool::Skill("x-skill".into()));
+        assert_eq!(miss[2], MissingTool::Mcp("nope".into()));
+    }
+
+    #[test]
+    fn missing_tools_empty_when_all_present() {
+        let snap = ToolSurfaceSnapshot {
+            subagents: ["code-reviewer", "general-purpose"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            skills: ["my-skill"].iter().map(|s| s.to_string()).collect(),
+            mcp: ["mcp1"].iter().map(|s| s.to_string()).collect(),
+        };
+        let req = ToolsRequired {
+            subagents: vec!["code-reviewer".into()],
+            skills: vec!["my-skill".into()],
+            mcp: vec!["mcp1".into()],
+        };
+        assert!(missing_tools(&req, &snap).is_empty());
+    }
+
+    #[test]
+    fn missing_tool_fix_hint_recommends_doctor_for_recommended_agents() {
+        let m = MissingTool::Subagent("code-reviewer".into());
+        let h = m.fix_hint();
+        assert!(h.contains("ccteam doctor"), "got: {h}");
+
+        let m2 = MissingTool::Subagent("user-custom".into());
+        let h2 = m2.fix_hint();
+        assert!(h2.contains("custom agent"), "got: {h2}");
     }
 }
