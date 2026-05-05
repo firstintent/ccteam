@@ -84,7 +84,10 @@ fn default_priority() -> OutboxPriority {
     OutboxPriority::Normal
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Variant order is significant: derive(Ord) treats `Normal < High`, so
+/// `b.priority.cmp(&a.priority)` sorts high-priority rows first — used by
+/// the `ccteam decisions` queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutboxPriority {
     Normal,
