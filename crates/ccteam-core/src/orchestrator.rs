@@ -579,7 +579,7 @@ impl Orchestrator {
                 None => continue, // hard-kill terminated this project
             };
             if let Err(err) = self.process_project(&slug, state) {
-                tracing::error!(slug, error = %err, "project tick failed");
+                tracing::error!(slug, error = format!("{err:#}"), "project tick failed");
             }
         }
         Ok(())
