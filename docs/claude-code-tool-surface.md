@@ -172,6 +172,63 @@ InputValidationError 失败。不要凭训练记忆或文件路径猜 skill 名�
 属于通道 2(TUI-only),要触发只能 orchestrator send-keys。**这是 plugin
 agent 在自治流水线里难用的真正原因**。
 
+#### 1.2.4 Skill 支持中途热加载,这是 ccteam 的重要杠杆
+
+Claude Code 对 `~/.claude/skills/`、项目 `.claude/skills/`、`--add-dir`
+所加目录实时监听:**新增 / 修改 / 删除 SKILL.md 文件,当前会话立即生效**,
+不需重启,不丢 context([官方文档](https://code.claude.com/docs/en/skills.md#live-change-detection))。
+
+**唯一例外**:会话启动时那个 skills 顶层目录如果还不存在,后来才创建,
+不会被监听 → 需要重启或 `/reload-plugins`。所以 `bootstrap_project`
+应该**预创建空目录**:`~/.claude/skills/`、`<project>/.claude/skills/`,
+即使一开始没文件。
+
+**对 ccteam 的架构含义**:
+- ccteam M1+ 可以做**按 phase 懒注入 skill** —— 比如 `review` phase 触发
+  前,orchestrator 把一份"针对当前 phase 定制的 review skill"写进
+  `<project>/.claude/skills/phase-review/SKILL.md`,长会话立即可调。
+- 不需要为了"让模型用某个能力"重启长会话或破坏 prompt cache。
+- Plugin **不能**中途装(需要重启);已装 plugin 可以通过 send-keys
+  `/reload-plugins` 不丢 context 地刷新它的 skills/agents/hooks/MCP/LSP。
+- Agent 文件(`~/.claude/agents/<name>.md`)文档没明说是否实时监听 ——
+  **需要实测**,见下面探针。
+
+#### 1.2.5 实测 agent 文件是否中途热加载(请手动验证)
+
+ccteam M1 自治调用 plugin agent 的方案 A 强依赖这条:`bootstrap_project`
+能不能在长会话启动**之后**才 ln -sf agent 文件,还是必须在 `tmux start`
+之前?跑这套验证:
+
+```
+# 1. 在长会话里先确认 code-reviewer 不可调
+请用 Task 工具,subagent_type="code-reviewer",
+description="probe", prompt="say hi"
+→ 应报 "Agent type 'code-reviewer' not found"
+```
+
+```
+# 2. 不退出会话,在另一个终端跑:
+mkdir -p ~/.claude/agents
+ln -sf ~/.claude/plugins/marketplaces/claude-plugins-official/plugins/pr-review-toolkit/agents/code-reviewer.md \
+       ~/.claude/agents/code-reviewer.md
+```
+
+```
+# 3. 回到长会话,再次跑同样的 Task 调用
+请用 Task 工具,subagent_type="code-reviewer",
+description="probe", prompt="say hi"
+```
+
+**两种可能**:
+- **可调** → agent 也支持热加载,`bootstrap_project` 可以放到 `ensure_session`
+  之后任意时机做 ln -sf,设计自由度高
+- **不可调** → 必须在长会话启动**之前**完成 ln -sf;`bootstrap_project`
+  顺序要严格保证(写 settings.json → ln agents → tmux start);如果中途
+  要新增,需 send-keys `/reload-plugins`(代价是该命令会重置 plugin 状态)
+
+把验证结果告诉我,我据此调整 §6.2 和 development-plan 里 M1 那条任务的
+精确顺序。
+
 ---
 
 ### 1.3 MCP 工具
