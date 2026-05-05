@@ -91,6 +91,15 @@ enum Command {
     },
     /// Resume a paused / escalated project (re-arm phase_state=idle).
     Resume { slug: String },
+    /// List the cross-project decisions queue — every project's
+    /// outbox file with `event_kind: clarify | escalation`. Surfaces
+    /// pending user-decision points across all running projects so the
+    /// meta-agent can offer "you have N pending decisions, want to
+    /// walk through them?" on attach (interfaces.md §5.6.4).
+    Decisions {
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
     /// Stop the running orchestrator daemon. Sends SIGTERM via the
     /// pidfile so the loop drains gracefully. Does **not** kill any
     /// tmux sessions — `ccteam start` reattaches to them on next launch
@@ -182,6 +191,12 @@ fn main() -> Result<()> {
         Command::Resume { slug } => {
             let paths = CcteamPaths::from_env()?;
             commands::run_resume(&paths, &slug)
+        }
+        Command::Decisions { format } => {
+            let paths = CcteamPaths::from_env()?;
+            let body = commands::run_decisions(&paths, format)?;
+            print!("{body}");
+            Ok(())
         }
         Command::Stop => run_stop(),
         Command::Doctor {

@@ -13,8 +13,8 @@ use ccteam_core::{
     bootstrap_meta_project, bootstrap_project, current_ccteam_bin, install_ccteam_control_skill,
     link_recommended_agents, pick_unused_slug, user_claude_dir, write_global_phase_templates,
     AgentLinkAction, AgentLinkReport, CcteamPaths, InstallSkillOptions, LinkOptions,
-    MetaBootstrapReport, PhaseState, PhaseTemplate, ProjectState, SkillInstallAction,
-    ToolSurfaceSnapshot, BUILTIN_SUBAGENTS, PHASE_TEMPLATES,
+    MetaBootstrapReport, OutboxEventKind, OutboxMessage, PhaseState, PhaseTemplate, ProjectState,
+    SessionMailbox, SkillInstallAction, ToolSurfaceSnapshot, BUILTIN_SUBAGENTS, PHASE_TEMPLATES,
 };
 use ccteam_core::tmux::TmuxSession;
 
@@ -233,6 +233,242 @@ pub fn run_resume(paths: &CcteamPaths, slug: &str) -> Result<()> {
         let _ = std::fs::rename(&esc, &archive);
     }
     Ok(())
+}
+
+/// One row in the cross-project decisions queue (`ccteam decisions`).
+///
+/// A "decision" = an outbox file in any project's `.ccteam/outbox/` whose
+/// front matter has `event_kind: clarify` or `event_kind: escalation`.
+/// These are the messages a user must look at; everything else (replies,
+/// progress, shipped) is informational and excluded.
+#[derive(Debug, Clone)]
+pub struct DecisionRow {
+    pub slug: String,
+    pub current_phase: String,
+    pub team: String,
+    pub event_kind: OutboxEventKind,
+    pub priority: ccteam_core::OutboxPriority,
+    pub created_at: chrono::DateTime<Utc>,
+    pub age_seconds: u64,
+    pub outbox_filename: String,
+    pub summary: String,
+}
+
+/// `ccteam decisions`. Aggregate the cross-project decisions queue and
+/// render it. interfaces.md §5.6.4 — meta-agent uses this as the
+/// surface for "你有 N 条待决策" UX. M1 follow-up increment.
+pub fn run_decisions(paths: &CcteamPaths, format: OutputFormat) -> Result<String> {
+    let rows = collect_decisions(paths)?;
+    Ok(match format {
+        OutputFormat::Text => render_decisions_text(&rows),
+        OutputFormat::Json => render_decisions_json(&rows)?,
+    })
+}
+
+/// Walk every project under `projects_root`, scan their outbox dirs, and
+/// emit one `DecisionRow` per outbox file whose `event_kind` warrants
+/// user attention. Broken outbox files are warned and skipped — never
+/// fatal, because one malformed file shouldn't blank the whole queue.
+pub fn collect_decisions(paths: &CcteamPaths) -> Result<Vec<DecisionRow>> {
+    let dir = &paths.projects_root;
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let now = Utc::now();
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir)
+        .with_context(|| format!("read_dir {}", dir.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let Some(slug) = entry.file_name().to_str().map(String::from) else {
+            continue;
+        };
+        let project_dir = entry.path();
+        let ccteam_dir = project_dir.join(".ccteam");
+        if !ccteam_dir.exists() {
+            continue;
+        }
+        // Resolve current phase + team from state.json. Missing /
+        // unparseable state.json is *not* a decisions-queue error; the
+        // outbox can still be surfaced under "<unknown>".
+        let (current_phase, team) = match ProjectState::load(&paths.project_state(&slug)) {
+            Ok(s) => {
+                let phase = if s.current_phase.is_empty() {
+                    "<idle>".to_string()
+                } else {
+                    s.current_phase
+                };
+                (phase, s.team)
+            }
+            Err(_) => ("<unknown>".to_string(), "<unknown>".to_string()),
+        };
+
+        let mailbox = SessionMailbox::for_ccteam_dir(&ccteam_dir);
+        let files = match mailbox.list_outbox() {
+            Ok(f) => f,
+            Err(err) => {
+                tracing::warn!(slug, error = %err, "skip project: outbox listing failed");
+                continue;
+            }
+        };
+        for path in files {
+            let msg = match OutboxMessage::load(&path) {
+                Ok(m) => m,
+                Err(err) => {
+                    tracing::warn!(
+                        slug,
+                        path = %path.display(),
+                        error = %err,
+                        "skip outbox file: parse failed",
+                    );
+                    continue;
+                }
+            };
+            // Filter: only items the user has to look at. Replies /
+            // progress / shipped notifications are not "decisions".
+            if !matches!(
+                msg.front.event_kind,
+                OutboxEventKind::Clarify | OutboxEventKind::Escalation
+            ) {
+                continue;
+            }
+            let age = now
+                .signed_duration_since(msg.front.created_at)
+                .num_seconds()
+                .max(0) as u64;
+            let outbox_filename = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            out.push(DecisionRow {
+                slug: slug.clone(),
+                current_phase: current_phase.clone(),
+                team: team.clone(),
+                event_kind: msg.front.event_kind,
+                priority: msg.front.priority,
+                created_at: msg.front.created_at,
+                age_seconds: age,
+                outbox_filename,
+                summary: summarize_body(&msg.body),
+            });
+        }
+    }
+    // Highest priority first, then oldest first within priority — old
+    // unanswered escalations should never get buried under a fresh
+    // clarify.
+    out.sort_by(|a, b| {
+        b.priority
+            .cmp(&a.priority)
+            .then_with(|| a.created_at.cmp(&b.created_at))
+    });
+    Ok(out)
+}
+
+/// Pull a one-line summary from the outbox body. Strips the first
+/// markdown heading (if any), trims, and truncates to 80 chars.
+fn summarize_body(body: &str) -> String {
+    let line = body
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with("# "))
+        .unwrap_or("");
+    if line.chars().count() <= 80 {
+        line.to_string()
+    } else {
+        let truncated: String = line.chars().take(77).collect();
+        format!("{truncated}...")
+    }
+}
+
+fn render_decisions_text(rows: &[DecisionRow]) -> String {
+    if rows.is_empty() {
+        return "no pending decisions across all projects.\n".to_string();
+    }
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{} pending decision{} across all projects:\n\n",
+        rows.len(),
+        if rows.len() == 1 { "" } else { "s" },
+    ));
+    out.push_str("slug                       phase             team             kind         age      summary\n");
+    out.push_str("------------------------   ---------------   --------------   ----------   ------   -------\n");
+    for row in rows {
+        let age = format_age(row.age_seconds);
+        let kind = match row.event_kind {
+            OutboxEventKind::Clarify => "clarify",
+            OutboxEventKind::Escalation => "escalation",
+            // Filtered upstream; defensive default.
+            _ => "other",
+        };
+        out.push_str(&format!(
+            "{:<26} {:<17} {:<16} {:<12} {:<8} {}\n",
+            ellipsize(&row.slug, 26),
+            ellipsize(&row.current_phase, 17),
+            ellipsize(&row.team, 16),
+            kind,
+            age,
+            row.summary,
+        ));
+    }
+    out
+}
+
+fn render_decisions_json(rows: &[DecisionRow]) -> Result<String> {
+    let arr: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            json!({
+                "slug": row.slug,
+                "current_phase": row.current_phase,
+                "team": row.team,
+                "event_kind": match row.event_kind {
+                    OutboxEventKind::Clarify => "clarify",
+                    OutboxEventKind::Escalation => "escalation",
+                    OutboxEventKind::Reply => "reply",
+                    OutboxEventKind::Progress => "progress",
+                    OutboxEventKind::Shipped => "shipped",
+                },
+                "priority": match row.priority {
+                    ccteam_core::OutboxPriority::Normal => "normal",
+                    ccteam_core::OutboxPriority::High => "high",
+                },
+                "created_at": row.created_at.to_rfc3339(),
+                "age_seconds": row.age_seconds,
+                "outbox_filename": row.outbox_filename,
+                "summary": row.summary,
+            })
+        })
+        .collect();
+    let body = json!({
+        "total": rows.len(),
+        "decisions": arr,
+    });
+    Ok(serde_json::to_string_pretty(&body)? + "\n")
+}
+
+fn format_age(seconds: u64) -> String {
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3600 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 86400 {
+        format!("{}h", seconds / 3600)
+    } else {
+        format!("{}d", seconds / 86400)
+    }
+}
+
+fn ellipsize(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{truncated}…")
+    }
 }
 
 /// `ccteam doctor` flags. Each mode is a separate boolean / option so
@@ -1071,5 +1307,231 @@ mod tests {
             would: Box::new(AgentLinkAction::Linked),
         });
         assert_eq!(label, "would: linked");
+    }
+
+    // -------- ccteam decisions (M1 follow-up) --------
+
+    /// Helper: write an outbox file with caller-controlled front matter
+    /// to `<projects_root>/<slug>/.ccteam/outbox/<filename>`. Uses
+    /// `OutboxMessage::save` so the file goes through the same atomic
+    /// write path used in production.
+    fn write_outbox(
+        paths: &CcteamPaths,
+        slug: &str,
+        filename: &str,
+        kind: OutboxEventKind,
+        priority: ccteam_core::OutboxPriority,
+        created_at: chrono::DateTime<Utc>,
+        body: &str,
+    ) {
+        let dir = paths.project_ccteam_dir(slug).join("outbox");
+        std::fs::create_dir_all(&dir).unwrap();
+        let msg = OutboxMessage {
+            front: ccteam_core::OutboxFrontMatter {
+                schema_version: 1,
+                in_reply_to: None,
+                in_reply_to_source_msg_id: None,
+                target_channels: Vec::new(),
+                created_at,
+                priority,
+                event_kind: kind,
+            },
+            body: body.to_string(),
+        };
+        msg.save(&dir.join(filename)).unwrap();
+    }
+
+    fn write_state(paths: &CcteamPaths, slug: &str, phase: &str, team: &str) {
+        let dir = paths.project_ccteam_dir(slug);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = ProjectState::initial_for_team(slug.to_string(), team.to_string());
+        state.current_phase = phase.to_string();
+        state.save(&paths.project_state(slug)).unwrap();
+    }
+
+    #[test]
+    fn run_decisions_text_says_empty_when_no_projects() {
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let body = run_decisions(&paths, OutputFormat::Text).unwrap();
+        assert!(body.contains("no pending decisions"));
+    }
+
+    #[test]
+    fn run_decisions_excludes_reply_progress_shipped_event_kinds() {
+        // Only clarify / escalation should show up in the queue.
+        // Replies / progress / shipped notifications are informational,
+        // not user-actionable.
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        write_state(&paths, "alpha", "plan-eng", "dev");
+        let now = Utc::now();
+        write_outbox(
+            &paths,
+            "alpha",
+            "reply-1.md",
+            OutboxEventKind::Reply,
+            ccteam_core::OutboxPriority::Normal,
+            now,
+            "informational",
+        );
+        write_outbox(
+            &paths,
+            "alpha",
+            "reply-2.md",
+            OutboxEventKind::Progress,
+            ccteam_core::OutboxPriority::Normal,
+            now,
+            "informational",
+        );
+        write_outbox(
+            &paths,
+            "alpha",
+            "reply-3.md",
+            OutboxEventKind::Shipped,
+            ccteam_core::OutboxPriority::Normal,
+            now,
+            "informational",
+        );
+        let rows = collect_decisions(&paths).unwrap();
+        assert!(rows.is_empty(), "non-decision event_kinds must be filtered out");
+    }
+
+    #[test]
+    fn run_decisions_aggregates_clarify_and_escalation_across_projects() {
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        write_state(&paths, "alpha", "plan-eng", "dev");
+        write_state(&paths, "beta", "kickoff", "product-research");
+        let t1 = Utc::now() - chrono::Duration::hours(2);
+        let t2 = Utc::now() - chrono::Duration::minutes(30);
+        write_outbox(
+            &paths,
+            "alpha",
+            "reply-1.md",
+            OutboxEventKind::Clarify,
+            ccteam_core::OutboxPriority::Normal,
+            t1,
+            "选 SQLite 还是 Postgres?",
+        );
+        write_outbox(
+            &paths,
+            "beta",
+            "reply-1.md",
+            OutboxEventKind::Escalation,
+            ccteam_core::OutboxPriority::High,
+            t2,
+            "exceeded max_clarify_rounds",
+        );
+        let rows = collect_decisions(&paths).unwrap();
+        assert_eq!(rows.len(), 2);
+        // High-priority escalation must come first regardless of being
+        // newer than the clarify.
+        assert!(matches!(rows[0].event_kind, OutboxEventKind::Escalation));
+        assert_eq!(rows[0].slug, "beta");
+        assert_eq!(rows[1].slug, "alpha");
+    }
+
+    #[test]
+    fn run_decisions_json_serializes_complete_row_shape() {
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        write_state(&paths, "alpha", "plan-eng", "dev");
+        let opened = chrono::DateTime::parse_from_rfc3339("2026-05-06T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        write_outbox(
+            &paths,
+            "alpha",
+            "reply-1.md",
+            OutboxEventKind::Clarify,
+            ccteam_core::OutboxPriority::Normal,
+            opened,
+            "需要确认部署目标",
+        );
+        let body = run_decisions(&paths, OutputFormat::Json).unwrap();
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["total"], 1);
+        let row = &parsed["decisions"][0];
+        assert_eq!(row["slug"], "alpha");
+        assert_eq!(row["current_phase"], "plan-eng");
+        assert_eq!(row["team"], "dev");
+        assert_eq!(row["event_kind"], "clarify");
+        assert_eq!(row["priority"], "normal");
+        assert_eq!(row["outbox_filename"], "reply-1.md");
+        assert!(row["summary"].as_str().unwrap().contains("部署"));
+    }
+
+    #[test]
+    fn run_decisions_skips_unparseable_outbox_files() {
+        // A malformed outbox file in one project must not blank the
+        // queue — other projects should still surface.
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        write_state(&paths, "alpha", "plan-eng", "dev");
+        write_state(&paths, "broken", "plan-eng", "dev");
+        write_outbox(
+            &paths,
+            "alpha",
+            "reply-1.md",
+            OutboxEventKind::Clarify,
+            ccteam_core::OutboxPriority::Normal,
+            Utc::now(),
+            "valid question",
+        );
+        // Hand-write garbage that doesn't parse as an outbox file.
+        let bad_dir = paths.project_ccteam_dir("broken").join("outbox");
+        std::fs::create_dir_all(&bad_dir).unwrap();
+        std::fs::write(bad_dir.join("reply-bad.md"), "not even a yaml header").unwrap();
+
+        let rows = collect_decisions(&paths).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].slug, "alpha");
+    }
+
+    #[test]
+    fn run_decisions_summary_truncates_long_first_line() {
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        write_state(&paths, "alpha", "plan-eng", "dev");
+        let long_line = "x".repeat(200);
+        write_outbox(
+            &paths,
+            "alpha",
+            "reply-1.md",
+            OutboxEventKind::Clarify,
+            ccteam_core::OutboxPriority::Normal,
+            Utc::now(),
+            &long_line,
+        );
+        let rows = collect_decisions(&paths).unwrap();
+        assert_eq!(rows.len(), 1);
+        let summary = &rows[0].summary;
+        assert!(summary.ends_with("..."), "long summaries should be truncated with ellipsis");
+        assert!(summary.chars().count() <= 80);
+    }
+
+    #[test]
+    fn run_decisions_handles_project_without_state_json() {
+        // A project dir with outbox files but no state.json (race during
+        // bootstrap, manual cleanup, etc.) should still surface its
+        // pending items rather than vanish silently.
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let dir = paths.project_ccteam_dir("orphan").join("outbox");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_outbox(
+            &paths,
+            "orphan",
+            "reply-1.md",
+            OutboxEventKind::Escalation,
+            ccteam_core::OutboxPriority::High,
+            Utc::now(),
+            "项目状态丢失但 outbox 还在",
+        );
+        let rows = collect_decisions(&paths).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].current_phase, "<unknown>");
+        assert_eq!(rows[0].team, "<unknown>");
     }
 }
