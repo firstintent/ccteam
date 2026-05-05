@@ -22,14 +22,15 @@
 
 ## 摘要
 
-21 条发现(2026-05-05 加 F21、升级 F20 P1→P0,共增 1 条),分布:
+21 条发现(2026-05-05 加 F21、升级 F20 P1→P0,共增 1 条;2026-05-06 修复 F21),分布:
 
 | 优先级 | 数量 | 编号 |
 |---|---|---|
 | **P0 阻塞泛化** | 7 | F1, F2, F3, F4, F12, F13, F20(2026-05-05 升级) |
-| **P1 该做但可后置** | 10 | F5, F6, F7, F8, F9, F10, F11, F15, F19, F21 |
+| **P1 该做但可后置** | 9(原 10,F21 已修复) | F5, F6, F7, F8, F9, F10, F11, F15, F19, ~~F21~~ |
 | **P2 边角** | 3 | F16, F17, F18 |
 | **N/A 已是领域无关** | 1 | F14 |
+| **已修复** | 1 | F21(@a5fb21d) |
 
 **P0 关键路径**:F1(`auto_loop` 字段)+ F2(DAG 由 phase 模板推断)+ F3
 (`FIRST_PHASE` 改 DAG entry node)+ F4(`is_terminal` 改 DAG 终点判断)+
@@ -354,7 +355,7 @@ change。按 CLAUDE.md §五.3 "不写 backwards-compat shim",直接换。
 > 后续 RAG 索引重建。`development-plan.md` 已 reorder M3 ↔ M4(团队抽象前
 > 置),F20 现在阻塞新 M4 启动 —— 升级为 P0。
 
-### F21 — `stall_warn_minutes` phase YAML 字段已 spec 但 orchestrator 未读取
+### F21 — `stall_warn_minutes` phase YAML 字段已 spec 但 orchestrator 未读取(**已修复:2026-05-06 @ a5fb21d**)
 
 - **文件:行号**:`docs/interfaces.md §5.1` 已声明 phase YAML 有
   `stall_warn_minutes` 字段;`crates/ccteam-core/src/stall.rs` 的 `STALL_WARN_SECONDS`
@@ -471,7 +472,7 @@ change。按 CLAUDE.md §五.3 "不写 backwards-compat shim",直接换。
    - 长期 `docs/core/` + `docs/teams/<team>/` 整理(M3.4)
 8. **延后**:
    - F15(M1+ 引入 `block-push` 时一并做)
-   - F21(`stall_warn_minutes` 已 spec 未实现,M0.5.3 顺手或 M1 cross-cutting watcher 上线前)
+   - ~~F21~~(已修复 @a5fb21d:`stall.rs` 的 `StallThresholds::from_phase` + orchestrator 读 `current_phase` 模板)
    - F20(原 P1 已升 P0,M3 完成 retro_schema 数据形式后,M4.1 retro phase 实现一并处理)
 
 每个 PR 必须有 dev pipeline happy-path 回归测试通过。
