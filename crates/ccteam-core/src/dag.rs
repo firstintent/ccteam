@@ -159,6 +159,9 @@ mod tests {
             completion_signal: String::new(),
             next_on_done: next_on_done.map(String::from),
             next_on_escalate: None,
+            decision_mode: crate::phases::DecisionMode::default(),
+            max_clarify_rounds: 3,
+            golden_rules: Vec::new(),
         }
     }
 

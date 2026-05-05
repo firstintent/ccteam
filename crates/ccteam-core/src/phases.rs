@@ -1,10 +1,13 @@
 //! Phase template parser. Templates live as markdown files with a YAML
 //! front matter header — schema in `docs/interfaces.md` §5.1.
 //!
-//! M0 parses the template strictly enough to support orchestrator checks:
-//! - `parallelism` must be `solo` (M2/M3 widen this).
-//! - `sub_skills` may be empty; orchestrator no-ops it. M2 implements
-//!   actual scheduling (see development-plan §2.1 M0.6 acceptance).
+//! Schema scope:
+//! - `parallelism` is one of `solo` / `agent_team` / `multi_session`.
+//!   M2 lifts the gate to allow `agent_team` once `agent_team:` lists
+//!   at least one role; `multi_session` still bails (M3.x).
+//! - `sub_skills` is the auto-trigger schedule (M2.1+);
+//! - `decision_mode` / `max_clarify_rounds` / `golden_rules` (M2.3+) are
+//!   phase-internal user-decision UX + hard-quality enforcement contracts.
 
 use std::path::Path;
 
@@ -15,6 +18,7 @@ use crate::state::Parallelism;
 use crate::tool_surface::ToolsRequired;
 
 const DEFAULT_AUTO_LOOP_MAX_ITERATIONS: u32 = 3;
+const DEFAULT_MAX_CLARIFY_ROUNDS: u32 = 3;
 
 /// Phase-internal multi-role agent (M2+; M0 ignores).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,6 +50,84 @@ pub struct PhaseHooks {
     pub before: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after: Option<String>,
+}
+
+/// M2.3: phase-internal user-decision UX (interfaces §5.6.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionMode {
+    /// Block phase progress on `AskUserQuestion`. User assumed in-session.
+    Sync,
+    /// Write outbox `event_kind: clarify`; do not block. Pairs with
+    /// `PHASE_DONE_PENDING` (M3.6) when remaining work depends on the
+    /// answer. User assumed offline.
+    Async,
+    /// Try `AskUserQuestion` first; fall back to outbox after a short
+    /// in-phase timeout. Default.
+    Hybrid,
+}
+
+impl Default for DecisionMode {
+    fn default() -> Self {
+        Self::Hybrid
+    }
+}
+
+/// M2.3: hard-quality rule the orchestrator runs at phase boundary
+/// (interfaces §5.1, `golden_rules`).
+///
+/// YAML form:
+///
+/// ```yaml
+/// golden_rules:
+///   - rule_id: tests_green
+///     cmd: cargo test --workspace
+///   - rule_id: no_secrets_in_repo
+///     pattern: 'AWS_SECRET|sk-[a-zA-Z0-9]{32,}'
+/// ```
+///
+/// Exactly one of `cmd` / `pattern` per rule; checked by
+/// [`PhaseTemplate::validate_m0`]. The orchestrator carries no
+/// hard-coded `rule_id` — phase YAML is the only source of which
+/// rules to run, so plugin-style team templates can ship their own
+/// quality bars without ccteam-core changes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoldenRule {
+    pub rule_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cmd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+}
+
+/// What kind of enforcement a [`GoldenRule`] represents, after the
+/// exactly-one-of-cmd-pattern invariant is checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GoldenRuleKind<'a> {
+    /// Run a shell command; non-zero exit = violation.
+    Cmd(&'a str),
+    /// Regex match against staged diff / required-output text;
+    /// any match = violation.
+    Pattern(&'a str),
+}
+
+impl GoldenRule {
+    /// Resolve to the validated `Cmd | Pattern` shape. Errors when the
+    /// rule has zero or two of `cmd` / `pattern` set.
+    pub fn kind(&self) -> Result<GoldenRuleKind<'_>> {
+        match (self.cmd.as_deref(), self.pattern.as_deref()) {
+            (Some(c), None) => Ok(GoldenRuleKind::Cmd(c)),
+            (None, Some(p)) => Ok(GoldenRuleKind::Pattern(p)),
+            (Some(_), Some(_)) => bail!(
+                "golden_rule `{}` has both `cmd` and `pattern`; pick one",
+                self.rule_id,
+            ),
+            (None, None) => bail!(
+                "golden_rule `{}` missing both `cmd` and `pattern`; one is required",
+                self.rule_id,
+            ),
+        }
+    }
 }
 
 /// Parsed YAML front matter of a phase template.
@@ -119,10 +201,36 @@ pub struct PhaseTemplate {
     /// `target_phase` field, independent of this static fallback.
     #[serde(default)]
     pub next_on_escalate: Option<String>,
+
+    /// M2.3: how phase markdown surfaces user-decision questions
+    /// (interfaces §5.6.1). Default `hybrid` keeps every legacy
+    /// template working without declaring the field — `AskUserQuestion`
+    /// is tried first and the phase falls back to outbox after a
+    /// short in-phase timeout.
+    #[serde(default)]
+    pub decision_mode: DecisionMode,
+
+    /// M2.3: hard cap on CLARIFY rounds inside one phase. Past this
+    /// the phase must produce a best-effort artifact and ESCALATE
+    /// `INSUFFICIENT_CLARIFICATION` (interfaces §5.6.2). Default 3 —
+    /// verdict / kickoff phases bump it to 5–7 in their templates.
+    #[serde(default = "default_max_clarify_rounds")]
+    pub max_clarify_rounds: u32,
+
+    /// M2.3: phase-level hard-quality rules (interfaces §5.1
+    /// `golden_rules`). Empty = no enforcement; orchestrator never
+    /// adds rules itself, so dev / product-research / etc. teams
+    /// each declare their own.
+    #[serde(default)]
+    pub golden_rules: Vec<GoldenRule>,
 }
 
 fn default_auto_loop_max_iterations() -> u32 {
     DEFAULT_AUTO_LOOP_MAX_ITERATIONS
+}
+
+fn default_max_clarify_rounds() -> u32 {
+    DEFAULT_MAX_CLARIFY_ROUNDS
 }
 
 impl PhaseTemplate {
@@ -145,16 +253,27 @@ impl PhaseTemplate {
             .with_context(|| format!("parse phase template {}", path.display()))
     }
 
-    /// Validate M0 invariants. Stricter checks (per-trigger sub_skill
-    /// validity, agent_team coupling with parallelism::AgentTeam) land
-    /// in M2/M3.
+    /// Validate phase-template invariants. Method name is preserved as
+    /// `validate_m0` for callsite stability; the body widened in M2 to
+    /// allow `parallelism: agent_team` (M2.2) and check the new M2.3
+    /// fields (`max_clarify_rounds > 0`, `golden_rules` shape).
     pub fn validate_m0(&self) -> Result<()> {
-        if self.parallelism != Parallelism::Solo {
-            bail!(
-                "phase `{}` declares parallelism `{:?}`; M0 only supports `solo` (development-plan §2.1)",
-                self.name,
-                self.parallelism,
-            );
+        match self.parallelism {
+            Parallelism::Solo => {}
+            Parallelism::AgentTeam => {
+                if self.agent_team.is_empty() {
+                    bail!(
+                        "phase `{}` declares parallelism `agent_team` but no `agent_team:` roles; nothing for the orchestrator to dispatch",
+                        self.name,
+                    );
+                }
+            }
+            Parallelism::MultiSession => {
+                bail!(
+                    "phase `{}` declares parallelism `multi_session`; M2 does not support it yet (M3.x widens)",
+                    self.name,
+                );
+            }
         }
         if self.auto_loop && self.completion_signal.trim().is_empty() {
             bail!(
@@ -167,6 +286,17 @@ impl PhaseTemplate {
                 "phase `{}` declares `auto_loop: true` with `auto_loop_max_iterations: 0` — that would never enter the loop",
                 self.name,
             );
+        }
+        if self.max_clarify_rounds == 0 {
+            bail!(
+                "phase `{}` declares `max_clarify_rounds: 0`; phase would skip every clarify and ESCALATE on first try",
+                self.name,
+            );
+        }
+        for rule in &self.golden_rules {
+            rule.kind().with_context(|| {
+                format!("phase `{}` golden_rule `{}` invalid", self.name, rule.rule_id)
+            })?;
         }
         Ok(())
     }
@@ -215,20 +345,6 @@ mod tests {
         assert!(t.required_inputs.is_empty());
         assert!(t.sub_skills.is_empty());
         t.validate_m0().unwrap();
-    }
-
-    #[test]
-    fn validate_m0_rejects_agent_team_parallelism() {
-        let src = concat!(
-            "---\n",
-            "name: implement\n",
-            "parallelism: agent_team\n",
-            "---\n",
-            "body\n",
-        );
-        let t = PhaseTemplate::parse(src).unwrap();
-        let err = t.validate_m0().unwrap_err();
-        assert!(err.to_string().contains("solo"), "got: {err}");
     }
 
     #[test]
@@ -303,7 +419,7 @@ mod tests {
         assert!(!t.auto_loop);
         assert_eq!(t.auto_loop_max_iterations, 3);
         assert!(t.completion_signal.is_empty());
-        // M0 validation passes — auto_loop=false ignores the empty signal.
+        // Validation passes — auto_loop=false ignores the empty signal.
         t.validate_m0().unwrap();
     }
 
@@ -360,6 +476,168 @@ mod tests {
         let err = t.validate_m0().unwrap_err();
         assert!(
             format!("{err:#}").contains("auto_loop_max_iterations"),
+            "got: {err:#}",
+        );
+    }
+
+    // ---------------- M2.2 / M2.3 ----------------
+
+    #[test]
+    fn validate_m2_accepts_agent_team_with_roles() {
+        let src = concat!(
+            "---\n",
+            "name: implement\n",
+            "parallelism: agent_team\n",
+            "agent_team:\n",
+            "  - role: backend-dev\n",
+            "  - role: reviewer\n",
+            "---\n",
+            "body\n",
+        );
+        let t = PhaseTemplate::parse(src).unwrap();
+        t.validate_m0().unwrap();
+        assert_eq!(t.parallelism, Parallelism::AgentTeam);
+        assert_eq!(t.agent_team.len(), 2);
+    }
+
+    #[test]
+    fn validate_m2_rejects_agent_team_without_roles() {
+        let src = concat!(
+            "---\n",
+            "name: implement\n",
+            "parallelism: agent_team\n",
+            "---\n",
+            "body\n",
+        );
+        let t = PhaseTemplate::parse(src).unwrap();
+        let err = t.validate_m0().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("agent_team"),
+            "got: {err:#}",
+        );
+    }
+
+    #[test]
+    fn validate_m2_still_rejects_multi_session() {
+        let src = concat!(
+            "---\n",
+            "name: implement\n",
+            "parallelism: multi_session\n",
+            "---\n",
+            "body\n",
+        );
+        let t = PhaseTemplate::parse(src).unwrap();
+        let err = t.validate_m0().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("multi_session"),
+            "got: {err:#}",
+        );
+    }
+
+    #[test]
+    fn decision_mode_defaults_to_hybrid() {
+        let src = concat!(
+            "---\n",
+            "name: implement\n",
+            "parallelism: solo\n",
+            "---\n",
+            "body\n",
+        );
+        let t = PhaseTemplate::parse(src).unwrap();
+        assert_eq!(t.decision_mode, DecisionMode::Hybrid);
+        assert_eq!(t.max_clarify_rounds, 3);
+        assert!(t.golden_rules.is_empty());
+    }
+
+    #[test]
+    fn decision_mode_parses_explicit_sync_async_hybrid() {
+        for mode in ["sync", "async", "hybrid"] {
+            let src = format!(
+                "---\nname: x\nparallelism: solo\ndecision_mode: {mode}\n---\nbody\n",
+            );
+            let t = PhaseTemplate::parse(&src).unwrap();
+            let expected = match mode {
+                "sync" => DecisionMode::Sync,
+                "async" => DecisionMode::Async,
+                "hybrid" => DecisionMode::Hybrid,
+                _ => unreachable!(),
+            };
+            assert_eq!(t.decision_mode, expected, "mode={mode}");
+        }
+    }
+
+    #[test]
+    fn max_clarify_rounds_zero_fails_validation() {
+        let src = concat!(
+            "---\n",
+            "name: x\n",
+            "parallelism: solo\n",
+            "max_clarify_rounds: 0\n",
+            "---\n",
+            "body\n",
+        );
+        let t = PhaseTemplate::parse(src).unwrap();
+        let err = t.validate_m0().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("max_clarify_rounds"),
+            "got: {err:#}",
+        );
+    }
+
+    #[test]
+    fn golden_rules_parse_cmd_and_pattern() {
+        let src = concat!(
+            "---\n",
+            "name: ship\n",
+            "parallelism: solo\n",
+            "golden_rules:\n",
+            "  - rule_id: tests_green\n",
+            "    cmd: cargo test --workspace\n",
+            "  - rule_id: no_secrets_in_repo\n",
+            "    pattern: 'AWS_SECRET|sk-[a-zA-Z0-9]{32,}'\n",
+            "---\n",
+        );
+        let t = PhaseTemplate::parse(src).unwrap();
+        t.validate_m0().unwrap();
+        assert_eq!(t.golden_rules.len(), 2);
+        assert!(matches!(t.golden_rules[0].kind().unwrap(), GoldenRuleKind::Cmd(c) if c.starts_with("cargo")));
+        assert!(matches!(t.golden_rules[1].kind().unwrap(), GoldenRuleKind::Pattern(p) if p.contains("AWS_SECRET")));
+    }
+
+    #[test]
+    fn golden_rule_with_both_cmd_and_pattern_fails() {
+        let src = concat!(
+            "---\n",
+            "name: x\n",
+            "parallelism: solo\n",
+            "golden_rules:\n",
+            "  - rule_id: confused\n",
+            "    cmd: ls\n",
+            "    pattern: 'foo'\n",
+            "---\n",
+        );
+        let t = PhaseTemplate::parse(src).unwrap();
+        let err = t.validate_m0().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("confused"),
+            "got: {err:#}",
+        );
+    }
+
+    #[test]
+    fn golden_rule_with_neither_cmd_nor_pattern_fails() {
+        let src = concat!(
+            "---\n",
+            "name: x\n",
+            "parallelism: solo\n",
+            "golden_rules:\n",
+            "  - rule_id: empty_rule\n",
+            "---\n",
+        );
+        let t = PhaseTemplate::parse(src).unwrap();
+        let err = t.validate_m0().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("empty_rule"),
             "got: {err:#}",
         );
     }
