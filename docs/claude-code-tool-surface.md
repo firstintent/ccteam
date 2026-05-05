@@ -193,41 +193,66 @@ Claude Code 对 `~/.claude/skills/`、项目 `.claude/skills/`、`--add-dir`
 - Agent 文件(`~/.claude/agents/<name>.md`)文档没明说是否实时监听 ——
   **需要实测**,见下面探针。
 
-#### 1.2.5 实测 agent 文件是否中途热加载(请手动验证)
+#### 1.2.5 实测结果:agent **不**热加载
 
-ccteam M1 自治调用 plugin agent 的方案 A 强依赖这条:`bootstrap_project`
-能不能在长会话启动**之后**才 ln -sf agent 文件,还是必须在 `tmux start`
-之前?跑这套验证:
+**已验证(2026-05-05)**:
 
-```
-# 1. 在长会话里先确认 code-reviewer 不可调
-请用 Task 工具,subagent_type="code-reviewer",
-description="probe", prompt="say hi"
-→ 应报 "Agent type 'code-reviewer' not found"
-```
+1. 长会话里 `Task(subagent_type="code-reviewer")` → `Agent type 'code-reviewer' not found. Available agents: claude-code-guide, Explore, general-purpose, Plan, statusline-setup`
+2. 在另一终端 `ln -sf ~/.claude/plugins/.../pr-review-toolkit/agents/code-reviewer.md ~/.claude/agents/code-reviewer.md`
+3. 回长会话(**未退出 / 未 /reload-plugins**),再次 `Task(subagent_type="code-reviewer")` → **仍然** `Agent type 'code-reviewer' not found`,Available agents 列表没变
 
-```
-# 2. 不退出会话,在另一个终端跑:
-mkdir -p ~/.claude/agents
-ln -sf ~/.claude/plugins/marketplaces/claude-plugins-official/plugins/pr-review-toolkit/agents/code-reviewer.md \
-       ~/.claude/agents/code-reviewer.md
-```
+**结论与 skill 不同**:
+- Skill 的 SKILL.md 文件实时监听,中途加生效
+- `~/.claude/agents/<name>.md` **在会话启动时一次性扫描**,中途加文件不生效
+
+#### 1.2.6 给 ccteam M1 `bootstrap_project` 的强约束
+
+既然 agent 必须 startup 前注册,`bootstrap_project` 的执行顺序必须是:
 
 ```
-# 3. 回到长会话,再次跑同样的 Task 调用
-请用 Task 工具,subagent_type="code-reviewer",
-description="probe", prompt="say hi"
+ccteam new <brief>
+  ├─ 1. 创建 ~/projects/<slug>/ 目录与子目录
+  ├─ 2. 写 spec.md / CLAUDE.md / phase 模板 / settings.json
+  ├─ 3. 写 ~/.claude.json 的 hasTrustDialogAccepted
+  ├─ 4. **ln -sf 推荐 plugin agents 到 ~/.claude/agents/**(M1 新增)
+  ├─ 5. mkdir -p ~/.claude/skills/ <project>/.claude/skills/(占位让监听挂上)
+  └─ 6. 由 orchestrator ensure_session 触发 tmux new-session(claude TUI 启动)
 ```
 
-**两种可能**:
-- **可调** → agent 也支持热加载,`bootstrap_project` 可以放到 `ensure_session`
-  之后任意时机做 ln -sf,设计自由度高
-- **不可调** → 必须在长会话启动**之前**完成 ln -sf;`bootstrap_project`
-  顺序要严格保证(写 settings.json → ln agents → tmux start);如果中途
-  要新增,需 send-keys `/reload-plugins`(代价是该命令会重置 plugin 状态)
+第 4 步**必须**在第 6 步之前;第 5 步是为了让 skill 后续懒注入能命中
+(§1.2.4 实时监听只对会话启动时已存在的目录生效)。
 
-把验证结果告诉我,我据此调整 §6.2 和 development-plan 里 M1 那条任务的
-精确顺序。
+如果运行中需要新增 agent(M2 director-claude 决定切到一个新 agent),
+**只有两条路**:
+
+- **重启长会话**(`/exit` + 新 session)—— 不丢 progress.jsonl 但丢
+  prompt cache、丢 in-flight context
+- **send-keys `/reload-plugins`** —— 不丢 cache,但会把已装 plugin 全部
+  reload 一遍(plugin 状态回 idle)
+
+两条都贵,所以 M1 优先把"会用到的全部 agent"在 `bootstrap_project`
+阶段一次性 ln 齐。
+
+#### 1.2.7 `Task` ≠ `TaskCreate` — 容易踩的命名坑
+
+实测时模型在第二次调用走错了工具 — 用了 `TaskCreate` 而不是 `Task`/
+`Agent`。这两个是**完全不同的工具**:
+
+| 工具 | 作用 | 关键参数 |
+|---|---|---|
+| `Task` / `Agent` | 启动一个 subagent 跑一个任务 | `subagent_type`, `description`, `prompt` |
+| `TaskCreate` | 在任务管理列表里**创建一条 todo**(不是启动 agent) | `subject`, `description`, `activeForm` |
+
+phase markdown 写 prompt 时要明确说 "用 `Task` 工具" 或 "用 `Agent` 工具"
+(取决于当前会话哪个名字暴露出来——两个名字其实是同一个工具的别名)。
+**不要写"用 TaskCreate"——那是另一个工具,会创建 todo 而不是 launch agent**。
+也避免写"用 Task tool"再加上 `subject` / `description` 参数,模型可能挑错。
+最稳的写法:
+
+```
+请用 Task 工具(注意是 Agent 调度工具,不是 TaskCreate 任务管理工具),
+传 subagent_type="<name>", description="<short>", prompt="<full body>"。
+```
 
 ---
 
@@ -468,9 +493,13 @@ done
 | `pr-review-toolkit` | `comment-analyzer` | review phase |
 | `code-simplifier` | `code-simplifier` | review 后打磨 |
 
-**ccteam 路线图**:M1 起 `ccteam doctor --install-recommended-agents` 自动
-做上面的 ln -sf;在那之前,phase 模板用 §1.1.3 方案 B(`@文件引用` + Task
-general-purpose)兜底。
+**ccteam 路线图**:M1 起 `bootstrap_project` 在 `tmux new-session` **之前**
+自动做 ln -sf(执行顺序见 §1.2.6);可单独通过 `ccteam doctor
+--install-recommended-agents` 给老项目补做。在 M1 落地前,phase 模板用
+§1.1.3 方案 B(`@文件引用` + Task general-purpose)兜底。
+
+**关键约束**(已实测确认):agent 文件必须在 claude session 启动时已存在 ——
+中途 ln -sf 不生效(§1.2.5)。这条不能违反。
 
 ### 6.3 推荐挂的 hook(plugin 提供)
 
