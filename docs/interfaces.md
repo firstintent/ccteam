@@ -284,7 +284,9 @@ required_outputs:                 # 必产出物;Stop 前 hook 验证;缺则不�
   - src/**/*
   - .ccteam/implement-report.md
 soft_cost_warn_usd: 5.0           # 仅告警,不打断
-stall_warn_minutes: 5             # 5 分钟无 hook event 第一次软告警
+stall_warn_minutes: 5             # 1× warn / 3× suspicious / 6× escalate 三档(分钟);
+                                  # `5` → 5/15/30 分钟。research 04-primary 用 60 → 60/180/360
+                                  # 缺省时退回 5/15/30(代码常量,见 stall.rs)
 parallelism: solo                 # solo | agent_team | multi_session(详见 tech-design §3.3、§6.3、§6.11)
                                   # M0 仅支持 solo;M2 支持 agent_team;M3 支持 multi_session
                                   # subagent 不在此声明——任何 agent 都可 ad-hoc 通过 Task 工具启动

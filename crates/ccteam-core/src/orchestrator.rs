@@ -25,7 +25,7 @@ use crate::fix_loop::{self, FixLoopState};
 use crate::paths::CcteamPaths;
 use crate::phases::PhaseTemplate;
 use crate::progress;
-use crate::stall::{self, StallLevel};
+use crate::stall::{self, StallLevel, StallThresholds};
 use crate::state::{PhaseHistoryEntry, PhaseState, ProjectState};
 use crate::tmux::TmuxSession;
 use crate::tool_surface::{user_claude_dir, ToolSurfaceSnapshot};
@@ -676,22 +676,45 @@ impl Orchestrator {
             return;
         }
         let silent = stall::silent_seconds(state, now);
-        match stall::classify(silent) {
+
+        // Per-phase thresholds: research's 04-primary phase legitimately
+        // waits hours for human-supplied data, so applying dev's 5/15/30
+        // hardcoded buckets there would fire false warnings every tick.
+        // Falls back to the 5/15/30 default when the phase template
+        // doesn't declare `stall_warn_minutes` (or current_phase is
+        // empty during bootstrap).
+        let thresholds = self
+            .templates
+            .iter()
+            .find(|t| t.name == state.current_phase)
+            .map(|t| StallThresholds::from_phase(t.stall_warn_minutes))
+            .unwrap_or_default();
+
+        match stall::classify_with_thresholds(silent, &thresholds) {
             StallLevel::Ok => {}
             StallLevel::Warn => tracing::warn!(
                 slug,
+                phase = %state.current_phase,
                 silent_seconds = silent,
-                "stall ≥5min: project quiet, no progress events",
+                threshold_minutes = thresholds.warn_minutes(),
+                "stall ≥{}min: project quiet, no progress events",
+                thresholds.warn_minutes(),
             ),
             StallLevel::Suspicious => tracing::error!(
                 slug,
+                phase = %state.current_phase,
                 silent_seconds = silent,
-                "stall ≥15min: claude may be hung, consider attaching",
+                threshold_minutes = thresholds.suspicious_minutes(),
+                "stall ≥{}min: claude may be hung, consider attaching",
+                thresholds.suspicious_minutes(),
             ),
             StallLevel::Escalate => tracing::error!(
                 slug,
+                phase = %state.current_phase,
                 silent_seconds = silent,
-                "stall ≥30min: ESCALATE territory; M1 telegram should ping user",
+                threshold_minutes = thresholds.escalate_minutes(),
+                "stall ≥{}min: ESCALATE territory; M1 telegram should ping user",
+                thresholds.escalate_minutes(),
             ),
         }
     }

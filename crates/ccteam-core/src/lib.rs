@@ -24,8 +24,8 @@ pub use orchestrator::{
 pub use projects::{bootstrap_project, pick_unused_slug, pre_trust_project, slugify};
 pub use cost::{classify as classify_cost, CostLevel, COST_MID_WARN_USD};
 pub use stall::{
-    classify as classify_stall, silent_seconds, StallLevel, STALL_ESCALATE_SECONDS,
-    STALL_SUSPICIOUS_SECONDS, STALL_WARN_SECONDS,
+    classify as classify_stall, classify_with_thresholds, silent_seconds, StallLevel,
+    StallThresholds, STALL_ESCALATE_SECONDS, STALL_SUSPICIOUS_SECONDS, STALL_WARN_SECONDS,
 };
 pub use paths::{slug_from_project_dir, CcteamPaths};
 pub use phases::{
