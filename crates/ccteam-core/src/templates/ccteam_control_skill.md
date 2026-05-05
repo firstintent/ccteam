@@ -13,27 +13,33 @@ allowed-tools: [Bash]
 # ccteam-control
 
 ccteam is an autonomous project orchestrator built on Claude Code.
-This skill makes ccteam reachable from any claude session via the
-`ccteam` CLI. Default to `--format json` so output is structured.
+This skill makes ccteam reachable from any claude session.
 
-## Capability index
+**Prefer the MCP server.** Once `ccteam doctor --install-mcp` has
+registered the server (M2.5), every claude session sees nine
+`mcp__ccteam__*` tools — call those first. The `Bash` + `--format
+json` path below stays as a fallback for sessions where the MCP
+server isn't registered yet.
 
-| What you want | Command |
-|---|---|
-| List all projects                | `ccteam ls --format json` |
-| One project's full state         | `ccteam show <slug> --format json` |
-| Recent progress events           | `ccteam progress <slug>` (or `--tail` for live stream) |
-| Capture session pane content     | `ccteam peek <slug>` |
-| Start a new project              | `ccteam new --team=dev "<request>"` |
-| Pause project (no kill)          | `ccteam pause <slug>` *(M2 implements; M1 stub)* |
-| Resume project                   | `ccteam resume <slug>` |
-| Reject project                   | `ccteam reject <slug>` *(M2 implements; M1 stub)* |
-| Health checks                    | `ccteam doctor --tool-surface` |
-| Install meta-agent for a user    | `ccteam doctor --install-meta-agent <handle>` |
+## Capability index — MCP first, Bash fallback
 
-`--format json` is on every query command (`ls`, `show`). Prefer JSON
-when piping output into your own analysis. The schema lives in
-`docs/interfaces.md` §10.3.
+| What you want | MCP tool (preferred) | Bash fallback |
+|---|---|---|
+| List all projects                | `mcp__ccteam__ls`                | `ccteam ls --format json` |
+| One project's full state         | `mcp__ccteam__show`              | `ccteam show <slug> --format json` |
+| Recent progress events           | `mcp__ccteam__progress`          | `ccteam progress <slug>` |
+| Capture session pane content     | `mcp__ccteam__peek`              | `ccteam peek <slug>` |
+| Start a new project              | `mcp__ccteam__new`               | `ccteam new --team=dev "<request>"` |
+| Pause project (no kill)          | `mcp__ccteam__pause`             | `ccteam pause <slug>` |
+| Resume project                   | `mcp__ccteam__resume`            | `ccteam resume <slug>` |
+| Send NL to a session inbox       | `mcp__ccteam__send_to_session`   | (write `.ccteam/inbox/msg-<ts>-NNN.md`) |
+| Inject ESCALATE-style decision   | `mcp__ccteam__inject_decision`   | (compose body manually + send_to_session) |
+| Health checks                    | (Bash only)                      | `ccteam doctor --tool-surface` |
+| Install meta-agent               | (Bash only)                      | `ccteam doctor --install-meta-agent <handle>` |
+
+When the MCP server is registered, `ccteam doctor --install-mcp` (run
+once) wires `mcpServers.ccteam` into `~/.claude.json`. Existing claude
+sessions need `/reload-mcp`; new sessions pick it up immediately.
 
 ## Typical workflows
 
@@ -95,12 +101,16 @@ Combine the two outputs and recommend exactly **one** of:
 
 When this skill is loaded inside a ccteam meta-agent session:
 
-1. Prefer `ccteam new` dispatch over doing the work yourself. The
-   meta-agent role prompt (CLAUDE.md) covers the dispatcher-not-worker
-   rule — this skill is the tool list the dispatcher uses.
+1. Prefer `mcp__ccteam__new` dispatch over doing the work yourself.
+   The meta-agent role prompt (CLAUDE.md) covers the
+   dispatcher-not-worker rule — this skill is the tool list the
+   dispatcher uses.
 2. After every dispatch / status reply, write an outbox file at
    `~/projects/<user>-meta/.ccteam/outbox/reply-<ts>-<seq>.md` per
    `docs/interfaces.md` §3.4.3.
-3. M2.8 will swap shell-parsing for the `ccteam-mcp` MCP server. When
-   that lands, prefer `mcp__ccteam__*` tools over `Bash` invocations
-   of the same CLI. The `--format json` paths remain a stable fallback.
+3. When the user has resolved a project's clarify/escalation, use
+   `mcp__ccteam__inject_decision` (or its Bash equivalent) to push
+   the resolution back into the project session — it constructs an
+   ESCALATE-style markdown payload (interfaces §4.1.1) and atomically
+   writes it to the project's inbox so the orchestrator delivers it
+   on the next tick.

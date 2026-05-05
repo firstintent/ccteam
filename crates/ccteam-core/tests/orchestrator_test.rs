@@ -64,7 +64,10 @@ fn orchestrator_loads_valid_solo_template() {
 }
 
 #[test]
-fn orchestrator_fails_fast_on_agent_team_template() {
+fn orchestrator_fails_fast_on_agent_team_template_without_roles() {
+    // M2.2 lifts the blanket `parallelism: agent_team` ban — declared
+    // teams may now run agent_team phases — but the role list must be
+    // non-empty, otherwise the orchestrator has nothing to dispatch.
     let tmp = TempDir::new().unwrap();
     let paths = fresh_paths(&tmp);
     write_template(
@@ -82,9 +85,36 @@ fn orchestrator_fails_fast_on_agent_team_template() {
     let err = Orchestrator::new(paths, OrchestratorConfig::default()).unwrap_err();
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("solo"),
-        "expected M0 validation failure, got: {msg}",
+        msg.contains("agent_team"),
+        "expected validation failure mentioning agent_team, got: {msg}",
     );
+}
+
+#[test]
+fn orchestrator_accepts_agent_team_template_with_roles() {
+    // M2.2: phase YAML with parallelism: agent_team + at least one
+    // role passes validation. Orchestrator dispatch behavior is still
+    // gated on the M2.2.0 spike; this test only covers the schema.
+    let tmp = TempDir::new().unwrap();
+    let paths = fresh_paths(&tmp);
+    write_template(
+        &paths.phases_dir(),
+        "03-implement.md",
+        concat!(
+            "---\n",
+            "name: implement\n",
+            "parallelism: agent_team\n",
+            "agent_team:\n",
+            "  - role: backend-dev\n",
+            "  - role: reviewer\n",
+            "---\n",
+            "body\n",
+        ),
+    );
+
+    let orch = Orchestrator::new(paths, OrchestratorConfig::default()).unwrap();
+    assert_eq!(orch.templates().len(), 1);
+    assert_eq!(orch.templates()[0].agent_team.len(), 2);
 }
 
 #[test]

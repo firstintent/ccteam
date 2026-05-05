@@ -11,10 +11,11 @@ use serde_json::{json, Map, Value};
 
 use ccteam_core::{
     bootstrap_meta_project, bootstrap_project, current_ccteam_bin, install_ccteam_control_skill,
-    link_recommended_agents, pick_unused_slug, user_claude_dir, write_global_phase_templates,
-    AgentLinkAction, AgentLinkReport, CcteamPaths, InstallSkillOptions, LinkOptions,
-    MetaBootstrapReport, OutboxEventKind, OutboxMessage, PhaseState, PhaseTemplate, ProjectState,
-    SessionMailbox, SkillInstallAction, ToolSurfaceSnapshot, BUILTIN_SUBAGENTS, PHASE_TEMPLATES,
+    link_recommended_agents, pick_unused_slug, user_claude_dir, write_global_helper_templates,
+    write_global_phase_templates, AgentLinkAction, AgentLinkReport, CcteamPaths,
+    InstallSkillOptions, LinkOptions, MetaBootstrapReport, OutboxEventKind, OutboxMessage,
+    PhaseState, PhaseTemplate, ProjectState, SessionMailbox, SkillInstallAction,
+    ToolSurfaceSnapshot, BUILTIN_SUBAGENTS, HELPER_TEMPLATES, PHASE_TEMPLATES,
 };
 use ccteam_core::tmux::TmuxSession;
 
@@ -41,6 +42,7 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
 
     for sub in [
         "phases",
+        "templates",
         "progress",
         "inbox",
         "control",
@@ -56,6 +58,12 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
 
     write_global_phase_templates(&paths.root, opts.force)
         .with_context(|| format!("unpack phase templates to {}", paths.phases_dir().display()))?;
+    write_global_helper_templates(&paths.root, opts.force).with_context(|| {
+        format!(
+            "unpack helper templates to {}",
+            paths.templates_dir().display()
+        )
+    })?;
 
     let bin = current_ccteam_bin().ok();
 
@@ -68,6 +76,11 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
         "✓ unpacked {} phase templates → {}\n",
         PHASE_TEMPLATES.len(),
         paths.phases_dir().display()
+    ));
+    out.push_str(&format!(
+        "✓ unpacked {} helper templates → {}\n",
+        HELPER_TEMPLATES.len(),
+        paths.templates_dir().display()
     ));
     out.push_str("\nhealth check:\n");
     match &claude {
@@ -486,6 +499,8 @@ pub struct DoctorOptions {
     /// `Some("rob")` ⇒ creates `~/projects/rob-meta/` and triggers
     /// `install_skill` regardless of its standalone flag.
     pub install_meta_agent: Option<String>,
+    /// M2.5: register `mcpServers.ccteam` in `~/.claude.json`.
+    pub install_mcp: bool,
 }
 
 /// `ccteam doctor` dispatch. Returns a human-readable report so unit
@@ -494,7 +509,8 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
     let any_mode = opts.install_recommended_agents
         || opts.tool_surface
         || opts.install_skill
-        || opts.install_meta_agent.is_some();
+        || opts.install_meta_agent.is_some()
+        || opts.install_mcp;
     if !any_mode {
         return Ok(String::from(
             "ccteam doctor: pass at least one mode flag.\n\
@@ -507,7 +523,9 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
              --install-skill [--force]\n      \
              write ~/.claude/skills/ccteam-control/SKILL.md (M1.8).\n  \
              --install-meta-agent <user-handle>\n      \
-             bootstrap a meta-agent project for the given user (M1.0). Implies --install-skill.\n",
+             bootstrap a meta-agent project for the given user (M1.0). Implies --install-skill.\n  \
+             --install-mcp\n      \
+             register `mcpServers.ccteam` in ~/.claude.json so daily-driver claude + meta-agent see the 9-tool MCP server (M2.5).\n",
         ));
     }
     let mut out = String::new();
@@ -526,6 +544,22 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
     if let Some(handle) = &opts.install_meta_agent {
         out.push_str(&render_install_meta_agent_report(paths, handle)?);
     }
+    if opts.install_mcp {
+        out.push_str(&render_install_mcp_report()?);
+    }
+    Ok(out)
+}
+
+fn render_install_mcp_report() -> Result<String> {
+    let path = crate::mcp_serve::install_mcp()?;
+    let mut out = String::from("ccteam doctor --install-mcp\n\n");
+    out.push_str(&format!("  registered ccteam MCP server in {}\n", path.display()));
+    out.push_str("  tools surface : 9 (interfaces §12.2)\n");
+    out.push_str("  consumers     : daily-driver claude + meta-agent\n");
+    out.push('\n');
+    out.push_str(
+        "open a new claude session to pick up the change; existing sessions need /reload-mcp.\n",
+    );
     Ok(out)
 }
 
@@ -803,7 +837,7 @@ pub fn collect_projects(paths: &CcteamPaths) -> Result<Vec<ProjectSummary>> {
     Ok(out)
 }
 
-fn collect_recent_events(
+pub fn collect_recent_events(
     paths: &CcteamPaths,
     slug: &str,
     n: usize,
@@ -1192,7 +1226,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
         let report = run_init(&paths, InitOptions::default()).unwrap();
-        for sub in ["phases", "progress", "inbox", "control"] {
+        for sub in ["phases", "templates", "progress", "inbox", "control"] {
             assert!(
                 paths.root.join(sub).is_dir(),
                 "init must create {}",
@@ -1201,7 +1235,17 @@ mod tests {
         }
         assert!(paths.phases_dir().join("02-plan-eng.md").is_file());
         assert!(paths.phases_dir().join("09-ship.md").is_file());
+        // M2.4: helper templates land alongside phase templates.
+        assert!(paths
+            .templates_dir()
+            .join("review-with-user-loop.md")
+            .is_file());
+        assert!(paths
+            .templates_dir()
+            .join("kickoff-reverse-interview.md")
+            .is_file());
         assert!(report.contains("phase templates"));
+        assert!(report.contains("helper templates"));
         assert!(report.contains("next"));
     }
 

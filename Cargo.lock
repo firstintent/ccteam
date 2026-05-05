@@ -119,6 +119,7 @@ dependencies = [
  "ccteam-hooks",
  "chrono",
  "clap",
+ "dirs",
  "serde_json",
  "tempfile",
  "tokio",

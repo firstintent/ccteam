@@ -9,6 +9,8 @@ soft_cost_warn_usd: 3.0
 stall_warn_minutes: 5
 parallelism: solo
 sub_skills: []
+decision_mode: hybrid
+max_clarify_rounds: 3
 ---
 
 # 任务:技术规划
@@ -52,6 +54,17 @@ ccteam 是**高质量软件元开发系统**,不是"凑合能跑就行"的玩具
 - 模块图(组件、依赖方向、边界)
 - 关键流程(2–3 个核心场景的时序图或步骤描述,需对得上 spec 的核心场景)
 - 失败模式分析(关键路径上每一步可能怎么坏,系统怎么恢复或暴露错误)
+
+## 与用户对齐:review-with-user 循环
+
+`plan-eng.md` 与 `architecture.md` 写完后,**先用 review-with-user 循环跟用户对齐**——
+spec 中模糊的地方现在没澄清,implement 阶段会撞上同样的问题,代价更高。
+
+按以下模板的步骤跑(`@` 引用直接 inline,Claude Code 原生机制;orchestrator 不参与解析):
+
+@~/.ccteam/templates/review-with-user-loop.md
+
+settled review 写到 `.ccteam/plan-eng-review.md`(供 implement 阶段读取)。
 
 ## 收尾
 

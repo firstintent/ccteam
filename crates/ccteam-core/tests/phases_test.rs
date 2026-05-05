@@ -22,6 +22,10 @@ const M0_TEMPLATES: &[(&str, &str)] = &[
 
 #[test]
 fn every_m0_template_parses_and_validates() {
+    // M2.1+ note: sub_skills is no longer required to be empty —
+    // implement.md now declares the code-reviewer auto-trigger so the
+    // orchestrator runs it on phase_done. The validate path is the
+    // contract; the empty-list assertion was an M0-era invariant.
     let dir = phases_dir();
     for (file, expected_name) in M0_TEMPLATES {
         let path = dir.join(file);
@@ -32,19 +36,18 @@ fn every_m0_template_parses_and_validates() {
             template.name, *expected_name,
             "{file}: front-matter `name` must equal phase id (without numeric prefix)",
         );
+        // Dev's shipped phases are still all `solo` — M2.2 lifts this
+        // gate but the `agent_team` enablement lives in a follow-up
+        // commit (post-spike), not in the static templates.
         assert_eq!(
             template.parallelism,
             Parallelism::Solo,
-            "{file}: M0 only supports parallelism: solo",
-        );
-        assert!(
-            template.sub_skills.is_empty(),
-            "{file}: M0 sub_skills must be empty (M2 starts scheduling)",
+            "{file}: dev phases stay solo until M2.2 enables agent_team",
         );
 
         template
             .validate_m0()
-            .unwrap_or_else(|e| panic!("{file} fails M0 validation: {e:#}"));
+            .unwrap_or_else(|e| panic!("{file} fails validation: {e:#}"));
     }
 }
 

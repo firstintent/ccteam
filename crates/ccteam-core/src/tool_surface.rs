@@ -318,6 +318,110 @@ pub fn link_recommended_agents(opts: LinkOptions) -> Result<Vec<AgentLinkReport>
     link_recommended_agents_into(&claude_dir, opts)
 }
 
+/// M2.1 extension: like [`link_recommended_agents_into`] but also
+/// walks every phase template's `sub_skills` list, parses any
+/// `claude-plugins-official:<plugin>/agents/<name>.md` reference, and
+/// links the plugin source into `<claude_dir>/agents/<name>.md` —
+/// even if the agent isn't in [`RECOMMENDED_AGENTS`]. Result is the
+/// union of "8 hardcoded recommended" + "everything phase YAML asks
+/// for", deduplicated by target filename.
+///
+/// Tools_required.subagents are *not* auto-linked here — they're a
+/// names-only list with no source-path information; the operator is
+/// responsible for placing custom agents under `~/.claude/agents/`.
+/// The orchestrator's startup tool-surface check (M0.5.3) catches
+/// the missing case with a fix-hint.
+pub fn link_recommended_agents_for_phases_into(
+    claude_dir: &Path,
+    templates: &[crate::phases::PhaseTemplate],
+    opts: LinkOptions,
+) -> Result<Vec<AgentLinkReport>> {
+    let mut reports = link_recommended_agents_into(claude_dir, opts)?;
+
+    let agents_dir = claude_dir.join("agents");
+    if !opts.dry_run {
+        std::fs::create_dir_all(&agents_dir)
+            .with_context(|| format!("create {}", agents_dir.display()))?;
+    }
+
+    let mut seen: BTreeSet<&str> = reports.iter().map(|r| r.agent.filename).collect();
+    for template in templates {
+        for spec in &template.sub_skills {
+            let Some((source, leaked_filename)) =
+                parse_official_plugin_subagent(&spec.skill)
+            else {
+                continue;
+            };
+            if seen.contains(leaked_filename) {
+                continue;
+            }
+            // Link target stays under <claude_dir>/agents/, same as
+            // RECOMMENDED_AGENTS.
+            let abs_source = claude_dir
+                .join("plugins")
+                .join("marketplaces")
+                .join("claude-plugins-official")
+                .join("plugins")
+                .join(&source);
+            let target = agents_dir.join(leaked_filename);
+            let action = link_one_agent(&abs_source, &target, opts)?;
+            reports.push(AgentLinkReport {
+                // Build a synthetic RecommendedAgent — the report
+                // type is shared with the hardcoded path; we only
+                // need enough for the operator to read.
+                agent: RecommendedAgent {
+                    filename: Box::leak(leaked_filename.to_string().into_boxed_str()),
+                    plugin: Box::leak(plugin_part(&source).to_string().into_boxed_str()),
+                    relpath: Box::leak(rel_part(&source).to_string().into_boxed_str()),
+                },
+                target,
+                action,
+            });
+            seen.insert(Box::leak(leaked_filename.to_string().into_boxed_str()));
+        }
+    }
+    Ok(reports)
+}
+
+/// Production entry: resolve `~/.claude/` then call the phase-aware
+/// variant. Used by `bootstrap_project` so every project-creation
+/// path stages every plugin agent the templates declare.
+pub fn link_recommended_agents_for_phases(
+    templates: &[crate::phases::PhaseTemplate],
+    opts: LinkOptions,
+) -> Result<Vec<AgentLinkReport>> {
+    let claude_dir = user_claude_dir()?;
+    link_recommended_agents_for_phases_into(&claude_dir, templates, opts)
+}
+
+/// Parse `claude-plugins-official:<plugin>/agents/<name>.md`. Returns
+/// `(plugin/agents/<name>.md, <name>.md)` — the first component is
+/// joined under `plugins/marketplaces/claude-plugins-official/plugins/`
+/// for the abs source path, the second is the basename used under
+/// `<claude_dir>/agents/`.
+fn parse_official_plugin_subagent(skill: &str) -> Option<(String, &str)> {
+    let rest = skill.strip_prefix("claude-plugins-official:")?;
+    // Only auto-link when the relative path looks like an agent file.
+    // sub_skills can also reference hooks (.sh / .py) which Claude Code
+    // doesn't load via Task — those should not become symlinks under
+    // ~/.claude/agents/.
+    if !rest.contains("/agents/") || !rest.ends_with(".md") {
+        return None;
+    }
+    let filename = rest.rsplit('/').next()?;
+    Some((rest.to_string(), filename))
+}
+
+fn plugin_part(rest: &str) -> &str {
+    rest.split('/').next().unwrap_or(rest)
+}
+
+fn rel_part(rest: &str) -> &str {
+    let mut parts = rest.splitn(2, '/');
+    parts.next();
+    parts.next().unwrap_or(rest)
+}
+
 /// Test-only helper: set `CCTEAM_DISABLE_TOOL_SURFACE_BOOTSTRAP=1` so
 /// any subsequent `bootstrap_project` call in the same process
 /// no-ops the `~/.claude/` mutation. Use from a once-init at the top

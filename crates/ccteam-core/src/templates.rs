@@ -30,6 +30,28 @@ pub const PHASE_TEMPLATES: &[(&str, &str)] = &[
     ("09-ship.md", include_str!("../../../phases/09-ship.md")),
 ];
 
+/// M2.4: helper templates that phase markdown can `@`-reference. Shipped
+/// inside the binary so a fresh install (or `ccteam doctor`) can stamp
+/// them into `~/.ccteam/templates/` without an external git checkout.
+///
+/// `(on_disk_filename, body)` — phase markdown references them as
+/// `@~/.ccteam/templates/<on_disk_filename>` and Claude Code's native
+/// `@` mechanism inlines the body at prompt-build time. The orchestrator
+/// does not parse these — they're pure Claude Code surface.
+///
+/// Filenames use hyphens to match the @-reference convention; the Rust
+/// source filenames use underscores to match Rust module conventions.
+pub const HELPER_TEMPLATES: &[(&str, &str)] = &[
+    (
+        "review-with-user-loop.md",
+        include_str!("templates/review_with_user_loop.md"),
+    ),
+    (
+        "kickoff-reverse-interview.md",
+        include_str!("templates/kickoff_reverse_interview.md"),
+    ),
+];
+
 /// Strip a leading `NN-` index prefix off a global phase filename so it
 /// matches the path the phase prompt asks claude to read
 /// (`@.ccteam/phases/<phase>.md`). Returns the original name unchanged
@@ -146,6 +168,30 @@ pub fn write_global_phase_templates(global_dir: &Path, force: bool) -> Result<()
         .with_context(|| format!("create {}", dir.display()))?;
     for (global, body) in PHASE_TEMPLATES {
         let path = dir.join(global);
+        if path.exists() && !force {
+            continue;
+        }
+        std::fs::write(&path, body)
+            .with_context(|| format!("write {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// M2.4: write the embedded `HELPER_TEMPLATES` into
+/// `<global_dir>/templates/<filename>` so phase markdown's
+/// `@~/.ccteam/templates/<filename>` reference resolves. Idempotent;
+/// `force == false` preserves operator hand-edits.
+///
+/// Called by `ccteam init` (global skeleton) and `bootstrap_project`
+/// (defensive — covers the user who jumps straight to `ccteam new`
+/// without `ccteam init`). The two callers don't conflict because
+/// the writer is a no-op when files are already in place.
+pub fn write_global_helper_templates(global_dir: &Path, force: bool) -> Result<()> {
+    let dir = global_dir.join("templates");
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("create {}", dir.display()))?;
+    for (filename, body) in HELPER_TEMPLATES {
+        let path = dir.join(filename);
         if path.exists() && !force {
             continue;
         }

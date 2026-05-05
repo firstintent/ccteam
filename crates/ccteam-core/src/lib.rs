@@ -16,6 +16,7 @@ pub mod progress;
 pub mod projects;
 pub mod stall;
 pub mod state;
+pub mod subskill;
 pub mod team;
 pub mod templates;
 pub mod tmux;
@@ -54,21 +55,29 @@ pub use stall::{
 };
 pub use paths::{slug_from_project_dir, CcteamPaths};
 pub use phases::{
-    AgentTeamRole, PhaseHooks, PhaseTemplate, SubSkillSpec, SubSkillTrigger,
+    AgentTeamRole, DecisionMode, GoldenRule, GoldenRuleKind, PhaseHooks, PhaseTemplate,
+    SubSkillSpec, SubSkillTrigger,
+};
+pub use subskill::{
+    resolve_skill_path, run_sub_skills_for_phase, ClaudePRunner, SubSkillOutcome, SubSkillRunCtx,
+    SubSkillRunner,
 };
 pub use state::{Parallelism, PhaseHistoryEntry, PhaseState, ProjectState};
 pub use team::{RetroFieldKind, RetroFieldSpec, TeamSpec};
 pub use templates::{
     current_ccteam_bin, project_phase_filename, render_project_settings,
-    write_global_phase_templates, write_project_phase_templates, write_project_settings,
-    SettingsEnv, PHASE_TEMPLATES, PROJECT_SETTINGS_JSON,
+    write_global_helper_templates, write_global_phase_templates,
+    write_project_phase_templates, write_project_settings, SettingsEnv, HELPER_TEMPLATES,
+    PHASE_TEMPLATES, PROJECT_SETTINGS_JSON,
 };
 pub use tmux::{pid_is_alive, session_name_for_slug, tmux_available, TmuxSession};
 pub use tool_surface::{
     disable_tool_surface_bootstrap_for_tests, ensure_skills_placeholders,
-    link_recommended_agents, link_recommended_agents_into, missing_tools, user_claude_dir,
-    AgentLinkAction, AgentLinkReport, LinkOptions, MissingTool, RecommendedAgent,
-    ToolSurfaceSnapshot, ToolsRequired, BUILTIN_SUBAGENTS, RECOMMENDED_AGENTS,
+    link_recommended_agents, link_recommended_agents_for_phases,
+    link_recommended_agents_for_phases_into, link_recommended_agents_into, missing_tools,
+    user_claude_dir, AgentLinkAction, AgentLinkReport, LinkOptions, MissingTool,
+    RecommendedAgent, ToolSurfaceSnapshot, ToolsRequired, BUILTIN_SUBAGENTS,
+    RECOMMENDED_AGENTS,
 };
 
 /// Crate version, identical to the workspace package version.

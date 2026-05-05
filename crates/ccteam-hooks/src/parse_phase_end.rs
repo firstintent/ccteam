@@ -145,31 +145,33 @@ pub fn parse_phase_end(paths: &CcteamPaths, stdin: &Value) -> Result<ParseDecisi
     Ok(ParseDecision::Continue)
 }
 
-/// M0.5.4 structured ESCALATE grammar. Three explicit prefixes route
-/// to different orchestrator behavior; bare text degrades to
-/// `NEED_USER_INPUT` so old phase markdown keeps working.
+/// Structured ESCALATE grammar (interfaces §4.1.1). Pure string-prefix
+/// matching, no LLM — orchestrator stays a dumb Rust program. Bare text
+/// degrades to `NEED_USER_INPUT` so old phase markdown keeps working.
 ///
 /// Grammar (everything after `ESCALATE:` whitespace-trimmed):
 ///
 /// - `REVERT_TO_PHASE <name> — <reason>` → `kind="revert"`,
 ///   `target_phase="<name>"`. Em dash (`—`) preferred but plain `-` /
 ///   `--` accepted.
-/// - `NEED_USER_INPUT — <questions>` → `kind="need_user_input"`,
-///   `target_phase=null`. The reason carries the clarifying questions.
-/// - `ABORT — <reason>` → `kind="abort"`, `target_phase=null`. Project
-///   marked terminally failed; user must `ccteam new` from scratch.
-/// - Anything else → `kind="need_user_input"`, `target_phase=null`,
-///   `reason=<the whole tail>`. Equivalent to NEED_USER_INPUT for
-///   M0/M1 routing — orchestrator just stops the auto loop and waits
-///   for user.
-///
-/// Pure string-prefix matching, no LLM. Orchestrator is a dumb Rust
-/// program and stays that way.
+/// - `NEED_USER_INPUT — <questions>` → `kind="need_user_input"`.
+/// - `ABORT — <reason>` → `kind="abort"`. Project terminally failed.
+/// - **M2.3** `INSUFFICIENT_CLARIFICATION — <last_question>` →
+///   `kind="insufficient_clarification"`. Phase already produced a
+///   best-effort artifact; user picks continue / accept / abort
+///   (interfaces §5.6.2).
+/// - **M3.6** `PHASE_DONE_PENDING — <reason>` →
+///   `kind="phase_done_pending"`. Phase done modulo deferred decisions
+///   (interfaces §4.1.1). M2.3 only parses the prefix; orchestrator
+///   routing lands in M3.6.
+/// - Anything else → `kind="need_user_input"`, `reason=<the whole tail>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EscalateKind {
     Revert,
     NeedUserInput,
     Abort,
+    InsufficientClarification,
+    PhaseDonePending,
 }
 
 impl EscalateKind {
@@ -178,6 +180,8 @@ impl EscalateKind {
             EscalateKind::Revert => "revert",
             EscalateKind::NeedUserInput => "need_user_input",
             EscalateKind::Abort => "abort",
+            EscalateKind::InsufficientClarification => "insufficient_clarification",
+            EscalateKind::PhaseDonePending => "phase_done_pending",
         }
     }
 }
@@ -223,6 +227,30 @@ impl ParsedEscalate {
             let reason = trim_leading_dash(rest);
             return Self {
                 kind: EscalateKind::Abort,
+                target_phase: None,
+                reason: reason.to_string(),
+            };
+        }
+        // M2.3: phase exhausted max_clarify_rounds with a best-effort
+        // artifact already on disk — user picks continue / accept / abort.
+        // Match before NEED_USER_INPUT but the keywords don't share a
+        // prefix, so order is for readability.
+        if let Some(rest) = strip_grammar_prefix(trimmed, "INSUFFICIENT_CLARIFICATION") {
+            let reason = trim_leading_dash(rest);
+            return Self {
+                kind: EscalateKind::InsufficientClarification,
+                target_phase: None,
+                reason: reason.to_string(),
+            };
+        }
+        // M3.6: phase produced its required outputs but some sub-tasks
+        // are deferred (decisions queue). Parsing landed in M2.3 so
+        // phase markdown can use the prefix today; orchestrator routing
+        // for `phase_done_pending` ships in M3.6.
+        if let Some(rest) = strip_grammar_prefix(trimmed, "PHASE_DONE_PENDING") {
+            let reason = trim_leading_dash(rest);
+            return Self {
+                kind: EscalateKind::PhaseDonePending,
                 target_phase: None,
                 reason: reason.to_string(),
             };
@@ -379,6 +407,32 @@ mod parse_escalate_tests {
         let p = ParsedEscalate::from_reason("ABORT");
         assert_eq!(p.kind, EscalateKind::Abort);
         assert_eq!(p.reason, "");
+    }
+
+    #[test]
+    fn insufficient_clarification_with_em_dash() {
+        let p = ParsedEscalate::from_reason(
+            "INSUFFICIENT_CLARIFICATION \u{2014} 已 3 轮 CLARIFY 未收到目标平台答复",
+        );
+        assert_eq!(p.kind, EscalateKind::InsufficientClarification);
+        assert_eq!(p.target_phase, None);
+        assert_eq!(p.reason, "已 3 轮 CLARIFY 未收到目标平台答复");
+    }
+
+    #[test]
+    fn insufficient_clarification_keyword_serializes_to_snake_case() {
+        // Stop hook writes `kind` into progress.jsonl; the snake-case
+        // form is the only valid wire shape (interfaces §4.1.1).
+        let p = ParsedEscalate::from_reason("INSUFFICIENT_CLARIFICATION");
+        assert_eq!(p.kind.as_str(), "insufficient_clarification");
+    }
+
+    #[test]
+    fn phase_done_pending_parses() {
+        let p = ParsedEscalate::from_reason("PHASE_DONE_PENDING -- waiting on storage decision");
+        assert_eq!(p.kind, EscalateKind::PhaseDonePending);
+        assert_eq!(p.reason, "waiting on storage decision");
+        assert_eq!(p.kind.as_str(), "phase_done_pending");
     }
 }
 

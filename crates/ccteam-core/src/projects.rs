@@ -10,9 +10,12 @@ use serde_json::{Map, Value};
 
 use crate::paths::CcteamPaths;
 use crate::state::ProjectState;
-use crate::templates::{write_project_phase_templates, write_project_settings};
+use crate::templates::{
+    write_global_helper_templates, write_project_phase_templates, write_project_settings,
+};
+use crate::phases::PhaseTemplate;
 use crate::tool_surface::{
-    link_recommended_agents_into, user_claude_dir, AgentLinkAction, LinkOptions,
+    link_recommended_agents_for_phases_into, user_claude_dir, AgentLinkAction, LinkOptions,
 };
 
 /// Slugify a free-text project request: keep `[a-z0-9]`, collapse other
@@ -113,6 +116,17 @@ pub fn bootstrap_project(
 
     write_project_settings(&project_dir)?;
     write_project_phase_templates(&project_dir)?;
+    // M2.4: ensure ~/.ccteam/templates/ has the helper templates so
+    // any phase markdown's `@~/.ccteam/templates/<name>.md` reference
+    // resolves. Idempotent — no-ops when files already exist, so this
+    // doesn't fight `ccteam init` if the operator ran it first.
+    if let Err(err) = write_global_helper_templates(&paths.root, false) {
+        tracing::warn!(
+            global_dir = %paths.root.display(),
+            error = %err,
+            "could not stamp helper templates into ~/.ccteam/templates/; phase markdown using @-references may fail",
+        );
+    }
     if let Err(err) = pre_trust_project(&project_dir) {
         // Failing to pre-trust is annoying (next launch shows the
         // "Trust this folder?" prompt) but not fatal — log + continue.
@@ -123,15 +137,17 @@ pub fn bootstrap_project(
         );
     }
 
-    // M0.5.1 / M0.5.2: register plugin agents under ~/.claude/agents/
-    // and pre-create the skills placeholder directories. Both must be
-    // done **before** the orchestrator's ensure_session triggers
-    // `tmux new-session`, since Claude Code scans agents/ once at
-    // session start (per claude-code-tool-surface.md §1.2.5/6) and
-    // attaches the SKILL.md watcher only to dirs that exist at startup
-    // (§1.2.4). bootstrap_project runs in `ccteam new`, well before
-    // the daemon's ensure_session, so we're inside the safe window.
-    if let Err(err) = setup_tool_surface(&project_dir) {
+    // M0.5.1 / M0.5.2 / M2.1: register plugin agents under
+    // ~/.claude/agents/ (recommended set + every sub_skill plugin agent
+    // referenced in phase YAML) and pre-create the skills placeholder
+    // directories. Both must be done **before** the orchestrator's
+    // ensure_session triggers `tmux new-session`, since Claude Code
+    // scans agents/ once at session start (claude-code-tool-surface.md
+    // §1.2.5/6) and attaches the SKILL.md watcher only to dirs that
+    // exist at startup (§1.2.4). bootstrap_project runs in `ccteam
+    // new`, well before the daemon's ensure_session.
+    let templates = load_phase_templates_for_bootstrap();
+    if let Err(err) = setup_tool_surface(&project_dir, &templates) {
         tracing::warn!(
             project_dir = %project_dir.display(),
             error = %err,
@@ -149,6 +165,29 @@ pub fn bootstrap_project(
     }
 
     Ok(project_dir)
+}
+
+/// Parse the embedded phase templates (the same `PHASE_TEMPLATES`
+/// `bootstrap_project` writes to disk) into a `Vec<PhaseTemplate>` so
+/// `setup_tool_surface` can ln -sf every sub_skill plugin agent the
+/// dev pipeline declares. Filter out parse errors with a warn — a
+/// broken shipped template would crash the build, but if it ever
+/// happens we want bootstrap to keep working for unrelated phases.
+fn load_phase_templates_for_bootstrap() -> Vec<PhaseTemplate> {
+    crate::templates::PHASE_TEMPLATES
+        .iter()
+        .filter_map(|(name, body)| match PhaseTemplate::parse(body) {
+            Ok(t) => Some(t),
+            Err(err) => {
+                tracing::warn!(
+                    template = %name,
+                    error = %err,
+                    "embedded phase template did not parse during bootstrap; skipping for sub_skill linking",
+                );
+                None
+            }
+        })
+        .collect()
 }
 
 /// Pre-mark `project_dir` as trusted in `~/.claude.json` so the first
@@ -227,9 +266,10 @@ fn resolve_claude_json_path_from_env(
     Ok(h.join(".claude.json"))
 }
 
-/// Symlink the `RECOMMENDED_AGENTS` set into `~/.claude/agents/` and
-/// pre-create the global + project-local skills placeholder dirs. See
-/// the call site in `bootstrap_project` for the timing constraint.
+/// Symlink the `RECOMMENDED_AGENTS` set + every plugin agent named in
+/// `templates`' `sub_skills` into `~/.claude/agents/`, then pre-create
+/// the global + project-local skills placeholder dirs. See the call
+/// site in `bootstrap_project` for the timing constraint.
 ///
 /// **Test isolation**: tests that call `bootstrap_project` but don't
 /// want to mutate the developer's real `~/.claude/` should set the
@@ -241,7 +281,7 @@ fn resolve_claude_json_path_from_env(
 /// The project-local `<project>/.claude/skills/` placeholder is
 /// created unconditionally — it lives under `project_dir` (a
 /// tempdir during tests) and carries no global-pollution risk.
-fn setup_tool_surface(project_dir: &Path) -> Result<()> {
+fn setup_tool_surface(project_dir: &Path, templates: &[PhaseTemplate]) -> Result<()> {
     // Project-local placeholder always created — see doc comment.
     let project_skills = project_dir.join(".claude").join("skills");
     std::fs::create_dir_all(&project_skills)
@@ -257,7 +297,11 @@ fn setup_tool_surface(project_dir: &Path) -> Result<()> {
         return Ok(());
     }
     let claude = user_claude_dir()?;
-    let reports = link_recommended_agents_into(&claude, LinkOptions::default())?;
+    let reports = link_recommended_agents_for_phases_into(
+        &claude,
+        templates,
+        LinkOptions::default(),
+    )?;
     for r in &reports {
         match &r.action {
             AgentLinkAction::Linked => tracing::info!(
@@ -663,6 +707,49 @@ mod tests {
             "expected {} to exist after bootstrap_project",
             skills.display(),
         );
+    }
+
+    #[test]
+    fn bootstrap_project_writes_helper_templates_to_global_dir() {
+        // M2.4: bootstrap_project ensures ~/.ccteam/templates/ is
+        // populated with the embedded helper templates so phase
+        // markdown's `@~/.ccteam/templates/<name>` reference resolves
+        // even when the user skipped `ccteam init`.
+        ensure_isolation();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        bootstrap_project(&paths, "demo", "demo request", "dev").unwrap();
+        let templates = paths.root.join("templates");
+        assert!(
+            templates.join("review-with-user-loop.md").is_file(),
+            "review-with-user-loop.md missing from {}",
+            templates.display(),
+        );
+        assert!(
+            templates.join("kickoff-reverse-interview.md").is_file(),
+            "kickoff-reverse-interview.md missing",
+        );
+    }
+
+    #[test]
+    fn bootstrap_project_helper_templates_do_not_overwrite_user_edits() {
+        ensure_isolation();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        // First bootstrap stamps fresh templates.
+        bootstrap_project(&paths, "demo", "demo request", "dev").unwrap();
+        let path = paths.root.join("templates/review-with-user-loop.md");
+        std::fs::write(&path, "USER EDIT\n").unwrap();
+        // Second project bootstrap (e.g. user runs `ccteam new` again)
+        // must not clobber the user edit.
+        bootstrap_project(&paths, "demo2", "another request", "dev").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "USER EDIT\n");
     }
 
     #[test]

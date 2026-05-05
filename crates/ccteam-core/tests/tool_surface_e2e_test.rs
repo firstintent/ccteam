@@ -20,9 +20,10 @@ use serde_json::json;
 use tempfile::TempDir;
 
 use ccteam_core::{
-    bootstrap_project, decide_tick_from_events, dev_dag, progress, slugify,
-    CcteamPaths, Orchestrator, OrchestratorConfig, PhaseState, PhaseTemplate,
-    ProjectState, TickAction, RECOMMENDED_AGENTS,
+    bootstrap_project, decide_tick_from_events, dev_dag,
+    link_recommended_agents_for_phases_into, progress, slugify, AgentLinkAction, CcteamPaths,
+    LinkOptions, Orchestrator, OrchestratorConfig, PhaseState, PhaseTemplate, ProjectState,
+    TickAction, RECOMMENDED_AGENTS,
 };
 
 /// Several tests in this file mutate `CLAUDE_CONFIG_HOME`, which is a
@@ -239,5 +240,95 @@ fn missing_code_reviewer_fails_orchestrator_construction_with_fix_hint() {
         msg.contains("ccteam doctor"),
         "error must include the fix hint, got: {msg}",
     );
+}
+
+/// M2.1: phase YAML's `sub_skills` reference plugin agents that may
+/// not be in the hardcoded RECOMMENDED_AGENTS set. The phase-aware
+/// linker walks each template's sub_skills and ln -sfs the plugin
+/// source so `Task(subagent_type=...)` finds the agent at session
+/// start.
+#[test]
+fn link_phase_subagents_picks_up_sub_skill_plugin_agent() {
+    let tmp = TempDir::new().unwrap();
+    let claude_dir = tmp.path().join("claude");
+    stage_plugin_sources(&claude_dir);
+    // Stage an extra plugin agent that isn't in RECOMMENDED_AGENTS, so
+    // the test proves the extension does more than the hardcoded
+    // recommended set.
+    let custom = claude_dir
+        .join("plugins/marketplaces/claude-plugins-official/plugins/custom-toolkit/agents/custom-reviewer.md");
+    std::fs::create_dir_all(custom.parent().unwrap()).unwrap();
+    std::fs::write(&custom, "# custom-reviewer stub\n").unwrap();
+
+    let _guard = ScopedClaude::set(&claude_dir);
+
+    // Phase template with one sub_skill referencing the custom agent.
+    let body = concat!(
+        "---\n",
+        "name: review\n",
+        "parallelism: solo\n",
+        "sub_skills:\n",
+        "  - skill: claude-plugins-official:custom-toolkit/agents/custom-reviewer.md\n",
+        "    trigger: phase_done\n",
+        "    output_to: .ccteam/custom-review.md\n",
+        "---\n",
+        "body\n",
+    );
+    let template = PhaseTemplate::parse(body).unwrap();
+
+    let reports =
+        link_recommended_agents_for_phases_into(&claude_dir, &[template], LinkOptions::default())
+            .unwrap();
+
+    // Must include the 8 hardcoded agents *and* the new one.
+    assert_eq!(
+        reports.len(),
+        RECOMMENDED_AGENTS.len() + 1,
+        "expected {} reports, got {}",
+        RECOMMENDED_AGENTS.len() + 1,
+        reports.len(),
+    );
+    let custom_report = reports
+        .iter()
+        .find(|r| r.agent.filename == "custom-reviewer.md")
+        .expect("custom-reviewer plugin agent must appear in reports");
+    assert_eq!(custom_report.action, AgentLinkAction::Linked);
+    assert!(claude_dir
+        .join("agents/custom-reviewer.md")
+        .symlink_metadata()
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+/// Sub-skill referencing a hook script (`.sh`) instead of an agent
+/// must NOT be auto-linked into `~/.claude/agents/` — only `.md`
+/// files under `<plugin>/agents/` count as Task-callable subagents.
+#[test]
+fn link_phase_subagents_skips_non_agent_sub_skill_paths() {
+    let tmp = TempDir::new().unwrap();
+    let claude_dir = tmp.path().join("claude");
+    stage_plugin_sources(&claude_dir);
+
+    let _guard = ScopedClaude::set(&claude_dir);
+
+    let body = concat!(
+        "---\n",
+        "name: ship\n",
+        "parallelism: solo\n",
+        "sub_skills:\n",
+        "  - skill: claude-plugins-official:security-guidance/hooks/security_reminder_hook.py\n",
+        "    trigger: phase_start\n",
+        "    output_to: .ccteam/precheck.md\n",
+        "---\n",
+    );
+    let template = PhaseTemplate::parse(body).unwrap();
+
+    let reports =
+        link_recommended_agents_for_phases_into(&claude_dir, &[template], LinkOptions::default())
+            .unwrap();
+    // Just the 8 hardcoded — the .py hook is not eligible for Task
+    // dispatch, so no extra link.
+    assert_eq!(reports.len(), RECOMMENDED_AGENTS.len());
 }
 
