@@ -232,58 +232,92 @@ ccteam-mcp MCP server(M2)、具体 channel adapter 实现(M2+ 复用开源)。
 
 ---
 
-## 4. M2 — Seed Gate + Score(2 周)
+## 4. M2 — dev pipeline 工程机制(1.5 周)
 
-**唯一验收**:提"AI 菜谱生成器" → Seed 直接 REJECT,附"已有 N 个免费同类工具";一个测试全绿但实现糙的项目得分低于阈值,自动进 fix-cycle。
+> **2026-05-06 重构**:原 M2 把"Seed Gate(idea 是否值得做)"与"Score(构建质量)"
+> 都塞进 dev team,违反 strategic doc §3.1「不替领域定 done criteria」+ §3.4「不
+> 预设质量评分维度」。讨论后确认:
+>
+> - **Seed/Reject 流程提取为 product-research team**(M3.4 落地;dev team 不再
+>   自带否定流程)
+> - **Score 整体删除**:fix-loop(M0)+ phase YAML `golden_rules`(本里程碑)
+>   覆盖硬质量;软质量交给 M5 Critic 独立 team
+> - **CLARIFY 协议复用 M1.1 inbox/outbox**(无独立任务)
+> - **加 phase YAML 三字段**(`decision_mode` / `max_clarify_rounds` / `golden_rules`)+
+>   phase template `@文件引用` 机制(为 product-research team 与 review-with-user 模式服务)
+>
+> 净效果:8 → 5 任务,2 周 → 1.5 周,M2 聚焦 dev 工程机制(sub-skill 调度 /
+> agent_team / MCP server / phase 协议扩展)。
 
-| # | 任务 | 验收 | 依赖 |
-|---|---|---|---|
-| M2.1 | Seed phase 模板与 verdict 解析 | YAML front matter 输出 `verdict: PASS/REJECT/CLARIFY`;orchestrator 据此分流 | M1.5 |
-| M2.2 | CLARIFY 单问单答 | 强制 prompt 约束"只问一个问题";走 control/answer 回路 | M2.1、M1.3 |
-| M2.3 | Score phase + 6 维加权 | 输出 `scorecard.md` 含 Functionality/Quality/Tests/UX/Speed/Docs + bug penalty | M1.5 |
-| M2.4 | golden-rules.py 集成 | 抄 ccteam-creator 5 项 + 项目特定补充;phase `after` hook 调用,失败阻断 ship | M2.3 |
-| M2.5 | Critic 与 dev 进程隔离(M2 简化版) | Score 阶段单独起子进程读 implement 产物,**禁止** dev 自评 | M2.3 |
-| M2.6 | sub-skill 自动调度 | phase front matter `sub_skills` 被 orchestrator 自动 trigger;两档 trigger(`phase_start` / `phase_done`);产物按 `output_to` 落文件,自动作为下 phase prompt 的 `@文件引用`;复用 `claude-plugins-official:pr-review-toolkit/agents/code-reviewer` 验证一次端到端 | M2.5 | §6.10、§3.3 |
-| M2.7 | `parallelism: agent_team` 启用 | implement phase 模板设 `parallelism: agent_team`;orchestrator 启用 `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`;phase prompt 注入 backend-dev / frontend-dev / reviewer 三角色;Lead 协调下产物落 `.ccteam/<role>-output/` | M2.5 | §3.3、§6.3、§6.11 |
-| M2.8 | `ccteam-mcp` MCP server | binary 出 `ccteam mcp-serve` 子命令(stdio 协议);暴露 `ccteam__ls` / `__show` / `__new` / `__peek` / `__progress` / `__pause` / `__resume` 七个 tool;`ccteam doctor --install-mcp` 写 `~/.claude.json`;装后用户自带 claude 通过 MCP 调度 ccteam 比 Bash 工具更鲁棒;ccteam-control skill body 改为推荐"优先 MCP,fallback Bash" | M1.8 | §3.8、§6.4、interfaces §12 |
+**唯一验收**:dev 团队跑 `ccteam new "<完整 brief>"` 直通 ship —— sub-skill
+auto-trigger 跑通 ≥1 个 plugin agent(如 `code-reviewer`);agent_team mode
+在 implement phase 跑通 backend-dev / frontend-dev / reviewer 三角色;
+meta-agent 通过 ccteam-mcp 全部 9 个 tool 调度;phase template `@` 引用基础模板
+生效。**全程不出现 Seed REJECT 案例**(那个挪到 M3.5 product-research E2E)。
 
-**M2 不做**:RAG 召回(M3)、anti-leniency 严格规则(M4)、phase 内 audit 矩阵 / 投票(M3)、`parallelism: multi_session`(M3)、ccteam-mcp 写权限扩展(暂只暴露上述七个,attach/start/stop/memory rebuild 不暴露,见 interfaces §12.3)。
+| # | 任务 | 验收 | 依赖 | 来源 |
+|---|---|---|---|---|
+| M2.1 | sub-skill 自动调度 + link agents 扩展 | phase YAML `sub_skills` 被 orchestrator 自动 trigger(两档:`phase_start` / `phase_done`);产物按 `output_to` 落文件,自动作为下 phase prompt 的 `@文件引用`;`link_recommended_agents` 扩展接 phase YAML driven list,session 启动前扫 `sub_skills` + `tools_required` 全 ln -sf;复用 plugin 的 `code-reviewer` 端到端验证 | M1.5 | tech-design §6.10、§3.3 |
+| M2.2 | agent_team 兼容性 spike + 启用 | **M2.2.0 spike(0.5 天)**:hello-world 多 agent 协作验证 `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` 在当前 Claude Code 版本仍有效,失败立即 escalate;通过后 implement phase 模板设 `parallelism: agent_team`,prompt 注入 backend-dev / frontend-dev / reviewer 三角色;Lead 协调下产物落 `.ccteam/<role>-output/`;**role 集合 dev 写死,M3 时改 team.yaml 配置**(任务描述显式标注) | M2.1 | tech-design §3.3、§6.3、§6.11 |
+| M2.3 | phase YAML 字段批扩展(三字段)| interfaces.md §5.1 schema 加:① `decision_mode: sync\|async\|hybrid`(默认 hybrid;sync 用 AskUserQuestion 阻塞,async 写 outbox 不阻塞,hybrid 先试 AskUserQuestion 1-2 分钟超时降级 outbox);② `max_clarify_rounds: 3`(超限 phase 强制 best-effort 产出 + ESCALATE `INSUFFICIENT_CLARIFICATION`);③ `golden_rules: [{rule_id, pattern\|cmd}]`(orchestrator 不内置规则,只跑 enforcement —— **plugin 化,不再 ccteam-creator 5 项写死**) | M1.5 | strategic §3.1 / §3.4 / §3.5 |
+| M2.4 | phase template `@文件引用` 机制 + `~/.ccteam/templates/` | 落两个基础模板:`review-with-user-loop.md`(读上游 → 多轮 challenge → 落 review.md)+ `kickoff-reverse-interview.md`(spec 太薄时反向面试用户综合 brief);phase markdown 用 `@~/.ccteam/templates/<name>.md` 拼装(Claude Code 原生 `@` 机制,零新 schema);`team.yaml` 可覆盖默认路径(M3 衔接);**dev plan-eng phase 至少一处 `@review-with-user-loop` 验证生效** | M1.5 | best practices §3 / §5.2、tech-design §3.1 |
+| M2.5 | `ccteam-mcp` MCP server(9 tool) | binary 出 `ccteam mcp-serve` 子命令(stdio 协议);暴露 9 tool:`ls / show / new / peek / progress / pause / resume / send_to_session / inject_decision`;`ccteam doctor --install-mcp` 写 `~/.claude.json`;**首要 consumer = meta-agent session,辅助 = daily-driver claude**;`ccteam-control` skill body 改为推荐"优先 MCP,fallback Bash";interfaces.md §12 同步 9 tool schema(`send_to_session` 是 inbox 写入,`inject_decision` 是 ESCALATE 结构化注入) | M1.8 | tech-design §3.8、§6.4、interfaces §12 |
+
+**M2 不做**:
+- Seed phase / verdict 解析 → M3.4 product-research team
+- Score(任何形式 / 任何维度) → 删
+- CLARIFY 协议本身 → M1.1 inbox/outbox 已覆盖,M2 只用不写
+- ccteam-mcp 写权限扩展超出 9 tool(attach/start/stop/memory rebuild 不暴露,见 interfaces §12.3)
+- `PHASE_DONE_PENDING` 协议扩展 + phase defer 真不阻塞 → M3
+- `ccteam decisions` 全局队列 CLI → 已挪入 M1 收尾增量(配合 M1.0 meta-agent;M1 主 PR 完工后单独小增量 PR)
+- agent voting / phase 内 audit 矩阵 / `parallelism: multi_session` → M4 / M3 后
 
 ---
 
-## 5. M3 — Team Abstraction(2 周)
+## 5. M3 — Team Abstraction + product-research team(3 周)
 
 > 见 [docs/ccteam-as-domain-agnostic-orchestrator.md](./ccteam-as-domain-agnostic-orchestrator.md)
 > §6 落点论证。本里程碑把 ccteam 从"开发团队的编排层"泛化为"任意 AI 团队的编排层",
 > 是 M4 跨项目记忆 / M5 Critic 不写死 dev 假设的前提。
+>
+> **2026-05-06 reframe**:首个非 dev team 由 academic research(学术研究)
+> 改为 **product-research(产品调研:idea 是否值得做)**。理由:
+> ① product-research 把 M2 砍掉的 Seed Gate / REJECT 流程接住,落地后用户路径
+> 完整(uncertain idea → product-research 验证 → 决定派 dev 还是放弃);
+> ② 价值差异更显著(verdict 输出 vs code 输出),更能验证 team 抽象红线;
+> ③ 加 `PHASE_DONE_PENDING` 协议扩展(M2 砍掉的 phase defer 真不阻塞落到这里)。
+> academic research team 的 9 phase 草稿(strategic §C)推到 M5 之后 backlog,
+> 不阻塞 critical path。
 
-**唯一验收**:`ccteam new --team=research "<topic>"` 能跑通 happy path,产出最终研究
-报告;dev 团队的现有项目零迁移成本(`ccteam new "<brief>"` 默认 `--team=dev` 仍然
-工作)。
+**唯一验收**:`ccteam new --team=product-research "AI 菜谱生成器"` 跑通 happy path,
+verdict=REJECT,产出 `verdict.md` + `rationale.md`(列已有 N 个免费同类工具)+
+`next-steps.md`;dev 团队 `ccteam new "<brief>"` 默认 `--team=dev` 零迁移成本仍然工作。
 
 | # | 任务 | 验收 | 依赖 |
 |---|---|---|---|
-| M3.1 | §B 审计的 P0 项目全部修复 | `cargo test` 全绿;dev pipeline happy path 不变;`pub use ... M0_PHASE_DAG, FIRST_PHASE` lib API breaking change 完成(`docs/dev-coupling-audit.md` F1–F4 + F12 + F13 + **F20 升级 P0**) | M0.5 |
-| M3.2 | `team.yaml` schema + 解析 | `ccteam doctor --team dev` 列出 dev 团队当前的 7 件契约都从配置读;phase YAML `tools_required` / `auto_loop` / `completion_signal` / `stall_warn_minutes`(F21)从 phase 模板读,不再依赖常量 | M3.1 |
-| M3.3 | `ccteam new --team <name>` / `start --team <name>` | `--team` 缺省值 `dev`(向后兼容);非 dev team 启动需 team.yaml 存在;`state.json.team` 字段持久化 | M3.2 |
-| M3.4 | `phases-research/` 起草纳入仓库 | 9 个 phase 模板按 `phases-research/` 目录结构入仓(已由 strategic doc §C 起草);research 团队 phase DAG 通过 `validate_team` 校验;ESCALATE 至少含 1 个团队特有前缀(如 `HYPOTHESIS_REJECTED`) | M3.2 |
-| M3.5 | research 团队端到端 happy path | 起一个真实 research 项目跑到 ship,产出 `.ccteam/report.md`;progress.jsonl 完整事件序列含 phase 切换 + auto_loop 触发 + 至少一条 ESCALATE-resume 回路 | M3.1–M3.4 |
-| M3.6 | meta-agent skill 集占位(M2.8 之后顺手) | `ccteam-control` skill body 里加一节"team selection",说明 dispatch 时 `--team` 怎么选;`ccteam-dispatch` skill 起草作为 backlog 不落地 | M3.3、M2.8 | strategic §7 |
+| M3.1 | §B 审计的 P0 项目全部修复 | ✅ **已 ship**(F1/F2/F3/F4/F12/F13/F20,PR #1 @ `4766800`) | M0.5 |
+| M3.2 | `team.yaml` schema 全字段化 | F20 已落 `retro_schema[]`;本任务扩 `critic_dimensions[]` / `escalate_grammar_extensions[]` / `golden_rules[]` / `phase_dir`(默认 `phases/`,product-research 用 `phases-product-research/`)/ `verdict_schema`(产出 verdict 的 phase 列表) | M3.1 |
+| M3.3 | `ccteam new --team <name>` / `start --team <name>` | F12 已落 `--team` flag + state.json team field;本任务扩:非 dev team 启动需 `team.yaml` 存在,`team_dir` 自动 ln agents,`team.yaml` 验证失败 fail-fast | M3.2 |
+| M3.4 | **product-research team 模板入仓** | `phases-product-research/` 起草 6 phase:`kickoff` / `market-survey` / `differentiation-analysis` / `value-proposition` / `feasibility` / `verdict`;phase DAG 通过 `validate_team` 校验;3 个团队特有 ESCALATE 前缀(`MARKET_DUPLICATE` / `INSUFFICIENT_VALIDATION` / `LOW_DIFFERENTIATION`);verdict phase 输出 `verdict: PASS\|CONCERN\|REJECT`(复用 interfaces.md §5.3 schema) | M3.2、M2.4(template @ 引用) |
+| M3.5 | product-research E2E happy path | 起 "AI 菜谱生成器" 真实跑到 verdict=REJECT,产出三件产物;progress.jsonl 完整含 phase 切换 + decision_mode=async 至少一处 + 至少一条团队特有 ESCALATE-resume 回路 | M3.1–M3.4 |
+| M3.6 | `PHASE_DONE_PENDING` 协议扩展 | phase 内 claude 在写完 outbox `event_kind: decision_needed` 后,可 ESCALATE `PHASE_DONE_PENDING { open_decisions: [<msg-file>] }`;orchestrator 切到 `PhaseState::DonePending`;下 phase 启动检查 pending —— 工作不依赖该决策则 proceed,依赖则 block 并自动汇集到 decisions queue;首个使用方:product-research 的 `feasibility` phase | M3.5 | tech-design §3.5、interfaces §4.1.1 |
+| M3.7 | meta-agent skill 集 + dispatch 树扩展 | `ccteam-control` skill body 加 "team selection" 节;meta-agent role prompt 决策树第 2 步("分类团队类型")扩为 dev / product-research 两选项;NL 启发"听起来不确定要做的话先 product-research" | M3.3、M2.5 | strategic §7.2.2 |
 
 **M3 不做**:
-- `phases-marketing/` / `phases-ops/` 起草(M3.5 验证抽象后,M5 之后任意时机做,不阻塞 critical path)
-- 跨项目记忆 namespace 化(留给 M4,因为 M3 还没记忆)
-- meta-agent conversation continuity(留给 M4 RAG 落地一并设计)
-- Critic 维度泛化(留给 M5,但 M3 起草 team.yaml schema 时必须为 critic_dimensions 留好数据形式,不允许 enum 写死)
+- academic research team(`phases-research/` 学术调研)→ backlog,M5 后任意时机
+- `phases-marketing/` / `phases-ops/`(critical path 之外,M5 后任意时机)
+- 跨项目记忆 namespace 化(M4)
+- meta-agent conversation continuity(M4 RAG 一并)
+- Critic 维度泛化(M5,但 M3.2 必须为 critic_dimensions 留数据形式)
 
 **M3 风险**:
 
 | 风险 | 触发 | 应对 |
 |---|---|---|
-| §B 审计 P0 项过多,M3.1 单条堵住整个里程碑 | 审计发现深层耦合(例:fix-loop 状态机假设 dev 流程) | M3.1 拆为多个子 PR,每条 P0 独立 PR;按 §B 优先级排序逐个清 |
-| dev 团队的 `team-dev.yaml` 反推时和现状不一致 | 写 team-dev.yaml 时发现某些行为靠"巧合"工作,没显式契约 | 反推时逐条对照 strategic doc §1 责任分界表;"没契约的现状"必须先写到 §1 再纳入配置 |
-| research 团队跑通靠的是借用 dev plugin 的能力,而不是真验证了契约 | research phase 模板偷懒,ESCALATE 不用自定义前缀,critic 不用自定义维度 | M3.4 验收时强制要求 research 至少有 1 个自定义 ESCALATE 前缀 + 至少 1 个 dev 没有的 critic 维度 |
-| 显式拒绝清单(strategic doc §3)被 PR 软性绕过 | "为了通用"在 ccteam-core 加 `if team == "research"` | code-review 加规则:`ccteam-core/` 内出现 team 名字符串字面量 = 自动拒收 |
+| product-research phase 模板偷懒 | ESCALATE 不用自定义前缀,phase 用 dev 那套 | M3.4 验收强制要求 3 个自定义 ESCALATE 前缀 + 至少 2 个 phase 用 `decision_mode: async` |
+| `PHASE_DONE_PENDING` 协议扩展过深 | 跨 phase 依赖追踪复杂度爆炸 | M3.6 范围严限"phase 内能完成的部分先完成,decision-dependent 部分 defer";不做"跨 phase 子任务依赖图"(那是 M6 Symphony) |
+| 显式拒绝清单(strategic doc §3)被 PR 软性绕过 | "为了通用"在 ccteam-core 加 `if team == "product-research"` | code-review 规则:`ccteam-core/` 内出现 team 名字符串字面量 = 自动拒收 |
+| dev 团队的 `team-dev.yaml` 反推时和现状不一致 | 写 team-dev.yaml 时发现某些行为靠"巧合"工作,没显式契约 | 反推时逐条对照 strategic doc §1 责任分界表 |
 
 ---
 
@@ -367,26 +401,40 @@ M0.5.7 ─→ M1.0 (meta-agent 骨架) ─┬─→ M1.1 (inbox/outbox 协议加
                                   │
                                   ├─→ M1.2 (多项目并发) ─→ M1.5 (重启恢复) ─┬─→ M1.6 (watcher) ─→ M1.7 (L3 NL 通道)
                                   │                                          │
-                                  │                                          └─→ M2.1 (Seed) ─→ M2.5 (Critic 隔离) ─┬─→ M2.6 (sub-skill)
-                                  │                                                                                  └─→ M2.7 (agent_team)
-                                  └─→ M1.4 (项目 CLAUDE.md 兑现到 meta)                                                  ↓
-                                                                                                              M3.1 (P0 audit 修复)
-M0.11 ─→ M1.8 (ccteam-control skill)                                                                                     ↓
-                                                                                                               M3.2 (team.yaml schema) ─→ M3.3 (--team CLI)
-              M1.3 (meta dispatch E2E) ← 汇合 {M1.0, M1.1, M1.8}                                                          ↓
-              (M1 acceptance gate,不阻塞 M2)                                                                    M3.4 (phases-research) ─→ M3.5 (research E2E)
+                                  │                                          └─→ M2.1 (sub-skill) ─→ M2.2 (agent_team) ─┐
+                                  │                                              M2.3 (phase YAML 三字段)              │
+                                  │                                              M2.4 (template @ 引用机制)            │
+                                  └─→ M1.4 (项目 CLAUDE.md 兑现到 meta)                                                  │
                                                                                                                           ↓
+M0.11 ─→ M1.8 (ccteam-control skill) ─→ M2.5 (ccteam-mcp 9 tool)                                              M3.4 (product-research team)
+                                                                                                                          ↓
+              M1.3 (meta dispatch E2E) ← 汇合 {M1.0, M1.1, M1.8}                                              M3.5 (product-research E2E)
+              (M1 acceptance gate,不阻塞 M2)                                                                            ↓
                                                                                                                           ├──────────────────────┐
                                                                                                                           ↓                      ↓
                                                                                                                 M4.1 (team-aware retro)  M5.1 (Critic data-driven)
                                                                                                                 M4.2 (RAG, namespace)    M5.2 (anti-leniency)
-                                                                                                                M4.3 (Seed RAG)          M5.3 (WEAK BLOCK config)
+                                                                                                                M4.3 (verdict RAG)       M5.3 (WEAK BLOCK config)
                                                                                                                 M4.6 (meta continuity)   M5.4 (per-project 自适应)
                                                                                                                 M4.7/4.8 (audit + 投票)  M5.5 (cache opt)
                                                                                                                 M4.10 (multi_session)
 ```
 
 **关键变化(按时间倒序)**:
+
+- **2026-05-06 M2 简化**(架构红线 strategic doc §3.1 / §3.4 落实):
+  - **Seed Gate(REJECT/CLARIFY)从 dev team 提取为 product-research team**(M3.4
+    落地);dev team 不再自带"否定 idea"流程 —— 价值判断本属产品/市场 domain,
+    不是 dev 工程职责
+  - **Score 整体删除**:fix-loop(M0)+ phase YAML `golden_rules`(M2.3)覆盖
+    硬质量;软质量交给 M5 Critic 独立 team
+  - **CLARIFY 协议复用 M1.1 inbox/outbox**(无独立任务)
+  - **三个 phase YAML 字段**(`decision_mode` / `max_clarify_rounds` /
+    `golden_rules`)+ phase template `@文件引用` 机制 加进 M2,为 product-research
+    team 与 review-with-user 模式服务
+  - **academic research team 退到 backlog**;product-research 替代为 M3 首个
+    非 dev team(M3.4 / M3.5)
+  - 净效果:M2 任务 8 → 5,2 周 → 1.5 周
 
 - **2026-05-06 M1 reframe**(三层架构落定后):
   - 旧 M1.1(Telegram bot 入口)下沉到 M2+ Channel Layer,优先复用开源方案,**不在 ccteam 主代码库**
@@ -405,12 +453,15 @@ M0.11 ─→ M1.8 (ccteam-control skill)                                        
 
 **不在关键路径上的(可与主线并行)**:M1.3(M1 acceptance gate,不阻塞 M2)、
 M1.4(项目 CLAUDE.md)、M1.8(ccteam-control skill,M1.3 依赖但与 M1.0/1.1/1.2 主链并行)、
-M2.4(golden-rules)、M2.8(ccteam-mcp MCP server)、M3.6(meta-agent skill 集占位)、
-M4.4(anti-patterns)、M4.5(claude-mem MCP)、M4.9(新插件挂载)、
-M4.11(ratatui TUI,机会主义)、M5.4(评审自适应)、M5.6(web dashboard,机会主义)。
+M2.3(phase YAML 三字段,与 sub-skill / agent_team 主链解耦)、
+M2.4(template @ 引用机制,与 sub-skill / agent_team 主链解耦)、
+M2.5(ccteam-mcp,依赖 M1.8 但与 M2.1/M2.2 解耦)、
+M3.6(meta-agent skill 集占位)、M4.4(anti-patterns)、M4.5(claude-mem MCP)、
+M4.9(新插件挂载)、M4.11(ratatui TUI,机会主义)、
+M5.4(评审自适应)、M5.6(web dashboard,机会主义)。
 
-**关键路径终点**(因 M4.10):M2.7 → M4.10 成为新关键路径终点之一(痛点 13 最终落地);
-M2.7 卡住整条 multi-agent 速度并行链。
+**关键路径终点**(因 M4.10):M2.2(原 M2.7)→ M4.10 成为新关键路径终点之一
+(痛点 13 最终落地);M2.2 卡住整条 multi-agent 速度并行链。
 
 **M1 内部依赖说明**(图中无法完整呈现的边):
 

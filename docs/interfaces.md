@@ -370,6 +370,8 @@ interfaces §3.4.3"。具体写哪些事件:
 | `ESCALATE: REVERT_TO_PHASE <phase> — <reason>` | `revert` | `<phase>` | M1+:set current_phase=`<phase>`,phase_state=Idle,re-dispatch;M0 仍走通用 escalation(写 escalation.md,等用户) |
 | `ESCALATE: NEED_USER_INPUT — <questions>` | `need_user_input` | `null` | 写 escalation.md,inbox 等用户 |
 | `ESCALATE: ABORT — <reason>` | `abort` | `null` | 项目永久标 escalated,M0 等同 NEED_USER_INPUT |
+| `ESCALATE: INSUFFICIENT_CLARIFICATION — <last_question>` | `insufficient_clarification` | `null` | M2.3+:phase 已撞 `max_clarify_rounds` 上限,best-effort artifact 已产出;orchestrator 写 escalation.md,outbox `event_kind: escalation`,等用户决定继续 / 接受 / abort(详见 §5.6.2) |
+| `ESCALATE: PHASE_DONE_PENDING — <reason>` | `phase_done_pending` | `null` | M3.6+:phase 部分完成,某些子任务 defer 到 decisions queue;orchestrator 切 `PhaseState::DonePending`,下 phase 启动检查 pending(详见 development-plan §5 M3.6) |
 | `ESCALATE: <free text>`(无前缀) | `need_user_input` | `null` | 等同显式 NEED_USER_INPUT,reason 是整段文本 |
 
 分隔符:em dash `—`(U+2014)、`--`、` - `(单 dash 必须前后有空格——这是为了不切碎 `plan-eng` 这类 phase 名)。
@@ -445,6 +447,20 @@ next_on_done: implement           # 可选。`phase_done` 后跳转目标。省�
                                   # 末尾相省略 next_on_done = 终点节点 = is_terminal_phase)
 next_on_escalate: null            # 可选。`escalate` 后静态 revert 目标。省略(null)= 项目终态 escalated
                                   # (M0.5.4 ESCALATE: REVERT_TO_PHASE 语法在事件 target_phase 字段独立路由)
+decision_mode: hybrid             # M2.3+:sync | async | hybrid。默认 hybrid。详见 §5.6
+                                  # sync   = phase 内用 AskUserQuestion 阻塞式问用户(用户必然在场)
+                                  # async  = phase 写 outbox event_kind=clarify,不阻塞,可配合 PHASE_DONE_PENDING (M3.6)
+                                  # hybrid = 先试 AskUserQuestion 1-2 分钟超时降级 outbox(默认推荐)
+max_clarify_rounds: 3             # M2.3+:phase 内多轮 CLARIFY 硬上限,默认 3。超限 phase 强制基于现有
+                                  # 信息产出 best-effort artifact + ESCALATE INSUFFICIENT_CLARIFICATION
+                                  # 让用户决定继续追问 / 接受 best-effort / abort。详见 §5.6
+golden_rules:                     # M2.3+:phase 级硬约束 enforcement(after hook 之外的 plugin 化路径)
+  - rule_id: tests_green          # 规则 ID,落 progress.jsonl 用
+    cmd: cargo test --workspace   # 任选 cmd | pattern;cmd 退出码非 0 = 违反 = 阻断 phase_done
+  - rule_id: no_secrets_in_repo
+    pattern: 'AWS_SECRET|sk-[a-zA-Z0-9]{32,}'   # regex 匹配 staged diff 任一行 = 违反
+                                  # orchestrator 不内置规则,只跑 enforcement;dev / product-research / 等
+                                  # 团队各自在 phase YAML 里写需要的 rule_id;空 / 不写 = 不跑
 hooks:                            # phase 级 hook(项目级 hook 在 settings.json,详见 §6)
   before: scripts/snapshot-git.sh
   after: scripts/run-golden-rules.sh
@@ -455,28 +471,48 @@ hooks:                            # phase 级 hook(项目级 hook 在 settings.j
 (prompt body...)
 ```
 
-### 5.2 9 个 phase 列表
+### 5.2 dev team phase 列表(M3 后 team-aware)
+
+> **2026-05-06 重构**:原列表 9 phase(含 `00-seed.md` 与 `08-score.md`)是把
+> 价值判断(idea 是否值得做)与质量判断(构建做得好不好)塞进 dev pipeline
+> 的产物。讨论后:
+> - `00-seed.md` → 提取到 product-research team(M3.4 落地于 `phases-product-research/`)
+> - `08-score.md` → 整体删除;硬质量交给 fix-loop(M0)+ phase YAML
+>   `golden_rules`(M2.3),软质量交给 M5 Critic 独立 team
+>
+> dev team 当前 phase 集合(`phases/`):
 
 ```
-00-seed.md             # 可行性评估(PASS/REJECT/CLARIFY;输出格式详见 §5.3)
-01-plan-ceo.md         # 产品规划
 02-plan-eng.md         # 技术规划(multi_session 项目在此输出子模块清单 + interface-contracts.md)
 03-implement.md        # 代码实现
 04-test-author.md      # 测试编写
 05-test-run.md         # 跑测试,输出报告
-06-fix.md              # 修 bug(在 fix-cycle 中循环;详见 tech-design §3.5)
-07-review.md           # 代码审查
-08-score.md            # 评分(M2+;6 维 + bug penalty)
+06-fix.md              # 修 bug(在 fix-cycle 中循环;auto_loop=true;详见 tech-design §3.5)
 09-ship.md             # 提交、产文档、收尾
 ```
 
-### 5.3 Phase 0 Seed verdict 输出格式
+可选(尚未实现,按需补):
 
-Seed phase 末尾必须输出固定 markdown,orchestrator 解析 YAML front matter 决定走向:
+```
+01-plan-ceo.md         # 产品规划(可选;若需 PM 视角再加)
+07-review.md           # 代码审查(可选;M2.1 sub-skill 触发 plugin code-reviewer 即可覆盖)
+```
+
+> 编号断档(00 / 01 / 07 / 08 缺失)有意保留,M3.1 F2 已落 `Dag::from_templates`
+> 按文件名顺序推 DAG,断档不影响顺序;不重新编号是为了 git 历史与 phase 名稳定。
+
+### 5.3 Verdict phase 输出格式(通用)
+
+> **2026-05-06 reframe**:原标题"Phase 0 Seed verdict 输出格式"假设 Seed 在 dev
+> pipeline 内。Seed 提取到 product-research team 后,verdict schema 本身**作为通用
+> 协议保留**——任何团队的 phase 想做"PASS / CONCERN / REJECT / CLARIFY"判断都用
+> 这个格式。当前已知使用方:product-research team 的 `verdict` phase(M3.4)。
+
+verdict-emitting phase 末尾必须输出固定 markdown,orchestrator 解析 YAML front matter 决定走向:
 
 ```markdown
 ---
-verdict: PASS | REJECT | CLARIFY
+verdict: PASS | CONCERN | REJECT | CLARIFY
 confidence: 0.0-1.0
 ---
 
@@ -490,10 +526,18 @@ confidence: 0.0-1.0
 ...
 
 ## 决策
-- PASS 时:建议技术栈、项目骨架
+- PASS 时:产物足够,直接交付(product-research:产 next-steps.md 建议派 dev)
+- CONCERN 时:可推进但有保留;rationale 列具体担忧(M2.3+ 起支持)
 - REJECT 时:列举具体理由(已有 X、成本不可持续、用户量级 < N)
-- CLARIFY 时:**只**提一个问题(prompt 显式约束;`24h` 无回答 → 自动归档)
+- CLARIFY 时:**只**提一个问题(prompt 显式约束;`max_clarify_rounds` 见 §5.6)
 ```
+
+`verdict` 与 ESCALATE 的关系:
+
+- `verdict: PASS` → phase 正常 PHASE_DONE,走 `next_on_done`
+- `verdict: CONCERN` → phase 正常 PHASE_DONE,但 outbox 写 `event_kind: progress` 提醒用户(下游 phase 不阻塞)
+- `verdict: REJECT` → phase ESCALATE,前缀 `ABORT`(M0.5.4),orchestrator 转项目终态
+- `verdict: CLARIFY` → phase 写 outbox `event_kind: clarify`,按 `decision_mode` 走(§5.6);多轮上限 `max_clarify_rounds`
 
 ---
 
@@ -556,6 +600,50 @@ retro_schema:
 - `retro_schema[*].field` 非空,**不允许重复**(防 RAG 索引冲突)
 
 **M3.1 实现位置**:`crates/ccteam-core/src/team.rs`(`TeamSpec` / `RetroFieldSpec` / `RetroFieldKind`),通过 `ccteam_core::TeamSpec::load(path)` 暴露。当前 ccteam binary 不读这个文件——**M3.4 加载逻辑、M4.1 retro phase 读 schema**。
+
+---
+
+### 5.6 `decision_mode` 与 `max_clarify_rounds` 语义(M2.3+)
+
+> phase 内"用户决策点"的 UX 协议。两种用户姿态(在线 vs 离线)需要不同 phase 行为,
+> 用 `decision_mode` 字段一处选择。多轮 CLARIFY 用 `max_clarify_rounds` 防失控。
+
+#### 5.6.1 三种 mode 行为
+
+| mode | phase 内行为 | 何时阻塞 | 用户姿态假设 |
+|---|---|---|---|
+| `sync` | 用 `AskUserQuestion` 工具直接问;phase 阻塞等回答 | 一直阻塞到回答 | 用户必然 `tmux attach` 到 project session 或 meta session |
+| `async` | 写 outbox `event_kind: clarify`,继续做能做的事;若全部依赖该决策 → 写 `PHASE_DONE_PENDING`(M3.6+)| 仅在所有剩余工作都依赖该决策时阻塞 | 用户可能离线几小时;批量决策 |
+| `hybrid` | 先试 `AskUserQuestion`,1-2 分钟超时降级 `async` 路径 | 短时阻塞后转 async | **默认推荐**——同时支持两种姿态 |
+
+实施约束:
+
+- `decision_mode: sync` —— phase prompt 必须显式调 `AskUserQuestion`;orchestrator 检测到该 phase idle 不计 stall(因为等用户是合理的),`stall_warn_minutes` 退化为"最大耐心"
+- `decision_mode: async` —— phase prompt 必须显式 Write 到 `~/projects/<slug>/.ccteam/outbox/clarify-<ts>-<n>.md`(schema 见 §3.4.3);**M3.6 之前 async 等同于"phase 直接 ESCALATE NEED_USER_INPUT 阻塞",M3.6 起支持真 PHASE_DONE_PENDING**
+- `decision_mode: hybrid` —— phase prompt 含两段 conditional(伪码:"如果 AskUserQuestion 在 X 秒内有响应就用,否则降级 outbox");X 由 phase 内 timeout 控制,orchestrator 不参与
+
+#### 5.6.2 `max_clarify_rounds` 行为
+
+phase 内累计 CLARIFY 轮次(每个 outbox `event_kind: clarify` 文件 + 对应 inbox answer 算一轮)。达到上限:
+
+1. phase 必须基于现有信息产出 best-effort artifact(写 `required_outputs` 列出的产物)
+2. ESCALATE 前缀 `INSUFFICIENT_CLARIFICATION`(M0.5.4 grammar 扩展)
+3. ESCALATE 事件 `args.rounds_used` 写实际轮次,`args.last_question` 写最后一问
+4. orchestrator 写 `~/projects/<slug>/.ccteam/escalation.md`,meta-agent / channel layer 通过 outbox 通知用户
+5. 用户决定:① 注入更多上下文继续追问;② 接受 best-effort artifact,phase 视为 PHASE_DONE;③ ABORT 项目
+
+**默认 `max_clarify_rounds: 3`**。verdict phase / 反向面试 phase(`@kickoff-reverse-interview`,M2.4)可适当调高(5-7);常规 phase 应当少于 3。
+
+#### 5.6.3 与 outbox `event_kind` 枚举的对齐
+
+§3.4.3 outbox event_kind 枚举:`reply | progress | escalation | shipped | clarify`。`decision_mode` 字段决定 phase 内**写哪种** event_kind:
+
+- `sync` mode → 不写任何 outbox(用 AskUserQuestion 直接对话)
+- `async` / `hybrid` mode → 写 `clarify`(还想问)或 `escalation`(过 max_clarify_rounds 或 verdict=REJECT)
+
+#### 5.6.4 与 `ccteam decisions` CLI 的关系(M1 收尾增量)
+
+`ccteam decisions` 扫所有 `~/projects/*/.ccteam/outbox/*.md` 过滤 `event_kind: clarify | escalation`,聚合成跨项目决策队列。**用户在 meta session attach 时,meta-agent 主动汇报队列**(role prompt 启发,M1.0 已落)。
 
 ---
 
