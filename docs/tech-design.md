@@ -198,87 +198,13 @@ orchestrator 重启时：`tmux has-session` + `kill -0 <claude_pid>` 双重校�
 
 ### 3.3 Phase Pipeline（短期对标 gstack-auto）
 
-每个 phase 是一个 markdown 文件 + YAML front matter（抄 Symphony 的 WORKFLOW.md 形态）：
+每个 phase 是一个 markdown 文件 + YAML front matter（抄 Symphony 的 WORKFLOW.md 形态）。**完整字段定义、9 个 phase 列表、Seed verdict 输出格式 → [interfaces.md §5](./interfaces.md#5-phase-模板-schema)**。
 
-```
-~/.ccteam/phases/
-  00-seed.md             # 可行性评估（PASS/REJECT/CLARIFY）
-  01-plan-ceo.md         # 产品规划
-  02-plan-eng.md         # 技术规划
-  03-implement.md        # 代码实现
-  04-test-author.md      # 测试编写
-  05-test-run.md          # 跑测试，输出报告
-  06-fix.md              # 修 bug（在 fix loop 中循环）
-  07-review.md           # 代码审查
-  08-score.md            # 评分（6 维 + bug penalty）
-  09-ship.md             # 提交、产文档、收尾
-```
+phase 协议的核心架构选择（论证留本节,字段细节看 interfaces）:
 
-**phase 文件格式**：
-```markdown
----
-name: implement
-required_inputs:
-  - .ccteam/plan-eng.md
-  - .ccteam/architecture.md
-required_outputs:
-  - src/**/*
-  - .ccteam/implement-report.md
-soft_cost_warn_usd: 5.0    # 仅告警，不打断
-stall_warn_minutes: 5       # 5 分钟无 hook event 第一次软告警
-parallelism: solo           # 主框架并行粒度（痛点 13；详见 §6.11）
-                            #   solo（M0 默认）         | agent_team（M2）        | multi_session（M3）
-                            # subagent 不在此声明——任何 agent 都可 ad-hoc 通过 Task 工具启动，叠加在主框架之上
-agent_team:                 # 可选：本 phase 内启用 sub-agent（仅 parallelism: agent_team 时生效）
-  - role: backend-dev
-  - role: frontend-dev
-  - role: reviewer
-sub_skills:                 # 替人编排的 sub-skill（痛点 12；详见 §6.10）
-  - skill: "claude-plugins-official:pr-review-toolkit/agents/code-reviewer"
-    trigger: phase_done       # phase_start | phase_done（M0/M2 仅这两档）
-    output_to: .ccteam/code-review.md
-hooks:
-  before: scripts/snapshot-git.sh
-  after: scripts/run-golden-rules.sh
----
-
-# 任务
-
-你正在为 {{project.slug}} 的 implement phase 工作。
-读取 {{required_inputs}}，按 plan-eng.md 实现。
-产物必须满足 {{required_outputs}}。
-
-不要交互式询问任何问题——所有决策已经在 plan 阶段定好。
-如果发现 plan 有问题，写到 .ccteam/escalation.md 后退出。
-
-完成后写 .ccteam/implement-report.md 总结你做了什么。
-```
-
-**Phase 0：Seed 评估**（这是 ccteam 区别于 gstack-auto 的关键）：
-
-输出固定格式：
-```markdown
----
-verdict: PASS | REJECT | CLARIFY
-confidence: 0.0-1.0
----
-
-## 市场分析
-（已有竞品 / 用户量 / 替代方案）
-
-## 技术可行性
-（核心难点 / 依赖 / 估算工作量）
-
-## 商业可行性（按需）
-...
-
-## 决策
-- PASS 时：建议技术栈、项目骨架
-- REJECT 时：列举具体理由（已有 X、成本不可持续、用户量级 < N）
-- CLARIFY 时：提出唯一一个问题（不要列 5 个）
-```
-
-Seed 输出由 orchestrator 解析 YAML front matter 决定走向，不依赖 LLM 的自然语言判断。
+- **YAML front matter 是 orchestrator 的唯一解析入口**——`required_inputs` / `required_outputs` 给 L1 架构约束验证；`parallelism` / `agent_team` / `sub_skills` 给痛点 11/12/13 的实现层；`hooks` 给 phase 级生命周期。不解析 prompt body,prompt body 完全留给 claude。
+- **Seed 输出靠 YAML 决定走向（PASS/REJECT/CLARIFY），不依赖 LLM 自然语言判断**——orchestrator 只 parse front matter `verdict`，避免"AI 说话不算数"。
+- **`parallelism` 字段决定主框架并行粒度**(详见 §6.11):solo(M0 默认) / agent_team(M2) / multi_session(M3)。subagent **不在此声明**——任何 agent 都可 ad-hoc 通过 Task 工具启动,叠加在主框架之上。
 
 ### 3.4 Workspace 隔离与并行
 
@@ -597,112 +523,17 @@ if running_count < config.max_concurrent_projects:
 
 ## 5. 数据与文件协议
 
-### 5.1 全局目录布局
+完整字段、JSON schema、文件命名规则、事件类型清单 → **[interfaces.md](./interfaces.md)**。本节只保留架构约束:
 
-```
-~/.ccteam/
-├── config.yml             # 全局配置（并发上限、API key、bot token）
-├── inbox/                  # 待 triage
-├── queue/
-│   ├── seeding/
-│   ├── planning/
-│   ├── coding/
-│   ├── reviewing/
-│   ├── done/
-│   └── archive/
-├── phases/                 # phase 模板（启动时复制到项目）
-│   ├── 00-seed.md
-│   ├── 01-plan-ceo.md
-│   └── ...
-├── memory/                 # 跨项目记忆
-│   ├── patterns/
-│   ├── anti-patterns/
-│   └── index.json
-├── progress/
-│   └── <slug>.jsonl       # 每项目一个事件流（hooks 写入，inotify 监听）
-├── log/
-│   └── <slug>/             # stream-json 归档（可选，调试用）
-├── tmux/
-│   └── <slug>.layout       # 项目专属 tmux 多 pane 布局模板
-└── state/
-    └── orchestrator.json   # orchestrator 自身 in-memory 状态的快照
-```
+| 子节 | 架构约束 | interfaces.md 章节 |
+|---|---|---|
+| §5.1 全局目录布局 | `~/.ccteam/` 是单一根;不跨用户共享 | [§1.1](./interfaces.md#11-全局目录ccteam) |
+| §5.2 项目级 state.json | 原子写(`.tmp` + rename);`phase_state` 三态(`in_flight` / `idle` / `fix_locked`);损坏走 backup | [§2](./interfaces.md#2-state-协议) |
+| §5.3 Inbox 协议 | 文件名 `<ISO-timestamp>-<random>.md`,原子写 | [§3.1](./interfaces.md#31-inbox) |
+| §5.4 控制协议 | orchestrator 30s 扫,处理后**删除文件**(幂等) | [§3.3](./interfaces.md#33-control用户--orchestrator) |
+| §5.5 Progress.jsonl | **唯一状态事实来源**——orchestrator 只读这一个文件做状态转移;tmux 终端输出不参与状态判定 | [§4](./interfaces.md#4-progressjsonl-事件流) |
 
-### 5.2 项目级 state.json
-
-```json
-{
-  "slug": "bookmark-mgr-a3f9",
-  "created_at": "2026-05-04T10:23:00Z",
-  "tmux_session": "ccteam-bookmark-mgr-a3f9",
-  "claude_session_id": "abc123-def-456",
-  "claude_pid": 12345,
-  "phase_state": "in_flight",
-  "current_phase": "implement",
-  "phase_history": [
-    {"phase": "seed",     "status": "passed", "duration_s": 90, "cost_usd": 0.12},
-    {"phase": "plan-ceo", "status": "passed", "duration_s": 45, "cost_usd": 0.08},
-    {"phase": "plan-eng", "status": "passed", "duration_s": 60, "cost_usd": 0.15}
-  ],
-  "fix_cycle_count": 0,
-  "cost_used_usd": 1.23,
-  "soft_warn_threshold_usd": 20.0,
-  "hard_kill_threshold_usd": 200.0,
-  "context_tokens_used": 142000,
-  "context_reset_threshold_tokens": 600000,
-  "context_reset_count": 0,
-  "last_progress_event_at": "2026-05-04T11:23:45Z",
-  "last_event_type": "Stop",
-  "last_user_interaction_at": "2026-05-04T10:23:00Z",
-  "user_attached": false,
-  "user_pause_pending": false
-}
-```
-
-### 5.3 Inbox 协议
-
-文件名：`<ISO-timestamp>-<random>.md`，原子写入（先写 `.tmp` 再 `mv`）。
-内容：见 §3.1。
-
-### 5.4 控制协议（用户 → orchestrator）
-
-```
-~/.ccteam/control/
-├── reject-<slug>          # 创建文件 = 命令"否决项目 <slug>"
-├── pause-all              # 创建文件 = 暂停所有调度
-├── answer-<slug>.md        # 内容 = 用户对 clarify 问题的回答
-└── boost-<slug>            # 提升优先级
-```
-
-orchestrator 每轮扫描 control/，处理后删除文件。
-
-### 5.5 Progress.jsonl 格式（结构化事件流）
-
-每个项目一个 `~/.ccteam/progress/<slug>.jsonl`，由 Claude Code 的 hooks 写入。**这是 orchestrator 唯一的状态事实来源**——tmux 终端输出只给人看，不解析。
-
-**事件示例**：
-```jsonl
-{"ts":"2026-05-04T11:23:00Z","event":"session_start","tmux_session":"ccteam-bookmark-mgr-a3f9"}
-{"ts":"...","event":"phase_inject","phase":"implement"}
-{"ts":"...","event":"PreToolUse","tool":"Edit","path":"src/db.ts"}
-{"ts":"...","event":"PostToolUse","tool":"Bash","cmd":"pnpm test","exit_code":0,"duration_ms":4521}
-{"ts":"...","event":"phase_milestone","phase":"implement","note":"完成 schema + migration"}
-{"ts":"...","event":"phase_done","phase":"implement","duration_s":4521,"cost_usd":2.13}
-{"ts":"...","event":"escalate","reason":"db migration 不可调和","cycle":3}
-{"ts":"...","event":"user_attach","detected_by":"PreToolUse-input-source"}
-```
-
-**写入机制**：
-- `session_start` / `phase_inject`：orchestrator 直接 append（在 send-keys 前后）
-- `PreToolUse` / `PostToolUse` / `phase_milestone`：Claude Code hooks 调用脚本 append
-- `phase_done` / `escalate`：Stop hook 解析 claude 最后一行输出（`PHASE_DONE: ...` / `ESCALATE: ...`）写入
-
-**消费方**：
-- orchestrator：用 inotify 监听末尾，做状态转移与 stall 检测
-- 用户 dashboard pane：`tail -f progress/<slug>.jsonl | jq -c '.event + ":" + (.tool // .note // "")'`
-- retro phase：作为项目历史输入
-
-**Stream-json 仍可保留**（可选）：用 hook 把 `--output-format stream-json` 的内容旁路归档到 `~/.ccteam/log/<slug>/`，仅供事后调试，不参与状态判定。
+§5.5 关键论证(留本节,详见 interfaces §4):**"progress.jsonl 唯一事实来源"是架构红线**。曾经考虑过解析 tmux capture-pane 输出做状态判断——拒,因为终端文本格式不稳定、ANSI 转义难、对 prompt cache 表现敏感。所有状态转移走 hook 写出的 JSONL,deterministic 且可重放。
 
 ---
 
@@ -790,104 +621,17 @@ orchestrator 通过 `PreToolUse` hook 检测最近一次输入源：若来自人
 
 ### 6.2 Hooks 配置
 
-每个项目 `.claude/settings.json`（结构参考 ccgram / moshi-hooks 等线上项目）：
+完整 `settings.json` 模板、Hook 事件用途表、`cost-accumulate.sh` 工作原理 → **[interfaces.md §6](./interfaces.md#6-hooks-配置-schema)**。本节只保留架构论证:
 
-```json
-{
-  "permissions": {
-    "allow": ["*"],
-    "deny": ["WebFetch(url:https://*.bank.com/*)"]
-  },
-  "env": {
-    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
-  },
-  "hooks": {
-    "SessionStart": [
-      {
-        "hooks": [
-          {"type": "command", "command": "scripts/load-context.sh", "timeout": 5},
-          {"type": "command", "command": "scripts/progress-append.sh session_start", "async": true}
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {"type": "command", "command": "scripts/parse-phase-end.sh", "timeout": 10},
-          {"type": "command", "command": "scripts/progress-append.sh Stop", "async": true}
-        ]
-      }
-    ],
-    "Notification": [
-      {
-        "matcher": "idle_prompt|permission_prompt",
-        "hooks": [
-          {"type": "command", "command": "scripts/progress-append.sh notification", "async": true}
-        ]
-      }
-    ],
-    "PreToolUse": [
-      {
-        "hooks": [
-          {"type": "command", "command": "scripts/progress-append.sh PreToolUse", "async": true}
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "hooks": [
-          {"type": "command", "command": "scripts/progress-append.sh PostToolUse", "async": true},
-          {"type": "command", "command": "scripts/cost-accumulate.sh", "async": true}
-        ]
-      },
-      {
-        "matcher": "Bash:git push.*",
-        "hooks": [
-          {"type": "command", "command": "scripts/block-push.sh"}
-        ]
-      }
-    ],
-    "SubagentStop": [
-      {
-        "hooks": [
-          {"type": "command", "command": "scripts/progress-append.sh SubagentStop", "async": true}
-        ]
-      }
-    ],
-    "SessionEnd": [
-      {
-        "hooks": [
-          {"type": "command", "command": "scripts/progress-append.sh SessionEnd", "async": true}
-        ]
-      }
-    ]
-  }
-}
-```
+**为什么 hooks 是 ccteam 可观测性命脉**:Claude Code hooks 是 deterministic 的(详见 claude-code-best-practices §4.5)——同一事件触发同一脚本,这是把"AI 的随机推理"转成"系统可处理的事件流"的桥。ccteam 把所有 phase 边界 / 工具调用 / 退出信号都通过 hooks 落到 progress.jsonl,orchestrator 据此做状态转移,完全不解析 tmux 终端文本。
 
-**关键 hook 用途**：
+**Hook 写作纪律**(实现 PR 必须遵守):
+- append 类必须 `async: true`——别拖慢主流程
+- 解析 `PHASE_DONE` / `ESCALATE` 的 hook 设 `timeout: 10`,失败要落日志
+- hook 脚本放 `~/.ccteam/hooks/`,不放项目目录(避免被 claude 自己改)
+- `Stop` 一个 entry 内可挂多 command,但**`decision: block` 决策只能由 `parse-phase-end.sh` 单点输出**(详见 §3.5);其它 command 必须 `async: true` 仅做 append/log
 
-| Hook | 作用 |
-|---|---|
-| `SessionStart` | 写 ready 标记；append `session_start` 事件 |
-| `Stop` | claude 完成一轮 → 解析最后一行 `PHASE_DONE` / `ESCALATE`；append `Stop` 事件（**这是 idle 信号**，§6.9 注入协议依赖此事件） |
-| `Notification:idle_prompt` | claude 显式等待用户输入 → 同样作为 idle 信号 |
-| `Notification:permission_prompt` | 不应该出现（`--dangerously-skip-permissions` 兜底）；出现说明配置失效，记录排查 |
-| `PreToolUse` | append 工具调用事件；活跃信号（用于 stall 检测的反向判断） |
-| `PostToolUse`（通用） | append 事件；累加 token / cost 到 state.json（context_tokens_used 用于 §6.9 的 60% 阈值判断）|
-| `PostToolUse`（Bash matcher） | 拦截危险命令（`git push`、`rm -rf /`、deploy 脚本等） |
-| `SubagentStop` | 子 agent 退出（仅 Agent Teams phase 内相关）|
-| `SessionEnd` | claude 进程退出 → orchestrator 知道要么 reset 完成，要么 crash |
-
-**cost-accumulate.sh 工作原理（重要）**：Claude Code **不会**在 hook 输入里直接给 `cost_usd`——必须自己算。流程：
-
-1. hook 通过 stdin 收到 JSON，内含 `transcript_path`（Claude Code 的 session JSONL 路径）。
-2. 脚本 tail 该 JSONL 文件最后一条 `role:assistant` 记录，解析 `message.usage` 字段：`input_tokens` / `cache_read_input_tokens` / `cache_creation_input_tokens` / `output_tokens`（字段名参考 `claude-plugins-official/session-report/skills/session-report/analyze-sessions.mjs`）。
-3. 按当前模型单价（在 `~/.ccteam/config.yml` 维护一张 `model_rates` 表）计算本轮成本增量。
-4. 原子地（`.tmp` + rename）累加到 `state.json.cost_used_usd` 和 `state.json.context_tokens_used`。
-5. 后者直接驱动 §6.9 的 60% 阈值判断。
-
-`async: true` 不能省——同步阻塞会拖慢 PostToolUse 路径。
+**cost 来源关键事实**(写代码前必须知道):Claude Code **不**在 hook 输入里给 `cost_usd`——必须从 `transcript_path` 读 JSONL 解析 `usage.*` 自算。完整流程见 [interfaces.md §6.3](./interfaces.md#63-cost-accumulatesh-工作原理)。
 
 ### 6.3 Multi-agent 编排（phase 内并行 + cross-cutting watcher）
 
@@ -1112,61 +856,21 @@ fi
 
 ccteam 不重写 gstack / claude-plugins-official 的 skill；ccteam 的差异化是**替人 orchestrate 它们的调用时机与产物接力**——直接对应痛点 12。
 
-#### Phase front matter 的 `sub_skills` 字段
+完整 schema(`sub_skills` 字段 / trigger 时机表 / `skill:` 路径前缀三档 / `skill_intent.yaml` 扩展协议) → **[interfaces.md §7](./interfaces.md#7-sub-skill-调度-schema)**。
 
-呼应 §3.3。每个 phase 在 YAML front matter 列本阶段应自动 trigger 的 sub-skills：
+本节保留架构论证:
 
-```yaml
-sub_skills:
-  - skill: "claude-plugins-official:pr-review-toolkit/agents/code-reviewer"
-    trigger: phase_done
-    output_to: .ccteam/code-review.md
-  - skill: "claude-plugins-official:security-guidance/hooks/security_reminder_hook.py"
-    trigger: phase_start
-    output_to: .ccteam/security-precheck.md
-```
+**核心设计选择**:
+- **trigger 只两档**(`phase_start` / `phase_done`)——`before_done` 需 Stop hook 拦截,等同 fix-cycle 复杂度,M0/M2 不开
+- **产物自动接力**——orchestrator 把上一 phase 的 `output_to` 路径作为下一 phase prompt 的 `@文件引用` 自动追加,用户从头到尾不复制粘贴
+- **三种复用粒度共存**——`@文件引用`(零安装) / 拷贝到项目(冻结版本) / 整 plugin 安装(M2/M3+);`skill:` 字段路径前缀分发
+- **新插件靠 `skill_intent.yaml` 自描述**——社区作者写自己的挂载推荐,ccteam 不改代码即可接入(M3+ 自动)
 
-#### Trigger 时机（M0/M2 仅两档，足够）
+**与 §6.3 Multi-agent 编排的边界**:
+- `agent_team`(§6.3) = phase 内**并行**跑的 audit/dev sub-agent
+- `sub_skills`(本节) = phase 进入或完成时**串行**调用的工作流单元,产物落文件给下游用
 
-| Trigger | 何时跑 | 实现 |
-|---|---|---|
-| `phase_start` | phase prompt 注入前 | orchestrator 把 skill 内容前置到 prompt（或异步先跑产出文件供 phase 引用） |
-| `phase_done` | claude 输出 `PHASE_DONE` 后 | orchestrator 在状态机转移前调用 skill，产物落到 `output_to` |
-
-**M0/M2 不引入 `before_done` 之类需 Stop hook 拦截的 trigger**——那等同于再开一条 fix-cycle 复杂度路径。如未来真有用例（例：claude 写完代码主动跑 lint 后再退出），M3+ 再加。
-
-#### 产物接力（自动化的核心价值）
-
-每个 sub-skill 产物按 `output_to` 落到项目 `.ccteam/` 下。orchestrator 在调度下一 phase 时：
-1. 扫上一 phase 的 `sub_skills` 全部 `output_to` 路径
-2. 把这些路径作为下一 phase prompt 的 `@文件引用` 自动追加
-3. 下一 phase claude 自动读到上游 audit / review 产物
-
-**用户视角**：从头到尾不需要手动复制粘贴任何 skill 产物——这就是痛点 12 的落地。
-
-#### 复用粒度（呼应 CLAUDE.md §三.7）
-
-按需选三种粒度之一：
-- **直接 `@文件引用`**（零安装）——phase 模板里 inline 引用 plugin 文件
-- **拷贝到项目**（冻结版本）——`cp` 到 `~/projects/<slug>/.claude/agents/` 后改
-- **整 plugin 安装**（M2/M3 才考虑）——`/plugin install <name>@claude-plugins-official`
-
-`sub_skills` 字段支持三种粒度——`skill:` 路径既可指向官方仓库（自动按粒度 1）、也可指向项目级（粒度 2）、也可是已安装 plugin 的命令（粒度 3）。orchestrator 解析时按路径前缀分发。
-
-#### 新插件如何接入（Phase 协议的可扩展性）
-
-社区出新插件时，作者无须改 ccteam 代码——只需提供：
-1. 一份 `skill_intent.yaml` 描述本 skill 适合的 trigger（`phase_start` / `phase_done`）和典型 output 形态
-2. 推荐的挂载 phase（plan-eng / implement / review / ship 等）
-
-ccteam 在 Seed phase 后扫一次 `~/.claude/plugins/.../skill_intent.yaml`，按推荐挂载点把 skill 加到对应 phase 模板的 `sub_skills` 列表（M3+ 自动化；M0-M2 手动维护 phase 模板）。
-
-#### 与 §6.3 Multi-agent 编排的边界
-
-- **`agent_team`（§6.3）** = phase 内**并行**跑的 audit/dev sub-agent
-- **`sub_skills`（本节）** = phase 进入或完成时**串行**调用的工作流单元，产物落文件给下游用
-
-两个字段在 phase front matter 共存、互不冲突。
+两字段在 phase front matter 共存、互不冲突。
 
 ### 6.11 Multi-session per project（痛点 13 大项目加速；M3）
 
@@ -1183,57 +887,22 @@ ccteam 在 Seed phase 后扫一次 `~/.claude/plugins/.../skill_intent.yaml`，�
 | 开销 | 中（共享进程） | 大（N 进程 × 1M context） |
 | 取舍 | 优化 token 成本 | 优化墙钟时间 |
 
-#### 工作区结构
+工作区结构、tmux 命名、状态管理、资源约束 → **[interfaces.md §1.3](./interfaces.md#13-multi-session-项目子模块布局parallelism-multi_session)、[§2.2-2.3](./interfaces.md#22-master-statejsonparallelism-multi_session)、[§8](./interfaces.md#8-multi-session-per-project-协议m3)**。本节保留 fan-out / fan-in 论证:
 
-```
-~/projects/<slug>/
-├── .ccteam/
-│   ├── state.json                   # master state（项目级）
-│   ├── parallelism: multi_session
-│   ├── sub-modules/
-│   │   ├── backend-api/
-│   │   │   ├── state.json           # 子模块 state（独立 phase 进度）
-│   │   │   └── progress.jsonl
-│   │   ├── frontend-dashboard/
-│   │   ├── mobile-app/
-│   │   └── docs/
-│   └── interface-contracts.md       # 子模块间接口契约（fan-out 时定下，fan-in 时验证）
-├── backend-api/                     # 实际代码（独立目录）
-├── frontend-dashboard/
-├── mobile-app/
-└── docs/
-```
+#### Fan-out / Fan-in 协议(架构论证)
 
-#### Tmux session 命名
+主流程是分形的——master 项目级 phase 流(`plan-eng` → `fan-out` → `implement-parallel` → `fan-in` → `review` → `ship`)在 master session 跑;每子模块在自己的 session 跑完整 9-phase 流,与单 session 项目协议**完全一致**。
 
-```
-ccteam-<slug>                        # master session（编排）
-ccteam-<slug>--backend-api           # 子模块 session
-ccteam-<slug>--frontend-dashboard
-ccteam-<slug>--mobile-app
-ccteam-<slug>--docs
-```
+关键论证:
+1. **plan-eng 在 master 决定子模块切分**——子模块清单不是用户先验给的,是 plan-eng 输出的(`interface-contracts.md` + 模块清单)。master 不假设子模块独立度。
+2. **Fan-out 一次性、Fan-in 阻塞**——master orchestrator 起 N 个 sub-session 后退到 idle,通过 inotify 监听所有 sub-module `progress.jsonl`;**所有** sub-module 都到 review phase 才触发 fan-in。任一子模块 escalate → master 暂停 fan-in。
+3. **Review 在 master 跑,验证 contracts**——master 不是 N 个子模块的简单合并,而是有责任 audit 跨模块的接口契约(M3 靠 review phase 跑测试 + 人审 contracts.md;M5 才有形式化验证)。
 
-#### Fan-out / Fan-in 协议
+#### 状态管理(关键纪律)
 
-主流程：
-1. `plan-eng` phase（master session 跑）→ 输出 `interface-contracts.md` + 子模块清单
-2. **Fan-out**：master orchestrator 起 N 个 tmux 子 session，每 session 喂自己的子模块 spec + 共享 contracts
-3. 各子模块独立跑 implement / test / fix → phase 边界写各自 `progress.jsonl`
-4. **Fan-in**：所有子模块都到达 review phase 时，master session 起来跑 review（读所有子模块产物 + 验证 contracts 满足）
-5. `ship` phase 在 master session 跑（统一打包/发布）
-
-#### 状态管理
-
-- **master `state.json`**：项目级 phase（plan / fan-out / fan-in / review / ship）+ 子模块状态摘要
-- **sub-module `state.json`**：本子模块的 phase 进度（与单 session 项目协议一致）
-- master orchestrator 通过 inotify 监听**所有** sub-module `progress.jsonl`，决定何时 fan-in
-
-#### 资源约束
-
-- `~/.ccteam/config.yml` 加 `max_sessions_per_project: 4`（默认；可项目级覆盖）
-- 总 token 预算按 master + sum(sub-modules) 累加；硬上限触发 fan-in escalate
-- context reset：每个 sub-session 独立按 60% 阈值 reset，不互相影响（§6.9）
+- **master `state.json`** 维护项目级 phase + 子模块状态摘要(详见 interfaces §2.2)
+- **sub-module `state.json`** 维护子模块 phase 进度(与单 session 协议一致,详见 §2.3)
+- 总 token 预算 = master + sum(sub-modules);硬上限触发 fan-in escalate
 
 #### 三档叠加体现
 
@@ -1303,57 +972,9 @@ multi_session 项目内每个 sub-session 仍可独立选 `parallelism: agent_te
 
 ## 10. 附录
 
-### 10.1 关键命令清单
+### 10.1 命令签名 / 文件路径
 
-```bash
-# 启动 / 停止
-ccteam start                           # 启动 orchestrator（前台）
-ccteam start --daemon                  # 启动并 daemonize
-ccteam stop                            # 优雅停机（保留 tmux session）
-ccteam stop --kill-sessions            # 同时关闭所有 tmux session（慎用）
-
-# 提交需求
-ccteam new "需求文本"
-ccteam new -f spec.md                  # 从文件提
-
-# 查询状态
-ccteam ls                              # 所有项目状态
-ccteam show <slug>                     # 单项目详情（含 session 状态、cost、最近 progress）
-ccteam progress <slug> --tail          # 实时 tail progress.jsonl
-ccteam progress <slug> --phase implement  # 看特定 phase 事件
-
-# 进入项目（核心透明度入口）
-ccteam attach <slug>                   # tmux attach 到项目 session（可介入）
-ccteam peek <slug>                     # tmux capture-pane 一次性看当前屏，不 attach
-
-# 控制
-ccteam reject <slug>                   # 否决
-ccteam pause <slug>                    # 暂停（不杀 session）
-ccteam resume <slug>                   # 恢复自动调度（接管 attach 后的暂停）
-ccteam answer <slug> "回答内容"          # 响应 clarify
-ccteam kick <slug>                     # 软重启项目 session（claude --resume）
-
-# 维护
-ccteam memory ls                       # 看跨项目记忆
-ccteam memory rebuild                  # 重建索引
-ccteam config edit                     # 改全局配置
-ccteam doctor                          # 体检：tmux server / claude 可用性 / 死 session 检测
-```
-
-### 10.2 关键文件路径速查
-
-| 路径 | 用途 |
-|---|---|
-| `~/.ccteam/config.yml` | 全局配置 |
-| `~/.ccteam/inbox/` | 用户提需求 |
-| `~/.ccteam/queue/<state>/` | 项目状态分桶 |
-| `~/.ccteam/phases/` | phase 模板 |
-| `~/.ccteam/memory/` | 跨项目记忆 |
-| `~/.ccteam/progress/<slug>.jsonl` | 结构化事件流（hooks 写，inotify 监听） |
-| `~/.ccteam/log/<slug>/` | stream-json 归档（可选，调试用） |
-| `~/.ccteam/tmux/<slug>.layout` | 项目 tmux pane 布局模板 |
-| `~/projects/<slug>/.ccteam/` | 项目元数据 |
-| `~/projects/<slug>/CLAUDE.md` | 自动生成的项目运营手册 |
+完整 CLI 命令签名 → **[interfaces.md §10](./interfaces.md#10-cli-命令签名)**;关键文件路径速查 → **[interfaces.md §11](./interfaces.md#11-关键文件路径速查)**。本节不再重复维护。
 
 ### 10.3 参考项目
 
@@ -1382,12 +1003,14 @@ ccteam doctor                          # 体检：tmux server / claude 可用性
 ## 11. 本文档的位置
 
 - `requirements.md` 回答 **为什么做** 与 **谁会用**——已确认。
-- 本文档 `tech-design.md` 回答 **怎么做**——架构、协议、扩展点。
-- [`development-plan.md`](./development-plan.md) 回答 **何时做什么**——把 §7 里程碑细化到任务级，含痛点反向映射、依赖图、验收门、风险登记。
-- 后续 `interfaces.md`（待写）回答 **每个组件的精确接口**——orchestrator API、phase prompt schema、状态机事件。
+- 本文档 `tech-design.md` 回答 **怎么做**——架构论证、设计权衡、扩展点选择。
+- [`development-plan.md`](./development-plan.md) 回答 **何时做什么**——里程碑细化到任务级,含痛点反向映射、依赖图、验收门、风险登记。
+- [`interfaces.md`](./interfaces.md) 回答 **接口确切长什么样**——YAML schema、JSON shape、文件路径、事件类型、命令签名。
 
-所有实现 PR 必须能映射回：
+所有实现 PR 必须能映射回:
 1. `requirements.md` 的某条痛点
 2. 本文档某个组件 / phase / 流程
+3. `development-plan.md` 某条任务编号
+4. (改协议时) `interfaces.md` 必须同步
 
-无法映射的，先放进 backlog 而非合入主线。
+无法映射的,先放进 backlog 而非合入主线。

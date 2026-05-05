@@ -4,11 +4,12 @@
 
 ## 阅读顺序
 
-1. `docs/requirements.md` — 为什么做、为谁做(10 条用户痛点是 PR 验收唯一标准)
-2. `docs/tech-design.md` — 怎么做(架构红线、phase 协议、文件协议——已固化,**不要重新选型**)
-3. `docs/development-plan.md` — 何时做什么(里程碑任务、依赖图、痛点反向映射、验收门——PR 必须挂某条任务编号)
-4. `docs/claude-code-best-practices.md` — Claude Code 官方最佳实践本地副本(下面 §三所有扩展机制都引用此文件具体章节)
-5. 本文件 — 用哪些扩展机制实现 ccteam,以及具体复用哪些 `claude-plugins-official` 件
+1. `docs/requirements.md` — 为什么做、为谁做(13 条用户痛点是 PR 验收唯一标准)
+2. `docs/tech-design.md` — 怎么做(架构论证、设计权衡——已固化,**不要重新选型**)
+3. `docs/interfaces.md` — 接口确切长什么样(YAML schema、JSON shape、文件路径、事件类型、命令签名——改协议必须同步本文)
+4. `docs/development-plan.md` — 何时做什么(里程碑任务、依赖图、痛点反向映射、验收门——PR 必须挂某条任务编号)
+5. `docs/claude-code-best-practices.md` — Claude Code 官方最佳实践本地副本(下面 §三所有扩展机制都引用此文件具体章节)
+6. 本文件 — 用哪些扩展机制实现 ccteam,以及具体复用哪些 `claude-plugins-official` 件
 
 ---
 
@@ -154,8 +155,9 @@ claude-code-setup      code-review            hookify              ralph-loop
 ```
 ccteam/
 ├── docs/
-│   ├── requirements.md          ✅ 已定稿
-│   ├── tech-design.md            ✅ 已定稿(架构红线 + 协议)
+│   ├── requirements.md          ✅ 13 条痛点
+│   ├── tech-design.md            ✅ 架构论证(WHY)
+│   ├── interfaces.md             ✅ 接口卡(WHAT — schema / 路径 / 命令签名)
 │   ├── development-plan.md       ✅ 任务级开发计划(M0 active)
 │   └── claude-code-best-practices.md   ✅ 官方最佳实践本地副本
 ├── .claude/
@@ -177,11 +179,12 @@ M0 完整任务清单见 `docs/development-plan.md` §2(任务编号 M0.1–M0.1
 
 ## 五、PR / 实现纪律
 
-1. **每个 PR 必须能映射到三件事**:
+1. **每个 PR 必须能映射到**:
    - `requirements.md` §二的某条痛点(写 PR 描述,例:`痛点 4`)
    - `tech-design.md` 某章节(说明对应组件,例:`tech-design §3.5`)
    - `development-plan.md` 某条任务(例:`Closes M0.12`)
-   - 三个都不能映射 → backlog,不合主线(tech-design §11)
+   - 改了协议(YAML 字段、JSON shape、文件路径、CLI 签名)→ **必须同步 `interfaces.md` 对应章节**
+   - 都不能映射 → backlog,不合主线(tech-design §11)
 2. **commit message 用英语**——与现有 `prd & tech docs` / `Initial commit` 风格一致(文档与 phase prompt 用中文)
 3. **不写 backwards-compat shim**——M0 没有"老版本",任何向后兼容代码都是过度设计
 4. **优先编辑现有文件,不轻易新建**——尤其 phase 模板,先看 `claude-plugins-official/feature-dev/commands/feature-dev.md` 能不能直接 `@引用`(§3.7 检查清单)
