@@ -155,12 +155,7 @@ pub fn run_peek(slug: &str) -> Result<String> {
         bail!("tmux session not running: {}", session.name());
     }
     let output = Command::new("tmux")
-        .args([
-            "capture-pane",
-            "-p",
-            "-t",
-            &format!("{}:0", session.name()),
-        ])
+        .args(["capture-pane", "-p", "-t", session.name()])
         .output()
         .context("spawn tmux capture-pane")?;
     if !output.status.success() {

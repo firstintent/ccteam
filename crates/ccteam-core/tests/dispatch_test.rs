@@ -153,12 +153,7 @@ fn dispatch_phase_payload_lands_in_tmux_pane() {
     let mut last_capture = String::new();
     for _ in 0..30 {
         let output = std::process::Command::new("tmux")
-            .args([
-                "capture-pane",
-                "-p",
-                "-t",
-                &format!("{}:0", session.name()),
-            ])
+            .args(["capture-pane", "-p", "-t", session.name()])
             .output()
             .unwrap();
         last_capture = String::from_utf8_lossy(&output.stdout).into_owned();

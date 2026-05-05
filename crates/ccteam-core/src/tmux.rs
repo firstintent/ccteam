@@ -107,11 +107,15 @@ impl TmuxSession {
         // server-default that can be as small as 1×1, silently
         // truncating everything send-keys writes. resize-window is a
         // no-op when a real client later attaches.
+        //
+        // Target the session by name (no `:N` suffix) so we hit whatever
+        // the active window is — users with `base-index 1` in tmux.conf
+        // have no window 0, and a hard-coded `:0` errors out.
         let _ = Command::new("tmux")
             .args([
                 "resize-window",
                 "-t",
-                &format!("{}:0", self.name),
+                &self.name,
                 "-x",
                 "200",
                 "-y",
@@ -143,16 +147,18 @@ impl TmuxSession {
         Ok(())
     }
 
-    /// PID of the first pane's leader process (the `claude` process,
+    /// PID of the active pane's leader process (the `claude` process,
     /// in production). Returns `None` if the session doesn't exist or
     /// the pane has no associated PID yet.
+    ///
+    /// Targeted by session name only — tmux resolves to the active
+    /// window/pane, which avoids assumptions about `base-index`.
     pub fn pane_pid(&self) -> Result<Option<i32>> {
         if !self.exists() {
             return Ok(None);
         }
-        let target = format!("{}:0", self.name);
         let output = Command::new("tmux")
-            .args(["display-message", "-p", "-t", &target, "-F", "#{pane_pid}"])
+            .args(["display-message", "-p", "-t", &self.name, "-F", "#{pane_pid}"])
             .output()
             .with_context(|| format!("spawn tmux display-message for {}", self.name))?;
         if !output.status.success() {
@@ -196,18 +202,22 @@ impl TmuxSession {
         }
     }
 
-    /// Send literal text to the first pane and press Enter. Two tmux
+    /// Send literal text to the active pane and press Enter. Two tmux
     /// invocations: a `-l` (literal) send so unprintable characters in
     /// `text` aren't reinterpreted, then an `Enter` keypress to submit.
     /// Multi-line prompts arrive M0.8 (idle-aware injection).
+    ///
+    /// Targeted by session name only — tmux resolves to the active
+    /// window/pane, so this works regardless of the user's `base-index`
+    /// setting (`base-index 1` in tmux.conf would otherwise break a
+    /// hard-coded `:0` target).
     pub fn send_keys(&self, text: &str) -> Result<()> {
         if !self.exists() {
             bail!("send_keys: session does not exist: {}", self.name);
         }
-        let target = format!("{}:0", self.name);
 
         let output = Command::new("tmux")
-            .args(["send-keys", "-t", &target, "-l", "--", text])
+            .args(["send-keys", "-t", &self.name, "-l", "--", text])
             .output()
             .with_context(|| format!("spawn tmux send-keys (-l) for {}", self.name))?;
         if !output.status.success() {
@@ -216,7 +226,7 @@ impl TmuxSession {
         }
 
         let output = Command::new("tmux")
-            .args(["send-keys", "-t", &target, "Enter"])
+            .args(["send-keys", "-t", &self.name, "Enter"])
             .output()
             .with_context(|| format!("spawn tmux send-keys Enter for {}", self.name))?;
         if !output.status.success() {
