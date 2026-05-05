@@ -20,11 +20,15 @@ use chrono::{SecondsFormat, Utc};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde_json::{json, Value};
 
+use crate::fix_loop::{self, FixLoopState};
 use crate::paths::CcteamPaths;
 use crate::phases::PhaseTemplate;
 use crate::progress;
 use crate::state::{PhaseHistoryEntry, PhaseState, ProjectState};
 use crate::tmux::TmuxSession;
+
+const FIX_PHASE_NAME: &str = "fix";
+const FIX_LOOP_MAX_ITERATIONS: u32 = 3;
 
 /// M0 linear phase DAG. M2+ widens to fork on test results, sub-skill
 /// scheduling, and (M3) multi-session fan-out / fan-in.
@@ -85,7 +89,10 @@ pub fn decide_tick(state: &ProjectState, last_event: Option<&Value>) -> TickActi
         return TickAction::NoOp;
     }
 
-    if state.phase_state == PhaseState::InFlight {
+    if matches!(
+        state.phase_state,
+        PhaseState::InFlight | PhaseState::FixLocked
+    ) {
         let Some(e) = last_event else {
             return TickAction::NoOp; // dispatched but no events yet
         };
@@ -384,8 +391,23 @@ impl Orchestrator {
                 }
                 TickAction::DispatchPhase { phase } => {
                     self.dispatch_phase(slug, &phase)?;
+                    let target_state = if phase == FIX_PHASE_NAME {
+                        // Stop hook (M0.12) drives the loop; orchestrator
+                        // only re-enters on phase_done/escalate.
+                        let project_dir = self.paths.project_dir(slug);
+                        let prompt = progress::build_phase_prompt(&phase);
+                        let fl = FixLoopState::new(
+                            slug.to_string(),
+                            prompt,
+                            FIX_LOOP_MAX_ITERATIONS,
+                        );
+                        fix_loop::write(&fix_loop::path_in(&project_dir), &fl)?;
+                        PhaseState::FixLocked
+                    } else {
+                        PhaseState::InFlight
+                    };
                     state.current_phase = phase;
-                    state.phase_state = PhaseState::InFlight;
+                    state.phase_state = target_state;
                     state.save(&state_path)?;
                     return Ok(state);
                 }

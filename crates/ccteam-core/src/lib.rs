@@ -2,6 +2,7 @@
 //! and hook-shared schemas. Consumed by `ccteam-cli` (binary entry) and
 //! `ccteam-hooks` (hook handlers invoked via `ccteam hook ...`).
 
+pub mod fix_loop;
 pub mod orchestrator;
 pub mod paths;
 pub mod phases;
@@ -11,6 +12,7 @@ pub mod state;
 pub mod templates;
 pub mod tmux;
 
+pub use fix_loop::{FixLoopDecision, FixLoopFrontMatter, FixLoopState};
 pub use orchestrator::{
     append_progress_summary, build_progress_summary, decide_tick, is_terminal, next_phase,
     Orchestrator, OrchestratorConfig, TickAction, FIRST_PHASE, M0_PHASE_DAG,

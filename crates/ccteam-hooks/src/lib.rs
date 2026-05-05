@@ -15,5 +15,5 @@ pub mod transcript;
 
 pub use cost::cost_accumulate;
 pub use load_context::load_context;
-pub use parse_phase_end::parse_phase_end;
+pub use parse_phase_end::{parse_phase_end, ParseDecision};
 pub use progress::progress_append;

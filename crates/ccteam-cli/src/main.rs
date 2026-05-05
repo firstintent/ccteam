@@ -132,7 +132,17 @@ fn run_hook(cmd: HookCommand) -> Result<()> {
         HookCommand::ProgressAppend { event_type } => {
             ccteam_hooks::progress_append(&paths, &event_type, &stdin)
         }
-        HookCommand::ParsePhaseEnd => ccteam_hooks::parse_phase_end(&paths, &stdin),
+        HookCommand::ParsePhaseEnd => {
+            let decision = ccteam_hooks::parse_phase_end(&paths, &stdin)?;
+            if let ccteam_hooks::ParseDecision::Block { reason } = decision {
+                let json = serde_json::json!({
+                    "decision": "block",
+                    "reason": reason,
+                });
+                println!("{}", serde_json::to_string(&json)?);
+            }
+            Ok(())
+        }
         HookCommand::CostAccumulate => ccteam_hooks::cost_accumulate(&paths, &stdin),
         HookCommand::LoadContext => ccteam_hooks::load_context(&paths, &stdin),
     }
