@@ -1,0 +1,38 @@
+name: product-research
+description: Product research team — should we build this idea?
+phase_dir: phases-product-research
+
+# Phase that produces a verdict markdown (interfaces §5.3 schema).
+# `verdict.md` PASS/CONCERN/REJECT/CLARIFY drives downstream decisions.
+verdict_schema:
+  - verdict
+
+# Team-specific ESCALATE prefixes the Stop hook should treat as known
+# grammar (interfaces §4.1.1). Prefix is team semantics; route is one
+# of the three built-in kinds (revert_to_phase / need_user_input / abort).
+escalate_grammar_extensions:
+  - prefix: MARKET_DUPLICATE
+    route: abort
+    reason: "target market saturated — the idea duplicates an existing free / widely-used tool, no further research needed"
+  - prefix: INSUFFICIENT_VALIDATION
+    route: need_user_input
+    reason: "could not collect enough validation data within the round budget; user needs to supply more or accept best-effort"
+  - prefix: LOW_DIFFERENTIATION
+    route: revert_to_phase
+    target_phase: kickoff
+    reason: "no sustainable differentiation found; revert to kickoff so the user can rethink the brief from a different angle"
+
+# Team-wide golden_rules default. Phase YAML's golden_rules takes
+# priority — phases declaring their own ignore these. Empty for now;
+# product-research has no team-wide hard quality bars (each phase
+# declares its own where applicable).
+golden_rules: []
+
+# Critic dimensions — data form only in M3; M5 will read these.
+# Empty here per the plan §5 M3 design notes (4.2): research / dev
+# both leave critic_dimensions empty until M5 wires the Critic loop.
+critic_dimensions: []
+
+# Retro phase fields. Empty disables retro emission for this team.
+# product-research retros are not yet defined; M4.1 may revise.
+retro_schema: []
