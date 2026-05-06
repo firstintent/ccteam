@@ -65,21 +65,35 @@ pub fn random_suffix() -> String {
     format!("{:04x}", nanos & 0xFFFF)
 }
 
-/// Pick an unused slug under `paths.projects_root`. Tries the bare
-/// slugified base first, then `<base>-<suffix>` with up to 16 retries.
-pub fn pick_unused_slug(paths: &CcteamPaths, base: &str) -> Result<String> {
+/// Pick an unused slug under `paths.projects_root`, prefixed with the
+/// project's team name so `~/.claude/rules/ccteam-lessons-<team>.md`
+/// `paths:` frontmatter (`~/projects/<team>-*`) actually matches the
+/// project directory at session start (M4 main path; F22 fix, 2026-05-06).
+///
+/// Tries `<team>-<base>` first, then `<team>-<base>-<suffix>` with up
+/// to 16 retries on collision.
+///
+/// Meta-agent projects don't go through this function — they use
+/// `meta_slug(handle)` which hand-crafts `<handle>-meta` (suffix
+/// convention established before F22; rules don't scope to meta).
+pub fn pick_unused_slug(
+    paths: &CcteamPaths,
+    base: &str,
+    team: &str,
+) -> Result<String> {
     let base = slugify(base);
-    if !paths.project_dir(&base).exists() {
-        return Ok(base);
+    let prefixed = format!("{team}-{base}");
+    if !paths.project_dir(&prefixed).exists() {
+        return Ok(prefixed);
     }
     for _ in 0..16 {
-        let candidate = format!("{base}-{}", random_suffix());
+        let candidate = format!("{prefixed}-{}", random_suffix());
         if !paths.project_dir(&candidate).exists() {
             return Ok(candidate);
         }
     }
     Err(anyhow!(
-        "could not pick an unused slug after 16 attempts (base: {base})",
+        "could not pick an unused slug after 16 attempts (base: {prefixed})",
     ))
 }
 
@@ -500,6 +514,47 @@ mod tests {
         let s = slugify(&"a".repeat(80));
         assert_eq!(s.len(), 40);
         assert!(s.chars().all(|c| c == 'a'));
+    }
+
+    fn pick_paths(tmp: &tempfile::TempDir) -> CcteamPaths {
+        CcteamPaths {
+            root: tmp.path().join("ccteam-home"),
+            projects_root: tmp.path().join("projects"),
+        }
+    }
+
+    #[test]
+    fn pick_unused_slug_prefixes_team_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = pick_paths(&tmp);
+        let dev = pick_unused_slug(&paths, "make a todo cli", "dev").unwrap();
+        let pr = pick_unused_slug(&paths, "AI recipe generator", "product-research").unwrap();
+        assert_eq!(dev, "dev-make-a-todo-cli");
+        assert_eq!(pr, "product-research-ai-recipe-generator");
+    }
+
+    #[test]
+    fn pick_unused_slug_appends_suffix_on_collision_under_team_prefix() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = pick_paths(&tmp);
+        // Pre-create the bare prefixed slug directory so the next pick
+        // must fall back to a `<team>-<base>-<suffix>` form.
+        std::fs::create_dir_all(paths.project_dir("dev-todo-cli")).unwrap();
+        let s = pick_unused_slug(&paths, "todo cli", "dev").unwrap();
+        assert!(s.starts_with("dev-todo-cli-"), "expected suffix retry, got {s}");
+        assert_ne!(s, "dev-todo-cli");
+    }
+
+    #[test]
+    fn pick_unused_slug_keeps_team_prefix_distinct_per_team() {
+        // Same brief under different teams must produce distinct slugs.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = pick_paths(&tmp);
+        let dev = pick_unused_slug(&paths, "shared brief", "dev").unwrap();
+        let pr = pick_unused_slug(&paths, "shared brief", "product-research").unwrap();
+        assert_eq!(dev, "dev-shared-brief");
+        assert_eq!(pr, "product-research-shared-brief");
+        assert_ne!(dev, pr);
     }
 
     #[test]

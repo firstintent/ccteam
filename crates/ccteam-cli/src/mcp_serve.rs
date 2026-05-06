@@ -354,7 +354,7 @@ fn tool_new(paths: &CcteamPaths, args: &Value) -> Result<String> {
     if prompt.trim().is_empty() {
         return Err(anyhow!("prompt must be non-empty"));
     }
-    let slug = pick_unused_slug(paths, &prompt)?;
+    let slug = pick_unused_slug(paths, &prompt, &team)?;
     let project_dir = bootstrap_project(paths, &slug, &prompt, &team)?;
     Ok(serde_json::to_string_pretty(&json!({
         "slug": slug,
