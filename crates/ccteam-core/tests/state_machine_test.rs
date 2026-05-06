@@ -185,6 +185,76 @@ fn is_terminal_state_true_after_any_escalation() {
 }
 
 #[test]
+fn is_terminal_state_false_after_resumed_follows_escalated() {
+    // E2E 2026-05-06 F8: an escalated entry followed by a resumed
+    // entry must lift the terminal flag — otherwise `decide_tick`
+    // returns NoOp forever and the daemon stops dispatching the
+    // project even after `ccteam resume` clears phase_state.
+    let dag = dev_dag();
+    let mut state = fresh_state("fix", PhaseState::Idle);
+    state.phase_history.push(PhaseHistoryEntry {
+        phase: "fix".into(),
+        status: "escalated".into(),
+        duration_s: 0,
+        cost_usd: 0.0,
+    });
+    assert!(dag.is_terminal_state(&state), "escalated alone is terminal");
+
+    state.phase_history.push(PhaseHistoryEntry {
+        phase: "fix".into(),
+        status: "resumed".into(),
+        duration_s: 0,
+        cost_usd: 0.0,
+    });
+    assert!(
+        !dag.is_terminal_state(&state),
+        "escalated + resumed must lift the terminal flag",
+    );
+
+    // Re-escalate on a later phase: terminal again.
+    state.phase_history.push(PhaseHistoryEntry {
+        phase: "ship".into(),
+        status: "escalated".into(),
+        duration_s: 0,
+        cost_usd: 0.0,
+    });
+    assert!(dag.is_terminal_state(&state), "later escalation re-arms");
+
+    // Resume again: non-terminal.
+    state.phase_history.push(PhaseHistoryEntry {
+        phase: "ship".into(),
+        status: "resumed".into(),
+        duration_s: 0,
+        cost_usd: 0.0,
+    });
+    assert!(!dag.is_terminal_state(&state), "second resume lifts again");
+}
+
+#[test]
+fn is_terminal_state_true_after_passed_endpoint_even_following_resumed() {
+    // A successful ship after a resume cycle is still terminal —
+    // resume only clears the escalated flag, it doesn't override the
+    // ship-passed terminal.
+    let dag = dev_dag();
+    let mut state = fresh_state("ship", PhaseState::Idle);
+    for status in ["escalated", "resumed"] {
+        state.phase_history.push(PhaseHistoryEntry {
+            phase: "fix".into(),
+            status: status.into(),
+            duration_s: 0,
+            cost_usd: 0.0,
+        });
+    }
+    state.phase_history.push(PhaseHistoryEntry {
+        phase: "ship".into(),
+        status: "passed".into(),
+        duration_s: 0,
+        cost_usd: 0.0,
+    });
+    assert!(dag.is_terminal_state(&state));
+}
+
+#[test]
 fn is_terminal_state_false_when_non_endpoint_passes() {
     // After F4: "passed" on a non-endpoint phase is NOT terminal.
     // Old logic only checked for "ship" string match — this test
