@@ -1,8 +1,8 @@
 # ccteam 用户快速指南 V0.1
 
 > **版本**:V0.1(2026-05-06)
-> **覆盖功能**:M0(单项目 CLI)、M0.5(工具触发面)、M1(meta-agent + decisions)、M2(sub-skill / phase YAML / `ccteam-mcp`)、M2.3 follow-up(golden_rules)、M3(team abstraction + product-research team)
-> **未覆盖(后续里程碑)**:M4 跨项目记忆 / M5 Critic / multi_session / TUI / web dashboard
+> **覆盖功能**:M0(单项目 CLI)、M0.5(工具触发面)、M1(meta-agent + decisions)、M2(sub-skill / phase YAML / `ccteam-mcp`)、M2.3 follow-up(golden_rules)、M3(team abstraction + product-research team)、**M4.1–M4.4(跨项目记忆基础设施 — 注意 F22 阻塞实际生效,详见 §10)**
+> **未覆盖(后续里程碑)**:M5 Critic / multi_session / TUI / web dashboard
 >
 > 本文档面向**第一次手动跑 ccteam 全流程的用户**。每一步给可复制的命令 + 预期看到的现象;
 > 跟实测不一致 → 报 issue。
@@ -51,8 +51,11 @@ ccteam doctor --install-recommended-agents       # ln -sf 8 个 plugin agent 到
 ccteam doctor --tool-surface                     # 体检:phase tools_required 跨参表,验证可达
 ccteam doctor --install-skill                    # 装 ~/.claude/skills/ccteam-control/
 ccteam doctor --install-mcp                      # 在 ~/.claude.json 注册 mcpServers.ccteam(9 个 tool)
+ccteam doctor --install-memory-bridge            # 写 ~/.claude/rules/ccteam-lessons-{dev,product-research}.md(M4)
 ccteam doctor --install-meta-agent <你的 handle> # 创建 ~/projects/<handle>-meta/(meta-agent 工作目录)
 ```
+
+> **关于 `--install-memory-bridge`**:M4 跨项目记忆基础设施。装了之后,每次 dev / product-research 项目跑完 ship / REJECT verdict,Claude 会把跨项目 lessons append 到对应文件的 `<!-- ccteam-managed:lessons -->` marked section;下个项目启动时**官方 rules 机制**自动加载到上下文。**当前限制**:`paths:` frontmatter scope 到 `~/projects/<team>-*`,但 V0.1 bootstrap 仍创建 `~/projects/<slug>/`(无 team 前缀),所以**写入有效但下个项目不自动加载**(F22 待修;详见 §10)。装了不亏 — 写入会累积,F22 修完即自动激活。
 
 把 `<你的 handle>` 换成你想叫自己的名字(snake-case,例:`rob` / `alice`)。这名字后面会出现在 tmux session 名 `ccteam-meta-<handle>`、meta-agent 项目目录、决策回执等地方。
 
@@ -246,7 +249,7 @@ tail -f ~/.ccteam/progress/todo-cli.jsonl | jq -c '{event, phase: .phase // "_",
 | 04 | test-author | 写测试 |
 | 05 | test-run | 跑测试,捕获结果 |
 | 06 | fix | 失败则进 fix-loop(最多 3 轮);全绿走 ship |
-| 09 | ship | 创建 git commit,写 retro.md,golden_rules 检查 |
+| 09 | ship | 创建 git commit,写 retro.md,golden_rules 检查;**M4**:retro 同时写 `/memory`(本仓 auto-memory)+ `Edit ~/.claude/rules/ccteam-lessons-dev.md` marked section(跨项目) |
 
 `phase 01` 是 product-research 才有的 kickoff;`phase 07/08` 在 V0.1 没启用(Score 已删,Critic 留 M5)。
 
@@ -261,10 +264,17 @@ meta-agent 告诉你"已 ship,在 `~/projects/todo-cli/`"。进去看:
 ```bash
 cd ~/projects/todo-cli
 ls
-cat .ccteam/retro.md             # ship phase 写的回顾
+cat .ccteam/retro.md             # ship phase 写的回顾(项目内)
 cargo run -- add "买菜"          # 实际能跑
 cargo test                        # 测试全绿
 git log --oneline                 # ccteam 自己 commit 的历史
+
+# 跨项目 lessons(M4 — 装了 --install-memory-bridge 才有)
+cat ~/.claude/rules/ccteam-lessons-dev.md
+# marked section 内多了一段以本项目 slug + 日期为 H2,4 个 H3 字段(tech_stack /
+# pitfalls / successful_designs / do_not_do_again);下次 dev 项目启动时官方 rules
+# 机制自动加载这文件到 plan-eng phase 上下文
+# (V0.1 注意:F22 阻塞 paths scope,自动加载暂不工作 — 详见 §10)
 ```
 
 ### 5.4 价值
@@ -294,7 +304,7 @@ meta-agent 识别这是不确定方向,建议 product-research,你确认派单�
 | 03 | differentiation-analysis | differentiation.md(你的差异化在哪;若无 → ESCALATE: LOW_DIFFERENTIATION) |
 | 04 | value-proposition | value-prop.md(给谁、解决什么) |
 | 05 | feasibility | feasibility.md(技术 + 商业可行;**可能触发 PHASE_DONE_PENDING** 等用户决策再继续) |
-| 06 | verdict | verdict.md + rationale.md + next-steps.md(最终 PASS / CONCERN / REJECT / CLARIFY) |
+| 06 | verdict | verdict.md + rationale.md + next-steps.md(最终 PASS / CONCERN / REJECT / CLARIFY);**M4**:REJECT 分支会同时写 `/memory` + `Edit ~/.claude/rules/ccteam-lessons-product-research.md` marked section,把这次否决落进跨项目 lessons 库 |
 
 ### 6.3 中途的决策点(hybrid mode)
 
@@ -338,6 +348,34 @@ meta-agent 把决策注入项目 inbox(`mcp__ccteam__inject_decision`),orchestra
 meta-agent 报告 `verdict.md` 内容:`verdict: REJECT` + 主要理由。完整文件在 `~/projects/ai-recipe-fridge-photo/.ccteam/`。
 
 如果是 PASS / CONCERN,meta-agent 会主动建议:**要不要顺势派 dev 团队按 verdict 落地?**
+
+如果是 REJECT,跨项目 lessons 已写:
+
+```bash
+cat ~/.claude/rules/ccteam-lessons-product-research.md
+# marked section 末尾多一段 H2 = "<slug> (YYYY-MM-DD) — REJECT" + 4 个 H3 字段
+# (market_signals / differentiation_findings / feasibility_assessment / verdict_rationale)
+# 下次有相似 idea 进 product-research kickoff 时,Claude 会先扫这文件,
+# 命中重复 idea 直接短路 5 phase 流程倾向 REJECT
+# (V0.1 注意:F22 阻塞 paths scope,自动加载暂不工作 — 详见 §10)
+```
+
+### 6.6 (可选)claude-mem 增强:跨项目深度检索
+
+如果你装了 [claude-mem](https://github.com/thedotmack/claude-mem) 插件:
+
+```bash
+npx claude-mem install
+# 或通过插件市场:/plugin marketplace add claude-mem
+```
+
+claude-mem 会:
+- 自动 hook(SessionStart / Stop / SessionEnd 等 5 个生命周期钩子)捕获每个 session 的对话与决策摘要,无需 ccteam 干预
+- 暴露 4 个 read-only MCP tool(`search` / `timeline` / `get_observations` / `__IMPORTANT`),支持跨项目 FTS5 全文检索 + 类型过滤(bugfix / feature / decision / discovery / refactor / change)
+
+ccteam phase prompt(plan-eng / kickoff / verdict)写了 conditional:**"如果工具列表里看到 `mcp__*claude-mem*search`,你可以调它做跨项目语义检索"** —— LLM 自看 tool surface 决定调不调,**ccteam 不写检测代码、不写集成代码**。
+
+没装就完全跳过 — V0.1 默认机制(`~/.claude/rules/` + auto-memory)已够用(F22 修完后)。
 
 ---
 
@@ -436,12 +474,13 @@ ccteam doctor --tool-surface             # 验证 phase tools_required 没被新
 
 | 想做 | 现状 | 何时能做 |
 |---|---|---|
-| 跨项目记忆("上次类似项目我们怎么做的") | **未 ship** | M4(下一个里程碑) |
+| 跨项目记忆("上次类似项目我们怎么做的") | **基础设施已 ship**(M4.1–M4.4,2026-05-06):retro 写入有效;**但 F22 阻塞实际生效** —— `~/.claude/rules/ccteam-lessons-<team>.md` 的 `paths: ~/projects/<team>-*` 跟 bootstrap 实际产 `~/projects/<slug>/` 不匹配,下个项目启动时 rules 不自动加载 | F22 修(slug 加 team 前缀;dev-coupling-audit.md F22 P0)— **即将到来的独立 PR**;修完即激活 |
 | 多 agent 并行写代码(speed-up) | `parallelism: agent_team` schema 已落但 **enablement 永久 deferred**(spike A) | Claude Code 释出 first-class Agent Teams CLI 后 |
-| 大项目子模块拆分 (`multi_session`) | 未 ship | M4 后期 |
+| 大项目子模块拆分 (`multi_session`) | 未 ship | M4 后期(M4.8) |
 | Critic agent("接口不优雅"反馈) | 未 ship | M5 |
 | 跨设备(Telegram / Feishu)入口 | 未 ship | M2+ Channel layer |
-| TUI / web dashboard | 未 ship(底层 `ccteam-mcp` 已 ship,前端缺) | M4 / M5 机会主义任务 |
+| TUI / web dashboard | 未 ship(底层 `ccteam-mcp` 已 ship,前端缺) | M4 / M5 机会主义任务(M4.9 / M5.6) |
+| **claude-mem 跨项目深度检索**(可选增强) | 不在 ccteam 范围 — 用户自装即用 | `npx claude-mem install` 后 phase prompt 自动识别其 MCP tool |
 
 ---
 
@@ -455,6 +494,7 @@ ccteam doctor --tool-surface             # 验证 phase tools_required 没被新
 [ ] ccteam doctor --tool-surface(全绿)
 [ ] ccteam doctor --install-skill
 [ ] ccteam doctor --install-mcp
+[ ] ccteam doctor --install-memory-bridge       # M4 跨项目 lessons rules 文件
 [ ] ccteam doctor --install-meta-agent <handle>
 [ ] 终端 1:ccteam start --foreground
 [ ] 终端 2:tmux attach -t ccteam-meta-<handle> → 试一句"你能做什么"
