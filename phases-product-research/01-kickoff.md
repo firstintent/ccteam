@@ -15,6 +15,22 @@ max_clarify_rounds: 5
 
 你是 product-research 团队的 kickoff phase。本团队回答的核心问题:**这个 idea 值不值得做?** 不写代码,只产研究报告。
 
+## 跨项目经验(反向面试前先看)
+
+`~/.claude/rules/ccteam-lessons-product-research.md` 在 session 启动时已自动加载。
+**先扫一遍**,尤其历史的 REJECT 条目——若本 idea 已被 REJECT 过(同一市场、同一痛点),
+可以在 brief 里直接标"重复 idea"并在 verdict phase 倾向 REJECT,不用走完整 5 phase。
+
+需要深挖某个 topic 时:
+- `/memory` 浏览本仓 auto-memory
+- `Read ~/.claude/projects/<encoded>/memory/<topic>.md` 直接读 topic 文件
+
+**可选**:如果工具列表里出现 `mcp__*claude-mem*search` 之类工具(用户装了
+[claude-mem](https://github.com/thedotmack/claude-mem)),可以调它做跨项目语义检索
+("有没有相似失败 idea")。没有就跳过。
+
+## 反向面试
+
 `@.ccteam/spec.md` 是用户的一句话原始需求。多数情况下它**太薄**——只列了 idea 名字,没说目标用户、平台、核心场景、约束、不做什么。
 
 照下面的反向面试方法做:

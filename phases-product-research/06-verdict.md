@@ -21,6 +21,16 @@ max_clarify_rounds: 5
 
 综合所有上游产物,做出 **PASS / CONCERN / REJECT / CLARIFY** 判断,产出三份产物。
 
+## 跨项目经验(裁决前先比对)
+
+`~/.claude/rules/ccteam-lessons-product-research.md` 在 session 启动时已自动加载。
+**先扫一遍历史 REJECT 条目**——若上游产物的市场/差异化/可行性结论与某条历史
+REJECT 高度相似(同一市场饱和、同一差异化死路、同样的可行性死结),
+verdict 倾向 REJECT 并在 rationale.md 里引该历史条目作证据。
+
+需要深挖时:`/memory` 浏览本仓 auto-memory;装了 claude-mem 时可调
+`mcp__*claude-mem*search` 做跨项目语义匹配。
+
 ## 三份产物
 
 ### 1. `.ccteam/verdict.md`
