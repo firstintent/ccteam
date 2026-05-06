@@ -357,6 +357,8 @@ interfaces §3.4.3"。具体写哪些事件:
 {"ts":"...","event":"subskill_started","phase":"implement","skill":"claude-plugins-official:pr-review-toolkit/agents/code-reviewer.md","trigger":"phase_done"}
 {"ts":"...","event":"subskill_done","phase":"implement","skill":"...","output":".ccteam/code-review.md","bytes":4123}
 {"ts":"...","event":"phase_done","phase":"implement","duration_s":4521,"cost_usd":2.13}
+{"ts":"...","event":"golden_rules_check","phase":"implement","result":"pass","passed":["tests_green"],"skipped":[]}
+{"ts":"...","event":"golden_rules_check","phase":"implement","result":"fail","passed":["tests_green"],"violations":[{"rule_id":"no_secrets_in_repo","kind":"pattern","detail":"matched `AWS_SECRET` at .ccteam/implement-report.md:3"}],"skipped":[]}
 {"ts":"...","event":"phase_done_pending","phase":"feasibility","open_decisions":["reply-2026-05-06T100000Z-001.md"],"reason":"tech-stack decision deferred"}
 {"ts":"...","event":"escalate","kind":"need_user_input","target_phase":null,"reason":"db migration 不可调和","cycle":3}
 {"ts":"...","event":"escalate","kind":"revert","target_phase":"plan-eng","reason":"fix-loop 撞顶,根因在选型"}
@@ -465,9 +467,15 @@ golden_rules:                     # M2.3+:phase 级硬约束 enforcement(after h
   - rule_id: tests_green          # 规则 ID,落 progress.jsonl 用
     cmd: cargo test --workspace   # 任选 cmd | pattern;cmd 退出码非 0 = 违反 = 阻断 phase_done
   - rule_id: no_secrets_in_repo
-    pattern: 'AWS_SECRET|sk-[a-zA-Z0-9]{32,}'   # regex 匹配 staged diff 任一行 = 违反
+    pattern: 'AWS_SECRET|sk-[a-zA-Z0-9]{32,}'   # regex 匹配 required_outputs 文件内容 = 违反
                                   # orchestrator 不内置规则,只跑 enforcement;dev / product-research / 等
                                   # 团队各自在 phase YAML 里写需要的 rule_id;空 / 不写 = 不跑
+                                  # 执行时机:phase claude 写 PHASE_DONE → orchestrator 跑 phase_done
+                                  # sub-skills → 紧接着跑 golden_rules.enforce → 任一 violation = 阻断
+                                  # phase_history 标 status: blocked,phase_state 留 Idle,写
+                                  # escalation.md;事件 event: golden_rules_check 写 progress.jsonl
+                                  # (result: pass | fail)。Pattern 当前对 glob required_outputs(*/?)
+                                  # 跳过 + 报 skipped,只对字面路径生效
 hooks:                            # phase 级 hook(项目级 hook 在 settings.json,详见 §6)
   before: scripts/snapshot-git.sh
   after: scripts/run-golden-rules.sh
