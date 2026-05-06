@@ -1,7 +1,7 @@
 # ccteam 用户快速指南 V0.1
 
 > **版本**:V0.1(2026-05-06)
-> **覆盖功能**:M0(单项目 CLI)、M0.5(工具触发面)、M1(meta-agent + decisions)、M2(sub-skill / phase YAML / `ccteam-mcp`)、M2.3 follow-up(golden_rules)、M3(team abstraction + product-research team)、**M4.1–M4.4(跨项目记忆基础设施 — 注意 F22 阻塞实际生效,详见 §10)**
+> **覆盖功能**:M0(单项目 CLI)、M0.5(工具触发面)、M1(meta-agent + decisions)、M2(sub-skill / phase YAML / `ccteam-mcp`)、M2.3 follow-up(golden_rules)、M3(team abstraction + product-research team)、**M4.1–M4.4 跨项目记忆**(2026-05-06 F22 修复后**完全生效**;新项目目录带 `<team>-` 前缀)
 > **未覆盖(后续里程碑)**:M5 Critic / multi_session / TUI / web dashboard
 >
 > 本文档面向**第一次手动跑 ccteam 全流程的用户**。每一步给可复制的命令 + 预期看到的现象;
@@ -55,7 +55,7 @@ ccteam doctor --install-memory-bridge            # 写 ~/.claude/rules/ccteam-le
 ccteam doctor --install-meta-agent <你的 handle> # 创建 ~/projects/<handle>-meta/(meta-agent 工作目录)
 ```
 
-> **关于 `--install-memory-bridge`**:M4 跨项目记忆基础设施。装了之后,每次 dev / product-research 项目跑完 ship / REJECT verdict,Claude 会把跨项目 lessons append 到对应文件的 `<!-- ccteam-managed:lessons -->` marked section;下个项目启动时**官方 rules 机制**自动加载到上下文。**当前限制**:`paths:` frontmatter scope 到 `~/projects/<team>-*`,但 V0.1 bootstrap 仍创建 `~/projects/<slug>/`(无 team 前缀),所以**写入有效但下个项目不自动加载**(F22 待修;详见 §10)。装了不亏 — 写入会累积,F22 修完即自动激活。
+> **关于 `--install-memory-bridge`**:M4 跨项目记忆基础设施。装了之后,每次 dev / product-research 项目跑完 ship / REJECT verdict,Claude 会把跨项目 lessons append 到对应文件的 `<!-- ccteam-managed:lessons -->` marked section;下个项目启动时**官方 rules 机制**自动加载到上下文(2026-05-06 F22 修复后,新项目目录形如 `~/projects/dev-<slug>/` / `~/projects/product-research-<slug>/`,跟 rules `paths: ~/projects/<team>-*` 完全匹配)。
 
 把 `<你的 handle>` 换成你想叫自己的名字(snake-case,例:`rob` / `alice`)。这名字后面会出现在 tmux session 名 `ccteam-meta-<handle>`、meta-agent 项目目录、决策回执等地方。
 
@@ -274,7 +274,7 @@ cat ~/.claude/rules/ccteam-lessons-dev.md
 # marked section 内多了一段以本项目 slug + 日期为 H2,4 个 H3 字段(tech_stack /
 # pitfalls / successful_designs / do_not_do_again);下次 dev 项目启动时官方 rules
 # 机制自动加载这文件到 plan-eng phase 上下文
-# (V0.1 注意:F22 阻塞 paths scope,自动加载暂不工作 — 详见 §10)
+# (新项目目录带 dev- / product-research- 前缀,rules paths 自动匹配)
 ```
 
 ### 5.4 价值
@@ -357,7 +357,7 @@ cat ~/.claude/rules/ccteam-lessons-product-research.md
 # (market_signals / differentiation_findings / feasibility_assessment / verdict_rationale)
 # 下次有相似 idea 进 product-research kickoff 时,Claude 会先扫这文件,
 # 命中重复 idea 直接短路 5 phase 流程倾向 REJECT
-# (V0.1 注意:F22 阻塞 paths scope,自动加载暂不工作 — 详见 §10)
+# (新项目目录带 dev- / product-research- 前缀,rules paths 自动匹配)
 ```
 
 ### 6.6 (可选)claude-mem 增强:跨项目深度检索
@@ -375,7 +375,7 @@ claude-mem 会:
 
 ccteam phase prompt(plan-eng / kickoff / verdict)写了 conditional:**"如果工具列表里看到 `mcp__*claude-mem*search`,你可以调它做跨项目语义检索"** —— LLM 自看 tool surface 决定调不调,**ccteam 不写检测代码、不写集成代码**。
 
-没装就完全跳过 — V0.1 默认机制(`~/.claude/rules/` + auto-memory)已够用(F22 修完后)。
+没装就完全跳过 — V0.1 默认机制(`~/.claude/rules/` + auto-memory)已够用。
 
 ---
 
@@ -474,7 +474,7 @@ ccteam doctor --tool-surface             # 验证 phase tools_required 没被新
 
 | 想做 | 现状 | 何时能做 |
 |---|---|---|
-| 跨项目记忆("上次类似项目我们怎么做的") | **基础设施已 ship**(M4.1–M4.4,2026-05-06):retro 写入有效;**但 F22 阻塞实际生效** —— `~/.claude/rules/ccteam-lessons-<team>.md` 的 `paths: ~/projects/<team>-*` 跟 bootstrap 实际产 `~/projects/<slug>/` 不匹配,下个项目启动时 rules 不自动加载 | F22 修(slug 加 team 前缀;dev-coupling-audit.md F22 P0)— **即将到来的独立 PR**;修完即激活 |
+| 跨项目记忆("上次类似项目我们怎么做的") | **完全 ship**(M4.1–M4.4 + F22 修复,2026-05-06):新项目目录带 `<team>-` 前缀(`~/projects/dev-<slug>/`),rules `paths` 自动匹配,phase Claude 启动时自动加载跨项目 lessons | 现已可用 |
 | 多 agent 并行写代码(speed-up) | `parallelism: agent_team` schema 已落但 **enablement 永久 deferred**(spike A) | Claude Code 释出 first-class Agent Teams CLI 后 |
 | 大项目子模块拆分 (`multi_session`) | 未 ship | M4 后期(M4.8) |
 | Critic agent("接口不优雅"反馈) | 未 ship | M5 |
