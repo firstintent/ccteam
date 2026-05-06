@@ -88,7 +88,7 @@ pub fn latest_terminal_event_for_phase<'a>(
     for event in events.iter().rev() {
         let kind = event.get("event").and_then(|s| s.as_str()).unwrap_or("");
         match kind {
-            "phase_done" => {
+            "phase_done" | "phase_done_pending" => {
                 let phase = event.get("phase").and_then(|s| s.as_str()).unwrap_or("");
                 if phase == current {
                     return Some(event);

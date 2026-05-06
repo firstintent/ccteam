@@ -46,7 +46,8 @@ pub use skill::{
 pub use orchestrator::MAX_CONCURRENT_PROJECTS;
 pub use orchestrator::{
     append_progress_summary, build_progress_summary, check_phase_tools, decide_tick,
-    decide_tick_from_events, Orchestrator, OrchestratorConfig, TickAction,
+    decide_tick_from_events, intersect_open_decisions_with_required_inputs, Orchestrator,
+    OrchestratorConfig, TeamRuntime, TickAction,
 };
 pub use projects::{bootstrap_project, pick_unused_slug, pre_trust_project, slugify};
 pub use cost::{classify as classify_cost, CostLevel, COST_MID_WARN_USD};
@@ -68,12 +69,17 @@ pub use subskill::{
     SubSkillRunner,
 };
 pub use state::{Parallelism, PhaseHistoryEntry, PhaseState, ProjectState};
-pub use team::{RetroFieldKind, RetroFieldSpec, TeamSpec};
+pub use team::{
+    CriticDimensionSpec, CriticStrictness, EscalateGrammarExtension, EscalateRoute,
+    RetroFieldKind, RetroFieldSpec, TeamSpec,
+};
 pub use templates::{
-    current_ccteam_bin, project_phase_filename, render_project_settings,
-    write_global_helper_templates, write_global_phase_templates,
-    write_project_phase_templates, write_project_settings, SettingsEnv, HELPER_TEMPLATES,
-    PHASE_TEMPLATES, PROJECT_SETTINGS_JSON,
+    current_ccteam_bin, project_phase_filename, render_project_settings, team_bundle,
+    write_all_global_team_templates, write_global_helper_templates,
+    write_global_phase_templates, write_project_phase_templates,
+    write_project_phase_templates_for_team, write_project_settings, SettingsEnv,
+    TeamTemplateBundle, HELPER_TEMPLATES, PHASE_TEMPLATES, PROJECT_SETTINGS_JSON,
+    TEAM_BUNDLES,
 };
 pub use tmux::{pid_is_alive, session_name_for_slug, tmux_available, TmuxSession};
 pub use tool_surface::{

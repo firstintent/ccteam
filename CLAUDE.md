@@ -208,4 +208,8 @@ M0 完整任务清单见 `docs/development-plan.md` §2(任务编号 M0.1–M0.1
 - **`.claude/settings.json` 的 `bypassPermissions` 是开发态便利**——产品形态是 `--dangerously-skip-permissions` + 容器隔离,语义不同(最佳实践 §4.2 三选一)
 - **phase prompt 别写太长**——单条 send-keys 装得下;复杂内容用 `@文件引用`(最佳实践 §3「@ 引用文件」)
 - **`claude-plugins-official` 是参考实现,不是依赖**——别 vendor 一份;实现时按 §3.7 三种粒度选合适的
+- **测试调 `bootstrap_project` / `bootstrap_meta_project` 之前必须先调 `disable_tool_surface_bootstrap_for_tests()`**——否则向真实 `~/.claude.json` + `~/.claude/agents/` 写垃圾,长期撑大 `.claude.json` 会破坏 claude 登录(2026-05-06 实测)
+- **env-mutating 测试放 `crates/*/tests/*.rs` integration(各独立进程),不放 lib `#[cfg(test)] mod tests`**——同 binary 内其他测试读 env 会 race;`std::sync::Mutex` 只锁住本测试组,保不住没锁的 sibling
+- **多 session 并行编辑同一仓库**:主仓工作树绑定一个 session,并行用 `git worktree add -b <branch> /tmp/<name> main` 起独立工作树,完事 `git worktree remove`;主仓的 branch / dirty 状态不被打扰
+- **跨 session 协作时见到主仓 dirty 状态**:先 `git stash push -m "<owner-session> WIP"` 标清楚再切分支,切回原 session 时各自认领自己的 stash;别盲目 `git checkout -- .` 破坏对方进度
 - **本文件不超过 250 行**——CLAUDE.md 越长 cache 越贵,Claude 越忽略(最佳实践 §4.1 + §8「over-specified CLAUDE.md」)

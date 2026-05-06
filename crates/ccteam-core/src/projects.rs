@@ -11,7 +11,8 @@ use serde_json::{Map, Value};
 use crate::paths::CcteamPaths;
 use crate::state::ProjectState;
 use crate::templates::{
-    write_global_helper_templates, write_project_phase_templates, write_project_settings,
+    team_bundle, write_global_helper_templates, write_project_phase_templates_for_team,
+    write_project_settings,
 };
 use crate::phases::PhaseTemplate;
 use crate::tool_surface::{
@@ -115,7 +116,7 @@ pub fn bootstrap_project(
     state.save(&paths.project_state(slug))?;
 
     write_project_settings(&project_dir)?;
-    write_project_phase_templates(&project_dir)?;
+    write_project_phase_templates_for_team(&project_dir, team)?;
     // M2.4: ensure ~/.ccteam/templates/ has the helper templates so
     // any phase markdown's `@~/.ccteam/templates/<name>.md` reference
     // resolves. Idempotent — no-ops when files already exist, so this
@@ -146,7 +147,7 @@ pub fn bootstrap_project(
     // §1.2.5/6) and attaches the SKILL.md watcher only to dirs that
     // exist at startup (§1.2.4). bootstrap_project runs in `ccteam
     // new`, well before the daemon's ensure_session.
-    let templates = load_phase_templates_for_bootstrap();
+    let templates = load_phase_templates_for_bootstrap(team);
     if let Err(err) = setup_tool_surface(&project_dir, &templates) {
         tracing::warn!(
             project_dir = %project_dir.display(),
@@ -157,30 +158,54 @@ pub fn bootstrap_project(
 
     let claude_md = project_dir.join("CLAUDE.md");
     if !claude_md.exists() {
-        let body = format!(
-            "# CLAUDE.md (auto-managed by ccteam)\n\n## 项目上下文\n- slug: {slug}\n- 用户原始需求: 见 .ccteam/spec.md\n\n## 工作约定\n- 不要交互式询问。所有决策已在 .ccteam/plan-eng.md 中。\n- 测试不过不算完成。\n\n## 不做的事\n- 不要 git push(被 hook 拦截)\n- 不要修改 .ccteam/ 之外的元数据\n",
-        );
-        std::fs::write(&claude_md, body)
+        std::fs::write(&claude_md, render_project_claude_md(slug, team))
             .with_context(|| format!("write {}", claude_md.display()))?;
     }
 
     Ok(project_dir)
 }
 
-/// Parse the embedded phase templates (the same `PHASE_TEMPLATES`
-/// `bootstrap_project` writes to disk) into a `Vec<PhaseTemplate>` so
-/// `setup_tool_surface` can ln -sf every sub_skill plugin agent the
-/// dev pipeline declares. Filter out parse errors with a warn — a
-/// broken shipped template would crash the build, but if it ever
-/// happens we want bootstrap to keep working for unrelated phases.
-fn load_phase_templates_for_bootstrap() -> Vec<PhaseTemplate> {
-    crate::templates::PHASE_TEMPLATES
+/// Build the `<project>/CLAUDE.md` body for `team`. dev keeps its
+/// historical "no git push, tests must pass" wording; product-research
+/// gets a research-specific contract; unknown teams get a generic
+/// shell that doesn't bake in dev or research assumptions.
+fn render_project_claude_md(slug: &str, team: &str) -> String {
+    match team {
+        "dev" => format!(
+            "# CLAUDE.md (auto-managed by ccteam)\n\n## 项目上下文\n- slug: {slug}\n- team: dev\n- 用户原始需求: 见 .ccteam/spec.md\n\n## 工作约定\n- 不要交互式询问。所有决策已在 .ccteam/plan-eng.md 中。\n- 测试不过不算完成。\n\n## 不做的事\n- 不要 git push(被 hook 拦截)\n- 不要修改 .ccteam/ 之外的元数据\n",
+        ),
+        "product-research" => format!(
+            "# CLAUDE.md (auto-managed by ccteam)\n\n## 项目上下文\n- slug: {slug}\n- team: product-research\n- 用户原始需求: 见 .ccteam/spec.md\n\n## 工作约定\n- 不写代码,只产研究报告。\n- 至少 3 个独立信息源,**不要编造数据**;不确定时标 \"未确认\"。\n- 决策走 outbox(`async` 模式)或 AskUserQuestion,**不要**自行假设关键事实。\n\n## 不做的事\n- 不要修改 .ccteam/ 之外的元数据。\n- 不要在 verdict 之前下定论 — 让 phase DAG 走完。\n- 不要把 dev 的 \"测试不过不算完成\" 套用到本项目;研究报告的 done 是 verdict.md 写出 + rationale.md 自洽。\n",
+        ),
+        _ => format!(
+            "# CLAUDE.md (auto-managed by ccteam)\n\n## 项目上下文\n- slug: {slug}\n- team: {team}\n- 用户原始需求: 见 .ccteam/spec.md\n\n## 工作约定\n- 跟随该 team 的 phase 模板指示。\n- 不要修改 .ccteam/ 之外的元数据。\n",
+        ),
+    }
+}
+
+/// Parse the embedded phase templates for `team` into a
+/// `Vec<PhaseTemplate>` so `setup_tool_surface` can ln -sf every
+/// sub_skill plugin agent the team's pipeline declares. Filter out
+/// parse errors with a warn — a broken shipped template would crash
+/// the build, but if it ever happens we want bootstrap to keep
+/// working for unrelated phases.
+///
+/// Returns empty for the meta-agent team (no DAG) and for unknown
+/// teams (the user is expected to populate `~/.ccteam/<phase_dir>/`
+/// manually for hand-rolled teams).
+fn load_phase_templates_for_bootstrap(team: &str) -> Vec<PhaseTemplate> {
+    let Some(bundle) = team_bundle(team) else {
+        return Vec::new();
+    };
+    bundle
+        .phases
         .iter()
         .filter_map(|(name, body)| match PhaseTemplate::parse(body) {
             Ok(t) => Some(t),
             Err(err) => {
                 tracing::warn!(
                     template = %name,
+                    team,
                     error = %err,
                     "embedded phase template did not parse during bootstrap; skipping for sub_skill linking",
                 );

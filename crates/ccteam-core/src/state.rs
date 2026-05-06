@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PhaseState {
     /// Phase prompt injected; awaiting `phase_done` or `escalate` event.
@@ -29,6 +29,19 @@ pub enum PhaseState {
     Idle,
     /// Stop hook owns the loop (ralph-loop fix-cycle pattern, §3.5).
     FixLocked,
+    /// **M3.6**: phase produced its required outputs but flagged some
+    /// sub-tasks as deferred (`ESCALATE: PHASE_DONE_PENDING`,
+    /// interfaces §4.1.1). `open_decisions` lists outbox-file basenames
+    /// the phase wrote that still need user attention. The orchestrator
+    /// advances to the next phase only when its `required_inputs` does
+    /// not overlap `open_decisions`; otherwise it writes an escalation
+    /// and stays in `DonePending` until the user runs `ccteam resume`.
+    ///
+    /// Dropping `Copy` from `PhaseState` for this variant (Vec field)
+    /// — every call site uses `matches!` or moves, so this isn't
+    /// observable except in a couple of CLI render arms (handled with
+    /// an explicit pattern there).
+    DonePending { open_decisions: Vec<String> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

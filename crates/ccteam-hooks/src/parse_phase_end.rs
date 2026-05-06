@@ -120,13 +120,31 @@ pub fn parse_phase_end(paths: &CcteamPaths, stdin: &Value) -> Result<ParseDecisi
     } else {
         last_line.strip_prefix("ESCALATE:").map(|raw_reason| {
             let parsed = ParsedEscalate::from_reason(raw_reason);
-            json!({
-                "ts": now_rfc3339(),
-                "event": "escalate",
-                "kind": parsed.kind.as_str(),
-                "reason": parsed.reason,
-                "target_phase": parsed.target_phase,
-            })
+            // M3.6: PHASE_DONE_PENDING is structurally a phase
+            // termination with deferred decisions, not an escalation.
+            // Emit a dedicated `phase_done_pending` event so the
+            // orchestrator's state machine routes it through the
+            // open_decisions check (interfaces §4.1.1, dev-plan M3.6).
+            if parsed.kind == EscalateKind::PhaseDonePending {
+                let open_decisions = extract_outbox_filenames(&parsed.reason);
+                let current_phase = current_phase_from_state(cwd_path)
+                    .unwrap_or_default();
+                json!({
+                    "ts": now_rfc3339(),
+                    "event": "phase_done_pending",
+                    "phase": current_phase,
+                    "open_decisions": open_decisions,
+                    "reason": parsed.reason,
+                })
+            } else {
+                json!({
+                    "ts": now_rfc3339(),
+                    "event": "escalate",
+                    "kind": parsed.kind.as_str(),
+                    "reason": parsed.reason,
+                    "target_phase": parsed.target_phase,
+                })
+            }
         })
     };
 
@@ -434,8 +452,112 @@ mod parse_escalate_tests {
         assert_eq!(p.reason, "waiting on storage decision");
         assert_eq!(p.kind.as_str(), "phase_done_pending");
     }
+
+    #[test]
+    fn extract_outbox_filenames_picks_up_clarify_and_escalation_filenames() {
+        let r = "deferred storage decision — clarify-2026-05-06-001.md, clarify-tech-stack.md";
+        let names = extract_outbox_filenames(r);
+        assert_eq!(
+            names,
+            vec![
+                "clarify-2026-05-06-001.md".to_string(),
+                "clarify-tech-stack.md".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn extract_outbox_filenames_handles_brackets_and_parens() {
+        let r = "[clarify-A.md, clarify-B.md] (clarify-C.md)";
+        let names = extract_outbox_filenames(r);
+        assert_eq!(
+            names,
+            vec![
+                "clarify-A.md".to_string(),
+                "clarify-B.md".to_string(),
+                "clarify-C.md".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn extract_outbox_filenames_skips_unrelated_md_paths() {
+        // README.md isn't outbox-shaped → skipped.
+        let r = "see clarify-1.md and README.md for context";
+        let names = extract_outbox_filenames(r);
+        assert_eq!(names, vec!["clarify-1.md".to_string()]);
+    }
+
+    #[test]
+    fn extract_outbox_filenames_dedupes() {
+        let r = "clarify-A.md, again clarify-A.md, and clarify-A.md";
+        let names = extract_outbox_filenames(r);
+        assert_eq!(names, vec!["clarify-A.md".to_string()]);
+    }
+
+    #[test]
+    fn extract_outbox_filenames_empty_when_no_outbox_tokens() {
+        assert!(extract_outbox_filenames("").is_empty());
+        assert!(extract_outbox_filenames("just words and stuff").is_empty());
+    }
 }
 
 fn now_rfc3339() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+/// Read the current phase string from `<cwd>/.ccteam/state.json`.
+/// Returns `None` if the file is missing / unparseable — the Stop
+/// hook still emits a `phase_done_pending` event with empty `phase`
+/// rather than crashing the hook subprocess. The orchestrator's
+/// transition logic matches on the latest event's `phase` field, so
+/// an empty value just means "the orchestrator can't infer which
+/// phase deferred decisions" and the project sits in InFlight until
+/// the user runs `ccteam resume`.
+fn current_phase_from_state(cwd: &Path) -> Option<String> {
+    let path = ccteam_core::CcteamPaths::project_state_in(cwd);
+    let bytes = std::fs::read(&path).ok()?;
+    let v: Value = serde_json::from_slice(&bytes).ok()?;
+    v.get("current_phase")
+        .and_then(|s| s.as_str())
+        .map(str::to_string)
+}
+
+/// M3.6: scan free-text for outbox-style filenames so the Stop hook
+/// can populate `open_decisions` on the `phase_done_pending` event
+/// without forcing the phase markdown to use a strict syntax.
+///
+/// Matches any whitespace-/comma-/bracket-/paren-separated token
+/// whose suffix matches one of the recognised outbox filename prefixes
+/// followed by `-...md`. interfaces §3.4.1 documents the canonical
+/// `reply-<ts>-<seq>.md` form; informal `clarify-<topic>.md` /
+/// `escalation-<topic>.md` are accepted for phase markdown that
+/// references decisions by topic rather than timestamp.
+///
+/// Examples that match:
+/// - `PHASE_DONE_PENDING — reply-2026-05-06T100000Z-001.md needs storage call`
+/// - `... [clarify-A.md, clarify-B.md] ...`
+/// - `... (escalation-stack.md) ...`
+pub fn extract_outbox_filenames(reason: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw_token in reason
+        .split(|c: char| {
+            c.is_whitespace() || matches!(c, ',' | '[' | ']' | '(' | ')')
+        })
+    {
+        let token = raw_token.trim_matches(|c: char| !c.is_alphanumeric() && c != '.' && c != '-');
+        if token.is_empty() {
+            continue;
+        }
+        if !token.ends_with(".md") {
+            continue;
+        }
+        let recognised = ["reply-", "clarify-", "escalation-"]
+            .iter()
+            .any(|prefix| token.starts_with(prefix));
+        if recognised && !out.iter().any(|x: &String| x == token) {
+            out.push(token.to_string());
+        }
+    }
+    out
 }

@@ -11,11 +11,12 @@ use serde_json::{json, Map, Value};
 
 use ccteam_core::{
     bootstrap_meta_project, bootstrap_project, current_ccteam_bin, install_ccteam_control_skill,
-    link_recommended_agents, pick_unused_slug, user_claude_dir, write_global_helper_templates,
+    link_recommended_agents, pick_unused_slug, team_bundle, user_claude_dir,
+    write_all_global_team_templates, write_global_helper_templates,
     write_global_phase_templates, AgentLinkAction, AgentLinkReport, CcteamPaths,
     InstallSkillOptions, LinkOptions, MetaBootstrapReport, OutboxEventKind, OutboxMessage,
-    PhaseState, PhaseTemplate, ProjectState, SessionMailbox, SkillInstallAction,
-    ToolSurfaceSnapshot, BUILTIN_SUBAGENTS, HELPER_TEMPLATES, PHASE_TEMPLATES,
+    PhaseState, PhaseTemplate, ProjectState, SessionMailbox, SkillInstallAction, TeamSpec,
+    ToolSurfaceSnapshot, BUILTIN_SUBAGENTS, HELPER_TEMPLATES, PHASE_TEMPLATES, TEAM_BUNDLES,
 };
 use ccteam_core::tmux::TmuxSession;
 
@@ -62,6 +63,17 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
         format!(
             "unpack helper templates to {}",
             paths.templates_dir().display()
+        )
+    })?;
+    // M3.3: also unpack every embedded team.yaml + non-dev team's
+    // phase set so multi-team installs come up out of the box.
+    // dev's phase set is duplicated here (idempotent — `force=false`
+    // skips files already on disk) so the legacy `phases/` dir stays
+    // populated even when this is the only template writer ever called.
+    write_all_global_team_templates(&paths.root, opts.force).with_context(|| {
+        format!(
+            "unpack team bundles (team.yaml + per-team phases) to {}",
+            paths.root.display(),
         )
     })?;
 
@@ -111,8 +123,14 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
 /// `ccteam new "request" --team <name>`. Bootstraps a project on disk
 /// and returns the chosen slug. Side effects: creates
 /// `~/projects/<slug>/...`. `team` is recorded in state.json so the
-/// orchestrator can route this project through the matching phase set
-/// (M3.1 F12/F13 — non-dev teams land in M3.4).
+/// orchestrator can route this project through the matching phase set.
+///
+/// **M3.3 fail-fast**: non-dev teams require a `team.yaml` to be
+/// loadable — either as `~/.ccteam/teams/<team>/team.yaml` on disk
+/// or as an entry in the embedded `TEAM_BUNDLES` registry. The dev
+/// team is grandfathered in (no team.yaml required) so legacy
+/// installs without `ccteam init` still work. Meta-agent is also
+/// allowed without a team.yaml — its bootstrap path is bespoke.
 pub fn run_new(paths: &CcteamPaths, request: &str, team: &str) -> Result<String> {
     if request.trim().is_empty() {
         bail!("ccteam new: request must be non-empty");
@@ -120,9 +138,57 @@ pub fn run_new(paths: &CcteamPaths, request: &str, team: &str) -> Result<String>
     if team.trim().is_empty() {
         bail!("ccteam new: --team must be non-empty");
     }
+    ensure_team_resolvable(paths, team)?;
     let slug = pick_unused_slug(paths, request)?;
     bootstrap_project(paths, &slug, request, team)?;
     Ok(slug)
+}
+
+/// Resolve `team` against the on-disk + embedded team registry.
+/// Returns `Ok(())` when the team is bootable; otherwise returns a
+/// fail-fast error pointing the user at the missing team.yaml.
+///
+/// Resolution order:
+/// 1. `dev` and `meta-agent` always succeed (legacy paths).
+/// 2. If `~/.ccteam/teams/<team>/team.yaml` is on disk, load + validate it.
+/// 3. Else if the team is in the embedded `TEAM_BUNDLES`, succeed
+///    (bootstrap_project will write `~/.ccteam/teams/<team>/team.yaml`
+///    via the templates path on init).
+/// 4. Otherwise fail with a help message.
+fn ensure_team_resolvable(paths: &CcteamPaths, team: &str) -> Result<()> {
+    if team == "dev" || team == ccteam_core::META_TEAM_NAME {
+        return Ok(());
+    }
+    let yaml_path = paths.root.join("teams").join(team).join("team.yaml");
+    if yaml_path.exists() {
+        TeamSpec::load(&yaml_path).with_context(|| {
+            format!("ccteam new: failed to load {}", yaml_path.display())
+        })?;
+        return Ok(());
+    }
+    if team_bundle(team).is_some() {
+        // Embedded bundle exists; user just hasn't run `ccteam init`
+        // (or did but skipped this team). Recommend init so the
+        // orchestrator startup scan picks the team up consistently.
+        tracing::info!(
+            team,
+            "team has embedded bundle but no team.yaml on disk; \
+             stamp it via `ccteam init` so the orchestrator picks the team up consistently",
+        );
+        return Ok(());
+    }
+    bail!(
+        "ccteam new: unknown team `{team}` — \
+         create {} (see docs/interfaces.md §5.5 for schema), \
+         then re-run.\n\
+         Known embedded teams: {}.",
+        yaml_path.display(),
+        TEAM_BUNDLES
+            .iter()
+            .map(|(n, _)| *n)
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
 }
 
 /// `ccteam ls`. Returns either a human table or the interfaces.md §10.3
@@ -898,7 +964,7 @@ fn render_ls_text(projects: &[ProjectSummary]) -> String {
             "{:<40} {:<14} {:<11} ${:<5.2} {}s\n",
             truncate(&p.state.slug, 40),
             truncate(phase, 14),
-            phase_state_str(p.state.phase_state),
+            phase_state_str(&p.state.phase_state),
             p.state.cost_used_usd,
             p.age_seconds,
         ));
@@ -928,7 +994,7 @@ fn render_ls_json(projects: &[ProjectSummary]) -> Result<String> {
             json!({
                 "slug": p.state.slug,
                 "current_phase": p.state.current_phase,
-                "phase_state": phase_state_str(p.state.phase_state),
+                "phase_state": phase_state_str(&p.state.phase_state),
                 "cost_used_usd": p.state.cost_used_usd,
                 "context_tokens_used": p.state.context_tokens_used,
                 "tmux_session": p.state.tmux_session,
@@ -963,7 +1029,7 @@ fn render_show_text(
     out.push_str(&format!("current phase  : {}\n", display_phase(&state.current_phase)));
     out.push_str(&format!(
         "phase state    : {}\n",
-        phase_state_str(state.phase_state)
+        phase_state_str(&state.phase_state)
     ));
     out.push_str(&format!("cost used      : ${:.2}\n", state.cost_used_usd));
     out.push_str(&format!(
@@ -1022,11 +1088,12 @@ fn render_show_json(
     Ok(serde_json::to_string_pretty(&v)?)
 }
 
-fn phase_state_str(s: PhaseState) -> &'static str {
+fn phase_state_str(s: &PhaseState) -> &'static str {
     match s {
         PhaseState::InFlight => "in_flight",
         PhaseState::Idle => "idle",
         PhaseState::FixLocked => "fix_locked",
+        PhaseState::DonePending { .. } => "done_pending",
     }
 }
 
@@ -1113,12 +1180,68 @@ mod tests {
     fn run_new_records_team_in_state_json() {
         // M3.1 F12/F13: --team must persist into state.json so the
         // orchestrator can route this project's phase set.
+        // M3.3: non-dev teams now require ensure_team_resolvable to
+        // succeed — `product-research` is in the embedded TEAM_BUNDLES
+        // so the check passes without a team.yaml on disk.
         ensure_isolation();
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
-        let slug = run_new(&paths, "research project", "research").unwrap();
+        let slug =
+            run_new(&paths, "ai recipe generator idea", "product-research").unwrap();
         let state = ProjectState::load(&paths.project_state(&slug)).unwrap();
-        assert_eq!(state.team, "research");
+        assert_eq!(state.team, "product-research");
+    }
+
+    #[test]
+    fn run_new_rejects_unknown_team_with_helpful_error() {
+        // M3.3: unknown team (not embedded, not on disk) must fail-fast
+        // with a clear pointer to ~/.ccteam/teams/<team>/team.yaml.
+        ensure_isolation();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let err = run_new(&paths, "marketing copy idea", "marketing").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("unknown team"), "got: {msg}");
+        assert!(msg.contains("marketing"), "should name the missing team");
+        assert!(
+            msg.contains("teams/marketing/team.yaml"),
+            "should point at the missing path",
+        );
+        // Should also list the known embedded teams so users see the
+        // catalog of options:
+        assert!(msg.contains("dev"));
+        assert!(msg.contains("product-research"));
+    }
+
+    #[test]
+    fn run_new_accepts_team_yaml_on_disk_for_user_team() {
+        // M3.3: a user-authored team (not in embedded TEAM_BUNDLES)
+        // becomes valid as soon as ~/.ccteam/teams/<team>/team.yaml is
+        // on disk. The fail-fast check loads + validates the YAML.
+        ensure_isolation();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let yaml_path = paths
+            .root
+            .join("teams")
+            .join("custom-team")
+            .join("team.yaml");
+        std::fs::create_dir_all(yaml_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &yaml_path,
+            "name: custom-team\nphase_dir: phases-custom\n",
+        )
+        .unwrap();
+        // run_new without embedded phases for `custom-team` will fail
+        // later in bootstrap_project (no template bundle), but
+        // ensure_team_resolvable should accept the team.yaml first.
+        // The error we get back should NOT mention "unknown team".
+        let err = run_new(&paths, "do a thing", "custom-team").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("unknown team"),
+            "team.yaml on disk should pass the resolve check; got: {msg}",
+        );
     }
 
     #[test]

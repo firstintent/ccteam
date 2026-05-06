@@ -359,6 +359,7 @@ interfaces §3.4.3"。具体写哪些事件:
 {"ts":"...","event":"phase_done","phase":"implement","duration_s":4521,"cost_usd":2.13}
 {"ts":"...","event":"golden_rules_check","phase":"implement","result":"pass","passed":["tests_green"],"skipped":[]}
 {"ts":"...","event":"golden_rules_check","phase":"implement","result":"fail","passed":["tests_green"],"violations":[{"rule_id":"no_secrets_in_repo","kind":"pattern","detail":"matched `AWS_SECRET` at .ccteam/implement-report.md:3"}],"skipped":[]}
+{"ts":"...","event":"phase_done_pending","phase":"feasibility","open_decisions":["reply-2026-05-06T100000Z-001.md"],"reason":"tech-stack decision deferred"}
 {"ts":"...","event":"escalate","kind":"need_user_input","target_phase":null,"reason":"db migration 不可调和","cycle":3}
 {"ts":"...","event":"escalate","kind":"revert","target_phase":"plan-eng","reason":"fix-loop 撞顶,根因在选型"}
 {"ts":"...","event":"escalate","kind":"abort","target_phase":null,"reason":"超出 ccteam 当前能力,人工接手"}
@@ -378,7 +379,7 @@ interfaces §3.4.3"。具体写哪些事件:
 | `ESCALATE: NEED_USER_INPUT — <questions>` | `need_user_input` | `null` | 写 escalation.md,inbox 等用户 |
 | `ESCALATE: ABORT — <reason>` | `abort` | `null` | 项目永久标 escalated,M0 等同 NEED_USER_INPUT |
 | `ESCALATE: INSUFFICIENT_CLARIFICATION — <last_question>` | `insufficient_clarification` | `null` | M2.3+:phase 已撞 `max_clarify_rounds` 上限,best-effort artifact 已产出;orchestrator 写 escalation.md,outbox `event_kind: escalation`,等用户决定继续 / 接受 / abort(详见 §5.6.2) |
-| `ESCALATE: PHASE_DONE_PENDING — <reason>` | `phase_done_pending` | `null` | M3.6+:phase 部分完成,某些子任务 defer 到 decisions queue;orchestrator 切 `PhaseState::DonePending`,下 phase 启动检查 pending(详见 development-plan §5 M3.6) |
+| `ESCALATE: PHASE_DONE_PENDING — <reason>` | (special — emits standalone `phase_done_pending` event, not `escalate`) | `null` | M3.6 ✅:phase 产出 required_outputs 但部分子任务 defer。Stop hook 从 reason 解析 outbox 文件名(`reply-*.md` / `clarify-*.md` / `escalation-*.md`),写 `event: "phase_done_pending"` 含 `phase` / `open_decisions[]` / `reason` 三字段;orchestrator 走 `TickAction::AdvancePhasePending`,看下 phase `required_inputs` 与 `open_decisions` 静态交集决定 advance / 切 `PhaseState::DonePending` 阻塞(`ccteam resume` 清除) |
 | `ESCALATE: <free text>`(无前缀) | `need_user_input` | `null` | 等同显式 NEED_USER_INPUT,reason 是整段文本 |
 
 分隔符:em dash `—`(U+2014)、`--`、` - `(单 dash 必须前后有空格——这是为了不切碎 `plan-eng` 这类 phase 名)。
@@ -571,49 +572,71 @@ confidence: 0.0-1.0
 
 ---
 
-### 5.5 `team.yaml` 团队配置(M3.1+)
+### 5.5 `team.yaml` 团队配置(M3.1 / M3.2 / M3.3+)
 
-每个团队一份 `team.yaml`,M3.4 落到 `~/.ccteam/teams/<name>/team.yaml`。**M3.1 只交付数据形式 + 解析,无运行时调用**——`retro_schema` 字段供 M4.1 retro phase 实现读取,从 day 1 就能写出团队特定字段(避免 RAG 索引重建,详见 dev-coupling-audit.md F20)。
+每个团队一份 `team.yaml`,落 `~/.ccteam/teams/<name>/team.yaml`。
 
-```yaml
-# ~/.ccteam/teams/dev/team.yaml(M3.4 路径)
-name: dev                              # 必填。snake-case [a-z0-9_-]+,与 --team / state.json.team 对齐
-description: Software development team  # 可选。`ccteam ls --teams`(M3.4)显示
-retro_schema:                           # 可选。retro phase 字段定义。空 = 该团队无 retro
-  - field: tech_stack                   # 必填。snake_case;markdown 子节标题 + RAG tag(改名 = 索引失效)
-    description: Languages, frameworks, key libraries used
-    kind: list                          # 默认 list。可选 text(单段叙述)
-  - field: pitfalls
-    description: Mistakes / surprises to avoid next time
-  - field: successful_designs
-    description: Design choices that paid off
-  - field: do_not_do_again
-    description: Anti-patterns observed
-```
-
-**research 团队示例**(对比 dev 字段差异):
+- **M3.1** ✅ 落 `name` / `description` / `retro_schema`(M4.1 retro phase 读)
+- **M3.2** ✅ 加 `phase_dir` / `verdict_schema` / `escalate_grammar_extensions` /
+  `golden_rules`(team-wide 默认)/ `critic_dimensions`(M5 用,M3 留数据形式)
+- **M3.3** ✅ orchestrator 启动期扫 `~/.ccteam/teams/<name>/team.yaml`,
+  按 `phase_dir` 加载 phases,每团队建 `TeamRuntime { spec, templates, dag }`
+- **M3.4** ✅ product-research 团队入仓(`teams/product-research.yaml` +
+  `phases-product-research/`)
 
 ```yaml
-name: research
+# ~/.ccteam/teams/product-research/team.yaml — 完整字段示例
+name: product-research                  # 必填。snake-case [a-z0-9_-]+,与 --team / state.json.team 对齐
+description: Product research team       # 可选。`ccteam ls --teams`(M3.4)显示
+phase_dir: phases-product-research       # 默认 `phases`。phase 模板 markdown 所在目录(相对 ~/.ccteam/)
+
+# M3.4 verdict-emitting phase 名 list。对应 §5.3 通用 verdict schema。
+verdict_schema:
+  - verdict
+
+# M3.2: team-specific ESCALATE 前缀。Stop hook 看到 `ESCALATE: <prefix>` 时
+# 走对应 `route` 分支。前缀本身是数据,不在 ccteam-core 写死(strategic §3.6)。
+escalate_grammar_extensions:
+  - prefix: MARKET_DUPLICATE
+    route: abort                          # revert_to_phase | need_user_input | abort
+    reason: "target market saturated; idea duplicates an existing free / widely-used tool"
+  - prefix: INSUFFICIENT_VALIDATION
+    route: need_user_input
+    reason: "could not collect enough validation data within the round budget"
+  - prefix: LOW_DIFFERENTIATION
+    route: revert_to_phase
+    target_phase: kickoff
+    reason: "no sustainable differentiation; revert to kickoff to rethink"
+
+# M3.2: team-wide default golden_rules。Phase YAML `golden_rules` 优先 —
+# phase 不写时回退到 team.yaml 默认。
+golden_rules: []
+
+# M3.2 / M5: critic 维度配置(strategic doc §2.3 invariant 1 — 数据,非常量)。
+# M3 留 schema 形式,M5 才真正消费。dev / product-research 当前都留空。
+critic_dimensions: []
+
+# M4.1 retro phase 字段定义。空 = 该团队无 retro。
 retro_schema:
-  - field: methodology
-    description: Methods used for data collection / analysis
-  - field: data_sources
-    description: Sources consulted (URLs, papers, datasets)
-  - field: findings
-    description: Top-N conclusions
-  - field: open_questions
-    description: Things needing follow-up
-  - field: summary
-    description: Narrative recap of the research
-    kind: text
+  - field: market_signals
+    description: Top market signals collected
+    kind: list                            # 默认 list。可选 text(单段叙述)
 ```
 
 **校验**(`TeamSpec::validate` 在 parse 时执行):
 - `name` 非空,只允许 ascii 小写 / 数字 / `-` / `_`
+- `phase_dir` 非空、相对路径、不含 `..`
 - `retro_schema[*].field` 非空,**不允许重复**(防 RAG 索引冲突)
+- `escalate_grammar_extensions[*].prefix` 非空、唯一;
+  `route: revert_to_phase` 必须带 `target_phase`
+- `golden_rules[*]` 必须 `cmd | pattern` 二选一(同 phase YAML)
+- `verdict_schema[*]` 非空
+- `critic_dimensions[*].name` 非空、唯一
 
-**M3.1 实现位置**:`crates/ccteam-core/src/team.rs`(`TeamSpec` / `RetroFieldSpec` / `RetroFieldKind`),通过 `ccteam_core::TeamSpec::load(path)` 暴露。当前 ccteam binary 不读这个文件——**M3.4 加载逻辑、M4.1 retro phase 读 schema**。
+**实现位置**:`crates/ccteam-core/src/team.rs`(`TeamSpec` / `RetroFieldSpec` /
+`RetroFieldKind` / `CriticDimensionSpec` / `CriticStrictness` /
+`EscalateGrammarExtension` / `EscalateRoute`),通过 `ccteam_core::TeamSpec::load(path)`
+暴露。orchestrator 启动期扫描 + 加载在 `Orchestrator::new`(`load_team_runtimes`)。
 
 ---
 
