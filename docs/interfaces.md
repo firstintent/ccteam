@@ -660,7 +660,7 @@ retro_schema:
 实施约束:
 
 - `decision_mode: sync` —— phase prompt 必须显式调 `AskUserQuestion`;orchestrator 检测到该 phase idle 不计 stall(因为等用户是合理的),`stall_warn_minutes` 退化为"最大耐心"
-- `decision_mode: async` —— phase prompt 必须显式 Write 到 `~/projects/<slug>/.ccteam/outbox/clarify-<ts>-<n>.md`(schema 见 §3.4.3);**M3.6 之前 async 等同于"phase 直接 ESCALATE NEED_USER_INPUT 阻塞",M3.6 起支持真 PHASE_DONE_PENDING**
+- `decision_mode: async` —— phase prompt 必须显式 Write 到 `~/projects/<slug>/.ccteam/outbox/clarify-<ts>-<n>.md`(schema 见 §3.4.3);M3.6+ 支持真 PHASE_DONE_PENDING(phase 不被全 block,仅依赖该决策的下游 phase 等)
 - `decision_mode: hybrid` —— phase prompt 含两段 conditional(伪码:"如果 AskUserQuestion 在 X 秒内有响应就用,否则降级 outbox");X 由 phase 内 timeout 控制,orchestrator 不参与
 
 #### 5.6.2 `max_clarify_rounds` 行为
@@ -1072,6 +1072,8 @@ ccteam reject <slug>                   # 否决
 ccteam pause <slug>                    # 暂停(不杀 session)
 ccteam resume <slug>                   # 恢复自动调度(接管 attach 后的暂停)
 ccteam answer <slug> "回答内容"          # 响应 clarify
+ccteam decisions                       # M1 收尾增量:跨项目决策队列(扫 outbox event_kind: clarify|escalation)
+ccteam decisions --format json         # JSON 输出(meta-agent 主消费;详见 §5.6.4)
 ccteam fork-reply <slug> A             # L3 fork 决策(M1+;A/B/C)
 ccteam fork-reply <slug> B "去掉云同步"  # tweak
 ccteam kick <slug>                     # 软重启项目 session(claude --resume)
@@ -1090,6 +1092,7 @@ ccteam doctor --tool-surface                      # M0.5.6 phase tools_required 
 ccteam doctor --install-skill                     # M1.8 写 ccteam-control skill
 ccteam doctor --install-meta-agent <user-handle>  # M1.0 创建 meta-agent 项目(含 --install-skill)
 ccteam doctor --install-mcp                       # M2.5 在 ~/.claude.json 注册 mcpServers.ccteam(详见 §12)
+ccteam doctor --install-memory-bridge             # M4.2 写 ~/.claude/rules/ccteam-lessons-{dev,product-research}.md 占位 + paths frontmatter scope
 ccteam hook <subcmd>                              # debug:手动跑 hook(读 stdin JSON,写 stdout);
                                                   # subcmd ∈ {progress-append, parse-phase-end,
                                                   # cost-accumulate, load-context, block-push}

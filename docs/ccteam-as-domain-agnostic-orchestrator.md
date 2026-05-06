@@ -1,5 +1,14 @@
 # ccteam 作为领域无关编排层
 
+> **实施状态(2026-05-06)**:本文档原是 M3 团队抽象的 charter。**M3 已落地**
+> (commit `0d88ddc` PR #7 + 后续 M3.x 子 PR ship,详见 `development-plan.md` §5)
+> ——`team.yaml` schema、`--team` CLI、phase DAG inference、product-research
+> 团队作为首个非 dev 团队都已 ship;关联 dev-coupling 审计 13/23 条已关闭(详见
+> `docs/dev-coupling-audit.md` 摘要表)。**M4 跨项目记忆**走官方 `~/.claude/rules/`
+> + per-repo auto-memory 路径,亦已 ship(M4.1–M4.4)。本文继续保留作为团队
+> 抽象的**永久 charter**——未来再加新团队(marketing / ops / ...)时,§1 责任
+> 分界表 / §2 团队扩展契约 / §3 显式拒绝清单仍是**首要参考**。
+>
 > 本文回答一个问题:**ccteam 当前长得像"一个 dev 团队的编排器",但它的核心
 > 编排机制实际上与"做软件"这个领域无关——把 phase 集合换一组,同一台机器
 > 应该能跑研究团队、营销团队、运营团队**。本文负责把"编排层 vs 领域层"
@@ -27,10 +36,12 @@
   这种硬编码、fix-loop 完成信号 `TESTS_GREEN`、6 维评分维度、推荐 plugin
   agent 清单、artifact 文件命名(`spec.md` / `plan-eng.md` / ...)、危险命令
   拦截清单、Critic 视角集——这些假设了"你在做软件"。
-- **当前代码用"约定假设"代替了"显式参数"**:`orchestrator.rs` 直接写死 dev
-  pipeline 的 6-phase DAG,`fix_loop.rs` 直接写死 `TESTS_GREEN`,
-  `commands.rs` 直接写死要找的 artifact 名。短期没问题(M0 只有 dev 团队),
-  长期挡住了泛化路径——M3 之前必须把这些假设迁出 `ccteam-core`。
+- **当前代码用"约定假设"代替了"显式参数"**(2026-05-05 写,M3 已修):
+  `orchestrator.rs` 当时写死 dev pipeline 的 6-phase DAG,`fix_loop.rs` 写死
+  `TESTS_GREEN`,`commands.rs` 写死要找的 artifact 名。M3 已把 DAG 提取为
+  `crates/ccteam-core/src/dag.rs`(从 phase 模板推断);`completion_signal` 移到
+  phase YAML;**仅 `collect_artifacts` 仍硬编码 dev artifact 列表**(F8 待修)。
+  长期 `ccteam-core` 已基本无 dev 字面量,F1 / F8 收口后清零。
 - **首个非 dev 团队选 research**——工具面与 dev 重叠最多(同一批 plugin
   agent 复用率高、不需要新 MCP),但**完成信号**(tests pass → "3 个一手数
   据来源经过 Critic 交叉验证")与 **fix-loop 语义**(改代码 → 重设假设 +
@@ -161,7 +172,7 @@
 | 概念 | 归类 | 论证 |
 |---|---|---|
 | `~/.claude/projects/<encoded>/memory/` per-repo auto-memory | 🟢 | 官方机制,Claude 自主写;通用,与 ccteam-core 解耦 |
-| `~/.claude/rules/ccteam-lessons-<team>.md` 跨项目共享 | 🟢 | 通用机制(rules + `paths:` frontmatter scope);ccteam doctor `--install-memory-bridge` 占位,retro phase 写 marked section |
+| `~/.claude/rules/ccteam-lessons-<team>.md` 跨项目共享 | 🟢 | 通用机制(rules + `paths:` frontmatter scope `~/projects/<team>-*`,**F22 修复后 slug 加 team 前缀,scoping 实际生效**);ccteam doctor `--install-memory-bridge`(M4.2)落实文件骨架,retro phase(M4.1)写 marked section |
 | `team.yaml.retro_schema[]` 字段定义 | 🟡 | 当前 dev 已填 4 字段,product-research M4.1 必须补;mechanism 是"按 team 定义 retro 字段段落" |
 | 召回触发(Seed/verdict phase 启动时官方机制自动注入 rules + 可选 `mcp__*claude-mem*search`) | 🟢 | 通用,LLM 自看 tool surface 决定调不调 claude-mem |
 | **跨团队记忆隔离 vs 共享**(本文档新增问题) | 🟢 | rules 文件按 team 分名 + `paths:` frontmatter 按项目目录前缀 scope 实现隔离 |
@@ -173,8 +184,11 @@
 要在 ccteam 上跑一支新团队,必须交付以下 7 件东西。**少一件,orchestrator 拒绝
 启动**(`ccteam doctor --team <name>` 失败 → `ccteam start --team <name>` fail-fast)。
 
-> ✋ M3 才会真正实现这套契约(2026-05-05 reorder 后,见 §6.1)。本节先把契约钉死,
-> 后续 PR 按它实现 `team.yaml` 与 `--team` 参数。
+> ✅ **M3 已落地这套契约**(2026-05-06):`team.yaml` schema(retro_schema /
+> critic_dimensions / escalate_grammar_extensions / golden_rules / phase_dir /
+> verdict_schema)+ `--team` CLI + 团队特定 phase 集 + product-research 作为首个
+> 非 dev 团队全部 ship。本节继续作为新团队加入的契约骨架——加 marketing / ops
+> 时仍按此 7 件清单交付。
 
 ### 2.1 phase 集合(目录与命名)
 
@@ -330,7 +344,7 @@ orchestrator 解析 `parse-phase-end` 时按团队声明的前缀分发——前
 - 默认挂载 phase(信息性,不强制)
 - 用一句话说明何时该被调用(给 LLM 决策时读)
 
-### 2.7 与跨项目记忆(M3)的对接方式
+### 2.7 与跨项目记忆(M4)的对接方式
 
 每团队声明:
 - **retro phase 输出 schema**:patterns 文件该有哪些字段(dev: tech stack /
@@ -346,7 +360,7 @@ orchestrator 解析 `parse-phase-end` 时按团队声明的前缀分发——前
 ### 2.8 团队配置文件骨架
 
 ```yaml
-# ~/.ccteam/teams/<team-name>.yaml(规范化文件名;M3 实现)
+# ~/.ccteam/teams/<team-name>.yaml(规范化文件名;M3 已落地 — 见 `teams/dev.yaml` / `teams/product-research.yaml`)
 name: research
 phase_dir: phases-research                # 相对 ccteam 安装目录
 entry_phase: 00-topic                     # 等价 dev 的 plan-eng
@@ -473,32 +487,40 @@ danger_command_patterns:                  # 替代 dev 的 git push 拦截
 (2 文件)+ `crates/ccteam-hooks/src/`(5 文件)+ `crates/ccteam-core/src/
 templates/settings.json` + `phases/`(6 文件)+ 顶层 `CLAUDE.md` 与 `docs/`。
 
-按优先级分布:
+按优先级分布(**2026-05-06 post-M3/M4 sweep**):
 
 | 优先级 | 数量 | 编号 | 含义 |
 |---|---|---|---|
-| **P0 阻塞泛化** | 7 | F1, F2, F3, F4, F12, F13, F20(2026-05-05 升级) | 不解耦无法跑非 dev 团队 / 跨项目记忆;M3.1 必须清完 |
-| **P1 该做但可后置** | 10 | F5, F6, F7, F8, F9, F10, F11, F15, F19, F21(新增) | M3 中后段或 M4 内做完;延后会让命名内外冲突或文档失真 |
-| **P2 边角** | 3 | F16, F17, F18 | 跟 P0/P1 同 PR 顺手做;不阻塞功能 |
-| **N/A 已是领域无关** | 1 | F14 | 显式排除,避免后续误判 |
+| **P0 阻塞泛化(剩余)** | 1 | F1 | 仅剩 F1 触发逻辑切换:`if phase == FIX_PHASE_NAME` 改 `if template.auto_loop` |
+| **P1 剩余** | 6 | F5, F6, F7, F8, F15, F23(conditional) | fix_loop→auto_loop 重命名 / `collect_artifacts` 自动扫 / settings 危险命令 / 容器 bind-mount spike |
+| **P2 边角(剩余)** | 2 | F17, F18 | fix_loop→auto_loop 重命名时一并 |
+| **N/A 已是领域无关** | 2 | F14, F19 | F19 在 M3 docs 落地后重新评估 |
+| **已修复** | 12 | F2/F3/F4/F9/F10/F11/F12/F13/F16/F20/F21/F22 | M3/M4 ship 后批量关闭(详情见 audit 文档每条 status 注解) |
 
-**P0 关键路径**:F1(`auto_loop` 字段)+ F2(DAG 由 phase 模板推断)+ F3
-(`FIRST_PHASE` 改 DAG entry node)+ F4(`is_terminal` 改 DAG 终点判断)+
-F12(CLI `--team`)+ F13(`state.json.team` 字段)+ F20(team-aware
-`retro_schema`)——这 7 条解耦后,ccteam-core 即可跑非 dev 团队 + M4
-跨项目记忆不写死 dev 字段。
+**P0 剩余**(1 条):F1 — `auto_loop` phase YAML 字段已加(M3.1)且 `teams/dev.yaml` /
+`phases/06-fix.md` 已声明,但 orchestrator 触发分支仍是 `if phase == FIX_PHASE_NAME`
+字符串字面量。修完即可彻底从 ccteam-core 抹去 "fix" 字面量。
 
-**§B 元发现(对 §A 的反馈)**:`pub use ... M0_PHASE_DAG, FIRST_PHASE`
-在 `crates/ccteam-core/src/lib.rs:21` 把 dev 假设暴露到 lib 接口表面——
-M3.1 是一次 lib API breaking change。按 CLAUDE.md §五.3 不写 backwards-
-compat shim,直接换。这条已写进 §6.4 风险表与详审 §F2。
+**§B 元发现(对 §A 的反馈;2026-05-06 update)**:`pub use ... M0_PHASE_DAG, FIRST_PHASE`
+原暴露 dev 假设到 lib 接口表面 —— **已在 M3.1 处理**,常量删除,改为
+`PhaseDag::infer_from_templates`(`crates/ccteam-core/src/dag.rs`)。lib API breaking
+change 已发生,无 backwards-compat shim,符合 CLAUDE.md §五.3。
 
 审计过程中**没有发现**需要修订 §1 责任分界表或 §2 团队扩展契约的位置——
-所有发现都能映射到现有分类。这是抽象切对的好信号。
+所有发现都能映射到现有分类。这是抽象切对的好信号。M3/M4 ship 后的 post-sweep
+同样无需新分类。
 
 ---
 
 ## 5. 首个非 dev 团队的选择论证
+
+> **2026-05-06 实际落点**:M3 ship 的首个非 dev 团队是 **`product-research`**
+> (产品研究 — "should we build this idea?"),`teams/product-research.yaml` +
+> `phases-product-research/` 6 phase pipeline。是本节论证的 "research" 类的具
+> 体落点;选 product-research 而非泛 research 是因为它能直接对接 dev pipeline
+> (verdict.md PASS → 派给 dev,REJECT → 终止),首个非 dev 团队就拿到了 multi-team
+> 协作的实证。本节其余论证不变 — 工具面重叠 / 完成信号难点 / Critic 维度难
+> 点都被 product-research 验证。
 
 候选:research / marketing / ops。
 
@@ -548,19 +570,26 @@ compat shim,直接换。这条已写进 §6.4 风险表与详审 §F2。
 **不进 M0 / M0.5 / M1 / M2**——这些里程碑都还在补"dev 团队跑得稳"的洞,现在加
 team 抽象只会让两件事都做不好。
 
-### 6.1 M3 — Team Abstraction(本文档对应里程碑;约 2 周)
+### 6.1 M3 — Team Abstraction(本文档对应里程碑;约 2 周)— **已落地 2026-05-06**
 
 > **2026-05-05 reorder**:本文档原提案 "M4.5",但 ABC session 完成后审视发现:跨项
 > 目记忆(原 M3)和 Critic agent(原 M4)如果在团队抽象**之前**实施,retro_schema
 > 和 critic_dimensions 都会写死 dev 字段,后续 M4.5 落地时被迫推倒重来。**正确顺序
 > 是团队抽象**前置**,作为 M3。** `docs/development-plan.md` 已同步 reorder:
 > M3=Team Abstraction、M4=记忆、M5=Critic、M6=Symphony。
+>
+> **2026-05-06 ship**:M3.1–M3.7 全部 ship(commits `5535cf4` / `c75e092` /
+> `6cd8959` / `5a42d84` / `b1c434b` / `ce6541e`);PR #7 合并到 main。验收点:
+> `ccteam new --team=product-research "AI 菜谱生成器"` 走通 6-phase happy path
+> (M3.5 e2e 测试 + V0.1 user walkthrough);`ccteam new "<brief>"` 默认 `--team=dev`
+> 零迁移。M4 跨项目记忆(M4.1–M4.4)随后 ship,走官方 `~/.claude/rules/` +
+> per-repo auto-memory(`873aa0a` / `36b6d99` / `62e47a6` / `5e351b1`)。
 
-**唯一验收**:`ccteam new --team=research "<topic>"` 能跑通 happy path,产出最终研究
-报告;dev 团队的现有项目零迁移成本(`ccteam new "<brief>"` 默认 `--team=dev` 仍然
-工作)。
+**唯一验收**(已达成):`ccteam new --team=product-research "<topic>"` 能跑通
+happy path,产出最终 verdict 报告;dev 团队的现有项目零迁移成本
+(`ccteam new "<brief>"` 默认 `--team=dev` 仍然工作)。
 
-任务清单详见 `docs/development-plan.md` §5(M3.1 ~ M3.6)。本文档不再重复维护任务
+任务清单详见 `docs/development-plan.md` §5(M3.1 ~ M3.7)。本文档不再重复维护任务
 表,只做"为什么这么排"的论证。
 
 ### 6.2 为什么不更早?
@@ -570,23 +599,27 @@ team 抽象只会让两件事都做不好。
 - **M1/M2 在补用户体验**(telegram、Seed Gate、Score)——这些机制在 dev 团队上要
   先稳定,泛化的复杂度才不会被基础不稳放大。
 
-### 6.3 为什么不更晚?
+### 6.3 为什么不更晚?(回顾论证 — M3 已 ship,本节作 future memory)
 
 - **M4 跨项目记忆的 retro_schema** 必须从 day 1 团队感知,否则跨项目 lessons
-  字段段落布局重写代价高(audit F20 P0)。
+  字段段落布局重写代价高(audit F20 P0)。**结果验证**:M3.1 ship retro_schema
+  数据形式;M4.1 retro phase 直接消费 schema 写 `~/.claude/rules/ccteam-lessons-<team>.md`,
+  零返工。
 - **M5 Critic 的 critic_dimensions** 必须从 day 1 数据驱动,否则 anti-leniency 算法
-  写死 dev 6 维,M6 Symphony 多团队协作时返工(§2.3 invariant 1)。
+  写死 dev 6 维,M6 Symphony 多团队协作时返工(§2.3 invariant 1)。当前 M3.2
+  已 ship `critic_dimensions` 数据形式 + 校验,等 M5 启动直接读;dev / product-research
+  两个 team 都先填空,留给 M5 一并设计。
 - 这两条都把 team 抽象推到 M4 / M5 **之前**——即 M3。
 
-### 6.4 风险
+### 6.4 风险(回顾 — M3 已 ship,事后实绩)
 
-| 风险 | 触发 | 应对 |
-|---|---|---|
-| §B 审计 P0 项过多,M3.1 单条堵住整个里程碑 | 审计发现深层耦合(例:fix-loop 状态机假设 dev 流程) | M3.1 拆为多个子 PR,每条 P0 独立 PR;按 §B 优先级排序逐个清 |
-| dev 团队的 `team-dev.yaml` 反推时和现状不一致 | 写 team-dev.yaml 时发现某些行为靠"巧合"工作,没显式契约 | 反推时逐条对照 §1 责任分界表;"没契约的现状"必须先写到 §1 再纳入配置 |
-| research 团队跑通靠的是借用 dev plugin 的能力,而不是真验证了 §2 契约 | research phase 模板偷懒,ESCALATE 不用 §2.4 自定义前缀,critic 不用 §2.3 自定义维度 | M3.4 验收时强制要求 research 至少有 1 个自定义 ESCALATE 前缀 + 至少 1 个 dev 没有的 critic 维度 |
-| §3 "显式拒绝清单"被 PR 软性绕过 | "为了通用"在 ccteam-core 加 `if team == "research"` | code-review 加规则:`ccteam-core/` 内出现 team 名字符串字面量 = 自动拒收 |
-| M4 / M5 实现时仍被诱惑写死 dev 假设 | 团队抽象上线但 M4 retro / M5 critic 没真用配置驱动 | M4.1 必须读 `team.yaml.retro_schema[]`;M5.1 / M5.2 / M5.3 必须读 `team.yaml.critic_dimensions[]`;两者都纳入 M4 / M5 验收清单 |
+| 风险 | 触发 | 应对 | 实际结果 |
+|---|---|---|---|
+| §B 审计 P0 项过多,M3.1 单条堵住整个里程碑 | 审计发现深层耦合(例:fix-loop 状态机假设 dev 流程) | M3.1 拆为多个子 PR,每条 P0 独立 PR;按 §B 优先级排序逐个清 | ✅ M3.1 / M3.2 / M3.3 / M3.4 / M3.5 / M3.6 / M3.7 拆成 7 个子任务并行推;F1 一项延后至 post-M3 仍 P0 |
+| dev 团队的 `team-dev.yaml` 反推时和现状不一致 | 写 team-dev.yaml 时发现某些行为靠"巧合"工作,没显式契约 | 反推时逐条对照 §1 责任分界表;"没契约的现状"必须先写到 §1 再纳入配置 | ✅ 未触发;反推 dev.yaml 严格按 §1 / §2 模板 |
+| product-research 团队跑通靠的是借用 dev plugin 的能力,而不是真验证了 §2 契约 | phase 模板偷懒,ESCALATE 不用 §2.4 自定义前缀,critic 不用 §2.3 自定义维度 | M3.4 验收时强制要求至少有 1 个自定义 ESCALATE 前缀 + 至少 1 个 dev 没有的 critic 维度 | ✅ product-research 落 3 个自定义 ESCALATE 前缀(MARKET_DUPLICATE / INSUFFICIENT_VALIDATION / LOW_DIFFERENTIATION);critic_dimensions 留给 M5 一并设计 |
+| §3 "显式拒绝清单"被 PR 软性绕过 | "为了通用"在 ccteam-core 加 `if team == "research"` | code-review 加规则:`ccteam-core/` 内出现 team 名字符串字面量 = 自动拒收 | ⚠️ 部分:`render_project_claude_md` 有 `match team` 但分支只是 CLAUDE.md 模板内容(数据 not 决策),可接受 |
+| M4 / M5 实现时仍被诱惑写死 dev 假设 | 团队抽象上线但 M4 retro / M5 critic 没真用配置驱动 | M4.1 必须读 `team.yaml.retro_schema[]`;M5.1 / M5.2 / M5.3 必须读 `team.yaml.critic_dimensions[]`;两者都纳入 M4 / M5 验收清单 | ✅ M4.1 ship `team-aware retro phase prompts`(`873aa0a`),phases/09-ship.md / phases-product-research/06-verdict.md 均按各自 schema 写;M5 待启 |
 
 ---
 
@@ -718,11 +751,11 @@ prompt,而不是适配器代码。
 
 | 里程碑 | meta-agent pattern 进展 |
 |---|---|
-| **M1** | meta-agent session 上线(M1.0)+ inbox/outbox 协议加固(M1.1)+ ccteam-control skill 装好(M1.8)→ **终端 attach 即可 NL 对话**,无 channel 也能跑 |
-| M2 | `ccteam-mcp` MCP server + Channel adapter(Telegram 优先,复用开源)→ meta-agent 有结构化派单工具 + 移动端 NL 通道 |
-| M3 | 团队抽象上线 → meta-agent 派单时能选 `--team`(dev / research / ...) |
-| M4 | 跨项目 lessons via `~/.claude/rules/ccteam-lessons-<team>.md` + per-repo auto-memory(meta-agent 同享) → 完整跨项目记忆,ccteam-core 零检索代码 |
-| M5+ | 多团队协作(research → dev pipeline)+ 多 channel 收敛 → meta-agent 编排跨团队工作流,跨设备访问 |
+| **M1** ✅ ship | meta-agent session 上线(M1.0)+ inbox/outbox 协议加固(M1.1)+ ccteam-control skill 装好(M1.8)→ **终端 attach 即可 NL 对话**,无 channel 也能跑 |
+| M2 ✅ ship(M2.2 deferred) | `ccteam-mcp` MCP server(M2.5)+ Channel adapter(Telegram 优先,复用开源,**M2 内未做** — 留给后续)→ meta-agent 有结构化派单工具 |
+| M3 ✅ ship 2026-05-06 | 团队抽象上线 → meta-agent 派单时能选 `--team`(dev / product-research),M3.7 落 meta-agent dispatch tree |
+| M4 ✅ ship 2026-05-06 | 跨项目 lessons via `~/.claude/rules/ccteam-lessons-<team>.md` + per-repo auto-memory(meta-agent 同享) → 完整跨项目记忆,ccteam-core 零检索代码 |
+| M5+ | 多团队协作(product-research → dev pipeline)+ 多 channel 收敛 → meta-agent 编排跨团队工作流,跨设备访问 |
 
 ---
 
@@ -733,11 +766,11 @@ prompt,而不是适配器代码。
 - **tech-design.md** 是 mechanism 的设计论证;本文档**不**改 mechanism,只
   把它们标"哪些是 mechanism、哪些是 dev fill"。
 - **development-plan.md** 是任务清单;本文档对应 §5 M3 — Team Abstraction(2026-05-05
-  reorder 后,从原提案 M4.5 前移至 M3,见 §6.1 注解)。任务粒度(M3.1 ~ M3.6)由
-  development-plan 维护。
+  reorder 后,从原提案 M4.5 前移至 M3,见 §6.1 注解)。任务粒度(M3.1 ~ M3.7)由
+  development-plan 维护;M3 状态已标 ship。
 - **interfaces.md** 是协议字段表;本文档建议在 phase YAML schema 加
   `completion_signal` / `auto_loop` 字段(§2.1),那是 interfaces.md §5.1 的
-  扩展——M3.2 提交协议变更时必须同步 interfaces.md。
+  扩展——M3.2 提交协议变更时已同步 interfaces.md。
 
 ## 9. 本文档维护纪律
 
@@ -746,6 +779,8 @@ prompt,而不是适配器代码。
 2. **§B 审计的发现可以反过来修订 §1 / §2**——发现某条机制的 dev 假设比预
    想深,本文档要更新,不要硬塞 audit 节。
 3. **本文档不超过 800 行**——超出说明在重复 tech-design / interfaces;砍
-   重复内容,留指针。(M3 reorder + meta-agent pattern 落地后从 558 → 720+,
-   仍在阈值内。下一次重大扩展前,先看能不能砍掉哪节)
+   重复内容,留指针。(M3 reorder + meta-agent pattern 落地后从 558 → 720+;
+   2026-05-06 M3/M4 ship 后回填实施状态注解 → 780+,接近阈值。下一次重大
+   扩展前,**先砍**那些已经过时的论证文字 — 例如 §5 论证 research vs marketing
+   的优先级在 product-research ship 后已可大幅压缩)
 4. **commit message 用英文,文档内容用中文**(沿袭仓库现状)。

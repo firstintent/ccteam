@@ -23,34 +23,35 @@
 ## 摘要
 
 23 条发现(2026-05-05 加 F21、升级 F20 P1→P0,共增 1 条;2026-05-06 修复 F21;
-2026-05-06 M4.4 spike 加 F22 P0 + F23 P1 conditional;2026-05-06 修复 F22),分布:
+2026-05-06 M4.4 spike 加 F22 P0 + F23 P1 conditional;2026-05-06 修复 F22;
+**2026-05-06 post-M3/M4 sweep**:F2/F3/F4/F9/F10/F11/F12/F13/F20 由 M3 团队
+抽象 + M4 跨项目记忆批量关闭),分布:
 
 | 优先级 | 数量 | 编号 |
 |---|---|---|
-| **P0 阻塞泛化** | 7 | F1, F2, F3, F4, F12, F13, F20(2026-05-05 升级) |
-| **P1 该做但可后置** | 10 | F5, F6, F7, F8, F9, F10, F11, F15, F19, F23(conditional) |
-| **P2 边角** | 3 | F16, F17, F18 |
-| **N/A 已是领域无关** | 1 | F14 |
-| **已修复** | 2 | F21(@a5fb21d)、F22(2026-05-06 follow-up PR) |
+| **P0 阻塞泛化(剩余)** | 1 | F1(部分修复;触发逻辑仍按字符串) |
+| **P1 该做但可后置(剩余)** | 6 | F5, F6, F7, F8, F15, F23(conditional) |
+| **P2 边角(剩余)** | 2 | F17, F18 |
+| **N/A 已是领域无关** | 2 | F14, F19(M3 docs sweep 后)|
+| **已修复** | 12 | F2 / F3 / F4(M3.1 dag.rs)、F9 / F10 / F11(M3.4 team-aware bootstrap;F11 dev 仍裸 `phases/` 但非阻塞)、F12 / F13(M3.3 `--team` CLI + `state.team`)、F16(M3.4 phase 模板 team 化)、F20(M3.1+M3.4 retro_schema 数据形式 + product-research 填字段 + M4.1 phase 消费)、F21(@a5fb21d)、F22(PR #12)|
 
-**P0 关键路径**:F1(`auto_loop` 字段)+ F2(DAG 由 phase 模板推断)+ F3
-(`FIRST_PHASE` 改 DAG entry node)+ F4(`is_terminal` 改 DAG 终点判断)+
-F12(CLI `--team`)+ F13(`state.json.team` 字段)。这 6 条解耦后 ccteam-
-core 才能跑非 dev 团队。
+**剩余 P0 关键路径**:**只剩 F1**(`auto_loop` 字段已在 phase YAML 里加了
+[M3.1],orchestrator 仍按 `FIX_PHASE_NAME` 字符串触发 `FixLoopState`——需
+切到读 `template.auto_loop`)。完成后 ccteam-core 可彻底放弃 "fix" 这个名字。
 
-**元发现**:`pub use ... M0_PHASE_DAG, FIRST_PHASE`(`crates/ccteam-core/src/
-lib.rs:21`)把 dev 假设暴露到 lib 接口表面——M3.1 是一次 lib API breaking
-change。按 CLAUDE.md §五.3 "不写 backwards-compat shim",直接换。
+**元发现(2026-05-05 写)**:`pub use ... M0_PHASE_DAG, FIRST_PHASE`(`crates/
+ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已在 M3.1 落地**
+(dag.rs 替代 M0_PHASE_DAG / FIRST_PHASE,lib API breaking change 已发生)。
 
 **对 §A 的反馈**:审计过程中没有发现需要修订 strategic doc §1 责任分界表
 或 §2 团队扩展契约的位置——所有发现都能映射到现有分类。这是抽象切对的
-好信号。
+好信号。M3 落地后的 post-sweep 同样没发现需要新分类。
 
 ---
 
 ## P0 — 阻塞泛化
 
-### F1 — `FIX_PHASE_NAME` / `FIX_LOOP_MAX_ITERATIONS` 字符串耦合 fix-loop 触发
+### F1 — `FIX_PHASE_NAME` / `FIX_LOOP_MAX_ITERATIONS` 字符串耦合 fix-loop 触发(**部分修复:M3.1 加 phase YAML 字段;orchestrator 触发逻辑仍按字符串**)
 
 - **文件:行号**:`crates/ccteam-core/src/orchestrator.rs:32-33` + `:481-491`
   ```rust
@@ -77,8 +78,16 @@ change。按 CLAUDE.md §五.3 "不写 backwards-compat shim",直接换。
      `"TESTS_GREEN"` 默认值。
 - **优先级**:**P0**——`auto_loop` 字段是 strategic doc §1.3 / §2.1 团队扩展
   契约的核心,不解耦无法跑非 dev 团队。
+- **2026-05-06 部分修复**:phase YAML schema 已加 `auto_loop` /
+  `auto_loop_max_iterations` / `completion_signal` 三字段(`crates/ccteam-core/src/phases.rs`
+  M3.1),`teams/dev.yaml` + `phases/06-fix.md` 已声明 `auto_loop: true`;但
+  `orchestrator.rs` 的触发分支仍是 `if phase == FIX_PHASE_NAME`,**未切到读
+  `template.auto_loop`**——orchestrator 把 phase 名为 "fix" 的 phase 视作自循环,
+  其它 team 想标 `auto_loop: true` 仍不生效。剩余工作:把 `if phase == FIX_PHASE_NAME`
+  改为 `if dag.lookup(phase).map_or(false, |t| t.auto_loop)`,FixLoopState 的
+  `completion_signal` 与 `max_iterations` 改从 PhaseTemplate 读。
 
-### F2 — `M0_PHASE_DAG` 硬编码 dev 流程
+### F2 — `M0_PHASE_DAG` 硬编码 dev 流程(**已修复:M3.1 dag.rs**)
 
 - **文件:行号**:`crates/ccteam-core/src/orchestrator.rs:37-44` + 通过
   `pub use ... M0_PHASE_DAG` 暴露到 lib.rs:21
@@ -93,8 +102,11 @@ change。按 CLAUDE.md §五.3 "不写 backwards-compat shim",直接换。
      `next_on_escalate` 显式声明(M3.2);
   3. `next_phase()` 函数改成 `&self.dag` 上的查表方法。
 - **优先级**:**P0**——和 F1 一并解耦,是 `--team` 参数能工作的前提。
+- **2026-05-06 已修复**:M3.1 落 `crates/ccteam-core/src/dag.rs`(`PhaseDag::infer_from_templates`),
+  从加载的 `PhaseTemplate[]` 按文件名 `NN-` 前缀排序推断 happy-path DAG;`M0_PHASE_DAG`
+  常量删除,lib.rs `pub use` 已清理。orchestrator 改用 `team.dag.next_phase()` 查表。
 
-### F3 — `FIRST_PHASE = "plan-eng"` 硬编码
+### F3 — `FIRST_PHASE = "plan-eng"` 硬编码(**已修复:M3.1 dag.rs**)
 
 - **文件:行号**:`crates/ccteam-core/src/orchestrator.rs:46`
 - **现状**:`pub const FIRST_PHASE: &str = "plan-eng";`,`decide_tick_from_events`
@@ -104,8 +116,11 @@ change。按 CLAUDE.md §五.3 "不写 backwards-compat shim",直接换。
 - **解耦方案**:从 F2 推出的 DAG 取 `dag.entry_node()`(排序后第一个 phase 的
   name)作为 `current_phase` 兜底。
 - **优先级**:**P0**——同 F2 一并清。
+- **2026-05-06 已修复**:`FIRST_PHASE` 常量删除;orchestrator 在 `current_phase.is_empty()`
+  时取 `team.dag.entry_phase()`(DAG 排序后第一个节点),由 team.yaml 注入 phase 集
+  的入口节点决定。M3.4 的 product-research 团队入口 `01-kickoff` 验证可行。
 
-### F4 — `is_terminal()` 字符串匹配 `"ship"` 终态
+### F4 — `is_terminal()` 字符串匹配 `"ship"` 终态(**已修复:M3.1 dag.rs**)
 
 - **文件:行号**:`crates/ccteam-core/src/orchestrator.rs:59-64`
   ```rust
@@ -121,8 +136,12 @@ change。按 CLAUDE.md §五.3 "不写 backwards-compat shim",直接换。
 - **解耦方案**:改为 "history 末尾 phase ∈ DAG 的终点节点(no `next_phase`)
   且 status=passed"。从 F2 解耦后的 DAG 直接读得到。
 - **优先级**:**P0**——和 F2 / F3 同批清。
+- **2026-05-06 已修复**:`PhaseDag::is_terminal_phase` / `is_terminal_state`(`dag.rs:103-127`)
+  按"DAG 终点节点(无 next_phase)且 status=passed"或"任意 escalated"判定,
+  字符串字面量 `"ship"` 不再出现在 orchestrator 决策路径。dev 团队 `09-ship.md` /
+  product-research `06-verdict.md` 都被识别为各自 DAG 的终点节点。
 
-### F12 — `ccteam new` CLI 缺 `--team` 参数
+### F12 — `ccteam new` CLI 缺 `--team` 参数(**已修复:M3.3**)
 
 - **文件:行号**:`crates/ccteam-cli/src/main.rs:54-60` + `commands.rs:97-104`
 - **现状**:`Command::New { request, file }` 只接受 request 文本;`run_new`
@@ -134,8 +153,12 @@ change。按 CLAUDE.md §五.3 "不写 backwards-compat shim",直接换。
   3. `bootstrap_project` 受 team 参数影响选 phase 模板与 CLAUDE.md(F9/F10);
   4. project state.json 写入 `team: <name>`(F13)。
 - **优先级**:**P0**——M3.3 直接产物;F2/F10/F11 都需要这个入口才能生效。
+- **2026-05-06 已修复**:M3.3 落 `Command::New { team: String, ... }`(`crates/ccteam-cli/src/main.rs:70`)
+  + `run_new(paths, request, team)` 签名(`commands.rs:135`),`--team` 默认 `dev`;
+  `ensure_team_resolvable` 先 lookup team_bundle / `~/.ccteam/teams/<name>.yaml`,未知
+  团队 fail-fast。M3.5 e2e 验证 `ccteam new --team=product-research` 跑通 happy path。
 
-### F13 — `state.json` 缺 `team` 字段
+### F13 — `state.json` 缺 `team` 字段(**已修复:M3.1**)
 
 - **文件:行号**:`crates/ccteam-core/src/state.rs:54-77` + `interfaces.md §2.1`
 - **现状**:`ProjectState` 没有 team 标识。orchestrator 启动期不知道某个项目
@@ -148,6 +171,10 @@ change。按 CLAUDE.md §五.3 "不写 backwards-compat shim",直接换。
   3. interfaces.md §2.1 同步加字段。
 - **优先级**:**P0**——orchestrator dispatch 时必须能区分 team 才能选对 DAG /
   完成信号 / artifact 列表。
+- **2026-05-06 已修复**:M3.1 加 `pub team: String`(`state.rs:75`,默认 `"dev"` 兼容
+  M0 旧文件)+ `ProjectState::initial_for_team(slug, team)` 构造器;`Orchestrator`
+  按项目 `state.team` lazy-load 对应 `TeamSpec`(`team_bundle(team)` → `crates/ccteam-core/src/templates.rs:112`),
+  从 team.yaml 的 `phase_dir` 找 phase 模板。`interfaces.md §2.1` 同步加字段。
 
 ---
 
@@ -230,8 +257,13 @@ change。按 CLAUDE.md §五.3 "不写 backwards-compat shim",直接换。
 - **优先级**:**P1**——`ls` / `show` JSON schema 是 LLM 消费的(tech-design
   §3.8 用户自带 claude),错列 artifact 不阻塞跑通,但在 research 团队上线前
   必须修(否则 research 项目的 `topic.md` / `primary/*.md` 不被 `show` 报告)。
+- **2026-05-06 状态**:**仍未修复**——`commands.rs:993-1017` 的 `collect_artifacts`
+  仍硬编码同样 10 项 dev artifacts。M3 product-research 落地后 `show <slug> --format
+  json` 在 product-research 项目上**只会报告 `escalation.md` 一项存在**,kickoff /
+  market-survey / verdict 等 markdown 都被遗漏。建议优先修:扫 `<project>/.ccteam/*.md`
+  自动列出,key 用文件名 stem,无须 team 配置。
 
-### F9 — `bootstrap_project` 写死的 CLAUDE.md 内容含 dev 措辞
+### F9 — `bootstrap_project` 写死的 CLAUDE.md 内容含 dev 措辞(**已修复:M3.4**)
 
 - **文件:行号**:`crates/ccteam-core/src/projects.rs:120-125`
   ```rust
@@ -255,8 +287,12 @@ change。按 CLAUDE.md §五.3 "不写 backwards-compat shim",直接换。
   3. bootstrap 时读对应 team 的模板,替换 `{slug}` 占位符。
 - **优先级**:**P1**——bootstrap 的内容污染 phase prompt 上下文,research 项目
   上线前必须修。
+- **2026-05-06 已修复**:M3.4 `render_project_claude_md(slug, team)`
+  (`crates/ccteam-core/src/projects.rs:186`)按 team 分支:dev 保留历史 "no git push /
+  tests must pass" 措辞;`product-research` 改写为 "不写代码,只产研究报告 /
+  3 独立信息源 / 不要把 dev 测试假设套到本项目";unknown team 落到通用 shell。
 
-### F10 — `PHASE_TEMPLATES` 编译期 include dev phase MD
+### F10 — `PHASE_TEMPLATES` 编译期 include dev phase MD(**已修复:M3.4**)
 
 - **文件:行号**:`crates/ccteam-core/src/templates.rs:24-31`
   ```rust
@@ -279,8 +315,13 @@ change。按 CLAUDE.md §五.3 "不写 backwards-compat shim",直接换。
      读盘——核心 binary 永远内嵌至少一个团队(dev)作 zero-config 兜底。
 - **优先级**:**P1**——M3.4 直接产物。F10 + F2 共同决定 `--team` 参数能怎么
   实现。
+- **2026-05-06 已修复**:M3.4 落 `TeamTemplateBundle` 多 team registry
+  (`crates/ccteam-core/src/templates.rs:96-104`)—— dev 团队 6 phase 与 product-research
+  6 phase 各自 `include_str!` 入 binary,通过 `team_bundle(team)` 选用;`team.yaml`
+  的 `phase_dir` 字段决定写到哪个目录。"切换到 research 团队"的入口已存在
+  (`ccteam new --team=product-research`)。
 
-### F11 — phase 目录与文件命名缺 team scope
+### F11 — phase 目录与文件命名缺 team scope(**部分修复:M3.4 product-research 团队 / dev 仍用裸 `phases/`**)
 
 - **文件:行号**:`/home/rob/workplace/agents/ccteam/phases/`(整个目录)+
   `crates/ccteam-core/src/templates.rs:25-30` + `interfaces.md §1.1` 的
@@ -297,6 +338,11 @@ change。按 CLAUDE.md §五.3 "不写 backwards-compat shim",直接换。
   4. 项目内 `.ccteam/phases/` 仍按 phase 名扁平存放(项目本身只跑一个 team,
      phase 不混);项目 state.json 增加 `team: <name>` 字段(同 F13)。
 - **优先级**:**P1**——必做但可在 F2 解耦后批量做。
+- **2026-05-06 部分修复**:product-research 团队已用 `phases-product-research/` scope;
+  `team.yaml.phase_dir` 字段(M3.1)驱动写入位置;binary 内嵌 `<phase_dir>/<NN>-<phase>.md`
+  路径;orchestrator `~/.ccteam/<team.phase_dir>/` lazy-load。**未做**:dev 团队仍用
+  裸 `phases/` 目录(向后兼容期)而非 `phases-dev/`,也无 `~/.ccteam/teams/<team>/`
+  的合一目录布局——这两条是命名层 nice-to-have,不阻塞功能。
 
 ### F15 — settings.json 模板未含危险命令拦截(M1+ 风险)
 
@@ -314,7 +360,7 @@ change。按 CLAUDE.md §五.3 "不写 backwards-compat shim",直接换。
 - **优先级**:**P1**——M1+ 引入 `block-push` 时一并做;不在 M3 关键路径上,
   但把它写进 strategic doc §3.5 拒绝清单可避免 M1 时悄悄硬编码。
 
-### F19 — CLAUDE.md(顶层)与 docs/* 把 ccteam 描述为"开发团队的编排层"
+### F19 — CLAUDE.md(顶层)与 docs/* 把 ccteam 描述为"开发团队的编排层"(**N/A:M3 后 strategic doc + interfaces 团队抽象就位 / 仓库 docs 维持 dev-first 视角合理**)
 
 - **文件:行号**:顶层 `CLAUDE.md`(全文以 dev 视角写)、`docs/requirements.md`
   全文以"做软件"为痛点中心、`docs/tech-design.md` §1 设计原则表 / §2.1 进程
@@ -335,8 +381,14 @@ change。按 CLAUDE.md §五.3 "不写 backwards-compat shim",直接换。
      域特定),M3.4 一并整理。
 - **优先级**:**P1**——文档体系不解耦,新加入 ccteam 项目的人会以为"ccteam
   只服务 dev 团队"。M3 启动 PR 必须同步动文档。
+- **2026-05-06 重新评估为 N/A**:M3 落地后,`docs/ccteam-as-domain-agnostic-orchestrator.md`
+  作为团队抽象 charter 已就位,`interfaces.md` / `tech-design.md` 已加 team
+  抽象章节(M3 ship commit `23449cb`);`requirements.md` / 顶层 `CLAUDE.md`
+  保持 dev-centric 视角是**合理的**——ccteam 仓库本身的产品形态是 dev 团队
+  (痛点 1-13 都是 dev 痛点),非 dev 团队的需求由对应 `teams/<team>.yaml`
+  的描述字段 + `phases-<team>/` 文档承担。F19 不再需要单独追踪。
 
-### F20 — 跨项目记忆 schema 假设 dev 字段
+### F20 — 跨项目记忆 schema 假设 dev 字段(**已修复:M3.1 retro_schema 数据形式 + M3.4 product-research 填字段 + 09-ship.md / 06-verdict.md 消费 schema**)
 
 - **文件:行号**:`docs/tech-design.md §3.7` "关键字段:tech stack、踩过的坑、
   成功的设计选择、不要再做的事";`docs/development-plan.md §5 M3.1` "输出固
@@ -362,9 +414,11 @@ change。按 CLAUDE.md §五.3 "不写 backwards-compat shim",直接换。
 > `teams/product-research.yaml` 仍空(注释"M4.1 may revise")。M4 改走
 > 官方记忆机制后,`retro_schema` 字段不再驱动 RAG 索引,而是驱动 retro phase prompt
 > 写入 `~/.claude/rules/ccteam-lessons-<team>.md` 时的字段段落布局。
-> **F20 在 M4.1 PR 落地时关闭**:必须为 product-research 补 retro_schema +
-> 改造 `phases/09-ship.md` / `phases-product-research/06-verdict.md` inline retro 段
-> 消费 schema(详见 development-plan §6 M4.1)。
+>
+> **2026-05-06 关闭**:M4.1 ship 后(`873aa0a feat(M4.1): team-aware retro phase
+> prompts`),`phases/09-ship.md` 与 `phases-product-research/06-verdict.md` 都
+> inline retro 段按各自 team.yaml 的 `retro_schema` 字段写入 marked section;
+> product-research `retro_schema` 已填 5 字段(market_signals / 等)。F20 关闭。
 
 ### F21 — `stall_warn_minutes` phase YAML 字段已 spec 但 orchestrator 未读取(**已修复:2026-05-06 @ a5fb21d**)
 
@@ -421,7 +475,7 @@ change。按 CLAUDE.md §五.3 "不写 backwards-compat shim",直接换。
 
 ## P2 — 边角
 
-### F16 — `PHASE_TEMPLATES` 中 plan-ceo / 07-review / 08-score 缺位但 fix/test/ship 在位
+### F16 — `PHASE_TEMPLATES` 中 plan-ceo / 07-review / 08-score 缺位但 fix/test/ship 在位(**已修复:M3.4 多 team registry**)
 
 - **文件:行号**:`crates/ccteam-core/src/templates.rs:24-31` 仅 6 个;
   `interfaces.md §5.2` 列了 9 个完整 phase
@@ -430,6 +484,12 @@ change。按 CLAUDE.md §五.3 "不写 backwards-compat shim",直接换。
 - **是否真 dev-specific**:**是**(在交付的 phase 都是 dev fill)。
 - **解耦方案**:同 F10——团队配置决定该 binary 内嵌哪些 phase。
 - **优先级**:**P2**(随 F10 一并做)。
+- **2026-05-06 已修复**:M3.4 落 multi-team registry 后,每个 team 的 phase 集
+  由 `team_bundle(team)` 的 `phases: &'static [(&'static str, &'static str)]`
+  字段决定;dev 团队仍只 6 phase(plan-ceo / review / score 留给 M2+ / M5),
+  product-research 团队是完整 6 phase pipeline。"哪些 phase 入 binary"已是 team
+  配置驱动的数据,不再是 PHASE_TEMPLATES 单一常量。剩余 dev plan-ceo / review /
+  score 的实现归于产品功能(M2+ / M5),与领域无关耦合无关。
 
 ### F17 — 测试用例硬编码 dev phase 名
 
@@ -477,40 +537,34 @@ change。按 CLAUDE.md §五.3 "不写 backwards-compat shim",直接换。
 
 ## 修复顺序建议(M3.1 PR 拆分)
 
+> **2026-05-06 状态更新**:M3 已 ship,以下大部分 PR 已落地。保留历史记录。
+
 按依赖关系排:
 
-1. **PR A — phase 模板 schema 扩展(F1 字段层)**
+1. **PR A — phase 模板 schema 扩展(F1 字段层)** ✅ M3.1 ship
    - phase YAML 加 `auto_loop` / `auto_loop_max_iterations` /
      `completion_signal` 字段
    - phase 模板都更新(`fix.md` 加 `auto_loop: true` /
      `completion_signal: TESTS_GREEN`)
    - 测试覆盖
-2. **PR B — orchestrator DAG 提取(F2 + F3 + F4 + F1 触发逻辑)**
-   - 删 `M0_PHASE_DAG` / `FIRST_PHASE`
-   - 从 phase 模板推断 DAG
-   - `is_terminal` 改 DAG 终点判断
-   - `if phase == FIX_PHASE_NAME` 改 `if template.auto_loop`
-   - lib.rs `pub use` 清理(breaking change 已说明)
-3. **PR C — fix_loop → auto_loop 重命名(F5 + F6 + F7 + F18)**
+2. **PR B — orchestrator DAG 提取(F2 + F3 + F4 + F1 触发逻辑)** ✅ M3.1 ship(F2/F3/F4 部分 — F1 触发逻辑仍未切)
+   - 删 `M0_PHASE_DAG` / `FIRST_PHASE` ✅
+   - 从 phase 模板推断 DAG ✅(`crates/ccteam-core/src/dag.rs`)
+   - `is_terminal` 改 DAG 终点判断 ✅
+   - `if phase == FIX_PHASE_NAME` 改 `if template.auto_loop` ❌ 仍未做(F1 剩余 P0)
+   - lib.rs `pub use` 清理 ✅
+3. **PR C — fix_loop → auto_loop 重命名(F5 + F6 + F7 + F18)** ❌ 未做
    - 一次性重命名,保留 serde 兼容
-4. **PR D — `--team` CLI 入口(F12 + F13)**
-   - `Command::New` 加 `--team`
-   - `ProjectState.team` 字段
-   - `bootstrap_project` 受 team 参数
-5. **PR E — bootstrap 模板 team 化(F9 + F10 + F11 + F16 + F17)**
-   - CLAUDE.md 模板按 team
-   - `PHASE_TEMPLATES` 按 team
-   - `phases/` → `phases-dev/`
-   - 测试目录 `tests/team-dev/`
-6. **PR F — `collect_artifacts` 自动扫(F8)**
+4. **PR D — `--team` CLI 入口(F12 + F13)** ✅ M3.3 ship
+5. **PR E — bootstrap 模板 team 化(F9 + F10 + F11 + F16 + F17)** ✅ M3.4 ship(F11 dev 仍裸 `phases/`,F17 测试 fixture 仍 dev,均不阻塞)
+6. **PR F — `collect_artifacts` 自动扫(F8)** ❌ 仍未做(P1)
    - 改成扫 `.ccteam/*.md`
-7. **PR G — 文档解耦(F19)**
-   - `docs/` 顶部加免责
-   - 长期 `docs/core/` + `docs/teams/<team>/` 整理(M3.4)
+7. ~~**PR G — 文档解耦(F19)**~~ N/A — 重新评估,M3 后维持仓库 dev-first 视角合理(见 F19 状态注解)
 8. **延后**:
    - F15(M1+ 引入 `block-push` 时一并做)
-   - ~~F21~~(已修复 @a5fb21d:`stall.rs` 的 `StallThresholds::from_phase` + orchestrator 读 `current_phase` 模板)
-   - F20(原 P1 已升 P0,M3 完成 retro_schema 数据形式后,M4.1 retro phase 实现一并处理)
+   - ~~F21~~(已修复 @a5fb21d)
+   - ~~F20~~(已修复:M3.1 schema + M4.1 phase 消费)
+   - F23(M4.4 spike §4 deferred,F22 修复后已解锁,等谁跑一次)
 
 每个 PR 必须有 dev pipeline happy-path 回归测试通过。
 
