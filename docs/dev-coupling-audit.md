@@ -352,8 +352,18 @@ change。按 CLAUDE.md §五.3 "不写 backwards-compat shim",直接换。
 
 > **2026-05-05 升级注解**:原标 P1。ABC session 完成后用户审视发现:跨项目记
 > 忆(原 M3)在团队抽象(原 M4.5)之前实施时,retro 字段写死成 dev 字段会让
-> 后续 RAG 索引重建。`development-plan.md` 已 reorder M3 ↔ M4(团队抽象前
+> 后续跨项目 lessons 字段重写。`development-plan.md` 已 reorder M3 ↔ M4(团队抽象前
 > 置),F20 现在阻塞新 M4 启动 —— 升级为 P0。
+>
+> **2026-05-06 状态更新**:M3.1 / M3.2 已 ship `retro_schema` 数据形式 +
+> 校验(`crates/ccteam-core/src/team.rs`);`teams/dev.yaml` 已填 4 字段
+> (tech_stack / pitfalls / successful_designs / do_not_do_again),
+> `teams/product-research.yaml` 仍空(注释"M4.1 may revise")。M4 改走
+> 官方记忆机制后,`retro_schema` 字段不再驱动 RAG 索引,而是驱动 retro phase prompt
+> 写入 `~/.claude/rules/ccteam-lessons-<team>.md` 时的字段段落布局。
+> **F20 在 M4.1 PR 落地时关闭**:必须为 product-research 补 retro_schema +
+> 改造 `phases/09-ship.md` / `phases-product-research/06-verdict.md` inline retro 段
+> 消费 schema(详见 development-plan §6 M4.1)。
 
 ### F21 — `stall_warn_minutes` phase YAML 字段已 spec 但 orchestrator 未读取(**已修复:2026-05-06 @ a5fb21d**)
 

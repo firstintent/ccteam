@@ -19,7 +19,7 @@
 **ccteam 不是独立 AI 系统,它是 Claude Code 的编排层。**
 
 - **被编排者**:每个项目一个 Claude Code 长 session,用 tmux 守护、用 hooks 上报、用 MCP 接外部
-- **编排者**:Rust orchestrator(M0,Cargo workspace)、Telegram bot(M1)、跨项目记忆 RAG(M3)
+- **编排者**:Rust orchestrator(M0,Cargo workspace)、Telegram bot(M1)、跨项目记忆(M4;走官方 `~/.claude/CLAUDE.md` + `~/.claude/rules/*.md` + per-repo auto-memory,**ccteam-core 零检索代码**)
 - **入口/汇报**:**用户自带的 Claude Code session**(M1+ 装 `ccteam-control` skill / M2+ 通过 `ccteam-mcp` MCP)——ccteam **不做 chat 客户端**,chat 体验外包给原生 Claude Code(详见 tech-design §3.8)
 - **结论**:**严格遵守 Claude Code 最佳实践会让 ccteam 系统更高效**——任何与最佳实践冲突的设计选择必须有 tech-design.md 中的明确反对论证。两个层面都适用:
   - **开发 ccteam 本身时**(本仓库):每次写代码、写 prompt、改架构都先翻 `docs/claude-code-best-practices.md`
@@ -70,7 +70,7 @@ tech-design §6.4 已列,按里程碑装:
 | MCP | 里程碑 | 用途 |
 |---|---|---|
 | Telegram bot | M1 | 异步消息入口 + escalation 推送 |
-| claude-mem | M3 | 跨项目向量记忆索引 |
+| claude-mem | M4 可选 | 装了即增强(read-only MCP search / timeline / get_observations + 自带 hook 自动捕获);ccteam 不写集成代码,LLM 自看 tool surface 决定调不调 |
 | Playwright | 按需 | 前端 E2E,phase 内调用 |
 | GitHub | M4+ | PR 创建、issue 同步(优先 `gh` CLI——见最佳实践 §4.3) |
 

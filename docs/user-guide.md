@@ -257,8 +257,12 @@ ccteam new "想法 B"
 ccteam new "想法 C"
 # orchestrator 按 max_concurrent_projects=3 排队,不打扰
 
-ccteam memory ls                     # 跨项目记忆(M3+)
-ccteam memory rebuild
+# 跨项目记忆走 Claude Code 官方机制(M4):
+#   - 项目内累积:每个项目自动产生 ~/.claude/projects/<encoded>/memory/ auto-memory
+#   - 跨项目共享:retro phase 写到 ~/.claude/rules/ccteam-lessons-<team>.md,新项目 session 自动加载
+#   - 装了 claude-mem 即作可选增强(`/plugin install claude-mem`)
+# ccteam 不提供 memory 子命令 — 在 claude session 里用 /memory 命令查看,
+# 或直接 `cat ~/.claude/rules/ccteam-lessons-dev.md` 看跨项目 lessons。
 ```
 
 **Telegram(M1+)**:配过 token 后,在 telegram 给 bot 发"做个 X" → bot 自动 `ccteam new`;团队卡住或交付时 bot 推送 `⚠️ X 卡住了,需决策` / `✅ X 已交付`。
