@@ -225,8 +225,8 @@ ls /home/<you>/.claude/projects/-<sluggified-cwd>/*.jsonl
 - **Telegram bot 入口**:M1
 - **`ccteam-control` skill / `ccteam-mcp` MCP server**:M1 / M2(让用户在自带 claude 里用对话方式调度 ccteam)
 - **Seed phase + REJECT/CLARIFY**:M2
-- **跨项目记忆 + RAG**:M3
-- **Critic agent + score**:M4
+- **跨项目记忆**:M4(走官方 `~/.claude/CLAUDE.md` + `~/.claude/rules/ccteam-lessons-<team>.md` + per-repo auto-memory + 可选 claude-mem;不自建索引)
+- **Critic agent**:M5(score 已删除,软质量交给 critic_dimensions 数据驱动评审)
 - **`parallelism: agent_team` / `multi_session`**:M2 / M3
 
 也有几个**没 spec 的小尾巴**应该排进 backlog:

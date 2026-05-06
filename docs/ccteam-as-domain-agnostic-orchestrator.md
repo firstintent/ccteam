@@ -110,7 +110,7 @@
 
 | 文件 / 路径 | 归类 | 论证 |
 |---|---|---|
-| `~/.ccteam/{inbox,queue,control,phases,progress,memory}` | 🟢 | 全局编排层布局 |
+| `~/.ccteam/{inbox,queue,control,phases,progress}` | 🟢 | 全局编排层布局(M4 后无 `memory/` — 跨项目记忆走官方 `~/.claude/CLAUDE.md` + `~/.claude/rules/`) |
 | `~/projects/<slug>/.ccteam/state.json` | 🟢 | 项目元数据 mechanism |
 | `~/projects/<slug>/.ccteam/spec.md` | 🟡 | 字段名是 mechanism;research 团队等价物可能叫 `topic.md` / `brief.md`——应在 team 配置中声明 |
 | `~/projects/<slug>/.ccteam/<phase>-report.md` | 🟢 | 命名 pattern 是 mechanism(`<phase>-report.md`);具体哪些 phase 是 🟡 |
@@ -150,17 +150,21 @@
 | `ccteam new <brief>` / `ls` / `show` / `start` / `stop` / `attach` / `peek` / `progress` / `pause` / `resume` / `answer` | 🟢 | 都是 mechanism——多一个 `--team=<name>` 参数即可泛化(详见 §3) |
 | `ccteam doctor --tool-surface`(M0.5) | 🟢 | 校验 mechanism;校验对象是 🟡 |
 | `ccteam doctor --install-recommended-agents` 的**清单** | 🟡 | dev 团队推荐 8 个 plugin agent;research 团队需另一份 |
-| `ccteam memory rebuild`(M3) | 🟢 | RAG mechanism |
+| ~~`ccteam memory rebuild`~~ | — | M4 简化后无自建索引,该命令不存在;跨项目检索走 Claude session 内官方 `/memory` + 可选 `mcp__*claude-mem*search` |
 | `ccteam fork-reply`(M1+) | 🟢 | 通用 |
 
 ### 1.9 跨项目记忆
 
+> **2026-05-06 重塑**:M4 不再自建索引/向量库,完全复用 Claude Code 官方机制。
+> 详见 `docs/tech-design.md §3.7` + `references/research/claude-code-memory-research.md` §六。
+
 | 概念 | 归类 | 论证 |
 |---|---|---|
-| `~/.ccteam/memory/{patterns,anti-patterns,index.json}` 布局 | 🟢 | 通用 |
-| pattern 文件字段(tech stack / 踩过的坑 / 成功设计 / 不要再做) | 🟡 | 当前是 dev 团队字段;mechanism 是"按 team 自定义 retro 字段" |
-| 召回触发(Seed phase RAG) | 🟢 | 通用 |
-| **跨团队记忆隔离 vs 共享**(本文档新增问题) | 🟢 | mechanism 应支持按 team namespace 隔离,默认隔离,允许配置共享(详见 §2.7) |
+| `~/.claude/projects/<encoded>/memory/` per-repo auto-memory | 🟢 | 官方机制,Claude 自主写;通用,与 ccteam-core 解耦 |
+| `~/.claude/rules/ccteam-lessons-<team>.md` 跨项目共享 | 🟢 | 通用机制(rules + `paths:` frontmatter scope);ccteam doctor `--install-memory-bridge` 占位,retro phase 写 marked section |
+| `team.yaml.retro_schema[]` 字段定义 | 🟡 | 当前 dev 已填 4 字段,product-research M4.1 必须补;mechanism 是"按 team 定义 retro 字段段落" |
+| 召回触发(Seed/verdict phase 启动时官方机制自动注入 rules + 可选 `mcp__*claude-mem*search`) | 🟢 | 通用,LLM 自看 tool surface 决定调不调 claude-mem |
+| **跨团队记忆隔离 vs 共享**(本文档新增问题) | 🟢 | rules 文件按 team 分名 + `paths:` frontmatter 按项目目录前缀 scope 实现隔离 |
 
 ---
 
@@ -353,7 +357,8 @@ on_loop_exhaust: escalate                 # §2.5
 recommended_agents: [...]                 # §2.6
 recommended_skills: [...]
 recommended_mcp: [...]
-memory_namespace: team_only               # §2.7
+# M4 走官方 ~/.claude/rules/ + per-repo auto-memory,无 memory_namespace 字段;
+# 跨项目隔离通过 rules 文件按 team 分名 + paths: frontmatter scope 项目目录前缀实现。
 retro_schema:                             # §2.7
   - field: methodology_used
     type: text
@@ -423,8 +428,9 @@ danger_command_patterns:                  # 替代 dev 的 git push 拦截
 ### 3.7 不替领域定记忆字段
 
 - ❌ 不在 `ccteam-core` 假设 retro 含 "tech stack" / "踩过的坑"。
-- ✅ team 配置 `retro_schema[]` 决定字段;RAG 索引按 schema 类型决定做向量化
-  vs 关键字索引。
+- ✅ team 配置 `retro_schema[]` 决定字段;M4.1 retro phase prompt 按 schema 字段
+  生成段落,写入 `~/.claude/rules/ccteam-lessons-<team>.md` marked section
+  (M4 走官方 rules 机制,不做向量化也不建索引;详见 tech-design §3.7)。
 
 ---
 
@@ -566,8 +572,8 @@ team 抽象只会让两件事都做不好。
 
 ### 6.3 为什么不更晚?
 
-- **M4 跨项目记忆的 retro_schema** 必须从 day 1 团队感知,否则 RAG 索引重建代价高
-  (audit F20 P0)。
+- **M4 跨项目记忆的 retro_schema** 必须从 day 1 团队感知,否则跨项目 lessons
+  字段段落布局重写代价高(audit F20 P0)。
 - **M5 Critic 的 critic_dimensions** 必须从 day 1 数据驱动,否则 anti-leniency 算法
   写死 dev 6 维,M6 Symphony 多团队协作时返工(§2.3 invariant 1)。
 - 这两条都把 team 抽象推到 M4 / M5 **之前**——即 M3。
@@ -616,34 +622,34 @@ ccteam-control skill。差别只在生命周期(永不 terminal)与行为模式(
 | inbox/outbox 文件协议 | meta-agent 与 channel layer / 项目 session 之间的接入面 | **M1.1**(改) |
 | `ccteam-control` skill | meta-agent 调用 ccteam CLI 的"指挥棒" | M1.8 |
 | `ccteam-mcp` MCP server | meta-agent 派单的结构化控制面(替代 shell parse) | M2.8 |
-| 跨项目记忆 RAG / claude-mem MCP | meta-agent "上次相似项目"的长期记忆(项目级) | M4(记忆里程碑;reorder 后) |
-| meta-agent conversation log | meta-agent 对话历史的 reset 桥接 | M4.6(新加;见 §7.2.1) |
+| 跨项目 lessons via `~/.claude/rules/ccteam-lessons-<team>.md` + auto-memory(claude-mem 可选) | meta-agent "上次相似项目"的长期记忆(项目级) | M4(走官方机制,reorder + 2026-05-06 简化后) |
+| meta-agent conversation 续航 | meta-agent 对话历史的 reset 桥接 | M4 主路径(`~/.claude/rules/ccteam-lessons-<user>-meta.md` 滚动累积 + auto-memory;无独立 conversation-log) |
 | Channel adapters | meta-agent 跨设备 / 跨平台的输入输出代理 | M2+(优先复用开源) |
 | 长 tmux session per project | dev / research / ... 团队的"高密度施工工地" | M0.7 |
 | 团队抽象(`team.yaml` + `--team` CLI) | meta-agent 派单时选择"派给哪支团队" | M3(本文档对应里程碑) |
 
 **结论**:M1.0 + M1.1(meta-agent + 协议)+ M2.8(`ccteam-mcp`)+ M3(团队抽象)+
-M4(跨项目记忆 + conversation continuity)五件齐备,meta-agent pattern 完整。
+M4(跨项目记忆走官方 rules + auto-memory + 可选 claude-mem)五件齐备,meta-agent pattern 完整。
 
 ### 7.2 三块 ccteam 现状没显式覆盖的新机制
 
 #### 7.2.1 conversation continuity — meta-agent 的"上次我们聊过"
 
-跨项目记忆(M4)的语义是**项目级**的(已 ship 项目的 retro / pattern / anti-pattern)。
+跨项目记忆(M4)的语义是**项目级**的(已 ship 项目的 retro lessons)。
 但 meta-agent 跟用户的**对话历史**(讨论但还没派单的想法、被拒绝的方向、用户偏好)
-没有现成存放位置。
+也吃同一套官方机制 — 不需要独立 conversation-log.md 设计。
 
-**候选解法**(M4 实现 RAG 时一并考虑):
+**M4 主路径方案**(2026-05-06 简化后):
 
-- **(a) `~/projects/<user>-meta/.ccteam/conversation-log.md`** —— 滚动 markdown,
-  meta-agent session 启动时加载,phase context 接近 60% 时压缩为摘要 → 重启
-  session 桥接。沿用项目 session 的 context reset 机制(§6.9)
-- **(b) `claude-mem` MCP 在 user namespace** —— RAG index 加一个 `user/` 命名空间,
-  专门存 meta-agent 对话摘要。每轮对话结束后 meta-agent 主动写一条 summary
-- **(c) 两者结合**:`conversation-log.md` 是 hot path(当前会话内可读),
-  `claude-mem` user namespace 是 cold storage(reset 后召回历史摘要)
+- **官方 auto-memory 自动捕获**:meta-agent session 也是 ccteam-managed Claude Code session,
+  `~/.claude/projects/<meta-encoded>/memory/` 由 Claude 自主累积偏好 / 决策 / 拒绝过的方向
+- **跨用户对话累积**:`~/.claude/rules/ccteam-lessons-<user>-meta.md`(同 dev / product-research
+  团队同样的 rules 机制,但 namespace 是 `<user>-meta`)。retro 触发时机由 meta-agent
+  对话流自决(可由 phase prompt 引导,例如"对话进入新主题前总结上一段")
+- **可选**:用户装了 claude-mem,自动 5-hook 捕获就把 meta-agent 对话也覆盖了
 
-**M4.6 实施时挑一个**(推荐 (c) 组合方案,因为分别覆盖 hot / cold 路径)。
+不需要 `conversation-log.md` 滚动文件,不需要 60% 阈值压缩 — 都被官方机制取代。
+context reset 时官方机制会重新加载 rules,无独立桥接代码。
 
 #### 7.2.2 dispatch protocol — meta-agent 该怎么派单
 
@@ -715,7 +721,7 @@ prompt,而不是适配器代码。
 | **M1** | meta-agent session 上线(M1.0)+ inbox/outbox 协议加固(M1.1)+ ccteam-control skill 装好(M1.8)→ **终端 attach 即可 NL 对话**,无 channel 也能跑 |
 | M2 | `ccteam-mcp` MCP server + Channel adapter(Telegram 优先,复用开源)→ meta-agent 有结构化派单工具 + 移动端 NL 通道 |
 | M3 | 团队抽象上线 → meta-agent 派单时能选 `--team`(dev / research / ...) |
-| M4 | 跨项目记忆 + conversation continuity(M4.6)→ meta-agent 有完整 hot+cold 记忆 |
+| M4 | 跨项目 lessons via `~/.claude/rules/ccteam-lessons-<team>.md` + per-repo auto-memory(meta-agent 同享) → 完整跨项目记忆,ccteam-core 零检索代码 |
 | M5+ | 多团队协作(research → dev pipeline)+ 多 channel 收敛 → meta-agent 编排跨团队工作流,跨设备访问 |
 
 ---

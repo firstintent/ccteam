@@ -39,10 +39,8 @@
 │   ├── review-with-user-loop.md
 │   └── kickoff-reverse-interview.md
 ├── control/               # 用户 → orchestrator 控制信号(详见 §3.3)
-├── memory/                # 跨项目记忆(M3+)
-│   ├── patterns/
-│   ├── anti-patterns/
-│   └── index.json         # RAG 索引元数据
+# 跨项目记忆走官方 ~/.claude/CLAUDE.md + ~/.claude/rules/ + per-repo auto-memory(M4),
+# 不在 ~/.ccteam/ 下;详见 tech-design §3.7。
 ├── progress/
 │   └── <slug>.jsonl       # 每项目一个事件流(hooks 写,inotify 监听;详见 §4)
 ├── log/
@@ -402,7 +400,7 @@ interfaces §3.4.3"。具体写哪些事件:
 
 - **orchestrator**:`inotify` 监听末尾,做状态转移与 stall 检测
 - **用户 dashboard pane**:`tail -f progress/<slug>.jsonl | jq -c '.event + ":" + (.tool // .note // "")'`
-- **retro phase**(M3):作为项目历史输入
+- **retro phase**(M4;改造现有 ship.md / verdict.md inline retro 段):作为项目历史输入,通过 Claude session `/memory` + `Edit ~/.claude/rules/ccteam-lessons-<team>.md` 写入
 
 ### 4.4 Stream-json 归档(可选)
 
@@ -626,7 +624,7 @@ retro_schema:
 **校验**(`TeamSpec::validate` 在 parse 时执行):
 - `name` 非空,只允许 ascii 小写 / 数字 / `-` / `_`
 - `phase_dir` 非空、相对路径、不含 `..`
-- `retro_schema[*].field` 非空,**不允许重复**(防 RAG 索引冲突)
+- `retro_schema[*].field` 非空,**不允许重复**(防 schema 字段重名 — M4.1 retro 写入跨项目 lessons 文件时按 field 名映射段落)
 - `escalate_grammar_extensions[*].prefix` 非空、唯一;
   `route: revert_to_phase` 必须带 `target_phase`
 - `golden_rules[*]` 必须 `cmd | pattern` 二选一(同 phase YAML)
@@ -1076,8 +1074,9 @@ ccteam kick <slug>                     # 软重启项目 session(claude --resume
 ### 10.6 维护
 
 ```bash
-ccteam memory ls                                  # 看跨项目记忆(M3+)
-ccteam memory rebuild                             # 重建索引
+# 跨项目记忆走 Claude session 内官方机制(M4):/memory 命令查 auto-memory,
+# 直接编辑 ~/.claude/rules/ccteam-lessons-<team>.md 看 / 改跨项目 lessons。
+# ccteam 不提供 memory 子命令(无自建索引,无东西可 rebuild)。
 ccteam config edit                                # 改全局配置
 ccteam doctor                                     # 体检:列出可用 mode flags
 ccteam doctor --install-recommended-agents        # M0.5.5 ln -sf 8 个 plugin agent
@@ -1163,8 +1162,8 @@ orchestrator 识别 `state.team == "meta-agent"` 走 `process_meta_project` 分�
 
 - 不跑 phase DAG;`current_phase` 永远空,`phase_state` 永远 `Idle`
 - 仅做 `ensure_session`(常驻 tmux)+ `process_session_inbox`(吸收外部消息)
-- context 超 60% 时仍走 `reset_context` 桥接 CLAUDE.md(M1.4),M4.6 升级为
-  完整 conversation continuity
+- context 超 60% 时仍走 `reset_context` 桥接 CLAUDE.md(M1.4);跨项目记忆走
+  M4 主路径(`~/.claude/rules/ccteam-lessons-<user>-meta.md` 滚动累积 + auto-memory)
 
 `MAX_CONCURRENT_PROJECTS = 3`(M1.2 锁定常量)只对常规项目生效;meta session
 **永远不计入并发上限**。
@@ -1218,7 +1217,7 @@ orchestrator 识别 `state.team == "meta-agent"` 走 `process_meta_project` 分�
 
 - `ccteam attach` — tty 交互,MCP 协议不适合
 - `ccteam start / stop` — orchestrator 生命周期管理是 ops 决策,不让 LLM 误调
-- `ccteam memory rebuild` — 重操作,走 CLI
+- ~~`ccteam memory rebuild`~~ — M4 简化后无自建索引,该命令不存在
 - `ccteam doctor --install-*` — 单机配置变更,走 CLI(避免 MCP server 给 LLM 改 ~/.claude.json 的能力)
 
 ### 12.4 双消费者
@@ -1240,7 +1239,8 @@ orchestrator 识别 `state.team == "meta-agent"` 走 `process_meta_project` 分�
 | `~/.ccteam/control/` | 用户 → orchestrator 控制信号(详见 §3.3) |
 | `~/.ccteam/phases/` | phase 模板(详见 §5) |
 | `~/.ccteam/templates/` | M2.4+:phase 可 @ 引用的 prompt 片段(`review-with-user-loop.md` / `kickoff-reverse-interview.md`) |
-| `~/.ccteam/memory/` | 跨项目记忆(M3+) |
+| `~/.claude/rules/ccteam-lessons-<team>.md` | 跨项目 lessons(M4 走官方 rules 机制;`<team>` ∈ {dev, product-research, ...}) |
+| `~/.claude/projects/<encoded>/memory/` | 每项目 auto-memory(官方机制,Claude 自主写) |
 | `~/.ccteam/progress/<slug>.jsonl` | 结构化事件流(详见 §4) |
 | `~/.ccteam/log/<slug>/` | stream-json 归档(可选,调试用) |
 | `~/.ccteam/tmux/<slug>.layout` | 项目 tmux pane 布局模板 |

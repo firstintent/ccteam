@@ -18,7 +18,7 @@
 | **三态 Seed Gate** | 痛点 6：不是每个想法都值得做 | 每个项目先过 PASS / REJECT / CLARIFY；REJECT 不下场，节省精力 |
 | **测试即验收** | 痛点 3：测试和质量是黑洞 | 自动化 fix loop 收敛后跑 test，全绿才标记 done；无主观 review |
 | **3-Strike 自愈再升级** | 痛点 4：bug 修复无限循环 | 失败先自己修 N 轮，撞顶才升级用户，并附"试过什么 / 卡在哪" |
-| **跨项目沉淀** | 痛点 10：每个新项目从零开始 | 全局 `~/.ccteam/memory/` + RAG 检索，新项目 Seed 阶段自动召回 |
+| **跨项目沉淀** | 痛点 10：每个新项目从零开始 | 复用官方 `~/.claude/CLAUDE.md` + `~/.claude/rules/ccteam-lessons-<team>.md` + per-repo auto-memory；retro phase 让 Claude 写，Seed/verdict phase 启动时官方机制自动注入（详见 §3.7） |
 | **零交互沙盒** | 痛点 8：每一步都点允许 | 项目级 Docker / 容器隔离 + 全放行 settings.json |
 | **决策点 ≤ 3** | 痛点 2：AI 仍要求我当 PM | 只有不可逆决策（架构、scope 大改、API 形态）才走 escalation |
 | **纵深防御替代人值守** | 痛点 11：关键节点不把控 | L1 架构约束（hooks + required_outputs）+ L2 多 agent 互检 + cross-cutting watcher（议事）+ L3 用户兜底（仅 deadlock 弹）；详见 §3.6 |
@@ -63,7 +63,9 @@
 │  │ - 常驻、永不 terminal│  │ - 每项目一条独立 tmux   │  │
 │  │ - NL 派单 / 跨项目   │  │ - 独立 progress.jsonl   │  │
 │  │   查询 / 监控         │  │ - 独立 phase DAG        │  │
-│  │ - 跨项目 RAG(M4)    │  │ - 独立 context cache    │  │
+│  │ - 跨项目 lessons     │  │ - 独立 context cache    │  │
+│  │   via ~/.claude/rules │  │                         │  │
+│  │   (M4)               │  │                         │  │
 │  │ - tmux attach 即对话 │  │ - tmux attach 即对话    │  │
 │  └──────────────────────┘  └─────────────────────────┘  │
 │                                                          │
@@ -480,8 +482,8 @@ dumb router。这条贯彻到底,避免 Symphony 多层 agent 反模式
 |---|---|---|
 | 生命周期 | 永不 terminal,跟用户 ccteam 实例同寿 | ship / abort 即终态 |
 | 行为模式 | 事件循环(等输入→处理→等输入)| phase DAG(plan-eng → ... → ship) |
-| 主要工具 | `ccteam-control` skill(M1.8)/ `ccteam-mcp`(M2.8)/ 跨项目 RAG(M4) | 项目级文件操作 / 内嵌 plugin agents(M0.5 已 ln -sf) |
-| context reset | 60% 阈值时压缩对话历史到 conversation-log.md,新 session 桥接(M4.6) | 60% 阈值时把当前 phase 进度写 CLAUDE.md(已有 M0.10) |
+| 主要工具 | `ccteam-control` skill(M1.8)/ `ccteam-mcp`(M2.8)/ 跨项目 lessons(M4 走 `~/.claude/rules/` + auto-memory)| 项目级文件操作 / 内嵌 plugin agents(M0.5 已 ln -sf) |
+| context reset | 60% 阈值时桥接 CLAUDE.md(M0.10 沿用机制);跨项目记忆通过 `~/.claude/rules/ccteam-lessons-<user>-meta.md` 滚动累积(M4 路径,无独立 conversation-log) | 60% 阈值时把当前 phase 进度写 CLAUDE.md(已有 M0.10) |
 | 用户 attach | `tmux attach -t ccteam-meta-<user>`,直接 NL 对话 | `tmux attach -t ccteam-<slug>`,可介入项目执行 |
 
 #### M0:CLI
@@ -605,7 +607,7 @@ M3 ratatui TUI 与 M4 web dashboard 的前端栈实现**直接抄** `references/
 
 - 栈与 ccteam 完全对齐:Rust + ratatui + crossterm + tokio + axum(ws)
 - 抄的范围:`Cargo.toml` dep 组合 + ratatui 主循环范式 + WebSocket bridge 实现 + 它的 `docs/guides/web-dashboard.md`
-- **不抄核心**:9-phase 编排、Seed Gate、跨项目 RAG、Defense in Depth 是 ccteam 差异化护城河,AoE 没有
+- **不抄核心**:9-phase 编排、Seed Gate、跨项目 lessons(走官方 `~/.claude/rules/` + 可选 claude-mem)、Defense in Depth 是 ccteam 差异化护城河,AoE 没有
 
 详见 development-plan M3.X / M4.X 任务说明。
 
@@ -621,7 +623,7 @@ T+0:00  bot 写 ~/.ccteam/inbox/20260504-bm.md
 T+0:30  orchestrator 轮询发现新文件 → triage → 分配 slug
 T+0:35  启动 tmux session ccteam-bookmark-mgr-a3f9 + send-keys 注入 Seed prompt
 T+1:30  Seed 输出 verdict: PASS，建议技术栈：Vite + Dexie + PWA
-T+1:35  RAG 检索 memory，召回 2 条相关项目（PWA 离线缓存模式）
+T+1:35  Seed phase 启动；~/.claude/rules/ccteam-lessons-dev.md 自动注入（含 PWA 离线缓存 lessons）+ auto-memory 加载
 T+1:35  写 spec.md 合并，进入 Plan phase
 T+3:00  plan-ceo + plan-eng 完成
 T+3:00  Implement phase 启动（agent team: backend-dev + frontend-dev）
@@ -630,7 +632,7 @@ T+25:30 test-author phase 编测试
 T+30:00 test-run phase 全绿 → review
 T+33:00 review approved
 T+33:30 score phase（M2+）→ ship phase
-T+34:00 git tag v0.1.0，写 retro.md，更新 memory
+T+34:00 git tag v0.1.0；ship phase inline retro：Claude 调 /memory 写本仓 auto-memory + Edit ~/.claude/rules/ccteam-lessons-dev.md（marked section）
 T+34:00 telegram 推送：✅ bookmark-mgr 已交付，36/36 测试通过
 ```
 
@@ -924,7 +926,7 @@ orchestrator 在 plan phase 后写入：
 - 不要修改 .ccteam/ 之外的元数据
 - 不要碰其他项目目录
 
-## 跨项目经验（来自 ~/.ccteam/memory/）
+## 跨项目经验（来自 ~/.claude/rules/ccteam-lessons-<team>.md 自动注入 + per-repo auto-memory）
 {{ 召回的 top-3 patterns 摘要 }}
 ```
 
