@@ -33,6 +33,15 @@ golden_rules: []
 # both leave critic_dimensions empty until M5 wires the Critic loop.
 critic_dimensions: []
 
-# Retro phase fields. Empty disables retro emission for this team.
-# product-research retros are not yet defined; M4.1 may revise.
-retro_schema: []
+# Retro fields the M4.1 retro phase emits per product-research project
+# (REJECT branch only — PASS / CONCERN hand off to dev without producing a
+# product-research-side retro entry; the dev project's own retro covers it).
+retro_schema:
+  - field: market_signals
+    description: Top market signals collected (demand, saturation, pricing)
+  - field: differentiation_findings
+    description: Unique angles found / ruled out
+  - field: feasibility_assessment
+    description: Tech / business feasibility verdict
+  - field: verdict_rationale
+    description: Why this verdict (PASS / CONCERN / REJECT / CLARIFY)

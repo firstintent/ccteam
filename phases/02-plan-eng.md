@@ -18,6 +18,19 @@ max_clarify_rounds: 3
 ccteam 是**高质量软件元开发系统**,不是"凑合能跑就行"的玩具——这个阶段
 的产出会直接驱动后续 implement / test / fix。规划质量决定终产物质量。
 
+## 跨项目经验(开始规划前先看)
+
+`~/.claude/rules/ccteam-lessons-dev.md` 在 session 启动时已自动加载到上下文。
+**先扫一遍**,尤其 `do_not_do_again` 段——别把上一个项目踩过的坑当成新发现重新来一遍。
+
+需要深挖某个 topic 时:
+- `/memory` 浏览本仓 auto-memory
+- `Read ~/.claude/projects/<encoded>/memory/<topic>.md` 直接读 topic 文件
+
+**可选**:如果工具列表里出现 `mcp__*claude-mem*search` 之类工具(用户装了
+[claude-mem](https://github.com/thedotmack/claude-mem)),可以调它做跨项目语义检索;
+没有就跳过,默认机制已够用。
+
 ## 输入
 
 - `@.ccteam/spec.md` —— 用户原始需求

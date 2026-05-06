@@ -148,6 +148,13 @@ enum Command {
         /// any prior `ccteam` server entry but preserves other servers.
         #[arg(long, default_value_t = false)]
         install_mcp: bool,
+        /// M4.2: write `~/.claude/rules/ccteam-lessons-{dev,product-research}.md`
+        /// with `<!-- ccteam-managed:lessons begin/end -->` markers + `paths:`
+        /// frontmatter scope. Idempotent — re-runs no-op when markers are
+        /// intact, repair (single canonical block at end-of-file) when not.
+        /// User content outside markers is preserved.
+        #[arg(long, default_value_t = false)]
+        install_memory_bridge: bool,
     },
 }
 
@@ -228,6 +235,7 @@ fn main() -> Result<()> {
             install_skill,
             install_meta_agent,
             install_mcp,
+            install_memory_bridge,
         } => run_doctor(commands::DoctorOptions {
             install_recommended_agents,
             dry_run,
@@ -236,6 +244,7 @@ fn main() -> Result<()> {
             install_skill,
             install_meta_agent,
             install_mcp,
+            install_memory_bridge,
         }),
     }
 }
