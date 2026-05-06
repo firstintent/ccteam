@@ -990,28 +990,44 @@ pub fn collect_recent_events(
     Ok(all)
 }
 
+/// Collect every `.md` artifact under `<project>/.ccteam/` so non-dev
+/// teams (e.g. product-research with `verdict.md` / `rationale.md` /
+/// `next-steps.md` / `brief.md` / `market-survey.md`) get listed in
+/// `ccteam show <slug> --format json` without ccteam-cli holding a
+/// per-team artifact whitelist (F8 fix, 2026-05-07).
+///
+/// Key = file stem with `-` → `_` (e.g. `plan-eng.md` → `plan_eng`)
+/// so existing JSON consumers (the meta-agent dispatch tree, the
+/// ccteam-control skill) keep working without a schema migration.
+/// Sub-directories under `.ccteam/` (e.g. `outbox/`, `inbox/`) are
+/// not enumerated — those have dedicated views.
+///
+/// `auto-loop.state.md` is the orchestrator's runtime state file
+/// (formerly `fix-loop.state.md`); excluded from artifact reporting.
 fn collect_artifacts(paths: &CcteamPaths, slug: &str) -> Map<String, Value> {
     let mut m = Map::new();
     let ccteam_dir = paths.project_ccteam_dir(slug);
-    for known in [
-        ("spec", "spec.md"),
-        ("plan_eng", "plan-eng.md"),
-        ("plan_ceo", "plan-ceo.md"),
-        ("architecture", "architecture.md"),
-        ("implement_report", "implement-report.md"),
-        ("test_report", "test-report.md"),
-        ("fix_report", "fix-report.md"),
-        ("review_report", "review-report.md"),
-        ("retro", "retro.md"),
-        ("escalation", "escalation.md"),
-    ] {
-        let path = ccteam_dir.join(known.1);
-        if path.exists() {
-            m.insert(
-                known.0.into(),
-                Value::String(format!(".ccteam/{}", known.1)),
-            );
+    let Ok(entries) = std::fs::read_dir(&ccteam_dir) else {
+        return m;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
         }
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".md") {
+            continue;
+        }
+        // Skip orchestrator-internal runtime state files.
+        if name == "auto-loop.state.md" || name == "fix-loop.state.md" {
+            continue;
+        }
+        let stem = name.trim_end_matches(".md");
+        let key = stem.replace('-', "_");
+        m.insert(key, Value::String(format!(".ccteam/{name}")));
     }
     m
 }
@@ -1102,7 +1118,7 @@ fn render_show_text(
     ));
     out.push_str(&format!(
         "fix cycle      : {}\n",
-        state.fix_cycle_count
+        state.auto_loop_cycle_count
     ));
     out.push_str("\nphase history:\n");
     if state.phase_history.is_empty() {
@@ -1156,7 +1172,7 @@ fn phase_state_str(s: &PhaseState) -> &'static str {
     match s {
         PhaseState::InFlight => "in_flight",
         PhaseState::Idle => "idle",
-        PhaseState::FixLocked => "fix_locked",
+        PhaseState::AutoLocked => "fix_locked",
         PhaseState::DonePending { .. } => "done_pending",
     }
 }
@@ -1327,7 +1343,7 @@ mod tests {
             "current_phase": "",
             "parallelism": "solo",
             "phase_history": [],
-            "fix_cycle_count": 0,
+            "auto_loop_cycle_count": 0,
             "cost_used_usd": 0.0,
             "soft_warn_threshold_usd": 20.0,
             "hard_kill_threshold_usd": 200.0,
