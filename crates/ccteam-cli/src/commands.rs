@@ -588,6 +588,8 @@ pub struct DoctorOptions {
     pub install_meta_agent: Option<String>,
     /// M2.5: register `mcpServers.ccteam` in `~/.claude.json`.
     pub install_mcp: bool,
+    /// M4.2: install `~/.claude/rules/ccteam-lessons-<team>.md` placeholders.
+    pub install_memory_bridge: bool,
 }
 
 /// `ccteam doctor` dispatch. Returns a human-readable report so unit
@@ -597,7 +599,8 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
         || opts.tool_surface
         || opts.install_skill
         || opts.install_meta_agent.is_some()
-        || opts.install_mcp;
+        || opts.install_mcp
+        || opts.install_memory_bridge;
     if !any_mode {
         return Ok(String::from(
             "ccteam doctor: pass at least one mode flag.\n\
@@ -612,7 +615,9 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
              --install-meta-agent <user-handle>\n      \
              bootstrap a meta-agent project for the given user (M1.0). Implies --install-skill.\n  \
              --install-mcp\n      \
-             register `mcpServers.ccteam` in ~/.claude.json so daily-driver claude + meta-agent see the 9-tool MCP server (M2.5).\n",
+             register `mcpServers.ccteam` in ~/.claude.json so daily-driver claude + meta-agent see the 9-tool MCP server (M2.5).\n  \
+             --install-memory-bridge [--dry-run]\n      \
+             write ~/.claude/rules/ccteam-lessons-{dev,product-research}.md placeholders so the retro phase has somewhere to Edit cross-project lessons into (M4.2).\n",
         ));
     }
     let mut out = String::new();
@@ -634,6 +639,44 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
     if opts.install_mcp {
         out.push_str(&render_install_mcp_report()?);
     }
+    if opts.install_memory_bridge {
+        out.push_str(&render_install_memory_bridge_report(&opts)?);
+    }
+    Ok(out)
+}
+
+fn render_install_memory_bridge_report(opts: &DoctorOptions) -> Result<String> {
+    let install_opts = ccteam_core::InstallMemoryBridgeOptions {
+        dry_run: opts.dry_run,
+    };
+    let reports = ccteam_core::install_memory_bridge(install_opts)?;
+    let mut out = if opts.dry_run {
+        String::from("ccteam doctor --install-memory-bridge (dry-run)\n\n")
+    } else {
+        String::from("ccteam doctor --install-memory-bridge\n\n")
+    };
+    for r in &reports {
+        let label = match &r.action {
+            ccteam_core::MemoryBridgeAction::Wrote => "wrote",
+            ccteam_core::MemoryBridgeAction::AlreadyPresent => "already-present",
+            ccteam_core::MemoryBridgeAction::RepairedMarkedSection => "repaired",
+            ccteam_core::MemoryBridgeAction::DryRun { would_write: true } => "would write",
+            ccteam_core::MemoryBridgeAction::DryRun { would_write: false } => {
+                "no-op (already present)"
+            }
+        };
+        out.push_str(&format!(
+            "  {:<24} {:<24} {}\n",
+            r.team,
+            label,
+            r.target.display(),
+        ));
+    }
+    out.push('\n');
+    out.push_str(
+        "rules files auto-load into every Claude Code session whose cwd matches the\n\
+         `paths:` frontmatter; the retro phase Edits the marked block on project end.\n",
+    );
     Ok(out)
 }
 
@@ -1492,6 +1535,31 @@ mod tests {
         assert!(body.contains("tool-surface"));
         assert!(body.contains("install-skill"));
         assert!(body.contains("install-meta-agent"));
+        assert!(body.contains("install-memory-bridge"));
+    }
+
+    #[test]
+    fn run_doctor_install_memory_bridge_writes_both_team_files() {
+        ensure_isolation();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        std::env::set_var("CLAUDE_CONFIG_HOME", tmp.path().to_str().unwrap());
+
+        let opts = DoctorOptions {
+            install_memory_bridge: true,
+            ..DoctorOptions::default()
+        };
+        let report = run_doctor(&paths, opts).unwrap();
+        assert!(report.contains("install-memory-bridge"));
+        assert!(report.contains("dev"));
+        assert!(report.contains("product-research"));
+
+        let dev_path = tmp.path().join("rules/ccteam-lessons-dev.md");
+        let pr_path = tmp.path().join("rules/ccteam-lessons-product-research.md");
+        assert!(dev_path.is_file(), "dev lessons not written");
+        assert!(pr_path.is_file(), "product-research lessons not written");
+
+        std::env::remove_var("CLAUDE_CONFIG_HOME");
     }
 
     #[test]

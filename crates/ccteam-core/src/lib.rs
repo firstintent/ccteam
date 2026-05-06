@@ -10,6 +10,7 @@ pub mod golden_rules;
 pub mod inbox;
 pub mod meta_agent;
 pub mod orchestrator;
+pub mod memory_bridge;
 pub mod skill;
 pub mod paths;
 pub mod phases;
@@ -37,6 +38,10 @@ pub use inbox::{
 pub use meta_agent::{
     bootstrap_meta_project, meta_session_name, meta_slug, render_meta_role_prompt,
     MetaBootstrapReport, META_SESSION_PREFIX, META_TEAM_NAME,
+};
+pub use memory_bridge::{
+    install_into as install_memory_bridge_into, install_memory_bridge,
+    InstallMemoryBridgeOptions, MemoryBridgeAction, MemoryBridgeReport,
 };
 pub use skill::{
     install_ccteam_control_skill, install_into as install_skill_into,
