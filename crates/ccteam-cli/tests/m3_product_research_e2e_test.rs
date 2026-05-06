@@ -48,7 +48,7 @@ fn setup_product_research(
 ) -> (String, Orchestrator) {
     isolation();
     write_all_global_team_templates(&paths.root, false).unwrap();
-    let slug = pick_unused_slug(paths, brief).unwrap();
+    let slug = pick_unused_slug(paths, brief, "product-research").unwrap();
     bootstrap_project(paths, &slug, brief, "product-research").unwrap();
     let orch =
         Orchestrator::new(paths.clone(), OrchestratorConfig::default()).unwrap();

@@ -51,10 +51,16 @@
     └── orchestrator.json  # orchestrator 自身 in-memory 状态的快照
 ```
 
-### 1.2 项目级目录(`~/projects/<slug>/`)
+### 1.2 项目级目录(`~/projects/<team>-<slug>/`)
+
+> **2026-05-06 F22**:项目目录现在带 `<team>-` 前缀(如 `~/projects/dev-todo-cli/`、
+> `~/projects/product-research-ai-recipe/`),让 `~/.claude/rules/ccteam-lessons-<team>.md`
+> 的 `paths: ~/projects/<team>-*` frontmatter 在 phase Claude session 启动时正确匹配。
+> meta-agent 项目仍走 `<handle>-meta` 后缀约定(rules 不 scope 到 meta)。
+> 历史项目目录(F22 之前创建)保持原名,通过 state.json `team` 字段识别身份。
 
 ```
-~/projects/<slug>/
+~/projects/<team>-<slug>/
 ├── src/                          # 实际代码
 ├── tests/
 ├── package.json / pyproject.toml
@@ -1245,8 +1251,8 @@ orchestrator 识别 `state.team == "meta-agent"` 走 `process_meta_project` 分�
 | `~/.ccteam/log/<slug>/` | stream-json 归档(可选,调试用) |
 | `~/.ccteam/tmux/<slug>.layout` | 项目 tmux pane 布局模板 |
 | `~/.ccteam/state/orchestrator.json` | orchestrator 自身快照 |
-| `~/projects/<slug>/.ccteam/` | 项目元数据(详见 §1.2) |
-| `~/projects/<slug>/CLAUDE.md` | 自动生成的项目运营手册 |
+| `~/projects/<team>-<slug>/.ccteam/` | 项目元数据(详见 §1.2;F22 后带 team 前缀) |
+| `~/projects/<team>-<slug>/CLAUDE.md` | 自动生成的项目运营手册 |
 | `~/projects/<slug>/.claude/settings.json` | 项目级 Claude Code 配置(详见 §6.1) |
 | `~/projects/<slug>/.ccteam/sub-modules/<name>/` | multi-session 子模块元数据(M3+;详见 §1.3) |
 

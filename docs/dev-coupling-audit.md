@@ -23,15 +23,15 @@
 ## 摘要
 
 23 条发现(2026-05-05 加 F21、升级 F20 P1→P0,共增 1 条;2026-05-06 修复 F21;
-2026-05-06 M4.4 spike 加 F22 P0 + F23 P1 conditional),分布:
+2026-05-06 M4.4 spike 加 F22 P0 + F23 P1 conditional;2026-05-06 修复 F22),分布:
 
 | 优先级 | 数量 | 编号 |
 |---|---|---|
-| **P0 阻塞泛化** | 8 | F1, F2, F3, F4, F12, F13, F20(2026-05-05 升级), F22(2026-05-06 M4.4 spike) |
+| **P0 阻塞泛化** | 7 | F1, F2, F3, F4, F12, F13, F20(2026-05-05 升级) |
 | **P1 该做但可后置** | 10 | F5, F6, F7, F8, F9, F10, F11, F15, F19, F23(conditional) |
 | **P2 边角** | 3 | F16, F17, F18 |
 | **N/A 已是领域无关** | 1 | F14 |
-| **已修复** | 1 | F21(@a5fb21d) |
+| **已修复** | 2 | F21(@a5fb21d)、F22(2026-05-06 follow-up PR) |
 
 **P0 关键路径**:F1(`auto_loop` 字段)+ F2(DAG 由 phase 模板推断)+ F3
 (`FIRST_PHASE` 改 DAG entry node)+ F4(`is_terminal` 改 DAG 终点判断)+
@@ -391,37 +391,25 @@ change。按 CLAUDE.md §五.3 "不写 backwards-compat shim",直接换。
   里、orchestrator 假装支持(没崩),但实际行为不一致。常规审计扫现状代码
   vs 文档断言,容易漏掉这种"文档说有、代码静默忽略"的隐性债
 
-### F22 — 项目 slug 缺 team 前缀,导致 `~/.claude/rules/*.md` `paths:` scope 失效(2026-05-06 加,M4.4 spike 发现)
+### F22 — 项目 slug 缺 team 前缀,导致 `~/.claude/rules/*.md` `paths:` scope 失效(**已修复:2026-05-06 follow-up PR**)
 
-- **文件:行号**:`crates/ccteam-core/src/projects.rs:70` `pick_unused_slug` /
-  `crates/ccteam-core/src/projects.rs:96` `bootstrap_project`
-- **现状**:`ccteam new --team=dev "X"` 产出 `~/projects/<slug>/`,**slug 不带
-  team 前缀**;但 M4.2 安装的 `~/.claude/rules/ccteam-lessons-dev.md` frontmatter
-  写 `paths: [~/projects/dev-*]`,Claude Code 按 cwd 匹配 → 当前所有 dev 项目
-  都不在 `dev-*` 名下 → rules 文件对真正想读它的 phase session 不可见
-- **是否真 dev-specific**:**否——是协议约定缺失。** 已有先例:meta-agent 项目
-  通过 `bootstrap_meta_project` 写 `<handle>-meta` 后缀;非 meta 项目应同样
-  prefix `<team>-<slug>`
-- **解耦方案**:
-  1. `pick_unused_slug` 加 `team: &str` 参数,return `format!("{team}-{base}")`
-  2. `bootstrap_project` 调用方传 team
-  3. `interfaces.md` 项目目录约定段落同步("ccteam project dirs follow
-     `~/projects/<team>-<slug>/`")
-  4. 不写"老 slug 兼容"shim:M4 之前的项目 state.json 已记录 team,但目录
-     名不变;新建项目走新规则,doctor 不迁移历史(CLAUDE.md §五.3
-     "不写 backwards-compat shim")
-- **优先级**:**P0**——M4 主路径(rules 自动加载到 phase Claude)依赖此;
-  本 M4 PR 只发现不修(slug 是协议,改它需要同步 interfaces.md +
-  state.json 路径解析,跨 PR scope)
+- **文件:行号**:`crates/ccteam-core/src/projects.rs::pick_unused_slug` 现接受
+  `team: &str` 参数;`crates/ccteam-cli/src/commands.rs::run_new` + `mcp_serve.rs::handle_new`
+  调用点更新
+- **修复**:`pick_unused_slug` 产出 `<team>-<base>`(collision 时 `<team>-<base>-<suffix>`);
+  meta-agent 走自己的 `meta_slug(handle)` → `<handle>-meta`,不动
+- **何为 fix-the-fix**:`interfaces.md §1.2` 项目目录约定改为 `~/projects/<team>-<slug>/`;
+  M4.4 spike report §3 改 closed,§4 deferred check 解锁
+- **migration**:历史项目目录(F22 前创建)保留原名;orchestrator 通过 state.json
+  `team` 字段识别身份,目录名只是路径方便。新建项目走新规则。
 - **来源**:`docs/m4-spike-2026-05-06.md` §3
-- **下一步**:独立 PR 修(优先于 §4 deferred check 重跑)
 
 ### F23 — 容器 bind-mount `~/.claude/rules/` 待 M4.4 spike §4 重跑后定夺(2026-05-06 加)
 
 - **文件:行号**:N/A(未发现现状代码缺陷,**待 spike 验证**)
 - **现状**:M4.4 §4 deferred 检查"`--dangerously-skip-permissions` 容器
-  里 `~/.claude/rules/*.md` 是否被 Claude Code 当做 context 注入"——F22 修好之前
-  无法跑,所以是潜在隐患而非确认问题
+  里 `~/.claude/rules/*.md` 是否被 Claude Code 当做 context 注入"——**F22 修复后
+  spike 已解锁**,等谁跑一次就能定夺(F23 → P0 / 关闭)
 - **是否真 dev-specific**:**否——是基础设施层。**
 - **解耦方案**(若 spike 失败):doctor 加 `--bind-mount-claude-rules`
   子模式(往容器配置追加只读 mount),sketch 见

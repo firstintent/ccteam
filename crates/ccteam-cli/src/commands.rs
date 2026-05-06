@@ -140,7 +140,7 @@ pub fn run_new(paths: &CcteamPaths, request: &str, team: &str) -> Result<String>
         bail!("ccteam new: --team must be non-empty");
     }
     ensure_team_resolvable(paths, team)?;
-    let slug = pick_unused_slug(paths, request)?;
+    let slug = pick_unused_slug(paths, request, team)?;
     bootstrap_project(paths, &slug, request, team)?;
     Ok(slug)
 }
@@ -1216,7 +1216,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
         let slug = run_new(&paths, "Build a bookmark manager", "dev").unwrap();
-        assert!(slug.starts_with("build-a-bookmark-manager"));
+        // F22: slug now carries the team prefix so ~/.claude/rules/ccteam-lessons-dev.md
+        // `paths: ~/projects/dev-*` matches at session start.
+        assert!(slug.starts_with("dev-build-a-bookmark-manager"));
         let project = paths.project_dir(&slug);
         assert!(project.join(".ccteam/spec.md").exists());
         assert!(project.join(".ccteam/state.json").exists());
