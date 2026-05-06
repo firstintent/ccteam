@@ -212,4 +212,7 @@ M0 完整任务清单见 `docs/development-plan.md` §2(任务编号 M0.1–M0.1
 - **env-mutating 测试放 `crates/*/tests/*.rs` integration(各独立进程),不放 lib `#[cfg(test)] mod tests`**——同 binary 内其他测试读 env 会 race;`std::sync::Mutex` 只锁住本测试组,保不住没锁的 sibling
 - **多 session 并行编辑同一仓库**:主仓工作树绑定一个 session,并行用 `git worktree add -b <branch> /tmp/<name> main` 起独立工作树,完事 `git worktree remove`;主仓的 branch / dirty 状态不被打扰
 - **跨 session 协作时见到主仓 dirty 状态**:先 `git stash push -m "<owner-session> WIP"` 标清楚再切分支,切回原 session 时各自认领自己的 stash;别盲目 `git checkout -- .` 破坏对方进度
+- **M4 跨项目记忆 → ccteam-core 零检索代码**:全部经 Claude session 内官方接口(`/memory` / `Edit ~/.claude/rules/...`)完成,不写程序读 memory 文件;主路径走官方 `~/.claude/CLAUDE.md` + `~/.claude/rules/*.md` + per-repo auto-memory(详见 tech-design §3.7)
+- **claude-mem 是严格可选增强**:ccteam 不写检测/集成代码,phase prompt 写 conditional "如有 `mcp__*claude-mem*search` 工具则可调",**LLM 自看 tool surface 决定**;用户没装则 100% 走默认路径
+- **retro 写 `~/.claude/rules/ccteam-lessons-<team>.md` 必须限 marked section**:`<!-- ccteam-managed:lessons begin/end -->` 包裹,不污染用户其他段;phase prompt 严格约束,doctor `--install-memory-bridge` 只重写自己段(幂等)
 - **本文件不超过 250 行**——CLAUDE.md 越长 cache 越贵,Claude 越忽略(最佳实践 §4.1 + §8「over-specified CLAUDE.md」)

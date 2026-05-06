@@ -409,31 +409,43 @@ L1 → L2 → L3，不并联。L2 启动前 L1 已通过；L3 启动前 L2 已�
 
 ### 3.7 Cross-project Memory（差异化护城河）
 
-**目录布局**：
-```
-~/.ccteam/memory/
-├── patterns/
-│   ├── 2026-04-12-clipcache-fastapi-tdd.md
-│   ├── 2026-04-15-bookmark-mgr-pwa-offline.md
-│   └── ...
-├── anti-patterns/
-│   └── 2026-04-20-failed-ai-recipe-app.md  # REJECT 案例
-└── index.json                                # RAG 索引元数据
-```
+> **2026-05-06 重大重塑**:放弃自建索引/向量库,主路径完全复用 Claude Code 官方
+> 记忆机制(`~/.claude/CLAUDE.md` + `~/.claude/rules/*.md` + per-repo auto-memory),
+> **检索发生在 Claude session 内部,ccteam-core 零 memory 检索代码**。决策依据见
+> `references/research/claude-code-memory-research.md` 末尾「M4 决策依据」节;
+> 官方文档 https://code.claude.com/docs/en/memory。
 
-**写入时机**：
-- 每个项目终态（shipped / rejected / escalated）触发 retro phase
-- retro phase 让 Claude Code 读项目全历史 + scorecard，产出一份 pattern.md
-- 关键字段：tech stack、踩过的坑、成功的设计选择、不要再做的事
+**两条共享通道(官方 first-class 机制)**:
 
-**召回时机**：
-- Seed phase 启动时，先 RAG 检索 memory（按 spec.md 的 embedding）
-- 召回的 top-k 作为 prompt 上下文注入
-- 命中相似失败项目 → Seed 倾向于 REJECT 或 CLARIFY
+| 通道 | 路径 | 加载方式 | ccteam 用法 |
+|---|---|---|---|
+| 项目内累积 | `~/.claude/projects/<encoded>/memory/MEMORY.md` + topic 文件 | 每 session 启动加载前 200 行 / 25KB,topic 文件按需 | retro phase prompt 引导 Claude 用 `/memory` 自写 |
+| 跨项目共享 | `~/.claude/rules/ccteam-lessons-<team>.md`(支持 `paths:` frontmatter scope) | 每 session 启动加载,匹配路径才生效 | retro phase prompt 引导 Claude 用 `Edit` 写入 marked section;Seed/verdict 自动注入 |
 
-**实现选型（短期）**：
-- M0 用纯文件 + grep（无 RAG）
-- M3 引入向量索引：用 [claude-mem MCP](https://code.claude.com/) 或 sqlite + sentence-transformers
+**写入时机**(全部经 Claude session 内官方接口,不走 ccteam 代码):
+- 每个项目终态(shipped / rejected / escalated)触发 retro phase
+- phase prompt 引导 Claude:
+  - 项目特定 lessons → `/memory` 写本仓 auto-memory(Claude 自主决策何时写)
+  - 跨项目 lessons / 反模式 → `Edit ~/.claude/rules/ccteam-lessons-<team>.md`(限 `<!-- ccteam-managed:lessons -->` marked section,不污染用户其他段)
+- schema 字段从 `team.yaml.retro_schema[]` 读(F20 解决);dev 写 tech-stack/坑/成功设计/不要再做,
+  research 写方法学/数据源/假设结果
+
+**召回时机**(全部经 Claude session 内官方接口):
+- Seed/verdict phase 启动时:rules 已通过加载机制自动注入(零 RPC),Claude 直接看到上下文
+- 需深挖本项目历史 → Claude 用 `/memory` 浏览 + `Read` 读 topic 文件
+- 命中相似失败项目 → verdict 倾向 REJECT/CLARIFY
+
+**可选增强**(用户装了 [claude-mem](https://docs.claude-mem.ai/usage/search-tools)):
+- claude-mem 自带 5 个 hook(SessionStart/UserPromptSubmit/PostToolUse/Stop/SessionEnd)自动捕获,
+  ccteam 不调任何 hook;暴露 4 个 read-only MCP tool(`search` / `timeline` / `get_observations` / `__IMPORTANT`)支持跨项目 FTS5 检索 + type 过滤(bugfix/feature/decision/discovery/refactor/change)
+- phase prompt 提示"如检测到 `mcp__*claude-mem*search` 工具,可用于跨项目深度检索",**LLM 自看 tool surface 决定调不调**;ccteam 不写检测代码,不写集成代码
+- 用户没装则 100% 走默认路径,功能不受影响
+
+**ccteam 实际改动量**(M4.1–M4.4):
+- M4.1 retro phase prompt(纯 markdown)
+- M4.2 `ccteam doctor --install-memory-bridge`(创建 rules 占位文件 + marked section + path frontmatter,**唯一一段 ccteam 代码**)
+- M4.3 Seed/verdict phase prompt(纯 markdown)
+- M4.4 容器 bind-mount `~/.claude/` spike(0.5 天验证 rules + claude-mem hook 在 `--dangerously-skip-permissions` 容器内可见)
 
 ### 3.8 用户接口层
 
@@ -874,7 +886,7 @@ agent（本节）= 在 phase 内或后台**并行**跑的 multi-agent；sub-skil
 | MCP | 用途 | 出处 |
 |---|---|---|
 | **Telegram bot** | 通知 + 接收用户消息 | M1 自己写或用现成 |
-| **claude-mem** | 跨项目向量记忆 | M3 引入 |
+| **claude-mem** | 跨项目记忆**可选增强**(read-only MCP search / timeline / get_observations + 自带 hook 自动捕获);ccteam 不写集成代码,LLM 自看 tool surface 决定用不用 | M4 可选(默认路径走官方 `~/.claude/rules/` + auto-memory) |
 | **Playwright** | E2E 测试(前端项目) | 已有 |
 | **GitHub** | PR 创建、issue 管理 | 可选 M4 |
 

@@ -45,7 +45,7 @@ F20 / `docs/ccteam-as-domain-agnostic-orchestrator.md` §2.3 / §6)。
 | 7. 进度不透明 | tmux + progress.jsonl | — | — | — | — | — | — |
 | 8. 每步都点允许 | `--dangerously-skip-permissions` | — | — | — | — | — | — |
 | 9. AI 团队需要主持 | 守护进程 + tmux long session + CLI `--format json` | — | Telegram 入口替代 CLI + `ccteam-control` skill | `ccteam-mcp` MCP server | — | meta-agent 跨项目记忆落地 | — |
-| 10. 每项目从零开始 | — | — | — | — | — | RAG 召回 + 反模式(retro_schema 团队感知) | — |
+| 10. 每项目从零开始 | — | — | — | — | — | retro 写官方 auto-memory + `~/.claude/rules/ccteam-lessons-<team>.md` 跨项目共享(检索全在 Claude session 内,ccteam 零代码) | — |
 | 11. 关键节点不把控 | L1 架构约束(hooks + required_outputs) | **L1 扩展:tools_required + 启动期可达性校验** | cross-cutting watcher 上线 | 单 critic + dev 隔离;L3 telegram fork 决策 | — | phase 内 audit 矩阵 + 投票共识 | anti-leniency + WEAK BLOCK |
 | 12. 工作流编排 | phase 主干 + `sub_skills` 字段定义(空允许) | **plugin agent 注册 + skill 懒注入**(让 sub_skills 真有得调) | — | sub-skill 自动 trigger + 产物接力 | 团队抽象解锁多团队 sub_skills 共享 | 新插件按 `skill_intent.yaml` 自动挂载 | — |
 | 13. 并行规模 | phase 模板 `parallelism: solo` 字段(只此一档) | — | — | `parallelism: agent_team` 启用 | — | `parallelism: multi_session` 启用 | 自动并行规模识别 |
@@ -89,8 +89,8 @@ F20 / `docs/ccteam-as-domain-agnostic-orchestrator.md` §2.3 / §6)。
 - 多项目并发(M1)
 - Telegram bot(M1)
 - Seed phase——M0 默认所有需求 PASS 直接进 plan(M2)
-- 跨项目记忆 / RAG(M3)
-- Score / Critic / 6 维评分(M2/M4)
+- 跨项目记忆(M4;走官方 auto-memory + `~/.claude/rules/`,不自建索引)
+- Score / Critic / 6 维评分(M5)
 - `--resume` 兜底崩溃恢复(M0 用 `/exit` + 新 session + CLAUDE.md 桥接;`--resume` 留作 M1+ 增强)
 - web dashboard、score UI 之类的可视化(永远不在 ccteam 主线)
 
@@ -317,8 +317,8 @@ verdict=REJECT,产出 `verdict.md` + `rationale.md`(列已有 N 个免费同类�
 **M3 不做**:
 - academic research team(`phases-research/` 学术调研)→ backlog,M5 后任意时机
 - `phases-marketing/` / `phases-ops/`(critical path 之外,M5 后任意时机)
-- 跨项目记忆 namespace 化(M4)
-- meta-agent conversation continuity(M4 RAG 一并)
+- 跨项目记忆 namespace 化(M4;按 team 分文件 `~/.claude/rules/ccteam-lessons-<team>.md`)
+- meta-agent conversation continuity(M4;吃官方 auto-memory + 全局 rules 注入,无独立任务)
 - Critic 维度泛化(M5,但 M3.2 必须为 critic_dimensions 留数据形式)
 - M2.2 agent_team 启用复活(spike 推荐 A 仍生效;Claude Code 释出 first-class
   Agent Teams CLI 后再重 spike,与 M3 解耦)
@@ -340,30 +340,39 @@ verdict=REJECT,产出 `verdict.md` + `rationale.md`(列已有 N 个免费同类�
 
 ---
 
-## 6. M4 — 跨项目记忆(3 周)
+## 6. M4 — 跨项目记忆 + 多 agent 升级(2 周)
 
 **唯一验收**:第二次提相似项目 → Seed 阶段 prompt 里出现"上次做过 X,建议复用 Y";
-research 项目召回不污染 dev 项目的 RAG 索引(team namespace 已落地)。
+research 项目的 lessons 不污染 dev 项目;**ccteam-core 内零 memory 检索代码**(全部
+经 Claude session 内置机制完成)。
+
+**2026-05-06 重塑**(决策依据见 `references/research/claude-code-memory-research.md`
+末尾「M4 决策依据」节):放弃自建索引/向量库。主路径完全复用 Claude Code 官方
+机制(`~/.claude/CLAUDE.md` + `~/.claude/rules/*.md` + per-repo auto-memory),
+检索发生在 Claude session 内部(不写程序读文件)。装了 [claude-mem](https://docs.claude-mem.ai/usage/search-tools) 即作可选增强,phase prompt 让 LLM 自看 tool surface 决定调不调,
+ccteam 不写集成代码。
 
 | # | 任务 | 验收 | 依赖 |
 |---|---|---|---|
-| M4.1 | retro phase 自动产出 pattern.md(team-aware schema) | 项目终态(shipped/rejected/escalated)触发;字段从 `team.yaml.retro_schema[]` 读(F20 解决);dev 输出 tech stack/坑/成功设计/不要再做,research 输出方法学/数据源/假设结果 | M3.2 |
-| M4.2 | 向量索引(sqlite + sentence-transformers) | `~/.ccteam/memory/index.json` + 向量 db;**team namespace 隔离**(`team=dev` 召回不混入 `team=research` 模式);`ccteam memory rebuild` 全量重建 | M4.1 |
-| M4.3 | Seed phase 接 RAG 召回 | top-3 patterns 注入 Seed prompt;命中相似失败项目时 verdict 倾向 REJECT/CLARIFY;**只召回同 team 的 patterns**,anti-patterns 跨 team 共享 | M4.2、M2.1 |
-| M4.4 | anti-patterns 库 | REJECT 案例独立 namespace;召回时显式标注"不建议";跨 team 共享 | M4.1 |
-| M4.5 | claude-mem MCP 接入(可选) | 若稳定则替换自建索引;不稳就跳过 | M4.2 |
-| M4.6 | meta-agent conversation continuity 落地 | `claude-mem` MCP 加 user namespace,或 `~/.ccteam/meta/conversation-log.md` 滚动追加;`ccteam-control` skill 启动时主动读取(strategic doc §7.2.1) | M4.2 | strategic §7.2.1 |
-| M4.7 | phase 内 audit 矩阵(L2 升级) | `architect` / `critic` / `designer` / `security` / `scope-watcher` 按 phase 启用清单跑;复用 `claude-plugins-official` 现成 agent | M2.5 | tech-design §3.6 L2 |
-| M4.8 | agent 投票与共识机制 | M4.7 audit 输出 PASS/CONCERN/BLOCK;按 `yolo`/`balanced`/`careful` 信任档位决定是否上推 L3;分裂时弹用户 | M4.7、M1.7 | tech-design §3.6 L2/L3 |
-| M4.9 | 新插件自动挂载(扩展性) | 扫 `~/.claude/plugins/.../skill_intent.yaml`;按推荐 phase 自动加进 phase 模板 `sub_skills` | M2.6 | tech-design §6.10 |
-| M4.10 | `parallelism: multi_session`(大项目加速) | 实现 fan-out / fan-in 协议:plan-eng 输出子模块清单 + interface-contracts.md;orchestrator 起 N 个 sub-session;子模块独立跑 phase;review/ship 在 master fan-in;`max_sessions_per_project=4` 兜底;一次端到端验证(SaaS demo:backend ∥ frontend ∥ docs) | M2.7、M1.5 | tech-design §6.11 |
-| M4.11 | ratatui TUI 前端(机会主义,**非关键路径**) | `ccteam tui` 可跑;数据源走 `ccteam-core` lib API(M2.8 `mcp-serve` 同源 schema),不另起进程;不引入新 LLM 层(前端层 invariant) | M2.8 | tech-design §3.8 前端层 |
+| M4.1 | retro phase prompt 改造(team-aware) | 项目终态触发 retro;phase prompt 引导 Claude 用 `/memory` 写本项目 auto-memory(`~/.claude/projects/<encoded>/memory/`)+ 用 `Edit` 写跨项目 lessons 到 `~/.claude/rules/ccteam-lessons-<team>.md`(限 marked section);schema 字段从 `team.yaml.retro_schema[]` 读;**ccteam-core 零代码改动** | M3.2 |
+| M4.2 | `ccteam doctor --install-memory-bridge` | 创建 `~/.claude/rules/ccteam-lessons-{dev,product-research}.md` 占位文件,带 `<!-- ccteam-managed:lessons begin/end -->` 标记 + `paths:` frontmatter scope 到 ccteam 项目目录前缀;幂等(重跑 no-op 或重写 marked section,不重复 append) | M0.5(doctor 框架) |
+| M4.3 | Seed/verdict phase prompt 改造 | 提示分三层:① rules 已经自动注入(零成本)② 需深挖本项目历史 → `/memory` 浏览 + `Read` 读 topic 文件 ③ 如检测到 `mcp__*claude-mem*search` 工具 → 跨项目 search(LLM 自判,ccteam 不预先决定);命中相似失败项目时 verdict 倾向 REJECT/CLARIFY | M4.1、M4.2、M2.1 |
+| M4.4 | spike + 容器 bind-mount 验证(0.5 天) | 实测:① `~/.claude/rules/*.md` 在 ccteam-managed `--dangerously-skip-permissions` + 容器项目里仍自动加载;② `paths:` frontmatter 用 `~/projects/<team>-*` 通配 scope 生效;③ retro 写 marked section 幂等;若容器屏蔽 `~/.claude/`,M4.2 doctor 加 bind-mount 文档/脚本 | M4.2 |
+| M4.5 | phase 内 audit 矩阵(L2 升级) | `architect` / `critic` / `designer` / `security` / `scope-watcher` 按 phase 启用清单跑;复用 `claude-plugins-official` 现成 agent | M2.5 | tech-design §3.6 L2 |
+| M4.6 | agent 投票与共识机制 | M4.5 audit 输出 PASS/CONCERN/BLOCK;按 `yolo`/`balanced`/`careful` 信任档位决定是否上推 L3;分裂时弹用户 | M4.5、M1.7 | tech-design §3.6 L2/L3 |
+| M4.7 | 新插件自动挂载(扩展性) | 扫 `~/.claude/plugins/.../skill_intent.yaml`;按推荐 phase 自动加进 phase 模板 `sub_skills` | M2.6 | tech-design §6.10 |
+| M4.8 | `parallelism: multi_session`(大项目加速) | 实现 fan-out / fan-in 协议:plan-eng 输出子模块清单 + interface-contracts.md;orchestrator 起 N 个 sub-session;子模块独立跑 phase;review/ship 在 master fan-in;`max_sessions_per_project=4` 兜底;一次端到端验证(SaaS demo:backend ∥ frontend ∥ docs) | M2.7、M1.5 | tech-design §6.11 |
+| M4.9 | ratatui TUI 前端(机会主义,**非关键路径**) | `ccteam tui` 可跑;数据源走 `ccteam-core` lib API(M2.8 `mcp-serve` 同源 schema),不另起进程;不引入新 LLM 层(前端层 invariant) | M2.8 | tech-design §3.8 前端层 |
 
-**M4 不做**:跨项目接口契约管理(M6)、自动子模块切分(M6)、跨子模块 stop-the-world 重构(M6)。
+**M4 不做**:
+- 自建向量索引 / sqlite + sentence-transformers / `~/.ccteam/memory/index.json`(被官方机制取代)
+- ccteam-core 内 memory 检索代码(零代码红线,见 CLAUDE.md §六)
+- claude-mem 集成代码(read-only API + 自带 hook 自动捕获,LLM 自调即可)
+- 跨项目接口契约管理(M6)、自动子模块切分(M6)、跨子模块 stop-the-world 重构(M6)
 
-**M4 风险**:11 条任务对 3 周窗口偏紧(尤其 M4.7/4.8/4.10 都是新机制)。落地时按以下
-顺序削:M4.5(claude-mem MCP,可选)→ M4.4(anti-patterns,可推 M5)→ M4.9(新插件
-自动挂载,可推 M5)。M4.10 不可削——它是痛点 13 的最终落地。
+**M4 风险**:9 条任务对 2 周窗口仍紧(M4.5/4.6/4.8 是新机制)。落地时按以下顺序削:
+M4.7(新插件自动挂载,可推 M5)→ M4.9(TUI,机会主义)。M4.8 不可削——痛点 13 最终落地。
+**记忆部分(M4.1–M4.4)体量约 3 天 + 0.5 天 spike**,主要是 phase prompt + 一个 install 函数。
 
 ---
 
@@ -431,12 +440,12 @@ M0.11 ─→ M1.8 (ccteam-control skill) ─→ M2.5 (ccteam-mcp 9 tool)        
               (M1 acceptance gate,不阻塞 M2)                                                                            ↓
                                                                                                                           ├──────────────────────┐
                                                                                                                           ↓                      ↓
-                                                                                                                M4.1 (team-aware retro)  M5.1 (Critic data-driven)
-                                                                                                                M4.2 (RAG, namespace)    M5.2 (anti-leniency)
-                                                                                                                M4.3 (verdict RAG)       M5.3 (WEAK BLOCK config)
-                                                                                                                M4.6 (meta continuity)   M5.4 (per-project 自适应)
-                                                                                                                M4.7/4.8 (audit + 投票)  M5.5 (cache opt)
-                                                                                                                M4.10 (multi_session)
+                                                                                                                M4.1 (team-aware retro)   M5.1 (Critic data-driven)
+                                                                                                                M4.2 (memory-bridge)      M5.2 (anti-leniency)
+                                                                                                                M4.3 (verdict prompt)     M5.3 (WEAK BLOCK config)
+                                                                                                                M4.4 (container spike)    M5.4 (per-project 自适应)
+                                                                                                                M4.5/4.6 (audit + 投票)   M5.5 (cache opt)
+                                                                                                                M4.8 (multi_session)
 ```
 
 **关键变化(按时间倒序)**:
@@ -463,6 +472,15 @@ M0.11 ─→ M1.8 (ccteam-control skill) ─→ M2.5 (ccteam-mcp 9 tool)        
   - M1.7 改"L3 fork ABC structured push" → "L3 fork 走 NL 通道"(经 meta-agent NL 解析,见 M1 §3.7)
   - 旧 M1.9(多轮 CLARIFY)→ 推 M2,M1 用 "tmux attach 直接 NL 对话"覆盖
 
+- **2026-05-06 M4 简化**(决策依据 `references/research/claude-code-memory-research.md` + 官方
+  https://code.claude.com/docs/en/memory):放弃自建向量索引/sqlite,主路径完全复用
+  Claude Code 官方记忆机制(`~/.claude/CLAUDE.md` + `~/.claude/rules/*.md` + per-repo
+  auto-memory),检索发生在 Claude session 内部,**ccteam-core 零 memory 检索代码**。
+  claude-mem 降级为可选增强(read-only API + 自带 hook 自动捕获,LLM 自看 tool surface
+  决定调不调,ccteam 不写集成代码)。任务从 11 砍到 9(记忆 6 → 4,审查/扩展性 5 不动);
+  3 周 → 2 周;记忆部分约 3 天 + 0.5 天 spike。旧 M4.2/4.3/4.4/4.5/4.6 → 新 M4.2/4.3
+  + M4.4 spike;旧 M4.7–4.11 → 新 M4.5–4.9。
+
 - **2026-05-05 milestone reorder**:
   - M3 = Team Abstraction(原 M4.5 提案)插入到记忆 / Critic 之前 —— retro_schema 与
     critic_dimensions 从 day 1 就团队感知,避免 M4 / M5 完工后再被迫推倒重来
@@ -476,11 +494,10 @@ M2.3(phase YAML 三字段,与 sub-skill / agent_team 主链解耦)、
 M2.4(template @ 引用机制,与 sub-skill / agent_team 主链解耦)、
 M2.5(ccteam-mcp,依赖 M1.8 但与 M2.1/M2.2 解耦)、
 M3.7(meta-agent skill + dispatch 树扩展,可与 M3.4/3.5/3.6 并行)、
-M4.4(anti-patterns)、M4.5(claude-mem MCP)、
-M4.9(新插件挂载)、M4.11(ratatui TUI,机会主义)、
+M4.7(新插件挂载)、M4.9(ratatui TUI,机会主义)、
 M5.4(评审自适应)、M5.6(web dashboard,机会主义)。
 
-**关键路径终点**(因 M4.10):M2.2(原 M2.7)→ M4.10 成为新关键路径终点之一
+**关键路径终点**(因 M4.8):M2.2(原 M2.7)→ M4.8 成为新关键路径终点之一
 (痛点 13 最终落地);M2.2 卡住整条 multi-agent 速度并行链。
 
 **M1 内部依赖说明**(图中无法完整呈现的边):
@@ -501,7 +518,8 @@ M5.4(评审自适应)、M5.6(web dashboard,机会主义)。
 | ralph-loop Stop hook 范式与 ccteam 自有 Stop hook 互相冲突 | 中 | M0.12 卡住 | 不挂两个 hook,把 ralph 逻辑合到 parse-phase-end.sh(见 §2.3) |
 | context reset 后行为不一致(新 session 把 CLAUDE.md 桥接信息当独立任务做) | 中 | M0.10 不可用 | M0.10 必须包含至少 3 个真实项目的 reset 验证用例 |
 | Channel Layer 适配器(M2+)外部依赖变更或封号 | 低 | 远程入口断,但终端 attach + 文件 inbox 不受影响 | 三层架构已隔离:M1 不依赖任何 channel,channel adapter 是 M2+ 可插拔件,挂一个补一个 |
-| 向量索引方案选错(自建 vs claude-mem) | 中 | **M4** 阻塞(reorder 后 RAG 在 M4) | M4 启动前 spike 1 周,择优 |
+| 容器化项目屏蔽 `~/.claude/rules/` 加载 | 中 | M4.1–M4.3 跨项目 lessons 不可见 | M4.4 spike 必跑;若屏蔽则 doctor 加 bind-mount 步骤(单点修复,不改协议) |
+| `~/.claude/rules/` 被 LLM 写坏 | 低 | 用户级文件污染,影响其他项目 | retro phase prompt 严格限制只能写 marked section;一次性 setup 后 doctor `--verify-memory-bridge` 校验完整性 |
 | 估算偏差累积 | 高 | 整体延期 | 每个里程碑结束做 retro,把实际工时回填本文 |
 
 ---
