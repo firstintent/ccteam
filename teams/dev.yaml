@@ -1,0 +1,37 @@
+name: dev
+description: Software development team
+phase_dir: phases
+
+# dev's `golden_rules` is intentionally empty in M3.2: the existing
+# fix-loop (M0) + per-phase `golden_rules` declared inside individual
+# phase markdown already cover dev's hard quality gates. Adding stubs
+# here without a real consumer would make the team-wide vs phase-level
+# precedence rule harder to read. M3.4 reverse-engineering note (open
+# question 4.1, plan §5): leave empty until product-research has
+# proven the team-wide default pattern is worth landing for dev.
+golden_rules: []
+
+# critic_dimensions empty — M5 will populate (strategic doc §A inv 1).
+critic_dimensions: []
+
+# verdict_schema empty — dev pipeline doesn't currently emit verdict
+# markdown (no phase produces PASS/CONCERN/REJECT/CLARIFY). M5 may
+# revise if Critic surfaces verdicts.
+verdict_schema: []
+
+# escalate_grammar_extensions empty — dev only uses the four built-in
+# prefixes (REVERT_TO_PHASE / NEED_USER_INPUT / ABORT /
+# INSUFFICIENT_CLARIFICATION). Sticking with built-ins keeps dev's
+# orchestrator behavior identical to its M0–M2 history.
+escalate_grammar_extensions: []
+
+# Retro fields the M4.1 retro phase will emit per dev project.
+retro_schema:
+  - field: tech_stack
+    description: Languages, frameworks, key libraries used
+  - field: pitfalls
+    description: Mistakes / surprises to avoid next time
+  - field: successful_designs
+    description: Design choices that paid off
+  - field: do_not_do_again
+    description: Anti-patterns observed

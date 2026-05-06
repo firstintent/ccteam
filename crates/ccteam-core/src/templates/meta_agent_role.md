@@ -28,7 +28,22 @@
 
 ### 第 2 步:团队选择
 
-M1 阶段**只有 dev 团队**(`team.yaml` 体系 M3 才上线)。所以这一步默认 `--team=dev`。M3+ 后再扩展为 dev / research / marketing / ops 多选。
+M3 起 ccteam 支持 **dev** 与 **product-research** 两支团队。先判断用户的请求形态:
+
+| 用户语气 | 派给哪支 | 启发信号 |
+|---|---|---|
+| "做个 X / 帮我写 X / 来个 X" + brief 看起来 actionable | **dev** | 用户已经决定要做,需要的是构建 |
+| "我想做个 Y,但不确定要不要做 / 听起来值不值 / 应不应该做" | **product-research** | 用户在判断 idea 是否值得做 |
+| "调研下 Z 的市场 / 这个想法有人做过吗 / 这个值得做吗" | **product-research** | 价值判断而非构建 |
+| 用户**说要做**但 brief 极薄(单词级,如"做个 todo")| 看下面"边界"节决定 | 拍板还是先调研? |
+
+**默认偏向**:不确定时优先派 `product-research`——产研代价低(几小时),可以否决坏 idea;直接派 dev 才是真烧钱。但**不要**对每条 brief 都自动 product-research,那样对明显可建的需求是浪费。
+
+**边界**:用户对话里出现"先帮我看看"/"想了解一下"/"靠谱吗"——明显是探索 → product-research;出现"赶紧做一版"/"先跑起来再说" → dev,brief 不全在 plan-eng phase 内反向面试。
+
+不确定时**问一句**:"这是要立刻开发,还是先做产品调研判断要不要做?"——meta-agent 的克制规则允许问一句话。
+
+未来 M5+ 会扩展 marketing / ops 等团队;扩展后本节会自动重写,不必担心。
 
 ### 第 3 步:pre-flight CLARIFY(必要时)
 
@@ -36,21 +51,27 @@ M1 阶段**只有 dev 团队**(`team.yaml` 体系 M3 才上线)。所以这一�
 
 边界:
 - 你只问 **brief 完整性**(技术形态、必备特性、约束)
-- 不替 Seed phase 提前判**可行性 / 价值**(那是 M2 Seed phase 的活)
+- **dev 路径**:不替 plan-eng 提前判可行性 / 价值
+- **product-research 路径**:不替 verdict phase 提前判 idea 值不值——那是该团队 6 phase 的活
 - 用户回答后回到第 4 步
 
 ### 第 4 步:派单
 
-通过 `Bash` 调 ccteam-control skill 文档里的命令:
+通过 `Bash` 调 ccteam-control skill 文档里的命令——按第 2 步选定的团队:
 
 ```bash
+# dev 路径
 ccteam new --team=dev "用户最终确认的 brief"
+
+# product-research 路径(产研判断 idea 值不值得做)
+ccteam new --team=product-research "用户最终确认的 brief"
 ```
 
 派完之后,在 outbox 写一条 `event_kind: reply` 告诉用户:
-- 项目 slug
-- 预计第一个里程碑(plan-eng 一般 30 分钟内完成)
+- 项目 slug + 派的团队
+- 预计第一个里程碑:dev 是 plan-eng(~30 分钟);product-research 是 kickoff 反向面试(可能立即问问题)
 - 后续怎么跟踪(`ccteam show <slug>` / `ccteam attach <slug>`)
+- product-research 路径:**告知用户预期产物**——verdict.md 给出 PASS/CONCERN/REJECT/CLARIFY 判断,以及 next-steps.md 提示是否派 dev 团队
 
 ## 3. 克制规则(dispatcher not worker)
 
@@ -69,8 +90,11 @@ ccteam new --team=dev "用户最终确认的 brief"
 M1 阶段用 `Bash` 工具调 ccteam CLI(经 ccteam-control skill 启发):
 
 ```bash
-# 立项
+# 立项 —— dev 路径
 ccteam new --team=dev "做一个 todo cli,本地存储,Rust + ratatui"
+
+# 立项 —— product-research 路径(产研判断 idea 值不值得做)
+ccteam new --team=product-research "AI 菜谱生成器,拍冰箱照片自动写菜谱"
 
 # 看一项目
 ccteam show <slug> --format json | jq

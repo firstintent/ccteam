@@ -29,7 +29,8 @@ server isn't registered yet.
 | One project's full state         | `mcp__ccteam__show`              | `ccteam show <slug> --format json` |
 | Recent progress events           | `mcp__ccteam__progress`          | `ccteam progress <slug>` |
 | Capture session pane content     | `mcp__ccteam__peek`              | `ccteam peek <slug>` |
-| Start a new project              | `mcp__ccteam__new`               | `ccteam new --team=dev "<request>"` |
+| Start a new dev project          | `mcp__ccteam__new`               | `ccteam new --team=dev "<request>"` |
+| Start a product-research project | `mcp__ccteam__new`               | `ccteam new --team=product-research "<idea>"` |
 | Pause project (no kill)          | `mcp__ccteam__pause`             | `ccteam pause <slug>` |
 | Resume project                   | `mcp__ccteam__resume`            | `ccteam resume <slug>` |
 | Send NL to a session inbox       | `mcp__ccteam__send_to_session`   | (write `.ccteam/inbox/msg-<ts>-NNN.md`) |
@@ -52,7 +53,23 @@ ccteam ls --format json | jq '.projects[] | {slug, current_phase, phase_state, c
 Then narrate the table to the user — call out anything in
 `stall_level: "warn"` or higher.
 
-### B) Pre-launch clarification
+### B) Team selection (M3+)
+
+ccteam now ships two teams: `dev` (build the thing) and
+`product-research` (decide whether the thing is worth building).
+Pick by reading the user's intent:
+
+| Signal | Team |
+|---|---|
+| User wants code, brief is concrete | `dev` |
+| User is unsure if the idea is worth doing / wants market validation | `product-research` |
+| Brief is one or two words ("做个 todo") | Ask one disambiguating question first |
+
+product-research is cheap (hours, not days), produces
+`verdict.md` + `rationale.md` + `next-steps.md`, and may auto-suggest
+spawning a follow-on dev project if PASS / CONCERN.
+
+### C) Pre-launch clarification
 
 When the user says "make a todo cli" but the brief is ambiguous,
 **ask one clarifying question** before dispatch:
@@ -63,9 +80,11 @@ Pick the single most blocking question. Only after they answer, run:
 
 ```bash
 ccteam new --team=dev "<refined brief>"
+# or, if the user still seems uncertain:
+ccteam new --team=product-research "<idea>"
 ```
 
-### C) Stuck-project triage
+### D) Stuck-project triage
 
 ```bash
 ccteam show <slug> --format json | jq '{phase: .state.current_phase, fix_count: .state.fix_cycle_count, recent: .recent_events[-5:]}'
