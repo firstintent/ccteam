@@ -5,8 +5,9 @@ use serde_json::json;
 use tempfile::TempDir;
 
 use ccteam_core::{
-    decide_tick, dev_dag, progress, write_global_phase_templates, CcteamPaths, Orchestrator,
-    OrchestratorConfig, Parallelism, PhaseHistoryEntry, PhaseState, ProjectState, TickAction,
+    decide_tick, decide_tick_from_events, dev_dag, progress, write_global_phase_templates,
+    CcteamPaths, Orchestrator, OrchestratorConfig, Parallelism, PhaseHistoryEntry, PhaseState,
+    ProjectState, TickAction,
 };
 
 fn fresh_state(current_phase: &str, phase_state: PhaseState) -> ProjectState {
@@ -110,6 +111,37 @@ fn decide_tick_classifies_busy_events_as_noop() {
             "{kind} must be NoOp",
         );
     }
+}
+
+#[test]
+fn decide_tick_advances_through_phase_done_then_subagent_stop_sequence() {
+    // E2E 2026-05-06 F1+F2 regression: when the finished turn used Task,
+    // Claude Code emits Stop, parse-phase-end appends phase_done, and
+    // SubagentStop fires 2–5 s later. The literal last event in
+    // progress.jsonl is SubagentStop, but the project did finish — the
+    // tick must still resolve to AdvancePhase. Pair this with the
+    // is_idle change so the subsequent inject is sent bare instead of
+    // wrapped in `/btw` (which would spawn a toolless side-agent).
+    let dag = dev_dag();
+    let state = fresh_state("plan-eng", PhaseState::InFlight);
+    let events = vec![
+        json!({"event": "phase_inject", "phase": "plan-eng"}),
+        json!({"event": "PostToolUse", "tool": "Write"}),
+        json!({"event": "Stop"}),
+        json!({"event": "phase_done", "phase": "plan-eng"}),
+        json!({"event": "SubagentStop"}),
+    ];
+    assert_eq!(
+        decide_tick_from_events(&dag, &state, &events),
+        TickAction::AdvancePhase {
+            from: "plan-eng".into(),
+            to: Some("implement".into()),
+        },
+    );
+    // And the dispatcher's idle classifier must read the trailing
+    // SubagentStop as idle so the next prompt is sent bare.
+    let last = events.last();
+    assert!(progress::is_idle(last));
 }
 
 #[test]
