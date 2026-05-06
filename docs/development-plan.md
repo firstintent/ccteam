@@ -10,16 +10,18 @@
 
 ## 0. 总体节奏
 
-| 里程碑 | 时长 | 主目标 | 关键解锁的痛点 |
-|---|---|---|---|
-| **M0** | 2–3 周 | 单项目 CLI MVP——一句话需求 → 自动跑出能用的代码 | 1, 2, 3, 4, 7, 8, 9 |
-| **M0.5** | 1 周 | 工具触发面闭环——让 Claude Code 全套能力在自治模式下真正可调 | 11(地基)、12(地基) |
-| **M1** | 2 周 | 多项目并发 + Telegram 入口 | 5, 9(强化) |
-| **M2** | 2 周 | Seed Gate 否决无效想法 + Score 客观质量门 | 6, 3(强化) |
-| **M3** | 2 周 | Team Abstraction——`ccteam new --team=research` 跑通,dev 路径零回归 | 团队泛化地基 |
-| **M4** | 3 周 | 跨项目记忆(差异化护城河;retro_schema 团队感知) | 10 |
-| **M5** | 3 周 | Critic Agent 闭环——超越"测试通过=完成";critic_dimensions 团队感知 | 3(深化) |
-| **M6** | 3–6 月 | 大型软件长跑能力(对标 Symphony) | 长期 |
+| 里程碑 | 状态 | 时长 | 主目标 | 关键解锁的痛点 |
+|---|---|---|---|---|
+| **M0** | ✅ shipped | 2–3 周 | 单项目 CLI MVP——一句话需求 → 自动跑出能用的代码 | 1, 2, 3, 4, 7, 8, 9 |
+| **M0.5** | ✅ shipped | 1 周 | 工具触发面闭环——让 Claude Code 全套能力在自治模式下真正可调 | 11(地基)、12(地基) |
+| **M1** | ✅ shipped | 2 周 | meta-agent + 多项目并发 | 5, 9(强化) |
+| **M2** | ✅ shipped | 1.5 周 | dev pipeline 工程机制(sub-skill / phase YAML / ccteam-mcp / golden_rules schema) | 6(部分;Seed 提到 M3.4)、3(部分;golden_rules) |
+| **M2.3-followup** | ✅ shipped | — | F22 slug team prefix(`~/projects/<team>-<slug>/`,let `~/.claude/rules/` paths frontmatter scope 命中) | — |
+| **M3** | ✅ shipped | 3 周 | Team Abstraction + product-research team——`ccteam new --team=product-research` 跑通,dev 路径零回归 | 团队泛化地基、6(verdict / REJECT) |
+| **M4.1–M4.4** | ✅ shipped | — | 跨项目记忆(走官方 auto-memory + `~/.claude/rules/` + 可选 claude-mem;ccteam-core 零检索代码) | 10 |
+| **M4.5–M4.9** | ❌ planned | — | audit 矩阵 / 投票 / multi_session / 新插件挂载 / TUI | 11(深化)、12(深化)、13 |
+| **M5** | ❌ planned | 3 周 | Critic Agent 闭环——超越"测试通过=完成";critic_dimensions 团队感知 | 3(深化) |
+| **M6** | ❌ open | 3–6 月 | 大型软件长跑能力(对标 Symphony) | 长期 |
 
 **累计**:M0–M5 大约 15–16 周,基本覆盖 requirements.md 所有痛点。M6 进入开放探索期。
 
@@ -55,7 +57,7 @@ F20 / `docs/ccteam-as-domain-agnostic-orchestrator.md` §2.3 / §6)。
 
 ---
 
-## 2. M0 — 单项目 CLI MVP(active)
+## 2. M0 — 单项目 CLI MVP(✅ shipped)
 
 **唯一验收**:用 CLI 提一个需求 → 关掉所有终端 → 半小时后回来 → 看到一个能跑的项目 + 测试报告。
 
@@ -105,7 +107,7 @@ F20 / `docs/ccteam-as-domain-agnostic-orchestrator.md` §2.3 / §6)。
 
 ---
 
-## 2.5. M0.5 — 工具触发面闭环(1 周)
+## 2.5. M0.5 — 工具触发面闭环(✅ shipped)
 
 > 本里程碑由 [docs/claude-code-tool-surface.md](./claude-code-tool-surface.md)
 > 的实测结论催生。M0 happy path 跑通后,我们发现"phase markdown 能编排
@@ -180,7 +182,7 @@ ccteam 定位是"在 Claude Code 之上、不阉割其能力、自动调用其�
 
 ---
 
-## 3. M1 — meta-agent + 多项目并发(2 周)
+## 3. M1 — meta-agent + 多项目并发(✅ shipped)
 
 > **2026-05-06 reframe**:原 M1 主目标是"Telegram bot + 多项目 + Telegram fork
 > 决策"。复盘 + tech-design §2.1 的三层架构定下后,**Telegram bot 实现下沉
@@ -226,13 +228,13 @@ ccteam-mcp MCP server(M2)、具体 channel adapter 实现(M2+ 复用开源)。
 | 风险 | 触发 | 应对 |
 |---|---|---|
 | meta session 是新概念,M3 团队抽象未上线时怎么落地 | M1 早于 M3,无 `team.yaml` 体系 | M1.0 把 meta-agent 当作 hardcoded special team(orchestrator 内一个 enum 分支),M3 时再泛化进 `team.yaml` |
-| meta session context 涨爆 | 用户跟 meta 聊几周,1M 上限内 reset 60% 阈值仍要触发 | 沿用项目 session 的 context reset 机制;M4.6 落 conversation continuity 之前,M1 简易版用 `~/projects/<user>-meta/.ccteam/CLAUDE.md` 滚动追加 |
+| meta session context 涨爆 | 用户跟 meta 聊几周,1M 上限内 reset 60% 阈值仍要触发 | 沿用项目 session 的 context reset 机制;M4 conversation continuity 落 `~/.claude/rules/ccteam-lessons-<user>-meta.md` 滚动累积 + auto-memory(已 ship);M1 简易版用 `~/projects/<user>-meta/.ccteam/CLAUDE.md` 滚动追加 |
 | meta session 错把项目级请求当问答处理 | NL 解析有概率性 | meta-agent role prompt 显式写"任何项目级动作派单前 ESCALATE 一次确认";风险换可控 |
 | M1.0 写 role prompt 时把行为约束漏一条 | strategic §7.2.3 列了三条,实施时漏一条 | M1.0 验收清单显式对照 strategic §7.2.2/§7.2.3 |
 
 ---
 
-## 4. M2 — dev pipeline 工程机制(1.5 周)
+## 4. M2 — dev pipeline 工程机制(✅ shipped;M2.2 enablement permanently deferred — spike A)
 
 > **2026-05-06 重构**:原 M2 把"Seed Gate(idea 是否值得做)"与"Score(构建质量)"
 > 都塞进 dev team,违反 strategic doc §3.1「不替领域定 done criteria」+ §3.4「不
@@ -281,7 +283,7 @@ meta-agent 通过 ccteam-mcp 全部 9 个 tool 调度;phase template `@` 引用�
 
 ---
 
-## 5. M3 — Team Abstraction + product-research team(3 周)
+## 5. M3 — Team Abstraction + product-research team(✅ shipped)
 
 > 见 [docs/ccteam-as-domain-agnostic-orchestrator.md](./ccteam-as-domain-agnostic-orchestrator.md)
 > §6 落点论证。本里程碑把 ccteam 从"开发团队的编排层"泛化为"任意 AI 团队的编排层",
@@ -340,7 +342,7 @@ verdict=REJECT,产出 `verdict.md` + `rationale.md`(列已有 N 个免费同类�
 
 ---
 
-## 6. M4 — 跨项目记忆 + 多 agent 升级(2 周)
+## 6. M4 — 跨项目记忆 + 多 agent 升级(2 周;M4.1–M4.4 已 ship,M4.5+ 待启动)
 
 **唯一验收**:第二次提相似项目 → Seed 阶段 prompt 里出现"上次做过 X,建议复用 Y";
 research 项目的 lessons 不污染 dev 项目;**ccteam-core 内零 memory 检索代码**(全部
@@ -354,10 +356,10 @@ ccteam 不写集成代码。
 
 | # | 任务 | 验收 | 依赖 |
 |---|---|---|---|
-| M4.1 | retro phase prompt 改造(team-aware) | **物理实现路径**:改造 `phases/09-ship.md` L20-24 的 inline retro 段(dev)+ `phases-product-research/06-verdict.md` REJECT 分支的 inline retro 段(product-research);**不**新增独立 retro phase 文件。phase prompt 引导 Claude 用 `/memory` 写本项目 auto-memory(`~/.claude/projects/<encoded>/memory/`)+ 用 `Edit` 写跨项目 lessons 到 `~/.claude/rules/ccteam-lessons-<team>.md`(限 marked section);schema 字段从 `team.yaml.retro_schema[]` 读。**前置**:`teams/product-research.yaml.retro_schema` 当前空(注释"M4.1 may revise"),M4.1 PR 必须填值(候选字段:market_signals / differentiation_findings / feasibility_assessment / verdict_rationale);`teams/dev.yaml.retro_schema` 已有 4 字段。**ccteam-core 零代码改动** | M3.2 |
-| M4.2 | `ccteam doctor --install-memory-bridge` | 创建 `~/.claude/rules/ccteam-lessons-{dev,product-research}.md` 占位文件,带 `<!-- ccteam-managed:lessons begin/end -->` 标记 + `paths:` frontmatter scope 到 ccteam 项目目录前缀;幂等(重跑 no-op 或重写 marked section,不重复 append) | M0.5(doctor 框架) |
-| M4.3 | Seed/verdict phase prompt 改造 | 提示分三层:① rules 已经自动注入(零成本)② 需深挖本项目历史 → `/memory` 浏览 + `Read` 读 topic 文件 ③ 如检测到 `mcp__*claude-mem*search` 工具 → 跨项目 search(LLM 自判,ccteam 不预先决定);命中相似失败项目时 verdict 倾向 REJECT/CLARIFY | M4.1、M4.2、M2.1 |
-| M4.4 | spike + 容器 bind-mount 验证(0.5 天) | 实测:① `~/.claude/rules/*.md` 在 ccteam-managed `--dangerously-skip-permissions` + 容器项目里仍自动加载;② `paths:` frontmatter 用 `~/projects/<team>-*` 通配 scope 生效;③ retro 写 marked section 幂等;若容器屏蔽 `~/.claude/`,M4.2 doctor 加 bind-mount 文档/脚本 | M4.2 |
+| M4.1 ✅ | retro phase prompt 改造(team-aware) | **物理实现路径**:改造 `phases/09-ship.md` L20-24 的 inline retro 段(dev)+ `phases-product-research/06-verdict.md` REJECT 分支的 inline retro 段(product-research);**不**新增独立 retro phase 文件。phase prompt 引导 Claude 用 `/memory` 写本项目 auto-memory(`~/.claude/projects/<encoded>/memory/`)+ 用 `Edit` 写跨项目 lessons 到 `~/.claude/rules/ccteam-lessons-<team>.md`(限 marked section);schema 字段从 `team.yaml.retro_schema[]` 读。**前置**:`teams/product-research.yaml.retro_schema` 当前空(注释"M4.1 may revise"),M4.1 PR 必须填值(候选字段:market_signals / differentiation_findings / feasibility_assessment / verdict_rationale);`teams/dev.yaml.retro_schema` 已有 4 字段。**ccteam-core 零代码改动** | M3.2 |
+| M4.2 ✅ | `ccteam doctor --install-memory-bridge` | 创建 `~/.claude/rules/ccteam-lessons-{dev,product-research}.md` 占位文件,带 `<!-- ccteam-managed:lessons begin/end -->` 标记 + `paths:` frontmatter scope 到 ccteam 项目目录前缀;幂等(重跑 no-op 或重写 marked section,不重复 append) | M0.5(doctor 框架) |
+| M4.3 ✅ | Seed/verdict phase prompt 改造 | 提示分三层:① rules 已经自动注入(零成本)② 需深挖本项目历史 → `/memory` 浏览 + `Read` 读 topic 文件 ③ 如检测到 `mcp__*claude-mem*search` 工具 → 跨项目 search(LLM 自判,ccteam 不预先决定);命中相似失败项目时 verdict 倾向 REJECT/CLARIFY | M4.1、M4.2、M2.1 |
+| M4.4 ✅ | spike + 容器 bind-mount 验证(0.5 天) | 实测:① `~/.claude/rules/*.md` 在 ccteam-managed `--dangerously-skip-permissions` + 容器项目里仍自动加载;② `paths:` frontmatter 用 `~/projects/<team>-*` 通配 scope 生效;③ retro 写 marked section 幂等;若容器屏蔽 `~/.claude/`,M4.2 doctor 加 bind-mount 文档/脚本。spike 报告见 `docs/m4-spike-2026-05-06.md`;F22 follow-up PR(`~/projects/<team>-<slug>/` 前缀)已 ship 让 paths frontmatter 在 phase claude session 启动时正确匹配 | M4.2 |
 | M4.5 | phase 内 audit 矩阵(L2 升级) | `architect` / `critic` / `designer` / `security` / `scope-watcher` 按 phase 启用清单跑;复用 `claude-plugins-official` 现成 agent | M2.5 | tech-design §3.6 L2 |
 | M4.6 | agent 投票与共识机制 | M4.5 audit 输出 PASS/CONCERN/BLOCK;按 `yolo`/`balanced`/`careful` 信任档位决定是否上推 L3;分裂时弹用户 | M4.5、M1.7 | tech-design §3.6 L2/L3 |
 | M4.7 | 新插件自动挂载(扩展性) | 扫 `~/.claude/plugins/.../skill_intent.yaml`;按推荐 phase 自动加进 phase 模板 `sub_skills` | M2.6 | tech-design §6.10 |
@@ -450,6 +452,12 @@ M0.11 ─→ M1.8 (ccteam-control skill) ─→ M2.5 (ccteam-mcp 9 tool)        
 
 **关键变化(按时间倒序)**:
 
+- **2026-05-06 post-M4 ship state**(main `ae094bf`):M0–M4.4 全 ship + F22 fix(slug team prefix
+  `~/projects/<team>-<slug>/`,PR #12)+ E2E P0 fixes(F1+F2/F6/F8,PR #8)。M4.5–M4.9 / M5 / M6
+  仍 planned;M2.2 agent_team enablement 永久 deferred(spike A:Claude Code 不再暴露 first-class
+  Agent Teams CLI,schema 保留,启用步骤待官方释出后再 spike)。当前 critical path 终点:
+  M4.5(audit 矩阵)/ M4.8(multi_session)。
+
 - **2026-05-06 M2 简化**(架构红线 strategic doc §3.1 / §3.4 落实):
   - **Seed Gate(REJECT/CLARIFY)从 dev team 提取为 product-research team**(M3.4
     落地);dev team 不再自带"否定 idea"流程 —— 价值判断本属产品/市场 domain,
@@ -512,15 +520,15 @@ M5.4(评审自适应)、M5.6(web dashboard,机会主义)。
 
 ## 10. 进度风险登记
 
-| 风险 | 概率 | 影响 | 应对 |
-|---|---|---|---|
-| Claude Code 协议变更(hook 字段、CLI flag) | 中 | M0 整体阻塞 | 锁定测试过的 `claude --version`;CI 新版本 smoke test |
-| ralph-loop Stop hook 范式与 ccteam 自有 Stop hook 互相冲突 | 中 | M0.12 卡住 | 不挂两个 hook,把 ralph 逻辑合到 parse-phase-end.sh(见 §2.3) |
-| context reset 后行为不一致(新 session 把 CLAUDE.md 桥接信息当独立任务做) | 中 | M0.10 不可用 | M0.10 必须包含至少 3 个真实项目的 reset 验证用例 |
-| Channel Layer 适配器(M2+)外部依赖变更或封号 | 低 | 远程入口断,但终端 attach + 文件 inbox 不受影响 | 三层架构已隔离:M1 不依赖任何 channel,channel adapter 是 M2+ 可插拔件,挂一个补一个 |
-| 容器化项目屏蔽 `~/.claude/rules/` 加载 | 中 | M4.1–M4.3 跨项目 lessons 不可见 | M4.4 spike 必跑;若屏蔽则 doctor 加 bind-mount 步骤(单点修复,不改协议) |
-| `~/.claude/rules/` 被 LLM 写坏 | 低 | 用户级文件污染,影响其他项目 | retro phase prompt 严格限制只能写 marked section;一次性 setup 后 doctor `--verify-memory-bridge` 校验完整性 |
-| 估算偏差累积 | 高 | 整体延期 | 每个里程碑结束做 retro,把实际工时回填本文 |
+| 风险 | 状态 | 概率 | 影响 | 应对 |
+|---|---|---|---|---|
+| Claude Code 协议变更(hook 字段、CLI flag) | open | 中 | M0 整体阻塞 | 锁定测试过的 `claude --version`;CI 新版本 smoke test |
+| ralph-loop Stop hook 范式与 ccteam 自有 Stop hook 互相冲突 | ✅ closed(M0.12) | 中 | M0.12 卡住 | 不挂两个 hook,把 ralph 逻辑合到 parse-phase-end.sh(见 §2.3) |
+| context reset 后行为不一致(新 session 把 CLAUDE.md 桥接信息当独立任务做) | ✅ closed(M0.10) | 中 | M0.10 不可用 | M0.10 必须包含至少 3 个真实项目的 reset 验证用例 |
+| Channel Layer 适配器(M2+)外部依赖变更或封号 | open | 低 | 远程入口断,但终端 attach + 文件 inbox 不受影响 | 三层架构已隔离:M1 不依赖任何 channel,channel adapter 是 M2+ 可插拔件,挂一个补一个 |
+| 容器化项目屏蔽 `~/.claude/rules/` 加载 | ✅ closed(M4.4 spike + F22) | 中 | M4.1–M4.3 跨项目 lessons 不可见 | M4.4 spike 已跑;F22 让 `~/projects/<team>-<slug>/` 前缀与 paths frontmatter 通配匹配生效 |
+| `~/.claude/rules/` 被 LLM 写坏 | open | 低 | 用户级文件污染,影响其他项目 | retro phase prompt 严格限制只能写 marked section;一次性 setup 后 doctor `--verify-memory-bridge` 校验完整性 |
+| 估算偏差累积 | open | 高 | 整体延期 | 每个里程碑结束做 retro,把实际工时回填本文 |
 
 ---
 
