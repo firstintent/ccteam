@@ -10,7 +10,7 @@ parallelism: solo
 sub_skills: []
 auto_loop: true
 auto_loop_max_iterations: 3
-completion_signal: TESTS_GREEN
+completion_signal: "PHASE_DONE: fix"
 ---
 
 # 任务:修 bug(fix-cycle)
@@ -31,6 +31,7 @@ completion_signal: TESTS_GREEN
 
 最后一行:
 
-- **本轮全绿** → `PHASE_DONE: fix`(orchestrator 转回 test-run 复跑确认)
-- **仍有失败但 < 3 轮** → `PHASE_DONE: fix`(orchestrator 自动重入 fix-cycle)
-- **第 3 轮仍失败** → `ESCALATE: <一句话原因>`
+- **本轮全绿** → `PHASE_DONE: fix`(完成信号;orchestrator 推进下一相位)
+- **仍有失败但 < 3 轮** → 不要输出 `PHASE_DONE: fix`(那会被 orchestrator 当作完成);
+  只写本轮的 fix-report,Stop hook 会自动重喂 prompt 进入下一轮 fix-cycle
+- **第 3 轮仍失败** → `ESCALATE: <一句话原因>`(或留空让 orchestrator 在第 3 轮后自动 escalate)

@@ -68,3 +68,23 @@ fn every_m0_template_body_ends_with_phase_done_or_escalate() {
         );
     }
 }
+
+#[test]
+fn fix_phase_completion_signal_matches_body_phase_done_sigil() {
+    // E2E 2026-05-06 F6 regression: the fix phase declared
+    // `completion_signal: TESTS_GREEN` in YAML while the body told
+    // Claude to output `PHASE_DONE: fix`. The fix-loop never observed
+    // the signal, looped 3x, and falsely escalated despite all tests
+    // passing. Auto-loop phases must declare the signal Claude is
+    // actually instructed to emit.
+    let dir = phases_dir();
+    let template = PhaseTemplate::load(&dir.join("06-fix.md")).unwrap();
+    assert!(template.auto_loop, "fix phase is auto-loop driven");
+    assert_eq!(template.completion_signal, "PHASE_DONE: fix");
+    let body = std::fs::read_to_string(dir.join("06-fix.md")).unwrap();
+    assert!(
+        body.contains(&template.completion_signal),
+        "fix body must contain its declared completion_signal `{}`",
+        template.completion_signal,
+    );
+}
