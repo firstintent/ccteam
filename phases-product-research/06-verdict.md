@@ -63,8 +63,49 @@ confidence: 0.0-1.0
 
 - **PASS**:推荐派 dev 团队 spec(`ccteam new --team=dev "<refined brief>"`),列必带的关键事实
 - **CONCERN**:建议先做 1-2 周轻量验证(调用第三方 API 跑通核心 flow / 找 5 个目标用户访谈),再决定要不要派 dev
-- **REJECT**:建议不做。如果用户仍要做,**不要直接派 dev**——先写 retro 记录这次否决,让跨项目记忆能召回(M4 落地后)
+- **REJECT**:建议不做。如果用户仍要做,**不要直接派 dev**——先按下文「REJECT 分支 retro」要求把这次否决落进跨项目 lessons 库,再让用户决定
 - **CLARIFY**:列出还需要的信息
+
+## REJECT 分支 retro
+
+**只在 `verdict = REJECT` 时执行**(PASS / CONCERN 的 retro 由下游 dev 项目的 ship phase 写;
+CLARIFY 不是终态)。两处落地(基于 `teams/product-research.yaml.retro_schema`):
+
+1. **本仓库 auto-memory** → 调 `/memory` 写本项目特定 lessons,topic 文件结构你自定。
+
+2. **跨项目 lessons 库** → 用 `Edit` 修改 `~/.claude/rules/ccteam-lessons-product-research.md`,
+   **只改 `<!-- ccteam-managed:lessons begin/end -->` 之间内容**(不动标记,也不动
+   marked 外的用户段)。在 marked section 内 append 一段以本项目 slug + 日期为
+   H2 标题的新条目;字段顺序与 description 取自
+   `teams/product-research.yaml.retro_schema`(每字段一个 H3):
+
+   - `market_signals` — Top market signals collected (demand, saturation, pricing)
+   - `differentiation_findings` — Unique angles found / ruled out
+   - `feasibility_assessment` — Tech / business feasibility verdict
+   - `verdict_rationale` — Why this verdict (PASS / CONCERN / REJECT / CLARIFY)
+
+   格式:
+
+   ```
+   ## <项目 slug> (YYYY-MM-DD) — REJECT
+
+   ### market_signals
+   <一段总结>
+
+   ### differentiation_findings
+   <一段总结>
+
+   ### feasibility_assessment
+   <一段总结>
+
+   ### verdict_rationale
+   <一段总结,引 rationale.md>
+   ```
+
+   若 `~/.claude/rules/ccteam-lessons-product-research.md` 不存在,说明用户没跑过
+   `ccteam doctor --install-memory-bridge`;在 `.ccteam/rationale.md` 末尾追加一行
+   "memory bridge missing — run ccteam doctor --install-memory-bridge",跨项目
+   lessons 这次跳过(不 ESCALATE,verdict 已写完)。
 
 ## verdict 决定退出方式
 
