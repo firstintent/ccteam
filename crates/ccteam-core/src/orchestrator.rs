@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 
 use crate::cost::{self, CostLevel};
 use crate::dag::Dag;
-use crate::fix_loop::{self, FixLoopState};
+use crate::auto_loop::{self, AutoLoopState};
 use crate::inbox::{InboxMessage, SessionMailbox};
 use crate::meta_agent::META_TEAM_NAME;
 use crate::paths::CcteamPaths;
@@ -128,7 +128,7 @@ pub fn decide_tick_from_events(
 
     if matches!(
         state.phase_state,
-        PhaseState::InFlight | PhaseState::FixLocked
+        PhaseState::InFlight | PhaseState::AutoLocked
     ) {
         if events.is_empty() {
             return TickAction::NoOp; // dispatched but no events yet
@@ -915,14 +915,14 @@ impl Orchestrator {
                         let t = template.expect("auto_loop branch implies template present");
                         let project_dir = self.paths.project_dir(slug);
                         let prompt = progress::build_phase_prompt(&phase);
-                        let fl = FixLoopState::new(
+                        let fl = AutoLoopState::new(
                             slug.to_string(),
                             prompt,
                             t.auto_loop_max_iterations,
                             t.completion_signal.clone(),
                         );
-                        fix_loop::write(&fix_loop::path_in(&project_dir), &fl)?;
-                        PhaseState::FixLocked
+                        auto_loop::write(&auto_loop::path_in(&project_dir), &fl)?;
+                        PhaseState::AutoLocked
                     } else {
                         PhaseState::InFlight
                     };
@@ -1138,7 +1138,7 @@ impl Orchestrator {
     }
 
     /// Count regular (non-meta) projects whose tmux session is
-    /// currently driving a phase (`InFlight` or `FixLocked`). The
+    /// currently driving a phase (`InFlight` or `AutoLocked`). The
     /// concurrency gate (`MAX_CONCURRENT_PROJECTS`) compares this to
     /// the cap so over-the-limit idle projects wait their turn.
     pub fn count_active_regular(projects: &[(String, ProjectState)]) -> usize {
@@ -1146,7 +1146,7 @@ impl Orchestrator {
             .iter()
             .filter(|(_, s)| s.team != META_TEAM_NAME)
             .filter(|(_, s)| {
-                matches!(s.phase_state, PhaseState::InFlight | PhaseState::FixLocked)
+                matches!(s.phase_state, PhaseState::InFlight | PhaseState::AutoLocked)
             })
             .count()
     }
@@ -1249,12 +1249,12 @@ impl Orchestrator {
 
             // M1.2 concurrency gate: only let an idle regular project
             // *start* a new phase if the active count is under the cap.
-            // Already-active projects (InFlight / FixLocked) always run
+            // Already-active projects (InFlight / AutoLocked) always run
             // through process_project so their AdvancePhase / Escalated
             // transitions still land.
             let already_active = matches!(
                 state.phase_state,
-                PhaseState::InFlight | PhaseState::FixLocked,
+                PhaseState::InFlight | PhaseState::AutoLocked,
             );
             if !already_active && regular_dispatch_budget == 0 {
                 tracing::debug!(
@@ -1270,7 +1270,7 @@ impl Orchestrator {
                     if !already_active
                         && matches!(
                             updated.phase_state,
-                            PhaseState::InFlight | PhaseState::FixLocked,
+                            PhaseState::InFlight | PhaseState::AutoLocked,
                         )
                     {
                         regular_dispatch_budget = regular_dispatch_budget.saturating_sub(1);

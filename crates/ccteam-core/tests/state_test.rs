@@ -34,7 +34,7 @@ fn sample_state() -> ProjectState {
                 cost_usd: 0.15,
             },
         ],
-        fix_cycle_count: 0,
+        auto_loop_cycle_count: 0,
         cost_used_usd: 1.23,
         soft_warn_threshold_usd: 20.0,
         hard_kill_threshold_usd: 200.0,
@@ -107,7 +107,7 @@ fn load_falls_back_to_bak_when_main_is_corrupt() {
     let v1 = sample_state();
     v1.save(&main).unwrap();
     let mut v2 = v1.clone();
-    v2.fix_cycle_count = 2;
+    v2.auto_loop_cycle_count = 2;
     v2.save(&main).unwrap();
 
     std::fs::write(&main, b"{ not valid json").unwrap();

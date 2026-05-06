@@ -50,7 +50,7 @@ fn count_active_regular_excludes_meta_team() {
     let mut a = ProjectState::initial("p-1".into());
     a.phase_state = PhaseState::InFlight;
     let mut b = ProjectState::initial("p-2".into());
-    b.phase_state = PhaseState::FixLocked;
+    b.phase_state = PhaseState::AutoLocked;
     let mut idle = ProjectState::initial("p-3".into());
     idle.phase_state = PhaseState::Idle;
     let mut meta = ProjectState::initial_for_team("rob-meta".into(), META_TEAM_NAME.into());
@@ -251,7 +251,7 @@ fn poll_tick_caps_active_regular_projects_at_three() {
     let mut active1 = ProjectState::initial("p1".into());
     active1.phase_state = PhaseState::InFlight;
     let mut active2 = ProjectState::initial("p2".into());
-    active2.phase_state = PhaseState::FixLocked;
+    active2.phase_state = PhaseState::AutoLocked;
     let mut active3 = ProjectState::initial("p3".into());
     active3.phase_state = PhaseState::InFlight;
     let q1 = ProjectState::initial("q1".into());

@@ -294,7 +294,7 @@ fn tool_ls(paths: &CcteamPaths) -> Result<String> {
                 "phase_state": match p.state.phase_state {
                     ccteam_core::PhaseState::InFlight => "in_flight",
                     ccteam_core::PhaseState::Idle => "idle",
-                    ccteam_core::PhaseState::FixLocked => "fix_locked",
+                    ccteam_core::PhaseState::AutoLocked => "fix_locked",
                     ccteam_core::PhaseState::DonePending { .. } => "done_pending",
                 },
                 "cost_used_usd": p.state.cost_used_usd,

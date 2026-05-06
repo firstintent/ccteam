@@ -3,9 +3,9 @@
 //! Two responsibilities, in order:
 //!
 //! 1. **Fix-loop ralph-loop pattern** (M0.12, tech-design §3.5). If the
-//!    project has a `<project>/.ccteam/fix-loop.state.md`, this hook
+//!    project has a `<project>/.ccteam/auto-loop.state.md`, this hook
 //!    drives the loop: read the last assistant text, ask
-//!    `fix_loop::decide` whether to re-feed (block exit) or allow
+//!    `auto_loop::decide` whether to re-feed (block exit) or allow
 //!    exit (success / iteration cap). Re-injection bumps the
 //!    iteration counter in the state file; allow-exit deletes the
 //!    state file. Iteration cap without success → `escalate` event.
@@ -21,7 +21,7 @@ use anyhow::{anyhow, Result};
 use chrono::{SecondsFormat, Utc};
 use serde_json::{json, Value};
 
-use ccteam_core::fix_loop::{self, FixLoopDecision};
+use ccteam_core::auto_loop::{self, AutoLoopDecision};
 use ccteam_core::{progress::append_event, slug_from_project_dir, CcteamPaths};
 
 use crate::transcript::{last_assistant_message, message_text};
@@ -70,21 +70,21 @@ pub fn parse_phase_end(paths: &CcteamPaths, stdin: &Value) -> Result<ParseDecisi
     };
 
     // Step 1: fix-loop drives if the state file is present.
-    let fix_loop_path = fix_loop::path_in(cwd_path);
-    if let Some(state) = fix_loop::read(&fix_loop_path)? {
-        match fix_loop::decide(&state, &last_text) {
-            FixLoopDecision::Reinject {
+    let auto_loop_path = auto_loop::path_in(cwd_path);
+    if let Some(state) = auto_loop::read(&auto_loop_path)? {
+        match auto_loop::decide(&state, &last_text) {
+            AutoLoopDecision::Reinject {
                 prompt,
                 next_iteration,
             } => {
                 let mut next = state.clone();
                 next.front.iteration = next_iteration;
                 next.front.updated_at = Utc::now();
-                fix_loop::write(&fix_loop_path, &next)?;
+                auto_loop::write(&auto_loop_path, &next)?;
                 return Ok(ParseDecision::Block { reason: prompt });
             }
-            FixLoopDecision::AllowExit { succeeded } => {
-                fix_loop::delete(&fix_loop_path)?;
+            AutoLoopDecision::AllowExit { succeeded } => {
+                auto_loop::delete(&auto_loop_path)?;
                 if !succeeded {
                     let event = json!({
                         "ts": now_rfc3339(),

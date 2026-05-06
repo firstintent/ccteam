@@ -1,6 +1,6 @@
-//! Integration tests for the M0.12 fix-loop wiring inside
+//! Integration tests for the M0.12 auto-loop wiring inside
 //! `parse_phase_end`. The handler reads / mutates / deletes
-//! `<project>/.ccteam/fix-loop.state.md` and returns a `ParseDecision`
+//! `<project>/.ccteam/auto-loop.state.md` and returns a `ParseDecision`
 //! the CLI translates into the Stop-hook stdout JSON.
 
 use std::path::PathBuf;
@@ -9,7 +9,7 @@ use chrono::Utc;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-use ccteam_core::fix_loop::{self, FixLoopState};
+use ccteam_core::auto_loop::{self, AutoLoopState};
 use ccteam_core::{CcteamPaths, Parallelism, PhaseState, ProjectState};
 use ccteam_hooks::{parse_phase_end, ParseDecision};
 
@@ -38,11 +38,11 @@ impl Fixture {
             tmux_session: format!("ccteam-{slug}"),
             claude_session_id: None,
             claude_pid: None,
-            phase_state: PhaseState::FixLocked,
+            phase_state: PhaseState::AutoLocked,
             current_phase: "fix".into(),
             parallelism: Parallelism::Solo,
             phase_history: Vec::new(),
-            fix_cycle_count: 0,
+            auto_loop_cycle_count: 0,
             cost_used_usd: 0.0,
             soft_warn_threshold_usd: 20.0,
             hard_kill_threshold_usd: 200.0,
@@ -76,20 +76,20 @@ impl Fixture {
         std::fs::write(&self.transcript_path, body + "\n").unwrap();
     }
 
-    fn put_fix_loop(&self, iter: u32) -> FixLoopState {
-        let mut state = FixLoopState::new(
+    fn put_auto_loop(&self, iter: u32) -> AutoLoopState {
+        let mut state = AutoLoopState::new(
             self.slug.clone(),
             "请按 @.ccteam/phases/06-fix.md 完成本阶段...".into(),
             3,
             "TESTS_GREEN".into(),
         );
         state.front.iteration = iter;
-        fix_loop::write(&fix_loop::path_in(&self.project_dir), &state).unwrap();
+        auto_loop::write(&auto_loop::path_in(&self.project_dir), &state).unwrap();
         state
     }
 
-    fn fix_loop_path(&self) -> PathBuf {
-        fix_loop::path_in(&self.project_dir)
+    fn auto_loop_path(&self) -> PathBuf {
+        auto_loop::path_in(&self.project_dir)
     }
 
     fn progress_lines(&self) -> Vec<Value> {
@@ -117,9 +117,9 @@ fn assistant_msg(text: &str) -> Value {
 }
 
 #[test]
-fn fix_loop_blocks_and_bumps_iteration_when_signal_absent() {
+fn auto_loop_blocks_and_bumps_iteration_when_signal_absent() {
     let fx = Fixture::new("fix-iter1");
-    let _state = fx.put_fix_loop(1);
+    let _state = fx.put_auto_loop(1);
     fx.write_transcript(&[assistant_msg("Tried option A. tests still red.")]);
 
     let stdin = json!({
@@ -134,15 +134,15 @@ fn fix_loop_blocks_and_bumps_iteration_when_signal_absent() {
         other => panic!("expected Block, got {other:?}"),
     }
 
-    let s2 = fix_loop::read(&fx.fix_loop_path()).unwrap().unwrap();
+    let s2 = auto_loop::read(&fx.auto_loop_path()).unwrap().unwrap();
     assert_eq!(s2.front.iteration, 2);
     assert!(fx.progress_lines().is_empty(), "no event written on block");
 }
 
 #[test]
-fn fix_loop_allows_exit_and_clears_state_when_tests_green() {
+fn auto_loop_allows_exit_and_clears_state_when_tests_green() {
     let fx = Fixture::new("fix-green");
-    fx.put_fix_loop(2);
+    fx.put_auto_loop(2);
     fx.write_transcript(&[assistant_msg(
         "Re-ran cargo test. all passing.\nTESTS_GREEN\n\nPHASE_DONE: fix",
     )]);
@@ -154,7 +154,7 @@ fn fix_loop_allows_exit_and_clears_state_when_tests_green() {
     let decision = parse_phase_end(&fx.paths, &stdin).unwrap();
     assert_eq!(decision, ParseDecision::Continue);
     assert!(
-        !fx.fix_loop_path().exists(),
+        !fx.auto_loop_path().exists(),
         "state.md must be deleted after successful exit",
     );
     let events = fx.progress_lines();
@@ -163,9 +163,9 @@ fn fix_loop_allows_exit_and_clears_state_when_tests_green() {
 }
 
 #[test]
-fn fix_loop_emits_escalate_when_iteration_cap_reached_without_signal() {
+fn auto_loop_emits_escalate_when_iteration_cap_reached_without_signal() {
     let fx = Fixture::new("fix-cap");
-    fx.put_fix_loop(3); // already at cap
+    fx.put_auto_loop(3); // already at cap
     fx.write_transcript(&[assistant_msg(
         "Three rounds of triage; root cause unclear. Stopping.",
     )]);
@@ -177,7 +177,7 @@ fn fix_loop_emits_escalate_when_iteration_cap_reached_without_signal() {
     let decision = parse_phase_end(&fx.paths, &stdin).unwrap();
     assert_eq!(decision, ParseDecision::Continue);
     assert!(
-        !fx.fix_loop_path().exists(),
+        !fx.auto_loop_path().exists(),
         "state.md must be cleared at iteration cap",
     );
     let events = fx.progress_lines();
@@ -204,17 +204,17 @@ fn parse_phase_end_falls_through_to_normal_parsing_when_no_state_md() {
 }
 
 #[test]
-fn fix_loop_writes_with_ccteam_dir_already_present() {
+fn auto_loop_writes_with_ccteam_dir_already_present() {
     // Smoke test that the round-trip from orchestrator-write ↔
     // hook-read ↔ hook-write works against a real on-disk state file
     // (catches any divergence between writer and reader).
     let fx = Fixture::new("rt");
-    fx.put_fix_loop(1);
+    fx.put_auto_loop(1);
     fx.write_transcript(&[assistant_msg("still working.")]);
 
     let stdin = json!({"cwd": fx.project_dir, "transcript_path": fx.transcript_path});
     parse_phase_end(&fx.paths, &stdin).unwrap();
-    let s = fix_loop::read(&fx.fix_loop_path()).unwrap().unwrap();
+    let s = auto_loop::read(&fx.auto_loop_path()).unwrap().unwrap();
     assert_eq!(s.front.iteration, 2);
     assert_eq!(s.front.completion_signal, "TESTS_GREEN");
     assert!(s.prompt.contains("06-fix.md"));

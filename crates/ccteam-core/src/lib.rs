@@ -5,7 +5,7 @@
 pub mod cost;
 pub mod daemon;
 pub mod dag;
-pub mod fix_loop;
+pub mod auto_loop;
 pub mod golden_rules;
 pub mod inbox;
 pub mod meta_agent;
@@ -25,7 +25,7 @@ pub mod tmux;
 pub mod tool_surface;
 
 pub use dag::{dev_dag, Dag};
-pub use fix_loop::{FixLoopDecision, FixLoopFrontMatter, FixLoopState};
+pub use auto_loop::{AutoLoopDecision, AutoLoopFrontMatter, AutoLoopState};
 pub use golden_rules::{
     enforce as enforce_golden_rules, GoldenRuleKindLabel, GoldenRuleSkipped,
     GoldenRuleViolation, GoldenRulesReport,

@@ -25,15 +25,16 @@
 23 条发现(2026-05-05 加 F21、升级 F20 P1→P0,共增 1 条;2026-05-06 修复 F21;
 2026-05-06 M4.4 spike 加 F22 P0 + F23 P1 conditional;2026-05-06 修复 F22;
 **2026-05-06 post-M3/M4 sweep**:F2/F3/F4/F9/F10/F11/F12/F13/F20 由 M3 团队
-抽象 + M4 跨项目记忆批量关闭),分布:
+抽象 + M4 跨项目记忆批量关闭;**2026-05-07 fix_loop → auto_loop rename batch**:
+F1/F5/F6/F7/F8/F18 由独立 PR 一波关闭),分布:
 
 | 优先级 | 数量 | 编号 |
 |---|---|---|
-| **P0 阻塞泛化(剩余)** | 1 | F1(部分修复;触发逻辑仍按字符串) |
-| **P1 该做但可后置(剩余)** | 6 | F5, F6, F7, F8, F15, F23(conditional) |
-| **P2 边角(剩余)** | 2 | F17, F18 |
+| **P0 阻塞泛化(剩余)** | 0 | — |
+| **P1 该做但可后置(剩余)** | 2 | F15(M1+ block-push 时做)、F23(conditional;待 spike 重跑) |
+| **P2 边角(剩余)** | 1 | F17 |
 | **N/A 已是领域无关** | 2 | F14, F19(M3 docs sweep 后)|
-| **已修复** | 12 | F2 / F3 / F4(M3.1 dag.rs)、F9 / F10 / F11(M3.4 team-aware bootstrap;F11 dev 仍裸 `phases/` 但非阻塞)、F12 / F13(M3.3 `--team` CLI + `state.team`)、F16(M3.4 phase 模板 team 化)、F20(M3.1+M3.4 retro_schema 数据形式 + product-research 填字段 + M4.1 phase 消费)、F21(@a5fb21d)、F22(PR #12)|
+| **已修复** | 18 | F1 / F5 / F6 / F7 / F18(2026-05-07 rename PR;F1 触发逻辑实际早 M3.1 已切到 template.auto_loop,本 PR 完成命名层 sweep)、F2 / F3 / F4(M3.1 dag.rs)、F8(2026-05-07 directory scan)、F9 / F10 / F11(M3.4 team-aware bootstrap;F11 dev 仍裸 `phases/` 但非阻塞)、F12 / F13(M3.3 `--team` CLI + `state.team`)、F16(M3.4 phase 模板 team 化)、F20(M3.1+M3.4 retro_schema 数据形式 + product-research 填字段 + M4.1 phase 消费)、F21(@a5fb21d)、F22(PR #12)|
 
 **剩余 P0 关键路径**:**只剩 F1**(`auto_loop` 字段已在 phase YAML 里加了
 [M3.1],orchestrator 仍按 `FIX_PHASE_NAME` 字符串触发 `FixLoopState`——需
@@ -51,7 +52,7 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
 
 ## P0 — 阻塞泛化
 
-### F1 — `FIX_PHASE_NAME` / `FIX_LOOP_MAX_ITERATIONS` 字符串耦合 fix-loop 触发(**部分修复:M3.1 加 phase YAML 字段;orchestrator 触发逻辑仍按字符串**)
+### F1 — `FIX_PHASE_NAME` / `FIX_LOOP_MAX_ITERATIONS` 字符串耦合 fix-loop 触发(**已修复:M3.1 加 phase YAML 字段;触发逻辑早于 2026-05-06 已切到 `template.auto_loop`;2026-05-07 rename PR 完成命名层 sweep**)
 
 - **文件:行号**:`crates/ccteam-core/src/orchestrator.rs:32-33` + `:481-491`
   ```rust
@@ -180,7 +181,7 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
 
 ## P1 — 该做但可后置
 
-### F5 — `fix_loop` 模块 / 类型名假设了"fix"语义
+### F5 — `fix_loop` 模块 / 类型名假设了"fix"语义(**已修复:2026-05-07 rename PR**)
 
 - **文件:行号**:`crates/ccteam-core/src/fix_loop.rs`(整个文件)+
   `lib.rs:6,17`(`pub mod fix_loop` / `pub use fix_loop::{FixLoopDecision,
@@ -201,7 +202,7 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
   代码里出现 "auto_loop_phase 写 fix_loop.state.md" 的命名内外冲突。建议跟
   F1 同 PR 做。
 
-### F6 — `PhaseState::FixLocked` 枚举值名假设 fix
+### F6 — `PhaseState::FixLocked` 枚举值名假设 fix(**已修复:2026-05-07 rename PR**)
 
 - **文件:行号**:`crates/ccteam-core/src/state.rs:30-32`
   ```rust
@@ -218,7 +219,7 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
   `auto_locked`;state.json 加载时容错读取旧值(为已存在的 dev 项目)。
 - **优先级**:**P1**——同 F5 一并改。
 
-### F7 — `state.fix_cycle_count` 字段名假设 fix
+### F7 — `state.fix_cycle_count` 字段名假设 fix(**已修复:2026-05-07 rename PR**)
 
 - **文件:行号**:`crates/ccteam-core/src/state.rs:65`
 - **现状**:`pub fix_cycle_count: u32`
@@ -228,7 +229,7 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
   挪进 `phase_state` 内嵌(只在 AutoLocked 时有效)更优,但变更面更大。
 - **优先级**:**P1**——同 F5/F6 一并改。
 
-### F8 — `collect_artifacts` 硬编码 dev artifact 列表
+### F8 — `collect_artifacts` 硬编码 dev artifact 列表(**已修复:2026-05-07 directory scan PR**)
 
 - **文件:行号**:`crates/ccteam-cli/src/commands.rs:305-329`
   ```rust
@@ -504,7 +505,7 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
   配置——单元测试该面向具体场景。
 - **优先级**:**P2**——目录重命名,不阻塞功能。
 
-### F18 — `fix_loop_writes_with_ccteam_dir_already_present` 等测试名假设 fix
+### F18 — `fix_loop_writes_with_ccteam_dir_already_present` 等测试名假设 fix(**已修复:2026-05-07 rename PR — `fix_loop_test.rs` → `auto_loop_test.rs`**)
 
 - **文件:行号**:`crates/ccteam-hooks/tests/fix_loop_test.rs`(整个文件)
 - **现状**:测试模块、文件名、测试函数名都用 `fix_loop`。

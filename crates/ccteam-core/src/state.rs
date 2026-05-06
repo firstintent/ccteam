@@ -27,8 +27,11 @@ pub enum PhaseState {
     InFlight,
     /// Last phase finished; orchestrator may inject the next.
     Idle,
-    /// Stop hook owns the loop (ralph-loop fix-cycle pattern, §3.5).
-    FixLocked,
+    /// Stop hook owns the loop (ralph-loop pattern, §3.5).
+    /// `alias = "fix_locked"` keeps pre-rename state.json files (F5/F6
+    /// rename, 2026-05-06) loadable; new writes use `auto_locked`.
+    #[serde(alias = "fix_locked")]
+    AutoLocked,
     /// **M3.6**: phase produced its required outputs but flagged some
     /// sub-tasks as deferred (`ESCALATE: PHASE_DONE_PENDING`,
     /// interfaces §4.1.1). `open_decisions` lists outbox-file basenames
@@ -81,7 +84,10 @@ pub struct ProjectState {
     pub current_phase: String,
     pub parallelism: Parallelism,
     pub phase_history: Vec<PhaseHistoryEntry>,
-    pub fix_cycle_count: u32,
+    /// `alias = "fix_cycle_count"` keeps pre-rename state.json (F7,
+    /// 2026-05-06) loadable; new writes use `auto_loop_cycle_count`.
+    #[serde(alias = "fix_cycle_count")]
+    pub auto_loop_cycle_count: u32,
     pub cost_used_usd: f64,
     pub soft_warn_threshold_usd: f64,
     pub hard_kill_threshold_usd: f64,
@@ -123,7 +129,7 @@ impl ProjectState {
             current_phase: String::new(),
             parallelism: Parallelism::Solo,
             phase_history: Vec::new(),
-            fix_cycle_count: 0,
+            auto_loop_cycle_count: 0,
             cost_used_usd: 0.0,
             soft_warn_threshold_usd: 20.0,
             hard_kill_threshold_usd: 200.0,

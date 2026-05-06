@@ -118,7 +118,7 @@ fn meta_dispatch_e2e_inbox_to_outbox() {
   "current_phase": "",
   "parallelism": "solo",
   "phase_history": [],
-  "fix_cycle_count": 0,
+  "auto_loop_cycle_count": 0,
   "cost_used_usd": 0.0,
   "soft_warn_threshold_usd": 20.0,
   "hard_kill_threshold_usd": 200.0,
