@@ -105,18 +105,27 @@ impl Dag {
     }
 
     /// True when the project has reached a terminal state: any
-    /// history entry escalated, or the last passed history entry
-    /// landed on a DAG endpoint.
+    /// history entry escalated **without a subsequent `resumed`
+    /// entry**, or any passed history entry landed on a DAG endpoint.
+    ///
+    /// E2E 2026-05-06 F8: `ccteam resume` appends a `"resumed"` entry
+    /// after an `"escalated"` one to lift the terminal flag — without
+    /// it, the orchestrator's tick stayed `NoOp` forever and no
+    /// further phases advanced even after the user manually
+    /// re-injected the next phase. We pair escalated/resumed in
+    /// history rather than mutating the original entry so the audit
+    /// trail of past escalations stays intact.
     pub fn is_terminal_state(&self, state: &ProjectState) -> bool {
+        let mut escalated_active = false;
         for h in &state.phase_history {
-            if h.status == "escalated" {
-                return true;
-            }
-            if h.status == "passed" && self.is_terminal_phase(&h.phase) {
-                return true;
+            match h.status.as_str() {
+                "escalated" => escalated_active = true,
+                "resumed" => escalated_active = false,
+                "passed" if self.is_terminal_phase(&h.phase) => return true,
+                _ => {}
             }
         }
-        false
+        escalated_active
     }
 }
 

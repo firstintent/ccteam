@@ -114,9 +114,14 @@ pub fn latest_terminal_event_for_phase<'a>(
 /// `Stop` / `Notification:idle_prompt` are the canonical "claude is
 /// waiting" signals. Phase-boundary events (`session_start`,
 /// `phase_done`, `escalate`, `SessionEnd`) also imply nothing is
-/// in-flight. Anything else (`PreToolUse`, `PostToolUse`, `phase_inject`,
-/// `SubagentStop`) means a tool call is mid-flight — caller should use
-/// `/btw` to queue without interrupting.
+/// in-flight. `SubagentStop` fires 2–5 s after `Stop` whenever the
+/// finished turn used `Task`; the main loop is already idle by then,
+/// so we treat it the same as `Stop` (E2E 2026-05-06: classifying it
+/// as busy caused the next phase prompt to be wrapped in `/btw`,
+/// which spawns a tool-less side-agent and stalls the project).
+/// Anything else (`PreToolUse`, `PostToolUse`, `phase_inject`) means a
+/// tool call is mid-flight — caller should use `/btw` to queue without
+/// interrupting.
 pub fn is_idle(last: Option<&Value>) -> bool {
     let Some(event) = last else {
         return true;
@@ -124,7 +129,13 @@ pub fn is_idle(last: Option<&Value>) -> bool {
     let kind = event.get("event").and_then(|s| s.as_str()).unwrap_or("");
     matches!(
         kind,
-        "Stop" | "notification" | "session_start" | "SessionEnd" | "phase_done" | "escalate"
+        "Stop"
+            | "SubagentStop"
+            | "notification"
+            | "session_start"
+            | "SessionEnd"
+            | "phase_done"
+            | "escalate"
     )
 }
 
@@ -205,6 +216,17 @@ mod tests {
             let e = json!({"event": kind});
             assert!(is_idle(Some(&e)), "{kind} should be treated as idle");
         }
+    }
+
+    #[test]
+    fn idle_treats_subagent_stop_as_idle() {
+        // E2E 2026-05-06 F1+F2: Claude Code emits SubagentStop 2–5 s
+        // after Stop whenever a turn used Task. The main loop is already
+        // idle at that point — classifying it as busy caused the next
+        // phase inject to be wrapped in `/btw`, which spawns a toolless
+        // side-agent that cannot execute the next phase.
+        let e = json!({"event": "SubagentStop"});
+        assert!(is_idle(Some(&e)));
     }
 
     #[test]

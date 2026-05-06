@@ -15,7 +15,8 @@ use ccteam_core::{
     write_all_global_team_templates, write_global_helper_templates,
     write_global_phase_templates, AgentLinkAction, AgentLinkReport, CcteamPaths,
     InstallSkillOptions, LinkOptions, MetaBootstrapReport, OutboxEventKind, OutboxMessage,
-    PhaseState, PhaseTemplate, ProjectState, SessionMailbox, SkillInstallAction, TeamSpec,
+    PhaseHistoryEntry, PhaseState, PhaseTemplate, ProjectState, SessionMailbox,
+    SkillInstallAction, TeamSpec,
     ToolSurfaceSnapshot, BUILTIN_SUBAGENTS, HELPER_TEMPLATES, PHASE_TEMPLATES, TEAM_BUNDLES,
 };
 use ccteam_core::tmux::TmuxSession;
@@ -294,6 +295,15 @@ pub fn run_progress(paths: &CcteamPaths, slug: &str, tail: bool) -> Result<()> {
 /// the escalation marker if present, and sets phase_state back to idle so
 /// the daemon's next tick re-dispatches the current phase. Real
 /// `--resume` (claude session continuation) is M1+.
+///
+/// E2E 2026-05-06 F8: when the previous run ended in `escalate`, the
+/// last `phase_history` entry has `status: "escalated"` which makes
+/// `Dag::is_terminal_state` permanently return true. `is_terminal_state`
+/// blocks every subsequent tick at `NoOp`, so the daemon never picks
+/// the project back up even after the user resumes. Append a
+/// `"resumed"` entry (append-only — we don't mutate the prior
+/// escalated entry, so the escalation history stays auditable) so
+/// `is_terminal_state` lifts the flag.
 pub fn run_resume(paths: &CcteamPaths, slug: &str) -> Result<()> {
     let state_path = paths.project_state(slug);
     let mut state = ProjectState::load(&state_path)
@@ -302,6 +312,17 @@ pub fn run_resume(paths: &CcteamPaths, slug: &str) -> Result<()> {
     state.user_attached = false;
     state.phase_state = PhaseState::Idle;
     state.last_user_interaction_at = Utc::now();
+    if matches!(
+        state.phase_history.last().map(|h| h.status.as_str()),
+        Some("escalated"),
+    ) {
+        state.phase_history.push(PhaseHistoryEntry {
+            phase: state.current_phase.clone(),
+            status: "resumed".into(),
+            duration_s: 0,
+            cost_usd: 0.0,
+        });
+    }
     state.save(&state_path)?;
 
     let esc = paths.project_ccteam_dir(slug).join("escalation.md");
@@ -1342,6 +1363,65 @@ mod tests {
         assert_eq!(s2.phase_state, PhaseState::Idle);
         assert!(!s2.user_pause_pending);
         assert!(!esc.exists(), "escalation.md should be archived after resume");
+    }
+
+    #[test]
+    fn run_resume_appends_resumed_history_after_escalated_entry() {
+        // E2E 2026-05-06 F8: an escalated `phase_history` entry leaves
+        // `Dag::is_terminal_state` permanently true. `ccteam resume`
+        // must append a paired `"resumed"` entry so future ticks
+        // dispatch again. Append-only — the original escalated entry
+        // stays intact for audit.
+        ensure_isolation();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let slug = run_new(&paths, "demo", "dev").unwrap();
+
+        let state_path = paths.project_state(&slug);
+        let mut state = ProjectState::load(&state_path).unwrap();
+        state.phase_state = PhaseState::InFlight;
+        state.current_phase = "fix".into();
+        state.phase_history.push(PhaseHistoryEntry {
+            phase: "fix".into(),
+            status: "escalated".into(),
+            duration_s: 0,
+            cost_usd: 0.0,
+        });
+        state.save(&state_path).unwrap();
+
+        run_resume(&paths, &slug).unwrap();
+        let s2 = ProjectState::load(&state_path).unwrap();
+        assert_eq!(s2.phase_history.len(), 2, "resume must append, not mutate");
+        assert_eq!(s2.phase_history[0].status, "escalated");
+        assert_eq!(s2.phase_history[1].status, "resumed");
+        assert_eq!(s2.phase_history[1].phase, "fix");
+    }
+
+    #[test]
+    fn run_resume_does_not_append_resumed_when_no_escalation() {
+        // Non-escalated resume (e.g. user attached + paused) must not
+        // pollute phase_history with a spurious resumed entry — that
+        // would keep growing on repeat resumes for benign pauses.
+        ensure_isolation();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let slug = run_new(&paths, "demo", "dev").unwrap();
+
+        let state_path = paths.project_state(&slug);
+        let mut state = ProjectState::load(&state_path).unwrap();
+        state.user_pause_pending = true;
+        state.phase_history.push(PhaseHistoryEntry {
+            phase: "implement".into(),
+            status: "passed".into(),
+            duration_s: 0,
+            cost_usd: 0.0,
+        });
+        state.save(&state_path).unwrap();
+
+        run_resume(&paths, &slug).unwrap();
+        let s2 = ProjectState::load(&state_path).unwrap();
+        assert_eq!(s2.phase_history.len(), 1);
+        assert_eq!(s2.phase_history[0].status, "passed");
     }
 
     #[test]

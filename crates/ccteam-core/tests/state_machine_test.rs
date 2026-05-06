@@ -5,8 +5,9 @@ use serde_json::json;
 use tempfile::TempDir;
 
 use ccteam_core::{
-    decide_tick, dev_dag, progress, write_global_phase_templates, CcteamPaths, Orchestrator,
-    OrchestratorConfig, Parallelism, PhaseHistoryEntry, PhaseState, ProjectState, TickAction,
+    decide_tick, decide_tick_from_events, dev_dag, progress, write_global_phase_templates,
+    CcteamPaths, Orchestrator, OrchestratorConfig, Parallelism, PhaseHistoryEntry, PhaseState,
+    ProjectState, TickAction,
 };
 
 fn fresh_state(current_phase: &str, phase_state: PhaseState) -> ProjectState {
@@ -113,6 +114,37 @@ fn decide_tick_classifies_busy_events_as_noop() {
 }
 
 #[test]
+fn decide_tick_advances_through_phase_done_then_subagent_stop_sequence() {
+    // E2E 2026-05-06 F1+F2 regression: when the finished turn used Task,
+    // Claude Code emits Stop, parse-phase-end appends phase_done, and
+    // SubagentStop fires 2–5 s later. The literal last event in
+    // progress.jsonl is SubagentStop, but the project did finish — the
+    // tick must still resolve to AdvancePhase. Pair this with the
+    // is_idle change so the subsequent inject is sent bare instead of
+    // wrapped in `/btw` (which would spawn a toolless side-agent).
+    let dag = dev_dag();
+    let state = fresh_state("plan-eng", PhaseState::InFlight);
+    let events = vec![
+        json!({"event": "phase_inject", "phase": "plan-eng"}),
+        json!({"event": "PostToolUse", "tool": "Write"}),
+        json!({"event": "Stop"}),
+        json!({"event": "phase_done", "phase": "plan-eng"}),
+        json!({"event": "SubagentStop"}),
+    ];
+    assert_eq!(
+        decide_tick_from_events(&dag, &state, &events),
+        TickAction::AdvancePhase {
+            from: "plan-eng".into(),
+            to: Some("implement".into()),
+        },
+    );
+    // And the dispatcher's idle classifier must read the trailing
+    // SubagentStop as idle so the next prompt is sent bare.
+    let last = events.last();
+    assert!(progress::is_idle(last));
+}
+
+#[test]
 fn decide_tick_emits_escalated_on_escalate_event() {
     let dag = dev_dag();
     let state = fresh_state("fix", PhaseState::InFlight);
@@ -146,6 +178,76 @@ fn is_terminal_state_true_after_any_escalation() {
     state.phase_history.push(PhaseHistoryEntry {
         phase: "implement".into(),
         status: "escalated".into(),
+        duration_s: 0,
+        cost_usd: 0.0,
+    });
+    assert!(dag.is_terminal_state(&state));
+}
+
+#[test]
+fn is_terminal_state_false_after_resumed_follows_escalated() {
+    // E2E 2026-05-06 F8: an escalated entry followed by a resumed
+    // entry must lift the terminal flag — otherwise `decide_tick`
+    // returns NoOp forever and the daemon stops dispatching the
+    // project even after `ccteam resume` clears phase_state.
+    let dag = dev_dag();
+    let mut state = fresh_state("fix", PhaseState::Idle);
+    state.phase_history.push(PhaseHistoryEntry {
+        phase: "fix".into(),
+        status: "escalated".into(),
+        duration_s: 0,
+        cost_usd: 0.0,
+    });
+    assert!(dag.is_terminal_state(&state), "escalated alone is terminal");
+
+    state.phase_history.push(PhaseHistoryEntry {
+        phase: "fix".into(),
+        status: "resumed".into(),
+        duration_s: 0,
+        cost_usd: 0.0,
+    });
+    assert!(
+        !dag.is_terminal_state(&state),
+        "escalated + resumed must lift the terminal flag",
+    );
+
+    // Re-escalate on a later phase: terminal again.
+    state.phase_history.push(PhaseHistoryEntry {
+        phase: "ship".into(),
+        status: "escalated".into(),
+        duration_s: 0,
+        cost_usd: 0.0,
+    });
+    assert!(dag.is_terminal_state(&state), "later escalation re-arms");
+
+    // Resume again: non-terminal.
+    state.phase_history.push(PhaseHistoryEntry {
+        phase: "ship".into(),
+        status: "resumed".into(),
+        duration_s: 0,
+        cost_usd: 0.0,
+    });
+    assert!(!dag.is_terminal_state(&state), "second resume lifts again");
+}
+
+#[test]
+fn is_terminal_state_true_after_passed_endpoint_even_following_resumed() {
+    // A successful ship after a resume cycle is still terminal —
+    // resume only clears the escalated flag, it doesn't override the
+    // ship-passed terminal.
+    let dag = dev_dag();
+    let mut state = fresh_state("ship", PhaseState::Idle);
+    for status in ["escalated", "resumed"] {
+        state.phase_history.push(PhaseHistoryEntry {
+            phase: "fix".into(),
+            status: status.into(),
+            duration_s: 0,
+            cost_usd: 0.0,
+        });
+    }
+    state.phase_history.push(PhaseHistoryEntry {
+        phase: "ship".into(),
+        status: "passed".into(),
         duration_s: 0,
         cost_usd: 0.0,
     });
