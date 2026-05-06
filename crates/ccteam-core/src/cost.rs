@@ -51,7 +51,7 @@ mod tests {
             current_phase: String::new(),
             parallelism: Parallelism::Solo,
             phase_history: Vec::new(),
-            fix_cycle_count: 0,
+            auto_loop_cycle_count: 0,
             cost_used_usd: cost,
             soft_warn_threshold_usd: 20.0,
             hard_kill_threshold_usd: 200.0,

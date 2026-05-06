@@ -1,4 +1,4 @@
-//! Fix-loop state file (`<project>/.ccteam/fix-loop.state.md`) and the
+//! Fix-loop state file (`<project>/.ccteam/auto-loop.state.md`) and the
 //! pure decision function the Stop hook uses to drive the ralph-loop
 //! retry pattern (tech-design §3.5).
 //!
@@ -14,7 +14,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FixLoopFrontMatter {
+pub struct AutoLoopFrontMatter {
     pub slug: String,
     pub iteration: u32,
     pub max_iterations: u32,
@@ -23,15 +23,15 @@ pub struct FixLoopFrontMatter {
     pub updated_at: DateTime<Utc>,
 }
 
-/// Full fix-loop state: front matter + the prompt body that the Stop
+/// Full auto-loop state: front matter + the prompt body that the Stop
 /// hook re-feeds on retry.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FixLoopState {
-    pub front: FixLoopFrontMatter,
+pub struct AutoLoopState {
+    pub front: AutoLoopFrontMatter,
     pub prompt: String,
 }
 
-impl FixLoopState {
+impl AutoLoopState {
     pub fn new(
         slug: String,
         prompt: String,
@@ -40,7 +40,7 @@ impl FixLoopState {
     ) -> Self {
         let now = Utc::now();
         Self {
-            front: FixLoopFrontMatter {
+            front: AutoLoopFrontMatter {
                 slug,
                 iteration: 1,
                 max_iterations,
@@ -53,12 +53,12 @@ impl FixLoopState {
     }
 }
 
-/// `<project>/.ccteam/fix-loop.state.md`.
+/// `<project>/.ccteam/auto-loop.state.md`.
 pub fn path_in(project_dir: &Path) -> PathBuf {
-    project_dir.join(".ccteam").join("fix-loop.state.md")
+    project_dir.join(".ccteam").join("auto-loop.state.md")
 }
 
-pub fn read(path: &Path) -> Result<Option<FixLoopState>> {
+pub fn read(path: &Path) -> Result<Option<AutoLoopState>> {
     if !path.exists() {
         return Ok(None);
     }
@@ -67,25 +67,25 @@ pub fn read(path: &Path) -> Result<Option<FixLoopState>> {
     let after = body
         .strip_prefix("---\n")
         .or_else(|| body.strip_prefix("---\r\n"))
-        .ok_or_else(|| anyhow!("fix-loop state missing leading ---"))?;
+        .ok_or_else(|| anyhow!("auto-loop state missing leading ---"))?;
     let end = after
         .find("\n---\n")
         .or_else(|| after.find("\n---\r\n"))
-        .ok_or_else(|| anyhow!("fix-loop state missing closing ---"))?;
+        .ok_or_else(|| anyhow!("auto-loop state missing closing ---"))?;
     let front_str = &after[..end];
-    let front: FixLoopFrontMatter = serde_yaml::from_str(front_str)
-        .with_context(|| format!("parse fix-loop front matter at {}", path.display()))?;
+    let front: AutoLoopFrontMatter = serde_yaml::from_str(front_str)
+        .with_context(|| format!("parse auto-loop front matter at {}", path.display()))?;
     let prompt = after[end + "\n---\n".len()..].trim().to_string();
-    Ok(Some(FixLoopState { front, prompt }))
+    Ok(Some(AutoLoopState { front, prompt }))
 }
 
-pub fn write(path: &Path, state: &FixLoopState) -> Result<()> {
+pub fn write(path: &Path, state: &AutoLoopState) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create {}", parent.display()))?;
     }
     let front_yaml = serde_yaml::to_string(&state.front)
-        .context("serialize fix-loop front matter")?;
+        .context("serialize auto-loop front matter")?;
     let body = format!("---\n{front_yaml}---\n\n{}\n", state.prompt);
     std::fs::write(path, body).with_context(|| format!("write {}", path.display()))
 }
@@ -101,7 +101,7 @@ pub fn delete(path: &Path) -> Result<()> {
 /// re-feed the prompt, or allow the exit (signalling success or
 /// max-iterations exhaustion)?
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FixLoopDecision {
+pub enum AutoLoopDecision {
     /// Re-feed the prompt; bump `iteration` to `next_iteration` and
     /// rewrite the state file before the hook returns.
     Reinject {
@@ -114,14 +114,14 @@ pub enum FixLoopDecision {
     AllowExit { succeeded: bool },
 }
 
-pub fn decide(state: &FixLoopState, last_assistant_text: &str) -> FixLoopDecision {
+pub fn decide(state: &AutoLoopState, last_assistant_text: &str) -> AutoLoopDecision {
     if last_assistant_text.contains(&state.front.completion_signal) {
-        return FixLoopDecision::AllowExit { succeeded: true };
+        return AutoLoopDecision::AllowExit { succeeded: true };
     }
     if state.front.iteration >= state.front.max_iterations {
-        return FixLoopDecision::AllowExit { succeeded: false };
+        return AutoLoopDecision::AllowExit { succeeded: false };
     }
-    FixLoopDecision::Reinject {
+    AutoLoopDecision::Reinject {
         prompt: state.prompt.clone(),
         next_iteration: state.front.iteration + 1,
     }
@@ -132,8 +132,8 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn sample(iter: u32) -> FixLoopState {
-        let mut s = FixLoopState::new(
+    fn sample(iter: u32) -> AutoLoopState {
+        let mut s = AutoLoopState::new(
             "demo".into(),
             "fix the broken tests in src/db.rs".into(),
             3,
@@ -146,7 +146,7 @@ mod tests {
     #[test]
     fn roundtrip_write_read() {
         let tmp = TempDir::new().unwrap();
-        let p = tmp.path().join("fix-loop.state.md");
+        let p = tmp.path().join("auto-loop.state.md");
         let original = sample(1);
         write(&p, &original).unwrap();
         let loaded = read(&p).unwrap().unwrap();
@@ -164,7 +164,7 @@ mod tests {
     fn decide_reinjects_when_below_cap_and_signal_absent() {
         let s = sample(1);
         match decide(&s, "I'm working on it...") {
-            FixLoopDecision::Reinject {
+            AutoLoopDecision::Reinject {
                 prompt,
                 next_iteration,
             } => {
@@ -181,7 +181,7 @@ mod tests {
         let txt = "Re-ran cargo test, everything green. TESTS_GREEN";
         assert_eq!(
             decide(&s, txt),
-            FixLoopDecision::AllowExit { succeeded: true },
+            AutoLoopDecision::AllowExit { succeeded: true },
         );
     }
 
@@ -190,7 +190,7 @@ mod tests {
         let s = sample(3); // max_iterations is 3
         assert_eq!(
             decide(&s, "still failing"),
-            FixLoopDecision::AllowExit { succeeded: false },
+            AutoLoopDecision::AllowExit { succeeded: false },
         );
     }
 

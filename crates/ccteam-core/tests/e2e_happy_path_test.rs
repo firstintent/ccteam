@@ -3,7 +3,7 @@
 //! implement → test-author → test-run → fix → ship) by simulating
 //! the assistant's PHASE_DONE sigils directly into progress.jsonl.
 //! This bypasses tmux/claude (those are tested separately in
-//! dispatch_test, fix_loop_test, etc.) and focuses on verifying the
+//! dispatch_test, auto_loop_test, etc.) and focuses on verifying the
 //! orchestrator's decision layer + state.json transitions hold up
 //! across all 6 phases without leaks or mis-routes.
 
@@ -45,9 +45,9 @@ fn fresh(paths: &TempDir) -> CcteamPaths {
 }
 
 /// Pretend the orchestrator dispatched `phase`. `decide_tick` treats
-/// InFlight and FixLocked identically (both block AdvancePhase until
+/// InFlight and AutoLocked identically (both block AdvancePhase until
 /// a `phase_done` event lands), so this fixture uses InFlight
-/// uniformly — the FixLocked branch's actual transition is covered
+/// uniformly — the AutoLocked branch's actual transition is covered
 /// by the orchestrator tests in `state_machine_test.rs` and the
 /// hooks integration tests.
 fn fake_dispatch(state: &mut ProjectState, phase: &str) {

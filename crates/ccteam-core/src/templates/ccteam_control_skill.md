@@ -87,7 +87,7 @@ ccteam new --team=product-research "<idea>"
 ### D) Stuck-project triage
 
 ```bash
-ccteam show <slug> --format json | jq '{phase: .state.current_phase, fix_count: .state.fix_cycle_count, recent: .recent_events[-5:]}'
+ccteam show <slug> --format json | jq '{phase: .state.current_phase, fix_count: .state.auto_loop_cycle_count, recent: .recent_events[-5:]}'
 ccteam peek <slug>
 ```
 
