@@ -222,11 +222,27 @@ pub struct OrchestratorConfig {
     pub subskill_argv: Option<Vec<String>>,
 }
 
+/// Production model identifier passed to `claude --model`. The `[1m]`
+/// suffix is Claude Code's documented opt-in to the 1M-token context
+/// window — verified live against `claude --model claude-sonnet-4-5[1m]`
+/// (Claude Code 2.1.132): server returns "Extra usage is required for
+/// 1M context", which only fires when `[1m]` is recognized as a
+/// well-formed model alias. tech-design §6.1 / §6.9 require the long
+/// context for cache reuse + the 60% phase-boundary reset budget.
+///
+/// V0.2 §7 / dev-plan §9 M0.23.2: 1M default.
+pub const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-4-5[1m]";
+
 impl Default for OrchestratorConfig {
     fn default() -> Self {
         Self {
             tick_interval: Duration::from_secs(30),
-            claude_argv: vec!["claude".into(), "--dangerously-skip-permissions".into()],
+            claude_argv: vec![
+                "claude".into(),
+                "--dangerously-skip-permissions".into(),
+                "--model".into(),
+                DEFAULT_CLAUDE_MODEL.into(),
+            ],
             ready_timeout: Duration::from_secs(60),
             post_ready_warmup: Duration::from_secs(3),
             skip_tool_check: false,
@@ -1222,6 +1238,17 @@ impl Orchestrator {
         // assert "tick fired" without tolerating a 0-delay tick.
         tick.tick().await;
 
+        // M0.23.1: heartbeat so MCP entrypoints / meta-agent skill can
+        // surface "daemon down" via stat alone (no IPC). Fires at a
+        // fixed cadence (`HEARTBEAT_INTERVAL`); supervisors allow a
+        // grace of 2× before declaring the daemon dead.
+        let mut heartbeat = tokio::time::interval(crate::daemon::HEARTBEAT_INTERVAL);
+        // Touch immediately so a freshly-started daemon is observable
+        // before its first 30s elapses.
+        if let Err(err) = crate::daemon::write_heartbeat(&self.paths) {
+            tracing::warn!(error = %err, "initial heartbeat write failed");
+        }
+
         let mut tick_count: u64 = 0;
         let mut event_count: u64 = 0;
 
@@ -1234,11 +1261,17 @@ impl Orchestrator {
                         event_count,
                         "orchestrator shutdown signal received",
                     );
+                    crate::daemon::remove_heartbeat(&self.paths);
                     return Ok(());
                 }
                 _ = tick.tick() => {
                     tick_count += 1;
                     self.poll_tick(tick_count).await?;
+                }
+                _ = heartbeat.tick() => {
+                    if let Err(err) = crate::daemon::write_heartbeat(&self.paths) {
+                        tracing::warn!(error = %err, "heartbeat write failed");
+                    }
                 }
                 Some(event) = rx.recv() => {
                     event_count += 1;
@@ -1810,4 +1843,36 @@ pub fn intersect_open_decisions_with_required_inputs(
         }
     }
     blocking
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    #[test]
+    fn default_claude_argv_enables_1m_context() {
+        // M0.23.2: production claude session must opt into the 1M
+        // context window (`<model>[1m]` Claude Code suffix). tech-design
+        // §6.1 / §6.9 require this for cache reuse + the 60% reset budget.
+        let cfg = OrchestratorConfig::default();
+        let argv = &cfg.claude_argv;
+        assert_eq!(argv.first().map(String::as_str), Some("claude"));
+        assert!(
+            argv.iter().any(|a| a == "--dangerously-skip-permissions"),
+            "default argv must keep --dangerously-skip-permissions: {argv:?}",
+        );
+        let model_idx = argv
+            .iter()
+            .position(|a| a == "--model")
+            .expect("default argv must pass --model");
+        let model = argv
+            .get(model_idx + 1)
+            .expect("--model must be followed by a value");
+        assert!(
+            model.ends_with("[1m]"),
+            "default model must opt into 1M context (got `{model}`); the `[1m]` \
+             suffix is the Claude Code documented 1M alias",
+        );
+        assert_eq!(model, DEFAULT_CLAUDE_MODEL);
+    }
 }

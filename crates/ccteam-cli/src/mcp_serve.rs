@@ -30,8 +30,8 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use ccteam_core::{
-    bootstrap_project, inbox_filename, pick_unused_slug, CcteamPaths, InboxFrontMatter,
-    InboxMessage, ProjectState, SessionMailbox,
+    bootstrap_project, check_daemon_health, inbox_filename, pick_unused_slug, CcteamPaths,
+    DaemonHealth, InboxFrontMatter, InboxMessage, ProjectState, SessionMailbox,
 };
 
 use crate::commands::{
@@ -264,12 +264,36 @@ async fn call_tool(paths: &CcteamPaths, params: &Value) -> Result<Vec<Value>> {
         "ccteam__peek" => Ok(text_content(tool_peek(&args)?)),
         "ccteam__progress" => Ok(text_content(tool_progress(paths, &args)?)),
         "ccteam__new" => Ok(text_content(tool_new(paths, &args)?)),
-        "ccteam__pause" => Ok(text_content(tool_pause(paths, &args)?)),
-        "ccteam__resume" => Ok(text_content(tool_resume(paths, &args)?)),
-        "ccteam__send_to_session" => Ok(text_content(tool_send_to_session(paths, &args)?)),
-        "ccteam__inject_decision" => Ok(text_content(tool_inject_decision(paths, &args)?)),
+        "ccteam__pause" => {
+            require_healthy_daemon(paths)?;
+            Ok(text_content(tool_pause(paths, &args)?))
+        }
+        "ccteam__resume" => {
+            require_healthy_daemon(paths)?;
+            Ok(text_content(tool_resume(paths, &args)?))
+        }
+        "ccteam__send_to_session" => {
+            require_healthy_daemon(paths)?;
+            Ok(text_content(tool_send_to_session(paths, &args)?))
+        }
+        "ccteam__inject_decision" => {
+            require_healthy_daemon(paths)?;
+            Ok(text_content(tool_inject_decision(paths, &args)?))
+        }
         other => Err(anyhow!("unknown tool: {other}")),
     }
+}
+
+/// M0.23.1 + M0.23.3 fail-loud gate for action tools that need a live
+/// orchestrator (state-mutating tools where a dead daemon means the
+/// effect would silently never reach the project session). Pure stat
+/// against the heartbeat file — no IPC.
+fn require_healthy_daemon(paths: &CcteamPaths) -> Result<()> {
+    let health = check_daemon_health(paths);
+    if !health.is_healthy() {
+        return Err(anyhow!(health.describe()));
+    }
+    Ok(())
 }
 
 fn text_content(body: String) -> Vec<Value> {
@@ -303,14 +327,38 @@ fn tool_ls(paths: &CcteamPaths) -> Result<String> {
             })
         })
         .collect();
+    let health = check_daemon_health(paths);
     let body = json!({
         "projects": arr,
         "orchestrator": {
             "active_count": active_count,
             "max_concurrent": ccteam_core::MAX_CONCURRENT_PROJECTS,
+            "daemon_health": daemon_health_json(&health),
         },
     });
     Ok(serde_json::to_string_pretty(&body)?)
+}
+
+/// Stable JSON shape for daemon health: `status` is one of
+/// `healthy|no_heartbeat|stale`; `message` is the human-readable
+/// describe(); `age_secs` carries heartbeat age when available.
+fn daemon_health_json(health: &DaemonHealth) -> Value {
+    match health {
+        DaemonHealth::Healthy { age_secs } => json!({
+            "status": "healthy",
+            "age_secs": age_secs,
+            "message": health.describe(),
+        }),
+        DaemonHealth::NoHeartbeat => json!({
+            "status": "no_heartbeat",
+            "message": health.describe(),
+        }),
+        DaemonHealth::Stale { age_secs } => json!({
+            "status": "stale",
+            "age_secs": age_secs,
+            "message": health.describe(),
+        }),
+    }
 }
 
 fn tool_show(paths: &CcteamPaths, args: &Value) -> Result<String> {
@@ -819,6 +867,8 @@ mod tests {
             projects_root: tmp.path().join("projects"),
         };
         bootstrap_project(&paths, "demo", "demo request", "dev").unwrap();
+        // M0.23.1: action tools require a live daemon heartbeat.
+        ccteam_core::write_heartbeat(&paths).unwrap();
         let req = json!({
             "jsonrpc": "2.0",
             "id": 7,
@@ -844,6 +894,7 @@ mod tests {
             projects_root: tmp.path().join("projects"),
         };
         bootstrap_project(&paths, "demo", "demo request", "dev").unwrap();
+        ccteam_core::write_heartbeat(&paths).unwrap();
         let req = json!({
             "jsonrpc": "2.0",
             "id": 8,
@@ -869,12 +920,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_to_session_fails_loud_when_daemon_down() {
+        ensure_isolation();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        bootstrap_project(&paths, "demo", "demo request", "dev").unwrap();
+        // No heartbeat written → daemon considered down.
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": 70,
+            "method": "tools/call",
+            "params": {
+                "name": "ccteam__send_to_session",
+                "arguments": { "session": "demo", "body": "ignored" }
+            }
+        });
+        let resp = handle_request(&paths, &req).await.unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("daemon"), "got: {text}");
+        // And no inbox entry was created (fail-loud, not silent ack).
+        let inbox = paths.project_ccteam_dir("demo").join("inbox");
+        if inbox.exists() {
+            let entries: Vec<_> = std::fs::read_dir(&inbox).unwrap().collect();
+            assert_eq!(entries.len(), 0, "fail-loud must not write inbox");
+        }
+    }
+
+    #[tokio::test]
+    async fn pause_and_resume_fail_loud_when_daemon_down() {
+        ensure_isolation();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        bootstrap_project(&paths, "demo", "demo request", "dev").unwrap();
+        for tool in ["ccteam__pause", "ccteam__resume"] {
+            let req = json!({
+                "jsonrpc": "2.0",
+                "id": 71,
+                "method": "tools/call",
+                "params": {
+                    "name": tool,
+                    "arguments": { "slug": "demo" }
+                }
+            });
+            let resp = handle_request(&paths, &req).await.unwrap();
+            assert_eq!(resp["result"]["isError"], true, "{tool}");
+            let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains("daemon"), "{tool}: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ls_succeeds_without_daemon_and_annotates_health() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": 72,
+            "method": "tools/call",
+            "params": { "name": "ccteam__ls", "arguments": {} }
+        });
+        let resp = handle_request(&paths, &req).await.unwrap();
+        assert_eq!(resp["result"]["isError"], false);
+        let content = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(content).unwrap();
+        assert_eq!(
+            parsed["orchestrator"]["daemon_health"]["status"],
+            "no_heartbeat",
+            "ls must annotate daemon health when daemon is down"
+        );
+    }
+
+    #[tokio::test]
     async fn handle_tools_call_inject_decision_rejects_unknown_kind() {
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = CcteamPaths {
             root: tmp.path().join("home"),
             projects_root: tmp.path().join("projects"),
         };
+        // Heartbeat present so the daemon-health gate doesn't preempt
+        // the unknown-kind validation we're testing here.
+        ccteam_core::write_heartbeat(&paths).unwrap();
         let req = json!({
             "jsonrpc": "2.0",
             "id": 9,

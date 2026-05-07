@@ -22,11 +22,12 @@
 
 ## 摘要
 
-23 条发现(2026-05-05 加 F21、升级 F20 P1→P0,共增 1 条;2026-05-06 修复 F21;
+25 条发现(2026-05-05 加 F21、升级 F20 P1→P0,共增 1 条;2026-05-06 修复 F21;
 2026-05-06 M4.4 spike 加 F22 P0 + F23 P1 conditional;2026-05-06 修复 F22;
 **2026-05-06 post-M3/M4 sweep**:F2/F3/F4/F9/F10/F11/F12/F13/F20 由 M3 团队
 抽象 + M4 跨项目记忆批量关闭;**2026-05-07 fix_loop → auto_loop rename batch**:
-F1/F5/F6/F7/F8/F18 由独立 PR 一波关闭),分布:
+F1/F5/F6/F7/F8/F18 由独立 PR 一波关闭;**2026-05-08 V0.2 M0.23**:加 F24 + F25
+P0 + 同 PR 关闭),分布:
 
 | 优先级 | 数量 | 编号 |
 |---|---|---|
@@ -34,7 +35,7 @@ F1/F5/F6/F7/F8/F18 由独立 PR 一波关闭),分布:
 | **P1 该做但可后置(剩余)** | 2 | F15(M1+ block-push 时做)、F23(conditional;待 spike 重跑) |
 | **P2 边角(剩余)** | 1 | F17 |
 | **N/A 已是领域无关** | 2 | F14, F19(M3 docs sweep 后)|
-| **已修复** | 18 | F1 / F5 / F6 / F7 / F18(2026-05-07 rename PR;F1 触发逻辑实际早 M3.1 已切到 template.auto_loop,本 PR 完成命名层 sweep)、F2 / F3 / F4(M3.1 dag.rs)、F8(2026-05-07 directory scan)、F9 / F10 / F11(M3.4 team-aware bootstrap;F11 dev 仍裸 `phases/` 但非阻塞)、F12 / F13(M3.3 `--team` CLI + `state.team`)、F16(M3.4 phase 模板 team 化)、F20(M3.1+M3.4 retro_schema 数据形式 + product-research 填字段 + M4.1 phase 消费)、F21(@a5fb21d)、F22(PR #12)|
+| **已修复** | 20 | F1 / F5 / F6 / F7 / F18(2026-05-07 rename PR;F1 触发逻辑实际早 M3.1 已切到 template.auto_loop,本 PR 完成命名层 sweep)、F2 / F3 / F4(M3.1 dag.rs)、F8(2026-05-07 directory scan)、F9 / F10 / F11(M3.4 team-aware bootstrap;F11 dev 仍裸 `phases/` 但非阻塞)、F12 / F13(M3.3 `--team` CLI + `state.team`)、F16(M3.4 phase 模板 team 化)、F20(M3.1+M3.4 retro_schema 数据形式 + product-research 填字段 + M4.1 phase 消费)、F21(@a5fb21d)、F22(PR #12)、**F24 / F25(2026-05-08 M0.23 PR)** |
 
 ### V0.2 §6 反模式候选状态(prd-v0-2.md)
 
@@ -486,6 +487,39 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
   `docs/m4-spike-2026-05-06.md` §4
 - **优先级**:**P1 conditional**——F22 修完后跑 spike;失败才升 P0
 - **来源**:`docs/m4-spike-2026-05-06.md` §4
+
+### F24 — orchestrator daemon 死亡时 MCP 默认 ack 静默成功(**已修复:M0.23.1**)
+
+- **文件:行号**:`crates/ccteam-cli/src/mcp_serve.rs::tool_send_to_session` /
+  `tool_pause` / `tool_resume` / `tool_inject_decision`(M0.23.1 前)
+- **现状**:这些 action 工具写完磁盘 / 改完 state.json 就返回成功,完全
+  不检查 orchestrator 是否在跑——daemon 死了消息派不出去,用户以为成功。
+- **是否真 dev-specific**:**否——是基础设施层(每个团队都需要)。**
+- **解耦方案**(已落):daemon 每 30s touch
+  `~/.ccteam/state/orchestrator.heartbeat`;MCP action 工具入口 stat 该文件
+  mtime,>60s grace 视为死亡,直接返回 error。read-only 工具(`ls`/`show`/
+  `peek`/`progress`)不阻塞,`ls` 响应里附 `orchestrator.daemon_health` 让
+  meta-agent 自决定要不要提示用户。详见 tech-design §6.8。
+- **优先级**:**P0**(用户报告"消息不送达")。
+- **来源**:`docs/dev-plan-v0-2.md §9` M0.23.1 + M0.23.3。
+
+### F25 — 1M context 未默认启用,新项目 claude session 跑标准上下文(**已修复:M0.23.2**)
+
+- **文件:行号**:`crates/ccteam-core/src/orchestrator.rs::OrchestratorConfig::default`
+  (M0.23.2 前 `claude_argv` 只含 `["claude", "--dangerously-skip-permissions"]`)
+- **现状**:tech-design §6.1/§6.9 红线"默认开 1M 上下文",代码却没传 `--model`
+  flag。新项目 claude session 用账户默认 model(标准 200K context),撞 60%
+  reset 阈值会非常快;cache 重用空间也小。
+- **是否真 dev-specific**:**否——所有 team 都长跑,都需要 1M。**
+- **解耦方案**(已落):default `claude_argv` 加 `--model
+  claude-sonnet-4-5[1m]`(`[1m]` 后缀是 Claude Code 文档语法,`claude --model
+  <name>[1m] -p` 实测 server 返回 "Extra usage is required for 1M context"
+  确认语法识别)。常量名 `DEFAULT_CLAUDE_MODEL` exported,后续升 model
+  改这一处。tests 用 `claude_argv: vec!["sh", "-c", ...]` stub 不受影响。
+- **优先级**:**P0**(长跑直接撞 context 上限)。
+- **来源**:`docs/dev-plan-v0-2.md §9` M0.23.2 / `docs/prd-v0-2.md §7`。
+- **后续**:Claude 团队若推出更新 model 别名(eg `claude-sonnet-4-7[1m]`),
+  改 `DEFAULT_CLAUDE_MODEL` 一处即可;CLI flag 形式保持稳定。
 
 ---
 
