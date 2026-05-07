@@ -11,13 +11,13 @@ use serde_json::{json, Map, Value};
 
 use ccteam_core::{
     bootstrap_meta_project, bootstrap_project, current_ccteam_bin, install_ccteam_control_skill,
-    link_recommended_agents, pick_unused_slug, team_bundle, user_claude_dir,
+    link_recommended_agents, pick_unused_slug, user_claude_dir,
     write_all_global_team_templates, write_global_helper_templates,
     write_global_phase_templates, AgentLinkAction, AgentLinkReport, CcteamPaths,
     InstallSkillOptions, LinkOptions, MetaBootstrapReport, OutboxEventKind, OutboxMessage,
     PhaseHistoryEntry, PhaseState, PhaseTemplate, ProjectState, SessionMailbox,
     SkillInstallAction, TeamSpec,
-    ToolSurfaceSnapshot, BUILTIN_SUBAGENTS, HELPER_TEMPLATES, PHASE_TEMPLATES, TEAM_BUNDLES,
+    ToolSurfaceSnapshot, BUILTIN_SUBAGENTS, HELPER_TEMPLATES, PHASE_TEMPLATES,
 };
 use ccteam_core::tmux::TmuxSession;
 
@@ -127,11 +127,15 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
 /// orchestrator can route this project through the matching phase set.
 ///
 /// **M3.3 fail-fast**: non-dev teams require a `team.yaml` to be
-/// loadable — either as `~/.ccteam/teams/<team>/team.yaml` on disk
-/// or as an entry in the embedded `TEAM_BUNDLES` registry. The dev
-/// team is grandfathered in (no team.yaml required) so legacy
-/// installs without `ccteam init` still work. Meta-agent is also
-/// allowed without a team.yaml — its bootstrap path is bespoke.
+/// loadable from `~/.ccteam/teams/<team>/team.yaml`. The dev team is
+/// grandfathered in (no team.yaml required) so legacy installs
+/// without `ccteam init` still work. Meta-agent is also allowed
+/// without a team.yaml — its bootstrap path is bespoke.
+///
+/// V0.2 §6.4 candidate 3: shipped seeds (dev / product-research /
+/// meta-agent) are stamped to disk inside `run_new` so a fresh
+/// install no longer needs an explicit `ccteam init` for the
+/// validation to find them.
 pub fn run_new(paths: &CcteamPaths, request: &str, team: &str) -> Result<String> {
     if request.trim().is_empty() {
         bail!("ccteam new: request must be non-empty");
@@ -139,23 +143,32 @@ pub fn run_new(paths: &CcteamPaths, request: &str, team: &str) -> Result<String>
     if team.trim().is_empty() {
         bail!("ccteam new: --team must be non-empty");
     }
+    // Self-heal shipped seeds before validating — without this, a
+    // first-time `ccteam new --team product-research` against a
+    // freshly-installed binary would fail with "unknown team".
+    // force=false preserves operator hand-edits.
+    if let Err(err) = ccteam_core::write_all_global_team_templates(&paths.root, false) {
+        tracing::warn!(
+            error = %err,
+            root = %paths.root.display(),
+            "ccteam new: could not seed shipped team templates",
+        );
+    }
     ensure_team_resolvable(paths, team)?;
     let slug = pick_unused_slug(paths, request, team)?;
     bootstrap_project(paths, &slug, request, team)?;
     Ok(slug)
 }
 
-/// Resolve `team` against the on-disk + embedded team registry.
-/// Returns `Ok(())` when the team is bootable; otherwise returns a
+/// Resolve `team` against the on-disk team registry. Returns
+/// `Ok(())` when the team is bootable; otherwise returns a
 /// fail-fast error pointing the user at the missing team.yaml.
 ///
 /// Resolution order:
-/// 1. `dev` and `meta-agent` always succeed (legacy paths).
+/// 1. `dev` and `meta-agent` always succeed (legacy / bespoke paths).
 /// 2. If `~/.ccteam/teams/<team>/team.yaml` is on disk, load + validate it.
-/// 3. Else if the team is in the embedded `TEAM_BUNDLES`, succeed
-///    (bootstrap_project will write `~/.ccteam/teams/<team>/team.yaml`
-///    via the templates path on init).
-/// 4. Otherwise fail with a help message.
+/// 3. Otherwise fail with a help message listing the teams currently
+///    on disk.
 fn ensure_team_resolvable(paths: &CcteamPaths, team: &str) -> Result<()> {
     if team == "dev" || team == ccteam_core::META_TEAM_NAME {
         return Ok(());
@@ -167,29 +180,41 @@ fn ensure_team_resolvable(paths: &CcteamPaths, team: &str) -> Result<()> {
         })?;
         return Ok(());
     }
-    if team_bundle(team).is_some() {
-        // Embedded bundle exists; user just hasn't run `ccteam init`
-        // (or did but skipped this team). Recommend init so the
-        // orchestrator startup scan picks the team up consistently.
-        tracing::info!(
-            team,
-            "team has embedded bundle but no team.yaml on disk; \
-             stamp it via `ccteam init` so the orchestrator picks the team up consistently",
-        );
-        return Ok(());
-    }
+    let known = list_disk_teams(paths)
+        .ok()
+        .filter(|t| !t.is_empty())
+        .map(|t| t.join(", "))
+        .unwrap_or_else(|| "(none yet — run `ccteam doctor --reset-shipped-teams`)".into());
     bail!(
         "ccteam new: unknown team `{team}` — \
          create {} (see docs/interfaces.md §5.5 for schema), \
          then re-run.\n\
-         Known embedded teams: {}.",
+         Teams currently on disk: {known}.",
         yaml_path.display(),
-        TEAM_BUNDLES
-            .iter()
-            .map(|(n, _)| *n)
-            .collect::<Vec<_>>()
-            .join(", "),
     )
+}
+
+/// Enumerate teams discoverable under `<global_dir>/teams/<name>/team.yaml`.
+/// Used for error messages so users see what is actually available
+/// (V0.2 §6.4 candidate 3 — disk-driven team registry).
+fn list_disk_teams(paths: &CcteamPaths) -> Result<Vec<String>> {
+    let teams_dir = paths.root.join("teams");
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(&teams_dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(out),
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+            && entry.path().join("team.yaml").exists()
+        {
+            if let Some(name) = entry.file_name().to_str().map(String::from) {
+                out.push(name);
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
 }
 
 /// `ccteam ls`. Returns either a human table or the interfaces.md §10.3
@@ -590,6 +615,14 @@ pub struct DoctorOptions {
     pub install_mcp: bool,
     /// M4.2: install `~/.claude/rules/ccteam-lessons-<team>.md` placeholders.
     pub install_memory_bridge: bool,
+    /// V0.2 M0.16.2: re-write every shipped team
+    /// (`~/.ccteam/teams/<name>/team.yaml` + `~/.ccteam/<phase_dir>/*.md`)
+    /// using the in-binary seed bundle. `force=true` overwrites operator
+    /// hand-edits; `force=false` is equivalent to the auto-seed run on
+    /// `Orchestrator::new`. Useful after a ccteam upgrade ships
+    /// schema-additive team.yaml changes (e.g. the V0.2 `evergreen` /
+    /// `cost_policy` fields landed by M0.16).
+    pub reset_shipped_teams: bool,
 }
 
 /// `ccteam doctor` dispatch. Returns a human-readable report so unit
@@ -600,7 +633,8 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
         || opts.install_skill
         || opts.install_meta_agent.is_some()
         || opts.install_mcp
-        || opts.install_memory_bridge;
+        || opts.install_memory_bridge
+        || opts.reset_shipped_teams;
     if !any_mode {
         return Ok(String::from(
             "ccteam doctor: pass at least one mode flag.\n\
@@ -617,7 +651,9 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
              --install-mcp\n      \
              register `mcpServers.ccteam` in ~/.claude.json so daily-driver claude + meta-agent see the 9-tool MCP server (M2.5).\n  \
              --install-memory-bridge [--dry-run]\n      \
-             write ~/.claude/rules/ccteam-lessons-{dev,product-research}.md placeholders so the retro phase has somewhere to Edit cross-project lessons into (M4.2).\n",
+             write ~/.claude/rules/ccteam-lessons-<team>.md placeholders for every team with non-empty retro_schema (M4.2; V0.2 M0.16.2 — disk-driven team discovery).\n  \
+             --reset-shipped-teams [--force]\n      \
+             re-seed shipped team templates (~/.ccteam/teams/<name>/team.yaml + ~/.ccteam/<phase_dir>/*.md) from the in-binary bundle. Without --force, operator hand-edits are preserved; with --force, every shipped file is overwritten (V0.2 M0.16.2).\n",
         ));
     }
     let mut out = String::new();
@@ -640,16 +676,47 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
         out.push_str(&render_install_mcp_report()?);
     }
     if opts.install_memory_bridge {
-        out.push_str(&render_install_memory_bridge_report(&opts)?);
+        out.push_str(&render_install_memory_bridge_report(paths, &opts)?);
+    }
+    if opts.reset_shipped_teams {
+        out.push_str(&render_reset_shipped_teams_report(paths, &opts)?);
     }
     Ok(out)
 }
 
-fn render_install_memory_bridge_report(opts: &DoctorOptions) -> Result<String> {
+fn render_reset_shipped_teams_report(
+    paths: &CcteamPaths,
+    opts: &DoctorOptions,
+) -> Result<String> {
+    ccteam_core::write_all_global_team_templates(&paths.root, opts.force)?;
+    let mut out = String::from("ccteam doctor --reset-shipped-teams\n\n");
+    if opts.force {
+        out.push_str(
+            "  Re-wrote every shipped team's team.yaml + phase markdowns under \
+             ~/.ccteam/ (--force overwrote operator hand-edits).\n",
+        );
+    } else {
+        out.push_str(
+            "  Seeded shipped teams under ~/.ccteam/ (skipped existing files; \
+             pass --force to overwrite operator hand-edits).\n",
+        );
+    }
+    Ok(out)
+}
+
+fn render_install_memory_bridge_report(paths: &CcteamPaths, opts: &DoctorOptions) -> Result<String> {
+    // V0.2 §6.4 candidate 3: bridge teams are now discovered by
+    // scanning `~/.ccteam/teams/<name>/team.yaml`. Make sure shipped
+    // seeds are present before the scan so a fresh install (no
+    // `ccteam init` yet) still lays down dev / product-research
+    // bridges. force=false preserves operator hand-edits.
+    if !opts.dry_run {
+        ccteam_core::write_all_global_team_templates(&paths.root, false)?;
+    }
     let install_opts = ccteam_core::InstallMemoryBridgeOptions {
         dry_run: opts.dry_run,
     };
-    let reports = ccteam_core::install_memory_bridge(install_opts)?;
+    let reports = ccteam_core::install_memory_bridge(&paths.root, install_opts)?;
     let mut out = if opts.dry_run {
         String::from("ccteam doctor --install-memory-bridge (dry-run)\n\n")
     } else {
@@ -1203,7 +1270,7 @@ fn truncate(s: &str, n: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::OnceLock;
+    use std::sync::{Mutex, OnceLock};
 
     use super::*;
     use ccteam_core::{disable_tool_surface_bootstrap_for_tests, progress};
@@ -1217,6 +1284,19 @@ mod tests {
     static DISABLE_TOOL_SURFACE: OnceLock<()> = OnceLock::new();
     fn ensure_isolation() {
         DISABLE_TOOL_SURFACE.get_or_init(disable_tool_surface_bootstrap_for_tests);
+    }
+
+    /// Serialize tests that mutate `CLAUDE_CONFIG_HOME`. Per CLAUDE.md
+    /// §六, env-mutating tests really belong under
+    /// `crates/*/tests/*.rs` (separate processes), but until that
+    /// migration these tests can race against each other since they
+    /// run in the same process. The mutex makes them deterministic.
+    /// V0.2 M0.16.2 widened the timing window with the extra
+    /// `write_all_global_team_templates` call before
+    /// `install_memory_bridge`.
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
     }
 
     fn fresh_paths(tmp: &TempDir) -> CcteamPaths {
@@ -1262,9 +1342,11 @@ mod tests {
     fn run_new_records_team_in_state_json() {
         // M3.1 F12/F13: --team must persist into state.json so the
         // orchestrator can route this project's phase set.
-        // M3.3: non-dev teams now require ensure_team_resolvable to
-        // succeed — `product-research` is in the embedded TEAM_BUNDLES
-        // so the check passes without a team.yaml on disk.
+        // V0.2 M0.16.2: non-dev teams require team.yaml on disk;
+        // `run_new` self-heals shipped seeds first, so
+        // `product-research`'s yaml lands at
+        // ~/.ccteam/teams/product-research/team.yaml during this
+        // call — no manual `ccteam init` needed.
         ensure_isolation();
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
@@ -1276,8 +1358,9 @@ mod tests {
 
     #[test]
     fn run_new_rejects_unknown_team_with_helpful_error() {
-        // M3.3: unknown team (not embedded, not on disk) must fail-fast
-        // with a clear pointer to ~/.ccteam/teams/<team>/team.yaml.
+        // M3.3 + V0.2 M0.16.2: unknown team (not in shipped seeds, not
+        // on disk after self-heal) must fail-fast with a clear pointer
+        // to ~/.ccteam/teams/<team>/team.yaml.
         ensure_isolation();
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
@@ -1289,17 +1372,18 @@ mod tests {
             msg.contains("teams/marketing/team.yaml"),
             "should point at the missing path",
         );
-        // Should also list the known embedded teams so users see the
-        // catalog of options:
+        // After M0.16.2 self-heal, the disk-driven team list includes
+        // the shipped seeds — the error message lists those so users
+        // see the catalog of options:
         assert!(msg.contains("dev"));
         assert!(msg.contains("product-research"));
     }
 
     #[test]
     fn run_new_accepts_team_yaml_on_disk_for_user_team() {
-        // M3.3: a user-authored team (not in embedded TEAM_BUNDLES)
-        // becomes valid as soon as ~/.ccteam/teams/<team>/team.yaml is
-        // on disk. The fail-fast check loads + validates the YAML.
+        // M3.3: a user-authored team (not shipped) becomes valid as
+        // soon as ~/.ccteam/teams/<team>/team.yaml is on disk. The
+        // fail-fast check loads + validates the YAML.
         ensure_isolation();
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
@@ -1559,6 +1643,7 @@ mod tests {
     #[test]
     fn run_doctor_install_memory_bridge_writes_both_team_files() {
         ensure_isolation();
+        let _guard = env_lock().lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
         std::env::set_var("CLAUDE_CONFIG_HOME", tmp.path().to_str().unwrap());
@@ -1586,6 +1671,7 @@ mod tests {
         // --install-skill, so a single invocation gets the user a
         // ready-to-attach session.
         ensure_isolation();
+        let _guard = env_lock().lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
         // Redirect ~/.claude/ to the tempdir so the skill install
@@ -1617,6 +1703,7 @@ mod tests {
     #[test]
     fn run_doctor_install_skill_only_lays_down_skill_md() {
         ensure_isolation();
+        let _guard = env_lock().lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
         std::env::set_var("CLAUDE_CONFIG_HOME", tmp.path().to_str().unwrap());
@@ -1640,6 +1727,84 @@ mod tests {
             would: Box::new(AgentLinkAction::Linked),
         });
         assert_eq!(label, "would: linked");
+    }
+
+    // ---------------- V0.2 M0.16.2: shipped-team seed regen ----------------
+
+    #[test]
+    fn run_doctor_reset_shipped_teams_seeds_all_teams_under_global_dir() {
+        ensure_isolation();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let opts = DoctorOptions {
+            reset_shipped_teams: true,
+            ..DoctorOptions::default()
+        };
+        let report = run_doctor(&paths, opts).unwrap();
+        assert!(report.contains("reset-shipped-teams"));
+        // Every shipped team's team.yaml lands on disk under the
+        // declared layout. (Layout migration to teams/<name>/ is
+        // M0.17; for now teams/<name>/team.yaml is what
+        // write_all_global_team_templates writes.)
+        for team in ["dev", "product-research", "meta-agent"] {
+            let yaml = paths.root.join("teams").join(team).join("team.yaml");
+            assert!(
+                yaml.is_file(),
+                "shipped team `{team}` not seeded at {}",
+                yaml.display(),
+            );
+        }
+    }
+
+    #[test]
+    fn run_doctor_reset_shipped_teams_preserves_operator_edits_without_force() {
+        ensure_isolation();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+
+        // First seed lays down the shipped dev/team.yaml. Tamper with
+        // it the way an operator would.
+        run_doctor(&paths, DoctorOptions {
+            reset_shipped_teams: true,
+            ..DoctorOptions::default()
+        }).unwrap();
+        let dev_yaml = paths.root.join("teams").join("dev").join("team.yaml");
+        std::fs::write(&dev_yaml, "name: dev\ndescription: hand-edited\n").unwrap();
+
+        // Re-run without --force; the hand-edit must survive.
+        run_doctor(&paths, DoctorOptions {
+            reset_shipped_teams: true,
+            ..DoctorOptions::default()
+        }).unwrap();
+        let body = std::fs::read_to_string(&dev_yaml).unwrap();
+        assert!(body.contains("hand-edited"), "operator edit clobbered without --force");
+
+        // Now with --force, the seed wins again.
+        run_doctor(&paths, DoctorOptions {
+            reset_shipped_teams: true,
+            force: true,
+            ..DoctorOptions::default()
+        }).unwrap();
+        let body = std::fs::read_to_string(&dev_yaml).unwrap();
+        assert!(body.contains("Software development team"));
+        assert!(!body.contains("hand-edited"));
+    }
+
+    #[test]
+    fn run_new_self_heals_shipped_seeds_for_first_time_install() {
+        // V0.2 §6.4 candidate 3: a fresh install (no `ccteam init`) where
+        // ~/.ccteam/teams/ is empty must still let `ccteam new --team
+        // product-research` succeed because run_new self-heals.
+        ensure_isolation();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        assert!(!paths.root.join("teams").exists(), "precondition: empty global dir");
+
+        let slug = run_new(&paths, "Verify product-research bootstraps", "product-research")
+            .expect("run_new must auto-seed shipped templates before validation");
+        assert!(slug.starts_with("product-research-"));
+        // The seed must have landed during run_new.
+        assert!(paths.root.join("teams/product-research/team.yaml").is_file());
     }
 
     // -------- ccteam decisions (M1 follow-up) --------

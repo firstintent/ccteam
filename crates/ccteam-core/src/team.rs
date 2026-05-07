@@ -148,6 +148,48 @@ pub enum EscalateRoute {
     Abort,
 }
 
+/// V0.2 §6.4 candidate 5: cost-handling policy. Replaces the
+/// hardcoded `if state.team == META_TEAM_NAME { skip }` branch in
+/// `enforce_cost_thresholds` with a declarative per-team flag. Three
+/// variants cover the cases in flight:
+///
+/// - `None` — no cost tracking, no warnings, no kill. Used by
+///   evergreen teams (meta-agent) where "cost" is the user's running
+///   tab, not a per-project budget.
+/// - `Track` — log soft / mid warnings but never hard-kill. Reserved
+///   for future "long-running but observable" teams (V0.3+ may use
+///   this for watchdog / reviewer agents).
+/// - `KillAt(usd)` — current dev / product-research behavior: soft +
+///   mid warnings, hard-kill the tmux session when
+///   `state.cost_used_usd > usd`. The threshold is per-team, not
+///   per-project, so a team author sets a sensible default and the
+///   orchestrator uses it unless `state.hard_kill_threshold_usd`
+///   overrides at the project level.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "threshold_usd")]
+pub enum CostPolicy {
+    /// No tracking, no warnings, no kill. Evergreen sessions
+    /// (meta-agent) — cost is the user's running tab, not a per-project
+    /// budget.
+    None,
+    /// Soft + mid warnings only. Never hard-kills.
+    Track,
+    /// Soft + mid warnings + hard-kill at threshold. Default for
+    /// regular phase-DAG teams. Falls back to
+    /// `state.hard_kill_threshold_usd` (default $200) when this
+    /// variant's threshold is `None`.
+    KillAt(Option<f64>),
+}
+
+impl Default for CostPolicy {
+    fn default() -> Self {
+        // Phase-DAG teams default to the historical KillAt path so a
+        // team.yaml that omits `cost_policy` keeps M3 behavior intact.
+        // Evergreen teams (meta-agent) override to `None`.
+        Self::KillAt(None)
+    }
+}
+
 /// `team.yaml` — the team-level config. M3.1 shipped name /
 /// description / retro_schema; M3.2 adds the five fields below so the
 /// orchestrator can route phases / ESCALATE prefixes / golden-rule
@@ -203,6 +245,38 @@ pub struct TeamSpec {
     /// dev currently leaves this empty.
     #[serde(default)]
     pub verdict_schema: Vec<String>,
+
+    // ---------------- V0.2 M0.16 fields (§6.4 candidate 5) ----------------
+    /// Evergreen sessions never reach a phase-DAG terminal state and
+    /// don't follow the AdvancePhase / DispatchPhase loop — they're
+    /// event-loop sessions waiting for inbox messages. The orchestrator
+    /// dispatches them through `process_meta_project` instead of
+    /// `process_project`. Defaults to false so phase-DAG teams behave
+    /// unchanged.
+    ///
+    /// Replaces `if state.team == META_TEAM_NAME` branches in
+    /// `process_project` / `count_active_regular` / `tick`. Any
+    /// user-authored team can opt in (e.g. V0.3 watchdog / reviewer
+    /// agents) without ccteam-core changes.
+    #[serde(default)]
+    pub evergreen: bool,
+
+    /// Cost-handling policy (§6.4 candidate 5). Defaults to
+    /// `KillAt(None)` so phase-DAG teams keep current behavior;
+    /// evergreen teams (meta-agent) opt to `None`. See `CostPolicy`
+    /// for variant semantics.
+    #[serde(default)]
+    pub cost_policy: CostPolicy,
+
+    /// Auto-managed `<project>/CLAUDE.md` body. Replaces the hardcoded
+    /// `match team` in `projects::render_project_claude_md` (§6.2
+    /// candidate 2). `{slug}` and `{team}` placeholders are substituted
+    /// at bootstrap time; everything else lands verbatim.
+    ///
+    /// Empty string keeps a generic fallback body so a team.yaml
+    /// without `claude_md_template` still bootstraps.
+    #[serde(default)]
+    pub claude_md_template: String,
 }
 
 impl TeamSpec {
@@ -436,6 +510,9 @@ mod tests {
             golden_rules: Vec::new(),
             phase_dir: "phases".into(),
             verdict_schema: Vec::new(),
+            evergreen: false,
+            cost_policy: CostPolicy::default(),
+            claude_md_template: String::new(),
         };
         let yaml = serde_yaml::to_string(&original).unwrap();
         let parsed = TeamSpec::parse(&yaml).unwrap();
@@ -649,6 +726,71 @@ mod tests {
         assert!(spec.escalate_grammar_extensions.is_empty());
         assert!(spec.golden_rules.is_empty());
         assert!(spec.verdict_schema.is_empty());
+    }
+
+    // ---------------- V0.2 M0.16 fields (§6.4 candidate 5) ----------------
+
+    #[test]
+    fn m016_evergreen_defaults_false_and_cost_policy_kill_at_none() {
+        let spec = TeamSpec::parse("name: dev\n").unwrap();
+        assert!(!spec.evergreen);
+        assert_eq!(spec.cost_policy, CostPolicy::KillAt(None));
+    }
+
+    #[test]
+    fn m016_evergreen_round_trips() {
+        let src = concat!(
+            "name: meta-agent\n",
+            "evergreen: true\n",
+            "cost_policy:\n",
+            "  kind: none\n",
+        );
+        let spec = TeamSpec::parse(src).unwrap();
+        assert!(spec.evergreen);
+        assert_eq!(spec.cost_policy, CostPolicy::None);
+    }
+
+    #[test]
+    fn m016_cost_policy_track_round_trips() {
+        let src = concat!(
+            "name: x\n",
+            "cost_policy:\n",
+            "  kind: track\n",
+        );
+        let spec = TeamSpec::parse(src).unwrap();
+        assert_eq!(spec.cost_policy, CostPolicy::Track);
+    }
+
+    #[test]
+    fn m016_cost_policy_kill_at_with_threshold_round_trips() {
+        let src = concat!(
+            "name: x\n",
+            "cost_policy:\n",
+            "  kind: kill_at\n",
+            "  threshold_usd: 200.0\n",
+        );
+        let spec = TeamSpec::parse(src).unwrap();
+        assert_eq!(spec.cost_policy, CostPolicy::KillAt(Some(200.0)));
+    }
+
+    #[test]
+    fn m016_claude_md_template_default_is_empty_string() {
+        let spec = TeamSpec::parse("name: dev\n").unwrap();
+        assert!(spec.claude_md_template.is_empty());
+    }
+
+    #[test]
+    fn m016_claude_md_template_round_trips() {
+        let src = concat!(
+            "name: dev\n",
+            "claude_md_template: |\n",
+            "  # CLAUDE.md\n",
+            "  slug: {slug}\n",
+            "  team: {team}\n",
+        );
+        let spec = TeamSpec::parse(src).unwrap();
+        assert!(spec.claude_md_template.contains("{slug}"));
+        assert!(spec.claude_md_template.contains("{team}"));
     }
 
     #[test]

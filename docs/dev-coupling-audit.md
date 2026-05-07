@@ -36,6 +36,21 @@ F1/F5/F6/F7/F8/F18 由独立 PR 一波关闭),分布:
 | **N/A 已是领域无关** | 2 | F14, F19(M3 docs sweep 后)|
 | **已修复** | 18 | F1 / F5 / F6 / F7 / F18(2026-05-07 rename PR;F1 触发逻辑实际早 M3.1 已切到 template.auto_loop,本 PR 完成命名层 sweep)、F2 / F3 / F4(M3.1 dag.rs)、F8(2026-05-07 directory scan)、F9 / F10 / F11(M3.4 team-aware bootstrap;F11 dev 仍裸 `phases/` 但非阻塞)、F12 / F13(M3.3 `--team` CLI + `state.team`)、F16(M3.4 phase 模板 team 化)、F20(M3.1+M3.4 retro_schema 数据形式 + product-research 填字段 + M4.1 phase 消费)、F21(@a5fb21d)、F22(PR #12)|
 
+### V0.2 §6 反模式候选状态(prd-v0-2.md)
+
+PRD V0.2 §6 列了 8 条 ccteam-core 反模式候选清理任务,跟 F-finding
+独立编号但同源(都是"领域字面量泄漏到 core"):
+
+| 候选 | 描述 | 状态 |
+|---|---|---|
+| 1 + 8 | 协议关键字 `PHASE_DONE` / `ESCALATE` 三处镜像 → 单一 source | M0.18 待做 |
+| 2 | `render_project_claude_md` `match team` 写死 | **2026-05-07 关闭(M0.16.3,本 PR)** |
+| 3 | `TEAM_BUNDLES` 编译时常量 → seed-only | **2026-05-07 关闭(M0.16.2,本 PR)** |
+| 5 | meta-agent `if team == META_TEAM_NAME` 5 处分叉 | **2026-05-07 关闭(M0.16.1,本 PR)** |
+| 7 | `RECOMMENDED_AGENTS` ln -sf 8 plugin agent | M0.20 待做 |
+| 4 | `golden_rules` layered merge | V0.3 deferred |
+| 6 | `pre_trust_project` 写 `~/.claude.json` | V0.3 deferred |
+
 **剩余 P0 关键路径**:**只剩 F1**(`auto_loop` 字段已在 phase YAML 里加了
 [M3.1],orchestrator 仍按 `FIX_PHASE_NAME` 字符串触发 `FixLoopState`——需
 切到读 `template.auto_loop`)。完成后 ccteam-core 可彻底放弃 "fix" 这个名字。

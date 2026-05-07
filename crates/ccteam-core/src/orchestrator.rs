@@ -29,7 +29,9 @@ use crate::cost::{self, CostLevel};
 use crate::dag::Dag;
 use crate::auto_loop::{self, AutoLoopState};
 use crate::inbox::{InboxMessage, SessionMailbox};
-use crate::meta_agent::META_TEAM_NAME;
+// `META_TEAM_NAME` is no longer referenced from orchestrator after
+// V0.2 §6.4 candidate 5 — evergreen-team behavior dispatches off
+// `TeamSpec::evergreen` / `cost_policy` flags instead.
 use crate::paths::CcteamPaths;
 use crate::phases::{PhaseTemplate, SubSkillTrigger};
 use crate::progress;
@@ -253,6 +255,13 @@ impl Orchestrator {
     /// refuses to start in a known-bad state instead of silently
     /// routing through agent_team / multi_session paths that aren't
     /// implemented yet.
+    ///
+    /// **Pure load** — no side effects on `~/.ccteam/`. Production
+    /// callers seed shipped templates via `ccteam start` /
+    /// `ccteam init` / `ccteam doctor --reset-shipped-teams` before
+    /// constructing the orchestrator (V0.2 M0.16.2 — keeps tests
+    /// from picking up stray shipped teams when they construct an
+    /// Orchestrator against an empty tempdir).
     pub fn new(paths: CcteamPaths, config: OrchestratorConfig) -> Result<Self> {
         let teams = load_team_runtimes(&paths)?;
         if !config.skip_tool_check {
@@ -283,6 +292,9 @@ impl Orchestrator {
                 golden_rules: Vec::new(),
                 phase_dir: "phases".into(),
                 verdict_schema: Vec::new(),
+                evergreen: false,
+                cost_policy: crate::team::CostPolicy::default(),
+                claude_md_template: String::new(),
             },
             templates: Vec::new(),
             dag: Dag::from_templates(&[])?,
@@ -322,6 +334,28 @@ impl Orchestrator {
     /// Iterate every registered team. Used by `ccteam doctor` and tests.
     pub fn teams(&self) -> impl Iterator<Item = &TeamRuntime> {
         self.teams.values()
+    }
+
+    /// V0.2 §6.4 candidate 5: declarative replacement for
+    /// `state.team == META_TEAM_NAME` branches. Evergreen sessions
+    /// bypass phase-DAG advance, cost hard-kill, and stall warnings.
+    /// An unknown team (no runtime registered) defaults to `false` —
+    /// matching the historical behavior where only meta-agent fell
+    /// into the special branch and everything else ran the regular
+    /// phase-DAG path.
+    pub(crate) fn is_evergreen(&self, team: &str) -> bool {
+        self.team_runtime(team)
+            .is_some_and(|t| t.spec.evergreen)
+    }
+
+    /// V0.2 §6.4 candidate 5: cost policy lookup. Defaults to
+    /// `KillAt(None)` (the historical behavior — hard-kill at
+    /// `state.hard_kill_threshold_usd`) for any unknown team so
+    /// dropping a team.yaml without `cost_policy:` keeps M3 semantics.
+    pub(crate) fn cost_policy(&self, team: &str) -> crate::team::CostPolicy {
+        self.team_runtime(team)
+            .map(|t| t.spec.cost_policy)
+            .unwrap_or_default()
     }
 
     pub fn paths(&self) -> &CcteamPaths {
@@ -547,12 +581,13 @@ impl Orchestrator {
     /// Mutates + persists `state.claude_pid` whenever a new session is
     /// born. Skipped silently for terminal projects.
     pub fn ensure_session(&self, slug: &str, state: &mut ProjectState) -> Result<()> {
-        // Meta-agent sessions never reach a terminal phase state and the
-        // dag check below would skip them — guard meta-agent first so it
-        // always tries to come up.
-        let is_meta = state.team == META_TEAM_NAME;
+        // Evergreen sessions never reach a terminal phase state and the
+        // dag check below would skip them — guard evergreen first so it
+        // always tries to come up. (§6.4 candidate 5 declarative replacement
+        // for the prior `state.team == META_TEAM_NAME` literal.)
+        let is_evergreen = self.is_evergreen(&state.team);
         let team_dag = self.team_runtime(&state.team).map(|t| &t.dag);
-        if !is_meta && team_dag.is_some_and(|d| d.is_terminal_state(state)) {
+        if !is_evergreen && team_dag.is_some_and(|d| d.is_terminal_state(state)) {
             return Ok(());
         }
         let session = TmuxSession::from_name(state.tmux_session.clone());
@@ -604,12 +639,12 @@ impl Orchestrator {
     /// DispatchPhase chain so a phase boundary doesn't take two ticks
     /// to act on. The loop iteration cap is a paranoia guard.
     ///
-    /// Meta-agent projects (`team == META_TEAM_NAME`) bypass the phase
-    /// DAG entirely — they're event-loop sessions, not phase-DAG ones —
-    /// and only get `ensure_session` lifecycle handling. See
-    /// `process_meta_project` for that path.
+    /// Evergreen projects (`team.yaml.evergreen: true`) bypass the
+    /// phase DAG entirely — they're event-loop sessions, not phase-DAG
+    /// ones — and only get `ensure_session` lifecycle handling. See
+    /// `process_meta_project` for that path. (§6.4 candidate 5.)
     pub fn process_project(&self, slug: &str, mut state: ProjectState) -> Result<ProjectState> {
-        if state.team == META_TEAM_NAME {
+        if self.is_evergreen(&state.team) {
             return self.process_meta_project(slug, state);
         }
         // Resolve the project's team runtime. Unknown team in
@@ -1031,7 +1066,11 @@ impl Orchestrator {
         slug: &str,
         mut state: ProjectState,
     ) -> Result<ProjectState> {
-        debug_assert_eq!(state.team, META_TEAM_NAME);
+        debug_assert!(
+            self.is_evergreen(&state.team),
+            "process_meta_project called on non-evergreen team `{}`",
+            state.team,
+        );
         self.ensure_session(slug, &mut state)?;
         if let Err(err) = self.process_session_inbox(slug, &state) {
             tracing::warn!(slug, error = %err, "meta inbox processing failed");
@@ -1137,14 +1176,16 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// Count regular (non-meta) projects whose tmux session is
-    /// currently driving a phase (`InFlight` or `AutoLocked`). The
-    /// concurrency gate (`MAX_CONCURRENT_PROJECTS`) compares this to
-    /// the cap so over-the-limit idle projects wait their turn.
-    pub fn count_active_regular(projects: &[(String, ProjectState)]) -> usize {
+    /// Count phase-DAG projects whose tmux session is currently
+    /// driving a phase (`InFlight` or `AutoLocked`). The concurrency
+    /// gate (`MAX_CONCURRENT_PROJECTS`) compares this to the cap so
+    /// over-the-limit idle projects wait their turn. Evergreen sessions
+    /// are excluded — they're permanent fixtures in the User
+    /// Interaction Layer, not phase-DAG workers (§6.4 candidate 5).
+    pub fn count_active_regular(&self, projects: &[(String, ProjectState)]) -> usize {
         projects
             .iter()
-            .filter(|(_, s)| s.team != META_TEAM_NAME)
+            .filter(|(_, s)| !self.is_evergreen(&s.team))
             .filter(|(_, s)| {
                 matches!(s.phase_state, PhaseState::InFlight | PhaseState::AutoLocked)
             })
@@ -1209,7 +1250,7 @@ impl Orchestrator {
 
     async fn poll_tick(&self, tick_count: u64) -> Result<()> {
         let projects = self.discover_projects()?;
-        let active_regular = Self::count_active_regular(&projects);
+        let active_regular = self.count_active_regular(&projects);
         let total_templates: usize =
             self.teams.values().map(|t| t.templates.len()).sum();
         tracing::debug!(
@@ -1236,12 +1277,15 @@ impl Orchestrator {
                 None => continue, // hard-kill terminated this project
             };
 
-            if state.team == META_TEAM_NAME {
+            if self.is_evergreen(&state.team) {
+                // Evergreen sessions skip the concurrency cap — they're
+                // permanent fixtures in the User Interaction Layer
+                // (§6.4 candidate 5).
                 if let Err(err) = self.process_project(&slug, state) {
                     tracing::error!(
                         slug,
                         error = format!("{err:#}"),
-                        "meta tick failed",
+                        "evergreen tick failed",
                     );
                 }
                 continue;
@@ -1296,11 +1340,15 @@ impl Orchestrator {
         slug: &str,
         mut state: ProjectState,
     ) -> Result<Option<ProjectState>> {
-        // Meta-agent sessions are evergreen and don't fit "hard kill on
-        // budget" semantics — their cost is the user's running tab, not
-        // a per-project budget. M1 lets them through; M4 may want a
-        // separate ladder when conversation continuity (M4.6) lands.
-        if state.team == META_TEAM_NAME {
+        use crate::team::CostPolicy;
+        // V0.2 §6.4 candidate 5: declarative cost policy per team.
+        // `CostPolicy::None` (evergreen meta-agent) bypasses entirely.
+        // `CostPolicy::Track` logs soft / mid warnings but never kills.
+        // `CostPolicy::KillAt(threshold)` is the historical dev /
+        // product-research path; `threshold = None` falls back to
+        // `state.hard_kill_threshold_usd` (default $200 from M1).
+        let policy = self.cost_policy(&state.team);
+        if matches!(policy, CostPolicy::None) {
             return Ok(Some(state));
         }
         if self
@@ -1324,7 +1372,19 @@ impl Orchestrator {
                 cost::COST_MID_WARN_USD,
             ),
             CostLevel::HardKill => {
-                let hard = state.hard_kill_threshold_usd;
+                if matches!(policy, CostPolicy::Track) {
+                    // Track policy: log + return, never kill.
+                    tracing::error!(
+                        slug,
+                        cost = state.cost_used_usd,
+                        "cost over hard threshold but team policy is `track`; logging only",
+                    );
+                    return Ok(Some(state));
+                }
+                let hard = match policy {
+                    CostPolicy::KillAt(Some(team_override)) => team_override,
+                    _ => state.hard_kill_threshold_usd,
+                };
                 tracing::error!(
                     slug,
                     cost = state.cost_used_usd,
@@ -1371,11 +1431,12 @@ impl Orchestrator {
     }
 
     fn warn_if_stalled(&self, slug: &str, state: &ProjectState, now: chrono::DateTime<Utc>) {
-        // Meta-agent sessions sit idle by design (waiting for the next
+        // Evergreen sessions sit idle by design (waiting for the next
         // NL message) — stall semantics don't apply. dag.is_terminal_state
         // would also return false for them since they have no phase
-        // history, so guard explicitly.
-        if state.team == META_TEAM_NAME {
+        // history, so guard explicitly. (§6.4 candidate 5 declarative
+        // replacement.)
+        if self.is_evergreen(&state.team) {
             return;
         }
         let team = self.team_runtime(&state.team);
@@ -1605,28 +1666,42 @@ fn load_team_runtimes(paths: &CcteamPaths) -> Result<HashMap<String, TeamRuntime
             let spec = TeamSpec::load(&yaml).with_context(|| {
                 format!("load team.yaml at {}", yaml.display())
             })?;
-            let phase_dir = paths.root.join(&spec.phase_dir);
-            if !phase_dir.exists() {
-                tracing::warn!(
-                    team = %spec.name,
-                    phase_dir = %phase_dir.display(),
-                    "team registered but phase_dir is missing; \
-                     run `ccteam init` to populate templates",
-                );
-                continue;
-            }
-            let templates = load_phase_templates(&phase_dir)?;
-            for t in &templates {
-                t.validate_m0().with_context(|| {
-                    format!(
-                        "team `{}` phase template `{}` failed M0 validation",
-                        spec.name, t.name,
-                    )
+            // V0.2 §6.4 candidate 5: evergreen teams (meta-agent) ship
+            // an empty phase set — they're event-loop sessions, not
+            // phase-DAG ones. Skip the phase_dir presence check + the
+            // template load; the resulting TeamRuntime carries an
+            // empty templates Vec and an empty DAG, which `decide_tick`
+            // handles via early NoOp.
+            let (templates, dag) = if spec.evergreen {
+                let dag = Dag::from_templates(&[]).with_context(|| {
+                    format!("team `{}` build empty phase DAG", spec.name)
                 })?;
-            }
-            let dag = Dag::from_templates(&templates).with_context(|| {
-                format!("team `{}` build phase DAG", spec.name)
-            })?;
+                (Vec::new(), dag)
+            } else {
+                let phase_dir = paths.root.join(&spec.phase_dir);
+                if !phase_dir.exists() {
+                    tracing::warn!(
+                        team = %spec.name,
+                        phase_dir = %phase_dir.display(),
+                        "team registered but phase_dir is missing; \
+                         run `ccteam init` to populate templates",
+                    );
+                    continue;
+                }
+                let templates = load_phase_templates(&phase_dir)?;
+                for t in &templates {
+                    t.validate_m0().with_context(|| {
+                        format!(
+                            "team `{}` phase template `{}` failed M0 validation",
+                            spec.name, t.name,
+                        )
+                    })?;
+                }
+                let dag = Dag::from_templates(&templates).with_context(|| {
+                    format!("team `{}` build phase DAG", spec.name)
+                })?;
+                (templates, dag)
+            };
             teams.insert(
                 spec.name.clone(),
                 TeamRuntime {
@@ -1662,6 +1737,9 @@ fn load_team_runtimes(paths: &CcteamPaths) -> Result<HashMap<String, TeamRuntime
                     golden_rules: Vec::new(),
                     phase_dir: "phases".into(),
                     verdict_schema: Vec::new(),
+                    evergreen: false,
+                    cost_policy: crate::team::CostPolicy::default(),
+                    claude_md_template: String::new(),
                 };
                 teams.insert(
                     "dev".into(),

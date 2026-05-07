@@ -15,9 +15,9 @@ use std::time::Duration;
 use ccteam_core::tmux::{tmux_available, TmuxSession};
 use ccteam_core::{
     bootstrap_meta_project, bootstrap_project, disable_tool_surface_bootstrap_for_tests,
-    inbox_filename, write_global_phase_templates, CcteamPaths, InboxFrontMatter, InboxMessage,
-    Orchestrator, OrchestratorConfig, PhaseState, ProjectState, SessionMailbox,
-    MAX_CONCURRENT_PROJECTS, META_TEAM_NAME,
+    inbox_filename, write_all_global_team_templates, write_global_phase_templates, CcteamPaths,
+    InboxFrontMatter, InboxMessage, Orchestrator, OrchestratorConfig, PhaseState, ProjectState,
+    SessionMailbox, MAX_CONCURRENT_PROJECTS, META_TEAM_NAME,
 };
 use chrono::Utc;
 use tempfile::TempDir;
@@ -45,8 +45,37 @@ fn write_solo_phases(paths: &CcteamPaths) {
     write_global_phase_templates(&paths.root, true).unwrap();
 }
 
+/// Seed every shipped team (`teams/<name>/team.yaml`) so
+/// `Orchestrator::new`'s `load_team_runtimes` registers them. Tests
+/// exercising the V0.2 evergreen flag (meta-agent dispatched off
+/// `TeamSpec::evergreen` rather than a string compare) need this.
+fn seed_all_teams(paths: &CcteamPaths) {
+    write_all_global_team_templates(&paths.root, true).unwrap();
+}
+
+/// Build an `Orchestrator` with all shipped teams seeded so
+/// `count_active_regular` / `is_evergreen` work for meta-agent.
+fn orch_with_all_teams(paths: &CcteamPaths) -> Orchestrator {
+    seed_all_teams(paths);
+    Orchestrator::new(
+        paths.clone(),
+        OrchestratorConfig {
+            ready_timeout: Duration::from_secs(5),
+            post_ready_warmup: Duration::from_millis(0),
+            skip_tool_check: true,
+            ..OrchestratorConfig::default()
+        },
+    )
+    .unwrap()
+}
+
 #[test]
 fn count_active_regular_excludes_meta_team() {
+    isolation();
+    let tmp = TempDir::new().unwrap();
+    let paths = fresh_paths(&tmp);
+    let orch = orch_with_all_teams(&paths);
+
     let mut a = ProjectState::initial("p-1".into());
     a.phase_state = PhaseState::InFlight;
     let mut b = ProjectState::initial("p-2".into());
@@ -62,7 +91,7 @@ fn count_active_regular_excludes_meta_team() {
         ("p-3".into(), idle),
         ("rob-meta".into(), meta),
     ];
-    assert_eq!(Orchestrator::count_active_regular(&projects), 2);
+    assert_eq!(orch.count_active_regular(&projects), 2);
 }
 
 #[test]
@@ -189,7 +218,9 @@ fn meta_project_skips_phase_dispatch() {
     isolation();
     let tmp = TempDir::new().unwrap();
     let paths = fresh_paths(&tmp);
-    write_solo_phases(&paths);
+    // V0.2 §6.4 candidate 5: seed every shipped team so meta-agent's
+    // `evergreen: true` flag drives the dispatch.
+    seed_all_teams(&paths);
     // Per-test user handle so concurrent tmux session names don't collide.
     let user = format!("rob-skip-{}", std::process::id());
     let report = bootstrap_meta_project(&paths, &user).unwrap();
@@ -244,6 +275,11 @@ fn meta_project_skips_phase_dispatch() {
 
 #[test]
 fn poll_tick_caps_active_regular_projects_at_three() {
+    isolation();
+    let tmp = TempDir::new().unwrap();
+    let paths = fresh_paths(&tmp);
+    let orch = orch_with_all_teams(&paths);
+
     // We don't actually want to spin tmux for 5 projects in a unit
     // test, so we exercise the budget arithmetic directly. The pure
     // counter is the load-bearing assertion; the dispatch path itself
@@ -264,7 +300,7 @@ fn poll_tick_caps_active_regular_projects_at_three() {
         ("q1".into(), q1),
         ("q2".into(), q2),
     ];
-    let active = Orchestrator::count_active_regular(&projects);
+    let active = orch.count_active_regular(&projects);
     assert_eq!(active, 3);
     let budget = MAX_CONCURRENT_PROJECTS.saturating_sub(active);
     assert_eq!(
@@ -282,7 +318,12 @@ fn meta_context_reset_appends_progress_summary_to_claude_md() {
     isolation();
     let tmp = TempDir::new().unwrap();
     let paths = fresh_paths(&tmp);
-    write_solo_phases(&paths);
+    // V0.2 §6.4 candidate 5: seed every shipped team so meta-agent's
+    // `evergreen: true` flag is loadable when Orchestrator::new walks
+    // ~/.ccteam/teams/. Without this, `is_evergreen("meta-agent")`
+    // returns false and `process_project` skips the meta dispatch
+    // path entirely.
+    seed_all_teams(&paths);
     let user = format!("rob-reset-{}", std::process::id());
     let report = bootstrap_meta_project(&paths, &user).unwrap();
 
@@ -338,6 +379,11 @@ fn meta_context_reset_appends_progress_summary_to_claude_md() {
 
 #[test]
 fn meta_project_does_not_consume_concurrency_budget() {
+    isolation();
+    let tmp = TempDir::new().unwrap();
+    let paths = fresh_paths(&tmp);
+    let orch = orch_with_all_teams(&paths);
+
     let mut a = ProjectState::initial("p1".into());
     a.phase_state = PhaseState::InFlight;
     let mut b = ProjectState::initial("p2".into());
@@ -350,9 +396,9 @@ fn meta_project_does_not_consume_concurrency_budget() {
         ("p2".into(), b),
         ("rob-meta".into(), meta),
     ];
-    assert_eq!(Orchestrator::count_active_regular(&projects), 2);
+    assert_eq!(orch.count_active_regular(&projects), 2);
     assert!(
-        MAX_CONCURRENT_PROJECTS - Orchestrator::count_active_regular(&projects) > 0,
+        MAX_CONCURRENT_PROJECTS - orch.count_active_regular(&projects) > 0,
         "meta should leave at least one budget slot",
     );
 }

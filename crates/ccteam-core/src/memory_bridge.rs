@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+use crate::team::TeamSpec;
 use crate::tool_surface::user_claude_dir;
 
 const DEV_TEMPLATE: &str = include_str!("templates/memory_bridge_dev.md");
@@ -33,13 +34,72 @@ const CANONICAL_MARKED_BLOCK: &str = "<!-- ccteam-managed:lessons begin -->\n\
 (Empty until first retro. Phase prompts append lessons here using `Edit`.)\n\
 <!-- ccteam-managed:lessons end -->";
 
-/// Teams whose lessons file the bridge ships. Keep in lock-step with
-/// `teams/<name>.yaml` — every team consuming `retro_schema` needs a
-/// matching rules file or its retro phase has nowhere to `Edit`.
-const TEAMS: &[(&str, &str)] = &[
-    ("dev", DEV_TEMPLATE),
-    ("product-research", PRODUCT_RESEARCH_TEMPLATE),
-];
+/// V0.2 §6.4 candidate 3: which teams need a memory bridge is now
+/// disk-driven. Scan `<global_dir>/teams/<name>/team.yaml`; any team
+/// with a non-empty `retro_schema` gets a `~/.claude/rules/ccteam-lessons-<name>.md`
+/// scaffold. Shipped teams (dev / product-research) keep their richer
+/// embedded templates; user-authored teams fall back to a generic
+/// scaffold built from the team description.
+fn discover_bridge_teams(global_dir: &Path) -> Vec<(String, String)> {
+    let teams_dir = global_dir.join("teams");
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(&teams_dir) {
+        Ok(e) => e,
+        Err(_) => return out, // ~/.ccteam/teams/ not yet seeded
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let yaml = entry.path().join("team.yaml");
+        if !yaml.exists() {
+            continue;
+        }
+        let spec = match TeamSpec::load(&yaml) {
+            Ok(s) => s,
+            Err(err) => {
+                tracing::warn!(
+                    path = %yaml.display(),
+                    error = %err,
+                    "memory_bridge: skipping team with malformed team.yaml",
+                );
+                continue;
+            }
+        };
+        if spec.retro_schema.is_empty() {
+            continue;
+        }
+        let body = lookup_bridge_template(&spec);
+        out.push((spec.name, body));
+    }
+    out
+}
+
+/// Map a team to its bridge file body. Shipped teams use the curated
+/// `memory_bridge_<name>.md` template; user-authored teams get a
+/// generic scaffold derived from the team's description so a fresh
+/// `ccteam team publish` immediately has somewhere for retros to
+/// `Edit` cross-project lessons into.
+fn lookup_bridge_template(spec: &TeamSpec) -> String {
+    match spec.name.as_str() {
+        "dev" => DEV_TEMPLATE.to_string(),
+        "product-research" => PRODUCT_RESEARCH_TEMPLATE.to_string(),
+        _ => generic_bridge_template(spec),
+    }
+}
+
+fn generic_bridge_template(spec: &TeamSpec) -> String {
+    let description = if spec.description.trim().is_empty() {
+        format!("`{}` team", spec.name)
+    } else {
+        spec.description.trim().to_string()
+    };
+    format!(
+        "---\ndescription: cross-project memory for {description}. Appended by retro phases at session end; only the marker block is ccteam-managed.\nactivation:\n  paths:\n    - ~/projects/{name}-*\n---\n\n# Lessons learned ({name} team)\n\n(Empty until first retro. Phase prompts append lessons here using `Edit`.)\n\n<!-- ccteam-managed:lessons begin -->\n<!-- ccteam-managed:lessons end -->\n",
+        description = description,
+        name = spec.name,
+    )
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct InstallMemoryBridgeOptions {
@@ -70,17 +130,25 @@ pub enum MemoryBridgeAction {
     },
 }
 
-/// Install both team lessons files into `~/.claude/rules/`.
+/// Install lessons files for every team with a non-empty
+/// `retro_schema` into `~/.claude/rules/`. Teams are discovered by
+/// scanning `<global_dir>/teams/` (V0.2 §6.4 candidate 3 — formerly a
+/// hardcoded `const TEAMS` lock-stepped with the in-binary
+/// TEAM_BUNDLES).
 pub fn install_memory_bridge(
+    global_dir: &Path,
     opts: InstallMemoryBridgeOptions,
 ) -> Result<Vec<MemoryBridgeReport>> {
     let claude = user_claude_dir().context("resolve ~/.claude/")?;
-    install_into(&claude, opts)
+    install_into(global_dir, &claude, opts)
 }
 
-/// Test-injectable variant: write under `<claude_dir>/rules/...` so unit
-/// tests can point at a tempdir without mutating `$HOME/.claude/`.
+/// Test-injectable variant: write under `<claude_dir>/rules/...` so
+/// unit tests can point at a tempdir without mutating `$HOME/.claude/`.
+/// `global_dir` is the equivalent of `~/.ccteam/` — `teams/<name>/team.yaml`
+/// underneath it drives which teams get a bridge.
 pub fn install_into(
+    global_dir: &Path,
     claude_dir: &Path,
     opts: InstallMemoryBridgeOptions,
 ) -> Result<Vec<MemoryBridgeReport>> {
@@ -89,13 +157,14 @@ pub fn install_into(
         std::fs::create_dir_all(&rules_dir)
             .with_context(|| format!("create {}", rules_dir.display()))?;
     }
-    let mut reports = Vec::with_capacity(TEAMS.len());
-    for (team, template) in TEAMS {
+    let teams = discover_bridge_teams(global_dir);
+    let mut reports = Vec::with_capacity(teams.len());
+    for (team, template) in &teams {
         let target = rules_dir.join(format!("ccteam-lessons-{team}.md"));
         let action = install_one(&target, template, opts)
             .with_context(|| format!("install memory bridge for team {team}"))?;
         reports.push(MemoryBridgeReport {
-            team: (*team).to_string(),
+            team: team.clone(),
             target,
             action,
         });
@@ -190,11 +259,23 @@ mod tests {
         std::fs::read_to_string(path).unwrap()
     }
 
+    /// Seed shipped team yamls under `<tmp>/ccteam-home/teams/<name>/`
+    /// so `install_into(global, claude, ...)` finds dev / product-research
+    /// during the disk scan introduced in V0.2 §6.4 candidate 3.
+    /// Returns `(global_dir, claude_dir)` — claude_dir is `<tmp>/`,
+    /// matching the historical layout the per-test assertions expect.
+    fn seed(tmp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+        let global = tmp.path().join("ccteam-home");
+        crate::templates::write_all_global_team_templates(&global, true).unwrap();
+        (global, tmp.path().to_path_buf())
+    }
+
     #[test]
     fn install_creates_both_lessons_files_with_intact_markers() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let (global, claude) = seed(&tmp);
         let reports =
-            install_into(tmp.path(), InstallMemoryBridgeOptions::default()).unwrap();
+            install_into(&global, &claude, InstallMemoryBridgeOptions::default()).unwrap();
         assert_eq!(reports.len(), 2);
         for r in &reports {
             assert_eq!(r.action, MemoryBridgeAction::Wrote);
@@ -214,13 +295,14 @@ mod tests {
     #[test]
     fn install_idempotent_when_files_present_and_intact() {
         let tmp = tempfile::TempDir::new().unwrap();
-        install_into(tmp.path(), InstallMemoryBridgeOptions::default()).unwrap();
+        let (global, claude) = seed(&tmp);
+        install_into(&global, &claude, InstallMemoryBridgeOptions::default()).unwrap();
         // Capture baseline content (including default empty marked block body).
         let dev_target = tmp.path().join("rules/ccteam-lessons-dev.md");
         let baseline = read(&dev_target);
 
         let reports2 =
-            install_into(tmp.path(), InstallMemoryBridgeOptions::default()).unwrap();
+            install_into(&global, &claude, InstallMemoryBridgeOptions::default()).unwrap();
         for r in &reports2 {
             assert_eq!(r.action, MemoryBridgeAction::AlreadyPresent);
         }
@@ -232,7 +314,8 @@ mod tests {
     fn install_preserves_lessons_written_between_markers() {
         // Simulate a retro phase having edited the marked block.
         let tmp = tempfile::TempDir::new().unwrap();
-        install_into(tmp.path(), InstallMemoryBridgeOptions::default()).unwrap();
+        let (global, claude) = seed(&tmp);
+        install_into(&global, &claude, InstallMemoryBridgeOptions::default()).unwrap();
         let dev_target = tmp.path().join("rules/ccteam-lessons-dev.md");
         let with_lessons = read(&dev_target).replace(
             "(Empty until first retro. Phase prompts append lessons here using `Edit`.)",
@@ -241,7 +324,7 @@ mod tests {
         std::fs::write(&dev_target, &with_lessons).unwrap();
 
         let reports =
-            install_into(tmp.path(), InstallMemoryBridgeOptions::default()).unwrap();
+            install_into(&global, &claude, InstallMemoryBridgeOptions::default()).unwrap();
         assert_eq!(reports[0].action, MemoryBridgeAction::AlreadyPresent);
         let after = read(&dev_target);
         assert!(after.contains("Rust 1.78 + tokio"), "lessons clobbered");
@@ -251,6 +334,7 @@ mod tests {
     #[test]
     fn install_repairs_missing_markers_and_keeps_user_content() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let (global, claude) = seed(&tmp);
         let rules_dir = tmp.path().join("rules");
         std::fs::create_dir_all(&rules_dir).unwrap();
         let target = rules_dir.join("ccteam-lessons-dev.md");
@@ -262,7 +346,7 @@ mod tests {
         .unwrap();
 
         let reports =
-            install_into(tmp.path(), InstallMemoryBridgeOptions::default()).unwrap();
+            install_into(&global, &claude, InstallMemoryBridgeOptions::default()).unwrap();
         assert_eq!(reports[0].action, MemoryBridgeAction::RepairedMarkedSection);
         let after = read(&target);
         assert!(after.contains("# manually authored notes"));
@@ -273,6 +357,7 @@ mod tests {
     #[test]
     fn install_repairs_duplicated_marker_blocks() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let (global, claude) = seed(&tmp);
         let rules_dir = tmp.path().join("rules");
         std::fs::create_dir_all(&rules_dir).unwrap();
         let target = rules_dir.join("ccteam-lessons-dev.md");
@@ -284,7 +369,7 @@ mod tests {
         std::fs::write(&target, &dup).unwrap();
 
         let reports =
-            install_into(tmp.path(), InstallMemoryBridgeOptions::default()).unwrap();
+            install_into(&global, &claude, InstallMemoryBridgeOptions::default()).unwrap();
         assert_eq!(reports[0].action, MemoryBridgeAction::RepairedMarkedSection);
         let after = read(&target);
         assert!(marked_section_intact(&after));
@@ -296,6 +381,7 @@ mod tests {
     #[test]
     fn install_repairs_unbalanced_begin_marker() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let (global, claude) = seed(&tmp);
         let rules_dir = tmp.path().join("rules");
         std::fs::create_dir_all(&rules_dir).unwrap();
         let target = rules_dir.join("ccteam-lessons-dev.md");
@@ -306,7 +392,7 @@ mod tests {
         std::fs::write(&target, &body).unwrap();
 
         let reports =
-            install_into(tmp.path(), InstallMemoryBridgeOptions::default()).unwrap();
+            install_into(&global, &claude, InstallMemoryBridgeOptions::default()).unwrap();
         assert_eq!(reports[0].action, MemoryBridgeAction::RepairedMarkedSection);
         let after = read(&target);
         assert!(marked_section_intact(&after));
@@ -320,18 +406,63 @@ mod tests {
     #[test]
     fn dry_run_reports_actions_without_touching_disk() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let (global, claude) = seed(&tmp);
         let opts = InstallMemoryBridgeOptions { dry_run: true };
-        let reports = install_into(tmp.path(), opts).unwrap();
+        let reports = install_into(&global, &claude, opts).unwrap();
         for r in &reports {
             assert_eq!(r.action, MemoryBridgeAction::DryRun { would_write: true });
             assert!(!r.target.exists(), "dry-run wrote {}", r.target.display());
         }
         // Now install for real; second dry-run should report no-op.
-        install_into(tmp.path(), InstallMemoryBridgeOptions::default()).unwrap();
-        let reports2 = install_into(tmp.path(), opts).unwrap();
+        install_into(&global, &claude, InstallMemoryBridgeOptions::default()).unwrap();
+        let reports2 = install_into(&global, &claude, opts).unwrap();
         for r in &reports2 {
             assert_eq!(r.action, MemoryBridgeAction::DryRun { would_write: false });
         }
+    }
+
+    #[test]
+    fn install_skips_team_when_retro_schema_is_empty() {
+        // V0.2 §6.4 candidate 3: meta-agent ships with `retro_schema: []`,
+        // so the disk-scan path must NOT install a bridge for it. Also
+        // verifies the discovery is data-driven — adding a team.yaml
+        // with retro_schema produces a bridge without touching ccteam-core.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (global, claude) = seed(&tmp);
+        let reports =
+            install_into(&global, &claude, InstallMemoryBridgeOptions::default()).unwrap();
+        assert!(
+            reports.iter().all(|r| r.team != "meta-agent"),
+            "meta-agent has empty retro_schema and must not get a bridge: {:?}",
+            reports.iter().map(|r| &r.team).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn install_picks_up_user_authored_team_via_disk_scan() {
+        // V0.2 §6.4 candidate 3 — the team registry is now disk-driven.
+        // A user-authored team.yaml with non-empty retro_schema gets a
+        // bridge (with the generic fallback template) without ccteam-core
+        // changes.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (global, claude) = seed(&tmp);
+        let custom_dir = global.join("teams").join("custom");
+        std::fs::create_dir_all(&custom_dir).unwrap();
+        std::fs::write(
+            custom_dir.join("team.yaml"),
+            "name: custom\ndescription: A user-authored team\nphase_dir: phases-custom\nretro_schema:\n  - field: outcomes\n    description: Things observed\n",
+        )
+        .unwrap();
+        let reports =
+            install_into(&global, &claude, InstallMemoryBridgeOptions::default()).unwrap();
+        let custom = reports
+            .iter()
+            .find(|r| r.team == "custom")
+            .expect("custom team bridge missing");
+        assert_eq!(custom.action, MemoryBridgeAction::Wrote);
+        let body = read(&custom.target);
+        assert!(body.contains("ccteam-managed:lessons begin"));
+        assert!(body.contains("custom"));
     }
 
     #[test]

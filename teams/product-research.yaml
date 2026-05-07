@@ -2,6 +2,28 @@ name: product-research
 description: Product research team — should we build this idea?
 phase_dir: phases-product-research
 
+# V0.2 §6.4 candidate 2 — auto-managed `<project>/CLAUDE.md` body.
+# `{slug}` and `{team}` get substituted at bootstrap time. Replaces
+# the prior `match team { "product-research" => ... }` branch in
+# projects::render_project_claude_md.
+claude_md_template: |
+  # CLAUDE.md (auto-managed by ccteam)
+
+  ## 项目上下文
+  - slug: {slug}
+  - team: product-research
+  - 用户原始需求: 见 .ccteam/spec.md
+
+  ## 工作约定
+  - 不写代码,只产研究报告。
+  - 至少 3 个独立信息源,**不要编造数据**;不确定时标 "未确认"。
+  - 决策走 outbox(`async` 模式)或 AskUserQuestion,**不要**自行假设关键事实。
+
+  ## 不做的事
+  - 不要修改 .ccteam/ 之外的元数据。
+  - 不要在 verdict 之前下定论 — 让 phase DAG 走完。
+  - 不要把 dev 的 "测试不过不算完成" 套用到本项目;研究报告的 done 是 verdict.md 写出 + rationale.md 自洽。
+
 # Phase that produces a verdict markdown (interfaces §5.3 schema).
 # `verdict.md` PASS/CONCERN/REJECT/CLARIFY drives downstream decisions.
 verdict_schema:

@@ -6,13 +6,18 @@
 //! project requests via `ccteam new`, monitors active projects, and
 //! routes inbox/outbox messages.
 //!
-//! Two design rules locked by `docs/development-plan.md` §3 M1:
+//! Two design rules:
 //!
-//! 1. **Hardcoded `team == "meta-agent"` branch**: meta-agent behavior
-//!    (event loop, no phase DAG, never terminal) doesn't fit the phase-DAG
-//!    team contract; M3.4 may revisit. M1 wires a single `if state.team
-//!    == META_TEAM_NAME` branch in the orchestrator (see
-//!    `Orchestrator::process_project`).
+//! 1. **Evergreen flag, not hardcoded branch** (V0.2 §6.4 candidate 5):
+//!    meta-agent behavior (event loop, no phase DAG, never terminal,
+//!    no per-project cost cap) is declared in
+//!    `teams/meta-agent.yaml` via `evergreen: true` + `cost_policy:
+//!    {kind: none}`. The orchestrator dispatches off these flags
+//!    (`Orchestrator::is_evergreen` / `cost_policy`) — any
+//!    user-authored evergreen team (e.g. V0.3 watchdog / reviewer
+//!    agents) takes the same code path. The
+//!    `Orchestrator::process_meta_project` call still drives the
+//!    actual session lifecycle.
 //! 2. **Role prompt template lives in-binary**: shipped as
 //!    `include_str!`, rendered at bootstrap time with the user handle
 //!    interpolated. Anything fancier (hot-reload, per-user templates)
@@ -28,10 +33,13 @@ use crate::paths::CcteamPaths;
 use crate::projects::{bootstrap_project, slugify};
 use crate::state::ProjectState;
 
-/// Special team string the orchestrator uses to dispatch the
-/// meta-agent state machine instead of the phase-DAG one. Hardcoded
-/// for M1; M3.4 may turn it into a `TeamSpec` flag (see
-/// development-plan §3 M1 lock #4).
+/// Canonical team name for the user-facing NL dispatcher session.
+/// V0.2 §6.4 candidate 5: behavior is now driven by
+/// `teams/meta-agent.yaml.evergreen: true` rather than a string
+/// comparison in the orchestrator. This const remains as the slug
+/// passed to `bootstrap_project` so meta-agent's state.json says
+/// `team: meta-agent` and the orchestrator looks up its TeamSpec by
+/// the same key.
 pub const META_TEAM_NAME: &str = "meta-agent";
 
 /// tmux session prefix for meta-agent sessions. The full name is
