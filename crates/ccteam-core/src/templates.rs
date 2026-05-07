@@ -27,13 +27,17 @@ pub const PROJECT_SETTINGS_JSON: &str = include_str!("templates/settings.json");
 /// up via `team_bundle("dev")` so multi-team installs keep working.
 pub const PHASE_TEMPLATES: &[(&str, &str)] = DEV_PHASE_TEMPLATES;
 
+// V0.2 M0.17.1: shipped phases now live under `teams/<name>/phases/`
+// alongside their `team.yaml` (was `phases/` / `phases-product-research/`
+// at repo root). Layout matches what `~/.ccteam/teams/<name>/` looks
+// like after seeding, so the include_str! paths are 1:1 with on-disk.
 const DEV_PHASE_TEMPLATES: &[(&str, &str)] = &[
-    ("02-plan-eng.md", include_str!("../../../phases/02-plan-eng.md")),
-    ("03-implement.md", include_str!("../../../phases/03-implement.md")),
-    ("04-test-author.md", include_str!("../../../phases/04-test-author.md")),
-    ("05-test-run.md", include_str!("../../../phases/05-test-run.md")),
-    ("06-fix.md", include_str!("../../../phases/06-fix.md")),
-    ("09-ship.md", include_str!("../../../phases/09-ship.md")),
+    ("02-plan-eng.md", include_str!("../../../teams/dev/phases/02-plan-eng.md")),
+    ("03-implement.md", include_str!("../../../teams/dev/phases/03-implement.md")),
+    ("04-test-author.md", include_str!("../../../teams/dev/phases/04-test-author.md")),
+    ("05-test-run.md", include_str!("../../../teams/dev/phases/05-test-run.md")),
+    ("06-fix.md", include_str!("../../../teams/dev/phases/06-fix.md")),
+    ("09-ship.md", include_str!("../../../teams/dev/phases/09-ship.md")),
 ];
 
 /// product-research team phase set (M3.4). Six phases, all
@@ -42,27 +46,27 @@ const DEV_PHASE_TEMPLATES: &[(&str, &str)] = &[
 const PRODUCT_RESEARCH_PHASE_TEMPLATES: &[(&str, &str)] = &[
     (
         "01-kickoff.md",
-        include_str!("../../../phases-product-research/01-kickoff.md"),
+        include_str!("../../../teams/product-research/phases/01-kickoff.md"),
     ),
     (
         "02-market-survey.md",
-        include_str!("../../../phases-product-research/02-market-survey.md"),
+        include_str!("../../../teams/product-research/phases/02-market-survey.md"),
     ),
     (
         "03-differentiation-analysis.md",
-        include_str!("../../../phases-product-research/03-differentiation-analysis.md"),
+        include_str!("../../../teams/product-research/phases/03-differentiation-analysis.md"),
     ),
     (
         "04-value-proposition.md",
-        include_str!("../../../phases-product-research/04-value-proposition.md"),
+        include_str!("../../../teams/product-research/phases/04-value-proposition.md"),
     ),
     (
         "05-feasibility.md",
-        include_str!("../../../phases-product-research/05-feasibility.md"),
+        include_str!("../../../teams/product-research/phases/05-feasibility.md"),
     ),
     (
         "06-verdict.md",
-        include_str!("../../../phases-product-research/06-verdict.md"),
+        include_str!("../../../teams/product-research/phases/06-verdict.md"),
     ),
 ];
 
@@ -72,10 +76,10 @@ const PRODUCT_RESEARCH_PHASE_TEMPLATES: &[(&str, &str)] = &[
 /// orchestrator reads them at startup to resolve `phase_dir`,
 /// registered ESCALATE prefixes, the V0.2 `evergreen` / `cost_policy`
 /// flags, and (eventually) team-wide golden rules.
-const DEV_TEAM_YAML: &str = include_str!("../../../teams/dev.yaml");
+const DEV_TEAM_YAML: &str = include_str!("../../../teams/dev/team.yaml");
 const PRODUCT_RESEARCH_TEAM_YAML: &str =
-    include_str!("../../../teams/product-research.yaml");
-const META_AGENT_TEAM_YAML: &str = include_str!("../../../teams/meta-agent.yaml");
+    include_str!("../../../teams/product-research/team.yaml");
+const META_AGENT_TEAM_YAML: &str = include_str!("../../../teams/meta-agent/team.yaml");
 
 /// Empty phase set for evergreen teams (meta-agent). The orchestrator
 /// builds a `Dag::from_templates(&[])` for these, which `decide_tick`
@@ -321,27 +325,31 @@ pub fn write_global_phase_templates(global_dir: &Path, force: bool) -> Result<()
     Ok(())
 }
 
-/// M3.3: write every `TEAM_BUNDLES` entry's phase markdown into
-/// `<global_dir>/<team.yaml.phase_dir>/<NN-name>.md` and stamp
-/// `<global_dir>/teams/<name>/team.yaml`. Idempotent — `force=false`
-/// preserves operator hand-edits.
+/// V0.2 M0.17.2: write every shipped team's seed under the unified
+/// `<global_dir>/teams/<name>/` layout — `team.yaml` at the team-dir
+/// root, phases under `<team_dir>/<spec.phase_dir>/<NN-name>.md`
+/// (default `phases`). Idempotent — `force=false` preserves operator
+/// hand-edits.
 ///
-/// `phase_dir` is read from each bundle's embedded team.yaml so the
-/// orchestrator's startup scan finds templates at the same path the
-/// team config declares. dev's phase_dir = `phases` (matches the M0
-/// layout); product-research's = `phases-product-research` (so the
-/// two team's phase markdowns don't collide on disk).
+/// Replaces the M3.x layout where phase_dir was relative to
+/// `~/.ccteam/` and product-research used `phases-product-research`
+/// to avoid collision with dev's `phases`. Under the new layout,
+/// each team's phase dir lives inside its own team directory so the
+/// per-team prefix is redundant.
 pub fn write_all_global_team_templates(global_dir: &Path, force: bool) -> Result<()> {
     use crate::team::TeamSpec;
     for (name, bundle) in TEAM_BUNDLES {
         let spec = TeamSpec::parse(bundle.team_yaml).with_context(|| {
             format!("embedded team.yaml for `{name}` does not match TeamSpec schema")
         })?;
-        // Phase markdowns → <global>/<phase_dir>/<NN-name>.md. Skip
-        // the directory creation for evergreen / phase-less teams so
-        // we don't leave empty placeholder dirs around.
+        let team_dir = global_dir.join("teams").join(name);
+        std::fs::create_dir_all(&team_dir)
+            .with_context(|| format!("create {}", team_dir.display()))?;
+        // Phase markdowns → <global>/teams/<name>/<phase_dir>/<NN-name>.md.
+        // Skip the directory creation for evergreen / phase-less teams
+        // so we don't leave empty placeholder dirs around.
         if !bundle.phases.is_empty() {
-            let phase_dir = global_dir.join(&spec.phase_dir);
+            let phase_dir = team_dir.join(&spec.phase_dir);
             std::fs::create_dir_all(&phase_dir)
                 .with_context(|| format!("create {}", phase_dir.display()))?;
             for (filename, body) in bundle.phases {
@@ -354,9 +362,6 @@ pub fn write_all_global_team_templates(global_dir: &Path, force: bool) -> Result
             }
         }
         // team.yaml → <global>/teams/<name>/team.yaml.
-        let team_dir = global_dir.join("teams").join(name);
-        std::fs::create_dir_all(&team_dir)
-            .with_context(|| format!("create {}", team_dir.display()))?;
         let team_yaml_path = team_dir.join("team.yaml");
         if team_yaml_path.exists() && !force {
             continue;

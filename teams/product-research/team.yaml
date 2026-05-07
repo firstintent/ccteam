@@ -1,6 +1,11 @@
 name: product-research
 description: Product research team — should we build this idea?
-phase_dir: phases-product-research
+
+# V0.2 M0.17.2: phase_dir is now relative to the team directory
+# (~/.ccteam/teams/<name>/). Default `phases` matches the new layout.
+# Legacy yamls with `phase_dir: phases-product-research` are rewritten
+# to `phases` on load via TeamSpec::load (warn-only).
+phase_dir: phases
 
 # V0.2 §6.4 candidate 2 — auto-managed `<project>/CLAUDE.md` body.
 # `{slug}` and `{team}` get substituted at bootstrap time. Replaces

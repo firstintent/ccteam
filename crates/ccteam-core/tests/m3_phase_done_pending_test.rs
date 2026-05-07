@@ -219,15 +219,16 @@ fn process_project_parks_in_done_pending_when_next_phase_blocks() {
     // YAML wording.
     let tmp = TempDir::new().unwrap();
     let paths = fresh_paths(&tmp);
+    // V0.2 M0.17.1 layout: teams/<name>/phases/ under team dir, not
+    // a top-level phases-<team>/ at the global root.
     let team_dir = paths.root.join("teams").join("toy-pending");
-    std::fs::create_dir_all(&team_dir).unwrap();
+    let phase_dir = team_dir.join("phases");
+    std::fs::create_dir_all(&phase_dir).unwrap();
     std::fs::write(
         team_dir.join("team.yaml"),
-        "name: toy-pending\nphase_dir: phases-toy-pending\n",
+        "name: toy-pending\nphase_dir: phases\n",
     )
     .unwrap();
-    let phase_dir = paths.root.join("phases-toy-pending");
-    std::fs::create_dir_all(&phase_dir).unwrap();
     std::fs::write(
         phase_dir.join("01-collect.md"),
         "---\nname: collect\nparallelism: solo\n---\nbody\n",
@@ -314,15 +315,15 @@ fn process_project_advances_through_done_pending_when_no_block() {
     // transition via decide_tick + assert just the ACTION returned.
     let tmp = TempDir::new().unwrap();
     let paths = fresh_paths(&tmp);
+    // V0.2 M0.17.1: teams/<name>/phases/ under team dir.
     let team_dir = paths.root.join("teams").join("toy-no-block");
-    std::fs::create_dir_all(&team_dir).unwrap();
+    let phase_dir = team_dir.join("phases");
+    std::fs::create_dir_all(&phase_dir).unwrap();
     std::fs::write(
         team_dir.join("team.yaml"),
-        "name: toy-no-block\nphase_dir: phases-toy-no-block\n",
+        "name: toy-no-block\nphase_dir: phases\n",
     )
     .unwrap();
-    let phase_dir = paths.root.join("phases-toy-no-block");
-    std::fs::create_dir_all(&phase_dir).unwrap();
     std::fs::write(
         phase_dir.join("01-collect.md"),
         "---\nname: collect\nparallelism: solo\n---\nbody\n",

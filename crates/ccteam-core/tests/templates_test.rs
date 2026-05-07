@@ -88,7 +88,7 @@ fn plan_eng_phase_embeds_review_with_user_loop_helper() {
     // template via `@~/.ccteam/templates/review-with-user-loop.md` so
     // the helper actually lands in a phase prompt — otherwise we have
     // a dead template nobody calls.
-    let body = include_str!("../../../phases/02-plan-eng.md");
+    let body = include_str!("../../../teams/dev/phases/02-plan-eng.md");
     assert!(
         body.contains("@~/.ccteam/templates/review-with-user-loop.md"),
         "plan-eng phase markdown must inline @~/.ccteam/templates/review-with-user-loop.md",

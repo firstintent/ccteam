@@ -232,12 +232,20 @@ pub struct TeamSpec {
     #[serde(default)]
     pub golden_rules: Vec<GoldenRule>,
 
-    /// Phase template directory relative to the orchestrator root
-    /// (`~/.ccteam/`). Defaults to `phases/` so legacy dev installs
-    /// keep working without migration. product-research uses
-    /// `phases-product-research/`. Project-local templates live in
-    /// `<project>/.ccteam/phases/` and are written by `bootstrap_project`
-    /// — that path is independent of `phase_dir`.
+    /// Phase template directory **relative to the team directory**
+    /// (V0.2 M0.17.2). For shipped teams that's
+    /// `~/.ccteam/teams/<name>/<phase_dir>/`; user-authored teams in
+    /// `~/.config/ccteam/teams/<name>/<phase_dir>/` follow the same
+    /// pattern. Defaults to `phases` so a fresh team yaml just works.
+    /// Project-local templates live in `<project>/.ccteam/phases/` —
+    /// that path is independent of `phase_dir`.
+    ///
+    /// **Legacy compat**: yamls from M3.x ship with values like
+    /// `phases-product-research` — those refer to the old "relative
+    /// to ~/.ccteam/" semantic. `TeamSpec::load` (and parse-time
+    /// `validate`) detects the legacy `phases-` prefix and rewrites
+    /// to `phases` with a warn so the new layout works without manual
+    /// migration of user yamls.
     #[serde(default = "default_phase_dir")]
     pub phase_dir: String,
 
@@ -282,10 +290,15 @@ pub struct TeamSpec {
 }
 
 impl TeamSpec {
-    /// Parse `team.yaml` from raw YAML source.
+    /// Parse `team.yaml` from raw YAML source. V0.2 M0.17.2: legacy
+    /// `phase_dir: phases-<team>` values are rewritten to `phases`
+    /// after parse — they're a relic of the pre-M0.17 "relative to
+    /// ~/.ccteam/" layout. `validate()` then runs against the
+    /// rewritten spec.
     pub fn parse(source: &str) -> Result<Self> {
-        let spec: TeamSpec = serde_yaml::from_str(source)
+        let mut spec: TeamSpec = serde_yaml::from_str(source)
             .context("team.yaml does not match schema")?;
+        spec.normalize_legacy_phase_dir();
         spec.validate()?;
         Ok(spec)
     }
@@ -296,6 +309,26 @@ impl TeamSpec {
             .with_context(|| format!("read team.yaml at {}", path.display()))?;
         Self::parse(&source)
             .with_context(|| format!("parse team.yaml at {}", path.display()))
+    }
+
+    /// V0.2 M0.17.2: rewrite legacy `phase_dir: phases-<team>` to
+    /// `phases`. The old value comes from M3.x where `phase_dir` was
+    /// "relative to ~/.ccteam/" and product-research carried
+    /// `phase_dir: phases-product-research` so the two teams' phase
+    /// markdowns wouldn't collide on disk. With the M0.17 layout
+    /// (`~/.ccteam/teams/<name>/phases/`) the per-team prefix is
+    /// redundant — every team's phase dir is `phases` under its own
+    /// team dir. Rewrite-on-load keeps user yamls and shipped seeds
+    /// from the M3 era working without manual migration.
+    fn normalize_legacy_phase_dir(&mut self) {
+        if self.phase_dir.starts_with("phases-") {
+            let legacy = std::mem::replace(&mut self.phase_dir, "phases".into());
+            tracing::warn!(
+                team = %self.name,
+                legacy = %legacy,
+                "rewriting legacy phase_dir to `phases` (V0.2 M0.17.2 layout)",
+            );
+        }
     }
 
     /// Sanity checks at parse time. The orchestrator never wants to
@@ -531,9 +564,24 @@ mod tests {
 
     #[test]
     fn m32_phase_dir_explicit_value_round_trips() {
+        // V0.2 M0.17.2: legacy `phases-<team>` values get rewritten to
+        // `phases` on parse. A non-legacy custom value still round-trips.
+        let src = "name: product-research\nphase_dir: phases\n";
+        let spec = TeamSpec::parse(src).unwrap();
+        assert_eq!(spec.phase_dir, "phases");
+    }
+
+    #[test]
+    fn m017_legacy_phase_dir_rewrites_to_phases() {
+        // V0.2 M0.17.2: M3.x yamls used phase_dir relative to
+        // ~/.ccteam/, with values like `phases-product-research` to
+        // avoid collision. Under the M0.17 layout each team's phase
+        // dir lives inside the team's own directory, so the per-team
+        // prefix is redundant — rewrite-on-load keeps stale yamls
+        // working.
         let src = "name: product-research\nphase_dir: phases-product-research\n";
         let spec = TeamSpec::parse(src).unwrap();
-        assert_eq!(spec.phase_dir, "phases-product-research");
+        assert_eq!(spec.phase_dir, "phases");
     }
 
     #[test]
@@ -810,7 +858,9 @@ mod tests {
             "    description: Top market signals collected\n",
         );
         let spec = TeamSpec::parse(src).unwrap();
-        assert_eq!(spec.phase_dir, "phases-product-research");
+        // V0.2 M0.17.2: legacy `phases-product-research` rewritten to
+        // `phases` on parse (now relative to team dir, not ~/.ccteam/).
+        assert_eq!(spec.phase_dir, "phases");
         assert_eq!(spec.verdict_schema, vec!["verdict".to_string()]);
         assert_eq!(spec.escalate_grammar_extensions.len(), 3);
     }

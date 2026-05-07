@@ -20,6 +20,7 @@ pub mod stall;
 pub mod state;
 pub mod subskill;
 pub mod team;
+pub mod team_resolver;
 pub mod templates;
 pub mod tmux;
 pub mod tool_surface;
@@ -77,6 +78,10 @@ pub use state::{Parallelism, PhaseHistoryEntry, PhaseState, ProjectState};
 pub use team::{
     CostPolicy, CriticDimensionSpec, CriticStrictness, EscalateGrammarExtension, EscalateRoute,
     RetroFieldKind, RetroFieldSpec, TeamSpec,
+};
+pub use team_resolver::{
+    default_user_staging_dir, discover_team_names, resolve_team, save_team, TeamResolveContext,
+    TeamSource, TEAM_SOURCES,
 };
 pub use templates::{
     current_ccteam_bin, project_phase_filename, render_project_settings,

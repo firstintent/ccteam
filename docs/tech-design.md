@@ -256,6 +256,43 @@ V0.3 真要 cost 追踪不杀时再定义具体行为)。
 随 binary 发布;`Orchestrator::new` / `ccteam start` / `ccteam doctor
 --reset-shipped-teams` 都会把它写到 `~/.ccteam/teams/meta-agent/team.yaml`。
 
+#### 3.2.2 Team layout + TEAM_SOURCES(V0.2 §5.1 / §5.2)
+
+V0.2 M0.17 把每个 team 的 yaml + phases 整目录化:
+
+```
+~/.ccteam/teams/<name>/
+├── team.yaml          # 配置 schema 见 interfaces §5.5
+└── phases/            # `team.yaml.phase_dir`,默认 `phases`
+    └── *.md
+```
+
+仓内 ship 同布局(`teams/dev/team.yaml` + `teams/dev/phases/`),
+`include_str!` 1:1 对应 on-disk 路径。旧值(`phase_dir: phases-product-research`,
+M3.x "相对 ~/.ccteam/" 语义)在 `TeamSpec::parse` 自动重写为 `phases`(legacy
+compat,warn-only)。
+
+**三层加载优先级**(`crates/ccteam-core/src/team_resolver.rs`,借鉴 Claude
+Code `SETTING_SOURCES` 模式):
+
+```rust
+const TEAM_SOURCES: &[TeamSource] = &[
+    TeamSource::Project,  // <project_dir>/.ccteam/team/team.yaml
+    TeamSource::User,     // ~/.config/ccteam/teams/<name>/team.yaml
+    TeamSource::Repo,     // ~/.ccteam/teams/<name>/team.yaml
+];
+```
+
+整团维度,first-source-wins(撞名 project 完全覆盖 user / repo,**不**字段级
+合并)。读容错(yaml 错 → warn + 下一层),写严格(`save_team` 拒绝覆盖
+不可解析的现有 yaml)。orchestrator 启动调 `discover_team_names(ctx)` 拿到
+所有 User+Repo 层的 team 名,逐个走 `resolve_team(name, ctx)` 应用 layered
+override 语义,组成 `TeamRuntime` 表。
+
+**红线**:`load_team_runtimes` **不**手工扫 `~/.ccteam/teams/`,全部走
+resolver — 后续要加 V0.3 plugin layer 时,只在 `TeamSource::User` 实现里
+扩展 `path_for`,resolver 主流程零改动。
+
 ### 3.3 Phase Pipeline（短期对标 gstack-auto）
 
 每个 phase 是一个 markdown 文件 + YAML front matter（抄 Symphony 的 WORKFLOW.md 形态）。**完整字段定义、9 个 phase 列表、Seed verdict 输出格式 → [interfaces.md §5](./interfaces.md#5-phase-模板-schema)**。
