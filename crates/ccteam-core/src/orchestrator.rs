@@ -1343,7 +1343,6 @@ impl Orchestrator {
         use crate::team::CostPolicy;
         // V0.2 §6.4 candidate 5: declarative cost policy per team.
         // `CostPolicy::None` (evergreen meta-agent) bypasses entirely.
-        // `CostPolicy::Track` logs soft / mid warnings but never kills.
         // `CostPolicy::KillAt(threshold)` is the historical dev /
         // product-research path; `threshold = None` falls back to
         // `state.hard_kill_threshold_usd` (default $200 from M1).
@@ -1372,15 +1371,6 @@ impl Orchestrator {
                 cost::COST_MID_WARN_USD,
             ),
             CostLevel::HardKill => {
-                if matches!(policy, CostPolicy::Track) {
-                    // Track policy: log + return, never kill.
-                    tracing::error!(
-                        slug,
-                        cost = state.cost_used_usd,
-                        "cost over hard threshold but team policy is `track`; logging only",
-                    );
-                    return Ok(Some(state));
-                }
                 let hard = match policy {
                     CostPolicy::KillAt(Some(team_override)) => team_override,
                     _ => state.hard_kill_threshold_usd,

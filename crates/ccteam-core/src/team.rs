@@ -150,21 +150,25 @@ pub enum EscalateRoute {
 
 /// V0.2 §6.4 candidate 5: cost-handling policy. Replaces the
 /// hardcoded `if state.team == META_TEAM_NAME { skip }` branch in
-/// `enforce_cost_thresholds` with a declarative per-team flag. Three
-/// variants cover the cases in flight:
+/// `enforce_cost_thresholds` with a declarative per-team flag. Two
+/// variants cover the cases V0.2 has consumers for:
 ///
 /// - `None` — no cost tracking, no warnings, no kill. Used by
 ///   evergreen teams (meta-agent) where "cost" is the user's running
 ///   tab, not a per-project budget.
-/// - `Track` — log soft / mid warnings but never hard-kill. Reserved
-///   for future "long-running but observable" teams (V0.3+ may use
-///   this for watchdog / reviewer agents).
 /// - `KillAt(usd)` — current dev / product-research behavior: soft +
 ///   mid warnings, hard-kill the tmux session when
 ///   `state.cost_used_usd > usd`. The threshold is per-team, not
 ///   per-project, so a team author sets a sensible default and the
 ///   orchestrator uses it unless `state.hard_kill_threshold_usd`
 ///   overrides at the project level.
+///
+/// PRD §6.4 originally listed a third `Track` variant (warn but
+/// don't kill) for V0.3 watchdog agents. Dropped on review (PR #15
+/// 2026-05-07 fixup): V0.3 will define the watchdog cost behavior
+/// concretely (warn thresholds, soft-warn factor, etc.) — adding
+/// `Track` then with real consumers beats shipping a marker variant
+/// today.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "threshold_usd")]
 pub enum CostPolicy {
@@ -172,8 +176,6 @@ pub enum CostPolicy {
     /// (meta-agent) — cost is the user's running tab, not a per-project
     /// budget.
     None,
-    /// Soft + mid warnings only. Never hard-kills.
-    Track,
     /// Soft + mid warnings + hard-kill at threshold. Default for
     /// regular phase-DAG teams. Falls back to
     /// `state.hard_kill_threshold_usd` (default $200) when this
@@ -748,17 +750,6 @@ mod tests {
         let spec = TeamSpec::parse(src).unwrap();
         assert!(spec.evergreen);
         assert_eq!(spec.cost_policy, CostPolicy::None);
-    }
-
-    #[test]
-    fn m016_cost_policy_track_round_trips() {
-        let src = concat!(
-            "name: x\n",
-            "cost_policy:\n",
-            "  kind: track\n",
-        );
-        let spec = TeamSpec::parse(src).unwrap();
-        assert_eq!(spec.cost_policy, CostPolicy::Track);
     }
 
     #[test]

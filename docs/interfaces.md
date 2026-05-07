@@ -636,7 +636,7 @@ retro_schema:
 # cost_policy={kind: none}。
 evergreen: false
 cost_policy:
-  kind: kill_at        # none | track | kill_at
+  kind: kill_at        # none | kill_at
   threshold_usd: ~     # KillAt(None) 回退到 state.hard_kill_threshold_usd
 
 # V0.2 M0.16 — auto-managed `<project>/CLAUDE.md` body。{slug} / {team}

@@ -246,9 +246,11 @@ reviewer agent 同样会是常驻角色。这类 team 的 `team.yaml` 设
 **红线**:`Orchestrator` / `process_project` / `enforce_cost_thresholds` /
 `warn_if_stalled` / `count_active_regular` 全部用 `is_evergreen(team)` 查
 TeamSpec.evergreen,**不许**回到 `state.team == META_TEAM_NAME` 字面量
-分叉(strategic doc §3 ccteam-core 红线)。`cost_policy` 三种 variant
-(`None` / `Track` / `KillAt(Option<f64>)`)的语义在
-[interfaces.md §5.5](./interfaces.md#55-teamyaml-团队配置m31--m32--m33--v02-m016) 详述。
+分叉(strategic doc §3 ccteam-core 红线)。`cost_policy` 两种 variant
+(`None` / `KillAt(Option<f64>)`)的语义在
+[interfaces.md §5.5](./interfaces.md#55-teamyaml-团队配置m31--m32--m33--v02-m016) 详述
+(PRD §6.4 草稿曾列第三个 `Track` variant 给 V0.3 watchdog,review 时删 —
+V0.3 真要 cost 追踪不杀时再定义具体行为)。
 
 `teams/meta-agent.yaml` 是首个 evergreen 范例,V0.2 起作为 shipped seed
 随 binary 发布;`Orchestrator::new` / `ccteam start` / `ccteam doctor
