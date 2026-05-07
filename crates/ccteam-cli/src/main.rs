@@ -51,8 +51,9 @@ enum Command {
         #[arg(long, value_name = "SECONDS", default_value_t = 30)]
         tick_seconds: u64,
         /// Skip the M0.5.3 phase tools_required check at startup.
-        /// Use when an old project on disk needs `ccteam doctor
-        /// --install-recommended-agents` first.
+        /// Use when an old project on disk has phase YAML referencing
+        /// a plugin agent whose plugin isn't installed yet (run
+        /// `claude /plugin add <id>` first).
         #[arg(long, default_value_t = false)]
         skip_tool_check: bool,
     },
@@ -113,22 +114,17 @@ enum Command {
     Stop,
     /// Health checks + tool-surface maintenance.
     Doctor {
-        /// Backfill ~/.claude/agents/<name>.md symlinks for the eight
-        /// recommended plugin agents (M0.5.5). Idempotent. User-authored
-        /// agent files are preserved unless --force is given.
-        #[arg(long, default_value_t = false)]
-        install_recommended_agents: bool,
         /// Print + return what would happen without touching the
         /// filesystem.
         #[arg(long, default_value_t = false)]
         dry_run: bool,
-        /// Replace user-authored agent files with the plugin link.
-        /// Use cautiously.
+        /// Overwrite operator hand-edits (memory bridge / shipped team
+        /// seeds). Use cautiously.
         #[arg(long, default_value_t = false)]
         force: bool,
         /// Cross-check every shipped phase template's tools_required
-        /// against the live tool surface and print a markdown report
-        /// (M0.5.6).
+        /// against the live tool surface (plugin pipeline + user
+        /// agents/skills + MCP servers) and print a markdown report.
         #[arg(long, default_value_t = false)]
         tool_surface: bool,
         /// Install the `ccteam-control` skill at
@@ -172,6 +168,15 @@ enum Command {
         /// `--validate-team dev`).
         #[arg(long, value_name = "TEAM")]
         validate_team: Option<String>,
+        /// V0.2 M0.20: remove stale `~/.claude/agents/<name>.md`
+        /// symlinks left by the V0.1 `--install-recommended-agents`
+        /// path. Spawned project sessions now resolve plugin agents
+        /// through Claude Code's in-memory plugin pipeline via
+        /// `enabledPlugins` in `<project>/.claude/settings.json`, so
+        /// these symlinks are obsolete. Idempotent — no-op when no
+        /// marketplace symlinks remain.
+        #[arg(long, default_value_t = false)]
+        migrate_recommended_agents: bool,
     },
     /// V0.2 M0.18.6: render the orchestrator's per-phase inject
     /// prompt (frontmatter-driven) plus the `@`-referenced phase
@@ -265,7 +270,6 @@ fn main() -> Result<()> {
         }
         Command::Stop => run_stop(),
         Command::Doctor {
-            install_recommended_agents,
             dry_run,
             force,
             tool_surface,
@@ -275,8 +279,8 @@ fn main() -> Result<()> {
             install_memory_bridge,
             reset_shipped_teams,
             validate_team,
+            migrate_recommended_agents,
         } => run_doctor(commands::DoctorOptions {
-            install_recommended_agents,
             dry_run,
             force,
             tool_surface,
@@ -286,6 +290,7 @@ fn main() -> Result<()> {
             install_memory_bridge,
             reset_shipped_teams,
             validate_team,
+            migrate_recommended_agents,
         }),
         Command::Phase { cmd } => run_phase(cmd),
     }

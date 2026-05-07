@@ -11,12 +11,11 @@ use serde_json::{json, Map, Value};
 
 use ccteam_core::{
     bootstrap_meta_project, bootstrap_project, current_ccteam_bin, install_ccteam_control_skill,
-    link_recommended_agents, pick_unused_slug, user_claude_dir,
+    migrate_recommended_agent_symlinks, pick_unused_slug, user_claude_dir,
     write_all_global_team_templates, write_global_helper_templates,
-    write_global_phase_templates, AgentLinkAction, AgentLinkReport, CcteamPaths,
-    InstallSkillOptions, LinkOptions, MetaBootstrapReport, OutboxEventKind, OutboxMessage,
-    PhaseHistoryEntry, PhaseState, PhaseTemplate, ProjectState, SessionMailbox,
-    SkillInstallAction, TeamSpec,
+    write_global_phase_templates, CcteamPaths, InstallSkillOptions, MetaBootstrapReport,
+    MigrationReport, OutboxEventKind, OutboxMessage, PhaseHistoryEntry, PhaseState,
+    PhaseTemplate, ProjectState, SessionMailbox, SkillInstallAction, TeamSpec,
     ToolSurfaceSnapshot, BUILTIN_SUBAGENTS, HELPER_TEMPLATES, PHASE_TEMPLATES,
 };
 use ccteam_core::tmux::TmuxSession;
@@ -601,7 +600,6 @@ fn ellipsize(s: &str, max: usize) -> String {
 /// `--install-skill` automatically).
 #[derive(Debug, Clone, Default)]
 pub struct DoctorOptions {
-    pub install_recommended_agents: bool,
     pub dry_run: bool,
     pub force: bool,
     pub tool_surface: bool,
@@ -631,28 +629,33 @@ pub struct DoctorOptions {
     /// `ESCALATE:`) without failing — those drift in over time and a
     /// fail-loud check would block the orchestrator.
     pub validate_team: Option<String>,
+    /// V0.2 M0.20: remove stale `~/.claude/agents/<name>.md` symlinks
+    /// the M0.5 `--install-recommended-agents` path used to create.
+    /// One-time cleanup for users upgrading from V0.1 to the plugin-
+    /// pipeline-based path. Idempotent — no-op when no marketplace
+    /// symlinks remain.
+    pub migrate_recommended_agents: bool,
 }
 
 /// `ccteam doctor` dispatch. Returns a human-readable report so unit
 /// tests don't need to capture stdout.
 pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
-    let any_mode = opts.install_recommended_agents
-        || opts.tool_surface
+    let any_mode = opts.tool_surface
         || opts.install_skill
         || opts.install_meta_agent.is_some()
         || opts.install_mcp
         || opts.install_memory_bridge
         || opts.reset_shipped_teams
-        || opts.validate_team.is_some();
+        || opts.validate_team.is_some()
+        || opts.migrate_recommended_agents;
     if !any_mode {
         return Ok(String::from(
             "ccteam doctor: pass at least one mode flag.\n\
              \n\
              modes:\n  \
-             --install-recommended-agents [--dry-run] [--force]\n      \
-             ln -sf 8 plugin agents into ~/.claude/agents/ (M0.5.5).\n  \
              --tool-surface\n      \
-             cross-check phase templates' tools_required against current reachability (M0.5.6).\n  \
+             cross-check phase templates' tools_required against current reachability — \
+             plugin-pipeline-aware (V0.2 M0.20).\n  \
              --install-skill [--force]\n      \
              write ~/.claude/skills/ccteam-control/SKILL.md (M1.8).\n  \
              --install-meta-agent <user-handle>\n      \
@@ -664,13 +667,12 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
              --reset-shipped-teams [--force]\n      \
              re-seed shipped team templates (~/.ccteam/teams/<name>/team.yaml + ~/.ccteam/<phase_dir>/*.md) from the in-binary bundle. Without --force, operator hand-edits are preserved; with --force, every shipped file is overwritten (V0.2 M0.16.2).\n  \
              --validate-team <name>\n      \
-             load + validate one team's team.yaml + phase markdown set (V0.2 M0.18.5). Reports per-phase frontmatter health, IO contract consistency between adjacent phases, and warns on body-level protocol-keyword residue.\n",
+             load + validate one team's team.yaml + phase markdown set (V0.2 M0.18.5). Reports per-phase frontmatter health, IO contract consistency between adjacent phases, and warns on body-level protocol-keyword residue.\n  \
+             --migrate-recommended-agents [--dry-run]\n      \
+             remove stale ~/.claude/agents/<name>.md symlinks left by the V0.1 ln -sf path. One-time cleanup after upgrading to V0.2 plugin pipeline (V0.2 M0.20).\n",
         ));
     }
     let mut out = String::new();
-    if opts.install_recommended_agents {
-        out.push_str(&render_install_recommended_agents_report(&opts)?);
-    }
     if opts.tool_surface {
         out.push_str(&render_tool_surface_report(paths)?);
     }
@@ -694,6 +696,9 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
     }
     if let Some(team) = &opts.validate_team {
         out.push_str(&render_validate_team_report(paths, team)?);
+    }
+    if opts.migrate_recommended_agents {
+        out.push_str(&render_migrate_recommended_agents_report(&opts)?);
     }
     Ok(out)
 }
@@ -1092,66 +1097,51 @@ fn render_install_meta_agent_report(paths: &CcteamPaths, user_handle: &str) -> R
     Ok(out)
 }
 
-fn render_install_recommended_agents_report(opts: &DoctorOptions) -> Result<String> {
-    let reports = link_recommended_agents(LinkOptions {
-        force: opts.force,
-        dry_run: opts.dry_run,
-    })?;
+fn render_migrate_recommended_agents_report(opts: &DoctorOptions) -> Result<String> {
+    let claude = user_claude_dir()?;
+    let reports = migrate_recommended_agent_symlinks(&claude, opts.dry_run)?;
     let mut out = String::new();
     out.push_str(if opts.dry_run {
-        "ccteam doctor --install-recommended-agents (dry-run)\n"
+        "ccteam doctor --migrate-recommended-agents (dry-run)\n"
     } else {
-        "ccteam doctor --install-recommended-agents\n"
+        "ccteam doctor --migrate-recommended-agents\n"
     });
     out.push('\n');
-    let mut all_ok = true;
+    if reports.is_empty() {
+        out.push_str(
+            "  no stale ccteam-managed symlinks found under ~/.claude/agents/ — nothing to do.\n",
+        );
+        return Ok(out);
+    }
     for r in &reports {
-        out.push_str(&render_agent_link_line(r));
-        if !r.action.is_ok() {
-            all_ok = false;
-        }
+        out.push_str(&render_migration_line(r, opts.dry_run));
     }
     out.push('\n');
-    if !all_ok {
-        out.push_str(
-            "some agents skipped — pass --force to overwrite user files, or install \
-             claude-plugins-official for missing sources.\n",
-        );
-    } else if opts.dry_run {
+    if opts.dry_run {
         out.push_str(
             "no changes made (--dry-run). drop the flag to apply.\n",
         );
     } else {
-        out.push_str("all 8 plugin agents reachable via Task(subagent_type=...)\n");
+        out.push_str(&format!(
+            "removed {} stale symlink(s); spawned project sessions now resolve plugin agents \
+             through the in-memory plugin pipeline (V0.2 M0.20).\n",
+            reports.len(),
+        ));
     }
     Ok(out)
 }
 
-fn render_agent_link_line(r: &AgentLinkReport) -> String {
-    let action_label = format_action_label(&r.action);
+fn render_migration_line(r: &MigrationReport, dry_run: bool) -> String {
+    let label = if dry_run { "would remove" } else { "removed" };
     format!(
-        "  {:<28} {:<28} {}\n",
-        r.agent.filename, action_label, r.target.display(),
+        "  {:<28} {:<14} -> {}\n",
+        r.target
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("?"),
+        label,
+        r.previous_link.display(),
     )
-}
-
-fn format_action_label(action: &AgentLinkAction) -> String {
-    use AgentLinkAction::*;
-    match action {
-        Linked => "linked".into(),
-        AlreadyLinked => "already-linked".into(),
-        Replaced { previous_target } => {
-            format!("replaced (was -> {})", previous_target.display())
-        }
-        Kept { previous_target } => {
-            format!("kept foreign link (was -> {}; use --force to replace)", previous_target.display())
-        }
-        SkippedUserFile => "skipped (user file)".into(),
-        SkippedSourceMissing { source } => {
-            format!("skipped (source missing: {})", source.display())
-        }
-        DryRun { would } => format!("would: {}", format_action_label(would)),
-    }
 }
 
 fn render_tool_surface_report(paths: &CcteamPaths) -> Result<String> {
@@ -1918,12 +1908,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
         let body = run_doctor(&paths, DoctorOptions::default()).unwrap();
-        assert!(body.contains("install-recommended-agents"));
         assert!(body.contains("tool-surface"));
         assert!(body.contains("install-skill"));
         assert!(body.contains("install-meta-agent"));
         assert!(body.contains("install-memory-bridge"));
         assert!(body.contains("validate-team"), "got: {body}");
+        assert!(body.contains("migrate-recommended-agents"), "got: {body}");
     }
 
     #[test]
@@ -2005,14 +1995,6 @@ mod tests {
         let skill_path = tmp.path().join("skills/ccteam-control/SKILL.md");
         assert!(skill_path.is_file());
         std::env::remove_var("CLAUDE_CONFIG_HOME");
-    }
-
-    #[test]
-    fn format_action_label_renders_dry_run_clearly() {
-        let label = format_action_label(&AgentLinkAction::DryRun {
-            would: Box::new(AgentLinkAction::Linked),
-        });
-        assert_eq!(label, "would: linked");
     }
 
     // ---------------- V0.2 M0.16.2: shipped-team seed regen ----------------

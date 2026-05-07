@@ -599,13 +599,15 @@ confidence: 0.0-1.0
 
 | 子字段 | 名字来源 | "可达"判定 |
 |---|---|---|
-| `subagents` | `Task(subagent_type="<name>")` | `~/.claude/agents/<name>.md` 存在(不要列内置五个,但列了无害) |
+| `subagents` | `Task(subagent_type="<name>")` | (V0.2 M0.20)plugin pipeline 解析:`crates/ccteam-core/src/plugin_resolution.rs::KNOWN_PLUGIN_AGENTS` 命中 + 对应 plugin source 文件存在;或 `~/.claude/agents/<name>.md` 用户自写文件存在;或内置五个之一 |
 | `skills` | `Skill(skill="<name>")` | `~/.claude/skills/<name>/SKILL.md` 或 `~/.claude/plugins/marketplaces/*/plugins/*/skills/<name>/SKILL.md` 存在 |
 | `mcp` | `mcp__<name>__<tool>` 工具前缀 | `~/.claude.json` 或 `~/.claude/mcp_servers.json` 的 `mcpServers` 含此 key |
 
-实测背景:plugin 装了 plugin 不等于 plugin agent 进 Task 注册表 —— 必须 ln -sf 到 `~/.claude/agents/` 才行(详见 [docs/claude-code-tool-surface.md §1.1.2 / §1.2.5](./claude-code-tool-surface.md))。所以 `tools_required.subagents` 列 `code-reviewer` 而 `~/.claude/agents/code-reviewer.md` 不存在 → orchestrator 拒绝启动并给出 `ccteam doctor --install-recommended-agents` 修复命令。
+实测背景:plugin 装了 plugin 不等于 plugin agent 进 Task 注册表 —— spawned session 必须启用 plugin pipeline(V0.2 M0.20)。`bootstrap_project` 写 `<project>/.claude/settings.json` 时,根据 `tools_required.subagents` 解析 plugin 依赖,自动写入 `enabledPlugins: {"<plugin>@<mkt>": true}`;Claude Code session 启动时 plugin pipeline 加载 + 自动 namespace `<plugin>:<name>`,phase markdown 用裸名 `Task(subagent_type="code-reviewer")` 仍可调。`tools_required.subagents` 列 `code-reviewer` 而 plugin source 又不在 `~/.claude/plugins/marketplaces/` → orchestrator 拒绝启动并提示装 plugin(`claude /plugin add pr-review-toolkit@claude-plugins-official`)。
 
-`bootstrap_project` 已在 §1.2 项目创建路径里自动 ln -sf 八个推荐 agent + 占位 skills 目录,所以 happy path 上模板要的工具默认都有;只有用户手工编辑模板加了非推荐工具时才会触发本节的校验失败。
+`bootstrap_project` 已在 §1.2 项目创建路径里自动写 `enabledPlugins` + 占位 skills 目录,所以 happy path 上模板要的工具默认都有;只有用户手工编辑模板加了非推荐工具时才会触发本节的校验失败。
+
+V0.1 → V0.2 升级:V0.1 用户的 `~/.claude/agents/<name>.md` ln -sf 由 `ccteam doctor --migrate-recommended-agents` 一次性清理。
 
 ---
 
@@ -1168,12 +1170,12 @@ ccteam kick <slug>                     # 软重启项目 session(claude --resume
 # ccteam 不提供 memory 子命令(无自建索引,无东西可 rebuild)。
 ccteam config edit                                # 改全局配置
 ccteam doctor                                     # 体检:列出可用 mode flags
-ccteam doctor --install-recommended-agents        # M0.5.5 ln -sf 8 个 plugin agent
-ccteam doctor --tool-surface                      # M0.5.6 phase tools_required 交叉表
+ccteam doctor --tool-surface                      # phase tools_required 交叉表(plugin pipeline 感知,V0.2 M0.20)
 ccteam doctor --install-skill                     # M1.8 写 ccteam-control skill
 ccteam doctor --install-meta-agent <user-handle>  # M1.0 创建 meta-agent 项目(含 --install-skill)
 ccteam doctor --install-mcp                       # M2.5 在 ~/.claude.json 注册 mcpServers.ccteam(详见 §12)
 ccteam doctor --install-memory-bridge             # M4.2 写 ~/.claude/rules/ccteam-lessons-{dev,product-research}.md 占位 + paths frontmatter scope
+ccteam doctor --migrate-recommended-agents        # V0.2 M0.20 一次性清理 V0.1 ln -sf 残留 (~/.claude/agents/ 下指向 marketplace 的 symlink)
 ccteam hook <subcmd>                              # debug:手动跑 hook(读 stdin JSON,写 stdout);
                                                   # subcmd ∈ {progress-append, parse-phase-end,
                                                   # cost-accumulate, load-context, block-push}

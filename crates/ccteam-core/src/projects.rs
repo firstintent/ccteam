@@ -9,15 +9,14 @@ use chrono::{SecondsFormat, Utc};
 use serde_json::{Map, Value};
 
 use crate::paths::CcteamPaths;
+use crate::plugin_resolution::{lookup_plugin_agent, plugins_to_enable};
 use crate::state::ProjectState;
 use crate::templates::{
     team_bundle, write_global_helper_templates, write_project_phase_templates_for_team,
-    write_project_settings,
+    write_project_settings, EnabledPluginsSetting,
 };
 use crate::phases::PhaseTemplate;
-use crate::tool_surface::{
-    link_recommended_agents_for_phases_into, user_claude_dir, AgentLinkAction, LinkOptions,
-};
+use crate::tool_surface::user_claude_dir;
 
 /// Slugify a free-text project request: keep `[a-z0-9]`, collapse other
 /// runs to `-`, trim, lower-case, and cap at 40 chars. When the cap
@@ -129,7 +128,13 @@ pub fn bootstrap_project(
     let state = ProjectState::initial_for_team(slug.to_string(), team.to_string());
     state.save(&paths.project_state(slug))?;
 
-    write_project_settings(&project_dir)?;
+    // V0.2 M0.20 (candidate 7): compute the spawned-session
+    // `enabledPlugins` set from the team's phase YAML
+    // `tools_required.subagents`, replacing the M0.5 ln -sf protocol.
+    let templates = load_phase_templates_for_bootstrap(team);
+    let enabled_plugins = compute_enabled_plugins(&templates);
+
+    write_project_settings(&project_dir, &enabled_plugins)?;
     write_project_phase_templates_for_team(&project_dir, team)?;
     // M2.4: ensure ~/.ccteam/templates/ has the helper templates so
     // any phase markdown's `@~/.ccteam/templates/<name>.md` reference
@@ -152,16 +157,13 @@ pub fn bootstrap_project(
         );
     }
 
-    // M0.5.1 / M0.5.2 / M2.1: register plugin agents under
-    // ~/.claude/agents/ (recommended set + every sub_skill plugin agent
-    // referenced in phase YAML) and pre-create the skills placeholder
-    // directories. Both must be done **before** the orchestrator's
-    // ensure_session triggers `tmux new-session`, since Claude Code
-    // scans agents/ once at session start (claude-code-tool-surface.md
-    // §1.2.5/6) and attaches the SKILL.md watcher only to dirs that
-    // exist at startup (§1.2.4). bootstrap_project runs in `ccteam
-    // new`, well before the daemon's ensure_session.
-    let templates = load_phase_templates_for_bootstrap(team);
+    // V0.2 M0.20: pre-create the skills placeholder dirs and warn on
+    // any phase-declared subagent whose plugin source isn't on disk.
+    // Plugin pipeline activation lives in the spawned project's
+    // .claude/settings.json `enabledPlugins` (written above) — Claude
+    // Code's in-memory plugin loader reads it at session start and
+    // namespaces each agent as `<plugin>:<name>` automatically. No more
+    // ln -sf into ~/.claude/agents/ (replaces the M0.5 protocol).
     if let Err(err) = setup_tool_surface(&project_dir, &templates) {
         tracing::warn!(
             project_dir = %project_dir.display(),
@@ -330,23 +332,60 @@ fn resolve_claude_json_path_from_env(
     Ok(h.join(".claude.json"))
 }
 
-/// Symlink the `RECOMMENDED_AGENTS` set + every plugin agent named in
-/// `templates`' `sub_skills` into `~/.claude/agents/`, then pre-create
-/// the global + project-local skills placeholder dirs. See the call
-/// site in `bootstrap_project` for the timing constraint.
+/// Compute the `enabledPlugins` map a spawned project's
+/// `.claude/settings.json` needs by walking every phase template's
+/// `tools_required.subagents` (and any sub_skill referencing a plugin
+/// agent) and resolving each name through
+/// [`crate::plugin_resolution::lookup_plugin_agent`]. Built-ins and
+/// user-authored agent names produce no plugin entries.
 ///
-/// **Test isolation**: tests that call `bootstrap_project` but don't
-/// want to mutate the developer's real `~/.claude/` should set the
-/// env var `CCTEAM_DISABLE_TOOL_SURFACE_BOOTSTRAP=1` (or set
-/// `CLAUDE_CONFIG_HOME` to a tempdir and let it run). Production
-/// never sets the disable flag, so the only way for the symlinks to
-/// land is through bootstrap_project.
+/// V0.2 M0.20 — replaces the M0.5 `RECOMMENDED_AGENTS` ln -sf logic.
+fn compute_enabled_plugins(templates: &[PhaseTemplate]) -> EnabledPluginsSetting {
+    let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for t in templates {
+        for s in &t.tools_required.subagents {
+            names.insert(s.clone());
+        }
+        // sub_skills referencing `<mkt>:<plugin>/agents/<name>.md` carry
+        // the same plugin dependency even when the bare subagent name
+        // isn't listed in tools_required (M2.1 contract).
+        for spec in &t.sub_skills {
+            if let Some(bare) = parse_subskill_subagent_name(&spec.skill) {
+                names.insert(bare);
+            }
+        }
+    }
+    let plugin_ids = plugins_to_enable(names.iter().map(String::as_str));
+    EnabledPluginsSetting { plugin_ids }
+}
+
+/// Extract the bare agent name from a sub_skill `skill:` reference of
+/// the form `<marketplace>:<plugin>/agents/<name>.md`. Returns `None`
+/// for hook scripts (`.py`, `.sh`) or non-agent paths.
+fn parse_subskill_subagent_name(skill: &str) -> Option<String> {
+    let (_market, rest) = skill.split_once(':')?;
+    if !rest.contains("/agents/") || !rest.ends_with(".md") {
+        return None;
+    }
+    let filename = rest.rsplit('/').next()?;
+    Some(filename.strip_suffix(".md").unwrap_or(filename).to_string())
+}
+
+/// Pre-create the project-local + global skills placeholder dirs and
+/// log a warning for any phase-declared subagent whose plugin source
+/// isn't installed under `~/.claude/plugins/marketplaces/`.
 ///
-/// The project-local `<project>/.claude/skills/` placeholder is
-/// created unconditionally — it lives under `project_dir` (a
-/// tempdir during tests) and carries no global-pollution risk.
+/// Plugin agents are no longer ln -sf'd here (V0.2 M0.20) — Claude
+/// Code's in-memory plugin pipeline reads `enabledPlugins` from the
+/// spawned project's `.claude/settings.json` and namespaces each agent
+/// as `<plugin>:<name>`. Skills directory pre-creation still matters
+/// because Claude Code's SKILL.md watcher only attaches to dirs that
+/// exist at session start (§1.2.4).
+///
+/// **Test isolation**: tests that call `bootstrap_project` without
+/// caring about `~/.claude/` set `CCTEAM_DISABLE_TOOL_SURFACE_BOOTSTRAP=1`
+/// (or redirect `CLAUDE_CONFIG_HOME` to a tempdir).
 fn setup_tool_surface(project_dir: &Path, templates: &[PhaseTemplate]) -> Result<()> {
-    // Project-local placeholder always created — see doc comment.
     let project_skills = project_dir.join(".claude").join("skills");
     std::fs::create_dir_all(&project_skills)
         .with_context(|| format!("create {}", project_skills.display()))?;
@@ -361,52 +400,42 @@ fn setup_tool_surface(project_dir: &Path, templates: &[PhaseTemplate]) -> Result
         return Ok(());
     }
     let claude = user_claude_dir()?;
-    let reports = link_recommended_agents_for_phases_into(
-        &claude,
-        templates,
-        LinkOptions::default(),
-    )?;
-    for r in &reports {
-        match &r.action {
-            AgentLinkAction::Linked => tracing::info!(
-                agent = r.agent.filename,
-                target = %r.target.display(),
-                "linked plugin agent into ~/.claude/agents/",
-            ),
-            AgentLinkAction::AlreadyLinked => tracing::debug!(
-                agent = r.agent.filename,
-                "plugin agent symlink already in place",
-            ),
-            AgentLinkAction::Replaced { previous_target } => tracing::info!(
-                agent = r.agent.filename,
-                previous = %previous_target.display(),
-                "replaced foreign symlink with plugin source (force=true)",
-            ),
-            AgentLinkAction::Kept { previous_target } => tracing::warn!(
-                agent = r.agent.filename,
-                previous = %previous_target.display(),
-                "agent symlink points elsewhere — `Task(subagent_type=...)` will hit the foreign target. \
-                 run `ccteam doctor --install-recommended-agents --force` to replace.",
-            ),
-            AgentLinkAction::SkippedUserFile => tracing::warn!(
-                agent = r.agent.filename,
-                target = %r.target.display(),
-                "user-authored agent file at target; not overwriting (use `ccteam doctor --install-recommended-agents --force` to replace)",
-            ),
-            AgentLinkAction::SkippedSourceMissing { source } => tracing::warn!(
-                agent = r.agent.filename,
-                source = %source.display(),
-                "plugin source missing — install claude-plugins-official to enable this agent",
-            ),
-            AgentLinkAction::DryRun { .. } => {}
-        }
-    }
-    // Global ~/.claude/skills/ — only when not in test-disable mode
-    // (covered above). Project-local skills dir was already created
-    // unconditionally at function entry.
     let global_skills = claude.join("skills");
     std::fs::create_dir_all(&global_skills)
         .with_context(|| format!("create {}", global_skills.display()))?;
+
+    let mut declared: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for t in templates {
+        for s in &t.tools_required.subagents {
+            declared.insert(s.clone());
+        }
+        for spec in &t.sub_skills {
+            if let Some(bare) = parse_subskill_subagent_name(&spec.skill) {
+                declared.insert(bare);
+            }
+        }
+    }
+    for name in &declared {
+        let Some(agent) = lookup_plugin_agent(name) else {
+            continue;
+        };
+        let src = agent.source_path(&claude);
+        if src.is_file() {
+            tracing::debug!(
+                subagent = %name,
+                plugin = %agent.plugin_id(),
+                "plugin agent source present; spawned session enables plugin via enabledPlugins",
+            );
+        } else {
+            tracing::warn!(
+                subagent = %name,
+                plugin = %agent.plugin_id(),
+                source = %src.display(),
+                "plugin source missing — run `claude /plugin add {}` so phase markdown's Task(subagent_type=...) resolves",
+                agent.plugin_id(),
+            );
+        }
+    }
     Ok(())
 }
 

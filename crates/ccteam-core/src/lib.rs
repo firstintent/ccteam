@@ -14,6 +14,7 @@ pub mod memory_bridge;
 pub mod skill;
 pub mod paths;
 pub mod phases;
+pub mod plugin_resolution;
 pub mod progress;
 pub mod projects;
 pub mod stall;
@@ -88,8 +89,9 @@ pub use templates::{
     current_ccteam_bin, project_phase_filename, render_project_settings,
     write_all_global_team_templates, write_global_helper_templates,
     write_global_phase_templates, write_project_phase_templates,
-    write_project_phase_templates_for_team, write_project_settings, SettingsEnv,
-    HELPER_TEMPLATES, PHASE_TEMPLATES, PROJECT_SETTINGS_JSON,
+    write_project_phase_templates_for_team, write_project_settings,
+    EnabledPluginsSetting, SettingsEnv, HELPER_TEMPLATES, PHASE_TEMPLATES,
+    PROJECT_SETTINGS_JSON,
 };
 // V0.2 §6.4 candidate 3: TEAM_BUNDLES / team_bundle / TeamTemplateBundle
 // are no longer exported. They remain `pub(crate)` as the in-binary
@@ -97,13 +99,13 @@ pub use templates::{
 // outside ccteam-core query disk (`<global_dir>/teams/<name>/team.yaml`)
 // instead.
 pub use tmux::{pid_is_alive, session_name_for_slug, tmux_available, TmuxSession};
+pub use plugin_resolution::{
+    lookup_plugin_agent, plugins_to_enable, PluginAgent, KNOWN_PLUGIN_AGENTS,
+};
 pub use tool_surface::{
     disable_tool_surface_bootstrap_for_tests, ensure_skills_placeholders,
-    link_recommended_agents, link_recommended_agents_for_phases,
-    link_recommended_agents_for_phases_into, link_recommended_agents_into, missing_tools,
-    user_claude_dir, AgentLinkAction, AgentLinkReport, LinkOptions, MissingTool,
-    RecommendedAgent, ToolSurfaceSnapshot, ToolsRequired, BUILTIN_SUBAGENTS,
-    RECOMMENDED_AGENTS,
+    migrate_recommended_agent_symlinks, missing_tools, user_claude_dir, MigrationReport,
+    MissingTool, ToolSurfaceSnapshot, ToolsRequired, BUILTIN_SUBAGENTS,
 };
 
 /// Crate version, identical to the workspace package version.

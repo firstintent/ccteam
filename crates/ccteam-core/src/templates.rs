@@ -200,12 +200,29 @@ pub struct SettingsEnv {
     pub ccteam_projects_root: Option<String>,
 }
 
+/// Optional `enabledPlugins` map for the rendered settings.json. V0.2
+/// M0.20: spawned project sessions enable each plugin a phase's
+/// `tools_required.subagents` resolves to (via `plugin_resolution`) so
+/// Claude Code's in-memory plugin pipeline auto-namespaces the agent
+/// without ccteam-core ln -sf'ing into `~/.claude/agents/`.
+///
+/// Each entry is the `<plugin>@<marketplace>` key Claude Code's plugin
+/// pipeline expects.
+#[derive(Debug, Default, Clone)]
+pub struct EnabledPluginsSetting {
+    pub plugin_ids: std::collections::BTreeSet<String>,
+}
+
 /// Render `PROJECT_SETTINGS_JSON` with `__CCTEAM_BIN__` replaced by the
-/// given absolute binary path and `extra_env` merged into the top-level
-/// `env` block. Validates that the rewritten body is still valid JSON
-/// so a path with shell-hostile characters can't silently corrupt the
-/// settings file.
-pub fn render_project_settings(ccteam_bin: &Path, extra_env: &SettingsEnv) -> Result<String> {
+/// given absolute binary path, `extra_env` merged into the top-level
+/// `env` block, and `enabled` written under `enabledPlugins`. Validates
+/// that the rewritten body is still valid JSON so a path with
+/// shell-hostile characters can't silently corrupt the settings file.
+pub fn render_project_settings(
+    ccteam_bin: &Path,
+    extra_env: &SettingsEnv,
+    enabled: &EnabledPluginsSetting,
+) -> Result<String> {
     let bin = ccteam_bin
         .to_str()
         .ok_or_else(|| anyhow!("ccteam binary path not valid UTF-8: {}", ccteam_bin.display()))?;
@@ -228,16 +245,29 @@ pub fn render_project_settings(ccteam_bin: &Path, extra_env: &SettingsEnv) -> Re
             );
         }
     }
+    if !enabled.plugin_ids.is_empty() {
+        let mut map = serde_json::Map::new();
+        for id in &enabled.plugin_ids {
+            map.insert(id.clone(), Value::Bool(true));
+        }
+        v.as_object_mut()
+            .ok_or_else(|| anyhow!("settings.json root is not an object"))?
+            .insert("enabledPlugins".into(), Value::Object(map));
+    }
     serde_json::to_string_pretty(&v).context("serialize rendered settings.json")
 }
 
 /// Write `<project_dir>/.claude/settings.json` with hook commands
-/// pointing at the running ccteam binary by absolute path **and** the
-/// effective `CCTEAM_HOME` / `CCTEAM_PROJECTS_ROOT` baked into `env` so
-/// hook subprocesses don't depend on tmux env propagation. Creates the
-/// parent dir if missing. Idempotent — overwrites any prior render so
-/// re-running after a ccteam upgrade refreshes paths.
-pub fn write_project_settings(project_dir: &Path) -> Result<()> {
+/// pointing at the running ccteam binary by absolute path, the
+/// effective `CCTEAM_HOME` / `CCTEAM_PROJECTS_ROOT` baked into `env`,
+/// and the spawned-session `enabledPlugins` set. Creates the parent
+/// dir if missing. Idempotent — overwrites any prior render so
+/// re-running after a ccteam upgrade refreshes paths and the
+/// plugin set.
+pub fn write_project_settings(
+    project_dir: &Path,
+    enabled: &EnabledPluginsSetting,
+) -> Result<()> {
     let dir = project_dir.join(".claude");
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("create {}", dir.display()))?;
@@ -247,7 +277,7 @@ pub fn write_project_settings(project_dir: &Path) -> Result<()> {
         ccteam_home: std::env::var("CCTEAM_HOME").ok(),
         ccteam_projects_root: std::env::var("CCTEAM_PROJECTS_ROOT").ok(),
     };
-    let body = render_project_settings(&bin, &extra)?;
+    let body = render_project_settings(&bin, &extra, enabled)?;
     std::fs::write(&path, body)
         .with_context(|| format!("write {}", path.display()))?;
     Ok(())
@@ -404,9 +434,12 @@ mod tests {
 
     #[test]
     fn template_is_valid_json_with_expected_hook_keys() {
-        let body =
-            render_project_settings(Path::new("/usr/local/bin/ccteam"), &SettingsEnv::default())
-                .unwrap();
+        let body = render_project_settings(
+            Path::new("/usr/local/bin/ccteam"),
+            &SettingsEnv::default(),
+            &EnabledPluginsSetting::default(),
+        )
+        .unwrap();
         let v: serde_json::Value =
             serde_json::from_str(&body).expect("rendered template must be valid JSON");
         let hooks = v["hooks"].as_object().expect("hooks object");
@@ -428,9 +461,12 @@ mod tests {
 
     #[test]
     fn template_session_start_uses_absolute_ccteam_path() {
-        let body =
-            render_project_settings(Path::new("/usr/local/bin/ccteam"), &SettingsEnv::default())
-                .unwrap();
+        let body = render_project_settings(
+            Path::new("/usr/local/bin/ccteam"),
+            &SettingsEnv::default(),
+            &EnabledPluginsSetting::default(),
+        )
+        .unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         let entries = v["hooks"]["SessionStart"][0]["hooks"].as_array().unwrap();
         let cmds: Vec<&str> = entries
@@ -506,6 +542,7 @@ mod tests {
         let err = render_project_settings(
             Path::new("/tmp/has\"quote/ccteam"),
             &SettingsEnv::default(),
+            &EnabledPluginsSetting::default(),
         )
         .unwrap_err();
         assert!(format!("{err:#}").contains("characters"));
@@ -517,7 +554,12 @@ mod tests {
             ccteam_home: Some("/tmp/sandbox/home".into()),
             ccteam_projects_root: Some("/tmp/sandbox/projects".into()),
         };
-        let body = render_project_settings(Path::new("/usr/local/bin/ccteam"), &env).unwrap();
+        let body = render_project_settings(
+            Path::new("/usr/local/bin/ccteam"),
+            &env,
+            &EnabledPluginsSetting::default(),
+        )
+        .unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["env"]["CCTEAM_HOME"], "/tmp/sandbox/home");
         assert_eq!(v["env"]["CCTEAM_PROJECTS_ROOT"], "/tmp/sandbox/projects");
@@ -527,10 +569,47 @@ mod tests {
 
     #[test]
     fn render_project_settings_omits_env_when_default() {
-        let body =
-            render_project_settings(Path::new("/usr/local/bin/ccteam"), &SettingsEnv::default())
-                .unwrap();
+        let body = render_project_settings(
+            Path::new("/usr/local/bin/ccteam"),
+            &SettingsEnv::default(),
+            &EnabledPluginsSetting::default(),
+        )
+        .unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(v["env"]["CCTEAM_HOME"].is_null());
+    }
+
+    #[test]
+    fn render_project_settings_omits_enabled_plugins_when_empty() {
+        let body = render_project_settings(
+            Path::new("/usr/local/bin/ccteam"),
+            &SettingsEnv::default(),
+            &EnabledPluginsSetting::default(),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v.get("enabledPlugins").is_none());
+    }
+
+    #[test]
+    fn render_project_settings_writes_enabled_plugins_when_present() {
+        let mut enabled = EnabledPluginsSetting::default();
+        enabled
+            .plugin_ids
+            .insert("pr-review-toolkit@claude-plugins-official".into());
+        enabled
+            .plugin_ids
+            .insert("feature-dev@claude-plugins-official".into());
+        let body = render_project_settings(
+            Path::new("/usr/local/bin/ccteam"),
+            &SettingsEnv::default(),
+            &enabled,
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let map = v["enabledPlugins"].as_object().expect("enabledPlugins object");
+        assert_eq!(map.len(), 2);
+        assert_eq!(map["pr-review-toolkit@claude-plugins-official"], true);
+        assert_eq!(map["feature-dev@claude-plugins-official"], true);
     }
 }
