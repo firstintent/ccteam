@@ -8,7 +8,9 @@ use ccteam_core::{Parallelism, PhaseTemplate};
 
 fn phases_dir() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest.join("../../phases")
+    // V0.2 M0.17.1: phases live under teams/<name>/phases/ in the
+    // unified team layout (was repo-root `phases/`).
+    manifest.join("../../teams/dev/phases")
 }
 
 const M0_TEMPLATES: &[(&str, &str)] = &[

@@ -1635,74 +1635,102 @@ fn load_phase_templates(dir: &Path) -> Result<Vec<PhaseTemplate>> {
 /// than failing the whole orchestrator) — adding a team.yaml to an
 /// otherwise empty install is a normal step.
 fn load_team_runtimes(paths: &CcteamPaths) -> Result<HashMap<String, TeamRuntime>> {
+    use crate::team_resolver::{
+        default_user_staging_dir, discover_team_names, resolve_team, TeamResolveContext,
+        TEAM_SOURCES,
+    };
+
     let mut teams = HashMap::new();
     let teams_dir = paths.root.join("teams");
 
     let dev_yaml = teams_dir.join("dev").join("team.yaml");
     let dev_yaml_present = dev_yaml.exists();
 
-    if teams_dir.exists() {
-        for entry in std::fs::read_dir(&teams_dir)
-            .with_context(|| format!("read_dir {}", teams_dir.display()))?
-        {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
+    // V0.2 M0.17.4: walk every team name discoverable across User +
+    // Repo layers, then resolve through the layered resolver so a
+    // user-staged override beats a shipped seed of the same name.
+    let user_staging = default_user_staging_dir();
+    let ctx = TeamResolveContext::for_orchestrator(&paths.root, &user_staging);
+    let team_names = discover_team_names(&ctx);
+    for name in team_names {
+        let spec = match resolve_team(&name, &ctx) {
+            Ok(s) => s,
+            Err(err) => {
+                tracing::warn!(
+                    team = %name,
+                    error = format!("{err:#}"),
+                    "team listed by discover_team_names but resolve_team failed; skipping",
+                );
                 continue;
             }
-            let yaml = entry.path().join("team.yaml");
-            if !yaml.exists() {
-                continue;
-            }
-            let spec = TeamSpec::load(&yaml).with_context(|| {
-                format!("load team.yaml at {}", yaml.display())
-            })?;
-            // V0.2 §6.4 candidate 5: evergreen teams (meta-agent) ship
-            // an empty phase set — they're event-loop sessions, not
-            // phase-DAG ones. Skip the phase_dir presence check + the
-            // template load; the resulting TeamRuntime carries an
-            // empty templates Vec and an empty DAG, which `decide_tick`
-            // handles via early NoOp.
-            let (templates, dag) = if spec.evergreen {
-                let dag = Dag::from_templates(&[]).with_context(|| {
-                    format!("team `{}` build empty phase DAG", spec.name)
-                })?;
-                (Vec::new(), dag)
-            } else {
-                let phase_dir = paths.root.join(&spec.phase_dir);
-                if !phase_dir.exists() {
-                    tracing::warn!(
-                        team = %spec.name,
-                        phase_dir = %phase_dir.display(),
-                        "team registered but phase_dir is missing; \
-                         run `ccteam init` to populate templates",
-                    );
-                    continue;
-                }
-                let templates = load_phase_templates(&phase_dir)?;
-                for t in &templates {
-                    t.validate_m0().with_context(|| {
-                        format!(
-                            "team `{}` phase template `{}` failed M0 validation",
-                            spec.name, t.name,
-                        )
-                    })?;
-                }
-                let dag = Dag::from_templates(&templates).with_context(|| {
-                    format!("team `{}` build phase DAG", spec.name)
-                })?;
-                (templates, dag)
-            };
-            teams.insert(
-                spec.name.clone(),
-                TeamRuntime {
-                    spec,
-                    templates,
-                    dag,
-                },
-            );
-        }
-    }
+        };
+        // The TeamSource that won resolution is also where the
+        // phase markdowns live (per-team-dir layout, M0.17.2).
+        // Compute its team_dir by re-walking sources to find the
+        // first hit — keeps the resolver pure (no path returned).
+        let team_dir = TEAM_SOURCES
+            .iter()
+            .filter_map(|s| s.path_for(&name, &ctx))
+            .find(|p| p.exists())
+            .and_then(|p| p.parent().map(Path::to_path_buf));
 
+        // V0.2 §6.4 candidate 5: evergreen teams (meta-agent) ship
+        // an empty phase set — they're event-loop sessions, not
+        // phase-DAG ones. Skip the phase_dir presence check + the
+        // template load; the resulting TeamRuntime carries an
+        // empty templates Vec and an empty DAG, which `decide_tick`
+        // handles via early NoOp.
+        let (templates, dag) = if spec.evergreen {
+            let dag = Dag::from_templates(&[]).with_context(|| {
+                format!("team `{}` build empty phase DAG", spec.name)
+            })?;
+            (Vec::new(), dag)
+        } else {
+            // V0.2 M0.17.2: phase_dir is relative to the team
+            // directory. Legacy `phases-<team>` values were rewritten
+            // to `phases` by TeamSpec::parse so this join lands at
+            // the new layout regardless of yaml vintage.
+            let Some(team_dir) = team_dir else {
+                tracing::warn!(
+                    team = %spec.name,
+                    "non-evergreen team has no resolvable team_dir; \
+                     run `ccteam doctor --reset-shipped-teams`",
+                );
+                continue;
+            };
+            let phase_dir = team_dir.join(&spec.phase_dir);
+            if !phase_dir.exists() {
+                tracing::warn!(
+                    team = %spec.name,
+                    phase_dir = %phase_dir.display(),
+                    "team registered but phase_dir is missing; \
+                     run `ccteam init` to populate templates",
+                );
+                continue;
+            }
+            let templates = load_phase_templates(&phase_dir)?;
+            for t in &templates {
+                t.validate_m0().with_context(|| {
+                    format!(
+                        "team `{}` phase template `{}` failed M0 validation",
+                        spec.name, t.name,
+                    )
+                })?;
+            }
+            let dag = Dag::from_templates(&templates).with_context(|| {
+                format!("team `{}` build phase DAG", spec.name)
+            })?;
+            (templates, dag)
+        };
+        teams.insert(
+            name,
+            TeamRuntime {
+                spec,
+                templates,
+                dag,
+            },
+        );
+    }
     // Legacy fallback for dev: if no teams/dev/team.yaml on disk but
     // phases/ has templates, register an implicit dev team so M0–M2
     // installs without `ccteam init` keep running.

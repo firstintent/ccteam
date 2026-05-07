@@ -67,7 +67,7 @@ fn write_global_phases_with_implement(phases_dir: &Path) {
     // The shipped 03-implement.md declares tools_required:[code-reviewer]
     // — we read it from disk so this test breaks loudly if anyone
     // weakens the declaration.
-    let implement_src = include_str!("../../../phases/03-implement.md");
+    let implement_src = include_str!("../../../teams/dev/phases/03-implement.md");
     std::fs::write(phases_dir.join("03-implement.md"), implement_src).unwrap();
     // Plus a minimal plan-eng so the orchestrator has more than one
     // template to validate.
@@ -85,7 +85,7 @@ fn write_global_phases_with_implement(phases_dir: &Path) {
 fn shipped_implement_phase_declares_code_reviewer_subagent() {
     // Sentinel: catch a future commit that strips the tools_required
     // declaration from 03-implement.md without intending to.
-    let body = include_str!("../../../phases/03-implement.md");
+    let body = include_str!("../../../teams/dev/phases/03-implement.md");
     let template = PhaseTemplate::parse(body).unwrap();
     assert!(
         template

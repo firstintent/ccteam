@@ -17,8 +17,9 @@ cost_policy:
 # Phase markdown directory — declared for schema completeness even
 # though meta-agent ships no phase templates (phase set is empty).
 # load_team_runtimes treats `evergreen: true` as exempt from the
-# phase_dir-must-exist check.
-phase_dir: phases-meta-agent
+# phase_dir-must-exist check. V0.2 M0.17.2: `phase_dir` is now
+# relative to the team directory (~/.ccteam/teams/meta-agent/).
+phase_dir: phases
 
 # Auto-managed CLAUDE.md template (M0.16.3) — body lives in
 # crates/ccteam-core/src/templates/meta_agent_role.md so the

@@ -55,7 +55,8 @@ fn orchestrator_loads_dev_and_product_research_after_init() {
         .team_runtime("product-research")
         .expect("product-research team should be registered after write_all_global_team_templates");
     assert_eq!(pr.spec.name, "product-research");
-    assert_eq!(pr.spec.phase_dir, "phases-product-research");
+    // V0.2 M0.17.2: phase_dir is relative to team dir; default `phases`.
+    assert_eq!(pr.spec.phase_dir, "phases");
     assert!(
         pr.templates.iter().any(|t| t.name == "kickoff"),
         "product-research should have the kickoff phase",
@@ -138,9 +139,12 @@ fn orchestrator_skips_team_with_missing_phase_dir() {
     let paths = fresh_paths(&tmp);
     let team_dir = paths.root.join("teams").join("ghost-team");
     std::fs::create_dir_all(&team_dir).unwrap();
+    // V0.2 M0.17.2: any non-default phase_dir value works for the
+    // "phase_dir doesn't exist" path. `ghost` (no `phases-` legacy
+    // prefix) avoids triggering the legacy-rewrite logic.
     std::fs::write(
         team_dir.join("team.yaml"),
-        "name: ghost-team\nphase_dir: phases-ghost\n",
+        "name: ghost-team\nphase_dir: ghost\n",
     )
     .unwrap();
 
@@ -160,7 +164,13 @@ fn write_all_global_team_templates_is_idempotent() {
     let tmp = TempDir::new().unwrap();
     let paths = fresh_paths(&tmp);
     write_all_global_team_templates(&paths.root, false).unwrap();
-    let path = paths.root.join("phases").join("02-plan-eng.md");
+    // V0.2 M0.17.1: phase markdown lives under teams/<name>/phases/.
+    let path = paths
+        .root
+        .join("teams")
+        .join("dev")
+        .join("phases")
+        .join("02-plan-eng.md");
     std::fs::write(&path, "USER EDIT\n").unwrap();
     write_all_global_team_templates(&paths.root, false).unwrap();
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "USER EDIT\n");

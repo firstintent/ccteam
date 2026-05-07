@@ -13,28 +13,29 @@
 
 ### 1.1 全局目录(`~/.ccteam/`)
 
+> **V0.2 M0.17.1 layout shift**:每个 team 整目录,phase markdowns 在
+> `teams/<name>/phases/`(原 `phases/` / `phases-product-research/` 仓根铺平)。
+> 旧 yaml 的 `phase_dir: phases-<team>` 在 `TeamSpec::parse` 自动重写
+> 为 `phases`(legacy compat)。
+
 ```
 ~/.ccteam/
 ├── config.yml             # 全局配置(并发上限、API key、bot token、信任档位、模型单价表)
 ├── inbox/                 # 待 triage 的需求
-├── queue/
-│   ├── seeding/
-│   ├── planning/
-│   ├── coding/
-│   ├── reviewing/
-│   ├── done/
-│   └── archive/
-├── phases/                # phase 模板(启动时复制到项目)
-│   ├── 00-seed.md
-│   ├── 01-plan-ceo.md
-│   ├── 02-plan-eng.md
-│   ├── 03-implement.md
-│   ├── 04-test-author.md
-│   ├── 05-test-run.md
-│   ├── 06-fix.md
-│   ├── 07-review.md
-│   ├── 08-score.md
-│   └── 09-ship.md
+├── queue/                 # 阶段队列
+├── teams/                 # **V0.2 M0.17:每个 team 单一目录**
+│   ├── dev/
+│   │   ├── team.yaml      # 详见 §5.5
+│   │   └── phases/        # phase 模板(`team.yaml.phase_dir`,默认 `phases`)
+│   │       ├── 02-plan-eng.md
+│   │       ├── 03-implement.md
+│   │       └── ...
+│   ├── product-research/
+│   │   ├── team.yaml
+│   │   └── phases/
+│   ├── meta-agent/
+│   │   └── team.yaml      # evergreen,无 phases/(M0.16)
+│   └── <user-team>/       # 用户自建 team(staging 经 ~/.config/ccteam/teams/)
 ├── templates/             # M2.4+: phase 可 @ 引用的 prompt 片段(原生 @,orchestrator 不解析)
 │   ├── review-with-user-loop.md
 │   └── kickoff-reverse-interview.md
@@ -50,6 +51,21 @@
 └── state/
     └── orchestrator.json  # orchestrator 自身 in-memory 状态的快照
 ```
+
+**Team 解析三层优先级**(V0.2 M0.17.3,`team_resolver.rs`):
+
+```
+const TEAM_SOURCES: &[TeamSource] = &[
+    TeamSource::Project,  // <project_dir>/.ccteam/team/team.yaml(per-project override)
+    TeamSource::User,     // ~/.config/ccteam/teams/<name>/team.yaml(staging)
+                          // V0.3:+ ~/.claude/plugins/marketplaces/*/plugins/<team>/team.yaml
+    TeamSource::Repo,     // ~/.ccteam/teams/<name>/team.yaml(shipped seeds)
+];
+```
+
+First-source-wins,整团维度替换(撞名 project 完全覆盖 user / repo,**不**字段级合并)。
+读容错(yaml 错 → warn + 下一层),写严格(`save_team` 拒绝覆盖现存的不可解析
+yaml)。
 
 ### 1.2 项目级目录(`~/projects/<team>-<slug>/`)
 
