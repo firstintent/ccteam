@@ -75,17 +75,21 @@ pub use subskill::{
 };
 pub use state::{Parallelism, PhaseHistoryEntry, PhaseState, ProjectState};
 pub use team::{
-    CriticDimensionSpec, CriticStrictness, EscalateGrammarExtension, EscalateRoute,
+    CostPolicy, CriticDimensionSpec, CriticStrictness, EscalateGrammarExtension, EscalateRoute,
     RetroFieldKind, RetroFieldSpec, TeamSpec,
 };
 pub use templates::{
-    current_ccteam_bin, project_phase_filename, render_project_settings, team_bundle,
+    current_ccteam_bin, project_phase_filename, render_project_settings,
     write_all_global_team_templates, write_global_helper_templates,
     write_global_phase_templates, write_project_phase_templates,
     write_project_phase_templates_for_team, write_project_settings, SettingsEnv,
-    TeamTemplateBundle, HELPER_TEMPLATES, PHASE_TEMPLATES, PROJECT_SETTINGS_JSON,
-    TEAM_BUNDLES,
+    HELPER_TEMPLATES, PHASE_TEMPLATES, PROJECT_SETTINGS_JSON,
 };
+// V0.2 §6.4 candidate 3: TEAM_BUNDLES / team_bundle / TeamTemplateBundle
+// are no longer exported. They remain `pub(crate)` as the in-binary
+// seed source for `write_all_global_team_templates`; runtime code paths
+// outside ccteam-core query disk (`<global_dir>/teams/<name>/team.yaml`)
+// instead.
 pub use tmux::{pid_is_alive, session_name_for_slug, tmux_available, TmuxSession};
 pub use tool_surface::{
     disable_tool_surface_bootstrap_for_tests, ensure_skills_placeholders,

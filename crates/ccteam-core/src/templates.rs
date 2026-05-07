@@ -67,29 +67,44 @@ const PRODUCT_RESEARCH_PHASE_TEMPLATES: &[(&str, &str)] = &[
 ];
 
 /// Embedded `team.yaml` files keyed by team name. M3.4 ships dev +
-/// product-research. `ccteam init` writes these to
-/// `~/.ccteam/teams/<name>/team.yaml`. The orchestrator reads them at
-/// startup to resolve `phase_dir`, registered ESCALATE prefixes, and
-/// (eventually) team-wide golden rules.
+/// product-research; V0.2 M0.16 adds meta-agent (evergreen). `ccteam
+/// init` writes these to `~/.ccteam/teams/<name>/team.yaml`. The
+/// orchestrator reads them at startup to resolve `phase_dir`,
+/// registered ESCALATE prefixes, the V0.2 `evergreen` / `cost_policy`
+/// flags, and (eventually) team-wide golden rules.
 const DEV_TEAM_YAML: &str = include_str!("../../../teams/dev.yaml");
 const PRODUCT_RESEARCH_TEAM_YAML: &str =
     include_str!("../../../teams/product-research.yaml");
+const META_AGENT_TEAM_YAML: &str = include_str!("../../../teams/meta-agent.yaml");
+
+/// Empty phase set for evergreen teams (meta-agent). The orchestrator
+/// builds a `Dag::from_templates(&[])` for these, which `decide_tick`
+/// short-circuits to `NoOp`. `process_meta_project` runs the
+/// alternative event-loop path instead.
+const META_AGENT_PHASE_TEMPLATES: &[(&str, &str)] = &[];
 
 /// One team's compile-time bundle: a `team.yaml` body + the phase
 /// markdowns to stamp into the project's `<project>/.ccteam/phases/`
 /// dir on `ccteam new`. Looking up by team name keeps every
 /// per-team artifact in one place — adding a team is a config change.
+///
+/// V0.2 §6.4 candidate 3: `pub(crate)` — runtime code paths now read
+/// disk (`~/.ccteam/teams/<name>/team.yaml`); this struct is only
+/// the in-binary seed source for `write_all_global_team_templates`
+/// and the bootstrap-time helpers in `projects.rs`.
 #[derive(Debug, Clone, Copy)]
-pub struct TeamTemplateBundle {
+pub(crate) struct TeamTemplateBundle {
     pub team_yaml: &'static str,
     pub phases: &'static [(&'static str, &'static str)],
 }
 
-/// Per-team template registry. `bootstrap_project`,
-/// `write_global_phase_templates`, and `Orchestrator::new` consult
-/// this. Adding a new team = add an entry here + author its YAML +
-/// markdowns; ccteam-core changes nothing else.
-pub const TEAM_BUNDLES: &[(&str, TeamTemplateBundle)] = &[
+/// In-binary seed source for shipped teams. **Not** a runtime
+/// registry — production lookups walk `~/.ccteam/teams/<name>/team.yaml`
+/// (see `Orchestrator::team_runtime` /
+/// `memory_bridge::discover_bridge_teams`). Adding a new shipped team
+/// = add an entry here + author its YAML + markdowns; user-authored
+/// teams skip this entirely (V0.2 M0.22 team factory).
+pub(crate) const TEAM_BUNDLES: &[(&str, TeamTemplateBundle)] = &[
     (
         "dev",
         TeamTemplateBundle {
@@ -104,12 +119,21 @@ pub const TEAM_BUNDLES: &[(&str, TeamTemplateBundle)] = &[
             phases: PRODUCT_RESEARCH_PHASE_TEMPLATES,
         },
     ),
+    (
+        "meta-agent",
+        TeamTemplateBundle {
+            team_yaml: META_AGENT_TEAM_YAML,
+            phases: META_AGENT_PHASE_TEMPLATES,
+        },
+    ),
 ];
 
-/// Resolve a team's compile-time bundle. Returns `None` for unknown
-/// teams so callers can fall back to "no embedded templates" — useful
-/// for user-authored teams that live entirely on disk.
-pub fn team_bundle(team: &str) -> Option<TeamTemplateBundle> {
+/// Resolve a shipped team's compile-time seed bundle. Returns `None`
+/// for unknown teams so callers fall back to "no embedded templates" —
+/// the right behavior for user-authored teams that live entirely on
+/// disk. V0.2 §6.4 candidate 3: `pub(crate)` — only bootstrap-time
+/// callers in ccteam-core may use this.
+pub(crate) fn team_bundle(team: &str) -> Option<TeamTemplateBundle> {
     TEAM_BUNDLES
         .iter()
         .find_map(|(name, bundle)| (*name == team).then_some(*bundle))
@@ -237,17 +261,16 @@ pub fn write_project_phase_templates(project_dir: &Path) -> Result<()> {
 }
 
 /// M3.3: write the project-local phase templates for `team` under
-/// `<project_dir>/.ccteam/phases/`. The `meta-agent` team has no
-/// phase set (event-loop session); for it this is a no-op so meta
-/// project bootstrap doesn't fail with "unknown team".
+/// `<project_dir>/.ccteam/phases/`. Evergreen teams (e.g. meta-agent)
+/// ship an empty phase set — the loop body is a no-op for them, so
+/// the function returns successfully without ever creating the
+/// `phases/` directory. (V0.2 §6.4 candidate 5 — declarative "no
+/// phases" via empty bundle, replacing the prior `team ==
+/// META_TEAM_NAME` literal.)
 pub fn write_project_phase_templates_for_team(
     project_dir: &Path,
     team: &str,
 ) -> Result<()> {
-    if team == crate::meta_agent::META_TEAM_NAME {
-        // Meta-agent has no DAG; skip the phase write entirely.
-        return Ok(());
-    }
     let bundle = team_bundle(team).ok_or_else(|| {
         anyhow!(
             "no embedded phase templates for team `{team}` — \
@@ -256,6 +279,12 @@ pub fn write_project_phase_templates_for_team(
              to TEAM_BUNDLES in templates.rs"
         )
     })?;
+    if bundle.phases.is_empty() {
+        // Evergreen / phase-less team — skip the directory creation
+        // so we don't litter empty `.ccteam/phases/` dirs across
+        // event-loop project trees.
+        return Ok(());
+    }
     let dir = project_dir.join(".ccteam").join("phases");
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("create {}", dir.display()))?;
@@ -308,17 +337,21 @@ pub fn write_all_global_team_templates(global_dir: &Path, force: bool) -> Result
         let spec = TeamSpec::parse(bundle.team_yaml).with_context(|| {
             format!("embedded team.yaml for `{name}` does not match TeamSpec schema")
         })?;
-        // Phase markdowns → <global>/<phase_dir>/<NN-name>.md.
-        let phase_dir = global_dir.join(&spec.phase_dir);
-        std::fs::create_dir_all(&phase_dir)
-            .with_context(|| format!("create {}", phase_dir.display()))?;
-        for (filename, body) in bundle.phases {
-            let path = phase_dir.join(filename);
-            if path.exists() && !force {
-                continue;
+        // Phase markdowns → <global>/<phase_dir>/<NN-name>.md. Skip
+        // the directory creation for evergreen / phase-less teams so
+        // we don't leave empty placeholder dirs around.
+        if !bundle.phases.is_empty() {
+            let phase_dir = global_dir.join(&spec.phase_dir);
+            std::fs::create_dir_all(&phase_dir)
+                .with_context(|| format!("create {}", phase_dir.display()))?;
+            for (filename, body) in bundle.phases {
+                let path = phase_dir.join(filename);
+                if path.exists() && !force {
+                    continue;
+                }
+                std::fs::write(&path, body)
+                    .with_context(|| format!("write {}", path.display()))?;
             }
-            std::fs::write(&path, body)
-                .with_context(|| format!("write {}", path.display()))?;
         }
         // team.yaml → <global>/teams/<name>/team.yaml.
         let team_dir = global_dir.join("teams").join(name);

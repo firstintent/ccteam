@@ -576,7 +576,7 @@ confidence: 0.0-1.0
 
 ---
 
-### 5.5 `team.yaml` 团队配置(M3.1 / M3.2 / M3.3+)
+### 5.5 `team.yaml` 团队配置(M3.1 / M3.2 / M3.3 / V0.2 M0.16+)
 
 每个团队一份 `team.yaml`,落 `~/.ccteam/teams/<name>/team.yaml`。
 
@@ -587,6 +587,10 @@ confidence: 0.0-1.0
   按 `phase_dir` 加载 phases,每团队建 `TeamRuntime { spec, templates, dag }`
 - **M3.4** ✅ product-research 团队入仓(`teams/product-research.yaml` +
   `phases-product-research/`)
+- **V0.2 M0.16** ✅ 加 `evergreen` / `cost_policy` / `claude_md_template` —
+  替代 `if state.team == META_TEAM_NAME` / `match team` ccteam-core 分叉
+  (PRD §6.4 candidate 5 + §6.2 candidate 2);新增 `teams/meta-agent.yaml`
+  作 evergreen 范例;`memory_bridge` 团队列表改成扫盘(PRD §6.4 candidate 3)
 
 ```yaml
 # ~/.ccteam/teams/product-research/team.yaml — 完整字段示例
@@ -625,6 +629,22 @@ retro_schema:
   - field: market_signals
     description: Top market signals collected
     kind: list                            # 默认 list。可选 text(单段叙述)
+
+# V0.2 M0.16 — evergreen 标记 + cost 政策(PRD §6.4 candidate 5)。
+# 默认 evergreen=false / cost_policy=KillAt(None)(沿用 M3 行为)。
+# meta-agent / V0.3 watchdog / reviewer agent 应设 evergreen=true +
+# cost_policy={kind: none}。
+evergreen: false
+cost_policy:
+  kind: kill_at        # none | kill_at
+  threshold_usd: ~     # KillAt(None) 回退到 state.hard_kill_threshold_usd
+
+# V0.2 M0.16 — auto-managed `<project>/CLAUDE.md` body。{slug} / {team}
+# bootstrap 时替换。空字符串走通用 fallback(不烧 dev / research 假设)。
+# Replaces ccteam-core::projects::render_project_claude_md 的 match team。
+claude_md_template: |
+  # CLAUDE.md (auto-managed by ccteam)
+  ...
 ```
 
 **校验**(`TeamSpec::validate` 在 parse 时执行):
@@ -636,6 +656,12 @@ retro_schema:
 - `golden_rules[*]` 必须 `cmd | pattern` 二选一(同 phase YAML)
 - `verdict_schema[*]` 非空
 - `critic_dimensions[*].name` 非空、唯一
+- V0.2 M0.16:`evergreen` / `cost_policy` / `claude_md_template` 都 serde-default,
+  现存 yaml 不需 migration;`evergreen=true` 团队走
+  `Orchestrator::process_meta_project`(事件循环 + 上下文重置),
+  `phase_dir` 不需存在;`cost_policy=None` 跳过 cost 阶梯;
+  `cost_policy=KillAt(threshold)` 用 yaml 阈值覆盖
+  `state.hard_kill_threshold_usd`
 
 **实现位置**:`crates/ccteam-core/src/team.rs`(`TeamSpec` / `RetroFieldSpec` /
 `RetroFieldKind` / `CriticDimensionSpec` / `CriticStrictness` /

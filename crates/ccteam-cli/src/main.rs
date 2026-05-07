@@ -148,13 +148,22 @@ enum Command {
         /// any prior `ccteam` server entry but preserves other servers.
         #[arg(long, default_value_t = false)]
         install_mcp: bool,
-        /// M4.2: write `~/.claude/rules/ccteam-lessons-{dev,product-research}.md`
+        /// M4.2: write `~/.claude/rules/ccteam-lessons-<team>.md`
         /// with `<!-- ccteam-managed:lessons begin/end -->` markers + `paths:`
         /// frontmatter scope. Idempotent — re-runs no-op when markers are
         /// intact, repair (single canonical block at end-of-file) when not.
-        /// User content outside markers is preserved.
+        /// User content outside markers is preserved. Discovers teams by
+        /// scanning `~/.ccteam/teams/<name>/team.yaml` for non-empty
+        /// `retro_schema` (V0.2 M0.16.2).
         #[arg(long, default_value_t = false)]
         install_memory_bridge: bool,
+        /// V0.2 M0.16.2: re-write every shipped team's seed
+        /// (`~/.ccteam/teams/<name>/team.yaml` + `~/.ccteam/<phase_dir>/*.md`)
+        /// from the in-binary bundle. `force=false` preserves operator
+        /// hand-edits; pair with `--force` to clobber. Useful after a
+        /// ccteam upgrade ships schema-additive team.yaml fields.
+        #[arg(long, default_value_t = false)]
+        reset_shipped_teams: bool,
     },
 }
 
@@ -236,6 +245,7 @@ fn main() -> Result<()> {
             install_meta_agent,
             install_mcp,
             install_memory_bridge,
+            reset_shipped_teams,
         } => run_doctor(commands::DoctorOptions {
             install_recommended_agents,
             dry_run,
@@ -245,6 +255,7 @@ fn main() -> Result<()> {
             install_meta_agent,
             install_mcp,
             install_memory_bridge,
+            reset_shipped_teams,
         }),
     }
 }
@@ -301,6 +312,22 @@ fn run_hook(cmd: HookCommand) -> Result<()> {
 fn run_start(tick_seconds: u64, skip_tool_check: bool) -> Result<()> {
     init_tracing();
     let paths = CcteamPaths::from_env()?;
+
+    // V0.2 M0.16.2: self-heal shipped team seeds on every daemon
+    // start. force=false skips existing files so operator hand-edits
+    // are preserved; the call still ensures `~/.ccteam/teams/<name>/team.yaml`
+    // exists for every shipped team (dev / product-research /
+    // meta-agent) — without this, a fresh install missing `ccteam init`
+    // would leave `is_evergreen("meta-agent") == false` and the
+    // dispatcher would fall into the phase-DAG path.
+    if let Err(err) = ccteam_core::write_all_global_team_templates(&paths.root, false) {
+        tracing::warn!(
+            error = %err,
+            root = %paths.root.display(),
+            "ccteam start: could not seed shipped team templates; \
+             run `ccteam doctor --reset-shipped-teams` if teams are missing",
+        );
+    }
 
     if !paths.phases_dir().exists() {
         eprintln!(

@@ -179,22 +179,47 @@ pub fn bootstrap_project(
     Ok(project_dir)
 }
 
-/// Build the `<project>/CLAUDE.md` body for `team`. dev keeps its
-/// historical "no git push, tests must pass" wording; product-research
-/// gets a research-specific contract; unknown teams get a generic
-/// shell that doesn't bake in dev or research assumptions.
+/// Build the `<project>/CLAUDE.md` body for `team`. V0.2 §6.4
+/// candidate 2: the per-team body lives in `team.yaml.claude_md_template`,
+/// not in a `match team` branch in ccteam-core. Templates contain the
+/// literal placeholders `{slug}` / `{team}`, substituted here.
+///
+/// Lookup precedence:
+/// 1. The shipped `TEAM_BUNDLES` entry's `team.yaml.claude_md_template`
+///    (parsed lazily from the embedded yaml).
+/// 2. A generic body that doesn't bake in dev / research assumptions —
+///    used for unknown teams (user-authored without a template) and as
+///    a safety net if the shipped yaml fails to parse.
+///
+/// The body is written verbatim; teams that want richer templating
+/// (eg. `--config` style placeholder selection) should fill in
+/// values before storing the template, since runtime substitution is
+/// limited to the two slots the template author can rely on.
 fn render_project_claude_md(slug: &str, team: &str) -> String {
-    match team {
-        "dev" => format!(
-            "# CLAUDE.md (auto-managed by ccteam)\n\n## 项目上下文\n- slug: {slug}\n- team: dev\n- 用户原始需求: 见 .ccteam/spec.md\n\n## 工作约定\n- 不要交互式询问。所有决策已在 .ccteam/plan-eng.md 中。\n- 测试不过不算完成。\n\n## 不做的事\n- 不要 git push(被 hook 拦截)\n- 不要修改 .ccteam/ 之外的元数据\n",
-        ),
-        "product-research" => format!(
-            "# CLAUDE.md (auto-managed by ccteam)\n\n## 项目上下文\n- slug: {slug}\n- team: product-research\n- 用户原始需求: 见 .ccteam/spec.md\n\n## 工作约定\n- 不写代码,只产研究报告。\n- 至少 3 个独立信息源,**不要编造数据**;不确定时标 \"未确认\"。\n- 决策走 outbox(`async` 模式)或 AskUserQuestion,**不要**自行假设关键事实。\n\n## 不做的事\n- 不要修改 .ccteam/ 之外的元数据。\n- 不要在 verdict 之前下定论 — 让 phase DAG 走完。\n- 不要把 dev 的 \"测试不过不算完成\" 套用到本项目;研究报告的 done 是 verdict.md 写出 + rationale.md 自洽。\n",
-        ),
-        _ => format!(
-            "# CLAUDE.md (auto-managed by ccteam)\n\n## 项目上下文\n- slug: {slug}\n- team: {team}\n- 用户原始需求: 见 .ccteam/spec.md\n\n## 工作约定\n- 跟随该 team 的 phase 模板指示。\n- 不要修改 .ccteam/ 之外的元数据。\n",
-        ),
-    }
+    let template = team_bundle(team)
+        .and_then(|b| crate::team::TeamSpec::parse(b.team_yaml).ok())
+        .filter(|spec| !spec.claude_md_template.trim().is_empty())
+        .map(|spec| spec.claude_md_template);
+    let body = match template {
+        Some(t) => t,
+        None => generic_claude_md_template().to_string(),
+    };
+    body.replace("{slug}", slug).replace("{team}", team)
+}
+
+/// Fallback body for teams without an explicit `claude_md_template`.
+/// Carries no team-specific contract — phase markdown owns that.
+fn generic_claude_md_template() -> &'static str {
+    "# CLAUDE.md (auto-managed by ccteam)\n\
+     \n\
+     ## 项目上下文\n\
+     - slug: {slug}\n\
+     - team: {team}\n\
+     - 用户原始需求: 见 .ccteam/spec.md\n\
+     \n\
+     ## 工作约定\n\
+     - 跟随该 team 的 phase 模板指示。\n\
+     - 不要修改 .ccteam/ 之外的元数据。\n"
 }
 
 /// Parse the embedded phase templates for `team` into a
@@ -769,6 +794,52 @@ mod tests {
         // must not clobber the user edit.
         bootstrap_project(&paths, "demo2", "another request", "dev").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "USER EDIT\n");
+    }
+
+    // ---------------- V0.2 M0.16.3: claude_md_template ----------------
+
+    #[test]
+    fn render_project_claude_md_uses_dev_template_with_substitution() {
+        let body = render_project_claude_md("dev-build-todo", "dev");
+        assert!(body.contains("# CLAUDE.md (auto-managed by ccteam)"));
+        assert!(body.contains("- slug: dev-build-todo"));
+        assert!(body.contains("- team: dev"));
+        // dev-specific contract from the template body must land verbatim.
+        assert!(body.contains("测试不过不算完成"));
+        assert!(body.contains("不要 git push"));
+    }
+
+    #[test]
+    fn render_project_claude_md_uses_product_research_template_with_substitution() {
+        let body = render_project_claude_md("product-research-recipe-ai", "product-research");
+        assert!(body.contains("- slug: product-research-recipe-ai"));
+        assert!(body.contains("- team: product-research"));
+        // product-research-specific contract: no code, source diversity.
+        assert!(body.contains("不写代码"));
+        assert!(body.contains("3 个独立信息源"));
+    }
+
+    #[test]
+    fn render_project_claude_md_falls_back_to_generic_for_unknown_team() {
+        let body = render_project_claude_md("custom-foo-1", "custom-team");
+        // Generic body has no dev-specific or research-specific clauses.
+        assert!(body.contains("- slug: custom-foo-1"));
+        assert!(body.contains("- team: custom-team"));
+        assert!(!body.contains("测试不过不算完成"));
+        assert!(!body.contains("不写代码"));
+        assert!(body.contains("跟随该 team 的 phase 模板指示"));
+    }
+
+    #[test]
+    fn render_project_claude_md_falls_back_to_generic_when_template_field_empty() {
+        // meta-agent ships with an empty `claude_md_template` (the role
+        // prompt overwrites the file via a different path), so the
+        // generic body is the right fallback. This guards against
+        // accidentally writing "" as the body.
+        let body = render_project_claude_md("rob-meta", "meta-agent");
+        assert!(!body.is_empty());
+        assert!(body.contains("- slug: rob-meta"));
+        assert!(body.contains("- team: meta-agent"));
     }
 
     #[test]

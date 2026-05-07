@@ -231,6 +231,31 @@ inbox
 
 orchestrator 重启时：`tmux has-session` + `kill -0 <claude_pid>` 双重校验。session 还在 → 续接；进程不在 → 走 §6.1 的"极端情况——session 必须重启"路径用 `--resume` 恢复对话历史。
 
+#### 3.2.1 Evergreen 团队(V0.2 §6.4 candidate 5)
+
+某些团队不走 phase DAG —— meta-agent 是事件循环 session,V0.3 watchdog /
+reviewer agent 同样会是常驻角色。这类 team 的 `team.yaml` 设
+`evergreen: true` + `cost_policy: {kind: none}` 后,orchestrator 会:
+
+- `process_project` 早返,转到 `process_meta_project`(inbox drain +
+  context reset,§6.9)
+- `enforce_cost_thresholds` 跳过整个 cost 阶梯
+- `warn_if_stalled` 跳过 stall 警告(idle 是常态)
+- 不计入 `MAX_CONCURRENT_PROJECTS` 配额
+
+**红线**:`Orchestrator` / `process_project` / `enforce_cost_thresholds` /
+`warn_if_stalled` / `count_active_regular` 全部用 `is_evergreen(team)` 查
+TeamSpec.evergreen,**不许**回到 `state.team == META_TEAM_NAME` 字面量
+分叉(strategic doc §3 ccteam-core 红线)。`cost_policy` 两种 variant
+(`None` / `KillAt(Option<f64>)`)的语义在
+[interfaces.md §5.5](./interfaces.md#55-teamyaml-团队配置m31--m32--m33--v02-m016) 详述
+(PRD §6.4 草稿曾列第三个 `Track` variant 给 V0.3 watchdog,review 时删 —
+V0.3 真要 cost 追踪不杀时再定义具体行为)。
+
+`teams/meta-agent.yaml` 是首个 evergreen 范例,V0.2 起作为 shipped seed
+随 binary 发布;`Orchestrator::new` / `ccteam start` / `ccteam doctor
+--reset-shipped-teams` 都会把它写到 `~/.ccteam/teams/meta-agent/team.yaml`。
+
 ### 3.3 Phase Pipeline（短期对标 gstack-auto）
 
 每个 phase 是一个 markdown 文件 + YAML front matter（抄 Symphony 的 WORKFLOW.md 形态）。**完整字段定义、9 个 phase 列表、Seed verdict 输出格式 → [interfaces.md §5](./interfaces.md#5-phase-模板-schema)**。
