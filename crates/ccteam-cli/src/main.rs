@@ -164,6 +164,34 @@ enum Command {
         /// ccteam upgrade ships schema-additive team.yaml fields.
         #[arg(long, default_value_t = false)]
         reset_shipped_teams: bool,
+        /// V0.2 M0.18.5: load + validate the named team's
+        /// `team.yaml` and every phase markdown under its phase dir.
+        /// Fails-loud on schema violations and IO-contract gaps; warns
+        /// (without failing) on protocol-literal residue in phase
+        /// bodies. Pass the team name as the value (e.g.
+        /// `--validate-team dev`).
+        #[arg(long, value_name = "TEAM")]
+        validate_team: Option<String>,
+    },
+    /// V0.2 M0.18.6: render the orchestrator's per-phase inject
+    /// prompt (frontmatter-driven) plus the `@`-referenced phase
+    /// markdown body for visual debugging. Pure read-only — does not
+    /// touch any session.
+    Phase {
+        #[command(subcommand)]
+        cmd: PhaseCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum PhaseCommand {
+    /// Render `<team>` `<phase>`'s inject prompt + body. Useful when
+    /// authoring phase yamls / debugging unexpected phase behavior.
+    Show {
+        /// Team name as registered under `~/.ccteam/teams/`.
+        team: String,
+        /// Phase name (e.g. `implement`, not the prefixed filename).
+        phase: String,
     },
 }
 
@@ -246,6 +274,7 @@ fn main() -> Result<()> {
             install_mcp,
             install_memory_bridge,
             reset_shipped_teams,
+            validate_team,
         } => run_doctor(commands::DoctorOptions {
             install_recommended_agents,
             dry_run,
@@ -256,7 +285,20 @@ fn main() -> Result<()> {
             install_mcp,
             install_memory_bridge,
             reset_shipped_teams,
+            validate_team,
         }),
+        Command::Phase { cmd } => run_phase(cmd),
+    }
+}
+
+fn run_phase(cmd: PhaseCommand) -> Result<()> {
+    let paths = CcteamPaths::from_env()?;
+    match cmd {
+        PhaseCommand::Show { team, phase } => {
+            let body = commands::run_phase_show(&paths, &team, &phase)?;
+            print!("{body}");
+            Ok(())
+        }
     }
 }
 

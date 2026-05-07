@@ -490,7 +490,7 @@ golden_rules:                     # M2.3+:phase 级硬约束 enforcement(after h
     pattern: 'AWS_SECRET|sk-[a-zA-Z0-9]{32,}'   # regex 匹配 required_outputs 文件内容 = 违反
                                   # orchestrator 不内置规则,只跑 enforcement;dev / product-research / 等
                                   # 团队各自在 phase YAML 里写需要的 rule_id;空 / 不写 = 不跑
-                                  # 执行时机:phase claude 写 PHASE_DONE → orchestrator 跑 phase_done
+                                  # 执行时机:phase claude 写 phase 完成信号 → orchestrator 跑 phase_done
                                   # sub-skills → 紧接着跑 golden_rules.enforce → 任一 violation = 阻断
                                   # phase_history 标 status: blocked,phase_state 留 Idle,写
                                   # escalation.md;事件 event: golden_rules_check 写 progress.jsonl
@@ -499,11 +499,28 @@ golden_rules:                     # M2.3+:phase 级硬约束 enforcement(after h
 hooks:                            # phase 级 hook(项目级 hook 在 settings.json,详见 §6)
   before: scripts/snapshot-git.sh
   after: scripts/run-golden-rules.sh
+
+# V0.2 M0.18 inject-prompt frontmatter(phase-prompt-architecture.md §4.2)
+escalate_grammar_ref: standard    # 异常出口 grammar dialect。`standard` 走四个内置 prefix(REVERT_TO_PHASE / NEED_USER_INPUT / ABORT / INSUFFICIENT_CLARIFICATION);
+                                  # 团队特定 prefix 由 team.yaml.escalate_grammar_extensions 注册,与本字段独立
+outbox_question_protocol: v1      # 询问用户协议版本。V0.2 仅 `v1`(interfaces §3.4.3 outbox 文件 schema)
+inject_directives:                # 可选。orchestrator 拼装 inject prompt 时启用的 segment 列表
+                                  # 默认全开:[read_inputs, write_outputs, completion_signal, escalate_grammar, outbox_protocol, auto_loop, decision_mode]
+                                  # 设空 list `[]` 关闭所有 segment(escape hatch)
+  - read_inputs
+  - write_outputs
+  - completion_signal
+  - escalate_grammar
+  - outbox_protocol
+  - auto_loop
+  - decision_mode
 ---
 
 # 任务
 
-(prompt body...)
+(prompt body — V0.2 M0.18: 100% 领域内容,不许写 `PHASE_DONE: <name>` /
+`ESCALATE:` 等协议关键词;协议由 orchestrator 的 inject prompt 注入,详见
+`docs/phase-prompt-architecture.md` §3 三层架构 / §8 红线)
 ```
 
 ### 5.2 dev team phase 列表(M3 后 team-aware)
@@ -632,9 +649,28 @@ escalate_grammar_extensions:
     target_phase: kickoff
     reason: "no sustainable differentiation; revert to kickoff to rethink"
 
-# M3.2: team-wide default golden_rules。Phase YAML `golden_rules` 优先 —
-# phase 不写时回退到 team.yaml 默认。
-golden_rules: []
+# M3.2 / V0.2 M0.18: team-wide default golden_rules。Phase YAML
+# `golden_rules` 优先 — phase 不写时回退到 team.yaml 默认。
+#
+# V0.2 M0.18 schema(phase-prompt-architecture.md §6 拆分):
+# - `protocol`:协议级红线(orchestrator 处理)
+#   - `enforce: cmd_check`(默认):cmd / pattern 在 phase_done 边界跑
+#   - `enforce: prompt_directive`:directive 文本注入 inject prompt
+# - `domain`:业务级偏好(prompt-only,不跑 enforcement)
+#
+# **legacy compat**:M3.x 平铺 list 的 `Vec<{rule_id, cmd|pattern}>` 自动
+# 反序列化为 `protocol` + `enforce: cmd_check`(serde alias),无需迁移。
+golden_rules:
+  protocol:
+    - rule_id: tests_green
+      enforce: cmd_check
+      cmd: cargo test --workspace
+    - rule_id: outbox_only
+      enforce: prompt_directive
+      directive: "询问用户唯一合法出口是 outbox,禁用 AskUserQuestion / 纯文本"
+  domain:
+    - rule_id: prefer_small_pr
+      directive: "PR 控制在 500 行以内,大改动拆 stack"
 
 # M3.2 / M5: critic 维度配置(strategic doc §2.3 invariant 1 — 数据,非常量)。
 # M3 留 schema 形式,M5 才真正消费。dev / product-research 当前都留空。
@@ -669,7 +705,10 @@ claude_md_template: |
 - `retro_schema[*].field` 非空,**不允许重复**(防 schema 字段重名 — M4.1 retro 写入跨项目 lessons 文件时按 field 名映射段落)
 - `escalate_grammar_extensions[*].prefix` 非空、唯一;
   `route: revert_to_phase` 必须带 `target_phase`
-- `golden_rules[*]` 必须 `cmd | pattern` 二选一(同 phase YAML)
+- `golden_rules.protocol[*]` rule_id 唯一非空;
+  `enforce: cmd_check` 必须 `cmd | pattern` 二选一(同 phase YAML);
+  `enforce: prompt_directive` 必须 `directive` 非空
+- `golden_rules.domain[*]` rule_id 唯一非空;`directive` 必须非空
 - `verdict_schema[*]` 非空
 - `critic_dimensions[*].name` 非空、唯一
 - V0.2 M0.16:`evergreen` / `cost_policy` / `claude_md_template` 都 serde-default,

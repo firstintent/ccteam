@@ -44,28 +44,11 @@ max_clarify_rounds: 3
 本 phase 用 `async` 模式 (interfaces §5.6.1):
 
 - 如果碰到关键决策点(例:技术选型 A vs B,影响 1 周以上工作量),写 outbox `reply-<ts>-<seq>.md`(YAML frontmatter `event_kind: clarify`),**不阻塞**继续做能做的事
-- 如果剩余工作全部依赖该决策 → ESCALATE `PHASE_DONE_PENDING`,把 outbox 文件名列入 reason
+- 如果剩余工作全部依赖该决策 → 走 phase-done-pending 路径(M3.6 团队扩展前缀),reason 把 outbox 文件名列入
 
 outbox 路径:`<project>/.ccteam/outbox/reply-<ts>-<seq>.md`(schema 见 interfaces §3.4.3 — 文件名前缀是 `reply-`,event_kind 在 frontmatter 区分)
 
-## 退出
+## 异常分流(domain-specific)
 
-正常完成:
-
-```
-PHASE_DONE: feasibility
-```
-
-部分完成 + 待用户决策(M3.6 PHASE_DONE_PENDING):
-
-```
-ESCALATE: PHASE_DONE_PENDING — reply-<ts>-001.md (技术选型决策待 user)
-```
-
-(orchestrator 看到该 ESCALATE 后切 PhaseState::DonePending,下 phase verdict 启动时检查依赖,有则 block。)
-
-无法在合理范围内拿到关键技术信息:
-
-```
-ESCALATE: INSUFFICIENT_VALIDATION — 列具体哪些技术不确定性 + 已尝试的途径
-```
+- 关键技术不确定性无法在合理范围内拿到信息 → 走 `INSUFFICIENT_VALIDATION` 前缀(team.yaml 注册;route need_user_input),reason 列具体哪些技术不确定 + 已尝试的途径
+- 部分完成 + 待用户决策 → 走 phase-done-pending 路径(M3.6 团队扩展前缀),reason 列待决策的 outbox 文件名;orchestrator 看到该前缀后切 PhaseState::DonePending,下 phase verdict 启动时检查依赖

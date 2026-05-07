@@ -43,10 +43,10 @@ PRD V0.2 §6 列了 8 条 ccteam-core 反模式候选清理任务,跟 F-finding
 
 | 候选 | 描述 | 状态 |
 |---|---|---|
-| 1 + 8 | 协议关键字 `PHASE_DONE` / `ESCALATE` 三处镜像 → 单一 source | M0.18 待做 |
-| 2 | `render_project_claude_md` `match team` 写死 | **2026-05-07 关闭(M0.16.3,本 PR)** |
-| 3 | `TEAM_BUNDLES` 编译时常量 → seed-only | **2026-05-07 关闭(M0.16.2,本 PR)** |
-| 5 | meta-agent `if team == META_TEAM_NAME` 5 处分叉 | **2026-05-07 关闭(M0.16.1,本 PR)** |
+| 1 + 8 | 协议关键字 `PHASE_DONE` / `ESCALATE` 三处镜像 → 单一 source | **2026-05-08 关闭(M0.18,本 PR):inject prompt template + frontmatter `completion_signal` / `escalate_grammar_ref` 单一 source;phase markdown 正文清理协议关键词;`build_phase_prompt_for_template` 是唯一 protocol literal 拼装位置;详 `docs/phase-prompt-architecture.md`** |
+| 2 | `render_project_claude_md` `match team` 写死 | **2026-05-07 关闭(M0.16.3)** |
+| 3 | `TEAM_BUNDLES` 编译时常量 → seed-only | **2026-05-07 关闭(M0.16.2)** |
+| 5 | meta-agent `if team == META_TEAM_NAME` 5 处分叉 | **2026-05-07 关闭(M0.16.1)** |
 | 7 | `RECOMMENDED_AGENTS` ln -sf 8 plugin agent | M0.20 待做 |
 | 4 | `golden_rules` layered merge | V0.3 deferred |
 | 6 | `pre_trust_project` 写 `~/.claude.json` | V0.3 deferred |

@@ -20,7 +20,7 @@
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::phases::GoldenRule;
 
@@ -58,6 +58,151 @@ fn default_field_kind() -> RetroFieldKind {
 
 fn default_phase_dir() -> String {
     "phases".into()
+}
+
+/// V0.2 M0.18: how a team-level golden rule is enforced.
+///
+/// - `cmd_check` runs the rule's `cmd` (or matches its `pattern`) at
+///   `phase_done` boundary — the historic [`crate::golden_rules`]
+///   executor path. Non-zero exit / regex hit = violation.
+/// - `prompt_directive` skips runtime enforcement and instead injects
+///   the rule's `directive` text into the orchestrator's per-phase
+///   inject prompt so the assistant sees it as a hard constraint.
+///   Pairs with `domain` rules where the user's intent is "tell the
+///   LLM, don't run a check".
+///
+/// Default `cmd_check` keeps every M3.x team.yaml that listed flat
+/// `golden_rules` working — they continue to mean "run this command
+/// at phase boundary".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoldenRuleEnforcement {
+    /// Run `cmd` / match `pattern` at phase_done boundary; non-zero
+    /// exit / regex hit blocks the transition.
+    CmdCheck,
+    /// Inject `directive` into the phase's inject prompt; no runtime
+    /// enforcement — the assistant is expected to honor it.
+    PromptDirective,
+}
+
+impl Default for GoldenRuleEnforcement {
+    fn default() -> Self {
+        Self::CmdCheck
+    }
+}
+
+/// V0.2 M0.18: a `protocol` golden rule. Unlike the phase-level
+/// [`GoldenRule`] which is strictly cmd | pattern, protocol rules
+/// can also carry a `directive` string when `enforce: prompt_directive`
+/// — the inject-prompt template renders the directive verbatim.
+///
+/// Field validation:
+/// - `enforce: cmd_check` requires exactly one of `cmd` / `pattern`.
+/// - `enforce: prompt_directive` requires `directive` non-empty;
+///   `cmd` / `pattern` are tolerated (ignored) but trigger a warn so
+///   operators notice the dead field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtocolRule {
+    pub rule_id: String,
+    #[serde(default)]
+    pub enforce: GoldenRuleEnforcement,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cmd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directive: Option<String>,
+}
+
+/// V0.2 M0.18: a `domain` golden rule — pure prompt-layer guidance
+/// for the assistant ("prefer small PRs", "no SQL string interpolation").
+/// Domain rules never run at phase boundary; they're surfaced via
+/// the inject prompt. Phase markdown bodies may also reference domain
+/// rules implicitly (the user's freedom; doctor doesn't lint bodies).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DomainRule {
+    pub rule_id: String,
+    pub directive: String,
+}
+
+/// V0.2 M0.18: structured team-level golden rules with protocol /
+/// domain split (phase-prompt-architecture.md §6).
+///
+/// **Legacy compat**: a flat `Vec<GoldenRule>` in pre-V0.2 yamls is
+/// deserialized as `protocol` with `enforce: cmd_check` so M3.x team
+/// yamls keep loading. V0.2-shape yamls explicitly key `protocol:` /
+/// `domain:`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct TeamGoldenRules {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protocol: Vec<ProtocolRule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domain: Vec<DomainRule>,
+}
+
+impl TeamGoldenRules {
+    pub fn is_empty(&self) -> bool {
+        self.protocol.is_empty() && self.domain.is_empty()
+    }
+
+    /// V0.2 M0.18: extract the cmd-check rules in the historic
+    /// [`GoldenRule`] shape so [`crate::golden_rules::enforce`] can
+    /// keep running them without learning the new schema. Rules with
+    /// `enforce: prompt_directive` are excluded — they belong in the
+    /// inject prompt, not the cmd-check path.
+    pub fn as_cmd_check_rules(&self) -> Vec<GoldenRule> {
+        self.protocol
+            .iter()
+            .filter(|r| r.enforce == GoldenRuleEnforcement::CmdCheck)
+            .map(|r| GoldenRule {
+                rule_id: r.rule_id.clone(),
+                cmd: r.cmd.clone(),
+                pattern: r.pattern.clone(),
+            })
+            .collect()
+    }
+}
+
+/// V0.2 M0.18: deserialize either the new structured shape
+/// (`protocol: [...]` / `domain: [...]`) or the legacy flat list
+/// (`Vec<GoldenRule>` — coerced into `protocol` with
+/// `enforce: cmd_check`).
+impl<'de> Deserialize<'de> for TeamGoldenRules {
+    fn deserialize<D>(d: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use serde::de::Error as DeError;
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Either {
+            Structured {
+                #[serde(default)]
+                protocol: Vec<ProtocolRule>,
+                #[serde(default)]
+                domain: Vec<DomainRule>,
+            },
+            Legacy(Vec<GoldenRule>),
+        }
+
+        match Either::deserialize(d).map_err(D::Error::custom)? {
+            Either::Structured { protocol, domain } => Ok(TeamGoldenRules { protocol, domain }),
+            Either::Legacy(list) => Ok(TeamGoldenRules {
+                protocol: list
+                    .into_iter()
+                    .map(|r| ProtocolRule {
+                        rule_id: r.rule_id,
+                        enforce: GoldenRuleEnforcement::CmdCheck,
+                        cmd: r.cmd,
+                        pattern: r.pattern,
+                        directive: None,
+                    })
+                    .collect(),
+                domain: Vec::new(),
+            }),
+        }
+    }
 }
 
 /// M3.2: per-dimension Critic configuration (strategic doc §2.3).
@@ -225,12 +370,18 @@ pub struct TeamSpec {
     #[serde(default)]
     pub escalate_grammar_extensions: Vec<EscalateGrammarExtension>,
 
-    /// Team-wide default `golden_rules`. Phase YAML's `golden_rules`
-    /// takes priority — phases that declare their own rules ignore
-    /// the team default entirely (no merge, see strategic doc §3.4
-    /// "不预设质量评分维度"). Empty = team has no default rules.
+    /// Team-wide default `golden_rules` (V0.2 M0.18: structured —
+    /// `protocol` / `domain` split, phase-prompt-architecture.md §6).
+    /// Phase YAML's `golden_rules` takes priority — phases that
+    /// declare their own rules ignore the team default entirely (no
+    /// merge, see strategic doc §3.4 "不预设质量评分维度"). Empty =
+    /// team has no default rules.
+    ///
+    /// Legacy (M3.x) yamls with a flat list of `{rule_id, cmd|pattern}`
+    /// entries deserialize as `protocol` with `enforce: cmd_check` so
+    /// existing team yamls keep working (see [`TeamGoldenRules`]).
     #[serde(default)]
-    pub golden_rules: Vec<GoldenRule>,
+    pub golden_rules: TeamGoldenRules,
 
     /// Phase template directory **relative to the team directory**
     /// (V0.2 M0.17.2). For shipped teams that's
@@ -410,11 +561,65 @@ impl TeamSpec {
             }
         }
 
-        // M3.2: golden_rules cmd | pattern xor.
-        for rule in &self.golden_rules {
-            rule.kind().with_context(|| {
-                format!("team.yaml: golden_rule `{}` invalid", rule.rule_id)
-            })?;
+        // M3.2 / V0.2 M0.18: golden_rules.protocol cmd | pattern xor
+        // (cmd_check enforcement) or directive non-empty
+        // (prompt_directive enforcement).
+        let mut seen_protocol_id = std::collections::HashSet::new();
+        for rule in &self.golden_rules.protocol {
+            if rule.rule_id.trim().is_empty() {
+                bail!("team.yaml: golden_rules.protocol entry has empty rule_id");
+            }
+            if !seen_protocol_id.insert(rule.rule_id.as_str()) {
+                return Err(anyhow!(
+                    "team.yaml: golden_rules.protocol duplicates rule_id `{}`",
+                    rule.rule_id,
+                ));
+            }
+            match rule.enforce {
+                GoldenRuleEnforcement::CmdCheck => {
+                    let temp = GoldenRule {
+                        rule_id: rule.rule_id.clone(),
+                        cmd: rule.cmd.clone(),
+                        pattern: rule.pattern.clone(),
+                    };
+                    temp.kind().with_context(|| {
+                        format!(
+                            "team.yaml: golden_rules.protocol `{}` (cmd_check) invalid",
+                            rule.rule_id,
+                        )
+                    })?;
+                }
+                GoldenRuleEnforcement::PromptDirective => {
+                    if rule
+                        .directive
+                        .as_deref()
+                        .is_none_or(|s| s.trim().is_empty())
+                    {
+                        bail!(
+                            "team.yaml: golden_rules.protocol `{}` (prompt_directive) requires non-empty `directive`",
+                            rule.rule_id,
+                        );
+                    }
+                }
+            }
+        }
+        let mut seen_domain_id = std::collections::HashSet::new();
+        for rule in &self.golden_rules.domain {
+            if rule.rule_id.trim().is_empty() {
+                bail!("team.yaml: golden_rules.domain entry has empty rule_id");
+            }
+            if !seen_domain_id.insert(rule.rule_id.as_str()) {
+                return Err(anyhow!(
+                    "team.yaml: golden_rules.domain duplicates rule_id `{}`",
+                    rule.rule_id,
+                ));
+            }
+            if rule.directive.trim().is_empty() {
+                bail!(
+                    "team.yaml: golden_rules.domain `{}` requires non-empty `directive`",
+                    rule.rule_id,
+                );
+            }
         }
 
         // M3.2: verdict_schema entries non-empty.
@@ -542,7 +747,7 @@ mod tests {
             }],
             critic_dimensions: Vec::new(),
             escalate_grammar_extensions: Vec::new(),
-            golden_rules: Vec::new(),
+            golden_rules: TeamGoldenRules::default(),
             phase_dir: "phases".into(),
             verdict_schema: Vec::new(),
             evergreen: false,
@@ -666,7 +871,9 @@ mod tests {
     }
 
     #[test]
-    fn m32_team_wide_golden_rules_parse_and_validate() {
+    fn m32_team_wide_golden_rules_legacy_flat_list_still_parses() {
+        // V0.2 M0.18: legacy flat list deserializes via serde alias as
+        // protocol with enforce: cmd_check. M3.x team yamls keep working.
         let src = concat!(
             "name: dev\n",
             "golden_rules:\n",
@@ -676,7 +883,13 @@ mod tests {
             "    pattern: 'AWS_SECRET'\n",
         );
         let spec = TeamSpec::parse(src).unwrap();
-        assert_eq!(spec.golden_rules.len(), 2);
+        assert_eq!(spec.golden_rules.protocol.len(), 2);
+        assert!(spec.golden_rules.domain.is_empty());
+        assert_eq!(
+            spec.golden_rules.protocol[0].enforce,
+            GoldenRuleEnforcement::CmdCheck,
+        );
+        assert_eq!(spec.golden_rules.as_cmd_check_rules().len(), 2);
     }
 
     #[test]
@@ -690,6 +903,76 @@ mod tests {
         );
         let err = TeamSpec::parse(src).unwrap_err();
         assert!(format!("{err:#}").contains("confused"));
+    }
+
+    // ---------------- V0.2 M0.18 protocol / domain split ----------------
+
+    #[test]
+    fn m018_team_golden_rules_structured_form_parses() {
+        let src = concat!(
+            "name: dev\n",
+            "golden_rules:\n",
+            "  protocol:\n",
+            "    - rule_id: tests_green\n",
+            "      enforce: cmd_check\n",
+            "      cmd: cargo test --workspace\n",
+            "    - rule_id: outbox_only\n",
+            "      enforce: prompt_directive\n",
+            "      directive: '询问用户唯一合法出口是 outbox'\n",
+            "  domain:\n",
+            "    - rule_id: prefer_small_pr\n",
+            "      directive: 'PR 控制在 500 行以内'\n",
+        );
+        let spec = TeamSpec::parse(src).unwrap();
+        assert_eq!(spec.golden_rules.protocol.len(), 2);
+        assert_eq!(spec.golden_rules.domain.len(), 1);
+        assert_eq!(
+            spec.golden_rules.protocol[1].enforce,
+            GoldenRuleEnforcement::PromptDirective,
+        );
+        // cmd_check filter excludes the prompt_directive rule.
+        assert_eq!(spec.golden_rules.as_cmd_check_rules().len(), 1);
+    }
+
+    #[test]
+    fn m018_team_golden_rules_protocol_prompt_directive_requires_directive_text() {
+        let src = concat!(
+            "name: dev\n",
+            "golden_rules:\n",
+            "  protocol:\n",
+            "    - rule_id: missing_text\n",
+            "      enforce: prompt_directive\n",
+        );
+        let err = TeamSpec::parse(src).unwrap_err();
+        assert!(format!("{err:#}").contains("missing_text"));
+    }
+
+    #[test]
+    fn m018_team_golden_rules_domain_rule_requires_non_empty_directive() {
+        let src = concat!(
+            "name: dev\n",
+            "golden_rules:\n",
+            "  domain:\n",
+            "    - rule_id: empty_directive\n",
+            "      directive: ''\n",
+        );
+        let err = TeamSpec::parse(src).unwrap_err();
+        assert!(format!("{err:#}").contains("empty_directive"));
+    }
+
+    #[test]
+    fn m018_team_golden_rules_protocol_duplicate_rule_id_fails() {
+        let src = concat!(
+            "name: dev\n",
+            "golden_rules:\n",
+            "  protocol:\n",
+            "    - rule_id: dup\n",
+            "      cmd: ls\n",
+            "    - rule_id: dup\n",
+            "      cmd: pwd\n",
+        );
+        let err = TeamSpec::parse(src).unwrap_err();
+        assert!(format!("{err:#}").contains("dup"));
     }
 
     #[test]
