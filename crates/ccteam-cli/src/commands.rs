@@ -718,12 +718,26 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
 ///    this as warn-not-fail by design).
 fn render_validate_team_report(paths: &CcteamPaths, team: &str) -> Result<String> {
     use ccteam_core::{
-        default_user_staging_dir, resolve_team, TeamResolveContext, TEAM_SOURCES,
+        default_user_staging_dir, resolve_team, staging_dir_for, validate_staged_team,
+        TeamResolveContext, TEAM_SOURCES,
     };
 
     let mut out = format!("ccteam doctor --validate-team {team}\n\n");
     let user_staging = default_user_staging_dir();
     let ctx = TeamResolveContext::for_orchestrator(&paths.root, &user_staging);
+
+    // V0.2 M0.22.4: when a staged plugin tree exists at the user
+    // layer, run the plugin manifest checks before resolving the
+    // TeamSpec — operators authoring a team plugin want both the
+    // plugin schema findings and the phase IO findings in one report.
+    let staged = staging_dir_for(team, None);
+    if staged.join(".claude-plugin/plugin.json").exists() {
+        out.push_str("# Plugin manifest checks (staged tree)\n");
+        for line in validate_staged_team(&staged)? {
+            out.push_str(&format!("{line}\n"));
+        }
+        out.push('\n');
+    }
 
     let spec = match resolve_team(team, &ctx) {
         Ok(s) => {
