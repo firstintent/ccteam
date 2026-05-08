@@ -57,6 +57,15 @@ enum Command {
         /// `claude /plugin add <id>` first).
         #[arg(long, default_value_t = false)]
         skip_tool_check: bool,
+        /// F29 — override the claude argv used to spawn project tmux
+        /// sessions. Whitespace-split. Wins over `CCTEAM_CLAUDE_ARGV`
+        /// env which wins over the production default
+        /// (`claude --dangerously-skip-permissions --model …`). Used
+        /// by e2e harnesses to inject a stub claude (eg
+        /// `--claude-argv "sh -c 'cat > /dev/null'"`) so phase
+        /// pipeline can be exercised without burning LLM cost.
+        #[arg(long, value_name = "ARGV")]
+        claude_argv: Option<String>,
     },
     /// Create a new project from a one-line request.
     New {
@@ -318,7 +327,8 @@ fn main() -> Result<()> {
             foreground: _,
             tick_seconds,
             skip_tool_check,
-        } => run_start(tick_seconds, skip_tool_check),
+            claude_argv,
+        } => run_start(tick_seconds, skip_tool_check, claude_argv),
         Command::New { request, file, team } => run_new(request, file, team),
         Command::Ls { format } => run_ls(format),
         Command::Show { slug, format } => run_show(&slug, format),
@@ -500,7 +510,11 @@ fn run_hook(cmd: HookCommand) -> Result<()> {
     }
 }
 
-fn run_start(tick_seconds: u64, skip_tool_check: bool) -> Result<()> {
+fn run_start(
+    tick_seconds: u64,
+    skip_tool_check: bool,
+    claude_argv_flag: Option<String>,
+) -> Result<()> {
     init_tracing();
     let paths = CcteamPaths::from_env()?;
 
@@ -537,11 +551,20 @@ fn run_start(tick_seconds: u64, skip_tool_check: bool) -> Result<()> {
         );
     }
 
-    let config = OrchestratorConfig {
+    // F29 — precedence: CLI flag > CCTEAM_CLAUDE_ARGV env > production
+    // default. `OrchestratorConfig::default()` already reads the env;
+    // the flag layers on top.
+    let mut config = OrchestratorConfig {
         tick_interval: Duration::from_secs(tick_seconds.max(1)),
         skip_tool_check,
         ..OrchestratorConfig::default()
     };
+    if let Some(raw) = claude_argv_flag {
+        let parts: Vec<String> = raw.split_whitespace().map(String::from).collect();
+        if !parts.is_empty() {
+            config.claude_argv = parts;
+        }
+    }
     // Write the pidfile *before* constructing the orchestrator so a
     // second `ccteam start` against the same root errors out cleanly
     // before either side has touched tmux.

@@ -239,6 +239,13 @@ pub fn check_health(paths: &CcteamPaths) -> DaemonHealth {
     check_health_at(&heartbeat_path(paths), SystemTime::now())
 }
 
+/// V0.2.1 F27 — boolean variant of [`check_health`] for callers that
+/// only care "up or down" (text/json `ls` annotation). Returns `true`
+/// iff the heartbeat is fresh; missing or stale heartbeat → `false`.
+pub fn heartbeat_alive(paths: &CcteamPaths) -> bool {
+    check_health(paths).is_healthy()
+}
+
 /// Testable inner: classify based on the file at `path` relative to `now`.
 pub fn check_health_at(path: &Path, now: SystemTime) -> DaemonHealth {
     let metadata = match std::fs::metadata(path) {

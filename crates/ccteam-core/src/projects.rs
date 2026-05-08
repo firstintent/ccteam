@@ -301,7 +301,12 @@ pub fn pre_trust_project(project_dir: &Path) -> Result<()> {
 /// isolation tests (`tool_surface_e2e_test`-style) get a redirected
 /// trust write too. Production sets neither and falls through to
 /// `dirs::home_dir()`.
-fn resolve_claude_json_path() -> Result<PathBuf> {
+///
+/// Also reused by `ccteam doctor --install-mcp` (V0.2.1 F26) so the
+/// MCP install path honors the same env redirection as the trust-entry
+/// writer and the sibling `--install-skill` / `--install-memory-bridge`
+/// paths.
+pub fn resolve_claude_json_path() -> Result<PathBuf> {
     resolve_claude_json_path_from_env(
         std::env::var("CLAUDE_CONFIG_HOME").ok(),
         dirs::home_dir(),

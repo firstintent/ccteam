@@ -278,9 +278,15 @@ fn render_phase_scaffold(scaffold: &PhaseScaffold<'_>) -> String {
             yaml.push_str(&format!("- `{output}`\n"));
         }
     }
+    // F33 — V0.2 e2e retro flagged the prior wording for naming the
+    // protocol keywords inline (even backticked, an LLM reading the
+    // body could mistake them for signal). Replace with intent-only
+    // wording — the inject prompt remains the single producer of the
+    // actual control sequences.
     yaml.push_str(
-        "\n> 本文件由 ccteam team factory 生成。正文是任务描述,正文不写协议关键字\n\
-         > (`PHASE_DONE` / `ESCALATE` 由 orchestrator inject prompt 注入)。\n",
+        "\n> 本文件由 ccteam team factory 生成。正文只描述领域任务;\n\
+         > 阶段切换 / 升级信号由 orchestrator 在每次 phase prompt 注入时附带,\n\
+         > 不要在正文里复述。\n",
     );
     yaml
 }
@@ -618,6 +624,8 @@ mod tests {
     fn init_phase_body_excludes_protocol_literals() {
         // V0.2 M0.18: phase markdown bodies must not carry PHASE_DONE /
         // ESCALATE. Those are inject-prompt-only.
+        // V0.2.1 F33: also forbid the bare-token form so an LLM reading
+        // the body can't mistake even a backticked token for signal.
         let tmp = TempDir::new().unwrap();
         let report = run_init(&tmp);
         for path in &report.phase_paths {
@@ -630,6 +638,18 @@ mod tests {
             assert!(
                 !body.contains("ESCALATE:"),
                 "phase {} body has ESCALATE literal",
+                path.display(),
+            );
+            // F33 — bare-token form (no colon, but recognizable). Both
+            // backticked (`PHASE_DONE`) and unbacked tokens count.
+            assert!(
+                !body.contains("PHASE_DONE"),
+                "phase {} body has bare PHASE_DONE token (F33)",
+                path.display(),
+            );
+            assert!(
+                !body.contains("ESCALATE"),
+                "phase {} body has bare ESCALATE token (F33)",
                 path.display(),
             );
         }

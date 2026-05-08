@@ -27,16 +27,16 @@
 **2026-05-06 post-M3/M4 sweep**:F2/F3/F4/F9/F10/F11/F12/F13/F20 由 M3 团队
 抽象 + M4 跨项目记忆批量关闭;**2026-05-07 fix_loop → auto_loop rename batch**:
 F1/F5/F6/F7/F8/F18 由独立 PR 一波关闭;**2026-05-08 V0.2 M0.23**:加 F24 + F25
-P0 + 同 PR 关闭;**2026-05-08 V0.2 e2e retro**:加 F26-F33 八条 V0.2.1 候选),
-分布:
+P0 + 同 PR 关闭;**2026-05-08 V0.2 e2e retro**:加 F26-F33 八条 V0.2.1 候选;
+**2026-05-08 V0.2.1 patch**:F26-F33 全部修复),分布:
 
 | 优先级 | 数量 | 编号 |
 |---|---|---|
 | **P0 阻塞泛化(剩余)** | 0 | — |
-| **P1 该做但可后置(剩余)** | 6 | F15(M1+ block-push 时做)、F23(conditional;待 spike 重跑)、**F28 / F29 / F30 / F31(2026-05-08 V0.2 e2e 加,V0.2.1 候选)** |
-| **P2 边角(剩余)** | 5 | F17、**F26 / F27 / F32 / F33(2026-05-08 V0.2 e2e 加,V0.2.1 候选)** |
+| **P1 该做但可后置(剩余)** | 2 | F15(M1+ block-push 时做)、F23(conditional;待 spike 重跑) |
+| **P2 边角(剩余)** | 1 | F17 |
 | **N/A 已是领域无关** | 2 | F14, F19(M3 docs sweep 后)|
-| **已修复** | 20 | F1 / F5 / F6 / F7 / F18(2026-05-07 rename PR;F1 触发逻辑实际早 M3.1 已切到 template.auto_loop,本 PR 完成命名层 sweep)、F2 / F3 / F4(M3.1 dag.rs)、F8(2026-05-07 directory scan)、F9 / F10 / F11(M3.4 team-aware bootstrap;F11 dev 仍裸 `phases/` 但非阻塞)、F12 / F13(M3.3 `--team` CLI + `state.team`)、F16(M3.4 phase 模板 team 化)、F20(M3.1+M3.4 retro_schema 数据形式 + product-research 填字段 + M4.1 phase 消费)、F21(@a5fb21d)、F22(PR #12)、**F24 / F25(2026-05-08 M0.23 PR)** |
+| **已修复** | 28 | F1 / F5 / F6 / F7 / F18(2026-05-07 rename PR;F1 触发逻辑实际早 M3.1 已切到 template.auto_loop,本 PR 完成命名层 sweep)、F2 / F3 / F4(M3.1 dag.rs)、F8(2026-05-07 directory scan)、F9 / F10 / F11(M3.4 team-aware bootstrap;F11 dev 仍裸 `phases/` 但非阻塞)、F12 / F13(M3.3 `--team` CLI + `state.team`)、F16(M3.4 phase 模板 team 化)、F20(M3.1+M3.4 retro_schema 数据形式 + product-research 填字段 + M4.1 phase 消费)、F21(@a5fb21d)、F22(PR #12)、**F24 / F25(2026-05-08 M0.23 PR)**、**F26 / F27 / F28 / F29 / F30 / F31 / F32 / F33(2026-05-08 V0.2.1 patch)** |
 
 ### V0.2 §6 反模式候选状态(docs/v0-2/prd.md)
 
@@ -521,7 +521,7 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
 - **后续**:Claude 团队若推出更新 model 别名(eg `claude-sonnet-4-7[1m]`),
   改 `DEFAULT_CLAUDE_MODEL` 一处即可;CLI flag 形式保持稳定。
 
-### F28 — Project-layer team override 是 dead code(2026-05-08 加,待 V0.2.1)
+### F28 — Project-layer team override 是 dead code(2026-05-08 加;**已修复:2026-05-08(V0.2.1 PR)**)
 
 - **文件:行号**:`crates/ccteam-core/src/team_resolver.rs:48-52`
   (`TEAM_SOURCES = [Project, User, Repo]`)+ `:139`(`with_project()`
@@ -537,8 +537,9 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
   project 层真 first-source-wins。
 - **优先级**:**P1**(用户报"per-project override 不生效"时阻塞)。
 - **来源**:V0.2 e2e Suite B B5 / `docs/v0-2/e2e-retro.md`。
+- **2026-05-08 已修复(V0.2.1 PR)**:加 `Orchestrator::team_runtime_for_state(state)` (返回 `Cow<TeamRuntime>`);dispatch / process_project / stall / cost 命中 callsite 切到 project-aware lookup;`run_phase_show` 在 cwd 有 `.ccteam/team/team.yaml` 时走 `with_project(cwd)`;e2e test `team_resolver_project_layer_e2e_test.rs` 验证 project layer 真 first-source-wins。`TEAM_SOURCES::Project` enum variant 保留(M0.17 设计未改)。
 
-### F29 — 无 CLI/env stub-claude 注入路径(2026-05-08 加,待 V0.2.1)
+### F29 — 无 CLI/env stub-claude 注入路径(2026-05-08 加;**已修复:2026-05-08(V0.2.1 PR)**)
 
 - **文件:行号**:`crates/ccteam-core/src/orchestrator.rs:238`
   (`OrchestratorConfig.claude_argv` 仅 Rust struct);
@@ -552,8 +553,9 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
   (shell-split);`ccteam start --claude-argv "<line>"` flag。
 - **优先级**:**P1**(testability;阻塞纯 CLI e2e 验证 phase loop)。
 - **来源**:V0.2 e2e Suite B B1/B2 / `docs/v0-2/e2e-retro.md`。
+- **2026-05-08 已修复(V0.2.1 PR)**:`OrchestratorConfig::default()` 读 `CCTEAM_CLAUDE_ARGV`(whitespace-split);`ccteam start --claude-argv "<line>"` flag(优先级:flag > env > default);integration tests `orchestrator_claude_argv_env_test.rs` + `start_claude_argv_flag_test.rs`。
 
-### F30 — `doctor --validate-team` `[FAIL]` 不影响 exit code(2026-05-08 加,待 V0.2.1)
+### F30 — `doctor --validate-team` `[FAIL]` 不影响 exit code(2026-05-08 加;**已修复:2026-05-08(V0.2.1 PR)**)
 
 - **文件:行号**:`crates/ccteam-cli/src/commands.rs::render_validate_team_report`
   (line 719 起);Summary 计数器只 sum 每 phase finding,plugin-section
@@ -567,8 +569,9 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
   `[FAIL]` 进 Summary;exit code 据 `failures > 0` 设非零。
 - **优先级**:**P1**(team factory CI gating 缺位)。
 - **来源**:V0.2 e2e Suite D D7 / `docs/v0-2/e2e-retro.md`。
+- **2026-05-08 已修复(V0.2.1 PR)**:`render_validate_team_report` 改返回 `(String, u32 fails)`,plugin-section + phase-section `[FAIL]` 全部累计进 fails;`run_doctor` 在 `fails > 0` 时 `bail!` → 非零 exit code;integration test `doctor_validate_team_fail_loud_test.rs` 验证 unknown team / corrupt plugin manifest 都触发非零退出。
 
-### F31 — `TeamSpec` 缺 `#[serde(deny_unknown_fields)]`(2026-05-08 加;落实 M0.22 ⚠1,待 V0.2.1)
+### F31 — `TeamSpec` 缺 `#[serde(deny_unknown_fields)]`(2026-05-08 加;落实 M0.22 ⚠1;**已修复:2026-05-08(V0.2.1 PR)**)
 
 - **文件:行号**:`crates/ccteam-core/src/team.rs:107`(`TeamSpec` struct
   顶级)+ nested(`TeamGoldenRules` 等)。
@@ -581,6 +584,7 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
   的 `TeamSpec` 严格 schema 互不冲突。**
 - **优先级**:**P1**(team factory ship 前最好修)。
 - **来源**:V0.2 e2e Suite D D8 / M0.22 PR ⚠1 / `docs/v0-2/e2e-retro.md`。
+- **2026-05-08 已修复(V0.2.1 PR)**:`#[serde(deny_unknown_fields)]` 加到 `TeamSpec` 顶层 + 所有 ccteam 自己定义的子结构(`RetroFieldSpec` / `ProtocolRule` / `DomainRule` / `TeamGoldenRules.Structured` / `CriticDimensionSpec` / `EscalateGrammarExtension`);`team::tests::f31_top_level_unknown_field_fails_loud` + `f31_nested_unknown_field_fails_loud` 验证 typo 触发 fail-loud。
 
 ---
 
@@ -623,7 +627,7 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
 - **解耦方案**:F5 重命名时一并改,`fix_loop_test.rs` → `auto_loop_test.rs`。
 - **优先级**:**P2**(随 F5 一并改)。
 
-### F26 — `mcp_serve::install_mcp()` 不 honor `CLAUDE_CONFIG_HOME`(2026-05-08 加,待 V0.2.1)
+### F26 — `mcp_serve::install_mcp()` 不 honor `CLAUDE_CONFIG_HOME`(2026-05-08 加;**已修复:2026-05-08(V0.2.1 PR)**)
 
 - **文件:行号**:`crates/ccteam-cli/src/mcp_serve.rs:660-666`
   (用 `dirs::home_dir()` 写入 `~/.claude.json`,asymmetric with
@@ -634,8 +638,9 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
 - **解耦方案**:走 `user_claude_dir()`(已 honor `CLAUDE_CONFIG_HOME`)。
 - **优先级**:**P2**(e2e harness 痛点,production 用户透明)。
 - **来源**:V0.2 e2e Suite A / `docs/v0-2/e2e-retro.md`。
+- **2026-05-08 已修复(V0.2.1 PR)**:`install_mcp()` 走 `ccteam_core::projects::resolve_claude_json_path()`(已 honor `CLAUDE_CONFIG_HOME`,与 trust-entry writer + sibling installers 对称);integration test `install_mcp_claude_config_home_test.rs` 验证 redirect。
 
-### F27 — `ccteam ls` 无 daemon health 注解(2026-05-08 加,待 V0.2.1)
+### F27 — `ccteam ls` 无 daemon health 注解(2026-05-08 加;**已修复:2026-05-08(V0.2.1 PR)**)
 
 - **文件:行号**:`crates/ccteam-cli/src/commands.rs::render_ls_text`
   (1391-1409 行;无 daemon section);`render_ls_json`(1422-1456;
@@ -651,8 +656,9 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
 - **优先级**:**P2**(meta-agent 已可通过 MCP `ls` JSON `orchestrator`
   字段读取 — 该字段需先填值)。
 - **来源**:V0.2 e2e Suite A A5 / `docs/v0-2/e2e-retro.md`。
+- **2026-05-08 已修复(V0.2.1 PR)**:`daemon::heartbeat_alive(&Paths) -> bool` public helper;`render_ls_text` head 一行 `daemon: <up|down>`;`render_ls_json` `orchestrator.running` 改 bool;3 unit tests 覆盖 down / up / json shape。
 
-### F32 — daemon path doc drift(2026-05-08 加,docs-only)
+### F32 — daemon path doc drift(2026-05-08 加,docs-only;**已修复:2026-05-08(V0.2.1 PR)**)
 
 - **文件:行号**:`docs/v0-2/dev-plan.md §9` M0.23.1 写
   `~/.ccteam/daemon.{pid,heartbeat}`;实际代码路径
@@ -664,8 +670,9 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
 - **解耦方案**:`docs/v0-2/dev-plan.md §9` M0.23.1 路径段更新一行。
 - **优先级**:**P2**(cosmetic;不影响代码)。
 - **来源**:V0.2 e2e Suite A / `docs/v0-2/e2e-retro.md`。
+- **2026-05-08 已修复(V0.2.1 PR)**:`docs/v0-2/dev-plan.md §9` M0.23.1 路径段更新为 `~/.ccteam/state/orchestrator.{pid,heartbeat}`,与 tech-design §6.8 / 实际代码对齐。
 
-### F33 — team factory phase scaffold body 含 bare protocol tokens(2026-05-08 加,待 V0.2.1)
+### F33 — team factory phase scaffold body 含 bare protocol tokens(2026-05-08 加;**已修复:2026-05-08(V0.2.1 PR)**)
 
 - **文件:行号**:`crates/ccteam-core/src/team_factory.rs` phase
   scaffold render(`init_phase_body_excludes_protocol_literals` test
@@ -681,6 +688,7 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
   从 body 删,只在用户指南文档讲。
 - **优先级**:**P2**(cosmetic;validator 行为正确)。
 - **来源**:V0.2 e2e Suite D D5 / `docs/v0-2/e2e-retro.md`。
+- **2026-05-08 已修复(V0.2.1 PR)**:scaffold body 注释改为意图描述("阶段切换 / 升级信号由 orchestrator 在每次 phase prompt 注入时附带,不要在正文里复述"),不再出现协议关键字本身;`init_phase_body_excludes_protocol_literals` 测试加严:bare-token 形式(无 colon)也被检测。
 
 ---
 

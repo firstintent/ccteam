@@ -220,9 +220,10 @@ fn list_disk_teams(paths: &CcteamPaths) -> Result<Vec<String>> {
 /// JSON shape (a single string, not printed — caller decides).
 pub fn run_ls(paths: &CcteamPaths, format: OutputFormat) -> Result<String> {
     let projects = collect_projects(paths)?;
+    let daemon_up = ccteam_core::daemon::heartbeat_alive(paths);
     Ok(match format {
-        OutputFormat::Text => render_ls_text(&projects),
-        OutputFormat::Json => render_ls_json(&projects)?,
+        OutputFormat::Text => render_ls_text(&projects, daemon_up),
+        OutputFormat::Json => render_ls_json(&projects, daemon_up)?,
     })
 }
 
@@ -695,7 +696,17 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
         out.push_str(&render_reset_shipped_teams_report(paths, &opts)?);
     }
     if let Some(team) = &opts.validate_team {
-        out.push_str(&render_validate_team_report(paths, team)?);
+        let (report, fails) = render_validate_team_report(paths, team)?;
+        out.push_str(&report);
+        // F30 — `--help` advertises "Fails-loud on schema violations
+        // and IO-contract gaps". Honor that: any [FAIL] (phase-level
+        // or plugin-section) → non-zero exit so CI can gate on it.
+        if fails > 0 {
+            anyhow::bail!(
+                "ccteam doctor --validate-team {team}: {fails} fail(s) — \
+                 see report above\n\n{out}",
+            );
+        }
     }
     if opts.migrate_recommended_agents {
         out.push_str(&render_migrate_recommended_agents_report(&opts)?);
@@ -716,13 +727,20 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
 ///    `ESCALATE:`) inside the body trigger a warn (not error — bodies
 ///    are user territory; `docs/v0-2/phase-prompt-architecture.md` §9 docks
 ///    this as warn-not-fail by design).
-fn render_validate_team_report(paths: &CcteamPaths, team: &str) -> Result<String> {
+fn render_validate_team_report(
+    paths: &CcteamPaths,
+    team: &str,
+) -> Result<(String, u32)> {
     use ccteam_core::{
         default_user_staging_dir, resolve_team, staging_dir_for, validate_staged_team,
         TeamResolveContext, TEAM_SOURCES,
     };
 
     let mut out = format!("ccteam doctor --validate-team {team}\n\n");
+    // F30 — accumulate every [FAIL] line into a single counter so the
+    // top-level Summary and the `run_doctor` exit code agree. Phase-
+    // section findings sum into this same counter below.
+    let mut fails = 0u32;
     let user_staging = default_user_staging_dir();
     let ctx = TeamResolveContext::for_orchestrator(&paths.root, &user_staging);
 
@@ -734,6 +752,9 @@ fn render_validate_team_report(paths: &CcteamPaths, team: &str) -> Result<String
     if staged.join(".claude-plugin/plugin.json").exists() {
         out.push_str("# Plugin manifest checks (staged tree)\n");
         for line in validate_staged_team(&staged)? {
+            if line.starts_with("[FAIL]") {
+                fails += 1;
+            }
             out.push_str(&format!("{line}\n"));
         }
         out.push('\n');
@@ -746,7 +767,9 @@ fn render_validate_team_report(paths: &CcteamPaths, team: &str) -> Result<String
         }
         Err(err) => {
             out.push_str(&format!("[FAIL] team.yaml load: {err:#}\n"));
-            return Ok(out);
+            fails += 1;
+            out.push_str(&format!("\nSummary: 0 ok, 0 warn, {fails} fail\n"));
+            return Ok((out, fails));
         }
     };
 
@@ -754,7 +777,8 @@ fn render_validate_team_report(paths: &CcteamPaths, team: &str) -> Result<String
         out.push_str(
             "[OK] team is evergreen — skipping phase IO / markdown checks\n",
         );
-        return Ok(out);
+        out.push_str(&format!("\nSummary: 1 ok, 0 warn, {fails} fail\n"));
+        return Ok((out, fails));
     }
 
     // Locate the phase dir on disk via the same priority order the
@@ -771,7 +795,9 @@ fn render_validate_team_report(paths: &CcteamPaths, team: &str) -> Result<String
                 "[FAIL] could not locate team directory after resolve — \
                  run `ccteam doctor --reset-shipped-teams`\n",
             );
-            return Ok(out);
+            fails += 1;
+            out.push_str(&format!("\nSummary: 0 ok, 0 warn, {fails} fail\n"));
+            return Ok((out, fails));
         }
     };
     let phase_dir = team_dir.join(&spec.phase_dir);
@@ -780,7 +806,9 @@ fn render_validate_team_report(paths: &CcteamPaths, team: &str) -> Result<String
             "[FAIL] phase_dir {} does not exist\n",
             phase_dir.display(),
         ));
-        return Ok(out);
+        fails += 1;
+        out.push_str(&format!("\nSummary: 0 ok, 0 warn, {fails} fail\n"));
+        return Ok((out, fails));
     }
 
     // Sort phase markdowns so IO contract checks run in the
@@ -804,7 +832,8 @@ fn render_validate_team_report(paths: &CcteamPaths, team: &str) -> Result<String
             "[WARN] no phase markdowns under {}\n",
             phase_dir.display(),
         ));
-        return Ok(out);
+        out.push_str(&format!("\nSummary: 0 ok, 1 warn, {fails} fail\n"));
+        return Ok((out, fails));
     }
 
     // Project-bootstrapped artifacts the orchestrator writes before
@@ -819,7 +848,6 @@ fn render_validate_team_report(paths: &CcteamPaths, team: &str) -> Result<String
 
     let mut ok = 0u32;
     let mut warns = 0u32;
-    let mut fails = 0u32;
 
     for path in &entries {
         let file = path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
@@ -879,7 +907,7 @@ fn render_validate_team_report(paths: &CcteamPaths, team: &str) -> Result<String
     out.push_str(&format!(
         "\nSummary: {ok} ok, {warns} warn, {fails} fail\n",
     ));
-    Ok(out)
+    Ok((out, fails))
 }
 
 fn strip_frontmatter(body: &str) -> &str {
@@ -906,7 +934,17 @@ pub fn run_phase_show(
     };
 
     let user_staging = default_user_staging_dir();
-    let ctx = TeamResolveContext::for_orchestrator(&paths.root, &user_staging);
+    // V0.2.1 F28: when run from inside a project tree, layer 1
+    // (Project) wins so `phase show` reflects what the orchestrator
+    // would actually inject. Falls back to user / repo when there's
+    // no `.ccteam/team/team.yaml` in cwd.
+    let cwd = std::env::current_dir().ok();
+    let mut ctx = TeamResolveContext::for_orchestrator(&paths.root, &user_staging);
+    if let Some(cwd) = cwd.as_deref() {
+        if cwd.join(".ccteam").join("team").join("team.yaml").exists() {
+            ctx = ctx.with_project(cwd);
+        }
+    }
 
     let spec = resolve_team(team, &ctx)
         .with_context(|| format!("resolve team `{team}`"))?;
@@ -1388,11 +1426,21 @@ fn collect_artifacts(paths: &CcteamPaths, slug: &str) -> Map<String, Value> {
     m
 }
 
-fn render_ls_text(projects: &[ProjectSummary]) -> String {
-    if projects.is_empty() {
-        return "(no projects under ~/projects/. start one with `ccteam new \"<request>\"`.)\n".into();
-    }
+fn render_ls_text(projects: &[ProjectSummary], daemon_up: bool) -> String {
     let mut out = String::new();
+    // F27 — daemon health one-liner, always emitted (even on the
+    // empty-projects path) so users can disambiguate "no projects" from
+    // "daemon never came up".
+    out.push_str(&format!(
+        "daemon: {}\n",
+        if daemon_up { "up" } else { "down" }
+    ));
+    if projects.is_empty() {
+        out.push_str(
+            "(no projects under ~/projects/. start one with `ccteam new \"<request>\"`.)\n",
+        );
+        return out;
+    }
     out.push_str("SLUG                                     PHASE          STATE       COST   AGE\n");
     for p in projects {
         let phase = display_phase(&p.state.current_phase);
@@ -1419,7 +1467,7 @@ fn display_phase(phase: &str) -> &str {
     }
 }
 
-fn render_ls_json(projects: &[ProjectSummary]) -> Result<String> {
+fn render_ls_json(projects: &[ProjectSummary], daemon_up: bool) -> Result<String> {
     let active_count = projects
         .iter()
         .filter(|p| p.state.phase_state == PhaseState::InFlight)
@@ -1446,8 +1494,11 @@ fn render_ls_json(projects: &[ProjectSummary]) -> Result<String> {
         .collect();
     let v = json!({
         "projects": arr,
+        // F27 — `running` is now a real bool driven by
+        // `daemon::heartbeat_alive` so meta-agent / MCP consumers can
+        // gate writes on daemon liveness without an extra round trip.
         "orchestrator": {
-            "running": null,
+            "running": daemon_up,
             "active_count": active_count,
             "max_concurrent": 1,
         }
@@ -1808,6 +1859,51 @@ mod tests {
         assert_eq!(v["projects"].as_array().unwrap().len(), 2);
         assert_eq!(v["orchestrator"]["active_count"], 0);
         assert_eq!(v["orchestrator"]["max_concurrent"], 1);
+    }
+
+    #[test]
+    fn f27_run_ls_text_reports_daemon_down_when_no_heartbeat() {
+        // F27 — `ls` text output annotates daemon health on its first
+        // line so users can disambiguate "no projects" from "daemon
+        // never came up".
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let body = run_ls(&paths, OutputFormat::Text).unwrap();
+        let first_line = body.lines().next().unwrap_or("");
+        assert!(
+            first_line == "daemon: down",
+            "expected first line `daemon: down`; got: {first_line}",
+        );
+    }
+
+    #[test]
+    fn f27_run_ls_json_orchestrator_running_is_bool() {
+        // F27 — `orchestrator.running` was hardcoded `null` pre-V0.2.1;
+        // now it's a real bool gated on heartbeat freshness so MCP /
+        // meta-agent consumers can treat it as a status field.
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let body = run_ls(&paths, OutputFormat::Json).unwrap();
+        let v: Value = serde_json::from_str(&body).unwrap();
+        let running = &v["orchestrator"]["running"];
+        assert!(
+            running.is_boolean(),
+            "expected orchestrator.running:bool; got: {running:?}",
+        );
+        // No heartbeat written → must be false.
+        assert_eq!(running.as_bool(), Some(false));
+    }
+
+    #[test]
+    fn f27_run_ls_text_reports_daemon_up_on_fresh_heartbeat() {
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        ccteam_core::daemon::write_heartbeat(&paths).unwrap();
+        let body = run_ls(&paths, OutputFormat::Text).unwrap();
+        assert!(
+            body.starts_with("daemon: up"),
+            "expected `daemon: up` head line on fresh heartbeat; got:\n{body}",
+        );
     }
 
     #[test]
@@ -2399,9 +2495,13 @@ mod tests {
             validate_team: Some("totally-unknown".into()),
             ..DoctorOptions::default()
         };
-        let report = run_doctor(&paths, opts).unwrap();
-        assert!(report.contains("[FAIL] team.yaml load"), "got: {report}");
+        // F30 — fail-loud: any [FAIL] line bubbles a non-zero exit.
+        let err = run_doctor(&paths, opts).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("[FAIL] team.yaml load"), "got: {msg}");
+        assert!(msg.contains("1 fail"), "expected fails counter; got: {msg}");
     }
+
 
     #[test]
     fn validate_team_warns_when_phase_body_contains_protocol_literal() {

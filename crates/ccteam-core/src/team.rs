@@ -29,6 +29,7 @@ use crate::phases::GoldenRule;
 /// each field as a tagged document so future projects can pull only
 /// the field types relevant to their own team.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RetroFieldSpec {
     /// snake_case field name. Used as the markdown subsection slug
     /// AND the RAG index tag, so keep it stable per team — renaming
@@ -102,6 +103,7 @@ impl Default for GoldenRuleEnforcement {
 ///   `cmd` / `pattern` are tolerated (ignored) but trigger a warn so
 ///   operators notice the dead field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProtocolRule {
     pub rule_id: String,
     #[serde(default)]
@@ -120,6 +122,7 @@ pub struct ProtocolRule {
 /// the inject prompt. Phase markdown bodies may also reference domain
 /// rules implicitly (the user's freedom; doctor doesn't lint bodies).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DomainRule {
     pub rule_id: String,
     pub directive: String,
@@ -175,19 +178,25 @@ impl<'de> Deserialize<'de> for TeamGoldenRules {
         use serde::de::Error as DeError;
 
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Structured {
+            #[serde(default)]
+            protocol: Vec<ProtocolRule>,
+            #[serde(default)]
+            domain: Vec<DomainRule>,
+        }
+
+        #[derive(Deserialize)]
         #[serde(untagged)]
         enum Either {
-            Structured {
-                #[serde(default)]
-                protocol: Vec<ProtocolRule>,
-                #[serde(default)]
-                domain: Vec<DomainRule>,
-            },
+            Structured(Structured),
             Legacy(Vec<GoldenRule>),
         }
 
         match Either::deserialize(d).map_err(D::Error::custom)? {
-            Either::Structured { protocol, domain } => Ok(TeamGoldenRules { protocol, domain }),
+            Either::Structured(Structured { protocol, domain }) => {
+                Ok(TeamGoldenRules { protocol, domain })
+            }
             Either::Legacy(list) => Ok(TeamGoldenRules {
                 protocol: list
                     .into_iter()
@@ -213,6 +222,7 @@ impl<'de> Deserialize<'de> for TeamGoldenRules {
 /// All fields default so an M3 team.yaml can ship without any
 /// `critic_dimensions:` block — M5 will start adding them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CriticDimensionSpec {
     /// snake_case name. Used as the dimension identifier in M5
     /// scoring output and as the RAG tag for cross-project memory.
@@ -263,6 +273,7 @@ impl Default for CriticStrictness {
 /// mechanism. The `route` field selects which built-in `kind` the
 /// orchestrator uses to handle the escalate event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EscalateGrammarExtension {
     /// e.g. `MARKET_DUPLICATE` / `HYPOTHESIS_REJECTED`. Free-form
     /// uppercase by convention; the Stop hook matches on this exact
@@ -342,6 +353,7 @@ impl Default for CostPolicy {
 /// orchestrator can route phases / ESCALATE prefixes / golden-rule
 /// enforcement per team without ccteam-core knowing the team name.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TeamSpec {
     /// Team identifier. Must match the `--team` arg / `state.json.team`
     /// field. snake-case lowercase — gets used as a directory name.
@@ -1171,5 +1183,41 @@ mod tests {
         assert_eq!(spec.phase_dir, "phases");
         assert_eq!(spec.verdict_schema, vec!["verdict".to_string()]);
         assert_eq!(spec.escalate_grammar_extensions.len(), 3);
+    }
+
+    // F31 — `deny_unknown_fields` fail-loud on typo'd / unknown keys
+    // (V0.2.1). Two negatives: one at TeamSpec top level, one at a
+    // nested struct (RetroFieldSpec). Other nested structs share the
+    // same serde attribute path so coverage is by symmetry.
+
+    #[test]
+    fn f31_top_level_unknown_field_fails_loud() {
+        // typo: `cost_polciy` instead of `cost_policy` — pre-V0.2.1
+        // this silently fell back to defaults.
+        let src = "name: dev\ncost_polciy: none\n";
+        let err = TeamSpec::parse(src).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unknown field") && msg.contains("cost_polciy"),
+            "expected unknown-field error mentioning `cost_polciy`, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn f31_nested_unknown_field_fails_loud() {
+        // typo inside a retro_schema entry — `descripton` instead of
+        // `description`.
+        let src = concat!(
+            "name: dev\n",
+            "retro_schema:\n",
+            "  - field: tech_stack\n",
+            "    descripton: Languages used\n",
+        );
+        let err = TeamSpec::parse(src).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unknown field") && msg.contains("descripton"),
+            "expected unknown-field error mentioning `descripton`, got: {msg}",
+        );
     }
 }
