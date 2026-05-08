@@ -186,6 +186,36 @@ enum Command {
         #[command(subcommand)]
         cmd: PhaseCommand,
     },
+    /// V0.2 M0.21: translation layer that surfaces project anomalies
+    /// (auto-loop cycle / cost / phase duration / daemon down /
+    /// needs_attention.outbox) to the meta-agent as NL notifications.
+    /// Pure read-only — never mutates orchestrator state, never kills
+    /// sessions, never re-injects prompts.
+    Watchdog {
+        #[command(subcommand)]
+        cmd: WatchdogCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum WatchdogCommand {
+    /// Scan all projects + daemon heartbeat once and print every alert
+    /// that survives `~/.ccteam/watchdog.yaml` filtering. With
+    /// `--push --user <handle>` each alert is also appended to the
+    /// meta-agent session's outbox.
+    Scan {
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+        /// Also write each surviving alert to
+        /// `~/projects/<handle>-meta/.ccteam/outbox/`. Pair with
+        /// `--user <handle>`.
+        #[arg(long, default_value_t = false)]
+        push: bool,
+        /// User handle whose meta-agent outbox receives pushed alerts.
+        /// Required when `--push` is passed.
+        #[arg(long, value_name = "HANDLE")]
+        user: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -298,6 +328,22 @@ fn main() -> Result<()> {
             migrate_recommended_agents,
         }),
         Command::Phase { cmd } => run_phase(cmd),
+        Command::Watchdog { cmd } => run_watchdog(cmd),
+    }
+}
+
+fn run_watchdog(cmd: WatchdogCommand) -> Result<()> {
+    let paths = CcteamPaths::from_env()?;
+    match cmd {
+        WatchdogCommand::Scan { format, push, user } => {
+            if push && user.is_none() {
+                anyhow::bail!("`--push` requires `--user <handle>`");
+            }
+            let handle = if push { user.as_deref() } else { None };
+            let body = commands::run_watchdog_scan(&paths, format, handle)?;
+            print!("{body}");
+            Ok(())
+        }
     }
 }
 

@@ -25,6 +25,7 @@ pub mod team_resolver;
 pub mod templates;
 pub mod tmux;
 pub mod tool_surface;
+pub mod watchdog;
 
 pub use dag::{dev_dag, Dag};
 pub use auto_loop::{AutoLoopDecision, AutoLoopFrontMatter, AutoLoopState};
@@ -108,6 +109,12 @@ pub use tool_surface::{
     disable_tool_surface_bootstrap_for_tests, ensure_skills_placeholders,
     migrate_recommended_agent_symlinks, missing_tools, user_claude_dir, MigrationReport,
     MissingTool, ToolSurfaceSnapshot, ToolsRequired, BUILTIN_SUBAGENTS,
+};
+pub use watchdog::{
+    config_path as watchdog_config_path, load_config as load_watchdog_config,
+    push_alert_to_meta_outbox as push_watchdog_alert_to_meta_outbox, scan as watchdog_scan,
+    AlertKind as WatchdogAlertKind, NotifyMode as WatchdogNotifyMode, WatchdogAlert,
+    WatchdogConfig, DEFAULT_NOTIFY_ON_CYCLE_COUNT, WATCHDOG_CONFIG_FILENAME,
 };
 
 /// Crate version, identical to the workspace package version.
