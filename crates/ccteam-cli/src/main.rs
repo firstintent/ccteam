@@ -218,6 +218,11 @@ enum HookCommand {
     /// SessionStart hook: write the `<project>/.ccteam/ready` marker.
     /// M0.10 extends this to bridge a pre-reset progress summary.
     LoadContext,
+    /// V0.2 M0.19.3 PreToolUse hook for `AskUserQuestion`. Returns a
+    /// `permissionDecision: deny` so the assistant routes through the
+    /// outbox / clarify protocol instead of synchronously waiting on
+    /// an offline user.
+    InterceptAsk,
 }
 
 fn main() -> Result<()> {
@@ -342,17 +347,34 @@ fn run_hook(cmd: HookCommand) -> Result<()> {
         }
         HookCommand::ParsePhaseEnd => {
             let decision = ccteam_hooks::parse_phase_end(&paths, &stdin)?;
-            if let ccteam_hooks::ParseDecision::Block { reason } = decision {
-                let json = serde_json::json!({
-                    "decision": "block",
-                    "reason": reason,
-                });
-                println!("{}", serde_json::to_string(&json)?);
+            match decision {
+                ccteam_hooks::ParseDecision::Continue => Ok(()),
+                ccteam_hooks::ParseDecision::Block { reason } => {
+                    let json = serde_json::json!({
+                        "decision": "block",
+                        "reason": reason,
+                    });
+                    println!("{}", serde_json::to_string(&json)?);
+                    Ok(())
+                }
+                ccteam_hooks::ParseDecision::BlockMissingOutput { stderr } => {
+                    // V0.2 M0.19: exit 2 + stderr is the Stop hook
+                    // contract Claude Code interprets as a blocking
+                    // system message (`hooks.ts:2784-2805`). The
+                    // assistant is forced to re-prompt with the
+                    // stderr text injected.
+                    eprintln!("{stderr}");
+                    std::process::exit(2);
+                }
             }
-            Ok(())
         }
         HookCommand::CostAccumulate => ccteam_hooks::cost_accumulate(&paths, &stdin),
         HookCommand::LoadContext => ccteam_hooks::load_context(&paths, &stdin),
+        HookCommand::InterceptAsk => {
+            let decision = ccteam_hooks::intercept_ask_decision();
+            println!("{}", serde_json::to_string(&decision)?);
+            Ok(())
+        }
     }
 }
 

@@ -1,6 +1,6 @@
 //! `ccteam hook parse-phase-end` — Stop hook handler.
 //!
-//! Two responsibilities, in order:
+//! Three responsibilities, in order:
 //!
 //! 1. **Fix-loop ralph-loop pattern** (M0.12, tech-design §3.5). If the
 //!    project has a `<project>/.ccteam/auto-loop.state.md`, this hook
@@ -14,20 +14,34 @@
 //!    non-empty line of the latest assistant message starts with
 //!    `PHASE_DONE:` → `phase_done` event; `ESCALATE:` → `escalate`
 //!    event.
+//!
+//! 3. **V0.2 M0.19 self-loop fallback** (PRD §2.2 / alignment-review
+//!    §3.1). A phase ended without producing any of the three legal
+//!    outputs — no `PHASE_DONE` / `ESCALATE` in the assistant text and
+//!    no fresh outbox file under `<project>/.ccteam/outbox/`. The hook
+//!    returns exit 2 + stderr so Claude Code re-injects a coercive
+//!    "phase 未正常收尾" prompt and the assistant is forced to pick a
+//!    legal output. On the second entry (`stop_hook_active: true`)
+//!    the hook stops blocking and writes `needs_attention.outbox.json`
+//!    so the watchdog (M0.21) can surface it to the user.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{json, Value};
 
 use ccteam_core::auto_loop::{self, AutoLoopDecision};
-use ccteam_core::{progress::append_event, slug_from_project_dir, CcteamPaths};
+use ccteam_core::{
+    progress::{append_event, read_all_events},
+    slug_from_project_dir, CcteamPaths,
+};
 
 use crate::transcript::{last_assistant_message, message_text};
 
 /// Result of running `parse_phase_end`. The CLI dispatcher emits the
-/// Claude Code Stop hook decision JSON when this is `Block`.
+/// Claude Code Stop hook decision JSON when this is `Block`, and exits
+/// 2 with the carried stderr message when this is `BlockMissingOutput`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseDecision {
     /// Default: don't block; let claude continue exiting.
@@ -35,6 +49,13 @@ pub enum ParseDecision {
     /// Block the Stop and re-feed `reason` as the next user prompt
     /// (ralph-loop / fix-cycle).
     Block { reason: String },
+    /// V0.2 M0.19: phase ended with none of the three legal outputs
+    /// (PHASE_DONE / ESCALATE / outbox). The dispatcher prints `stderr`
+    /// to fd 2 and exits with code 2. Claude Code interprets exit 2 +
+    /// stderr as a blocking system message and re-prompts the model
+    /// with the stderr text (`hooks.ts:2784-2805`). The next Stop entry
+    /// carries `stop_hook_active: true` and we won't recurse.
+    BlockMissingOutput { stderr: String },
 }
 
 pub fn parse_phase_end(paths: &CcteamPaths, stdin: &Value) -> Result<ParseDecision> {
@@ -150,17 +171,200 @@ pub fn parse_phase_end(paths: &CcteamPaths, stdin: &Value) -> Result<ParseDecisi
 
     if let Some(event) = event {
         append_event(&progress_path, &event)?;
-    } else {
-        // Hook fired but found no sigil. Log to stderr at debug level so
-        // the operator can confirm the hook was reached even when no
-        // event was emitted — silent zero-exit is otherwise hard to
-        // diagnose in production runs.
-        eprintln!(
-            "[ccteam parse-phase-end] no PHASE_DONE/ESCALATE in last_text (head: {:?})",
-            last_text.lines().rev().take(3).collect::<Vec<_>>(),
-        );
+        return Ok(ParseDecision::Continue);
     }
-    Ok(ParseDecision::Continue)
+
+    // V0.2 M0.19 self-loop fallback. The phase ended with neither a
+    // PHASE_DONE/ESCALATE sigil in the assistant text nor an active
+    // ralph-loop state file. Check whether the assistant at least wrote
+    // a fresh outbox file (the third legal output); if so, this is a
+    // legitimate user-decision pause and we let the orchestrator route
+    // it. Otherwise the phase has silently halted — fail loud.
+    let phase_started_at = phase_started_at(&progress_path)?;
+    let outbox_dir = cwd_path.join(".ccteam").join("outbox");
+    let fresh_outbox = fresh_outbox_files(&outbox_dir, phase_started_at)?;
+
+    if !fresh_outbox.is_empty() {
+        // Decision pause is legitimate; the orchestrator's existing
+        // outbox / decisions queue path takes over from here.
+        return Ok(ParseDecision::Continue);
+    }
+
+    // No legal output produced. Decide between exit-2 (first Stop) and
+    // append-needs-attention (second Stop, recursion guard).
+    let stop_hook_active = stdin
+        .get("stop_hook_active")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if stop_hook_active {
+        // L3 fail-safe per PRD §2.3: do not block again, just record
+        // the stall so the watchdog surfaces it. Claude Code carries
+        // `stop_hook_active: true` on the second Stop entry so a phase
+        // that keeps producing nothing won't loop forever.
+        let pane_tail = capture_pane_tail(&slug, 30);
+        write_needs_attention_outbox(
+            cwd_path,
+            &slug,
+            &last_text,
+            pane_tail.as_deref(),
+        )?;
+        return Ok(ParseDecision::Continue);
+    }
+
+    eprintln!(
+        "[ccteam parse-phase-end] phase未产出 PHASE_DONE/ESCALATE/outbox 任一 (head: {:?})",
+        last_text.lines().rev().take(3).collect::<Vec<_>>(),
+    );
+    Ok(ParseDecision::BlockMissingOutput {
+        stderr: SELF_LOOP_FALLBACK_MESSAGE.to_string(),
+    })
+}
+
+/// V0.2 M0.19: stderr text Claude Code injects back into the model
+/// when this hook returns exit 2. Kept short so a single re-prompt
+/// fits well within Claude Code's blockingError budget.
+const SELF_LOOP_FALLBACK_MESSAGE: &str =
+    "phase 未正常收尾。请输出 PHASE_DONE: <phase> / ESCALATE: <reason> / 写 .ccteam/outbox/clarify-<ts>.md 三者之一。\
+     直接询问用户的纯文本问句不会被人看见,只会触发本次提示重发。";
+
+/// Walk progress.jsonl for the most recent `phase_inject` event and
+/// return its `ts` timestamp. The Stop hook treats this as the lower
+/// bound for "outbox file written by *this* phase". `None` (no
+/// `phase_inject` yet) means the phase started before progress was
+/// initialized — treat every outbox file as fresh.
+fn phase_started_at(progress_path: &Path) -> Result<Option<DateTime<Utc>>> {
+    if !progress_path.exists() {
+        return Ok(None);
+    }
+    let events = read_all_events(progress_path)?;
+    for event in events.iter().rev() {
+        let kind = event.get("event").and_then(|s| s.as_str()).unwrap_or("");
+        if kind == "phase_inject" {
+            let ts = event.get("ts").and_then(|s| s.as_str()).unwrap_or("");
+            return Ok(DateTime::parse_from_rfc3339(ts)
+                .map(|d| d.with_timezone(&Utc))
+                .ok());
+        }
+    }
+    Ok(None)
+}
+
+/// Return the basenames of outbox files created or modified after
+/// `since`. `since: None` collects every outbox file. The Stop hook
+/// uses this to detect the third legal phase output.
+fn fresh_outbox_files(
+    outbox_dir: &Path,
+    since: Option<DateTime<Utc>>,
+) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(outbox_dir) {
+        Ok(it) => it,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(out);
+        }
+        Err(err) => {
+            return Err(err.into());
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = match path.file_name().and_then(|s| s.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        if !name.ends_with(".md") {
+            continue;
+        }
+        let recognised = ["clarify-", "escalation-", "reply-"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix));
+        if !recognised {
+            continue;
+        }
+        if let Some(min) = since {
+            let stale = entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .map(|t| DateTime::<Utc>::from(t) < min)
+                .unwrap_or(false);
+            if stale {
+                continue;
+            }
+        }
+        out.push(name);
+    }
+    Ok(out)
+}
+
+/// Capture the last `n` lines of the project's tmux pane. Returns
+/// `None` if tmux isn't installed, the session is missing, or the
+/// invocation otherwise fails. The captured text only ever lands in
+/// `needs_attention.outbox.json` as user-facing surface info — never
+/// parsed by the orchestrator's state machine (see CLAUDE.md
+/// "永不解析 tmux 终端输出" red line).
+fn capture_pane_tail(slug: &str, lines: usize) -> Option<String> {
+    let session = format!("ccteam-{slug}");
+    let output = std::process::Command::new("tmux")
+        .args([
+            "capture-pane",
+            "-p",
+            "-t",
+            &session,
+            "-S",
+            &format!("-{lines}"),
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim_end().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+/// V0.2 M0.19 L3 fail-safe: write `<project>/.ccteam/needs_attention.outbox.json`
+/// with the most recent assistant message + pane tail. The watchdog
+/// (M0.21) reads it and surfaces it to the user. Idempotent — the file
+/// is always overwritten with the latest snapshot.
+fn write_needs_attention_outbox(
+    cwd: &Path,
+    slug: &str,
+    last_assistant_message: &str,
+    pane_tail: Option<&str>,
+) -> Result<()> {
+    let dir = cwd.join(".ccteam");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("needs_attention.outbox.json");
+    let body = json!({
+        "schema_version": 1,
+        "ts": now_rfc3339(),
+        "slug": slug,
+        "reason": "stop_hook_active recursion guard tripped — phase produced no PHASE_DONE/ESCALATE/outbox over two consecutive Stop entries",
+        "last_assistant_message": last_assistant_message,
+        "pane_tail": pane_tail.unwrap_or(""),
+    });
+    let pretty = serde_json::to_string_pretty(&body)?;
+    std::fs::write(&path, pretty)?;
+    Ok(())
+}
+
+/// Path the L3 fail-safe writes when the Stop hook recurses. Exposed
+/// so tests + the watchdog (M0.21) can locate it without re-deriving
+/// the layout.
+pub fn needs_attention_outbox_path(cwd: &Path) -> PathBuf {
+    cwd.join(".ccteam").join("needs_attention.outbox.json")
 }
 
 /// Structured ESCALATE grammar (interfaces §4.1.1). Pure string-prefix

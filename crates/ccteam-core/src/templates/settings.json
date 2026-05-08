@@ -36,6 +36,12 @@
         "hooks": [
           {"type": "command", "command": "__CCTEAM_BIN__ hook progress-append PreToolUse", "async": true}
         ]
+      },
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {"type": "command", "command": "__CCTEAM_BIN__ hook intercept-ask", "timeout": 5}
+        ]
       }
     ],
     "PostToolUse": [

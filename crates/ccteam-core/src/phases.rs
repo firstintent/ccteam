@@ -198,7 +198,13 @@ pub struct PhaseTemplate {
     /// Mechanism is phase-name-agnostic — dev's `fix` phase sets it
     /// true, research's `04-primary` data-collection phase will also
     /// set it true.
-    #[serde(default)]
+    ///
+    /// V0.2 M0.19: default flipped to `true`. Every phase self-loops
+    /// unless its yaml explicitly opts out with `auto_loop: false`.
+    /// Pairs with the Stop-hook self-loop fallback (parse_phase_end
+    /// exits 2 + stderr when neither PHASE_DONE / ESCALATE / outbox
+    /// fired) so phases can never silently halt the orchestrator.
+    #[serde(default = "default_auto_loop")]
     pub auto_loop: bool,
 
     /// Iteration cap when `auto_loop = true`. Defaults to 3 so existing
@@ -277,6 +283,14 @@ pub struct PhaseTemplate {
 
 fn default_auto_loop_max_iterations() -> u32 {
     DEFAULT_AUTO_LOOP_MAX_ITERATIONS
+}
+
+/// V0.2 M0.19: phases self-loop unless explicitly opted out. The Stop
+/// hook re-injects the same prompt up to `auto_loop_max_iterations`
+/// times (default 3) until the assistant emits the phase's
+/// `completion_signal` (default `PHASE_DONE: <name>`).
+fn default_auto_loop() -> bool {
+    true
 }
 
 fn default_max_clarify_rounds() -> u32 {
@@ -539,7 +553,12 @@ mod tests {
     }
 
     #[test]
-    fn auto_loop_defaults_to_false_when_omitted() {
+    fn auto_loop_defaults_to_true_when_omitted() {
+        // V0.2 M0.19: phases self-loop by default. A yaml that omits
+        // the field gets `auto_loop: true` + the synthesized
+        // `PHASE_DONE: <name>` completion signal so the Stop hook can
+        // re-inject up to `auto_loop_max_iterations` times until the
+        // assistant emits the signal.
         let src = concat!(
             "---\n",
             "name: implement\n",
@@ -548,10 +567,29 @@ mod tests {
             "body\n",
         );
         let t = PhaseTemplate::parse(src).unwrap();
-        assert!(!t.auto_loop);
+        assert!(t.auto_loop);
         assert_eq!(t.auto_loop_max_iterations, 3);
         assert!(t.completion_signal.is_empty());
-        // Validation passes — auto_loop=false ignores the empty signal.
+        // effective_completion_signal() falls back to PHASE_DONE: <name>.
+        assert_eq!(t.effective_completion_signal(), "PHASE_DONE: implement");
+        t.validate_m0().unwrap();
+    }
+
+    #[test]
+    fn auto_loop_explicit_false_opts_out() {
+        // Some phase yamls (e.g. evergreen meta-agent stubs, ad-hoc
+        // diagnostic phases) may want to skip the ralph-loop. Explicit
+        // `auto_loop: false` continues to disable it.
+        let src = concat!(
+            "---\n",
+            "name: kickoff\n",
+            "parallelism: solo\n",
+            "auto_loop: false\n",
+            "---\n",
+            "body\n",
+        );
+        let t = PhaseTemplate::parse(src).unwrap();
+        assert!(!t.auto_loop);
         t.validate_m0().unwrap();
     }
 

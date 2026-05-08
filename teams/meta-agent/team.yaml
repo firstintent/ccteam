@@ -34,5 +34,15 @@ claude_md_template: ""
 retro_schema: []
 critic_dimensions: []
 escalate_grammar_extensions: []
-golden_rules: []
 verdict_schema: []
+
+# V0.2 M0.19.4: meta-agent has no phase pipeline but the same
+# self-loop protocol applies to its dispatcher prompt — every
+# AskUserQuestion attempt has to route through the outbox so an
+# offline user never freezes the long-running session.
+golden_rules:
+  protocol:
+    - rule_id: forbid_ask_user_question
+      enforce: prompt_directive
+      directive: "禁用 AskUserQuestion / 纯文本问句。询问用户唯一合法出口是写 .ccteam/outbox/clarify-<ts>.md(配 PHASE_DONE_PENDING 或 ESCALATE NEED_USER_INPUT)。"
+  domain: []

@@ -460,6 +460,27 @@ mod tests {
     }
 
     #[test]
+    fn template_pre_tool_use_intercepts_ask_user_question() {
+        // V0.2 M0.19.3: PreToolUse must carry a second matcher-bound
+        // entry for `AskUserQuestion` so the hook can deny the call
+        // before the assistant blocks waiting on an offline user.
+        let body = render_project_settings(
+            Path::new("/usr/local/bin/ccteam"),
+            &SettingsEnv::default(),
+            &EnabledPluginsSetting::default(),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let entries = v["hooks"]["PreToolUse"].as_array().unwrap();
+        let intercept = entries
+            .iter()
+            .find(|e| e.get("matcher").and_then(|m| m.as_str()) == Some("AskUserQuestion"))
+            .expect("PreToolUse must have an AskUserQuestion matcher entry");
+        let cmd = intercept["hooks"][0]["command"].as_str().unwrap();
+        assert_eq!(cmd, "/usr/local/bin/ccteam hook intercept-ask");
+    }
+
+    #[test]
     fn template_session_start_uses_absolute_ccteam_path() {
         let body = render_project_settings(
             Path::new("/usr/local/bin/ccteam"),
