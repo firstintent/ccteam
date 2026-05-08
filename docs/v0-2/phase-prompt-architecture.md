@@ -1,6 +1,6 @@
 # Phase Prompt Architecture — 协议层与领域层分离
 
-> V0.2 §5.3 子设计文档。配套 PRD `docs/prd-v0-2.md`。
+> V0.2 §5.3 子设计文档。配套 PRD `docs/v0-2/prd.md`。
 >
 > **TL;DR**:phase markdown 三层架构 — frontmatter 是协议(declarative)、
 > 正文是领域(用户全权)、orchestrator 注入的 inject-prompt 是运行时拼装层

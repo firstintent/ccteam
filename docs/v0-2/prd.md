@@ -44,7 +44,7 @@ V0.2 翻面:**auto_loop 成为 phase 默认行为**。Stop hook 触发 = LLM idl
 让 LLM 自己看 phase prompt + `.ccteam/` 状态决定下一步。
 
 **Stop hook 实施细节**(基于 Claude Code hooks lifecycle 研究,详见
-`docs/v0-2-claude-code-alignment-review.md` §3.1):
+`docs/v0-2/alignment-review.md` §3.1):
 
 - Stop hook **exit 2 + stderr** 路径:hook 检查 `.ccteam/` 这一轮 phase 没
   产出三种文件之一 → exit 2,stderr 写"phase 未正常收尾,请输出 PHASE_DONE
@@ -70,7 +70,7 @@ V0.2 翻面:**auto_loop 成为 phase 默认行为**。Stop hook 触发 = LLM idl
 - **L1 prompt 约束**:`golden_rules` 写明"禁用 AskUserQuestion,改写 outbox"
 - **L2 PreToolUse hook 拦截**:配 `matcher: "AskUserQuestion"`,返回
   `permissionDecision: "deny"` + reason "本 phase 应自决,改为写 outbox"。
-  机制确定可行(详见 `v0-2-claude-code-alignment-review.md` §3.2),不必等
+  机制确定可行(详见 `docs/v0-2/alignment-review.md` §3.2),不必等
   漂移数据 — V0.2 直接做
 
 之前 PRD 草案把 hook 拦截标为 "V0.3 视漂移决定"。Fork 4 研究确认机制零成本
@@ -116,7 +116,7 @@ watchdog 不是兜底决策层,是**预警层**。
 ### 3.4 信号源:外部 timer + Stop hook,不用 SessionEnd
 
 基于 Claude Code hooks lifecycle 研究(详见
-`docs/v0-2-claude-code-alignment-review.md` §3.3):**`SessionEnd` 不适合
+`docs/v0-2/alignment-review.md` §3.3):**`SessionEnd` 不适合
 做 watchdog 触发源**。`exit_reason` 枚举只有 6 个全是用户主动事件
 (`clear` / `resume` / `logout` / ...),stall 不会触发它。
 
@@ -165,7 +165,7 @@ V0.2 不引入新概念,只是把 team 创建做成**对话式工厂**。
 ### 4.3 工厂产物形态 — Claude Code plugin 格式
 
 > 重大调整(2026-05-07):基于 Fork 3 plugin/marketplace 机制研究
-> (详见 `docs/v0-2-claude-code-alignment-review.md` §2),工厂产物**不另起
+> (详见 `docs/v0-2/alignment-review.md` §2),工厂产物**不另起
 > ccteam 私有协议,直接走 Claude Code plugin 格式**。`plugin.json` schema
 > 已 partial-merge 了 commands / agents / skills / hooks / mcpServers /
 > userConfig / dependencies 全部扩展点(§1.4 哲学),覆盖 ccteam team 95%
@@ -323,7 +323,7 @@ User-level team 实际落在 Claude Code plugin pipeline(§4.3 决议),staging
 orchestrator 加载 team 时按 project > user > repo 优先级搜:**整团维度,
 first-source-wins**(撞名 project 完全覆盖 user / repo,不字段级合并)。
 
-设计依据见 `docs/v0-2-claude-code-alignment-review.md` §4。借鉴的是 Claude
+设计依据见 `docs/v0-2/alignment-review.md` §4。借鉴的是 Claude
 Code `SETTING_SOURCES` enum 模式,**不照搬**字段维度合并(ccteam team 是
 整体替换,合并语义会让"哪个 phase 在哪一层"不可溯源)。
 
@@ -364,7 +364,7 @@ orchestrator 加载完全数据驱动 — `ccteam-core` 不再 hardcode 任何 t
 ESCALATE grammar 例子,跟业务约束 / 风格偏好 / 角色 framing 混杂),
 用户随手改可能破协议。
 
-> **完整设计在子文档:`docs/phase-prompt-architecture.md`**(三层架构、
+> **完整设计在子文档:`docs/v0-2/phase-prompt-architecture.md`**(三层架构、
 > frontmatter 字段全集、orchestrator inject prompt 模板、改造前后示例、
 > 实施步骤、测试策略)。本节只列摘要 + 决议。
 
@@ -458,7 +458,7 @@ auto-memory 文件名 + e2e 测试假设),布局重构本身已经够大;领域�
 ## 6. ccteam-core 反模式重构(V0.2 必做)
 
 > 基于 Fork 2 audit + Claude Code 哲学对照,详见
-> `docs/v0-2-claude-code-alignment-review.md` §5(完整 8 个候选清单)。
+> `docs/v0-2/alignment-review.md` §5(完整 8 个候选清单)。
 > 本节列 V0.2 必做 6 条(高优先级);V0.3 deferred 2 条见 §7。
 
 V0.2 §2 / §3 / §4 / §5 是新功能 + 协议升级;§6 是**清理 ccteam-core 既有
@@ -624,7 +624,7 @@ V0.3 deferred:
   缺层静默 fall-through,读容错写严格
 - [ ] 369 测试 baseline 不退步;clippy 不新增 warning
 
-§5.3 领域 / 编排分离(详见 `docs/phase-prompt-architecture.md`):
+§5.3 领域 / 编排分离(详见 `docs/v0-2/phase-prompt-architecture.md`):
 - [ ] frontmatter 加 `completion_signal` / `escalate_grammar_ref` /
   `outbox_question_protocol` 字段;serde alias 兼容旧 yaml
 - [ ] orchestrator inject prompt 模板化,据 frontmatter 字段差异化拼装;
@@ -639,7 +639,7 @@ V0.3 deferred:
 - [ ] 故意改 phase 正文加废话 — phase 行为不变;故意删 frontmatter
   `completion_signal` — doctor fail-loud
 
-§6 ccteam-core 反模式重构(详见 `docs/v0-2-claude-code-alignment-review.md` §5/§7):
+§6 ccteam-core 反模式重构(详见 `docs/v0-2/alignment-review.md` §5/§7):
 - [ ] **红线检查**:`grep -rE "\b(dev|product-research|meta-agent)\b"` 在
   `crates/ccteam-core/src/` 应只命中注释 / 测试 — 候选 2/5
 - [ ] **协议关键字单一 source**:`grep -rE "PHASE_DONE|ESCALATE"` 在
@@ -677,7 +677,7 @@ V0.3 deferred:
 - 2026-05-07:初稿。基于 V0.1 实测痛点列表 + 一轮架构讨论达成。
 - 2026-05-07:§4 加 team 工厂(用户自定义工作流);§5 加团队布局重构。
 - 2026-05-07:§5.3 推荐方案从 B+C 切换 D(协议外移到 orchestrator inject prompt);
-  详细设计落 `docs/phase-prompt-architecture.md`。
+  详细设计落 `docs/v0-2/phase-prompt-architecture.md`。
 - 2026-05-07:5 路并行 fork 综合 review 后大幅升级:
   - §2 加 Stop hook `exit 2 + stop_hook_active` 防递归实现细节
   - §2.4 PreToolUse 拦截 AskUserQuestion 从 V0.3 待评估升级到 V0.2 必做
@@ -686,4 +686,4 @@ V0.3 deferred:
     删 ccteam 自营注册中心)
   - §5.2 加 `TEAM_SOURCES` enum 设计(借鉴 layered settings)+ plugin pipeline 兼容
   - 新加 §6 ccteam-core 反模式重构(6 条 V0.2 必做 + 2 条 V0.3 deferred)
-  - 综合分析依据落 `docs/v0-2-claude-code-alignment-review.md`
+  - 综合分析依据落 `docs/v0-2/alignment-review.md`

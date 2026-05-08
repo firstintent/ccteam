@@ -500,7 +500,7 @@ hooks:                            # phase 级 hook(项目级 hook 在 settings.j
   before: scripts/snapshot-git.sh
   after: scripts/run-golden-rules.sh
 
-# V0.2 M0.18 inject-prompt frontmatter(phase-prompt-architecture.md §4.2)
+# V0.2 M0.18 inject-prompt frontmatter(docs/v0-2/phase-prompt-architecture.md §4.2)
 escalate_grammar_ref: standard    # 异常出口 grammar dialect。`standard` 走四个内置 prefix(REVERT_TO_PHASE / NEED_USER_INPUT / ABORT / INSUFFICIENT_CLARIFICATION);
                                   # 团队特定 prefix 由 team.yaml.escalate_grammar_extensions 注册,与本字段独立
 outbox_question_protocol: v1      # 询问用户协议版本。V0.2 仅 `v1`(interfaces §3.4.3 outbox 文件 schema)
@@ -520,7 +520,7 @@ inject_directives:                # 可选。orchestrator 拼装 inject prompt �
 
 (prompt body — V0.2 M0.18: 100% 领域内容,不许写 `PHASE_DONE: <name>` /
 `ESCALATE:` 等协议关键词;协议由 orchestrator 的 inject prompt 注入,详见
-`docs/phase-prompt-architecture.md` §3 三层架构 / §8 红线)
+`docs/v0-2/docs/v0-2/phase-prompt-architecture.md` §3 三层架构 / §8 红线)
 ```
 
 ### 5.2 dev team phase 列表(M3 后 team-aware)
@@ -654,7 +654,7 @@ escalate_grammar_extensions:
 # M3.2 / V0.2 M0.18: team-wide default golden_rules。Phase YAML
 # `golden_rules` 优先 — phase 不写时回退到 team.yaml 默认。
 #
-# V0.2 M0.18 schema(phase-prompt-architecture.md §6 拆分):
+# V0.2 M0.18 schema(docs/v0-2/phase-prompt-architecture.md §6 拆分):
 # - `protocol`:协议级红线(orchestrator 处理)
 #   - `enforce: cmd_check`(默认):cmd / pattern 在 phase_done 边界跑
 #   - `enforce: prompt_directive`:directive 文本注入 inject prompt
@@ -776,7 +776,7 @@ V0.3 candidate)。
 
 **`team.yaml` 在 plugin 根目录的去向**:Claude Code plugin loader
 读 `.claude-plugin/plugin.json` 时按 zod schema 校,unknown 顶级文件
-被忽略(默认 strip,见 `docs/v0-2-claude-code-alignment-review.md`
+被忽略(默认 strip,见 `docs/v0-2/alignment-review.md`
 §2.7)。`team.yaml` 不会污染 plugin 加载,ccteam 通过
 `team_resolver::resolve_team` 直接读。
 
@@ -935,7 +935,7 @@ phase 内累计 CLARIFY 轮次(每个 outbox `event_kind: clarify` 文件 + 对�
 | `Notification:idle_prompt` | claude 显式等待用户输入 → idle 信号 |
 | `Notification:permission_prompt` | 不应出现(`--dangerously-skip-permissions` 兜底);出现说明配置失效 |
 | `PreToolUse`(通用) | append 工具调用事件;活跃信号(stall 检测反向判断) |
-| `PreToolUse(matcher: AskUserQuestion)` | **V0.2 M0.19.3**:`ccteam hook intercept-ask` 返回 `permissionDecision: deny`,assistant 改写 outbox。机制详见 `docs/v0-2-claude-code-alignment-review.md` §3.2 |
+| `PreToolUse(matcher: AskUserQuestion)` | **V0.2 M0.19.3**:`ccteam hook intercept-ask` 返回 `permissionDecision: deny`,assistant 改写 outbox。机制详见 `docs/v0-2/alignment-review.md` §3.2 |
 | `PostToolUse`(通用) | append 事件;`cost-accumulate.sh` 累加 token / cost 到 `state.json` |
 | `PostToolUse(Bash matcher)` | 拦截危险命令(`git push` / `rm -rf /` / deploy 脚本) |
 | `SubagentStop` | 子 agent 退出(仅 Agent Teams phase 内相关) |

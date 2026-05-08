@@ -714,7 +714,7 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
 ///    bootstrapped artifact like `.ccteam/spec.md`)
 /// 4. phase body residue: protocol literals (`PHASE_DONE: <name>` /
 ///    `ESCALATE:`) inside the body trigger a warn (not error — bodies
-///    are user territory; `phase-prompt-architecture.md` §9 docks
+///    are user territory; `docs/v0-2/phase-prompt-architecture.md` §9 docks
 ///    this as warn-not-fail by design).
 fn render_validate_team_report(paths: &CcteamPaths, team: &str) -> Result<String> {
     use ccteam_core::{

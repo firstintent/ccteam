@@ -4,9 +4,9 @@
 > 每个 milestone 对应 1-2 PR。
 >
 > 配套文档:
-> - 需求决策:`docs/prd-v0-2.md`
-> - 设计依据:`docs/v0-2-claude-code-alignment-review.md`
-> - 子设计:`docs/phase-prompt-architecture.md`
+> - 需求决策:`docs/v0-2/prd.md`
+> - 设计依据:`docs/v0-2/alignment-review.md`
+> - 子设计:`docs/v0-2/phase-prompt-architecture.md`
 >
 > CLAUDE.md 约定:**`development-plan.md` 只追当前 in-flight 任务**;V0.2 进入
 > in-flight 时,`development-plan.md` reference 本文档,不复制。
@@ -143,7 +143,7 @@ M0.16 (foundation)
 
 **关联 PRD**:§5.3 + §6.1(候选 1)+ §6.5(候选 8)
 
-详见 `docs/phase-prompt-architecture.md` §11 详细步骤。
+详见 `docs/v0-2/phase-prompt-architecture.md` §11 详细步骤。
 
 ### 任务
 
@@ -184,7 +184,7 @@ M0.16 (foundation)
 ### 文档同步
 
 - `docs/interfaces.md` §5.1 加 marker / 协议字段全集更新
-- `docs/phase-prompt-architecture.md` 已是 SoT,无需更新
+- `docs/v0-2/phase-prompt-architecture.md` 已是 SoT,无需更新
 - `docs/dev-coupling-audit.md` 关闭候选 1/8
 
 ---
@@ -358,7 +358,7 @@ M0.16 (foundation)
 
 - `docs/tech-design.md` 加 §X team factory 章节
 - `docs/interfaces.md` 加 plugin manifest 兼容字段说明
-- 新建 `docs/team-factory-userguide.md` 用户指南(简短,~100 行)
+- 新建 `docs/v0-2/team-factory-userguide.md` 用户指南(简短,~100 行)
 
 ---
 
@@ -450,5 +450,5 @@ M0.16 (foundation)
 
 ## Changelog
 
-- 2026-05-07:初稿。基于 prd-v0-2.md + alignment review 拆 8 个 milestone
+- 2026-05-07:初稿。基于 docs/v0-2/prd.md + alignment review 拆 8 个 milestone
   (M0.16-M0.23),~5 kLOC / ~6 周。

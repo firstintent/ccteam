@@ -5,7 +5,7 @@
 //! V0.2 M0.18: phase markdown bodies no longer contain protocol
 //! literals (`PHASE_DONE: <name>` / `ESCALATE:`). The orchestrator's
 //! per-phase inject prompt carries those — the body stays domain-only.
-//! See `docs/phase-prompt-architecture.md` §8 for the invariant.
+//! See `docs/v0-2/phase-prompt-architecture.md` §8 for the invariant.
 
 use std::path::PathBuf;
 
@@ -64,7 +64,7 @@ fn every_m0_template_body_omits_protocol_literals() {
     // belong in the orchestrator's inject prompt, not in the phase
     // markdown body. A phase body that drifts back to spelling the
     // protocol keyword should fail this guard so reviews catch it
-    // before merge. See `docs/phase-prompt-architecture.md` §8.
+    // before merge. See `docs/v0-2/phase-prompt-architecture.md` §8.
     let dir = phases_dir();
     for (file, expected_name) in M0_TEMPLATES {
         let path = dir.join(file);

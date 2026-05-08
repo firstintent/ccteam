@@ -158,6 +158,6 @@ file is invisible to Claude Code's plugin pipeline.
 - `docs/tech-design.md` §6.12 — design decisions.
 - `docs/interfaces.md` §5.1 / §5.5 — phase frontmatter + team.yaml
   schema (the factory writes these).
-- `docs/v0-2-claude-code-alignment-review.md` §2 — why we use the
+- `docs/v0-2/alignment-review.md` §2 — why we use the
   Claude Code plugin format instead of inventing a ccteam-specific
   packaging.

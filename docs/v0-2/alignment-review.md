@@ -1,6 +1,6 @@
 # V0.2 Claude-Code-native Alignment Review
 
-> 配套 `docs/prd-v0-2.md` 的设计依据文档。基于 2026-05-07 五路并行 fork
+> 配套 `docs/v0-2/prd.md` 的设计依据文档。基于 2026-05-07 五路并行 fork
 > 研究(claude-code 设计模式 / ccteam 反模式 audit / plugin-marketplace
 > 机制 / hooks lifecycle 全集 / layered settings 加载)综合产出。
 >

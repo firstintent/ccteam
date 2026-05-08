@@ -164,7 +164,7 @@ fn synthesize_minimal_template(phase: &str) -> crate::phases::PhaseTemplate {
 /// `template`. This is the **single source of truth** for protocol-
 /// level directives (PHASE_DONE / ESCALATE / outbox / required IO);
 /// phase markdown bodies must contain only domain content. See
-/// `docs/phase-prompt-architecture.md` §5 for the segment list and
+/// `docs/v0-2/phase-prompt-architecture.md` §5 for the segment list and
 /// §8 invariants.
 ///
 /// `attachments` are project-relative paths to surface as `@<path>`

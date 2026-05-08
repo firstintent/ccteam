@@ -717,7 +717,7 @@ LLM 推理只发生在两处:① **L2 项目级 claude**(tmux 内) ② **L0 用�
 | `cost_overrun` / `phase_duration_overrun` | `<project>/.ccteam/state.json::cost_used_usd` / `last_progress_event_at` | 一直有 |
 | `daemon_down` | `~/.ccteam/state/orchestrator.heartbeat` mtime | M0.23.1 |
 
-**信号源选择**(详见 `docs/v0-2-claude-code-alignment-review.md` §3.3):
+**信号源选择**(详见 `docs/v0-2/alignment-review.md` §3.3):
 **不用 SessionEnd**——其 `exit_reason` 6 个枚举全是用户主动事件,stall 不触发。
 靠外部 timer + Stop hook L3 兜底就够了。
 
@@ -1378,7 +1378,7 @@ meta-agent ───────────►  CLI/factory ──────�
 - `crates/ccteam-core/src/templates/ccteam_team_author_skill.md` — meta-agent 用的 dialogue skill。
 - `crates/ccteam-cli/src/team_factory_cli.rs` — `ccteam team init` / `ccteam team publish` CLI 包装。
 - `crates/ccteam-cli/src/commands.rs` — `--validate-team` 加 plugin manifest 段。
-- `docs/team-factory-userguide.md` — 用户实操指引。
+- `docs/v0-2/team-factory-userguide.md` — 用户实操指引。
 
 V0.3 候选(本里程碑不做):
 - `userConfig` 工厂 emit(用户 enable plugin 时填表)

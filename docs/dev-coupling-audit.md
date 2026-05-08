@@ -37,14 +37,14 @@ P0 + 同 PR 关闭),分布:
 | **N/A 已是领域无关** | 2 | F14, F19(M3 docs sweep 后)|
 | **已修复** | 20 | F1 / F5 / F6 / F7 / F18(2026-05-07 rename PR;F1 触发逻辑实际早 M3.1 已切到 template.auto_loop,本 PR 完成命名层 sweep)、F2 / F3 / F4(M3.1 dag.rs)、F8(2026-05-07 directory scan)、F9 / F10 / F11(M3.4 team-aware bootstrap;F11 dev 仍裸 `phases/` 但非阻塞)、F12 / F13(M3.3 `--team` CLI + `state.team`)、F16(M3.4 phase 模板 team 化)、F20(M3.1+M3.4 retro_schema 数据形式 + product-research 填字段 + M4.1 phase 消费)、F21(@a5fb21d)、F22(PR #12)、**F24 / F25(2026-05-08 M0.23 PR)** |
 
-### V0.2 §6 反模式候选状态(prd-v0-2.md)
+### V0.2 §6 反模式候选状态(docs/v0-2/prd.md)
 
 PRD V0.2 §6 列了 8 条 ccteam-core 反模式候选清理任务,跟 F-finding
 独立编号但同源(都是"领域字面量泄漏到 core"):
 
 | 候选 | 描述 | 状态 |
 |---|---|---|
-| 1 + 8 | 协议关键字 `PHASE_DONE` / `ESCALATE` 三处镜像 → 单一 source | **2026-05-08 关闭(M0.18):inject prompt template + frontmatter `completion_signal` / `escalate_grammar_ref` 单一 source;phase markdown 正文清理协议关键词;`build_phase_prompt_for_template` 是唯一 protocol literal 拼装位置;详 `docs/phase-prompt-architecture.md`** |
+| 1 + 8 | 协议关键字 `PHASE_DONE` / `ESCALATE` 三处镜像 → 单一 source | **2026-05-08 关闭(M0.18):inject prompt template + frontmatter `completion_signal` / `escalate_grammar_ref` 单一 source;phase markdown 正文清理协议关键词;`build_phase_prompt_for_template` 是唯一 protocol literal 拼装位置;详 `docs/v0-2/phase-prompt-architecture.md`** |
 | 2 | `render_project_claude_md` `match team` 写死 | **2026-05-07 关闭(M0.16.3)** |
 | 3 | `TEAM_BUNDLES` 编译时常量 → seed-only | **2026-05-07 关闭(M0.16.2)** |
 | 5 | meta-agent `if team == META_TEAM_NAME` 5 处分叉 | **2026-05-07 关闭(M0.16.1)** |
@@ -501,7 +501,7 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
   `peek`/`progress`)不阻塞,`ls` 响应里附 `orchestrator.daemon_health` 让
   meta-agent 自决定要不要提示用户。详见 tech-design §6.8。
 - **优先级**:**P0**(用户报告"消息不送达")。
-- **来源**:`docs/dev-plan-v0-2.md §9` M0.23.1 + M0.23.3。
+- **来源**:`docs/v0-2/dev-plan.md §9` M0.23.1 + M0.23.3。
 
 ### F25 — 1M context 未默认启用,新项目 claude session 跑标准上下文(**已修复:M0.23.2**)
 
@@ -516,7 +516,7 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
   常量名 `DEFAULT_CLAUDE_MODEL` exported,后续升 model 改这一处。tests
   用 `claude_argv: vec!["sh", "-c", ...]` stub 不受影响。
 - **优先级**:**P0**(长跑直接撞 context 上限)。
-- **来源**:`docs/dev-plan-v0-2.md §9` M0.23.2 / `docs/prd-v0-2.md §7`。
+- **来源**:`docs/v0-2/dev-plan.md §9` M0.23.2 / `docs/v0-2/prd.md §7`。
 - **后续**:Claude 团队若推出更新 model 别名(eg `claude-sonnet-4-7[1m]`),
   改 `DEFAULT_CLAUDE_MODEL` 一处即可;CLI flag 形式保持稳定。
 
