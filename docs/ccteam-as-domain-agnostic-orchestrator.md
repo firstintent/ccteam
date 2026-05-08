@@ -1,7 +1,7 @@
 # ccteam 作为领域无关编排层
 
 > **实施状态(2026-05-06)**:本文档原是 M3 团队抽象的 charter。**M3 已落地**
-> (commit `0d88ddc` PR #7 + 后续 M3.x 子 PR ship,详见 `development-plan.md` §5)
+> (commit `0d88ddc` PR #7 + 后续 M3.x 子 PR ship,详见 `docs/v0-1/docs/v0-1/development-plan.md` §5)
 > ——`team.yaml` schema、`--team` CLI、phase DAG inference、product-research
 > 团队作为首个非 dev 团队都已 ship;关联 dev-coupling 审计 13/23 条已关闭(详见
 > `docs/dev-coupling-audit.md` 摘要表)。**M4 跨项目记忆**走官方 `~/.claude/rules/`
@@ -575,7 +575,7 @@ team 抽象只会让两件事都做不好。
 > **2026-05-05 reorder**:本文档原提案 "M4.5",但 ABC session 完成后审视发现:跨项
 > 目记忆(原 M3)和 Critic agent(原 M4)如果在团队抽象**之前**实施,retro_schema
 > 和 critic_dimensions 都会写死 dev 字段,后续 M4.5 落地时被迫推倒重来。**正确顺序
-> 是团队抽象**前置**,作为 M3。** `docs/development-plan.md` 已同步 reorder:
+> 是团队抽象**前置**,作为 M3。** `docs/v0-1/docs/v0-1/development-plan.md` 已同步 reorder:
 > M3=Team Abstraction、M4=记忆、M5=Critic、M6=Symphony。
 >
 > **2026-05-06 ship**:M3.1–M3.7 全部 ship(commits `5535cf4` / `c75e092` /
@@ -589,7 +589,7 @@ team 抽象只会让两件事都做不好。
 happy path,产出最终 verdict 报告;dev 团队的现有项目零迁移成本
 (`ccteam new "<brief>"` 默认 `--team=dev` 仍然工作)。
 
-任务清单详见 `docs/development-plan.md` §5(M3.1 ~ M3.7)。本文档不再重复维护任务
+任务清单详见 `docs/v0-1/docs/v0-1/development-plan.md` §5(M3.1 ~ M3.7)。本文档不再重复维护任务
 表,只做"为什么这么排"的论证。
 
 ### 6.2 为什么不更早?
@@ -759,13 +759,13 @@ prompt,而不是适配器代码。
 
 ---
 
-## 8. 与 CLAUDE.md / tech-design.md / development-plan.md 的关系
+## 8. 与 CLAUDE.md / tech-design.md / docs/v0-1/development-plan.md 的关系
 
 - **CLAUDE.md** §一"定位:ccteam 是 Claude Code 之上的元工具"是本文档的精神
   上游——把"meta-tool"再往上抽一层,得出"meta-tool of any AI team"。
 - **tech-design.md** 是 mechanism 的设计论证;本文档**不**改 mechanism,只
   把它们标"哪些是 mechanism、哪些是 dev fill"。
-- **development-plan.md** 是任务清单;本文档对应 §5 M3 — Team Abstraction(2026-05-05
+- **docs/v0-1/development-plan.md** 是任务清单;本文档对应 §5 M3 — Team Abstraction(2026-05-05
   reorder 后,从原提案 M4.5 前移至 M3,见 §6.1 注解)。任务粒度(M3.1 ~ M3.7)由
   development-plan 维护;M3 状态已标 ship。
 - **interfaces.md** 是协议字段表;本文档建议在 phase YAML schema 加

@@ -152,7 +152,7 @@ For the full design, see [`docs/tech-design.md`](docs/tech-design.md).
 
 The complete walkthrough — install, every doctor flag, dispatch a dev project end-to-end, dispatch a product-research project, intervene when stuck, decisions queue — is at:
 
-→ [`docs/user-quickstart-v0.1.md`](docs/user-quickstart-v0.1.md)
+→ [`docs/v0-1/user-quickstart.md`](docs/v0-1/user-quickstart.md)
 
 The user guide is **versioned**: when M5 ships, `v0.2` will appear without mutating v0.1.
 
@@ -160,11 +160,11 @@ The user guide is **versioned**: when M5 ships, `v0.2` will appear without mutat
 
 | Doc | Audience | Purpose |
 |---|---|---|
-| [`docs/user-quickstart-v0.1.md`](docs/user-quickstart-v0.1.md) | end users | hands-on walkthrough |
+| [`docs/v0-1/user-quickstart.md`](docs/v0-1/user-quickstart.md) | end users | hands-on walkthrough |
 | [`docs/requirements.md`](docs/requirements.md) | contributors | 13 user pain points (acceptance baseline) |
 | [`docs/tech-design.md`](docs/tech-design.md) | contributors | architecture, three-tier model, invariants |
 | [`docs/interfaces.md`](docs/interfaces.md) | contributors | protocol reference (state.json / phase YAML / events / CLI / MCP) |
-| [`docs/development-plan.md`](docs/development-plan.md) | contributors | milestone roadmap + dependency graph |
+| [`docs/v0-1/development-plan.md`](docs/v0-1/development-plan.md) | contributors | milestone roadmap + dependency graph |
 | [`docs/dev-coupling-audit.md`](docs/dev-coupling-audit.md) | contributors | dev-team coupling tracking (F1–F23) |
 | [`docs/ccteam-as-domain-agnostic-orchestrator.md`](docs/ccteam-as-domain-agnostic-orchestrator.md) | contributors | strategic case for team abstraction |
 | [`CLAUDE.md`](CLAUDE.md) | AI sessions | implementation rules + red lines (consumed by Claude Code in this repo) |
@@ -176,7 +176,7 @@ ccteam is itself developed using Claude Code under the worktree-per-task pattern
 1. Fork + clone
 2. `git worktree add -b feat/your-thing /tmp/ccteam-feature origin/main`
 3. Read [`CLAUDE.md`](CLAUDE.md) — it's the AI implementation guide and applies to humans equally
-4. Every PR maps to a pain point + a `tech-design.md` section + a `development-plan.md` task ID
+4. Every PR maps to a pain point + a `tech-design.md` section + a `docs/v0-1/development-plan.md` task ID
 5. `cargo test --workspace` must stay green; `cargo clippy --workspace --all-targets -- -D warnings` no new warnings
 6. Open a PR; the maintainer reviews
 

@@ -5,18 +5,18 @@
 
 ---
 
-## 一、当前状态(2026-05-06)
+## 一、当前状态(2026-05-08)
 
 | 项 | 值 |
 |---|---|
 | 仓库根 | `~/workplace/agents/ccteam` |
-| 主分支 main HEAD | `ae094bf`(post PR #12 F22 fix);**以 `git rev-parse origin/main` 为准** |
-| 测试 baseline | **369 全绿**(`cargo test --workspace`) |
+| 主分支 main HEAD | **以 `git rev-parse origin/main` 为准**(V0.2 ship 后 docs 整理) |
+| 测试 baseline | **497 全绿**(`cargo test --workspace`) |
 | Clippy | 4 pre-existing errors(非本仓引入,sweep 时确认相同基线) |
-| 代码规模 | ~6 kLOC across `ccteam-core` / `ccteam-cli` / `ccteam-hooks` |
-| 已 ship 里程碑 | M0(CLI MVP)、M0.5(工具触发面)、M1(meta-agent + decisions queue)、M2(sub-skill / phase YAML / `ccteam-mcp`)、M2.3 follow-up(golden_rules)、M3(team abstraction + product-research team)、**M4.1–M4.4(跨项目记忆 + F22 slug 前缀)** |
-| 当前 next | M4.5/M4.6(audit + voting,L2 升级)/ M5(Critic agent)— 看 `docs/development-plan.md` §6/§7 |
-| 已固化但 deferred | M2.2 agent_team enablement(spike A;Claude Code 当前版本无 first-class CLI surface — 见 `docs/m2-agent-team-spike.md`) |
+| 代码规模 | ~10 kLOC across `ccteam-core` / `ccteam-cli` / `ccteam-hooks` |
+| 已 ship 里程碑 | **V0.1**:M0 / M0.5 / M1 / M2 / M2.3 / M3 / M4.1-M4.4 — 详 `docs/v0-1/README.md`<br>**V0.2**:M0.16-M0.23(8 个 milestone:反模式清理 / 团队布局 + plugin 模型 / phase prompt 协议外移 / 自循环 + AskUserQuestion 拦截 / plugin pipeline / daemon supervision / watchdog / team factory)— 详 `docs/v0-2/README.md` |
+| 当前 next | V0.3 候选方向待定,deferred 项见 `docs/v0-2/README.md` 末尾 |
+| 永久 deferred | M2.2 agent_team enablement(spike A,Claude Code 无 first-class CLI surface — 见 `docs/v0-1/m2-agent-team-spike.md`)|
 
 **ccteam 是 Claude Code 之上的元工具,不是独立 AI 系统**:每个项目一个 Claude Code 长 session(tmux 守护,hooks 上报,MCP 接外部);Rust orchestrator 编排;用户通过 meta-agent(常驻 ccteam-managed claude session)+ `ccteam-control` skill / `ccteam-mcp` MCP 用自然语言对话操作。详见 `docs/tech-design.md` §2.1 三层架构。
 
@@ -26,18 +26,19 @@
 
 | # | 文档 | 何时读 |
 |---|---|---|
+| 0 | `docs/README.md` — 全局文档索引 + 维护规约 | 加 / 改 / 归档文档前 |
 | 1 | `docs/requirements.md` — 13 痛点 | 验收基准;PR 描述映射用 |
 | 2 | `docs/tech-design.md` — 架构 SoT | 改架构前必看;§3.7 Cross-project Memory / §3.8 用户接口层 / §6 扩展点 |
 | 3 | `docs/interfaces.md` — 协议参考 | 改 schema / CLI / MCP / hooks 时同步 |
-| 4 | `docs/development-plan.md` — 里程碑路线 | PR 描述映射任务编号 |
-| 5 | `docs/user-quickstart-v0.1.md` — 实操 walkthrough | 给用户看的;实操语义跟代码不一致就报 |
-| 6 | `docs/dev-coupling-audit.md` — F1–F23 解耦审计 | 改 `ccteam-core` 之前;新发现加 F<N> |
+| 4 | `docs/v0-2/README.md` — V0.2 文档入口 + V0.3 deferred 列表 | 当前最新版,V0.2 ship 状态 / V0.3 候选 |
+| 5 | `docs/v0-1/README.md` — V0.1 历史归档入口 | 看 V0.1 决策依据(M0-M4.4)|
+| 6 | `docs/dev-coupling-audit.md` — F-finding 解耦审计 | 改 `ccteam-core` 之前;新发现加 F<N> |
 | 7 | `docs/ccteam-as-domain-agnostic-orchestrator.md` — 团队泛化论证 | M5+ 加新 team / 改 `ccteam-core` 红线时 |
 | 8 | `docs/claude-code-best-practices.md` | 改 phase prompt / hooks / context 管理时 |
 | 9 | `docs/claude-code-tool-surface.md` | 改 phase YAML `tools_required` / sub-skill 时 |
 | 10 | `references/research/claude-code-memory-research.md` §六 | M4 任何记忆相关改动前 |
 
-> **session 起手 30 秒 onboarding**:`git rev-parse origin/main` 看 HEAD → `cargo test --workspace 2>&1 \| grep -E "^test result" \| awk '{p+=$4;f+=$6}END{print p,f}'` 看 baseline → 读 `docs/development-plan.md` §1 `M0–M4 状态总览` 知道你在哪一段 → 读用户的具体诉求 → 干。
+> **session 起手 30 秒 onboarding**:`git rev-parse origin/main` 看 HEAD → `cargo test --workspace 2>&1 \| grep -E "^test result" \| awk '{p+=$4;f+=$6}END{print p,f}'` 看 baseline → 读 `docs/v0-2/README.md` 看当前版状态 + V0.3 候选 → 读用户的具体诉求 → 干。
 
 ---
 
@@ -79,7 +80,7 @@
 1. **每个 PR 描述必须映射**:
    - `requirements.md` §二某条痛点(例:`痛点 4`)
    - `tech-design.md` 某章节(例:`tech-design §3.5`)
-   - `development-plan.md` 某条任务(例:`Closes M4.1`)/ `dev-coupling-audit.md` 某条 F-finding
+   - `docs/v0-1/development-plan.md` 某条任务(例:`Closes M4.1`)/ `dev-coupling-audit.md` 某条 F-finding
    - 改协议(YAML 字段、JSON shape、文件路径、CLI 签名)→ **必须同步 `interfaces.md`**
 2. **commit message 用英语**;文档与 phase prompt 用中文
 3. **不写 backwards-compat shim**;`ccteam-core` 不写废弃代码 stub;CLAUDE.md §五.3

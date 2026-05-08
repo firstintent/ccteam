@@ -230,7 +230,7 @@ unexpected interactions.
 
 - 痛点 10 — every project starts from zero
 - `docs/tech-design.md` §3.7 — Cross-project Memory architecture
-- `docs/development-plan.md` §6 — M4.1–M4.4 task table
+- `docs/v0-1/development-plan.md` §6 — M4.1–M4.4 task table
 - `references/research/claude-code-memory-research.md` §六 — M4 decision
   basis (rules + auto-memory + optional claude-mem MCP)
 - `crates/ccteam-core/src/memory_bridge.rs` — installer + tests

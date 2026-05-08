@@ -302,7 +302,7 @@ phase 协议的核心架构选择（论证留本节,字段细节看 interfaces�
 
 - **YAML front matter 是 orchestrator 的唯一解析入口**——`required_inputs` / `required_outputs` 给 L1 架构约束验证；`parallelism` / `agent_team` / `sub_skills` 给痛点 11/12/13 的实现层；`hooks` 给 phase 级生命周期。不解析 prompt body,prompt body 完全留给 claude。
 - **Seed 输出靠 YAML 决定走向（PASS/REJECT/CLARIFY），不依赖 LLM 自然语言判断**——orchestrator 只 parse front matter `verdict`，避免"AI 说话不算数"。
-- **`parallelism` 字段决定主框架并行粒度**(详见 §6.11):solo(已 ship,默认) / agent_team(永久 deferred,见 §6.3 模式 A 与 m2-agent-team-spike.md) / multi_session(未 ship,M4.8)。subagent **不在此声明**——任何 agent 都可 ad-hoc 通过 Task 工具启动,叠加在主框架之上。
+- **`parallelism` 字段决定主框架并行粒度**(详见 §6.11):solo(已 ship,默认) / agent_team(永久 deferred,见 §6.3 模式 A 与 docs/v0-1/m2-agent-team-spike.md) / multi_session(未 ship,M4.8)。subagent **不在此声明**——任何 agent 都可 ad-hoc 通过 Task 工具启动,叠加在主框架之上。
 
 ### 3.4 Workspace 隔离与并行
 
@@ -549,7 +549,7 @@ ccteam 全系统 6 类 claude 会出现的位置:
 | **L0.5 meta-agent session** | **是**(ccteam-managed 常驻 tmux + claude) | 常驻、永不 terminal | 已 ship(M1) |
 | **L1 编排层**(orchestrator daemon) | 不是(Rust) | 常驻 | ccteam start 后 |
 | **L2 项目级 claude**(每项目一个 tmux session) | 是 | 常驻(长 session,直到 ship/abort) | ccteam new 后 |
-| **L3 phase 内 agent team / subagent** | 是(Task 工具启动) | 短命(phase 内,跑完返回总结即销毁) | subagent 已 ship(M2);agent_team 永久 deferred(spike A,m2-agent-team-spike.md) |
+| **L3 phase 内 agent team / subagent** | 是(Task 工具启动) | 短命(phase 内,跑完返回总结即销毁) | subagent 已 ship(M2);agent_team 永久 deferred(spike A,docs/v0-1/m2-agent-team-spike.md) |
 | **L4 multi_session 子模块 claude** | 是(每子模块一个完整 session) | 常驻 | 未 ship(M4.8) |
 | **L5 横切短命 claude**(cost-watcher / scope-watcher / drift-detector) | 是 | 短命(Stop hook 触发,跑完即退) | 已 ship(M1) |
 
@@ -972,7 +972,7 @@ ccteam 用 multi-agent 编排同时承担两个不同目标——**质量**（�
 
 > **现状**:`parallelism: agent_team` 启用路径**永久 deferred**——
 > Claude Code 当前版本无 first-class CLI 表面让 phase prompt 内显式
-> 调度多 sub-agent 协作(详见 m2-agent-team-spike.md 决策记录)。
+> 调度多 sub-agent 协作(详见 docs/v0-1/m2-agent-team-spike.md 决策记录)。
 > 概念槽位保留在 phase front matter 与 §6.11 三档叠加体系中,但 ccteam
 > 不依赖此机制——phase 内"多角色议事"通过 ad-hoc subagent(Task 工具)
 > 与 cross-cutting watcher(模式 B)实现。
@@ -1389,22 +1389,28 @@ V0.3 候选(本里程碑不做):
 
 ## 7. 里程碑路线图
 
-详细任务、依赖、验收门、痛点反向映射、风险登记 → [development-plan.md](./development-plan.md)。本节仅给一句话索引：
+历史 milestone(V0.1 + V0.2)。每个版本的具体任务详情在该版本的 dev-plan
+文档,本节仅一句话索引：
 
-| 里程碑 | 主目标 | 状态 | 解锁的关键痛点 |
+| 里程碑 | 主目标 | 状态 | 详情 |
 |---|---|---|---|
-| **M0** | 单项目 CLI MVP——一句话需求自动产出能跑的代码 | 已 ship | 1, 2, 3, 4, 7, 8, 9 |
-| **M0.5** | 工具表面（plugin agent ln -sf / tools_required / doctor） | 已 ship | 9（强化） |
-| **M1** | meta-agent + decisions queue + inbox/outbox | 已 ship | 5, 9（强化） |
-| **M2** | sub-skill auto-trigger + ccteam-mcp 9 tools（M2.2 agent_team 永久 deferred） | 已 ship | 6, 3（强化），12 |
-| **M2.3** | golden_rules executor（L1 强化） | 已 ship | 3（强化），11 |
-| **M3** | team abstraction + product-research team | 已 ship | 13（产研维度） |
-| **M4.1–M4.4** | 跨项目记忆（官方 rules + auto-memory + 可选 claude-mem） | 已 ship | 10 |
-| **M4.5–M4.6** | 多 audit 投票 + anti-leniency | 未 ship | 3（深化），11 |
-| **M4.7–M4.9** | plugin auto-mount / multi_session / TUI | 未 ship | 12（深化），13（深化） |
-| **M5** | Critic Agent 深化 + 大型软件长跑（对标 Symphony） | 未 ship | 长期 |
+| **M0** | 单项目 CLI MVP | 已 ship | [docs/v0-1/development-plan.md](./v0-1/development-plan.md) |
+| **M0.5** | 工具表面 | 已 ship | 同上 |
+| **M1** | meta-agent + decisions queue + inbox/outbox | 已 ship | 同上 |
+| **M2** | sub-skill auto-trigger + ccteam-mcp 9 tools | 已 ship(M2.2 agent_team 永久 deferred,见 [m2-agent-team-spike](./v0-1/m2-agent-team-spike.md))| 同上 |
+| **M2.3** | golden_rules executor(L1 强化) | 已 ship | 同上 |
+| **M3** | team abstraction + product-research team | 已 ship | 同上 |
+| **M4.1-M4.4** | 跨项目记忆(官方 rules + auto-memory + 可选 claude-mem) | 已 ship | 同上 |
+| **M0.16-M0.23** | V0.2 全部 8 milestone | 已 ship | [docs/v0-2/dev-plan.md](./v0-2/dev-plan.md) |
+| **M4.5-M4.6** | 多 audit 投票 + anti-leniency | 未 ship | (未规划到具体版本)|
+| **M4.7-M4.9** | plugin auto-mount / multi_session / TUI | 未 ship | (未规划到具体版本)|
+| **M5** | Critic Agent 深化 + 大型软件长跑(对标 Symphony) | 未 ship | V0.3+ 候选,见 [docs/v0-2/README.md V0.3 deferred](./v0-2/README.md) |
 
-**任何里程碑修改优先改 development-plan.md**——本节只作目录索引，不维护具体任务。里程碑推进准则在 development-plan.md §1 与 §10 维护。
+**版本化文档维护**:每发布一个版本,该版本所有规划文档(PRD / dev-plan /
+design / retro / userguide)归档到 `docs/v<major>-<minor>/`,通过该目录的
+README.md 索引;**根目录只保留跨版本 SoT**(本文件 / interfaces / requirements /
+dev-coupling-audit / claude-code-* / 战略文档)。当前版本的 in-flight 任务
+单列在该版本 dev-plan,不再维护"全局 development-plan"。
 
 ---
 
@@ -1476,13 +1482,13 @@ V0.3 候选(本里程碑不做):
 
 - `requirements.md` 回答 **为什么做** 与 **谁会用**——已确认。
 - 本文档 `tech-design.md` 回答 **怎么做**——架构论证、设计权衡、扩展点选择。
-- [`development-plan.md`](./development-plan.md) 回答 **何时做什么**——里程碑细化到任务级,含痛点反向映射、依赖图、验收门、风险登记。
+- [`docs/v0-1/docs/v0-1/development-plan.md`](./v0-1/development-plan.md) 回答 **何时做什么**——里程碑细化到任务级,含痛点反向映射、依赖图、验收门、风险登记。
 - [`interfaces.md`](./interfaces.md) 回答 **接口确切长什么样**——YAML schema、JSON shape、文件路径、事件类型、命令签名。
 
 所有实现 PR 必须能映射回:
 1. `requirements.md` 的某条痛点
 2. 本文档某个组件 / phase / 流程
-3. `development-plan.md` 某条任务编号
+3. `docs/v0-1/docs/v0-1/development-plan.md` 某条任务编号
 4. (改协议时) `interfaces.md` 必须同步
 
 无法映射的,先放进 backlog 而非合入主线。

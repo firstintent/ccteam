@@ -7,7 +7,7 @@
 
 ## 1. 背景
 
-V0.1 实测(`docs/user-quickstart-v0.1.md` 跑下来)暴露的核心痛点:**项目 session
+V0.1 实测(`docs/v0-1/user-quickstart.md` 跑下来)暴露的核心痛点:**项目 session
 "卡住"时编排层无法感知 / 无法兜底**。具体场景:
 
 - 项目 session 输出一段问题,等用户决策 → 用户没在线 → 永远挂起

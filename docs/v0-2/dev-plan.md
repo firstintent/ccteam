@@ -8,8 +8,8 @@
 > - 设计依据:`docs/v0-2/alignment-review.md`
 > - 子设计:`docs/v0-2/phase-prompt-architecture.md`
 >
-> CLAUDE.md 约定:**`development-plan.md` 只追当前 in-flight 任务**;V0.2 进入
-> in-flight 时,`development-plan.md` reference 本文档,不复制。
+> CLAUDE.md 约定:**`docs/v0-1/development-plan.md` 只追当前 in-flight 任务**;V0.2 进入
+> in-flight 时,`docs/v0-1/development-plan.md` reference 本文档,不复制。
 
 ---
 

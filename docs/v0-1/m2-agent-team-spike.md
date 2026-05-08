@@ -1,6 +1,6 @@
 # M2.2.0 Agent Team 兼容性 spike 报告
 
-> 触发任务:`docs/development-plan.md` §4 M2.2 子任务 M2.2.0(0.5 天硬上限)
+> 触发任务:`docs/v0-1/development-plan.md` §4 M2.2 子任务 M2.2.0(0.5 天硬上限)
 >
 > 目的:验证 `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` 在 Claude Code 当前
 > 版本下是否仍触发 Agent Teams 实验功能(Lead + 多角色并行子 agent)。

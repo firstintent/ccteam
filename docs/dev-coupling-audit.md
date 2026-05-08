@@ -408,7 +408,7 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
 ### F20 — 跨项目记忆 schema 假设 dev 字段(**已修复:M3.1 retro_schema 数据形式 + M3.4 product-research 填字段 + 09-ship.md / 06-verdict.md 消费 schema**)
 
 - **文件:行号**:`docs/tech-design.md §3.7` "关键字段:tech stack、踩过的坑、
-  成功的设计选择、不要再做的事";`docs/development-plan.md §5 M3.1` "输出固
+  成功的设计选择、不要再做的事";`docs/v0-1/development-plan.md §5 M3.1` "输出固
   定字段(tech stack/坑/成功设计/不要再做)"
 - **现状**:M3 retro pattern 字段全是 dev 视角。
 - **是否真 dev-specific**:**是。** research 项目的 retro 字段不同(方法学 /
@@ -422,7 +422,7 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
 
 > **2026-05-05 升级注解**:原标 P1。ABC session 完成后用户审视发现:跨项目记
 > 忆(原 M3)在团队抽象(原 M4.5)之前实施时,retro 字段写死成 dev 字段会让
-> 后续跨项目 lessons 字段重写。`development-plan.md` 已 reorder M3 ↔ M4(团队抽象前
+> 后续跨项目 lessons 字段重写。`docs/v0-1/development-plan.md` 已 reorder M3 ↔ M4(团队抽象前
 > 置),F20 现在阻塞新 M4 启动 —— 升级为 P0。
 >
 > **2026-05-06 状态更新**:M3.1 / M3.2 已 ship `retro_schema` 数据形式 +
@@ -473,7 +473,7 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
   M4.4 spike report §3 改 closed,§4 deferred check 解锁
 - **migration**:历史项目目录(F22 前创建)保留原名;orchestrator 通过 state.json
   `team` 字段识别身份,目录名只是路径方便。新建项目走新规则。
-- **来源**:`docs/m4-spike-2026-05-06.md` §3
+- **来源**:`docs/v0-1/m4-spike.md` §3
 
 ### F23 — 容器 bind-mount `~/.claude/rules/` 待 M4.4 spike §4 重跑后定夺(2026-05-06 加)
 
@@ -484,9 +484,9 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
 - **是否真 dev-specific**:**否——是基础设施层。**
 - **解耦方案**(若 spike 失败):doctor 加 `--bind-mount-claude-rules`
   子模式(往容器配置追加只读 mount),sketch 见
-  `docs/m4-spike-2026-05-06.md` §4
+  `docs/v0-1/m4-spike.md` §4
 - **优先级**:**P1 conditional**——F22 修完后跑 spike;失败才升 P0
-- **来源**:`docs/m4-spike-2026-05-06.md` §4
+- **来源**:`docs/v0-1/m4-spike.md` §4
 
 ### F24 — orchestrator daemon 死亡时 MCP 默认 ack 静默成功(**已修复:M0.23.1**)
 
