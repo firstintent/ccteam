@@ -1333,6 +1333,58 @@ multi_session 项目内每个 sub-session 仍可独立选 `parallelism: agent_te
 - **子模块接口契约的形式化验证** = M5（M4.8 仅靠 review phase 跑测试 + 人审 contracts.md 满足度）
 - **跨子模块的 stop-the-world 重构** = M5（impl 中发现 contract 错时只能 escalate）
 
+### 6.12 Team factory(V0.2 M0.22 — 用户自定义 team 落地为 plugin)
+
+源自 PRD §4 + alignment-review §2。**复用 Claude Code plugin 格式,不发明 ccteam 私有打包**。
+
+#### 三阶段流水线
+
+```text
+            interview                 init                  publish
+meta-agent ───────────►  CLI/factory ───────►  staging ──────────────►  marketplace / GitHub
+  (skill)                              ~/.config/ccteam/teams/<name>/
+```
+
+1. **Interview** — 元 agent 跑 `ccteam-team-author` skill,跟用户对话收集 metadata(name / description / author)+ phase 列表 + tools + golden_rules + retro_schema + verdict_schema。一次一题,默认值能用就用。
+2. **Init** — `ccteam team init <name>` 落 staging 树到 `~/.config/ccteam/teams/<name>/`,内含:
+   - `.claude-plugin/plugin.json`(Claude Code plugin manifest 严格 schema:`name` / `description` / `author`)
+   - `team.yaml`(ccteam team 配置,作为 plugin 顶级 unknown 字段;zod 默认 strip,plugin pipeline 加载时忽略)
+   - `phases/<NN>-<phase>.md`(frontmatter + 正文领域模板;**正文不写 `PHASE_DONE:` / `ESCALATE:`**——M0.18 D 方案,协议关键字仅由 orchestrator inject prompt 注入)
+   - `README.md`
+3. **Publish** — `ccteam team publish <name> --target {local|github}`:
+   - `local`:软链 staging 到 `~/.claude/plugins/marketplaces/ccteam-local/plugins/<name>/`,产出 directory-source 标识 `<name>@ccteam-local`(用户 `claude /plugin enable` 启用)
+   - `github`:`gh repo create` + push,产出 GitHub URL(用户 `claude /plugin add <owner>/<repo>` 拉取)
+
+#### 关键设计决策
+
+- **不在 ccteam 自营 marketplace 注册中心**(alignment-review §2.3):用 Claude Code 已有的 `directory` source 作 `ccteam-local`,远程走 `gh repo` + `github` source。
+- **`team.yaml` 不走 plugin `settings` 注入**(alignment-review §2.7):plugin loader 只 allowlist `agent` key,其他 strip。改作 plugin 根目录顶级 unknown 文件,ccteam 自己读(`team_resolver`)。
+- **plugin manifest schema 借鉴 `claude-plugins-official`**:观察 `~/.claude/plugins/marketplaces/claude-plugins-official/plugins/*/.claude-plugin/plugin.json` 实例,所有都只用 `name` / `description` / `author { name, email? }` + 偶有 `version`。`PluginManifest` struct 严格 serialize 这四个字段,反序列化 lenient(unknown 字段忽略,符合 zod default strip)。
+- **`enabledPlugins` 复用 M0.20 已 ship pipeline**:工厂产物的 `team.yaml` 声明依赖,`bootstrap_project` 写 `<project>/.claude/settings.json` 时由 `plugin_resolution` 推断。工厂自身不直接管理 plugin pipeline。
+- **doctor `--validate-team` 二档验证**(M0.22.4):
+  1. 已 ship 的 phase IO 契约 + frontmatter 校验(M0.18.5)
+  2. 新增 plugin manifest schema + name 一致性校验(M0.22.4),仅当 staging 树存在时触发
+
+#### 红线
+
+- ccteam-core 不出现 team 名字面量(M0.16 基线)— 工厂代码也不许;团队特定行为靠用户写的 `team.yaml`。
+- 工厂产物 phase markdown 正文不许写 `PHASE_DONE: <name>` / `ESCALATE: <prefix>` 关键字(M0.18 D 方案)。
+- 不 vendor `claude-plugins-official` — 工厂模板可写 `tools_required.subagents: [code-reviewer]` 引用 plugin agent,**不**把 plugin source 拷到工厂产物。
+- `--target github` 用户未 `gh auth login` → fail-loud,不试图绕过;不嵌入凭证。
+
+#### 实现位置
+
+- `crates/ccteam-core/src/team_factory.rs` — `init_team_staging` / `publish_team` / `validate_staged_team` 主路径;`PluginManifest` / `PhaseScaffold` / `PublishTarget` 数据类型。
+- `crates/ccteam-core/src/templates/ccteam_team_author_skill.md` — meta-agent 用的 dialogue skill。
+- `crates/ccteam-cli/src/team_factory_cli.rs` — `ccteam team init` / `ccteam team publish` CLI 包装。
+- `crates/ccteam-cli/src/commands.rs` — `--validate-team` 加 plugin manifest 段。
+- `docs/team-factory-userguide.md` — 用户实操指引。
+
+V0.3 候选(本里程碑不做):
+- `userConfig` 工厂 emit(用户 enable plugin 时填表)
+- `dependencies`(team-plugin 间依赖,eg 引用 `code-reviewer` plugin)
+- 多 phase 一次性 init(当前 V0.2 单 phase 起步,多 phase 走 skill 多轮 init)
+
 ---
 
 ## 7. 里程碑路线图

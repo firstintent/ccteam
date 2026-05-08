@@ -16,8 +16,18 @@ use crate::tool_surface::user_claude_dir;
 /// inside `~/.claude/skills/`.
 pub const CCTEAM_CONTROL_SKILL_NAME: &str = "ccteam-control";
 
+/// V0.2 M0.22.1 — `ccteam-team-author` skill name. Walks the
+/// meta-agent through the team-factory dialogue (phase list, tools,
+/// golden rules, retro / verdict schema, plugin metadata) before
+/// invoking `ccteam team init`.
+pub const CCTEAM_TEAM_AUTHOR_SKILL_NAME: &str = "ccteam-team-author";
+
 /// Embedded `SKILL.md` body. Written verbatim during install.
 const CCTEAM_CONTROL_SKILL_MD: &str = include_str!("templates/ccteam_control_skill.md");
+
+/// Embedded `SKILL.md` body for the team-author skill (V0.2 M0.22.1).
+const CCTEAM_TEAM_AUTHOR_SKILL_MD: &str =
+    include_str!("templates/ccteam_team_author_skill.md");
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct InstallSkillOptions {
@@ -48,12 +58,42 @@ pub fn install_ccteam_control_skill(opts: InstallSkillOptions) -> Result<Install
     install_into(&claude, opts)
 }
 
+/// V0.2 M0.22.1: install the `ccteam-team-author` skill into
+/// `~/.claude/skills/ccteam-team-author/SKILL.md`. Same idempotent
+/// semantics as `install_ccteam_control_skill`.
+pub fn install_ccteam_team_author_skill(
+    opts: InstallSkillOptions,
+) -> Result<InstallSkillReport> {
+    let claude = user_claude_dir().context("resolve ~/.claude/")?;
+    install_skill_body_into(
+        &claude,
+        CCTEAM_TEAM_AUTHOR_SKILL_NAME,
+        CCTEAM_TEAM_AUTHOR_SKILL_MD,
+        opts,
+    )
+}
+
 /// Test-injectable variant: write into `<claude_dir>/skills/...` so unit
 /// tests can point at a tempdir without mutating `$HOME/.claude/`.
 pub fn install_into(claude_dir: &Path, opts: InstallSkillOptions) -> Result<InstallSkillReport> {
-    let dir = claude_dir
-        .join("skills")
-        .join(CCTEAM_CONTROL_SKILL_NAME);
+    install_skill_body_into(
+        claude_dir,
+        CCTEAM_CONTROL_SKILL_NAME,
+        CCTEAM_CONTROL_SKILL_MD,
+        opts,
+    )
+}
+
+/// Shared idempotent writer used by both install_into (control) and
+/// the team-author install path. Skill name selects the `<claude_dir>/skills/<name>/`
+/// directory; body is the verbatim SKILL.md contents.
+pub fn install_skill_body_into(
+    claude_dir: &Path,
+    skill_name: &str,
+    body: &str,
+    opts: InstallSkillOptions,
+) -> Result<InstallSkillReport> {
+    let dir = claude_dir.join("skills").join(skill_name);
     let target = dir.join("SKILL.md");
     let exists = target.exists();
 
@@ -75,7 +115,7 @@ pub fn install_into(claude_dir: &Path, opts: InstallSkillOptions) -> Result<Inst
 
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("create {}", dir.display()))?;
-    std::fs::write(&target, CCTEAM_CONTROL_SKILL_MD)
+    std::fs::write(&target, body)
         .with_context(|| format!("write {}", target.display()))?;
     Ok(InstallSkillReport {
         target,
@@ -140,5 +180,44 @@ mod tests {
             SkillInstallAction::DryRun { would_write: true },
         );
         assert!(!r.target.exists());
+    }
+
+    // ---------------- V0.2 M0.22.1 team-author skill ----------------
+
+    #[test]
+    fn team_author_skill_installs_under_ccteam_team_author_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let report = install_skill_body_into(
+            tmp.path(),
+            CCTEAM_TEAM_AUTHOR_SKILL_NAME,
+            CCTEAM_TEAM_AUTHOR_SKILL_MD,
+            InstallSkillOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(report.action, SkillInstallAction::Wrote);
+        let body = std::fs::read_to_string(&report.target).unwrap();
+        assert!(body.starts_with("---\n"));
+        assert!(body.contains("name: ccteam-team-author"));
+        assert!(body.contains("Capability index"));
+    }
+
+    #[test]
+    fn team_author_skill_install_is_idempotent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        install_skill_body_into(
+            tmp.path(),
+            CCTEAM_TEAM_AUTHOR_SKILL_NAME,
+            CCTEAM_TEAM_AUTHOR_SKILL_MD,
+            InstallSkillOptions::default(),
+        )
+        .unwrap();
+        let r2 = install_skill_body_into(
+            tmp.path(),
+            CCTEAM_TEAM_AUTHOR_SKILL_NAME,
+            CCTEAM_TEAM_AUTHOR_SKILL_MD,
+            InstallSkillOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(r2.action, SkillInstallAction::AlreadyPresent);
     }
 }

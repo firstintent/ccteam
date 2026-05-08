@@ -21,6 +21,7 @@ pub mod stall;
 pub mod state;
 pub mod subskill;
 pub mod team;
+pub mod team_factory;
 pub mod team_resolver;
 pub mod templates;
 pub mod tmux;
@@ -47,9 +48,10 @@ pub use memory_bridge::{
     InstallMemoryBridgeOptions, MemoryBridgeAction, MemoryBridgeReport,
 };
 pub use skill::{
-    install_ccteam_control_skill, install_into as install_skill_into,
+    install_ccteam_control_skill, install_ccteam_team_author_skill,
+    install_into as install_skill_into, install_skill_body_into,
     InstallSkillOptions, InstallSkillReport, SkillInstallAction,
-    CCTEAM_CONTROL_SKILL_NAME,
+    CCTEAM_CONTROL_SKILL_NAME, CCTEAM_TEAM_AUTHOR_SKILL_NAME,
 };
 pub use orchestrator::MAX_CONCURRENT_PROJECTS;
 pub use orchestrator::{
@@ -83,6 +85,11 @@ pub use team::{
     CostPolicy, CriticDimensionSpec, CriticStrictness, DomainRule, EscalateGrammarExtension,
     EscalateRoute, GoldenRuleEnforcement, ProtocolRule, RetroFieldKind, RetroFieldSpec,
     TeamGoldenRules, TeamSpec,
+};
+pub use team_factory::{
+    init_team_staging, publish_team, staging_dir_for, validate_staged_team, InitReport,
+    PhaseScaffold, PluginAuthor, PluginManifest, PublishInput, PublishReport, PublishTarget,
+    TeamInitInput,
 };
 pub use team_resolver::{
     default_user_staging_dir, discover_team_names, resolve_team, save_team, TeamResolveContext,

@@ -725,6 +725,74 @@ claude_md_template: |
 `EscalateGrammarExtension` / `EscalateRoute`),通过 `ccteam_core::TeamSpec::load(path)`
 暴露。orchestrator 启动期扫描 + 加载在 `Orchestrator::new`(`load_team_runtimes`)。
 
+#### 5.5.1 Plugin manifest 兼容字段(V0.2 M0.22 team factory)
+
+工厂产物的 staging 树 (`~/.config/ccteam/teams/<name>/`) 是合法的
+**Claude Code plugin**,顶层布局:
+
+```text
+<staging>/
+  .claude-plugin/
+    plugin.json                       # Claude Code plugin manifest(严格 schema)
+  team.yaml                           # ccteam team 配置(plugin loader unknown,zod strip)
+  phases/
+    01-<phase>.md                     # 同 §5.1 frontmatter
+    ...
+  README.md
+  agents/      (可选,plugin 自带 subagent)
+  commands/    (可选)
+  skills/      (可选)
+  hooks/hooks.json   (可选)
+  .mcp.json    (可选,plugin 自带 MCP server)
+```
+
+`plugin.json` 字段集(借鉴 `~/.claude/plugins/marketplaces/claude-plugins-official/`
+所有实例的实际 schema):
+
+```json
+{
+  "name": "my-team",
+  "description": "Custom marketing-research team",
+  "author": {
+    "name": "Alice",
+    "email": "alice@example.com"
+  },
+  "version": "0.1.0"
+}
+```
+
+- **`name`** 必填,ascii lower / digit / `-` / `_`(与 `team.yaml.name`
+  一致;工厂在 `init_team_staging` 强制 lock-step)。doubles as plugin
+  目录名。
+- **`description`** 必填非空,一行。
+- **`author.name`** 必填非空。**`author.email`** 可选。
+- **`version`** 可选(`claude-plugins-official/explanatory-output-style`
+  ship,其他不 ship)。
+
+**ccteam 不写 plugin loader 的额外字段**(`hooks` / `mcpServers` /
+`enabledPlugins` / `userConfig` / `dependencies`)。这些是 Claude
+Code plugin 标准,工厂产物在需要时手工补齐(V0.2 不自动 emit;
+V0.3 candidate)。
+
+**`team.yaml` 在 plugin 根目录的去向**:Claude Code plugin loader
+读 `.claude-plugin/plugin.json` 时按 zod schema 校,unknown 顶级文件
+被忽略(默认 strip,见 `docs/v0-2-claude-code-alignment-review.md`
+§2.7)。`team.yaml` 不会污染 plugin 加载,ccteam 通过
+`team_resolver::resolve_team` 直接读。
+
+**校验**(`ccteam doctor --validate-team <name>`,M0.22.4 在 M0.18.5
+基础上扩展):
+1. `.claude-plugin/plugin.json` 解析 + `PluginManifest::validate`
+   (name / description / author.name 非空,name 字符集合法)
+2. `team.yaml` 解析 + `TeamSpec::validate`(同 §5.5)
+3. **`plugin.json.name` 必须等于 `team.yaml.name`** — 工厂强制
+   lock-step;手工编辑漂移 → `[FAIL]`
+
+**实现位置**:`crates/ccteam-core/src/team_factory.rs`(`PluginManifest` /
+`PluginAuthor` / `init_team_staging` / `validate_staged_team` /
+`publish_team`)。CLI 入口在 `crates/ccteam-cli/src/team_factory_cli.rs`
+`ccteam team {init,publish}`。
+
 ---
 
 ### 5.6 `decision_mode` 与 `max_clarify_rounds` 语义(M2.3+)
