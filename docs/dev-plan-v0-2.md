@@ -281,34 +281,42 @@ M0.16 (foundation)
 
 ### 任务
 
-- [ ] **M0.21.1** meta-agent role prompt 升级
-  - `crates/ccteam-core/src/templates/meta_agent_role.md` 加 watchdog 部分
-  - 描述 watchdog 角色边界(不做技术决策,只做 UX 翻译)
-  - 列周期任务:扫所有项目 progress.jsonl summary,做 UX 判断
-- [ ] **M0.21.2** Watchdog 数据源
-  - 信号 1:`needs_attention.outbox.json`(M0.19 Stop hook 兜底产出)
-  - 信号 2:`progress.jsonl` 里 `auto_loop_cycle` 事件 ≥ 2 次
-  - 信号 3:phase 当前 cost / 时长超阈值(已有)
-  - 信号 4:orchestrator daemon health check 失败(M0.23)
-- [ ] **M0.21.3** 通知阈值配置
+- [x] **M0.21.1** meta-agent role prompt 升级
+  - `crates/ccteam-core/src/templates/meta_agent_role.md` 加 watchdog 部分(§7)
+  - 描述 watchdog 角色边界(translation only,不做技术决策)
+  - 列周期任务:`ccteam watchdog scan` + 优先级处理顺序
+- [x] **M0.21.2** Watchdog 数据源
+  - 信号 1:`needs_attention.outbox.json`(M0.19 Stop hook L3 兜底)
+  - 信号 2:`<project>/.ccteam/auto-loop.state.md::iteration`(直接读 state 文件,
+    dev-plan 原写"`progress.jsonl` 里 `auto_loop_cycle` 事件",代码里没这事件;
+    `iteration` 字段是同语义的更直接来源)
+  - 信号 3:phase 当前 cost / 时长超阈值(state.json 字段)
+  - 信号 4:orchestrator daemon heartbeat stale(M0.23.1 已 ship)
+- [x] **M0.21.3** 通知阈值配置
   - `~/.ccteam/watchdog.yaml`(新)— 用户级配置
-  - 字段:`notify_on_cycle_count: u32`(默认 cap-1=2)/ `notify_on_phase_cost_usd: Option<f64>` / `notify_on_phase_duration_min: Option<u32>` / `notify_mode: quiet|normal|verbose`
-- [ ] **M0.21.4** Watchdog 通知机制
-  - meta-agent 通过 outbox(meta-agent 自己的 outbox)推通知
-  - 现有 channel layer(M2+ 未 ship)不依赖,V0.2 仅在 meta-agent session attach 时显示
+  - 字段:`notify_on_cycle_count` / `notify_on_phase_cost_usd` / `notify_on_phase_duration_min` / `notify_mode`
+- [x] **M0.21.4** Watchdog 通知机制
+  - meta-agent 通过自己的 outbox(`~/projects/<handle>-meta/.ccteam/outbox/`)
+    收 alert(`escalation` priority=high / `progress` priority=normal)
+  - V0.2:**手动**触发(meta-agent 跑 `ccteam watchdog scan --push --user <handle>`);
+    M2+ channel layer 上线后才有 cron-style 自动 timer
 
 ### 验收
 
-- [ ] e2e:phase auto_loop cycle 第 2 次时,meta-agent surface 一条用户可读通知
-- [ ] e2e:用户改 `~/.ccteam/watchdog.yaml` `notify_mode: quiet` → 通知不再 surface
-- [ ] watchdog 不改任何 orchestrator 行为(grep `crates/ccteam-core/src/orchestrator.rs` 不调 watchdog)
-- [ ] 369 baseline + ~10 新测试
+- [x] e2e:auto-loop iteration ≥ 2 时 surface NL 通知 + 写 outbox
+  (`crates/ccteam-core/tests/watchdog_e2e_test.rs::auto_loop_iteration_2_surfaces_alert_then_pushes_to_meta_outbox`)
+- [x] e2e:`notify_mode: quiet` 静默 cycle 但 `daemon_down` / `cost_overrun` 仍 surface
+  (`crates/ccteam-core/tests/watchdog_e2e_test.rs::quiet_mode_drops_cycle_alert_but_pushes_daemon_down_when_heartbeat_missing`)
+- [x] watchdog 不改任何 orchestrator 行为(grep `crates/ccteam-core/src/orchestrator.rs` `watchdog` = 0)
+  (额外:`watchdog_does_not_mutate_state_or_progress_jsonl` 验 state.json mtime / progress 计数不变)
+- [x] 451 baseline + 21 新测试 = 472(原估 ~10,实际拆得更细;含 lib + e2e + cli)
 
 ### 文档同步
 
-- `docs/tech-design.md` 加 §3.X watchdog 章节
-- `docs/interfaces.md` 加 `watchdog.yaml` schema
-- 加新红线到 tech-design:**smart layer 只做 translation 不做 decision**
+- [x] `docs/tech-design.md` §3.9 watchdog 章节
+- [x] `docs/tech-design.md` §1 设计原则表加 "smart layer 只做 translation 不做 decision" 红线
+- [x] `docs/interfaces.md` §12.5 `watchdog.yaml` schema + alert 输出契约
+- [x] `docs/interfaces.md` §10.5 + §13 文件路径表 加 `ccteam watchdog scan` / `~/.ccteam/watchdog.yaml`
 
 ---
 

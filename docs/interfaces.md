@@ -1216,6 +1216,9 @@ ccteam resume <slug>                   # 恢复自动调度(接管 attach 后的
 ccteam answer <slug> "回答内容"          # 响应 clarify
 ccteam decisions                       # M1 收尾增量:跨项目决策队列(扫 outbox event_kind: clarify|escalation)
 ccteam decisions --format json         # JSON 输出(meta-agent 主消费;详见 §5.6.4)
+ccteam watchdog scan                   # V0.2 M0.21 translation-only 健康巡检(详见 §12.5)
+ccteam watchdog scan --format json     # 结构化输出(meta-agent 主消费)
+ccteam watchdog scan --push --user <handle>  # 把 alert 写进 meta-agent outbox
 ccteam fork-reply <slug> A             # L3 fork 决策(M1+;A/B/C)
 ccteam fork-reply <slug> B "去掉云同步"  # tweak
 ccteam kick <slug>                     # 软重启项目 session(claude --resume)
@@ -1380,11 +1383,78 @@ orchestrator 识别 `state.team == "meta-agent"` 走 `process_meta_project` 分�
 
 ---
 
+## 12.5 Watchdog `watchdog.yaml` schema(V0.2 M0.21)
+
+> **架构沿革**:V0.2 把"低层信号 → meta-agent NL 通知"独立成 watchdog
+> 角色(tech-design §3.9)。watchdog 是 **translation only** 层:读 4 个数据源
+> + 用户阈值 → 产出 NL alert 写 meta-agent 自己的 outbox。**不动 orchestrator
+> 状态**(零写入 progress.jsonl / state.json / control / inbox)。
+
+### 12.5.1 文件位置
+
+`~/.ccteam/watchdog.yaml`(用户级,全局生效)。文件不存在 ⇒ 全字段走默认。
+解析失败 ⇒ fail-loud(用户配置坏不静默回 default)。
+
+### 12.5.2 字段
+
+| 字段 | 类型 | 默认 | 含义 |
+|---|---|---|---|
+| `notify_on_cycle_count` | `u32` | `2` | `<project>/.ccteam/auto-loop.state.md::iteration` 达到此值即 alert(默认 = 通常 cap 3 - 1) |
+| `notify_on_phase_cost_usd` | `Option<f64>` | `None` | `state.json::cost_used_usd` 超此 USD 数即 alert;`None` ⇒ 不报 cost |
+| `notify_on_phase_duration_min` | `Option<u32>` | `None` | 当前 phase 距 `last_progress_event_at` 超此分钟即 alert;`None` ⇒ 不报 |
+| `notify_mode` | `quiet \| normal \| verbose` | `normal` | 见 §12.5.3 |
+
+### 12.5.3 `notify_mode` 语义
+
+- `quiet` — 仅放行 `cost_overrun` + `daemon_down`(钱 / 守护死必报);静默
+  `auto_loop_cycle` / `phase_duration_overrun` / `needs_attention`
+- `normal` — 默认;每个 alert kind 每次扫描发一次
+- `verbose` — 同 `normal` + 不去重 `needs_attention`(用于 debug,不推荐生产)
+
+### 12.5.4 Alert 输出契约
+
+`ccteam watchdog scan --format json` 输出 schema:
+
+```json
+{
+  "alerts": [
+    {
+      "kind": "needs_attention | auto_loop_cycle | cost_overrun | phase_duration_overrun | daemon_down",
+      "slug": "<team>-<slug> | null",
+      "message": "human-readable NL",
+      "emitted_at": "RFC3339",
+      "details": { "/* alert-kind specific */": "..." }
+    }
+  ],
+  "config": { /* echoed WatchdogConfig */ }
+}
+```
+
+`--push --user <handle>` 时,每条 alert 还原成 `<project>/<handle>-meta/.ccteam/outbox/reply-<ts>-<NNN>.md`(§3.4.3 outbox schema):
+
+| Alert kind | `event_kind` | `priority` |
+|---|---|---|
+| `daemon_down` / `cost_overrun` / `needs_attention` | `escalation` | `high` |
+| `auto_loop_cycle` / `phase_duration_overrun` | `progress` | `normal` |
+
+### 12.5.5 调用约束(translation only)
+
+- watchdog 读以下文件;**不写**它们任意一个:
+  - `~/.ccteam/state/orchestrator.heartbeat`(只 stat mtime)
+  - `<project>/.ccteam/state.json`
+  - `<project>/.ccteam/auto-loop.state.md`
+  - `<project>/.ccteam/needs_attention.outbox.json`
+- watchdog 唯一**写**目标:`~/projects/<handle>-meta/.ccteam/outbox/reply-*.md`
+- `ccteam-core::orchestrator` 模块 grep `watchdog` 必为 **0 次**(核心红线)
+
+---
+
 ## 13. 关键文件路径速查
 
 | 路径 | 用途 |
 |---|---|
 | `~/.ccteam/config.yml` | 全局配置(并发、阈值、信任档位、模型单价) |
+| `~/.ccteam/watchdog.yaml` | V0.2 M0.21:translation-only watchdog 阈值 + notify_mode(详见 §12.5) |
 | `~/.ccteam/inbox/` | 用户提需求 |
 | `~/.ccteam/queue/<state>/` | 项目状态分桶 |
 | `~/.ccteam/control/` | 用户 → orchestrator 控制信号(详见 §3.3) |

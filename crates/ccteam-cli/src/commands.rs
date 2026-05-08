@@ -1543,6 +1543,59 @@ fn truncate(s: &str, n: usize) -> &str {
     }
 }
 
+/// `ccteam watchdog scan` (V0.2 M0.21). Reads `~/.ccteam/watchdog.yaml`
+/// (or defaults), scans every project + the daemon heartbeat, and
+/// renders the resulting alerts. With `push_to_user_handle: Some(<h>)`
+/// each alert that survives filtering is also written to the meta-agent
+/// session's outbox so the meta-agent can surface it in NL.
+///
+/// Translation only: never mutates orchestrator state, never kills
+/// sessions, never re-injects prompts. Pure read-side classifier.
+pub fn run_watchdog_scan(
+    paths: &CcteamPaths,
+    format: OutputFormat,
+    push_to_user_handle: Option<&str>,
+) -> Result<String> {
+    let cfg = ccteam_core::load_watchdog_config(paths)?;
+    let alerts = ccteam_core::watchdog_scan(paths, &cfg)?;
+    if let Some(handle) = push_to_user_handle {
+        for alert in &alerts {
+            ccteam_core::push_watchdog_alert_to_meta_outbox(paths, handle, alert)
+                .with_context(|| {
+                    format!("push watchdog alert to meta outbox for `{handle}`")
+                })?;
+        }
+    }
+    Ok(match format {
+        OutputFormat::Json => {
+            serde_json::to_string_pretty(&serde_json::json!({
+                "alerts": alerts,
+                "config": cfg,
+            }))? + "\n"
+        }
+        OutputFormat::Text => render_watchdog_text(&alerts, push_to_user_handle.is_some()),
+    })
+}
+
+fn render_watchdog_text(alerts: &[ccteam_core::WatchdogAlert], pushed: bool) -> String {
+    if alerts.is_empty() {
+        return "watchdog: no alerts.\n".into();
+    }
+    let mut out = format!("watchdog: {} alert(s)\n", alerts.len());
+    for a in alerts {
+        let scope = a.slug.as_deref().unwrap_or("(global)");
+        out.push_str(&format!(
+            "  [{}] {scope}: {}\n",
+            a.kind.as_str(),
+            a.message,
+        ));
+    }
+    if pushed {
+        out.push_str("(also written to meta-agent outbox)\n");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Mutex, OnceLock};
@@ -2415,5 +2468,29 @@ mod tests {
 
         let err = run_phase_show(&paths, "meta-agent", "anything").unwrap_err();
         assert!(format!("{err:#}").contains("evergreen"));
+    }
+
+    #[test]
+    fn watchdog_scan_text_format_renders_no_alerts_when_healthy() {
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        std::fs::create_dir_all(&paths.projects_root).unwrap();
+        ccteam_core::write_heartbeat(&paths).unwrap();
+        let out = run_watchdog_scan(&paths, OutputFormat::Text, None).unwrap();
+        assert!(out.contains("no alerts"), "got: {out}");
+    }
+
+    #[test]
+    fn watchdog_scan_json_format_emits_structured_payload() {
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        std::fs::create_dir_all(&paths.projects_root).unwrap();
+        // Heartbeat absent ⇒ daemon_down alert.
+        let out = run_watchdog_scan(&paths, OutputFormat::Json, None).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        let alerts = parsed["alerts"].as_array().unwrap();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0]["kind"], "daemon_down");
+        assert!(parsed["config"].is_object());
     }
 }

@@ -24,6 +24,7 @@
 | **纵深防御替代人值守** | 痛点 11：关键节点不把控 | L1 架构约束（hooks + required_outputs）+ L2 多 agent 互检 + cross-cutting watcher（议事）+ L3 用户兜底（仅 deadlock 弹）；详见 §3.6 |
 | **pipeline 编排 sub-skill** | 痛点 12：工作流插件靠人手动调 | 9 主干 phase + 每 phase front matter `sub_skills` 字段；orchestrator 自动 trigger，产物自动接力；复用 gstack / claude-plugins-official 的 plugin，不重写；详见 §6.10 |
 | **并行规模自适应** | 痛点 13：大项目串行慢、并行规模选不对 | plan-eng 按 spec 复杂度选 `parallelism: solo / agent_team / multi_session`；subagent 任何粒度可叠加（ad-hoc，不在协议中声明）；三档叠加层级，不是互斥；详见 §3.3、§6.3、§6.11 |
+| **smart layer 只 translate,不 decide**（V0.2 M0.21） | watchdog / 后续 ux-helper 不能改 orchestrator 状态 | translation 层(meta-agent watchdog 等)只读取既有遥测,产出 NL 通知;**绝不**调 orchestrator API、写 progress.jsonl、kill session、re-inject prompt;**所有状态变更只能由 orchestrator + hooks 走;** 详见 §3.X |
 
 ---
 
@@ -693,6 +694,56 @@ LLM 推理只发生在两处:① **L2 项目级 claude**(tmux 内) ② **L0 用�
 - **不抄核心**:9-phase 编排、Seed Gate、跨项目 lessons(走官方 `~/.claude/rules/` + 可选 claude-mem)、Defense in Depth 是 ccteam 差异化护城河,AoE 没有
 
 详见 development-plan M4.9 任务说明。
+
+### 3.9 Watchdog(translation-only smart layer,V0.2 M0.21)
+
+> **架构沿革**:meta-agent(§3.8)主路径是"用户主动问 → meta-agent 答"。
+> 但 ccteam 的疼点之一是**没人值守时项目静默卡死**——L2 hooks 只能记录,
+> 没法主动捅醒用户。V0.2 把"低层信号 → 用户能读懂的 NL"这一步独立出来叫
+> **watchdog**:不是新组件 / 新进程,而是 meta-agent 的一个角色面 +
+> 一组 ccteam Rust 函数。
+
+**translation only 红线**(本文 §1 表格新增条):
+- ❌ watchdog 不调 orchestrator API、不写 progress.jsonl、不 kill session、不 re-inject prompt
+- ❌ watchdog 不替用户拍板("该不该 attach"、"该不该 kill"、"该不该改方案")
+- ✅ watchdog 只读 4 个数据源,翻译成 NL,推到 meta-agent 自己的 outbox(§3.4.3)
+
+**4 个数据源**(全是只读):
+
+| 信号 | 路径 | 来源 milestone |
+|---|---|---|
+| `needs_attention` | `<project>/.ccteam/needs_attention.outbox.json` | M0.19 Stop hook L3 兜底 |
+| `auto_loop_cycle` | `<project>/.ccteam/auto-loop.state.md::iteration` | M0.12 ralph-loop |
+| `cost_overrun` / `phase_duration_overrun` | `<project>/.ccteam/state.json::cost_used_usd` / `last_progress_event_at` | 一直有 |
+| `daemon_down` | `~/.ccteam/state/orchestrator.heartbeat` mtime | M0.23.1 |
+
+**信号源选择**(详见 `docs/v0-2-claude-code-alignment-review.md` §3.3):
+**不用 SessionEnd**——其 `exit_reason` 6 个枚举全是用户主动事件,stall 不触发。
+靠外部 timer + Stop hook L3 兜底就够了。
+
+**用户配置**:`~/.ccteam/watchdog.yaml`(interfaces.md `watchdog.yaml schema`):
+
+```yaml
+notify_on_cycle_count: 2          # 默认 cap-1=2
+notify_on_phase_cost_usd: 30.0    # USD,可选
+notify_on_phase_duration_min: 60  # 分钟,可选
+notify_mode: normal               # quiet / normal / verbose
+```
+
+`quiet` 模式只放行 `cost_overrun` + `daemon_down`(钱 / 守护死必报);
+`verbose` 不去重,每次扫描都重发 `needs_attention`。
+
+**触发**(M0.21):**手动**——meta-agent 自己跑 `ccteam watchdog scan` 这条命令。
+M2+ channel layer 上线后会有 cron-style 自动触发(60s 默认推荐;
+当前 milestone 不实现自动 timer)。
+
+**实施要点**:
+- 全部代码在 `crates/ccteam-core/src/watchdog.rs`(单文件,~600 行)
+- `crates/ccteam-cli/src/main.rs::Command::Watchdog::Scan` 暴露 CLI:
+  `ccteam watchdog scan [--push --user <handle>]`
+- meta-agent role prompt(§3.8 引用)新增 §7 描述 watchdog 角色边界
+- `crates/ccteam-core/src/orchestrator.rs` **零** watchdog 引用
+  (grep `watchdog` 命中 0 次是核心红线)
 
 ---
 
