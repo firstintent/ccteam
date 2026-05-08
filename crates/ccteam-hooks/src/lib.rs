@@ -8,12 +8,16 @@
 //! and §6.2 / §6.3 (per-hook responsibilities).
 
 pub mod cost;
+pub mod intercept_ask;
 pub mod load_context;
 pub mod parse_phase_end;
 pub mod progress;
 pub mod transcript;
 
 pub use cost::cost_accumulate;
+pub use intercept_ask::intercept_ask_decision;
 pub use load_context::load_context;
-pub use parse_phase_end::{parse_phase_end, EscalateKind, ParseDecision, ParsedEscalate};
+pub use parse_phase_end::{
+    needs_attention_outbox_path, parse_phase_end, EscalateKind, ParseDecision, ParsedEscalate,
+};
 pub use progress::progress_append;

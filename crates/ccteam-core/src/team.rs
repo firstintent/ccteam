@@ -975,6 +975,31 @@ mod tests {
         assert!(format!("{err:#}").contains("dup"));
     }
 
+    // ---------------- V0.2 M0.19.4 forbid_ask_user_question ----------------
+
+    #[test]
+    fn m019_forbid_ask_user_question_rule_loads_as_prompt_directive() {
+        // Shape every shipped team.yaml uses to enforce the self-loop
+        // protocol: a `protocol` rule with `enforce: prompt_directive`
+        // whose `directive` text rides into every phase's inject prompt.
+        let src = concat!(
+            "name: dev\n",
+            "golden_rules:\n",
+            "  protocol:\n",
+            "    - rule_id: forbid_ask_user_question\n",
+            "      enforce: prompt_directive\n",
+            "      directive: '禁用 AskUserQuestion / 纯文本问句。改写 .ccteam/outbox/clarify-<ts>.md。'\n",
+        );
+        let spec = TeamSpec::parse(src).unwrap();
+        assert_eq!(spec.golden_rules.protocol.len(), 1);
+        let rule = &spec.golden_rules.protocol[0];
+        assert_eq!(rule.rule_id, "forbid_ask_user_question");
+        assert_eq!(rule.enforce, GoldenRuleEnforcement::PromptDirective);
+        assert!(rule.directive.as_deref().unwrap().contains("AskUserQuestion"));
+        // It's a prompt-only rule, not a cmd-check.
+        assert!(spec.golden_rules.as_cmd_check_rules().is_empty());
+    }
+
     #[test]
     fn m32_verdict_schema_round_trips() {
         let src = concat!(

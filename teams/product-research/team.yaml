@@ -49,11 +49,18 @@ escalate_grammar_extensions:
     target_phase: kickoff
     reason: "no sustainable differentiation found; revert to kickoff so the user can rethink the brief from a different angle"
 
-# Team-wide golden_rules default. Phase YAML's golden_rules takes
-# priority — phases declaring their own ignore these. Empty for now;
-# product-research has no team-wide hard quality bars (each phase
-# declares its own where applicable).
-golden_rules: []
+# V0.2 M0.19.4: enforce the self-loop protocol via prompt directive.
+# `forbid_ask_user_question` rides into every phase's inject prompt as
+# a hard constraint — the assistant is steered to write
+# .ccteam/outbox/clarify-<ts>.md instead of synchronously blocking on
+# AskUserQuestion / nat-text questions. PreToolUse hook
+# (`ccteam hook intercept-ask`) is the matching deterministic guard.
+golden_rules:
+  protocol:
+    - rule_id: forbid_ask_user_question
+      enforce: prompt_directive
+      directive: "禁用 AskUserQuestion / 纯文本问句。询问用户唯一合法出口是写 .ccteam/outbox/clarify-<ts>.md(配 PHASE_DONE_PENDING 或 ESCALATE NEED_USER_INPUT)。"
+  domain: []
 
 # Critic dimensions — data form only in M3; M5 will read these.
 # Empty here per the plan §5 M3 design notes (4.2): research / dev

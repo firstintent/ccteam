@@ -501,7 +501,9 @@ mod tests {
 
     #[test]
     fn inject_prompt_auto_loop_segment_emitted_only_when_auto_loop_true() {
-        let t_off = parse_template("name: x\nparallelism: solo");
+        // V0.2 M0.19: `auto_loop` defaults to `true`, so an "off"
+        // template must opt out explicitly.
+        let t_off = parse_template("name: x\nparallelism: solo\nauto_loop: false");
         let off = build_phase_prompt_for_template(&t_off, &[]);
         assert!(!off.contains("auto_loop=true"));
 

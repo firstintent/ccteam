@@ -818,6 +818,12 @@ phase 内累计 CLARIFY 轮次(每个 outbox `event_kind: clarify` 文件 + 对�
         "hooks": [
           {"type": "command", "command": "ccteam hook progress-append PreToolUse", "async": true}
         ]
+      },
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {"type": "command", "command": "ccteam hook intercept-ask", "timeout": 5}
+        ]
       }
     ],
     "PostToolUse": [
@@ -857,14 +863,67 @@ phase 内累计 CLARIFY 轮次(每个 outbox `event_kind: clarify` 文件 + 对�
 | Hook | 作用 |
 |---|---|
 | `SessionStart` | 写 ready 标记;append `session_start` 事件 |
-| `Stop` | 解析最后一行 `PHASE_DONE` / `ESCALATE`;append `Stop` 事件(idle 信号);若 fix-loop.state.md 存在则按 ralph-loop 范式拦截重喂 |
+| `Stop` | 解析最后一行 `PHASE_DONE` / `ESCALATE`;append `Stop` 事件(idle 信号);若 fix-loop.state.md 存在按 ralph-loop 范式拦截重喂;**V0.2 M0.19**:三档兜底——前两档都没命中且 outbox 没新文件 → exit 2 + stderr 强制续聊,`stop_hook_active=true` 时写 `needs_attention.outbox.json` 不再 block |
 | `Notification:idle_prompt` | claude 显式等待用户输入 → idle 信号 |
 | `Notification:permission_prompt` | 不应出现(`--dangerously-skip-permissions` 兜底);出现说明配置失效 |
-| `PreToolUse` | append 工具调用事件;活跃信号(stall 检测反向判断) |
+| `PreToolUse`(通用) | append 工具调用事件;活跃信号(stall 检测反向判断) |
+| `PreToolUse(matcher: AskUserQuestion)` | **V0.2 M0.19.3**:`ccteam hook intercept-ask` 返回 `permissionDecision: deny`,assistant 改写 outbox。机制详见 `docs/v0-2-claude-code-alignment-review.md` §3.2 |
 | `PostToolUse`(通用) | append 事件;`cost-accumulate.sh` 累加 token / cost 到 `state.json` |
 | `PostToolUse(Bash matcher)` | 拦截危险命令(`git push` / `rm -rf /` / deploy 脚本) |
 | `SubagentStop` | 子 agent 退出(仅 Agent Teams phase 内相关) |
 | `SessionEnd` | claude 进程退出 → orchestrator 知道 reset 完成 vs crash |
+
+#### 6.2.1 `parse-phase-end` 状态机(V0.2 M0.19 三档兜底)
+
+```
+Stop fires
+  │
+  ▼
+auto-loop.state.md 存在?
+  │ yes ──→ 读 state,decide()
+  │           │
+  │           ├─ Reinject → ParseDecision::Block { reason }(stdout JSON)
+  │           └─ AllowExit + 撞顶 → emit escalate;Continue
+  │ no
+  ▼
+last_assistant_message 末行 PHASE_DONE / ESCALATE?
+  │ yes ──→ append 对应 progress 事件;Continue
+  │ no
+  ▼
+<project>/.ccteam/outbox/ 有 phase_inject ts 之后的 clarify-* / escalation-* / reply-*?
+  │ yes ──→ Continue(orchestrator 决策队列接力)
+  │ no
+  ▼
+stop_hook_active == true?
+  │ yes ──→ 写 needs_attention.outbox.json;Continue(L3 fail-safe 防递归)
+  │ no  ──→ ParseDecision::BlockMissingOutput { stderr }
+            (CLI dispatcher 写 stderr,exit 2;Claude Code 把 stderr 当 blockingError 注入下一轮)
+```
+
+`needs_attention.outbox.json` schema:
+
+```json
+{
+  "schema_version": 1,
+  "ts": "<RFC3339>",
+  "slug": "<slug>",
+  "reason": "stop_hook_active recursion guard tripped — phase produced no PHASE_DONE/ESCALATE/outbox over two consecutive Stop entries",
+  "last_assistant_message": "<原始末段 assistant 文本>",
+  "pane_tail": "<tmux capture-pane 末 30 行;仅 surface 给用户,不参与 orchestrator 状态机>"
+}
+```
+
+`ccteam hook intercept-ask` 返回的 PreToolUse 决策(`hooks.ts:608-625`):
+
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "deny",
+    "permissionDecisionReason": "本 phase 应自决,不能用 AskUserQuestion ... 改写 .ccteam/outbox/clarify-<ts>.md ..."
+  }
+}
+```
 
 ### 6.3 `cost-accumulate` 子命令工作原理
 

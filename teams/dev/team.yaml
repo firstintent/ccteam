@@ -22,14 +22,18 @@ claude_md_template: |
   - 不要 git push(被 hook 拦截)
   - 不要修改 .ccteam/ 之外的元数据
 
-# dev's `golden_rules` is intentionally empty in M3.2: the existing
-# fix-loop (M0) + per-phase `golden_rules` declared inside individual
-# phase markdown already cover dev's hard quality gates. Adding stubs
-# here without a real consumer would make the team-wide vs phase-level
-# precedence rule harder to read. M3.4 reverse-engineering note (open
-# question 4.1, plan §5): leave empty until product-research has
-# proven the team-wide default pattern is worth landing for dev.
-golden_rules: []
+# V0.2 M0.19.4: enforce the self-loop protocol via prompt directive.
+# `forbid_ask_user_question` rides into every phase's inject prompt as
+# a hard constraint — the assistant is steered to write
+# .ccteam/outbox/clarify-<ts>.md instead of synchronously blocking on
+# AskUserQuestion / nat-text questions. PreToolUse hook
+# (`ccteam hook intercept-ask`) is the matching deterministic guard.
+golden_rules:
+  protocol:
+    - rule_id: forbid_ask_user_question
+      enforce: prompt_directive
+      directive: "禁用 AskUserQuestion / 纯文本问句。询问用户唯一合法出口是写 .ccteam/outbox/clarify-<ts>.md(配 PHASE_DONE_PENDING 或 ESCALATE NEED_USER_INPUT)。"
+  domain: []
 
 # critic_dimensions empty — M5 will populate (strategic doc §A inv 1).
 critic_dimensions: []

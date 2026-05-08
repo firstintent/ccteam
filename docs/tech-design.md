@@ -398,6 +398,24 @@ test-run phase
 
 **禁止静默重试**：fix loop 撞 3 次顶绝不静默重置——这是 ccteam 区别于"AI 永远说没事"的承诺。
 
+#### V0.2 M0.19 — auto_loop default-on + Stop hook self-loop fallback
+
+**`PhaseTemplate.auto_loop` 默认 `true`**：每个 phase 自循环,撞 `auto_loop_max_iterations`(默认 3)顶才 escalate。phase yaml 显式 `auto_loop: false` 才 opt-out(evergreen 桥接 / ad-hoc diagnostic phase 用)。`completion_signal` 留空时 `effective_completion_signal()` 回退到 `PHASE_DONE: <phase-name>`,因此 phase yaml 不需要重复声明协议字面量。
+
+**Stop hook 三档兜底**(`crates/ccteam-hooks/src/parse_phase_end.rs`):
+
+1. **Auto-loop reinject**:`<project>/.ccteam/auto-loop.state.md` 存在 → 按 ralph-loop 范式重喂 prompt,撞顶时 emit escalate 事件。
+2. **PHASE_DONE / ESCALATE 解析**:assistant 末行匹配协议关键字 → 写 progress 事件,Continue。
+3. **Self-loop fallback**(V0.2 新增):前两档都没命中,且 `<project>/.ccteam/outbox/` 没有本 phase 内的 `clarify-* / escalation-* / reply-*` 新文件 → 区分两种情形:
+   - **第一次进入**(`stop_hook_active` 为 false / 缺):返回 exit 2 + stderr `phase 未正常收尾,请输出 PHASE_DONE / ESCALATE / 写 outbox 之一`。Claude Code 把 stderr 当 blockingError 注入下一轮(`hooks.ts:2784-2805`),assistant 被强制重选合法出口。
+   - **第二次进入**(`stop_hook_active` 为 true,L3 fail-safe):写 `<project>/.ccteam/needs_attention.outbox.json`(含 `last_assistant_message` + `tmux capture-pane` 末 30 行),不再 block。watchdog(M0.21)读这个文件 surface 给用户。
+
+**关键约束**:第三档**不**让 ccteam orchestrator 主动 send-keys 续 loop;Claude Code 自己接管循环。orchestrator 只在 progress.jsonl 出现 phase_done / escalate 事件时换 phase。`tmux capture-pane` 输出**只**写进 needs_attention 文件作为给用户看的 surface,不参与状态机决策(沿用"主路径不解析终端输出"红线)。
+
+#### V0.2 M0.19.3 — PreToolUse 拦截 AskUserQuestion
+
+`AskUserQuestion` 是 LLM 内部同步阻塞,Stop hook 不会触发。bootstrap 写 `<project>/.claude/settings.json` 时配 `PreToolUse` matcher `AskUserQuestion`,跑 `ccteam hook intercept-ask` 返回 `permissionDecision: deny`(reason 指引去 outbox)。LLM 收到 deny 立即改写 outbox。pair 的 prompt-layer 软约束在 team.yaml `golden_rules.protocol.forbid_ask_user_question` —— inject prompt 把 directive 文字写进协议红线段(progress.rs `build_phase_prompt_for_template_with_team`)。
+
 ### 3.6 三层防御协议（Defense in Depth）
 
 替代旧方案中"人持续在场审查"的能力，用三层独立机制保证质量与方向不偏（呼应痛点 11）：
@@ -1185,6 +1203,19 @@ fi
 ```
 
 `/btw`（by the way）是 Claude Code 内建命令——把消息塞到"待办"，不打断当前推理，claude 完成手头的事后会处理。这一条命令就是注入失败的全部解法，**不**做超时重试 / capture-pane 解析 / kill-restart 多层兜底。
+
+#### V0.2 M0.19 — auto_loop default-on 后的 phase 完结路径
+
+`auto_loop` 默认 `true`(§3.5)后,phase 退出路径只有四种合法形态(orchestrator / Stop hook 都按这套识别):
+
+| 出口 | 触发 | progress 事件 | 后续 |
+|---|---|---|---|
+| `PHASE_DONE: <phase>` | assistant 末行匹配 | `phase_done` | orchestrator 换下一 phase |
+| `PHASE_DONE_PENDING — ...` | assistant 末行匹配 | `phase_done_pending` + `open_decisions` | orchestrator 看 outbox / 静等 |
+| `ESCALATE: <prefix> <reason>` | assistant 末行匹配 | `escalate` | orchestrator 走 escalate 路由 |
+| `<project>/.ccteam/outbox/clarify-*.md` | phase 在 phase_inject ts 之后写新文件 | (无) | orchestrator 决策队列接力 |
+
+**没产出三种合法出口任一 → Stop hook fallback 接管**:第一次 Stop 返回 exit 2 + stderr 强制 LLM 续聊,第二次 (`stop_hook_active=true`) 写 `<project>/.ccteam/needs_attention.outbox.json` 让 watchdog(M0.21)接力 surface 给用户。**永远不出现"silent halt"**——即使 LLM 反复输出纯文本问句,撞 cycle cap 也会硬 escalate。
 
 ### 6.10 Sub-skill 自动调度（替人编排 plugin）
 

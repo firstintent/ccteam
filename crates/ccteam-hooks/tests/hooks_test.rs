@@ -371,7 +371,12 @@ fn cost_accumulate_handles_claude_code_2x_schema() {
 }
 
 #[test]
-fn parse_phase_end_silent_when_no_sigil() {
+fn parse_phase_end_returns_block_missing_output_when_no_sigil_no_outbox() {
+    // V0.2 M0.19: Stop hook fallback. The phase wrote nothing legal —
+    // no PHASE_DONE / ESCALATE in the assistant text, no outbox file,
+    // and no `stop_hook_active` recursion guard. The hook returns
+    // BlockMissingOutput so the dispatcher exits 2 and stderr is
+    // re-injected by Claude Code.
     let fx = Fixture::new("bookmark-mgr-a3f9");
     fx.write_transcript(&[assistant_message(
         "Just a plain answer with no terminal sigil.",
@@ -382,11 +387,18 @@ fn parse_phase_end_silent_when_no_sigil() {
         "transcript_path": fx.transcript_path,
     });
 
-    parse_phase_end(&fx.paths, &stdin).unwrap();
+    let decision = parse_phase_end(&fx.paths, &stdin).unwrap();
+    match decision {
+        ccteam_hooks::ParseDecision::BlockMissingOutput { stderr } => {
+            assert!(stderr.contains("PHASE_DONE"), "stderr: {stderr}");
+            assert!(stderr.contains("outbox"), "stderr: {stderr}");
+        }
+        other => panic!("expected BlockMissingOutput, got {other:?}"),
+    }
     let p = fx.paths.progress_jsonl(&fx.slug);
     assert!(
         !p.exists(),
-        "no progress.jsonl should be created when there is no terminal sigil",
+        "no progress event should be appended when phase produced nothing legal",
     );
 }
 
@@ -558,4 +570,170 @@ fn progress_append_errors_when_state_json_absent() {
         msg.contains("state.json"),
         "expected state.json read failure, got: {msg}",
     );
+}
+
+// ---------------- V0.2 M0.19 self-loop fallback ----------------
+
+#[test]
+fn parse_phase_end_continues_when_phase_wrote_outbox_clarify() {
+    // V0.2 M0.19: a phase that ended in a user-decision pause writes
+    // .ccteam/outbox/clarify-<ts>.md as one of the three legal outputs.
+    // The Stop hook must NOT block — the orchestrator's existing
+    // decisions queue path takes over.
+    let fx = Fixture::new("bookmark-mgr-a3f9");
+    fx.write_transcript(&[assistant_message(
+        "Need a sec — written .ccteam/outbox/clarify-2026-05-08-001.md.",
+        None,
+    )]);
+    let outbox = fx.project_dir.join(".ccteam").join("outbox");
+    std::fs::create_dir_all(&outbox).unwrap();
+    std::fs::write(
+        outbox.join("clarify-2026-05-08-001.md"),
+        "---\nschema_version: 1\nevent_kind: clarify\n---\n\nq?",
+    )
+    .unwrap();
+    let stdin = json!({
+        "cwd": fx.project_dir,
+        "transcript_path": fx.transcript_path,
+    });
+
+    let decision = parse_phase_end(&fx.paths, &stdin).unwrap();
+    assert_eq!(decision, ccteam_hooks::ParseDecision::Continue);
+}
+
+#[test]
+fn parse_phase_end_appends_needs_attention_when_stop_hook_active_recurses() {
+    // V0.2 M0.19 L3: second Stop entry carries `stop_hook_active: true`.
+    // The hook must not block again (recursion guard) and instead drop
+    // a `needs_attention.outbox.json` so the watchdog (M0.21) can
+    // surface the stall to the user.
+    let fx = Fixture::new("bookmark-mgr-a3f9");
+    fx.write_transcript(&[assistant_message(
+        "I'll keep waiting for clarity.",
+        None,
+    )]);
+    let stdin = json!({
+        "cwd": fx.project_dir,
+        "transcript_path": fx.transcript_path,
+        "stop_hook_active": true,
+    });
+
+    let decision = parse_phase_end(&fx.paths, &stdin).unwrap();
+    assert_eq!(decision, ccteam_hooks::ParseDecision::Continue);
+
+    let outbox = ccteam_hooks::needs_attention_outbox_path(&fx.project_dir);
+    assert!(outbox.exists(), "needs_attention.outbox.json must be written");
+    let body: Value = serde_json::from_slice(&std::fs::read(&outbox).unwrap()).unwrap();
+    assert_eq!(body["schema_version"], 1);
+    assert_eq!(body["slug"], "bookmark-mgr-a3f9");
+    assert!(body["last_assistant_message"]
+        .as_str()
+        .unwrap()
+        .contains("waiting"));
+}
+
+#[test]
+fn parse_phase_end_ignores_stale_outbox_from_previous_phase() {
+    // Simulate: previous phase wrote clarify-A.md, then orchestrator
+    // dispatched the next phase (phase_inject ts in progress.jsonl);
+    // current phase ended with no new output. The Stop hook must NOT
+    // treat the stale file as a fresh output — it should fall to
+    // BlockMissingOutput so the assistant gets re-prompted.
+    let fx = Fixture::new("bookmark-mgr-a3f9");
+    let outbox = fx.project_dir.join(".ccteam").join("outbox");
+    std::fs::create_dir_all(&outbox).unwrap();
+    let stale = outbox.join("clarify-old-phase.md");
+    std::fs::write(&stale, "old").unwrap();
+
+    // Backdate the stale file so phase_inject's ts is "later".
+    let early = std::time::SystemTime::UNIX_EPOCH
+        + std::time::Duration::from_secs(1_700_000_000);
+    let f = std::fs::File::options().write(true).open(&stale).unwrap();
+    f.set_times(std::fs::FileTimes::new().set_modified(early)).unwrap();
+
+    let progress_path = fx.paths.progress_jsonl(&fx.slug);
+    std::fs::create_dir_all(progress_path.parent().unwrap()).unwrap();
+    // phase_inject at "now" — well after the backdated outbox file.
+    let later = chrono::Utc::now().to_rfc3339();
+    std::fs::write(
+        &progress_path,
+        format!(
+            "{}\n",
+            json!({"event": "phase_inject", "phase": "implement", "ts": later})
+        ),
+    )
+    .unwrap();
+
+    fx.write_transcript(&[assistant_message("done thinking", None)]);
+    let stdin = json!({
+        "cwd": fx.project_dir,
+        "transcript_path": fx.transcript_path,
+    });
+    let decision = parse_phase_end(&fx.paths, &stdin).unwrap();
+    assert!(matches!(
+        decision,
+        ccteam_hooks::ParseDecision::BlockMissingOutput { .. }
+    ));
+}
+
+#[test]
+fn parse_phase_end_treats_legacy_outbox_files_as_fresh_when_no_phase_inject() {
+    // No phase_inject event in progress.jsonl yet (e.g. project just
+    // bootstrapped) → the hook can't compute a "since" cutoff. It
+    // must still treat any pre-existing outbox file as legitimate and
+    // keep returning Continue.
+    let fx = Fixture::new("bookmark-mgr-a3f9");
+    fx.write_transcript(&[assistant_message(
+        "see clarify file",
+        None,
+    )]);
+    let outbox = fx.project_dir.join(".ccteam").join("outbox");
+    std::fs::create_dir_all(&outbox).unwrap();
+    std::fs::write(outbox.join("clarify-pre-existing.md"), "body").unwrap();
+    let stdin = json!({
+        "cwd": fx.project_dir,
+        "transcript_path": fx.transcript_path,
+    });
+    let decision = parse_phase_end(&fx.paths, &stdin).unwrap();
+    assert_eq!(decision, ccteam_hooks::ParseDecision::Continue);
+}
+
+#[test]
+fn parse_phase_end_does_not_recurse_after_first_block_missing_output() {
+    // Second-entry contract: stop_hook_active=true short-circuits to
+    // append + Continue, never to BlockMissingOutput. Otherwise the
+    // assistant could oscillate between Stop entries forever.
+    let fx = Fixture::new("bookmark-mgr-a3f9");
+    fx.write_transcript(&[assistant_message("still nothing", None)]);
+    let stdin = json!({
+        "cwd": fx.project_dir,
+        "transcript_path": fx.transcript_path,
+        "stop_hook_active": true,
+    });
+    let decision = parse_phase_end(&fx.paths, &stdin).unwrap();
+    assert!(matches!(
+        decision,
+        ccteam_hooks::ParseDecision::Continue
+    ));
+}
+
+#[test]
+fn intercept_ask_decision_returns_deny_with_outbox_reason() {
+    // V0.2 M0.19.3: pure unit shape — the decision JSON must carry a
+    // `permissionDecision: deny` and the reason must steer the
+    // assistant toward the outbox protocol.
+    let v = ccteam_hooks::intercept_ask_decision();
+    assert_eq!(
+        v["hookSpecificOutput"]["hookEventName"].as_str(),
+        Some("PreToolUse"),
+    );
+    assert_eq!(
+        v["hookSpecificOutput"]["permissionDecision"].as_str(),
+        Some("deny"),
+    );
+    let reason = v["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap();
+    assert!(reason.contains("outbox"));
+    assert!(reason.contains("AskUserQuestion"));
 }
