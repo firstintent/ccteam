@@ -14,7 +14,7 @@ sub_skills: []
 
 执行项目的测试套件(语言惯例:`cargo test` / `pnpm test` / `pytest` 等)。捕获完整输出。
 
-写 `.ccteam/test-report.md`:
+`test-report.md` 内容要点:
 
 - 总用例数 / 通过 / 失败 / 跳过
 - 每个失败用例的简短摘要(下 phase 修复用)
@@ -22,6 +22,6 @@ sub_skills: []
 
 判定分流:
 
-- **全绿** → 最后一行 `PHASE_DONE: test-run`
-- **有失败** → 最后一行 `PHASE_DONE: test-run`(orchestrator 状态机转 fix-cycle)
-- **测试套件本身崩溃** → `ESCALATE: test suite crashed: <原因>`
+- **全绿** → 正常完成,phase 收尾
+- **有失败** → 仍正常完成本阶段,orchestrator 状态机会自动转 fix-cycle
+- **测试套件本身崩溃**(无法判定通过/失败)→ 走异常出口,reason 描述崩溃原因

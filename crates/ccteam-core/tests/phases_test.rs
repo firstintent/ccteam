@@ -1,6 +1,11 @@
-//! Integration test: load every phase template shipped under `phases/`
-//! and verify it parses + satisfies M0 invariants (`parallelism: solo`,
-//! empty `sub_skills`).
+//! Integration test: load every phase template shipped under
+//! `teams/<team>/phases/` and verify it parses + satisfies M0 invariants
+//! (`parallelism: solo`).
+//!
+//! V0.2 M0.18: phase markdown bodies no longer contain protocol
+//! literals (`PHASE_DONE: <name>` / `ESCALATE:`). The orchestrator's
+//! per-phase inject prompt carries those — the body stays domain-only.
+//! See `docs/phase-prompt-architecture.md` §8 for the invariant.
 
 use std::path::PathBuf;
 
@@ -54,39 +59,52 @@ fn every_m0_template_parses_and_validates() {
 }
 
 #[test]
-fn every_m0_template_body_ends_with_phase_done_or_escalate() {
+fn every_m0_template_body_omits_protocol_literals() {
+    // V0.2 M0.18: protocol keywords (`PHASE_DONE: <name>` / `ESCALATE:`)
+    // belong in the orchestrator's inject prompt, not in the phase
+    // markdown body. A phase body that drifts back to spelling the
+    // protocol keyword should fail this guard so reviews catch it
+    // before merge. See `docs/phase-prompt-architecture.md` §8.
     let dir = phases_dir();
     for (file, expected_name) in M0_TEMPLATES {
         let path = dir.join(file);
         let body = std::fs::read_to_string(&path).unwrap();
-        let phase_done = format!("PHASE_DONE: {expected_name}");
+        // Strip frontmatter — `completion_signal:` may legitimately
+        // declare the literal there, but the body must be clean.
+        let body_only = strip_frontmatter(&body);
+        let banned = format!("PHASE_DONE: {expected_name}");
         assert!(
-            body.contains(&phase_done),
-            "{file}: must mention `{phase_done}` so Stop hook can detect terminal state",
+            !body_only.contains(&banned),
+            "{file} body still contains protocol literal `{banned}` — \
+             V0.2 M0.18 expects the inject prompt to carry it",
         );
         assert!(
-            body.contains("ESCALATE"),
-            "{file}: must mention `ESCALATE:` as the failure signal",
+            !body_only.contains("ESCALATE:"),
+            "{file} body still contains `ESCALATE:` literal — \
+             V0.2 M0.18 expects the inject prompt to carry it",
         );
     }
 }
 
 #[test]
-fn fix_phase_completion_signal_matches_body_phase_done_sigil() {
-    // E2E 2026-05-06 F6 regression: the fix phase declared
-    // `completion_signal: TESTS_GREEN` in YAML while the body told
-    // Claude to output `PHASE_DONE: fix`. The fix-loop never observed
-    // the signal, looped 3x, and falsely escalated despite all tests
-    // passing. Auto-loop phases must declare the signal Claude is
-    // actually instructed to emit.
+fn fix_phase_effective_completion_signal_resolves_to_phase_done_sigil() {
+    // V0.2 M0.18: `06-fix.md` no longer declares `completion_signal`
+    // explicitly — `effective_completion_signal()` synthesizes
+    // `PHASE_DONE: fix` from the phase name. The auto-loop bootstrap
+    // and the inject-prompt builder both consume the synthesized
+    // value, so the body / frontmatter stay free of the protocol
+    // literal.
     let dir = phases_dir();
     let template = PhaseTemplate::load(&dir.join("06-fix.md")).unwrap();
     assert!(template.auto_loop, "fix phase is auto-loop driven");
-    assert_eq!(template.completion_signal, "PHASE_DONE: fix");
-    let body = std::fs::read_to_string(dir.join("06-fix.md")).unwrap();
-    assert!(
-        body.contains(&template.completion_signal),
-        "fix body must contain its declared completion_signal `{}`",
-        template.completion_signal,
-    );
+    assert_eq!(template.effective_completion_signal(), "PHASE_DONE: fix");
+}
+
+fn strip_frontmatter(body: &str) -> &str {
+    if let Some(rest) = body.strip_prefix("---\n") {
+        if let Some(end) = rest.find("\n---\n") {
+            return &rest[end + 5..];
+        }
+    }
+    body
 }

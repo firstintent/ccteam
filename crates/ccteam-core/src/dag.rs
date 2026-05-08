@@ -171,6 +171,9 @@ mod tests {
             decision_mode: crate::phases::DecisionMode::default(),
             max_clarify_rounds: 3,
             golden_rules: Vec::new(),
+            escalate_grammar_ref: None,
+            outbox_question_protocol: None,
+            inject_directives: None,
         }
     }
 

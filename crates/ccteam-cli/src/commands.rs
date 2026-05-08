@@ -623,6 +623,14 @@ pub struct DoctorOptions {
     /// schema-additive team.yaml changes (e.g. the V0.2 `evergreen` /
     /// `cost_policy` fields landed by M0.16).
     pub reset_shipped_teams: bool,
+    /// V0.2 M0.18.5: load + validate one team's phase templates +
+    /// `team.yaml`, including the new V0.2 inject-prompt frontmatter
+    /// fields and phase IO contract (every required_input must be a
+    /// prior phase's required_output). Reports each phase's state and
+    /// warns on body-level protocol-keyword residue (`PHASE_DONE: <name>` /
+    /// `ESCALATE:`) without failing — those drift in over time and a
+    /// fail-loud check would block the orchestrator.
+    pub validate_team: Option<String>,
 }
 
 /// `ccteam doctor` dispatch. Returns a human-readable report so unit
@@ -634,7 +642,8 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
         || opts.install_meta_agent.is_some()
         || opts.install_mcp
         || opts.install_memory_bridge
-        || opts.reset_shipped_teams;
+        || opts.reset_shipped_teams
+        || opts.validate_team.is_some();
     if !any_mode {
         return Ok(String::from(
             "ccteam doctor: pass at least one mode flag.\n\
@@ -653,7 +662,9 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
              --install-memory-bridge [--dry-run]\n      \
              write ~/.claude/rules/ccteam-lessons-<team>.md placeholders for every team with non-empty retro_schema (M4.2; V0.2 M0.16.2 — disk-driven team discovery).\n  \
              --reset-shipped-teams [--force]\n      \
-             re-seed shipped team templates (~/.ccteam/teams/<name>/team.yaml + ~/.ccteam/<phase_dir>/*.md) from the in-binary bundle. Without --force, operator hand-edits are preserved; with --force, every shipped file is overwritten (V0.2 M0.16.2).\n",
+             re-seed shipped team templates (~/.ccteam/teams/<name>/team.yaml + ~/.ccteam/<phase_dir>/*.md) from the in-binary bundle. Without --force, operator hand-edits are preserved; with --force, every shipped file is overwritten (V0.2 M0.16.2).\n  \
+             --validate-team <name>\n      \
+             load + validate one team's team.yaml + phase markdown set (V0.2 M0.18.5). Reports per-phase frontmatter health, IO contract consistency between adjacent phases, and warns on body-level protocol-keyword residue.\n",
         ));
     }
     let mut out = String::new();
@@ -680,6 +691,280 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
     }
     if opts.reset_shipped_teams {
         out.push_str(&render_reset_shipped_teams_report(paths, &opts)?);
+    }
+    if let Some(team) = &opts.validate_team {
+        out.push_str(&render_validate_team_report(paths, team)?);
+    }
+    Ok(out)
+}
+
+/// V0.2 M0.18.5: load + validate one team's `team.yaml` and every
+/// phase markdown the team ships. Surfaces:
+///
+/// 1. team.yaml load + parse + validate
+/// 2. phase frontmatter parse + `validate_m0` (covers V0.2 inject-
+///    prompt fields: empty `escalate_grammar_ref` / unknown directives)
+/// 3. phase IO contract: each phase's `required_inputs` must be
+///    produced by some prior phase's `required_outputs` (or a project-
+///    bootstrapped artifact like `.ccteam/spec.md`)
+/// 4. phase body residue: protocol literals (`PHASE_DONE: <name>` /
+///    `ESCALATE:`) inside the body trigger a warn (not error — bodies
+///    are user territory; `phase-prompt-architecture.md` §9 docks
+///    this as warn-not-fail by design).
+fn render_validate_team_report(paths: &CcteamPaths, team: &str) -> Result<String> {
+    use ccteam_core::{
+        default_user_staging_dir, resolve_team, TeamResolveContext, TEAM_SOURCES,
+    };
+
+    let mut out = format!("ccteam doctor --validate-team {team}\n\n");
+    let user_staging = default_user_staging_dir();
+    let ctx = TeamResolveContext::for_orchestrator(&paths.root, &user_staging);
+
+    let spec = match resolve_team(team, &ctx) {
+        Ok(s) => {
+            out.push_str(&format!("[OK] team.yaml resolves; name=`{}`\n", s.name));
+            s
+        }
+        Err(err) => {
+            out.push_str(&format!("[FAIL] team.yaml load: {err:#}\n"));
+            return Ok(out);
+        }
+    };
+
+    if spec.evergreen {
+        out.push_str(
+            "[OK] team is evergreen — skipping phase IO / markdown checks\n",
+        );
+        return Ok(out);
+    }
+
+    // Locate the phase dir on disk via the same priority order the
+    // resolver uses.
+    let team_dir = TEAM_SOURCES
+        .iter()
+        .filter_map(|s| s.path_for(team, &ctx))
+        .find(|p| p.exists())
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
+    let team_dir = match team_dir {
+        Some(p) => p,
+        None => {
+            out.push_str(
+                "[FAIL] could not locate team directory after resolve — \
+                 run `ccteam doctor --reset-shipped-teams`\n",
+            );
+            return Ok(out);
+        }
+    };
+    let phase_dir = team_dir.join(&spec.phase_dir);
+    if !phase_dir.exists() {
+        out.push_str(&format!(
+            "[FAIL] phase_dir {} does not exist\n",
+            phase_dir.display(),
+        ));
+        return Ok(out);
+    }
+
+    // Sort phase markdowns so IO contract checks run in the
+    // deterministic on-disk order (`02-plan-eng.md` < `03-implement.md`
+    // < ...).
+    let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&phase_dir)?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) == Some("md") {
+                Some(p)
+            } else {
+                None
+            }
+        })
+        .collect();
+    entries.sort();
+
+    if entries.is_empty() {
+        out.push_str(&format!(
+            "[WARN] no phase markdowns under {}\n",
+            phase_dir.display(),
+        ));
+        return Ok(out);
+    }
+
+    // Project-bootstrapped artifacts the orchestrator writes before
+    // the first phase runs. Treated as "produced by phase[-1]" so the
+    // first phase can declare them as required_inputs without breaking
+    // the IO contract check.
+    let mut produced: std::collections::HashSet<String> =
+        ["spec.md", ".ccteam/spec.md"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+
+    let mut ok = 0u32;
+    let mut warns = 0u32;
+    let mut fails = 0u32;
+
+    for path in &entries {
+        let file = path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
+        match PhaseTemplate::load(path) {
+            Ok(t) => {
+                if let Err(err) = t.validate_m0() {
+                    out.push_str(&format!("[FAIL] {file}: validate_m0: {err:#}\n"));
+                    fails += 1;
+                    continue;
+                }
+                // IO contract: every required_input must be in `produced`.
+                for input in &t.required_inputs {
+                    if !produced.contains(input) {
+                        out.push_str(&format!(
+                            "[WARN] {file}: required_input `{input}` not produced by any prior phase\n",
+                        ));
+                        warns += 1;
+                    }
+                }
+                // Body residue: warn on protocol literals (architecture §9).
+                let body_raw = std::fs::read_to_string(path).unwrap_or_default();
+                let body = strip_frontmatter(&body_raw);
+                let phase_done_literal = format!("PHASE_DONE: {}", t.name);
+                if body.contains(&phase_done_literal) {
+                    out.push_str(&format!(
+                        "[WARN] {file}: body contains `{phase_done_literal}` — V0.2 expects the inject prompt to carry it\n",
+                    ));
+                    warns += 1;
+                }
+                if body.contains("ESCALATE:") {
+                    out.push_str(&format!(
+                        "[WARN] {file}: body contains `ESCALATE:` literal — V0.2 expects the inject prompt to carry it\n",
+                    ));
+                    warns += 1;
+                }
+                if body.trim().is_empty() {
+                    out.push_str(&format!(
+                        "[WARN] {file}: body is empty — phase markdown should still describe the domain task\n",
+                    ));
+                    warns += 1;
+                }
+                // After this phase, its outputs become available to
+                // downstream phases.
+                for o in &t.required_outputs {
+                    produced.insert(o.clone());
+                }
+                out.push_str(&format!("[OK]   {file}: phase=`{}`\n", t.name));
+                ok += 1;
+            }
+            Err(err) => {
+                out.push_str(&format!("[FAIL] {file}: parse: {err:#}\n"));
+                fails += 1;
+            }
+        }
+    }
+
+    out.push_str(&format!(
+        "\nSummary: {ok} ok, {warns} warn, {fails} fail\n",
+    ));
+    Ok(out)
+}
+
+fn strip_frontmatter(body: &str) -> &str {
+    if let Some(rest) = body.strip_prefix("---\n") {
+        if let Some(end) = rest.find("\n---\n") {
+            return &rest[end + 5..];
+        }
+    }
+    body
+}
+
+/// V0.2 M0.18.6: render `<team>` `<phase>`'s inject prompt + body for
+/// debugging. Renders the same `build_phase_prompt_for_template_with_team`
+/// output the orchestrator dispatches, plus the phase markdown body
+/// the assistant sees via `@.ccteam/phases/<phase>.md`. Pure read-only.
+pub fn run_phase_show(
+    paths: &CcteamPaths,
+    team: &str,
+    phase: &str,
+) -> Result<String> {
+    use ccteam_core::{
+        default_user_staging_dir, resolve_team, GoldenRuleEnforcement,
+        TeamResolveContext, TEAM_SOURCES,
+    };
+
+    let user_staging = default_user_staging_dir();
+    let ctx = TeamResolveContext::for_orchestrator(&paths.root, &user_staging);
+
+    let spec = resolve_team(team, &ctx)
+        .with_context(|| format!("resolve team `{team}`"))?;
+
+    if spec.evergreen {
+        bail!(
+            "team `{team}` is evergreen — it has no phase DAG, so `phase show` does not apply"
+        );
+    }
+
+    let team_dir = TEAM_SOURCES
+        .iter()
+        .filter_map(|s| s.path_for(team, &ctx))
+        .find(|p| p.exists())
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+        .ok_or_else(|| anyhow::anyhow!("could not locate team directory for `{team}`"))?;
+    let phase_dir = team_dir.join(&spec.phase_dir);
+    let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&phase_dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("md"))
+        .collect();
+    entries.sort();
+
+    let mut found_template: Option<PhaseTemplate> = None;
+    let mut found_path: Option<std::path::PathBuf> = None;
+    for path in &entries {
+        match PhaseTemplate::load(path) {
+            Ok(t) if t.name == phase => {
+                found_template = Some(t);
+                found_path = Some(path.clone());
+                break;
+            }
+            _ => continue,
+        }
+    }
+
+    let template = found_template.ok_or_else(|| {
+        anyhow::anyhow!(
+            "team `{team}` has no phase `{phase}` under {} — \
+             check `ccteam doctor --validate-team {team}` for the phase list",
+            phase_dir.display(),
+        )
+    })?;
+    let template_path = found_path.unwrap();
+
+    // Mirror orchestrator's dispatch path: assemble protocol directives
+    // from team.yaml, then build the inject prompt with no attachments
+    // (debug rendering doesn't see prior phase outputs).
+    let protocol_dirs: Vec<&str> = spec
+        .golden_rules
+        .protocol
+        .iter()
+        .filter(|r| r.enforce == GoldenRuleEnforcement::PromptDirective)
+        .filter_map(|r| r.directive.as_deref())
+        .collect();
+    let inject = ccteam_core::progress::build_phase_prompt_for_template_with_team(
+        &template,
+        &[],
+        &protocol_dirs,
+    );
+
+    let body = std::fs::read_to_string(&template_path)
+        .with_context(|| format!("read {}", template_path.display()))?;
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# Inject prompt (orchestrator-rendered for `{team}` / `{phase}`)\n\n",
+    ));
+    out.push_str(&format!("```\n{inject}\n```\n\n"));
+    out.push_str(&format!(
+        "# Phase markdown ({})\n\n",
+        template_path.display(),
+    ));
+    out.push_str(&body);
+    if !out.ends_with('\n') {
+        out.push('\n');
     }
     Ok(out)
 }
@@ -1638,6 +1923,7 @@ mod tests {
         assert!(body.contains("install-skill"));
         assert!(body.contains("install-meta-agent"));
         assert!(body.contains("install-memory-bridge"));
+        assert!(body.contains("validate-team"), "got: {body}");
     }
 
     #[test]
@@ -2031,5 +2317,121 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].current_phase, "<unknown>");
         assert_eq!(rows[0].team, "<unknown>");
+    }
+
+    // ---------------- V0.2 M0.18.5 doctor --validate-team ----------------
+
+    #[test]
+    fn validate_team_reports_ok_for_shipped_dev_team() {
+        ensure_isolation();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        // Seed shipped teams on disk so the resolver can walk them.
+        ccteam_core::write_all_global_team_templates(&paths.root, false).unwrap();
+
+        let opts = DoctorOptions {
+            validate_team: Some("dev".into()),
+            ..DoctorOptions::default()
+        };
+        let report = run_doctor(&paths, opts).unwrap();
+        assert!(report.contains("validate-team dev"), "got: {report}");
+        assert!(report.contains("[OK] team.yaml"), "got: {report}");
+        assert!(report.contains("plan-eng"), "got: {report}");
+        assert!(report.contains("Summary:"), "got: {report}");
+    }
+
+    #[test]
+    fn validate_team_reports_fail_for_unknown_team() {
+        ensure_isolation();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+
+        let opts = DoctorOptions {
+            validate_team: Some("totally-unknown".into()),
+            ..DoctorOptions::default()
+        };
+        let report = run_doctor(&paths, opts).unwrap();
+        assert!(report.contains("[FAIL] team.yaml load"), "got: {report}");
+    }
+
+    #[test]
+    fn validate_team_warns_when_phase_body_contains_protocol_literal() {
+        ensure_isolation();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        ccteam_core::write_all_global_team_templates(&paths.root, false).unwrap();
+
+        // Re-write one phase body to include the banned literal so we
+        // verify the warn path. The frontmatter stays valid; only the
+        // body drifts.
+        let phase_path = paths
+            .root
+            .join("teams/dev/phases/03-implement.md");
+        let original = std::fs::read_to_string(&phase_path).unwrap();
+        let drifted = format!("{original}\n\n最后一行: PHASE_DONE: implement\n");
+        std::fs::write(&phase_path, drifted).unwrap();
+
+        let opts = DoctorOptions {
+            validate_team: Some("dev".into()),
+            ..DoctorOptions::default()
+        };
+        let report = run_doctor(&paths, opts).unwrap();
+        assert!(
+            report.contains("[WARN]") && report.contains("PHASE_DONE: implement"),
+            "got: {report}",
+        );
+    }
+
+    #[test]
+    fn validate_team_skips_phase_dir_for_evergreen_team() {
+        ensure_isolation();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        ccteam_core::write_all_global_team_templates(&paths.root, false).unwrap();
+
+        let opts = DoctorOptions {
+            validate_team: Some("meta-agent".into()),
+            ..DoctorOptions::default()
+        };
+        let report = run_doctor(&paths, opts).unwrap();
+        assert!(report.contains("evergreen"), "got: {report}");
+    }
+
+    // ---------------- V0.2 M0.18.6 ccteam phase show ----------------
+
+    #[test]
+    fn phase_show_renders_inject_prompt_and_body() {
+        ensure_isolation();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        ccteam_core::write_all_global_team_templates(&paths.root, false).unwrap();
+
+        let body = run_phase_show(&paths, "dev", "implement").unwrap();
+        assert!(body.contains("Inject prompt"), "got: {body}");
+        assert!(body.contains("@.ccteam/phases/implement.md"));
+        assert!(body.contains("PHASE_DONE: implement"));
+        assert!(body.contains("Phase markdown"));
+    }
+
+    #[test]
+    fn phase_show_errors_on_unknown_phase() {
+        ensure_isolation();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        ccteam_core::write_all_global_team_templates(&paths.root, false).unwrap();
+
+        let err = run_phase_show(&paths, "dev", "nonexistent").unwrap_err();
+        assert!(format!("{err:#}").contains("nonexistent"));
+    }
+
+    #[test]
+    fn phase_show_errors_on_evergreen_team() {
+        ensure_isolation();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        ccteam_core::write_all_global_team_templates(&paths.root, false).unwrap();
+
+        let err = run_phase_show(&paths, "meta-agent", "anything").unwrap_err();
+        assert!(format!("{err:#}").contains("evergreen"));
     }
 }

@@ -49,7 +49,7 @@ max_clarify_rounds: 3
 
 ## 决策
 
-`.ccteam/value-prop.md` 末尾必含一个判断行:
+`value-prop.md` 末尾必含一个判断行:
 
 ```
 价值强度: weak | moderate | strong
@@ -59,10 +59,5 @@ max_clarify_rounds: 3
 - **moderate**:有清楚的核心用户群,Month 1 retention 估计能到 30-50%
 - **strong**:核心用户痛点强,Month 1 retention 估计 50%+,差异化可持续
 
-## 退出
-
-```
-PHASE_DONE: value-proposition
-```
-
-(本 phase 不预期触发团队特化 ESCALATE — 价值弱归弱,不一定是项目 abort 信号,留给 verdict phase 综合判断。)
+本 phase 不预期触发团队特化异常出口 — 价值弱归弱,不一定是项目 abort 信号,
+留给 verdict phase 综合判断。

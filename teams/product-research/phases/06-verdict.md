@@ -33,7 +33,7 @@ verdict 倾向 REJECT 并在 rationale.md 里引该历史条目作证据。
 
 ## 三份产物
 
-### 1. `.ccteam/verdict.md`
+### 1. `verdict.md`
 
 按 interfaces §5.3 通用 verdict schema:
 
@@ -59,7 +59,7 @@ confidence: 0.0-1.0
 (一句话:做 / 不做 / 还要更多信息)
 ```
 
-### 2. `.ccteam/rationale.md`
+### 2. `rationale.md`
 
 详细论证:
 
@@ -67,7 +67,7 @@ confidence: 0.0-1.0
 - **削弱决策的反向证据**(诚实列出,不掩盖)
 - **不确定性来源**(我们没找到 / 没确认的事)
 
-### 3. `.ccteam/next-steps.md`
+### 3. `next-steps.md`
 
 按 verdict 的不同走向给具体下一步:
 
@@ -79,7 +79,7 @@ confidence: 0.0-1.0
 ## REJECT 分支 retro
 
 **只在 `verdict = REJECT` 时执行**(PASS / CONCERN 的 retro 由下游 dev 项目的 ship phase 写;
-CLARIFY 不是终态)。两处落地(基于 `teams/product-research.yaml.retro_schema`):
+CLARIFY 不是终态)。两处落地(基于 `teams/product-research/team.yaml.retro_schema`):
 
 1. **本仓库 auto-memory** → 调 `/memory` 写本项目特定 lessons,topic 文件结构你自定。
 
@@ -87,7 +87,7 @@ CLARIFY 不是终态)。两处落地(基于 `teams/product-research.yaml.retro_s
    **只改 `<!-- ccteam-managed:lessons begin/end -->` 之间内容**(不动标记,也不动
    marked 外的用户段)。在 marked section 内 append 一段以本项目 slug + 日期为
    H2 标题的新条目;字段顺序与 description 取自
-   `teams/product-research.yaml.retro_schema`(每字段一个 H3):
+   `teams/product-research/team.yaml.retro_schema`(每字段一个 H3):
 
    - `market_signals` — Top market signals collected (demand, saturation, pricing)
    - `differentiation_findings` — Unique angles found / ruled out
@@ -113,26 +113,21 @@ CLARIFY 不是终态)。两处落地(基于 `teams/product-research.yaml.retro_s
    ```
 
    若 `~/.claude/rules/ccteam-lessons-product-research.md` 不存在,说明用户没跑过
-   `ccteam doctor --install-memory-bridge`;在 `.ccteam/rationale.md` 末尾追加一行
+   `ccteam doctor --install-memory-bridge`;在 `rationale.md` 末尾追加一行
    "memory bridge missing — run ccteam doctor --install-memory-bridge",跨项目
-   lessons 这次跳过(不 ESCALATE,verdict 已写完)。
+   lessons 这次跳过(verdict 已写完,不走异常出口)。
 
 ## verdict 决定退出方式
 
-| verdict | PHASE_DONE 形式 | 含义 |
+| verdict | 退出方式 | 含义 |
 |---|---|---|
-| `PASS` | `PHASE_DONE: verdict` | 项目研究完成,推荐进入 dev |
-| `CONCERN` | `PHASE_DONE: verdict` | 项目研究完成,但有保留 |
-| `REJECT` | `ESCALATE: ABORT — <reason>` | 项目研究完成,结论是不做(此为 product-research happy path 的真实终态;不是失败) |
+| `PASS` | 正常完成 | 项目研究完成,推荐进入 dev |
+| `CONCERN` | 正常完成 | 项目研究完成,但有保留 |
+| `REJECT` | `ABORT` prefix(team.yaml 注册的 standard 路由) | 项目研究完成,结论是不做(此为 product-research happy path 的真实终态;不是失败) |
 | `CLARIFY` | 写 outbox event_kind=clarify;循环回本 phase | 信息不足,等用户答复 |
 
-`max_clarify_rounds: 5` 撞顶时:
-
-```
-ESCALATE: INSUFFICIENT_CLARIFICATION — 关键问题
-```
-
-(产物已 best-effort 写出,等用户决定接受 / 继续 / abort。)
+`max_clarify_rounds: 5` 撞顶时:走 `INSUFFICIENT_CLARIFICATION` prefix
+(产物已 best-effort 写出,等用户决定接受 / 继续 / abort)。
 
 ## decision_mode: async
 

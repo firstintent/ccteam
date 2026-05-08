@@ -289,7 +289,7 @@ impl Orchestrator {
                 retro_schema: Vec::new(),
                 critic_dimensions: Vec::new(),
                 escalate_grammar_extensions: Vec::new(),
-                golden_rules: Vec::new(),
+                golden_rules: crate::team::TeamGoldenRules::default(),
                 phase_dir: "phases".into(),
                 verdict_schema: Vec::new(),
                 evergreen: false,
@@ -390,7 +390,35 @@ impl Orchestrator {
 
         let attachments = self.attachments_for_next_phase(slug, state);
         let attachment_refs: Vec<&str> = attachments.iter().map(String::as_str).collect();
-        let prompt = progress::build_phase_prompt_with_attachments(phase, &attachment_refs);
+        // V0.2 M0.18: prefer the template-aware inject builder when the
+        // team / phase is registered. Falls back to the legacy name-only
+        // shape only when the team or template is missing (e.g. an
+        // unknown team `state.team` slipped past validation), keeping
+        // the dispatch path resilient.
+        let prompt = match self.team_runtime(&state.team) {
+            Some(team) => match team.templates.iter().find(|tpl| tpl.name == phase) {
+                Some(template) => {
+                    let protocol_dirs: Vec<&str> = team
+                        .spec
+                        .golden_rules
+                        .protocol
+                        .iter()
+                        .filter(|r| {
+                            r.enforce
+                                == crate::team::GoldenRuleEnforcement::PromptDirective
+                        })
+                        .filter_map(|r| r.directive.as_deref())
+                        .collect();
+                    progress::build_phase_prompt_for_template_with_team(
+                        template,
+                        &attachment_refs,
+                        &protocol_dirs,
+                    )
+                }
+                None => progress::build_phase_prompt_with_attachments(phase, &attachment_refs),
+            },
+            None => progress::build_phase_prompt_with_attachments(phase, &attachment_refs),
+        };
         let message = progress::idle_aware_message(&prompt, idle);
 
         let session = TmuxSession::from_name(state.tmux_session.clone());
@@ -949,12 +977,17 @@ impl Orchestrator {
                         // only re-enters on phase_done/escalate.
                         let t = template.expect("auto_loop branch implies template present");
                         let project_dir = self.paths.project_dir(slug);
-                        let prompt = progress::build_phase_prompt(&phase);
+                        // V0.2 M0.18: re-prompt the assistant with the
+                        // same template-driven inject prompt the dispatch
+                        // path used, so auto-loop iterations see the
+                        // same protocol directives instead of a stripped
+                        // legacy shim.
+                        let prompt = progress::build_phase_prompt_for_template(t, &[]);
                         let fl = AutoLoopState::new(
                             slug.to_string(),
                             prompt,
                             t.auto_loop_max_iterations,
-                            t.completion_signal.clone(),
+                            t.effective_completion_signal(),
                         );
                         auto_loop::write(&auto_loop::path_in(&project_dir), &fl)?;
                         PhaseState::AutoLocked
@@ -1752,7 +1785,7 @@ fn load_team_runtimes(paths: &CcteamPaths) -> Result<HashMap<String, TeamRuntime
                     retro_schema: Vec::new(),
                     critic_dimensions: Vec::new(),
                     escalate_grammar_extensions: Vec::new(),
-                    golden_rules: Vec::new(),
+                    golden_rules: crate::team::TeamGoldenRules::default(),
                     phase_dir: "phases".into(),
                     verdict_schema: Vec::new(),
                     evergreen: false,

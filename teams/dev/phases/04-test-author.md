@@ -12,7 +12,7 @@ sub_skills: []
 
 # 任务:测试编写
 
-读取 `@.ccteam/implement-report.md` 与代码,为每个核心模块写测试。覆盖:
+读 `implement-report.md` 与代码,为每个核心模块写测试。覆盖:
 
 - 正常路径(happy path)
 - 边界条件(空输入、上 / 下界、并发)
@@ -20,10 +20,8 @@ sub_skills: []
 
 不允许 mock 关键外部依赖(数据库 / 文件系统 / 外部 API 用 fixture,避免"测试绿但生产挂"的假绿)。
 
-完成后写 `.ccteam/test-author-report.md`:
+`test-author-report.md` 内容要点:
 
 - 新增测试文件 + 用例数量
 - 选择 fixture vs mock 的判断依据
 - 仍未覆盖的边界(明确遗留给 review 关注)
-
-最后一行单独输出 `PHASE_DONE: test-author`(或 `ESCALATE: <一句话原因>`)。

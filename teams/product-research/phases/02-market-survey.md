@@ -13,7 +13,7 @@ max_clarify_rounds: 3
 
 # Market Survey — 市场调研
 
-你是 product-research 团队的 market-survey phase。读 `@.ccteam/brief.md`,系统调研这个 idea 当前的市场状态。
+读 `brief.md`,系统调研这个 idea 当前的市场状态。
 
 ## 调研维度(每个都要在产物里覆盖)
 
@@ -39,27 +39,10 @@ max_clarify_rounds: 3
 
 读完调研结果后,自检:
 
-- 如果发现 ≥3 个免费且广泛使用的同类工具完全覆盖了核心场景 → 走 `MARKET_DUPLICATE` 路径(下面)
+- 如果发现 ≥3 个免费且广泛使用的同类工具完全覆盖了核心场景 → 走 `MARKET_DUPLICATE` 异常出口(team.yaml 注册;route abort,项目终态)
 - 如果搜不到竞品但用户痛点明确 → 这是 contrarian opportunity 信号,在产物里高亮
 
-## 退出
+## 异常分流(domain-specific)
 
-正常情况:写完 `.ccteam/market-survey.md` 后:
-
-```
-PHASE_DONE: market-survey
-```
-
-发现 idea 已被免费工具完全覆盖 / 市场极度饱和:
-
-```
-ESCALATE: MARKET_DUPLICATE — 列出 N 个免费替代品,概述覆盖度
-```
-
-(此 prefix 由 team.yaml.escalate_grammar_extensions 注册;走 abort 路径,项目终态。)
-
-数据收集严重不足且 3 轮 clarify 无法补全:
-
-```
-ESCALATE: INSUFFICIENT_VALIDATION — 缺哪些维度,为什么 3 轮没解决
-```
+- 数据收集严重不足且 3 轮 clarify 无法补全 → `INSUFFICIENT_VALIDATION` prefix(team.yaml 注册;route need_user_input),reason 描述缺哪些维度、为什么 3 轮没解决
+- 市场已被免费工具完全覆盖 → `MARKET_DUPLICATE` prefix,reason 列 N 个免费替代品 + 概述覆盖度

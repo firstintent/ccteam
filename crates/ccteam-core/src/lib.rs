@@ -76,8 +76,9 @@ pub use subskill::{
 };
 pub use state::{Parallelism, PhaseHistoryEntry, PhaseState, ProjectState};
 pub use team::{
-    CostPolicy, CriticDimensionSpec, CriticStrictness, EscalateGrammarExtension, EscalateRoute,
-    RetroFieldKind, RetroFieldSpec, TeamSpec,
+    CostPolicy, CriticDimensionSpec, CriticStrictness, DomainRule, EscalateGrammarExtension,
+    EscalateRoute, GoldenRuleEnforcement, ProtocolRule, RetroFieldKind, RetroFieldSpec,
+    TeamGoldenRules, TeamSpec,
 };
 pub use team_resolver::{
     default_user_staging_dir, discover_team_names, resolve_team, save_team, TeamResolveContext,

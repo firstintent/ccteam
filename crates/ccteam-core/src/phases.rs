@@ -20,6 +20,33 @@ use crate::tool_surface::ToolsRequired;
 const DEFAULT_AUTO_LOOP_MAX_ITERATIONS: u32 = 3;
 const DEFAULT_MAX_CLARIFY_ROUNDS: u32 = 3;
 
+/// V0.2 M0.18: default for `escalate_grammar_ref`. `standard` resolves
+/// against the four built-in ESCALATE prefixes (`REVERT_TO_PHASE` /
+/// `NEED_USER_INPUT` / `ABORT` / `INSUFFICIENT_CLARIFICATION`). A team
+/// extends the surface via `team.yaml.escalate_grammar_extensions`,
+/// not by inventing new `escalate_grammar_ref` values.
+pub const DEFAULT_ESCALATE_GRAMMAR_REF: &str = "standard";
+
+/// V0.2 M0.18: default for `outbox_question_protocol`. `v1` is the
+/// shape documented in interfaces §3.4.3: outbox files under
+/// `<project>/.ccteam/outbox/` with `event_kind: clarify` frontmatter.
+pub const DEFAULT_OUTBOX_QUESTION_PROTOCOL: &str = "v1";
+
+/// V0.2 M0.18: ordered set of inject-prompt segments the orchestrator
+/// composes when dispatching a phase. Each name maps to a clause in
+/// `progress::build_phase_prompt_with_attachments`. Phase YAML can
+/// shrink the set via `inject_directives:` to opt out of segments
+/// (escape hatch — most phases use the default).
+pub const DEFAULT_INJECT_DIRECTIVES: &[&str] = &[
+    "read_inputs",
+    "write_outputs",
+    "completion_signal",
+    "escalate_grammar",
+    "outbox_protocol",
+    "auto_loop",
+    "decision_mode",
+];
+
 /// Phase-internal multi-role agent (M2+; M0 ignores).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentTeamRole {
@@ -223,6 +250,29 @@ pub struct PhaseTemplate {
     /// each declare their own.
     #[serde(default)]
     pub golden_rules: Vec<GoldenRule>,
+
+    /// V0.2 M0.18: ESCALATE grammar dialect this phase emits. `standard`
+    /// resolves to the four built-in prefixes; team-specific extensions
+    /// (e.g. `MARKET_DUPLICATE`) come from `team.yaml.escalate_grammar_extensions`
+    /// regardless of this field. `inject_directives` controls whether
+    /// the inject prompt mentions the dialect at all.
+    #[serde(default)]
+    pub escalate_grammar_ref: Option<String>,
+
+    /// V0.2 M0.18: which outbox-question protocol the inject prompt
+    /// instructs the assistant to use when it needs to ask the user.
+    /// Only `v1` ships in V0.2 (interfaces §3.4.3). Defaulting to
+    /// `None` keeps legacy phase yamls valid and the inject prompt
+    /// uses `DEFAULT_OUTBOX_QUESTION_PROTOCOL` when composing.
+    #[serde(default)]
+    pub outbox_question_protocol: Option<String>,
+
+    /// V0.2 M0.18: explicit list of inject-prompt segments to compose.
+    /// `None` (yaml omitted) means use `DEFAULT_INJECT_DIRECTIVES`.
+    /// Phase yamls rarely override this — the field exists as an
+    /// escape hatch when a phase truly needs a custom prompt shape.
+    #[serde(default)]
+    pub inject_directives: Option<Vec<String>>,
 }
 
 fn default_auto_loop_max_iterations() -> u32 {
@@ -275,12 +325,13 @@ impl PhaseTemplate {
                 );
             }
         }
-        if self.auto_loop && self.completion_signal.trim().is_empty() {
-            bail!(
-                "phase `{}` declares `auto_loop: true` but no `completion_signal` — orchestrator can't tell when the loop is done",
-                self.name,
-            );
-        }
+        // V0.2 M0.18: when `completion_signal` is omitted the inject
+        // prompt + auto-loop both fall back to
+        // `PHASE_DONE: <phase-name>` via `effective_completion_signal()`,
+        // so an empty literal field is no longer a validation error.
+        // This lets phase yamls keep frontmatter free of the
+        // `PHASE_DONE` literal — the protocol value is supplied by
+        // ccteam-core's default when the field is absent.
         if self.auto_loop && self.auto_loop_max_iterations == 0 {
             bail!(
                 "phase `{}` declares `auto_loop: true` with `auto_loop_max_iterations: 0` — that would never enter the loop",
@@ -298,6 +349,40 @@ impl PhaseTemplate {
                 format!("phase `{}` golden_rule `{}` invalid", self.name, rule.rule_id)
             })?;
         }
+        // V0.2 M0.18: an explicit empty `escalate_grammar_ref: ''` is
+        // a configuration mistake — we default-fill it when missing,
+        // but a present-but-empty value means the operator typed it
+        // and meant something they didn't write.
+        if let Some(g) = &self.escalate_grammar_ref {
+            if g.trim().is_empty() {
+                bail!(
+                    "phase `{}` declares empty `escalate_grammar_ref` — drop the field to use `{}` default, or supply a non-empty dialect",
+                    self.name,
+                    DEFAULT_ESCALATE_GRAMMAR_REF,
+                );
+            }
+        }
+        if let Some(p) = &self.outbox_question_protocol {
+            if p.trim().is_empty() {
+                bail!(
+                    "phase `{}` declares empty `outbox_question_protocol` — drop the field to use `{}` default",
+                    self.name,
+                    DEFAULT_OUTBOX_QUESTION_PROTOCOL,
+                );
+            }
+        }
+        if let Some(directives) = &self.inject_directives {
+            for name in directives {
+                if !DEFAULT_INJECT_DIRECTIVES.iter().any(|d| *d == name) {
+                    bail!(
+                        "phase `{}` declares unknown inject directive `{}`; valid: {:?}",
+                        self.name,
+                        name,
+                        DEFAULT_INJECT_DIRECTIVES,
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
@@ -308,6 +393,53 @@ impl PhaseTemplate {
         snap: &crate::tool_surface::ToolSurfaceSnapshot,
     ) -> Vec<crate::tool_surface::MissingTool> {
         crate::tool_surface::missing_tools(&self.tools_required, snap)
+    }
+
+    /// V0.2 M0.18: effective completion signal the inject prompt should
+    /// reference. Falls back to `PHASE_DONE: <name>` when the yaml
+    /// omits the field — mirrors the historic hardcoded inject string
+    /// so legacy phase yamls keep behaving the same after the inject-
+    /// prompt template lands.
+    pub fn effective_completion_signal(&self) -> String {
+        let trimmed = self.completion_signal.trim();
+        if trimmed.is_empty() {
+            format!("PHASE_DONE: {}", self.name)
+        } else {
+            trimmed.to_string()
+        }
+    }
+
+    /// V0.2 M0.18: effective ESCALATE grammar dialect. Defaults to
+    /// `DEFAULT_ESCALATE_GRAMMAR_REF` when omitted.
+    pub fn effective_escalate_grammar_ref(&self) -> &str {
+        self.escalate_grammar_ref
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(DEFAULT_ESCALATE_GRAMMAR_REF)
+    }
+
+    /// V0.2 M0.18: effective outbox-question protocol. Defaults to
+    /// `DEFAULT_OUTBOX_QUESTION_PROTOCOL` when omitted.
+    pub fn effective_outbox_question_protocol(&self) -> &str {
+        self.outbox_question_protocol
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(DEFAULT_OUTBOX_QUESTION_PROTOCOL)
+    }
+
+    /// V0.2 M0.18: effective inject directives. Empty `Some(vec![])`
+    /// is honored (a phase opts out of every conditional segment) —
+    /// only `None` falls back to defaults.
+    pub fn effective_inject_directives(&self) -> Vec<String> {
+        match self.inject_directives.as_ref() {
+            Some(list) => list.clone(),
+            None => DEFAULT_INJECT_DIRECTIVES
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+        }
     }
 }
 
@@ -443,7 +575,12 @@ mod tests {
     }
 
     #[test]
-    fn auto_loop_true_without_completion_signal_fails_validation() {
+    fn auto_loop_true_without_completion_signal_defaults_to_phase_done_phase_name() {
+        // V0.2 M0.18: a phase yaml that omits `completion_signal` is no
+        // longer a validation error. The inject-prompt builder + auto-
+        // loop bootstrap synthesize `PHASE_DONE: <name>` via
+        // `effective_completion_signal()`. Drops a body-level reason
+        // for phase markdown to repeat the protocol literal.
         let src = concat!(
             "---\n",
             "name: fix\n",
@@ -453,11 +590,8 @@ mod tests {
             "body\n",
         );
         let t = PhaseTemplate::parse(src).unwrap();
-        let err = t.validate_m0().unwrap_err();
-        assert!(
-            format!("{err:#}").contains("completion_signal"),
-            "got: {err:#}",
-        );
+        t.validate_m0().unwrap();
+        assert_eq!(t.effective_completion_signal(), "PHASE_DONE: fix");
     }
 
     #[test]
@@ -622,6 +756,138 @@ mod tests {
             format!("{err:#}").contains("confused"),
             "got: {err:#}",
         );
+    }
+
+    // ---------------- V0.2 M0.18 inject-prompt frontmatter ----------------
+
+    #[test]
+    fn m018_completion_signal_defaults_to_phase_done_phase_when_omitted() {
+        let src = concat!(
+            "---\n",
+            "name: implement\n",
+            "parallelism: solo\n",
+            "---\n",
+        );
+        let t = PhaseTemplate::parse(src).unwrap();
+        assert_eq!(t.effective_completion_signal(), "PHASE_DONE: implement");
+    }
+
+    #[test]
+    fn m018_completion_signal_explicit_value_takes_priority() {
+        let src = concat!(
+            "---\n",
+            "name: fix\n",
+            "parallelism: solo\n",
+            "auto_loop: true\n",
+            "completion_signal: TESTS_GREEN\n",
+            "---\n",
+        );
+        let t = PhaseTemplate::parse(src).unwrap();
+        assert_eq!(t.effective_completion_signal(), "TESTS_GREEN");
+    }
+
+    #[test]
+    fn m018_escalate_grammar_ref_defaults_to_standard() {
+        let src = "---\nname: x\nparallelism: solo\n---\n";
+        let t = PhaseTemplate::parse(src).unwrap();
+        assert_eq!(t.effective_escalate_grammar_ref(), "standard");
+    }
+
+    #[test]
+    fn m018_outbox_question_protocol_defaults_to_v1() {
+        let src = "---\nname: x\nparallelism: solo\n---\n";
+        let t = PhaseTemplate::parse(src).unwrap();
+        assert_eq!(t.effective_outbox_question_protocol(), "v1");
+    }
+
+    #[test]
+    fn m018_inject_directives_default_when_omitted() {
+        let src = "---\nname: x\nparallelism: solo\n---\n";
+        let t = PhaseTemplate::parse(src).unwrap();
+        let d = t.effective_inject_directives();
+        assert!(d.contains(&"read_inputs".to_string()));
+        assert!(d.contains(&"completion_signal".to_string()));
+        assert!(d.contains(&"escalate_grammar".to_string()));
+    }
+
+    #[test]
+    fn m018_inject_directives_explicit_empty_opts_out_of_all_segments() {
+        let src = concat!(
+            "---\n",
+            "name: x\n",
+            "parallelism: solo\n",
+            "inject_directives: []\n",
+            "---\n",
+        );
+        let t = PhaseTemplate::parse(src).unwrap();
+        assert!(t.effective_inject_directives().is_empty());
+    }
+
+    #[test]
+    fn m018_inject_directives_unknown_name_fails_validation() {
+        let src = concat!(
+            "---\n",
+            "name: x\n",
+            "parallelism: solo\n",
+            "inject_directives:\n",
+            "  - bogus_directive\n",
+            "---\n",
+        );
+        let t = PhaseTemplate::parse(src).unwrap();
+        let err = t.validate_m0().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("bogus_directive"),
+            "got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn m018_empty_escalate_grammar_ref_string_fails_validation() {
+        let src = concat!(
+            "---\n",
+            "name: x\n",
+            "parallelism: solo\n",
+            "escalate_grammar_ref: ''\n",
+            "---\n",
+        );
+        let t = PhaseTemplate::parse(src).unwrap();
+        let err = t.validate_m0().unwrap_err();
+        assert!(format!("{err:#}").contains("escalate_grammar_ref"));
+    }
+
+    #[test]
+    fn m018_empty_outbox_question_protocol_fails_validation() {
+        let src = concat!(
+            "---\n",
+            "name: x\n",
+            "parallelism: solo\n",
+            "outbox_question_protocol: ''\n",
+            "---\n",
+        );
+        let t = PhaseTemplate::parse(src).unwrap();
+        let err = t.validate_m0().unwrap_err();
+        assert!(format!("{err:#}").contains("outbox_question_protocol"));
+    }
+
+    #[test]
+    fn m018_legacy_phase_yaml_without_v02_fields_still_parses() {
+        // Mirror of the M2 / M3 era yaml shape — every V0.2 inject-
+        // prompt field defaulted means existing dev / product-research
+        // phase markdowns load unchanged.
+        let src = concat!(
+            "---\n",
+            "name: implement\n",
+            "required_inputs: [.ccteam/plan-eng.md]\n",
+            "required_outputs: [.ccteam/implement-report.md]\n",
+            "parallelism: solo\n",
+            "---\n",
+            "body\n",
+        );
+        let t = PhaseTemplate::parse(src).unwrap();
+        assert!(t.escalate_grammar_ref.is_none());
+        assert!(t.outbox_question_protocol.is_none());
+        assert!(t.inject_directives.is_none());
+        assert_eq!(t.effective_completion_signal(), "PHASE_DONE: implement");
     }
 
     #[test]

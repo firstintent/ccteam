@@ -49,7 +49,7 @@ max_clarify_rounds: 5
 
 **不要问**实现技术(语言、框架)——那是 dev 团队 plan-eng 的活,本团队不关心。
 
-## 输出 `.ccteam/brief.md`
+## 输出 `brief.md` 内容要点
 
 按反向面试模板的"综合 brief"章节产出。**必有**段落:
 
@@ -58,16 +58,5 @@ max_clarify_rounds: 5
 - 仍未确定但可推进的假设
 - 建议的下一阶段:应当是 `market-survey`(下一 phase)
 
-## 退出
-
-写完 `.ccteam/brief.md` 后输出末行:
-
-```
-PHASE_DONE: kickoff
-```
-
-如果 5 轮 CLARIFY 仍无法得到关键事实,产出 best-effort brief 后 ESCALATE:
-
-```
-ESCALATE: INSUFFICIENT_CLARIFICATION — 关键问题描述
-```
+5 轮 CLARIFY 仍无法得到关键事实时,产出 best-effort brief,并以
+`INSUFFICIENT_CLARIFICATION` prefix 走异常出口,reason 描述哪几个关键问题没解决。

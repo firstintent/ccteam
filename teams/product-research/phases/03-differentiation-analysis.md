@@ -14,7 +14,7 @@ max_clarify_rounds: 3
 
 # Differentiation Analysis — 差异化分析
 
-读 `@.ccteam/brief.md` 与 `@.ccteam/market-survey.md`,回答:**这个 idea 与现有方案相比,差异化在哪里?差到能让用户切换吗?**
+读 `brief.md` 与 `market-survey.md`,回答:**这个 idea 与现有方案相比,差异化在哪里?差到能让用户切换吗?**
 
 ## 必答的三件事
 
@@ -40,20 +40,13 @@ max_clarify_rounds: 3
 
 20 字以内回答:用户为什么选这个方案,而不是 market-survey 列的任一现有方案?
 
-如果答不出来 / 答案像"功能更全"这种空话 → 差异化 == 0,触发 LOW_DIFFERENTIATION。
+如果答不出来 / 答案像"功能更全"这种空话 → 差异化 == 0,触发 `LOW_DIFFERENTIATION` 异常出口。
 
-## 退出
+## 异常分流(domain-specific)
 
-差异化清楚:
+`LOW_DIFFERENTIATION` prefix(team.yaml 注册;route revert_to_phase → kickoff):
+差异化不存在或仅是"颜色不同"级别的伪差异时使用。reason 写"现有方案已覆盖核心需求,
+无可持续差异"或类似的具体描述。
 
-```
-PHASE_DONE: differentiation-analysis
-```
-
-差异化不存在或仅是"颜色不同"级别的伪差异:
-
-```
-ESCALATE: LOW_DIFFERENTIATION — 现有方案已覆盖核心需求,无可持续差异
-```
-
-(此 prefix 由 team.yaml 注册;路由 revert_to_phase → kickoff,让用户重新审视 brief。差异化不存在通常意味着 idea 切入点不对,需要换角度而不是继续推进。)
+差异化不存在通常意味着 idea 切入点不对,需要换角度而不是继续推进 — 因此走
+revert 路径让用户重新审视 brief。
