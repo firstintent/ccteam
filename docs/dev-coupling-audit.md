@@ -27,13 +27,14 @@
 **2026-05-06 post-M3/M4 sweep**:F2/F3/F4/F9/F10/F11/F12/F13/F20 由 M3 团队
 抽象 + M4 跨项目记忆批量关闭;**2026-05-07 fix_loop → auto_loop rename batch**:
 F1/F5/F6/F7/F8/F18 由独立 PR 一波关闭;**2026-05-08 V0.2 M0.23**:加 F24 + F25
-P0 + 同 PR 关闭),分布:
+P0 + 同 PR 关闭;**2026-05-08 V0.2 e2e retro**:加 F26-F33 八条 V0.2.1 候选),
+分布:
 
 | 优先级 | 数量 | 编号 |
 |---|---|---|
 | **P0 阻塞泛化(剩余)** | 0 | — |
-| **P1 该做但可后置(剩余)** | 2 | F15(M1+ block-push 时做)、F23(conditional;待 spike 重跑) |
-| **P2 边角(剩余)** | 1 | F17 |
+| **P1 该做但可后置(剩余)** | 6 | F15(M1+ block-push 时做)、F23(conditional;待 spike 重跑)、**F28 / F29 / F30 / F31(2026-05-08 V0.2 e2e 加,V0.2.1 候选)** |
+| **P2 边角(剩余)** | 5 | F17、**F26 / F27 / F32 / F33(2026-05-08 V0.2 e2e 加,V0.2.1 候选)** |
 | **N/A 已是领域无关** | 2 | F14, F19(M3 docs sweep 后)|
 | **已修复** | 20 | F1 / F5 / F6 / F7 / F18(2026-05-07 rename PR;F1 触发逻辑实际早 M3.1 已切到 template.auto_loop,本 PR 完成命名层 sweep)、F2 / F3 / F4(M3.1 dag.rs)、F8(2026-05-07 directory scan)、F9 / F10 / F11(M3.4 team-aware bootstrap;F11 dev 仍裸 `phases/` 但非阻塞)、F12 / F13(M3.3 `--team` CLI + `state.team`)、F16(M3.4 phase 模板 team 化)、F20(M3.1+M3.4 retro_schema 数据形式 + product-research 填字段 + M4.1 phase 消费)、F21(@a5fb21d)、F22(PR #12)、**F24 / F25(2026-05-08 M0.23 PR)** |
 
@@ -520,6 +521,67 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
 - **后续**:Claude 团队若推出更新 model 别名(eg `claude-sonnet-4-7[1m]`),
   改 `DEFAULT_CLAUDE_MODEL` 一处即可;CLI flag 形式保持稳定。
 
+### F28 — Project-layer team override 是 dead code(2026-05-08 加,待 V0.2.1)
+
+- **文件:行号**:`crates/ccteam-core/src/team_resolver.rs:48-52`
+  (`TEAM_SOURCES = [Project, User, Repo]`)+ `:139`(`with_project()`
+  builder);production callers 均不带 `with_project`
+  (`orchestrator.rs:1717` `for_orchestrator(...)` /
+  `commands.rs:909` `run_phase_show` 同)。
+- **现状**:M0.17 三层 resolver 设计 + docs 描述 first-source-wins,但
+  `<project>/.ccteam/team/team.yaml` 在 production path 永远不被探查;
+  User layer 与 Repo layer fall-through 工作正常。
+- **是否真 dev-specific**:**否——team resolution 基础设施。**
+- **解耦方案**:`for_orchestrator(...)` callsite 改
+  `with_project(state.project_dir)`;`run_phase_show` 同;补 e2e 验证
+  project 层真 first-source-wins。
+- **优先级**:**P1**(用户报"per-project override 不生效"时阻塞)。
+- **来源**:V0.2 e2e Suite B B5 / `docs/v0-2/e2e-retro.md`。
+
+### F29 — 无 CLI/env stub-claude 注入路径(2026-05-08 加,待 V0.2.1)
+
+- **文件:行号**:`crates/ccteam-core/src/orchestrator.rs:238`
+  (`OrchestratorConfig.claude_argv` 仅 Rust struct);
+  `ccteam-cli/src/main.rs` `Command::Start` 无 `--claude-argv` flag;
+  `OrchestratorConfig::default()` 不读 `CCTEAM_CLAUDE_ARGV`。
+- **现状**:Rust unit/integration test 通过
+  `claude_argv: vec!["sh", "-c", ...]` stub claude;CLI e2e / CI smoke
+  无注入路径,phase pipeline 必须真 spawn claude(烧 LLM cost)。
+- **是否真 dev-specific**:**否——测试基础设施。**
+- **解耦方案**:`OrchestratorConfig::default()` 读 `CCTEAM_CLAUDE_ARGV`
+  (shell-split);`ccteam start --claude-argv "<line>"` flag。
+- **优先级**:**P1**(testability;阻塞纯 CLI e2e 验证 phase loop)。
+- **来源**:V0.2 e2e Suite B B1/B2 / `docs/v0-2/e2e-retro.md`。
+
+### F30 — `doctor --validate-team` `[FAIL]` 不影响 exit code(2026-05-08 加,待 V0.2.1)
+
+- **文件:行号**:`crates/ccteam-cli/src/commands.rs::render_validate_team_report`
+  (line 719 起);Summary 计数器只 sum 每 phase finding,plugin-section
+  的 `[FAIL]` 行(eg `plugin.json parse: missing field 'author'`)不入
+  Summary,exit code 始终 0。
+- **现状**:`doctor --help` 文案 "Fails-loud on schema violations and
+  IO-contract gaps" 与实际行为冲突;CI / 脚本无法
+  `&& gh release ...` gate。
+- **是否真 dev-specific**:**否——doctor 基础设施。**
+- **解耦方案**:`render_validate_team_report` 累计 plugin-section
+  `[FAIL]` 进 Summary;exit code 据 `failures > 0` 设非零。
+- **优先级**:**P1**(team factory CI gating 缺位)。
+- **来源**:V0.2 e2e Suite D D7 / `docs/v0-2/e2e-retro.md`。
+
+### F31 — `TeamSpec` 缺 `#[serde(deny_unknown_fields)]`(2026-05-08 加;落实 M0.22 ⚠1,待 V0.2.1)
+
+- **文件:行号**:`crates/ccteam-core/src/team.rs:107`(`TeamSpec` struct
+  顶级)+ nested(`TeamGoldenRules` 等)。
+- **现状**:typo(eg `cost_polciy:`)静默 fall-back 到默认值;团队作者
+  无 feedback。M0.22 PR description ⚠1 已 flag,V0.2 e2e Suite D D8 复现。
+- **是否真 dev-specific**:**否——团队作者 UX。**
+- **解耦方案**:加 `#[serde(deny_unknown_fields)]` 到 `TeamSpec` +
+  nested;补 1 个 negative 测试。注:**plugin manifest 顶级保留
+  `team.yaml` unknown 字段(M0.22 ⚠1)是 zod-strip 设计,与 ccteam 自己
+  的 `TeamSpec` 严格 schema 互不冲突。**
+- **优先级**:**P1**(team factory ship 前最好修)。
+- **来源**:V0.2 e2e Suite D D8 / M0.22 PR ⚠1 / `docs/v0-2/e2e-retro.md`。
+
 ---
 
 ## P2 — 边角
@@ -560,6 +622,65 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
 - **是否真 dev-specific**:**命名上**——同 F5/F6/F7,机制是 auto-loop。
 - **解耦方案**:F5 重命名时一并改,`fix_loop_test.rs` → `auto_loop_test.rs`。
 - **优先级**:**P2**(随 F5 一并改)。
+
+### F26 — `mcp_serve::install_mcp()` 不 honor `CLAUDE_CONFIG_HOME`(2026-05-08 加,待 V0.2.1)
+
+- **文件:行号**:`crates/ccteam-cli/src/mcp_serve.rs:660-666`
+  (用 `dirs::home_dir()` 写入 `~/.claude.json`,asymmetric with
+  `--install-skill` / `--install-memory-bridge` 走 `user_claude_dir()`)。
+- **现状**:e2e 隔离测试必须叠加 `HOME=$E2E_ROOT` 兜底,否则
+  `--install-mcp` 写入用户真 `~/.claude.json`。
+- **是否真 dev-specific**:**否——env 处理一致性。**
+- **解耦方案**:走 `user_claude_dir()`(已 honor `CLAUDE_CONFIG_HOME`)。
+- **优先级**:**P2**(e2e harness 痛点,production 用户透明)。
+- **来源**:V0.2 e2e Suite A / `docs/v0-2/e2e-retro.md`。
+
+### F27 — `ccteam ls` 无 daemon health 注解(2026-05-08 加,待 V0.2.1)
+
+- **文件:行号**:`crates/ccteam-cli/src/commands.rs::render_ls_text`
+  (1391-1409 行;无 daemon section);`render_ls_json`(1422-1456;
+  `orchestrator.running: null` 硬编码);`crates/ccteam-core/src/daemon.rs:46-49`
+  (无 public `heartbeat_alive(paths) -> bool` helper)。
+- **现状**:M0.23.1 daemon health check 已加到 MCP write 路径(F24
+  closed),`ls` read-only 不 block 但也不注解;`docs/v0-2/dev-plan.md §9`
+  M0.23.1 文字未明确要求 `ls` 注解。
+- **是否真 dev-specific**:**否——观测层 UX。**
+- **解耦方案**:`daemon.rs` 加 public `heartbeat_alive(&Paths) -> bool`;
+  `render_ls_text` 加 head 一行 `daemon: <up|down>`;`render_ls_json`
+  填 `orchestrator.running` 字段。
+- **优先级**:**P2**(meta-agent 已可通过 MCP `ls` JSON `orchestrator`
+  字段读取 — 该字段需先填值)。
+- **来源**:V0.2 e2e Suite A A5 / `docs/v0-2/e2e-retro.md`。
+
+### F32 — daemon path doc drift(2026-05-08 加,docs-only)
+
+- **文件:行号**:`docs/v0-2/dev-plan.md §9` M0.23.1 写
+  `~/.ccteam/daemon.{pid,heartbeat}`;实际代码路径
+  `~/.ccteam/state/orchestrator.{pid,heartbeat}`(`crates/ccteam-core/src/daemon.rs:30,47`)。
+- **现状**:F24 PR description 已记录"沿用 M1.5 已建立的 `state/`
+  子目录约定 + `orchestrator.pid` 现有命名,语义等价";`tech-design.md
+  §6.8` 已对齐,`dev-plan.md §9` 待回填。
+- **是否真 dev-specific**:**否——纯 docs。**
+- **解耦方案**:`docs/v0-2/dev-plan.md §9` M0.23.1 路径段更新一行。
+- **优先级**:**P2**(cosmetic;不影响代码)。
+- **来源**:V0.2 e2e Suite A / `docs/v0-2/e2e-retro.md`。
+
+### F33 — team factory phase scaffold body 含 bare protocol tokens(2026-05-08 加,待 V0.2.1)
+
+- **文件:行号**:`crates/ccteam-core/src/team_factory.rs` phase
+  scaffold render(`init_phase_body_excludes_protocol_literals` test
+  enforces colon-grammar `PHASE_DONE: <name>` / `ESCALATE:` 不出现);
+  生成的 `01-intake.md` 末尾注释含 bare `PHASE_DONE` / `ESCALATE`
+  tokens(无 colon)说明"正文不写协议关键字"。
+- **现状**:validator 正确跳过(M0.18.5 residue check 抓的是
+  `PHASE_DONE: <name>` colon-grammar);但 LLM 读到这段注释时可能误解
+  bare token 为 signal。
+- **是否真 dev-specific**:**否——team factory 模板措辞。**
+- **解耦方案**:scaffold 注释改用 backticks 引号或别的指代
+  (eg `"协议关键字(由 orchestrator inject prompt 注入)"`);或彻底
+  从 body 删,只在用户指南文档讲。
+- **优先级**:**P2**(cosmetic;validator 行为正确)。
+- **来源**:V0.2 e2e Suite D D5 / `docs/v0-2/e2e-retro.md`。
 
 ---
 
