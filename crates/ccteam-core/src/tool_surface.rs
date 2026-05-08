@@ -1,23 +1,16 @@
-//! Tool-surface foundation (M0.5). Makes Claude Code's plugin agents
-//! and skills callable from inside ccteam-managed long sessions.
+//! Tool-surface foundation. Validates phase YAML's
+//! `tools_required` (subagents / skills / MCP servers) against what's
+//! reachable on this machine.
 //!
-//! Two artifacts shipped here:
-//!
-//! 1. `RECOMMENDED_AGENTS` — the eight `claude-plugins-official` plugin
-//!    agents that ccteam phase markdown is allowed to invoke via
-//!    `Task(subagent_type=…)`. Plugin agents do **not** auto-register
-//!    in Claude Code's `Task` namespace just because the plugin is
-//!    installed (per `docs/claude-code-tool-surface.md` §1.1.2 / §1.2.5);
-//!    we have to symlink each `<plugin>/agents/<name>.md` into
-//!    `~/.claude/agents/` **before** the tmux session starts, since
-//!    Claude Code scans that directory at session start and never again.
-//!
-//! 2. `ensure_skills_placeholders` — pre-creates the global and
-//!    project-local skills directories (even empty) so Claude Code's
-//!    live SKILL.md monitor (§1.2.4) attaches at session start. Without
-//!    this, "lazy-inject a skill mid-session" silently fails.
-//!
-//! Pure-ish: file-system mutations only; no orchestrator side effects.
+//! V0.2 M0.20 (candidate 7) replaces the M0.5 `RECOMMENDED_AGENTS`
+//! ln -sf protocol with Claude Code's in-memory plugin pipeline:
+//! `bootstrap_project` writes `enabledPlugins` into the spawned
+//! project's `.claude/settings.json`, Claude Code namespaces plugin
+//! agents as `<plugin>:<name>` automatically, and ccteam-core no
+//! longer touches `~/.claude/agents/`. The reachability check here
+//! walks the plugin pipeline (via [`plugin_resolution`]) plus
+//! `~/.claude/agents/` (operator's user-authored customs) plus
+//! `~/.claude/skills/` (user skills) plus plugin-shipped skills.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -25,280 +18,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// One recommended plugin agent we link into `~/.claude/agents/`.
-///
-/// `filename` is the basename used inside `~/.claude/agents/` and the
-/// `subagent_type` Claude Code will accept (e.g. `code-reviewer.md` →
-/// `Task(subagent_type="code-reviewer")`). `plugin` is the
-/// `claude-plugins-official` plugin directory name; `relpath` is the
-/// path inside that plugin to the agent file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RecommendedAgent {
-    pub filename: &'static str,
-    pub plugin: &'static str,
-    pub relpath: &'static str,
-}
-
-impl RecommendedAgent {
-    /// `subagent_type` Claude Code accepts for `Task(subagent_type=…)`,
-    /// derived from `filename` (drop trailing `.md`).
-    pub fn subagent_type(&self) -> &'static str {
-        self.filename.strip_suffix(".md").unwrap_or(self.filename)
-    }
-
-    /// Absolute path to the plugin's agent file under
-    /// `<claude_dir>/plugins/marketplaces/claude-plugins-official/plugins/`.
-    pub fn source_path(&self, claude_dir: &Path) -> PathBuf {
-        claude_dir
-            .join("plugins")
-            .join("marketplaces")
-            .join("claude-plugins-official")
-            .join("plugins")
-            .join(self.plugin)
-            .join(self.relpath)
-    }
-}
-
-/// The eight plugin agents `bootstrap_project` symlinks into
-/// `~/.claude/agents/`. Source list: `docs/claude-code-tool-surface.md`
-/// §6.2 (kept identical so the doctor cross-check is straightforward).
-pub const RECOMMENDED_AGENTS: &[RecommendedAgent] = &[
-    RecommendedAgent {
-        filename: "code-reviewer.md",
-        plugin: "pr-review-toolkit",
-        relpath: "agents/code-reviewer.md",
-    },
-    RecommendedAgent {
-        filename: "silent-failure-hunter.md",
-        plugin: "pr-review-toolkit",
-        relpath: "agents/silent-failure-hunter.md",
-    },
-    RecommendedAgent {
-        filename: "pr-test-analyzer.md",
-        plugin: "pr-review-toolkit",
-        relpath: "agents/pr-test-analyzer.md",
-    },
-    RecommendedAgent {
-        filename: "type-design-analyzer.md",
-        plugin: "pr-review-toolkit",
-        relpath: "agents/type-design-analyzer.md",
-    },
-    RecommendedAgent {
-        filename: "comment-analyzer.md",
-        plugin: "pr-review-toolkit",
-        relpath: "agents/comment-analyzer.md",
-    },
-    RecommendedAgent {
-        filename: "code-architect.md",
-        plugin: "feature-dev",
-        relpath: "agents/code-architect.md",
-    },
-    RecommendedAgent {
-        filename: "code-explorer.md",
-        plugin: "feature-dev",
-        relpath: "agents/code-explorer.md",
-    },
-    RecommendedAgent {
-        filename: "code-simplifier.md",
-        plugin: "code-simplifier",
-        relpath: "agents/code-simplifier.md",
-    },
-];
-
-/// What `link_recommended_agents_into` did for one agent. Surfaced so
-/// `ccteam doctor --install-recommended-agents` can render a per-agent
-/// status line.
-///
-/// The `Kept` vs `Replaced` split matters: a foreign symlink left
-/// in place (Kept) means `Task(subagent_type=…)` will hit the user's
-/// stale target, **not** the plugin source we wanted; only `Replaced`
-/// (force=true) actually leaves the registration in a usable state.
-/// `is_ok` reflects this so the doctor verdict doesn't lie.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AgentLinkAction {
-    /// Created a fresh symlink target → source.
-    Linked,
-    /// A symlink already pointed at our source; no-op.
-    AlreadyLinked,
-    /// Symlink existed and pointed *elsewhere*. We removed it and
-    /// replaced it with our source (force=true). Now correct.
-    Replaced { previous_target: PathBuf },
-    /// Symlink existed and pointed *elsewhere*. force=false, so we
-    /// left it alone. The slot is **not** wired to our plugin source —
-    /// `Task(subagent_type=…)` will still hit the wrong target.
-    Kept { previous_target: PathBuf },
-    /// A regular file existed at the target; skipped to preserve user
-    /// authorship. `force=true` would replace it instead.
-    SkippedUserFile,
-    /// Source file is missing under the plugins dir; skipped. The user
-    /// likely uninstalled the plugin (or the marketplace path differs).
-    SkippedSourceMissing { source: PathBuf },
-    /// Would-be no-op in `--dry-run` mode.
-    DryRun { would: Box<AgentLinkAction> },
-}
-
-impl AgentLinkAction {
-    /// True if this action made (or would make) the symlink point at
-    /// our plugin source. Used by the `bootstrap` and `doctor` paths
-    /// to decide overall success. **Excludes** `Kept` because that
-    /// leaves a foreign symlink in place.
-    pub fn is_ok(&self) -> bool {
-        match self {
-            AgentLinkAction::Linked
-            | AgentLinkAction::AlreadyLinked
-            | AgentLinkAction::Replaced { .. } => true,
-            AgentLinkAction::DryRun { would } => would.is_ok(),
-            AgentLinkAction::Kept { .. }
-            | AgentLinkAction::SkippedUserFile
-            | AgentLinkAction::SkippedSourceMissing { .. } => false,
-        }
-    }
-}
-
-/// One per-agent line in the report.
-#[derive(Debug, Clone)]
-pub struct AgentLinkReport {
-    pub agent: RecommendedAgent,
-    pub target: PathBuf,
-    pub action: AgentLinkAction,
-}
-
-/// `link_recommended_agents` policy knob.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct LinkOptions {
-    /// Replace user-authored regular files / symlinks pointing
-    /// elsewhere. Default false: keep user files and warn instead.
-    pub force: bool,
-    /// Print + return what *would* happen but don't touch the
-    /// filesystem. Used by `ccteam doctor --install-recommended-agents
-    /// --dry-run`.
-    pub dry_run: bool,
-}
-
-/// Symlink every `RECOMMENDED_AGENTS` entry from its plugin source into
-/// `<claude_dir>/agents/`. Test seam — production callers go through
-/// [`link_recommended_agents`] which resolves `claude_dir` from
-/// `dirs::home_dir()`.
-pub fn link_recommended_agents_into(
-    claude_dir: &Path,
-    opts: LinkOptions,
-) -> Result<Vec<AgentLinkReport>> {
-    let agents_dir = claude_dir.join("agents");
-    if !opts.dry_run {
-        std::fs::create_dir_all(&agents_dir)
-            .with_context(|| format!("create {}", agents_dir.display()))?;
-    }
-
-    let mut out = Vec::with_capacity(RECOMMENDED_AGENTS.len());
-    for agent in RECOMMENDED_AGENTS {
-        let source = agent.source_path(claude_dir);
-        let target = agents_dir.join(agent.filename);
-        let action = link_one_agent(&source, &target, opts)?;
-        out.push(AgentLinkReport {
-            agent: *agent,
-            target,
-            action,
-        });
-    }
-    Ok(out)
-}
-
-fn link_one_agent(
-    source: &Path,
-    target: &Path,
-    opts: LinkOptions,
-) -> Result<AgentLinkAction> {
-    if !source.exists() {
-        return Ok(AgentLinkAction::SkippedSourceMissing {
-            source: source.to_path_buf(),
-        });
-    }
-
-    let inner = if let Some(existing) = read_symlink_safe(target)? {
-        if existing == source {
-            AgentLinkAction::AlreadyLinked
-        } else if opts.force {
-            if !opts.dry_run {
-                std::fs::remove_file(target).with_context(|| {
-                    format!("remove existing symlink {}", target.display())
-                })?;
-                symlink_file(source, target)?;
-            }
-            AgentLinkAction::Replaced {
-                previous_target: existing,
-            }
-        } else {
-            AgentLinkAction::Kept {
-                previous_target: existing,
-            }
-        }
-    } else if target.exists() {
-        if opts.force {
-            if !opts.dry_run {
-                std::fs::remove_file(target).with_context(|| {
-                    format!("remove user file {}", target.display())
-                })?;
-                symlink_file(source, target)?;
-            }
-            AgentLinkAction::Linked
-        } else {
-            AgentLinkAction::SkippedUserFile
-        }
-    } else {
-        if !opts.dry_run {
-            symlink_file(source, target)?;
-        }
-        AgentLinkAction::Linked
-    };
-
-    Ok(if opts.dry_run {
-        AgentLinkAction::DryRun {
-            would: Box::new(inner),
-        }
-    } else {
-        inner
-    })
-}
-
-/// Resolve a symlink at `path` to its absolute target if (and only if)
-/// `path` is a symlink. Returns `Ok(None)` for regular files / missing
-/// paths so the caller can branch on those separately.
-fn read_symlink_safe(path: &Path) -> Result<Option<PathBuf>> {
-    let meta = match std::fs::symlink_metadata(path) {
-        Ok(m) => m,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => {
-            return Err(err)
-                .with_context(|| format!("symlink_metadata {}", path.display()));
-        }
-    };
-    if !meta.file_type().is_symlink() {
-        return Ok(None);
-    }
-    let raw = std::fs::read_link(path)
-        .with_context(|| format!("read_link {}", path.display()))?;
-    let resolved = if raw.is_absolute() {
-        raw
-    } else {
-        path.parent()
-            .map(|p| p.join(&raw))
-            .unwrap_or(raw)
-    };
-    Ok(Some(resolved))
-}
-
-#[cfg(unix)]
-fn symlink_file(source: &Path, target: &Path) -> Result<()> {
-    std::os::unix::fs::symlink(source, target)
-        .with_context(|| format!("symlink {} → {}", target.display(), source.display()))
-}
-
-#[cfg(not(unix))]
-fn symlink_file(_source: &Path, _target: &Path) -> Result<()> {
-    Err(anyhow!(
-        "ccteam tool-surface symlinks are not supported on this platform yet",
-    ))
-}
+use crate::plugin_resolution::{lookup_plugin_agent, KNOWN_PLUGIN_AGENTS};
 
 /// Resolve the user's `~/.claude/` directory (where Claude Code scans
 /// `agents/` and `skills/`). Honors `CLAUDE_CONFIG_HOME` for testing.
@@ -311,125 +31,11 @@ pub fn user_claude_dir() -> Result<PathBuf> {
     Ok(home.join(".claude"))
 }
 
-/// Production entry point: resolve `~/.claude/` and call
-/// [`link_recommended_agents_into`].
-pub fn link_recommended_agents(opts: LinkOptions) -> Result<Vec<AgentLinkReport>> {
-    let claude_dir = user_claude_dir()?;
-    link_recommended_agents_into(&claude_dir, opts)
-}
-
-/// M2.1 extension: like [`link_recommended_agents_into`] but also
-/// walks every phase template's `sub_skills` list, parses any
-/// `claude-plugins-official:<plugin>/agents/<name>.md` reference, and
-/// links the plugin source into `<claude_dir>/agents/<name>.md` —
-/// even if the agent isn't in [`RECOMMENDED_AGENTS`]. Result is the
-/// union of "8 hardcoded recommended" + "everything phase YAML asks
-/// for", deduplicated by target filename.
-///
-/// Tools_required.subagents are *not* auto-linked here — they're a
-/// names-only list with no source-path information; the operator is
-/// responsible for placing custom agents under `~/.claude/agents/`.
-/// The orchestrator's startup tool-surface check (M0.5.3) catches
-/// the missing case with a fix-hint.
-pub fn link_recommended_agents_for_phases_into(
-    claude_dir: &Path,
-    templates: &[crate::phases::PhaseTemplate],
-    opts: LinkOptions,
-) -> Result<Vec<AgentLinkReport>> {
-    let mut reports = link_recommended_agents_into(claude_dir, opts)?;
-
-    let agents_dir = claude_dir.join("agents");
-    if !opts.dry_run {
-        std::fs::create_dir_all(&agents_dir)
-            .with_context(|| format!("create {}", agents_dir.display()))?;
-    }
-
-    let mut seen: BTreeSet<&str> = reports.iter().map(|r| r.agent.filename).collect();
-    for template in templates {
-        for spec in &template.sub_skills {
-            let Some((source, leaked_filename)) =
-                parse_official_plugin_subagent(&spec.skill)
-            else {
-                continue;
-            };
-            if seen.contains(leaked_filename) {
-                continue;
-            }
-            // Link target stays under <claude_dir>/agents/, same as
-            // RECOMMENDED_AGENTS.
-            let abs_source = claude_dir
-                .join("plugins")
-                .join("marketplaces")
-                .join("claude-plugins-official")
-                .join("plugins")
-                .join(&source);
-            let target = agents_dir.join(leaked_filename);
-            let action = link_one_agent(&abs_source, &target, opts)?;
-            reports.push(AgentLinkReport {
-                // Build a synthetic RecommendedAgent — the report
-                // type is shared with the hardcoded path; we only
-                // need enough for the operator to read.
-                agent: RecommendedAgent {
-                    filename: Box::leak(leaked_filename.to_string().into_boxed_str()),
-                    plugin: Box::leak(plugin_part(&source).to_string().into_boxed_str()),
-                    relpath: Box::leak(rel_part(&source).to_string().into_boxed_str()),
-                },
-                target,
-                action,
-            });
-            seen.insert(Box::leak(leaked_filename.to_string().into_boxed_str()));
-        }
-    }
-    Ok(reports)
-}
-
-/// Production entry: resolve `~/.claude/` then call the phase-aware
-/// variant. Used by `bootstrap_project` so every project-creation
-/// path stages every plugin agent the templates declare.
-pub fn link_recommended_agents_for_phases(
-    templates: &[crate::phases::PhaseTemplate],
-    opts: LinkOptions,
-) -> Result<Vec<AgentLinkReport>> {
-    let claude_dir = user_claude_dir()?;
-    link_recommended_agents_for_phases_into(&claude_dir, templates, opts)
-}
-
-/// Parse `claude-plugins-official:<plugin>/agents/<name>.md`. Returns
-/// `(plugin/agents/<name>.md, <name>.md)` — the first component is
-/// joined under `plugins/marketplaces/claude-plugins-official/plugins/`
-/// for the abs source path, the second is the basename used under
-/// `<claude_dir>/agents/`.
-fn parse_official_plugin_subagent(skill: &str) -> Option<(String, &str)> {
-    let rest = skill.strip_prefix("claude-plugins-official:")?;
-    // Only auto-link when the relative path looks like an agent file.
-    // sub_skills can also reference hooks (.sh / .py) which Claude Code
-    // doesn't load via Task — those should not become symlinks under
-    // ~/.claude/agents/.
-    if !rest.contains("/agents/") || !rest.ends_with(".md") {
-        return None;
-    }
-    let filename = rest.rsplit('/').next()?;
-    Some((rest.to_string(), filename))
-}
-
-fn plugin_part(rest: &str) -> &str {
-    rest.split('/').next().unwrap_or(rest)
-}
-
-fn rel_part(rest: &str) -> &str {
-    let mut parts = rest.splitn(2, '/');
-    parts.next();
-    parts.next().unwrap_or(rest)
-}
-
 /// Test-only helper: set `CCTEAM_DISABLE_TOOL_SURFACE_BOOTSTRAP=1` so
 /// any subsequent `bootstrap_project` call in the same process
 /// no-ops the `~/.claude/` mutation. Use from a once-init at the top
 /// of test files that exercise `bootstrap_project` but don't care
 /// about tool-surface side effects.
-///
-/// Safe across parallel test threads (env var write is atomic on
-/// Linux); idempotent because it's one fixed value.
 pub fn disable_tool_surface_bootstrap_for_tests() {
     std::env::set_var("CCTEAM_DISABLE_TOOL_SURFACE_BOOTSTRAP", "1");
 }
@@ -450,14 +56,17 @@ pub fn ensure_skills_placeholders(claude_dir: &Path, project_dir: &Path) -> Resu
 /// Tools a phase markdown declares it needs at runtime. Validated
 /// against [`ToolSurfaceSnapshot`] at orchestrator startup so a phase
 /// that asks for `Task(subagent_type="code-reviewer")` fails fast if
-/// the agent file is missing under `~/.claude/agents/`.
+/// neither the plugin shipping it is enabled nor a user-authored
+/// `~/.claude/agents/code-reviewer.md` exists.
 ///
 /// Schema: `docs/interfaces.md` §5.1.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolsRequired {
     /// `subagent_type` strings (e.g. `code-reviewer`, `general-purpose`).
     /// Five built-ins are always reachable and don't need to be listed,
-    /// but listing them is harmless.
+    /// but listing them is harmless. Plugin-shipped agents resolve via
+    /// [`crate::plugin_resolution`] and require the plugin to be
+    /// enabled in the spawned project's `enabledPlugins`.
     #[serde(default)]
     pub subagents: Vec<String>,
     /// Skill names callable via the `Skill` tool. Resolved against
@@ -465,9 +74,7 @@ pub struct ToolsRequired {
     /// `skills/<name>/SKILL.md`.
     #[serde(default)]
     pub skills: Vec<String>,
-    /// MCP server names from `~/.claude.json` `mcpServers` keys
-    /// (and any plugin `.mcp.json` once M2 lands plugin-aware
-    /// MCP discovery).
+    /// MCP server names from `~/.claude.json` `mcpServers` keys.
     #[serde(default)]
     pub mcp: Vec<String>,
 }
@@ -494,6 +101,11 @@ pub const BUILTIN_SUBAGENTS: &[&str] = &[
 /// What's actually reachable on the current machine. Built once at
 /// orchestrator startup and used to validate every phase template's
 /// `tools_required`.
+///
+/// For plugin-shipped agents the snapshot indexes both the bare name
+/// (`code-reviewer`) and the namespaced one (`pr-review-toolkit:code-reviewer`)
+/// — phase YAML can use either form, and the namespaced form survives
+/// when two plugins ship a `code-simplifier`-style collision.
 #[derive(Debug, Clone, Default)]
 pub struct ToolSurfaceSnapshot {
     pub subagents: BTreeSet<String>,
@@ -509,10 +121,14 @@ impl ToolSurfaceSnapshot {
     }
 
     /// Build a snapshot by reading the filesystem under `claude_dir`
-    /// (`~/.claude/`). MCP servers come from `<claude_dir>/.claude.json`
-    /// or `<claude_dir>/mcp_servers.json` when present. Plugin-supplied
-    /// skills are pulled from
-    /// `<claude_dir>/plugins/marketplaces/*/plugins/*/skills/<name>/`.
+    /// (`~/.claude/`).
+    ///
+    /// Plugin-shipped subagents are picked up from
+    /// [`KNOWN_PLUGIN_AGENTS`] when their plugin source file exists
+    /// under `<claude_dir>/plugins/marketplaces/<mkt>/plugins/<plugin>/agents/<name>.md`.
+    /// User-authored agents from `<claude_dir>/agents/<name>.md` still
+    /// resolve (operator escape hatch). Skills and MCP servers come
+    /// from the same paths as before.
     pub fn scan(claude_dir: &Path) -> Result<Self> {
         let mut subagents: BTreeSet<String> = BUILTIN_SUBAGENTS
             .iter()
@@ -521,7 +137,22 @@ impl ToolSurfaceSnapshot {
         let mut skills: BTreeSet<String> = BTreeSet::new();
         let mut mcp: BTreeSet<String> = BTreeSet::new();
 
-        // ~/.claude/agents/<name>.md → subagent_type "<name>"
+        // Plugin-shipped subagents (V0.2 M0.20 — replaces the prior
+        // ~/.claude/agents/ ln -sf scan). A plugin agent counts as
+        // reachable iff its source file exists on disk; the project
+        // session's `enabledPlugins` decides which plugins actually
+        // load, but the source file existing is a necessary condition
+        // either way.
+        for agent in KNOWN_PLUGIN_AGENTS {
+            if agent.source_path(claude_dir).is_file() {
+                subagents.insert(agent.subagent.to_string());
+                subagents.insert(format!("{}:{}", agent.plugin, agent.subagent));
+            }
+        }
+
+        // ~/.claude/agents/<name>.md → subagent_type "<name>". Operator
+        // escape hatch for custom agents that aren't shipped by any
+        // plugin. ccteam-core no longer writes here (V0.2 M0.20).
         let agents_dir = claude_dir.join("agents");
         if let Ok(entries) = std::fs::read_dir(&agents_dir) {
             for e in entries.flatten() {
@@ -616,8 +247,13 @@ impl MissingTool {
     pub fn fix_hint(&self) -> String {
         match self {
             MissingTool::Subagent(name) => {
-                if RECOMMENDED_AGENTS.iter().any(|a| a.subagent_type() == name) {
-                    "run `ccteam doctor --install-recommended-agents` to symlink the plugin agent".into()
+                if let Some(a) = lookup_plugin_agent(name) {
+                    format!(
+                        "install plugin `{}` (e.g. `claude /plugin add {}`); \
+                         spawned project sessions enable it via `enabledPlugins` automatically",
+                        a.plugin_id(),
+                        a.plugin_id(),
+                    )
                 } else {
                     format!(
                         "drop `{name}.md` into ~/.claude/agents/ (custom agent), or remove it from `tools_required.subagents`"
@@ -692,144 +328,81 @@ fn collect_mcp_from(path: &Path, out: &mut BTreeSet<String>) {
     }
 }
 
+/// Remove every `~/.claude/agents/<name>.md` symlink whose target
+/// resolves into `<claude_dir>/plugins/marketplaces/`. Surfaced for
+/// `ccteam doctor --migrate-recommended-agents` so V0.1 users with
+/// the old M0.5 ln -sf protocol can clean up stale links once they
+/// upgrade to V0.2's plugin pipeline.
+///
+/// Regular files (operator-authored agents) and symlinks pointing
+/// outside the marketplace tree are preserved. Returns the report so
+/// the doctor command can render per-agent status; `dry_run=true`
+/// reports without touching the filesystem.
+pub fn migrate_recommended_agent_symlinks(
+    claude_dir: &Path,
+    dry_run: bool,
+) -> Result<Vec<MigrationReport>> {
+    let agents_dir = claude_dir.join("agents");
+    let marketplaces_root = claude_dir.join("plugins").join("marketplaces");
+    let mut out: Vec<MigrationReport> = Vec::new();
+    let entries = match std::fs::read_dir(&agents_dir) {
+        Ok(e) => e,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("read_dir {}", agents_dir.display()));
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !meta.file_type().is_symlink() {
+            continue;
+        }
+        let raw = match std::fs::read_link(&path) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let resolved = if raw.is_absolute() {
+            raw.clone()
+        } else {
+            path.parent()
+                .map(|p| p.join(&raw))
+                .unwrap_or_else(|| raw.clone())
+        };
+        if !resolved.starts_with(&marketplaces_root) {
+            continue;
+        }
+        if !dry_run {
+            std::fs::remove_file(&path)
+                .with_context(|| format!("remove {}", path.display()))?;
+        }
+        out.push(MigrationReport {
+            target: path,
+            previous_link: raw,
+            removed: !dry_run,
+        });
+    }
+    Ok(out)
+}
+
+/// One symlink the migrate command found / removed.
+#[derive(Debug, Clone)]
+pub struct MigrationReport {
+    /// `<claude_dir>/agents/<name>.md` whose stale ln -sf was found.
+    pub target: PathBuf,
+    /// What the symlink pointed at (relative or absolute, as stored).
+    pub previous_link: PathBuf,
+    /// `false` for `dry_run=true` runs.
+    pub removed: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn fake_claude_dir(tmp: &tempfile::TempDir) -> PathBuf {
-        let dir = tmp.path().join(".claude");
-        // Stage all 8 plugin agent files so link_one_agent finds sources.
-        for agent in RECOMMENDED_AGENTS {
-            let src = agent.source_path(&dir);
-            std::fs::create_dir_all(src.parent().unwrap()).unwrap();
-            std::fs::write(&src, format!("# stub for {}\n", agent.filename)).unwrap();
-        }
-        dir
-    }
-
-    #[test]
-    fn recommended_set_has_eight_distinct_filenames() {
-        assert_eq!(RECOMMENDED_AGENTS.len(), 8);
-        let mut names: Vec<&str> = RECOMMENDED_AGENTS.iter().map(|a| a.filename).collect();
-        names.sort();
-        names.dedup();
-        assert_eq!(names.len(), 8, "filenames must be unique under ~/.claude/agents/");
-    }
-
-    #[test]
-    fn subagent_type_drops_md_suffix() {
-        let a = RECOMMENDED_AGENTS[0];
-        assert_eq!(a.filename, "code-reviewer.md");
-        assert_eq!(a.subagent_type(), "code-reviewer");
-    }
-
-    #[test]
-    fn link_recommended_agents_creates_eight_symlinks() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let claude = fake_claude_dir(&tmp);
-
-        let reports = link_recommended_agents_into(&claude, LinkOptions::default()).unwrap();
-        assert_eq!(reports.len(), 8);
-        for r in &reports {
-            assert_eq!(r.action, AgentLinkAction::Linked, "{:?}", r);
-            let meta = std::fs::symlink_metadata(&r.target).unwrap();
-            assert!(meta.file_type().is_symlink());
-        }
-    }
-
-    #[test]
-    fn link_recommended_agents_is_idempotent() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let claude = fake_claude_dir(&tmp);
-
-        link_recommended_agents_into(&claude, LinkOptions::default()).unwrap();
-        let reports = link_recommended_agents_into(&claude, LinkOptions::default()).unwrap();
-        for r in reports {
-            assert_eq!(r.action, AgentLinkAction::AlreadyLinked, "{:?}", r);
-        }
-    }
-
-    #[test]
-    fn link_recommended_agents_skips_user_authored_file_without_force() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let claude = fake_claude_dir(&tmp);
-        let agents = claude.join("agents");
-        std::fs::create_dir_all(&agents).unwrap();
-        let user_file = agents.join("code-reviewer.md");
-        std::fs::write(&user_file, "USER VERSION").unwrap();
-
-        let reports = link_recommended_agents_into(&claude, LinkOptions::default()).unwrap();
-        let cr = reports
-            .iter()
-            .find(|r| r.agent.filename == "code-reviewer.md")
-            .unwrap();
-        assert_eq!(cr.action, AgentLinkAction::SkippedUserFile);
-        // User file untouched.
-        assert_eq!(std::fs::read_to_string(&user_file).unwrap(), "USER VERSION");
-    }
-
-    #[test]
-    fn link_recommended_agents_force_replaces_user_file() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let claude = fake_claude_dir(&tmp);
-        let agents = claude.join("agents");
-        std::fs::create_dir_all(&agents).unwrap();
-        let user_file = agents.join("code-reviewer.md");
-        std::fs::write(&user_file, "USER VERSION").unwrap();
-
-        link_recommended_agents_into(&claude, LinkOptions { force: true, dry_run: false })
-            .unwrap();
-        let meta = std::fs::symlink_metadata(&user_file).unwrap();
-        assert!(meta.file_type().is_symlink(), "force should replace user file");
-    }
-
-    #[test]
-    fn link_recommended_agents_skips_when_source_missing() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let claude = tmp.path().join(".claude"); // do NOT pre-stage sources
-
-        let reports = link_recommended_agents_into(&claude, LinkOptions::default()).unwrap();
-        for r in reports {
-            assert!(
-                matches!(r.action, AgentLinkAction::SkippedSourceMissing { .. }),
-                "expected SkippedSourceMissing, got {:?}",
-                r.action,
-            );
-        }
-        // No symlinks created.
-        let agents = claude.join("agents");
-        if agents.exists() {
-            let count = std::fs::read_dir(&agents).unwrap().count();
-            assert_eq!(count, 0, "should not create any symlinks when sources missing");
-        }
-    }
-
-    #[test]
-    fn link_recommended_agents_dry_run_no_filesystem_writes() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let claude = fake_claude_dir(&tmp);
-        let agents_dir = claude.join("agents");
-
-        let reports = link_recommended_agents_into(
-            &claude,
-            LinkOptions { force: false, dry_run: true },
-        )
-        .unwrap();
-        for r in reports {
-            assert!(
-                matches!(r.action, AgentLinkAction::DryRun { .. }),
-                "expected DryRun, got {:?}",
-                r.action,
-            );
-            assert!(
-                !r.target.exists(),
-                "dry_run must not create {}",
-                r.target.display(),
-            );
-        }
-        // Even the parent agents dir shouldn't be created in dry-run.
-        assert!(!agents_dir.exists(), "agents dir should not be auto-created in dry-run");
-    }
 
     #[test]
     fn ensure_skills_placeholders_creates_both_dirs() {
@@ -870,7 +443,7 @@ mod tests {
         let claude = tmp.path().join(".claude");
         // user-authored agent
         std::fs::create_dir_all(claude.join("agents")).unwrap();
-        std::fs::write(claude.join("agents/code-reviewer.md"), "# stub").unwrap();
+        std::fs::write(claude.join("agents/user-custom.md"), "# stub").unwrap();
         // user-authored skill
         std::fs::create_dir_all(claude.join("skills/my-skill")).unwrap();
         std::fs::write(claude.join("skills/my-skill/SKILL.md"), "# stub").unwrap();
@@ -881,15 +454,33 @@ mod tests {
         std::fs::write(plugin_skill.join("SKILL.md"), "# stub").unwrap();
 
         let snap = ToolSurfaceSnapshot::scan(&claude).unwrap();
-        assert!(snap.has_subagent("code-reviewer"));
+        assert!(snap.has_subagent("user-custom"));
         assert!(snap.has_skill("my-skill"));
         assert!(snap.has_skill("plug-skill"));
     }
 
     #[test]
+    fn snapshot_picks_up_plugin_subagent_via_in_memory_pipeline() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let claude = tmp.path().join(".claude");
+        // Stage the source file the way claude-plugins-official lays
+        // out on disk after `claude /plugin add`.
+        let src = claude
+            .join("plugins/marketplaces/claude-plugins-official/plugins/pr-review-toolkit/agents/code-reviewer.md");
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        std::fs::write(&src, "# code-reviewer\n").unwrap();
+
+        let snap = ToolSurfaceSnapshot::scan(&claude).unwrap();
+        // Reachable under both bare and namespaced forms.
+        assert!(snap.has_subagent("code-reviewer"));
+        assert!(snap.has_subagent("pr-review-toolkit:code-reviewer"));
+        // Other plugin agents whose source isn't staged don't leak in.
+        assert!(!snap.has_subagent("code-architect"));
+    }
+
+    #[test]
     fn snapshot_reads_mcp_from_claude_json() {
         let tmp = tempfile::TempDir::new().unwrap();
-        // Layout: <home>/.claude/ for claude_dir, <home>/.claude.json sibling
         let claude = tmp.path().join(".claude");
         std::fs::create_dir_all(&claude).unwrap();
         std::fs::write(
@@ -940,13 +531,83 @@ mod tests {
     }
 
     #[test]
-    fn missing_tool_fix_hint_recommends_doctor_for_recommended_agents() {
+    fn fix_hint_for_known_plugin_agent_names_plugin_id() {
         let m = MissingTool::Subagent("code-reviewer".into());
         let h = m.fix_hint();
-        assert!(h.contains("ccteam doctor"), "got: {h}");
+        assert!(
+            h.contains("pr-review-toolkit@claude-plugins-official"),
+            "got: {h}",
+        );
+        assert!(h.contains("plugin"), "got: {h}");
+    }
 
-        let m2 = MissingTool::Subagent("user-custom".into());
-        let h2 = m2.fix_hint();
-        assert!(h2.contains("custom agent"), "got: {h2}");
+    #[test]
+    fn fix_hint_for_unknown_subagent_points_at_user_agents_dir() {
+        let m = MissingTool::Subagent("user-custom".into());
+        let h = m.fix_hint();
+        assert!(h.contains("custom agent"), "got: {h}");
+        assert!(h.contains("~/.claude/agents/"), "got: {h}");
+    }
+
+    #[test]
+    fn migrate_returns_empty_when_no_agents_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let claude = tmp.path().join(".claude");
+        let reports = migrate_recommended_agent_symlinks(&claude, false).unwrap();
+        assert!(reports.is_empty());
+    }
+
+    #[test]
+    fn migrate_removes_only_marketplace_symlinks() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let claude = tmp.path().join(".claude");
+        let agents = claude.join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        // Stage a plugin source file.
+        let plugin_src = claude.join(
+            "plugins/marketplaces/claude-plugins-official/plugins/pr-review-toolkit/agents/code-reviewer.md",
+        );
+        std::fs::create_dir_all(plugin_src.parent().unwrap()).unwrap();
+        std::fs::write(&plugin_src, "# stub").unwrap();
+        // ccteam-style symlink -> marketplace
+        let stale = agents.join("code-reviewer.md");
+        std::os::unix::fs::symlink(&plugin_src, &stale).unwrap();
+        // Operator-authored regular file (must survive)
+        let user_file = agents.join("user-custom.md");
+        std::fs::write(&user_file, "# operator").unwrap();
+        // Operator symlink to a non-marketplace path (must survive)
+        let foreign_target = tmp.path().join("foreign.md");
+        std::fs::write(&foreign_target, "# foreign").unwrap();
+        let foreign_link = agents.join("foreign.md");
+        std::os::unix::fs::symlink(&foreign_target, &foreign_link).unwrap();
+
+        let reports = migrate_recommended_agent_symlinks(&claude, false).unwrap();
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].removed);
+        assert!(!stale.exists());
+        // Survivors:
+        assert!(user_file.exists());
+        assert!(foreign_link.symlink_metadata().unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn migrate_dry_run_does_not_remove() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let claude = tmp.path().join(".claude");
+        let agents = claude.join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        let plugin_src = claude.join(
+            "plugins/marketplaces/claude-plugins-official/plugins/pr-review-toolkit/agents/code-reviewer.md",
+        );
+        std::fs::create_dir_all(plugin_src.parent().unwrap()).unwrap();
+        std::fs::write(&plugin_src, "# stub").unwrap();
+        let stale = agents.join("code-reviewer.md");
+        std::os::unix::fs::symlink(&plugin_src, &stale).unwrap();
+
+        let reports = migrate_recommended_agent_symlinks(&claude, true).unwrap();
+        assert_eq!(reports.len(), 1);
+        assert!(!reports[0].removed);
+        // Dry-run preserves the symlink.
+        assert!(stale.symlink_metadata().unwrap().file_type().is_symlink());
     }
 }

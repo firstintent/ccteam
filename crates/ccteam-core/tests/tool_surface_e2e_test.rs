@@ -1,16 +1,15 @@
-//! M0.5.7 — end-to-end regression for the tool-surface foundation.
+//! Tool-surface foundation regression. V0.2 M0.20 replaces the M0.5
+//! `~/.claude/agents/` ln -sf protocol with Claude Code's in-memory
+//! plugin pipeline:
 //!
-//! Acceptance: a freshly bootstrapped project must come up under
-//! orchestrator startup even when its phase markdown declares
-//! `tools_required: subagents: [code-reviewer]`. The bootstrap path
-//! is responsible for ln -sf'ing the agent file before
-//! `Orchestrator::new`'s tool-surface validator runs.
-//!
-//! We exercise the full chain — bootstrap_project (which calls
-//! setup_tool_surface internally) → orchestrator construction with
-//! the real `tools_required` from `phases/03-implement.md` — under
-//! an isolated `CLAUDE_CONFIG_HOME` pointed at a tempdir so the test
-//! doesn't depend on the developer's `~/.claude/` state.
+//!   1. `bootstrap_project` writes `enabledPlugins` into the spawned
+//!      project's `.claude/settings.json`, derived from each phase
+//!      YAML's `tools_required.subagents` via `plugin_resolution`.
+//!   2. The orchestrator's tool-surface validator passes when the
+//!      plugin source file exists under
+//!      `~/.claude/plugins/marketplaces/<mkt>/plugins/<plugin>/agents/<name>.md`.
+//!   3. `Task(subagent_type=...)` resolves at runtime through the
+//!      plugin pipeline (Claude Code namespaces it as `<plugin>:<name>`).
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -20,10 +19,9 @@ use serde_json::json;
 use tempfile::TempDir;
 
 use ccteam_core::{
-    bootstrap_project, decide_tick_from_events, dev_dag,
-    link_recommended_agents_for_phases_into, progress, slugify, AgentLinkAction, CcteamPaths,
-    LinkOptions, Orchestrator, OrchestratorConfig, PhaseState, PhaseTemplate, ProjectState,
-    TickAction, RECOMMENDED_AGENTS,
+    bootstrap_project, decide_tick_from_events, dev_dag, plugins_to_enable, progress, slugify,
+    CcteamPaths, KNOWN_PLUGIN_AGENTS, Orchestrator, OrchestratorConfig, PhaseState,
+    PhaseTemplate, ProjectState, TickAction,
 };
 
 /// Several tests in this file mutate `CLAUDE_CONFIG_HOME`, which is a
@@ -54,23 +52,21 @@ impl Drop for ScopedClaude<'_> {
     }
 }
 
+/// Stage every shipped plugin agent's source file under the in-memory
+/// plugin pipeline path layout. Mirrors what `claude /plugin add
+/// claude-plugins-official` writes after marketplace fetch.
 fn stage_plugin_sources(claude_dir: &Path) {
-    for agent in RECOMMENDED_AGENTS {
+    for agent in KNOWN_PLUGIN_AGENTS {
         let src = agent.source_path(claude_dir);
         std::fs::create_dir_all(src.parent().unwrap()).unwrap();
-        std::fs::write(&src, format!("# stub for {}\n", agent.filename)).unwrap();
+        std::fs::write(&src, format!("# stub for {}\n", agent.subagent)).unwrap();
     }
 }
 
 fn write_global_phases_with_implement(phases_dir: &Path) {
     std::fs::create_dir_all(phases_dir).unwrap();
-    // The shipped 03-implement.md declares tools_required:[code-reviewer]
-    // — we read it from disk so this test breaks loudly if anyone
-    // weakens the declaration.
     let implement_src = include_str!("../../../teams/dev/phases/03-implement.md");
     std::fs::write(phases_dir.join("03-implement.md"), implement_src).unwrap();
-    // Plus a minimal plan-eng so the orchestrator has more than one
-    // template to validate.
     let plan_eng = concat!(
         "---\n",
         "name: plan-eng\n",
@@ -83,8 +79,6 @@ fn write_global_phases_with_implement(phases_dir: &Path) {
 
 #[test]
 fn shipped_implement_phase_declares_code_reviewer_subagent() {
-    // Sentinel: catch a future commit that strips the tools_required
-    // declaration from 03-implement.md without intending to.
     let body = include_str!("../../../teams/dev/phases/03-implement.md");
     let template = PhaseTemplate::parse(body).unwrap();
     assert!(
@@ -104,13 +98,12 @@ fn shipped_implement_phase_declares_code_reviewer_subagent() {
     );
 }
 
-/// Full M0.5.7 chain:
-///   1. set CLAUDE_CONFIG_HOME → tempdir/claude
-///   2. stage all 8 plugin agent source files there
-///   3. bootstrap_project (ln -sf 8 agents into <claude>/agents/)
-///   4. write the *real* shipped implement.md to phases dir
-///   5. Orchestrator::new — tool-surface validator must pass because
-///      bootstrap_project just registered code-reviewer
+/// V0.2 M0.20 chain:
+///   1. CLAUDE_CONFIG_HOME → tempdir/claude
+///   2. stage every plugin agent source file (simulates plugin install)
+///   3. bootstrap_project writes enabledPlugins to settings.json
+///   4. orchestrator's tool-surface validator passes via the plugin
+///      pipeline reachability check
 #[test]
 fn fresh_project_passes_tool_surface_validator_for_shipped_implement() {
     let tmp = TempDir::new().unwrap();
@@ -126,22 +119,29 @@ fn fresh_project_passes_tool_surface_validator_for_shipped_implement() {
     write_global_phases_with_implement(&paths.phases_dir());
 
     let slug = slugify("review smoke");
-    bootstrap_project(&paths, &slug, "review smoke", "dev").unwrap();
+    let project_dir = bootstrap_project(&paths, &slug, "review smoke", "dev").unwrap();
 
-    // Confirm bootstrap actually placed the symlink — this is the
-    // M0.5.1 + M0.5.3 contract.
-    let target = claude_dir.join("agents").join("code-reviewer.md");
-    assert!(
-        target.exists(),
-        "bootstrap_project must ln -sf code-reviewer.md into {}",
-        target.display(),
-    );
-    let meta = std::fs::symlink_metadata(&target).unwrap();
-    assert!(meta.file_type().is_symlink());
+    // V0.2 M0.20 contract: the spawned project's settings.json carries
+    // enabledPlugins for the plugin shipping each declared subagent
+    // (instead of an ln -sf into ~/.claude/agents/).
+    let settings = project_dir.join(".claude/settings.json");
+    let v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+    let enabled = v["enabledPlugins"]
+        .as_object()
+        .expect("enabledPlugins must be present when team declares plugin subagents");
+    assert_eq!(enabled["pr-review-toolkit@claude-plugins-official"], true);
 
-    // The validator is what would otherwise fail loudly. Construction
-    // succeeding with default config (skip_tool_check=false) is the
-    // acceptance.
+    // No ln -sf into ~/.claude/agents/ — V0.2 M0.20 deletes that path.
+    let agents_dir = claude_dir.join("agents");
+    if agents_dir.exists() {
+        let count = std::fs::read_dir(&agents_dir).unwrap().count();
+        assert_eq!(
+            count, 0,
+            "ccteam-core no longer writes ~/.claude/agents/ — found {count} entries",
+        );
+    }
+
     let orch = Orchestrator::new(paths, OrchestratorConfig::default()).unwrap();
     assert_eq!(orch.templates().len(), 2);
     let names: Vec<&str> = orch.templates().iter().map(|t| t.name.as_str()).collect();
@@ -149,11 +149,8 @@ fn fresh_project_passes_tool_surface_validator_for_shipped_implement() {
     assert!(names.contains(&"plan-eng"));
 }
 
-/// SubagentStop appears *after* phase_done in real Claude Code 2.x
-/// (subagent shutdown happens after the parent turn's Stop hook
-/// fires). Our state machine must still advance — confirmed in
-/// `progress::latest_terminal_event_for_phase` unit tests, but worth
-/// re-asserting at the orchestrator decision level for M0.5.7.
+/// SubagentStop appears *after* phase_done in real Claude Code 2.x —
+/// the state machine must still advance.
 #[test]
 fn implement_phase_advances_when_subagent_done_lands_after_phase_done() {
     let tmp = TempDir::new().unwrap();
@@ -165,16 +162,11 @@ fn implement_phase_advances_when_subagent_done_lands_after_phase_done() {
     let project_dir = paths.project_dir(slug);
     std::fs::create_dir_all(project_dir.join(".ccteam")).unwrap();
 
-    // State: implement is in-flight after a code-reviewer Task launch.
     let mut state = ProjectState::initial(slug.into());
     state.current_phase = "implement".into();
     state.phase_state = PhaseState::InFlight;
     state.save(&paths.project_state(slug)).unwrap();
 
-    // Simulate the production event sequence: phase_inject (impl
-    // started), the code-reviewer subagent's PreToolUse / PostToolUse,
-    // then parse-phase-end's phase_done, then a trailing SubagentStop
-    // for the code-reviewer.
     let progress_path = paths.progress_jsonl(slug);
     let events = [
         json!({"event": "phase_inject", "phase": "implement"}),
@@ -186,7 +178,6 @@ fn implement_phase_advances_when_subagent_done_lands_after_phase_done() {
             "phase": "implement",
             "ts": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
         }),
-        // Real Claude Code 2.1.x flushes SubagentStop *after* Stop.
         json!({"event": "SubagentStop", "subagent_type": "code-reviewer"}),
     ];
     for e in &events {
@@ -206,16 +197,13 @@ fn implement_phase_advances_when_subagent_done_lands_after_phase_done() {
     );
 }
 
-/// Negative case: if bootstrap is skipped (no symlink + no fallback),
-/// orchestrator startup must reject with a fix hint. This locks in
-/// the "fail loud, never silently silent-fail" contract.
+/// Negative case: when the plugin source isn't installed, orchestrator
+/// startup must reject with a fix hint pointing at the plugin id.
 #[test]
 fn missing_code_reviewer_fails_orchestrator_construction_with_fix_hint() {
     let tmp = TempDir::new().unwrap();
     let claude_dir = tmp.path().join("claude-empty");
     std::fs::create_dir_all(&claude_dir).unwrap();
-    // Note: we deliberately do NOT stage plugin sources, so no link
-    // bootstrap can produce.
 
     let _claude_guard = ScopedClaude::set(&claude_dir);
 
@@ -225,8 +213,6 @@ fn missing_code_reviewer_fails_orchestrator_construction_with_fix_hint() {
     };
     write_global_phases_with_implement(&paths.phases_dir());
 
-    // Bootstrap will warn (source missing) but not fail. The
-    // orchestrator validator is what we expect to fail loudly.
     let slug = slugify("missing reviewer");
     bootstrap_project(&paths, &slug, "missing reviewer", "dev").unwrap();
 
@@ -237,98 +223,59 @@ fn missing_code_reviewer_fails_orchestrator_construction_with_fix_hint() {
         "error must name the missing subagent, got: {msg}",
     );
     assert!(
-        msg.contains("ccteam doctor"),
-        "error must include the fix hint, got: {msg}",
+        msg.contains("pr-review-toolkit@claude-plugins-official"),
+        "error must include the plugin id fix hint, got: {msg}",
     );
 }
 
-/// M2.1: phase YAML's `sub_skills` reference plugin agents that may
-/// not be in the hardcoded RECOMMENDED_AGENTS set. The phase-aware
-/// linker walks each template's sub_skills and ln -sfs the plugin
-/// source so `Task(subagent_type=...)` finds the agent at session
-/// start.
+/// V0.2 M0.20: phase YAML's sub_skill referencing a plugin agent via
+/// `<marketplace>:<plugin>/agents/<name>.md` propagates the same plugin
+/// dependency into `enabledPlugins` even when the bare name isn't
+/// listed in `tools_required.subagents`.
 #[test]
-fn link_phase_subagents_picks_up_sub_skill_plugin_agent() {
-    let tmp = TempDir::new().unwrap();
-    let claude_dir = tmp.path().join("claude");
-    stage_plugin_sources(&claude_dir);
-    // Stage an extra plugin agent that isn't in RECOMMENDED_AGENTS, so
-    // the test proves the extension does more than the hardcoded
-    // recommended set.
-    let custom = claude_dir
-        .join("plugins/marketplaces/claude-plugins-official/plugins/custom-toolkit/agents/custom-reviewer.md");
-    std::fs::create_dir_all(custom.parent().unwrap()).unwrap();
-    std::fs::write(&custom, "# custom-reviewer stub\n").unwrap();
-
-    let _guard = ScopedClaude::set(&claude_dir);
-
-    // Phase template with one sub_skill referencing the custom agent.
+fn enabled_plugins_picks_up_sub_skill_plugin_agent() {
     let body = concat!(
         "---\n",
         "name: review\n",
         "parallelism: solo\n",
         "sub_skills:\n",
-        "  - skill: claude-plugins-official:custom-toolkit/agents/custom-reviewer.md\n",
+        "  - skill: claude-plugins-official:pr-review-toolkit/agents/code-reviewer.md\n",
         "    trigger: phase_done\n",
-        "    output_to: .ccteam/custom-review.md\n",
+        "    output_to: .ccteam/code-review.md\n",
         "---\n",
         "body\n",
     );
     let template = PhaseTemplate::parse(body).unwrap();
 
-    let reports =
-        link_recommended_agents_for_phases_into(&claude_dir, &[template], LinkOptions::default())
-            .unwrap();
-
-    // Must include the 8 hardcoded agents *and* the new one.
-    assert_eq!(
-        reports.len(),
-        RECOMMENDED_AGENTS.len() + 1,
-        "expected {} reports, got {}",
-        RECOMMENDED_AGENTS.len() + 1,
-        reports.len(),
+    // The bare subagent name extracted from the sub_skill path resolves
+    // through plugin_resolution.
+    let plugin_ids = plugins_to_enable(["code-reviewer"]);
+    assert!(
+        plugin_ids.contains("pr-review-toolkit@claude-plugins-official"),
+        "code-reviewer must resolve to pr-review-toolkit@claude-plugins-official",
     );
-    let custom_report = reports
-        .iter()
-        .find(|r| r.agent.filename == "custom-reviewer.md")
-        .expect("custom-reviewer plugin agent must appear in reports");
-    assert_eq!(custom_report.action, AgentLinkAction::Linked);
-    assert!(claude_dir
-        .join("agents/custom-reviewer.md")
-        .symlink_metadata()
-        .unwrap()
-        .file_type()
-        .is_symlink());
+    // Sentinel: the parsed template still carries the sub_skill reference
+    // verbatim so bootstrap_project sees it.
+    assert_eq!(template.sub_skills.len(), 1);
+    assert!(
+        template.sub_skills[0].skill.contains("code-reviewer.md"),
+        "sub_skill must keep the agent path intact",
+    );
 }
 
-/// Sub-skill referencing a hook script (`.sh`) instead of an agent
-/// must NOT be auto-linked into `~/.claude/agents/` — only `.md`
-/// files under `<plugin>/agents/` count as Task-callable subagents.
+/// Plugin name lookup table covers every shipped phase YAML's known
+/// subagent so a fresh project's enabledPlugins isn't empty by accident
+/// for the dev / product-research teams.
 #[test]
-fn link_phase_subagents_skips_non_agent_sub_skill_paths() {
-    let tmp = TempDir::new().unwrap();
-    let claude_dir = tmp.path().join("claude");
-    stage_plugin_sources(&claude_dir);
-
-    let _guard = ScopedClaude::set(&claude_dir);
-
-    let body = concat!(
-        "---\n",
-        "name: ship\n",
-        "parallelism: solo\n",
-        "sub_skills:\n",
-        "  - skill: claude-plugins-official:security-guidance/hooks/security_reminder_hook.py\n",
-        "    trigger: phase_start\n",
-        "    output_to: .ccteam/precheck.md\n",
-        "---\n",
-    );
-    let template = PhaseTemplate::parse(body).unwrap();
-
-    let reports =
-        link_recommended_agents_for_phases_into(&claude_dir, &[template], LinkOptions::default())
-            .unwrap();
-    // Just the 8 hardcoded — the .py hook is not eligible for Task
-    // dispatch, so no extra link.
-    assert_eq!(reports.len(), RECOMMENDED_AGENTS.len());
+fn known_subagents_resolve_to_official_marketplace_plugins() {
+    let plugin_ids: Vec<String> = plugins_to_enable([
+        "code-reviewer",
+        "code-architect",
+        "code-simplifier",
+    ])
+    .into_iter()
+    .collect();
+    assert!(plugin_ids.contains(&"pr-review-toolkit@claude-plugins-official".to_string()));
+    assert!(plugin_ids.contains(&"feature-dev@claude-plugins-official".to_string()));
+    assert!(plugin_ids.contains(&"code-simplifier@claude-plugins-official".to_string()));
 }
-

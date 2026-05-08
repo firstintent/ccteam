@@ -107,4 +107,5 @@
 - **跨 session 协作时见到主仓 dirty 状态** → `git stash push -m "<owner-session> WIP"` 再切,别盲目 `git checkout -- .`
 - **改了 `ccteam-core` 公共 API**(如 `pick_unused_slug` 签名)→ grep 全 caller(包括 tests / mcp_serve.rs / commands.rs)
 - **F22 后 slug 带 team 前缀**:`run_new` test 期望 `dev-<base>` 而非 `<base>`;改新 slug 路径时验证 rules `paths:` 还匹配
+- **V0.1 → V0.2 升级一次性迁移**:M0.20 后 plugin agent 通过 spawned session `enabledPlugins` 启用,不再 ln -sf 进 `~/.claude/agents/`。V0.1 用户首次升级 V0.2 时跑 `ccteam doctor --migrate-recommended-agents` 清理旧 ln -sf(只删 ccteam 自己创建的 marketplace symlink,用户手写 agent 不动)
 - **本文件不超过 250 行** — CLAUDE.md 越长 cache 越贵,Claude 越忽略(best-practices §4.1 + §8)

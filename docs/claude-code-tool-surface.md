@@ -83,13 +83,16 @@ command 触发后的特殊上下文里可调,**不进全局 Task subagent 注册
 
 | 方案 | 怎么做 | 评价 |
 |---|---|---|
-| A. 安装到全局 agents 目录 | `cp <plugin>/agents/code-reviewer.md ~/.claude/agents/` 后,所有 claude session 的 `Task(subagent_type="code-reviewer")` 都能调 | ✅ 推荐;ccteam M1 `bootstrap_project` 应该批量做这件事 |
+| A. 启用 in-memory plugin pipeline | spawned session 的 `<project>/.claude/settings.json` 写 `enabledPlugins: {"<plugin>@<mkt>": true}`,Claude Code 自动 namespace `<plugin>:<name>`,phase markdown 用裸名仍可调 | ✅ V0.2 M0.20 起的官方路径;ccteam `bootstrap_project` 自动据 phase YAML 写 |
 | B. `@文件引用` + general-purpose 执行 | phase markdown 里写 "请用 Task(subagent_type='general-purpose'),把 `@~/.claude/plugins/.../agents/code-reviewer.md` 的内容当作 system prompt,review 当前 diff" | ✅ 零安装,但每次都走 general-purpose,损失了 plugin agent 的 model / color / tools 配置 |
 | C. orchestrator send-keys 触发 slash command | tmux send-keys `/review-pr <args>`,plugin 自己的 prompt body 在 TUI 上下文里能调它的私有 agent | ⚠️ 阻塞长会话当前 turn,只适合 phase 边界 |
 
-**ccteam 的设计选择**:M0 用方案 B(零安装,文档先行);M1 在 `bootstrap_project`
-里加方案 A 的批量复制(`ccteam doctor --install-recommended-agents`);方案 C
-留给 director-claude(通道 3)在跨 phase 路由时调用。
+**ccteam 的设计选择**:V0.2 M0.20 起 `bootstrap_project` 用方案 A
+(`enabledPlugins` 写到 spawned session 的 settings.json,plugin pipeline
+自动加载 + namespace);**V0.1 的 ln -sf 路径已删除**,旧 ccteam 用户用
+`ccteam doctor --migrate-recommended-agents` 一次性清理 `~/.claude/agents/`
+里残留的 ccteam 创建的 symlink。方案 B 仍然作为零安装兜底;方案 C 留给
+director-claude(通道 3)在跨 phase 路由时调用。
 
 #### 1.1.4 验证示例(无需任何 plugin,直接可跑)
 
@@ -129,8 +132,10 @@ Task(subagent_type="code-reviewer", description="review HEAD diff",
      prompt="Review the unstaged diff against CLAUDE.md guidelines.")
 ```
 
-ccteam 项目用 plugin agent 的步骤见 §6.2(必须先 ln -sf 到 `~/.claude/agents/`
-才能 Task 调,不是装 plugin 就能用)。
+ccteam 项目从 V0.2 M0.20 起靠 in-memory plugin pipeline 调用 plugin agent
+(详见 §6.2):`bootstrap_project` 把依赖的 plugin 写进
+`<project>/.claude/settings.json` 的 `enabledPlugins` 字段,Claude Code
+session 启动时 plugin pipeline 自动加载,**不再 ln -sf 到 `~/.claude/agents/`**。
 
 ---
 
@@ -207,20 +212,25 @@ Claude Code 对 `~/.claude/skills/`、项目 `.claude/skills/`、`--add-dir`
 
 **最终结论**:
 - Skill 的 SKILL.md 文件**实时监听**,中途加生效(§1.2.4)
-- `~/.claude/agents/<name>.md` **会话启动时一次性扫描**,**中途加不生效**;但 startup 时已存在的 agent 文件**正常被识别**——所以 M1 `bootstrap_project` 在 `tmux new-session` 之前 ln -sf 这条路**完全可行**(已实测确认)
+- `~/.claude/agents/<name>.md` **会话启动时一次性扫描**,**中途加不生效**;
+  V0.1 ccteam 靠 startup 前 ln -sf 这条路曾经可行,**V0.2 M0.20 改走
+  in-memory plugin pipeline**(`enabledPlugins` 写到 spawned session
+  的 settings.json,Claude Code session 启动时一次性加载 enabled plugin)
+  —— ccteam-core 不再写 `~/.claude/agents/`
 
-#### 1.2.6 给 ccteam M1 `bootstrap_project` 的强约束
+#### 1.2.6 给 ccteam `bootstrap_project` 的强约束
 
-既然 agent 必须 startup 前注册,`bootstrap_project` 的执行顺序必须是:
+agent / plugin 必须 startup 前注册,`bootstrap_project` 的执行顺序必须是:
 
 ```
 ccteam new <brief>
   ├─ 1. 创建 ~/projects/<slug>/ 目录与子目录
   ├─ 2. 写 spec.md / CLAUDE.md / phase 模板 / settings.json
+  │       (含 `enabledPlugins`,V0.2 M0.20)
   ├─ 3. 写 ~/.claude.json 的 hasTrustDialogAccepted
-  ├─ 4. **ln -sf 推荐 plugin agents 到 ~/.claude/agents/**(M1 新增)
-  ├─ 5. mkdir -p ~/.claude/skills/ <project>/.claude/skills/(占位让监听挂上)
-  └─ 6. 由 orchestrator ensure_session 触发 tmux new-session(claude TUI 启动)
+  ├─ 4. mkdir -p ~/.claude/skills/ <project>/.claude/skills/(占位让监听挂上)
+  └─ 5. 由 orchestrator ensure_session 触发 tmux new-session(claude TUI 启动,
+        plugin pipeline 加载 enabledPlugins 并 namespace 每个 plugin agent)
 ```
 
 第 4 步**必须**在第 6 步之前;第 5 步是为了让 skill 后续懒注入能命中
@@ -424,15 +434,16 @@ ESCALATE 语法节、phase 模板里的 ESCALATE 写法示例。M0 不需要,先
 
 | 决策类型 | 谁来 | 前置条件 |
 |---|---|---|
-| 当前 phase 里要不要调 code-reviewer / code-simplifier | 通道 1(长会话内 Claude 自决) | agent 文件已 ln 到 `~/.claude/agents/`(见 §6.2) |
+| 当前 phase 里要不要调 code-reviewer / code-simplifier | 通道 1(长会话内 Claude 自决) | spawned session settings.json 有 `enabledPlugins` 启用对应 plugin(见 §6.2) |
 | 要不要 `/exit` reset / `/reload-plugins` | 通道 2(orchestrator,看 cost / context 阈值机械触发) | — |
 | 下一 phase 走 fix 还是 ship,要不要 inject `/review-pr` 等 TUI 命令 | 通道 3(director-claude) | M1+ |
 
-**重要的架构后果**:Plugin agent 不是"装了 plugin 就能调"——必须额外做一步
-agents 目录注册才进通道 1。这意味着:**ccteam M1 的 `bootstrap_project`
-必须把 §6.2 那段 ln -sf 加进去**,否则所有"phase 让模型自己调 code-reviewer"
-的设计在产出项目里都跑不通,只能 fallback 到通道 3 的 send-keys `/review-pr`。
-这条已记入 development-plan(M1.x)。
+**重要的架构后果**:Plugin agent 不是"装了 plugin 就能调"——spawned project
+session 必须显式 enable plugin pipeline 才进通道 1。**V0.2 M0.20 起
+`bootstrap_project` 自动据 phase YAML `tools_required.subagents` 写
+`enabledPlugins` 到 `<project>/.claude/settings.json`**,session 启动时
+plugin pipeline 加载 + namespace,phase markdown 用 `Task(subagent_type=...)`
+即可调。否则只能 fallback 到通道 3 的 send-keys `/review-pr`。
 
 ### 3.4 与 sub_skills 的边界(M2)
 
@@ -461,44 +472,31 @@ sub_skills 是 phase front matter 里**声明式**指定的 plugin 触发,固定
 | `claude-code-guide` | Claude Code 内置 | Claude Code 用法咨询 |
 | `statusline-setup` | Claude Code 内置 | 配置 status line |
 
-### 6.2 想做 plugin 级别 review / simplify / 架构方案 — 必须做安装步骤
+### 6.2 想做 plugin 级别 review / simplify / 架构方案 — 用 plugin pipeline
 
 `pr-review-toolkit` / `feature-dev` / `code-simplifier` 等 plugin 里的 agent
-**装了 plugin 也不能直接 Task 调**(见 §1.1.2)。要在 ccteam 自治调用,
-需要在 ccteam `bootstrap_project`(或一次性手工)里执行下面这步:
+**装了 plugin 也不能直接 Task 调**(见 §1.1.2),除非 enable plugin pipeline。
+ccteam V0.2 M0.20 起走**官方 in-memory plugin pipeline 路径**——不再 ln -sf。
 
-```bash
-# 把 plugin agent 文件软链/拷到全局 agents 目录,Claude Code 会扫这里
-# 自动注册成 subagent_type。
-# 显式列出每个文件 —— **不要用 pr-review-toolkit/agents/*.md 这种 glob**:
-# 该目录下也有 code-simplifier.md,会跟下面 code-simplifier plugin 的同名文
-# 件抢同一个 ~/.claude/agents/code-simplifier.md target,后写盖前写,得到
-# 哪个版本不确定。
-mkdir -p ~/.claude/agents
-PLUGIN_ROOT=~/.claude/plugins/marketplaces/claude-plugins-official/plugins
-for src in \
-  "$PLUGIN_ROOT/pr-review-toolkit/agents/code-reviewer.md" \
-  "$PLUGIN_ROOT/pr-review-toolkit/agents/silent-failure-hunter.md" \
-  "$PLUGIN_ROOT/pr-review-toolkit/agents/pr-test-analyzer.md" \
-  "$PLUGIN_ROOT/pr-review-toolkit/agents/type-design-analyzer.md" \
-  "$PLUGIN_ROOT/pr-review-toolkit/agents/comment-analyzer.md" \
-  "$PLUGIN_ROOT/feature-dev/agents/code-architect.md" \
-  "$PLUGIN_ROOT/feature-dev/agents/code-explorer.md" \
-  "$PLUGIN_ROOT/code-simplifier/agents/code-simplifier.md"
-do
-  ln -sf "$src" "$HOME/.claude/agents/$(basename "$src")"
-done
+**ccteam 自治调用**:`bootstrap_project` 写 `<project>/.claude/settings.json`
+时,根据 phase YAML `tools_required.subagents` 解析出依赖的 Claude Code plugin
+(静态映射表:`crates/ccteam-core/src/plugin_resolution.rs`),写入
+`enabledPlugins`:
+
+```jsonc
+{
+  "enabledPlugins": {
+    "pr-review-toolkit@claude-plugins-official": true,
+    "feature-dev@claude-plugins-official": true,
+    "code-simplifier@claude-plugins-official": true
+  }
+}
 ```
 
-(`code-simplifier` 取自 `code-simplifier` plugin 的版本——它是该 plugin 的
-正主;`pr-review-toolkit` 里的 `code-simplifier.md` 是该 plugin 内部使用的
-副本,生产代码 M0.5.1 实测 reviewer catch 了这个重名 target 冲突,显式枚举
-是正确做法。)
-
-之后用 `Task(subagent_type="probe-XXX")` 探当前可用列表 —— 应该多出
-`code-reviewer`、`code-architect`、`code-explorer`、`code-simplifier`、
-`silent-failure-hunter`、`pr-test-analyzer`、`type-design-analyzer`、
-`comment-analyzer`。
+Claude Code session 启动时 plugin pipeline 自动加载 enabled plugin,
+**namespace 加 `<plugin>:` 前缀**(eg `pr-review-toolkit:code-reviewer`);
+phase markdown 用裸名 `Task(subagent_type="code-reviewer")` 仍然可调,
+plugin pipeline 自匹配。
 
 | 来源 plugin | agent 文件 → subagent_type | ccteam 用例 |
 |---|---|---|
@@ -511,13 +509,19 @@ done
 | `pr-review-toolkit` | `comment-analyzer` | review phase |
 | `code-simplifier` | `code-simplifier` | review 后打磨 |
 
-**ccteam 路线图**:M1 起 `bootstrap_project` 在 `tmux new-session` **之前**
-自动做 ln -sf(执行顺序见 §1.2.6);可单独通过 `ccteam doctor
---install-recommended-agents` 给老项目补做。在 M1 落地前,phase 模板用
-§1.1.3 方案 B(`@文件引用` + Task general-purpose)兜底。
+**用户需先装上游 plugin**:`claude /plugin add pr-review-toolkit@claude-plugins-official`
+(以及 `feature-dev` / `code-simplifier`)——**只一次,装在 user level
+(`~/.claude/plugins/marketplaces/`)**。spawned project session 通过
+`enabledPlugins` 启用 plugin pipeline,不需要每个项目重装。
 
-**关键约束**(已实测确认):agent 文件必须在 claude session 启动时已存在 ——
-中途 ln -sf 不生效(§1.2.5)。这条不能违反。
+**V0.1 → V0.2 升级**:V0.1 用户的 `~/.claude/agents/<name>.md` ln -sf
+是 ccteam-core 自己写的,V0.2 起停止维护。一次性清理:
+`ccteam doctor --migrate-recommended-agents [--dry-run]`(只删 ccteam
+当年创建的 marketplace symlink,操作员手写文件保留)。
+
+**关键约束**(plugin pipeline 替代 ln -sf 后仍然成立):enabledPlugins
+必须在 session 启动时已写好——orchestrator 在 `tmux new-session` **之前**
+完成 `bootstrap_project`(执行顺序见 §1.2.6),然后启动 session 才能正确加载。
 
 ### 6.3 推荐挂的 hook(plugin 提供)
 
@@ -543,7 +547,7 @@ done
 | 引用某个文件让模型读 | `@.ccteam/spec.md` |
 | 引用 plugin 里某个 agent 文件让模型按里面规程办 | `@~/.claude/plugins/marketplaces/claude-plugins-official/plugins/feature-dev/agents/code-architect.md` |
 | 让模型主动 launch subagent(默认 5 个) | "请使用 Task 工具,subagent_type='general-purpose'/'Explore'/'Plan'/'claude-code-guide'/'statusline-setup',..." |
-| 让模型主动 launch plugin subagent(必须先 §6.2 ln -sf) | "请使用 Task 工具,subagent_type='code-reviewer',..." |
+| 让模型主动 launch plugin subagent(必须先 §6.2 enable plugin pipeline) | "请使用 Task 工具,subagent_type='code-reviewer',..." |
 | 模型按 plugin agent 规程办但不显式调 subagent | "请读 `@~/.claude/plugins/.../agents/code-reviewer.md`,严格按其指引 review 当前 diff" |
 | 让模型用 skill | "请使用 Skill 工具调用 <name> skill" |
 | 让模型用 MCP tool | "请使用 mcp__\<server>__\<tool> 工具,..." |
@@ -566,8 +570,8 @@ done
 
 | 现象 | 根因 | 对策 |
 |---|---|---|
-| phase markdown 写 "请 `/review`",模型却没有动作 | 模型摸不到 slash command | 改为 "请用 Task 工具调 code-reviewer subagent" + §6.2 安装 |
-| `Task(subagent_type="code-reviewer")` 报 "Agent type not found, Available: general-purpose, Explore, Plan, claude-code-guide, statusline-setup" | **装了 plugin 不等于 Task 能调它的 agent**(plugin agent 文件不进 Task 全局注册表) | 跑 §6.2 那段 ln -sf,把 plugin agent 文件链到 `~/.claude/agents/`;或临时用方案 B(`@文件引用` + Task general-purpose) |
+| phase markdown 写 "请 `/review`",模型却没有动作 | 模型摸不到 slash command | 改为 "请用 Task 工具调 code-reviewer subagent" + §6.2 plugin pipeline 启用 |
+| `Task(subagent_type="code-reviewer")` 报 "Agent type not found, Available: general-purpose, Explore, Plan, claude-code-guide, statusline-setup" | **装了 plugin 不等于 Task 能调它的 agent**(spawned session 没启用 plugin pipeline) | spawned session 的 `<project>/.claude/settings.json` 加 `enabledPlugins: {"<plugin>@<mkt>": true}`(ccteam V0.2 M0.20 自动做);旧 ccteam 用户跑 `ccteam doctor --migrate-recommended-agents` 清理残留 ln -sf;临时兜底用方案 B(`@文件引用` + Task general-purpose) |
 | `Skill(skill="review-pr")` 报 InputValidationError | `review-pr` 是 plugin 的 slash command 不是 Skill;`commands/<name>.md` 文件不被 Skill 工具识别 | 这条只能走通道 2(orchestrator send-keys `/review-pr`),phase markdown 别让模型自己调 |
 | `Skill(skill="X")` 报 InputValidationError | skill 名字写错 / 当前会话没加载到 system-reminder 列表 | §1.2.2 的探针实测当前可调 skill |
 | `mcp__foo__bar` 报工具不存在 | MCP server 没连 | 检查项目 `.mcp.json` + `ccteam doctor` |

@@ -545,7 +545,7 @@ dumb router。这条贯彻到底,避免 Symphony 多层 agent 反模式
 |---|---|---|
 | 生命周期 | 永不 terminal,跟用户 ccteam 实例同寿 | ship / abort 即终态 |
 | 行为模式 | 事件循环(等输入→处理→等输入)| phase DAG(plan-eng → ... → ship) |
-| 主要工具 | `ccteam-control` skill(已 ship,M1.8)/ `ccteam-mcp`(已 ship,M2.8)/ 跨项目 lessons(已 ship,M4 走 `~/.claude/rules/` + auto-memory)| 项目级文件操作 / 内嵌 plugin agents(已 ship,M0.5 ln -sf) |
+| 主要工具 | `ccteam-control` skill(已 ship,M1.8)/ `ccteam-mcp`(已 ship,M2.8)/ 跨项目 lessons(已 ship,M4 走 `~/.claude/rules/` + auto-memory)| 项目级文件操作 / 内嵌 plugin agents(已 ship,V0.2 M0.20 改走 `enabledPlugins` 写到 `<project>/.claude/settings.json`,Claude Code in-memory plugin pipeline 自动 namespace `<plugin>:<name>`,不再 ln -sf 进 `~/.claude/agents/`) |
 | context reset | 60% 阈值时桥接 CLAUDE.md(M0.10 已 ship);跨项目记忆通过 `~/.claude/rules/ccteam-lessons-<user>-meta.md` 滚动累积(M4 路径,无独立 conversation-log) | 60% 阈值时把当前 phase 进度写 CLAUDE.md(已 ship,M0.10) |
 | 用户 attach | `tmux attach -t ccteam-meta-<user>`,直接 NL 对话 | `tmux attach -t ccteam-<team>-<slug>`,可介入项目执行 |
 
@@ -974,6 +974,30 @@ agent（本节）= 在 phase 内或后台**并行**跑的 multi-agent；sub-skil
 完整 tool schema 与协议见 [interfaces.md §12](./interfaces.md#12-ccteam-mcp-mcp-server-m2)。**M0 / M1 走 CLI `--format json` 兜底路径**——用户的 claude 用 Bash 工具调即可;M2 后 MCP 路径作为首选,CLI 仍然保留作为脚本化入口。
 
 **实现形态**:`ccteam-mcp` 与 `ccteam-core` 同 crate(workspace 内 lib + 多 binary),通过 `ccteam mcp-serve` 子命令暴露——读写同一份 state.json / progress.jsonl,**为将来 `ccteam tui`(未 ship,M4.9) / `ccteam serve` web 前端(backlog)预留同一状态读写 API**。三种前端共用 `ccteam-core` lib API(详见 §3.8 前端层小节),MCP 只是把这套 API 套上 MCP wire protocol 给外部 LLM 消费。
+
+#### Plugin pipeline(V0.2 M0.20,候选 7)
+
+**Spawned project session 启 plugin agent 走 `enabledPlugins` 路径,不再 ln -sf 进 `~/.claude/agents/`**。
+
+`bootstrap_project` 写 `<project>/.claude/settings.json` 时,根据 team 的 phase YAML
+`tools_required.subagents` + `sub_skills` 解析依赖的 Claude Code plugin
+(eg `code-reviewer` → `pr-review-toolkit@claude-plugins-official`),写入
+`enabledPlugins: {"<plugin>@<mkt>": true}`。Claude Code session 启动时
+in-memory plugin pipeline 加载 enabled plugin,**自动加 `<plugin>:` namespace**
+(eg `pr-review-toolkit:code-reviewer`);phase markdown 用裸名
+`Task(subagent_type="code-reviewer")` 仍然可调,plugin pipeline 自匹配。
+
+- 静态映射表:`crates/ccteam-core/src/plugin_resolution.rs`
+  (`KNOWN_PLUGIN_AGENTS` const,8 个 `claude-plugins-official` agent;V0.3 改运行时发现)
+- doctor `--tool-surface` 校验:`enabledPlugins` 引用的 plugin source 文件
+  存在于 `~/.claude/plugins/marketplaces/<mkt>/plugins/<plugin>/agents/<name>.md`
+- doctor `--migrate-recommended-agents`:一次性清理 V0.1 留下的
+  `~/.claude/agents/` ln -sf(只删指向 marketplace 的 symlink,
+  操作员手写文件保留)
+
+**ccteam-core 不再写 `~/.claude/agents/`**——M4 红线"零检索 + 不写程序读 memory 文件"
+扩展到 plugin pipeline:plugin 装载交还 Claude Code 官方 in-memory pipeline,
+ccteam 只声明依赖。
 
 ### 6.5 项目级 CLAUDE.md（每项目自动生成）
 
