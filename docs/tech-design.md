@@ -1120,6 +1120,24 @@ orchestrator 监听 progress.jsonl 最新事件时间戳：
 
 阈值都在 `~/.ccteam/config.yml` 里可调；CLI `ccteam show <slug>` 可实时查询。
 
+#### Daemon 健康监督（M0.23.1)
+
+orchestrator 是**所有 phase 派发 + inbox 派送**的单点 — daemon 死了用户写的 inbox / 调的 MCP 命令会**沉默成功**(写到磁盘但永远不被消费)。M0.23.1 给一条 fail-loud 路径:
+
+| 文件 | 谁写 | 谁读 | 语义 |
+|---|---|---|---|
+| `~/.ccteam/state/orchestrator.pid` | daemon 启动时写 | `ccteam stop` | PID(已有,M1.5) |
+| `~/.ccteam/state/orchestrator.heartbeat` | daemon 每 30s 写 | MCP 入口 / meta-agent skill | mtime 是 liveness 唯一来源 |
+
+**判定**:`now - mtime ≤ 60s` → healthy;否则 stale(grace 是 2× heartbeat 间隔,容忍单次 GC pause / 阻塞 IO)。文件不存在 → no_heartbeat(daemon 未启动)。
+
+**消费规则**(action vs read-only 二分):
+
+- **action 工具**(`pause`/`resume`/`send_to_session`/`inject_decision`)— daemon 不健康直接返回 error,**绝不**写出 inbox 文件就成功(否则用户以为消息派出去了实际烂在磁盘)。M0.23.3 也走这一条。
+- **read-only 工具**(`ls`/`show`/`peek`/`progress`)— state.json 在磁盘,daemon 死也能查;`ls` 在响应里附 `orchestrator.daemon_health` 字段(`status`/`age_secs`/`message`),meta-agent 自看自决定要不要提示用户。
+
+**红线**:health check **只 stat heartbeat 文件**,不做任何 RPC / kill -0 / tmux capture-pane。pure stat 才能放在每个 MCP 调用的 hot path。daemon 启动时立即 touch 一次心跳文件(不等 30s),所以"刚起来的 daemon" 也立刻可观察。
+
 ### 6.9 长跑鲁棒性（单一策略）
 
 针对长跑场景的两个典型问题，各采用一条最直接的路径——**不做多层兜底**。

@@ -54,13 +54,15 @@ pub use orchestrator::MAX_CONCURRENT_PROJECTS;
 pub use orchestrator::{
     append_progress_summary, build_progress_summary, check_phase_tools, decide_tick,
     decide_tick_from_events, intersect_open_decisions_with_required_inputs, Orchestrator,
-    OrchestratorConfig, TeamRuntime, TickAction,
+    OrchestratorConfig, TeamRuntime, TickAction, DEFAULT_CLAUDE_MODEL,
 };
 pub use projects::{bootstrap_project, pick_unused_slug, pre_trust_project, slugify};
 pub use cost::{classify as classify_cost, CostLevel, COST_MID_WARN_USD};
 pub use daemon::{
-    pidfile_path, read_pidfile, remove_pidfile, send_sigterm_to_pidfile, write_pidfile,
-    PIDFILE_NAME,
+    check_health as check_daemon_health, check_health_at as check_daemon_health_at,
+    heartbeat_path, pidfile_path, read_pidfile, remove_heartbeat, remove_pidfile,
+    send_sigterm_to_pidfile, write_heartbeat, write_pidfile, DaemonHealth, HEARTBEAT_GRACE,
+    HEARTBEAT_INTERVAL, HEARTBEAT_NAME, PIDFILE_NAME,
 };
 pub use stall::{
     classify as classify_stall, classify_with_thresholds, silent_seconds, StallLevel,
