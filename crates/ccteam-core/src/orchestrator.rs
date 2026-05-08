@@ -224,14 +224,12 @@ pub struct OrchestratorConfig {
 
 /// Production model identifier passed to `claude --model`. The `[1m]`
 /// suffix is Claude Code's documented opt-in to the 1M-token context
-/// window — verified live against `claude --model claude-sonnet-4-5[1m]`
-/// (Claude Code 2.1.132): server returns "Extra usage is required for
-/// 1M context", which only fires when `[1m]` is recognized as a
-/// well-formed model alias. tech-design §6.1 / §6.9 require the long
-/// context for cache reuse + the 60% phase-boundary reset budget.
+/// window. tech-design §6.1 / §6.9 require the long context for cache
+/// reuse + the 60% phase-boundary reset budget.
 ///
-/// V0.2 §7 / dev-plan §9 M0.23.2: 1M default.
-pub const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-4-5[1m]";
+/// V0.2 §7 / dev-plan §9 M0.23.2: 1M default. When Anthropic publishes
+/// a newer Sonnet alias, change this single line.
+pub const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-4-6[1m]";
 
 impl Default for OrchestratorConfig {
     fn default() -> Self {

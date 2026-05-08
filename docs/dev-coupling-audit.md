@@ -512,10 +512,9 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
   reset 阈值会非常快;cache 重用空间也小。
 - **是否真 dev-specific**:**否——所有 team 都长跑,都需要 1M。**
 - **解耦方案**(已落):default `claude_argv` 加 `--model
-  claude-sonnet-4-5[1m]`(`[1m]` 后缀是 Claude Code 文档语法,`claude --model
-  <name>[1m] -p` 实测 server 返回 "Extra usage is required for 1M context"
-  确认语法识别)。常量名 `DEFAULT_CLAUDE_MODEL` exported,后续升 model
-  改这一处。tests 用 `claude_argv: vec!["sh", "-c", ...]` stub 不受影响。
+  claude-sonnet-4-6[1m]`(`[1m]` 后缀是 Claude Code 文档语法标准用法)。
+  常量名 `DEFAULT_CLAUDE_MODEL` exported,后续升 model 改这一处。tests
+  用 `claude_argv: vec!["sh", "-c", ...]` stub 不受影响。
 - **优先级**:**P0**(长跑直接撞 context 上限)。
 - **来源**:`docs/dev-plan-v0-2.md §9` M0.23.2 / `docs/prd-v0-2.md §7`。
 - **后续**:Claude 团队若推出更新 model 别名(eg `claude-sonnet-4-7[1m]`),
