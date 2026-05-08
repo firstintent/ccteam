@@ -47,7 +47,7 @@ use crate::tool_surface::{user_claude_dir, ToolSurfaceSnapshot};
 /// `Orchestrator::process_project` looks this up by `state.team` and
 /// uses the right `dag` for state-machine transitions, so dev and
 /// product-research can run concurrently without a global team flag.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TeamRuntime {
     pub spec: TeamSpec,
     pub templates: Vec<PhaseTemplate>,
@@ -233,14 +233,36 @@ pub const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-4-6[1m]";
 
 impl Default for OrchestratorConfig {
     fn default() -> Self {
+        // F29 — `CCTEAM_CLAUDE_ARGV` lets CLI / e2e harness inject a
+        // stub claude (eg `sh -c 'echo …'`) without rebuilding the
+        // binary. Whitespace-split for shell-style invocation; empty /
+        // unset = production default below. CLI flag still wins via
+        // an explicit `OrchestratorConfig.claude_argv` assignment in
+        // `ccteam start`.
+        let claude_argv = std::env::var("CCTEAM_CLAUDE_ARGV")
+            .ok()
+            .and_then(|raw| {
+                let parts: Vec<String> = raw
+                    .split_whitespace()
+                    .map(String::from)
+                    .collect();
+                if parts.is_empty() {
+                    None
+                } else {
+                    Some(parts)
+                }
+            })
+            .unwrap_or_else(|| {
+                vec![
+                    "claude".into(),
+                    "--dangerously-skip-permissions".into(),
+                    "--model".into(),
+                    DEFAULT_CLAUDE_MODEL.into(),
+                ]
+            });
         Self {
             tick_interval: Duration::from_secs(30),
-            claude_argv: vec![
-                "claude".into(),
-                "--dangerously-skip-permissions".into(),
-                "--model".into(),
-                DEFAULT_CLAUDE_MODEL.into(),
-            ],
+            claude_argv,
             ready_timeout: Duration::from_secs(60),
             post_ready_warmup: Duration::from_secs(3),
             skip_tool_check: false,
@@ -345,6 +367,50 @@ impl Orchestrator {
         self.teams.get(team)
     }
 
+    /// V0.2.1 F28 — project-scoped resolution. When the project carries
+    /// a `<project_dir>/.ccteam/team/team.yaml`, that override wins over
+    /// the global cache. Otherwise returns a borrowed handle to the
+    /// cached runtime so the common case stays zero-allocation.
+    ///
+    /// `Cow` lets the rare project-override case return an owned
+    /// `TeamRuntime` (rebuilt by re-resolving + reloading phase
+    /// templates from the override's team_dir) while the dominant
+    /// "no override" path keeps the original `&TeamRuntime` semantics.
+    /// Callers that don't need the override can keep using
+    /// [`Self::team_runtime`].
+    pub fn team_runtime_for_state<'a>(
+        &'a self,
+        state: &ProjectState,
+    ) -> Option<std::borrow::Cow<'a, TeamRuntime>> {
+        let project_dir = self.paths.project_dir(&state.slug);
+        let override_yaml = project_dir
+            .join(".ccteam")
+            .join("team")
+            .join("team.yaml");
+        if !override_yaml.exists() {
+            return self
+                .team_runtime(&state.team)
+                .map(std::borrow::Cow::Borrowed);
+        }
+        // Project has an override — re-resolve + rebuild a TeamRuntime
+        // from the override's team_dir. The override is per-project so
+        // we deliberately do NOT cache.
+        match build_project_team_runtime(&self.paths, state, &project_dir) {
+            Ok(rt) => Some(std::borrow::Cow::Owned(rt)),
+            Err(err) => {
+                tracing::warn!(
+                    team = %state.team,
+                    slug = %state.slug,
+                    error = format!("{err:#}"),
+                    "project-layer team override failed to build; \
+                     falling back to global cached runtime",
+                );
+                self.team_runtime(&state.team)
+                    .map(std::borrow::Cow::Borrowed)
+            }
+        }
+    }
+
     /// Iterate every registered team. Used by `ccteam doctor` and tests.
     pub fn teams(&self) -> impl Iterator<Item = &TeamRuntime> {
         self.teams.values()
@@ -409,7 +475,9 @@ impl Orchestrator {
         // shape only when the team or template is missing (e.g. an
         // unknown team `state.team` slipped past validation), keeping
         // the dispatch path resilient.
-        let prompt = match self.team_runtime(&state.team) {
+        // V0.2.1 F28: project-layer override wins via
+        // `team_runtime_for_state`.
+        let prompt = match self.team_runtime_for_state(state) {
             Some(team) => match team.templates.iter().find(|tpl| tpl.name == phase) {
                 Some(template) => {
                     let protocol_dirs: Vec<&str> = team
@@ -470,7 +538,8 @@ impl Orchestrator {
         let Some(prev) = state.phase_history.last() else {
             return Vec::new();
         };
-        let Some(team) = self.team_runtime(&state.team) else {
+        // V0.2.1 F28: project-layer override wins.
+        let Some(team) = self.team_runtime_for_state(state) else {
             return Vec::new();
         };
         let Some(template) = team.templates.iter().find(|t| t.name == prev.phase) else {
@@ -628,7 +697,10 @@ impl Orchestrator {
         // always tries to come up. (§6.4 candidate 5 declarative replacement
         // for the prior `state.team == META_TEAM_NAME` literal.)
         let is_evergreen = self.is_evergreen(&state.team);
-        let team_dag = self.team_runtime(&state.team).map(|t| &t.dag);
+        // V0.2.1 F28: project-layer override wins for the DAG used to
+        // gate the "terminal state" early-exit.
+        let team_for_dag = self.team_runtime_for_state(state);
+        let team_dag = team_for_dag.as_deref().map(|t| &t.dag);
         if !is_evergreen && team_dag.is_some_and(|d| d.is_terminal_state(state)) {
             return Ok(());
         }
@@ -693,7 +765,9 @@ impl Orchestrator {
         // state.json is a misconfiguration — we log + skip rather
         // than panicking so a single broken project doesn't take the
         // whole orchestrator down.
-        let team = match self.team_runtime(&state.team) {
+        // V0.2.1 F28: project-layer override wins for the duration of
+        // this `process_project` call (re-resolved per tick, no cache).
+        let team_cow = match self.team_runtime_for_state(&state) {
             Some(t) => t,
             None => {
                 tracing::error!(
@@ -705,6 +779,7 @@ impl Orchestrator {
                 return Ok(state);
             }
         };
+        let team: &TeamRuntime = team_cow.as_ref();
         const MAX_ITERS: u32 = 4;
         let progress_path = self.paths.progress_jsonl(slug);
         let state_path = self.paths.project_state(slug);
@@ -1414,8 +1489,9 @@ impl Orchestrator {
         if matches!(policy, CostPolicy::None) {
             return Ok(Some(state));
         }
+        // V0.2.1 F28: project-layer override wins for terminal-state check.
         if self
-            .team_runtime(&state.team)
+            .team_runtime_for_state(&state)
             .is_some_and(|t| t.dag.is_terminal_state(&state))
         {
             return Ok(Some(state));
@@ -1493,7 +1569,9 @@ impl Orchestrator {
         if self.is_evergreen(&state.team) {
             return;
         }
-        let team = self.team_runtime(&state.team);
+        // V0.2.1 F28: project-layer override wins.
+        let team_cow = self.team_runtime_for_state(state);
+        let team: Option<&TeamRuntime> = team_cow.as_deref();
         if team.is_some_and(|t| t.dag.is_terminal_state(state)) {
             return;
         }
@@ -1842,6 +1920,101 @@ fn load_team_runtimes(paths: &CcteamPaths) -> Result<HashMap<String, TeamRuntime
         );
     }
     Ok(teams)
+}
+
+/// V0.2.1 F28 — rebuild a single team's runtime from a project-layer
+/// override. Called per-tick (no caching) so a project can edit its
+/// `<project_dir>/.ccteam/team/team.yaml` without restarting the
+/// orchestrator. The override's `phase_dir` is resolved relative to the
+/// project's `team_dir` (`<project_dir>/.ccteam/team/`); when the
+/// override doesn't ship phase markdowns, the resolution falls back
+/// through TEAM_SOURCES so user / repo phase templates still drive the
+/// DAG (the override is mainly for spec-level fields like
+/// `golden_rules` / `description`).
+fn build_project_team_runtime(
+    paths: &CcteamPaths,
+    state: &ProjectState,
+    project_dir: &Path,
+) -> Result<TeamRuntime> {
+    use crate::team_resolver::{
+        default_user_staging_dir, resolve_team, TeamResolveContext, TEAM_SOURCES,
+    };
+
+    let user_staging = default_user_staging_dir();
+    let ctx = TeamResolveContext::for_orchestrator(&paths.root, &user_staging)
+        .with_project(project_dir);
+
+    let spec = resolve_team(&state.team, &ctx)
+        .with_context(|| format!("project-layer resolve team `{}`", state.team))?;
+
+    if spec.evergreen {
+        let dag = Dag::from_templates(&[]).with_context(|| {
+            format!("team `{}` build empty phase DAG (project layer)", spec.name)
+        })?;
+        return Ok(TeamRuntime {
+            spec,
+            templates: Vec::new(),
+            dag,
+        });
+    }
+
+    // Locate phase_dir on disk via the same priority order the
+    // resolver used for the spec. The override's team_dir is
+    // `<project_dir>/.ccteam/team/`; if the override only carries
+    // a `team.yaml` (no phases/ subdir), fall through to user/repo
+    // so phase markdowns still load.
+    let team_dir = TEAM_SOURCES
+        .iter()
+        .filter_map(|s| s.path_for(&state.team, &ctx))
+        .find(|p| p.exists())
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "project-layer team `{}` resolved spec but no team_dir found",
+                state.team,
+            )
+        })?;
+    let phase_dir = team_dir.join(&spec.phase_dir);
+    let templates = if phase_dir.exists() {
+        load_phase_templates(&phase_dir)?
+    } else {
+        // Project override carried just team.yaml; reuse user/repo
+        // phase markdowns by walking sources skipping the project layer.
+        let fallback_ctx =
+            TeamResolveContext::for_orchestrator(&paths.root, &user_staging);
+        let fallback_team_dir = TEAM_SOURCES
+            .iter()
+            .filter_map(|s| s.path_for(&state.team, &fallback_ctx))
+            .find(|p| p.exists())
+            .and_then(|p| p.parent().map(Path::to_path_buf));
+        match fallback_team_dir {
+            Some(d) => {
+                let pd = d.join(&spec.phase_dir);
+                if pd.exists() {
+                    load_phase_templates(&pd)?
+                } else {
+                    Vec::new()
+                }
+            }
+            None => Vec::new(),
+        }
+    };
+    for t in &templates {
+        t.validate_m0().with_context(|| {
+            format!(
+                "project-layer team `{}` template `{}` failed M0 validation",
+                spec.name, t.name,
+            )
+        })?;
+    }
+    let dag = Dag::from_templates(&templates).with_context(|| {
+        format!("project-layer team `{}` build phase DAG", spec.name)
+    })?;
+    Ok(TeamRuntime {
+        spec,
+        templates,
+        dag,
+    })
 }
 
 /// M3.6: static intersection of `open_decisions` (outbox basenames the

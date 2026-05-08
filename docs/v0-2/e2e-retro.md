@@ -162,17 +162,17 @@ V0.2 **可 ship**。e2e 主路径(init / 迁移 / hook self-loop / watchdog 翻�
 
 ---
 
-## 6. V0.2.1 patch 计划(建议)
+## 6. V0.2.1 patch 计划(**全部完成:2026-05-08 V0.2.1 PR**)
 
 按工作量 + 影响排序:
 
-| Patch | F | 工作量 | 描述 |
-|---|---|---|---|
-| **P1** | F31 | <1h | 加 `#[serde(deny_unknown_fields)]` 到 `TeamSpec` + nested struct;补 1 个测试 |
-| **P2** | F30 | 1-2h | `render_validate_team_report` 累计 plugin-section `[FAIL]` 进 Summary + 非零 exit |
-| **P3** | F28 | 2-4h | `for_orchestrator` callsite 改 `with_project(state.project_dir)`;`run_phase_show` 同;补 e2e 验证 project-layer 真 first-source-wins |
-| **P4** | F29 | 1-2h | `OrchestratorConfig::default()` 读 `CCTEAM_CLAUDE_ARGV`;`ccteam start --claude-argv <shell-line>` flag。让 V0.2.2 e2e 真跑 phase loop |
-| **P5** | F26 / F27 / F32 / F33 | <1h each | env / 注解 / docs 各小修(可合 1 PR) |
+| Patch | F | 工作量 | 描述 | 状态 |
+|---|---|---|---|---|
+| **P1** | F31 | <1h | 加 `#[serde(deny_unknown_fields)]` 到 `TeamSpec` + nested struct;补 1 个测试 | **完成(V0.2.1 PR)** |
+| **P2** | F30 | 1-2h | `render_validate_team_report` 累计 plugin-section `[FAIL]` 进 Summary + 非零 exit | **完成(V0.2.1 PR)** |
+| **P3** | F28 | 2-4h | `for_orchestrator` callsite 改 `with_project(state.project_dir)`;`run_phase_show` 同;补 e2e 验证 project-layer 真 first-source-wins | **完成(V0.2.1 PR)** — `team_runtime_for_state` 返 `Cow<TeamRuntime>`,dispatch / process / stall / cost 切换 |
+| **P4** | F29 | 1-2h | `OrchestratorConfig::default()` 读 `CCTEAM_CLAUDE_ARGV`;`ccteam start --claude-argv <shell-line>` flag。让 V0.2.2 e2e 真跑 phase loop | **完成(V0.2.1 PR)** |
+| **P5** | F26 / F27 / F32 / F33 | <1h each | env / 注解 / docs 各小修(可合 1 PR) | **完成(V0.2.1 PR)** |
 
 **前置 NRS smoke**(用户 1 分钟):
 - NRS-1:`ccteam team init smoke && ccteam team publish smoke --target local && claude /plugin enable smoke@ccteam-local` — 看 stderr 是否含 "unknown key team.yaml"。结果决定 F31 是否升级 P0

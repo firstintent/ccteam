@@ -371,7 +371,7 @@ M0.16 (foundation)
 ### 任务
 
 - [ ] **M0.23.1** orchestrator daemon health supervision
-  - daemon 写 `~/.ccteam/daemon.pid` + `~/.ccteam/daemon.heartbeat`(每 30s)
+  - daemon 写 `~/.ccteam/state/orchestrator.pid` + `~/.ccteam/state/orchestrator.heartbeat`(每 30s;沿用 M1.5 `state/` 子目录约定 + `orchestrator.*` 命名)
   - MCP 任意命令入口 + meta-agent skill 启动时 health check
   - daemon 死亡时:meta-agent 立即 surface "daemon down",MCP 命令 fail-loud
 - [ ] **M0.23.2** 1M context 默认启用

@@ -657,10 +657,13 @@ pub fn install_mcp_into(claude_json: &std::path::Path, ccteam_bin: &std::path::P
 
 /// Production path: locate `~/.claude.json` and the running binary,
 /// then call `install_mcp_into`.
+///
+/// V0.2.1 F26: honors `CLAUDE_CONFIG_HOME` via
+/// [`ccteam_core::projects::resolve_claude_json_path`] so e2e harnesses
+/// get the same redirection sibling installers (`--install-skill`,
+/// `--install-memory-bridge`) already honor through `user_claude_dir()`.
 pub fn install_mcp() -> Result<std::path::PathBuf> {
-    let claude_json = dirs::home_dir()
-        .ok_or_else(|| anyhow!("could not resolve home directory"))?
-        .join(".claude.json");
+    let claude_json = ccteam_core::projects::resolve_claude_json_path()?;
     let bin = ccteam_core::current_ccteam_bin()?;
     install_mcp_into(&claude_json, &bin)?;
     Ok(claude_json)
