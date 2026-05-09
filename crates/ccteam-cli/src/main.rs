@@ -79,6 +79,26 @@ enum Command {
         /// teams (research, design, ...) land in M3.4.
         #[arg(long, default_value = "dev")]
         team: String,
+        /// V0.2.2 F34 Tier 1 — explicit slug override. When set, skips
+        /// the Tier 3 `claude -p` smart-suggest and Tier 4 deterministic
+        /// fallback. Validated `[a-z0-9-]+`, len ≤ 60. B2 prefix
+        /// semantics: if the value already starts with `<team>-` it's
+        /// kept verbatim, otherwise `<team>-` is prepended automatically
+        /// (PRD §3.2.1).
+        #[arg(long, value_name = "NAME")]
+        slug: Option<String>,
+        /// V0.2.2 F34 Tier 3 — when set, skip the `claude -p` smart-
+        /// suggest path and fall back directly to the deterministic
+        /// `slugify_brief()` Tier 4. Useful in scripts / CI where you
+        /// don't want the per-invocation LLM round trip.
+        #[arg(long, default_value_t = false)]
+        no_auto_slug: bool,
+        /// V0.2.2 F34 Tier 3 — model name passed to `claude -p` for
+        /// the smart-suggest fallback. Default `claude-haiku-4-5-20251001`
+        /// (cheapest + fastest viable). Override with eg
+        /// `claude-sonnet-4-5-20251001` for harder briefs.
+        #[arg(long, value_name = "MODEL", default_value = "claude-haiku-4-5-20251001")]
+        auto_slug_model: String,
     },
     /// List all known projects.
     Ls {
@@ -187,6 +207,12 @@ enum Command {
         /// marketplace symlinks remain.
         #[arg(long, default_value_t = false)]
         migrate_recommended_agents: bool,
+        /// V0.2.2 F38: render a one-shot PNG screenshot of the given
+        /// project's tmux pane to verify the `vt100 + imageproc` path
+        /// end-to-end. Reports the font in use + the resulting PNG
+        /// path or the degrade reason (tmux missing / font / IO).
+        #[arg(long, value_name = "SLUG")]
+        screenshot_smoke: Option<String>,
     },
     /// V0.2 M0.18.6: render the orchestrator's per-phase inject
     /// prompt (frontmatter-driven) plus the `@`-referenced phase
@@ -329,7 +355,14 @@ fn main() -> Result<()> {
             skip_tool_check,
             claude_argv,
         } => run_start(tick_seconds, skip_tool_check, claude_argv),
-        Command::New { request, file, team } => run_new(request, file, team),
+        Command::New {
+            request,
+            file,
+            team,
+            slug,
+            no_auto_slug,
+            auto_slug_model,
+        } => run_new(request, file, team, slug, no_auto_slug, auto_slug_model),
         Command::Ls { format } => run_ls(format),
         Command::Show { slug, format } => run_show(&slug, format),
         Command::Attach { slug } => commands::run_attach(&slug),
@@ -369,6 +402,7 @@ fn main() -> Result<()> {
             reset_shipped_teams,
             validate_team,
             migrate_recommended_agents,
+            screenshot_smoke,
         } => run_doctor(commands::DoctorOptions {
             dry_run,
             force,
@@ -380,6 +414,7 @@ fn main() -> Result<()> {
             reset_shipped_teams,
             validate_team,
             migrate_recommended_agents,
+            screenshot_smoke,
         }),
         Command::Phase { cmd } => run_phase(cmd),
         Command::Watchdog { cmd } => run_watchdog(cmd),
@@ -612,7 +647,14 @@ fn run_start(
     result
 }
 
-fn run_new(request: Option<String>, file: Option<PathBuf>, team: String) -> Result<()> {
+fn run_new(
+    request: Option<String>,
+    file: Option<PathBuf>,
+    team: String,
+    slug: Option<String>,
+    no_auto_slug: bool,
+    auto_slug_model: String,
+) -> Result<()> {
     let paths = CcteamPaths::from_env()?;
     let body = match (file, request) {
         (Some(path), _) => std::fs::read_to_string(&path)
@@ -622,7 +664,12 @@ fn run_new(request: Option<String>, file: Option<PathBuf>, team: String) -> Resu
             anyhow::bail!("cct new: provide a request as a positional arg or --file PATH")
         }
     };
-    let slug = commands::run_new(&paths, body.trim(), &team)?;
+    let opts = commands::RunNewOptions {
+        slug: slug.as_deref(),
+        no_auto_slug,
+        auto_slug_model: &auto_slug_model,
+    };
+    let slug = commands::run_new(&paths, body.trim(), &team, opts)?;
     println!("created project {slug} (team: {team})");
     println!("  spec   : {}", paths.project_ccteam_dir(&slug).join("spec.md").display());
     println!("  state  : {}", paths.project_state(&slug).display());

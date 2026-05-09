@@ -31,6 +31,13 @@ pub const CCT_CONTROL_SKILL_NAME: &str = "cct-control";
 /// V0.2.2 F39: renamed from `ccteam-team-author`.
 pub const CCT_TEAM_AUTHOR_SKILL_NAME: &str = "cct-team-author";
 
+/// V0.2.2 F34 — `cct-project-creator` skill name. Walks the
+/// meta-agent through the four-phase project-creation dialogue
+/// (clarify brief → recommend slug → pick team → dispatch via
+/// `cct new`). Replaces the inline `meta_agent_role.md` §2 dispatch
+/// flow with a structured AskUserQuestion-driven UX.
+pub const CCT_PROJECT_CREATOR_SKILL_NAME: &str = "cct-project-creator";
+
 /// V0.2.2 F39: legacy V0.1/V0.2 skill directory names that
 /// `cct doctor` migrates. Exposed so the migration helper can scan
 /// for stale installs without re-declaring the names.
@@ -50,6 +57,12 @@ pub const CCT_CONTROL_SKILL_MD: &str = include_str!(concat!(
 pub const CCT_TEAM_AUTHOR_SKILL_MD: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../skills/cct-team-author/SKILL.md"
+));
+
+/// Embedded `SKILL.md` body for the project-creator skill (V0.2.2 F34).
+pub const CCT_PROJECT_CREATOR_SKILL_MD: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../skills/cct-project-creator/SKILL.md"
 ));
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -92,6 +105,23 @@ pub fn install_cct_team_author_skill(
         &claude,
         CCT_TEAM_AUTHOR_SKILL_NAME,
         CCT_TEAM_AUTHOR_SKILL_MD,
+        opts,
+    )
+}
+
+/// V0.2.2 F34: install the `cct-project-creator` skill into
+/// `~/.claude/skills/cct-project-creator/SKILL.md`. Same idempotent
+/// semantics as `install_cct_control_skill`. Carries the four-phase
+/// project-creation dialogue the meta-agent now invokes instead of
+/// inlining dispatch logic in `meta_agent_role.md` §2.
+pub fn install_cct_project_creator_skill(
+    opts: InstallSkillOptions,
+) -> Result<InstallSkillReport> {
+    let claude = user_claude_dir().context("resolve ~/.claude/")?;
+    install_skill_body_into(
+        &claude,
+        CCT_PROJECT_CREATOR_SKILL_NAME,
+        CCT_PROJECT_CREATOR_SKILL_MD,
         opts,
     )
 }
@@ -247,6 +277,62 @@ mod tests {
             tmp.path(),
             CCT_TEAM_AUTHOR_SKILL_NAME,
             CCT_TEAM_AUTHOR_SKILL_MD,
+            InstallSkillOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(r2.action, SkillInstallAction::AlreadyPresent);
+    }
+
+    // -------------- V0.2.2 F34 project-creator skill --------------
+
+    #[test]
+    fn project_creator_skill_installs_with_marker_and_phases() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let report = install_skill_body_into(
+            tmp.path(),
+            CCT_PROJECT_CREATOR_SKILL_NAME,
+            CCT_PROJECT_CREATOR_SKILL_MD,
+            InstallSkillOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(report.action, SkillInstallAction::Wrote);
+        let body = std::fs::read_to_string(&report.target).unwrap();
+        assert!(
+            body.contains("<!-- ccteam-managed:skill begin -->"),
+            "must carry the ccteam-managed begin marker (F39 migration prerequisite)",
+        );
+        assert!(
+            body.contains("<!-- ccteam-managed:skill end -->"),
+            "must carry the ccteam-managed end marker",
+        );
+        assert!(body.contains("name: cct-project-creator"));
+        // The four-phase dialogue is the body's main contract; if any
+        // disappears, the meta-agent silently loses behavior.
+        for phase in [
+            "Phase A — Clarify",
+            "Phase B — Recommend",
+            "Phase C — Pick a team",
+            "Phase D — Dispatch",
+        ] {
+            assert!(body.contains(phase), "missing phase: {phase}");
+        }
+        assert!(body.contains("AskUserQuestion"));
+    }
+
+    #[test]
+    fn project_creator_skill_install_is_idempotent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        install_skill_body_into(
+            tmp.path(),
+            CCT_PROJECT_CREATOR_SKILL_NAME,
+            CCT_PROJECT_CREATOR_SKILL_MD,
+            InstallSkillOptions::default(),
+        )
+        .unwrap();
+        let r2 = install_skill_body_into(
+            tmp.path(),
+            CCT_PROJECT_CREATOR_SKILL_NAME,
+            CCT_PROJECT_CREATOR_SKILL_MD,
             InstallSkillOptions::default(),
         )
         .unwrap();
