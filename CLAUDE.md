@@ -18,7 +18,7 @@
 | 当前 next | V0.3 候选方向待定,deferred 项见 `docs/v0-2/README.md` 末尾 |
 | 永久 deferred | M2.2 agent_team enablement(spike A,Claude Code 无 first-class CLI surface — 见 `docs/v0-1/m2-agent-team-spike.md`)|
 
-**ccteam 是 Claude Code 之上的元工具,不是独立 AI 系统**:每个项目一个 Claude Code 长 session(tmux 守护,hooks 上报,MCP 接外部);Rust orchestrator 编排;用户通过 meta-agent(常驻 ccteam-managed claude session)+ `ccteam-control` skill / `ccteam-mcp` MCP 用自然语言对话操作。详见 `docs/tech-design.md` §2.1 三层架构。
+**ccteam 是 Claude Code 之上的元工具,不是独立 AI 系统**:每个项目一个 Claude Code 长 session(tmux 守护,hooks 上报,MCP 接外部);Rust orchestrator 编排(binary 名 `cct`,F39 起);用户通过 meta-agent(常驻 ccteam-managed claude session)+ `cct-control` skill / `ccteam` MCP server(`mcp__ccteam__*` 命名空间)用自然语言对话操作。详见 `docs/tech-design.md` §2.1 三层架构。
 
 ---
 
@@ -59,6 +59,7 @@
 - **retro 写 `~/.claude/rules/ccteam-lessons-<team>.md` 必须限 marked section**:`<!-- ccteam-managed:lessons begin/end -->` 包裹,不污染用户其他段;phase prompt 严格约束,doctor `--install-memory-bridge` 只重写自己段(幂等)
 - **新建项目目录走 `~/projects/<team>-<slug>/` 约定**(F22 后):`pick_unused_slug` 强制 team 前缀;meta-agent 仍 `<handle>-meta` 后缀(独立路径)
 - **`ccteam-core` 不出现 team 名字面量**:strategic doc §3 红线;团队特定行为靠 `team.yaml` 数据驱动
+- **`cct` 短前缀约定**(V0.2.2 F39):binary 名 `cct`,自带 skill `cct-control` / `cct-team-author`,顶层 `skills/` 目录是 SoT;**项目名仍叫 ccteam**(`crates/ccteam-{cli,core,hooks}` / `~/.ccteam/` / git repo / MCP 命名空间 `mcp__ccteam__*` 不动 — 详 PRD §8.3)。`cct doctor` 自带 V0.1/V0.2 → V0.2.2 迁移逻辑;新代码 / phase prompt / docs 一律用 `cct`
 
 ---
 
@@ -67,7 +68,7 @@
 | 机制 | 用途 | 文档 |
 |---|---|---|
 | **CLAUDE.md** | 项目级 / 用户级持久指令 | best-practices §4.1 |
-| **Skills** | `ccteam-control` skill(M1.8 ✅)/ `ccgram-messaging`(M3+ 多 orchestrator) | tech-design §6.7 |
+| **Skills** | `cct-control`(M1.8 ✅,V0.2.2 F39 改名)/ `cct-team-author`(M0.22 ✅)/ `ccgram-messaging`(M3+ 多 orchestrator);自带 skill SoT 在 repo 根 `skills/` | tech-design §6.7 |
 | **MCP** | `ccteam-mcp`(M2 ✅,9 tools)/ `claude-mem`(M4 可选) | tech-design §6.4 |
 | **Subagents** | phase 内 `Task(subagent_type=...)` 节流;`code-reviewer` 等 8 个 plugin agent 已 ln -sf | best-practices §6.3 |
 | **Hooks** | `progress.jsonl append` / `parse-phase-end` / `cost-accumulate` 已 ship;`Stop`/`SubagentStop`/`SessionEnd` 都进 idle 列表(F1+F2 修复) | tech-design §6.2 |
@@ -94,11 +95,22 @@
 
 跨 session 见主仓 dirty 状态:先 `git stash push -m "<owner-session> WIP"` 再切;别盲目 `git checkout -- .`。
 
+### Patch 版本(V0.x.y)开发流程
+
+1. **doc-first**:PRD + dev-plan 落 `docs/v0-x-y/`;用户 review 后才动代码
+2. **worktree-per-PR**:每个 finding 单独 `git worktree add -b <branch> /tmp/ccteam-<name> origin/main`
+3. **subagent 派工**:主 session 用 Agent 工具派每个 worktree(briefing 含 PRD section + 验收条目)
+4. **PR review/fix/merge**:主 session 拉 PR diff review → 退回 fix 或本地补 → merge
+5. **cargo bump**:`workspace.package.version` 同步 bump,commit subject 用 `vX.Y.Z:` 前缀
+6. **CLAUDE.md baseline 更新**:`cargo test --workspace` 通过新数后回填 §一表格
+
+(主仓 main 不变 dirty;worktree 工具流详上节"多 session 并行编辑同一仓库")
+
 ---
 
 ## 六、易踩的坑(实战累积)
 
-- **不要给 ccteam 自己加 ccteam 风格的 hook/orchestrator** — 循环引用排错地狱。本仓库用 Claude Code 默认行为开发,只产出物(`~/projects/<team>-<slug>/`)挂 ccteam hook
+- **不要给 ccteam 自己加 ccteam 风格的 hook/orchestrator** — 循环引用排错地狱。本仓库用 Claude Code 默认行为开发,只产出物(`~/projects/<team>-<slug>/`)挂 cct 自己的 hook
 - **`.claude/settings.json` 的 `bypassPermissions` 是开发态便利** — 产品形态是 `--dangerously-skip-permissions` + 容器隔离,语义不同(best-practices §4.2 三选一)
 - **phase prompt 别写太长** — 单条 send-keys 装得下;复杂内容用 `@文件引用`(best-practices §3)
 - **`claude-plugins-official` 是参考实现,不是依赖** — 别 vendor 一份;按 §3.7 三粒度选(@引用 / 拷贝改 / 整 plugin install)
@@ -108,5 +120,6 @@
 - **跨 session 协作时见到主仓 dirty 状态** → `git stash push -m "<owner-session> WIP"` 再切,别盲目 `git checkout -- .`
 - **改了 `ccteam-core` 公共 API**(如 `pick_unused_slug` 签名)→ grep 全 caller(包括 tests / mcp_serve.rs / commands.rs)
 - **F22 后 slug 带 team 前缀**:`run_new` test 期望 `dev-<base>` 而非 `<base>`;改新 slug 路径时验证 rules `paths:` 还匹配
-- **V0.1 → V0.2 升级一次性迁移**:M0.20 后 plugin agent 通过 spawned session `enabledPlugins` 启用,不再 ln -sf 进 `~/.claude/agents/`。V0.1 用户首次升级 V0.2 时跑 `ccteam doctor --migrate-recommended-agents` 清理旧 ln -sf(只删 ccteam 自己创建的 marketplace symlink,用户手写 agent 不动)
+- **V0.1 → V0.2 升级一次性迁移**:M0.20 后 plugin agent 通过 spawned session `enabledPlugins` 启用,不再 ln -sf 进 `~/.claude/agents/`。V0.1 用户首次升级 V0.2 时跑 `cct doctor --migrate-recommended-agents` 清理旧 ln -sf(只删 ccteam 自己创建的 marketplace symlink,用户手写 agent 不动)
+- **V0.2 → V0.2.2 升级一次性迁移**(F39):binary `ccteam` → `cct`,skill `ccteam-{control,team-author}` → `cct-{control,team-author}`。`cct doctor --install-skill` / `--install-meta-agent` 自动检测 + 清旧 skill dir(marker 校验,只清 ccteam-managed 的;用户手改保留 + warn) + rewrite `~/projects/<slug>/.claude/settings.json` 老 hook command 路径(原子写)
 - **本文件不超过 250 行** — CLAUDE.md 越长 cache 越贵,Claude 越忽略(best-practices §4.1 + §8)

@@ -9,7 +9,7 @@ paths:
 
 Auto-populated by the ccteam `verdict` phase retro segment (REJECT branch).
 The retro segment overwrites only the marked block below — anything you write
-outside of it is preserved across `ccteam doctor --install-memory-bridge`
+outside of it is preserved across `cct doctor --install-memory-bridge`
 re-runs.
 
 Field layout matches `teams/product-research.yaml.retro_schema`:

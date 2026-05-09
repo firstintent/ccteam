@@ -901,8 +901,12 @@ mod tests {
         // Reject the placeholder having survived the render — that's the
         // PATH-dependent failure mode we're guarding against.
         assert!(
-            !cmd.contains("__CCTEAM_BIN__"),
+            !cmd.contains("{{CCT_BIN}}"),
             "settings.json placeholder should be substituted, got: {cmd}",
+        );
+        assert!(
+            !cmd.contains("__CCTEAM_BIN__"),
+            "legacy F39 placeholder should not return, got: {cmd}",
         );
     }
 }

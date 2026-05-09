@@ -1,4 +1,4 @@
-//! `ccteam` binary entry point.
+//! `cct` binary entry point (V0.2.2 F39 renamed from `ccteam`).
 
 mod commands;
 mod mcp_serve;
@@ -15,7 +15,7 @@ use commands::{InitOptions, OutputFormat};
 
 #[derive(Parser)]
 #[command(
-    name = "ccteam",
+    name = "cct",
     version,
     about = "Autonomous AI development orchestrator built on Claude Code",
 )]
@@ -113,13 +113,13 @@ enum Command {
         format: OutputFormat,
     },
     /// M2.5: run the ccteam MCP server (stdio JSON-RPC). Wired into
-    /// `~/.claude.json` `mcpServers.ccteam` by `ccteam doctor
+    /// `~/.claude.json` `mcpServers.ccteam` by `cct doctor
     /// --install-mcp` so daily-driver claude sessions and the meta
     /// agent both see the 9-tool surface (interfaces §12).
     McpServe,
     /// Stop the running orchestrator daemon. Sends SIGTERM via the
     /// pidfile so the loop drains gracefully. Does **not** kill any
-    /// tmux sessions — `ccteam start` reattaches to them on next launch
+    /// tmux sessions — `cct start` reattaches to them on next launch
     /// (M1.5).
     Stop,
     /// Health checks + tool-surface maintenance.
@@ -137,14 +137,14 @@ enum Command {
         /// agents/skills + MCP servers) and print a markdown report.
         #[arg(long, default_value_t = false)]
         tool_surface: bool,
-        /// Install the `ccteam-control` skill at
-        /// `~/.claude/skills/ccteam-control/SKILL.md` (M1.8). Idempotent.
+        /// Install the `cct-control` skill at
+        /// `~/.claude/skills/cct-control/SKILL.md` (M1.8). Idempotent.
         #[arg(long, default_value_t = false)]
         install_skill: bool,
         /// Bootstrap a meta-agent project (M1.0) for the given user
         /// handle. Creates `~/projects/<handle>-meta/` with the
         /// dispatcher role prompt + inbox/outbox dirs and (always)
-        /// installs the `ccteam-control` skill. Pass the user handle as
+        /// installs the `cct-control` skill. Pass the user handle as
         /// the value (e.g. `--install-meta-agent rob`).
         #[arg(long, value_name = "HANDLE")]
         install_meta_agent: Option<String>,
@@ -205,7 +205,7 @@ enum Command {
         #[command(subcommand)]
         cmd: WatchdogCommand,
     },
-    /// V0.2 M0.22: author + publish a ccteam team as a Claude Code
+    /// V0.2 M0.22: author + publish a cct team as a Claude Code
     /// plugin. `init` scaffolds the staging tree under
     /// `~/.config/ccteam/teams/<name>/`; `publish` links it into the
     /// `ccteam-local` marketplace or pushes it to a GitHub repo.
@@ -448,14 +448,14 @@ fn run_stop() -> Result<()> {
     let paths = CcteamPaths::from_env()?;
     match ccteam_core::send_sigterm_to_pidfile(&paths)? {
         Some(pid) => {
-            println!("ccteam stop: SIGTERM sent to orchestrator pid {pid}");
+            println!("cct stop: SIGTERM sent to orchestrator pid {pid}");
             println!(
-                "tmux sessions are NOT killed — `ccteam start` will reattach to them.",
+                "tmux sessions are NOT killed — `cct start` will reattach to them.",
             );
             Ok(())
         }
         None => {
-            println!("ccteam stop: no running orchestrator (pidfile absent or stale).");
+            println!("cct stop: no running orchestrator (pidfile absent or stale).");
             Ok(())
         }
     }
@@ -522,21 +522,21 @@ fn run_start(
     // start. force=false skips existing files so operator hand-edits
     // are preserved; the call still ensures `~/.ccteam/teams/<name>/team.yaml`
     // exists for every shipped team (dev / product-research /
-    // meta-agent) — without this, a fresh install missing `ccteam init`
+    // meta-agent) — without this, a fresh install missing `cct init`
     // would leave `is_evergreen("meta-agent") == false` and the
     // dispatcher would fall into the phase-DAG path.
     if let Err(err) = ccteam_core::write_all_global_team_templates(&paths.root, false) {
         tracing::warn!(
             error = %err,
             root = %paths.root.display(),
-            "ccteam start: could not seed shipped team templates; \
-             run `ccteam doctor --reset-shipped-teams` if teams are missing",
+            "cct start: could not seed shipped team templates; \
+             run `cct doctor --reset-shipped-teams` if teams are missing",
         );
     }
 
     if !paths.phases_dir().exists() {
         eprintln!(
-            "ccteam: phases dir {} not found.\n  run `ccteam init` once to unpack templates, then come back.",
+            "ccteam: phases dir {} not found.\n  run `cct init` once to unpack templates, then come back.",
             paths.phases_dir().display()
         );
     }
@@ -546,7 +546,7 @@ fn run_start(
             .unwrap_or(true)
     {
         eprintln!(
-            "ccteam: no projects under {} yet.\n  start one in another terminal: ccteam new \"<your idea>\"",
+            "ccteam: no projects under {} yet.\n  start one in another terminal: cct new \"<your idea>\"",
             paths.projects_root.display()
         );
     }
@@ -566,7 +566,7 @@ fn run_start(
         }
     }
     // Write the pidfile *before* constructing the orchestrator so a
-    // second `ccteam start` against the same root errors out cleanly
+    // second `cct start` against the same root errors out cleanly
     // before either side has touched tmux.
     let pidfile = ccteam_core::write_pidfile(&paths)?;
     tracing::info!(pidfile = %pidfile.display(), "orchestrator pidfile written");
@@ -596,7 +596,7 @@ fn run_start(
                     };
                     tokio::select! {
                         _ = tokio::signal::ctrl_c() => tracing::info!("ctrl+c received"),
-                        _ = sigterm.recv() => tracing::info!("SIGTERM received (ccteam stop)"),
+                        _ = sigterm.recv() => tracing::info!("SIGTERM received (cct stop)"),
                     }
                 }
                 #[cfg(not(unix))]
@@ -619,7 +619,7 @@ fn run_new(request: Option<String>, file: Option<PathBuf>, team: String) -> Resu
             .with_context(|| format!("read {}", path.display()))?,
         (None, Some(text)) => text,
         (None, None) => {
-            anyhow::bail!("ccteam new: provide a request as a positional arg or --file PATH")
+            anyhow::bail!("cct new: provide a request as a positional arg or --file PATH")
         }
     };
     let slug = commands::run_new(&paths, body.trim(), &team)?;
@@ -627,7 +627,7 @@ fn run_new(request: Option<String>, file: Option<PathBuf>, team: String) -> Resu
     println!("  spec   : {}", paths.project_ccteam_dir(&slug).join("spec.md").display());
     println!("  state  : {}", paths.project_state(&slug).display());
     println!("  config : {}", paths.project_dir(&slug).join(".claude/settings.json").display());
-    println!("\nrun `ccteam start --foreground` (in another terminal) to dispatch the first phase.");
+    println!("\nrun `cct start --foreground` (in another terminal) to dispatch the first phase.");
     Ok(())
 }
 

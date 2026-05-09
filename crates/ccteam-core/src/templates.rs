@@ -1,9 +1,12 @@
 //! Embedded ccteam templates rendered into produced-project trees by
-//! `ccteam new` and the global `~/.ccteam/` skeleton produced by
-//! `ccteam init`. The settings.json source uses the placeholder
-//! `__CCTEAM_BIN__` for the binary path so we can rewrite hook commands
+//! `cct new` and the global `~/.ccteam/` skeleton produced by
+//! `cct init`. The settings.json source uses the placeholder
+//! `{{CCT_BIN}}` for the binary path so we can rewrite hook commands
 //! to absolute paths at install time (otherwise hook subprocesses
-//! inherit Claude Code's PATH and silently fail to find `ccteam`).
+//! inherit Claude Code's PATH and silently fail to find `cct`).
+//!
+//! V0.2.2 F39: placeholder renamed from `__CCTEAM_BIN__` (binary now
+//! `cct`); the substitution semantics are unchanged.
 
 use std::path::Path;
 
@@ -11,10 +14,10 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 
 /// Per-project `.claude/settings.json` template. The template uses
-/// `__CCTEAM_BIN__` everywhere a real install would name `ccteam`; we
-/// substitute the running binary's absolute path at write time so hook
-/// subprocesses don't depend on the user's PATH (which Claude Code
-/// inherits and may not include the ccteam install dir).
+/// `{{CCT_BIN}}` everywhere a real install would name the absolute
+/// `cct` binary path; we substitute the running binary's absolute path
+/// at write time so hook subprocesses don't depend on the user's PATH
+/// (which Claude Code inherits and may not include the cct install dir).
 pub const PROJECT_SETTINGS_JSON: &str = include_str!("templates/settings.json");
 
 /// Phase template payloads — `(global_filename_with_index_prefix, body)`.
@@ -71,7 +74,7 @@ const PRODUCT_RESEARCH_PHASE_TEMPLATES: &[(&str, &str)] = &[
 ];
 
 /// Embedded `team.yaml` files keyed by team name. M3.4 ships dev +
-/// product-research; V0.2 M0.16 adds meta-agent (evergreen). `ccteam
+/// product-research; V0.2 M0.16 adds meta-agent (evergreen). `cct
 /// init` writes these to `~/.ccteam/teams/<name>/team.yaml`. The
 /// orchestrator reads them at startup to resolve `phase_dir`,
 /// registered ESCALATE prefixes, the V0.2 `evergreen` / `cost_policy`
@@ -89,7 +92,7 @@ const META_AGENT_PHASE_TEMPLATES: &[(&str, &str)] = &[];
 
 /// One team's compile-time bundle: a `team.yaml` body + the phase
 /// markdowns to stamp into the project's `<project>/.ccteam/phases/`
-/// dir on `ccteam new`. Looking up by team name keeps every
+/// dir on `cct new`. Looking up by team name keeps every
 /// per-team artifact in one place — adding a team is a config change.
 ///
 /// V0.2 §6.4 candidate 3: `pub(crate)` — runtime code paths now read
@@ -144,7 +147,7 @@ pub(crate) fn team_bundle(team: &str) -> Option<TeamTemplateBundle> {
 }
 
 /// M2.4: helper templates that phase markdown can `@`-reference. Shipped
-/// inside the binary so a fresh install (or `ccteam doctor`) can stamp
+/// inside the binary so a fresh install (or `cct doctor`) can stamp
 /// them into `~/.ccteam/templates/` without an external git checkout.
 ///
 /// `(on_disk_filename, body)` — phase markdown references them as
@@ -182,10 +185,13 @@ pub fn project_phase_filename(global: &str) -> &str {
     }
 }
 
-/// Resolve the path to the running ccteam binary. Falls back from
+/// Resolve the path to the running cct binary. Falls back from
 /// canonicalized to raw `current_exe()` because `canonicalize` rejects
 /// some `/proc/self/exe`-style paths in container test environments.
-pub fn current_ccteam_bin() -> Result<std::path::PathBuf> {
+///
+/// V0.2.2 F39: function renamed from `current_ccteam_bin` (binary
+/// renamed to `cct`); behavior is unchanged.
+pub fn current_cct_bin() -> Result<std::path::PathBuf> {
     let raw = std::env::current_exe().context("std::env::current_exe")?;
     Ok(raw.canonicalize().unwrap_or(raw))
 }
@@ -213,25 +219,25 @@ pub struct EnabledPluginsSetting {
     pub plugin_ids: std::collections::BTreeSet<String>,
 }
 
-/// Render `PROJECT_SETTINGS_JSON` with `__CCTEAM_BIN__` replaced by the
+/// Render `PROJECT_SETTINGS_JSON` with `{{CCT_BIN}}` replaced by the
 /// given absolute binary path, `extra_env` merged into the top-level
 /// `env` block, and `enabled` written under `enabledPlugins`. Validates
 /// that the rewritten body is still valid JSON so a path with
 /// shell-hostile characters can't silently corrupt the settings file.
 pub fn render_project_settings(
-    ccteam_bin: &Path,
+    cct_bin: &Path,
     extra_env: &SettingsEnv,
     enabled: &EnabledPluginsSetting,
 ) -> Result<String> {
-    let bin = ccteam_bin
+    let bin = cct_bin
         .to_str()
-        .ok_or_else(|| anyhow!("ccteam binary path not valid UTF-8: {}", ccteam_bin.display()))?;
+        .ok_or_else(|| anyhow!("cct binary path not valid UTF-8: {}", cct_bin.display()))?;
     if bin.contains('"') || bin.contains('\\') {
         return Err(anyhow!(
-            "ccteam binary path contains characters that can't be embedded in settings.json: {bin}"
+            "cct binary path contains characters that can't be embedded in settings.json: {bin}"
         ));
     }
-    let body = PROJECT_SETTINGS_JSON.replace("__CCTEAM_BIN__", bin);
+    let body = PROJECT_SETTINGS_JSON.replace("{{CCT_BIN}}", bin);
     let mut v: Value = serde_json::from_str(&body)
         .with_context(|| format!("rendered settings.json is not valid JSON (bin={bin})"))?;
     if let Some(env) = v.get_mut("env").and_then(|e| e.as_object_mut()) {
@@ -258,11 +264,11 @@ pub fn render_project_settings(
 }
 
 /// Write `<project_dir>/.claude/settings.json` with hook commands
-/// pointing at the running ccteam binary by absolute path, the
+/// pointing at the running cct binary by absolute path, the
 /// effective `CCTEAM_HOME` / `CCTEAM_PROJECTS_ROOT` baked into `env`,
 /// and the spawned-session `enabledPlugins` set. Creates the parent
 /// dir if missing. Idempotent — overwrites any prior render so
-/// re-running after a ccteam upgrade refreshes paths and the
+/// re-running after a cct upgrade refreshes paths and the
 /// plugin set.
 pub fn write_project_settings(
     project_dir: &Path,
@@ -272,7 +278,7 @@ pub fn write_project_settings(
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("create {}", dir.display()))?;
     let path = dir.join("settings.json");
-    let bin = current_ccteam_bin()?;
+    let bin = current_cct_bin()?;
     let extra = SettingsEnv {
         ccteam_home: std::env::var("CCTEAM_HOME").ok(),
         ccteam_projects_root: std::env::var("CCTEAM_PROJECTS_ROOT").ok(),
@@ -332,7 +338,7 @@ pub fn write_project_phase_templates_for_team(
 }
 
 /// Write each `PHASE_TEMPLATES` entry into `<global_dir>/phases/` under
-/// its full prefixed name (e.g. `02-plan-eng.md`). Used by `ccteam init`
+/// its full prefixed name (e.g. `02-plan-eng.md`). Used by `cct init`
 /// so the orchestrator can load + validate templates from `~/.ccteam/`.
 /// `force == false` skips files already on disk so an operator can hand-
 /// edit a global template and not lose it on re-init.
@@ -408,9 +414,9 @@ pub fn write_all_global_team_templates(global_dir: &Path, force: bool) -> Result
 /// `@~/.ccteam/templates/<filename>` reference resolves. Idempotent;
 /// `force == false` preserves operator hand-edits.
 ///
-/// Called by `ccteam init` (global skeleton) and `bootstrap_project`
-/// (defensive — covers the user who jumps straight to `ccteam new`
-/// without `ccteam init`). The two callers don't conflict because
+/// Called by `cct init` (global skeleton) and `bootstrap_project`
+/// (defensive — covers the user who jumps straight to `cct new`
+/// without `cct init`). The two callers don't conflict because
 /// the writer is a no-op when files are already in place.
 pub fn write_global_helper_templates(global_dir: &Path, force: bool) -> Result<()> {
     let dir = global_dir.join("templates");
@@ -465,7 +471,7 @@ mod tests {
         // entry for `AskUserQuestion` so the hook can deny the call
         // before the assistant blocks waiting on an offline user.
         let body = render_project_settings(
-            Path::new("/usr/local/bin/ccteam"),
+            Path::new("/usr/local/bin/cct"),
             &SettingsEnv::default(),
             &EnabledPluginsSetting::default(),
         )
@@ -477,13 +483,13 @@ mod tests {
             .find(|e| e.get("matcher").and_then(|m| m.as_str()) == Some("AskUserQuestion"))
             .expect("PreToolUse must have an AskUserQuestion matcher entry");
         let cmd = intercept["hooks"][0]["command"].as_str().unwrap();
-        assert_eq!(cmd, "/usr/local/bin/ccteam hook intercept-ask");
+        assert_eq!(cmd, "/usr/local/bin/cct hook intercept-ask");
     }
 
     #[test]
-    fn template_session_start_uses_absolute_ccteam_path() {
+    fn template_session_start_uses_absolute_cct_path() {
         let body = render_project_settings(
-            Path::new("/usr/local/bin/ccteam"),
+            Path::new("/usr/local/bin/cct"),
             &SettingsEnv::default(),
             &EnabledPluginsSetting::default(),
         )
@@ -497,25 +503,30 @@ mod tests {
         assert_eq!(
             cmds,
             vec![
-                "/usr/local/bin/ccteam hook load-context",
-                "/usr/local/bin/ccteam hook progress-append session_start"
+                "/usr/local/bin/cct hook load-context",
+                "/usr/local/bin/cct hook progress-append session_start"
             ],
         );
     }
 
     #[test]
-    fn raw_template_uses_placeholder_not_bare_ccteam() {
-        // Guard against accidentally re-introducing `"command": "ccteam …"`
+    fn raw_template_uses_placeholder_not_bare_cct() {
+        // Guard against accidentally re-introducing `"command": "cct …"`
         // — the un-substituted form makes hook subprocesses depend on PATH,
         // which Claude Code inherits from its parent and which often does
-        // not include the ccteam install dir.
+        // not include the cct install dir.
         assert!(
-            PROJECT_SETTINGS_JSON.contains("__CCTEAM_BIN__"),
-            "template should reference __CCTEAM_BIN__ placeholder",
+            PROJECT_SETTINGS_JSON.contains("{{CCT_BIN}}"),
+            "template should reference {{CCT_BIN}} placeholder",
         );
         assert!(
-            !PROJECT_SETTINGS_JSON.contains("\"ccteam hook"),
-            "template should not embed bare `ccteam hook` — see render_project_settings",
+            !PROJECT_SETTINGS_JSON.contains("\"cct hook"),
+            "template should not embed bare `cct hook` — see render_project_settings",
+        );
+        // F39 sweep guard: legacy placeholder must not return.
+        assert!(
+            !PROJECT_SETTINGS_JSON.contains("__CCTEAM_BIN__"),
+            "template should not embed legacy __CCTEAM_BIN__ placeholder (F39)",
         );
     }
 

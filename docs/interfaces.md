@@ -305,7 +305,7 @@ event_kind: reply                             # reply | progress | escalation | 
 
 # NL reply body
 
-收到了。我已经用 `ccteam new` 派单给 dev 团队,slug = bookmark-mgr-a3f9。
+收到了。我已经用 `cct new` 派单给 dev 团队,slug = bookmark-mgr-a3f9。
 预计 30 分钟内 plan-eng 完成,有 escalation 我会同步。
 ```
 
@@ -399,7 +399,7 @@ interfaces §3.4.3"。具体写哪些事件:
 | `ESCALATE: NEED_USER_INPUT — <questions>` | `need_user_input` | `null` | 写 escalation.md,inbox 等用户 |
 | `ESCALATE: ABORT — <reason>` | `abort` | `null` | 项目永久标 escalated,M0 等同 NEED_USER_INPUT |
 | `ESCALATE: INSUFFICIENT_CLARIFICATION — <last_question>` | `insufficient_clarification` | `null` | M2.3+:phase 已撞 `max_clarify_rounds` 上限,best-effort artifact 已产出;orchestrator 写 escalation.md,outbox `event_kind: escalation`,等用户决定继续 / 接受 / abort(详见 §5.6.2) |
-| `ESCALATE: PHASE_DONE_PENDING — <reason>` | (special — emits standalone `phase_done_pending` event, not `escalate`) | `null` | M3.6 ✅:phase 产出 required_outputs 但部分子任务 defer。Stop hook 从 reason 解析 outbox 文件名(`reply-*.md` / `clarify-*.md` / `escalation-*.md`),写 `event: "phase_done_pending"` 含 `phase` / `open_decisions[]` / `reason` 三字段;orchestrator 走 `TickAction::AdvancePhasePending`,看下 phase `required_inputs` 与 `open_decisions` 静态交集决定 advance / 切 `PhaseState::DonePending` 阻塞(`ccteam resume` 清除) |
+| `ESCALATE: PHASE_DONE_PENDING — <reason>` | (special — emits standalone `phase_done_pending` event, not `escalate`) | `null` | M3.6 ✅:phase 产出 required_outputs 但部分子任务 defer。Stop hook 从 reason 解析 outbox 文件名(`reply-*.md` / `clarify-*.md` / `escalation-*.md`),写 `event: "phase_done_pending"` 含 `phase` / `open_decisions[]` / `reason` 三字段;orchestrator 走 `TickAction::AdvancePhasePending`,看下 phase `required_inputs` 与 `open_decisions` 静态交集决定 advance / 切 `PhaseState::DonePending` 阻塞(`cct resume` 清除) |
 | `ESCALATE: <free text>`(无前缀) | `need_user_input` | `null` | 等同显式 NEED_USER_INPUT,reason 是整段文本 |
 
 分隔符:em dash `—`(U+2014)、`--`、` - `(单 dash 必须前后有空格——这是为了不切碎 `plan-eng` 这类 phase 名)。
@@ -595,7 +595,7 @@ confidence: 0.0-1.0
 
 ### 5.4 `tools_required` 字段语义(M0.5+)
 
-声明 phase 模板里会用到的工具,orchestrator 启动时枚举本机可达项 + 交叉比对,缺谁报谁 + 给修复命令(`ccteam start` 直接 fail-fast,除非加 `--skip-tool-check`)。
+声明 phase 模板里会用到的工具,orchestrator 启动时枚举本机可达项 + 交叉比对,缺谁报谁 + 给修复命令(`cct start` 直接 fail-fast,除非加 `--skip-tool-check`)。
 
 | 子字段 | 名字来源 | "可达"判定 |
 |---|---|---|
@@ -607,7 +607,7 @@ confidence: 0.0-1.0
 
 `bootstrap_project` 已在 §1.2 项目创建路径里自动写 `enabledPlugins` + 占位 skills 目录,所以 happy path 上模板要的工具默认都有;只有用户手工编辑模板加了非推荐工具时才会触发本节的校验失败。
 
-V0.1 → V0.2 升级:V0.1 用户的 `~/.claude/agents/<name>.md` ln -sf 由 `ccteam doctor --migrate-recommended-agents` 一次性清理。
+V0.1 → V0.2 升级:V0.1 用户的 `~/.claude/agents/<name>.md` ln -sf 由 `cct doctor --migrate-recommended-agents` 一次性清理。
 
 ---
 
@@ -630,7 +630,7 @@ V0.1 → V0.2 升级:V0.1 用户的 `~/.claude/agents/<name>.md` ln -sf 由 `cct
 ```yaml
 # ~/.ccteam/teams/product-research/team.yaml — 完整字段示例
 name: product-research                  # 必填。snake-case [a-z0-9_-]+,与 --team / state.json.team 对齐
-description: Product research team       # 可选。`ccteam ls --teams`(M3.4)显示
+description: Product research team       # 可选。`cct ls --teams`(M3.4)显示
 phase_dir: phases-product-research       # 默认 `phases`。phase 模板 markdown 所在目录(相对 ~/.ccteam/)
 
 # M3.4 verdict-emitting phase 名 list。对应 §5.3 通用 verdict schema。
@@ -734,7 +734,7 @@ claude_md_template: |
 <staging>/
   .claude-plugin/
     plugin.json                       # Claude Code plugin manifest(严格 schema)
-  team.yaml                           # ccteam team 配置(plugin loader unknown,zod strip)
+  team.yaml                           # cct team 配置(plugin loader unknown,zod strip)
   phases/
     01-<phase>.md                     # 同 §5.1 frontmatter
     ...
@@ -780,7 +780,7 @@ V0.3 candidate)。
 §2.7)。`team.yaml` 不会污染 plugin 加载,ccteam 通过
 `team_resolver::resolve_team` 直接读。
 
-**校验**(`ccteam doctor --validate-team <name>`,M0.22.4 在 M0.18.5
+**校验**(`cct doctor --validate-team <name>`,M0.22.4 在 M0.18.5
 基础上扩展):
 1. `.claude-plugin/plugin.json` 解析 + `PluginManifest::validate`
    (name / description / author.name 非空,name 字符集合法)
@@ -791,7 +791,7 @@ V0.3 candidate)。
 **实现位置**:`crates/ccteam-core/src/team_factory.rs`(`PluginManifest` /
 `PluginAuthor` / `init_team_staging` / `validate_staged_team` /
 `publish_team`)。CLI 入口在 `crates/ccteam-cli/src/team_factory_cli.rs`
-`ccteam team {init,publish}`。
+`cct team {init,publish}`。
 
 ---
 
@@ -833,9 +833,9 @@ phase 内累计 CLARIFY 轮次(每个 outbox `event_kind: clarify` 文件 + 对�
 - `sync` mode → 不写任何 outbox(用 AskUserQuestion 直接对话)
 - `async` / `hybrid` mode → 写 `clarify`(还想问)或 `escalation`(过 max_clarify_rounds 或 verdict=REJECT)
 
-#### 5.6.4 与 `ccteam decisions` CLI 的关系(M1 收尾增量)
+#### 5.6.4 与 `cct decisions` CLI 的关系(M1 收尾增量)
 
-`ccteam decisions` 扫所有 `~/projects/*/.ccteam/outbox/*.md` 过滤 `event_kind: clarify | escalation`,聚合成跨项目决策队列。**用户在 meta session attach 时,meta-agent 主动汇报队列**(role prompt 启发,M1.0 已落)。
+`cct decisions` 扫所有 `~/projects/*/.ccteam/outbox/*.md` 过滤 `event_kind: clarify | escalation`,聚合成跨项目决策队列。**用户在 meta session attach 时,meta-agent 主动汇报队列**(role prompt 启发,M1.0 已落)。
 
 ---
 
@@ -843,7 +843,7 @@ phase 内累计 CLARIFY 轮次(每个 outbox `event_kind: clarify` 文件 + 对�
 
 ### 6.1 项目 `.claude/settings.json` 完整模板
 
-> **D1 备注**:所有 hook 都是 `ccteam` 单 binary 的子命令(`ccteam hook <name>`),不再是独立 bash/python 脚本——零运行时依赖,与 orchestrator 共享 serde schema。debug 时可手动跑 `ccteam hook <subcmd>` 喂 stdin JSON(详见 §10.6)。
+> **D1 备注**:所有 hook 都是 `ccteam` 单 binary 的子命令(`cct hook <name>`),不再是独立 bash/python 脚本——零运行时依赖,与 orchestrator 共享 serde schema。debug 时可手动跑 `cct hook <subcmd>` 喂 stdin JSON(详见 §10.6)。
 >
 > **M0 备注**:M0.4 渲染的模板是下面 JSON 的一个真子集——**不含** `PostToolUse(Bash:git push.*)` 拦截分支(M1+ 才补上 `block-push` 子命令实现)。M0 渲染源在 `crates/ccteam-core/src/templates/settings.json`。
 
@@ -860,16 +860,16 @@ phase 内累计 CLARIFY 轮次(每个 outbox `event_kind: clarify` 文件 + 对�
     "SessionStart": [
       {
         "hooks": [
-          {"type": "command", "command": "ccteam hook load-context", "timeout": 5},
-          {"type": "command", "command": "ccteam hook progress-append session_start", "async": true}
+          {"type": "command", "command": "cct hook load-context", "timeout": 5},
+          {"type": "command", "command": "cct hook progress-append session_start", "async": true}
         ]
       }
     ],
     "Stop": [
       {
         "hooks": [
-          {"type": "command", "command": "ccteam hook parse-phase-end", "timeout": 10},
-          {"type": "command", "command": "ccteam hook progress-append Stop", "async": true}
+          {"type": "command", "command": "cct hook parse-phase-end", "timeout": 10},
+          {"type": "command", "command": "cct hook progress-append Stop", "async": true}
         ]
       }
     ],
@@ -877,48 +877,48 @@ phase 内累计 CLARIFY 轮次(每个 outbox `event_kind: clarify` 文件 + 对�
       {
         "matcher": "idle_prompt|permission_prompt",
         "hooks": [
-          {"type": "command", "command": "ccteam hook progress-append notification", "async": true}
+          {"type": "command", "command": "cct hook progress-append notification", "async": true}
         ]
       }
     ],
     "PreToolUse": [
       {
         "hooks": [
-          {"type": "command", "command": "ccteam hook progress-append PreToolUse", "async": true}
+          {"type": "command", "command": "cct hook progress-append PreToolUse", "async": true}
         ]
       },
       {
         "matcher": "AskUserQuestion",
         "hooks": [
-          {"type": "command", "command": "ccteam hook intercept-ask", "timeout": 5}
+          {"type": "command", "command": "cct hook intercept-ask", "timeout": 5}
         ]
       }
     ],
     "PostToolUse": [
       {
         "hooks": [
-          {"type": "command", "command": "ccteam hook progress-append PostToolUse", "async": true},
-          {"type": "command", "command": "ccteam hook cost-accumulate", "async": true}
+          {"type": "command", "command": "cct hook progress-append PostToolUse", "async": true},
+          {"type": "command", "command": "cct hook cost-accumulate", "async": true}
         ]
       },
       {
         "matcher": "Bash:git push.*",
         "hooks": [
-          {"type": "command", "command": "ccteam hook block-push"}
+          {"type": "command", "command": "cct hook block-push"}
         ]
       }
     ],
     "SubagentStop": [
       {
         "hooks": [
-          {"type": "command", "command": "ccteam hook progress-append SubagentStop", "async": true}
+          {"type": "command", "command": "cct hook progress-append SubagentStop", "async": true}
         ]
       }
     ],
     "SessionEnd": [
       {
         "hooks": [
-          {"type": "command", "command": "ccteam hook progress-append SessionEnd", "async": true}
+          {"type": "command", "command": "cct hook progress-append SessionEnd", "async": true}
         ]
       }
     ]
@@ -935,7 +935,7 @@ phase 内累计 CLARIFY 轮次(每个 outbox `event_kind: clarify` 文件 + 对�
 | `Notification:idle_prompt` | claude 显式等待用户输入 → idle 信号 |
 | `Notification:permission_prompt` | 不应出现(`--dangerously-skip-permissions` 兜底);出现说明配置失效 |
 | `PreToolUse`(通用) | append 工具调用事件;活跃信号(stall 检测反向判断) |
-| `PreToolUse(matcher: AskUserQuestion)` | **V0.2 M0.19.3**:`ccteam hook intercept-ask` 返回 `permissionDecision: deny`,assistant 改写 outbox。机制详见 `docs/v0-2/alignment-review.md` §3.2 |
+| `PreToolUse(matcher: AskUserQuestion)` | **V0.2 M0.19.3**:`cct hook intercept-ask` 返回 `permissionDecision: deny`,assistant 改写 outbox。机制详见 `docs/v0-2/alignment-review.md` §3.2 |
 | `PostToolUse`(通用) | append 事件;`cost-accumulate.sh` 累加 token / cost 到 `state.json` |
 | `PostToolUse(Bash matcher)` | 拦截危险命令(`git push` / `rm -rf /` / deploy 脚本) |
 | `SubagentStop` | 子 agent 退出(仅 Agent Teams phase 内相关) |
@@ -981,7 +981,7 @@ stop_hook_active == true?
 }
 ```
 
-`ccteam hook intercept-ask` 返回的 PreToolUse 决策(`hooks.ts:608-625`):
+`cct hook intercept-ask` 返回的 PreToolUse 决策(`hooks.ts:608-625`):
 
 ```json
 {
@@ -1189,35 +1189,35 @@ fork_timeout_hours: 24            # L3 默认通过超时(careful 模式忽略)
 ### 10.1 启动 / 停止
 
 ```bash
-ccteam start                           # 启动 orchestrator(前台)
-ccteam start --daemon                  # 启动并 daemonize
-ccteam stop                            # 优雅停机(保留 tmux session)
-ccteam stop --kill-sessions            # 同时关闭所有 tmux session(慎用)
-ccteam mcp-serve                       # M2+:作为 ccteam-mcp 跑 stdio MCP 协议(详见 §12)
+cct start                           # 启动 orchestrator(前台)
+cct start --daemon                  # 启动并 daemonize
+cct stop                            # 优雅停机(保留 tmux session)
+cct stop --kill-sessions            # 同时关闭所有 tmux session(慎用)
+cct mcp-serve                       # M2+:作为 ccteam-mcp 跑 stdio MCP 协议(详见 §12)
 ```
 
 ### 10.2 提交需求
 
 ```bash
-ccteam new "需求文本"
-ccteam new -f spec.md                  # 从文件提
-ccteam new --mode yolo "需求"          # 覆盖默认 trust_mode
+cct new "需求文本"
+cct new -f spec.md                  # 从文件提
+cct new --mode yolo "需求"          # 覆盖默认 trust_mode
 ```
 
 ### 10.3 查询状态
 
 ```bash
-ccteam ls                              # 所有项目状态(human 表格)
-ccteam ls --format json                # JSON 输出(给 LLM / 脚本用)
-ccteam show <slug>                     # 单项目详情(含 session 状态、cost、最近 progress)
-ccteam show <slug> --format json       # JSON 输出
-ccteam progress <slug> --tail          # 实时 tail progress.jsonl
-ccteam progress <slug> --phase implement  # 看特定 phase 事件
+cct ls                              # 所有项目状态(human 表格)
+cct ls --format json                # JSON 输出(给 LLM / 脚本用)
+cct show <slug>                     # 单项目详情(含 session 状态、cost、最近 progress)
+cct show <slug> --format json       # JSON 输出
+cct progress <slug> --tail          # 实时 tail progress.jsonl
+cct progress <slug> --phase implement  # 看特定 phase 事件
 ```
 
 **`--format json` 是 M0 强制项**——所有查询命令必须支持,以让"用户自带 claude"路径(详见 [tech-design.md §3.8](./tech-design.md#38-用户接口层))通过 Bash 工具调时无需解析表格。
 
-#### `ccteam ls --format json` schema
+#### `cct ls --format json` schema
 
 ```json
 {
@@ -1243,7 +1243,7 @@ ccteam progress <slug> --phase implement  # 看特定 phase 事件
 }
 ```
 
-#### `ccteam show <slug> --format json` schema
+#### `cct show <slug> --format json` schema
 
 是 §2.1 项目级 state.json 的全量 + 派生字段:
 
@@ -1270,23 +1270,23 @@ ccteam progress <slug> --phase implement  # 看特定 phase 事件
 ### 10.4 进入项目
 
 ```bash
-ccteam attach <slug>                   # tmux attach 到项目 master session
-ccteam attach <slug> --sub backend-api # multi-session 项目 attach 到子模块 session(M3+)
-ccteam peek <slug>                     # tmux capture-pane 一次性看当前屏,不 attach
+cct attach <slug>                   # tmux attach 到项目 master session
+cct attach <slug> --sub backend-api # multi-session 项目 attach 到子模块 session(M3+)
+cct peek <slug>                     # tmux capture-pane 一次性看当前屏,不 attach
 ```
 
 ### 10.5 控制
 
 ```bash
 ccteam reject <slug>                   # 否决
-ccteam pause <slug>                    # 暂停(不杀 session)
-ccteam resume <slug>                   # 恢复自动调度(接管 attach 后的暂停)
+cct pause <slug>                    # 暂停(不杀 session)
+cct resume <slug>                   # 恢复自动调度(接管 attach 后的暂停)
 ccteam answer <slug> "回答内容"          # 响应 clarify
-ccteam decisions                       # M1 收尾增量:跨项目决策队列(扫 outbox event_kind: clarify|escalation)
-ccteam decisions --format json         # JSON 输出(meta-agent 主消费;详见 §5.6.4)
-ccteam watchdog scan                   # V0.2 M0.21 translation-only 健康巡检(详见 §12.5)
-ccteam watchdog scan --format json     # 结构化输出(meta-agent 主消费)
-ccteam watchdog scan --push --user <handle>  # 把 alert 写进 meta-agent outbox
+cct decisions                       # M1 收尾增量:跨项目决策队列(扫 outbox event_kind: clarify|escalation)
+cct decisions --format json         # JSON 输出(meta-agent 主消费;详见 §5.6.4)
+cct watchdog scan                   # V0.2 M0.21 translation-only 健康巡检(详见 §12.5)
+cct watchdog scan --format json     # 结构化输出(meta-agent 主消费)
+cct watchdog scan --push --user <handle>  # 把 alert 写进 meta-agent outbox
 ccteam fork-reply <slug> A             # L3 fork 决策(M1+;A/B/C)
 ccteam fork-reply <slug> B "去掉云同步"  # tweak
 ccteam kick <slug>                     # 软重启项目 session(claude --resume)
@@ -1299,46 +1299,46 @@ ccteam kick <slug>                     # 软重启项目 session(claude --resume
 # 直接编辑 ~/.claude/rules/ccteam-lessons-<team>.md 看 / 改跨项目 lessons。
 # ccteam 不提供 memory 子命令(无自建索引,无东西可 rebuild)。
 ccteam config edit                                # 改全局配置
-ccteam doctor                                     # 体检:列出可用 mode flags
-ccteam doctor --tool-surface                      # phase tools_required 交叉表(plugin pipeline 感知,V0.2 M0.20)
-ccteam doctor --install-skill                     # M1.8 写 ccteam-control skill
-ccteam doctor --install-meta-agent <user-handle>  # M1.0 创建 meta-agent 项目(含 --install-skill)
-ccteam doctor --install-mcp                       # M2.5 在 ~/.claude.json 注册 mcpServers.ccteam(详见 §12)
-ccteam doctor --install-memory-bridge             # M4.2 写 ~/.claude/rules/ccteam-lessons-{dev,product-research}.md 占位 + paths frontmatter scope
-ccteam doctor --migrate-recommended-agents        # V0.2 M0.20 一次性清理 V0.1 ln -sf 残留 (~/.claude/agents/ 下指向 marketplace 的 symlink)
-ccteam hook <subcmd>                              # debug:手动跑 hook(读 stdin JSON,写 stdout);
+cct doctor                                     # 体检:列出可用 mode flags
+cct doctor --tool-surface                      # phase tools_required 交叉表(plugin pipeline 感知,V0.2 M0.20)
+cct doctor --install-skill                     # M1.8 写 cct-control skill
+cct doctor --install-meta-agent <user-handle>  # M1.0 创建 meta-agent 项目(含 --install-skill)
+cct doctor --install-mcp                       # M2.5 在 ~/.claude.json 注册 mcpServers.ccteam(详见 §12)
+cct doctor --install-memory-bridge             # M4.2 写 ~/.claude/rules/ccteam-lessons-{dev,product-research}.md 占位 + paths frontmatter scope
+cct doctor --migrate-recommended-agents        # V0.2 M0.20 一次性清理 V0.1 ln -sf 残留 (~/.claude/agents/ 下指向 marketplace 的 symlink)
+cct hook <subcmd>                              # debug:手动跑 hook(读 stdin JSON,写 stdout);
                                                   # subcmd ∈ {progress-append, parse-phase-end,
                                                   # cost-accumulate, load-context, block-push}
 ```
 
-#### `ccteam stop` 行为契约(M1.5)
+#### `cct stop` 行为契约(M1.5)
 
-`ccteam stop` 通过 `~/.ccteam/state/orchestrator.pid` 找到正在跑的
-orchestrator,发 SIGTERM。**不杀任何 tmux session**——`ccteam start`
+`cct stop` 通过 `~/.ccteam/state/orchestrator.pid` 找到正在跑的
+orchestrator,发 SIGTERM。**不杀任何 tmux session**——`cct start`
 下次启动时通过 `discover_projects` + `ensure_session` 自动 reattach
-所有活跃 session(meta + 项目)。pidfile 由 `ccteam start` 写入,
-退出时清理;若 pidfile 指向的 PID 已死,`ccteam start` 自动重新认领。
+所有活跃 session(meta + 项目)。pidfile 由 `cct start` 写入,
+退出时清理;若 pidfile 指向的 PID 已死,`cct start` 自动重新认领。
 
 ---
 
-## 11. `ccteam-control` skill(M1+)
+## 11. `cct-control` skill(M1+)
 
 让用户在自己的 Claude Code session 里调度 ccteam。架构论证见 [tech-design.md §3.8 / §6.7](./tech-design.md#38-用户接口层)。
 
 ### 11.1 安装位置
 
 ```
-~/.claude/skills/ccteam-control/
+~/.claude/skills/cct-control/
 └── SKILL.md
 ```
 
-由 ccteam M1 release 通过 `ccteam doctor --install-skill` 写入,或手动 `cp` from binary unpack。装一次,所有 claude session 自动可见。
+由 ccteam M1 release 通过 `cct doctor --install-skill` 写入,或手动 `cp` from binary unpack。装一次,所有 claude session 自动可见。
 
 ### 11.2 SKILL.md 字段约定
 
 ```yaml
 ---
-name: ccteam-control
+name: cct-control
 description: |
   Manage ccteam projects from any Claude Code session.
   Use when the user asks about ccteam status, wants to start a new ccteam project,
@@ -1371,7 +1371,7 @@ M1 时 skill 让 claude 用 Bash 工具 + `--format json` 调 CLI。M2 ccteam-mc
 
 ### 11.5 Meta-agent role prompt(M1.0)
 
-`ccteam doctor --install-meta-agent <user>` 落地两件事:
+`cct doctor --install-meta-agent <user>` 落地两件事:
 
 1. **项目骨架** `~/projects/<user>-meta/` —— 通过 `bootstrap_project(team=meta-agent)`
    生成,然后把 `state.json.tmux_session` 改成 `ccteam-meta-<user>`(注:与项目
@@ -1411,19 +1411,19 @@ orchestrator 识别 `state.team == "meta-agent"` 走 `process_meta_project` 分�
 }
 ```
 
-由 `ccteam doctor --install-mcp` 写入(M2 release)。`ccteam mcp-serve` 是 binary 子命令,stdio 协议。
+由 `cct doctor --install-mcp` 写入(M2 release)。`cct mcp-serve` 是 binary 子命令,stdio 协议。
 
 ### 12.2 暴露的 tool 清单(M2.5 起,9 tool)
 
 | Tool 名 | 对应 CLI / 行为 | 入参 | 返回 |
 |---|---|---|---|
-| `ccteam__ls` | `ccteam ls --format json` | `{}` | §10.3 ls JSON schema(扩 `team`) |
-| `ccteam__show` | `ccteam show <slug> --format json` | `{slug: string}` | §10.3 show JSON schema |
-| `ccteam__new` | `ccteam new "..."` | `{prompt: string, team?: string}` | `{slug: string, workspace: string}` |
-| `ccteam__peek` | `ccteam peek <slug>` | `{slug: string}` | tmux capture-pane stdout 字符串 |
-| `ccteam__progress` | `ccteam progress <slug>` | `{slug: string, last_n?: number}` | `{events: [...]}` |
+| `ccteam__ls` | `cct ls --format json` | `{}` | §10.3 ls JSON schema(扩 `team`) |
+| `ccteam__show` | `cct show <slug> --format json` | `{slug: string}` | §10.3 show JSON schema |
+| `ccteam__new` | `cct new "..."` | `{prompt: string, team?: string}` | `{slug: string, workspace: string}` |
+| `ccteam__peek` | `cct peek <slug>` | `{slug: string}` | tmux capture-pane stdout 字符串 |
+| `ccteam__progress` | `cct progress <slug>` | `{slug: string, last_n?: number}` | `{events: [...]}` |
 | `ccteam__pause` | 设 `state.user_pause_pending=true` | `{slug: string}` | `{ok: bool, slug: string, user_pause_pending: bool}` |
-| `ccteam__resume` | `ccteam resume <slug>` | `{slug: string}` | `{ok: bool, slug: string}` |
+| `ccteam__resume` | `cct resume <slug>` | `{slug: string}` | `{ok: bool, slug: string}` |
 | `ccteam__send_to_session`(M2.5 新)| 原子写 `<session>/.ccteam/inbox/msg-<ts>-NNN.md`(§3.4.2)| `{session: string, body: string, content_type?: "text"\|"markdown"}` | `{ok: bool, session: string, inbox_file: string}` |
 | `ccteam__inject_decision`(M2.5 新)| 构造 ESCALATE-shape payload(§4.1.1),走 `send_to_session` 落 inbox | `{slug: string, escalate_kind: "revert_to_phase"\|"need_user_input"\|"abort"\|"insufficient_clarification"\|"phase_done_pending", args?: {target_phase?: string, reason?: string}}` | `{ok: bool, slug: string, inbox_file: string}` |
 
@@ -1437,10 +1437,10 @@ orchestrator 识别 `state.team == "meta-agent"` 走 `process_meta_project` 分�
 
 ### 12.3 不暴露的(M2 显式排除)
 
-- `ccteam attach` — tty 交互,MCP 协议不适合
-- `ccteam start / stop` — orchestrator 生命周期管理是 ops 决策,不让 LLM 误调
+- `cct attach` — tty 交互,MCP 协议不适合
+- `cct start / stop` — orchestrator 生命周期管理是 ops 决策,不让 LLM 误调
 - ~~`ccteam memory rebuild`~~ — M4 简化后无自建索引,该命令不存在
-- `ccteam doctor --install-*` — 单机配置变更,走 CLI(避免 MCP server 给 LLM 改 ~/.claude.json 的能力)
+- `cct doctor --install-*` — 单机配置变更,走 CLI(避免 MCP server 给 LLM 改 ~/.claude.json 的能力)
 
 ### 12.4 双消费者
 
@@ -1481,7 +1481,7 @@ orchestrator 识别 `state.team == "meta-agent"` 走 `process_meta_project` 分�
 
 ### 12.5.4 Alert 输出契约
 
-`ccteam watchdog scan --format json` 输出 schema:
+`cct watchdog scan --format json` 输出 schema:
 
 ```json
 {
@@ -1552,27 +1552,27 @@ orchestrator 识别 `state.team == "meta-agent"` 走 `process_meta_project` 分�
 ```rust
 // crates/ccteam-core/src/lib.rs(示意签名,实际可调整)
 
-/// 读单项目状态(对应 §2.1 state.json 的全量结构 + 派生字段;§10.3 `ccteam show --format json` 的内核)。
+/// 读单项目状态(对应 §2.1 state.json 的全量结构 + 派生字段;§10.3 `cct show --format json` 的内核)。
 pub fn get_state(slug: &str) -> Result<ProjectState, CoreError>;
 
-/// 列所有项目摘要(§10.3 `ccteam ls --format json` 的内核)。
+/// 列所有项目摘要(§10.3 `cct ls --format json` 的内核)。
 pub fn list_projects() -> Result<Vec<ProjectSummary>, CoreError>;
 
 /// 提交控制信号——写 §3.3 `~/.ccteam/control/` 文件,orchestrator 下一轮扫到生效。
 /// `ControlSignal` 枚举覆盖 reject / pause / resume / answer / boost / fork-reply。
 pub fn submit_control(slug: &str, signal: ControlSignal) -> Result<(), CoreError>;
 
-/// 一次性读取 progress.jsonl 末尾 N 条事件(§10.3 `ccteam progress --tail` 的非流式入口)。
+/// 一次性读取 progress.jsonl 末尾 N 条事件(§10.3 `cct progress --tail` 的非流式入口)。
 pub fn tail_progress(slug: &str, last_n: usize) -> Result<Vec<Event>, CoreError>;
 
 /// 流式订阅 progress.jsonl(`tokio` Stream;inotify 监听末尾)。
 /// TUI / web dashboard 实时事件推送的主接口。
 pub fn attach_progress(slug: &str) -> Result<impl Stream<Item = Result<Event, CoreError>>, CoreError>;
 
-/// 提交新需求(对应 §10.2 `ccteam new`),返回分配的 slug 与项目目录。
+/// 提交新需求(对应 §10.2 `cct new`),返回分配的 slug 与项目目录。
 pub fn submit_inbox(spec: InboxSpec) -> Result<NewProjectHandle, CoreError>;
 
-/// 一次性 capture 项目 tmux pane 当前屏(§10.4 `ccteam peek` 的内核;不 attach)。
+/// 一次性 capture 项目 tmux pane 当前屏(§10.4 `cct peek` 的内核;不 attach)。
 pub fn peek_pane(slug: &str, lines: Option<usize>) -> Result<PaneCapture, CoreError>;
 ```
 
@@ -1580,8 +1580,8 @@ pub fn peek_pane(slug: &str, lines: Option<usize>) -> Result<PaneCapture, CoreEr
 
 | `ccteam-core` 类型 | wire 格式(CLI `--format json` / MCP tool 返回) | 来源章节 |
 |---|---|---|
-| `ProjectState` | `ccteam show --format json` 全量 | §2.1 + §10.3 |
-| `ProjectSummary` | `ccteam ls --format json` `projects[]` 元素 | §10.3 |
+| `ProjectState` | `cct show --format json` 全量 | §2.1 + §10.3 |
+| `ProjectSummary` | `cct ls --format json` `projects[]` 元素 | §10.3 |
 | `Event` | progress.jsonl 单行 | §4.1 |
 | `ControlSignal` | `~/.ccteam/control/` 文件命名约定 | §3.3 |
 | `InboxSpec` | `~/.ccteam/inbox/*.md` front matter + body | §3.1 |

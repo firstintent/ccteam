@@ -447,7 +447,7 @@ fn decisions_queue_lists_clarify_outbox_from_product_research_project() {
 /// CCTEAM_HOME / CCTEAM_PROJECTS_ROOT redirected to the test sandbox.
 /// Returns the captured stdout on success.
 fn run_ccteam_subcommand(paths: &CcteamPaths, args: &[&str]) -> anyhow::Result<String> {
-    let bin = env!("CARGO_BIN_EXE_ccteam");
+    let bin = env!("CARGO_BIN_EXE_cct");
     let out = Command::new(bin)
         .args(args)
         .env("CCTEAM_HOME", paths.root.as_os_str())
