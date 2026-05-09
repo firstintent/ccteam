@@ -3,7 +3,8 @@
 //!
 //! Confirms the wire contract that interfaces.md §12 promises:
 //! - `initialize` returns `protocolVersion` + `tools` capability;
-//! - `tools/list` enumerates exactly 9 tools, all `ccteam__*`;
+//! - `tools/list` enumerates exactly 10 tools, all `ccteam__*`
+//!   (M2.5 shipped 9; V0.2.2 F38 added `ccteam__screenshot`);
 //! - `tools/call ccteam__ls` returns a JSON-encoded projects list as
 //!   the first content[].text.
 
@@ -110,7 +111,9 @@ fn mcp_serve_initialize_returns_protocol_version_and_tools_cap() {
 }
 
 #[test]
-fn mcp_serve_tools_list_returns_nine_ccteam_tools() {
+fn mcp_serve_tools_list_returns_full_tool_set() {
+    // M2.5 shipped 9 tools; V0.2.2 F38 added `ccteam__screenshot` for
+    // a total of 10. Bump this when a new tool lands.
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().join("home");
     let projects = tmp.path().join("projects");
@@ -126,7 +129,7 @@ fn mcp_serve_tools_list_returns_nine_ccteam_tools() {
     }));
     let resp = srv.recv();
     let tools = resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 9, "M2.5 brief = exactly 9 tools");
+    assert_eq!(tools.len(), 10, "9 base tools + V0.2.2 F38 screenshot");
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     for required in [
         "ccteam__ls",
@@ -138,6 +141,7 @@ fn mcp_serve_tools_list_returns_nine_ccteam_tools() {
         "ccteam__resume",
         "ccteam__send_to_session",
         "ccteam__inject_decision",
+        "ccteam__screenshot",
     ] {
         assert!(names.contains(&required), "missing tool: {required}");
     }

@@ -32,6 +32,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{json, Value};
 
 use ccteam_core::auto_loop::{self, AutoLoopDecision};
+use ccteam_core::tmux;
 use ccteam_core::{
     progress::{append_event, read_all_events},
     slug_from_project_dir, CcteamPaths,
@@ -202,7 +203,7 @@ pub fn parse_phase_end(paths: &CcteamPaths, stdin: &Value) -> Result<ParseDecisi
         // the stall so the watchdog surfaces it. Claude Code carries
         // `stop_hook_active: true` on the second Stop entry so a phase
         // that keeps producing nothing won't loop forever.
-        let pane_tail = capture_pane_tail(&slug, 30);
+        let pane_tail = tmux::capture_pane_tail(&slug, 30, false);
         write_needs_attention_outbox(
             cwd_path,
             &slug,
@@ -302,36 +303,6 @@ fn fresh_outbox_files(
         out.push(name);
     }
     Ok(out)
-}
-
-/// Capture the last `n` lines of the project's tmux pane. Returns
-/// `None` if tmux isn't installed, the session is missing, or the
-/// invocation otherwise fails. The captured text only ever lands in
-/// `needs_attention.outbox.json` as user-facing surface info — never
-/// parsed by the orchestrator's state machine (see CLAUDE.md
-/// "永不解析 tmux 终端输出" red line).
-fn capture_pane_tail(slug: &str, lines: usize) -> Option<String> {
-    let session = format!("ccteam-{slug}");
-    let output = std::process::Command::new("tmux")
-        .args([
-            "capture-pane",
-            "-p",
-            "-t",
-            &session,
-            "-S",
-            &format!("-{lines}"),
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout).trim_end().to_string();
-    if text.is_empty() {
-        None
-    } else {
-        Some(text)
-    }
 }
 
 /// V0.2 M0.19 L3 fail-safe: write `<project>/.ccteam/needs_attention.outbox.json`

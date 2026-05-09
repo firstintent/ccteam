@@ -17,6 +17,8 @@ pub mod phases;
 pub mod plugin_resolution;
 pub mod progress;
 pub mod projects;
+pub mod screenshot;
+pub mod silence_classifier;
 pub mod stall;
 pub mod state;
 pub mod subskill;
@@ -48,10 +50,11 @@ pub use memory_bridge::{
     InstallMemoryBridgeOptions, MemoryBridgeAction, MemoryBridgeReport,
 };
 pub use skill::{
-    install_cct_control_skill, install_cct_team_author_skill,
-    install_into as install_skill_into, install_skill_body_into,
-    InstallSkillOptions, InstallSkillReport, SkillInstallAction,
-    CCT_CONTROL_SKILL_NAME, CCT_TEAM_AUTHOR_SKILL_NAME, LEGACY_SKILL_NAMES,
+    install_cct_control_skill, install_cct_project_creator_skill,
+    install_cct_team_author_skill, install_into as install_skill_into,
+    install_skill_body_into, InstallSkillOptions, InstallSkillReport, SkillInstallAction,
+    CCT_CONTROL_SKILL_NAME, CCT_PROJECT_CREATOR_SKILL_NAME, CCT_TEAM_AUTHOR_SKILL_NAME,
+    LEGACY_SKILL_NAMES,
 };
 pub use orchestrator::MAX_CONCURRENT_PROJECTS;
 pub use orchestrator::{
@@ -59,13 +62,22 @@ pub use orchestrator::{
     decide_tick_from_events, intersect_open_decisions_with_required_inputs, Orchestrator,
     OrchestratorConfig, TeamRuntime, TickAction, DEFAULT_CLAUDE_MODEL,
 };
-pub use projects::{bootstrap_project, pick_unused_slug, pre_trust_project, slugify};
+pub use projects::{
+    bootstrap_project, pick_unused_slug, pick_unused_slug_verbatim, pre_trust_project,
+    slugify, slugify_brief,
+};
 pub use cost::{classify as classify_cost, CostLevel, COST_MID_WARN_USD};
 pub use daemon::{
     check_health as check_daemon_health, check_health_at as check_daemon_health_at,
     heartbeat_path, pidfile_path, read_pidfile, remove_heartbeat, remove_pidfile,
     send_sigterm_to_pidfile, write_heartbeat, write_pidfile, DaemonHealth, HEARTBEAT_GRACE,
     HEARTBEAT_INTERVAL, HEARTBEAT_NAME, PIDFILE_NAME,
+};
+pub use silence_classifier::{
+    classify as classify_silence, load_retry_count as load_limbo_retry_count,
+    reset_retry_count as reset_limbo_retry_count, retry_path_in as limbo_retry_path_in,
+    save_retry_count as save_limbo_retry_count, LastEventSummary, LimboAction, LimboRetryCount,
+    SilenceClass, LIMBO_RETRY_FILE, MAX_LIMBO_RETRY,
 };
 pub use stall::{
     classify as classify_stall, classify_with_thresholds, silent_seconds, StallLevel,
@@ -108,7 +120,14 @@ pub use templates::{
 // seed source for `write_all_global_team_templates`; runtime code paths
 // outside ccteam-core query disk (`<global_dir>/teams/<name>/team.yaml`)
 // instead.
-pub use tmux::{pid_is_alive, session_name_for_slug, tmux_available, TmuxSession};
+pub use screenshot::{
+    probe_font as probe_screenshot_font, render_screenshot, vt100_color_to_rgb,
+    FONT_ENV as SCREENSHOT_FONT_ENV, ScreenshotResult,
+};
+pub use tmux::{
+    capture_pane_tail, capture_pane_with_ansi, pid_is_alive, query_pane_dims,
+    session_name_for_slug, tmux_available, TmuxSession,
+};
 pub use plugin_resolution::{
     lookup_plugin_agent, plugins_to_enable, PluginAgent, KNOWN_PLUGIN_AGENTS,
 };

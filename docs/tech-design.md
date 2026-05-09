@@ -388,6 +388,24 @@ test-run phase
 
 **fix-cycle 决策逻辑只能在一处**：Claude Code 允许一个 Stop hook entry 下挂多个 command（§6.2 settings.json 即如此——同时跑 `parse-phase-end.sh` 和异步的 `progress-append.sh Stop`），这没问题。但**fix-cycle 的"是否拦截退出 + 重喂"决策只能由 `parse-phase-end.sh` 单点输出**——同 entry 内多个 command 的执行顺序虽稳定，但只有第一个 stdout JSON 决策有效，其它 command 必须 `async: true` 仅做 append/log 类副作用。脚本内部判断"现在是不是 fix-cycle 模式"分支处理（fix-cycle → ralph 范式拦截重喂；非 fix-cycle → 解析 `PHASE_DONE` / `ESCALATE`）。
 
+**V0.2.2 F35 — silence classifier 兜底层（detached from fix-loop）**：
+ralph-loop / `auto_loop::decide` 只在 Stop hook 触发时跑（input = last
+assistant text），有两个失效场景:(1) API tool-call hang — `PreToolUse`
+后 `PostToolUse` / `Stop` 永不来,auto-loop 根本不触发;(2) send-keys
+路由错误 — `phase_inject` 发了但 prompt 落到 sub-agent 上下文,主 agent
+没 Stop。orchestrator daemon 主循环新增 `silence_classifier::classify`
+(deterministic,无 LLM),按 `progress.jsonl` 末事件 + 静默时长分 7 类
+(`Healthy` / `Terminal` / `SubagentBusy` / `SubagentRunaway` /
+`MidToolHung(tool)` / `PostStopLimbo` / `InjectLimbo`):前 3 类 noop,
+`SubagentRunaway` / `MidToolHung` 写 enriched
+`needs_attention.outbox.json`(meta-agent NL 翻译 + propose-confirm 三选
+一,**不**自动 act),两类 `*Limbo` 由 orchestrator 直接 deterministic
+re-inject 1 次(`MAX_LIMBO_RETRY`,per-phase 计数器存
+`<project>/.ccteam/limbo-retry-count.json`),超 cap 转 enriched escalate。
+红线:`silence_classifier` 不发 Ctrl-C / 不 kill / 不 LLM;`pane_tail` 只
+入 outbox payload 给人读,**不**进 orchestrator 状态机。详见
+`crates/ccteam-core/src/silence_classifier.rs` 与 `interfaces.md` §6.2.1。
+
 **escalation 触发时**，orchestrator 收集：
 - 最后一次 test-report.md
 - 三次 fix-plan.md 的诊断
@@ -1248,6 +1266,11 @@ orchestrator 是**所有 phase 派发 + inbox 派送**的单点 — daemon 死�
 - **判断 idle**：从 `~/.ccteam/progress/<slug>.jsonl` 末尾读最新事件——`Stop` 或 `Notification:idle_prompt` 表示 claude 当前 idle；其他事件（最近一条是 `PreToolUse` / `PostToolUse`）表示 claude 正在干活。
 - **idle 时直接 send-keys**：注入 phase prompt + Enter。
 - **忙时用 `/btw`**：claude 不会被打断，会把消息排队到当前任务完成后处理。
+- **V0.2.2 F35 silence classifier 兜底**(详见 §3.5 末段):orchestrator
+  daemon 主循环每个 tick 调 `silence_classifier::classify`,把"phase_inject 后无任何下游事件 ≥ warn 阈值" / "Stop 后 auto-loop 未推进 ≥ warn"两类
+  limbo 自动 deterministic re-inject 1 次(`MAX_LIMBO_RETRY = 1`,per-phase
+  计数);超 cap 写 enriched `needs_attention.outbox.json` 由 watchdog +
+  meta-agent 翻译给用户。**不发 Ctrl-C / 不 kill / 不 LLM**。
 
 ```bash
 # 注入前判断

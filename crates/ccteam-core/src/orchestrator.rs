@@ -35,7 +35,11 @@ use crate::inbox::{InboxMessage, SessionMailbox};
 use crate::paths::CcteamPaths;
 use crate::phases::{PhaseTemplate, SubSkillTrigger};
 use crate::progress;
+use crate::silence_classifier::{
+    self, LastEventSummary, LimboAction, SilenceClass, MAX_LIMBO_RETRY,
+};
 use crate::stall::{self, StallLevel, StallThresholds};
+use crate::tmux::capture_pane_tail;
 use crate::state::{PhaseHistoryEntry, PhaseState, ProjectState};
 use crate::subskill::{self, ClaudePRunner, SubSkillRunner};
 use crate::team::TeamSpec;
@@ -907,6 +911,21 @@ impl Orchestrator {
                     state.last_progress_event_at = Some(Utc::now());
                     state.last_event_type = Some("phase_done".into());
                     state.save(&state_path)?;
+                    // V0.2.2 F35: phase changed — reset the per-phase
+                    // limbo retry counter so the new phase gets its own
+                    // budget. Best-effort: a missing file is fine.
+                    let project_dir = self.paths.project_dir(slug);
+                    let retry_path = silence_classifier::retry_path_in(&project_dir);
+                    if let Err(err) = silence_classifier::reset_retry_count(
+                        &retry_path,
+                        &state.current_phase,
+                    ) {
+                        tracing::warn!(
+                            slug,
+                            error = %err,
+                            "F35 limbo retry counter reset failed; non-fatal",
+                        );
+                    }
                     tracing::info!(
                         slug,
                         from = %from,
@@ -1424,6 +1443,21 @@ impl Orchestrator {
 
         for (slug, state) in projects {
             self.warn_if_stalled(&slug, &state, now);
+            // V0.2.2 F35: event-aware silence classifier. Runs in the
+            // same loop as `warn_if_stalled` so evergreen projects are
+            // already filtered upstream — meta-agent silence semantics
+            // don't apply (they sit idle waiting for NL by design).
+            // Failures here must never abort the tick: the classifier
+            // is a smart-layer translator, not a hard dependency.
+            if !self.is_evergreen(&state.team) {
+                if let Err(err) = self.classify_and_act_on_silence(&slug, &state, now) {
+                    tracing::warn!(
+                        slug,
+                        error = format!("{err:#}"),
+                        "silence classifier tick failed; continuing",
+                    );
+                }
+            }
             let state = match self.enforce_cost_thresholds(&slug, state)? {
                 Some(updated) => updated,
                 None => continue, // hard-kill terminated this project
@@ -1628,6 +1662,284 @@ impl Orchestrator {
                 thresholds.escalate_minutes(),
             ),
         }
+    }
+
+    /// V0.2.2 F35: silence classifier — read progress.jsonl tail +
+    /// silent-second budget, decide whether the project is genuinely
+    /// stuck and (optionally) act on it.
+    ///
+    /// Three side-effect paths, mapped from
+    /// `LimboAction::from(class)`:
+    ///
+    /// - `NoOp` (Healthy / Terminal / SubagentBusy) → return.
+    /// - `EnrichedEscalate` (SubagentRunaway / MidToolHung) → write
+    ///   `<project>/.ccteam/needs_attention.outbox.json` with the
+    ///   classification payload (`ccteam_classification`,
+    ///   `ccteam_silent_seconds`, `ccteam_last_event`,
+    ///   `ccteam_pane_tail`); the watchdog (M0.21) surfaces it to the
+    ///   meta-agent which translates to NL for the user.
+    /// - `DeterministicReinject` (PostStopLimbo / InjectLimbo) →
+    ///   bump `<project>/.ccteam/limbo-retry-count.json`; if under
+    ///   the cap (`MAX_LIMBO_RETRY = 1`), call
+    ///   `dispatch_phase_with_state(slug, current_phase, state)` —
+    ///   the existing send-keys / idle-aware path. If at the cap
+    ///   already, downgrade to `EnrichedEscalate` (with
+    ///   `ccteam_classification: "limbo_capped"` so the meta-agent
+    ///   sees we exhausted the deterministic budget).
+    ///
+    /// **Red lines**: classifier never sends Ctrl-C / kills (CLAUDE.md
+    /// "永不主动 kill"); pane tail rides the outbox payload only —
+    /// the orchestrator state machine does not consume it (CLAUDE.md
+    /// "永不解析 tmux 终端输出"); evergreen / meta-agent projects
+    /// skip this path (`poll_tick` already filters via
+    /// `is_evergreen()`).
+    pub fn classify_and_act_on_silence_for_test(
+        &self,
+        slug: &str,
+        state: &ProjectState,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<()> {
+        self.classify_and_act_on_silence(slug, state, now)
+    }
+
+    fn classify_and_act_on_silence(
+        &self,
+        slug: &str,
+        state: &ProjectState,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<()> {
+        // Defense in depth: the caller already filters evergreen
+        // projects, but a future refactor mustn't accidentally route
+        // meta-agent silence into the classifier.
+        if self.is_evergreen(&state.team) {
+            return Ok(());
+        }
+        // Skip projects that haven't been dispatched yet (no current
+        // phase). `silent_seconds` would compare against `created_at`
+        // and immediately classify a fresh project as a Limbo case.
+        if state.current_phase.is_empty() {
+            return Ok(());
+        }
+        // Skip terminal-state projects — phase DAG already parked them.
+        if let Some(team) = self.team_runtime_for_state(state) {
+            if team.dag.is_terminal_state(state) {
+                return Ok(());
+            }
+        }
+
+        let progress_path = self.paths.progress_jsonl(slug);
+        let events = match progress::read_all_events(&progress_path) {
+            Ok(e) => e,
+            Err(err) => {
+                tracing::warn!(slug, error = %err, "silence classifier: read progress.jsonl failed");
+                return Ok(());
+            }
+        };
+
+        let thresholds = self
+            .team_runtime_for_state(state)
+            .and_then(|team_cow| {
+                team_cow
+                    .templates
+                    .iter()
+                    .find(|p| p.name == state.current_phase)
+                    .map(|t| StallThresholds::from_phase(t.stall_warn_minutes))
+            })
+            .unwrap_or_default();
+        let silent = stall::silent_seconds(state, now);
+        let class = silence_classifier::classify(&events, silent, &thresholds);
+        let action = LimboAction::from(&class);
+
+        match action {
+            LimboAction::NoOp => Ok(()),
+            LimboAction::EnrichedEscalate => self.write_enriched_outbox(
+                slug,
+                state,
+                &class,
+                silent,
+                events.last(),
+                /* limbo_capped */ false,
+            ),
+            LimboAction::DeterministicReinject => {
+                self.attempt_limbo_reinject(slug, state, &class, silent, events.last())
+            }
+        }
+    }
+
+    /// `LimboAction::DeterministicReinject` handler — bump retry
+    /// counter, re-inject if under cap, otherwise downgrade to
+    /// enriched escalate.
+    fn attempt_limbo_reinject(
+        &self,
+        slug: &str,
+        state: &ProjectState,
+        class: &SilenceClass,
+        silent_seconds: u64,
+        last_event: Option<&Value>,
+    ) -> Result<()> {
+        let project_dir = self.paths.project_dir(slug);
+        let retry_path = silence_classifier::retry_path_in(&project_dir);
+        let mut counter =
+            silence_classifier::load_retry_count(&retry_path, &state.current_phase)?;
+        if counter.count >= MAX_LIMBO_RETRY {
+            // Cap exhausted — surface as enriched escalate so the
+            // meta-agent / user sees we tried and gave up. The
+            // payload's `ccteam_classification` carries `limbo_capped`
+            // (not the original class) so the user-facing NL says
+            // "we already re-injected once, still nothing — please
+            // attach".
+            tracing::warn!(
+                slug,
+                phase = %state.current_phase,
+                class = class.discriminant(),
+                silent_seconds,
+                "silence classifier: limbo retry cap reached; escalating",
+            );
+            return self.write_enriched_outbox(
+                slug,
+                state,
+                class,
+                silent_seconds,
+                last_event,
+                /* limbo_capped */ true,
+            );
+        }
+        // Under the cap: deterministic re-inject of the *current*
+        // phase prompt (not the next one). Reuses the existing
+        // send-keys path so idle-aware framing still applies. No LLM
+        // / no terminal-output parsing.
+        tracing::info!(
+            slug,
+            phase = %state.current_phase,
+            class = class.discriminant(),
+            silent_seconds,
+            "silence classifier: deterministic re-inject (limbo retry {}/{})",
+            counter.count + 1,
+            MAX_LIMBO_RETRY,
+        );
+        if let Err(err) = self.dispatch_phase_with_state(slug, &state.current_phase, state) {
+            // dispatch failure (e.g. tmux session missing) — log + try
+            // again next tick. We don't bump the counter on a
+            // dispatch error so a flaky tmux doesn't burn our retry
+            // budget.
+            tracing::warn!(
+                slug,
+                phase = %state.current_phase,
+                error = %err,
+                "silence classifier: deterministic re-inject failed; counter NOT incremented",
+            );
+            return Ok(());
+        }
+        counter.count += 1;
+        counter.last_at = Some(Utc::now());
+        silence_classifier::save_retry_count(&retry_path, &counter)?;
+        Ok(())
+    }
+
+    /// Write an enriched `<project>/.ccteam/needs_attention.outbox.json`
+    /// payload with classification fields. Adds **new** fields on top
+    /// of the M0.19 Stop-hook L3 fail-safe schema; the watchdog reads
+    /// the file regardless of which writer produced it.
+    ///
+    /// `limbo_capped`: when true the outbox is written *because* the
+    /// per-phase retry cap was exhausted. The classification field
+    /// records `"limbo_capped"` so the user-facing translation is
+    /// "deterministic retries exhausted — please attach", not
+    /// "tool hung".
+    fn write_enriched_outbox(
+        &self,
+        slug: &str,
+        state: &ProjectState,
+        class: &SilenceClass,
+        silent_seconds: u64,
+        last_event: Option<&Value>,
+        limbo_capped: bool,
+    ) -> Result<()> {
+        let project_dir = self.paths.project_dir(slug);
+        let cc = project_dir.join(".ccteam");
+        std::fs::create_dir_all(&cc)
+            .with_context(|| format!("create {}", cc.display()))?;
+        let outbox_path = cc.join("needs_attention.outbox.json");
+
+        // Pane tail is best-effort — classifier red line: if tmux is
+        // unavailable the outbox still ships, the meta-agent surfaces
+        // the rest.
+        let pane = capture_pane_tail(slug, 30, false).unwrap_or_default();
+
+        let classification = if limbo_capped {
+            "limbo_capped"
+        } else {
+            class.discriminant()
+        };
+        let last_event_summary = last_event.map(LastEventSummary::from_value);
+        // `reason` = single-line tag (grep-friendly, log-friendly).
+        // `body` = NL paragraph the meta-agent feeds into its §7.0
+        // propose-confirm template. interfaces.md §6.2.1 spells the
+        // contract.
+        let reason = format!(
+            "F35 silence_classifier classification={classification} silent_seconds={silent_seconds}",
+        );
+        let body = match (class, limbo_capped) {
+            (_, true) => format!(
+                "项目 `{}` 在 phase `{}` 第 {} 分钟卡住:F35 deterministic re-inject 已重试 {} 次仍无新事件,需要人工 attach。",
+                slug,
+                state.current_phase,
+                silent_seconds / 60,
+                MAX_LIMBO_RETRY,
+            ),
+            (SilenceClass::SubagentRunaway, _) => format!(
+                "项目 `{}` 在 phase `{}` 静默 {} 分钟:子 agent (PreToolUse(Task)) 似乎跑超时,无 SubagentStop。",
+                slug,
+                state.current_phase,
+                silent_seconds / 60,
+            ),
+            (SilenceClass::MidToolHung(tool), _) => format!(
+                "项目 `{}` 在 phase `{}` 静默 {} 分钟:Tool `{}` 看起来 hang 了(PreToolUse 后无 PostToolUse)。",
+                slug,
+                state.current_phase,
+                silent_seconds / 60,
+                tool,
+            ),
+            _ => format!(
+                "项目 `{}` 在 phase `{}` 静默 {} 分钟,classification={}。",
+                slug,
+                state.current_phase,
+                silent_seconds / 60,
+                class.discriminant(),
+            ),
+        };
+
+        let payload = json!({
+            "schema_version": 1,
+            "ts": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            "slug": slug,
+            "event_kind": "escalation",
+            "priority": "high",
+            "reason": reason,
+            // V0.2.2 F35 enriched fields. Optional from a schema
+            // standpoint — the M0.19 L3 writer doesn't emit them.
+            "ccteam_classification": classification,
+            "ccteam_silent_seconds": silent_seconds,
+            "ccteam_last_event": last_event_summary,
+            "ccteam_pane_tail": pane,
+            "body": body,
+        });
+
+        let pretty = serde_json::to_string_pretty(&payload)?;
+        let tmp = outbox_path.with_extension("json.tmp");
+        std::fs::write(&tmp, pretty)
+            .with_context(|| format!("write {}", tmp.display()))?;
+        std::fs::rename(&tmp, &outbox_path).with_context(|| {
+            format!("rename {} -> {}", tmp.display(), outbox_path.display())
+        })?;
+        tracing::warn!(
+            slug,
+            phase = %state.current_phase,
+            classification,
+            silent_seconds,
+            "silence classifier: enriched needs_attention outbox written",
+        );
+        Ok(())
     }
 
     async fn handle_progress_event(&self, event: notify::Event) -> Result<()> {

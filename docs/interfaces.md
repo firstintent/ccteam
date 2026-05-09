@@ -979,18 +979,81 @@ stop_hook_active == true?
             (CLI dispatcher 写 stderr,exit 2;Claude Code 把 stderr 当 blockingError 注入下一轮)
 ```
 
-`needs_attention.outbox.json` schema:
+`needs_attention.outbox.json` schema(两个 writer,共享 schema):
 
 ```json
 {
   "schema_version": 1,
   "ts": "<RFC3339>",
   "slug": "<slug>",
-  "reason": "stop_hook_active recursion guard tripped — phase produced no PHASE_DONE/ESCALATE/outbox over two consecutive Stop entries",
+  "reason": "<short human description>",
+
+  // M0.19 Stop hook L3 fail-safe writer fields (recursion guard).
+  // Optional — F35 writer omits these.
   "last_assistant_message": "<原始末段 assistant 文本>",
-  "pane_tail": "<tmux capture-pane 末 30 行;仅 surface 给用户,不参与 orchestrator 状态机>"
+  "pane_tail": "<tmux capture-pane 末 30 行(legacy 字段名;F35 复用 ccteam_pane_tail)>",
+
+  // V0.2.2 F35 silence-classifier enriched fields. Optional —
+  // M0.19 L3 writer omits these. Meta-agent role prompt §7.0
+  // surfaces them as propose-confirm options.
+  "event_kind": "escalation",
+  "priority": "high",
+  "ccteam_classification": "mid_tool_hung",        // 见 SilenceClass 枚举
+  "ccteam_silent_seconds": 900,
+  "ccteam_last_event": {                            // F35 progress.jsonl 末事件摘要
+    "ts": "<RFC3339>",
+    "event": "PreToolUse",
+    "tool": "Read"                                  // 仅 PreToolUse / PostToolUse 含
+  },
+  "ccteam_pane_tail": "<tmux capture-pane 末 30 行;仅 surface,不进 orchestrator 状态机>",
+  "body": "<NL 翻译给 meta-agent / 用户的描述>"
 }
 ```
+
+**`ccteam_classification` 枚举值**(F35 silence_classifier `SilenceClass`,
+PRD §4.2.1 表):
+
+- `subagent_runaway` — `PreToolUse(tool=Task)` 后 ≥ phase escalate 阈值,无 SubagentStop
+- `mid_tool_hung` — `PreToolUse(tool != Task)` 后 ≥ phase warn 阈值,无 PostToolUse
+- `limbo_capped` — F35 deterministic re-inject 已重试 cap 次(默认 1)仍未恢复
+- `post_stop_limbo` / `inject_limbo` — 罕见(orchestrator 通常已 re-inject 1 次,
+  这两类只在 cap 之前一过性出现)
+
+`Healthy` / `Terminal` / `SubagentBusy` 不写 outbox(F35 deterministic 判定为不需要
+干预)。
+
+**两个 writer 共存**:M0.19 L3 fail-safe 写 `pane_tail` /
+`last_assistant_message`;F35 silence classifier 写 `ccteam_*` 字段族(包括
+`ccteam_pane_tail`)+ `body`。watchdog (M0.21) 读所有字段并向 meta-agent surface;
+后写覆盖前写(原子 `<file>.tmp` + rename)。
+
+**字段分工**:`reason` = 单行短描述(grep 友好,日志可摘);`body` = NL 段落
+(meta-agent §7.0 翻译模板的输入,可含选项 a/b/c)。两者都由 F35 writer 写,
+M0.19 L3 writer 只写 `reason`。
+
+#### 6.2.2 `limbo-retry-count.json` schema(V0.2.2 F35)
+
+`<project>/.ccteam/limbo-retry-count.json`:F35 silence classifier 的 per-phase
+deterministic re-inject 计数器。`MAX_LIMBO_RETRY = 1`(`PostStopLimbo` /
+`InjectLimbo` 类只重试 1 次,超 cap 转 enriched escalate)。phase 推进时
+orchestrator 重置(写入新 `phase` + `count: 0`)。
+
+```json
+{
+  "phase": "implement",
+  "count": 1,
+  "last_at": "2026-05-09T10:00:00Z"
+}
+```
+
+**生命周期**:phase 进入 → 计数器不存在 / 0;触发 limbo + re-inject 成功 →
+`count = 1` + `last_at` 更新;再触发 limbo → cap 已满,写 enriched outbox 改记
+`ccteam_classification: "limbo_capped"`,**不**再 re-inject。phase 推进 →
+`reset_retry_count(path, &new_phase)` 重写为 `count: 0` + `phase = new_phase`。
+
+**红线**:cap = 1 是 F35 在底层 `auto_loop` 3-cap 之上的额外兜底;两层叠加之后
+撞顶必 enriched escalate(CLAUDE.md "fix-loop 撞 3 次顶必 escalate,绝不静默
+重置")。
 
 `cct hook intercept-ask` 返回的 PreToolUse 决策(`hooks.ts:608-625`):
 
@@ -1211,9 +1274,25 @@ cct mcp-serve                       # M2+:作为 ccteam-mcp 跑 stdio MCP 协议
 
 ```bash
 cct new "需求文本"
-cct new -f spec.md                  # 从文件提
-cct new --mode yolo "需求"          # 覆盖默认 trust_mode
+cct new -f spec.md                            # 从文件提
+cct new --mode yolo "需求"                    # 覆盖默认 trust_mode
+
+# V0.2.2 F34 — slug 决策四层:
+cct new --slug ccteam-ui --team dev "..."     # Tier 1:显式 slug(B2 前缀语义);
+                                              #   `dev-ccteam-ui` 或 verbatim
+cct new --no-auto-slug "..."                  # Tier 4:跳过 LLM 智能 fallback,
+                                              #   走 deterministic `slugify_brief`
+cct new --auto-slug-model claude-sonnet-4-5-20251001 "..."
+                                              # Tier 3:override 默认 haiku
+                                              #   (env CCTEAM_AUTO_SLUG=off 全局禁)
 ```
+
+**slug 决定优先级**(PRD `docs/v0-2-2/prd.md` §3.2):
+
+1. **Tier 1**:`--slug` 显式(零延迟,确定;B2 prefix — 已带 team prefix verbatim)
+2. **Tier 2**:meta-agent 派单工作流的 `cct-project-creator` skill 推荐 + 用户确认(零额外 LLM call)
+3. **Tier 3**:`cct new` 不带 `--slug` 时 shell-out `claude -p haiku`(2-5s,~$0.0001)+ Y/n,非 tty auto-accept
+4. **Tier 4**:LLM 不可用 / `--no-auto-slug` / env `CCTEAM_AUTO_SLUG=off` → `slugify_brief()` deterministic 兜底
 
 ### 10.3 查询状态
 
@@ -1424,7 +1503,7 @@ orchestrator 识别 `state.team == "meta-agent"` 走 `process_meta_project` 分�
 
 由 `cct doctor --install-mcp` 写入(M2 release)。`cct mcp-serve` 是 binary 子命令,stdio 协议。
 
-### 12.2 暴露的 tool 清单(M2.5 起,9 tool)
+### 12.2 暴露的 tool 清单(M2.5 起 9 tool;V0.2.2 F38 起 10 tool)
 
 | Tool 名 | 对应 CLI / 行为 | 入参 | 返回 |
 |---|---|---|---|
@@ -1437,6 +1516,9 @@ orchestrator 识别 `state.team == "meta-agent"` 走 `process_meta_project` 分�
 | `ccteam__resume` | `cct resume <slug>` | `{slug: string}` | `{ok: bool, slug: string}` |
 | `ccteam__send_to_session`(M2.5 新)| 原子写 `<session>/.ccteam/inbox/msg-<ts>-NNN.md`(§3.4.2)| `{session: string, body: string, content_type?: "text"\|"markdown"}` | `{ok: bool, session: string, inbox_file: string}` |
 | `ccteam__inject_decision`(M2.5 新)| 构造 ESCALATE-shape payload(§4.1.1),走 `send_to_session` 落 inbox | `{slug: string, escalate_kind: "revert_to_phase"\|"need_user_input"\|"abort"\|"insufficient_clarification"\|"phase_done_pending", args?: {target_phase?: string, reason?: string}}` | `{ok: bool, slug: string, inbox_file: string}` |
+| `ccteam__screenshot`(V0.2.2 F38)| `tmux capture-pane -e` → `vt100::Parser` → `imageproc` → 写 `<project>/.ccteam/screenshots/<utc>.png` | `{slug: string, lines?: number}`(`lines` 默认 50) | 成功:`{ok: true, slug: string, path: string}`;graceful degrade:`{ok: false, slug: string, reason: string}` |
+
+V0.2.2 F38 红线:`screenshot` 是**只读**(daemon-independent),与 `peek` 同档,失败永不阻塞主路径(catch_unwind 兜 vt100/imageproc panic;tmux/font/IO 失败一律 `Ok(None)` → `{ok:false, reason}`)。截图字节流仅用于渲染,**不进入** `progress.jsonl` / `state.json` / state machine(CLAUDE.md §三红线"永不解析 tmux 终端输出")。字体走 vendored JetBrains Mono Regular(OFL,见 `LICENSES.md`),`CCTEAM_SCREENSHOT_FONT_TTF` env 可运行时覆盖(eg 切到 CJK / emoji 覆盖字体)。`cct doctor --screenshot-smoke <slug>` 跑端到端验证。
 
 `send_to_session` / `inject_decision` 是 M2.5 增量(meta-agent 主消费者):
 让 meta-agent 把用户的回复 / 决策推送回项目 session,**adapter 进程内不做
