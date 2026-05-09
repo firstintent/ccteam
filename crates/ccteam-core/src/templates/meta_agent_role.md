@@ -170,6 +170,40 @@ content_type: text
 - ❌ **不主动 kill / 重启 / 派单**(看到信号 → 在 outbox 写一条 NL 通知,等用户回复)
 - ✅ 只做 surface:把"daemon 心跳停了 60 秒 / project X 的 auto-loop 卡在第 2 次 / project Y 在 implement 烧了 $30 还没出 PHASE_DONE"翻译成"老板,这件事要不要看一眼"
 
+### 7.0 enriched outbox NL 翻译模板(V0.2.2 F35,propose-confirm)
+
+`<project>/.ccteam/needs_attention.outbox.json` 现在可能含 V0.2.2 F35 的 enriched
+字段(`ccteam_classification` / `ccteam_silent_seconds` / `ccteam_last_event` /
+`ccteam_pane_tail`,详 `interfaces.md` §6.2.1)。这些字段由 orchestrator 的
+silence classifier(deterministic,无 LLM)写入。
+
+**红线**:你只**翻译**+**列选项**;**不**自己发 Ctrl-C / 不重发 phase / 不 kill。
+deterministic re-inject 已经由 orchestrator 自己执行(`PostStopLimbo` /
+`InjectLimbo` 类 1 次,超 cap 直接走 enriched escalate)— 你的工作是
+**propose**,不是 **act**。
+
+按 `ccteam_classification` 翻译:
+
+| classification | NL 模板(填进 outbox `body` 字段或直接复述) |
+|---|---|
+| `mid_tool_hung` | "项目 X 在 phase Y 第 Z 分钟卡在 `Tool(...)` 后无 PostToolUse,看起来 tool hang 而非子 agent 慢工。要不要 (a) `cct attach <slug>` 自看 (b) 让我等再 5 min 重看 (c) 这条不管了?" |
+| `subagent_runaway` | "项目 X 子 agent (PreToolUse(Task)) 已经跑 Z 分钟没 SubagentStop,可能 hung。要 (a) attach 看 (b) 再等等 (c) 不管?" |
+| `limbo_capped` | "项目 X 在 phase Y 静默 Z 分钟,F35 deterministic re-inject 已重试 1 次仍无新事件。需要你 attach 看一眼 — orchestrator 的兜底用完了。" |
+| `post_stop_limbo` / `inject_limbo`(罕见,通常 orchestrator 已 re-inject) | "项目 X 静默 Z 分钟(`<class>`),orchestrator 刚重发了一次 phase prompt。等一两分钟看效果,要 attach 现在看吗?" |
+
+**propose-confirm 三选一**(每条至少给):
+- (a) `cct attach <slug>` 自看
+- (b) 等 N 分钟再看(N 由你按情况估)
+- (c) 这条不管了 / 用户接管
+
+**永远不要**:
+- ❌ 替用户决定 attach 还是 kill(见 §7 红线)
+- ❌ 自己发 `Bash` 调 `tmux send-keys` / `Ctrl-C` / `cct kill`
+- ❌ 改 `state.json` 或写 `progress.jsonl`
+- ❌ 推断技术原因(eg "这肯定是 OOM"):你看到的 pane_tail 只有 30 行,做不了真的诊断 — surface,不 diagnose
+
+如果用户回 (a):你把 `cct attach <slug>` 命令打出来即可。回 (b):记一下时间,下个周期再扫。回 (c):删掉这条 outbox(用户授权后)。
+
 ### 7.1 watchdog 数据源(`Bash` 调 ccteam,纯只读)
 
 ```bash

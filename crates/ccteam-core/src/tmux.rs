@@ -237,6 +237,42 @@ impl TmuxSession {
     }
 }
 
+/// Capture the last `lines` lines of the project's tmux pane, addressed
+/// by slug. Returns `None` when tmux isn't installed, the session is
+/// missing, or the invocation otherwise fails — every call site is a
+/// best-effort surface (no Result propagation).
+///
+/// The captured text only ever lands in user-facing surfaces
+/// (`needs_attention.outbox.json` payload / meta-agent NL translation)
+/// — **never** parsed by the orchestrator's state machine (CLAUDE.md
+/// "永不解析 tmux 终端输出" red line).
+///
+/// `with_ansi=false` runs `tmux capture-pane -p` (plain text, the F35
+/// silence-classifier path). `with_ansi=true` runs `tmux capture-pane
+/// -e -p` so escape sequences round-trip — useful when the captured
+/// text will be shown to the user (eg. NL translation that quotes a
+/// short snippet). F38 screenshot rendering uses `capture_pane_with_ansi`
+/// instead (which returns raw bytes for `vt100::Parser`).
+pub fn capture_pane_tail(slug: &str, lines: usize, with_ansi: bool) -> Option<String> {
+    let session = session_name_for_slug(slug);
+    let mut cmd = Command::new("tmux");
+    cmd.arg("capture-pane").arg("-p");
+    if with_ansi {
+        cmd.arg("-e");
+    }
+    cmd.args(["-t", &session, "-S", &format!("-{lines}")]);
+    let output = cmd.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim_end().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
 /// V0.2.2 F38 helper — capture the active pane's contents **with ANSI
 /// escape sequences preserved** (`tmux capture-pane -e -p -S -<lines>`).
 /// Returns the raw bytes so callers can feed them to a terminal state
@@ -253,6 +289,9 @@ impl TmuxSession {
 /// red line "永不解析 tmux 终端输出" (CLAUDE.md §3) means this byte
 /// stream MUST NOT feed any state-machine / phase-classification
 /// path; `progress.jsonl` remains the single state source of truth.
+///
+/// Sibling helper [`capture_pane_tail`] returns the same bytes as a
+/// `String` for NL surface use; this one keeps raw bytes for `vt100`.
 pub fn capture_pane_with_ansi(slug: &str, lines: usize) -> Result<Option<Vec<u8>>> {
     let name = session_name_for_slug(slug);
     let lines_arg = format!("-{lines}");
