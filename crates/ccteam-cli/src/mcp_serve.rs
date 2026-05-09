@@ -30,8 +30,9 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use ccteam_core::{
-    bootstrap_project, check_daemon_health, inbox_filename, pick_unused_slug, CcteamPaths,
-    DaemonHealth, InboxFrontMatter, InboxMessage, ProjectState, SessionMailbox,
+    bootstrap_project, check_daemon_health, inbox_filename, pick_unused_slug,
+    render_screenshot, CcteamPaths, DaemonHealth, InboxFrontMatter, InboxMessage,
+    ProjectState, SessionMailbox,
 };
 
 use crate::commands::{
@@ -227,6 +228,23 @@ fn tool_definitions() -> Vec<Value> {
                 "required": ["slug", "escalate_kind"],
             }),
         }),
+        // V0.2.2 F38 — terminal screenshot. Read-only (no daemon
+        // requirement); mirrors `ccteam__peek` semantics.
+        json!({
+            "name": "ccteam__screenshot",
+            "description": "Render the current tmux pane of a project to a PNG under <project>/.ccteam/screenshots/<utc>.png. Pure Rust pipeline (vt100 → imageproc), no system deps. Returns the absolute path on success or a reason on graceful degrade. V0.2.2 F38.",
+            "inputSchema": json!({
+                "type": "object",
+                "properties": {
+                    "slug": { "type": "string", "description": "Project slug." },
+                    "lines": {
+                        "type": "integer",
+                        "description": "Scrollback depth to capture (default 50)."
+                    }
+                },
+                "required": ["slug"],
+            }),
+        }),
     ]
 }
 
@@ -280,6 +298,7 @@ async fn call_tool(paths: &CcteamPaths, params: &Value) -> Result<Vec<Value>> {
             require_healthy_daemon(paths)?;
             Ok(text_content(tool_inject_decision(paths, &args)?))
         }
+        "ccteam__screenshot" => Ok(text_content(tool_screenshot(paths, &args)?)),
         other => Err(anyhow!("unknown tool: {other}")),
     }
 }
@@ -533,6 +552,32 @@ fn tool_inject_decision(paths: &CcteamPaths, args: &Value) -> Result<String> {
     )
 }
 
+/// V0.2.2 F38: render a PNG screenshot of the project's pane and
+/// return the absolute path. `lines` defaults to 50 when omitted.
+/// Returns `{ok:true, path}` on success and `{ok:false, reason}` on
+/// graceful degrade (tmux missing, font failed, etc.) — never
+/// `Err()` for those paths so callers can attach the reason in NL.
+fn tool_screenshot(paths: &CcteamPaths, args: &Value) -> Result<String> {
+    let slug = arg_string(args, "slug")?;
+    let lines = args
+        .get("lines")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(50) as usize;
+    match render_screenshot(paths, &slug, lines)? {
+        Some(path) => Ok(serde_json::to_string_pretty(&json!({
+            "ok": true,
+            "slug": slug,
+            "path": path.to_string_lossy(),
+        }))?),
+        None => Ok(serde_json::to_string_pretty(&json!({
+            "ok": false,
+            "slug": slug,
+            "reason": "screenshot rendering degraded; check daemon stderr for warn details \
+                      (tmux missing, session not found, font failed, or IO failure)",
+        }))?),
+    }
+}
+
 // -------------- Helpers --------------
 
 fn arg_string(args: &Value, name: &str) -> Result<String> {
@@ -674,9 +719,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_definitions_count_matches_m25_spec() {
-        // M2.5 brief: 9 tools exactly.
-        assert_eq!(tool_definitions().len(), 9);
+    fn tool_definitions_count_matches_spec() {
+        // M2.5 brief: 9 tools. V0.2.2 F38 adds `ccteam__screenshot` →
+        // 10 total. Bump this when a new tool lands.
+        assert_eq!(tool_definitions().len(), 10);
     }
 
     #[test]
@@ -688,11 +734,29 @@ mod tests {
             .collect();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), 9, "tool names must be unique");
+        assert_eq!(names.len(), 10, "tool names must be unique");
         for tool in &tools {
             assert!(tool["name"].as_str().unwrap().starts_with("ccteam__"));
             assert_eq!(tool["inputSchema"]["type"], "object");
         }
+    }
+
+    #[test]
+    fn screenshot_tool_definition_present_with_optional_lines() {
+        let tools = tool_definitions();
+        let s = tools
+            .iter()
+            .find(|t| t["name"] == "ccteam__screenshot")
+            .expect("screenshot tool registered");
+        let req: Vec<&str> = s["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        // `slug` required, `lines` optional.
+        assert_eq!(req, vec!["slug"]);
+        assert_eq!(s["inputSchema"]["properties"]["lines"]["type"], "integer");
     }
 
     #[test]
@@ -795,7 +859,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_tools_list_returns_nine_tools() {
+    async fn handle_tools_list_returns_full_tool_set() {
+        // M2.5: 9 tools. V0.2.2 F38: +1 (`ccteam__screenshot`) → 10.
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = CcteamPaths {
             root: tmp.path().join("home"),
@@ -809,7 +874,41 @@ mod tests {
         });
         let resp = handle_request(&paths, &req).await.unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 10);
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"ccteam__screenshot"));
+    }
+
+    #[tokio::test]
+    async fn handle_tools_call_screenshot_degrades_when_session_missing() {
+        // No tmux session for this slug → the tool returns ok=false
+        // with a reason, NOT isError=true. (Mirrors `peek` semantics:
+        // read-only, daemon-independent.)
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": {
+                "name": "ccteam__screenshot",
+                "arguments": { "slug": "no-such-slug-xyz", "lines": 5 }
+            }
+        });
+        let resp = handle_request(&paths, &req).await.unwrap();
+        // Graceful degrade lands as a normal result (not isError).
+        assert_eq!(resp["result"]["isError"], false);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("\"ok\": false"),
+            "expected ok=false on graceful degrade, got: {text}"
+        );
     }
 
     #[tokio::test]

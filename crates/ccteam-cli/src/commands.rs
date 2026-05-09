@@ -641,6 +641,11 @@ pub struct DoctorOptions {
     /// pipeline-based path. Idempotent — no-op when no marketplace
     /// symlinks remain.
     pub migrate_recommended_agents: bool,
+    /// V0.2.2 F38: end-to-end screenshot pipeline smoke test for the
+    /// given project slug. Triggers `render_screenshot` and reports
+    /// the resulting PNG path or graceful-degrade reason. Verifies
+    /// font + tmux + IO without requiring a live MCP client.
+    pub screenshot_smoke: Option<String>,
 }
 
 /// `cct doctor` dispatch. Returns a human-readable report so unit
@@ -653,7 +658,8 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
         || opts.install_memory_bridge
         || opts.reset_shipped_teams
         || opts.validate_team.is_some()
-        || opts.migrate_recommended_agents;
+        || opts.migrate_recommended_agents
+        || opts.screenshot_smoke.is_some();
     if !any_mode {
         return Ok(String::from(
             "cct doctor: pass at least one mode flag.\n\
@@ -677,7 +683,9 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
              --validate-team <name>\n      \
              load + validate one team's team.yaml + phase markdown set (V0.2 M0.18.5). Reports per-phase frontmatter health, IO contract consistency between adjacent phases, and warns on body-level protocol-keyword residue.\n  \
              --migrate-recommended-agents [--dry-run]\n      \
-             remove stale ~/.claude/agents/<name>.md symlinks left by the V0.1 ln -sf path. One-time cleanup after upgrading to V0.2 plugin pipeline (V0.2 M0.20).\n",
+             remove stale ~/.claude/agents/<name>.md symlinks left by the V0.1 ln -sf path. One-time cleanup after upgrading to V0.2 plugin pipeline (V0.2 M0.20).\n  \
+             --screenshot-smoke <slug>\n      \
+             render an end-to-end PNG screenshot of <slug>'s tmux pane to <project>/.ccteam/screenshots/<utc>.png. Verifies font + tmux + imageproc + IO; reports the path on success, the degrade reason on failure (V0.2.2 F38).\n",
         ));
     }
     let mut out = String::new();
@@ -717,6 +725,9 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
     }
     if opts.migrate_recommended_agents {
         out.push_str(&render_migrate_recommended_agents_report(&opts)?);
+    }
+    if let Some(slug) = &opts.screenshot_smoke {
+        out.push_str(&render_screenshot_smoke_report(paths, slug)?);
     }
     Ok(out)
 }
@@ -1360,6 +1371,52 @@ fn render_migration_line(r: &MigrationReport, dry_run: bool) -> String {
         label,
         r.previous_link.display(),
     )
+}
+
+/// V0.2.2 F38: end-to-end smoke for the screenshot pipeline.
+/// Reports the font in use, then attempts a real `render_screenshot`
+/// and surfaces either the resulting PNG path + size or the
+/// degrade reason (tmux missing / vt100 panic / IO failure).
+fn render_screenshot_smoke_report(paths: &CcteamPaths, slug: &str) -> Result<String> {
+    let mut out = String::from("cct doctor --screenshot-smoke\n\n");
+    out.push_str(&format!("  slug:        {slug}\n"));
+    match ccteam_core::probe_screenshot_font() {
+        Ok(label) => out.push_str(&format!("  font probe:  ok  ({label})\n")),
+        Err(err) => {
+            out.push_str(&format!("  font probe:  FAIL  ({err:#})\n"));
+            out.push_str(
+                "\nfont check failed — set CCTEAM_SCREENSHOT_FONT_TTF or restore the \
+                 vendored JetBrainsMono-Regular.ttf under crates/ccteam-core/assets/fonts/.\n",
+            );
+            return Ok(out);
+        }
+    }
+    match ccteam_core::render_screenshot(paths, slug, 50)? {
+        Some(path) => {
+            let size = std::fs::metadata(&path)
+                .map(|m| m.len())
+                .unwrap_or_default();
+            out.push_str("  render:      ok\n");
+            out.push_str(&format!("  png:         {}\n", path.display()));
+            out.push_str(&format!("  size:        {size} bytes\n"));
+            out.push('\n');
+            out.push_str(
+                "open the PNG with `xdg-open` / `open` to confirm the pane was captured.\n",
+            );
+        }
+        None => {
+            out.push_str("  render:      degraded  (no PNG written)\n\n");
+            out.push_str(
+                "rendering returned Ok(None). Common causes:\n  \
+                 - the tmux session `ccteam-<slug>` does not exist (start with `cct start`).\n  \
+                 - tmux is not installed on this host.\n  \
+                 - vt100 / imageproc panicked on a malformed input (unusual; check daemon stderr).\n  \
+                 - IO error writing the PNG file.\n\n\
+                 Re-run with RUST_LOG=warn to see the precise reason in stderr.\n",
+            );
+        }
+    }
+    Ok(out)
 }
 
 fn render_tool_surface_report(paths: &CcteamPaths) -> Result<String> {
