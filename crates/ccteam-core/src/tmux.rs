@@ -237,6 +237,76 @@ impl TmuxSession {
     }
 }
 
+/// V0.2.2 F38 helper — capture the active pane's contents **with ANSI
+/// escape sequences preserved** (`tmux capture-pane -e -p -S -<lines>`).
+/// Returns the raw bytes so callers can feed them to a terminal state
+/// machine (`vt100::Parser`) for rendering.
+///
+/// `lines` is the scrollback depth (`-S -<n>`). Use a small value
+/// (~50) for screenshots so big projects don't dump the full history.
+///
+/// Returns `Ok(None)` (not Err) when the session doesn't exist or
+/// tmux fails — callers degrade gracefully (no PNG produced) rather
+/// than aborting the enclosing main path.
+///
+/// **Red line**: this output is for rendering only. The architecture
+/// red line "永不解析 tmux 终端输出" (CLAUDE.md §3) means this byte
+/// stream MUST NOT feed any state-machine / phase-classification
+/// path; `progress.jsonl` remains the single state source of truth.
+pub fn capture_pane_with_ansi(slug: &str, lines: usize) -> Result<Option<Vec<u8>>> {
+    let name = session_name_for_slug(slug);
+    let lines_arg = format!("-{lines}");
+    let output = Command::new("tmux")
+        .args([
+            "capture-pane",
+            "-e",
+            "-p",
+            "-t",
+            &name,
+            "-S",
+            &lines_arg,
+        ])
+        .output()
+        .with_context(|| format!("spawn tmux capture-pane for {name}"))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    Ok(Some(output.stdout))
+}
+
+/// V0.2.2 F38 helper — query the active pane's height/width via
+/// `tmux display-message -p '#{pane_height} #{pane_width}'`. Returns
+/// `Ok(None)` on session-missing / tmux failure.
+pub fn query_pane_dims(slug: &str) -> Result<Option<(u16, u16)>> {
+    let name = session_name_for_slug(slug);
+    let output = Command::new("tmux")
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            &name,
+            "-F",
+            "#{pane_height} #{pane_width}",
+        ])
+        .output()
+        .with_context(|| format!("spawn tmux display-message for {name}"))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let s = String::from_utf8_lossy(&output.stdout);
+    let trimmed = s.trim();
+    let mut it = trimmed.split_ascii_whitespace();
+    let rows: u16 = match it.next().and_then(|n| n.parse().ok()) {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+    let cols: u16 = match it.next().and_then(|n| n.parse().ok()) {
+        Some(c) => c,
+        None => return Ok(None),
+    };
+    Ok(Some((rows, cols)))
+}
+
 /// `kill -0 <pid>`: returns true iff the process exists and the caller
 /// has permission to signal it. Used in the documented double-check
 /// (`tmux has-session` + `kill -0 pid`) for orchestrator reattach.

@@ -17,6 +17,7 @@ pub mod phases;
 pub mod plugin_resolution;
 pub mod progress;
 pub mod projects;
+pub mod screenshot;
 pub mod stall;
 pub mod state;
 pub mod subskill;
@@ -108,7 +109,14 @@ pub use templates::{
 // seed source for `write_all_global_team_templates`; runtime code paths
 // outside ccteam-core query disk (`<global_dir>/teams/<name>/team.yaml`)
 // instead.
-pub use tmux::{pid_is_alive, session_name_for_slug, tmux_available, TmuxSession};
+pub use screenshot::{
+    probe_font as probe_screenshot_font, render_screenshot, vt100_color_to_rgb,
+    FONT_ENV as SCREENSHOT_FONT_ENV, ScreenshotResult,
+};
+pub use tmux::{
+    capture_pane_with_ansi, pid_is_alive, query_pane_dims, session_name_for_slug,
+    tmux_available, TmuxSession,
+};
 pub use plugin_resolution::{
     lookup_plugin_agent, plugins_to_enable, PluginAgent, KNOWN_PLUGIN_AGENTS,
 };

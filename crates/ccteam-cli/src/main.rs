@@ -187,6 +187,12 @@ enum Command {
         /// marketplace symlinks remain.
         #[arg(long, default_value_t = false)]
         migrate_recommended_agents: bool,
+        /// V0.2.2 F38: render a one-shot PNG screenshot of the given
+        /// project's tmux pane to verify the `vt100 + imageproc` path
+        /// end-to-end. Reports the font in use + the resulting PNG
+        /// path or the degrade reason (tmux missing / font / IO).
+        #[arg(long, value_name = "SLUG")]
+        screenshot_smoke: Option<String>,
     },
     /// V0.2 M0.18.6: render the orchestrator's per-phase inject
     /// prompt (frontmatter-driven) plus the `@`-referenced phase
@@ -369,6 +375,7 @@ fn main() -> Result<()> {
             reset_shipped_teams,
             validate_team,
             migrate_recommended_agents,
+            screenshot_smoke,
         } => run_doctor(commands::DoctorOptions {
             dry_run,
             force,
@@ -380,6 +387,7 @@ fn main() -> Result<()> {
             reset_shipped_teams,
             validate_team,
             migrate_recommended_agents,
+            screenshot_smoke,
         }),
         Command::Phase { cmd } => run_phase(cmd),
         Command::Watchdog { cmd } => run_watchdog(cmd),

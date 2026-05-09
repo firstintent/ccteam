@@ -75,6 +75,28 @@ impl CcteamPaths {
     pub fn project_ready_in(project_dir: &Path) -> PathBuf {
         project_dir.join(".ccteam").join("ready")
     }
+
+    /// `<project>/.ccteam/screenshots/` — V0.2.2 F38 PNG screenshot
+    /// directory. Created lazily by `screenshot::render_screenshot`.
+    pub fn project_screenshots_dir(&self, slug: &str) -> PathBuf {
+        self.project_ccteam_dir(slug).join("screenshots")
+    }
+
+    /// V0.2.2 F38: Build a unique PNG path under
+    /// `<project>/.ccteam/screenshots/<utc>.png`. The timestamp is
+    /// the same compact RFC3339-no-colons format used by inbox
+    /// filenames so screenshots sort lexically by capture time.
+    pub fn project_screenshot_path(
+        &self,
+        slug: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> PathBuf {
+        let stamp = now
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            .replace(':', "");
+        self.project_screenshots_dir(slug)
+            .join(format!("{stamp}.png"))
+    }
 }
 
 /// Read a project's slug by loading `<project_dir>/.ccteam/state.json`.

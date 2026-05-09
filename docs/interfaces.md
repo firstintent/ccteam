@@ -1413,7 +1413,7 @@ orchestrator 识别 `state.team == "meta-agent"` 走 `process_meta_project` 分�
 
 由 `cct doctor --install-mcp` 写入(M2 release)。`cct mcp-serve` 是 binary 子命令,stdio 协议。
 
-### 12.2 暴露的 tool 清单(M2.5 起,9 tool)
+### 12.2 暴露的 tool 清单(M2.5 起 9 tool;V0.2.2 F38 起 10 tool)
 
 | Tool 名 | 对应 CLI / 行为 | 入参 | 返回 |
 |---|---|---|---|
@@ -1426,6 +1426,9 @@ orchestrator 识别 `state.team == "meta-agent"` 走 `process_meta_project` 分�
 | `ccteam__resume` | `cct resume <slug>` | `{slug: string}` | `{ok: bool, slug: string}` |
 | `ccteam__send_to_session`(M2.5 新)| 原子写 `<session>/.ccteam/inbox/msg-<ts>-NNN.md`(§3.4.2)| `{session: string, body: string, content_type?: "text"\|"markdown"}` | `{ok: bool, session: string, inbox_file: string}` |
 | `ccteam__inject_decision`(M2.5 新)| 构造 ESCALATE-shape payload(§4.1.1),走 `send_to_session` 落 inbox | `{slug: string, escalate_kind: "revert_to_phase"\|"need_user_input"\|"abort"\|"insufficient_clarification"\|"phase_done_pending", args?: {target_phase?: string, reason?: string}}` | `{ok: bool, slug: string, inbox_file: string}` |
+| `ccteam__screenshot`(V0.2.2 F38)| `tmux capture-pane -e` → `vt100::Parser` → `imageproc` → 写 `<project>/.ccteam/screenshots/<utc>.png` | `{slug: string, lines?: number}`(`lines` 默认 50) | 成功:`{ok: true, slug: string, path: string}`;graceful degrade:`{ok: false, slug: string, reason: string}` |
+
+V0.2.2 F38 红线:`screenshot` 是**只读**(daemon-independent),与 `peek` 同档,失败永不阻塞主路径(catch_unwind 兜 vt100/imageproc panic;tmux/font/IO 失败一律 `Ok(None)` → `{ok:false, reason}`)。截图字节流仅用于渲染,**不进入** `progress.jsonl` / `state.json` / state machine(CLAUDE.md §三红线"永不解析 tmux 终端输出")。字体走 vendored JetBrains Mono Regular(OFL,见 `LICENSES.md`),`CCTEAM_SCREENSHOT_FONT_TTF` env 可运行时覆盖(eg 切到 CJK / emoji 覆盖字体)。`cct doctor --screenshot-smoke <slug>` 跑端到端验证。
 
 `send_to_session` / `inject_decision` 是 M2.5 增量(meta-agent 主消费者):
 让 meta-agent 把用户的回复 / 决策推送回项目 session,**adapter 进程内不做

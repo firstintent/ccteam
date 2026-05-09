@@ -18,5 +18,13 @@ tracing.workspace = true
 anyhow.workspace = true
 regex.workspace = true
 
+# V0.2.2 F38 — terminal screenshot pipeline (vt100 + imageproc DIY).
+# All four crates are pure Rust; no system C deps (libfontconfig /
+# libfreetype). See `docs/v0-2-2/prd.md` §7 for the full rationale.
+vt100 = "0.15"
+image = { version = "0.25", default-features = false, features = ["png"] }
+imageproc = { version = "0.25", default-features = false }
+ab_glyph = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
