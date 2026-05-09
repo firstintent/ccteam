@@ -626,12 +626,22 @@ V0.1 → V0.2 升级:V0.1 用户的 `~/.claude/agents/<name>.md` ln -sf 由 `cct
   替代 `if state.team == META_TEAM_NAME` / `match team` ccteam-core 分叉
   (PRD §6.4 candidate 5 + §6.2 candidate 2);新增 `teams/meta-agent.yaml`
   作 evergreen 范例;`memory_bridge` 团队列表改成扫盘(PRD §6.4 candidate 3)
+- **V0.2.2 F40** ✅ 加 `aliases: Vec<String>`(默认空),配合 `team_resolver` /
+  `Orchestrator::team_runtime` / `team_bundle` / `ensure_team_resolvable` 的
+  alias 解析路径,实现"软 rename"(`product-research` → `research` 是 V0.2.2
+  首例,`teams/research/team.yaml` 列 `aliases: [product-research]`)。老项目
+  state.json::team 字面 / 项目目录名 / 老 rules 文件全不动;`cct new --team
+  product-research` 仍工作并 stderr warn deprecated。详 PRD §9。
 
 ```yaml
-# ~/.ccteam/teams/product-research/team.yaml — 完整字段示例
-name: product-research                  # 必填。snake-case [a-z0-9_-]+,与 --team / state.json.team 对齐
-description: Product research team       # 可选。`cct ls --teams`(M3.4)显示
-phase_dir: phases-product-research       # 默认 `phases`。phase 模板 markdown 所在目录(相对 ~/.ccteam/)
+# ~/.ccteam/teams/research/team.yaml — 完整字段示例(V0.2.2 起 canonical 名 `research`)
+name: research                          # 必填。snake-case [a-z0-9_-]+,与 --team / state.json.team 对齐
+aliases: [product-research]             # 可选(V0.2.2 F40)。老项目 state.json::team 仍可解析;同 charset 规则,不能与 name 重叠
+description: |                          # 可选。`cct ls --teams`(M3.4)显示
+  Product research team —
+  kickoff → research → verdict → next-steps;
+  用于"判断 idea 值不值得做"场景。
+phase_dir: phases                        # 默认 `phases`。phase 模板 markdown 所在目录(相对 team_dir)
 
 # M3.4 verdict-emitting phase 名 list。对应 §5.3 通用 verdict schema。
 verdict_schema:
@@ -703,6 +713,7 @@ claude_md_template: |
 
 **校验**(`TeamSpec::validate` 在 parse 时执行):
 - `name` 非空,只允许 ascii 小写 / 数字 / `-` / `_`
+- `aliases[*]` 各 alias 同 `name` 的 charset 规则;不能为空、不能重复、不能与 `name` 自身重叠(V0.2.2 F40)
 - `phase_dir` 非空、相对路径、不含 `..`
 - `retro_schema[*].field` 非空,**不允许重复**(防 schema 字段重名 — M4.1 retro 写入跨项目 lessons 文件时按 field 名映射段落)
 - `escalate_grammar_extensions[*].prefix` 非空、唯一;

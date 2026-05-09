@@ -325,6 +325,7 @@ impl Orchestrator {
         let empty = TeamRuntime {
             spec: TeamSpec {
                 name: String::new(),
+                aliases: Vec::new(),
                 description: String::new(),
                 retro_schema: Vec::new(),
                 critic_dimensions: Vec::new(),
@@ -367,8 +368,20 @@ impl Orchestrator {
 
     /// Look up the runtime for `team`. Returns `None` for unknown
     /// teams (project's state.json carries an unknown team string).
+    ///
+    /// V0.2.2 F40 — alias-aware: when no runtime is keyed under the
+    /// canonical name, scan every registered runtime's `spec.aliases`
+    /// and return the first match. Lets old projects whose
+    /// `state.json::team` carries a renamed team (e.g.
+    /// `product-research` → `research`) still find the loaded runtime
+    /// without forcing a data migration.
     pub fn team_runtime(&self, team: &str) -> Option<&TeamRuntime> {
-        self.teams.get(team)
+        if let Some(rt) = self.teams.get(team) {
+            return Some(rt);
+        }
+        self.teams
+            .values()
+            .find(|rt| rt.spec.aliases.iter().any(|a| a == team))
     }
 
     /// V0.2.1 F28 — project-scoped resolution. When the project carries
@@ -2202,6 +2215,7 @@ fn load_team_runtimes(paths: &CcteamPaths) -> Result<HashMap<String, TeamRuntime
                     .context("legacy dev: build phase DAG")?;
                 let spec = TeamSpec {
                     name: "dev".into(),
+                    aliases: Vec::new(),
                     description: "Software development team (legacy fallback)".into(),
                     retro_schema: Vec::new(),
                     critic_dimensions: Vec::new(),

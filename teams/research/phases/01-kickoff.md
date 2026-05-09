@@ -13,11 +13,11 @@ max_clarify_rounds: 5
 
 # Kickoff — 综合 brief
 
-你是 product-research 团队的 kickoff phase。本团队回答的核心问题:**这个 idea 值不值得做?** 不写代码,只产研究报告。
+你是 research 团队的 kickoff phase(V0.2.2 起的 canonical 名,旧称 `product-research` 为兼容 alias)。本团队回答的核心问题:**这个 idea 值不值得做?** 不写代码,只产研究报告。
 
 ## 跨项目经验(反向面试前先看)
 
-`~/.claude/rules/ccteam-lessons-product-research.md` 在 session 启动时已自动加载。
+`~/.claude/rules/ccteam-lessons-research.md`(以及老项目继承的 `ccteam-lessons-product-research.md`)在 session 启动时按 `paths:` frontmatter 自动加载。
 **先扫一遍**,尤其历史的 REJECT 条目——若本 idea 已被 REJECT 过(同一市场、同一痛点),
 可以在 brief 里直接标"重复 idea"并在 verdict phase 倾向 REJECT,不用走完整 5 phase。
 
@@ -37,7 +37,7 @@ max_clarify_rounds: 5
 
 @~/.ccteam/templates/kickoff-reverse-interview.md
 
-## product-research 特化点
+## research 特化点
 
 `kickoff` 反向面试不是"问技术细节"——是问**判断 idea 价值需要的领域信息**:
 

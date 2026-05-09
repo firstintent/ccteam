@@ -672,6 +672,35 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
 - **来源**:V0.2 e2e Suite A / `docs/v0-2/e2e-retro.md`。
 - **2026-05-08 已修复(V0.2.1 PR)**:`docs/v0-2/dev-plan.md §9` M0.23.1 路径段更新为 `~/.ccteam/state/orchestrator.{pid,heartbeat}`,与 tech-design §6.8 / 实际代码对齐。
 
+### F40 — `product-research` team 名冗长 + 领域名缺位(2026-05-09 加;**已修复:2026-05-09(V0.2.2 PR #6 alias 软迁移)**)
+
+- **文件:行号**:`teams/product-research/team.yaml::name`(M3.4 起的字面值)
+  + 全栈 callsite(`crates/ccteam-core/src/team.rs::TeamSpec` /
+  `team_resolver.rs::resolve_team` / `templates.rs::TEAM_BUNDLES` /
+  `memory_bridge.rs::lookup_bridge_template` /
+  `crates/ccteam-cli/src/commands.rs::ensure_team_resolvable` 等)。
+- **现状**:`product-research` 又长又冗(命令行 `cct new --team
+  product-research "<brief>"`、`~/projects/product-research-<slug>/`
+  目录前缀、`~/.claude/rules/ccteam-lessons-product-research.md` rules
+  文件名),跟简短的 `dev` 对比读 / 写都繁;领域名 vs team 名混淆
+  (`product-research` 既是技术 team 名又是领域描述,两者绑死)。
+- **是否真 dev-specific**:**否——team 命名问题。**
+- **解耦方案**:V0.2 PRD §5.4 的 `team.yaml::aliases` 方案拉回 V0.2.2 做。
+  仓内 `teams/product-research/` → `teams/research/`(`git mv` 保 history);
+  `team.yaml::name = research` + `aliases: [product-research]` + 多行
+  `description` 字段载全称;`TeamSpec` 加 `pub aliases: Vec<String>` +
+  validate;`resolve_team` / `team_bundle` / `Orchestrator::team_runtime` /
+  `ensure_team_resolvable` 全 alias-aware(name miss → walk
+  `aliases:`);老项目 `state.json::team = "product-research"` 字面 +
+  `~/projects/product-research-*` 目录 + 老 rules 文件全不动;新项目走
+  `state.team = "research"` + `~/projects/research-*`;`cct new --team
+  product-research` stderr warn deprecated 但仍工作。
+- **优先级**:**P2**(命名;不阻塞功能,但持续摩擦用户体验)。
+- **来源**:`docs/v0-2-2/prd.md §9`(F40 全文,~110 行)。
+- **2026-05-09 已修复(V0.2.2 PR #6)**:仓内 team 重命名 + alias 软迁移
+  ship。530 tests 全绿(524 baseline + 6 新 alias resolution / round-trip
+  / cli 测试);clippy 无新 warning。详 PR `v0-2-2-team-alias`。
+
 ### F33 — team factory phase scaffold body 含 bare protocol tokens(2026-05-08 加;**已修复:2026-05-08(V0.2.1 PR)**)
 
 - **文件:行号**:`crates/ccteam-core/src/team_factory.rs` phase

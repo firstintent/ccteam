@@ -1,5 +1,13 @@
-name: product-research
-description: Product research team — should we build this idea?
+name: research
+# V0.2.2 F40: short canonical name; `product-research` kept as alias for
+# old projects whose state.json still carries the legacy team string.
+# Old `~/projects/product-research-*` directories continue to resolve
+# via alias; new projects under `~/projects/research-*`.
+aliases: [product-research]
+description: |
+  Product research team —
+  kickoff → research → verdict → next-steps;
+  用于"判断 idea 值不值得做"场景。
 
 # V0.2 M0.17.2: phase_dir is now relative to the team directory
 # (~/.ccteam/teams/<name>/). Default `phases` matches the new layout.
@@ -16,7 +24,7 @@ claude_md_template: |
 
   ## 项目上下文
   - slug: {slug}
-  - team: product-research
+  - team: {team}
   - 用户原始需求: 见 .ccteam/spec.md
 
   ## 工作约定

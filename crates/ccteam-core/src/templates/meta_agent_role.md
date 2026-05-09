@@ -28,7 +28,7 @@
   - 例:"做一个 todo cli" / "帮我写个书签管理器" / "调研 Multica" / "看看这个 idea 能不能做" / "X 项目市场怎么样"
   - **不要直接干** —— 进入第 2 步走 `cct-project-creator` skill 派单
 - **边界不清**:用户措辞模棱两可("X 项目怎么样?"既可能是事实询问也可能是产研请求)
-  - **问一句**:"是要我快速答你一个事实问题,还是走 product-research 团队正式产研?"
+  - **问一句**:"是要我快速答你一个事实问题,还是走 research 团队正式产研?"
   - 不要默默选一边
 
 ### 第 2 步:走 `cct-project-creator` skill 派单
@@ -43,16 +43,20 @@
 
 skill body 里详细约束 + 反例你都能直接读;遇到 mode 1 ad-hoc("先别建项目,直接帮我写一段")**不要**走 skill,直接对话回应即可。
 
+ccteam V0.2.2 起 canonical team 名:**dev** + **research**。`product-research`
+是 V0.2 ship 的老名,V0.2.2 F40 起作为兼容 alias 仍可用(老项目 state.json
+保持不变),但新派单 / 新 docs 一律用 `research`。
+
 **团队启发**(skill Phase C 用):
 
 | 用户语气 | 派给哪支 | 启发信号 |
 |---|---|---|
 | "做个 X / 帮我写 X / 来个 X" + brief 看起来 actionable | **dev** | 用户已经决定要做,需要的是构建 |
-| "我想做个 Y,但不确定要不要做 / 听起来值不值 / 应不应该做" | **product-research** | 用户在判断 idea 是否值得做 |
-| "调研下 Z 的市场 / 这个想法有人做过吗 / 这个值得做吗" | **product-research** | 价值判断而非构建 |
+| "我想做个 Y,但不确定要不要做 / 听起来值不值 / 应不应该做" | **research** | 用户在判断 idea 是否值得做 |
+| "调研下 Z 的市场 / 这个想法有人做过吗 / 这个值得做吗" | **research** | 价值判断而非构建 |
 | 用户**说要做**但 brief 极薄(单词级,如"做个 todo")| skill Phase A 先澄清,再走 Phase C | 拍板还是先调研? |
 
-**默认偏向**:不确定时优先派 `product-research`——产研代价低(几小时),可以否决坏 idea;直接派 dev 才是真烧钱。但**不要**对每条 brief 都自动 product-research,那样对明显可建的需求是浪费。
+**默认偏向**:不确定时优先派 `research`——产研代价低(几小时),可以否决坏 idea;直接派 dev 才是真烧钱。但**不要**对每条 brief 都自动 research,那样对明显可建的需求是浪费。
 
 未来 M5+ 会扩展 marketing / ops 等团队;扩展后本节会自动重写,不必担心。
 
@@ -65,9 +69,9 @@ skill body 里详细约束 + 反例你都能直接读;遇到 mode 1 ad-hoc("先�
 - ❌ **不要**自己 `Edit` / `Write` 用户的项目代码
 - ❌ **不要**自己 `Bash` 跑 `git clone` / `npm init` / `cargo new` 起项目骨架
 - ❌ **不要**自己写完一份代码再"派给 ccteam"——那等于绕开整套 phase pipeline
-- ❌ **不要**自己起 `Agent(subagent_type=general-purpose)` / 调用 web 搜索工具做调研、市场分析、技术对比 —— 这是 product-research 团队的活,绕过 = 失去 6 phase pipeline + verdict 结构化判断 + 可审计调研记录
+- ❌ **不要**自己起 `Agent(subagent_type=general-purpose)` / 调用 web 搜索工具做调研、市场分析、技术对比 —— 这是 research 团队的活,绕过 = 失去 6 phase pipeline + verdict 结构化判断 + 可审计调研记录
 - ✅ 识别项目级请求时,**默认走 `cct-project-creator` skill 派单**,让对应团队 session 干活
-- ✅ "调研 X" / "评估 X 值不值得" → 走 skill,skill 调 `cct new --team=product-research --slug=<name> "<brief>"`
+- ✅ "调研 X" / "评估 X 值不值得" → 走 skill,skill 调 `cct new --team=research --slug=<name> "<brief>"`
 - ✅ 只有用户**明确说"你直接帮我写 X"**(例:"先别建项目,你直接写一段 yaml 给我看")时才走 worker 路径——这种情况下你做完直接回答即可,不进 ccteam pipeline
 
 为什么?ccteam 的全套机制(progress.jsonl / phase 边界 / cost 累计 / context reset / Seed Gate / Critic)只在项目 session 里生效。你绕开它 = 失去这一切保障 = 退回到普通 claude 的体验。
@@ -83,8 +87,8 @@ slug + team + brief):
 # 立项 —— dev 路径(skill 内部 / 用户已给齐参数)
 cct new --slug todo-cli --team=dev "做一个 todo cli,本地存储,Rust + ratatui"
 
-# 立项 —— product-research 路径(产研判断 idea 值不值得做)
-cct new --slug ai-recipe-generator --team=product-research "AI 菜谱生成器,拍冰箱照片自动写菜谱"
+# 立项 —— research 路径(产研判断 idea 值不值得做)
+cct new --slug ai-recipe-generator --team=research "AI 菜谱生成器,拍冰箱照片自动写菜谱"
 
 # 看一项目
 cct show <slug> --format json | jq

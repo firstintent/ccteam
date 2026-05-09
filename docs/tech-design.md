@@ -294,6 +294,16 @@ override 语义,组成 `TeamRuntime` 表。
 resolver — 后续要加 V0.3 plugin layer 时,只在 `TeamSource::User` 实现里
 扩展 `path_for`,resolver 主流程零改动。
 
+**Soft rename via aliases**(V0.2.2 F40):`team.yaml::aliases: Vec<String>`
+让 shipped team 可以改 canonical 名,老项目 `state.json::team` /
+`~/projects/<old>-*` 目录 / `~/.claude/rules/ccteam-lessons-<old>.md` 全
+**不动**;`resolve_team` 第一遍按目录名 try_load 不命中后,第二遍扫每个
+source 的 `teams/*/team.yaml` 按 `spec.aliases` 匹配;
+`Orchestrator::team_runtime(team)` 同步走 `teams.get(team)` 兜底
+`teams.values().find(|rt| rt.spec.aliases.contains(team))`。V0.2.2 首例:
+`product-research` → `research`(详 `docs/v0-2-2/prd.md §9`)。`dev` 已经
+短,未做。
+
 ### 3.3 Phase Pipeline（短期对标 gstack-auto）
 
 每个 phase 是一个 markdown 文件 + YAML front matter（抄 Symphony 的 WORKFLOW.md 形态）。**完整字段定义、9 个 phase 列表、Seed verdict 输出格式 → [interfaces.md §5](./interfaces.md#5-phase-模板-schema)**。

@@ -359,6 +359,20 @@ pub struct TeamSpec {
     /// field. snake-case lowercase — gets used as a directory name.
     pub name: String,
 
+    /// V0.2.2 F40 — soft-rename aliases. Old team identifiers that
+    /// still appear in user data (`state.json::team`, project
+    /// directories like `~/projects/<old-name>-*`) resolve to this
+    /// canonical spec via [`crate::team_resolver::resolve_team`] /
+    /// [`crate::orchestrator::Orchestrator::team_runtime`]. Used to
+    /// rename a shipped team without touching user data — old projects
+    /// keep working, new projects pick up the canonical name.
+    ///
+    /// Each alias must be unique within the team and follow the same
+    /// `[a-z0-9_-]+` charset as `name`. Defaults to empty so
+    /// pre-V0.2.2 yamls keep parsing.
+    #[serde(default)]
+    pub aliases: Vec<String>,
+
     /// Human-readable one-liner; surfaced by `ccteam ls --teams`
     /// (M3.4) and in error messages.
     #[serde(default)]
@@ -519,6 +533,33 @@ impl TeamSpec {
                 "team.yaml: `name` must be ascii lower / digit / `-` / `_`; got `{}`",
                 self.name,
             );
+        }
+
+        // V0.2.2 F40: aliases follow the same charset rules as `name`,
+        // must be unique within the team, and must not collide with the
+        // canonical name (an alias === itself is meaningless).
+        let mut alias_seen = std::collections::HashSet::new();
+        for alias in &self.aliases {
+            if alias.trim().is_empty() {
+                bail!("team.yaml: alias entry must be non-empty");
+            }
+            if alias
+                .chars()
+                .any(|c| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_'))
+            {
+                bail!(
+                    "team.yaml: alias `{alias}` must be ascii lower / digit / `-` / `_`",
+                );
+            }
+            if alias == &self.name {
+                bail!(
+                    "team.yaml: alias `{alias}` matches canonical name; \
+                     drop it from the aliases list",
+                );
+            }
+            if !alias_seen.insert(alias.as_str()) {
+                return Err(anyhow!("team.yaml: duplicate alias `{alias}`"));
+            }
         }
 
         let mut seen = std::collections::HashSet::new();
@@ -751,6 +792,7 @@ mod tests {
     fn round_trip_through_yaml_preserves_fields() {
         let original = TeamSpec {
             name: "dev".into(),
+            aliases: Vec::new(),
             description: "Software dev".into(),
             retro_schema: vec![RetroFieldSpec {
                 field: "tech_stack".into(),
