@@ -1070,10 +1070,16 @@ fn render_validate_team_report(
     }
 
     // Locate the phase dir on disk via the same priority order the
-    // resolver uses.
+    // resolver uses. V0.2.2 F41: walk by `spec.name` (canonical), not
+    // the user-supplied `team` arg — when `team` is an F40 alias
+    // (eg `product-research`), the team.yaml lives at the canonical
+    // `teams/research/team.yaml` path, so resolving by alias would
+    // miss it and produce a misleading "could not locate team
+    // directory" failure even though the resolver returned a valid
+    // TeamSpec.
     let team_dir = TEAM_SOURCES
         .iter()
-        .filter_map(|s| s.path_for(team, &ctx))
+        .filter_map(|s| s.path_for(&spec.name, &ctx))
         .find(|p| p.exists())
         .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
     let team_dir = match team_dir {
@@ -3125,6 +3131,39 @@ mod tests {
         assert!(msg.contains("1 fail"), "expected fails counter; got: {msg}");
     }
 
+
+    #[test]
+    fn validate_team_resolves_alias_to_canonical_dir() {
+        // V0.2.2 F41 regression: when --validate-team is given an F40
+        // alias (eg `product-research`), the command should resolve to
+        // canonical TeamSpec (`research`) AND locate the phase dir at
+        // the canonical path (`teams/research/`), not at the alias arg
+        // (`teams/product-research/`, which doesn't exist after F40).
+        ensure_isolation();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        ccteam_core::write_all_global_team_templates(&paths.root, false).unwrap();
+
+        let opts = DoctorOptions {
+            validate_team: Some("product-research".into()),
+            ..DoctorOptions::default()
+        };
+        let report = run_doctor(&paths, opts).unwrap();
+        assert!(
+            report.contains("[OK] team.yaml resolves; name=`research`"),
+            "alias should resolve to canonical name; got: {report}"
+        );
+        // Phase dir located → not the misleading "could not locate team
+        // directory" failure that F41 produced before the fix.
+        assert!(
+            !report.contains("could not locate team directory"),
+            "alias path should locate canonical team dir; got: {report}"
+        );
+        assert!(
+            report.contains("0 fail"),
+            "alias-resolve path should pass with 0 fail; got: {report}"
+        );
+    }
 
     #[test]
     fn validate_team_warns_when_phase_body_contains_protocol_literal() {
