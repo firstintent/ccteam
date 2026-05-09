@@ -1200,9 +1200,25 @@ cct mcp-serve                       # M2+:作为 ccteam-mcp 跑 stdio MCP 协议
 
 ```bash
 cct new "需求文本"
-cct new -f spec.md                  # 从文件提
-cct new --mode yolo "需求"          # 覆盖默认 trust_mode
+cct new -f spec.md                            # 从文件提
+cct new --mode yolo "需求"                    # 覆盖默认 trust_mode
+
+# V0.2.2 F34 — slug 决策四层:
+cct new --slug ccteam-ui --team dev "..."     # Tier 1:显式 slug(B2 前缀语义);
+                                              #   `dev-ccteam-ui` 或 verbatim
+cct new --no-auto-slug "..."                  # Tier 4:跳过 LLM 智能 fallback,
+                                              #   走 deterministic `slugify_brief`
+cct new --auto-slug-model claude-sonnet-4-5-20251001 "..."
+                                              # Tier 3:override 默认 haiku
+                                              #   (env CCTEAM_AUTO_SLUG=off 全局禁)
 ```
+
+**slug 决定优先级**(PRD `docs/v0-2-2/prd.md` §3.2):
+
+1. **Tier 1**:`--slug` 显式(零延迟,确定;B2 prefix — 已带 team prefix verbatim)
+2. **Tier 2**:meta-agent 派单工作流的 `cct-project-creator` skill 推荐 + 用户确认(零额外 LLM call)
+3. **Tier 3**:`cct new` 不带 `--slug` 时 shell-out `claude -p haiku`(2-5s,~$0.0001)+ Y/n,非 tty auto-accept
+4. **Tier 4**:LLM 不可用 / `--no-auto-slug` / env `CCTEAM_AUTO_SLUG=off` → `slugify_brief()` deterministic 兜底
 
 ### 10.3 查询状态
 

@@ -11,14 +11,15 @@ use serde_json::{json, Map, Value};
 
 use ccteam_core::{
     bootstrap_meta_project, bootstrap_project, current_cct_bin, install_cct_control_skill,
-    install_cct_team_author_skill, migrate_legacy_skill_dirs,
-    migrate_recommended_agent_symlinks, pick_unused_slug, rewrite_legacy_hook_commands,
-    user_claude_dir, write_all_global_team_templates, write_global_helper_templates,
-    write_global_phase_templates, CcteamPaths, HookCmdRewriteAction, HookCmdRewriteReport,
-    InstallSkillOptions, LegacySkillAction, LegacySkillReport, MetaBootstrapReport,
-    MigrationReport, OutboxEventKind, OutboxMessage, PhaseHistoryEntry, PhaseState,
-    PhaseTemplate, ProjectState, SessionMailbox, SkillInstallAction, TeamSpec,
-    ToolSurfaceSnapshot, BUILTIN_SUBAGENTS, HELPER_TEMPLATES, PHASE_TEMPLATES,
+    install_cct_project_creator_skill, install_cct_team_author_skill,
+    migrate_legacy_skill_dirs, migrate_recommended_agent_symlinks, pick_unused_slug,
+    rewrite_legacy_hook_commands, user_claude_dir, write_all_global_team_templates,
+    write_global_helper_templates, write_global_phase_templates, CcteamPaths,
+    HookCmdRewriteAction, HookCmdRewriteReport, InstallSkillOptions, LegacySkillAction,
+    LegacySkillReport, MetaBootstrapReport, MigrationReport, OutboxEventKind, OutboxMessage,
+    PhaseHistoryEntry, PhaseState, PhaseTemplate, ProjectState, SessionMailbox,
+    SkillInstallAction, TeamSpec, ToolSurfaceSnapshot, BUILTIN_SUBAGENTS, HELPER_TEMPLATES,
+    PHASE_TEMPLATES,
 };
 use ccteam_core::tmux::TmuxSession;
 
@@ -122,6 +123,24 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
     Ok(out)
 }
 
+/// V0.2.2 F34: optional knobs for `run_new` covering the four-tier
+/// slug-decision stack (PRD §3.2):
+///
+/// - `slug` set → Tier 1 (verbatim, B2 prefix semantics).
+/// - `slug` unset, tty + claude available + `!no_auto_slug` →
+///   Tier 3 (`claude -p` smart suggest + Y/n confirm).
+/// - `slug` unset and Tier 3 unavailable / declined →
+///   Tier 4 (`slugify_brief()` deterministic).
+///
+/// `RunNewOptions::default()` keeps the V0.2.1 behavior (no flag,
+/// no auto-suggest, deterministic Tier 4 from `slugify_brief`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RunNewOptions<'a> {
+    pub slug: Option<&'a str>,
+    pub no_auto_slug: bool,
+    pub auto_slug_model: &'a str,
+}
+
 /// `cct new "request" --team <name>`. Bootstraps a project on disk
 /// and returns the chosen slug. Side effects: creates
 /// `~/projects/<slug>/...`. `team` is recorded in state.json so the
@@ -137,7 +156,14 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
 /// meta-agent) are stamped to disk inside `run_new` so a fresh
 /// install no longer needs an explicit `cct init` for the
 /// validation to find them.
-pub fn run_new(paths: &CcteamPaths, request: &str, team: &str) -> Result<String> {
+///
+/// V0.2.2 F34: takes `RunNewOptions` for the four-tier slug stack.
+pub fn run_new(
+    paths: &CcteamPaths,
+    request: &str,
+    team: &str,
+    opts: RunNewOptions<'_>,
+) -> Result<String> {
     if request.trim().is_empty() {
         bail!("cct new: request must be non-empty");
     }
@@ -156,9 +182,205 @@ pub fn run_new(paths: &CcteamPaths, request: &str, team: &str) -> Result<String>
         );
     }
     ensure_team_resolvable(paths, team)?;
-    let slug = pick_unused_slug(paths, request, team)?;
+    let slug = decide_slug(paths, request, team, opts)?;
     bootstrap_project(paths, &slug, request, team)?;
     Ok(slug)
+}
+
+/// V0.2.2 F34 four-tier slug decision. Pure-ish (only LLM shell-out
+/// and stdin/stdout for confirmation if Tier 3 fires); test-friendly
+/// because the env / flag inputs all flow through `RunNewOptions` +
+/// `CCTEAM_AUTO_SLUG{,_BIN}` env vars.
+fn decide_slug(
+    paths: &CcteamPaths,
+    request: &str,
+    team: &str,
+    opts: RunNewOptions<'_>,
+) -> Result<String> {
+    // Tier 1: explicit --slug wins.
+    if let Some(raw) = opts.slug {
+        return ccteam_core::pick_unused_slug_verbatim(paths, raw, team);
+    }
+    // Tier 3: `claude -p` smart suggestion. Skip when `--no-auto-slug`,
+    // when the env disables it, or when claude is unreachable / non-tty.
+    let env_disables = std::env::var("CCTEAM_AUTO_SLUG")
+        .map(|v| v.eq_ignore_ascii_case("off") || v == "0")
+        .unwrap_or(false);
+    if !opts.no_auto_slug && !env_disables {
+        match try_smart_slug(request, opts.auto_slug_model) {
+            Ok(Some(suggestion)) => {
+                return ccteam_core::pick_unused_slug_verbatim(paths, &suggestion, team);
+            }
+            Ok(None) => {
+                // Smart path silently declined (eg user typed `n`); fall
+                // through to Tier 4 — printed reason already.
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "cct new: smart slug suggestion unavailable; falling back to deterministic",
+                );
+            }
+        }
+    }
+    // Tier 4: token-aware deterministic.
+    pick_unused_slug(paths, request, team)
+}
+
+/// V0.2.2 F34 Tier 3 — shell out to `claude -p` for an LLM-quality
+/// slug suggestion, gated on tty / claude-on-PATH / env knobs.
+///
+/// Returns:
+/// - `Ok(Some(slug))` — `claude -p` produced a clean slug and (in tty
+///   contexts) the user accepted it.
+/// - `Ok(None)` — the user declined the suggestion in interactive mode.
+/// - `Err(_)` — every reason we want logged before falling through.
+///
+/// Test seam: `CCTEAM_AUTO_SLUG_BIN` overrides the resolved binary
+/// path (eg point at a stub script during integration tests so the
+/// tier is exercised without a real LLM).
+fn try_smart_slug(request: &str, model: &str) -> Result<Option<String>> {
+    use std::io::{self, BufRead, Write};
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    // Resolve the binary. Honor a test override first.
+    let bin = match std::env::var("CCTEAM_AUTO_SLUG_BIN") {
+        Ok(v) if !v.is_empty() => v,
+        _ => match which_claude() {
+            Some(p) => p,
+            None => bail!("`claude` not on PATH (Tier 3 disabled)"),
+        },
+    };
+
+    let prompt = render_smart_slug_prompt(request);
+
+    eprintln!("[cct] querying claude for slug recommendation...");
+    let mut child = Command::new(&bin)
+        .args(["-p", "--model", model])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawn `{bin} -p`"))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(prompt.as_bytes())
+            .context("write prompt to claude stdin")?;
+    }
+
+    // Wait up to 15s for the child. We poll instead of `child.wait()`
+    // so we can hard-kill on timeout.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let output = loop {
+        match child.try_wait().context("poll claude child")? {
+            Some(_status) => break child.wait_with_output().context("collect claude output")?,
+            None => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    bail!("`claude -p` timed out after 15s; falling back to deterministic slug");
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    };
+
+    if !output.status.success() {
+        bail!(
+            "`claude -p` exited with non-zero status (`{:?}`): {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let raw = String::from_utf8_lossy(&output.stdout).into_owned();
+    let suggestion = match sanitize_smart_slug(&raw) {
+        Some(s) => s,
+        None => bail!("`claude -p` returned no usable slug: {:?}", raw.trim()),
+    };
+
+    // Confirm in tty contexts; auto-accept when piped.
+    let tty = std::io::IsTerminal::is_terminal(&io::stdin());
+    if !tty {
+        eprintln!("[cct] suggested: {suggestion} (auto-accepted, non-tty)");
+        return Ok(Some(suggestion));
+    }
+
+    eprint!("[cct] suggested: {suggestion}\n[cct] accept? [Y/n] (rerun with --slug to override): ");
+    io::stderr().flush().ok();
+    let mut line = String::new();
+    let stdin = io::stdin();
+    stdin.lock().read_line(&mut line).context("read confirmation")?;
+    let reply = line.trim().to_ascii_lowercase();
+    if reply.is_empty() || reply == "y" || reply == "yes" {
+        Ok(Some(suggestion))
+    } else {
+        eprintln!(
+            "[cct] declined; rerun with `--slug <name>` to set explicitly, or fall back to deterministic"
+        );
+        Ok(None)
+    }
+}
+
+/// Build the Tier 3 prompt. Pulled out so the integration tests can
+/// stub a deterministic `claude` echoing back a fixed slug without
+/// caring about the prompt body (PRD §3.2.3 keeps the wording stable).
+fn render_smart_slug_prompt(request: &str) -> String {
+    format!(
+        "Generate a 2-4 token kebab-case slug for a project with this brief:\n\
+         '{request}'\n\n\
+         Rules:\n\
+         - Capture the core noun/concept (brand name if present), not action verbs\n\
+         - Drop stop words (a, the, of, etc) and pure-digit tokens\n\
+         - Output ONLY the slug, no explanation, no quotes, no markdown\n\
+         Examples:\n\
+         - 'AI recipe generator from fridge photo' -> recipe-generator\n\
+         - 'Build a todo cli with ratatui' -> todo-cli\n\
+         - 'HermesTrade DEX prediction market' -> hermestrade-dex\n\
+         Slug:"
+    )
+}
+
+/// Lock the smart-slug output down to `[a-z0-9-]+`, len 2..=60. Strips
+/// trailing whitespace / quotes / `Slug:` echo, so the LLM has some
+/// slack but the disk layer doesn't see anything weird.
+fn sanitize_smart_slug(raw: &str) -> Option<String> {
+    let candidate = raw
+        .lines()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty())?
+        .trim_matches(|c: char| {
+            c == '"' || c == '\'' || c == '`' || c.is_ascii_whitespace()
+        })
+        .trim_start_matches("Slug:")
+        .trim();
+    let lowered = candidate.to_ascii_lowercase();
+    let cleaned: String = lowered
+        .chars()
+        .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-')
+        .collect();
+    let trimmed = cleaned.trim_matches('-');
+    if trimmed.len() < 2 || trimmed.len() > 60 {
+        return None;
+    }
+    if trimmed.chars().all(|c| c == '-') {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// Resolve `claude` via `which`. Returns `None` when not on PATH; the
+/// caller falls through to Tier 4. Stdlib only — no extra crate.
+fn which_claude() -> Option<String> {
+    let path_env = std::env::var_os("PATH")?;
+    for entry in std::env::split_paths(&path_env) {
+        let candidate = entry.join("claude");
+        if candidate.is_file() {
+            return candidate.to_str().map(String::from);
+        }
+    }
+    None
 }
 
 /// Resolve `team` against the on-disk team registry. Returns
@@ -1131,18 +1353,25 @@ fn render_install_skill_report(paths: &CcteamPaths, opts: &DoctorOptions) -> Res
     };
     let mut out = String::from("cct doctor --install-skill\n\n");
 
-    // V0.2.2 F39: install both shipped skills under their cct-* names.
+    // V0.2.2 F39: install all shipped skills under their cct-* names.
+    // V0.2.2 F34: cct-project-creator joins the install set.
     let control = install_cct_control_skill(install_opts)?;
     out.push_str(&format!(
-        "  cct-control      {label}  {}\n",
+        "  cct-control          {label}  {}\n",
         control.target.display(),
         label = skill_install_label(&control.action),
     ));
     let team_author = install_cct_team_author_skill(install_opts)?;
     out.push_str(&format!(
-        "  cct-team-author  {label}  {}\n",
+        "  cct-team-author      {label}  {}\n",
         team_author.target.display(),
         label = skill_install_label(&team_author.action),
+    ));
+    let project_creator = install_cct_project_creator_skill(install_opts)?;
+    out.push_str(&format!(
+        "  cct-project-creator  {label}  {}\n",
+        project_creator.target.display(),
+        label = skill_install_label(&project_creator.action),
     ));
     out.push('\n');
 
@@ -1865,15 +2094,35 @@ mod tests {
         }
     }
 
+    /// V0.2.2 F34: thin wrapper that defaults to deterministic Tier 4
+    /// (no auto-suggest) so unit tests don't accidentally shell-out to
+    /// `claude -p` on dev / CI machines that have it on PATH.
+    fn run_new_t4(paths: &CcteamPaths, request: &str, team: &str) -> Result<String> {
+        run_new(
+            paths,
+            request,
+            team,
+            RunNewOptions {
+                slug: None,
+                no_auto_slug: true,
+                auto_slug_model: "claude-haiku-4-5-20251001",
+            },
+        )
+    }
+
     #[test]
     fn run_new_creates_slug_and_bootstrap_files() {
         ensure_isolation();
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
-        let slug = run_new(&paths, "Build a bookmark manager", "dev").unwrap();
+        let slug = run_new_t4(&paths, "Build a bookmark manager", "dev").unwrap();
         // F22: slug now carries the team prefix so ~/.claude/rules/ccteam-lessons-dev.md
         // `paths: ~/projects/dev-*` matches at session start.
-        assert!(slug.starts_with("dev-build-a-bookmark-manager"));
+        // V0.2.2 F34: `slugify_brief` drops stop-words so `a` is filtered out.
+        assert!(
+            slug.starts_with("dev-build-bookmark-manager"),
+            "expected `dev-build-bookmark-manager*`, got {slug}",
+        );
         let project = paths.project_dir(&slug);
         assert!(project.join(".ccteam/spec.md").exists());
         assert!(project.join(".ccteam/state.json").exists());
@@ -1885,7 +2134,7 @@ mod tests {
     fn run_new_rejects_empty_request() {
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
-        let err = run_new(&paths, "   \n\t", "dev").unwrap_err();
+        let err = run_new_t4(&paths, "   \n\t", "dev").unwrap_err();
         assert!(format!("{err:#}").contains("non-empty"));
     }
 
@@ -1893,7 +2142,7 @@ mod tests {
     fn run_new_rejects_empty_team() {
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
-        let err = run_new(&paths, "build something", "  ").unwrap_err();
+        let err = run_new_t4(&paths, "build something", "  ").unwrap_err();
         assert!(format!("{err:#}").contains("--team"));
     }
 
@@ -1910,7 +2159,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
         let slug =
-            run_new(&paths, "ai recipe generator idea", "product-research").unwrap();
+            run_new_t4(&paths, "ai recipe generator idea", "product-research").unwrap();
         let state = ProjectState::load(&paths.project_state(&slug)).unwrap();
         assert_eq!(state.team, "product-research");
     }
@@ -1923,7 +2172,7 @@ mod tests {
         ensure_isolation();
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
-        let err = run_new(&paths, "marketing copy idea", "marketing").unwrap_err();
+        let err = run_new_t4(&paths, "marketing copy idea", "marketing").unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("unknown team"), "got: {msg}");
         assert!(msg.contains("marketing"), "should name the missing team");
@@ -1961,7 +2210,7 @@ mod tests {
         // later in bootstrap_project (no template bundle), but
         // ensure_team_resolvable should accept the team.yaml first.
         // The error we get back should NOT mention "unknown team".
-        let err = run_new(&paths, "do a thing", "custom-team").unwrap_err();
+        let err = run_new_t4(&paths, "do a thing", "custom-team").unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             !msg.contains("unknown team"),
@@ -2017,8 +2266,8 @@ mod tests {
         ensure_isolation();
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
-        run_new(&paths, "demo one", "dev").unwrap();
-        run_new(&paths, "demo two", "dev").unwrap();
+        run_new_t4(&paths, "demo one", "dev").unwrap();
+        run_new_t4(&paths, "demo two", "dev").unwrap();
 
         let body = run_ls(&paths, OutputFormat::Json).unwrap();
         let v: Value = serde_json::from_str(&body).unwrap();
@@ -2077,7 +2326,7 @@ mod tests {
         ensure_isolation();
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
-        let slug = run_new(&paths, "demo", "dev").unwrap();
+        let slug = run_new_t4(&paths, "demo", "dev").unwrap();
         let body = run_show(&paths, &slug, OutputFormat::Json).unwrap();
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["state"]["slug"], slug);
@@ -2097,7 +2346,7 @@ mod tests {
         ensure_isolation();
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
-        let slug = run_new(&paths, "demo", "dev").unwrap();
+        let slug = run_new_t4(&paths, "demo", "dev").unwrap();
         // simulate an escalated state
         let state_path = paths.project_state(&slug);
         let mut state = ProjectState::load(&state_path).unwrap();
@@ -2124,7 +2373,7 @@ mod tests {
         ensure_isolation();
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
-        let slug = run_new(&paths, "demo", "dev").unwrap();
+        let slug = run_new_t4(&paths, "demo", "dev").unwrap();
 
         let state_path = paths.project_state(&slug);
         let mut state = ProjectState::load(&state_path).unwrap();
@@ -2154,7 +2403,7 @@ mod tests {
         ensure_isolation();
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
-        let slug = run_new(&paths, "demo", "dev").unwrap();
+        let slug = run_new_t4(&paths, "demo", "dev").unwrap();
 
         let state_path = paths.project_state(&slug);
         let mut state = ProjectState::load(&state_path).unwrap();
@@ -2219,7 +2468,7 @@ mod tests {
         ensure_isolation();
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
-        let slug = run_new(&paths, "demo", "dev").unwrap();
+        let slug = run_new_t4(&paths, "demo", "dev").unwrap();
         progress::append_event(
             &paths.progress_jsonl(&slug),
             &json!({"event": "session_start", "ts": "2026-05-05T00:00:00Z"}),
@@ -2465,7 +2714,7 @@ mod tests {
         let paths = fresh_paths(&tmp);
         assert!(!paths.root.join("teams").exists(), "precondition: empty global dir");
 
-        let slug = run_new(&paths, "Verify product-research bootstraps", "product-research")
+        let slug = run_new_t4(&paths, "Verify product-research bootstraps", "product-research")
             .expect("run_new must auto-seed shipped templates before validation");
         assert!(slug.starts_with("product-research-"));
         // The seed must have landed during run_new.
@@ -2840,5 +3089,130 @@ mod tests {
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0]["kind"], "daemon_down");
         assert!(parsed["config"].is_object());
+    }
+
+    // -------------- V0.2.2 F34 — slug --slug flag + sanitize ---------------
+
+    #[test]
+    fn run_new_with_explicit_slug_uses_verbatim_path() {
+        ensure_isolation();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let slug = run_new(
+            &paths,
+            "literally anything goes here",
+            "dev",
+            RunNewOptions {
+                slug: Some("ccteam-ui"),
+                no_auto_slug: true,
+                auto_slug_model: "claude-haiku-4-5-20251001",
+            },
+        )
+        .unwrap();
+        assert_eq!(slug, "dev-ccteam-ui");
+        assert!(paths.project_dir(&slug).join(".ccteam/spec.md").exists());
+    }
+
+    #[test]
+    fn run_new_with_explicit_slug_keeps_team_prefix_when_present() {
+        ensure_isolation();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let slug = run_new(
+            &paths,
+            "irrelevant brief",
+            "dev",
+            RunNewOptions {
+                slug: Some("dev-explicit-name"),
+                no_auto_slug: true,
+                auto_slug_model: "claude-haiku-4-5-20251001",
+            },
+        )
+        .unwrap();
+        assert_eq!(slug, "dev-explicit-name");
+    }
+
+    #[test]
+    fn run_new_with_explicit_illegal_slug_fails_loud() {
+        ensure_isolation();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let err = run_new(
+            &paths,
+            "irrelevant",
+            "dev",
+            RunNewOptions {
+                slug: Some("Bad Slug!"),
+                no_auto_slug: true,
+                auto_slug_model: "claude-haiku-4-5-20251001",
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("[a-z0-9-]+"),
+            "expected fail-loud regex hint, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn sanitize_smart_slug_accepts_clean_kebab() {
+        assert_eq!(
+            sanitize_smart_slug("hermestrade-dex\n"),
+            Some("hermestrade-dex".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_smart_slug_strips_quotes_and_label_prefix() {
+        assert_eq!(
+            sanitize_smart_slug("\"todo-cli\""),
+            Some("todo-cli".to_string())
+        );
+        assert_eq!(
+            sanitize_smart_slug("Slug: ai-recipe-generator"),
+            Some("ai-recipe-generator".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_smart_slug_takes_first_non_empty_line() {
+        let raw = "\n\nthe-slug\nignored explanation line\n";
+        assert_eq!(sanitize_smart_slug(raw), Some("the-slug".to_string()));
+    }
+
+    #[test]
+    fn sanitize_smart_slug_lowercases_and_drops_disallowed_chars() {
+        // Letters lowered, exclamation stripped → `hello-world`
+        assert_eq!(
+            sanitize_smart_slug("Hello-World!"),
+            Some("hello-world".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_smart_slug_rejects_too_short_or_too_long() {
+        assert_eq!(sanitize_smart_slug("a"), None);
+        assert_eq!(sanitize_smart_slug(&"x".repeat(61)), None);
+        // Boundary: exactly 60 is fine.
+        assert_eq!(
+            sanitize_smart_slug(&"x".repeat(60)),
+            Some("x".repeat(60))
+        );
+    }
+
+    #[test]
+    fn sanitize_smart_slug_rejects_empty_or_dash_only() {
+        assert_eq!(sanitize_smart_slug(""), None);
+        assert_eq!(sanitize_smart_slug("---"), None);
+    }
+
+    #[test]
+    fn render_smart_slug_prompt_embeds_brief_and_examples() {
+        let p = render_smart_slug_prompt("Build HermesTrade DEX home");
+        assert!(p.contains("Build HermesTrade DEX home"));
+        // The example anchors keep the prompt stable for tests + audits.
+        assert!(p.contains("HermesTrade DEX prediction market"));
+        assert!(p.contains("Slug:"));
     }
 }

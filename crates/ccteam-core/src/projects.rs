@@ -64,6 +64,71 @@ pub fn random_suffix() -> String {
     format!("{:04x}", nanos & 0xFFFF)
 }
 
+/// V0.2.2 F34 Tier 4: token-aware deterministic slug generator. Used
+/// when the meta-agent / `claude -p` tier is unavailable (no LLM,
+/// `--no-auto-slug`, env `CCTEAM_AUTO_SLUG=off`). Improves over
+/// `slugify()`'s 40-char char-level cap by:
+///
+/// 1. Reusing `slugify` for character normalization (`[a-z0-9]` +
+///    `-` collapsing).
+/// 2. Splitting on `-` into tokens; filtering out:
+///    - English stop words (`a`/`an`/`the`/`of`/`to`/`for`/`with`/
+///      `that`/`and`/`or`/`in`/`on`/`at`/`is`/`are`).
+///    - Pure-digit tokens (`v2` / `2k` are kept because they contain
+///      letters; `2` / `42` are dropped).
+///    - Tokens shorter than 2 chars.
+/// 3. De-duplicating consecutive repeats (`ccteam ccteam ui` →
+///    `ccteam ui`).
+/// 4. Taking the first 3 surviving tokens, joined by `-`.
+/// 5. If everything was filtered, falling back to the raw `slugify()`
+///    output so the caller never gets an empty slug.
+///
+/// **`slugify()` is not modified** — it still backs the meta-agent
+/// `<handle>-meta` path where the input is already a short user
+/// handle that should be used verbatim.
+pub fn slugify_brief(input: &str) -> String {
+    const STOP_WORDS: &[&str] = &[
+        "a", "an", "the", "of", "to", "for", "with", "that", "and", "or", "in", "on",
+        "at", "is", "are",
+    ];
+    const MAX_TOKENS: usize = 3;
+
+    let normalized = slugify(input);
+    if normalized == "project" {
+        // The char-level path already gave up; nothing for the
+        // token filter to do.
+        return normalized;
+    }
+
+    let mut kept: Vec<&str> = Vec::new();
+    for token in normalized.split('-') {
+        if token.len() < 2 {
+            continue;
+        }
+        if STOP_WORDS.contains(&token) {
+            continue;
+        }
+        if token.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        if kept.last().is_some_and(|prev| *prev == token) {
+            continue;
+        }
+        kept.push(token);
+        if kept.len() >= MAX_TOKENS {
+            break;
+        }
+    }
+
+    if kept.is_empty() {
+        // Everything got filtered (e.g. brief "to of and"). Fall
+        // back to the raw normalized slug so the caller still gets
+        // something usable rather than `project`.
+        return normalized;
+    }
+    kept.join("-")
+}
+
 /// Pick an unused slug under `paths.projects_root`, prefixed with the
 /// project's team name so `~/.claude/rules/ccteam-lessons-<team>.md`
 /// `paths:` frontmatter (`~/projects/<team>-*`) actually matches the
@@ -71,6 +136,13 @@ pub fn random_suffix() -> String {
 ///
 /// Tries `<team>-<base>` first, then `<team>-<base>-<suffix>` with up
 /// to 16 retries on collision.
+///
+/// V0.2.2 F34: the `base` argument is a free-text request — it gets
+/// run through `slugify_brief` (token-aware) so `<team>-<base>` stays
+/// readable. Callers that already have a deliberate slug (eg
+/// `--slug ccteam-ui`) should use [`pick_unused_slug_verbatim`] which
+/// skips token filtering and only enforces team prefix + collision
+/// retry.
 ///
 /// Meta-agent projects don't go through this function — they use
 /// `meta_slug(handle)` which hand-crafts `<handle>-meta` (suffix
@@ -80,10 +152,70 @@ pub fn pick_unused_slug(
     base: &str,
     team: &str,
 ) -> Result<String> {
-    let base = slugify(base);
+    let base = slugify_brief(base);
+    pick_unused_under_team_prefix(paths, &base, team)
+}
+
+/// V0.2.2 F34 Tier 1: pick an unused slug from a deliberate user-
+/// chosen base. Skips token filtering (the user has already named
+/// the project) and only does:
+///
+/// - Validate `[a-z0-9-]+`, length ≤ 60, no leading / trailing dash.
+/// - B2 prefix semantics: if `slug` already starts with `<team>-`
+///   keep it verbatim; otherwise prepend `<team>-`.
+/// - Collision retry via `-{4hex}` suffix (same as `pick_unused_slug`).
+pub fn pick_unused_slug_verbatim(
+    paths: &CcteamPaths,
+    slug: &str,
+    team: &str,
+) -> Result<String> {
+    let trimmed = slug.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("slug must be non-empty"));
+    }
+    if trimmed.len() > 60 {
+        return Err(anyhow!(
+            "slug too long ({} chars > 60); use a shorter name",
+            trimmed.len()
+        ));
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err(anyhow!(
+            "slug must match [a-z0-9-]+; got {trimmed:?}",
+        ));
+    }
+    if trimmed.starts_with('-') || trimmed.ends_with('-') {
+        return Err(anyhow!(
+            "slug must not start or end with `-`; got {trimmed:?}",
+        ));
+    }
+    let team_prefix = format!("{team}-");
+    let prefixed = if trimmed.starts_with(&team_prefix) || trimmed == team {
+        trimmed.to_string()
+    } else {
+        format!("{team_prefix}{trimmed}")
+    };
+    pick_unused_with_prefixed(paths, &prefixed)
+}
+
+/// Internal helper: takes an already-prefixed slug, returns the same
+/// or a `-{4hex}` retry on collision. Shared between the verbatim
+/// (`--slug`) and brief-derived paths.
+fn pick_unused_under_team_prefix(
+    paths: &CcteamPaths,
+    base: &str,
+    team: &str,
+) -> Result<String> {
     let prefixed = format!("{team}-{base}");
-    if !paths.project_dir(&prefixed).exists() {
-        return Ok(prefixed);
+    pick_unused_with_prefixed(paths, &prefixed)
+}
+
+fn pick_unused_with_prefixed(paths: &CcteamPaths, prefixed: &str) -> Result<String> {
+    if !paths.project_dir(prefixed).exists() {
+        return Ok(prefixed.to_string());
     }
     for _ in 0..16 {
         let candidate = format!("{prefixed}-{}", random_suffix());
@@ -588,7 +720,9 @@ mod tests {
         let paths = pick_paths(&tmp);
         let dev = pick_unused_slug(&paths, "make a todo cli", "dev").unwrap();
         let pr = pick_unused_slug(&paths, "AI recipe generator", "product-research").unwrap();
-        assert_eq!(dev, "dev-make-a-todo-cli");
+        // V0.2.2 F34: `slugify_brief` drops stop-words (`a`) so the
+        // brief-derived base is `make-todo-cli`, not `make-a-todo-cli`.
+        assert_eq!(dev, "dev-make-todo-cli");
         assert_eq!(pr, "product-research-ai-recipe-generator");
     }
 
@@ -614,6 +748,142 @@ mod tests {
         assert_eq!(dev, "dev-shared-brief");
         assert_eq!(pr, "product-research-shared-brief");
         assert_ne!(dev, pr);
+    }
+
+    // --- V0.2.2 F34 — slugify_brief() Tier 4 deterministic ---
+
+    #[test]
+    fn slugify_brief_drops_pure_digit_tokens_and_keeps_mixed() {
+        // PRD §3.2.4 case 1:
+        // `ccteam ui — V1.2 session subagent 3` → tokens
+        // [ccteam, ui, v1, 2, session, subagent, 3] →
+        // drop `2`/`3` (pure digit), keep `v1` (letter+digit) →
+        // first 3 → `ccteam-ui-v1`.
+        assert_eq!(
+            slugify_brief("ccteam ui — V1.2 session subagent 3"),
+            "ccteam-ui-v1"
+        );
+    }
+
+    #[test]
+    fn slugify_brief_drops_stop_words() {
+        // `Build a tiny Python CLI that converts CSV to JSON` →
+        // tokens drop `a`/`that`/`to` → first 3 = build, tiny, python.
+        assert_eq!(
+            slugify_brief("Build a tiny Python CLI that converts CSV to JSON"),
+            "build-tiny-python"
+        );
+    }
+
+    #[test]
+    fn slugify_brief_keeps_brand_and_caps_at_three_tokens() {
+        assert_eq!(
+            slugify_brief("AI recipe generator from fridge photo"),
+            "ai-recipe-generator"
+        );
+        assert_eq!(slugify_brief("HermesTrade DEX home"), "hermestrade-dex-home");
+    }
+
+    #[test]
+    fn slugify_brief_handles_short_briefs_unchanged() {
+        // Three real tokens, nothing to filter.
+        assert_eq!(slugify_brief("Predict market + DEX"), "predict-market-dex");
+    }
+
+    #[test]
+    fn slugify_brief_falls_back_when_all_filtered() {
+        // Only stop-words → fall back to raw `slugify` so the caller
+        // never gets `project` from a degenerate filter pass.
+        assert_eq!(slugify_brief("to of and"), "to-of-and");
+    }
+
+    #[test]
+    fn slugify_brief_dedups_consecutive_repeats() {
+        // `ccteam ccteam ui` → token list `[ccteam, ccteam, ui]` →
+        // dedup last → `[ccteam, ui]` → joined = `ccteam-ui`.
+        assert_eq!(slugify_brief("ccteam ccteam ui"), "ccteam-ui");
+    }
+
+    #[test]
+    fn slugify_brief_drops_stop_word_do() {
+        // `do the thing` → drop `the` (stop) → `[do, thing]`.
+        // `do` is len 2 + not in stop list → kept.
+        assert_eq!(slugify_brief("do the thing"), "do-thing");
+    }
+
+    #[test]
+    fn slugify_brief_falls_back_to_project_for_empty_input() {
+        assert_eq!(slugify_brief(""), "project");
+        assert_eq!(slugify_brief("中文"), "project");
+    }
+
+    // --- V0.2.2 F34 — pick_unused_slug_verbatim (--slug flag path) ---
+
+    #[test]
+    fn verbatim_prefixes_team_when_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = pick_paths(&tmp);
+        let s = pick_unused_slug_verbatim(&paths, "ccteam-ui", "dev").unwrap();
+        assert_eq!(s, "dev-ccteam-ui");
+    }
+
+    #[test]
+    fn verbatim_keeps_team_prefix_when_already_present() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = pick_paths(&tmp);
+        let s = pick_unused_slug_verbatim(&paths, "dev-ccteam-ui", "dev").unwrap();
+        assert_eq!(s, "dev-ccteam-ui");
+    }
+
+    #[test]
+    fn verbatim_does_not_match_partial_prefix() {
+        // `dev` ≠ `product-research`, so `--slug product-research-foo
+        // --team dev` must prepend `dev-` even though the slug starts
+        // with the substring `product`. (PRD §3.2.1 row 4.)
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = pick_paths(&tmp);
+        let s = pick_unused_slug_verbatim(&paths, "product-research-foo", "dev").unwrap();
+        assert_eq!(s, "dev-product-research-foo");
+    }
+
+    #[test]
+    fn verbatim_rejects_illegal_chars() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = pick_paths(&tmp);
+        let err = pick_unused_slug_verbatim(&paths, "Bad Name!", "dev").unwrap_err();
+        assert!(
+            err.to_string().contains("[a-z0-9-]+"),
+            "expected fail-loud regex hint, got {err}",
+        );
+    }
+
+    #[test]
+    fn verbatim_rejects_empty_and_dash_edges() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = pick_paths(&tmp);
+        assert!(pick_unused_slug_verbatim(&paths, "", "dev").is_err());
+        assert!(pick_unused_slug_verbatim(&paths, "   ", "dev").is_err());
+        assert!(pick_unused_slug_verbatim(&paths, "-leading", "dev").is_err());
+        assert!(pick_unused_slug_verbatim(&paths, "trailing-", "dev").is_err());
+    }
+
+    #[test]
+    fn verbatim_rejects_too_long() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = pick_paths(&tmp);
+        let long = "a".repeat(61);
+        let err = pick_unused_slug_verbatim(&paths, &long, "dev").unwrap_err();
+        assert!(err.to_string().contains("too long"));
+    }
+
+    #[test]
+    fn verbatim_collision_retries_with_suffix() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = pick_paths(&tmp);
+        std::fs::create_dir_all(paths.project_dir("dev-x")).unwrap();
+        let s = pick_unused_slug_verbatim(&paths, "x", "dev").unwrap();
+        assert!(s.starts_with("dev-x-"), "expected suffix retry, got {s}");
+        assert_ne!(s, "dev-x");
     }
 
     #[test]
