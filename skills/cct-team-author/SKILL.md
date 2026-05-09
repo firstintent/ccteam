@@ -1,17 +1,18 @@
+<!-- ccteam-managed:skill begin -->
 ---
-name: ccteam-team-author
+name: cct-team-author
 description: |
   Author a new ccteam team plugin via dialogue with the user. Use when
   the user asks to create / design / scaffold a team, or wants to package
   a custom phase pipeline as a Claude Code plugin. Primary consumer is
   the ccteam meta-agent session — it walks the user through phase list,
   tools, golden rules, retro schema, verdict schema, and plugin metadata,
-  then invokes `ccteam team init` / `ccteam team publish` to materialize
+  then invokes `cct team init` / `cct team publish` to materialize
   and share the result.
 allowed-tools: [Bash, Read, Write, Edit]
 ---
 
-# ccteam-team-author
+# cct-team-author
 
 ccteam ships two teams out of the box (`dev`, `product-research`). When
 the user wants a different workflow — code review only, market research
@@ -24,10 +25,10 @@ Claude Code runs.
 
 | What you want | Bash command |
 |---|---|
-| Scaffold a team from interview answers | `ccteam team init <name> --description "…"` |
-| Validate a staged team | `ccteam doctor --validate-team <name>` |
-| Publish to local marketplace        | `ccteam team publish <name> --target local` |
-| Publish to GitHub                   | `ccteam team publish <name> --target github --repo <owner>/<name>` |
+| Scaffold a team from interview answers | `cct team init <name> --description "…"` |
+| Validate a staged team | `cct doctor --validate-team <name>` |
+| Publish to local marketplace        | `cct team publish <name> --target local` |
+| Publish to GitHub                   | `cct team publish <name> --target github --repo <owner>/<name>` |
 | Inspect what was generated          | `ls ~/.config/ccteam/teams/<name>/` |
 
 Staging path: `~/.config/ccteam/teams/<name>/`. Layout mirrors a Claude
@@ -37,14 +38,14 @@ optional `agents/` `commands/` `hooks/hooks.json` `.mcp.json`).
 ## Typical workflow — interview the user, then scaffold
 
 The factory expects answers to a small set of questions before
-`ccteam team init` can produce a useful skeleton. Walk the user through
+`cct team init` can produce a useful skeleton. Walk the user through
 them one at a time — do **not** dump every question in a single turn.
 
 ### A) Plugin metadata
 
 1. Plugin / team `name` — must be ascii lowercase + `-` + digits.
    Doubles as `team.yaml.name`.
-2. One-line `description` (shown in `ccteam ls --teams`,
+2. One-line `description` (shown in `cct ls --teams`,
    `marketplace.json`).
 3. `author.name` (and optionally `author.email`).
 
@@ -67,7 +68,7 @@ them one at a time — do **not** dump every question in a single turn.
 Per phase, ask: which subagents / skills / MCP servers does this phase
 invoke? (Common subagents: `code-reviewer`, `code-architect`,
 `code-explorer`, `silent-failure-hunter`.) The factory writes
-`tools_required:` for each phase; `ccteam doctor --validate-team` then
+`tools_required:` for each phase; `cct doctor --validate-team` then
 cross-checks reachability.
 
 ### D) Golden rules (team-wide)
@@ -118,7 +119,7 @@ prefixes — `REVERT_TO_PHASE` / `NEED_USER_INPUT` / `ABORT` /
   `ESCALATE: …`) into the body — those are inject-prompt territory only
   (V0.2 M0.18).
 - **Validate before publishing.** Always run
-  `ccteam doctor --validate-team <name>` after `init` and before
+  `cct doctor --validate-team <name>` after `init` and before
   `publish`. Fix any `[FAIL]`; surface `[WARN]` to the user.
 
 ## Publish targets
@@ -146,3 +147,4 @@ prefixes — `REVERT_TO_PHASE` / `NEED_USER_INPUT` / `ABORT` /
 - It does not auto-install the plugin in any session. Publish writes the
   artifact; the user enables it in each Claude Code session that wants
   it (`/plugin enable`).
+<!-- ccteam-managed:skill end -->

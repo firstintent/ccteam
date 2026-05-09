@@ -47,7 +47,7 @@ const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const SERVER_NAME: &str = "ccteam";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Run `ccteam mcp-serve`. Reads JSON-RPC requests one per line from
+/// Run `cct mcp-serve`. Reads JSON-RPC requests one per line from
 /// stdin; writes responses one per line to stdout. Returns when stdin
 /// closes (clean shutdown when the parent disconnects).
 pub async fn run_mcp_serve(paths: CcteamPaths) -> Result<()> {
@@ -643,7 +643,7 @@ pub fn install_mcp_into(claude_json: &std::path::Path, ccteam_bin: &std::path::P
             .with_context(|| format!("create {}", parent.display()))?;
     }
     let mut tmp_os = claude_json.as_os_str().to_owned();
-    tmp_os.push(".ccteam-mcp.tmp");
+    tmp_os.push(".cct-mcp.tmp");
     let tmp = std::path::PathBuf::from(tmp_os);
     {
         let mut f = std::fs::File::create(&tmp)
@@ -664,7 +664,7 @@ pub fn install_mcp_into(claude_json: &std::path::Path, ccteam_bin: &std::path::P
 /// `--install-memory-bridge`) already honor through `user_claude_dir()`.
 pub fn install_mcp() -> Result<std::path::PathBuf> {
     let claude_json = ccteam_core::projects::resolve_claude_json_path()?;
-    let bin = ccteam_core::current_ccteam_bin()?;
+    let bin = ccteam_core::current_cct_bin()?;
     install_mcp_into(&claude_json, &bin)?;
     Ok(claude_json)
 }
@@ -697,13 +697,16 @@ mod tests {
 
     #[test]
     fn install_mcp_into_writes_command_args_env_for_ccteam_server() {
+        // V0.2.2 F39: binary is `cct` but the MCP server name stays
+        // `ccteam` (PRD §8.3 — server-name rename deferred to V0.3 to
+        // avoid touching every user's `~/.claude.json`).
         let tmp = tempfile::TempDir::new().unwrap();
         let claude_json = tmp.path().join(".claude.json");
-        let ccteam_bin = std::path::PathBuf::from("/usr/local/bin/ccteam");
-        install_mcp_into(&claude_json, &ccteam_bin).unwrap();
+        let cct_bin = std::path::PathBuf::from("/usr/local/bin/cct");
+        install_mcp_into(&claude_json, &cct_bin).unwrap();
         let body = std::fs::read_to_string(&claude_json).unwrap();
         let v: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(v["mcpServers"]["ccteam"]["command"], "/usr/local/bin/ccteam");
+        assert_eq!(v["mcpServers"]["ccteam"]["command"], "/usr/local/bin/cct");
         assert_eq!(v["mcpServers"]["ccteam"]["args"][0], "mcp-serve");
     }
 
@@ -716,11 +719,11 @@ mod tests {
             r#"{"userID": "rob", "mcpServers": {"playwright": {"command": "npx"}}}"#,
         )
         .unwrap();
-        install_mcp_into(&claude_json, &std::path::PathBuf::from("/x/ccteam")).unwrap();
+        install_mcp_into(&claude_json, &std::path::PathBuf::from("/x/cct")).unwrap();
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&claude_json).unwrap()).unwrap();
         assert_eq!(v["userID"], "rob");
         assert_eq!(v["mcpServers"]["playwright"]["command"], "npx");
-        assert_eq!(v["mcpServers"]["ccteam"]["command"], "/x/ccteam");
+        assert_eq!(v["mcpServers"]["ccteam"]["command"], "/x/cct");
     }
 
     #[test]

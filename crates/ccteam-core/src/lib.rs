@@ -48,10 +48,10 @@ pub use memory_bridge::{
     InstallMemoryBridgeOptions, MemoryBridgeAction, MemoryBridgeReport,
 };
 pub use skill::{
-    install_ccteam_control_skill, install_ccteam_team_author_skill,
+    install_cct_control_skill, install_cct_team_author_skill,
     install_into as install_skill_into, install_skill_body_into,
     InstallSkillOptions, InstallSkillReport, SkillInstallAction,
-    CCTEAM_CONTROL_SKILL_NAME, CCTEAM_TEAM_AUTHOR_SKILL_NAME,
+    CCT_CONTROL_SKILL_NAME, CCT_TEAM_AUTHOR_SKILL_NAME, LEGACY_SKILL_NAMES,
 };
 pub use orchestrator::MAX_CONCURRENT_PROJECTS;
 pub use orchestrator::{
@@ -96,7 +96,7 @@ pub use team_resolver::{
     TeamSource, TEAM_SOURCES,
 };
 pub use templates::{
-    current_ccteam_bin, project_phase_filename, render_project_settings,
+    current_cct_bin, project_phase_filename, render_project_settings,
     write_all_global_team_templates, write_global_helper_templates,
     write_global_phase_templates, write_project_phase_templates,
     write_project_phase_templates_for_team, write_project_settings,
@@ -114,7 +114,9 @@ pub use plugin_resolution::{
 };
 pub use tool_surface::{
     disable_tool_surface_bootstrap_for_tests, ensure_skills_placeholders,
-    migrate_recommended_agent_symlinks, missing_tools, user_claude_dir, MigrationReport,
+    migrate_legacy_skill_dirs, migrate_recommended_agent_symlinks, missing_tools,
+    rewrite_legacy_hook_commands, user_claude_dir, HookCmdRewriteAction,
+    HookCmdRewriteReport, LegacySkillAction, LegacySkillReport, MigrationReport,
     MissingTool, ToolSurfaceSnapshot, ToolsRequired, BUILTIN_SUBAGENTS,
 };
 pub use watchdog::{

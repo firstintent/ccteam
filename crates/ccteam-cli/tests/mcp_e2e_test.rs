@@ -25,7 +25,7 @@ struct McpServer {
 
 impl McpServer {
     fn spawn(home: &std::path::Path, projects: &std::path::Path) -> Self {
-        let bin = env!("CARGO_BIN_EXE_ccteam");
+        let bin = env!("CARGO_BIN_EXE_cct");
         let mut child = Command::new(bin)
             .arg("mcp-serve")
             .env("CCTEAM_HOME", home)

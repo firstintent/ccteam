@@ -4,10 +4,10 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "ccteam command-line tool: orchestrator daemon, project management, and hook subcommands."
+description = "cct (ccteam) command-line tool: orchestrator daemon, project management, and hook subcommands."
 
 [[bin]]
-name = "ccteam"
+name = "cct"
 path = "src/main.rs"
 
 [dependencies]

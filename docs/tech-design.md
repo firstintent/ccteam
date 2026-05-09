@@ -137,7 +137,7 @@ session + 每个项目 session)是独立 OS 进程;Rust orchestrator 是另一�
 **为什么用 tmux 长 session 而非每 phase 一个 `claude -p` 子进程？**
 
 - **prompt cache 复用**：Anthropic prompt cache TTL 5 分钟，命中后费用降到约 10%。每 phase 起新子进程意味着重读 CLAUDE.md / spec / 上游产物，反复触发冷启动；同 session 跨 phase 共享缓存，长跑项目（数小时-数天）累计省下大量成本。
-- **可观测性天然解决**：tmux 是终端 UI，用户 `ccteam attach <slug>` 立刻看到 Claude 在做什么；headless 子进程必须靠解析 stream-json 才能知情。
+- **可观测性天然解决**：tmux 是终端 UI，用户 `cct attach <slug>` 立刻看到 Claude 在做什么；headless 子进程必须靠解析 stream-json 才能知情。
 - **可中断 / 可注入**：用户 attach 后直接键入指令纠偏（"等等，先别用 SQLite"），Ctrl+C 中断推理；headless 模式没有这个能力。
 - **detach 即守护**：tmux session 在用户断开后继续运行——这是 tmux 的本质优势，刚好契合"关掉电脑团队继续跑"。
 - **不限制 max_turns / max_budget**：长 session 模式下不再硬封顶（理由见 §6.8）；只保留 stall 检测作为软告警。
@@ -154,7 +154,7 @@ session + 每个项目 session)是独立 OS 进程;Rust orchestrator 是另一�
 
 **写入端**（多种异步入口）：
 - **Telegram bot**：用户发消息 → bot 写文件
-- **`ccteam new "做一个书签管理器"`**：CLI 直接写文件
+- **`cct new "做一个书签管理器"`**：CLI 直接写文件
 - **手动 `echo` / 编辑器**：完全降级路径
 
 **文件格式**：
@@ -254,7 +254,7 @@ TeamSpec.evergreen,**不许**回到 `state.team == META_TEAM_NAME` 字面量
 V0.3 真要 cost 追踪不杀时再定义具体行为)。
 
 `teams/meta-agent.yaml` 是首个 evergreen 范例,V0.2 起作为 shipped seed
-随 binary 发布;`Orchestrator::new` / `ccteam start` / `ccteam doctor
+随 binary 发布;`Orchestrator::new` / `cct start` / `cct doctor
 --reset-shipped-teams` 都会把它写到 `~/.ccteam/teams/meta-agent/team.yaml`。
 
 #### 3.2.2 Team layout + TEAM_SOURCES(V0.2 §5.1 / §5.2)
@@ -415,7 +415,7 @@ test-run phase
 
 #### V0.2 M0.19.3 — PreToolUse 拦截 AskUserQuestion
 
-`AskUserQuestion` 是 LLM 内部同步阻塞,Stop hook 不会触发。bootstrap 写 `<project>/.claude/settings.json` 时配 `PreToolUse` matcher `AskUserQuestion`,跑 `ccteam hook intercept-ask` 返回 `permissionDecision: deny`(reason 指引去 outbox)。LLM 收到 deny 立即改写 outbox。pair 的 prompt-layer 软约束在 team.yaml `golden_rules.protocol.forbid_ask_user_question` —— inject prompt 把 directive 文字写进协议红线段(progress.rs `build_phase_prompt_for_template_with_team`)。
+`AskUserQuestion` 是 LLM 内部同步阻塞,Stop hook 不会触发。bootstrap 写 `<project>/.claude/settings.json` 时配 `PreToolUse` matcher `AskUserQuestion`,跑 `cct hook intercept-ask` 返回 `permissionDecision: deny`(reason 指引去 outbox)。LLM 收到 deny 立即改写 outbox。pair 的 prompt-layer 软约束在 team.yaml `golden_rules.protocol.forbid_ask_user_question` —— inject prompt 把 directive 文字写进协议红线段(progress.rs `build_phase_prompt_for_template_with_team`)。
 
 ### 3.6 三层防御协议（Defense in Depth）
 
@@ -527,7 +527,7 @@ L1 → L2 → L3，不并联。L2 启动前 L1 已通过；L3 启动前 L2 已�
 
 **ccteam 实际改动量**(已 ship,M4.1–M4.4):
 - M4.1 retro phase prompt(纯 markdown)
-- M4.2 `ccteam doctor --install-memory-bridge`(创建 rules 占位文件 + marked section + path frontmatter,**唯一一段 ccteam 代码**)
+- M4.2 `cct doctor --install-memory-bridge`(创建 rules 占位文件 + marked section + path frontmatter,**唯一一段 ccteam 代码**)
 - M4.3 Seed/verdict phase prompt(纯 markdown,含 conversation continuity——M4.6 已折叠进 M4.3)
 - M4.4 容器 bind-mount `~/.claude/` spike(已验证 rules + claude-mem hook 在 `--dangerously-skip-permissions` 容器内可见)
 
@@ -547,8 +547,8 @@ ccteam 全系统 6 类 claude 会出现的位置:
 |---|---|---|---|
 | **L0 Channel Layer** | **不是**(各 channel 适配器进程,无内嵌 LLM,Symphony 反模式禁止) | 适配器进程随用户配置启动 | M2+ stub,大概率复用开源方案 |
 | **L0.5 meta-agent session** | **是**(ccteam-managed 常驻 tmux + claude) | 常驻、永不 terminal | 已 ship(M1) |
-| **L1 编排层**(orchestrator daemon) | 不是(Rust) | 常驻 | ccteam start 后 |
-| **L2 项目级 claude**(每项目一个 tmux session) | 是 | 常驻(长 session,直到 ship/abort) | ccteam new 后 |
+| **L1 编排层**(orchestrator daemon) | 不是(Rust) | 常驻 | cct start 后 |
+| **L2 项目级 claude**(每项目一个 tmux session) | 是 | 常驻(长 session,直到 ship/abort) | cct new 后 |
 | **L3 phase 内 agent team / subagent** | 是(Task 工具启动) | 短命(phase 内,跑完返回总结即销毁) | subagent 已 ship(M2);agent_team 永久 deferred(spike A,docs/v0-1/m2-agent-team-spike.md) |
 | **L4 multi_session 子模块 claude** | 是(每子模块一个完整 session) | 常驻 | 未 ship(M4.8) |
 | **L5 横切短命 claude**(cost-watcher / scope-watcher / drift-detector) | 是 | 短命(Stop hook 触发,跑完即退) | 已 ship(M1) |
@@ -564,33 +564,33 @@ dumb router。这条贯彻到底,避免 Symphony 多层 agent 反模式
 |---|---|---|
 | 生命周期 | 永不 terminal,跟用户 ccteam 实例同寿 | ship / abort 即终态 |
 | 行为模式 | 事件循环(等输入→处理→等输入)| phase DAG(plan-eng → ... → ship) |
-| 主要工具 | `ccteam-control` skill(已 ship,M1.8)/ `ccteam-mcp`(已 ship,M2.8)/ 跨项目 lessons(已 ship,M4 走 `~/.claude/rules/` + auto-memory)| 项目级文件操作 / 内嵌 plugin agents(已 ship,V0.2 M0.20 改走 `enabledPlugins` 写到 `<project>/.claude/settings.json`,Claude Code in-memory plugin pipeline 自动 namespace `<plugin>:<name>`,不再 ln -sf 进 `~/.claude/agents/`) |
+| 主要工具 | `cct-control` skill(已 ship,M1.8)/ `ccteam-mcp`(已 ship,M2.8)/ 跨项目 lessons(已 ship,M4 走 `~/.claude/rules/` + auto-memory)| 项目级文件操作 / 内嵌 plugin agents(已 ship,V0.2 M0.20 改走 `enabledPlugins` 写到 `<project>/.claude/settings.json`,Claude Code in-memory plugin pipeline 自动 namespace `<plugin>:<name>`,不再 ln -sf 进 `~/.claude/agents/`) |
 | context reset | 60% 阈值时桥接 CLAUDE.md(M0.10 已 ship);跨项目记忆通过 `~/.claude/rules/ccteam-lessons-<user>-meta.md` 滚动累积(M4 路径,无独立 conversation-log) | 60% 阈值时把当前 phase 进度写 CLAUDE.md(已 ship,M0.10) |
 | 用户 attach | `tmux attach -t ccteam-meta-<user>`,直接 NL 对话 | `tmux attach -t ccteam-<team>-<slug>`,可介入项目执行 |
 
 #### CLI(已 ship,M0)
 
 ```bash
-ccteam new "做一个本地书签管理器"     # 写 inbox(无 LLM,纯薄壳)
-ccteam ls                              # 查所有项目状态
-ccteam show <slug>                     # 详情
-ccteam progress <slug> --tail          # 实时 tail progress.jsonl
+cct new "做一个本地书签管理器"     # 写 inbox(无 LLM,纯薄壳)
+cct ls                              # 查所有项目状态
+cct show <slug>                     # 详情
+cct progress <slug> --tail          # 实时 tail progress.jsonl
 ccteam answer <slug> "用 PWA"          # 回应 clarify 问题
-ccteam attach <slug> / peek <slug>     # 介入 / 瞄一眼
-ccteam start / stop                    # orchestrator 生命周期
+cct attach <slug> / peek <slug>     # 介入 / 瞄一眼
+cct start / stop                    # orchestrator 生命周期
 ```
 
 **关键约束**:CLI 必须输出 LLM 友好的结构化数据——所有查询命令支持 `--format json`(详见 [interfaces.md §10](./interfaces.md#10-cli-命令签名))。理由:让用户自带 claude 通过 Bash 工具调时不用解析表格。
 
-#### meta-agent session + inbox/outbox 协议 + ccteam-control skill(已 ship,M1)
+#### meta-agent session + inbox/outbox 协议 + cct-control skill(已 ship,M1)
 
 > **架构沿革**:原 M1 把"Telegram bot 实现"列为核心任务。现在
 > Telegram bot **下沉到 Channel Layer(M2+ stub)**;M1 只交付能跑 NL 对话
-> 的最小集合:meta-agent 长会话 + inbox/outbox 文件协议 + ccteam-control
+> 的最小集合:meta-agent 长会话 + inbox/outbox 文件协议 + cct-control
 > skill。
 
 - **meta-agent session**(已 ship,M1.0):ccteam-managed 常驻 tmux session,
-  跑 `claude --dangerously-skip-permissions`,装 `ccteam-control` skill。
+  跑 `claude --dangerously-skip-permissions`,装 `cct-control` skill。
   用户用 `tmux attach -t ccteam-meta-<user>` 在终端 NL 对话,meta-agent
   调 ccteam CLI 派单 / 查项目 / 跨项目召回(详见 development-plan §3 M1)
 - **inbox/outbox 文件协议**(已 ship,M1.1):`<session>/.ccteam/inbox/msg-<n>.md`
@@ -598,9 +598,9 @@ ccteam start / stop                    # orchestrator 生命周期
   inbox,触发 send-keys 注入到对应 session;session 写 outbox,
   Channel Layer(M2+ stub)读 outbox 推到对应 channel。**M1 不实现具体
   channel,只把协议钉死**
-- **ccteam-control skill**(已 ship,M1.8):描述 ccteam CLI 命令清单 +
+- **cct-control skill**(已 ship,M1.8):描述 ccteam CLI 命令清单 +
   典型工作流。**首要 consumer 是 meta-agent session,次要 consumer
-  是用户自己的 daily-driver claude**(详见 [interfaces.md §11](./interfaces.md#11-ccteam-control-skillm1))
+  是用户自己的 daily-driver claude**(详见 [interfaces.md §11](./interfaces.md#11-cct-control-skillm1))
 - **CLARIFY 多轮**(推至 channel 层):channel 层落地后再设计;当前用
   "tmux attach 直接对话"覆盖
 
@@ -630,13 +630,13 @@ ccteam start / stop                    # orchestrator 生命周期
    session,channel 是 dumb router
 
 **用户自带 daily-driver claude 仍然有用**:用户在自己电脑前已经开了一
-个 claude 处理别的事,装 `ccteam-control` skill 后随时可调度 ccteam,
+个 claude 处理别的事,装 `cct-control` skill 后随时可调度 ccteam,
 这条**作为辅助路径保留**,但不是 ccteam 的核心入口。核心入口是
 meta-agent session + Channel Layer。
 
 #### Web 仪表盘——不在主线
 
-曾考虑过 M2 Web 仪表盘。**剥离主线**——`ccteam ls --format json` + 用户自带 claude 的对话能力已覆盖"用人话汇报"需求。Web 仪表盘永远在 backlog,不进里程碑(参见 §11 / development-plan §2.2)。
+曾考虑过 M2 Web 仪表盘。**剥离主线**——`cct ls --format json` + 用户自带 claude 的对话能力已覆盖"用人话汇报"需求。Web 仪表盘永远在 backlog,不进里程碑(参见 §11 / development-plan §2.2)。
 
 #### 前端层(可插拔)
 
@@ -665,7 +665,7 @@ ccteam 核心(orchestrator + tmux + hooks)是 **headless 状态引擎**——所
 +----------------------------------------------------------+
 ```
 
-**Warp / iTerm2 / Alacritty 等本地终端 = 用户终端选择,不是 ccteam 集成对象**。`ccteam attach <slug>` 在任何 tmux 兼容终端里行为完全一致——ccteam 透明兼容,无需特殊适配。用户偏好哪个终端就用哪个,与 ccteam 无关。
+**Warp / iTerm2 / Alacritty 等本地终端 = 用户终端选择,不是 ccteam 集成对象**。`cct attach <slug>` 在任何 tmux 兼容终端里行为完全一致——ccteam 透明兼容,无需特殊适配。用户偏好哪个终端就用哪个,与 ccteam 无关。
 
 **前端档位**:
 
@@ -679,7 +679,7 @@ ccteam 核心(orchestrator + tmux + hooks)是 **headless 状态引擎**——所
 
 任何前端(CLI / TUI / web dashboard)**不得**在 ccteam 内引入新 LLM 层。
 
-- ✅ web dashboard 通过 xterm.js + WebSocket 桥**直通到 tmux 内的项目级 claude**——等价于"远程版 `ccteam attach`"。用户在浏览器键入 = 通过 send-keys 注入 tmux,不经任何 ccteam 中介 LLM
+- ✅ web dashboard 通过 xterm.js + WebSocket 桥**直通到 tmux 内的项目级 claude**——等价于"远程版 `cct attach`"。用户在浏览器键入 = 通过 send-keys 注入 tmux,不经任何 ccteam 中介 LLM
 - ✅ web 介入触发 `PreToolUse` hook 检测 user_attach,自动暂停 phase(与本地 attach 语义一致)
 - ❌ 不在 ccteam 层起 meta-claude / 自实现聊天 UI / 翻译用户 prompt(已被否决的 `ccteam chat` 路径复活)
 
@@ -733,14 +733,14 @@ notify_mode: normal               # quiet / normal / verbose
 `quiet` 模式只放行 `cost_overrun` + `daemon_down`(钱 / 守护死必报);
 `verbose` 不去重,每次扫描都重发 `needs_attention`。
 
-**触发**(M0.21):**手动**——meta-agent 自己跑 `ccteam watchdog scan` 这条命令。
+**触发**(M0.21):**手动**——meta-agent 自己跑 `cct watchdog scan` 这条命令。
 M2+ channel layer 上线后会有 cron-style 自动触发(60s 默认推荐;
 当前 milestone 不实现自动 timer)。
 
 **实施要点**:
 - 全部代码在 `crates/ccteam-core/src/watchdog.rs`(单文件,~600 行)
 - `crates/ccteam-cli/src/main.rs::Command::Watchdog::Scan` 暴露 CLI:
-  `ccteam watchdog scan [--push --user <handle>]`
+  `cct watchdog scan [--push --user <handle>]`
 - meta-agent role prompt(§3.8 引用)新增 §7 描述 watchdog 角色边界
 - `crates/ccteam-core/src/orchestrator.rs` **零** watchdog 引用
   (grep `watchdog` 命中 0 次是核心红线)
@@ -835,7 +835,7 @@ if running_count < config.max_concurrent_projects:
 | fix-cycle 撞 3 次顶 | escalate，附三次诊断 + capture-pane 快照 |
 | Seed REJECT | 终态，归档 + 通知 |
 | explicit `ESCALATE: ...` 输出 / escalation.md | 终态，转发给用户 |
-| 用户 attach 中手动介入 | 自动暂停 phase 推进，等 detach 或 `ccteam resume <slug>` |
+| 用户 attach 中手动介入 | 自动暂停 phase 推进，等 detach 或 `cct resume <slug>` |
 
 ---
 
@@ -922,12 +922,12 @@ fi
 #### 用户介入
 
 ```bash
-ccteam attach <slug>     # = tmux attach -t ccteam-<team>-<slug>
+cct attach <slug>     # = tmux attach -t ccteam-<team>-<slug>
 # 用户键入文本 → claude 当作 prompt 接收
 # Ctrl+B D 离开（claude 继续跑）
 ```
 
-orchestrator 通过 `PreToolUse` hook 检测最近一次输入源：若来自人（vs. 来自 send-keys 时盖的 marker），自动暂停 phase 推进，等 `ccteam resume <slug>` 或用户 detach 超过 N 分钟（视为放权）。
+orchestrator 通过 `PreToolUse` hook 检测最近一次输入源：若来自人（vs. 来自 send-keys 时盖的 marker），自动暂停 phase 推进，等 `cct resume <slug>` 或用户 detach 超过 N 分钟（视为放权）。
 
 #### 关键约束
 
@@ -945,7 +945,7 @@ orchestrator 通过 `PreToolUse` hook 检测最近一次输入源：若来自人
 
 **为什么 hooks 是 ccteam 可观测性命脉**:Claude Code hooks 是 deterministic 的(详见 claude-code-best-practices §4.5)——同一事件触发同一脚本,这是把"AI 的随机推理"转成"系统可处理的事件流"的桥。ccteam 把所有 phase 边界 / 工具调用 / 退出信号都通过 hooks 落到 progress.jsonl,orchestrator 据此做状态转移,完全不解析 tmux 终端文本。
 
-**实现形态**:hook 实现是 `ccteam hook <name>` 子命令(如 `ccteam hook progress-append` / `ccteam hook parse-phase-end` / `ccteam hook cost-accumulate`)——单 binary 分发,与 orchestrator 共享同一份 serde schema(progress.jsonl 事件定义、state.json 字段),不再依赖独立 bash / python 脚本运行时。official plugin 自带的 hook(如 `security_reminder_hook.py`)通过 shell shim 包装挂上,不直接依赖。
+**实现形态**:hook 实现是 `cct hook <name>` 子命令(如 `cct hook progress-append` / `cct hook parse-phase-end` / `cct hook cost-accumulate`)——单 binary 分发,与 orchestrator 共享同一份 serde schema(progress.jsonl 事件定义、state.json 字段),不再依赖独立 bash / python 脚本运行时。official plugin 自带的 hook(如 `security_reminder_hook.py`)通过 shell shim 包装挂上,不直接依赖。
 
 **Hook 写作纪律**(实现 PR 必须遵守):
 - append 类必须 `async: true`——别拖慢主流程
@@ -1042,7 +1042,7 @@ agent（本节）= 在 phase 内或后台**并行**跑的 multi-agent；sub-skil
 
 完整 tool schema 与协议见 [interfaces.md §12](./interfaces.md#12-ccteam-mcp-mcp-server-m2)。**M0 / M1 走 CLI `--format json` 兜底路径**——用户的 claude 用 Bash 工具调即可;M2 后 MCP 路径作为首选,CLI 仍然保留作为脚本化入口。
 
-**实现形态**:`ccteam-mcp` 与 `ccteam-core` 同 crate(workspace 内 lib + 多 binary),通过 `ccteam mcp-serve` 子命令暴露——读写同一份 state.json / progress.jsonl,**为将来 `ccteam tui`(未 ship,M4.9) / `ccteam serve` web 前端(backlog)预留同一状态读写 API**。三种前端共用 `ccteam-core` lib API(详见 §3.8 前端层小节),MCP 只是把这套 API 套上 MCP wire protocol 给外部 LLM 消费。
+**实现形态**:`ccteam-mcp` 与 `ccteam-core` 同 crate(workspace 内 lib + 多 binary),通过 `cct mcp-serve` 子命令暴露——读写同一份 state.json / progress.jsonl,**为将来 `ccteam tui`(未 ship,M4.9) / `ccteam serve` web 前端(backlog)预留同一状态读写 API**。三种前端共用 `ccteam-core` lib API(详见 §3.8 前端层小节),MCP 只是把这套 API 套上 MCP wire protocol 给外部 LLM 消费。
 
 #### Plugin pipeline(V0.2 M0.20,候选 7)
 
@@ -1119,22 +1119,22 @@ ccteam 出两个 skill:
 
 用户在自己的 Claude Code 里手动喊 `/ccteam-implement` 等,跑单 phase——作为不起 daemon 的 fallback。product-research team 的 phase 序列(`01-kickoff` / `02-market-survey` / `03-differentiation-analysis` / `04-value-proposition` / `05-feasibility` / `06-verdict`)走 `phases-product-research/` 子目录。
 
-#### `ccteam-control`(已 ship,M1+,用户自带 claude 调度 ccteam 的入口)
+#### `cct-control`(已 ship,M1+,用户自带 claude 调度 ccteam 的入口)
 
 ```
-~/.claude/skills/ccteam-control/
+~/.claude/skills/cct-control/
 └── SKILL.md           # CLI 命令清单 + 典型工作流 + 何时 attach vs peek
 ```
 
 **用途**:用户在任意目录开 `claude` → skill 自动激活 → claude 知道:
-- 怎么调 `ccteam ls --format json` 看跨项目状态
-- 怎么调 `ccteam new "..."` 立项(并先多轮澄清)
-- 卡住时综合 `ccteam peek <slug>` + `ccteam progress <slug> --tail` 给用户一句可贴的纠偏 prompt
-- 何时该建议用户 `ccteam attach`(自己介入)vs `ccteam pause`(暂停后再决定)
+- 怎么调 `cct ls --format json` 看跨项目状态
+- 怎么调 `cct new "..."` 立项(并先多轮澄清)
+- 卡住时综合 `cct peek <slug>` + `cct progress <slug> --tail` 给用户一句可贴的纠偏 prompt
+- 何时该建议用户 `cct attach`(自己介入)vs `cct pause`(暂停后再决定)
 
 这是 §3.8"用户自带 claude 当入口"路径的实现。M2 已上 ccteam-mcp MCP server(§6.4),skill 仍保留作为发现 / 引导层。
 
-完整 SKILL.md 内容契约见 [interfaces.md §11](./interfaces.md#11-ccteam-control-skillm1)。
+完整 SKILL.md 内容契约见 [interfaces.md §11](./interfaces.md#11-cct-control-skillm1)。
 
 ### 6.8 透明度与可观测性
 
@@ -1142,7 +1142,7 @@ ccteam 长跑场景下"看不到 AI 在干什么"是首要担忧。三层透明�
 
 #### 第一层：tmux session（给人看，零延迟）
 
-`ccteam attach <slug>` 立即看到完整 claude 交互界面：
+`cct attach <slug>` 立即看到完整 claude 交互界面：
 - 当前 thinking
 - 上一次 tool call 的输入与结果
 - 文件 diff
@@ -1170,7 +1170,7 @@ orchestrator 监听 progress.jsonl 最新事件时间戳：
 | 静默时长 | 动作 |
 |---|---|
 | < 5 min | 正常（推理 / 长 Bash / 网络等待） |
-| 5–15 min | 第一次软告警："项目 X 看起来卡了，要不要 `ccteam attach`？" |
+| 5–15 min | 第一次软告警："项目 X 看起来卡了，要不要 `cct attach`？" |
 | 15–30 min | 标记 `suspicious`，但**仍不 kill**；告警升级 |
 | > 30 min | 升级为 escalation，由用户决定 |
 
@@ -1187,7 +1187,7 @@ orchestrator 监听 progress.jsonl 最新事件时间戳：
 | 项目累计 $50 | 再次软告警 + 触发 retro 评估 |
 | 项目累计 $200 | 物理上限，kill + escalate |
 
-阈值都在 `~/.ccteam/config.yml` 里可调；CLI `ccteam show <slug>` 可实时查询。
+阈值都在 `~/.ccteam/config.yml` 里可调；CLI `cct show <slug>` 可实时查询。
 
 #### Daemon 健康监督（M0.23.1)
 
@@ -1195,7 +1195,7 @@ orchestrator 是**所有 phase 派发 + inbox 派送**的单点 — daemon 死�
 
 | 文件 | 谁写 | 谁读 | 语义 |
 |---|---|---|---|
-| `~/.ccteam/state/orchestrator.pid` | daemon 启动时写 | `ccteam stop` | PID(已有,M1.5) |
+| `~/.ccteam/state/orchestrator.pid` | daemon 启动时写 | `cct stop` | PID(已有,M1.5) |
 | `~/.ccteam/state/orchestrator.heartbeat` | daemon 每 30s 写 | MCP 入口 / meta-agent skill | mtime 是 liveness 唯一来源 |
 
 **判定**:`now - mtime ≤ 60s` → healthy;否则 stale(grace 是 2× heartbeat 间隔,容忍单次 GC pause / 阻塞 IO)。文件不存在 → no_heartbeat(daemon 未启动)。
@@ -1345,13 +1345,13 @@ meta-agent ───────────►  CLI/factory ──────�
   (skill)                              ~/.config/ccteam/teams/<name>/
 ```
 
-1. **Interview** — 元 agent 跑 `ccteam-team-author` skill,跟用户对话收集 metadata(name / description / author)+ phase 列表 + tools + golden_rules + retro_schema + verdict_schema。一次一题,默认值能用就用。
-2. **Init** — `ccteam team init <name>` 落 staging 树到 `~/.config/ccteam/teams/<name>/`,内含:
+1. **Interview** — 元 agent 跑 `cct-team-author` skill,跟用户对话收集 metadata(name / description / author)+ phase 列表 + tools + golden_rules + retro_schema + verdict_schema。一次一题,默认值能用就用。
+2. **Init** — `cct team init <name>` 落 staging 树到 `~/.config/ccteam/teams/<name>/`,内含:
    - `.claude-plugin/plugin.json`(Claude Code plugin manifest 严格 schema:`name` / `description` / `author`)
-   - `team.yaml`(ccteam team 配置,作为 plugin 顶级 unknown 字段;zod 默认 strip,plugin pipeline 加载时忽略)
+   - `team.yaml`(cct team 配置,作为 plugin 顶级 unknown 字段;zod 默认 strip,plugin pipeline 加载时忽略)
    - `phases/<NN>-<phase>.md`(frontmatter + 正文领域模板;**正文不写 `PHASE_DONE:` / `ESCALATE:`**——M0.18 D 方案,协议关键字仅由 orchestrator inject prompt 注入)
    - `README.md`
-3. **Publish** — `ccteam team publish <name> --target {local|github}`:
+3. **Publish** — `cct team publish <name> --target {local|github}`:
    - `local`:软链 staging 到 `~/.claude/plugins/marketplaces/ccteam-local/plugins/<name>/`,产出 directory-source 标识 `<name>@ccteam-local`(用户 `claude /plugin enable` 启用)
    - `github`:`gh repo create` + push,产出 GitHub URL(用户 `claude /plugin add <owner>/<repo>` 拉取)
 
@@ -1376,7 +1376,7 @@ meta-agent ───────────►  CLI/factory ──────�
 
 - `crates/ccteam-core/src/team_factory.rs` — `init_team_staging` / `publish_team` / `validate_staged_team` 主路径;`PluginManifest` / `PhaseScaffold` / `PublishTarget` 数据类型。
 - `crates/ccteam-core/src/templates/ccteam_team_author_skill.md` — meta-agent 用的 dialogue skill。
-- `crates/ccteam-cli/src/team_factory_cli.rs` — `ccteam team init` / `ccteam team publish` CLI 包装。
+- `crates/ccteam-cli/src/team_factory_cli.rs` — `cct team init` / `cct team publish` CLI 包装。
 - `crates/ccteam-cli/src/commands.rs` — `--validate-team` 加 plugin manifest 段。
 - `docs/v0-2/team-factory-userguide.md` — 用户实操指引。
 
