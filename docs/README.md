@@ -22,7 +22,9 @@
 |---|---|---|
 | **V0.1** | [`v0-1/README.md`](v0-1/README.md) | 已 ship(M0-M4.4)。历史归档 |
 | **V0.2** | [`v0-2/README.md`](v0-2/README.md) | 已 ship(M0.16-M0.23)。历史归档 |
-| V0.3 | (未启动) | 候选方向见 `v0-2/README.md` "V0.3 deferred" 段 |
+| **V0.2.1** | (并入 `v0-2/`)| 已 ship(F26-F33 dust patch),docs 折在 `v0-2/e2e-retro.md §6` |
+| **V0.2.2** | [`v0-2-2/README.md`](v0-2-2/README.md) | 已 ship(F34-F40 + 配套 3 项,7 PR;首例 patch 独立目录)|
+| V0.3 | (未启动) | 候选方向见 `v0-2/README.md` "V0.3 deferred" 段 + `v0-2-2/prd.md §11` |
 
 ## 文档维护规约
 
@@ -36,8 +38,13 @@
 
 **禁忌**:
 - 不再维护"全局 development-plan.md"(已归档 V0.1,V0.2 起每版本独立 dev-plan)
-- 不在根目录囤"未来版本意图"(V0.3 候选放 v0-2/README.md 末尾,V0.3 启动时迁到 v0-3/prd.md)
+- 不在根目录囤"未来版本意图"(V0.3 候选放 `v0-2/README.md` 末尾,V0.3 启动时迁到 `v0-3/prd.md`)
 - 不在版本归档目录里改跨版本 SoT(双 source 对齐难)
+
+**Patch 版本目录约定(V0.2.2 起)**:
+- **小 patch**(< 4 finding,纯 dust 修):docs 折在 `v0-<minor>/e2e-retro.md §<patch>` 段,**不独立目录**(参考 V0.2.1)
+- **大 patch**(≥ 4 finding,含逻辑变更 / 新机制):**单独目录** `v0-<minor>-<patch>/`,内含 `prd.md` + `dev-plan.md` + 可选 `feedback.md` / `e2e-retro.md`(参考 V0.2.2)
+- 大 patch 目录独立维护,跟 minor 版本归档同等地位
 
 **新增 V0.3 时的步骤**:
 1. `mkdir docs/v0-3/`

@@ -5,17 +5,18 @@
 
 ---
 
-## 一、当前状态(2026-05-08)
+## 一、当前状态(2026-05-09)
 
 | 项 | 值 |
 |---|---|
 | 仓库根 | `~/workplace/agents/ccteam` |
-| 主分支 main HEAD | **以 `git rev-parse origin/main` 为准**(V0.2 ship 后 docs 整理) |
-| 测试 baseline | **497 全绿**(`cargo test --workspace`) |
+| 主分支 main HEAD | **以 `git rev-parse origin/main` 为准**(V0.2.2 ship 后) |
+| Workspace version | **`0.2.2`**(V0.2.2 起跟版同步;V0.1/V0.2 ship 时 `0.0.1` 未跟,V0.2.2 retroactive 修正)|
+| 测试 baseline | **628 全绿**(`cargo test --workspace`)|
 | Clippy | 4 pre-existing errors(非本仓引入,sweep 时确认相同基线) |
-| 代码规模 | ~10 kLOC across `ccteam-core` / `ccteam-cli` / `ccteam-hooks` |
-| 已 ship 里程碑 | **V0.1**:M0 / M0.5 / M1 / M2 / M2.3 / M3 / M4.1-M4.4 — 详 `docs/v0-1/README.md`<br>**V0.2**:M0.16-M0.23(8 个 milestone:反模式清理 / 团队布局 + plugin 模型 / phase prompt 协议外移 / 自循环 + AskUserQuestion 拦截 / plugin pipeline / daemon supervision / watchdog / team factory)— 详 `docs/v0-2/README.md` |
-| 当前 next | V0.3 候选方向待定,deferred 项见 `docs/v0-2/README.md` 末尾 |
+| 代码规模 | ~12 kLOC across `ccteam-core` / `ccteam-cli` / `ccteam-hooks` |
+| 已 ship 里程碑 | **V0.1**:M0 / M0.5 / M1 / M2 / M2.3 / M3 / M4.1-M4.4 — 详 `docs/v0-1/README.md`<br>**V0.2**:M0.16-M0.23(8 个 milestone:反模式清理 / 团队布局 + plugin 模型 / phase prompt 协议外移 / 自循环 + AskUserQuestion 拦截 / plugin pipeline / daemon supervision / watchdog / team factory)— 详 `docs/v0-2/README.md`<br>**V0.2.2**:F34-F40(7 finding 跨 7 PR:cct convention sweep / slug 4-tier + 决策树加固 / silence classifier / subagent guard / 截图 PNG / team alias)— 详 `docs/v0-2-2/README.md` |
+| 当前 next | V0.3 候选方向待定,deferred 项见 `docs/v0-2/README.md` 末尾 + `docs/v0-2-2/prd.md §11` |
 | 永久 deferred | M2.2 agent_team enablement(spike A,Claude Code 无 first-class CLI surface — 见 `docs/v0-1/m2-agent-team-spike.md`)|
 
 **ccteam 是 Claude Code 之上的元工具,不是独立 AI 系统**:每个项目一个 Claude Code 长 session(tmux 守护,hooks 上报,MCP 接外部);Rust orchestrator 编排(binary 名 `cct`,F39 起);用户通过 meta-agent(常驻 ccteam-managed claude session)+ `cct-control` skill / `ccteam` MCP server(`mcp__ccteam__*` 命名空间)用自然语言对话操作。详见 `docs/tech-design.md` §2.1 三层架构。

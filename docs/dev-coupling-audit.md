@@ -28,7 +28,8 @@
 抽象 + M4 跨项目记忆批量关闭;**2026-05-07 fix_loop → auto_loop rename batch**:
 F1/F5/F6/F7/F8/F18 由独立 PR 一波关闭;**2026-05-08 V0.2 M0.23**:加 F24 + F25
 P0 + 同 PR 关闭;**2026-05-08 V0.2 e2e retro**:加 F26-F33 八条 V0.2.1 候选;
-**2026-05-08 V0.2.1 patch**:F26-F33 全部修复),分布:
+**2026-05-08 V0.2.1 patch**:F26-F33 全部修复;
+**2026-05-09 V0.2.2 patch**:加 F34-F40 七条用户反馈 + 命名 sweep + UX 增强,跨 7 PR 全部修复),分布:
 
 | 优先级 | 数量 | 编号 |
 |---|---|---|
@@ -36,7 +37,7 @@ P0 + 同 PR 关闭;**2026-05-08 V0.2 e2e retro**:加 F26-F33 八条 V0.2.1 候�
 | **P1 该做但可后置(剩余)** | 2 | F15(M1+ block-push 时做)、F23(conditional;待 spike 重跑) |
 | **P2 边角(剩余)** | 1 | F17 |
 | **N/A 已是领域无关** | 2 | F14, F19(M3 docs sweep 后)|
-| **已修复** | 28 | F1 / F5 / F6 / F7 / F18(2026-05-07 rename PR;F1 触发逻辑实际早 M3.1 已切到 template.auto_loop,本 PR 完成命名层 sweep)、F2 / F3 / F4(M3.1 dag.rs)、F8(2026-05-07 directory scan)、F9 / F10 / F11(M3.4 team-aware bootstrap;F11 dev 仍裸 `phases/` 但非阻塞)、F12 / F13(M3.3 `--team` CLI + `state.team`)、F16(M3.4 phase 模板 team 化)、F20(M3.1+M3.4 retro_schema 数据形式 + product-research 填字段 + M4.1 phase 消费)、F21(@a5fb21d)、F22(PR #12)、**F24 / F25(2026-05-08 M0.23 PR)**、**F26 / F27 / F28 / F29 / F30 / F31 / F32 / F33(2026-05-08 V0.2.1 patch)** |
+| **已修复** | 35 | F1 / F5 / F6 / F7 / F18(2026-05-07 rename PR;F1 触发逻辑实际早 M3.1 已切到 template.auto_loop,本 PR 完成命名层 sweep)、F2 / F3 / F4(M3.1 dag.rs)、F8(2026-05-07 directory scan)、F9 / F10 / F11(M3.4 team-aware bootstrap;F11 dev 仍裸 `phases/` 但非阻塞)、F12 / F13(M3.3 `--team` CLI + `state.team`)、F16(M3.4 phase 模板 team 化)、F20(M3.1+M3.4 retro_schema 数据形式 + product-research 填字段 + M4.1 phase 消费)、F21(@a5fb21d)、F22(PR #12)、**F24 / F25(2026-05-08 M0.23 PR)**、**F26 / F27 / F28 / F29 / F30 / F31 / F32 / F33(2026-05-08 V0.2.1 patch)**、**F34 / F35 / F36 / F37 / F38 / F39 / F40(2026-05-09 V0.2.2 patch — 7 finding 跨 7 PR)** |
 
 ### V0.2 §6 反模式候选状态(docs/v0-2/prd.md)
 
@@ -671,6 +672,60 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
 - **优先级**:**P2**(cosmetic;不影响代码)。
 - **来源**:V0.2 e2e Suite A / `docs/v0-2/e2e-retro.md`。
 - **2026-05-08 已修复(V0.2.1 PR)**:`docs/v0-2/dev-plan.md §9` M0.23.1 路径段更新为 `~/.ccteam/state/orchestrator.{pid,heartbeat}`,与 tech-design §6.8 / 实际代码对齐。
+
+### F34 — slug 命名失控(算法 + 接口缺位;2026-05-09 加;**已修复:2026-05-09(V0.2.2 PR #2)**)
+
+- **文件:行号**:`crates/ccteam-core/src/projects.rs::pick_unused_slug` 字符级 slugify(40-char cap,无 token / 语义层裁剪);`crates/ccteam-cli/src/main.rs::Commands::New` 缺 `--slug` 接口
+- **现状**:brief 整段 slugify 撞死冗长 slug(`dev-ccteam-ui-ccteam-1-2-session-subagent-3` ≠ 用户原话 `ccteam-ui`);meta-agent 派单前不确认项目名,用户后悔无路(slug 重命名不支持)。
+- **是否真 dev-specific**:**否——通用 UX 缺陷**。
+- **解耦方案**:四层调用栈 — Tier 1 `cct new --slug X`(B2 prefix 自动加 team-)/ Tier 2 `cct-project-creator` skill(meta-agent 调,带 AskUserQuestion 结构化选项)/ Tier 3 `claude -p haiku` 智能 fallback(15s timeout,Y/n 确认 / `--no-auto-slug` env 控)/ Tier 4 deterministic `slugify_brief()`(token-aware + stop-word + dedup + 取前 3 token)。
+- **优先级**:**P1**(用户日常摩擦点)。
+- **来源**:2026-05-08 用户实战反馈 issue #1+#2(`docs/v0-2-2/feedback.md` / `docs/v0-2-2/prd.md §3`)。
+
+### F35 — auto-loop 过度依赖 Stop event(2026-05-09 加;**已修复:2026-05-09(V0.2.2 PR #3 silence classifier)**)
+
+- **文件:行号**:`crates/ccteam-core/src/auto_loop.rs::decide` 输入仅 `last_assistant_text`(只在 Stop hook 触发时跑);`progress.jsonl` 末事件 ≠ Stop 时(API tool-call hang / send-keys 路由错)永不触发。
+- **现状**:DeepSeek API 调用未返回 → mid-tool-call hang → 无 Stop → auto-loop 停在 iteration 1 永不重试;`/btw` 注入 `phase_inject` 后无任何后续 event(F36 case)同样卡死。
+- **是否真 dev-specific**:**否——控制平面盲区**。
+- **解耦方案**:`silence_classifier.rs` 7-class deterministic classifier(Healthy/Terminal/SubagentBusy/SubagentRunaway/MidToolHung/PostStopLimbo/InjectLimbo)按 progress.jsonl 末事件语义 × 静默时长分类;limbo 类 deterministic re-inject 1 次(`MAX_LIMBO_RETRY = 1`,`limbo-retry-count.json` 记账,phase 推进 reset);hung 类 enriched outbox(`needs_attention.outbox.json` 加 `ccteam_classification` / `ccteam_silent_seconds` / `ccteam_last_event` / `ccteam_pane_tail`);meta-agent 走 propose-confirm NL 翻译,**不 autonomous decide**(红线"smart layer 只 translation 不 decision")。`capture_pane_tail` 提到 `ccteam-core::tmux` 共享,F38 同帮手字段 `with_ansi: bool`。
+- **优先级**:**P0** ship-blocker(实际 bug,V0.1/V0.2 用户已撞)。
+- **来源**:2026-05-08 用户实战反馈 issue #3+#5(`docs/v0-2-2/feedback.md` / `docs/v0-2-2/prd.md §4`)。
+
+### F36 — send-keys 注入到活跃 subagent(2026-05-09 加;**已修复:2026-05-09(V0.2.2 PR #4 subagent guard)**)
+
+- **文件:行号**:`crates/ccteam-core/src/orchestrator.rs::dispatch_phase_with_state` 注入前不感知 subagent 状态(`PreToolUse(tool=Task)` 未配 `SubagentStop`),tmux send-keys 落到 subagent 上下文。
+- **现状**:`/btw` 注入 `test-author` prompt 时 `code-reviewer` subagent 仍活跃,prompt 被 subagent 接收(无工具权限,无法执行);主 agent 永不收到,无 Stop → auto-loop 卡死。
+- **是否真 dev-specific**:**否——控制平面盲区**。
+- **解耦方案**:`progress::subagent_active(events)` pure deterministic helper(扫末尾事件序列,counting `PreToolUse(Task)` − `SubagentStop` 配对窗口);dispatch 前 guard:active → `<project>/.ccteam/pending-inject.json` 落盘 defer + 不发 send-keys;daemon tick 在 `SubagentStop` event 后 drain pending(再 guard 防 race);`max_defer_minutes`(默认 10)兜底,超时 → 走 F35 enriched outbox(classification = `inject_defer_timeout`)+ 删 pending。F35 InjectLimbo 是 race 漏接的兜底层(`attempt_limbo_reinject` 见 pending exists 则跳过,避免烧 retry quota)。
+- **优先级**:**P0** ship-blocker(实际 bug,V0.1/V0.2 用户已撞)。
+- **来源**:2026-05-08 用户实战反馈 issue #4(`docs/v0-2-2/feedback.md` / `docs/v0-2-2/prd.md §5`)。
+
+### F37 — meta-agent 绕开 pipeline 自调研(2026-05-09 加;**已修复:2026-05-09(V0.2.2 PR #2 决策树加固 + cct-project-creator skill)**)
+
+- **文件:行号**:`crates/ccteam-core/src/templates/meta_agent_role.md` §1 决策树边界不严("调研 X" 被错误归入"问答"分支)+ §3 克制规则缺"❌ 不起 Agent subagent 自调研"反例。
+- **现状**:用户要求"调研 Multica",meta-agent 没派 product-research,而是自起 `Agent(subagent_type=general-purpose)` 做 Web 搜索 + 直出结论;product-research 6-phase pipeline(kickoff / research / verdict / next-steps)被绕过,无可审计调研记录。
+- **是否真 dev-specific**:**否——meta-agent 决策树软约束被漂移**。
+- **解耦方案**:`meta_agent_role.md` §1 加 "调研 X = 项目请求" 反例(项目请求段含"调研 / 评估 / 分析 / 看看 X 值不值得");§3 克制规则加 "❌ 不要自起 `Agent(subagent_type=general-purpose)` / 调用 web 搜索做调研" 反例;§2 派单段 inline rules 抽出,改"走 `cct-project-creator` skill"(skill body 接 Phase A/B/C/D — 需求澄清 / slug 推荐 / team 选择 / 派单);F34 + F37 同 PR 落地。
+- **优先级**:**P1**(决策树漂移影响 UX 一致性)。
+- **来源**:2026-05-08 用户实战反馈 issue #6(`docs/v0-2-2/feedback.md` / `docs/v0-2-2/prd.md §6`)。
+
+### F38 — 终端截图 PNG(UX 增强;2026-05-09 加;**已修复:2026-05-09(V0.2.2 PR #5 vt100 + imageproc DIY)**)
+
+- **文件:行号**:无(新功能)。F35 enriched outbox `pane_tail` 是文本维度,`channel adapter` / 用户人眼缺直观视觉维度。
+- **现状**:meta-agent 通知用户项目状态时只能给文本 `pane_tail`(30 行 capture-pane);ANSI 颜色 / progress bar / 框线字符在文本里失真。
+- **是否真 dev-specific**:**否——通用 UX 增强**。
+- **解耦方案**:`tmux capture-pane -e` → `vt100::Parser` cell grid → `imageproc::drawing::{draw_filled_rect_mut, draw_text_mut}`(`ab_glyph` 字体)→ `image` PNG。**纯 Rust 全栈**(vendored JetBrainsMono-Regular.ttf OFL via `include_bytes!`,绕过 font-kit / fontconfig 系统依赖);`ANSI_256` 调色板常量(16 + 216 cube + 24 grayscale);`mcp__ccteam__screenshot(slug, lines?)` MCP 工具(namespace 保留 ccteam,V0.3 评估改名);`cct doctor --screenshot-smoke <slug>` flag;`std::panic::catch_unwind` 兜 vt100 / imageproc 边缘 panic;`CCTEAM_SCREENSHOT_FONT_TTF` env 覆盖字体。F35 enriched outbox 后续可加 `screenshot_path` 字段(本 PR ship MCP 工具 + smoke,outbox 集成留 follow-up)。
+- **优先级**:**P2**(UX 增强,补 F35 视觉维度;非阻塞)。
+- **来源**:用户 2026-05-09 追加(`docs/v0-2-2/prd.md §7`);载体经 5 轮迭代:Pillow → vte+tiny-skia → freeze(Linux 5.15 segfault) → ansee(font-kit deps)→ vt100+imageproc DIY(选定)。
+
+### F39 — `cct` 短前缀约定 sweep(2026-05-09 加;**已修复:2026-05-09(V0.2.2 PR #1 cct convention sweep)**)
+
+- **文件:行号**:`crates/ccteam-cli/Cargo.toml::[[bin]] name = "ccteam"`(老);`crates/ccteam-core/src/templates/{ccteam_control,ccteam_team_author}_skill.md`(老 skill 模板);全 `ccteam <cmd>` 命令字面量(README / docs / phase / role / memory-bridge templates);`crates/ccteam-core/src/templates/settings.json` hook command 老 `ccteam` 路径。
+- **现状**:V0.1/V0.2 ship 时命名前缀都是 `ccteam-`,跟简短 `dev` / `cct-slash` / `ccgram` 等周边工具命名风格不一致;`~/.claude/skills/` listing 三 `ccteam-*` 长字符;命令行 `ccteam new ...` 比 `cct new ...` 多打 4 字符。
+- **是否真 dev-specific**:**否——命名约定**。
+- **解耦方案**:三对象同步重命名:binary `ccteam` → `cct`(`Cargo.toml::[[bin]] name`)+ skill `ccteam-{control,team-author}` → `cct-{control,team-author}` + 顶层 `skills/` 目录(SoT);Rust 常量 + 函数同步(`CCT_*_SKILL_NAME` / `install_cct_*_skill` / `current_cct_bin`);settings.json 占位符 `{{CCT_BIN}}`(doctor 安装时填 `current_exe()`);`cct doctor` 自动迁移 V0.1/V0.2 用户(检测 + 清旧 `~/.claude/skills/ccteam-*/` marker 校验 + rewrite 老 settings.json hook 命令路径,原子写)。**保留**(per PRD §8.3):MCP server name `ccteam`(`mcpServers.ccteam`)+ `~/.config/ccteam/` XDG dir + `~/.ccteam/` 项目根 + crate 名 + git repo + workspace 名。CLAUDE.md §三红线 + §四 Skills 行 + §五 patch 流程 + §六 升级条目同步加。
+- **优先级**:**P3**(cleanup;非阻塞)。
+- **来源**:用户 2026-05-09 追加(`docs/v0-2-2/prd.md §8`);初为 F34 skill 重构子项,后抽出独立 finding(机械 rename 跟逻辑变更解耦,先 merge)。
 
 ### F40 — `product-research` team 名冗长 + 领域名缺位(2026-05-09 加;**已修复:2026-05-09(V0.2.2 PR #6 alias 软迁移)**)
 

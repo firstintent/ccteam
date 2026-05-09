@@ -4,7 +4,9 @@ V0.2.2 是首个**单独目录的 patch 版本**(V0.2.1 折在 `v0-2/e2e-retro.m
 本轮 7 finding(F34-F40)+ 3 配套,7 PR sequencing,实现量超 V0.2.1 dust patch
 量级,docs 单独维护。
 
-base = `origin/main` `170f5a8`(V0.2.1 ship);测试 baseline 511/0。
+**已 ship**(2026-05-09):base 起点 = `origin/main` `170f5a8`(V0.2.1);
+ship 终点 = workspace `0.2.2` 起点(`Cargo.toml::workspace.package.version`);
+测试 baseline 起点 511 / ship 628(+117 测试 across 7 PRs,0 退步)。
 
 ## 文档清单
 
