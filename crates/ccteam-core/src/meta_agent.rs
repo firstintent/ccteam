@@ -224,18 +224,20 @@ mod tests {
     }
 
     #[test]
-    fn render_role_prompt_includes_dev_and_product_research_team_options() {
+    fn render_role_prompt_includes_dev_and_research_team_options() {
         // M3.7: §2 step-2 (team selection) must mention both dev and
-        // product-research so meta-agent's NL dispatch knows the
-        // catalog of options.
+        // research so meta-agent's NL dispatch knows the catalog of
+        // options. V0.2.2 F40: the canonical name is `research`; the
+        // legacy alias `product-research` may still appear in
+        // explanatory prose but is no longer the primary command shape.
         let body = render_meta_role_prompt("rob");
         assert!(
-            body.contains("product-research"),
-            "team selection step must mention product-research",
+            body.contains("research"),
+            "team selection step must mention research",
         );
         assert!(
-            body.contains("--team=dev") && body.contains("--team=product-research"),
-            "dispatch examples must show both teams' command shapes",
+            body.contains("--team=dev") && body.contains("--team=research"),
+            "dispatch examples must show both teams' canonical command shapes",
         );
         // The decision-tree wording from task M3.7 must be present —
         // gives meta-agent NL heuristics for picking dev vs research.

@@ -146,6 +146,12 @@ impl<'a> TeamResolveContext<'a> {
 /// the resolution — they get logged and the loop falls through to
 /// the next source. ENOENT is silent. Returns `Err` only when no
 /// source carried `name`.
+///
+/// V0.2.2 F40 — alias scan: when no source carries a directory named
+/// `name`, walk every team yaml at every source and match by
+/// `spec.aliases`. Lets old projects whose `state.json::team` carries
+/// a legacy name (e.g. `product-research` → `research`) still resolve
+/// against the renamed shipped team.
 pub fn resolve_team(name: &str, ctx: &TeamResolveContext) -> Result<TeamSpec> {
     for source in TEAM_SOURCES {
         match source.try_load(name, ctx) {
@@ -162,9 +168,54 @@ pub fn resolve_team(name: &str, ctx: &TeamResolveContext) -> Result<TeamSpec> {
             }
         }
     }
+    if let Some(spec) = resolve_by_alias(name, ctx) {
+        return Ok(spec);
+    }
     Err(anyhow!(
         "team `{name}` not found in any source (project / user / repo)"
     ))
+}
+
+/// V0.2.2 F40 — second-pass alias resolution. Walks every team yaml
+/// under each source's `teams/` directory and returns the first spec
+/// whose `aliases` list contains `query`. Project source is skipped:
+/// the project layer is a single fixed yaml at
+/// `<project>/.ccteam/team/team.yaml`, which `try_load` already
+/// covered in pass one.
+fn resolve_by_alias(query: &str, ctx: &TeamResolveContext) -> Option<TeamSpec> {
+    for dir in [
+        ctx.user_staging_dir.join("teams"),
+        ctx.global_dir.join("teams"),
+    ] {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let yaml = entry.path().join("team.yaml");
+            if !yaml.exists() {
+                continue;
+            }
+            let spec = match TeamSpec::load(&yaml) {
+                Ok(s) => s,
+                Err(err) => {
+                    tracing::warn!(
+                        path = %yaml.display(),
+                        error = format!("{err:#}"),
+                        "alias scan: skipping unreadable team.yaml",
+                    );
+                    continue;
+                }
+            };
+            if spec.aliases.iter().any(|a| a == query) {
+                return Some(spec);
+            }
+        }
+    }
+    None
 }
 
 /// Enumerate the distinct team names discoverable across User + Repo
@@ -403,6 +454,70 @@ mod tests {
         assert!(written.starts_with(&user));
         let reloaded = TeamSpec::load(&written).unwrap();
         assert_eq!(reloaded.description, "saved via resolver");
+    }
+
+    // V0.2.2 F40 — alias scan path. The renamed `research` team's
+    // yaml lists `aliases: [product-research]`; old projects whose
+    // state.json::team still points to `product-research` must
+    // resolve through the second-pass alias scan when no
+    // `teams/product-research/team.yaml` lives on disk anymore.
+
+    #[test]
+    fn resolve_team_falls_through_to_alias_scan_when_no_directory_match() {
+        let tmp = TempDir::new().unwrap();
+        let global = tmp.path().join("ccteam-home");
+        let user = tmp.path().join("user");
+        write_yaml(
+            &global.join("teams").join("research").join("team.yaml"),
+            "name: research\naliases: [product-research]\n",
+        );
+        let ctx = ctx_for(&global, &user);
+        // Direct hit on canonical name.
+        let canonical = resolve_team("research", &ctx).unwrap();
+        assert_eq!(canonical.name, "research");
+        // Alias hit via the second-pass scan.
+        let via_alias = resolve_team("product-research", &ctx).unwrap();
+        assert_eq!(via_alias.name, "research");
+        assert_eq!(via_alias.aliases, vec!["product-research".to_string()]);
+    }
+
+    #[test]
+    fn resolve_team_alias_scan_ignores_unrelated_teams() {
+        // Two teams on disk; only one declares the alias the caller
+        // asks for. Make sure the scan returns the right one and
+        // doesn't fall through to a sibling.
+        let tmp = TempDir::new().unwrap();
+        let global = tmp.path().join("ccteam-home");
+        let user = tmp.path().join("user");
+        write_yaml(
+            &global.join("teams").join("dev").join("team.yaml"),
+            "name: dev\n",
+        );
+        write_yaml(
+            &global.join("teams").join("research").join("team.yaml"),
+            "name: research\naliases: [product-research]\n",
+        );
+        let ctx = ctx_for(&global, &user);
+        let spec = resolve_team("product-research", &ctx).unwrap();
+        assert_eq!(spec.name, "research");
+    }
+
+    #[test]
+    fn resolve_team_unknown_alias_still_errors() {
+        // A name that's not on disk and not in any aliases list must
+        // still fail with the helpful "not found in any source" message.
+        let tmp = TempDir::new().unwrap();
+        let global = tmp.path().join("ccteam-home");
+        let user = tmp.path().join("user");
+        write_yaml(
+            &global.join("teams").join("research").join("team.yaml"),
+            "name: research\naliases: [product-research]\n",
+        );
+        let ctx = ctx_for(&global, &user);
+        let err = resolve_team("nonexistent-team", &ctx).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("nonexistent-team"));
+        assert!(msg.contains("project / user / repo"));
     }
 
     #[test]

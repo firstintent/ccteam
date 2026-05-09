@@ -1,11 +1,17 @@
-//! M3.5 product-research E2E (mock claude / state-machine drive).
+//! M3.5 research E2E (mock claude / state-machine drive).
 //!
-//! M3 唯一验收: `ccteam new --team=product-research "AI 菜谱生成器"` runs
+//! M3 唯一验收: `cct new --team=research "AI 菜谱生成器"` runs
 //! through the 6-phase pipeline → verdict=REJECT, produces verdict.md /
 //! rationale.md / next-steps.md; progress.jsonl includes ≥1
 //! decision_mode=async outbox + ≥1 team-specific ESCALATE prefix +
-//! ≥1 PHASE_DONE_PENDING; `ccteam decisions` sees the project's
+//! ≥1 PHASE_DONE_PENDING; `cct decisions` sees the project's
 //! pending decisions.
+//!
+//! V0.2.2 F40 — team renamed from `product-research` to `research`
+//! (canonical). The legacy `product-research` name remains a valid
+//! alias for old projects (state.json::team unchanged). See
+//! `bootstrap_with_legacy_alias_product_research_resolves` below for
+//! the alias resolution check.
 //!
 //! These tests drive the orchestrator state machine directly via
 //! `decide_tick_from_events` (no real claude). The point is to pin
@@ -42,7 +48,25 @@ fn fresh_paths(tmp: &TempDir) -> CcteamPaths {
     }
 }
 
-fn setup_product_research(
+fn setup_research(
+    paths: &CcteamPaths,
+    brief: &str,
+) -> (String, Orchestrator) {
+    isolation();
+    write_all_global_team_templates(&paths.root, false).unwrap();
+    let slug = pick_unused_slug(paths, brief, "research").unwrap();
+    bootstrap_project(paths, &slug, brief, "research").unwrap();
+    let orch =
+        Orchestrator::new(paths.clone(), OrchestratorConfig::default()).unwrap();
+    (slug, orch)
+}
+
+/// V0.2.2 F40 — legacy alias setup. Bootstraps a project whose
+/// `state.json::team` carries the deprecated `product-research`
+/// name to exercise the alias-aware resolver / team_runtime path.
+/// Slug + project directory keep the legacy `product-research-*`
+/// prefix (matches old `~/projects/product-research-*` rules paths).
+fn setup_research_via_legacy_alias(
     paths: &CcteamPaths,
     brief: &str,
 ) -> (String, Orchestrator) {
@@ -56,12 +80,12 @@ fn setup_product_research(
 }
 
 #[test]
-fn bootstrap_writes_state_json_with_product_research_team() {
+fn bootstrap_writes_state_json_with_research_team() {
     let tmp = TempDir::new().unwrap();
     let paths = fresh_paths(&tmp);
-    let (slug, _orch) = setup_product_research(&paths, "ai 菜谱生成器");
+    let (slug, _orch) = setup_research(&paths, "ai 菜谱生成器");
     let state = ProjectState::load(&paths.project_state(&slug)).unwrap();
-    assert_eq!(state.team, "product-research");
+    assert_eq!(state.team, "research");
     let project_phase_dir = paths.project_dir(&slug).join(".ccteam/phases");
     for name in [
         "kickoff",
@@ -80,10 +104,46 @@ fn bootstrap_writes_state_json_with_product_research_team() {
 }
 
 #[test]
+fn bootstrap_with_legacy_alias_product_research_resolves() {
+    // V0.2.2 F40 — legacy `--team product-research` flow. After the
+    // shipped team rename, the alias-aware ensure_team_resolvable +
+    // alias-scan team_bundle path keep `bootstrap_project(...,
+    // "product-research")` working. State.json preserves the typed
+    // string; team_runtime resolves through the canonical research
+    // bundle's `aliases:` list.
+    let tmp = TempDir::new().unwrap();
+    let paths = fresh_paths(&tmp);
+    let (slug, orch) =
+        setup_research_via_legacy_alias(&paths, "ai 菜谱生成器");
+    assert!(
+        slug.starts_with("product-research-"),
+        "legacy alias projects keep their `product-research-*` slug prefix; got `{slug}`",
+    );
+    let state = ProjectState::load(&paths.project_state(&slug)).unwrap();
+    assert_eq!(state.team, "product-research");
+    // team_runtime resolves through the alias-aware lookup path.
+    let runtime = orch
+        .team_runtime("product-research")
+        .expect("alias `product-research` must resolve to research runtime");
+    assert_eq!(
+        runtime.spec.name, "research",
+        "the alias resolves to the canonical research spec",
+    );
+    // Phase markdowns from the canonical research bundle land in the
+    // project's .ccteam/phases dir at bootstrap (team_bundle alias
+    // lookup chose the research bundle).
+    let project_phase_dir = paths.project_dir(&slug).join(".ccteam/phases");
+    assert!(
+        project_phase_dir.join("kickoff.md").is_file(),
+        "research bundle phases must be stamped via alias bootstrap",
+    );
+}
+
+#[test]
 fn product_research_team_runtime_carries_full_escalate_grammar_extensions() {
     let tmp = TempDir::new().unwrap();
     let paths = fresh_paths(&tmp);
-    let (_slug, orch) = setup_product_research(&paths, "ai 菜谱生成器");
+    let (_slug, orch) = setup_research(&paths, "ai 菜谱生成器");
     let pr = orch.team_runtime("product-research").unwrap();
     let prefixes: std::collections::HashMap<&str, EscalateRoute> = pr
         .spec
@@ -112,7 +172,7 @@ fn product_research_team_runtime_carries_full_escalate_grammar_extensions() {
 fn product_research_state_machine_walks_six_phases() {
     let tmp = TempDir::new().unwrap();
     let paths = fresh_paths(&tmp);
-    let (slug, orch) = setup_product_research(
+    let (slug, orch) = setup_research(
         &paths,
         "AI 菜谱生成器 — 拍冰箱照片自动写菜谱",
     );
@@ -174,7 +234,7 @@ fn feasibility_phase_done_pending_advances_to_verdict_no_block() {
     //    so the orchestrator advances cleanly.
     let tmp = TempDir::new().unwrap();
     let paths = fresh_paths(&tmp);
-    let (slug, orch) = setup_product_research(&paths, "AI 菜谱生成器");
+    let (slug, orch) = setup_research(&paths, "AI 菜谱生成器");
     let pr = orch.team_runtime("product-research").unwrap();
 
     // Pre-populate outbox/clarify file.
@@ -225,7 +285,7 @@ fn feasibility_phase_done_pending_advances_to_verdict_no_block() {
 fn verdict_phase_abort_marks_project_escalated() {
     let tmp = TempDir::new().unwrap();
     let paths = fresh_paths(&tmp);
-    let (slug, orch) = setup_product_research(&paths, "AI 菜谱生成器");
+    let (slug, orch) = setup_research(&paths, "AI 菜谱生成器");
     let pr = orch.team_runtime("product-research").unwrap();
 
     let mut state = ProjectState::load(&paths.project_state(&slug)).unwrap();
@@ -284,7 +344,7 @@ fn market_survey_market_duplicate_escalate_archives_marker_on_resume() {
     // observable cycle (interfaces §10.5).
     let tmp = TempDir::new().unwrap();
     let paths = fresh_paths(&tmp);
-    let (slug, _orch) = setup_product_research(&paths, "AI 菜谱生成器");
+    let (slug, _orch) = setup_research(&paths, "AI 菜谱生成器");
 
     let cc = paths.project_ccteam_dir(&slug);
     let escalation = cc.join("escalation.md");
@@ -324,7 +384,7 @@ fn product_research_logs_progress_jsonl_for_full_run() {
     // required marker.
     let tmp = TempDir::new().unwrap();
     let paths = fresh_paths(&tmp);
-    let (slug, _orch) = setup_product_research(&paths, "AI 菜谱生成器");
+    let (slug, _orch) = setup_research(&paths, "AI 菜谱生成器");
     let progress_path = paths.progress_jsonl(&slug);
     std::fs::create_dir_all(progress_path.parent().unwrap()).unwrap();
 
@@ -399,7 +459,7 @@ fn decisions_queue_lists_clarify_outbox_from_product_research_project() {
     // file appear in the JSON output.
     let tmp = TempDir::new().unwrap();
     let paths = fresh_paths(&tmp);
-    let (slug, _orch) = setup_product_research(&paths, "AI 菜谱生成器");
+    let (slug, _orch) = setup_research(&paths, "AI 菜谱生成器");
 
     let cc = paths.project_ccteam_dir(&slug);
     std::fs::create_dir_all(cc.join("outbox")).unwrap();
@@ -438,7 +498,9 @@ fn decisions_queue_lists_clarify_outbox_from_product_research_project() {
         .find(|d| d["slug"].as_str() == Some(slug.as_str()))
         .and_then(|d| d["team"].as_str())
         .unwrap_or("");
-    assert_eq!(team, "product-research", "decisions should carry team");
+    // V0.2.2 F40: state.json::team for new projects is the canonical
+    // `research`; decisions surface mirrors state.json verbatim.
+    assert_eq!(team, "research", "decisions should carry team");
 }
 
 // ---- helpers reaching into the binary --------------------------------

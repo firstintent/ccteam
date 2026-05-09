@@ -22,6 +22,8 @@ V0.2 已 ship(`origin/main = 503269a`,8 个 milestone M0.16-M0.23,497/0 测试)�
 - watchdog 升级到 Critic agent(M5)整合
 - Conditional / lazy phase activation via `paths:` glob(借鉴 Claude Code skills `paths:` 字段)
 - Team 重命名(`dev` → `software-development` 等领域命名;牵扯 state.json / slug 前缀过广)
+  — **部分 ship 在 V0.2.2 F40**:`product-research` → `research` 通过 `team.yaml::aliases` 软迁移
+  (`docs/v0-2-2/prd.md §9`);`dev` 已经短,V0.2.2 PRD 未列入,仍 deferred
 - M0.20 `KNOWN_PLUGIN_AGENTS` → runtime discovery(walk `~/.claude/plugins/marketplaces/*/plugins/*/agents/`)
 - M0.21 watchdog cron timer(M2+ channel layer 后)
 - M0.22 `dependencies`(team-plugin 间复用)+ `userConfig`(用户填表)实施

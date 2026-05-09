@@ -145,9 +145,9 @@ pub fn run_new(paths: &CcteamPaths, request: &str, team: &str) -> Result<String>
         bail!("cct new: --team must be non-empty");
     }
     // Self-heal shipped seeds before validating — without this, a
-    // first-time `cct new --team product-research` against a
-    // freshly-installed binary would fail with "unknown team".
-    // force=false preserves operator hand-edits.
+    // first-time `cct new --team research` against a freshly-installed
+    // binary would fail with "unknown team". force=false preserves
+    // operator hand-edits.
     if let Err(err) = ccteam_core::write_all_global_team_templates(&paths.root, false) {
         tracing::warn!(
             error = %err,
@@ -156,6 +156,21 @@ pub fn run_new(paths: &CcteamPaths, request: &str, team: &str) -> Result<String>
         );
     }
     ensure_team_resolvable(paths, team)?;
+    // V0.2.2 F40 — warn when the operator passed an alias instead of
+    // the canonical team name. The project still bootstraps under the
+    // alias (state.json::team / slug prefix preserve the typed string)
+    // so old muscle memory keeps working; the warn flags the
+    // transition path so new docs and skills migrate to the canonical
+    // name. Print to stderr (not via tracing) so users on plain
+    // installs without RUST_LOG see it.
+    if let Some(canonical) = find_alias_canonical(paths, team) {
+        if canonical != team {
+            eprintln!(
+                "cct new: `--team {team}` is a deprecated alias for `{canonical}`; \
+                 prefer `--team {canonical}` going forward",
+            );
+        }
+    }
     let slug = pick_unused_slug(paths, request, team)?;
     bootstrap_project(paths, &slug, request, team)?;
     Ok(slug)
@@ -168,7 +183,11 @@ pub fn run_new(paths: &CcteamPaths, request: &str, team: &str) -> Result<String>
 /// Resolution order:
 /// 1. `dev` and `meta-agent` always succeed (legacy / bespoke paths).
 /// 2. If `~/.ccteam/teams/<team>/team.yaml` is on disk, load + validate it.
-/// 3. Otherwise fail with a help message listing the teams currently
+/// 3. V0.2.2 F40: scan every `~/.ccteam/teams/*/team.yaml` and accept
+///    `team` when it matches a `spec.aliases` entry. Lets old projects'
+///    `--team product-research` continue working after the canonical
+///    rename to `research` (warn-deprecated; see `run_new`).
+/// 4. Otherwise fail with a help message listing the teams currently
 ///    on disk.
 fn ensure_team_resolvable(paths: &CcteamPaths, team: &str) -> Result<()> {
     if team == "dev" || team == ccteam_core::META_TEAM_NAME {
@@ -179,6 +198,9 @@ fn ensure_team_resolvable(paths: &CcteamPaths, team: &str) -> Result<()> {
         TeamSpec::load(&yaml_path).with_context(|| {
             format!("cct new: failed to load {}", yaml_path.display())
         })?;
+        return Ok(());
+    }
+    if find_alias_canonical(paths, team).is_some() {
         return Ok(());
     }
     let known = list_disk_teams(paths)
@@ -193,6 +215,32 @@ fn ensure_team_resolvable(paths: &CcteamPaths, team: &str) -> Result<()> {
          Teams currently on disk: {known}.",
         yaml_path.display(),
     )
+}
+
+/// V0.2.2 F40 — given a possible alias, return the canonical name of
+/// the team whose yaml lists it. Walks `<root>/teams/*/team.yaml`
+/// once. Yaml parse errors silently fall through to the next entry —
+/// the caller's failure path covers the no-match case.
+fn find_alias_canonical(paths: &CcteamPaths, alias: &str) -> Option<String> {
+    let teams_dir = paths.root.join("teams");
+    let entries = std::fs::read_dir(&teams_dir).ok()?;
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let yaml = entry.path().join("team.yaml");
+        if !yaml.exists() {
+            continue;
+        }
+        let spec = match TeamSpec::load(&yaml) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if spec.aliases.iter().any(|a| a == alias) {
+            return Some(spec.name);
+        }
+    }
+    None
 }
 
 /// Enumerate teams discoverable under `<global_dir>/teams/<name>/team.yaml`.
@@ -1933,9 +1981,11 @@ mod tests {
         );
         // After M0.16.2 self-heal, the disk-driven team list includes
         // the shipped seeds — the error message lists those so users
-        // see the catalog of options:
+        // see the catalog of options. V0.2.2 F40: `research` is the
+        // canonical name; `product-research` only exists as an alias
+        // (no directory on disk), so the help message lists `research`.
         assert!(msg.contains("dev"));
-        assert!(msg.contains("product-research"));
+        assert!(msg.contains("research"));
     }
 
     #[test]
@@ -2260,12 +2310,17 @@ mod tests {
         let report = run_doctor(&paths, opts).unwrap();
         assert!(report.contains("install-memory-bridge"));
         assert!(report.contains("dev"));
-        assert!(report.contains("product-research"));
+        // V0.2.2 F40: research is the canonical team name; the bridge
+        // file scaffold ships at ccteam-lessons-research.md. Old
+        // installs already on disk keep their
+        // ccteam-lessons-product-research.md file untouched (different
+        // test surface — no need to fixture it here).
+        assert!(report.contains("research"));
 
         let dev_path = tmp.path().join("rules/ccteam-lessons-dev.md");
-        let pr_path = tmp.path().join("rules/ccteam-lessons-product-research.md");
+        let research_path = tmp.path().join("rules/ccteam-lessons-research.md");
         assert!(dev_path.is_file(), "dev lessons not written");
-        assert!(pr_path.is_file(), "product-research lessons not written");
+        assert!(research_path.is_file(), "research lessons not written");
 
         std::env::remove_var("CLAUDE_CONFIG_HOME");
     }
@@ -2411,7 +2466,8 @@ mod tests {
         // declared layout. (Layout migration to teams/<name>/ is
         // M0.17; for now teams/<name>/team.yaml is what
         // write_all_global_team_templates writes.)
-        for team in ["dev", "product-research", "meta-agent"] {
+        // V0.2.2 F40: `research` (canonical) replaced `product-research`.
+        for team in ["dev", "research", "meta-agent"] {
             let yaml = paths.root.join("teams").join(team).join("team.yaml");
             assert!(
                 yaml.is_file(),
@@ -2459,17 +2515,44 @@ mod tests {
     fn run_new_self_heals_shipped_seeds_for_first_time_install() {
         // V0.2 §6.4 candidate 3: a fresh install (no `cct init`) where
         // ~/.ccteam/teams/ is empty must still let `cct new --team
-        // product-research` succeed because run_new self-heals.
+        // research` succeed because run_new self-heals.
+        // V0.2.2 F40: canonical name is `research`.
         ensure_isolation();
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
         assert!(!paths.root.join("teams").exists(), "precondition: empty global dir");
 
-        let slug = run_new(&paths, "Verify product-research bootstraps", "product-research")
+        let slug = run_new(&paths, "Verify research bootstraps", "research")
             .expect("run_new must auto-seed shipped templates before validation");
-        assert!(slug.starts_with("product-research-"));
+        assert!(slug.starts_with("research-"));
         // The seed must have landed during run_new.
-        assert!(paths.root.join("teams/product-research/team.yaml").is_file());
+        assert!(paths.root.join("teams/research/team.yaml").is_file());
+    }
+
+    #[test]
+    fn run_new_accepts_legacy_alias_product_research_with_deprecation_warn() {
+        // V0.2.2 F40 — `cct new --team product-research` still works
+        // (alias resolution against shipped `teams/research/team.yaml`).
+        // The slug carries the typed-team prefix so the project lands at
+        // ~/projects/product-research-<base>; state.json::team also
+        // preserves the typed alias so the daemon's tick walks the
+        // alias-aware team_runtime path. Visible deprecation goes to
+        // stderr (not asserted here — captured-output isolation is
+        // brittle in unit tests; the e2e test in
+        // crates/ccteam-cli/tests/m3_product_research_e2e_test.rs covers
+        // the alias resolution end-to-end).
+        ensure_isolation();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let slug = run_new(&paths, "ai recipe generator", "product-research")
+            .expect("alias must resolve to canonical research team");
+        assert!(
+            slug.starts_with("product-research-"),
+            "alias-input slug should preserve the typed team prefix; got `{slug}`",
+        );
+        let state =
+            ccteam_core::ProjectState::load(&paths.project_state(&slug)).unwrap();
+        assert_eq!(state.team, "product-research");
     }
 
     // -------- cct decisions (M1 follow-up) --------

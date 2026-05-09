@@ -23,7 +23,7 @@ max_clarify_rounds: 5
 
 ## 跨项目经验(裁决前先比对)
 
-`~/.claude/rules/ccteam-lessons-product-research.md` 在 session 启动时已自动加载。
+`~/.claude/rules/ccteam-lessons-research.md` (V0.2.2 canonical) 与老项目继承的 `ccteam-lessons-product-research.md` 在 session 启动时按 `paths:` frontmatter 自动加载。
 **先扫一遍历史 REJECT 条目**——若上游产物的市场/差异化/可行性结论与某条历史
 REJECT 高度相似(同一市场饱和、同一差异化死路、同样的可行性死结),
 verdict 倾向 REJECT 并在 rationale.md 里引该历史条目作证据。
@@ -79,15 +79,19 @@ confidence: 0.0-1.0
 ## REJECT 分支 retro
 
 **只在 `verdict = REJECT` 时执行**(PASS / CONCERN 的 retro 由下游 dev 项目的 ship phase 写;
-CLARIFY 不是终态)。两处落地(基于 `teams/product-research/team.yaml.retro_schema`):
+CLARIFY 不是终态)。两处落地(基于 `teams/research/team.yaml.retro_schema`):
 
 1. **本仓库 auto-memory** → 调 `/memory` 写本项目特定 lessons,topic 文件结构你自定。
 
-2. **跨项目 lessons 库** → 用 `Edit` 修改 `~/.claude/rules/ccteam-lessons-product-research.md`,
+2. **跨项目 lessons 库** → 用 `Edit` 修改对应代际的 lessons 文件:
+   - 新项目(state.team = `research`):`~/.claude/rules/ccteam-lessons-research.md`
+   - 老项目(state.team = `product-research` 即 V0.2.2 alias):仍写老的
+     `~/.claude/rules/ccteam-lessons-product-research.md`(已积累的内容不丢)
+
    **只改 `<!-- ccteam-managed:lessons begin/end -->` 之间内容**(不动标记,也不动
    marked 外的用户段)。在 marked section 内 append 一段以本项目 slug + 日期为
    H2 标题的新条目;字段顺序与 description 取自
-   `teams/product-research/team.yaml.retro_schema`(每字段一个 H3):
+   `teams/research/team.yaml.retro_schema`(每字段一个 H3):
 
    - `market_signals` — Top market signals collected (demand, saturation, pricing)
    - `differentiation_findings` — Unique angles found / ruled out
@@ -112,7 +116,7 @@ CLARIFY 不是终态)。两处落地(基于 `teams/product-research/team.yaml.re
    <一段总结,引 rationale.md>
    ```
 
-   若 `~/.claude/rules/ccteam-lessons-product-research.md` 不存在,说明用户没跑过
+   若对应代际的 lessons 文件(`ccteam-lessons-research.md` 新项目;`ccteam-lessons-product-research.md` 老项目)不存在,说明用户没跑过
    `ccteam doctor --install-memory-bridge`;在 `rationale.md` 末尾追加一行
    "memory bridge missing — run ccteam doctor --install-memory-bridge",跨项目
    lessons 这次跳过(verdict 已写完,不走异常出口)。
@@ -123,7 +127,7 @@ CLARIFY 不是终态)。两处落地(基于 `teams/product-research/team.yaml.re
 |---|---|---|
 | `PASS` | 正常完成 | 项目研究完成,推荐进入 dev |
 | `CONCERN` | 正常完成 | 项目研究完成,但有保留 |
-| `REJECT` | `ABORT` prefix(team.yaml 注册的 standard 路由) | 项目研究完成,结论是不做(此为 product-research happy path 的真实终态;不是失败) |
+| `REJECT` | `ABORT` prefix(team.yaml 注册的 standard 路由) | 项目研究完成,结论是不做(此为 research happy path 的真实终态;不是失败) |
 | `CLARIFY` | 写 outbox event_kind=clarify;循环回本 phase | 信息不足,等用户答复 |
 
 `max_clarify_rounds: 5` 撞顶时:走 `INSUFFICIENT_CLARIFICATION` prefix

@@ -43,45 +43,48 @@ const DEV_PHASE_TEMPLATES: &[(&str, &str)] = &[
     ("09-ship.md", include_str!("../../../teams/dev/phases/09-ship.md")),
 ];
 
-/// product-research team phase set (M3.4). Six phases, all
-/// `parallelism: solo`. Last two phases use `decision_mode: async`
-/// so user-decision points write to outbox instead of blocking.
-const PRODUCT_RESEARCH_PHASE_TEMPLATES: &[(&str, &str)] = &[
+/// research team phase set (M3.4; V0.2.2 F40 renamed from
+/// `product-research`). Six phases, all `parallelism: solo`. Last two
+/// phases use `decision_mode: async` so user-decision points write to
+/// outbox instead of blocking.
+const RESEARCH_PHASE_TEMPLATES: &[(&str, &str)] = &[
     (
         "01-kickoff.md",
-        include_str!("../../../teams/product-research/phases/01-kickoff.md"),
+        include_str!("../../../teams/research/phases/01-kickoff.md"),
     ),
     (
         "02-market-survey.md",
-        include_str!("../../../teams/product-research/phases/02-market-survey.md"),
+        include_str!("../../../teams/research/phases/02-market-survey.md"),
     ),
     (
         "03-differentiation-analysis.md",
-        include_str!("../../../teams/product-research/phases/03-differentiation-analysis.md"),
+        include_str!("../../../teams/research/phases/03-differentiation-analysis.md"),
     ),
     (
         "04-value-proposition.md",
-        include_str!("../../../teams/product-research/phases/04-value-proposition.md"),
+        include_str!("../../../teams/research/phases/04-value-proposition.md"),
     ),
     (
         "05-feasibility.md",
-        include_str!("../../../teams/product-research/phases/05-feasibility.md"),
+        include_str!("../../../teams/research/phases/05-feasibility.md"),
     ),
     (
         "06-verdict.md",
-        include_str!("../../../teams/product-research/phases/06-verdict.md"),
+        include_str!("../../../teams/research/phases/06-verdict.md"),
     ),
 ];
 
 /// Embedded `team.yaml` files keyed by team name. M3.4 ships dev +
-/// product-research; V0.2 M0.16 adds meta-agent (evergreen). `cct
-/// init` writes these to `~/.ccteam/teams/<name>/team.yaml`. The
-/// orchestrator reads them at startup to resolve `phase_dir`,
-/// registered ESCALATE prefixes, the V0.2 `evergreen` / `cost_policy`
-/// flags, and (eventually) team-wide golden rules.
+/// research (V0.2.2 F40 renamed from `product-research`; alias
+/// preserved on the yaml so old projects still resolve). V0.2 M0.16
+/// adds meta-agent (evergreen). `cct init` writes these to
+/// `~/.ccteam/teams/<name>/team.yaml`. The orchestrator reads them at
+/// startup to resolve `phase_dir`, registered ESCALATE prefixes, the
+/// V0.2 `evergreen` / `cost_policy` flags, and (eventually) team-wide
+/// golden rules.
 const DEV_TEAM_YAML: &str = include_str!("../../../teams/dev/team.yaml");
-const PRODUCT_RESEARCH_TEAM_YAML: &str =
-    include_str!("../../../teams/product-research/team.yaml");
+const RESEARCH_TEAM_YAML: &str =
+    include_str!("../../../teams/research/team.yaml");
 const META_AGENT_TEAM_YAML: &str = include_str!("../../../teams/meta-agent/team.yaml");
 
 /// Empty phase set for evergreen teams (meta-agent). The orchestrator
@@ -120,10 +123,10 @@ pub(crate) const TEAM_BUNDLES: &[(&str, TeamTemplateBundle)] = &[
         },
     ),
     (
-        "product-research",
+        "research",
         TeamTemplateBundle {
-            team_yaml: PRODUCT_RESEARCH_TEAM_YAML,
-            phases: PRODUCT_RESEARCH_PHASE_TEMPLATES,
+            team_yaml: RESEARCH_TEAM_YAML,
+            phases: RESEARCH_PHASE_TEMPLATES,
         },
     ),
     (
@@ -140,10 +143,30 @@ pub(crate) const TEAM_BUNDLES: &[(&str, TeamTemplateBundle)] = &[
 /// the right behavior for user-authored teams that live entirely on
 /// disk. V0.2 §6.4 candidate 3: `pub(crate)` — only bootstrap-time
 /// callers in ccteam-core may use this.
+///
+/// V0.2.2 F40: matches by canonical key first, then by `aliases:` in
+/// each bundle's parsed `team.yaml`. Lets old projects whose
+/// `state.json::team` still carries a legacy name (e.g. `product-research`
+/// → `research`) still find the right bundle for bootstrap-time work
+/// like CLAUDE.md rendering / phase template stamping. Falls through
+/// silently when the team yaml fails to parse — the spec is in the
+/// repo so the only realistic cause is a development-time edit error,
+/// and the caller's `None` branch covers it.
 pub(crate) fn team_bundle(team: &str) -> Option<TeamTemplateBundle> {
-    TEAM_BUNDLES
+    if let Some(b) = TEAM_BUNDLES
         .iter()
         .find_map(|(name, bundle)| (*name == team).then_some(*bundle))
+    {
+        return Some(b);
+    }
+    TEAM_BUNDLES.iter().find_map(|(_name, bundle)| {
+        let spec = crate::team::TeamSpec::parse(bundle.team_yaml).ok()?;
+        if spec.aliases.iter().any(|a| a == team) {
+            Some(*bundle)
+        } else {
+            None
+        }
+    })
 }
 
 /// M2.4: helper templates that phase markdown can `@`-reference. Shipped

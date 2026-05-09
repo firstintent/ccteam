@@ -1,10 +1,18 @@
 //! `ccteam doctor --install-memory-bridge` (M4.2).
 //!
-//! Lays down `~/.claude/rules/ccteam-lessons-{dev,product-research}.md`
+//! Lays down `~/.claude/rules/ccteam-lessons-{dev,research}.md`
 //! occupying the only ccteam-managed section in each file. Anything the
 //! user writes outside the `<!-- ccteam-managed:lessons begin/end -->`
 //! marker pair is preserved on re-runs; the marker pair itself is
 //! repaired (deduped / re-added at end-of-file) when malformed.
+//!
+//! V0.2.2 F40 — `research` (canonical) replaces `product-research`.
+//! The new bridge file's `paths:` frontmatter scopes to
+//! `~/projects/research-*`. Pre-V0.2.2 installs already carry
+//! `~/.claude/rules/ccteam-lessons-product-research.md` whose own
+//! `paths:` scopes to `~/projects/product-research-*` — that file is
+//! left untouched so the cross-project lessons accumulated against
+//! old projects keep applying.
 //!
 //! The file body itself never holds a project's lessons — those land
 //! between the markers via the retro phase's `Edit` call. This module
@@ -22,8 +30,11 @@ use crate::team::TeamSpec;
 use crate::tool_surface::user_claude_dir;
 
 const DEV_TEMPLATE: &str = include_str!("templates/memory_bridge_dev.md");
-const PRODUCT_RESEARCH_TEMPLATE: &str =
-    include_str!("templates/memory_bridge_product_research.md");
+/// V0.2.2 F40: renamed from `memory_bridge_product_research.md` (file
+/// `git mv`'d). `paths:` frontmatter now scopes to
+/// `~/projects/research-*` for new projects.
+const RESEARCH_TEMPLATE: &str =
+    include_str!("templates/memory_bridge_research.md");
 
 const MARKER_BEGIN: &str = "<!-- ccteam-managed:lessons begin -->";
 const MARKER_END: &str = "<!-- ccteam-managed:lessons end -->";
@@ -37,7 +48,7 @@ const CANONICAL_MARKED_BLOCK: &str = "<!-- ccteam-managed:lessons begin -->\n\
 /// V0.2 §6.4 candidate 3: which teams need a memory bridge is now
 /// disk-driven. Scan `<global_dir>/teams/<name>/team.yaml`; any team
 /// with a non-empty `retro_schema` gets a `~/.claude/rules/ccteam-lessons-<name>.md`
-/// scaffold. Shipped teams (dev / product-research) keep their richer
+/// scaffold. Shipped teams (dev / research) keep their richer
 /// embedded templates; user-authored teams fall back to a generic
 /// scaffold built from the team description.
 fn discover_bridge_teams(global_dir: &Path) -> Vec<(String, String)> {
@@ -83,7 +94,11 @@ fn discover_bridge_teams(global_dir: &Path) -> Vec<(String, String)> {
 fn lookup_bridge_template(spec: &TeamSpec) -> String {
     match spec.name.as_str() {
         "dev" => DEV_TEMPLATE.to_string(),
-        "product-research" => PRODUCT_RESEARCH_TEMPLATE.to_string(),
+        // V0.2.2 F40: canonical name `research`; the legacy alias
+        // `product-research` only appears on old user data, not on
+        // any shipped team yaml's `name` field, so it doesn't need
+        // a match arm here.
+        "research" => RESEARCH_TEMPLATE.to_string(),
         _ => generic_bridge_template(spec),
     }
 }
@@ -260,7 +275,7 @@ mod tests {
     }
 
     /// Seed shipped team yamls under `<tmp>/ccteam-home/teams/<name>/`
-    /// so `install_into(global, claude, ...)` finds dev / product-research
+    /// so `install_into(global, claude, ...)` finds dev / research
     /// during the disk scan introduced in V0.2 §6.4 candidate 3.
     /// Returns `(global_dir, claude_dir)` — claude_dir is `<tmp>/`,
     /// matching the historical layout the per-test assertions expect.
@@ -284,12 +299,18 @@ mod tests {
             assert!(marked_section_intact(&body), "markers not intact");
             assert!(body.contains("paths:"), "frontmatter paths missing");
         }
-        let dev = &reports[0];
-        assert_eq!(dev.team, "dev");
+        // V0.2.2 F40: read_dir order isn't stable across filesystems;
+        // look up by team name instead of index.
+        let dev = reports
+            .iter()
+            .find(|r| r.team == "dev")
+            .expect("dev bridge missing");
         assert!(read(&dev.target).contains("~/projects/dev-*"));
-        let pr = &reports[1];
-        assert_eq!(pr.team, "product-research");
-        assert!(read(&pr.target).contains("~/projects/product-research-*"));
+        let research = reports
+            .iter()
+            .find(|r| r.team == "research")
+            .expect("research bridge missing");
+        assert!(read(&research.target).contains("~/projects/research-*"));
     }
 
     #[test]
