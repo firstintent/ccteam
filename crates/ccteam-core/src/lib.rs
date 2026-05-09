@@ -49,10 +49,11 @@ pub use memory_bridge::{
     InstallMemoryBridgeOptions, MemoryBridgeAction, MemoryBridgeReport,
 };
 pub use skill::{
-    install_cct_control_skill, install_cct_team_author_skill,
-    install_into as install_skill_into, install_skill_body_into,
-    InstallSkillOptions, InstallSkillReport, SkillInstallAction,
-    CCT_CONTROL_SKILL_NAME, CCT_TEAM_AUTHOR_SKILL_NAME, LEGACY_SKILL_NAMES,
+    install_cct_control_skill, install_cct_project_creator_skill,
+    install_cct_team_author_skill, install_into as install_skill_into,
+    install_skill_body_into, InstallSkillOptions, InstallSkillReport, SkillInstallAction,
+    CCT_CONTROL_SKILL_NAME, CCT_PROJECT_CREATOR_SKILL_NAME, CCT_TEAM_AUTHOR_SKILL_NAME,
+    LEGACY_SKILL_NAMES,
 };
 pub use orchestrator::MAX_CONCURRENT_PROJECTS;
 pub use orchestrator::{
@@ -60,7 +61,10 @@ pub use orchestrator::{
     decide_tick_from_events, intersect_open_decisions_with_required_inputs, Orchestrator,
     OrchestratorConfig, TeamRuntime, TickAction, DEFAULT_CLAUDE_MODEL,
 };
-pub use projects::{bootstrap_project, pick_unused_slug, pre_trust_project, slugify};
+pub use projects::{
+    bootstrap_project, pick_unused_slug, pick_unused_slug_verbatim, pre_trust_project,
+    slugify, slugify_brief,
+};
 pub use cost::{classify as classify_cost, CostLevel, COST_MID_WARN_USD};
 pub use daemon::{
     check_health as check_daemon_health, check_health_at as check_daemon_health_at,
