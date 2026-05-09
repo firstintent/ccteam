@@ -102,8 +102,8 @@ Apply the `meta_agent_role.md` §2 decision tree:
 | User says | Recommend |
 |---|---|
 | "做个 X / 帮我写 X / 来个 X" + brief is actionable | `dev` |
-| "我想做 Y 但不确定 / 值不值 / 该不该" | `product-research` |
-| "调研 Z / 这个想法有人做过吗 / 这个值得做吗" | `product-research` |
+| "我想做 Y 但不确定 / 值不值 / 该不该" | `research` |
+| "调研 Z / 这个想法有人做过吗 / 这个值得做吗" | `research` |
 
 If the recommendation is unambiguous, propose it directly with one
 `AskUserQuestion` for confirmation. If it's borderline:
@@ -114,15 +114,16 @@ AskUserQuestion({
   options: [
     { label: "dev",
       description: "立即开发(plan-eng → implement → … → ship)" },
-    { label: "product-research",
+    { label: "research",
       description: "先调研判断 idea 值不值得做(verdict + next-steps)" },
   ]
 })
 ```
 
-Default toward `product-research` when in doubt — research is cheap, dev
-is expensive. But do not auto-research every brief; obvious build asks
-should go straight to dev.
+Default toward `research` when in doubt — research is cheap, dev is
+expensive. But do not auto-research every brief; obvious build asks
+should go straight to dev. (V0.2.2 F40 起 `product-research` 是兼容
+alias,canonical 名是 `research`;新派单一律用 `research`。)
 
 ## Phase D — Dispatch + notify
 
@@ -143,7 +144,7 @@ After dispatch, write an outbox `event_kind: reply` (per
 - The first milestone they should expect:
   - **dev** → `plan-eng` runs first, ~30 min, may surface clarify
     questions you'll see in the decisions queue.
-  - **product-research** → `kickoff` runs first and may immediately
+  - **research** → `kickoff` runs first and may immediately
     reverse-interview before doing any research.
 - Follow-up commands: `cct show <slug>` for state, `cct attach <slug>`
   for live tmux.

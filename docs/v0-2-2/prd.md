@@ -931,6 +931,13 @@ V0.2.2);老的会过期,但不会崩。
 --install-skill` / `--install-meta-agent` 触发时同步跑。跟 V0.2.0 的
 `--migrate-recommended-agents` 同模式("安装时清旧 + 新装")。
 
+> **测试 staging 注**(V0.2.2 e2e retro F43):detection 是 `marker OR
+> frontmatter name:` 的 OR 关系(intentional belt-and-suspenders;V0.2.0
+> 早期 install 不带 marker,只能靠 frontmatter `name:` 命中)。模拟"用户
+> 手改 skill"做 e2e 测试时,需**同时 strip 两个 signal**(去 marker `<!--
+> ccteam-managed:skill -->` + 改 frontmatter `name: <other>`),任一保留都
+> 会命中 detection 视为 ccteam-managed → 误删。
+
 #### 8.2.6 文档 sweep
 
 | 文件 | 处理 |
