@@ -76,6 +76,14 @@ impl CcteamPaths {
         project_dir.join(".ccteam").join("ready")
     }
 
+    /// `<project>/.ccteam/pending-inject.json` — V0.2.2 F36 deferred
+    /// phase-inject record. See `crate::pending_inject` for shape +
+    /// lifecycle.
+    pub fn project_pending_inject(&self, slug: &str) -> PathBuf {
+        self.project_ccteam_dir(slug)
+            .join(crate::pending_inject::PENDING_INJECT_FILE)
+    }
+
     /// `<project>/.ccteam/screenshots/` — V0.2.2 F38 PNG screenshot
     /// directory. Created lazily by `screenshot::render_screenshot`.
     pub fn project_screenshots_dir(&self, slug: &str) -> PathBuf {

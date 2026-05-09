@@ -11,6 +11,7 @@ pub mod inbox;
 pub mod meta_agent;
 pub mod orchestrator;
 pub mod memory_bridge;
+pub mod pending_inject;
 pub mod skill;
 pub mod paths;
 pub mod phases;
@@ -59,8 +60,9 @@ pub use skill::{
 pub use orchestrator::MAX_CONCURRENT_PROJECTS;
 pub use orchestrator::{
     append_progress_summary, build_progress_summary, check_phase_tools, decide_tick,
-    decide_tick_from_events, intersect_open_decisions_with_required_inputs, Orchestrator,
-    OrchestratorConfig, TeamRuntime, TickAction, DEFAULT_CLAUDE_MODEL,
+    decide_tick_from_events, intersect_open_decisions_with_required_inputs,
+    DrainPendingOutcome, Orchestrator, OrchestratorConfig, TeamRuntime, TickAction,
+    DEFAULT_CLAUDE_MODEL,
 };
 pub use projects::{
     bootstrap_project, pick_unused_slug, pick_unused_slug_verbatim, pre_trust_project,
@@ -72,6 +74,11 @@ pub use daemon::{
     heartbeat_path, pidfile_path, read_pidfile, remove_heartbeat, remove_pidfile,
     send_sigterm_to_pidfile, write_heartbeat, write_pidfile, DaemonHealth, HEARTBEAT_GRACE,
     HEARTBEAT_INTERVAL, HEARTBEAT_NAME, PIDFILE_NAME,
+};
+pub use pending_inject::{
+    delete as delete_pending_inject, load as load_pending_inject,
+    pending_inject_path_in, save as save_pending_inject, PendingInject,
+    DEFAULT_MAX_DEFER_MINUTES, PENDING_INJECT_FILE,
 };
 pub use silence_classifier::{
     classify as classify_silence, load_retry_count as load_limbo_retry_count,

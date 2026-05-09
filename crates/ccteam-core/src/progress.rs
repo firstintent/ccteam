@@ -305,6 +305,50 @@ pub fn build_phase_prompt_with_attachments(phase: &str, attachments: &[&str]) ->
     out
 }
 
+/// V0.2.2 F36: detect whether a sub-agent (`Task` tool) is currently
+/// in flight by walking `events` from the tail and counting how many
+/// `PreToolUse(tool=Task)` openings have not yet been matched by a
+/// `SubagentStop`. Returns `true` when at least one window is open.
+///
+/// **Why count, not last-event-match**: Claude Code can launch a
+/// sub-agent (`Task`), have it spawn an inner Task, and emit two
+/// `PreToolUse(Task)` events in a row before the matching pair of
+/// `SubagentStop` events arrives. A naive "is the most recent event a
+/// `Task` PreToolUse?" check misses the second-from-top case the
+/// moment the inner sub-agent emits its own `PreToolUse`.
+///
+/// **Why scan from the tail**: every `SubagentStop` past the open
+/// window already cancelled an earlier `PreToolUse(Task)` we don't
+/// care about. We stop counting as soon as `open_windows` returns to
+/// zero — older paired sequences can't reach into the current open
+/// state.
+///
+/// Pure deterministic helper; no I/O. Honors the **"`progress.jsonl`
+/// is the only state truth"** red line — F36's send-keys guard reads
+/// progress events, never tmux pane text.
+pub fn subagent_active(events: &[Value]) -> bool {
+    let mut closes_pending: u64 = 0;
+    for event in events.iter().rev() {
+        let kind = event.get("event").and_then(|s| s.as_str()).unwrap_or("");
+        match kind {
+            "SubagentStop" => {
+                closes_pending = closes_pending.saturating_add(1);
+            }
+            "PreToolUse" => {
+                let tool = event.get("tool").and_then(|s| s.as_str()).unwrap_or("");
+                if tool == "Task" {
+                    if closes_pending == 0 {
+                        return true;
+                    }
+                    closes_pending -= 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// `/btw <prompt>` when claude is busy so the message queues without
 /// interrupting; bare prompt when idle.
 pub fn idle_aware_message(prompt: &str, idle: bool) -> String {
@@ -578,5 +622,80 @@ mod tests {
             json!({"event": "phase_done", "phase": "plan-eng"}), // stale
         ];
         assert!(latest_terminal_event_for_phase(&events, "implement").is_none());
+    }
+
+    // ---------------- V0.2.2 F36 subagent_active helper ----------------
+
+    fn pretool_task() -> Value {
+        json!({"event": "PreToolUse", "tool": "Task"})
+    }
+    fn pretool_other(tool: &str) -> Value {
+        json!({"event": "PreToolUse", "tool": tool})
+    }
+    fn subagent_stop() -> Value {
+        json!({"event": "SubagentStop"})
+    }
+
+    #[test]
+    fn subagent_active_empty_log_returns_false() {
+        assert!(!subagent_active(&[]));
+    }
+
+    #[test]
+    fn subagent_active_open_window_after_pretool_task() {
+        let events = [
+            json!({"event": "phase_inject", "phase": "implement"}),
+            pretool_task(),
+        ];
+        assert!(subagent_active(&events));
+    }
+
+    #[test]
+    fn subagent_active_paired_pretool_task_and_subagent_stop_returns_false() {
+        let events = [pretool_task(), subagent_stop()];
+        assert!(!subagent_active(&events));
+    }
+
+    #[test]
+    fn subagent_active_nested_task_calls_open_two_windows() {
+        // outer Task launched, inner Task launched, only one SubagentStop
+        // arrived so far → still one open window.
+        let events = [
+            pretool_task(),
+            pretool_task(),
+            subagent_stop(),
+        ];
+        assert!(subagent_active(&events));
+    }
+
+    #[test]
+    fn subagent_active_old_subagent_stop_does_not_close_new_pretool_task() {
+        // Old paired sequence (closed) followed by a fresh PreToolUse(Task)
+        // with no follow-up — the new window must register as active.
+        let events = [
+            pretool_task(),
+            subagent_stop(),
+            json!({"event": "PostToolUse", "tool": "Read"}),
+            pretool_task(),
+        ];
+        assert!(subagent_active(&events));
+    }
+
+    #[test]
+    fn subagent_active_ignores_non_task_pretool() {
+        let events = [pretool_other("Read"), pretool_other("Edit")];
+        assert!(!subagent_active(&events));
+    }
+
+    #[test]
+    fn subagent_active_extra_subagent_stops_do_not_underflow() {
+        // Defensive: stray SubagentStop events with no matching open
+        // window must not panic / wrap around.
+        let events = [
+            subagent_stop(),
+            subagent_stop(),
+            pretool_task(),
+        ];
+        assert!(subagent_active(&events));
     }
 }

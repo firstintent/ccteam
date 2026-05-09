@@ -33,6 +33,7 @@ use crate::inbox::{InboxMessage, SessionMailbox};
 // V0.2 §6.4 candidate 5 — evergreen-team behavior dispatches off
 // `TeamSpec::evergreen` / `cost_policy` flags instead.
 use crate::paths::CcteamPaths;
+use crate::pending_inject::{self, PendingInject, DEFAULT_MAX_DEFER_MINUTES};
 use crate::phases::{PhaseTemplate, SubSkillTrigger};
 use crate::progress;
 use crate::silence_classifier::{
@@ -63,6 +64,33 @@ pub struct TeamRuntime {
 /// meta-agent session is **not counted** — it's a permanent fixture in
 /// the User Interaction Layer.
 pub const MAX_CONCURRENT_PROJECTS: usize = 3;
+
+/// V0.2.2 F36: outcome of a single
+/// `Orchestrator::drain_pending_inject_inner` call. Production code
+/// only inspects `Drained` / `TimedOut` for log lines; tests assert
+/// the full enum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DrainPendingOutcome {
+    /// No pending-inject record on disk for this slug.
+    None,
+    /// Sub-agent is still active and the budget has not been exhausted.
+    /// Try again on the next tick.
+    StillBlocked,
+    /// Pending record is older than `max_defer_minutes` — surfaced an
+    /// enriched escalate (`ccteam_classification: "inject_defer_timeout"`)
+    /// and deleted the record.
+    TimedOut,
+    /// Sub-agent has stopped and the dispatch path sent keys; pending
+    /// record removed.
+    Drained,
+    /// Sub-agent has stopped but the dispatch re-deferred (sub-agent
+    /// re-armed between the drain check and the dispatch's own check).
+    /// The fresh pending record is left on disk for the next tick.
+    Deferred,
+    /// `dispatch_phase_with_state` itself errored (e.g. tmux session
+    /// missing). Pending record left on disk for retry.
+    DispatchFailed,
+}
 
 /// Pure decision function: given the current `state` and the last
 /// progress.jsonl event, what should the orchestrator do next?
@@ -475,6 +503,16 @@ impl Orchestrator {
     /// Same as `dispatch_phase` but the caller passes the already-loaded
     /// `ProjectState`. Used inside `process_project` to avoid a redundant
     /// reload (and so meta-agent paths can pass their bespoke state).
+    ///
+    /// **V0.2.2 F36 send-keys subagent guard**: when
+    /// `progress::subagent_active` returns true, this method writes a
+    /// `<project>/.ccteam/pending-inject.json` record and returns
+    /// `Ok(())` **without** sending keys or appending a `phase_inject`
+    /// event. The orchestrator daemon tick later drains the record on
+    /// the next `SubagentStop` (or surfaces an enriched escalate after
+    /// `max_defer_minutes`). Evergreen / meta-agent projects bypass
+    /// the guard — `process_meta_project` does not call this path
+    /// today, but the early-return makes the contract explicit.
     pub fn dispatch_phase_with_state(
         &self,
         slug: &str,
@@ -487,6 +525,39 @@ impl Orchestrator {
 
         let attachments = self.attachments_for_next_phase(slug, state);
         let attachment_refs: Vec<&str> = attachments.iter().map(String::as_str).collect();
+
+        // V0.2.2 F36: defer when a sub-agent is in flight. Send-keys to
+        // the main agent's input buffer in that window gets re-routed
+        // into the sub-agent's context (Claude Code 2.x behavior,
+        // E2E 2026-05-08), so we persist the inject for the daemon
+        // drain instead. Evergreen sessions skip the guard entirely —
+        // their dispatch path doesn't route through here, but we keep
+        // the check so any future caller stays safe.
+        if !self.is_evergreen(&state.team) {
+            let recent = progress::read_all_events(&progress_path)?;
+            if progress::subagent_active(&recent) {
+                let pending = PendingInject::new(
+                    slug,
+                    phase,
+                    attachments,
+                    Utc::now(),
+                    DEFAULT_MAX_DEFER_MINUTES,
+                );
+                let pending_path = self.paths.project_pending_inject(slug);
+                pending_inject::save(&pending_path, &pending).with_context(|| {
+                    format!(
+                        "save pending-inject for slug={slug} phase={phase}",
+                    )
+                })?;
+                tracing::info!(
+                    slug,
+                    phase,
+                    max_defer_minutes = DEFAULT_MAX_DEFER_MINUTES,
+                    "F36 subagent active; deferring phase inject until SubagentStop",
+                );
+                return Ok(());
+            }
+        }
         // V0.2 M0.18: prefer the template-aware inject builder when the
         // team / phase is registered. Falls back to the legacy name-only
         // shape only when the team or template is missing (e.g. an
@@ -1443,6 +1514,20 @@ impl Orchestrator {
 
         for (slug, state) in projects {
             self.warn_if_stalled(&slug, &state, now);
+            // V0.2.2 F36: drain `pending-inject.json` before the F35
+            // silence classifier runs so a successfully-drained inject
+            // (which appends a fresh `phase_inject` event) doesn't get
+            // re-classified as `InjectLimbo`. Evergreen projects skip:
+            // they don't go through the F36 send-keys guard.
+            if !self.is_evergreen(&state.team) {
+                if let Err(err) = self.drain_pending_inject(&slug, &state, now) {
+                    tracing::warn!(
+                        slug,
+                        error = format!("{err:#}"),
+                        "F36 pending-inject drain failed; continuing",
+                    );
+                }
+            }
             // V0.2.2 F35: event-aware silence classifier. Runs in the
             // same loop as `warn_if_stalled` so evergreen projects are
             // already filtered upstream — meta-agent silence semantics
@@ -1702,6 +1787,224 @@ impl Orchestrator {
         self.classify_and_act_on_silence(slug, state, now)
     }
 
+    /// Test surface for the F36 daemon-tick drain. `poll_tick` calls
+    /// `drain_pending_inject` directly with `now = Utc::now()`; tests
+    /// pin a controlled `now` so timeout cases are deterministic.
+    pub fn drain_pending_inject_for_test(
+        &self,
+        slug: &str,
+        state: &ProjectState,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<DrainPendingOutcome> {
+        self.drain_pending_inject_inner(slug, state, now)
+    }
+
+    fn drain_pending_inject(
+        &self,
+        slug: &str,
+        state: &ProjectState,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<()> {
+        // The public surface returns the outcome; `poll_tick` doesn't
+        // need it (logging happens inline) so we discard.
+        let _ = self.drain_pending_inject_inner(slug, state, now)?;
+        Ok(())
+    }
+
+    /// V0.2.2 F36 daemon-tick drain.
+    ///
+    /// - No pending file → `DrainPendingOutcome::None`.
+    /// - Pending file + sub-agent still active + budget remaining →
+    ///   `DrainPendingOutcome::StillBlocked`.
+    /// - Pending file + budget exhausted → enriched outbox with
+    ///   `ccteam_classification: "inject_defer_timeout"`, file deleted
+    ///   → `DrainPendingOutcome::TimedOut`.
+    /// - Pending file + sub-agent idle → real
+    ///   `dispatch_phase_with_state` call, file deleted →
+    ///   `DrainPendingOutcome::Drained`. If the dispatch itself defers
+    ///   again (sub-agent restarted between read and write), the
+    ///   pending record is rewritten by the dispatch path; we surface
+    ///   `Deferred` to make that visible to tests.
+    fn drain_pending_inject_inner(
+        &self,
+        slug: &str,
+        state: &ProjectState,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<DrainPendingOutcome> {
+        // Belt-and-suspenders: caller filters evergreen, but refactors
+        // shouldn't accidentally drain a meta-agent's pending record.
+        if self.is_evergreen(&state.team) {
+            return Ok(DrainPendingOutcome::None);
+        }
+        let pending_path = self.paths.project_pending_inject(slug);
+        let Some(pending) = pending_inject::load(&pending_path)? else {
+            return Ok(DrainPendingOutcome::None);
+        };
+
+        // Timeout takes priority over the active-subagent check —
+        // even if a sub-agent is still in flight, after `max_defer_minutes`
+        // we fail loud rather than wait forever.
+        if pending.is_expired(now) {
+            let progress_path = self.paths.progress_jsonl(slug);
+            let last_event = progress::last_event(&progress_path).unwrap_or(None);
+            let silent = stall::silent_seconds(state, now);
+            self.write_inject_defer_timeout_outbox(
+                slug,
+                state,
+                &pending,
+                silent,
+                last_event.as_ref(),
+            )?;
+            // Best-effort delete; if it fails the next tick will retry
+            // the timeout path which is idempotent against a missing
+            // outbox.
+            if let Err(err) = pending_inject::delete(&pending_path) {
+                tracing::warn!(
+                    slug,
+                    error = %err,
+                    "F36 timeout: failed to delete pending-inject; will retry next tick",
+                );
+            }
+            tracing::warn!(
+                slug,
+                phase = %pending.phase,
+                max_defer_minutes = pending.max_defer_minutes,
+                "F36 pending-inject timed out; surfaced as inject_defer_timeout escalate",
+            );
+            return Ok(DrainPendingOutcome::TimedOut);
+        }
+
+        let progress_path = self.paths.progress_jsonl(slug);
+        let events = progress::read_all_events(&progress_path)?;
+        if progress::subagent_active(&events) {
+            return Ok(DrainPendingOutcome::StillBlocked);
+        }
+
+        // Sub-agent has stopped and we're inside the budget — real
+        // dispatch. Use the original phase recorded at defer time so a
+        // late state change doesn't surprise us.
+        match self.dispatch_phase_with_state(slug, &pending.phase, state) {
+            Ok(()) => {
+                // Decide if `dispatch_phase_with_state` actually sent
+                // keys or re-deferred. The race window is real: a
+                // sub-agent could emit `PreToolUse(Task)` between our
+                // `subagent_active` check and the dispatch path's own
+                // check. Either way, the pending file on disk is now
+                // up to date — if the dispatch deferred, it overwrote
+                // our record with a fresh `enqueued_at`; if it sent,
+                // the path is gone (its own write was succeeded by
+                // our delete below, or it didn't write at all). We
+                // reconcile by reading the file back.
+                let after = pending_inject::load(&pending_path)?;
+                if let Some(after) = after {
+                    if after.enqueued_at > pending.enqueued_at {
+                        // Re-deferred — leave the new record on disk
+                        // untouched.
+                        return Ok(DrainPendingOutcome::Deferred);
+                    }
+                    // File still bears our record (dispatch sent keys
+                    // without re-deferring — the normal success path).
+                    // Fall through to delete to maintain the
+                    // invariant "drain on real dispatch ⇒ no pending
+                    // file".
+                }
+                if let Err(err) = pending_inject::delete(&pending_path) {
+                    tracing::warn!(
+                        slug,
+                        error = %err,
+                        "F36 drain: failed to delete pending-inject after dispatch",
+                    );
+                }
+                tracing::info!(
+                    slug,
+                    phase = %pending.phase,
+                    "F36 pending-inject drained; phase prompt sent",
+                );
+                Ok(DrainPendingOutcome::Drained)
+            }
+            Err(err) => {
+                // Dispatch failure (e.g. tmux session missing) — leave
+                // the pending record on disk so the next tick retries.
+                // No counter to bump; the timeout path is the only
+                // give-up route.
+                tracing::warn!(
+                    slug,
+                    phase = %pending.phase,
+                    error = %err,
+                    "F36 drain: dispatch_phase_with_state failed; record left for retry",
+                );
+                Ok(DrainPendingOutcome::DispatchFailed)
+            }
+        }
+    }
+
+    /// Write the F36 `inject_defer_timeout` enriched outbox payload.
+    ///
+    /// Re-uses the F35 schema (same `schema_version`, `event_kind`,
+    /// `ccteam_classification`, `ccteam_silent_seconds`,
+    /// `ccteam_last_event`, `ccteam_pane_tail`, and `body` fields) so
+    /// the watchdog / meta-agent surface treats both classifications
+    /// uniformly.
+    fn write_inject_defer_timeout_outbox(
+        &self,
+        slug: &str,
+        state: &ProjectState,
+        pending: &PendingInject,
+        silent_seconds: u64,
+        last_event: Option<&Value>,
+    ) -> Result<()> {
+        let project_dir = self.paths.project_dir(slug);
+        let cc = project_dir.join(".ccteam");
+        std::fs::create_dir_all(&cc)
+            .with_context(|| format!("create {}", cc.display()))?;
+        let outbox_path = cc.join("needs_attention.outbox.json");
+
+        let pane = capture_pane_tail(slug, 30, false).unwrap_or_default();
+        let last_event_summary = last_event.map(LastEventSummary::from_value);
+        let reason = format!(
+            "F36 pending-inject timeout phase={phase} max_defer_minutes={budget}",
+            phase = pending.phase,
+            budget = pending.max_defer_minutes,
+        );
+        let body = format!(
+            "项目 `{slug}` 的 phase `{phase}` inject 已 defer 超过 {budget} 分钟仍未真发(子 agent 一直未停),需要人工 attach 看看到底卡哪。",
+            slug = slug,
+            phase = pending.phase,
+            budget = pending.max_defer_minutes,
+        );
+
+        let payload = json!({
+            "schema_version": 1,
+            "ts": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            "slug": slug,
+            "event_kind": "escalation",
+            "priority": "high",
+            "reason": reason,
+            "ccteam_classification": "inject_defer_timeout",
+            "ccteam_silent_seconds": silent_seconds,
+            "ccteam_last_event": last_event_summary,
+            "ccteam_pane_tail": pane,
+            "body": body,
+        });
+
+        let pretty = serde_json::to_string_pretty(&payload)?;
+        let tmp = outbox_path.with_extension("json.tmp");
+        std::fs::write(&tmp, pretty)
+            .with_context(|| format!("write {}", tmp.display()))?;
+        std::fs::rename(&tmp, &outbox_path).with_context(|| {
+            format!("rename {} -> {}", tmp.display(), outbox_path.display())
+        })?;
+        tracing::warn!(
+            slug,
+            phase = %pending.phase,
+            current_phase = %state.current_phase,
+            classification = "inject_defer_timeout",
+            silent_seconds,
+            "F36 inject_defer_timeout outbox written",
+        );
+        Ok(())
+    }
+
     fn classify_and_act_on_silence(
         &self,
         slug: &str,
@@ -1778,6 +2081,26 @@ impl Orchestrator {
         last_event: Option<&Value>,
     ) -> Result<()> {
         let project_dir = self.paths.project_dir(slug);
+        // V0.2.2 F36 × F35 coordination: when a pending-inject record
+        // already exists, the F35 deterministic re-inject would no-op
+        // through the F36 guard (the dispatch path would just rewrite
+        // the pending file again). Burning the retry counter on a
+        // no-op breaks the "fix-loop 撞 3 次顶必 escalate" invariant
+        // (we'd cap before ever attempting a real send). Skip — the
+        // F36 daemon-tick drain owns this case and will either send
+        // on SubagentStop or surface `inject_defer_timeout` after the
+        // budget elapses.
+        let pending_path = self.paths.project_pending_inject(slug);
+        if pending_path.exists() {
+            tracing::info!(
+                slug,
+                phase = %state.current_phase,
+                class = class.discriminant(),
+                silent_seconds,
+                "F35 limbo retry skipped: F36 pending-inject in flight",
+            );
+            return Ok(());
+        }
         let retry_path = silence_classifier::retry_path_in(&project_dir);
         let mut counter =
             silence_classifier::load_retry_count(&retry_path, &state.current_phase)?;
