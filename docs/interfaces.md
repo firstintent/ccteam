@@ -1011,13 +1011,15 @@ stop_hook_active == true?
 ```
 
 **`ccteam_classification` 枚举值**(F35 silence_classifier `SilenceClass`,
-PRD §4.2.1 表):
+PRD §4.2.1 表;F36 timeout 沿用同 schema):
 
 - `subagent_runaway` — `PreToolUse(tool=Task)` 后 ≥ phase escalate 阈值,无 SubagentStop
 - `mid_tool_hung` — `PreToolUse(tool != Task)` 后 ≥ phase warn 阈值,无 PostToolUse
 - `limbo_capped` — F35 deterministic re-inject 已重试 cap 次(默认 1)仍未恢复
 - `post_stop_limbo` / `inject_limbo` — 罕见(orchestrator 通常已 re-inject 1 次,
   这两类只在 cap 之前一过性出现)
+- `inject_defer_timeout` — F36 send-keys subagent guard 已 defer 超 `max_defer_minutes`
+  (默认 10)仍未真发(子 agent 一直未停);见 §6.2.3 `pending-inject.json`
 
 `Healthy` / `Terminal` / `SubagentBusy` 不写 outbox(F35 deterministic 判定为不需要
 干预)。
@@ -1054,6 +1056,43 @@ orchestrator 重置(写入新 `phase` + `count: 0`)。
 **红线**:cap = 1 是 F35 在底层 `auto_loop` 3-cap 之上的额外兜底;两层叠加之后
 撞顶必 enriched escalate(CLAUDE.md "fix-loop 撞 3 次顶必 escalate,绝不静默
 重置")。
+
+#### 6.2.3 `pending-inject.json` schema(V0.2.2 F36)
+
+`<project>/.ccteam/pending-inject.json`:F36 send-keys subagent guard 的
+deferred phase-inject 记录。`Orchestrator::dispatch_phase_with_state` 检测到
+`progress::subagent_active(events) == true`(`PreToolUse(tool=Task)` 还有未配
+对的 `SubagentStop`)时不发 send-keys / 不写 `phase_inject` 事件,改落盘本文件;
+orchestrator daemon tick 后续在 SubagentStop 真到达 + 不再 active 时真发并删本
+文件。**单文件覆盖,不积累队列** — 每个项目同时只有一条 deferred phase 待发,
+新的覆盖旧的(`<file>.json.tmp` + rename 原子写)。
+
+```json
+{
+  "schema_version": 1,
+  "slug": "dev-x",
+  "phase": "implement",
+  "attachments": [".ccteam/code-review.md"],
+  "enqueued_at": "2026-05-09T10:00:00Z",
+  "max_defer_minutes": 10
+}
+```
+
+**生命周期**:
+
+1. dispatch 检测 active subagent → save record(`enqueued_at = now`)
+2. 后续 tick:
+   - 仍 active + 未 timeout → no-op,等下次 SubagentStop event
+   - 不再 active + 未 timeout → 真发 `dispatch_phase_with_state`,delete record
+   - timeout(`now - enqueued_at >= max_defer_minutes`) → 写 enriched outbox
+     `ccteam_classification: "inject_defer_timeout"`,delete record(主路径不挂)
+3. evergreen / meta-agent 项目 (`is_evergreen()`) 早 return,跳过 guard 与 drain
+
+**与 F35 协同**(PRD §5.3):
+- F36 主路径主动 defer;`InjectLimbo` 类(phase_inject 后 ≥ warn 阈值无 follow-up)
+  是 F36 race 漏接的兜底重发(F35 deterministic re-inject)
+- F35 `attempt_limbo_reinject` 检测到 pending-inject 在飞 → 跳过本次 retry,
+  不烧 `MAX_LIMBO_RETRY` 预算(F36 drain 路径独立兜底)
 
 `cct hook intercept-ask` 返回的 PreToolUse 决策(`hooks.ts:608-625`):
 

@@ -1271,6 +1271,15 @@ orchestrator 是**所有 phase 派发 + inbox 派送**的单点 — daemon 死�
   limbo 自动 deterministic re-inject 1 次(`MAX_LIMBO_RETRY = 1`,per-phase
   计数);超 cap 写 enriched `needs_attention.outbox.json` 由 watchdog +
   meta-agent 翻译给用户。**不发 Ctrl-C / 不 kill / 不 LLM**。
+- **V0.2.2 F36 send-keys subagent guard**:`dispatch_phase_with_state` 注入前
+  调 `progress::subagent_active(events)`(扫末事件:`PreToolUse(tool=Task)` 减
+  `SubagentStop` 配对 > 0 → true),发现子 agent 在飞时不发 send-keys、不写
+  `phase_inject` 事件,改落 `<project>/.ccteam/pending-inject.json`(单文件,
+  schema 详 interfaces.md §6.2.3)。daemon tick 后续在 SubagentStop 真到 + 不
+  active 时真发并删本文件;`max_defer_minutes`(默认 10)兜底,超时改写 enriched
+  outbox `ccteam_classification: "inject_defer_timeout"`。F35 `attempt_limbo_reinject`
+  发现 pending-inject 在飞时跳过本次 retry,不烧 deterministic 预算;F36 race
+  漏接(eg 子 agent 几秒后才 emit)兜底走 F35 `InjectLimbo`。
 
 ```bash
 # 注入前判断
