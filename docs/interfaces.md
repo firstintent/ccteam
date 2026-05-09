@@ -968,18 +968,81 @@ stop_hook_active == true?
             (CLI dispatcher 写 stderr,exit 2;Claude Code 把 stderr 当 blockingError 注入下一轮)
 ```
 
-`needs_attention.outbox.json` schema:
+`needs_attention.outbox.json` schema(两个 writer,共享 schema):
 
 ```json
 {
   "schema_version": 1,
   "ts": "<RFC3339>",
   "slug": "<slug>",
-  "reason": "stop_hook_active recursion guard tripped — phase produced no PHASE_DONE/ESCALATE/outbox over two consecutive Stop entries",
+  "reason": "<short human description>",
+
+  // M0.19 Stop hook L3 fail-safe writer fields (recursion guard).
+  // Optional — F35 writer omits these.
   "last_assistant_message": "<原始末段 assistant 文本>",
-  "pane_tail": "<tmux capture-pane 末 30 行;仅 surface 给用户,不参与 orchestrator 状态机>"
+  "pane_tail": "<tmux capture-pane 末 30 行(legacy 字段名;F35 复用 ccteam_pane_tail)>",
+
+  // V0.2.2 F35 silence-classifier enriched fields. Optional —
+  // M0.19 L3 writer omits these. Meta-agent role prompt §7.0
+  // surfaces them as propose-confirm options.
+  "event_kind": "escalation",
+  "priority": "high",
+  "ccteam_classification": "mid_tool_hung",        // 见 SilenceClass 枚举
+  "ccteam_silent_seconds": 900,
+  "ccteam_last_event": {                            // F35 progress.jsonl 末事件摘要
+    "ts": "<RFC3339>",
+    "event": "PreToolUse",
+    "tool": "Read"                                  // 仅 PreToolUse / PostToolUse 含
+  },
+  "ccteam_pane_tail": "<tmux capture-pane 末 30 行;仅 surface,不进 orchestrator 状态机>",
+  "body": "<NL 翻译给 meta-agent / 用户的描述>"
 }
 ```
+
+**`ccteam_classification` 枚举值**(F35 silence_classifier `SilenceClass`,
+PRD §4.2.1 表):
+
+- `subagent_runaway` — `PreToolUse(tool=Task)` 后 ≥ phase escalate 阈值,无 SubagentStop
+- `mid_tool_hung` — `PreToolUse(tool != Task)` 后 ≥ phase warn 阈值,无 PostToolUse
+- `limbo_capped` — F35 deterministic re-inject 已重试 cap 次(默认 1)仍未恢复
+- `post_stop_limbo` / `inject_limbo` — 罕见(orchestrator 通常已 re-inject 1 次,
+  这两类只在 cap 之前一过性出现)
+
+`Healthy` / `Terminal` / `SubagentBusy` 不写 outbox(F35 deterministic 判定为不需要
+干预)。
+
+**两个 writer 共存**:M0.19 L3 fail-safe 写 `pane_tail` /
+`last_assistant_message`;F35 silence classifier 写 `ccteam_*` 字段族(包括
+`ccteam_pane_tail`)+ `body`。watchdog (M0.21) 读所有字段并向 meta-agent surface;
+后写覆盖前写(原子 `<file>.tmp` + rename)。
+
+**字段分工**:`reason` = 单行短描述(grep 友好,日志可摘);`body` = NL 段落
+(meta-agent §7.0 翻译模板的输入,可含选项 a/b/c)。两者都由 F35 writer 写,
+M0.19 L3 writer 只写 `reason`。
+
+#### 6.2.2 `limbo-retry-count.json` schema(V0.2.2 F35)
+
+`<project>/.ccteam/limbo-retry-count.json`:F35 silence classifier 的 per-phase
+deterministic re-inject 计数器。`MAX_LIMBO_RETRY = 1`(`PostStopLimbo` /
+`InjectLimbo` 类只重试 1 次,超 cap 转 enriched escalate)。phase 推进时
+orchestrator 重置(写入新 `phase` + `count: 0`)。
+
+```json
+{
+  "phase": "implement",
+  "count": 1,
+  "last_at": "2026-05-09T10:00:00Z"
+}
+```
+
+**生命周期**:phase 进入 → 计数器不存在 / 0;触发 limbo + re-inject 成功 →
+`count = 1` + `last_at` 更新;再触发 limbo → cap 已满,写 enriched outbox 改记
+`ccteam_classification: "limbo_capped"`,**不**再 re-inject。phase 推进 →
+`reset_retry_count(path, &new_phase)` 重写为 `count: 0` + `phase = new_phase`。
+
+**红线**:cap = 1 是 F35 在底层 `auto_loop` 3-cap 之上的额外兜底;两层叠加之后
+撞顶必 enriched escalate(CLAUDE.md "fix-loop 撞 3 次顶必 escalate,绝不静默
+重置")。
 
 `cct hook intercept-ask` 返回的 PreToolUse 决策(`hooks.ts:608-625`):
 

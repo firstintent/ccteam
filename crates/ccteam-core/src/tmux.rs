@@ -237,6 +237,40 @@ impl TmuxSession {
     }
 }
 
+/// Capture the last `lines` lines of the project's tmux pane, addressed
+/// by slug. Returns `None` when tmux isn't installed, the session is
+/// missing, or the invocation otherwise fails — every call site is a
+/// best-effort surface (no Result propagation).
+///
+/// The captured text only ever lands in user-facing surfaces
+/// (`needs_attention.outbox.json` payload / meta-agent NL translation)
+/// — **never** parsed by the orchestrator's state machine (CLAUDE.md
+/// "永不解析 tmux 终端输出" red line).
+///
+/// `with_ansi=false` runs `tmux capture-pane -p` (plain text, the F35
+/// silence-classifier path). `with_ansi=true` runs `tmux capture-pane
+/// -e -p` so escape sequences round-trip — reserved for the F38
+/// screenshot path (V0.2.2 PR #5); F35 callers pass `false`.
+pub fn capture_pane_tail(slug: &str, lines: usize, with_ansi: bool) -> Option<String> {
+    let session = session_name_for_slug(slug);
+    let mut cmd = Command::new("tmux");
+    cmd.arg("capture-pane").arg("-p");
+    if with_ansi {
+        cmd.arg("-e");
+    }
+    cmd.args(["-t", &session, "-S", &format!("-{lines}")]);
+    let output = cmd.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim_end().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
 /// `kill -0 <pid>`: returns true iff the process exists and the caller
 /// has permission to signal it. Used in the documented double-check
 /// (`tmux has-session` + `kill -0 pid`) for orchestrator reattach.

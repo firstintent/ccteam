@@ -17,6 +17,7 @@ pub mod phases;
 pub mod plugin_resolution;
 pub mod progress;
 pub mod projects;
+pub mod silence_classifier;
 pub mod stall;
 pub mod state;
 pub mod subskill;
@@ -67,6 +68,12 @@ pub use daemon::{
     send_sigterm_to_pidfile, write_heartbeat, write_pidfile, DaemonHealth, HEARTBEAT_GRACE,
     HEARTBEAT_INTERVAL, HEARTBEAT_NAME, PIDFILE_NAME,
 };
+pub use silence_classifier::{
+    classify as classify_silence, load_retry_count as load_limbo_retry_count,
+    reset_retry_count as reset_limbo_retry_count, retry_path_in as limbo_retry_path_in,
+    save_retry_count as save_limbo_retry_count, LastEventSummary, LimboAction, LimboRetryCount,
+    SilenceClass, LIMBO_RETRY_FILE, MAX_LIMBO_RETRY,
+};
 pub use stall::{
     classify as classify_stall, classify_with_thresholds, silent_seconds, StallLevel,
     StallThresholds, STALL_ESCALATE_SECONDS, STALL_SUSPICIOUS_SECONDS, STALL_WARN_SECONDS,
@@ -108,7 +115,9 @@ pub use templates::{
 // seed source for `write_all_global_team_templates`; runtime code paths
 // outside ccteam-core query disk (`<global_dir>/teams/<name>/team.yaml`)
 // instead.
-pub use tmux::{pid_is_alive, session_name_for_slug, tmux_available, TmuxSession};
+pub use tmux::{
+    capture_pane_tail, pid_is_alive, session_name_for_slug, tmux_available, TmuxSession,
+};
 pub use plugin_resolution::{
     lookup_plugin_agent, plugins_to_enable, PluginAgent, KNOWN_PLUGIN_AGENTS,
 };
