@@ -41,6 +41,8 @@
 
 > **session 起手 30 秒 onboarding**:`git rev-parse origin/main` 看 HEAD → `cargo test --workspace 2>&1 \| grep -E "^test result" \| awk '{p+=$4;f+=$6}END{print p,f}'` 看 baseline → 读 `docs/v0-2/README.md` 看当前版状态 + V0.3 候选 → 读用户的具体诉求 → 干。
 
+> **对照参考**(本地 clone,**`/references/` 已 gitignore**,不入库):`references/claude-code/`(Anthropic Claude Code 源码,bun + TypeScript)+ `references/codex/codex-rs/`(OpenAI Codex CLI Rust workspace)。做 HarnessAdapter / 协议适配 / hook 兼容性 / statusline-stdin shape 验证 等接口工作时翻;**不要把这两份源码当 ccteam 自己的依赖**(永久 deferred)。
+
 ---
 
 ## 三、不可触碰的架构红线
