@@ -123,3 +123,15 @@
 - **V0.1 → V0.2 升级一次性迁移**:M0.20 后 plugin agent 通过 spawned session `enabledPlugins` 启用,不再 ln -sf 进 `~/.claude/agents/`。V0.1 用户首次升级 V0.2 时跑 `ccteam doctor --migrate-recommended-agents` 清理旧 ln -sf(只删 ccteam 自己创建的 marketplace symlink,用户手写 agent 不动)
 - **V0.2.2 (F39) → V0.2.2 (F44) 反向迁移**:用户从 F39'd V0.2.2 升级到 F44'd V0.2.2 时,`ccteam doctor` 自动检测 `~/.local/bin/cct` 旧 symlink、`~/.claude/skills/cct-{control,team-author,project-creator}/` 旧 skill dir(marker 校验,只清 ccteam-managed 的;用户手改保留 + warn)、`~/projects/<slug>/.claude/settings.json` 老 hook command 路径(`cct` → `ccteam`,原子写)。原因:F39 选 `cct` 二进制名时未检查 namespace,Ubuntu `proj-bin` 已占 `/usr/bin/cct`(PROJ 工具),`~/.local/bin/cct` 在标准 PATH 上会静默 shadow GIS 工具
 - **本文件不超过 250 行** — CLAUDE.md 越长 cache 越贵,Claude 越忽略(best-practices §4.1 + §8)
+
+---
+
+## 七、Rust 代码格式化约定
+
+`rustfmt.toml` 在仓库根 pin 房子样式(stable rustfmt;`max_width = 100`、`tab_spaces = 4`、`use_field_init_shorthand`)。约定:
+
+- **新文件 / 大改的文件:`cargo fmt -- <files>` 必跑**(commit 前)。提交前每个 PR 跑一遍 `cargo fmt --check -- <changed_files>` 自检。
+- **小改 drifted 文件:不做 fmt-sweep**。本仓存量 fmt drift ~4-5 kLOC(历史遗留);全仓 `cargo fmt --all` 会爆 PR diff,review 不动。规则:动几行格式化几行,周边老代码不顺手 reformat。
+- **不上 workspace-wide CI fmt gate**(直到 drift 清零):全仓 `cargo fmt --check` 会红;改用 changed-files-only 自检 + `make fmt` 局部跑。
+- **`make fmt` = `cargo fmt --all`**(开发态便利,清干净自己的工作树用);**`make fmt-check` = `cargo fmt --all -- --check`**(只在 drift 清零后才指望它绿)。
+- **drift 清理走独立 chore PR**:不混进 finding / feature PR;按模块拆,一次一个 crate / 子目录,方便 review。
