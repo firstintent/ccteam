@@ -49,6 +49,7 @@ RUNTIME_DIRS   := state progress inbox queue control log
 .DEFAULT_GOAL := help
 .PHONY: help build release clean check fmt clippy test \
         install uninstall reinstall \
+        setup start attach \
         doctor tool-surface \
         tmux-clean agents-clean state-clean wipe nuke
 
@@ -68,6 +69,10 @@ help:
 	@printf '  make install       symlink %s → %s\n' '$(RELEASE_BIN)' '$(BIN_LINK)'
 	@printf '  make uninstall     remove %s (state untouched)\n' '$(BIN_LINK)'
 	@printf '  make reinstall     uninstall + install\n\n'
+	@printf '\033[1mFirst-time setup & run (end-to-end)\033[0m\n'
+	@printf '  make setup HANDLE=<h>   one-shot: init + 4 doctor installs + tool-surface\n'
+	@printf '  make start              ccteam start --foreground (Terminal A)\n'
+	@printf '  make attach HANDLE=<h>  tmux attach -t ccteam-meta-<h> (Terminal B)\n\n'
 	@printf '\033[1mHealth check\033[0m\n'
 	@printf '  make doctor        ccteam doctor --tool-surface\n'
 	@printf '  make tool-surface  alias for doctor\n\n'
@@ -137,6 +142,43 @@ uninstall:
 	fi
 
 reinstall: uninstall install
+
+# --- First-time setup & run --------------------------------------------------
+#
+# `make setup HANDLE=rob` bundles the six idempotent first-time steps so users
+# don't have to memorize / paste-and-edit the doctor command list. `make start`
+# and `make attach` wrap the canonical Quick start two-terminal flow.
+
+HANDLE ?=
+
+setup:
+	@if [ -z "$(HANDLE)" ]; then \
+	    printf '\033[31merror:\033[0m HANDLE is required. Example: make setup HANDLE=rob\n' >&2; \
+	    exit 1; \
+	fi
+	@command -v $(BIN_NAME) >/dev/null || { printf '\033[31merror:\033[0m %s not on PATH; run `make install` first\n' '$(BIN_NAME)' >&2; exit 1; }
+	$(BIN_NAME) init
+	$(BIN_NAME) doctor --install-skill
+	$(BIN_NAME) doctor --install-mcp
+	$(BIN_NAME) doctor --install-memory-bridge
+	$(BIN_NAME) doctor --install-meta-agent $(HANDLE)
+	$(BIN_NAME) doctor --tool-surface
+	@printf '\n\033[32mready.\033[0m\n'
+	@printf 'next:\n'
+	@printf '  Terminal A: make start                 (or: ccteam start --foreground)\n'
+	@printf '  Terminal B: make attach HANDLE=%s     (or: tmux attach -t ccteam-meta-%s)\n' '$(HANDLE)' '$(HANDLE)'
+
+start:
+	@command -v $(BIN_NAME) >/dev/null || { printf '\033[31merror:\033[0m %s not on PATH; run `make install`\n' '$(BIN_NAME)' >&2; exit 1; }
+	$(BIN_NAME) start --foreground
+
+attach:
+	@if [ -z "$(HANDLE)" ]; then \
+	    printf '\033[31merror:\033[0m HANDLE is required. Example: make attach HANDLE=rob\n' >&2; \
+	    exit 1; \
+	fi
+	@command -v tmux >/dev/null || { printf '\033[31merror:\033[0m tmux not installed\n' >&2; exit 1; }
+	tmux attach -t ccteam-meta-$(HANDLE)
 
 # --- Health check ------------------------------------------------------------
 
