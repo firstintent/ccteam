@@ -313,6 +313,11 @@ phase 协议的核心架构选择（论证留本节,字段细节看 interfaces�
 - **YAML front matter 是 orchestrator 的唯一解析入口**——`required_inputs` / `required_outputs` 给 L1 架构约束验证；`parallelism` / `agent_team` / `sub_skills` 给痛点 11/12/13 的实现层；`hooks` 给 phase 级生命周期。不解析 prompt body,prompt body 完全留给 claude。
 - **Seed 输出靠 YAML 决定走向（PASS/REJECT/CLARIFY），不依赖 LLM 自然语言判断**——orchestrator 只 parse front matter `verdict`，避免"AI 说话不算数"。
 - **`parallelism` 字段决定主框架并行粒度**(详见 §6.11):solo(已 ship,默认) / agent_team(永久 deferred,见 §6.3 模式 A 与 docs/v0-1/m2-agent-team-spike.md) / multi_session(未 ship,M4.8)。subagent **不在此声明**——任何 agent 都可 ad-hoc 通过 Task 工具启动,叠加在主框架之上。
+- **`team.yaml::kind` 决定团队姿态**(V0.3.1):`workflow` / `multi_workflow`
+  继续走 phase DAG;`flex` 没有 phase DAG,orchestrator 不注入 phase prompt /
+  auto_loop / golden_rules,但 hooks、progress、cost、silence classifier 与
+  web observability 保留。`kind` 是 team 级字段,与 phase 级 `parallelism`
+  正交。
 
 ### 3.4 Workspace 隔离与并行
 
@@ -662,7 +667,7 @@ ccteam start / stop                    # orchestrator 生命周期
 这条**作为辅助路径保留**,但不是 ccteam 的核心入口。核心入口是
 meta-agent session + Channel Layer。
 
-#### Web 仪表盘(V0.3 已 ship — M5.0-M5.4 全 merge,workspace.version 0.3.0)
+#### Web 仪表盘(V0.3/V0.3.1 已 ship — workspace.version 0.3.1)
 
 V0.2 / V0.2.2 之前曾把 web 仪表盘剥离主线(`ccteam ls --format json` + 用户自带 claude 已覆盖"用人话汇报")。V0.3 重新评估:多项目并发(M3+ team factory ship 后用户实际跑 ≥ 3 项目)与离场场景下,「一屏看全局」需要可视化聚合;`ccteam ls` 表格在 ≥ 5 项目时阅读成本陡增。**因此 V0.3 ship `ccteam web`,作为第四类用户接入面**,与 CLI / MCP / filesystem 共存,各自最强项不同(终端 = power user 全控;MCP = meta-agent 自动化;filesystem = hooks / 调试;web = 一屏总览 + 局域网 / 手机访问)。
 
@@ -677,6 +682,7 @@ V0.3 ship 状态:
 | **M5.2** | SSE 实时事件流(`/sse/all` + `/sse/project/<slug>` 单 `notify` watcher → `tokio::sync::broadcast` capacity `1024` fan-out;wire format `event: progress` + `data: <one-line-JSON>`,15s `: keepalive`)+ 按需 PNG 截图(`/screenshot/<slug>.png` 同步 `spawn_blocking` 调 F38 `render_screenshot`,F38 不可用 → 504 + plain-text reason,**不 polling**)| ✅ |
 | **M5.3** | 写动作(`POST /api/<slug>/{btw,inject_decision,pause,resume}` 全走 `ccteam_core::actions::*` M5.0 promote;handler boundary 校验长度 + path-traversal `..` + `<project>/.ccteam/` prefix)+ token 鉴权(loopback 免 token / 非 loopback 默认 token / `--no-auth` opt-out + 5s LAN-RCE 倒计时;`Authorization: Bearer ccteam:<token>`,`subtle::ConstantTimeEq` 比对,`~/.ccteam/web-token` mode 0600;浏览器 URL shim `?token=ccteam:<hex>` → HttpOnly `ccteam_token` cookie + 303 → 干净 URL;`/health` 例外免 auth)| ✅ |
 | **M5.4** | E2E + retro + workspace.version `0.2.2` → `0.3.0` ship gate(`tests/e2e_test.rs` 跨层 happy path canary;`docs/v0-3/e2e-retro.md` ship 报告)| ✅ |
+| **V0.3.1 F50/F51** | flex UI:dashboard `Kind` 列、`/project/<slug>` session cards、`/session/<slug>/<sid>` 详情、`/sse/project/<slug>/<sid>` sid filter、`/screenshot/<slug>-<sid>.png`、F51 flex e2e canary | ✅ |
 
 V0.3 主要红线(详 PRD §3 / `interfaces.md` §15 / CLAUDE.md §三):
 
@@ -1005,6 +1011,12 @@ orchestrator 通过 `PreToolUse` hook 检测最近一次输入源：若来自人
 ### 6.3 Multi-agent 编排（phase 内并行 + cross-cutting watcher）
 
 ccteam 用 multi-agent 编排同时承担两个不同目标——**质量**（痛点 11 L2，多视角议事）与**速度**（痛点 13 L 加速，多角色并行）。两个目标用同一个 Agent Teams 机制实现，但 phase prompt 中表达不同：
+
+V0.3.1 另加一条**进程级**并行路径: `kind: flex` 项目通过
+`ccteam session add/ls/attach/rm` 手动管理多个 harness session。它不是
+phase 内 Agent Team,也不参与 fan-out/fan-in;每个 session 都有独立 cwd /
+progress stream / harness snapshot,用于用户原生 Claude Code 工作流与
+cross-review。
 
 | 目标 | 多 agent 干啥 | 典型 phase | 痛点 |
 |---|---|---|---|
@@ -1349,7 +1361,16 @@ ccteam 不重写 gstack / claude-plugins-official 的 skill；ccteam 的差异�
 
 两字段在 phase front matter 共存、互不冲突。
 
-### 6.11 Multi-session per project（痛点 13 大项目加速；未 ship,M4.8）
+### 6.11 Multi-session per project（痛点 13 大项目加速）
+
+V0.3.1 已 ship **adhoc flex multi-session**:只对 `kind: flex` 项目生效,
+用户显式 `ccteam session add <slug> --harness=claude` 创建
+`<project>/.ccteam/sessions/<sid>/`,master `state.json::sessions` 注册,
+tmux 名 `ccteam-<slug>-<sid>`,progress 走
+`~/.ccteam/progress/<slug>/<sid>.jsonl`。`session rm` 是唯一用户显式授权
+关闭 session 的路径。Codex harness 在 V0.3.1 是 trait stub,V0.3.2 实现。
+
+下面的 **phase fan-out/fan-in multi_session** 仍未 ship(M4.8):
 
 适用：plan-eng 在分析 spec 时识别出"≥3 个独立子模块且接口稳定"——例如 SaaS 拆 backend-api / frontend-dashboard / mobile-app / docs。**未 ship(M4.8)**；当前默认 `parallelism: solo`(`agent_team` 槽位永久 deferred,见 §6.3 模式 A)。
 
@@ -1446,7 +1467,7 @@ V0.3 候选(本里程碑不做):
 - `dependencies`(team-plugin 间依赖,eg 引用 `code-reviewer` plugin)
 - 多 phase 一次性 init(当前 V0.2 单 phase 起步,多 phase 走 skill 多轮 init)
 
-### 6.13 Web layer(V0.3 已 ship,M5.0-M5.4 全 merge)
+### 6.13 Web layer(V0.3/V0.3.1 已 ship)
 
 V0.3 主线版本新加第四接入层(继 terminal / MCP / filesystem 之后),由 `crates/ccteam-web` crate 提供:
 
@@ -1459,6 +1480,9 @@ V0.3 主线版本新加第四接入层(继 terminal / MCP / filesystem 之后),�
   - **截图**:`/screenshot/<slug>.png` 同步调 `ccteam_core::render_screenshot`(F38)wrap 在 `tokio::task::spawn_blocking`(F38 内部 shell out tmux + imageproc 渲染,会 ~200-500 ms 阻塞);F38 graceful degrade(tmux 无 session)→ **504 + plain-text reason**,不 polling(`Cache-Control: no-cache, must-revalidate`)。
 - **M5.3 范围**:写动作 endpoint(`POST /api/<slug>/{btw,inject_decision,pause,resume}`)+ 默认 token 鉴权(loopback bypass + 非 loopback 自动生成 `~/.ccteam/web-token` mode 0600 + URL shim cookie + CSRF 防御)。
 - **M5.4 范围**:`crates/ccteam-web/tests/e2e_test.rs` 端到端 canary(GET / → /project/<slug> → SSE → POST /btw 跨层 sequenced)+ `docs/v0-3/e2e-retro.md` ship 报告 + workspace.version `0.2.2 → 0.3.0` + CLAUDE.md baseline 回填。详 `docs/v0-3/prd.md` §3-§7。
+- **V0.3.1 范围**:flex 项目 web 适配(`/session/<slug>/<sid>`、sid-scoped
+  SSE / harness / screenshot / `/btw`),`crates/ccteam-web/tests/flex_e2e_test.rs`
+  作为 F51 ship gate canary。
 - **架构红线**(V0.3 主线维持):progress.jsonl 仍是 SoT,web 不解析 tmux 终端(M5.2 SSE watcher 仅读 progress.jsonl,F38 截图内部 vt100 化非文本解析);web 不 kill 长 session;web 不写跨项目记忆;`/btw` 走跟 telegram channel + MCP `send_to_session` 完全相同的 inbox + idle dispatch 路径,不开新通路。
 
 ---

@@ -145,6 +145,22 @@ Surface:
 - Live updates via Server-Sent Events
 - Write actions: send `/btw <text>`, inject decisions, pause/resume per project
 
+V0.3.1 adds flex teams for manual multi-session work. A flex project has no phase DAG:
+ccteam keeps observability, harness snapshots, progress streams, and web controls while you drive
+Claude Code sessions directly.
+
+```bash
+ccteam team init scratch --kind flex --author-name "$USER"
+ccteam team publish scratch --target local
+ccteam new "Investigate the migration plan" --team scratch --slug scratch-migration
+ccteam session add scratch-migration --harness=claude
+ccteam session ls scratch-migration
+```
+
+The dashboard shows `kind=flex`; `/project/<slug>` lists session cards, and
+`/session/<slug>/<sid>` shows that session's events, harness snapshot, pane snapshot, screenshot
+fallback, and sid-scoped `/btw` control.
+
 Security: non-loopback bind requires `Authorization: Bearer ccteam:<token>` (or the cookie set by the URL shim) on every request — this header doubles as the CSRF token for write actions, since browsers won't auto-attach `Authorization` on cross-origin form submissions. `--no-auth` opt-out shows a 5-second stderr countdown so accidents are recoverable. See [`docs/v0-3/prd.md §9`](docs/v0-3/prd.md) for the full threat model.
 
 ## Built-in teams
