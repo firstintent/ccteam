@@ -1427,6 +1427,16 @@ V0.3 候选(本里程碑不做):
 - `dependencies`(team-plugin 间依赖,eg 引用 `code-reviewer` plugin)
 - 多 phase 一次性 init(当前 V0.2 单 phase 起步,多 phase 走 skill 多轮 init)
 
+### 6.13 Web layer(V0.3 M5.0 起;占位,M5.4 补全)
+
+V0.3 主线版本新加第四接入层(继 terminal / MCP / filesystem 之后),由 `crates/ccteam-web` crate 提供:
+
+- **入口**:`ccteam web --bind <addr> [--no-auth] [--token-file <path>]`(`docs/interfaces.md` §10.6)。CLI subcommand 调 `ccteam_web::serve(ServeOpts)`,axum 0.8 server 绑端口、装路由、Ctrl-C / SIGTERM 优雅退出。
+- **依赖图**:`ccteam-web` 只 depend on `ccteam-core`(F45 promote 后 4 个 write helper 落 `actions::*` 模块)。**严格不 dep `ccteam-cli`** — `crates/ccteam-web/tests/dep_graph_test.rs` 自检 `cargo tree -p ccteam-web` 不命中 `ccteam-cli`。
+- **M5.0 范围**(本里程碑):scaffold + `GET /health` 200 JSON + `ServeOpts { bind, no_auth, token_file }` 类型形稳。
+- **后续里程碑**:M5.1 read-only dashboard + 项目详情页(askama 模板 + htmx)/ M5.2 SSE + 按需 PNG 截图 / M5.3 写动作 endpoint + 默认 token 鉴权(loopback bypass)/ M5.4 e2e + ship gate。详 `docs/v0-3/prd.md` §3-§7。
+- **架构红线**(V0.3 主线维持):progress.jsonl 仍是 SoT,web 不解析 tmux 终端;web 不 kill 长 session;web 不写跨项目记忆;`/btw` 走跟 telegram channel + MCP `send_to_session` 完全相同的 inbox + idle dispatch 路径,不开新通路。
+
 ---
 
 ## 7. 里程碑路线图

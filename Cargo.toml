@@ -4,6 +4,7 @@ members = [
     "crates/ccteam-core",
     "crates/ccteam-cli",
     "crates/ccteam-hooks",
+    "crates/ccteam-web",
 ]
 
 [workspace.package]
@@ -15,6 +16,7 @@ license = "MIT"
 [workspace.dependencies]
 ccteam-core = { path = "crates/ccteam-core" }
 ccteam-hooks = { path = "crates/ccteam-hooks" }
+ccteam-web = { path = "crates/ccteam-web" }
 
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive", "env"] }
@@ -28,6 +30,17 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 regex = { version = "1", default-features = false, features = ["std", "perf"] }
+
+# V0.3 M5.0 — web UI (axum + askama). Pinned per `docs/v0-3/prd.md`
+# §3.2.2; minor bumps in M5.x must update the table there.
+axum = "0.8"
+askama = "0.12"
+# Constant-time token comparison for M5.3 token auth. Pulled in at
+# M5.0 so `ServeOpts::token_file` can carry the knob without dep
+# manifest churn when the auth middleware actually lands.
+subtle = "2.5"
+# HTTP client used by ccteam-web integration tests (lib + subprocess).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [profile.release]
 lto = true

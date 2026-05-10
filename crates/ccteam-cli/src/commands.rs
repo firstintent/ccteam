@@ -17,10 +17,15 @@ use ccteam_core::{
     write_global_helper_templates, write_global_phase_templates, CcteamPaths,
     HookCmdRewriteAction, HookCmdRewriteReport, InstallSkillOptions, LegacySkillAction,
     LegacySkillReport, MetaBootstrapReport, MigrationReport, OutboxEventKind, OutboxMessage,
-    PhaseHistoryEntry, PhaseState, PhaseTemplate, ProjectState, SessionMailbox,
+    PhaseState, PhaseTemplate, ProjectState, SessionMailbox,
     SkillInstallAction, TeamSpec, ToolSurfaceSnapshot, BUILTIN_SUBAGENTS, HELPER_TEMPLATES,
     PHASE_TEMPLATES,
 };
+// V0.3 M5.0: `run_resume` body lives in `ccteam_core::actions::resume`,
+// so `PhaseHistoryEntry` is now only referenced from the test module
+// (other consumers go through the actions::* path).
+#[cfg(test)]
+use ccteam_core::PhaseHistoryEntry;
 use ccteam_core::tmux::TmuxSession;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -601,35 +606,14 @@ pub fn run_progress(paths: &CcteamPaths, slug: &str, tail: bool) -> Result<()> {
 /// `"resumed"` entry (append-only — we don't mutate the prior
 /// escalated entry, so the escalation history stays auditable) so
 /// `is_terminal_state` lifts the flag.
+///
+/// V0.3 M5.0: body lives in `ccteam_core::actions::resume` so the
+/// V0.3 web layer (and the MCP wrapper) can call the same logic
+/// without depending on `ccteam-cli`. This thin wrapper preserves the
+/// public CLI surface; `ccteam resume <slug>` continues to dispatch
+/// through here.
 pub fn run_resume(paths: &CcteamPaths, slug: &str) -> Result<()> {
-    let state_path = paths.project_state(slug);
-    let mut state = ProjectState::load(&state_path)
-        .with_context(|| format!("load state for {slug}"))?;
-    state.user_pause_pending = false;
-    state.user_attached = false;
-    state.phase_state = PhaseState::Idle;
-    state.last_user_interaction_at = Utc::now();
-    if matches!(
-        state.phase_history.last().map(|h| h.status.as_str()),
-        Some("escalated"),
-    ) {
-        state.phase_history.push(PhaseHistoryEntry {
-            phase: state.current_phase.clone(),
-            status: "resumed".into(),
-            duration_s: 0,
-            cost_usd: 0.0,
-        });
-    }
-    state.save(&state_path)?;
-
-    let esc = paths.project_ccteam_dir(slug).join("escalation.md");
-    if esc.exists() {
-        let archive = paths
-            .project_ccteam_dir(slug)
-            .join(format!("escalation.{}.md", state.context_reset_count));
-        let _ = std::fs::rename(&esc, &archive);
-    }
-    Ok(())
+    ccteam_core::actions::resume(paths, slug)
 }
 
 /// One row in the cross-project decisions queue (`ccteam decisions`).
@@ -2166,6 +2150,39 @@ fn render_watchdog_text(alerts: &[ccteam_core::WatchdogAlert], pushed: bool) -> 
         out.push_str("(also written to meta-agent outbox)\n");
     }
     out
+}
+
+/// V0.3 M5.0: knobs forwarded by `ccteam web` clap struct → axum
+/// scaffold. Mirrors `ccteam_web::ServeOpts` 1:1 except `bind` is
+/// still a string here (parsed in `run_web`).
+#[derive(Debug, Clone)]
+pub struct WebOptions {
+    pub bind: String,
+    pub no_auth: bool,
+    pub token_file: Option<std::path::PathBuf>,
+}
+
+/// `ccteam web --bind <addr>` entry. Translates clap-side string +
+/// flags into `ccteam_web::ServeOpts`, then drives a current-thread
+/// tokio runtime to `serve(opts)` (mirrors the `mcp-serve` shape so a
+/// future operator running both side-by-side sees the same harness).
+pub fn run_web(opts: WebOptions) -> Result<()> {
+    use std::net::SocketAddr;
+
+    let bind: SocketAddr = opts
+        .bind
+        .parse()
+        .with_context(|| format!("parse --bind `{}` as SocketAddr", opts.bind))?;
+    let serve_opts = ccteam_web::ServeOpts {
+        bind,
+        no_auth: opts.no_auth,
+        token_file: opts.token_file,
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime for ccteam web")?;
+    runtime.block_on(ccteam_web::serve(serve_opts))
 }
 
 #[cfg(test)]

@@ -3,6 +3,7 @@
 //! `ccteam-hooks` (hook handlers invoked via `ccteam hook ...`).
 
 
+pub mod actions;
 pub mod cost;
 pub mod daemon;
 pub mod dag;
@@ -32,6 +33,10 @@ pub mod tmux;
 pub mod tool_surface;
 pub mod watchdog;
 
+pub use actions::{
+    inject_decision, next_inbox_seq, pause, resume, send_to_session, send_to_session_with,
+    DecisionInput, SendOptions, SendResult,
+};
 pub use dag::{dev_dag, Dag};
 pub use auto_loop::{AutoLoopDecision, AutoLoopFrontMatter, AutoLoopState};
 pub use golden_rules::{

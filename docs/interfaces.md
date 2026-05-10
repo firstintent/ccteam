@@ -1438,6 +1438,11 @@ ccteam doctor --migrate-recommended-agents        # V0.2 M0.20 一次性清理 V
 ccteam hook <subcmd>                              # debug:手动跑 hook(读 stdin JSON,写 stdout);
                                                   # subcmd ∈ {progress-append, parse-phase-end,
                                                   # cost-accumulate, load-context, block-push}
+ccteam web --bind 127.0.0.1:7331                  # V0.3 M5.0 web UI scaffold(`/health` only;
+                                                  # M5.1 dashboard / M5.2 SSE / M5.3 写动作 + token auth)
+ccteam web --bind 0.0.0.0:7331 [--no-auth]        # 同上,LAN 模式;M5.3 默认强 token 鉴权,
+                                                  # `--no-auth` 5s 倒计时 + stderr warn 后照样 listen
+ccteam web --token-file <path>                    # 自定义 token 文件路径(M5.3 消费;默认 ~/.ccteam/web-token)
 ```
 
 #### `ccteam stop` 行为契约(M1.5)
