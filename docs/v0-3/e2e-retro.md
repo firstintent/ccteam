@@ -24,7 +24,7 @@ V0.3 5 PR 顺序 ship,全 2026-05-10 当日完成(单人 dispatcher 5 worktree �
 | **PR #2** | M5.1 read-only dashboard | 2026-05-10 21:26 | `39b0890` | `GET /` + `/project/<slug>` + `/assets/{file}`;`ccteam_core::queries` 也 promote;outbox / state / events 渲染 + status badge |
 | **PR #3** | M5.2 SSE event push + 截图 | 2026-05-10 21:51 | `a835d72` | `/sse/{all,project/<slug>}` + 单 watcher → broadcast(1024 cap);`/screenshot/<slug>.png` `spawn_blocking` 调 F38 |
 | **PR #4** | M5.3 写动作 + token auth | 2026-05-10 22:19 | `65de090` | `POST /api/<slug>/{btw,inject_decision,pause,resume}`;`auth_layer` middleware(loopback bypass / 非 loopback 默认 token);URL shim cookie + CSRF 防御;LAN-RCE 5s grace |
-| **PR #5** | M5.4 e2e + retro + ship gate | 2026-05-10 (本 PR) | (本 PR HEAD)| `tests/e2e_test.rs` 端到端 canary;`workspace.version 0.2.2 → 0.3.0`;CLAUDE.md baseline 回填;本 retro 落档;docs sweep |
+| **PR #5** | M5.4 e2e + retro + ship gate | 2026-05-10 | (待 merge 后回填) | `tests/e2e_test.rs` 端到端 canary;`workspace.version 0.2.2 → 0.3.0`;CLAUDE.md baseline 回填;本 retro 落档;docs sweep |
 
 总规模:~2.3 kLOC(scaffold + 模板 + handler + 测试)+ 107 新测试,覆盖
 dep 图 / actions 模块单元 / dashboard / project 详情 / 静态资源 / SSE
@@ -65,24 +65,32 @@ wire format / 截图 endpoint / write actions / auth middleware / token 文件�
 
 ## 3. 跨浏览器 spot-check
 
-V0.3 主线只 ship 桌面 web,M5.4 brief 要求至少 spot-check 主流浏览器。
-本次实测覆盖范围:
+**真实情况:本次 ship gate 没有真浏览器 spot-check。** dispatcher 跑在
+headless Linux 工作环境,无图形 / 无浏览器 host,无法实际打开 Chrome /
+Firefox / Safari 验证 SSE 实时刷 / htmx swap / 写动作表单等"用户视角"
+行为。
 
-| 浏览器 | 版本 | dashboard | project 详情 | SSE 实时 | 截图 | 写动作表单 |
-|---|---|---|---|---|---|---|
-| Chrome (Linux) | 130.x | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Firefox (Linux) | 132.x | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Safari (macOS) | — | (未验证)| (未验证)| (未验证)| (未验证)| (未验证)|
+| 浏览器 | 版本 | spot-check 状态 |
+|---|---|---|
+| Chrome / Chromium | — | (未验证)|
+| Firefox | — | (未验证)|
+| Safari (macOS / iOS)| — | (未验证)|
 
-**说明**:dispatcher 工作环境无 macOS host,Safari 一栏 V0.3 ship gate 前
-**未做** spot-check。已知 SSE / `EventSource` / `fetch` / `<form hx-post>`
-全部 Safari 14+ 支持(2020 起),理论应 work,但 V0.3 不保证;若用户报问题
-跟 V0.4 channel layer 一并评估。Linux 环境下 Chromium-derived(Edge / Brave
-等)与 Chrome 同栈,未独立测。
+**已验证**:跨层 wire 协议(routing / SSE wire format / htmx-friendly
+content-type / 303 redirect / Bearer header)由 axum + reqwest 集成测试
+端到端覆盖,详 §2 矩阵 22 条全 PASS。这层等价于 "HTTP 协议正确",
+**不**等价于"浏览器渲染正确"。
 
-**htmx + SSE ext** vendored 版本(`htmx.min.js` 2.0.4 + `htmx-ext-sse.js`
-2.x)在 Chrome / Firefox 下 swap 行为符合 PRD §5.2.4 + interfaces.md §15.6;
-表格 prepend + 滑动窗口截 200 行实测正常。
+**deferred 真浏览器验证**:留给 ship 后两条路径之一:
+
+- 用户 dogfood 自报告(`/btw` / inject_decision / dashboard 视觉)
+- V0.4 follow-up — 至少 Chrome 一档真打开 + 截屏存档
+
+如有问题报告,按 PR feedback 进 V0.3.x dust patch 或 V0.4 修。
+
+**预期但未验证**:vendored htmx 2.0.4 + htmx-ext-sse 2.x 在 ES2020+ 浏览器
+应工作(SSE / EventSource / fetch / `<form hx-post>` 都是 2020 前 baseline
+features),但 V0.3 不保证。htmx 上游已自带跨浏览器 CI;ccteam 自己未跑。
 
 ---
 
@@ -99,7 +107,7 @@ V0.3 ship 时已知边界 / 限制,**全部 by design**,不影响主路径,V0.4 
 | L4 | **status badge 7-class 仅 read-only label**:即使 `silence_classifier` 分类为 `PostStopLimbo` / `SubagentRunaway`,web 层不调任何副作用 fn(re-inject / escalate)— orchestrator 走 F35 副作用路径 | `interfaces.md §15.2` 红线 + CLAUDE.md §三 read-only 红线 | 维持;V0.4 channel layer 后评估是否加「点击重新注入」按钮 |
 | L5 | **per-project 写动作无 rate-limit**:`auth_layer` 仅 token 校验,无频次限制 | PRD §6.3 不做(V0.4 deferred)| V0.4 加 |
 | L6 | **`/sse/all` + `/sse/project/<slug>` 不 multiplex**:advisor + PRD §5.2.3 决策"不复用一条连接,易丢追踪",一个 client 同时盯 dashboard + project 详情会开两条 EventSource | PRD §8.3 拓扑决策 | 维持;现代浏览器 HTTP/1.1 keep-alive ≥ 6 连接,正常用足够 |
-| L7 | **Safari spot-check 缺**(详 §3) | dispatcher 无 macOS host | V0.4 或用户首报告时跟 |
+| L7 | **真浏览器 spot-check 缺**(详 §3 — 全部跨浏览器,不止 Safari)| dispatcher 无图形 host | V0.4 或用户首报告时跟 |
 
 **non-issues**(看似 lingering 但实际是 by design):
 
@@ -140,7 +148,7 @@ deferred 列表)。
 | **跨层 happy path(本 PR e2e)** | ✓ |
 | **PR-by-PR 集成测试覆盖** | 107 新测试全 PASS;workspace 总 738/0 |
 | **clippy 退步** | 0(4 pre-existing 仍 baseline) |
-| **跨浏览器 spot-check** | Chrome 130 / Firefox 132 ✓;Safari 缺(L7) |
+| **跨浏览器 spot-check** | 缺(全部,详 §3 + L7)— deferred 给用户 dogfood 或 V0.4 |
 | **lingering issues** | 7 项,全 by design,V0.4 评估 |
 | **V0.4 deferred** | 9 项(2 P0/P1 + 7 P2),详 §5 |
 
