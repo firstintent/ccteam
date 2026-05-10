@@ -145,7 +145,7 @@ reinstall: uninstall install
 
 # --- First-time setup & run --------------------------------------------------
 #
-# `make setup HANDLE=rob` bundles the six idempotent first-time steps so users
+# `make setup HANDLE=cto` bundles the six idempotent first-time steps so users
 # don't have to memorize / paste-and-edit the doctor command list. `make start`
 # and `make attach` wrap the canonical Quick start two-terminal flow.
 
@@ -153,7 +153,7 @@ HANDLE ?=
 
 setup:
 	@if [ -z "$(HANDLE)" ]; then \
-	    printf '\033[31merror:\033[0m HANDLE is required. Example: make setup HANDLE=rob\n' >&2; \
+	    printf '\033[31merror:\033[0m HANDLE is required. Example: make setup HANDLE=cto\n' >&2; \
 	    exit 1; \
 	fi
 	@command -v $(BIN_NAME) >/dev/null || { printf '\033[31merror:\033[0m %s not on PATH; run `make install` first\n' '$(BIN_NAME)' >&2; exit 1; }
@@ -174,7 +174,7 @@ start:
 
 attach:
 	@if [ -z "$(HANDLE)" ]; then \
-	    printf '\033[31merror:\033[0m HANDLE is required. Example: make attach HANDLE=rob\n' >&2; \
+	    printf '\033[31merror:\033[0m HANDLE is required. Example: make attach HANDLE=cto\n' >&2; \
 	    exit 1; \
 	fi
 	@command -v tmux >/dev/null || { printf '\033[31merror:\033[0m tmux not installed\n' >&2; exit 1; }
