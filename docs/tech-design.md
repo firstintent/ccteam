@@ -666,7 +666,7 @@ meta-agent session + Channel Layer。
 
 V0.2 / V0.2.2 之前曾把 web 仪表盘剥离主线(`ccteam ls --format json` + 用户自带 claude 已覆盖"用人话汇报")。V0.3 重新评估:多项目并发(M3+ team factory ship 后用户实际跑 ≥ 3 项目)与离场场景下,「一屏看全局」需要可视化聚合;`ccteam ls` 表格在 ≥ 5 项目时阅读成本陡增。**因此 V0.3 ship `cct web`,作为第四类用户接入面**,与 CLI / MCP / filesystem 共存,各自最强项不同(终端 = power user 全控;MCP = meta-agent 自动化;filesystem = hooks / 调试;web = 一屏总览 + 局域网 / 手机访问)。
 
-实现栈:axum 0.8 + askama 0.12 + htmx 2.0.4(vendored,~50 KB),无 npm / Vite / build toolchain;`include_bytes!` 把 htmx + CSS 打进 binary,模仿 V0.2.2 F38 vendored TTF 模式。`ccteam-web` 是独立 workspace crate,**dep 只**到 `ccteam-core`,不依赖 `ccteam-cli`(binary-as-library 反模式;`tests/dep_graph_test.rs` 锁红线)。
+实现栈:axum 0.8 + askama 0.12 + htmx 2.0.4 + htmx-ext-sse 2.x(vendored,~60 KB)+ `notify` workspace + `futures` / `tokio-stream` for SSE bridging,无 npm / Vite / build toolchain;`include_bytes!` 把 htmx / htmx-ext-sse / CSS 打进 binary,模仿 V0.2.2 F38 vendored TTF 模式。`ccteam-web` 是独立 workspace crate,**dep 只**到 `ccteam-core`,不依赖 `ccteam-cli`(binary-as-library 反模式;`tests/dep_graph_test.rs` 锁红线)。
 
 V0.3 ship 状态:
 
@@ -674,7 +674,7 @@ V0.3 ship 状态:
 |---|---|---|
 | **M5.0** | crate scaffold + write helper promote 到 `ccteam-core::actions` + `GET /health` | ✅ |
 | **M5.1** | read-only dashboard:`GET /` 项目列表 + `GET /project/<slug>` 详情 + `GET /assets/{file}` 静态资源 + 状态 badge(F35 silence_classifier 只读复用)+ outbox 渲染(`SessionMailbox`)| ✅ |
-| **M5.2** | SSE 实时事件流(`/sse/all` + `/sse/project/<slug>` 单 notify watcher fan-out)+ 按需 PNG 截图(`/screenshot/<slug>.png` 复用 F38 `render_screenshot`)| 计划中 |
+| **M5.2** | SSE 实时事件流(`/sse/all` + `/sse/project/<slug>` 单 `notify` watcher → `tokio::sync::broadcast` capacity `1024` fan-out;wire format `event: progress` + `data: <one-line-JSON>`,15s `: keepalive`)+ 按需 PNG 截图(`/screenshot/<slug>.png` 同步 `spawn_blocking` 调 F38 `render_screenshot`,F38 不可用 → 504 + plain-text reason,**不 polling**)| ✅ |
 | **M5.3** | 写动作(`POST /api/<slug>/{btw,inject_decision,pause,resume}` 全走 `ccteam_core::actions::*` M5.0 promote)+ token 鉴权(loopback 免 token / 非 loopback 默认 token,`Authorization: Bearer ccteam:<token>`,`subtle::ConstantTimeEq` 比对,`~/.ccteam/web-token` mode 0600)| 计划中 |
 | **M5.4** | E2E + retro + workspace.version `0.2.2` → `0.3.0` ship gate | 计划中 |
 
@@ -1452,9 +1452,14 @@ V0.3 主线版本新加第四接入层(继 terminal / MCP / filesystem 之后),�
 
 - **入口**:`ccteam web --bind <addr> [--no-auth] [--token-file <path>]`(`docs/interfaces.md` §10.6)。CLI subcommand 调 `ccteam_web::serve(ServeOpts)`,axum 0.8 server 绑端口、装路由、Ctrl-C / SIGTERM 优雅退出。
 - **依赖图**:`ccteam-web` 只 depend on `ccteam-core`(F45 promote 后 4 个 write helper 落 `actions::*` 模块)。**严格不 dep `ccteam-cli`** — `crates/ccteam-web/tests/dep_graph_test.rs` 自检 `cargo tree -p ccteam-web` 不命中 `ccteam-cli`。
-- **M5.0 范围**(本里程碑):scaffold + `GET /health` 200 JSON + `ServeOpts { bind, no_auth, token_file }` 类型形稳。
-- **后续里程碑**:M5.1 read-only dashboard + 项目详情页(askama 模板 + htmx)/ M5.2 SSE + 按需 PNG 截图 / M5.3 写动作 endpoint + 默认 token 鉴权(loopback bypass)/ M5.4 e2e + ship gate。详 `docs/v0-3/prd.md` §3-§7。
-- **架构红线**(V0.3 主线维持):progress.jsonl 仍是 SoT,web 不解析 tmux 终端;web 不 kill 长 session;web 不写跨项目记忆;`/btw` 走跟 telegram channel + MCP `send_to_session` 完全相同的 inbox + idle dispatch 路径,不开新通路。
+- **M5.0 范围**:scaffold + `GET /health` 200 JSON + `ServeOpts { bind, no_auth, token_file }` 类型形稳。
+- **M5.1 范围**:read-only dashboard(`/`)+ 项目详情(`/project/<slug>`)+ vendored htmx / CSS(`/assets/*`)+ outbox / events 渲染 + status badge(F35 silence_classifier 只读复用)。
+- **M5.2 范围**(本里程碑):**SSE 实时事件流 + 按需 PNG 截图**。
+  - **SSE topology**:单个 `notify::RecommendedWatcher` recursive 监 `~/.ccteam/progress/`,守一条专用 OS 线程跑 + per-file 字节 watermark + 单一 `tokio::sync::broadcast::Sender<ProgressUpdate>`(capacity = `1024` 字面);两个 SSE handler(`/sse/all` + `/sse/project/<slug>`)各自 `subscribe()`,后者 server-side filter 按 slug 字段。详 `docs/interfaces.md` §15.6 wire format。
+  - **截图**:`/screenshot/<slug>.png` 同步调 `ccteam_core::render_screenshot`(F38)wrap 在 `tokio::task::spawn_blocking`(F38 内部 shell out tmux + imageproc 渲染,会 ~200-500 ms 阻塞);F38 graceful degrade(tmux 无 session)→ **504 + plain-text reason**,不 polling(`Cache-Control: no-cache, must-revalidate`)。
+- **M5.3 范围**:写动作 endpoint + 默认 token 鉴权(loopback bypass)。
+- **M5.4 范围**:e2e + ship gate。详 `docs/v0-3/prd.md` §3-§7。
+- **架构红线**(V0.3 主线维持):progress.jsonl 仍是 SoT,web 不解析 tmux 终端(M5.2 SSE watcher 仅读 progress.jsonl,F38 截图内部 vt100 化非文本解析);web 不 kill 长 session;web 不写跨项目记忆;`/btw` 走跟 telegram channel + MCP `send_to_session` 完全相同的 inbox + idle dispatch 路径,不开新通路。
 
 ---
 

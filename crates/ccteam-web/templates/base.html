@@ -5,7 +5,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{% block title %}ccteam web{% endblock %}</title>
     <link rel="stylesheet" href="/assets/style.css">
+    <!-- htmx + the SSE extension. Order matters: the extension
+         registers itself against the global htmx instance, so the
+         core lib must load first. Both `defer` so the DOM is parsed
+         before any extension hooks attempt to attach. -->
     <script src="/assets/htmx.min.js" defer></script>
+    <script src="/assets/htmx-ext-sse.js" defer></script>
 </head>
 <body>
     <nav>

@@ -3,7 +3,7 @@
 {% block title %}ccteam — projects{% endblock %}
 
 {% block content %}
-    <h1>Projects ({{ projects.len() }})</h1>
+    <h1>Projects ({{ projects.len() }}) <span class="live-dot" title="streaming via SSE"></span></h1>
     {% if projects.is_empty() %}
         <p class="empty">No projects under <code>{{ projects_root }}</code> yet. Run <code>ccteam new ...</code> to start one.</p>
     {% else %}
@@ -18,18 +18,50 @@
                 <th class="num">Cost (USD)</th>
             </tr>
         </thead>
-        <tbody>
+        <tbody id="dash-tbody">
             {% for p in projects %}
-            <tr>
+            <tr data-slug="{{ p.slug }}">
                 <td><a href="/project/{{ p.slug }}">{{ p.slug }}</a></td>
                 <td>{{ p.team }}</td>
-                <td>{% if p.current_phase.is_empty() %}<span class="muted">—</span>{% else %}{{ p.current_phase }}{% endif %}</td>
-                <td class="muted">{{ p.last_event_label }}</td>
-                <td><span class="badge {{ p.badge_class }}">{{ p.badge_label }}</span></td>
+                <td class="cell-phase">{% if p.current_phase.is_empty() %}<span class="muted">—</span>{% else %}{{ p.current_phase }}{% endif %}</td>
+                <td class="muted cell-last-event">{{ p.last_event_label }}</td>
+                <td class="cell-status"><span class="badge {{ p.badge_class }}">{{ p.badge_label }}</span></td>
                 <td class="num">{{ p.cost_label }}</td>
             </tr>
             {% endfor %}
         </tbody>
     </table>
     {% endif %}
+
+    {# V0.3 M5.2 — `/sse/all` SSE stream patches `last event` cell of
+       each project row whenever a new progress event for that slug
+       lands. Status badge stays server-side (it's a derived label —
+       SSE just hints "something happened recently"). The script is
+       intentionally small (~20 lines) and presentation-only — no
+       state mutations, no inbox writes (that's M5.3). #}
+    <script>
+        (function () {
+            if (!{{ projects.len() }}) return;
+            var es = new EventSource('/sse/all');
+            es.addEventListener('progress', function (ev) {
+                var data;
+                try { data = JSON.parse(ev.data); } catch (e) { return; }
+                if (!data || !data.slug) return;
+                var row = document.querySelector('tr[data-slug="' + cssEscape(data.slug) + '"]');
+                if (!row) return;
+                var last = row.querySelector('.cell-last-event');
+                if (last) last.textContent = 'just now';
+            });
+            es.addEventListener('reconnect_hint', function () {
+                es.close();
+                setTimeout(function () { location.reload(); }, 1000);
+            });
+            function cssEscape(s) {
+                // Slugs are [a-z0-9-]+ in practice (F22-after); be
+                // paranoid and escape anything outside that class
+                // for the attribute selector.
+                return String(s).replace(/[^a-zA-Z0-9_-]/g, '\\$&');
+            }
+        })();
+    </script>
 {% endblock %}

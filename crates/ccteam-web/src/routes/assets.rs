@@ -20,6 +20,7 @@ use axum::{
 use crate::state::AppState;
 
 const HTMX_JS: &[u8] = include_bytes!("../../assets/htmx.min.js");
+const HTMX_EXT_SSE_JS: &[u8] = include_bytes!("../../assets/htmx-ext-sse.js");
 const STYLE_CSS: &[u8] = include_bytes!("../../assets/style.css");
 
 const CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
@@ -31,6 +32,10 @@ pub fn router() -> Router<AppState> {
 async fn handle_asset(Path(file): Path<String>) -> impl IntoResponse {
     let (bytes, ctype): (&'static [u8], &'static str) = match file.as_str() {
         "htmx.min.js" => (HTMX_JS, "application/javascript; charset=utf-8"),
+        // V0.3 M5.2 — htmx 2.x SSE extension (separate file from the
+        // core lib). Loaded by `<script>` after htmx.min.js so the
+        // extension can register its handlers.
+        "htmx-ext-sse.js" => (HTMX_EXT_SSE_JS, "application/javascript; charset=utf-8"),
         "style.css" => (STYLE_CSS, "text/css; charset=utf-8"),
         _ => {
             return (StatusCode::NOT_FOUND, "asset not found").into_response();

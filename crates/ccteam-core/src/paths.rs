@@ -33,7 +33,15 @@ impl CcteamPaths {
     }
 
     pub fn progress_jsonl(&self, slug: &str) -> PathBuf {
-        self.root.join("progress").join(format!("{slug}.jsonl"))
+        self.progress_dir().join(format!("{slug}.jsonl"))
+    }
+
+    /// `~/.ccteam/progress/` — directory holding `<slug>.jsonl`
+    /// streams. Public since V0.3 M5.2 so the `ccteam-web` watcher
+    /// can attach a recursive `notify` watcher without re-deriving
+    /// the path.
+    pub fn progress_dir(&self) -> PathBuf {
+        self.root.join("progress")
     }
 
     pub fn inbox_dir(&self) -> PathBuf {
