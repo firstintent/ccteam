@@ -11,6 +11,18 @@
         &middot; cost: {{ cost_label }} USD
     </p>
 
+    {# V0.3 M5.3 — auth banner. When `auth_enabled = true` the user
+       reached this page through the bearer header / cookie shim, so
+       a green confirmation is reassuring + makes the threat model
+       legible. When `--no-auth` opt-out is in effect, render a red
+       warning instead so the operator can see at a glance that the
+       LAN-RCE surface is open. #}
+    {% if auth_enabled %}
+    <p class="auth-banner ok">Authenticated session ✓</p>
+    {% else %}
+    <p class="auth-banner warn">WARNING: write actions are unauthenticated (loopback default or --no-auth)</p>
+    {% endif %}
+
     <h2>State</h2>
     <pre>{{ state_json_pretty }}</pre>
 
@@ -89,6 +101,111 @@
             img.src = '/screenshot/' + encodeURIComponent(slug) + '.png?t=' + Date.now();
         }
     </script>
+
+    {# V0.3 M5.3 — write-action sidebar. Each form is a normal
+       `application/x-www-form-urlencoded` POST that 303-redirects back
+       to this same page (route handlers in src/routes/actions.rs).
+       Auth is enforced by the `auth_layer` middleware; same-origin
+       browser form submits include the cookie automatically, but we
+       *also* attach an `Authorization: Bearer ccteam:<...>` header
+       via `fetch()` (when `auth_enabled = true`) because the
+       middleware demands the bearer header for POST as a CSRF defense
+       (cross-origin form submits cannot inject custom headers).
+       PRD §6.2.5 / advisor option (a). #}
+    <h2>Controls</h2>
+    <div class="controls">
+        <div class="control-block">
+            <h3>Send <code>/btw</code></h3>
+            <form id="btw-form" method="post" action="/api/{{ slug }}/btw">
+                <textarea name="text" required minlength="1" maxlength="4000"
+                          placeholder="free-text nudge, queued via inbox"></textarea>
+                <button type="submit">Send</button>
+            </form>
+        </div>
+
+        <div class="control-block">
+            <h3>Inject decision</h3>
+            {% if decision_candidates.is_empty() %}
+            <form id="decision-form" method="post" action="/api/{{ slug }}/inject_decision">
+                <select name="path" disabled>
+                    <option>(no decisions pending)</option>
+                </select>
+                <textarea name="body" disabled
+                          placeholder="no decision-*.md files awaiting injection"></textarea>
+                <button type="submit" disabled>Inject</button>
+            </form>
+            {% else %}
+            <form id="decision-form" method="post" action="/api/{{ slug }}/inject_decision">
+                <select name="path" required>
+                    {% for c in decision_candidates %}
+                    <option value="{{ c }}">{{ c }}</option>
+                    {% endfor %}
+                </select>
+                <textarea name="body" required minlength="1" maxlength="8000"
+                          placeholder="decision body (markdown, written verbatim)"></textarea>
+                <button type="submit">Inject</button>
+            </form>
+            {% endif %}
+        </div>
+
+        <div class="control-block">
+            <h3>Pause / Resume</h3>
+            <form id="pause-form" method="post" action="/api/{{ slug }}/pause" style="display:inline-block">
+                <button type="submit">Pause</button>
+            </form>
+            <form id="resume-form" method="post" action="/api/{{ slug }}/resume" style="display:inline-block">
+                <button type="submit">Resume</button>
+            </form>
+            <p class="muted">
+                Pause sets <code>user_pause_pending=true</code>; the orchestrator pauses auto-dispatch
+                but the tmux session stays alive (red line: never kill long sessions).
+            </p>
+        </div>
+    </div>
+
+    {% if auth_enabled %}
+    <script>
+        // V0.3 M5.3 — bearer-header injector for the four control
+        // forms. With auth on, every POST must carry the Authorization
+        // header (CSRF defense — cross-origin form-submits cannot
+        // forge it). We intercept submit, fire `fetch()` with the
+        // header, and follow the 303 redirect by reloading the page.
+        // Cookie alone wouldn't be a CSRF defense; bearer header is.
+        (function () {
+            var TOKEN = {% match auth_wire_token %}{% when Some with (t) %}"{{ t }}"{% when None %}""{% endmatch %};
+            var ids = ['btw-form', 'decision-form', 'pause-form', 'resume-form'];
+            ids.forEach(function (id) {
+                var form = document.getElementById(id);
+                if (!form) return;
+                form.addEventListener('submit', function (ev) {
+                    ev.preventDefault();
+                    var fd = new FormData(form);
+                    var body = new URLSearchParams();
+                    fd.forEach(function (v, k) { body.append(k, v); });
+                    fetch(form.action, {
+                        method: 'POST',
+                        headers: {
+                            'Authorization': 'Bearer ' + TOKEN,
+                            'Content-Type': 'application/x-www-form-urlencoded',
+                        },
+                        body: body.toString(),
+                        credentials: 'same-origin',
+                        redirect: 'manual',
+                    }).then(function (resp) {
+                        // Server-side handlers reply 303 → /project/<slug>.
+                        // `redirect: manual` makes 3xx surface as opaqueredirect
+                        // (status 0); fetch won't follow cross-origin so just
+                        // reload the page to pick up the new state.
+                        location.reload();
+                    }).catch(function (err) {
+                        console.error('ccteam form submit failed', err);
+                        alert('submit failed: ' + err);
+                    });
+                });
+            });
+        })();
+    </script>
+    {% endif %}
 
     {# Small inline shim that grafts SSE `progress` events onto the
        events table and trims the visible row count to 200. We avoid

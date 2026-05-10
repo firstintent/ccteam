@@ -19,6 +19,7 @@ use axum::{
 use ccteam_core::ProjectState;
 use chrono::Utc;
 
+use crate::decisions::scan_candidates;
 use crate::queries::{
     events_to_rows, outbox_rows, slug_recent_events, DEFAULT_EVENT_LIMIT, DEFAULT_OUTBOX_LIMIT,
 };
@@ -65,6 +66,14 @@ async fn handle_project(
         Err(err) => format!("(serialize error: {err})"),
     };
 
+    // V0.3 M5.3 — write-action context: decision candidates list +
+    // auth state echoed into `hx-headers` so same-origin form
+    // submits carry the bearer token (CSRF defense, PRD §6.2.5).
+    let decision_candidates: Vec<String> = scan_candidates(&app.paths, &slug)
+        .into_iter()
+        .map(|p| p.display().to_string())
+        .collect();
+
     let tpl = ProjectTemplate {
         version: env!("CARGO_PKG_VERSION"),
         slug: state.slug.clone(),
@@ -76,6 +85,9 @@ async fn handle_project(
         state_json_pretty,
         events: event_rows,
         outbox,
+        auth_enabled: app.auth.enabled,
+        auth_wire_token: app.auth.wire_token(),
+        decision_candidates,
     };
     HtmlTemplate(tpl).into_response()
 }

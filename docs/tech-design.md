@@ -675,7 +675,7 @@ V0.3 ship 状态:
 | **M5.0** | crate scaffold + write helper promote 到 `ccteam-core::actions` + `GET /health` | ✅ |
 | **M5.1** | read-only dashboard:`GET /` 项目列表 + `GET /project/<slug>` 详情 + `GET /assets/{file}` 静态资源 + 状态 badge(F35 silence_classifier 只读复用)+ outbox 渲染(`SessionMailbox`)| ✅ |
 | **M5.2** | SSE 实时事件流(`/sse/all` + `/sse/project/<slug>` 单 `notify` watcher → `tokio::sync::broadcast` capacity `1024` fan-out;wire format `event: progress` + `data: <one-line-JSON>`,15s `: keepalive`)+ 按需 PNG 截图(`/screenshot/<slug>.png` 同步 `spawn_blocking` 调 F38 `render_screenshot`,F38 不可用 → 504 + plain-text reason,**不 polling**)| ✅ |
-| **M5.3** | 写动作(`POST /api/<slug>/{btw,inject_decision,pause,resume}` 全走 `ccteam_core::actions::*` M5.0 promote)+ token 鉴权(loopback 免 token / 非 loopback 默认 token,`Authorization: Bearer ccteam:<token>`,`subtle::ConstantTimeEq` 比对,`~/.ccteam/web-token` mode 0600)| 计划中 |
+| **M5.3** | 写动作(`POST /api/<slug>/{btw,inject_decision,pause,resume}` 全走 `ccteam_core::actions::*` M5.0 promote;handler boundary 校验长度 + path-traversal `..` + `<project>/.ccteam/` prefix)+ token 鉴权(loopback 免 token / 非 loopback 默认 token / `--no-auth` opt-out + 5s LAN-RCE 倒计时;`Authorization: Bearer ccteam:<token>`,`subtle::ConstantTimeEq` 比对,`~/.ccteam/web-token` mode 0600;浏览器 URL shim `?token=ccteam:<hex>` → HttpOnly `ccteam_token` cookie + 303 → 干净 URL;`/health` 例外免 auth)| ✅ |
 | **M5.4** | E2E + retro + workspace.version `0.2.2` → `0.3.0` ship gate | 计划中 |
 
 V0.3 主要红线(详 PRD §3 / `interfaces.md` §15 / CLAUDE.md §三):

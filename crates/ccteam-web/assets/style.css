@@ -253,3 +253,72 @@ code {
     background: var(--bg-hover);
     border-color: var(--accent);
 }
+
+/* V0.3 M5.3 — auth banners + controls sidebar. */
+.auth-banner {
+    margin: 0.5rem 0 1rem 0;
+    padding: 0.4rem 0.75rem;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-size: 0.85rem;
+    display: inline-block;
+}
+.auth-banner.ok {
+    color: var(--green);
+    border-color: var(--green);
+    background: rgba(63, 185, 80, 0.07);
+}
+.auth-banner.warn {
+    color: var(--red);
+    border-color: var(--red);
+    background: rgba(248, 81, 73, 0.07);
+}
+.controls .control-block {
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.75rem 1rem;
+    margin-bottom: 0.75rem;
+    background: var(--bg-elev);
+}
+.controls h3 {
+    margin: 0 0 0.5rem 0;
+    font-size: 0.95rem;
+}
+.controls form {
+    margin: 0;
+}
+.controls textarea, .controls select {
+    display: block;
+    width: 100%;
+    background: var(--bg);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.4rem;
+    font-family: inherit;
+    font-size: 0.85rem;
+    margin-bottom: 0.5rem;
+}
+.controls textarea {
+    min-height: 4rem;
+    resize: vertical;
+}
+.controls button {
+    background: var(--bg);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.3rem 0.9rem;
+    font-family: inherit;
+    font-size: 0.85rem;
+    cursor: pointer;
+    margin-right: 0.5rem;
+}
+.controls button:hover:not(:disabled) {
+    background: var(--bg-hover);
+    border-color: var(--accent);
+}
+.controls button:disabled, .controls textarea:disabled, .controls select:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}

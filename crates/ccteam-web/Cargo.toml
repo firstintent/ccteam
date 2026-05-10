@@ -32,10 +32,19 @@ askama = { workspace = true }
 # `ServeOpts` can carry the token-file knob without churning dep
 # manifests when M5.3 lands.
 subtle = { workspace = true }
+# V0.3 M5.3 — auth middleware:
+# - `axum-extra` provides the `CookieJar` extractor (not in axum 0.8
+#   itself); the cookie shim sets a HttpOnly `ccteam_token` cookie so
+#   browser GETs / SSE auto-include credentials after the first
+#   `?token=ccteam:<...>` URL hit.
+# - `rand` 0.8 generates the 32-byte token persisted at
+#   `~/.ccteam/web-token` mode 0600.
+axum-extra = { version = "0.10", features = ["cookie"] }
+rand = "0.8"
 
 [dev-dependencies]
 tempfile = "3"
-reqwest = { workspace = true, features = ["json", "stream"] }
+reqwest = { workspace = true, features = ["json", "stream", "cookies"] }
 # V0.3 M5.2 — SSE integration tests need to read the streaming body
 # line by line. `tokio-util` exposes `StreamReader` (bytes stream →
 # AsyncRead); `futures-util` provides the `StreamExt::map` adapter

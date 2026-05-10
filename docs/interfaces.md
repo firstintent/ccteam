@@ -1882,3 +1882,99 @@ watermark(`HashMap<PathBuf, u64>`,Mutex 保护)→ 读 appended bytes →
 
 **file rotation**:文件 size 缩小(truncate / rename)→ watermark 重置
 为 0,replay 全部内容,记 `tracing::warn!`(罕见,主要为防御 corner case)。
+
+### 15.7 Write-action POST endpoints(M5.3)
+
+V0.3 M5.3 加四个 form-encoded POST 端点,全部走
+`ccteam-core::actions::*`(`docs/dev-coupling-audit.md` F45 close):
+
+| Method | Path | Body(`application/x-www-form-urlencoded`) | 状态码 | 说明 |
+|---|---|---|---|---|
+| `POST` | `/api/{slug}/btw` | `text=<urlencoded, 1..=4000 chars>` | 303 / 400 / 5xx | 调 `actions::send_to_session(paths, slug, text)`;成功 → `Location: /project/<slug>` |
+| `POST` | `/api/{slug}/inject_decision` | `path=<absolute, 必须前缀 ~/projects/<slug>/.ccteam/>&body=<urlencoded, 1..=8000 chars>` | 303 / 400 / 5xx | 调 `actions::inject_decision(paths, slug, DecisionInput)`;`path` 含 `..` 组件 / 非绝对 / 不在 `<project>/.ccteam/` 之下 → 400 |
+| `POST` | `/api/{slug}/pause` | (空)| 303 / 4xx | 调 `actions::pause(paths, slug)` — 设 `state.user_pause_pending=true`,**不**杀 tmux session(CLAUDE.md §三 红线)|
+| `POST` | `/api/{slug}/resume` | (空)| 303 / 4xx | 调 `actions::resume(paths, slug)` — 清 `user_pause_pending` + `user_attached`,`phase_state` 回 `Idle`,归档 `escalation.md`(若存在)|
+
+**成功语义**:全部 303 See Other → `/project/<slug>`,浏览器自动跟随
+回详情页;form 提交流程 = 用户写完 → submit → 303 → 重新加载详情页
+看 inbox 落地 / state.json 翻位。
+
+**输入校验红线**:
+
+- `text` / `body` 长度上下界(`1..=4000` / `1..=8000`)在 route boundary
+  做,超长直接 400;**不**让 `actions::send_to_session` 自己挡(actions
+  层是 policy-free helper,长度策略归 channel 层)。
+- `inject_decision` `path` 必须满足:`is_absolute()` + 不含 `Component::ParentDir`
+  + `starts_with(paths.project_ccteam_dir(slug))`。这三条共同抗
+  `~/projects/<slug>/.ccteam/../../../etc/passwd` 与裸 `/etc/passwd`。
+
+**错误语义**:
+
+- 400 + plain-text reason:输入校验失败、unknown slug(`actions::*`
+  返 `no project / session named ...`)
+- 5xx + plain-text:`inject_decision` 写盘失败 / `pause` / `resume`
+  状态机错误(罕见)
+- 写动作 handler **永不** 5xx 静默 — handler 内 `tracing::warn!`
+  + 客户端拿到具体 reason,方便 dogfood debug
+
+### 15.8 鉴权(M5.3)
+
+ccteam web 默认走 token 鉴权,启动时根据 bind 地址决定:
+
+| bind | `--no-auth` | enabled | token |
+|---|---|---|---|
+| `127.0.0.1:*` / `[::1]:*` | false | false(loopback 信任)| 不生成 |
+| `127.0.0.1:*` / `[::1]:*` | true | false | 不生成 |
+| 非 loopback(`0.0.0.0` / LAN IP)| false | **true**(默认开)| `~/.ccteam/web-token` 生成或读 |
+| 非 loopback | true | false(显式 opt-out)| 不生成,stderr 大字 LAN-RCE 警告 + 5s Ctrl-C 倒计时 |
+
+#### 15.8.1 Token 文件协议
+
+- 路径:`~/.ccteam/web-token`(可经 `--token-file <path>` 覆盖)
+- 内容:32-byte 随机 → lowercase hex(64 ASCII chars)+ trailing `\n`(load 时 `trim()`)
+- 文件 mode:**`0o600`**(Unix `OpenOptions::create_new` + `mode(0o600)`)
+- 已存在 + mode != 0600 → stderr 警告 + 继续加载(不 fail-closed,
+  避免 dogfood 期间因为 umask race 锁死)
+- 删除 + 重启 → 自动重生,token 不可重放
+
+#### 15.8.2 Wire format
+
+- 客户端 header:`Authorization: Bearer ccteam:<hex>`(constant-time
+  比对,`subtle::ConstantTimeEq`,长度先短路再 ct_eq;长度泄露不影响
+  threat model 因为 hex 长度公开 = 64)
+- 浏览器首次访问可走 URL shim:`?token=ccteam:<hex>`,middleware:
+  1. 验证 token,
+  2. `Set-Cookie: ccteam_token=<hex>; HttpOnly; SameSite=Strict; Path=/`,
+  3. 303 redirect 到去掉 `token` 参数的相同 URL
+- 后续 GET / SSE 自动携带 cookie;auth_layer 优先 Bearer header,
+  其次 cookie value(constant-time 同上)
+
+#### 15.8.3 鉴权范围
+
+- **整体权限**(用户 2026-05-10 决策,无 read/write 拆分):enabled 时
+  所有 stateful router 路径(`/`, `/project/<slug>`, `/sse/...`,
+  `/screenshot/...`, `/api/.../...`)都需要 Bearer header 或 cookie。
+- **`/health` 例外**:留给 ops 监控,response body 仅
+  `{status, version}`,无 project 状态泄漏。
+- 非 loopback `--no-auth` 启动时 stderr 输出红色 ANSI 警告:
+  `WARNING: --no-auth on non-loopback bind = LAN-wide RCE on
+  bypassPermissions sessions.` + 5s 倒计时(`ServeOpts::no_auth_grace_secs`
+  = `Some(5)` 默认,集成测试传 `Some(0)` 跳过 grace)。
+
+#### 15.8.4 CSRF 防御
+
+写动作 POST 必须 carries `Authorization: Bearer` header,即使
+session cookie 有效。理由:
+
+- 浏览器跨域 form-submit 不会附加 `Authorization`(header allowlist),
+- 跨域 fetch / XHR 触发 CORS preflight,server 默认拒,
+- 同源 form-submit 由 `project.html` inline JS 注入 Bearer header
+  (token 从 server-side 模板渲染进 JS 字符串字面量),
+
+→ 攻击者跨域 form 即使 cookie 自动附带也**无法**生成有效 POST。
+
+XSS tradeoff:token 出现在 HTML attribute 而非纯 HttpOnly cookie。
+被 XSS'd 时攻击者本来就能同源 fetch + 自动 cookie,所以 inline 不
+增加 threat surface。
+
+

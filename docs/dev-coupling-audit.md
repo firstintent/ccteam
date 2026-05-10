@@ -32,7 +32,7 @@ P0 + 同 PR 关闭;**2026-05-08 V0.2 e2e retro**:加 F26-F33 八条 V0.2.1 候�
 **2026-05-09 V0.2.2 patch**:加 F34-F40 七条用户反馈 + 命名 sweep + UX 增强,跨 7 PR 全部修复;
 **2026-05-09 V0.2.2 e2e retro patch**:4-suite 并行 e2e 验证,撞 F41 (P1) + F42 (P1) + F43 (P2),同 PR 一波修;
 **2026-05-10 V0.2.2 F44 反向回滚**:`/usr/bin/cct` namespace 碰撞驱动整体反向 F39,F44 单 PR 覆盖;
-**2026-05-10 V0.3 doc-only kickoff**:加 F45 P1(write helper promote ccteam-cli → ccteam-core::actions,M5.0 关键解耦),实施在 V0.3 PR #1 / #4);**2026-05-10 V0.3 PR #1 ship**:F45 promote 部分修复(actions 模块 + mcp_serve wrapper 透传 + dep_graph 自检测试落地),仍待 M5.3 写动作 endpoint 消费才整体 close,分布:
+**2026-05-10 V0.3 doc-only kickoff**:加 F45 P1(write helper promote ccteam-cli → ccteam-core::actions,M5.0 关键解耦),实施在 V0.3 PR #1 / #4);**2026-05-10 V0.3 PR #1 ship**:F45 promote 部分修复(actions 模块 + mcp_serve wrapper 透传 + dep_graph 自检测试落地),仍待 M5.3 写动作 endpoint 消费才整体 close;**2026-05-10 V0.3 PR #4 ship**:F45 **整体 close**(M5.3 写动作 endpoint + token auth + URL-shim cookie + path-traversal 守卫全部 ship),分布:
 
 | 优先级 | 数量 | 编号 |
 |---|---|---|
@@ -738,7 +738,7 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
 - **优先级**:**P0**(silent-substitute footgun)。
 - **来源**:用户 2026-05-10 反馈 + 实证 `dpkg -S /usr/bin/cct` 命中 `proj-bin`。
 
-### F45 — write 动作 + 读端 helper 锁在 ccteam-cli,V0.3 web crate 无法复用(2026-05-10 加;**写端部分修复:V0.3 PR #1;读端补强:V0.3 PR #2;整体 close 在 V0.3 M5.3 PR #4 写动作 endpoint 落地**)
+### F45 — write 动作 + 读端 helper 锁在 ccteam-cli,V0.3 web crate 无法复用(2026-05-10 加;**整体 close:V0.3 M5.3 PR #4 写动作 endpoint + auth gate 落地**)
 
 - **文件:行号**:`crates/ccteam-cli/src/mcp_serve.rs::tool_send_to_session`(line 456,`fn` 非 `pub fn`)+ `tool_inject_decision`(line 500,同)+ pause / resume 在 mcp_serve 内 inline logic 无独立 fn。
 - **现状**:V0.2.2 ship 时,写动作 helper 全部位于 `ccteam-cli::mcp_serve.rs` 私有 fn,只供 MCP tool dispatch 内部消费;V0.3 web UI(新 crate `crates/ccteam-web`)需要复用同一逻辑写 inbox / control,但 `ccteam-web` 不能 depend on `ccteam-cli`(binary-as-library 反模式 + dep 图倒挂 — `ccteam-cli` 是 binary entry,`ccteam-web` 是新 crate,sibling 关系应共下沉 `ccteam-core`)。读侧 helper 已 public(`collect_projects` / `collect_recent_events` / `run_resume` / `run_show`,以及 `ccteam_core::ProjectState` / `CcteamPaths` / `render_screenshot` / `tmux::capture_pane_*` / `check_daemon_health` / `SessionMailbox` / `inbox_filename` / `pick_unused_slug` / `bootstrap_project`),写侧未 promote。
@@ -749,6 +749,7 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
 - **2026-05-10 部分修复(V0.3 PR #1)**:`crates/ccteam-core/src/actions.rs` 落地;4 个 pub fn(`send_to_session` + `send_to_session_with` / `inject_decision` / `pause` / `resume`)外加 `next_inbox_seq` / `next_inbox_path` / `DecisionInput` / `SendOptions` / `SendResult`。`mcp_serve.rs::tool_send_to_session` / `tool_inject_decision` / `tool_pause` / `tool_resume` 全部改为薄 wrapper(args 拆 + JSON encode + 调 `actions::*`),18 个 mcp_serve 测试不变绿(回归保证 wrapper 透传);`commands::run_resume` body 提到 `actions::resume`,旧 fn 仅留 thin-wrap。`crates/ccteam-web/tests/dep_graph_test.rs` 自检 `cargo tree -p ccteam-web` 不命中 `ccteam-cli`。
 - **2026-05-10 读端补强(V0.3 PR #2)**:`ProjectSummary` / `collect_projects` / `collect_recent_events` 同样 promote — 原存于 `ccteam-cli::commands` 公有 fn,但 `ccteam-web` 不能 depend on `ccteam-cli`(同 binary-as-library 反模式),不能 import 它们。新建 `crates/ccteam-core/src/queries.rs` 模块,move 三者过来 + 加 6 个单元测试;`ccteam-cli::commands` 留 `pub use ccteam_core::{collect_projects, collect_recent_events, ProjectSummary};` 让 `mcp_serve.rs` / `run_ls` / `run_progress` 现有 import 路径不变。M5.1 dashboard / project handler 直接调 `ccteam_core::queries::*`,dep_graph_test 仍绿。
 - **仍 open**:web 层 POST endpoint(`/api/<slug>/{btw,inject_decision,pause,resume}`)在 M5.3 落地后才真正消费 actions::*,届时本 finding 整体 close。
+- **2026-05-10 整体 close(V0.3 PR #4)**:`crates/ccteam-web/src/routes/actions.rs` 落地 — 四个 POST handler `handle_btw` / `handle_inject_decision` / `handle_pause` / `handle_resume` 全部 thin-call `ccteam_core::actions::*`,validation(text length 1..=4000 / decision body 1..=8000 / 路径 absolute + 不含 `..` + `starts_with(project_ccteam_dir(slug))`) 在 route boundary 完成。`crates/ccteam-web/src/auth.rs` 加 token-Bearer middleware(loopback 信任默认 / 非 loopback 自动开 + 文件 mode 0600 + URL shim cookie)+ `/health` 例外。`cargo tree -p ccteam-web | grep ccteam-cli` 仍 0 命中,dep_graph_test 守红线。47 新测试覆盖 actions 4 endpoint + auth 8 路径 + token 文件 5 场景;737 全绿(690 baseline → 737)。本 finding **整体 close**。
 
 ### F40 — `product-research` team 名冗长 + 领域名缺位(2026-05-09 加;**已修复:2026-05-09(V0.2.2 PR #6 alias 软迁移)**)
 

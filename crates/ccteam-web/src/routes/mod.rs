@@ -1,14 +1,17 @@
 //! Axum routers for the ccteam web layer.
 //!
 //! M5.0 shipped `/health`. M5.1 added `dashboard` / `project` /
-//! `assets`. **M5.2 (this PR)** mounts `sse` (`/sse/all` +
-//! `/sse/project/<slug>`) + `screenshot` (`/screenshot/<slug>.png`).
-//! M5.3 mounts `actions` + auth middleware.
+//! `assets`. M5.2 added `sse` (`/sse/all` + `/sse/project/<slug>`) +
+//! `screenshot` (`/screenshot/<slug>.png`). **M5.3 (this PR)** mounts
+//! `actions` (`POST /api/<slug>/{btw,inject_decision,pause,resume}`)
+//! and the `auth_layer` middleware that gates the entire stateful
+//! router when token auth is enabled.
 
 use axum::Router;
 
 use crate::state::AppState;
 
+pub mod actions;
 pub mod assets;
 pub mod dashboard;
 pub mod health;
@@ -18,9 +21,9 @@ pub mod sse;
 
 /// Compose every M5.x sub-router available at the current ship state.
 /// `health` is state-less (M5.0 contract) so it merges in without an
-/// `AppState`; the M5.1 / M5.2 routers are stateful and need the
-/// same `AppState` so the call site builds them via `.with_state(...)`
-/// in `lib::router`.
+/// `AppState`; the M5.1 / M5.2 / M5.3 routers are stateful and need
+/// the same `AppState` so the call site builds them via
+/// `.with_state(...)` in `lib::router`.
 pub fn stateful_router() -> Router<AppState> {
     Router::new()
         .merge(dashboard::router())
@@ -28,9 +31,12 @@ pub fn stateful_router() -> Router<AppState> {
         .merge(assets::router())
         .merge(sse::router())
         .merge(screenshot::router())
+        .merge(actions::router())
 }
 
-/// Stateless routers (currently just `/health`).
+/// Stateless routers (currently just `/health`). M5.3 keeps `/health`
+/// outside the auth gate so ops monitoring works without baking in
+/// the secret token.
 pub fn stateless_router() -> Router {
     Router::new().merge(health::router())
 }
