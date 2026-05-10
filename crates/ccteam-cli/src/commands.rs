@@ -10,8 +10,8 @@ use chrono::Utc;
 use serde_json::{json, Map, Value};
 
 use ccteam_core::{
-    bootstrap_meta_project, bootstrap_project, current_cct_bin, install_cct_control_skill,
-    install_cct_project_creator_skill, install_cct_team_author_skill,
+    bootstrap_meta_project, bootstrap_project, current_ccteam_bin, install_ccteam_control_skill,
+    install_ccteam_project_creator_skill, install_ccteam_team_author_skill,
     migrate_legacy_skill_dirs, migrate_recommended_agent_symlinks, pick_unused_slug,
     rewrite_legacy_hook_commands, user_claude_dir, write_all_global_team_templates,
     write_global_helper_templates, write_global_phase_templates, CcteamPaths,
@@ -29,7 +29,7 @@ pub enum OutputFormat {
     Json,
 }
 
-/// Options passed from the `cct init` argument parser.
+/// Options passed from the `ccteam init` argument parser.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct InitOptions {
     /// Overwrite existing global phase templates instead of skipping
@@ -37,7 +37,7 @@ pub struct InitOptions {
     pub force: bool,
 }
 
-/// `cct init`. Creates `~/.ccteam/{phases,progress,inbox,control,
+/// `ccteam init`. Creates `~/.ccteam/{phases,progress,inbox,control,
 /// queue,memory,state}`, unpacks the embedded phase templates into
 /// `~/.ccteam/phases/`, and runs a quick health check. Returns a
 /// human-readable report.
@@ -80,7 +80,7 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
         )
     })?;
 
-    let bin = current_cct_bin().ok();
+    let bin = current_ccteam_bin().ok();
 
     let claude = Command::new("claude").arg("--version").output();
     let tmux = Command::new("tmux").arg("-V").output();
@@ -118,8 +118,8 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
     }
 
     out.push_str("\nnext:\n");
-    out.push_str("  cct new \"<your one-line request>\"\n");
-    out.push_str("  cct start --foreground   # in another terminal\n");
+    out.push_str("  ccteam new \"<your one-line request>\"\n");
+    out.push_str("  ccteam start --foreground   # in another terminal\n");
     Ok(out)
 }
 
@@ -141,7 +141,7 @@ pub struct RunNewOptions<'a> {
     pub auto_slug_model: &'a str,
 }
 
-/// `cct new "request" --team <name>`. Bootstraps a project on disk
+/// `ccteam new "request" --team <name>`. Bootstraps a project on disk
 /// and returns the chosen slug. Side effects: creates
 /// `~/projects/<slug>/...`. `team` is recorded in state.json so the
 /// orchestrator can route this project through the matching phase set.
@@ -149,12 +149,12 @@ pub struct RunNewOptions<'a> {
 /// **M3.3 fail-fast**: non-dev teams require a `team.yaml` to be
 /// loadable from `~/.ccteam/teams/<team>/team.yaml`. The dev team is
 /// grandfathered in (no team.yaml required) so legacy installs
-/// without `cct init` still work. Meta-agent is also allowed
+/// without `ccteam init` still work. Meta-agent is also allowed
 /// without a team.yaml — its bootstrap path is bespoke.
 ///
 /// V0.2 §6.4 candidate 3: shipped seeds (dev / product-research /
 /// meta-agent) are stamped to disk inside `run_new` so a fresh
-/// install no longer needs an explicit `cct init` for the
+/// install no longer needs an explicit `ccteam init` for the
 /// validation to find them.
 ///
 /// V0.2.2 F34: takes `RunNewOptions` for the four-tier slug stack.
@@ -165,20 +165,20 @@ pub fn run_new(
     opts: RunNewOptions<'_>,
 ) -> Result<String> {
     if request.trim().is_empty() {
-        bail!("cct new: request must be non-empty");
+        bail!("ccteam new: request must be non-empty");
     }
     if team.trim().is_empty() {
-        bail!("cct new: --team must be non-empty");
+        bail!("ccteam new: --team must be non-empty");
     }
     // Self-heal shipped seeds before validating — without this, a
-    // first-time `cct new --team research` against a freshly-installed
+    // first-time `ccteam new --team research` against a freshly-installed
     // binary would fail with "unknown team". force=false preserves
     // operator hand-edits.
     if let Err(err) = ccteam_core::write_all_global_team_templates(&paths.root, false) {
         tracing::warn!(
             error = %err,
             root = %paths.root.display(),
-            "cct new: could not seed shipped team templates",
+            "ccteam new: could not seed shipped team templates",
         );
     }
     ensure_team_resolvable(paths, team)?;
@@ -192,7 +192,7 @@ pub fn run_new(
     if let Some(canonical) = find_alias_canonical(paths, team) {
         if canonical != team {
             eprintln!(
-                "cct new: `--team {team}` is a deprecated alias for `{canonical}`; \
+                "ccteam new: `--team {team}` is a deprecated alias for `{canonical}`; \
                  prefer `--team {canonical}` going forward",
             );
         }
@@ -233,7 +233,7 @@ fn decide_slug(
             Err(err) => {
                 tracing::warn!(
                     error = %err,
-                    "cct new: smart slug suggestion unavailable; falling back to deterministic",
+                    "ccteam new: smart slug suggestion unavailable; falling back to deterministic",
                 );
             }
         }
@@ -270,7 +270,7 @@ fn try_smart_slug(request: &str, model: &str) -> Result<Option<String>> {
 
     let prompt = render_smart_slug_prompt(request);
 
-    eprintln!("[cct] querying claude for slug recommendation...");
+    eprintln!("[ccteam] querying claude for slug recommendation...");
     let mut child = Command::new(&bin)
         .args(["-p", "--model", model])
         .stdin(Stdio::piped())
@@ -318,11 +318,11 @@ fn try_smart_slug(request: &str, model: &str) -> Result<Option<String>> {
     // Confirm in tty contexts; auto-accept when piped.
     let tty = std::io::IsTerminal::is_terminal(&io::stdin());
     if !tty {
-        eprintln!("[cct] suggested: {suggestion} (auto-accepted, non-tty)");
+        eprintln!("[ccteam] suggested: {suggestion} (auto-accepted, non-tty)");
         return Ok(Some(suggestion));
     }
 
-    eprint!("[cct] suggested: {suggestion}\n[cct] accept? [Y/n] (rerun with --slug to override): ");
+    eprint!("[ccteam] suggested: {suggestion}\n[ccteam] accept? [Y/n] (rerun with --slug to override): ");
     io::stderr().flush().ok();
     let mut line = String::new();
     let stdin = io::stdin();
@@ -332,7 +332,7 @@ fn try_smart_slug(request: &str, model: &str) -> Result<Option<String>> {
         Ok(Some(suggestion))
     } else {
         eprintln!(
-            "[cct] declined; rerun with `--slug <name>` to set explicitly, or fall back to deterministic"
+            "[ccteam] declined; rerun with `--slug <name>` to set explicitly, or fall back to deterministic"
         );
         Ok(None)
     }
@@ -418,7 +418,7 @@ fn ensure_team_resolvable(paths: &CcteamPaths, team: &str) -> Result<()> {
     let yaml_path = paths.root.join("teams").join(team).join("team.yaml");
     if yaml_path.exists() {
         TeamSpec::load(&yaml_path).with_context(|| {
-            format!("cct new: failed to load {}", yaml_path.display())
+            format!("ccteam new: failed to load {}", yaml_path.display())
         })?;
         return Ok(());
     }
@@ -429,9 +429,9 @@ fn ensure_team_resolvable(paths: &CcteamPaths, team: &str) -> Result<()> {
         .ok()
         .filter(|t| !t.is_empty())
         .map(|t| t.join(", "))
-        .unwrap_or_else(|| "(none yet — run `cct doctor --reset-shipped-teams`)".into());
+        .unwrap_or_else(|| "(none yet — run `ccteam doctor --reset-shipped-teams`)".into());
     bail!(
-        "cct new: unknown team `{team}` — \
+        "ccteam new: unknown team `{team}` — \
          create {} (see docs/interfaces.md §5.5 for schema), \
          then re-run.\n\
          Teams currently on disk: {known}.",
@@ -488,7 +488,7 @@ fn list_disk_teams(paths: &CcteamPaths) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// `cct ls`. Returns either a human table or the interfaces.md §10.3
+/// `ccteam ls`. Returns either a human table or the interfaces.md §10.3
 /// JSON shape (a single string, not printed — caller decides).
 pub fn run_ls(paths: &CcteamPaths, format: OutputFormat) -> Result<String> {
     let projects = collect_projects(paths)?;
@@ -499,7 +499,7 @@ pub fn run_ls(paths: &CcteamPaths, format: OutputFormat) -> Result<String> {
     })
 }
 
-/// `cct show <slug>`. Renders the full project view per
+/// `ccteam show <slug>`. Renders the full project view per
 /// interfaces.md §10.3 (json) or a human-readable summary (text).
 pub fn run_show(paths: &CcteamPaths, slug: &str, format: OutputFormat) -> Result<String> {
     let state_path = paths.project_state(slug);
@@ -516,7 +516,7 @@ pub fn run_show(paths: &CcteamPaths, slug: &str, format: OutputFormat) -> Result
     })
 }
 
-/// `cct attach <slug>`. Execs `tmux attach -t ccteam-<slug>`. Exits
+/// `ccteam attach <slug>`. Execs `tmux attach -t ccteam-<slug>`. Exits
 /// successfully when the user detaches; non-zero on error.
 pub fn run_attach(slug: &str) -> Result<()> {
     let session = TmuxSession::for_slug(slug);
@@ -533,7 +533,7 @@ pub fn run_attach(slug: &str) -> Result<()> {
     Ok(())
 }
 
-/// `cct peek <slug>`. Returns the contents of the session's first
+/// `ccteam peek <slug>`. Returns the contents of the session's first
 /// pane via `tmux capture-pane -p`.
 pub fn run_peek(slug: &str) -> Result<String> {
     let session = TmuxSession::for_slug(slug);
@@ -551,7 +551,7 @@ pub fn run_peek(slug: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// `cct progress <slug>`. With `tail = false`, returns the entire
+/// `ccteam progress <slug>`. With `tail = false`, returns the entire
 /// progress.jsonl as text. With `tail = true`, reads + writes to
 /// stdout in a polling loop until Ctrl-C.
 pub fn run_progress(paths: &CcteamPaths, slug: &str, tail: bool) -> Result<()> {
@@ -588,7 +588,7 @@ pub fn run_progress(paths: &CcteamPaths, slug: &str, tail: bool) -> Result<()> {
     }
 }
 
-/// `cct resume <slug>`. M0 minimum: clears any user_pause flag, drops
+/// `ccteam resume <slug>`. M0 minimum: clears any user_pause flag, drops
 /// the escalation marker if present, and sets phase_state back to idle so
 /// the daemon's next tick re-dispatches the current phase. Real
 /// `--resume` (claude session continuation) is M1+.
@@ -632,7 +632,7 @@ pub fn run_resume(paths: &CcteamPaths, slug: &str) -> Result<()> {
     Ok(())
 }
 
-/// One row in the cross-project decisions queue (`cct decisions`).
+/// One row in the cross-project decisions queue (`ccteam decisions`).
 ///
 /// A "decision" = an outbox file in any project's `.ccteam/outbox/` whose
 /// front matter has `event_kind: clarify` or `event_kind: escalation`.
@@ -651,7 +651,7 @@ pub struct DecisionRow {
     pub summary: String,
 }
 
-/// `cct decisions`. Aggregate the cross-project decisions queue and
+/// `ccteam decisions`. Aggregate the cross-project decisions queue and
 /// render it. interfaces.md §5.6.4 — meta-agent uses this as the
 /// surface for "你有 N 条待决策" UX. M1 follow-up increment.
 pub fn run_decisions(paths: &CcteamPaths, format: OutputFormat) -> Result<String> {
@@ -868,7 +868,7 @@ fn ellipsize(s: &str, max: usize) -> String {
     }
 }
 
-/// `cct doctor` flags. Each mode is a separate boolean / option so
+/// `ccteam doctor` flags. Each mode is a separate boolean / option so
 /// they can be combined (e.g. `--install-meta-agent rob` implies
 /// `--install-skill` automatically).
 #[derive(Debug, Clone, Default)]
@@ -876,10 +876,11 @@ pub struct DoctorOptions {
     pub dry_run: bool,
     pub force: bool,
     pub tool_surface: bool,
-    /// M1.8 (V0.2.2 F39): install `~/.claude/skills/cct-control/SKILL.md`
-    /// and `~/.claude/skills/cct-team-author/SKILL.md`, plus run the
-    /// V0.1/V0.2 → V0.2.2 cleanup migration (legacy skill dirs and
-    /// stale settings.json hook command paths).
+    /// M1.8: install `~/.claude/skills/ccteam-control/SKILL.md`
+    /// and `~/.claude/skills/ccteam-team-author/SKILL.md`, plus run the
+    /// V0.2.2 (F39'd) → V0.2.2 (F44'd) reverse migration (cleanup of
+    /// legacy `cct-*` skill dirs and stale settings.json hook command
+    /// paths).
     pub install_skill: bool,
     /// M1.0: bootstrap a meta-agent project for the given user handle.
     /// `Some("rob")` ⇒ creates `~/projects/rob-meta/` and triggers
@@ -918,7 +919,7 @@ pub struct DoctorOptions {
     pub screenshot_smoke: Option<String>,
 }
 
-/// `cct doctor` dispatch. Returns a human-readable report so unit
+/// `ccteam doctor` dispatch. Returns a human-readable report so unit
 /// tests don't need to capture stdout.
 pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
     let any_mode = opts.tool_surface
@@ -932,15 +933,15 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
         || opts.screenshot_smoke.is_some();
     if !any_mode {
         return Ok(String::from(
-            "cct doctor: pass at least one mode flag.\n\
+            "ccteam doctor: pass at least one mode flag.\n\
              \n\
              modes:\n  \
              --tool-surface\n      \
              cross-check phase templates' tools_required against current reachability — \
              plugin-pipeline-aware (V0.2 M0.20).\n  \
              --install-skill [--force]\n      \
-             write ~/.claude/skills/cct-{control,team-author}/SKILL.md (M1.8 + V0.2.2 F39); \
-             also runs the V0.1/V0.2 → V0.2.2 cleanup (legacy `ccteam-*` skill dirs + \
+             write ~/.claude/skills/ccteam-{control,team-author,project-creator}/SKILL.md (M1.8); \
+             also runs the V0.2.2 (F39'd) → V0.2.2 (F44'd) reverse migration (legacy `cct-*` skill dirs + \
              stale settings.json hook command paths).\n  \
              --install-meta-agent <user-handle>\n      \
              bootstrap a meta-agent project for the given user (M1.0). Implies --install-skill.\n  \
@@ -988,7 +989,7 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
         // or plugin-section) → non-zero exit so CI can gate on it.
         if fails > 0 {
             anyhow::bail!(
-                "cct doctor --validate-team {team}: {fails} fail(s) — \
+                "ccteam doctor --validate-team {team}: {fails} fail(s) — \
                  see report above\n\n{out}",
             );
         }
@@ -1024,7 +1025,7 @@ fn render_validate_team_report(
         TeamResolveContext, TEAM_SOURCES,
     };
 
-    let mut out = format!("cct doctor --validate-team {team}\n\n");
+    let mut out = format!("ccteam doctor --validate-team {team}\n\n");
     // F30 — accumulate every [FAIL] line into a single counter so the
     // top-level Summary and the `run_doctor` exit code agree. Phase-
     // section findings sum into this same counter below.
@@ -1087,7 +1088,7 @@ fn render_validate_team_report(
         None => {
             out.push_str(
                 "[FAIL] could not locate team directory after resolve — \
-                 run `cct doctor --reset-shipped-teams`\n",
+                 run `ccteam doctor --reset-shipped-teams`\n",
             );
             fails += 1;
             out.push_str(&format!("\nSummary: 0 ok, 0 warn, {fails} fail\n"));
@@ -1279,7 +1280,7 @@ pub fn run_phase_show(
     let template = found_template.ok_or_else(|| {
         anyhow::anyhow!(
             "team `{team}` has no phase `{phase}` under {} — \
-             check `cct doctor --validate-team {team}` for the phase list",
+             check `ccteam doctor --validate-team {team}` for the phase list",
             phase_dir.display(),
         )
     })?;
@@ -1325,7 +1326,7 @@ fn render_reset_shipped_teams_report(
     opts: &DoctorOptions,
 ) -> Result<String> {
     ccteam_core::write_all_global_team_templates(&paths.root, opts.force)?;
-    let mut out = String::from("cct doctor --reset-shipped-teams\n\n");
+    let mut out = String::from("ccteam doctor --reset-shipped-teams\n\n");
     if opts.force {
         out.push_str(
             "  Re-wrote every shipped team's team.yaml + phase markdowns under \
@@ -1344,7 +1345,7 @@ fn render_install_memory_bridge_report(paths: &CcteamPaths, opts: &DoctorOptions
     // V0.2 §6.4 candidate 3: bridge teams are now discovered by
     // scanning `~/.ccteam/teams/<name>/team.yaml`. Make sure shipped
     // seeds are present before the scan so a fresh install (no
-    // `cct init` yet) still lays down dev / product-research
+    // `ccteam init` yet) still lays down dev / product-research
     // bridges. force=false preserves operator hand-edits.
     if !opts.dry_run {
         ccteam_core::write_all_global_team_templates(&paths.root, false)?;
@@ -1354,9 +1355,9 @@ fn render_install_memory_bridge_report(paths: &CcteamPaths, opts: &DoctorOptions
     };
     let reports = ccteam_core::install_memory_bridge(&paths.root, install_opts)?;
     let mut out = if opts.dry_run {
-        String::from("cct doctor --install-memory-bridge (dry-run)\n\n")
+        String::from("ccteam doctor --install-memory-bridge (dry-run)\n\n")
     } else {
-        String::from("cct doctor --install-memory-bridge\n\n")
+        String::from("ccteam doctor --install-memory-bridge\n\n")
     };
     for r in &reports {
         let label = match &r.action {
@@ -1385,7 +1386,7 @@ fn render_install_memory_bridge_report(paths: &CcteamPaths, opts: &DoctorOptions
 
 fn render_install_mcp_report() -> Result<String> {
     let path = crate::mcp_serve::install_mcp()?;
-    let mut out = String::from("cct doctor --install-mcp\n\n");
+    let mut out = String::from("ccteam doctor --install-mcp\n\n");
     out.push_str(&format!("  registered ccteam MCP server in {}\n", path.display()));
     out.push_str("  tools surface : 9 (interfaces §12.2)\n");
     out.push_str("  consumers     : daily-driver claude + meta-agent\n");
@@ -1416,57 +1417,57 @@ fn render_install_skill_report(paths: &CcteamPaths, opts: &DoctorOptions) -> Res
         force: opts.force,
         dry_run: opts.dry_run,
     };
-    let mut out = String::from("cct doctor --install-skill\n\n");
+    let mut out = String::from("ccteam doctor --install-skill\n\n");
 
-    // V0.2.2 F39: install all shipped skills under their cct-* names.
-    // V0.2.2 F34: cct-project-creator joins the install set.
-    let control = install_cct_control_skill(install_opts)?;
+    // V0.2.2 F44: install all shipped skills under their canonical
+    // ccteam-* names (reverting F39's `cct-*` rename).
+    let control = install_ccteam_control_skill(install_opts)?;
     out.push_str(&format!(
-        "  cct-control          {label}  {}\n",
+        "  ccteam-control          {label}  {}\n",
         control.target.display(),
         label = skill_install_label(&control.action),
     ));
-    let team_author = install_cct_team_author_skill(install_opts)?;
+    let team_author = install_ccteam_team_author_skill(install_opts)?;
     out.push_str(&format!(
-        "  cct-team-author      {label}  {}\n",
+        "  ccteam-team-author      {label}  {}\n",
         team_author.target.display(),
         label = skill_install_label(&team_author.action),
     ));
-    let project_creator = install_cct_project_creator_skill(install_opts)?;
+    let project_creator = install_ccteam_project_creator_skill(install_opts)?;
     out.push_str(&format!(
-        "  cct-project-creator  {label}  {}\n",
+        "  ccteam-project-creator  {label}  {}\n",
         project_creator.target.display(),
         label = skill_install_label(&project_creator.action),
     ));
     out.push('\n');
 
-    // V0.2.2 F39 migration: clean up legacy V0.1/V0.2 skill dirs and
-    // rewrite stale settings.json hook command paths so users upgrading
-    // from V0.2.1 don't end up with duplicate `ccteam-*` + `cct-*` skill
-    // directories or hook commands pointing at a renamed binary.
-    out.push_str(&render_f39_migration(paths, opts)?);
+    // V0.2.2 F44 reverse migration: clean up F39-era `cct-*` skill dirs
+    // and rewrite stale settings.json hook command paths so users
+    // upgrading from F39'd V0.2.2 to F44'd V0.2.2 don't end up with
+    // duplicate `cct-*` + `ccteam-*` skill directories or hook commands
+    // pointing at the F39 `cct` binary that no longer exists.
+    out.push_str(&render_f44_migration(paths, opts)?);
 
     Ok(out)
 }
 
-/// V0.2.2 F39: detect-and-clean V0.1/V0.2 install artifacts so users
-/// who upgrade `ccteam → cct` don't end up with both naming
-/// conventions live at once. Runs as a side effect of `--install-skill`
-/// and `--install-meta-agent` (PRD §8.2.5 — "no new doctor flag,
-/// migration runs alongside install").
-fn render_f39_migration(paths: &CcteamPaths, opts: &DoctorOptions) -> Result<String> {
+/// V0.2.2 F44: detect-and-clean F39-era install artifacts so users who
+/// revert from `cct → ccteam` don't end up with both naming conventions
+/// live at once. Runs as a side effect of `--install-skill` and
+/// `--install-meta-agent`.
+fn render_f44_migration(paths: &CcteamPaths, opts: &DoctorOptions) -> Result<String> {
     let mut out = String::new();
     let claude = match user_claude_dir() {
         Ok(c) => c,
         Err(_) => {
-            // No claude dir — no V0.1/V0.2 install to clean up.
+            // No claude dir — no F39-era install to clean up.
             return Ok(out);
         }
     };
 
-    out.push_str("F39 migration (V0.1/V0.2 → V0.2.2 cleanup)\n\n");
+    out.push_str("F44 reverse migration (V0.2.2 F39 → V0.2.2 F44 cleanup)\n\n");
 
-    // 1. Legacy skill dirs.
+    // 1. Legacy `cct-*` skill dirs.
     let skill_reports = migrate_legacy_skill_dirs(&claude, opts.dry_run)?;
     let any_skill_action = skill_reports
         .iter()
@@ -1476,13 +1477,13 @@ fn render_f39_migration(paths: &CcteamPaths, opts: &DoctorOptions) -> Result<Str
             out.push_str(&render_legacy_skill_line(r, opts.dry_run));
         }
     } else {
-        out.push_str("  legacy skills    no `~/.claude/skills/ccteam-*` dirs found — nothing to do.\n");
+        out.push_str("  legacy skills    no `~/.claude/skills/cct-*` dirs found — nothing to do.\n");
     }
 
     // 2. Stale settings.json hook command paths. Use the orchestrator's
     // resolved projects root so test fixtures get the tempdir; tests
     // don't otherwise mutate `~/projects/`.
-    let new_bin = current_cct_bin().ok();
+    let new_bin = current_ccteam_bin().ok();
     if let Some(bin) = new_bin.as_ref() {
         let hook_reports =
             scan_project_settings_for_hook_rewrite(&paths.projects_root, bin, opts.dry_run)?;
@@ -1504,7 +1505,7 @@ fn render_f39_migration(paths: &CcteamPaths, opts: &DoctorOptions) -> Result<Str
                 // All NoChangeNeeded — collapse the table to a single
                 // friendly summary instead of dumping every project.
                 out.clear();
-                out.push_str("F39 migration (V0.1/V0.2 → V0.2.2 cleanup)\n\n");
+                out.push_str("F44 reverse migration (V0.2.2 F39 → V0.2.2 F44 cleanup)\n\n");
                 for r in &skill_reports {
                     out.push_str(&render_legacy_skill_line(r, opts.dry_run));
                 }
@@ -1515,7 +1516,7 @@ fn render_f39_migration(paths: &CcteamPaths, opts: &DoctorOptions) -> Result<Str
             }
         }
     } else {
-        out.push_str("  legacy hooks     could not resolve `cct` binary — skipped.\n");
+        out.push_str("  legacy hooks     could not resolve `ccteam` binary — skipped.\n");
     }
     out.push('\n');
     Ok(out)
@@ -1587,7 +1588,7 @@ fn scan_project_settings_for_hook_rewrite(
 
 fn render_install_meta_agent_report(paths: &CcteamPaths, user_handle: &str) -> Result<String> {
     let report: MetaBootstrapReport = bootstrap_meta_project(paths, user_handle)?;
-    let mut out = String::from("cct doctor --install-meta-agent\n\n");
+    let mut out = String::from("ccteam doctor --install-meta-agent\n\n");
     out.push_str(&format!("  user handle      {user_handle}\n"));
     out.push_str(&format!("  project slug     {}\n", report.slug));
     out.push_str(&format!("  project dir      {}\n", report.project_dir.display()));
@@ -1605,7 +1606,7 @@ fn render_install_meta_agent_report(paths: &CcteamPaths, user_handle: &str) -> R
         "attach with      tmux attach -t ccteam-meta-{}\n",
         ccteam_core::meta_slug(user_handle)?.trim_end_matches("-meta"),
     ));
-    out.push_str("\nrun `cct start --foreground` (in another terminal) to wake the meta session.\n");
+    out.push_str("\nrun `ccteam start --foreground` (in another terminal) to wake the meta session.\n");
     Ok(out)
 }
 
@@ -1614,9 +1615,9 @@ fn render_migrate_recommended_agents_report(opts: &DoctorOptions) -> Result<Stri
     let reports = migrate_recommended_agent_symlinks(&claude, opts.dry_run)?;
     let mut out = String::new();
     out.push_str(if opts.dry_run {
-        "cct doctor --migrate-recommended-agents (dry-run)\n"
+        "ccteam doctor --migrate-recommended-agents (dry-run)\n"
     } else {
-        "cct doctor --migrate-recommended-agents\n"
+        "ccteam doctor --migrate-recommended-agents\n"
     });
     out.push('\n');
     if reports.is_empty() {
@@ -1661,7 +1662,7 @@ fn render_migration_line(r: &MigrationReport, dry_run: bool) -> String {
 /// and surfaces either the resulting PNG path + size or the
 /// degrade reason (tmux missing / vt100 panic / IO failure).
 fn render_screenshot_smoke_report(paths: &CcteamPaths, slug: &str) -> Result<String> {
-    let mut out = String::from("cct doctor --screenshot-smoke\n\n");
+    let mut out = String::from("ccteam doctor --screenshot-smoke\n\n");
     out.push_str(&format!("  slug:        {slug}\n"));
     match ccteam_core::probe_screenshot_font() {
         Ok(label) => out.push_str(&format!("  font probe:  ok  ({label})\n")),
@@ -1691,7 +1692,7 @@ fn render_screenshot_smoke_report(paths: &CcteamPaths, slug: &str) -> Result<Str
             out.push_str("  render:      degraded  (no PNG written)\n\n");
             out.push_str(
                 "rendering returned Ok(None). Common causes:\n  \
-                 - the tmux session `ccteam-<slug>` does not exist (start with `cct start`).\n  \
+                 - the tmux session `ccteam-<slug>` does not exist (start with `ccteam start`).\n  \
                  - tmux is not installed on this host.\n  \
                  - vt100 / imageproc panicked on a malformed input (unusual; check daemon stderr).\n  \
                  - IO error writing the PNG file.\n\n\
@@ -1708,7 +1709,7 @@ fn render_tool_surface_report(paths: &CcteamPaths) -> Result<String> {
     let templates = load_local_phase_templates(paths)?;
 
     let mut out = String::new();
-    out.push_str("cct doctor --tool-surface\n");
+    out.push_str("ccteam doctor --tool-surface\n");
     out.push_str(&format!(
         "\nclaude dir       : {}\n",
         claude.display()
@@ -1729,7 +1730,7 @@ fn render_tool_surface_report(paths: &CcteamPaths) -> Result<String> {
 
     if templates.is_empty() {
         out.push_str(
-            "no phase templates under ~/.ccteam/phases/ — run `cct init` first.\n",
+            "no phase templates under ~/.ccteam/phases/ — run `ccteam init` first.\n",
         );
         return Ok(out);
     }
@@ -1780,7 +1781,7 @@ fn render_tool_surface_report(paths: &CcteamPaths) -> Result<String> {
     if any_missing {
         out.push_str(
             "**Verdict:** at least one phase has a missing tool. \
-             `cct start` will refuse until they're installed (or pass --skip-tool-check).\n",
+             `ccteam start` will refuse until they're installed (or pass --skip-tool-check).\n",
         );
     } else {
         out.push_str("**Verdict:** all phase tool dependencies reachable.\n");
@@ -1893,12 +1894,12 @@ pub fn collect_recent_events(
 /// Collect every `.md` artifact under `<project>/.ccteam/` so non-dev
 /// teams (e.g. product-research with `verdict.md` / `rationale.md` /
 /// `next-steps.md` / `brief.md` / `market-survey.md`) get listed in
-/// `cct show <slug> --format json` without ccteam-cli holding a
+/// `ccteam show <slug> --format json` without ccteam-cli holding a
 /// per-team artifact whitelist (F8 fix, 2026-05-07).
 ///
 /// Key = file stem with `-` → `_` (e.g. `plan-eng.md` → `plan_eng`)
 /// so existing JSON consumers (the meta-agent dispatch tree, the
-/// cct-control skill) keep working without a schema migration.
+/// ccteam-control skill) keep working without a schema migration.
 /// Sub-directories under `.ccteam/` (e.g. `outbox/`, `inbox/`) are
 /// not enumerated — those have dedicated views.
 ///
@@ -1943,7 +1944,7 @@ fn render_ls_text(projects: &[ProjectSummary], daemon_up: bool) -> String {
     ));
     if projects.is_empty() {
         out.push_str(
-            "(no projects under ~/projects/. start one with `cct new \"<request>\"`.)\n",
+            "(no projects under ~/projects/. start one with `ccteam new \"<request>\"`.)\n",
         );
         return out;
     }
@@ -1962,7 +1963,7 @@ fn render_ls_text(projects: &[ProjectSummary], daemon_up: bool) -> String {
     out
 }
 
-/// `current_phase` is empty between `cct new` and the first
+/// `current_phase` is empty between `ccteam new` and the first
 /// dispatch; surface that as `pending` instead of a blank column so
 /// `ls` and `show` are readable on fresh projects.
 fn display_phase(phase: &str) -> &str {
@@ -2114,7 +2115,7 @@ fn truncate(s: &str, n: usize) -> &str {
     }
 }
 
-/// `cct watchdog scan` (V0.2 M0.21). Reads `~/.ccteam/watchdog.yaml`
+/// `ccteam watchdog scan` (V0.2 M0.21). Reads `~/.ccteam/watchdog.yaml`
 /// (or defaults), scans every project + the daemon heartbeat, and
 /// renders the resulting alerts. With `push_to_user_handle: Some(<h>)`
 /// each alert that survives filtering is also written to the meta-agent
@@ -2265,7 +2266,7 @@ mod tests {
         // `run_new` self-heals shipped seeds first, so
         // `product-research`'s yaml lands at
         // ~/.ccteam/teams/product-research/team.yaml during this
-        // call — no manual `cct init` needed.
+        // call — no manual `ccteam init` needed.
         ensure_isolation();
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
@@ -2479,7 +2480,7 @@ mod tests {
     #[test]
     fn run_resume_appends_resumed_history_after_escalated_entry() {
         // E2E 2026-05-06 F8: an escalated `phase_history` entry leaves
-        // `Dag::is_terminal_state` permanently true. `cct resume`
+        // `Dag::is_terminal_state` permanently true. `ccteam resume`
         // must append a paired `"resumed"` entry so future ticks
         // dispatch again. Append-only — the original escalated entry
         // stays intact for audit.
@@ -2665,14 +2666,14 @@ mod tests {
         assert_eq!(state.team, "meta-agent");
         assert_eq!(state.tmux_session, "ccteam-meta-rob");
 
-        // Skill landed under the redirected ~/.claude/. V0.2.2 F39 →
-        // both shipped skills should be written under cct-* names.
-        let control = tmp.path().join("skills/cct-control/SKILL.md");
-        assert!(control.is_file(), "cct-control SKILL.md not written: {}", control.display());
-        let team_author = tmp.path().join("skills/cct-team-author/SKILL.md");
+        // Skill landed under the redirected ~/.claude/. F44 reverts F39:
+        // both shipped skills are written under canonical ccteam-* names.
+        let control = tmp.path().join("skills/ccteam-control/SKILL.md");
+        assert!(control.is_file(), "ccteam-control SKILL.md not written: {}", control.display());
+        let team_author = tmp.path().join("skills/ccteam-team-author/SKILL.md");
         assert!(
             team_author.is_file(),
-            "cct-team-author SKILL.md not written: {}",
+            "ccteam-team-author SKILL.md not written: {}",
             team_author.display(),
         );
 
@@ -2695,29 +2696,29 @@ mod tests {
         assert!(report.contains("install-skill"));
         assert!(!report.contains("install-meta-agent"));
 
-        // V0.2.2 F39: both shipped skills land under cct-* names.
-        assert!(tmp.path().join("skills/cct-control/SKILL.md").is_file());
-        assert!(tmp.path().join("skills/cct-team-author/SKILL.md").is_file());
+        // F44 reverts F39: shipped skills land under canonical ccteam-* names.
+        assert!(tmp.path().join("skills/ccteam-control/SKILL.md").is_file());
+        assert!(tmp.path().join("skills/ccteam-team-author/SKILL.md").is_file());
         std::env::remove_var("CLAUDE_CONFIG_HOME");
     }
 
     #[test]
-    fn run_doctor_install_skill_runs_f39_legacy_skill_cleanup() {
-        // V0.2.2 F39: --install-skill detects + removes any
-        // ~/.claude/skills/ccteam-{control,team-author}/ left over from
-        // V0.1/V0.2 installs whose body still carries the
+    fn run_doctor_install_skill_runs_f44_legacy_skill_cleanup() {
+        // V0.2.2 F44: --install-skill detects + removes any
+        // ~/.claude/skills/cct-{control,team-author,project-creator}/ left
+        // over from F39'd V0.2.2 installs whose body still carries the
         // ccteam-managed marker (or canonical frontmatter).
         ensure_isolation();
         let _guard = env_lock().lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
         std::env::set_var("CLAUDE_CONFIG_HOME", tmp.path().to_str().unwrap());
-        // Stage a V0.2.x install.
-        let legacy = tmp.path().join("skills/ccteam-control");
+        // Stage an F39'd install (V0.2.2 PR #1 era).
+        let legacy = tmp.path().join("skills/cct-control");
         std::fs::create_dir_all(&legacy).unwrap();
         std::fs::write(
             legacy.join("SKILL.md"),
-            "---\nname: ccteam-control\n---\n# legacy body\n",
+            "---\nname: cct-control\n---\n# legacy body\n",
         )
         .unwrap();
 
@@ -2726,24 +2727,24 @@ mod tests {
             ..DoctorOptions::default()
         };
         let report = run_doctor(&paths, opts).unwrap();
-        assert!(report.contains("F39 migration"), "F39 report header missing: {report}");
-        assert!(report.contains("ccteam-control/"), "legacy entry missing: {report}");
-        assert!(!legacy.exists(), "legacy ccteam-control dir survived");
-        // New name still landed.
-        assert!(tmp.path().join("skills/cct-control/SKILL.md").is_file());
+        assert!(report.contains("F44 reverse migration"), "F44 report header missing: {report}");
+        assert!(report.contains("cct-control/"), "legacy entry missing: {report}");
+        assert!(!legacy.exists(), "legacy cct-control dir survived");
+        // New (canonical) name still landed.
+        assert!(tmp.path().join("skills/ccteam-control/SKILL.md").is_file());
         std::env::remove_var("CLAUDE_CONFIG_HOME");
     }
 
     #[test]
     fn run_doctor_install_skill_preserves_user_hand_edited_legacy_skill() {
-        // F39: a legacy directory whose SKILL.md was hand-edited
+        // F44: a legacy `cct-*` directory whose SKILL.md was hand-edited
         // (no marker, no canonical frontmatter) is preserved.
         ensure_isolation();
         let _guard = env_lock().lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
         std::env::set_var("CLAUDE_CONFIG_HOME", tmp.path().to_str().unwrap());
-        let legacy = tmp.path().join("skills/ccteam-team-author");
+        let legacy = tmp.path().join("skills/cct-team-author");
         std::fs::create_dir_all(&legacy).unwrap();
         std::fs::write(
             legacy.join("SKILL.md"),
@@ -2756,7 +2757,7 @@ mod tests {
             ..DoctorOptions::default()
         };
         let report = run_doctor(&paths, opts).unwrap();
-        assert!(report.contains("preserved"), "F39 should report preserve: {report}");
+        assert!(report.contains("preserved"), "F44 should report preserve: {report}");
         assert!(legacy.exists(), "hand-edited legacy dir was unexpectedly removed");
         std::env::remove_var("CLAUDE_CONFIG_HOME");
     }
@@ -2825,8 +2826,8 @@ mod tests {
 
     #[test]
     fn run_new_self_heals_shipped_seeds_for_first_time_install() {
-        // V0.2 §6.4 candidate 3: a fresh install (no `cct init`) where
-        // ~/.ccteam/teams/ is empty must still let `cct new --team
+        // V0.2 §6.4 candidate 3: a fresh install (no `ccteam init`) where
+        // ~/.ccteam/teams/ is empty must still let `ccteam new --team
         // research` succeed because run_new self-heals.
         // V0.2.2 F40: canonical name is `research`.
         ensure_isolation();
@@ -2843,7 +2844,7 @@ mod tests {
 
     #[test]
     fn run_new_accepts_legacy_alias_product_research_with_deprecation_warn() {
-        // V0.2.2 F40 — `cct new --team product-research` still works
+        // V0.2.2 F40 — `ccteam new --team product-research` still works
         // (alias resolution against shipped `teams/research/team.yaml`).
         // The slug carries the typed-team prefix so the project lands at
         // ~/projects/product-research-<base>; state.json::team also
@@ -2867,7 +2868,7 @@ mod tests {
         assert_eq!(state.team, "product-research");
     }
 
-    // -------- cct decisions (M1 follow-up) --------
+    // -------- ccteam decisions (M1 follow-up) --------
 
     /// Helper: write an outbox file with caller-controlled front matter
     /// to `<projects_root>/<slug>/.ccteam/outbox/<filename>`. Uses

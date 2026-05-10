@@ -32,7 +32,7 @@ fn install_mcp_writes_to_claude_config_home_when_set() {
     let fake_home = tmp.path().join("fake-home");
     std::fs::create_dir_all(&fake_home).unwrap();
 
-    let bin = env!("CARGO_BIN_EXE_cct");
+    let bin = env!("CARGO_BIN_EXE_ccteam");
     let out = Command::new(bin)
         .args(["doctor", "--install-mcp"])
         .env("CLAUDE_CONFIG_HOME", &claude_dir)

@@ -9,7 +9,7 @@ use std::process::Command;
 
 #[test]
 fn ccteam_start_help_advertises_claude_argv_flag() {
-    let bin = env!("CARGO_BIN_EXE_cct");
+    let bin = env!("CARGO_BIN_EXE_ccteam");
     let out = Command::new(bin)
         .args(["start", "--help"])
         .output()

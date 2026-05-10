@@ -1,6 +1,6 @@
 <!-- ccteam-managed:skill begin -->
 ---
-name: cct-control
+name: ccteam-control
 description: |
   Manage ccteam projects from any Claude Code session. Use when the
   user asks about ccteam status, wants to start a new ccteam project,
@@ -11,13 +11,13 @@ description: |
 allowed-tools: [Bash]
 ---
 
-# cct-control
+# ccteam-control
 
 ccteam is an autonomous project orchestrator built on Claude Code.
 This skill makes ccteam reachable from any claude session via the
-short-prefix `cct` CLI (V0.2.2 F39).
+`ccteam` CLI.
 
-**Prefer the MCP server.** Once `cct doctor --install-mcp` has
+**Prefer the MCP server.** Once `ccteam doctor --install-mcp` has
 registered the server (M2.5), every claude session sees nine
 `mcp__ccteam__*` tools — call those first. The `Bash` + `--format
 json` path below stays as a fallback for sessions where the MCP
@@ -27,31 +27,29 @@ server isn't registered yet.
 
 | What you want | MCP tool (preferred) | Bash fallback |
 |---|---|---|
-| List all projects                | `mcp__ccteam__ls`                | `cct ls --format json` |
-| One project's full state         | `mcp__ccteam__show`              | `cct show <slug> --format json` |
-| Recent progress events           | `mcp__ccteam__progress`          | `cct progress <slug>` |
-| Capture session pane content     | `mcp__ccteam__peek`              | `cct peek <slug>` |
-| Start a new dev project          | `mcp__ccteam__new`               | `cct new --team=dev "<request>"` |
-| Start a product-research project | `mcp__ccteam__new`               | `cct new --team=product-research "<idea>"` |
-| Pause project (no kill)          | `mcp__ccteam__pause`             | `cct pause <slug>` |
-| Resume project                   | `mcp__ccteam__resume`            | `cct resume <slug>` |
+| List all projects                | `mcp__ccteam__ls`                | `ccteam ls --format json` |
+| One project's full state         | `mcp__ccteam__show`              | `ccteam show <slug> --format json` |
+| Recent progress events           | `mcp__ccteam__progress`          | `ccteam progress <slug>` |
+| Capture session pane content     | `mcp__ccteam__peek`              | `ccteam peek <slug>` |
+| Start a new dev project          | `mcp__ccteam__new`               | `ccteam new --team=dev "<request>"` |
+| Start a product-research project | `mcp__ccteam__new`               | `ccteam new --team=product-research "<idea>"` |
+| Pause project (no kill)          | `mcp__ccteam__pause`             | `ccteam pause <slug>` |
+| Resume project                   | `mcp__ccteam__resume`            | `ccteam resume <slug>` |
 | Send NL to a session inbox       | `mcp__ccteam__send_to_session`   | (write `.ccteam/inbox/msg-<ts>-NNN.md`) |
 | Inject ESCALATE-style decision   | `mcp__ccteam__inject_decision`   | (compose body manually + send_to_session) |
-| Health checks                    | (Bash only)                      | `cct doctor --tool-surface` |
-| Install meta-agent               | (Bash only)                      | `cct doctor --install-meta-agent <handle>` |
+| Health checks                    | (Bash only)                      | `ccteam doctor --tool-surface` |
+| Install meta-agent               | (Bash only)                      | `ccteam doctor --install-meta-agent <handle>` |
 
-When the MCP server is registered, `cct doctor --install-mcp` (run
+When the MCP server is registered, `ccteam doctor --install-mcp` (run
 once) wires `mcpServers.ccteam` into `~/.claude.json`. Existing claude
-sessions need `/reload-mcp`; new sessions pick it up immediately. The
-MCP server name stays `ccteam` (V0.2.2 §8.3 — namespace change is
-deferred to V0.3 to avoid touching user `~/.claude.json` files).
+sessions need `/reload-mcp`; new sessions pick it up immediately.
 
 ## Typical workflows
 
 ### A) Cross-project status report
 
 ```bash
-cct ls --format json | jq '.projects[] | {slug, current_phase, phase_state, cost_used_usd, age_seconds}'
+ccteam ls --format json | jq '.projects[] | {slug, current_phase, phase_state, cost_used_usd, age_seconds}'
 ```
 
 Then narrate the table to the user — call out anything in
@@ -83,22 +81,22 @@ When the user says "make a todo cli" but the brief is ambiguous,
 Pick the single most blocking question. Only after they answer, run:
 
 ```bash
-cct new --team=dev "<refined brief>"
+ccteam new --team=dev "<refined brief>"
 # or, if the user still seems uncertain:
-cct new --team=product-research "<idea>"
+ccteam new --team=product-research "<idea>"
 ```
 
 ### D) Stuck-project triage
 
 ```bash
-cct show <slug> --format json | jq '{phase: .state.current_phase, fix_count: .state.auto_loop_cycle_count, recent: .recent_events[-5:]}'
-cct peek <slug>
+ccteam show <slug> --format json | jq '{phase: .state.current_phase, fix_count: .state.auto_loop_cycle_count, recent: .recent_events[-5:]}'
+ccteam peek <slug>
 ```
 
 Combine the two outputs and recommend exactly **one** of:
-- `cct attach <slug>` — user wants to drive
-- `cct pause <slug>` — pause and think
-- `cct resume <slug>` after fixing — back to autonomous
+- `ccteam attach <slug>` — user wants to drive
+- `ccteam pause <slug>` — pause and think
+- `ccteam resume <slug>` after fixing — back to autonomous
 
 ## Decision principles
 
@@ -117,7 +115,7 @@ Combine the two outputs and recommend exactly **one** of:
 - It cannot edit `~/projects/<slug>/.ccteam/` metadata directly. All
   control flows through the CLI (or `~/.ccteam/control/` files for
   M2+ asynchronous control).
-- It cannot start the ccteam orchestrator daemon — that's `cct
+- It cannot start the ccteam orchestrator daemon — that's `ccteam
   start --foreground` and is an ops decision, not an agent decision.
 
 ## Meta-agent specifics

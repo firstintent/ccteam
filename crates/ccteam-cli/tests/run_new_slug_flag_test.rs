@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn cct_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_cct")
+    env!("CARGO_BIN_EXE_ccteam")
 }
 
 #[test]
@@ -15,13 +15,13 @@ fn cct_new_help_advertises_slug_flags() {
     let out = Command::new(cct_bin())
         .args(["new", "--help"])
         .output()
-        .expect("spawn cct new --help");
-    assert!(out.status.success(), "cct new --help should exit 0");
+        .expect("spawn ccteam new --help");
+    assert!(out.status.success(), "ccteam new --help should exit 0");
     let stdout = String::from_utf8_lossy(&out.stdout);
     for flag in ["--slug", "--no-auto-slug", "--auto-slug-model"] {
         assert!(
             stdout.contains(flag),
-            "cct new --help should advertise {flag}; got:\n{stdout}",
+            "ccteam new --help should advertise {flag}; got:\n{stdout}",
         );
     }
 }
@@ -50,13 +50,13 @@ fn cct_new_with_explicit_slug_creates_project_dir() {
         // Belt-and-suspenders: the unit-side env knob also forces Tier 4.
         .env("CCTEAM_AUTO_SLUG", "off")
         .output()
-        .expect("spawn cct new");
+        .expect("spawn ccteam new");
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         out.status.success(),
-        "cct new should succeed; stdout:\n{stdout}\nstderr:\n{stderr}",
+        "ccteam new should succeed; stdout:\n{stdout}\nstderr:\n{stderr}",
     );
     assert!(
         stdout.contains("dev-ccteam-ui"),
@@ -93,7 +93,7 @@ fn cct_new_rejects_explicit_slug_with_illegal_chars() {
         .env("CCTEAM_PROJECTS_ROOT", &projects_root)
         .env("CCTEAM_AUTO_SLUG", "off")
         .output()
-        .expect("spawn cct new");
+        .expect("spawn ccteam new");
 
     assert!(!out.status.success(), "illegal slug must fail-loud");
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -148,13 +148,13 @@ fn cct_new_tier3_reads_from_stub_claude_bin() {
         // CCTEAM_AUTO_SLUG is unset so Tier 3 is allowed to fire.
         .env_remove("CCTEAM_AUTO_SLUG")
         .output()
-        .expect("spawn cct new");
+        .expect("spawn ccteam new");
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         out.status.success(),
-        "cct new with stub claude should succeed; stdout:\n{stdout}\nstderr:\n{stderr}",
+        "ccteam new with stub claude should succeed; stdout:\n{stdout}\nstderr:\n{stderr}",
     );
     assert!(
         stdout.contains("dev-tier3-stub-slug"),
@@ -204,7 +204,7 @@ fn cct_new_tier3_falls_back_to_tier4_when_stub_returns_garbage() {
         .env("CCTEAM_AUTO_SLUG_BIN", &stub)
         .env_remove("CCTEAM_AUTO_SLUG")
         .output()
-        .expect("spawn cct new");
+        .expect("spawn ccteam new");
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(

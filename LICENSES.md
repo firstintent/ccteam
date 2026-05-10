@@ -10,7 +10,7 @@ or repository, with their respective licenses.
 
 - **Vendored at**: `crates/ccteam-core/assets/fonts/JetBrainsMono-Regular.ttf`
 - **Used by**: V0.2.2 F38 — terminal screenshot pipeline. Baked into the
-  `cct` binary via `include_bytes!` so screenshot rendering has zero
+  `ccteam` binary via `include_bytes!` so screenshot rendering has zero
   system-font dependencies. Users can override at runtime by setting
   the `CCTEAM_SCREENSHOT_FONT_TTF` environment variable.
 - **Upstream**: <https://github.com/JetBrains/JetBrainsMono>

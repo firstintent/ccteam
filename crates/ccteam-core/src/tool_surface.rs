@@ -400,10 +400,10 @@ pub struct MigrationReport {
     pub removed: bool,
 }
 
-/// V0.2.2 F39: outcome of a single legacy skill directory check.
+/// V0.2.2 F44: outcome of a single legacy skill directory check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LegacySkillAction {
-    /// Directory absent — V0.1/V0.2 user never installed this skill, or
+    /// Directory absent — user never installed this F39-era skill, or
     /// already cleaned up. Reported as "no-op".
     NotFound,
     /// Body carried the `<!-- ccteam-managed:skill … -->` marker (or the
@@ -417,27 +417,29 @@ pub enum LegacySkillAction {
     PreservedHandEdit,
 }
 
-/// V0.2.2 F39: report for one `~/.claude/skills/<legacy>/` directory.
+/// V0.2.2 F44: report for one `~/.claude/skills/<legacy>/` directory.
 #[derive(Debug, Clone)]
 pub struct LegacySkillReport {
     /// `<claude_dir>/skills/<legacy_name>/`.
     pub target: PathBuf,
-    /// One of the V0.1/V0.2 `LEGACY_SKILL_NAMES` entries.
+    /// One of the F39-era `LEGACY_SKILL_NAMES` entries (`cct-*`).
     pub legacy_name: String,
     pub action: LegacySkillAction,
 }
 
-/// V0.2.2 F39: detect and (when safe) remove `~/.claude/skills/ccteam-{control,team-author}/`
-/// dirs left over from V0.1/V0.2 installs. The cct doctor migration
-/// path calls this after the new `cct-{control,team-author}` skills
-/// have been installed so users can collapse to a single skill set.
+/// V0.2.2 F44: detect and (when safe) remove
+/// `~/.claude/skills/cct-{control,team-author,project-creator}/` dirs
+/// left over from V0.2.2 (F39'd) installs. The `ccteam doctor` migration
+/// path calls this after the canonical `ccteam-{control,team-author,
+/// project-creator}` skills have been installed so users can collapse
+/// to a single skill set.
 ///
-/// **Safety contract (PRD §8.2.5)**: only removes a legacy directory
-/// whose `SKILL.md` body still carries the `<!-- ccteam-managed:skill ... -->`
-/// marker or the matching `name: ccteam-{control,team-author}` YAML
-/// frontmatter. Operator hand-edits (no marker, no canonical frontmatter)
-/// are preserved as-is — the user must remove them manually if they
-/// want a clean tree.
+/// **Safety contract**: only removes a legacy directory whose `SKILL.md`
+/// body still carries the `<!-- ccteam-managed:skill ... -->` marker or
+/// the matching `name: cct-{control,team-author,project-creator}` YAML
+/// frontmatter. Operator hand-edits (no marker, no canonical
+/// frontmatter) are preserved as-is — the user must remove them
+/// manually if they want a clean tree.
 ///
 /// `dry_run=true` reports without touching the filesystem.
 pub fn migrate_legacy_skill_dirs(
@@ -462,9 +464,9 @@ pub fn migrate_legacy_skill_dirs(
         }
 
         // Body must carry the ccteam-managed marker (the body we shipped
-        // through V0.1/V0.2 plus the V0.2.2 wrapper) **or** the
-        // canonical frontmatter `name: ccteam-…` so we can be sure it's
-        // the unedited shipped skill. Either signal alone is enough.
+        // through V0.2.2 F39) **or** the canonical frontmatter
+        // `name: cct-…` so we can be sure it's the unedited shipped
+        // skill. Either signal alone is enough.
         let body = std::fs::read_to_string(&skill_md).unwrap_or_default();
         let canonical_frontmatter = format!("name: {legacy}");
         let is_managed = body.contains("<!-- ccteam-managed:skill begin -->")
@@ -498,13 +500,13 @@ pub fn migrate_legacy_skill_dirs(
     Ok(out)
 }
 
-/// V0.2.2 F39: outcome of a single project's settings.json hook
-/// command rewrite (legacy `… ccteam hook …` → `<current_exe> hook …`).
+/// V0.2.2 F44: outcome of a single project's settings.json hook
+/// command rewrite (legacy `… cct hook …` → `<current_exe> hook …`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookCmdRewriteAction {
     /// File absent — nothing to do.
     NotFound,
-    /// File present, no hook command referenced a legacy `ccteam`
+    /// File present, no hook command referenced an F39-era `cct`
     /// binary path. Idempotent re-run after a successful migration
     /// hits this branch.
     NoChangeNeeded,
@@ -514,23 +516,23 @@ pub enum HookCmdRewriteAction {
     Rewrote { entries: usize },
 }
 
-/// V0.2.2 F39: report for one `~/projects/<slug>/.claude/settings.json`.
+/// V0.2.2 F44: report for one `~/projects/<slug>/.claude/settings.json`.
 #[derive(Debug, Clone)]
 pub struct HookCmdRewriteReport {
     pub target: PathBuf,
     pub action: HookCmdRewriteAction,
 }
 
-/// V0.2.2 F39: rewrite legacy `… /ccteam hook …` (or `ccteam hook …`
+/// V0.2.2 F44: rewrite F39-era `… /cct hook …` (or `cct hook …`
 /// without an absolute prefix) entries in a project's settings.json
-/// so they invoke the new `cct` binary at the running ccteam
+/// so they invoke the canonical `ccteam` binary at the running
 /// process's `current_exe()` path. Idempotent — re-runs after success
 /// hit `NoChangeNeeded`.
 ///
-/// Detection rule: any `command` string that ends with the legacy
-/// segment `/ccteam hook ` or starts with `ccteam hook ` (no slash).
-/// The replacement substitutes everything up through the binary path
-/// with the new binary path. Hook subcommands (e.g. `progress-append
+/// Detection rule: any `command` string that ends with the F39 segment
+/// `/cct hook ` or starts with `cct hook ` (no slash). The replacement
+/// substitutes everything up through the binary path with the new
+/// binary path. Hook subcommands (e.g. `progress-append
 /// session_start`) are preserved verbatim so this works for every hook
 /// in `templates/settings.json`.
 pub fn rewrite_legacy_hook_commands(
@@ -547,10 +549,10 @@ pub fn rewrite_legacy_hook_commands(
 
     let new_bin_str = new_bin
         .to_str()
-        .ok_or_else(|| anyhow!("cct binary path not valid UTF-8: {}", new_bin.display()))?;
+        .ok_or_else(|| anyhow!("ccteam binary path not valid UTF-8: {}", new_bin.display()))?;
     if new_bin_str.contains('"') || new_bin_str.contains('\\') {
         return Err(anyhow!(
-            "cct binary path contains characters that can't be embedded in settings.json: {new_bin_str}"
+            "ccteam binary path contains characters that can't be embedded in settings.json: {new_bin_str}"
         ));
     }
 
@@ -607,7 +609,7 @@ pub fn rewrite_legacy_hook_commands(
     let body = serde_json::to_string_pretty(&v).context("serialize updated settings.json")?;
     // Atomic write: write to `<path>.tmp` then rename so a crash mid-
     // write can't leave a half-rewritten settings.json on disk.
-    let tmp = settings_path.with_extension("json.cct-migrate.tmp");
+    let tmp = settings_path.with_extension("json.ccteam-migrate.tmp");
     std::fs::write(&tmp, &body)
         .with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, settings_path)
@@ -618,24 +620,23 @@ pub fn rewrite_legacy_hook_commands(
     })
 }
 
-/// V0.2.2 F39: rewrite one hook `command` string. Returns `None` when
-/// the command does not look like a legacy `ccteam hook …` invocation
+/// V0.2.2 F44: rewrite one hook `command` string. Returns `None` when
+/// the command does not look like an F39-era `cct hook …` invocation
 /// (so the caller can leave it alone — preserves operator-authored
 /// hooks). Otherwise returns the rewritten string with the binary path
-/// swapped to `new_bin`.
+/// swapped to `new_bin` (the canonical `ccteam` binary).
 fn rewrite_one_hook_command(cmd: &str, new_bin: &str) -> Option<String> {
-    // Already pointing at the new `cct` binary? Idempotency.
-    if cmd.contains("/cct hook ") || cmd.starts_with("cct hook ") {
+    // Already pointing at the canonical `ccteam` binary? Idempotency.
+    if cmd.contains("/ccteam hook ") || cmd.starts_with("ccteam hook ") {
         return None;
     }
-    // Absolute path ending with `/ccteam hook …`.
-    if let Some(idx) = cmd.find("/ccteam hook ") {
-        let tail = &cmd[idx + "/ccteam".len()..];
+    // Absolute path ending with `/cct hook …` (F39 binary name).
+    if let Some(idx) = cmd.find("/cct hook ") {
+        let tail = &cmd[idx + "/cct".len()..];
         return Some(format!("{new_bin}{tail}"));
     }
-    // Bare `ccteam hook …` with no path prefix (uncommon but legal in
-    // V0.1 templates).
-    if let Some(rest) = cmd.strip_prefix("ccteam hook ") {
+    // Bare `cct hook …` with no path prefix (uncommon but legal).
+    if let Some(rest) = cmd.strip_prefix("cct hook ") {
         return Some(format!("{new_bin} hook {rest}"));
     }
     None
@@ -852,7 +853,7 @@ mod tests {
         assert!(stale.symlink_metadata().unwrap().file_type().is_symlink());
     }
 
-    // -------------------- V0.2.2 F39 migration helpers --------------------
+    // -------------------- V0.2.2 F44 reverse-migration helpers --------------------
 
     fn write_legacy_skill(claude: &Path, name: &str, body: &str) -> PathBuf {
         let dir = claude.join("skills").join(name);
@@ -867,7 +868,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let claude = tmp.path().join(".claude");
         let reports = migrate_legacy_skill_dirs(&claude, false).unwrap();
-        assert_eq!(reports.len(), 2);
+        assert_eq!(reports.len(), 3);
         for r in &reports {
             assert_eq!(r.action, LegacySkillAction::NotFound);
         }
@@ -879,34 +880,34 @@ mod tests {
         let claude = tmp.path().join(".claude");
         let dir = write_legacy_skill(
             &claude,
-            "ccteam-control",
-            "<!-- ccteam-managed:skill begin -->\n---\nname: ccteam-control\n---\n# body\n<!-- ccteam-managed:skill end -->\n",
+            "cct-control",
+            "<!-- ccteam-managed:skill begin -->\n---\nname: cct-control\n---\n# body\n<!-- ccteam-managed:skill end -->\n",
         );
         let reports = migrate_legacy_skill_dirs(&claude, false).unwrap();
         let ctrl = reports
             .iter()
-            .find(|r| r.legacy_name == "ccteam-control")
+            .find(|r| r.legacy_name == "cct-control")
             .unwrap();
         assert_eq!(ctrl.action, LegacySkillAction::Removed);
         assert!(!dir.exists());
     }
 
     #[test]
-    fn migrate_legacy_skill_dirs_removes_v0_2_install_via_frontmatter() {
-        // V0.2.0 / V0.2.1 shipped the skill body without the
-        // ccteam-managed marker (the marker is V0.2.2 F39 prep). Detect
-        // it by frontmatter `name:` instead.
+    fn migrate_legacy_skill_dirs_removes_via_frontmatter_only() {
+        // F39 always shipped the marker, but if a user installed the
+        // body via some other path that stripped the comment marker,
+        // detect via frontmatter `name:` instead.
         let tmp = tempfile::TempDir::new().unwrap();
         let claude = tmp.path().join(".claude");
         let dir = write_legacy_skill(
             &claude,
-            "ccteam-team-author",
-            "---\nname: ccteam-team-author\n---\n# body\n",
+            "cct-team-author",
+            "---\nname: cct-team-author\n---\n# body\n",
         );
         let reports = migrate_legacy_skill_dirs(&claude, false).unwrap();
         let ta = reports
             .iter()
-            .find(|r| r.legacy_name == "ccteam-team-author")
+            .find(|r| r.legacy_name == "cct-team-author")
             .unwrap();
         assert_eq!(ta.action, LegacySkillAction::Removed);
         assert!(!dir.exists());
@@ -918,13 +919,13 @@ mod tests {
         let claude = tmp.path().join(".claude");
         let dir = write_legacy_skill(
             &claude,
-            "ccteam-control",
+            "cct-control",
             "---\nname: my-custom-fork\n---\n# user wrote this\n",
         );
         let reports = migrate_legacy_skill_dirs(&claude, false).unwrap();
         let ctrl = reports
             .iter()
-            .find(|r| r.legacy_name == "ccteam-control")
+            .find(|r| r.legacy_name == "cct-control")
             .unwrap();
         assert_eq!(ctrl.action, LegacySkillAction::PreservedHandEdit);
         assert!(dir.exists());
@@ -936,16 +937,54 @@ mod tests {
         let claude = tmp.path().join(".claude");
         let dir = write_legacy_skill(
             &claude,
-            "ccteam-control",
-            "<!-- ccteam-managed:skill begin -->\n---\nname: ccteam-control\n---\n",
+            "cct-control",
+            "<!-- ccteam-managed:skill begin -->\n---\nname: cct-control\n---\n",
         );
         let reports = migrate_legacy_skill_dirs(&claude, true).unwrap();
         let ctrl = reports
             .iter()
-            .find(|r| r.legacy_name == "ccteam-control")
+            .find(|r| r.legacy_name == "cct-control")
             .unwrap();
         assert_eq!(ctrl.action, LegacySkillAction::WouldRemove);
         assert!(dir.exists());
+    }
+
+    #[test]
+    fn migrate_legacy_skill_dirs_handles_project_creator() {
+        // F39 added cct-project-creator (F34); F44 must clean it up too.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let claude = tmp.path().join(".claude");
+        let dir = write_legacy_skill(
+            &claude,
+            "cct-project-creator",
+            "<!-- ccteam-managed:skill begin -->\n---\nname: cct-project-creator\n---\n",
+        );
+        let reports = migrate_legacy_skill_dirs(&claude, false).unwrap();
+        let pc = reports
+            .iter()
+            .find(|r| r.legacy_name == "cct-project-creator")
+            .unwrap();
+        assert_eq!(pc.action, LegacySkillAction::Removed);
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn migrate_legacy_skill_dirs_idempotent_after_first_run() {
+        // Running F44 migration twice is a no-op the second time.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let claude = tmp.path().join(".claude");
+        write_legacy_skill(
+            &claude,
+            "cct-control",
+            "<!-- ccteam-managed:skill begin -->\n---\nname: cct-control\n---\n",
+        );
+        // First pass removes.
+        migrate_legacy_skill_dirs(&claude, false).unwrap();
+        // Second pass is a no-op (everything reports NotFound).
+        let reports = migrate_legacy_skill_dirs(&claude, false).unwrap();
+        for r in &reports {
+            assert_eq!(r.action, LegacySkillAction::NotFound);
+        }
     }
 
     fn legacy_settings_json(legacy_bin: &str) -> String {
@@ -970,22 +1009,22 @@ mod tests {
     fn rewrite_legacy_hook_commands_swaps_absolute_path() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("settings.json");
-        std::fs::write(&path, legacy_settings_json("/home/u/.cargo/bin/ccteam")).unwrap();
-        let new_bin = PathBuf::from("/home/u/.cargo/bin/cct");
+        std::fs::write(&path, legacy_settings_json("/home/u/.cargo/bin/cct")).unwrap();
+        let new_bin = PathBuf::from("/home/u/.cargo/bin/ccteam");
         let rep = rewrite_legacy_hook_commands(&path, &new_bin, false).unwrap();
         assert_eq!(rep.action, HookCmdRewriteAction::Rewrote { entries: 3 });
         let body = std::fs::read_to_string(&path).unwrap();
-        assert!(body.contains("/home/u/.cargo/bin/cct hook load-context"), "got: {body}");
-        assert!(!body.contains("/ccteam hook"), "legacy path survived: {body}");
+        assert!(body.contains("/home/u/.cargo/bin/ccteam hook load-context"), "got: {body}");
+        assert!(!body.contains("/cct hook"), "F39-era path survived: {body}");
     }
 
     #[test]
     fn rewrite_legacy_hook_commands_dry_run_does_not_write() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("settings.json");
-        let original = legacy_settings_json("/home/u/.cargo/bin/ccteam");
+        let original = legacy_settings_json("/home/u/.cargo/bin/cct");
         std::fs::write(&path, &original).unwrap();
-        let new_bin = PathBuf::from("/home/u/.cargo/bin/cct");
+        let new_bin = PathBuf::from("/home/u/.cargo/bin/ccteam");
         let rep = rewrite_legacy_hook_commands(&path, &new_bin, true).unwrap();
         assert_eq!(rep.action, HookCmdRewriteAction::WouldRewrite { entries: 3 });
         let body = std::fs::read_to_string(&path).unwrap();
@@ -993,11 +1032,11 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_legacy_hook_commands_idempotent_when_already_cct() {
+    fn rewrite_legacy_hook_commands_idempotent_when_already_ccteam() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("settings.json");
-        std::fs::write(&path, legacy_settings_json("/home/u/.cargo/bin/cct")).unwrap();
-        let new_bin = PathBuf::from("/home/u/.cargo/bin/cct");
+        std::fs::write(&path, legacy_settings_json("/home/u/.cargo/bin/ccteam")).unwrap();
+        let new_bin = PathBuf::from("/home/u/.cargo/bin/ccteam");
         let rep = rewrite_legacy_hook_commands(&path, &new_bin, false).unwrap();
         assert_eq!(rep.action, HookCmdRewriteAction::NoChangeNeeded);
     }
@@ -1006,24 +1045,24 @@ mod tests {
     fn rewrite_legacy_hook_commands_handles_missing_file() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("settings.json");
-        let new_bin = PathBuf::from("/usr/local/bin/cct");
+        let new_bin = PathBuf::from("/usr/local/bin/ccteam");
         let rep = rewrite_legacy_hook_commands(&path, &new_bin, false).unwrap();
         assert_eq!(rep.action, HookCmdRewriteAction::NotFound);
     }
 
     #[test]
-    fn rewrite_one_hook_command_handles_bare_ccteam_prefix() {
-        let got = rewrite_one_hook_command("ccteam hook progress-append PreToolUse", "/x/cct");
+    fn rewrite_one_hook_command_handles_bare_cct_prefix() {
+        let got = rewrite_one_hook_command("cct hook progress-append PreToolUse", "/x/ccteam");
         assert_eq!(
             got.as_deref(),
-            Some("/x/cct hook progress-append PreToolUse"),
+            Some("/x/ccteam hook progress-append PreToolUse"),
         );
     }
 
     #[test]
     fn rewrite_one_hook_command_returns_none_for_unrelated_commands() {
         assert!(
-            rewrite_one_hook_command("/usr/bin/jq .progress[]", "/x/cct").is_none(),
+            rewrite_one_hook_command("/usr/bin/jq .progress[]", "/x/ccteam").is_none(),
             "should not touch operator-authored hooks",
         );
     }

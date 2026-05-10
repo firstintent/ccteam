@@ -1,15 +1,15 @@
 //! M1.3 acceptance test (end-to-end meta-agent dispatch).
 //!
 //! Production flow we're modeling:
-//!   1. `cct doctor --install-meta-agent <user>` lays down the
-//!      meta-agent project + role prompt + cct-control skill.
+//!   1. `ccteam doctor --install-meta-agent <user>` lays down the
+//!      meta-agent project + role prompt + ccteam-control skill.
 //!   2. orchestrator brings up `ccteam-meta-<user>` tmux session.
 //!   3. user / channel adapter writes an inbox file with a project
 //!      request.
 //!   4. orchestrator's inbox watcher injects the body into the meta
 //!      session via send-keys (idle path, since the session is fresh).
 //!   5. inside the session, claude reads the body, decides to
-//!      `cct new --team=dev` (we mock this — see below).
+//!      `ccteam new --team=dev` (we mock this — see below).
 //!   6. meta writes an outbox `event_kind: reply` confirming the
 //!      dispatch.
 //!
@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use ccteam_core::tmux::{tmux_available, TmuxSession};
 use ccteam_core::{
-    bootstrap_meta_project, current_cct_bin, disable_tool_surface_bootstrap_for_tests,
+    bootstrap_meta_project, current_ccteam_bin, disable_tool_surface_bootstrap_for_tests,
     inbox_filename, install_skill_into, write_global_phase_templates, CcteamPaths, InboxFrontMatter,
     InboxMessage, InstallSkillOptions, Orchestrator, OrchestratorConfig, OutboxEventKind,
     OutboxFrontMatter, OutboxMessage, OutboxPriority, ProjectState, SessionMailbox,
@@ -50,35 +50,34 @@ fn meta_dispatch_e2e_inbox_to_outbox() {
         eprintln!("[skip] tmux not on PATH");
         return;
     }
-    // Note: in the test binary `current_cct_bin()` returns the test
-    // binary itself (which doesn't speak `cct new`). Cross-crate
-    // CARGO_BIN_EXE_cct isn't exported either, so we model the
+    // Note: in the test binary `current_ccteam_bin()` returns the test
+    // binary itself (which doesn't speak `ccteam new`). Cross-crate
+    // CARGO_BIN_EXE_ccteam isn't exported either, so we model the
     // dispatch by laying down a project directory + state.json
     // directly inside the shell stand-in. The real meta-agent binds
-    // its `Bash("cct new ...")` call in production; that subshell
+    // its `Bash("ccteam new ...")` call in production; that subshell
     // execution path is covered by the dedicated `commands::run_new`
     // unit tests.
-    let _ = current_cct_bin().ok();
+    let _ = current_ccteam_bin().ok();
     isolation();
 
     let tmp = TempDir::new().unwrap();
     let paths = fresh_paths(&tmp);
     write_global_phase_templates(&paths.root, true).unwrap();
 
-    // Step 1: install meta-agent + cct-control skill (M1.0 + M1.8 +
-    // V0.2.2 F39 rename).
+    // Step 1: install meta-agent + ccteam-control skill (M1.0 + M1.8).
     let user = format!("e2e-{}", std::process::id());
     let report = bootstrap_meta_project(&paths, &user).unwrap();
     let claude_root = tmp.path().join("claude-home");
     install_skill_into(&claude_root, InstallSkillOptions::default()).unwrap();
-    assert!(claude_root.join("skills/cct-control/SKILL.md").is_file());
+    assert!(claude_root.join("skills/ccteam-control/SKILL.md").is_file());
 
     // Step 2/3: prepare a stand-in for claude that, on first run,
     // (a) touches the ready marker so ensure_session unblocks,
     // (b) waits for the inbox-injected message body to arrive on
     //     stdin (we approximate this by polling for the orchestrator's
     //     `inbox_consumed` progress event),
-    // (c) executes `cct new --team=dev "<brief>"` to dispatch,
+    // (c) executes `ccteam new --team=dev "<brief>"` to dispatch,
     // (d) writes the meta outbox reply file.
     //
     // The orchestrator's send-keys will land "做一个 todo cli\n" in
@@ -94,11 +93,11 @@ fn meta_dispatch_e2e_inbox_to_outbox() {
     let dispatched_slug_dir = paths.projects_root.join("todo-cli");
     let dispatched_str = dispatched_slug_dir.to_string_lossy().to_string();
 
-    // Shell stand-in for `claude` running cct-control via Bash:
+    // Shell stand-in for `claude` running ccteam-control via Bash:
     //   1. touch ready marker
     //   2. read first line from the pane (orchestrator's send-keys
     //      delivers the inbox body)
-    //   3. simulate `cct new --team=dev "<brief>"` by laying down
+    //   3. simulate `ccteam new --team=dev "<brief>"` by laying down
     //      `<projects>/todo-cli/.ccteam/state.json`
     //   4. write meta outbox `event_kind: reply` confirming dispatch
     //   5. stay alive so the test can attach.

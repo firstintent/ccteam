@@ -1,10 +1,10 @@
-//! V0.2 M0.22 — `cct team {init,publish}` CLI handlers.
+//! V0.2 M0.22 — `ccteam team {init,publish}` CLI handlers.
 //!
 //! `init` is intentionally lightweight: it stamps a single-phase
 //! starter staging tree (`<staging>/.claude-plugin/plugin.json` +
 //! `team.yaml` + `phases/01-intake.md` + `README.md`). The team author
 //! then either edits the staging files directly or runs the meta-agent
-//! `cct-team-author` skill, which interview-mode produces the same
+//! `ccteam-team-author` skill, which interview-mode produces the same
 //! tree with N phases instead of one.
 //!
 //! `publish` calls `ccteam_core::publish_team` for the local target.
