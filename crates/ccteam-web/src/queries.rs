@@ -15,7 +15,8 @@ use crate::views::{EventRow, OutboxRow};
 
 const OUTBOX_PREVIEW_CHARS: usize = 200;
 pub const DEFAULT_OUTBOX_LIMIT: usize = 20;
-pub const DEFAULT_EVENT_LIMIT: usize = 200;
+pub const STATUS_EVENT_LIMIT: usize = 200;
+pub const PROJECT_EVENT_DISPLAY_LIMIT: usize = 10;
 
 /// Tail `n` recent events. Any I/O failure is logged + swallowed (the
 /// dashboard prefers an empty list to a 500 page on a single broken

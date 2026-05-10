@@ -1761,11 +1761,12 @@ pub fn peek_pane(slug: &str, lines: Option<usize>) -> Result<PaneCapture, CoreEr
 | `GET` | `/health` | 200 | `application/json` | liveness:`{"status":"ok","version":"<crate>"}`;auth 例外 |
 | `GET` | `/` | 200 | `text/html; charset=utf-8` | 项目列表 dashboard;空时 fallback 文案 `No projects` |
 | `GET` | `/project/{slug}` | 200 / 404 | `text/html; charset=utf-8` / `text/plain` | 项目详情(state JSON / recent events / outbox / pane snapshot);未知 slug → 404 + plain text `project not found: <slug>` |
-| `GET` | `/assets/{file}` | 200 / 404 | `application/javascript; charset=utf-8`(htmx / htmx-ext-sse)/ `text/css; charset=utf-8`(style)/ `text/plain`(404) | vendored 静态资源;`Cache-Control: public, max-age=31536000, immutable`;白名单 = `htmx.min.js` / `htmx-ext-sse.js` / `style.css`,其他 file → 404 |
+| `GET` | `/assets/{file}` | 200 / 404 | `application/javascript; charset=utf-8`(htmx / htmx-ext-sse / xterm)/ `text/css; charset=utf-8`(style / xterm)/ `text/plain`(404) | vendored 静态资源;`Cache-Control: public, max-age=31536000, immutable`;白名单 = `htmx.min.js` / `htmx-ext-sse.js` / `xterm.js` / `xterm.css` / `style.css`,其他 file → 404 |
 | `GET` | `/sse/all` | 200 | `text/event-stream` | 全局 SSE 流:每条 progress.jsonl 写入推一帧 |
 | `GET` | `/sse/project/{slug}` | 200 | `text/event-stream` | per-slug SSE 流:server-side 过滤,只发该 slug 事件 |
 | `GET` | `/sse/harness/{slug}` | 200 | `text/event-stream` | V0.3.1 F46:per-slug harness 状态流,该 slug 下所有 sid 的 statusline snapshot |
 | `GET` | `/sse/harness/{slug}/{sid}` | 200 | `text/event-stream` | V0.3.1 F46:per-(slug,sid) harness 状态流,只发该 session 的 snapshot |
+| `GET` | `/api/{slug}/pane-snapshot.ansi` | 200 / 504 | `application/octet-stream`(200)/ `text/plain`(504) | 按需 tmux ANSI snapshot;xterm.js 浏览器端只读渲染;headers:`x-ccteam-pane-rows` / `x-ccteam-pane-cols`;tmux 无 session → 504 |
 | `GET` | `/screenshot/{slug}.png` | 200 / 404 / 504 | `image/png`(200)/ `text/plain`(404 / 504) | 按需 PNG 截图;F38 unavailable / tmux 无 session → 504 + 文本 reason;非 `<slug>.png` 路径 → 404 |
 | `POST` | `/api/{slug}/btw` | 303 / 400 / 4xx | `text/plain`(error) | `text=<urlencoded, 1..=4000>`;详 §15.7 |
 | `POST` | `/api/{slug}/inject_decision` | 303 / 400 / 5xx | `text/plain`(error) | `path=<absolute>&body=<urlencoded, 1..=8000>`;详 §15.7 |
@@ -1797,20 +1798,22 @@ CLAUDE.md §三 read-only 红线)。
 1. **Header**:slug / team / current_phase / status badge / cost。
 2. **State**:`serde_json::to_string_pretty(&state)` 进 `<pre>`(完整
    `state.json`,折叠 / 滚动由浏览器决定)。
-3. **Recent events**:`collect_recent_events(paths, slug, 200)` 末 200
-   条 progress.jsonl,渲染 `ts` / `event` / `detail`(`detail` = `tool=<X>`
+3. **Recent events**:`collect_recent_events(paths, slug, 200)` 供 status badge
+   只读分类;页面表格仅渲染最后 10 条,避免大日志卡住浏览器。
+   每条 progress.jsonl,渲染 `ts` / `event` / `detail`(`detail` = `tool=<X>`
    / `phase=<X>` / `kind=<X>` / `count=<N>` 之一,前者优先)。
 4. **Outbox**:`SessionMailbox::list_outbox` 后 reverse + truncate 20。
    每条 `<li>` 渲染 `event_kind`(lowercase debug 字面量 — `progress` /
    `reply` / `escalation` / `shipped` / `clarify`)+ `created_at` RFC3339 +
    `filename` + body 头 200 char。front-matter 解析失败渲染
    `(unparseable)` 占位,不 5xx。
-5. **Pane snapshot**:页面加载即拉一次 `/screenshot/<slug>.png`,下方 button
-   触发 cache-busting `?t=<ms>` 重新 fetch;F38 ~200-500 ms render,
-   **不 polling**(PRD §5.2.5)。
+5. **Pane snapshot**:页面加载即拉一次 `/api/<slug>/pane-snapshot.ansi`,
+   由 vendored `@xterm/xterm` 浏览器端只读渲染;下方 button 触发
+   cache-busting `?t=<ms>` 重新 fetch。`/screenshot/<slug>.png` 保留为 PNG
+   fallback。**不 polling**(PRD §5.2.5)。
 6. **Live events**:页面内嵌 `EventSource('/sse/project/<slug>')` 订阅 SSE
    流,新 `progress` 事件 prepend 到 `#events-tbody`,client-side 滑动窗口
-   截到 200 行;`reconnect_hint` 帧出现 → 1s 后 `location.reload()`。
+   截到 10 行;`reconnect_hint` 帧出现 → 1s 后 `location.reload()`。
 7. **写动作 forms**:`/btw`(自由文本 textarea,1..=4000)+
    `/inject_decision`(structured path/body)+ `/pause` / `/resume` 按钮 —
    全部 htmx `hx-post`,服务端 303 → 浏览器跟回详情页;详 §15.7 + §15.8。
@@ -1821,10 +1824,12 @@ CLAUDE.md §三 read-only 红线)。
   upstream snapshot,BSD-2-Clause;详 `LICENSES.md`)
 - `htmx-ext-sse.js` ← `crates/ccteam-web/assets/htmx-ext-sse.js`(htmx 2.x
   SSE extension upstream snapshot,BSD-2-Clause)
+- `xterm.js` / `xterm.css` ← `crates/ccteam-web/assets/xterm.*`
+  (`@xterm/xterm` 6.0.0 upstream snapshot,MIT;详 `LICENSES.md`)
 - `style.css` ← `crates/ccteam-web/assets/style.css`(本仓自写 ~4 KB,
-  monospace + dark-mode-friendly,含 live-dot + screenshot-panel)
+  monospace + dark-mode-friendly,含 live-dot + terminal panel)
 
-三者均通过 `include_bytes!` 编译期打包进 `ccteam` binary;`ccteam web` 自包含
+这些静态资源均通过 `include_bytes!` 编译期打包进 `ccteam` binary;`ccteam web` 自包含
 启动,无 npm / Vite / build toolchain 依赖,模仿 V0.2.2 F38 vendored TTF
 模式。`Cache-Control: public, max-age=31536000, immutable` — 同一 binary
 版本下 bytes 永不变,新版 binary 释放后自然 ID 变更触发 cache miss。
@@ -1836,7 +1841,9 @@ CLAUDE.md §三 read-only 红线)。
   `ccteam-cli::commands` promote 到 `ccteam-core::queries` —
   `dev-coupling-audit.md` F45 / `prd.md` §4),**不解析 tmux 输出**(F38
   截图通过 `ccteam_core::render_screenshot` 在 M5.2 加,内部已 vt100 化,
-  不算字符串解析)。M5.2 SSE watcher 同样只读 progress.jsonl,**不接 tmux**。
+  不算字符串解析)。`/api/<slug>/pane-snapshot.ansi` 只把 tmux ANSI bytes
+  作为浏览器端 xterm 渲染输入返回,不进入任何状态机。M5.2 SSE watcher
+  同样只读 progress.jsonl,**不接 tmux**。
 - **`ccteam-web` MUST NOT depend on `ccteam-cli`**:`cargo tree -p
   ccteam-web | grep ccteam-cli` 必须 0 命中(`tests/dep_graph_test.rs`
   锁红线)。dashboard / project / assets / sse / screenshot handler 全部
@@ -1845,9 +1852,10 @@ CLAUDE.md §三 read-only 红线)。
 - **永远不主动 kill**:web 层(包含写动作)不发 SIGINT / Ctrl-C /
   `tmux kill-session`,只走 `ccteam_core::actions::*`(M5.0 promote)走
   inbox + state.json 控制平面。
-- **截图不 polling**:`/screenshot/<slug>.png` 仅在用户 click / 页面加载时
-  同步调一次,`Cache-Control: no-cache, must-revalidate`;F38 渲染
-  ~200-500 ms,polling 烧 CPU 且 PNG 大不必要。
+- **截图不 polling**:`/api/<slug>/pane-snapshot.ansi` 与
+  `/screenshot/<slug>.png` 仅在用户 click / 页面加载时同步调一次,
+  `Cache-Control: no-cache, must-revalidate`;tmux capture / F38 渲染都是
+  按需观测面,polling 烧 CPU / bandwidth。
 
 ### 15.6 SSE wire format(M5.2)
 
@@ -2030,5 +2038,3 @@ session cookie 有效。理由:
 XSS tradeoff:token 出现在 HTML attribute 而非纯 HttpOnly cookie。
 被 XSS'd 时攻击者本来就能同源 fetch + 自动 cookie,所以 inline 不
 增加 threat surface。
-
-

@@ -84,8 +84,8 @@ pub fn random_suffix() -> String {
 ///    output so the caller never gets an empty slug.
 ///
 /// **`slugify()` is not modified** — it still backs the meta-agent
-/// `<handle>-meta` path where the input is already a short user
-/// handle that should be used verbatim.
+/// `meta-<handle>` path where the handle should be normalized
+/// verbatim.
 pub fn slugify_brief(input: &str) -> String {
     const STOP_WORDS: &[&str] = &[
         "a", "an", "the", "of", "to", "for", "with", "that", "and", "or", "in", "on",
@@ -145,8 +145,8 @@ pub fn slugify_brief(input: &str) -> String {
 /// retry.
 ///
 /// Meta-agent projects don't go through this function — they use
-/// `meta_slug(handle)` which hand-crafts `<handle>-meta` (suffix
-/// convention established before F22; rules don't scope to meta).
+/// `meta_slug(handle)` which hand-crafts `meta-<handle>` so the
+/// directory aligns with the `ccteam-meta-<handle>` tmux session.
 pub fn pick_unused_slug(
     paths: &CcteamPaths,
     base: &str,
@@ -1140,9 +1140,9 @@ mod tests {
         // prompt overwrites the file via a different path), so the
         // generic body is the right fallback. This guards against
         // accidentally writing "" as the body.
-        let body = render_project_claude_md("rob-meta", "meta-agent");
+        let body = render_project_claude_md("meta-rob", "meta-agent");
         assert!(!body.is_empty());
-        assert!(body.contains("- slug: rob-meta"));
+        assert!(body.contains("- slug: meta-rob"));
         assert!(body.contains("- team: meta-agent"));
     }
 

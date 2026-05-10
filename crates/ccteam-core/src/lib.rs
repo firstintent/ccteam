@@ -145,8 +145,10 @@ pub use screenshot::{
     FONT_ENV as SCREENSHOT_FONT_ENV, ScreenshotResult,
 };
 pub use tmux::{
-    capture_pane_tail, capture_pane_with_ansi, pid_is_alive, query_pane_dims,
-    session_name_for_slug, tmux_available, TmuxSession,
+    capture_pane_tail, capture_pane_tail_from_session, capture_pane_with_ansi,
+    capture_pane_with_ansi_from_session, pid_is_alive, query_pane_dims,
+    query_pane_dims_from_session, session_name_for_project, session_name_for_slug,
+    tmux_available, TmuxSession,
 };
 pub use plugin_resolution::{
     lookup_plugin_agent, plugins_to_enable, PluginAgent, KNOWN_PLUGIN_AGENTS,

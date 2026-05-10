@@ -1,7 +1,7 @@
 //! Meta-agent session bootstrap (M1.0).
 //!
 //! The meta-agent is a ccteam-managed long tmux session under
-//! `~/projects/<user>-meta/` that the human user attaches to with
+//! `~/projects/meta-<user>/` that the human user attaches to with
 //! `tmux attach -t ccteam-meta-<user>` and talks to in NL. It dispatches
 //! project requests via `ccteam new`, monitors active projects, and
 //! routes inbox/outbox messages.
@@ -54,15 +54,16 @@ pub const META_SESSION_PREFIX: &str = "ccteam-meta-";
 const META_ROLE_PROMPT_TEMPLATE: &str =
     include_str!("templates/meta_agent_role.md");
 
-/// Build the meta-agent's project slug from a user handle. Slug is
-/// `<user>-meta`, slugified — so `Rob` and `rob` collapse to the same
-/// directory, which is what we want.
+/// Build the meta-agent's canonical project slug from a user handle.
+/// Slug is `meta-<user>`, slugified, matching the dedicated tmux
+/// session `ccteam-meta-<user>` and the team-prefixed convention used
+/// by regular project slugs such as `dev-...`.
 pub fn meta_slug(user_handle: &str) -> Result<String> {
     let trimmed = user_handle.trim();
     if trimmed.is_empty() {
         return Err(anyhow!("meta-agent user handle must be non-empty"));
     }
-    Ok(format!("{}-meta", slugify(trimmed)))
+    Ok(format!("meta-{}", slugify(trimmed)))
 }
 
 /// `ccteam-meta-<user>` tmux session name.
@@ -113,14 +114,12 @@ pub fn bootstrap_meta_project(
         bootstrap_project(paths, &slug, &request, META_TEAM_NAME)
             .context("bootstrap meta-agent project tree")?;
     }
-    // Always normalize the meta-agent's tmux_session name. bootstrap_project
-    // initializes it as `ccteam-<slug>` (which would yield `ccteam-rob-meta`),
-    // but the strategic doc + interfaces.md call for `ccteam-meta-<user>`
-    // — distinct prefix so meta sessions are visually separated from
-    // project sessions in `tmux ls`. Rewrite after bootstrap_project runs.
+    // Always normalize the meta-agent's state so re-running doctor
+    // repairs stale team/session fields inside the canonical project.
     let state_path = paths.project_state(&slug);
     let mut state = ProjectState::load(&state_path)
         .with_context(|| format!("reload meta state {}", state_path.display()))?;
+    state.slug = slug.clone();
     state.team = META_TEAM_NAME.into();
     state.tmux_session = meta_session_name(user_handle)?;
     state.save(&state_path)?;
@@ -173,9 +172,9 @@ mod tests {
     }
 
     #[test]
-    fn meta_slug_combines_user_with_meta_suffix() {
-        assert_eq!(meta_slug("rob").unwrap(), "rob-meta");
-        assert_eq!(meta_slug("Rob Test User").unwrap(), "rob-test-user-meta");
+    fn meta_slug_uses_meta_prefix() {
+        assert_eq!(meta_slug("rob").unwrap(), "meta-rob");
+        assert_eq!(meta_slug("Rob Test User").unwrap(), "meta-rob-test-user");
     }
 
     #[test]
@@ -198,6 +197,19 @@ mod tests {
         assert!(body.contains("rob"), "role prompt should mention user handle");
         assert!(!body.contains("__USER_HANDLE__"), "placeholder should be substituted");
         assert!(!body.contains("__GENERATED_AT__"));
+    }
+
+    #[test]
+    fn render_role_prompt_uses_canonical_meta_project_path() {
+        let body = render_meta_role_prompt("rob");
+        assert!(
+            body.contains("~/projects/meta-rob/.ccteam/inbox/"),
+            "role prompt should mention canonical meta inbox path",
+        );
+        assert!(
+            body.contains("~/projects/meta-rob/.ccteam/outbox/"),
+            "role prompt should mention canonical meta outbox path",
+        );
     }
 
     #[test]
@@ -254,13 +266,14 @@ mod tests {
         let p = paths(&tmp);
         let report = bootstrap_meta_project(&p, "rob").unwrap();
 
-        assert_eq!(report.slug, "rob-meta");
+        assert_eq!(report.slug, "meta-rob");
         assert!(report.project_dir.is_dir());
         assert!(report.claude_md.is_file());
         assert!(p.project_state(&report.slug).is_file());
 
         let state = ProjectState::load(&p.project_state(&report.slug)).unwrap();
         assert_eq!(state.team, META_TEAM_NAME);
+        assert_eq!(state.slug, "meta-rob");
         // tmux name uses the dedicated `ccteam-meta-<user>` prefix
         // rather than `ccteam-<slug>` so it visually separates from
         // project sessions in `tmux ls`.
@@ -284,11 +297,12 @@ mod tests {
 
         // Tamper with CLAUDE.md, re-run, verify it gets refreshed and the
         // tampering is gone.
-        let cm = p.project_dir("rob-meta").join("CLAUDE.md");
+        let cm = p.project_dir("meta-rob").join("CLAUDE.md");
         std::fs::write(&cm, "stale\n").unwrap();
         let report = bootstrap_meta_project(&p, "rob").unwrap();
         assert!(report.already_existed);
         let body = std::fs::read_to_string(&cm).unwrap();
         assert!(body.contains("决策树"), "role prompt should be re-rendered");
     }
+
 }

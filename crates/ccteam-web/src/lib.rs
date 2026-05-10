@@ -10,8 +10,9 @@
 //!   page, `GET /assets/{file}` vendored static assets.
 //! - **M5.2** — `GET /sse/all` + `GET /sse/project/<slug>` live
 //!   progress event streams (single `notify` watcher fans out into a
-//!   `tokio::sync::broadcast` capacity 1024) + `GET
-//!   /screenshot/<slug>.png` on-demand pane render via F38.
+//!   `tokio::sync::broadcast` capacity 1024) + on-demand pane
+//!   snapshots (`GET /api/<slug>/pane-snapshot.ansi` for xterm.js,
+//!   `GET /screenshot/<slug>.png` as the PNG fallback).
 //! - **M5.3 (this PR)** — `POST /api/<slug>/{btw,inject_decision,
 //!   pause,resume}` write actions backed by `ccteam_core::actions::*`,
 //!   plus a token-auth gate (`auth_layer` middleware) on the entire
@@ -146,7 +147,10 @@ pub async fn serve(opts: ServeOpts) -> Result<()> {
         eprintln!(
             "\x1b[1;31mWARNING:\x1b[0m --no-auth on non-loopback bind = LAN-wide RCE on bypassPermissions sessions.",
         );
-        eprintln!("Press Ctrl-C within {}s to abort.", opts.no_auth_grace_secs.unwrap_or(5));
+        eprintln!(
+            "Press Ctrl-C within {}s to abort.",
+            opts.no_auth_grace_secs.unwrap_or(5)
+        );
         eprintln!();
         let grace = opts.no_auth_grace_secs.unwrap_or(5);
         if grace > 0 {
@@ -168,7 +172,10 @@ pub async fn serve(opts: ServeOpts) -> Result<()> {
         let hex = token::generate_or_load_token(&token_path)
             .with_context(|| format!("load or generate token at {}", token_path.display()))?;
         if !token_existed {
-            eprintln!("ccteam web: generated new auth token at {}", token_path.display());
+            eprintln!(
+                "ccteam web: generated new auth token at {}",
+                token_path.display()
+            );
         }
         // Echo to stderr (PRD §6.2.4) so the operator can paste it into
         // a browser. Using stderr (not stdout) keeps the subprocess

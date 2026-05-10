@@ -41,7 +41,7 @@ use ccteam_core::{
 };
 
 use crate::commands::{
-    collect_projects, collect_recent_events, run_show, OutputFormat,
+    collect_projects, collect_recent_events, run_peek, run_show, OutputFormat,
 };
 
 /// Stable MCP protocol version this server speaks. Newer client versions
@@ -210,7 +210,7 @@ fn tool_definitions() -> Vec<Value> {
             "inputSchema": json!({
                 "type": "object",
                 "properties": {
-                    "session": { "type": "string", "description": "Project slug OR meta session slug (e.g. 'rob-meta')." },
+                    "session": { "type": "string", "description": "Project slug OR meta session slug (e.g. 'meta-rob')." },
                     "content_type": { "type": "string", "description": "Content type: text|markdown (default 'text')." },
                     "body": { "type": "string", "description": "Message body (NL/markdown)." }
                 },
@@ -284,7 +284,7 @@ async fn call_tool(paths: &CcteamPaths, params: &Value) -> Result<Vec<Value>> {
     match name {
         "ccteam__ls" => Ok(text_content(tool_ls(paths)?)),
         "ccteam__show" => Ok(text_content(tool_show(paths, &args)?)),
-        "ccteam__peek" => Ok(text_content(tool_peek(&args)?)),
+        "ccteam__peek" => Ok(text_content(tool_peek(paths, &args)?)),
         "ccteam__progress" => Ok(text_content(tool_progress(paths, &args)?)),
         "ccteam__new" => Ok(text_content(tool_new(paths, &args)?)),
         "ccteam__pause" => {
@@ -390,20 +390,9 @@ fn tool_show(paths: &CcteamPaths, args: &Value) -> Result<String> {
     run_show(paths, &slug, OutputFormat::Json)
 }
 
-fn tool_peek(args: &Value) -> Result<String> {
+fn tool_peek(paths: &CcteamPaths, args: &Value) -> Result<String> {
     let slug = arg_string(args, "slug")?;
-    let session = ccteam_core::session_name_for_slug(&slug);
-    let output = std::process::Command::new("tmux")
-        .args(["capture-pane", "-p", "-t", &session])
-        .output()
-        .context("spawn tmux capture-pane")?;
-    if !output.status.success() {
-        return Err(anyhow!(
-            "tmux capture-pane failed: {}",
-            String::from_utf8_lossy(&output.stderr),
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    run_peek(paths, &slug)
 }
 
 fn tool_progress(paths: &CcteamPaths, args: &Value) -> Result<String> {

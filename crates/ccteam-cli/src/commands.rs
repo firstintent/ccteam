@@ -17,7 +17,7 @@ use ccteam_core::{
     write_global_helper_templates, write_global_phase_templates, CcteamPaths,
     HookCmdRewriteAction, HookCmdRewriteReport, InstallSkillOptions, LegacySkillAction,
     LegacySkillReport, MetaBootstrapReport, MigrationReport, OutboxEventKind, OutboxMessage,
-    PhaseState, PhaseTemplate, ProjectState, SessionMailbox,
+    PhaseState, PhaseTemplate, ProjectState, SessionMailbox, session_name_for_project,
     SkillInstallAction, TeamSpec, ToolSurfaceSnapshot, BUILTIN_SUBAGENTS, HELPER_TEMPLATES,
     PHASE_TEMPLATES,
 };
@@ -408,7 +408,7 @@ fn which_claude() -> Option<String> {
 /// fail-fast error pointing the user at the missing team.yaml.
 ///
 /// Resolution order:
-/// 1. `dev` and `meta-agent` always succeed (legacy / bespoke paths).
+/// 1. `dev` and `meta-agent` always succeed (built-in / bespoke paths).
 /// 2. If `~/.ccteam/teams/<team>/team.yaml` is on disk, load + validate it.
 /// 3. V0.2.2 F40: scan every `~/.ccteam/teams/*/team.yaml` and accept
 ///    `team` when it matches a `spec.aliases` entry. Lets old projects'
@@ -521,10 +521,10 @@ pub fn run_show(paths: &CcteamPaths, slug: &str, format: OutputFormat) -> Result
     })
 }
 
-/// `ccteam attach <slug>`. Execs `tmux attach -t ccteam-<slug>`. Exits
+/// `ccteam attach <slug>`. Execs `tmux attach -t <state.tmux_session>`. Exits
 /// successfully when the user detaches; non-zero on error.
-pub fn run_attach(slug: &str) -> Result<()> {
-    let session = TmuxSession::for_slug(slug);
+pub fn run_attach(paths: &CcteamPaths, slug: &str) -> Result<()> {
+    let session = TmuxSession::from_name(session_name_for_project(paths, slug));
     if !session.exists() {
         bail!("tmux session not running: {}", session.name());
     }
@@ -540,8 +540,8 @@ pub fn run_attach(slug: &str) -> Result<()> {
 
 /// `ccteam peek <slug>`. Returns the contents of the session's first
 /// pane via `tmux capture-pane -p`.
-pub fn run_peek(slug: &str) -> Result<String> {
-    let session = TmuxSession::for_slug(slug);
+pub fn run_peek(paths: &CcteamPaths, slug: &str) -> Result<String> {
+    let session = TmuxSession::from_name(session_name_for_project(paths, slug));
     if !session.exists() {
         bail!("tmux session not running: {}", session.name());
     }
@@ -867,7 +867,7 @@ pub struct DoctorOptions {
     /// paths).
     pub install_skill: bool,
     /// M1.0: bootstrap a meta-agent project for the given user handle.
-    /// `Some("rob")` ⇒ creates `~/projects/rob-meta/` and triggers
+    /// `Some("rob")` ⇒ creates `~/projects/meta-rob/` and triggers
     /// `install_skill` regardless of its standalone flag.
     pub install_meta_agent: Option<String>,
     /// M2.5: register `mcpServers.ccteam` in `~/.claude.json`.
@@ -1594,14 +1594,9 @@ fn render_install_meta_agent_report(paths: &CcteamPaths, user_handle: &str) -> R
         if report.already_existed { "refreshed" } else { "created" },
     ));
     out.push('\n');
-    out.push_str(&format!(
-        "tmux session     ccteam-meta-{}\n",
-        ccteam_core::meta_slug(user_handle)?.trim_end_matches("-meta"),
-    ));
-    out.push_str(&format!(
-        "attach with      tmux attach -t ccteam-meta-{}\n",
-        ccteam_core::meta_slug(user_handle)?.trim_end_matches("-meta"),
-    ));
+    let tmux_session = ccteam_core::meta_session_name(user_handle)?;
+    out.push_str(&format!("tmux session     {tmux_session}\n"));
+    out.push_str(&format!("attach with      tmux attach -t {tmux_session}\n"));
     out.push_str("\nrun `ccteam start --foreground` (in another terminal) to wake the meta session.\n");
     Ok(out)
 }
@@ -2375,6 +2370,22 @@ mod tests {
     }
 
     #[test]
+    fn run_peek_uses_state_tmux_session_for_meta_project() {
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let mut state = ProjectState::initial_for_team("meta-cto".into(), "meta-agent".into());
+        state.tmux_session = "ccteam-meta-cto".into();
+        state.save(&paths.project_state("meta-cto")).unwrap();
+
+        let err = run_peek(&paths, "meta-cto").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("ccteam-meta-cto"),
+            "peek should target state.tmux_session, got: {msg}",
+        );
+    }
+
+    #[test]
     fn run_new_creates_slug_and_bootstrap_files() {
         ensure_isolation();
         let tmp = TempDir::new().unwrap();
@@ -2810,12 +2821,13 @@ mod tests {
         let report = run_doctor(&paths, opts).unwrap();
         assert!(report.contains("install-skill"), "skill install report missing");
         assert!(report.contains("install-meta-agent"), "meta install report missing");
-        assert!(report.contains("rob-meta"), "meta slug should be reported");
+        assert!(report.contains("meta-rob"), "meta slug should be reported");
 
         // Project directory exists.
-        assert!(paths.project_dir("rob-meta").is_dir());
-        let state = ProjectState::load(&paths.project_state("rob-meta")).unwrap();
+        assert!(paths.project_dir("meta-rob").is_dir());
+        let state = ProjectState::load(&paths.project_state("meta-rob")).unwrap();
         assert_eq!(state.team, "meta-agent");
+        assert_eq!(state.slug, "meta-rob");
         assert_eq!(state.tmux_session, "ccteam-meta-rob");
 
         // Skill landed under the redirected ~/.claude/. F44 reverts F39:

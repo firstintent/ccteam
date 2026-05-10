@@ -50,7 +50,10 @@ use imageproc::rect::Rect;
 use vt100::Parser;
 
 use crate::paths::CcteamPaths;
-use crate::tmux::{capture_pane_with_ansi, query_pane_dims};
+use crate::tmux::{
+    capture_pane_with_ansi_from_session, query_pane_dims_from_session,
+    session_name_for_project,
+};
 
 pub mod ansi_palette;
 
@@ -100,26 +103,29 @@ pub fn render_screenshot(
     slug: &str,
     lines: usize,
 ) -> ScreenshotResult {
+    let session_name = session_name_for_project(paths, slug);
+
     // 1. tmux capture (ANSI escapes preserved).
-    let ansi_bytes = match capture_pane_with_ansi(slug, lines) {
+    let ansi_bytes = match capture_pane_with_ansi_from_session(&session_name, lines) {
         Ok(Some(b)) => b,
         Ok(None) => {
             tracing::warn!(
                 "screenshot: tmux capture-pane returned no output for slug `{slug}` \
-                 (session missing or tmux failed)"
+                 session `{session_name}` (session missing or tmux failed)"
             );
             return Ok(None);
         }
         Err(err) => {
             tracing::warn!(
-                "screenshot: tmux capture-pane failed for slug `{slug}`: {err:#}"
+                "screenshot: tmux capture-pane failed for slug `{slug}` \
+                 session `{session_name}`: {err:#}"
             );
             return Ok(None);
         }
     };
 
     // 2. pane dims (rows × cols) — fall back to 80×24 when query fails.
-    let (rows, cols) = match query_pane_dims(slug) {
+    let (rows, cols) = match query_pane_dims_from_session(&session_name) {
         Ok(Some((r, c))) => (r as usize, c as usize),
         _ => (FALLBACK_DIMS.0 as usize, FALLBACK_DIMS.1 as usize),
     };

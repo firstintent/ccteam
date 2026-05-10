@@ -90,6 +90,54 @@ async fn style_asset_is_served_with_css_content_type() {
 }
 
 #[tokio::test]
+async fn xterm_assets_are_served() {
+    let addr = spawn_server().await;
+
+    let js_url = format!("http://{addr}/assets/xterm.js");
+    let js_resp = reqwest::get(&js_url).await.expect("GET /assets/xterm.js");
+    assert_eq!(js_resp.status(), 200);
+    let js_ctype = js_resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        js_ctype.contains("application/javascript"),
+        "xterm.js content-type must be JavaScript, got: {js_ctype}",
+    );
+    let js_body = js_resp.bytes().await.unwrap();
+    assert!(
+        js_body.len() > 100_000,
+        "xterm.js body must be the vendored browser bundle"
+    );
+    let js_text = std::str::from_utf8(&js_body).unwrap_or("");
+    assert!(
+        !js_text.contains("sourceMappingURL="),
+        "xterm.js should not reference a non-vendored source map"
+    );
+
+    let css_url = format!("http://{addr}/assets/xterm.css");
+    let css_resp = reqwest::get(&css_url).await.expect("GET /assets/xterm.css");
+    assert_eq!(css_resp.status(), 200);
+    let css_ctype = css_resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        css_ctype.contains("text/css"),
+        "xterm.css content-type must be CSS, got: {css_ctype}",
+    );
+    let css_body = css_resp.text().await.unwrap();
+    assert!(
+        css_body.contains(".xterm"),
+        "xterm.css should contain xterm class rules"
+    );
+}
+
+#[tokio::test]
 async fn unknown_asset_returns_404() {
     let addr = spawn_server().await;
     let url = format!("http://{addr}/assets/missing.js");
