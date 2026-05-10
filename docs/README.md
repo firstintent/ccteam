@@ -12,6 +12,7 @@
 | [`research/architecture-analysis.md`](research/architecture-analysis.md) | 架构分析 | 面向架构师快速理解当前实现 |
 | [`research/thin-harness-fat-skills-architecture-improvement.md`](research/thin-harness-fat-skills-architecture-improvement.md) | 架构改进建议 | 评估 Thin Harness + Fat Skills 对 ccteam 的启发 |
 | [`research/ccteam-codex-integration.md`](research/ccteam-codex-integration.md) | Codex 集成方案 | 设计 Codex 作为控制端、review/QA sidecar 与未来 worker provider 的路径 |
+| [`research/ccteam-ast-grep-integration.md`](research/ccteam-ast-grep-integration.md) | ast-grep 集成分析 | 评估 AST 结构搜索、规则和 codemod 对 ccteam + Claude Code/Codex 的增强 |
 | [`dev-coupling-audit.md`](dev-coupling-audit.md) | F-finding 累积(跨版本) | 改 ccteam-core 之前 |
 | [`ccteam-as-domain-agnostic-orchestrator.md`](ccteam-as-domain-agnostic-orchestrator.md) | team 泛化 charter | 加新 team 之前 |
 | [`claude-code-best-practices.md`](claude-code-best-practices.md) | Claude Code 实践参考 | 改 phase prompt / hooks / context 时 |
