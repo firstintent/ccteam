@@ -9,7 +9,7 @@
 
 | 项 | 值 |
 |---|---|
-| 仓库根 | `~/workplace/agents/ccteam` |
+| 仓库根 | 本会话 `cwd` 即是;显式查用 `git rev-parse --show-toplevel` |
 | 主分支 main HEAD | **以 `git rev-parse origin/main` 为准**(V0.3 ship 后) |
 | Workspace version | **`0.3.0`**(V0.3 ship,2026-05-10) |
 | 测试 baseline | **738 全绿**(`cargo test --workspace`;V0.3 累计 +107 测试)|
