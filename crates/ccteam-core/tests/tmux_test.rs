@@ -69,12 +69,12 @@ fn session_name_for_project_falls_back_to_slug_when_state_missing() {
 fn session_name_for_project_uses_state_tmux_session() {
     let tmp = tempfile::TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
-    let mut state = ProjectState::initial_for_team("cto-meta".into(), "meta-agent".into());
+    let mut state = ProjectState::initial_for_team("meta-cto".into(), "meta-agent".into());
     state.tmux_session = "ccteam-meta-cto".into();
-    state.save(&paths.project_state("cto-meta")).unwrap();
+    state.save(&paths.project_state("meta-cto")).unwrap();
 
     assert_eq!(
-        session_name_for_project(&paths, "cto-meta"),
+        session_name_for_project(&paths, "meta-cto"),
         "ccteam-meta-cto"
     );
 }

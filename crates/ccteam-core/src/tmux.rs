@@ -32,11 +32,9 @@ pub fn session_name_for_slug(slug: &str) -> String {
 ///
 /// Most projects use the conventional `ccteam-<slug>` name, but
 /// meta-agent sessions intentionally use `ccteam-meta-<handle>`.
-/// `state.json.tmux_session` is the source of truth for those cases,
-/// including legacy installs whose slug was `<handle>-meta`. If the
-/// state is missing or malformed we fall back to the conventional name
-/// so diagnostic surfaces continue to degrade the same way older builds
-/// did.
+/// `state.json.tmux_session` is the source of truth for those cases.
+/// If the state is missing or malformed we fall back to the
+/// conventional name so diagnostic surfaces still degrade cleanly.
 pub fn session_name_for_project(paths: &CcteamPaths, slug: &str) -> String {
     let fallback = session_name_for_slug(slug);
     let state_path = paths.project_state(slug);
@@ -283,8 +281,7 @@ pub fn capture_pane_tail(slug: &str, lines: usize, with_ansi: bool) -> Option<St
 ///
 /// Prefer this for project-scoped call sites that already loaded
 /// `state.json.tmux_session`; meta-agent projects use tmux session
-/// `ccteam-meta-<handle>`, and legacy installs may still have a
-/// `<handle>-meta` slug on disk.
+/// `ccteam-meta-<handle>`.
 pub fn capture_pane_tail_from_session(
     session_name: &str,
     lines: usize,
