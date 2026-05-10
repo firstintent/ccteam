@@ -5,9 +5,13 @@ V0.2 已 ship(`origin/main = 503269a`,8 个 milestone M0.16-M0.23,497/0 测试)�
 
 > **已 ship V0.3**(2026-05-10,`docs/v0-3/`):web UI dashboard + SSE +
 > 写动作 + token auth(5 milestone M5.0-M5.4,新 crate `ccteam-web`,
-> workspace.version 0.3.0,738 测试)。下方 "V0.3 deferred 项" 仍 deferred
-> (web UI 是新增主线,不替代列出的 deferred 项;V0.4 候选见
-> [`docs/v0-3/prd.md §10`](../v0-3/prd.md))。
+> workspace.version 0.3.0,738 测试)。**+ V0.3.1 起始(drafting,
+> `docs/v0-3-1/`)**:战略 pivot — flex team kind + adhoc multi-session +
+> HarnessAdapter trait + CodexAdapter stub(F46-F51,6 finding 跨 6 PR,
+> workspace.version 目标 0.3.1)。下方 "V0.3 deferred 项" 仍 deferred(V0.3
+> web UI / V0.3.1 session farm 都是新增主线,不替代列出的 deferred 项;
+> V0.4 候选见 [`docs/v0-3/prd.md §10`](../v0-3/prd.md) +
+> [`docs/v0-3-1/prd.md §10`](../v0-3-1/prd.md))。
 
 ## 文档清单
 
