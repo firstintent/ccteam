@@ -78,7 +78,7 @@ One-time setup (idempotent — re-runs are no-ops):
 make setup HANDLE=<your-handle>   # init + 4 doctor installs + tool-surface health check
 ```
 
-`<your-handle>` is whatever you want to call yourself — snake_case, e.g. `rob` or `alice`.
+`<your-handle>` is whatever you want to call yourself — snake_case, e.g. `cto` or `alice`.
 
 <details>
 <summary>What <code>make setup</code> runs (if you want to do it by hand)</summary>
