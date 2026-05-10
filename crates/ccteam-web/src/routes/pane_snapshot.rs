@@ -8,7 +8,7 @@
 //! as a fallback.
 
 use axum::{
-    extract::Path,
+    extract::{Path, State},
     http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
@@ -24,11 +24,13 @@ pub fn router() -> Router<AppState> {
     Router::new().route("/api/{slug}/pane-snapshot.ansi", get(handle_pane_snapshot))
 }
 
-async fn handle_pane_snapshot(Path(slug): Path<String>) -> Response {
-    let capture_slug = slug.clone();
-    let capture =
-        tokio::task::spawn_blocking(move || capture_snapshot_bytes(&capture_slug, SNAPSHOT_LINES))
-            .await;
+async fn handle_pane_snapshot(State(app): State<AppState>, Path(slug): Path<String>) -> Response {
+    let session_name = ccteam_core::session_name_for_project(app.paths.as_ref(), &slug);
+    let capture_session_name = session_name.clone();
+    let capture = tokio::task::spawn_blocking(move || {
+        capture_snapshot_bytes(&capture_session_name, SNAPSHOT_LINES)
+    })
+    .await;
 
     let Some((bytes, rows, cols)) = (match capture {
         Ok(Ok(Some(snapshot))) => Some(snapshot),
@@ -52,7 +54,7 @@ async fn handle_pane_snapshot(Path(slug): Path<String>) -> Response {
     }) else {
         return (
             StatusCode::GATEWAY_TIMEOUT,
-            "pane snapshot unavailable: tmux session not found\n",
+            format!("pane snapshot unavailable: tmux session not found: {session_name}\n"),
         )
             .into_response();
     };
@@ -81,12 +83,15 @@ async fn handle_pane_snapshot(Path(slug): Path<String>) -> Response {
         .into_response()
 }
 
-fn capture_snapshot_bytes(slug: &str, lines: usize) -> anyhow::Result<Option<(Vec<u8>, u16, u16)>> {
-    let bytes = match ccteam_core::capture_pane_with_ansi(slug, lines)? {
+fn capture_snapshot_bytes(
+    session_name: &str,
+    lines: usize,
+) -> anyhow::Result<Option<(Vec<u8>, u16, u16)>> {
+    let bytes = match ccteam_core::capture_pane_with_ansi_from_session(session_name, lines)? {
         Some(b) => b,
         None => return Ok(None),
     };
-    let (rows, cols) = match ccteam_core::query_pane_dims(slug) {
+    let (rows, cols) = match ccteam_core::query_pane_dims_from_session(session_name) {
         Ok(Some((r, c))) if r > 0 && c > 0 => (r, c),
         Ok(Some(_)) | Ok(None) | Err(_) => FALLBACK_DIMS,
     };

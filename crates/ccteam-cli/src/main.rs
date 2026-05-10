@@ -162,7 +162,7 @@ enum Command {
         #[arg(long, default_value_t = false)]
         install_skill: bool,
         /// Bootstrap a meta-agent project (M1.0) for the given user
-        /// handle. Creates `~/projects/<handle>-meta/` with the
+        /// handle. Creates `~/projects/meta-<handle>/` with the
         /// dispatcher role prompt + inbox/outbox dirs and (always)
         /// installs the `ccteam-control` skill. Pass the user handle as
         /// the value (e.g. `--install-meta-agent rob`).
@@ -272,7 +272,7 @@ enum WatchdogCommand {
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
         /// Also write each surviving alert to
-        /// `~/projects/<handle>-meta/.ccteam/outbox/`. Pair with
+        /// `~/projects/meta-<handle>/.ccteam/outbox/`. Pair with
         /// `--user <handle>`.
         #[arg(long, default_value_t = false)]
         push: bool,
@@ -386,7 +386,10 @@ fn main() -> Result<()> {
         } => run_new(request, file, team, slug, no_auto_slug, auto_slug_model),
         Command::Ls { format } => run_ls(format),
         Command::Show { slug, format } => run_show(&slug, format),
-        Command::Attach { slug } => commands::run_attach(&slug),
+        Command::Attach { slug } => {
+            let paths = CcteamPaths::from_env()?;
+            commands::run_attach(&paths, &slug)
+        }
         Command::Peek { slug } => run_peek(&slug),
         Command::Progress { slug, tail } => {
             let paths = CcteamPaths::from_env()?;
@@ -726,7 +729,8 @@ fn run_show(slug: &str, format: OutputFormat) -> Result<()> {
 }
 
 fn run_peek(slug: &str) -> Result<()> {
-    let body = commands::run_peek(slug)?;
+    let paths = CcteamPaths::from_env()?;
+    let body = commands::run_peek(&paths, slug)?;
     print!("{body}");
     Ok(())
 }

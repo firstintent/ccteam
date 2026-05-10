@@ -203,7 +203,9 @@ pub fn parse_phase_end(paths: &CcteamPaths, stdin: &Value) -> Result<ParseDecisi
         // the stall so the watchdog surfaces it. Claude Code carries
         // `stop_hook_active: true` on the second Stop entry so a phase
         // that keeps producing nothing won't loop forever.
-        let pane_tail = tmux::capture_pane_tail(&slug, 30, false);
+        let tmux_session = tmux::session_name_for_project(paths, &slug);
+        let pane_tail =
+            tmux::capture_pane_tail_from_session(&tmux_session, 30, false);
         write_needs_attention_outbox(
             cwd_path,
             &slug,

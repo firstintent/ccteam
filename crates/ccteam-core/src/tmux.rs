@@ -18,11 +18,32 @@ use std::process::Command;
 
 use anyhow::{anyhow, bail, Context, Result};
 
+use crate::paths::CcteamPaths;
+use crate::state::ProjectState;
+
 pub const SESSION_PREFIX: &str = "ccteam-";
 
 /// Build the conventional tmux session name for a project slug.
 pub fn session_name_for_slug(slug: &str) -> String {
     format!("{SESSION_PREFIX}{slug}")
+}
+
+/// Resolve the live tmux session name for a project slug.
+///
+/// Most projects use the conventional `ccteam-<slug>` name, but
+/// meta-agent sessions intentionally use `ccteam-meta-<handle>`.
+/// `state.json.tmux_session` is the source of truth for those cases,
+/// including legacy installs whose slug was `<handle>-meta`. If the
+/// state is missing or malformed we fall back to the conventional name
+/// so diagnostic surfaces continue to degrade the same way older builds
+/// did.
+pub fn session_name_for_project(paths: &CcteamPaths, slug: &str) -> String {
+    let fallback = session_name_for_slug(slug);
+    let state_path = paths.project_state(slug);
+    match ProjectState::load(&state_path) {
+        Ok(state) if !state.tmux_session.trim().is_empty() => state.tmux_session,
+        _ => fallback,
+    }
 }
 
 /// Handle to a (possibly non-existent) tmux session. Methods are
@@ -255,12 +276,26 @@ impl TmuxSession {
 /// instead (which returns raw bytes for `vt100::Parser`).
 pub fn capture_pane_tail(slug: &str, lines: usize, with_ansi: bool) -> Option<String> {
     let session = session_name_for_slug(slug);
+    capture_pane_tail_from_session(&session, lines, with_ansi)
+}
+
+/// Capture pane tail by exact tmux session name.
+///
+/// Prefer this for project-scoped call sites that already loaded
+/// `state.json.tmux_session`; meta-agent projects use tmux session
+/// `ccteam-meta-<handle>`, and legacy installs may still have a
+/// `<handle>-meta` slug on disk.
+pub fn capture_pane_tail_from_session(
+    session_name: &str,
+    lines: usize,
+    with_ansi: bool,
+) -> Option<String> {
     let mut cmd = Command::new("tmux");
     cmd.arg("capture-pane").arg("-p");
     if with_ansi {
         cmd.arg("-e");
     }
-    cmd.args(["-t", &session, "-S", &format!("-{lines}")]);
+    cmd.args(["-t", session_name, "-S", &format!("-{lines}")]);
     let output = cmd.output().ok()?;
     if !output.status.success() {
         return None;
@@ -294,6 +329,16 @@ pub fn capture_pane_tail(slug: &str, lines: usize, with_ansi: bool) -> Option<St
 /// `String` for NL surface use; this one keeps raw bytes for `vt100`.
 pub fn capture_pane_with_ansi(slug: &str, lines: usize) -> Result<Option<Vec<u8>>> {
     let name = session_name_for_slug(slug);
+    capture_pane_with_ansi_from_session(&name, lines)
+}
+
+/// Capture a tmux pane by exact session name. Use this when the
+/// caller has already resolved `state.json.tmux_session` instead of a
+/// conventional project slug.
+pub fn capture_pane_with_ansi_from_session(
+    session_name: &str,
+    lines: usize,
+) -> Result<Option<Vec<u8>>> {
     let lines_arg = format!("-{lines}");
     let output = Command::new("tmux")
         .args([
@@ -301,12 +346,12 @@ pub fn capture_pane_with_ansi(slug: &str, lines: usize) -> Result<Option<Vec<u8>
             "-e",
             "-p",
             "-t",
-            &name,
+            session_name,
             "-S",
             &lines_arg,
         ])
         .output()
-        .with_context(|| format!("spawn tmux capture-pane for {name}"))?;
+        .with_context(|| format!("spawn tmux capture-pane for {session_name}"))?;
     if !output.status.success() {
         return Ok(None);
     }
@@ -318,17 +363,22 @@ pub fn capture_pane_with_ansi(slug: &str, lines: usize) -> Result<Option<Vec<u8>
 /// `Ok(None)` on session-missing / tmux failure.
 pub fn query_pane_dims(slug: &str) -> Result<Option<(u16, u16)>> {
     let name = session_name_for_slug(slug);
+    query_pane_dims_from_session(&name)
+}
+
+/// Query pane dimensions by exact tmux session name.
+pub fn query_pane_dims_from_session(session_name: &str) -> Result<Option<(u16, u16)>> {
     let output = Command::new("tmux")
         .args([
             "display-message",
             "-p",
             "-t",
-            &name,
+            session_name,
             "-F",
             "#{pane_height} #{pane_width}",
         ])
         .output()
-        .with_context(|| format!("spawn tmux display-message for {name}"))?;
+        .with_context(|| format!("spawn tmux display-message for {session_name}"))?;
     if !output.status.success() {
         return Ok(None);
     }

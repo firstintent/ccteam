@@ -6,7 +6,8 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use ccteam_core::tmux::{pid_is_alive, tmux_available, TmuxSession};
+use ccteam_core::tmux::{pid_is_alive, session_name_for_project, tmux_available, TmuxSession};
+use ccteam_core::{CcteamPaths, ProjectState};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -44,6 +45,38 @@ fn skip_if_no_tmux(test_name: &str) -> bool {
         return true;
     }
     false
+}
+
+fn fake_paths(root: &std::path::Path) -> CcteamPaths {
+    CcteamPaths {
+        root: root.join(".ccteam"),
+        projects_root: root.join("projects"),
+    }
+}
+
+#[test]
+fn session_name_for_project_falls_back_to_slug_when_state_missing() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+
+    assert_eq!(
+        session_name_for_project(&paths, "dev-openclaw-download"),
+        "ccteam-dev-openclaw-download"
+    );
+}
+
+#[test]
+fn session_name_for_project_uses_state_tmux_session() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let mut state = ProjectState::initial_for_team("cto-meta".into(), "meta-agent".into());
+    state.tmux_session = "ccteam-meta-cto".into();
+    state.save(&paths.project_state("cto-meta")).unwrap();
+
+    assert_eq!(
+        session_name_for_project(&paths, "cto-meta"),
+        "ccteam-meta-cto"
+    );
 }
 
 #[test]

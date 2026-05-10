@@ -38,7 +38,7 @@ use crate::inbox::{
     outbox_filename, OutboxEventKind, OutboxFrontMatter, OutboxMessage, OutboxPriority,
     LATEST_SCHEMA_VERSION,
 };
-use crate::meta_agent::meta_slug;
+use crate::meta_agent::resolve_meta_slug;
 use crate::paths::CcteamPaths;
 use crate::state::ProjectState;
 
@@ -443,7 +443,7 @@ fn keep(alert: &WatchdogAlert, config: &WatchdogConfig) -> bool {
 }
 
 /// Render an alert into a meta-agent outbox file under
-/// `~/projects/<user-handle>-meta/.ccteam/outbox/`. Returns the path
+/// `~/projects/meta-<user-handle>/.ccteam/outbox/`. Returns the path
 /// written. The meta-agent's own session reads its outbox and surfaces
 /// each entry in NL.
 ///
@@ -456,7 +456,7 @@ pub fn push_alert_to_meta_outbox(
     user_handle: &str,
     alert: &WatchdogAlert,
 ) -> Result<PathBuf> {
-    let slug = meta_slug(user_handle)?;
+    let slug = resolve_meta_slug(paths, user_handle)?;
     let outbox_dir = paths
         .project_ccteam_dir(&slug)
         .join("outbox");
@@ -797,6 +797,11 @@ mod tests {
         };
         let path = push_alert_to_meta_outbox(&p, "rob", &alert).unwrap();
         assert!(path.exists());
+        assert!(
+            path.starts_with(p.project_ccteam_dir("meta-rob").join("outbox")),
+            "watchdog should write to canonical meta slug; got {}",
+            path.display(),
+        );
         let body = std::fs::read_to_string(&path).unwrap();
         assert!(body.contains("watchdog: daemon_down"));
         assert!(body.contains("event_kind: escalation"));

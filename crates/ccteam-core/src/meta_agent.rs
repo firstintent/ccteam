@@ -1,7 +1,7 @@
 //! Meta-agent session bootstrap (M1.0).
 //!
 //! The meta-agent is a ccteam-managed long tmux session under
-//! `~/projects/<user>-meta/` that the human user attaches to with
+//! `~/projects/meta-<user>/` that the human user attaches to with
 //! `tmux attach -t ccteam-meta-<user>` and talks to in NL. It dispatches
 //! project requests via `ccteam new`, monitors active projects, and
 //! routes inbox/outbox messages.
@@ -54,15 +54,45 @@ pub const META_SESSION_PREFIX: &str = "ccteam-meta-";
 const META_ROLE_PROMPT_TEMPLATE: &str =
     include_str!("templates/meta_agent_role.md");
 
-/// Build the meta-agent's project slug from a user handle. Slug is
-/// `<user>-meta`, slugified — so `Rob` and `rob` collapse to the same
-/// directory, which is what we want.
+/// Build the meta-agent's canonical project slug from a user handle.
+/// Slug is `meta-<user>`, slugified, matching the dedicated tmux
+/// session `ccteam-meta-<user>` and the team-prefixed convention used
+/// by regular project slugs such as `dev-...`.
 pub fn meta_slug(user_handle: &str) -> Result<String> {
     let trimmed = user_handle.trim();
     if trimmed.is_empty() {
         return Err(anyhow!("meta-agent user handle must be non-empty"));
     }
+    Ok(format!("meta-{}", slugify(trimmed)))
+}
+
+/// Legacy meta-agent slug used before V0.3 follow-up:
+/// `<user>-meta`. Kept only so `doctor --install-meta-agent` can
+/// migrate existing installs without losing their state/outbox.
+fn legacy_meta_slug(user_handle: &str) -> Result<String> {
+    let trimmed = user_handle.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("meta-agent user handle must be non-empty"));
+    }
     Ok(format!("{}-meta", slugify(trimmed)))
+}
+
+/// Resolve the meta-agent slug that currently exists on disk.
+///
+/// New callers should use [`meta_slug`] for creation. Notification
+/// paths use this resolver so old `<user>-meta` installs still receive
+/// alerts until the user re-runs `doctor --install-meta-agent`, which
+/// migrates them to `meta-<user>`.
+pub fn resolve_meta_slug(paths: &CcteamPaths, user_handle: &str) -> Result<String> {
+    let slug = meta_slug(user_handle)?;
+    if paths.project_state(&slug).exists() {
+        return Ok(slug);
+    }
+    let legacy = legacy_meta_slug(user_handle)?;
+    if paths.project_state(&legacy).exists() {
+        return Ok(legacy);
+    }
+    Ok(slug)
 }
 
 /// `ccteam-meta-<user>` tmux session name.
@@ -99,6 +129,7 @@ pub fn bootstrap_meta_project(
     user_handle: &str,
 ) -> Result<MetaBootstrapReport> {
     let slug = meta_slug(user_handle)?;
+    migrate_legacy_meta_project(paths, user_handle, &slug)?;
     let project_dir = paths.project_dir(&slug);
     let already_existed = paths.project_state(&slug).exists();
 
@@ -113,14 +144,14 @@ pub fn bootstrap_meta_project(
         bootstrap_project(paths, &slug, &request, META_TEAM_NAME)
             .context("bootstrap meta-agent project tree")?;
     }
-    // Always normalize the meta-agent's tmux_session name. bootstrap_project
-    // initializes it as `ccteam-<slug>` (which would yield `ccteam-rob-meta`),
-    // but the strategic doc + interfaces.md call for `ccteam-meta-<user>`
-    // — distinct prefix so meta sessions are visually separated from
-    // project sessions in `tmux ls`. Rewrite after bootstrap_project runs.
+    // Always normalize the meta-agent's tmux_session name. New
+    // canonical slugs (`meta-<user>`) already line up with
+    // `ccteam-meta-<user>`, but migrated legacy projects need their
+    // state refreshed after the directory rename.
     let state_path = paths.project_state(&slug);
     let mut state = ProjectState::load(&state_path)
         .with_context(|| format!("reload meta state {}", state_path.display()))?;
+    state.slug = slug.clone();
     state.team = META_TEAM_NAME.into();
     state.tmux_session = meta_session_name(user_handle)?;
     state.save(&state_path)?;
@@ -141,6 +172,56 @@ pub fn bootstrap_meta_project(
         claude_md,
         already_existed,
     })
+}
+
+fn migrate_legacy_meta_project(
+    paths: &CcteamPaths,
+    user_handle: &str,
+    canonical_slug: &str,
+) -> Result<()> {
+    let legacy_slug = legacy_meta_slug(user_handle)?;
+    if legacy_slug == canonical_slug {
+        return Ok(());
+    }
+
+    let legacy_state = paths.project_state(&legacy_slug);
+    let canonical_state = paths.project_state(canonical_slug);
+    if !legacy_state.exists() || canonical_state.exists() {
+        return Ok(());
+    }
+
+    let legacy_dir = paths.project_dir(&legacy_slug);
+    let canonical_dir = paths.project_dir(canonical_slug);
+    if canonical_dir.exists() {
+        return Err(anyhow!(
+            "cannot migrate legacy meta-agent project `{}` to `{}`: target directory already exists",
+            legacy_dir.display(),
+            canonical_dir.display(),
+        ));
+    }
+
+    std::fs::create_dir_all(&paths.projects_root)
+        .with_context(|| format!("create {}", paths.projects_root.display()))?;
+    std::fs::rename(&legacy_dir, &canonical_dir)
+        .with_context(|| format!("rename {} -> {}", legacy_dir.display(), canonical_dir.display()))?;
+
+    let legacy_progress = paths.progress_jsonl(&legacy_slug);
+    let canonical_progress = paths.progress_jsonl(canonical_slug);
+    if legacy_progress.exists() && !canonical_progress.exists() {
+        if let Some(parent) = canonical_progress.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
+        std::fs::rename(&legacy_progress, &canonical_progress).with_context(|| {
+            format!(
+                "rename {} -> {}",
+                legacy_progress.display(),
+                canonical_progress.display()
+            )
+        })?;
+    }
+
+    Ok(())
 }
 
 /// Result of `bootstrap_meta_project` — useful for the doctor command's
@@ -173,9 +254,9 @@ mod tests {
     }
 
     #[test]
-    fn meta_slug_combines_user_with_meta_suffix() {
-        assert_eq!(meta_slug("rob").unwrap(), "rob-meta");
-        assert_eq!(meta_slug("Rob Test User").unwrap(), "rob-test-user-meta");
+    fn meta_slug_uses_meta_prefix() {
+        assert_eq!(meta_slug("rob").unwrap(), "meta-rob");
+        assert_eq!(meta_slug("Rob Test User").unwrap(), "meta-rob-test-user");
     }
 
     #[test]
@@ -198,6 +279,23 @@ mod tests {
         assert!(body.contains("rob"), "role prompt should mention user handle");
         assert!(!body.contains("__USER_HANDLE__"), "placeholder should be substituted");
         assert!(!body.contains("__GENERATED_AT__"));
+    }
+
+    #[test]
+    fn render_role_prompt_uses_canonical_meta_project_path() {
+        let body = render_meta_role_prompt("rob");
+        assert!(
+            body.contains("~/projects/meta-rob/.ccteam/inbox/"),
+            "role prompt should mention canonical meta inbox path",
+        );
+        assert!(
+            body.contains("~/projects/meta-rob/.ccteam/outbox/"),
+            "role prompt should mention canonical meta outbox path",
+        );
+        assert!(
+            !body.contains("~/projects/rob-meta/"),
+            "role prompt must not point migrated meta-agents at the legacy path",
+        );
     }
 
     #[test]
@@ -254,13 +352,14 @@ mod tests {
         let p = paths(&tmp);
         let report = bootstrap_meta_project(&p, "rob").unwrap();
 
-        assert_eq!(report.slug, "rob-meta");
+        assert_eq!(report.slug, "meta-rob");
         assert!(report.project_dir.is_dir());
         assert!(report.claude_md.is_file());
         assert!(p.project_state(&report.slug).is_file());
 
         let state = ProjectState::load(&p.project_state(&report.slug)).unwrap();
         assert_eq!(state.team, META_TEAM_NAME);
+        assert_eq!(state.slug, "meta-rob");
         // tmux name uses the dedicated `ccteam-meta-<user>` prefix
         // rather than `ccteam-<slug>` so it visually separates from
         // project sessions in `tmux ls`.
@@ -284,11 +383,36 @@ mod tests {
 
         // Tamper with CLAUDE.md, re-run, verify it gets refreshed and the
         // tampering is gone.
-        let cm = p.project_dir("rob-meta").join("CLAUDE.md");
+        let cm = p.project_dir("meta-rob").join("CLAUDE.md");
         std::fs::write(&cm, "stale\n").unwrap();
         let report = bootstrap_meta_project(&p, "rob").unwrap();
         assert!(report.already_existed);
         let body = std::fs::read_to_string(&cm).unwrap();
         assert!(body.contains("决策树"), "role prompt should be re-rendered");
+    }
+
+    #[test]
+    fn bootstrap_meta_project_migrates_legacy_user_meta_directory() {
+        isolation();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let p = paths(&tmp);
+        let legacy = p.project_dir("rob-meta");
+        std::fs::create_dir_all(legacy.join(".ccteam")).unwrap();
+        let mut state = ProjectState::initial_for_team("rob-meta".into(), META_TEAM_NAME.into());
+        state.tmux_session = "ccteam-meta-rob".into();
+        state.save(&p.project_state("rob-meta")).unwrap();
+        std::fs::create_dir_all(p.progress_dir()).unwrap();
+        std::fs::write(p.progress_jsonl("rob-meta"), "{}\n").unwrap();
+
+        let report = bootstrap_meta_project(&p, "rob").unwrap();
+
+        assert_eq!(report.slug, "meta-rob");
+        assert!(!p.project_dir("rob-meta").exists());
+        assert!(p.project_dir("meta-rob").is_dir());
+        assert!(!p.progress_jsonl("rob-meta").exists());
+        assert!(p.progress_jsonl("meta-rob").exists());
+        let state = ProjectState::load(&p.project_state("meta-rob")).unwrap();
+        assert_eq!(state.slug, "meta-rob");
+        assert_eq!(state.tmux_session, "ccteam-meta-rob");
     }
 }

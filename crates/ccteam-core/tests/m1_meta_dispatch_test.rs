@@ -82,14 +82,14 @@ fn count_active_regular_excludes_meta_team() {
     b.phase_state = PhaseState::AutoLocked;
     let mut idle = ProjectState::initial("p-3".into());
     idle.phase_state = PhaseState::Idle;
-    let mut meta = ProjectState::initial_for_team("rob-meta".into(), META_TEAM_NAME.into());
+    let mut meta = ProjectState::initial_for_team("meta-rob".into(), META_TEAM_NAME.into());
     meta.phase_state = PhaseState::InFlight; // even if mislabeled, it shouldn't count
 
     let projects = vec![
         ("p-1".into(), a),
         ("p-2".into(), b),
         ("p-3".into(), idle),
-        ("rob-meta".into(), meta),
+        ("meta-rob".into(), meta),
     ];
     assert_eq!(orch.count_active_regular(&projects), 2);
 }
@@ -388,13 +388,13 @@ fn meta_project_does_not_consume_concurrency_budget() {
     a.phase_state = PhaseState::InFlight;
     let mut b = ProjectState::initial("p2".into());
     b.phase_state = PhaseState::InFlight;
-    let mut meta = ProjectState::initial_for_team("rob-meta".into(), META_TEAM_NAME.into());
+    let mut meta = ProjectState::initial_for_team("meta-rob".into(), META_TEAM_NAME.into());
     meta.phase_state = PhaseState::InFlight;
 
     let projects = vec![
         ("p1".into(), a),
         ("p2".into(), b),
-        ("rob-meta".into(), meta),
+        ("meta-rob".into(), meta),
     ];
     assert_eq!(orch.count_active_regular(&projects), 2);
     assert!(
@@ -402,4 +402,3 @@ fn meta_project_does_not_consume_concurrency_budget() {
         "meta should leave at least one budget slot",
     );
 }
-
