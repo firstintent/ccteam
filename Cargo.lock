@@ -301,7 +301,7 @@ dependencies = [
 
 [[package]]
 name = "ccteam-cli"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "ccteam-core",
@@ -319,7 +319,7 @@ dependencies = [
 
 [[package]]
 name = "ccteam-core"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "ab_glyph",
  "anyhow",
@@ -340,7 +340,7 @@ dependencies = [
 
 [[package]]
 name = "ccteam-hooks"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "ccteam-core",
@@ -353,7 +353,7 @@ dependencies = [
 
 [[package]]
 name = "ccteam-web"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "askama",

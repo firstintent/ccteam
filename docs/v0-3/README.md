@@ -6,11 +6,12 @@ F38 截图),并提供有限的写动作(`/btw` / inject_decision / pause / resum
 新 crate `crates/ccteam-web`,axum + askama + htmx + SSE 单 binary,无 npm /
 无 build toolchain。
 
-**状态**:**drafting**(2026-05-10 doc-only kickoff PR;实施跨 5 PR M5.0-M5.4
-未启动)。
+**状态**:**已 ship**(2026-05-10,5 PR M5.0-M5.4 全 merge;
+workspace.version `0.3.0`;测试 738/0)。
 
-base = `origin/main` `2988de6`(V0.2.2 F44 ship 终点);测试 baseline 起点
-631/0;workspace.version 起点 `0.2.2`,V0.3 ship gate 前 bump `0.3.0`。
+base 起点 = `origin/main` `2988de6`(V0.2.2 F44 ship 终点,测试 631);ship
+终点 = V0.3 PR #5 merge 后(测试 738,+107 测试 / V0.3 自身贡献)。
+ship 报告:[`e2e-retro.md`](e2e-retro.md)。
 
 ## 文档清单
 
@@ -18,6 +19,7 @@ base = `origin/main` `2988de6`(V0.2.2 F44 ship 终点);测试 baseline 起点
 |---|---|---|
 | [`prd.md`](prd.md) | V0.3 PRD — 12 节,5 milestone(M5.0-M5.4)设计 + 技术决策 + 威胁模型 + PR sequencing | V0.3 设计意图源头 |
 | [`dev-plan.md`](dev-plan.md) | 5 PR milestone 拆解 + worktree 分支 + subagent briefing 模板 + 红线 grep 矩阵 | V0.3 实施 |
+| [`e2e-retro.md`](e2e-retro.md) | V0.3 ship gate 端到端验证矩阵(22 场景全 PASS)+ 跨浏览器 spot-check + lingering issues + V0.4 deferred | V0.3 ship 报告 |
 
 ## Milestones 速查
 

@@ -3,9 +3,11 @@
 V0.2 已 ship(`origin/main = 503269a`,8 个 milestone M0.16-M0.23,497/0 测试)。
 本目录收纳 V0.2 全部相关文档。
 
-> **V0.3 起始**(drafting,2026-05-10):web UI(读 + 受限写)— 详
-> [`docs/v0-3/`](../v0-3/)。下方 "V0.3 deferred 项" 仍 deferred(web UI 是
-> 新增主线,不替代列出的 deferred 项)。
+> **已 ship V0.3**(2026-05-10,`docs/v0-3/`):web UI dashboard + SSE +
+> 写动作 + token auth(5 milestone M5.0-M5.4,新 crate `ccteam-web`,
+> workspace.version 0.3.0,738 测试)。下方 "V0.3 deferred 项" 仍 deferred
+> (web UI 是新增主线,不替代列出的 deferred 项;V0.4 候选见
+> [`docs/v0-3/prd.md §10`](../v0-3/prd.md))。
 
 ## 文档清单
 
