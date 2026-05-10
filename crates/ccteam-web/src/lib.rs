@@ -45,7 +45,7 @@ pub mod watcher;
 
 pub use auth::AuthState;
 pub use state::AppState;
-pub use watcher::{EventBus, ProgressUpdate};
+pub use watcher::{EventBus, HarnessSnapshotEvent, ProgressUpdate};
 
 /// Knobs accepted by [`serve`]. Mirrors the `ccteam web` CLI flags
 /// 1:1 so the CLI translation in `ccteam-cli::commands::run_web`
