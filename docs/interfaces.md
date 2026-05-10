@@ -635,9 +635,15 @@ V0.1 → V0.2 升级:V0.1 用户的 `~/.claude/agents/<name>.md` ln -sf 由 `cct
   首例,`teams/research/team.yaml` 列 `aliases: [product-research]`)。老项目
   state.json::team 字面 / 项目目录名 / 老 rules 文件全不动;`ccteam new --team
   product-research` 仍工作并 stderr warn deprecated。详 PRD §9。
+- **V0.3.1 F48** ✅ 加 `kind: TeamKind`(默认 `workflow`),取值
+  `workflow | multi_workflow | flex`。`workflow` / `multi_workflow` 是
+  phase-driven;`flex` 团队无 phase DAG,orchestrator 不跑 auto_loop / phase
+  prompt injection / golden_rules,但 hooks / progress.jsonl / silence
+  classifier / cost watcher 仍保留。`ccteam team init <name> --kind flex`
+  生成无 `phases/` 的 staging tree。
 - **V0.3.1 F47** ✅ 加 `sessions: Vec<DefaultSessionSpec>`(默认空),每条
   `{ sid: String, harness: HarnessKind }`,`HarnessKind = claude | codex`(serde
-  `lowercase` rename)。**只对 `kind: flex` 团队有意义**(`kind` 字段 F48 落);
+  `lowercase` rename)。**只对 `kind: flex` 团队有意义**;
   workflow / multi_workflow 团队 parse 不 fail 但忽略。F47 ship trait stub +
   schema;F49 PR(V0.3.1 PR #4)落 `state.json::sessions[]` runtime + adhoc
   `ccteam session add/ls/attach/rm` 命令。详 PRD §F47 + `docs/research/ccteam-codex-integration.md`。
@@ -646,6 +652,7 @@ V0.1 → V0.2 升级:V0.1 用户的 `~/.claude/agents/<name>.md` ln -sf 由 `cct
 # ~/.ccteam/teams/research/team.yaml — 完整字段示例(V0.2.2 起 canonical 名 `research`)
 name: research                          # 必填。snake-case [a-z0-9_-]+,与 --team / state.json.team 对齐
 aliases: [product-research]             # 可选(V0.2.2 F40)。老项目 state.json::team 仍可解析;同 charset 规则,不能与 name 重叠
+kind: workflow                          # V0.3.1 F48。workflow | multi_workflow | flex;默认 workflow
 description: |                          # 可选。`ccteam ls --teams`(M3.4)显示
   Product research team —
   kickoff → research → verdict → next-steps;
@@ -719,8 +726,8 @@ claude_md_template: |
   # CLAUDE.md (auto-managed by ccteam)
   ...
 
-# V0.3.1 F47 — flex 团队的默认 session 列表(workflow / multi_workflow 团队
-# 该字段忽略,不 fail);F48 PR 落 `kind: flex`,F49 PR 落 runtime path
+# V0.3.1 F47/F48 — flex 团队的默认 session 列表(workflow / multi_workflow 团队
+# 该字段忽略,不 fail);F49 PR 落 runtime path
 # (`ccteam session add/ls/attach/rm` 实际写 state.json::sessions[])。
 # 每条 `harness:` ∈ {claude, codex},缺省 `claude`;`sid:` 必填。
 # 详 PRD §F47 + docs/research/ccteam-codex-integration.md。
@@ -744,7 +751,13 @@ sessions:
 **校验**(`TeamSpec::validate` 在 parse 时执行):
 - `name` 非空,只允许 ascii 小写 / 数字 / `-` / `_`
 - `aliases[*]` 各 alias 同 `name` 的 charset 规则;不能为空、不能重复、不能与 `name` 自身重叠(V0.2.2 F40)
-- `phase_dir` 非空、相对路径、不含 `..`
+- `kind` 缺省为 `workflow`;`workflow | multi_workflow` 保持 phase-driven
+  行为;`flex` 团队跳过 phase DAG / auto_loop / phase prompt / golden_rules
+  machinery,但保留 observability。`flex` 不允许 `golden_rules` /
+  `escalate_grammar_extensions` / custom `phase_dir` / phase-boundary
+  schema(`retro_schema` / `verdict_schema`)。
+- `phase_dir` 对 phase-driven 团队必须非空、相对路径、不含 `..`;flex 可
+  保留默认 `phases` 字段但 orchestrator / doctor 不加载或校验该目录
 - `retro_schema[*].field` 非空,**不允许重复**(防 schema 字段重名 — M4.1 retro 写入跨项目 lessons 文件时按 field 名映射段落)
 - `escalate_grammar_extensions[*].prefix` 非空、唯一;
   `route: revert_to_phase` 必须带 `target_phase`

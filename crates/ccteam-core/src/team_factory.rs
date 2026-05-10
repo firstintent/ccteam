@@ -201,21 +201,23 @@ pub fn init_team_staging(input: &TeamInitInput<'_>) -> Result<InitReport> {
     std::fs::write(&team_yaml_path, team_yaml_body)
         .with_context(|| format!("write {}", team_yaml_path.display()))?;
 
-    let phase_dir_name: &str = if input.spec.phase_dir.is_empty() {
-        "phases"
-    } else {
-        input.spec.phase_dir.as_str()
-    };
-    let phase_dir = staging.join(phase_dir_name);
-    std::fs::create_dir_all(&phase_dir)
-        .with_context(|| format!("create {}", phase_dir.display()))?;
     let mut phase_paths = Vec::with_capacity(input.phases.len());
-    for (idx, scaffold) in input.phases.iter().enumerate() {
-        let filename = format!("{:02}-{}.md", idx + 1, scaffold.name);
-        let path = phase_dir.join(&filename);
-        std::fs::write(&path, render_phase_scaffold(scaffold))
-            .with_context(|| format!("write {}", path.display()))?;
-        phase_paths.push(path);
+    if input.spec.kind.is_phase_driven() || !input.phases.is_empty() {
+        let phase_dir_name: &str = if input.spec.phase_dir.is_empty() {
+            "phases"
+        } else {
+            input.spec.phase_dir.as_str()
+        };
+        let phase_dir = staging.join(phase_dir_name);
+        std::fs::create_dir_all(&phase_dir)
+            .with_context(|| format!("create {}", phase_dir.display()))?;
+        for (idx, scaffold) in input.phases.iter().enumerate() {
+            let filename = format!("{:02}-{}.md", idx + 1, scaffold.name);
+            let path = phase_dir.join(&filename);
+            std::fs::write(&path, render_phase_scaffold(scaffold))
+                .with_context(|| format!("write {}", path.display()))?;
+            phase_paths.push(path);
+        }
     }
 
     let readme_path = staging.join("README.md");
@@ -307,7 +309,19 @@ fn render_readme(input: &TeamInitInput<'_>) -> String {
     ));
     s.push_str("```\n\n");
     s.push_str("## Phases\n\n");
-    if input.phases.is_empty() {
+    if input.spec.kind.is_flex() {
+        s.push_str("(no phases — flex team)\n");
+        if !input.spec.sessions.is_empty() {
+            s.push_str("\n## Default Sessions\n\n");
+            for session in &input.spec.sessions {
+                let harness = match session.harness {
+                    crate::team::HarnessKind::Claude => "claude",
+                    crate::team::HarnessKind::Codex => "codex",
+                };
+                s.push_str(&format!("- `{}` — `{harness}`\n", session.sid));
+            }
+        }
+    } else if input.phases.is_empty() {
         s.push_str("(no phases — evergreen team)\n");
     } else {
         for scaffold in input.phases {
@@ -584,6 +598,31 @@ mod tests {
         .unwrap()
     }
 
+    fn flex_spec() -> TeamSpec {
+        TeamSpec::parse(concat!(
+            "name: example\n",
+            "kind: flex\n",
+            "description: example flex team\n",
+            "claude_md_template: flex team instructions\n",
+            "sessions:\n",
+            "  - sid: claude-1\n",
+            "    harness: claude\n",
+        ))
+        .unwrap()
+    }
+
+    fn run_flex_init(tmp: &TempDir) -> InitReport {
+        let spec = flex_spec();
+        let manifest = sample_manifest();
+        init_team_staging(&TeamInitInput {
+            spec: &spec,
+            manifest: &manifest,
+            phases: &[],
+            staging_root_override: Some(tmp.path()),
+        })
+        .unwrap()
+    }
+
     #[test]
     fn init_writes_full_plugin_layout() {
         let tmp = TempDir::new().unwrap();
@@ -594,6 +633,32 @@ mod tests {
         assert!(report.phase_paths[0].file_name().unwrap() == "01-kickoff.md");
         assert!(report.phase_paths[1].file_name().unwrap() == "02-build.md");
         assert!(report.readme_path.exists());
+    }
+
+    #[test]
+    fn f48_flex_init_skips_phase_scaffold() {
+        let tmp = TempDir::new().unwrap();
+        let report = run_flex_init(&tmp);
+        assert!(report.manifest_path.exists());
+        assert!(report.team_yaml_path.exists());
+        assert!(report.phase_paths.is_empty());
+        assert!(!report.staging_dir.join("phases").exists());
+        assert!(report.readme_path.exists());
+    }
+
+    #[test]
+    fn f48_flex_init_writes_kind_and_default_session() {
+        let tmp = TempDir::new().unwrap();
+        let report = run_flex_init(&tmp);
+        let body = std::fs::read_to_string(&report.team_yaml_path).unwrap();
+        assert!(body.contains("kind: flex"), "got:\n{body}");
+        assert!(body.contains("sid: claude-1"), "got:\n{body}");
+        assert!(body.contains("harness: claude"), "got:\n{body}");
+
+        let reloaded = TeamSpec::load(&report.team_yaml_path).unwrap();
+        assert!(reloaded.kind.is_flex());
+        assert_eq!(reloaded.sessions.len(), 1);
+        assert_eq!(reloaded.sessions[0].sid, "claude-1");
     }
 
     #[test]
@@ -746,6 +811,18 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let _report = run_init(&tmp);
         let staging = staging_dir_for("example", Some(tmp.path()));
+        let findings = validate_staged_team(&staging).unwrap();
+        assert!(findings.iter().any(|l| l.starts_with("[OK] plugin.json")));
+        assert!(findings.iter().any(|l| l.starts_with("[OK] team.yaml")));
+        assert!(!findings.iter().any(|l| l.starts_with("[FAIL]")));
+    }
+
+    #[test]
+    fn f48_validate_staged_team_accepts_flex_without_phases_dir() {
+        let tmp = TempDir::new().unwrap();
+        let _report = run_flex_init(&tmp);
+        let staging = staging_dir_for("example", Some(tmp.path()));
+        assert!(!staging.join("phases").exists());
         let findings = validate_staged_team(&staging).unwrap();
         assert!(findings.iter().any(|l| l.starts_with("[OK] plugin.json")));
         assert!(findings.iter().any(|l| l.starts_with("[OK] team.yaml")));

@@ -1204,10 +1204,11 @@ fn render_validate_team_report(
         }
     };
 
-    if spec.evergreen {
-        out.push_str(
-            "[OK] team is evergreen — skipping phase IO / markdown checks\n",
-        );
+    if spec.evergreen || spec.kind.is_flex() {
+        let label = if spec.evergreen { "evergreen" } else { "flex" };
+        out.push_str(&format!(
+            "[OK] team is {label} — skipping phase IO / markdown checks\n",
+        ));
         out.push_str(&format!("\nSummary: 1 ok, 0 warn, {fails} fail\n"));
         return Ok((out, fails));
     }
@@ -1386,9 +1387,10 @@ pub fn run_phase_show(
     let spec = resolve_team(team, &ctx)
         .with_context(|| format!("resolve team `{team}`"))?;
 
-    if spec.evergreen {
+    if spec.evergreen || spec.kind.is_flex() {
+        let label = if spec.evergreen { "evergreen" } else { "flex" };
         bail!(
-            "team `{team}` is evergreen — it has no phase DAG, so `phase show` does not apply"
+            "team `{team}` is {label} — it has no phase DAG, so `phase show` does not apply"
         );
     }
 

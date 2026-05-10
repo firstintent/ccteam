@@ -333,6 +333,9 @@ enum TeamCommand {
         /// Plugin manifest `version` (optional, eg `0.1.0`).
         #[arg(long)]
         version: Option<String>,
+        /// Team execution kind. `flex` skips phase scaffolding.
+        #[arg(long, value_enum, default_value_t = team_factory_cli::TeamKindArg::Workflow)]
+        kind: team_factory_cli::TeamKindArg,
     },
     /// Publish a staged team. `--target local` symlinks staging into
     /// `~/.claude/plugins/marketplaces/ccteam-local/plugins/<name>/`;
@@ -564,6 +567,7 @@ fn run_team(cmd: TeamCommand) -> Result<()> {
             author_name,
             author_email,
             version,
+            kind,
         } => {
             let body = team_factory_cli::run_team_init(&team_factory_cli::TeamInitArgs {
                 name,
@@ -571,6 +575,7 @@ fn run_team(cmd: TeamCommand) -> Result<()> {
                 author_name,
                 author_email,
                 version,
+                kind,
             })?;
             print!("{body}");
             Ok(())

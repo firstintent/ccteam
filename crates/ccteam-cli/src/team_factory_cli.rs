@@ -20,7 +20,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use ccteam_core::{
     init_team_staging, publish_team, staging_dir_for, validate_staged_team, InitReport,
     PhaseScaffold, PluginAuthor, PluginManifest, PublishInput, PublishReport, PublishTarget,
-    TeamInitInput, TeamSpec,
+    TeamInitInput, TeamKind, TeamSpec,
 };
 
 /// `ccteam team init` arguments parsed from clap.
@@ -31,6 +31,7 @@ pub struct TeamInitArgs {
     pub author_name: String,
     pub author_email: Option<String>,
     pub version: Option<String>,
+    pub kind: TeamKindArg,
 }
 
 /// `ccteam team publish` arguments parsed from clap.
@@ -50,16 +51,57 @@ pub enum PublishTargetArg {
     Github,
 }
 
+/// CLI mirror of [`ccteam_core::TeamKind`]. Kept local so core does not
+/// depend on clap derives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum TeamKindArg {
+    Workflow,
+    #[value(name = "multi_workflow", alias = "multi-workflow")]
+    MultiWorkflow,
+    Flex,
+}
+
+impl TeamKindArg {
+    fn as_core(self) -> TeamKind {
+        match self {
+            Self::Workflow => TeamKind::Workflow,
+            Self::MultiWorkflow => TeamKind::MultiWorkflow,
+            Self::Flex => TeamKind::Flex,
+        }
+    }
+}
+
 /// Run `ccteam team init <name>`. Writes the staging tree under
 /// `~/.config/ccteam/teams/<name>/` (or `$XDG_CONFIG_HOME/ccteam/...`).
 /// Returns a human-readable report so the binary entry point can
 /// print it.
 pub fn run_team_init(args: &TeamInitArgs) -> Result<String> {
     let mut spec_yaml = format!("name: {}\n", args.name);
+    if args.kind != TeamKindArg::Workflow {
+        let kind = match args.kind.as_core() {
+            TeamKind::Workflow => "workflow",
+            TeamKind::MultiWorkflow => "multi_workflow",
+            TeamKind::Flex => "flex",
+        };
+        spec_yaml.push_str(&format!("kind: {kind}\n"));
+    }
     if !args.description.is_empty() {
         spec_yaml.push_str(&format!("description: {}\n", args.description));
     }
     spec_yaml.push_str("phase_dir: phases\n");
+    if args.kind == TeamKindArg::Flex {
+        spec_yaml.push_str(concat!(
+            "claude_md_template: |\n",
+            "  # CLAUDE.md (auto-managed by ccteam)\n",
+            "  \n",
+            "  本项目是 flex 团队,无预定 phase。你按照原始 Claude Code 姿态自由工作即可。\n",
+            "  ccteam 会监测 progress.jsonl 与 cost; silence 长时会升级给 meta-agent / 用户 channel,不会主动 kill 你。\n",
+            "  需要并行 worker 时,让 meta-agent 运行 `ccteam session add <slug>` 起新 session。\n",
+            "sessions:\n",
+            "  - sid: claude-1\n",
+            "    harness: claude\n",
+        ));
+    }
     let spec = TeamSpec::parse(&spec_yaml)
         .with_context(|| format!("synthesize TeamSpec from `--name {}`", args.name))?;
 
@@ -76,13 +118,17 @@ pub fn run_team_init(args: &TeamInitArgs) -> Result<String> {
     // Single starter phase. The team-author skill produces multi-phase
     // teams via N init invocations / direct edit; the CLI default
     // keeps the surface small and predictable.
-    let phases = vec![PhaseScaffold {
-        name: "intake",
-        task_summary: "interview the user, write `.ccteam/spec.md`.",
-        required_inputs: &[],
-        required_outputs: &[".ccteam/spec.md"],
-        auto_loop: true,
-    }];
+    let phases = if args.kind == TeamKindArg::Flex {
+        Vec::new()
+    } else {
+        vec![PhaseScaffold {
+            name: "intake",
+            task_summary: "interview the user, write `.ccteam/spec.md`.",
+            required_inputs: &[],
+            required_outputs: &[".ccteam/spec.md"],
+            auto_loop: true,
+        }]
+    };
 
     let report: InitReport = init_team_staging(&TeamInitInput {
         spec: &spec,
@@ -113,12 +159,21 @@ fn render_init_report(report: &InitReport) -> String {
         out.push_str(&format!("                {}\n", path.display()));
     }
     out.push_str(&format!("  README        {}\n\n", report.readme_path.display()));
-    out.push_str(
-        "next:\n  \
-         1. edit phases/*.md bodies to fill in domain detail.\n  \
-         2. ccteam doctor --validate-team <name> — checks plugin manifest + team.yaml.\n  \
-         3. ccteam team publish <name> --target local|github\n",
-    );
+    if report.phase_paths.is_empty() {
+        out.push_str(
+            "next:\n  \
+             1. edit team.yaml / README.md to fill in domain detail.\n  \
+             2. ccteam doctor --validate-team <name> — checks plugin manifest + team.yaml.\n  \
+             3. ccteam team publish <name> --target local|github\n",
+        );
+    } else {
+        out.push_str(
+            "next:\n  \
+             1. edit phases/*.md bodies to fill in domain detail.\n  \
+             2. ccteam doctor --validate-team <name> — checks plugin manifest + team.yaml.\n  \
+             3. ccteam team publish <name> --target local|github\n",
+        );
+    }
     out
 }
 

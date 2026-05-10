@@ -770,12 +770,12 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
 - **优先级**:**P1**(forward-compat 接口,本 PR 不阻塞用户跑 claude harness)。
 - **来源**:`docs/v0-3-1/prd.md §4` + `docs/research/ccteam-codex-integration.md` M0-M1 路线 + 用户 Telegram 2026-05-10 message 313 决策"V0.3.1 落 stub,V0.3.2 落 impl"。
 
-### F48 — `kind: flex` team kind 缺位,phase 编排是 ccteam 唯一工作姿态(2026-05-10 加;**待 V0.3.1 PR #3 ship**)
+### F48 — `kind: flex` team kind 缺位,phase 编排是 ccteam 唯一工作姿态(2026-05-10 加;**V0.3.1 PR #3 实现中**)
 
 - **文件:行号**:`crates/ccteam-core/src/team.rs::TeamSpec`(加 `kind: TeamKind` 字段);`crates/ccteam-core/src/orchestrator.rs::TeamRuntime`(加 `should_run_auto_loop` / `should_inject_phase` / `should_check_golden_rules` helpers);`crates/ccteam-core/src/team_factory.rs::init_team_staging`(`--kind=flex` 跳过 phase scaffold)。
 - **现状**:V0.1/V0.2/V0.3 ccteam 团队都是 phase-driven(workflow 暗含),没有"空 phase / 用户原生姿态驱动 session" 这种姿态。V0.3.1 战略 pivot 把 ccteam 扩展为 session farm,需要支持用户在 session 里自由跑(无 phase 注入 / 无 auto_loop / 无 golden_rules),ccteam 只观测 + 记录 + 提供控制面。
 - **是否真 dev-specific**:**否——team kind 抽象。**
-- **解耦方案**:`team.yaml::kind` 字段,`TeamKind { Workflow, MultiWorkflow, Flex }`,`#[serde(default)]` 保 V0.1/V0.2/V0.3 yaml parse 不变(默认 `Workflow`)。`kind: flex` 与 `parallelism`(phase 级字段)正交 — flex 团队无 phase 所以 `parallelism` 不适用。`TeamSpec::validate` 拒绝非法组合(flex + golden_rules / escalate_grammar_extensions / 非空 phase_dir)。orchestrator behavior gating 三个 helper(`should_run_auto_loop` 等)按 kind 返 bool;**flex 团队 silence_classifier / cost watcher / hooks / progress.jsonl / 跨项目 memory bridge 仍跑**(observability 全保留)。team factory `--kind=flex` scaffold 跳过 phase markdown。
+- **解耦方案**:`team.yaml::kind` 字段,`TeamKind { Workflow, MultiWorkflow, Flex }`,`#[serde(default)]` 保 V0.1/V0.2/V0.3 yaml parse 不变(默认 `Workflow`)。`kind: flex` 与 `parallelism`(phase 级字段)正交 — flex 团队无 phase 所以 `parallelism` 不适用。`TeamSpec::validate` 拒绝非法组合(flex + golden_rules / escalate_grammar_extensions / custom phase_dir / phase-boundary schema)。orchestrator behavior gating 三个 helper(`should_run_auto_loop` 等)按 kind 返 bool;**flex 团队 silence_classifier / cost watcher / hooks / progress.jsonl / 跨项目 memory bridge 仍跑**(observability 全保留)。team factory `--kind=flex` scaffold 跳过 phase markdown。
 - **优先级**:**P0**(V0.3.1 战略 pivot 核心;F49 multi-session 在此基础上)。
 - **来源**:`docs/v0-3-1/prd.md §5`;用户 Telegram 2026-05-10 message 311 原话:"team 工厂创建出空的 phases 团队...用户原始用 claude code 方式来完成"。
 

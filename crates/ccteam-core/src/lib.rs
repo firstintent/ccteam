@@ -116,7 +116,7 @@ pub use state::{Parallelism, PhaseHistoryEntry, PhaseState, ProjectState};
 pub use team::{
     CostPolicy, CriticDimensionSpec, CriticStrictness, DefaultSessionSpec, DomainRule,
     EscalateGrammarExtension, EscalateRoute, GoldenRuleEnforcement, HarnessKind, ProtocolRule,
-    RetroFieldKind, RetroFieldSpec, TeamGoldenRules, TeamSpec,
+    RetroFieldKind, RetroFieldSpec, TeamGoldenRules, TeamKind, TeamSpec,
 };
 pub use team_factory::{
     init_team_staging, publish_team, staging_dir_for, validate_staged_team, InitReport,

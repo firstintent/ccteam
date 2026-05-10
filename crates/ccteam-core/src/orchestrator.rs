@@ -59,6 +59,20 @@ pub struct TeamRuntime {
     pub dag: Dag,
 }
 
+impl TeamRuntime {
+    pub fn should_run_auto_loop(&self) -> bool {
+        self.spec.kind.is_phase_driven()
+    }
+
+    pub fn should_inject_phase(&self) -> bool {
+        self.spec.kind.is_phase_driven()
+    }
+
+    pub fn should_check_golden_rules(&self) -> bool {
+        self.spec.kind.is_phase_driven()
+    }
+}
+
 /// M1.2: how many regular project sessions can run concurrently. Hard-
 /// coded for M1; M3 may move it to `team.yaml` / global config. The
 /// meta-agent session is **not counted** — it's a permanent fixture in
@@ -354,6 +368,7 @@ impl Orchestrator {
             spec: TeamSpec {
                 name: String::new(),
                 aliases: Vec::new(),
+                kind: crate::team::TeamKind::Workflow,
                 description: String::new(),
                 retro_schema: Vec::new(),
                 critic_dimensions: Vec::new(),
@@ -905,7 +920,9 @@ impl Orchestrator {
                         // route through the same escalation flow as
                         // ESCALATE: the user fixes, then `ccteam
                         // resume <slug>` re-arms the phase for retry.
-                        if !prev_template.golden_rules.is_empty() {
+                        if team.should_check_golden_rules()
+                            && !prev_template.golden_rules.is_empty()
+                        {
                             let project_dir = self.paths.project_dir(slug);
                             match crate::golden_rules::enforce(
                                 prev_template,
@@ -1146,6 +1163,15 @@ impl Orchestrator {
                     return Ok(state);
                 }
                 TickAction::DispatchPhase { phase } => {
+                    if !team.should_inject_phase() {
+                        tracing::debug!(
+                            slug,
+                            team = %team.spec.name,
+                            kind = ?team.spec.kind,
+                            "team kind disables phase injection",
+                        );
+                        return Ok(state);
+                    }
                     // M0.7: orchestrator owns the tmux session lifecycle.
                     // Without this call, a fresh project's first tick
                     // (and any tick after a session crash) would error
@@ -1165,7 +1191,9 @@ impl Orchestrator {
                     }
                     self.dispatch_phase(slug, &phase)?;
                     let template = team.templates.iter().find(|t| t.name == phase);
-                    let target_state = if template.is_some_and(|t| t.auto_loop) {
+                    let target_state = if team.should_run_auto_loop()
+                        && template.is_some_and(|t| t.auto_loop)
+                    {
                         // Stop hook (M0.12) drives the loop; orchestrator
                         // only re-enters on phase_done/escalate.
                         let t = template.expect("auto_loop branch implies template present");
@@ -2468,12 +2496,11 @@ fn load_team_runtimes(paths: &CcteamPaths) -> Result<HashMap<String, TeamRuntime
             .and_then(|p| p.parent().map(Path::to_path_buf));
 
         // V0.2 §6.4 candidate 5: evergreen teams (meta-agent) ship
-        // an empty phase set — they're event-loop sessions, not
-        // phase-DAG ones. Skip the phase_dir presence check + the
-        // template load; the resulting TeamRuntime carries an
-        // empty templates Vec and an empty DAG, which `decide_tick`
-        // handles via early NoOp.
-        let (templates, dag) = if spec.evergreen {
+        // an empty phase set. F48 flex teams also carry no phase DAG,
+        // but remain ordinary user projects whose sessions are managed
+        // by the adhoc session layer. Skip phase_dir/template loading
+        // for both.
+        let (templates, dag) = if spec.evergreen || spec.kind.is_flex() {
             let dag = Dag::from_templates(&[]).with_context(|| {
                 format!("team `{}` build empty phase DAG", spec.name)
             })?;
@@ -2542,6 +2569,7 @@ fn load_team_runtimes(paths: &CcteamPaths) -> Result<HashMap<String, TeamRuntime
                 let spec = TeamSpec {
                     name: "dev".into(),
                     aliases: Vec::new(),
+                    kind: crate::team::TeamKind::Workflow,
                     description: "Software development team (legacy fallback)".into(),
                     retro_schema: Vec::new(),
                     critic_dimensions: Vec::new(),
@@ -2600,7 +2628,7 @@ fn build_project_team_runtime(
     let spec = resolve_team(&state.team, &ctx)
         .with_context(|| format!("project-layer resolve team `{}`", state.team))?;
 
-    if spec.evergreen {
+    if spec.evergreen || spec.kind.is_flex() {
         let dag = Dag::from_templates(&[]).with_context(|| {
             format!("team `{}` build empty phase DAG (project layer)", spec.name)
         })?;
@@ -2705,6 +2733,33 @@ pub fn intersect_open_decisions_with_required_inputs(
 #[cfg(test)]
 mod config_tests {
     use super::*;
+
+    fn runtime_for_kind(kind: &str) -> TeamRuntime {
+        let spec = TeamSpec::parse(&format!("name: sample\nkind: {kind}\n")).unwrap();
+        TeamRuntime {
+            spec,
+            templates: Vec::new(),
+            dag: Dag::from_templates(&[]).unwrap(),
+        }
+    }
+
+    #[test]
+    fn f48_team_runtime_helpers_gate_phase_machinery_by_kind() {
+        let workflow = runtime_for_kind("workflow");
+        assert!(workflow.should_run_auto_loop());
+        assert!(workflow.should_inject_phase());
+        assert!(workflow.should_check_golden_rules());
+
+        let multi = runtime_for_kind("multi_workflow");
+        assert!(multi.should_run_auto_loop());
+        assert!(multi.should_inject_phase());
+        assert!(multi.should_check_golden_rules());
+
+        let flex = runtime_for_kind("flex");
+        assert!(!flex.should_run_auto_loop());
+        assert!(!flex.should_inject_phase());
+        assert!(!flex.should_check_golden_rules());
+    }
 
     #[test]
     fn default_claude_argv_enables_1m_context() {
