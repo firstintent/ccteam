@@ -5,7 +5,7 @@
 {% block content %}
     <h1>Projects ({{ projects.len() }})</h1>
     {% if projects.is_empty() %}
-        <p class="empty">No projects under <code>{{ projects_root }}</code> yet. Run <code>cct new ...</code> to start one.</p>
+        <p class="empty">No projects under <code>{{ projects_root }}</code> yet. Run <code>ccteam new ...</code> to start one.</p>
     {% else %}
     <table>
         <thead>

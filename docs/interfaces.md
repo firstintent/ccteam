@@ -1745,7 +1745,7 @@ pub fn peek_pane(slug: &str, lines: Option<usize>) -> Result<PaneCapture, CoreEr
 
 ## 15. Web UI 路由(V0.3 M5.1+)
 
-> V0.3 M5.1 起 `cct web --bind <addr>` 暴露本地 / 局域网 web UI。
+> V0.3 M5.1 起 `ccteam web --bind <addr>` 暴露本地 / 局域网 web UI。
 > 路由分两组:**stateless**(健康探针)+ **stateful**(消费 `CcteamPaths`
 > 的 dashboard / 项目详情 / 静态资源)。本节列 M5.1 ship 的全部路由;M5.2
 > 加 `/sse/all` + `/sse/project/<slug>` + `/screenshot/<slug>.png`,
@@ -1803,7 +1803,7 @@ CLAUDE.md §三 read-only 红线)。
 - `style.css` ← `crates/ccteam-web/assets/style.css`(本仓自写 ~3 KB,
   monospace + dark-mode-friendly)
 
-二者均通过 `include_bytes!` 编译期打包进 `cct` binary;`cct web` 自包含
+二者均通过 `include_bytes!` 编译期打包进 `ccteam` binary;`ccteam web` 自包含
 启动,无 npm / Vite / build toolchain 依赖,模仿 V0.2.2 F38 vendored TTF
 模式。`Cache-Control: public, max-age=31536000, immutable` — 同一 binary
 版本下 bytes 永不变,新版 binary 释放后自然 ID 变更触发 cache miss。
