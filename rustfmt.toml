@@ -1,0 +1,15 @@
+# ccteam rustfmt config — pins house style so contributors don't bikeshed
+# whitespace. Stable rustfmt only (no `unstable_features = true`); CI and
+# `cargo fmt --check` must run on stable.
+#
+# **Apply to new / heavily-edited files only.** Pre-existing codebase carries
+# a known fmt drift (~4-5 kLOC); a workspace-wide `cargo fmt --all` sweep
+# explodes diffs and breaks reviewability. See CLAUDE.md §七 for the rule.
+
+edition = "2021"
+max_width = 100
+hard_tabs = false
+tab_spaces = 4
+newline_style = "Unix"
+use_field_init_shorthand = true
+use_try_shorthand = true
