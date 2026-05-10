@@ -1,17 +1,14 @@
-//! `cct-control` + `cct-team-author` skill installation (M1.8 + M0.22.1).
+//! `ccteam-control` + `ccteam-team-author` skill installation (M1.8 + M0.22.1).
 //!
 //! Skills live at `~/.claude/skills/<name>/SKILL.md` (or under a plugin
-//! tree). The `cct-control` and `cct-team-author` skill bodies are
+//! tree). The `ccteam-control` and `ccteam-team-author` skill bodies are
 //! shipped inside the binary and written to disk by
-//! `cct doctor --install-skill`. The `--install-meta-agent` path also
+//! `ccteam doctor --install-skill`. The `--install-meta-agent` path also
 //! calls this so a freshly-bootstrapped meta-agent has both skills on
 //! first launch.
 //!
-//! V0.2.2 F39: skill names migrated from `ccteam-{control,team-author}`
-//! to `cct-{control,team-author}`; the markdown bodies live under the
-//! repo-root `skills/` directory (cross-dir `include_str!` into the
-//! ccteam-core binary). Migration of V0.1/V0.2 user installs is handled
-//! by `cct doctor` (see `migrate_legacy_skill_dirs` in tool_surface).
+//! The markdown bodies live under the repo-root `skills/` directory
+//! (cross-dir `include_str!` into the ccteam-core binary).
 
 use std::path::{Path, PathBuf};
 
@@ -20,49 +17,51 @@ use anyhow::{Context, Result};
 use crate::tool_surface::user_claude_dir;
 
 /// Skill directory name. Embedded SKILL.md ships under this folder
-/// inside `~/.claude/skills/`. V0.2.2 F39: `ccteam-control` → `cct-control`.
-pub const CCT_CONTROL_SKILL_NAME: &str = "cct-control";
+/// inside `~/.claude/skills/`.
+pub const CCTEAM_CONTROL_SKILL_NAME: &str = "ccteam-control";
 
-/// V0.2 M0.22.1 — `cct-team-author` skill name. Walks the
+/// V0.2 M0.22.1 — `ccteam-team-author` skill name. Walks the
 /// meta-agent through the team-factory dialogue (phase list, tools,
 /// golden rules, retro / verdict schema, plugin metadata) before
-/// invoking `cct team init`.
-///
-/// V0.2.2 F39: renamed from `ccteam-team-author`.
-pub const CCT_TEAM_AUTHOR_SKILL_NAME: &str = "cct-team-author";
+/// invoking `ccteam team init`.
+pub const CCTEAM_TEAM_AUTHOR_SKILL_NAME: &str = "ccteam-team-author";
 
-/// V0.2.2 F34 — `cct-project-creator` skill name. Walks the
+/// V0.2.2 F34 — `ccteam-project-creator` skill name. Walks the
 /// meta-agent through the four-phase project-creation dialogue
 /// (clarify brief → recommend slug → pick team → dispatch via
-/// `cct new`). Replaces the inline `meta_agent_role.md` §2 dispatch
+/// `ccteam new`). Replaces the inline `meta_agent_role.md` §2 dispatch
 /// flow with a structured AskUserQuestion-driven UX.
-pub const CCT_PROJECT_CREATOR_SKILL_NAME: &str = "cct-project-creator";
+pub const CCTEAM_PROJECT_CREATOR_SKILL_NAME: &str = "ccteam-project-creator";
 
-/// V0.2.2 F39: legacy V0.1/V0.2 skill directory names that
-/// `cct doctor` migrates. Exposed so the migration helper can scan
-/// for stale installs without re-declaring the names.
-pub const LEGACY_SKILL_NAMES: &[&str] = &["ccteam-control", "ccteam-team-author"];
+/// V0.2.2 F44: legacy V0.2.2 (F39'd) skill directory names that
+/// `ccteam doctor` migrates back. Exposed so the migration helper can
+/// scan for stale `cct-*` installs without re-declaring the names.
+pub const LEGACY_SKILL_NAMES: &[&str] = &[
+    "cct-control",
+    "cct-team-author",
+    "cct-project-creator",
+];
 
 /// Embedded `SKILL.md` body. Written verbatim during install.
 ///
-/// V0.2.2 F39: skill bodies live at `<repo>/skills/cct-<name>/SKILL.md`
+/// Skill bodies live at `<repo>/skills/ccteam-<name>/SKILL.md`
 /// (top-level `skills/` directory) so they're authoritative outside
 /// the Rust source tree.
-pub const CCT_CONTROL_SKILL_MD: &str = include_str!(concat!(
+pub const CCTEAM_CONTROL_SKILL_MD: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../skills/cct-control/SKILL.md"
+    "/../../skills/ccteam-control/SKILL.md"
 ));
 
 /// Embedded `SKILL.md` body for the team-author skill (V0.2 M0.22.1).
-pub const CCT_TEAM_AUTHOR_SKILL_MD: &str = include_str!(concat!(
+pub const CCTEAM_TEAM_AUTHOR_SKILL_MD: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../skills/cct-team-author/SKILL.md"
+    "/../../skills/ccteam-team-author/SKILL.md"
 ));
 
 /// Embedded `SKILL.md` body for the project-creator skill (V0.2.2 F34).
-pub const CCT_PROJECT_CREATOR_SKILL_MD: &str = include_str!(concat!(
+pub const CCTEAM_PROJECT_CREATOR_SKILL_MD: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../skills/cct-project-creator/SKILL.md"
+    "/../../skills/ccteam-project-creator/SKILL.md"
 ));
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -88,40 +87,40 @@ pub enum SkillInstallAction {
     DryRun { would_write: bool },
 }
 
-/// Install the `cct-control` skill into `~/.claude/skills/cct-control/SKILL.md`.
-pub fn install_cct_control_skill(opts: InstallSkillOptions) -> Result<InstallSkillReport> {
+/// Install the `ccteam-control` skill into `~/.claude/skills/ccteam-control/SKILL.md`.
+pub fn install_ccteam_control_skill(opts: InstallSkillOptions) -> Result<InstallSkillReport> {
     let claude = user_claude_dir().context("resolve ~/.claude/")?;
     install_into(&claude, opts)
 }
 
-/// V0.2 M0.22.1: install the `cct-team-author` skill into
-/// `~/.claude/skills/cct-team-author/SKILL.md`. Same idempotent
-/// semantics as `install_cct_control_skill`.
-pub fn install_cct_team_author_skill(
+/// V0.2 M0.22.1: install the `ccteam-team-author` skill into
+/// `~/.claude/skills/ccteam-team-author/SKILL.md`. Same idempotent
+/// semantics as `install_ccteam_control_skill`.
+pub fn install_ccteam_team_author_skill(
     opts: InstallSkillOptions,
 ) -> Result<InstallSkillReport> {
     let claude = user_claude_dir().context("resolve ~/.claude/")?;
     install_skill_body_into(
         &claude,
-        CCT_TEAM_AUTHOR_SKILL_NAME,
-        CCT_TEAM_AUTHOR_SKILL_MD,
+        CCTEAM_TEAM_AUTHOR_SKILL_NAME,
+        CCTEAM_TEAM_AUTHOR_SKILL_MD,
         opts,
     )
 }
 
-/// V0.2.2 F34: install the `cct-project-creator` skill into
-/// `~/.claude/skills/cct-project-creator/SKILL.md`. Same idempotent
-/// semantics as `install_cct_control_skill`. Carries the four-phase
+/// V0.2.2 F34: install the `ccteam-project-creator` skill into
+/// `~/.claude/skills/ccteam-project-creator/SKILL.md`. Same idempotent
+/// semantics as `install_ccteam_control_skill`. Carries the four-phase
 /// project-creation dialogue the meta-agent now invokes instead of
 /// inlining dispatch logic in `meta_agent_role.md` §2.
-pub fn install_cct_project_creator_skill(
+pub fn install_ccteam_project_creator_skill(
     opts: InstallSkillOptions,
 ) -> Result<InstallSkillReport> {
     let claude = user_claude_dir().context("resolve ~/.claude/")?;
     install_skill_body_into(
         &claude,
-        CCT_PROJECT_CREATOR_SKILL_NAME,
-        CCT_PROJECT_CREATOR_SKILL_MD,
+        CCTEAM_PROJECT_CREATOR_SKILL_NAME,
+        CCTEAM_PROJECT_CREATOR_SKILL_MD,
         opts,
     )
 }
@@ -131,8 +130,8 @@ pub fn install_cct_project_creator_skill(
 pub fn install_into(claude_dir: &Path, opts: InstallSkillOptions) -> Result<InstallSkillReport> {
     install_skill_body_into(
         claude_dir,
-        CCT_CONTROL_SKILL_NAME,
-        CCT_CONTROL_SKILL_MD,
+        CCTEAM_CONTROL_SKILL_NAME,
+        CCTEAM_CONTROL_SKILL_MD,
         opts,
     )
 }
@@ -191,17 +190,19 @@ mod tests {
         assert_eq!(report.action, SkillInstallAction::Wrote);
         assert!(report.target.exists());
         let body = std::fs::read_to_string(&report.target).unwrap();
-        // V0.2.2 F39: bodies are wrapped in `<!-- ccteam-managed:skill begin/end -->`
-        // markers; the YAML front matter follows the open marker.
+        // Bodies are wrapped in `<!-- ccteam-managed:skill begin/end -->`
+        // markers so the F44 reverse migration can detect ccteam-managed
+        // installs (vs. user hand-edits) when sweeping legacy `cct-*`
+        // skill directories.
         assert!(
             body.contains("<!-- ccteam-managed:skill begin -->"),
-            "must contain ccteam-managed begin marker (F39 migration prerequisite)",
+            "must contain ccteam-managed begin marker (F44 migration prerequisite)",
         );
         assert!(
             body.contains("<!-- ccteam-managed:skill end -->"),
             "must contain ccteam-managed end marker",
         );
-        assert!(body.contains("---\nname: cct-control"));
+        assert!(body.contains("---\nname: ccteam-control"));
         assert!(body.contains("allowed-tools: [Bash]"));
         // Required body chapters per interfaces §11.3.
         for required in ["Capability index", "Typical workflows", "Decision principles", "What this skill cannot do"] {
@@ -221,12 +222,12 @@ mod tests {
     fn force_overwrites_existing_file() {
         let tmp = tempfile::TempDir::new().unwrap();
         install_into(tmp.path(), InstallSkillOptions::default()).unwrap();
-        let target = tmp.path().join("skills/cct-control/SKILL.md");
+        let target = tmp.path().join("skills/ccteam-control/SKILL.md");
         std::fs::write(&target, "tampered\n").unwrap();
         let r = install_into(tmp.path(), InstallSkillOptions { force: true, dry_run: false }).unwrap();
         assert_eq!(r.action, SkillInstallAction::Replaced);
         let body = std::fs::read_to_string(&target).unwrap();
-        assert!(body.contains("name: cct-control"));
+        assert!(body.contains("name: ccteam-control"));
     }
 
     #[test]
@@ -247,19 +248,19 @@ mod tests {
     // ---------------- V0.2 M0.22.1 team-author skill ----------------
 
     #[test]
-    fn team_author_skill_installs_under_cct_team_author_dir() {
+    fn team_author_skill_installs_under_ccteam_team_author_dir() {
         let tmp = tempfile::TempDir::new().unwrap();
         let report = install_skill_body_into(
             tmp.path(),
-            CCT_TEAM_AUTHOR_SKILL_NAME,
-            CCT_TEAM_AUTHOR_SKILL_MD,
+            CCTEAM_TEAM_AUTHOR_SKILL_NAME,
+            CCTEAM_TEAM_AUTHOR_SKILL_MD,
             InstallSkillOptions::default(),
         )
         .unwrap();
         assert_eq!(report.action, SkillInstallAction::Wrote);
         let body = std::fs::read_to_string(&report.target).unwrap();
         assert!(body.contains("<!-- ccteam-managed:skill begin -->"));
-        assert!(body.contains("name: cct-team-author"));
+        assert!(body.contains("name: ccteam-team-author"));
         assert!(body.contains("Capability index"));
     }
 
@@ -268,15 +269,15 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         install_skill_body_into(
             tmp.path(),
-            CCT_TEAM_AUTHOR_SKILL_NAME,
-            CCT_TEAM_AUTHOR_SKILL_MD,
+            CCTEAM_TEAM_AUTHOR_SKILL_NAME,
+            CCTEAM_TEAM_AUTHOR_SKILL_MD,
             InstallSkillOptions::default(),
         )
         .unwrap();
         let r2 = install_skill_body_into(
             tmp.path(),
-            CCT_TEAM_AUTHOR_SKILL_NAME,
-            CCT_TEAM_AUTHOR_SKILL_MD,
+            CCTEAM_TEAM_AUTHOR_SKILL_NAME,
+            CCTEAM_TEAM_AUTHOR_SKILL_MD,
             InstallSkillOptions::default(),
         )
         .unwrap();
@@ -290,8 +291,8 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let report = install_skill_body_into(
             tmp.path(),
-            CCT_PROJECT_CREATOR_SKILL_NAME,
-            CCT_PROJECT_CREATOR_SKILL_MD,
+            CCTEAM_PROJECT_CREATOR_SKILL_NAME,
+            CCTEAM_PROJECT_CREATOR_SKILL_MD,
             InstallSkillOptions::default(),
         )
         .unwrap();
@@ -299,13 +300,13 @@ mod tests {
         let body = std::fs::read_to_string(&report.target).unwrap();
         assert!(
             body.contains("<!-- ccteam-managed:skill begin -->"),
-            "must carry the ccteam-managed begin marker (F39 migration prerequisite)",
+            "must carry the ccteam-managed begin marker (F44 migration prerequisite)",
         );
         assert!(
             body.contains("<!-- ccteam-managed:skill end -->"),
             "must carry the ccteam-managed end marker",
         );
-        assert!(body.contains("name: cct-project-creator"));
+        assert!(body.contains("name: ccteam-project-creator"));
         // The four-phase dialogue is the body's main contract; if any
         // disappears, the meta-agent silently loses behavior.
         for phase in [
@@ -324,15 +325,15 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         install_skill_body_into(
             tmp.path(),
-            CCT_PROJECT_CREATOR_SKILL_NAME,
-            CCT_PROJECT_CREATOR_SKILL_MD,
+            CCTEAM_PROJECT_CREATOR_SKILL_NAME,
+            CCTEAM_PROJECT_CREATOR_SKILL_MD,
             InstallSkillOptions::default(),
         )
         .unwrap();
         let r2 = install_skill_body_into(
             tmp.path(),
-            CCT_PROJECT_CREATOR_SKILL_NAME,
-            CCT_PROJECT_CREATOR_SKILL_MD,
+            CCTEAM_PROJECT_CREATOR_SKILL_NAME,
+            CCTEAM_PROJECT_CREATOR_SKILL_MD,
             InstallSkillOptions::default(),
         )
         .unwrap();

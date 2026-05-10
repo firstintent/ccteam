@@ -11,7 +11,7 @@ You talk to a **meta-agent** — a permanent Claude Code session that understand
 ```
 You:    "Make a Rust CLI for managing bookmarks, SQLite-backed."
 Meta:   "I'll dispatch the dev team. Slug = dev-bookmark-cli-rust-sqlite.
-         Tracking via `cct show dev-bookmark-cli-rust-sqlite`."
+         Tracking via `ccteam show dev-bookmark-cli-rust-sqlite`."
 [~30 minutes later]
 Meta:   "dev-bookmark-cli-rust-sqlite shipped. 22 tests green, $4.80
          cost, retro lessons appended to ~/.claude/rules/ccteam-lessons-dev.md."
@@ -35,7 +35,7 @@ You:    "I want a team for iterating an existing app: new requirement →
          feasibility → architecture → implementation → tests → release."
 Meta:   "Drafting a custom team. Plugin manifest + 6 phase markdowns
          under ~/.config/ccteam/teams/iter-app/. Run
-         `cct team publish iter-app --target local` when ready."
+         `ccteam team publish iter-app --target local` when ready."
 ```
 
 ## Why ccteam
@@ -75,23 +75,23 @@ ccteam --version
 One-time setup (idempotent — re-runs are no-ops):
 
 ```bash
-cct init                                       # ~/.ccteam/ skeleton
-cct doctor --install-skill                     # cct-control skill (any claude session reaches ccteam)
-cct doctor --install-mcp                       # 9-tool MCP server in ~/.claude.json
-cct doctor --install-memory-bridge             # ~/.claude/rules/ccteam-lessons-<team>.md placeholders
-cct doctor --install-meta-agent <your-handle>  # bootstrap your meta-agent project
-cct doctor --tool-surface                      # health check (must be green)
+ccteam init                                       # ~/.ccteam/ skeleton
+ccteam doctor --install-skill                     # ccteam-control skill (any claude session reaches ccteam)
+ccteam doctor --install-mcp                       # 9-tool MCP server in ~/.claude.json
+ccteam doctor --install-memory-bridge             # ~/.claude/rules/ccteam-lessons-<team>.md placeholders
+ccteam doctor --install-meta-agent <your-handle>  # bootstrap your meta-agent project
+ccteam doctor --tool-surface                      # health check (must be green)
 ```
 
 `<your-handle>` is whatever you want to call yourself — snake_case, e.g. `rob` or `alice`.
 
-> **Upgrading from a pre-2026-05 ccteam?** Run `cct doctor --migrate-recommended-agents` once after the upgrade. Spawned project sessions now resolve plugin agents through Claude Code's plugin pipeline, so the legacy `~/.claude/agents/<name>.md` symlinks ccteam used to create are obsolete; this command removes them. User-authored agents are preserved.
+> **Upgrading from a pre-2026-05 ccteam?** Run `ccteam doctor --migrate-recommended-agents` once after the upgrade. Spawned project sessions now resolve plugin agents through Claude Code's plugin pipeline, so the legacy `~/.claude/agents/<name>.md` symlinks ccteam used to create are obsolete; this command removes them. User-authored agents are preserved.
 
 ## Quick start
 
 ```bash
 # Terminal A — start the orchestrator (foreground; keep this open)
-cct start --foreground
+ccteam start --foreground
 
 # Terminal B — talk to the meta-agent
 tmux attach -t ccteam-meta-<your-handle>
@@ -112,7 +112,7 @@ claude
 # Or:   "Dispatch a dev team to make a todo CLI in Python."
 ```
 
-The meta-agent uses the `cct-control` skill plus the `ccteam-mcp` 9-tool MCP server you installed, so any Claude Code session understands ccteam.
+The meta-agent uses the `ccteam-control` skill plus the `ccteam-mcp` 9-tool MCP server you installed, so any Claude Code session understands ccteam.
 
 ## Built-in teams
 
@@ -131,11 +131,11 @@ To author a custom team, ask the meta-agent:
 The meta-agent walks you through phase definition, tools required, golden-rule constraints, and retro-schema fields, then scaffolds the plugin under `~/.config/ccteam/teams/<name>/`. Publish with:
 
 ```bash
-cct team publish <name> --target local              # link into ccteam-local marketplace
-cct team publish <name> --target github --repo ...  # push to a GitHub repo as a shareable plugin
+ccteam team publish <name> --target local              # link into ccteam-local marketplace
+ccteam team publish <name> --target github --repo ...  # push to a GitHub repo as a shareable plugin
 ```
 
-Anyone who installs your team-plugin via Claude Code's plugin commands gets a fully-functional cct team.
+Anyone who installs your team-plugin via Claude Code's plugin commands gets a fully-functional ccteam team.
 
 ## How it works
 

@@ -1,10 +1,10 @@
 //! M3.5 research E2E (mock claude / state-machine drive).
 //!
-//! M3 唯一验收: `cct new --team=research "AI 菜谱生成器"` runs
+//! M3 唯一验收: `ccteam new --team=research "AI 菜谱生成器"` runs
 //! through the 6-phase pipeline → verdict=REJECT, produces verdict.md /
 //! rationale.md / next-steps.md; progress.jsonl includes ≥1
 //! decision_mode=async outbox + ≥1 team-specific ESCALATE prefix +
-//! ≥1 PHASE_DONE_PENDING; `cct decisions` sees the project's
+//! ≥1 PHASE_DONE_PENDING; `ccteam decisions` sees the project's
 //! pending decisions.
 //!
 //! V0.2.2 F40 — team renamed from `product-research` to `research`
@@ -509,7 +509,7 @@ fn decisions_queue_lists_clarify_outbox_from_product_research_project() {
 /// CCTEAM_HOME / CCTEAM_PROJECTS_ROOT redirected to the test sandbox.
 /// Returns the captured stdout on success.
 fn run_ccteam_subcommand(paths: &CcteamPaths, args: &[&str]) -> anyhow::Result<String> {
-    let bin = env!("CARGO_BIN_EXE_cct");
+    let bin = env!("CARGO_BIN_EXE_ccteam");
     let out = Command::new(bin)
         .args(args)
         .env("CCTEAM_HOME", paths.root.as_os_str())

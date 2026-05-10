@@ -1,10 +1,10 @@
 <!-- ccteam-managed:skill begin -->
 ---
-name: cct-project-creator
+name: ccteam-project-creator
 description: |
   When the user wants to create a new ccteam project — walk a four-phase
   dialogue: clarify the brief, recommend a slug, pick a team, and dispatch
-  via `cct new`. Use when the user says "新项目" / "建一个 X" / "做个 X" /
+  via `ccteam new`. Use when the user says "新项目" / "建一个 X" / "做个 X" /
   "做一个 X" / "调研 X" / "评估 X 值不值" / "看看 X 能不能做". Primary
   consumer is the ccteam meta-agent session; the skill assumes
   `AskUserQuestion` is available (which is true inside the meta-agent
@@ -13,10 +13,10 @@ description: |
 allowed-tools: [Bash, AskUserQuestion]
 ---
 
-# cct-project-creator
+# ccteam-project-creator
 
 You are a **project-creation dialogue guide**, not a worker. After this
-skill finishes, you call `cct new --slug <slug> --team <team>
+skill finishes, you call `ccteam new --slug <slug> --team <team>
 "<refined brief>"` to dispatch the project to a fresh ccteam session.
 **You do not write code, do not scaffold, do not run `git init` /
 `cargo new` — the dispatched session does all of that.**
@@ -67,7 +67,7 @@ Compose a recommended slug from the brief + Phase A answer:
   → `hermestrade-dex`).
 - **No verb-leading**: use `todo-cli`, not `build-todo-cli`.
 - **2-4 tokens, kebab-case, `[a-z0-9-]+`, ≤ 60 chars.**
-- **Do not include the team prefix** — `cct new` adds it automatically
+- **Do not include the team prefix** — `ccteam new` adds it automatically
   (B2 prefix semantics, PRD §3.2.1).
 
 Confirm with `AskUserQuestion`:
@@ -130,12 +130,12 @@ alias,canonical 名是 `research`;新派单一律用 `research`。)
 Run the CLI:
 
 ```bash
-cct new --slug <slug> --team <team> "<refined brief>"
+ccteam new --slug <slug> --team <team> "<refined brief>"
 ```
 
 Use the brief from Phase A (incorporating the user's clarification) as
 the request body. The slug is whatever Phase B settled on; `--slug`
-makes `cct new` skip the Tier 3 `claude -p` smart-suggestion path.
+makes `ccteam new` skip the Tier 3 `claude -p` smart-suggestion path.
 
 After dispatch, write an outbox `event_kind: reply` (per
 `meta_agent_role.md` §8) telling the user:
@@ -146,10 +146,10 @@ After dispatch, write an outbox `event_kind: reply` (per
     questions you'll see in the decisions queue.
   - **research** → `kickoff` runs first and may immediately
     reverse-interview before doing any research.
-- Follow-up commands: `cct show <slug>` for state, `cct attach <slug>`
+- Follow-up commands: `ccteam show <slug>` for state, `ccteam attach <slug>`
   for live tmux.
 
-Do **not** announce the dispatch before `cct new` returns successfully —
+Do **not** announce the dispatch before `ccteam new` returns successfully —
 if the CLI errors out (eg unknown team), surface the error to the user
 and re-run Phase C with the corrected team.
 
@@ -160,7 +160,7 @@ and re-run Phase C with the corrected team.
 - ❌ Never runs `git clone`, `cargo new`, `npm init` itself.
 - ❌ Never dispatches more than one project per invocation.
 - ❌ Never asks the user > 1 clarifying question per phase.
-- ❌ Never bypasses `cct new` — even if the user says "just do it" the
+- ❌ Never bypasses `ccteam new` — even if the user says "just do it" the
   ccteam pipeline is the only path that gets progress / cost / context
   / Seed Gate / Critic guarantees.
 

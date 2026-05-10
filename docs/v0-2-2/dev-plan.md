@@ -1088,14 +1088,78 @@ EOF
 | #5 F38 | 631 | +~20(ANSI_256 / vt100_color / render smoke / degrade)| ~651 |
 | #6 F40 | 651 | +~10(alias resolution / deprecation warn)| ~661 |
 | #7 chore | 661 | 0(配套不加测试,跑全集)| **~661** |
+| #8 F44 | 628(post-retro) | +2(反向迁移测试;F39 13 个 forward 测试 in-place flip 不计净增)| **631** |
 
-**V0.2.2 ship 测试 baseline 预估:~660+**(对照 V0.2.1 = 511,+ ~150)。clippy
-不新增 warning(4 pre-existing 不算)。
+**V0.2.2 ship 测试 baseline 实测**:628(F41-F43 dust patch 后)→ F44 ship 631。
+clippy 不新增 warning(4 pre-existing 不算)。
+
+---
+
+## 13. PR #8 — F44 revert F39 cct convention sweep
+
+> **目标**:整体反向 PR #1 (F39) 的所有改动 — binary 名 `cct` → `ccteam`、
+> skill `cct-*` → `ccteam-*`、Rust API、placeholder、docs sweep + V0.2.2(F39'd)
+> → V0.2.2(F44'd) 反向迁移逻辑。**不 bump workspace.version**(继续 `0.2.2`,
+> 跟 F41-F43 dust patch 同 umbrella)。
+
+**关联 PRD**:§11(F44 全文)+ §8(F39 全文,不修改作为历史记录)
+
+### 任务
+
+- [x] **#8.1** binary rename 反向
+  - `crates/ccteam-cli/Cargo.toml::[[bin]] name` `"cct"` → `"ccteam"`
+  - Rust 内 `current_cct_bin()` 改回 `current_ccteam_bin()`(全 callsite)
+  - `Makefile` 早已是 `BIN_NAME := ccteam`(F39 漏改),F44 不动
+- [x] **#8.2** 顶层 `skills/` 目录反向 rename
+  - `git mv skills/cct-{control,team-author,project-creator}/ skills/ccteam-{control,team-author,project-creator}/`
+  - SKILL.md frontmatter `name:` 字段 + body 内字面 `cct` 命令例子全 sweep
+- [x] **#8.3** Rust 常量 / 函数名反向
+  - `CCT_*_SKILL_{NAME,MD}` → `CCTEAM_*_SKILL_{NAME,MD}`
+  - `install_cct_*_skill` → `install_ccteam_*_skill`
+  - `LEGACY_SKILL_NAMES` 内容反向(`ccteam-*` → `cct-*`,变成 F39 era 的反向迁移目标)
+- [x] **#8.4** placeholder 反向
+  - `crates/ccteam-core/src/templates/settings.json` `{{CCT_BIN}}` → `__CCTEAM_BIN__`
+  - `crates/ccteam-core/src/templates.rs::render_project_settings` 替换串同步
+- [x] **#8.5** F39 → F44 反向迁移逻辑(`ccteam doctor`)
+  - 检测 `~/.claude/skills/cct-{control,team-author,project-creator}/` marker / frontmatter,匹配则 `rm -rf`,不匹配保留 + warn
+  - `~/projects/<slug>/.claude/settings.json` hook command `/cct hook ` → `/ccteam hook `(原子写,`json.ccteam-migrate.tmp` 临时文件)
+  - 检测 `~/.local/bin/cct` / `~/.cargo/bin/cct` 旧 symlink — warn,不主动删
+- [x] **#8.6** 测试反向
+  - `tool_surface.rs` 内 13 个 F39 migration 测试 fixtures `ccteam-*` → `cct-*` flip(in-place,test 数量不变)
+  - 加 2 反向专属测试:`migrate_legacy_skill_dirs_handles_project_creator`、`migrate_legacy_skill_dirs_idempotent_after_first_run`
+  - `commands.rs` 内 doctor F39 测试改名 → F44(逻辑相同,fixtures 反向)
+- [x] **#8.7** docs sweep 反向
+  - `README.md` / `docs/{tech-design,interfaces,requirements,dev-coupling-audit}.md`:`cct <cmd>` → `ccteam <cmd>`(forward-looking 段)
+  - `crates/ccteam-core/src/templates/{meta_agent_role,memory_bridge_*}.md`:全 `cct` → `ccteam`
+  - `CLAUDE.md` 三处:§三 删除 cct 红线、§四 Skills 行回到 `ccteam-*`、§六 V0.2 → V0.2.2 entry 改为 F39 → F44 反向迁移
+  - `docs/v0-2-2/{prd.md,dev-plan.md,README.md}`:加 F44 章节(本节);F39 §8 / PR #1 §2 全文不动作为历史
+  - `docs/v0-1/` / `docs/v0-2/` 历史归档不动
+  - `docs/v0-2-2/e2e-retro.md` 不动(F39 ship 时的快照,反映当时实情)
+
+### 验收
+
+- [x] `crates/ccteam-cli/Cargo.toml::[[bin]] name = "ccteam"`,`cargo build --release` 产物 = `ccteam`
+- [x] `skills/ccteam-{control,team-author,project-creator}/SKILL.md` 三个 ship,frontmatter `name:` = `ccteam-*`,body 命令字面量 `ccteam <cmd>`
+- [x] `skill.rs` 三常量 + 三 install 函数全反向 rename
+- [x] `settings.json` 模板用 `__CCTEAM_BIN__`,`render_project_settings` 替换正确
+- [x] `git grep -nE '\bcct\b' -- ':!docs/v0-2-2/prd.md' ':!docs/v0-2-2/dev-plan.md' ':!docs/v0-2-2/README.md' ':!docs/v0-2-2/e2e-retro.md' ':!docs/dev-coupling-audit.md' ':!docs/v0-1' ':!docs/v0-2/'` 在 forward-looking 源码 / 文档命中 0(F44 PRD / dev-plan / README + dev-coupling-audit F39 历史 + tool_surface.rs 反向迁移逻辑内 `cct-*` 检测字符串除外)
+- [x] `cargo test --workspace` 全绿,628 → 631(F39 in-place flip 不计净增,纯加 2 测试)
+- [x] clippy 不新增 warning
+
+### 文档同步
+
+- `CLAUDE.md` §一 baseline 表格 `628 → 631`、§六 反向迁移条目
+- `docs/v0-2-2/{README,prd,dev-plan}.md` 三个加 F44
+- `docs/dev-coupling-audit.md` F39 标 "已 F44 反向" + F44 新增条目
+- `docs/v0-2-2/e2e-retro.md` 不动(历史 e2e 快照)
 
 ---
 
 ## Changelog
 
+- 2026-05-10:**F44 PR #8 追加** — 用户 2026-05-10 反馈 `/usr/bin/cct` 已被
+  Ubuntu `proj-bin`(PROJ GIS)占用 → F39 整体反向回滚为 PR #8。本 dev-plan
+  加 §13 PR #8 任务清单 + 测试 baseline 表加一行。F39 PR #1 (§2) 全文不动。
 - 2026-05-09:初稿。基于 `docs/v0-2-2/prd.md` + V0.2 dev-plan 风格参考拆 7 PR
   (F39 / F34+F37 / F35 / F36 / F38 / F40 / chore),~1.65 kLOC / ~3 周。每 PR
   worktree subagent briefing 模板就位,subagent 拿到模板 + 进 worktree 即可开干。

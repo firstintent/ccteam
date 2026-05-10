@@ -9,7 +9,7 @@ paths:
 
 Auto-populated by the ccteam `ship` phase retro segment. The retro segment
 overwrites only the marked block below — anything you write outside of it is
-preserved across `cct doctor --install-memory-bridge` re-runs.
+preserved across `ccteam doctor --install-memory-bridge` re-runs.
 
 Field layout matches `teams/dev.yaml.retro_schema`:
 

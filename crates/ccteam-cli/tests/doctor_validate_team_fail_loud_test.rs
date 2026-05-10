@@ -16,7 +16,7 @@ fn run_doctor_validate(
     xdg: &std::path::Path,
     team: &str,
 ) -> std::process::Output {
-    let bin = env!("CARGO_BIN_EXE_cct");
+    let bin = env!("CARGO_BIN_EXE_ccteam");
     Command::new(bin)
         .arg("doctor")
         .arg("--validate-team")

@@ -1205,7 +1205,68 @@ PR #3 / #4 / #5 跟 #1 解耦,可平行起 worktree;merge 顺序仍按 PR # 推�
 
 ---
 
-## 11. 不在范围 / V0.3 deferred
+## 11. F44 — 反向 F39 cct convention sweep,恢复 ccteam 二进制
+
+> **追加**:2026-05-10。本节作为 F39 的反向回滚 ship 记录;§8 F39 PRD 全文保
+> 留作历史,不修改。F44 是 V0.2.2 umbrella 的第 8 个 finding(PR #8),不 bump
+> workspace version(继续 0.2.2)。
+
+### 11.1 问题
+
+`/usr/bin/cct` 已被 Ubuntu `proj-bin` 包占用(PROJ — Coordinate Conversion
+and Transformation,标准 GIS 工具)。F39 (PR #1, 2026-05-09) 选 `cct` 二进制名
+时未检查这个 namespace。在标准 Ubuntu PATH(`~/.local/bin` 在 `/usr/bin` 之
+前)上,`~/.local/bin/cct` 会**静默 shadow** 系统 PROJ 工具 — 任何跑 GIS
+作业的用户都会被 ccteam binary 替换掉真正的 PROJ `cct`。这是隐蔽的 silent-
+substitute footgun。用户 2026-05-10 实测命中,决定 F39 整体反向回滚。
+
+### 11.2 设计 — 全反向 F39 四类改动
+
+四个类目逐项 mirror-image 反向(详 §8.2.1-§8.2.6):
+
+| F39 改动 | F44 反向 |
+|---|---|
+| `[[bin]] name = "cct"` | → `name = "ccteam"` |
+| skill `cct-{control,team-author,project-creator}/` | → `ccteam-{control,team-author,project-creator}/` |
+| Rust API `current_cct_bin` / `install_cct_*_skill` / `CCT_*_SKILL_NAME` | → `current_ccteam_bin` / `install_ccteam_*_skill` / `CCTEAM_*_SKILL_NAME` |
+| placeholder `{{CCT_BIN}}` | → `__CCTEAM_BIN__`(回到 F39 之前的命名)|
+| docs sweep `cct <cmd>` | → `ccteam <cmd>` |
+| CLAUDE.md §三 cct 红线 / §四 Skills 行 / §六 升级条目 | → 红线删除、Skills 行回到 ccteam-*、迁移条目改为 F39 → F44 反向 |
+
+### 11.3 反向迁移(`ccteam doctor`)
+
+镜像 F39 的 V0.1/V0.2 → V0.2.2 迁移逻辑,加一份 F39'd V0.2.2 → F44'd V0.2.2 反向:
+
+| 检测 | 行为 |
+|---|---|
+| `~/.local/bin/cct`(或 `~/.cargo/bin/cct`)指向 ccteam binary | warn "old `cct` binary detected; safe to `rm` (V0.2.2 F44 起命令名回退到 `ccteam`)";不主动删 |
+| `~/.claude/skills/cct-control/` 存在 | marker (`<!-- ccteam-managed:skill -->`) **OR** 顶 frontmatter `name: cct-control` 命中 → `rm -rf`;均不命中(用户手改)→ 保留 + warn |
+| `~/.claude/skills/cct-team-author/` 同上 | 同上 |
+| `~/.claude/skills/cct-project-creator/` 同上 | 同上 |
+| `~/projects/<slug>/.claude/settings.json` hook command 含 `/cct hook ` 或 `cct hook ` | atomic rewrite 为 `<current_exe>/ccteam hook ...`(`current_exe()` 是 ccteam 真实路径);保留所有其他 JSON 字段 |
+
+`ccteam doctor`(裸调用)+ `ccteam doctor --install-skill` / `--install-meta-agent`
+都会触发,跟 F39 forward 模式一致。
+
+### 11.4 不做(per F39 §8.3 已保留,F44 继续保留)
+
+- **MCP server name**:`mcpServers.ccteam` 不动 — F39 没改,F44 也不改
+- **`~/.config/ccteam/` XDG / `~/.ccteam/` 项目根**:不改
+- **Cargo workspace / crate 名**:`crates/ccteam-{cli,core,hooks}` 不改
+- **git repo / cargo workspace 名**:不改
+
+### 11.5 测试影响
+
+F39 加了 13 个 forward migration 测试。F44 把它们 in-place 反向(fixtures 从
+`ccteam-*` flip 成 `cct-*`,assertions 反向)— test 总数稳定。新增 2 个
+反向迁移专属测试(`migrate_legacy_skill_dirs_handles_project_creator` /
+`migrate_legacy_skill_dirs_idempotent_after_first_run`)。
+
+`cargo test --workspace` baseline:F39 ship 后 628 → F44 ship 631(+2 净增)。
+
+---
+
+## 12. 不在范围 / V0.3 deferred
 
 - **slug rename**:state.json / `~/.claude/rules/` paths regex / tmux session 全条线迁移
 - **MCP 工具 `mcp__ccteam__interrupt(slug)`**:V0.3 跟 channel layer 一起评估 ergonomics
@@ -1229,7 +1290,7 @@ PR #3 / #4 / #5 跟 #1 解耦,可平行起 worktree;merge 顺序仍按 PR # 推�
 
 ---
 
-## 12. Workspace version bump
+## 13. Workspace version bump
 
 `Cargo.toml::workspace.package.version` `"0.0.1"` → `"0.2.2"`。retroactive 修正
 (V0.1 / V0.2 ship 时未 sync,V0.2.1 PR 也未 sync)。新政策:每个 minor / patch
@@ -1240,7 +1301,7 @@ release **必须 bump** + 在 commit message subject 一致(`v0.2.2: ...`)。
 
 ---
 
-## 13. CLAUDE.md dev-flow 追加段(草案)
+## 14. CLAUDE.md dev-flow 追加段(草案)
 
 落到 `CLAUDE.md` §五 PR / 实现纪律 末尾,新增小节:
 
@@ -1262,6 +1323,12 @@ release **必须 bump** + 在 commit message subject 一致(`v0.2.2: ...`)。
 
 ## Changelog
 
+- 2026-05-10:**F44 反向 F39** — 用户 2026-05-10 反馈:`/usr/bin/cct` 已被
+  Ubuntu `proj-bin` 包(PROJ Coordinate Conversion / GIS 工具)占用,F39 选
+  `cct` 名字时未检查此 namespace。`~/.local/bin/cct` 在标准 PATH 上前置会静默
+  shadow 系统 PROJ 工具 — silent-substitute footgun。决策:**整体反向 F39**,
+  保留 V0.2.2 umbrella(继续 `0.2.2`,不 bump version),作为单 PR #8。F44
+  PRD 写为 §11(本节);F39 §8 全文不动,作为历史记录。
 - 2026-05-09:**F39 抽出独立 finding** — 用户连追三条:`ccteam-control` skill
   前缀改 `cct-control` → 二进制 `ccteam` → `cct` → CLAUDE.md 加 `cct` 约定。三条
   同源 = "cct 短前缀约定 sweep",归并为 F39。F39 退出 F34 scope,改成独立 PR #1

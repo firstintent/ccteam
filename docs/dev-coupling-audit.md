@@ -679,7 +679,7 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
 - **文件:行号**:`crates/ccteam-core/src/projects.rs::pick_unused_slug` 字符级 slugify(40-char cap,无 token / 语义层裁剪);`crates/ccteam-cli/src/main.rs::Commands::New` 缺 `--slug` 接口
 - **现状**:brief 整段 slugify 撞死冗长 slug(`dev-ccteam-ui-ccteam-1-2-session-subagent-3` ≠ 用户原话 `ccteam-ui`);meta-agent 派单前不确认项目名,用户后悔无路(slug 重命名不支持)。
 - **是否真 dev-specific**:**否——通用 UX 缺陷**。
-- **解耦方案**:四层调用栈 — Tier 1 `cct new --slug X`(B2 prefix 自动加 team-)/ Tier 2 `cct-project-creator` skill(meta-agent 调,带 AskUserQuestion 结构化选项)/ Tier 3 `claude -p haiku` 智能 fallback(15s timeout,Y/n 确认 / `--no-auto-slug` env 控)/ Tier 4 deterministic `slugify_brief()`(token-aware + stop-word + dedup + 取前 3 token)。
+- **解耦方案**:四层调用栈 — Tier 1 `ccteam new --slug X`(B2 prefix 自动加 team-)/ Tier 2 `ccteam-project-creator` skill(meta-agent 调,带 AskUserQuestion 结构化选项)/ Tier 3 `claude -p haiku` 智能 fallback(15s timeout,Y/n 确认 / `--no-auto-slug` env 控)/ Tier 4 deterministic `slugify_brief()`(token-aware + stop-word + dedup + 取前 3 token)。
 - **优先级**:**P1**(用户日常摩擦点)。
 - **来源**:2026-05-08 用户实战反馈 issue #1+#2(`docs/v0-2-2/feedback.md` / `docs/v0-2-2/prd.md §3`)。
 
@@ -701,12 +701,12 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
 - **优先级**:**P0** ship-blocker(实际 bug,V0.1/V0.2 用户已撞)。
 - **来源**:2026-05-08 用户实战反馈 issue #4(`docs/v0-2-2/feedback.md` / `docs/v0-2-2/prd.md §5`)。
 
-### F37 — meta-agent 绕开 pipeline 自调研(2026-05-09 加;**已修复:2026-05-09(V0.2.2 PR #2 决策树加固 + cct-project-creator skill)**)
+### F37 — meta-agent 绕开 pipeline 自调研(2026-05-09 加;**已修复:2026-05-09(V0.2.2 PR #2 决策树加固 + ccteam-project-creator skill)**)
 
 - **文件:行号**:`crates/ccteam-core/src/templates/meta_agent_role.md` §1 决策树边界不严("调研 X" 被错误归入"问答"分支)+ §3 克制规则缺"❌ 不起 Agent subagent 自调研"反例。
 - **现状**:用户要求"调研 Multica",meta-agent 没派 product-research,而是自起 `Agent(subagent_type=general-purpose)` 做 Web 搜索 + 直出结论;product-research 6-phase pipeline(kickoff / research / verdict / next-steps)被绕过,无可审计调研记录。
 - **是否真 dev-specific**:**否——meta-agent 决策树软约束被漂移**。
-- **解耦方案**:`meta_agent_role.md` §1 加 "调研 X = 项目请求" 反例(项目请求段含"调研 / 评估 / 分析 / 看看 X 值不值得");§3 克制规则加 "❌ 不要自起 `Agent(subagent_type=general-purpose)` / 调用 web 搜索做调研" 反例;§2 派单段 inline rules 抽出,改"走 `cct-project-creator` skill"(skill body 接 Phase A/B/C/D — 需求澄清 / slug 推荐 / team 选择 / 派单);F34 + F37 同 PR 落地。
+- **解耦方案**:`meta_agent_role.md` §1 加 "调研 X = 项目请求" 反例(项目请求段含"调研 / 评估 / 分析 / 看看 X 值不值得");§3 克制规则加 "❌ 不要自起 `Agent(subagent_type=general-purpose)` / 调用 web 搜索做调研" 反例;§2 派单段 inline rules 抽出,改"走 `ccteam-project-creator` skill"(skill body 接 Phase A/B/C/D — 需求澄清 / slug 推荐 / team 选择 / 派单);F34 + F37 同 PR 落地。
 - **优先级**:**P1**(决策树漂移影响 UX 一致性)。
 - **来源**:2026-05-08 用户实战反馈 issue #6(`docs/v0-2-2/feedback.md` / `docs/v0-2-2/prd.md §6`)。
 
@@ -715,18 +715,26 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
 - **文件:行号**:无(新功能)。F35 enriched outbox `pane_tail` 是文本维度,`channel adapter` / 用户人眼缺直观视觉维度。
 - **现状**:meta-agent 通知用户项目状态时只能给文本 `pane_tail`(30 行 capture-pane);ANSI 颜色 / progress bar / 框线字符在文本里失真。
 - **是否真 dev-specific**:**否——通用 UX 增强**。
-- **解耦方案**:`tmux capture-pane -e` → `vt100::Parser` cell grid → `imageproc::drawing::{draw_filled_rect_mut, draw_text_mut}`(`ab_glyph` 字体)→ `image` PNG。**纯 Rust 全栈**(vendored JetBrainsMono-Regular.ttf OFL via `include_bytes!`,绕过 font-kit / fontconfig 系统依赖);`ANSI_256` 调色板常量(16 + 216 cube + 24 grayscale);`mcp__ccteam__screenshot(slug, lines?)` MCP 工具(namespace 保留 ccteam,V0.3 评估改名);`cct doctor --screenshot-smoke <slug>` flag;`std::panic::catch_unwind` 兜 vt100 / imageproc 边缘 panic;`CCTEAM_SCREENSHOT_FONT_TTF` env 覆盖字体。F35 enriched outbox 后续可加 `screenshot_path` 字段(本 PR ship MCP 工具 + smoke,outbox 集成留 follow-up)。
+- **解耦方案**:`tmux capture-pane -e` → `vt100::Parser` cell grid → `imageproc::drawing::{draw_filled_rect_mut, draw_text_mut}`(`ab_glyph` 字体)→ `image` PNG。**纯 Rust 全栈**(vendored JetBrainsMono-Regular.ttf OFL via `include_bytes!`,绕过 font-kit / fontconfig 系统依赖);`ANSI_256` 调色板常量(16 + 216 cube + 24 grayscale);`mcp__ccteam__screenshot(slug, lines?)` MCP 工具(namespace 保留 ccteam,V0.3 评估改名);`ccteam doctor --screenshot-smoke <slug>` flag;`std::panic::catch_unwind` 兜 vt100 / imageproc 边缘 panic;`CCTEAM_SCREENSHOT_FONT_TTF` env 覆盖字体。F35 enriched outbox 后续可加 `screenshot_path` 字段(本 PR ship MCP 工具 + smoke,outbox 集成留 follow-up)。
 - **优先级**:**P2**(UX 增强,补 F35 视觉维度;非阻塞)。
 - **来源**:用户 2026-05-09 追加(`docs/v0-2-2/prd.md §7`);载体经 5 轮迭代:Pillow → vte+tiny-skia → freeze(Linux 5.15 segfault) → ansee(font-kit deps)→ vt100+imageproc DIY(选定)。
 
-### F39 — `cct` 短前缀约定 sweep(2026-05-09 加;**已修复:2026-05-09(V0.2.2 PR #1 cct convention sweep)**)
+### F39 — `cct` 短前缀约定 sweep(2026-05-09 加;**已修复→后被 F44 反向**:2026-05-09 PR #1 落地;2026-05-10 PR #8 反向回滚 — 详 F44)
 
-- **文件:行号**:`crates/ccteam-cli/Cargo.toml::[[bin]] name = "ccteam"`(老);`crates/ccteam-core/src/templates/{ccteam_control,ccteam_team_author}_skill.md`(老 skill 模板);全 `ccteam <cmd>` 命令字面量(README / docs / phase / role / memory-bridge templates);`crates/ccteam-core/src/templates/settings.json` hook command 老 `ccteam` 路径。
-- **现状**:V0.1/V0.2 ship 时命名前缀都是 `ccteam-`,跟简短 `dev` / `cct-slash` / `ccgram` 等周边工具命名风格不一致;`~/.claude/skills/` listing 三 `ccteam-*` 长字符;命令行 `ccteam new ...` 比 `cct new ...` 多打 4 字符。
-- **是否真 dev-specific**:**否——命名约定**。
-- **解耦方案**:三对象同步重命名:binary `ccteam` → `cct`(`Cargo.toml::[[bin]] name`)+ skill `ccteam-{control,team-author}` → `cct-{control,team-author}` + 顶层 `skills/` 目录(SoT);Rust 常量 + 函数同步(`CCT_*_SKILL_NAME` / `install_cct_*_skill` / `current_cct_bin`);settings.json 占位符 `{{CCT_BIN}}`(doctor 安装时填 `current_exe()`);`cct doctor` 自动迁移 V0.1/V0.2 用户(检测 + 清旧 `~/.claude/skills/ccteam-*/` marker 校验 + rewrite 老 settings.json hook 命令路径,原子写)。**保留**(per PRD §8.3):MCP server name `ccteam`(`mcpServers.ccteam`)+ `~/.config/ccteam/` XDG dir + `~/.ccteam/` 项目根 + crate 名 + git repo + workspace 名。CLAUDE.md §三红线 + §四 Skills 行 + §五 patch 流程 + §六 升级条目同步加。
-- **优先级**:**P3**(cleanup;非阻塞)。
-- **来源**:用户 2026-05-09 追加(`docs/v0-2-2/prd.md §8`);初为 F34 skill 重构子项,后抽出独立 finding(机械 rename 跟逻辑变更解耦,先 merge)。
+- **文件:行号**:`crates/ccteam-cli/Cargo.toml::[[bin]] name`、`skills/cct-*/SKILL.md`、`crates/ccteam-core/src/templates/settings.json` 占位符。
+- **现状(F39 实施时)**:V0.1/V0.2 ship 时命名前缀都是 `ccteam-`;F39 把 binary 改 `cct`、skill 改 `cct-*`、占位符改 `{{CCT_BIN}}`、Rust API 改 `current_cct_bin` / `install_cct_*` / `CCT_*_SKILL_NAME`。
+- **后续**:**F44 把 F39 全部反向**。原因:`/usr/bin/cct` 已被 Ubuntu `proj-bin`(PROJ Coordinate Conversion / GIS)占用,`~/.local/bin/cct` 在标准 PATH 上会静默 shadow 系统工具。
+- **优先级**:已实施 → 已反向。
+- **来源**:用户 2026-05-09 追加;反向决策 2026-05-10。
+
+### F44 — 反向 F39 cct convention sweep,恢复 ccteam 二进制(2026-05-10 加;**已修复:2026-05-10(V0.2.2 PR #8)**)
+
+- **文件:行号**:全 F39 触及面(binary、skill、Rust API、placeholder、docs sweep、CLAUDE.md §三/§四/§六)反向回滚到 ccteam-* 命名。
+- **现状**:F39 选 `cct` 二进制名时未检查 namespace;Ubuntu `proj-bin` 包提供 `/usr/bin/cct`(PROJ 工具),与 ccteam 同名碰撞,`~/.local/bin/cct` 在标准 PATH 上前置会静默 shadow 系统 GIS 工具。
+- **是否真 dev-specific**:**否——命名碰撞修复**。
+- **解耦方案**:逐一反向:binary `cct` → `ccteam`、skill `cct-*` → `ccteam-*`、Rust `current_cct_bin` → `current_ccteam_bin` / `install_cct_*_skill` → `install_ccteam_*_skill`、placeholder `{{CCT_BIN}}` → `__CCTEAM_BIN__`、docs sweep。`ccteam doctor` 加 F39 → F44 反向迁移(检测 `~/.claude/skills/cct-{control,team-author,project-creator}/` marker + frontmatter 校验,匹配则 rm -rf;rewrite `~/projects/<slug>/.claude/settings.json` 内 `cct hook` → `ccteam hook` 原子写)。**保留**(per F39 §8.3):MCP server name `ccteam`、`~/.ccteam/` 项目根、crate 名、git repo / workspace 名 — 这些 F39 本就没动。
+- **优先级**:**P0**(silent-substitute footgun)。
+- **来源**:用户 2026-05-10 反馈 + 实证 `dpkg -S /usr/bin/cct` 命中 `proj-bin`。
 
 ### F40 — `product-research` team 名冗长 + 领域名缺位(2026-05-09 加;**已修复:2026-05-09(V0.2.2 PR #6 alias 软迁移)**)
 
@@ -735,7 +743,7 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
   `team_resolver.rs::resolve_team` / `templates.rs::TEAM_BUNDLES` /
   `memory_bridge.rs::lookup_bridge_template` /
   `crates/ccteam-cli/src/commands.rs::ensure_team_resolvable` 等)。
-- **现状**:`product-research` 又长又冗(命令行 `cct new --team
+- **现状**:`product-research` 又长又冗(命令行 `ccteam new --team
   product-research "<brief>"`、`~/projects/product-research-<slug>/`
   目录前缀、`~/.claude/rules/ccteam-lessons-product-research.md` rules
   文件名),跟简短的 `dev` 对比读 / 写都繁;领域名 vs team 名混淆
@@ -749,7 +757,7 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
   `ensure_team_resolvable` 全 alias-aware(name miss → walk
   `aliases:`);老项目 `state.json::team = "product-research"` 字面 +
   `~/projects/product-research-*` 目录 + 老 rules 文件全不动;新项目走
-  `state.team = "research"` + `~/projects/research-*`;`cct new --team
+  `state.team = "research"` + `~/projects/research-*`;`ccteam new --team
   product-research` stderr warn deprecated 但仍工作。
 - **优先级**:**P2**(命名;不阻塞功能,但持续摩擦用户体验)。
 - **来源**:`docs/v0-2-2/prd.md §9`(F40 全文,~110 行)。
