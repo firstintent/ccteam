@@ -98,6 +98,20 @@ impl CcteamPaths {
         self.project_ccteam_dir(slug).join("screenshots")
     }
 
+    /// `~/.ccteam/harness/` — V0.3.1 F46 dual-write target for the
+    /// Claude Code statusline wrapper (and future Codex equivalent).
+    /// Each session deposits one `<slug>-<sid>.json` file holding the
+    /// most recent harness statusline JSON; the ccteam-web watcher
+    /// tails this dir and broadcasts `harness_snapshot` events.
+    ///
+    /// **Architectural red line** (CLAUDE.md §三, PRD §3.3): files in
+    /// this directory are *presentation only*. The orchestrator state
+    /// machine never reads them — `progress.jsonl` remains the single
+    /// source of truth.
+    pub fn harness_dir(&self) -> PathBuf {
+        self.root.join("harness")
+    }
+
     /// V0.2.2 F38: Build a unique PNG path under
     /// `<project>/.ccteam/screenshots/<utc>.png`. The timestamp is
     /// the same compact RFC3339-no-colons format used by inbox

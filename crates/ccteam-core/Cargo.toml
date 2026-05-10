@@ -17,6 +17,7 @@ tokio.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
 regex.workspace = true
+thiserror.workspace = true
 
 # V0.2.2 F38 — terminal screenshot pipeline (vt100 + imageproc DIY).
 # All four crates are pure Rust; no system C deps (libfontconfig /

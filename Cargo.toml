@@ -30,6 +30,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 regex = { version = "1", default-features = false, features = ["std", "perf"] }
+# V0.3.1 F46 — harness adapter error types (HarnessError) use thiserror
+# derive so `&'static str` payloads on `NotImplemented` stay alloc-free
+# and the variant set is exhaustive without per-call format!() boilerplate.
+thiserror = "1"
 
 # V0.3 M5.0 — web UI (axum + askama). Pinned per `docs/v0-3/prd.md`
 # §3.2.2; minor bumps in M5.x must update the table there.
