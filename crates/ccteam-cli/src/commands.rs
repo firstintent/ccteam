@@ -408,7 +408,7 @@ fn which_claude() -> Option<String> {
 /// fail-fast error pointing the user at the missing team.yaml.
 ///
 /// Resolution order:
-/// 1. `dev` and `meta-agent` always succeed (legacy / bespoke paths).
+/// 1. `dev` and `meta-agent` always succeed (built-in / bespoke paths).
 /// 2. If `~/.ccteam/teams/<team>/team.yaml` is on disk, load + validate it.
 /// 3. V0.2.2 F40: scan every `~/.ccteam/teams/*/team.yaml` and accept
 ///    `team` when it matches a `spec.aliases` entry. Lets old projects'
