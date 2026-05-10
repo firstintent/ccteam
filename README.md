@@ -75,6 +75,15 @@ ccteam --version
 One-time setup (idempotent — re-runs are no-ops):
 
 ```bash
+make setup HANDLE=<your-handle>   # init + 4 doctor installs + tool-surface health check
+```
+
+`<your-handle>` is whatever you want to call yourself — snake_case, e.g. `rob` or `alice`.
+
+<details>
+<summary>What <code>make setup</code> runs (if you want to do it by hand)</summary>
+
+```bash
 ccteam init                                       # ~/.ccteam/ skeleton
 ccteam doctor --install-skill                     # ccteam-control skill (any claude session reaches ccteam)
 ccteam doctor --install-mcp                       # 9-tool MCP server in ~/.claude.json
@@ -83,7 +92,7 @@ ccteam doctor --install-meta-agent <your-handle>  # bootstrap your meta-agent pr
 ccteam doctor --tool-surface                      # health check (must be green)
 ```
 
-`<your-handle>` is whatever you want to call yourself — snake_case, e.g. `rob` or `alice`.
+</details>
 
 > **Upgrading from a pre-2026-05 ccteam?** Run `ccteam doctor --migrate-recommended-agents` once after the upgrade. Spawned project sessions now resolve plugin agents through Claude Code's plugin pipeline, so the legacy `~/.claude/agents/<name>.md` symlinks ccteam used to create are obsolete; this command removes them. User-authored agents are preserved.
 
@@ -91,10 +100,10 @@ ccteam doctor --tool-surface                      # health check (must be green)
 
 ```bash
 # Terminal A — start the orchestrator (foreground; keep this open)
-ccteam start --foreground
+make start                              # or: ccteam start --foreground
 
 # Terminal B — talk to the meta-agent
-tmux attach -t ccteam-meta-<your-handle>
+make attach HANDLE=<your-handle>        # or: tmux attach -t ccteam-meta-<your-handle>
 # Then type in natural language:
 #   "Make a markdown editor, web-based, single HTML file, no build step."
 # Or for fuzzy ideas:
