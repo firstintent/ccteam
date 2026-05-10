@@ -282,6 +282,23 @@ mod tests {
     }
 
     #[test]
+    fn render_role_prompt_uses_canonical_meta_project_path() {
+        let body = render_meta_role_prompt("rob");
+        assert!(
+            body.contains("~/projects/meta-rob/.ccteam/inbox/"),
+            "role prompt should mention canonical meta inbox path",
+        );
+        assert!(
+            body.contains("~/projects/meta-rob/.ccteam/outbox/"),
+            "role prompt should mention canonical meta outbox path",
+        );
+        assert!(
+            !body.contains("~/projects/rob-meta/"),
+            "role prompt must not point migrated meta-agents at the legacy path",
+        );
+    }
+
+    #[test]
     fn render_role_prompt_includes_seven_required_chapters() {
         // Per task brief §5: the role prompt must contain all seven
         // chapters covering identity / decision tree / dispatcher
