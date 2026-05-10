@@ -31,11 +31,12 @@ pub fn session_name_for_slug(slug: &str) -> String {
 /// Resolve the live tmux session name for a project slug.
 ///
 /// Most projects use the conventional `ccteam-<slug>` name, but
-/// meta-agent sessions intentionally do not: slug `cto-meta` maps to
-/// tmux session `ccteam-meta-cto`. `state.json.tmux_session` is the
-/// source of truth for those cases. If the state is missing or malformed
-/// we fall back to the conventional name so diagnostic surfaces continue
-/// to degrade the same way older builds did.
+/// meta-agent sessions intentionally use `ccteam-meta-<handle>`.
+/// `state.json.tmux_session` is the source of truth for those cases,
+/// including legacy installs whose slug was `<handle>-meta`. If the
+/// state is missing or malformed we fall back to the conventional name
+/// so diagnostic surfaces continue to degrade the same way older builds
+/// did.
 pub fn session_name_for_project(paths: &CcteamPaths, slug: &str) -> String {
     let fallback = session_name_for_slug(slug);
     let state_path = paths.project_state(slug);
@@ -275,12 +276,26 @@ impl TmuxSession {
 /// instead (which returns raw bytes for `vt100::Parser`).
 pub fn capture_pane_tail(slug: &str, lines: usize, with_ansi: bool) -> Option<String> {
     let session = session_name_for_slug(slug);
+    capture_pane_tail_from_session(&session, lines, with_ansi)
+}
+
+/// Capture pane tail by exact tmux session name.
+///
+/// Prefer this for project-scoped call sites that already loaded
+/// `state.json.tmux_session`; meta-agent projects use tmux session
+/// `ccteam-meta-<handle>`, and legacy installs may still have a
+/// `<handle>-meta` slug on disk.
+pub fn capture_pane_tail_from_session(
+    session_name: &str,
+    lines: usize,
+    with_ansi: bool,
+) -> Option<String> {
     let mut cmd = Command::new("tmux");
     cmd.arg("capture-pane").arg("-p");
     if with_ansi {
         cmd.arg("-e");
     }
-    cmd.args(["-t", &session, "-S", &format!("-{lines}")]);
+    cmd.args(["-t", session_name, "-S", &format!("-{lines}")]);
     let output = cmd.output().ok()?;
     if !output.status.success() {
         return None;

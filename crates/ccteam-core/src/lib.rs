@@ -51,7 +51,7 @@ pub use inbox::{
 };
 pub use meta_agent::{
     bootstrap_meta_project, meta_session_name, meta_slug, render_meta_role_prompt,
-    MetaBootstrapReport, META_SESSION_PREFIX, META_TEAM_NAME,
+    resolve_meta_slug, MetaBootstrapReport, META_SESSION_PREFIX, META_TEAM_NAME,
 };
 pub use memory_bridge::{
     install_into as install_memory_bridge_into, install_memory_bridge,
@@ -140,9 +140,10 @@ pub use screenshot::{
     FONT_ENV as SCREENSHOT_FONT_ENV, ScreenshotResult,
 };
 pub use tmux::{
-    capture_pane_tail, capture_pane_with_ansi, capture_pane_with_ansi_from_session,
-    pid_is_alive, query_pane_dims, query_pane_dims_from_session, session_name_for_project,
-    session_name_for_slug, tmux_available, TmuxSession,
+    capture_pane_tail, capture_pane_tail_from_session, capture_pane_with_ansi,
+    capture_pane_with_ansi_from_session, pid_is_alive, query_pane_dims,
+    query_pane_dims_from_session, session_name_for_project, session_name_for_slug,
+    tmux_available, TmuxSession,
 };
 pub use plugin_resolution::{
     lookup_plugin_agent, plugins_to_enable, PluginAgent, KNOWN_PLUGIN_AGENTS,

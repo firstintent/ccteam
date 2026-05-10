@@ -40,7 +40,7 @@ use crate::silence_classifier::{
     self, LastEventSummary, LimboAction, SilenceClass, MAX_LIMBO_RETRY,
 };
 use crate::stall::{self, StallLevel, StallThresholds};
-use crate::tmux::capture_pane_tail;
+use crate::tmux::capture_pane_tail_from_session;
 use crate::state::{PhaseHistoryEntry, PhaseState, ProjectState};
 use crate::subskill::{self, ClaudePRunner, SubSkillRunner};
 use crate::team::TeamSpec;
@@ -1959,7 +1959,8 @@ impl Orchestrator {
             .with_context(|| format!("create {}", cc.display()))?;
         let outbox_path = cc.join("needs_attention.outbox.json");
 
-        let pane = capture_pane_tail(slug, 30, false).unwrap_or_default();
+        let pane = capture_pane_tail_from_session(&state.tmux_session, 30, false)
+            .unwrap_or_default();
         let last_event_summary = last_event.map(LastEventSummary::from_value);
         let reason = format!(
             "F36 pending-inject timeout phase={phase} max_defer_minutes={budget}",
@@ -2187,7 +2188,8 @@ impl Orchestrator {
         // Pane tail is best-effort — classifier red line: if tmux is
         // unavailable the outbox still ships, the meta-agent surfaces
         // the rest.
-        let pane = capture_pane_tail(slug, 30, false).unwrap_or_default();
+        let pane = capture_pane_tail_from_session(&state.tmux_session, 30, false)
+            .unwrap_or_default();
 
         let classification = if limbo_capped {
             "limbo_capped"
