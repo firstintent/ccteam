@@ -901,6 +901,12 @@ pub struct DoctorOptions {
     /// the resulting PNG path or graceful-degrade reason. Verifies
     /// font + tmux + IO without requiring a live MCP client.
     pub screenshot_smoke: Option<String>,
+    /// V0.3.1 F46: install / refresh `~/.claude/statusline-command.sh`
+    /// so Claude Code's statusline command tees stdin into
+    /// `ccteam hook harness-snapshot` before passing through to the
+    /// user's original (preserved as `<orig>.bak-<utc-ts>`).
+    /// Idempotent — re-runs preserve the existing backup target.
+    pub install_statusline_adapter: bool,
 }
 
 /// `ccteam doctor` dispatch. Returns a human-readable report so unit
@@ -914,7 +920,8 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
         || opts.reset_shipped_teams
         || opts.validate_team.is_some()
         || opts.migrate_recommended_agents
-        || opts.screenshot_smoke.is_some();
+        || opts.screenshot_smoke.is_some()
+        || opts.install_statusline_adapter;
     if !any_mode {
         return Ok(String::from(
             "ccteam doctor: pass at least one mode flag.\n\
@@ -940,7 +947,9 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
              --migrate-recommended-agents [--dry-run]\n      \
              remove stale ~/.claude/agents/<name>.md symlinks left by the V0.1 ln -sf path. One-time cleanup after upgrading to V0.2 plugin pipeline (V0.2 M0.20).\n  \
              --screenshot-smoke <slug>\n      \
-             render an end-to-end PNG screenshot of <slug>'s tmux pane to <project>/.ccteam/screenshots/<utc>.png. Verifies font + tmux + imageproc + IO; reports the path on success, the degrade reason on failure (V0.2.2 F38).\n",
+             render an end-to-end PNG screenshot of <slug>'s tmux pane to <project>/.ccteam/screenshots/<utc>.png. Verifies font + tmux + imageproc + IO; reports the path on success, the degrade reason on failure (V0.2.2 F38).\n  \
+             --install-statusline-adapter\n      \
+             install / refresh ~/.claude/statusline-command.sh so Claude Code's statusline command tees stdin into `ccteam hook harness-snapshot` before invoking the user's original (preserved as a `.bak-<utc-ts>` file). Idempotent (V0.3.1 F46).\n",
         ));
     }
     let mut out = String::new();
@@ -983,6 +992,9 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
     }
     if let Some(slug) = &opts.screenshot_smoke {
         out.push_str(&render_screenshot_smoke_report(paths, slug)?);
+    }
+    if opts.install_statusline_adapter {
+        out.push_str(&install_statusline_adapter(paths)?);
     }
     Ok(out)
 }
@@ -2094,6 +2106,192 @@ pub struct WebOptions {
 /// flags into `ccteam_web::ServeOpts`, then drives a current-thread
 /// tokio runtime to `serve(opts)` (mirrors the `mcp-serve` shape so a
 /// future operator running both side-by-side sees the same harness).
+/// V0.3.1 F46 hook subcommand handler — `ccteam hook harness-snapshot`.
+///
+/// Reads ALL of stdin to a String (the Claude Code statusline command
+/// is fed an opaque blob; we treat it as raw bytes), resolves the
+/// destination under `~/.ccteam/harness/<slug>-<sid>.json` from
+/// `current_dir()`, and atomically dual-writes via
+/// [`ccteam_core::write_harness_snapshot`].
+///
+/// **Architectural red line** (PRD §3.3, this PR): never bubble — the
+/// statusline render path is sacred. The caller in `main::run_hook`
+/// wraps any error in `let _ = ...` and exits 0. We still return a
+/// `Result` for testability (so the unit suite can assert success on
+/// the happy path).
+pub fn run_hook_harness_snapshot(paths: &CcteamPaths) -> Result<()> {
+    let raw = std::io::read_to_string(std::io::stdin().lock())
+        .context("read stdin for harness-snapshot hook")?;
+    let cwd = std::env::current_dir().context("current_dir for harness-snapshot hook")?;
+    match ccteam_core::write_harness_snapshot(paths, &cwd, &raw) {
+        Ok(true) => {
+            tracing::debug!(
+                cwd = %cwd.display(),
+                "ccteam harness-snapshot: dual-wrote",
+            );
+        }
+        Ok(false) => {
+            tracing::debug!(
+                cwd = %cwd.display(),
+                "ccteam harness-snapshot: cwd outside projects_root, skip",
+            );
+        }
+        Err(err) => {
+            tracing::debug!(
+                cwd = %cwd.display(),
+                error = %err,
+                "ccteam harness-snapshot: best-effort write failed",
+            );
+        }
+    }
+    Ok(())
+}
+
+/// V0.3.1 F46 — install / refresh `~/.claude/statusline-command.sh`
+/// so Claude Code's statusline command tees its stdin into our hook
+/// before passing through to the user's original (preserved as a
+/// `.bak-<utc-ts>` file).
+///
+/// Idempotency rules (per dev-plan §2.1):
+///
+/// - **No existing file** → write a fresh wrapper, no passthrough.
+/// - **Existing user file, no marker** → backup to
+///   `<orig>.bak-YYYYMMDDTHHMMSSZ`, write wrapper, passthrough invokes
+///   the backup.
+/// - **Existing wrapper with marker** → re-install: rewrite from the
+///   in-binary template, glob-pick the most-recent `<orig>.bak-*` as
+///   the passthrough target. No new backup is taken (we'd be backing
+///   up our own output).
+///
+/// Wrapper marker (CLAUDE.md §三 marker convention adapted for shell
+/// `#`-comment syntax — analogous to the F39 markdown
+/// `<!-- ccteam-managed:lessons begin/end -->` pattern):
+///
+/// ```sh
+/// # ccteam-managed:statusline begin (V0.3.1 F46 — do not hand-edit;
+/// #                                    re-run `ccteam doctor --install-statusline-adapter`)
+/// ```
+///
+/// Returns the user-facing report line (printed by `run_doctor`).
+pub fn install_statusline_adapter(_paths: &CcteamPaths) -> Result<String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let claude_dir = user_claude_dir().context("resolve user ~/.claude dir")?;
+    let target = claude_dir.join("statusline-command.sh");
+    let bin = current_ccteam_bin().context("resolve current ccteam binary path")?;
+
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create dir {}", parent.display()))?;
+    }
+
+    let existing = match std::fs::read_to_string(&target) {
+        Ok(s) => Some(s),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(anyhow::Error::from(err)
+            .context(format!("read existing {}", target.display()))),
+    };
+
+    let backup_path: Option<std::path::PathBuf> = match existing.as_deref() {
+        None => None,
+        Some(body) if body.contains(STATUSLINE_MARKER_BEGIN) => {
+            // Re-install: find the most recent prior backup so the
+            // refreshed wrapper still passes through to the user's
+            // original. We do NOT create a new backup of our own output.
+            find_latest_statusline_backup(&claude_dir)?
+        }
+        Some(body) => {
+            // Brand-new install over a user-authored statusline. Take a
+            // backup and use it as the passthrough target.
+            let stamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+            let bak = target.with_file_name(format!("statusline-command.sh.bak-{stamp}"));
+            std::fs::write(&bak, body)
+                .with_context(|| format!("write backup {}", bak.display()))?;
+            // Mirror the source's executable bit if we can; harmless
+            // if we cannot read metadata.
+            if let Ok(meta) = std::fs::metadata(&target) {
+                let mode = meta.permissions().mode();
+                let _ = std::fs::set_permissions(&bak, std::fs::Permissions::from_mode(mode));
+            }
+            Some(bak)
+        }
+    };
+
+    let wrapper_body = render_statusline_wrapper(&bin, backup_path.as_deref());
+    let tmp = target.with_file_name("statusline-command.sh.ccteam-tmp");
+    std::fs::write(&tmp, &wrapper_body)
+        .with_context(|| format!("write wrapper tmp {}", tmp.display()))?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("chmod 0755 {}", tmp.display()))?;
+    std::fs::rename(&tmp, &target)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), target.display()))?;
+
+    let backup_disp = backup_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "none".into());
+    Ok(format!(
+        "ccteam doctor --install-statusline-adapter\n\n  \
+         installed: {} (backup: {})\n",
+        target.display(),
+        backup_disp,
+    ))
+}
+
+/// Marker that flags the statusline wrapper as ccteam-managed (per
+/// CLAUDE.md §三). The `(V0.3.1 F46 ...)` suffix mirrors the F39
+/// memory-bridge marker convention so future audits can grep one
+/// pattern across both surfaces.
+const STATUSLINE_MARKER_BEGIN: &str =
+    "# ccteam-managed:statusline begin (V0.3.1 F46";
+
+fn render_statusline_wrapper(bin: &std::path::Path, backup: Option<&std::path::Path>) -> String {
+    let bin_disp = bin.display().to_string();
+    let mut out = String::new();
+    out.push_str("#!/bin/sh\n");
+    out.push_str(STATUSLINE_MARKER_BEGIN);
+    out.push_str(" — do not hand-edit;\n");
+    out.push_str("#                                    re-run `ccteam doctor --install-statusline-adapter`)\n");
+    out.push_str("INPUT=$(cat)\n");
+    out.push_str("# Dual-write: best-effort, never blocks statusline render\n");
+    out.push_str(&format!(
+        "printf '%s' \"$INPUT\" | {bin_disp} hook harness-snapshot 2>/dev/null || true\n",
+    ));
+    out.push_str("# ccteam-managed:statusline end\n");
+    if let Some(bak) = backup {
+        out.push_str("# Passthrough to user's original (preserved as backup)\n");
+        out.push_str(&format!("if [ -x \"{}\" ]; then\n", bak.display()));
+        out.push_str(&format!("    printf '%s' \"$INPUT\" | \"{}\"\n", bak.display()));
+        out.push_str("fi\n");
+    }
+    out
+}
+
+/// Glob `~/.claude/statusline-command.sh.bak-*` and return the path
+/// with the lexicographically-greatest suffix (timestamps sort lex).
+fn find_latest_statusline_backup(
+    claude_dir: &std::path::Path,
+) -> Result<Option<std::path::PathBuf>> {
+    let entries = match std::fs::read_dir(claude_dir) {
+        Ok(e) => e,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("read_dir {}", claude_dir.display())),
+    };
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_s = match name.to_str() {
+            Some(s) => s,
+            None => continue,
+        };
+        if name_s.starts_with("statusline-command.sh.bak-") {
+            candidates.push(entry.path());
+        }
+    }
+    candidates.sort();
+    Ok(candidates.into_iter().next_back())
+}
+
 pub fn run_web(opts: WebOptions) -> Result<()> {
     use std::net::SocketAddr;
 

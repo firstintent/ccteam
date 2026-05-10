@@ -213,6 +213,13 @@ enum Command {
         /// path or the degrade reason (tmux missing / font / IO).
         #[arg(long, value_name = "SLUG")]
         screenshot_smoke: Option<String>,
+        /// V0.3.1 F46: install / refresh
+        /// `~/.claude/statusline-command.sh` so Claude Code's
+        /// statusline command tees stdin into
+        /// `ccteam hook harness-snapshot` before invoking the user's
+        /// original (preserved as a `.bak-<utc-ts>` file). Idempotent.
+        #[arg(long, default_value_t = false)]
+        install_statusline_adapter: bool,
     },
     /// V0.2 M0.18.6: render the orchestrator's per-phase inject
     /// prompt (frontmatter-driven) plus the `@`-referenced phase
@@ -353,6 +360,14 @@ enum HookCommand {
     /// outbox / clarify protocol instead of synchronously waiting on
     /// an offline user.
     InterceptAsk,
+    /// V0.3.1 F46 statusline-wrapper sink. Reads the harness stdin
+    /// JSON (whatever shape Claude Code emits to its statusline
+    /// command — we treat it opaquely as raw bytes), resolves the
+    /// `<slug>-<sid>.json` target under `~/.ccteam/harness/` from
+    /// `current_dir()`, and atomically dual-writes. Best-effort by
+    /// design: any failure (resolve / IO / non-utf8) is swallowed so
+    /// the user's TUI footer never breaks because of our hook.
+    HarnessSnapshot,
 }
 
 fn main() -> Result<()> {
@@ -427,6 +442,7 @@ fn main() -> Result<()> {
             validate_team,
             migrate_recommended_agents,
             screenshot_smoke,
+            install_statusline_adapter,
         } => run_doctor(commands::DoctorOptions {
             dry_run,
             force,
@@ -439,6 +455,7 @@ fn main() -> Result<()> {
             validate_team,
             migrate_recommended_agents,
             screenshot_smoke,
+            install_statusline_adapter,
         }),
         Command::Phase { cmd } => run_phase(cmd),
         Command::Watchdog { cmd } => run_watchdog(cmd),
@@ -541,14 +558,19 @@ fn run_doctor(opts: commands::DoctorOptions) -> Result<()> {
 
 fn run_hook(cmd: HookCommand) -> Result<()> {
     let paths = CcteamPaths::from_env()?;
-    let stdin: serde_json::Value = serde_json::from_reader(std::io::stdin().lock())
-        .context("parse hook stdin as JSON")?;
 
+    // The HarnessSnapshot arm wants raw bytes (the Claude Code
+    // statusline command is fed an opaque JSON-ish blob — we treat it
+    // as an opaque string) and must NEVER fail loudly. Every other arm
+    // expects a parsed `serde_json::Value` via the historical contract.
+    // Read stdin per-arm so each path stays minimal.
     match cmd {
         HookCommand::ProgressAppend { event_type } => {
+            let stdin = parse_hook_stdin_json()?;
             ccteam_hooks::progress_append(&paths, &event_type, &stdin)
         }
         HookCommand::ParsePhaseEnd => {
+            let stdin = parse_hook_stdin_json()?;
             let decision = ccteam_hooks::parse_phase_end(&paths, &stdin)?;
             match decision {
                 ccteam_hooks::ParseDecision::Continue => Ok(()),
@@ -571,14 +593,32 @@ fn run_hook(cmd: HookCommand) -> Result<()> {
                 }
             }
         }
-        HookCommand::CostAccumulate => ccteam_hooks::cost_accumulate(&paths, &stdin),
-        HookCommand::LoadContext => ccteam_hooks::load_context(&paths, &stdin),
+        HookCommand::CostAccumulate => {
+            let stdin = parse_hook_stdin_json()?;
+            ccteam_hooks::cost_accumulate(&paths, &stdin)
+        }
+        HookCommand::LoadContext => {
+            let stdin = parse_hook_stdin_json()?;
+            ccteam_hooks::load_context(&paths, &stdin)
+        }
         HookCommand::InterceptAsk => {
             let decision = ccteam_hooks::intercept_ask_decision();
             println!("{}", serde_json::to_string(&decision)?);
             Ok(())
         }
+        HookCommand::HarnessSnapshot => {
+            // V0.3.1 F46 — never bubble: the statusline render path is
+            // sacred. Best-effort dual-write; any error → debug log +
+            // exit 0.
+            let _ = commands::run_hook_harness_snapshot(&paths);
+            Ok(())
+        }
     }
+}
+
+fn parse_hook_stdin_json() -> Result<serde_json::Value> {
+    serde_json::from_reader(std::io::stdin().lock())
+        .context("parse hook stdin as JSON")
 }
 
 fn run_start(

@@ -42,6 +42,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use ccteam_core::HarnessSnapshot;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde_json::Value;
 use tokio::sync::broadcast;
@@ -68,17 +69,46 @@ pub struct ProgressUpdate {
     pub event_json: String,
 }
 
-/// Handle to the broadcast Sender — held by [`AppState`] and
-/// `subscribe()`d by SSE handlers. Drops the sender → background task
-/// exits naturally on next iteration when no subscribers remain.
+/// V0.3.1 F46 — one harness `<slug>-<sid>.json` snapshot, ready for
+/// SSE serialization. Emitted by the sibling `~/.ccteam/harness/`
+/// watcher (see [`spawn_harness_watcher_into`]) onto its own broadcast
+/// channel inside [`EventBus`]. Wire format documented in
+/// `routes::harness_sse`.
+#[derive(Clone, Debug)]
+pub struct HarnessSnapshotEvent {
+    pub slug: String,
+    pub sid: String,
+    pub snapshot: HarnessSnapshot,
+}
+
+/// Handle to the broadcast Senders — held by [`AppState`] and
+/// `subscribe()`d by SSE handlers. Drops the senders → background
+/// tasks exit naturally on next iteration when no subscribers remain.
+///
+/// Two sibling channels (decision documented in PR body): one for
+/// progress.jsonl events (M5.2), one for `~/.ccteam/harness/*.json`
+/// snapshots (V0.3.1 F46). Sibling channels keep the existing
+/// `subscribe()` / `publish_synthetic()` shape stable for the five
+/// M5.2 tests + `routes::sse` consumer; switching to an enum would
+/// have required signature churn for zero functional gain.
 #[derive(Clone)]
 pub struct EventBus {
     tx: broadcast::Sender<ProgressUpdate>,
+    /// V0.3.1 F46 — sibling channel for `harness_snapshot` events.
+    harness_tx: broadcast::Sender<HarnessSnapshotEvent>,
 }
 
 impl EventBus {
     pub fn subscribe(&self) -> broadcast::Receiver<ProgressUpdate> {
         self.tx.subscribe()
+    }
+
+    /// V0.3.1 F46 — subscribe to the sibling harness snapshot
+    /// channel. Mirrors [`subscribe`] but delivers
+    /// [`HarnessSnapshotEvent`] from the `~/.ccteam/harness/`
+    /// watcher.
+    pub fn subscribe_harness(&self) -> broadcast::Receiver<HarnessSnapshotEvent> {
+        self.harness_tx.subscribe()
     }
 
     /// Construct an inert bus with no producer task. Used as a
@@ -87,7 +117,9 @@ impl EventBus {
     /// events and the page still renders.
     pub fn inert() -> Self {
         let (tx, _rx) = broadcast::channel::<ProgressUpdate>(BROADCAST_CAPACITY);
-        EventBus { tx }
+        let (harness_tx, _hrx) =
+            broadcast::channel::<HarnessSnapshotEvent>(BROADCAST_CAPACITY);
+        EventBus { tx, harness_tx }
     }
 
     /// Test helper for unit tests + integration tests. Not a stable
@@ -99,6 +131,13 @@ impl EventBus {
     pub fn publish_synthetic(&self, msg: ProgressUpdate) {
         let _ = self.tx.send(msg);
     }
+
+    /// V0.3.1 F46 — synthetic publish for the harness sibling
+    /// channel. Same usage shape as [`publish_synthetic`].
+    #[doc(hidden)]
+    pub fn publish_harness_synthetic(&self, msg: HarnessSnapshotEvent) {
+        let _ = self.harness_tx.send(msg);
+    }
 }
 
 /// Spawn the watcher background task. Returns the bus handle — the
@@ -106,17 +145,24 @@ impl EventBus {
 /// the server (drop → broadcast Sender goes away → in-flight SSE
 /// streams close naturally).
 ///
-/// The watcher itself runs in a dedicated `tokio::task::spawn_blocking`
-/// thread because `notify::RecommendedWatcher` callbacks are invoked
-/// from the notify thread and may block while reading the file — we
-/// don't want that on a tokio worker.
-pub fn spawn_watcher(progress_dir: PathBuf) -> Result<EventBus> {
-    // Ensure the dir exists; notify::watch fails on a missing path.
+/// V0.3.1 F46 spawns a sibling thread for `~/.ccteam/harness/` so a
+/// single `AppState::new` call wires up both pumps. Pass
+/// `harness_dir = None` (or use [`spawn_progress_watcher_only`]) when
+/// the caller only wants progress events (legacy callsite).
+pub fn spawn_watcher(progress_dir: PathBuf, harness_dir: PathBuf) -> Result<EventBus> {
+    // Ensure both dirs exist; notify::watch fails on a missing path.
     std::fs::create_dir_all(&progress_dir)
         .with_context(|| format!("create progress dir {}", progress_dir.display()))?;
+    std::fs::create_dir_all(&harness_dir)
+        .with_context(|| format!("create harness dir {}", harness_dir.display()))?;
 
     let (tx, _rx) = broadcast::channel::<ProgressUpdate>(BROADCAST_CAPACITY);
-    let bus = EventBus { tx: tx.clone() };
+    let (harness_tx, _hrx) =
+        broadcast::channel::<HarnessSnapshotEvent>(BROADCAST_CAPACITY);
+    let bus = EventBus {
+        tx: tx.clone(),
+        harness_tx: harness_tx.clone(),
+    };
 
     // Seed watermarks for files already present at startup so we do
     // NOT replay history (PRD §5.2.1 — connecting clients see only
@@ -134,6 +180,15 @@ pub fn spawn_watcher(progress_dir: PathBuf) -> Result<EventBus> {
             run_watcher_thread(progress_dir_for_thread, tx, watermarks);
         })
         .context("spawn ccteam-web watcher thread")?;
+
+    // V0.3.1 F46 — sibling thread tailing `~/.ccteam/harness/`.
+    let harness_dir_for_thread = harness_dir.clone();
+    std::thread::Builder::new()
+        .name("ccteam-web-harness-watcher".into())
+        .spawn(move || {
+            run_harness_watcher_thread(harness_dir_for_thread, harness_tx);
+        })
+        .context("spawn ccteam-web harness watcher thread")?;
 
     Ok(bus)
 }
@@ -338,6 +393,189 @@ fn initial_watermarks(progress_dir: &Path) -> HashMap<PathBuf, u64> {
     out
 }
 
+// =====================================================================
+// V0.3.1 F46 — harness snapshot watcher
+// =====================================================================
+//
+// Sibling pump tailing `~/.ccteam/harness/<slug>-<sid>.json`. On each
+// `Modify` / `Create` event we read the file once, parse as
+// `HarnessSnapshot`, and broadcast a `HarnessSnapshotEvent` on the
+// dedicated harness channel.
+//
+// Files come in two filename shapes (mirrors `derive_harness_path`):
+//   - `<slug>-<sid>.json`   — sid = `claude-N` or `codex-N`
+//   - `_meta-<handle>.json` — meta-agent project (slug = full stem,
+//                              sid = "default")
+//
+// Splitting `dev-foo-claude-1.json` into ("dev-foo", "claude-1") needs
+// a rule because both halves contain hyphens. We match the trailing
+// `(claude|codex)-\d+` suffix; anything else (older static-fixtured
+// filename, future harness type) is dropped with a `tracing::warn!`.
+
+fn run_harness_watcher_thread(
+    harness_dir: PathBuf,
+    tx: broadcast::Sender<HarnessSnapshotEvent>,
+) {
+    let (event_tx, event_rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
+    let mut watcher: RecommendedWatcher = match notify::recommended_watcher(move |res| {
+        let _ = event_tx.send(res);
+    }) {
+        Ok(w) => w,
+        Err(err) => {
+            tracing::error!(?err, "ccteam-web: harness notify::recommended_watcher init failed");
+            return;
+        }
+    };
+    if let Err(err) = watcher.watch(&harness_dir, RecursiveMode::NonRecursive) {
+        tracing::error!(
+            ?err,
+            dir = %harness_dir.display(),
+            "ccteam-web: harness notify::watch failed",
+        );
+        return;
+    }
+
+    tracing::info!(
+        dir = %harness_dir.display(),
+        "ccteam-web: harness watcher started",
+    );
+
+    while let Ok(res) = event_rx.recv() {
+        match res {
+            Ok(ev) => handle_harness_fs_event(ev, &tx),
+            Err(err) => tracing::warn!(?err, "ccteam-web: harness watcher reported error"),
+        }
+    }
+}
+
+fn handle_harness_fs_event(
+    ev: notify::Event,
+    tx: &broadcast::Sender<HarnessSnapshotEvent>,
+) {
+    let interesting = matches!(ev.kind, EventKind::Modify(_) | EventKind::Create(_));
+    if !interesting {
+        return;
+    }
+    for path in ev.paths {
+        if !is_harness_snapshot_file(&path) {
+            continue;
+        }
+        if let Err(err) = publish_harness_snapshot(&path, tx) {
+            tracing::warn!(
+                file = %path.display(),
+                error = %err,
+                "publish harness snapshot failed",
+            );
+        }
+    }
+}
+
+fn is_harness_snapshot_file(path: &Path) -> bool {
+    if path.extension().and_then(|s| s.to_str()) != Some("json") {
+        return false;
+    }
+    // Skip the `<name>.tmp` rename source from `write_harness_snapshot`.
+    let name = match path.file_name().and_then(|s| s.to_str()) {
+        Some(n) => n,
+        None => return false,
+    };
+    if name.ends_with(".tmp") {
+        return false;
+    }
+    true
+}
+
+fn publish_harness_snapshot(
+    path: &Path,
+    tx: &broadcast::Sender<HarnessSnapshotEvent>,
+) -> Result<()> {
+    let stem = match path.file_stem().and_then(|s| s.to_str()) {
+        Some(s) => s.to_string(),
+        None => return Ok(()),
+    };
+    let (slug, sid) = match split_harness_stem(&stem) {
+        Some(pair) => pair,
+        None => {
+            tracing::warn!(
+                file = %path.display(),
+                stem = %stem,
+                "harness file stem did not match `<slug>-<claude|codex>-N` or `_meta-<handle>` — skipping",
+            );
+            return Ok(());
+        }
+    };
+    let body = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            // Race with rename or unlink — drop quietly.
+            return Ok(());
+        }
+        Err(err) => return Err(err).context("read harness snapshot"),
+    };
+    let snapshot: HarnessSnapshot = match serde_json::from_str(&body) {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::warn!(
+                file = %path.display(),
+                error = %err,
+                "harness snapshot did not parse as HarnessSnapshot — skipping",
+            );
+            return Ok(());
+        }
+    };
+    let _ = tx.send(HarnessSnapshotEvent {
+        slug,
+        sid,
+        snapshot,
+    });
+    Ok(())
+}
+
+/// Split a harness file stem into `(slug, sid)`.
+///
+/// Match rules (mirrors the writer in `ccteam_core::harness`):
+///   - `_meta-<handle>` → `("_meta-<handle>", "default")` (meta-agent
+///                          project — single session, no real sid)
+///   - `<slug>-<claude|codex>-N` → `(<slug>, <claude|codex>-N)`
+///   - anything else → `None` (drop event)
+pub(crate) fn split_harness_stem(stem: &str) -> Option<(String, String)> {
+    if stem.starts_with("_meta-") {
+        return Some((stem.to_string(), "default".to_string()));
+    }
+    // Search right-to-left for the first hyphen that separates the
+    // last `claude|codex-N` group from the slug.
+    let bytes = stem.as_bytes();
+    let mut tail_start = bytes.len();
+    // Walk back through digits...
+    while tail_start > 0 && bytes[tail_start - 1].is_ascii_digit() {
+        tail_start -= 1;
+    }
+    if tail_start == bytes.len() || tail_start == 0 || bytes[tail_start - 1] != b'-' {
+        return None;
+    }
+    // ...consume the `-` separating digits from the harness keyword
+    let kw_end = tail_start - 1;
+    // The keyword must be `claude` or `codex`.
+    for kw in ["claude", "codex"] {
+        let kw_start = kw_end.checked_sub(kw.len())?;
+        if &stem[kw_start..kw_end] == kw
+            && (kw_start == 0 || bytes[kw_start - 1] == b'-')
+        {
+            if kw_start == 0 {
+                // No slug prefix — invalid (we always expect `<slug>-claude-N`).
+                return None;
+            }
+            let slug = &stem[..kw_start - 1];
+            let sid = &stem[kw_start..];
+            if slug.is_empty() {
+                return None;
+            }
+            return Some((slug.to_string(), sid.to_string()));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,5 +674,58 @@ mod tests {
         // updating the spec, the grep matrix flag will surface it,
         // but the unit test makes the contract explicit too.
         assert_eq!(BROADCAST_CAPACITY, 1024);
+    }
+
+    // V0.3.1 F46 — `split_harness_stem` is the only non-trivial
+    // routing logic in the harness watcher path; cover the main
+    // shapes here so the integration test can stay focused on the
+    // wire format.
+
+    #[test]
+    fn split_harness_stem_handles_single_team_segment_slug() {
+        assert_eq!(
+            split_harness_stem("dev-foo-claude-1"),
+            Some(("dev-foo".into(), "claude-1".into()))
+        );
+    }
+
+    #[test]
+    fn split_harness_stem_handles_multi_segment_slug() {
+        assert_eq!(
+            split_harness_stem("research-bigquery-tax-claude-2"),
+            Some(("research-bigquery-tax".into(), "claude-2".into()))
+        );
+    }
+
+    #[test]
+    fn split_harness_stem_handles_codex_sid() {
+        assert_eq!(
+            split_harness_stem("dev-foo-codex-7"),
+            Some(("dev-foo".into(), "codex-7".into()))
+        );
+    }
+
+    #[test]
+    fn split_harness_stem_handles_meta_handle() {
+        assert_eq!(
+            split_harness_stem("_meta-rob"),
+            Some(("_meta-rob".into(), "default".into()))
+        );
+    }
+
+    #[test]
+    fn split_harness_stem_rejects_garbage() {
+        assert!(split_harness_stem("just-a-name").is_none());
+        assert!(split_harness_stem("dev-foo").is_none());
+        assert!(split_harness_stem("claude-1").is_none()); // missing slug
+        assert!(split_harness_stem("").is_none());
+    }
+
+    #[test]
+    fn is_harness_snapshot_file_filters_correctly() {
+        assert!(is_harness_snapshot_file(Path::new("/x/dev-foo-claude-1.json")));
+        assert!(!is_harness_snapshot_file(Path::new("/x/dev-foo-claude-1.tmp")));
+        assert!(!is_harness_snapshot_file(Path::new("/x/dev-foo-claude-1.json.tmp")));
+        assert!(!is_harness_snapshot_file(Path::new("/x/notes.md")));
     }
 }

@@ -16,6 +16,7 @@ use crate::state::AppState;
 pub mod actions;
 pub mod assets;
 pub mod dashboard;
+pub mod harness_sse;
 pub mod health;
 pub mod pane_snapshot;
 pub mod project;
@@ -33,6 +34,7 @@ pub fn stateful_router() -> Router<AppState> {
         .merge(project::router())
         .merge(assets::router())
         .merge(sse::router())
+        .merge(harness_sse::router())
         .merge(pane_snapshot::router())
         .merge(screenshot::router())
         .merge(actions::router())

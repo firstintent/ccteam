@@ -44,6 +44,9 @@
 # 不在 ~/.ccteam/ 下;详见 tech-design §3.7。
 ├── progress/
 │   └── <slug>.jsonl       # 每项目一个事件流(hooks 写,inotify 监听;详见 §4)
+├── harness/               # V0.3.1 F46:Claude Code statusline-command 双写镜像
+│   ├── <slug>-<sid>.json  #   每 (slug, sid) 最新 harness snapshot;读侧 = ccteam-web `/sse/harness/...`
+│   └── _meta-<handle>.json #  meta-agent 项目(单 session,sid 视作 "default")
 ├── log/
 │   └── <slug>/            # stream-json 归档(可选,调试用)
 ├── tmux/
@@ -1761,6 +1764,8 @@ pub fn peek_pane(slug: &str, lines: Option<usize>) -> Result<PaneCapture, CoreEr
 | `GET` | `/assets/{file}` | 200 / 404 | `application/javascript; charset=utf-8`(htmx / htmx-ext-sse / xterm)/ `text/css; charset=utf-8`(style / xterm)/ `text/plain`(404) | vendored 静态资源;`Cache-Control: public, max-age=31536000, immutable`;白名单 = `htmx.min.js` / `htmx-ext-sse.js` / `xterm.js` / `xterm.css` / `style.css`,其他 file → 404 |
 | `GET` | `/sse/all` | 200 | `text/event-stream` | 全局 SSE 流:每条 progress.jsonl 写入推一帧 |
 | `GET` | `/sse/project/{slug}` | 200 | `text/event-stream` | per-slug SSE 流:server-side 过滤,只发该 slug 事件 |
+| `GET` | `/sse/harness/{slug}` | 200 | `text/event-stream` | V0.3.1 F46:per-slug harness 状态流,该 slug 下所有 sid 的 statusline snapshot |
+| `GET` | `/sse/harness/{slug}/{sid}` | 200 | `text/event-stream` | V0.3.1 F46:per-(slug,sid) harness 状态流,只发该 session 的 snapshot |
 | `GET` | `/api/{slug}/pane-snapshot.ansi` | 200 / 504 | `application/octet-stream`(200)/ `text/plain`(504) | 按需 tmux ANSI snapshot;xterm.js 浏览器端只读渲染;headers:`x-ccteam-pane-rows` / `x-ccteam-pane-cols`;tmux 无 session → 504 |
 | `GET` | `/screenshot/{slug}.png` | 200 / 404 / 504 | `image/png`(200)/ `text/plain`(404 / 504) | 按需 PNG 截图;F38 unavailable / tmux 无 session → 504 + 文本 reason;非 `<slug>.png` 路径 → 404 |
 | `POST` | `/api/{slug}/btw` | 303 / 400 / 4xx | `text/plain`(error) | `text=<urlencoded, 1..=4000>`;详 §15.7 |
@@ -1898,6 +1903,47 @@ watermark(`HashMap<PathBuf, u64>`,Mutex 保护)→ 读 appended bytes →
 
 **file rotation**:文件 size 缩小(truncate / rename)→ watermark 重置
 为 0,replay 全部内容,记 `tracing::warn!`(罕见,主要为防御 corner case)。
+
+### 15.6.1 Harness SSE wire format(V0.3.1 F46)
+
+`/sse/harness/<slug>` 与 `/sse/harness/<slug>/<sid>` 共享同一格式 ——
+`<slug>` endpoint 不过滤 sid,`<slug>/<sid>` endpoint server-side
+filter 到精确 (slug, sid) 对:
+
+```
+event: harness_snapshot
+data: {"slug":"dev-foo","sid":"claude-1","snapshot":{"harness":"claude-code","model_display_name":"Claude Sonnet 4.5","context_used_pct":12,"cost_usd_total":0.42,"rate_limit_pct":7,"cwd":"/home/u/projects/dev-foo","raw":{...},"captured_at":"2026-05-11T12:34:56Z"}}
+
+: keepalive
+
+event: reconnect_hint
+data: {"type":"reconnect_hint","reason":"Lagged(1024)"}
+
+```
+
+字段约定:
+
+- `event:` 名固定 `harness_snapshot`(future-proof — Codex / 其他 harness
+  接入时仍走同名;`snapshot.harness` 区分语义)。
+- `data:` 是**单行 JSON envelope**:`{slug, sid, snapshot}`。`snapshot` =
+  完整 `ccteam_core::HarnessSnapshot` 序列化(详 §16),包含
+  `model_display_name` / `context_used_pct` / `cost_usd_total` /
+  `rate_limit_pct` / `cwd` / `raw` / `captured_at`。
+- keep-alive + `reconnect_hint` 行为与 §15.6 一致(15s `:` 注释,
+  Lagged → 主动断流)。
+
+**watcher 拓扑**:`crates/ccteam-web/src/watcher.rs` 起一条 *sibling* OS
+线程(单独于 progress watcher),`notify::RecommendedWatcher` non-recursive
+监 `~/.ccteam/harness/`;每检测到 `<slug>-<sid>.json` 的 Modify / Create
+事件 → 读完整文件 → `serde_json::from_str::<HarnessSnapshot>` → 推
+`tokio::sync::broadcast::Sender<HarnessSnapshotEvent>`(独立 channel,
+capacity = 1024)。文件名拆分规则:`_meta-<handle>` → ("_meta-<handle>",
+"default");否则 `(slug)-(claude|codex)-N` 右向左匹配;不匹配的文件名
+丢弃 + warn。`<name>.json.tmp` 跳过(写入侧 atomic tmp+rename)。
+
+**单源真值红线**:harness/ 文件**仅供展示**。orchestrator state machine
+**永远不读**该目录 — `progress.jsonl` 仍是唯一控制平面 SoT(详 PRD §3.3 +
+CLAUDE.md §三)。
 
 ### 15.7 Write-action POST endpoints(M5.3)
 

@@ -53,13 +53,14 @@ impl AppState {
     }
 
     fn build(paths: CcteamPaths, auth: AuthState) -> Self {
-        let bus = match spawn_watcher(paths.progress_dir()) {
+        let bus = match spawn_watcher(paths.progress_dir(), paths.harness_dir()) {
             Ok(b) => b,
             Err(err) => {
                 tracing::error!(
                     ?err,
-                    dir = %paths.progress_dir().display(),
-                    "ccteam-web: progress watcher failed to start; SSE will be inert",
+                    progress_dir = %paths.progress_dir().display(),
+                    harness_dir = %paths.harness_dir().display(),
+                    "ccteam-web: progress + harness watchers failed to start; SSE will be inert",
                 );
                 EventBus::inert()
             }

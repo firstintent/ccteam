@@ -9,6 +9,7 @@ pub mod daemon;
 pub mod dag;
 pub mod auto_loop;
 pub mod golden_rules;
+pub mod harness;
 pub mod inbox;
 pub mod meta_agent;
 pub mod orchestrator;
@@ -37,6 +38,10 @@ pub mod watchdog;
 pub use actions::{
     inject_decision, next_inbox_seq, pause, resume, send_to_session, send_to_session_with,
     DecisionInput, SendOptions, SendResult,
+};
+pub use harness::{
+    derive_harness_path, write_harness_snapshot, ClaudeCodeAdapter, HarnessAdapter, HarnessError,
+    HarnessSnapshot, SessionHandle, SpawnOpts, SubagentState,
 };
 pub use dag::{dev_dag, Dag};
 pub use auto_loop::{AutoLoopDecision, AutoLoopFrontMatter, AutoLoopState};
