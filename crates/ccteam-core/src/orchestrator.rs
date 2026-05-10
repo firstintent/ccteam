@@ -364,6 +364,7 @@ impl Orchestrator {
                 evergreen: false,
                 cost_policy: crate::team::CostPolicy::default(),
                 claude_md_template: String::new(),
+                sessions: Vec::new(),
             },
             templates: Vec::new(),
             dag: Dag::from_templates(&[])?,
@@ -2551,6 +2552,7 @@ fn load_team_runtimes(paths: &CcteamPaths) -> Result<HashMap<String, TeamRuntime
                     evergreen: false,
                     cost_policy: crate::team::CostPolicy::default(),
                     claude_md_template: String::new(),
+                    sessions: Vec::new(),
                 };
                 teams.insert(
                     "dev".into(),
