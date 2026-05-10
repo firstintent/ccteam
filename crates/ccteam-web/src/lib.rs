@@ -3,35 +3,47 @@
 //! Single entry: [`serve`]. Wired up by `ccteam-cli` via
 //! `commands::run_web` so the binary stays a thin protocol adapter.
 //!
-//! Ship state (per `docs/v0-3/prd.md` §3 / §4 / §5):
+//! Ship state (per `docs/v0-3/prd.md` §3 / §4 / §5 / §6):
 //!
 //! - **M5.0** — `GET /health` + bind / shutdown plumbing.
 //! - **M5.1** — `GET /` dashboard, `GET /project/<slug>` detail
 //!   page, `GET /assets/{file}` vendored static assets.
-//! - **M5.2 (this PR)** — `GET /sse/all` + `GET /sse/project/<slug>`
-//!   live progress event streams (single `notify` watcher fans out
-//!   into a `tokio::sync::broadcast` capacity 1024) + `GET
+//! - **M5.2** — `GET /sse/all` + `GET /sse/project/<slug>` live
+//!   progress event streams (single `notify` watcher fans out into a
+//!   `tokio::sync::broadcast` capacity 1024) + `GET
 //!   /screenshot/<slug>.png` on-demand pane render via F38.
-//! - M5.3 — write actions + token auth.
+//! - **M5.3 (this PR)** — `POST /api/<slug>/{btw,inject_decision,
+//!   pause,resume}` write actions backed by `ccteam_core::actions::*`,
+//!   plus a token-auth gate (`auth_layer` middleware) on the entire
+//!   stateful router. Loopback bind defaults to no auth; non-loopback
+//!   bind generates `~/.ccteam/web-token` (mode 0600) and demands
+//!   `Authorization: Bearer ccteam:<token>` on every request (or the
+//!   matching `ccteam_token` cookie set by the URL shim).
 //!
-//! [`ServeOpts`] is stable from M5.0 forward — M5.3 consumes
-//! `no_auth` / `token_file` exactly as defined here.
+//! [`ServeOpts`] is stable from M5.0 forward and now adds
+//! `no_auth_grace_secs` (test seam — `Some(0)` skips the 5 s
+//! Ctrl-C window when `--no-auth` opts out on a non-loopback bind).
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
-use axum::Router;
+use axum::{middleware::from_fn_with_state, Router};
 use ccteam_core::CcteamPaths;
 use tokio::net::TcpListener;
 
+pub mod auth;
+pub mod decisions;
 pub mod queries;
 pub mod routes;
 pub mod state;
 pub mod status;
+pub mod token;
 pub mod views;
 pub mod watcher;
 
+pub use auth::AuthState;
 pub use state::AppState;
 pub use watcher::{EventBus, ProgressUpdate};
 
@@ -43,13 +55,30 @@ pub struct ServeOpts {
     /// Address to bind. `127.0.0.1:0` ⇒ pick a free port (used by
     /// integration tests).
     pub bind: SocketAddr,
-    /// Disable token auth on write endpoints. M5.3 will honor this;
-    /// M5.0 / M5.1 has no write endpoints so the flag is currently a
-    /// no-op record for ServeOpts shape stability.
+    /// Disable token auth on write endpoints. M5.3 honors this; if
+    /// the bind is non-loopback the operator gets a stderr warning +
+    /// a [`no_auth_grace_secs`]-second Ctrl-C window before serving.
     pub no_auth: bool,
     /// Custom path to read the auth token from. Default
-    /// (`None`) means `~/.ccteam/web-token`. M5.3 consumes this.
+    /// (`None`) means `~/.ccteam/web-token`.
     pub token_file: Option<PathBuf>,
+    /// Test seam: how long to sleep (eprintln'ing the LAN-RCE warning
+    /// banner first) when `no_auth = true` AND the bind is
+    /// non-loopback. Production `serve()` callers pass `Some(5)` —
+    /// integration tests pass `Some(0)` so the captured stderr can be
+    /// asserted without taking 5 s per case.
+    pub no_auth_grace_secs: Option<u64>,
+}
+
+impl Default for ServeOpts {
+    fn default() -> Self {
+        Self {
+            bind: "127.0.0.1:7331".parse().expect("hardcoded loopback parses"),
+            no_auth: false,
+            token_file: None,
+            no_auth_grace_secs: Some(5),
+        }
+    }
 }
 
 /// Build the router with a freshly resolved `CcteamPaths`. Used by
@@ -62,40 +91,106 @@ pub fn router() -> Result<Router> {
 
 /// Build the router with an explicit `AppState`. Tests use this so
 /// each test owns its own `tempdir`-backed paths.
+///
+/// The auth layer wraps the **stateful** router (everything except
+/// `/health`). When `state.auth.enabled = false` the layer is a
+/// pass-through; when enabled it gates every route on a valid
+/// `Authorization: Bearer ccteam:<token>` header or the matching
+/// `ccteam_token` cookie set via the URL shim (see
+/// `auth::auth_layer`).
 pub fn router_with_state(state: AppState) -> Router {
+    let stateful = routes::stateful_router()
+        .layer(from_fn_with_state(state.clone(), auth::auth_layer))
+        .with_state(state);
     Router::new()
         .merge(routes::stateless_router())
-        .merge(routes::stateful_router().with_state(state))
+        .merge(stateful)
 }
 
 /// Start the web server. Binds, prints the bound address one line
 /// to stdout (so subprocess harnesses can parse the port for the
 /// `:0` placeholder case), then serves until Ctrl-C / SIGTERM.
+///
+/// Auth heuristic (PRD §6.2.4):
+///
+/// | bind             | --no-auth | enabled | token             |
+/// |------------------|-----------|---------|-------------------|
+/// | loopback         | false     | false   | not generated     |
+/// | loopback         | true      | false   | not generated     |
+/// | non-loopback     | false     | **true**| generated or read |
+/// | non-loopback     | true      | false   | not generated     |
+///
+/// On the non-loopback `--no-auth` path we eprintln a LAN-wide RCE
+/// banner and sleep [`ServeOpts::no_auth_grace_secs`] seconds (test
+/// seam: pass `Some(0)` to skip in integration tests) so the operator
+/// has a window to Ctrl-C out.
 pub async fn serve(opts: ServeOpts) -> Result<()> {
+    let paths = CcteamPaths::from_env().context("resolve CcteamPaths from env for ccteam web")?;
+
     let listener = TcpListener::bind(opts.bind)
         .await
         .with_context(|| format!("bind {} for ccteam web", opts.bind))?;
     let local = listener
         .local_addr()
         .context("read local_addr after bind")?;
+    let non_loopback = !auth::is_loopback(&local);
+
+    // Decide auth state from the bind heuristic.
+    let auth_state = if !non_loopback {
+        if opts.no_auth {
+            eprintln!("ccteam web: --no-auth on loopback is the implicit default (no-op).");
+        }
+        AuthState::disabled()
+    } else if opts.no_auth {
+        eprintln!();
+        eprintln!(
+            "\x1b[1;31mWARNING:\x1b[0m --no-auth on non-loopback bind = LAN-wide RCE on bypassPermissions sessions.",
+        );
+        eprintln!("Press Ctrl-C within {}s to abort.", opts.no_auth_grace_secs.unwrap_or(5));
+        eprintln!();
+        let grace = opts.no_auth_grace_secs.unwrap_or(5);
+        if grace > 0 {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(grace)) => {},
+                _ = tokio::signal::ctrl_c() => {
+                    eprintln!("ccteam web: aborted during --no-auth grace window.");
+                    return Ok(());
+                }
+            }
+        }
+        AuthState::disabled()
+    } else {
+        let token_path = opts
+            .token_file
+            .clone()
+            .unwrap_or_else(|| token::default_token_path(&paths));
+        let token_existed = token_path.exists();
+        let hex = token::generate_or_load_token(&token_path)
+            .with_context(|| format!("load or generate token at {}", token_path.display()))?;
+        if !token_existed {
+            eprintln!("ccteam web: generated new auth token at {}", token_path.display());
+        }
+        // Echo to stderr (PRD §6.2.4) so the operator can paste it into
+        // a browser. Using stderr (not stdout) keeps the subprocess
+        // harness in tests free to parse the bind line on stdout
+        // unambiguously.
+        eprintln!("ccteam web: auth token: ccteam:{hex}");
+        eprintln!(
+            "ccteam web: reset token via:  rm {} && restart",
+            token_path.display(),
+        );
+        AuthState::enabled(hex)
+    };
 
     // Subprocess-friendly bind announcement. Format is stable:
-    // `ccteam web listening on http://<addr>`. The first line written
-    // to stdout, flushed before serving so test harnesses can read
-    // the port assigned to `:0`.
+    // `ccteam web listening on http://<addr>`. First line on stdout,
+    // flushed before serving so test harnesses can parse the assigned
+    // port when `bind = :0`.
     println!("ccteam web listening on http://{local}");
-    if opts.no_auth {
-        eprintln!("ccteam web: --no-auth is set (M5.3 will honor this on write endpoints).");
-    }
-    if let Some(token) = &opts.token_file {
-        eprintln!(
-            "ccteam web: --token-file {} (M5.3 will honor this on write endpoints).",
-            token.display(),
-        );
-    }
-    tracing::info!(addr = %local, "ccteam web bound");
+    tracing::info!(addr = %local, auth_enabled = auth_state.enabled, "ccteam web bound");
 
-    let app = router()?;
+    let state = AppState::with_auth(paths, auth_state);
+    let app = router_with_state(state);
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
@@ -192,16 +287,23 @@ mod tests {
 
     #[test]
     fn serve_opts_shape_is_stable() {
-        // M5.3 will read these three fields by name. If a future PR
-        // renames any of them, this test compiles-fails — a deliberate
-        // tripwire for M5.3 contract stability.
+        // M5.3 reads `bind` / `no_auth` / `token_file` /
+        // `no_auth_grace_secs` by name. If a future PR renames any of
+        // them, this test compiles-fails — a deliberate tripwire for
+        // contract stability.
         let opts = ServeOpts {
             bind: "127.0.0.1:7331".parse().unwrap(),
             no_auth: false,
             token_file: None,
+            no_auth_grace_secs: Some(5),
         };
         assert!(!opts.no_auth);
         assert!(opts.token_file.is_none());
         assert_eq!(opts.bind.port(), 7331);
+        assert_eq!(opts.no_auth_grace_secs, Some(5));
+        // Default keeps the same loopback bind + auth-on stance.
+        let d = ServeOpts::default();
+        assert!(d.bind.ip().is_loopback());
+        assert_eq!(d.no_auth_grace_secs, Some(5));
     }
 }

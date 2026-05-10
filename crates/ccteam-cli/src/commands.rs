@@ -2110,6 +2110,10 @@ pub fn run_web(opts: WebOptions) -> Result<()> {
         bind,
         no_auth: opts.no_auth,
         token_file: opts.token_file,
+        // Production CLI path keeps the 5 s Ctrl-C window so an
+        // operator who passes `--no-auth` on a non-loopback bind has
+        // a chance to abort before the LAN-RCE surface goes live.
+        no_auth_grace_secs: Some(5),
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

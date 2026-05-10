@@ -64,6 +64,18 @@ pub struct ProjectTemplate {
     pub state_json_pretty: String,
     pub events: Vec<EventRow>,
     pub outbox: Vec<OutboxRow>,
+    /// V0.3 M5.3 — write-action surface. Values:
+    ///
+    /// - `auth_enabled`: true ⇒ render the "Authenticated session"
+    ///   banner + emit `hx-headers` (or, here, plain JS fetch headers
+    ///   wired into form submits) carrying the bearer token.
+    /// - `auth_wire_token`: Some(`ccteam:<hex>`) when auth is on; the
+    ///   template inlines this only inside `hx-headers` attributes.
+    /// - `decision_candidates`: absolute paths matching
+    ///   `<project>/.ccteam/decision-*.md` for the form `<select>`.
+    pub auth_enabled: bool,
+    pub auth_wire_token: Option<String>,
+    pub decision_candidates: Vec<String>,
 }
 
 pub struct EventRow {

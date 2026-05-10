@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use ccteam_core::CcteamPaths;
 
+use crate::auth::AuthState;
 use crate::watcher::{spawn_watcher, EventBus};
 
 #[derive(Clone)]
@@ -23,6 +24,11 @@ pub struct AppState {
     /// `bus.subscribe()`; the producer side is owned by the
     /// dedicated watcher thread spawned in [`AppState::new`].
     pub bus: EventBus,
+    /// V0.3 M5.3 — auth gate state. Cloned per request, so the inner
+    /// `Arc<AuthState>` keeps the token allocation shared. When
+    /// `enabled = false` (loopback bind, or `--no-auth` opt-out) the
+    /// `auth_layer` middleware short-circuits to pass-through.
+    pub auth: Arc<AuthState>,
 }
 
 impl AppState {
@@ -31,7 +37,22 @@ impl AppState {
     /// we log + fall back to an inert bus so the read-only routes
     /// (`/`, `/project/<slug>`) still serve. SSE will simply have no
     /// publisher; clients reconnect harmlessly.
+    ///
+    /// Auth defaults to disabled — callers that want a token gate
+    /// (the `serve()` non-loopback path) construct via
+    /// [`AppState::with_auth`].
     pub fn new(paths: CcteamPaths) -> Self {
+        Self::build(paths, AuthState::disabled())
+    }
+
+    /// Construct an `AppState` with an explicit auth state. Used by
+    /// `serve()` once it has decided enabled / token from the bind
+    /// heuristic + token-file path.
+    pub fn with_auth(paths: CcteamPaths, auth: AuthState) -> Self {
+        Self::build(paths, auth)
+    }
+
+    fn build(paths: CcteamPaths, auth: AuthState) -> Self {
         let bus = match spawn_watcher(paths.progress_dir()) {
             Ok(b) => b,
             Err(err) => {
@@ -46,6 +67,7 @@ impl AppState {
         Self {
             paths: Arc::new(paths),
             bus,
+            auth: Arc::new(auth),
         }
     }
 
@@ -57,6 +79,7 @@ impl AppState {
         Self {
             paths: Arc::new(paths),
             bus,
+            auth: Arc::new(AuthState::disabled()),
         }
     }
 }
