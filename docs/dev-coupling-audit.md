@@ -32,13 +32,14 @@ P0 + 同 PR 关闭;**2026-05-08 V0.2 e2e retro**:加 F26-F33 八条 V0.2.1 候�
 **2026-05-09 V0.2.2 patch**:加 F34-F40 七条用户反馈 + 命名 sweep + UX 增强,跨 7 PR 全部修复;
 **2026-05-09 V0.2.2 e2e retro patch**:4-suite 并行 e2e 验证,撞 F41 (P1) + F42 (P1) + F43 (P2),同 PR 一波修;
 **2026-05-10 V0.2.2 F44 反向回滚**:`/usr/bin/cct` namespace 碰撞驱动整体反向 F39,F44 单 PR 覆盖;
-**2026-05-10 V0.3 doc-only kickoff**:加 F45 P1(write helper promote ccteam-cli → ccteam-core::actions,M5.0 关键解耦),实施在 V0.3 PR #1 / #4);**2026-05-10 V0.3 PR #1 ship**:F45 promote 部分修复(actions 模块 + mcp_serve wrapper 透传 + dep_graph 自检测试落地),仍待 M5.3 写动作 endpoint 消费才整体 close;**2026-05-10 V0.3 PR #4 ship**:F45 **整体 close**(M5.3 写动作 endpoint + token auth + URL-shim cookie + path-traversal 守卫全部 ship),分布:
+**2026-05-10 V0.3 doc-only kickoff**:加 F45 P1(write helper promote ccteam-cli → ccteam-core::actions,M5.0 关键解耦),实施在 V0.3 PR #1 / #4);**2026-05-10 V0.3 PR #1 ship**:F45 promote 部分修复(actions 模块 + mcp_serve wrapper 透传 + dep_graph 自检测试落地),仍待 M5.3 写动作 endpoint 消费才整体 close;**2026-05-10 V0.3 PR #4 ship**:F45 **整体 close**(M5.3 写动作 endpoint + token auth + URL-shim cookie + path-traversal 守卫全部 ship);**2026-05-10 V0.3.1 doc-only kickoff**:加 F46-F51 六条(战略 pivot:flex team kind + adhoc multi-session + HarnessAdapter trait + CodexAdapter stub + web flex 适配 + ship gate),待 V0.3.1 ship 后填 close 状态;分布:
 
 | 优先级 | 数量 | 编号 |
 |---|---|---|
 | **P0 阻塞泛化(剩余)** | 0 | — |
 | **P1 该做但可后置(剩余)** | 2 | F15(M1+ block-push 时做)、F23(conditional;待 spike 重跑) |
 | **P2 边角(剩余)** | 1 | F17 |
+| **V0.3.1 待 ship**(2026-05-10 加) | 6 | F46(P0)、F47(P1)、F48(P0)、F49(P0)、F50(P1)、F51(P0)|
 | **N/A 已是领域无关** | 2 | F14, F19(M3 docs sweep 后)|
 | **已修复** | 38 | F1 / F5 / F6 / F7 / F18(2026-05-07 rename PR;F1 触发逻辑实际早 M3.1 已切到 template.auto_loop,本 PR 完成命名层 sweep)、F2 / F3 / F4(M3.1 dag.rs)、F8(2026-05-07 directory scan)、F9 / F10 / F11(M3.4 team-aware bootstrap;F11 dev 仍裸 `phases/` 但非阻塞)、F12 / F13(M3.3 `--team` CLI + `state.team`)、F16(M3.4 phase 模板 team 化)、F20(M3.1+M3.4 retro_schema 数据形式 + product-research 填字段 + M4.1 phase 消费)、F21(@a5fb21d)、F22(PR #12)、**F24 / F25(2026-05-08 M0.23 PR)**、**F26 / F27 / F28 / F29 / F30 / F31 / F32 / F33(2026-05-08 V0.2.1 patch)**、**F34 / F35 / F36 / F37 / F38 / F39 / F40(2026-05-09 V0.2.2 patch — 7 finding 跨 7 PR)**、**F41 / F42 / F43(2026-05-09 V0.2.2 e2e retro patch)** |
 
@@ -750,6 +751,60 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
 - **2026-05-10 读端补强(V0.3 PR #2)**:`ProjectSummary` / `collect_projects` / `collect_recent_events` 同样 promote — 原存于 `ccteam-cli::commands` 公有 fn,但 `ccteam-web` 不能 depend on `ccteam-cli`(同 binary-as-library 反模式),不能 import 它们。新建 `crates/ccteam-core/src/queries.rs` 模块,move 三者过来 + 加 6 个单元测试;`ccteam-cli::commands` 留 `pub use ccteam_core::{collect_projects, collect_recent_events, ProjectSummary};` 让 `mcp_serve.rs` / `run_ls` / `run_progress` 现有 import 路径不变。M5.1 dashboard / project handler 直接调 `ccteam_core::queries::*`,dep_graph_test 仍绿。
 - **仍 open**:web 层 POST endpoint(`/api/<slug>/{btw,inject_decision,pause,resume}`)在 M5.3 落地后才真正消费 actions::*,届时本 finding 整体 close。
 - **2026-05-10 整体 close(V0.3 PR #4)**:`crates/ccteam-web/src/routes/actions.rs` 落地 — 四个 POST handler `handle_btw` / `handle_inject_decision` / `handle_pause` / `handle_resume` 全部 thin-call `ccteam_core::actions::*`,validation(text length 1..=4000 / decision body 1..=8000 / 路径 absolute + 不含 `..` + `starts_with(project_ccteam_dir(slug))`) 在 route boundary 完成。`crates/ccteam-web/src/auth.rs` 加 token-Bearer middleware(loopback 信任默认 / 非 loopback 自动开 + 文件 mode 0600 + URL shim cookie)+ `/health` 例外。`cargo tree -p ccteam-web | grep ccteam-cli` 仍 0 命中,dep_graph_test 守红线。47 新测试覆盖 actions 4 endpoint + auth 8 路径 + token 文件 5 场景;737 全绿(690 baseline → 737)。本 finding **整体 close**。
+
+### F46 — HarnessAdapter trait 缺位,Claude Code statusline 结构化数据丢失(2026-05-10 加;**待 V0.3.1 PR #1 ship**)
+
+- **文件:行号**:`crates/ccteam-core/src/harness.rs`(新建);`crates/ccteam-web/src/routes/sse.rs`(扩 harness SSE);`~/.claude/statusline-command.sh` wrapper 落 `~/.ccteam/harness/<slug>-<sid>.json`。
+- **现状**:V0.3 web UI dashboard 的数据源 = `progress.jsonl` + tmux pane 截图(F38);Claude Code statusline + subagent 面板里**有大量结构化数据**(模型名 / context% / token / cost / rate-limit / subagent),V0.3 dashboard 拿不到结构化版本(只截图视觉版),F35 enriched outbox 也只 ASCII pane_tail。V0.3.1 引入 Codex 后,session 也不再只有一种 harness — 需要 trait 抽象统一。
+- **是否真 dev-specific**:**否——presentation 信息抽象层。** 跟 phase / team 无关,所有 harness 都需要(claude / codex / 未来 cline / aider / 等)。
+- **解耦方案**:`crates/ccteam-core/src/harness.rs` 加 `HarnessAdapter` trait + `HarnessSnapshot` / `SubagentState` / `SpawnOpts` / `SessionHandle` / `HarnessError` 数据结构;`ClaudeCodeAdapter` 完整实现 trait 全部方法;`ccteam doctor --install-statusline-adapter` 安装 wrapper(marker `# ccteam-managed:statusline begin/end` 保护用户手改 + 原文件 backup .bak-<utc-ts>);`~/.ccteam/harness/<slug>-<sid>.json` 协议(stdin JSON 全覆盖,delta archive V0.4 deferred);web SSE `GET /sse/harness/<slug>` + `/sse/harness/<slug>/<sid>`。**红线**:harness snapshot 只是 presentation,**不参与 orchestrator 状态决策**(progress.jsonl 仍 SoT)。
+- **优先级**:**P0**(V0.3.1 foundation;F47/F49/F50 都依赖 trait shape)。
+- **来源**:`docs/v0-3-1/prd.md §3`;研究 doc `docs/research/v0-3-1-harness-adapter-plan.md`(V0.3 ship 前临时记录,本 finding 是其正式版);用户 Telegram 2026-05-10 message 311。
+
+### F47 — Codex CLI 缺前向兼容 trait stub,V0.3.2 实现无地方接入(2026-05-10 加;**待 V0.3.1 PR #2 ship**)
+
+- **文件:行号**:`crates/ccteam-core/src/harness.rs`(F46 后扩 `CodexAdapter`);`crates/ccteam-core/src/team.rs::TeamSpec`(加 `sessions: Vec<DefaultSessionSpec>` 字段);`crates/ccteam-cli/src/commands.rs::run_session_*`(`--harness=codex` flag);`run_doctor` 加 codex 检测段。
+- **现状**:V0.3.1 不实现 Codex 完整支持(`docs/research/ccteam-codex-integration.md` M2-M5 路线 ~月级工程量),但 CLI 与 schema 需要现在就接受 `harness: codex` 让用户提前声明意图,V0.3.2 落 `CodexAdapter` 实现时不破已 ship 代码。
+- **是否真 dev-specific**:**否——前向兼容 stub。**
+- **解耦方案**:`CodexAdapter` 全 stub 实现 trait,`spawn_session` / `ingest_snapshot` / `shutdown_session` 全返 `Err(HarnessError::NotImplemented { harness: "codex", reason: "Codex adapter is trait-stub in V0.3.1; full implementation tracked in docs/v0-3-1/prd.md §F47, deferred to V0.3.2+. Use --harness=claude or wait." })`(reason 是 `&'static str`,无 alloc);`team.yaml::sessions[]` schema(`harness: claude | codex`,serde 默认 `claude`);`ccteam session add --harness codex` 接受 flag,执行返友好 error + exit 1;`ccteam doctor` 检测 `which codex` 输出 informational(不 fail)。
+- **优先级**:**P1**(forward-compat 接口,本 PR 不阻塞用户跑 claude harness)。
+- **来源**:`docs/v0-3-1/prd.md §4` + `docs/research/ccteam-codex-integration.md` M0-M1 路线 + 用户 Telegram 2026-05-10 message 313 决策"V0.3.1 落 stub,V0.3.2 落 impl"。
+
+### F48 — `kind: flex` team kind 缺位,phase 编排是 ccteam 唯一工作姿态(2026-05-10 加;**待 V0.3.1 PR #3 ship**)
+
+- **文件:行号**:`crates/ccteam-core/src/team.rs::TeamSpec`(加 `kind: TeamKind` 字段);`crates/ccteam-core/src/orchestrator.rs::TeamRuntime`(加 `should_run_auto_loop` / `should_inject_phase` / `should_check_golden_rules` helpers);`crates/ccteam-core/src/team_factory.rs::init_team_staging`(`--kind=flex` 跳过 phase scaffold)。
+- **现状**:V0.1/V0.2/V0.3 ccteam 团队都是 phase-driven(workflow 暗含),没有"空 phase / 用户原生姿态驱动 session" 这种姿态。V0.3.1 战略 pivot 把 ccteam 扩展为 session farm,需要支持用户在 session 里自由跑(无 phase 注入 / 无 auto_loop / 无 golden_rules),ccteam 只观测 + 记录 + 提供控制面。
+- **是否真 dev-specific**:**否——team kind 抽象。**
+- **解耦方案**:`team.yaml::kind` 字段,`TeamKind { Workflow, MultiWorkflow, Flex }`,`#[serde(default)]` 保 V0.1/V0.2/V0.3 yaml parse 不变(默认 `Workflow`)。`kind: flex` 与 `parallelism`(phase 级字段)正交 — flex 团队无 phase 所以 `parallelism` 不适用。`TeamSpec::validate` 拒绝非法组合(flex + golden_rules / escalate_grammar_extensions / 非空 phase_dir)。orchestrator behavior gating 三个 helper(`should_run_auto_loop` 等)按 kind 返 bool;**flex 团队 silence_classifier / cost watcher / hooks / progress.jsonl / 跨项目 memory bridge 仍跑**(observability 全保留)。team factory `--kind=flex` scaffold 跳过 phase markdown。
+- **优先级**:**P0**(V0.3.1 战略 pivot 核心;F49 multi-session 在此基础上)。
+- **来源**:`docs/v0-3-1/prd.md §5`;用户 Telegram 2026-05-10 message 311 原话:"team 工厂创建出空的 phases 团队...用户原始用 claude code 方式来完成"。
+
+### F49 — Adhoc multi-session 缺位,单项目无法托管 N 个不同 harness session(2026-05-10 加;**待 V0.3.1 PR #4 ship**)
+
+- **文件:行号**:`crates/ccteam-cli/src/commands.rs::run_session_{add,ls,attach,rm}`(新建);`crates/ccteam-core/src/state.rs::ProjectState`(扩 `sessions: BTreeMap<sid, SessionRecord>` + `next_sid_seq: BTreeMap<harness, u64>` 字段);`crates/ccteam-hooks/src/progress.rs`(`progress.jsonl` 路径解析按 `state::team_kind` 分流到 `<slug>/<sid>.jsonl` 子目录 vs flat `<slug>.jsonl`)。
+- **现状**:V0.3 ccteam 项目 = 单 tmux session(except `parallelism: multi_session` 的 phase 级 fan-out 拓扑)。flex 团队需要 adhoc:用户起项目后任意时刻 `ccteam session add` 起新 session,删 session,attach 任一 session,混合 Claude+Codex(支持 cross-review pattern)。multi_session 的 master + 预定义 sub-module 是 phase 级、代码维度,**不**适合 adhoc + 进程维度。
+- **是否真 dev-specific**:**否——session 维度并行机制。**
+- **解耦方案**:**新轻量 session 注册**(不复用 multi_session 拓扑)— `~/projects/<team>-<slug>/.ccteam/sessions/<sid>/` 子目录,master `state.json::sessions{sid: {harness, tmux_session, started_at, pid}}` + `next_sid_seq{harness: u64}` 字段(serde default 空 BTreeMap 保 V0.3 单 session 项目兼容);sid 格式 `<harness>-<n>`,n 单调递增**删后不复用**;tmux 命名 `ccteam-<slug>-<sid>`(workflow / multi_workflow 项目仍 `ccteam-<slug>` 不变);`progress.jsonl` flex 项目走 `~/.ccteam/progress/<slug>/<sid>.jsonl`,workflow 项目仍 `<slug>.jsonl` flat;`ccteam session {add,ls,attach,rm}` CLI;**`rm` 是唯一显式用户授权 kill 路径**(CLAUDE.md §三 红线)。master state.json atomic write + retry-on-conflict 应对并发 add race。
+- **优先级**:**P0**(V0.3.1 战略 pivot 核心 — flex 团队的实际用法)。
+- **来源**:`docs/v0-3-1/prd.md §6`;用户 Telegram 2026-05-10 message 312"多 session 拉前 V0.3.1"决策。
+
+### F50 — Web 层假设单 session 项目,flex 团队无展示路径(2026-05-10 加;**待 V0.3.1 PR #5 ship**)
+
+- **文件:行号**:`crates/ccteam-web/templates/dashboard.html`(加 `Kind` 列);`crates/ccteam-web/templates/project.html`(flex 项目走 N session cards 模板分支);新模板 `templates/session.html` + handler `routes/session.rs`;`crates/ccteam-web/src/routes/sse.rs`(扩 `/sse/project/<slug>/<sid>` server-side filter);`crates/ccteam-core/src/screenshot.rs::render_screenshot`(签名加 `sid: Option<&str>`)。
+- **现状**:V0.3 web UI(M5.0-M5.4 ship)假设单 session 项目;V0.3.1 引入 flex + adhoc multi-session 后,dashboard 需要 `Kind` 列,project 详情页对 flex 走 N session cards,需要新页 `/session/<slug>/<sid>`,SSE 需要 sid filter,screenshot 需要扩 `<slug>-<sid>.png`。
+- **是否真 dev-specific**:**否——展示层适配。**
+- **解耦方案**:dashboard 加 `Kind` 列(workflow / multi_workflow / flex);`Phase` 列对 flex 项目渲染 `—`;flex 项目 detail 页走 N session cards 分支(harness badge 蓝/绿,缩略截图,Detail link);workflow / multi_workflow 项目 detail 完全不变(回归保证);新页 `/session/<slug>/<sid>` 渲染 header + per-session events / harness panel / write actions sidebar;`/sse/project/<slug>/<sid>` server-side `msg.sid == <sid>` 过滤(`EventMsg` 加 `sid: Option<String>`);`/sse/harness/<slug>/<sid>` 推 harness_snapshot;`/screenshot/<slug>-<sid>.png` 路由 — `render_screenshot(slug, Some(sid), opts)`;`/screenshot/<slug>.png` workflow 项目保留(V0.3 兼容)。
+- **优先级**:**P1**(展示层 — 用户首屏看到的 V0.3.1 价值,但不阻塞 backend ship)。
+- **来源**:`docs/v0-3-1/prd.md §7`;用户 Telegram 2026-05-10 message 315 dashboard 决策。
+
+### F51 — V0.3.1 ship gate(2026-05-10 加;**待 V0.3.1 PR #6 ship**)
+
+- **文件:行号**:`Cargo.toml`(workspace.package.version 0.3.0 → 0.3.1);`CLAUDE.md` §一 baseline 表格 + §六 易踩坑;`docs/v0-3-1/e2e-retro.md`(新建);`docs/v0-2/README.md`(V0.3 pointer 更新);`docs/dev-coupling-audit.md` F46-F51 close 标记;`crates/ccteam-web/tests/flex_e2e_test.rs`(新建)。
+- **现状**:V0.3.1 patch round(F46-F50)ship 后需要正式 ship gate。V0.2.2 政策:每 minor / patch release 必须 bump workspace.version + commit subject `vX.Y.Z:` 前缀。
+- **是否真 dev-specific**:**否——chore + ship gate。**
+- **解耦方案**:flex_e2e_test.rs 跑端到端(reqwest server happy path + codex error path);`Cargo.toml::workspace.package.version` `"0.3.0"` → `"0.3.1"`;CLAUDE.md §一 baseline 回填(workspace.version + 实测测试数 + V0.3.1 milestone 行);CLAUDE.md §六 加 V0.3 → V0.3.1 升级注;`docs/v0-3-1/e2e-retro.md` 4-suite 跨 flex 多 session / harness adapter / web UI / codex stub;`docs/v0-2/README.md` 更新 V0.3 起始 pointer 为 "已 ship V0.3 + V0.3.1";dev-coupling-audit.md F46-F51 close 标记;tech-design.md / interfaces.md 增量段终稿。
+- **优先级**:**P0**(ship gate)。
+- **来源**:`docs/v0-3-1/prd.md §8` / §12 / §13。
 
 ### F40 — `product-research` team 名冗长 + 领域名缺位(2026-05-09 加;**已修复:2026-05-09(V0.2.2 PR #6 alias 软迁移)**)
 
