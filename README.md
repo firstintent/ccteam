@@ -123,6 +123,30 @@ claude
 
 The meta-agent uses the `ccteam-control` skill plus the `ccteam-mcp` 9-tool MCP server you installed, so any Claude Code session understands ccteam.
 
+## Web dashboard (V0.3)
+
+A read+write web UI for browsing all projects, watching events stream live, and dispatching actions to running sessions:
+
+```bash
+# Local-only (no auth required)
+ccteam web --bind 127.0.0.1:7331
+# → open http://127.0.0.1:7331
+
+# LAN-accessible (auto-generates token at ~/.ccteam/web-token, mode 0600)
+ccteam web --bind 0.0.0.0:7331
+# → token printed to stderr; pass as ?token=ccteam:<token> on first visit
+#   (browser then stores HttpOnly cookie; subsequent navigation seamless)
+```
+
+Surface:
+
+- `/` — project list (slug / team / phase / last event / status badge / cost)
+- `/project/<slug>` — detail page (state + last 200 events + outbox + tmux pane screenshot)
+- Live updates via Server-Sent Events
+- Write actions: send `/btw <text>`, inject decisions, pause/resume per project
+
+Security: non-loopback bind requires `Authorization: Bearer ccteam:<token>` (or the cookie set by the URL shim) on every request — this header doubles as the CSRF token for write actions, since browsers won't auto-attach `Authorization` on cross-origin form submissions. `--no-auth` opt-out shows a 5-second stderr countdown so accidents are recoverable. See [`docs/v0-3/prd.md §9`](docs/v0-3/prd.md) for the full threat model.
+
 ## Built-in teams
 
 | Team | What it ships | When to use |

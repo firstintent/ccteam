@@ -1438,12 +1438,13 @@ ccteam doctor --migrate-recommended-agents        # V0.2 M0.20 一次性清理 V
 ccteam hook <subcmd>                              # debug:手动跑 hook(读 stdin JSON,写 stdout);
                                                   # subcmd ∈ {progress-append, parse-phase-end,
                                                   # cost-accumulate, load-context, block-push}
-ccteam web --bind 127.0.0.1:7331                  # V0.3 M5.1 read-only web UI(详见 §15;`/`
-                                                  # dashboard / `/project/<slug>` / `/assets/{file}`;
-                                                  # M5.2 SSE / M5.3 写动作 + token auth 后续 ship)
-ccteam web --bind 0.0.0.0:7331 [--no-auth]        # 同上,LAN 模式;M5.3 默认强 token 鉴权,
+ccteam web --bind 127.0.0.1:7331                  # V0.3 web UI(详见 §15;`/` dashboard /
+                                                  # `/project/<slug>` / `/assets/{file}` /
+                                                  # `/sse/{all,project/<slug>}` / `/screenshot/<slug>.png` /
+                                                  # `POST /api/<slug>/{btw,inject_decision,pause,resume}`)
+ccteam web --bind 0.0.0.0:7331 [--no-auth]        # 同上,LAN 模式;非 loopback 默认强 token 鉴权,
                                                   # `--no-auth` 5s 倒计时 + stderr warn 后照样 listen
-ccteam web --token-file <path>                    # 自定义 token 文件路径(M5.3 消费;默认 ~/.ccteam/web-token)
+ccteam web --token-file <path>                    # 自定义 token 文件路径(默认 ~/.ccteam/web-token)
 ```
 
 #### `ccteam stop` 行为契约(M1.5)
@@ -1743,24 +1744,28 @@ pub fn peek_pane(slug: &str, lines: Option<usize>) -> Result<PaneCapture, CoreEr
 
 ---
 
-## 15. Web UI 路由(V0.3 M5.1+)
+## 15. Web UI 路由(V0.3 已 ship)
 
-> V0.3 M5.1 起 `ccteam web --bind <addr>` 暴露本地 / 局域网 web UI。
-> 路由分两组:**stateless**(健康探针)+ **stateful**(消费 `CcteamPaths`
-> 的 dashboard / 项目详情 / 静态资源 / SSE / 截图)。本节列 M5.1+M5.2
-> ship 的全部路由;M5.3 加 `POST /api/<slug>/{btw,inject_decision,pause,resume}`。
+> V0.3 起 `ccteam web --bind <addr>` 暴露本地 / 局域网 web UI。路由分两组:
+> **stateless**(健康探针)+ **stateful**(消费 `CcteamPaths` 的 dashboard /
+> 项目详情 / 静态资源 / SSE / 截图 / 写动作)。`auth_layer` middleware 包
+> stateful 组(loopback bind 默认 disabled,非 loopback 默认 enabled)。
 
-### 15.1 路由表(M5.1+M5.2)
+### 15.1 路由表
 
 | Method | Path | 状态码 | Content-Type | 说明 |
 |---|---|---|---|---|
-| `GET` | `/health` | 200 | `application/json` | M5.0 liveness:`{"status":"ok","version":"<crate>"}` |
+| `GET` | `/health` | 200 | `application/json` | liveness:`{"status":"ok","version":"<crate>"}`;auth 例外 |
 | `GET` | `/` | 200 | `text/html; charset=utf-8` | 项目列表 dashboard;空时 fallback 文案 `No projects` |
 | `GET` | `/project/{slug}` | 200 / 404 | `text/html; charset=utf-8` / `text/plain` | 项目详情(state JSON / recent events / outbox / pane snapshot);未知 slug → 404 + plain text `project not found: <slug>` |
 | `GET` | `/assets/{file}` | 200 / 404 | `application/javascript; charset=utf-8`(htmx / htmx-ext-sse)/ `text/css; charset=utf-8`(style)/ `text/plain`(404) | vendored 静态资源;`Cache-Control: public, max-age=31536000, immutable`;白名单 = `htmx.min.js` / `htmx-ext-sse.js` / `style.css`,其他 file → 404 |
-| `GET` | `/sse/all` | 200 | `text/event-stream` | M5.2 全局 SSE 流:每条 progress.jsonl 写入推一帧 |
-| `GET` | `/sse/project/{slug}` | 200 | `text/event-stream` | M5.2 per-slug SSE 流:server-side 过滤,只发该 slug 事件 |
-| `GET` | `/screenshot/{slug}.png` | 200 / 404 / 504 | `image/png`(200)/ `text/plain`(404 / 504) | M5.2 按需 PNG 截图;F38 unavailable / tmux 无 session → 504 + 文本 reason;非 `<slug>.png` 路径 → 404 |
+| `GET` | `/sse/all` | 200 | `text/event-stream` | 全局 SSE 流:每条 progress.jsonl 写入推一帧 |
+| `GET` | `/sse/project/{slug}` | 200 | `text/event-stream` | per-slug SSE 流:server-side 过滤,只发该 slug 事件 |
+| `GET` | `/screenshot/{slug}.png` | 200 / 404 / 504 | `image/png`(200)/ `text/plain`(404 / 504) | 按需 PNG 截图;F38 unavailable / tmux 无 session → 504 + 文本 reason;非 `<slug>.png` 路径 → 404 |
+| `POST` | `/api/{slug}/btw` | 303 / 400 / 4xx | `text/plain`(error) | `text=<urlencoded, 1..=4000>`;详 §15.7 |
+| `POST` | `/api/{slug}/inject_decision` | 303 / 400 / 5xx | `text/plain`(error) | `path=<absolute>&body=<urlencoded, 1..=8000>`;详 §15.7 |
+| `POST` | `/api/{slug}/pause` | 303 / 4xx | `text/plain`(error) | 空 body;详 §15.7 |
+| `POST` | `/api/{slug}/resume` | 303 / 4xx | `text/plain`(error) | 空 body;详 §15.7 |
 
 ### 15.2 dashboard 行(`/` 表格)
 
@@ -1795,21 +1800,24 @@ CLAUDE.md §三 read-only 红线)。
    `reply` / `escalation` / `shipped` / `clarify`)+ `created_at` RFC3339 +
    `filename` + body 头 200 char。front-matter 解析失败渲染
    `(unparseable)` 占位,不 5xx。
-5. **Pane snapshot**(M5.2):页面加载即拉一次 `/screenshot/<slug>.png`,
-   下方 button 触发 cache-busting `?t=<ms>` 重新 fetch;F38 ~200-500 ms
-   render,**不 polling**(PRD §5.2.5)。
-6. **Live events**(M5.2):页面内嵌 `EventSource('/sse/project/<slug>')`
-   订阅 SSE 流,新 `progress` 事件 prepend 到 `#events-tbody`,client-side
-   滑动窗口截到 200 行;`reconnect_hint` 帧出现 → 1s 后 `location.reload()`。
+5. **Pane snapshot**:页面加载即拉一次 `/screenshot/<slug>.png`,下方 button
+   触发 cache-busting `?t=<ms>` 重新 fetch;F38 ~200-500 ms render,
+   **不 polling**(PRD §5.2.5)。
+6. **Live events**:页面内嵌 `EventSource('/sse/project/<slug>')` 订阅 SSE
+   流,新 `progress` 事件 prepend 到 `#events-tbody`,client-side 滑动窗口
+   截到 200 行;`reconnect_hint` 帧出现 → 1s 后 `location.reload()`。
+7. **写动作 forms**:`/btw`(自由文本 textarea,1..=4000)+
+   `/inject_decision`(structured path/body)+ `/pause` / `/resume` 按钮 —
+   全部 htmx `hx-post`,服务端 303 → 浏览器跟回详情页;详 §15.7 + §15.8。
 
 ### 15.4 静态资源协议
 
 - `htmx.min.js` ← `crates/ccteam-web/assets/htmx.min.js`(htmx 2.0.4
   upstream snapshot,BSD-2-Clause;详 `LICENSES.md`)
 - `htmx-ext-sse.js` ← `crates/ccteam-web/assets/htmx-ext-sse.js`(htmx 2.x
-  SSE extension upstream snapshot,BSD-2-Clause;V0.3 M5.2 起 vendored)
+  SSE extension upstream snapshot,BSD-2-Clause)
 - `style.css` ← `crates/ccteam-web/assets/style.css`(本仓自写 ~4 KB,
-  monospace + dark-mode-friendly,M5.2 加 live-dot + screenshot-panel)
+  monospace + dark-mode-friendly,含 live-dot + screenshot-panel)
 
 三者均通过 `include_bytes!` 编译期打包进 `ccteam` binary;`ccteam web` 自包含
 启动,无 npm / Vite / build toolchain 依赖,模仿 V0.2.2 F38 vendored TTF
@@ -1829,12 +1837,12 @@ CLAUDE.md §三 read-only 红线)。
   锁红线)。dashboard / project / assets / sse / screenshot handler 全部
   依赖 `ccteam-core::{queries, ProjectState, SessionMailbox,
   render_screenshot, ...}` 的 public surface。
-- **永远不主动 kill**:M5.1 / M5.2 是只读;M5.3 加写动作时仍守此红线,
-  web 层不发 SIGINT / Ctrl-C / `tmux kill-session`,只走 `actions::*`
-  (M5.0 promote)走 inbox + state.json 控制平面。
-- **截图不 polling**(M5.2):`/screenshot/<slug>.png` 仅在用户 click /
-  页面加载时同步调一次,`Cache-Control: no-cache, must-revalidate`;F38
-  渲染 ~200-500 ms,polling 烧 CPU 且 PNG 大不必要。
+- **永远不主动 kill**:web 层(包含写动作)不发 SIGINT / Ctrl-C /
+  `tmux kill-session`,只走 `ccteam_core::actions::*`(M5.0 promote)走
+  inbox + state.json 控制平面。
+- **截图不 polling**:`/screenshot/<slug>.png` 仅在用户 click / 页面加载时
+  同步调一次,`Cache-Control: no-cache, must-revalidate`;F38 渲染
+  ~200-500 ms,polling 烧 CPU 且 PNG 大不必要。
 
 ### 15.6 SSE wire format(M5.2)
 

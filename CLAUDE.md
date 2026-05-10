@@ -5,21 +5,21 @@
 
 ---
 
-## 一、当前状态(2026-05-09)
+## 一、当前状态(2026-05-10)
 
 | 项 | 值 |
 |---|---|
 | 仓库根 | `~/workplace/agents/ccteam` |
-| 主分支 main HEAD | **以 `git rev-parse origin/main` 为准**(V0.2.2 ship 后) |
-| Workspace version | **`0.2.2`**(V0.2.2 起跟版同步;V0.1/V0.2 ship 时 `0.0.1` 未跟,V0.2.2 retroactive 修正)|
-| 测试 baseline | **631 全绿**(`cargo test --workspace`;F44 加 2 个反向迁移测试)|
+| 主分支 main HEAD | **以 `git rev-parse origin/main` 为准**(V0.3 ship 后) |
+| Workspace version | **`0.3.0`**(V0.3 ship,2026-05-10) |
+| 测试 baseline | **738 全绿**(`cargo test --workspace`;V0.3 累计 +107 测试)|
 | Clippy | 4 pre-existing errors(非本仓引入,sweep 时确认相同基线) |
-| 代码规模 | ~12 kLOC across `ccteam-core` / `ccteam-cli` / `ccteam-hooks` |
-| 已 ship 里程碑 | **V0.1**:M0 / M0.5 / M1 / M2 / M2.3 / M3 / M4.1-M4.4 — 详 `docs/v0-1/README.md`<br>**V0.2**:M0.16-M0.23(8 个 milestone)— 详 `docs/v0-2/README.md`<br>**V0.2.2**:F34-F40 + F44(F39 cct convention sweep 已被 F44 反向回滚 / slug 4-tier + 决策树加固 / silence classifier / subagent guard / 截图 PNG / team alias)— 详 `docs/v0-2-2/README.md` |
-| 当前 next | V0.3 候选方向待定,deferred 项见 `docs/v0-2/README.md` 末尾 + `docs/v0-2-2/prd.md §11` |
+| 代码规模 | ~14 kLOC across `ccteam-core` / `ccteam-cli` / `ccteam-hooks` / `ccteam-web` |
+| 已 ship 里程碑 | **V0.1**:M0 / M0.5 / M1 / M2 / M2.3 / M3 / M4.1-M4.4 — 详 `docs/v0-1/README.md`<br>**V0.2**:M0.16-M0.23(8 个 milestone)— 详 `docs/v0-2/README.md`<br>**V0.2.2**:F34-F40 + F44(F39 cct rename 已 F44 反向回滚)— 详 `docs/v0-2-2/README.md`<br>**V0.3**:M5.0-M5.4(5 milestone:web UI scaffold + 写 helper 提取 / read-only dashboard / SSE + screenshot / 写动作 + token auth / e2e + ship gate)— 详 `docs/v0-3/README.md` |
+| 当前 next | V0.4 候选方向待定,deferred 项见 `docs/v0-3/prd.md §10`(OAuth / TLS / per-project ACL / 隧道集成等)|
 | 永久 deferred | M2.2 agent_team enablement(spike A,Claude Code 无 first-class CLI surface — 见 `docs/v0-1/m2-agent-team-spike.md`)|
 
-**ccteam 是 Claude Code 之上的元工具,不是独立 AI 系统**:每个项目一个 Claude Code 长 session(tmux 守护,hooks 上报,MCP 接外部);Rust orchestrator 编排(binary 名 `ccteam`);用户通过 meta-agent(常驻 ccteam-managed claude session)+ `ccteam-control` skill / `ccteam` MCP server(`mcp__ccteam__*` 命名空间)用自然语言对话操作。详见 `docs/tech-design.md` §2.1 三层架构。
+**ccteam 是 Claude Code 之上的元工具,不是独立 AI 系统**:每个项目一个 Claude Code 长 session(tmux 守护,hooks 上报,MCP 接外部);Rust orchestrator 编排(binary 名 `ccteam`);用户通过 meta-agent(常驻 ccteam-managed claude session)+ `ccteam-control` skill / `ccteam` MCP server(`mcp__ccteam__*` 命名空间)用自然语言对话操作。V0.3 起多一层 web UI(`ccteam web`,`crates/ccteam-web`)。详见 `docs/tech-design.md` §2.1 三层架构 + §3.8 Web 仪表盘。
 
 ---
 
