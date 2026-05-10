@@ -120,6 +120,7 @@ async fn sse_all_emits_synthetic_progress_event() {
 
     bus.publish_synthetic(ProgressUpdate {
         slug: "dev-foo".into(),
+        sid: None,
         event_json: r#"{"ts":"2026-05-10T12:00:00Z","event":"phase_inject","phase":"plan-eng"}"#
             .into(),
     });
@@ -149,10 +150,12 @@ async fn sse_project_filters_to_matching_slug() {
     // filtered out), then the one we care about.
     bus.publish_synthetic(ProgressUpdate {
         slug: "dev-other".into(),
+        sid: None,
         event_json: r#"{"event":"PostToolUse","tool":"Read"}"#.into(),
     });
     bus.publish_synthetic(ProgressUpdate {
         slug: "dev-target".into(),
+        sid: None,
         event_json: r#"{"event":"phase_done","phase":"ship"}"#.into(),
     });
 
@@ -168,6 +171,50 @@ async fn sse_project_filters_to_matching_slug() {
     assert!(
         bonus.is_none(),
         "unexpected extra event made it through filter: {:?}",
+        bonus
+    );
+}
+
+#[tokio::test]
+async fn sse_project_session_filters_to_matching_sid() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    std::fs::create_dir_all(paths.progress_dir()).unwrap();
+    let state = AppState::new(paths);
+    let bus = state.bus.clone();
+    let addr = spawn_server(state).await;
+
+    let mut lines = open_sse(addr, "/sse/project/dev-target/claude-1").await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    bus.publish_synthetic(ProgressUpdate {
+        slug: "dev-target".into(),
+        sid: Some("claude-2".into()),
+        event_json: r#"{"event":"PostToolUse","tool":"Read"}"#.into(),
+    });
+    bus.publish_synthetic(ProgressUpdate {
+        slug: "dev-target".into(),
+        sid: None,
+        event_json: r#"{"event":"phase_done","phase":"workflow"}"#.into(),
+    });
+    bus.publish_synthetic(ProgressUpdate {
+        slug: "dev-target".into(),
+        sid: Some("claude-1".into()),
+        event_json: r#"{"event":"PostToolUse","tool":"Edit"}"#.into(),
+    });
+
+    let payload = read_one_event(&mut lines, Duration::from_secs(2))
+        .await
+        .expect("expected one event for dev-target/claude-1");
+    let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(parsed["slug"], "dev-target");
+    assert_eq!(parsed["sid"], "claude-1");
+    assert_eq!(parsed["tool"], "Edit");
+
+    let bonus = read_one_event(&mut lines, Duration::from_millis(150)).await;
+    assert!(
+        bonus.is_none(),
+        "unexpected extra event made it through sid filter: {:?}",
         bonus
     );
 }

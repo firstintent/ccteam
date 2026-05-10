@@ -12,7 +12,7 @@
 //! §三 read-only red line.
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Router};
-use ccteam_core::collect_projects;
+use ccteam_core::{collect_projects, TeamKind};
 
 use crate::queries::{recent_event_summary, slug_recent_events};
 use crate::state::AppState;
@@ -55,7 +55,12 @@ fn build_template(app: &AppState) -> anyhow::Result<DashboardTemplate> {
         rows.push(DashboardRow {
             slug: s.state.slug.clone(),
             team: s.state.team.clone(),
-            current_phase: s.state.current_phase.clone(),
+            kind: team_kind_label(s.state.team_kind).to_string(),
+            current_phase: if s.state.team_kind == TeamKind::Flex {
+                String::new()
+            } else {
+                s.state.current_phase.clone()
+            },
             last_event_label,
             badge_class: badge.css_class(),
             badge_label: badge.label(),
@@ -68,4 +73,12 @@ fn build_template(app: &AppState) -> anyhow::Result<DashboardTemplate> {
         projects_root: app.paths.projects_root.display().to_string(),
         projects: rows,
     })
+}
+
+fn team_kind_label(kind: TeamKind) -> &'static str {
+    match kind {
+        TeamKind::Workflow => "workflow",
+        TeamKind::MultiWorkflow => "multi_workflow",
+        TeamKind::Flex => "flex",
+    }
 }

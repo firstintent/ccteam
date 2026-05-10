@@ -155,6 +155,70 @@ code {
 .badge.hung      { color: var(--yellow); border-color: var(--yellow); }
 .badge.limbo     { color: var(--orange); border-color: var(--orange); }
 .badge.runaway   { color: var(--red);    border-color: var(--red);    }
+.badge.harness-claude { color: var(--blue); border-color: var(--blue); }
+.badge.harness-codex  { color: var(--green); border-color: var(--green); }
+
+.session-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 0.75rem;
+}
+
+.session-card {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.75rem;
+}
+
+.session-card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+}
+
+.session-card-head h3 {
+    margin: 0;
+}
+
+.session-facts {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 0.25rem 0.75rem;
+    margin: 0.75rem 0;
+}
+
+.session-facts dt {
+    color: var(--fg-muted);
+}
+
+.session-facts dd {
+    margin: 0;
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.session-shot,
+.session-detail-shot {
+    display: block;
+    max-width: 100%;
+    min-height: 6rem;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: #101216;
+}
+
+.attach-command {
+    overflow-wrap: anywhere;
+}
+
+.harness-panel {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.75rem;
+}
 
 .outbox-list {
     list-style: none;

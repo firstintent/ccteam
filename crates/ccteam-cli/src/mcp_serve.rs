@@ -531,7 +531,7 @@ fn tool_screenshot(paths: &CcteamPaths, args: &Value) -> Result<String> {
         .get("lines")
         .and_then(|v| v.as_u64())
         .unwrap_or(50) as usize;
-    match render_screenshot(paths, &slug, lines)? {
+    match render_screenshot(paths, &slug, None, lines)? {
         Some(path) => Ok(serde_json::to_string_pretty(&json!({
             "ok": true,
             "slug": slug,

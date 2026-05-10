@@ -14,6 +14,7 @@ use axum::{
     routing::get,
     Router,
 };
+use ccteam_core::{ProjectState, TeamKind};
 
 use crate::state::AppState;
 
@@ -21,11 +22,31 @@ const SNAPSHOT_LINES: usize = 50;
 const FALLBACK_DIMS: (u16, u16) = (24, 80);
 
 pub fn router() -> Router<AppState> {
-    Router::new().route("/api/{slug}/pane-snapshot.ansi", get(handle_pane_snapshot))
+    Router::new()
+        .route("/api/{slug}/pane-snapshot.ansi", get(handle_pane_snapshot))
+        .route(
+            "/api/{slug}/{sid}/pane-snapshot.ansi",
+            get(handle_session_pane_snapshot),
+        )
 }
 
 async fn handle_pane_snapshot(State(app): State<AppState>, Path(slug): Path<String>) -> Response {
     let session_name = ccteam_core::session_name_for_project(app.paths.as_ref(), &slug);
+    serve_pane_snapshot(slug, None, session_name).await
+}
+
+async fn handle_session_pane_snapshot(
+    State(app): State<AppState>,
+    Path((slug, sid)): Path<(String, String)>,
+) -> Response {
+    let session_name = match session_name_for_project_session(&app, &slug, &sid) {
+        Ok(name) => name,
+        Err(resp) => return resp,
+    };
+    serve_pane_snapshot(slug, Some(sid), session_name).await
+}
+
+async fn serve_pane_snapshot(slug: String, sid: Option<String>, session_name: String) -> Response {
     let capture_session_name = session_name.clone();
     let capture = tokio::task::spawn_blocking(move || {
         capture_snapshot_bytes(&capture_session_name, SNAPSHOT_LINES)
@@ -36,7 +57,7 @@ async fn handle_pane_snapshot(State(app): State<AppState>, Path(slug): Path<Stri
         Ok(Ok(Some(snapshot))) => Some(snapshot),
         Ok(Ok(None)) => None,
         Ok(Err(err)) => {
-            tracing::warn!(slug, ?err, "pane snapshot capture returned Err");
+            tracing::warn!(slug = %slug, sid = ?sid, ?err, "pane snapshot capture returned Err");
             return (
                 StatusCode::GATEWAY_TIMEOUT,
                 format!("pane snapshot capture failed: {err}"),
@@ -44,7 +65,7 @@ async fn handle_pane_snapshot(State(app): State<AppState>, Path(slug): Path<Stri
                 .into_response();
         }
         Err(err) => {
-            tracing::warn!(slug, ?err, "pane snapshot worker failed");
+            tracing::warn!(slug = %slug, sid = ?sid, ?err, "pane snapshot worker failed");
             return (
                 StatusCode::GATEWAY_TIMEOUT,
                 format!("pane snapshot worker failed: {err}"),
@@ -81,6 +102,35 @@ async fn handle_pane_snapshot(State(app): State<AppState>, Path(slug): Path<Stri
         bytes,
     )
         .into_response()
+}
+
+fn session_name_for_project_session(
+    app: &AppState,
+    slug: &str,
+    sid: &str,
+) -> Result<String, Response> {
+    let state = ProjectState::load(&app.paths.project_state(slug)).map_err(|err| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("project not found or unreadable: {slug}: {err}"),
+        )
+            .into_response()
+    })?;
+    if state.team_kind != TeamKind::Flex {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("project {slug} is not a flex project"),
+        )
+            .into_response());
+    }
+    let record = state.sessions.get(sid).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("session not found: {slug}/{sid}"),
+        )
+            .into_response()
+    })?;
+    Ok(record.tmux_session.clone())
 }
 
 fn capture_snapshot_bytes(

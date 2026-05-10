@@ -50,6 +50,7 @@ use imageproc::rect::Rect;
 use vt100::Parser;
 
 use crate::paths::CcteamPaths;
+use crate::state::ProjectState;
 use crate::tmux::{
     capture_pane_with_ansi_from_session, query_pane_dims_from_session,
     session_name_for_project,
@@ -101,9 +102,13 @@ pub type ScreenshotResult = Result<Option<PathBuf>>;
 pub fn render_screenshot(
     paths: &CcteamPaths,
     slug: &str,
+    sid: Option<&str>,
     lines: usize,
 ) -> ScreenshotResult {
-    let session_name = session_name_for_project(paths, slug);
+    let session_name = match sid {
+        Some(sid) => session_name_for_project_session(paths, slug, sid),
+        None => session_name_for_project(paths, slug),
+    };
 
     // 1. tmux capture (ANSI escapes preserved).
     let ansi_bytes = match capture_pane_with_ansi_from_session(&session_name, lines) {
@@ -190,6 +195,14 @@ pub fn render_screenshot(
         return Ok(None);
     }
     Ok(Some(out))
+}
+
+fn session_name_for_project_session(paths: &CcteamPaths, slug: &str, sid: &str) -> String {
+    ProjectState::load(&paths.project_state(slug))
+        .ok()
+        .and_then(|state| state.sessions.get(sid).map(|record| record.tmux_session.clone()))
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| format!("ccteam-{slug}-{sid}"))
 }
 
 /// Inner render path — pure compute over the ANSI byte stream + font.
@@ -405,6 +418,7 @@ mod tests {
         let result = render_screenshot(
             &paths,
             "this-slug-definitely-doesnt-exist-xyz-123",
+            None,
             10,
         )
         .expect("graceful degrade returns Ok");

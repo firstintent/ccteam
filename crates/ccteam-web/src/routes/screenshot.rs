@@ -57,7 +57,7 @@ async fn handle_screenshot(State(app): State<AppState>, Path(file): Path<String>
     // Strip the `.png` suffix to recover the slug. Anything else is a
     // 404 — the path stays narrow so a future `.jpg` or thumbnail
     // doesn't accidentally land here.
-    let slug = match file.strip_suffix(".png") {
+    let stem = match file.strip_suffix(".png") {
         Some(s) if !s.is_empty() => s.to_string(),
         _ => {
             return (
@@ -67,10 +67,11 @@ async fn handle_screenshot(State(app): State<AppState>, Path(file): Path<String>
                 .into_response();
         }
     };
+    let (slug, sid) = resolve_screenshot_target(&app, &stem);
 
     let paths: CcteamPaths = (*app.paths).clone();
     let render = tokio::task::spawn_blocking(move || {
-        ccteam_core::render_screenshot(&paths, &slug, SCREENSHOT_LINES)
+        ccteam_core::render_screenshot(&paths, &slug, sid.as_deref(), SCREENSHOT_LINES)
     })
     .await;
 
@@ -137,4 +138,94 @@ async fn handle_screenshot(State(app): State<AppState>, Path(file): Path<String>
         bytes,
     )
         .into_response()
+}
+
+fn resolve_screenshot_target(app: &AppState, stem: &str) -> (String, Option<String>) {
+    if app.paths.project_state(stem).exists() {
+        return (stem.to_string(), None);
+    }
+    if let Some((slug, sid)) = split_slug_sid(stem) {
+        if ccteam_core::ProjectState::load(&app.paths.project_state(slug))
+            .map(|state| state.sessions.contains_key(sid))
+            .unwrap_or(false)
+        {
+            return (slug.to_string(), Some(sid.to_string()));
+        }
+    }
+    (stem.to_string(), None)
+}
+
+fn split_slug_sid(stem: &str) -> Option<(&str, &str)> {
+    for marker in ["-claude-", "-codex-"] {
+        if let Some(idx) = stem.rfind(marker) {
+            let slug = &stem[..idx];
+            let sid = &stem[idx + 1..];
+            let digits = sid.rsplit_once('-')?.1;
+            if !slug.is_empty() && !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+            {
+                return Some((slug, sid));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ccteam_core::{HarnessKind, ProjectState, SessionRecord, TeamKind};
+    use chrono::Utc;
+
+    fn fake_app() -> (tempfile::TempDir, AppState) {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join(".ccteam"),
+            projects_root: tmp.path().join("projects"),
+        };
+        (tmp, AppState::new(paths))
+    }
+
+    #[test]
+    fn split_slug_sid_handles_hyphenated_slug() {
+        assert_eq!(
+            split_slug_sid("research-bigquery-tax-claude-12"),
+            Some(("research-bigquery-tax", "claude-12")),
+        );
+    }
+
+    #[test]
+    fn resolve_screenshot_target_uses_registered_flex_sid() {
+        let (_tmp, app) = fake_app();
+        let mut state = ProjectState::initial_for_team("dev-flex".into(), "dev".into());
+        state.team_kind = TeamKind::Flex;
+        state.sessions.insert(
+            "claude-1".into(),
+            SessionRecord {
+                harness: HarnessKind::Claude,
+                tmux_session: "ccteam-dev-flex-claude-1".into(),
+                started_at: Utc::now(),
+                pid: None,
+            },
+        );
+        state.save(&app.paths.project_state("dev-flex")).unwrap();
+
+        assert_eq!(
+            resolve_screenshot_target(&app, "dev-flex-claude-1"),
+            ("dev-flex".into(), Some("claude-1".into())),
+        );
+    }
+
+    #[test]
+    fn resolve_screenshot_target_prefers_exact_slug_over_sid_suffix() {
+        let (_tmp, app) = fake_app();
+        let exact = ProjectState::initial("dev-flex-claude-1".into());
+        exact
+            .save(&app.paths.project_state("dev-flex-claude-1"))
+            .unwrap();
+
+        assert_eq!(
+            resolve_screenshot_target(&app, "dev-flex-claude-1"),
+            ("dev-flex-claude-1".into(), None),
+        );
+    }
 }

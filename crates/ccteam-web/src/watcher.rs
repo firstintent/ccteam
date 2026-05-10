@@ -62,6 +62,10 @@ pub const BROADCAST_CAPACITY: usize = 1024;
 #[derive(Clone, Debug)]
 pub struct ProgressUpdate {
     pub slug: String,
+    /// V0.3.1 F50 — flex session id parsed from
+    /// `~/.ccteam/progress/<slug>/<sid>.jsonl`. Legacy workflow
+    /// `<slug>.jsonl` streams leave this as `None`.
+    pub sid: Option<String>,
     /// Owned single-line JSON string. Already trimmed of trailing
     /// `\n`. Always parseable as a JSON object — invalid lines are
     /// dropped at the watcher with a `tracing::warn!` rather than
@@ -277,11 +281,11 @@ fn drain_new_lines(
     tx: &broadcast::Sender<ProgressUpdate>,
     watermarks: &Arc<std::sync::Mutex<HashMap<PathBuf, u64>>>,
 ) -> Result<()> {
-    let slug = match path.file_stem().and_then(|s| s.to_str()) {
-        Some(s) => s.to_string(),
+    let (slug, sid) = match progress_slug_sid(path) {
+        Some(pair) => pair,
         None => {
-            // Defensive — `is_progress_file` already filtered, but a
-            // weird path (`.jsonl` with no stem) shouldn't crash.
+            // Defensive — `is_progress_file` already filtered, but
+            // a weird path shouldn't crash.
             return Ok(());
         }
     };
@@ -362,6 +366,7 @@ fn drain_new_lines(
         }
         let msg = ProgressUpdate {
             slug: slug.clone(),
+            sid: sid.clone(),
             event_json: line.to_string(),
         };
         // `send` returns Err if there are no subscribers, which is
@@ -373,21 +378,45 @@ fn drain_new_lines(
     Ok(())
 }
 
+fn progress_slug_sid(path: &Path) -> Option<(String, Option<String>)> {
+    let sid_or_slug = path.file_stem()?.to_str()?.to_string();
+    let parent_name = path.parent()?.file_name()?.to_str()?;
+    if parent_name != "progress" && is_session_sid(&sid_or_slug) {
+        Some((parent_name.to_string(), Some(sid_or_slug)))
+    } else {
+        Some((sid_or_slug, None))
+    }
+}
+
+fn is_session_sid(value: &str) -> bool {
+    let Some((prefix, seq)) = value.rsplit_once('-') else {
+        return false;
+    };
+    matches!(prefix, "claude" | "codex")
+        && !seq.is_empty()
+        && seq.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// Seed watermarks at the current file size for every existing
 /// `<slug>.jsonl` so connecting clients don't see history.
 fn initial_watermarks(progress_dir: &Path) -> HashMap<PathBuf, u64> {
     let mut out = HashMap::new();
-    let entries = match std::fs::read_dir(progress_dir) {
-        Ok(e) => e,
-        Err(_) => return out,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !is_progress_file(&path) {
-            continue;
-        }
-        if let Ok(meta) = entry.metadata() {
-            out.insert(path, meta.len());
+    let mut stack = vec![progress_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(path);
+            } else if is_progress_file(&path) {
+                out.insert(path, meta.len());
+            }
         }
     }
     out
@@ -599,6 +628,16 @@ mod tests {
     }
 
     #[test]
+    fn initial_watermarks_seeds_nested_session_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("dev-flex").join("claude-1.jsonl");
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(&f, b"{}\n").unwrap();
+        let wm = initial_watermarks(tmp.path());
+        assert_eq!(wm.get(&f).copied(), Some(3));
+    }
+
+    #[test]
     fn drain_new_lines_emits_appended_lines() {
         let tmp = tempfile::tempdir().unwrap();
         let f = tmp.path().join("dev-foo.jsonl");
@@ -621,8 +660,10 @@ mod tests {
         let m1 = rx.try_recv().unwrap();
         let m2 = rx.try_recv().unwrap();
         assert_eq!(m1.slug, "dev-foo");
+        assert_eq!(m1.sid, None);
         assert!(m1.event_json.contains("phase_inject"));
         assert_eq!(m2.slug, "dev-foo");
+        assert_eq!(m2.sid, None);
         assert!(m2.event_json.contains("PostToolUse"));
         assert!(rx.try_recv().is_err());
 
@@ -642,8 +683,24 @@ mod tests {
         drain_new_lines(&f, &tx, &wm).unwrap();
         let m = rx.try_recv().unwrap();
         assert_eq!(m.slug, "dev-bar");
+        assert_eq!(m.sid, None);
         assert!(m.event_json.contains("good"));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn drain_new_lines_tags_nested_session_sid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("dev-flex").join("claude-1.jsonl");
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(&f, b"{\"event\":\"PostToolUse\",\"tool\":\"Read\"}\n").unwrap();
+
+        let (tx, mut rx) = broadcast::channel::<ProgressUpdate>(BROADCAST_CAPACITY);
+        let wm = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        drain_new_lines(&f, &tx, &wm).unwrap();
+        let m = rx.try_recv().unwrap();
+        assert_eq!(m.slug, "dev-flex");
+        assert_eq!(m.sid.as_deref(), Some("claude-1"));
     }
 
     #[test]

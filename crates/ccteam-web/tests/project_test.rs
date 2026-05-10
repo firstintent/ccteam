@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use ccteam_core::inbox::{
     outbox_filename, OutboxEventKind, OutboxFrontMatter, OutboxMessage, OutboxPriority,
 };
-use ccteam_core::{CcteamPaths, ProjectState};
+use ccteam_core::{CcteamPaths, HarnessKind, ProjectState, SessionRecord, TeamKind};
 use ccteam_web::{router_with_state, AppState};
 use chrono::Utc;
 use serde_json::json;
@@ -22,6 +22,42 @@ fn fake_paths(root: &std::path::Path) -> CcteamPaths {
         root: root.join(".ccteam"),
         projects_root: root.join("projects"),
     }
+}
+
+fn fixture_flex_project(paths: &CcteamPaths, slug: &str) {
+    let mut state = ProjectState::initial(slug.to_string());
+    state.team_kind = TeamKind::Flex;
+    state.current_phase = "must-not-render".into();
+    state.sessions.insert(
+        "claude-1".into(),
+        SessionRecord {
+            harness: HarnessKind::Claude,
+            tmux_session: format!("ccteam-{slug}-claude-1"),
+            started_at: Utc::now(),
+            pid: None,
+        },
+    );
+    state.sessions.insert(
+        "codex-1".into(),
+        SessionRecord {
+            harness: HarnessKind::Codex,
+            tmux_session: format!("ccteam-{slug}-codex-1"),
+            started_at: Utc::now(),
+            pid: None,
+        },
+    );
+    state.save(&paths.project_state(slug)).unwrap();
+
+    let claude_progress = paths.progress_jsonl_for_session(slug, "claude-1");
+    fs::create_dir_all(claude_progress.parent().unwrap()).unwrap();
+    fs::write(
+        &claude_progress,
+        format!(
+            "{}\n",
+            json!({"ts": "2026-05-10T10:01:00Z", "event": "PostToolUse", "tool": "Read"})
+        ),
+    )
+    .unwrap();
 }
 
 async fn spawn_server(state: AppState) -> SocketAddr {
@@ -200,4 +236,117 @@ async fn project_detail_limits_recent_events_to_latest_ten() {
         body.contains("var MAX_ROWS = 10"),
         "SSE row cap should match the server-rendered limit"
     );
+}
+
+#[tokio::test]
+async fn flex_project_detail_renders_session_cards() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let slug = "dev-flex";
+    fixture_flex_project(&paths, slug);
+
+    let addr = spawn_server(AppState::new(paths)).await;
+    let url = format!("http://{addr}/project/{slug}");
+    let resp = reqwest::get(&url).await.expect("GET /project/<slug>");
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+
+    assert!(body.contains("Sessions (2)"), "body=\n{body}");
+    assert!(body.contains("/session/dev-flex/claude-1"), "body=\n{body}");
+    assert!(body.contains("/session/dev-flex/codex-1"), "body=\n{body}");
+    assert!(body.contains("harness-claude"), "body=\n{body}");
+    assert!(body.contains("harness-codex"), "body=\n{body}");
+    assert!(
+        body.contains("/screenshot/dev-flex-claude-1.png")
+            && body.contains("tmux attach -t ccteam-dev-flex-claude-1"),
+        "session card screenshot and attach command missing. body=\n{body}",
+    );
+    assert!(
+        !body.contains("must-not-render"),
+        "flex project detail must not render workflow current_phase. body=\n{body}",
+    );
+}
+
+#[tokio::test]
+async fn session_detail_renders_registered_flex_session() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let slug = "dev-flex";
+    fixture_flex_project(&paths, slug);
+
+    let addr = spawn_server(AppState::new(paths)).await;
+    let url = format!("http://{addr}/session/{slug}/claude-1");
+    let resp = reqwest::get(&url).await.expect("GET /session/<slug>/<sid>");
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+
+    assert!(body.contains("dev-flex / claude-1"), "body=\n{body}");
+    assert!(body.contains("harness-claude"), "body=\n{body}");
+    assert!(
+        body.contains("/sse/project/dev-flex/claude-1")
+            && body.contains("/sse/harness/dev-flex/claude-1"),
+        "session detail should subscribe to per-session streams. body=\n{body}",
+    );
+    assert!(
+        body.contains("/api/dev-flex/claude-1/pane-snapshot.ansi")
+            && body.contains("/screenshot/dev-flex-claude-1.png"),
+        "session detail should expose sid-scoped snapshots. body=\n{body}",
+    );
+    assert!(
+        body.contains("/api/dev-flex/claude-1/btw")
+            && body.contains("/api/dev-flex/claude-1/pause")
+            && body.contains("/api/dev-flex/claude-1/resume"),
+        "session detail should post through sid-scoped actions. body=\n{body}",
+    );
+}
+
+#[tokio::test]
+async fn session_detail_returns_404_for_unknown_sid() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let slug = "dev-flex";
+    fixture_flex_project(&paths, slug);
+
+    let addr = spawn_server(AppState::new(paths)).await;
+    let url = format!("http://{addr}/session/{slug}/claude-99");
+    let resp = reqwest::get(&url).await.expect("GET /session/<slug>/<sid>");
+    assert_eq!(resp.status(), 404);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("session not found"), "body=\n{body}");
+}
+
+#[tokio::test]
+async fn session_btw_posts_to_session_inbox() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let paths_for_assert = paths.clone();
+    let slug = "dev-flex";
+    fixture_flex_project(&paths, slug);
+
+    let addr = spawn_server(AppState::new(paths)).await;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let url = format!("http://{addr}/api/{slug}/claude-1/btw");
+    let resp = client
+        .post(url)
+        .form(&[("text", "hello session")])
+        .send()
+        .await
+        .expect("POST session btw");
+    assert_eq!(resp.status(), 303);
+
+    let inbox_dir = paths_for_assert
+        .project_session_dir(slug, "claude-1")
+        .join("inbox");
+    let mut entries = fs::read_dir(&inbox_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    entries.sort();
+    assert_eq!(entries.len(), 1);
+    let body = fs::read_to_string(&entries[0]).unwrap();
+    assert!(body.contains("source: ccteam-web"), "body=\n{body}");
+    assert!(body.contains("hello session"), "body=\n{body}");
 }

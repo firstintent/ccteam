@@ -6,8 +6,9 @@
 
 use std::net::SocketAddr;
 
-use ccteam_core::{CcteamPaths, ProjectState};
+use ccteam_core::{CcteamPaths, HarnessKind, ProjectState, SessionRecord, TeamKind};
 use ccteam_web::{router_with_state, AppState};
+use chrono::Utc;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
@@ -77,4 +78,52 @@ async fn pane_snapshot_uses_state_tmux_session_for_meta_projects() {
         body.contains("ccteam-meta-cto"),
         "degraded response should identify the state-backed tmux session; got: {body}",
     );
+}
+
+#[tokio::test]
+async fn pane_snapshot_uses_state_tmux_session_for_flex_sid() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    std::fs::create_dir_all(paths.progress_dir()).unwrap();
+    let mut project = ProjectState::initial_for_team("dev-flex".into(), "dev".into());
+    project.team_kind = TeamKind::Flex;
+    project.sessions.insert(
+        "claude-1".into(),
+        SessionRecord {
+            harness: HarnessKind::Claude,
+            tmux_session: "ccteam-dev-flex-claude-1".into(),
+            started_at: Utc::now(),
+            pid: None,
+        },
+    );
+    project.save(&paths.project_state("dev-flex")).unwrap();
+
+    let state = AppState::new(paths);
+    let addr = spawn_server(state).await;
+
+    let url = format!("http://{addr}/api/dev-flex/claude-1/pane-snapshot.ansi");
+    let resp = reqwest::get(&url).await.expect("GET pane snapshot");
+    assert_eq!(resp.status(), 504);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("ccteam-dev-flex-claude-1"),
+        "degraded response should identify the sid-backed tmux session; got: {body}",
+    );
+}
+
+#[tokio::test]
+async fn pane_snapshot_returns_404_for_unknown_flex_sid() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    std::fs::create_dir_all(paths.progress_dir()).unwrap();
+    let mut project = ProjectState::initial_for_team("dev-flex".into(), "dev".into());
+    project.team_kind = TeamKind::Flex;
+    project.save(&paths.project_state("dev-flex")).unwrap();
+
+    let state = AppState::new(paths);
+    let addr = spawn_server(state).await;
+
+    let url = format!("http://{addr}/api/dev-flex/claude-1/pane-snapshot.ansi");
+    let resp = reqwest::get(&url).await.expect("GET pane snapshot");
+    assert_eq!(resp.status(), 404);
 }

@@ -1859,17 +1859,24 @@ pub fn peek_pane(slug: &str, lines: Option<usize>) -> Result<PaneCapture, CoreEr
 | `GET` | `/health` | 200 | `application/json` | liveness:`{"status":"ok","version":"<crate>"}`;auth 例外 |
 | `GET` | `/` | 200 | `text/html; charset=utf-8` | 项目列表 dashboard;空时 fallback 文案 `No projects` |
 | `GET` | `/project/{slug}` | 200 / 404 | `text/html; charset=utf-8` / `text/plain` | 项目详情(state JSON / recent events / outbox / pane snapshot);未知 slug → 404 + plain text `project not found: <slug>` |
+| `GET` | `/session/{slug}/{sid}` | 200 / 404 | `text/html; charset=utf-8` / `text/plain` | V0.3.1 F50:flex session 详情(per-session events / harness snapshot / sid-scoped controls);未知 sid → 404 |
 | `GET` | `/assets/{file}` | 200 / 404 | `application/javascript; charset=utf-8`(htmx / htmx-ext-sse / xterm)/ `text/css; charset=utf-8`(style / xterm)/ `text/plain`(404) | vendored 静态资源;`Cache-Control: public, max-age=31536000, immutable`;白名单 = `htmx.min.js` / `htmx-ext-sse.js` / `xterm.js` / `xterm.css` / `style.css`,其他 file → 404 |
 | `GET` | `/sse/all` | 200 | `text/event-stream` | 全局 SSE 流:每条 progress.jsonl 写入推一帧 |
 | `GET` | `/sse/project/{slug}` | 200 | `text/event-stream` | per-slug SSE 流:server-side 过滤,只发该 slug 事件 |
+| `GET` | `/sse/project/{slug}/{sid}` | 200 | `text/event-stream` | V0.3.1 F50:per-flex-session SSE 流:只发该 `(slug,sid)` 事件 |
 | `GET` | `/sse/harness/{slug}` | 200 | `text/event-stream` | V0.3.1 F46:per-slug harness 状态流,该 slug 下所有 sid 的 statusline snapshot |
 | `GET` | `/sse/harness/{slug}/{sid}` | 200 | `text/event-stream` | V0.3.1 F46:per-(slug,sid) harness 状态流,只发该 session 的 snapshot |
 | `GET` | `/api/{slug}/pane-snapshot.ansi` | 200 / 504 | `application/octet-stream`(200)/ `text/plain`(504) | 按需 tmux ANSI snapshot;xterm.js 浏览器端只读渲染;headers:`x-ccteam-pane-rows` / `x-ccteam-pane-cols`;tmux 无 session → 504 |
+| `GET` | `/api/{slug}/{sid}/pane-snapshot.ansi` | 200 / 404 / 504 | `application/octet-stream`(200)/ `text/plain`(404 / 504) | V0.3.1 F50:按 `state.json::sessions[{sid}].tmux_session` 捕获 flex session pane |
 | `GET` | `/screenshot/{slug}.png` | 200 / 404 / 504 | `image/png`(200)/ `text/plain`(404 / 504) | 按需 PNG 截图;F38 unavailable / tmux 无 session → 504 + 文本 reason;非 `<slug>.png` 路径 → 404 |
+| `GET` | `/screenshot/{slug}-{sid}.png` | 200 / 404 / 504 | `image/png`(200)/ `text/plain`(404 / 504) | V0.3.1 F50:flex session PNG 截图;`sid` 通过 master `state.json::sessions` 解析,slug 含 hyphen 兼容 |
 | `POST` | `/api/{slug}/btw` | 303 / 400 / 4xx | `text/plain`(error) | `text=<urlencoded, 1..=4000>`;详 §15.7 |
+| `POST` | `/api/{slug}/{sid}/btw` | 303 / 400 / 404 | `text/plain`(error) | V0.3.1 F50:`text=<urlencoded, 1..=4000>`,写 flex session 私有 inbox |
 | `POST` | `/api/{slug}/inject_decision` | 303 / 400 / 5xx | `text/plain`(error) | `path=<absolute>&body=<urlencoded, 1..=8000>`;详 §15.7 |
 | `POST` | `/api/{slug}/pause` | 303 / 4xx | `text/plain`(error) | 空 body;详 §15.7 |
+| `POST` | `/api/{slug}/{sid}/pause` | 303 / 4xx | `text/plain`(error) | V0.3.1 F50:sid 校验后走 project-level pause,返回 `/session/{slug}/{sid}` |
 | `POST` | `/api/{slug}/resume` | 303 / 4xx | `text/plain`(error) | 空 body;详 §15.7 |
+| `POST` | `/api/{slug}/{sid}/resume` | 303 / 4xx | `text/plain`(error) | V0.3.1 F50:sid 校验后走 project-level resume,返回 `/session/{slug}/{sid}` |
 
 ### 15.2 dashboard 行(`/` 表格)
 
@@ -1879,7 +1886,8 @@ pub fn peek_pane(slug: &str, lines: Option<usize>) -> Result<PaneCapture, CoreEr
 |---|---|
 | Slug | `state.slug`(linked 到 `/project/<slug>`)|
 | Team | `state.team` |
-| Phase | `state.current_phase`(空时 `—`)|
+| Kind | `state.team_kind`(`workflow` / `multi_workflow` / `flex`) |
+| Phase | `state.current_phase`(空时 `—`;`kind: flex` 不显示 workflow phase)|
 | Last event | `Utc::now() - state.last_progress_event_at` 的 humanized 时长(`30s ago` / `15m ago` / `2h ago`)|
 | Status | `silence_classifier::classify(events, silent_seconds, default thresholds)` 之一:`healthy` / `terminal` / `subagent` / `runaway` / `tool-hung` / `limbo` |
 | Cost | `state.cost_used_usd`,`%.2f` 格式 |
@@ -1915,6 +1923,32 @@ CLAUDE.md §三 read-only 红线)。
 7. **写动作 forms**:`/btw`(自由文本 textarea,1..=4000)+
    `/inject_decision`(structured path/body)+ `/pause` / `/resume` 按钮 —
    全部 htmx `hx-post`,服务端 303 → 浏览器跟回详情页;详 §15.7 + §15.8。
+
+`kind: flex` 项目详情页不渲染 workflow state / phase controls,改为:
+
+- **Sessions grid**:`state.json::sessions` 每个 sid 一张卡,显示 harness
+  badge / tmux session / status / last event / cost,点击进入
+  `/session/<slug>/<sid>`。
+- **Session screenshots**:卡片 PNG 使用 `/screenshot/<slug>-<sid>.png`;
+  sid 通过 master state 校验,不靠字符串切 slug。
+- **Live events**:项目页仍订阅 `/sse/project/<slug>` 聚合该 flex 项目所有
+  session progress stream。
+
+### 15.3.1 flex session 详情(`/session/<slug>/<sid>`)
+
+仅对 `kind: flex` 项目有效。读路径按 sid 收敛:
+
+1. **Header**:slug / sid / team / harness / tmux session / status / cost。
+2. **Harness snapshot**:读 `~/.ccteam/harness/<slug>-<sid>.json`,并订阅
+   `/sse/harness/<slug>/<sid>` 实时更新。
+3. **Pane snapshot**:页面加载和手动 refresh 拉
+   `/api/<slug>/<sid>/pane-snapshot.ansi`;PNG fallback 是
+   `/screenshot/<slug>-<sid>.png`。
+4. **Recent events**:只读
+   `~/.ccteam/progress/<slug>/<sid>.jsonl`,页面 SSE 订阅
+   `/sse/project/<slug>/<sid>`。
+5. **写动作 forms**:`/api/<slug>/<sid>/btw` 写 session 私有 inbox;
+   pause / resume sid 路由只做 sid 校验,然后沿用 project-level 控制状态。
 
 ### 15.4 静态资源协议
 
@@ -1957,7 +1991,9 @@ CLAUDE.md §三 read-only 红线)。
 
 ### 15.6 SSE wire format(M5.2)
 
-两个 SSE endpoint(`/sse/all` + `/sse/project/<slug>`)wire 格式完全一致:
+三个 progress SSE endpoint(`/sse/all` + `/sse/project/<slug>` +
+`/sse/project/<slug>/<sid>`)wire 格式完全一致;session endpoint 额外按
+`ProgressUpdate.sid` 过滤:
 
 ```
 event: progress
@@ -1977,8 +2013,9 @@ data: {"type":"reconnect_hint","reason":"Lagged(1024)"}
 
 - `event:` 名固定 `progress`(future-proof — 新 event 类型加新 `event:` 名)。
 - `data:` 是**单行 JSON**(SSE 协议要求),内容 = 原 progress.jsonl 行
-  + server 注入的 `slug` 字段(client-side 路由依赖此字段;若原行恰巧
-  也含 `slug`,server 端覆盖之,以 watcher 解析的 filename 为准)。
+  + server 注入的 `slug` 字段;flex 嵌套进度文件
+  `<slug>/<sid>.jsonl` 还会注入 `sid`。若原行恰巧也含这些字段,server
+  端覆盖之,以 watcher 解析的文件路径为准。
 - `: keepalive` 注释行 15s 周期发出(axum `Sse::keep_alive` 默认),
   防 nginx / 反向代理默认 60s 空闲超时。
 - `event: reconnect_hint` 出现 = 此 SSE 订阅者落后超过 broadcast 容量
@@ -1987,7 +2024,8 @@ data: {"type":"reconnect_hint","reason":"Lagged(1024)"}
 
 **watcher 拓扑**:`crates/ccteam-web/src/watcher.rs` 起一条专用 OS 线程,
 单个 `notify::RecommendedWatcher` recursive 监 `~/.ccteam/progress/`;
-每检测到 `<slug>.jsonl` 的 Modify / Create 事件 → 维护 per-file 字节
+每检测到 `<slug>.jsonl` 或 `<slug>/<sid>.jsonl` 的 Modify / Create 事件
+→ 维护 per-file 字节
 watermark(`HashMap<PathBuf, u64>`,Mutex 保护)→ 读 appended bytes →
 按行 parse + JSON 校验 → 推 `tokio::sync::broadcast::Sender<ProgressUpdate>`
 (capacity = `1024` 字面量,PRD §5.2.2 + dev-plan §8 grep red line)。

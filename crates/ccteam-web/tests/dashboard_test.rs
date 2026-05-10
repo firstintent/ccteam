@@ -7,7 +7,7 @@
 
 use std::net::SocketAddr;
 
-use ccteam_core::{CcteamPaths, ProjectState};
+use ccteam_core::{CcteamPaths, ProjectState, TeamKind};
 use ccteam_web::{router_with_state, AppState};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -54,6 +54,11 @@ async fn dashboard_lists_one_project_slug() {
         body.contains("Projects"),
         "body must contain dashboard heading"
     );
+    assert!(body.contains("<th>Kind</th>"), "kind column missing");
+    assert!(
+        body.contains("<code>workflow</code>"),
+        "workflow kind missing"
+    );
 }
 
 #[tokio::test]
@@ -67,6 +72,48 @@ async fn dashboard_handles_empty_projects_root() {
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
     assert!(body.contains("No projects"), "empty state copy missing");
+}
+
+#[tokio::test]
+async fn dashboard_renders_kind_and_blank_phase_for_flex_project() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+
+    let mut workflow = ProjectState::initial("dev-workflow".to_string());
+    workflow.current_phase = "implement".into();
+    workflow.save(&paths.project_state("dev-workflow")).unwrap();
+
+    let mut multi = ProjectState::initial("dev-multi".to_string());
+    multi.team_kind = TeamKind::MultiWorkflow;
+    multi.current_phase = "research".into();
+    multi.save(&paths.project_state("dev-multi")).unwrap();
+
+    let mut flex = ProjectState::initial("dev-flex".to_string());
+    flex.team_kind = TeamKind::Flex;
+    flex.current_phase = "should-not-render".into();
+    flex.save(&paths.project_state("dev-flex")).unwrap();
+
+    let addr = spawn_server(AppState::new(paths)).await;
+    let url = format!("http://{addr}/");
+    let resp = reqwest::get(&url).await.expect("GET /");
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+
+    assert!(body.contains("<code>workflow</code>"), "body=\n{body}");
+    assert!(
+        body.contains("<code>multi_workflow</code>"),
+        "body=\n{body}"
+    );
+    assert!(body.contains("<code>flex</code>"), "body=\n{body}");
+    assert!(
+        !body.contains("should-not-render"),
+        "flex current_phase must not render as a workflow phase. body=\n{body}",
+    );
+    assert!(
+        body.contains(r#"<tr data-slug="dev-flex">"#)
+            && body.contains(r#"<td class="cell-phase"><span class="muted">—</span></td>"#),
+        "flex row should render phase dash. body=\n{body}",
+    );
 }
 
 #[tokio::test]

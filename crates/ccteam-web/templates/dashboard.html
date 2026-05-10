@@ -12,6 +12,7 @@
             <tr>
                 <th>Slug</th>
                 <th>Team</th>
+                <th>Kind</th>
                 <th>Phase</th>
                 <th>Last event</th>
                 <th>Status</th>
@@ -23,6 +24,7 @@
             <tr data-slug="{{ p.slug }}">
                 <td><a href="/project/{{ p.slug }}">{{ p.slug }}</a></td>
                 <td>{{ p.team }}</td>
+                <td><code>{{ p.kind }}</code></td>
                 <td class="cell-phase">{% if p.current_phase.is_empty() %}<span class="muted">—</span>{% else %}{{ p.current_phase }}{% endif %}</td>
                 <td class="muted cell-last-event">{{ p.last_event_label }}</td>
                 <td class="cell-status"><span class="badge {{ p.badge_class }}">{{ p.badge_label }}</span></td>

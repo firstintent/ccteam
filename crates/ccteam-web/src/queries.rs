@@ -31,6 +31,33 @@ pub fn slug_recent_events(paths: &CcteamPaths, slug: &str, n: usize) -> Vec<Valu
     }
 }
 
+/// Tail `n` events from one flex session's progress stream.
+pub fn session_recent_events(paths: &CcteamPaths, slug: &str, sid: &str, n: usize) -> Vec<Value> {
+    let path = paths.progress_jsonl_for_session(slug, sid);
+    let body = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(err) => {
+            tracing::warn!(file = %path.display(), error = %err, "session progress read failed");
+            return Vec::new();
+        }
+    };
+    let mut all: Vec<Value> = body
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    if all.len() > n {
+        let drop = all.len() - n;
+        all.drain(..drop);
+    }
+    all
+}
+
+pub fn event_ts_label(event: &Value) -> Option<String> {
+    event.get("ts").and_then(|s| s.as_str()).map(str::to_string)
+}
+
 /// Convert raw progress events to `EventRow` for the project page.
 pub fn events_to_rows(events: &[Value]) -> Vec<EventRow> {
     events
@@ -76,10 +103,24 @@ fn short_detail(event: &Value) -> String {
 /// the page down.
 pub fn outbox_rows(paths: &CcteamPaths, slug: &str, limit: usize) -> Vec<OutboxRow> {
     let mailbox = SessionMailbox::for_ccteam_dir(&paths.project_ccteam_dir(slug));
+    mailbox_outbox_rows(mailbox, slug, limit)
+}
+
+pub fn session_outbox_rows(
+    paths: &CcteamPaths,
+    slug: &str,
+    sid: &str,
+    limit: usize,
+) -> Vec<OutboxRow> {
+    let mailbox = SessionMailbox::for_ccteam_dir(&paths.project_session_dir(slug, sid));
+    mailbox_outbox_rows(mailbox, &format!("{slug}/{sid}"), limit)
+}
+
+fn mailbox_outbox_rows(mailbox: SessionMailbox, label: &str, limit: usize) -> Vec<OutboxRow> {
     let mut paths_vec = match mailbox.list_outbox() {
         Ok(v) => v,
         Err(err) => {
-            tracing::warn!(slug, error = %err, "list_outbox failed");
+            tracing::warn!(target = %label, error = %err, "list_outbox failed");
             return Vec::new();
         }
     };

@@ -4,6 +4,7 @@
 //!
 //! - `GET /sse/all`            — every progress event from every project
 //! - `GET /sse/project/<slug>` — only events for the requested slug
+//! - `GET /sse/project/<slug>/<sid>` — only one flex session
 //!
 //! Wire format (per PRD §5.2.3):
 //!
@@ -51,6 +52,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/sse/all", get(handle_sse_all))
         .route("/sse/project/{slug}", get(handle_sse_project))
+        .route("/sse/project/{slug}/{sid}", get(handle_sse_project_session))
 }
 
 async fn handle_sse_all(
@@ -83,6 +85,32 @@ async fn handle_sse_project(
     Sse::new(stream).keep_alive(KeepAlive::default().interval(KEEPALIVE_INTERVAL))
 }
 
+async fn handle_sse_project_session(
+    State(app): State<AppState>,
+    Path((slug, sid)): Path<(String, String)>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let rx = app.bus.subscribe();
+    let target_slug = slug.clone();
+    let target_sid = sid.clone();
+    let stream = BroadcastStream::new(rx).filter_map(move |item| {
+        let target_slug = target_slug.clone();
+        let target_sid = target_sid.clone();
+        async move {
+            match item {
+                Ok(update)
+                    if update.slug == target_slug
+                        && update.sid.as_deref() == Some(target_sid.as_str()) =>
+                {
+                    Some(Ok(progress_event(&update)))
+                }
+                Ok(_) => None,
+                Err(err) => Some(Ok(reconnect_hint(&format!("{err}")))),
+            }
+        }
+    });
+    Sse::new(stream).keep_alive(KeepAlive::default().interval(KEEPALIVE_INTERVAL))
+}
+
 /// Build the `event: progress` SSE frame. `data:` is a single-line
 /// JSON object = original progress line with `slug` injected. We
 /// inject `slug` even if the line already has one (server is the
@@ -97,9 +125,12 @@ fn progress_event(update: &ProgressUpdate) -> Event {
                 "slug".into(),
                 serde_json::Value::String(update.slug.clone()),
             );
+            if let Some(sid) = &update.sid {
+                map.insert("sid".into(), serde_json::Value::String(sid.clone()));
+            }
             serde_json::Value::Object(map)
         }
-        _ => json!({ "slug": update.slug, "raw": update.event_json }),
+        _ => json!({ "slug": update.slug, "sid": update.sid, "raw": update.event_json }),
     };
     Event::default().event("progress").data(payload.to_string())
 }
@@ -123,6 +154,7 @@ mod tests {
     fn progress_event_injects_slug_into_object_payload() {
         let u = ProgressUpdate {
             slug: "dev-foo".into(),
+            sid: None,
             event_json: r#"{"ts":"2026-05-10T12:00:00Z","event":"PostToolUse","tool":"Read"}"#
                 .into(),
         };
@@ -141,6 +173,7 @@ mod tests {
     fn progress_event_handles_garbage_payload() {
         let u = ProgressUpdate {
             slug: "x".into(),
+            sid: None,
             event_json: "not-json".into(),
         };
         let _ev = progress_event(&u);

@@ -21,6 +21,7 @@ pub mod health;
 pub mod pane_snapshot;
 pub mod project;
 pub mod screenshot;
+pub mod session;
 pub mod sse;
 
 /// Compose every M5.x sub-router available at the current ship state.
@@ -32,6 +33,7 @@ pub fn stateful_router() -> Router<AppState> {
     Router::new()
         .merge(dashboard::router())
         .merge(project::router())
+        .merge(session::router())
         .merge(assets::router())
         .merge(sse::router())
         .merge(harness_sse::router())

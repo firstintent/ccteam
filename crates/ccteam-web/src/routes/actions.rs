@@ -25,6 +25,7 @@
 
 use std::path::{Component, PathBuf};
 
+use anyhow::{bail, Context};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -33,6 +34,11 @@ use axum::{
     Form, Router,
 };
 use ccteam_core::actions::{self, DecisionInput};
+use ccteam_core::{
+    inbox_filename, next_inbox_seq, InboxFrontMatter, InboxMessage, ProjectState, SessionMailbox,
+    TeamKind, LATEST_SCHEMA_VERSION,
+};
+use chrono::Utc;
 use serde::Deserialize;
 
 use crate::state::AppState;
@@ -59,14 +65,22 @@ pub struct InjectDecisionForm {
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/{slug}/btw", post(handle_btw))
+        .route("/api/{slug}/{sid}/btw", post(handle_session_btw))
         .route("/api/{slug}/inject_decision", post(handle_inject_decision))
         .route("/api/{slug}/pause", post(handle_pause))
+        .route("/api/{slug}/{sid}/pause", post(handle_session_pause))
         .route("/api/{slug}/resume", post(handle_resume))
+        .route("/api/{slug}/{sid}/resume", post(handle_session_resume))
 }
 
 /// Common success → 303 See Other → /project/<slug>.
 fn redirect_back(slug: &str) -> Response {
     Redirect::to(&format!("/project/{slug}")).into_response()
+}
+
+/// Session-scoped success → 303 See Other → /session/<slug>/<sid>.
+fn redirect_back_session(slug: &str, sid: &str) -> Response {
+    Redirect::to(&format!("/session/{slug}/{sid}")).into_response()
 }
 
 /// Reject text payloads that are empty / whitespace-only / over the cap.
@@ -151,6 +165,23 @@ async fn handle_btw(
     }
 }
 
+async fn handle_session_btw(
+    State(app): State<AppState>,
+    Path((slug, sid)): Path<(String, String)>,
+    Form(form): Form<BtwForm>,
+) -> Response {
+    if let Err(resp) = validate_text("text", &form.text, BTW_MAX) {
+        return resp;
+    }
+    match send_to_registered_session(&app, &slug, &sid, &form.text) {
+        Ok(_) => redirect_back_session(&slug, &sid),
+        Err(err) => {
+            tracing::warn!(slug = %slug, sid = %sid, error = %err, "send_to_registered_session failed");
+            (StatusCode::BAD_REQUEST, format!("btw failed: {err}")).into_response()
+        }
+    }
+}
+
 async fn handle_inject_decision(
     State(app): State<AppState>,
     Path(slug): Path<String>,
@@ -190,6 +221,22 @@ async fn handle_pause(State(app): State<AppState>, Path(slug): Path<String>) -> 
     }
 }
 
+async fn handle_session_pause(
+    State(app): State<AppState>,
+    Path((slug, sid)): Path<(String, String)>,
+) -> Response {
+    if let Err(resp) = validate_known_session(&app, &slug, &sid) {
+        return resp;
+    }
+    match actions::pause(&app.paths, &slug) {
+        Ok(_) => redirect_back_session(&slug, &sid),
+        Err(err) => {
+            tracing::warn!(slug = %slug, sid = %sid, error = %err, "pause failed");
+            (StatusCode::BAD_REQUEST, format!("pause failed: {err}")).into_response()
+        }
+    }
+}
+
 async fn handle_resume(State(app): State<AppState>, Path(slug): Path<String>) -> Response {
     match actions::resume(&app.paths, &slug) {
         Ok(_) => redirect_back(&slug),
@@ -198,6 +245,86 @@ async fn handle_resume(State(app): State<AppState>, Path(slug): Path<String>) ->
             (StatusCode::BAD_REQUEST, format!("resume failed: {err}")).into_response()
         }
     }
+}
+
+async fn handle_session_resume(
+    State(app): State<AppState>,
+    Path((slug, sid)): Path<(String, String)>,
+) -> Response {
+    if let Err(resp) = validate_known_session(&app, &slug, &sid) {
+        return resp;
+    }
+    match actions::resume(&app.paths, &slug) {
+        Ok(_) => redirect_back_session(&slug, &sid),
+        Err(err) => {
+            tracing::warn!(slug = %slug, sid = %sid, error = %err, "resume failed");
+            (StatusCode::BAD_REQUEST, format!("resume failed: {err}")).into_response()
+        }
+    }
+}
+
+#[allow(clippy::result_large_err)] // Err = axum Response; handler fast-fail.
+fn validate_known_session(app: &AppState, slug: &str, sid: &str) -> Result<(), Response> {
+    let state = ProjectState::load(&app.paths.project_state(slug)).map_err(|err| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("project not found or unreadable: {slug}: {err}"),
+        )
+            .into_response()
+    })?;
+    if state.team_kind != TeamKind::Flex {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("project {slug} is not a flex project"),
+        )
+            .into_response());
+    }
+    if !state.sessions.contains_key(sid) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("session not found: {slug}/{sid}"),
+        )
+            .into_response());
+    }
+    Ok(())
+}
+
+fn send_to_registered_session(
+    app: &AppState,
+    slug: &str,
+    sid: &str,
+    body: &str,
+) -> anyhow::Result<()> {
+    let state = ProjectState::load(&app.paths.project_state(slug))
+        .with_context(|| format!("load state for {slug}"))?;
+    if state.team_kind != TeamKind::Flex {
+        bail!("project {slug} is not a flex project");
+    }
+    if !state.sessions.contains_key(sid) {
+        bail!("session not found: {slug}/{sid}");
+    }
+
+    let mailbox = SessionMailbox::for_ccteam_dir(&app.paths.project_session_dir(slug, sid));
+    mailbox.ensure_dirs()?;
+    let now = Utc::now();
+    let filename = inbox_filename(now, next_inbox_seq(&mailbox)?);
+    let inbox_path = mailbox.inbox.join(&filename);
+    let msg = InboxMessage {
+        front: InboxFrontMatter {
+            schema_version: LATEST_SCHEMA_VERSION,
+            source: "ccteam-web".into(),
+            source_chat_id: None,
+            source_msg_id: None,
+            source_user: "web".into(),
+            created_at: now,
+            ingested_at: now,
+            content_type: "text".into(),
+            attachments: Vec::new(),
+        },
+        body: format!("{}\n", body.trim_end_matches('\n')),
+    };
+    msg.save(&inbox_path)?;
+    Ok(())
 }
 
 #[cfg(test)]

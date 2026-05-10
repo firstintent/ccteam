@@ -44,6 +44,7 @@ pub struct DashboardTemplate {
 pub struct DashboardRow {
     pub slug: String,
     pub team: String,
+    pub kind: String,
     pub current_phase: String,
     pub last_event_label: String,
     pub badge_class: &'static str,
@@ -57,10 +58,14 @@ pub struct ProjectTemplate {
     pub version: &'static str,
     pub slug: String,
     pub team: String,
+    pub kind: String,
+    pub is_flex: bool,
     pub current_phase: String,
     pub badge_class: &'static str,
     pub badge_label: &'static str,
     pub cost_label: String,
+    pub created_at: String,
+    pub sessions: Vec<SessionCard>,
     pub state_json_pretty: String,
     pub events: Vec<EventRow>,
     pub outbox: Vec<OutboxRow>,
@@ -76,6 +81,51 @@ pub struct ProjectTemplate {
     pub auth_enabled: bool,
     pub auth_wire_token: Option<String>,
     pub decision_candidates: Vec<String>,
+}
+
+pub struct SessionCard {
+    pub sid: String,
+    pub harness: String,
+    pub harness_class: &'static str,
+    pub tmux_session: String,
+    pub status_class: &'static str,
+    pub status_label: &'static str,
+    pub last_event_label: String,
+    pub cost_label: String,
+    pub detail_href: String,
+    pub screenshot_href: String,
+    pub attach_command: String,
+}
+
+#[derive(Template)]
+#[template(path = "session.html")]
+pub struct SessionTemplate {
+    pub version: &'static str,
+    pub slug: String,
+    pub sid: String,
+    pub team: String,
+    pub kind: String,
+    pub harness: String,
+    pub harness_class: &'static str,
+    pub tmux_session: String,
+    pub started_at: String,
+    pub status_class: &'static str,
+    pub status_label: &'static str,
+    pub cost_label: String,
+    pub events: Vec<EventRow>,
+    pub outbox: Vec<OutboxRow>,
+    pub auth_enabled: bool,
+    pub auth_wire_token: Option<String>,
+    pub decision_candidates: Vec<String>,
+    pub harness_snapshot: Option<HarnessSnapshotView>,
+}
+
+pub struct HarnessSnapshotView {
+    pub model: String,
+    pub context_used_pct: String,
+    pub cost_usd_total: String,
+    pub rate_limit_pct: String,
+    pub captured_at: String,
 }
 
 pub struct EventRow {

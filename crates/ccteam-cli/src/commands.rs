@@ -1989,7 +1989,7 @@ fn render_screenshot_smoke_report(paths: &CcteamPaths, slug: &str) -> Result<Str
             return Ok(out);
         }
     }
-    match ccteam_core::render_screenshot(paths, slug, 50)? {
+    match ccteam_core::render_screenshot(paths, slug, None, 50)? {
         Some(path) => {
             let size = std::fs::metadata(&path)
                 .map(|m| m.len())
