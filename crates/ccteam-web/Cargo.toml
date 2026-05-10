@@ -9,6 +9,7 @@ description = "ccteam V0.3 web UI: read-only dashboard + write-action endpoints 
 [dependencies]
 ccteam-core.workspace = true
 anyhow.workspace = true
+chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

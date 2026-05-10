@@ -1799,81 +1799,14 @@ fn load_local_phase_templates(paths: &CcteamPaths) -> Result<Vec<PhaseTemplate>>
     Ok(out)
 }
 
-/// Project metadata with derived fields used by `ls`. Pulled out so
-/// rendering and the JSON path share one source of truth.
-#[derive(Debug)]
-pub struct ProjectSummary {
-    pub state: ProjectState,
-    pub age_seconds: u64,
-    pub stall_silent_seconds: u64,
-}
-
-pub fn collect_projects(paths: &CcteamPaths) -> Result<Vec<ProjectSummary>> {
-    let dir = &paths.projects_root;
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    let mut out = Vec::new();
-    for entry in std::fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let Some(slug) = entry.file_name().to_str().map(String::from) else {
-            continue;
-        };
-        let state_path = paths.project_state(&slug);
-        if !state_path.exists() {
-            continue;
-        }
-        let state = match ProjectState::load(&state_path) {
-            Ok(s) => s,
-            Err(err) => {
-                tracing::warn!(slug, error = %err, "skip project: state.json failed to load");
-                continue;
-            }
-        };
-        let now = Utc::now();
-        let age = now
-            .signed_duration_since(state.created_at)
-            .num_seconds()
-            .max(0) as u64;
-        let silent = state
-            .last_progress_event_at
-            .map(|t| now.signed_duration_since(t).num_seconds().max(0) as u64)
-            .unwrap_or(age);
-        out.push(ProjectSummary {
-            state,
-            age_seconds: age,
-            stall_silent_seconds: silent,
-        });
-    }
-    out.sort_by(|a, b| a.state.slug.cmp(&b.state.slug));
-    Ok(out)
-}
-
-pub fn collect_recent_events(
-    paths: &CcteamPaths,
-    slug: &str,
-    n: usize,
-) -> Result<Vec<Value>> {
-    let path = paths.progress_jsonl(slug);
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let body = std::fs::read_to_string(&path)
-        .with_context(|| format!("read {}", path.display()))?;
-    let mut all: Vec<Value> = body
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect();
-    if all.len() > n {
-        let drop = all.len() - n;
-        all.drain(..drop);
-    }
-    Ok(all)
-}
+// V0.3 M5.1 — `ProjectSummary` / `collect_projects` /
+// `collect_recent_events` moved to `ccteam_core::queries` so the
+// V0.3 web crate can reuse them without depending on `ccteam-cli`
+// (binary-as-library is a dep-graph anti-pattern). Re-exported below
+// so existing call sites (`run_ls`, `run_progress`, `mcp_serve.rs`)
+// keep their `use ccteam_cli::commands::{collect_projects, ...}`
+// lines unchanged. See `docs/dev-coupling-audit.md` F45.
+pub use ccteam_core::{collect_projects, collect_recent_events, ProjectSummary};
 
 /// Collect every `.md` artifact under `<project>/.ccteam/` so non-dev
 /// teams (e.g. product-research with `verdict.md` / `rationale.md` /

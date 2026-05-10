@@ -1438,8 +1438,9 @@ ccteam doctor --migrate-recommended-agents        # V0.2 M0.20 一次性清理 V
 ccteam hook <subcmd>                              # debug:手动跑 hook(读 stdin JSON,写 stdout);
                                                   # subcmd ∈ {progress-append, parse-phase-end,
                                                   # cost-accumulate, load-context, block-push}
-ccteam web --bind 127.0.0.1:7331                  # V0.3 M5.0 web UI scaffold(`/health` only;
-                                                  # M5.1 dashboard / M5.2 SSE / M5.3 写动作 + token auth)
+ccteam web --bind 127.0.0.1:7331                  # V0.3 M5.1 read-only web UI(详见 §15;`/`
+                                                  # dashboard / `/project/<slug>` / `/assets/{file}`;
+                                                  # M5.2 SSE / M5.3 写动作 + token auth 后续 ship)
 ccteam web --bind 0.0.0.0:7331 [--no-auth]        # 同上,LAN 模式;M5.3 默认强 token 鉴权,
                                                   # `--no-auth` 5s 倒计时 + stderr warn 后照样 listen
 ccteam web --token-file <path>                    # 自定义 token 文件路径(M5.3 消费;默认 ~/.ccteam/web-token)
@@ -1739,3 +1740,87 @@ pub fn peek_pane(slug: &str, lines: Option<usize>) -> Result<PaneCapture, CoreEr
 | `ccteam__pause` / `ccteam__resume` | `submit_control(slug, Pause/Resume)` |
 
 → M2 实现 `ccteam-mcp` 时是**薄壳**,不复制业务逻辑。
+
+---
+
+## 15. Web UI 路由(V0.3 M5.1+)
+
+> V0.3 M5.1 起 `cct web --bind <addr>` 暴露本地 / 局域网 web UI。
+> 路由分两组:**stateless**(健康探针)+ **stateful**(消费 `CcteamPaths`
+> 的 dashboard / 项目详情 / 静态资源)。本节列 M5.1 ship 的全部路由;M5.2
+> 加 `/sse/all` + `/sse/project/<slug>` + `/screenshot/<slug>.png`,
+> M5.3 加 `POST /api/<slug>/{btw,inject_decision,pause,resume}`。
+
+### 15.1 路由表(M5.1)
+
+| Method | Path | 状态码 | Content-Type | 说明 |
+|---|---|---|---|---|
+| `GET` | `/health` | 200 | `application/json` | M5.0 liveness:`{"status":"ok","version":"<crate>"}` |
+| `GET` | `/` | 200 | `text/html; charset=utf-8` | 项目列表 dashboard;空时 fallback 文案 `No projects` |
+| `GET` | `/project/{slug}` | 200 / 404 | `text/html; charset=utf-8` / `text/plain` | 项目详情(state JSON / recent events / outbox);未知 slug → 404 + plain text `project not found: <slug>` |
+| `GET` | `/assets/{file}` | 200 / 404 | `application/javascript; charset=utf-8`(htmx)/ `text/css; charset=utf-8`(style)/ `text/plain`(404) | vendored 静态资源;`Cache-Control: public, max-age=31536000, immutable`;白名单 = `htmx.min.js` / `style.css`,其他 file → 404 |
+
+### 15.2 dashboard 行(`/` 表格)
+
+每行字段映射 `ccteam_core::ProjectSummary` + 派生:
+
+| 列 | 来源 |
+|---|---|
+| Slug | `state.slug`(linked 到 `/project/<slug>`)|
+| Team | `state.team` |
+| Phase | `state.current_phase`(空时 `—`)|
+| Last event | `Utc::now() - state.last_progress_event_at` 的 humanized 时长(`30s ago` / `15m ago` / `2h ago`)|
+| Status | `silence_classifier::classify(events, silent_seconds, default thresholds)` 之一:`healthy` / `terminal` / `subagent` / `runaway` / `tool-hung` / `limbo` |
+| Cost | `state.cost_used_usd`,`%.2f` 格式 |
+
+**红线**:status badge 是**只读** label。即使分类是 `PostStopLimbo` /
+`SubagentRunaway`,web 层 **不**调 `LimboAction::from` / 重新注入 / 软告警 —
+仅 orchestrator 持续走 F35 副作用路径(详 `silence_classifier.rs` 头注 +
+CLAUDE.md §三 read-only 红线)。
+
+### 15.3 project 详情(`/project/<slug>`)
+
+按渲染顺序:
+
+1. **Header**:slug / team / current_phase / status badge / cost。
+2. **State**:`serde_json::to_string_pretty(&state)` 进 `<pre>`(完整
+   `state.json`,折叠 / 滚动由浏览器决定)。
+3. **Recent events**:`collect_recent_events(paths, slug, 200)` 末 200
+   条 progress.jsonl,渲染 `ts` / `event` / `detail`(`detail` = `tool=<X>`
+   / `phase=<X>` / `kind=<X>` / `count=<N>` 之一,前者优先)。
+4. **Outbox**:`SessionMailbox::list_outbox` 后 reverse + truncate 20。
+   每条 `<li>` 渲染 `event_kind`(lowercase debug 字面量 — `progress` /
+   `reply` / `escalation` / `shipped` / `clarify`)+ `created_at` RFC3339 +
+   `filename` + body 头 200 char。front-matter 解析失败渲染
+   `(unparseable)` 占位,不 5xx。
+5. **Pane snapshot**:M5.1 静态占位 `<div class="placeholder">`,M5.2
+   填 on-demand `/screenshot/<slug>.png`。
+
+### 15.4 静态资源协议
+
+- `htmx.min.js` ← `crates/ccteam-web/assets/htmx.min.js`(htmx 2.0.4
+  upstream snapshot,BSD-2-Clause;详 `LICENSES.md`)
+- `style.css` ← `crates/ccteam-web/assets/style.css`(本仓自写 ~3 KB,
+  monospace + dark-mode-friendly)
+
+二者均通过 `include_bytes!` 编译期打包进 `cct` binary;`cct web` 自包含
+启动,无 npm / Vite / build toolchain 依赖,模仿 V0.2.2 F38 vendored TTF
+模式。`Cache-Control: public, max-age=31536000, immutable` — 同一 binary
+版本下 bytes 永不变,新版 binary 释放后自然 ID 变更触发 cache miss。
+
+### 15.5 数据流红线
+
+- **`progress.jsonl` 是 SoT**:web 层一律走
+  `ccteam_core::collect_recent_events(paths, slug, n)`(V0.3 M5.1 起从
+  `ccteam-cli::commands` promote 到 `ccteam-core::queries` —
+  `dev-coupling-audit.md` F45 / `prd.md` §4),**不解析 tmux 输出**(F38
+  截图通过 `ccteam_core::render_screenshot` 在 M5.2 加,内部已 vt100 化,
+  不算字符串解析)。
+- **`ccteam-web` MUST NOT depend on `ccteam-cli`**:`cargo tree -p
+  ccteam-web | grep ccteam-cli` 必须 0 命中(`tests/dep_graph_test.rs`
+  锁红线)。dashboard / project / assets handler 全部依赖
+  `ccteam-core::{queries, ProjectState, SessionMailbox, ...}` 的 public
+  surface。
+- **永远不主动 kill**:M5.1 是只读;M5.2 / M5.3 加 SSE / 写动作时仍守此
+  红线,web 层不发 SIGINT / Ctrl-C / `tmux kill-session`,只走
+  `actions::*`(M5.0 promote)走 inbox + state.json 控制平面。

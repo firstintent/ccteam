@@ -662,9 +662,28 @@ ccteam start / stop                    # orchestrator 生命周期
 这条**作为辅助路径保留**,但不是 ccteam 的核心入口。核心入口是
 meta-agent session + Channel Layer。
 
-#### Web 仪表盘——不在主线
+#### Web 仪表盘(V0.3 M5.1+ 已 ship,read-only;M5.2/M5.3 后续 ship live + write)
 
-曾考虑过 M2 Web 仪表盘。**剥离主线**——`ccteam ls --format json` + 用户自带 claude 的对话能力已覆盖"用人话汇报"需求。Web 仪表盘永远在 backlog,不进里程碑(参见 §11 / development-plan §2.2)。
+V0.2 / V0.2.2 之前曾把 web 仪表盘剥离主线(`ccteam ls --format json` + 用户自带 claude 已覆盖"用人话汇报")。V0.3 重新评估:多项目并发(M3+ team factory ship 后用户实际跑 ≥ 3 项目)与离场场景下,「一屏看全局」需要可视化聚合;`ccteam ls` 表格在 ≥ 5 项目时阅读成本陡增。**因此 V0.3 ship `cct web`,作为第四类用户接入面**,与 CLI / MCP / filesystem 共存,各自最强项不同(终端 = power user 全控;MCP = meta-agent 自动化;filesystem = hooks / 调试;web = 一屏总览 + 局域网 / 手机访问)。
+
+实现栈:axum 0.8 + askama 0.12 + htmx 2.0.4(vendored,~50 KB),无 npm / Vite / build toolchain;`include_bytes!` 把 htmx + CSS 打进 binary,模仿 V0.2.2 F38 vendored TTF 模式。`ccteam-web` 是独立 workspace crate,**dep 只**到 `ccteam-core`,不依赖 `ccteam-cli`(binary-as-library 反模式;`tests/dep_graph_test.rs` 锁红线)。
+
+V0.3 ship 状态:
+
+| Milestone | 范围 | 已 ship |
+|---|---|---|
+| **M5.0** | crate scaffold + write helper promote 到 `ccteam-core::actions` + `GET /health` | ✅ |
+| **M5.1** | read-only dashboard:`GET /` 项目列表 + `GET /project/<slug>` 详情 + `GET /assets/{file}` 静态资源 + 状态 badge(F35 silence_classifier 只读复用)+ outbox 渲染(`SessionMailbox`)| ✅ |
+| **M5.2** | SSE 实时事件流(`/sse/all` + `/sse/project/<slug>` 单 notify watcher fan-out)+ 按需 PNG 截图(`/screenshot/<slug>.png` 复用 F38 `render_screenshot`)| 计划中 |
+| **M5.3** | 写动作(`POST /api/<slug>/{btw,inject_decision,pause,resume}` 全走 `ccteam_core::actions::*` M5.0 promote)+ token 鉴权(loopback 免 token / 非 loopback 默认 token,`Authorization: Bearer ccteam:<token>`,`subtle::ConstantTimeEq` 比对,`~/.ccteam/web-token` mode 0600)| 计划中 |
+| **M5.4** | E2E + retro + workspace.version `0.2.2` → `0.3.0` ship gate | 计划中 |
+
+V0.3 主要红线(详 PRD §3 / `interfaces.md` §15 / CLAUDE.md §三):
+
+- **`progress.jsonl` 是 SoT**:web 层走 `ccteam_core::collect_recent_events`,**不解析 tmux 终端输出**(M5.2 截图通过 `ccteam_core::render_screenshot` 内部 vt100 化)
+- **永不主动 kill**:M5.1 read-only;M5.2/M5.3 加 SSE / 写动作时仍守红线 — 仅走 `actions::*`(inbox + state.json 控制平面),不发 SIGINT / `tmux kill-session`
+- **status badge 是只读 label**:即使 `silence_classifier::classify` 返 `PostStopLimbo` / `SubagentRunaway`,web 层 **不**调 `LimboAction::from` / 重新注入 — orchestrator 持续走 F35 副作用路径
+- **dep graph**:`cargo tree -p ccteam-web | grep ccteam-cli` 必须 0 命中
 
 #### 前端层(可插拔)
 

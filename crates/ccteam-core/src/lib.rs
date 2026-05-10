@@ -20,6 +20,7 @@ pub mod phases;
 pub mod plugin_resolution;
 pub mod progress;
 pub mod projects;
+pub mod queries;
 pub mod screenshot;
 pub mod silence_classifier;
 pub mod stall;
@@ -97,6 +98,7 @@ pub use stall::{
     StallThresholds, STALL_ESCALATE_SECONDS, STALL_SUSPICIOUS_SECONDS, STALL_WARN_SECONDS,
 };
 pub use paths::{slug_from_project_dir, CcteamPaths};
+pub use queries::{collect_projects, collect_recent_events, ProjectSummary};
 pub use phases::{
     AgentTeamRole, DecisionMode, GoldenRule, GoldenRuleKind, PhaseHooks, PhaseTemplate,
     SubSkillSpec, SubSkillTrigger,

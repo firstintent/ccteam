@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+
+{% block title %}ccteam — projects{% endblock %}
+
+{% block content %}
+    <h1>Projects ({{ projects.len() }})</h1>
+    {% if projects.is_empty() %}
+        <p class="empty">No projects under <code>{{ projects_root }}</code> yet. Run <code>cct new ...</code> to start one.</p>
+    {% else %}
+    <table>
+        <thead>
+            <tr>
+                <th>Slug</th>
+                <th>Team</th>
+                <th>Phase</th>
+                <th>Last event</th>
+                <th>Status</th>
+                <th class="num">Cost (USD)</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for p in projects %}
+            <tr>
+                <td><a href="/project/{{ p.slug }}">{{ p.slug }}</a></td>
+                <td>{{ p.team }}</td>
+                <td>{% if p.current_phase.is_empty() %}<span class="muted">—</span>{% else %}{{ p.current_phase }}{% endif %}</td>
+                <td class="muted">{{ p.last_event_label }}</td>
+                <td><span class="badge {{ p.badge_class }}">{{ p.badge_label }}</span></td>
+                <td class="num">{{ p.cost_label }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% endif %}
+{% endblock %}

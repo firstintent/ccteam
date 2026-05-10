@@ -336,6 +336,7 @@ dependencies = [
  "askama",
  "axum",
  "ccteam-core",
+ "chrono",
  "notify",
  "reqwest",
  "serde",

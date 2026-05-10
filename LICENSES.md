@@ -23,3 +23,16 @@ The OFL permits embedding and redistribution of the font as part of
 software, including binary forms; it forbids sale of the font as a
 standalone product. Derivative works of the font (which ccteam does
 not produce) must use a Reserved Font Name distinct from the original.
+
+## JavaScript
+
+### htmx
+
+- **Vendored at**: `crates/ccteam-web/assets/htmx.min.js`
+- **Used by**: V0.3 M5.1 — read-only web dashboard. Baked into the
+  `ccteam` binary via `include_bytes!`; served by `GET /assets/htmx.min.js`
+  so the web UI is self-contained (no npm / Vite / external CDN).
+- **Upstream**: <https://htmx.org>
+- **Version vendored**: 2.0.4
+- **License**: [BSD 2-Clause "Simplified" License](https://github.com/bigskysoftware/htmx/blob/master/LICENSE)
+- **Copyright**: Copyright (c) 2020, Big Sky Software
