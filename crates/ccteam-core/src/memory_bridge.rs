@@ -274,6 +274,13 @@ mod tests {
         std::fs::read_to_string(path).unwrap()
     }
 
+    fn report_for<'a>(reports: &'a [MemoryBridgeReport], team: &str) -> &'a MemoryBridgeReport {
+        reports
+            .iter()
+            .find(|r| r.team == team)
+            .unwrap_or_else(|| panic!("{team} bridge report missing"))
+    }
+
     /// Seed shipped team yamls under `<tmp>/ccteam-home/teams/<name>/`
     /// so `install_into(global, claude, ...)` finds dev / research
     /// during the disk scan introduced in V0.2 §6.4 candidate 3.
@@ -368,7 +375,10 @@ mod tests {
 
         let reports =
             install_into(&global, &claude, InstallMemoryBridgeOptions::default()).unwrap();
-        assert_eq!(reports[0].action, MemoryBridgeAction::RepairedMarkedSection);
+        assert_eq!(
+            report_for(&reports, "dev").action,
+            MemoryBridgeAction::RepairedMarkedSection
+        );
         let after = read(&target);
         assert!(after.contains("# manually authored notes"));
         assert!(after.contains("- a personal note"));
@@ -391,7 +401,10 @@ mod tests {
 
         let reports =
             install_into(&global, &claude, InstallMemoryBridgeOptions::default()).unwrap();
-        assert_eq!(reports[0].action, MemoryBridgeAction::RepairedMarkedSection);
+        assert_eq!(
+            report_for(&reports, "dev").action,
+            MemoryBridgeAction::RepairedMarkedSection
+        );
         let after = read(&target);
         assert!(marked_section_intact(&after));
         assert_eq!(after.matches(MARKER_BEGIN).count(), 1);
@@ -414,7 +427,10 @@ mod tests {
 
         let reports =
             install_into(&global, &claude, InstallMemoryBridgeOptions::default()).unwrap();
-        assert_eq!(reports[0].action, MemoryBridgeAction::RepairedMarkedSection);
+        assert_eq!(
+            report_for(&reports, "dev").action,
+            MemoryBridgeAction::RepairedMarkedSection
+        );
         let after = read(&target);
         assert!(marked_section_intact(&after));
         assert!(after.contains("user prose stays"));

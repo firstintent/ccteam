@@ -2,10 +2,12 @@
 //!
 //! M5.0 shipped `/health`. M5.1 added `dashboard` / `project` /
 //! `assets`. M5.2 added `sse` (`/sse/all` + `/sse/project/<slug>`) +
-//! `screenshot` (`/screenshot/<slug>.png`). **M5.3 (this PR)** mounts
-//! `actions` (`POST /api/<slug>/{btw,inject_decision,pause,resume}`)
-//! and the `auth_layer` middleware that gates the entire stateful
-//! router when token auth is enabled.
+//! `screenshot` (`/screenshot/<slug>.png`). The pane snapshot route
+//! adds raw ANSI bytes for browser-side xterm.js rendering. **M5.3
+//! (this PR)** mounts `actions` (`POST
+//! /api/<slug>/{btw,inject_decision,pause,resume}`) and the
+//! `auth_layer` middleware that gates the entire stateful router when
+//! token auth is enabled.
 
 use axum::Router;
 
@@ -15,6 +17,7 @@ pub mod actions;
 pub mod assets;
 pub mod dashboard;
 pub mod health;
+pub mod pane_snapshot;
 pub mod project;
 pub mod screenshot;
 pub mod sse;
@@ -30,6 +33,7 @@ pub fn stateful_router() -> Router<AppState> {
         .merge(project::router())
         .merge(assets::router())
         .merge(sse::router())
+        .merge(pane_snapshot::router())
         .merge(screenshot::router())
         .merge(actions::router())
 }

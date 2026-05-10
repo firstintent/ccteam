@@ -1,6 +1,9 @@
 {% extends "base.html" %}
 
 {% block title %}ccteam — {{ slug }}{% endblock %}
+{% block head %}
+    <link rel="stylesheet" href="/assets/xterm.css">
+{% endblock %}
 
 {% block content %}
     <h1>{{ slug }}</h1>
@@ -29,9 +32,9 @@
     <h2>Recent events ({{ events.len() }}) <span class="live-dot" title="streaming via SSE"></span></h2>
     {# V0.3 M5.2 — New `progress` events from `/sse/project/<slug>`
        are prepended to `#events-tbody` by the small inline script
-       at the bottom of this template. The initial 200 rows are
+       at the bottom of this template. The initial 10 rows are
        server-rendered into the tbody; SSE adds events that arrive
-       after the page loads, capped at 200 rows total via a sliding
+       after the page loads, capped at 10 rows total via a sliding
        window. We use vanilla `EventSource` (not htmx-ext-sse swap)
        because we need PREPEND with a row cap, and htmx swap is
        full-replace by design. #}
@@ -77,29 +80,95 @@
     {% endif %}
 
     <h2>Pane snapshot</h2>
-    {# V0.3 M5.2 — on-demand `/screenshot/<slug>.png` render. The
-       `<img>` triggers F38 on initial page load (~200-500ms render);
-       the refresh button replaces the `src` with a cache-busting
-       query string so the browser re-fetches without hitting the
-       BFCache. Renders never auto-poll (PRD §5.2.5). #}
-    <div class="screenshot-panel">
-        <p class="muted">
-            <button type="button" onclick="ccteamRefreshScreenshot('{{ slug }}')">Refresh snapshot</button>
-            <span class="muted">render is on-demand only — F38 (vt100 + imageproc) is ~200-500ms per capture.</span>
+    {# V0.3 pane snapshot refresh — xterm.js renders the tmux ANSI
+       capture in the browser. This stays read-only and manual-refresh;
+       the legacy PNG endpoint remains linked as a fallback. #}
+    <div class="terminal-panel">
+        <p class="muted terminal-toolbar">
+            <button type="button" onclick="ccteamRefreshPaneSnapshot('{{ slug }}')">Refresh snapshot</button>
+            <span id="pane-terminal-status" class="muted">loading terminal snapshot...</span>
+            <a class="muted" href="/screenshot/{{ slug }}.png">PNG fallback</a>
         </p>
-        <img id="pane-screenshot" src="/screenshot/{{ slug }}.png" alt="tmux pane screenshot (unavailable if session not running)" />
+        <div id="pane-terminal" class="terminal-snapshot" role="img" aria-label="read-only tmux pane snapshot"></div>
     </div>
+    <script src="/assets/xterm.js"></script>
     <script>
-        // Cache-bust the `<img src>` so a manual refresh triggers
-        // a brand-new F38 render (Cache-Control on the endpoint is
-        // already `no-cache, must-revalidate` but Chrome's BFCache
-        // reuses bytes on plain `src` reassignment without a query
-        // string change).
-        function ccteamRefreshScreenshot(slug) {
-            var img = document.getElementById('pane-screenshot');
-            if (!img) return;
-            img.src = '/screenshot/' + encodeURIComponent(slug) + '.png?t=' + Date.now();
-        }
+        (function () {
+            var activeTerminal = null;
+
+            window.ccteamRefreshPaneSnapshot = function (slug) {
+                var holder = document.getElementById('pane-terminal');
+                var status = document.getElementById('pane-terminal-status');
+                if (!holder || !status) return;
+                if (!window.Terminal) {
+                    status.textContent = 'xterm.js failed to load';
+                    return;
+                }
+                status.textContent = 'loading terminal snapshot...';
+                fetch('/api/' + encodeURIComponent(slug) + '/pane-snapshot.ansi?t=' + Date.now(), {
+                    credentials: 'same-origin',
+                    cache: 'no-store',
+                }).then(function (resp) {
+                    if (!resp.ok) {
+                        return resp.text().then(function (text) {
+                            throw new Error(text || ('HTTP ' + resp.status));
+                        });
+                    }
+                    var rows = ccteamClampInt(resp.headers.get('x-ccteam-pane-rows'), 24, 1, 200);
+                    var cols = ccteamClampInt(resp.headers.get('x-ccteam-pane-cols'), 80, 1, 400);
+                    return resp.arrayBuffer().then(function (buf) {
+                        return { rows: rows, cols: cols, bytes: new Uint8Array(buf) };
+                    });
+                }).then(function (snapshot) {
+                    if (activeTerminal) {
+                        activeTerminal.dispose();
+                        activeTerminal = null;
+                    }
+                    holder.textContent = '';
+                    var term = new Terminal({
+                        rows: snapshot.rows,
+                        cols: snapshot.cols,
+                        disableStdin: true,
+                        convertEol: true,
+                        cursorBlink: false,
+                        scrollback: 0,
+                        fontFamily: '"JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+                        fontSize: 13,
+                        lineHeight: 1.15,
+                        theme: {
+                            background: '#101216',
+                            foreground: '#d6dde8',
+                            cursor: '#d6dde8',
+                        },
+                    });
+                    activeTerminal = term;
+                    term.open(holder);
+                    term.write(snapshot.bytes);
+                    status.textContent = snapshot.cols + 'x' + snapshot.rows + ' read-only xterm render';
+                }).catch(function (err) {
+                    if (activeTerminal) {
+                        activeTerminal.dispose();
+                        activeTerminal = null;
+                    }
+                    holder.textContent = '';
+                    status.textContent = String(err.message || err).trim();
+                });
+            };
+
+            function ccteamClampInt(value, fallback, min, max) {
+                var n = parseInt(value || '', 10);
+                if (!Number.isFinite(n)) return fallback;
+                return Math.max(min, Math.min(max, n));
+            }
+
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', function () {
+                    window.ccteamRefreshPaneSnapshot('{{ slug }}');
+                });
+            } else {
+                window.ccteamRefreshPaneSnapshot('{{ slug }}');
+            }
+        })();
     </script>
 
     {# V0.3 M5.3 — write-action sidebar. Each form is a normal
@@ -208,14 +277,14 @@
     {% endif %}
 
     {# Small inline shim that grafts SSE `progress` events onto the
-       events table and trims the visible row count to 200. We avoid
+       events table and trims the visible row count to 10. We avoid
        htmx's built-in `sse-swap` because we want PREPEND semantics
        (newest at top) and a sliding-window cap; htmx's swap = full
        replace, which would lose the server-rendered baseline. #}
     <script>
         (function () {
             var SSE_TARGET = '/sse/project/{{ slug }}';
-            var MAX_ROWS = 200;
+            var MAX_ROWS = 10;
             var es = new EventSource(SSE_TARGET);
             es.addEventListener('progress', function (ev) {
                 var data;

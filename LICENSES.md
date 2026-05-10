@@ -48,3 +48,18 @@ not produce) must use a Reserved Font Name distinct from the original.
 - **Version vendored**: 2.2.2
 - **License**: [BSD 2-Clause "Simplified" License](https://github.com/bigskysoftware/htmx-extensions/blob/main/LICENSE)
 - **Copyright**: Copyright (c) 2020, Big Sky Software
+
+### @xterm/xterm
+
+- **Vendored at**: `crates/ccteam-web/assets/xterm.js` and
+  `crates/ccteam-web/assets/xterm.css`
+- **Used by**: V0.3 pane snapshot rendering. The web UI fetches raw
+  ANSI bytes from `GET /api/<slug>/pane-snapshot.ansi` and renders them
+  client-side with xterm.js, while keeping the legacy PNG screenshot
+  endpoint as a fallback.
+- **Upstream**: <https://xtermjs.org/>
+- **Version vendored**: 6.0.0
+- **License**: [MIT License](https://github.com/xtermjs/xterm.js/blob/master/LICENSE)
+- **Copyright**: Copyright (c) 2017-2019, The xterm.js authors;
+  Copyright (c) 2014-2016, SourceLair Private Company;
+  Copyright (c) 2012-2013, Christopher Jeffrey

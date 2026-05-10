@@ -113,10 +113,13 @@ async fn project_detail_renders_state_events_and_outbox() {
     );
     assert!(body.contains("progress"), "outbox kind must render");
 
-    // Screenshot panel placeholder is present (M5.2 will replace it).
+    // xterm-backed pane snapshot panel is present, with PNG fallback
+    // still linked for degraded browsers.
     assert!(
-        body.contains("Screenshot panel") || body.contains("screenshot"),
-        "screenshot placeholder must be present",
+        body.contains("/assets/xterm.js")
+            && body.contains("pane-snapshot.ansi")
+            && body.contains("PNG fallback"),
+        "xterm pane snapshot wiring must be present",
     );
 }
 
@@ -152,4 +155,49 @@ async fn project_detail_handles_no_progress_or_outbox() {
     assert!(body.contains(slug));
     assert!(body.contains("No events") || body.contains("Recent events (0)"));
     assert!(body.contains("No outbox") || body.contains("Outbox (0)"));
+}
+
+#[tokio::test]
+async fn project_detail_limits_recent_events_to_latest_ten() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let slug = "dev-many-events";
+    let state = ProjectState::initial(slug.to_string());
+    state.save(&paths.project_state(slug)).unwrap();
+
+    let progress = paths.progress_jsonl(slug);
+    fs::create_dir_all(progress.parent().unwrap()).unwrap();
+    let mut body = String::new();
+    for i in 0..12 {
+        body.push_str(
+            &json!({
+                "ts": format!("2026-05-10T10:{i:02}:00Z"),
+                "event": format!("event_{i:02}"),
+                "phase": "implement",
+            })
+            .to_string(),
+        );
+        body.push('\n');
+    }
+    fs::write(&progress, body).unwrap();
+
+    let addr = spawn_server(AppState::new(paths)).await;
+    let url = format!("http://{addr}/project/{slug}");
+    let resp = reqwest::get(&url).await.expect("GET /project/<slug>");
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+
+    assert!(body.contains("Recent events (10)"), "body=\n{body}");
+    assert!(
+        !body.contains("event_00") && !body.contains("event_01"),
+        "oldest events should not be rendered. body=\n{body}",
+    );
+    assert!(
+        body.contains("event_02") && body.contains("event_11"),
+        "latest ten events should be rendered. body=\n{body}",
+    );
+    assert!(
+        body.contains("var MAX_ROWS = 10"),
+        "SSE row cap should match the server-rendered limit"
+    );
 }
