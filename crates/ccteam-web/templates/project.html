@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+
+{% block title %}ccteam — {{ slug }}{% endblock %}
+
+{% block content %}
+    <h1>{{ slug }}</h1>
+    <p class="muted">
+        team: <code>{{ team }}</code>
+        &middot; phase: {% if current_phase.is_empty() %}<span class="muted">—</span>{% else %}<code>{{ current_phase }}</code>{% endif %}
+        &middot; status: <span class="badge {{ badge_class }}">{{ badge_label }}</span>
+        &middot; cost: {{ cost_label }} USD
+    </p>
+
+    <h2>State</h2>
+    <pre>{{ state_json_pretty }}</pre>
+
+    <h2>Recent events ({{ events.len() }})</h2>
+    {% if events.is_empty() %}
+        <p class="empty">No events on <code>progress.jsonl</code> yet.</p>
+    {% else %}
+    <table>
+        <thead>
+            <tr>
+                <th>Timestamp</th>
+                <th>Event</th>
+                <th>Detail</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for e in events %}
+            <tr>
+                <td class="muted">{{ e.ts }}</td>
+                <td>{{ e.event }}</td>
+                <td class="muted">{{ e.detail }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% endif %}
+
+    <h2>Outbox ({{ outbox.len() }})</h2>
+    {% if outbox.is_empty() %}
+        <p class="empty">No outbox messages.</p>
+    {% else %}
+    <ul class="outbox-list">
+        {% for m in outbox %}
+        <li>
+            <div class="meta">
+                <strong>{{ m.kind }}</strong>
+                &middot; <span class="muted">{{ m.created_at }}</span>
+                &middot; <code>{{ m.filename }}</code>
+            </div>
+            <div class="preview">{{ m.preview }}</div>
+        </li>
+        {% endfor %}
+    </ul>
+    {% endif %}
+
+    <h2>Pane snapshot</h2>
+    <!-- M5.2 will fill this with on-demand `/screenshot/<slug>.png`. -->
+    <div class="placeholder">Screenshot panel — populated in M5.2 (SSE + on-demand PNG render).</div>
+{% endblock %}

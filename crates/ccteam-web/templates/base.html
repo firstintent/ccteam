@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}ccteam web{% endblock %}</title>
+    <link rel="stylesheet" href="/assets/style.css">
+    <script src="/assets/htmx.min.js" defer></script>
+</head>
+<body>
+    <nav>
+        <a class="brand" href="/">ccteam</a>
+        <span class="ver">v{{ version }}</span>
+        <span class="muted">read-only dashboard</span>
+    </nav>
+    <main>
+        {% block content %}{% endblock %}
+    </main>
+</body>
+</html>

@@ -1,28 +1,34 @@
-//! V0.3 M5.0 — `ccteam web` axum scaffold.
+//! V0.3 web layer entry point.
 //!
-//! Single entry point: [`serve`]. Wired up by `ccteam-cli` via
+//! Single entry: [`serve`]. Wired up by `ccteam-cli` via
 //! `commands::run_web` so the binary stays a thin protocol adapter.
 //!
-//! M5.0 scope (see `docs/v0-3/prd.md` §3 + `docs/v0-3/dev-plan.md` §2):
+//! Ship state (per `docs/v0-3/prd.md` §3 / §4):
 //!
-//! - bind axum router on `opts.bind`
-//! - install one route: `GET /health`
-//! - graceful shutdown on Ctrl-C / SIGTERM
-//! - print the actual bound `SocketAddr` to stdout so subprocess
-//!   harnesses can read the port assigned by `127.0.0.1:0`
+//! - **M5.0** — `GET /health` + bind / shutdown plumbing.
+//! - **M5.1 (this PR)** — `GET /` dashboard, `GET /project/<slug>`
+//!   detail page, `GET /assets/{file}` vendored static assets.
+//! - M5.2 — SSE + on-demand screenshot.
+//! - M5.3 — write actions + token auth.
 //!
-//! Dashboard / SSE / write actions / token auth land in M5.1 / M5.2 /
-//! M5.3. The [`ServeOpts`] shape is stable from M5.0 forward — M5.3
-//! consumes `no_auth` / `token_file` exactly as defined here.
+//! [`ServeOpts`] is stable from M5.0 forward — M5.3 consumes
+//! `no_auth` / `token_file` exactly as defined here.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use axum::Router;
+use ccteam_core::CcteamPaths;
 use tokio::net::TcpListener;
 
+pub mod queries;
 pub mod routes;
+pub mod state;
+pub mod status;
+pub mod views;
+
+pub use state::AppState;
 
 /// Knobs accepted by [`serve`]. Mirrors the `ccteam web` CLI flags
 /// 1:1 so the CLI translation in `ccteam-cli::commands::run_web`
@@ -33,7 +39,7 @@ pub struct ServeOpts {
     /// integration tests).
     pub bind: SocketAddr,
     /// Disable token auth on write endpoints. M5.3 will honor this;
-    /// M5.0 has no write endpoints so the flag is currently a
+    /// M5.0 / M5.1 has no write endpoints so the flag is currently a
     /// no-op record for ServeOpts shape stability.
     pub no_auth: bool,
     /// Custom path to read the auth token from. Default
@@ -41,15 +47,25 @@ pub struct ServeOpts {
     pub token_file: Option<PathBuf>,
 }
 
-/// Build the M5.0 router. Kept separate from [`serve`] so unit tests
-/// can mount it without binding a real port.
-pub fn router() -> Router {
-    Router::new().merge(routes::router())
+/// Build the router with a freshly resolved `CcteamPaths`. Used by
+/// `serve`; tests call [`router_with_state`] directly to inject a
+/// tempdir-backed `AppState`.
+pub fn router() -> Result<Router> {
+    let paths = CcteamPaths::from_env().context("resolve CcteamPaths from env for ccteam web")?;
+    Ok(router_with_state(AppState::new(paths)))
+}
+
+/// Build the router with an explicit `AppState`. Tests use this so
+/// each test owns its own `tempdir`-backed paths.
+pub fn router_with_state(state: AppState) -> Router {
+    Router::new()
+        .merge(routes::stateless_router())
+        .merge(routes::stateful_router().with_state(state))
 }
 
 /// Start the web server. Binds, prints the bound address one line
 /// to stdout (so subprocess harnesses can parse the port for the
-/// `0` placeholder case), then serves until Ctrl-C / SIGTERM.
+/// `:0` placeholder case), then serves until Ctrl-C / SIGTERM.
 pub async fn serve(opts: ServeOpts) -> Result<()> {
     let listener = TcpListener::bind(opts.bind)
         .await
@@ -74,7 +90,7 @@ pub async fn serve(opts: ServeOpts) -> Result<()> {
     }
     tracing::info!(addr = %local, "ccteam web bound");
 
-    let app = router();
+    let app = router()?;
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
@@ -123,6 +139,18 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
 
+    fn fake_state() -> AppState {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join(".ccteam"),
+            projects_root: tmp.path().join("projects"),
+        };
+        // tmp is dropped at end of scope but AppState only uses paths
+        // by value; for a test that just hits /health this is fine.
+        std::mem::forget(tmp);
+        AppState::new(paths)
+    }
+
     #[tokio::test]
     async fn serve_health_endpoint_returns_ok_json() {
         let listener =
@@ -130,7 +158,7 @@ mod tests {
                 .await
                 .unwrap();
         let addr = listener.local_addr().unwrap();
-        let app = router();
+        let app = router_with_state(fake_state());
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
