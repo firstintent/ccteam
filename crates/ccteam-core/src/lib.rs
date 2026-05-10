@@ -40,8 +40,8 @@ pub use actions::{
     DecisionInput, SendOptions, SendResult,
 };
 pub use harness::{
-    derive_harness_path, write_harness_snapshot, ClaudeCodeAdapter, HarnessAdapter, HarnessError,
-    HarnessSnapshot, SessionHandle, SpawnOpts, SubagentState,
+    derive_harness_path, write_harness_snapshot, ClaudeCodeAdapter, CodexAdapter, HarnessAdapter,
+    HarnessError, HarnessSnapshot, SessionHandle, SpawnOpts, SubagentState,
 };
 pub use dag::{dev_dag, Dag};
 pub use auto_loop::{AutoLoopDecision, AutoLoopFrontMatter, AutoLoopState};
@@ -114,9 +114,9 @@ pub use subskill::{
 };
 pub use state::{Parallelism, PhaseHistoryEntry, PhaseState, ProjectState};
 pub use team::{
-    CostPolicy, CriticDimensionSpec, CriticStrictness, DomainRule, EscalateGrammarExtension,
-    EscalateRoute, GoldenRuleEnforcement, ProtocolRule, RetroFieldKind, RetroFieldSpec,
-    TeamGoldenRules, TeamSpec,
+    CostPolicy, CriticDimensionSpec, CriticStrictness, DefaultSessionSpec, DomainRule,
+    EscalateGrammarExtension, EscalateRoute, GoldenRuleEnforcement, HarnessKind, ProtocolRule,
+    RetroFieldKind, RetroFieldSpec, TeamGoldenRules, TeamSpec,
 };
 pub use team_factory::{
     init_team_staging, publish_team, staging_dir_for, validate_staged_team, InitReport,

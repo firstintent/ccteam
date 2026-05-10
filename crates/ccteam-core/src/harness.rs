@@ -378,6 +378,81 @@ fn send_exit_command(tmux_session: &str) -> std::io::Result<()> {
 }
 
 // =====================================================================
+// CodexAdapter (V0.3.1 F47 — trait-stub only)
+// =====================================================================
+
+/// V0.3.1 F47 [`HarnessAdapter`] stub for OpenAI's `codex` CLI. Every
+/// fallible method returns [`HarnessError::NotImplemented`] with a
+/// `&'static str` reason pointing operators at the V0.3.2 tracking
+/// doc + the upstream codex integration research note.
+///
+/// The stub exists so:
+///
+/// 1. F47 PR can land the **trait shape** (`harness: codex` accepted
+///    by `team.yaml::sessions[]` and `ccteam session add --harness codex`)
+///    without F47 also having to ship the real Codex bridge — that
+///    work is `~month` of integration plumbing tracked in
+///    `docs/research/ccteam-codex-integration.md` M1-M5.
+/// 2. V0.3.2's real `CodexAdapter` impl can swap into this slot
+///    without touching any caller (the trait surface is closed).
+/// 3. Users who flip `--harness codex` early get a friendly error
+///    pointing to the tracking issue rather than panic / silent fall
+///    back to claude.
+///
+/// Stateless zero-size — share one `'static` instance.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CodexAdapter;
+
+/// V0.3.1 F47 stub reason — a single harmonized constant referenced
+/// from every `HarnessAdapter` method. Keeping this `&'static str`
+/// preserves the `NotImplemented::reason: &'static str` contract
+/// (CLAUDE.md §三 / PRD §4.2.1) so the stub is allocation-free.
+///
+/// Both substrings the F47 verification tests check — `"V0.3.2"` and
+/// `"docs/research/ccteam-codex-integration.md"` — are present here,
+/// so any caller pattern-matching `NotImplemented { harness: "codex",
+/// reason }` can rely on both citations being available.
+const CODEX_NOT_IMPLEMENTED_REASON: &str =
+    "Codex adapter is trait-stub in V0.3.1; full Codex CLI integration deferred to V0.3.2+ \
+     — see docs/research/ccteam-codex-integration.md M1-M5 and docs/v0-3-1/prd.md §F47. \
+     Use --harness=claude or wait for V0.3.2.";
+
+impl CodexAdapter {
+    /// Build a fresh `CodexAdapter`. Const so callers can write
+    /// `static CX: CodexAdapter = CodexAdapter::new();`.
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl HarnessAdapter for CodexAdapter {
+    fn name(&self) -> &'static str {
+        "codex"
+    }
+
+    fn ingest_snapshot(&self, _raw: &str) -> Result<HarnessSnapshot, HarnessError> {
+        Err(HarnessError::NotImplemented {
+            harness: "codex",
+            reason: CODEX_NOT_IMPLEMENTED_REASON,
+        })
+    }
+
+    fn spawn_session(&self, _opts: SpawnOpts) -> Result<SessionHandle, HarnessError> {
+        Err(HarnessError::NotImplemented {
+            harness: "codex",
+            reason: CODEX_NOT_IMPLEMENTED_REASON,
+        })
+    }
+
+    fn shutdown_session(&self, _handle: &SessionHandle) -> Result<(), HarnessError> {
+        Err(HarnessError::NotImplemented {
+            harness: "codex",
+            reason: CODEX_NOT_IMPLEMENTED_REASON,
+        })
+    }
+}
+
+// =====================================================================
 // Path derivation (statusline wrapper helper)
 // =====================================================================
 
@@ -719,5 +794,96 @@ mod tests {
             captured_at: Utc::now(),
         };
         assert!(ClaudeCodeAdapter::new().subagent_states(&snap).is_empty());
+    }
+
+    // ----- CodexAdapter (V0.3.1 F47 stub) -----
+    //
+    // Every fallible method must return `HarnessError::NotImplemented`
+    // with `&'static str` payloads citing both V0.3.2 and the
+    // codex-integration research doc (PRD §F47 §4.2.1). The reason
+    // strings are harmonized across all three methods so callers
+    // (including the F49 `ccteam session add` CLI surface) can match
+    // the same two substrings on every method.
+
+    #[test]
+    fn codex_adapter_name_is_codex() {
+        // Stability test — `ccteam-web` SSE wire format embeds this
+        // string, mirroring `claude_code_adapter_name_is_stable`. F49
+        // CLI dispatch and team.yaml `harness: codex` round-trip both
+        // depend on this literal.
+        assert_eq!(CodexAdapter::new().name(), "codex");
+    }
+
+    #[test]
+    fn codex_adapter_spawn_returns_not_implemented_with_v0_3_2_reason() {
+        let opts = SpawnOpts {
+            harness: "codex",
+            slug: "flex-foo".into(),
+            sid: "codex-1".into(),
+            cwd: PathBuf::from("/tmp"),
+            extra_args: Vec::new(),
+        };
+        match CodexAdapter::new().spawn_session(opts).unwrap_err() {
+            HarnessError::NotImplemented { harness, reason } => {
+                assert_eq!(harness, "codex");
+                assert!(
+                    reason.contains("V0.3.2"),
+                    "reason should cite V0.3.2: {reason}",
+                );
+                assert!(
+                    reason.contains("docs/research/ccteam-codex-integration.md"),
+                    "reason should cite codex-integration research doc: {reason}",
+                );
+            }
+            other => panic!("expected NotImplemented, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn codex_adapter_ingest_returns_not_implemented() {
+        match CodexAdapter::new().ingest_snapshot("{}").unwrap_err() {
+            HarnessError::NotImplemented { harness, reason } => {
+                assert_eq!(harness, "codex");
+                assert!(reason.contains("V0.3.2"));
+                assert!(reason.contains("docs/research/ccteam-codex-integration.md"));
+            }
+            other => panic!("expected NotImplemented, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn codex_adapter_shutdown_returns_not_implemented() {
+        let handle = SessionHandle {
+            tmux_session: "ccteam-flex-foo-codex-1".into(),
+            harness: "codex".into(),
+            sid: "codex-1".into(),
+            pid: None,
+            started_at: Utc::now(),
+        };
+        match CodexAdapter::new().shutdown_session(&handle).unwrap_err() {
+            HarnessError::NotImplemented { harness, reason } => {
+                assert_eq!(harness, "codex");
+                assert!(reason.contains("V0.3.2"));
+                assert!(reason.contains("docs/research/ccteam-codex-integration.md"));
+            }
+            other => panic!("expected NotImplemented, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn codex_adapter_subagent_states_default_empty() {
+        // Mirrors `subagent_states_default_empty_for_v0_3_1` — the
+        // stub uses the trait's default `Vec::new()` impl.
+        let snap = HarnessSnapshot {
+            harness: "codex".into(),
+            model_display_name: "X".into(),
+            context_used_pct: 0,
+            cost_usd_total: 0.0,
+            rate_limit_pct: None,
+            cwd: None,
+            raw: serde_json::Value::Null,
+            captured_at: Utc::now(),
+        };
+        assert!(CodexAdapter::new().subagent_states(&snap).is_empty());
     }
 }
