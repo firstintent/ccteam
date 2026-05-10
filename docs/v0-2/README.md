@@ -3,6 +3,10 @@
 V0.2 已 ship(`origin/main = 503269a`,8 个 milestone M0.16-M0.23,497/0 测试)。
 本目录收纳 V0.2 全部相关文档。
 
+> **V0.3 起始**(drafting,2026-05-10):web UI(读 + 受限写)— 详
+> [`docs/v0-3/`](../v0-3/)。下方 "V0.3 deferred 项" 仍 deferred(web UI 是
+> 新增主线,不替代列出的 deferred 项)。
+
 ## 文档清单
 
 | 文件 | 内容 | 何时读 |

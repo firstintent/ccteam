@@ -30,7 +30,9 @@ F1/F5/F6/F7/F8/F18 由独立 PR 一波关闭;**2026-05-08 V0.2 M0.23**:加 F24 +
 P0 + 同 PR 关闭;**2026-05-08 V0.2 e2e retro**:加 F26-F33 八条 V0.2.1 候选;
 **2026-05-08 V0.2.1 patch**:F26-F33 全部修复;
 **2026-05-09 V0.2.2 patch**:加 F34-F40 七条用户反馈 + 命名 sweep + UX 增强,跨 7 PR 全部修复;
-**2026-05-09 V0.2.2 e2e retro patch**:4-suite 并行 e2e 验证,撞 F41 (P1) + F42 (P1) + F43 (P2),同 PR 一波修),分布:
+**2026-05-09 V0.2.2 e2e retro patch**:4-suite 并行 e2e 验证,撞 F41 (P1) + F42 (P1) + F43 (P2),同 PR 一波修;
+**2026-05-10 V0.2.2 F44 反向回滚**:`/usr/bin/cct` namespace 碰撞驱动整体反向 F39,F44 单 PR 覆盖;
+**2026-05-10 V0.3 doc-only kickoff**:加 F45 P1(write helper promote ccteam-cli → ccteam-core::actions,M5.0 关键解耦),实施在 V0.3 PR #1 / #4),分布:
 
 | 优先级 | 数量 | 编号 |
 |---|---|---|
@@ -735,6 +737,15 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
 - **解耦方案**:逐一反向:binary `cct` → `ccteam`、skill `cct-*` → `ccteam-*`、Rust `current_cct_bin` → `current_ccteam_bin` / `install_cct_*_skill` → `install_ccteam_*_skill`、placeholder `{{CCT_BIN}}` → `__CCTEAM_BIN__`、docs sweep。`ccteam doctor` 加 F39 → F44 反向迁移(检测 `~/.claude/skills/cct-{control,team-author,project-creator}/` marker + frontmatter 校验,匹配则 rm -rf;rewrite `~/projects/<slug>/.claude/settings.json` 内 `cct hook` → `ccteam hook` 原子写)。**保留**(per F39 §8.3):MCP server name `ccteam`、`~/.ccteam/` 项目根、crate 名、git repo / workspace 名 — 这些 F39 本就没动。
 - **优先级**:**P0**(silent-substitute footgun)。
 - **来源**:用户 2026-05-10 反馈 + 实证 `dpkg -S /usr/bin/cct` 命中 `proj-bin`。
+
+### F45 — write 动作 helper 锁在 ccteam-cli::mcp_serve 私有 fn,V0.3 web crate 无法复用(2026-05-10 加;**待修复:V0.3 M5.0 PR #1 promote + V0.3 M5.3 PR #4 close**)
+
+- **文件:行号**:`crates/ccteam-cli/src/mcp_serve.rs::tool_send_to_session`(line 456,`fn` 非 `pub fn`)+ `tool_inject_decision`(line 500,同)+ pause / resume 在 mcp_serve 内 inline logic 无独立 fn。
+- **现状**:V0.2.2 ship 时,写动作 helper 全部位于 `ccteam-cli::mcp_serve.rs` 私有 fn,只供 MCP tool dispatch 内部消费;V0.3 web UI(新 crate `crates/ccteam-web`)需要复用同一逻辑写 inbox / control,但 `ccteam-web` 不能 depend on `ccteam-cli`(binary-as-library 反模式 + dep 图倒挂 — `ccteam-cli` 是 binary entry,`ccteam-web` 是新 crate,sibling 关系应共下沉 `ccteam-core`)。读侧 helper 已 public(`collect_projects` / `collect_recent_events` / `run_resume` / `run_show`,以及 `ccteam_core::ProjectState` / `CcteamPaths` / `render_screenshot` / `tmux::capture_pane_*` / `check_daemon_health` / `SessionMailbox` / `inbox_filename` / `pick_unused_slug` / `bootstrap_project`),写侧未 promote。
+- **是否真 dev-specific**:**否——dep 图整理 + 跨消费者复用**。
+- **解耦方案**:V0.3 M5.0(PR #1)新建 `crates/ccteam-core/src/actions.rs`,提 4 个 pub fn:`send_to_session(paths, slug, text)` / `inject_decision(paths, slug, DecisionInput)` / `pause(paths, slug)` / `resume(paths, slug)`;`mcp_serve.rs::tool_*` 内部 logic 全提到 `actions::*`,wrapper 留 args 拆 + JSON encode;`ccteam-web::routes::actions::*` 直调 `ccteam_core::actions::*`,`ccteam-web` 只 depend on `ccteam-core`(`cargo tree -p ccteam-web` 验证不出现 `ccteam-cli`)。M5.3(PR #4)写动作 endpoint 落地后 close。
+- **优先级**:**P1**(V0.3 M5.0 启动门槛;`ccteam-web` 没这个 promote 就走不通)。
+- **来源**:V0.3 M5.0 audit(`docs/v0-3/prd.md §3`)。
 
 ### F40 — `product-research` team 名冗长 + 领域名缺位(2026-05-09 加;**已修复:2026-05-09(V0.2.2 PR #6 alias 软迁移)**)
 
