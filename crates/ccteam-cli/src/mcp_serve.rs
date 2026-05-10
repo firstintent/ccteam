@@ -25,18 +25,23 @@
 use std::io::Write;
 
 use anyhow::{anyhow, Context, Result};
-use chrono::Utc;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+// V0.3 M5.0 (F45 promote): write-helper logic lives in
+// `ccteam_core::actions`; the wrappers below stay thin (args parse +
+// JSON encode + delegate). Web-side consumers (`crates/ccteam-web`)
+// pick up the same import line in M5.3 (`docs/v0-3/dev-plan.md` §5
+// #4.3) — at which point `git grep -nE 'use ccteam_core::actions'`
+// returns ≥ 2 hits.
+use ccteam_core::actions;
 use ccteam_core::{
-    bootstrap_project, check_daemon_health, inbox_filename, pick_unused_slug,
-    render_screenshot, CcteamPaths, DaemonHealth, InboxFrontMatter, InboxMessage,
-    ProjectState, SessionMailbox,
+    bootstrap_project, check_daemon_health, pick_unused_slug,
+    render_screenshot, CcteamPaths, DaemonHealth, SendOptions,
 };
 
 use crate::commands::{
-    collect_projects, collect_recent_events, run_resume, run_show, OutputFormat,
+    collect_projects, collect_recent_events, run_show, OutputFormat,
 };
 
 /// Stable MCP protocol version this server speaks. Newer client versions
@@ -431,12 +436,7 @@ fn tool_new(paths: &CcteamPaths, args: &Value) -> Result<String> {
 
 fn tool_pause(paths: &CcteamPaths, args: &Value) -> Result<String> {
     let slug = arg_string(args, "slug")?;
-    let state_path = paths.project_state(&slug);
-    let mut state = ProjectState::load(&state_path)
-        .with_context(|| format!("load state for {slug}"))?;
-    state.user_pause_pending = true;
-    state.last_user_interaction_at = Utc::now();
-    state.save(&state_path)?;
+    actions::pause(paths, &slug)?;
     Ok(serde_json::to_string_pretty(&json!({
         "ok": true,
         "slug": slug,
@@ -446,7 +446,7 @@ fn tool_pause(paths: &CcteamPaths, args: &Value) -> Result<String> {
 
 fn tool_resume(paths: &CcteamPaths, args: &Value) -> Result<String> {
     let slug = arg_string(args, "slug")?;
-    run_resume(paths, &slug)?;
+    actions::resume(paths, &slug)?;
     Ok(serde_json::to_string_pretty(&json!({
         "ok": true,
         "slug": slug,
@@ -461,39 +461,18 @@ fn tool_send_to_session(paths: &CcteamPaths, args: &Value) -> Result<String> {
         .and_then(|v| v.as_str())
         .unwrap_or("text")
         .to_string();
-    let project_dir = paths.project_dir(&session);
-    if !project_dir.exists() {
-        return Err(anyhow!(
-            "no project / session named `{}` (looked under {})",
-            session,
-            project_dir.display(),
-        ));
-    }
-    let ccteam_dir = paths.project_ccteam_dir(&session);
-    let mailbox = SessionMailbox::for_ccteam_dir(&ccteam_dir);
-    mailbox.ensure_dirs()?;
-    let now = Utc::now();
-    let filename = inbox_filename(now, next_inbox_seq(&mailbox)?);
-    let inbox_path = mailbox.inbox.join(&filename);
-    let msg = InboxMessage {
-        front: InboxFrontMatter {
-            schema_version: ccteam_core::LATEST_SCHEMA_VERSION,
-            source: "ccteam-mcp".into(),
-            source_chat_id: None,
-            source_msg_id: None,
-            source_user: "mcp".into(),
-            created_at: now,
-            ingested_at: now,
-            content_type,
-            attachments: Vec::new(),
-        },
-        body: format!("{body}\n"),
+    // Wrapper keeps `source = "ccteam-mcp"` for backward compat with
+    // retro / silence-classifier consumers that grep on `source`.
+    let opts = SendOptions {
+        source: "ccteam-mcp".into(),
+        source_user: "mcp".into(),
+        content_type,
     };
-    msg.save(&inbox_path)?;
+    let result = actions::send_to_session_with(paths, &session, &body, &opts)?;
     Ok(serde_json::to_string_pretty(&json!({
         "ok": true,
         "session": session,
-        "inbox_file": filename,
+        "inbox_file": result.inbox_file,
     }))?)
 }
 
@@ -585,30 +564,6 @@ fn arg_string(args: &Value, name: &str) -> Result<String> {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .ok_or_else(|| anyhow!("missing required argument `{name}`"))
-}
-
-/// Compute the next 1-based sequence number for inbox writes within
-/// the same wall-clock second. Scans existing files in the inbox dir
-/// and picks `max + 1`. Tolerates a corrupted dir by defaulting to 1.
-fn next_inbox_seq(mailbox: &SessionMailbox) -> Result<u32> {
-    let entries = mailbox.list_inbox()?;
-    let mut max = 0u32;
-    for path in entries {
-        if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-            // Filename: msg-<ts>-<NNN>.md
-            if let Some(seq) = name
-                .strip_prefix("msg-")
-                .and_then(|rest| rest.rsplit_once('-'))
-                .map(|(_, last)| last.trim_end_matches(".md"))
-                .and_then(|n| n.parse::<u32>().ok())
-            {
-                if seq > max {
-                    max = seq;
-                }
-            }
-        }
-    }
-    Ok(max + 1)
 }
 
 fn json_rpc_error(id: Option<Value>, code: i32, message: &str) -> Value {
@@ -789,39 +744,9 @@ mod tests {
         assert_eq!(v["mcpServers"]["ccteam"]["command"], "/x/ccteam");
     }
 
-    #[test]
-    fn next_inbox_seq_starts_at_one_for_empty_dir() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mb = SessionMailbox::for_ccteam_dir(tmp.path());
-        mb.ensure_dirs().unwrap();
-        assert_eq!(next_inbox_seq(&mb).unwrap(), 1);
-    }
-
-    #[test]
-    fn next_inbox_seq_is_one_more_than_max_existing() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mb = SessionMailbox::for_ccteam_dir(tmp.path());
-        mb.ensure_dirs().unwrap();
-        // Stage three real msg files so list_inbox sees them.
-        for seq in [1u32, 2, 5] {
-            let name = inbox_filename(Utc::now(), seq);
-            let path = mb.inbox.join(&name);
-            std::fs::write(
-                &path,
-                concat!(
-                    "---\nschema_version: 1\nsource: cli\nsource_user: rob\n",
-                    "created_at: 2026-05-06T10:30:00Z\n",
-                    "ingested_at: 2026-05-06T10:30:00Z\n",
-                    "content_type: text\n---\n\nx\n",
-                ),
-            )
-            .unwrap();
-            // tweak time so each filename differs even for fast tests
-            let _ = seq;
-        }
-        let next = next_inbox_seq(&mb).unwrap();
-        assert!(next >= 6, "next must be > existing max 5, got {next}");
-    }
+    // V0.3 M5.0: `next_inbox_seq` body lives in
+    // `ccteam_core::actions::next_inbox_seq`; coverage moved with it
+    // (see `crates/ccteam-core/src/actions.rs` test module).
 
     #[test]
     fn json_rpc_error_includes_id_and_envelope() {

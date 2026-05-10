@@ -239,6 +239,27 @@ enum Command {
         #[command(subcommand)]
         cmd: TeamCommand,
     },
+    /// V0.3 M5.0: serve the ccteam web UI (read + restricted-write,
+    /// `docs/v0-3/prd.md` §3-§6). M5.0 ships the scaffold + `/health`
+    /// endpoint only; dashboard / SSE / write actions land in M5.1-3.
+    Web {
+        /// Listen address. Default `127.0.0.1:7331` — auth is disabled
+        /// when bound to loopback. Bind to `0.0.0.0:<port>` for LAN
+        /// reach (M5.3 requires token auth on non-loopback unless
+        /// `--no-auth`).
+        #[arg(long, default_value = "127.0.0.1:7331")]
+        bind: String,
+        /// Disable token auth on write endpoints. DANGEROUS on
+        /// non-loopback bind — M5.3 prints a 5-second warning before
+        /// listening.
+        #[arg(long, default_value_t = false)]
+        no_auth: bool,
+        /// Custom path to read the auth token from (default
+        /// `~/.ccteam/web-token`). M5.3 consumes this; M5.0 records
+        /// it on `ServeOpts` for shape stability.
+        #[arg(long, value_name = "PATH")]
+        token_file: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -419,6 +440,18 @@ fn main() -> Result<()> {
         Command::Phase { cmd } => run_phase(cmd),
         Command::Watchdog { cmd } => run_watchdog(cmd),
         Command::Team { cmd } => run_team(cmd),
+        Command::Web {
+            bind,
+            no_auth,
+            token_file,
+        } => {
+            init_tracing();
+            commands::run_web(commands::WebOptions {
+                bind,
+                no_auth,
+                token_file,
+            })
+        }
     }
 }
 
