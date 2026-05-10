@@ -635,6 +635,12 @@ V0.1 → V0.2 升级:V0.1 用户的 `~/.claude/agents/<name>.md` ln -sf 由 `cct
   首例,`teams/research/team.yaml` 列 `aliases: [product-research]`)。老项目
   state.json::team 字面 / 项目目录名 / 老 rules 文件全不动;`ccteam new --team
   product-research` 仍工作并 stderr warn deprecated。详 PRD §9。
+- **V0.3.1 F47** ✅ 加 `sessions: Vec<DefaultSessionSpec>`(默认空),每条
+  `{ sid: String, harness: HarnessKind }`,`HarnessKind = claude | codex`(serde
+  `lowercase` rename)。**只对 `kind: flex` 团队有意义**(`kind` 字段 F48 落);
+  workflow / multi_workflow 团队 parse 不 fail 但忽略。F47 ship trait stub +
+  schema;F49 PR(V0.3.1 PR #4)落 `state.json::sessions[]` runtime + adhoc
+  `ccteam session add/ls/attach/rm` 命令。详 PRD §F47 + `docs/research/ccteam-codex-integration.md`。
 
 ```yaml
 # ~/.ccteam/teams/research/team.yaml — 完整字段示例(V0.2.2 起 canonical 名 `research`)
@@ -712,7 +718,28 @@ cost_policy:
 claude_md_template: |
   # CLAUDE.md (auto-managed by ccteam)
   ...
+
+# V0.3.1 F47 — flex 团队的默认 session 列表(workflow / multi_workflow 团队
+# 该字段忽略,不 fail);F48 PR 落 `kind: flex`,F49 PR 落 runtime path
+# (`ccteam session add/ls/attach/rm` 实际写 state.json::sessions[])。
+# 每条 `harness:` ∈ {claude, codex},缺省 `claude`;`sid:` 必填。
+# 详 PRD §F47 + docs/research/ccteam-codex-integration.md。
+sessions:
+  - sid: claude-1
+    harness: claude
+  - sid: codex-1
+    harness: codex
 ```
+
+`DefaultSessionSpec` 字段表(V0.3.1 F47):
+
+| 字段       | 类型           | 默认       | 说明 |
+|------------|----------------|------------|------|
+| `sid`      | `String`       | 必填       | session id slug。F49 派生 tmux session 名 `ccteam-<slug>-<sid>` 与 `<harness-dir>/<slug>-<sid>.json` dual-write 目标 |
+| `harness`  | `HarnessKind`  | `claude`   | `claude` → `ClaudeCodeAdapter`(V0.3.1 完整);`codex` → `CodexAdapter`(V0.3.1 stub,V0.3.2 实现)|
+
+`#[serde(deny_unknown_fields)]` 在 `DefaultSessionSpec` 启用,typo `sd:` 等 fail-loud。
+`HarnessKind` `#[serde(rename_all = "lowercase")]`,未知 variant fail-loud(prevents `harness: anthropic` 等静默 fallback)。
 
 **校验**(`TeamSpec::validate` 在 parse 时执行):
 - `name` 非空,只允许 ascii 小写 / 数字 / `-` / `_`
@@ -733,11 +760,17 @@ claude_md_template: |
   `phase_dir` 不需存在;`cost_policy=None` 跳过 cost 阶梯;
   `cost_policy=KillAt(threshold)` 用 yaml 阈值覆盖
   `state.hard_kill_threshold_usd`
+- V0.3.1 F47:`sessions: Vec<DefaultSessionSpec>` serde-default 空,V0.1/V0.2/V0.3
+  yaml 解析不变;`harness: claude | codex` 严格 enum(未知 variant fail-loud);
+  `DefaultSessionSpec` `deny_unknown_fields`(typo `sd:` fail-loud)。语义校验
+  (sid 唯一 / `claude-N` vs `codex-N` 命名约定 / kind: flex 强约束)F49 PR 落,
+  F47 只校验 schema 解析
 
 **实现位置**:`crates/ccteam-core/src/team.rs`(`TeamSpec` / `RetroFieldSpec` /
 `RetroFieldKind` / `CriticDimensionSpec` / `CriticStrictness` /
-`EscalateGrammarExtension` / `EscalateRoute`),通过 `ccteam_core::TeamSpec::load(path)`
-暴露。orchestrator 启动期扫描 + 加载在 `Orchestrator::new`(`load_team_runtimes`)。
+`EscalateGrammarExtension` / `EscalateRoute` / V0.3.1 F47:`DefaultSessionSpec` /
+`HarnessKind`),通过 `ccteam_core::TeamSpec::load(path)` 暴露。orchestrator 启动期扫描 +
+加载在 `Orchestrator::new`(`load_team_runtimes`)。
 
 #### 5.5.1 Plugin manifest 兼容字段(V0.2 M0.22 team factory)
 
