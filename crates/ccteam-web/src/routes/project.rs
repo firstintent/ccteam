@@ -1,9 +1,9 @@
 //! `GET /project/<slug>` — project detail page.
 //!
 //! Loads `~/.ccteam/projects/<slug>/.ccteam/state.json`, tails the
-//! last 200 progress events, scans the outbox dir for the 20 newest
-//! messages, and renders the askama `project.html` template. Unknown
-//! slug returns 404.
+//! last 10 progress events for display, scans the outbox dir for the
+//! 20 newest messages, and renders the askama `project.html` template.
+//! Unknown slug returns 404.
 //!
 //! Read-only — no write endpoints, no escalation, no state mutation.
 //! M5.3 will add forms here; for M5.1 the screenshot panel is a
@@ -21,7 +21,8 @@ use chrono::Utc;
 
 use crate::decisions::scan_candidates;
 use crate::queries::{
-    events_to_rows, outbox_rows, slug_recent_events, DEFAULT_EVENT_LIMIT, DEFAULT_OUTBOX_LIMIT,
+    events_to_rows, outbox_rows, slug_recent_events, DEFAULT_OUTBOX_LIMIT,
+    PROJECT_EVENT_DISPLAY_LIMIT, STATUS_EVENT_LIMIT,
 };
 use crate::state::AppState;
 use crate::status::status_badge;
@@ -51,15 +52,18 @@ async fn handle_project(
         }
     };
 
-    let raw_events = slug_recent_events(&app.paths, &slug, DEFAULT_EVENT_LIMIT);
-    let event_rows = events_to_rows(&raw_events);
+    let status_events = slug_recent_events(&app.paths, &slug, STATUS_EVENT_LIMIT);
+    let display_start = status_events
+        .len()
+        .saturating_sub(PROJECT_EVENT_DISPLAY_LIMIT);
+    let event_rows = events_to_rows(&status_events[display_start..]);
     let outbox = outbox_rows(&app.paths, &slug, DEFAULT_OUTBOX_LIMIT);
 
     let silent = state
         .last_progress_event_at
         .map(|t| Utc::now().signed_duration_since(t).num_seconds().max(0) as u64)
         .unwrap_or(0);
-    let badge = status_badge(&state, &raw_events, silent);
+    let badge = status_badge(&state, &status_events, silent);
 
     let state_json_pretty = match serde_json::to_string_pretty(&state) {
         Ok(s) => s,

@@ -218,9 +218,9 @@ code {
     50%      { opacity: 0.35; }
 }
 
-/* V0.3 M5.2 — on-demand pane snapshot panel. Image is constrained
-   to the main column; refresh button + caption sit above. */
-.screenshot-panel {
+/* V0.3 pane snapshot panel. xterm.js renders raw tmux ANSI bytes in
+   the browser; the legacy PNG endpoint remains a linked fallback. */
+.terminal-panel {
     background: var(--bg-elev);
     border: 1px solid var(--border);
     border-radius: 6px;
@@ -228,16 +228,35 @@ code {
     margin-top: 0.5rem;
 }
 
-.screenshot-panel img {
-    display: block;
-    max-width: 100%;
-    height: auto;
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    background: #000;
+.terminal-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
 }
 
-.screenshot-panel button {
+.terminal-snapshot {
+    max-width: 100%;
+    overflow: auto;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: #101216;
+    padding: 0.5rem;
+}
+
+.terminal-snapshot .xterm {
+    padding: 0;
+}
+
+.terminal-snapshot .xterm-viewport {
+    overflow-y: hidden;
+}
+
+.terminal-snapshot .xterm-screen {
+    outline: none;
+}
+
+.terminal-panel button {
     background: var(--bg);
     color: var(--fg);
     border: 1px solid var(--border);
@@ -246,10 +265,9 @@ code {
     font-family: inherit;
     font-size: 0.85rem;
     cursor: pointer;
-    margin-right: 0.5rem;
 }
 
-.screenshot-panel button:hover {
+.terminal-panel button:hover {
     background: var(--bg-hover);
     border-color: var(--accent);
 }
