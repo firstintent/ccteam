@@ -19,6 +19,7 @@
 //! `subagent_active` cases in `progress.rs::tests`.
 
 use std::path::Path;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -27,7 +28,7 @@ use ccteam_core::{
     limbo_retry_path_in, load_limbo_retry_count, load_pending_inject, pending_inject_path_in,
     progress, save_pending_inject, write_global_phase_templates, CcteamPaths,
     DrainPendingOutcome, Orchestrator, OrchestratorConfig, Parallelism, PendingInject,
-    PhaseState, ProjectState,
+    PhaseState, ProjectState, TeamKind,
 };
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -87,6 +88,7 @@ fn fixture(
     ProjectState {
         slug: slug.clone(),
         team: "dev".into(),
+        team_kind: TeamKind::Workflow,
         created_at: stale,
         tmux_session: TmuxSession::for_slug(&slug).name().to_string(),
         claude_session_id: None,
@@ -107,6 +109,8 @@ fn fixture(
         last_user_interaction_at: stale,
         user_attached: false,
         user_pause_pending: false,
+        sessions: BTreeMap::new(),
+        next_sid_seq: BTreeMap::new(),
     }
     .save(&paths.project_state(&slug))
     .unwrap();

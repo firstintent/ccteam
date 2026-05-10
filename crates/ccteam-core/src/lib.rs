@@ -102,7 +102,9 @@ pub use stall::{
     classify as classify_stall, classify_with_thresholds, silent_seconds, StallLevel,
     StallThresholds, STALL_ESCALATE_SECONDS, STALL_SUSPICIOUS_SECONDS, STALL_WARN_SECONDS,
 };
-pub use paths::{slug_from_project_dir, CcteamPaths};
+pub use paths::{
+    session_context_from_cwd, slug_from_project_dir, CcteamPaths, ProjectSessionContext,
+};
 pub use queries::{collect_projects, collect_recent_events, ProjectSummary};
 pub use phases::{
     AgentTeamRole, DecisionMode, GoldenRule, GoldenRuleKind, PhaseHooks, PhaseTemplate,
@@ -112,7 +114,9 @@ pub use subskill::{
     resolve_skill_path, run_sub_skills_for_phase, ClaudePRunner, SubSkillOutcome, SubSkillRunCtx,
     SubSkillRunner,
 };
-pub use state::{Parallelism, PhaseHistoryEntry, PhaseState, ProjectState};
+pub use state::{
+    harness_sid_prefix, Parallelism, PhaseHistoryEntry, PhaseState, ProjectState, SessionRecord,
+};
 pub use team::{
     CostPolicy, CriticDimensionSpec, CriticStrictness, DefaultSessionSpec, DomainRule,
     EscalateGrammarExtension, EscalateRoute, GoldenRuleEnforcement, HarnessKind, ProtocolRule,

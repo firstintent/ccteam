@@ -4,12 +4,13 @@
 //! asserts the resulting filesystem side effect.
 
 use std::path::{Path, PathBuf};
+use std::collections::BTreeMap;
 
 use chrono::Utc;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-use ccteam_core::{CcteamPaths, Parallelism, PhaseState, ProjectState};
+use ccteam_core::{CcteamPaths, Parallelism, PhaseState, ProjectState, TeamKind};
 use ccteam_hooks::{cost_accumulate, load_context, parse_phase_end, progress_append};
 
 struct Fixture {
@@ -41,6 +42,7 @@ impl Fixture {
         let state = ProjectState {
             slug: slug.into(),
             team: "dev".into(),
+            team_kind: TeamKind::Workflow,
             created_at: now,
             tmux_session: format!("ccteam-{slug}"),
             claude_session_id: None,
@@ -61,6 +63,8 @@ impl Fixture {
             last_user_interaction_at: now,
             user_attached: false,
             user_pause_pending: false,
+            sessions: BTreeMap::new(),
+            next_sid_seq: BTreeMap::new(),
         };
         state.save(&state_path).unwrap();
 
@@ -99,6 +103,26 @@ impl Fixture {
 
     fn read_state(&self) -> ProjectState {
         ProjectState::load(&self.paths.project_state(&self.slug)).unwrap()
+    }
+
+    fn read_session_progress_lines(&self, sid: &str) -> Vec<Value> {
+        let p = self.paths.progress_jsonl_for_session(&self.slug, sid);
+        if !p.exists() {
+            return Vec::new();
+        }
+        std::fs::read_to_string(&p)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    fn mark_flex(&self) {
+        let mut state = self.read_state();
+        state.team = "flex".into();
+        state.team_kind = TeamKind::Flex;
+        state.save(&self.paths.project_state(&self.slug)).unwrap();
     }
 }
 
@@ -167,6 +191,23 @@ fn progress_append_appends_across_multiple_invocations() {
     assert_eq!(events[0]["event"], "session_start");
     assert_eq!(events[1]["event"], "Stop");
     assert_eq!(events[2]["event"], "SessionEnd");
+}
+
+#[test]
+fn progress_append_routes_flex_session_to_nested_jsonl() {
+    let fx = Fixture::new("flex-demo");
+    fx.mark_flex();
+    let session_dir = fx.paths.project_session_dir(&fx.slug, "claude-1");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let stdin = json!({"cwd": session_dir});
+
+    progress_append(&fx.paths, "Stop", &stdin).unwrap();
+
+    assert!(fx.read_progress_lines().is_empty());
+    let events = fx.read_session_progress_lines("claude-1");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["event"], "Stop");
+    assert_eq!(events[0]["sid"], "claude-1");
 }
 
 #[test]

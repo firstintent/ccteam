@@ -1,18 +1,22 @@
 //! Integration tests for `ccteam_core::state` — `ProjectState` round-trip,
 //! atomic save semantics, and corruption recovery via `.bak`.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use chrono::{TimeZone, Utc};
 use tempfile::TempDir;
 
-use ccteam_core::{Parallelism, PhaseHistoryEntry, PhaseState, ProjectState};
+use ccteam_core::{
+    HarnessKind, Parallelism, PhaseHistoryEntry, PhaseState, ProjectState, SessionRecord, TeamKind,
+};
 
 fn sample_state() -> ProjectState {
     let t0 = Utc.with_ymd_and_hms(2026, 5, 4, 10, 23, 0).unwrap();
     ProjectState {
         slug: "bookmark-mgr-a3f9".into(),
         team: "dev".into(),
+        team_kind: TeamKind::Workflow,
         created_at: t0,
         tmux_session: "ccteam-bookmark-mgr-a3f9".into(),
         claude_session_id: Some("abc123-def-456".into()),
@@ -46,6 +50,8 @@ fn sample_state() -> ProjectState {
         last_user_interaction_at: t0,
         user_attached: false,
         user_pause_pending: false,
+        sessions: BTreeMap::new(),
+        next_sid_seq: BTreeMap::new(),
     }
 }
 
@@ -159,4 +165,77 @@ fn load_rejects_unknown_enum_value() {
         msg.contains("parallelism") || msg.contains("variant"),
         "expected enum-rejection error, got: {msg}"
     );
+}
+
+#[test]
+fn legacy_state_without_f49_fields_loads_as_workflow_with_empty_sessions() {
+    let dir = TempDir::new().unwrap();
+    let (main, _, _) = paths(&dir);
+    let body = r#"{
+        "slug": "legacy",
+        "team": "dev",
+        "created_at": "2026-05-01T00:00:00Z",
+        "tmux_session": "ccteam-legacy",
+        "claude_session_id": null,
+        "claude_pid": null,
+        "phase_state": "idle",
+        "current_phase": "",
+        "parallelism": "solo",
+        "phase_history": [],
+        "auto_loop_cycle_count": 0,
+        "cost_used_usd": 0.0,
+        "soft_warn_threshold_usd": 20.0,
+        "hard_kill_threshold_usd": 200.0,
+        "context_tokens_used": 0,
+        "context_reset_threshold_tokens": 600000,
+        "context_reset_count": 0,
+        "last_progress_event_at": null,
+        "last_event_type": null,
+        "last_user_interaction_at": "2026-05-01T00:00:00Z",
+        "user_attached": false,
+        "user_pause_pending": false
+    }"#;
+    std::fs::write(&main, body).unwrap();
+
+    let loaded = ProjectState::load(&main).unwrap();
+    assert_eq!(loaded.team_kind, TeamKind::Workflow);
+    assert!(loaded.sessions.is_empty());
+    assert!(loaded.next_sid_seq.is_empty());
+
+    loaded.save(&main).unwrap();
+    let saved = std::fs::read_to_string(&main).unwrap();
+    assert!(!saved.contains("sessions"));
+    assert!(!saved.contains("next_sid_seq"));
+    assert!(!saved.contains("team_kind"));
+}
+
+#[test]
+fn flex_sessions_round_trip_and_sid_allocator_does_not_reuse_removed_sid() {
+    let dir = TempDir::new().unwrap();
+    let (main, _, _) = paths(&dir);
+    let t0 = Utc.with_ymd_and_hms(2026, 5, 10, 12, 0, 0).unwrap();
+    let mut state = sample_state();
+    state.team_kind = TeamKind::Flex;
+    let first = state.allocate_sid(HarnessKind::Claude);
+    assert_eq!(first, "claude-1");
+    state.sessions.insert(
+        first.clone(),
+        SessionRecord {
+            harness: HarnessKind::Claude,
+            tmux_session: "ccteam-bookmark-mgr-a3f9-claude-1".into(),
+            started_at: t0,
+            pid: Some(42),
+        },
+    );
+    state.sessions.remove(&first);
+    let second = state.allocate_sid(HarnessKind::Claude);
+    assert_eq!(second, "claude-2");
+
+    state.save(&main).unwrap();
+    let body = std::fs::read_to_string(&main).unwrap();
+    assert!(body.contains("\"team_kind\": \"flex\""));
+    assert!(body.contains("\"next_sid_seq\""));
+    let loaded = ProjectState::load(&main).unwrap();
+    assert_eq!(loaded.team_kind, TeamKind::Flex);
+    assert_eq!(loaded.next_sid_seq.get(&HarnessKind::Claude), Some(&3));
 }

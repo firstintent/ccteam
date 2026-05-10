@@ -43,7 +43,8 @@
 # 跨项目记忆走官方 ~/.claude/CLAUDE.md + ~/.claude/rules/ + per-repo auto-memory(M4),
 # 不在 ~/.ccteam/ 下;详见 tech-design §3.7。
 ├── progress/
-│   └── <slug>.jsonl       # 每项目一个事件流(hooks 写,inotify 监听;详见 §4)
+│   ├── <slug>.jsonl       # workflow / multi_workflow 项目事件流(详见 §4)
+│   └── <slug>/<sid>.jsonl # V0.3.1 F49 flex 项目每 session 独立事件流
 ├── harness/               # V0.3.1 F46:Claude Code statusline-command 双写镜像
 │   ├── <slug>-<sid>.json  #   每 (slug, sid) 最新 harness snapshot;读侧 = ccteam-web `/sse/harness/...`
 │   └── _meta-<handle>.json #  meta-agent 项目(单 session,sid 视作 "default")
@@ -97,6 +98,8 @@ yaml)。
 │   ├── state.json                # 项目级状态机(详见 §2.1)
 │   ├── escalation.md             # 触发用户介入时写这里
 │   ├── fix-loop.state.md         # fix-cycle 内部状态(ralph-loop 风格)
+│   ├── sessions/                 # V0.3.1 F49 flex-only adhoc session cwd
+│   │   └── <sid>/                # 例 claude-1;内含本 session inbox/outbox
 │   └── ready                     # SessionStart hook 写出的就绪标记
 ├── .claude/
 │   └── settings.json             # 详见 §6.1
@@ -125,6 +128,33 @@ yaml)。
 └── docs/
 ```
 
+### 1.4 Flex adhoc multi-session 布局(`kind: flex`)
+
+`kind: flex` 是 V0.3.1 的手动 session farm:不走 phase DAG,但保留 hooks /
+progress.jsonl / cost / silence classifier / web observability。它不同于
+§1.3 的 `parallelism: multi_session` fan-out/fan-in 项目形态。
+
+```
+~/projects/<team>-<slug>/
+├── .ccteam/
+│   ├── state.json                 # master state,含 team_kind/sessions/next_sid_seq
+│   └── sessions/
+│       ├── claude-1/
+│       │   ├── inbox/
+│       │   └── outbox/
+│       └── claude-2/
+└── .claude/settings.json
+
+~/.ccteam/progress/<slug>/
+├── claude-1.jsonl
+└── claude-2.jsonl
+```
+
+`ccteam session add <slug> --harness=claude` 分配单调递增 sid
+`<harness>-<n>`、创建 `<project>/.ccteam/sessions/<sid>/`、启动 tmux
+`ccteam-<slug>-<sid>` 并写入 `state.json::sessions`。`session rm` 是
+V0.3.1 唯一自动关闭 harness session 的路径,且必须由用户显式触发。
+
 ---
 
 ## 2. State 协议
@@ -135,6 +165,7 @@ yaml)。
 {
   "slug": "bookmark-mgr-a3f9",
   "team": "dev",
+  "team_kind": "workflow",
   "created_at": "2026-05-04T10:23:00Z",
   "tmux_session": "ccteam-bookmark-mgr-a3f9",
   "claude_session_id": "abc123-def-456",
@@ -158,7 +189,9 @@ yaml)。
   "last_event_type": "Stop",
   "last_user_interaction_at": "2026-05-04T10:23:00Z",
   "user_attached": false,
-  "user_pause_pending": false
+  "user_pause_pending": false,
+  "sessions": {},
+  "next_sid_seq": {}
 }
 ```
 
@@ -167,6 +200,16 @@ yaml)。
 **`parallelism` 枚举**:`solo` / `agent_team` / `multi_session`(详见 §5.1 phase schema)。
 
 **`team` 字段**(M3.1 F13):指定项目跑哪个团队的 phase 集合(默认 `dev`,M3.4 加 `research` 等)。serde 默认值 `"dev"`,所以 M3.1 之前写出的 state.json 自动以 dev 团队加载,无需迁移脚本。
+
+**`team_kind` 字段**(V0.3.1 F49):项目创建/首次 `session` 操作时从
+`team.yaml::kind` 缓存到 state,供 hooks 在不跑 team resolver 的情况下判断 flex
+路径。serde 默认 `workflow`,并在默认值时可省略。
+
+**`sessions` / `next_sid_seq` 字段**(V0.3.1 F49):flex 项目的 master session
+registry。`sessions` 是 `{ "<sid>": { "harness": "claude", "tmux_session":
+"ccteam-<slug>-<sid>", "started_at": "...", "pid": 12345|null } }`;
+`next_sid_seq` 是每 harness 的下一个编号,删除 session 不递减,确保 sid 不复用。
+workflow / multi_workflow 项目保持空对象或省略。
 
 **原子写入**:`.tmp` + `rename`;启动校验 schema,损坏走 backup。
 
@@ -367,12 +410,16 @@ interfaces §3.4.3"。具体写哪些事件:
 
 ## 4. Progress.jsonl 事件流
 
-每个项目一个 `~/.ccteam/progress/<slug>.jsonl`。**这是 orchestrator 唯一的状态事实来源**——tmux 终端输出只给人看,不解析。
+workflow / multi_workflow 项目使用一个 `~/.ccteam/progress/<slug>.jsonl`。
+flex 项目使用每 session 一个 `~/.ccteam/progress/<slug>/<sid>.jsonl`,读侧按
+`ts` 聚合。**这是 orchestrator 唯一的状态事实来源**——tmux 终端输出只给人看,
+不解析;`~/.ccteam/harness/*.json` 只服务展示。
 
 ### 4.1 事件类型(完整清单)
 
 ```jsonl
 {"ts":"2026-05-04T11:23:00Z","event":"session_start","tmux_session":"ccteam-bookmark-mgr-a3f9"}
+{"ts":"2026-05-10T09:00:00Z","event":"PreToolUse","sid":"claude-1","tool":"Edit","path":"src/lib.rs"}
 {"ts":"...","event":"phase_inject","phase":"implement","attachments":[".ccteam/code-review.md"]}
 {"ts":"...","event":"PreToolUse","tool":"Edit","path":"src/db.ts"}
 {"ts":"...","event":"PostToolUse","tool":"Bash","cmd":"pnpm test","exit_code":0,"duration_ms":4521}
@@ -423,7 +470,7 @@ interfaces §3.4.3"。具体写哪些事件:
 
 ### 4.3 消费方
 
-- **orchestrator**:`inotify` 监听末尾,做状态转移与 stall 检测
+- **orchestrator**:`inotify` 递归监听 progress 目录,做状态转移与 stall 检测
 - **用户 dashboard pane**:`tail -f progress/<slug>.jsonl | jq -c '.event + ":" + (.tool // .note // "")'`
 - **retro phase**(M4;改造现有 ship.md / verdict.md inline retro 段):作为项目历史输入,通过 Claude session `/memory` + `Edit ~/.claude/rules/ccteam-lessons-<team>.md` 写入
 
@@ -645,8 +692,13 @@ V0.1 → V0.2 升级:V0.1 用户的 `~/.claude/agents/<name>.md` ln -sf 由 `cct
   `{ sid: String, harness: HarnessKind }`,`HarnessKind = claude | codex`(serde
   `lowercase` rename)。**只对 `kind: flex` 团队有意义**;
   workflow / multi_workflow 团队 parse 不 fail 但忽略。F47 ship trait stub +
-  schema;F49 PR(V0.3.1 PR #4)落 `state.json::sessions[]` runtime + adhoc
-  `ccteam session add/ls/attach/rm` 命令。详 PRD §F47 + `docs/research/ccteam-codex-integration.md`。
+  schema。
+- **V0.3.1 F49** ✅ `ccteam session add/ls/attach/rm` 落地 flex runtime:
+  `state.json::sessions` registry、`next_sid_seq` 单调分配、
+  tmux `ccteam-<slug>-<sid>`、per-session cwd
+  `<project>/.ccteam/sessions/<sid>/`、per-session progress
+  `~/.ccteam/progress/<slug>/<sid>.jsonl`。`--harness=codex` 保持 V0.3.2
+  stub error。详 PRD §F49 + `docs/research/ccteam-codex-integration.md`。
 
 ```yaml
 # ~/.ccteam/teams/research/team.yaml — 完整字段示例(V0.2.2 起 canonical 名 `research`)

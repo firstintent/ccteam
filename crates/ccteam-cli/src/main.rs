@@ -246,13 +246,9 @@ enum Command {
         #[command(subcommand)]
         cmd: TeamCommand,
     },
-    /// V0.3.1 F47 — adhoc multi-session primitives for `kind: flex`
-    /// teams. F47 ships the **CLI parser stub only**: `add --harness
-    /// codex` exercises the [`HarnessAdapter`] stub-error path; every
-    /// other surface (`add --harness claude` / `ls` / `attach` / `rm`)
-    /// returns a "see F49" error pending the master state.json::sessions
-    /// wiring (F49, V0.3.1 PR #4). The schema lands now so users /
-    /// scripts can author against the final command shape.
+    /// V0.3.1 F49 — adhoc multi-session primitives for `kind: flex`
+    /// teams. `add --harness claude` creates a registered tmux session;
+    /// `add --harness codex` still returns the V0.3.2 stub error.
     Session {
         #[command(subcommand)]
         action: SessionAction,
@@ -351,41 +347,31 @@ enum TeamCommand {
     },
 }
 
-/// V0.3.1 F47 — `ccteam session` subcommand surface. F47 PR ships
-/// the parser shape + the `add --harness codex` stub-error verification
-/// path; F49 PR fills the real `add --harness claude` / `ls` / `attach`
-/// / `rm` impls with master state.json::sessions wiring.
+/// V0.3.1 F49 — `ccteam session` subcommand surface for flex teams.
 #[derive(Subcommand)]
 enum SessionAction {
-    /// Add a new harness session to an existing project. F47 stub:
-    /// `--harness codex` returns the `CodexAdapter::spawn_session`
-    /// `NotImplemented` error verbatim; `--harness claude` defers to
-    /// F49 (which wires `state.json::sessions[]`).
+    /// Add a new harness session to an existing flex project.
     Add {
         /// Project slug (must already exist under `~/projects/`).
         slug: String,
         /// Harness backing the new session. Defaults to `claude` to
-        /// match `HarnessKind::default()` once F49 wires it through.
+        /// match `HarnessKind::default()`.
         #[arg(long, value_enum, default_value_t = HarnessKindCli::Claude)]
         harness: HarnessKindCli,
     },
-    /// List sessions registered for a project. F47 stub returns a
-    /// "see F49" error; F49 reads `state.json::sessions[]`.
+    /// List sessions registered for a flex project.
     Ls {
         /// Project slug.
         slug: String,
     },
-    /// Attach to one specific session of a project. F47 stub returns
-    /// a "see F49" error; F49 wires `tmux attach -t ccteam-<slug>-<sid>`.
+    /// Attach to one specific session of a flex project.
     Attach {
         /// Project slug.
         slug: String,
         /// Session id (e.g. `claude-1`, `codex-2`).
         sid: String,
     },
-    /// Remove (graceful shutdown) one session of a project. F47 stub
-    /// returns a "see F49" error; F49 invokes
-    /// `HarnessAdapter::shutdown_session` + scrubs `state.json`.
+    /// Remove (graceful shutdown) one session of a flex project.
     Rm {
         /// Project slug.
         slug: String,
@@ -592,12 +578,8 @@ fn run_team(cmd: TeamCommand) -> Result<()> {
     }
 }
 
-/// V0.3.1 F47 — dispatch `ccteam session <action>` to the stub
-/// handlers in `commands::run_session_*`. The codex error path is
-/// the F47 verification target; every other variant returns a
-/// friendly "see F49 (V0.3.1 PR #4)" error so users authoring scripts
-/// against the final shape get immediate feedback that the runtime
-/// path is still pending.
+/// V0.3.1 F49 — dispatch `ccteam session <action>` to the flex
+/// multi-session handlers.
 fn run_session(action: SessionAction) -> Result<()> {
     match action {
         SessionAction::Add { slug, harness } => {

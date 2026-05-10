@@ -35,7 +35,7 @@ use ccteam_core::auto_loop::{self, AutoLoopDecision};
 use ccteam_core::tmux;
 use ccteam_core::{
     progress::{append_event, read_all_events},
-    slug_from_project_dir, CcteamPaths,
+    session_context_from_cwd, CcteamPaths,
 };
 
 use crate::transcript::{last_assistant_message, message_text};
@@ -70,8 +70,10 @@ pub fn parse_phase_end(paths: &CcteamPaths, stdin: &Value) -> Result<ParseDecisi
         .ok_or_else(|| anyhow!("hook stdin missing `transcript_path`"))?;
 
     let cwd_path = Path::new(cwd);
-    let slug = slug_from_project_dir(cwd_path)?;
-    let progress_path = paths.progress_jsonl(&slug);
+    let context = session_context_from_cwd(cwd_path, paths)?;
+    let slug = context.slug.clone();
+    let project_dir = context.project_dir.clone();
+    let progress_path = paths.progress_jsonl_for_context(&context);
 
     // Prefer Claude Code's stdin field — at Stop time, the transcript
     // file may not yet contain the latest assistant turn (the JSONL
@@ -92,7 +94,7 @@ pub fn parse_phase_end(paths: &CcteamPaths, stdin: &Value) -> Result<ParseDecisi
     };
 
     // Step 1: fix-loop drives if the state file is present.
-    let auto_loop_path = auto_loop::path_in(cwd_path);
+    let auto_loop_path = auto_loop::path_in(&project_dir);
     if let Some(state) = auto_loop::read(&auto_loop_path)? {
         match auto_loop::decide(&state, &last_text) {
             AutoLoopDecision::Reinject {
@@ -149,7 +151,7 @@ pub fn parse_phase_end(paths: &CcteamPaths, stdin: &Value) -> Result<ParseDecisi
             // open_decisions check (interfaces §4.1.1, dev-plan M3.6).
             if parsed.kind == EscalateKind::PhaseDonePending {
                 let open_decisions = extract_outbox_filenames(&parsed.reason);
-                let current_phase = current_phase_from_state(cwd_path)
+                let current_phase = current_phase_from_state(&project_dir)
                     .unwrap_or_default();
                 json!({
                     "ts": now_rfc3339(),
@@ -182,7 +184,7 @@ pub fn parse_phase_end(paths: &CcteamPaths, stdin: &Value) -> Result<ParseDecisi
     // legitimate user-decision pause and we let the orchestrator route
     // it. Otherwise the phase has silently halted — fail loud.
     let phase_started_at = phase_started_at(&progress_path)?;
-    let outbox_dir = cwd_path.join(".ccteam").join("outbox");
+    let outbox_dir = project_dir.join(".ccteam").join("outbox");
     let fresh_outbox = fresh_outbox_files(&outbox_dir, phase_started_at)?;
 
     if !fresh_outbox.is_empty() {
@@ -207,7 +209,7 @@ pub fn parse_phase_end(paths: &CcteamPaths, stdin: &Value) -> Result<ParseDecisi
         let pane_tail =
             tmux::capture_pane_tail_from_session(&tmux_session, 30, false);
         write_needs_attention_outbox(
-            cwd_path,
+            &project_dir,
             &slug,
             &last_text,
             pane_tail.as_deref(),

@@ -3,6 +3,7 @@
 //! `<project>/.ccteam/auto-loop.state.md` and returns a `ParseDecision`
 //! the CLI translates into the Stop-hook stdout JSON.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use chrono::Utc;
@@ -10,7 +11,7 @@ use serde_json::{json, Value};
 use tempfile::TempDir;
 
 use ccteam_core::auto_loop::{self, AutoLoopState};
-use ccteam_core::{CcteamPaths, Parallelism, PhaseState, ProjectState};
+use ccteam_core::{CcteamPaths, Parallelism, PhaseState, ProjectState, TeamKind};
 use ccteam_hooks::{parse_phase_end, ParseDecision};
 
 struct Fixture {
@@ -34,6 +35,7 @@ impl Fixture {
         ProjectState {
             slug: slug.into(),
             team: "dev".into(),
+            team_kind: TeamKind::Workflow,
             created_at: now,
             tmux_session: format!("ccteam-{slug}"),
             claude_session_id: None,
@@ -54,6 +56,8 @@ impl Fixture {
             last_user_interaction_at: now,
             user_attached: false,
             user_pause_pending: false,
+            sessions: BTreeMap::new(),
+            next_sid_seq: BTreeMap::new(),
         }
         .save(&paths.project_state(slug))
         .unwrap();

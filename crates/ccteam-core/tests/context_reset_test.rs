@@ -1,6 +1,7 @@
 //! Tests for M0.10 context reset.
 
 use std::path::Path;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -11,7 +12,7 @@ use ccteam_core::tmux::{tmux_available, TmuxSession};
 use ccteam_core::{
     append_progress_summary, build_progress_summary, write_global_phase_templates,
     CcteamPaths, Orchestrator, OrchestratorConfig, Parallelism, PhaseHistoryEntry,
-    PhaseState, ProjectState,
+    PhaseState, ProjectState, TeamKind,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -27,6 +28,7 @@ fn fresh_state(slug: &str, current_phase: &str) -> ProjectState {
     ProjectState {
         slug: slug.into(),
         team: "dev".into(),
+        team_kind: TeamKind::Workflow,
         created_at: now,
         tmux_session: TmuxSession::for_slug(slug).name().into(),
         claude_session_id: None,
@@ -60,6 +62,8 @@ fn fresh_state(slug: &str, current_phase: &str) -> ProjectState {
         last_user_interaction_at: now,
         user_attached: false,
         user_pause_pending: false,
+        sessions: BTreeMap::new(),
+        next_sid_seq: BTreeMap::new(),
     }
 }
 

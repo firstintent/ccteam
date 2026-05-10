@@ -376,7 +376,7 @@ impl Default for CostPolicy {
 /// rename is `lowercase` so `team.yaml` stays user-readable
 /// (`harness: claude` / `harness: codex`) without mentioning the
 /// internal `claude-code` adapter name.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HarnessKind {
     /// Anthropic's Claude Code TUI — V0.3.1 default + only fully

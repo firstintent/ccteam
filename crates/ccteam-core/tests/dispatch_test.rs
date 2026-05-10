@@ -5,13 +5,14 @@
 //! tmux is unavailable.
 
 use std::path::Path;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use ccteam_core::tmux::{tmux_available, TmuxSession};
 use ccteam_core::{
     progress, write_global_phase_templates, CcteamPaths, Orchestrator, OrchestratorConfig,
-    Parallelism, PhaseState, ProjectState,
+    Parallelism, PhaseState, ProjectState, TeamKind,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -64,6 +65,7 @@ fn fixture(test_name: &str) -> Option<(TempDir, CcteamPaths, String, ScopedSessi
     ProjectState {
         slug: slug.clone(),
         team: "dev".into(),
+        team_kind: TeamKind::Workflow,
         created_at: now,
         tmux_session: TmuxSession::for_slug(&slug).name().to_string(),
         claude_session_id: None,
@@ -84,6 +86,8 @@ fn fixture(test_name: &str) -> Option<(TempDir, CcteamPaths, String, ScopedSessi
         last_user_interaction_at: now,
         user_attached: false,
         user_pause_pending: false,
+        sessions: BTreeMap::new(),
+        next_sid_seq: BTreeMap::new(),
     }
     .save(&paths.project_state(&slug))
     .unwrap();

@@ -11,7 +11,7 @@ use std::path::Path;
 use anyhow::{anyhow, Result};
 use serde_json::Value;
 
-use ccteam_core::{slug_from_project_dir, CcteamPaths, ProjectState};
+use ccteam_core::{session_context_from_cwd, CcteamPaths, ProjectState};
 
 #[derive(Debug, Clone, Copy)]
 pub struct ModelRates {
@@ -109,8 +109,8 @@ pub fn cost_accumulate(paths: &CcteamPaths, stdin: &Value) -> Result<()> {
         .and_then(|s| s.as_str())
         .ok_or_else(|| anyhow!("hook stdin missing `transcript_path`"))?;
 
-    let slug = slug_from_project_dir(Path::new(cwd))?;
-    let state_path = paths.project_state(&slug);
+    let context = session_context_from_cwd(Path::new(cwd), paths)?;
+    let state_path = paths.project_state(&context.slug);
 
     let (total_cost, latest_tokens) = scan_transcript(Path::new(transcript_path))?;
 

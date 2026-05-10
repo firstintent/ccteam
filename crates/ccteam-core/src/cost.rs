@@ -36,13 +36,16 @@ pub fn classify(state: &ProjectState) -> CostLevel {
 mod tests {
     use super::*;
     use crate::state::{Parallelism, PhaseState};
+    use crate::team::TeamKind;
     use chrono::Utc;
+    use std::collections::BTreeMap;
 
     fn st(cost: f64) -> ProjectState {
         let now = Utc::now();
         ProjectState {
             slug: "demo".into(),
             team: "dev".into(),
+            team_kind: TeamKind::Workflow,
             created_at: now,
             tmux_session: "ccteam-demo".into(),
             claude_session_id: None,
@@ -63,6 +66,8 @@ mod tests {
             last_user_interaction_at: now,
             user_attached: false,
             user_pause_pending: false,
+            sessions: BTreeMap::new(),
+            next_sid_seq: BTreeMap::new(),
         }
     }
 

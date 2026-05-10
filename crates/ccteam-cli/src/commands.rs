@@ -204,7 +204,26 @@ pub fn run_new(
     }
     let slug = decide_slug(paths, request, team, opts)?;
     bootstrap_project(paths, &slug, request, team)?;
+    stamp_project_team_kind(paths, &slug, team)?;
     Ok(slug)
+}
+
+fn stamp_project_team_kind(paths: &CcteamPaths, slug: &str, team: &str) -> Result<()> {
+    let kind = resolve_team_kind(paths, team)?;
+    let state_path = paths.project_state(slug);
+    let mut state = ProjectState::load(&state_path)?;
+    state.team_kind = kind;
+    state.save(&state_path)
+}
+
+fn resolve_team_kind(paths: &CcteamPaths, team: &str) -> Result<ccteam_core::TeamKind> {
+    use ccteam_core::{default_user_staging_dir, resolve_team, TeamResolveContext};
+
+    let user_staging = default_user_staging_dir();
+    let ctx = TeamResolveContext::for_orchestrator(&paths.root, &user_staging);
+    let spec = resolve_team(team, &ctx)
+        .with_context(|| format!("resolve team `{team}` for team kind"))?;
+    Ok(spec.kind)
 }
 
 /// V0.2.2 F34 four-tier slug decision. Pure-ish (only LLM shell-out
@@ -561,6 +580,25 @@ pub fn run_peek(paths: &CcteamPaths, slug: &str) -> Result<String> {
 /// stdout in a polling loop until Ctrl-C.
 pub fn run_progress(paths: &CcteamPaths, slug: &str, tail: bool) -> Result<()> {
     use std::io::Write;
+    let state = ProjectState::load(&paths.project_state(slug)).ok();
+    if state
+        .as_ref()
+        .is_some_and(|s| s.team_kind == ccteam_core::TeamKind::Flex)
+    {
+        if tail {
+            bail!(
+                "ccteam progress --tail is not supported for flex project `{slug}`; \
+                 use `ccteam session ls {slug}` or the web session view",
+            );
+        }
+        let events = collect_recent_events(paths, slug, usize::MAX)?;
+        let mut stdout = std::io::stdout().lock();
+        for event in events {
+            writeln!(stdout, "{}", serde_json::to_string(&event)?)?;
+        }
+        return Ok(());
+    }
+
     let path = paths.progress_jsonl(slug);
     if !path.exists() {
         bail!("no progress.jsonl yet for {slug}: {}", path.display());
@@ -617,32 +655,18 @@ pub fn run_resume(paths: &CcteamPaths, slug: &str) -> Result<()> {
 }
 
 // =====================================================================
-// V0.3.1 F47 — `ccteam session` stub handlers
+// V0.3.1 F49 — `ccteam session` handlers for flex teams
 // =====================================================================
-//
-// F47 PR ships the CLI parser shape only; the master state.json::sessions
-// runtime path is F49 (V0.3.1 PR #4). Two of the four handlers
-// (`add --harness codex` + the trivial codex-side spawn surface) actually
-// exercise the [`CodexAdapter`] stub error path so the F47 verification
-// is end-to-end; the rest return a friendly "see F49" error so anyone
-// scripting against the final command shape today gets immediate
-// feedback.
 
-/// V0.3.1 F47 — `ccteam session add <slug> --harness <kind>` stub.
-///
-/// - `--harness codex` → calls [`ccteam_core::CodexAdapter::spawn_session`],
-///   captures the [`ccteam_core::HarnessError::NotImplemented`] variant,
-///   and re-emits it as an `anyhow::Error`. This is the F47 verification
-///   target — exercising the stub error path proves the trait wiring
-///   end-to-end before V0.3.2 fills it in.
-/// - `--harness claude` → returns a "see F49 (V0.3.1 PR #4)" error
-///   without touching `ClaudeCodeAdapter::spawn_session`. F46 already
-///   shipped the trait impl, but the master `state.json::sessions[]`
-///   schema (where the new session must register) is the F49 deliverable
-///   — calling spawn_session standalone here would create an orphan
-///   tmux session the orchestrator can't see.
+/// Add a registered harness session to a flex project. Claude sessions
+/// spawn under `ccteam-<slug>-<sid>` and record in the master
+/// `state.json::sessions` map. Codex intentionally keeps F47's
+/// `NotImplemented` path until the V0.3.2 adapter lands.
 pub fn run_session_add(slug: &str, harness: ccteam_core::HarnessKind) -> Result<()> {
-    use ccteam_core::{CodexAdapter, HarnessAdapter, HarnessError, HarnessKind, SpawnOpts};
+    use ccteam_core::{
+        harness_sid_prefix, ClaudeCodeAdapter, CodexAdapter, HarnessAdapter, HarnessError,
+        HarnessKind, SessionRecord, SpawnOpts, TeamKind,
+    };
 
     match harness {
         HarnessKind::Codex => {
@@ -685,46 +709,197 @@ pub fn run_session_add(slug: &str, harness: ccteam_core::HarnessKind) -> Result<
             }
         }
         HarnessKind::Claude => {
-            // F49 PR #4 wires the master state.json::sessions[] schema
-            // and the per-sid tmux name allocator (`next_sid_seq`).
-            // Standalone `ClaudeCodeAdapter::spawn_session` would
-            // succeed but leave an orphan session — bail loudly here.
-            bail!(
-                "ccteam session add --harness=claude: implemented by F49 \
-                 (V0.3.1 PR #4); F47 (V0.3.1 PR #2) ships the CLI parser \
-                 stub only. See docs/v0-3-1/dev-plan.md §3 + §6 for the \
-                 sequencing rationale.",
-            )
+            let paths = CcteamPaths::from_env()?;
+            let state_path = paths.project_state(slug);
+            let mut state = load_project_state(&paths, slug)?;
+            refresh_state_team_kind(&paths, &mut state)?;
+            if state.team_kind != TeamKind::Flex {
+                bail_session_requires_flex(&state)?;
+            }
+
+            let sid = state.allocate_sid(harness);
+            let session_dir = paths.project_session_dir(slug, &sid);
+            std::fs::create_dir_all(session_dir.join("inbox"))
+                .with_context(|| format!("create {}", session_dir.join("inbox").display()))?;
+            std::fs::create_dir_all(session_dir.join("outbox"))
+                .with_context(|| format!("create {}", session_dir.join("outbox").display()))?;
+
+            let adapter = ClaudeCodeAdapter::new();
+            let handle = adapter
+                .spawn_session(SpawnOpts {
+                    harness: adapter.name(),
+                    slug: slug.to_string(),
+                    sid: sid.clone(),
+                    cwd: session_dir.clone(),
+                    extra_args: Vec::new(),
+                })
+                .map_err(|err| anyhow::anyhow!("{err}"))?;
+
+            let was_empty = state.sessions.is_empty();
+            if was_empty {
+                state.tmux_session = handle.tmux_session.clone();
+                state.claude_pid = handle.pid.and_then(|pid| i32::try_from(pid).ok());
+            }
+            state.sessions.insert(
+                sid.clone(),
+                SessionRecord {
+                    harness,
+                    tmux_session: handle.tmux_session.clone(),
+                    started_at: handle.started_at,
+                    pid: handle.pid,
+                },
+            );
+            state.save(&state_path)?;
+            println!(
+                "added session {sid} ({}) for {slug}\n  tmux: {}\n  cwd: {}",
+                harness_sid_prefix(harness),
+                handle.tmux_session,
+                session_dir.display(),
+            );
+            Ok(())
         }
     }
 }
 
-/// V0.3.1 F47 stub — F49 reads `state.json::sessions[]` and prints one
-/// row per registered session. Until then, hard-fail with a pointer.
-pub fn run_session_ls(_slug: &str) -> Result<()> {
-    bail!(
-        "ccteam session ls: implemented by F49 (V0.3.1 PR #4); \
-         F47 ships the CLI parser stub only. See docs/v0-3-1/dev-plan.md §6.",
-    )
+/// Print one row per registered flex session.
+pub fn run_session_ls(slug: &str) -> Result<()> {
+    let paths = CcteamPaths::from_env()?;
+    let mut state = load_project_state(&paths, slug)?;
+    refresh_state_team_kind(&paths, &mut state)?;
+    if state.team_kind != ccteam_core::TeamKind::Flex {
+        bail_session_requires_flex(&state)?;
+    }
+
+    println!("sid\tharness\ttmux\tstarted_at\tpid\tlast_event");
+    for (sid, record) in &state.sessions {
+        let last = session_last_event(&paths, slug, sid)?;
+        let pid = record
+            .pid
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "-".into());
+        println!(
+            "{sid}\t{}\t{}\t{}\t{}\t{}",
+            ccteam_core::harness_sid_prefix(record.harness),
+            record.tmux_session,
+            record.started_at.to_rfc3339(),
+            pid,
+            last.unwrap_or_else(|| "-".into()),
+        );
+    }
+    Ok(())
 }
 
-/// V0.3.1 F47 stub — F49 invokes `tmux attach -t ccteam-<slug>-<sid>`
-/// after validating the sid against `state.json::sessions[]`.
-pub fn run_session_attach(_slug: &str, _sid: &str) -> Result<()> {
-    bail!(
-        "ccteam session attach: implemented by F49 (V0.3.1 PR #4); \
-         F47 ships the CLI parser stub only. See docs/v0-3-1/dev-plan.md §6.",
-    )
+/// Attach to one registered flex session.
+pub fn run_session_attach(slug: &str, sid: &str) -> Result<()> {
+    let paths = CcteamPaths::from_env()?;
+    let mut state = load_project_state(&paths, slug)?;
+    refresh_state_team_kind(&paths, &mut state)?;
+    if state.team_kind != ccteam_core::TeamKind::Flex {
+        bail_session_requires_flex(&state)?;
+    }
+    let record = state.sessions.get(sid).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown session `{sid}` for `{slug}`; available: {}",
+            available_sids(&state)
+        )
+    })?;
+    let session = TmuxSession::from_name(record.tmux_session.clone());
+    if !session.exists() {
+        bail!("tmux session not running: {}", session.name());
+    }
+    let status = Command::new("tmux")
+        .args(["attach", "-t", session.name()])
+        .status()
+        .context("spawn tmux attach")?;
+    if !status.success() {
+        bail!("tmux attach exited with {status}");
+    }
+    Ok(())
 }
 
-/// V0.3.1 F47 stub — F49 invokes `HarnessAdapter::shutdown_session`
-/// for the right harness kind, then scrubs the entry from
+/// Gracefully shut down one registered flex session and scrub it from
 /// `state.json::sessions[]`.
-pub fn run_session_rm(_slug: &str, _sid: &str) -> Result<()> {
+pub fn run_session_rm(slug: &str, sid: &str) -> Result<()> {
+    use ccteam_core::{ClaudeCodeAdapter, CodexAdapter, HarnessAdapter, SessionHandle};
+
+    let paths = CcteamPaths::from_env()?;
+    let state_path = paths.project_state(slug);
+    let mut state = load_project_state(&paths, slug)?;
+    refresh_state_team_kind(&paths, &mut state)?;
+    if state.team_kind != ccteam_core::TeamKind::Flex {
+        bail_session_requires_flex(&state)?;
+    }
+    let record = state.sessions.get(sid).cloned().ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown session `{sid}` for `{slug}`; available: {}",
+            available_sids(&state)
+        )
+    })?;
+    let handle = SessionHandle {
+        tmux_session: record.tmux_session.clone(),
+        harness: ccteam_core::harness_sid_prefix(record.harness).into(),
+        sid: sid.to_string(),
+        pid: record.pid,
+        started_at: record.started_at,
+    };
+    match record.harness {
+        ccteam_core::HarnessKind::Claude => ClaudeCodeAdapter::new()
+            .shutdown_session(&handle)
+            .map_err(|err| anyhow::anyhow!("{err}"))?,
+        ccteam_core::HarnessKind::Codex => CodexAdapter::new()
+            .shutdown_session(&handle)
+            .map_err(|err| anyhow::anyhow!("{err}"))?,
+    }
+    state.sessions.remove(sid);
+    state.save(&state_path)?;
+    println!("removed session {sid} from {slug}");
+    Ok(())
+}
+
+fn load_project_state(paths: &CcteamPaths, slug: &str) -> Result<ProjectState> {
+    let state_path = paths.project_state(slug);
+    if !state_path.exists() {
+        bail!("project not found: {slug}");
+    }
+    ProjectState::load(&state_path)
+}
+
+fn refresh_state_team_kind(paths: &CcteamPaths, state: &mut ProjectState) -> Result<()> {
+    if let Ok(kind) = resolve_team_kind(paths, &state.team) {
+        state.team_kind = kind;
+    }
+    Ok(())
+}
+
+fn bail_session_requires_flex(state: &ProjectState) -> Result<()> {
     bail!(
-        "ccteam session rm: implemented by F49 (V0.3.1 PR #4); \
-         F47 ships the CLI parser stub only. See docs/v0-3-1/dev-plan.md §6.",
+        "session subcommands only work on flex teams; project `{}` is team `{}` (kind={:?})",
+        state.slug,
+        state.team,
+        state.team_kind,
     )
+}
+
+fn available_sids(state: &ProjectState) -> String {
+    if state.sessions.is_empty() {
+        "(none)".into()
+    } else {
+        state.sessions.keys().cloned().collect::<Vec<_>>().join(", ")
+    }
+}
+
+fn session_last_event(paths: &CcteamPaths, slug: &str, sid: &str) -> Result<Option<String>> {
+    let path = paths.progress_jsonl_for_session(slug, sid);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let body = std::fs::read_to_string(&path)
+        .with_context(|| format!("read {}", path.display()))?;
+    Ok(body
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str::<Value>(line).ok())
+        .and_then(|v| v.get("event").and_then(|e| e.as_str()).map(str::to_string)))
 }
 
 /// One row in the cross-project decisions queue (`ccteam decisions`).

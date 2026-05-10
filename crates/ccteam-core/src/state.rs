@@ -13,12 +13,15 @@
 //!   unknown values; unknown top-level fields are tolerated for
 //!   forward-compat when a future ccteam adds optional metadata.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+use crate::team::{HarnessKind, TeamKind};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -66,6 +69,16 @@ pub struct PhaseHistoryEntry {
     pub cost_usd: f64,
 }
 
+/// V0.3.1 F49 — one registered harness session in a flex project's
+/// master `state.json::sessions` map.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionRecord {
+    pub harness: HarnessKind,
+    pub tmux_session: String,
+    pub started_at: DateTime<Utc>,
+    pub pid: Option<u32>,
+}
+
 /// Project-level state, persisted as `~/projects/<slug>/.ccteam/state.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectState {
@@ -76,6 +89,10 @@ pub struct ProjectState {
     /// dev team, no migration script needed.
     #[serde(default = "default_team")]
     pub team: String,
+    /// V0.3.1 F49 — cached team kind for hooks and lightweight readers.
+    /// Old state files omit it and deserialize as workflow.
+    #[serde(default, skip_serializing_if = "is_default_team_kind")]
+    pub team_kind: TeamKind,
     pub created_at: DateTime<Utc>,
     pub tmux_session: String,
     pub claude_session_id: Option<String>,
@@ -99,10 +116,23 @@ pub struct ProjectState {
     pub last_user_interaction_at: DateTime<Utc>,
     pub user_attached: bool,
     pub user_pause_pending: bool,
+    /// V0.3.1 F49 — flex-only session registry. Empty for workflow /
+    /// multi_workflow projects and skipped on serialize for old-shape
+    /// compatibility.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sessions: BTreeMap<String, SessionRecord>,
+    /// Next sid sequence per harness. Values are monotonic and not
+    /// decremented on `session rm`, so removed sids are never reused.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub next_sid_seq: BTreeMap<HarnessKind, u64>,
 }
 
 fn default_team() -> String {
     "dev".into()
+}
+
+fn is_default_team_kind(kind: &TeamKind) -> bool {
+    *kind == TeamKind::Workflow
 }
 
 impl ProjectState {
@@ -122,6 +152,7 @@ impl ProjectState {
             tmux_session: format!("ccteam-{slug}"),
             slug,
             team,
+            team_kind: TeamKind::Workflow,
             created_at: now,
             claude_session_id: None,
             claude_pid: None,
@@ -141,7 +172,36 @@ impl ProjectState {
             last_user_interaction_at: now,
             user_attached: false,
             user_pause_pending: false,
+            sessions: BTreeMap::new(),
+            next_sid_seq: BTreeMap::new(),
         }
+    }
+
+    pub fn allocate_sid(&mut self, harness: HarnessKind) -> String {
+        let next = self
+            .next_sid_seq
+            .get(&harness)
+            .copied()
+            .unwrap_or(1)
+            .max(self.max_sid_number(harness).saturating_add(1))
+            .max(1);
+        self.next_sid_seq.insert(harness, next.saturating_add(1));
+        format!("{}-{next}", harness_sid_prefix(harness))
+    }
+
+    pub fn reserve_sid(&mut self, harness: HarnessKind, sid: &str) {
+        if let Some(n) = sid_number_for_harness(sid, harness) {
+            let entry = self.next_sid_seq.entry(harness).or_insert(1);
+            *entry = (*entry).max(n.saturating_add(1));
+        }
+    }
+
+    fn max_sid_number(&self, harness: HarnessKind) -> u64 {
+        self.sessions
+            .keys()
+            .filter_map(|sid| sid_number_for_harness(sid, harness))
+            .max()
+            .unwrap_or(0)
     }
 
     /// Atomically persist to `path`. Rotates any existing file to `<path>.bak`
@@ -197,6 +257,19 @@ impl ProjectState {
             }
         }
     }
+}
+
+pub fn harness_sid_prefix(harness: HarnessKind) -> &'static str {
+    match harness {
+        HarnessKind::Claude => "claude",
+        HarnessKind::Codex => "codex",
+    }
+}
+
+fn sid_number_for_harness(sid: &str, harness: HarnessKind) -> Option<u64> {
+    sid.strip_prefix(harness_sid_prefix(harness))
+        .and_then(|rest| rest.strip_prefix('-'))
+        .and_then(|n| n.parse::<u64>().ok())
 }
 
 fn read_and_parse(path: &Path) -> Result<ProjectState> {

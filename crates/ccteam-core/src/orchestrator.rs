@@ -1468,7 +1468,7 @@ impl Orchestrator {
             },
         )?;
         watcher
-            .watch(&progress_dir, RecursiveMode::NonRecursive)
+            .watch(&progress_dir, RecursiveMode::Recursive)
             .with_context(|| format!("watch {}", progress_dir.display()))?;
 
         let mut tick = tokio::time::interval(self.config.tick_interval);

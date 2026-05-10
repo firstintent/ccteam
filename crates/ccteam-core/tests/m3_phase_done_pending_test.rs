@@ -12,12 +12,13 @@
 
 use chrono::Utc;
 use serde_json::json;
+use std::collections::BTreeMap;
 use tempfile::TempDir;
 
 use ccteam_core::{
     decide_tick_from_events, intersect_open_decisions_with_required_inputs, progress,
     write_all_global_team_templates, CcteamPaths, Orchestrator, OrchestratorConfig,
-    Parallelism, PhaseState, ProjectState, TickAction,
+    Parallelism, PhaseState, ProjectState, TeamKind, TickAction,
 };
 
 fn fresh_paths(tmp: &TempDir) -> CcteamPaths {
@@ -32,6 +33,7 @@ fn fresh_state_for_team(team: &str, slug: &str, current_phase: &str) -> ProjectS
     ProjectState {
         slug: slug.into(),
         team: team.into(),
+        team_kind: TeamKind::Workflow,
         created_at: now,
         tmux_session: format!("ccteam-{slug}"),
         claude_session_id: None,
@@ -52,6 +54,8 @@ fn fresh_state_for_team(team: &str, slug: &str, current_phase: &str) -> ProjectS
         last_user_interaction_at: now,
         user_attached: false,
         user_pause_pending: false,
+        sessions: BTreeMap::new(),
+        next_sid_seq: BTreeMap::new(),
     }
 }
 

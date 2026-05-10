@@ -19,6 +19,7 @@
 //! `crates/ccteam-core/src/silence_classifier.rs::tests` (21 cases).
 
 use std::path::Path;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -26,7 +27,7 @@ use ccteam_core::tmux::{tmux_available, TmuxSession};
 use ccteam_core::{
     limbo_retry_path_in, load_limbo_retry_count, progress,
     write_global_phase_templates, CcteamPaths, Orchestrator, OrchestratorConfig, Parallelism,
-    PhaseState, ProjectState,
+    PhaseState, ProjectState, TeamKind,
 };
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -86,6 +87,7 @@ fn fixture(
     ProjectState {
         slug: slug.clone(),
         team: "dev".into(),
+        team_kind: TeamKind::Workflow,
         created_at: stale,
         tmux_session: TmuxSession::for_slug(&slug).name().to_string(),
         claude_session_id: None,
@@ -106,6 +108,8 @@ fn fixture(
         last_user_interaction_at: stale,
         user_attached: false,
         user_pause_pending: false,
+        sessions: BTreeMap::new(),
+        next_sid_seq: BTreeMap::new(),
     }
     .save(&paths.project_state(&slug))
     .unwrap();
