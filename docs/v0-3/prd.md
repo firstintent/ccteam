@@ -554,23 +554,21 @@ token 生成路径:
   hex 编码 → 写文件 `mode 0600` → stdout echo:
   ```
   ccteam web listening on http://0.0.0.0:7331
-  Auth token (write actions): ccteam:<token>
+  Auth token: ccteam:<token>
   Reset with: rm ~/.ccteam/web-token && restart
   ```
 - 已存在 → 校验 mode 0600(否则 warn)+ 加载
 
-middleware 行为:
+middleware 行为(**整体权限,不区分读写** — 用户 2026-05-10 决策,不留 `--read-public` 后门):
 
 - enabled = false → pass through
-- enabled = true 且 path matches `^/api/` → check `Authorization: Bearer ccteam:<token>`,
-  constant-time 对比(`subtle::ConstantTimeEq`);不匹配 → 401 plain-text "auth required"
-- 其他路径(GET dashboard / SSE / screenshot)— V0.3 默认 **也 require token**
-  (token cookie + bearer 二选一);用户嫌烦走 `--no-auth`(loopback 开发态)
-  或 V0.4 加 `--read-public` flag(`docs/v0-3/` deferred)
-
-注:本 PRD 第一版**所有 endpoint** 都受 token 保护(包括 read);M5.3 实施时
-比较成本与 UX 后,允许 PR 内细调(eg 只 gate `/api/`,read 端 cookie-based)。
-最终方案 `interfaces.md` 落档时定。
+- enabled = true → **所有路径**(GET dashboard / SSE / screenshot / POST `/api/...`)
+  统一 check `Authorization: Bearer ccteam:<token>`,constant-time 对比
+  (`subtle::ConstantTimeEq`);不匹配 → 401 plain-text "auth required"
+- 浏览器 GET 通过 token cookie 注入:首次访问带 query string `?token=ccteam:<...>`,
+  middleware set HttpOnly cookie + 302 redirect 去掉 query;后续 GET / SSE 走 cookie。
+  POST `/api/...` 仍要 `Authorization: Bearer` header(同时也是 CSRF 防御 — §6.2.5)
+- 用户嫌烦走 `--no-auth`(loopback 开发态默认无 auth,非 loopback 显式 opt-out + stderr warn)
 
 #### 6.2.5 CSRF 防御
 
