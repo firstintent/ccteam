@@ -355,27 +355,21 @@ impl Default for CostPolicy {
 /// rename is `lowercase` so `team.yaml` stays user-readable
 /// (`harness: claude` / `harness: codex`) without mentioning the
 /// internal `claude-code` adapter name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HarnessKind {
     /// Anthropic's Claude Code TUI — V0.3.1 default + only fully
     /// supported harness. Backed by [`crate::harness::ClaudeCodeAdapter`].
+    /// `#[default]` because Claude Code is the only real harness in
+    /// V0.3.1; F48 PR adds the `kind: flex` team layer that consumes
+    /// this default; F49 fills the master state.json::sessions wiring.
+    #[default]
     Claude,
     /// OpenAI's `codex` CLI. V0.3.1 ships the trait stub
     /// ([`crate::harness::CodexAdapter`]); real spawn / ingest /
     /// shutdown lands in V0.3.2 (PRD §F47, see also
     /// `docs/research/ccteam-codex-integration.md`).
     Codex,
-}
-
-impl Default for HarnessKind {
-    fn default() -> Self {
-        // Claude Code is the V0.3.1 fully-supported harness; team.yaml
-        // entries that omit `harness:` resolve here. F48 PR adds the
-        // `kind: flex` team layer that consumes this default; F49 fills
-        // the master state.json::sessions wiring.
-        Self::Claude
-    }
 }
 
 /// V0.3.1 F47 — one entry in `team.yaml::sessions[]`. Declares a

@@ -246,6 +246,17 @@ enum Command {
         #[command(subcommand)]
         cmd: TeamCommand,
     },
+    /// V0.3.1 F47 — adhoc multi-session primitives for `kind: flex`
+    /// teams. F47 ships the **CLI parser stub only**: `add --harness
+    /// codex` exercises the [`HarnessAdapter`] stub-error path; every
+    /// other surface (`add --harness claude` / `ls` / `attach` / `rm`)
+    /// returns a "see F49" error pending the master state.json::sessions
+    /// wiring (F49, V0.3.1 PR #4). The schema lands now so users /
+    /// scripts can author against the final command shape.
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
+    },
     /// V0.3 M5.0: serve the ccteam web UI (read + restricted-write,
     /// `docs/v0-3/prd.md` §3-§6). M5.0 ships the scaffold + `/health`
     /// endpoint only; dashboard / SSE / write actions land in M5.1-3.
@@ -335,6 +346,60 @@ enum TeamCommand {
         #[arg(long)]
         repo: Option<String>,
     },
+}
+
+/// V0.3.1 F47 — `ccteam session` subcommand surface. F47 PR ships
+/// the parser shape + the `add --harness codex` stub-error verification
+/// path; F49 PR fills the real `add --harness claude` / `ls` / `attach`
+/// / `rm` impls with master state.json::sessions wiring.
+#[derive(Subcommand)]
+enum SessionAction {
+    /// Add a new harness session to an existing project. F47 stub:
+    /// `--harness codex` returns the `CodexAdapter::spawn_session`
+    /// `NotImplemented` error verbatim; `--harness claude` defers to
+    /// F49 (which wires `state.json::sessions[]`).
+    Add {
+        /// Project slug (must already exist under `~/projects/`).
+        slug: String,
+        /// Harness backing the new session. Defaults to `claude` to
+        /// match `HarnessKind::default()` once F49 wires it through.
+        #[arg(long, value_enum, default_value_t = HarnessKindCli::Claude)]
+        harness: HarnessKindCli,
+    },
+    /// List sessions registered for a project. F47 stub returns a
+    /// "see F49" error; F49 reads `state.json::sessions[]`.
+    Ls {
+        /// Project slug.
+        slug: String,
+    },
+    /// Attach to one specific session of a project. F47 stub returns
+    /// a "see F49" error; F49 wires `tmux attach -t ccteam-<slug>-<sid>`.
+    Attach {
+        /// Project slug.
+        slug: String,
+        /// Session id (e.g. `claude-1`, `codex-2`).
+        sid: String,
+    },
+    /// Remove (graceful shutdown) one session of a project. F47 stub
+    /// returns a "see F49" error; F49 invokes
+    /// `HarnessAdapter::shutdown_session` + scrubs `state.json`.
+    Rm {
+        /// Project slug.
+        slug: String,
+        /// Session id to remove.
+        sid: String,
+    },
+}
+
+/// V0.3.1 F47 — CLI surface mirror of [`ccteam_core::HarnessKind`].
+/// Lives in the CLI crate so `clap::ValueEnum` derivation doesn't
+/// pollute the core schema enum (which deserves to round-trip yaml /
+/// json without clap dependencies). Convert via `match` at dispatch
+/// time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum HarnessKindCli {
+    Claude,
+    Codex,
 }
 
 #[derive(Subcommand)]
@@ -460,6 +525,7 @@ fn main() -> Result<()> {
         Command::Phase { cmd } => run_phase(cmd),
         Command::Watchdog { cmd } => run_watchdog(cmd),
         Command::Team { cmd } => run_team(cmd),
+        Command::Session { action } => run_session(action),
         Command::Web {
             bind,
             no_auth,
@@ -518,6 +584,27 @@ fn run_team(cmd: TeamCommand) -> Result<()> {
             print!("{body}");
             Ok(())
         }
+    }
+}
+
+/// V0.3.1 F47 — dispatch `ccteam session <action>` to the stub
+/// handlers in `commands::run_session_*`. The codex error path is
+/// the F47 verification target; every other variant returns a
+/// friendly "see F49 (V0.3.1 PR #4)" error so users authoring scripts
+/// against the final shape get immediate feedback that the runtime
+/// path is still pending.
+fn run_session(action: SessionAction) -> Result<()> {
+    match action {
+        SessionAction::Add { slug, harness } => {
+            let kind = match harness {
+                HarnessKindCli::Claude => ccteam_core::HarnessKind::Claude,
+                HarnessKindCli::Codex => ccteam_core::HarnessKind::Codex,
+            };
+            commands::run_session_add(&slug, kind)
+        }
+        SessionAction::Ls { slug } => commands::run_session_ls(&slug),
+        SessionAction::Attach { slug, sid } => commands::run_session_attach(&slug, &sid),
+        SessionAction::Rm { slug, sid } => commands::run_session_rm(&slug, &sid),
     }
 }
 

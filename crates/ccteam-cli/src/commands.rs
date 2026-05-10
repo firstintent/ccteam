@@ -616,6 +616,117 @@ pub fn run_resume(paths: &CcteamPaths, slug: &str) -> Result<()> {
     ccteam_core::actions::resume(paths, slug)
 }
 
+// =====================================================================
+// V0.3.1 F47 — `ccteam session` stub handlers
+// =====================================================================
+//
+// F47 PR ships the CLI parser shape only; the master state.json::sessions
+// runtime path is F49 (V0.3.1 PR #4). Two of the four handlers
+// (`add --harness codex` + the trivial codex-side spawn surface) actually
+// exercise the [`CodexAdapter`] stub error path so the F47 verification
+// is end-to-end; the rest return a friendly "see F49" error so anyone
+// scripting against the final command shape today gets immediate
+// feedback.
+
+/// V0.3.1 F47 — `ccteam session add <slug> --harness <kind>` stub.
+///
+/// - `--harness codex` → calls [`ccteam_core::CodexAdapter::spawn_session`],
+///   captures the [`ccteam_core::HarnessError::NotImplemented`] variant,
+///   and re-emits it as an `anyhow::Error`. This is the F47 verification
+///   target — exercising the stub error path proves the trait wiring
+///   end-to-end before V0.3.2 fills it in.
+/// - `--harness claude` → returns a "see F49 (V0.3.1 PR #4)" error
+///   without touching `ClaudeCodeAdapter::spawn_session`. F46 already
+///   shipped the trait impl, but the master `state.json::sessions[]`
+///   schema (where the new session must register) is the F49 deliverable
+///   — calling spawn_session standalone here would create an orphan
+///   tmux session the orchestrator can't see.
+pub fn run_session_add(slug: &str, harness: ccteam_core::HarnessKind) -> Result<()> {
+    use ccteam_core::{CodexAdapter, HarnessAdapter, HarnessError, HarnessKind, SpawnOpts};
+
+    match harness {
+        HarnessKind::Codex => {
+            // Construct minimal SpawnOpts — every value is a placeholder
+            // because the stub returns `NotImplemented` before reading
+            // any of them. We still pass a realistic shape (cwd =
+            // `~/projects/<slug>`) so V0.3.2's real impl can swap in
+            // here without changing the caller.
+            let cwd = ccteam_core::CcteamPaths::from_env()
+                .map(|p| p.project_dir(slug))
+                .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
+            let opts = SpawnOpts {
+                harness: "codex",
+                slug: slug.to_string(),
+                sid: "codex-1".to_string(),
+                cwd,
+                extra_args: Vec::new(),
+            };
+            match CodexAdapter::new().spawn_session(opts) {
+                Ok(_handle) => bail!(
+                    "internal error: V0.3.1 CodexAdapter::spawn_session returned Ok — \
+                     the stub must return NotImplemented (PRD §F47); \
+                     please file a bug",
+                ),
+                Err(HarnessError::NotImplemented { harness, reason }) => {
+                    bail!(
+                        "ccteam session add --harness=codex: harness `{harness}` is \
+                         deferred to V0.3.2 — {reason}",
+                    );
+                }
+                Err(other) => {
+                    // Any other error variant means the stub regressed
+                    // (e.g. someone added a real spawn path that fails
+                    // before reaching NotImplemented). Surface verbatim.
+                    bail!(
+                        "ccteam session add --harness=codex: unexpected error from \
+                         CodexAdapter (V0.3.1 must always return NotImplemented): {other}",
+                    );
+                }
+            }
+        }
+        HarnessKind::Claude => {
+            // F49 PR #4 wires the master state.json::sessions[] schema
+            // and the per-sid tmux name allocator (`next_sid_seq`).
+            // Standalone `ClaudeCodeAdapter::spawn_session` would
+            // succeed but leave an orphan session — bail loudly here.
+            bail!(
+                "ccteam session add --harness=claude: implemented by F49 \
+                 (V0.3.1 PR #4); F47 (V0.3.1 PR #2) ships the CLI parser \
+                 stub only. See docs/v0-3-1/dev-plan.md §3 + §6 for the \
+                 sequencing rationale.",
+            )
+        }
+    }
+}
+
+/// V0.3.1 F47 stub — F49 reads `state.json::sessions[]` and prints one
+/// row per registered session. Until then, hard-fail with a pointer.
+pub fn run_session_ls(_slug: &str) -> Result<()> {
+    bail!(
+        "ccteam session ls: implemented by F49 (V0.3.1 PR #4); \
+         F47 ships the CLI parser stub only. See docs/v0-3-1/dev-plan.md §6.",
+    )
+}
+
+/// V0.3.1 F47 stub — F49 invokes `tmux attach -t ccteam-<slug>-<sid>`
+/// after validating the sid against `state.json::sessions[]`.
+pub fn run_session_attach(_slug: &str, _sid: &str) -> Result<()> {
+    bail!(
+        "ccteam session attach: implemented by F49 (V0.3.1 PR #4); \
+         F47 ships the CLI parser stub only. See docs/v0-3-1/dev-plan.md §6.",
+    )
+}
+
+/// V0.3.1 F47 stub — F49 invokes `HarnessAdapter::shutdown_session`
+/// for the right harness kind, then scrubs the entry from
+/// `state.json::sessions[]`.
+pub fn run_session_rm(_slug: &str, _sid: &str) -> Result<()> {
+    bail!(
+        "ccteam session rm: implemented by F49 (V0.3.1 PR #4); \
+         F47 ships the CLI parser stub only. See docs/v0-3-1/dev-plan.md §6.",
+    )
+}
+
 /// One row in the cross-project decisions queue (`ccteam decisions`).
 ///
 /// A "decision" = an outbox file in any project's `.ccteam/outbox/` whose
@@ -996,7 +1107,42 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
     if opts.install_statusline_adapter {
         out.push_str(&install_statusline_adapter(paths)?);
     }
+    // V0.3.1 F47 — informational codex CLI detection. Appends one line
+    // to every successful doctor run (any_mode == true) so operators
+    // see whether the codex binary is on PATH ahead of V0.3.2's real
+    // CodexAdapter impl. **Never fails the doctor exit code** —
+    // `which codex` returning non-zero is the expected state today.
+    out.push_str(&render_codex_detection_line());
     Ok(out)
+}
+
+/// V0.3.1 F47 — pure informational `which codex` detection. Returns
+/// a single line ending with `\n`. The lookup uses `Command::new("which")`
+/// and tolerates every failure mode (missing `which`, IO error, codex
+/// binary absent) by emitting the "not found" line.
+fn render_codex_detection_line() -> String {
+    let output = Command::new("which").arg("codex").output();
+    match output {
+        Ok(out) if out.status.success() => {
+            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if path.is_empty() {
+                // `which` returned 0 but no path — defensive: treat as
+                // not-found rather than printing a misleading empty path.
+                fallback_not_found_line()
+            } else {
+                format!("[ccteam] codex CLI: present @ {path}\n")
+            }
+        }
+        // `which` non-zero exit (codex not on PATH) or spawn error
+        // (no `which` binary) — both surface as informational not-found.
+        _ => fallback_not_found_line(),
+    }
+}
+
+fn fallback_not_found_line() -> String {
+    String::from(
+        "[ccteam] codex CLI: not found (V0.3.1 trait-stub only; install codex CLI for V0.3.2+ — see docs/research/ccteam-codex-integration.md)\n",
+    )
 }
 
 /// V0.2 M0.18.5: load + validate one team's `team.yaml` and every
@@ -2842,6 +2988,47 @@ mod tests {
         );
 
         std::env::remove_var("CLAUDE_CONFIG_HOME");
+    }
+
+    #[test]
+    fn run_doctor_appends_codex_detection_line_when_any_mode_runs() {
+        // V0.3.1 F47 — every successful doctor run (any_mode == true)
+        // appends one informational `[ccteam] codex CLI: ...` line at
+        // the end. Pure informational — never fails the report. The
+        // exact path / not-found suffix depends on the host so we
+        // only pin the prefix.
+        ensure_isolation();
+        let _guard = env_lock().lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        std::env::set_var("CLAUDE_CONFIG_HOME", tmp.path().to_str().unwrap());
+
+        let opts = DoctorOptions {
+            install_skill: true,
+            ..DoctorOptions::default()
+        };
+        let report = run_doctor(&paths, opts).unwrap();
+        assert!(
+            report.contains("[ccteam] codex CLI:"),
+            "doctor report must include codex CLI detection line; got:\n{report}",
+        );
+        std::env::remove_var("CLAUDE_CONFIG_HOME");
+    }
+
+    #[test]
+    fn run_doctor_no_flags_help_text_does_not_print_codex_line() {
+        // The help-text early-return path is a usage error, not a
+        // health check — codex detection is gated on `any_mode == true`
+        // (see `run_doctor` source). Pin that contract so a future
+        // refactor doesn't accidentally surface the line in the help
+        // text and confuse first-time users.
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let body = run_doctor(&paths, DoctorOptions::default()).unwrap();
+        assert!(
+            !body.contains("[ccteam] codex CLI:"),
+            "help-text path must NOT include codex detection; got:\n{body}",
+        );
     }
 
     #[test]
