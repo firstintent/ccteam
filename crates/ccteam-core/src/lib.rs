@@ -51,7 +51,7 @@ pub use inbox::{
 };
 pub use meta_agent::{
     bootstrap_meta_project, meta_session_name, meta_slug, render_meta_role_prompt,
-    resolve_meta_slug, MetaBootstrapReport, META_SESSION_PREFIX, META_TEAM_NAME,
+    MetaBootstrapReport, META_SESSION_PREFIX, META_TEAM_NAME,
 };
 pub use memory_bridge::{
     install_into as install_memory_bridge_into, install_memory_bridge,

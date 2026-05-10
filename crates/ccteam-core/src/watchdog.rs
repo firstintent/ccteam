@@ -38,7 +38,7 @@ use crate::inbox::{
     outbox_filename, OutboxEventKind, OutboxFrontMatter, OutboxMessage, OutboxPriority,
     LATEST_SCHEMA_VERSION,
 };
-use crate::meta_agent::resolve_meta_slug;
+use crate::meta_agent::meta_slug;
 use crate::paths::CcteamPaths;
 use crate::state::ProjectState;
 
@@ -456,7 +456,7 @@ pub fn push_alert_to_meta_outbox(
     user_handle: &str,
     alert: &WatchdogAlert,
 ) -> Result<PathBuf> {
-    let slug = resolve_meta_slug(paths, user_handle)?;
+    let slug = meta_slug(user_handle)?;
     let outbox_dir = paths
         .project_ccteam_dir(&slug)
         .join("outbox");

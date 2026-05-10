@@ -1140,9 +1140,9 @@ mod tests {
         // prompt overwrites the file via a different path), so the
         // generic body is the right fallback. This guards against
         // accidentally writing "" as the body.
-        let body = render_project_claude_md("rob-meta", "meta-agent");
+        let body = render_project_claude_md("meta-rob", "meta-agent");
         assert!(!body.is_empty());
-        assert!(body.contains("- slug: rob-meta"));
+        assert!(body.contains("- slug: meta-rob"));
         assert!(body.contains("- team: meta-agent"));
     }
 
