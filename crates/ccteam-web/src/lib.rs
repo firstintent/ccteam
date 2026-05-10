@@ -3,12 +3,15 @@
 //! Single entry: [`serve`]. Wired up by `ccteam-cli` via
 //! `commands::run_web` so the binary stays a thin protocol adapter.
 //!
-//! Ship state (per `docs/v0-3/prd.md` §3 / §4):
+//! Ship state (per `docs/v0-3/prd.md` §3 / §4 / §5):
 //!
 //! - **M5.0** — `GET /health` + bind / shutdown plumbing.
-//! - **M5.1 (this PR)** — `GET /` dashboard, `GET /project/<slug>`
-//!   detail page, `GET /assets/{file}` vendored static assets.
-//! - M5.2 — SSE + on-demand screenshot.
+//! - **M5.1** — `GET /` dashboard, `GET /project/<slug>` detail
+//!   page, `GET /assets/{file}` vendored static assets.
+//! - **M5.2 (this PR)** — `GET /sse/all` + `GET /sse/project/<slug>`
+//!   live progress event streams (single `notify` watcher fans out
+//!   into a `tokio::sync::broadcast` capacity 1024) + `GET
+//!   /screenshot/<slug>.png` on-demand pane render via F38.
 //! - M5.3 — write actions + token auth.
 //!
 //! [`ServeOpts`] is stable from M5.0 forward — M5.3 consumes
@@ -27,8 +30,10 @@ pub mod routes;
 pub mod state;
 pub mod status;
 pub mod views;
+pub mod watcher;
 
 pub use state::AppState;
+pub use watcher::{EventBus, ProgressUpdate};
 
 /// Knobs accepted by [`serve`]. Mirrors the `ccteam web` CLI flags
 /// 1:1 so the CLI translation in `ccteam-cli::commands::run_web`

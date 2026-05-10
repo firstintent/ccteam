@@ -1747,18 +1747,20 @@ pub fn peek_pane(slug: &str, lines: Option<usize>) -> Result<PaneCapture, CoreEr
 
 > V0.3 M5.1 起 `ccteam web --bind <addr>` 暴露本地 / 局域网 web UI。
 > 路由分两组:**stateless**(健康探针)+ **stateful**(消费 `CcteamPaths`
-> 的 dashboard / 项目详情 / 静态资源)。本节列 M5.1 ship 的全部路由;M5.2
-> 加 `/sse/all` + `/sse/project/<slug>` + `/screenshot/<slug>.png`,
-> M5.3 加 `POST /api/<slug>/{btw,inject_decision,pause,resume}`。
+> 的 dashboard / 项目详情 / 静态资源 / SSE / 截图)。本节列 M5.1+M5.2
+> ship 的全部路由;M5.3 加 `POST /api/<slug>/{btw,inject_decision,pause,resume}`。
 
-### 15.1 路由表(M5.1)
+### 15.1 路由表(M5.1+M5.2)
 
 | Method | Path | 状态码 | Content-Type | 说明 |
 |---|---|---|---|---|
 | `GET` | `/health` | 200 | `application/json` | M5.0 liveness:`{"status":"ok","version":"<crate>"}` |
 | `GET` | `/` | 200 | `text/html; charset=utf-8` | 项目列表 dashboard;空时 fallback 文案 `No projects` |
-| `GET` | `/project/{slug}` | 200 / 404 | `text/html; charset=utf-8` / `text/plain` | 项目详情(state JSON / recent events / outbox);未知 slug → 404 + plain text `project not found: <slug>` |
-| `GET` | `/assets/{file}` | 200 / 404 | `application/javascript; charset=utf-8`(htmx)/ `text/css; charset=utf-8`(style)/ `text/plain`(404) | vendored 静态资源;`Cache-Control: public, max-age=31536000, immutable`;白名单 = `htmx.min.js` / `style.css`,其他 file → 404 |
+| `GET` | `/project/{slug}` | 200 / 404 | `text/html; charset=utf-8` / `text/plain` | 项目详情(state JSON / recent events / outbox / pane snapshot);未知 slug → 404 + plain text `project not found: <slug>` |
+| `GET` | `/assets/{file}` | 200 / 404 | `application/javascript; charset=utf-8`(htmx / htmx-ext-sse)/ `text/css; charset=utf-8`(style)/ `text/plain`(404) | vendored 静态资源;`Cache-Control: public, max-age=31536000, immutable`;白名单 = `htmx.min.js` / `htmx-ext-sse.js` / `style.css`,其他 file → 404 |
+| `GET` | `/sse/all` | 200 | `text/event-stream` | M5.2 全局 SSE 流:每条 progress.jsonl 写入推一帧 |
+| `GET` | `/sse/project/{slug}` | 200 | `text/event-stream` | M5.2 per-slug SSE 流:server-side 过滤,只发该 slug 事件 |
+| `GET` | `/screenshot/{slug}.png` | 200 / 404 / 504 | `image/png`(200)/ `text/plain`(404 / 504) | M5.2 按需 PNG 截图;F38 unavailable / tmux 无 session → 504 + 文本 reason;非 `<slug>.png` 路径 → 404 |
 
 ### 15.2 dashboard 行(`/` 表格)
 
@@ -1793,17 +1795,23 @@ CLAUDE.md §三 read-only 红线)。
    `reply` / `escalation` / `shipped` / `clarify`)+ `created_at` RFC3339 +
    `filename` + body 头 200 char。front-matter 解析失败渲染
    `(unparseable)` 占位,不 5xx。
-5. **Pane snapshot**:M5.1 静态占位 `<div class="placeholder">`,M5.2
-   填 on-demand `/screenshot/<slug>.png`。
+5. **Pane snapshot**(M5.2):页面加载即拉一次 `/screenshot/<slug>.png`,
+   下方 button 触发 cache-busting `?t=<ms>` 重新 fetch;F38 ~200-500 ms
+   render,**不 polling**(PRD §5.2.5)。
+6. **Live events**(M5.2):页面内嵌 `EventSource('/sse/project/<slug>')`
+   订阅 SSE 流,新 `progress` 事件 prepend 到 `#events-tbody`,client-side
+   滑动窗口截到 200 行;`reconnect_hint` 帧出现 → 1s 后 `location.reload()`。
 
 ### 15.4 静态资源协议
 
 - `htmx.min.js` ← `crates/ccteam-web/assets/htmx.min.js`(htmx 2.0.4
   upstream snapshot,BSD-2-Clause;详 `LICENSES.md`)
-- `style.css` ← `crates/ccteam-web/assets/style.css`(本仓自写 ~3 KB,
-  monospace + dark-mode-friendly)
+- `htmx-ext-sse.js` ← `crates/ccteam-web/assets/htmx-ext-sse.js`(htmx 2.x
+  SSE extension upstream snapshot,BSD-2-Clause;V0.3 M5.2 起 vendored)
+- `style.css` ← `crates/ccteam-web/assets/style.css`(本仓自写 ~4 KB,
+  monospace + dark-mode-friendly,M5.2 加 live-dot + screenshot-panel)
 
-二者均通过 `include_bytes!` 编译期打包进 `ccteam` binary;`ccteam web` 自包含
+三者均通过 `include_bytes!` 编译期打包进 `ccteam` binary;`ccteam web` 自包含
 启动,无 npm / Vite / build toolchain 依赖,模仿 V0.2.2 F38 vendored TTF
 模式。`Cache-Control: public, max-age=31536000, immutable` — 同一 binary
 版本下 bytes 永不变,新版 binary 释放后自然 ID 变更触发 cache miss。
@@ -1815,12 +1823,62 @@ CLAUDE.md §三 read-only 红线)。
   `ccteam-cli::commands` promote 到 `ccteam-core::queries` —
   `dev-coupling-audit.md` F45 / `prd.md` §4),**不解析 tmux 输出**(F38
   截图通过 `ccteam_core::render_screenshot` 在 M5.2 加,内部已 vt100 化,
-  不算字符串解析)。
+  不算字符串解析)。M5.2 SSE watcher 同样只读 progress.jsonl,**不接 tmux**。
 - **`ccteam-web` MUST NOT depend on `ccteam-cli`**:`cargo tree -p
   ccteam-web | grep ccteam-cli` 必须 0 命中(`tests/dep_graph_test.rs`
-  锁红线)。dashboard / project / assets handler 全部依赖
-  `ccteam-core::{queries, ProjectState, SessionMailbox, ...}` 的 public
-  surface。
-- **永远不主动 kill**:M5.1 是只读;M5.2 / M5.3 加 SSE / 写动作时仍守此
-  红线,web 层不发 SIGINT / Ctrl-C / `tmux kill-session`,只走
-  `actions::*`(M5.0 promote)走 inbox + state.json 控制平面。
+  锁红线)。dashboard / project / assets / sse / screenshot handler 全部
+  依赖 `ccteam-core::{queries, ProjectState, SessionMailbox,
+  render_screenshot, ...}` 的 public surface。
+- **永远不主动 kill**:M5.1 / M5.2 是只读;M5.3 加写动作时仍守此红线,
+  web 层不发 SIGINT / Ctrl-C / `tmux kill-session`,只走 `actions::*`
+  (M5.0 promote)走 inbox + state.json 控制平面。
+- **截图不 polling**(M5.2):`/screenshot/<slug>.png` 仅在用户 click /
+  页面加载时同步调一次,`Cache-Control: no-cache, must-revalidate`;F38
+  渲染 ~200-500 ms,polling 烧 CPU 且 PNG 大不必要。
+
+### 15.6 SSE wire format(M5.2)
+
+两个 SSE endpoint(`/sse/all` + `/sse/project/<slug>`)wire 格式完全一致:
+
+```
+event: progress
+data: {"slug":"dev-foo","ts":"2026-05-10T12:34:56Z","event":"PostToolUse","tool":"Read",...}
+
+event: progress
+data: {"slug":"dev-foo","ts":"2026-05-10T12:34:57Z","event":"phase_done","phase":"plan-eng",...}
+
+: keepalive
+
+event: reconnect_hint
+data: {"type":"reconnect_hint","reason":"Lagged(1024)"}
+
+```
+
+字段约定:
+
+- `event:` 名固定 `progress`(future-proof — 新 event 类型加新 `event:` 名)。
+- `data:` 是**单行 JSON**(SSE 协议要求),内容 = 原 progress.jsonl 行
+  + server 注入的 `slug` 字段(client-side 路由依赖此字段;若原行恰巧
+  也含 `slug`,server 端覆盖之,以 watcher 解析的 filename 为准)。
+- `: keepalive` 注释行 15s 周期发出(axum `Sse::keep_alive` 默认),
+  防 nginx / 反向代理默认 60s 空闲超时。
+- `event: reconnect_hint` 出现 = 此 SSE 订阅者落后超过 broadcast 容量
+  (1024 帧),server 主动断流;client 收到 → 关闭 EventSource,1s 后
+  reload(htmx-ext-sse / vanilla EventSource 都 auto-reconnect)。
+
+**watcher 拓扑**:`crates/ccteam-web/src/watcher.rs` 起一条专用 OS 线程,
+单个 `notify::RecommendedWatcher` recursive 监 `~/.ccteam/progress/`;
+每检测到 `<slug>.jsonl` 的 Modify / Create 事件 → 维护 per-file 字节
+watermark(`HashMap<PathBuf, u64>`,Mutex 保护)→ 读 appended bytes →
+按行 parse + JSON 校验 → 推 `tokio::sync::broadcast::Sender<ProgressUpdate>`
+(capacity = `1024` 字面量,PRD §5.2.2 + dev-plan §8 grep red line)。
+两个 SSE handler 都 `bus.subscribe()` 同一 broadcast。
+
+**watermark 启动语义**:server 启动时,扫 `~/.ccteam/progress/` 全部
+现存 `<slug>.jsonl`,记录当前文件大小作为 watermark 起点 — **不重放
+历史**(连接进来的客户端只看到 connect-time 之后的事件,M5.4 retro 可
+评估加历史回放选项,V0.3 不做)。新创建的文件(Create 事件)从 offset 0
+开始读 — 创建本身已经发生在 server 启动后,这些字节是「实时」的。
+
+**file rotation**:文件 size 缩小(truncate / rename)→ watermark 重置
+为 0,replay 全部内容,记 `tracing::warn!`(罕见,主要为防御 corner case)。

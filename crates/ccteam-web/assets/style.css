@@ -198,3 +198,58 @@ code {
     padding: 1rem;
     text-align: center;
 }
+
+/* V0.3 M5.2 — live SSE indicator next to section headings. Pure
+   presentation: pulses gently to show the page is "alive". */
+.live-dot {
+    display: inline-block;
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: 50%;
+    background: var(--green);
+    box-shadow: 0 0 6px var(--green);
+    margin-left: 0.5rem;
+    vertical-align: middle;
+    animation: ccteam-pulse 2s ease-in-out infinite;
+}
+
+@keyframes ccteam-pulse {
+    0%, 100% { opacity: 1; }
+    50%      { opacity: 0.35; }
+}
+
+/* V0.3 M5.2 — on-demand pane snapshot panel. Image is constrained
+   to the main column; refresh button + caption sit above. */
+.screenshot-panel {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.75rem;
+    margin-top: 0.5rem;
+}
+
+.screenshot-panel img {
+    display: block;
+    max-width: 100%;
+    height: auto;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: #000;
+}
+
+.screenshot-panel button {
+    background: var(--bg);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.25rem 0.75rem;
+    font-family: inherit;
+    font-size: 0.85rem;
+    cursor: pointer;
+    margin-right: 0.5rem;
+}
+
+.screenshot-panel button:hover {
+    background: var(--bg-hover);
+    border-color: var(--accent);
+}

@@ -36,3 +36,15 @@ not produce) must use a Reserved Font Name distinct from the original.
 - **Version vendored**: 2.0.4
 - **License**: [BSD 2-Clause "Simplified" License](https://github.com/bigskysoftware/htmx/blob/master/LICENSE)
 - **Copyright**: Copyright (c) 2020, Big Sky Software
+
+### htmx-ext-sse
+
+- **Vendored at**: `crates/ccteam-web/assets/htmx-ext-sse.js`
+- **Used by**: V0.3 M5.2 — Server-Sent Events extension for htmx.
+  Loaded by `GET /assets/htmx-ext-sse.js` after the htmx core lib so
+  the SSE extension can register its handlers. Powers the live event
+  feed on the dashboard / project detail pages.
+- **Upstream**: <https://github.com/bigskysoftware/htmx-extensions/tree/main/src/sse>
+- **Version vendored**: 2.2.2
+- **License**: [BSD 2-Clause "Simplified" License](https://github.com/bigskysoftware/htmx-extensions/blob/main/LICENSE)
+- **Copyright**: Copyright (c) 2020, Big Sky Software

@@ -14,10 +14,15 @@
     <h2>State</h2>
     <pre>{{ state_json_pretty }}</pre>
 
-    <h2>Recent events ({{ events.len() }})</h2>
-    {% if events.is_empty() %}
-        <p class="empty">No events on <code>progress.jsonl</code> yet.</p>
-    {% else %}
+    <h2>Recent events ({{ events.len() }}) <span class="live-dot" title="streaming via SSE"></span></h2>
+    {# V0.3 M5.2 — New `progress` events from `/sse/project/<slug>`
+       are prepended to `#events-tbody` by the small inline script
+       at the bottom of this template. The initial 200 rows are
+       server-rendered into the tbody; SSE adds events that arrive
+       after the page loads, capped at 200 rows total via a sliding
+       window. We use vanilla `EventSource` (not htmx-ext-sse swap)
+       because we need PREPEND with a row cap, and htmx swap is
+       full-replace by design. #}
     <table>
         <thead>
             <tr>
@@ -26,7 +31,10 @@
                 <th>Detail</th>
             </tr>
         </thead>
-        <tbody>
+        <tbody id="events-tbody">
+            {% if events.is_empty() %}
+            <tr id="events-empty"><td colspan="3" class="muted">No events on <code>progress.jsonl</code> yet — waiting for the first SSE message.</td></tr>
+            {% else %}
             {% for e in events %}
             <tr>
                 <td class="muted">{{ e.ts }}</td>
@@ -34,9 +42,9 @@
                 <td class="muted">{{ e.detail }}</td>
             </tr>
             {% endfor %}
+            {% endif %}
         </tbody>
     </table>
-    {% endif %}
 
     <h2>Outbox ({{ outbox.len() }})</h2>
     {% if outbox.is_empty() %}
@@ -57,6 +65,72 @@
     {% endif %}
 
     <h2>Pane snapshot</h2>
-    <!-- M5.2 will fill this with on-demand `/screenshot/<slug>.png`. -->
-    <div class="placeholder">Screenshot panel — populated in M5.2 (SSE + on-demand PNG render).</div>
+    {# V0.3 M5.2 — on-demand `/screenshot/<slug>.png` render. The
+       `<img>` triggers F38 on initial page load (~200-500ms render);
+       the refresh button replaces the `src` with a cache-busting
+       query string so the browser re-fetches without hitting the
+       BFCache. Renders never auto-poll (PRD §5.2.5). #}
+    <div class="screenshot-panel">
+        <p class="muted">
+            <button type="button" onclick="ccteamRefreshScreenshot('{{ slug }}')">Refresh snapshot</button>
+            <span class="muted">render is on-demand only — F38 (vt100 + imageproc) is ~200-500ms per capture.</span>
+        </p>
+        <img id="pane-screenshot" src="/screenshot/{{ slug }}.png" alt="tmux pane screenshot (unavailable if session not running)" />
+    </div>
+    <script>
+        // Cache-bust the `<img src>` so a manual refresh triggers
+        // a brand-new F38 render (Cache-Control on the endpoint is
+        // already `no-cache, must-revalidate` but Chrome's BFCache
+        // reuses bytes on plain `src` reassignment without a query
+        // string change).
+        function ccteamRefreshScreenshot(slug) {
+            var img = document.getElementById('pane-screenshot');
+            if (!img) return;
+            img.src = '/screenshot/' + encodeURIComponent(slug) + '.png?t=' + Date.now();
+        }
+    </script>
+
+    {# Small inline shim that grafts SSE `progress` events onto the
+       events table and trims the visible row count to 200. We avoid
+       htmx's built-in `sse-swap` because we want PREPEND semantics
+       (newest at top) and a sliding-window cap; htmx's swap = full
+       replace, which would lose the server-rendered baseline. #}
+    <script>
+        (function () {
+            var SSE_TARGET = '/sse/project/{{ slug }}';
+            var MAX_ROWS = 200;
+            var es = new EventSource(SSE_TARGET);
+            es.addEventListener('progress', function (ev) {
+                var data;
+                try { data = JSON.parse(ev.data); } catch (e) { return; }
+                var tbody = document.getElementById('events-tbody');
+                if (!tbody) return;
+                var empty = document.getElementById('events-empty');
+                if (empty) empty.remove();
+                var tr = document.createElement('tr');
+                tr.innerHTML = '<td class="muted"></td><td></td><td class="muted"></td>';
+                var tds = tr.querySelectorAll('td');
+                tds[0].textContent = data.ts || '';
+                tds[1].textContent = data.event || '(unknown)';
+                tds[2].textContent = ccteamShortDetail(data);
+                tbody.insertBefore(tr, tbody.firstChild);
+                while (tbody.children.length > MAX_ROWS) {
+                    tbody.removeChild(tbody.lastChild);
+                }
+            });
+            es.addEventListener('reconnect_hint', function () {
+                // Server told us we lagged. EventSource auto-reconnects
+                // on close, so just close & let the browser retry.
+                es.close();
+                setTimeout(function () { location.reload(); }, 1000);
+            });
+            function ccteamShortDetail(d) {
+                if (d.tool) return 'tool=' + d.tool;
+                if (d.phase) return 'phase=' + d.phase;
+                if (d.kind) return 'kind=' + d.kind;
+                if (d.count !== undefined) return 'count=' + d.count;
+                return '';
+            }
+        })();
+    </script>
 {% endblock %}

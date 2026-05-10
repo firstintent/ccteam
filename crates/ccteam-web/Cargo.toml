@@ -16,6 +16,15 @@ tokio.workspace = true
 notify.workspace = true
 tracing.workspace = true
 
+# V0.3 M5.2 — SSE event push.
+# `futures` provides Stream / StreamExt combinators (`flat_map`,
+# `filter_map`) used by the SSE handlers to bridge the broadcast
+# Receiver into an axum SSE response.
+# `tokio-stream` exposes `BroadcastStream`, the canonical adapter
+# from `tokio::sync::broadcast::Receiver` to `futures::Stream`.
+futures = "0.3"
+tokio-stream = { version = "0.1", features = ["sync"] }
+
 # V0.3 M5.0 — pinned per docs/v0-3/prd.md §3.2.2.
 axum = { workspace = true }
 askama = { workspace = true }
@@ -26,4 +35,10 @@ subtle = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
-reqwest = { workspace = true, features = ["json"] }
+reqwest = { workspace = true, features = ["json", "stream"] }
+# V0.3 M5.2 — SSE integration tests need to read the streaming body
+# line by line. `tokio-util` exposes `StreamReader` (bytes stream →
+# AsyncRead); `futures-util` provides the `StreamExt::map` adapter
+# we use to bridge `reqwest::Error` → `std::io::Error`.
+tokio-util = { version = "0.7", features = ["io"] }
+futures-util = "0.3"
