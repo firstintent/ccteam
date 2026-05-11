@@ -160,6 +160,26 @@ Caused by:
 如果设置了 `CLAUDE_CONFIG_HOME`,publish 目标在
 `$CLAUDE_CONFIG_HOME/plugins/marketplaces/ccteam-local/plugins/$TEAM`。
 
+注意这里有两套目录:
+
+- `${XDG_CONFIG_HOME:-$HOME/.config}/ccteam/teams/$TEAM` 是 team factory 的
+  staging 目录,`ccteam new --team "$TEAM"` 会从这里读取用户自定义 team。
+- `${CLAUDE_CONFIG_HOME:-$HOME/.claude}/plugins/marketplaces/ccteam-local/plugins/$TEAM`
+  是 Claude Code plugin marketplace 链接,给 Claude Code 发现 plugin 用。
+
+如果你的二进制还报 `unknown team manual-flex`,说明它还没包含本手册对应的
+V0.3.1 修复。先 `git pull && cargo build --workspace`,再继续。临时绕过也可以
+把 staging team 链到 ccteam registry:
+
+```bash
+TEAM_STAGING="${XDG_CONFIG_HOME:-$HOME/.config}/ccteam/teams/$TEAM"
+TEAM_REGISTRY="$CCTEAM_HOME/teams/$TEAM"
+mkdir -p "$CCTEAM_HOME/teams"
+if [ ! -e "$TEAM_REGISTRY" ]; then
+  ln -s "$TEAM_STAGING" "$TEAM_REGISTRY"
+fi
+```
+
 ---
 
 ## 2. 创建 flex project

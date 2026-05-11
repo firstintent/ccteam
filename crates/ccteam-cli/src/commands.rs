@@ -3,6 +3,7 @@
 //! formatted string instead of printing) so unit tests don't need a
 //! real terminal or running orchestrator.
 
+use std::path::Path;
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
@@ -436,6 +437,15 @@ fn which_claude() -> Option<String> {
 /// 4. Otherwise fail with a help message listing the teams currently
 ///    on disk.
 fn ensure_team_resolvable(paths: &CcteamPaths, team: &str) -> Result<()> {
+    let user_staging = ccteam_core::default_user_staging_dir();
+    ensure_team_resolvable_with_user_staging(paths, team, &user_staging)
+}
+
+fn ensure_team_resolvable_with_user_staging(
+    paths: &CcteamPaths,
+    team: &str,
+    user_staging_dir: &Path,
+) -> Result<()> {
     if team == "dev" || team == ccteam_core::META_TEAM_NAME {
         return Ok(());
     }
@@ -446,7 +456,15 @@ fn ensure_team_resolvable(paths: &CcteamPaths, team: &str) -> Result<()> {
         })?;
         return Ok(());
     }
-    if find_alias_canonical(paths, team).is_some() {
+    let staging_yaml_path = user_staging_dir.join("teams").join(team).join("team.yaml");
+    if staging_yaml_path.exists() {
+        TeamSpec::load(&staging_yaml_path).with_context(|| {
+            format!("ccteam new: failed to load {}", staging_yaml_path.display())
+        })?;
+        return Ok(());
+    }
+    let ctx = ccteam_core::TeamResolveContext::for_orchestrator(&paths.root, user_staging_dir);
+    if ccteam_core::resolve_team(team, &ctx).is_ok() {
         return Ok(());
     }
     let known = list_disk_teams(paths)

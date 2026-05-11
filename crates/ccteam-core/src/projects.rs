@@ -16,6 +16,8 @@ use crate::templates::{
     write_project_settings, EnabledPluginsSetting,
 };
 use crate::phases::PhaseTemplate;
+use crate::team::TeamSpec;
+use crate::team_resolver::TeamResolveContext;
 use crate::tool_surface::user_claude_dir;
 
 /// Slugify a free-text project request: keep `[a-z0-9]`, collapse other
@@ -263,11 +265,19 @@ pub fn bootstrap_project(
     // V0.2 M0.20 (candidate 7): compute the spawned-session
     // `enabledPlugins` set from the team's phase YAML
     // `tools_required.subagents`, replacing the M0.5 ln -sf protocol.
-    let templates = load_phase_templates_for_bootstrap(team);
+    let resolved_spec = resolve_project_team_spec(paths, team);
+    let team_is_flex = resolved_spec.as_ref().is_some_and(|spec| spec.kind.is_flex());
+    let templates = if team_is_flex {
+        Vec::new()
+    } else {
+        load_phase_templates_for_bootstrap(team)
+    };
     let enabled_plugins = compute_enabled_plugins(&templates);
 
     write_project_settings(&project_dir, &enabled_plugins)?;
-    write_project_phase_templates_for_team(&project_dir, team)?;
+    if !team_is_flex {
+        write_project_phase_templates_for_team(&project_dir, team)?;
+    }
     // M2.4: ensure ~/.ccteam/templates/ has the helper templates so
     // any phase markdown's `@~/.ccteam/templates/<name>.md` reference
     // resolves. Idempotent — no-ops when files already exist, so this
@@ -306,11 +316,18 @@ pub fn bootstrap_project(
 
     let claude_md = project_dir.join("CLAUDE.md");
     if !claude_md.exists() {
-        std::fs::write(&claude_md, render_project_claude_md(slug, team))
+        let body = render_project_claude_md(slug, team, resolved_spec.as_ref());
+        std::fs::write(&claude_md, body)
             .with_context(|| format!("write {}", claude_md.display()))?;
     }
 
     Ok(project_dir)
+}
+
+fn resolve_project_team_spec(paths: &CcteamPaths, team: &str) -> Option<TeamSpec> {
+    let user_staging = crate::team_resolver::default_user_staging_dir();
+    let ctx = TeamResolveContext::for_orchestrator(&paths.root, &user_staging);
+    crate::team_resolver::resolve_team(team, &ctx).ok()
 }
 
 /// Build the `<project>/CLAUDE.md` body for `team`. V0.2 §6.4
@@ -319,9 +336,11 @@ pub fn bootstrap_project(
 /// literal placeholders `{slug}` / `{team}`, substituted here.
 ///
 /// Lookup precedence:
-/// 1. The shipped `TEAM_BUNDLES` entry's `team.yaml.claude_md_template`
+/// 1. The resolved `TeamSpec`'s `claude_md_template` (for user-authored
+///    staging teams).
+/// 2. The shipped `TEAM_BUNDLES` entry's `team.yaml.claude_md_template`
 ///    (parsed lazily from the embedded yaml).
-/// 2. A generic body that doesn't bake in dev / research assumptions —
+/// 3. A generic body that doesn't bake in dev / research assumptions —
 ///    used for unknown teams (user-authored without a template) and as
 ///    a safety net if the shipped yaml fails to parse.
 ///
@@ -329,11 +348,16 @@ pub fn bootstrap_project(
 /// (eg. `--config` style placeholder selection) should fill in
 /// values before storing the template, since runtime substitution is
 /// limited to the two slots the template author can rely on.
-fn render_project_claude_md(slug: &str, team: &str) -> String {
-    let template = team_bundle(team)
-        .and_then(|b| crate::team::TeamSpec::parse(b.team_yaml).ok())
+fn render_project_claude_md(slug: &str, team: &str, resolved_spec: Option<&TeamSpec>) -> String {
+    let template = resolved_spec
         .filter(|spec| !spec.claude_md_template.trim().is_empty())
-        .map(|spec| spec.claude_md_template);
+        .map(|spec| spec.claude_md_template.clone())
+        .or_else(|| {
+            team_bundle(team)
+                .and_then(|b| crate::team::TeamSpec::parse(b.team_yaml).ok())
+                .filter(|spec| !spec.claude_md_template.trim().is_empty())
+                .map(|spec| spec.claude_md_template)
+        });
     let body = match template {
         Some(t) => t,
         None => generic_claude_md_template().to_string(),
@@ -1104,7 +1128,7 @@ mod tests {
 
     #[test]
     fn render_project_claude_md_uses_dev_template_with_substitution() {
-        let body = render_project_claude_md("dev-build-todo", "dev");
+        let body = render_project_claude_md("dev-build-todo", "dev", None);
         assert!(body.contains("# CLAUDE.md (auto-managed by ccteam)"));
         assert!(body.contains("- slug: dev-build-todo"));
         assert!(body.contains("- team: dev"));
@@ -1115,7 +1139,11 @@ mod tests {
 
     #[test]
     fn render_project_claude_md_uses_product_research_template_with_substitution() {
-        let body = render_project_claude_md("product-research-recipe-ai", "product-research");
+        let body = render_project_claude_md(
+            "product-research-recipe-ai",
+            "product-research",
+            None,
+        );
         assert!(body.contains("- slug: product-research-recipe-ai"));
         assert!(body.contains("- team: product-research"));
         // product-research-specific contract: no code, source diversity.
@@ -1125,7 +1153,7 @@ mod tests {
 
     #[test]
     fn render_project_claude_md_falls_back_to_generic_for_unknown_team() {
-        let body = render_project_claude_md("custom-foo-1", "custom-team");
+        let body = render_project_claude_md("custom-foo-1", "custom-team", None);
         // Generic body has no dev-specific or research-specific clauses.
         assert!(body.contains("- slug: custom-foo-1"));
         assert!(body.contains("- team: custom-team"));
@@ -1135,12 +1163,24 @@ mod tests {
     }
 
     #[test]
+    fn render_project_claude_md_prefers_resolved_team_template() {
+        let spec = TeamSpec::parse(
+            "name: custom-flex\n\
+             kind: flex\n\
+             claude_md_template: \"custom flex template for {slug} / {team}\"\n",
+        )
+        .unwrap();
+        let body = render_project_claude_md("custom-flex-demo", "custom-flex", Some(&spec));
+        assert!(body.contains("custom flex template for custom-flex-demo / custom-flex"));
+    }
+
+    #[test]
     fn render_project_claude_md_falls_back_to_generic_when_template_field_empty() {
         // meta-agent ships with an empty `claude_md_template` (the role
         // prompt overwrites the file via a different path), so the
         // generic body is the right fallback. This guards against
         // accidentally writing "" as the body.
-        let body = render_project_claude_md("meta-rob", "meta-agent");
+        let body = render_project_claude_md("meta-rob", "meta-agent", None);
         assert!(!body.is_empty());
         assert!(body.contains("- slug: meta-rob"));
         assert!(body.contains("- team: meta-agent"));
