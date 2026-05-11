@@ -11,6 +11,17 @@ V0.3.1 的 Codex 只到 trait stub:能声明 `harness: codex`,CLI 也接受
 
 ## 0. 准备
 
+### 0.0 这份手册的验证边界
+
+手动验证分两条线:
+
+- **默认路径不需要跑 `ccteam start`**:flex team 创建、project 创建、
+  `ccteam session add/ls/attach/rm`、statusline / harness snapshot、web 页面、
+  SSE、screenshot 和写动作都可以直接验证。
+- **只有验证 orchestrator 行为时才跑 `ccteam start`**:见第 6 节。`start` 会扫描
+  projects root 下的项目,workflow 项目可能会启动真实 Claude session;不想触发旧项目时,
+  请使用第 0.2 节的 `/tmp` 隔离环境。
+
 ### 0.1 选择二进制
 
 如果已安装 `ccteam`,直接用:
@@ -65,6 +76,7 @@ export TEAM=manual-flex
 export SLUG=manual-flex-check
 export SID1=claude-1
 export SID2=claude-2
+export TEAM_DESCRIPTION="Manual V0.3.1 flex verification team"
 export CCTEAM_HOME="${CCTEAM_HOME:-$HOME/.ccteam}"
 export CCTEAM_PROJECTS_ROOT="${CCTEAM_PROJECTS_ROOT:-$HOME/projects}"
 ```
@@ -80,7 +92,10 @@ export CCTEAM_PROJECTS_ROOT="${CCTEAM_PROJECTS_ROOT:-$HOME/projects}"
 ### 1.1 创建 flex team
 
 ```bash
-"$CCTEAM_BIN" team init "$TEAM" --kind flex --author-name "${USER:-manual}"
+"$CCTEAM_BIN" team init "$TEAM" \
+  --kind flex \
+  --description "$TEAM_DESCRIPTION" \
+  --author-name "${USER:-manual}"
 ```
 
 期望:
@@ -101,11 +116,24 @@ sed -n '1,80p' "$TEAM_YAML"
 ```yaml
 name: manual-flex
 kind: flex
+description: Manual V0.3.1 flex verification team
 phase_dir: phases
 sessions:
   - sid: claude-1
     harness: claude
 ```
+
+`--description` 不能省略。`team init` 会同时生成 Claude Code plugin manifest,
+manifest 的 `description` 是非空必填字段;如果省略,会看到:
+
+```text
+Error: plugin manifest
+
+Caused by:
+    plugin.json: `description` must be non-empty
+```
+
+这是参数缺失,不是 flex team 本身失败。补上 `--description` 后重跑即可。
 
 注意:`team.yaml::sessions[]` 是默认 session schema / 文档入口;当前 V0.3.1
 运行时仍通过 `ccteam session add` 显式启动实际 tmux session。
@@ -507,7 +535,12 @@ curl -H "Authorization: Bearer ccteam:<token>" ...
 
 ## 6. Orchestrator flex 行为
 
-flex team 没有 phase DAG。手动验证重点是"不注入 phase prompt,但观测面保留":
+本节是可选项,不是前面 flex team / multi-session / web 验证的前置步骤。
+`session add` 会直接启动对应 tmux session;web 直接读取 state / progress /
+harness snapshot 文件。因此只验用户可见功能时,不用跑 `ccteam start`。
+
+需要专门验 orchestrator 时再跑本节。flex team 没有 phase DAG,手动验证重点是
+"不注入 phase prompt,但观测面保留":
 
 如果你按 3.6 创建了 `dev-v031-check` 只做负向验证,又不想让 orchestrator
 启动这个 workflow 项目的真实 Claude session,先删掉它:
@@ -567,7 +600,7 @@ ls -1 "${CLAUDE_CONFIG_HOME:-$HOME/.claude}"/statusline-command.sh.bak-* 2>/dev/
 ## 8. 验收清单
 
 - [ ] `ccteam --version` 是 `0.3.1`
-- [ ] `team init --kind flex` 生成 `kind: flex`,无 phases,含 `sessions[].harness`
+- [ ] `team init --kind flex --description ...` 生成 `kind: flex`,无 phases,含 `sessions[].harness`
 - [ ] `doctor --validate-team <team>` 对 flex team 通过
 - [ ] `team publish --target local` 创建 ccteam-local marketplace symlink
 - [ ] `ccteam new --team <flex>` 创建 `team_kind: flex` 项目
@@ -586,3 +619,4 @@ ls -1 "${CLAUDE_CONFIG_HOME:-$HOME/.claude}"/statusline-command.sh.bak-* 2>/dev/
 - [ ] `/screenshot/<slug>-<sid>.png` 返回 PNG 或 graceful 504
 - [ ] `POST /api/<slug>/<sid>/btw` 写入 session inbox
 - [ ] `POST /api/<slug>/<sid>/{pause,resume}` 返回 303
+- [ ] 只验 CLI / web / SSE 时未启动 `ccteam start`;只在第 6 节 orchestrator 可选项中启动
