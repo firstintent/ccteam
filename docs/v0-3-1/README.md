@@ -20,6 +20,7 @@ workspace.version = `0.3.1`,测试 baseline `833/0`。
 |---|---|---|
 | [`prd.md`](prd.md) | V0.3.1 PRD — 战略 pivot 背景 + 6 finding(F46-F51)设计 + 已知风险 + V0.4 deferred + PR sequencing | V0.3.1 设计意图源头 |
 | [`dev-plan.md`](dev-plan.md) | 6 PR 拆解 + 依赖图 + 红线 grep 矩阵 + worktree subagent briefing 模板(F46 完整,F47-F51 增量化基) | V0.3.1 实施 |
+| [`user-manual.md`](user-manual.md) | V0.3.1 用户使用与手动验证手册 — flex team / multi-session / harness snapshot / web UI 逐项验收 | 手动验证 V0.3.1 功能 |
 | [`e2e-retro.md`](e2e-retro.md) | F51 ship gate e2e retro — 4 suite 隔离验证、结果、verdict、numbers | V0.3.1 ship 验收 |
 
 ## Findings 速查
