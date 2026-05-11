@@ -148,8 +148,14 @@ Caused by:
 期望:
 
 - `doctor --validate-team` 对 flex team 跳过 phase IO / markdown checks
+- `doctor` 末尾如果出现
+  `[ccteam] codex CLI: not found (V0.3.1 trait-stub only; ...)`,这是
+  V0.3.1 的 Codex 前向兼容探测,不计入 fail,也不影响 flex 验证
 - `team publish --target local` 在 Claude Code local marketplace 下创建
   `ccteam-local/plugins/$TEAM` symlink
+- `team publish` 输出里的 `linked → .../plugins/$TEAM` 就是成功信号;后面的
+  `share with: ... claude /plugin add <staging-path>` 是给分发给其他机器时看的
+  提示,本机 local marketplace 验证不需要再执行
 
 如果设置了 `CLAUDE_CONFIG_HOME`,publish 目标在
 `$CLAUDE_CONFIG_HOME/plugins/marketplaces/ccteam-local/plugins/$TEAM`。
