@@ -1,14 +1,39 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { WTerm } from "@wterm/dom";
-import type {
-  ActivateMessage,
-  PauseOutputMessage,
-  PrimaryStatusMessage,
-  ResizeMessage,
-  ResumeOutputMessage,
-} from "../lib/types";
-import { getToken } from "../lib/token";
+import { ptyUrlFor, PTY_SUBPROTOCOL } from "../lib/terminalConfig";
+import { toastBus } from "../lib/toastBus";
 import { useWebSettings } from "./useWebSettings";
+
+// V0.3.2 F57 — adapter for the F56 WS PTY relay.
+//
+// Hook ownership: forked from AoE `web/src/hooks/useTerminal.ts` (1128
+// lines) and trimmed for the ccteam relay protocol. Removed:
+//   - AoE primary/secondary client semantics (activate / primary_status)
+//   - pause_output / resume_output control frames
+//   - `aoe-auth` subprotocol token (ccteam auths via cookie)
+//   - claude_fullscreen prop (F56 does not yet expose it)
+// Kept (these are terminal-quality, not AoE-specific): reconnect
+// backoff (1s→30s cap, 7 retries), 250ms resize debounce with
+// scrollback gating, IME printable-input guard, mobile textarea
+// backspace repeat, touch/wheel scrollback tracking, pinch zoom,
+// Ctrl-modifier refs, useWebSettings font persistence.
+//
+// Auth flow: the cookie shim in `auth_layer` runs before the
+// `WebSocketUpgrade` extractor; an unauth'd browser gets a 401 and the
+// upgrade is refused. No header needed in JS.
+//
+// Manual verification (post `npm run build`):
+//   1. Mount <TerminalView slug="..." /> on a live workflow project ->
+//      xterm renders inside ~250ms; first bytes from tmux are visible.
+//   2. Press keys -> WS DevTools shows outgoing binary frames; the
+//      tmux pane echoes input back.
+//   3. Resize the browser window or toggle the soft keyboard -> at
+//      most one `{"type":"resize",...}` text frame per 250ms.
+//   4. `kill -KILL` the `ccteam web` process -> banner shows
+//      "Reconnecting in Ns..." and retries with exponential backoff
+//      until either reconnect or 7th attempt -> "Connection lost".
+//   5. Force a broadcast lag on the server -> console.warn lag once,
+//      stream continues without disconnect.
 
 // Exponential backoff: 1s, 2s, 4s, 8s, 16s, 30s, 30s (cap). Seven attempts
 // cover typical tunnel restarts and transient WiFi drops without flooding
@@ -38,7 +63,6 @@ export interface TerminalState {
   reconnecting: boolean;
   retryCount: number;
   retryCountdown: number;
-  isPrimary: boolean;
   /**
    * True when the user has scrolled up and tmux is (likely) in copy-mode.
    * Set when the first wheel-up byte goes out after being false; cleared
@@ -50,20 +74,17 @@ export interface TerminalState {
 }
 
 /**
- * Manages a wterm terminal connected to a PTY-relayed WebSocket.
- * Returns a ref to attach to a container div, plus connection state.
+ * Manages a wterm terminal connected to a PTY-relayed WebSocket via
+ * the F56 `/ws/<slug>/pty` (or `/ws/<slug>/<sid>/pty`) endpoint.
+ * Returns a container ref plus connection state.
  *
- * `claudeFullscreen` is read at connect time (the connect effect's deps
- * are intentionally only `[sessionId, wsPath]`). Toggling Claude's
- * `/tui` setting mid-session won't take effect on the live wterm; the
- * user has to reattach. That matches Claude Code itself, which also
- * needs a restart to switch renderers.
+ * The connect effect's deps are intentionally only `[slug, sid]`; a
+ * runtime swap of either re-creates the terminal and reconnects.
  */
 export function useTerminal(
-  sessionId: string | null,
-  wsPath: string = "ws",
+  slug: string | null,
+  sid?: string,
   autoFocus: boolean = true,
-  claudeFullscreen: boolean = false,
 ) {
   const { settings, update } = useWebSettings();
   const containerRef = useRef<HTMLDivElement>(null);
@@ -110,12 +131,11 @@ export function useTerminal(
     reconnecting: false,
     retryCount: 0,
     retryCountdown: 0,
-    isPrimary: true,
     isInScrollback: false,
   });
 
   useEffect(() => {
-    if (!sessionId || !containerRef.current) return;
+    if (!slug || !containerRef.current) return;
 
     // Clean up previous instance
     wsRef.current?.close();
@@ -204,7 +224,9 @@ export function useTerminal(
       if (cols === lastSentCols && rows === lastSentRows) return;
       const ws = wsRef.current;
       if (ws?.readyState !== WebSocket.OPEN) return;
-      ws.send(JSON.stringify({ type: "resize", cols, rows } as ResizeMessage));
+      // F56 ClientControl::Resize shape. Lowercase `type` is required
+      // by serde(rename_all = "lowercase") on the server enum.
+      ws.send(JSON.stringify({ type: "resize", cols, rows }));
       lastSentCols = cols;
       lastSentRows = rows;
     };
@@ -426,15 +448,11 @@ export function useTerminal(
       });
 
     function connect() {
-      const proto = location.protocol === "https:" ? "wss:" : "ws:";
-      // Pass the auth token via the WebSocket subprotocol list instead of
-      // the URL query string. URLs land in access logs (axum, cloudflared,
-      // Tailscale, any reverse proxy); subprotocol headers don't.
-      const token = getToken();
-      const url = `${proto}//${location.host}/sessions/${sessionId}/${wsPath}`;
-      const ws = token
-        ? new WebSocket(url, ["aoe-auth", token])
-        : new WebSocket(url);
+      // F56 endpoint: /ws/<slug>/pty or /ws/<slug>/<sid>/pty. Auth
+      // travels in the same `ccteam_token` cookie the SPA already
+      // carries (auth_layer extracts before WebSocketUpgrade).
+      const url = ptyUrlFor(slug, sid);
+      const ws = new WebSocket(url, [PTY_SUBPROTOCOL]);
       ws.binaryType = "arraybuffer";
       wsRef.current = ws;
 
@@ -459,13 +477,8 @@ export function useTerminal(
           reconnecting: false,
           retryCount: 0,
           retryCountdown: 0,
-          isPrimary: true,
         }));
         if (autoFocus) term.focus();
-        // Claim primary immediately so this client's resize is applied.
-        // Without this, the first resize lands in "vacant" state (which
-        // works) but a race with focus/visibility events could delay it.
-        ws.send(JSON.stringify({ type: "activate" } as ActivateMessage));
         // Send initial PTY dimensions only if wterm has actually measured
         // the container. Reading term.cols/term.rows directly would yield
         // wterm's 80x24 default before ResizeObserver fires, and pushing
@@ -494,16 +507,28 @@ export function useTerminal(
         if (event.data instanceof ArrayBuffer) {
           term.write(new Uint8Array(event.data));
         } else if (typeof event.data === "string") {
-          // Check for server control messages before writing to terminal
+          // F56 only sends one text control type today: `{"type":"lag",
+          // "behind":N}`. The stream continues from the latest offset
+          // when this fires, so we just notify the user; the relay
+          // does NOT close the socket.
           try {
-            const msg = JSON.parse(event.data) as { type?: string };
-            if (msg.type === "primary_status") {
-              const status = msg as PrimaryStatusMessage;
-              setState((prev) => ({ ...prev, isPrimary: status.is_primary }));
+            const msg = JSON.parse(event.data) as {
+              type?: string;
+              behind?: number;
+            };
+            if (msg.type === "lag") {
+              const behind = typeof msg.behind === "number" ? msg.behind : 0;
+              console.warn(
+                `[ccteam-pty] broadcast lag: dropped ${behind} frames before resuming`,
+              );
+              toastBus.handler?.info(
+                `Terminal stream lagged; dropped ${behind} frame${behind === 1 ? "" : "s"}.`,
+              );
               return;
             }
           } catch {
-            // Not JSON, treat as terminal text
+            // Not JSON, treat as terminal text (forward-compat with
+            // any future plain-text control surface from F56).
           }
           term.write(event.data);
         }
@@ -584,12 +609,12 @@ export function useTerminal(
     // so tmux mouse-mode enters copy-mode and scrolls.
     //
     // Track net wheel-UP depth so the client knows whether tmux is in
-    // copy-mode and can pause/resume the pane's process accordingly.
-    // Tmux doesn't signal copy-mode state over the PTY, so the client
+    // copy-mode and renders the "Back to live" FAB accordingly. Tmux
+    // doesn't signal copy-mode state over the PTY, so the client
     // infers it from scroll direction: depth goes 0 → 1 on first
-    // wheel-UP (copy-mode entered), back to 0 when balanced (copy-mode
-    // auto-exited via tmux's `-e` flag on desktop, or manually exited
-    // via the "Back to live" button on mobile).
+    // wheel-UP (copy-mode entered), back to 0 when balanced
+    // (copy-mode auto-exited via tmux's `-e` flag on desktop, or
+    // manually exited via the "Back to live" button on mobile).
     //
     // Mobile-only: clamp wheel-DOWN emissions so depth floors at 1,
     // preventing tmux's `-e` auto-exit. On mobile the down-swipe
@@ -597,28 +622,18 @@ export function useTerminal(
     // position. Desktop keeps the unclamped behavior — scroll-down-past-
     // bottom auto-exits, as users expect there.
     //
-    // Pause/resume apply to BOTH platforms: claude's continued output
-    // shifts scrollback under the reader regardless of client size.
+    // V0.3.2 F57 — the AoE pause_output/resume_output sends were
+    // dropped here. F56 has no such control surface; the relay is a
+    // raw byte pipe and tmux remains in charge of which bytes flow.
+    // The scrollback flag is still meaningful as a UI hint for the
+    // "Back to live" FAB and the resize gate (sendResize defers
+    // resizes while reading scrollback).
     const WHEEL_UP_SEQ = "\x1b[<64;1;1M";
     const WHEEL_DOWN_SEQ = "\x1b[<65;1;1M";
     let scrollbackDepth = 0;
     const sendWheel = (dir: "up" | "down", count: number) => {
       const ws = wsRef.current;
       if (ws?.readyState !== WebSocket.OPEN) return;
-
-      // Fullscreen renderer path: Claude Code manages its own virtualized
-      // scrollback inside the alt screen, so tmux copy-mode is never
-      // engaged. Skip the depth tracking and the pause/resume dance.
-      // Just emit raw wheel sequences and let Claude's renderer handle
-      // them. isInScrollback stays false; downstream UI (BackToLiveButton)
-      // hides itself accordingly.
-      if (claudeFullscreen) {
-        const seq = dir === "up" ? WHEEL_UP_SEQ : WHEEL_DOWN_SEQ;
-        for (let i = 0; i < count; i++) {
-          ws.send(new TextEncoder().encode(seq));
-        }
-        return;
-      }
 
       let sendCount = count;
       const clampForMobile = isMobileViewport();
@@ -631,7 +646,7 @@ export function useTerminal(
         scrollbackDepth -= sendCount;
       } else {
         // Desktop: emit freely, let tmux's -e handle exit. Track depth
-        // so the resume transition fires when the user scrolls back.
+        // so the live-transition fires when the user scrolls back.
         scrollbackDepth = Math.max(0, scrollbackDepth - sendCount);
       }
       const seq = dir === "up" ? WHEEL_UP_SEQ : WHEEL_DOWN_SEQ;
@@ -640,31 +655,17 @@ export function useTerminal(
       }
       // Transition into scrollback on first wheel-up (desktop + mobile).
       if (dir === "up") {
-        setState((prev) => {
-          if (prev.isInScrollback) return prev;
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(
-              JSON.stringify({ type: "pause_output" } as PauseOutputMessage),
-            );
-          }
-          return { ...prev, isInScrollback: true };
-        });
+        setState((prev) =>
+          prev.isInScrollback ? prev : { ...prev, isInScrollback: true },
+        );
       } else if (scrollbackDepth === 0) {
-        // Back at live on desktop (tmux auto-exited copy-mode via -e);
-        // resume the pane's process. On mobile this branch never fires
-        // because the clamp keeps depth >= 1; mobile exits via the
-        // explicit "Back to live" button (see exitScrollback).
-        setState((prev) => {
-          if (!prev.isInScrollback) return prev;
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(
-              JSON.stringify({
-                type: "resume_output",
-              } as ResumeOutputMessage),
-            );
-          }
-          return { ...prev, isInScrollback: false };
-        });
+        // Back at live on desktop (tmux auto-exited copy-mode via -e).
+        // On mobile this branch never fires because the clamp keeps
+        // depth >= 1; mobile exits via the explicit "Back to live"
+        // button (see exitScrollback).
+        setState((prev) =>
+          prev.isInScrollback ? { ...prev, isInScrollback: false } : prev,
+        );
       }
     };
     // Expose so exitScrollback can reset the depth in sync with the
@@ -994,26 +995,16 @@ export function useTerminal(
     };
     viewport.addEventListener("wheel", onWheel, { passive: false });
 
-    // When the user switches to this tab/window, tell the server so it
-    // can claim primary and resize the PTY to match this viewport.
-    const sendActivate = () => {
-      const ws = wsRef.current;
-      if (ws?.readyState === WebSocket.OPEN) {
-        const msg: ActivateMessage = { type: "activate" };
-        ws.send(JSON.stringify(msg));
-      }
-    };
-    const onVisibilityChange = () => {
-      if (document.visibilityState === "visible") sendActivate();
-    };
-    document.addEventListener("visibilitychange", onVisibilityChange);
-    window.addEventListener("focus", sendActivate);
+    // V0.3.2 F57 — the AoE visibilitychange / window-focus listeners
+    // sent `{"type":"activate"}` to claim primary. F56 has no primary
+    // concept; multiple WS subscribers share the same broadcast
+    // channel. The listeners are gone; if a single PTY ever needs to
+    // re-send geometry on tab-resume, drive that off the resize
+    // observer (it fires when innerHeight changes on iOS focus).
 
     return () => {
       connectOnReady = false;
       cancelMomentum();
-      document.removeEventListener("visibilitychange", onVisibilityChange);
-      window.removeEventListener("focus", sendActivate);
       viewport.removeEventListener("touchstart", onTouchStart, touchOpts);
       viewport.removeEventListener("touchmove", onTouchMove, touchOpts);
       viewport.removeEventListener("touchend", onTouchEnd, touchOpts);
@@ -1031,7 +1022,7 @@ export function useTerminal(
       wsRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId, wsPath]);
+  }, [slug, sid]);
 
   // Apply font size changes from settings UI to the live terminal.
   useEffect(() => {
@@ -1079,22 +1070,14 @@ export function useTerminal(
     }
   }, []);
 
-  const activate = useCallback(() => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(
-        JSON.stringify({ type: "activate" } as ActivateMessage),
-      );
-    }
-  }, []);
-
   // Mobile-only: sends ESC to force tmux out of copy-mode. On mobile we
   // clamp scroll-down so tmux never reaches the bottom on its own; the
   // button is the only way back to live.
   //
-  // Also sends `resume_output` so the server SIGCONTs the pane's
-  // process tree (which was paused on entry to scrollback). The server
-  // auto-resumes on disconnect as a safety net, so forgetting this is
-  // annoying but not permanent.
+  // V0.3.2 F57 — AoE's resume_output send was dropped; F56 has no
+  // pause/resume control surface (it's a raw byte relay), so the only
+  // payload that matters is the Escape that drops tmux out of
+  // copy-mode.
   const exitScrollback = useCallback(() => {
     // Cancel any in-flight momentum decay first. Otherwise a tap that
     // lands while a fast flick is still emitting wheel-ups would let the
@@ -1103,9 +1086,6 @@ export function useTerminal(
     cancelMomentumRef.current?.();
     const ws = wsRef.current;
     if (ws?.readyState === WebSocket.OPEN) {
-      ws.send(
-        JSON.stringify({ type: "resume_output" } as ResumeOutputMessage),
-      );
       ws.send(new TextEncoder().encode("\x1b"));
     }
     resetScrollbackDepthRef.current?.();
@@ -1120,7 +1100,6 @@ export function useTerminal(
     state,
     manualReconnect,
     sendData,
-    activate,
     exitScrollback,
     ctrlActiveRef,
     clearCtrlRef,
