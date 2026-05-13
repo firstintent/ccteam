@@ -5,6 +5,21 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "ccteam V0.3 web UI: read-only dashboard + write-action endpoints (axum + askama)."
+# V0.3.2 F53 — `build.rs` drives `npm run build` for the SPA bundle
+# under `web/` and ensures `web/dist/` exists so `rust-embed` can pick
+# the assets up at crate compile time. Gated by the `web-bundle`
+# feature (default-on); disabling it skips npm entirely and falls back
+# to a placeholder `index.html` so the rust-embed expansion still finds
+# something to embed.
+build = "build.rs"
+
+[features]
+# V0.3.2 F53 — when on (default), `build.rs` runs `npm install` +
+# `npm run build` in `web/`. When off (`--no-default-features`),
+# `build.rs` skips npm and writes a placeholder `web/dist/index.html`
+# so rust-embed has a valid folder to embed.
+default = ["web-bundle"]
+web-bundle = []
 
 [dependencies]
 ccteam-core.workspace = true
@@ -41,6 +56,12 @@ subtle = { workspace = true }
 #   `~/.ccteam/web-token` mode 0600.
 axum-extra = { version = "0.10", features = ["cookie"] }
 rand = "0.8"
+
+# V0.3.2 F53 — embed the vite-built SPA bundle (`web/dist/`) into the
+# binary so `ccteam web` ships the React UI without a separate static
+# files step. Asset routes live in `routes/assets.rs`.
+rust-embed = "8"
+mime_guess = "2"
 
 [dev-dependencies]
 tempfile = "3"
