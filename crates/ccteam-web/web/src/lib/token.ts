@@ -14,10 +14,25 @@
 
 const STORAGE_KEY = "aoe_auth_token";
 
+/** Pure parser: pull `?token=...` out of an arbitrary URL string. Returns
+ *  null when absent. Doesn't touch localStorage or history. Exposed for
+ *  TokenEntryPage (V0.3.2 F58) so it can accept either a raw token or a
+ *  pasted dashboard URL without re-implementing this logic. */
+export function extractTokenFromQuery(href?: string): string | null {
+  const input = href ?? (typeof window !== "undefined" ? window.location.href : "");
+  if (!input) return null;
+  try {
+    const url = new URL(input);
+    const token = url.searchParams.get("token");
+    return token && token.length > 0 ? token : null;
+  } catch {
+    return null;
+  }
+}
+
 function captureFromUrl(): void {
   if (typeof window === "undefined") return;
-  const url = new URL(window.location.href);
-  const token = url.searchParams.get("token");
+  const token = extractTokenFromQuery(window.location.href);
   if (!token) return;
 
   try {
@@ -28,6 +43,7 @@ function captureFromUrl(): void {
     return;
   }
 
+  const url = new URL(window.location.href);
   url.searchParams.delete("token");
   const clean = url.pathname + (url.search ? url.search : "") + url.hash;
   window.history.replaceState(null, "", clean || "/");
