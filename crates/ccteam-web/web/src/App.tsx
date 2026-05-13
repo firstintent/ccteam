@@ -16,6 +16,7 @@
 import { Route, Routes } from "react-router-dom";
 import { TopBar } from "./components/TopBar";
 import { ContentSplit } from "./components/ContentSplit";
+import Dashboard from "./pages/Dashboard";
 
 function PlaceholderPage({ label }: { label: string }) {
   return (
@@ -38,7 +39,7 @@ export default function App() {
             onToggleCollapse={() => {}}
             left={
               <Routes>
-                <Route path="/" element={<PlaceholderPage label="dashboard" />} />
+                <Route path="/" element={<Dashboard />} />
                 <Route
                   path="/p/:slug"
                   element={<PlaceholderPage label="project detail" />}
