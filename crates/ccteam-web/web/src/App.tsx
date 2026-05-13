@@ -17,6 +17,8 @@ import { Route, Routes } from "react-router-dom";
 import { TopBar } from "./components/TopBar";
 import { ContentSplit } from "./components/ContentSplit";
 import Dashboard from "./pages/Dashboard";
+import ProjectDetail from "./pages/ProjectDetail";
+import SessionDetail from "./pages/SessionDetail";
 
 function PlaceholderPage({ label }: { label: string }) {
   return (
@@ -40,14 +42,8 @@ export default function App() {
             left={
               <Routes>
                 <Route path="/" element={<Dashboard />} />
-                <Route
-                  path="/p/:slug"
-                  element={<PlaceholderPage label="project detail" />}
-                />
-                <Route
-                  path="/p/:slug/s/:sid"
-                  element={<PlaceholderPage label="session detail" />}
-                />
+                <Route path="/p/:slug" element={<ProjectDetail />} />
+                <Route path="/p/:slug/s/:sid" element={<SessionDetail />} />
                 <Route path="*" element={<PlaceholderPage label="route" />} />
               </Routes>
             }

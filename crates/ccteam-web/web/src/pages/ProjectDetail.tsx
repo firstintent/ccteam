@@ -1,0 +1,216 @@
+// V0.3.2 F55 — Project detail page.
+//
+// Consumes `/api/v1/projects/<slug>` (docs/interfaces.md §16.2) and
+// subscribes `/sse/project/<slug>` via EventsLive for live event
+// updates.
+//
+// Layout (per F55 spec):
+//   - top:    team / kind / current_phase / badge_label
+//   - right:  EventsLive (scope=project) + OutboxList (inline)
+//   - bottom: flex-only session tab strip (is_flex && sessions.length)
+//   - debug:  collapsible Pending decisions list
+//
+// Write actions (btw / inject_decision / pause / resume) are owned by
+// F58 — this page only reads.
+
+import { useEffect, useState } from "react";
+import { Link, useParams } from "react-router-dom";
+import {
+  fetchProject,
+  type ProjectSummary,
+  type OutboxRow,
+  type SessionCard,
+} from "../lib/detailApi";
+import { EventsLive } from "../components/EventsLive";
+
+function StatusBadge({ cls, label }: { cls: string; label: string }) {
+  // `badge_class` strings like "badge-ok" / "badge-warn" / "badge-err"
+  // come straight from server templates. We don't have CSS classes
+  // for those in the SPA, so we map the suffix to color tokens we DO
+  // have, falling back to neutral surface.
+  const suffix = cls.replace(/^badge-/, "");
+  const color =
+    suffix === "ok"
+      ? "text-status-running border-status-running/40 bg-status-running/10"
+      : suffix === "warn"
+        ? "text-status-waiting border-status-waiting/40 bg-status-waiting/10"
+        : suffix === "err" || suffix === "error"
+          ? "text-status-error border-status-error/40 bg-status-error/10"
+          : "text-text-secondary border-surface-700/40 bg-surface-800";
+  return (
+    <span
+      className={
+        "inline-flex items-center px-2 py-0.5 rounded text-[11px] font-mono uppercase tracking-wide border " +
+        color
+      }
+    >
+      {label}
+    </span>
+  );
+}
+
+function OutboxList({ rows }: { rows: OutboxRow[] }) {
+  return (
+    <section className="border border-surface-700/40 rounded-md bg-surface-850 flex flex-col min-h-0">
+      <header className="px-3 py-2 border-b border-surface-700/30 shrink-0">
+        <h3 className="text-xs uppercase tracking-wide text-text-secondary">
+          Outbox
+        </h3>
+      </header>
+      <ol className="flex-1 min-h-0 overflow-auto font-mono text-xs divide-y divide-surface-700/20">
+        {rows.length === 0 && (
+          <li className="px-3 py-2 text-text-dim italic">empty</li>
+        )}
+        {rows.map((r) => (
+          // F58 may add "open in editor" — for now filename is plain text.
+          <li key={r.filename} className="px-3 py-1.5">
+            <div className="flex justify-between gap-3">
+              <span className="text-text-primary truncate" title={r.filename}>
+                {r.filename}
+              </span>
+              <span className="text-text-dim shrink-0">{r.kind}</span>
+            </div>
+            {r.preview && (
+              <div className="text-text-muted text-[11px] truncate">
+                {r.preview}
+              </div>
+            )}
+            <div className="text-text-dim text-[10px]">{r.created_at}</div>
+          </li>
+        ))}
+      </ol>
+    </section>
+  );
+}
+
+function SessionTab({ slug, card }: { slug: string; card: SessionCard }) {
+  return (
+    <Link
+      to={`/p/${encodeURIComponent(slug)}/s/${encodeURIComponent(card.sid)}`}
+      className="flex items-center gap-2 px-3 py-1.5 border border-surface-700/40 rounded-md bg-surface-800 hover:bg-surface-700/50 transition-colors text-xs"
+    >
+      <span className="font-mono text-text-primary">{card.sid}</span>
+      <StatusBadge cls={card.status_class} label={card.status_label} />
+      {card.harness && (
+        <span className="text-text-dim text-[10px] uppercase">
+          {card.harness}
+        </span>
+      )}
+    </Link>
+  );
+}
+
+export default function ProjectDetail() {
+  const { slug } = useParams<{ slug: string }>();
+  const [summary, setSummary] = useState<ProjectSummary | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!slug) return;
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    setSummary(null);
+    fetchProject(slug)
+      .then((data) => {
+        if (!cancelled) setSummary(data);
+      })
+      .catch((e) => {
+        if (!cancelled)
+          setError(e instanceof Error ? e.message : String(e));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [slug]);
+
+  if (!slug) {
+    return (
+      <div className="p-6 text-text-dim text-sm">missing :slug route param</div>
+    );
+  }
+  if (loading) {
+    return (
+      <div className="p-6 text-text-dim text-xs font-mono uppercase">
+        loading project {slug}…
+      </div>
+    );
+  }
+  if (error) {
+    return (
+      <div className="p-6 text-status-error text-sm font-mono">
+        Failed to load project: {error}
+      </div>
+    );
+  }
+  if (!summary) {
+    return <div className="p-6 text-text-dim text-sm">no data</div>;
+  }
+
+  return (
+    <div className="flex flex-col h-full min-h-0 overflow-auto p-4 gap-4">
+      {/* TOP — identity row */}
+      <header className="flex flex-wrap items-baseline gap-3">
+        <h1 className="text-lg font-semibold text-text-bright">
+          {summary.slug}
+        </h1>
+        <span className="text-xs text-text-secondary font-mono">
+          team={summary.team}
+        </span>
+        <span className="text-xs text-text-secondary font-mono">
+          kind={summary.kind}
+        </span>
+        <span className="text-xs text-text-secondary font-mono">
+          phase={summary.current_phase}
+        </span>
+        <StatusBadge cls={summary.badge_class} label={summary.badge_label} />
+        <span className="text-xs text-text-dim font-mono ml-auto">
+          cost ${summary.cost_label}
+        </span>
+      </header>
+
+      {/* Flex-only session tabs */}
+      {summary.is_flex && summary.sessions.length > 0 && (
+        <nav className="flex flex-wrap gap-2">
+          {summary.sessions.map((s) => (
+            <SessionTab key={s.sid} slug={summary.slug} card={s} />
+          ))}
+        </nav>
+      )}
+
+      {/* Main two-column layout: events + outbox */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 min-h-0 flex-1">
+        <div className="lg:col-span-2 min-h-[24rem] flex">
+          <EventsLive
+            scope={{ kind: "project", slug: summary.slug }}
+            initialEvents={summary.events}
+          />
+        </div>
+        <div className="min-h-[24rem] flex">
+          <OutboxList rows={summary.outbox} />
+        </div>
+      </div>
+
+      {/* Collapsible debug — F58 will turn this into an inject form */}
+      <details className="border border-surface-700/40 rounded-md bg-surface-850">
+        <summary className="px-3 py-2 cursor-pointer text-xs uppercase tracking-wide text-text-secondary">
+          Pending decisions ({summary.decision_candidates.length})
+        </summary>
+        <ul className="px-3 py-2 font-mono text-xs space-y-1">
+          {summary.decision_candidates.length === 0 && (
+            <li className="text-text-dim italic">none</li>
+          )}
+          {summary.decision_candidates.map((p) => (
+            <li key={p} className="text-text-secondary truncate" title={p}>
+              {p}
+            </li>
+          ))}
+        </ul>
+      </details>
+    </div>
+  );
+}
