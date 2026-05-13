@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "ccteam V0.3 web UI: read-only dashboard + write-action endpoints (axum + askama)."
+description = "ccteam V0.3.2 web UI: React SPA + JSON API + WS PTY relay."
 # V0.3.2 F53 — `build.rs` drives `npm run build` for the SPA bundle
 # under `web/` and ensures `web/dist/` exists so `rust-embed` can pick
 # the assets up at crate compile time. Gated by the `web-bundle`

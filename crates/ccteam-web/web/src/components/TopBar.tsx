@@ -1,15 +1,24 @@
-// V0.3.2 F53 — base shell version of TopBar. The AoE original wired up
-// PaletteTriggerPill + OverflowMenu (both deleted with the rest of the
-// AoE cockpit / wizard / settings UX). F54+ will re-introduce its own
-// command palette / overflow menu specific to ccteam — for now this is
-// a thin header with sidebar toggle + dashboard link + optional diff
-// toggle + offline badge so the SPA shell renders.
+// V0.3.2 F53 + F59 — base shell version of TopBar. The AoE original wired
+// up PaletteTriggerPill + OverflowMenu (both deleted with the rest of the
+// AoE cockpit / wizard / settings UX). F59 also dropped the import on
+// `lib/types.ts` (AoE-orphan) in favour of a couple of structural typedefs
+// kept inline. Future ccteam-specific palette / overflow lives here.
 
-import type { SessionResponse, Workspace } from "../lib/types";
+/** Minimal AoE-derived shapes the SPA shell still surfaces in the
+ *  header. Ccteam doesn't populate these today (App.tsx passes neither
+ *  workspace nor session) but the props stay typed so detail pages or
+ *  a future workspace picker can drive them. */
+interface WorkspaceShape {
+  projectPath?: string | null;
+  displayName?: string | null;
+}
+interface SessionShape {
+  id?: string;
+}
 
 interface Props {
-  activeWorkspace?: Workspace;
-  activeSession?: SessionResponse | null;
+  activeWorkspace?: WorkspaceShape;
+  activeSession?: SessionShape | null;
   onToggleSidebar?: () => void;
   onToggleDiff?: () => void;
   diffCollapsed?: boolean;

@@ -10,10 +10,11 @@
 // disabled to avoid double-fire. On error, surface via toast and let
 // the parent's next state poll correct the visible "paused" badge.
 //
-// TODO: F58 → F55 integration: import this in pages/ProjectDetail.tsx
-//       and pages/SessionDetail.tsx. Derive `paused` from
-//       `ProjectSummary.user_pause_pending` (or session-equivalent in
-//       flex flows).
+// Wired into pages/ProjectDetail.tsx (project-level pause derived
+// from `state.user_pause_pending`) and pages/SessionDetail.tsx
+// (session-scoped, currently passes `paused=false` since the F52
+// SessionDetail JSON doesn't surface a session pause flag yet —
+// V0.3.1 F50 keeps the flag project-scoped) by V0.3.2 F59.
 //
 // Test plan (JSDoc — playwright deferred per V0.3.2 PRD):
 //   - PauseResumeButtons: paused=false → Pause active, Resume disabled

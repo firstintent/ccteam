@@ -1,9 +1,8 @@
 //! V0.3.2 F52 — JSON API parity layer.
 //!
 //! Exposes JSON endpoints that mirror the data the V0.3 askama HTML
-//! views render. The SPA in F54+ consumes these directly; the existing
-//! HTML routes (`/`, `/project/<slug>`, `/session/<slug>/<sid>`) stay
-//! unchanged until F59 retires them.
+//! views used to render. The SPA (F54+) consumes these directly;
+//! V0.3.2 F59 retired the HTML routes (now 301-redirect into `/app/...`).
 //!
 //! Endpoints:
 //!
@@ -13,11 +12,9 @@
 //! - `GET /api/v1/auth/token` → `{"wire_token": "ccteam:<hex>" | null}`.
 //!
 //! The composite DTOs (`ProjectSummary` / `SessionDetail` /
-//! [`AuthToken`]) are defined here, not on the askama template structs.
-//! This keeps `auth_wire_token` syntactically impossible to leak from
-//! the project / session JSON (the field does not exist on the DTOs;
-//! it is only on the askama `ProjectTemplate` / `SessionTemplate` for
-//! HTML rendering).
+//! [`AuthToken`]) are defined here. `auth_wire_token` is syntactically
+//! impossible to leak from the project / session JSON (the field does
+//! not exist on the DTOs; auth state lives behind `/api/v1/auth/token`).
 //!
 //! Auth: this module merges into [`super::stateful_router`] so the
 //! existing `auth_layer` middleware in `lib::router_with_state`
@@ -57,8 +54,8 @@ pub fn router() -> Router<AppState> {
 
 /// JSON returned by `GET /api/v1/projects/{slug}`.
 ///
-/// Mirrors the askama [`crate::views::ProjectTemplate`] payload for
-/// SPA consumption, with two deliberate differences:
+/// Two deliberate shape choices vs. the V0.3 (retired) askama project
+/// template payload:
 ///
 /// 1. `state_json_pretty: String` → `state: serde_json::Value` — the
 ///    SPA picks its own formatting; pretty-printing is presentation.
@@ -85,8 +82,8 @@ pub struct ProjectSummary {
 
 /// JSON returned by `GET /api/v1/projects/{slug}/sessions/{sid}`.
 ///
-/// Mirrors [`crate::views::SessionTemplate`] without the auth fields
-/// (same rationale as [`ProjectSummary`]).
+/// Shape matches the V0.3 (retired) askama session template payload
+/// minus the auth fields (same rationale as [`ProjectSummary`]).
 #[derive(Serialize)]
 pub struct SessionDetail {
     pub slug: String,

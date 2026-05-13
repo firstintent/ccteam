@@ -4,8 +4,14 @@
 //!
 //! - **Legacy `/assets/{file}`** (M5.1) — htmx, the htmx SSE
 //!   extension, @xterm/xterm 6.0.0, and the hand-written `style.css`,
-//!   all baked via `include_bytes!`. Kept live alongside the new SPA
-//!   surface until F59 retires htmx.
+//!   all baked via `include_bytes!`. V0.3.2 F59 retired the htmx
+//!   *routes* (the three `.html` templates are gone; `/`,
+//!   `/project/<slug>`, `/session/<slug>/<sid>` are now 301 redirects
+//!   into `/app/...`), but the static byte assets stay served for one
+//!   more release. **TODO(V0.3.3)**: delete the five `include_bytes!`
+//!   blocks below + the `handle_legacy_asset` route + the underlying
+//!   files in `crates/ccteam-web/assets/` once V0.3.2 has shipped and
+//!   no external page is known to be deep-linking them.
 //! - **V0.3.2 F53 SPA surface** — `GET /app/*` serves the vite-built
 //!   React shell (with react-router fallback to `index.html`) and
 //!   `GET /assets/spa/*` serves its hashed bundle assets. The bundle

@@ -1,17 +1,18 @@
-// V0.3.2 F55 — Project detail page.
+// V0.3.2 F55 + F59 — Project detail page.
 //
 // Consumes `/api/v1/projects/<slug>` (docs/interfaces.md §16.2) and
 // subscribes `/sse/project/<slug>` via EventsLive for live event
 // updates.
 //
-// Layout (per F55 spec):
-//   - top:    team / kind / current_phase / badge_label
-//   - right:  EventsLive (scope=project) + OutboxList (inline)
+// Layout:
+//   - top:    team / kind / current_phase / badge_label + PauseResumeButtons (F58)
+//   - right:  EventsLive (scope=project) + BtwForm (F58) + OutboxList
 //   - bottom: flex-only session tab strip (is_flex && sessions.length)
-//   - debug:  collapsible Pending decisions list
+//   - decisions: InjectDecisionForm (F58) wired to summary.decision_candidates
 //
-// Write actions (btw / inject_decision / pause / resume) are owned by
-// F58 — this page only reads.
+// F58 shipped BtwForm / InjectDecisionForm / PauseResumeButtons as
+// standalone components; F59 wires them into this page (write surface
+// finally goes live in the SPA).
 
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
@@ -22,6 +23,21 @@ import {
   type SessionCard,
 } from "../lib/detailApi";
 import { EventsLive } from "../components/EventsLive";
+import { BtwForm } from "../components/BtwForm";
+import { InjectDecisionForm } from "../components/InjectDecisionForm";
+import { PauseResumeButtons } from "../components/PauseResumeButtons";
+
+/** Read `state.user_pause_pending` from the opaque `ProjectSummary.state`
+ *  JSON blob without leaking the unknown shape through to consumers.
+ *  Defaults to `false` so we render the "Pause" button enabled when
+ *  the server hasn't populated the field. */
+function readPaused(state: unknown): boolean {
+  if (state && typeof state === "object" && "user_pause_pending" in state) {
+    const v = (state as Record<string, unknown>).user_pause_pending;
+    return v === true;
+  }
+  return false;
+}
 
 function StatusBadge({ cls, label }: { cls: string; label: string }) {
   // `badge_class` strings like "badge-ok" / "badge-warn" / "badge-err"
@@ -106,6 +122,12 @@ export default function ProjectDetail() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
+  // Bumping `reloadTick` triggers a re-fetch. The F58 form components
+  // call this via `onSuccess` so the visible state catches up with the
+  // server after a successful write (pause flag, decision list, etc.).
+  const [reloadTick, setReloadTick] = useState(0);
+  const triggerReload = () => setReloadTick((n) => n + 1);
+
   useEffect(() => {
     if (!slug) return;
     let cancelled = false;
@@ -126,7 +148,7 @@ export default function ProjectDetail() {
     return () => {
       cancelled = true;
     };
-  }, [slug]);
+  }, [slug, reloadTick]);
 
   if (!slug) {
     return (
@@ -151,9 +173,11 @@ export default function ProjectDetail() {
     return <div className="p-6 text-text-dim text-sm">no data</div>;
   }
 
+  const paused = readPaused(summary.state);
+
   return (
     <div className="flex flex-col h-full min-h-0 overflow-auto p-4 gap-4">
-      {/* TOP — identity row */}
+      {/* TOP — identity row + pause/resume */}
       <header className="flex flex-wrap items-baseline gap-3">
         <h1 className="text-lg font-semibold text-text-bright">
           {summary.slug}
@@ -171,6 +195,11 @@ export default function ProjectDetail() {
         <span className="text-xs text-text-dim font-mono ml-auto">
           cost ${summary.cost_label}
         </span>
+        <PauseResumeButtons
+          slug={summary.slug}
+          paused={paused}
+          onSuccess={triggerReload}
+        />
       </header>
 
       {/* Flex-only session tabs */}
@@ -182,7 +211,7 @@ export default function ProjectDetail() {
         </nav>
       )}
 
-      {/* Main two-column layout: events + outbox */}
+      {/* Main two-column layout: events + (BTW form + outbox) */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 min-h-0 flex-1">
         <div className="lg:col-span-2 min-h-[24rem] flex">
           <EventsLive
@@ -190,27 +219,29 @@ export default function ProjectDetail() {
             initialEvents={summary.events}
           />
         </div>
-        <div className="min-h-[24rem] flex">
+        <div className="min-h-[24rem] flex flex-col gap-4">
+          <section className="border border-surface-700/40 rounded-md bg-surface-850 p-3">
+            <h3 className="text-xs uppercase tracking-wide text-text-secondary mb-2">
+              BTW (inject note)
+            </h3>
+            <BtwForm slug={summary.slug} onSuccess={triggerReload} />
+          </section>
           <OutboxList rows={summary.outbox} />
         </div>
       </div>
 
-      {/* Collapsible debug — F58 will turn this into an inject form */}
-      <details className="border border-surface-700/40 rounded-md bg-surface-850">
-        <summary className="px-3 py-2 cursor-pointer text-xs uppercase tracking-wide text-text-secondary">
+      {/* Decisions — F58 inject form. Always renders the section header;
+          the form's own empty-state covers "no candidates pending". */}
+      <section className="border border-surface-700/40 rounded-md bg-surface-850 p-3">
+        <h3 className="text-xs uppercase tracking-wide text-text-secondary mb-2">
           Pending decisions ({summary.decision_candidates.length})
-        </summary>
-        <ul className="px-3 py-2 font-mono text-xs space-y-1">
-          {summary.decision_candidates.length === 0 && (
-            <li className="text-text-dim italic">none</li>
-          )}
-          {summary.decision_candidates.map((p) => (
-            <li key={p} className="text-text-secondary truncate" title={p}>
-              {p}
-            </li>
-          ))}
-        </ul>
-      </details>
+        </h3>
+        <InjectDecisionForm
+          slug={summary.slug}
+          candidates={summary.decision_candidates}
+          onSuccess={triggerReload}
+        />
+      </section>
     </div>
   );
 }

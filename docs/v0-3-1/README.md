@@ -1,5 +1,12 @@
 # V0.3.1 文档索引
 
+> **V0.3.2 erratum**(2026-05-11):V0.3.1 PRD §10.3 曾把 `CodexAdapter`
+> 完整实现 deferred 到 V0.3.2;在 V0.3.2 scope 锁定时(用户 confirm
+> Shape A,web UI rewrite only)slip 到 **V0.3.3**。原因见
+> [`docs/v0-3-2/prd.md §3.1`](../v0-3-2/prd.md#31-决策---v032-范围--shape-aweb-ui-only)。
+> 本 README 中 §10.3 / F47 tail 仍按"deferred to V0.3.2+"读;实际目标
+> 版本以 erratum 为准。
+
 V0.3.1 是 V0.3 主线 ship 后的**首个 patch round**(F-numbered findings under
 one umbrella),也是 ccteam 的**战略支点版本**:从"phase-driven workflow
 orchestrator"扩展为"session-layer farm + observability + cross-project

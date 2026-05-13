@@ -12,8 +12,8 @@
 // — the orchestrator team has occasional out-of-band uses (e.g.,
 // dropping a note for the next phase to read without escalating).
 //
-// TODO: F58 → F55 integration: import this in pages/ProjectDetail.tsx
-//       and pass `candidates` from `ProjectSummary.decision_candidates`.
+// Wired into pages/ProjectDetail.tsx by V0.3.2 F59. The page passes
+// `candidates` from `ProjectSummary.decision_candidates`.
 //
 // Test plan (JSDoc — playwright deferred per V0.3.2 PRD):
 //   - InjectDecisionForm: select candidate, type body starting with

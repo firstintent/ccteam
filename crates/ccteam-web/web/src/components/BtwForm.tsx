@@ -7,12 +7,8 @@
 // the server's error string as an error toast and keeps the textarea
 // intact so the operator can retry without retyping.
 //
-// TODO: F58 → F55 integration: import this in pages/ProjectDetail.tsx
-//       (project-level usage — `<BtwForm slug={slug} />`) and
-//       pages/SessionDetail.tsx (flex session usage —
-//       `<BtwForm slug={slug} sid={sid} />`). F58 stops short of
-//       touching the detail pages; phase-2 merge resolution wires
-//       them in.
+// Wired into pages/ProjectDetail.tsx (project-level) and
+// pages/SessionDetail.tsx (flex session) by V0.3.2 F59.
 //
 // Test plan (JSDoc — playwright deferred per V0.3.2 PRD):
 //   - BtwForm: enter text, submit, server returns ok=true → textarea

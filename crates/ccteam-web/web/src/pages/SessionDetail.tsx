@@ -1,21 +1,25 @@
-// V0.3.2 F55 — Session detail page.
+// V0.3.2 F55 + F59 — Session detail page.
 //
 // Consumes `/api/v1/projects/<slug>/sessions/<sid>` (docs/interfaces.md
 // §16.3) and subscribes:
 //   - `/sse/project/<slug>/<sid>`  via EventsLive
 //   - `/sse/harness/<slug>/<sid>`  via HarnessPanel
 //
-// Layout (per F55 spec):
+// Layout:
 //   - top:     status row (slug / sid / harness / tmux_session /
-//              started_at / cost_label + status badge)
-//   - middle:  HarnessPanel
-//   - below:   EventsLive (scope=session)
-//   - side:    OutboxList
-//   - reserved: <div id="terminal-mount" /> — F57 mounts TerminalView
-//   - debug:   collapsible Pending decisions list
+//              started_at / cost_label + status badge + PauseResumeButtons)
+//   - middle:  HarnessPanel + terminal mount
+//   - below:   EventsLive (scope=session) + BtwForm (sid-scoped) + Outbox
+//   - decisions: collapsible Pending decisions list (project-scoped;
+//                inject form is on ProjectDetail only)
 //
 // Only flex projects return a SessionDetail; non-flex slugs 404 at
 // the API and surface as "Not found" here.
+//
+// `paused` defaults `false`: the F52 SessionDetail JSON doesn't surface
+// the pause flag yet (the orchestrator's user_pause_pending is
+// project-scoped per V0.3.1 F50). Operators looking for the live flag
+// view should consult ProjectDetail's pause/resume buttons.
 
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
@@ -26,6 +30,8 @@ import {
 } from "../lib/detailApi";
 import { EventsLive } from "../components/EventsLive";
 import { HarnessPanel } from "../components/HarnessPanel";
+import { BtwForm } from "../components/BtwForm";
+import { PauseResumeButtons } from "../components/PauseResumeButtons";
 
 function StatusBadge({ cls, label }: { cls: string; label: string }) {
   const suffix = cls.replace(/^badge-/, "");
@@ -88,6 +94,11 @@ export default function SessionDetail() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
+  // F58 forms call `triggerReload` to refresh the JSON snapshot after
+  // a successful write (so the next render reflects server state).
+  const [reloadTick, setReloadTick] = useState(0);
+  const triggerReload = () => setReloadTick((n) => n + 1);
+
   useEffect(() => {
     if (!slug || !sid) return;
     let cancelled = false;
@@ -107,7 +118,7 @@ export default function SessionDetail() {
     return () => {
       cancelled = true;
     };
-  }, [slug, sid]);
+  }, [slug, sid, reloadTick]);
 
   if (!slug || !sid) {
     return (
@@ -136,7 +147,7 @@ export default function SessionDetail() {
 
   return (
     <div className="flex flex-col h-full min-h-0 overflow-auto p-4 gap-4">
-      {/* TOP — identity row */}
+      {/* TOP — identity row + pause/resume */}
       <header className="flex flex-wrap items-baseline gap-3">
         <Link
           to={`/p/${encodeURIComponent(detail.slug)}`}
@@ -158,6 +169,12 @@ export default function SessionDetail() {
         <span className="text-xs text-text-dim font-mono ml-auto">
           cost ${detail.cost_label}
         </span>
+        <PauseResumeButtons
+          slug={detail.slug}
+          sid={detail.sid}
+          paused={false}
+          onSuccess={triggerReload}
+        />
       </header>
 
       {/* MIDDLE — harness panel + terminal placeholder */}
@@ -180,7 +197,9 @@ export default function SessionDetail() {
         </div>
       </div>
 
-      {/* BELOW — events + outbox */}
+      {/* BELOW — events + (BTW + outbox). The session-scoped BtwForm
+          routes to `/api/<slug>/<sid>/btw` (per V0.3.1 F50 session
+          inbox), keeping cross-session traffic isolated. */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 min-h-0 flex-1">
         <div className="lg:col-span-2 min-h-[24rem] flex">
           <EventsLive
@@ -188,7 +207,17 @@ export default function SessionDetail() {
             initialEvents={detail.events}
           />
         </div>
-        <div className="min-h-[24rem] flex">
+        <div className="min-h-[24rem] flex flex-col gap-4">
+          <section className="border border-surface-700/40 rounded-md bg-surface-850 p-3">
+            <h3 className="text-xs uppercase tracking-wide text-text-secondary mb-2">
+              BTW (session inbox)
+            </h3>
+            <BtwForm
+              slug={detail.slug}
+              sid={detail.sid}
+              onSuccess={triggerReload}
+            />
+          </section>
           <OutboxList rows={detail.outbox} />
         </div>
       </div>

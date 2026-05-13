@@ -1,4 +1,9 @@
-import { isServerDown } from "./connectionState";
+// V0.3.2 F59 — dropped the `connectionState.ts` integration along with
+// `DisconnectBanner.tsx` (both AoE-era orphans with no ccteam SPA
+// consumer). 5xx and network errors now always surface as toasts;
+// connection-down de-duplication is V0.4 work if the toast spam ever
+// becomes a real problem.
+
 import { reportError } from "./toastBus";
 import { clearToken, getToken, saveToken } from "./token";
 
@@ -80,7 +85,7 @@ export function installFetchErrorToasts(): void {
           handleTokenAuthFailure();
         }
       }
-      if (isApi && res.status >= 500 && !isServerDown()) {
+      if (isApi && res.status >= 500) {
         reportError(`Server error ${res.status} from ${path}`);
       }
       return res;
@@ -92,9 +97,7 @@ export function installFetchErrorToasts(): void {
       ) {
         throw err;
       }
-      // When the server is known to be down, suppress per-request toasts.
-      // The DisconnectBanner handles the user-facing notification instead.
-      if (isApi && !isServerDown()) {
+      if (isApi) {
         reportError(
           `Network error contacting ${path}. Check your connection.`,
         );
