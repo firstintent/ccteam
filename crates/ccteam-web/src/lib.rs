@@ -36,6 +36,7 @@ use tokio::net::TcpListener;
 
 pub mod auth;
 pub mod decisions;
+pub mod pty;
 pub mod queries;
 pub mod routes;
 pub mod state;

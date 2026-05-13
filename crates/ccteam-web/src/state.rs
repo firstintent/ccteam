@@ -15,6 +15,7 @@ use std::sync::Arc;
 use ccteam_core::CcteamPaths;
 
 use crate::auth::AuthState;
+use crate::pty::PtyRegistry;
 use crate::watcher::{spawn_watcher, EventBus};
 
 #[derive(Clone)]
@@ -29,6 +30,11 @@ pub struct AppState {
     /// `enabled = false` (loopback bind, or `--no-auth` opt-out) the
     /// `auth_layer` middleware short-circuits to pass-through.
     pub auth: Arc<AuthState>,
+    /// V0.3.2 F56 — refcounted `tmux pipe-pane` registry shared by
+    /// all WS PTY subscribers. The first subscriber to a given
+    /// `<slug>` (or `<slug>/<sid>`) creates the FIFO + `pipe-pane`;
+    /// the last drop tears them down.
+    pub pty: PtyRegistry,
 }
 
 impl AppState {
@@ -69,6 +75,7 @@ impl AppState {
             paths: Arc::new(paths),
             bus,
             auth: Arc::new(auth),
+            pty: PtyRegistry::new(),
         }
     }
 
@@ -81,6 +88,7 @@ impl AppState {
             paths: Arc::new(paths),
             bus,
             auth: Arc::new(AuthState::disabled()),
+            pty: PtyRegistry::new(),
         }
     }
 }

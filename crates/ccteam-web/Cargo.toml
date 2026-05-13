@@ -41,7 +41,9 @@ futures = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 
 # V0.3 M5.0 — pinned per docs/v0-3/prd.md §3.2.2.
-axum = { workspace = true }
+# V0.3.2 F56 — enable `ws` feature so `axum::extract::ws::WebSocketUpgrade`
+# is available for the PTY relay endpoints.
+axum = { workspace = true, features = ["ws"] }
 askama = { workspace = true }
 # Constant-time token comparison (M5.3 token auth). Pulled in now so
 # `ServeOpts` can carry the token-file knob without churning dep
@@ -63,6 +65,23 @@ rand = "0.8"
 rust-embed = "8"
 mime_guess = "2"
 
+# V0.3.2 F56 — WS PTY relay backend.
+# `futures-util` is promoted from dev-dep to runtime dep so the handler
+# can use `SinkExt::send` + `StreamExt::next` on the split `WebSocket`.
+# `nix` (signal feature) is kept available for the F57 follow-up which
+# wires pause/resume into the PTY refcount semantics — F56 itself only
+# refcounts subscribers and stops `tmux pipe-pane` on the last drop.
+# `portable-pty` stays declared but unused in F56: F56 relays *tmux*
+# pane bytes via `pipe-pane` + a FIFO, so we never own a PTY pair here.
+# TODO(F57): use portable-pty if we ever spawn a private `tmux attach`
+# for stdin routing instead of `tmux send-keys`.
+portable-pty = "0.8"
+futures-util = "0.3"
+# `signal` keeps F57's planned SIGSTOP/SIGCONT path on the menu;
+# `fs` is required for `nix::sys::stat::Mode` + `nix::unistd::mkfifo`
+# (F56 uses these to create the FIFO under `~/.ccteam/pty/`).
+nix = { version = "0.29", default-features = false, features = ["signal", "fs"] }
+
 [dev-dependencies]
 tempfile = "3"
 reqwest = { workspace = true, features = ["json", "stream", "cookies"] }
@@ -71,4 +90,11 @@ reqwest = { workspace = true, features = ["json", "stream", "cookies"] }
 # AsyncRead); `futures-util` provides the `StreamExt::map` adapter
 # we use to bridge `reqwest::Error` → `std::io::Error`.
 tokio-util = { version = "0.7", features = ["io"] }
-futures-util = "0.3"
+# V0.3.2 F56 — WS PTY relay integration tests. `tokio-tungstenite` is
+# the canonical async-tungstenite-on-tokio WS client; matches the
+# version used by `axum::extract::ws` internally (tungstenite 0.24).
+# `serial_test` serialises tmux-touching tests so concurrent
+# session_name collisions can't happen even on `cargo test -j N`.
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+serial_test = "3"
+nix = { version = "0.29", default-features = false, features = ["signal", "process"] }

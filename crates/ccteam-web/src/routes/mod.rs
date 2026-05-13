@@ -21,6 +21,7 @@ pub mod harness_sse;
 pub mod health;
 pub mod pane_snapshot;
 pub mod project;
+pub mod pty_ws;
 pub mod screenshot;
 pub mod session;
 pub mod sse;
@@ -42,6 +43,7 @@ pub fn stateful_router() -> Router<AppState> {
         .merge(screenshot::router())
         .merge(actions::router())
         .merge(api_v1::router())
+        .merge(pty_ws::router())
 }
 
 /// Stateless routers (currently just `/health`). M5.3 keeps `/health`

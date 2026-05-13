@@ -125,6 +125,19 @@ impl CcteamPaths {
         self.project_ccteam_dir(slug).join("screenshots")
     }
 
+    /// `~/.ccteam/pty/` — V0.3.2 F56 directory holding FIFO files used
+    /// by the web layer's `tmux pipe-pane` relay (one FIFO per active
+    /// `<slug>` or `<slug>-<sid>` subscription). Files are created /
+    /// unlinked at runtime by `ccteam_web::routes::pty_ws`.
+    ///
+    /// **Architectural red line** (CLAUDE.md §三, PRD §F56 §6): this
+    /// directory is a presentation-layer control plane. The
+    /// orchestrator never reads it; `progress.jsonl` remains the
+    /// single source of truth.
+    pub fn pty_dir(&self) -> PathBuf {
+        self.root.join("pty")
+    }
+
     /// `~/.ccteam/harness/` — V0.3.1 F46 dual-write target for the
     /// Claude Code statusline wrapper (and future Codex equivalent).
     /// Each session deposits one `<slug>-<sid>.json` file holding the
