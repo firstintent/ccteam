@@ -14,6 +14,7 @@ use axum::Router;
 use crate::state::AppState;
 
 pub mod actions;
+pub mod api_v1;
 pub mod assets;
 pub mod dashboard;
 pub mod harness_sse;
@@ -40,6 +41,7 @@ pub fn stateful_router() -> Router<AppState> {
         .merge(pane_snapshot::router())
         .merge(screenshot::router())
         .merge(actions::router())
+        .merge(api_v1::router())
 }
 
 /// Stateless routers (currently just `/health`). M5.3 keeps `/health`

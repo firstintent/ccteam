@@ -2174,3 +2174,118 @@ session cookie 有效。理由:
 XSS tradeoff:token 出现在 HTML attribute 而非纯 HttpOnly cookie。
 被 XSS'd 时攻击者本来就能同源 fetch + 自动 cookie,所以 inline 不
 增加 threat surface。
+
+---
+
+## 16. V0.3.2 JSON API v1(F52)
+
+> SPA(F53+)消费的等价 JSON 端点。askama HTML 路径(§15)在 F59
+> 之前保留双发,不变;两者共享 `auth_layer` 中间件(§15.8)。
+
+### 16.1 端点表
+
+| Method | Path | Response | 说明 |
+|---|---|---|---|
+| GET | `/api/v1/projects` | `Vec<DashboardRow>` | dashboard 行的纯 JSON 序列化(§15.2 字段集) |
+| GET | `/api/v1/projects/{slug}` | `ProjectSummary` | §16.2;§15.3 / §15.3.1 数据的 SPA 形态 |
+| GET | `/api/v1/projects/{slug}/sessions/{sid}` | `SessionDetail` | §16.3;flex session detail 数据(`team_kind != flex` ⇒ 404) |
+| GET | `/api/v1/auth/token` | `AuthToken` | §16.4;SPA bootstrap 检查 token 是否需要 |
+
+未知 slug / 非 flex 项目 / 未知 sid ⇒ `404` + `{"error": "<msg>"}`(`Content-Type: application/json`)。
+
+### 16.2 `ProjectSummary`
+
+JSON shape:
+
+```jsonc
+{
+  "slug": "demo",
+  "team": "dev",
+  "kind": "workflow",        // workflow | multi_workflow | flex
+  "is_flex": false,
+  "current_phase": "implement",
+  "badge_class": "badge-ok",
+  "badge_label": "ok",
+  "cost_label": "0.42",      // formatted "{:.2}"
+  "created_at": "2026-05-12T17:08:00+00:00",  // RFC3339
+  "sessions": [],            // SessionCard[] (flex 项目才非空,§15.3.1 字段一致)
+  "state": { ... },          // 完整 ProjectState (serde_json::Value;非 pretty-printed)
+  "events": [ {"ts":"...","event":"PostToolUse","detail":"tool=Edit"}, ... ],
+  "outbox": [ {"filename":"...","kind":"...","created_at":"...","preview":"..."}, ... ],
+  "decision_candidates": ["/absolute/path/decision-x.md", ...]
+}
+```
+
+与 askama [`ProjectTemplate`] 对比的两点差异(故意):
+
+1. `state` 是结构化 JSON,**不是** `state_json_pretty` 字符串。SPA 自决定缩进 / 高亮。
+2. **不含** `auth_enabled` / `auth_wire_token` 字段;token 单独走 §16.4 endpoint,
+   避免在列表 / 详情 JSON 中泄露。
+
+### 16.3 `SessionDetail`
+
+JSON shape(只 flex 项目):
+
+```jsonc
+{
+  "slug": "flex-demo",
+  "sid": "claude-1",
+  "team": "flex",
+  "kind": "flex",
+  "harness": "claude",       // claude | codex
+  "harness_class": "harness-claude",
+  "tmux_session": "ccteam-flex-demo-claude-1",
+  "started_at": "2026-05-12T17:08:00+00:00",
+  "status_class": "badge-ok",
+  "status_label": "ok",
+  "cost_label": "1.23",
+  "events": [...],
+  "outbox": [...],
+  "decision_candidates": [...],
+  "harness_snapshot": {
+    "model": "Claude Opus 4.7",
+    "context_used_pct": "17%",
+    "cost_usd_total": "1.23",
+    "rate_limit_pct": "4%",
+    "captured_at": "2026-05-12T17:08:30+00:00"
+  }
+}
+```
+
+`harness_snapshot` 字段 = `null` 当 `~/.ccteam/harness/<slug>-<sid>.json` 不存在。
+
+### 16.4 `AuthToken`
+
+`GET /api/v1/auth/token`:
+
+```jsonc
+// auth.enabled == false (loopback default):
+{"wire_token": null}
+
+// auth.enabled == true:
+{"wire_token": "ccteam:<hex>"}
+```
+
+SPA 用此值判断是否需要 token-entry flow。auth_layer 仍 gates 此 endpoint;
+浏览器首次访问需走 `?token=ccteam:<hex>` URL-shim cookie 路径(§15.8.2)。
+
+### 16.5 写动作端点(content-type 协商)
+
+§15.7 中 7 条 POST endpoint(`/api/{slug}/{btw,inject_decision,pause,resume}`
++ `/api/{slug}/{sid}/{btw,pause,resume}`)V0.3.2 起接受双 content-type:
+
+| `Content-Type` | 成功响应 | 失败响应 |
+|---|---|---|
+| `application/x-www-form-urlencoded`(默认 / 现有 htmx 路径) | `303 See Other` → `/project/<slug>` 或 `/session/<slug>/<sid>` | 4xx/5xx + 纯文本 body |
+| `application/json` | `200 OK` + `{"ok":true}` | 4xx/5xx + `{"ok":false,"error":"<msg>"}` |
+
+无 `Content-Type` header(pause / resume 旧 form 走 form-encoded 空 body)
+默认走 form 分支,保持现有 htmx 契约。
+
+### 16.6 不破坏的红线
+
+- progress.jsonl 仍是 orchestrator 状态唯一事实来源;JSON API 仅 read +
+  写动作,不解析 / 不回写。
+- token 不出现于 `/api/v1/projects` / `/api/v1/projects/{slug}` /
+  `/api/v1/projects/{slug}/sessions/{sid}` JSON;仅 `/api/v1/auth/token` 暴露。
+- HTML 路径 §15 完全不动;F59 才下线。

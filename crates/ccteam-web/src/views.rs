@@ -10,6 +10,7 @@ use axum::{
     http::StatusCode,
     response::{Html, IntoResponse, Response},
 };
+use serde::Serialize;
 
 /// Wrap an askama template so axum renders it as `text/html` with a
 /// graceful 500 fallback if rendering fails (askama 0.12 returns
@@ -41,6 +42,7 @@ pub struct DashboardTemplate {
     pub projects: Vec<DashboardRow>,
 }
 
+#[derive(Serialize)]
 pub struct DashboardRow {
     pub slug: String,
     pub team: String,
@@ -83,6 +85,7 @@ pub struct ProjectTemplate {
     pub decision_candidates: Vec<String>,
 }
 
+#[derive(Serialize)]
 pub struct SessionCard {
     pub sid: String,
     pub harness: String,
@@ -120,6 +123,7 @@ pub struct SessionTemplate {
     pub harness_snapshot: Option<HarnessSnapshotView>,
 }
 
+#[derive(Serialize)]
 pub struct HarnessSnapshotView {
     pub model: String,
     pub context_used_pct: String,
@@ -128,12 +132,14 @@ pub struct HarnessSnapshotView {
     pub captured_at: String,
 }
 
+#[derive(Serialize)]
 pub struct EventRow {
     pub ts: String,
     pub event: String,
     pub detail: String,
 }
 
+#[derive(Serialize)]
 pub struct OutboxRow {
     pub filename: String,
     pub kind: String,
