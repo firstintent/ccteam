@@ -1,0 +1,29 @@
+# examples/workflows/research-loop.yaml
+# 场景：持续抓取原始数据 → 并行评估提炼 insights → codex 审查 → 报告
+
+name: research-loop
+description: 持续抓取 raw data → 并行评估提炼 insights → codex 审查 → 报告
+
+agents:
+  searcher:
+    executor: claude
+    trigger: manual
+    output: .ccteam/research/
+
+  synthesizer:
+    executor: claude
+    trigger: watch:.ccteam/research/
+    parallelism: 3
+    input: .ccteam/research/
+    output: .ccteam/synthesis/
+
+  reviewer:
+    executor: codex
+    trigger: watch:.ccteam/synthesis/
+    input: .ccteam/synthesis/
+    output: .ccteam/reviews/
+
+  reporter:
+    executor: claude
+    trigger: gate
+    input: .ccteam/reviews/
