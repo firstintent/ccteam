@@ -50,6 +50,15 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc as stdmpsc;
 use std::time::{Duration, Instant};
 
+/// Poll interval inside the watcher's blocking loop. The thread wakes
+/// every interval to check whether the tokio mpsc receiver (held by
+/// the orchestrator) is still alive — i.e. it can see "shutdown" even
+/// while notify is idle. Without this poll, an idle workflow leaves
+/// the watcher thread parked in `recv()` forever, which keeps the
+/// tokio blocking-pool alive and prevents `ccteam start` from exiting
+/// on SIGTERM.
+pub const WATCHER_SHUTDOWN_POLL: Duration = Duration::from_millis(500);
+
 use anyhow::{Context, Result};
 use chrono::{SecondsFormat, Utc};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -263,12 +272,23 @@ impl ArtifactWatcher {
             let mut last_emit: HashMap<(PathBuf, String), Instant> = HashMap::new();
 
             loop {
-                // Block on the std mpsc; recv() returns Err the
-                // moment the notify watcher drops, which is our
-                // shutdown signal.
-                let res = match event_rx.recv() {
+                // Bounded wait so the thread can notice "outbound tokio
+                // mpsc closed" even when notify is idle. Without this,
+                // an idle workflow would park the thread forever on
+                // `recv()`, keeping the tokio blocking pool — and the
+                // whole process — alive past SIGTERM.
+                let res = match event_rx.recv_timeout(WATCHER_SHUTDOWN_POLL) {
                     Ok(v) => v,
-                    Err(_) => break, // watcher dropped → shutdown
+                    Err(stdmpsc::RecvTimeoutError::Timeout) => {
+                        // tokio Sender::is_closed is the cheap check;
+                        // when the orchestrator drops its Receiver the
+                        // channel is marked closed and we exit cleanly.
+                        if tx.is_closed() {
+                            return;
+                        }
+                        continue;
+                    }
+                    Err(stdmpsc::RecvTimeoutError::Disconnected) => break,
                 };
                 let ev = match res {
                     Ok(e) => e,

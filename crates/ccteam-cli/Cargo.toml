@@ -23,5 +23,12 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
 
+# V0.4.0-hotfix — `prctl(PR_SET_PDEATHSIG, SIGTERM)` so mcp-serve
+# self-terminates when its parent (Claude Code MCP client) goes
+# away. Without this, idle stdin doesn't surface EOF and the process
+# accumulates. Linux-only; the wrapper is `#[cfg(target_os = "linux")]`
+# no-op elsewhere.
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"

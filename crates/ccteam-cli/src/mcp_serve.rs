@@ -56,18 +56,43 @@ const SERVER_NAME: &str = "ccteam";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Run `ccteam mcp-serve`. Reads JSON-RPC requests one per line from
-/// stdin; writes responses one per line to stdout. Returns when stdin
-/// closes (clean shutdown when the parent disconnects).
+/// stdin; writes responses one per line to stdout.
+///
+/// Returns when ANY of:
+/// - stdin closes (parent disconnect, normal MCP shutdown)
+/// - SIGTERM (kernel via [`set_pdeathsig_sigterm`] when parent dies, or
+///   explicit `kill -TERM`)
+/// - SIGINT (Ctrl-C in interactive testing)
+///
+/// The signal arm exists because some Claude Code spawn paths leave
+/// stdin attached to /dev/null or a keep-alive pipe, so the
+/// `next_line()` reader never sees EOF when the parent goes away. The
+/// `PR_SET_PDEATHSIG` syscall guarantees the kernel sends us SIGTERM
+/// the instant our parent exits on Linux, regardless of stdin state.
 pub async fn run_mcp_serve(paths: CcteamPaths) -> Result<()> {
+    set_pdeathsig_sigterm();
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin).lines();
     let mut stdout = tokio::io::stdout();
 
-    while let Some(line) = reader
-        .next_line()
-        .await
-        .context("read stdin from MCP client")?
-    {
+    let mut sigterm = signal_stream(SignalKind::terminate());
+    let mut sigint = signal_stream(SignalKind::interrupt());
+
+    loop {
+        let line = tokio::select! {
+            line = reader.next_line() => match line.context("read stdin from MCP client")? {
+                Some(l) => l,
+                None => return Ok(()), // stdin EOF
+            },
+            _ = signal_recv(&mut sigterm) => {
+                tracing::info!("mcp-serve: SIGTERM (parent exited or explicit stop); shutting down");
+                return Ok(());
+            }
+            _ = signal_recv(&mut sigint) => {
+                tracing::info!("mcp-serve: SIGINT; shutting down");
+                return Ok(());
+            }
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -85,7 +110,60 @@ pub async fn run_mcp_serve(paths: CcteamPaths) -> Result<()> {
             write_message(&mut stdout, &response).await?;
         }
     }
-    Ok(())
+}
+
+/// On Linux ask the kernel to send us SIGTERM the moment our parent
+/// process exits. This guarantees mcp-serve doesn't get orphaned and
+/// pile up after a Claude Code session closes — even when stdin EOF
+/// isn't propagated (some daemon-spawn paths inherit /dev/null or a
+/// keep-alive descriptor). No-op on non-Linux platforms.
+#[cfg(target_os = "linux")]
+fn set_pdeathsig_sigterm() {
+    // SAFETY: prctl is a thin syscall wrapper; PR_SET_PDEATHSIG is
+    // documented to take a signal number in arg2 and ignore the rest.
+    // SIGTERM (15) is portable.
+    unsafe {
+        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_pdeathsig_sigterm() {}
+
+#[cfg(unix)]
+type SigStream = tokio::signal::unix::Signal;
+#[cfg(not(unix))]
+type SigStream = ();
+
+#[cfg(unix)]
+use tokio::signal::unix::SignalKind;
+#[cfg(not(unix))]
+struct SignalKind;
+#[cfg(not(unix))]
+impl SignalKind {
+    fn terminate() -> Self {
+        Self
+    }
+    fn interrupt() -> Self {
+        Self
+    }
+}
+
+#[cfg(unix)]
+fn signal_stream(kind: SignalKind) -> SigStream {
+    tokio::signal::unix::signal(kind).expect("install unix signal handler")
+}
+#[cfg(not(unix))]
+fn signal_stream(_: SignalKind) -> SigStream {}
+
+#[cfg(unix)]
+async fn signal_recv(s: &mut SigStream) {
+    let _ = s.recv().await;
+}
+#[cfg(not(unix))]
+async fn signal_recv(_: &mut SigStream) {
+    // On non-unix there's no signal arm; future never resolves.
+    std::future::pending::<()>().await;
 }
 
 /// Dispatch a single JSON-RPC message. Returns `Some(response)` for
