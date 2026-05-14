@@ -1,0 +1,898 @@
+//! V0.4.0 F66 — thin orchestrator integration tests.
+//!
+//! Coverage matrix (20 cases) — see `docs/v0-4-0/dev-plan.md` §8.1 #7.9.
+//!
+//! These tests exercise the new artifact-trigger dispatch loop without
+//! touching tmux: a `MockAdapter` implementing [`HarnessAdapter`] is
+//! swapped in via `Orchestrator::set_adapter`, and synthesised
+//! [`ArtifactEvent`]s are fed through the `test_handle_artifact_event`
+//! hook (gated behind the `test-util` feature).
+//!
+//! Red-line audit:
+//! - No `cargo test`-level dependency on `tmux` / `claude` binaries.
+//! - No `~/.claude/jobs` / `~/.ccteam` writes outside `tempdir()`.
+//! - `progress.jsonl` is asserted as SoT for every dispatch decision
+//!   (tests #11, #18 read it back).
+
+#![cfg(feature = "test-util")]
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use indexmap::IndexMap;
+use serde_json::Value;
+use serial_test::serial;
+use tempfile::TempDir;
+
+use ccteam_core::artifact_watcher::{ArtifactEvent, WatchKind};
+use ccteam_core::harness::{
+    HarnessAdapter, HarnessError, HarnessSnapshot, SessionHandle, SpawnOpts,
+};
+use ccteam_core::orchestrator::{Orchestrator, OrchestratorConfig};
+use ccteam_core::workflow::{AgentSpec, Executor, Trigger, WorkflowSpec};
+use ccteam_core::CcteamPaths;
+
+// =====================================================================
+// MockAdapter
+// =====================================================================
+
+/// Test double — records every `spawn_session` call, returns a fake
+/// [`SessionHandle`]. The next-fail counter lets a test set up "first N
+/// spawns must fail" scenarios for escalation coverage.
+#[derive(Clone, Default)]
+struct MockAdapter {
+    name: &'static str,
+    /// `(slug, sid, executor)` tuples for every successful spawn.
+    spawned: Arc<Mutex<Vec<(String, String, String)>>>,
+    seq: Arc<AtomicU64>,
+    /// Number of remaining forced-failure responses.
+    fail_remaining: Arc<AtomicU64>,
+    /// Track explicit shutdown calls — red-line guard for "never kill
+    /// running session".
+    shutdown_calls: Arc<AtomicU64>,
+}
+
+impl MockAdapter {
+    fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            seq: Arc::new(AtomicU64::new(1)),
+            ..Default::default()
+        }
+    }
+    fn fail_next(&self, n: u64) {
+        self.fail_remaining.store(n, Ordering::SeqCst);
+    }
+    fn spawn_count(&self) -> usize {
+        self.spawned.lock().unwrap().len()
+    }
+    fn shutdown_count(&self) -> u64 {
+        self.shutdown_calls.load(Ordering::SeqCst)
+    }
+}
+
+impl HarnessAdapter for MockAdapter {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+    fn ingest_snapshot(&self, _raw: &str) -> Result<HarnessSnapshot, HarnessError> {
+        Err(HarnessError::IngestFailed("mock".into()))
+    }
+    fn spawn_session(&self, opts: SpawnOpts) -> Result<SessionHandle, HarnessError> {
+        if self.fail_remaining.load(Ordering::SeqCst) > 0 {
+            self.fail_remaining.fetch_sub(1, Ordering::SeqCst);
+            return Err(HarnessError::SpawnFailed("mock fail".into()));
+        }
+        let n = self.seq.fetch_add(1, Ordering::SeqCst);
+        let sid = opts.sid;
+        let exec = match opts.harness {
+            "codex" => "codex",
+            _ => "claude",
+        };
+        self.spawned
+            .lock()
+            .unwrap()
+            .push((opts.slug.clone(), sid.clone(), exec.to_string()));
+        Ok(SessionHandle {
+            tmux_session: format!("mock-{}-{}-{}", opts.slug, exec, n),
+            harness: self.name.to_string(),
+            sid,
+            pid: Some(10_000 + n as u32),
+            started_at: chrono::Utc::now(),
+        })
+    }
+    fn shutdown_session(&self, _handle: &SessionHandle) -> Result<(), HarnessError> {
+        self.shutdown_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+// =====================================================================
+// Fixture helpers
+// =====================================================================
+
+/// Build a temporary `<project>/workflow.yaml` directory tree and
+/// return `(project_dir, paths, progress_path)`. `paths.root` is set to
+/// a fresh tempdir per call so progress jsonl files don't bleed
+/// between tests.
+fn make_project(workflow_yaml: &str) -> (TempDir, TempDir, PathBuf, CcteamPaths, PathBuf, String) {
+    let projects_root = tempfile::tempdir().unwrap();
+    let ccteam_root = tempfile::tempdir().unwrap();
+    let slug = format!(
+        "f66-{}",
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+    );
+    let project_dir = projects_root.path().join(&slug);
+    std::fs::create_dir_all(&project_dir).unwrap();
+    std::fs::write(project_dir.join("workflow.yaml"), workflow_yaml).unwrap();
+
+    let paths = CcteamPaths {
+        root: ccteam_root.path().to_path_buf(),
+        projects_root: projects_root.path().to_path_buf(),
+    };
+    let progress_path = paths.progress_jsonl(&slug);
+    (
+        projects_root,
+        ccteam_root,
+        project_dir,
+        paths,
+        progress_path,
+        slug,
+    )
+}
+
+fn watch_spec(role: &str, watch_rel: &str, parallelism: Option<u32>) -> WorkflowSpec {
+    let mut agents = IndexMap::new();
+    agents.insert(
+        role.into(),
+        AgentSpec {
+            executor: Executor::Claude,
+            trigger: Trigger::Watch(PathBuf::from(watch_rel)),
+            parallelism,
+            input: Some(PathBuf::from(watch_rel)),
+            output: None,
+            interval: None,
+            timeout: None,
+            on_timeout: None,
+        },
+    );
+    WorkflowSpec {
+        name: "test-workflow".into(),
+        description: None,
+        agents,
+    }
+}
+
+fn gate_spec(role: &str, input_rel: &str) -> WorkflowSpec {
+    let mut agents = IndexMap::new();
+    agents.insert(
+        role.into(),
+        AgentSpec {
+            executor: Executor::Claude,
+            trigger: Trigger::Gate,
+            parallelism: None,
+            input: Some(PathBuf::from(input_rel)),
+            output: None,
+            interval: None,
+            timeout: None,
+            on_timeout: None,
+        },
+    );
+    WorkflowSpec {
+        name: "test-gate-workflow".into(),
+        description: None,
+        agents,
+    }
+}
+
+fn read_events(path: &Path) -> Vec<Value> {
+    if !path.exists() {
+        return Vec::new();
+    }
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .collect()
+}
+
+fn build_orchestrator(paths: CcteamPaths) -> (Orchestrator, Arc<MockAdapter>, Arc<MockAdapter>) {
+    let mut orch = Orchestrator::new(paths, OrchestratorConfig::default()).unwrap();
+    let claude_mock = Arc::new(MockAdapter::new("claude-mock"));
+    let codex_mock = Arc::new(MockAdapter::new("codex-mock"));
+    orch.set_adapter(Executor::Claude, claude_mock.clone());
+    orch.set_adapter(Executor::Codex, codex_mock.clone());
+    (orch, claude_mock, codex_mock)
+}
+
+// =====================================================================
+// Tests
+// =====================================================================
+
+const YAML_WATCH_FIXER: &str = "\
+name: test-workflow
+agents:
+  fixer:
+    executor: claude
+    trigger: watch:issues
+    parallelism: 2
+    input: issues
+    output: fixes
+";
+
+const YAML_MANUAL_EXPLORER: &str = "\
+name: test-workflow
+agents:
+  explorer:
+    executor: claude
+    trigger: manual
+    output: issues
+";
+
+const YAML_GATE_SHIPPER: &str = "\
+name: test-gate-workflow
+agents:
+  shipper:
+    executor: claude
+    trigger: gate
+    input: verdicts
+";
+
+#[tokio::test]
+async fn t01_run_project_loads_workflow() {
+    let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_WATCH_FIXER);
+    // Ensure the watch dir exists so the watcher's pre-scan does not
+    // abort. The test only verifies the entry path compiles and the
+    // workflow loads — actual dispatch is covered in later cases.
+    std::fs::create_dir_all(pdir.join("issues")).unwrap();
+
+    let (orch, _claude, _codex) = build_orchestrator(paths);
+    // Run for a short while then drop the future. The watcher parks
+    // forever in stub mode; we just need the loaded-workflow event.
+    let fut = orch.run_project(&slug);
+    let race = tokio::time::timeout(std::time::Duration::from_millis(200), fut).await;
+    // Either the timeout fired (expected — event_loop has nothing to
+    // do) or run_project completed with Ok. Both are pass.
+    let _ = race;
+
+    let progress_path = orch.paths().progress_jsonl(&slug);
+    let events = read_events(&progress_path);
+    assert!(
+        events
+            .iter()
+            .any(|e| e.get("event").and_then(Value::as_str) == Some("workflow_start")),
+        "workflow_start event missing"
+    );
+}
+
+#[tokio::test]
+async fn t02_no_workflow_returns_error() {
+    let projects_root = tempfile::tempdir().unwrap();
+    let ccteam_root = tempfile::tempdir().unwrap();
+    let slug = "no-workflow";
+    std::fs::create_dir_all(projects_root.path().join(slug)).unwrap();
+    let paths = CcteamPaths {
+        root: ccteam_root.path().to_path_buf(),
+        projects_root: projects_root.path().to_path_buf(),
+    };
+    let (orch, _c, _co) = build_orchestrator(paths);
+    let res = orch.run_project(slug).await;
+    assert!(res.is_err(), "expected error when workflow.yaml missing");
+    let msg = format!("{}", res.unwrap_err());
+    assert!(
+        msg.contains("workflow.yaml not found") || msg.contains("not found"),
+        "unexpected error msg: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn t03_dispatch_watch_trigger_on_existing_artifact() {
+    let (_pr, _cr, pdir, paths, _progress, _slug) = make_project(YAML_WATCH_FIXER);
+    std::fs::create_dir_all(pdir.join("issues")).unwrap();
+    std::fs::write(pdir.join("issues/a.md"), "x").unwrap();
+    let (orch, claude, _codex) = build_orchestrator(paths);
+    let spec = watch_spec("fixer", "issues", Some(2));
+    let progress = orch.paths().progress_jsonl("dispatch-test");
+
+    // Simulate the watcher: ArtifactWatcher::new pre-seeds existing
+    // files. We replicate the same path by hand-feeding the event.
+    let evt = ArtifactEvent {
+        role: "fixer".into(),
+        artifact_path: pdir.join("issues/a.md"),
+        event_kind: WatchKind::Created,
+    };
+    orch.test_handle_artifact_event("dispatch-test", &spec, &pdir, &progress, evt)
+        .await
+        .unwrap();
+    assert_eq!(claude.spawn_count(), 1, "pre-existing artifact must spawn");
+}
+
+#[tokio::test]
+async fn t04_artifact_event_spawns_agent() {
+    let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_WATCH_FIXER);
+    let (orch, claude, _codex) = build_orchestrator(paths);
+    let spec = watch_spec("fixer", "issues", Some(2));
+    let progress = orch.paths().progress_jsonl(&slug);
+    let evt = ArtifactEvent {
+        role: "fixer".into(),
+        artifact_path: pdir.join("issues/new.md"),
+        event_kind: WatchKind::Created,
+    };
+    orch.test_handle_artifact_event(&slug, &spec, &pdir, &progress, evt)
+        .await
+        .unwrap();
+    assert_eq!(claude.spawn_count(), 1);
+    let events = read_events(&progress);
+    assert!(events
+        .iter()
+        .any(|e| e.get("event").and_then(Value::as_str) == Some("artifact_received")));
+    assert!(events
+        .iter()
+        .any(|e| e.get("event").and_then(Value::as_str) == Some("agent_spawn")));
+}
+
+#[tokio::test]
+async fn t05_parallelism_limit_respected() {
+    let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_WATCH_FIXER);
+    let (orch, claude, _codex) = build_orchestrator(paths);
+    let spec = watch_spec("fixer", "issues", Some(2));
+    let progress = orch.paths().progress_jsonl(&slug);
+
+    // Three events; parallelism=2 → 3rd must enqueue.
+    for i in 0..3 {
+        let evt = ArtifactEvent {
+            role: "fixer".into(),
+            artifact_path: pdir.join(format!("issues/{i}.md")),
+        event_kind: WatchKind::Created,
+        };
+        orch.test_handle_artifact_event(&slug, &spec, &pdir, &progress, evt)
+            .await
+            .unwrap();
+    }
+    assert_eq!(claude.spawn_count(), 2, "max 2 spawns under parallelism=2");
+    assert_eq!(orch.test_pending_count("fixer").await, 1);
+}
+
+#[tokio::test]
+async fn t06_gate_trigger_fires_on_input_satisfied() {
+    let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_GATE_SHIPPER);
+    std::fs::create_dir_all(pdir.join("verdicts")).unwrap();
+    std::fs::write(pdir.join("verdicts/v1.md"), "ok").unwrap();
+    let (orch, claude, _codex) = build_orchestrator(paths);
+    let spec = gate_spec("shipper", "verdicts");
+    let progress = orch.paths().progress_jsonl(&slug);
+
+    // Initial dispatch puts the gate in Waiting state; poll_completions
+    // (which we exercise via test hook) runs check_gates → release.
+    orch.test_poll_completions(&slug, &spec, &pdir, &progress)
+        .await;
+    assert!(
+        claude.spawn_count() >= 1,
+        "gate must spawn when input dir non-empty"
+    );
+    let events = read_events(&progress);
+    assert!(events
+        .iter()
+        .any(|e| e.get("event").and_then(Value::as_str) == Some("gate_triggered")));
+}
+
+#[tokio::test]
+#[serial]
+async fn t07_budget_exceeded_blocks_spawn() {
+    let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_WATCH_FIXER);
+    // Pin a tiny budget via env so any cost > 0.01 trips it.
+    std::env::set_var("CCTEAM_BUDGET_LIMIT_USD", "0.01");
+    let (orch, claude, _codex) = build_orchestrator(paths);
+    let spec = watch_spec("fixer", "issues", Some(2));
+    let progress = orch.paths().progress_jsonl(&slug);
+    // Pre-write an agent_done with a big cost to push us over.
+    ccteam_core::progress::append_event(
+        &progress,
+        &serde_json::json!({
+            "event": "agent_done",
+            "role": "fixer",
+            "cost_usd": 1.00,
+            "ts": chrono::Utc::now().to_rfc3339(),
+        }),
+    )
+    .unwrap();
+    let evt = ArtifactEvent {
+        role: "fixer".into(),
+        artifact_path: pdir.join("issues/x.md"),
+        event_kind: WatchKind::Created,
+    };
+    orch.test_handle_artifact_event(&slug, &spec, &pdir, &progress, evt)
+        .await
+        .unwrap();
+    std::env::remove_var("CCTEAM_BUDGET_LIMIT_USD");
+    assert_eq!(claude.spawn_count(), 0, "budget must block spawn");
+    let events = read_events(&progress);
+    assert!(events
+        .iter()
+        .any(|e| e.get("event").and_then(Value::as_str) == Some("budget_exceeded")));
+}
+
+#[tokio::test]
+async fn t08_gate_override_file_force_triggers() {
+    let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_GATE_SHIPPER);
+    // Important: no verdicts dir → threshold NOT met. Only the
+    // override file should force the spawn.
+    let (orch, claude, _codex) = build_orchestrator(paths);
+    let spec = gate_spec("shipper", "verdicts");
+    let progress = orch.paths().progress_jsonl(&slug);
+    orch.test_gate_override(&slug, &spec, "shipper", &pdir, &progress)
+        .await
+        .unwrap();
+    assert_eq!(claude.spawn_count(), 1, "override must force spawn");
+    let events = read_events(&progress);
+    let gate_evt = events
+        .iter()
+        .find(|e| e.get("event").and_then(Value::as_str) == Some("gate_triggered"))
+        .expect("gate_triggered missing");
+    assert_eq!(gate_evt.get("forced").and_then(Value::as_bool), Some(true));
+}
+
+#[tokio::test]
+#[serial]
+async fn t09_completed_session_dequeues_pending() {
+    let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_WATCH_FIXER);
+    let state_dir = tempfile::tempdir().unwrap();
+    std::env::set_var("CCTEAM_SESSION_STATE_DIR", state_dir.path());
+    let (orch, claude, _codex) = build_orchestrator(paths);
+    let spec = watch_spec("fixer", "issues", Some(1));
+    let progress = orch.paths().progress_jsonl(&slug);
+
+    // 2 events under parallelism=1 → 1 spawn, 1 pending.
+    for i in 0..2 {
+        let evt = ArtifactEvent {
+            role: "fixer".into(),
+            artifact_path: pdir.join(format!("issues/{i}.md")),
+        event_kind: WatchKind::Created,
+        };
+        orch.test_handle_artifact_event(&slug, &spec, &pdir, &progress, evt)
+            .await
+            .unwrap();
+    }
+    assert_eq!(claude.spawn_count(), 1);
+    assert_eq!(orch.test_pending_count("fixer").await, 1);
+
+    // Drop a state.json marking the running session "completed".
+    let spawned = claude.spawned.lock().unwrap()[0].clone();
+    let sid_dir = state_dir.path().join(&spawned.1);
+    std::fs::create_dir_all(&sid_dir).unwrap();
+    std::fs::write(
+        sid_dir.join("state.json"),
+        r#"{"status":"completed","cost_usd":0.01}"#,
+    )
+    .unwrap();
+
+    orch.test_poll_completions(&slug, &spec, &pdir, &progress)
+        .await;
+    std::env::remove_var("CCTEAM_SESSION_STATE_DIR");
+    assert_eq!(
+        claude.spawn_count(),
+        2,
+        "pending dequeue must trigger second spawn"
+    );
+    assert_eq!(orch.test_pending_count("fixer").await, 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn t10_workflow_done_event_written() {
+    let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_GATE_SHIPPER);
+    let state_dir = tempfile::tempdir().unwrap();
+    std::env::set_var("CCTEAM_SESSION_STATE_DIR", state_dir.path());
+    let (orch, claude, _codex) = build_orchestrator(paths);
+    let spec = gate_spec("shipper", "verdicts");
+    let progress = orch.paths().progress_jsonl(&slug);
+
+    // Force the gate.
+    orch.test_gate_override(&slug, &spec, "shipper", &pdir, &progress)
+        .await
+        .unwrap();
+    assert_eq!(claude.spawn_count(), 1);
+
+    // Mark the spawned session "completed".
+    let sid = claude.spawned.lock().unwrap()[0].1.clone();
+    let sid_dir = state_dir.path().join(&sid);
+    std::fs::create_dir_all(&sid_dir).unwrap();
+    std::fs::write(
+        sid_dir.join("state.json"),
+        r#"{"status":"completed","cost_usd":0.0}"#,
+    )
+    .unwrap();
+
+    orch.test_poll_completions(&slug, &spec, &pdir, &progress)
+        .await;
+    std::env::remove_var("CCTEAM_SESSION_STATE_DIR");
+    let events = read_events(&progress);
+    assert!(
+        events
+            .iter()
+            .any(|e| e.get("event").and_then(Value::as_str) == Some("workflow_done")),
+        "workflow_done event missing after gate completion"
+    );
+}
+
+#[tokio::test]
+async fn t11_progress_jsonl_has_correct_events() {
+    let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_WATCH_FIXER);
+    std::fs::create_dir_all(pdir.join("issues")).unwrap();
+    let (orch, _claude, _codex) = build_orchestrator(paths);
+    let spec = watch_spec("fixer", "issues", Some(1));
+    let progress = orch.paths().progress_jsonl(&slug);
+
+    // Manually write workflow_start (run_project does this) + feed one
+    // artifact_received via test hook.
+    ccteam_core::progress::append_event(
+        &progress,
+        &serde_json::json!({
+            "event": "workflow_start", "workflow": "test-workflow",
+            "slug": slug, "ts": chrono::Utc::now().to_rfc3339(),
+        }),
+    )
+    .unwrap();
+    let evt = ArtifactEvent {
+        role: "fixer".into(),
+        artifact_path: pdir.join("issues/a.md"),
+        event_kind: WatchKind::Created,
+    };
+    orch.test_handle_artifact_event(&slug, &spec, &pdir, &progress, evt)
+        .await
+        .unwrap();
+    let events = read_events(&progress);
+    let kinds: std::collections::HashSet<&str> = events
+        .iter()
+        .filter_map(|e| e.get("event").and_then(Value::as_str))
+        .collect();
+    // At least workflow_start + artifact_received + agent_spawn.
+    assert!(kinds.contains("workflow_start"), "workflow_start missing");
+    assert!(
+        kinds.contains("artifact_received"),
+        "artifact_received missing"
+    );
+    assert!(kinds.contains("agent_spawn"), "agent_spawn missing");
+}
+
+#[tokio::test]
+#[serial]
+async fn t12_budget_preserved_across_restarts() {
+    let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_WATCH_FIXER);
+    let progress = paths.progress_jsonl(&slug);
+    // Persist a heavy cost from a previous "run".
+    ccteam_core::progress::append_event(
+        &progress,
+        &serde_json::json!({
+            "event": "agent_done",
+            "role": "fixer",
+            "cost_usd": 999.0,
+            "ts": chrono::Utc::now().to_rfc3339(),
+        }),
+    )
+    .unwrap();
+    // Fresh orchestrator instance — must respect the prior cost.
+    std::env::set_var("CCTEAM_BUDGET_LIMIT_USD", "100.0");
+    let (orch, claude, _codex) = build_orchestrator(paths);
+    let spec = watch_spec("fixer", "issues", Some(1));
+    let evt = ArtifactEvent {
+        role: "fixer".into(),
+        artifact_path: pdir.join("issues/a.md"),
+        event_kind: WatchKind::Created,
+    };
+    orch.test_handle_artifact_event(&slug, &spec, &pdir, &progress, evt)
+        .await
+        .unwrap();
+    std::env::remove_var("CCTEAM_BUDGET_LIMIT_USD");
+    assert_eq!(
+        claude.spawn_count(),
+        0,
+        "restored cost must block spawn across restarts"
+    );
+}
+
+#[tokio::test]
+async fn t13_orchestrator_new_registers_adapters() {
+    let projects_root = tempfile::tempdir().unwrap();
+    let ccteam_root = tempfile::tempdir().unwrap();
+    let paths = CcteamPaths {
+        root: ccteam_root.path().to_path_buf(),
+        projects_root: projects_root.path().to_path_buf(),
+    };
+    let orch = Orchestrator::new(paths, OrchestratorConfig::default()).unwrap();
+    let keys = orch.test_adapter_keys();
+    assert!(keys.contains(&"claude"), "claude adapter not registered");
+    assert!(keys.contains(&"codex"), "codex adapter not registered");
+}
+
+#[tokio::test]
+#[serial]
+async fn t14_slow_session_completion_no_leak() {
+    // A "slow" session whose state.json never reports done. We verify
+    // running count stays at 1 after multiple polls and that dropping
+    // the orchestrator cleans up without a Mutex panic.
+    let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_WATCH_FIXER);
+    let state_dir = tempfile::tempdir().unwrap();
+    std::env::set_var("CCTEAM_SESSION_STATE_DIR", state_dir.path());
+    let (orch, claude, _codex) = build_orchestrator(paths);
+    let spec = watch_spec("fixer", "issues", Some(2));
+    let progress = orch.paths().progress_jsonl(&slug);
+    let evt = ArtifactEvent {
+        role: "fixer".into(),
+        artifact_path: pdir.join("issues/a.md"),
+        event_kind: WatchKind::Created,
+    };
+    orch.test_handle_artifact_event(&slug, &spec, &pdir, &progress, evt)
+        .await
+        .unwrap();
+    assert_eq!(claude.spawn_count(), 1);
+    for _ in 0..3 {
+        orch.test_poll_completions(&slug, &spec, &pdir, &progress)
+            .await;
+    }
+    assert_eq!(
+        orch.test_running_count("fixer").await,
+        1,
+        "no leak — slow session stays accounted for"
+    );
+    std::env::remove_var("CCTEAM_SESSION_STATE_DIR");
+    drop(orch); // implicit RAII drop should not panic
+}
+
+#[tokio::test]
+async fn t15_manual_trigger_not_auto_spawned() {
+    let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_MANUAL_EXPLORER);
+    let (orch, claude, _codex) = build_orchestrator(paths);
+    // Use run_project's dispatch_initial_triggers path — manual trigger
+    // must not spawn.
+    let fut = orch.run_project(&slug);
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(200), fut).await;
+    assert_eq!(
+        claude.spawn_count(),
+        0,
+        "manual trigger must NOT auto-spawn"
+    );
+    let _ = pdir;
+}
+
+#[tokio::test]
+async fn t16_multiple_watch_agents_independent() {
+    let yaml = "\
+name: multi
+agents:
+  agentA:
+    executor: claude
+    trigger: watch:dirA
+    parallelism: 1
+    input: dirA
+  agentB:
+    executor: claude
+    trigger: watch:dirB
+    parallelism: 1
+    input: dirB
+";
+    let (_pr, _cr, pdir, paths, _progress, slug) = make_project(yaml);
+    let (orch, claude, _codex) = build_orchestrator(paths);
+    let mut agents = IndexMap::new();
+    agents.insert(
+        "agentA".into(),
+        AgentSpec {
+            executor: Executor::Claude,
+            trigger: Trigger::Watch(PathBuf::from("dirA")),
+            parallelism: Some(1),
+            input: Some(PathBuf::from("dirA")),
+            output: None,
+            interval: None,
+            timeout: None,
+            on_timeout: None,
+        },
+    );
+    agents.insert(
+        "agentB".into(),
+        AgentSpec {
+            executor: Executor::Claude,
+            trigger: Trigger::Watch(PathBuf::from("dirB")),
+            parallelism: Some(1),
+            input: Some(PathBuf::from("dirB")),
+            output: None,
+            interval: None,
+            timeout: None,
+            on_timeout: None,
+        },
+    );
+    let spec = WorkflowSpec {
+        name: "multi".into(),
+        description: None,
+        agents,
+    };
+    let progress = orch.paths().progress_jsonl(&slug);
+    orch.test_handle_artifact_event(
+        &slug,
+        &spec,
+        &pdir,
+        &progress,
+        ArtifactEvent {
+            role: "agentA".into(),
+            artifact_path: pdir.join("dirA/a.md"),
+        event_kind: WatchKind::Created,
+        },
+    )
+    .await
+    .unwrap();
+    orch.test_handle_artifact_event(
+        &slug,
+        &spec,
+        &pdir,
+        &progress,
+        ArtifactEvent {
+            role: "agentB".into(),
+            artifact_path: pdir.join("dirB/b.md"),
+        event_kind: WatchKind::Created,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(orch.test_running_count("agentA").await, 1);
+    assert_eq!(orch.test_running_count("agentB").await, 1);
+    assert_eq!(claude.spawn_count(), 2);
+}
+
+#[tokio::test]
+#[serial]
+async fn t17_pending_queue_fifo() {
+    let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_WATCH_FIXER);
+    let state_dir = tempfile::tempdir().unwrap();
+    std::env::set_var("CCTEAM_SESSION_STATE_DIR", state_dir.path());
+    let (orch, claude, _codex) = build_orchestrator(paths);
+    let spec = watch_spec("fixer", "issues", Some(1));
+    let progress = orch.paths().progress_jsonl(&slug);
+
+    for i in 0..3 {
+        let evt = ArtifactEvent {
+            role: "fixer".into(),
+            artifact_path: pdir.join(format!("issues/{i}.md")),
+        event_kind: WatchKind::Created,
+        };
+        orch.test_handle_artifact_event(&slug, &spec, &pdir, &progress, evt)
+            .await
+            .unwrap();
+    }
+    assert_eq!(claude.spawn_count(), 1);
+    assert_eq!(orch.test_pending_count("fixer").await, 2);
+
+    // Complete each session in turn, expect FIFO dispatch.
+    for n in 0..2u32 {
+        let sid = claude.spawned.lock().unwrap()[n as usize].1.clone();
+        let sid_dir = state_dir.path().join(&sid);
+        std::fs::create_dir_all(&sid_dir).unwrap();
+        std::fs::write(
+            sid_dir.join("state.json"),
+            r#"{"status":"completed","cost_usd":0.0}"#,
+        )
+        .unwrap();
+        orch.test_poll_completions(&slug, &spec, &pdir, &progress)
+            .await;
+    }
+    std::env::remove_var("CCTEAM_SESSION_STATE_DIR");
+    assert_eq!(claude.spawn_count(), 3, "all queued must spawn in order");
+    assert_eq!(orch.test_pending_count("fixer").await, 0);
+}
+
+#[tokio::test]
+async fn t18_session_error_writes_escalation_event() {
+    let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_WATCH_FIXER);
+    let (orch, claude, _codex) = build_orchestrator(paths);
+    claude.fail_next(1);
+    let spec = watch_spec("fixer", "issues", Some(2));
+    let progress = orch.paths().progress_jsonl(&slug);
+    let evt = ArtifactEvent {
+        role: "fixer".into(),
+        artifact_path: pdir.join("issues/a.md"),
+        event_kind: WatchKind::Created,
+    };
+    orch.test_handle_artifact_event(&slug, &spec, &pdir, &progress, evt)
+        .await
+        .unwrap();
+    assert_eq!(
+        claude.spawn_count(),
+        0,
+        "the single attempt failed; no successful spawn"
+    );
+    let events = read_events(&progress);
+    assert!(events.iter().any(|e| {
+        e.get("event").and_then(Value::as_str) == Some("escalation")
+            && e.get("kind").and_then(Value::as_str) == Some("spawn_failed")
+    }));
+    assert_eq!(orch.test_fail_count("fixer").await, 1);
+}
+
+#[tokio::test]
+async fn t19_escalation_on_3_consecutive_failures() {
+    let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_WATCH_FIXER);
+    let (orch, claude, _codex) = build_orchestrator(paths);
+    claude.fail_next(3);
+    let spec = watch_spec("fixer", "issues", Some(5));
+    let progress = orch.paths().progress_jsonl(&slug);
+    for i in 0..3 {
+        let evt = ArtifactEvent {
+            role: "fixer".into(),
+            artifact_path: pdir.join(format!("issues/{i}.md")),
+        event_kind: WatchKind::Created,
+        };
+        orch.test_handle_artifact_event(&slug, &spec, &pdir, &progress, evt)
+            .await
+            .unwrap();
+    }
+    assert_eq!(claude.spawn_count(), 0);
+    assert_eq!(orch.test_fail_count("fixer").await, 3);
+    // Escalation should have landed in ~/.ccteam/inbox/.
+    let inbox = orch.paths().inbox_dir();
+    let mut found = false;
+    if let Ok(rd) = std::fs::read_dir(&inbox) {
+        for entry in rd.flatten() {
+            let body = std::fs::read_to_string(entry.path()).unwrap_or_default();
+            if body.contains("fixer") && body.contains("3 consecutive") {
+                found = true;
+                break;
+            }
+        }
+    }
+    assert!(found, "expected btw escalation file in {:?}", inbox);
+}
+
+#[tokio::test]
+#[serial]
+async fn t20_meta_agent_not_killed() {
+    // The orchestrator never calls shutdown_session on its own
+    // dispatch path. We register a fake running session (mimicking a
+    // meta-agent) and run every codepath that could touch it.
+    let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_WATCH_FIXER);
+    let (orch, claude, _codex) = build_orchestrator(paths);
+    orch.test_register_running(
+        "meta-agent",
+        SessionHandle {
+            tmux_session: "ccteam-meta".into(),
+            harness: "claude-code".into(),
+            sid: "meta-1".into(),
+            pid: Some(1234),
+            started_at: chrono::Utc::now(),
+        },
+    )
+    .await;
+    let spec = watch_spec("fixer", "issues", Some(2));
+    let progress = orch.paths().progress_jsonl(&slug);
+
+    // Send a budget-exceeding event then several artifact events; none
+    // of these should result in a shutdown_session call.
+    std::env::set_var("CCTEAM_BUDGET_LIMIT_USD", "0.001");
+    ccteam_core::progress::append_event(
+        &progress,
+        &serde_json::json!({
+            "event": "agent_done", "role": "fixer", "cost_usd": 1.0,
+            "ts": chrono::Utc::now().to_rfc3339(),
+        }),
+    )
+    .unwrap();
+    for i in 0..3 {
+        let evt = ArtifactEvent {
+            role: "fixer".into(),
+            artifact_path: pdir.join(format!("issues/{i}.md")),
+        event_kind: WatchKind::Created,
+        };
+        orch.test_handle_artifact_event(&slug, &spec, &pdir, &progress, evt)
+            .await
+            .unwrap();
+    }
+    orch.test_poll_completions(&slug, &spec, &pdir, &progress)
+        .await;
+    std::env::remove_var("CCTEAM_BUDGET_LIMIT_USD");
+    assert_eq!(
+        claude.shutdown_count(),
+        0,
+        "orchestrator must NOT call shutdown_session (meta-agent kill red line)"
+    );
+    // The meta-agent fake session is still on the books.
+    assert_eq!(orch.test_running_count("meta-agent").await, 1);
+}

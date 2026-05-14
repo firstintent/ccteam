@@ -45,10 +45,22 @@ tempfile = "3"
 serial_test = "3"
 
 [features]
-default = []
+default = ["test-util"]
 # V0.4.0 F62 — gates CodexAdapter integration tests
 # (`crates/ccteam-core/tests/codex_adapter_test.rs`). The tests require
 # `tmux` on PATH and exercise the real `codex` CLI when present.
 # Default feature set excludes them so CI without those binaries still
 # passes; opt in with `cargo test --features codex-tests`.
 codex-tests = []
+# V0.4.0 F66 — exposes Orchestrator's `test_*` helper methods + the
+# `Orchestrator::set_adapter` + ArtifactWatcher `test_sender` to crates
+# outside the library (notably the integration test crate). The methods
+# already exist behind `#[cfg(test)]` for in-crate unit tests; this
+# feature lets `tests/orchestrator_thin_test.rs` (which compiles as a
+# separate crate target) reach the same surface without a separate
+# parallel implementation. Default-on so `cargo test --workspace`
+# (without `--features` flags) picks up the F66 thin-orchestrator suite;
+# the binary surface only adds methods prefixed with `test_` (plus
+# `Orchestrator::set_adapter`), all of which are no-op in production
+# code paths.
+test-util = []
