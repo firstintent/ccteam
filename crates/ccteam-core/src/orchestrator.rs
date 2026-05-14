@@ -273,6 +273,8 @@ impl Orchestrator {
                 },
                 _ = ticker.tick() => {
                     self.poll_completions(slug, spec, project_dir, progress_path).await;
+                    self.check_spawn_requests(slug, spec, project_dir, progress_path).await;
+                    self.check_gates(slug, spec, project_dir, progress_path).await;
                     self.check_workflow_done(slug, spec, progress_path).await;
                 }
             }
@@ -532,6 +534,95 @@ impl Orchestrator {
 
         self.check_gates(slug, spec, project_dir, progress_path)
             .await;
+    }
+
+    /// Scan `.ccteam/spawn_requests/*.json` markers written by the F65
+    /// `ccteam__spawn_agent` MCP tool (or hand-written by users via the
+    /// migration-guide path). Each marker JSON carries `{"role": "...",
+    /// ...}`; orchestrator spawns the role and deletes the marker on
+    /// success. Failed spawns retain the marker for the next tick so
+    /// transient errors auto-retry (subject to fix-loop 3-strike
+    /// escalate per `bump_fail_count`).
+    ///
+    /// This is the V0.4.0 wiring for `Trigger::Manual` / `Trigger::Schedule`
+    /// agents — they have no natural fire path otherwise. `Trigger::Gate`
+    /// still goes through `check_gates`, and `Trigger::Watch` through the
+    /// inotify-driven `handle_artifact_event`. Manual roles are spawned
+    /// regardless of trigger kind once a marker shows up (lets users
+    /// force-fire any role for debug / replay).
+    async fn check_spawn_requests(
+        &self,
+        slug: &str,
+        spec: &WorkflowSpec,
+        project_dir: &std::path::Path,
+        progress_path: &std::path::Path,
+    ) {
+        let bucket = project_dir.join(".ccteam").join("spawn_requests");
+        let Ok(entries) = std::fs::read_dir(&bucket) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let role = match std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|v| v.get("role").and_then(|r| r.as_str()).map(String::from))
+            {
+                Some(r) => r,
+                None => {
+                    tracing::warn!(
+                        marker = ?path,
+                        "spawn_request missing `role` field; deleting"
+                    );
+                    let _ = std::fs::remove_file(&path);
+                    continue;
+                }
+            };
+            let Some(agent) = spec.agents.get(&role) else {
+                tracing::warn!(role, "spawn_request for unknown role; deleting");
+                let _ = std::fs::remove_file(&path);
+                continue;
+            };
+            // `try_spawn` swallows spawn errors internally (bumps
+            // fail_count + logs) and returns Ok(()), so we sample the
+            // fail counter to decide whether the marker should be kept
+            // for next-tick retry. The marker is deleted ONLY when a
+            // session actually came up; transient errors retain it.
+            let before = self
+                .fail_counts
+                .lock()
+                .await
+                .get(&role)
+                .copied()
+                .unwrap_or(0);
+            if let Err(err) = self
+                .try_spawn(slug, &role, agent, project_dir, progress_path)
+                .await
+            {
+                tracing::warn!(role, error = ?err, "spawn_request errored");
+                continue;
+            }
+            let after = self
+                .fail_counts
+                .lock()
+                .await
+                .get(&role)
+                .copied()
+                .unwrap_or(0);
+            if after > before {
+                tracing::warn!(
+                    role,
+                    "spawn_request retained for retry (fail_count {} → {})",
+                    before,
+                    after
+                );
+                continue;
+            }
+            let _ = std::fs::remove_file(&path);
+        }
     }
 
     /// Release a `Trigger::Gate` agent when its input dir has ≥1 file
@@ -810,6 +901,17 @@ impl Orchestrator {
         self.poll_completions(slug, spec, project_dir, progress_path)
             .await;
         self.check_workflow_done(slug, spec, progress_path).await;
+    }
+
+    pub async fn test_check_spawn_requests(
+        &self,
+        slug: &str,
+        spec: &WorkflowSpec,
+        project_dir: &std::path::Path,
+        progress_path: &std::path::Path,
+    ) {
+        self.check_spawn_requests(slug, spec, project_dir, progress_path)
+            .await;
     }
 
     pub async fn test_gate_override(

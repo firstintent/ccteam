@@ -165,6 +165,28 @@ fn watch_spec(role: &str, watch_rel: &str, parallelism: Option<u32>) -> Workflow
     }
 }
 
+fn manual_spec(role: &str) -> WorkflowSpec {
+    let mut agents = IndexMap::new();
+    agents.insert(
+        role.into(),
+        AgentSpec {
+            executor: Executor::Claude,
+            trigger: Trigger::Manual,
+            parallelism: None,
+            input: None,
+            output: None,
+            interval: None,
+            timeout: None,
+            on_timeout: None,
+        },
+    );
+    WorkflowSpec {
+        name: "test-manual-workflow".into(),
+        description: None,
+        agents,
+    }
+}
+
 fn gate_spec(role: &str, input_rel: &str) -> WorkflowSpec {
     let mut agents = IndexMap::new();
     agents.insert(
@@ -897,4 +919,114 @@ async fn t20_meta_agent_not_killed() {
     );
     // The meta-agent fake session is still on the books.
     assert_eq!(orch.test_running_count("meta-agent").await, 1);
+}
+
+// =====================================================================
+// V0.4.0-hotfix — spawn_requests marker consumer
+// =====================================================================
+
+const YAML_MANUAL_SPEC: &str = "\
+name: manual-test
+agents:
+  explorer:
+    executor: claude
+    trigger: manual
+";
+
+#[tokio::test]
+async fn t21_spawn_requests_marker_fires_manual_role() {
+    let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_MANUAL_SPEC);
+    let (orch, claude, _codex) = build_orchestrator(paths);
+    let spec = manual_spec("explorer");
+    let progress = orch.paths().progress_jsonl(&slug);
+
+    // User-side: write spawn_requests marker (mirrors F65
+    // `ccteam__spawn_agent` MCP tool or hand-written migration-guide path).
+    let bucket = pdir.join(".ccteam").join("spawn_requests");
+    std::fs::create_dir_all(&bucket).unwrap();
+    let marker = bucket.join("explorer-test.json");
+    std::fs::write(
+        &marker,
+        r#"{"role":"explorer","session_id":"explorer-test","requested_at":"2026-05-14T13:00:00Z","overrides":{}}"#,
+    )
+    .unwrap();
+
+    // Tick consumes the marker.
+    orch.test_check_spawn_requests(&slug, &spec, &pdir, &progress)
+        .await;
+
+    assert_eq!(claude.spawn_count(), 1, "marker must trigger spawn");
+    assert!(!marker.exists(), "successful spawn must delete the marker");
+}
+
+#[tokio::test]
+async fn t22_spawn_requests_unknown_role_deletes_marker() {
+    let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_MANUAL_SPEC);
+    let (orch, claude, _codex) = build_orchestrator(paths);
+    let spec = manual_spec("explorer");
+    let progress = orch.paths().progress_jsonl(&slug);
+
+    let bucket = pdir.join(".ccteam").join("spawn_requests");
+    std::fs::create_dir_all(&bucket).unwrap();
+    let marker = bucket.join("ghost.json");
+    std::fs::write(&marker, r#"{"role":"ghost","session_id":"ghost-x"}"#).unwrap();
+
+    orch.test_check_spawn_requests(&slug, &spec, &pdir, &progress)
+        .await;
+
+    assert_eq!(claude.spawn_count(), 0, "unknown role must not spawn");
+    assert!(!marker.exists(), "unknown role marker must be deleted");
+}
+
+#[tokio::test]
+async fn t23_spawn_requests_malformed_marker_deletes() {
+    let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_MANUAL_SPEC);
+    let (orch, claude, _codex) = build_orchestrator(paths);
+    let spec = manual_spec("explorer");
+    let progress = orch.paths().progress_jsonl(&slug);
+
+    let bucket = pdir.join(".ccteam").join("spawn_requests");
+    std::fs::create_dir_all(&bucket).unwrap();
+    let marker = bucket.join("bad.json");
+    std::fs::write(&marker, r#"{"no_role_field": true}"#).unwrap();
+
+    orch.test_check_spawn_requests(&slug, &spec, &pdir, &progress)
+        .await;
+
+    assert_eq!(claude.spawn_count(), 0);
+    assert!(!marker.exists(), "malformed marker must be deleted");
+}
+
+#[tokio::test]
+#[serial]
+async fn t24_spawn_requests_failed_spawn_retains_marker() {
+    let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_MANUAL_SPEC);
+    let (orch, claude, _codex) = build_orchestrator(paths);
+    let spec = manual_spec("explorer");
+    let progress = orch.paths().progress_jsonl(&slug);
+
+    let bucket = pdir.join(".ccteam").join("spawn_requests");
+    std::fs::create_dir_all(&bucket).unwrap();
+    let marker = bucket.join("explorer-retry.json");
+    std::fs::write(
+        &marker,
+        r#"{"role":"explorer","session_id":"explorer-retry"}"#,
+    )
+    .unwrap();
+
+    claude.fail_next(1);
+    orch.test_check_spawn_requests(&slug, &spec, &pdir, &progress)
+        .await;
+
+    assert_eq!(claude.spawn_count(), 0, "first spawn forced to fail");
+    assert!(
+        marker.exists(),
+        "failed spawn must retain marker for next-tick retry"
+    );
+
+    // Next tick succeeds.
+    orch.test_check_spawn_requests(&slug, &spec, &pdir, &progress)
+        .await;
+    assert_eq!(claude.spawn_count(), 1, "retry must spawn");
+    assert!(!marker.exists(), "successful retry must delete marker");
 }

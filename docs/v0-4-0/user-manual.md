@@ -90,22 +90,50 @@ ccteam web --bind 127.0.0.1:7331
 - Gate 状态 + 解锁按钮
 - progress.jsonl 实时流（SSE）
 
-### 第 5 步：触发首轮
+### 第 5 步:触发首轮
 
 V0.4.0 没有 `ccteam ctl ...` CLI。手动触发的两条路径:
 
+#### Path A:meta-agent(推荐)
+
+一次性安装(全局,只跑一次):
+
 ```bash
-# A. 通过 meta-agent session(推荐) — 在 meta-agent 的 claude session 里说自然语言:
-#    "现在跑一轮 explorer,让它探索登录页的 UI 问题"
-#    meta-agent 会调 mcp__ccteam__ccteam__spawn_agent 工具。
-#
-# B. 直接写 marker 文件让 orchestrator 下一 tick 接走:
-mkdir -p .ccteam/spawn_requests
-cat > .ccteam/spawn_requests/explorer-$(date +%s).json <<'JSON'
-{ "role": "explorer", "ts": "$(date -u +%FT%TZ)" }
-JSON
-# orchestrator 5s 内扫到 → 调 spawn_session → 删 marker
+ccteam doctor --install-mcp        # 注册 ccteam MCP server 到 ~/.claude.json
+ccteam doctor --install-skill      # 安装 ccteam-control skill 到 ~/.claude/skills/
 ```
+
+之后**任何 claude session 都能看到 ccteam 的 17 个 MCP 工具**。开一个新
+claude session(或现有 session)直接说自然语言:
+
+> "现在跑一轮 explorer,让它探索登录页的 UI 问题"
+
+claude 会自动调 `mcp__ccteam__ccteam__spawn_agent` 工具 → orchestrator
+下一 tick(默认 5 s)看到 marker → 调 spawn_session。
+
+可选:专门的 meta-agent 项目(常驻 session,有项目上下文记忆):
+
+```bash
+ccteam doctor --install-meta-agent rob   # 把 rob 换成你的 handle
+# → 在 ~/projects/meta-rob/ 创建一个常驻 meta-agent 项目
+cd ~/projects/meta-rob
+claude   # 进 meta-agent session
+```
+
+#### Path B:直接写 marker 文件
+
+orchestrator 每 tick 扫 `.ccteam/spawn_requests/` 目录,carry `role`
+字段的 JSON 文件都会被 spawn:
+
+```bash
+mkdir -p .ccteam/spawn_requests
+echo '{"role":"explorer"}' > .ccteam/spawn_requests/explorer-$(date +%s).json
+# orchestrator 5s 内看到 → 调 spawn_session → 删 marker
+# 失败保留 marker 下一 tick 重试(3 次顶 escalate 到 meta-agent inbox)
+```
+
+只需 `role` 字段;`session_id` / `requested_at` / `overrides` 由 F65
+MCP 工具自动填,手写时省略也行。
 
 之后整个 workflow 自动运转:explorer → 写 issues → watcher 触发 fixer ×
 N(并行)→ 写 fixes → 触发 reviewer → 写 verdicts。
@@ -368,13 +396,18 @@ watch trigger 下的 `parallelism: N` 字段是**初始默认值**。运行时�
 # A. Meta-agent 调(推荐)
 mcp__ccteam__ccteam__set_parallelism(slug="<slug>", role="fixer", parallelism=5)
 
-# B. 直接写 override 文件
+# B. 直接写 override 文件(V0.4.1 才有热读 consumer — V0.4.0 暂只能重启
+#    orchestrator 让新值生效;markers 会保留供 V0.4.1 接走)
 mkdir -p ~/projects/<slug>/.ccteam
-cat > ~/projects/<slug>/.ccteam/workflow_overrides.json <<'JSON'
-{ "fixer": { "parallelism": 5 } }
-JSON
-# orchestrator 每 tick 热读该文件,合并到 in-memory parallelism map
+echo '{"fixer": {"parallelism": 5}}' \
+  > ~/projects/<slug>/.ccteam/workflow_overrides.json
 ```
+
+> ⚠️ V0.4.0 已实现 `spawn_requests` + `gate_override` 两个 marker bucket 的
+> consumer(F66 + V0.4.0 hotfix)。其余 marker bucket(`workflow_overrides.json`
+> 热读、`signal/<role>_<sid>` SIGSTOP/SIGCONT、`stop_signal/<role>_<sid>`
+> 软停)是 F65 写、F66 还没接的 — V0.4.1 P0 候选。当前只能通过 `ccteam stop`
+> + 改 `workflow.yaml::parallelism` 字段 + `ccteam start` 重启来调。
 
 降速场景：
 
@@ -405,6 +438,28 @@ ccteam 跟踪每个项目累计 cost(聚合 `progress.jsonl` 的 `agent_done.cos
    - 或降 parallelism + 等已跑 session 完成(见 §8)
    - 或停 daemon:`ccteam stop`(SIGTERM 通过 pidfile,**不杀 session**,
      restart 时 `ccteam start` 重新挂载)
+
+---
+
+## 9.5 V0.4.0 V0.3.x inbox 行为变化
+
+V0.3.x 中 `mcp__ccteam__ccteam__send_to_session` / `inject_decision` 等工具
+向 `<project>/.ccteam/inbox/*.md` 写消息,daemon 通过 `/btw` send-keys
+注入到 tmux 中正在跑的 claude session。**V0.4.0 没有这条路径**:
+
+- `claude --bg --agent` 启动的 session 是一次性的(spawn → run → exit),
+  没有"持续运行接收消息"的语义
+- 写入 `<project>/.ccteam/inbox/*.md` 在 V0.4.0 **没有 consumer**,文件
+  会累积但不会触发任何事情(无日志、无 error)
+- meta-agent 用 `ccteam__signal` 工具发的 btw 也会落到 inbox,V0.4.0
+  同样无效
+
+V0.4.0 等价做法:**briefing 写到 `.claude/agents/<role>.md` 里**,新一轮
+spawn 会读到。要给 in-flight session 实时反馈 → 设计成一个新 role 用
+`watch:` 监听某个 artifact dir,从那里推送上下文。
+
+V0.4.1 候选:让 `inbox/*.md` 在下一次 spawn 同 role 时作为 stdin 注入到
+新 session(自动作为 briefing 的一部分)。
 
 ---
 
