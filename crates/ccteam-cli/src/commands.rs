@@ -2619,7 +2619,15 @@ mod tests {
         std::fs::write(&path, "USER EDIT").unwrap();
         run_init(&paths, InitOptions::default()).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "USER EDIT");
-        run_init(&paths, InitOptions { force: true }).unwrap();
+        run_init(
+            &paths,
+            InitOptions {
+                force: true,
+                interactive: false,
+                yes: false,
+            },
+        )
+        .unwrap();
         assert_ne!(std::fs::read_to_string(&path).unwrap(), "USER EDIT");
     }
 
@@ -2698,9 +2706,10 @@ mod tests {
 
     #[test]
     fn run_doctor_install_meta_agent_creates_project_and_skill() {
-        // M1.0 + M1.8 combo: --install-meta-agent <handle> implies
+        // M1.0 + M1.8 combo: --install-meta-agent implies
         // --install-skill, so a single invocation gets the user a
-        // ready-to-attach session.
+        // ready-to-attach session. V0.4.1: handle dropped — one ccteam
+        // install ⇒ one meta-agent at canonical `meta/`.
         ensure_isolation();
         let _guard = env_lock().lock().unwrap();
         let tmp = TempDir::new().unwrap();
@@ -2710,7 +2719,7 @@ mod tests {
         std::env::set_var("CLAUDE_CONFIG_HOME", tmp.path().to_str().unwrap());
 
         let opts = DoctorOptions {
-            install_meta_agent: Some("rob".into()),
+            install_meta_agent: true,
             ..DoctorOptions::default()
         };
         let report = run_doctor(&paths, opts).unwrap();
@@ -2722,14 +2731,14 @@ mod tests {
             report.contains("install-meta-agent"),
             "meta install report missing"
         );
-        assert!(report.contains("meta-rob"), "meta slug should be reported");
+        assert!(report.contains("meta"), "meta slug should be reported");
 
-        // Project directory exists.
-        assert!(paths.project_dir("meta-rob").is_dir());
-        let state = ProjectState::load(&paths.project_state("meta-rob")).unwrap();
+        // Project directory exists at canonical V0.4.1 path.
+        assert!(paths.project_dir("meta").is_dir());
+        let state = ProjectState::load(&paths.project_state("meta")).unwrap();
         assert_eq!(state.team, "meta-agent");
-        assert_eq!(state.slug, "meta-rob");
-        assert_eq!(state.tmux_session, "ccteam-meta-rob");
+        assert_eq!(state.slug, "meta");
+        assert_eq!(state.tmux_session, "ccteam-meta");
 
         // Skill landed under the redirected ~/.claude/. F44 reverts F39:
         // both shipped skills are written under canonical ccteam-* names.
@@ -3165,7 +3174,7 @@ mod tests {
         let paths = fresh_paths(&tmp);
         std::fs::create_dir_all(&paths.projects_root).unwrap();
         ccteam_core::write_heartbeat(&paths).unwrap();
-        let out = run_watchdog_scan(&paths, OutputFormat::Text, None).unwrap();
+        let out = run_watchdog_scan(&paths, OutputFormat::Text, false).unwrap();
         assert!(out.contains("no alerts"), "got: {out}");
     }
 
@@ -3175,7 +3184,7 @@ mod tests {
         let paths = fresh_paths(&tmp);
         std::fs::create_dir_all(&paths.projects_root).unwrap();
         // Heartbeat absent ⇒ daemon_down alert.
-        let out = run_watchdog_scan(&paths, OutputFormat::Json, None).unwrap();
+        let out = run_watchdog_scan(&paths, OutputFormat::Json, false).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
         let alerts = parsed["alerts"].as_array().unwrap();
         assert_eq!(alerts.len(), 1);

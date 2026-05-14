@@ -138,19 +138,20 @@ fn session_add_help_advertises_harness_flag() {
 
 #[test]
 fn session_add_claude_spawns_bg_job_and_records_state() {
-    // V0.4.0 F61: ClaudeCodeAdapter no longer spawns tmux — it invokes
-    // `claude --bg --agent <role>` as a child process and parses
-    // `job_id` from the first stdout line. The fake `claude` binary
-    // mimics that contract: print a job_id JSON line and exit 0. The
-    // adapter calls `Command::output()` so the child MUST terminate,
-    // otherwise the spawn step hangs forever.
+    // V0.4.0 F61 + V0.4.0 hotfix 441675f: ClaudeCodeAdapter invokes
+    // `claude --bg --agent <role>` as a child process and parses the
+    // job id from a `backgrounded · <id>` stdout line (the real CLI
+    // shape — see `parse_backgrounded_short_id` in harness.rs). The
+    // fake `claude` binary mirrors that contract. The adapter calls
+    // `Command::output()` so the child MUST terminate, otherwise the
+    // spawn step hangs forever.
     let fx = Fixture::new_empty_flex();
     let fake_bin = fx._tmp.path().join("bin");
     std::fs::create_dir_all(&fake_bin).unwrap();
     let fake_claude = fake_bin.join("claude");
     std::fs::write(
         &fake_claude,
-        "#!/bin/sh\nprintf '{\"job_id\":\"job-fixture-1\"}\\n'\nexit 0\n",
+        "#!/bin/sh\nprintf 'backgrounded · job-fixture-1\\n'\nexit 0\n",
     )
     .unwrap();
     #[cfg(unix)]
