@@ -62,18 +62,71 @@ pub fn render_meta_role_prompt() -> String {
         .replace("__GENERATED_AT__", &now)
 }
 
+/// Sweep `paths.projects_root` for legacy V0.1-V0.4.0 meta layouts
+/// (`meta-<handle>/`, e.g. `meta-rob`, `meta-cto`) and remove them.
+///
+/// Marker-checked: only deletes a directory if its `state.json::team`
+/// equals [`META_TEAM_NAME`]. Random user dirs that happen to start
+/// with `meta-` are left alone. The canonical `meta/` directory is
+/// never touched. Returns the removed paths so callers can surface a
+/// summary line.
+///
+/// Per CLAUDE.md §三 we don't kill any tmux sessions named after the
+/// removed layout (e.g. `ccteam-meta-cto`) — those are still owned by
+/// the user and will become orphaned but harmless after this sweep.
+pub fn clean_stale_meta_layouts(paths: &CcteamPaths) -> Result<Vec<PathBuf>> {
+    let root = &paths.projects_root;
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut removed = Vec::new();
+    for entry in
+        std::fs::read_dir(root).with_context(|| format!("read_dir {}", root.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(String::from) else {
+            continue;
+        };
+        if name == META_SLUG || !name.starts_with("meta-") {
+            continue;
+        }
+        let state_path = paths.project_state(&name);
+        if !state_path.exists() {
+            continue;
+        }
+        let Ok(state) = ProjectState::load(&state_path) else {
+            continue;
+        };
+        if state.team != META_TEAM_NAME {
+            continue;
+        }
+        let dir = entry.path();
+        std::fs::remove_dir_all(&dir)
+            .with_context(|| format!("remove stale meta layout {}", dir.display()))?;
+        removed.push(dir);
+    }
+    Ok(removed)
+}
+
 /// Bootstrap the meta-agent's project tree:
-/// 1. Run `bootstrap_project(...team=meta-agent)` to lay down
+/// 1. Sweep legacy `meta-<handle>/` layouts (V0.4.1: one ccteam install
+///    = one meta-agent; old per-handle directories are dead).
+/// 2. Run `bootstrap_project(...team=meta-agent)` to lay down
 ///    `state.json`, `.claude/settings.json`, and the project skeleton.
-/// 2. Overwrite the auto-generated `CLAUDE.md` with the meta-agent
+/// 3. Overwrite the auto-generated `CLAUDE.md` with the meta-agent
 ///    role prompt so the new session loads dispatcher behavior.
-/// 3. Pre-create `inbox/` + `outbox/` so an inotify watcher can attach
+/// 4. Pre-create `inbox/` + `outbox/` so an inotify watcher can attach
 ///    immediately at session startup.
 ///
 /// Idempotent: re-running refreshes the CLAUDE.md role prompt + the
 /// canonical state.json fields (slug, team, tmux_session) so doctor can
 /// repair drift in-place.
 pub fn bootstrap_meta_project(paths: &CcteamPaths) -> Result<MetaBootstrapReport> {
+    let removed_stale =
+        clean_stale_meta_layouts(paths).context("sweep stale meta-<handle> layouts")?;
     let slug = meta_slug();
     let project_dir = paths.project_dir(&slug);
     let already_existed = paths.project_state(&slug).exists();
@@ -109,6 +162,7 @@ pub fn bootstrap_meta_project(paths: &CcteamPaths) -> Result<MetaBootstrapReport
         project_dir,
         claude_md,
         already_existed,
+        removed_stale,
     })
 }
 
@@ -120,6 +174,10 @@ pub struct MetaBootstrapReport {
     pub project_dir: PathBuf,
     pub claude_md: PathBuf,
     pub already_existed: bool,
+    /// Legacy `meta-<handle>/` directories removed in this call (V0.4.1
+    /// cleanup). Empty on fresh installs and on idempotent re-runs after
+    /// the first sweep.
+    pub removed_stale: Vec<PathBuf>,
 }
 
 #[cfg(test)]
@@ -237,5 +295,71 @@ mod tests {
         assert!(report.already_existed);
         let body = std::fs::read_to_string(&cm).unwrap();
         assert!(body.contains("决策树"), "role prompt should be re-rendered");
+    }
+
+    /// Plant a legacy V0.1-V0.4.0 `meta-<handle>` dir with the
+    /// meta-agent marker so the cleanup sweep recognises it. Returns
+    /// the absolute project dir.
+    fn plant_legacy_meta_dir(p: &CcteamPaths, slug: &str) -> PathBuf {
+        let dir = p.project_dir(slug);
+        std::fs::create_dir_all(p.project_ccteam_dir(slug)).unwrap();
+        let mut state = ProjectState::initial_for_team(slug.into(), META_TEAM_NAME.into());
+        state.tmux_session = format!("ccteam-{slug}");
+        state.save(&p.project_state(slug)).unwrap();
+        dir
+    }
+
+    #[test]
+    fn bootstrap_removes_legacy_meta_handle_dirs() {
+        isolation();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let p = paths(&tmp);
+
+        let cto = plant_legacy_meta_dir(&p, "meta-cto");
+        let rob = plant_legacy_meta_dir(&p, "meta-rob");
+
+        // Unrelated user dir that happens to start with `meta-` — has
+        // no state.json so the marker check skips it.
+        let userdir = p.projects_root.join("meta-notes");
+        std::fs::create_dir_all(&userdir).unwrap();
+
+        let report = bootstrap_meta_project(&p).unwrap();
+
+        assert_eq!(report.removed_stale.len(), 2);
+        assert!(!cto.exists(), "stale meta-cto must be removed");
+        assert!(!rob.exists(), "stale meta-rob must be removed");
+        assert!(userdir.exists(), "non-ccteam meta-* dir must be left alone");
+        assert!(p.project_dir("meta").is_dir(), "new meta/ must exist");
+    }
+
+    #[test]
+    fn bootstrap_skips_meta_prefixed_dir_with_wrong_team() {
+        isolation();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let p = paths(&tmp);
+
+        // A user project that happens to be named `meta-research` and
+        // has a real state.json — but team is `research`, not
+        // `meta-agent`. Must not be deleted.
+        let slug = "meta-research";
+        std::fs::create_dir_all(p.project_ccteam_dir(slug)).unwrap();
+        let state = ProjectState::initial_for_team(slug.into(), "research".into());
+        state.save(&p.project_state(slug)).unwrap();
+
+        let report = bootstrap_meta_project(&p).unwrap();
+        assert!(report.removed_stale.is_empty());
+        assert!(
+            p.project_dir(slug).is_dir(),
+            "user project named meta-research must survive"
+        );
+    }
+
+    #[test]
+    fn bootstrap_is_clean_on_fresh_install() {
+        isolation();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let p = paths(&tmp);
+        let report = bootstrap_meta_project(&p).unwrap();
+        assert!(report.removed_stale.is_empty());
     }
 }

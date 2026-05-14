@@ -70,8 +70,8 @@ pub use memory_bridge::{
     MemoryBridgeAction, MemoryBridgeReport,
 };
 pub use meta_agent::{
-    bootstrap_meta_project, meta_session_name, meta_slug, render_meta_role_prompt,
-    MetaBootstrapReport, META_SESSION_NAME, META_SLUG, META_TEAM_NAME,
+    bootstrap_meta_project, clean_stale_meta_layouts, meta_session_name, meta_slug,
+    render_meta_role_prompt, MetaBootstrapReport, META_SESSION_NAME, META_SLUG, META_TEAM_NAME,
 };
 pub use orchestrator::MAX_CONCURRENT_PROJECTS;
 pub use orchestrator::{Orchestrator, OrchestratorConfig, DEFAULT_CLAUDE_MODEL};

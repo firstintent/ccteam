@@ -1824,6 +1824,15 @@ fn render_install_meta_agent_report(paths: &CcteamPaths) -> Result<String> {
             "created"
         },
     ));
+    if !report.removed_stale.is_empty() {
+        out.push_str(&format!(
+            "  cleaned legacy   {} stale meta-<handle> dir(s) removed\n",
+            report.removed_stale.len()
+        ));
+        for path in &report.removed_stale {
+            out.push_str(&format!("                     - {}\n", path.display()));
+        }
+    }
     out.push('\n');
     let tmux_session = ccteam_core::meta_session_name();
     out.push_str(&format!("tmux session     {tmux_session}\n"));
