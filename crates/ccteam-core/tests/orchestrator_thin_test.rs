@@ -1030,3 +1030,151 @@ async fn t24_spawn_requests_failed_spawn_retains_marker() {
     assert_eq!(claude.spawn_count(), 1, "retry must spawn");
     assert!(!marker.exists(), "successful retry must delete marker");
 }
+
+// =====================================================================
+// V0.4.0-hotfix — inbox consumer (acknowledgement + archive)
+// =====================================================================
+
+fn write_inbox_msg(project_dir: &Path, filename: &str, body: &str, source_user: &str) {
+    let dir = project_dir.join(".ccteam").join("inbox");
+    std::fs::create_dir_all(&dir).unwrap();
+    let frontmatter = format!(
+        "---\nschema_version: 1\nsource: ccteam-mcp\nsource_user: {source_user}\n\
+         created_at: 2026-05-14T13:00:00Z\ningested_at: 2026-05-14T13:00:00Z\n\
+         content_type: text\n---\n\n{body}\n"
+    );
+    std::fs::write(dir.join(filename), frontmatter).unwrap();
+}
+
+#[tokio::test]
+async fn t25_inbox_message_archives_and_logs_event() {
+    let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_MANUAL_SPEC);
+    let (orch, _claude, _codex) = build_orchestrator(paths);
+    let progress = orch.paths().progress_jsonl(&slug);
+
+    write_inbox_msg(
+        &pdir,
+        "msg-2026-05-14T130000Z-001.md",
+        "please look at fixes/",
+        "rob",
+    );
+
+    orch.test_check_inbox(&slug, &pdir, &progress).await;
+
+    let inbox = pdir.join(".ccteam").join("inbox");
+    let archived = pdir.join(".ccteam").join("inbox.archived");
+    assert!(
+        !inbox.join("msg-2026-05-14T130000Z-001.md").exists(),
+        "consumed message must leave inbox/"
+    );
+    assert!(
+        archived.join("msg-2026-05-14T130000Z-001.md").exists(),
+        "consumed message must land in inbox.archived/"
+    );
+
+    let events = read_events(&progress);
+    let inbox_evt = events
+        .iter()
+        .find(|e| e.get("event").and_then(|s| s.as_str()) == Some("inbox_received"))
+        .expect("inbox_received event must be in progress.jsonl");
+    assert_eq!(
+        inbox_evt.get("filename").and_then(|s| s.as_str()),
+        Some("msg-2026-05-14T130000Z-001.md")
+    );
+    assert_eq!(
+        inbox_evt.get("source_user").and_then(|s| s.as_str()),
+        Some("rob")
+    );
+    assert_eq!(
+        inbox_evt.get("parse_failed").and_then(|b| b.as_bool()),
+        Some(false)
+    );
+    assert!(inbox_evt
+        .get("body_summary")
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .contains("please look at fixes/"));
+}
+
+#[tokio::test]
+async fn t26_inbox_malformed_archives_with_parse_failed_flag() {
+    let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_MANUAL_SPEC);
+    let (orch, _claude, _codex) = build_orchestrator(paths);
+    let progress = orch.paths().progress_jsonl(&slug);
+
+    let inbox_dir = pdir.join(".ccteam").join("inbox");
+    std::fs::create_dir_all(&inbox_dir).unwrap();
+    let bad = "msg-2026-05-14T130001Z-001.md";
+    std::fs::write(inbox_dir.join(bad), "no frontmatter just body").unwrap();
+
+    orch.test_check_inbox(&slug, &pdir, &progress).await;
+
+    assert!(
+        !inbox_dir.join(bad).exists(),
+        "malformed must still archive (don't loop forever)"
+    );
+    assert!(pdir
+        .join(".ccteam")
+        .join("inbox.archived")
+        .join(bad)
+        .exists());
+
+    let events = read_events(&progress);
+    let inbox_evt = events
+        .iter()
+        .find(|e| e.get("event").and_then(|s| s.as_str()) == Some("inbox_received"))
+        .expect("inbox_received emitted for malformed too");
+    assert_eq!(
+        inbox_evt.get("parse_failed").and_then(|b| b.as_bool()),
+        Some(true)
+    );
+}
+
+#[tokio::test]
+async fn t28_run_writes_heartbeat_and_honors_shutdown() {
+    // Smoke test for the V0.4.0-hotfix `Orchestrator::run` impl:
+    // 1. heartbeat file lands under `<paths.root>/state/`
+    // 2. shutdown future resolves → run() returns Ok cleanly
+    // 3. heartbeat is removed on shutdown (per CLAUDE.md "no orphans")
+    //
+    // Roster is intentionally empty (no projects) so we don't depend on
+    // inotify or the watcher thread (WSL flake).
+    let projects_root = tempfile::tempdir().unwrap();
+    let ccteam_root = tempfile::tempdir().unwrap();
+    let paths = CcteamPaths {
+        root: ccteam_root.path().to_path_buf(),
+        projects_root: projects_root.path().to_path_buf(),
+    };
+    let orch = std::sync::Arc::new(
+        Orchestrator::new(paths.clone(), OrchestratorConfig::default()).unwrap(),
+    );
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let shutdown = async move {
+        let _ = rx.await;
+    };
+
+    let orch_for_task = std::sync::Arc::clone(&orch);
+    let handle = tokio::spawn(async move { orch_for_task.run(shutdown).await });
+
+    // Give the daemon a tick to write the initial heartbeat.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let hb = paths.root.join("state").join("orchestrator.heartbeat");
+    assert!(hb.exists(), "initial heartbeat must be written");
+
+    let _ = tx.send(());
+    let result = handle.await.unwrap();
+    assert!(result.is_ok(), "run() must return Ok on graceful shutdown");
+    assert!(!hb.exists(), "heartbeat must be cleaned up on shutdown");
+}
+
+#[tokio::test]
+async fn t27_inbox_no_op_when_empty() {
+    let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_MANUAL_SPEC);
+    let (orch, _claude, _codex) = build_orchestrator(paths);
+    let progress = orch.paths().progress_jsonl(&slug);
+
+    // No inbox dir at all → no panic, no events.
+    orch.test_check_inbox(&slug, &pdir, &progress).await;
+    assert!(read_events(&progress).is_empty());
+}

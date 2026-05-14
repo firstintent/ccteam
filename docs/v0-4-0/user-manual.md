@@ -445,21 +445,34 @@ ccteam 跟踪每个项目累计 cost(聚合 `progress.jsonl` 的 `agent_done.cos
 
 V0.3.x 中 `mcp__ccteam__ccteam__send_to_session` / `inject_decision` 等工具
 向 `<project>/.ccteam/inbox/*.md` 写消息,daemon 通过 `/btw` send-keys
-注入到 tmux 中正在跑的 claude session。**V0.4.0 没有这条路径**:
+注入到 tmux 中正在跑的 claude session。**V0.4.0 没有 in-flight send-keys
+路径**(`claude --bg --agent` session 是一次性的,无 `/btw` 等价)。
 
-- `claude --bg --agent` 启动的 session 是一次性的(spawn → run → exit),
-  没有"持续运行接收消息"的语义
-- 写入 `<project>/.ccteam/inbox/*.md` 在 V0.4.0 **没有 consumer**,文件
-  会累积但不会触发任何事情(无日志、无 error)
-- meta-agent 用 `ccteam__signal` 工具发的 btw 也会落到 inbox,V0.4.0
-  同样无效
+**V0.4.0 hotfix 后实际行为**(`Orchestrator::check_inbox` ticker step):
 
-V0.4.0 等价做法:**briefing 写到 `.claude/agents/<role>.md` 里**,新一轮
-spawn 会读到。要给 in-flight session 实时反馈 → 设计成一个新 role 用
-`watch:` 监听某个 artifact dir,从那里推送上下文。
+- orchestrator 每 5s 扫一次 `<project>/.ccteam/inbox/msg-*.md`
+- 每条消息写一行 `inbox_received` event 到 `progress.jsonl`
+  (含 `source` / `source_user` / `body_summary` / `parse_failed` 字段)
+- 原文件 rename 到 `<project>/.ccteam/inbox.archived/<filename>`
+  (保留全文,不删除 — 供 meta-agent 审计或人工 grep)
+- 解析失败(无 frontmatter 等)同样 archive,event 标 `parse_failed: true`
 
-V0.4.1 候选:让 `inbox/*.md` 在下一次 spawn 同 role 时作为 stdin 注入到
-新 session(自动作为 briefing 的一部分)。
+所以 `ccteam send_to_session` / `inject_decision` 不再是黑洞,但
+**也不会自动唤醒任何 in-flight session**。验证消息被收到:
+
+```bash
+ccteam progress <slug> | grep inbox_received       # 看 event
+ls ~/projects/<slug>/.ccteam/inbox.archived/        # 看归档全文
+```
+
+需要让某 agent 处理消息 → 两条路:
+
+1. 把 briefing 写到 `.claude/agents/<role>.md` 里,然后 `ccteam__spawn_agent`
+   触发新一轮 spawn,session 读 role 文件作为指令
+2. 设计一个 `watch:` role 监听某 artifact dir,在那里推送上下文
+
+V0.4.1 候选:让 archive 阶段顺带把 body 注入下一次 spawn 同 role 的
+stdin / briefing 文件,真正闭环"消息→session"链路。
 
 ---
 

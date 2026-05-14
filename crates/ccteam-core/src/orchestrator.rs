@@ -28,11 +28,15 @@ use anyhow::Result;
 use chrono::Utc;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
+use tokio::task::JoinSet;
 
 use crate::artifact_watcher::{ArtifactEvent, ArtifactWatcher};
+use crate::daemon;
 use crate::harness::{ClaudeCodeAdapter, CodexAdapter, HarnessAdapter, SessionHandle, SpawnOpts};
+use crate::inbox::{InboxMessage, SessionMailbox};
 use crate::paths::CcteamPaths;
 use crate::progress;
+use crate::queries;
 use crate::workflow::{AgentSpec, Executor, Trigger, WorkflowError, WorkflowSpec};
 
 /// Hard cap on concurrent project sessions (excluding the meta-agent).
@@ -210,15 +214,97 @@ impl Orchestrator {
         res
     }
 
-    /// F66 daemon loop = park until shutdown. Per-project iteration +
-    /// inbox drain land in F67 once meta-agent MCP tooling sits on top.
-    pub async fn run<F>(&self, shutdown: F) -> Result<()>
+    /// Daemon entry point: roster every project under
+    /// `paths.projects_root` that has a `workflow.yaml`, drive each
+    /// through [`run_project`] on its own tokio task, and keep the
+    /// heartbeat file fresh so [`crate::daemon::check_health`] reports
+    /// healthy. Returns when `shutdown` resolves.
+    ///
+    /// ### Shutdown semantics
+    ///
+    /// On `shutdown`, per-project tasks are aborted via `JoinSet`.
+    /// Aborting a tokio task does **not** kill the underlying
+    /// claude/codex sessions it spawned — those keep running as their
+    /// own processes (CLAUDE.md §三 "永不主动 kill 长 session"). The
+    /// next `ccteam start` re-rosters them via state.json polling.
+    ///
+    /// ### `self: &Arc<Self>`
+    ///
+    /// Each per-project task captures an `Arc<Self>` clone so it owns a
+    /// 'static reference to the orchestrator. All internal state is
+    /// already `Arc<Mutex<...>>` so concurrent project tasks share it
+    /// safely.
+    pub async fn run<F>(self: &Arc<Self>, shutdown: F) -> Result<()>
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
-        tracing::info!("orchestrator daemon: parked (F66 stub; per-project via run_project)");
-        shutdown.await;
-        Ok(())
+        let projects = queries::collect_projects(&self.paths).unwrap_or_else(|err| {
+            tracing::warn!(?err, "collect_projects failed; daemon starts with empty roster");
+            Vec::new()
+        });
+
+        let mut tasks: JoinSet<(String, Result<()>)> = JoinSet::new();
+        for proj in projects {
+            let slug = proj.state.slug.clone();
+            let project_dir = self.paths.project_dir(&slug);
+            // V0.4.0 only — legacy V0.3.x phase-driven projects (no
+            // workflow.yaml) are skipped silently. They have no F66
+            // event-loop equivalent; their orchestration was the deleted
+            // phase state machine.
+            if !project_dir.join("workflow.yaml").exists()
+                && !project_dir.join(".ccteam").join("workflow.yaml").exists()
+            {
+                tracing::debug!(slug, "no workflow.yaml; skipping (pre-V0.4.0 project)");
+                continue;
+            }
+            tracing::info!(slug, "starting project event loop");
+            let orch = Arc::clone(self);
+            tasks.spawn(async move {
+                let res = orch.run_project(&slug).await;
+                (slug, res)
+            });
+        }
+
+        if let Err(err) = daemon::write_heartbeat(&self.paths) {
+            tracing::warn!(?err, "initial heartbeat write failed");
+        }
+        let mut hb_ticker = tokio::time::interval(daemon::HEARTBEAT_INTERVAL);
+        hb_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // `interval` fires its first tick immediately; we already wrote
+        // an initial heartbeat above, so swallow that fire.
+        hb_ticker.tick().await;
+
+        tokio::pin!(shutdown);
+        loop {
+            tokio::select! {
+                _ = &mut shutdown => {
+                    tracing::info!("shutdown received; aborting project tasks (sessions remain alive)");
+                    tasks.abort_all();
+                    while tasks.join_next().await.is_some() {}
+                    daemon::remove_heartbeat(&self.paths);
+                    return Ok(());
+                }
+                _ = hb_ticker.tick() => {
+                    if let Err(err) = daemon::write_heartbeat(&self.paths) {
+                        tracing::warn!(?err, "heartbeat write failed");
+                    }
+                }
+                Some(joined) = tasks.join_next() => {
+                    match joined {
+                        Ok((slug, Ok(()))) => {
+                            tracing::info!(slug, "project event loop ended cleanly");
+                        }
+                        Ok((slug, Err(err))) => {
+                            tracing::warn!(slug, error = ?err, "project event loop errored");
+                        }
+                        Err(je) if je.is_cancelled() => {}
+                        Err(je) => {
+                            tracing::warn!(error = ?je, "project task panicked");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // ---- dispatch helpers ---------------------------------------------------
@@ -275,6 +361,7 @@ impl Orchestrator {
                     self.poll_completions(slug, spec, project_dir, progress_path).await;
                     self.check_spawn_requests(slug, spec, project_dir, progress_path).await;
                     self.check_gates(slug, spec, project_dir, progress_path).await;
+                    self.check_inbox(slug, project_dir, progress_path).await;
                     self.check_workflow_done(slug, spec, progress_path).await;
                 }
             }
@@ -625,6 +712,113 @@ impl Orchestrator {
         }
     }
 
+    /// Scan `<project>/.ccteam/inbox/msg-*.md` for unconsumed messages
+    /// (written by `ccteam__send_to_session` / `ccteam__inject_decision`
+    /// / channel adapters) and convert each into an `inbox_received`
+    /// progress event, then move the file to `.ccteam/inbox.archived/`.
+    ///
+    /// ## V0.4.0 delivery semantics
+    ///
+    /// V0.3.x orchestrator injected inbox bodies into a long-lived tmux
+    /// claude session via send-keys; V0.4.0 spawned sessions are
+    /// `claude --bg` one-shots with no idle inject target. Until V0.4.1
+    /// wires inbox-as-spawn-stdin (let next-spawn briefing pick up
+    /// pending messages), this consumer's job is **acknowledgement +
+    /// audit trail**: the message becomes a visible event in
+    /// `progress.jsonl` (meta-agent can read via `ccteam__progress`)
+    /// and the file moves to `inbox.archived/` so it does not re-fire.
+    ///
+    /// Malformed files (bad front matter) skip the parse but still
+    /// archive, with a `parse_failed: true` flag in the event so the
+    /// meta-agent can decide whether to surface them.
+    async fn check_inbox(
+        &self,
+        slug: &str,
+        project_dir: &std::path::Path,
+        progress_path: &std::path::Path,
+    ) {
+        let ccteam_dir = project_dir.join(".ccteam");
+        let mailbox = SessionMailbox::for_ccteam_dir(&ccteam_dir);
+        let files = match mailbox.list_inbox() {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::warn!(slug, ?err, "inbox list failed");
+                return;
+            }
+        };
+        if files.is_empty() {
+            return;
+        }
+        let archive_dir = ccteam_dir.join("inbox.archived");
+        if let Err(err) = std::fs::create_dir_all(&archive_dir) {
+            tracing::warn!(slug, ?err, "inbox.archived mkdir failed; messages stay in inbox");
+            return;
+        }
+
+        for path in files {
+            let filename = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            let raw = match std::fs::read_to_string(&path) {
+                Ok(s) => s,
+                Err(err) => {
+                    tracing::warn!(slug, ?err, filename, "inbox read failed; leaving in place");
+                    continue;
+                }
+            };
+            let parsed = InboxMessage::parse(&raw).ok();
+            let (source, source_user, body_summary, parse_failed) = match &parsed {
+                Some(msg) => {
+                    // Trim to a leading slice — full body lives in the
+                    // archived file; the event is for visibility only.
+                    let summary: String = msg.body.chars().take(500).collect();
+                    (
+                        msg.front.source.clone(),
+                        msg.front.source_user.clone(),
+                        summary,
+                        false,
+                    )
+                }
+                None => {
+                    let summary: String = raw.chars().take(500).collect();
+                    (String::new(), String::new(), summary, true)
+                }
+            };
+            let archived_path = archive_dir.join(&filename);
+            if let Err(err) = std::fs::rename(&path, &archived_path) {
+                tracing::warn!(
+                    slug,
+                    ?err,
+                    filename,
+                    "inbox archive rename failed; will retry next tick"
+                );
+                continue;
+            }
+            let _ = progress::append_event(
+                progress_path,
+                &json!({
+                    "event": "inbox_received",
+                    "slug": slug,
+                    "filename": filename,
+                    "source": source,
+                    "source_user": source_user,
+                    "body_summary": body_summary,
+                    "parse_failed": parse_failed,
+                    "archived_path": archived_path.to_string_lossy(),
+                    "ts": Utc::now().to_rfc3339(),
+                }),
+            );
+            tracing::info!(
+                slug,
+                filename,
+                source = %source,
+                "inbox message acknowledged + archived"
+            );
+        }
+    }
+
     /// Release a `Trigger::Gate` agent when its input dir has ≥1 file
     /// (default policy; richer thresholds land in F67) OR an explicit
     /// `.ccteam/gate_override/<role>` file exists (force).
@@ -912,6 +1106,15 @@ impl Orchestrator {
     ) {
         self.check_spawn_requests(slug, spec, project_dir, progress_path)
             .await;
+    }
+
+    pub async fn test_check_inbox(
+        &self,
+        slug: &str,
+        project_dir: &std::path::Path,
+        progress_path: &std::path::Path,
+    ) {
+        self.check_inbox(slug, project_dir, progress_path).await;
     }
 
     pub async fn test_gate_override(

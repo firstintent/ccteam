@@ -734,7 +734,7 @@ fn run_start(
     // pidfile cleanup), so clone before the move into Orchestrator::new.
     let cleanup_paths = paths.clone();
     let result = (|| -> Result<()> {
-        let orchestrator = Orchestrator::new(paths, config)?;
+        let orchestrator = std::sync::Arc::new(Orchestrator::new(paths, config)?);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
