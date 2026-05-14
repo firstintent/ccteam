@@ -10,8 +10,6 @@
 //              started_at / cost_label + status badge + PauseResumeButtons)
 //   - middle:  HarnessPanel + terminal mount
 //   - below:   EventsLive (scope=session) + BtwForm (sid-scoped) + Outbox
-//   - decisions: collapsible Pending decisions list (project-scoped;
-//                inject form is on ProjectDetail only)
 //
 // Only flex projects return a SessionDetail; non-flex slugs 404 at
 // the API and surface as "Not found" here.
@@ -20,6 +18,11 @@
 // the pause flag yet (the orchestrator's user_pause_pending is
 // project-scoped per V0.3.1 F50). Operators looking for the live flag
 // view should consult ProjectDetail's pause/resume buttons.
+//
+// V0.4.0 F68: the "Pending decisions" collapsible (phase decision graph)
+// was dropped — phase machinery retired in F60. Workflow-axis decisions
+// (gate triggers, role spawns) live on the ProjectDetail page via
+// WorkflowView, since they're project-scoped not session-scoped.
 
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
@@ -219,23 +222,6 @@ export default function SessionDetail() {
           <OutboxList rows={detail.outbox} />
         </div>
       </div>
-
-      {/* Collapsible decisions debug list */}
-      <details className="border border-surface-700/40 rounded-md bg-surface-850">
-        <summary className="px-3 py-2 cursor-pointer text-xs uppercase tracking-wide text-text-secondary">
-          Pending decisions ({detail.decision_candidates.length})
-        </summary>
-        <ul className="px-3 py-2 font-mono text-xs space-y-1">
-          {detail.decision_candidates.length === 0 && (
-            <li className="text-text-dim italic">none</li>
-          )}
-          {detail.decision_candidates.map((p) => (
-            <li key={p} className="text-text-secondary truncate" title={p}>
-              {p}
-            </li>
-          ))}
-        </ul>
-      </details>
     </div>
   );
 }

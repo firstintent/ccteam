@@ -1,9 +1,15 @@
 // V0.3.2 F55 — harness statusline snapshot panel.
 //
-// Mirrors V0.3.1 F46's `~/.ccteam/harness/<slug>-<sid>.json` shape
-// surfaced through ccteam-web/src/routes/harness_sse.rs as the
-// `event: harness_snapshot` SSE topic (see docs/interfaces.md
-// §15 / §16.3 — `harness_snapshot` is a sibling of `progress`).
+// V0.4.0 F61 / F68: the V0.3.1 statusline-mirror pipeline
+// (`~/.ccteam/harness/<slug>-<sid>.json` written by the statusline
+// adapter) was retired. The Rust side (`crates/ccteam-core/harness.rs`)
+// now reads Claude Code's native background-job state from
+// `~/.claude/jobs/<job_id>/state.json` (`parse_cc_state_json`). The
+// orchestrator periodically materializes a `HarnessSnapshot` envelope
+// from that file and republishes it on the existing
+// `/sse/harness/<slug>/<sid>` SSE topic — the SPA-side wire format and
+// `HarnessSnapshotView` shape are unchanged, so this component does not
+// need to re-target an endpoint.
 //
 // Why a local `useEventSource` rather than reusing F54's
 // `useProgressStream`: harness snapshots arrive on a DIFFERENT SSE
@@ -20,8 +26,9 @@ type Props = {
   slug: string;
   sid: string;
   /** Initial snapshot from REST (`SessionDetail.harness_snapshot`).
-   *  May be null when `~/.ccteam/harness/<slug>-<sid>.json` does not
-   *  yet exist for this session. */
+   *  May be null when no snapshot has been published yet — V0.4.0 F61
+   *  derives this from `~/.claude/jobs/<job_id>/state.json` on the Rust
+   *  side; pre-F61 builds used a statusline-mirrored file. */
   snapshot: HarnessSnapshotView | null;
 };
 

@@ -50,11 +50,20 @@ function formatRelative(tsIso: string, now: number = Date.now()): string {
 /** Events the dashboard surfaces as "fresh" in the last_event_label.
  *  Anything else (PostToolUse spam, UserPromptSubmit echoes) would
  *  thrash the row label every keystroke without telling the operator
- *  anything new. */
+ *  anything new.
+ *
+ *  V0.4.0 F68: `phase_*` lifecycle events were retired alongside the
+ *  phase machinery (F60). The workflow-driven replacements live on the
+ *  agent / artifact axis; we surface their lifecycle here so the
+ *  dashboard's "last event" column stays meaningful. */
 const FRESHNESS_EVENTS = new Set([
-  "phase_start",
-  "phase_done",
-  "phase_end",
+  // V0.4.0 workflow events (F66 / F67)
+  "agent_spawn",
+  "agent_done",
+  "gate_triggered",
+  "artifact_landed",
+  "escalation",
+  // Long-lived signals carried over from V0.3.x
   "idle_state_change",
   "idle_prompt",
   "fix_loop_escalation",
@@ -98,9 +107,6 @@ function ProjectCard({ row, onOpen }: ProjectCardProps) {
         <span className="px-1.5 py-0.5 rounded bg-surface-700/40 uppercase tracking-wider">
           {harness}
         </span>
-      </div>
-      <div className="text-xs text-text-secondary truncate" title={row.current_phase}>
-        {row.current_phase || "—"}
       </div>
       <div className="flex items-center justify-between text-[11px] font-mono text-text-dim mt-auto pt-1">
         <span className="truncate">{row.last_event_label || "no events"}</span>

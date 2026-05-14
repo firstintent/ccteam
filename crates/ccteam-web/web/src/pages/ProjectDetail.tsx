@@ -5,14 +5,16 @@
 // updates.
 //
 // Layout:
-//   - top:    team / kind / current_phase / badge_label + PauseResumeButtons (F58)
+//   - top:    team / kind / badge_label + PauseResumeButtons (F58)
+//   - middle: WorkflowView (F68 — agent cards + artifact counts +
+//             gate chips), driven by ProjectSummary.workflow_summary
 //   - right:  EventsLive (scope=project) + BtwForm (F58) + OutboxList
 //   - bottom: flex-only session tab strip (is_flex && sessions.length)
-//   - decisions: InjectDecisionForm (F58) wired to summary.decision_candidates
 //
-// F58 shipped BtwForm / InjectDecisionForm / PauseResumeButtons as
-// standalone components; F59 wires them into this page (write surface
-// finally goes live in the SPA).
+// V0.4.0 F68: the phase chip + InjectDecisionForm section are gone
+// (phase machinery retired in F60). The workflow view replaces the
+// "pending decisions" pane; meta-agent decisions now flow through the
+// F65 MCP tools (`ccteam__trigger_gate` etc.).
 
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
@@ -24,8 +26,8 @@ import {
 } from "../lib/detailApi";
 import { EventsLive } from "../components/EventsLive";
 import { BtwForm } from "../components/BtwForm";
-import { InjectDecisionForm } from "../components/InjectDecisionForm";
 import { PauseResumeButtons } from "../components/PauseResumeButtons";
+import WorkflowView from "./WorkflowView";
 
 /** Read `state.user_pause_pending` from the opaque `ProjectSummary.state`
  *  JSON blob without leaking the unknown shape through to consumers.
@@ -191,9 +193,6 @@ export default function ProjectDetail() {
         <span className="text-xs text-text-secondary font-mono">
           kind={summary.kind}
         </span>
-        <span className="text-xs text-text-secondary font-mono">
-          phase={summary.current_phase}
-        </span>
         <StatusBadge cls={summary.badge_class} label={summary.badge_label} />
         <span className="text-xs text-text-dim font-mono ml-auto">
           cost ${summary.cost_label}
@@ -214,6 +213,18 @@ export default function ProjectDetail() {
         </nav>
       )}
 
+      {/* Workflow view (V0.4.0 F68) — renders agent cards + artifact
+          counts + gate chips. `workflow_summary` is null for legacy
+          projects without workflow.yaml; the component renders a
+          friendly "no workflow.yaml" hint in that case. */}
+      {summary.workflow_summary && (
+        <WorkflowView
+          slug={summary.slug}
+          summary={summary.workflow_summary}
+          onReload={triggerReload}
+        />
+      )}
+
       {/* Main two-column layout: events + (BTW form + outbox) */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 min-h-0 flex-1">
         <div className="lg:col-span-2 min-h-[24rem] flex">
@@ -232,19 +243,6 @@ export default function ProjectDetail() {
           <OutboxList rows={summary.outbox} />
         </div>
       </div>
-
-      {/* Decisions — F58 inject form. Always renders the section header;
-          the form's own empty-state covers "no candidates pending". */}
-      <section className="border border-surface-700/40 rounded-md bg-surface-850 p-3">
-        <h3 className="text-xs uppercase tracking-wide text-text-secondary mb-2">
-          Pending decisions ({summary.decision_candidates.length})
-        </h3>
-        <InjectDecisionForm
-          slug={summary.slug}
-          candidates={summary.decision_candidates}
-          onSuccess={triggerReload}
-        />
-      </section>
     </div>
   );
 }

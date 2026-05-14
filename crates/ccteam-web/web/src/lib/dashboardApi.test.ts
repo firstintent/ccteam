@@ -28,7 +28,6 @@ describe("fetchDashboard", () => {
         slug: "dev-foo",
         team: "dev",
         kind: "workflow",
-        current_phase: "plan-eng",
         last_event_label: "5s ago",
         badge_class: "bg-status-running",
         badge_label: "Running",

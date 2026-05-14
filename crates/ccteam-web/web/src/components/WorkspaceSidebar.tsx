@@ -119,7 +119,7 @@ export const WorkspaceSidebar = memo(function WorkspaceSidebar({
                           ? "border-brand-600 bg-surface-850 text-text-primary"
                           : "border-transparent text-text-secondary hover:bg-surface-700/40"
                       }`}
-                      title={`${p.slug} — ${p.current_phase}`}
+                      title={`${p.slug} — ${p.badge_label}`}
                     >
                       {p.slug}
                     </Link>
