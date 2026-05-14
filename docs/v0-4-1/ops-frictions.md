@@ -219,6 +219,91 @@ ccteam cost --today              # 今天
 
 ---
 
+---
+
+## V0.4.1 deploy-verify 追加(2026-05-14 host 192.168.1.19)
+
+下面这一批是把 `892f5e1` 部署到 NAS host 真机跑 8 项 UX 验证时发现的。
+8/8 简化都过,但暴露了几条 V0.4.2 候选的 UX 漏洞。详细 verify 表见
+`docs/v0-4-1/deploy-verify.md`。
+
+### P0 — `ccteam init -y` 不感知已有 meta-agent 项目
+
+**症状**:host 上原本有 `~/projects/meta-cto/`(V0.4.0 handle=`cto` 老 layout,
+state.json 含 $0.47 历史 cost + 真实 tmux session `ccteam-meta-cto`)。跑
+`ccteam init -y` 后,wizard 平行新建了 `~/projects/meta/`,**没警告、没合并、
+没迁移**。结果:
+
+```
+$ ccteam ls
+SLUG                                     PHASE          STATE       COST   AGE
+meta                                     pending        idle        $0.00  84s
+meta-cto                                 pending        idle        $0.47  16898s
+```
+
+两个独立 state.json + 两个独立 tmux session 名,用户得手动决定保留哪个 +
+把另一个 mv 走。
+
+**需要的产品改动**:
+1. `ccteam init -y` / `ccteam doctor --install-meta-agent` 先 scan `~/projects/meta*/`
+2. 检测到 `meta-<handle>/` 且无 `~/projects/meta/` 时提示:
+   ```
+   found legacy meta-agent at ~/projects/meta-cto/ (V0.4.0 handle layout).
+   V0.4.1 dropped the handle. run:
+     ccteam doctor --migrate-meta-handle
+   to mv ~/projects/meta-cto → ~/projects/meta (preserves state.json).
+   ```
+3. 检测到 `~/projects/meta/` 已存在时 short-circuit `already-present`,
+   不要重写 CLAUDE.md / state.json
+
+### P1 — 运行中 daemon 不 hot-reload 新 project
+
+**症状**:`init -y` 在 18:28:57Z 创建 `~/projects/meta/`,但跑在 18:24:43Z
+启动的 daemon 没监到。`tail /tmp/ccteam.log` 只见 `dev-ui-quality` 一条
+event loop,没有 `meta`。`ccteam ls` 显示 meta 是因为它直接扫 filesystem,
+但 orchestrator 内部 roster 仍只装 `dev-ui-quality`(故 `ccteam send meta "..."`
+会 route 不到)。
+
+修复:
+- orchestrator tick 重 scan `~/projects/*/`,新发现的起 event loop
+- 或 `ccteam new` / `ccteam init --install-meta-agent` 在 daemon 跑时发 USR1
+- 或最轻:`ccteam status` 多一行 "N on disk / M loaded — restart needed to pick up X"
+
+### P2 — Web 路由命名没 doc SoT
+
+**症状**:verify prompt 写 `curl /api/health`,实际是 `/health`(`/api/health` 404)。
+prompt 作者凭印象写错,暴露的是:web API 命名约定没集中文档。`/api/{slug}/...`
+(actions)、`/api/v1/...`(data)、`/health`(loose root)、`/app/...`(SPA)、
+`/assets/spa/...`(static)分布在 5 个 mod 里要 grep 才知道。
+
+修复:`docs/interfaces.md` 加 §11.x "Web API 路由表"全列出;`ccteam status`
+打一行 `web: /health · /app/ · /api/v1/*`。
+
+### P2 — `ccteam init -y` output 没 next-steps hint
+
+**症状**:`init -y` 末行是 `tmux session     ccteam-meta`,exit 0,但用户不知道
+"下一步干嘛"。期望像 `cargo new` 那样:
+
+```
+✓ meta-agent ready. attach with:
+    tmux attach -t ccteam-meta
+✓ start the orchestrator:
+    ccteam start &
+✓ create your first project:
+    ccteam new "build a foo cli"
+```
+
+### P2 — `ccteam send` 默认 first manual-trigger role 不可覆盖
+
+**症状**:`ccteam send dev-ui-quality "..."` 命中 `spawn=Some("explorer")`
+(workflow.yaml 第一个 `trigger: manual` role)。多 manual-trigger workflow
+没法 send 时指定哪个 role。
+
+修复:`ccteam send <slug> --role <role> "..."`,或 inbox markdown frontmatter
+支持 `target_role:` 字段。
+
+---
+
 ## Lessons(给我自己)
 
 1. **永远不要 `rm -f ~/.ccteam/state/orchestrator.pid`** — 那是个安全锁。
