@@ -26,8 +26,7 @@ pub fn user_claude_dir() -> Result<PathBuf> {
     if let Ok(s) = std::env::var("CLAUDE_CONFIG_HOME") {
         return Ok(PathBuf::from(s));
     }
-    let home = dirs::home_dir()
-        .ok_or_else(|| anyhow!("could not resolve home directory"))?;
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("could not resolve home directory"))?;
     Ok(home.join(".claude"))
 }
 
@@ -45,11 +44,9 @@ pub fn disable_tool_surface_bootstrap_for_tests() {
 /// dir must exist at startup or the watcher won't fire). Idempotent.
 pub fn ensure_skills_placeholders(claude_dir: &Path, project_dir: &Path) -> Result<()> {
     let global = claude_dir.join("skills");
-    std::fs::create_dir_all(&global)
-        .with_context(|| format!("create {}", global.display()))?;
+    std::fs::create_dir_all(&global).with_context(|| format!("create {}", global.display()))?;
     let local = project_dir.join(".claude").join("skills");
-    std::fs::create_dir_all(&local)
-        .with_context(|| format!("create {}", local.display()))?;
+    std::fs::create_dir_all(&local).with_context(|| format!("create {}", local.display()))?;
     Ok(())
 }
 
@@ -130,10 +127,8 @@ impl ToolSurfaceSnapshot {
     /// resolve (operator escape hatch). Skills and MCP servers come
     /// from the same paths as before.
     pub fn scan(claude_dir: &Path) -> Result<Self> {
-        let mut subagents: BTreeSet<String> = BUILTIN_SUBAGENTS
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect();
+        let mut subagents: BTreeSet<String> =
+            BUILTIN_SUBAGENTS.iter().map(|s| (*s).to_string()).collect();
         let mut skills: BTreeSet<String> = BTreeSet::new();
         let mut mcp: BTreeSet<String> = BTreeSet::new();
 
@@ -235,9 +230,7 @@ impl MissingTool {
 
     pub fn name(&self) -> &str {
         match self {
-            MissingTool::Subagent(s)
-            | MissingTool::Skill(s)
-            | MissingTool::Mcp(s) => s.as_str(),
+            MissingTool::Subagent(s) | MissingTool::Skill(s) | MissingTool::Mcp(s) => s.as_str(),
         }
     }
 
@@ -349,8 +342,7 @@ pub fn migrate_recommended_agent_symlinks(
         Ok(e) => e,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(out),
         Err(err) => {
-            return Err(err)
-                .with_context(|| format!("read_dir {}", agents_dir.display()));
+            return Err(err).with_context(|| format!("read_dir {}", agents_dir.display()));
         }
     };
     for entry in entries.flatten() {
@@ -377,8 +369,7 @@ pub fn migrate_recommended_agent_symlinks(
             continue;
         }
         if !dry_run {
-            std::fs::remove_file(&path)
-                .with_context(|| format!("remove {}", path.display()))?;
+            std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
         }
         out.push(MigrationReport {
             target: path,
@@ -573,9 +564,7 @@ pub fn rewrite_legacy_hook_commands(
             continue;
         };
         for entry in arr.iter_mut() {
-            let Some(inner_hooks) =
-                entry.get_mut("hooks").and_then(|h| h.as_array_mut())
-            else {
+            let Some(inner_hooks) = entry.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
                 continue;
             };
             for hook in inner_hooks.iter_mut() {
@@ -610,8 +599,7 @@ pub fn rewrite_legacy_hook_commands(
     // Atomic write: write to `<path>.tmp` then rename so a crash mid-
     // write can't leave a half-rewritten settings.json on disk.
     let tmp = settings_path.with_extension("json.ccteam-migrate.tmp");
-    std::fs::write(&tmp, &body)
-        .with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::write(&tmp, &body).with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, settings_path)
         .with_context(|| format!("rename {} -> {}", tmp.display(), settings_path.display()))?;
     Ok(HookCmdRewriteReport {
@@ -690,8 +678,7 @@ mod tests {
         std::fs::create_dir_all(claude.join("skills/my-skill")).unwrap();
         std::fs::write(claude.join("skills/my-skill/SKILL.md"), "# stub").unwrap();
         // plugin-shipped skill
-        let plugin_skill = claude
-            .join("plugins/marketplaces/x/plugins/foo/skills/plug-skill");
+        let plugin_skill = claude.join("plugins/marketplaces/x/plugins/foo/skills/plug-skill");
         std::fs::create_dir_all(&plugin_skill).unwrap();
         std::fs::write(plugin_skill.join("SKILL.md"), "# stub").unwrap();
 
@@ -829,7 +816,11 @@ mod tests {
         assert!(!stale.exists());
         // Survivors:
         assert!(user_file.exists());
-        assert!(foreign_link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(foreign_link
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[test]
@@ -1014,7 +1005,10 @@ mod tests {
         let rep = rewrite_legacy_hook_commands(&path, &new_bin, false).unwrap();
         assert_eq!(rep.action, HookCmdRewriteAction::Rewrote { entries: 3 });
         let body = std::fs::read_to_string(&path).unwrap();
-        assert!(body.contains("/home/u/.cargo/bin/ccteam hook load-context"), "got: {body}");
+        assert!(
+            body.contains("/home/u/.cargo/bin/ccteam hook load-context"),
+            "got: {body}"
+        );
         assert!(!body.contains("/cct hook"), "F39-era path survived: {body}");
     }
 
@@ -1026,7 +1020,10 @@ mod tests {
         std::fs::write(&path, &original).unwrap();
         let new_bin = PathBuf::from("/home/u/.cargo/bin/ccteam");
         let rep = rewrite_legacy_hook_commands(&path, &new_bin, true).unwrap();
-        assert_eq!(rep.action, HookCmdRewriteAction::WouldRewrite { entries: 3 });
+        assert_eq!(
+            rep.action,
+            HookCmdRewriteAction::WouldRewrite { entries: 3 }
+        );
         let body = std::fs::read_to_string(&path).unwrap();
         assert_eq!(body, original);
     }

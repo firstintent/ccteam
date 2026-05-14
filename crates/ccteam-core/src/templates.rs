@@ -1,9 +1,18 @@
-//! Embedded ccteam templates rendered into produced-project trees by
-//! `ccteam new` and the global `~/.ccteam/` skeleton produced by
-//! `ccteam init`. The settings.json source uses the placeholder
-//! `__CCTEAM_BIN__` for the binary path so we can rewrite hook commands
-//! to absolute paths at install time (otherwise hook subprocesses
-//! inherit Claude Code's PATH and silently fail to find `ccteam`).
+//! V0.4.0 F60 — embedded ccteam project bootstrap templates.
+//!
+//! Pre-F60 this module also held the shipped phase template payloads
+//! (`PHASE_TEMPLATES`, `TEAM_BUNDLES`, `write_*_phase_templates`,
+//! `write_all_global_team_templates`). Those went with the rest of
+//! the phase machinery; F66 reintroduces a much smaller bootstrap path
+//! against the new `workflow.yaml` schema.
+//!
+//! What survives F60:
+//! - the per-project `.claude/settings.json` template + render helper —
+//!   produced-project hook plumbing has not changed shape, so we still
+//!   ship the same settings.json scaffold;
+//! - the helper-template writer (`write_global_helper_templates`) —
+//!   helper markdown is referenced by user-authored agent prompts via
+//!   `@~/.ccteam/templates/<name>` and is not coupled to phases.
 
 use std::path::Path;
 
@@ -17,166 +26,15 @@ use serde_json::Value;
 /// (which Claude Code inherits and may not include the ccteam install dir).
 pub const PROJECT_SETTINGS_JSON: &str = include_str!("templates/settings.json");
 
-/// Phase template payloads — `(global_filename_with_index_prefix, body)`.
-/// Project-local copies use the unprefixed name (e.g. `plan-eng.md`)
-/// because the phase prompt in `progress::build_phase_prompt` references
-/// `@.ccteam/phases/<phase>.md` without the numeric prefix.
+/// M2.4: helper templates that user-authored agent / workflow markdown
+/// can `@`-reference. Shipped inside the binary so a fresh install (or
+/// `ccteam doctor`) can stamp them into `~/.ccteam/templates/` without
+/// an external git checkout.
 ///
-/// **Backwards-compat alias** for the dev team's phase set. M0–M2
-/// callers loading dev phases directly still work; M3.3+ should look
-/// up via `team_bundle("dev")` so multi-team installs keep working.
-pub const PHASE_TEMPLATES: &[(&str, &str)] = DEV_PHASE_TEMPLATES;
-
-// V0.2 M0.17.1: shipped phases now live under `teams/<name>/phases/`
-// alongside their `team.yaml` (was `phases/` / `phases-product-research/`
-// at repo root). Layout matches what `~/.ccteam/teams/<name>/` looks
-// like after seeding, so the include_str! paths are 1:1 with on-disk.
-const DEV_PHASE_TEMPLATES: &[(&str, &str)] = &[
-    ("02-plan-eng.md", include_str!("../../../teams/dev/phases/02-plan-eng.md")),
-    ("03-implement.md", include_str!("../../../teams/dev/phases/03-implement.md")),
-    ("04-test-author.md", include_str!("../../../teams/dev/phases/04-test-author.md")),
-    ("05-test-run.md", include_str!("../../../teams/dev/phases/05-test-run.md")),
-    ("06-fix.md", include_str!("../../../teams/dev/phases/06-fix.md")),
-    ("09-ship.md", include_str!("../../../teams/dev/phases/09-ship.md")),
-];
-
-/// research team phase set (M3.4; V0.2.2 F40 renamed from
-/// `product-research`). Six phases, all `parallelism: solo`. Last two
-/// phases use `decision_mode: async` so user-decision points write to
-/// outbox instead of blocking.
-const RESEARCH_PHASE_TEMPLATES: &[(&str, &str)] = &[
-    (
-        "01-kickoff.md",
-        include_str!("../../../teams/research/phases/01-kickoff.md"),
-    ),
-    (
-        "02-market-survey.md",
-        include_str!("../../../teams/research/phases/02-market-survey.md"),
-    ),
-    (
-        "03-differentiation-analysis.md",
-        include_str!("../../../teams/research/phases/03-differentiation-analysis.md"),
-    ),
-    (
-        "04-value-proposition.md",
-        include_str!("../../../teams/research/phases/04-value-proposition.md"),
-    ),
-    (
-        "05-feasibility.md",
-        include_str!("../../../teams/research/phases/05-feasibility.md"),
-    ),
-    (
-        "06-verdict.md",
-        include_str!("../../../teams/research/phases/06-verdict.md"),
-    ),
-];
-
-/// Embedded `team.yaml` files keyed by team name. M3.4 ships dev +
-/// research (V0.2.2 F40 renamed from `product-research`; alias
-/// preserved on the yaml so old projects still resolve). V0.2 M0.16
-/// adds meta-agent (evergreen). `ccteam init` writes these to
-/// `~/.ccteam/teams/<name>/team.yaml`. The orchestrator reads them at
-/// startup to resolve `phase_dir`, registered ESCALATE prefixes, the
-/// V0.2 `evergreen` / `cost_policy` flags, and (eventually) team-wide
-/// golden rules.
-const DEV_TEAM_YAML: &str = include_str!("../../../teams/dev/team.yaml");
-const RESEARCH_TEAM_YAML: &str =
-    include_str!("../../../teams/research/team.yaml");
-const META_AGENT_TEAM_YAML: &str = include_str!("../../../teams/meta-agent/team.yaml");
-
-/// Empty phase set for evergreen teams (meta-agent). The orchestrator
-/// builds a `Dag::from_templates(&[])` for these, which `decide_tick`
-/// short-circuits to `NoOp`. `process_meta_project` runs the
-/// alternative event-loop path instead.
-const META_AGENT_PHASE_TEMPLATES: &[(&str, &str)] = &[];
-
-/// One team's compile-time bundle: a `team.yaml` body + the phase
-/// markdowns to stamp into the project's `<project>/.ccteam/phases/`
-/// dir on `ccteam new`. Looking up by team name keeps every
-/// per-team artifact in one place — adding a team is a config change.
-///
-/// V0.2 §6.4 candidate 3: `pub(crate)` — runtime code paths now read
-/// disk (`~/.ccteam/teams/<name>/team.yaml`); this struct is only
-/// the in-binary seed source for `write_all_global_team_templates`
-/// and the bootstrap-time helpers in `projects.rs`.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct TeamTemplateBundle {
-    pub team_yaml: &'static str,
-    pub phases: &'static [(&'static str, &'static str)],
-}
-
-/// In-binary seed source for shipped teams. **Not** a runtime
-/// registry — production lookups walk `~/.ccteam/teams/<name>/team.yaml`
-/// (see `Orchestrator::team_runtime` /
-/// `memory_bridge::discover_bridge_teams`). Adding a new shipped team
-/// = add an entry here + author its YAML + markdowns; user-authored
-/// teams skip this entirely (V0.2 M0.22 team factory).
-pub(crate) const TEAM_BUNDLES: &[(&str, TeamTemplateBundle)] = &[
-    (
-        "dev",
-        TeamTemplateBundle {
-            team_yaml: DEV_TEAM_YAML,
-            phases: DEV_PHASE_TEMPLATES,
-        },
-    ),
-    (
-        "research",
-        TeamTemplateBundle {
-            team_yaml: RESEARCH_TEAM_YAML,
-            phases: RESEARCH_PHASE_TEMPLATES,
-        },
-    ),
-    (
-        "meta-agent",
-        TeamTemplateBundle {
-            team_yaml: META_AGENT_TEAM_YAML,
-            phases: META_AGENT_PHASE_TEMPLATES,
-        },
-    ),
-];
-
-/// Resolve a shipped team's compile-time seed bundle. Returns `None`
-/// for unknown teams so callers fall back to "no embedded templates" —
-/// the right behavior for user-authored teams that live entirely on
-/// disk. V0.2 §6.4 candidate 3: `pub(crate)` — only bootstrap-time
-/// callers in ccteam-core may use this.
-///
-/// V0.2.2 F40: matches by canonical key first, then by `aliases:` in
-/// each bundle's parsed `team.yaml`. Lets old projects whose
-/// `state.json::team` still carries a legacy name (e.g. `product-research`
-/// → `research`) still find the right bundle for bootstrap-time work
-/// like CLAUDE.md rendering / phase template stamping. Falls through
-/// silently when the team yaml fails to parse — the spec is in the
-/// repo so the only realistic cause is a development-time edit error,
-/// and the caller's `None` branch covers it.
-pub(crate) fn team_bundle(team: &str) -> Option<TeamTemplateBundle> {
-    if let Some(b) = TEAM_BUNDLES
-        .iter()
-        .find_map(|(name, bundle)| (*name == team).then_some(*bundle))
-    {
-        return Some(b);
-    }
-    TEAM_BUNDLES.iter().find_map(|(_name, bundle)| {
-        let spec = crate::team::TeamSpec::parse(bundle.team_yaml).ok()?;
-        if spec.aliases.iter().any(|a| a == team) {
-            Some(*bundle)
-        } else {
-            None
-        }
-    })
-}
-
-/// M2.4: helper templates that phase markdown can `@`-reference. Shipped
-/// inside the binary so a fresh install (or `ccteam doctor`) can stamp
-/// them into `~/.ccteam/templates/` without an external git checkout.
-///
-/// `(on_disk_filename, body)` — phase markdown references them as
+/// `(on_disk_filename, body)` — markdown references them as
 /// `@~/.ccteam/templates/<on_disk_filename>` and Claude Code's native
 /// `@` mechanism inlines the body at prompt-build time. The orchestrator
 /// does not parse these — they're pure Claude Code surface.
-///
-/// Filenames use hyphens to match the @-reference convention; the Rust
-/// source filenames use underscores to match Rust module conventions.
 pub const HELPER_TEMPLATES: &[(&str, &str)] = &[
     (
         "review-with-user-loop.md",
@@ -187,23 +45,6 @@ pub const HELPER_TEMPLATES: &[(&str, &str)] = &[
         include_str!("templates/kickoff_reverse_interview.md"),
     ),
 ];
-
-/// Strip a leading `NN-` index prefix off a global phase filename so it
-/// matches the path the phase prompt asks claude to read
-/// (`@.ccteam/phases/<phase>.md`). Returns the original name unchanged
-/// when no prefix is present.
-pub fn project_phase_filename(global: &str) -> &str {
-    let bytes = global.as_bytes();
-    if bytes.len() > 3
-        && bytes[0].is_ascii_digit()
-        && bytes[1].is_ascii_digit()
-        && bytes[2] == b'-'
-    {
-        &global[3..]
-    } else {
-        global
-    }
-}
 
 /// Resolve the path to the running ccteam binary. Falls back from
 /// canonicalized to raw `current_exe()` because `canonicalize` rejects
@@ -223,11 +64,7 @@ pub struct SettingsEnv {
     pub ccteam_projects_root: Option<String>,
 }
 
-/// Optional `enabledPlugins` map for the rendered settings.json. V0.2
-/// M0.20: spawned project sessions enable each plugin a phase's
-/// `tools_required.subagents` resolves to (via `plugin_resolution`) so
-/// Claude Code's in-memory plugin pipeline auto-namespaces the agent
-/// without ccteam-core ln -sf'ing into `~/.claude/agents/`.
+/// Optional `enabledPlugins` map for the rendered settings.json.
 ///
 /// Each entry is the `<plugin>@<marketplace>` key Claude Code's plugin
 /// pipeline expects.
@@ -246,9 +83,12 @@ pub fn render_project_settings(
     extra_env: &SettingsEnv,
     enabled: &EnabledPluginsSetting,
 ) -> Result<String> {
-    let bin = ccteam_bin
-        .to_str()
-        .ok_or_else(|| anyhow!("ccteam binary path not valid UTF-8: {}", ccteam_bin.display()))?;
+    let bin = ccteam_bin.to_str().ok_or_else(|| {
+        anyhow!(
+            "ccteam binary path not valid UTF-8: {}",
+            ccteam_bin.display()
+        )
+    })?;
     if bin.contains('"') || bin.contains('\\') {
         return Err(anyhow!(
             "ccteam binary path contains characters that can't be embedded in settings.json: {bin}"
@@ -262,10 +102,7 @@ pub fn render_project_settings(
             env.insert("CCTEAM_HOME".into(), Value::String(home.clone()));
         }
         if let Some(proj) = &extra_env.ccteam_projects_root {
-            env.insert(
-                "CCTEAM_PROJECTS_ROOT".into(),
-                Value::String(proj.clone()),
-            );
+            env.insert("CCTEAM_PROJECTS_ROOT".into(), Value::String(proj.clone()));
         }
     }
     if !enabled.plugin_ids.is_empty() {
@@ -287,13 +124,9 @@ pub fn render_project_settings(
 /// dir if missing. Idempotent — overwrites any prior render so
 /// re-running after a ccteam upgrade refreshes paths and the
 /// plugin set.
-pub fn write_project_settings(
-    project_dir: &Path,
-    enabled: &EnabledPluginsSetting,
-) -> Result<()> {
+pub fn write_project_settings(project_dir: &Path, enabled: &EnabledPluginsSetting) -> Result<()> {
     let dir = project_dir.join(".claude");
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("create {}", dir.display()))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let path = dir.join("settings.json");
     let bin = current_ccteam_bin()?;
     let extra = SettingsEnv {
@@ -301,151 +134,23 @@ pub fn write_project_settings(
         ccteam_projects_root: std::env::var("CCTEAM_PROJECTS_ROOT").ok(),
     };
     let body = render_project_settings(&bin, &extra, enabled)?;
-    std::fs::write(&path, body)
-        .with_context(|| format!("write {}", path.display()))?;
-    Ok(())
-}
-
-/// Write each dev `PHASE_TEMPLATES` entry into
-/// `<project_dir>/.ccteam/phases/` under its **unprefixed** name
-/// (e.g. `plan-eng.md`) so it matches the path embedded in
-/// `progress::build_phase_prompt`. Idempotent; later calls overwrite.
-///
-/// **M3.3 alias** for the dev team. Use
-/// `write_project_phase_templates_for_team` for non-dev teams.
-pub fn write_project_phase_templates(project_dir: &Path) -> Result<()> {
-    write_project_phase_templates_for_team(project_dir, "dev")
-}
-
-/// M3.3: write the project-local phase templates for `team` under
-/// `<project_dir>/.ccteam/phases/`. Evergreen teams (e.g. meta-agent)
-/// ship an empty phase set — the loop body is a no-op for them, so
-/// the function returns successfully without ever creating the
-/// `phases/` directory. (V0.2 §6.4 candidate 5 — declarative "no
-/// phases" via empty bundle, replacing the prior `team ==
-/// META_TEAM_NAME` literal.)
-pub fn write_project_phase_templates_for_team(
-    project_dir: &Path,
-    team: &str,
-) -> Result<()> {
-    let bundle = team_bundle(team).ok_or_else(|| {
-        anyhow!(
-            "no embedded phase templates for team `{team}` — \
-             ensure `~/.ccteam/teams/{team}/team.yaml` and \
-             `~/.ccteam/<phase_dir>/` are populated, or add the team \
-             to TEAM_BUNDLES in templates.rs"
-        )
-    })?;
-    if bundle.phases.is_empty() {
-        // Evergreen / phase-less team — skip the directory creation
-        // so we don't litter empty `.ccteam/phases/` dirs across
-        // event-loop project trees.
-        return Ok(());
-    }
-    let dir = project_dir.join(".ccteam").join("phases");
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("create {}", dir.display()))?;
-    for (global, body) in bundle.phases {
-        let name = project_phase_filename(global);
-        let path = dir.join(name);
-        std::fs::write(&path, body)
-            .with_context(|| format!("write {}", path.display()))?;
-    }
-    Ok(())
-}
-
-/// Write each `PHASE_TEMPLATES` entry into `<global_dir>/phases/` under
-/// its full prefixed name (e.g. `02-plan-eng.md`). Used by `ccteam init`
-/// so the orchestrator can load + validate templates from `~/.ccteam/`.
-/// `force == false` skips files already on disk so an operator can hand-
-/// edit a global template and not lose it on re-init.
-///
-/// **M3.3 backwards-compat shim**: also writes the dev phases through
-/// the new team-aware path. `write_all_global_team_templates` is the
-/// preferred entry point for new code.
-pub fn write_global_phase_templates(global_dir: &Path, force: bool) -> Result<()> {
-    let dir = global_dir.join("phases");
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("create {}", dir.display()))?;
-    for (global, body) in PHASE_TEMPLATES {
-        let path = dir.join(global);
-        if path.exists() && !force {
-            continue;
-        }
-        std::fs::write(&path, body)
-            .with_context(|| format!("write {}", path.display()))?;
-    }
-    Ok(())
-}
-
-/// V0.2 M0.17.2: write every shipped team's seed under the unified
-/// `<global_dir>/teams/<name>/` layout — `team.yaml` at the team-dir
-/// root, phases under `<team_dir>/<spec.phase_dir>/<NN-name>.md`
-/// (default `phases`). Idempotent — `force=false` preserves operator
-/// hand-edits.
-///
-/// Replaces the M3.x layout where phase_dir was relative to
-/// `~/.ccteam/` and product-research used `phases-product-research`
-/// to avoid collision with dev's `phases`. Under the new layout,
-/// each team's phase dir lives inside its own team directory so the
-/// per-team prefix is redundant.
-pub fn write_all_global_team_templates(global_dir: &Path, force: bool) -> Result<()> {
-    use crate::team::TeamSpec;
-    for (name, bundle) in TEAM_BUNDLES {
-        let spec = TeamSpec::parse(bundle.team_yaml).with_context(|| {
-            format!("embedded team.yaml for `{name}` does not match TeamSpec schema")
-        })?;
-        let team_dir = global_dir.join("teams").join(name);
-        std::fs::create_dir_all(&team_dir)
-            .with_context(|| format!("create {}", team_dir.display()))?;
-        // Phase markdowns → <global>/teams/<name>/<phase_dir>/<NN-name>.md.
-        // Skip the directory creation for evergreen / phase-less teams
-        // so we don't leave empty placeholder dirs around.
-        if !bundle.phases.is_empty() {
-            let phase_dir = team_dir.join(&spec.phase_dir);
-            std::fs::create_dir_all(&phase_dir)
-                .with_context(|| format!("create {}", phase_dir.display()))?;
-            for (filename, body) in bundle.phases {
-                let path = phase_dir.join(filename);
-                if path.exists() && !force {
-                    continue;
-                }
-                std::fs::write(&path, body)
-                    .with_context(|| format!("write {}", path.display()))?;
-            }
-        }
-        // team.yaml → <global>/teams/<name>/team.yaml.
-        let team_yaml_path = team_dir.join("team.yaml");
-        if team_yaml_path.exists() && !force {
-            continue;
-        }
-        std::fs::write(&team_yaml_path, bundle.team_yaml).with_context(|| {
-            format!("write {}", team_yaml_path.display())
-        })?;
-    }
+    std::fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
 
 /// M2.4: write the embedded `HELPER_TEMPLATES` into
-/// `<global_dir>/templates/<filename>` so phase markdown's
+/// `<global_dir>/templates/<filename>` so user-authored markdown's
 /// `@~/.ccteam/templates/<filename>` reference resolves. Idempotent;
 /// `force == false` preserves operator hand-edits.
-///
-/// Called by `ccteam init` (global skeleton) and `bootstrap_project`
-/// (defensive — covers the user who jumps straight to `ccteam new`
-/// without `ccteam init`). The two callers don't conflict because
-/// the writer is a no-op when files are already in place.
 pub fn write_global_helper_templates(global_dir: &Path, force: bool) -> Result<()> {
     let dir = global_dir.join("templates");
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("create {}", dir.display()))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     for (filename, body) in HELPER_TEMPLATES {
         let path = dir.join(filename);
         if path.exists() && !force {
             continue;
         }
-        std::fs::write(&path, body)
-            .with_context(|| format!("write {}", path.display()))?;
+        std::fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
     }
     Ok(())
 }
@@ -483,27 +188,6 @@ mod tests {
     }
 
     #[test]
-    fn template_pre_tool_use_intercepts_ask_user_question() {
-        // V0.2 M0.19.3: PreToolUse must carry a second matcher-bound
-        // entry for `AskUserQuestion` so the hook can deny the call
-        // before the assistant blocks waiting on an offline user.
-        let body = render_project_settings(
-            Path::new("/usr/local/bin/ccteam"),
-            &SettingsEnv::default(),
-            &EnabledPluginsSetting::default(),
-        )
-        .unwrap();
-        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        let entries = v["hooks"]["PreToolUse"].as_array().unwrap();
-        let intercept = entries
-            .iter()
-            .find(|e| e.get("matcher").and_then(|m| m.as_str()) == Some("AskUserQuestion"))
-            .expect("PreToolUse must have an AskUserQuestion matcher entry");
-        let cmd = intercept["hooks"][0]["command"].as_str().unwrap();
-        assert_eq!(cmd, "/usr/local/bin/ccteam hook intercept-ask");
-    }
-
-    #[test]
     fn template_session_start_uses_absolute_ccteam_path() {
         let body = render_project_settings(
             Path::new("/usr/local/bin/ccteam"),
@@ -528,10 +212,6 @@ mod tests {
 
     #[test]
     fn raw_template_uses_placeholder_not_bare_ccteam() {
-        // Guard against accidentally re-introducing `"command": "ccteam …"`
-        // — the un-substituted form makes hook subprocesses depend on PATH,
-        // which Claude Code inherits from its parent and which often does
-        // not include the ccteam install dir.
         assert!(
             PROJECT_SETTINGS_JSON.contains("__CCTEAM_BIN__"),
             "template should reference __CCTEAM_BIN__ placeholder",
@@ -545,45 +225,6 @@ mod tests {
             !PROJECT_SETTINGS_JSON.contains("{{CCT_BIN}}"),
             "template should not embed F39-era `{{CCT_BIN}}` placeholder (F44)",
         );
-    }
-
-    #[test]
-    fn project_phase_filename_strips_two_digit_prefix() {
-        assert_eq!(project_phase_filename("02-plan-eng.md"), "plan-eng.md");
-        assert_eq!(project_phase_filename("09-ship.md"), "ship.md");
-        assert_eq!(project_phase_filename("plan-eng.md"), "plan-eng.md");
-        assert_eq!(project_phase_filename("ab-foo.md"), "ab-foo.md"); // not digits
-    }
-
-    #[test]
-    fn write_project_phase_templates_drops_index_prefix() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        write_project_phase_templates(tmp.path()).unwrap();
-        let phases = tmp.path().join(".ccteam/phases");
-        assert!(phases.join("plan-eng.md").exists());
-        assert!(phases.join("ship.md").exists());
-        assert!(!phases.join("02-plan-eng.md").exists());
-    }
-
-    #[test]
-    fn write_global_phase_templates_keeps_index_prefix() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        write_global_phase_templates(tmp.path(), false).unwrap();
-        let phases = tmp.path().join("phases");
-        assert!(phases.join("02-plan-eng.md").exists());
-        assert!(phases.join("09-ship.md").exists());
-    }
-
-    #[test]
-    fn write_global_phase_templates_preserves_user_edits_without_force() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        write_global_phase_templates(tmp.path(), false).unwrap();
-        let path = tmp.path().join("phases/02-plan-eng.md");
-        std::fs::write(&path, "USER EDITED").unwrap();
-        write_global_phase_templates(tmp.path(), false).unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "USER EDITED");
-        write_global_phase_templates(tmp.path(), true).unwrap();
-        assert_ne!(std::fs::read_to_string(&path).unwrap(), "USER EDITED");
     }
 
     #[test]
@@ -656,7 +297,9 @@ mod tests {
         )
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        let map = v["enabledPlugins"].as_object().expect("enabledPlugins object");
+        let map = v["enabledPlugins"]
+            .as_object()
+            .expect("enabledPlugins object");
         assert_eq!(map.len(), 2);
         assert_eq!(map["pr-review-toolkit@claude-plugins-official"], true);
         assert_eq!(map["feature-dev@claude-plugins-official"], true);

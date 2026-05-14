@@ -85,12 +85,7 @@ fn fixture_workflow_project(paths: &CcteamPaths, slug: &str, tmux_session: &str)
     state.save(&paths.project_state(slug)).unwrap();
 }
 
-fn fixture_flex_session(
-    paths: &CcteamPaths,
-    slug: &str,
-    sid: &str,
-    tmux_session: &str,
-) {
+fn fixture_flex_session(paths: &CcteamPaths, slug: &str, sid: &str, tmux_session: &str) {
     std::fs::create_dir_all(paths.project_ccteam_dir(slug)).unwrap();
     let now = Utc::now();
     let mut state = ProjectState::initial_for_team(slug.into(), "flex".into());
@@ -130,8 +125,10 @@ fn ws_request(addr: SocketAddr, path: &str) -> ClientRequest {
 
 fn ws_request_with_subprotocol(addr: SocketAddr, path: &str) -> ClientRequest {
     let mut req = ws_request(addr, path);
-    req.headers_mut()
-        .insert("Sec-WebSocket-Protocol", HeaderValue::from_static(SUBPROTOCOL));
+    req.headers_mut().insert(
+        "Sec-WebSocket-Protocol",
+        HeaderValue::from_static(SUBPROTOCOL),
+    );
     req
 }
 
@@ -354,9 +351,11 @@ async fn ws_receives_pane_bytes_from_pipe_pane() {
     // before tmux has hooked the cat-writer up, in which case those
     // bytes are simply never captured.
     let ts = tmux_name.clone();
-    let attached =
-        wait_for(Duration::from_secs(2), || pane_pipe_status(&ts) == "1").await;
-    assert!(attached, "pipe-pane should attach within 2s after WS connect");
+    let attached = wait_for(Duration::from_secs(2), || pane_pipe_status(&ts) == "1").await;
+    assert!(
+        attached,
+        "pipe-pane should attach within 2s after WS connect"
+    );
 
     // Generate pane output. send-keys with the literal text + Enter
     // triggers the shell to echo + execute the command.
@@ -429,9 +428,11 @@ async fn ws_two_clients_share_one_pipe_pane() {
     let (mut ws2, _) = tokio_tungstenite::connect_async(req2).await.unwrap();
 
     let ts = tmux_name.clone();
-    let attached =
-        wait_for(Duration::from_secs(2), || pane_pipe_status(&ts) == "1").await;
-    assert!(attached, "pipe-pane should attach within 2s after WS connect");
+    let attached = wait_for(Duration::from_secs(2), || pane_pipe_status(&ts) == "1").await;
+    assert!(
+        attached,
+        "pipe-pane should attach within 2s after WS connect"
+    );
 
     let _ = std::process::Command::new("tmux")
         .args([
@@ -603,9 +604,11 @@ async fn ws_flex_sid_scoped_route_relays_bytes() {
     assert_eq!(resp.status(), StatusCode::SWITCHING_PROTOCOLS);
 
     let ts = tmux_name.clone();
-    let attached =
-        wait_for(Duration::from_secs(2), || pane_pipe_status(&ts) == "1").await;
-    assert!(attached, "pipe-pane should attach within 2s after WS connect");
+    let attached = wait_for(Duration::from_secs(2), || pane_pipe_status(&ts) == "1").await;
+    assert!(
+        attached,
+        "pipe-pane should attach within 2s after WS connect"
+    );
 
     let _ = std::process::Command::new("tmux")
         .args([
@@ -667,7 +670,5 @@ fn memmem(haystack: &[u8], needle: &[u8]) -> bool {
     if haystack.len() < needle.len() {
         return false;
     }
-    haystack
-        .windows(needle.len())
-        .any(|w| w == needle)
+    haystack.windows(needle.len()).any(|w| w == needle)
 }

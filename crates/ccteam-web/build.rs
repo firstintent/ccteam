@@ -64,10 +64,7 @@ fn main() {
 
     let node_modules = web_dir.join("node_modules");
     if !node_modules.exists() {
-        eprintln!(
-            "ccteam-web: running `npm install` in {}",
-            web_dir.display()
-        );
+        eprintln!("ccteam-web: running `npm install` in {}", web_dir.display());
         let status = Command::new("npm")
             .args(["install", "--no-audit", "--no-fund", "--silent"])
             .current_dir(&web_dir)
@@ -139,6 +136,5 @@ fn write_placeholder_dist(dist_dir: &Path) {
         </body></html>\n";
     fs::write(dist_dir.join("index.html"), placeholder)
         .unwrap_or_else(|err| panic!("write placeholder index.html: {err}"));
-    fs::write(dist_dir.join(".gitkeep"), "")
-        .unwrap_or_else(|err| panic!("write .gitkeep: {err}"));
+    fs::write(dist_dir.join(".gitkeep"), "").unwrap_or_else(|err| panic!("write .gitkeep: {err}"));
 }

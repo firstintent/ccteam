@@ -1,17 +1,23 @@
-//! `state.json` — project-level orchestrator state. Schema in
-//! `docs/interfaces.md` §2.1; semantics (phase_state machine, parallelism
-//! tiers) in `docs/tech-design.md` §3.2 / §3.3.
+//! `state.json` — project-level orchestrator state. Schema reference in
+//! `docs/interfaces.md` §2.1.
+//!
+//! V0.4.0 F60: the pre-F60 phase state machine (PhaseState variants
+//! InFlight / DonePending / AutoLocked) is gone — F66 reintroduces an
+//! `agent_sessions` shape against `workflow.yaml`. Until then we keep
+//! the identity / cost / lifecycle fields plus the V0.3.1 F49 flex
+//! session registry. `current_phase`, `phase_history`, and
+//! `last_event_type` survive as **serde-only compat fields** with
+//! `skip_serializing_if` so fresh writes drop them but old state.json
+//! files load unchanged (the F66 workflow loop won't read these — it
+//! tracks dispatch on the new shape).
 //!
 //! Persistence guarantees:
 //! - **Atomic write**: serialize → write `<path>.tmp` → rename to `<path>`.
-//!   POSIX `rename(2)` makes the new contents observable atomically; readers
-//!   never see a half-written file.
+//!   POSIX `rename(2)` makes the new contents observable atomically.
 //! - **One-deep backup**: before each save, the prior `<path>` is rotated to
-//!   `<path>.bak` via rename. Crash between rotation and rename leaves the
-//!   prior state recoverable from `.bak`; load falls back automatically.
+//!   `<path>.bak` via rename. Load falls back automatically on parse failure.
 //! - **Strict deserialize**: enums (`phase_state`, `parallelism`) reject
-//!   unknown values; unknown top-level fields are tolerated for
-//!   forward-compat when a future ccteam adds optional metadata.
+//!   unknown values.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -23,31 +29,29 @@ use serde::{Deserialize, Serialize};
 
 use crate::team::{HarnessKind, TeamKind};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// V0.4.0 F60 — only `Idle` and `Done` survive the phase-machine purge.
+/// `Idle` keeps existing tests / hook code that reads `state.phase_state`
+/// loadable; `Done` is reserved for F66 workflow completion.
+///
+/// `alias = "in_flight" / "done_pending" / "auto_locked" / "fix_locked"`
+/// lets pre-F60 state.json files still load (every legacy variant is
+/// coerced to `Idle` on read — the F66 loop will re-evaluate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PhaseState {
-    /// Phase prompt injected; awaiting `phase_done` or `escalate` event.
-    InFlight,
-    /// Last phase finished; orchestrator may inject the next.
+    /// Project is alive but not currently driving any phase. The F66
+    /// workflow loop will subsume the dispatch logic; the variant
+    /// remains so old `state.json` files load without migration.
+    #[serde(
+        alias = "in_flight",
+        alias = "done_pending",
+        alias = "auto_locked",
+        alias = "fix_locked"
+    )]
     Idle,
-    /// Stop hook owns the loop (ralph-loop pattern, §3.5).
-    /// `alias = "fix_locked"` keeps pre-rename state.json files (F5/F6
-    /// rename, 2026-05-06) loadable; new writes use `auto_locked`.
-    #[serde(alias = "fix_locked")]
-    AutoLocked,
-    /// **M3.6**: phase produced its required outputs but flagged some
-    /// sub-tasks as deferred (`ESCALATE: PHASE_DONE_PENDING`,
-    /// interfaces §4.1.1). `open_decisions` lists outbox-file basenames
-    /// the phase wrote that still need user attention. The orchestrator
-    /// advances to the next phase only when its `required_inputs` does
-    /// not overlap `open_decisions`; otherwise it writes an escalation
-    /// and stays in `DonePending` until the user runs `ccteam resume`.
-    ///
-    /// Dropping `Copy` from `PhaseState` for this variant (Vec field)
-    /// — every call site uses `matches!` or moves, so this isn't
-    /// observable except in a couple of CLI render arms (handled with
-    /// an explicit pattern there).
-    DonePending { open_decisions: Vec<String> },
+    /// Project terminated successfully. The F66 workflow loop will
+    /// transition to this when every gated artifact resolves.
+    Done,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,6 +65,10 @@ pub enum Parallelism {
     MultiSession,
 }
 
+/// V0.4.0 F60 — preserved as a serde-only compat type so old
+/// state.json files load. F66 will replace phase tracking with
+/// workflow agent-session tracking; until then this struct is
+/// inhabitable but unused by the runtime.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PhaseHistoryEntry {
     pub phase: String,
@@ -80,13 +88,17 @@ pub struct SessionRecord {
 }
 
 /// Project-level state, persisted as `~/projects/<slug>/.ccteam/state.json`.
+///
+/// V0.4.0 F60: phase state machine fields removed. The F66 workflow
+/// loop reintroduces dispatch tracking on a fresh shape; until then
+/// only identity / lifecycle / cost / context-budget fields remain,
+/// plus the V0.3.1 F49 flex `sessions` registry.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectState {
     pub slug: String,
-    /// Team this project runs under — selects which phase template
-    /// set the orchestrator uses (M3.1 F13). serde-default `"dev"`
-    /// keeps state.json files written before M3.1 loadable as the
-    /// dev team, no migration script needed.
+    /// Team this project runs under. serde-default `"dev"` keeps state.json
+    /// files written before M3.1 loadable as the dev team, no migration
+    /// script needed.
     #[serde(default = "default_team")]
     pub team: String,
     /// V0.3.1 F49 — cached team kind for hooks and lightweight readers.
@@ -97,13 +109,34 @@ pub struct ProjectState {
     pub tmux_session: String,
     pub claude_session_id: Option<String>,
     pub claude_pid: Option<i32>,
+    /// Coarse-grained lifecycle state. F60 collapsed this to
+    /// `Idle` / `Done`; F66 will either extend the enum or replace
+    /// it with workflow-aware tracking.
+    #[serde(default = "default_phase_state")]
     pub phase_state: PhaseState,
-    pub current_phase: String,
+    /// V0.4.0 F60 retained for serde-compat: old state.json files
+    /// recorded a `parallelism` field. Default `Solo` keeps loading
+    /// without migration; nothing currently reads it.
+    #[serde(default = "default_parallelism")]
     pub parallelism: Parallelism,
+    /// V0.4.0 F60 compat fields — retained so old state.json files
+    /// load and CLI/test sites that still read these strings keep
+    /// compiling. F66 wires the new dispatch loop to a fresh set of
+    /// agent-session fields; until then writes default-skip these so
+    /// fresh state.json files don't propagate the legacy shape.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub current_phase: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub phase_history: Vec<PhaseHistoryEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_event_type: Option<String>,
     /// `alias = "fix_cycle_count"` keeps pre-rename state.json (F7,
     /// 2026-05-06) loadable; new writes use `auto_loop_cycle_count`.
-    #[serde(alias = "fix_cycle_count")]
+    #[serde(
+        default,
+        alias = "fix_cycle_count",
+        skip_serializing_if = "is_zero_u32"
+    )]
     pub auto_loop_cycle_count: u32,
     pub cost_used_usd: f64,
     pub soft_warn_threshold_usd: f64,
@@ -112,7 +145,6 @@ pub struct ProjectState {
     pub context_reset_threshold_tokens: u64,
     pub context_reset_count: u32,
     pub last_progress_event_at: Option<DateTime<Utc>>,
-    pub last_event_type: Option<String>,
     pub last_user_interaction_at: DateTime<Utc>,
     pub user_attached: bool,
     pub user_pause_pending: bool,
@@ -131,14 +163,24 @@ fn default_team() -> String {
     "dev".into()
 }
 
+fn default_phase_state() -> PhaseState {
+    PhaseState::Idle
+}
+
+fn default_parallelism() -> Parallelism {
+    Parallelism::Solo
+}
+
 fn is_default_team_kind(kind: &TeamKind) -> bool {
     *kind == TeamKind::Workflow
 }
 
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
+}
+
 impl ProjectState {
-    /// Default initial state for a freshly-created project. `current_phase`
-    /// is left empty so the orchestrator's first tick reads it as
-    /// "no phase yet" and dispatches the DAG entry node.
+    /// Default initial state for a freshly-created project.
     pub fn initial(slug: String) -> Self {
         Self::initial_for_team(slug, default_team())
     }
@@ -157,9 +199,10 @@ impl ProjectState {
             claude_session_id: None,
             claude_pid: None,
             phase_state: PhaseState::Idle,
-            current_phase: String::new(),
             parallelism: Parallelism::Solo,
+            current_phase: String::new(),
             phase_history: Vec::new(),
+            last_event_type: None,
             auto_loop_cycle_count: 0,
             cost_used_usd: 0.0,
             soft_warn_threshold_usd: 20.0,
@@ -168,7 +211,6 @@ impl ProjectState {
             context_reset_threshold_tokens: 600_000,
             context_reset_count: 0,
             last_progress_event_at: None,
-            last_event_type: None,
             last_user_interaction_at: now,
             user_attached: false,
             user_pause_pending: false,
@@ -208,8 +250,7 @@ impl ProjectState {
     /// before writing, so a load can recover the prior state if a crash
     /// interleaves with this call.
     pub fn save(&self, path: &Path) -> Result<()> {
-        let json = serde_json::to_string_pretty(self)
-            .context("serialize ProjectState")?;
+        let json = serde_json::to_string_pretty(self).context("serialize ProjectState")?;
 
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -250,9 +291,7 @@ impl ProjectState {
                     "state.json unreadable; recovering from .bak",
                 );
                 read_and_parse(&bak).with_context(|| {
-                    format!(
-                        "primary load failed ({primary:#}); backup load also failed",
-                    )
+                    format!("primary load failed ({primary:#}); backup load also failed",)
                 })
             }
         }
@@ -273,10 +312,8 @@ fn sid_number_for_harness(sid: &str, harness: HarnessKind) -> Option<u64> {
 }
 
 fn read_and_parse(path: &Path) -> Result<ProjectState> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("read {}", path.display()))?;
-    serde_json::from_slice(&bytes)
-        .with_context(|| format!("parse {}", path.display()))
+    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))
 }
 
 /// Append a literal suffix to a path's filename (e.g. `state.json` →

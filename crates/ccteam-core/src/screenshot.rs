@@ -52,8 +52,7 @@ use vt100::Parser;
 use crate::paths::CcteamPaths;
 use crate::state::ProjectState;
 use crate::tmux::{
-    capture_pane_with_ansi_from_session, query_pane_dims_from_session,
-    session_name_for_project,
+    capture_pane_with_ansi_from_session, query_pane_dims_from_session, session_name_for_project,
 };
 
 pub mod ansi_palette;
@@ -62,8 +61,7 @@ use ansi_palette::ANSI_256;
 
 /// JetBrains Mono Regular (OFL) baked in at compile time. ~270 KB.
 /// See `crates/ccteam-core/assets/fonts/JetBrainsMono-Regular.ttf`.
-const VENDORED_TTF: &[u8] =
-    include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf");
+const VENDORED_TTF: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf");
 
 /// Env var: when set to an absolute path, overrides the vendored font
 /// at runtime (e.g. swap to a CJK / emoji-covering fallback).
@@ -200,7 +198,12 @@ pub fn render_screenshot(
 fn session_name_for_project_session(paths: &CcteamPaths, slug: &str, sid: &str) -> String {
     ProjectState::load(&paths.project_state(slug))
         .ok()
-        .and_then(|state| state.sessions.get(sid).map(|record| record.tmux_session.clone()))
+        .and_then(|state| {
+            state
+                .sessions
+                .get(sid)
+                .map(|record| record.tmux_session.clone())
+        })
         .filter(|name| !name.trim().is_empty())
         .unwrap_or_else(|| format!("ccteam-{slug}-{sid}"))
 }
@@ -258,11 +261,7 @@ fn render_to_png_bytes(
             let x = (PADDING + c as u32 * cell_w) as i32;
             let y = (PADDING + r as u32 * cell_h) as i32;
             // Always paint the bg rectangle so non-default colors show.
-            draw_filled_rect_mut(
-                &mut img,
-                Rect::at(x, y).of_size(cell_w, cell_h),
-                bg,
-            );
+            draw_filled_rect_mut(&mut img, Rect::at(x, y).of_size(cell_w, cell_h), bg);
             let s = cell.contents();
             if !s.is_empty() && s != " " {
                 draw_text_mut(&mut img, fg, x, y, scale, font, &s);
@@ -301,8 +300,7 @@ fn describe_panic(payload: &Box<dyn std::any::Any + Send>) -> String {
 pub fn probe_font() -> Result<String> {
     let (label, bytes): (String, Cow<[u8]>) = match std::env::var(FONT_ENV) {
         Ok(p) => {
-            let body = std::fs::read(&p)
-                .with_context(|| format!("read {FONT_ENV}=`{p}`"))?;
+            let body = std::fs::read(&p).with_context(|| format!("read {FONT_ENV}=`{p}`"))?;
             (format!("env {FONT_ENV}=`{p}`"), Cow::Owned(body))
         }
         Err(_) => (
@@ -310,8 +308,7 @@ pub fn probe_font() -> Result<String> {
             Cow::Borrowed(VENDORED_TTF),
         ),
     };
-    FontRef::try_from_slice(&bytes)
-        .with_context(|| format!("parse ttf from {label}"))?;
+    FontRef::try_from_slice(&bytes).with_context(|| format!("parse ttf from {label}"))?;
     Ok(label)
 }
 
@@ -342,15 +339,9 @@ mod tests {
             Rgb([0x80, 0x00, 0x00])
         );
         // idx 196 = pure cube-red.
-        assert_eq!(
-            vt100_color_to_rgb(Color::Idx(196), dflt),
-            Rgb([0xff, 0, 0])
-        );
+        assert_eq!(vt100_color_to_rgb(Color::Idx(196), dflt), Rgb([0xff, 0, 0]));
         // idx 232 = grayscale base.
-        assert_eq!(
-            vt100_color_to_rgb(Color::Idx(232), dflt),
-            Rgb([8, 8, 8])
-        );
+        assert_eq!(vt100_color_to_rgb(Color::Idx(232), dflt), Rgb([8, 8, 8]));
     }
 
     #[test]
@@ -374,10 +365,7 @@ mod tests {
         // path; we explicitly clear and restore.
         unsafe { std::env::remove_var(FONT_ENV) };
         let label = probe_font().expect("vendored probe ok");
-        assert!(
-            label.contains("vendored"),
-            "unexpected label: {label}"
-        );
+        assert!(label.contains("vendored"), "unexpected label: {label}");
         if let Some(p) = prev {
             unsafe { std::env::set_var(FONT_ENV, p) };
         }

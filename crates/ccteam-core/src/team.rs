@@ -22,8 +22,6 @@ use std::path::Path;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::phases::GoldenRule;
-
 /// One field in a team's retro schema. M4.1 retro phase emits a
 /// markdown section per entry; the cross-project memory RAG indexes
 /// each field as a tagged document so future projects can pull only
@@ -163,28 +161,26 @@ impl TeamGoldenRules {
     pub fn is_empty(&self) -> bool {
         self.protocol.is_empty() && self.domain.is_empty()
     }
+}
 
-    /// V0.2 M0.18: extract the cmd-check rules in the historic
-    /// [`GoldenRule`] shape so [`crate::golden_rules::enforce`] can
-    /// keep running them without learning the new schema. Rules with
-    /// `enforce: prompt_directive` are excluded — they belong in the
-    /// inject prompt, not the cmd-check path.
-    pub fn as_cmd_check_rules(&self) -> Vec<GoldenRule> {
-        self.protocol
-            .iter()
-            .filter(|r| r.enforce == GoldenRuleEnforcement::CmdCheck)
-            .map(|r| GoldenRule {
-                rule_id: r.rule_id.clone(),
-                cmd: r.cmd.clone(),
-                pattern: r.pattern.clone(),
-            })
-            .collect()
-    }
+/// V0.2 M0.18 legacy compat shape — pre-V0.2 yamls listed flat
+/// `golden_rules` items with `rule_id` + (`cmd` | `pattern`). Kept as
+/// a private deserialization-only shape so old team.yaml files still
+/// load post-F60 (the phase machinery that used to consume these is
+/// gone; the `Deserialize` impl below coerces them into `protocol`
+/// with `enforce: cmd_check`).
+#[derive(Debug, Clone, Deserialize)]
+struct LegacyGoldenRule {
+    rule_id: String,
+    #[serde(default)]
+    cmd: Option<String>,
+    #[serde(default)]
+    pattern: Option<String>,
 }
 
 /// V0.2 M0.18: deserialize either the new structured shape
 /// (`protocol: [...]` / `domain: [...]`) or the legacy flat list
-/// (`Vec<GoldenRule>` — coerced into `protocol` with
+/// (`Vec<LegacyGoldenRule>` — coerced into `protocol` with
 /// `enforce: cmd_check`).
 impl<'de> Deserialize<'de> for TeamGoldenRules {
     fn deserialize<D>(d: D) -> std::result::Result<Self, D::Error>
@@ -206,7 +202,7 @@ impl<'de> Deserialize<'de> for TeamGoldenRules {
         #[serde(untagged)]
         enum Either {
             Structured(Structured),
-            Legacy(Vec<GoldenRule>),
+            Legacy(Vec<LegacyGoldenRule>),
         }
 
         match Either::deserialize(d).map_err(D::Error::custom)? {
@@ -750,17 +746,21 @@ impl TeamSpec {
             }
             match rule.enforce {
                 GoldenRuleEnforcement::CmdCheck => {
-                    let temp = GoldenRule {
-                        rule_id: rule.rule_id.clone(),
-                        cmd: rule.cmd.clone(),
-                        pattern: rule.pattern.clone(),
-                    };
-                    temp.kind().with_context(|| {
-                        format!(
-                            "team.yaml: golden_rules.protocol `{}` (cmd_check) invalid",
+                    // Cmd-check validity: exactly one of `cmd` / `pattern`.
+                    // Pre-F60 this leaned on `phases::GoldenRule::kind()`
+                    // for the message text; inlined here so team.rs no
+                    // longer transitively depends on the deleted module.
+                    match (rule.cmd.as_deref(), rule.pattern.as_deref()) {
+                        (Some(_), None) | (None, Some(_)) => {}
+                        (Some(_), Some(_)) => bail!(
+                            "team.yaml: golden_rules.protocol `{}` (cmd_check) has both `cmd` and `pattern`; pick one",
                             rule.rule_id,
-                        )
-                    })?;
+                        ),
+                        (None, None) => bail!(
+                            "team.yaml: golden_rules.protocol `{}` (cmd_check) missing both `cmd` and `pattern`; one is required",
+                            rule.rule_id,
+                        ),
+                    }
                 }
                 GoldenRuleEnforcement::PromptDirective => {
                     if rule
@@ -1068,7 +1068,6 @@ mod tests {
             spec.golden_rules.protocol[0].enforce,
             GoldenRuleEnforcement::CmdCheck,
         );
-        assert_eq!(spec.golden_rules.as_cmd_check_rules().len(), 2);
     }
 
     #[test]
@@ -1109,8 +1108,6 @@ mod tests {
             spec.golden_rules.protocol[1].enforce,
             GoldenRuleEnforcement::PromptDirective,
         );
-        // cmd_check filter excludes the prompt_directive rule.
-        assert_eq!(spec.golden_rules.as_cmd_check_rules().len(), 1);
     }
 
     #[test]
@@ -1179,8 +1176,6 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("AskUserQuestion"));
-        // It's a prompt-only rule, not a cmd-check.
-        assert!(spec.golden_rules.as_cmd_check_rules().is_empty());
     }
 
     #[test]

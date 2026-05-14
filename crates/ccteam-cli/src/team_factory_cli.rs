@@ -142,7 +142,10 @@ pub fn run_team_init(args: &TeamInitArgs) -> Result<String> {
 fn render_init_report(report: &InitReport) -> String {
     let mut out = String::new();
     out.push_str("ccteam team init\n\n");
-    out.push_str(&format!("  staging dir   {}\n", report.staging_dir.display()));
+    out.push_str(&format!(
+        "  staging dir   {}\n",
+        report.staging_dir.display()
+    ));
     out.push_str(&format!(
         "  manifest      {}\n",
         report.manifest_path.display(),
@@ -151,14 +154,15 @@ fn render_init_report(report: &InitReport) -> String {
         "  team yaml     {}\n",
         report.team_yaml_path.display(),
     ));
-    out.push_str(&format!(
-        "  phases ({})  ", report.phase_paths.len(),
-    ));
+    out.push_str(&format!("  phases ({})  ", report.phase_paths.len(),));
     out.push('\n');
     for path in &report.phase_paths {
         out.push_str(&format!("                {}\n", path.display()));
     }
-    out.push_str(&format!("  README        {}\n\n", report.readme_path.display()));
+    out.push_str(&format!(
+        "  README        {}\n\n",
+        report.readme_path.display()
+    ));
     if report.phase_paths.is_empty() {
         out.push_str(
             "next:\n  \
@@ -191,9 +195,7 @@ pub fn run_team_publish(args: &TeamPublishArgs) -> Result<String> {
         out.push_str(&format!("  {line}\n"));
     }
     if findings.iter().any(|l| l.starts_with("[FAIL]")) {
-        bail!(
-            "ccteam team publish: validation failed — fix the [FAIL] lines above and re-run.",
-        );
+        bail!("ccteam team publish: validation failed — fix the [FAIL] lines above and re-run.",);
     }
     match args.target {
         PublishTargetArg::Local => {
@@ -207,9 +209,7 @@ pub fn run_team_publish(args: &TeamPublishArgs) -> Result<String> {
         }
         PublishTargetArg::Github => {
             let repo = args.repo.as_deref().ok_or_else(|| {
-                anyhow!(
-                    "ccteam team publish --target github requires --repo <owner>/<name>",
-                )
+                anyhow!("ccteam team publish --target github requires --repo <owner>/<name>",)
             })?;
             // Ensure the staging dir is otherwise OK before any network
             // side-effects. Then shell out.
@@ -224,9 +224,7 @@ pub fn run_team_publish(args: &TeamPublishArgs) -> Result<String> {
             let url = github_publish_via_gh(&staging, repo)
                 .with_context(|| format!("publish staged team to github repo `{repo}`"))?;
             out.push_str(&format!("  pushed → {url}\n"));
-            out.push_str(&format!(
-                "\nshare with: claude /plugin add {repo}\n",
-            ));
+            out.push_str(&format!("\nshare with: claude /plugin add {repo}\n",));
         }
     }
     Ok(out)
@@ -289,23 +287,13 @@ fn github_publish_via_gh(staging: &Path, repo: &str) -> Result<String> {
     let create = Command::new("gh")
         .current_dir(staging)
         .args([
-            "repo",
-            "create",
-            repo,
-            "--public",
-            "--source",
-            ".",
-            "--remote",
-            "origin",
-            "--push",
+            "repo", "create", repo, "--public", "--source", ".", "--remote", "origin", "--push",
         ])
         .output()
         .context("invoke gh repo create")?;
     if !create.status.success() {
         let stderr = String::from_utf8_lossy(&create.stderr);
-        bail!(
-            "gh repo create failed.\nstderr:\n{stderr}",
-        );
+        bail!("gh repo create failed.\nstderr:\n{stderr}",);
     }
     Ok(format!("https://github.com/{repo}"))
 }

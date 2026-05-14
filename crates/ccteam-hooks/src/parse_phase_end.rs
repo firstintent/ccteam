@@ -151,8 +151,7 @@ pub fn parse_phase_end(paths: &CcteamPaths, stdin: &Value) -> Result<ParseDecisi
             // open_decisions check (interfaces §4.1.1, dev-plan M3.6).
             if parsed.kind == EscalateKind::PhaseDonePending {
                 let open_decisions = extract_outbox_filenames(&parsed.reason);
-                let current_phase = current_phase_from_state(&project_dir)
-                    .unwrap_or_default();
+                let current_phase = current_phase_from_state(&project_dir).unwrap_or_default();
                 json!({
                     "ts": now_rfc3339(),
                     "event": "phase_done_pending",
@@ -206,14 +205,8 @@ pub fn parse_phase_end(paths: &CcteamPaths, stdin: &Value) -> Result<ParseDecisi
         // `stop_hook_active: true` on the second Stop entry so a phase
         // that keeps producing nothing won't loop forever.
         let tmux_session = tmux::session_name_for_project(paths, &slug);
-        let pane_tail =
-            tmux::capture_pane_tail_from_session(&tmux_session, 30, false);
-        write_needs_attention_outbox(
-            &project_dir,
-            &slug,
-            &last_text,
-            pane_tail.as_deref(),
-        )?;
+        let pane_tail = tmux::capture_pane_tail_from_session(&tmux_session, 30, false);
+        write_needs_attention_outbox(&project_dir, &slug, &last_text, pane_tail.as_deref())?;
         return Ok(ParseDecision::Continue);
     }
 
@@ -258,10 +251,7 @@ fn phase_started_at(progress_path: &Path) -> Result<Option<DateTime<Utc>>> {
 /// Return the basenames of outbox files created or modified after
 /// `since`. `since: None` collects every outbox file. The Stop hook
 /// uses this to detect the third legal phase output.
-fn fresh_outbox_files(
-    outbox_dir: &Path,
-    since: Option<DateTime<Utc>>,
-) -> Result<Vec<String>> {
+fn fresh_outbox_files(outbox_dir: &Path, since: Option<DateTime<Utc>>) -> Result<Vec<String>> {
     let mut out = Vec::new();
     let entries = match std::fs::read_dir(outbox_dir) {
         Ok(it) => it,
@@ -719,10 +709,8 @@ fn current_phase_from_state(cwd: &Path) -> Option<String> {
 /// - `... (escalation-stack.md) ...`
 pub fn extract_outbox_filenames(reason: &str) -> Vec<String> {
     let mut out = Vec::new();
-    for raw_token in reason
-        .split(|c: char| {
-            c.is_whitespace() || matches!(c, ',' | '[' | ']' | '(' | ')')
-        })
+    for raw_token in
+        reason.split(|c: char| c.is_whitespace() || matches!(c, ',' | '[' | ']' | '(' | ')'))
     {
         let token = raw_token.trim_matches(|c: char| !c.is_alphanumeric() && c != '.' && c != '-');
         if token.is_empty() {

@@ -119,11 +119,13 @@ pub struct TeamInitInput<'a> {
 }
 
 /// One phase scaffold. The factory writes a phase markdown file with
-/// minimal frontmatter (the required keys for `PhaseTemplate::parse` +
-/// `validate_m0`) and a domain-task body template. Protocol literals
-/// (`PHASE_DONE: …` / `ESCALATE: …`) are deliberately absent from the
-/// body — V0.2 M0.18 keeps those inside the orchestrator's inject
-/// prompt only.
+/// minimal frontmatter and a domain-task body template. Protocol
+/// literals (`PHASE_DONE: …` / `ESCALATE: …`) are deliberately absent
+/// from the body — the orchestrator's inject prompt owns them.
+///
+/// V0.4.0 F60: the phase template runtime parser was deleted with the
+/// rest of the phase machinery; scaffolds remain as a user-editable
+/// markdown shape until F63 introduces `workflow.yaml`.
 #[derive(Debug, Clone)]
 pub struct PhaseScaffold<'a> {
     pub name: &'a str,
@@ -196,8 +198,7 @@ pub fn init_team_staging(input: &TeamInitInput<'_>) -> Result<InitReport> {
         .with_context(|| format!("write {}", manifest_path.display()))?;
 
     let team_yaml_path = staging.join("team.yaml");
-    let team_yaml_body =
-        serde_yaml::to_string(input.spec).context("serialize team.yaml")?;
+    let team_yaml_body = serde_yaml::to_string(input.spec).context("serialize team.yaml")?;
     std::fs::write(&team_yaml_path, team_yaml_body)
         .with_context(|| format!("write {}", team_yaml_path.display()))?;
 
@@ -238,10 +239,10 @@ fn read_existing_manifest(staging: &Path) -> Result<Option<PluginManifest>> {
     if !path.exists() {
         return Ok(None);
     }
-    let body = std::fs::read_to_string(&path)
-        .with_context(|| format!("read {}", path.display()))?;
-    let manifest: PluginManifest = serde_json::from_str(&body)
-        .with_context(|| format!("parse {}", path.display()))?;
+    let body =
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let manifest: PluginManifest =
+        serde_json::from_str(&body).with_context(|| format!("parse {}", path.display()))?;
     Ok(Some(manifest))
 }
 
@@ -325,11 +326,16 @@ fn render_readme(input: &TeamInitInput<'_>) -> String {
         s.push_str("(no phases — evergreen team)\n");
     } else {
         for scaffold in input.phases {
-            s.push_str(&format!("- `{}` — {}\n", scaffold.name, scaffold.task_summary));
+            s.push_str(&format!(
+                "- `{}` — {}\n",
+                scaffold.name, scaffold.task_summary
+            ));
         }
     }
     s.push('\n');
-    s.push_str("Authored via `ccteam team init`. Edit `phases/*.md` bodies to fill in domain detail.\n");
+    s.push_str(
+        "Authored via `ccteam team init`. Edit `phases/*.md` bodies to fill in domain detail.\n",
+    );
     s
 }
 
@@ -414,9 +420,8 @@ pub fn publish_team(input: &PublishInput<'_>) -> Result<PublishReport> {
             // unrelated team that happens to share the name).
             match std::fs::symlink_metadata(&link) {
                 Ok(meta) if meta.file_type().is_symlink() => {
-                    std::fs::remove_file(&link).with_context(|| {
-                        format!("remove stale symlink {}", link.display())
-                    })?;
+                    std::fs::remove_file(&link)
+                        .with_context(|| format!("remove stale symlink {}", link.display()))?;
                 }
                 Ok(_) => bail!(
                     "ccteam team publish: {} exists and is not a symlink — \
@@ -426,13 +431,8 @@ pub fn publish_team(input: &PublishInput<'_>) -> Result<PublishReport> {
                 Err(_) => {}
             }
             #[cfg(unix)]
-            std::os::unix::fs::symlink(&staging, &link).with_context(|| {
-                format!(
-                    "symlink {} -> {}",
-                    link.display(),
-                    staging.display(),
-                )
-            })?;
+            std::os::unix::fs::symlink(&staging, &link)
+                .with_context(|| format!("symlink {} -> {}", link.display(), staging.display(),))?;
             #[cfg(not(unix))]
             std::fs::create_dir_all(&link).context("non-unix publish-local fallback")?;
             ensure_marketplace_json(&claude)?;
@@ -471,8 +471,7 @@ fn ensure_marketplace_json(claude_dir: &Path) -> Result<()> {
         .join("ccteam-local")
         .join("marketplace.json");
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     let body = serde_json::json!({
         "name": "ccteam-local",
@@ -679,10 +678,7 @@ mod tests {
         // team.yaml lives at root, NOT under .claude-plugin/, so the
         // plugin loader's zod schema strips it as an unknown root file
         // (alignment-review §2.7).
-        assert_eq!(
-            report.team_yaml_path.parent().unwrap(),
-            report.staging_dir,
-        );
+        assert_eq!(report.team_yaml_path.parent().unwrap(), report.staging_dir,);
     }
 
     #[test]
@@ -717,16 +713,6 @@ mod tests {
                 "phase {} body has bare ESCALATE token (F33)",
                 path.display(),
             );
-        }
-    }
-
-    #[test]
-    fn init_phase_frontmatter_parses_back_into_phase_template() {
-        let tmp = TempDir::new().unwrap();
-        let report = run_init(&tmp);
-        for path in &report.phase_paths {
-            let template = crate::phases::PhaseTemplate::load(path).unwrap();
-            template.validate_m0().unwrap();
         }
     }
 
@@ -835,7 +821,9 @@ mod tests {
         let staging = tmp.path().join("orphan");
         std::fs::create_dir_all(&staging).unwrap();
         let findings = validate_staged_team(&staging).unwrap();
-        assert!(findings.iter().any(|l| l.contains("[FAIL] missing plugin manifest")));
+        assert!(findings
+            .iter()
+            .any(|l| l.contains("[FAIL] missing plugin manifest")));
     }
 
     #[test]
@@ -847,7 +835,9 @@ mod tests {
         std::fs::write(staging.join("team.yaml"), "name: drifted\n").unwrap();
         let findings = validate_staged_team(&staging).unwrap();
         assert!(
-            findings.iter().any(|l| l.starts_with("[FAIL]") && l.contains("lock-step")),
+            findings
+                .iter()
+                .any(|l| l.starts_with("[FAIL]") && l.contains("lock-step")),
             "got: {findings:?}",
         );
     }
@@ -872,8 +862,7 @@ mod tests {
         let staging = staging_dir_for("example", Some(tmp.path()));
         assert_eq!(canonical, std::fs::canonicalize(&staging).unwrap());
         // marketplace.json exists under ccteam-local/.
-        let mkt = claude
-            .join("plugins/marketplaces/ccteam-local/marketplace.json");
+        let mkt = claude.join("plugins/marketplaces/ccteam-local/marketplace.json");
         assert!(mkt.exists());
     }
 
@@ -893,8 +882,7 @@ mod tests {
             .unwrap();
         }
         // Symlink survives the second pass.
-        let link = claude
-            .join("plugins/marketplaces/ccteam-local/plugins/example");
+        let link = claude.join("plugins/marketplaces/ccteam-local/plugins/example");
         assert!(link.exists());
     }
 

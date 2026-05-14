@@ -28,7 +28,11 @@ use tempfile::TempDir;
 
 const MARKER: &str = "# ccteam-managed:statusline begin (V0.3.1 F46";
 
-fn run_install(claude_dir: &std::path::Path, home: &std::path::Path, ccteam_home: &std::path::Path) -> std::process::Output {
+fn run_install(
+    claude_dir: &std::path::Path,
+    home: &std::path::Path,
+    ccteam_home: &std::path::Path,
+) -> std::process::Output {
     let bin = env!("CARGO_BIN_EXE_ccteam");
     Command::new(bin)
         .args(["doctor", "--install-statusline-adapter"])
@@ -51,7 +55,10 @@ fn fresh_install_writes_wrapper_with_marker_and_no_backup() {
     let out = run_install(&claude_dir, &home, &ccteam_home);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "exit not ok; stdout={stdout}; stderr={stderr}");
+    assert!(
+        out.status.success(),
+        "exit not ok; stdout={stdout}; stderr={stderr}"
+    );
 
     let target = claude_dir.join("statusline-command.sh");
     assert!(target.exists(), "wrapper file should exist");
@@ -100,7 +107,10 @@ fn install_over_user_file_creates_backup_and_passthrough() {
     let out = run_install(&claude_dir, &home, &ccteam_home);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "exit not ok; stdout={stdout}; stderr={stderr}");
+    assert!(
+        out.status.success(),
+        "exit not ok; stdout={stdout}; stderr={stderr}"
+    );
 
     // 1. Wrapper has marker.
     let body = std::fs::read_to_string(&target).unwrap();
@@ -114,7 +124,11 @@ fn install_over_user_file_creates_backup_and_passthrough() {
         .filter_map(|e| e.file_name().into_string().ok())
         .filter(|n| n.starts_with("statusline-command.sh.bak-"))
         .collect();
-    assert_eq!(backups.len(), 1, "expected exactly one backup; found {backups:?}");
+    assert_eq!(
+        backups.len(),
+        1,
+        "expected exactly one backup; found {backups:?}"
+    );
     let bak_name = &backups[0];
     let suffix = bak_name.trim_start_matches("statusline-command.sh.bak-");
     // Format `YYYYMMDDTHHMMSSZ` (16 chars).
@@ -137,7 +151,10 @@ fn install_over_user_file_creates_backup_and_passthrough() {
     );
 
     // 5. Report announces the backup path.
-    assert!(stdout.contains(bak_name.as_str()), "report missing backup path; stdout=\n{stdout}");
+    assert!(
+        stdout.contains(bak_name.as_str()),
+        "report missing backup path; stdout=\n{stdout}"
+    );
 }
 
 #[test]

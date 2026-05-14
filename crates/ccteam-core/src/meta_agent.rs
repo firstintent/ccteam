@@ -51,8 +51,7 @@ pub const META_SESSION_PREFIX: &str = "ccteam-meta-";
 /// Embedded role prompt template. Sourced from
 /// `crates/ccteam-core/src/templates/meta_agent_role.md` so the
 /// document is reviewable / diffable as markdown.
-const META_ROLE_PROMPT_TEMPLATE: &str =
-    include_str!("templates/meta_agent_role.md");
+const META_ROLE_PROMPT_TEMPLATE: &str = include_str!("templates/meta_agent_role.md");
 
 /// Build the meta-agent's canonical project slug from a user handle.
 /// Slug is `meta-<user>`, slugified, matching the dedicated tmux
@@ -194,8 +193,14 @@ mod tests {
     #[test]
     fn render_role_prompt_substitutes_user_handle() {
         let body = render_meta_role_prompt("rob");
-        assert!(body.contains("rob"), "role prompt should mention user handle");
-        assert!(!body.contains("__USER_HANDLE__"), "placeholder should be substituted");
+        assert!(
+            body.contains("rob"),
+            "role prompt should mention user handle"
+        );
+        assert!(
+            !body.contains("__USER_HANDLE__"),
+            "placeholder should be substituted"
+        );
         assert!(!body.contains("__GENERATED_AT__"));
     }
 
@@ -220,13 +225,13 @@ mod tests {
         let body = render_meta_role_prompt("rob");
         // The headings live in the template under section anchors.
         for required in [
-            "你是谁",            // identity
-            "决策树",            // decision tree
-            "克制规则",          // dispatcher-not-worker
-            "派单工具",          // dispatch tools
-            "监控规则",          // monitoring
-            "inbox",             // inbox handling
-            "outbox",            // outbox emission
+            "你是谁",   // identity
+            "决策树",   // decision tree
+            "克制规则", // dispatcher-not-worker
+            "派单工具", // dispatch tools
+            "监控规则", // monitoring
+            "inbox",    // inbox handling
+            "outbox",   // outbox emission
         ] {
             assert!(
                 body.contains(required),
@@ -304,5 +309,4 @@ mod tests {
         let body = std::fs::read_to_string(&cm).unwrap();
         assert!(body.contains("决策树"), "role prompt should be re-rendered");
     }
-
 }

@@ -99,11 +99,9 @@ pub fn pending_inject_path_in(project_dir: &Path) -> PathBuf {
 /// existing pending inject is replaced.
 pub fn save(path: &Path, record: &PendingInject) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    let body = serde_json::to_string_pretty(record)
-        .context("serialize pending-inject record")?;
+    let body = serde_json::to_string_pretty(record).context("serialize pending-inject record")?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, body).with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, path)
@@ -118,13 +116,12 @@ pub fn load(path: &Path) -> Result<Option<PendingInject>> {
     if !path.exists() {
         return Ok(None);
     }
-    let body = std::fs::read_to_string(path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let body = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     if body.trim().is_empty() {
         return Ok(None);
     }
-    let record: PendingInject = serde_json::from_str(&body)
-        .with_context(|| format!("parse {}", path.display()))?;
+    let record: PendingInject =
+        serde_json::from_str(&body).with_context(|| format!("parse {}", path.display()))?;
     Ok(Some(record))
 }
 
@@ -134,8 +131,7 @@ pub fn delete(path: &Path) -> Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err)
-            .with_context(|| format!("remove {}", path.display())),
+        Err(err) => Err(err).with_context(|| format!("remove {}", path.display())),
     }
 }
 
@@ -152,7 +148,11 @@ mod tests {
     #[test]
     fn pending_inject_path_lives_under_dot_ccteam() {
         let p = pending_inject_path_in(Path::new("/tmp/proj"));
-        assert!(p.ends_with(".ccteam/pending-inject.json"), "got {}", p.display());
+        assert!(
+            p.ends_with(".ccteam/pending-inject.json"),
+            "got {}",
+            p.display()
+        );
     }
 
     #[test]

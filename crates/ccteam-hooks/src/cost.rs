@@ -85,7 +85,9 @@ pub fn scan_transcript(path: &Path) -> Result<(f64, u64)> {
         // under `message`. Older prototypes used `type: "message"`.
         // We rely on `message.role` rather than the top-level `type`
         // so this handler tracks both schemas without churn.
-        let Some(msg) = v.get("message") else { continue };
+        let Some(msg) = v.get("message") else {
+            continue;
+        };
         if msg.get("role").and_then(|s| s.as_str()) != Some("assistant") {
             continue;
         }

@@ -130,8 +130,8 @@ pub struct OutboxMessage {
 impl InboxMessage {
     pub fn parse(source: &str) -> Result<Self> {
         let (front_yaml, body) = split_front_matter(source)?;
-        let front: InboxFrontMatter = serde_yaml::from_str(front_yaml)
-            .context("inbox front matter does not match schema")?;
+        let front: InboxFrontMatter =
+            serde_yaml::from_str(front_yaml).context("inbox front matter does not match schema")?;
         Ok(Self {
             front,
             body: body.to_string(),
@@ -141,14 +141,12 @@ impl InboxMessage {
     pub fn load(path: &Path) -> Result<Self> {
         let body = std::fs::read_to_string(path)
             .with_context(|| format!("read inbox {}", path.display()))?;
-        Self::parse(&body)
-            .with_context(|| format!("parse inbox {}", path.display()))
+        Self::parse(&body).with_context(|| format!("parse inbox {}", path.display()))
     }
 
     /// Render to the canonical `--- yaml --- body` form.
     pub fn to_string(&self) -> Result<String> {
-        let yaml = serde_yaml::to_string(&self.front)
-            .context("serialize inbox front matter")?;
+        let yaml = serde_yaml::to_string(&self.front).context("serialize inbox front matter")?;
         Ok(format!("---\n{yaml}---\n\n{}", self.body))
     }
 
@@ -173,13 +171,11 @@ impl OutboxMessage {
     pub fn load(path: &Path) -> Result<Self> {
         let body = std::fs::read_to_string(path)
             .with_context(|| format!("read outbox {}", path.display()))?;
-        Self::parse(&body)
-            .with_context(|| format!("parse outbox {}", path.display()))
+        Self::parse(&body).with_context(|| format!("parse outbox {}", path.display()))
     }
 
     pub fn to_string(&self) -> Result<String> {
-        let yaml = serde_yaml::to_string(&self.front)
-            .context("serialize outbox front matter")?;
+        let yaml = serde_yaml::to_string(&self.front).context("serialize outbox front matter")?;
         Ok(format!("---\n{yaml}---\n\n{}", self.body))
     }
 
@@ -256,9 +252,7 @@ fn list_messages(dir: &Path, prefix: &str) -> Result<Vec<PathBuf>> {
         .filter(|p| {
             p.file_name()
                 .and_then(|s| s.to_str())
-                .is_some_and(|n| {
-                    n.starts_with(prefix) && n.ends_with(".md") && !n.starts_with('.')
-                })
+                .is_some_and(|n| n.starts_with(prefix) && n.ends_with(".md") && !n.starts_with('.'))
         })
         .collect();
     out.sort();
@@ -269,14 +263,12 @@ fn list_messages(dir: &Path, prefix: &str) -> Result<Vec<PathBuf>> {
 /// dir if missing.
 fn atomic_write(path: &Path, body: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     let mut tmp_os = path.as_os_str().to_owned();
     tmp_os.push(".tmp");
     let tmp = PathBuf::from(tmp_os);
-    std::fs::write(&tmp, body)
-        .with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::write(&tmp, body).with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, path)
         .with_context(|| format!("rename {} → {}", tmp.display(), path.display()))?;
     Ok(())
@@ -299,7 +291,10 @@ fn split_front_matter(source: &str) -> Result<(&str, &str)> {
     } else {
         end + 5
     };
-    let body = after_first.get(body_start_offset..).unwrap_or("").trim_start_matches('\n');
+    let body = after_first
+        .get(body_start_offset..)
+        .unwrap_or("")
+        .trim_start_matches('\n');
     Ok((yaml, body))
 }
 
@@ -458,8 +453,18 @@ mod tests {
 
         let list = mb.list_inbox().unwrap();
         assert_eq!(list.len(), 2);
-        assert!(list[0].file_name().unwrap().to_str().unwrap().ends_with("-001.md"));
-        assert!(list[1].file_name().unwrap().to_str().unwrap().ends_with("-002.md"));
+        assert!(list[0]
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .ends_with("-001.md"));
+        assert!(list[1]
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .ends_with("-002.md"));
     }
 
     #[test]

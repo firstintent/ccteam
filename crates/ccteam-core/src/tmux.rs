@@ -131,15 +131,7 @@ impl TmuxSession {
         // the active window is — users with `base-index 1` in tmux.conf
         // have no window 0, and a hard-coded `:0` errors out.
         let _ = Command::new("tmux")
-            .args([
-                "resize-window",
-                "-t",
-                &self.name,
-                "-x",
-                "200",
-                "-y",
-                "50",
-            ])
+            .args(["resize-window", "-t", &self.name, "-x", "200", "-y", "50"])
             .output();
 
         Ok(())
@@ -177,7 +169,14 @@ impl TmuxSession {
             return Ok(None);
         }
         let output = Command::new("tmux")
-            .args(["display-message", "-p", "-t", &self.name, "-F", "#{pane_pid}"])
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                &self.name,
+                "-F",
+                "#{pane_pid}",
+            ])
             .output()
             .with_context(|| format!("spawn tmux display-message for {}", self.name))?;
         if !output.status.success() {
@@ -297,7 +296,9 @@ pub fn capture_pane_tail_from_session(
     if !output.status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&output.stdout).trim_end().to_string();
+    let text = String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string();
     if text.is_empty() {
         None
     } else {

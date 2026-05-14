@@ -36,11 +36,7 @@ pub const CCTEAM_PROJECT_CREATOR_SKILL_NAME: &str = "ccteam-project-creator";
 /// V0.2.2 F44: legacy V0.2.2 (F39'd) skill directory names that
 /// `ccteam doctor` migrates back. Exposed so the migration helper can
 /// scan for stale `cct-*` installs without re-declaring the names.
-pub const LEGACY_SKILL_NAMES: &[&str] = &[
-    "cct-control",
-    "cct-team-author",
-    "cct-project-creator",
-];
+pub const LEGACY_SKILL_NAMES: &[&str] = &["cct-control", "cct-team-author", "cct-project-creator"];
 
 /// Embedded `SKILL.md` body. Written verbatim during install.
 ///
@@ -96,9 +92,7 @@ pub fn install_ccteam_control_skill(opts: InstallSkillOptions) -> Result<Install
 /// V0.2 M0.22.1: install the `ccteam-team-author` skill into
 /// `~/.claude/skills/ccteam-team-author/SKILL.md`. Same idempotent
 /// semantics as `install_ccteam_control_skill`.
-pub fn install_ccteam_team_author_skill(
-    opts: InstallSkillOptions,
-) -> Result<InstallSkillReport> {
+pub fn install_ccteam_team_author_skill(opts: InstallSkillOptions) -> Result<InstallSkillReport> {
     let claude = user_claude_dir().context("resolve ~/.claude/")?;
     install_skill_body_into(
         &claude,
@@ -165,10 +159,8 @@ pub fn install_skill_body_into(
         });
     }
 
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("create {}", dir.display()))?;
-    std::fs::write(&target, body)
-        .with_context(|| format!("write {}", target.display()))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    std::fs::write(&target, body).with_context(|| format!("write {}", target.display()))?;
     Ok(InstallSkillReport {
         target,
         action: if exists {
@@ -205,7 +197,12 @@ mod tests {
         assert!(body.contains("---\nname: ccteam-control"));
         assert!(body.contains("allowed-tools: [Bash]"));
         // Required body chapters per interfaces §11.3.
-        for required in ["Capability index", "Typical workflows", "Decision principles", "What this skill cannot do"] {
+        for required in [
+            "Capability index",
+            "Typical workflows",
+            "Decision principles",
+            "What this skill cannot do",
+        ] {
             assert!(body.contains(required), "missing chapter: {required}");
         }
     }
@@ -224,7 +221,14 @@ mod tests {
         install_into(tmp.path(), InstallSkillOptions::default()).unwrap();
         let target = tmp.path().join("skills/ccteam-control/SKILL.md");
         std::fs::write(&target, "tampered\n").unwrap();
-        let r = install_into(tmp.path(), InstallSkillOptions { force: true, dry_run: false }).unwrap();
+        let r = install_into(
+            tmp.path(),
+            InstallSkillOptions {
+                force: true,
+                dry_run: false,
+            },
+        )
+        .unwrap();
         assert_eq!(r.action, SkillInstallAction::Replaced);
         let body = std::fs::read_to_string(&target).unwrap();
         assert!(body.contains("name: ccteam-control"));
@@ -235,13 +239,13 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let r = install_into(
             tmp.path(),
-            InstallSkillOptions { force: false, dry_run: true },
+            InstallSkillOptions {
+                force: false,
+                dry_run: true,
+            },
         )
         .unwrap();
-        assert_eq!(
-            r.action,
-            SkillInstallAction::DryRun { would_write: true },
-        );
+        assert_eq!(r.action, SkillInstallAction::DryRun { would_write: true },);
         assert!(!r.target.exists());
     }
 

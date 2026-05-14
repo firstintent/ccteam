@@ -141,9 +141,9 @@ impl LimboAction {
     /// the cap is exhausted.
     pub fn from(class: &SilenceClass) -> Self {
         match class {
-            SilenceClass::Healthy
-            | SilenceClass::Terminal
-            | SilenceClass::SubagentBusy => LimboAction::NoOp,
+            SilenceClass::Healthy | SilenceClass::Terminal | SilenceClass::SubagentBusy => {
+                LimboAction::NoOp
+            }
             SilenceClass::SubagentRunaway | SilenceClass::MidToolHung(_) => {
                 LimboAction::EnrichedEscalate
             }
@@ -299,13 +299,12 @@ pub fn load_retry_count(path: &Path, current_phase: &str) -> Result<LimboRetryCo
     if !path.exists() {
         return Ok(LimboRetryCount::fresh(current_phase));
     }
-    let body = std::fs::read_to_string(path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let body = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     if body.trim().is_empty() {
         return Ok(LimboRetryCount::fresh(current_phase));
     }
-    let counter: LimboRetryCount = serde_json::from_str(&body)
-        .with_context(|| format!("parse {}", path.display()))?;
+    let counter: LimboRetryCount =
+        serde_json::from_str(&body).with_context(|| format!("parse {}", path.display()))?;
     if counter.phase != current_phase {
         Ok(LimboRetryCount::fresh(current_phase))
     } else {
@@ -316,12 +315,10 @@ pub fn load_retry_count(path: &Path, current_phase: &str) -> Result<LimboRetryCo
 /// Persist the retry counter atomically (`<path>.tmp` then `rename`).
 pub fn save_retry_count(path: &Path, counter: &LimboRetryCount) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     let tmp = path.with_extension("json.tmp");
-    let body = serde_json::to_string_pretty(counter)
-        .context("serialize limbo-retry-count")?;
+    let body = serde_json::to_string_pretty(counter).context("serialize limbo-retry-count")?;
     std::fs::write(&tmp, body).with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, path)
         .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
@@ -425,7 +422,10 @@ mod tests {
     fn classify_mid_tool_below_warn_is_healthy() {
         let events = [pretool("Read")];
         // 4 min < default warn 5 min — tool calls < 5 min are normal.
-        assert_eq!(classify(&events, 4 * 60, &defaults()), SilenceClass::Healthy);
+        assert_eq!(
+            classify(&events, 4 * 60, &defaults()),
+            SilenceClass::Healthy
+        );
     }
 
     #[test]
@@ -509,10 +509,7 @@ mod tests {
 
     #[test]
     fn limbo_action_maps_classes_to_orchestrator_intent() {
-        assert_eq!(
-            LimboAction::from(&SilenceClass::Healthy),
-            LimboAction::NoOp,
-        );
+        assert_eq!(LimboAction::from(&SilenceClass::Healthy), LimboAction::NoOp,);
         assert_eq!(
             LimboAction::from(&SilenceClass::Terminal),
             LimboAction::NoOp,

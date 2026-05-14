@@ -3,8 +3,8 @@
 //! hook stdin payload that Claude Code would normally send, then
 //! asserts the resulting filesystem side effect.
 
-use std::path::{Path, PathBuf};
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use serde_json::{json, Value};
@@ -157,7 +157,10 @@ fn progress_append_writes_pretooluse_with_path_and_tool() {
     assert_eq!(e["event"], "PreToolUse");
     assert_eq!(e["tool"], "Edit");
     assert_eq!(e["path"], "src/db.ts");
-    assert!(e["ts"].as_str().unwrap().contains("T"), "ts must be ISO 8601");
+    assert!(
+        e["ts"].as_str().unwrap().contains("T"),
+        "ts must be ISO 8601"
+    );
 }
 
 #[test]
@@ -649,10 +652,7 @@ fn parse_phase_end_appends_needs_attention_when_stop_hook_active_recurses() {
     // a `needs_attention.outbox.json` so the watchdog (M0.21) can
     // surface the stall to the user.
     let fx = Fixture::new("bookmark-mgr-a3f9");
-    fx.write_transcript(&[assistant_message(
-        "I'll keep waiting for clarity.",
-        None,
-    )]);
+    fx.write_transcript(&[assistant_message("I'll keep waiting for clarity.", None)]);
     let stdin = json!({
         "cwd": fx.project_dir,
         "transcript_path": fx.transcript_path,
@@ -663,7 +663,10 @@ fn parse_phase_end_appends_needs_attention_when_stop_hook_active_recurses() {
     assert_eq!(decision, ccteam_hooks::ParseDecision::Continue);
 
     let outbox = ccteam_hooks::needs_attention_outbox_path(&fx.project_dir);
-    assert!(outbox.exists(), "needs_attention.outbox.json must be written");
+    assert!(
+        outbox.exists(),
+        "needs_attention.outbox.json must be written"
+    );
     let body: Value = serde_json::from_slice(&std::fs::read(&outbox).unwrap()).unwrap();
     assert_eq!(body["schema_version"], 1);
     assert_eq!(body["slug"], "bookmark-mgr-a3f9");
@@ -687,10 +690,10 @@ fn parse_phase_end_ignores_stale_outbox_from_previous_phase() {
     std::fs::write(&stale, "old").unwrap();
 
     // Backdate the stale file so phase_inject's ts is "later".
-    let early = std::time::SystemTime::UNIX_EPOCH
-        + std::time::Duration::from_secs(1_700_000_000);
+    let early = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
     let f = std::fs::File::options().write(true).open(&stale).unwrap();
-    f.set_times(std::fs::FileTimes::new().set_modified(early)).unwrap();
+    f.set_times(std::fs::FileTimes::new().set_modified(early))
+        .unwrap();
 
     let progress_path = fx.paths.progress_jsonl(&fx.slug);
     std::fs::create_dir_all(progress_path.parent().unwrap()).unwrap();
@@ -724,10 +727,7 @@ fn parse_phase_end_treats_legacy_outbox_files_as_fresh_when_no_phase_inject() {
     // must still treat any pre-existing outbox file as legitimate and
     // keep returning Continue.
     let fx = Fixture::new("bookmark-mgr-a3f9");
-    fx.write_transcript(&[assistant_message(
-        "see clarify file",
-        None,
-    )]);
+    fx.write_transcript(&[assistant_message("see clarify file", None)]);
     let outbox = fx.project_dir.join(".ccteam").join("outbox");
     std::fs::create_dir_all(&outbox).unwrap();
     std::fs::write(outbox.join("clarify-pre-existing.md"), "body").unwrap();
@@ -752,10 +752,7 @@ fn parse_phase_end_does_not_recurse_after_first_block_missing_output() {
         "stop_hook_active": true,
     });
     let decision = parse_phase_end(&fx.paths, &stdin).unwrap();
-    assert!(matches!(
-        decision,
-        ccteam_hooks::ParseDecision::Continue
-    ));
+    assert!(matches!(decision, ccteam_hooks::ParseDecision::Continue));
 }
 
 #[test]

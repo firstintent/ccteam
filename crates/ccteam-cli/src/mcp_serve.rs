@@ -36,13 +36,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 // returns ≥ 2 hits.
 use ccteam_core::actions;
 use ccteam_core::{
-    bootstrap_project, check_daemon_health, pick_unused_slug,
-    render_screenshot, CcteamPaths, DaemonHealth, SendOptions,
+    bootstrap_project, check_daemon_health, pick_unused_slug, render_screenshot, CcteamPaths,
+    DaemonHealth, SendOptions,
 };
 
-use crate::commands::{
-    collect_projects, collect_recent_events, run_peek, run_show, OutputFormat,
-};
+use crate::commands::{collect_projects, collect_recent_events, run_peek, run_show, OutputFormat};
 
 /// Stable MCP protocol version this server speaks. Newer client versions
 /// downgrade gracefully because we never advertise capabilities we don't
@@ -73,11 +71,7 @@ pub async fn run_mcp_serve(paths: CcteamPaths) -> Result<()> {
         let req: Value = match serde_json::from_str(trimmed) {
             Ok(v) => v,
             Err(err) => {
-                let err_obj = json_rpc_error(
-                    None,
-                    -32700,
-                    &format!("parse error: {err}"),
-                );
+                let err_obj = json_rpc_error(None, -32700, &format!("parse error: {err}"));
                 write_message(&mut stdout, &err_obj).await?;
                 continue;
             }
@@ -94,10 +88,7 @@ pub async fn run_mcp_serve(paths: CcteamPaths) -> Result<()> {
 /// requests (which carry an `id`) and `None` for notifications.
 async fn handle_request(paths: &CcteamPaths, req: &Value) -> Option<Value> {
     let id = req.get("id").cloned();
-    let method = req
-        .get("method")
-        .and_then(|m| m.as_str())
-        .unwrap_or("");
+    let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or(json!({}));
 
     // Notifications (no `id`) never get a reply.
@@ -257,10 +248,7 @@ fn object_schema(props: &[(&str, &str, &str)]) -> Value {
     let mut p = serde_json::Map::new();
     let mut required = Vec::new();
     for (name, ty, desc) in props {
-        p.insert(
-            (*name).into(),
-            json!({ "type": ty, "description": desc }),
-        );
+        p.insert((*name).into(), json!({ "type": ty, "description": desc }));
         required.push(*name);
     }
     json!({
@@ -277,10 +265,7 @@ async fn call_tool(paths: &CcteamPaths, params: &Value) -> Result<Vec<Value>> {
         .get("name")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("tools/call missing `name`"))?;
-    let args = params
-        .get("arguments")
-        .cloned()
-        .unwrap_or(json!({}));
+    let args = params.get("arguments").cloned().unwrap_or(json!({}));
     match name {
         "ccteam__ls" => Ok(text_content(tool_ls(paths)?)),
         "ccteam__show" => Ok(text_content(tool_show(paths, &args)?)),
@@ -328,10 +313,10 @@ fn text_content(body: String) -> Vec<Value> {
 
 fn tool_ls(paths: &CcteamPaths) -> Result<String> {
     let projects = collect_projects(paths)?;
-    let active_count = projects
-        .iter()
-        .filter(|p| matches!(p.state.phase_state, ccteam_core::PhaseState::InFlight))
-        .count();
+    // V0.4.0 F60: active_count was derived from `phase_state == InFlight`;
+    // with the phase state machine deleted F66 will recompute this from
+    // `state.sessions` (live agent count).
+    let active_count = 0usize;
     let arr: Vec<Value> = projects
         .iter()
         .map(|p| {
@@ -340,10 +325,8 @@ fn tool_ls(paths: &CcteamPaths) -> Result<String> {
                 "team": p.state.team,
                 "current_phase": p.state.current_phase,
                 "phase_state": match p.state.phase_state {
-                    ccteam_core::PhaseState::InFlight => "in_flight",
                     ccteam_core::PhaseState::Idle => "idle",
-                    ccteam_core::PhaseState::AutoLocked => "fix_locked",
-                    ccteam_core::PhaseState::DonePending { .. } => "done_pending",
+                    ccteam_core::PhaseState::Done => "done",
                 },
                 "cost_used_usd": p.state.cost_used_usd,
                 "tmux_session": p.state.tmux_session,
@@ -397,10 +380,7 @@ fn tool_peek(paths: &CcteamPaths, args: &Value) -> Result<String> {
 
 fn tool_progress(paths: &CcteamPaths, args: &Value) -> Result<String> {
     let slug = arg_string(args, "slug")?;
-    let last_n = args
-        .get("last_n")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(50) as usize;
+    let last_n = args.get("last_n").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
     let events = collect_recent_events(paths, &slug, last_n)?;
     Ok(serde_json::to_string_pretty(&json!({ "events": events }))?)
 }
@@ -474,9 +454,7 @@ fn tool_inject_decision(paths: &CcteamPaths, args: &Value) -> Result<String> {
         .get("reason")
         .and_then(|v| v.as_str())
         .unwrap_or("(no reason provided)");
-    let target_phase = inner_args
-        .get("target_phase")
-        .and_then(|v| v.as_str());
+    let target_phase = inner_args.get("target_phase").and_then(|v| v.as_str());
 
     // Build a structured NL message that the in-session claude can
     // recognize as a meta-agent decision. The body re-uses the
@@ -527,10 +505,7 @@ fn tool_inject_decision(paths: &CcteamPaths, args: &Value) -> Result<String> {
 /// `Err()` for those paths so callers can attach the reason in NL.
 fn tool_screenshot(paths: &CcteamPaths, args: &Value) -> Result<String> {
     let slug = arg_string(args, "slug")?;
-    let lines = args
-        .get("lines")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(50) as usize;
+    let lines = args.get("lines").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
     match render_screenshot(paths, &slug, None, lines)? {
         Some(path) => Ok(serde_json::to_string_pretty(&json!({
             "ok": true,
@@ -566,10 +541,7 @@ fn json_rpc_error(id: Option<Value>, code: i32, message: &str) -> Value {
     })
 }
 
-async fn write_message(
-    stdout: &mut tokio::io::Stdout,
-    msg: &Value,
-) -> Result<()> {
+async fn write_message(stdout: &mut tokio::io::Stdout, msg: &Value) -> Result<()> {
     let mut line = serde_json::to_string(msg).context("serialize MCP message")?;
     line.push('\n');
     stdout
@@ -628,15 +600,14 @@ pub fn install_mcp_into(claude_json: &std::path::Path, ccteam_bin: &std::path::P
 
     let body = serde_json::to_string_pretty(&Value::Object(root))?;
     if let Some(parent) = claude_json.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     let mut tmp_os = claude_json.as_os_str().to_owned();
     tmp_os.push(".ccteam-mcp.tmp");
     let tmp = std::path::PathBuf::from(tmp_os);
     {
-        let mut f = std::fs::File::create(&tmp)
-            .with_context(|| format!("create {}", tmp.display()))?;
+        let mut f =
+            std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
         f.write_all(body.as_bytes())?;
     }
     std::fs::rename(&tmp, claude_json)
@@ -672,10 +643,7 @@ mod tests {
     #[test]
     fn tool_definitions_have_unique_names_and_object_schemas() {
         let tools = tool_definitions();
-        let mut names: Vec<&str> = tools
-            .iter()
-            .map(|t| t["name"].as_str().unwrap())
-            .collect();
+        let mut names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         names.sort();
         names.dedup();
         assert_eq!(names.len(), 10, "tool names must be unique");
@@ -713,7 +681,10 @@ mod tests {
         install_mcp_into(&claude_json, &ccteam_bin).unwrap();
         let body = std::fs::read_to_string(&claude_json).unwrap();
         let v: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(v["mcpServers"]["ccteam"]["command"], "/usr/local/bin/ccteam");
+        assert_eq!(
+            v["mcpServers"]["ccteam"]["command"],
+            "/usr/local/bin/ccteam"
+        );
         assert_eq!(v["mcpServers"]["ccteam"]["args"][0], "mcp-serve");
     }
 
@@ -727,7 +698,8 @@ mod tests {
         )
         .unwrap();
         install_mcp_into(&claude_json, &std::path::PathBuf::from("/x/ccteam")).unwrap();
-        let v: Value = serde_json::from_str(&std::fs::read_to_string(&claude_json).unwrap()).unwrap();
+        let v: Value =
+            serde_json::from_str(&std::fs::read_to_string(&claude_json).unwrap()).unwrap();
         assert_eq!(v["userID"], "rob");
         assert_eq!(v["mcpServers"]["playwright"]["command"], "npx");
         assert_eq!(v["mcpServers"]["ccteam"]["command"], "/x/ccteam");
@@ -788,10 +760,7 @@ mod tests {
         let resp = handle_request(&paths, &req).await.unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 10);
-        let names: Vec<&str> = tools
-            .iter()
-            .map(|t| t["name"].as_str().unwrap())
-            .collect();
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"ccteam__screenshot"));
     }
 
@@ -900,7 +869,11 @@ mod tests {
         assert_eq!(resp["result"]["isError"], false);
         let inbox = paths.project_ccteam_dir("demo").join("inbox");
         let entries: Vec<_> = std::fs::read_dir(&inbox).unwrap().collect();
-        assert_eq!(entries.len(), 1, "send_to_session must write exactly one inbox file");
+        assert_eq!(
+            entries.len(),
+            1,
+            "send_to_session must write exactly one inbox file"
+        );
     }
 
     #[tokio::test]
@@ -1012,8 +985,7 @@ mod tests {
         let content = resp["result"]["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(content).unwrap();
         assert_eq!(
-            parsed["orchestrator"]["daemon_health"]["status"],
-            "no_heartbeat",
+            parsed["orchestrator"]["daemon_health"]["status"], "no_heartbeat",
             "ls must annotate daemon health when daemon is down"
         );
     }

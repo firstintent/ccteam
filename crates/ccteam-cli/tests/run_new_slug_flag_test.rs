@@ -161,7 +161,9 @@ fn cct_new_tier3_reads_from_stub_claude_bin() {
         "expected stubbed slug in output; got:\n{stdout}\nstderr:\n{stderr}",
     );
     assert!(
-        projects_root.join("dev-tier3-stub-slug/.ccteam/spec.md").is_file(),
+        projects_root
+            .join("dev-tier3-stub-slug/.ccteam/spec.md")
+            .is_file(),
         "spec.md must exist under projects_root for the stubbed slug",
     );
 }
@@ -179,11 +181,7 @@ fn cct_new_tier3_falls_back_to_tier4_when_stub_returns_garbage() {
 
     let stub = tmp.path().join("claude-garbage.sh");
     // Empty stdout → sanitizer rejects → Tier 4 fallback.
-    std::fs::write(
-        &stub,
-        b"#!/usr/bin/env sh\ncat > /dev/null\nprintf ''\n",
-    )
-    .expect("write stub");
+    std::fs::write(&stub, b"#!/usr/bin/env sh\ncat > /dev/null\nprintf ''\n").expect("write stub");
     let mut perms = std::fs::metadata(&stub).unwrap().permissions();
     use std::os::unix::fs::PermissionsExt;
     perms.set_mode(0o755);

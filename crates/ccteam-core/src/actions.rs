@@ -36,7 +36,7 @@ use crate::inbox::{
     inbox_filename, InboxFrontMatter, InboxMessage, SessionMailbox, LATEST_SCHEMA_VERSION,
 };
 use crate::paths::CcteamPaths;
-use crate::state::{PhaseHistoryEntry, PhaseState, ProjectState};
+use crate::state::{PhaseState, ProjectState};
 
 /// Source label every action helper stamps onto inbox front matter.
 ///
@@ -209,15 +209,17 @@ pub fn pause(paths: &CcteamPaths, slug: &str) -> Result<()> {
     Ok(())
 }
 
-/// Resume a paused / escalated project.
+/// Resume a paused project.
 ///
 /// Clears `user_pause_pending`, lifts `user_attached`, re-arms
-/// `phase_state=Idle` so the daemon's next tick re-dispatches the
-/// current phase. Appends a `"resumed"` `PhaseHistoryEntry` when the
-/// last entry is `"escalated"` (append-only — the prior escalated
-/// entry stays auditable). Archives any sibling `escalation.md` to
+/// `phase_state=Idle` so the F66 workflow loop's next tick can
+/// re-evaluate. Archives any sibling `escalation.md` to
 /// `escalation.<context_reset_count>.md` so future ESCALATE writes
 /// don't collide.
+///
+/// V0.4.0 F60: the legacy `phase_history` resume marker is gone with
+/// the rest of the phase machinery. F66 reintroduces resume tracking
+/// on the new workflow event log.
 pub fn resume(paths: &CcteamPaths, slug: &str) -> Result<()> {
     let state_path = paths.project_state(slug);
     let mut state =
@@ -226,17 +228,6 @@ pub fn resume(paths: &CcteamPaths, slug: &str) -> Result<()> {
     state.user_attached = false;
     state.phase_state = PhaseState::Idle;
     state.last_user_interaction_at = Utc::now();
-    if matches!(
-        state.phase_history.last().map(|h| h.status.as_str()),
-        Some("escalated"),
-    ) {
-        state.phase_history.push(PhaseHistoryEntry {
-            phase: state.current_phase.clone(),
-            status: "resumed".into(),
-            duration_s: 0,
-            cost_usd: 0.0,
-        });
-    }
     state.save(&state_path)?;
 
     let esc = paths.project_ccteam_dir(slug).join("escalation.md");
@@ -415,18 +406,11 @@ mod tests {
         bootstrap_project(&paths, "demo", "demo request", "dev").unwrap();
         let state_path = paths.project_state("demo");
 
-        // Set up a paused + escalated state.
+        // Set up a paused state.
         {
             let mut s = ProjectState::load(&state_path).unwrap();
             s.user_pause_pending = true;
             s.user_attached = true;
-            s.phase_state = PhaseState::AutoLocked;
-            s.phase_history.push(PhaseHistoryEntry {
-                phase: s.current_phase.clone(),
-                status: "escalated".into(),
-                duration_s: 0,
-                cost_usd: 0.0,
-            });
             s.save(&state_path).unwrap();
         }
 
@@ -436,16 +420,6 @@ mod tests {
         assert!(!after.user_pause_pending);
         assert!(!after.user_attached);
         assert_eq!(after.phase_state, PhaseState::Idle);
-        // Append-only history: escalated entry survives + a "resumed"
-        // entry is appended.
-        let last_two: Vec<&str> = after
-            .phase_history
-            .iter()
-            .rev()
-            .take(2)
-            .map(|h| h.status.as_str())
-            .collect();
-        assert_eq!(last_two, vec!["resumed", "escalated"]);
     }
 
     #[test]
@@ -464,18 +438,6 @@ mod tests {
             .filter(|n| n.starts_with("escalation.") && n.ends_with(".md"))
             .collect();
         assert_eq!(entries.len(), 1, "expected exactly one archived escalation");
-    }
-
-    #[test]
-    fn resume_does_not_append_resumed_when_no_escalated_entry() {
-        let (_tmp, paths) = isolated_paths();
-        bootstrap_project(&paths, "demo", "demo request", "dev").unwrap();
-        let state_path = paths.project_state("demo");
-        let before = ProjectState::load(&state_path).unwrap();
-        let history_len = before.phase_history.len();
-        resume(&paths, "demo").unwrap();
-        let after = ProjectState::load(&state_path).unwrap();
-        assert_eq!(after.phase_history.len(), history_len);
     }
 
     #[test]
