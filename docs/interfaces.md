@@ -2289,3 +2289,85 @@ SPA 用此值判断是否需要 token-entry flow。auth_layer 仍 gates 此 endp
 - token 不出现于 `/api/v1/projects` / `/api/v1/projects/{slug}` /
   `/api/v1/projects/{slug}/sessions/{sid}` JSON;仅 `/api/v1/auth/token` 暴露。
 - HTML 路径 §15 完全不动;F59 才下线。
+
+---
+
+## 17. V0.4.0 `workflow.yaml` schema(F63)
+
+> 完整解析器:`crates/ccteam-core/src/workflow.rs`(`WorkflowSpec` /
+> `AgentSpec` / `Trigger` / `Executor` / `OnTimeout` / `WorkflowError`)。
+> 进入项目目录后 `WorkflowSpec::load_for_project(<dir>)` 自动从
+> `<dir>/workflow.yaml` 或 fallback `<dir>/.ccteam/workflow.yaml` 加载。
+
+### 17.1 顶层字段
+
+```yaml
+name: <string>            # 必填。workflow 标识(项目内唯一)
+description: <string>     # 可选。供 meta-agent / web UI 展示
+agents:                   # 必填。map<role-name, AgentSpec>;非空
+  <role-name>: <AgentSpec>
+  ...
+```
+
+- `agents` 解析为 `IndexMap<String, AgentSpec>`,**保留 YAML 声明顺序**——
+  trigger graph 构建 / 日志输出 / fixture round-trip 都依赖此顺序确定性。
+- `role-name` 只允许 `[a-z0-9_-]`,长度 ≥ 1;**必须**对应
+  `.claude/agents/<role>.md`(orchestrator 启动时校验,F66 落地)。
+
+### 17.2 `AgentSpec` 字段
+
+| 字段 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `executor` | `claude` \| `codex` | `claude` | 选择哪个 harness 二进制(F61 ClaudeCodeAdapter / F62 CodexAdapter)|
+| `trigger` | scalar string | 必填 | 见 §17.3 |
+| `parallelism` | `u32` | `None`(等价 1) | 同时最多多少个 session 实例。`> 1` **仅** `watch:` 合法 |
+| `input` | path | `None` | artifact 输入目录(相对项目根),F64 watcher 派发时通过 `CCTEAM_INPUT` env 注入 spawned harness |
+| `output` | path | `None` | artifact 输出目录,通过 `CCTEAM_OUTPUT` 注入 |
+| `interval` | duration string | `None` | 仅 `trigger: schedule` 有效(V0.4.0 占位,V0.4.1 接 cron)|
+| `timeout` | duration string | `None` | 单 session 软超时(F64+ watchdog 消费)|
+| `on_timeout` | `escalate` \| `retry` \| `skip` | `None`(等价 `escalate`) | 超时动作 |
+
+**红线(schema 级 hard error)**:`workflow.yaml` 内**不允许**出现
+`prompt:` / `system_prompt:` / `messages:` 字段——所有 prompt 内容
+住在 `.claude/agents/<role>.md`,不进 workflow.yaml。
+
+### 17.3 `trigger` 标量字符串语法
+
+| 形式 | `Trigger` 变体 | 语义 |
+|---|---|---|
+| `manual` | `Trigger::Manual` | meta-agent 或用户显式 `ccteam trigger <role>` 才派发 |
+| `schedule` | `Trigger::Schedule` | 定时(V0.4.0 stub:meta-agent 手动触发占位;V0.4.1 接 `interval`)|
+| `gate` | `Trigger::Gate` | 等 `trigger_gate` MCP 调用解锁(必须有 `input`)|
+| `watch:<path>` | `Trigger::Watch(PathBuf)` | F64 inotify watcher 监 `<path>` 新文件 → 派发 |
+
+### 17.4 校验规则(`WorkflowSpec::validate`)
+
+1. `agents` map 非空。
+2. role 名字符集 `[a-z0-9_-]`,非空。
+3. `trigger: watch:<path>` 的 `<path>` 非空(`watch:` 单独 → `ValidationFailed`)。
+4. `trigger: gate` 必须有 `input`。
+5. `parallelism > 1` 只允许 `watch:` trigger;`schedule` / `gate` / `manual` 单实例。
+
+### 17.5 `WorkflowError` 变体
+
+| 变体 | 触发 |
+|---|---|
+| `NotFound(PathBuf)` | `load_for_project` 两处都不存在 |
+| `ReadFailed(io::Error)` | 文件系统读失败(权限 / EIO 等)|
+| `ParseFailed(serde_yaml::Error)` | YAML 语法 / 未知 enum 变体(如 `executor: unknown`)|
+| `ValidationFailed(String)` | 上述 5 条结构校验失败,String 携带 role + 原因 |
+
+### 17.6 Fixture 参考
+
+- `crates/ccteam-core/tests/fixtures/workflow-ui-quality-loop.yaml` ——
+  4 个 agent(`explorer` manual / `fixer` watch+parallel=10 /
+  `reviewer` watch codex / `shipper` gate)
+- `crates/ccteam-core/tests/fixtures/workflow-research-loop.yaml` ——
+  2 个 agent(`claw` manual / `evaluator` watch+parallel=5)
+
+### 17.7 不破坏的红线
+
+- workflow.rs 是**纯数据 + 校验**:不写 `progress.jsonl`,不动 tmux,
+  不接 MCP。F64 watcher / F65 MCP / F66 orchestrator 才接 IO。
+- 不出现 team 名字面量(无 `"dev"` / `"qa"` / `"ccteam"` 等;test 文本
+  除外)。F66 orchestrator 通过 role 名(用户定义数据)驱动调度。

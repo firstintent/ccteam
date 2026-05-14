@@ -19,6 +19,14 @@ anyhow.workspace = true
 regex.workspace = true
 thiserror.workspace = true
 
+# V0.4.0 F63 — workflow.yaml parser. IndexMap preserves agent declaration
+# order from YAML so trigger graph build / log output / fixture round-trips
+# remain deterministic. serde feature so AgentSpec can derive Deserialize on
+# `agents: IndexMap<String, AgentSpec>` directly. Already present transitively
+# (serde_yaml → indexmap v2.x) so this only promotes it to a direct dep with
+# the serde feature opt-in.
+indexmap = { version = "2", features = ["serde"] }
+
 # V0.2.2 F38 — terminal screenshot pipeline (vt100 + imageproc DIY).
 # All four crates are pure Rust; no system C deps (libfontconfig /
 # libfreetype). See `docs/v0-2-2/prd.md` §7 for the full rationale.

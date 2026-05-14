@@ -34,6 +34,9 @@ pub mod templates;
 pub mod tmux;
 pub mod tool_surface;
 pub mod watchdog;
+// V0.4.0 F63 — workflow.yaml schema + parser. Pure data + validation;
+// no IO side effects beyond reading the YAML file. See module docs.
+pub mod workflow;
 
 pub use actions::{
     inject_decision, next_inbox_seq, pause, resume, send_to_session, send_to_session_with,
@@ -170,6 +173,8 @@ pub use watchdog::{
     AlertKind as WatchdogAlertKind, NotifyMode as WatchdogNotifyMode, WatchdogAlert,
     WatchdogConfig, DEFAULT_NOTIFY_ON_CYCLE_COUNT, WATCHDOG_CONFIG_FILENAME,
 };
+// V0.4.0 F63 — workflow.yaml schema.
+pub use workflow::{AgentSpec, Executor, OnTimeout, Trigger, WorkflowError, WorkflowSpec};
 
 /// Crate version, identical to the workspace package version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
