@@ -23,6 +23,7 @@
 //! JSON-RPC 2.0 error object shape (interfaces §12).
 
 use std::io::Write;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
@@ -51,6 +52,36 @@ use crate::mcp_workflow_tools;
 /// implement.
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
+/// How often to poll for orphan / idle-timeout shutdown conditions.
+/// Cheap (one `getppid()` + an `Instant::elapsed()`); 30s keeps the
+/// overhead negligible while still catching the parent-died case
+/// within one tick.
+const MCP_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+
+/// No JSON-RPC traffic for this long ⇒ the parent isn't using us,
+/// suicide so we don't pile up. Defaults to 5 minutes; the
+/// `CCTEAM_MCP_IDLE_TIMEOUT_SECS` env var overrides for tests.
+const MCP_DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+fn mcp_idle_timeout() -> Duration {
+    std::env::var("CCTEAM_MCP_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(MCP_DEFAULT_IDLE_TIMEOUT)
+}
+
+#[cfg(unix)]
+fn current_ppid() -> i32 {
+    // SAFETY: getppid is always-safe; returns this process's parent
+    // PID. Cast pid_t (i32 on Linux, i32 on macOS) to i32.
+    unsafe { libc::getppid() as i32 }
+}
+#[cfg(not(unix))]
+fn current_ppid() -> i32 {
+    0
+}
+
 /// Server identity advertised in `initialize`.
 const SERVER_NAME: &str = "ccteam";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -63,14 +94,20 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// - SIGTERM (kernel via [`set_pdeathsig_sigterm`] when parent dies, or
 ///   explicit `kill -TERM`)
 /// - SIGINT (Ctrl-C in interactive testing)
+/// - parent reparented (getppid changed → original parent died but
+///   PR_SET_PDEATHSIG signal didn't reach us, e.g. when an
+///   intermediate shell shielded it)
+/// - idle for [`MCP_DEFAULT_IDLE_TIMEOUT`] (no JSON-RPC traffic; parent
+///   is alive but stopped talking to us — a stale zombie session)
 ///
-/// The signal arm exists because some Claude Code spawn paths leave
-/// stdin attached to /dev/null or a keep-alive pipe, so the
-/// `next_line()` reader never sees EOF when the parent goes away. The
-/// `PR_SET_PDEATHSIG` syscall guarantees the kernel sends us SIGTERM
-/// the instant our parent exits on Linux, regardless of stdin state.
+/// The orphan and idle arms are belt-and-suspenders on top of stdin
+/// EOF + `PR_SET_PDEATHSIG`. On WSL and some claude-spawn paths
+/// neither of those fires reliably, so without these belts mcp-serve
+/// processes pile up one-per-bg-job and exhaust file descriptors.
 pub async fn run_mcp_serve(paths: CcteamPaths) -> Result<()> {
     set_pdeathsig_sigterm();
+    let original_ppid = current_ppid();
+    let idle_timeout = mcp_idle_timeout();
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin).lines();
     let mut stdout = tokio::io::stdout();
@@ -78,10 +115,21 @@ pub async fn run_mcp_serve(paths: CcteamPaths) -> Result<()> {
     let mut sigterm = signal_stream(SignalKind::terminate());
     let mut sigint = signal_stream(SignalKind::interrupt());
 
+    let mut health_ticker = tokio::time::interval(MCP_HEALTH_CHECK_INTERVAL);
+    health_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // First tick fires immediately; swallow it so the orphan / idle
+    // checks don't run before we've had a chance to do any work.
+    health_ticker.tick().await;
+
+    let mut last_activity = Instant::now();
+
     loop {
         let line = tokio::select! {
             line = reader.next_line() => match line.context("read stdin from MCP client")? {
-                Some(l) => l,
+                Some(l) => {
+                    last_activity = Instant::now();
+                    l
+                }
                 None => return Ok(()), // stdin EOF
             },
             _ = signal_recv(&mut sigterm) => {
@@ -91,6 +139,22 @@ pub async fn run_mcp_serve(paths: CcteamPaths) -> Result<()> {
             _ = signal_recv(&mut sigint) => {
                 tracing::info!("mcp-serve: SIGINT; shutting down");
                 return Ok(());
+            }
+            _ = health_ticker.tick() => {
+                if should_exit_for_orphan(original_ppid) {
+                    tracing::info!(original_ppid, current_ppid = current_ppid(),
+                        "mcp-serve: parent reparented (orphan); shutting down");
+                    return Ok(());
+                }
+                if last_activity.elapsed() >= idle_timeout {
+                    tracing::info!(
+                        idle_secs = last_activity.elapsed().as_secs(),
+                        timeout_secs = idle_timeout.as_secs(),
+                        "mcp-serve: idle timeout reached; shutting down"
+                    );
+                    return Ok(());
+                }
+                continue;
             }
         };
         let trimmed = line.trim();
@@ -110,6 +174,22 @@ pub async fn run_mcp_serve(paths: CcteamPaths) -> Result<()> {
             write_message(&mut stdout, &response).await?;
         }
     }
+}
+
+/// Returns true if our parent process has changed since startup —
+/// strong signal that the original parent died and we got reparented
+/// to init or a subreaper. On Unix we trust `getppid()`; on non-Unix
+/// we always return false (no equivalent).
+///
+/// `original_ppid == 0` (the non-unix default) short-circuits this
+/// check to off so the function is a no-op on platforms where we
+/// can't observe parent identity.
+fn should_exit_for_orphan(original_ppid: i32) -> bool {
+    if original_ppid == 0 {
+        return false;
+    }
+    let now = current_ppid();
+    now != original_ppid || now == 1
 }
 
 /// On Linux ask the kernel to send us SIGTERM the moment our parent
@@ -1098,6 +1178,55 @@ mod tests {
             parsed["orchestrator"]["daemon_health"]["status"], "no_heartbeat",
             "ls must annotate daemon health when daemon is down"
         );
+    }
+
+    #[test]
+    fn should_exit_for_orphan_returns_true_on_ppid_change() {
+        // Simulate "we started under ppid=12345; now getppid() returns
+        // something else" by passing an impossible original ppid.
+        // current_ppid() returns this test process's real ppid, which
+        // will never equal 12345 → orphan.
+        assert!(should_exit_for_orphan(12345));
+    }
+
+    #[test]
+    fn should_exit_for_orphan_is_noop_when_original_ppid_zero() {
+        // Non-unix builds set original_ppid=0 ⇒ orphan check disabled.
+        assert!(!should_exit_for_orphan(0));
+    }
+
+    #[test]
+    fn should_exit_for_orphan_returns_false_when_ppid_unchanged() {
+        let ppid = current_ppid();
+        if ppid == 0 {
+            // Non-unix path; nothing to assert.
+            return;
+        }
+        // current ppid == original ppid AND not 1 ⇒ still attached.
+        if ppid == 1 {
+            // Test process happens to be PID 1 (e.g. inside a minimal
+            // container); orphan check correctly reports orphan.
+            assert!(should_exit_for_orphan(ppid));
+        } else {
+            assert!(!should_exit_for_orphan(ppid));
+        }
+    }
+
+    #[test]
+    fn mcp_idle_timeout_reads_env_then_falls_back_to_default() {
+        // Single test exercises both the env-override path and the
+        // default-on-missing path so the two halves don't race against
+        // each other under `cargo test`'s parallel runner. No other
+        // test touches CCTEAM_MCP_IDLE_TIMEOUT_SECS so this is the only
+        // user of the var.
+        let prev = std::env::var("CCTEAM_MCP_IDLE_TIMEOUT_SECS").ok();
+        std::env::set_var("CCTEAM_MCP_IDLE_TIMEOUT_SECS", "7");
+        assert_eq!(mcp_idle_timeout(), Duration::from_secs(7));
+        std::env::remove_var("CCTEAM_MCP_IDLE_TIMEOUT_SECS");
+        assert_eq!(mcp_idle_timeout(), MCP_DEFAULT_IDLE_TIMEOUT);
+        if let Some(v) = prev {
+            std::env::set_var("CCTEAM_MCP_IDLE_TIMEOUT_SECS", v);
+        }
     }
 
     #[tokio::test]
