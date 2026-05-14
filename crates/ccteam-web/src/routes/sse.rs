@@ -137,8 +137,8 @@ fn progress_event(update: &ProgressUpdate) -> Event {
 
 /// Synthetic frame emitted when the broadcast subscriber lags and the
 /// stream is about to close. Tells the client to drop & reconnect;
-/// htmx-ext-sse listens for any `event:` name so we mark this one
-/// `reconnect_hint` for clarity in the browser dev tools.
+/// the SPA's EventSource listener watches for any `event:` name so we
+/// mark this one `reconnect_hint` for clarity in the browser dev tools.
 fn reconnect_hint(reason: &str) -> Event {
     Event::default()
         .event("reconnect_hint")

@@ -1,7 +1,7 @@
 # V0.4.0 文档索引
 
-> **状态**：**planning**（2026-05-14，设计已 lock，待实施）。
-> base = V0.3.2 ship 终点（`origin/main`）；workspace.version 起点 `0.3.2`。
+> **状态**：**SHIPPED**（2026-05-14；F60-F69 全部 merged，workspace.version `0.4.0`）。
+> base = V0.3.2 ship 终点（`origin/main`）；workspace.version 起点 `0.3.2` → 终点 `0.4.0`。
 
 V0.4.0 是一次**架构级重构**，核心目标：
 
@@ -33,18 +33,19 @@ V0.4.0 是一次**架构级重构**，核心目标：
 
 | F | 范围 | 依赖 | 状态 |
 |---|---|---|---|
-| **F60** | Phase machinery removal（删 phases.rs、inject_directives、golden_rules 等）| — | pending |
-| **F61** | ClaudeCodeAdapter thin refactor（claude --bg --agent + state.json）| — | pending |
-| **F62** | Real CodexAdapter（吸收 V0.3.3 deferred）| — | pending |
-| **F63** | workflow.yaml schema + parser | F60 | pending |
-| **F64** | Artifact watcher（inotify-based trigger）| F63 | pending |
-| **F65** | Meta-agent MCP tools（7 新工具）| F63 + F64 | pending |
-| **F66** | Thin orchestrator（替换 2713 LOC phase 状态机）| F63–F65 | pending |
-| **F67** | Progress tracking refactor（business state SoT）| F66 | pending |
-| **F68** | ccteam-web v0.4.0 adaptation（Agent View + workflow 视图）| F61 + F67 | pending |
-| **F69** | Example workflows + e2e + ship gate | F60–F68 | pending |
+| **F60** | Phase machinery removal（删 phases.rs、inject_directives、golden_rules 等）| — | ✅ ship (PR #54) |
+| **F61** | ClaudeCodeAdapter thin refactor（claude --bg --agent + state.json）| — | ✅ ship (PR #58) |
+| **F62** | Real CodexAdapter（吸收 V0.3.3 deferred）| — | ✅ ship (PR #53) |
+| **F63** | workflow.yaml schema + parser | F60 | ✅ ship (PR #52) |
+| **F64** | Artifact watcher（inotify-based trigger）| F63 | ✅ ship (PR #56) |
+| **F65** | Meta-agent MCP tools（7 新工具）| F63 + F64 | ✅ ship (PR #57) |
+| **F66** | Thin orchestrator（替换 2713 LOC phase 状态机）| F63–F65 | ✅ ship (PR #59) |
+| **F67** | Progress tracking refactor（business state SoT）| F66 | ✅ ship (PR #60) |
+| **F68** | ccteam-web v0.4.0 adaptation（Agent View + workflow 视图）| F61 + F67 | ✅ ship (PR #61) |
+| **F69-docs** | Examples + user-manual + migration-guide scaffolding | — | ✅ ship (PR #51) |
+| **F69** | e2e + version bump + CLAUDE.md baseline + htmx final cleanup | F60–F68 | ✅ ship (本 PR) |
 
-并行机会：F60 / F61 / F62 三路同时起步。
+实际执行：F60 / F61 / F62 / F63 / F69-docs 五路初始并行；F64 在 F63 merge 后并行；F65 / F66 在 F60 merge 后并行；F67 / F68 / F69 顺序串行。F61 因 base 太老需要重做一次（fresh main rebase）。详 `docs/v0-4-0/e2e-retro.md` §2 retro。
 
 ## 文档清单
 

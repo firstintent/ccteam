@@ -1,29 +1,18 @@
-//! Static asset handlers.
+//! Static asset handlers — SPA bundle only after V0.4.0.
 //!
-//! Two surfaces share this module:
-//!
-//! - **Legacy `/assets/{file}`** (M5.1) — htmx, the htmx SSE
-//!   extension, @xterm/xterm 6.0.0, and the hand-written `style.css`,
-//!   all baked via `include_bytes!`. V0.3.2 F59 retired the htmx
-//!   *routes* (the three `.html` templates are gone; `/`,
-//!   `/project/<slug>`, `/session/<slug>/<sid>` are now 301 redirects
-//!   into `/app/...`), but the static byte assets stay served for one
-//!   more release. **TODO(V0.3.3)**: delete the five `include_bytes!`
-//!   blocks below + the `handle_legacy_asset` route + the underlying
-//!   files in `crates/ccteam-web/assets/` once V0.3.2 has shipped and
-//!   no external page is known to be deep-linking them.
-//! - **V0.3.2 F53 SPA surface** — `GET /app/*` serves the vite-built
-//!   React shell (with react-router fallback to `index.html`) and
-//!   `GET /assets/spa/*` serves its hashed bundle assets. The bundle
-//!   is embedded via `rust-embed::RustEmbed` from `web/dist/` (driven
-//!   by `build.rs`).
+//! V0.3.2 F59 retired the htmx HTML routes (the three `.html` templates
+//! were deleted; `/`, `/project/<slug>`, `/session/<slug>/<sid>` are now
+//! 301 redirects into `/app/...`). V0.4.0 F69 finishes the cleanup by
+//! deleting the five legacy `include_bytes!` blocks (htmx, htmx-ext-sse,
+//! xterm.js, xterm.css, hand-written style.css) along with the
+//! `/assets/{file}` route and the underlying byte files in
+//! `crates/ccteam-web/assets/`. The SPA bundle (`/app/*` + `/assets/spa/*`)
+//! is the sole surface this module serves.
 //!
 //! Cache policy:
 //!
-//! - Legacy `/assets/{file}` bytes are version-frozen at build time,
-//!   so `public, max-age=31536000, immutable` is safe.
-//! - SPA hashed bundle under `/assets/spa/...` carries the same long
-//!   `immutable` cache because vite hashes the filenames.
+//! - SPA hashed bundle under `/assets/spa/...` is `public,
+//!   max-age=31536000, immutable` because vite hashes the filenames.
 //! - SPA `index.html` (returned for any `/app/...` route) is
 //!   `no-cache` because every SPA upgrade replaces it.
 
@@ -37,12 +26,6 @@ use axum::{
 use rust_embed::RustEmbed;
 
 use crate::state::AppState;
-
-const HTMX_JS: &[u8] = include_bytes!("../../assets/htmx.min.js");
-const HTMX_EXT_SSE_JS: &[u8] = include_bytes!("../../assets/htmx-ext-sse.js");
-const XTERM_JS: &[u8] = include_bytes!("../../assets/xterm.js");
-const XTERM_CSS: &[u8] = include_bytes!("../../assets/xterm.css");
-const STYLE_CSS: &[u8] = include_bytes!("../../assets/style.css");
 
 const CACHE_IMMUTABLE: &str = "public, max-age=31536000, immutable";
 const CACHE_NO_CACHE: &str = "no-cache";
@@ -58,7 +41,6 @@ struct SpaAssets;
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/assets/{file}", get(handle_legacy_asset))
         // SPA hashed bundle. Vite emits paths like `assets/<n>-<hash>.js`
         // inside `dist/` when `base: "/app/"` is set, so the embedded
         // lookup key is the suffix after `/assets/spa/`.
@@ -72,31 +54,6 @@ pub fn router() -> Router<AppState> {
         // `/app/` and any deeper path — direct lookup first, then
         // react-router fallback to index.html.
         .route("/app/{*path}", get(handle_spa_path))
-}
-
-async fn handle_legacy_asset(Path(file): Path<String>) -> impl IntoResponse {
-    let (bytes, ctype): (&'static [u8], &'static str) = match file.as_str() {
-        "htmx.min.js" => (HTMX_JS, "application/javascript; charset=utf-8"),
-        "htmx-ext-sse.js" => (HTMX_EXT_SSE_JS, "application/javascript; charset=utf-8"),
-        "xterm.js" => (XTERM_JS, "application/javascript; charset=utf-8"),
-        "xterm.css" => (XTERM_CSS, "text/css; charset=utf-8"),
-        "style.css" => (STYLE_CSS, "text/css; charset=utf-8"),
-        _ => {
-            return (StatusCode::NOT_FOUND, "asset not found").into_response();
-        }
-    };
-
-    (
-        [
-            (header::CONTENT_TYPE, HeaderValue::from_static(ctype)),
-            (
-                header::CACHE_CONTROL,
-                HeaderValue::from_static(CACHE_IMMUTABLE),
-            ),
-        ],
-        bytes,
-    )
-        .into_response()
 }
 
 async fn handle_spa_bundle_asset(Path(path): Path<String>) -> impl IntoResponse {
