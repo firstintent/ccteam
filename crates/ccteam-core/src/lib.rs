@@ -9,6 +9,10 @@
 //! shape (F63) and artifact-trigger watcher (F64).
 
 pub mod actions;
+// V0.4.0 F64 — artifact-trigger filesystem watcher (inotify / fsevents).
+// Emits ArtifactEvent for every workflow.yaml `Trigger::Watch(<path>)`
+// agent. See module docs + docs/v0-4-0/prd.md §6.2.
+pub mod artifact_watcher;
 pub mod auto_loop;
 pub mod cost;
 pub mod daemon;
@@ -149,6 +153,8 @@ pub use watchdog::{
 };
 // V0.4.0 F63 — workflow.yaml schema.
 pub use workflow::{AgentSpec, Executor, OnTimeout, Trigger, WorkflowError, WorkflowSpec};
+// V0.4.0 F64 — artifact watcher event types + watcher entry point.
+pub use artifact_watcher::{ArtifactEvent, ArtifactWatcher, WatchKind, DEBOUNCE_WINDOW};
 
 /// Crate version, identical to the workspace package version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
