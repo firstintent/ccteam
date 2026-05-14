@@ -47,9 +47,9 @@ enum Command {
         #[command(subcommand)]
         cmd: HookCommand,
     },
-    /// Run the orchestrator daemon. M0 only supports `--foreground`
-    /// mode (the flag is accepted for forward compat with M1 daemon
-    /// mode but currently a no-op; `start` always runs in foreground).
+    /// Run the orchestrator daemon (and, by default, the web UI on
+    /// `127.0.0.1:7331` in the same process). Pass `--no-web` to run
+    /// orchestrator only.
     Start {
         #[arg(long, default_value_t = false)]
         foreground: bool,
@@ -71,6 +71,25 @@ enum Command {
         /// pipeline can be exercised without burning LLM cost.
         #[arg(long, value_name = "ARGV")]
         claude_argv: Option<String>,
+        /// Skip starting the embedded web UI. Use this when you want
+        /// orchestrator only (e.g. headless server, custom web bind
+        /// via a separate `ccteam web` invocation).
+        #[arg(long, default_value_t = false)]
+        no_web: bool,
+        /// Embedded web UI bind address. Loopback (default) disables
+        /// auth; non-loopback generates `~/.ccteam/web-token` and
+        /// requires `Authorization: Bearer ccteam:<token>`.
+        #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:7331")]
+        web_bind: String,
+        /// Disable token auth on the embedded web. DANGEROUS on
+        /// non-loopback bind — prints a 5-second warning before
+        /// listening.
+        #[arg(long, default_value_t = false)]
+        web_no_auth: bool,
+        /// Custom path to read the auth token from (default
+        /// `~/.ccteam/web-token`).
+        #[arg(long, value_name = "PATH")]
+        web_token_file: Option<PathBuf>,
     },
     /// Create a new project from a one-line request.
     New {
@@ -132,6 +151,40 @@ enum Command {
     },
     /// Resume a paused / escalated project (re-arm phase_state=idle).
     Resume { slug: String },
+    /// Send a free-form message to a project's inbox. Wraps the
+    /// MCP-equivalent `send_to_session` so users don't have to
+    /// hand-write the markdown frontmatter. Orchestrator auto-routes
+    /// the message to a worker (or the meta-agent in V0.4.1+) on
+    /// the next tick.
+    Send {
+        /// Project slug (or meta-agent handle for meta-agent inbox).
+        slug: String,
+        /// Optional target role override (writes frontmatter
+        /// `target_role: <role>`). Otherwise routing follows the
+        /// inbox default rules.
+        #[arg(short = 'r', long)]
+        role: Option<String>,
+        /// If set, frontmatter `no_spawn: true` is added so the
+        /// message is archived for audit only (no auto-spawn).
+        #[arg(long, default_value_t = false)]
+        no_spawn: bool,
+        /// Message body. Use `-` to read from stdin.
+        body: String,
+    },
+    /// Trigger a fresh spawn of `<role>` in `<slug>` with an optional
+    /// kick prompt. Writes a `.ccteam/spawn_requests/<role>-<ts>.json`
+    /// marker the orchestrator picks up on its next tick. CLI shortcut
+    /// for the MCP `ccteam__spawn_agent` tool.
+    Spawn {
+        /// Project slug.
+        slug: String,
+        /// Workflow role (must exist in `<project>/workflow.yaml`).
+        role: String,
+        /// Optional initial prompt. Falls back to the default kick
+        /// prompt when omitted (let the role's `.claude/agents/<role>.md`
+        /// drive). Use `-` to read from stdin.
+        prompt: Option<String>,
+    },
     /// List the cross-project decisions queue — every project's
     /// outbox file with `event_kind: clarify | escalation`. Surfaces
     /// pending user-decision points across all running projects so the
@@ -183,6 +236,12 @@ enum Command {
         /// any prior `ccteam` server entry but preserves other servers.
         #[arg(long, default_value_t = false)]
         install_mcp: bool,
+        /// V0.4.1: aggregate first-run setup. Equivalent to
+        /// `--install-mcp --install-skill --install-meta-agent <HANDLE>`.
+        /// Pass the user handle as the value
+        /// (e.g. `--install-all rob`). Idempotent.
+        #[arg(long, value_name = "HANDLE")]
+        install_all: Option<String>,
         /// M4.2: write `~/.claude/rules/ccteam-lessons-<team>.md`
         /// with `<!-- ccteam-managed:lessons begin/end -->` markers + `paths:`
         /// frontmatter scope. Idempotent — re-runs no-op when markers are
@@ -442,7 +501,21 @@ fn main() -> Result<()> {
             tick_seconds,
             skip_tool_check,
             claude_argv,
-        } => run_start(tick_seconds, skip_tool_check, claude_argv),
+            no_web,
+            web_bind,
+            web_no_auth,
+            web_token_file,
+        } => run_start(
+            tick_seconds,
+            skip_tool_check,
+            claude_argv,
+            StartWebOpts {
+                disabled: no_web,
+                bind: web_bind,
+                no_auth: web_no_auth,
+                token_file: web_token_file,
+            },
+        ),
         Command::New {
             request,
             file,
@@ -465,6 +538,23 @@ fn main() -> Result<()> {
         Command::Resume { slug } => {
             let paths = CcteamPaths::from_env()?;
             commands::run_resume(&paths, &slug)
+        }
+        Command::Send {
+            slug,
+            role,
+            no_spawn,
+            body,
+        } => {
+            let paths = CcteamPaths::from_env()?;
+            run_send(&paths, &slug, role.as_deref(), no_spawn, &body)
+        }
+        Command::Spawn {
+            slug,
+            role,
+            prompt,
+        } => {
+            let paths = CcteamPaths::from_env()?;
+            run_spawn(&paths, &slug, &role, prompt.as_deref())
         }
         Command::Decisions { format } => {
             let paths = CcteamPaths::from_env()?;
@@ -489,24 +579,34 @@ fn main() -> Result<()> {
             install_skill,
             install_meta_agent,
             install_mcp,
+            install_all,
             install_memory_bridge,
             reset_shipped_teams,
             validate_team,
             migrate_recommended_agents,
             screenshot_smoke,
-        } => run_doctor(commands::DoctorOptions {
-            dry_run,
-            force,
-            tool_surface,
-            install_skill,
-            install_meta_agent,
-            install_mcp,
-            install_memory_bridge,
-            reset_shipped_teams,
-            validate_team,
-            migrate_recommended_agents,
-            screenshot_smoke,
-        }),
+        } => {
+            // V0.4.1 `--install-all <handle>` is sugar for the three
+            // first-run flags. Explicit flags still win where present;
+            // we only OR-in the aggregate's components.
+            let (final_mcp, final_skill, final_meta) = match install_all {
+                Some(h) => (true, true, Some(h)),
+                None => (install_mcp, install_skill, install_meta_agent),
+            };
+            run_doctor(commands::DoctorOptions {
+                dry_run,
+                force,
+                tool_surface,
+                install_skill: final_skill,
+                install_meta_agent: final_meta,
+                install_mcp: final_mcp,
+                install_memory_bridge,
+                reset_shipped_teams,
+                validate_team,
+                migrate_recommended_agents,
+                screenshot_smoke,
+            })
+        }
         Command::Phase { cmd } => run_phase(cmd),
         Command::Watchdog { cmd } => run_watchdog(cmd),
         Command::Team { cmd } => run_team(cmd),
@@ -680,10 +780,18 @@ fn parse_hook_stdin_json() -> Result<serde_json::Value> {
     serde_json::from_reader(std::io::stdin().lock()).context("parse hook stdin as JSON")
 }
 
+struct StartWebOpts {
+    disabled: bool,
+    bind: String,
+    no_auth: bool,
+    token_file: Option<PathBuf>,
+}
+
 fn run_start(
     tick_seconds: u64,
     skip_tool_check: bool,
     claude_argv_flag: Option<String>,
+    web: StartWebOpts,
 ) -> Result<()> {
     init_tracing();
     let paths = CcteamPaths::from_env()?;
@@ -740,35 +848,243 @@ fn run_start(
             .build()
             .context("build tokio runtime")?;
         runtime.block_on(async move {
-            let shutdown = async {
-                #[cfg(unix)]
-                {
-                    use tokio::signal::unix::{signal, SignalKind};
-                    let mut sigterm = match signal(SignalKind::terminate()) {
-                        Ok(s) => s,
-                        Err(err) => {
-                            tracing::warn!(?err, "could not install SIGTERM handler");
-                            let _ = tokio::signal::ctrl_c().await;
-                            tracing::info!("ctrl+c received");
-                            return;
-                        }
-                    };
-                    tokio::select! {
-                        _ = tokio::signal::ctrl_c() => tracing::info!("ctrl+c received"),
-                        _ = sigterm.recv() => tracing::info!("SIGTERM received (ccteam stop)"),
+            // V0.4.1 simplification: orchestrator + web share one
+            // shutdown signal (Ctrl-C or SIGTERM). The watch::channel
+            // lets multiple awaiters subscribe to the same termination
+            // event without consuming a single oneshot.
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+            let signal_task = tokio::spawn(async move {
+                wait_for_shutdown_signal().await;
+                let _ = shutdown_tx.send(true);
+            });
+
+            let web_handle = if web.disabled {
+                None
+            } else {
+                let opts = match parse_web_opts(&web) {
+                    Ok(o) => o,
+                    Err(err) => {
+                        signal_task.abort();
+                        return Err(err);
                     }
-                }
-                #[cfg(not(unix))]
-                {
-                    let _ = tokio::signal::ctrl_c().await;
-                    tracing::info!("ctrl+c received");
+                };
+                let mut rx = shutdown_rx.clone();
+                Some(tokio::spawn(async move {
+                    ccteam_web::serve_with_shutdown(opts, async move {
+                        let _ = rx.changed().await;
+                    })
+                    .await
+                }))
+            };
+
+            let orch_shutdown = {
+                let mut rx = shutdown_rx.clone();
+                async move {
+                    let _ = rx.changed().await;
                 }
             };
-            orchestrator.run(shutdown).await
+            let orch_result = orchestrator.run(orch_shutdown).await;
+
+            // Drain the web task once shutdown propagates.
+            if let Some(h) = web_handle {
+                match h.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => tracing::warn!(?err, "ccteam web exited with error"),
+                    Err(je) if je.is_cancelled() => {}
+                    Err(je) => tracing::warn!(?je, "ccteam web task panicked"),
+                }
+            }
+            signal_task.abort();
+            orch_result
         })
     })();
     ccteam_core::remove_pidfile(&cleanup_paths);
     result
+}
+
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(err) => {
+                tracing::warn!(?err, "could not install SIGTERM handler");
+                let _ = tokio::signal::ctrl_c().await;
+                tracing::info!("ctrl+c received");
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => tracing::info!("ctrl+c received"),
+            _ = sigterm.recv() => tracing::info!("SIGTERM received (ccteam stop)"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("ctrl+c received");
+    }
+}
+
+fn parse_web_opts(web: &StartWebOpts) -> Result<ccteam_web::ServeOpts> {
+    let bind: std::net::SocketAddr = web
+        .bind
+        .parse()
+        .with_context(|| format!("--web-bind {} is not a valid socket address", web.bind))?;
+    Ok(ccteam_web::ServeOpts {
+        bind,
+        no_auth: web.no_auth,
+        token_file: web.token_file.clone(),
+        no_auth_grace_secs: Some(5),
+    })
+}
+
+fn read_body_or_stdin(body: &str) -> Result<String> {
+    if body == "-" {
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin().lock(), &mut buf)
+            .context("read body from stdin")?;
+        Ok(buf)
+    } else {
+        Ok(body.to_string())
+    }
+}
+
+fn run_send(
+    paths: &CcteamPaths,
+    slug: &str,
+    role: Option<&str>,
+    no_spawn: bool,
+    body: &str,
+) -> Result<()> {
+    let project_dir = paths.project_dir(slug);
+    if !project_dir.exists() {
+        anyhow::bail!(
+            "no project `{slug}` at {}",
+            project_dir.display()
+        );
+    }
+    let body = read_body_or_stdin(body)?;
+    let body = body.trim();
+    if body.is_empty() {
+        anyhow::bail!("ccteam send: refusing to write empty body");
+    }
+    // Compose a full inbox message frontmatter + body. The orchestrator's
+    // check_inbox routes off `target_role` / `no_spawn` so we surface
+    // those as CLI flags.
+    let now = chrono::Utc::now();
+    let ts = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let mut frontmatter = format!(
+        "---\nschema_version: 1\nsource: ccteam-cli\nsource_user: {user}\n\
+         created_at: {ts}\ningested_at: {ts}\ncontent_type: text\n",
+        user = std::env::var("USER").unwrap_or_else(|_| "ccteam".into()),
+        ts = ts,
+    );
+    if let Some(r) = role {
+        frontmatter.push_str(&format!("target_role: {r}\n"));
+    }
+    if no_spawn {
+        frontmatter.push_str("no_spawn: true\n");
+    }
+    frontmatter.push_str("---\n\n");
+    frontmatter.push_str(body);
+    frontmatter.push('\n');
+
+    let inbox_dir = paths.project_ccteam_dir(slug).join("inbox");
+    std::fs::create_dir_all(&inbox_dir)
+        .with_context(|| format!("create {}", inbox_dir.display()))?;
+    let stamp = now.format("%Y%m%dT%H%M%SZ");
+    // Pick a sequence so a single second's bulk send doesn't collide.
+    let mut seq = 1u32;
+    let path = loop {
+        let candidate = inbox_dir.join(format!("msg-{stamp}-{:03}.md", seq));
+        if !candidate.exists() {
+            break candidate;
+        }
+        seq = seq.saturating_add(1);
+        if seq > 999 {
+            anyhow::bail!("ccteam send: filename collision storm (>999 in one second)");
+        }
+    };
+    // Atomic write: .tmp then rename (matches inbox.rs::save).
+    let tmp = path.with_extension("md.tmp");
+    std::fs::write(&tmp, &frontmatter)
+        .with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("rename {} → {}", tmp.display(), path.display()))?;
+    println!("queued inbox message: {}", path.display());
+    if no_spawn {
+        println!("  (no_spawn: true → archived only, no auto-spawn)");
+    } else if let Some(r) = role {
+        println!("  target_role: {r}");
+    } else {
+        println!("  → first workflow `trigger: manual` role on next tick");
+    }
+    Ok(())
+}
+
+fn run_spawn(
+    paths: &CcteamPaths,
+    slug: &str,
+    role: &str,
+    prompt: Option<&str>,
+) -> Result<()> {
+    let project_dir = paths.project_dir(slug);
+    if !project_dir.exists() {
+        anyhow::bail!(
+            "no project `{slug}` at {}",
+            project_dir.display()
+        );
+    }
+    // Validate the role exists in workflow.yaml so we fail loud here
+    // instead of letting the orchestrator silently delete the marker
+    // ("spawn_request for unknown role; deleting").
+    let spec = ccteam_core::workflow::WorkflowSpec::load_for_project(&project_dir)
+        .with_context(|| format!("load workflow.yaml from {}", project_dir.display()))?;
+    if !spec.agents.contains_key(role) {
+        anyhow::bail!(
+            "role `{role}` not declared in workflow.yaml. Declared roles: {:?}",
+            spec.agents.keys().collect::<Vec<_>>()
+        );
+    }
+
+    let bucket = project_dir.join(".ccteam").join("spawn_requests");
+    std::fs::create_dir_all(&bucket)
+        .with_context(|| format!("create {}", bucket.display()))?;
+    let session_id = format!(
+        "{role}-{}",
+        chrono::Utc::now().timestamp_micros()
+    );
+    let marker = bucket.join(format!("{session_id}.json"));
+
+    let resolved_prompt = match prompt {
+        Some("-") => Some(read_body_or_stdin("-")?.trim().to_string()),
+        Some(p) => Some(p.to_string()),
+        None => None,
+    };
+    let mut payload = serde_json::json!({
+        "role": role,
+        "session_id": session_id,
+        "source": "cli",
+        "requested_at": chrono::Utc::now().to_rfc3339(),
+    });
+    if let Some(p) = resolved_prompt.as_deref() {
+        payload["prompt"] = serde_json::Value::String(p.to_string());
+    }
+    std::fs::write(&marker, serde_json::to_string_pretty(&payload)?)
+        .with_context(|| format!("write {}", marker.display()))?;
+    println!("queued spawn request: {}", marker.display());
+    println!("  role:       {role}");
+    println!("  session_id: {session_id}");
+    if let Some(p) = resolved_prompt.as_deref() {
+        let head: String = p.chars().take(80).collect();
+        println!("  prompt:     {head}{}", if p.len() > 80 { "…" } else { "" });
+    } else {
+        println!("  prompt:     <default kick prompt>");
+    }
+    Ok(())
 }
 
 fn run_new(

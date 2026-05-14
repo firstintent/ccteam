@@ -109,9 +109,8 @@ pub fn router_with_state(state: AppState) -> Router {
         .merge(stateful)
 }
 
-/// Start the web server. Binds, prints the bound address one line
-/// to stdout (so subprocess harnesses can parse the port for the
-/// `:0` placeholder case), then serves until Ctrl-C / SIGTERM.
+/// Standalone `ccteam web` entry. Calls [`serve_with_shutdown`] with
+/// the default Ctrl-C / SIGTERM signal-based shutdown.
 ///
 /// Auth heuristic (PRD §6.2.4):
 ///
@@ -127,6 +126,18 @@ pub fn router_with_state(state: AppState) -> Router {
 /// seam: pass `Some(0)` to skip in integration tests) so the operator
 /// has a window to Ctrl-C out.
 pub async fn serve(opts: ServeOpts) -> Result<()> {
+    serve_with_shutdown(opts, shutdown_signal()).await
+}
+
+/// Embedded entry: serve the web UI until `shutdown` resolves. Used by
+/// `ccteam start` to host the web server in the same process as the
+/// orchestrator daemon (V0.4.1 simplification: one binary, one
+/// terminal, one shutdown signal). The standalone `ccteam web` command
+/// is a thin wrapper that supplies the default signal-based shutdown.
+pub async fn serve_with_shutdown<F>(opts: ServeOpts, shutdown: F) -> Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
     let paths = CcteamPaths::from_env().context("resolve CcteamPaths from env for ccteam web")?;
 
     let listener = TcpListener::bind(opts.bind)
@@ -200,7 +211,7 @@ pub async fn serve(opts: ServeOpts) -> Result<()> {
     let state = AppState::with_auth(paths, auth_state);
     let app = router_with_state(state);
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown)
         .await
         .context("axum serve loop terminated with error")?;
     Ok(())
