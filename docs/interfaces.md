@@ -1658,7 +1658,7 @@ orchestrator 识别 `state.team == "meta-agent"` 走 `process_meta_project` 分�
 
 由 `ccteam doctor --install-mcp` 写入(M2 release)。`ccteam mcp-serve` 是 binary 子命令,stdio 协议。
 
-### 12.2 暴露的 tool 清单(M2.5 起 9 tool;V0.2.2 F38 起 10 tool)
+### 12.2 暴露的 tool 清单(M2.5 起 9 tool;V0.2.2 F38 起 10 tool;V0.4.0 F65 起 17 tool)
 
 | Tool 名 | 对应 CLI / 行为 | 入参 | 返回 |
 |---|---|---|---|
@@ -1672,6 +1672,13 @@ orchestrator 识别 `state.team == "meta-agent"` 走 `process_meta_project` 分�
 | `ccteam__send_to_session`(M2.5 新)| 原子写 `<session>/.ccteam/inbox/msg-<ts>-NNN.md`(§3.4.2)| `{session: string, body: string, content_type?: "text"\|"markdown"}` | `{ok: bool, session: string, inbox_file: string}` |
 | `ccteam__inject_decision`(M2.5 新)| 构造 ESCALATE-shape payload(§4.1.1),走 `send_to_session` 落 inbox | `{slug: string, escalate_kind: "revert_to_phase"\|"need_user_input"\|"abort"\|"insufficient_clarification"\|"phase_done_pending", args?: {target_phase?: string, reason?: string}}` | `{ok: bool, slug: string, inbox_file: string}` |
 | `ccteam__screenshot`(V0.2.2 F38)| `tmux capture-pane -e` → `vt100::Parser` → `imageproc` → 写 `<project>/.ccteam/screenshots/<utc>.png` | `{slug: string, lines?: number}`(`lines` 默认 50) | 成功:`{ok: true, slug: string, path: string}`;graceful degrade:`{ok: false, slug: string, reason: string}` |
+| `ccteam__spawn_agent`(V0.4.0 F65)| 在 `<project>/.ccteam/spawn_requests/<role>-<ts>.json` 写 spawn marker;F66 orchestrator 每 tick 消费 | `{slug: string, role: string, overrides?: object}` | `{ok: bool, slug, role, session_id, marker, note}` |
+| `ccteam__stop_agent`(V0.4.0 F65)| 在 `<project>/.ccteam/stop_signal/<role>_<sid>` 写 soft-stop marker;`session_id` 为空 = 停该 role 所有 session(filename 用 `__all__` 占位)| `{slug: string, role: string, session_id?: string}` | `{ok: bool, slug, role, session_id, marker, note}` |
+| `ccteam__observe_agents`(V0.4.0 F65)| 一次性读 `state.json::sessions`(V0.3.1 F49 registry);F66 会扩展 record 加 `role`/`status` | `{slug: string}` | `{slug, agents: [{session_id, role, harness, tmux_session, started_at, pid, status}]}` |
+| `ccteam__signal`(V0.4.0 F65)| `pause`/`resume`/`interrupt` → `<project>/.ccteam/signal/<role>_<sid>` marker(F66 转 SIGSTOP/SIGCONT/SIGINT);`btw` → `actions::send_to_session_with` 走 inbox | `{slug: string, role: string, session_id?: string, signal: "pause"\|"resume"\|"btw"\|"interrupt", message?: string}` | `{ok: bool, slug, role, session_id, signal, marker/inbox_file}` |
+| `ccteam__set_parallelism`(V0.4.0 F65)| 原子合并写 `<project>/.ccteam/workflow_overrides.json`(F66 每 tick reload);1≤N≤50 | `{slug: string, role: string, parallelism: integer}` | `{ok: bool, slug, role, parallelism, overrides_file}` |
+| `ccteam__trigger_gate`(V0.4.0 F65)| 写 `<project>/.ccteam/gate_override/<role>`;`force=true` instruct F66 跳过 input-satisfaction check | `{slug: string, role: string, force?: boolean}` | `{ok: bool, slug, role, force, marker, note}` |
+| `ccteam__get_artifact_summary`(V0.4.0 F65)| stat-only(O(n) on inode,不读 file 内容)遍历 `workflow.yaml` 所有 agent 的 `input`/`output` 目录 | `{slug: string}` | `{slug, artifacts: {<dir>: {count, latest, latest_mtime, size_bytes, exists}}}` |
 
 V0.2.2 F38 红线:`screenshot` 是**只读**(daemon-independent),与 `peek` 同档,失败永不阻塞主路径(catch_unwind 兜 vt100/imageproc panic;tmux/font/IO 失败一律 `Ok(None)` → `{ok:false, reason}`)。截图字节流仅用于渲染,**不进入** `progress.jsonl` / `state.json` / state machine(CLAUDE.md §三红线"永不解析 tmux 终端输出")。字体走 vendored JetBrains Mono Regular(OFL,见 `LICENSES.md`),`CCTEAM_SCREENSHOT_FONT_TTF` env 可运行时覆盖(eg 切到 CJK / emoji 覆盖字体)。`ccteam doctor --screenshot-smoke <slug>` 跑端到端验证。
 
@@ -1682,6 +1689,14 @@ V0.2.2 F38 红线:`screenshot` 是**只读**(daemon-independent),与 `peek` 同�
 `ccteam__inject_decision` 内部是 `send_to_session` 的 thin wrapper —— 把
 `escalate_kind` 翻成 markdown payload(显式标记 `**META-AGENT DECISION**`
 + ESCALATE shape),然后走同一条 inbox 路径。
+
+**V0.4.0 F65 7 个新工具**(meta-agent workflow control):底层是**文件系统控制平面**——
+每个 mutating tool 写一个 marker 文件到 `<project>/.ccteam/<bucket>/`,F66 thin
+orchestrator 每 tick 扫桶 → 执行操作 → 删 marker。文件桶清单:`spawn_requests/`、
+`stop_signal/`、`signal/`、`gate_override/`、`workflow_overrides.json`。`observe_agents` /
+`get_artifact_summary` 是**纯只读**(无 daemon 依赖),`spawn_agent` / `stop_agent` /
+`signal` / `set_parallelism` / `trigger_gate` 走 `require_healthy_daemon()` gate(死
+orchestrator 不会静默吞 marker)。schema/handler 实现在 `crates/ccteam-cli/src/mcp_workflow_tools.rs`。
 
 ### 12.3 不暴露的(M2 显式排除)
 

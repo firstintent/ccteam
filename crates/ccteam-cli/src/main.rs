@@ -2,6 +2,11 @@
 
 mod commands;
 mod mcp_serve;
+// V0.4.0 F65 — meta-agent MCP workflow tools (7 new). Lives in its own
+// module to keep `mcp_serve.rs` focused on the M2.5 protocol surface
+// while the workflow tools accumulate in lockstep with the F66
+// orchestrator.
+mod mcp_workflow_tools;
 mod team_factory_cli;
 
 use std::path::PathBuf;
