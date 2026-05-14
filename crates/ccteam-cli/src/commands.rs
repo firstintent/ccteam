@@ -676,74 +676,39 @@ pub fn run_resume(paths: &CcteamPaths, slug: &str) -> Result<()> {
 // V0.3.1 F49 — `ccteam session` handlers for flex teams
 // =====================================================================
 
-/// Add a registered harness session to a flex project. Claude sessions
-/// spawn under `ccteam-<slug>-<sid>` and record in the master
-/// `state.json::sessions` map. Codex intentionally keeps F47's
-/// `NotImplemented` path until the V0.3.2 adapter lands.
+/// Add a registered harness session to a flex project. Both claude
+/// and codex sessions spawn under `ccteam-<slug>-<sid>` via the
+/// harness's adapter and record in the master `state.json::sessions`
+/// map. Codex went real in V0.4.0 F62 (replaces V0.3.1 F47 stub).
 pub fn run_session_add(slug: &str, harness: ccteam_core::HarnessKind) -> Result<()> {
     use ccteam_core::{
-        harness_sid_prefix, ClaudeCodeAdapter, CodexAdapter, HarnessAdapter, HarnessError,
-        HarnessKind, SessionRecord, SpawnOpts, TeamKind,
+        harness_sid_prefix, ClaudeCodeAdapter, CodexAdapter, HarnessAdapter, HarnessKind,
+        SessionRecord, SpawnOpts, TeamKind,
     };
 
-    match harness {
-        HarnessKind::Codex => {
-            // Construct minimal SpawnOpts — every value is a placeholder
-            // because the stub returns `NotImplemented` before reading
-            // any of them. We still pass a realistic shape (cwd =
-            // `~/projects/<slug>`) so V0.3.2's real impl can swap in
-            // here without changing the caller.
-            let cwd = ccteam_core::CcteamPaths::from_env()
-                .map(|p| p.project_dir(slug))
-                .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
-            let opts = SpawnOpts {
-                harness: "codex",
-                slug: slug.to_string(),
-                sid: "codex-1".to_string(),
-                cwd,
-                extra_args: Vec::new(),
-            };
-            match CodexAdapter::new().spawn_session(opts) {
-                Ok(_handle) => bail!(
-                    "internal error: V0.3.1 CodexAdapter::spawn_session returned Ok — \
-                     the stub must return NotImplemented (PRD §F47); \
-                     please file a bug",
-                ),
-                Err(HarnessError::NotImplemented { harness, reason }) => {
-                    bail!(
-                        "ccteam session add --harness=codex: harness `{harness}` is \
-                         deferred to V0.3.2 — {reason}",
-                    );
-                }
-                Err(other) => {
-                    // Any other error variant means the stub regressed
-                    // (e.g. someone added a real spawn path that fails
-                    // before reaching NotImplemented). Surface verbatim.
-                    bail!(
-                        "ccteam session add --harness=codex: unexpected error from \
-                         CodexAdapter (V0.3.1 must always return NotImplemented): {other}",
-                    );
-                }
-            }
-        }
+    let paths = CcteamPaths::from_env()?;
+    let state_path = paths.project_state(slug);
+    let mut state = load_project_state(&paths, slug)?;
+    refresh_state_team_kind(&paths, &mut state)?;
+    if state.team_kind != TeamKind::Flex {
+        bail_session_requires_flex(&state)?;
+    }
+
+    let sid = state.allocate_sid(harness);
+    let session_dir = paths.project_session_dir(slug, &sid);
+    std::fs::create_dir_all(session_dir.join("inbox"))
+        .with_context(|| format!("create {}", session_dir.join("inbox").display()))?;
+    std::fs::create_dir_all(session_dir.join("outbox"))
+        .with_context(|| format!("create {}", session_dir.join("outbox").display()))?;
+
+    // Adapter dispatch — every harness shares the SpawnOpts schema so
+    // the call sites differ only in which `Adapter::new()` runs. The
+    // V0.3.1 F47 codex branch returned NotImplemented; V0.4.0 F62
+    // swaps in the real tmux + codex CLI implementation.
+    let handle = match harness {
         HarnessKind::Claude => {
-            let paths = CcteamPaths::from_env()?;
-            let state_path = paths.project_state(slug);
-            let mut state = load_project_state(&paths, slug)?;
-            refresh_state_team_kind(&paths, &mut state)?;
-            if state.team_kind != TeamKind::Flex {
-                bail_session_requires_flex(&state)?;
-            }
-
-            let sid = state.allocate_sid(harness);
-            let session_dir = paths.project_session_dir(slug, &sid);
-            std::fs::create_dir_all(session_dir.join("inbox"))
-                .with_context(|| format!("create {}", session_dir.join("inbox").display()))?;
-            std::fs::create_dir_all(session_dir.join("outbox"))
-                .with_context(|| format!("create {}", session_dir.join("outbox").display()))?;
-
             let adapter = ClaudeCodeAdapter::new();
-            let handle = adapter
+            adapter
                 .spawn_session(SpawnOpts {
                     harness: adapter.name(),
                     slug: slug.to_string(),
@@ -751,32 +716,44 @@ pub fn run_session_add(slug: &str, harness: ccteam_core::HarnessKind) -> Result<
                     cwd: session_dir.clone(),
                     extra_args: Vec::new(),
                 })
-                .map_err(|err| anyhow::anyhow!("{err}"))?;
-
-            let was_empty = state.sessions.is_empty();
-            if was_empty {
-                state.tmux_session = handle.tmux_session.clone();
-                state.claude_pid = handle.pid.and_then(|pid| i32::try_from(pid).ok());
-            }
-            state.sessions.insert(
-                sid.clone(),
-                SessionRecord {
-                    harness,
-                    tmux_session: handle.tmux_session.clone(),
-                    started_at: handle.started_at,
-                    pid: handle.pid,
-                },
-            );
-            state.save(&state_path)?;
-            println!(
-                "added session {sid} ({}) for {slug}\n  tmux: {}\n  cwd: {}",
-                harness_sid_prefix(harness),
-                handle.tmux_session,
-                session_dir.display(),
-            );
-            Ok(())
+                .map_err(|err| anyhow::anyhow!("{err}"))?
         }
+        HarnessKind::Codex => {
+            let adapter = CodexAdapter::new();
+            adapter
+                .spawn_session(SpawnOpts {
+                    harness: adapter.name(),
+                    slug: slug.to_string(),
+                    sid: sid.clone(),
+                    cwd: session_dir.clone(),
+                    extra_args: Vec::new(),
+                })
+                .map_err(|err| anyhow::anyhow!("{err}"))?
+        }
+    };
+
+    let was_empty = state.sessions.is_empty();
+    if was_empty {
+        state.tmux_session = handle.tmux_session.clone();
+        state.claude_pid = handle.pid.and_then(|pid| i32::try_from(pid).ok());
     }
+    state.sessions.insert(
+        sid.clone(),
+        SessionRecord {
+            harness,
+            tmux_session: handle.tmux_session.clone(),
+            started_at: handle.started_at,
+            pid: handle.pid,
+        },
+    );
+    state.save(&state_path)?;
+    println!(
+        "added session {sid} ({}) for {slug}\n  tmux: {}\n  cwd: {}",
+        harness_sid_prefix(harness),
+        handle.tmux_session,
+        session_dir.display(),
+    );
+    Ok(())
 }
 
 /// Print one row per registered flex session.
@@ -1334,7 +1311,7 @@ fn render_codex_detection_line() -> String {
 
 fn fallback_not_found_line() -> String {
     String::from(
-        "[ccteam] codex CLI: not found (V0.3.1 trait-stub only; install codex CLI for V0.3.2+ — see docs/research/ccteam-codex-integration.md)\n",
+        "[ccteam] codex CLI: not found (install for V0.4.0 CodexAdapter — see docs/research/ccteam-codex-integration.md)\n",
     )
 }
 

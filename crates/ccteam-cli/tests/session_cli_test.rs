@@ -190,33 +190,33 @@ fn session_add_claude_spawns_tmux_session_and_records_state() {
 }
 
 #[test]
-fn session_add_codex_exits_with_v0_3_2_pointer() {
-    // F47 verification target — exercises CodexAdapter::spawn_session's
-    // NotImplemented error path through the full CLI stack.
+fn session_add_codex_no_longer_returns_v0_3_1_stub_error() {
+    // V0.4.0 F62 regression guard: CodexAdapter::spawn_session is no
+    // longer the V0.3.1 NotImplemented stub. Invoking
+    // `ccteam session add --harness=codex` against a non-existent
+    // project must fail with the *project-not-found* path (or the
+    // tmux/codex-CLI not-found path on hosts without those bins) —
+    // never with the legacy "V0.3.2 deferral" stub message.
     let out = Command::new(cct_bin())
         .args(["session", "add", "some-slug", "--harness=codex"])
         .output()
         .expect("spawn ccteam session add --harness=codex");
     assert!(
         !out.status.success(),
-        "ccteam session add --harness=codex must exit non-zero (V0.3.1 stub); \
+        "ccteam session add --harness=codex against unknown project must exit non-zero; \
          stdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
-    assert_eq!(
-        out.status.code(),
-        Some(1),
-        "ccteam session add --harness=codex should exit code 1",
-    );
     let stderr = String::from_utf8_lossy(&out.stderr);
+    // Legacy V0.3.1 stub strings must not surface anymore.
     assert!(
-        stderr.contains("V0.3.2"),
-        "stderr should cite V0.3.2 deferral; got:\n{stderr}",
+        !stderr.contains("trait-stub in V0.3.1"),
+        "V0.3.1 stub message leaked post-F62; got:\n{stderr}",
     );
     assert!(
-        stderr.contains("docs/research/ccteam-codex-integration.md"),
-        "stderr should cite codex-integration research doc; got:\n{stderr}",
+        !stderr.contains("deferred to V0.3.2"),
+        "V0.3.1 stub deferral message leaked post-F62; got:\n{stderr}",
     );
 }
 

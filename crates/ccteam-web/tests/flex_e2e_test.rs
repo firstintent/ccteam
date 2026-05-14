@@ -319,21 +319,28 @@ async fn v0_3_1_flex_dashboard_session_sse_harness_and_actions() {
 }
 
 #[test]
-fn v0_3_1_codex_adapter_remains_trait_stub() {
-    let err = CodexAdapter::new()
-        .spawn_session(SpawnOpts {
-            harness: "codex",
-            slug: "flex-e2e".into(),
-            sid: "codex-1".into(),
-            cwd: std::env::temp_dir(),
-            extra_args: Vec::new(),
-        })
-        .expect_err("CodexAdapter must stay stubbed in V0.3.1");
-    let msg = err.to_string();
-    assert!(msg.contains("trait-stub in V0.3.1"), "msg={msg}");
-    assert!(msg.contains("V0.3.2"), "msg={msg}");
-    assert!(
-        msg.contains("docs/research/ccteam-codex-integration.md"),
-        "msg={msg}",
-    );
+fn v0_4_0_codex_adapter_is_no_longer_trait_stub() {
+    // V0.4.0 F62 replaces V0.3.1's NotImplemented stub with a real
+    // tmux + codex CLI implementation. This regression guard pins
+    // that contract: the pure-Rust `ingest_snapshot` path is now
+    // permissive (returns a fallback snapshot for empty pane bodies)
+    // and never produces `NotImplemented`. Spawn / shutdown surfaces
+    // are tmux-dependent and live under the `codex-tests` feature.
+    let adapter = CodexAdapter::new();
+    let snap = adapter
+        .ingest_snapshot("")
+        .expect("ingest fallback must succeed post-F62");
+    assert_eq!(snap.harness, "codex");
+    assert_eq!(snap.model_display_name, "codex");
+    assert_eq!(snap.context_used_pct, 0);
+    // SpawnOpts still round-trip cleanly — schema unchanged across
+    // F62. (We do NOT call spawn_session here; that's covered by the
+    // codex-tests feature-gated integration test.)
+    let _opts = SpawnOpts {
+        harness: "codex",
+        slug: "flex-e2e".into(),
+        sid: "codex-1".into(),
+        cwd: std::env::temp_dir(),
+        extra_args: Vec::new(),
+    };
 }

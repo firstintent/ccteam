@@ -53,9 +53,12 @@ use crate::tmux::{session_name_for_slug, TmuxSession};
 pub const DEFAULT_CLAUDE_SID: &str = "claude-1";
 
 /// Adapter contract for any LLM "harness" ccteam may host inside a
-/// tmux session. V0.3.1 F46 ships [`ClaudeCodeAdapter`]; F47 will add
-/// `CodexAdapter` as a stub returning `Err(NotImplemented)` from every
-/// fallible method.
+/// tmux session. V0.3.1 F46 shipped [`ClaudeCodeAdapter`]; V0.3.1 F47
+/// landed `CodexAdapter` as a trait stub that returned
+/// `Err(NotImplemented)`; V0.4.0 F62 replaced that stub with a real
+/// tmux + codex CLI implementation. The `NotImplemented` error
+/// variant remains on [`HarnessError`] for any future harness whose
+/// integration ships in stages.
 ///
 /// Implementations are stateless — a single `'static` instance can be
 /// shared across all sessions of that harness type. Callers choose the
@@ -204,11 +207,13 @@ pub enum HarnessError {
     /// timed out or tmux refused the kill request.
     #[error("shutdown failed: {0}")]
     ShutdownFailed(String),
-    /// Adapter declares the surface unsupported. F47's `CodexAdapter`
-    /// returns this from every fallible method until V0.3.2 fills it
-    /// in; the `&'static str` payloads keep const-string callsites
+    /// Adapter declares the surface unsupported. V0.3.1 F47 used this
+    /// for the `CodexAdapter` stub until V0.4.0 F62 swapped in the
+    /// real implementation. The variant is preserved on the enum for
+    /// any future harness whose integration lands in stages; the
+    /// `&'static str` payloads keep const-string callsites
     /// allocation-free.
-    #[error("harness '{harness}' not implemented in V0.3.1: {reason}")]
+    #[error("harness '{harness}' not implemented: {reason}")]
     NotImplemented {
         harness: &'static str,
         reason: &'static str,
@@ -378,50 +383,162 @@ fn send_exit_command(tmux_session: &str) -> std::io::Result<()> {
 }
 
 // =====================================================================
-// CodexAdapter (V0.3.1 F47 — trait-stub only)
+// CodexAdapter (V0.4.0 F62 — real tmux + codex CLI implementation)
 // =====================================================================
 
-/// V0.3.1 F47 [`HarnessAdapter`] stub for OpenAI's `codex` CLI. Every
-/// fallible method returns [`HarnessError::NotImplemented`] with a
-/// `&'static str` reason pointing operators at the V0.3.2 tracking
-/// doc + the upstream codex integration research note.
+/// V0.4.0 F62 [`HarnessAdapter`] implementation for OpenAI's `codex`
+/// CLI. Replaces the V0.3.1 F47 trait stub (which returned
+/// [`HarnessError::NotImplemented`] from every fallible method).
 ///
-/// The stub exists so:
+/// Architecture (`docs/v0-4-0/prd.md` §6.5 + dev-plan §4):
 ///
-/// 1. F47 PR can land the **trait shape** (`harness: codex` accepted
-///    by `team.yaml::sessions[]` and `ccteam session add --harness codex`)
-///    without F47 also having to ship the real Codex bridge — that
-///    work is `~month` of integration plumbing tracked in
-///    `docs/research/ccteam-codex-integration.md` M1-M5.
-/// 2. V0.3.2's real `CodexAdapter` impl can swap into this slot
-///    without touching any caller (the trait surface is closed).
-/// 3. Users who flip `--harness codex` early get a friendly error
-///    pointing to the tracking issue rather than panic / silent fall
-///    back to claude.
+/// - **Transport**: tmux long-session, mirroring `ClaudeCodeAdapter`.
+///   A detached tmux session named `ccteam-<slug>-<sid>` hosts the
+///   `codex` process; `pane_pid` is read once post-spawn for liveness
+///   checks. Distinct from F61's ClaudeCode `--bg` job_id path — codex
+///   does not (yet) expose an equivalent background-runner protocol,
+///   so tmux remains the canonical session container.
+/// - **Status channel**: codex has no native statusline / stdin-JSON
+///   surface. [`Self::ingest_snapshot`] reads the last few lines of
+///   the tmux pane via `capture-pane -p` and greps for a
+///   `CODEX_STATUS: <json>` marker line that the codex agent (or the
+///   workflow's role .md) is expected to print after each turn. When
+///   no marker is found, the adapter returns a permissive default
+///   snapshot (`ctx_pct=0`, `cost=0`, model="codex") rather than
+///   failing — the snapshot pipeline is presentation-only (red line
+///   in CLAUDE.md §三 / PRD §3.3), so a missing tail is not an error.
+/// - **State observation file**: a `~/.ccteam/codex/<sid>/state.json`
+///   is written at spawn time mirroring `ClaudeCodeAdapter`'s
+///   statusline dual-write file shape. This lets F66 orchestrator
+///   surfaces consume codex state through the same observe-file
+///   pattern as claude. Best-effort write: a failing write does not
+///   block spawn (we still own the tmux session).
+/// - **Shutdown**: graceful `q\r` send-keys (codex's documented
+///   quit-bind), 500ms grace period, then `tmux kill-session -t
+///   <name>` fallback. Only kills the session we own (matched by the
+///   `SessionHandle::tmux_session` name) — never `kill-server` or
+///   pattern-matched kills (red line in this PR's grep checks).
 ///
 /// Stateless zero-size — share one `'static` instance.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CodexAdapter;
 
-/// V0.3.1 F47 stub reason — a single harmonized constant referenced
-/// from every `HarnessAdapter` method. Keeping this `&'static str`
-/// preserves the `NotImplemented::reason: &'static str` contract
-/// (CLAUDE.md §三 / PRD §4.2.1) so the stub is allocation-free.
+/// Marker line the codex agent prints in its tmux pane to publish
+/// state to the observer (PRD §6.5 + dev-plan §3.2). The parser greps
+/// the last few `capture-pane` lines for this prefix and JSON-decodes
+/// the trailing payload. Spelled out as a `&'static str` so callers
+/// (tests, future code-gen) can pattern-match the same literal.
+pub const CODEX_STATUS_MARKER: &str = "CODEX_STATUS:";
+
+/// Number of trailing pane lines an observer (the F66 watcher, the
+/// integration test in `tests/codex_adapter_test.rs`) is expected to
+/// capture from a codex tmux session before feeding the pane body to
+/// [`CodexAdapter::ingest_snapshot`]. Five lines balances signal
+/// (codex agents typically print the marker as the last line of a
+/// reply) against pane noise (longer tails may include earlier
+/// snapshots whose JSON has since been superseded). Bumped via PR if
+/// real-world agents start emitting status further from the tail.
 ///
-/// Both substrings the F47 verification tests check — `"V0.3.2"` and
-/// `"docs/research/ccteam-codex-integration.md"` — are present here,
-/// so any caller pattern-matching `NotImplemented { harness: "codex",
-/// reason }` can rely on both citations being available.
-const CODEX_NOT_IMPLEMENTED_REASON: &str =
-    "Codex adapter is trait-stub in V0.3.1; full Codex CLI integration deferred to V0.3.2+ \
-     — see docs/research/ccteam-codex-integration.md M1-M5 and docs/v0-3-1/prd.md §F47. \
-     Use --harness=claude or wait for V0.3.2.";
+/// `ingest_snapshot` itself ignores tail size — it scans every line
+/// the caller passed in — but exposing the constant lets callers and
+/// tests agree on the canonical capture window.
+pub const CODEX_STATUS_TAIL_LINES: usize = 5;
 
 impl CodexAdapter {
     /// Build a fresh `CodexAdapter`. Const so callers can write
     /// `static CX: CodexAdapter = CodexAdapter::new();`.
     pub const fn new() -> Self {
         Self
+    }
+
+    /// Resolve `~/.ccteam/codex/<sid>/state.json` for a session. The
+    /// directory mirrors the F46 `harness/` dual-write layout — one
+    /// directory per harness so observer code can iterate cleanly.
+    ///
+    /// Returns `None` if `CcteamPaths::from_env()` fails (HOME unset
+    /// in some test contexts) — the caller treats that as a soft
+    /// no-op and still owns the tmux session.
+    fn state_json_path(sid: &str) -> Option<PathBuf> {
+        let paths = CcteamPaths::from_env().ok()?;
+        Some(paths.root.join("codex").join(sid).join("state.json"))
+    }
+
+    /// Best-effort write of the initial `state.json` post-spawn. Shape
+    /// mirrors what `ClaudeCodeAdapter`'s statusline dual-write
+    /// produces so the F66 / F65 orchestrator's observer can read both
+    /// harnesses uniformly. Silent failure: returns `Ok(())` even if
+    /// the directory create or rename failed (we logged the warn) so
+    /// `spawn_session` doesn't propagate a non-fatal observer error
+    /// to the caller's `SessionHandle` flow.
+    fn write_initial_state(sid: &str, pid: Option<u32>) {
+        let Some(target) = Self::state_json_path(sid) else {
+            return;
+        };
+        let body = serde_json::json!({
+            "status": "starting",
+            "pid": pid,
+            "model": "codex",
+            "context_pct": 0,
+            "cost_usd": 0.0,
+        });
+        let raw = match serde_json::to_string(&body) {
+            Ok(s) => s,
+            Err(err) => {
+                tracing::warn!(error = %err, sid = %sid, "codex state.json serialise");
+                return;
+            }
+        };
+        if let Some(parent) = target.parent() {
+            if let Err(err) = std::fs::create_dir_all(parent) {
+                tracing::warn!(error = %err, path = %parent.display(), "codex state.json mkdir");
+                return;
+            }
+        }
+        if let Err(err) = std::fs::write(&target, raw.as_bytes()) {
+            tracing::warn!(error = %err, path = %target.display(), "codex state.json write");
+        }
+    }
+
+    /// Parse a tmux `capture-pane -p` body for the `CODEX_STATUS:`
+    /// marker line. Returns the JSON payload of the **last** matching
+    /// line (most recent status wins). Free function so tests can
+    /// drive it without spawning tmux.
+    fn parse_status_line(pane: &str) -> Option<serde_json::Value> {
+        pane.lines()
+            .rev()
+            .find_map(|line| line.trim().strip_prefix(CODEX_STATUS_MARKER))
+            .and_then(|rest| serde_json::from_str(rest.trim()).ok())
+    }
+
+    /// Build a `HarnessSnapshot` from a parsed `CODEX_STATUS:` JSON
+    /// payload (or `None` for the fallback shape). Field set matches
+    /// `HarnessSnapshot`'s normalized shape; codex-side keys are
+    /// optional and pluck through the existing `pluck_*` helpers for
+    /// forward-compat with future codex agent contracts.
+    fn snapshot_from_status(payload: Option<serde_json::Value>) -> HarnessSnapshot {
+        let value = payload.unwrap_or(serde_json::Value::Null);
+        let model_display_name = pluck_str(&value, &["model"])
+            .or_else(|| pluck_str(&value, &["model_display_name"]))
+            .unwrap_or_else(|| "codex".to_string());
+        let context_used_pct = pluck_pct(&value, &["context_pct"])
+            .or_else(|| pluck_pct(&value, &["context_used_pct"]))
+            .unwrap_or(0);
+        let cost_usd_total = pluck_f64(&value, &["cost_usd"])
+            .or_else(|| pluck_f64(&value, &["cost_usd_total"]))
+            .unwrap_or(0.0);
+        let rate_limit_pct = pluck_pct(&value, &["rate_limit_pct"]);
+        let cwd = pluck_str(&value, &["cwd"]).map(PathBuf::from);
+
+        HarnessSnapshot {
+            harness: "codex".to_string(),
+            model_display_name,
+            context_used_pct,
+            cost_usd_total,
+            rate_limit_pct,
+            cwd,
+            raw: value,
+            captured_at: Utc::now(),
+        }
     }
 }
 
@@ -430,26 +547,131 @@ impl HarnessAdapter for CodexAdapter {
         "codex"
     }
 
-    fn ingest_snapshot(&self, _raw: &str) -> Result<HarnessSnapshot, HarnessError> {
-        Err(HarnessError::NotImplemented {
-            harness: "codex",
-            reason: CODEX_NOT_IMPLEMENTED_REASON,
+    /// Ingest a tmux pane capture (passed as `raw`) for codex status
+    /// data. Unlike [`ClaudeCodeAdapter::ingest_snapshot`] which
+    /// consumes structured statusline JSON, this method accepts the
+    /// raw tmux pane body (caller is the observer that already ran
+    /// `capture-pane -p`) and greps for the `CODEX_STATUS:` marker.
+    ///
+    /// Permissive: missing / malformed marker returns the fallback
+    /// snapshot (`model="codex"`, zero pct/cost) rather than failing.
+    /// The snapshot pipeline is presentation-only — see CLAUDE.md
+    /// §三 / PRD §3.3.
+    fn ingest_snapshot(&self, raw: &str) -> Result<HarnessSnapshot, HarnessError> {
+        let payload = Self::parse_status_line(raw);
+        Ok(Self::snapshot_from_status(payload))
+    }
+
+    /// Spawn a codex tmux session. The command is `codex` with
+    /// `opts.extra_args` appended verbatim — callers (F65 meta-agent
+    /// MCP `spawn_agent`, the F49 CLI surface) thread role-specific
+    /// arguments (`exec --sandbox workspace-write --cd <cwd>`, prompt
+    /// strings, etc.) through `extra_args` to stay schema-stable.
+    /// When `extra_args` is empty, codex starts in default interactive
+    /// mode and waits for human input on the tmux pane.
+    fn spawn_session(&self, opts: SpawnOpts) -> Result<SessionHandle, HarnessError> {
+        let tmux_session = format!("{}-{}", session_name_for_slug(&opts.slug), opts.sid)
+            // session_name_for_slug already prepends "ccteam-", so the
+            // result is "ccteam-<slug>-<sid>" matching the F49 spec.
+            .trim_start_matches('-')
+            .to_string();
+
+        // Defense in depth: refuse to spawn over an existing session
+        // — that would mean the F49 master state.json::next_sid_seq
+        // bookkeeping drifted and reused a sid.
+        let session = TmuxSession::from_name(tmux_session.clone());
+        if session.exists() {
+            return Err(HarnessError::SpawnFailed(format!(
+                "tmux session already exists: {tmux_session} \
+                 (sid collision; F49 next_sid_seq accounting drifted)"
+            )));
+        }
+
+        // Base argv: bare `codex` so the session is interactive by
+        // default; F65 passes `exec --sandbox … "--cd" <cwd>` etc. via
+        // `extra_args`. Mirrors `ClaudeCodeAdapter`'s argv layout.
+        let mut argv: Vec<String> = vec!["codex".to_string()];
+        argv.extend(opts.extra_args.iter().cloned());
+        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+
+        session
+            .start(&opts.cwd, &argv_refs)
+            .map_err(|err| HarnessError::SpawnFailed(format!("tmux new-session: {err:#}")))?;
+
+        let pid = session
+            .pane_pid()
+            .ok()
+            .flatten()
+            .and_then(|n| u32::try_from(n).ok());
+
+        // Best-effort observe-file write so F66's reader sees a fresh
+        // state.json immediately. Failure is logged and swallowed —
+        // the tmux session is the source of truth, not this file.
+        Self::write_initial_state(&opts.sid, pid);
+
+        Ok(SessionHandle {
+            tmux_session,
+            harness: self.name().to_string(),
+            sid: opts.sid,
+            pid,
+            started_at: Utc::now(),
         })
     }
 
-    fn spawn_session(&self, _opts: SpawnOpts) -> Result<SessionHandle, HarnessError> {
-        Err(HarnessError::NotImplemented {
-            harness: "codex",
-            reason: CODEX_NOT_IMPLEMENTED_REASON,
-        })
+    /// Graceful shutdown of a codex tmux session. Sends `q` + Enter
+    /// (codex's documented quit binding), waits 500ms for the process
+    /// to drain, then `tmux kill-session -t <handle.tmux_session>` as
+    /// the authoritative cleanup. Targets only the named session — no
+    /// `kill-server` / pattern kills (red line CLAUDE.md §三).
+    fn shutdown_session(&self, handle: &SessionHandle) -> Result<(), HarnessError> {
+        let session = TmuxSession::from_name(handle.tmux_session.clone());
+        if !session.exists() {
+            // Already gone — treat as success (idempotent, matches the
+            // ClaudeCodeAdapter shutdown contract).
+            return Ok(());
+        }
+        if let Err(err) = send_codex_quit_keys(&handle.tmux_session) {
+            tracing::warn!(
+                error = %err,
+                session = %handle.tmux_session,
+                "CodexAdapter::shutdown_session: send-keys q failed; \
+                 falling through to tmux kill-session",
+            );
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        if session.exists() {
+            session.kill().map_err(|err| {
+                HarnessError::ShutdownFailed(format!("tmux kill-session: {err:#}"))
+            })?;
+        }
+        Ok(())
     }
+}
 
-    fn shutdown_session(&self, _handle: &SessionHandle) -> Result<(), HarnessError> {
-        Err(HarnessError::NotImplemented {
-            harness: "codex",
-            reason: CODEX_NOT_IMPLEMENTED_REASON,
-        })
+/// Send `q` + Enter to the named tmux session — codex's standard
+/// quit keybinding. Separate from `send_exit_command` (Claude Code's
+/// `/exit` slash-command) so the two harnesses' shutdown grammars
+/// stay distinct.
+fn send_codex_quit_keys(tmux_session: &str) -> std::io::Result<()> {
+    let send_lit = Command::new("tmux")
+        .args(["send-keys", "-t", tmux_session, "-l", "--", "q"])
+        .output()?;
+    if !send_lit.status.success() {
+        return Err(std::io::Error::other(format!(
+            "tmux send-keys -l q: {}",
+            String::from_utf8_lossy(&send_lit.stderr)
+        )));
     }
+    let send_enter = Command::new("tmux")
+        .args(["send-keys", "-t", tmux_session, "Enter"])
+        .output()?;
+    if !send_enter.status.success() {
+        return Err(std::io::Error::other(format!(
+            "tmux send-keys Enter: {}",
+            String::from_utf8_lossy(&send_enter.stderr)
+        )));
+    }
+    Ok(())
 }
 
 // =====================================================================
@@ -530,10 +752,7 @@ pub fn write_harness_snapshot(paths: &CcteamPaths, cwd: &Path, raw: &str) -> std
         std::fs::create_dir_all(parent)?;
     }
     let tmp = match target.file_name() {
-        Some(name) => target.with_file_name(format!(
-            "{}.tmp",
-            name.to_str().unwrap_or("snapshot")
-        )),
+        Some(name) => target.with_file_name(format!("{}.tmp", name.to_str().unwrap_or("snapshot"))),
         None => return Ok(false),
     };
     std::fs::write(&tmp, raw.as_bytes())?;
@@ -708,9 +927,7 @@ mod tests {
     #[test]
     fn ingest_malformed_json_returns_ingest_failed() {
         let raw = r#"{"model": "broken"#;
-        let err = ClaudeCodeAdapter::new()
-            .ingest_snapshot(raw)
-            .unwrap_err();
+        let err = ClaudeCodeAdapter::new().ingest_snapshot(raw).unwrap_err();
         assert!(matches!(err, HarnessError::IngestFailed(_)));
     }
 
@@ -753,9 +970,7 @@ mod tests {
         assert!(target.exists());
         assert_eq!(std::fs::read_to_string(&target).unwrap(), raw);
         // No leftover .tmp.
-        let tmp_target = paths
-            .harness_dir()
-            .join("dev-foo-claude-1.json.tmp");
+        let tmp_target = paths.harness_dir().join("dev-foo-claude-1.json.tmp");
         assert!(!tmp_target.exists());
     }
 
@@ -796,14 +1011,14 @@ mod tests {
         assert!(ClaudeCodeAdapter::new().subagent_states(&snap).is_empty());
     }
 
-    // ----- CodexAdapter (V0.3.1 F47 stub) -----
+    // ----- CodexAdapter (V0.4.0 F62 real implementation) -----
     //
-    // Every fallible method must return `HarnessError::NotImplemented`
-    // with `&'static str` payloads citing both V0.3.2 and the
-    // codex-integration research doc (PRD §F47 §4.2.1). The reason
-    // strings are harmonized across all three methods so callers
-    // (including the F49 `ccteam session add` CLI surface) can match
-    // the same two substrings on every method.
+    // Unit tests cover the pure-Rust surfaces that don't need tmux or
+    // the codex CLI: name stability, snapshot parsing, fallback shape,
+    // status JSON round-trip. The tmux-bearing surfaces
+    // (`spawn_session`, `shutdown_session`) live in
+    // `crates/ccteam-core/tests/codex_adapter_test.rs` under the
+    // `codex-tests` feature gate (PR §3.5).
 
     #[test]
     fn codex_adapter_name_is_codex() {
@@ -815,65 +1030,75 @@ mod tests {
     }
 
     #[test]
-    fn codex_adapter_spawn_returns_not_implemented_with_v0_3_2_reason() {
-        let opts = SpawnOpts {
-            harness: "codex",
-            slug: "flex-foo".into(),
-            sid: "codex-1".into(),
-            cwd: PathBuf::from("/tmp"),
-            extra_args: Vec::new(),
-        };
-        match CodexAdapter::new().spawn_session(opts).unwrap_err() {
-            HarnessError::NotImplemented { harness, reason } => {
-                assert_eq!(harness, "codex");
-                assert!(
-                    reason.contains("V0.3.2"),
-                    "reason should cite V0.3.2: {reason}",
-                );
-                assert!(
-                    reason.contains("docs/research/ccteam-codex-integration.md"),
-                    "reason should cite codex-integration research doc: {reason}",
-                );
-            }
-            other => panic!("expected NotImplemented, got {other:?}"),
-        }
+    fn codex_adapter_ingest_empty_pane_returns_fallback_snapshot() {
+        // No CODEX_STATUS line → permissive fallback (snapshot pipeline
+        // is presentation-only; PRD §3.3). model="codex", zero pct/cost.
+        let snap = CodexAdapter::new()
+            .ingest_snapshot("")
+            .expect("permissive fallback");
+        assert_eq!(snap.harness, "codex");
+        assert_eq!(snap.model_display_name, "codex");
+        assert_eq!(snap.context_used_pct, 0);
+        assert_eq!(snap.cost_usd_total, 0.0);
+        assert_eq!(snap.rate_limit_pct, None);
+        assert!(snap.cwd.is_none());
     }
 
     #[test]
-    fn codex_adapter_ingest_returns_not_implemented() {
-        match CodexAdapter::new().ingest_snapshot("{}").unwrap_err() {
-            HarnessError::NotImplemented { harness, reason } => {
-                assert_eq!(harness, "codex");
-                assert!(reason.contains("V0.3.2"));
-                assert!(reason.contains("docs/research/ccteam-codex-integration.md"));
-            }
-            other => panic!("expected NotImplemented, got {other:?}"),
-        }
+    fn codex_adapter_ingest_status_line_parses() {
+        let pane = "(some scrollback)\n\
+                    CODEX_STATUS: {\"model\":\"o3\",\"context_pct\":42,\"cost_usd\":1.25}\n\
+                    (trailing prompt)\n";
+        let snap = CodexAdapter::new().ingest_snapshot(pane).unwrap();
+        assert_eq!(snap.harness, "codex");
+        assert_eq!(snap.model_display_name, "o3");
+        assert_eq!(snap.context_used_pct, 42);
+        assert!((snap.cost_usd_total - 1.25).abs() < 1e-9);
     }
 
     #[test]
-    fn codex_adapter_shutdown_returns_not_implemented() {
-        let handle = SessionHandle {
-            tmux_session: "ccteam-flex-foo-codex-1".into(),
-            harness: "codex".into(),
-            sid: "codex-1".into(),
-            pid: None,
-            started_at: Utc::now(),
-        };
-        match CodexAdapter::new().shutdown_session(&handle).unwrap_err() {
-            HarnessError::NotImplemented { harness, reason } => {
-                assert_eq!(harness, "codex");
-                assert!(reason.contains("V0.3.2"));
-                assert!(reason.contains("docs/research/ccteam-codex-integration.md"));
+    fn codex_adapter_ingest_last_status_line_wins() {
+        // Two markers: the most recent (deepest in the pane) is used.
+        let pane = "CODEX_STATUS: {\"model\":\"o1\",\"context_pct\":10}\n\
+                    intermediate\n\
+                    CODEX_STATUS: {\"model\":\"o3\",\"context_pct\":80}\n";
+        let snap = CodexAdapter::new().ingest_snapshot(pane).unwrap();
+        assert_eq!(snap.model_display_name, "o3");
+        assert_eq!(snap.context_used_pct, 80);
+    }
+
+    #[test]
+    fn codex_adapter_ingest_malformed_json_falls_back_silently() {
+        // Marker line is present but JSON is broken → fallback shape;
+        // no error propagated. Snapshot pipeline must not panic.
+        let pane = "CODEX_STATUS: { broken json\n";
+        let snap = CodexAdapter::new().ingest_snapshot(pane).unwrap();
+        assert_eq!(snap.model_display_name, "codex");
+        assert_eq!(snap.context_used_pct, 0);
+    }
+
+    #[test]
+    fn codex_adapter_does_not_return_not_implemented() {
+        // Regression guard for F62: pure-Rust surfaces (ingest, name)
+        // must never produce `HarnessError::NotImplemented`. Spawn /
+        // shutdown depend on tmux and are exercised under the
+        // `codex-tests` feature, but pattern-matching here covers the
+        // ingest path with a dummy input. Compile-level: if anyone
+        // re-introduces the stub, this match-arm panics.
+        let res = CodexAdapter::new().ingest_snapshot("");
+        match res {
+            Ok(_) => {}
+            Err(HarnessError::NotImplemented { .. }) => {
+                panic!("CodexAdapter must not return NotImplemented post-F62")
             }
-            other => panic!("expected NotImplemented, got {other:?}"),
+            Err(other) => panic!("unexpected ingest error: {other:?}"),
         }
     }
 
     #[test]
     fn codex_adapter_subagent_states_default_empty() {
-        // Mirrors `subagent_states_default_empty_for_v0_3_1` — the
-        // stub uses the trait's default `Vec::new()` impl.
+        // Mirrors `subagent_states_default_empty_for_v0_3_1`. Codex's
+        // subagent surface is still TBD pending upstream API.
         let snap = HarnessSnapshot {
             harness: "codex".into(),
             model_display_name: "X".into(),
