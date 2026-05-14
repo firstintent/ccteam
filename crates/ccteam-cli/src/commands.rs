@@ -34,6 +34,14 @@ pub struct InitOptions {
     /// Overwrite existing global phase templates instead of skipping
     /// them (default: false, so hand edits stick across re-init).
     pub force: bool,
+    /// V0.4.1: when set, interactively prompt the user for each
+    /// optional install step (MCP, skill, meta-agent) after laying
+    /// down the directory skeleton.
+    pub interactive: bool,
+    /// V0.4.1: assume `yes` for every prompt the wizard would ask.
+    /// Implies `interactive` in the sense that all install steps run,
+    /// but skips the actual stdin prompts.
+    pub yes: bool,
 }
 
 /// `ccteam init`. Creates `~/.ccteam/{phases,progress,inbox,control,
@@ -104,10 +112,75 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
         None => out.push_str("  ccteam   : current_exe() failed (binary path unresolved)\n"),
     }
 
+    // V0.4.1 wizard: install MCP / skill / meta-agent with optional
+    // interactive prompts. Falls back to printing the manual next-step
+    // hints when neither flag is set (legacy behavior).
+    if opts.interactive || opts.yes {
+        out.push_str("\nfirst-run install:\n");
+        let mut did_something = false;
+
+        let do_skill = ask_yn("install ccteam-control skill (~/.claude/skills/)", opts.yes)?;
+        if do_skill {
+            out.push_str(&render_install_skill_report(paths, &DoctorOptions {
+                install_skill: true,
+                ..Default::default()
+            })?);
+            did_something = true;
+        }
+        let do_mcp = ask_yn(
+            "register ccteam MCP server in ~/.claude.json (mcpServers.ccteam)",
+            opts.yes,
+        )?;
+        if do_mcp {
+            out.push_str(&render_install_mcp_report()?);
+            did_something = true;
+        }
+        let do_meta = ask_yn(
+            "bootstrap meta-agent project (~/projects/meta/)",
+            opts.yes,
+        )?;
+        if do_meta {
+            out.push_str(&render_install_meta_agent_report(paths)?);
+            did_something = true;
+        }
+
+        if !did_something {
+            out.push_str("  (no install steps selected)\n");
+        }
+    }
+
     out.push_str("\nnext:\n");
     out.push_str("  ccteam new \"<your one-line request>\"\n");
-    out.push_str("  ccteam start --foreground   # in another terminal\n");
+    out.push_str("  ccteam start                # boots orchestrator + web on 127.0.0.1:7331\n");
     Ok(out)
+}
+
+/// Prompt the user `<question> [Y/n]: ` and return their answer. With
+/// `yes_to_all = true`, skips the prompt and answers `true` (the
+/// `-y` flag path). Reading a non-TTY stdin without `-y` returns
+/// `false` to avoid hanging in pipelines.
+fn ask_yn(question: &str, yes_to_all: bool) -> Result<bool> {
+    use std::io::{IsTerminal, Write};
+    if yes_to_all {
+        println!("  ✓ {question} (--yes)");
+        return Ok(true);
+    }
+    if !std::io::stdin().is_terminal() {
+        // non-interactive + no -y → skip the question (safe default).
+        println!("  · {question}: SKIPPED (non-tty, pass --yes to enable)");
+        return Ok(false);
+    }
+    print!("  {question}? [Y/n]: ");
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .context("read y/n from stdin")?;
+    let answer = matches!(
+        line.trim().to_ascii_lowercase().as_str(),
+        "" | "y" | "yes" | "ok"
+    );
+    Ok(answer)
 }
 
 /// V0.2.2 F34: optional knobs for `run_new` covering the four-tier

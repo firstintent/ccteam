@@ -217,13 +217,13 @@ impl DaemonHealth {
                 format!("orchestrator daemon healthy ({age_secs}s since last heartbeat)")
             }
             DaemonHealth::NoHeartbeat => {
-                "orchestrator daemon down: no heartbeat file (start it with `ccteam start \
-                 --foreground` in another terminal)"
+                "orchestrator daemon down: no heartbeat file (start it with `ccteam start` \
+                 in another terminal)"
                     .into()
             }
             DaemonHealth::Stale { age_secs } => format!(
                 "orchestrator daemon down: heartbeat is {age_secs}s old (grace = {}s); \
-                 restart with `ccteam start --foreground`",
+                 restart with `ccteam start`",
                 HEARTBEAT_GRACE.as_secs()
             ),
         }

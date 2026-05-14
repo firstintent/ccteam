@@ -32,13 +32,25 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// One-shot setup: create `~/.ccteam/` skeleton, unpack phase
-    /// templates to `~/.ccteam/phases/`, and run a quick health check
-    /// (claude / tmux / ccteam-on-PATH). Idempotent — safe to re-run.
+    /// templates, and run a quick health check (claude / tmux /
+    /// ccteam-on-PATH). Idempotent — safe to re-run.
+    ///
+    /// V0.4.1: pass `-i` / `--interactive` to also prompt y/n for
+    /// optional installs (MCP, skill, meta-agent), or `-y` / `--yes`
+    /// to install all of them without prompting.
     Init {
         /// Overwrite existing global phase templates (default: skip if
         /// already on disk so hand-edits stick).
         #[arg(long, default_value_t = false)]
         force: bool,
+        /// V0.4.1: interactively prompt for each optional install step
+        /// after the directory skeleton.
+        #[arg(short = 'i', long, default_value_t = false)]
+        interactive: bool,
+        /// V0.4.1: assume yes for every install-step prompt the wizard
+        /// would ask. Useful in scripts / CI.
+        #[arg(short = 'y', long, default_value_t = false)]
+        yes: bool,
     },
     /// Hook handlers invoked by Claude Code per project settings.json.
     /// Each subcommand reads stdin JSON (the Claude Code hook payload)
@@ -135,6 +147,16 @@ enum Command {
     Ls {
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
+    },
+    /// V0.4.1: one-screen aggregate health view. Reports daemon
+    /// heartbeat age, every project's slug + age + recent-event time,
+    /// the last N progress events merged across projects, and the
+    /// embedded-web token (file path + value). Replaces having to grep
+    /// `ls` + `progress` + multiple `doctor` checks.
+    Status {
+        /// How many recent progress events to merge + print.
+        #[arg(long, default_value_t = 5)]
+        tail: usize,
     },
     /// Show one project's full state, recent events, and artifacts.
     /// With no slug, lists every available slug + a re-run hint.
@@ -494,9 +516,16 @@ fn main() -> Result<()> {
     };
 
     match command {
-        Command::Init { force } => {
+        Command::Init { force, interactive, yes } => {
             let paths = CcteamPaths::from_env()?;
-            let report = commands::run_init(&paths, InitOptions { force })?;
+            let report = commands::run_init(
+                &paths,
+                InitOptions {
+                    force,
+                    interactive,
+                    yes,
+                },
+            )?;
             print!("{report}");
             Ok(())
         }
@@ -530,6 +559,7 @@ fn main() -> Result<()> {
             auto_slug_model,
         } => run_new(request, file, team, slug, no_auto_slug, auto_slug_model),
         Command::Ls { format } => run_ls(format),
+        Command::Status { tail } => run_status(tail),
         Command::Show { slug, format } => match slug {
             Some(s) => run_show(&s, format),
             None => show_slug_picker(),
@@ -990,6 +1020,99 @@ fn parse_web_opts(web: &StartWebOpts) -> Result<ccteam_web::ServeOpts> {
         token_file: web.token_file.clone(),
         no_auth_grace_secs: Some(5),
     })
+}
+
+fn run_status(tail: usize) -> Result<()> {
+    let paths = CcteamPaths::from_env()?;
+    use ccteam_core::check_daemon_health;
+
+    println!("ccteam status");
+    println!();
+
+    // Daemon health
+    let health = check_daemon_health(&paths);
+    println!("  daemon:  {}", health.describe());
+    println!();
+
+    // Projects
+    let projects = ccteam_core::queries::collect_projects(&paths).unwrap_or_default();
+    if projects.is_empty() {
+        println!("  projects: (none — `ccteam new \"<idea>\"` to create one)");
+    } else {
+        println!("  projects ({}):", projects.len());
+        for p in &projects {
+            let age = humanize_secs(p.age_seconds);
+            let silent = humanize_secs(p.stall_silent_seconds);
+            println!(
+                "    {:<32}  age {:>8}  last-event {:>8}",
+                p.state.slug, age, silent
+            );
+        }
+    }
+    println!();
+
+    // Recent events across all projects (merged)
+    if tail > 0 && !projects.is_empty() {
+        println!("  recent events (last {}):", tail);
+        let mut all_events: Vec<(String, serde_json::Value)> = Vec::new();
+        for p in &projects {
+            let evs = ccteam_core::progress::read_all_events(&paths.progress_jsonl(&p.state.slug))
+                .unwrap_or_default();
+            for e in evs {
+                all_events.push((p.state.slug.clone(), e));
+            }
+        }
+        // Sort by event ts string (RFC3339 sorts lexicographically).
+        all_events.sort_by_key(|(_, e)| {
+            e.get("ts")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .unwrap_or_default()
+        });
+        for (slug, evt) in all_events.iter().rev().take(tail).rev() {
+            let kind = evt.get("event").and_then(|v| v.as_str()).unwrap_or("?");
+            let ts = evt.get("ts").and_then(|v| v.as_str()).unwrap_or("");
+            let role = evt.get("role").and_then(|v| v.as_str()).unwrap_or("");
+            let role_s = if role.is_empty() {
+                String::new()
+            } else {
+                format!(" role={role}")
+            };
+            println!("    [{ts}] {slug} {kind}{role_s}");
+        }
+        println!();
+    }
+
+    // Web token
+    let token_path = ccteam_web::token::default_token_path(&paths);
+    if token_path.exists() {
+        match std::fs::read_to_string(&token_path) {
+            Ok(hex) => println!(
+                "  web token: ccteam:{}  ({})",
+                hex.trim(),
+                token_path.display()
+            ),
+            Err(_) => println!("  web token: <unreadable> ({})", token_path.display()),
+        }
+    } else {
+        println!(
+            "  web token: <none yet — generated on first non-loopback `ccteam start`> ({})",
+            token_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn humanize_secs(s: u64) -> String {
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m", s / 60)
+    } else if s < 86400 {
+        format!("{}h", s / 3600)
+    } else {
+        format!("{}d", s / 86400)
+    }
 }
 
 fn show_slug_picker() -> Result<()> {
