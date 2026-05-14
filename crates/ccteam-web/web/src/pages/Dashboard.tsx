@@ -28,8 +28,6 @@ import {
   useProgressStream,
   type ProgressEvent,
 } from "../hooks/useProgressStream";
-import { WorkspaceSidebar } from "../components/WorkspaceSidebar";
-
 /** Format an SSE event timestamp as a short relative-time string.
  *
  *  Uses `Intl.RelativeTimeFormat` so we don't pull in a date lib. The
@@ -224,7 +222,6 @@ export default function Dashboard() {
 
   return (
     <div className="h-full flex min-h-0 min-w-0">
-      <WorkspaceSidebar projects={cards} activeSlug={null} />
       <div className="flex-1 min-w-0 overflow-y-auto">
         {error && (
           <div className="m-4 px-3 py-2 rounded border border-status-error/40 bg-status-error/10 text-status-error text-xs font-mono">

@@ -12,14 +12,17 @@
 // even when auth is required. The first /api/* 401 trips `saw401`
 // and the gate flips on the next render.
 
-import { Route, Routes } from "react-router-dom";
+import { useEffect, useState } from "react";
+import { Route, Routes, useMatch } from "react-router-dom";
 import { TopBar } from "./components/TopBar";
 import { ContentSplit } from "./components/ContentSplit";
+import { WorkspaceSidebar } from "./components/WorkspaceSidebar";
 import Dashboard from "./pages/Dashboard";
 import ProjectDetail from "./pages/ProjectDetail";
 import SessionDetail from "./pages/SessionDetail";
 import { TokenEntryPage } from "./components/TokenEntryPage";
 import { useAuthState } from "./hooks/useAuthState";
+import { fetchDashboard, type DashboardRow } from "./lib/dashboardApi";
 
 function PlaceholderPage({ label }: { label: string }) {
   return (
@@ -47,12 +50,44 @@ function TokenEntryGate({ children }: { children: React.ReactNode }) {
   return <>{children}</>;
 }
 
+/** Persistent Projects sidebar — mounted in App so it stays visible on
+ *  every route (dashboard, project detail, session detail). Fetches
+ *  `/api/v1/projects` once on mount; auth / network failures fall back
+ *  to the empty-state copy the sidebar already renders. Active slug is
+ *  derived from the URL via useMatch so navigation keeps the highlight
+ *  in sync without prop-drilling.
+ *
+ *  Note: this fetch overlaps with Dashboard's own fetch (the dashboard
+ *  grid still needs SSE-merged rows for last_event_label). The extra
+ *  request is harmless and keeps the two surfaces decoupled. */
+function PersistentSidebar() {
+  const [projects, setProjects] = useState<DashboardRow[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    fetchDashboard()
+      .then((rows) => {
+        if (!cancelled) setProjects(rows);
+      })
+      .catch(() => {
+        // TokenEntryGate / Dashboard surface auth + error UX; sidebar
+        // just stays empty so it doesn't double-report.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  const match = useMatch("/p/:slug/*");
+  const activeSlug = match?.params.slug ?? null;
+  return <WorkspaceSidebar projects={projects} activeSlug={activeSlug} />;
+}
+
 export default function App() {
   return (
     <TokenEntryGate>
       <div className="h-dvh flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset">
         <TopBar />
         <div className="flex flex-1 min-h-0">
+          <PersistentSidebar />
           <div className="flex-1 flex flex-col min-h-0 min-w-0">
             <ContentSplit
               collapsed
