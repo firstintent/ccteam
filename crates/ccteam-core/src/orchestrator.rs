@@ -19,7 +19,7 @@
 //!   3 consecutive times → push a `btw` alert to the meta-agent inbox.
 //! - **Zero team-name literals.** No `"ccteam"` / `"chainup"` / `"dev"`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -56,6 +56,12 @@ pub const MAX_CONSECUTIVE_SPAWN_FAILURES: u32 = 3;
 
 /// State.json poll interval for the completion watcher.
 pub const COMPLETION_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How often the daemon rescans `paths.projects_root` to pick up
+/// projects created after startup (e.g. via `ccteam init` or `ccteam
+/// new` while the daemon is running). Each rescan walks the dir and
+/// spawns event loops for any slug it hasn't seen before.
+pub const ROSTER_RESCAN_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub struct OrchestratorConfig {
@@ -258,6 +264,15 @@ impl Orchestrator {
     /// heartbeat file fresh so [`crate::daemon::check_health`] reports
     /// healthy. Returns when `shutdown` resolves.
     ///
+    /// ### Hot-reload of new projects
+    ///
+    /// `paths.projects_root` is rescanned every [`ROSTER_RESCAN_INTERVAL`]
+    /// so projects created after startup (e.g. `ccteam init` running
+    /// against a live daemon) get an event loop without requiring a
+    /// daemon restart. A slug is spawned at most once per daemon
+    /// lifetime — completed/failed tasks are NOT respawned (matches
+    /// existing "next `ccteam start` re-rosters" semantics).
+    ///
     /// ### Shutdown semantics
     ///
     /// On `shutdown`, per-project tasks are aborted via `JoinSet`.
@@ -276,32 +291,10 @@ impl Orchestrator {
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
-        let projects = queries::collect_projects(&self.paths).unwrap_or_else(|err| {
-            tracing::warn!(?err, "collect_projects failed; daemon starts with empty roster");
-            Vec::new()
-        });
-
         let mut tasks: JoinSet<(String, Result<()>)> = JoinSet::new();
-        for proj in projects {
-            let slug = proj.state.slug.clone();
-            let project_dir = self.paths.project_dir(&slug);
-            // V0.4.0 only — legacy V0.3.x phase-driven projects (no
-            // workflow.yaml) are skipped silently. They have no F66
-            // event-loop equivalent; their orchestration was the deleted
-            // phase state machine.
-            if !project_dir.join("workflow.yaml").exists()
-                && !project_dir.join(".ccteam").join("workflow.yaml").exists()
-            {
-                tracing::debug!(slug, "no workflow.yaml; skipping (pre-V0.4.0 project)");
-                continue;
-            }
-            tracing::info!(slug, "starting project event loop");
-            let orch = Arc::clone(self);
-            tasks.spawn(async move {
-                let res = orch.run_project(&slug).await;
-                (slug, res)
-            });
-        }
+        let mut spawned: HashSet<String> = HashSet::new();
+
+        self.spawn_new_rostered_projects(&mut tasks, &mut spawned, "startup");
 
         if let Err(err) = daemon::write_heartbeat(&self.paths) {
             tracing::warn!(?err, "initial heartbeat write failed");
@@ -311,6 +304,10 @@ impl Orchestrator {
         // `interval` fires its first tick immediately; we already wrote
         // an initial heartbeat above, so swallow that fire.
         hb_ticker.tick().await;
+
+        let mut rescan_ticker = tokio::time::interval(ROSTER_RESCAN_INTERVAL);
+        rescan_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        rescan_ticker.tick().await;
 
         tokio::pin!(shutdown);
         loop {
@@ -327,6 +324,9 @@ impl Orchestrator {
                         tracing::warn!(?err, "heartbeat write failed");
                     }
                 }
+                _ = rescan_ticker.tick() => {
+                    self.spawn_new_rostered_projects(&mut tasks, &mut spawned, "rescan");
+                }
                 Some(joined) = tasks.join_next() => {
                     match joined {
                         Ok((slug, Ok(()))) => {
@@ -342,6 +342,51 @@ impl Orchestrator {
                     }
                 }
             }
+        }
+    }
+
+    /// Walk the projects root and spawn event loops for slugs not yet
+    /// in `spawned`. Shared between startup (`origin = "startup"`) and
+    /// the periodic rescan tick (`origin = "rescan"`). Slugs without a
+    /// `workflow.yaml` are skipped silently — those are legacy V0.3.x
+    /// phase-driven projects with no event-loop equivalent.
+    fn spawn_new_rostered_projects(
+        self: &Arc<Self>,
+        tasks: &mut JoinSet<(String, Result<()>)>,
+        spawned: &mut HashSet<String>,
+        origin: &'static str,
+    ) {
+        let projects = match queries::collect_projects(&self.paths) {
+            Ok(p) => p,
+            Err(err) => {
+                tracing::warn!(?err, origin, "collect_projects failed; roster unchanged");
+                return;
+            }
+        };
+        for proj in projects {
+            let slug = proj.state.slug.clone();
+            if spawned.contains(&slug) {
+                continue;
+            }
+            let project_dir = self.paths.project_dir(&slug);
+            if !project_dir.join("workflow.yaml").exists()
+                && !project_dir.join(".ccteam").join("workflow.yaml").exists()
+            {
+                tracing::debug!(slug, "no workflow.yaml; skipping (pre-V0.4.0 project)");
+                continue;
+            }
+            if origin == "rescan" {
+                tracing::info!(slug, "hot-loaded new project; starting event loop");
+            } else {
+                tracing::info!(slug, "starting project event loop");
+            }
+            let orch = Arc::clone(self);
+            let slug_for_task = slug.clone();
+            tasks.spawn(async move {
+                let res = orch.run_project(&slug_for_task).await;
+                (slug_for_task, res)
+            });
+            spawned.insert(slug);
         }
     }
 
