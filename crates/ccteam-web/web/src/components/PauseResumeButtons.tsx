@@ -3,7 +3,7 @@
 // Two-button pair gated by the project's current pause state. Pause
 // sets `state.user_pause_pending=true` (server side via the F52 JSON
 // contract — actions::pause in ccteam-core); resume clears it plus
-// `user_attached` and `phase_state`. Neither kills the tmux session
+// `user_attached`. Neither kills the tmux session
 // (CLAUDE.md §三 red lines).
 //
 // Optimistic UI: while a request is in flight, both buttons are

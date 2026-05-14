@@ -1,4 +1,4 @@
-//! V0.3.1 F46 — harness statusline snapshot SSE endpoints.
+//! V0.3.1 F46 — harness snapshot SSE endpoints (V0.4.0 F61 retargeted).
 //!
 //! Mirrors the M5.2 `routes/sse.rs` shape, but pulls from the sibling
 //! [`crate::watcher::EventBus::subscribe_harness`] channel:
@@ -20,6 +20,11 @@
 //! envelope wrapping the parsed `HarnessSnapshot` (so consumers don't
 //! have to derive slug / sid from the source filename — the watcher
 //! already did that).
+//!
+//! Source of the snapshots: V0.4.0 F61 publishes them from Claude Code's
+//! native `~/.claude/jobs/<job_id>/state.json` (`parse_cc_state_json`).
+//! Earlier ship lines used a different source file. The SSE wire shape
+//! is unchanged across both — this route is harness-source-agnostic.
 //!
 //! Keep-alive + lagging-consumer behavior matches `routes::sse` (15s
 //! `:` comment, `reconnect_hint` synthetic frame on `Lagged(N)`).

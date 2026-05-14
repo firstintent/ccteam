@@ -10,6 +10,11 @@
 // (the askama template and the JSON serializer share the struct). If
 // the server adds a field, add it here as optional first — drop the
 // optional once the rollout window passes.
+//
+// V0.4.0 F68 update: `current_phase` removed (phase machinery retired
+// in F60). Workflow-aware columns will be added once a workflow-summary
+// roll-up endpoint exists; until then the dashboard shows team / kind +
+// badge / cost only.
 
 /** One row in the dashboard project list — matches the Rust `DashboardRow`
  *  struct's `Serialize` shape. See `docs/interfaces.md` §16.1. */
@@ -17,7 +22,6 @@ export interface DashboardRow {
   slug: string;
   team: string;
   kind: string;
-  current_phase: string;
   last_event_label: string;
   badge_class: string;
   badge_label: string;
