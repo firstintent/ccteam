@@ -43,34 +43,46 @@ cp ~/workplace/agents/ccteam/examples/workflows/agents/{explorer,fixer,reviewer,
 随后 **逐个 review 并按你的项目改写** `.claude/agents/*.md` 的正文 prompt。模板只是
 起点，真实 prompt 应描述你的具体 UI / 代码栈 / 验收标准。
 
-### 第 4 步：启动 orchestrator
+### 第 4 步:启动 orchestrator daemon
 
 ```bash
-ccteam run dev-ui-quality
-# 项目目录内 workflow.yaml 存在时，orchestrator 自动加载
-# 此时 watch trigger 已注册，gate 处于 locked 状态
+ccteam start --foreground
+# orchestrator 扫所有 ~/.ccteam/projects/ 下含 workflow.yaml 的项目,
+# 各自 watch trigger 已注册,gate 处于 locked 状态。
+# 此命令是全局 daemon — 不是 per-slug,要看具体项目用:
+#   ccteam show <slug>
+#   ccteam progress <slug> --tail
 ```
 
-### 第 5 步：触发首轮探索
+### 第 5 步:触发首轮探索
 
-通过 meta-agent（自然语言）或直接调 MCP 工具：
+V0.4.0 没有 `ccteam ctl` CLI。两条触发路径:
 
 ```bash
-# 走 meta-agent（推荐）：在 meta-agent session 里说 "现在跑一轮 explorer"
-# 或走 CLI 直接调 spawn_agent：
-ccteam ctl spawn-agent --slug dev-ui-quality --role explorer
+# A. 通过 meta-agent(推荐):在 meta-agent claude session 里说自然语言
+#    "现在跑一轮 explorer 探索登录页 UI 问题"
+#    meta-agent 调 mcp__ccteam__ccteam__spawn_agent(slug="dev-ui-quality", role="explorer")
+
+# B. 直接写 marker 文件让 orchestrator 下一 tick(5s)接走:
+mkdir -p ~/projects/dev-ui-quality/.ccteam/spawn_requests
+echo '{}' > ~/projects/dev-ui-quality/.ccteam/spawn_requests/explorer-$(date +%s).json
 ```
 
-explorer 把 UI 问题写到 `.ccteam/issues/`，inotify 自动触发 fixer 并发（最多
-10 个）→ fixer 写 `.ccteam/fixes/` → 触发 reviewer → 写 `.ccteam/verdicts/`。
+explorer 把 UI 问题写到 `.ccteam/issues/`,inotify 自动触发 fixer 并发(最多
+10 个)→ fixer 写 `.ccteam/fixes/` → 触发 reviewer → 写 `.ccteam/verdicts/`。
 
-### 第 6 步：解锁 Gate 发布
+### 第 6 步:解锁 Gate 发布
 
 reviewer 攒够 verdict 后,在 ccteam-web UI 点击 "shipper" gate 的解锁按钮,
-或 CLI:
+或通过 meta-agent MCP 工具,或直接写 marker 文件:
 
 ```bash
-ccteam ctl trigger-gate --slug dev-ui-quality --gate shipper
+# A. meta-agent NL:"我看 verdicts 都过了,解锁 shipper 出货"
+#    调用 mcp__ccteam__ccteam__trigger_gate
+
+# B. 直接写 marker:
+mkdir -p ~/projects/dev-ui-quality/.ccteam/gate_override
+echo '{}' > ~/projects/dev-ui-quality/.ccteam/gate_override/shipper
 ```
 
 shipper 启动,读取 verdict 列表执行发布动作。
