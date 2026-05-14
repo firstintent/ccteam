@@ -94,6 +94,7 @@ async fn pane_snapshot_uses_state_tmux_session_for_flex_sid() {
             tmux_session: "ccteam-dev-flex-claude-1".into(),
             started_at: Utc::now(),
             pid: None,
+            job_id: None,
         },
     );
     project.save(&paths.project_state("dev-flex")).unwrap();

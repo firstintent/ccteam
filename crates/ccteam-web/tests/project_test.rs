@@ -32,6 +32,7 @@ fn fixture_flex_project(paths: &CcteamPaths, slug: &str) {
             tmux_session: format!("ccteam-{slug}-claude-1"),
             started_at: Utc::now(),
             pid: None,
+            job_id: None,
         },
     );
     state.save(&paths.project_state(slug)).unwrap();

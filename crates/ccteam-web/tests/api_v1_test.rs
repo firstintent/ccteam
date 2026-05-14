@@ -56,6 +56,7 @@ fn fixture_flex_project(paths: &CcteamPaths, slug: &str, sid: &str) {
             tmux_session: format!("ccteam-{slug}-{sid}"),
             started_at: chrono::Utc::now(),
             pid: None,
+            job_id: None,
         },
     );
     state.next_sid_seq.insert(HarnessKind::Claude, 2);

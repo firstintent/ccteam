@@ -147,6 +147,7 @@ fn t01_spawn_creates_tmux_session() {
         slug: slug.clone(),
         sid: "codex-1".into(),
         cwd: std::env::temp_dir(),
+        role: String::new(),
         extra_args: Vec::new(),
     };
     let handle = CodexAdapter::new()
@@ -235,6 +236,7 @@ fn t04_shutdown_kills_session() {
             slug: slug.clone(),
             sid: "codex-1".into(),
             cwd: std::env::temp_dir(),
+            role: String::new(),
             extra_args: Vec::new(),
         })
         .expect("spawn for shutdown test");
@@ -289,6 +291,7 @@ fn t05_codex_not_implemented_removed() {
         tmux_session: format!("ccteam-{}-phantom", unique_slug("t05")),
         harness: "codex".into(),
         sid: "codex-99".into(),
+        job_id: None,
         pid: None,
         started_at: Utc::now(),
     };
@@ -305,6 +308,7 @@ fn t05_codex_not_implemented_removed() {
         slug: unique_slug("t05spawn"),
         sid: "codex-1".into(),
         cwd: PathBuf::from("/nonexistent-dir-f62"),
+        role: String::new(),
         extra_args: Vec::new(),
     };
     let spawn_res = adapter.spawn_session(opts);
@@ -344,6 +348,7 @@ fn e2e_spawn_capture_parse_shutdown_round_trip() {
             slug: slug.clone(),
             sid: "codex-1".into(),
             cwd: std::env::temp_dir(),
+            role: String::new(),
             extra_args: Vec::new(),
         })
         .expect("spawn for e2e round-trip");
