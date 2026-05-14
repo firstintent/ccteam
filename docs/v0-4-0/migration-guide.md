@@ -61,10 +61,10 @@ V0.4.0 orchestrator 读到 `phases:` 字段会 hard error（明确的 fail-fast�
 
 | V0.3.x 命令 | V0.4.0 替代 |
 |---|---|
-| `ccteam phase advance` | 无（phase 概念删除）|
-| `ccteam phase rerun` | `ccteam ctl spawn-agent --role <role>` |
-| `ccteam phase skip` | 无（artifact-driven 无顺序语义） |
-| `ccteam doctor --check-phase-dag` | `ccteam doctor --check-workflow` |
+| `ccteam phase advance` | 无(phase 概念删除) |
+| `ccteam phase rerun` | meta-agent 调 `mcp__ccteam__ccteam__spawn_agent(slug, role)` 或写 marker `<project>/.ccteam/spawn_requests/<role>-<ts>.json` |
+| `ccteam phase skip` | 无(artifact-driven 无顺序语义) |
+| `ccteam doctor --check-phase-dag` | 暂无;V0.4.1 候选(orchestrator 启动时已 validate `workflow.yaml`,失败写 progress.jsonl) |
 
 ### 2.3 progress.jsonl event 类型变化
 
@@ -87,13 +87,18 @@ V0.4.0 新增 event 类型：
 
 ---
 
-## 3. 自动迁移工具
+## 3. 自动迁移工具(V0.4.1 候选,V0.4.0 尚未实现)
+
+> ⚠️ **`ccteam doctor --migrate-phase-to-workflow` 子命令是 V0.4.1 P2 候选,
+> 当前 V0.4.0 未实现**。F60 删 phase 系统时只留了 doctor 子命令 stub,
+> 真实 migration logic 待 V0.4.1 补。本节描述**预期行为**(spec),供
+> V0.4.1 实现 + 现阶段手动迁移参考。
 
 ```bash
-ccteam doctor --migrate-phase-to-workflow
+ccteam doctor --migrate-phase-to-workflow   # V0.4.1 候选(stub 返回 not-implemented)
 ```
 
-该命令的行为：
+该命令的预期行为:
 
 ### 3.1 检测阶段
 
@@ -188,7 +193,8 @@ Migration summary:
 Next steps:
   1. Review each .claude/agents/<role>.md and tighten prompts
   2. Review workflow.yaml — adjust parallelism, trigger types
-  3. Test with: ccteam run <slug> + ccteam ctl spawn-agent --role <first>
+  3. Test with: ccteam start --foreground (在另一终端写 marker 触发首个 role,
+     例如: echo '{}' > <project>/.ccteam/spawn_requests/<first>-$(date +%s).json)
   4. Delete team.yaml.v0-3-bak when satisfied
 ```
 
@@ -365,9 +371,11 @@ V0.3.x 中 `team.yaml::kind: flex` 模式（多 session 自由编排）在 V0.4.
 被 `workflow.yaml` 完全取代——`kind: flex` 的语义重写为：
 "加载 workflow.yaml 而非走 phase DAG"。已有 flex 项目影响：
 
-- `state.json::sessions{}` 字段保留（用于 session id 分配）
+- `state.json::sessions{}` 字段保留(用于 session id 分配)
 - `~/.ccteam/progress/<slug>/<sid>.jsonl` per-session 路径保留
-- 旧 flex CLI（如 `ccteam ctl flex-new`）替换为 `ccteam ctl spawn-agent`
+- 旧 V0.3.1 `ccteam session add --harness claude` 创建命名 session 仍可用;
+  workflow.yaml 模式下推荐通过 marker 文件或 MCP `spawn_agent` 而非
+  `session add`(后者不绑定 workflow role,只起 tmux)
 
 自动迁移工具会把 flex 项目识别为"已是 workflow"状态，跳过转换，
 但仍需要你手动写 `workflow.yaml`（自动迁移不会生成无 phase 的项目的
@@ -378,25 +386,31 @@ workflow.yaml）。
 ## 7. 迁移后验证
 
 ```bash
-# 1. 验证 workflow.yaml schema
-ccteam ctl validate-workflow --slug <slug>
-# 期望：no errors
+# 1. workflow.yaml schema 由 orchestrator 启动时 deep-validate
+#    (V0.4.1 候选:独立 ccteam doctor --check-workflow 子命令)
+#    本地手验:
+test -f workflow.yaml || test -f .ccteam/workflow.yaml && echo OK
+grep -E "^\s*(prompt|system_prompt|messages):" workflow.yaml \
+  && echo "ERROR: forbidden field" || echo "OK: no forbidden fields"
 
-# 2. 验证所有 agent role 文件存在
-ccteam doctor --check-workflow --slug <slug>
-# 期望：all agent role files present
+# 2. 验证所有 agent role 文件存在(workflow.yaml 内的 role 都得有)
+python3 -c "import yaml,os,sys; s=yaml.safe_load(open('workflow.yaml')); \
+  miss=[r for r in s['agents'] if not os.path.exists(f'.claude/agents/{r}.md')]; \
+  print('MISSING:', miss) if miss else print('OK')"
 
-# 3. dry-run（不实际 spawn，只验证 trigger 注册）
-ccteam run --dry-run --slug <slug>
-# 期望：watcher 注册成功，无 error
+# 3. 启动 orchestrator(前台,Ctrl-C 退出)
+ccteam start --foreground
 
-# 4. smoke 测试 — manual trigger
-ccteam ctl spawn-agent --slug <slug> --role <first-role>
-ccteam ctl observe --slug <slug>
-# 期望：可以看到 session 启动
+# 4. smoke 测试 — manual trigger 首个 role(在另一终端):
+mkdir -p ~/projects/<slug>/.ccteam/spawn_requests
+echo '{}' > ~/projects/<slug>/.ccteam/spawn_requests/<first-role>-$(date +%s).json
 
-# 5. 端到端测试 — 一轮跑通
-# 用最低 parallelism 跑一遍，确认 artifact 流转 + Gate 解锁正常
+# 5. 看是否 spawn 成功:
+ccteam show <slug>
+ccteam progress <slug> --tail | grep -E "agent_spawn|workflow_start"
+
+# 6. 端到端测试 — 一轮跑通
+# 用最低 parallelism 跑一遍,确认 artifact 流转 + Gate 解锁正常
 ```
 
 确认全部 OK 后，删除 `team.yaml.v0-3-bak` 备份。

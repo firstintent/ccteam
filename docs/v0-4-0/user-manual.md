@@ -53,19 +53,27 @@ cp ~/workplace/agents/ccteam/examples/workflows/agents/{explorer,fixer,reviewer,
 随后 review 并按你的项目改写 `.claude/agents/*.md` 正文 prompt。模板是
 通用骨架，真实 prompt 应描述你的代码栈、UI 规范、验收标准。
 
-### 第 3 步：启动 orchestrator
+### 第 3 步：启动 orchestrator daemon
 
 ```bash
-ccteam run dev-ui-quality
+# 前台跑（看实时日志，Ctrl-C 退出）
+ccteam start --foreground
+
+# 或后台 daemon
+ccteam start &
 ```
 
-orchestrator 启动时：
+orchestrator daemon 启动后会扫描 `~/.ccteam/projects/` 下所有已知项目,**自动**
+为每个有 `workflow.yaml` 的项目调用 `Orchestrator::run_project(slug)`:
 
-1. 加载 `workflow.yaml` 并验证（任何 `prompt:` 字段会被 reject）
+1. 加载 `workflow.yaml` 并验证(任何 `prompt:` 字段会被 reject)
 2. 验证每个 agent role 都有对应 `.claude/agents/<role>.md`
 3. 注册 inotify watcher 到所有 `watch:` trigger 的路径
-4. 初始化 Gate 状态（默认 locked）
+4. 初始化 Gate 状态(默认 locked)
 5. progress.jsonl 写入 `workflow_start` event
+
+> 注:`ccteam start` 是**全局 daemon**,不是 per-project。要专门查看某个项目
+> 的进度用 `ccteam progress <slug>` / `ccteam show <slug>`。
 
 ### 第 4 步：在 web UI 看 workflow 拓扑
 
@@ -84,26 +92,37 @@ ccteam web --bind 127.0.0.1:7331
 
 ### 第 5 步：触发首轮
 
-通过 meta-agent（推荐）或 CLI：
+V0.4.0 没有 `ccteam ctl ...` CLI。手动触发的两条路径:
 
 ```bash
-# 通过 meta-agent session（自然语言）
-# 跟 meta-agent 说："现在跑一轮 explorer，让它探索登录页的 UI 问题"
-
-# 或直接 CLI
-ccteam ctl spawn-agent --slug dev-ui-quality --role explorer
+# A. 通过 meta-agent session(推荐) — 在 meta-agent 的 claude session 里说自然语言:
+#    "现在跑一轮 explorer,让它探索登录页的 UI 问题"
+#    meta-agent 会调 mcp__ccteam__ccteam__spawn_agent 工具。
+#
+# B. 直接写 marker 文件让 orchestrator 下一 tick 接走:
+mkdir -p .ccteam/spawn_requests
+cat > .ccteam/spawn_requests/explorer-$(date +%s).json <<'JSON'
+{ "role": "explorer", "ts": "$(date -u +%FT%TZ)" }
+JSON
+# orchestrator 5s 内扫到 → 调 spawn_session → 删 marker
 ```
 
-之后整个 workflow 自动运转：explorer → 写 issues → watcher 触发 fixer ×
-N（并行）→ 写 fixes → 触发 reviewer → 写 verdicts。
+之后整个 workflow 自动运转:explorer → 写 issues → watcher 触发 fixer ×
+N(并行)→ 写 fixes → 触发 reviewer → 写 verdicts。
 
-### 第 6 步：解锁 Gate 发布
+### 第 6 步:解锁 Gate 发布
 
-reviewer 攒够 pass 的 verdict 后，在 web UI 点击 shipper 的 unlock 按钮，
-或 CLI：
+reviewer 攒够 pass 的 verdict 后,在 web UI 点击 shipper 的 [Unlock] 按钮,
+或通过 meta-agent 调 MCP 工具,或直接写 marker 文件:
 
 ```bash
-ccteam ctl trigger-gate --slug dev-ui-quality --gate shipper
+# A. Meta-agent NL:"我看 verdicts 都过了,解锁 shipper 出货"
+#    meta-agent 调 mcp__ccteam__ccteam__trigger_gate
+
+# B. 直接写 marker:
+mkdir -p .ccteam/gate_override
+echo '{}' > .ccteam/gate_override/shipper
+# orchestrator 下一 tick spawn shipper + 删 marker
 ```
 
 shipper 启动 → 整合 fix → 创建 PR → 写 ship-log → 完成。
@@ -322,10 +341,15 @@ http://localhost:7331/app/projects/<slug>
 → 确认 → Gate 解锁
 ```
 
-### 7.2 CLI
+### 7.2 直接写 marker 文件
+
+V0.4.0 没有 `ccteam ctl` CLI;orchestrator 通过文件系统控制平面消费 marker:
 
 ```bash
-ccteam ctl trigger-gate --slug <slug> --gate <role>
+mkdir -p ~/projects/<slug>/.ccteam/gate_override
+echo '{}' > ~/projects/<slug>/.ccteam/gate_override/<role>
+# orchestrator 下一 tick(5s)spawn gate agent + 删 marker。
+# 写 {"force": true} 可跳过 input 条件检查强制 spawn。
 ```
 
 ### 7.3 Meta-agent 自动
@@ -338,14 +362,18 @@ meta-agent prompt 应明确约束哪些情况下可自动解锁、哪些必须 s
 
 ## 8. Parallelism 动态调节
 
-watch trigger 下的 `parallelism: N` 字段是**初始默认值**。运行时可以动态改：
+watch trigger 下的 `parallelism: N` 字段是**初始默认值**。运行时可以动态改:
 
 ```bash
-# Meta-agent 调
-mcp__ccteam__ccteam__set_parallelism(role="fixer", n=5)
+# A. Meta-agent 调(推荐)
+mcp__ccteam__ccteam__set_parallelism(slug="<slug>", role="fixer", parallelism=5)
 
-# CLI 等价
-ccteam ctl set-parallelism --slug <slug> --role fixer --n 5
+# B. 直接写 override 文件
+mkdir -p ~/projects/<slug>/.ccteam
+cat > ~/projects/<slug>/.ccteam/workflow_overrides.json <<'JSON'
+{ "fixer": { "parallelism": 5 } }
+JSON
+# orchestrator 每 tick 热读该文件,合并到 in-memory parallelism map
 ```
 
 降速场景：
@@ -363,39 +391,41 @@ ccteam ctl set-parallelism --slug <slug> --role fixer --n 5
 
 ---
 
-## 9. Budget 检查（$200 上限）
+## 9. Budget 检查($200 上限)
 
-ccteam 跟踪每个项目累计 cost（读取 `state.json` 中的 `cost_usd` +
-聚合所有 session）。默认上限 **$200 / project**，超出后：
+ccteam 跟踪每个项目累计 cost(聚合 `progress.jsonl` 的 `agent_done.cost_usd`)。
+默认上限 **$200 / project**(F66 `MAX_PROJECT_BUDGET_USD`),超出后:
 
 1. progress.jsonl 写入 `budget_exceeded` event
-2. orchestrator 停止 spawn 新 session（**不主动 kill 在跑 session**——红线）
-3. web UI / meta-agent / CLI 都收到 alert
-4. 用户需要：
-   - 调 budget：`ccteam ctl set-budget --slug <slug> --limit 300`
-   - 或降 parallelism + 等已跑 session 完成
-   - 或暂停 workflow：`ccteam ctl pause --slug <slug>`
-
-软告警阈值（不自动 kill）：
-
-- $50 → progress.jsonl `cost_warning_50`
-- $100 → progress.jsonl `cost_warning_100`
-- $200 → `budget_exceeded` + 停止 spawn
+2. orchestrator 停止 spawn 新 session(**不主动 kill 在跑 session**——红线)
+3. web UI / meta-agent 都收到 alert
+4. 用户需要:
+   - 调 budget:启动前 `export CCTEAM_BUDGET_LIMIT_USD=300` 或编辑项目
+     `team.yaml::cost.hard_kill_threshold_usd: 300`
+   - 或降 parallelism + 等已跑 session 完成(见 §8)
+   - 或停 daemon:`ccteam stop`(SIGTERM 通过 pidfile,**不杀 session**,
+     restart 时 `ccteam start` 重新挂载)
 
 ---
 
 ## 10. 故障排查 FAQ
 
-### Q1: workflow 不启动？
+### Q1: workflow 不启动?
 
 ```bash
 # 检查 workflow.yaml 路径
 ls workflow.yaml  # 或 .ccteam/workflow.yaml
-# 检查 schema 是否合法
-ccteam ctl validate-workflow --slug <slug>
-# 看 orchestrator 日志
-tail ~/.ccteam/logs/<slug>.log
+# 看 orchestrator 状态
+ccteam show <slug>
+# 看进度日志
+ccteam progress <slug> --tail
+# 看 orchestrator daemon stdout(--foreground 时直接看终端;daemon 模式看
+# ~/.ccteam/logs/orchestrator.log 或 ccteam start 启动 shell 的 stderr 重定向)
 ```
+
+> 注:V0.4.0 没有独立的 `validate-workflow` CLI;`workflow.yaml` 在
+> `Orchestrator::run_project` 启动时 deep-validate,schema 错误会写入
+> progress.jsonl + escalation event。`ccteam progress <slug>` 看错误细节。
 
 常见原因：
 
@@ -404,18 +434,22 @@ tail ~/.ccteam/logs/<slug>.log
 - `prompt:` 字段被 reject
 - `.claude/agents/<role>.md` 缺失（schema 校验失败）
 
-### Q2: agent 不响应 / 看不到 session 出现？
+### Q2: agent 不响应 / 看不到 session 出现?
 
 ```bash
-# 查 Claude Code 原生 session 列表
+# 查 Claude Code 原生 session 列表(Agent View)
 claude agents
 
-# 查 ccteam 这边的视角
-ccteam ctl observe --slug <slug>
+# 查 ccteam 这边的视角(state + 最近 events)
+ccteam show <slug>
+ccteam progress <slug> --tail | grep -E "agent_spawn|agent_done|escalation"
 
-# 直接看 state.json
+# 通过 meta-agent MCP 工具一次性看所有 agent:
+#   mcp__ccteam__ccteam__observe_agents(slug="<slug>")
+
+# 直接看 state.json(F61 路径)
 ls ~/.claude/jobs/
-cat ~/.claude/jobs/<id>/state.json
+cat ~/.claude/jobs/<job_id>/state.json
 ```
 
 常见原因：
@@ -424,14 +458,14 @@ cat ~/.claude/jobs/<id>/state.json
 - agent role 名不匹配 `.claude/agents/<role>.md`
 - parallelism 已满（看 `ccteam__observe_agents`）
 
-### Q3: artifact 触发失败？写了文件，下游没启动？
+### Q3: artifact 触发失败?写了文件,下游没启动?
 
 ```bash
-# 看 inotify watcher 日志
-grep "watcher" ~/.ccteam/logs/<slug>.log
+# 看 progress.jsonl 是否有 artifact_received event
+ccteam progress <slug> --tail | grep "artifact_received"
 
-# 看 progress.jsonl 是否有 artifact_event
-ccteam ctl progress --slug <slug> | grep artifact
+# 看 inotify watcher 日志(daemon stderr)
+grep "artifact_watcher\|notify" ~/.ccteam/logs/orchestrator.log
 ```
 
 常见原因：
@@ -441,19 +475,21 @@ ccteam ctl progress --slug <slug> | grep artifact
 - 文件路径不在 watch 列表（workflow.yaml `watch:` 字段拼错）
 - debounce 期内有其他文件覆盖（200ms 内）
 
-### Q4: cost 超支？
+### Q4: cost 超支?
 
 ```bash
-# 查累计 cost
-ccteam ctl show --slug <slug> | grep cost
-# 查每个 agent cost 占比
-ccteam ctl observe --slug <slug> --include-cost
+# 查累计 cost(progress.jsonl 是 SoT)
+ccteam progress <slug> --tail | grep -E "agent_done|budget_exceeded|cost"
 
-# 立即降速
-ccteam ctl set-parallelism --slug <slug> --role fixer --n 1
+# 查每个 agent cost 占比(meta-agent MCP):
+#   mcp__ccteam__ccteam__observe_agents(slug="<slug>")
+
+# 立即降速(写 override 文件,见 §8):
+echo '{"fixer": {"parallelism": 1}}' \
+  > ~/projects/<slug>/.ccteam/workflow_overrides.json
 
 # 看 budget_exceeded event
-ccteam ctl progress --slug <slug> | grep budget
+ccteam progress <slug> --tail | grep budget
 ```
 
 常见原因：
@@ -467,22 +503,28 @@ ccteam ctl progress --slug <slug> | grep budget
 
 ## 11. 从 V0.3.x 迁移
 
-如果你有 V0.3.x phase 驱动项目（`team.yaml::kind: workflow` + `phases:`
-列表）：
+V0.4.0 已把 `team.yaml::kind: workflow`(phase 驱动)EOL。如果你有 V0.3.x
+phase 项目:
 
-```bash
-ccteam doctor --migrate-phase-to-workflow
-```
+> ⚠️ **`ccteam doctor --migrate-phase-to-workflow` 命令是 V0.4.1 候选,
+> 当前 V0.4.0 未实现真实 migration logic**。手动迁移路径如下;V0.4.1 再
+> 加 doctor 工具自动化。
 
-这个命令会：
+手动迁移步骤(参 `migration-guide.md` 完整版):
 
-1. 检测 `team.yaml::kind: workflow` 的项目
-2. 读取 `phases:` 列表
-3. 生成 `workflow.yaml` 骨架（按 phase 顺序连线）
-4. 生成 `.claude/agents/<phase-name>.md`（迁移 prompt 内容）
-5. 提示你 review 后删除旧 `phases` 字段
+1. 备份旧 `team.yaml`(只保留非 phase 字段:`slug` / `name` / `team` /
+   `description` / `worktree_dir` / `cost` 等)
+2. 删 `team.yaml::phases` 字段(整段删,不留空 list)
+3. 新建 `workflow.yaml`:用 `examples/workflows/ui-quality-loop.yaml` 或
+   `research-loop.yaml` 做模板,改 role 名 + trigger + parallelism 让它
+   表达原 phase 流(按 DAG 顺序连成 watch + gate 拓扑)
+4. 新建 `.claude/agents/<role>.md`:**原 phase prompt 的内容迁过去**——
+   每个原 phase 一个 .md 文件,frontmatter 写 `description: ...` +
+   `tools: ...`(查 `~/.claude/agents/` 看格式),正文写原 prompt
+5. 跑 `ccteam start --foreground` 让 orchestrator 在新拓扑上跑;有问题
+   看 progress.jsonl
 
-完整迁移指南：[`migration-guide.md`](migration-guide.md)。
+完整迁移指南:[`migration-guide.md`](migration-guide.md)。
 
 ---
 
