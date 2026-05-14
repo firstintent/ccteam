@@ -44,7 +44,8 @@ pub use actions::{
 };
 pub use harness::{
     derive_harness_path, write_harness_snapshot, ClaudeCodeAdapter, CodexAdapter, HarnessAdapter,
-    HarnessError, HarnessSnapshot, SessionHandle, SpawnOpts, SubagentState,
+    HarnessError, HarnessSnapshot, SessionHandle, SpawnOpts, SubagentState, CODEX_STATUS_MARKER,
+    CODEX_STATUS_TAIL_LINES,
 };
 pub use dag::{dev_dag, Dag};
 pub use auto_loop::{AutoLoopDecision, AutoLoopFrontMatter, AutoLoopState};

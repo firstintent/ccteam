@@ -815,6 +815,15 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
 - **优先级**:**P0**(V0.4.0 重构基石,F64 / F65 / F66 全部依赖)。
 - **来源**:`docs/v0-4-0/prd.md §6.1` + `docs/v0-4-0/prd.md §F63` + `docs/v0-4-0/dev-plan.md §5`。
 
+### F62 — V0.3.1 F47 CodexAdapter `NotImplemented` 桩(V0.3.3 → V0.4.0 slip;2026-05-14 加;**2026-05-14 V0.4.0 PR #3 ship,close**)
+
+- **文件:行号**:`crates/ccteam-core/src/harness.rs::CodexAdapter`(V0.3.1 F47 ship 时三个 fallible 方法全返 `HarnessError::NotImplemented`,`CODEX_NOT_IMPLEMENTED_REASON` const 指向 V0.3.2 / `docs/research/ccteam-codex-integration.md`);`crates/ccteam-cli/src/commands.rs::run_session_add` codex 分支(对 stub 做 `NotImplemented` 解包并打印 deferral 错误);`crates/ccteam-web/tests/flex_e2e_test.rs::v0_3_1_codex_adapter_remains_trait_stub`;`crates/ccteam-cli/tests/session_cli_test.rs::session_add_codex_exits_with_v0_3_2_pointer`。
+- **现状**:V0.3.1 PRD §10.3 + V0.3.1 README erratum 把 CodexAdapter 真实实现 slip 到 V0.3.3;V0.4.0 架构重写(F60-F69)随手吸收。stub 阻止 flex team 真混用 claude + codex(`ccteam session add --harness=codex` 永远 exit 1)。
+- **是否真 dev-specific**:**否——multi-harness 编排基础设施缺口。** 所有用 codex 做 review/QA gate 的 team(F65 ui-quality-loop sample 即依赖此)都受影响。
+- **解耦方案(已 ship)**:`CodexAdapter::spawn_session` 走 `tmux new-session -d -s ccteam-<slug>-<sid> codex [extra_args...]`,挂自己 spawn 的 session(精确 `-t <name>` 不波及他人);`ingest_snapshot` 接收 tmux `capture-pane -p` 文本,grep `CODEX_STATUS: <json>` marker 行解析,无 marker → permissive fallback snapshot(`model="codex"`,`ctx_pct=0`,`cost=0`,不报 error;snapshot 流是 presentation-only,见 CLAUDE.md §三);`shutdown_session` 发 `q\r` send-keys → 500ms grace → `tmux kill-session -t <name>` 兜底,幂等于"已死"。初始 `~/.ccteam/codex/<sid>/state.json` 写 `{status:"starting", pid, model:"codex", context_pct:0, cost_usd:0}`(镜像 CC statusline dual-write 形,F66 watcher 统一消费)。`CODEX_STATUS_MARKER` + `CODEX_STATUS_TAIL_LINES` 通过 `pub use` 公开给 watcher / 测试。`crates/ccteam-cli/src/commands.rs::run_session_add` codex 分支与 claude 分支合并,共享 sid 分配 / session_dir 创建 / state.json 写入路径。`crates/ccteam-core/Cargo.toml` 加 `[features] codex-tests = []` + `serial_test` dev-dep;`crates/ccteam-core/tests/codex_adapter_test.rs` 新文件 6 测试(t01 spawn 创建 tmux session、t02 ingest fallback、t03 ingest parse、t04 shutdown 幂等清理、t05 三方法均不返 NotImplemented、e2e 走 fake codex shell 一次性 round-trip)`#[serial]` 串行化、`tmux_available()` 软跳过;`flex_e2e_test.rs` / `session_cli_test.rs` 老 stub 断言改为反向 regression guard。
+- **优先级**:**P0**(multi-harness gating)。
+- **来源**:`docs/v0-3-1/prd.md §10.3` erratum + `docs/v0-4-0/prd.md §F62` + `docs/v0-4-0/dev-plan.md §4`。
+
 ### F40 — `product-research` team 名冗长 + 领域名缺位(2026-05-09 加;**已修复:2026-05-09(V0.2.2 PR #6 alias 软迁移)**)
 
 - **文件:行号**:`teams/product-research/team.yaml::name`(M3.4 起的字面值)

@@ -37,3 +37,18 @@ ab_glyph = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+
+# V0.4.0 F62 — codex-tests serialises tmux-touching integration tests
+# so concurrent CodexAdapter spawn/shutdown checks don't race on the
+# shared `tmux` server. Pinned to the same major as ccteam-web's
+# dev-dependency for cargo dedup.
+serial_test = "3"
+
+[features]
+default = []
+# V0.4.0 F62 — gates CodexAdapter integration tests
+# (`crates/ccteam-core/tests/codex_adapter_test.rs`). The tests require
+# `tmux` on PATH and exercise the real `codex` CLI when present.
+# Default feature set excludes them so CI without those binaries still
+# passes; opt in with `cargo test --features codex-tests`.
+codex-tests = []
