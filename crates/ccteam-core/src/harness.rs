@@ -294,10 +294,12 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         parse_cc_state_json(raw)
     }
 
-    /// Spawn `claude --bg --agent <role> --output-format stream-json
-    /// --workdir <cwd>`. Parses the first stdout line as JSON, extracts
-    /// the `job_id` field, and records it on the returned
-    /// [`SessionHandle`].
+    /// Spawn `claude --bg --agent <role>` with `cwd` set via process
+    /// `current_dir` (Claude Code has no `--workdir` flag — the real CLI
+    /// reads cwd from the child process's working directory and writes
+    /// it back into `state.json::cwd`). Parses the first non-empty
+    /// stdout line of the shape `backgrounded · <daemonShort>` and
+    /// records the short id as `SessionHandle::job_id`.
     ///
     /// Test override: `$CCTEAM_CLAUDE_BIN` swaps in a fake script for
     /// hermetic unit tests. Production reads `claude` from `$PATH`.
@@ -313,10 +315,7 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         cmd.arg("--bg")
             .arg("--agent")
             .arg(&opts.role)
-            .arg("--output-format")
-            .arg("stream-json")
-            .arg("--workdir")
-            .arg(&opts.cwd);
+            .current_dir(&opts.cwd);
 
         let output = cmd
             .output()
@@ -331,26 +330,12 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let first_line = stdout
-            .lines()
-            .find(|l| !l.trim().is_empty())
-            .ok_or_else(|| {
-                HarnessError::SpawnFailed("claude --bg produced no stdout".to_string())
-            })?;
-
-        let parsed: serde_json::Value = serde_json::from_str(first_line).map_err(|err| {
-            HarnessError::SpawnFailed(format!("parse claude --bg JSON line ({err}): {first_line}"))
+        let job_id = parse_backgrounded_short_id(&stdout).ok_or_else(|| {
+            HarnessError::SpawnFailed(format!(
+                "claude --bg stdout missing `backgrounded · <id>` line: {}",
+                stdout.trim()
+            ))
         })?;
-
-        let job_id = parsed
-            .get("job_id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                HarnessError::SpawnFailed(format!(
-                    "claude --bg stdout missing job_id field: {first_line}"
-                ))
-            })?
-            .to_string();
 
         // Preserve the per-sid name shape so F49 state.json registry
         // entries (indexed by `tmux_session`) stay stable across the
@@ -427,6 +412,40 @@ impl HarnessAdapter for ClaudeCodeAdapter {
     }
 }
 
+/// Scan `claude --bg` stdout for the `backgrounded · <id>` marker line
+/// and return the short hex id. Real CLI output:
+///
+/// ```text
+/// warning: no agent named 'explorer' — spawning with default template
+/// backgrounded · 9432490e
+///   claude agents             list sessions
+///   claude attach 9432490e    open in this terminal
+///   ...
+/// ```
+///
+/// Picks the first line that starts with `backgrounded` (after trimming
+/// leading whitespace) and returns the last whitespace-separated token
+/// — that's the id Claude prints. Returns `None` if no such line
+/// exists, signalling the CLI shape drifted (caller bubbles as
+/// `SpawnFailed`).
+fn parse_backgrounded_short_id(stdout: &str) -> Option<String> {
+    for line in stdout.lines() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with("backgrounded") {
+            continue;
+        }
+        let last = trimmed.split_whitespace().next_back()?;
+        // Accept anything non-empty — production prints 8-hex (e.g.
+        // `9432490e`), but we don't lock to that shape so a future
+        // longer id doesn't break the parser.
+        if last.is_empty() || last == "backgrounded" {
+            return None;
+        }
+        return Some(last.to_string());
+    }
+    None
+}
+
 /// Resolve the absolute path to `state.json` for a Claude Code
 /// background job. Honors `$CCTEAM_CLAUDE_JOBS_DIR` for hermetic tests;
 /// otherwise resolves under `~/.claude/jobs/<job_id>/state.json`.
@@ -451,31 +470,36 @@ pub fn state_json_path(job_id: &str) -> PathBuf {
 /// Parse a Claude Code `state.json` body into a [`HarnessSnapshot`].
 ///
 /// Tolerant of missing / extra fields — only outright JSON-parse
-/// failures bubble. The CC native shape (per Anthropic Claude Code
-/// docs §background-jobs) is:
+/// failures bubble. The real CC `--bg` shape (probed against
+/// `claude 2.1.141` on 2026-05-14):
 ///
 /// ```json
 /// {
-///   "status": "running" | "idle" | "stopped",
-///   "model": "Claude Sonnet 4.5",
-///   "context_pct": 42,
-///   "cost_usd": 1.25,
-///   "turn_count": 17,
-///   "pid": 12345,
-///   "workdir": "/home/u/projects/dev-foo"
+///   "state": "working" | "done" | "failed" | "crashed",
+///   "tempo": "active" | "idle",
+///   "cwd": "/tmp",
+///   "daemonShort": "9432490e",
+///   "sessionId": "9432490e-90f8-...",
+///   "cliVersion": "2.1.141",
+///   "template": "bg",
+///   "intent": "...",
+///   "output": { "result": "..." },
+///   "createdAt": "2026-05-14T15:12:43.111Z",
+///   "updatedAt": "2026-05-14T15:13:00.579Z"
 /// }
 /// ```
 ///
-/// Fields the snapshot cares about map 1:1; `turn_count` is preserved
-/// in `raw` for the F66 / web layer to read directly. `status` is
-/// likewise preserved in `raw` (the snapshot shape pre-dates the
-/// F61 status enum).
+/// The legacy F61 schema (`status` / `model` / `context_pct` /
+/// `cost_usd` / `workdir`) is also accepted as a fallback in case a
+/// future Claude Code build re-exposes those fields. The raw `Value`
+/// preserves everything for downstream consumers.
 pub fn parse_cc_state_json(raw: &str) -> Result<HarnessSnapshot, HarnessError> {
     let value: serde_json::Value = serde_json::from_str(raw)
         .map_err(|err| HarnessError::IngestFailed(format!("parse state.json: {err}")))?;
 
     let model_display_name = pluck_str(&value, &["model"])
         .or_else(|| pluck_str(&value, &["model_display_name"]))
+        .or_else(|| pluck_str(&value, &["cliVersion"]).map(|v| format!("claude {v}")))
         .unwrap_or_else(|| "unknown".to_string());
     let context_used_pct = pluck_pct(&value, &["context_pct"])
         .or_else(|| pluck_pct(&value, &["context_used_pct"]))
@@ -484,8 +508,8 @@ pub fn parse_cc_state_json(raw: &str) -> Result<HarnessSnapshot, HarnessError> {
         .or_else(|| pluck_f64(&value, &["cost_usd_total"]))
         .unwrap_or(0.0);
     let rate_limit_pct = pluck_pct(&value, &["rate_limit_pct"]);
-    let cwd = pluck_str(&value, &["workdir"])
-        .or_else(|| pluck_str(&value, &["cwd"]))
+    let cwd = pluck_str(&value, &["cwd"])
+        .or_else(|| pluck_str(&value, &["workdir"]))
         .map(PathBuf::from);
 
     Ok(HarnessSnapshot {

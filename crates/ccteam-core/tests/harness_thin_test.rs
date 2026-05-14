@@ -63,7 +63,9 @@ impl Drop for EnvGuard {
 #[serial]
 fn t01_spawn_returns_job_id() {
     let tmp = TempDir::new().unwrap();
-    let bin = install_fake_claude_bin(tmp.path(), r#"{"job_id":"job-abc123","status":"queued"}"#);
+    // Real `claude --bg` stdout: `backgrounded · <8-hex>` followed by
+    // a tip block. The parser must pick the id off the first line.
+    let bin = install_fake_claude_bin(tmp.path(), "backgrounded · 9432490e");
     let _bin_guard = EnvGuard::set(CLAUDE_BIN_ENV, &bin);
 
     let opts = SpawnOpts {
@@ -80,7 +82,7 @@ fn t01_spawn_returns_job_id() {
 
     assert_eq!(handle.harness, "claude-code");
     assert_eq!(handle.sid, "claude-1");
-    assert_eq!(handle.job_id.as_deref(), Some("job-abc123"));
+    assert_eq!(handle.job_id.as_deref(), Some("9432490e"));
     // F61 retains the `ccteam-<slug>-<sid>` name shape for downstream
     // labels even though ClaudeCodeAdapter no longer owns a tmux session.
     assert_eq!(handle.tmux_session, "ccteam-dev-thin-claude-1");
@@ -99,41 +101,42 @@ fn t02_ingest_from_state_json() {
     let tmp = TempDir::new().unwrap();
     let _jobs_guard = EnvGuard::set(CLAUDE_JOBS_DIR_ENV, tmp.path());
 
-    let job_id = "job-xyz789";
+    let job_id = "9432490e";
     let job_dir = tmp.path().join(job_id);
     std::fs::create_dir_all(&job_dir).unwrap();
+    // Real `claude 2.1.x` state.json shape: `state` (not `status`),
+    // `cwd` (not `workdir`), no cost/model/context fields.
     let raw = r#"{
-        "status": "running",
-        "model": "Claude Sonnet 4.5",
-        "context_pct": 42,
-        "cost_usd": 1.25,
-        "turn_count": 7,
-        "pid": 12345,
-        "workdir": "/tmp/some-project"
+        "state": "working",
+        "tempo": "active",
+        "cwd": "/tmp/some-project",
+        "daemonShort": "9432490e",
+        "sessionId": "9432490e-90f8-457c-87b6-2ccfc5c452d3",
+        "cliVersion": "2.1.141",
+        "template": "bg",
+        "intent": "do the thing"
     }"#;
     std::fs::write(job_dir.join("state.json"), raw).unwrap();
 
-    // The adapter's `ingest_snapshot` consumes `raw` directly — callers
-    // (F66 observer) resolve the path via `state_json_path` and read
-    // bytes themselves. This test exercises both: file is on disk via
-    // the env override, then we read it and feed it in.
     let path = state_json_path(job_id);
     assert_eq!(path, tmp.path().join(job_id).join("state.json"));
     let body = std::fs::read_to_string(&path).unwrap();
 
     let snap = ClaudeCodeAdapter::new().ingest_snapshot(&body).unwrap();
     assert_eq!(snap.harness, "claude-code");
-    assert_eq!(snap.model_display_name, "Claude Sonnet 4.5");
-    assert_eq!(snap.context_used_pct, 42);
-    assert!((snap.cost_usd_total - 1.25).abs() < 1e-9);
+    // No `model` field → fall back to `cliVersion`.
+    assert_eq!(snap.model_display_name, "claude 2.1.141");
+    // No `context_pct` / `cost_usd` → defaults.
+    assert_eq!(snap.context_used_pct, 0);
+    assert!((snap.cost_usd_total - 0.0).abs() < 1e-9);
     assert_eq!(
         snap.cwd.as_deref(),
         Some(std::path::Path::new("/tmp/some-project"))
     );
-    // raw preserves the full state.json shape — F66 / web layer reads
-    // `turn_count` + `status` directly from it.
-    assert_eq!(snap.raw["turn_count"], 7);
-    assert_eq!(snap.raw["status"], "running");
+    // raw preserves full shape — orchestrator reads `state` for the
+    // session_status decision.
+    assert_eq!(snap.raw["state"], "working");
+    assert_eq!(snap.raw["daemonShort"], "9432490e");
 }
 
 // =====================================================================
@@ -156,14 +159,14 @@ fn t03_shutdown_sends_sigterm() {
         .expect("spawn sleep child");
     let pid = child.id() as i32;
 
-    let job_id = "job-shutdown";
+    let job_id = "fa11dead";
     let job_dir = tmp.path().join(job_id);
     std::fs::create_dir_all(&job_dir).unwrap();
     let state = serde_json::json!({
-        "status": "running",
-        "model": "X",
-        "context_pct": 0,
-        "cost_usd": 0.0,
+        "state": "working",
+        "tempo": "active",
+        "cwd": "/tmp",
+        "daemonShort": job_id,
         "pid": pid,
     });
     std::fs::write(
@@ -260,52 +263,60 @@ fn t05_thin_api_surface_present() {
 
 #[test]
 #[serial]
-fn t06_spawn_includes_role() {
+fn t06_spawn_includes_role_and_cwd_via_current_dir() {
     let tmp = TempDir::new().unwrap();
-    // Fake claude that echoes its argv to stderr so the test can
-    // assert the role flag was forwarded correctly. stdout still emits
-    // a valid job_id JSON line so spawn_session succeeds.
+    let cwd = tmp.path().join("project-root");
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    // Fake claude that records argv + working directory to sentinel
+    // files. Production claude has no `--workdir` flag; cwd is set via
+    // `Command::current_dir` and shows up as `pwd` in the child.
     let bin = tmp.path().join("claude");
     let script = r#"#!/bin/sh
-# Echo all argv to a sentinel file so the test can inspect it.
 printf '%s\n' "$@" > "$CCTEAM_TEST_ARGV_SINK"
-printf '{"job_id":"job-role-1"}\n'
+pwd > "$CCTEAM_TEST_CWD_SINK"
+printf 'backgrounded · facefeed\n'
+printf '  claude agents             list sessions\n'
 "#;
     std::fs::write(&bin, script).unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let sink = tmp.path().join("argv.txt");
+    let argv_sink = tmp.path().join("argv.txt");
+    let cwd_sink = tmp.path().join("cwd.txt");
     let _bin_guard = EnvGuard::set(CLAUDE_BIN_ENV, &bin);
-    let _sink_guard = EnvGuard::set("CCTEAM_TEST_ARGV_SINK", &sink);
+    let _argv_guard = EnvGuard::set("CCTEAM_TEST_ARGV_SINK", &argv_sink);
+    let _cwd_guard = EnvGuard::set("CCTEAM_TEST_CWD_SINK", &cwd_sink);
 
     let opts = SpawnOpts {
         harness: "claude-code",
         slug: "dev-roletest".into(),
         sid: "claude-1".into(),
-        cwd: tmp.path().to_path_buf(),
+        cwd: cwd.clone(),
         role: "reviewer".into(),
         extra_args: Vec::new(),
     };
     let handle = ClaudeCodeAdapter::new().spawn_session(opts).unwrap();
-    assert_eq!(handle.job_id.as_deref(), Some("job-role-1"));
+    assert_eq!(handle.job_id.as_deref(), Some("facefeed"));
 
-    let argv = std::fs::read_to_string(&sink).unwrap();
-    // Required flags from F61 spawn:
-    //   --bg --agent <role> --output-format stream-json --workdir <cwd>
+    let argv = std::fs::read_to_string(&argv_sink).unwrap();
     assert!(argv.contains("--bg"), "argv missing --bg: {argv}");
     assert!(argv.contains("--agent"), "argv missing --agent: {argv}");
     assert!(
         argv.contains("reviewer"),
         "argv missing role 'reviewer': {argv}"
     );
+    // CRITICAL: real claude CLI has no --workdir flag. Spawning with
+    // one exits "unknown option '--workdir'" before init.
     assert!(
-        argv.contains("--output-format"),
-        "argv missing --output-format: {argv}"
+        !argv.contains("--workdir"),
+        "argv must NOT include --workdir (not a real CLI flag): {argv}"
     );
-    assert!(
-        argv.contains("stream-json"),
-        "argv missing stream-json: {argv}"
-    );
-    assert!(argv.contains("--workdir"), "argv missing --workdir: {argv}");
+
+    // cwd should be set via Command::current_dir → reflected in pwd.
+    let observed_cwd = std::fs::read_to_string(&cwd_sink).unwrap();
+    // Use canonicalize on both sides — /tmp can be a symlink on macOS.
+    let expected = std::fs::canonicalize(&cwd).unwrap();
+    let observed = std::fs::canonicalize(observed_cwd.trim()).unwrap();
+    assert_eq!(observed, expected, "spawn cwd mismatch");
 }
 
 // =====================================================================
@@ -342,11 +353,38 @@ fn t07_spawn_rejects_empty_role() {
 
 #[test]
 #[serial]
-fn t08_spawn_missing_job_id_fails_loud() {
+fn t08b_spawn_skips_warning_prefix_and_picks_backgrounded_line() {
+    // Real claude prints a warning line before `backgrounded · <id>`
+    // when the agent name is unknown — parser must skip it.
     let tmp = TempDir::new().unwrap();
-    // Fake binary that emits valid JSON without a job_id field. Must
-    // bubble as SpawnFailed (loud), not silently succeed with None.
-    let bin = install_fake_claude_bin(tmp.path(), r#"{"status":"queued"}"#);
+    let bin = tmp.path().join("claude");
+    let script = "#!/bin/sh\n\
+        printf 'warning: no agent named %s\\n' \"explorer\"\n\
+        printf 'backgrounded · deadbeef\\n'\n\
+        printf '  claude agents             list sessions\\n'\n";
+    std::fs::write(&bin, script).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _bin_guard = EnvGuard::set(CLAUDE_BIN_ENV, &bin);
+
+    let opts = SpawnOpts {
+        harness: "claude-code",
+        slug: "dev-warn".into(),
+        sid: "claude-1".into(),
+        cwd: tmp.path().to_path_buf(),
+        role: "explorer".into(),
+        extra_args: Vec::new(),
+    };
+    let handle = ClaudeCodeAdapter::new().spawn_session(opts).unwrap();
+    assert_eq!(handle.job_id.as_deref(), Some("deadbeef"));
+}
+
+#[test]
+#[serial]
+fn t08_spawn_missing_backgrounded_line_fails_loud() {
+    let tmp = TempDir::new().unwrap();
+    // Fake binary that emits unrelated output (no `backgrounded · …`
+    // marker). Must bubble as SpawnFailed (loud), not silently succeed.
+    let bin = install_fake_claude_bin(tmp.path(), "queued no marker here");
     let _bin_guard = EnvGuard::set(CLAUDE_BIN_ENV, &bin);
 
     let opts = SpawnOpts {
@@ -360,7 +398,10 @@ fn t08_spawn_missing_job_id_fails_loud() {
     let err = ClaudeCodeAdapter::new().spawn_session(opts).unwrap_err();
     match err {
         HarnessError::SpawnFailed(msg) => {
-            assert!(msg.contains("job_id"), "error must mention job_id: {msg}");
+            assert!(
+                msg.contains("backgrounded"),
+                "error must mention backgrounded marker: {msg}"
+            );
         }
         other => panic!("expected SpawnFailed, got {other:?}"),
     }

@@ -951,13 +951,26 @@ impl Orchestrator {
         let Ok(v) = serde_json::from_str::<Value>(&body) else {
             return SessionStatus::Running;
         };
-        let status = v
-            .get("status")
+        // Real `claude --bg` 2.1.x writes `state` ∈ {working, done,
+        // failed, crashed}; legacy / fixture rows may carry `status` ∈
+        // {running, completed, error, stopped}. Read both, normalize
+        // to the SessionStatus::Done payload tag the orchestrator's
+        // downstream events expect.
+        let raw = v
+            .get("state")
             .and_then(|s| s.as_str())
-            .unwrap_or("running");
-        if !matches!(status, "stopped" | "completed" | "error") {
+            .or_else(|| v.get("status").and_then(|s| s.as_str()))
+            .unwrap_or("working");
+        let normalized = match raw {
+            "done" | "completed" => Some("completed"),
+            "failed" | "crashed" | "error" => Some("error"),
+            "stopped" => Some("stopped"),
+            // "working" / "running" / "idle" / "active" / unknown → still running
+            _ => None,
+        };
+        let Some(status) = normalized else {
             return SessionStatus::Running;
-        }
+        };
         let cost_usd = v
             .get("cost_usd")
             .and_then(|n| n.as_f64())
@@ -968,9 +981,14 @@ impl Orchestrator {
         }
     }
 
-    /// State.json path: claude → `~/.claude/jobs/<sid>/state.json`,
-    /// codex → `~/.ccteam/codex/<sid>/state.json`. Tests override both
-    /// via `CCTEAM_SESSION_STATE_DIR`.
+    /// State.json path:
+    /// - codex → `~/.ccteam/codex/<sid>/state.json`
+    /// - claude-code → `~/.claude/jobs/<job_id>/state.json` (where
+    ///   `job_id` is the `daemonShort` from the `backgrounded · <id>`
+    ///   spawn line)
+    /// - test override via `CCTEAM_SESSION_STATE_DIR` env keys by `sid`
+    ///   so existing fixture stubs (write `<dir>/<sid>/state.json`)
+    ///   keep working without job_id plumbing.
     fn session_state_path(&self, handle: &SessionHandle) -> PathBuf {
         if let Ok(custom) = std::env::var("CCTEAM_SESSION_STATE_DIR") {
             return PathBuf::from(custom).join(&handle.sid).join("state.json");
@@ -984,9 +1002,10 @@ impl Orchestrator {
                 .join("state.json");
         }
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+        let id = handle.job_id.as_deref().unwrap_or("__no_job_id__");
         home.join(".claude")
             .join("jobs")
-            .join(&handle.sid)
+            .join(id)
             .join("state.json")
     }
 
