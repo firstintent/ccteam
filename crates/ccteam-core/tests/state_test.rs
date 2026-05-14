@@ -97,7 +97,10 @@ fn second_save_rotates_previous_to_bak_then_writes_new() {
     v2.current_phase = "test-run".into();
     v2.save(&main).unwrap();
 
-    assert!(!tmp.exists(), ".tmp must not linger after a successful save");
+    assert!(
+        !tmp.exists(),
+        ".tmp must not linger after a successful save"
+    );
     let loaded_main = ProjectState::load(&main).unwrap();
     assert_eq!(loaded_main, v2, "main must hold the latest write");
 
@@ -225,6 +228,7 @@ fn flex_sessions_round_trip_and_sid_allocator_does_not_reuse_removed_sid() {
             tmux_session: "ccteam-bookmark-mgr-a3f9-claude-1".into(),
             started_at: t0,
             pid: Some(42),
+            job_id: None,
         },
     );
     state.sessions.remove(&first);

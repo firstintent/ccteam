@@ -1,103 +1,110 @@
-//! V0.3.1 F46 — `HarnessAdapter` trait + `ClaudeCodeAdapter`.
+//! V0.4.0 F61 — `HarnessAdapter` trait + thin `ClaudeCodeAdapter`.
 //!
-//! V0.3.1's strategic pivot (`docs/v0-3-1/prd.md` §1) re-frames ccteam
-//! as a "session farm + observability layer" on top of multiple
-//! harnesses (Claude Code today, Codex tomorrow). This module owns the
-//! trait shape every harness fills in: ingest a structured status
-//! snapshot from the harness's native channel, optionally enumerate
-//! subagent state, spawn / shutdown the underlying tmux session.
+//! V0.4.0's architectural pivot (`docs/v0-4-0/prd.md` §6.4) re-frames
+//! ccteam around Claude Code's native Agent View (`claude --bg --agent`):
 //!
-//! Data flow (Claude Code happy path):
+//! - `ccteam` no longer manages tmux as the host for Claude Code
+//!   sessions — `claude --bg` does that natively.
+//! - `ccteam` no longer parses the TUI footer JSON channel for session
+//!   state — `~/.claude/jobs/<job_id>/state.json` is the canonical
+//!   observability surface.
+//!
+//! Data flow (Claude Code happy path, V0.4.0):
 //!
 //! ```text
-//! Claude Code TUI
-//!   ↓ stdin JSON
-//! ~/.claude/statusline-command.sh        (ccteam-managed wrapper)
-//!   ↓ original render path                 ↓ NEW: dual-write
-//! TUI footer string                       ~/.ccteam/harness/<slug>-<sid>.json
-//!                                            ↓ notify watcher (ccteam-web)
-//!                                         tokio::sync::broadcast<HarnessSnapshotEvent>
-//!                                            ↓ SSE
-//!                                         /sse/harness/<slug>[/<sid>]
+//! ccteam orchestrator
+//!   ↓ spawn
+//! claude --bg --agent <role>  →  prints { "job_id": "..." } on stdout
+//!   ↓
+//! claude daemon (background)
+//!   ↓ writes
+//! ~/.claude/jobs/<job_id>/state.json   (model / context_pct / cost_usd / pid / ...)
+//!   ↓ read on demand
+//! ccteam observe → HarnessSnapshot → ccteam-web SSE
 //! ```
 //!
-//! **Architectural red lines** (CLAUDE.md §三, PRD §3.3):
+//! **Architectural red lines** (CLAUDE.md §三, V0.4.0 PRD §12):
 //!
 //! - The snapshot pipeline is **presentation-only**. Nothing in
-//!   `orchestrator.rs` consumes a `HarnessSnapshot` — `progress.jsonl`
-//!   remains the single source of truth for state transitions.
-//! - `shutdown_session` is the **only** path that kills a long-running
-//!   session, and it must be invoked exclusively from a user-initiated
-//!   `ccteam session rm` (F49). Watchdog / silence classifier never
-//!   call it.
-//! - `ccteam-core` does not know team-name literals. The adapter knows
-//!   its own harness identifier (`"claude-code"`, `"codex"`) but never
-//!   inspects team kinds — that's the orchestrator / web layer's job.
+//!   `orchestrator.rs` consumes a `HarnessSnapshot` — the orchestrator's
+//!   business-state SoT is unchanged (see PRD §12 for the SoT contract).
+//! - `shutdown_session` sends SIGTERM via the `pid` recorded in
+//!   `state.json`. The Codex stub's tmux-based path is unrelated.
+//! - `ccteam-core` does not know team-name literals or agent-role
+//!   literals. The adapter knows its own harness identifier
+//!   (`"claude-code"`, `"codex"`) but never inspects role names.
+//!
+//! **Why a "thin" adapter**: under V0.3.1's tmux-host model the
+//! adapter owned spawn, observe, shutdown, AND a parallel TUI-footer
+//! tee pipeline. V0.4.0 collapses spawn / observe / shutdown to three
+//! thin `Command` invocations + one `read_to_string` — roughly an
+//! 80% LOC drop. The hard work (rendering, agent role definition,
+//! model selection) lives in Claude Code itself.
 
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
-use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::paths::CcteamPaths;
-use crate::tmux::{session_name_for_slug, TmuxSession};
-
-/// Default sid for projects that haven't opted into multi-session
-/// (V0.3 single-session projects, or the first claude session in a
-/// flex project before F49 lands per-session subdirs). Picked so the
-/// dual-write file name still encodes harness identity, even on legacy
-/// project layouts.
+/// Default sid for single-session projects that haven't opted into
+/// the flex multi-session model. Used by the path resolver in
+/// `crate::paths` to compute the per-session business-state file
+/// path when `ProjectSessionContext` doesn't carry an explicit sid.
+/// Retained from V0.3.1 F46 — V0.4.0 F61's CC sessions don't directly
+/// consume this constant (the job_id is the primary key now), but
+/// flex multi-session callsites still rely on it.
 pub const DEFAULT_CLAUDE_SID: &str = "claude-1";
 
-/// Adapter contract for any LLM "harness" ccteam may host inside a
-/// tmux session. V0.3.1 F46 ships [`ClaudeCodeAdapter`]; F47 will add
-/// `CodexAdapter` as a stub returning `Err(NotImplemented)` from every
-/// fallible method.
+/// Adapter contract for any LLM "harness" ccteam may spawn. V0.4.0
+/// F61 ships [`ClaudeCodeAdapter`] backed by `claude --bg --agent`;
+/// F62 fills in `CodexAdapter` with a real implementation (replacing
+/// V0.3.1 F47's `NotImplemented` stub).
 ///
 /// Implementations are stateless — a single `'static` instance can be
-/// shared across all sessions of that harness type. Callers choose the
-/// adapter via the `harness` field on `team.yaml::sessions[]` (F47) or
-/// the F49 `ccteam session add --harness <kind>` flag.
+/// shared across all sessions of that harness type.
 pub trait HarnessAdapter: Send + Sync {
     /// Stable identifier, e.g. `"claude-code"`, `"codex"`. Used as the
-    /// `harness` discriminator on snapshots + session handles, and in
-    /// `HarnessError::NotImplemented::harness`.
+    /// `harness` discriminator on snapshots + session handles.
     fn name(&self) -> &'static str;
 
     /// Ingest a fresh status snapshot from the harness's native
-    /// channel (Claude Code's statusline stdin JSON; Codex equivalent
-    /// TBD). Returns a normalized [`HarnessSnapshot`] the web layer
-    /// can consume without knowing which harness produced it.
+    /// observability channel. For Claude Code that's the contents of
+    /// `~/.claude/jobs/<job_id>/state.json`; for Codex (F62) it's the
+    /// codex CLI's state output. Callers are responsible for reading
+    /// the file off disk and passing the string here — keeping the
+    /// trait pure-functional makes mocking trivial.
     fn ingest_snapshot(&self, raw: &str) -> Result<HarnessSnapshot, HarnessError>;
 
     /// Best-effort enumeration of in-flight subagents. Returns an
     /// empty `Vec` when the harness doesn't surface this data —
-    /// V0.3.1 Claude Code returns empty until upstream API exposes it
-    /// (PRD §3.3 deferred to V0.4); Codex stub returns empty too.
+    /// V0.4.0 Claude Code returns empty until upstream API exposes it;
+    /// Codex stub returns empty too.
     fn subagent_states(&self, _snapshot: &HarnessSnapshot) -> Vec<SubagentState> {
         Vec::new()
     }
 
-    /// Spawn a new harness session. Wraps `tmux new-session -d` so the
-    /// session is detached from any controlling terminal; the
-    /// orchestrator / `ccteam attach` re-attaches via the returned
-    /// [`SessionHandle`]'s `tmux_session` name.
+    /// Spawn a new harness session. For Claude Code this invokes
+    /// `claude --bg --agent <role>` and captures the resulting
+    /// `job_id` into the returned [`SessionHandle`]. The actual
+    /// session lives in Claude Code's daemon, NOT inside a ccteam
+    /// tmux session (V0.4.0 red line: ccteam does not host CC).
     fn spawn_session(&self, opts: SpawnOpts) -> Result<SessionHandle, HarnessError>;
 
-    /// Graceful shutdown. The ONLY caller in V0.3.1 is the user's
-    /// explicit `ccteam session rm` invocation (F49) — never silent
-    /// kill (red line CLAUDE.md §三 / PRD §3.3).
+    /// Graceful shutdown. For Claude Code: read pid from
+    /// `~/.claude/jobs/<job_id>/state.json` and send `SIGTERM`. The
+    /// ONLY caller in V0.4.0 is a user-initiated stop (e.g.
+    /// `ccteam session rm`, MCP `stop_agent`) — never silent kill
+    /// (red line CLAUDE.md §三).
     fn shutdown_session(&self, handle: &SessionHandle) -> Result<(), HarnessError>;
 }
 
 /// Normalized status snapshot from any harness. Field set is the
 /// minimum union covered by every shipping harness (Claude Code's
-/// statusline JSON today; Codex's equivalent will fill the same
-/// shape in V0.3.2). Unknown / missing fields fall back to defaults
-/// rather than failing — `raw` carries the full upstream JSON for
+/// `state.json` today; Codex's equivalent will fill the same shape
+/// in F62). Unknown / missing fields fall back to defaults rather
+/// than failing — `raw` carries the full upstream JSON for
 /// forward-compat.
 ///
 /// `harness` is `String` (not `&'static str`) so the struct
@@ -108,20 +115,18 @@ pub trait HarnessAdapter: Send + Sync {
 pub struct HarnessSnapshot {
     /// Harness identifier — matches [`HarnessAdapter::name`].
     pub harness: String,
-    /// Human-readable model name (`"Claude Sonnet 4.5"`, etc.).
+    /// Human-readable model name (`"claude-opus-4-5"`, `"Claude Sonnet 4.5"`, etc.).
     pub model_display_name: String,
-    /// Context window utilization, 0..=100. Statusline scripts often
-    /// omit this on session-start; we coerce missing → 0.
+    /// Context window utilization, 0..=100. Missing → 0.
     pub context_used_pct: u8,
-    /// Cumulative session cost in USD. Coerced to 0.0 when the
-    /// harness doesn't expose cost data (older Claude Code releases).
+    /// Cumulative session cost in USD. Coerced to 0.0 when missing.
     pub cost_usd_total: f64,
     /// Five-hour rate-limit utilization (Claude Code field). `None`
-    /// when the harness doesn't surface this surface.
+    /// when the harness doesn't surface this surface — V0.4.0
+    /// `state.json` does not yet expose it.
     pub rate_limit_pct: Option<u8>,
-    /// Session cwd as reported by the harness. Used by the
-    /// orchestrator + path resolver to derive the `<slug>-<sid>`
-    /// dual-write target. `None` for free-running sessions.
+    /// Session cwd as reported by the harness. `None` when the
+    /// `state.json` doesn't record it.
     pub cwd: Option<PathBuf>,
     /// Full upstream JSON. Carried verbatim so future harness
     /// upgrades don't require a ccteam release to surface new fields.
@@ -130,9 +135,9 @@ pub struct HarnessSnapshot {
     pub captured_at: DateTime<Utc>,
 }
 
-/// Optional per-snapshot subagent state. V0.3.1 always empty — the
-/// shape is reserved for V0.4+ when Claude Code's API exposes
-/// structured subagent progress (PRD §3.3).
+/// Optional per-snapshot subagent state. V0.4.0 always empty — the
+/// shape is reserved for when Claude Code's API exposes structured
+/// subagent progress.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SubagentState {
     /// Subagent type ("main" / "general-purpose" / "code-reviewer" / …).
@@ -140,74 +145,87 @@ pub struct SubagentState {
     /// Human label, when distinct from `kind`.
     pub label: Option<String>,
     /// How long the subagent has been running.
-    pub running_for: Option<Duration>,
+    pub running_for: Option<std::time::Duration>,
     /// Cumulative input tokens.
     pub tokens_in: Option<u64>,
     /// Cumulative output tokens.
     pub tokens_out: Option<u64>,
 }
 
-/// Inputs for [`HarnessAdapter::spawn_session`]. The adapter combines
-/// `harness` + `slug` + `sid` to derive the tmux session name
-/// (`ccteam-<slug>-<sid>` for flex projects, `ccteam-<slug>` for V0.3
-/// single-session projects via the F49 path, but F46 always emits the
-/// per-sid form so the foundation is uniform).
+/// Inputs for [`HarnessAdapter::spawn_session`]. The role name is
+/// fed straight into `claude --bg --agent <role>`; agent body lives
+/// in the project's `.claude/agents/<role>.md` (Claude Code-managed).
 #[derive(Debug, Clone)]
 pub struct SpawnOpts {
     /// Harness identifier (`"claude-code"`, `"codex"`). Should match
     /// the adapter's [`HarnessAdapter::name`].
     pub harness: &'static str,
+    /// Claude Code agent role. Resolves to `.claude/agents/<role>.md`
+    /// inside `cwd`. Free-form string — the orchestrator passes whatever
+    /// `workflow.yaml::agents.<role>` defines.
+    pub role: String,
     /// Project slug (e.g. `"flex-foo"` after F22's team prefix).
     pub slug: String,
-    /// Session id (e.g. `"claude-1"`, `"codex-2"`).
+    /// Session id (e.g. `"claude-1"`, `"codex-2"`). Used by the
+    /// orchestrator + web layer for indexing; not consumed by the
+    /// harness command line itself.
     pub sid: String,
     /// Working directory for the spawned session — typically
-    /// `~/projects/<team>-<slug>/` (F49 may extend to per-sid subdirs).
+    /// `~/projects/<team>-<slug>/`. Passed to Claude Code via
+    /// `--workdir`.
     pub cwd: PathBuf,
-    /// Extra args appended to the harness command line. For
-    /// `ClaudeCodeAdapter`, these append to `claude
-    /// --dangerously-skip-permissions ...`; F49 sets things like
-    /// `--model …` here.
-    pub extra_args: Vec<String>,
 }
 
 /// Outcome of [`HarnessAdapter::spawn_session`]. Owned by the caller
-/// (F49 master `state.json::sessions[]`); the adapter never caches.
+/// (orchestrator state, flex `state.json::sessions[]`); the adapter
+/// never caches.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionHandle {
-    /// tmux session name in the standard `ccteam-<slug>-<sid>` form.
+    /// V0.4.0 F61: Claude Code background `job_id` as printed by
+    /// `claude --bg --agent <role>` on stdout. This is the primary
+    /// key for observability — `~/.claude/jobs/<job_id>/state.json`
+    /// is read on every `ingest_snapshot` call.
+    pub job_id: String,
+    /// tmux session name. Legacy field retained for back-compat with
+    /// flex multi-session callsites (`session add --harness claude`
+    /// records this in `state.json::sessions[]`). For
+    /// claude-bg-driven sessions, this is set to a synthetic
+    /// `"claude-bg:<job_id>"` form — tmux is NOT actually running.
+    /// Codex sessions (F62) will set this to a real tmux session name.
     pub tmux_session: String,
     /// Harness identifier — matches [`HarnessAdapter::name`].
     pub harness: String,
     /// Session id, mirroring [`SpawnOpts::sid`].
     pub sid: String,
-    /// Active pane PID, when tmux discloses it. `None` immediately
-    /// post-spawn before the harness has a chance to fork.
+    /// Background session pid as reported by Claude Code's
+    /// `state.json`. `None` immediately post-spawn before the
+    /// daemon has written its first state file; populated by the
+    /// orchestrator on the first successful `ingest_snapshot`.
     pub pid: Option<u32>,
     /// Wall-clock start time.
     pub started_at: DateTime<Utc>,
 }
 
-/// V0.3.1 F46 error type for every fallible [`HarnessAdapter`]
+/// V0.4.0 F61 error type for every fallible [`HarnessAdapter`]
 /// surface. `NotImplemented` carries `&'static str` fields so const
-/// callsites (`CodexAdapter`'s stub error path, F47) compile to a
+/// callsites (`CodexAdapter`'s stub error path) compile to a
 /// non-allocating literal.
 #[derive(Debug, Error)]
 pub enum HarnessError {
-    /// JSON parse / shape mismatch on the harness statusline channel.
+    /// JSON parse / shape mismatch on the harness state.json channel.
     #[error("snapshot ingest failed: {0}")]
     IngestFailed(String),
-    /// tmux / process failure during `spawn_session`.
+    /// `claude --bg` invocation failed, or its stdout did not contain
+    /// a parsable `job_id`.
     #[error("spawn failed: {0}")]
     SpawnFailed(String),
-    /// `shutdown_session` failure — graceful `/exit` send-keys flow
-    /// timed out or tmux refused the kill request.
+    /// `shutdown_session` could not send SIGTERM or could not parse
+    /// the pid from `state.json`.
     #[error("shutdown failed: {0}")]
     ShutdownFailed(String),
-    /// Adapter declares the surface unsupported. F47's `CodexAdapter`
-    /// returns this from every fallible method until V0.3.2 fills it
-    /// in; the `&'static str` payloads keep const-string callsites
-    /// allocation-free.
+    /// Adapter declares the surface unsupported. Codex returns this
+    /// in V0.3.1; F62 will fill in real impls. The `&'static str`
+    /// payloads keep const-string callsites allocation-free.
     #[error("harness '{harness}' not implemented in V0.3.1: {reason}")]
     NotImplemented {
         harness: &'static str,
@@ -225,29 +243,34 @@ impl From<std::io::Error> for HarnessError {
 }
 
 // =====================================================================
-// ClaudeCodeAdapter
+// ClaudeCodeAdapter (V0.4.0 F61 thin refactor)
 // =====================================================================
 
-/// V0.3.1 F46 [`HarnessAdapter`] implementation for Anthropic's Claude
-/// Code TUI. Stateless zero-size struct — share one `'static` instance.
+/// V0.4.0 F61 [`HarnessAdapter`] implementation for Anthropic's Claude
+/// Code Agent View (`claude --bg --agent`). Stateless zero-size struct
+/// — share one `'static` instance.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ClaudeCodeAdapter;
 
-/// Statusline JSON field path constants — single source of truth so
-/// the unit tests + `ingest_snapshot` agree.
-const FIELD_MODEL_DISPLAY_NAME: &[&str] = &["model", "display_name"];
-const FIELD_CONTEXT_USED_PCT: &[&str] = &["context_window", "used_percentage"];
-const FIELD_COST_USD_TOTAL: &[&str] = &["cost", "total_cost_usd"];
-const FIELD_RATE_LIMIT_PCT: &[&str] = &["rate_limits", "five_hour", "used_percentage"];
-const FIELD_CWD: &[&str] = &["cwd"];
-
 impl ClaudeCodeAdapter {
-    /// Build a fresh `ClaudeCodeAdapter`. Const so users can write
+    /// Build a fresh `ClaudeCodeAdapter`. Const so callers can write
     /// `static CC: ClaudeCodeAdapter = ClaudeCodeAdapter::new();`.
     pub const fn new() -> Self {
         Self
     }
 }
+
+/// Environment variable used by tests to override the `claude` binary
+/// path. Production code resolves `claude` from `$PATH` unless the
+/// caller sets this. Tests in `tests/harness_thin_test.rs` set it to
+/// a tmpdir-resident mock script.
+const CLAUDE_BIN_ENV: &str = "CCTEAM_CLAUDE_BIN";
+
+/// Environment variable used by tests to override the
+/// `~/.claude/jobs/` root. Production code resolves it via
+/// [`state_json_path`] (relative to `dirs::home_dir()`); tests set
+/// this to a tmpdir so `ingest_snapshot` reads from a known location.
+pub const CLAUDE_JOBS_DIR_ENV: &str = "CCTEAM_CLAUDE_JOBS_DIR";
 
 impl HarnessAdapter for ClaudeCodeAdapter {
     fn name(&self) -> &'static str {
@@ -255,149 +278,210 @@ impl HarnessAdapter for ClaudeCodeAdapter {
     }
 
     fn ingest_snapshot(&self, raw: &str) -> Result<HarnessSnapshot, HarnessError> {
-        let value: serde_json::Value = serde_json::from_str(raw)
-            .map_err(|err| HarnessError::IngestFailed(format!("parse statusline JSON: {err}")))?;
-
-        let model_display_name = pluck_str(&value, FIELD_MODEL_DISPLAY_NAME)
-            .unwrap_or_else(|| "unknown".to_string());
-        let context_used_pct = pluck_pct(&value, FIELD_CONTEXT_USED_PCT).unwrap_or(0);
-        let cost_usd_total = pluck_f64(&value, FIELD_COST_USD_TOTAL).unwrap_or(0.0);
-        let rate_limit_pct = pluck_pct(&value, FIELD_RATE_LIMIT_PCT);
-        let cwd = pluck_str(&value, FIELD_CWD).map(PathBuf::from);
-
-        Ok(HarnessSnapshot {
-            harness: self.name().to_string(),
-            model_display_name,
-            context_used_pct,
-            cost_usd_total,
-            rate_limit_pct,
-            cwd,
-            raw: value,
-            captured_at: Utc::now(),
-        })
+        parse_cc_state_json(raw, self.name())
     }
 
     fn spawn_session(&self, opts: SpawnOpts) -> Result<SessionHandle, HarnessError> {
-        let tmux_session = format!("{}-{}", session_name_for_slug(&opts.slug), opts.sid)
-            // session_name_for_slug already prepends "ccteam-", so the
-            // result is "ccteam-<slug>-<sid>" matching the F49 spec.
-            .trim_start_matches('-')
-            .to_string();
+        let bin = std::env::var(CLAUDE_BIN_ENV).unwrap_or_else(|_| "claude".to_string());
+        let cwd_disp = opts.cwd.display().to_string();
+        let output = Command::new(&bin)
+            .args([
+                "--bg",
+                "--agent",
+                &opts.role,
+                "--output-format",
+                "stream-json",
+                "--workdir",
+                &cwd_disp,
+            ])
+            .output()
+            .map_err(|err| {
+                HarnessError::SpawnFailed(format!(
+                    "invoke `{bin} --bg --agent {role}`: {err}",
+                    role = opts.role
+                ))
+            })?;
 
-        // Defense in depth: refuse to spawn over an existing session
-        // — that would mean F49 lost track of `next_sid_seq` and
-        // attempted to reuse a sid.
-        let session = TmuxSession::from_name(tmux_session.clone());
-        if session.exists() {
+        if !output.status.success() {
             return Err(HarnessError::SpawnFailed(format!(
-                "tmux session already exists: {tmux_session} \
-                 (sid collision; F49 next_sid_seq accounting drifted)"
+                "`claude --bg --agent {role}` exited {status}: {stderr}",
+                role = opts.role,
+                status = output.status,
+                stderr = String::from_utf8_lossy(&output.stderr),
             )));
         }
 
-        let mut argv: Vec<String> = vec![
-            "claude".to_string(),
-            "--dangerously-skip-permissions".to_string(),
-        ];
-        argv.extend(opts.extra_args.iter().cloned());
-        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-
-        session
-            .start(&opts.cwd, &argv_refs)
-            .map_err(|err| HarnessError::SpawnFailed(format!("tmux new-session: {err:#}")))?;
-
-        let pid = session
-            .pane_pid()
-            .ok()
-            .flatten()
-            .and_then(|n| u32::try_from(n).ok());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let job_id = extract_job_id(&stdout).ok_or_else(|| {
+            HarnessError::SpawnFailed(format!("no `job_id` field in claude --bg stdout: {stdout}",))
+        })?;
 
         Ok(SessionHandle {
-            tmux_session,
+            job_id: job_id.clone(),
+            // V0.4.0 F61: synthetic name. CC sessions no longer run
+            // inside a ccteam-managed tmux session. The field is
+            // retained for back-compat with flex `state.json::sessions[]`
+            // callsites that still display it.
+            tmux_session: format!("claude-bg:{job_id}"),
             harness: self.name().to_string(),
             sid: opts.sid,
-            pid,
+            pid: None,
             started_at: Utc::now(),
         })
     }
 
     fn shutdown_session(&self, handle: &SessionHandle) -> Result<(), HarnessError> {
-        let session = TmuxSession::from_name(handle.tmux_session.clone());
-        if !session.exists() {
-            // Already gone — treat as success (idempotent).
+        // Read the state.json to find the pid, then send SIGTERM.
+        // Missing state.json or already-stopped pid → no-op (idempotent).
+        let path = state_json_path(&handle.job_id);
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                // Already gone — treat as success.
+                return Ok(());
+            }
+            Err(err) => {
+                return Err(HarnessError::ShutdownFailed(format!(
+                    "read {}: {err}",
+                    path.display(),
+                )));
+            }
+        };
+        let v: serde_json::Value = serde_json::from_str(&raw).map_err(|err| {
+            HarnessError::ShutdownFailed(format!("parse {}: {err}", path.display()))
+        })?;
+        let pid = v
+            .get("pid")
+            .and_then(|n| n.as_u64())
+            .and_then(|n| i32::try_from(n).ok());
+        let Some(pid) = pid else {
+            // No pid recorded → nothing to kill.
             return Ok(());
-        }
-        // Best-effort graceful exit: send `/exit\n` to the active pane,
-        // wait 5s, then hard-kill if tmux still owns the session. A
-        // failure on the send-keys step is non-fatal — the kill below
-        // is the authoritative cleanup.
-        if let Err(err) = send_exit_command(&handle.tmux_session) {
-            tracing::warn!(
-                error = %err,
-                session = %handle.tmux_session,
-                "ClaudeCodeAdapter::shutdown_session: send-keys /exit failed; \
-                 falling through to tmux kill-session",
-            );
-        }
+        };
 
-        std::thread::sleep(Duration::from_secs(5));
-
-        if session.exists() {
-            session
-                .kill()
-                .map_err(|err| HarnessError::ShutdownFailed(format!("tmux kill-session: {err:#}")))?;
+        // SIGTERM via libc kill. If the process has already exited,
+        // kill(2) returns ESRCH; treat as success (idempotent).
+        // Safety: kill is async-signal-safe and side-effect bounded.
+        let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
+        if rc != 0 {
+            let errno = std::io::Error::last_os_error();
+            if errno.raw_os_error() == Some(libc::ESRCH) {
+                // Process already gone — success.
+                return Ok(());
+            }
+            return Err(HarnessError::ShutdownFailed(format!(
+                "kill({pid}, SIGTERM) failed: {errno}",
+            )));
         }
         Ok(())
     }
 }
 
-/// Send `/exit\n` literally to the named tmux session. We use an
-/// explicit Command sequence (rather than `TmuxSession::send_keys`) so
-/// `/exit` is interpreted by Claude Code as a slash-command, not as
-/// part of an in-flight prompt.
-fn send_exit_command(tmux_session: &str) -> std::io::Result<()> {
-    let send_lit = Command::new("tmux")
-        .args(["send-keys", "-t", tmux_session, "-l", "--", "/exit"])
-        .output()?;
-    if !send_lit.status.success() {
-        return Err(std::io::Error::other(format!(
-            "tmux send-keys -l /exit: {}",
-            String::from_utf8_lossy(&send_lit.stderr)
-        )));
+/// Parse the first balanced JSON object out of `stdout`. `claude --bg`
+/// emits a stream-json line containing `{ "job_id": "...", ... }` on
+/// success. We scan for the first `{` then balance brace depth so we
+/// pick up the full object even when more JSON follows on the same
+/// line.
+fn extract_job_id(stdout: &str) -> Option<String> {
+    let bytes = stdout.as_bytes();
+    let start = bytes.iter().position(|b| *b == b'{')?;
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut esc = false;
+    for (i, b) in bytes.iter().enumerate().skip(start) {
+        let c = *b;
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == b'\\' {
+                esc = true;
+            } else if c == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            b'"' => in_str = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    let slice = &stdout[start..=i];
+                    let v: serde_json::Value = serde_json::from_str(slice).ok()?;
+                    return v
+                        .get("job_id")
+                        .and_then(|j| j.as_str())
+                        .map(|s| s.to_string());
+                }
+            }
+            _ => {}
+        }
     }
-    let send_enter = Command::new("tmux")
-        .args(["send-keys", "-t", tmux_session, "Enter"])
-        .output()?;
-    if !send_enter.status.success() {
-        return Err(std::io::Error::other(format!(
-            "tmux send-keys Enter: {}",
-            String::from_utf8_lossy(&send_enter.stderr)
-        )));
-    }
-    Ok(())
+    None
+}
+
+/// Parse a `~/.claude/jobs/<job_id>/state.json` body into a
+/// normalized [`HarnessSnapshot`]. Schema (V0.4.0 PRD §6.4):
+///
+/// ```json
+/// {
+///   "status": "running | idle | error | completed",
+///   "model": "claude-opus-4-5",
+///   "context_pct": 0.45,
+///   "cost_usd": 1.23,
+///   "turn_count": 12,
+///   "pid": 12345,
+///   "last_activity": "2026-05-14T10:00:00Z",
+///   "cwd": "/home/u/projects/dev-foo"
+/// }
+/// ```
+///
+/// Unknown / missing fields fall back to defaults rather than failing;
+/// `context_pct` accepts either fraction (0.45) or percent (45) for
+/// forward-compat with upstream changes.
+pub fn parse_cc_state_json(raw: &str, harness_name: &str) -> Result<HarnessSnapshot, HarnessError> {
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|err| HarnessError::IngestFailed(format!("parse state.json: {err}")))?;
+    let model_display_name = value
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let context_used_pct = value
+        .get("context_pct")
+        .and_then(|p| p.as_f64())
+        .map(|p| {
+            // Accept fraction (0.0..=1.0) or percent (0..=100).
+            let scaled = if p <= 1.0 { p * 100.0 } else { p };
+            scaled.clamp(0.0, 100.0).round() as u8
+        })
+        .unwrap_or(0);
+    let cost_usd_total = value
+        .get("cost_usd")
+        .and_then(|c| c.as_f64())
+        .unwrap_or(0.0);
+    let cwd = value.get("cwd").and_then(|c| c.as_str()).map(PathBuf::from);
+
+    Ok(HarnessSnapshot {
+        harness: harness_name.to_string(),
+        model_display_name,
+        context_used_pct,
+        cost_usd_total,
+        rate_limit_pct: None,
+        cwd,
+        raw: value,
+        captured_at: Utc::now(),
+    })
 }
 
 // =====================================================================
-// CodexAdapter (V0.3.1 F47 — trait-stub only)
+// CodexAdapter (V0.3.1 F47 stub — F62 fills it in)
 // =====================================================================
 
 /// V0.3.1 F47 [`HarnessAdapter`] stub for OpenAI's `codex` CLI. Every
 /// fallible method returns [`HarnessError::NotImplemented`] with a
-/// `&'static str` reason pointing operators at the V0.3.2 tracking
-/// doc + the upstream codex integration research note.
-///
-/// The stub exists so:
-///
-/// 1. F47 PR can land the **trait shape** (`harness: codex` accepted
-///    by `team.yaml::sessions[]` and `ccteam session add --harness codex`)
-///    without F47 also having to ship the real Codex bridge — that
-///    work is `~month` of integration plumbing tracked in
-///    `docs/research/ccteam-codex-integration.md` M1-M5.
-/// 2. V0.3.2's real `CodexAdapter` impl can swap into this slot
-///    without touching any caller (the trait surface is closed).
-/// 3. Users who flip `--harness codex` early get a friendly error
-///    pointing to the tracking issue rather than panic / silent fall
-///    back to claude.
+/// `&'static str` reason. The real implementation lands in F62 as part
+/// of the V0.4.0 round (see `docs/v0-4-0/prd.md` §6.5).
 ///
 /// Stateless zero-size — share one `'static` instance.
 #[derive(Debug, Default, Clone, Copy)]
@@ -405,13 +489,10 @@ pub struct CodexAdapter;
 
 /// V0.3.1 F47 stub reason — a single harmonized constant referenced
 /// from every `HarnessAdapter` method. Keeping this `&'static str`
-/// preserves the `NotImplemented::reason: &'static str` contract
-/// (CLAUDE.md §三 / PRD §4.2.1) so the stub is allocation-free.
+/// preserves the `NotImplemented::reason: &'static str` contract.
 ///
 /// Both substrings the F47 verification tests check — `"V0.3.2"` and
-/// `"docs/research/ccteam-codex-integration.md"` — are present here,
-/// so any caller pattern-matching `NotImplemented { harness: "codex",
-/// reason }` can rely on both citations being available.
+/// `"docs/research/ccteam-codex-integration.md"` — are present here.
 const CODEX_NOT_IMPLEMENTED_REASON: &str =
     "Codex adapter is trait-stub in V0.3.1; full Codex CLI integration deferred to V0.3.2+ \
      — see docs/research/ccteam-codex-integration.md M1-M5 and docs/v0-3-1/prd.md §F47. \
@@ -453,137 +534,27 @@ impl HarnessAdapter for CodexAdapter {
 }
 
 // =====================================================================
-// Path derivation (statusline wrapper helper)
+// Public helpers
 // =====================================================================
 
-/// Decide which `<harness-dir>/<filename>.json` file the wrapper
-/// should dual-write to, given the cwd reported by the harness's
-/// statusline JSON. Returns `None` when the cwd doesn't fall under
-/// `~/projects/` — meta-agent / random claude sessions outside the
-/// orchestrator's scope drop silently.
-///
-/// Match rules (PRD §3.2.3 + dev-plan §2.1 #1.4):
-///
-/// 1. `~/projects/<team>-<slug>/.ccteam/sessions/<sid>/...` →
-///    `<harness-dir>/<slug>-<sid>.json` (F49 multi-session path).
-/// 2. `~/projects/<team>-<slug>/...` (no `sessions/<sid>/` subdir) →
-///    `<harness-dir>/<slug>-claude-1.json` (V0.3 single-session
-///    default; sid stays `claude-1` for back-compat with the existing
-///    `ccteam-<slug>` tmux name).
-/// 3. `~/projects/<handle>-meta/...` → `<harness-dir>/_meta-<handle>.json`
-///    (meta-agent — orchestrator outside the per-team scope).
-/// 4. Anything else → `None` (random claude session, /etc, /tmp, …).
-///
-/// Path traversal defense: components containing `..` reject to
-/// `None` rather than risking a write outside `harness_dir`.
-pub fn derive_harness_path(cwd: &Path, paths: &CcteamPaths) -> Option<PathBuf> {
-    if cwd.components().any(|c| matches!(c, Component::ParentDir)) {
-        return None;
-    }
-    let rel = cwd.strip_prefix(&paths.projects_root).ok()?;
-    let mut comps = rel.components();
-    let head_os = match comps.next()? {
-        Component::Normal(n) => n,
-        _ => return None,
-    };
-    let head = head_os.to_str()?;
-
-    // Rule 3 — meta-agent (`<handle>-meta`).
-    if let Some(handle) = head.strip_suffix("-meta") {
-        if handle.is_empty() {
-            return None;
-        }
-        return Some(paths.harness_dir().join(format!("_meta-{handle}.json")));
-    }
-
-    // Rules 1 + 2 — `<team>-<slug>` form. The slug is the head (per
-    // F22, the team prefix is part of the slug). Look for the F49
-    // `.ccteam/sessions/<sid>/` shape next.
-    let slug = head;
-    let sid = match comps.next() {
-        Some(Component::Normal(n)) if n == ".ccteam" => match comps.next() {
-            Some(Component::Normal(s)) if s == "sessions" => match comps.next() {
-                Some(Component::Normal(sid_os)) => sid_os.to_str()?.to_string(),
-                _ => DEFAULT_CLAUDE_SID.to_string(),
-            },
-            _ => DEFAULT_CLAUDE_SID.to_string(),
-        },
-        _ => DEFAULT_CLAUDE_SID.to_string(),
-    };
-
-    Some(paths.harness_dir().join(format!("{slug}-{sid}.json")))
-}
-
-/// Atomically dual-write `raw` (the harness statusline stdin JSON)
-/// into the resolved `<harness-dir>/<slug>-<sid>.json` file. Uses the
-/// canonical `<path>.tmp` + `rename` pattern so the SSE watcher's
-/// `Modify` event never sees a half-written file.
-///
-/// Best-effort by design: if the target dir can't be created or the
-/// resolved path is `None`, silently no-op so the wrapper script's
-/// `2>/dev/null` exits cleanly.
-pub fn write_harness_snapshot(paths: &CcteamPaths, cwd: &Path, raw: &str) -> std::io::Result<bool> {
-    let Some(target) = derive_harness_path(cwd, paths) else {
-        return Ok(false);
-    };
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = match target.file_name() {
-        Some(name) => target.with_file_name(format!(
-            "{}.tmp",
-            name.to_str().unwrap_or("snapshot")
-        )),
-        None => return Ok(false),
-    };
-    std::fs::write(&tmp, raw.as_bytes())?;
-    std::fs::rename(&tmp, &target)?;
-    Ok(true)
-}
-
-// =====================================================================
-// Plucker helpers — tolerant of missing / mistyped fields, mirroring
-// `~/.claude/statusline-command.sh`'s `jq // empty` style.
-// =====================================================================
-
-fn pluck<'a>(value: &'a serde_json::Value, path: &[&str]) -> Option<&'a serde_json::Value> {
-    let mut cursor = value;
-    for key in path {
-        cursor = cursor.get(*key)?;
-    }
-    Some(cursor)
-}
-
-fn pluck_str(value: &serde_json::Value, path: &[&str]) -> Option<String> {
-    pluck(value, path)
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-}
-
-fn pluck_f64(value: &serde_json::Value, path: &[&str]) -> Option<f64> {
-    pluck(value, path).and_then(|v| v.as_f64())
-}
-
-fn pluck_pct(value: &serde_json::Value, path: &[&str]) -> Option<u8> {
-    pluck(value, path).and_then(|v| {
-        // Statusline JSON occasionally encodes percentages as
-        // integers, occasionally as floats. Accept either.
-        v.as_u64()
-            .map(|n| n.min(100) as u8)
-            .or_else(|| v.as_f64().map(|n| n.clamp(0.0, 100.0).round() as u8))
-    })
+/// Resolve the canonical path to a Claude Code background job's state
+/// file: `~/.claude/jobs/<job_id>/state.json`. Tests can override the
+/// jobs root via [`CLAUDE_JOBS_DIR_ENV`].
+pub fn state_json_path(job_id: &str) -> PathBuf {
+    let jobs_root = std::env::var(CLAUDE_JOBS_DIR_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs::home_dir()
+                .unwrap_or_default()
+                .join(".claude")
+                .join("jobs")
+        });
+    jobs_root.join(job_id).join("state.json")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn fake_paths(root: &Path) -> CcteamPaths {
-        CcteamPaths {
-            root: root.join(".ccteam"),
-            projects_root: root.join("projects"),
-        }
-    }
 
     // ----- HarnessSnapshot round-trip -----
 
@@ -601,94 +572,47 @@ mod tests {
         };
         let json = serde_json::to_string(&original).unwrap();
         let back: HarnessSnapshot = serde_json::from_str(&json).unwrap();
-        // captured_at round-trips via RFC3339 — equality holds because
-        // chrono's serde uses lossless format.
         assert_eq!(back, original);
     }
 
-    // ----- derive_harness_path -----
+    // ----- ClaudeCodeAdapter::ingest_snapshot / parse_cc_state_json -----
 
     #[test]
-    fn derive_path_multi_session_subdir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = fake_paths(tmp.path());
-        let cwd = paths
-            .projects_root
-            .join("dev-foo/.ccteam/sessions/claude-2");
-        let got = derive_harness_path(&cwd, &paths).unwrap();
-        assert_eq!(got, paths.harness_dir().join("dev-foo-claude-2.json"));
-    }
-
-    #[test]
-    fn derive_path_single_session_default() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = fake_paths(tmp.path());
-        let cwd = paths.projects_root.join("dev-foo");
-        let got = derive_harness_path(&cwd, &paths).unwrap();
-        assert_eq!(got, paths.harness_dir().join("dev-foo-claude-1.json"));
-    }
-
-    #[test]
-    fn derive_path_meta_agent() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = fake_paths(tmp.path());
-        let cwd = paths.projects_root.join("rob-meta");
-        let got = derive_harness_path(&cwd, &paths).unwrap();
-        assert_eq!(got, paths.harness_dir().join("_meta-rob.json"));
-    }
-
-    #[test]
-    fn derive_path_outside_projects_returns_none() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = fake_paths(tmp.path());
-        let cwd = std::path::PathBuf::from("/tmp/random");
-        assert!(derive_harness_path(&cwd, &paths).is_none());
-    }
-
-    #[test]
-    fn derive_path_rejects_parent_traversal() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = fake_paths(tmp.path());
-        // Even if the cwd looks like a valid project subpath, ParentDir
-        // anywhere in the components must collapse to None.
-        let cwd = paths
-            .projects_root
-            .join("dev-foo")
-            .join("..")
-            .join("..")
-            .join("etc");
-        assert!(derive_harness_path(&cwd, &paths).is_none());
-    }
-
-    // ----- ClaudeCodeAdapter::ingest_snapshot -----
-
-    #[test]
-    fn ingest_full_statusline_json() {
+    fn ingest_full_state_json() {
         let raw = r#"{
-            "model": {"display_name": "Claude Sonnet 4.5"},
-            "context_window": {"used_percentage": 73},
-            "cost": {"total_cost_usd": 4.56},
-            "rate_limits": {"five_hour": {"used_percentage": 22}},
+            "status": "running",
+            "model": "claude-opus-4-5",
+            "context_pct": 0.45,
+            "cost_usd": 1.23,
+            "turn_count": 12,
+            "pid": 12345,
+            "last_activity": "2026-05-14T10:00:00Z",
             "cwd": "/home/u/projects/dev-foo"
         }"#;
         let snap = ClaudeCodeAdapter::new().ingest_snapshot(raw).unwrap();
         assert_eq!(snap.harness, "claude-code");
-        assert_eq!(snap.model_display_name, "Claude Sonnet 4.5");
-        assert_eq!(snap.context_used_pct, 73);
-        assert!((snap.cost_usd_total - 4.56).abs() < 1e-9);
-        assert_eq!(snap.rate_limit_pct, Some(22));
+        assert_eq!(snap.model_display_name, "claude-opus-4-5");
+        // 0.45 fraction → 45 percent.
+        assert_eq!(snap.context_used_pct, 45);
+        assert!((snap.cost_usd_total - 1.23).abs() < 1e-9);
+        assert_eq!(snap.rate_limit_pct, None);
         assert_eq!(
             snap.cwd.as_deref(),
-            Some(Path::new("/home/u/projects/dev-foo"))
+            Some(std::path::Path::new("/home/u/projects/dev-foo")),
         );
     }
 
     #[test]
+    fn ingest_state_json_with_percent_form() {
+        // Forward-compat: upstream may switch to integer-percent form.
+        let raw = r#"{ "model": "X", "context_pct": 73 }"#;
+        let snap = ClaudeCodeAdapter::new().ingest_snapshot(raw).unwrap();
+        assert_eq!(snap.context_used_pct, 73);
+    }
+
+    #[test]
     fn ingest_missing_cost_falls_back_to_zero() {
-        let raw = r#"{
-            "model": {"display_name": "Claude Haiku 4.5"},
-            "context_window": {"used_percentage": 5}
-        }"#;
+        let raw = r#"{ "model": "Haiku 4.5", "context_pct": 0.05 }"#;
         let snap = ClaudeCodeAdapter::new().ingest_snapshot(raw).unwrap();
         assert_eq!(snap.cost_usd_total, 0.0);
         assert_eq!(snap.rate_limit_pct, None);
@@ -696,35 +620,21 @@ mod tests {
     }
 
     #[test]
-    fn ingest_missing_rate_limit_keeps_none() {
-        let raw = r#"{
-            "model": {"display_name": "X"},
-            "cost": {"total_cost_usd": 0.01}
-        }"#;
-        let snap = ClaudeCodeAdapter::new().ingest_snapshot(raw).unwrap();
-        assert_eq!(snap.rate_limit_pct, None);
-    }
-
-    #[test]
     fn ingest_malformed_json_returns_ingest_failed() {
         let raw = r#"{"model": "broken"#;
-        let err = ClaudeCodeAdapter::new()
-            .ingest_snapshot(raw)
-            .unwrap_err();
+        let err = ClaudeCodeAdapter::new().ingest_snapshot(raw).unwrap_err();
         assert!(matches!(err, HarnessError::IngestFailed(_)));
     }
 
     #[test]
-    fn ingest_extra_unknown_fields_passes_through_in_raw() {
+    fn ingest_unknown_fields_pass_through_in_raw() {
         let raw = r#"{
-            "model": {"display_name": "Claude Opus 4.7"},
-            "context_window": {"used_percentage": 12},
+            "model": "Opus 4.7",
+            "context_pct": 0.12,
             "future_field": {"nested": [1, 2, 3]}
         }"#;
         let snap = ClaudeCodeAdapter::new().ingest_snapshot(raw).unwrap();
-        // `raw` carries the full upstream JSON for forward-compat.
         assert_eq!(snap.raw["future_field"]["nested"][1], 2);
-        // Known fields parsed normally.
         assert_eq!(snap.context_used_pct, 12);
     }
 
@@ -740,36 +650,6 @@ mod tests {
     }
 
     #[test]
-    fn write_harness_snapshot_creates_dir_and_atomic_renames() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = fake_paths(tmp.path());
-        let cwd = paths.projects_root.join("dev-foo");
-        let raw = r#"{"model":{"display_name":"X"}}"#;
-
-        let wrote = write_harness_snapshot(&paths, &cwd, raw).unwrap();
-        assert!(wrote);
-
-        let target = paths.harness_dir().join("dev-foo-claude-1.json");
-        assert!(target.exists());
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), raw);
-        // No leftover .tmp.
-        let tmp_target = paths
-            .harness_dir()
-            .join("dev-foo-claude-1.json.tmp");
-        assert!(!tmp_target.exists());
-    }
-
-    #[test]
-    fn write_harness_snapshot_returns_false_outside_projects() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = fake_paths(tmp.path());
-        let cwd = std::path::PathBuf::from("/tmp/random");
-        let wrote = write_harness_snapshot(&paths, &cwd, "{}").unwrap();
-        assert!(!wrote);
-        assert!(!paths.harness_dir().exists());
-    }
-
-    #[test]
     fn claude_code_adapter_name_is_stable() {
         // Stability test — `ccteam-web` SSE wire format embeds this
         // string into JSON payloads. A rename here cascades into the
@@ -778,11 +658,11 @@ mod tests {
     }
 
     #[test]
-    fn subagent_states_default_empty_for_v0_3_1() {
-        // V0.3.1 contract: ClaudeCodeAdapter never emits subagent
-        // states (deferred per PRD §3.3 — Claude Code doesn't expose
-        // structured subagent data yet). Test pins the contract so a
-        // future PR that wires it must update this expectation.
+    fn subagent_states_default_empty_for_v0_4_0() {
+        // V0.4.0 contract: ClaudeCodeAdapter never emits subagent
+        // states (deferred — Claude Code doesn't expose structured
+        // subagent data yet). Test pins the contract so a future PR
+        // that wires it must update this expectation.
         let snap = HarnessSnapshot {
             harness: "claude-code".into(),
             model_display_name: "X".into(),
@@ -796,21 +676,59 @@ mod tests {
         assert!(ClaudeCodeAdapter::new().subagent_states(&snap).is_empty());
     }
 
-    // ----- CodexAdapter (V0.3.1 F47 stub) -----
+    // ----- extract_job_id -----
+
+    #[test]
+    fn extract_job_id_from_simple_object() {
+        let stdout = r#"{"job_id":"abc123","status":"started"}"#;
+        assert_eq!(extract_job_id(stdout).as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn extract_job_id_from_nested_object() {
+        let stdout = r#"{"job_id":"jid-1","extra":{"nested":{"deeper":"value"}}}"#;
+        assert_eq!(extract_job_id(stdout).as_deref(), Some("jid-1"));
+    }
+
+    #[test]
+    fn extract_job_id_with_leading_garbage() {
+        // Real claude CLI prefixes some banner output before the
+        // stream-json line.
+        let stdout = "Starting background session...\n{\"job_id\":\"xyz\"}\n";
+        assert_eq!(extract_job_id(stdout).as_deref(), Some("xyz"));
+    }
+
+    #[test]
+    fn extract_job_id_missing_returns_none() {
+        let stdout = r#"{"status":"started"}"#;
+        assert_eq!(extract_job_id(stdout), None);
+    }
+
+    // ----- state_json_path -----
     //
-    // Every fallible method must return `HarnessError::NotImplemented`
-    // with `&'static str` payloads citing both V0.3.2 and the
-    // codex-integration research doc (PRD §F47 §4.2.1). The reason
-    // strings are harmonized across all three methods so callers
-    // (including the F49 `ccteam session add` CLI surface) can match
-    // the same two substrings on every method.
+    // Env-mutating env-override coverage lives in
+    // `tests/harness_thin_test.rs` (integration test, separate
+    // process) per CLAUDE.md §六. Here we only assert the
+    // production-default shape, which is deterministic without env.
+
+    #[test]
+    fn state_json_path_default_shape() {
+        // Skip if CCTEAM_CLAUDE_JOBS_DIR is leaked from a sibling
+        // integration test running concurrently.
+        if std::env::var(CLAUDE_JOBS_DIR_ENV).is_ok() {
+            return;
+        }
+        let p = state_json_path("abc123");
+        let s = p.to_string_lossy();
+        assert!(s.contains(".claude"), "{s}");
+        assert!(s.contains("jobs"), "{s}");
+        assert!(s.ends_with("abc123/state.json"), "{s}");
+    }
+
+    // ----- CodexAdapter (V0.3.1 F47 stub) -----
 
     #[test]
     fn codex_adapter_name_is_codex() {
-        // Stability test — `ccteam-web` SSE wire format embeds this
-        // string, mirroring `claude_code_adapter_name_is_stable`. F49
-        // CLI dispatch and team.yaml `harness: codex` round-trip both
-        // depend on this literal.
         assert_eq!(CodexAdapter::new().name(), "codex");
     }
 
@@ -818,17 +736,17 @@ mod tests {
     fn codex_adapter_spawn_returns_not_implemented_with_v0_3_2_reason() {
         let opts = SpawnOpts {
             harness: "codex",
+            role: "main".into(),
             slug: "flex-foo".into(),
             sid: "codex-1".into(),
             cwd: PathBuf::from("/tmp"),
-            extra_args: Vec::new(),
         };
         match CodexAdapter::new().spawn_session(opts).unwrap_err() {
             HarnessError::NotImplemented { harness, reason } => {
                 assert_eq!(harness, "codex");
                 assert!(
                     reason.contains("V0.3.2"),
-                    "reason should cite V0.3.2: {reason}",
+                    "reason should cite V0.3.2: {reason}"
                 );
                 assert!(
                     reason.contains("docs/research/ccteam-codex-integration.md"),
@@ -854,6 +772,7 @@ mod tests {
     #[test]
     fn codex_adapter_shutdown_returns_not_implemented() {
         let handle = SessionHandle {
+            job_id: "n/a".into(),
             tmux_session: "ccteam-flex-foo-codex-1".into(),
             harness: "codex".into(),
             sid: "codex-1".into(),
@@ -872,8 +791,6 @@ mod tests {
 
     #[test]
     fn codex_adapter_subagent_states_default_empty() {
-        // Mirrors `subagent_states_default_empty_for_v0_3_1` — the
-        // stub uses the trait's default `Vec::new()` impl.
         let snap = HarnessSnapshot {
             harness: "codex".into(),
             model_display_name: "X".into(),

@@ -351,6 +351,7 @@ dependencies = [
  "dirs",
  "image",
  "imageproc",
+ "libc",
  "notify",
  "regex",
  "serde",

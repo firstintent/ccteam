@@ -40,8 +40,9 @@ pub use actions::{
     DecisionInput, SendOptions, SendResult,
 };
 pub use harness::{
-    derive_harness_path, write_harness_snapshot, ClaudeCodeAdapter, CodexAdapter, HarnessAdapter,
+    parse_cc_state_json, state_json_path, ClaudeCodeAdapter, CodexAdapter, HarnessAdapter,
     HarnessError, HarnessSnapshot, SessionHandle, SpawnOpts, SubagentState,
+    CLAUDE_JOBS_DIR_ENV, DEFAULT_CLAUDE_SID,
 };
 pub use dag::{dev_dag, Dag};
 pub use auto_loop::{AutoLoopDecision, AutoLoopFrontMatter, AutoLoopState};

@@ -21,7 +21,7 @@
 
 use std::process::Command;
 
-use ccteam_core::{tmux_available, HarnessKind, ProjectState, SessionRecord, TeamKind};
+use ccteam_core::{HarnessKind, ProjectState, SessionRecord, TeamKind};
 use tempfile::TempDir;
 
 fn cct_bin() -> &'static str {
@@ -64,6 +64,7 @@ impl Fixture {
                     tmux_session: "ccteam-flex-demo-claude-1".into(),
                     started_at: chrono::Utc::now(),
                     pid: None,
+                    job_id: None,
                 },
             );
             state.next_sid_seq.insert(HarnessKind::Claude, 2);
@@ -136,21 +137,21 @@ fn session_add_help_advertises_harness_flag() {
 }
 
 #[test]
-fn session_add_claude_spawns_tmux_session_and_records_state() {
-    if !tmux_available() {
-        eprintln!(
-            "[skip] session_add_claude_spawns_tmux_session_and_records_state: tmux not on PATH"
-        );
-        return;
-    }
-
+fn session_add_claude_records_state_via_claude_bg() {
+    // V0.4.0 F61: `ccteam session add --harness=claude` no longer
+    // calls `tmux new-session`; it invokes `claude --bg --agent <role>`
+    // and records the returned `job_id`. We stub `claude` to print a
+    // fixed JSON envelope and exit 0 so the CLI path runs end-to-end
+    // without a real Claude Code binary on PATH.
     let fx = Fixture::new_empty_flex();
     let fake_bin = fx._tmp.path().join("bin");
     std::fs::create_dir_all(&fake_bin).unwrap();
     let fake_claude = fake_bin.join("claude");
     std::fs::write(
         &fake_claude,
-        "#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile true; do sleep 1; done\n",
+        "#!/bin/sh\n\
+         # V0.4.0 F61 mock: emit a job_id envelope and exit.\n\
+         printf '%s\\n' '{\"job_id\":\"jid-test-1\",\"status\":\"started\"}'\n",
     )
     .unwrap();
     #[cfg(unix)]
@@ -160,12 +161,10 @@ fn session_add_claude_spawns_tmux_session_and_records_state() {
         perms.set_mode(0o755);
         std::fs::set_permissions(&fake_claude, perms).unwrap();
     }
-    let old_path = std::env::var("PATH").unwrap_or_default();
-    let test_path = format!("{}:{old_path}", fake_bin.display());
 
     let out = fx
         .command()
-        .env("PATH", test_path)
+        .env("CCTEAM_CLAUDE_BIN", &fake_claude)
         .args(["session", "add", &fx.slug, "--harness=claude"])
         .output()
         .expect("spawn session add");
@@ -182,11 +181,11 @@ fn session_add_claude_spawns_tmux_session_and_records_state() {
     };
     let state = ProjectState::load(&paths.project_state(&fx.slug)).unwrap();
     let record = state.sessions.get("claude-1").expect("claude-1 record");
-    assert_eq!(record.tmux_session, "ccteam-flex-demo-claude-1");
+    // V0.4.0 F61: tmux_session is synthetic `claude-bg:<job_id>`.
+    assert_eq!(record.tmux_session, "claude-bg:jid-test-1");
+    assert_eq!(record.job_id.as_deref(), Some("jid-test-1"));
     assert_eq!(state.next_sid_seq.get(&HarnessKind::Claude), Some(&2));
     assert!(paths.project_session_dir(&fx.slug, "claude-1").exists());
-
-    let _ = ccteam_core::TmuxSession::from_name(record.tmux_session.clone()).kill();
 }
 
 #[test]

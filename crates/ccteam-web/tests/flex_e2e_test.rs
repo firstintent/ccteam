@@ -127,6 +127,7 @@ async fn v0_3_1_flex_dashboard_session_sse_harness_and_actions() {
                 tmux_session: format!("ccteam-{slug}-{sid}"),
                 started_at: chrono::Utc::now(),
                 pid: None,
+                job_id: None,
             },
         );
     }
@@ -323,10 +324,10 @@ fn v0_3_1_codex_adapter_remains_trait_stub() {
     let err = CodexAdapter::new()
         .spawn_session(SpawnOpts {
             harness: "codex",
+            role: "main".into(),
             slug: "flex-e2e".into(),
             sid: "codex-1".into(),
             cwd: std::env::temp_dir(),
-            extra_args: Vec::new(),
         })
         .expect_err("CodexAdapter must stay stubbed in V0.3.1");
     let msg = err.to_string();

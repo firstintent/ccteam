@@ -77,6 +77,12 @@ pub struct SessionRecord {
     pub tmux_session: String,
     pub started_at: DateTime<Utc>,
     pub pid: Option<u32>,
+    /// V0.4.0 F61 — Claude Code background `job_id` (printed by
+    /// `claude --bg --agent <role>`). Only populated for `claude`
+    /// harness sessions; codex harness leaves it empty. Optional +
+    /// serde-default so V0.3.1 state.json files still deserialize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
 }
 
 /// Project-level state, persisted as `~/projects/<slug>/.ccteam/state.json`.
@@ -208,8 +214,7 @@ impl ProjectState {
     /// before writing, so a load can recover the prior state if a crash
     /// interleaves with this call.
     pub fn save(&self, path: &Path) -> Result<()> {
-        let json = serde_json::to_string_pretty(self)
-            .context("serialize ProjectState")?;
+        let json = serde_json::to_string_pretty(self).context("serialize ProjectState")?;
 
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -250,9 +255,7 @@ impl ProjectState {
                     "state.json unreadable; recovering from .bak",
                 );
                 read_and_parse(&bak).with_context(|| {
-                    format!(
-                        "primary load failed ({primary:#}); backup load also failed",
-                    )
+                    format!("primary load failed ({primary:#}); backup load also failed",)
                 })
             }
         }
@@ -273,10 +276,8 @@ fn sid_number_for_harness(sid: &str, harness: HarnessKind) -> Option<u64> {
 }
 
 fn read_and_parse(path: &Path) -> Result<ProjectState> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("read {}", path.display()))?;
-    serde_json::from_slice(&bytes)
-        .with_context(|| format!("parse {}", path.display()))
+    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))
 }
 
 /// Append a literal suffix to a path's filename (e.g. `state.json` →

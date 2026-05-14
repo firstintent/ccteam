@@ -429,7 +429,9 @@ fn initial_watermarks(progress_dir: &Path) -> HashMap<PathBuf, u64> {
 // `HarnessSnapshot`, and broadcast a `HarnessSnapshotEvent` on the
 // dedicated harness channel.
 //
-// Files come in two filename shapes (mirrors `derive_harness_path`):
+// Files come in two filename shapes (V0.3.1 dual-write convention,
+// retained as the SSE watcher's parse contract — V0.4.0 F66
+// orchestrator will write these directly):
 //   - `<slug>-<sid>.json`   — sid = `claude-N` or `codex-N`
 //   - `_meta-<handle>.json` — meta-agent project (slug = full stem,
 //                              sid = "default")
@@ -498,7 +500,8 @@ fn is_harness_snapshot_file(path: &Path) -> bool {
     if path.extension().and_then(|s| s.to_str()) != Some("json") {
         return false;
     }
-    // Skip the `<name>.tmp` rename source from `write_harness_snapshot`.
+    // Skip the `<name>.tmp` rename source from atomic snapshot writes
+    // (V0.3.1 F46 writer convention, preserved in V0.4.0 F66 orchestrator).
     let name = match path.file_name().and_then(|s| s.to_str()) {
         Some(n) => n,
         None => return false,

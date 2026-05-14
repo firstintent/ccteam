@@ -19,6 +19,12 @@ anyhow.workspace = true
 regex.workspace = true
 thiserror.workspace = true
 
+# V0.4.0 F61 — `ClaudeCodeAdapter::shutdown_session` sends SIGTERM via
+# `libc::kill` to the pid recorded in `~/.claude/jobs/<job_id>/state.json`.
+# Pinned to a recent stable release; `libc` is the de facto cross-crate
+# POSIX FFI surface.
+libc = "0.2"
+
 # V0.2.2 F38 — terminal screenshot pipeline (vt100 + imageproc DIY).
 # All four crates are pure Rust; no system C deps (libfontconfig /
 # libfreetype). See `docs/v0-2-2/prd.md` §7 for the full rationale.

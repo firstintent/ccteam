@@ -806,6 +806,15 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
 - **优先级**:**P0**(ship gate)。
 - **来源**:`docs/v0-3-1/prd.md §8` / §12 / §13。
 
+### F61 — ClaudeCodeAdapter thin refactor: claude --bg + state.json,删 statusline 管道(2026-05-14 加;**2026-05-14 V0.4.0 PR #2 ship,close**)
+
+- **文件:行号**:`crates/ccteam-core/src/harness.rs`(大改:旧 tmux + statusline ~800 LOC 删,新 claude --bg + state.json ~250 LOC);`crates/ccteam-core/src/lib.rs`(re-export 更新:删 `derive_harness_path/write_harness_snapshot`,加 `parse_cc_state_json/state_json_path/CLAUDE_JOBS_DIR_ENV`);`crates/ccteam-core/src/state.rs`(`SessionRecord` 新增 `Option<String> job_id` field);`crates/ccteam-cli/src/main.rs`(删 `HookCommand::HarnessSnapshot` + `--install-statusline-adapter` clap field);`crates/ccteam-cli/src/commands.rs`(删 `run_hook_harness_snapshot` / `install_statusline_adapter` / `render_statusline_wrapper` / `find_latest_statusline_backup` / `STATUSLINE_MARKER_BEGIN`,更新 `SpawnOpts` 构造去 `extra_args` 加 `role: "main"`);`crates/ccteam-cli/tests/statusline_install_test.rs`(删除);`crates/ccteam-core/tests/harness_thin_test.rs`(新增 6 测试 + mock claude binary)。
+- **现状**:V0.3.1 F46 ClaudeCodeAdapter 自己管 tmux 作 CC 宿主 + 解析 statusline JSON。V0.4.0 PRD §6.4:CC 2.1.139+ Agent View(`claude --bg --agent`)+ `~/.claude/jobs/<job_id>/state.json` 是原生路径,ccteam 不该重做。本 PR 重构 adapter,spawn → `claude --bg --agent <role>` 捕获 job_id;observe → 读 state.json;shutdown → SIGTERM via state.json pid;删 statusline-command.sh 写入路径 + doctor 安装入口 + hook 子命令。
+- **是否真 dev-specific**:**否——架构 pivot,domain-agnostic。**
+- **解耦方案(已 ship)**:`HarnessAdapter` trait 形状不变,实现内部全换;`SpawnOpts` 加 `role: String`、删 `extra_args`;`SessionHandle` 加 `job_id: String`;新 helper `state_json_path` + env override `CCTEAM_CLAUDE_BIN` / `CCTEAM_CLAUDE_JOBS_DIR` 支持单元 + 集成测试;Codex stub 保持不变(F62 接);`CodexAdapter` 错误消息仍 cite V0.3.2(F47 verification tests 保留)。新增依赖 `libc = "0.2"`(SIGTERM via libc::kill)。
+- **优先级**:**P0**(V0.4.0 架构基础)。
+- **来源**:`docs/v0-4-0/prd.md §6.4` + §F61 + `docs/v0-4-0/dev-plan.md §3`。
+
 ### F40 — `product-research` team 名冗长 + 领域名缺位(2026-05-09 加;**已修复:2026-05-09(V0.2.2 PR #6 alias 软迁移)**)
 
 - **文件:行号**:`teams/product-research/team.yaml::name`(M3.4 起的字面值)
