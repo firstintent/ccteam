@@ -417,6 +417,14 @@ impl Orchestrator {
             .await
     }
 
+    /// Default kicker prompt when neither marker nor artifact provides
+    /// one. `claude --bg --agent <role>` requires a positional prompt;
+    /// without it the session parks at "stuck on a startup dialog". The
+    /// agent's `.claude/agents/<role>.md` body is the real instruction
+    /// set — this string just nudges the LLM to start consulting it.
+    const DEFAULT_KICK_PROMPT: &'static str =
+        "Begin your assigned task. Your role definition is in .claude/agents/<your-role>.md.";
+
     async fn try_spawn(
         &self,
         slug: &str,
@@ -424,6 +432,19 @@ impl Orchestrator {
         agent: &AgentSpec,
         project_dir: &std::path::Path,
         progress_path: &std::path::Path,
+    ) -> Result<()> {
+        self.try_spawn_with_prompt(slug, role, agent, project_dir, progress_path, None)
+            .await
+    }
+
+    async fn try_spawn_with_prompt(
+        &self,
+        slug: &str,
+        role: &str,
+        agent: &AgentSpec,
+        project_dir: &std::path::Path,
+        progress_path: &std::path::Path,
+        prompt: Option<String>,
     ) -> Result<()> {
         // Budget guard — progress.jsonl is SoT, so cumulative cost
         // survives orchestrator restarts.
@@ -463,6 +484,7 @@ impl Orchestrator {
         };
 
         let sid = format!("{}-{}", role, self.next_role_seq().await);
+        let kick = prompt.unwrap_or_else(|| Self::DEFAULT_KICK_PROMPT.to_string());
         let opts = SpawnOpts {
             harness: match agent.executor {
                 Executor::Claude => "claude-code",
@@ -472,7 +494,7 @@ impl Orchestrator {
             sid: sid.clone(),
             cwd: project_dir.to_path_buf(),
             role: role.to_string(),
-            extra_args: Vec::new(),
+            extra_args: vec![kick],
         };
 
         match adapter.spawn_session(opts) {
@@ -653,9 +675,11 @@ impl Orchestrator {
             if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let role = match std::fs::read_to_string(&path)
+            let parsed = std::fs::read_to_string(&path)
                 .ok()
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+            let role = match parsed
+                .as_ref()
                 .and_then(|v| v.get("role").and_then(|r| r.as_str()).map(String::from))
             {
                 Some(r) => r,
@@ -668,6 +692,15 @@ impl Orchestrator {
                     continue;
                 }
             };
+            // Optional `prompt` field (top-level or under `overrides`)
+            // becomes the positional prompt for `claude --bg`. Falls
+            // back to `Self::DEFAULT_KICK_PROMPT` when absent.
+            let prompt = parsed.as_ref().and_then(|v| {
+                v.get("prompt")
+                    .and_then(|p| p.as_str())
+                    .or_else(|| v.pointer("/overrides/prompt").and_then(|p| p.as_str()))
+                    .map(|s| s.to_string())
+            });
             let Some(agent) = spec.agents.get(&role) else {
                 tracing::warn!(role, "spawn_request for unknown role; deleting");
                 let _ = std::fs::remove_file(&path);
@@ -686,7 +719,7 @@ impl Orchestrator {
                 .copied()
                 .unwrap_or(0);
             if let Err(err) = self
-                .try_spawn(slug, &role, agent, project_dir, progress_path)
+                .try_spawn_with_prompt(slug, &role, agent, project_dir, progress_path, prompt)
                 .await
             {
                 tracing::warn!(role, error = ?err, "spawn_request errored");

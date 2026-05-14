@@ -261,13 +261,18 @@ impl From<std::io::Error> for HarnessError {
 /// session lifecycle now flows through Claude Code's native `--bg`
 /// background-job surface:
 ///
-/// - **spawn_session**: `claude --bg --agent <role> --output-format
-///   stream-json --workdir <cwd>` as a child process; first stdout
-///   line is JSON containing `job_id`.
+/// - **spawn_session**: `claude --bg --agent <role>
+///   --dangerously-skip-permissions` with `cwd` set via
+///   `Command::current_dir` (Claude Code 2.1.x has no `--workdir`
+///   flag — cwd is the spawned process's working directory). First
+///   stdout line is `backgrounded · <daemonShort>`; the short id is
+///   stored as `SessionHandle::job_id`.
 /// - **ingest_snapshot**: reads `~/.claude/jobs/<job_id>/state.json`
 ///   (or `$CCTEAM_CLAUDE_JOBS_DIR/<job_id>/state.json` in tests) and
-///   parses Claude Code's native state shape (`status`, `model`,
-///   `context_pct`, `cost_usd`, `turn_count`).
+///   parses Claude Code's native state shape (`state` ∈ {working, done,
+///   failed, crashed}, `cwd`, `daemonShort`, `sessionId`, `cliVersion`,
+///   ...). Legacy F61 keys (`status`, `model`, `workdir`) are also
+///   tolerated for forward compat with any future re-exposure.
 /// - **shutdown_session**: SIGTERM via `libc::kill` on the pid from
 ///   `state.json`; ESRCH ("no such process") is idempotent success.
 #[derive(Debug, Default, Clone, Copy)]
@@ -320,8 +325,15 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         cmd.arg("--bg")
             .arg("--agent")
             .arg(&opts.role)
-            .arg("--dangerously-skip-permissions")
-            .current_dir(&opts.cwd);
+            .arg("--dangerously-skip-permissions");
+        // Caller-provided extra args (F62 / F65 escape hatch) — orchestrator
+        // forwards the marker's `prompt` field here so `claude --bg` gets
+        // its required positional. Without a positional prompt the session
+        // also parks ("stuck on a startup dialog").
+        for a in &opts.extra_args {
+            cmd.arg(a);
+        }
+        cmd.current_dir(&opts.cwd);
 
         let output = cmd
             .output()
