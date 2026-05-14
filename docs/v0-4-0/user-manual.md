@@ -448,31 +448,56 @@ V0.3.x 中 `mcp__ccteam__ccteam__send_to_session` / `inject_decision` 等工具
 注入到 tmux 中正在跑的 claude session。**V0.4.0 没有 in-flight send-keys
 路径**(`claude --bg --agent` session 是一次性的,无 `/btw` 等价)。
 
-**V0.4.0 hotfix 后实际行为**(`Orchestrator::check_inbox` ticker step):
+**V0.4.0 hotfix 后的等价语义**(`Orchestrator::check_inbox` 每 5s 一次):
 
-- orchestrator 每 5s 扫一次 `<project>/.ccteam/inbox/msg-*.md`
-- 每条消息写一行 `inbox_received` event 到 `progress.jsonl`
-  (含 `source` / `source_user` / `body_summary` / `parse_failed` 字段)
-- 原文件 rename 到 `<project>/.ccteam/inbox.archived/<filename>`
-  (保留全文,不删除 — 供 meta-agent 审计或人工 grep)
-- 解析失败(无 frontmatter 等)同样 archive,event 标 `parse_failed: true`
+每条 inbox 消息 → 三件事:
 
-所以 `ccteam send_to_session` / `inject_decision` 不再是黑洞,但
-**也不会自动唤醒任何 in-flight session**。验证消息被收到:
+1. **archive** 到 `<project>/.ccteam/inbox.archived/<filename>`(原子 rename,保留全文)
+2. **emit** 一行 `inbox_received` event 到 `progress.jsonl`(含
+   `source` / `source_user` / `body_summary` / `parse_failed` /
+   `auto_spawn_role` / `auto_spawn_marker` 字段)
+3. **route** — 默认把 body 作为 prompt 写一个 `spawn_requests/<role>-inbox-<ts>.json`
+   marker,下一 tick orchestrator 起一个**全新**的 `claude --bg` session 来处理
+   (相当于"用户对该 agent 发起新一轮对话")
 
-```bash
-ccteam progress <slug> | grep inbox_received       # 看 event
-ls ~/projects/<slug>/.ccteam/inbox.archived/        # 看归档全文
+**路由规则**:
+
+- frontmatter `target_role: <role>` → 路由到那个 role(role 必须在 workflow.yaml)
+- 无 `target_role` → 路由到 workflow.yaml 中第一个 `trigger: manual` 的 role
+- 无 manual role → 仅 archive,不 spawn(log warning)
+
+**Opt-out**:frontmatter `no_spawn: true` → 仅 archive,不写 spawn marker
+(适合纯审计 / 笔记类消息)。
+
+**不 spawn 的情况**:body 为空 / 空白 / parse_failed = true。
+
+```yaml
+---
+schema_version: 1
+source: cli
+source_user: rob
+created_at: 2026-05-14T13:00:00Z
+ingested_at: 2026-05-14T13:00:00Z
+content_type: text
+target_role: fixer       # 可选,默认第一个 manual role
+no_spawn: true           # 可选,只 archive 不 spawn
+---
+
+# body 这里是 prompt
+请检查 .ccteam/issues/ 下所有 issue,选影响最大的 3 个修。
 ```
 
-需要让某 agent 处理消息 → 两条路:
+```bash
+ccteam progress <slug> | grep inbox_received     # 看 event + auto_spawn_role
+ls ~/projects/<slug>/.ccteam/inbox.archived/     # 看归档全文
+ls ~/projects/<slug>/.ccteam/spawn_requests/     # 看由 inbox 写出的 marker (会被消费)
+```
 
-1. 把 briefing 写到 `.claude/agents/<role>.md` 里,然后 `ccteam__spawn_agent`
-   触发新一轮 spawn,session 读 role 文件作为指令
-2. 设计一个 `watch:` role 监听某 artifact dir,在那里推送上下文
-
-V0.4.1 候选:让 archive 阶段顺带把 body 注入下一次 spawn 同 role 的
-stdin / briefing 文件,真正闭环"消息→session"链路。
+**注意 in-flight session 不会受影响**:V0.4.0 `claude --bg` 是一次性的,
+新消息只能触发**新一轮** spawn(并发可能,subject to parallelism 限制)。
+要给当前 in-flight 的 agent 发实时反馈 → 等它结束 / `ccteam__stop_agent`
+软停后再发消息。V0.4.1 候选:在不结束当前 session 的前提下,把 inbox
+body 作为 briefing 注入下一次 spawn 同 role 的环境变量或 stdin。
 
 ---
 

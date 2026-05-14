@@ -106,6 +106,44 @@ pub enum GateState {
     Fired,
 }
 
+/// Loose probe for two optional routing hints in the inbox front matter
+/// that the strict `InboxMessage` schema doesn't model:
+///   `target_role: <role>`  — auto-spawn target for the message
+///   `no_spawn: true`       — archive only, skip auto-spawn
+///
+/// Returns `(target_role, no_spawn_opt_out)`. Missing front matter or
+/// any parse failure → `(None, false)` (default behaviour: route to
+/// first manual role).
+fn parse_inbox_routing_hints(raw: &str) -> (Option<String>, bool) {
+    let after_first = match raw
+        .strip_prefix("---\n")
+        .or_else(|| raw.strip_prefix("---\r\n"))
+    {
+        Some(s) => s,
+        None => return (None, false),
+    };
+    let end = match after_first
+        .find("\n---\n")
+        .or_else(|| after_first.find("\n---\r\n"))
+    {
+        Some(i) => i,
+        None => return (None, false),
+    };
+    let yaml = &after_first[..end];
+    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(yaml) else {
+        return (None, false);
+    };
+    let target_role = value
+        .get("target_role")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let no_spawn = value
+        .get("no_spawn")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    (target_role, no_spawn)
+}
+
 /// V0.4.0 F66 thin orchestrator. Lifecycle-only — never injects prompt.
 pub struct Orchestrator {
     paths: CcteamPaths,
@@ -361,7 +399,7 @@ impl Orchestrator {
                     self.poll_completions(slug, spec, project_dir, progress_path).await;
                     self.check_spawn_requests(slug, spec, project_dir, progress_path).await;
                     self.check_gates(slug, spec, project_dir, progress_path).await;
-                    self.check_inbox(slug, project_dir, progress_path).await;
+                    self.check_inbox(slug, spec, project_dir, progress_path).await;
                     self.check_workflow_done(slug, spec, progress_path).await;
                 }
             }
@@ -747,26 +785,34 @@ impl Orchestrator {
 
     /// Scan `<project>/.ccteam/inbox/msg-*.md` for unconsumed messages
     /// (written by `ccteam__send_to_session` / `ccteam__inject_decision`
-    /// / channel adapters) and convert each into an `inbox_received`
-    /// progress event, then move the file to `.ccteam/inbox.archived/`.
+    /// / channel adapters), archive each to `.ccteam/inbox.archived/`,
+    /// emit one `inbox_received` event, and — when the message body is
+    /// non-empty — auto-write a `.ccteam/spawn_requests/` marker so a
+    /// fresh agent session picks up the message as its kick prompt.
     ///
     /// ## V0.4.0 delivery semantics
     ///
-    /// V0.3.x orchestrator injected inbox bodies into a long-lived tmux
-    /// claude session via send-keys; V0.4.0 spawned sessions are
-    /// `claude --bg` one-shots with no idle inject target. Until V0.4.1
-    /// wires inbox-as-spawn-stdin (let next-spawn briefing pick up
-    /// pending messages), this consumer's job is **acknowledgement +
-    /// audit trail**: the message becomes a visible event in
-    /// `progress.jsonl` (meta-agent can read via `ccteam__progress`)
-    /// and the file moves to `inbox.archived/` so it does not re-fire.
+    /// V0.3.x send-keys'd inbox bodies into a long-lived tmux claude
+    /// session; V0.4.0 `claude --bg` sessions are one-shot, so there's
+    /// no idle inject target. Instead we spawn a fresh session with the
+    /// message as its prompt — semantically equivalent to "user typed
+    /// this message into a new chat with the agent."
     ///
-    /// Malformed files (bad front matter) skip the parse but still
-    /// archive, with a `parse_failed: true` flag in the event so the
-    /// meta-agent can decide whether to surface them.
+    /// **Target role selection**:
+    /// - Front-matter `target_role: <role>` → that role (must exist in
+    ///   workflow.yaml; else log + skip the spawn but still archive).
+    /// - Otherwise → first `Trigger::Manual` role in `spec.agents`.
+    /// - No manual role exists → archive only + log a hint.
+    ///
+    /// **Opt-out**: front-matter `no_spawn: true` skips the auto-spawn
+    /// (archive only, useful for note-taking / audit-only messages).
+    ///
+    /// **Parse-failed messages**: archive but never auto-spawn — the
+    /// body could be anything, including stale binary garbage.
     async fn check_inbox(
         &self,
         slug: &str,
+        spec: &WorkflowSpec,
         project_dir: &std::path::Path,
         progress_path: &std::path::Path,
     ) {
@@ -802,21 +848,26 @@ impl Orchestrator {
                 }
             };
             let parsed = InboxMessage::parse(&raw).ok();
-            let (source, source_user, body_summary, parse_failed) = match &parsed {
+            // Best-effort second pass: when the frontmatter has extra
+            // routing fields (`target_role`, `no_spawn`) the strict
+            // `InboxMessage` schema doesn't model, fall back to a loose
+            // YAML probe so users can hint dispatch without breaking the
+            // typed front-matter contract.
+            let (loose_target, loose_no_spawn) = parse_inbox_routing_hints(&raw);
+            let (source, source_user, body, body_summary, parse_failed) = match &parsed {
                 Some(msg) => {
-                    // Trim to a leading slice — full body lives in the
-                    // archived file; the event is for visibility only.
                     let summary: String = msg.body.chars().take(500).collect();
                     (
                         msg.front.source.clone(),
                         msg.front.source_user.clone(),
+                        msg.body.clone(),
                         summary,
                         false,
                     )
                 }
                 None => {
                     let summary: String = raw.chars().take(500).collect();
-                    (String::new(), String::new(), summary, true)
+                    (String::new(), String::new(), raw.clone(), summary, true)
                 }
             };
             let archived_path = archive_dir.join(&filename);
@@ -829,6 +880,56 @@ impl Orchestrator {
                 );
                 continue;
             }
+
+            // Decide spawn target — only for parsed messages with
+            // non-empty body and no explicit opt-out.
+            let body_trim = body.trim();
+            let auto_spawn_role: Option<String> = if parse_failed || body_trim.is_empty()
+                || loose_no_spawn
+            {
+                None
+            } else if let Some(target) = loose_target {
+                if spec.agents.contains_key(&target) {
+                    Some(target)
+                } else {
+                    tracing::warn!(slug, target, "inbox target_role not in workflow.yaml; archive only");
+                    None
+                }
+            } else {
+                spec.agents
+                    .iter()
+                    .find(|(_, a)| matches!(a.trigger, Trigger::Manual))
+                    .map(|(r, _)| r.clone())
+            };
+
+            let mut spawn_marker: Option<String> = None;
+            if let Some(role) = &auto_spawn_role {
+                let marker_dir = ccteam_dir.join("spawn_requests");
+                if std::fs::create_dir_all(&marker_dir).is_ok() {
+                    let marker_name = format!(
+                        "{}-inbox-{}.json",
+                        role,
+                        Utc::now().format("%Y%m%dT%H%M%S%f")
+                    );
+                    let marker_path = marker_dir.join(&marker_name);
+                    let payload = json!({
+                        "role": role,
+                        "prompt": body_trim,
+                        "source": "inbox",
+                        "source_filename": filename,
+                        "requested_at": Utc::now().to_rfc3339(),
+                    });
+                    if let Err(err) = std::fs::write(
+                        &marker_path,
+                        serde_json::to_string_pretty(&payload).unwrap_or_default(),
+                    ) {
+                        tracing::warn!(slug, ?err, role, "inbox auto-spawn marker write failed");
+                    } else {
+                        spawn_marker = Some(marker_name);
+                    }
+                }
+            }
+
             let _ = progress::append_event(
                 progress_path,
                 &json!({
@@ -840,6 +941,8 @@ impl Orchestrator {
                     "body_summary": body_summary,
                     "parse_failed": parse_failed,
                     "archived_path": archived_path.to_string_lossy(),
+                    "auto_spawn_role": auto_spawn_role,
+                    "auto_spawn_marker": spawn_marker,
                     "ts": Utc::now().to_rfc3339(),
                 }),
             );
@@ -847,7 +950,8 @@ impl Orchestrator {
                 slug,
                 filename,
                 source = %source,
-                "inbox message acknowledged + archived"
+                spawn = ?auto_spawn_role,
+                "inbox message archived + routed"
             );
         }
     }
@@ -1163,10 +1267,11 @@ impl Orchestrator {
     pub async fn test_check_inbox(
         &self,
         slug: &str,
+        spec: &WorkflowSpec,
         project_dir: &std::path::Path,
         progress_path: &std::path::Path,
     ) {
-        self.check_inbox(slug, project_dir, progress_path).await;
+        self.check_inbox(slug, spec, project_dir, progress_path).await;
     }
 
     pub async fn test_gate_override(

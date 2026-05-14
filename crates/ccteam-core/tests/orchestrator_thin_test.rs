@@ -1050,6 +1050,7 @@ fn write_inbox_msg(project_dir: &Path, filename: &str, body: &str, source_user: 
 async fn t25_inbox_message_archives_and_logs_event() {
     let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_MANUAL_SPEC);
     let (orch, _claude, _codex) = build_orchestrator(paths);
+    let spec = manual_spec("explorer");
     let progress = orch.paths().progress_jsonl(&slug);
 
     write_inbox_msg(
@@ -1059,7 +1060,7 @@ async fn t25_inbox_message_archives_and_logs_event() {
         "rob",
     );
 
-    orch.test_check_inbox(&slug, &pdir, &progress).await;
+    orch.test_check_inbox(&slug, &spec, &pdir, &progress).await;
 
     let inbox = pdir.join(".ccteam").join("inbox");
     let archived = pdir.join(".ccteam").join("inbox.archived");
@@ -1100,6 +1101,7 @@ async fn t25_inbox_message_archives_and_logs_event() {
 async fn t26_inbox_malformed_archives_with_parse_failed_flag() {
     let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_MANUAL_SPEC);
     let (orch, _claude, _codex) = build_orchestrator(paths);
+    let spec = manual_spec("explorer");
     let progress = orch.paths().progress_jsonl(&slug);
 
     let inbox_dir = pdir.join(".ccteam").join("inbox");
@@ -1107,7 +1109,7 @@ async fn t26_inbox_malformed_archives_with_parse_failed_flag() {
     let bad = "msg-2026-05-14T130001Z-001.md";
     std::fs::write(inbox_dir.join(bad), "no frontmatter just body").unwrap();
 
-    orch.test_check_inbox(&slug, &pdir, &progress).await;
+    orch.test_check_inbox(&slug, &spec, &pdir, &progress).await;
 
     assert!(
         !inbox_dir.join(bad).exists(),
@@ -1172,9 +1174,149 @@ async fn t28_run_writes_heartbeat_and_honors_shutdown() {
 async fn t27_inbox_no_op_when_empty() {
     let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_MANUAL_SPEC);
     let (orch, _claude, _codex) = build_orchestrator(paths);
+    let spec = manual_spec("explorer");
     let progress = orch.paths().progress_jsonl(&slug);
 
     // No inbox dir at all → no panic, no events.
-    orch.test_check_inbox(&slug, &pdir, &progress).await;
+    orch.test_check_inbox(&slug, &spec, &pdir, &progress).await;
     assert!(read_events(&progress).is_empty());
+}
+
+// =====================================================================
+// V0.4.0-hotfix — inbox auto-spawn (default route to first manual role)
+// =====================================================================
+
+fn write_inbox_msg_raw(project_dir: &Path, filename: &str, raw: &str) {
+    let dir = project_dir.join(".ccteam").join("inbox");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(filename), raw).unwrap();
+}
+
+#[tokio::test]
+async fn t29_inbox_auto_spawns_first_manual_role() {
+    let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_MANUAL_SPEC);
+    let (orch, _claude, _codex) = build_orchestrator(paths);
+    let spec = manual_spec("explorer");
+    let progress = orch.paths().progress_jsonl(&slug);
+
+    write_inbox_msg(&pdir, "msg-1.md", "hi there", "rob");
+
+    orch.test_check_inbox(&slug, &spec, &pdir, &progress).await;
+
+    // Archive happened
+    assert!(pdir.join(".ccteam/inbox.archived/msg-1.md").exists());
+
+    // spawn_requests/ now contains an explorer-inbox-* marker.
+    let req_dir = pdir.join(".ccteam/spawn_requests");
+    let entries: Vec<_> = std::fs::read_dir(&req_dir).unwrap().flatten().collect();
+    assert_eq!(entries.len(), 1, "exactly one spawn marker written");
+    let marker_path = entries[0].path();
+    let marker_body = std::fs::read_to_string(&marker_path).unwrap();
+    let marker_json: serde_json::Value = serde_json::from_str(&marker_body).unwrap();
+    assert_eq!(marker_json["role"], "explorer");
+    assert_eq!(marker_json["prompt"], "hi there");
+    assert_eq!(marker_json["source"], "inbox");
+
+    // Event annotation
+    let evt = read_events(&progress)
+        .into_iter()
+        .find(|e| e.get("event").and_then(|s| s.as_str()) == Some("inbox_received"))
+        .unwrap();
+    assert_eq!(evt["auto_spawn_role"], "explorer");
+    assert!(evt["auto_spawn_marker"].is_string());
+}
+
+#[tokio::test]
+async fn t30_inbox_no_spawn_opt_out() {
+    let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_MANUAL_SPEC);
+    let (orch, _claude, _codex) = build_orchestrator(paths);
+    let spec = manual_spec("explorer");
+    let progress = orch.paths().progress_jsonl(&slug);
+
+    // Frontmatter `no_spawn: true` → archive only, no marker.
+    let raw = "---\nschema_version: 1\nsource: cli\nsource_user: rob\n\
+               created_at: 2026-05-14T13:00:00Z\ningested_at: 2026-05-14T13:00:00Z\n\
+               content_type: text\nno_spawn: true\n---\n\nnote for archive only\n";
+    write_inbox_msg_raw(&pdir, "msg-noop.md", raw);
+
+    orch.test_check_inbox(&slug, &spec, &pdir, &progress).await;
+
+    assert!(pdir.join(".ccteam/inbox.archived/msg-noop.md").exists());
+    let req_dir = pdir.join(".ccteam/spawn_requests");
+    let count = std::fs::read_dir(&req_dir)
+        .map(|rd| rd.flatten().count())
+        .unwrap_or(0);
+    assert_eq!(count, 0, "no_spawn:true must suppress marker write");
+
+    let evt = read_events(&progress)
+        .into_iter()
+        .find(|e| e.get("event").and_then(|s| s.as_str()) == Some("inbox_received"))
+        .unwrap();
+    assert!(evt["auto_spawn_role"].is_null());
+}
+
+#[tokio::test]
+async fn t31_inbox_target_role_routes_explicitly() {
+    // Workflow with two roles — `target_role: fixer` must override the
+    // "first manual role" heuristic.
+    let yaml = "name: dual\nagents:\n  \
+                explorer:\n    executor: claude\n    trigger: manual\n  \
+                fixer:\n    executor: claude\n    trigger: manual\n";
+    let (_pr, _cr, pdir, paths, _progress, slug) = make_project(yaml);
+    let (orch, _claude, _codex) = build_orchestrator(paths);
+    let mut agents = IndexMap::new();
+    for role in ["explorer", "fixer"] {
+        agents.insert(
+            role.into(),
+            AgentSpec {
+                executor: Executor::Claude,
+                trigger: Trigger::Manual,
+                parallelism: None,
+                input: None,
+                output: None,
+                interval: None,
+                timeout: None,
+                on_timeout: None,
+            },
+        );
+    }
+    let spec = WorkflowSpec {
+        name: "dual".into(),
+        description: None,
+        agents,
+    };
+    let progress = orch.paths().progress_jsonl(&slug);
+
+    let raw = "---\nschema_version: 1\nsource: cli\nsource_user: rob\n\
+               created_at: 2026-05-14T13:00:00Z\ningested_at: 2026-05-14T13:00:00Z\n\
+               content_type: text\ntarget_role: fixer\n---\n\nplease handle\n";
+    write_inbox_msg_raw(&pdir, "msg-target.md", raw);
+
+    orch.test_check_inbox(&slug, &spec, &pdir, &progress).await;
+
+    let req_dir = pdir.join(".ccteam/spawn_requests");
+    let entries: Vec<_> = std::fs::read_dir(&req_dir).unwrap().flatten().collect();
+    assert_eq!(entries.len(), 1);
+    let marker_body = std::fs::read_to_string(entries[0].path()).unwrap();
+    let marker_json: serde_json::Value = serde_json::from_str(&marker_body).unwrap();
+    assert_eq!(marker_json["role"], "fixer", "target_role must win over default");
+}
+
+#[tokio::test]
+async fn t32_inbox_empty_body_no_spawn() {
+    let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_MANUAL_SPEC);
+    let (orch, _claude, _codex) = build_orchestrator(paths);
+    let spec = manual_spec("explorer");
+    let progress = orch.paths().progress_jsonl(&slug);
+
+    // Whitespace-only body → don't waste a spawn.
+    write_inbox_msg(&pdir, "msg-empty.md", "   \n\n  ", "rob");
+
+    orch.test_check_inbox(&slug, &spec, &pdir, &progress).await;
+
+    let req_dir = pdir.join(".ccteam/spawn_requests");
+    let count = std::fs::read_dir(&req_dir)
+        .map(|rd| rd.flatten().count())
+        .unwrap_or(0);
+    assert_eq!(count, 0, "empty body must not trigger spawn");
 }
