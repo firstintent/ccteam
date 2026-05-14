@@ -382,6 +382,7 @@ impl Orchestrator {
             slug: slug.to_string(),
             sid: sid.clone(),
             cwd: project_dir.to_path_buf(),
+            role: role.to_string(),
             extra_args: Vec::new(),
         };
 

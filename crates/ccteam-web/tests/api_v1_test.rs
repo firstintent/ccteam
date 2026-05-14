@@ -6,8 +6,11 @@
 //!   shape the dashboard renders, including `kind` and `cost_label`.
 //! - `GET /api/v1/projects/{slug}` returns the composite
 //!   `ProjectSummary` shape: state / events / outbox / sessions /
-//!   decision_candidates — and **does not** include
+//!   workflow_summary — and **does not** include
 //!   `wire_token` / `auth_wire_token` / `auth_enabled` (redline grep #4).
+//!   V0.4.0 F67 dropped the legacy `decision_candidates` /
+//!   `current_phase` fields — the workflow view consumes
+//!   `workflow_summary` (a `WorkflowSummary` or `null`).
 //! - `GET /api/v1/projects/{slug}/sessions/{sid}` (flex only) returns
 //!   `SessionDetail` with `harness_snapshot` populated when the
 //!   harness mirror file exists.
@@ -149,7 +152,12 @@ async fn get_api_v1_project_detail_returns_summary_shape() {
     assert!(body["events"].is_array());
     assert!(body["outbox"].is_array());
     assert!(body["sessions"].is_array());
-    assert!(body["decision_candidates"].is_array());
+    // V0.4.0 F67: `decision_candidates` / `current_phase` retired
+    // along with the phase machinery (F60). `workflow_summary` may
+    // be null for legacy projects without a workflow.yaml.
+    assert!(body.get("decision_candidates").is_none());
+    assert!(body.get("current_phase").is_none());
+    assert!(body.get("workflow_summary").is_some());
     // Redline: token / auth fields not present.
     assert!(body.get("wire_token").is_none());
     assert!(body.get("auth_wire_token").is_none());
@@ -199,7 +207,8 @@ async fn get_api_v1_session_detail_returns_harness_snapshot() {
     assert_eq!(body["kind"], "flex");
     assert!(body["events"].is_array());
     assert!(body["outbox"].is_array());
-    assert!(body["decision_candidates"].is_array());
+    // V0.4.0 F67: session DTO no longer carries `decision_candidates`.
+    assert!(body.get("decision_candidates").is_none());
     let snap = &body["harness_snapshot"];
     assert_eq!(snap["model"], "Claude Opus 4.7");
     assert!(snap["captured_at"].is_string());

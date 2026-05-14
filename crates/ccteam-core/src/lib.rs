@@ -85,11 +85,18 @@ pub use pending_inject::{
 pub use plugin_resolution::{
     lookup_plugin_agent, plugins_to_enable, PluginAgent, KNOWN_PLUGIN_AGENTS,
 };
+pub use progress::{
+    current_agent_sessions, escalation_count, workflow_cost_total, AgentSessionStatus,
+    AgentSessionSummary,
+};
 pub use projects::{
     bootstrap_project, pick_unused_slug, pick_unused_slug_verbatim, pre_trust_project, slugify,
     slugify_brief,
 };
-pub use queries::{collect_projects, collect_recent_events, ProjectSummary};
+pub use queries::{
+    collect_projects, collect_recent_events, workflow_summary, AgentStatus, ProjectSummary,
+    WorkflowSummary,
+};
 pub use screenshot::{
     probe_font as probe_screenshot_font, render_screenshot, vt100_color_to_rgb, ScreenshotResult,
     FONT_ENV as SCREENSHOT_FONT_ENV,

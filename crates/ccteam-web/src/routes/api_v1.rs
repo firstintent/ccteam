@@ -27,11 +27,10 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use ccteam_core::{HarnessKind, HarnessSnapshot, ProjectState, TeamKind};
+use ccteam_core::{HarnessKind, HarnessSnapshot, ProjectState, TeamKind, WorkflowSummary};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use crate::decisions::scan_candidates;
 use crate::queries::{
     event_ts_label, events_to_rows, outbox_rows, recent_event_summary, session_outbox_rows,
     session_recent_events, slug_recent_events, DEFAULT_OUTBOX_LIMIT, PROJECT_EVENT_DISPLAY_LIMIT,
@@ -62,13 +61,18 @@ pub fn router() -> Router<AppState> {
 /// 2. `auth_wire_token` / `auth_enabled` are **not** on this struct.
 ///    Tokens belong on `/api/v1/auth/token` (single explicit endpoint)
 ///    so listing API responses cannot leak them.
+///
+/// V0.4.0 F67: `current_phase` and `decision_candidates` removed —
+/// phase machinery was retired in F60. The new `workflow_summary`
+/// field replaces both (the SPA wires it in F68; current Rust
+/// callers leave it `None` for legacy projects without a
+/// workflow.yaml).
 #[derive(Serialize)]
 pub struct ProjectSummary {
     pub slug: String,
     pub team: String,
     pub kind: String,
     pub is_flex: bool,
-    pub current_phase: String,
     pub badge_class: &'static str,
     pub badge_label: &'static str,
     pub cost_label: String,
@@ -77,13 +81,16 @@ pub struct ProjectSummary {
     pub state: serde_json::Value,
     pub events: Vec<EventRow>,
     pub outbox: Vec<OutboxRow>,
-    pub decision_candidates: Vec<String>,
+    pub workflow_summary: Option<WorkflowSummary>,
 }
 
 /// JSON returned by `GET /api/v1/projects/{slug}/sessions/{sid}`.
 ///
 /// Shape matches the V0.3 (retired) askama session template payload
 /// minus the auth fields (same rationale as [`ProjectSummary`]).
+///
+/// V0.4.0 F67: `decision_candidates` removed — phase decision graph
+/// was retired in F60.
 #[derive(Serialize)]
 pub struct SessionDetail {
     pub slug: String,
@@ -99,7 +106,6 @@ pub struct SessionDetail {
     pub cost_label: String,
     pub events: Vec<EventRow>,
     pub outbox: Vec<OutboxRow>,
-    pub decision_candidates: Vec<String>,
     pub harness_snapshot: Option<HarnessSnapshotView>,
 }
 
@@ -142,11 +148,6 @@ fn build_projects(app: &AppState) -> anyhow::Result<Vec<DashboardRow>> {
             slug: s.state.slug.clone(),
             team: s.state.team.clone(),
             kind: team_kind_label(s.state.team_kind).to_string(),
-            current_phase: if s.state.team_kind == TeamKind::Flex {
-                String::new()
-            } else {
-                s.state.current_phase.clone()
-            },
             last_event_label,
             badge_class: badge.css_class(),
             badge_label: badge.label(),
@@ -207,17 +208,19 @@ async fn handle_project(
         }
     };
 
-    let decision_candidates: Vec<String> = scan_candidates(&app.paths, &slug)
-        .into_iter()
-        .map(|p| p.display().to_string())
-        .collect();
+    let workflow_summary = match ccteam_core::workflow_summary(&slug, &app.paths) {
+        Ok(s) => Some(s),
+        Err(err) => {
+            tracing::warn!(slug, error = %err, "workflow_summary build failed");
+            None
+        }
+    };
 
     let summary = ProjectSummary {
         slug: state.slug.clone(),
         team: state.team.clone(),
         kind: team_kind_label(state.team_kind).to_string(),
         is_flex: state.team_kind == TeamKind::Flex,
-        current_phase: state.current_phase.clone(),
         badge_class: badge.css_class(),
         badge_label: badge.label(),
         cost_label: format!("{:.2}", state.cost_used_usd),
@@ -226,7 +229,7 @@ async fn handle_project(
         state: state_value,
         events: event_rows,
         outbox,
-        decision_candidates,
+        workflow_summary,
     };
     Json(summary).into_response()
 }
@@ -291,10 +294,6 @@ async fn handle_session(
         })
         .unwrap_or(0);
     let badge = status_badge(&state, &status_events, silent);
-    let decision_candidates: Vec<String> = scan_candidates(&app.paths, &slug)
-        .into_iter()
-        .map(|p| p.display().to_string())
-        .collect();
     let snapshot = load_harness_snapshot(&app, &slug, &sid);
     let cost_label = snapshot
         .as_ref()
@@ -315,7 +314,6 @@ async fn handle_session(
         cost_label,
         events: events_to_rows(&status_events[display_start..]),
         outbox: session_outbox_rows(&app.paths, &slug, &sid, DEFAULT_OUTBOX_LIMIT),
-        decision_candidates,
         harness_snapshot: snapshot.map(snapshot_view),
     };
     Json(detail).into_response()

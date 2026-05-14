@@ -100,6 +100,7 @@ impl HarnessAdapter for MockAdapter {
             sid,
             pid: Some(10_000 + n as u32),
             started_at: chrono::Utc::now(),
+            job_id: None,
         })
     }
     fn shutdown_session(&self, _handle: &SessionHandle) -> Result<(), HarnessError> {
@@ -345,7 +346,7 @@ async fn t05_parallelism_limit_respected() {
         let evt = ArtifactEvent {
             role: "fixer".into(),
             artifact_path: pdir.join(format!("issues/{i}.md")),
-        event_kind: WatchKind::Created,
+            event_kind: WatchKind::Created,
         };
         orch.test_handle_artifact_event(&slug, &spec, &pdir, &progress, evt)
             .await
@@ -449,7 +450,7 @@ async fn t09_completed_session_dequeues_pending() {
         let evt = ArtifactEvent {
             role: "fixer".into(),
             artifact_path: pdir.join(format!("issues/{i}.md")),
-        event_kind: WatchKind::Created,
+            event_kind: WatchKind::Created,
         };
         orch.test_handle_artifact_event(&slug, &spec, &pdir, &progress, evt)
             .await
@@ -716,7 +717,7 @@ agents:
         ArtifactEvent {
             role: "agentA".into(),
             artifact_path: pdir.join("dirA/a.md"),
-        event_kind: WatchKind::Created,
+            event_kind: WatchKind::Created,
         },
     )
     .await
@@ -729,7 +730,7 @@ agents:
         ArtifactEvent {
             role: "agentB".into(),
             artifact_path: pdir.join("dirB/b.md"),
-        event_kind: WatchKind::Created,
+            event_kind: WatchKind::Created,
         },
     )
     .await
@@ -753,7 +754,7 @@ async fn t17_pending_queue_fifo() {
         let evt = ArtifactEvent {
             role: "fixer".into(),
             artifact_path: pdir.join(format!("issues/{i}.md")),
-        event_kind: WatchKind::Created,
+            event_kind: WatchKind::Created,
         };
         orch.test_handle_artifact_event(&slug, &spec, &pdir, &progress, evt)
             .await
@@ -819,7 +820,7 @@ async fn t19_escalation_on_3_consecutive_failures() {
         let evt = ArtifactEvent {
             role: "fixer".into(),
             artifact_path: pdir.join(format!("issues/{i}.md")),
-        event_kind: WatchKind::Created,
+            event_kind: WatchKind::Created,
         };
         orch.test_handle_artifact_event(&slug, &spec, &pdir, &progress, evt)
             .await
@@ -858,6 +859,7 @@ async fn t20_meta_agent_not_killed() {
             sid: "meta-1".into(),
             pid: Some(1234),
             started_at: chrono::Utc::now(),
+            job_id: None,
         },
     )
     .await;
@@ -879,7 +881,7 @@ async fn t20_meta_agent_not_killed() {
         let evt = ArtifactEvent {
             role: "fixer".into(),
             artifact_path: pdir.join(format!("issues/{i}.md")),
-        event_kind: WatchKind::Created,
+            event_kind: WatchKind::Created,
         };
         orch.test_handle_artifact_event(&slug, &spec, &pdir, &progress, evt)
             .await
