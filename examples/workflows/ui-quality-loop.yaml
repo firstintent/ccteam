@@ -1,0 +1,30 @@
+# examples/workflows/ui-quality-loop.yaml
+# 场景：对 web 项目持续探索 UI 问题 → 并行修复 → codex review → 人工 Gate → 发布
+# 拷贝本文件到项目根 workflow.yaml 或 .ccteam/workflow.yaml 使用
+
+name: ui-quality-loop
+description: 探索 UI 问题 → 并行修复 → codex review → 人工 Gate → 发布
+
+agents:
+  explorer:
+    executor: claude
+    trigger: manual
+    output: .ccteam/issues/
+
+  fixer:
+    executor: claude
+    trigger: watch:.ccteam/issues/
+    parallelism: 10
+    input: .ccteam/issues/
+    output: .ccteam/fixes/
+
+  reviewer:
+    executor: codex
+    trigger: watch:.ccteam/fixes/
+    input: .ccteam/fixes/
+    output: .ccteam/verdicts/
+
+  shipper:
+    executor: claude
+    trigger: gate
+    input: .ccteam/verdicts/
