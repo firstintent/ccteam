@@ -310,6 +310,12 @@ printf '  claude agents             list sessions\n'
         !argv.contains("--workdir"),
         "argv must NOT include --workdir (not a real CLI flag): {argv}"
     );
+    // CLAUDE.md §三 — bg sessions need permissions skipped or they park
+    // at the workspace trust dialog and never run.
+    assert!(
+        argv.contains("--dangerously-skip-permissions"),
+        "argv must skip permission prompts for --bg: {argv}"
+    );
 
     // cwd should be set via Command::current_dir → reflected in pwd.
     let observed_cwd = std::fs::read_to_string(&cwd_sink).unwrap();

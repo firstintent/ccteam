@@ -312,9 +312,15 @@ impl HarnessAdapter for ClaudeCodeAdapter {
 
         let bin = std::env::var(CLAUDE_BIN_ENV).unwrap_or_else(|_| "claude".to_string());
         let mut cmd = Command::new(&bin);
+        // `--dangerously-skip-permissions` is the production pattern per
+        // CLAUDE.md §三 — without it `claude --bg` parks at the workspace
+        // trust dialog and the session never makes forward progress.
+        // Project isolation comes from `cwd` (per-project dir), not from
+        // a permission prompt the bg session cannot answer.
         cmd.arg("--bg")
             .arg("--agent")
             .arg(&opts.role)
+            .arg("--dangerously-skip-permissions")
             .current_dir(&opts.cwd);
 
         let output = cmd
