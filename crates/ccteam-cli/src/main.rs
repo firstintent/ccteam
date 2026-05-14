@@ -48,10 +48,13 @@ enum Command {
         cmd: HookCommand,
     },
     /// Run the orchestrator daemon (and, by default, the web UI on
-    /// `127.0.0.1:7331` in the same process). Pass `--no-web` to run
-    /// orchestrator only.
+    /// `127.0.0.1:7331` in the same process). Foreground is the only
+    /// supported mode — `ccteam start` is enough; the `--foreground`
+    /// flag is accepted for back-compat but no longer required.
+    /// Pass `--no-web` to run orchestrator only.
     Start {
-        #[arg(long, default_value_t = false)]
+        /// Back-compat no-op: foreground is the only mode.
+        #[arg(long, default_value_t = false, hide = true)]
         foreground: bool,
         /// Override the polling tick interval (debug / tests only).
         #[arg(long, value_name = "SECONDS", default_value_t = 30)]
@@ -134,8 +137,9 @@ enum Command {
         format: OutputFormat,
     },
     /// Show one project's full state, recent events, and artifacts.
+    /// With no slug, lists every available slug + a re-run hint.
     Show {
-        slug: String,
+        slug: Option<String>,
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
     },
@@ -484,7 +488,13 @@ enum HookCommand {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // No subcommand → print help instead of silently exiting. Prior
+    // behavior (V0.4.0 and earlier) was Ok(()) with nothing on stdout,
+    // which left users wondering whether ccteam was installed at all.
     let Some(command) = cli.command else {
+        use clap::CommandFactory;
+        Cli::command().print_help().context("print help")?;
+        println!();
         return Ok(());
     };
 
@@ -525,7 +535,10 @@ fn main() -> Result<()> {
             auto_slug_model,
         } => run_new(request, file, team, slug, no_auto_slug, auto_slug_model),
         Command::Ls { format } => run_ls(format),
-        Command::Show { slug, format } => run_show(&slug, format),
+        Command::Show { slug, format } => match slug {
+            Some(s) => run_show(&s, format),
+            None => show_slug_picker(),
+        },
         Command::Attach { slug } => {
             let paths = CcteamPaths::from_env()?;
             commands::run_attach(&paths, &slug)
@@ -838,6 +851,15 @@ fn run_start(
     let pidfile = ccteam_core::write_pidfile(&paths)?;
     tracing::info!(pidfile = %pidfile.display(), "orchestrator pidfile written");
 
+    // Print a single banner up front so the operator can paste the web
+    // URL into a browser without grepping mid-log noise. Skip when
+    // web is disabled. Token is resolved here (read or pre-generate)
+    // only when bind is non-loopback so the loopback fast-path stays
+    // zero-IO.
+    if !web.disabled {
+        print_web_banner(&paths, &web);
+    }
+
     // We need the paths twice (for orchestrator construction + final
     // pidfile cleanup), so clone before the move into Orchestrator::new.
     let cleanup_paths = paths.clone();
@@ -928,6 +950,46 @@ async fn wait_for_shutdown_signal() {
     }
 }
 
+fn print_web_banner(paths: &CcteamPaths, web: &StartWebOpts) {
+    let bind: std::net::SocketAddr = match web.bind.parse() {
+        Ok(a) => a,
+        Err(_) => {
+            // Defer the error to parse_web_opts inside the async block;
+            // banner is best-effort.
+            return;
+        }
+    };
+    let loopback = ccteam_web::auth::is_loopback(&bind);
+    let scheme = "http";
+    eprintln!();
+    eprintln!("┌─ ccteam web ─────────────────────────────────────────────");
+    if loopback || web.no_auth {
+        eprintln!("│  URL:   {scheme}://{bind}/");
+        if !loopback && web.no_auth {
+            eprintln!("│  AUTH:  DISABLED (--web-no-auth on non-loopback — LAN-wide!)");
+        } else {
+            eprintln!("│  AUTH:  disabled (loopback bind)");
+        }
+    } else {
+        let token_path = web
+            .token_file
+            .clone()
+            .unwrap_or_else(|| ccteam_web::token::default_token_path(paths));
+        match ccteam_web::token::generate_or_load_token(&token_path) {
+            Ok(hex) => {
+                eprintln!("│  URL:   {scheme}://{bind}/?token=ccteam:{hex}");
+                eprintln!("│  TOKEN: ccteam:{hex}");
+                eprintln!("│  FILE:  {}", token_path.display());
+            }
+            Err(err) => {
+                eprintln!("│  URL:   {scheme}://{bind}/  (token init failed: {err})");
+            }
+        }
+    }
+    eprintln!("└──────────────────────────────────────────────────────────");
+    eprintln!();
+}
+
 fn parse_web_opts(web: &StartWebOpts) -> Result<ccteam_web::ServeOpts> {
     let bind: std::net::SocketAddr = web
         .bind
@@ -939,6 +1001,22 @@ fn parse_web_opts(web: &StartWebOpts) -> Result<ccteam_web::ServeOpts> {
         token_file: web.token_file.clone(),
         no_auth_grace_secs: Some(5),
     })
+}
+
+fn show_slug_picker() -> Result<()> {
+    let paths = CcteamPaths::from_env()?;
+    let projects = ccteam_core::queries::collect_projects(&paths).unwrap_or_default();
+    if projects.is_empty() {
+        println!("no projects yet — `ccteam new \"<your idea>\"` to make one.");
+        return Ok(());
+    }
+    println!("`ccteam show` needs a slug. Available:");
+    for p in &projects {
+        println!("  {}", p.state.slug);
+    }
+    println!();
+    println!("re-run as `ccteam show <slug>`.");
+    Ok(())
 }
 
 fn read_body_or_stdin(body: &str) -> Result<String> {

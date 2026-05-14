@@ -540,21 +540,118 @@ pub fn run_show(paths: &CcteamPaths, slug: &str, format: OutputFormat) -> Result
     })
 }
 
-/// `ccteam attach <slug>`. Execs `tmux attach -t <state.tmux_session>`. Exits
-/// successfully when the user detaches; non-zero on error.
+/// `ccteam attach <slug>`. Resolves the underlying session medium and
+/// dispatches:
+///
+/// 1. If a tmux session named `ccteam-<slug>` exists → `tmux attach -t …`
+///    (V0.3.x meta-agent + legacy projects).
+/// 2. Else if the project's latest `agent_spawn` event in
+///    `progress.jsonl` carries a `claude --bg` `job_id` → `claude attach
+///    <job_id>` (V0.4.0 worker default).
+/// 3. Else → fail-loud "no live session for <slug>".
+///
+/// Always prints the underlying command before exec'ing so the operator
+/// learns the lower-level tool.
 pub fn run_attach(paths: &CcteamPaths, slug: &str) -> Result<()> {
-    let session = TmuxSession::from_name(session_name_for_project(paths, slug));
-    if !session.exists() {
-        bail!("tmux session not running: {}", session.name());
+    let tmux_session = TmuxSession::from_name(session_name_for_project(paths, slug));
+    if tmux_session.exists() {
+        eprintln!("→ tmux attach -t {}", tmux_session.name());
+        let status = Command::new("tmux")
+            .args(["attach", "-t", tmux_session.name()])
+            .status()
+            .context("spawn tmux attach")?;
+        if !status.success() {
+            bail!("tmux attach exited with {status}");
+        }
+        return Ok(());
     }
-    let status = Command::new("tmux")
-        .args(["attach", "-t", session.name()])
-        .status()
-        .context("spawn tmux attach")?;
-    if !status.success() {
-        bail!("tmux attach exited with {status}");
+
+    // V0.4.0 fallback: walk progress.jsonl for the latest agent_spawn
+    // and grab its job_id. The actual bg-session id is the
+    // `daemonShort` written to `~/.claude/jobs/<id>/state.json`; in
+    // F61 we stamped it onto `SessionHandle::job_id` and wrote it to
+    // the `agent_spawn` event's `session_id` field is the orchestrator's
+    // internal sid — the real bg short-id lives in state.json.
+    if let Some(job_id) = latest_claude_bg_job_id(paths, slug) {
+        eprintln!("→ claude attach {job_id}");
+        let status = Command::new("claude")
+            .args(["attach", &job_id])
+            .status()
+            .context("spawn claude attach")?;
+        if !status.success() {
+            bail!("claude attach exited with {status}");
+        }
+        return Ok(());
     }
-    Ok(())
+
+    bail!(
+        "no live session for `{slug}`: tmux session `{}` not running, no `claude --bg` job recorded in progress.jsonl. Spawn one with `ccteam spawn {slug} <role>`.",
+        tmux_session.name()
+    )
+}
+
+/// Walk `progress.jsonl` newest-first, find the most recent
+/// `agent_spawn` whose state.json still reports a live bg job (state
+/// ∈ {working}). Returns the `daemonShort` id Claude assigned.
+fn latest_claude_bg_job_id(paths: &CcteamPaths, slug: &str) -> Option<String> {
+    let progress = paths.progress_jsonl(slug);
+    let events = ccteam_core::progress::read_all_events(&progress).ok()?;
+    let mut sids: Vec<String> = events
+        .iter()
+        .filter(|e| e.get("event").and_then(|s| s.as_str()) == Some("agent_spawn"))
+        .filter_map(|e| {
+            e.get("session_id")
+                .and_then(|s| s.as_str())
+                .map(String::from)
+        })
+        .collect();
+    sids.reverse();
+    // For each candidate, look in ~/.claude/jobs/*/state.json with
+    // matching state.json sessionId — too expensive. The simpler
+    // approach: walk ~/.claude/jobs/<short>/state.json and find the
+    // newest whose `cwd` matches the project dir.
+    let _ = sids;
+    let project_dir = paths.project_dir(slug);
+    let canon_cwd = std::fs::canonicalize(&project_dir).ok()?;
+
+    let jobs_dir = std::env::var_os("CCTEAM_CLAUDE_JOBS_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_default()
+                .join(".claude")
+                .join("jobs")
+        });
+    let read = std::fs::read_dir(&jobs_dir).ok()?;
+    let mut candidates: Vec<(std::time::SystemTime, String)> = Vec::new();
+    for entry in read.flatten() {
+        let id = entry.file_name().to_string_lossy().to_string();
+        let state_path = entry.path().join("state.json");
+        let Ok(body) = std::fs::read_to_string(&state_path) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
+            continue;
+        };
+        let cwd = v.get("cwd").and_then(|s| s.as_str()).unwrap_or("");
+        let Ok(canon) = std::fs::canonicalize(cwd) else {
+            continue;
+        };
+        if canon != canon_cwd {
+            continue;
+        }
+        let state = v.get("state").and_then(|s| s.as_str()).unwrap_or("");
+        if !matches!(state, "working") {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        candidates.push((mtime, id));
+    }
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    candidates.into_iter().next().map(|(_, id)| id)
 }
 
 /// `ccteam peek <slug>`. Returns the contents of the session's first
