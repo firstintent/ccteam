@@ -1,71 +1,71 @@
-//! V0.4.0 F60 — Thin orchestrator stub.
+//! V0.4.0 F66 — Thin orchestrator (dispatch shell).
 //!
-//! The legacy phase state machine (M0–M3.x; ~2700 LOC) was deleted in
-//! F60 along with `phases.rs`, `golden_rules.rs`, `dag.rs`, and the
-//! template loaders. This module is intentionally minimal until F66
-//! lands the artifact-trigger workflow loop.
+//! Replaces the V0.3.x phase state machine (deleted in F60). Loads
+//! `workflow.yaml` (F63) → starts [`ArtifactWatcher`] (F64) → walks
+//! initial triggers → event-loops on artifact channel → polls completed
+//! sessions via `state.json::status` → fans pending events.
 //!
-//! Public surface kept stable for callers that already exist:
-//! - `Orchestrator { paths }` (constructor + path accessor)
-//! - `OrchestratorConfig` (preserved for CLI flag plumbing in
-//!   `ccteam start`; fields trimmed to what the stub needs)
-//! - `MAX_CONCURRENT_PROJECTS` (consumed by `discover_projects` callers)
-//! - `DEFAULT_CLAUDE_MODEL` (consumed by CLI + tests for `--model`)
-//! - `run_project` / `run` — return `todo!("F66 thin orchestrator")`
+//! ## Architectural red lines (CLAUDE.md §三)
 //!
-//! Everything phase-related (decide_tick, dispatch_phase,
-//! attachments_for_next_phase, handle_golden_rules_violation, the
-//! TeamRuntime { templates, dag } cache, all PhaseState handling) has
-//! been removed. F63 introduces the new `workflow.yaml` surface; F66
-//! re-implements the dispatch loop against it.
+//! - **No prompt injection.** Agent behaviour lives in
+//!   `.claude/agents/<role>.md`; this file's grep for `send_prompt` /
+//!   `inject_phase` / `phase_prompt` MUST return 0 code hits.
+//! - **`progress.jsonl` is SoT.** Every dispatch decision writes one of
+//!   the 7 canonical events (workflow_start / agent_spawn / agent_done /
+//!   artifact_received / gate_triggered / budget_exceeded / workflow_done).
+//! - **Never kill running sessions.** Budget exceeded → block new
+//!   spawns only.
+//! - **fix-loop 3-strike escalate.** Same role failing `spawn_session`
+//!   3 consecutive times → push a `btw` alert to the meta-agent inbox.
+//! - **Zero team-name literals.** No `"ccteam"` / `"chainup"` / `"dev"`.
 
+use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use chrono::Utc;
+use serde_json::{json, Value};
+use tokio::sync::{mpsc, Mutex};
 
+use crate::artifact_watcher::{ArtifactEvent, ArtifactWatcher};
+use crate::harness::{ClaudeCodeAdapter, CodexAdapter, HarnessAdapter, SessionHandle, SpawnOpts};
 use crate::paths::CcteamPaths;
+use crate::progress;
+use crate::workflow::{AgentSpec, Executor, Trigger, WorkflowError, WorkflowSpec};
 
-/// M1.2: how many regular project sessions can run concurrently. Hard-
-/// coded for M1; M3 may move it to `team.yaml` / global config. The
-/// meta-agent session is **not counted** — it's a permanent fixture in
-/// the User Interaction Layer.
+/// Hard cap on concurrent project sessions (excluding the meta-agent).
 pub const MAX_CONCURRENT_PROJECTS: usize = 3;
 
-/// Production model identifier passed to `claude --model`. The `[1m]`
-/// suffix is Claude Code's documented opt-in to the 1M-token context
-/// window. tech-design §6.1 / §6.9 require the long context for cache
-/// reuse + the 60% phase-boundary reset budget.
-///
-/// V0.2 §7 / dev-plan §9 M0.23.2: 1M default. When Anthropic publishes
-/// a newer Sonnet alias, change this single line.
+/// Production model id; `[1m]` opts in to Claude Code's 1M context.
 pub const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-4-6[1m]";
+
+/// Default budget ceiling (USD). Mirrors CLAUDE.md §三 "项目累计 cost
+/// > $200 物理上限". F66 only blocks new spawns at this line — running
+/// sessions are never killed.
+pub const DEFAULT_BUDGET_LIMIT_USD: f64 = 200.0;
+
+/// Consecutive `spawn_session` failures (per role) before meta-agent
+/// escalation. CLAUDE.md §三 fix-loop 3-strike rule.
+pub const MAX_CONSECUTIVE_SPAWN_FAILURES: u32 = 3;
+
+/// State.json poll interval for the completion watcher.
+pub const COMPLETION_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct OrchestratorConfig {
-    /// How often the main loop ticks in the absence of progress events.
     pub tick_interval: Duration,
-    /// argv for the in-pane process when (re)starting a project's tmux
-    /// session. Default is `claude --dangerously-skip-permissions`.
     pub claude_argv: Vec<String>,
-    /// How long the context-reset routine waits for SessionStart's
-    /// ready marker before bailing.
     pub ready_timeout: Duration,
-    /// Extra delay between SessionStart's ready marker landing and the
-    /// first send-keys.
     pub post_ready_warmup: Duration,
-    /// Skip the M0.5.3 startup `tools_required` check (F66 will revisit
-    /// the validator contract against the new workflow schema).
     pub skip_tool_check: bool,
 }
 
 impl Default for OrchestratorConfig {
     fn default() -> Self {
         // F29 — `CCTEAM_CLAUDE_ARGV` lets CLI / e2e harness inject a
-        // stub claude (eg `sh -c 'echo …'`) without rebuilding the
-        // binary. Whitespace-split for shell-style invocation; empty /
-        // unset = production default below. CLI flag still wins via
-        // an explicit `OrchestratorConfig.claude_argv` assignment in
-        // `ccteam start`.
+        // stub claude without rebuilding the binary.
         let claude_argv = std::env::var("CCTEAM_CLAUDE_ARGV")
             .ok()
             .and_then(|raw| {
@@ -94,44 +94,751 @@ impl Default for OrchestratorConfig {
     }
 }
 
-/// V0.4.0 F60 stub. The full orchestrator is rebuilt in F66 against
-/// the new `workflow.yaml` schema (F63) and artifact-trigger watcher
-/// (F64). For now the type exists so `ccteam-cli` keeps compiling but
-/// every dispatch / run entry point returns a `todo!()` so a stray
-/// production call is loud, not silent.
-#[derive(Debug)]
+/// Per-gate lifecycle. F67/F68 may extend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateState {
+    Waiting,
+    Released,
+    Fired,
+}
+
+/// V0.4.0 F66 thin orchestrator. Lifecycle-only — never injects prompt.
 pub struct Orchestrator {
     paths: CcteamPaths,
     #[allow(dead_code)]
     config: OrchestratorConfig,
+    adapters: HashMap<&'static str, Arc<dyn HarnessAdapter + Send + Sync>>,
+    running: Arc<Mutex<HashMap<String, Vec<SessionHandle>>>>,
+    pending: Arc<Mutex<HashMap<String, VecDeque<ArtifactEvent>>>>,
+    fail_counts: Arc<Mutex<HashMap<String, u32>>>,
+    gate_states: Arc<Mutex<HashMap<String, GateState>>>,
+    cost_accum: Arc<Mutex<f64>>,
+}
+
+impl std::fmt::Debug for Orchestrator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Orchestrator")
+            .field("paths", &self.paths)
+            .field(
+                "adapters",
+                &self.adapters.keys().copied().collect::<Vec<_>>(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+enum SessionStatus {
+    Running,
+    Done {
+        cost_usd: Option<f64>,
+        status: String,
+    },
 }
 
 impl Orchestrator {
-    /// Construct the stub. Stores `paths` and `config`; no side effects
-    /// on `~/.ccteam/`, no validation of phase templates (the legacy
-    /// validator was deleted with the rest of the phase machinery).
+    /// Build orchestrator; pre-register claude + codex adapters so the
+    /// dispatch path never allocates one mid-flight.
     pub fn new(paths: CcteamPaths, config: OrchestratorConfig) -> Result<Self> {
-        Ok(Self { paths, config })
+        let mut adapters: HashMap<&'static str, Arc<dyn HarnessAdapter + Send + Sync>> =
+            HashMap::new();
+        adapters.insert("claude", Arc::new(ClaudeCodeAdapter::new()));
+        adapters.insert("codex", Arc::new(CodexAdapter::new()));
+        Ok(Self {
+            paths,
+            config,
+            adapters,
+            running: Arc::new(Mutex::new(HashMap::new())),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            fail_counts: Arc::new(Mutex::new(HashMap::new())),
+            gate_states: Arc::new(Mutex::new(HashMap::new())),
+            cost_accum: Arc::new(Mutex::new(0.0)),
+        })
     }
 
     pub fn paths(&self) -> &CcteamPaths {
         &self.paths
     }
 
-    /// F66 will lay down the per-project artifact-trigger loop against
-    /// the new `workflow.yaml` schema. Until then the stub refuses to
-    /// pretend it can run anything.
-    pub async fn run_project(&self, _slug: &str) -> Result<()> {
-        todo!("F66 thin orchestrator");
+    fn adapter_for(&self, exec: Executor) -> Option<&Arc<dyn HarnessAdapter + Send + Sync>> {
+        let key: &'static str = match exec {
+            Executor::Claude => "claude",
+            Executor::Codex => "codex",
+        };
+        self.adapters.get(key)
     }
 
-    /// F66 will lay down the daemon loop (watchdog + artifact-trigger
-    /// dispatch + meta-agent inbox drain). Until then the stub refuses
-    /// to pretend it can run anything.
-    pub async fn run<F>(&self, _shutdown: F) -> Result<()>
+    /// Test-only adapter override; production CLI never calls this.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_adapter(&mut self, exec: Executor, adapter: Arc<dyn HarnessAdapter + Send + Sync>) {
+        let key: &'static str = match exec {
+            Executor::Claude => "claude",
+            Executor::Codex => "codex",
+        };
+        self.adapters.insert(key, adapter);
+    }
+
+    // ---- public entry points ------------------------------------------------
+
+    pub async fn run_project(&self, slug: &str) -> Result<()> {
+        let project_dir = self.paths.project_dir(slug);
+        let progress_path = self.paths.progress_jsonl(slug);
+
+        let spec = WorkflowSpec::load_for_project(&project_dir).map_err(|e| match e {
+            WorkflowError::NotFound(p) => anyhow::anyhow!("workflow.yaml not found in {:?}", p),
+            other => anyhow::anyhow!(other),
+        })?;
+
+        progress::append_event(
+            &progress_path,
+            &json!({
+                "event": "workflow_start",
+                "workflow": spec.name,
+                "slug": slug,
+                "ts": Utc::now().to_rfc3339(),
+            }),
+        )?;
+
+        let (watcher, rx) = ArtifactWatcher::new(&spec, Some(project_dir.as_path()))?;
+        let watcher_handle = watcher.start();
+
+        self.dispatch_initial_triggers(slug, &spec).await?;
+        let res = self
+            .event_loop(slug, &spec, &project_dir, &progress_path, rx)
+            .await;
+
+        watcher_handle.abort();
+        res
+    }
+
+    /// F66 daemon loop = park until shutdown. Per-project iteration +
+    /// inbox drain land in F67 once meta-agent MCP tooling sits on top.
+    pub async fn run<F>(&self, shutdown: F) -> Result<()>
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
-        todo!("F66 thin orchestrator");
+        tracing::info!("orchestrator daemon: parked (F66 stub; per-project via run_project)");
+        shutdown.await;
+        Ok(())
+    }
+
+    // ---- dispatch helpers ---------------------------------------------------
+
+    async fn dispatch_initial_triggers(&self, slug: &str, spec: &WorkflowSpec) -> Result<()> {
+        for (role, agent) in &spec.agents {
+            match &agent.trigger {
+                Trigger::Manual | Trigger::Schedule => {
+                    tracing::info!(slug, role = role.as_str(), "waiting for explicit trigger");
+                }
+                Trigger::Gate => {
+                    self.gate_states
+                        .lock()
+                        .await
+                        .insert(role.clone(), GateState::Waiting);
+                    tracing::info!(slug, role = role.as_str(), "gate waiting");
+                }
+                Trigger::Watch(path) => {
+                    tracing::info!(slug, role = role.as_str(), watch = ?path, "watch registered");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn event_loop(
+        &self,
+        slug: &str,
+        spec: &WorkflowSpec,
+        project_dir: &std::path::Path,
+        progress_path: &std::path::Path,
+        mut rx: mpsc::Receiver<ArtifactEvent>,
+    ) -> Result<()> {
+        let mut ticker = tokio::time::interval(COMPLETION_POLL_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                maybe = rx.recv() => match maybe {
+                    Some(evt) => {
+                        if let Err(err) = self
+                            .handle_artifact_event(slug, spec, project_dir, progress_path, evt)
+                            .await
+                        {
+                            tracing::warn!(?err, slug, "handle_artifact_event failed");
+                        }
+                    }
+                    None => {
+                        tracing::info!(slug, "artifact channel closed; loop done");
+                        break;
+                    }
+                },
+                _ = ticker.tick() => {
+                    self.poll_completions(slug, spec, project_dir, progress_path).await;
+                    self.check_workflow_done(slug, spec, progress_path).await;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_artifact_event(
+        &self,
+        slug: &str,
+        spec: &WorkflowSpec,
+        project_dir: &std::path::Path,
+        progress_path: &std::path::Path,
+        evt: ArtifactEvent,
+    ) -> Result<()> {
+        let role = evt.role.clone();
+        let Some(agent) = spec.agents.get(&role) else {
+            tracing::warn!(role = role.as_str(), "artifact event for unknown role");
+            return Ok(());
+        };
+
+        progress::append_event(
+            progress_path,
+            &json!({
+                "event": "artifact_received",
+                "role": role,
+                "artifact_path": evt.artifact_path,
+                "slug": slug,
+                "ts": Utc::now().to_rfc3339(),
+            }),
+        )?;
+
+        let max_par = agent.parallelism.unwrap_or(1).max(1) as usize;
+        let running_count = self
+            .running
+            .lock()
+            .await
+            .get(&role)
+            .map(|v| v.len())
+            .unwrap_or(0);
+
+        if running_count >= max_par {
+            self.pending
+                .lock()
+                .await
+                .entry(role.clone())
+                .or_default()
+                .push_back(evt);
+            return Ok(());
+        }
+
+        self.try_spawn(slug, &role, agent, project_dir, progress_path)
+            .await
+    }
+
+    async fn try_spawn(
+        &self,
+        slug: &str,
+        role: &str,
+        agent: &AgentSpec,
+        project_dir: &std::path::Path,
+        progress_path: &std::path::Path,
+    ) -> Result<()> {
+        // Budget guard — progress.jsonl is SoT, so cumulative cost
+        // survives orchestrator restarts.
+        let cost_so_far = self
+            .cumulative_cost_from_progress(progress_path)
+            .await
+            .unwrap_or(0.0);
+        let budget = self.budget_limit_for_project(project_dir);
+        if cost_so_far >= budget {
+            progress::append_event(
+                progress_path,
+                &json!({
+                    "event": "budget_exceeded",
+                    "role": role,
+                    "cost_used_usd": cost_so_far,
+                    "budget_limit_usd": budget,
+                    "slug": slug,
+                    "ts": Utc::now().to_rfc3339(),
+                }),
+            )?;
+            self.send_btw_escalation(
+                slug,
+                &format!(
+                    "budget exceeded for role `{}` (used ${:.2} of ${:.2}); spawn blocked. \
+                     Running sessions left intact.",
+                    role, cost_so_far, budget
+                ),
+            )
+            .await;
+            return Ok(());
+        }
+
+        let Some(adapter) = self.adapter_for(agent.executor) else {
+            tracing::warn!(role, executor = ?agent.executor, "no adapter registered");
+            self.bump_fail_count(slug, role, progress_path).await?;
+            return Ok(());
+        };
+
+        let sid = format!("{}-{}", role, self.next_role_seq().await);
+        let opts = SpawnOpts {
+            harness: match agent.executor {
+                Executor::Claude => "claude-code",
+                Executor::Codex => "codex",
+            },
+            slug: slug.to_string(),
+            sid: sid.clone(),
+            cwd: project_dir.to_path_buf(),
+            extra_args: Vec::new(),
+        };
+
+        match adapter.spawn_session(opts) {
+            Ok(handle) => {
+                self.running
+                    .lock()
+                    .await
+                    .entry(role.to_string())
+                    .or_default()
+                    .push(handle.clone());
+                self.fail_counts.lock().await.insert(role.to_string(), 0);
+                progress::append_event(
+                    progress_path,
+                    &json!({
+                        "event": "agent_spawn",
+                        "role": role,
+                        "session_id": handle.sid,
+                        "tmux_session": handle.tmux_session,
+                        "executor": match agent.executor {
+                            Executor::Claude => "claude",
+                            Executor::Codex => "codex",
+                        },
+                        "slug": slug,
+                        "ts": Utc::now().to_rfc3339(),
+                    }),
+                )?;
+                Ok(())
+            }
+            Err(err) => {
+                tracing::warn!(role, ?err, "spawn_session failed");
+                self.bump_fail_count(slug, role, progress_path).await?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Monotonic microsecond sequence — collision-free across one
+    /// orchestrator instance; F67 may swap in a counter map.
+    async fn next_role_seq(&self) -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(1)
+    }
+
+    async fn bump_fail_count(
+        &self,
+        slug: &str,
+        role: &str,
+        progress_path: &std::path::Path,
+    ) -> Result<()> {
+        let cur = {
+            let mut counts = self.fail_counts.lock().await;
+            let entry = counts.entry(role.to_string()).or_insert(0);
+            *entry = entry.saturating_add(1);
+            *entry
+        };
+
+        progress::append_event(
+            progress_path,
+            &json!({
+                "event": "escalation",
+                "kind": "spawn_failed",
+                "role": role,
+                "consecutive_failures": cur,
+                "slug": slug,
+                "ts": Utc::now().to_rfc3339(),
+            }),
+        )?;
+
+        if cur >= MAX_CONSECUTIVE_SPAWN_FAILURES {
+            self.send_btw_escalation(
+                slug,
+                &format!(
+                    "role `{}` failed to spawn {} consecutive times — orchestrator escalating \
+                     per fix-loop 3-strike rule.",
+                    role, cur
+                ),
+            )
+            .await;
+        }
+        Ok(())
+    }
+
+    async fn poll_completions(
+        &self,
+        slug: &str,
+        spec: &WorkflowSpec,
+        project_dir: &std::path::Path,
+        progress_path: &std::path::Path,
+    ) {
+        let mut finished: Vec<(String, SessionHandle, Option<f64>, String)> = Vec::new();
+        {
+            let mut running = self.running.lock().await;
+            for (role, handles) in running.iter_mut() {
+                let mut keep = Vec::with_capacity(handles.len());
+                for handle in handles.drain(..) {
+                    match self.session_status(&handle) {
+                        SessionStatus::Done { cost_usd, status } => {
+                            finished.push((role.clone(), handle, cost_usd, status));
+                        }
+                        SessionStatus::Running => keep.push(handle),
+                    }
+                }
+                *handles = keep;
+            }
+            running.retain(|_, v| !v.is_empty());
+        }
+
+        for (role, handle, cost_usd, status) in finished {
+            if let Some(c) = cost_usd {
+                *self.cost_accum.lock().await += c;
+            }
+            let _ = progress::append_event(
+                progress_path,
+                &json!({
+                    "event": "agent_done",
+                    "role": role,
+                    "session_id": handle.sid,
+                    "status": status,
+                    "cost_usd": cost_usd.unwrap_or(0.0),
+                    "slug": slug,
+                    "ts": Utc::now().to_rfc3339(),
+                }),
+            );
+
+            if status == "completed" || status == "stopped" {
+                self.fail_counts.lock().await.insert(role.clone(), 0);
+            }
+
+            // Drain one pending event for this role, if any.
+            let pending_evt = {
+                let mut pending = self.pending.lock().await;
+                pending.get_mut(&role).and_then(|q| q.pop_front())
+            };
+            if let Some(evt) = pending_evt {
+                if let Some(agent) = spec.agents.get(&role) {
+                    let _ = self
+                        .try_spawn(slug, &role, agent, project_dir, progress_path)
+                        .await;
+                    let _ = evt;
+                }
+            }
+        }
+
+        self.check_gates(slug, spec, project_dir, progress_path)
+            .await;
+    }
+
+    /// Release a `Trigger::Gate` agent when its input dir has ≥1 file
+    /// (default policy; richer thresholds land in F67) OR an explicit
+    /// `.ccteam/gate_override/<role>` file exists (force).
+    async fn check_gates(
+        &self,
+        slug: &str,
+        spec: &WorkflowSpec,
+        project_dir: &std::path::Path,
+        progress_path: &std::path::Path,
+    ) {
+        for (role, agent) in &spec.agents {
+            if !matches!(agent.trigger, Trigger::Gate) {
+                continue;
+            }
+            let cur = self
+                .gate_states
+                .lock()
+                .await
+                .get(role)
+                .copied()
+                .unwrap_or(GateState::Waiting);
+            if cur != GateState::Waiting {
+                continue;
+            }
+
+            let override_path = project_dir.join(".ccteam").join("gate_override").join(role);
+            let forced = override_path.exists();
+            let threshold_met = agent
+                .input
+                .as_ref()
+                .map(|rel| {
+                    let dir = project_dir.join(rel);
+                    std::fs::read_dir(&dir)
+                        .map(|rd| rd.flatten().any(|e| e.path().is_file()))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+
+            if forced || threshold_met {
+                self.gate_states
+                    .lock()
+                    .await
+                    .insert(role.clone(), GateState::Released);
+                let _ = progress::append_event(
+                    progress_path,
+                    &json!({
+                        "event": "gate_triggered",
+                        "role": role,
+                        "forced": forced,
+                        "threshold_met": threshold_met,
+                        "slug": slug,
+                        "ts": Utc::now().to_rfc3339(),
+                    }),
+                );
+                if forced {
+                    let _ = std::fs::remove_file(&override_path);
+                }
+                let _ = self
+                    .try_spawn(slug, role, agent, project_dir, progress_path)
+                    .await;
+                self.gate_states
+                    .lock()
+                    .await
+                    .insert(role.clone(), GateState::Fired);
+            }
+        }
+    }
+
+    /// Idempotent: emits `workflow_done` exactly once when every gate
+    /// agent is Fired AND has no running session. Uses sentinel key
+    /// `__workflow_done__` to guard against double-emit.
+    async fn check_workflow_done(
+        &self,
+        slug: &str,
+        spec: &WorkflowSpec,
+        progress_path: &std::path::Path,
+    ) {
+        const SENTINEL: &str = "__workflow_done__";
+        if self.gate_states.lock().await.contains_key(SENTINEL) {
+            return;
+        }
+        let mut any_gate = false;
+        let mut all_fired = true;
+        for (role, agent) in &spec.agents {
+            if !matches!(agent.trigger, Trigger::Gate) {
+                continue;
+            }
+            any_gate = true;
+            let state = self
+                .gate_states
+                .lock()
+                .await
+                .get(role)
+                .copied()
+                .unwrap_or(GateState::Waiting);
+            let running_count = self
+                .running
+                .lock()
+                .await
+                .get(role)
+                .map(|v| v.len())
+                .unwrap_or(0);
+            if state != GateState::Fired || running_count > 0 {
+                all_fired = false;
+                break;
+            }
+        }
+        if any_gate && all_fired {
+            self.gate_states
+                .lock()
+                .await
+                .insert(SENTINEL.to_string(), GateState::Fired);
+            let _ = progress::append_event(
+                progress_path,
+                &json!({
+                    "event": "workflow_done",
+                    "workflow": spec.name,
+                    "slug": slug,
+                    "ts": Utc::now().to_rfc3339(),
+                }),
+            );
+        }
+    }
+
+    fn session_status(&self, handle: &SessionHandle) -> SessionStatus {
+        let path = self.session_state_path(handle);
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            return SessionStatus::Running;
+        };
+        let Ok(v) = serde_json::from_str::<Value>(&body) else {
+            return SessionStatus::Running;
+        };
+        let status = v
+            .get("status")
+            .and_then(|s| s.as_str())
+            .unwrap_or("running");
+        if !matches!(status, "stopped" | "completed" | "error") {
+            return SessionStatus::Running;
+        }
+        let cost_usd = v
+            .get("cost_usd")
+            .and_then(|n| n.as_f64())
+            .or_else(|| v.get("cost").and_then(|n| n.as_f64()));
+        SessionStatus::Done {
+            cost_usd,
+            status: status.to_string(),
+        }
+    }
+
+    /// State.json path: claude → `~/.claude/jobs/<sid>/state.json`,
+    /// codex → `~/.ccteam/codex/<sid>/state.json`. Tests override both
+    /// via `CCTEAM_SESSION_STATE_DIR`.
+    fn session_state_path(&self, handle: &SessionHandle) -> PathBuf {
+        if let Ok(custom) = std::env::var("CCTEAM_SESSION_STATE_DIR") {
+            return PathBuf::from(custom).join(&handle.sid).join("state.json");
+        }
+        if handle.harness == "codex" {
+            return self
+                .paths
+                .root
+                .join("codex")
+                .join(&handle.sid)
+                .join("state.json");
+        }
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+        home.join(".claude")
+            .join("jobs")
+            .join(&handle.sid)
+            .join("state.json")
+    }
+
+    /// Sum `cost_usd` over every `agent_done` row in `progress.jsonl`.
+    /// progress.jsonl is the SoT; the in-process accumulator is just a
+    /// floor for the race-against-hook-writer case.
+    async fn cumulative_cost_from_progress(&self, progress_path: &std::path::Path) -> Result<f64> {
+        let events = progress::read_all_events(progress_path).unwrap_or_default();
+        let mut total = 0.0;
+        for evt in events {
+            if evt.get("event").and_then(|s| s.as_str()) == Some("agent_done") {
+                if let Some(c) = evt.get("cost_usd").and_then(|n| n.as_f64()) {
+                    total += c;
+                }
+            }
+        }
+        Ok(total.max(*self.cost_accum.lock().await))
+    }
+
+    /// V0.4.0 F66 budget resolution: env `CCTEAM_BUDGET_LIMIT_USD`
+    /// (test hook) → [`DEFAULT_BUDGET_LIMIT_USD`]. F67 will read
+    /// `team.yaml::cost.hard_kill_threshold_usd` here.
+    fn budget_limit_for_project(&self, _project_dir: &std::path::Path) -> f64 {
+        std::env::var("CCTEAM_BUDGET_LIMIT_USD")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(DEFAULT_BUDGET_LIMIT_USD)
+    }
+
+    /// Push a meta-agent `btw` escalation file into the inbox dir. F67
+    /// may wire a richer routing path; F66 keeps it as a flat write.
+    async fn send_btw_escalation(&self, slug: &str, body: &str) {
+        let target_dir = self.paths.inbox_dir();
+        if std::fs::create_dir_all(&target_dir).is_err() {
+            tracing::warn!(slug, "could not create inbox dir for escalation");
+            return;
+        }
+        let fname = format!(
+            "{}-escalation-{}.txt",
+            Utc::now().format("%Y%m%dT%H%M%SZ"),
+            slug
+        );
+        let path = target_dir.join(fname);
+        if let Err(err) = std::fs::write(&path, body) {
+            tracing::warn!(slug, ?err, "escalation write failed");
+        } else {
+            tracing::info!(slug, body, "escalation queued");
+        }
+    }
+}
+
+// =====================================================================
+// Test surface (gated behind `cfg(any(test, feature = "test-util"))`).
+// Lets the integration crate at `tests/orchestrator_thin_test.rs` drive
+// the orchestrator without tmux. All methods are prefixed `test_*`
+// (plus `set_adapter`) — production CLI never calls them.
+// =====================================================================
+#[cfg(any(test, feature = "test-util"))]
+impl Orchestrator {
+    pub async fn test_handle_artifact_event(
+        &self,
+        slug: &str,
+        spec: &WorkflowSpec,
+        project_dir: &std::path::Path,
+        progress_path: &std::path::Path,
+        evt: ArtifactEvent,
+    ) -> Result<()> {
+        self.handle_artifact_event(slug, spec, project_dir, progress_path, evt)
+            .await
+    }
+
+    pub async fn test_running_count(&self, role: &str) -> usize {
+        self.running
+            .lock()
+            .await
+            .get(role)
+            .map(|v| v.len())
+            .unwrap_or(0)
+    }
+
+    pub async fn test_pending_count(&self, role: &str) -> usize {
+        self.pending
+            .lock()
+            .await
+            .get(role)
+            .map(|q| q.len())
+            .unwrap_or(0)
+    }
+
+    pub async fn test_fail_count(&self, role: &str) -> u32 {
+        self.fail_counts
+            .lock()
+            .await
+            .get(role)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub async fn test_poll_completions(
+        &self,
+        slug: &str,
+        spec: &WorkflowSpec,
+        project_dir: &std::path::Path,
+        progress_path: &std::path::Path,
+    ) {
+        self.poll_completions(slug, spec, project_dir, progress_path)
+            .await;
+        self.check_workflow_done(slug, spec, progress_path).await;
+    }
+
+    pub async fn test_gate_override(
+        &self,
+        slug: &str,
+        spec: &WorkflowSpec,
+        role: &str,
+        project_dir: &std::path::Path,
+        progress_path: &std::path::Path,
+    ) -> Result<()> {
+        let dir = project_dir.join(".ccteam").join("gate_override");
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join(role), "force")?;
+        self.check_gates(slug, spec, project_dir, progress_path)
+            .await;
+        Ok(())
+    }
+
+    pub async fn test_register_running(&self, role: &str, handle: SessionHandle) {
+        self.running
+            .lock()
+            .await
+            .entry(role.to_string())
+            .or_default()
+            .push(handle);
+    }
+
+    pub fn test_adapter_keys(&self) -> Vec<&'static str> {
+        let mut keys: Vec<_> = self.adapters.keys().copied().collect();
+        keys.sort();
+        keys
     }
 }
