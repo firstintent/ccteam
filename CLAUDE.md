@@ -12,7 +12,7 @@
 | 仓库根 | 本会话 `cwd` 即是;显式查用 `git rev-parse --show-toplevel` |
 | 主分支 main HEAD | **以 `git rev-parse origin/main` 为准**(V0.3.2 ship 后) |
 | Workspace version | **`0.3.2`**(V0.3.2 patch round ship) |
-| 测试 baseline | **`833/0`** + F52-F58 增量 — **待用户跑 `cargo test --workspace` 验证**(F59 ship gate 未运行 workspace 全测;`crates/ccteam-web/tests/{project,e2e,actions}_test.rs` 有若干测试期望 HTML body,F59 改 301 后预期红,详 `docs/v0-3-2/README.md §"已知 follow-up"`) |
+| 测试 baseline | **`866/0`**(`cargo test --workspace --locked`;V0.3.2 F59 verification follow-up 已修 legacy route/action 测试 + SPA ship gate) |
 | Clippy | 9 pre-existing errors(非本轮引入,sweep 时确认相同基线) |
 | 代码规模 | ~16 kLOC Rust + ~12 kLOC TypeScript(`crates/ccteam-web/web/`,V0.3.2 lift AoE) |
 | 已 ship 里程碑 | **V0.1**:M0 / M0.5 / M1 / M2 / M2.3 / M3 / M4.1-M4.4 — 详 `docs/v0-1/README.md`<br>**V0.2**:M0.16-M0.23(8 个 milestone)— 详 `docs/v0-2/README.md`<br>**V0.2.2**:F34-F40 + F44(F39 binary rename 已 F44 反向回滚)— 详 `docs/v0-2-2/README.md`<br>**V0.3**:M5.0-M5.4 — 详 `docs/v0-3/README.md`<br>**V0.3.1**:F46-F51(HarnessAdapter + Codex stub + flex kind + adhoc multi-session + web flex + ship gate)— 详 `docs/v0-3-1/README.md`<br>**V0.3.2**:F52-F59(JSON API parity + vite scaffold + Dashboard SPA + detail SPA + WS PTY backend + xterm input + write actions + htmx retire / ship gate)— 详 `docs/v0-3-2/README.md` |

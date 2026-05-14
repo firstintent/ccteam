@@ -131,9 +131,12 @@ export default function ProjectDetail() {
   useEffect(() => {
     if (!slug) return;
     let cancelled = false;
-    setLoading(true);
-    setError(null);
-    setSummary(null);
+    queueMicrotask(() => {
+      if (cancelled) return;
+      setLoading(true);
+      setError(null);
+      setSummary(null);
+    });
     fetchProject(slug)
       .then((data) => {
         if (!cancelled) setSummary(data);

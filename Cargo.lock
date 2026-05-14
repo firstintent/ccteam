@@ -325,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "ccteam-cli"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "ccteam-core",
@@ -343,7 +343,7 @@ dependencies = [
 
 [[package]]
 name = "ccteam-core"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "ab_glyph",
  "anyhow",
@@ -365,7 +365,7 @@ dependencies = [
 
 [[package]]
 name = "ccteam-hooks"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "ccteam-core",
@@ -378,7 +378,7 @@ dependencies = [
 
 [[package]]
 name = "ccteam-web"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "askama",
@@ -388,13 +388,16 @@ dependencies = [
  "chrono",
  "futures",
  "futures-util",
+ "mime_guess",
  "nix 0.29.0",
  "notify",
  "portable-pty",
  "rand 0.8.6",
  "reqwest",
+ "rust-embed",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "serial_test",
  "subtle",
  "tempfile",
@@ -1998,6 +2001,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust-embed"
+version = "8.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04113cb9355a377d83f06ef1f0a45b8ab8cd7d8b1288160717d66df5c7988d27"
+dependencies = [
+ "rust-embed-impl",
+ "rust-embed-utils",
+ "walkdir",
+]
+
+[[package]]
+name = "rust-embed-impl"
+version = "8.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da0902e4c7c8e997159ab384e6d0fc91c221375f6894346ae107f47dd0f3ccaa"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "rust-embed-utils",
+ "syn",
+ "walkdir",
+]
+
+[[package]]
+name = "rust-embed-utils"
+version = "8.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5bcdef0be6fe7f6fa333b1073c949729274b05f123a0ad7efcb8efd878e5c3b1"
+dependencies = [
+ "sha2",
+ "walkdir",
+]
+
+[[package]]
 name = "rustc-hash"
 version = "2.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2260,6 +2297,17 @@ name = "sha1"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
+]
+
+[[package]]
+name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
 dependencies = [
  "cfg-if",
  "cpufeatures",

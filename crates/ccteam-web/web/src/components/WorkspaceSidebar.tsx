@@ -58,7 +58,7 @@ function groupProjects(projects: DashboardRow[]): GroupedTeam[] {
 
   const teams = Object.keys(byTeam).sort();
   return teams.map((team) => {
-    const kindMap = byTeam[team];
+    const kindMap = byTeam[team] ?? {};
     const allKinds = Object.keys(kindMap);
     // Stable kind order: known kinds in KIND_ORDER first, rest
     // alphabetical at the tail.
@@ -70,7 +70,7 @@ function groupProjects(projects: DashboardRow[]): GroupedTeam[] {
       team,
       kinds: ordered.map((kind) => ({
         kind,
-        projects: [...kindMap[kind]].sort((a, b) =>
+        projects: [...(kindMap[kind] ?? [])].sort((a, b) =>
           a.slug.localeCompare(b.slug),
         ),
       })),

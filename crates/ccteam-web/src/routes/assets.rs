@@ -65,6 +65,10 @@ pub fn router() -> Router<AppState> {
         .route("/assets/spa/{*path}", get(handle_spa_bundle_asset))
         // `/app` exact (no trailing slash).
         .route("/app", get(handle_spa_root))
+        // `/app/` is the canonical F59 user entrypoint. Axum's
+        // catch-all route below does not match the empty suffix, so
+        // keep this exact route alongside `/app`.
+        .route("/app/", get(handle_spa_root))
         // `/app/` and any deeper path — direct lookup first, then
         // react-router fallback to index.html.
         .route("/app/{*path}", get(handle_spa_path))

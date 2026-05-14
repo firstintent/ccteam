@@ -25,9 +25,9 @@ use chrono::{SecondsFormat, Utc};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde_json::{json, Value};
 
+use crate::auto_loop::{self, AutoLoopState};
 use crate::cost::{self, CostLevel};
 use crate::dag::Dag;
-use crate::auto_loop::{self, AutoLoopState};
 use crate::inbox::{InboxMessage, SessionMailbox};
 // `META_TEAM_NAME` is no longer referenced from orchestrator after
 // V0.2 §6.4 candidate 5 — evergreen-team behavior dispatches off
@@ -40,10 +40,10 @@ use crate::silence_classifier::{
     self, LastEventSummary, LimboAction, SilenceClass, MAX_LIMBO_RETRY,
 };
 use crate::stall::{self, StallLevel, StallThresholds};
-use crate::tmux::capture_pane_tail_from_session;
 use crate::state::{PhaseHistoryEntry, PhaseState, ProjectState};
 use crate::subskill::{self, ClaudePRunner, SubSkillRunner};
 use crate::team::TeamSpec;
+use crate::tmux::capture_pane_tail_from_session;
 use crate::tmux::TmuxSession;
 use crate::tool_surface::{user_claude_dir, ToolSurfaceSnapshot};
 
@@ -114,10 +114,7 @@ pub enum TickAction {
     /// Nothing to do (still in-flight, or terminal state reached).
     NoOp,
     /// claude completed `from`; advance state to `to` (None => DAG end).
-    AdvancePhase {
-        from: String,
-        to: Option<String>,
-    },
+    AdvancePhase { from: String, to: Option<String> },
     /// **M3.6**: claude printed `ESCALATE: PHASE_DONE_PENDING — ...`
     /// (interfaces §4.1.1). The phase produced its required outputs but
     /// flagged some sub-tasks as deferred. The orchestrator will advance
@@ -130,18 +127,17 @@ pub enum TickAction {
         open_decisions: Vec<String>,
     },
     /// claude printed `ESCALATE: <reason>`. Mark the project escalated.
-    Escalated {
-        phase: String,
-        reason: String,
-    },
+    Escalated { phase: String, reason: String },
     /// claude is idle; orchestrator should inject the named phase prompt.
-    DispatchPhase {
-        phase: String,
-    },
+    DispatchPhase { phase: String },
 }
 
 pub fn decide_tick(dag: &Dag, state: &ProjectState, last_event: Option<&Value>) -> TickAction {
-    decide_tick_from_events(dag, state, last_event.map(std::slice::from_ref).unwrap_or(&[]))
+    decide_tick_from_events(
+        dag,
+        state,
+        last_event.map(std::slice::from_ref).unwrap_or(&[]),
+    )
 }
 
 /// Like `decide_tick` but considers recent events as a slice rather
@@ -152,11 +148,7 @@ pub fn decide_tick(dag: &Dag, state: &ProjectState, last_event: Option<&Value>) 
 ///
 /// `events` should be ordered oldest→newest. `decide_tick` continues
 /// to forward a single event for backwards-compat with old call sites.
-pub fn decide_tick_from_events(
-    dag: &Dag,
-    state: &ProjectState,
-    events: &[Value],
-) -> TickAction {
+pub fn decide_tick_from_events(dag: &Dag, state: &ProjectState, events: &[Value]) -> TickAction {
     if dag.is_empty() {
         // No phases loaded — orchestrator is inert until templates land.
         return TickAction::NoOp;
@@ -184,10 +176,7 @@ pub fn decide_tick_from_events(
         if let Some(terminal) =
             crate::progress::latest_terminal_event_for_phase(events, &state.current_phase)
         {
-            let kind = terminal
-                .get("event")
-                .and_then(|s| s.as_str())
-                .unwrap_or("");
+            let kind = terminal.get("event").and_then(|s| s.as_str()).unwrap_or("");
             return match kind {
                 "phase_done" => TickAction::AdvancePhase {
                     from: state.current_phase.clone(),
@@ -288,10 +277,7 @@ impl Default for OrchestratorConfig {
         let claude_argv = std::env::var("CCTEAM_CLAUDE_ARGV")
             .ok()
             .and_then(|raw| {
-                let parts: Vec<String> = raw
-                    .split_whitespace()
-                    .map(String::from)
-                    .collect();
+                let parts: Vec<String> = raw.split_whitespace().map(String::from).collect();
                 if parts.is_empty() {
                     None
                 } else {
@@ -348,9 +334,8 @@ impl Orchestrator {
         let teams = load_team_runtimes(&paths)?;
         if !config.skip_tool_check {
             for runtime in teams.values() {
-                check_phase_tools(&runtime.templates).with_context(|| {
-                    format!("team `{}` tool surface check", runtime.spec.name)
-                })?;
+                check_phase_tools(&runtime.templates)
+                    .with_context(|| format!("team `{}` tool surface check", runtime.spec.name))?;
             }
         } else {
             tracing::warn!("skip_tool_check=true: phase tools_required not validated");
@@ -444,10 +429,7 @@ impl Orchestrator {
         state: &ProjectState,
     ) -> Option<std::borrow::Cow<'a, TeamRuntime>> {
         let project_dir = self.paths.project_dir(&state.slug);
-        let override_yaml = project_dir
-            .join(".ccteam")
-            .join("team")
-            .join("team.yaml");
+        let override_yaml = project_dir.join(".ccteam").join("team").join("team.yaml");
         if !override_yaml.exists() {
             return self
                 .team_runtime(&state.team)
@@ -485,8 +467,7 @@ impl Orchestrator {
     /// into the special branch and everything else ran the regular
     /// phase-DAG path.
     pub(crate) fn is_evergreen(&self, team: &str) -> bool {
-        self.team_runtime(team)
-            .is_some_and(|t| t.spec.evergreen)
+        self.team_runtime(team).is_some_and(|t| t.spec.evergreen)
     }
 
     /// V0.2 §6.4 candidate 5: cost policy lookup. Defaults to
@@ -561,9 +542,7 @@ impl Orchestrator {
                 );
                 let pending_path = self.paths.project_pending_inject(slug);
                 pending_inject::save(&pending_path, &pending).with_context(|| {
-                    format!(
-                        "save pending-inject for slug={slug} phase={phase}",
-                    )
+                    format!("save pending-inject for slug={slug} phase={phase}",)
                 })?;
                 tracing::info!(
                     slug,
@@ -590,8 +569,7 @@ impl Orchestrator {
                         .protocol
                         .iter()
                         .filter(|r| {
-                            r.enforce
-                                == crate::team::GoldenRuleEnforcement::PromptDirective
+                            r.enforce == crate::team::GoldenRuleEnforcement::PromptDirective
                         })
                         .filter_map(|r| r.directive.as_deref())
                         .collect();
@@ -634,11 +612,7 @@ impl Orchestrator {
     /// exist, or no sub-skills wrote anything, returns an empty vec.
     /// Public for direct testing (the dispatch path that consumes this
     /// is hard to drive in unit tests because of the tmux dependency).
-    pub fn attachments_for_next_phase(
-        &self,
-        slug: &str,
-        state: &ProjectState,
-    ) -> Vec<String> {
+    pub fn attachments_for_next_phase(&self, slug: &str, state: &ProjectState) -> Vec<String> {
         let Some(prev) = state.phase_history.last() else {
             return Vec::new();
         };
@@ -703,8 +677,8 @@ impl Orchestrator {
             return Ok(Vec::new());
         }
         let mut out = Vec::new();
-        for entry in std::fs::read_dir(dir)
-            .with_context(|| format!("read_dir {}", dir.display()))?
+        for entry in
+            std::fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))?
         {
             let entry = entry?;
             if !entry.file_type()?.is_dir() {
@@ -899,14 +873,8 @@ impl Orchestrator {
                     // time the next phase prompt is built (the prompt
                     // builder pulls in @-attachments from the prior
                     // phase's sub_skills outputs).
-                    if let Some(prev_template) =
-                        team.templates.iter().find(|t| t.name == from)
-                    {
-                        self.run_phase_sub_skills(
-                            &slug.to_string(),
-                            prev_template,
-                            SubSkillTrigger::PhaseDone,
-                        );
+                    if let Some(prev_template) = team.templates.iter().find(|t| t.name == from) {
+                        self.run_phase_sub_skills(slug, prev_template, SubSkillTrigger::PhaseDone);
 
                         // M2.3 follow-up: golden_rules enforcement.
                         // Sub-skills have produced their artifacts;
@@ -924,20 +892,15 @@ impl Orchestrator {
                             && !prev_template.golden_rules.is_empty()
                         {
                             let project_dir = self.paths.project_dir(slug);
-                            match crate::golden_rules::enforce(
-                                prev_template,
-                                &project_dir,
-                            ) {
+                            match crate::golden_rules::enforce(prev_template, &project_dir) {
                                 Ok(report) if !report.is_pass() => {
-                                    if let Err(err) = self
-                                        .handle_golden_rules_violation(
-                                            slug,
-                                            &from,
-                                            &report,
-                                            &mut state,
-                                            &state_path,
-                                        )
-                                    {
+                                    if let Err(err) = self.handle_golden_rules_violation(
+                                        slug,
+                                        &from,
+                                        &report,
+                                        &mut state,
+                                        &state_path,
+                                    ) {
                                         tracing::error!(
                                             slug,
                                             phase = %from,
@@ -969,10 +932,7 @@ impl Orchestrator {
                                         "skipped": report.skipped,
                                         "ts": Utc::now().to_rfc3339(),
                                     });
-                                    let _ = progress::append_event(
-                                        &progress_path,
-                                        &event,
-                                    );
+                                    let _ = progress::append_event(&progress_path, &event);
                                 }
                                 Err(err) => {
                                     // Couldn't even run enforcement —
@@ -1005,10 +965,9 @@ impl Orchestrator {
                     // budget. Best-effort: a missing file is fine.
                     let project_dir = self.paths.project_dir(slug);
                     let retry_path = silence_classifier::retry_path_in(&project_dir);
-                    if let Err(err) = silence_classifier::reset_retry_count(
-                        &retry_path,
-                        &state.current_phase,
-                    ) {
+                    if let Err(err) =
+                        silence_classifier::reset_retry_count(&retry_path, &state.current_phase)
+                    {
                         tracing::warn!(
                             slug,
                             error = %err,
@@ -1057,14 +1016,8 @@ impl Orchestrator {
                         None => Vec::new(),
                     };
 
-                    if let Some(prev_template) =
-                        team.templates.iter().find(|t| t.name == from)
-                    {
-                        self.run_phase_sub_skills(
-                            &slug.to_string(),
-                            prev_template,
-                            SubSkillTrigger::PhaseDone,
-                        );
+                    if let Some(prev_template) = team.templates.iter().find(|t| t.name == from) {
+                        self.run_phase_sub_skills(slug, prev_template, SubSkillTrigger::PhaseDone);
                     }
 
                     state.phase_history.push(PhaseHistoryEntry {
@@ -1102,8 +1055,7 @@ impl Orchestrator {
                         // current_phase stays at `from` so peek/show
                         // surface the *deferred* phase, not a phase the
                         // user hasn't seen yet.
-                        let esc_path =
-                            self.paths.project_ccteam_dir(slug).join("escalation.md");
+                        let esc_path = self.paths.project_ccteam_dir(slug).join("escalation.md");
                         if let Some(parent) = esc_path.parent() {
                             std::fs::create_dir_all(parent)
                                 .with_context(|| format!("create {}", parent.display()))?;
@@ -1147,8 +1099,7 @@ impl Orchestrator {
                     state.phase_state = PhaseState::Idle;
                     state.last_progress_event_at = Some(Utc::now());
                     state.last_event_type = Some("escalate".into());
-                    let esc_path =
-                        self.paths.project_ccteam_dir(slug).join("escalation.md");
+                    let esc_path = self.paths.project_ccteam_dir(slug).join("escalation.md");
                     if let Some(parent) = esc_path.parent() {
                         std::fs::create_dir_all(parent)
                             .with_context(|| format!("create {}", parent.display()))?;
@@ -1183,38 +1134,33 @@ impl Orchestrator {
                     // available when the phase begins. Failures land
                     // in progress.jsonl but never block the phase.
                     if let Some(template) = team.templates.iter().find(|t| t.name == phase) {
-                        self.run_phase_sub_skills(
-                            slug,
-                            template,
-                            SubSkillTrigger::PhaseStart,
-                        );
+                        self.run_phase_sub_skills(slug, template, SubSkillTrigger::PhaseStart);
                     }
                     self.dispatch_phase(slug, &phase)?;
                     let template = team.templates.iter().find(|t| t.name == phase);
-                    let target_state = if team.should_run_auto_loop()
-                        && template.is_some_and(|t| t.auto_loop)
-                    {
-                        // Stop hook (M0.12) drives the loop; orchestrator
-                        // only re-enters on phase_done/escalate.
-                        let t = template.expect("auto_loop branch implies template present");
-                        let project_dir = self.paths.project_dir(slug);
-                        // V0.2 M0.18: re-prompt the assistant with the
-                        // same template-driven inject prompt the dispatch
-                        // path used, so auto-loop iterations see the
-                        // same protocol directives instead of a stripped
-                        // legacy shim.
-                        let prompt = progress::build_phase_prompt_for_template(t, &[]);
-                        let fl = AutoLoopState::new(
-                            slug.to_string(),
-                            prompt,
-                            t.auto_loop_max_iterations,
-                            t.effective_completion_signal(),
-                        );
-                        auto_loop::write(&auto_loop::path_in(&project_dir), &fl)?;
-                        PhaseState::AutoLocked
-                    } else {
-                        PhaseState::InFlight
-                    };
+                    let target_state =
+                        if team.should_run_auto_loop() && template.is_some_and(|t| t.auto_loop) {
+                            // Stop hook (M0.12) drives the loop; orchestrator
+                            // only re-enters on phase_done/escalate.
+                            let t = template.expect("auto_loop branch implies template present");
+                            let project_dir = self.paths.project_dir(slug);
+                            // V0.2 M0.18: re-prompt the assistant with the
+                            // same template-driven inject prompt the dispatch
+                            // path used, so auto-loop iterations see the
+                            // same protocol directives instead of a stripped
+                            // legacy shim.
+                            let prompt = progress::build_phase_prompt_for_template(t, &[]);
+                            let fl = AutoLoopState::new(
+                                slug.to_string(),
+                                prompt,
+                                t.auto_loop_max_iterations,
+                                t.effective_completion_signal(),
+                            );
+                            auto_loop::write(&auto_loop::path_in(&project_dir), &fl)?;
+                            PhaseState::AutoLocked
+                        } else {
+                            PhaseState::InFlight
+                        };
                     state.current_phase = phase;
                     state.phase_state = target_state;
                     state.save(&state_path)?;
@@ -1222,7 +1168,10 @@ impl Orchestrator {
                 }
             }
         }
-        tracing::warn!(slug, "process_project hit MAX_ITERS; possible state-machine bug");
+        tracing::warn!(
+            slug,
+            "process_project hit MAX_ITERS; possible state-machine bug"
+        );
         Ok(state)
     }
 
@@ -1281,8 +1230,7 @@ impl Orchestrator {
         body.push_str(
             "\nfix the underlying issue, then run `ccteam resume <slug>` to retry the phase.\n",
         );
-        std::fs::write(&esc_path, body)
-            .with_context(|| format!("write {}", esc_path.display()))?;
+        std::fs::write(&esc_path, body).with_context(|| format!("write {}", esc_path.display()))?;
 
         let event = serde_json::json!({
             "event": "golden_rules_check",
@@ -1351,11 +1299,7 @@ impl Orchestrator {
     /// via tmux send-keys (idle-aware), and then deleted — exactly
     /// matching the §3.4.5 protocol. Errors per-file are logged; one
     /// bad message must not stall the others.
-    pub fn process_session_inbox(
-        &self,
-        slug: &str,
-        state: &ProjectState,
-    ) -> Result<()> {
+    pub fn process_session_inbox(&self, slug: &str, state: &ProjectState) -> Result<()> {
         let cc = self.paths.project_ccteam_dir(slug);
         let mailbox = SessionMailbox::for_ccteam_dir(&cc);
         let entries = mailbox.list_inbox()?;
@@ -1440,9 +1384,7 @@ impl Orchestrator {
         projects
             .iter()
             .filter(|(_, s)| !self.is_evergreen(&s.team))
-            .filter(|(_, s)| {
-                matches!(s.phase_state, PhaseState::InFlight | PhaseState::AutoLocked)
-            })
+            .filter(|(_, s)| matches!(s.phase_state, PhaseState::InFlight | PhaseState::AutoLocked))
             .count()
     }
 
@@ -1459,14 +1401,13 @@ impl Orchestrator {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<notify::Event>();
 
         // Keep the watcher alive for the duration of the loop.
-        let mut watcher: RecommendedWatcher = notify::recommended_watcher(
-            move |res: notify::Result<notify::Event>| match res {
+        let mut watcher: RecommendedWatcher =
+            notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
                 Ok(event) => {
                     let _ = tx.send(event);
                 }
                 Err(err) => tracing::warn!(?err, "progress watcher error"),
-            },
-        )?;
+            })?;
         watcher
             .watch(&progress_dir, RecursiveMode::Recursive)
             .with_context(|| format!("watch {}", progress_dir.display()))?;
@@ -1522,8 +1463,7 @@ impl Orchestrator {
     async fn poll_tick(&self, tick_count: u64) -> Result<()> {
         let projects = self.discover_projects()?;
         let active_regular = self.count_active_regular(&projects);
-        let total_templates: usize =
-            self.teams.values().map(|t| t.templates.len()).sum();
+        let total_templates: usize = self.teams.values().map(|t| t.templates.len()).sum();
         tracing::debug!(
             tick = tick_count,
             teams = self.teams.len(),
@@ -1538,8 +1478,7 @@ impl Orchestrator {
         // Process meta-agent projects first — they're permanent fixtures
         // and must not be deferred when the regular concurrency cap is
         // reached. Then handle regular projects with the cap.
-        let mut regular_dispatch_budget =
-            MAX_CONCURRENT_PROJECTS.saturating_sub(active_regular);
+        let mut regular_dispatch_budget = MAX_CONCURRENT_PROJECTS.saturating_sub(active_regular);
 
         for (slug, state) in projects {
             self.warn_if_stalled(&slug, &state, now);
@@ -1582,11 +1521,7 @@ impl Orchestrator {
                 // permanent fixtures in the User Interaction Layer
                 // (§6.4 candidate 5).
                 if let Err(err) = self.process_project(&slug, state) {
-                    tracing::error!(
-                        slug,
-                        error = format!("{err:#}"),
-                        "evergreen tick failed",
-                    );
+                    tracing::error!(slug, error = format!("{err:#}"), "evergreen tick failed",);
                 }
                 continue;
             }
@@ -1620,11 +1555,9 @@ impl Orchestrator {
                         regular_dispatch_budget = regular_dispatch_budget.saturating_sub(1);
                     }
                 }
-                Err(err) => tracing::error!(
-                    slug,
-                    error = format!("{err:#}"),
-                    "project tick failed",
-                ),
+                Err(err) => {
+                    tracing::error!(slug, error = format!("{err:#}"), "project tick failed",)
+                }
             }
         }
         Ok(())
@@ -1984,12 +1917,11 @@ impl Orchestrator {
     ) -> Result<()> {
         let project_dir = self.paths.project_dir(slug);
         let cc = project_dir.join(".ccteam");
-        std::fs::create_dir_all(&cc)
-            .with_context(|| format!("create {}", cc.display()))?;
+        std::fs::create_dir_all(&cc).with_context(|| format!("create {}", cc.display()))?;
         let outbox_path = cc.join("needs_attention.outbox.json");
 
-        let pane = capture_pane_tail_from_session(&state.tmux_session, 30, false)
-            .unwrap_or_default();
+        let pane =
+            capture_pane_tail_from_session(&state.tmux_session, 30, false).unwrap_or_default();
         let last_event_summary = last_event.map(LastEventSummary::from_value);
         let reason = format!(
             "F36 pending-inject timeout phase={phase} max_defer_minutes={budget}",
@@ -2019,11 +1951,9 @@ impl Orchestrator {
 
         let pretty = serde_json::to_string_pretty(&payload)?;
         let tmp = outbox_path.with_extension("json.tmp");
-        std::fs::write(&tmp, pretty)
-            .with_context(|| format!("write {}", tmp.display()))?;
-        std::fs::rename(&tmp, &outbox_path).with_context(|| {
-            format!("rename {} -> {}", tmp.display(), outbox_path.display())
-        })?;
+        std::fs::write(&tmp, pretty).with_context(|| format!("write {}", tmp.display()))?;
+        std::fs::rename(&tmp, &outbox_path)
+            .with_context(|| format!("rename {} -> {}", tmp.display(), outbox_path.display()))?;
         tracing::warn!(
             slug,
             phase = %pending.phase,
@@ -2132,8 +2062,7 @@ impl Orchestrator {
             return Ok(());
         }
         let retry_path = silence_classifier::retry_path_in(&project_dir);
-        let mut counter =
-            silence_classifier::load_retry_count(&retry_path, &state.current_phase)?;
+        let mut counter = silence_classifier::load_retry_count(&retry_path, &state.current_phase)?;
         if counter.count >= MAX_LIMBO_RETRY {
             // Cap exhausted — surface as enriched escalate so the
             // meta-agent / user sees we tried and gave up. The
@@ -2210,15 +2139,14 @@ impl Orchestrator {
     ) -> Result<()> {
         let project_dir = self.paths.project_dir(slug);
         let cc = project_dir.join(".ccteam");
-        std::fs::create_dir_all(&cc)
-            .with_context(|| format!("create {}", cc.display()))?;
+        std::fs::create_dir_all(&cc).with_context(|| format!("create {}", cc.display()))?;
         let outbox_path = cc.join("needs_attention.outbox.json");
 
         // Pane tail is best-effort — classifier red line: if tmux is
         // unavailable the outbox still ships, the meta-agent surfaces
         // the rest.
-        let pane = capture_pane_tail_from_session(&state.tmux_session, 30, false)
-            .unwrap_or_default();
+        let pane =
+            capture_pane_tail_from_session(&state.tmux_session, 30, false).unwrap_or_default();
 
         let classification = if limbo_capped {
             "limbo_capped"
@@ -2281,11 +2209,9 @@ impl Orchestrator {
 
         let pretty = serde_json::to_string_pretty(&payload)?;
         let tmp = outbox_path.with_extension("json.tmp");
-        std::fs::write(&tmp, pretty)
-            .with_context(|| format!("write {}", tmp.display()))?;
-        std::fs::rename(&tmp, &outbox_path).with_context(|| {
-            format!("rename {} -> {}", tmp.display(), outbox_path.display())
-        })?;
+        std::fs::write(&tmp, pretty).with_context(|| format!("write {}", tmp.display()))?;
+        std::fs::rename(&tmp, &outbox_path)
+            .with_context(|| format!("rename {} -> {}", tmp.display(), outbox_path.display()))?;
         tracing::warn!(
             slug,
             phase = %state.current_phase,
@@ -2336,8 +2262,7 @@ pub fn build_progress_summary(state: &ProjectState) -> String {
 pub fn append_progress_summary(claude_md: &Path, summary: &str) -> Result<()> {
     use std::io::Write;
     if let Some(parent) = claude_md.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     if !claude_md.exists() {
         std::fs::write(
@@ -2501,9 +2426,8 @@ fn load_team_runtimes(paths: &CcteamPaths) -> Result<HashMap<String, TeamRuntime
         // by the adhoc session layer. Skip phase_dir/template loading
         // for both.
         let (templates, dag) = if spec.evergreen || spec.kind.is_flex() {
-            let dag = Dag::from_templates(&[]).with_context(|| {
-                format!("team `{}` build empty phase DAG", spec.name)
-            })?;
+            let dag = Dag::from_templates(&[])
+                .with_context(|| format!("team `{}` build empty phase DAG", spec.name))?;
             (Vec::new(), dag)
         } else {
             // V0.2 M0.17.2: phase_dir is relative to the team
@@ -2537,9 +2461,8 @@ fn load_team_runtimes(paths: &CcteamPaths) -> Result<HashMap<String, TeamRuntime
                     )
                 })?;
             }
-            let dag = Dag::from_templates(&templates).with_context(|| {
-                format!("team `{}` build phase DAG", spec.name)
-            })?;
+            let dag = Dag::from_templates(&templates)
+                .with_context(|| format!("team `{}` build phase DAG", spec.name))?;
             (templates, dag)
         };
         teams.insert(
@@ -2560,12 +2483,14 @@ fn load_team_runtimes(paths: &CcteamPaths) -> Result<HashMap<String, TeamRuntime
             let templates = load_phase_templates(&phase_dir)?;
             for t in &templates {
                 t.validate_m0().with_context(|| {
-                    format!("legacy dev phase template `{}` failed M0 validation", t.name)
+                    format!(
+                        "legacy dev phase template `{}` failed M0 validation",
+                        t.name
+                    )
                 })?;
             }
             if !templates.is_empty() {
-                let dag = Dag::from_templates(&templates)
-                    .context("legacy dev: build phase DAG")?;
+                let dag = Dag::from_templates(&templates).context("legacy dev: build phase DAG")?;
                 let spec = TeamSpec {
                     name: "dev".into(),
                     aliases: Vec::new(),
@@ -2622,8 +2547,8 @@ fn build_project_team_runtime(
     };
 
     let user_staging = default_user_staging_dir();
-    let ctx = TeamResolveContext::for_orchestrator(&paths.root, &user_staging)
-        .with_project(project_dir);
+    let ctx =
+        TeamResolveContext::for_orchestrator(&paths.root, &user_staging).with_project(project_dir);
 
     let spec = resolve_team(&state.team, &ctx)
         .with_context(|| format!("project-layer resolve team `{}`", state.team))?;
@@ -2661,8 +2586,7 @@ fn build_project_team_runtime(
     } else {
         // Project override carried just team.yaml; reuse user/repo
         // phase markdowns by walking sources skipping the project layer.
-        let fallback_ctx =
-            TeamResolveContext::for_orchestrator(&paths.root, &user_staging);
+        let fallback_ctx = TeamResolveContext::for_orchestrator(&paths.root, &user_staging);
         let fallback_team_dir = TEAM_SOURCES
             .iter()
             .filter_map(|s| s.path_for(&state.team, &fallback_ctx))
@@ -2688,9 +2612,8 @@ fn build_project_team_runtime(
             )
         })?;
     }
-    let dag = Dag::from_templates(&templates).with_context(|| {
-        format!("project-layer team `{}` build phase DAG", spec.name)
-    })?;
+    let dag = Dag::from_templates(&templates)
+        .with_context(|| format!("project-layer team `{}` build phase DAG", spec.name))?;
     Ok(TeamRuntime {
         spec,
         templates,

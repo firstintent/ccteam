@@ -3,9 +3,13 @@
 //! This complements the focused F48-F50 unit/integration suites by
 //! sequencing the new flex surface in one server run:
 //!
-//!   GET /                         -> dashboard renders kind=flex
-//!   GET /project/<slug>           -> flex session cards render
-//!   GET /session/<slug>/<sid>     -> per-session events + harness panel
+//!   GET /                         -> 301 /app/
+//!   GET /api/v1/projects          -> dashboard JSON includes kind=flex
+//!   GET /project/<slug>           -> 301 /app/p/<slug>
+//!   GET /api/v1/projects/<slug>   -> flex session data renders in JSON
+//!   GET /session/<slug>/<sid>     -> 301 /app/p/<slug>/s/<sid>
+//!   GET /api/v1/projects/<slug>/sessions/<sid>
+//!                                  -> per-session events + harness data
 //!   /sse/project/<slug>/<sid>     -> progress event includes sid
 //!   /sse/harness/<slug>/<sid>     -> harness snapshot event arrives
 //!   POST /api/<slug>/<sid>/btw    -> session inbox file lands
@@ -152,41 +156,91 @@ async fn v0_3_1_flex_dashboard_session_sse_harness_and_actions() {
         .build()
         .unwrap();
 
-    let body = reqwest::get(format!("http://{addr}/"))
-        .await
-        .unwrap()
-        .text()
+    let resp = nofollow
+        .get(format!("http://{addr}/"))
+        .send()
         .await
         .unwrap();
-    assert!(body.contains(&slug), "dashboard should list flex project");
-    assert!(
-        body.contains("<code>flex</code>"),
-        "dashboard should show kind"
+    assert_eq!(resp.status(), 301);
+    assert_eq!(
+        resp.headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(""),
+        "/app/",
     );
 
-    let body = reqwest::get(format!("http://{addr}/project/{slug}"))
+    let rows: serde_json::Value = reqwest::get(format!("http://{addr}/api/v1/projects"))
         .await
         .unwrap()
-        .text()
+        .json()
         .await
         .unwrap();
-    assert!(body.contains("Sessions (2)"), "project page body:\n{body}");
-    assert!(body.contains(&format!("/session/{slug}/claude-1")));
-    assert!(body.contains(&format!("/screenshot/{slug}-claude-1.png")));
+    let row = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["slug"] == slug)
+        .expect("dashboard JSON should list flex project");
+    assert_eq!(row["kind"], "flex");
 
-    let body = reqwest::get(format!("http://{addr}/session/{slug}/claude-1"))
-        .await
-        .unwrap()
-        .text()
+    let resp = nofollow
+        .get(format!("http://{addr}/project/{slug}"))
+        .send()
         .await
         .unwrap();
-    assert!(
-        body.contains("Claude Sonnet 4.5"),
-        "session page body:\n{body}"
+    assert_eq!(resp.status(), 301);
+    assert_eq!(
+        resp.headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(""),
+        format!("/app/p/{slug}"),
     );
-    assert!(body.contains("PostToolUse"), "session page body:\n{body}");
-    assert!(body.contains(&format!("/sse/project/{slug}/claude-1")));
-    assert!(body.contains(&format!("/api/{slug}/claude-1/btw")));
+
+    let project: serde_json::Value = reqwest::get(format!("http://{addr}/api/v1/projects/{slug}"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(project["slug"], slug);
+    assert_eq!(project["kind"], "flex");
+    let sessions = project["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 2);
+    assert!(sessions.iter().any(|session| session["sid"] == "claude-1"));
+
+    let resp = nofollow
+        .get(format!("http://{addr}/session/{slug}/claude-1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 301);
+    assert_eq!(
+        resp.headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(""),
+        format!("/app/p/{slug}/s/claude-1"),
+    );
+
+    let session: serde_json::Value = reqwest::get(format!(
+        "http://{addr}/api/v1/projects/{slug}/sessions/claude-1"
+    ))
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(session["harness_snapshot"]["model"], "Claude Sonnet 4.5",);
+    assert!(
+        session["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["event"] == "PostToolUse"),
+        "session JSON should include progress event: {session}",
+    );
 
     let mut progress_lines = open_sse(addr, &format!("/sse/project/{slug}/claude-1")).await;
     tokio::time::sleep(Duration::from_millis(150)).await;

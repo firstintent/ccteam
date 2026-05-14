@@ -3,16 +3,18 @@
 //! Each milestone (M5.1 dashboard / M5.2 SSE + screenshot / M5.3 write
 //! actions) ships its own focused integration suite. This test exists
 //! to catch the *cross-layer regression* the per-milestone tests miss:
-//! the same fixture project must survive a dashboard render, a project
-//! detail render, an SSE event delivery, and a write-action POST in
-//! one sequenced run, with the disk side-effect of the POST observable
-//! afterwards.
+//! the same fixture project must survive the F59 legacy redirects, the
+//! F52 JSON data API used by the SPA, an SSE event delivery, and a
+//! write-action POST in one sequenced run, with the disk side-effect
+//! of the POST observable afterwards.
 //!
 //! The brief (`docs/v0-3/dev-plan.md` §6 #5.1) explicitly orders the
 //! sequence:
 //!
-//!   GET /                  → 200, body mentions slug
-//!   GET /project/<slug>    → 200, body mentions phase
+//!   GET /                  → 301 /app/
+//!   GET /api/v1/projects   → JSON dashboard data mentions slug
+//!   GET /project/<slug>    → 301 /app/p/<slug>
+//!   GET /api/v1/projects/<slug> → JSON detail data mentions phase
 //!   open /sse/project/<slug>, append progress.jsonl line, observe SSE
 //!   POST /api/<slug>/btw   → 303, inbox file lands on disk
 //!
@@ -144,28 +146,56 @@ async fn v0_3_happy_path_dashboard_project_sse_and_btw() {
         .build()
         .unwrap();
 
-    // ── 1. GET / ────────────────────────────────────────────────
-    let resp = reqwest::get(format!("http://{addr}/"))
+    // ── 1. Legacy root redirects; SPA dashboard data comes from JSON ─
+    let resp = nofollow
+        .get(format!("http://{addr}/"))
+        .send()
         .await
         .expect("GET /");
-    assert_eq!(resp.status(), 200, "dashboard must return 200");
-    let body = resp.text().await.unwrap();
-    assert!(
-        body.contains(slug),
-        "dashboard body must list slug {slug}; got:\n{body}",
+    assert_eq!(resp.status(), 301, "legacy dashboard must redirect");
+    assert_eq!(
+        resp.headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(""),
+        "/app/",
     );
 
-    // ── 2. GET /project/<slug> ──────────────────────────────────
-    let resp = reqwest::get(format!("http://{addr}/project/{slug}"))
+    let resp = reqwest::get(format!("http://{addr}/api/v1/projects"))
+        .await
+        .expect("GET /api/v1/projects");
+    assert_eq!(resp.status(), 200, "projects API must return 200");
+    let rows: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["slug"] == slug),
+        "projects API must list slug {slug}; got {rows}",
+    );
+
+    // ── 2. Legacy project path redirects; SPA detail data comes from JSON ─
+    let resp = nofollow
+        .get(format!("http://{addr}/project/{slug}"))
+        .send()
         .await
         .expect("GET /project/<slug>");
-    assert_eq!(resp.status(), 200, "project page must return 200");
-    let body = resp.text().await.unwrap();
-    assert!(body.contains(slug), "project page must mention slug");
-    assert!(
-        body.contains("implement"),
-        "project page must show current_phase=implement; got:\n{body}",
+    assert_eq!(resp.status(), 301, "legacy project page must redirect");
+    assert_eq!(
+        resp.headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(""),
+        format!("/app/p/{slug}"),
     );
+
+    let resp = reqwest::get(format!("http://{addr}/api/v1/projects/{slug}"))
+        .await
+        .expect("GET /api/v1/projects/<slug>");
+    assert_eq!(resp.status(), 200, "project JSON must return 200");
+    let detail: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(detail["slug"], slug);
+    assert_eq!(detail["state"]["current_phase"], "implement");
 
     // ── 3. SSE — append progress.jsonl line, see it on the wire ─
     let mut lines = open_sse(addr, &format!("/sse/project/{slug}")).await;
@@ -195,9 +225,7 @@ async fn v0_3_happy_path_dashboard_project_sse_and_btw() {
 
     // ── 4. POST /api/<slug>/btw — observe inbox side-effect ─────
     let inbox_dir = paths.project_ccteam_dir(slug).join("inbox");
-    let before: usize = fs::read_dir(&inbox_dir)
-        .map(|it| it.count())
-        .unwrap_or(0);
+    let before: usize = fs::read_dir(&inbox_dir).map(|it| it.count()).unwrap_or(0);
 
     let resp = nofollow
         .post(format!("http://{addr}/api/{slug}/btw"))
@@ -219,9 +247,7 @@ async fn v0_3_happy_path_dashboard_project_sse_and_btw() {
     // any scheduler jitter on slow CI.
     let mut after: usize = before;
     for _ in 0..10 {
-        after = fs::read_dir(&inbox_dir)
-            .map(|it| it.count())
-            .unwrap_or(0);
+        after = fs::read_dir(&inbox_dir).map(|it| it.count()).unwrap_or(0);
         if after > before {
             break;
         }

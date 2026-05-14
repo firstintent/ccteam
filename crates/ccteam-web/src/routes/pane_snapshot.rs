@@ -41,7 +41,7 @@ async fn handle_session_pane_snapshot(
 ) -> Response {
     let session_name = match session_name_for_project_session(&app, &slug, &sid) {
         Ok(name) => name,
-        Err(resp) => return resp,
+        Err((status, message)) => return (status, message).into_response(),
     };
     serve_pane_snapshot(slug, Some(sid), session_name).await
 }
@@ -108,27 +108,24 @@ fn session_name_for_project_session(
     app: &AppState,
     slug: &str,
     sid: &str,
-) -> Result<String, Response> {
+) -> Result<String, (StatusCode, String)> {
     let state = ProjectState::load(&app.paths.project_state(slug)).map_err(|err| {
         (
             StatusCode::NOT_FOUND,
             format!("project not found or unreadable: {slug}: {err}"),
         )
-            .into_response()
     })?;
     if state.team_kind != TeamKind::Flex {
         return Err((
             StatusCode::BAD_REQUEST,
             format!("project {slug} is not a flex project"),
-        )
-            .into_response());
+        ));
     }
     let record = state.sessions.get(sid).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
             format!("session not found: {slug}/{sid}"),
         )
-            .into_response()
     })?;
     Ok(record.tmux_session.clone())
 }

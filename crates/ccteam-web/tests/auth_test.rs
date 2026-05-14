@@ -61,7 +61,7 @@ async fn loopback_default_no_token_required_for_root() {
     let paths = fake_paths(tmp.path());
     let state = AppState::with_auth(paths, AuthState::disabled());
     let addr = spawn(state).await;
-    let resp = reqwest::get(&format!("http://{addr}/")).await.unwrap();
+    let resp = reqwest::get(format!("http://{addr}/")).await.unwrap();
     assert_eq!(resp.status(), 200, "auth disabled ⇒ open");
 }
 
@@ -71,7 +71,7 @@ async fn auth_enabled_rejects_missing_authorization() {
     let paths = fake_paths(tmp.path());
     let state = AppState::with_auth(paths, AuthState::enabled(TOKEN_HEX.into()));
     let addr = spawn(state).await;
-    let resp = reqwest::get(&format!("http://{addr}/")).await.unwrap();
+    let resp = reqwest::get(format!("http://{addr}/")).await.unwrap();
     assert_eq!(resp.status(), 401, "no auth header ⇒ 401");
     let body = resp.text().await.unwrap();
     assert!(body.contains("auth required"), "got: {body}");
@@ -84,7 +84,7 @@ async fn auth_enabled_accepts_valid_bearer_header() {
     let state = AppState::with_auth(paths, AuthState::enabled(TOKEN_HEX.into()));
     let addr = spawn(state).await;
     let resp = reqwest::Client::new()
-        .get(&format!("http://{addr}/"))
+        .get(format!("http://{addr}/"))
         .header("Authorization", format!("Bearer ccteam:{TOKEN_HEX}"))
         .send()
         .await
@@ -99,7 +99,7 @@ async fn auth_enabled_rejects_wrong_bearer_token() {
     let state = AppState::with_auth(paths, AuthState::enabled(TOKEN_HEX.into()));
     let addr = spawn(state).await;
     let resp = reqwest::Client::new()
-        .get(&format!("http://{addr}/"))
+        .get(format!("http://{addr}/"))
         .header("Authorization", "Bearer ccteam:nope")
         .send()
         .await
@@ -116,7 +116,7 @@ async fn url_shim_sets_cookie_and_redirects_to_clean_uri() {
     let addr = spawn(state).await;
     let client = nofollow();
     let resp = client
-        .get(&format!(
+        .get(format!(
             "http://{addr}/project/demo?token=ccteam:{TOKEN_HEX}"
         ))
         .send()
@@ -164,13 +164,13 @@ async fn cookie_carries_subsequent_request() {
     // First hit goes through the URL shim; reqwest follows the 303
     // and the cookie store retains the cookie for round 2.
     let resp = client
-        .get(&format!("http://{addr}/?token=ccteam:{TOKEN_HEX}"))
+        .get(format!("http://{addr}/?token=ccteam:{TOKEN_HEX}"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
     // Second hit — no token on the URL — must succeed via cookie.
-    let resp2 = client.get(&format!("http://{addr}/")).send().await.unwrap();
+    let resp2 = client.get(format!("http://{addr}/")).send().await.unwrap();
     assert_eq!(
         resp2.status(),
         200,
@@ -184,9 +184,7 @@ async fn health_endpoint_is_exempt_from_auth() {
     let paths = fake_paths(tmp.path());
     let state = AppState::with_auth(paths, AuthState::enabled(TOKEN_HEX.into()));
     let addr = spawn(state).await;
-    let resp = reqwest::get(&format!("http://{addr}/health"))
-        .await
-        .unwrap();
+    let resp = reqwest::get(format!("http://{addr}/health")).await.unwrap();
     assert_eq!(resp.status(), 200, "/health must not require auth");
 }
 
@@ -198,7 +196,7 @@ async fn url_shim_rejects_wrong_token() {
     let addr = spawn(state).await;
     let client = nofollow();
     let resp = client
-        .get(&format!("http://{addr}/?token=ccteam:wrong"))
+        .get(format!("http://{addr}/?token=ccteam:wrong"))
         .send()
         .await
         .unwrap();

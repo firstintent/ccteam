@@ -219,11 +219,6 @@ test.describe("Mobile keyboard detection and layout", () => {
 
     const scrolledToBottom = await page.evaluate(() => {
       return new Promise<boolean>((resolve) => {
-        const orig = (
-          window as unknown as {
-            __termScrollBottom?: boolean;
-          }
-        ).__termScrollBottom;
         // Watch for scrollTop change on the wterm container
         const wt = document.querySelector(".wterm");
         if (!wt) return resolve(false);
@@ -242,6 +237,7 @@ test.describe("Mobile keyboard detection and layout", () => {
     // Trigger keyboard after setting up observer
     await simulateKeyboardOpen(page, 300);
     // The test is primarily that no crash occurs; scroll observation is best-effort
+    expect(typeof scrolledToBottom).toBe("boolean");
   });
 
   test("small viewport delta below threshold does NOT grow the reservation", async ({

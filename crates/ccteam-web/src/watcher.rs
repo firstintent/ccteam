@@ -121,8 +121,7 @@ impl EventBus {
     /// events and the page still renders.
     pub fn inert() -> Self {
         let (tx, _rx) = broadcast::channel::<ProgressUpdate>(BROADCAST_CAPACITY);
-        let (harness_tx, _hrx) =
-            broadcast::channel::<HarnessSnapshotEvent>(BROADCAST_CAPACITY);
+        let (harness_tx, _hrx) = broadcast::channel::<HarnessSnapshotEvent>(BROADCAST_CAPACITY);
         EventBus { tx, harness_tx }
     }
 
@@ -161,8 +160,7 @@ pub fn spawn_watcher(progress_dir: PathBuf, harness_dir: PathBuf) -> Result<Even
         .with_context(|| format!("create harness dir {}", harness_dir.display()))?;
 
     let (tx, _rx) = broadcast::channel::<ProgressUpdate>(BROADCAST_CAPACITY);
-    let (harness_tx, _hrx) =
-        broadcast::channel::<HarnessSnapshotEvent>(BROADCAST_CAPACITY);
+    let (harness_tx, _hrx) = broadcast::channel::<HarnessSnapshotEvent>(BROADCAST_CAPACITY);
     let bus = EventBus {
         tx: tx.clone(),
         harness_tx: harness_tx.clone(),
@@ -441,17 +439,17 @@ fn initial_watermarks(progress_dir: &Path) -> HashMap<PathBuf, u64> {
 // `(claude|codex)-\d+` suffix; anything else (older static-fixtured
 // filename, future harness type) is dropped with a `tracing::warn!`.
 
-fn run_harness_watcher_thread(
-    harness_dir: PathBuf,
-    tx: broadcast::Sender<HarnessSnapshotEvent>,
-) {
+fn run_harness_watcher_thread(harness_dir: PathBuf, tx: broadcast::Sender<HarnessSnapshotEvent>) {
     let (event_tx, event_rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
     let mut watcher: RecommendedWatcher = match notify::recommended_watcher(move |res| {
         let _ = event_tx.send(res);
     }) {
         Ok(w) => w,
         Err(err) => {
-            tracing::error!(?err, "ccteam-web: harness notify::recommended_watcher init failed");
+            tracing::error!(
+                ?err,
+                "ccteam-web: harness notify::recommended_watcher init failed"
+            );
             return;
         }
     };
@@ -477,10 +475,7 @@ fn run_harness_watcher_thread(
     }
 }
 
-fn handle_harness_fs_event(
-    ev: notify::Event,
-    tx: &broadcast::Sender<HarnessSnapshotEvent>,
-) {
+fn handle_harness_fs_event(ev: notify::Event, tx: &broadcast::Sender<HarnessSnapshotEvent>) {
     let interesting = matches!(ev.kind, EventKind::Modify(_) | EventKind::Create(_));
     if !interesting {
         return;
@@ -563,10 +558,10 @@ fn publish_harness_snapshot(
 /// Split a harness file stem into `(slug, sid)`.
 ///
 /// Match rules (mirrors the writer in `ccteam_core::harness`):
-///   - `_meta-<handle>` → `("_meta-<handle>", "default")` (meta-agent
-///                          project — single session, no real sid)
-///   - `<slug>-<claude|codex>-N` → `(<slug>, <claude|codex>-N)`
-///   - anything else → `None` (drop event)
+/// - `_meta-<handle>` → `("_meta-<handle>", "default")` (meta-agent project,
+///   single session, no real sid)
+/// - `<slug>-<claude|codex>-N` → `(<slug>, <claude|codex>-N)`
+/// - anything else → `None` (drop event)
 pub(crate) fn split_harness_stem(stem: &str) -> Option<(String, String)> {
     if stem.starts_with("_meta-") {
         return Some((stem.to_string(), "default".to_string()));
@@ -587,9 +582,7 @@ pub(crate) fn split_harness_stem(stem: &str) -> Option<(String, String)> {
     // The keyword must be `claude` or `codex`.
     for kw in ["claude", "codex"] {
         let kw_start = kw_end.checked_sub(kw.len())?;
-        if &stem[kw_start..kw_end] == kw
-            && (kw_start == 0 || bytes[kw_start - 1] == b'-')
-        {
+        if &stem[kw_start..kw_end] == kw && (kw_start == 0 || bytes[kw_start - 1] == b'-') {
             if kw_start == 0 {
                 // No slug prefix — invalid (we always expect `<slug>-claude-N`).
                 return None;
@@ -780,9 +773,15 @@ mod tests {
 
     #[test]
     fn is_harness_snapshot_file_filters_correctly() {
-        assert!(is_harness_snapshot_file(Path::new("/x/dev-foo-claude-1.json")));
-        assert!(!is_harness_snapshot_file(Path::new("/x/dev-foo-claude-1.tmp")));
-        assert!(!is_harness_snapshot_file(Path::new("/x/dev-foo-claude-1.json.tmp")));
+        assert!(is_harness_snapshot_file(Path::new(
+            "/x/dev-foo-claude-1.json"
+        )));
+        assert!(!is_harness_snapshot_file(Path::new(
+            "/x/dev-foo-claude-1.tmp"
+        )));
+        assert!(!is_harness_snapshot_file(Path::new(
+            "/x/dev-foo-claude-1.json.tmp"
+        )));
         assert!(!is_harness_snapshot_file(Path::new("/x/notes.md")));
     }
 }

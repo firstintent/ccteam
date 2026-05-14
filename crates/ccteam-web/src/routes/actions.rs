@@ -41,11 +41,12 @@ use std::path::{Component, PathBuf};
 
 use anyhow::{bail, Context};
 use axum::{
+    body,
     extract::{FromRequest, Path, Request, State},
     http::{header, StatusCode},
     response::{IntoResponse, Redirect, Response},
     routing::post,
-    Form, Json, Router,
+    Json, Router,
 };
 use ccteam_core::actions::{self, DecisionInput};
 use ccteam_core::{
@@ -64,6 +65,11 @@ const BTW_MAX: usize = 4000;
 
 /// Maximum length of an `inject_decision` body (chars).
 const DECISION_BODY_MAX: usize = 8000;
+
+/// Form submissions in this surface are tiny (one text field or two
+/// decision fields). Keep the extractor bounded even though the later
+/// field validators enforce the user-facing caps.
+const FORM_BODY_LIMIT: usize = 64 * 1024;
 
 #[derive(Debug, Deserialize)]
 pub struct BtwForm {
@@ -115,10 +121,21 @@ where
                 Ok(Json(value)) => Ok(FormOrJson(value, InputMode::Json)),
                 Err(rejection) => Err(json_error(rejection.status(), &rejection.body_text())),
             },
-            InputMode::Form => match Form::<T>::from_request(req, state).await {
-                Ok(Form(value)) => Ok(FormOrJson(value, InputMode::Form)),
-                Err(rejection) => Err((rejection.status(), rejection.body_text()).into_response()),
-            },
+            InputMode::Form => {
+                let bytes = body::to_bytes(req.into_body(), FORM_BODY_LIMIT)
+                    .await
+                    .map_err(|err| {
+                        (StatusCode::BAD_REQUEST, format!("invalid form body: {err}"))
+                            .into_response()
+                    })?;
+                match serde_urlencoded::from_bytes::<T>(&bytes) {
+                    Ok(value) => Ok(FormOrJson(value, InputMode::Form)),
+                    Err(err) => Err(
+                        (StatusCode::BAD_REQUEST, format!("invalid form body: {err}"))
+                            .into_response(),
+                    ),
+                }
+            }
         }
     }
 }

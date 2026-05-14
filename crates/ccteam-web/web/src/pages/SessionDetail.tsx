@@ -32,6 +32,7 @@ import { EventsLive } from "../components/EventsLive";
 import { HarnessPanel } from "../components/HarnessPanel";
 import { BtwForm } from "../components/BtwForm";
 import { PauseResumeButtons } from "../components/PauseResumeButtons";
+import { TerminalView } from "../components/TerminalView";
 
 function StatusBadge({ cls, label }: { cls: string; label: string }) {
   const suffix = cls.replace(/^badge-/, "");
@@ -102,9 +103,12 @@ export default function SessionDetail() {
   useEffect(() => {
     if (!slug || !sid) return;
     let cancelled = false;
-    setLoading(true);
-    setError(null);
-    setDetail(null);
+    queueMicrotask(() => {
+      if (cancelled) return;
+      setLoading(true);
+      setError(null);
+      setDetail(null);
+    });
     fetchSession(slug, sid)
       .then((data) => {
         if (!cancelled) setDetail(data);
@@ -184,17 +188,11 @@ export default function SessionDetail() {
           sid={detail.sid}
           snapshot={detail.harness_snapshot}
         />
-        {/* TODO(F57): mount <TerminalView /> here. F57 owns
-            useTerminal.ts + TerminalView.tsx and wires the WS PTY
-            relay (F56 backend already shipped). */}
-        <div
-          id="terminal-mount"
-          className="lg:col-span-2 border border-surface-700/40 rounded-md bg-surface-950 min-h-[16rem] flex items-center justify-center"
-        >
-          <span className="text-xs font-mono uppercase tracking-wide text-text-dim">
-            terminal mount — F57
-          </span>
-        </div>
+        <TerminalView
+          slug={detail.slug}
+          sid={detail.sid}
+          className="lg:col-span-2 border border-surface-700/40 rounded-md bg-surface-950 min-h-[16rem]"
+        />
       </div>
 
       {/* BELOW — events + (BTW + outbox). The session-scoped BtwForm

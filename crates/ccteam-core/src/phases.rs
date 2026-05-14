@@ -80,7 +80,7 @@ pub struct PhaseHooks {
 }
 
 /// M2.3: phase-internal user-decision UX (interfaces §5.6.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DecisionMode {
     /// Block phase progress on `AskUserQuestion`. User assumed in-session.
@@ -91,13 +91,8 @@ pub enum DecisionMode {
     Async,
     /// Try `AskUserQuestion` first; fall back to outbox after a short
     /// in-phase timeout. Default.
+    #[default]
     Hybrid,
-}
-
-impl Default for DecisionMode {
-    fn default() -> Self {
-        Self::Hybrid
-    }
 }
 
 /// M2.3: hard-quality rule the orchestrator runs at phase boundary
@@ -313,8 +308,7 @@ impl PhaseTemplate {
     pub fn load(path: &Path) -> Result<Self> {
         let source = std::fs::read_to_string(path)
             .with_context(|| format!("read phase template {}", path.display()))?;
-        Self::parse(&source)
-            .with_context(|| format!("parse phase template {}", path.display()))
+        Self::parse(&source).with_context(|| format!("parse phase template {}", path.display()))
     }
 
     /// Validate phase-template invariants. Method name is preserved as
@@ -360,7 +354,10 @@ impl PhaseTemplate {
         }
         for rule in &self.golden_rules {
             rule.kind().with_context(|| {
-                format!("phase `{}` golden_rule `{}` invalid", self.name, rule.rule_id)
+                format!(
+                    "phase `{}` golden_rule `{}` invalid",
+                    self.name, rule.rule_id
+                )
             })?;
         }
         // V0.2 M0.18: an explicit empty `escalate_grammar_ref: ''` is
@@ -534,7 +531,10 @@ mod tests {
             "body\n",
         );
         let t = PhaseTemplate::parse(src).unwrap();
-        assert_eq!(t.tools_required.subagents, vec!["code-reviewer", "code-architect"]);
+        assert_eq!(
+            t.tools_required.subagents,
+            vec!["code-reviewer", "code-architect"]
+        );
         assert_eq!(t.tools_required.skills, vec!["some-skill"]);
         assert_eq!(t.tools_required.mcp, vec!["playwright"]);
     }
@@ -683,10 +683,7 @@ mod tests {
         );
         let t = PhaseTemplate::parse(src).unwrap();
         let err = t.validate_m0().unwrap_err();
-        assert!(
-            format!("{err:#}").contains("agent_team"),
-            "got: {err:#}",
-        );
+        assert!(format!("{err:#}").contains("agent_team"), "got: {err:#}",);
     }
 
     #[test]
@@ -700,10 +697,7 @@ mod tests {
         );
         let t = PhaseTemplate::parse(src).unwrap();
         let err = t.validate_m0().unwrap_err();
-        assert!(
-            format!("{err:#}").contains("multi_session"),
-            "got: {err:#}",
-        );
+        assert!(format!("{err:#}").contains("multi_session"), "got: {err:#}",);
     }
 
     #[test]
@@ -724,9 +718,8 @@ mod tests {
     #[test]
     fn decision_mode_parses_explicit_sync_async_hybrid() {
         for mode in ["sync", "async", "hybrid"] {
-            let src = format!(
-                "---\nname: x\nparallelism: solo\ndecision_mode: {mode}\n---\nbody\n",
-            );
+            let src =
+                format!("---\nname: x\nparallelism: solo\ndecision_mode: {mode}\n---\nbody\n",);
             let t = PhaseTemplate::parse(&src).unwrap();
             let expected = match mode {
                 "sync" => DecisionMode::Sync,
@@ -772,8 +765,12 @@ mod tests {
         let t = PhaseTemplate::parse(src).unwrap();
         t.validate_m0().unwrap();
         assert_eq!(t.golden_rules.len(), 2);
-        assert!(matches!(t.golden_rules[0].kind().unwrap(), GoldenRuleKind::Cmd(c) if c.starts_with("cargo")));
-        assert!(matches!(t.golden_rules[1].kind().unwrap(), GoldenRuleKind::Pattern(p) if p.contains("AWS_SECRET")));
+        assert!(
+            matches!(t.golden_rules[0].kind().unwrap(), GoldenRuleKind::Cmd(c) if c.starts_with("cargo"))
+        );
+        assert!(
+            matches!(t.golden_rules[1].kind().unwrap(), GoldenRuleKind::Pattern(p) if p.contains("AWS_SECRET"))
+        );
     }
 
     #[test]
@@ -790,22 +787,14 @@ mod tests {
         );
         let t = PhaseTemplate::parse(src).unwrap();
         let err = t.validate_m0().unwrap_err();
-        assert!(
-            format!("{err:#}").contains("confused"),
-            "got: {err:#}",
-        );
+        assert!(format!("{err:#}").contains("confused"), "got: {err:#}",);
     }
 
     // ---------------- V0.2 M0.18 inject-prompt frontmatter ----------------
 
     #[test]
     fn m018_completion_signal_defaults_to_phase_done_phase_when_omitted() {
-        let src = concat!(
-            "---\n",
-            "name: implement\n",
-            "parallelism: solo\n",
-            "---\n",
-        );
+        let src = concat!("---\n", "name: implement\n", "parallelism: solo\n", "---\n",);
         let t = PhaseTemplate::parse(src).unwrap();
         assert_eq!(t.effective_completion_signal(), "PHASE_DONE: implement");
     }
@@ -940,9 +929,6 @@ mod tests {
         );
         let t = PhaseTemplate::parse(src).unwrap();
         let err = t.validate_m0().unwrap_err();
-        assert!(
-            format!("{err:#}").contains("empty_rule"),
-            "got: {err:#}",
-        );
+        assert!(format!("{err:#}").contains("empty_rule"), "got: {err:#}",);
     }
 }

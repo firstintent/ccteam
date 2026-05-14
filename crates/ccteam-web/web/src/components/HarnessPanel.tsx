@@ -40,7 +40,10 @@ function useHarnessSnapshotStream(
   const [connected, setConnected] = useState(false);
   const [lastError, setLastError] = useState<string | null>(null);
   const cbRef = useRef(onSnapshot);
-  cbRef.current = onSnapshot;
+
+  useEffect(() => {
+    cbRef.current = onSnapshot;
+  }, [onSnapshot]);
 
   useEffect(() => {
     if (!slug || !sid) return;
@@ -141,7 +144,13 @@ export function HarnessPanel({ slug, sid, snapshot }: Props) {
   // refetch on slug/sid change), reset local state so we don't show
   // stale data from the previous session.
   useEffect(() => {
-    setLive(snapshot);
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (!cancelled) setLive(snapshot);
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [snapshot, slug, sid]);
 
   const { connected, lastError } = useHarnessSnapshotStream(slug, sid, (snap) =>

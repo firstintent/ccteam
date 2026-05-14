@@ -135,9 +135,15 @@ export function useProgressStream(
       esRef.current?.close();
       esRef.current = null;
       retryCountRef.current = 0;
-      setConnected(false);
-      setLastError(null);
-      return;
+      let cancelled = false;
+      queueMicrotask(() => {
+        if (cancelled) return;
+        setConnected(false);
+        setLastError(null);
+      });
+      return () => {
+        cancelled = true;
+      };
     }
 
     const url = scopeUrl(scope);

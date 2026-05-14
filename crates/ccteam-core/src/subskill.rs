@@ -132,9 +132,9 @@ impl SubSkillRunner for ClaudePRunner {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
-        let mut child = cmd.spawn().with_context(|| {
-            format!("spawn sub-skill runner {:?}", self.argv)
-        })?;
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("spawn sub-skill runner {:?}", self.argv))?;
         if let Some(mut stdin) = child.stdin.take() {
             use std::io::Write;
             stdin
@@ -178,9 +178,7 @@ pub fn resolve_skill_path(skill: &str, project_dir: &Path) -> Option<PathBuf> {
         // `claude-plugins-official:<plugin>/<rel>` →
         // `~/.claude/plugins/marketplaces/claude-plugins-official/plugins/<plugin>/<rel>`
         let claude = user_claude_dir().ok()?;
-        let mut parts = rest.splitn(2, '/');
-        let plugin = parts.next()?;
-        let rel = parts.next()?;
+        let (plugin, rel) = rest.split_once('/')?;
         let mut p = claude
             .join("plugins")
             .join("marketplaces")
@@ -310,8 +308,7 @@ fn run_one(
     };
     let output_path = project_dir.join(&spec.output_to);
     if let Some(parent) = output_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     std::fs::write(&output_path, body.as_bytes())
         .with_context(|| format!("write sub-skill output {}", output_path.display()))?;
@@ -444,7 +441,10 @@ mod tests {
             &progress,
             &runner,
         );
-        assert!(outs.is_empty(), "phase_start spec must not run on phase_done");
+        assert!(
+            outs.is_empty(),
+            "phase_start spec must not run on phase_done"
+        );
         assert!(!project.join(".ccteam/precheck.md").exists());
     }
 
@@ -467,7 +467,10 @@ mod tests {
             &progress,
             &runner,
         );
-        assert!(outs.is_empty(), "installed: prefix should be skipped (not run)");
+        assert!(
+            outs.is_empty(),
+            "installed: prefix should be skipped (not run)"
+        );
         let evs = std::fs::read_to_string(&progress).unwrap();
         assert!(evs.contains("subskill_skipped"));
     }
@@ -497,7 +500,10 @@ mod tests {
             &progress,
             &ErrRunner,
         );
-        assert!(outs.is_empty(), "failed runner must not produce an output path");
+        assert!(
+            outs.is_empty(),
+            "failed runner must not produce an output path"
+        );
         let evs = std::fs::read_to_string(&progress).unwrap();
         assert!(evs.contains("subskill_failed"));
     }

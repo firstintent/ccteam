@@ -11,9 +11,8 @@ WebSocket PTY relay 协议,数据层重写以贴 ccteam 的 flex + workflow +
 harness 模型。
 
 base = `origin/main` `10634c0`(V0.3.1 ship 终点)。workspace.version
-`0.3.1` → `0.3.2`(F59 bump)。Rust 测试 baseline `833/0`(F52-F58
-增量未运行,**待用户跑 `cargo test --workspace` 验证**;预期红的测试
-见下文 "已知 follow-up")。
+`0.3.1` → `0.3.2`(F59 bump)。Rust 测试 baseline 已验证为
+`866/0`(`cargo test --workspace --locked`,F59 follow-up 后)。
 
 ## §3 已 lock 的 scope 决策(2026-05-11 用户 confirm)
 
@@ -95,39 +94,32 @@ base = `origin/main` `10634c0`(V0.3.1 ship 终点)。workspace.version
 - **legacy htmx assets 清理**(`assets/htmx.min.js` 等)— V0.3.3
   (TODO marker 已埋在 `crates/ccteam-web/src/routes/assets.rs`)
 
-## 已知 follow-up(用户跑测试前先看)
+## F59 verification follow-up(2026-05-14)
 
-F59 ship 没有运行 `cargo test --workspace`,以下几类测试**预期会红**,
-下一轮 cycle 处理:
+F59 ship 后的验证缺口已补齐:
 
-1. **`crates/ccteam-web/tests/dashboard_test.rs`** — `GET /` 多处断言
-   HTML body(`"Projects"` heading / `<th>Kind</th>` / `<code>workflow
-   </code>` 等)。F59 改 301 后 status 不再是 200,body 不再是 HTML。
-   需改为断言 `status == 301` + `Location: /app/`,或迁到
-   `tests/api_v1_test.rs` 同等断言走 JSON。
-2. **`crates/ccteam-web/tests/project_test.rs`** — 多处 `GET /project/<slug>`
-   原断言 HTML body 内容,新路径返回 301 + 空 body。需改为断言
-   `status == 301` + `Location: /app/p/<slug>` header。
-3. **`crates/ccteam-web/tests/e2e_test.rs`** + **`flex_e2e_test.rs`** —
-   `GET /project/<slug>` 断言 `body mentions phase` 段失效;同上改为
-   301 断言即可,JSON 等价断言已在 api_v1_test.rs 覆盖。
-4. **`crates/ccteam-web/tests/actions_test.rs`** — 文件顶 doc-comment 写
-   "303 See Other → `/project/<slug>`",F58 已切到 JSON `{"ok":true}`,
-   doc-comment 仅需更新(实际 assertion 应已是 JSON)。
-5. **AoE-fork web 单测**(`crates/ccteam-web/web/...`,vitest /
-   playwright)— `Toasts` 的 SW-message handler 已删,`sessionId` 路径已删,
-   相关 vitest 断言(若有)需要更新或删除。`npm run build` 应能过(orphan
-   清理后 import 链已闭合)。
-6. **`askama` workspace dep** — F59 后没有任何 live `#[derive(Template)]`
-   引用它,`cargo build` 会带个 unused-dep warning(非 error)。`templates/
-   base.html` 还在,所以 dep 保留;V0.3.3 若移除 `base.html`,顺手把
-   `askama = "0.12"` 从 `Cargo.toml` workspace deps 与
-   `crates/ccteam-web/Cargo.toml` `[dependencies]` 都清掉。
+- Rust workspace:`cargo build --workspace --locked` + `cargo test
+  --workspace --locked` 通过;测试 baseline `866/0`。
+- SPA toolchain:`npm install --no-audit --no-fund`、`npm run build`、
+  `npm run lint`、`npm run test:unit`、`npm test` 通过。
+- `Cargo.lock` 同步 V0.3.2 version bump + `rust-embed` / `mime_guess`
+  / `serde_urlencoded`;`web/package-lock.json` 落档以符合 `.npmrc`
+  的 pin exact versions 约束。
+- Legacy route tests 已按 F59 合约改为 `301 Location: /app/...`;
+  data/body 覆盖转到 F52 JSON API + V0.3.2 Playwright smoke。
+- `/app/` 精确入口已补上,避免 `/` 301 后落 404。
+- 裸 `POST /api/<slug>/{pause,resume}` 无 `Content-Type` 的 form
+  兼容路径已恢复 303 合约;SPA JSON `{}` 路径保持 `{"ok":true}`。
+- Session detail 已挂载 `TerminalView`,覆盖 F57 xterm/WS PTY 用户面。
+- 默认 Playwright gate 收敛为 ccteam-owned `v032-spa.spec.ts`;
+  AoE fork specs 暂留作参考,后续 surface promoted 时再逐项启用。
+
+仍 deferred 到 V0.3.3/V0.4 的项见上节"V0.3.3 / V0.4 deferred 项"。
 
 ## 跟其他文档关系
 
-- 主仓 `CLAUDE.md` §一 baseline 已由 F59 回填(0.3.1 → 0.3.2,V0.3.2
-  milestone 行;测试数留 `**待用户跑 cargo test 验证**` 占位);§三
+- 主仓 `CLAUDE.md` §一 baseline 已由 F59 follow-up 回填(0.3.1 → 0.3.2,
+  V0.3.2 milestone 行;测试 baseline `866/0`);§三
   红线 V0.3.2 不动(progress.jsonl SoT / 永不主动 kill / ccteam-core
   无 team 名字面量)。
 - `docs/interfaces.md` §16 — F52 JSON API endpoints + WS PTY

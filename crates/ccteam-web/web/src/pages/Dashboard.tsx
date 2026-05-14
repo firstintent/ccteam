@@ -164,20 +164,27 @@ export default function Dashboard() {
     }
     const targetSlug = latestEvent.slug;
     const targetTs = latestEvent.ts;
-    setRows((prev) => {
-      if (!prev) return prev;
-      let hit = false;
-      const next = prev.map((r) => {
-        if (r.slug !== targetSlug) return r;
-        hit = true;
-        return { ...r, last_event_label: formatRelative(targetTs) };
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (cancelled) return;
+      setRows((prev) => {
+        if (!prev) return prev;
+        let hit = false;
+        const next = prev.map((r) => {
+          if (r.slug !== targetSlug) return r;
+          hit = true;
+          return { ...r, last_event_label: formatRelative(targetTs) };
+        });
+        // Avoid creating a new array (and rerender) if no row matched —
+        // common case: a project the dashboard hasn't fetched yet because
+        // it was created after the SSE stream opened. F54 doesn't refresh
+        // on insert; the user reloads to see new projects.
+        return hit ? next : prev;
       });
-      // Avoid creating a new array (and rerender) if no row matched —
-      // common case: a project the dashboard hasn't fetched yet because
-      // it was created after the SSE stream opened. F54 doesn't refresh
-      // on insert; the user reloads to see new projects.
-      return hit ? next : prev;
     });
+    return () => {
+      cancelled = true;
+    };
   }, [latestEvent]);
 
   const cards = useMemo(() => rows ?? [], [rows]);

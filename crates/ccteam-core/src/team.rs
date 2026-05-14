@@ -96,21 +96,16 @@ impl TeamKind {
 /// Default `cmd_check` keeps every M3.x team.yaml that listed flat
 /// `golden_rules` working — they continue to mean "run this command
 /// at phase boundary".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum GoldenRuleEnforcement {
     /// Run `cmd` / match `pattern` at phase_done boundary; non-zero
     /// exit / regex hit blocks the transition.
+    #[default]
     CmdCheck,
     /// Inject `directive` into the phase's inject prompt; no runtime
     /// enforcement — the assistant is expected to honor it.
     PromptDirective,
-}
-
-impl Default for GoldenRuleEnforcement {
-    fn default() -> Self {
-        Self::CmdCheck
-    }
 }
 
 /// V0.2 M0.18: a `protocol` golden rule. Unlike the phase-level
@@ -267,21 +262,16 @@ pub struct CriticDimensionSpec {
     pub rubric: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum CriticStrictness {
     /// At least one comment of any level passes anti-leniency.
     Lenient,
     /// At least one CONCERN or BLOCK passes anti-leniency.
+    #[default]
     Normal,
     /// Must have at least one BLOCK to pass anti-leniency.
     Strict,
-}
-
-impl Default for CriticStrictness {
-    fn default() -> Self {
-        Self::Normal
-    }
 }
 
 /// M3.2: a team-specific ESCALATE prefix the Stop hook should treat as
@@ -568,8 +558,8 @@ impl TeamSpec {
     /// ~/.ccteam/" layout. `validate()` then runs against the
     /// rewritten spec.
     pub fn parse(source: &str) -> Result<Self> {
-        let mut spec: TeamSpec = serde_yaml::from_str(source)
-            .context("team.yaml does not match schema")?;
+        let mut spec: TeamSpec =
+            serde_yaml::from_str(source).context("team.yaml does not match schema")?;
         spec.normalize_legacy_phase_dir();
         spec.validate()?;
         Ok(spec)
@@ -579,8 +569,7 @@ impl TeamSpec {
     pub fn load(path: &Path) -> Result<Self> {
         let source = std::fs::read_to_string(path)
             .with_context(|| format!("read team.yaml at {}", path.display()))?;
-        Self::parse(&source)
-            .with_context(|| format!("parse team.yaml at {}", path.display()))
+        Self::parse(&source).with_context(|| format!("parse team.yaml at {}", path.display()))
     }
 
     /// V0.2 M0.17.2: rewrite legacy `phase_dir: phases-<team>` to
@@ -642,9 +631,7 @@ impl TeamSpec {
                 .chars()
                 .any(|c| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_'))
             {
-                bail!(
-                    "team.yaml: alias `{alias}` must be ascii lower / digit / `-` / `_`",
-                );
+                bail!("team.yaml: alias `{alias}` must be ascii lower / digit / `-` / `_`",);
             }
             if alias == &self.name {
                 bail!(
@@ -738,7 +725,7 @@ impl TeamSpec {
                 ));
             }
             if matches!(ext.route, EscalateRoute::RevertToPhase)
-                && ext.target_phase.as_deref().map_or(true, str::is_empty)
+                && ext.target_phase.as_deref().is_none_or(str::is_empty)
             {
                 bail!(
                     "team.yaml: escalate prefix `{}` has route revert_to_phase but no target_phase",
@@ -1017,7 +1004,10 @@ mod tests {
         let ldiff = &spec.escalate_grammar_extensions[2];
         assert_eq!(ldiff.prefix, "LOW_DIFFERENTIATION");
         assert_eq!(ldiff.route, EscalateRoute::RevertToPhase);
-        assert_eq!(ldiff.target_phase.as_deref(), Some("differentiation-analysis"));
+        assert_eq!(
+            ldiff.target_phase.as_deref(),
+            Some("differentiation-analysis")
+        );
     }
 
     #[test]
@@ -1184,7 +1174,11 @@ mod tests {
         let rule = &spec.golden_rules.protocol[0];
         assert_eq!(rule.rule_id, "forbid_ask_user_question");
         assert_eq!(rule.enforce, GoldenRuleEnforcement::PromptDirective);
-        assert!(rule.directive.as_deref().unwrap().contains("AskUserQuestion"));
+        assert!(rule
+            .directive
+            .as_deref()
+            .unwrap()
+            .contains("AskUserQuestion"));
         // It's a prompt-only rule, not a cmd-check.
         assert!(spec.golden_rules.as_cmd_check_rules().is_empty());
     }
@@ -1545,11 +1539,7 @@ mod tests {
     fn f47_sessions_field_harness_defaults_to_claude_when_omitted() {
         // `{sid: claude-1}` without an explicit `harness:` key parses
         // and resolves to HarnessKind::Claude (matches `Default` impl).
-        let src = concat!(
-            "name: my-flex\n",
-            "sessions:\n",
-            "  - sid: claude-1\n",
-        );
+        let src = concat!("name: my-flex\n", "sessions:\n", "  - sid: claude-1\n",);
         let spec = TeamSpec::parse(src).unwrap();
         assert_eq!(spec.sessions[0].harness, HarnessKind::Claude);
     }

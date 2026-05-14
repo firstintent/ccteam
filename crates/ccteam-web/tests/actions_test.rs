@@ -62,7 +62,7 @@ async fn post_btw_writes_inbox_file_and_redirects() {
     let addr = spawn(state).await;
     let client = nofollow();
     let resp = client
-        .post(&format!("http://{addr}/api/demo/btw"))
+        .post(format!("http://{addr}/api/demo/btw"))
         .form(&[("text", "hello from web")])
         .send()
         .await
@@ -92,7 +92,7 @@ async fn post_btw_rejects_empty_text() {
     let state = AppState::new(paths);
     let addr = spawn(state).await;
     let resp = reqwest::Client::new()
-        .post(&format!("http://{addr}/api/demo/btw"))
+        .post(format!("http://{addr}/api/demo/btw"))
         .form(&[("text", "")])
         .send()
         .await
@@ -109,7 +109,7 @@ async fn post_btw_rejects_overlong_text() {
     let addr = spawn(state).await;
     let big = "x".repeat(5000);
     let resp = reqwest::Client::new()
-        .post(&format!("http://{addr}/api/demo/btw"))
+        .post(format!("http://{addr}/api/demo/btw"))
         .form(&[("text", big.as_str())])
         .send()
         .await
@@ -128,7 +128,7 @@ async fn post_inject_decision_writes_file_under_ccteam_dir() {
     let addr = spawn(state).await;
     let client = nofollow();
     let resp = client
-        .post(&format!("http://{addr}/api/demo/inject_decision"))
+        .post(format!("http://{addr}/api/demo/inject_decision"))
         .form(&[
             ("path", target.display().to_string().as_str()),
             ("body", "**META-AGENT DECISION**: ship\n"),
@@ -150,7 +150,7 @@ async fn post_inject_decision_rejects_path_outside_ccteam_dir() {
     let state = AppState::new(paths);
     let addr = spawn(state).await;
     let resp = reqwest::Client::new()
-        .post(&format!("http://{addr}/api/demo/inject_decision"))
+        .post(format!("http://{addr}/api/demo/inject_decision"))
         .form(&[("path", "/etc/passwd"), ("body", "evil")])
         .send()
         .await
@@ -170,7 +170,7 @@ async fn post_inject_decision_rejects_dotdot_traversal() {
     let state = AppState::new(paths);
     let addr = spawn(state).await;
     let resp = reqwest::Client::new()
-        .post(&format!("http://{addr}/api/demo/inject_decision"))
+        .post(format!("http://{addr}/api/demo/inject_decision"))
         .form(&[("path", raw.as_str()), ("body", "evil")])
         .send()
         .await
@@ -189,7 +189,7 @@ async fn post_pause_sets_user_pause_pending() {
     let addr = spawn(state).await;
     let client = nofollow();
     let resp = client
-        .post(&format!("http://{addr}/api/demo/pause"))
+        .post(format!("http://{addr}/api/demo/pause"))
         .send()
         .await
         .unwrap();
@@ -216,7 +216,7 @@ async fn post_resume_clears_user_pause_pending() {
     let addr = spawn(state).await;
     let client = nofollow();
     let resp = client
-        .post(&format!("http://{addr}/api/demo/resume"))
+        .post(format!("http://{addr}/api/demo/resume"))
         .send()
         .await
         .unwrap();
@@ -232,7 +232,7 @@ async fn post_btw_for_unknown_slug_returns_4xx() {
     let state = AppState::new(paths);
     let addr = spawn(state).await;
     let resp = reqwest::Client::new()
-        .post(&format!("http://{addr}/api/missing/btw"))
+        .post(format!("http://{addr}/api/missing/btw"))
         .form(&[("text", "hi")])
         .send()
         .await

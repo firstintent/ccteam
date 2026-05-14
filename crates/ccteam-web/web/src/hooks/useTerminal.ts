@@ -136,6 +136,7 @@ export function useTerminal(
 
   useEffect(() => {
     if (!slug || !containerRef.current) return;
+    const activeSlug = slug;
 
     // Clean up previous instance
     wsRef.current?.close();
@@ -451,7 +452,7 @@ export function useTerminal(
       // F56 endpoint: /ws/<slug>/pty or /ws/<slug>/<sid>/pty. Auth
       // travels in the same `ccteam_token` cookie the SPA already
       // carries (auth_layer extracts before WebSocketUpgrade).
-      const url = ptyUrlFor(slug, sid);
+      const url = ptyUrlFor(activeSlug, sid ?? undefined);
       const ws = new WebSocket(url, [PTY_SUBPROTOCOL]);
       ws.binaryType = "arraybuffer";
       wsRef.current = ws;

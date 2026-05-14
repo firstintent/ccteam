@@ -3,10 +3,10 @@
 //! Mirrors the M5.2 `routes/sse.rs` shape, but pulls from the sibling
 //! [`crate::watcher::EventBus::subscribe_harness`] channel:
 //!
-//! - `GET /sse/harness/<slug>`            — every harness snapshot for any
-//!                                          sid under <slug>
-//! - `GET /sse/harness/<slug>/<sid>`      — only snapshots for the
-//!                                          requested (slug, sid) pair
+//! - `GET /sse/harness/<slug>` — every harness snapshot for any sid under
+//!   `<slug>`.
+//! - `GET /sse/harness/<slug>/<sid>` — only snapshots for the requested
+//!   `(slug, sid)` pair.
 //!
 //! Wire format (per dev-plan §2.3):
 //!
@@ -49,10 +49,7 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/sse/harness/{slug}", get(handle_sse_harness_all))
-        .route(
-            "/sse/harness/{slug}/{sid}",
-            get(handle_sse_harness_session),
-        )
+        .route("/sse/harness/{slug}/{sid}", get(handle_sse_harness_session))
 }
 
 async fn handle_sse_harness_all(
@@ -64,9 +61,7 @@ async fn handle_sse_harness_all(
     let stream = BroadcastStream::new(rx).flat_map(move |item| {
         let target = target.clone();
         match item {
-            Ok(update) if update.slug == target => {
-                stream::iter(vec![Ok(harness_event(&update))])
-            }
+            Ok(update) if update.slug == target => stream::iter(vec![Ok(harness_event(&update))]),
             Ok(_) => stream::iter(vec![]),
             Err(err) => stream::iter(vec![Ok(reconnect_hint(&format!("{err}")))]),
         }
