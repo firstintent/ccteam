@@ -41,6 +41,10 @@ use ccteam_core::{
 };
 
 use crate::commands::{collect_projects, collect_recent_events, run_peek, run_show, OutputFormat};
+// V0.4.0 F65 — 7 new workflow tools. Schemas + handlers live in a
+// dedicated module so `mcp_serve.rs` stays focused on the M2.5 protocol
+// surface.
+use crate::mcp_workflow_tools;
 
 /// Stable MCP protocol version this server speaks. Newer client versions
 /// downgrade gracefully because we never advertise capabilities we don't
@@ -139,10 +143,14 @@ fn tools_list_response() -> Value {
     json!({ "tools": tool_definitions() })
 }
 
-/// Single source of truth for the 9-tool surface. Schemas mirror
-/// interfaces.md §12.2.
+/// Single source of truth for the MCP tool surface. M2.5 shipped 9
+/// tools; V0.2.2 F38 added `ccteam__screenshot` → 10; V0.4.0 F65 adds
+/// 7 workflow-control tools (`spawn_agent` / `stop_agent` /
+/// `observe_agents` / `signal` / `set_parallelism` / `trigger_gate` /
+/// `get_artifact_summary`) → 17 total. Schemas mirror interfaces.md
+/// §12.2.
 fn tool_definitions() -> Vec<Value> {
-    vec![
+    let mut tools: Vec<Value> = vec![
         // Read-only inspection.
         json!({
             "name": "ccteam__ls",
@@ -241,7 +249,10 @@ fn tool_definitions() -> Vec<Value> {
                 "required": ["slug"],
             }),
         }),
-    ]
+    ];
+    // V0.4.0 F65 — append the 7 workflow-control tools.
+    tools.extend(mcp_workflow_tools::workflow_tool_definitions());
+    tools
 }
 
 fn object_schema(props: &[(&str, &str, &str)]) -> Value {
@@ -289,7 +300,23 @@ async fn call_tool(paths: &CcteamPaths, params: &Value) -> Result<Vec<Value>> {
             Ok(text_content(tool_inject_decision(paths, &args)?))
         }
         "ccteam__screenshot" => Ok(text_content(tool_screenshot(paths, &args)?)),
-        other => Err(anyhow!("unknown tool: {other}")),
+        // V0.4.0 F65 — route the 7 workflow tools through the
+        // dedicated dispatcher. Mutating tools (spawn / stop / signal /
+        // set_parallelism / trigger_gate) gate on a live daemon
+        // heartbeat so a dead orchestrator surfaces immediately rather
+        // than silently swallowing marker writes that no one consumes.
+        // Read-only tools (observe_agents / get_artifact_summary) stay
+        // daemon-independent so the meta-agent can inspect a stopped
+        // project.
+        other => {
+            if mcp_workflow_tools::requires_daemon(other) {
+                require_healthy_daemon(paths)?;
+            }
+            match mcp_workflow_tools::dispatch(paths, other, &args)? {
+                Some(body) => Ok(text_content(body)),
+                None => Err(anyhow!("unknown tool: {other}")),
+            }
+        }
     }
 }
 
@@ -636,8 +663,9 @@ mod tests {
     #[test]
     fn tool_definitions_count_matches_spec() {
         // M2.5 brief: 9 tools. V0.2.2 F38 adds `ccteam__screenshot` →
-        // 10 total. Bump this when a new tool lands.
-        assert_eq!(tool_definitions().len(), 10);
+        // 10. V0.4.0 F65 adds 7 workflow tools → 17 total. Bump this
+        // when a new tool lands.
+        assert_eq!(tool_definitions().len(), 17);
     }
 
     #[test]
@@ -646,7 +674,7 @@ mod tests {
         let mut names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), 10, "tool names must be unique");
+        assert_eq!(names.len(), 17, "tool names must be unique");
         for tool in &tools {
             assert!(tool["name"].as_str().unwrap().starts_with("ccteam__"));
             assert_eq!(tool["inputSchema"]["type"], "object");
@@ -746,6 +774,7 @@ mod tests {
     #[tokio::test]
     async fn handle_tools_list_returns_full_tool_set() {
         // M2.5: 9 tools. V0.2.2 F38: +1 (`ccteam__screenshot`) → 10.
+        // V0.4.0 F65: +7 workflow tools → 17.
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = CcteamPaths {
             root: tmp.path().join("home"),
@@ -759,9 +788,12 @@ mod tests {
         });
         let resp = handle_request(&paths, &req).await.unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 17);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"ccteam__screenshot"));
+        // V0.4.0 F65 — spot-check one of the new tools is in the list.
+        assert!(names.contains(&"ccteam__spawn_agent"));
+        assert!(names.contains(&"ccteam__get_artifact_summary"));
     }
 
     #[tokio::test]
