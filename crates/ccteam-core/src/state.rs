@@ -79,12 +79,21 @@ pub struct PhaseHistoryEntry {
 
 /// V0.3.1 F49 — one registered harness session in a flex project's
 /// master `state.json::sessions` map.
+///
+/// V0.4.0 F61 added `job_id` for the Claude Code `--bg` background-job
+/// id. Codex rows leave it `None`; old state.json files written before
+/// F61 also deserialize with `None` (serde default), keeping the
+/// upgrade path migration-free.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub harness: HarnessKind,
     pub tmux_session: String,
     pub started_at: DateTime<Utc>,
     pub pid: Option<u32>,
+    /// V0.4.0 F61 — Claude Code background-job id. `None` for codex
+    /// sessions and for legacy rows written before F61.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
 }
 
 /// Project-level state, persisted as `~/projects/<slug>/.ccteam/state.json`.

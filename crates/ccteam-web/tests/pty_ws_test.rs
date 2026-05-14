@@ -101,6 +101,7 @@ fn fixture_flex_session(paths: &CcteamPaths, slug: &str, sid: &str, tmux_session
             tmux_session: tmux_session.to_string(),
             started_at: now,
             pid: None,
+            job_id: None,
         },
     );
     state.sessions = sessions;

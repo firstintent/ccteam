@@ -127,6 +127,7 @@ async fn v0_3_1_flex_dashboard_session_sse_harness_and_actions() {
                 tmux_session: format!("ccteam-{slug}-{sid}"),
                 started_at: chrono::Utc::now(),
                 pid: None,
+                job_id: None,
             },
         );
     }
@@ -341,6 +342,7 @@ fn v0_4_0_codex_adapter_is_no_longer_trait_stub() {
         slug: "flex-e2e".into(),
         sid: "codex-1".into(),
         cwd: std::env::temp_dir(),
+        role: String::new(),
         extra_args: Vec::new(),
     };
 }

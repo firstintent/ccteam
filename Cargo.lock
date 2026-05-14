@@ -352,6 +352,7 @@ dependencies = [
  "image",
  "imageproc",
  "indexmap",
+ "libc",
  "notify",
  "regex",
  "serde",

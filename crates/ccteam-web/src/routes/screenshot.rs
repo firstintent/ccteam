@@ -205,6 +205,7 @@ mod tests {
                 tmux_session: "ccteam-dev-flex-claude-1".into(),
                 started_at: Utc::now(),
                 pid: None,
+                job_id: None,
             },
         );
         state.save(&app.paths.project_state("dev-flex")).unwrap();

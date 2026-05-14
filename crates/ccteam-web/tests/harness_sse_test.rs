@@ -191,10 +191,11 @@ async fn sse_harness_end_to_end_file_write_reaches_stream() {
     // to subscribe (M5.2 sse_test.rs uses the same 150ms).
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    // Write a snapshot file. We bypass `write_harness_snapshot` and
-    // emit JSON directly so the test is independent of the writer's
-    // path-derivation rules — the watcher's only contract here is
-    // "see file <slug>-<sid>.json + parse + broadcast".
+    // Write a snapshot file directly (F61 retired the V0.3.1
+    // `write_harness_snapshot` helper; F68 will reintroduce the writer
+    // path against the new `claude --bg` state.json source). The
+    // watcher's contract here is unchanged: "see file <slug>-<sid>.json
+    // + parse + broadcast".
     let target = paths.harness_dir().join("dev-watch-claude-1.json");
     let snap = fixture_snapshot();
     let body = serde_json::to_string(&snap).unwrap();

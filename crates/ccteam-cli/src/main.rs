@@ -222,13 +222,6 @@ enum Command {
         /// path or the degrade reason (tmux missing / font / IO).
         #[arg(long, value_name = "SLUG")]
         screenshot_smoke: Option<String>,
-        /// V0.3.1 F46: install / refresh
-        /// `~/.claude/statusline-command.sh` so Claude Code's
-        /// statusline command tees stdin into
-        /// `ccteam hook harness-snapshot` before invoking the user's
-        /// original (preserved as a `.bak-<utc-ts>` file). Idempotent.
-        #[arg(long, default_value_t = false)]
-        install_statusline_adapter: bool,
     },
     /// V0.2 M0.18.6: render the orchestrator's per-phase inject
     /// prompt (frontmatter-driven) plus the `@`-referenced phase
@@ -367,6 +360,12 @@ enum SessionAction {
         /// match `HarnessKind::default()`.
         #[arg(long, value_enum, default_value_t = HarnessKindCli::Claude)]
         harness: HarnessKindCli,
+        /// V0.4.0 F61 — agent role for `claude --bg --agent <role>`.
+        /// Resolves against the project's `.claude/agents/<role>.md`.
+        /// Required for claude sessions; ignored for codex (codex
+        /// threads role-equivalents through its own argv).
+        #[arg(long, default_value = "main")]
+        role: String,
     },
     /// List sessions registered for a flex project.
     Ls {
@@ -421,14 +420,6 @@ enum HookCommand {
     /// outbox / clarify protocol instead of synchronously waiting on
     /// an offline user.
     InterceptAsk,
-    /// V0.3.1 F46 statusline-wrapper sink. Reads the harness stdin
-    /// JSON (whatever shape Claude Code emits to its statusline
-    /// command — we treat it opaquely as raw bytes), resolves the
-    /// `<slug>-<sid>.json` target under `~/.ccteam/harness/` from
-    /// `current_dir()`, and atomically dual-writes. Best-effort by
-    /// design: any failure (resolve / IO / non-utf8) is swallowed so
-    /// the user's TUI footer never breaks because of our hook.
-    HarnessSnapshot,
 }
 
 fn main() -> Result<()> {
@@ -503,7 +494,6 @@ fn main() -> Result<()> {
             validate_team,
             migrate_recommended_agents,
             screenshot_smoke,
-            install_statusline_adapter,
         } => run_doctor(commands::DoctorOptions {
             dry_run,
             force,
@@ -516,7 +506,6 @@ fn main() -> Result<()> {
             validate_team,
             migrate_recommended_agents,
             screenshot_smoke,
-            install_statusline_adapter,
         }),
         Command::Phase { cmd } => run_phase(cmd),
         Command::Watchdog { cmd } => run_watchdog(cmd),
@@ -589,12 +578,16 @@ fn run_team(cmd: TeamCommand) -> Result<()> {
 /// multi-session handlers.
 fn run_session(action: SessionAction) -> Result<()> {
     match action {
-        SessionAction::Add { slug, harness } => {
+        SessionAction::Add {
+            slug,
+            harness,
+            role,
+        } => {
             let kind = match harness {
                 HarnessKindCli::Claude => ccteam_core::HarnessKind::Claude,
                 HarnessKindCli::Codex => ccteam_core::HarnessKind::Codex,
             };
-            commands::run_session_add(&slug, kind)
+            commands::run_session_add(&slug, kind, role)
         }
         SessionAction::Ls { slug } => commands::run_session_ls(&slug),
         SessionAction::Attach { slug, sid } => commands::run_session_attach(&slug, &sid),
@@ -638,11 +631,6 @@ fn run_doctor(opts: commands::DoctorOptions) -> Result<()> {
 fn run_hook(cmd: HookCommand) -> Result<()> {
     let paths = CcteamPaths::from_env()?;
 
-    // The HarnessSnapshot arm wants raw bytes (the Claude Code
-    // statusline command is fed an opaque JSON-ish blob — we treat it
-    // as an opaque string) and must NEVER fail loudly. Every other arm
-    // expects a parsed `serde_json::Value` via the historical contract.
-    // Read stdin per-arm so each path stays minimal.
     match cmd {
         HookCommand::ProgressAppend { event_type } => {
             let stdin = parse_hook_stdin_json()?;
@@ -683,13 +671,6 @@ fn run_hook(cmd: HookCommand) -> Result<()> {
         HookCommand::InterceptAsk => {
             let decision = ccteam_hooks::intercept_ask_decision();
             println!("{}", serde_json::to_string(&decision)?);
-            Ok(())
-        }
-        HookCommand::HarnessSnapshot => {
-            // V0.3.1 F46 — never bubble: the statusline render path is
-            // sacred. Best-effort dual-write; any error → debug log +
-            // exit 0.
-            let _ = commands::run_hook_harness_snapshot(&paths);
             Ok(())
         }
     }

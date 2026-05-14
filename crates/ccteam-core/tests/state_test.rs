@@ -227,6 +227,7 @@ fn flex_sessions_round_trip_and_sid_allocator_does_not_reuse_removed_sid() {
             tmux_session: "ccteam-bookmark-mgr-a3f9-claude-1".into(),
             started_at: t0,
             pid: Some(42),
+            job_id: None,
         },
     );
     state.sessions.remove(&first);

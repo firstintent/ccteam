@@ -498,7 +498,9 @@ fn is_harness_snapshot_file(path: &Path) -> bool {
     if path.extension().and_then(|s| s.to_str()) != Some("json") {
         return false;
     }
-    // Skip the `<name>.tmp` rename source from `write_harness_snapshot`.
+    // Skip any `<name>.tmp` rename source produced by atomic file writers
+    // (F68 / future harness observer paths still use the canonical tmp+rename
+    // pattern even after F61 retired the V0.3.1 `write_harness_snapshot`).
     let name = match path.file_name().and_then(|s| s.to_str()) {
         Some(n) => n,
         None => return false,
