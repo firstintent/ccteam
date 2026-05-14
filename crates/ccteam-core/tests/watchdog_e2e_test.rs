@@ -54,7 +54,7 @@ fn auto_loop_iteration_2_surfaces_alert_then_pushes_to_meta_outbox() {
     assert_eq!(alert.slug.as_deref(), Some(slug));
     assert!(alert.message.contains("2/3"));
 
-    let path = push_watchdog_alert_to_meta_outbox(&p, "rob", alert).unwrap();
+    let path = push_watchdog_alert_to_meta_outbox(&p,alert).unwrap();
     let msg = OutboxMessage::load(&path).unwrap();
     // Cycle alerts are progress-priority (informational, not action-mandated).
     assert_eq!(msg.front.event_kind, OutboxEventKind::Progress);
@@ -97,7 +97,7 @@ fn quiet_mode_drops_cycle_alert_but_pushes_daemon_down_when_heartbeat_missing() 
         .collect();
     assert_eq!(daemon.len(), 1, "daemon_down breaks through quiet");
 
-    let path = push_watchdog_alert_to_meta_outbox(&p, "rob", daemon[0]).unwrap();
+    let path = push_watchdog_alert_to_meta_outbox(&p,daemon[0]).unwrap();
     let msg = OutboxMessage::load(&path).unwrap();
     assert_eq!(msg.front.event_kind, OutboxEventKind::Escalation);
     assert_eq!(msg.front.priority, OutboxPriority::High);

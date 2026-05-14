@@ -1234,10 +1234,11 @@ pub struct DoctorOptions {
     /// legacy `cct-*` skill dirs and stale settings.json hook command
     /// paths).
     pub install_skill: bool,
-    /// M1.0: bootstrap a meta-agent project for the given user handle.
-    /// `Some("rob")` ⇒ creates `~/projects/meta-rob/` and triggers
-    /// `install_skill` regardless of its standalone flag.
-    pub install_meta_agent: Option<String>,
+    /// V0.4.1: bootstrap the meta-agent project at `~/projects/meta/`.
+    /// `true` triggers `install_skill` regardless of its standalone
+    /// flag. (Pre-V0.4.1 this was `Option<String>` for a per-user handle
+    /// — handle was dropped, the meta-agent slug is now always `meta`.)
+    pub install_meta_agent: bool,
     /// M2.5: register `mcpServers.ccteam` in `~/.claude.json`.
     pub install_mcp: bool,
     /// M4.2: install `~/.claude/rules/ccteam-lessons-<team>.md` placeholders.
@@ -1276,7 +1277,7 @@ pub struct DoctorOptions {
 pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
     let any_mode = opts.tool_surface
         || opts.install_skill
-        || opts.install_meta_agent.is_some()
+        || opts.install_meta_agent
         || opts.install_mcp
         || opts.install_memory_bridge
         || opts.reset_shipped_teams
@@ -1295,8 +1296,8 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
              write ~/.claude/skills/ccteam-{control,team-author,project-creator}/SKILL.md (M1.8); \
              also runs the V0.2.2 (F39'd) → V0.2.2 (F44'd) reverse migration (legacy `cct-*` skill dirs + \
              stale settings.json hook command paths).\n  \
-             --install-meta-agent <user-handle>\n      \
-             bootstrap a meta-agent project for the given user (M1.0). Implies --install-skill.\n  \
+             --install-meta-agent\n      \
+             bootstrap the canonical meta-agent project at ~/projects/meta/. Implies --install-skill. (V0.4.1: handle dropped — one ccteam install = one meta-agent.)\n  \
              --install-mcp\n      \
              register `mcpServers.ccteam` in ~/.claude.json so daily-driver claude + meta-agent see the 9-tool MCP server (M2.5).\n  \
              --install-memory-bridge [--dry-run]\n      \
@@ -1317,12 +1318,12 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
     }
     // --install-meta-agent implies --install-skill so a fresh meta
     // session has the dispatcher tool list immediately.
-    let install_skill_now = opts.install_skill || opts.install_meta_agent.is_some();
+    let install_skill_now = opts.install_skill || opts.install_meta_agent;
     if install_skill_now {
         out.push_str(&render_install_skill_report(paths, &opts)?);
     }
-    if let Some(handle) = &opts.install_meta_agent {
-        out.push_str(&render_install_meta_agent_report(paths, handle)?);
+    if opts.install_meta_agent {
+        out.push_str(&render_install_meta_agent_report(paths)?);
     }
     if opts.install_mcp {
         out.push_str(&render_install_mcp_report()?);
@@ -1730,10 +1731,9 @@ fn scan_project_settings_for_hook_rewrite(
     Ok(out)
 }
 
-fn render_install_meta_agent_report(paths: &CcteamPaths, user_handle: &str) -> Result<String> {
-    let report: MetaBootstrapReport = bootstrap_meta_project(paths, user_handle)?;
+fn render_install_meta_agent_report(paths: &CcteamPaths) -> Result<String> {
+    let report: MetaBootstrapReport = bootstrap_meta_project(paths)?;
     let mut out = String::from("ccteam doctor --install-meta-agent\n\n");
-    out.push_str(&format!("  user handle      {user_handle}\n"));
     out.push_str(&format!("  project slug     {}\n", report.slug));
     out.push_str(&format!(
         "  project dir      {}\n",
@@ -1752,11 +1752,11 @@ fn render_install_meta_agent_report(paths: &CcteamPaths, user_handle: &str) -> R
         },
     ));
     out.push('\n');
-    let tmux_session = ccteam_core::meta_session_name(user_handle)?;
+    let tmux_session = ccteam_core::meta_session_name();
     out.push_str(&format!("tmux session     {tmux_session}\n"));
     out.push_str(&format!("attach with      tmux attach -t {tmux_session}\n"));
     out.push_str(
-        "\nrun `ccteam start --foreground` (in another terminal) to wake the meta session.\n",
+        "\nrun `ccteam start` (in another terminal) to wake the meta session.\n",
     );
     Ok(out)
 }
@@ -2115,14 +2115,14 @@ fn truncate(s: &str, n: usize) -> &str {
 pub fn run_watchdog_scan(
     paths: &CcteamPaths,
     format: OutputFormat,
-    push_to_user_handle: Option<&str>,
+    push_to_meta: bool,
 ) -> Result<String> {
     let cfg = ccteam_core::load_watchdog_config(paths)?;
     let alerts = ccteam_core::watchdog_scan(paths, &cfg)?;
-    if let Some(handle) = push_to_user_handle {
+    if push_to_meta {
         for alert in &alerts {
-            ccteam_core::push_watchdog_alert_to_meta_outbox(paths, handle, alert)
-                .with_context(|| format!("push watchdog alert to meta outbox for `{handle}`"))?;
+            ccteam_core::push_watchdog_alert_to_meta_outbox(paths, alert)
+                .context("push watchdog alert to meta outbox")?;
         }
     }
     Ok(match format {
@@ -2132,7 +2132,7 @@ pub fn run_watchdog_scan(
                 "config": cfg,
             }))? + "\n"
         }
-        OutputFormat::Text => render_watchdog_text(&alerts, push_to_user_handle.is_some()),
+        OutputFormat::Text => render_watchdog_text(&alerts, push_to_meta),
     })
 }
 

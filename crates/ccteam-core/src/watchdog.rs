@@ -450,10 +450,9 @@ fn keep(alert: &WatchdogAlert, config: &WatchdogConfig) -> bool {
 /// no action mandated).
 pub fn push_alert_to_meta_outbox(
     paths: &CcteamPaths,
-    user_handle: &str,
     alert: &WatchdogAlert,
 ) -> Result<PathBuf> {
-    let slug = meta_slug(user_handle)?;
+    let slug = meta_slug();
     let outbox_dir = paths.project_ccteam_dir(&slug).join("outbox");
     std::fs::create_dir_all(&outbox_dir)
         .with_context(|| format!("create {}", outbox_dir.display()))?;
@@ -792,10 +791,10 @@ mod tests {
             emitted_at: Utc::now(),
             details: serde_json::json!({"status": "no_heartbeat"}),
         };
-        let path = push_alert_to_meta_outbox(&p, "rob", &alert).unwrap();
+        let path = push_alert_to_meta_outbox(&p, &alert).unwrap();
         assert!(path.exists());
         assert!(
-            path.starts_with(p.project_ccteam_dir("meta-rob").join("outbox")),
+            path.starts_with(p.project_ccteam_dir("meta").join("outbox")),
             "watchdog should write to canonical meta slug; got {}",
             path.display(),
         );
@@ -820,7 +819,7 @@ mod tests {
             emitted_at: Utc::now(),
             details: serde_json::Value::Null,
         };
-        let path = push_alert_to_meta_outbox(&p, "rob", &alert).unwrap();
+        let path = push_alert_to_meta_outbox(&p, &alert).unwrap();
         let m = OutboxMessage::load(&path).unwrap();
         assert_eq!(m.front.event_kind, OutboxEventKind::Progress);
         assert_eq!(m.front.priority, OutboxPriority::Normal);
@@ -837,8 +836,8 @@ mod tests {
             emitted_at: Utc::now(),
             details: serde_json::Value::Null,
         };
-        let p1 = push_alert_to_meta_outbox(&p, "rob", &alert).unwrap();
-        let p2 = push_alert_to_meta_outbox(&p, "rob", &alert).unwrap();
+        let p1 = push_alert_to_meta_outbox(&p, &alert).unwrap();
+        let p2 = push_alert_to_meta_outbox(&p, &alert).unwrap();
         assert_ne!(p1, p2, "second push must produce a distinct filename");
     }
 

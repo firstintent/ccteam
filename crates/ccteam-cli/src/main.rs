@@ -227,13 +227,12 @@ enum Command {
         /// `~/.claude/skills/ccteam-control/SKILL.md` (M1.8). Idempotent.
         #[arg(long, default_value_t = false)]
         install_skill: bool,
-        /// Bootstrap a meta-agent project (M1.0) for the given user
-        /// handle. Creates `~/projects/meta-<handle>/` with the
-        /// dispatcher role prompt + inbox/outbox dirs and (always)
-        /// installs the `ccteam-control` skill. Pass the user handle as
-        /// the value (e.g. `--install-meta-agent rob`).
-        #[arg(long, value_name = "HANDLE")]
-        install_meta_agent: Option<String>,
+        /// Bootstrap the canonical meta-agent project at
+        /// `~/projects/meta/` with the dispatcher role prompt +
+        /// inbox/outbox dirs. Also installs the `ccteam-control` skill.
+        /// V0.4.1: handle dropped (one ccteam install = one meta-agent).
+        #[arg(long, default_value_t = false)]
+        install_meta_agent: bool,
         /// M2.5: register `mcpServers.ccteam` in `~/.claude.json` so
         /// daily-driver claude + meta-agent both see the ccteam MCP
         /// server (9 tools, interfaces §12). Idempotent — overwrites
@@ -241,11 +240,11 @@ enum Command {
         #[arg(long, default_value_t = false)]
         install_mcp: bool,
         /// V0.4.1: aggregate first-run setup. Equivalent to
-        /// `--install-mcp --install-skill --install-meta-agent <HANDLE>`.
-        /// Pass the user handle as the value
-        /// (e.g. `--install-all rob`). Idempotent.
-        #[arg(long, value_name = "HANDLE")]
-        install_all: Option<String>,
+        /// `--install-mcp --install-skill --install-meta-agent`.
+        /// Idempotent. (Pre-V0.4.1 needed a `<HANDLE>` value;
+        /// handle was dropped — one ccteam install = one meta-agent.)
+        #[arg(long, default_value_t = false)]
+        install_all: bool,
         /// M4.2: write `~/.claude/rules/ccteam-lessons-<team>.md`
         /// with `<!-- ccteam-managed:lessons begin/end -->` markers + `paths:`
         /// frontmatter scope. Idempotent — re-runs no-op when markers are
@@ -345,20 +344,16 @@ enum Command {
 enum WatchdogCommand {
     /// Scan all projects + daemon heartbeat once and print every alert
     /// that survives `~/.ccteam/watchdog.yaml` filtering. With
-    /// `--push --user <handle>` each alert is also appended to the
-    /// meta-agent session's outbox.
+    /// With `--push` each alert is also appended to the canonical
+    /// meta-agent session's outbox at `~/projects/meta/.ccteam/outbox/`.
     Scan {
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
-        /// Also write each surviving alert to
-        /// `~/projects/meta-<handle>/.ccteam/outbox/`. Pair with
-        /// `--user <handle>`.
+        /// Also write each surviving alert to the canonical meta-agent
+        /// outbox (`~/projects/meta/.ccteam/outbox/`). V0.4.1: handle
+        /// dropped — one ccteam install = one meta-agent.
         #[arg(long, default_value_t = false)]
         push: bool,
-        /// User handle whose meta-agent outbox receives pushed alerts.
-        /// Required when `--push` is passed.
-        #[arg(long, value_name = "HANDLE")]
-        user: Option<String>,
     },
 }
 
@@ -599,13 +594,11 @@ fn main() -> Result<()> {
             migrate_recommended_agents,
             screenshot_smoke,
         } => {
-            // V0.4.1 `--install-all <handle>` is sugar for the three
-            // first-run flags. Explicit flags still win where present;
-            // we only OR-in the aggregate's components.
-            let (final_mcp, final_skill, final_meta) = match install_all {
-                Some(h) => (true, true, Some(h)),
-                None => (install_mcp, install_skill, install_meta_agent),
-            };
+            // V0.4.1 `--install-all` is sugar for the three first-run
+            // flags. Explicit flags still win where set; we OR them.
+            let final_mcp = install_mcp || install_all;
+            let final_skill = install_skill || install_all;
+            let final_meta = install_meta_agent || install_all;
             run_doctor(commands::DoctorOptions {
                 dry_run,
                 force,
@@ -642,12 +635,8 @@ fn main() -> Result<()> {
 fn run_watchdog(cmd: WatchdogCommand) -> Result<()> {
     let paths = CcteamPaths::from_env()?;
     match cmd {
-        WatchdogCommand::Scan { format, push, user } => {
-            if push && user.is_none() {
-                anyhow::bail!("`--push` requires `--user <handle>`");
-            }
-            let handle = if push { user.as_deref() } else { None };
-            let body = commands::run_watchdog_scan(&paths, format, handle)?;
+        WatchdogCommand::Scan { format, push } => {
+            let body = commands::run_watchdog_scan(&paths, format, push)?;
             print!("{body}");
             Ok(())
         }
