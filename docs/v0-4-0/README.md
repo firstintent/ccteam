@@ -68,7 +68,7 @@ V0.4.0 是一次**架构级重构**，核心目标：
 
 - **CodexAdapter 完整实现** → 吸收进 V0.4.0 F62
 - **flex workflow promotion** → V0.4.0 架构重写后该概念已不存在；workflow.yaml 取代
-- **legacy htmx assets 清理** → F68 ccteam-web 适配时一并清理
+- **legacy htmx assets 清理**（`assets/htmx.min.js`、`htmx-ext-sse.js`、`xterm.js` 等 V0.3.2 F59 遗留静态文件，非 React SPA）→ F68 ccteam-web 适配时顺手删；SPA（`crates/ccteam-web/web/`）完全保留
 - **V0.3.3 作为单独 patch round 取消**；V0.4.0 直接接续 V0.3.2
 
 ## 跟其他文档关系
