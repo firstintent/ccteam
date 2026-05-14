@@ -28,13 +28,21 @@
 //! write-helper promotion to the read side), `docs/tech-design.md`
 //! §5.5 progress.jsonl SoT.
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use chrono::Utc;
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::paths::CcteamPaths;
+use crate::progress::{
+    self, current_agent_sessions, escalation_count, workflow_cost_total, AgentSessionStatus,
+    AgentSessionSummary,
+};
 use crate::state::ProjectState;
 use crate::team::TeamKind;
+use crate::workflow::{Trigger, WorkflowError, WorkflowSpec};
 
 /// Project metadata with derived fields used by `ccteam ls`, the MCP
 /// `ls` tool, and the V0.3 web dashboard. Pulled out so each renderer
@@ -169,6 +177,234 @@ fn event_sort_key(event: &Value) -> String {
         .and_then(|ts| ts.as_str())
         .unwrap_or("")
         .to_string()
+}
+
+// ---------------- V0.4.0 F67 WorkflowSummary ----------------
+
+/// Per-agent aggregate the workflow view (F68 SPA) renders. Derived
+/// from progress.jsonl events + the project's `workflow.yaml` agent
+/// dir convention. `queued_count` stays `0` in V0.4.0 — F66's
+/// `pending` queue is in-memory and not yet persisted to disk; once
+/// F67/F68 wire a pending file it surfaces here.
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentStatus {
+    /// Agent role (key in `WorkflowSpec::agents`).
+    pub role: String,
+    /// Number of `agent_spawn` events for this role with no matching
+    /// terminal `agent_done`.
+    pub running_count: u32,
+    /// Always `0` in V0.4.0. F66's pending queue is in-memory; a
+    /// later PR may persist it and populate this field.
+    pub queued_count: u32,
+    /// Sum of `cost_usd` across every terminal `agent_done` event
+    /// for this role.
+    pub total_cost_usd: f64,
+    /// Status of the most recently terminated session for this role
+    /// (by `started_at`), or `None` when no `agent_done` has fired
+    /// yet for this role.
+    pub last_session_status: Option<AgentSessionStatus>,
+}
+
+/// Snapshot of one project's workflow state for the meta-agent / web
+/// dashboard. Cheap to compute (`O(N)` over progress events + one
+/// `read_dir` per agent's artifact directory) so callers can refresh
+/// at SPA poll rates without instrumentation.
+///
+/// Output ordering: `agents` is sorted by role name ASCII; consumers
+/// that need the YAML declaration order can re-sort against the spec.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowSummary {
+    /// `WorkflowSpec::name` for the project, or `""` when the project
+    /// has no workflow.yaml (e.g. legacy V0.3.x slug discovered by
+    /// `collect_projects` before migration).
+    pub workflow_name: String,
+    /// One entry per `WorkflowSpec::agents` role (sorted ASCII).
+    pub agents: Vec<AgentStatus>,
+    /// `<input or output dir relative path>` → file count. Each
+    /// agent's `input` AND `output` directories are stat-ed (if set
+    /// in workflow.yaml). Missing dirs map to `0`.
+    pub artifact_counts: HashMap<String, u64>,
+    /// Sum of cost across every `agent_done` event in the slice.
+    pub total_cost_usd: f64,
+    /// Count of `escalation` events in the slice.
+    pub escalation_count: u32,
+    /// `role` → `"waiting"` / `"released"` / `"fired"`. Derived from
+    /// `gate_triggered` events: any role that appears in a
+    /// `gate_triggered` event is `"fired"`; remaining `Trigger::Gate`
+    /// roles in the spec stay `"waiting"`.
+    pub gate_states: HashMap<String, String>,
+}
+
+impl Default for WorkflowSummary {
+    fn default() -> Self {
+        Self {
+            workflow_name: String::new(),
+            agents: Vec::new(),
+            artifact_counts: HashMap::new(),
+            total_cost_usd: 0.0,
+            escalation_count: 0,
+            gate_states: HashMap::new(),
+        }
+    }
+}
+
+/// Build a [`WorkflowSummary`] for `slug` by reading
+/// `<project>/workflow.yaml` (or `<project>/.ccteam/workflow.yaml`)
+/// and merging with the project's progress.jsonl event stream.
+///
+/// Returns `Ok(WorkflowSummary::default())` (with `workflow_name = ""`)
+/// when the project has no workflow.yaml — this lets the SPA show a
+/// blank workflow panel for legacy / pre-V0.4.0 projects without 500-ing.
+///
+/// Errors only on hard IO failure (e.g. `state.json` unreadable mid-read,
+/// project directory absent).
+pub fn workflow_summary(slug: &str, paths: &CcteamPaths) -> Result<WorkflowSummary> {
+    let project_dir = paths.project_dir(slug);
+
+    // Try to load workflow.yaml; absence is non-fatal (legacy project).
+    let spec = match WorkflowSpec::load_for_project(&project_dir) {
+        Ok(s) => Some(s),
+        Err(WorkflowError::NotFound(_)) => None,
+        Err(err) => {
+            tracing::warn!(
+                slug,
+                error = %err,
+                "workflow.yaml present but failed to parse; returning empty summary",
+            );
+            None
+        }
+    };
+
+    // Load progress events. Flex projects use sharded per-sid files
+    // (read via `collect_recent_flex_events`); workflow uses the flat
+    // `<slug>.jsonl`. F66 writes to the flat file for workflow
+    // projects (where V0.4.0 lives), so we read that path
+    // directly; flex stays consistent via `collect_recent_events`.
+    let state = ProjectState::load(&paths.project_state(slug)).ok();
+    let events: Vec<Value> = if state
+        .as_ref()
+        .is_some_and(|s| s.team_kind == TeamKind::Flex)
+    {
+        collect_recent_flex_events(paths, slug, usize::MAX).unwrap_or_default()
+    } else {
+        progress::read_all_events(&paths.progress_jsonl(slug)).unwrap_or_default()
+    };
+
+    let total_cost_usd = workflow_cost_total(&events);
+    let escalation_count = escalation_count(&events);
+    let sessions = current_agent_sessions(&events);
+
+    let mut artifact_counts: HashMap<String, u64> = HashMap::new();
+    let mut gate_states: HashMap<String, String> = HashMap::new();
+
+    if let Some(spec) = &spec {
+        // gate_states default to "waiting" for every Gate role; flip
+        // to "fired" when a `gate_triggered` event names the role.
+        for (role, agent) in &spec.agents {
+            if matches!(agent.trigger, Trigger::Gate) {
+                gate_states.insert(role.clone(), "waiting".to_string());
+            }
+        }
+        for event in &events {
+            if event.get("event").and_then(|s| s.as_str()) == Some("gate_triggered") {
+                if let Some(role) = event.get("role").and_then(|s| s.as_str()) {
+                    gate_states.insert(role.to_string(), "fired".to_string());
+                }
+            }
+        }
+
+        // Stat each agent's input + output dirs.
+        for agent in spec.agents.values() {
+            for rel in [agent.input.as_ref(), agent.output.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                let key = rel.display().to_string();
+                let dir = project_dir.join(rel);
+                let count = count_files_in_dir(&dir);
+                artifact_counts.insert(key, count);
+            }
+        }
+    }
+
+    // Aggregate per-role stats from the session list.
+    let agents = if let Some(spec) = &spec {
+        let mut by_role: HashMap<&str, AgentStatus> = HashMap::new();
+        for role in spec.agents.keys() {
+            by_role.insert(
+                role.as_str(),
+                AgentStatus {
+                    role: role.clone(),
+                    running_count: 0,
+                    queued_count: 0,
+                    total_cost_usd: 0.0,
+                    last_session_status: None,
+                },
+            );
+        }
+        // Walk sessions; sorted by `started_at` ascending so the
+        // last entry per role is the most recently spawned.
+        let mut last_by_role: HashMap<&str, &AgentSessionSummary> = HashMap::new();
+        for session in &sessions {
+            let Some(status) = by_role.get_mut(session.role.as_str()) else {
+                // session.role not in spec — surface as a synthetic
+                // role row so the UI can see it (orphan agent).
+                let entry = by_role.entry(session.role.as_str()).or_insert(AgentStatus {
+                    role: session.role.clone(),
+                    running_count: 0,
+                    queued_count: 0,
+                    total_cost_usd: 0.0,
+                    last_session_status: None,
+                });
+                accumulate_session(entry, session);
+                last_by_role.insert(session.role.as_str(), session);
+                continue;
+            };
+            accumulate_session(status, session);
+            last_by_role.insert(session.role.as_str(), session);
+        }
+        for (role, last) in last_by_role {
+            if let Some(status) = by_role.get_mut(role) {
+                if !matches!(last.status, AgentSessionStatus::Running) {
+                    status.last_session_status = Some(last.status.clone());
+                }
+            }
+        }
+        let mut out: Vec<AgentStatus> = by_role.into_values().collect();
+        out.sort_by(|a, b| a.role.cmp(&b.role));
+        out
+    } else {
+        Vec::new()
+    };
+
+    Ok(WorkflowSummary {
+        workflow_name: spec.as_ref().map(|s| s.name.clone()).unwrap_or_default(),
+        agents,
+        artifact_counts,
+        total_cost_usd,
+        escalation_count,
+        gate_states,
+    })
+}
+
+fn accumulate_session(status: &mut AgentStatus, session: &AgentSessionSummary) {
+    match &session.status {
+        AgentSessionStatus::Running => {
+            status.running_count = status.running_count.saturating_add(1);
+        }
+        AgentSessionStatus::Done { cost_usd } | AgentSessionStatus::Errored { cost_usd } => {
+            status.total_cost_usd += cost_usd;
+        }
+    }
+}
+
+fn count_files_in_dir(dir: &std::path::Path) -> u64 {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    rd.flatten()
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .count() as u64
 }
 
 #[cfg(test)]

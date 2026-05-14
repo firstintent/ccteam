@@ -415,29 +415,62 @@ flex 项目使用每 session 一个 `~/.ccteam/progress/<slug>/<sid>.jsonl`,读�
 `ts` 聚合。**这是 orchestrator 唯一的状态事实来源**——tmux 终端输出只给人看,
 不解析;`~/.ccteam/harness/*.json` 只服务展示。
 
+> **V0.4.0 F60+F66+F67**:phase 机制(`phase_inject` / `phase_done` /
+> `phase_milestone` / `golden_rules_check` / `phase_done_pending` /
+> `subskill_*` / `escalate(kind=revert|abort|insufficient_clarification|
+> need_user_input)`)整组事件随 phase 状态机一并 EOL。F66 thin
+> orchestrator 写 7 类 workflow-driven event;F66 fix-loop 写
+> 第 8 类 `escalation` event。下文 §4.1 给出新清单(workflow
+> domain)与仍保留的 hook-domain 事件(`PreToolUse` / `PostToolUse` /
+> `SubagentStop` / `Stop` / `SessionEnd` / `user_attach`)。
+> V0.4.0 ESCALATE grammar(§4.1.1)目前未使用,保留以备 V0.4.1+
+> 决策点恢复。
+
 ### 4.1 事件类型(完整清单)
 
+V0.4.0 起 progress.jsonl 由两个域共同写入:
+
+**workflow domain**(F66 orchestrator 写,共 7 类 + F66 fix-loop 第 8 类 `escalation`):
+
 ```jsonl
-{"ts":"2026-05-04T11:23:00Z","event":"session_start","tmux_session":"ccteam-bookmark-mgr-a3f9"}
-{"ts":"2026-05-10T09:00:00Z","event":"PreToolUse","sid":"claude-1","tool":"Edit","path":"src/lib.rs"}
-{"ts":"...","event":"phase_inject","phase":"implement","attachments":[".ccteam/code-review.md"]}
-{"ts":"...","event":"PreToolUse","tool":"Edit","path":"src/db.ts"}
-{"ts":"...","event":"PostToolUse","tool":"Bash","cmd":"pnpm test","exit_code":0,"duration_ms":4521}
-{"ts":"...","event":"phase_milestone","phase":"implement","note":"完成 schema + migration"}
-{"ts":"...","event":"subskill_started","phase":"implement","skill":"claude-plugins-official:pr-review-toolkit/agents/code-reviewer.md","trigger":"phase_done"}
-{"ts":"...","event":"subskill_done","phase":"implement","skill":"...","output":".ccteam/code-review.md","bytes":4123}
-{"ts":"...","event":"phase_done","phase":"implement","duration_s":4521,"cost_usd":2.13}
-{"ts":"...","event":"golden_rules_check","phase":"implement","result":"pass","passed":["tests_green"],"skipped":[]}
-{"ts":"...","event":"golden_rules_check","phase":"implement","result":"fail","passed":["tests_green"],"violations":[{"rule_id":"no_secrets_in_repo","kind":"pattern","detail":"matched `AWS_SECRET` at .ccteam/implement-report.md:3"}],"skipped":[]}
-{"ts":"...","event":"phase_done_pending","phase":"feasibility","open_decisions":["reply-2026-05-06T100000Z-001.md"],"reason":"tech-stack decision deferred"}
-{"ts":"...","event":"escalate","kind":"need_user_input","target_phase":null,"reason":"db migration 不可调和","cycle":3}
-{"ts":"...","event":"escalate","kind":"revert","target_phase":"plan-eng","reason":"fix-loop 撞顶,根因在选型"}
-{"ts":"...","event":"escalate","kind":"abort","target_phase":null,"reason":"超出 ccteam 当前能力,人工接手"}
-{"ts":"...","event":"user_attach","detected_by":"PreToolUse-input-source"}
-{"ts":"...","event":"watcher_concern","watcher":"scope-watcher","note":"添加了云同步,超出 spec"}
-{"ts":"...","event":"watcher_block","watcher":"cost-watcher","note":"项目累计 $200 触发硬上限"}
-{"ts":"...","event":"SessionEnd","reason":"context_reset"}
+{"ts":"2026-05-10T09:00:00Z","event":"workflow_start","workflow":"watcher","slug":"dev-foo"}
+{"ts":"2026-05-10T09:00:01Z","event":"agent_spawn","role":"fixer","session_id":"fixer-1","executor":"claude","tmux_session":"ccteam-dev-foo-fixer-1","slug":"dev-foo"}
+{"ts":"2026-05-10T09:00:02Z","event":"artifact_received","role":"fixer","artifact_path":"/abs/path/to/issues/bug.md","slug":"dev-foo"}
+{"ts":"2026-05-10T09:00:03Z","event":"gate_triggered","role":"reviewer","forced":false,"threshold_met":true,"slug":"dev-foo"}
+{"ts":"2026-05-10T09:01:00Z","event":"agent_done","role":"fixer","session_id":"fixer-1","status":"completed","cost_usd":0.42,"slug":"dev-foo"}
+{"ts":"2026-05-10T09:01:01Z","event":"budget_exceeded","role":"reviewer","cost_used_usd":205.13,"budget_limit_usd":200.0,"slug":"dev-foo"}
+{"ts":"2026-05-10T09:01:02Z","event":"escalation","kind":"spawn_failed","role":"fixer","consecutive_failures":3,"slug":"dev-foo"}
+{"ts":"2026-05-10T09:02:00Z","event":"workflow_done","workflow":"watcher","slug":"dev-foo"}
 ```
+
+字段语义:
+
+| event | 必有字段 | 选填字段 | 写入时机 |
+|---|---|---|---|
+| `workflow_start` | `workflow` (`WorkflowSpec::name`), `slug`, `ts` | — | `Orchestrator::run_project` 入口,加载 workflow.yaml 成功后 |
+| `agent_spawn` | `role`, `session_id`, `executor` (`claude`\|`codex`), `slug`, `ts` | `tmux_session` (claude 用 `ccteam-<slug>-<sid>` 占位;codex 写真名) | `HarnessAdapter::spawn_session` 返回 `Ok(handle)` 后 |
+| `agent_done` | `role`, `session_id`, `status` (`completed`\|`stopped`\|`error`), `cost_usd` (f64;无 cost 时 `0.0`), `slug`, `ts` | — | `session_state_path` 文件 `status` ∈ {`stopped`, `completed`, `error`} 时,poll 一次 |
+| `artifact_received` | `role`, `artifact_path` (abs), `slug`, `ts` | — | `ArtifactWatcher` 通过 mpsc 投递 `ArtifactEvent` 后,orchestrator 立刻 append(spawn 决策之前) |
+| `gate_triggered` | `role`, `forced` (bool), `threshold_met` (bool), `slug`, `ts` | — | `check_gates` 解锁 Gate 时;`forced=true` 表示 `.ccteam/gate_override/<role>` marker 触发 |
+| `budget_exceeded` | `role`, `cost_used_usd` (f64), `budget_limit_usd` (f64), `slug`, `ts` | — | `try_spawn` 内 budget guard 拦截 spawn 时(运行 session 永不被 kill) |
+| `workflow_done` | `workflow`, `slug`, `ts` | — | 所有 Gate role 都进入 Fired 状态且无 running session 时,幂等 emit 一次 |
+| `escalation` | `kind` (`spawn_failed` 等), `role`, `consecutive_failures` (u32), `slug`, `ts` | — | `bump_fail_count` 每次 +1;`>= MAX_CONSECUTIVE_SPAWN_FAILURES` 时另发 `send_btw_escalation` 到 meta-agent inbox |
+
+**hook domain**(Claude Code / Codex hook 写,V0.4.0 保留;详见 §6.2):
+
+```jsonl
+{"ts":"2026-05-10T09:00:00Z","event":"PreToolUse","tool":"Edit","path":"src/lib.rs"}
+{"ts":"...","event":"PostToolUse","tool":"Bash","cmd":"pnpm test","exit_code":0,"duration_ms":4521}
+{"ts":"...","event":"SubagentStop"}
+{"ts":"...","event":"Stop"}
+{"ts":"...","event":"SessionEnd","reason":"context_reset"}
+{"ts":"...","event":"notification"}
+{"ts":"...","event":"user_attach","detected_by":"PreToolUse-input-source"}
+```
+
+(V0.4.0 F60 起 `session_start` 仍由 orchestrator 写;`SubagentStop` /
+`Stop` / `SessionEnd` / `notification` 由 `idle_aware_message` /
+`is_idle` / `subagent_active` 等 idle 探测消费,见 `progress.rs`。)
 
 ### 4.1.1 ESCALATE grammar(M0.5.4)
 
@@ -460,19 +493,32 @@ flex 项目使用每 session 一个 `~/.ccteam/progress/<slug>/<sid>.jsonl`,读�
 
 | 事件 | 写入方 |
 |---|---|
-| `session_start` / `phase_inject` | orchestrator(send-keys 前后直接 append) |
-| `PreToolUse` / `PostToolUse` / `phase_milestone` | Claude Code hooks(详见 §6.1) |
-| `phase_done` / `escalate` | Stop hook 解析 claude 最后一行(`PHASE_DONE: <phase>` / `ESCALATE: <reason>`) |
-| `subskill_started` / `subskill_done` / `subskill_skipped` / `subskill_failed` | M2.1 orchestrator 在 phase_start / phase_done 边界跑 sub-skill;`subskill_done` 含 `output` 与 `bytes`,`subskill_skipped` 含 `reason`(`installed:` 前缀等),`subskill_failed` 含 `error` |
-| `user_attach` | PreToolUse hook 检测输入源 |
-| `watcher_concern` / `watcher_block` | Cross-cutting watcher 异步子进程(详见 tech-design §6.3 模式 B) |
-| `SessionEnd` | SessionEnd hook |
+| `workflow_start` / `workflow_done` | F66 orchestrator(`Orchestrator::run_project` 入口 / `check_workflow_done` 守门) |
+| `agent_spawn` | F66 orchestrator(`HarnessAdapter::spawn_session` 返回 Ok 后) |
+| `agent_done` | F66 orchestrator(`poll_completions` 检测到 session state.json `status` ∈ {`completed`, `stopped`, `error`}) |
+| `artifact_received` | F66 orchestrator(`ArtifactWatcher` mpsc 投递后) |
+| `gate_triggered` | F66 orchestrator(`check_gates` 释放 Gate 时) |
+| `budget_exceeded` | F66 orchestrator(`try_spawn` budget guard) |
+| `escalation` | F66 orchestrator(`bump_fail_count`,fix-loop 3-strike 与 `spawn_session` 持续失败) |
+| `session_start` / `PreToolUse` / `PostToolUse` / `SubagentStop` / `Stop` / `SessionEnd` / `notification` / `user_attach` | Claude Code / Codex hooks 与启动器(详见 §6.2;V0.4.0 保留不变) |
 
 ### 4.3 消费方
 
-- **orchestrator**:`inotify` 递归监听 progress 目录,做状态转移与 stall 检测
-- **用户 dashboard pane**:`tail -f progress/<slug>.jsonl | jq -c '.event + ":" + (.tool // .note // "")'`
-- **retro phase**(M4;改造现有 ship.md / verdict.md inline retro 段):作为项目历史输入,通过 Claude session `/memory` + `Edit ~/.claude/rules/ccteam-lessons-<team>.md` 写入
+- **orchestrator** 自身(读 progress.jsonl 用于 budget guard / fix-loop 计数 /
+  workflow_done 幂等保护):见 `ccteam_core::progress::read_all_events`
+  与 `Orchestrator::cumulative_cost_from_progress`
+- **`ccteam_core::progress`**(F67):暴露 `workflow_cost_total` /
+  `current_agent_sessions` / `escalation_count` 三组聚合,
+  pure-function 接口供 web 与 meta-agent 查询(见 §4.4 + `queries::workflow_summary`)
+- **`ccteam_core::queries::workflow_summary`**(F67):合并 workflow.yaml
+  规格与 progress.jsonl 事件,生成 `WorkflowSummary { workflow_name,
+  agents[], artifact_counts, total_cost_usd, escalation_count,
+  gate_states }`;F68 SPA 消费
+- **MCP `observe_agents`**(F65):读 `state.json::sessions` 列出运行
+  session;cost / status 字段 V0.4.1 起改读 `agent_done` 事件
+- **用户 dashboard pane**:`tail -f progress/<slug>.jsonl | jq -c '.event + ":" + (.role // .tool // "")'`
+- **retro / lessons writer**:作为项目历史输入,通过 Claude session
+  `/memory` + `Edit ~/.claude/rules/ccteam-lessons-<team>.md` 写入
 
 ### 4.4 Stream-json 归档(可选)
 

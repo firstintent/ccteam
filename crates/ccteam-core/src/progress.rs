@@ -1,4 +1,4 @@
-//! progress.jsonl reader / writer + idle detection.
+//! progress.jsonl reader / writer + idle detection + workflow event aggregations.
 //!
 //! progress.jsonl is the orchestrator's only state-truth source
 //! (`docs/tech-design.md` §5.5). This module gives both the hook
@@ -12,11 +12,23 @@
 //! injection-prompt builder against the new `workflow.yaml` schema.
 //! Event-log read/write/idle helpers stay — they're channel-layer
 //! primitives shared by every consumer.
+//!
+//! V0.4.0 F67: workflow-event aggregation helpers
+//! (`workflow_cost_total`, `current_agent_sessions`,
+//! `escalation_count`) read F66's 8 canonical event kinds
+//! (`workflow_start` / `agent_spawn` / `agent_done` /
+//! `artifact_received` / `gate_triggered` / `budget_exceeded` /
+//! `workflow_done` / `escalation`). They are pure functions over a
+//! `&[Value]` slice — no IO, no state — so call sites can choose how
+//! to source the slice (one-shot read, tail follow, etc.).
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use serde::Serialize;
 use serde_json::Value;
 
 /// Append `event` as one JSONL line. Creates parent dir + file when
@@ -159,6 +171,152 @@ pub fn idle_aware_message(prompt: &str, idle: bool) -> String {
     } else {
         format!("/btw {prompt}")
     }
+}
+
+// ---------------- V0.4.0 F67 workflow event aggregations ----------------
+
+/// Status of one agent session inferred from the `agent_spawn` /
+/// `agent_done` event pair.
+///
+/// `Running` — `agent_spawn` was seen without a matching `agent_done`
+/// for the same `(role, session_id)`.
+/// `Done { cost_usd }` — terminal `agent_done` with `status` in
+/// `{"completed", "stopped"}`. `cost_usd` defaults to `0.0` when the
+/// event omits the field.
+/// `Errored` — terminal `agent_done` with any other `status` (e.g.
+/// `"error"`); F66 still writes `cost_usd` but the dispatch failed.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum AgentSessionStatus {
+    /// Session has not yet emitted `agent_done`.
+    Running,
+    /// Session terminated normally. `cost_usd` mirrors F66's
+    /// `agent_done.cost_usd` field (0.0 when the harness reported no
+    /// cost).
+    Done { cost_usd: f64 },
+    /// Session terminated with a non-success `status`.
+    Errored { cost_usd: f64 },
+}
+
+/// One agent session summary derived from progress.jsonl events.
+/// `started_at` is the `agent_spawn` event's `ts` (parsed RFC3339; if
+/// the field is missing or unparseable the helper uses the current
+/// wall-clock time at parse, which is harmless for an event that
+/// already preceded `now`).
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentSessionSummary {
+    pub role: String,
+    pub session_id: String,
+    pub started_at: DateTime<Utc>,
+    pub status: AgentSessionStatus,
+}
+
+/// Sum `cost_usd` across every `agent_done` event in the slice.
+///
+/// F66 writes the per-session cost on the terminal `agent_done` event
+/// (NOT on `agent_spawn`; the harness only knows the cost once the
+/// session ends). Missing or non-numeric `cost_usd` fields contribute
+/// `0.0`.
+pub fn workflow_cost_total(events: &[Value]) -> f64 {
+    events
+        .iter()
+        .filter(|e| e.get("event").and_then(|s| s.as_str()) == Some("agent_done"))
+        .map(|e| e.get("cost_usd").and_then(|v| v.as_f64()).unwrap_or(0.0))
+        .sum()
+}
+
+/// Count `escalation` events in the slice. Escalations come from two
+/// F66 codepaths: the 3-strike `spawn_failed` fix-loop and the
+/// budget-exceeded guard's `send_btw_escalation` (which writes an
+/// `escalation` event before the inbox push). Both surface here as a
+/// single integer for `WorkflowSummary.escalation_count`.
+pub fn escalation_count(events: &[Value]) -> u32 {
+    events
+        .iter()
+        .filter(|e| e.get("event").and_then(|s| s.as_str()) == Some("escalation"))
+        .count() as u32
+}
+
+/// Walk events and reconstruct each agent session's status from the
+/// `agent_spawn` / `agent_done` pair (matched by `session_id`).
+///
+/// Output order is deterministic: sessions are sorted by `started_at`
+/// ascending, then by `session_id` as a tiebreaker. This keeps tests
+/// and UI rows stable across runs.
+///
+/// Sessions whose `agent_spawn` lacks a `session_id` field are
+/// skipped (they cannot be paired with a later `agent_done`).
+pub fn current_agent_sessions(events: &[Value]) -> Vec<AgentSessionSummary> {
+    // `BTreeMap` keyed by session_id keeps a single entry per session
+    // (the last terminal `agent_done` wins if for some reason two
+    // arrive).
+    let mut by_sid: BTreeMap<String, AgentSessionSummary> = BTreeMap::new();
+
+    for event in events {
+        let kind = event.get("event").and_then(|s| s.as_str()).unwrap_or("");
+        let sid = match event.get("session_id").and_then(|s| s.as_str()) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => continue,
+        };
+        let role = event
+            .get("role")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        match kind {
+            "agent_spawn" => {
+                let started_at = parse_ts(event.get("ts").and_then(|s| s.as_str()));
+                by_sid.entry(sid.clone()).or_insert(AgentSessionSummary {
+                    role,
+                    session_id: sid,
+                    started_at,
+                    status: AgentSessionStatus::Running,
+                });
+            }
+            "agent_done" => {
+                let cost_usd = event
+                    .get("cost_usd")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                let status_str = event
+                    .get("status")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("completed");
+                let status = match status_str {
+                    "completed" | "stopped" => AgentSessionStatus::Done { cost_usd },
+                    _ => AgentSessionStatus::Errored { cost_usd },
+                };
+                // Update existing entry if `agent_spawn` was already
+                // observed; otherwise synthesise from this event only
+                // (rare: progress.jsonl truncation, but defensible).
+                by_sid
+                    .entry(sid.clone())
+                    .and_modify(|entry| entry.status = status.clone())
+                    .or_insert(AgentSessionSummary {
+                        role: role.clone(),
+                        session_id: sid,
+                        started_at: parse_ts(event.get("ts").and_then(|s| s.as_str())),
+                        status,
+                    });
+            }
+            _ => {}
+        }
+    }
+
+    let mut out: Vec<AgentSessionSummary> = by_sid.into_values().collect();
+    out.sort_by(|a, b| {
+        a.started_at
+            .cmp(&b.started_at)
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
+    out
+}
+
+fn parse_ts(raw: Option<&str>) -> DateTime<Utc> {
+    raw.and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or_else(Utc::now)
 }
 
 #[cfg(test)]

@@ -14,6 +14,12 @@
 //! (`routes::api_v1`) doc-comments still reference. These derive
 //! `Serialize` so they encode straight into the F52 JSON contract
 //! without churn.
+//!
+//! V0.4.0 F67: the legacy `current_phase` field on [`DashboardRow`]
+//! is dropped — phase machinery was retired in F60 and the field
+//! decayed into the empty string. The SPA's dashboard column moved
+//! to the F67 `workflow_summary` shape (rendered downstream of
+//! `WorkflowSummary` in `api_v1::ProjectSummary` / consumed by F68).
 
 use serde::Serialize;
 
@@ -22,7 +28,6 @@ pub struct DashboardRow {
     pub slug: String,
     pub team: String,
     pub kind: String,
-    pub current_phase: String,
     pub last_event_label: String,
     pub badge_class: &'static str,
     pub badge_label: &'static str,
