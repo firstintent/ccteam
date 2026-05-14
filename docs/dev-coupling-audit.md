@@ -824,6 +824,86 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
 - **优先级**:**P0**(multi-harness gating)。
 - **来源**:`docs/v0-3-1/prd.md §10.3` erratum + `docs/v0-4-0/prd.md §F62` + `docs/v0-4-0/dev-plan.md §4`。
 
+### F60 — Phase machinery removal(V0.4.0 PR #1;2026-05-14 加)
+
+- **scope(净删除)**:
+  - **删整个文件**:`crates/ccteam-core/src/phases.rs`(934 LOC)、
+    `crates/ccteam-core/src/golden_rules.rs`(555 LOC)、
+    `crates/ccteam-core/src/dag.rs`(217 LOC)、
+    `crates/ccteam-core/src/subskill.rs`(522 LOC)。
+  - **掏空保留桩**:`crates/ccteam-core/src/orchestrator.rs`
+    (2713 → ~140 LOC):删 `decide_tick` / `decide_tick_from_events`、
+    `TeamRuntime { templates, dag }`、`dispatch_phase_with_state`、
+    `attachments_for_next_phase`、`handle_golden_rules_violation`、
+    `process_project` / `process_meta_project` / `process_session_inbox`、
+    全部 `PhaseState::{InFlight, DonePending, AutoLocked}` 处理分支;
+    保留 `Orchestrator { paths, config }` + `new` + `paths` +
+    `run_project`(`todo!("F66 thin orchestrator")`)+ `run`(同 stub)。
+  - **trim**:
+    - `crates/ccteam-core/src/state.rs`:`PhaseState` 仅留 `Idle` / `Done`
+      (旧变体 deserialize alias 到 `Idle`);`current_phase` /
+      `phase_history` / `last_event_type` / `auto_loop_cycle_count` 保留
+      为 serde-compat 字段(`skip_serializing_if`),新写不带、老 state.json
+      仍可读。
+    - `crates/ccteam-core/src/templates.rs`:删 `TEAM_BUNDLES` /
+      `PHASE_TEMPLATES` / `team_bundle` / `write_*_phase_templates*` /
+      `write_all_global_team_templates`;保留 `PROJECT_SETTINGS_JSON` /
+      `HELPER_TEMPLATES` / `render_project_settings` /
+      `write_project_settings` / `write_global_helper_templates` /
+      `EnabledPluginsSetting` / `SettingsEnv`(non-phase 项目 bootstrap)。
+    - `crates/ccteam-core/src/progress.rs`:删 `build_phase_prompt` /
+      `build_phase_prompt_for_template` /
+      `build_phase_prompt_for_template_with_team` /
+      `build_phase_prompt_with_attachments` /
+      `synthesize_minimal_template` / `latest_terminal_event_for_phase`;
+      保留 `append_event` / `last_event` / `read_all_events` /
+      `is_idle` / `subagent_active` / `idle_aware_message`(channel 层 SoT)。
+    - `crates/ccteam-core/src/team.rs`:删 `use crate::phases::GoldenRule`,
+      内联 cmd-check 验证;`as_cmd_check_rules` 因无消费者一并删;
+      legacy yaml shape 的 `Vec<GoldenRule>` 用 private `LegacyGoldenRule`
+      shim 替换(deserialize-only,保 backwards-compat)。
+    - `crates/ccteam-core/src/projects.rs`:删 `compute_enabled_plugins` /
+      `load_phase_templates_for_bootstrap` / `setup_tool_surface` /
+      `parse_subskill_subagent_name`;`bootstrap_project` 不再写 phase
+      模板,`enabled_plugins` 一律 default(F66 重做)。
+    - `crates/ccteam-core/src/team_factory.rs`:删 phase template parse
+      smoke 测试 `init_phase_frontmatter_parses_back_into_phase_template`。
+    - `crates/ccteam-core/src/memory_bridge.rs`:`tests::seed` 不再调
+      `write_all_global_team_templates`,inline 写最小 team.yaml 三件套。
+    - `crates/ccteam-core/src/actions.rs`:`resume` 删 `phase_history.push`
+      paired "resumed" 标记逻辑;`PhaseHistoryEntry` import 一并删。
+    - `crates/ccteam-cli/src/commands.rs`:`render_validate_team_report`
+      / `run_phase_show` / `render_reset_shipped_teams_report` /
+      `render_install_memory_bridge_report` / `render_tool_surface_report`
+      五个 doctor 子命令 stub 化(返回 V0.4.0 F60 not-implemented message);
+      `run_new` 删 shipped-seed 自愈;`stamp_project_team_kind` 给 dev /
+      meta-agent 默认 `TeamKind::Workflow`(不再依赖 disk team.yaml)。
+    - `crates/ccteam-cli/src/main.rs`:`ccteam start` 删 shipped-team
+      self-heal。
+    - `crates/ccteam-cli/src/mcp_serve.rs`:`tool_ls` 的 active_count 改
+      `0`(F66 重算)、PhaseState 字符串 match arm 收敛到 idle / done。
+  - **删测试**:phase 机制相关 integration test 整文件删除
+    (`crates/ccteam-core/tests/`:`context_reset_test.rs` /
+    `dispatch_test.rs` / `e2e_happy_path_test.rs` /
+    `m1_dispatch_e2e_test.rs` / `m1_meta_dispatch_test.rs` /
+    `m2_subskill_test.rs` / `m3_phase_done_pending_test.rs` /
+    `m3_team_runtime_test.rs` / `orchestrator_test.rs` /
+    `pending_inject_e2e_test.rs` / `phases_test.rs` /
+    `silence_classifier_e2e_test.rs` / `state_machine_test.rs` /
+    `team_resolver_project_layer_e2e_test.rs` / `templates_test.rs` /
+    `tool_surface_e2e_test.rs`,`crates/ccteam-cli/tests/`:
+    `m3_product_research_e2e_test.rs`)。
+- **不在本 PR**:`workflow.yaml` schema + parser(F63)、artifact
+  watcher(F64)、新 MCP 工具(F65)、薄 orchestrator 重建(F66)。
+- **是否真 dev-specific**:**否——架构 pivot 净删除。** Claude Code 已具
+  备 phase / plan 内置能力,phase 模板系统跟原生功能竞争,根本错误。
+- **解耦方案(已 ship)**:净删除 ~3500 LOC,workspace 仍 cargo
+  check + cargo test 全绿(测试数从 866 → 663,失败 0,删的是 phase
+  机制专属测试)。F66 在新 `workflow.yaml` 拓扑上重建调度,**不** 把
+  phase 模板再带回来。
+- **优先级**:**P0**(架构 pivot 必经)。
+- **来源**:`docs/v0-4-0/prd.md §F60` + §5 / `docs/v0-4-0/dev-plan.md §2`。
+
 ### F40 — `product-research` team 名冗长 + 领域名缺位(2026-05-09 加;**已修复:2026-05-09(V0.2.2 PR #6 alias 软迁移)**)
 
 - **文件:行号**:`teams/product-research/team.yaml::name`(M3.4 起的字面值)

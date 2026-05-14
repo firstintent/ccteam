@@ -22,10 +22,8 @@ pub fn load_context(paths: &CcteamPaths, stdin: &serde_json::Value) -> Result<()
 
     let ready = CcteamPaths::project_ready_in(&project_dir);
     if let Some(parent) = ready.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    std::fs::write(&ready, b"")
-        .with_context(|| format!("write {}", ready.display()))?;
+    std::fs::write(&ready, b"").with_context(|| format!("write {}", ready.display()))?;
     Ok(())
 }

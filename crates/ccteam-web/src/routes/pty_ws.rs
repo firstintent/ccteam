@@ -126,16 +126,17 @@ async fn handle_session_ws(
 /// Common upgrade path: echo the subprotocol if the client asked for
 /// it, then hand off to the byte-relay loop.
 fn upgrade(ws: WebSocketUpgrade, app: AppState, key: String, tmux_session: String) -> Response {
-    ws.protocols([SUBPROTOCOL]).on_upgrade(move |socket| async move {
-        if let Err(err) = run(socket, app, key.clone(), tmux_session.clone()).await {
-            tracing::warn!(
-                key = %key,
-                tmux_session = %tmux_session,
-                error = %err,
-                "pty_ws: relay loop exited with error",
-            );
-        }
-    })
+    ws.protocols([SUBPROTOCOL])
+        .on_upgrade(move |socket| async move {
+            if let Err(err) = run(socket, app, key.clone(), tmux_session.clone()).await {
+                tracing::warn!(
+                    key = %key,
+                    tmux_session = %tmux_session,
+                    error = %err,
+                    "pty_ws: relay loop exited with error",
+                );
+            }
+        })
 }
 
 async fn run(
@@ -144,10 +145,7 @@ async fn run(
     key: String,
     tmux_session: String,
 ) -> anyhow::Result<()> {
-    let subscription = app
-        .pty
-        .subscribe(&key, &tmux_session, &app.paths)
-        .await?;
+    let subscription = app.pty.subscribe(&key, &tmux_session, &app.paths).await?;
     let tmux_session: Arc<str> = Arc::from(subscription.tmux_session().to_string());
     relay(socket, subscription, tmux_session).await;
     Ok(())

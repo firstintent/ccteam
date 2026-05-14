@@ -168,9 +168,7 @@ impl PtySession {
         if !status.success() {
             // Clean up so a later retry can succeed.
             let _ = tokio::fs::remove_file(&fifo_path).await;
-            anyhow::bail!(
-                "tmux pipe-pane failed for session {tmux_session} (exit {status})",
-            );
+            anyhow::bail!("tmux pipe-pane failed for session {tmux_session} (exit {status})",);
         }
 
         Ok(Self {

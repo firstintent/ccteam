@@ -25,7 +25,9 @@ pub fn last_assistant_message(path: &Path) -> Result<Option<serde_json::Value>> 
             Ok(v) => v,
             Err(_) => continue,
         };
-        let Some(msg) = v.get("message") else { continue };
+        let Some(msg) = v.get("message") else {
+            continue;
+        };
         if msg.get("role").and_then(|s| s.as_str()) != Some("assistant") {
             continue;
         }

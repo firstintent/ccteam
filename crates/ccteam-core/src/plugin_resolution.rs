@@ -141,8 +141,7 @@ mod tests {
     #[test]
     fn known_plugin_agents_has_eight_distinct_subagents() {
         assert_eq!(KNOWN_PLUGIN_AGENTS.len(), 8);
-        let mut names: Vec<&str> =
-            KNOWN_PLUGIN_AGENTS.iter().map(|a| a.subagent).collect();
+        let mut names: Vec<&str> = KNOWN_PLUGIN_AGENTS.iter().map(|a| a.subagent).collect();
         names.sort();
         names.dedup();
         assert_eq!(names.len(), 8);

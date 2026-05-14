@@ -127,13 +127,11 @@ pub fn load_config_at(path: &Path) -> Result<WatchdogConfig> {
     if !path.exists() {
         return Ok(WatchdogConfig::default());
     }
-    let body = std::fs::read_to_string(path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let body = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     if body.trim().is_empty() {
         return Ok(WatchdogConfig::default());
     }
-    serde_yaml::from_str(&body)
-        .with_context(|| format!("parse {}", path.display()))
+    serde_yaml::from_str(&body).with_context(|| format!("parse {}", path.display()))
 }
 
 /// Discriminator for `WatchdogAlert`. The variant name is the only
@@ -283,10 +281,12 @@ fn scan_project(
     alerts: &mut Vec<WatchdogAlert>,
 ) -> Result<()> {
     // Signal 1: Stop hook L3 fail-safe (M0.19).
-    let needs = project_dir.join(".ccteam").join("needs_attention.outbox.json");
+    let needs = project_dir
+        .join(".ccteam")
+        .join("needs_attention.outbox.json");
     if needs.exists() {
-        let body = std::fs::read_to_string(&needs)
-            .with_context(|| format!("read {}", needs.display()))?;
+        let body =
+            std::fs::read_to_string(&needs).with_context(|| format!("read {}", needs.display()))?;
         let parsed: serde_json::Value =
             serde_json::from_str(&body).unwrap_or_else(|_| serde_json::json!({"raw": body}));
         let reason = parsed
@@ -390,10 +390,7 @@ fn display_phase(phase: &str) -> &str {
 
 /// Apply `notify_mode` + per-kind thresholds to a candidate list.
 fn filter(alerts: Vec<WatchdogAlert>, config: &WatchdogConfig) -> Vec<WatchdogAlert> {
-    alerts
-        .into_iter()
-        .filter(|a| keep(a, config))
-        .collect()
+    alerts.into_iter().filter(|a| keep(a, config)).collect()
 }
 
 fn keep(alert: &WatchdogAlert, config: &WatchdogConfig) -> bool {
@@ -457,9 +454,7 @@ pub fn push_alert_to_meta_outbox(
     alert: &WatchdogAlert,
 ) -> Result<PathBuf> {
     let slug = meta_slug(user_handle)?;
-    let outbox_dir = paths
-        .project_ccteam_dir(&slug)
-        .join("outbox");
+    let outbox_dir = paths.project_ccteam_dir(&slug).join("outbox");
     std::fs::create_dir_all(&outbox_dir)
         .with_context(|| format!("create {}", outbox_dir.display()))?;
 
@@ -503,12 +498,14 @@ pub fn push_alert_to_meta_outbox(
 /// would race a concurrent meta-agent reply, but watchdog is the only
 /// caller that runs as a Rust process so a single-process bump is fine.
 fn next_outbox_seq(dir: &Path, now: DateTime<Utc>) -> Result<u32> {
-    let prefix_ts = now.to_rfc3339_opts(SecondsFormat::Secs, true).replace(':', "");
+    let prefix_ts = now
+        .to_rfc3339_opts(SecondsFormat::Secs, true)
+        .replace(':', "");
     let prefix = format!("reply-{prefix_ts}-");
     let mut max = 0u32;
     if dir.exists() {
-        for entry in std::fs::read_dir(dir)
-            .with_context(|| format!("read_dir {}", dir.display()))?
+        for entry in
+            std::fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))?
         {
             let Ok(entry) = entry else { continue };
             let Some(name) = entry.file_name().to_str().map(String::from) else {

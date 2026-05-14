@@ -33,8 +33,7 @@ const DEV_TEMPLATE: &str = include_str!("templates/memory_bridge_dev.md");
 /// V0.2.2 F40: renamed from `memory_bridge_product_research.md` (file
 /// `git mv`'d). `paths:` frontmatter now scopes to
 /// `~/projects/research-*` for new projects.
-const RESEARCH_TEMPLATE: &str =
-    include_str!("templates/memory_bridge_research.md");
+const RESEARCH_TEMPLATE: &str = include_str!("templates/memory_bridge_research.md");
 
 const MARKER_BEGIN: &str = "<!-- ccteam-managed:lessons begin -->";
 const MARKER_END: &str = "<!-- ccteam-managed:lessons end -->";
@@ -200,8 +199,8 @@ fn install_one(
             .with_context(|| format!("write {}", target.display()))?;
         return Ok(MemoryBridgeAction::Wrote);
     }
-    let body = std::fs::read_to_string(target)
-        .with_context(|| format!("read {}", target.display()))?;
+    let body =
+        std::fs::read_to_string(target).with_context(|| format!("read {}", target.display()))?;
     if marked_section_intact(&body) {
         return Ok(if opts.dry_run {
             MemoryBridgeAction::DryRun { would_write: false }
@@ -213,8 +212,7 @@ fn install_one(
         return Ok(MemoryBridgeAction::DryRun { would_write: true });
     }
     let repaired = repair_marked_section(&body);
-    std::fs::write(target, repaired)
-        .with_context(|| format!("write {}", target.display()))?;
+    std::fs::write(target, repaired).with_context(|| format!("write {}", target.display()))?;
     Ok(MemoryBridgeAction::RepairedMarkedSection)
 }
 
@@ -281,14 +279,32 @@ mod tests {
             .unwrap_or_else(|| panic!("{team} bridge report missing"))
     }
 
-    /// Seed shipped team yamls under `<tmp>/ccteam-home/teams/<name>/`
-    /// so `install_into(global, claude, ...)` finds dev / research
-    /// during the disk scan introduced in V0.2 §6.4 candidate 3.
-    /// Returns `(global_dir, claude_dir)` — claude_dir is `<tmp>/`,
-    /// matching the historical layout the per-test assertions expect.
+    /// V0.4.0 F60: the shipped TEAM_BUNDLES writer was deleted with the
+    /// phase machinery. Inline the minimum team.yaml shape the install
+    /// path needs (`name`, non-empty `retro_schema`) for `dev` and
+    /// `research`, plus a `meta-agent` with empty `retro_schema` to
+    /// verify the install-skips-empty-retro-schema branch.
     fn seed(tmp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
         let global = tmp.path().join("ccteam-home");
-        crate::templates::write_all_global_team_templates(&global, true).unwrap();
+        let teams = global.join("teams");
+        for (team, yaml) in [
+            (
+                "dev",
+                "name: dev\ndescription: dev team\nretro_schema:\n  - field: tech_stack\n    description: stack notes\n  - field: pitfalls\n    description: things to avoid\n",
+            ),
+            (
+                "research",
+                "name: research\ndescription: research team\nretro_schema:\n  - field: findings\n    description: notes\n",
+            ),
+            (
+                "meta-agent",
+                "name: meta-agent\nevergreen: true\ndescription: meta-agent\nretro_schema: []\n",
+            ),
+        ] {
+            let team_dir = teams.join(team);
+            std::fs::create_dir_all(&team_dir).unwrap();
+            std::fs::write(team_dir.join("team.yaml"), yaml).unwrap();
+        }
         (global, tmp.path().to_path_buf())
     }
 

@@ -62,8 +62,7 @@ pub fn read(path: &Path) -> Result<Option<AutoLoopState>> {
     if !path.exists() {
         return Ok(None);
     }
-    let body = std::fs::read_to_string(path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let body = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let after = body
         .strip_prefix("---\n")
         .or_else(|| body.strip_prefix("---\r\n"))
@@ -81,11 +80,10 @@ pub fn read(path: &Path) -> Result<Option<AutoLoopState>> {
 
 pub fn write(path: &Path, state: &AutoLoopState) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    let front_yaml = serde_yaml::to_string(&state.front)
-        .context("serialize auto-loop front matter")?;
+    let front_yaml =
+        serde_yaml::to_string(&state.front).context("serialize auto-loop front matter")?;
     let body = format!("---\n{front_yaml}---\n\n{}\n", state.prompt);
     std::fs::write(path, body).with_context(|| format!("write {}", path.display()))
 }
@@ -104,10 +102,7 @@ pub fn delete(path: &Path) -> Result<()> {
 pub enum AutoLoopDecision {
     /// Re-feed the prompt; bump `iteration` to `next_iteration` and
     /// rewrite the state file before the hook returns.
-    Reinject {
-        prompt: String,
-        next_iteration: u32,
-    },
+    Reinject { prompt: String, next_iteration: u32 },
     /// Allow exit. `succeeded = true` when the completion signal was
     /// observed, `false` when iteration reached the cap without it
     /// (caller emits `escalate`).

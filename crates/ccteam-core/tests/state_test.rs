@@ -21,9 +21,9 @@ fn sample_state() -> ProjectState {
         tmux_session: "ccteam-bookmark-mgr-a3f9".into(),
         claude_session_id: Some("abc123-def-456".into()),
         claude_pid: Some(12345),
-        phase_state: PhaseState::InFlight,
-        current_phase: "implement".into(),
+        phase_state: PhaseState::Idle,
         parallelism: Parallelism::Solo,
+        current_phase: "implement".into(),
         phase_history: vec![
             PhaseHistoryEntry {
                 phase: "seed".into(),
@@ -38,6 +38,7 @@ fn sample_state() -> ProjectState {
                 cost_usd: 0.15,
             },
         ],
+        last_event_type: Some("Stop".into()),
         auto_loop_cycle_count: 0,
         cost_used_usd: 1.23,
         soft_warn_threshold_usd: 20.0,
@@ -46,7 +47,6 @@ fn sample_state() -> ProjectState {
         context_reset_threshold_tokens: 600_000,
         context_reset_count: 0,
         last_progress_event_at: Some(t0),
-        last_event_type: Some("Stop".into()),
         last_user_interaction_at: t0,
         user_attached: false,
         user_pause_pending: false,
@@ -94,10 +94,12 @@ fn second_save_rotates_previous_to_bak_then_writes_new() {
 
     let mut v2 = v1.clone();
     v2.cost_used_usd = 9.99;
-    v2.current_phase = "test-run".into();
     v2.save(&main).unwrap();
 
-    assert!(!tmp.exists(), ".tmp must not linger after a successful save");
+    assert!(
+        !tmp.exists(),
+        ".tmp must not linger after a successful save"
+    );
     let loaded_main = ProjectState::load(&main).unwrap();
     assert_eq!(loaded_main, v2, "main must hold the latest write");
 

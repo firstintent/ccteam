@@ -9,16 +9,12 @@ use chrono::{SecondsFormat, Utc};
 use serde_json::{Map, Value};
 
 use crate::paths::CcteamPaths;
-use crate::plugin_resolution::{lookup_plugin_agent, plugins_to_enable};
 use crate::state::ProjectState;
-use crate::templates::{
-    team_bundle, write_global_helper_templates, write_project_phase_templates_for_team,
-    write_project_settings, EnabledPluginsSetting,
-};
-use crate::phases::PhaseTemplate;
 use crate::team::TeamSpec;
 use crate::team_resolver::TeamResolveContext;
-use crate::tool_surface::user_claude_dir;
+use crate::templates::{
+    write_global_helper_templates, write_project_settings, EnabledPluginsSetting,
+};
 
 /// Slugify a free-text project request: keep `[a-z0-9]`, collapse other
 /// runs to `-`, trim, lower-case, and cap at 40 chars. When the cap
@@ -90,8 +86,8 @@ pub fn random_suffix() -> String {
 /// verbatim.
 pub fn slugify_brief(input: &str) -> String {
     const STOP_WORDS: &[&str] = &[
-        "a", "an", "the", "of", "to", "for", "with", "that", "and", "or", "in", "on",
-        "at", "is", "are",
+        "a", "an", "the", "of", "to", "for", "with", "that", "and", "or", "in", "on", "at", "is",
+        "are",
     ];
     const MAX_TOKENS: usize = 3;
 
@@ -149,11 +145,7 @@ pub fn slugify_brief(input: &str) -> String {
 /// Meta-agent projects don't go through this function — they use
 /// `meta_slug(handle)` which hand-crafts `meta-<handle>` so the
 /// directory aligns with the `ccteam-meta-<handle>` tmux session.
-pub fn pick_unused_slug(
-    paths: &CcteamPaths,
-    base: &str,
-    team: &str,
-) -> Result<String> {
+pub fn pick_unused_slug(paths: &CcteamPaths, base: &str, team: &str) -> Result<String> {
     let base = slugify_brief(base);
     pick_unused_under_team_prefix(paths, &base, team)
 }
@@ -166,11 +158,7 @@ pub fn pick_unused_slug(
 /// - B2 prefix semantics: if `slug` already starts with `<team>-`
 ///   keep it verbatim; otherwise prepend `<team>-`.
 /// - Collision retry via `-{4hex}` suffix (same as `pick_unused_slug`).
-pub fn pick_unused_slug_verbatim(
-    paths: &CcteamPaths,
-    slug: &str,
-    team: &str,
-) -> Result<String> {
+pub fn pick_unused_slug_verbatim(paths: &CcteamPaths, slug: &str, team: &str) -> Result<String> {
     let trimmed = slug.trim();
     if trimmed.is_empty() {
         return Err(anyhow!("slug must be non-empty"));
@@ -185,9 +173,7 @@ pub fn pick_unused_slug_verbatim(
         .chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
     {
-        return Err(anyhow!(
-            "slug must match [a-z0-9-]+; got {trimmed:?}",
-        ));
+        return Err(anyhow!("slug must match [a-z0-9-]+; got {trimmed:?}",));
     }
     if trimmed.starts_with('-') || trimmed.ends_with('-') {
         return Err(anyhow!(
@@ -206,11 +192,7 @@ pub fn pick_unused_slug_verbatim(
 /// Internal helper: takes an already-prefixed slug, returns the same
 /// or a `-{4hex}` retry on collision. Shared between the verbatim
 /// (`--slug`) and brief-derived paths.
-fn pick_unused_under_team_prefix(
-    paths: &CcteamPaths,
-    base: &str,
-    team: &str,
-) -> Result<String> {
+fn pick_unused_under_team_prefix(paths: &CcteamPaths, base: &str, team: &str) -> Result<String> {
     let prefixed = format!("{team}-{base}");
     pick_unused_with_prefixed(paths, &prefixed)
 }
@@ -262,31 +244,27 @@ pub fn bootstrap_project(
     let state = ProjectState::initial_for_team(slug.to_string(), team.to_string());
     state.save(&paths.project_state(slug))?;
 
-    // V0.2 M0.20 (candidate 7): compute the spawned-session
-    // `enabledPlugins` set from the team's phase YAML
-    // `tools_required.subagents`, replacing the M0.5 ln -sf protocol.
+    // V0.4.0 F60: the phase-template-driven `enabledPlugins` resolver
+    // (`compute_enabled_plugins` + `load_phase_templates_for_bootstrap`)
+    // was deleted with the rest of the phase machinery. F66 will
+    // reintroduce the plugin enablement set computed from
+    // `workflow.yaml::agents.<role>.executor`. For now we lay down
+    // settings.json with an empty plugin set so the project bootstraps
+    // cleanly; user-authored agent prompts still resolve their plugin
+    // surface via the global `~/.claude/agents/` layer.
     let resolved_spec = resolve_project_team_spec(paths, team);
-    let team_is_flex = resolved_spec.as_ref().is_some_and(|spec| spec.kind.is_flex());
-    let templates = if team_is_flex {
-        Vec::new()
-    } else {
-        load_phase_templates_for_bootstrap(team)
-    };
-    let enabled_plugins = compute_enabled_plugins(&templates);
+    let enabled_plugins = EnabledPluginsSetting::default();
 
     write_project_settings(&project_dir, &enabled_plugins)?;
-    if !team_is_flex {
-        write_project_phase_templates_for_team(&project_dir, team)?;
-    }
     // M2.4: ensure ~/.ccteam/templates/ has the helper templates so
-    // any phase markdown's `@~/.ccteam/templates/<name>.md` reference
-    // resolves. Idempotent — no-ops when files already exist, so this
-    // doesn't fight `ccteam init` if the operator ran it first.
+    // user-authored agent / workflow markdown's `@~/.ccteam/templates/<name>.md`
+    // reference resolves. Idempotent — no-ops when files already exist,
+    // so this doesn't fight `ccteam init` if the operator ran it first.
     if let Err(err) = write_global_helper_templates(&paths.root, false) {
         tracing::warn!(
             global_dir = %paths.root.display(),
             error = %err,
-            "could not stamp helper templates into ~/.ccteam/templates/; phase markdown using @-references may fail",
+            "could not stamp helper templates into ~/.ccteam/templates/; markdown using @-references may fail",
         );
     }
     if let Err(err) = pre_trust_project(&project_dir) {
@@ -296,21 +274,6 @@ pub fn bootstrap_project(
             project_dir = %project_dir.display(),
             error = %err,
             "could not pre-trust project in ~/.claude.json; first claude launch may show trust prompt",
-        );
-    }
-
-    // V0.2 M0.20: pre-create the skills placeholder dirs and warn on
-    // any phase-declared subagent whose plugin source isn't on disk.
-    // Plugin pipeline activation lives in the spawned project's
-    // .claude/settings.json `enabledPlugins` (written above) — Claude
-    // Code's in-memory plugin loader reads it at session start and
-    // namespaces each agent as `<plugin>:<name>` automatically. No more
-    // ln -sf into ~/.claude/agents/ (replaces the M0.5 protocol).
-    if let Err(err) = setup_tool_surface(&project_dir, &templates) {
-        tracing::warn!(
-            project_dir = %project_dir.display(),
-            error = %err,
-            "tool-surface setup failed; phase markdown that depends on plugin agents may not work",
         );
     }
 
@@ -330,34 +293,23 @@ fn resolve_project_team_spec(paths: &CcteamPaths, team: &str) -> Option<TeamSpec
     crate::team_resolver::resolve_team(team, &ctx).ok()
 }
 
-/// Build the `<project>/CLAUDE.md` body for `team`. V0.2 §6.4
-/// candidate 2: the per-team body lives in `team.yaml.claude_md_template`,
-/// not in a `match team` branch in ccteam-core. Templates contain the
+/// Build the `<project>/CLAUDE.md` body for `team`. The per-team body
+/// lives in `team.yaml.claude_md_template`; templates contain the
 /// literal placeholders `{slug}` / `{team}`, substituted here.
 ///
 /// Lookup precedence:
 /// 1. The resolved `TeamSpec`'s `claude_md_template` (for user-authored
-///    staging teams).
-/// 2. The shipped `TEAM_BUNDLES` entry's `team.yaml.claude_md_template`
-///    (parsed lazily from the embedded yaml).
-/// 3. A generic body that doesn't bake in dev / research assumptions —
-///    used for unknown teams (user-authored without a template) and as
-///    a safety net if the shipped yaml fails to parse.
+///    teams resolved via `team_resolver`).
+/// 2. A generic body that doesn't bake in dev / research assumptions —
+///    used for unknown teams (user-authored without a template).
 ///
-/// The body is written verbatim; teams that want richer templating
-/// (eg. `--config` style placeholder selection) should fill in
-/// values before storing the template, since runtime substitution is
-/// limited to the two slots the template author can rely on.
+/// V0.4.0 F60: the shipped `TEAM_BUNDLES` fallback was deleted with the
+/// rest of the phase machinery; user-authored teams must carry their
+/// own `claude_md_template`, otherwise the generic body is rendered.
 fn render_project_claude_md(slug: &str, team: &str, resolved_spec: Option<&TeamSpec>) -> String {
     let template = resolved_spec
         .filter(|spec| !spec.claude_md_template.trim().is_empty())
-        .map(|spec| spec.claude_md_template.clone())
-        .or_else(|| {
-            team_bundle(team)
-                .and_then(|b| crate::team::TeamSpec::parse(b.team_yaml).ok())
-                .filter(|spec| !spec.claude_md_template.trim().is_empty())
-                .map(|spec| spec.claude_md_template)
-        });
+        .map(|spec| spec.claude_md_template.clone());
     let body = match template {
         Some(t) => t,
         None => generic_claude_md_template().to_string(),
@@ -376,40 +328,8 @@ fn generic_claude_md_template() -> &'static str {
      - 用户原始需求: 见 .ccteam/spec.md\n\
      \n\
      ## 工作约定\n\
-     - 跟随该 team 的 phase 模板指示。\n\
+     - 跟随该 team 的 workflow.yaml / agent 指示。\n\
      - 不要修改 .ccteam/ 之外的元数据。\n"
-}
-
-/// Parse the embedded phase templates for `team` into a
-/// `Vec<PhaseTemplate>` so `setup_tool_surface` can ln -sf every
-/// sub_skill plugin agent the team's pipeline declares. Filter out
-/// parse errors with a warn — a broken shipped template would crash
-/// the build, but if it ever happens we want bootstrap to keep
-/// working for unrelated phases.
-///
-/// Returns empty for the meta-agent team (no DAG) and for unknown
-/// teams (the user is expected to populate `~/.ccteam/<phase_dir>/`
-/// manually for hand-rolled teams).
-fn load_phase_templates_for_bootstrap(team: &str) -> Vec<PhaseTemplate> {
-    let Some(bundle) = team_bundle(team) else {
-        return Vec::new();
-    };
-    bundle
-        .phases
-        .iter()
-        .filter_map(|(name, body)| match PhaseTemplate::parse(body) {
-            Ok(t) => Some(t),
-            Err(err) => {
-                tracing::warn!(
-                    template = %name,
-                    team,
-                    error = %err,
-                    "embedded phase template did not parse during bootstrap; skipping for sub_skill linking",
-                );
-                None
-            }
-        })
-        .collect()
 }
 
 /// Pre-mark `project_dir` as trusted in `~/.claude.json` so the first
@@ -463,10 +383,7 @@ pub fn pre_trust_project(project_dir: &Path) -> Result<()> {
 /// writer and the sibling `--install-skill` / `--install-memory-bridge`
 /// paths.
 pub fn resolve_claude_json_path() -> Result<PathBuf> {
-    resolve_claude_json_path_from_env(
-        std::env::var("CLAUDE_CONFIG_HOME").ok(),
-        dirs::home_dir(),
-    )
+    resolve_claude_json_path_from_env(std::env::var("CLAUDE_CONFIG_HOME").ok(), dirs::home_dir())
 }
 
 /// Pure resolution helper for `resolve_claude_json_path`. Factored out
@@ -488,116 +405,8 @@ fn resolve_claude_json_path_from_env(
             None => claude_dir.join(".claude.json"),
         });
     }
-    let h = home
-        .ok_or_else(|| anyhow!("could not resolve home directory for ~/.claude.json"))?;
+    let h = home.ok_or_else(|| anyhow!("could not resolve home directory for ~/.claude.json"))?;
     Ok(h.join(".claude.json"))
-}
-
-/// Compute the `enabledPlugins` map a spawned project's
-/// `.claude/settings.json` needs by walking every phase template's
-/// `tools_required.subagents` (and any sub_skill referencing a plugin
-/// agent) and resolving each name through
-/// [`crate::plugin_resolution::lookup_plugin_agent`]. Built-ins and
-/// user-authored agent names produce no plugin entries.
-///
-/// V0.2 M0.20 — replaces the M0.5 `RECOMMENDED_AGENTS` ln -sf logic.
-fn compute_enabled_plugins(templates: &[PhaseTemplate]) -> EnabledPluginsSetting {
-    let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for t in templates {
-        for s in &t.tools_required.subagents {
-            names.insert(s.clone());
-        }
-        // sub_skills referencing `<mkt>:<plugin>/agents/<name>.md` carry
-        // the same plugin dependency even when the bare subagent name
-        // isn't listed in tools_required (M2.1 contract).
-        for spec in &t.sub_skills {
-            if let Some(bare) = parse_subskill_subagent_name(&spec.skill) {
-                names.insert(bare);
-            }
-        }
-    }
-    let plugin_ids = plugins_to_enable(names.iter().map(String::as_str));
-    EnabledPluginsSetting { plugin_ids }
-}
-
-/// Extract the bare agent name from a sub_skill `skill:` reference of
-/// the form `<marketplace>:<plugin>/agents/<name>.md`. Returns `None`
-/// for hook scripts (`.py`, `.sh`) or non-agent paths.
-fn parse_subskill_subagent_name(skill: &str) -> Option<String> {
-    let (_market, rest) = skill.split_once(':')?;
-    if !rest.contains("/agents/") || !rest.ends_with(".md") {
-        return None;
-    }
-    let filename = rest.rsplit('/').next()?;
-    Some(filename.strip_suffix(".md").unwrap_or(filename).to_string())
-}
-
-/// Pre-create the project-local + global skills placeholder dirs and
-/// log a warning for any phase-declared subagent whose plugin source
-/// isn't installed under `~/.claude/plugins/marketplaces/`.
-///
-/// Plugin agents are no longer ln -sf'd here (V0.2 M0.20) — Claude
-/// Code's in-memory plugin pipeline reads `enabledPlugins` from the
-/// spawned project's `.claude/settings.json` and namespaces each agent
-/// as `<plugin>:<name>`. Skills directory pre-creation still matters
-/// because Claude Code's SKILL.md watcher only attaches to dirs that
-/// exist at session start (§1.2.4).
-///
-/// **Test isolation**: tests that call `bootstrap_project` without
-/// caring about `~/.claude/` set `CCTEAM_DISABLE_TOOL_SURFACE_BOOTSTRAP=1`
-/// (or redirect `CLAUDE_CONFIG_HOME` to a tempdir).
-fn setup_tool_surface(project_dir: &Path, templates: &[PhaseTemplate]) -> Result<()> {
-    let project_skills = project_dir.join(".claude").join("skills");
-    std::fs::create_dir_all(&project_skills)
-        .with_context(|| format!("create {}", project_skills.display()))?;
-
-    if std::env::var("CCTEAM_DISABLE_TOOL_SURFACE_BOOTSTRAP")
-        .ok()
-        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes"))
-    {
-        tracing::debug!(
-            "CCTEAM_DISABLE_TOOL_SURFACE_BOOTSTRAP set; skipping global ~/.claude/ tool-surface setup",
-        );
-        return Ok(());
-    }
-    let claude = user_claude_dir()?;
-    let global_skills = claude.join("skills");
-    std::fs::create_dir_all(&global_skills)
-        .with_context(|| format!("create {}", global_skills.display()))?;
-
-    let mut declared: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for t in templates {
-        for s in &t.tools_required.subagents {
-            declared.insert(s.clone());
-        }
-        for spec in &t.sub_skills {
-            if let Some(bare) = parse_subskill_subagent_name(&spec.skill) {
-                declared.insert(bare);
-            }
-        }
-    }
-    for name in &declared {
-        let Some(agent) = lookup_plugin_agent(name) else {
-            continue;
-        };
-        let src = agent.source_path(&claude);
-        if src.is_file() {
-            tracing::debug!(
-                subagent = %name,
-                plugin = %agent.plugin_id(),
-                "plugin agent source present; spawned session enables plugin via enabledPlugins",
-            );
-        } else {
-            tracing::warn!(
-                subagent = %name,
-                plugin = %agent.plugin_id(),
-                source = %src.display(),
-                "plugin source missing — run `claude /plugin add {}` so phase markdown's Task(subagent_type=...) resolves",
-                agent.plugin_id(),
-            );
-        }
-    }
-    Ok(())
 }
 
 /// `pre_trust_project` core, factored out for unit testing with an
@@ -650,20 +459,18 @@ pub(crate) fn write_trust_entry(claude_json: &Path, project_dir: &Path) -> Resul
     };
     entry_map.insert("hasTrustDialogAccepted".into(), Value::Bool(true));
 
-    let body = serde_json::to_string_pretty(&Value::Object(root))
-        .context("serialize ~/.claude.json")?;
+    let body =
+        serde_json::to_string_pretty(&Value::Object(root)).context("serialize ~/.claude.json")?;
 
     if let Some(parent) = claude_json.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     let tmp = {
         let mut s = claude_json.as_os_str().to_owned();
         s.push(".ccteam.tmp");
         PathBuf::from(s)
     };
-    std::fs::write(&tmp, body.as_bytes())
-        .with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::write(&tmp, body.as_bytes()).with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, claude_json)
         .with_context(|| format!("rename {} → {}", tmp.display(), claude_json.display()))?;
     Ok(())
@@ -758,7 +565,10 @@ mod tests {
         // must fall back to a `<team>-<base>-<suffix>` form.
         std::fs::create_dir_all(paths.project_dir("dev-todo-cli")).unwrap();
         let s = pick_unused_slug(&paths, "todo cli", "dev").unwrap();
-        assert!(s.starts_with("dev-todo-cli-"), "expected suffix retry, got {s}");
+        assert!(
+            s.starts_with("dev-todo-cli-"),
+            "expected suffix retry, got {s}"
+        );
         assert_ne!(s, "dev-todo-cli");
     }
 
@@ -805,7 +615,10 @@ mod tests {
             slugify_brief("AI recipe generator from fridge photo"),
             "ai-recipe-generator"
         );
-        assert_eq!(slugify_brief("HermesTrade DEX home"), "hermestrade-dex-home");
+        assert_eq!(
+            slugify_brief("HermesTrade DEX home"),
+            "hermestrade-dex-home"
+        );
     }
 
     #[test]
@@ -1041,47 +854,6 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_project_writes_phase_templates_into_dot_ccteam_phases() {
-        ensure_isolation();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let paths = CcteamPaths {
-            root: tmp.path().join("home"),
-            projects_root: tmp.path().join("projects"),
-        };
-        let slug = "demo";
-        bootstrap_project(&paths, slug, "demo request", "dev").unwrap();
-        let phases_dir = paths.project_dir(slug).join(".ccteam/phases");
-        assert!(phases_dir.join("plan-eng.md").exists());
-        assert!(phases_dir.join("implement.md").exists());
-        assert!(phases_dir.join("ship.md").exists());
-        // No prefixed copies — those live in ~/.ccteam/phases/, not the
-        // project tree (which is what the phase prompt references).
-        assert!(!phases_dir.join("02-plan-eng.md").exists());
-    }
-
-    #[test]
-    fn bootstrap_project_creates_project_local_skills_placeholder() {
-        // M0.5.2: the project-side `<project>/.claude/skills/` dir must
-        // exist at session start so Claude Code's live SKILL.md monitor
-        // attaches there. The project-local mkdir runs **before** the
-        // tool-surface gate, so it works even with the disable flag set
-        // (other tests in this binary may have set it).
-        ensure_isolation();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let paths = CcteamPaths {
-            root: tmp.path().join("home"),
-            projects_root: tmp.path().join("projects"),
-        };
-        bootstrap_project(&paths, "demo", "demo request", "dev").unwrap();
-        let skills = paths.project_dir("demo").join(".claude/skills");
-        assert!(
-            skills.is_dir(),
-            "expected {} to exist after bootstrap_project",
-            skills.display(),
-        );
-    }
-
-    #[test]
     fn bootstrap_project_writes_helper_templates_to_global_dir() {
         // M2.4: bootstrap_project ensures ~/.ccteam/templates/ is
         // populated with the embedded helper templates so phase
@@ -1127,39 +899,23 @@ mod tests {
     // ---------------- V0.2 M0.16.3: claude_md_template ----------------
 
     #[test]
-    fn render_project_claude_md_uses_dev_template_with_substitution() {
+    fn render_project_claude_md_falls_back_to_generic_when_no_resolved_spec() {
+        // V0.4.0 F60: the shipped TEAM_BUNDLES fallback was deleted with
+        // the phase machinery. With no resolved_spec, every team gets
+        // the generic body — substitution still applies.
         let body = render_project_claude_md("dev-build-todo", "dev", None);
         assert!(body.contains("# CLAUDE.md (auto-managed by ccteam)"));
         assert!(body.contains("- slug: dev-build-todo"));
         assert!(body.contains("- team: dev"));
-        // dev-specific contract from the template body must land verbatim.
-        assert!(body.contains("测试不过不算完成"));
-        assert!(body.contains("不要 git push"));
-    }
-
-    #[test]
-    fn render_project_claude_md_uses_product_research_template_with_substitution() {
-        let body = render_project_claude_md(
-            "product-research-recipe-ai",
-            "product-research",
-            None,
-        );
-        assert!(body.contains("- slug: product-research-recipe-ai"));
-        assert!(body.contains("- team: product-research"));
-        // product-research-specific contract: no code, source diversity.
-        assert!(body.contains("不写代码"));
-        assert!(body.contains("3 个独立信息源"));
+        assert!(body.contains("workflow.yaml"));
     }
 
     #[test]
     fn render_project_claude_md_falls_back_to_generic_for_unknown_team() {
         let body = render_project_claude_md("custom-foo-1", "custom-team", None);
-        // Generic body has no dev-specific or research-specific clauses.
         assert!(body.contains("- slug: custom-foo-1"));
         assert!(body.contains("- team: custom-team"));
-        assert!(!body.contains("测试不过不算完成"));
-        assert!(!body.contains("不写代码"));
-        assert!(body.contains("跟随该 team 的 phase 模板指示"));
+        assert!(body.contains("workflow.yaml"));
     }
 
     #[test]

@@ -130,7 +130,10 @@ async fn sse_harness_emits_synthetic_snapshot_event() {
     let parsed: serde_json::Value = serde_json::from_str(&payload).expect("data is valid JSON");
     assert_eq!(parsed["slug"], "dev-foo");
     assert_eq!(parsed["sid"], "claude-1");
-    assert_eq!(parsed["snapshot"]["model_display_name"], "Claude Sonnet 4.5");
+    assert_eq!(
+        parsed["snapshot"]["model_display_name"],
+        "Claude Sonnet 4.5"
+    );
     assert_eq!(parsed["snapshot"]["context_used_pct"], 12);
 }
 
@@ -208,5 +211,8 @@ async fn sse_harness_end_to_end_file_write_reaches_stream() {
     let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
     assert_eq!(parsed["slug"], "dev-watch");
     assert_eq!(parsed["sid"], "claude-1");
-    assert_eq!(parsed["snapshot"]["model_display_name"], "Claude Sonnet 4.5");
+    assert_eq!(
+        parsed["snapshot"]["model_display_name"],
+        "Claude Sonnet 4.5"
+    );
 }

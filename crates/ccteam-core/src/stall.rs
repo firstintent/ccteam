@@ -110,9 +110,7 @@ pub fn classify(silent_seconds: u64) -> StallLevel {
 /// the project is created.
 pub fn silent_seconds(state: &ProjectState, now: DateTime<Utc>) -> u64 {
     let baseline = state.last_progress_event_at.unwrap_or(state.created_at);
-    now.signed_duration_since(baseline)
-        .num_seconds()
-        .max(0) as u64
+    now.signed_duration_since(baseline).num_seconds().max(0) as u64
 }
 
 #[cfg(test)]
@@ -158,7 +156,10 @@ mod tests {
         assert_eq!(classify_with_thresholds(5 * 60, &t), StallLevel::Ok);
         assert_eq!(classify_with_thresholds(59 * 60, &t), StallLevel::Ok);
         assert_eq!(classify_with_thresholds(60 * 60, &t), StallLevel::Warn);
-        assert_eq!(classify_with_thresholds(180 * 60, &t), StallLevel::Suspicious);
+        assert_eq!(
+            classify_with_thresholds(180 * 60, &t),
+            StallLevel::Suspicious
+        );
         assert_eq!(classify_with_thresholds(360 * 60, &t), StallLevel::Escalate);
     }
 

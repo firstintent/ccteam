@@ -17,7 +17,7 @@ use commands::{InitOptions, OutputFormat};
 #[command(
     name = "ccteam",
     version,
-    about = "Autonomous AI development orchestrator built on Claude Code",
+    about = "Autonomous AI development orchestrator built on Claude Code"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -97,7 +97,11 @@ enum Command {
         /// the smart-suggest fallback. Default `claude-haiku-4-5-20251001`
         /// (cheapest + fastest viable). Override with eg
         /// `claude-sonnet-4-5-20251001` for harder briefs.
-        #[arg(long, value_name = "MODEL", default_value = "claude-haiku-4-5-20251001")]
+        #[arg(
+            long,
+            value_name = "MODEL",
+            default_value = "claude-haiku-4-5-20251001"
+        )]
         auto_slug_model: String,
     },
     /// List all known projects.
@@ -396,9 +400,7 @@ enum HookCommand {
     /// Append one event line to ~/.ccteam/progress/<slug>.jsonl.
     /// `event_type` is the `event` field on the resulting JSONL record
     /// (e.g. "PreToolUse" / "Stop" / "session_start").
-    ProgressAppend {
-        event_type: String,
-    },
+    ProgressAppend { event_type: String },
     /// Stop hook: parse last assistant message for `PHASE_DONE: <phase>`
     /// or `ESCALATE: <reason>` and emit the matching progress event.
     ParsePhaseEnd,
@@ -611,9 +613,7 @@ fn run_stop() -> Result<()> {
     match ccteam_core::send_sigterm_to_pidfile(&paths)? {
         Some(pid) => {
             println!("ccteam stop: SIGTERM sent to orchestrator pid {pid}");
-            println!(
-                "tmux sessions are NOT killed — `ccteam start` will reattach to them.",
-            );
+            println!("tmux sessions are NOT killed — `ccteam start` will reattach to them.",);
             Ok(())
         }
         None => {
@@ -691,8 +691,7 @@ fn run_hook(cmd: HookCommand) -> Result<()> {
 }
 
 fn parse_hook_stdin_json() -> Result<serde_json::Value> {
-    serde_json::from_reader(std::io::stdin().lock())
-        .context("parse hook stdin as JSON")
+    serde_json::from_reader(std::io::stdin().lock()).context("parse hook stdin as JSON")
 }
 
 fn run_start(
@@ -703,21 +702,10 @@ fn run_start(
     init_tracing();
     let paths = CcteamPaths::from_env()?;
 
-    // V0.2 M0.16.2: self-heal shipped team seeds on every daemon
-    // start. force=false skips existing files so operator hand-edits
-    // are preserved; the call still ensures `~/.ccteam/teams/<name>/team.yaml`
-    // exists for every shipped team (dev / product-research /
-    // meta-agent) — without this, a fresh install missing `ccteam init`
-    // would leave `is_evergreen("meta-agent") == false` and the
-    // dispatcher would fall into the phase-DAG path.
-    if let Err(err) = ccteam_core::write_all_global_team_templates(&paths.root, false) {
-        tracing::warn!(
-            error = %err,
-            root = %paths.root.display(),
-            "ccteam start: could not seed shipped team templates; \
-             run `ccteam doctor --reset-shipped-teams` if teams are missing",
-        );
-    }
+    // V0.4.0 F60: the shipped team seed writer was deleted with the
+    // phase machinery (F63 will reintroduce a workflow seed). Daemon
+    // start no longer self-heals — operators supply their own
+    // `~/.ccteam/teams/<name>/team.yaml`.
 
     if !paths.phases_dir().exists() {
         eprintln!(
@@ -807,8 +795,9 @@ fn run_new(
 ) -> Result<()> {
     let paths = CcteamPaths::from_env()?;
     let body = match (file, request) {
-        (Some(path), _) => std::fs::read_to_string(&path)
-            .with_context(|| format!("read {}", path.display()))?,
+        (Some(path), _) => {
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?
+        }
         (None, Some(text)) => text,
         (None, None) => {
             anyhow::bail!("ccteam new: provide a request as a positional arg or --file PATH")
@@ -821,10 +810,21 @@ fn run_new(
     };
     let slug = commands::run_new(&paths, body.trim(), &team, opts)?;
     println!("created project {slug} (team: {team})");
-    println!("  spec   : {}", paths.project_ccteam_dir(&slug).join("spec.md").display());
+    println!(
+        "  spec   : {}",
+        paths.project_ccteam_dir(&slug).join("spec.md").display()
+    );
     println!("  state  : {}", paths.project_state(&slug).display());
-    println!("  config : {}", paths.project_dir(&slug).join(".claude/settings.json").display());
-    println!("\nrun `ccteam start --foreground` (in another terminal) to dispatch the first phase.");
+    println!(
+        "  config : {}",
+        paths
+            .project_dir(&slug)
+            .join(".claude/settings.json")
+            .display()
+    );
+    println!(
+        "\nrun `ccteam start --foreground` (in another terminal) to dispatch the first phase."
+    );
     Ok(())
 }
 

@@ -482,6 +482,14 @@ flex 项目使用每 session 一个 `~/.ccteam/progress/<slug>/<sid>.jsonl`,读�
 
 ## 5. Phase 模板 schema
 
+> **V0.4.0 F60 历史归档**:下列字段(`required_inputs` / `required_outputs` /
+> `golden_rules` / `inject_directives` / `escalate_grammar_ref` /
+> `decision_mode` / `max_clarify_rounds` / `sub_skills` / `auto_loop` /
+> `completion_signal` / `agent_team` / 等)随 phase 机制一并在 V0.4.0 F60
+> 删除。F63 引入新 `workflow.yaml` schema(`docs/v0-4-0/prd.md §6.1`),
+> 完全不同的形状(`agents.<role>.trigger: schedule|watch|gate`,**禁止**
+> `prompt:` 字段);旧 phase YAML 不向新机制迁移。本节保留为历史档。
+
 ### 5.1 YAML front matter 完整字段
 
 ```yaml

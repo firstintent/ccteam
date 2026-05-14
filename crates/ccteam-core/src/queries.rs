@@ -150,8 +150,7 @@ fn read_tail_events(path: &std::path::Path, n: usize) -> Result<Vec<Value>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let body =
-        std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let body = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let mut all: Vec<Value> = body
         .lines()
         .filter(|l| !l.trim().is_empty())

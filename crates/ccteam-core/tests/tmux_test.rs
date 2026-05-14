@@ -206,10 +206,7 @@ fn send_keys_delivers_to_the_session() {
     let sentinel = dir.path().join("hello");
     let session = ScopedSession::new(unique_session("send"));
     // Run an interactive shell so it accepts keystrokes.
-    session
-        .session()
-        .start(dir.path(), &["sh", "-i"])
-        .unwrap();
+    session.session().start(dir.path(), &["sh", "-i"]).unwrap();
     // Give the shell a moment to come up.
     std::thread::sleep(std::time::Duration::from_millis(200));
 
@@ -225,7 +222,10 @@ fn send_keys_delivers_to_the_session() {
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    panic!("sentinel {} never appeared — send_keys did not deliver", sentinel.display());
+    panic!(
+        "sentinel {} never appeared — send_keys did not deliver",
+        sentinel.display()
+    );
 }
 
 #[test]
@@ -253,19 +253,32 @@ fn send_keys_works_with_base_index_one() {
     let dir = tempfile::TempDir::new().unwrap();
     let cfg = dir.path().join("tmux.conf");
     std::fs::write(&cfg, "set -g base-index 1\n").unwrap();
-    let socket = format!("ccteam-bidx1-{}-{}", std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed));
+    let socket = format!(
+        "ccteam-bidx1-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
     let session_name = "bidx1";
 
     // Start a session on our private server.
     let status = Command::new("tmux")
         .args([
-            "-L", &socket,
-            "-f", cfg.to_str().unwrap(),
-            "new-session", "-d", "-s", session_name,
-            "-c", dir.path().to_str().unwrap(),
-            "-x", "200", "-y", "50",
-            "sh", "-i",
+            "-L",
+            &socket,
+            "-f",
+            cfg.to_str().unwrap(),
+            "new-session",
+            "-d",
+            "-s",
+            session_name,
+            "-c",
+            dir.path().to_str().unwrap(),
+            "-x",
+            "200",
+            "-y",
+            "50",
+            "sh",
+            "-i",
         ])
         .status()
         .unwrap();
@@ -286,9 +299,14 @@ fn send_keys_works_with_base_index_one() {
     // exist and tmux exits non-zero with "can't find window: 0".
     let out = Command::new("tmux")
         .args([
-            "-L", &socket,
-            "send-keys", "-t", &format!("{session_name}:0"),
-            "-l", "--", "ignored",
+            "-L",
+            &socket,
+            "send-keys",
+            "-t",
+            &format!("{session_name}:0"),
+            "-l",
+            "--",
+            "ignored",
         ])
         .output()
         .unwrap();
@@ -308,9 +326,14 @@ fn send_keys_works_with_base_index_one() {
     let cmd = format!("touch {}", sentinel.display());
     let out = Command::new("tmux")
         .args([
-            "-L", &socket,
-            "send-keys", "-t", session_name,
-            "-l", "--", &cmd,
+            "-L",
+            &socket,
+            "send-keys",
+            "-t",
+            session_name,
+            "-l",
+            "--",
+            &cmd,
         ])
         .output()
         .unwrap();

@@ -45,11 +45,7 @@ use crate::team::TeamSpec;
 
 /// Ordered list of team sources. Resolution walks this list and
 /// returns the first hit. Mirrors Claude Code's `SETTING_SOURCES`.
-pub const TEAM_SOURCES: &[TeamSource] = &[
-    TeamSource::Project,
-    TeamSource::User,
-    TeamSource::Repo,
-];
+pub const TEAM_SOURCES: &[TeamSource] = &[TeamSource::Project, TeamSource::User, TeamSource::Repo];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TeamSource {
@@ -73,12 +69,7 @@ impl TeamSource {
                     .join(name)
                     .join("team.yaml"),
             ),
-            TeamSource::Repo => Some(
-                ctx.global_dir
-                    .join("teams")
-                    .join(name)
-                    .join("team.yaml"),
-            ),
+            TeamSource::Repo => Some(ctx.global_dir.join("teams").join(name).join("team.yaml")),
         }
     }
 
@@ -88,11 +79,7 @@ impl TeamSource {
     ///   doesn't apply (lets the caller fall through),
     /// - `Err(_)` when the file exists but failed to parse (the
     ///   caller logs a warn and falls through — see `resolve_team`).
-    pub fn try_load(
-        &self,
-        name: &str,
-        ctx: &TeamResolveContext,
-    ) -> Result<Option<TeamSpec>> {
+    pub fn try_load(&self, name: &str, ctx: &TeamResolveContext) -> Result<Option<TeamSpec>> {
         let Some(path) = self.path_for(name, ctx) else {
             return Ok(None);
         };
@@ -272,13 +259,10 @@ pub fn save_team(spec: &TeamSpec, ctx: &TeamResolveContext) -> Result<PathBuf> {
         })?;
     }
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    let body = serde_yaml::to_string(spec)
-        .context("serialize TeamSpec to yaml")?;
-    std::fs::write(&path, body)
-        .with_context(|| format!("write {}", path.display()))?;
+    let body = serde_yaml::to_string(spec).context("serialize TeamSpec to yaml")?;
+    std::fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
     Ok(path)
 }
 
@@ -409,7 +393,10 @@ mod tests {
             "name: dev\n",
         );
         write_yaml(
-            &global.join("teams").join("product-research").join("team.yaml"),
+            &global
+                .join("teams")
+                .join("product-research")
+                .join("team.yaml"),
             "name: product-research\n",
         );
         write_yaml(

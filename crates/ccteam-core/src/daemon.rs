@@ -58,8 +58,7 @@ pub fn heartbeat_path(paths: &CcteamPaths) -> PathBuf {
 pub fn write_pidfile(paths: &CcteamPaths) -> Result<PathBuf> {
     let path = pidfile_path(paths);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     if path.exists() {
         match read_pidfile(&path) {
@@ -102,8 +101,7 @@ pub fn remove_pidfile(paths: &CcteamPaths) {
 /// Read the PID from `path`. Surfaces both "missing" and "garbled" as
 /// errors so the caller can decide whether to bail or treat as stale.
 pub fn read_pidfile(path: &Path) -> Result<u32> {
-    let body = std::fs::read_to_string(path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let body = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     body.trim()
         .parse::<u32>()
         .with_context(|| format!("parse pid from {}", path.display()))
@@ -168,8 +166,7 @@ pub fn send_sigterm_to_pidfile(_paths: &CcteamPaths) -> Result<Option<u32>> {
 pub fn write_heartbeat(paths: &CcteamPaths) -> Result<()> {
     let path = heartbeat_path(paths);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     let pid = std::process::id();
     let now = chrono::Utc::now().to_rfc3339();
@@ -252,10 +249,7 @@ pub fn check_health_at(path: &Path, now: SystemTime) -> DaemonHealth {
         Ok(m) => m,
         Err(_) => return DaemonHealth::NoHeartbeat,
     };
-    let mtime = metadata
-        .modified()
-        .ok()
-        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let mtime = metadata.modified().ok().unwrap_or(SystemTime::UNIX_EPOCH);
     let age = now.duration_since(mtime).unwrap_or(Duration::ZERO);
     let age_secs = age.as_secs();
     if age <= HEARTBEAT_GRACE {
@@ -367,7 +361,10 @@ mod tests {
         let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
         let now = mtime + HEARTBEAT_GRACE * 2;
         let health = check_health_at(&path, now);
-        assert!(matches!(health, DaemonHealth::Stale { .. }), "got {health:?}");
+        assert!(
+            matches!(health, DaemonHealth::Stale { .. }),
+            "got {health:?}"
+        );
         assert!(!health.is_healthy());
     }
 

@@ -263,8 +263,8 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         let value: serde_json::Value = serde_json::from_str(raw)
             .map_err(|err| HarnessError::IngestFailed(format!("parse statusline JSON: {err}")))?;
 
-        let model_display_name = pluck_str(&value, FIELD_MODEL_DISPLAY_NAME)
-            .unwrap_or_else(|| "unknown".to_string());
+        let model_display_name =
+            pluck_str(&value, FIELD_MODEL_DISPLAY_NAME).unwrap_or_else(|| "unknown".to_string());
         let context_used_pct = pluck_pct(&value, FIELD_CONTEXT_USED_PCT).unwrap_or(0);
         let cost_usd_total = pluck_f64(&value, FIELD_COST_USD_TOTAL).unwrap_or(0.0);
         let rate_limit_pct = pluck_pct(&value, FIELD_RATE_LIMIT_PCT);
@@ -348,9 +348,9 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         std::thread::sleep(Duration::from_secs(5));
 
         if session.exists() {
-            session
-                .kill()
-                .map_err(|err| HarnessError::ShutdownFailed(format!("tmux kill-session: {err:#}")))?;
+            session.kill().map_err(|err| {
+                HarnessError::ShutdownFailed(format!("tmux kill-session: {err:#}"))
+            })?;
         }
         Ok(())
     }

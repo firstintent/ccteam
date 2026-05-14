@@ -182,14 +182,16 @@ pub struct ProjectSessionContext {
 /// payload to the global progress.jsonl path.
 pub fn slug_from_project_dir(project_dir: &Path) -> Result<String> {
     let state_path = CcteamPaths::project_state_in(project_dir);
-    let bytes = std::fs::read(&state_path)
-        .with_context(|| format!("read {}", state_path.display()))?;
+    let bytes =
+        std::fs::read(&state_path).with_context(|| format!("read {}", state_path.display()))?;
     let v: serde_json::Value = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse {}", state_path.display()))?;
-    let slug = v
-        .get("slug")
-        .and_then(|s| s.as_str())
-        .ok_or_else(|| anyhow!("state.json missing `slug` field at {}", state_path.display()))?;
+    let slug = v.get("slug").and_then(|s| s.as_str()).ok_or_else(|| {
+        anyhow!(
+            "state.json missing `slug` field at {}",
+            state_path.display()
+        )
+    })?;
     Ok(slug.to_string())
 }
 

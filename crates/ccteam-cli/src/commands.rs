@@ -10,24 +10,17 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use serde_json::{json, Map, Value};
 
+use ccteam_core::tmux::TmuxSession;
 use ccteam_core::{
     bootstrap_meta_project, bootstrap_project, current_ccteam_bin, install_ccteam_control_skill,
     install_ccteam_project_creator_skill, install_ccteam_team_author_skill,
     migrate_legacy_skill_dirs, migrate_recommended_agent_symlinks, pick_unused_slug,
-    rewrite_legacy_hook_commands, user_claude_dir, write_all_global_team_templates,
-    write_global_helper_templates, write_global_phase_templates, CcteamPaths,
-    HookCmdRewriteAction, HookCmdRewriteReport, InstallSkillOptions, LegacySkillAction,
-    LegacySkillReport, MetaBootstrapReport, MigrationReport, OutboxEventKind, OutboxMessage,
-    PhaseState, PhaseTemplate, ProjectState, SessionMailbox, session_name_for_project,
+    rewrite_legacy_hook_commands, session_name_for_project, user_claude_dir,
+    write_global_helper_templates, CcteamPaths, HookCmdRewriteAction, HookCmdRewriteReport,
+    InstallSkillOptions, LegacySkillAction, LegacySkillReport, MetaBootstrapReport,
+    MigrationReport, OutboxEventKind, OutboxMessage, PhaseState, ProjectState, SessionMailbox,
     SkillInstallAction, TeamSpec, ToolSurfaceSnapshot, BUILTIN_SUBAGENTS, HELPER_TEMPLATES,
-    PHASE_TEMPLATES,
 };
-// V0.3 M5.0: `run_resume` body lives in `ccteam_core::actions::resume`,
-// so `PhaseHistoryEntry` is now only referenced from the test module
-// (other consumers go through the actions::* path).
-#[cfg(test)]
-use ccteam_core::PhaseHistoryEntry;
-use ccteam_core::tmux::TmuxSession;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum OutputFormat {
@@ -62,27 +55,17 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
         "log",
     ] {
         let dir = paths.root.join(sub);
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("create {}", dir.display()))?;
+        std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     }
 
-    write_global_phase_templates(&paths.root, opts.force)
-        .with_context(|| format!("unpack phase templates to {}", paths.phases_dir().display()))?;
+    // V0.4.0 F60: phase template + shipped-team-bundle writers were
+    // deleted with the rest of the phase machinery. `ccteam init` now
+    // only lays down the directory skeleton + helper templates; F63
+    // reintroduces a workflow.yaml seed writer.
     write_global_helper_templates(&paths.root, opts.force).with_context(|| {
         format!(
             "unpack helper templates to {}",
             paths.templates_dir().display()
-        )
-    })?;
-    // M3.3: also unpack every embedded team.yaml + non-dev team's
-    // phase set so multi-team installs come up out of the box.
-    // dev's phase set is duplicated here (idempotent — `force=false`
-    // skips files already on disk) so the legacy `phases/` dir stays
-    // populated even when this is the only template writer ever called.
-    write_all_global_team_templates(&paths.root, opts.force).with_context(|| {
-        format!(
-            "unpack team bundles (team.yaml + per-team phases) to {}",
-            paths.root.display(),
         )
     })?;
 
@@ -94,11 +77,6 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
     let mut out = String::new();
     out.push_str(&format!("✓ created {}\n", paths.root.display()));
     out.push_str(&format!(
-        "✓ unpacked {} phase templates → {}\n",
-        PHASE_TEMPLATES.len(),
-        paths.phases_dir().display()
-    ));
-    out.push_str(&format!(
         "✓ unpacked {} helper templates → {}\n",
         HELPER_TEMPLATES.len(),
         paths.templates_dir().display()
@@ -109,14 +87,17 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
             "  claude   : {}\n",
             String::from_utf8_lossy(&o.stdout).trim()
         )),
-        _ => out.push_str("  claude   : NOT FOUND on PATH (install: https://claude.com/claude-code)\n"),
+        _ => out
+            .push_str("  claude   : NOT FOUND on PATH (install: https://claude.com/claude-code)\n"),
     }
     match &tmux {
         Ok(o) if o.status.success() => out.push_str(&format!(
             "  tmux     : {}\n",
             String::from_utf8_lossy(&o.stdout).trim()
         )),
-        _ => out.push_str("  tmux     : NOT FOUND on PATH (apt install tmux / brew install tmux)\n"),
+        _ => {
+            out.push_str("  tmux     : NOT FOUND on PATH (apt install tmux / brew install tmux)\n")
+        }
     }
     match &bin {
         Some(p) => out.push_str(&format!("  ccteam   : {}\n", p.display())),
@@ -176,17 +157,11 @@ pub fn run_new(
     if team.trim().is_empty() {
         bail!("ccteam new: --team must be non-empty");
     }
-    // Self-heal shipped seeds before validating — without this, a
-    // first-time `ccteam new --team research` against a freshly-installed
-    // binary would fail with "unknown team". force=false preserves
-    // operator hand-edits.
-    if let Err(err) = ccteam_core::write_all_global_team_templates(&paths.root, false) {
-        tracing::warn!(
-            error = %err,
-            root = %paths.root.display(),
-            "ccteam new: could not seed shipped team templates",
-        );
-    }
+    // V0.4.0 F60: the shipped team seed writer was deleted with the
+    // phase machinery. Users running V0.4 against a fresh install must
+    // supply their own team.yaml via `ccteam doctor --reset-shipped-teams`
+    // (deprecated; will be replaced by `ccteam doctor --install-workflows`
+    // in F63) or by hand-editing `~/.ccteam/teams/<name>/team.yaml`.
     ensure_team_resolvable(paths, team)?;
     // V0.2.2 F40 — warn when the operator passed an alias instead of
     // the canonical team name. The project still bootstraps under the
@@ -218,12 +193,19 @@ fn stamp_project_team_kind(paths: &CcteamPaths, slug: &str, team: &str) -> Resul
 }
 
 fn resolve_team_kind(paths: &CcteamPaths, team: &str) -> Result<ccteam_core::TeamKind> {
-    use ccteam_core::{default_user_staging_dir, resolve_team, TeamResolveContext};
+    use ccteam_core::{default_user_staging_dir, resolve_team, TeamKind, TeamResolveContext};
 
+    // V0.4.0 F60: `dev` and `meta-agent` were previously seeded on disk
+    // by the shipped TEAM_BUNDLES writer. Now there's nothing to read,
+    // so default both to `Workflow` (the legacy phase-driven kind) —
+    // F66 will rewrite this dispatch path against `workflow.yaml`.
+    if team == "dev" || team == ccteam_core::META_TEAM_NAME {
+        return Ok(TeamKind::Workflow);
+    }
     let user_staging = default_user_staging_dir();
     let ctx = TeamResolveContext::for_orchestrator(&paths.root, &user_staging);
-    let spec = resolve_team(team, &ctx)
-        .with_context(|| format!("resolve team `{team}` for team kind"))?;
+    let spec =
+        resolve_team(team, &ctx).with_context(|| format!("resolve team `{team}` for team kind"))?;
     Ok(spec.kind)
 }
 
@@ -351,7 +333,10 @@ fn try_smart_slug(request: &str, model: &str) -> Result<Option<String>> {
     io::stderr().flush().ok();
     let mut line = String::new();
     let stdin = io::stdin();
-    stdin.lock().read_line(&mut line).context("read confirmation")?;
+    stdin
+        .lock()
+        .read_line(&mut line)
+        .context("read confirmation")?;
     let reply = line.trim().to_ascii_lowercase();
     if reply.is_empty() || reply == "y" || reply == "yes" {
         Ok(Some(suggestion))
@@ -390,9 +375,7 @@ fn sanitize_smart_slug(raw: &str) -> Option<String> {
         .lines()
         .map(|l| l.trim())
         .find(|l| !l.is_empty())?
-        .trim_matches(|c: char| {
-            c == '"' || c == '\'' || c == '`' || c.is_ascii_whitespace()
-        })
+        .trim_matches(|c: char| c == '"' || c == '\'' || c == '`' || c.is_ascii_whitespace())
         .trim_start_matches("Slug:")
         .trim();
     let lowered = candidate.to_ascii_lowercase();
@@ -451,9 +434,8 @@ fn ensure_team_resolvable_with_user_staging(
     }
     let yaml_path = paths.root.join("teams").join(team).join("team.yaml");
     if yaml_path.exists() {
-        TeamSpec::load(&yaml_path).with_context(|| {
-            format!("ccteam new: failed to load {}", yaml_path.display())
-        })?;
+        TeamSpec::load(&yaml_path)
+            .with_context(|| format!("ccteam new: failed to load {}", yaml_path.display()))?;
         return Ok(());
     }
     let staging_yaml_path = user_staging_dir.join("teams").join(team).join("team.yaml");
@@ -622,8 +604,8 @@ pub fn run_progress(paths: &CcteamPaths, slug: &str, tail: bool) -> Result<()> {
         bail!("no progress.jsonl yet for {slug}: {}", path.display());
     }
     let mut stdout = std::io::stdout().lock();
-    let initial = std::fs::read_to_string(&path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let initial =
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     stdout.write_all(initial.as_bytes())?;
     if !tail {
         return Ok(());
@@ -879,7 +861,12 @@ fn available_sids(state: &ProjectState) -> String {
     if state.sessions.is_empty() {
         "(none)".into()
     } else {
-        state.sessions.keys().cloned().collect::<Vec<_>>().join(", ")
+        state
+            .sessions
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -888,8 +875,8 @@ fn session_last_event(paths: &CcteamPaths, slug: &str, sid: &str) -> Result<Opti
     if !path.exists() {
         return Ok(None);
     }
-    let body = std::fs::read_to_string(&path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let body =
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     Ok(body
         .lines()
         .rev()
@@ -938,9 +925,7 @@ pub fn collect_decisions(paths: &CcteamPaths) -> Result<Vec<DecisionRow>> {
     }
     let now = Utc::now();
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(dir)
-        .with_context(|| format!("read_dir {}", dir.display()))?
-    {
+    for entry in std::fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
             continue;
@@ -1328,19 +1313,13 @@ fn fallback_not_found_line() -> String {
 ///    `ESCALATE:`) inside the body trigger a warn (not error — bodies
 ///    are user territory; `docs/v0-2/phase-prompt-architecture.md` §9 docks
 ///    this as warn-not-fail by design).
-fn render_validate_team_report(
-    paths: &CcteamPaths,
-    team: &str,
-) -> Result<(String, u32)> {
+fn render_validate_team_report(paths: &CcteamPaths, team: &str) -> Result<(String, u32)> {
     use ccteam_core::{
         default_user_staging_dir, resolve_team, staging_dir_for, validate_staged_team,
-        TeamResolveContext, TEAM_SOURCES,
+        TeamResolveContext,
     };
 
     let mut out = format!("ccteam doctor --validate-team {team}\n\n");
-    // F30 — accumulate every [FAIL] line into a single counter so the
-    // top-level Summary and the `run_doctor` exit code agree. Phase-
-    // section findings sum into this same counter below.
     let mut fails = 0u32;
     let user_staging = default_user_staging_dir();
     let ctx = TeamResolveContext::for_orchestrator(&paths.root, &user_staging);
@@ -1361,11 +1340,8 @@ fn render_validate_team_report(
         out.push('\n');
     }
 
-    let spec = match resolve_team(team, &ctx) {
-        Ok(s) => {
-            out.push_str(&format!("[OK] team.yaml resolves; name=`{}`\n", s.name));
-            s
-        }
+    match resolve_team(team, &ctx) {
+        Ok(s) => out.push_str(&format!("[OK] team.yaml resolves; name=`{}`\n", s.name)),
         Err(err) => {
             out.push_str(&format!("[FAIL] team.yaml load: {err:#}\n"));
             fails += 1;
@@ -1374,296 +1350,55 @@ fn render_validate_team_report(
         }
     };
 
-    if spec.evergreen || spec.kind.is_flex() {
-        let label = if spec.evergreen { "evergreen" } else { "flex" };
-        out.push_str(&format!(
-            "[OK] team is {label} — skipping phase IO / markdown checks\n",
-        ));
-        out.push_str(&format!("\nSummary: 1 ok, 0 warn, {fails} fail\n"));
-        return Ok((out, fails));
-    }
-
-    // Locate the phase dir on disk via the same priority order the
-    // resolver uses. V0.2.2 F41: walk by `spec.name` (canonical), not
-    // the user-supplied `team` arg — when `team` is an F40 alias
-    // (eg `product-research`), the team.yaml lives at the canonical
-    // `teams/research/team.yaml` path, so resolving by alias would
-    // miss it and produce a misleading "could not locate team
-    // directory" failure even though the resolver returned a valid
-    // TeamSpec.
-    let team_dir = TEAM_SOURCES
-        .iter()
-        .filter_map(|s| s.path_for(&spec.name, &ctx))
-        .find(|p| p.exists())
-        .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
-    let team_dir = match team_dir {
-        Some(p) => p,
-        None => {
-            out.push_str(
-                "[FAIL] could not locate team directory after resolve — \
-                 run `ccteam doctor --reset-shipped-teams`\n",
-            );
-            fails += 1;
-            out.push_str(&format!("\nSummary: 0 ok, 0 warn, {fails} fail\n"));
-            return Ok((out, fails));
-        }
-    };
-    let phase_dir = team_dir.join(&spec.phase_dir);
-    if !phase_dir.exists() {
-        out.push_str(&format!(
-            "[FAIL] phase_dir {} does not exist\n",
-            phase_dir.display(),
-        ));
-        fails += 1;
-        out.push_str(&format!("\nSummary: 0 ok, 0 warn, {fails} fail\n"));
-        return Ok((out, fails));
-    }
-
-    // Sort phase markdowns so IO contract checks run in the
-    // deterministic on-disk order (`02-plan-eng.md` < `03-implement.md`
-    // < ...).
-    let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&phase_dir)?
-        .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let p = e.path();
-            if p.extension().and_then(|s| s.to_str()) == Some("md") {
-                Some(p)
-            } else {
-                None
-            }
-        })
-        .collect();
-    entries.sort();
-
-    if entries.is_empty() {
-        out.push_str(&format!(
-            "[WARN] no phase markdowns under {}\n",
-            phase_dir.display(),
-        ));
-        out.push_str(&format!("\nSummary: 0 ok, 1 warn, {fails} fail\n"));
-        return Ok((out, fails));
-    }
-
-    // Project-bootstrapped artifacts the orchestrator writes before
-    // the first phase runs. Treated as "produced by phase[-1]" so the
-    // first phase can declare them as required_inputs without breaking
-    // the IO contract check.
-    let mut produced: std::collections::HashSet<String> =
-        ["spec.md", ".ccteam/spec.md"]
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect();
-
-    let mut ok = 0u32;
-    let mut warns = 0u32;
-
-    for path in &entries {
-        let file = path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
-        match PhaseTemplate::load(path) {
-            Ok(t) => {
-                if let Err(err) = t.validate_m0() {
-                    out.push_str(&format!("[FAIL] {file}: validate_m0: {err:#}\n"));
-                    fails += 1;
-                    continue;
-                }
-                // IO contract: every required_input must be in `produced`.
-                for input in &t.required_inputs {
-                    if !produced.contains(input) {
-                        out.push_str(&format!(
-                            "[WARN] {file}: required_input `{input}` not produced by any prior phase\n",
-                        ));
-                        warns += 1;
-                    }
-                }
-                // Body residue: warn on protocol literals (architecture §9).
-                let body_raw = std::fs::read_to_string(path).unwrap_or_default();
-                let body = strip_frontmatter(&body_raw);
-                let phase_done_literal = format!("PHASE_DONE: {}", t.name);
-                if body.contains(&phase_done_literal) {
-                    out.push_str(&format!(
-                        "[WARN] {file}: body contains `{phase_done_literal}` — V0.2 expects the inject prompt to carry it\n",
-                    ));
-                    warns += 1;
-                }
-                if body.contains("ESCALATE:") {
-                    out.push_str(&format!(
-                        "[WARN] {file}: body contains `ESCALATE:` literal — V0.2 expects the inject prompt to carry it\n",
-                    ));
-                    warns += 1;
-                }
-                if body.trim().is_empty() {
-                    out.push_str(&format!(
-                        "[WARN] {file}: body is empty — phase markdown should still describe the domain task\n",
-                    ));
-                    warns += 1;
-                }
-                // After this phase, its outputs become available to
-                // downstream phases.
-                for o in &t.required_outputs {
-                    produced.insert(o.clone());
-                }
-                out.push_str(&format!("[OK]   {file}: phase=`{}`\n", t.name));
-                ok += 1;
-            }
-            Err(err) => {
-                out.push_str(&format!("[FAIL] {file}: parse: {err:#}\n"));
-                fails += 1;
-            }
-        }
-    }
-
-    out.push_str(&format!(
-        "\nSummary: {ok} ok, {warns} warn, {fails} fail\n",
-    ));
+    // V0.4.0 F60: phase IO / markdown body checks were tied to the
+    // deleted `PhaseTemplate` parser. F63 will reintroduce a
+    // `workflow.yaml` validator; until then the doctor only verifies
+    // the team.yaml itself resolves.
+    out.push_str(
+        "[INFO] phase IO / markdown checks skipped — V0.4.0 F60 removed the phase template parser; \
+         F63 reintroduces a `workflow.yaml` validator.\n",
+    );
+    out.push_str(&format!("\nSummary: 1 ok, 0 warn, {fails} fail\n"));
     Ok((out, fails))
 }
 
-fn strip_frontmatter(body: &str) -> &str {
-    if let Some(rest) = body.strip_prefix("---\n") {
-        if let Some(end) = rest.find("\n---\n") {
-            return &rest[end + 5..];
-        }
-    }
-    body
-}
-
-/// V0.2 M0.18.6: render `<team>` `<phase>`'s inject prompt + body for
-/// debugging. Renders the same `build_phase_prompt_for_template_with_team`
-/// output the orchestrator dispatches, plus the phase markdown body
-/// the assistant sees via `@.ccteam/phases/<phase>.md`. Pure read-only.
-pub fn run_phase_show(
-    paths: &CcteamPaths,
-    team: &str,
-    phase: &str,
-) -> Result<String> {
-    use ccteam_core::{
-        default_user_staging_dir, resolve_team, GoldenRuleEnforcement,
-        TeamResolveContext, TEAM_SOURCES,
-    };
-
-    let user_staging = default_user_staging_dir();
-    // V0.2.1 F28: when run from inside a project tree, layer 1
-    // (Project) wins so `phase show` reflects what the orchestrator
-    // would actually inject. Falls back to user / repo when there's
-    // no `.ccteam/team/team.yaml` in cwd.
-    let cwd = std::env::current_dir().ok();
-    let mut ctx = TeamResolveContext::for_orchestrator(&paths.root, &user_staging);
-    if let Some(cwd) = cwd.as_deref() {
-        if cwd.join(".ccteam").join("team").join("team.yaml").exists() {
-            ctx = ctx.with_project(cwd);
-        }
-    }
-
-    let spec = resolve_team(team, &ctx)
-        .with_context(|| format!("resolve team `{team}`"))?;
-
-    if spec.evergreen || spec.kind.is_flex() {
-        let label = if spec.evergreen { "evergreen" } else { "flex" };
-        bail!(
-            "team `{team}` is {label} — it has no phase DAG, so `phase show` does not apply"
-        );
-    }
-
-    let team_dir = TEAM_SOURCES
-        .iter()
-        .filter_map(|s| s.path_for(team, &ctx))
-        .find(|p| p.exists())
-        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
-        .ok_or_else(|| anyhow::anyhow!("could not locate team directory for `{team}`"))?;
-    let phase_dir = team_dir.join(&spec.phase_dir);
-    let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&phase_dir)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("md"))
-        .collect();
-    entries.sort();
-
-    let mut found_template: Option<PhaseTemplate> = None;
-    let mut found_path: Option<std::path::PathBuf> = None;
-    for path in &entries {
-        match PhaseTemplate::load(path) {
-            Ok(t) if t.name == phase => {
-                found_template = Some(t);
-                found_path = Some(path.clone());
-                break;
-            }
-            _ => continue,
-        }
-    }
-
-    let template = found_template.ok_or_else(|| {
-        anyhow::anyhow!(
-            "team `{team}` has no phase `{phase}` under {} — \
-             check `ccteam doctor --validate-team {team}` for the phase list",
-            phase_dir.display(),
-        )
-    })?;
-    let template_path = found_path.unwrap();
-
-    // Mirror orchestrator's dispatch path: assemble protocol directives
-    // from team.yaml, then build the inject prompt with no attachments
-    // (debug rendering doesn't see prior phase outputs).
-    let protocol_dirs: Vec<&str> = spec
-        .golden_rules
-        .protocol
-        .iter()
-        .filter(|r| r.enforce == GoldenRuleEnforcement::PromptDirective)
-        .filter_map(|r| r.directive.as_deref())
-        .collect();
-    let inject = ccteam_core::progress::build_phase_prompt_for_template_with_team(
-        &template,
-        &[],
-        &protocol_dirs,
+/// V0.4.0 F60: phase template rendering was deleted with the rest of
+/// the phase machinery. The CLI surface is preserved as a `todo!()`-
+/// equivalent stub so `ccteam phase show` returns a clear "not in this
+/// release" error instead of silently no-op'ing; F63 will reintroduce
+/// the equivalent for the new `workflow.yaml` schema.
+pub fn run_phase_show(_paths: &CcteamPaths, _team: &str, _phase: &str) -> Result<String> {
+    bail!(
+        "ccteam phase show: phase template rendering was removed in V0.4.0 F60; \
+         see docs/v0-4-0/prd.md §F63 for the replacement against `workflow.yaml`",
     );
-
-    let body = std::fs::read_to_string(&template_path)
-        .with_context(|| format!("read {}", template_path.display()))?;
-
-    let mut out = String::new();
-    out.push_str(&format!(
-        "# Inject prompt (orchestrator-rendered for `{team}` / `{phase}`)\n\n",
-    ));
-    out.push_str(&format!("```\n{inject}\n```\n\n"));
-    out.push_str(&format!(
-        "# Phase markdown ({})\n\n",
-        template_path.display(),
-    ));
-    out.push_str(&body);
-    if !out.ends_with('\n') {
-        out.push('\n');
-    }
-    Ok(out)
 }
 
 fn render_reset_shipped_teams_report(
-    paths: &CcteamPaths,
-    opts: &DoctorOptions,
+    _paths: &CcteamPaths,
+    _opts: &DoctorOptions,
 ) -> Result<String> {
-    ccteam_core::write_all_global_team_templates(&paths.root, opts.force)?;
+    // V0.4.0 F60: the shipped team bundle writer (dev / research /
+    // meta-agent phase markdowns + team.yaml) was deleted with the
+    // rest of the phase machinery. F63 reintroduces a workflow seed
+    // writer; until then this is a noop with a clear message.
     let mut out = String::from("ccteam doctor --reset-shipped-teams\n\n");
-    if opts.force {
-        out.push_str(
-            "  Re-wrote every shipped team's team.yaml + phase markdowns under \
-             ~/.ccteam/ (--force overwrote operator hand-edits).\n",
-        );
-    } else {
-        out.push_str(
-            "  Seeded shipped teams under ~/.ccteam/ (skipped existing files; \
-             pass --force to overwrite operator hand-edits).\n",
-        );
-    }
+    out.push_str(
+        "  V0.4.0 F60: shipped team bundles removed — supply your own \
+         `~/.ccteam/teams/<name>/team.yaml` until F63 lands the new \
+         workflow seed writer.\n",
+    );
     Ok(out)
 }
 
-fn render_install_memory_bridge_report(paths: &CcteamPaths, opts: &DoctorOptions) -> Result<String> {
-    // V0.2 §6.4 candidate 3: bridge teams are now discovered by
-    // scanning `~/.ccteam/teams/<name>/team.yaml`. Make sure shipped
-    // seeds are present before the scan so a fresh install (no
-    // `ccteam init` yet) still lays down dev / product-research
-    // bridges. force=false preserves operator hand-edits.
-    if !opts.dry_run {
-        ccteam_core::write_all_global_team_templates(&paths.root, false)?;
-    }
+fn render_install_memory_bridge_report(
+    paths: &CcteamPaths,
+    opts: &DoctorOptions,
+) -> Result<String> {
+    // V0.4.0 F60: the shipped team bundle writer was removed; bridge
+    // discovery still walks `~/.ccteam/teams/<name>/team.yaml`, so
+    // operators must supply those by hand (or via the F63 workflow
+    // seed writer once it lands) before running this command.
     let install_opts = ccteam_core::InstallMemoryBridgeOptions {
         dry_run: opts.dry_run,
     };
@@ -1701,7 +1436,10 @@ fn render_install_memory_bridge_report(paths: &CcteamPaths, opts: &DoctorOptions
 fn render_install_mcp_report() -> Result<String> {
     let path = crate::mcp_serve::install_mcp()?;
     let mut out = String::from("ccteam doctor --install-mcp\n\n");
-    out.push_str(&format!("  registered ccteam MCP server in {}\n", path.display()));
+    out.push_str(&format!(
+        "  registered ccteam MCP server in {}\n",
+        path.display()
+    ));
     out.push_str("  tools surface : 9 (interfaces §12.2)\n");
     out.push_str("  consumers     : daily-driver claude + meta-agent\n");
     out.push('\n');
@@ -1791,7 +1529,9 @@ fn render_f44_migration(paths: &CcteamPaths, opts: &DoctorOptions) -> Result<Str
             out.push_str(&render_legacy_skill_line(r, opts.dry_run));
         }
     } else {
-        out.push_str("  legacy skills    no `~/.claude/skills/cct-*` dirs found — nothing to do.\n");
+        out.push_str(
+            "  legacy skills    no `~/.claude/skills/cct-*` dirs found — nothing to do.\n",
+        );
     }
 
     // 2. Stale settings.json hook command paths. Use the orchestrator's
@@ -1810,7 +1550,8 @@ fn render_f44_migration(paths: &CcteamPaths, opts: &DoctorOptions) -> Result<Str
                 out.push_str(&line);
                 if matches!(
                     r.action,
-                    HookCmdRewriteAction::Rewrote { .. } | HookCmdRewriteAction::WouldRewrite { .. }
+                    HookCmdRewriteAction::Rewrote { .. }
+                        | HookCmdRewriteAction::WouldRewrite { .. }
                 ) {
                     any_rewritten = true;
                 }
@@ -1881,8 +1622,7 @@ fn scan_project_settings_for_hook_rewrite(
         Ok(e) => e,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(out),
         Err(err) => {
-            return Err(err)
-                .with_context(|| format!("read_dir {}", projects_root.display()));
+            return Err(err).with_context(|| format!("read_dir {}", projects_root.display()));
         }
     };
     for entry in entries.flatten() {
@@ -1905,17 +1645,29 @@ fn render_install_meta_agent_report(paths: &CcteamPaths, user_handle: &str) -> R
     let mut out = String::from("ccteam doctor --install-meta-agent\n\n");
     out.push_str(&format!("  user handle      {user_handle}\n"));
     out.push_str(&format!("  project slug     {}\n", report.slug));
-    out.push_str(&format!("  project dir      {}\n", report.project_dir.display()));
-    out.push_str(&format!("  role prompt      {}\n", report.claude_md.display()));
+    out.push_str(&format!(
+        "  project dir      {}\n",
+        report.project_dir.display()
+    ));
+    out.push_str(&format!(
+        "  role prompt      {}\n",
+        report.claude_md.display()
+    ));
     out.push_str(&format!(
         "  status           {}\n",
-        if report.already_existed { "refreshed" } else { "created" },
+        if report.already_existed {
+            "refreshed"
+        } else {
+            "created"
+        },
     ));
     out.push('\n');
     let tmux_session = ccteam_core::meta_session_name(user_handle)?;
     out.push_str(&format!("tmux session     {tmux_session}\n"));
     out.push_str(&format!("attach with      tmux attach -t {tmux_session}\n"));
-    out.push_str("\nrun `ccteam start --foreground` (in another terminal) to wake the meta session.\n");
+    out.push_str(
+        "\nrun `ccteam start --foreground` (in another terminal) to wake the meta session.\n",
+    );
     Ok(out)
 }
 
@@ -1940,9 +1692,7 @@ fn render_migrate_recommended_agents_report(opts: &DoctorOptions) -> Result<Stri
     }
     out.push('\n');
     if opts.dry_run {
-        out.push_str(
-            "no changes made (--dry-run). drop the flag to apply.\n",
-        );
+        out.push_str("no changes made (--dry-run). drop the flag to apply.\n");
     } else {
         out.push_str(&format!(
             "removed {} stale symlink(s); spawned project sessions now resolve plugin agents \
@@ -1957,10 +1707,7 @@ fn render_migration_line(r: &MigrationReport, dry_run: bool) -> String {
     let label = if dry_run { "would remove" } else { "removed" };
     format!(
         "  {:<28} {:<14} -> {}\n",
-        r.target
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("?"),
+        r.target.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
         label,
         r.previous_link.display(),
     )
@@ -2012,22 +1759,13 @@ fn render_screenshot_smoke_report(paths: &CcteamPaths, slug: &str) -> Result<Str
     Ok(out)
 }
 
-fn render_tool_surface_report(paths: &CcteamPaths) -> Result<String> {
+fn render_tool_surface_report(_paths: &CcteamPaths) -> Result<String> {
     let claude = user_claude_dir()?;
     let snap = ToolSurfaceSnapshot::scan(&claude)?;
-    let templates = load_local_phase_templates(paths)?;
 
     let mut out = String::new();
     out.push_str("ccteam doctor --tool-surface\n");
-    out.push_str(&format!(
-        "\nclaude dir       : {}\n",
-        claude.display()
-    ));
-    out.push_str(&format!(
-        "phase templates  : {} loaded from {}\n",
-        templates.len(),
-        paths.phases_dir().display(),
-    ));
+    out.push_str(&format!("\nclaude dir       : {}\n", claude.display()));
     out.push_str(&format!(
         "subagents seen   : {} (incl. {} built-ins)\n",
         snap.subagents.len(),
@@ -2036,91 +1774,11 @@ fn render_tool_surface_report(paths: &CcteamPaths) -> Result<String> {
     out.push_str(&format!("skills seen      : {}\n", snap.skills.len()));
     out.push_str(&format!("mcp servers seen : {}\n", snap.mcp.len()));
     out.push('\n');
-
-    if templates.is_empty() {
-        out.push_str(
-            "no phase templates under ~/.ccteam/phases/ — run `ccteam init` first.\n",
-        );
-        return Ok(out);
-    }
-
-    out.push_str("| phase | kind | name | status | fix |\n");
-    out.push_str("|---|---|---|---|---|\n");
-    let mut any_missing = false;
-    for t in &templates {
-        let req = &t.tools_required;
-        let mut emitted = false;
-        for kind_name in [
-            ("subagent", &req.subagents, &snap.subagents),
-            ("skill", &req.skills, &snap.skills),
-            ("mcp", &req.mcp, &snap.mcp),
-        ] {
-            let (kind, list, set) = kind_name;
-            for name in list {
-                emitted = true;
-                if set.contains(name) {
-                    out.push_str(&format!(
-                        "| {phase} | {kind} | `{name}` | OK | — |\n",
-                        phase = t.name,
-                    ));
-                } else {
-                    any_missing = true;
-                    let m = match kind {
-                        "subagent" => ccteam_core::MissingTool::Subagent(name.clone()),
-                        "skill" => ccteam_core::MissingTool::Skill(name.clone()),
-                        _ => ccteam_core::MissingTool::Mcp(name.clone()),
-                    };
-                    out.push_str(&format!(
-                        "| {phase} | {kind} | `{name}` | **MISSING** | {fix} |\n",
-                        phase = t.name,
-                        fix = m.fix_hint(),
-                    ));
-                }
-            }
-        }
-        if !emitted {
-            out.push_str(&format!(
-                "| {phase} | — | — | none required | — |\n",
-                phase = t.name,
-            ));
-        }
-    }
-
-    out.push('\n');
-    if any_missing {
-        out.push_str(
-            "**Verdict:** at least one phase has a missing tool. \
-             `ccteam start` will refuse until they're installed (or pass --skip-tool-check).\n",
-        );
-    } else {
-        out.push_str("**Verdict:** all phase tool dependencies reachable.\n");
-    }
-    Ok(out)
-}
-
-fn load_local_phase_templates(paths: &CcteamPaths) -> Result<Vec<PhaseTemplate>> {
-    let dir = paths.phases_dir();
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    let mut entries: Vec<_> = std::fs::read_dir(&dir)
-        .with_context(|| format!("read_dir {}", dir.display()))?
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .is_some_and(|x| x.eq_ignore_ascii_case("md"))
-        })
-        .collect();
-    entries.sort_by_key(|e| e.file_name());
-    let mut out = Vec::with_capacity(entries.len());
-    for e in entries {
-        let path = e.path();
-        out.push(
-            PhaseTemplate::load(&path)
-                .with_context(|| format!("load {}", path.display()))?,
-        );
-    }
+    out.push_str(
+        "V0.4.0 F60: phase template walk removed. F63 will reintroduce \
+         a workflow-aware tool-surface check; until then this report \
+         only enumerates what's installed under ~/.claude/.\n",
+    );
     Ok(out)
 }
 
@@ -2190,7 +1848,9 @@ fn render_ls_text(projects: &[ProjectSummary], daemon_up: bool) -> String {
         );
         return out;
     }
-    out.push_str("SLUG                                     PHASE          STATE       COST   AGE\n");
+    out.push_str(
+        "SLUG                                     PHASE          STATE       COST   AGE\n",
+    );
     for p in projects {
         let phase = display_phase(&p.state.current_phase);
         out.push_str(&format!(
@@ -2217,10 +1877,10 @@ fn display_phase(phase: &str) -> &str {
 }
 
 fn render_ls_json(projects: &[ProjectSummary], daemon_up: bool) -> Result<String> {
-    let active_count = projects
-        .iter()
-        .filter(|p| p.state.phase_state == PhaseState::InFlight)
-        .count();
+    // V0.4.0 F60: the phase state machine was deleted; "active" can no
+    // longer be derived from `phase_state == InFlight`. F66 will
+    // recompute this from `state.sessions` (live agent count).
+    let active_count = 0usize;
     let arr: Vec<Value> = projects
         .iter()
         .map(|p| {
@@ -2262,7 +1922,10 @@ fn render_show_text(
 ) -> String {
     let mut out = String::new();
     out.push_str(&format!("# {} ({})\n\n", state.slug, state.tmux_session));
-    out.push_str(&format!("current phase  : {}\n", display_phase(&state.current_phase)));
+    out.push_str(&format!(
+        "current phase  : {}\n",
+        display_phase(&state.current_phase)
+    ));
     out.push_str(&format!(
         "phase state    : {}\n",
         phase_state_str(&state.phase_state)
@@ -2289,11 +1952,7 @@ fn render_show_text(
         out.push_str("  (none yet)\n");
     } else {
         for (k, v) in artifacts {
-            out.push_str(&format!(
-                "  {:<18} {}\n",
-                k,
-                v.as_str().unwrap_or("<?>")
-            ));
+            out.push_str(&format!("  {:<18} {}\n", k, v.as_str().unwrap_or("<?>")));
         }
     }
     out.push_str(&format!("\nrecent events ({}):\n", recent.len()));
@@ -2326,10 +1985,8 @@ fn render_show_json(
 
 fn phase_state_str(s: &PhaseState) -> &'static str {
     match s {
-        PhaseState::InFlight => "in_flight",
         PhaseState::Idle => "idle",
-        PhaseState::AutoLocked => "fix_locked",
-        PhaseState::DonePending { .. } => "done_pending",
+        PhaseState::Done => "done",
     }
 }
 
@@ -2375,9 +2032,7 @@ pub fn run_watchdog_scan(
     if let Some(handle) = push_to_user_handle {
         for alert in &alerts {
             ccteam_core::push_watchdog_alert_to_meta_outbox(paths, handle, alert)
-                .with_context(|| {
-                    format!("push watchdog alert to meta outbox for `{handle}`")
-                })?;
+                .with_context(|| format!("push watchdog alert to meta outbox for `{handle}`"))?;
         }
     }
     Ok(match format {
@@ -2398,11 +2053,7 @@ fn render_watchdog_text(alerts: &[ccteam_core::WatchdogAlert], pushed: bool) -> 
     let mut out = format!("watchdog: {} alert(s)\n", alerts.len());
     for a in alerts {
         let scope = a.slug.as_deref().unwrap_or("(global)");
-        out.push_str(&format!(
-            "  [{}] {scope}: {}\n",
-            a.kind.as_str(),
-            a.message,
-        ));
+        out.push_str(&format!("  [{}] {scope}: {}\n", a.kind.as_str(), a.message,));
     }
     if pushed {
         out.push_str("(also written to meta-agent outbox)\n");
@@ -2506,8 +2157,11 @@ pub fn install_statusline_adapter(_paths: &CcteamPaths) -> Result<String> {
     let existing = match std::fs::read_to_string(&target) {
         Ok(s) => Some(s),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-        Err(err) => return Err(anyhow::Error::from(err)
-            .context(format!("read existing {}", target.display()))),
+        Err(err) => {
+            return Err(
+                anyhow::Error::from(err).context(format!("read existing {}", target.display()))
+            )
+        }
     };
 
     let backup_path: Option<std::path::PathBuf> = match existing.as_deref() {
@@ -2560,8 +2214,7 @@ pub fn install_statusline_adapter(_paths: &CcteamPaths) -> Result<String> {
 /// CLAUDE.md §三). The `(V0.3.1 F46 ...)` suffix mirrors the F39
 /// memory-bridge marker convention so future audits can grep one
 /// pattern across both surfaces.
-const STATUSLINE_MARKER_BEGIN: &str =
-    "# ccteam-managed:statusline begin (V0.3.1 F46";
+const STATUSLINE_MARKER_BEGIN: &str = "# ccteam-managed:statusline begin (V0.3.1 F46";
 
 fn render_statusline_wrapper(bin: &std::path::Path, backup: Option<&std::path::Path>) -> String {
     let bin_disp = bin.display().to_string();
@@ -2579,7 +2232,10 @@ fn render_statusline_wrapper(bin: &std::path::Path, backup: Option<&std::path::P
     if let Some(bak) = backup {
         out.push_str("# Passthrough to user's original (preserved as backup)\n");
         out.push_str(&format!("if [ -x \"{}\" ]; then\n", bak.display()));
-        out.push_str(&format!("    printf '%s' \"$INPUT\" | \"{}\"\n", bak.display()));
+        out.push_str(&format!(
+            "    printf '%s' \"$INPUT\" | \"{}\"\n",
+            bak.display()
+        ));
         out.push_str("fi\n");
     }
     out
@@ -2743,25 +2399,25 @@ mod tests {
     fn run_new_records_team_in_state_json() {
         // M3.1 F12/F13: --team must persist into state.json so the
         // orchestrator can route this project's phase set.
-        // V0.2 M0.16.2: non-dev teams require team.yaml on disk;
-        // `run_new` self-heals shipped seeds first, so
-        // `product-research`'s yaml lands at
-        // ~/.ccteam/teams/product-research/team.yaml during this
-        // call — no manual `ccteam init` needed.
+        // V0.4.0 F60: shipped team bundles deleted — the user-authored
+        // team.yaml must already exist on disk before run_new.
         ensure_isolation();
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
-        let slug =
-            run_new_t4(&paths, "ai recipe generator idea", "product-research").unwrap();
+        // Seed a minimal research team yaml by hand (F60 removed the
+        // shipped writer).
+        let yaml = paths.root.join("teams/research/team.yaml");
+        std::fs::create_dir_all(yaml.parent().unwrap()).unwrap();
+        std::fs::write(&yaml, "name: research\n").unwrap();
+        let slug = run_new_t4(&paths, "ai recipe generator idea", "research").unwrap();
         let state = ProjectState::load(&paths.project_state(&slug)).unwrap();
-        assert_eq!(state.team, "product-research");
+        assert_eq!(state.team, "research");
     }
 
     #[test]
     fn run_new_rejects_unknown_team_with_helpful_error() {
-        // M3.3 + V0.2 M0.16.2: unknown team (not in shipped seeds, not
-        // on disk after self-heal) must fail-fast with a clear pointer
-        // to ~/.ccteam/teams/<team>/team.yaml.
+        // M3.3: unknown team must fail-fast with a clear pointer to
+        // ~/.ccteam/teams/<team>/team.yaml.
         ensure_isolation();
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
@@ -2773,13 +2429,6 @@ mod tests {
             msg.contains("teams/marketing/team.yaml"),
             "should point at the missing path",
         );
-        // After M0.16.2 self-heal, the disk-driven team list includes
-        // the shipped seeds — the error message lists those so users
-        // see the catalog of options. V0.2.2 F40: `research` is the
-        // canonical name; `product-research` only exists as an alias
-        // (no directory on disk), so the help message lists `research`.
-        assert!(msg.contains("dev"));
-        assert!(msg.contains("research"));
     }
 
     #[test]
@@ -2796,21 +2445,13 @@ mod tests {
             .join("custom-team")
             .join("team.yaml");
         std::fs::create_dir_all(yaml_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &yaml_path,
-            "name: custom-team\nphase_dir: phases-custom\n",
-        )
-        .unwrap();
-        // run_new without embedded phases for `custom-team` will fail
-        // later in bootstrap_project (no template bundle), but
-        // ensure_team_resolvable should accept the team.yaml first.
-        // The error we get back should NOT mention "unknown team".
-        let err = run_new_t4(&paths, "do a thing", "custom-team").unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            !msg.contains("unknown team"),
-            "team.yaml on disk should pass the resolve check; got: {msg}",
-        );
+        std::fs::write(&yaml_path, "name: custom-team\nphase_dir: phases-custom\n").unwrap();
+        // V0.4.0 F60: bootstrap_project no longer requires phase
+        // template bundles, so run_new succeeds for any user-authored
+        // team whose team.yaml is on disk.
+        let slug = run_new_t4(&paths, "do a thing", "custom-team")
+            .expect("user-authored team.yaml should pass resolve");
+        assert!(slug.starts_with("custom-team-"), "got: {slug}");
     }
 
     #[test]
@@ -2942,10 +2583,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
         let slug = run_new_t4(&paths, "demo", "dev").unwrap();
-        // simulate an escalated state
         let state_path = paths.project_state(&slug);
         let mut state = ProjectState::load(&state_path).unwrap();
-        state.phase_state = PhaseState::InFlight;
         state.user_pause_pending = true;
         state.save(&state_path).unwrap();
         let esc = paths.project_ccteam_dir(&slug).join("escalation.md");
@@ -2955,70 +2594,14 @@ mod tests {
         let s2 = ProjectState::load(&state_path).unwrap();
         assert_eq!(s2.phase_state, PhaseState::Idle);
         assert!(!s2.user_pause_pending);
-        assert!(!esc.exists(), "escalation.md should be archived after resume");
+        assert!(
+            !esc.exists(),
+            "escalation.md should be archived after resume"
+        );
     }
 
     #[test]
-    fn run_resume_appends_resumed_history_after_escalated_entry() {
-        // E2E 2026-05-06 F8: an escalated `phase_history` entry leaves
-        // `Dag::is_terminal_state` permanently true. `ccteam resume`
-        // must append a paired `"resumed"` entry so future ticks
-        // dispatch again. Append-only — the original escalated entry
-        // stays intact for audit.
-        ensure_isolation();
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        let slug = run_new_t4(&paths, "demo", "dev").unwrap();
-
-        let state_path = paths.project_state(&slug);
-        let mut state = ProjectState::load(&state_path).unwrap();
-        state.phase_state = PhaseState::InFlight;
-        state.current_phase = "fix".into();
-        state.phase_history.push(PhaseHistoryEntry {
-            phase: "fix".into(),
-            status: "escalated".into(),
-            duration_s: 0,
-            cost_usd: 0.0,
-        });
-        state.save(&state_path).unwrap();
-
-        run_resume(&paths, &slug).unwrap();
-        let s2 = ProjectState::load(&state_path).unwrap();
-        assert_eq!(s2.phase_history.len(), 2, "resume must append, not mutate");
-        assert_eq!(s2.phase_history[0].status, "escalated");
-        assert_eq!(s2.phase_history[1].status, "resumed");
-        assert_eq!(s2.phase_history[1].phase, "fix");
-    }
-
-    #[test]
-    fn run_resume_does_not_append_resumed_when_no_escalation() {
-        // Non-escalated resume (e.g. user attached + paused) must not
-        // pollute phase_history with a spurious resumed entry — that
-        // would keep growing on repeat resumes for benign pauses.
-        ensure_isolation();
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        let slug = run_new_t4(&paths, "demo", "dev").unwrap();
-
-        let state_path = paths.project_state(&slug);
-        let mut state = ProjectState::load(&state_path).unwrap();
-        state.user_pause_pending = true;
-        state.phase_history.push(PhaseHistoryEntry {
-            phase: "implement".into(),
-            status: "passed".into(),
-            duration_s: 0,
-            cost_usd: 0.0,
-        });
-        state.save(&state_path).unwrap();
-
-        run_resume(&paths, &slug).unwrap();
-        let s2 = ProjectState::load(&state_path).unwrap();
-        assert_eq!(s2.phase_history.len(), 1);
-        assert_eq!(s2.phase_history[0].status, "passed");
-    }
-
-    #[test]
-    fn run_init_creates_global_skeleton_and_unpacks_phases() {
+    fn run_init_creates_global_skeleton_and_unpacks_helpers() {
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
         let report = run_init(&paths, InitOptions::default()).unwrap();
@@ -3029,9 +2612,8 @@ mod tests {
                 paths.root.join(sub).display()
             );
         }
-        assert!(paths.phases_dir().join("02-plan-eng.md").is_file());
-        assert!(paths.phases_dir().join("09-ship.md").is_file());
-        // M2.4: helper templates land alongside phase templates.
+        // V0.4.0 F60: phase template writing removed (F63 reintroduces
+        // workflow seeds). Only helper templates land via init now.
         assert!(paths
             .templates_dir()
             .join("review-with-user-loop.md")
@@ -3040,17 +2622,19 @@ mod tests {
             .templates_dir()
             .join("kickoff-reverse-interview.md")
             .is_file());
-        assert!(report.contains("phase templates"));
         assert!(report.contains("helper templates"));
         assert!(report.contains("next"));
     }
 
     #[test]
     fn run_init_is_idempotent_and_preserves_user_edits() {
+        // V0.4.0 F60: phase template writer removed; the
+        // helper-template writer still uses the same idempotency
+        // contract (skip-existing without --force; overwrite with).
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
         run_init(&paths, InitOptions::default()).unwrap();
-        let path = paths.phases_dir().join("02-plan-eng.md");
+        let path = paths.templates_dir().join("review-with-user-loop.md");
         std::fs::write(&path, "USER EDIT").unwrap();
         run_init(&paths, InitOptions::default()).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "USER EDIT");
@@ -3091,11 +2675,28 @@ mod tests {
 
     #[test]
     fn run_doctor_install_memory_bridge_writes_both_team_files() {
+        // V0.4.0 F60: shipped team bundles deleted; install_memory_bridge
+        // discovers teams by scanning `<root>/teams/<name>/team.yaml`.
+        // Seed dev + research yamls inline so the disk scan finds them.
         ensure_isolation();
         let _guard = env_lock().lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
         std::env::set_var("CLAUDE_CONFIG_HOME", tmp.path().to_str().unwrap());
+        for (team, yaml) in [
+            (
+                "dev",
+                "name: dev\nretro_schema:\n  - field: tech_stack\n    description: stack notes\n",
+            ),
+            (
+                "research",
+                "name: research\nretro_schema:\n  - field: findings\n    description: notes\n",
+            ),
+        ] {
+            let team_dir = paths.root.join("teams").join(team);
+            std::fs::create_dir_all(&team_dir).unwrap();
+            std::fs::write(team_dir.join("team.yaml"), yaml).unwrap();
+        }
 
         let opts = DoctorOptions {
             install_memory_bridge: true,
@@ -3104,11 +2705,6 @@ mod tests {
         let report = run_doctor(&paths, opts).unwrap();
         assert!(report.contains("install-memory-bridge"));
         assert!(report.contains("dev"));
-        // V0.2.2 F40: research is the canonical team name; the bridge
-        // file scaffold ships at ccteam-lessons-research.md. Old
-        // installs already on disk keep their
-        // ccteam-lessons-product-research.md file untouched (different
-        // test surface — no need to fixture it here).
         assert!(report.contains("research"));
 
         let dev_path = tmp.path().join("rules/ccteam-lessons-dev.md");
@@ -3137,8 +2733,14 @@ mod tests {
             ..DoctorOptions::default()
         };
         let report = run_doctor(&paths, opts).unwrap();
-        assert!(report.contains("install-skill"), "skill install report missing");
-        assert!(report.contains("install-meta-agent"), "meta install report missing");
+        assert!(
+            report.contains("install-skill"),
+            "skill install report missing"
+        );
+        assert!(
+            report.contains("install-meta-agent"),
+            "meta install report missing"
+        );
         assert!(report.contains("meta-rob"), "meta slug should be reported");
 
         // Project directory exists.
@@ -3151,7 +2753,11 @@ mod tests {
         // Skill landed under the redirected ~/.claude/. F44 reverts F39:
         // both shipped skills are written under canonical ccteam-* names.
         let control = tmp.path().join("skills/ccteam-control/SKILL.md");
-        assert!(control.is_file(), "ccteam-control SKILL.md not written: {}", control.display());
+        assert!(
+            control.is_file(),
+            "ccteam-control SKILL.md not written: {}",
+            control.display()
+        );
         let team_author = tmp.path().join("skills/ccteam-team-author/SKILL.md");
         assert!(
             team_author.is_file(),
@@ -3221,7 +2827,10 @@ mod tests {
 
         // F44 reverts F39: shipped skills land under canonical ccteam-* names.
         assert!(tmp.path().join("skills/ccteam-control/SKILL.md").is_file());
-        assert!(tmp.path().join("skills/ccteam-team-author/SKILL.md").is_file());
+        assert!(tmp
+            .path()
+            .join("skills/ccteam-team-author/SKILL.md")
+            .is_file());
         std::env::remove_var("CLAUDE_CONFIG_HOME");
     }
 
@@ -3250,8 +2859,14 @@ mod tests {
             ..DoctorOptions::default()
         };
         let report = run_doctor(&paths, opts).unwrap();
-        assert!(report.contains("F44 reverse migration"), "F44 report header missing: {report}");
-        assert!(report.contains("cct-control/"), "legacy entry missing: {report}");
+        assert!(
+            report.contains("F44 reverse migration"),
+            "F44 report header missing: {report}"
+        );
+        assert!(
+            report.contains("cct-control/"),
+            "legacy entry missing: {report}"
+        );
         assert!(!legacy.exists(), "legacy cct-control dir survived");
         // New (canonical) name still landed.
         assert!(tmp.path().join("skills/ccteam-control/SKILL.md").is_file());
@@ -3280,116 +2895,24 @@ mod tests {
             ..DoctorOptions::default()
         };
         let report = run_doctor(&paths, opts).unwrap();
-        assert!(report.contains("preserved"), "F44 should report preserve: {report}");
-        assert!(legacy.exists(), "hand-edited legacy dir was unexpectedly removed");
+        assert!(
+            report.contains("preserved"),
+            "F44 should report preserve: {report}"
+        );
+        assert!(
+            legacy.exists(),
+            "hand-edited legacy dir was unexpectedly removed"
+        );
         std::env::remove_var("CLAUDE_CONFIG_HOME");
     }
 
-    // ---------------- V0.2 M0.16.2: shipped-team seed regen ----------------
+    // V0.4.0 F60: shipped-team seed writer (dev / research / meta-agent
+    // bundles + write_all_global_team_templates) was deleted with the
+    // phase machinery. F63 reintroduces a workflow.yaml seed writer.
 
-    #[test]
-    fn run_doctor_reset_shipped_teams_seeds_all_teams_under_global_dir() {
-        ensure_isolation();
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        let opts = DoctorOptions {
-            reset_shipped_teams: true,
-            ..DoctorOptions::default()
-        };
-        let report = run_doctor(&paths, opts).unwrap();
-        assert!(report.contains("reset-shipped-teams"));
-        // Every shipped team's team.yaml lands on disk under the
-        // declared layout. (Layout migration to teams/<name>/ is
-        // M0.17; for now teams/<name>/team.yaml is what
-        // write_all_global_team_templates writes.)
-        // V0.2.2 F40: `research` (canonical) replaced `product-research`.
-        for team in ["dev", "research", "meta-agent"] {
-            let yaml = paths.root.join("teams").join(team).join("team.yaml");
-            assert!(
-                yaml.is_file(),
-                "shipped team `{team}` not seeded at {}",
-                yaml.display(),
-            );
-        }
-    }
-
-    #[test]
-    fn run_doctor_reset_shipped_teams_preserves_operator_edits_without_force() {
-        ensure_isolation();
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-
-        // First seed lays down the shipped dev/team.yaml. Tamper with
-        // it the way an operator would.
-        run_doctor(&paths, DoctorOptions {
-            reset_shipped_teams: true,
-            ..DoctorOptions::default()
-        }).unwrap();
-        let dev_yaml = paths.root.join("teams").join("dev").join("team.yaml");
-        std::fs::write(&dev_yaml, "name: dev\ndescription: hand-edited\n").unwrap();
-
-        // Re-run without --force; the hand-edit must survive.
-        run_doctor(&paths, DoctorOptions {
-            reset_shipped_teams: true,
-            ..DoctorOptions::default()
-        }).unwrap();
-        let body = std::fs::read_to_string(&dev_yaml).unwrap();
-        assert!(body.contains("hand-edited"), "operator edit clobbered without --force");
-
-        // Now with --force, the seed wins again.
-        run_doctor(&paths, DoctorOptions {
-            reset_shipped_teams: true,
-            force: true,
-            ..DoctorOptions::default()
-        }).unwrap();
-        let body = std::fs::read_to_string(&dev_yaml).unwrap();
-        assert!(body.contains("Software development team"));
-        assert!(!body.contains("hand-edited"));
-    }
-
-    #[test]
-    fn run_new_self_heals_shipped_seeds_for_first_time_install() {
-        // V0.2 §6.4 candidate 3: a fresh install (no `ccteam init`) where
-        // ~/.ccteam/teams/ is empty must still let `ccteam new --team
-        // research` succeed because run_new self-heals.
-        // V0.2.2 F40: canonical name is `research`.
-        ensure_isolation();
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        assert!(!paths.root.join("teams").exists(), "precondition: empty global dir");
-
-        let slug = run_new_t4(&paths, "Verify research bootstraps", "research")
-            .expect("run_new must auto-seed shipped templates before validation");
-        assert!(slug.starts_with("research-"));
-        // The seed must have landed during run_new.
-        assert!(paths.root.join("teams/research/team.yaml").is_file());
-    }
-
-    #[test]
-    fn run_new_accepts_legacy_alias_product_research_with_deprecation_warn() {
-        // V0.2.2 F40 — `ccteam new --team product-research` still works
-        // (alias resolution against shipped `teams/research/team.yaml`).
-        // The slug carries the typed-team prefix so the project lands at
-        // ~/projects/product-research-<base>; state.json::team also
-        // preserves the typed alias so the daemon's tick walks the
-        // alias-aware team_runtime path. Visible deprecation goes to
-        // stderr (not asserted here — captured-output isolation is
-        // brittle in unit tests; the e2e test in
-        // crates/ccteam-cli/tests/m3_product_research_e2e_test.rs covers
-        // the alias resolution end-to-end).
-        ensure_isolation();
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        let slug = run_new_t4(&paths, "ai recipe generator", "product-research")
-            .expect("alias must resolve to canonical research team");
-        assert!(
-            slug.starts_with("product-research-"),
-            "alias-input slug should preserve the typed team prefix; got `{slug}`",
-        );
-        let state =
-            ccteam_core::ProjectState::load(&paths.project_state(&slug)).unwrap();
-        assert_eq!(state.team, "product-research");
-    }
+    // V0.4.0 F60: alias resolution against shipped research team.yaml
+    // removed — F40's deprecation path depended on the deleted shipped
+    // bundle writer. F63 will revisit alias semantics for workflow.yaml.
 
     // -------- ccteam decisions (M1 follow-up) --------
 
@@ -3476,7 +2999,10 @@ mod tests {
             "informational",
         );
         let rows = collect_decisions(&paths).unwrap();
-        assert!(rows.is_empty(), "non-decision event_kinds must be filtered out");
+        assert!(
+            rows.is_empty(),
+            "non-decision event_kinds must be filtered out"
+        );
     }
 
     #[test]
@@ -3589,7 +3115,10 @@ mod tests {
         let rows = collect_decisions(&paths).unwrap();
         assert_eq!(rows.len(), 1);
         let summary = &rows[0].summary;
-        assert!(summary.ends_with("..."), "long summaries should be truncated with ellipsis");
+        assert!(
+            summary.ends_with("..."),
+            "long summaries should be truncated with ellipsis"
+        );
         assert!(summary.chars().count() <= 80);
     }
 
@@ -3619,24 +3148,9 @@ mod tests {
 
     // ---------------- V0.2 M0.18.5 doctor --validate-team ----------------
 
-    #[test]
-    fn validate_team_reports_ok_for_shipped_dev_team() {
-        ensure_isolation();
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        // Seed shipped teams on disk so the resolver can walk them.
-        ccteam_core::write_all_global_team_templates(&paths.root, false).unwrap();
-
-        let opts = DoctorOptions {
-            validate_team: Some("dev".into()),
-            ..DoctorOptions::default()
-        };
-        let report = run_doctor(&paths, opts).unwrap();
-        assert!(report.contains("validate-team dev"), "got: {report}");
-        assert!(report.contains("[OK] team.yaml"), "got: {report}");
-        assert!(report.contains("plan-eng"), "got: {report}");
-        assert!(report.contains("Summary:"), "got: {report}");
-    }
+    // V0.4.0 F60: validate-team / phase-show shipped-team smoke tests
+    // were tied to the deleted shipped-team-bundle writer. F63 will
+    // reintroduce equivalents against `workflow.yaml`.
 
     #[test]
     fn validate_team_reports_fail_for_unknown_team() {
@@ -3655,119 +3169,13 @@ mod tests {
         assert!(msg.contains("1 fail"), "expected fails counter; got: {msg}");
     }
 
-
     #[test]
-    fn validate_team_resolves_alias_to_canonical_dir() {
-        // V0.2.2 F41 regression: when --validate-team is given an F40
-        // alias (eg `product-research`), the command should resolve to
-        // canonical TeamSpec (`research`) AND locate the phase dir at
-        // the canonical path (`teams/research/`), not at the alias arg
-        // (`teams/product-research/`, which doesn't exist after F40).
+    fn phase_show_errors_with_v040_not_implemented_message() {
         ensure_isolation();
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
-        ccteam_core::write_all_global_team_templates(&paths.root, false).unwrap();
-
-        let opts = DoctorOptions {
-            validate_team: Some("product-research".into()),
-            ..DoctorOptions::default()
-        };
-        let report = run_doctor(&paths, opts).unwrap();
-        assert!(
-            report.contains("[OK] team.yaml resolves; name=`research`"),
-            "alias should resolve to canonical name; got: {report}"
-        );
-        // Phase dir located → not the misleading "could not locate team
-        // directory" failure that F41 produced before the fix.
-        assert!(
-            !report.contains("could not locate team directory"),
-            "alias path should locate canonical team dir; got: {report}"
-        );
-        assert!(
-            report.contains("0 fail"),
-            "alias-resolve path should pass with 0 fail; got: {report}"
-        );
-    }
-
-    #[test]
-    fn validate_team_warns_when_phase_body_contains_protocol_literal() {
-        ensure_isolation();
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        ccteam_core::write_all_global_team_templates(&paths.root, false).unwrap();
-
-        // Re-write one phase body to include the banned literal so we
-        // verify the warn path. The frontmatter stays valid; only the
-        // body drifts.
-        let phase_path = paths
-            .root
-            .join("teams/dev/phases/03-implement.md");
-        let original = std::fs::read_to_string(&phase_path).unwrap();
-        let drifted = format!("{original}\n\n最后一行: PHASE_DONE: implement\n");
-        std::fs::write(&phase_path, drifted).unwrap();
-
-        let opts = DoctorOptions {
-            validate_team: Some("dev".into()),
-            ..DoctorOptions::default()
-        };
-        let report = run_doctor(&paths, opts).unwrap();
-        assert!(
-            report.contains("[WARN]") && report.contains("PHASE_DONE: implement"),
-            "got: {report}",
-        );
-    }
-
-    #[test]
-    fn validate_team_skips_phase_dir_for_evergreen_team() {
-        ensure_isolation();
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        ccteam_core::write_all_global_team_templates(&paths.root, false).unwrap();
-
-        let opts = DoctorOptions {
-            validate_team: Some("meta-agent".into()),
-            ..DoctorOptions::default()
-        };
-        let report = run_doctor(&paths, opts).unwrap();
-        assert!(report.contains("evergreen"), "got: {report}");
-    }
-
-    // ---------------- V0.2 M0.18.6 ccteam phase show ----------------
-
-    #[test]
-    fn phase_show_renders_inject_prompt_and_body() {
-        ensure_isolation();
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        ccteam_core::write_all_global_team_templates(&paths.root, false).unwrap();
-
-        let body = run_phase_show(&paths, "dev", "implement").unwrap();
-        assert!(body.contains("Inject prompt"), "got: {body}");
-        assert!(body.contains("@.ccteam/phases/implement.md"));
-        assert!(body.contains("PHASE_DONE: implement"));
-        assert!(body.contains("Phase markdown"));
-    }
-
-    #[test]
-    fn phase_show_errors_on_unknown_phase() {
-        ensure_isolation();
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        ccteam_core::write_all_global_team_templates(&paths.root, false).unwrap();
-
-        let err = run_phase_show(&paths, "dev", "nonexistent").unwrap_err();
-        assert!(format!("{err:#}").contains("nonexistent"));
-    }
-
-    #[test]
-    fn phase_show_errors_on_evergreen_team() {
-        ensure_isolation();
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        ccteam_core::write_all_global_team_templates(&paths.root, false).unwrap();
-
-        let err = run_phase_show(&paths, "meta-agent", "anything").unwrap_err();
-        assert!(format!("{err:#}").contains("evergreen"));
+        let err = run_phase_show(&paths, "dev", "implement").unwrap_err();
+        assert!(format!("{err:#}").contains("F60"), "got: {err:#}");
     }
 
     #[test]
@@ -3898,10 +3306,7 @@ mod tests {
         assert_eq!(sanitize_smart_slug("a"), None);
         assert_eq!(sanitize_smart_slug(&"x".repeat(61)), None);
         // Boundary: exactly 60 is fine.
-        assert_eq!(
-            sanitize_smart_slug(&"x".repeat(60)),
-            Some("x".repeat(60))
-        );
+        assert_eq!(sanitize_smart_slug(&"x".repeat(60)), Some("x".repeat(60)));
     }
 
     #[test]
