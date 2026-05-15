@@ -22,6 +22,8 @@ pub mod harness;
 pub mod inbox;
 pub mod memory_bridge;
 pub mod meta_agent;
+// V0.4.2 F74 — one-shot migration (V0.4.1 → V0.4.2 config.yaml fold).
+pub mod migration;
 pub mod orchestrator;
 pub mod paths;
 pub mod pending_inject;
@@ -76,6 +78,9 @@ pub use inbox::{
 pub use memory_bridge::{
     install_into as install_memory_bridge_into, install_memory_bridge, InstallMemoryBridgeOptions,
     MemoryBridgeAction, MemoryBridgeReport,
+};
+pub use migration::{
+    migrate_v041_to_v042, render_migration_report, MigrationReport as V042MigrationReport,
 };
 pub use meta_agent::{
     bootstrap_meta_project, clean_stale_meta_layouts, meta_session_name, meta_slug,

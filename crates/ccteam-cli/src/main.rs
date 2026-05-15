@@ -308,6 +308,14 @@ enum Command {
         /// path or the degrade reason (tmux missing / font / IO).
         #[arg(long, value_name = "SLUG")]
         screenshot_smoke: Option<String>,
+        /// V0.4.2 F74: fold V0.4.1 project layout into the new
+        /// `~/.ccteam/config.yaml`. Walks `~/projects/*` and appends
+        /// every parseable `.ccteam/state.json` to `config.yaml::
+        /// projects[]`; folds `~/.ccteam/watchdog.yaml` into
+        /// `config.yaml::watchdog` and renames the old file to
+        /// `watchdog.yaml.migrated`. Idempotent.
+        #[arg(long, default_value_t = false)]
+        migrate_v041_to_v042: bool,
     },
     /// V0.2 M0.18.6: render the orchestrator's per-phase inject
     /// prompt (frontmatter-driven) plus the `@`-referenced phase
@@ -626,6 +634,7 @@ fn main() -> Result<()> {
             validate_team,
             migrate_recommended_agents,
             screenshot_smoke,
+            migrate_v041_to_v042,
         } => {
             // V0.4.1 `--install-all` is sugar for the three first-run
             // flags. Explicit flags still win where set; we OR them.
@@ -644,6 +653,7 @@ fn main() -> Result<()> {
                 validate_team,
                 migrate_recommended_agents,
                 screenshot_smoke,
+                migrate_v041_to_v042,
             })
         }
         Command::Phase { cmd } => run_phase(cmd),

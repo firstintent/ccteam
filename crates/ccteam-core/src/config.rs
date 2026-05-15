@@ -37,10 +37,9 @@ use serde::{Deserialize, Serialize};
 /// File name relative to `paths.root` (`~/.ccteam/`).
 pub const CONFIG_FILENAME: &str = "config.yaml";
 
-/// Top-level config schema. Future fields (web defaults, watchdog
-/// settings) plug in as their own optional sections without breaking
-/// existing files — `serde(default)` on every collection guarantees an
-/// older config.yaml still parses.
+/// Top-level config schema. Future fields plug in as their own
+/// optional sections without breaking existing files — `serde(default)`
+/// on every collection guarantees an older config.yaml still parses.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct CcteamConfig {
     /// Canonical base for `ccteam init --in <slug>`. When absent,
@@ -53,6 +52,13 @@ pub struct CcteamConfig {
     /// install; `ccteam init` appends one entry per successful install.
     #[serde(default)]
     pub projects: Vec<ProjectEntry>,
+
+    /// V0.4.2 F74: watchdog tunables, folded in from the legacy
+    /// `~/.ccteam/watchdog.yaml`. When absent, watchdog uses defaults
+    /// (or, on V0.4.1 systems pre-migration, falls back to reading
+    /// `watchdog.yaml` directly).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watchdog: Option<crate::watchdog::WatchdogConfig>,
 }
 
 /// One project registry entry. `path` is absolute; `team` mirrors
@@ -209,6 +215,7 @@ mod tests {
         let cfg = CcteamConfig {
             projects_root: Some(PathBuf::from("/work/repos")),
             projects: vec![entry.clone()],
+            watchdog: None,
         };
         save(tmp.path(), &cfg).unwrap();
         let loaded = load(tmp.path()).unwrap();

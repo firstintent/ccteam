@@ -114,10 +114,24 @@ pub fn config_path(paths: &CcteamPaths) -> PathBuf {
     paths.root.join(WATCHDOG_CONFIG_FILENAME)
 }
 
-/// Load `watchdog.yaml`. Returns `WatchdogConfig::default()` when the
-/// file is absent. Parse errors fail-loud — a typo in user config
-/// shouldn't silently revert to defaults.
+/// Load the watchdog config.
+///
+/// V0.4.2 F74: `~/.ccteam/config.yaml::watchdog` is the canonical
+/// source. When that field is absent (fresh install, or pre-migration
+/// V0.4.1 box), fall back to the legacy `watchdog.yaml` sibling file.
+/// Both-missing returns `WatchdogConfig::default()`. Parse errors
+/// fail-loud — a typo shouldn't silently revert to defaults.
 pub fn load_config(paths: &CcteamPaths) -> Result<WatchdogConfig> {
+    match crate::config::load(&paths.root) {
+        Ok(cfg) => {
+            if let Some(w) = cfg.watchdog {
+                return Ok(w);
+            }
+        }
+        Err(err) => {
+            tracing::warn!(?err, "config.yaml load failed; falling back to watchdog.yaml");
+        }
+    }
     let path = config_path(paths);
     load_config_at(&path)
 }

@@ -1343,6 +1343,11 @@ pub struct DoctorOptions {
     /// the resulting PNG path or graceful-degrade reason. Verifies
     /// font + tmux + IO without requiring a live MCP client.
     pub screenshot_smoke: Option<String>,
+    /// V0.4.2 F74: fold V0.4.1 project layout into the new
+    /// `~/.ccteam/config.yaml`. See `ccteam_core::migrate_v041_to_v042`
+    /// for the exact rules. Idempotent — safe to run on already-
+    /// migrated homes.
+    pub migrate_v041_to_v042: bool,
 }
 
 /// `ccteam doctor` dispatch. Returns a human-readable report so unit
@@ -1356,7 +1361,8 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
         || opts.reset_shipped_teams
         || opts.validate_team.is_some()
         || opts.migrate_recommended_agents
-        || opts.screenshot_smoke.is_some();
+        || opts.screenshot_smoke.is_some()
+        || opts.migrate_v041_to_v042;
     if !any_mode {
         return Ok(String::from(
             "ccteam doctor: pass at least one mode flag.\n\
@@ -1382,7 +1388,9 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
              --migrate-recommended-agents [--dry-run]\n      \
              remove stale ~/.claude/agents/<name>.md symlinks left by the V0.1 ln -sf path. One-time cleanup after upgrading to V0.2 plugin pipeline (V0.2 M0.20).\n  \
              --screenshot-smoke <slug>\n      \
-             render an end-to-end PNG screenshot of <slug>'s tmux pane to <project>/.ccteam/screenshots/<utc>.png. Verifies font + tmux + imageproc + IO; reports the path on success, the degrade reason on failure (V0.2.2 F38).\n",
+             render an end-to-end PNG screenshot of <slug>'s tmux pane to <project>/.ccteam/screenshots/<utc>.png. Verifies font + tmux + imageproc + IO; reports the path on success, the degrade reason on failure (V0.2.2 F38).\n  \
+             --migrate-v041-to-v042\n      \
+             fold V0.4.1 ~/projects/* + ~/.ccteam/watchdog.yaml into the new ~/.ccteam/config.yaml. Idempotent (V0.4.2 F74).\n",
         ));
     }
     let mut out = String::new();
@@ -1425,6 +1433,10 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
     }
     if let Some(slug) = &opts.screenshot_smoke {
         out.push_str(&render_screenshot_smoke_report(paths, slug)?);
+    }
+    if opts.migrate_v041_to_v042 {
+        let report = ccteam_core::migrate_v041_to_v042(paths)?;
+        out.push_str(&ccteam_core::render_migration_report(&report));
     }
     // V0.3.1 F47 — informational codex CLI detection. Appends one line
     // to every successful doctor run (any_mode == true) so operators
