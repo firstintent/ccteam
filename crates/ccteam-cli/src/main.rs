@@ -91,10 +91,12 @@ enum Command {
         /// via a separate `ccteam web` invocation).
         #[arg(long, default_value_t = false)]
         no_web: bool,
-        /// Embedded web UI bind address. Loopback (default) disables
-        /// auth; non-loopback generates `~/.ccteam/web-token` and
-        /// requires `Authorization: Bearer ccteam:<token>`.
-        #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:7331")]
+        /// Embedded web UI bind address. Default `0.0.0.0:7331` so
+        /// host deployments are LAN-reachable out of the box; auth is
+        /// auto-enabled on non-loopback binds and the token lands in
+        /// `~/.ccteam/web-token`. Use `127.0.0.1:7331` to restrict to
+        /// loopback (auth then disabled).
+        #[arg(long, value_name = "ADDR", default_value = "0.0.0.0:7331")]
         web_bind: String,
         /// Disable token auth on the embedded web. DANGEROUS on
         /// non-loopback bind — prints a 5-second warning before
@@ -343,11 +345,12 @@ enum Command {
     /// `docs/v0-3/prd.md` §3-§6). M5.0 ships the scaffold + `/health`
     /// endpoint only; dashboard / SSE / write actions land in M5.1-3.
     Web {
-        /// Listen address. Default `127.0.0.1:7331` — auth is disabled
-        /// when bound to loopback. Bind to `0.0.0.0:<port>` for LAN
-        /// reach (M5.3 requires token auth on non-loopback unless
-        /// `--no-auth`).
-        #[arg(long, default_value = "127.0.0.1:7331")]
+        /// Listen address. Default `0.0.0.0:7331` so host deployments
+        /// reach the LAN out of the box; auth is auto-enabled on
+        /// non-loopback. Use `127.0.0.1:7331` for loopback-only
+        /// (auth then disabled). M5.3 requires token auth on
+        /// non-loopback unless `--no-auth`.
+        #[arg(long, default_value = "0.0.0.0:7331")]
         bind: String,
         /// Disable token auth on write endpoints. DANGEROUS on
         /// non-loopback bind — M5.3 prints a 5-second warning before
@@ -980,10 +983,20 @@ fn print_web_banner(paths: &CcteamPaths, web: &StartWebOpts) {
     };
     let loopback = ccteam_web::auth::is_loopback(&bind);
     let scheme = "http";
+    // When bound to the unspecified address (0.0.0.0), substitute the
+    // host's hostname in the displayed URL so the line is clickable;
+    // 0.0.0.0:port isn't a real destination. Fall back to the literal
+    // socket addr if gethostname() fails.
+    let display_url_host = if bind.ip().is_unspecified() {
+        read_hostname().unwrap_or_else(|| bind.ip().to_string())
+    } else {
+        bind.ip().to_string()
+    };
+    let display_url = format!("{scheme}://{display_url_host}:{}", bind.port());
     eprintln!();
     eprintln!("┌─ ccteam web ─────────────────────────────────────────────");
     if loopback || web.no_auth {
-        eprintln!("│  URL:   {scheme}://{bind}/");
+        eprintln!("│  URL:   {display_url}/");
         if !loopback && web.no_auth {
             eprintln!("│  AUTH:  DISABLED (--web-no-auth on non-loopback — LAN-wide!)");
         } else {
@@ -996,17 +1009,44 @@ fn print_web_banner(paths: &CcteamPaths, web: &StartWebOpts) {
             .unwrap_or_else(|| ccteam_web::token::default_token_path(paths));
         match ccteam_web::token::generate_or_load_token(&token_path) {
             Ok(hex) => {
-                eprintln!("│  URL:   {scheme}://{bind}/?token=ccteam:{hex}");
+                eprintln!("│  URL:   {display_url}/?token=ccteam:{hex}");
                 eprintln!("│  TOKEN: ccteam:{hex}");
                 eprintln!("│  FILE:  {}", token_path.display());
             }
             Err(err) => {
-                eprintln!("│  URL:   {scheme}://{bind}/  (token init failed: {err})");
+                eprintln!("│  URL:   {display_url}/  (token init failed: {err})");
             }
         }
     }
+    eprintln!("│  BIND:  {bind}");
     eprintln!("└──────────────────────────────────────────────────────────");
     eprintln!();
+}
+
+/// Read the OS hostname via libc `gethostname`. Returns `None` on
+/// syscall failure or a non-UTF8 result.
+#[cfg(unix)]
+fn read_hostname() -> Option<String> {
+    use std::ffi::CStr;
+    let mut buf = [0u8; 256];
+    // SAFETY: gethostname writes at most `len-1` bytes and NUL-terminates.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut _, buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    // Ensure NUL-termination before scanning the buffer.
+    buf[buf.len() - 1] = 0;
+    let cstr = CStr::from_bytes_until_nul(&buf).ok()?;
+    let s = cstr.to_str().ok()?.to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+#[cfg(not(unix))]
+fn read_hostname() -> Option<String> {
+    None
 }
 
 fn parse_web_opts(web: &StartWebOpts) -> Result<ccteam_web::ServeOpts> {

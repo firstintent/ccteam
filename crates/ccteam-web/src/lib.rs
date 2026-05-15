@@ -54,8 +54,10 @@ pub use watcher::{EventBus, HarnessSnapshotEvent, ProgressUpdate};
 /// stays mechanical.
 #[derive(Debug, Clone)]
 pub struct ServeOpts {
-    /// Address to bind. `127.0.0.1:0` ⇒ pick a free port (used by
-    /// integration tests).
+    /// Address to bind. Default (`0.0.0.0:7331`) reaches the LAN with
+    /// auto-enabled token auth; loopback (`127.0.0.1:<port>`) skips
+    /// auth. `127.0.0.1:0` ⇒ pick a free port (used by integration
+    /// tests).
     pub bind: SocketAddr,
     /// Disable token auth on write endpoints. M5.3 honors this; if
     /// the bind is non-loopback the operator gets a stderr warning +
@@ -75,7 +77,11 @@ pub struct ServeOpts {
 impl Default for ServeOpts {
     fn default() -> Self {
         Self {
-            bind: "127.0.0.1:7331".parse().expect("hardcoded loopback parses"),
+            // V0.4.2: default to the unspecified bind so host
+            // deployments are LAN-reachable out of the box. Auth is
+            // automatically enabled on non-loopback (see `serve()`'s
+            // auth heuristic table), so token-on-disk is the gate.
+            bind: "0.0.0.0:7331".parse().expect("hardcoded unspecified parses"),
             no_auth: false,
             token_file: None,
             no_auth_grace_secs: Some(5),
@@ -320,9 +326,14 @@ mod tests {
         assert!(opts.token_file.is_none());
         assert_eq!(opts.bind.port(), 7331);
         assert_eq!(opts.no_auth_grace_secs, Some(5));
-        // Default keeps the same loopback bind + auth-on stance.
+        // V0.4.2: default bind is unspecified (0.0.0.0) so host
+        // deployments reach the LAN by default. Auth-on stance is
+        // preserved (no_auth defaults to false) — the unspecified
+        // bind triggers the auth-enabled branch in `serve()`.
         let d = ServeOpts::default();
-        assert!(d.bind.ip().is_loopback());
+        assert!(d.bind.ip().is_unspecified(), "default bind is 0.0.0.0");
+        assert!(!d.bind.ip().is_loopback(), "default bind is not loopback");
+        assert!(!d.no_auth, "default keeps auth on");
         assert_eq!(d.no_auth_grace_secs, Some(5));
     }
 }
