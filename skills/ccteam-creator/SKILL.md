@@ -155,10 +155,37 @@ For skill files, read:
 @~/.claude/plugins/marketplaces/anthropic-agent-skills/skills/skill-creator/SKILL.md
 ```
 
-The single ccteam-specific addition: every agent should output
-`PHASE_DONE: <role>` on success so the Stop hook closes the session
-cleanly. That's enforced by `@crates/ccteam-hooks/src/parse_phase_end.rs`,
-not by frontmatter.
+The single ccteam-specific addition: every agent must output
+`PHASE_DONE: <role>` as the **last line of its final text message** so
+the Stop hook closes the session cleanly. Enforced by
+`@crates/ccteam-hooks/src/parse_phase_end.rs`, which runs
+`.lines().rev().find(|l| !l.trim().is_empty())` — meaning *any* trailing
+non-empty line wins. Real-world failure modes the agent prompt must
+guard against:
+
+- **PHASE_DONE wrapped in a code fence**:
+
+  ```
+  PHASE_DONE: planner
+  ```
+
+  The last non-empty line is the `` ``` `` fence, not the sigil → hook
+  reports "phase 未正常收尾".
+
+- **PHASE_DONE inside a Bash `tool_use` (echo / cat)**: the hook reads
+  the assistant **text** message, not the tool_use content. Output the
+  sigil as plain assistant text, NOT via `echo PHASE_DONE: …`.
+
+- **Tool calls after PHASE_DONE**: if the agent runs any tool *after*
+  emitting the sigil, the subsequent text becomes the new "last
+  message" and the sigil is invisible.
+
+Closing instruction the agent prompt should carry verbatim:
+
+```
+完成所有 Step 后,**最后一条 assistant 消息必须是纯文本,内容只有一行**:
+`PHASE_DONE: <role>` —— 不要 code fence、不要 tool_use 包裹、不要尾随内容。
+```
 
 In-repo examples for the agent body style you can copy structurally
 (not verbatim — keep them ccteam-flavored): any deployed project's
