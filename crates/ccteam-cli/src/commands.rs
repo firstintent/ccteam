@@ -100,13 +100,18 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
 
     // -- 2. Resolve project install target ---------------------------
     let target = resolve_install_target(paths, &opts)?;
-    let target_slug = opts.slug.clone().unwrap_or_else(|| {
+    let derived_slug = opts.slug.clone().unwrap_or_else(|| {
         target
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("project")
             .to_string()
     });
+    // V0.4.3 F76: validate slug grammar before anything writes to disk.
+    // Catches whitespace / unicode / leading-dash cases that used to
+    // create `~/projects/<bad-name>/` directories silently.
+    let target_slug = ccteam_core::validate_slug_format(&derived_slug)
+        .with_context(|| format!("ccteam init: invalid slug {derived_slug:?}"))?;
     let target_team = opts.team.clone().unwrap_or_else(|| "dev".to_string());
 
     // -- 3a. Refuse install in the ccteam repo itself ----------------
@@ -129,12 +134,16 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
             .is_some_and(|(a, b)| a == b);
         if !same_target && !opts.force {
             return Err(anyhow::anyhow!(
-                "slug `{}` is already registered at {} in {}; refusing to overwrite the registry pointer to {}.\n\
-                 Pick a different slug with `--slug <other-name>`, or pass `--force` to retarget the existing entry.",
-                target_slug,
-                existing.path.display(),
-                ccteam_core::ccteam_config_path(&paths.root).display(),
-                target.display(),
+                "slug `{slug}` is already registered in {config} pointing at {existing}, \
+                 but this install would point it at {requested}. Refusing to silently retarget.\n\n\
+                 Resolve by either:\n  \
+                 - pick a different slug:  `ccteam init --slug <other-name>` (or `--in <other-path>`),\n  \
+                 - intentionally retarget: re-run with `--force` (the registry entry will be \
+                 rewritten to {requested}).",
+                slug = target_slug,
+                config = ccteam_core::ccteam_config_path(&paths.root).display(),
+                existing = existing.path.display(),
+                requested = target.display(),
             ));
         }
     }
@@ -2628,6 +2637,32 @@ mod tests {
                 .unwrap(),
             "USER AGENT\n",
             "agents must be overwritten by --reset-agents",
+        );
+    }
+
+    /// V0.4.3 F76: invalid slug grammar fails loud at the CLI
+    /// boundary, before any directory is created.
+    #[test]
+    fn run_init_rejects_invalid_slug_grammar() {
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let err = run_init(
+            &paths,
+            InitOptions {
+                install_in: Some(tmp.path().join("ok-dir")),
+                slug: Some("做一个 todo cli".into()),
+                ..InitOptions::default()
+            },
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("[a-z0-9-]+"),
+            "expected slug-grammar fail-loud; got: {msg}",
+        );
+        assert!(
+            !tmp.path().join("ok-dir").join(".ccteam").exists(),
+            "no .ccteam/ should have been created when slug is invalid",
         );
     }
 

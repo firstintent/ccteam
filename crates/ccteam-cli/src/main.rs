@@ -1343,25 +1343,25 @@ fn run_spawn(
 }
 
 fn run_new(slug: String, team: String) -> Result<()> {
-    let slug = slug.trim();
-    if slug.is_empty() {
-        anyhow::bail!("ccteam new: slug must be non-empty");
-    }
     if team.trim().is_empty() {
         anyhow::bail!("ccteam new: --team must be non-empty");
     }
+    // V0.4.3 F76: fail loud at the CLI boundary on invalid slug grammar
+    // (whitespace / unicode / leading dash etc.) so we don't spawn
+    // `~/projects/<garbage>/` and leave junk for the user to clean up.
+    let validated = ccteam_core::validate_slug_format(&slug)
+        .with_context(|| format!("ccteam new {slug:?}"))?;
     let paths = CcteamPaths::from_env()?;
     // V0.4.2 F75: `ccteam new <slug>` delegates to `ccteam init` with
-    // `install_in = <projects_root>/<final_slug>`. Same install
-    // pipeline, same overwrite-strategy semantics. F22 invariant: if
+    // `install_in = <projects_root>/<final_slug>`. F22 invariant: if
     // the user-supplied slug isn't already prefixed with `<team>-`,
     // we prepend automatically so `~/.claude/rules/ccteam-lessons-
     // <team>.md` paths globs still match.
     let team_prefix = format!("{team}-");
-    let final_slug = if slug.starts_with(&team_prefix) {
-        slug.to_string()
+    let final_slug = if validated.starts_with(&team_prefix) {
+        validated
     } else {
-        format!("{team_prefix}{slug}")
+        format!("{team_prefix}{validated}")
     };
     let target = paths.projects_root.join(&final_slug);
     let report = commands::run_init(

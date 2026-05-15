@@ -150,15 +150,12 @@ pub fn pick_unused_slug(paths: &CcteamPaths, base: &str, team: &str) -> Result<S
     pick_unused_under_team_prefix(paths, &base, team)
 }
 
-/// V0.2.2 F34 Tier 1: pick an unused slug from a deliberate user-
-/// chosen base. Skips token filtering (the user has already named
-/// the project) and only does:
-///
-/// - Validate `[a-z0-9-]+`, length ≤ 60, no leading / trailing dash.
-/// - B2 prefix semantics: if `slug` already starts with `<team>-`
-///   keep it verbatim; otherwise prepend `<team>-`.
-/// - Collision retry via `-{4hex}` suffix (same as `pick_unused_slug`).
-pub fn pick_unused_slug_verbatim(paths: &CcteamPaths, slug: &str, team: &str) -> Result<String> {
+/// V0.4.2 F75 reviewer fix: validate that `slug` matches the on-disk
+/// slug grammar — `[a-z0-9][a-z0-9-]*`, length ≤ 60, no leading /
+/// trailing dash. Returns the trimmed string on success. Use this
+/// from CLI parsers (`ccteam init --slug`, `ccteam new <slug>`) so
+/// invalid input fails loud before any directory is created.
+pub fn validate_slug_format(slug: &str) -> Result<String> {
     let trimmed = slug.trim();
     if trimmed.is_empty() {
         return Err(anyhow!("slug must be non-empty"));
@@ -173,13 +170,28 @@ pub fn pick_unused_slug_verbatim(paths: &CcteamPaths, slug: &str, team: &str) ->
         .chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
     {
-        return Err(anyhow!("slug must match [a-z0-9-]+; got {trimmed:?}",));
+        return Err(anyhow!(
+            "slug must match [a-z0-9-]+ (lowercase ASCII, digits, dashes only); got {trimmed:?}",
+        ));
     }
     if trimmed.starts_with('-') || trimmed.ends_with('-') {
         return Err(anyhow!(
             "slug must not start or end with `-`; got {trimmed:?}",
         ));
     }
+    Ok(trimmed.to_string())
+}
+
+/// V0.2.2 F34 Tier 1: pick an unused slug from a deliberate user-
+/// chosen base. Skips token filtering (the user has already named
+/// the project) and only does:
+///
+/// - Validate `[a-z0-9-]+`, length ≤ 60, no leading / trailing dash.
+/// - B2 prefix semantics: if `slug` already starts with `<team>-`
+///   keep it verbatim; otherwise prepend `<team>-`.
+/// - Collision retry via `-{4hex}` suffix (same as `pick_unused_slug`).
+pub fn pick_unused_slug_verbatim(paths: &CcteamPaths, slug: &str, team: &str) -> Result<String> {
+    let trimmed = validate_slug_format(slug)?;
     let team_prefix = format!("{team}-");
     let prefixed = if trimmed.starts_with(&team_prefix) || trimmed == team {
         trimmed.to_string()
