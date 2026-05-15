@@ -14,6 +14,12 @@ pub mod actions;
 // agent. See module docs + docs/v0-4-0/prd.md §6.2.
 pub mod artifact_watcher;
 pub mod auto_loop;
+// V0.4.5 F80 — Liveness probe for `claude --bg` background jobs.
+// Cross-references the recorded `job_id` against
+// `~/.claude/jobs/<id>/state.json` so consumers (web UI, orchestrator
+// poll loop) can distinguish "really running" from "stale agent_spawn
+// after daemon SIGKILL". See module docs.
+pub mod claude_job;
 // V0.4.2 F73 — `~/.ccteam/config.yaml` global config + projects registry.
 pub mod config;
 pub mod cost;
@@ -52,6 +58,7 @@ pub use actions::{
     DecisionInput, SendOptions, SendResult,
 };
 pub use auto_loop::{AutoLoopDecision, AutoLoopFrontMatter, AutoLoopState};
+pub use claude_job::{classify as classify_job_state, probe_job, probe_state_json, JobLiveness};
 pub use config::{
     append_project as append_project_to_config, config_path as ccteam_config_path,
     load as load_ccteam_config, lookup_project as lookup_project_in_config,
@@ -79,12 +86,12 @@ pub use memory_bridge::{
     install_into as install_memory_bridge_into, install_memory_bridge, InstallMemoryBridgeOptions,
     MemoryBridgeAction, MemoryBridgeReport,
 };
-pub use migration::{
-    migrate_v041_to_v042, render_migration_report, MigrationReport as V042MigrationReport,
-};
 pub use meta_agent::{
     bootstrap_meta_project, clean_stale_meta_layouts, meta_session_name, meta_slug,
     render_meta_role_prompt, MetaBootstrapReport, META_SESSION_NAME, META_SLUG, META_TEAM_NAME,
+};
+pub use migration::{
+    migrate_v041_to_v042, render_migration_report, MigrationReport as V042MigrationReport,
 };
 pub use orchestrator::MAX_CONCURRENT_PROJECTS;
 pub use orchestrator::{Orchestrator, OrchestratorConfig, DEFAULT_CLAUDE_MODEL};

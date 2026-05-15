@@ -246,11 +246,60 @@ pub fn escalation_count(events: &[Value]) -> u32 {
 ///
 /// Sessions whose `agent_spawn` lacks a `session_id` field are
 /// skipped (they cannot be paired with a later `agent_done`).
+///
+/// **Pure function.** Always returns `AgentSessionStatus::Running`
+/// for any spawn without a matching `agent_done`, regardless of
+/// whether the underlying claude bg job is still alive. The web /
+/// orchestrator caller layers V0.4.5 F80 liveness probing on top
+/// via [`current_agent_sessions_with_liveness`] — keeping this fn
+/// pure preserves the existing test suite + lets schema-level unit
+/// tests stay IO-free.
 pub fn current_agent_sessions(events: &[Value]) -> Vec<AgentSessionSummary> {
+    current_agent_sessions_inner(events, None::<&dyn Fn(Option<&str>) -> _>)
+}
+
+/// V0.4.5 F80 — liveness-aware sibling of [`current_agent_sessions`].
+///
+/// Same accounting as the pure version, but after the spawn/done
+/// pairing pass every `Running` entry is cross-referenced against
+/// the caller's `liveness` closure. The closure receives the
+/// `job_id` recorded on the originating `agent_spawn` event
+/// (`None` for legacy / pre-F80 rows) and returns the liveness
+/// verdict.
+///
+/// Terminal verdicts demote `Running` → `Done` / `Errored` with the
+/// closure's reported `cost_usd`, matching the shape the SPA already
+/// renders for genuinely-finished sessions. The pure
+/// `current_agent_sessions` API stays untouched so existing callers
+/// + unit tests are unaffected.
+///
+/// **Side-effect-free.** This function does not write to
+/// `progress.jsonl`; the matching cleanup `agent_done` is emitted
+/// by `orchestrator::poll_completions` (the only consumer authorised
+/// to write workflow events). The function just makes the read-side
+/// UI consistent immediately, before the orchestrator's next tick.
+pub fn current_agent_sessions_with_liveness<F>(
+    events: &[Value],
+    liveness: F,
+) -> Vec<AgentSessionSummary>
+where
+    F: Fn(Option<&str>) -> crate::claude_job::JobLiveness,
+{
+    current_agent_sessions_inner(events, Some(&liveness))
+}
+
+fn current_agent_sessions_inner(
+    events: &[Value],
+    liveness: Option<&dyn Fn(Option<&str>) -> crate::claude_job::JobLiveness>,
+) -> Vec<AgentSessionSummary> {
     // `BTreeMap` keyed by session_id keeps a single entry per session
     // (the last terminal `agent_done` wins if for some reason two
     // arrive).
     let mut by_sid: BTreeMap<String, AgentSessionSummary> = BTreeMap::new();
+    // V0.4.5 F80 — remember each session's `agent_spawn::job_id`
+    // (if any) so the optional liveness probe can run after the
+    // first pass.
+    let mut job_ids: BTreeMap<String, Option<String>> = BTreeMap::new();
 
     for event in events {
         let kind = event.get("event").and_then(|s| s.as_str()).unwrap_or("");
@@ -267,12 +316,17 @@ pub fn current_agent_sessions(events: &[Value]) -> Vec<AgentSessionSummary> {
         match kind {
             "agent_spawn" => {
                 let started_at = parse_ts(event.get("ts").and_then(|s| s.as_str()));
+                let job_id = event
+                    .get("job_id")
+                    .and_then(|s| s.as_str())
+                    .map(String::from);
                 by_sid.entry(sid.clone()).or_insert(AgentSessionSummary {
                     role,
-                    session_id: sid,
+                    session_id: sid.clone(),
                     started_at,
                     status: AgentSessionStatus::Running,
                 });
+                job_ids.entry(sid).or_insert(job_id);
             }
             "agent_done" => {
                 let cost_usd = event
@@ -304,6 +358,27 @@ pub fn current_agent_sessions(events: &[Value]) -> Vec<AgentSessionSummary> {
         }
     }
 
+    // V0.4.5 F80 — second pass: demote phantom `Running` entries
+    // whose claude bg job is gone (state.json missing, firstTerminalAt
+    // non-null, or state is terminal).
+    if let Some(probe) = liveness {
+        for (sid, entry) in by_sid.iter_mut() {
+            if !matches!(entry.status, AgentSessionStatus::Running) {
+                continue;
+            }
+            let job_id = job_ids.get(sid).and_then(|opt| opt.as_deref());
+            match probe(job_id) {
+                crate::claude_job::JobLiveness::Running => {}
+                crate::claude_job::JobLiveness::Terminal { status, cost_usd } => {
+                    entry.status = match status {
+                        "completed" | "stopped" => AgentSessionStatus::Done { cost_usd },
+                        _ => AgentSessionStatus::Errored { cost_usd },
+                    };
+                }
+            }
+        }
+    }
+
     let mut out: Vec<AgentSessionSummary> = by_sid.into_values().collect();
     out.sort_by(|a, b| {
         a.started_at
@@ -311,6 +386,51 @@ pub fn current_agent_sessions(events: &[Value]) -> Vec<AgentSessionSummary> {
             .then_with(|| a.session_id.cmp(&b.session_id))
     });
     out
+}
+
+/// V0.4.5 F80 — extract `(session_id, job_id, role)` triples from
+/// every `agent_spawn` event in `events` that does **not** yet have
+/// a matching `agent_done`. Used by
+/// `orchestrator::poll_completions` to drive the stale-spawn cleanup
+/// scan (one `agent_done` per phantom row).
+///
+/// Pure. Caller-controlled IO: typically each `(sid, job_id, role)`
+/// is fed into [`crate::claude_job::probe_job`] and, when terminal,
+/// translated into a synthetic `agent_done` event the orchestrator
+/// appends to `progress.jsonl`.
+pub fn open_agent_spawns(events: &[Value]) -> Vec<(String, Option<String>, String)> {
+    let mut spawns: BTreeMap<String, (Option<String>, String)> = BTreeMap::new();
+    let mut closed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for event in events {
+        let kind = event.get("event").and_then(|s| s.as_str()).unwrap_or("");
+        let sid = match event.get("session_id").and_then(|s| s.as_str()) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => continue,
+        };
+        match kind {
+            "agent_spawn" => {
+                let job_id = event
+                    .get("job_id")
+                    .and_then(|s| s.as_str())
+                    .map(String::from);
+                let role = event
+                    .get("role")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                spawns.entry(sid).or_insert((job_id, role));
+            }
+            "agent_done" => {
+                closed.insert(sid);
+            }
+            _ => {}
+        }
+    }
+    spawns
+        .into_iter()
+        .filter(|(sid, _)| !closed.contains(sid))
+        .map(|(sid, (job_id, role))| (sid, job_id, role))
+        .collect()
 }
 
 fn parse_ts(raw: Option<&str>) -> DateTime<Utc> {

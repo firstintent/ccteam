@@ -1299,7 +1299,10 @@ async fn t31_inbox_target_role_routes_explicitly() {
     assert_eq!(entries.len(), 1);
     let marker_body = std::fs::read_to_string(entries[0].path()).unwrap();
     let marker_json: serde_json::Value = serde_json::from_str(&marker_body).unwrap();
-    assert_eq!(marker_json["role"], "fixer", "target_role must win over default");
+    assert_eq!(
+        marker_json["role"], "fixer",
+        "target_role must win over default"
+    );
 }
 
 #[tokio::test]
@@ -1319,4 +1322,282 @@ async fn t32_inbox_empty_body_no_spawn() {
         .map(|rd| rd.flatten().count())
         .unwrap_or(0);
     assert_eq!(count, 0, "empty body must not trigger spawn");
+}
+
+// =====================================================================
+// V0.4.5 F80 — stale-spawn cleanup in poll_completions.
+//
+// Live-host observation: when the daemon was SIGKILLed mid-flight,
+// claude bg jobs died without anything writing the matching
+// `agent_done`. The stale `agent_spawn` rows in progress.jsonl
+// stayed there forever and the web UI showed a phantom running
+// count. F80's fix has two halves:
+//
+//   (a) every fresh `agent_spawn` event now carries `job_id` so the
+//       read-side / cleanup probe knows where to look in
+//       `~/.claude/jobs/<job_id>/state.json`.
+//   (b) `poll_completions` now scans `progress::open_agent_spawns`
+//       and synthesises an `agent_done` event for any row whose
+//       job is terminal (state.json missing / firstTerminalAt
+//       non-null / state in {failed, crashed, ...}) and is NOT
+//       currently owned by this orchestrator instance (the in-memory
+//       `running` map already covers genuine in-flight sessions).
+// =====================================================================
+
+#[tokio::test]
+#[serial]
+async fn t33_poll_completions_clears_phantom_spawn_from_progress() {
+    // Pre-write an agent_spawn whose job_id has no state.json — this
+    // is the SIGKILL-casualty shape. poll_completions must emit a
+    // synthetic agent_done so the running count drops.
+    let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_WATCH_FIXER);
+    let progress = paths.progress_jsonl(&slug);
+    ccteam_core::progress::append_event(
+        &progress,
+        &serde_json::json!({
+            "event": "agent_spawn",
+            "role": "fixer",
+            "session_id": "fixer-phantom",
+            "tmux_session": "ccteam-test-fixer-phantom",
+            "job_id": "dead-job",
+            "executor": "claude",
+            "slug": slug,
+            "ts": chrono::Utc::now().to_rfc3339(),
+        }),
+    )
+    .unwrap();
+    // Empty jobs dir → state_json_path("dead-job") returns ENOENT
+    // → probe_job classifies as Terminal { status: "killed", cost_usd: 0.0 }.
+    let jobs_dir = tempfile::tempdir().unwrap();
+    let prev = std::env::var_os(ccteam_core::CLAUDE_JOBS_DIR_ENV);
+    std::env::set_var(ccteam_core::CLAUDE_JOBS_DIR_ENV, jobs_dir.path());
+
+    let (orch, _claude, _codex) = build_orchestrator(paths);
+    let spec = watch_spec("fixer", "issues", Some(2));
+
+    orch.test_poll_completions(&slug, &spec, &pdir, &progress)
+        .await;
+
+    match prev {
+        Some(v) => std::env::set_var(ccteam_core::CLAUDE_JOBS_DIR_ENV, v),
+        None => std::env::remove_var(ccteam_core::CLAUDE_JOBS_DIR_ENV),
+    }
+
+    let events = read_events(&progress);
+    let done = events
+        .iter()
+        .filter(|e| e.get("event").and_then(Value::as_str) == Some("agent_done"))
+        .find(|e| e.get("session_id").and_then(Value::as_str) == Some("fixer-phantom"))
+        .expect("synthetic agent_done for phantom spawn must be present");
+    assert_eq!(done["status"], "killed");
+    assert_eq!(done["cost_usd"].as_f64(), Some(0.0));
+}
+
+#[tokio::test]
+#[serial]
+async fn t34_poll_completions_skips_phantom_pass_when_in_memory_owned() {
+    // If the orchestrator's in-memory `running` map already lists the
+    // sid (i.e. we own the session and just haven't observed its
+    // state.json transition yet), the phantom-cleanup pass must NOT
+    // fire — that would race the genuine `agent_done` write.
+    use ccteam_core::harness::SessionHandle;
+
+    let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_WATCH_FIXER);
+    let progress = paths.progress_jsonl(&slug);
+    ccteam_core::progress::append_event(
+        &progress,
+        &serde_json::json!({
+            "event": "agent_spawn",
+            "role": "fixer",
+            "session_id": "fixer-owned",
+            "tmux_session": "ccteam-test-fixer-owned",
+            "job_id": "owned-job",
+            "executor": "claude",
+            "slug": slug,
+            "ts": chrono::Utc::now().to_rfc3339(),
+        }),
+    )
+    .unwrap();
+
+    // No state.json file — probe would say "killed" if we ran it.
+    let jobs_dir = tempfile::tempdir().unwrap();
+    let prev = std::env::var_os(ccteam_core::CLAUDE_JOBS_DIR_ENV);
+    std::env::set_var(ccteam_core::CLAUDE_JOBS_DIR_ENV, jobs_dir.path());
+
+    let (orch, _claude, _codex) = build_orchestrator(paths);
+    let spec = watch_spec("fixer", "issues", Some(2));
+
+    // Register the same sid as "owned" in the orchestrator's running map.
+    orch.test_register_running(
+        "fixer",
+        SessionHandle {
+            tmux_session: "ccteam-test-fixer-owned".into(),
+            harness: "claude-code".into(),
+            sid: "fixer-owned".into(),
+            job_id: Some("owned-job".into()),
+            pid: None,
+            started_at: chrono::Utc::now(),
+        },
+    )
+    .await;
+
+    orch.test_poll_completions(&slug, &spec, &pdir, &progress)
+        .await;
+
+    match prev {
+        Some(v) => std::env::set_var(ccteam_core::CLAUDE_JOBS_DIR_ENV, v),
+        None => std::env::remove_var(ccteam_core::CLAUDE_JOBS_DIR_ENV),
+    }
+
+    let events = read_events(&progress);
+    // The session has its own state.json poll path that says Running
+    // (state_json_path missing → SessionStatus::Running fallback) so
+    // the cleanup pass must NOT have written an agent_done for it.
+    let synthetic = events
+        .iter()
+        .filter(|e| e.get("event").and_then(Value::as_str) == Some("agent_done"))
+        .any(|e| e.get("session_id").and_then(Value::as_str) == Some("fixer-owned"));
+    assert!(
+        !synthetic,
+        "orchestrator must not synthesise agent_done for an in-memory-owned session",
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn t35_agent_spawn_event_carries_job_id_field() {
+    // Bug 1 plumbing: fresh agent_spawn events must include the
+    // `job_id` field so the read-side cleanup can locate state.json.
+    // The default MockAdapter returns `job_id: None`; use a custom
+    // adapter that returns a fixed string and verify it round-trips.
+    use ccteam_core::harness::{
+        HarnessAdapter, HarnessError, HarnessSnapshot, SessionHandle, SpawnOpts,
+    };
+
+    #[derive(Default)]
+    struct JobIdMockAdapter;
+    impl HarnessAdapter for JobIdMockAdapter {
+        fn name(&self) -> &'static str {
+            "claude-mock"
+        }
+        fn ingest_snapshot(&self, _raw: &str) -> Result<HarnessSnapshot, HarnessError> {
+            Err(HarnessError::IngestFailed("mock".into()))
+        }
+        fn spawn_session(&self, opts: SpawnOpts) -> Result<SessionHandle, HarnessError> {
+            Ok(SessionHandle {
+                tmux_session: format!("mock-{}", opts.sid),
+                harness: "claude-mock".into(),
+                sid: opts.sid,
+                job_id: Some("abc12345".into()),
+                pid: None,
+                started_at: chrono::Utc::now(),
+            })
+        }
+        fn shutdown_session(&self, _h: &SessionHandle) -> Result<(), HarnessError> {
+            Ok(())
+        }
+    }
+
+    let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_WATCH_FIXER);
+    let mut orch = Orchestrator::new(paths.clone(), OrchestratorConfig::default()).unwrap();
+    orch.set_adapter(Executor::Claude, Arc::new(JobIdMockAdapter));
+    orch.set_adapter(Executor::Codex, Arc::new(JobIdMockAdapter));
+    let spec = watch_spec("fixer", "issues", Some(1));
+    let progress = orch.paths().progress_jsonl(&slug);
+
+    let evt = ArtifactEvent {
+        role: "fixer".into(),
+        artifact_path: pdir.join("issues/a.md"),
+        event_kind: WatchKind::Created,
+    };
+    orch.test_handle_artifact_event(&slug, &spec, &pdir, &progress, evt)
+        .await
+        .unwrap();
+
+    let events = read_events(&progress);
+    let spawn = events
+        .iter()
+        .find(|e| e.get("event").and_then(Value::as_str) == Some("agent_spawn"))
+        .expect("agent_spawn missing");
+    assert_eq!(
+        spawn.get("job_id").and_then(Value::as_str),
+        Some("abc12345"),
+        "agent_spawn must carry harness job_id verbatim",
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn t36_phantom_cleanup_bumps_project_state_cost_in_sync() {
+    // Cost-aggregation fix: when poll_completions writes the synthetic
+    // `agent_done`, it must also bump `state.cost_used_usd` so the
+    // dashboard column (sourced from ProjectState) and the web UI
+    // (sourced from progress.jsonl) report the same total. For this
+    // case we use a state.json with non-zero cost so the bump is
+    // observable; the phantom path itself reports cost_usd = 0 by
+    // design (sigkill → no cost recorded).
+    use ccteam_core::state::ProjectState;
+
+    let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_WATCH_FIXER);
+    let progress = paths.progress_jsonl(&slug);
+    // Seed the state.json so the orchestrator can read/write it.
+    ProjectState::initial(slug.clone())
+        .save(&paths.project_state(&slug))
+        .unwrap();
+
+    // Pre-write a phantom spawn whose job_id has a state.json with
+    // cost_usd reported by Claude before the host crashed.
+    ccteam_core::progress::append_event(
+        &progress,
+        &serde_json::json!({
+            "event": "agent_spawn",
+            "role": "fixer",
+            "session_id": "fixer-killed",
+            "tmux_session": "ccteam-test-fixer-killed",
+            "job_id": "cost-recorded",
+            "executor": "claude",
+            "slug": slug,
+            "ts": chrono::Utc::now().to_rfc3339(),
+        }),
+    )
+    .unwrap();
+
+    let jobs_dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(jobs_dir.path().join("cost-recorded")).unwrap();
+    std::fs::write(
+        jobs_dir.path().join("cost-recorded").join("state.json"),
+        // `state` is terminal; Claude managed to flush cost before
+        // dying. The phantom-cleanup pass must propagate that cost.
+        r#"{"state":"failed","cost_usd":1.25,"firstTerminalAt":"2026-05-15T12:00:00Z"}"#,
+    )
+    .unwrap();
+    let prev = std::env::var_os(ccteam_core::CLAUDE_JOBS_DIR_ENV);
+    std::env::set_var(ccteam_core::CLAUDE_JOBS_DIR_ENV, jobs_dir.path());
+
+    let (orch, _claude, _codex) = build_orchestrator(paths.clone());
+    let spec = watch_spec("fixer", "issues", Some(2));
+
+    orch.test_poll_completions(&slug, &spec, &pdir, &progress)
+        .await;
+
+    match prev {
+        Some(v) => std::env::set_var(ccteam_core::CLAUDE_JOBS_DIR_ENV, v),
+        None => std::env::remove_var(ccteam_core::CLAUDE_JOBS_DIR_ENV),
+    }
+
+    let events = read_events(&progress);
+    let done = events
+        .iter()
+        .filter(|e| e.get("event").and_then(Value::as_str) == Some("agent_done"))
+        .find(|e| e.get("session_id").and_then(Value::as_str) == Some("fixer-killed"))
+        .expect("synthetic agent_done missing");
+    assert_eq!(done["status"], "error", "failed state.json maps to error");
+    assert!((done["cost_usd"].as_f64().unwrap() - 1.25).abs() < 1e-9);
+
+    let state = ProjectState::load(&paths.project_state(&slug)).unwrap();
+    assert!(
+        (state.cost_used_usd - 1.25).abs() < 1e-9,
+        "state.cost_used_usd must mirror the agent_done cost, got {}",
+        state.cost_used_usd,
+    );
 }

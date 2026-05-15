@@ -260,6 +260,37 @@ body {
   animation: slide-in-right 0.2s ease-out;
 }
 
+/* V0.4.5 F80 — "agent active" pulse indicator. Used in WorkflowView
+ * AgentCard headers when running_count > 0 to surface that a claude
+ * session is genuinely tool-using right now (the count badge alone
+ * was not enough signal — operators couldn't tell stale from live
+ * before F80's cleanup).
+ *
+ * Kept slow + low contrast on purpose. Hard flashing would be a UX
+ * regression for users who keep the workflow tab open all day.
+ * prefers-reduced-motion respects accessibility opt-out. */
+@keyframes agent-active-pulse {
+  0%, 100% { opacity: 0.55; transform: scale(1); }
+  50% { opacity: 1; transform: scale(1.18); }
+}
+
+.agent-active-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--color-status-running);
+  box-shadow: 0 0 6px var(--color-status-running);
+  animation: agent-active-pulse 1.8s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .agent-active-dot {
+    animation: none;
+    opacity: 0.85;
+  }
+}
+
 /* Focus indicators for keyboard navigation */
 button:focus-visible,
 a:focus-visible,

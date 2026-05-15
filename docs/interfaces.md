@@ -434,7 +434,7 @@ V0.4.0 起 progress.jsonl 由两个域共同写入:
 
 ```jsonl
 {"ts":"2026-05-10T09:00:00Z","event":"workflow_start","workflow":"watcher","slug":"dev-foo"}
-{"ts":"2026-05-10T09:00:01Z","event":"agent_spawn","role":"fixer","session_id":"fixer-1","executor":"claude","tmux_session":"ccteam-dev-foo-fixer-1","slug":"dev-foo"}
+{"ts":"2026-05-10T09:00:01Z","event":"agent_spawn","role":"fixer","session_id":"fixer-1","executor":"claude","tmux_session":"ccteam-dev-foo-fixer-1","job_id":"9432490e","slug":"dev-foo"}
 {"ts":"2026-05-10T09:00:02Z","event":"artifact_received","role":"fixer","artifact_path":"/abs/path/to/issues/bug.md","slug":"dev-foo"}
 {"ts":"2026-05-10T09:00:03Z","event":"gate_triggered","role":"reviewer","forced":false,"threshold_met":true,"slug":"dev-foo"}
 {"ts":"2026-05-10T09:01:00Z","event":"agent_done","role":"fixer","session_id":"fixer-1","status":"completed","cost_usd":0.42,"slug":"dev-foo"}
@@ -448,8 +448,8 @@ V0.4.0 起 progress.jsonl 由两个域共同写入:
 | event | 必有字段 | 选填字段 | 写入时机 |
 |---|---|---|---|
 | `workflow_start` | `workflow` (`WorkflowSpec::name`), `slug`, `ts` | — | `Orchestrator::run_project` 入口,加载 workflow.yaml 成功后 |
-| `agent_spawn` | `role`, `session_id`, `executor` (`claude`\|`codex`), `slug`, `ts` | `tmux_session` (claude 用 `ccteam-<slug>-<sid>` 占位;codex 写真名) | `HarnessAdapter::spawn_session` 返回 `Ok(handle)` 后 |
-| `agent_done` | `role`, `session_id`, `status` (`completed`\|`stopped`\|`error`), `cost_usd` (f64;无 cost 时 `0.0`), `slug`, `ts` | — | `session_state_path` 文件 `status` ∈ {`stopped`, `completed`, `error`} 时,poll 一次 |
+| `agent_spawn` | `role`, `session_id`, `executor` (`claude`\|`codex`), `slug`, `ts` | `tmux_session` (claude 用 `ccteam-<slug>-<sid>` 占位;codex 写真名),`job_id` (V0.4.5 F80;Claude Code `--bg` 返回的短 hash,如 `"9432490e"`,codex 行为 `null`) | `HarnessAdapter::spawn_session` 返回 `Ok(handle)` 后 |
+| `agent_done` | `role`, `session_id`, `status` (`completed`\|`stopped`\|`error`\|`killed`), `cost_usd` (f64;无 cost 时 `0.0`), `slug`, `ts` | — | (a) `session_state_path` 文件 `status` ∈ {`stopped`, `completed`, `error`} 时,poll 一次;(b) **V0.4.5 F80**:`poll_completions` 发现 progress.jsonl 含 open `agent_spawn` 但其 `job_id` 对应的 `~/.claude/jobs/<id>/state.json` 已 terminal(`firstTerminalAt` 非空 / state ∈ {done, failed, crashed, stopped} / 文件不存在),orchestrator 合成 `agent_done`,`status: "killed"` 用于 SIGKILL 死亡的 phantom row(防止 web UI 显示僵尸 running)|
 | `artifact_received` | `role`, `artifact_path` (abs), `slug`, `ts` | — | `ArtifactWatcher` 通过 mpsc 投递 `ArtifactEvent` 后,orchestrator 立刻 append(spawn 决策之前) |
 | `gate_triggered` | `role`, `forced` (bool), `threshold_met` (bool), `slug`, `ts` | — | `check_gates` 解锁 Gate 时;`forced=true` 表示 `.ccteam/gate_override/<role>` marker 触发 |
 | `budget_exceeded` | `role`, `cost_used_usd` (f64), `budget_limit_usd` (f64), `slug`, `ts` | — | `try_spawn` 内 budget guard 拦截 spawn 时(运行 session 永不被 kill) |

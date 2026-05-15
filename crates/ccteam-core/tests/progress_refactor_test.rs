@@ -257,9 +257,18 @@ fn t07_append_and_read_roundtrip() {
 }
 
 #[test]
+#[serial_test::serial]
 fn t08_workflow_summary_with_artifacts() {
     // Fixture workflow.yaml + populated input/output dirs → counts
     // surface in the summary keyed by relative path.
+    //
+    // V0.4.5 F80 update: workflow_summary now cross-references each
+    // open agent_spawn against `state.json::state`. An agent_spawn
+    // without `job_id` is treated as terminal by the liveness probe
+    // (legacy / pre-F80 rows clear out). To preserve the
+    // running_count=1 assertion we record a `job_id` on the spawn
+    // and stand up an alive state.json under
+    // `$CCTEAM_CLAUDE_JOBS_DIR/<job_id>/state.json`.
     let tmp = TempDir::new().unwrap();
     let slug = "watch-proj";
     let yaml = "\
@@ -272,7 +281,20 @@ agents:
     input: issues
     output: fixes
 ";
-    let events = vec![spawn("fixer", "fixer-1", "2026-05-10T00:00:00Z")];
+    let jobs_dir = tmp.path().join("jobs");
+    std::fs::create_dir_all(jobs_dir.join("live-job-1")).unwrap();
+    std::fs::write(
+        jobs_dir.join("live-job-1").join("state.json"),
+        r#"{"state":"working","firstTerminalAt":null,"cost_usd":0.0}"#,
+    )
+    .unwrap();
+
+    let events = vec![spawn_with_job(
+        "fixer",
+        "fixer-1",
+        Some("live-job-1"),
+        "2026-05-10T00:00:00Z",
+    )];
     let (paths, project_dir) = make_project(&tmp, slug, yaml, &events);
 
     let issues_dir = project_dir.join("issues");
@@ -283,7 +305,16 @@ agents:
     std::fs::write(issues_dir.join("b.md"), "b").unwrap();
     std::fs::write(fixes_dir.join("z.md"), "z").unwrap();
 
+    let prev = std::env::var_os(ccteam_core::CLAUDE_JOBS_DIR_ENV);
+    std::env::set_var(ccteam_core::CLAUDE_JOBS_DIR_ENV, &jobs_dir);
+
     let summary = workflow_summary(slug, &paths).unwrap();
+
+    match prev {
+        Some(v) => std::env::set_var(ccteam_core::CLAUDE_JOBS_DIR_ENV, v),
+        None => std::env::remove_var(ccteam_core::CLAUDE_JOBS_DIR_ENV),
+    }
+
     assert_eq!(summary.workflow_name, "watcher");
     let counts: HashMap<String, u64> = summary.artifact_counts.clone();
     assert_eq!(counts.get("issues").copied(), Some(2));
@@ -465,4 +496,250 @@ agents:
         "flex session-stream cost expected 0.42, got {}",
         summary.total_cost_usd,
     );
+}
+
+// =====================================================================
+// V0.4.5 F80 — stale-spawn liveness coverage.
+//
+// Bug: when the daemon is SIGKILLed in-flight, claude bg sessions die
+// without anything writing the matching `agent_done`. The stale
+// `agent_spawn` lines stayed in progress.jsonl forever and the web UI
+// showed phantom "running" counts. F80 cross-references each open
+// spawn against `~/.claude/jobs/<job_id>/state.json`; the helper that
+// powers workflow_summary's new behaviour is
+// `current_agent_sessions_with_liveness` (pure modulo the injected
+// liveness probe).
+//
+// Architecture refs: `docs/v0-4-0/prd.md` §6, `docs/dev-coupling-audit.md`
+// F80, `CLAUDE.md` §三.
+// =====================================================================
+
+fn spawn_with_job(role: &str, sid: &str, job_id: Option<&str>, ts: &str) -> Value {
+    let mut e = serde_json::Map::new();
+    e.insert("event".into(), json!("agent_spawn"));
+    e.insert("role".into(), json!(role));
+    e.insert("session_id".into(), json!(sid));
+    e.insert("executor".into(), json!("claude"));
+    e.insert("ts".into(), json!(ts));
+    if let Some(id) = job_id {
+        e.insert("job_id".into(), json!(id));
+    }
+    Value::Object(e)
+}
+
+/// Materialise `<jobs>/<job_id>/state.json` with the given body
+/// shape; honors `$CCTEAM_CLAUDE_JOBS_DIR` so callers pin all jobs
+/// under a single tempdir.
+fn write_job_state(jobs_dir: &std::path::Path, job_id: &str, body: &serde_json::Value) {
+    let dir = jobs_dir.join(job_id);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("state.json"), serde_json::to_string(body).unwrap()).unwrap();
+}
+
+#[test]
+fn t13_workflow_summary_drops_phantom_spawn_when_job_state_missing() {
+    use ccteam_core::progress::current_agent_sessions_with_liveness;
+
+    let events = vec![spawn_with_job(
+        "explorer",
+        "explorer-1",
+        Some("dead-jobid"),
+        "2026-05-10T00:00:00Z",
+    )];
+    // Pure helper call — no IO. The closure returns Terminal for the
+    // dead job_id, mirroring what `claude_job::probe_job` would
+    // return when `state.json` is missing on disk.
+    let sessions = current_agent_sessions_with_liveness(&events, |job_id| match job_id {
+        Some("dead-jobid") => ccteam_core::JobLiveness::Terminal {
+            status: "killed",
+            cost_usd: 0.0,
+        },
+        _ => ccteam_core::JobLiveness::Running,
+    });
+    assert_eq!(sessions.len(), 1);
+    match &sessions[0].status {
+        AgentSessionStatus::Errored { cost_usd } => {
+            assert_eq!(*cost_usd, 0.0, "killed phantom gets zero cost");
+        }
+        other => panic!("expected Errored (killed), got {other:?}"),
+    }
+}
+
+#[test]
+fn t14_workflow_summary_keeps_live_spawn_when_job_state_working() {
+    use ccteam_core::progress::current_agent_sessions_with_liveness;
+
+    let events = vec![spawn_with_job(
+        "explorer",
+        "explorer-2",
+        Some("alive-jobid"),
+        "2026-05-10T00:00:00Z",
+    )];
+    let sessions = current_agent_sessions_with_liveness(&events, |job_id| match job_id {
+        Some("alive-jobid") => ccteam_core::JobLiveness::Running,
+        _ => ccteam_core::JobLiveness::Terminal {
+            status: "killed",
+            cost_usd: 0.0,
+        },
+    });
+    assert_eq!(sessions.len(), 1);
+    assert!(matches!(sessions[0].status, AgentSessionStatus::Running));
+}
+
+#[test]
+#[serial_test::serial]
+fn t15_workflow_summary_phantom_drop_via_real_state_json() {
+    // End-to-end: write the workflow.yaml + progress.jsonl with a
+    // single `agent_spawn` whose job_id points at `dead-1` (no
+    // state.json present in the jobs tempdir). workflow_summary must
+    // report running_count = 0, since the liveness probe sees the
+    // missing file and treats the spawn as terminal.
+    let tmp = TempDir::new().unwrap();
+    let jobs_dir = tmp.path().join("jobs");
+    std::fs::create_dir_all(&jobs_dir).unwrap();
+    // `alive-1` job is genuinely running.
+    write_job_state(
+        &jobs_dir,
+        "alive-1",
+        &json!({
+            "state": "working",
+            "firstTerminalAt": null,
+            "cost_usd": 0.50,
+        }),
+    );
+    // `dead-1` job has no state.json at all (= SIGKILL casualty).
+
+    let prev = std::env::var_os(ccteam_core::CLAUDE_JOBS_DIR_ENV);
+    std::env::set_var(ccteam_core::CLAUDE_JOBS_DIR_ENV, &jobs_dir);
+
+    let slug = "phantom-proj";
+    let yaml = "\
+name: phantoms
+agents:
+  explorer:
+    executor: claude
+    trigger: manual
+";
+    let events = vec![
+        spawn_with_job(
+            "explorer",
+            "explorer-1",
+            Some("dead-1"),
+            "2026-05-10T00:00:00Z",
+        ),
+        spawn_with_job(
+            "explorer",
+            "explorer-2",
+            Some("alive-1"),
+            "2026-05-10T00:00:01Z",
+        ),
+    ];
+    let (paths, _pdir) = make_project(&tmp, slug, yaml, &events);
+
+    let summary = workflow_summary(slug, &paths).unwrap();
+
+    match prev {
+        Some(v) => std::env::set_var(ccteam_core::CLAUDE_JOBS_DIR_ENV, v),
+        None => std::env::remove_var(ccteam_core::CLAUDE_JOBS_DIR_ENV),
+    }
+
+    let explorer = summary
+        .agents
+        .iter()
+        .find(|a| a.role == "explorer")
+        .expect("explorer row");
+    assert_eq!(
+        explorer.running_count, 1,
+        "phantom dead-1 must drop; alive-1 stays running",
+    );
+}
+
+#[test]
+fn t16_workflow_summary_drops_phantom_with_missing_job_id() {
+    use ccteam_core::progress::current_agent_sessions_with_liveness;
+
+    // Legacy (pre-F80) agent_spawn line — no `job_id` field. The
+    // closure receives `None` and must report Terminal so the stale
+    // row clears.
+    let events = vec![spawn_with_job(
+        "fixer",
+        "fixer-1",
+        None,
+        "2026-05-10T00:00:00Z",
+    )];
+    let sessions = current_agent_sessions_with_liveness(&events, ccteam_core::probe_job);
+    assert_eq!(sessions.len(), 1);
+    assert!(
+        matches!(sessions[0].status, AgentSessionStatus::Errored { .. }),
+        "legacy spawn without job_id must drop, got {:?}",
+        sessions[0].status,
+    );
+}
+
+#[test]
+fn t17_workflow_summary_skips_phantom_when_done_pair_present() {
+    use ccteam_core::progress::current_agent_sessions_with_liveness;
+
+    // If `agent_done` is already in the log, the liveness probe must
+    // not fire for that session (the explicit terminal event wins,
+    // including its real cost_usd).
+    let events = vec![
+        spawn_with_job(
+            "planner",
+            "planner-1",
+            Some("alive-1"),
+            "2026-05-10T00:00:00Z",
+        ),
+        done(
+            "planner",
+            "planner-1",
+            "completed",
+            0.42,
+            "2026-05-10T00:00:01Z",
+        ),
+    ];
+    let sessions = current_agent_sessions_with_liveness(&events, |_| {
+        // If this closure runs for planner-1 we know the impl is
+        // skipping the liveness probe correctly only when no done is
+        // present. Force panic so the test fails if the impl ever
+        // probes a session with an explicit `agent_done`.
+        panic!("liveness probe must not fire when agent_done is present");
+    });
+    assert_eq!(sessions.len(), 1);
+    match &sessions[0].status {
+        AgentSessionStatus::Done { cost_usd } => assert_eq!(*cost_usd, 0.42),
+        other => panic!("expected Done, got {other:?}"),
+    }
+}
+
+#[test]
+fn t18_open_agent_spawns_returns_unclosed_triples() {
+    use ccteam_core::progress::open_agent_spawns;
+
+    let events = vec![
+        spawn_with_job(
+            "explorer",
+            "explorer-1",
+            Some("job-a"),
+            "2026-05-10T00:00:00Z",
+        ),
+        spawn_with_job(
+            "explorer",
+            "explorer-2",
+            Some("job-b"),
+            "2026-05-10T00:00:01Z",
+        ),
+        done(
+            "explorer",
+            "explorer-1",
+            "completed",
+            0.1,
+            "2026-05-10T00:00:02Z",
+        ),
+    ];
+    let open = open_agent_spawns(&events);
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].0, "explorer-2");
+    assert_eq!(open[0].1.as_deref(), Some("job-b"));
+    assert_eq!(open[0].2, "explorer");
 }

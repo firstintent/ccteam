@@ -71,9 +71,23 @@ function AgentCard({
   onTriggerGate?: (role: string) => void;
 }) {
   const isGate = gateState !== undefined;
+  // V0.4.5 F80 — surface a live "agent active" indicator alongside the
+  // role label when running_count > 0. The count badge alone was easy
+  // to miss; the pulsing dot makes "this agent is doing something right
+  // now" obvious at a glance. Animation lives in index.css
+  // `.agent-active-dot` (slow pulse, prefers-reduced-motion honored).
+  const isActive = agent.running_count > 0;
   return (
     <div className="border border-surface-700/40 rounded-md bg-surface-850 p-3 flex flex-col gap-1.5 min-w-0">
       <div className="flex items-center gap-2 min-w-0">
+        {isActive && (
+          <span
+            className="agent-active-dot shrink-0"
+            aria-label={`agent ${agent.role} active`}
+            role="status"
+            title={`${agent.running_count} session${agent.running_count > 1 ? "s" : ""} running`}
+          />
+        )}
         <span
           className="font-mono text-sm text-text-primary truncate flex-1"
           title={agent.role}

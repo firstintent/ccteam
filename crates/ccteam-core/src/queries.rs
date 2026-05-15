@@ -37,8 +37,8 @@ use serde_json::Value;
 
 use crate::paths::CcteamPaths;
 use crate::progress::{
-    self, current_agent_sessions, escalation_count, workflow_cost_total, AgentSessionStatus,
-    AgentSessionSummary,
+    self, current_agent_sessions_with_liveness, escalation_count, workflow_cost_total,
+    AgentSessionStatus, AgentSessionSummary,
 };
 use crate::state::ProjectState;
 use crate::team::TeamKind;
@@ -344,7 +344,15 @@ pub fn workflow_summary(slug: &str, paths: &CcteamPaths) -> Result<WorkflowSumma
 
     let total_cost_usd = workflow_cost_total(&events);
     let escalation_count = escalation_count(&events);
-    let sessions = current_agent_sessions(&events);
+    // V0.4.5 F80 — liveness-aware accounting. Each open `agent_spawn`
+    // is cross-referenced against `~/.claude/jobs/<job_id>/state.json`
+    // so phantom rows (daemon SIGKILL casualties whose process died
+    // without writing `agent_done`) drop out of the running count
+    // immediately, before the orchestrator's next `poll_completions`
+    // tick writes the synthetic cleanup event.
+    let sessions = current_agent_sessions_with_liveness(&events, |job_id| {
+        crate::claude_job::probe_job(job_id)
+    });
 
     let mut artifact_counts: HashMap<String, u64> = HashMap::new();
     let mut gate_states: HashMap<String, String> = HashMap::new();
@@ -515,7 +523,8 @@ mod tests {
         let external = tmp.path().join("external").join("myapp");
         std::fs::create_dir_all(external.join(".ccteam")).unwrap();
         let state = ProjectState::initial("myapp".into());
-        state.save(&external.join(".ccteam").join("state.json"))
+        state
+            .save(&external.join(".ccteam").join("state.json"))
             .unwrap();
 
         crate::config::append_project(

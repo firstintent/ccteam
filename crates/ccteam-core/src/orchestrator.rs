@@ -611,6 +611,11 @@ impl Orchestrator {
                     .or_default()
                     .push(handle.clone());
                 self.fail_counts.lock().await.insert(role.to_string(), 0);
+                // V0.4.5 F80 — record `job_id` on the agent_spawn so
+                // the read-side (queries::workflow_summary) and
+                // poll_completions can cross-reference
+                // `~/.claude/jobs/<id>/state.json` for liveness.
+                // Codex sessions leave it null (no `--bg` surface yet).
                 progress::append_event(
                     progress_path,
                     &json!({
@@ -618,6 +623,7 @@ impl Orchestrator {
                         "role": role,
                         "session_id": handle.sid,
                         "tmux_session": handle.tmux_session,
+                        "job_id": handle.job_id,
                         "executor": match agent.executor {
                             Executor::Claude => "claude",
                             Executor::Codex => "codex",
@@ -710,9 +716,67 @@ impl Orchestrator {
             running.retain(|_, v| !v.is_empty());
         }
 
+        // V0.4.5 F80 — stale-spawn cleanup. Walk progress.jsonl for
+        // any `agent_spawn` rows still missing a matching `agent_done`,
+        // probe `~/.claude/jobs/<job_id>/state.json` to decide whether
+        // they're really alive or were SIGKILL casualties from a prior
+        // daemon shutdown. Phantom rows get a synthetic `agent_done`
+        // here so the running count drops back to ground truth without
+        // the user having to nuke `progress.jsonl`. The in-memory
+        // `running` map is already correct (handles for dead sessions
+        // never repopulated on daemon restart); this is purely about
+        // the progress-jsonl event log.
+        let events = progress::read_all_events(progress_path).unwrap_or_default();
+        let in_memory_sids: std::collections::HashSet<String> = {
+            let running = self.running.lock().await;
+            running
+                .values()
+                .flat_map(|v| v.iter().map(|h| h.sid.clone()))
+                .collect()
+        };
+        for (sid, job_id, role) in progress::open_agent_spawns(&events) {
+            if in_memory_sids.contains(&sid) {
+                continue; // genuinely tracked by this orchestrator instance
+            }
+            let verdict = crate::claude_job::probe_job(job_id.as_deref());
+            let crate::claude_job::JobLiveness::Terminal { status, cost_usd } = verdict else {
+                continue;
+            };
+            tracing::info!(
+                slug,
+                role = role.as_str(),
+                session_id = sid.as_str(),
+                ?job_id,
+                status,
+                cost_usd,
+                "F80 stale-spawn cleanup: emitting synthetic agent_done",
+            );
+            finished.push((
+                role,
+                SessionHandle {
+                    tmux_session: String::new(),
+                    harness: "claude-code".to_string(),
+                    sid,
+                    job_id,
+                    pid: None,
+                    started_at: Utc::now(),
+                },
+                Some(cost_usd),
+                status.to_string(),
+            ));
+        }
+
         for (role, handle, cost_usd, status) in finished {
             if let Some(c) = cost_usd {
                 *self.cost_accum.lock().await += c;
+                // V0.4.5 F80 — keep `state.cost_used_usd` (read by
+                // `ccteam show <slug>` + the dashboard cost column)
+                // in sync with the `agent_done` cost the web UI
+                // already aggregates from progress.jsonl. Pre-F80
+                // these two surfaces diverged: hooks updated
+                // state.cost_used_usd from the per-tool cost feed,
+                // but agent_done cost lived only in the event log.
+                self.bump_project_state_cost(slug, c).await;
             }
             let _ = progress::append_event(
                 progress_path,
@@ -748,6 +812,36 @@ impl Orchestrator {
 
         self.check_gates(slug, spec, project_dir, progress_path)
             .await;
+    }
+
+    /// V0.4.5 F80 — best-effort bump of `state.cost_used_usd` on disk
+    /// so the dashboard cost column (sourced from `ProjectState`) and
+    /// the web UI workflow card (sourced from progress.jsonl
+    /// `agent_done.cost_usd`) report the same number. Read-modify-write
+    /// is wrapped in `ProjectState::save` which is atomic + makes a
+    /// `.bak`; a missing `state.json` (test fixtures, transient race)
+    /// is silently skipped — the source-of-truth event log already has
+    /// the cost. Errors log but never bubble; the orchestrator's
+    /// dispatch loop must not stall on cost-bookkeeping.
+    async fn bump_project_state_cost(&self, slug: &str, delta: f64) {
+        if delta <= 0.0 {
+            return;
+        }
+        let state_path = self.paths.project_state(slug);
+        if !state_path.exists() {
+            return;
+        }
+        let mut state = match crate::state::ProjectState::load(&state_path) {
+            Ok(s) => s,
+            Err(err) => {
+                tracing::warn!(slug, ?err, "F80 cost bump: load state.json failed");
+                return;
+            }
+        };
+        state.cost_used_usd += delta;
+        if let Err(err) = state.save(&state_path) {
+            tracing::warn!(slug, ?err, "F80 cost bump: save state.json failed");
+        }
     }
 
     /// Scan `.ccteam/spawn_requests/*.json` markers written by the F65
@@ -897,7 +991,11 @@ impl Orchestrator {
         }
         let archive_dir = ccteam_dir.join("inbox.archived");
         if let Err(err) = std::fs::create_dir_all(&archive_dir) {
-            tracing::warn!(slug, ?err, "inbox.archived mkdir failed; messages stay in inbox");
+            tracing::warn!(
+                slug,
+                ?err,
+                "inbox.archived mkdir failed; messages stay in inbox"
+            );
             return;
         }
 
@@ -951,23 +1049,26 @@ impl Orchestrator {
             // Decide spawn target — only for parsed messages with
             // non-empty body and no explicit opt-out.
             let body_trim = body.trim();
-            let auto_spawn_role: Option<String> = if parse_failed || body_trim.is_empty()
-                || loose_no_spawn
-            {
-                None
-            } else if let Some(target) = loose_target {
-                if spec.agents.contains_key(&target) {
-                    Some(target)
-                } else {
-                    tracing::warn!(slug, target, "inbox target_role not in workflow.yaml; archive only");
+            let auto_spawn_role: Option<String> =
+                if parse_failed || body_trim.is_empty() || loose_no_spawn {
                     None
-                }
-            } else {
-                spec.agents
-                    .iter()
-                    .find(|(_, a)| matches!(a.trigger, Trigger::Manual))
-                    .map(|(r, _)| r.clone())
-            };
+                } else if let Some(target) = loose_target {
+                    if spec.agents.contains_key(&target) {
+                        Some(target)
+                    } else {
+                        tracing::warn!(
+                            slug,
+                            target,
+                            "inbox target_role not in workflow.yaml; archive only"
+                        );
+                        None
+                    }
+                } else {
+                    spec.agents
+                        .iter()
+                        .find(|(_, a)| matches!(a.trigger, Trigger::Manual))
+                        .map(|(r, _)| r.clone())
+                };
 
             let mut spawn_marker: Option<String> = None;
             if let Some(role) = &auto_spawn_role {
@@ -1338,7 +1439,8 @@ impl Orchestrator {
         project_dir: &std::path::Path,
         progress_path: &std::path::Path,
     ) {
-        self.check_inbox(slug, spec, project_dir, progress_path).await;
+        self.check_inbox(slug, spec, project_dir, progress_path)
+            .await;
     }
 
     pub async fn test_gate_override(
