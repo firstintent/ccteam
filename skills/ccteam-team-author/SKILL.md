@@ -1,15 +1,6 @@
-<!-- ccteam-managed:skill begin -->
 ---
 name: ccteam-team-author
-description: |
-  Author a new ccteam team plugin via dialogue with the user. Use when
-  the user asks to create / design / scaffold a team, or wants to package
-  a custom phase pipeline as a Claude Code plugin. Primary consumer is
-  the ccteam meta-agent session — it walks the user through phase list,
-  tools, golden rules, retro schema, verdict schema, and plugin metadata,
-  then invokes `ccteam team init` / `ccteam team publish` to materialize
-  and share the result.
-allowed-tools: [Bash, Read, Write, Edit]
+description: Author a new ccteam team plugin via dialogue with the user. Use when the user asks to create / design / scaffold a team, or wants to package a custom phase pipeline as a Claude Code plugin. Primary consumer is the ccteam meta-agent session — it walks the user through phase list, tools, golden rules, retro schema, verdict schema, and plugin metadata, then invokes `ccteam team init` / `ccteam team publish` to materialize and share the result.
 ---
 
 # ccteam-team-author
@@ -147,4 +138,3 @@ prefixes — `REVERT_TO_PHASE` / `NEED_USER_INPUT` / `ABORT` /
 - It does not auto-install the plugin in any session. Publish writes the
   artifact; the user enables it in each Claude Code session that wants
   it (`/plugin enable`).
-<!-- ccteam-managed:skill end -->

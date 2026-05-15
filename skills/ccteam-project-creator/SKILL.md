@@ -1,16 +1,6 @@
-<!-- ccteam-managed:skill begin -->
 ---
 name: ccteam-project-creator
-description: |
-  When the user wants to create a new ccteam project — walk a four-phase
-  dialogue: clarify the brief, recommend a slug, pick a team, and dispatch
-  via `ccteam new`. Use when the user says "新项目" / "建一个 X" / "做个 X" /
-  "做一个 X" / "调研 X" / "评估 X 值不值" / "看看 X 能不能做". Primary
-  consumer is the ccteam meta-agent session; the skill assumes
-  `AskUserQuestion` is available (which is true inside the meta-agent
-  context — the V0.2 PreToolUse intercept runs in project sessions only,
-  not the meta-agent).
-allowed-tools: [Bash, AskUserQuestion]
+description: When the user wants to create a new ccteam project — walk a four-phase dialogue clarifying the brief, recommending a slug, picking a team, and dispatching via `ccteam new`. Use when the user says "新项目" / "建一个 X" / "做个 X" / "做一个 X" / "调研 X" / "评估 X 值不值" / "看看 X 能不能做". Primary consumer is the ccteam meta-agent session; the skill assumes `AskUserQuestion` is available (which is true inside the meta-agent context — the V0.2 PreToolUse intercept runs in project sessions only, not the meta-agent).
 ---
 
 # ccteam-project-creator
@@ -170,4 +160,3 @@ and re-run Phase C with the corrected team.
 If the user explicitly says "先别建项目,直接帮我写一段代码" (mode 1 ad-hoc),
 do **not** invoke this skill. Drop back to plain conversation; the
 meta-agent role prompt §3 covers that exception.
-<!-- ccteam-managed:skill end -->

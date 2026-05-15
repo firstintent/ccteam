@@ -1,14 +1,6 @@
-<!-- ccteam-managed:skill begin -->
 ---
 name: ccteam-control
-description: |
-  Manage ccteam projects from any Claude Code session. Use when the
-  user asks about ccteam status, wants to start a new ccteam project,
-  needs to inspect / pause / resume an active ccteam project, or asks
-  for advice on intervening when a project is stuck. Primary consumer
-  is the ccteam meta-agent session; secondary consumer is the user's
-  own daily-driver claude.
-allowed-tools: [Bash]
+description: Manage ccteam projects from any Claude Code session. Use when the user asks about ccteam status, wants to start a new ccteam project, needs to inspect / pause / resume an active ccteam project, or asks for advice on intervening when a project is stuck. Primary consumer is the ccteam meta-agent session; secondary consumer is the user's own daily-driver claude.
 ---
 
 # ccteam-control
@@ -135,4 +127,3 @@ When this skill is loaded inside a ccteam meta-agent session:
    ESCALATE-style markdown payload (interfaces §4.1.1) and atomically
    writes it to the project's inbox so the orchestrator delivers it
    on the next tick.
-<!-- ccteam-managed:skill end -->

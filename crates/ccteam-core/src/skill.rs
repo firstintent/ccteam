@@ -182,20 +182,12 @@ mod tests {
         assert_eq!(report.action, SkillInstallAction::Wrote);
         assert!(report.target.exists());
         let body = std::fs::read_to_string(&report.target).unwrap();
-        // Bodies are wrapped in `<!-- ccteam-managed:skill begin/end -->`
-        // markers so the F44 reverse migration can detect ccteam-managed
-        // installs (vs. user hand-edits) when sweeping legacy `cct-*`
-        // skill directories.
-        assert!(
-            body.contains("<!-- ccteam-managed:skill begin -->"),
-            "must contain ccteam-managed begin marker (F44 migration prerequisite)",
-        );
-        assert!(
-            body.contains("<!-- ccteam-managed:skill end -->"),
-            "must contain ccteam-managed end marker",
-        );
-        assert!(body.contains("---\nname: ccteam-control"));
-        assert!(body.contains("allowed-tools: [Bash]"));
+        // Frontmatter follows the official Anthropic skill-creator spec:
+        // file starts with `---`, then `name` + `description` only.
+        // ccteam-managed markers + `allowed-tools` were dropped in
+        // V0.4.4 to align with skill-creator; F44 reverse migration's
+        // `is_managed` check falls back to the canonical `name:` field.
+        assert!(body.starts_with("---\nname: ccteam-control"));
         // Required body chapters per interfaces §11.3.
         for required in [
             "Capability index",
@@ -263,8 +255,7 @@ mod tests {
         .unwrap();
         assert_eq!(report.action, SkillInstallAction::Wrote);
         let body = std::fs::read_to_string(&report.target).unwrap();
-        assert!(body.contains("<!-- ccteam-managed:skill begin -->"));
-        assert!(body.contains("name: ccteam-team-author"));
+        assert!(body.starts_with("---\nname: ccteam-team-author"));
         assert!(body.contains("Capability index"));
     }
 
@@ -291,7 +282,7 @@ mod tests {
     // -------------- V0.2.2 F34 project-creator skill --------------
 
     #[test]
-    fn project_creator_skill_installs_with_marker_and_phases() {
+    fn project_creator_skill_installs_with_phases() {
         let tmp = tempfile::TempDir::new().unwrap();
         let report = install_skill_body_into(
             tmp.path(),
@@ -302,15 +293,7 @@ mod tests {
         .unwrap();
         assert_eq!(report.action, SkillInstallAction::Wrote);
         let body = std::fs::read_to_string(&report.target).unwrap();
-        assert!(
-            body.contains("<!-- ccteam-managed:skill begin -->"),
-            "must carry the ccteam-managed begin marker (F44 migration prerequisite)",
-        );
-        assert!(
-            body.contains("<!-- ccteam-managed:skill end -->"),
-            "must carry the ccteam-managed end marker",
-        );
-        assert!(body.contains("name: ccteam-project-creator"));
+        assert!(body.starts_with("---\nname: ccteam-project-creator"));
         // The four-phase dialogue is the body's main contract; if any
         // disappears, the meta-agent silently loses behavior.
         for phase in [
