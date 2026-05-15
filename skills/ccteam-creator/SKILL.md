@@ -1,14 +1,6 @@
-<!-- ccteam-managed:skill begin -->
 ---
 name: ccteam-creator
-description: |
-  Design and scaffold a ccteam workflow inside an existing project — pick
-  agent topology, write `workflow.yaml`, generate per-role
-  `.claude/agents/<role>.md` files with valid frontmatter, and optionally
-  add project-local skills. Use when the user says "做个 workflow" /
-  "建一个 agent / skill" / "把 X 自动化" / "迁移 X 到 ccteam" / "给这个项目
-  加 ccteam 流水线" / "design a multi-agent loop".
-allowed-tools: [Bash, Read, Write, Edit, AskUserQuestion]
+description: Design and scaffold a ccteam workflow inside an existing project. Use when the user says "做个 workflow" / "建一个 agent / skill" / "把 X 自动化" / "迁移 X 到 ccteam" / "给这个项目加 ccteam 流水线" / "design a multi-agent loop". Walks the user through picking agent topology, writes `workflow.yaml`, generates per-role `.claude/agents/<role>.md` with valid frontmatter, and optionally adds project-local skills. Defers to the official `agent-creator` and `skill-creator` specs for frontmatter rules — does not duplicate them.
 ---
 
 # ccteam-creator
@@ -246,4 +238,3 @@ triggers) or `ccteam spawn <slug> <role>` (manual).
 - `@crates/ccteam-core/src/workflow.rs` — schema source of truth
 - `@docs/interfaces.md` — protocol-level field meanings
 - `@CLAUDE.md` §三 — architectural red lines (file system as control plane, etc.)
-<!-- ccteam-managed:skill end -->
