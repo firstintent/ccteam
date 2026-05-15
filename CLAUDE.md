@@ -70,7 +70,7 @@
 | 机制 | 用途 | 文档 |
 |---|---|---|
 | **CLAUDE.md** | 项目级 / 用户级持久指令 | best-practices §4.1 |
-| **Skills** | `ccteam-control`(M1.8 ✅)/ `ccteam-team-author`(M0.22 ✅)/ `ccteam-project-creator`(V0.2.2 F34 ✅)/ `ccgram-messaging`(M3+ 多 orchestrator);自带 skill SoT 在 repo 根 `skills/` | tech-design §6.7 |
+| **Skills** | `ccteam-control`(M1.8 ✅)/ `ccteam-team-author`(M0.22 ✅)/ `ccteam-project-creator`(V0.2.2 F34 ✅)/ `ccteam-creator`(V0.4.4 ✅,workflow + agent + skill 创建 dialogue 指引,引用官方 spec 不复制)/ `ccgram-messaging`(M3+ 多 orchestrator);自带 skill SoT 在 repo 根 `skills/` | tech-design §6.7 |
 | **MCP** | `ccteam-mcp`(M2 ✅,9 tools)/ `claude-mem`(M4 可选) | tech-design §6.4 |
 | **Subagents** | phase 内 `Task(subagent_type=...)` 节流;`code-reviewer` 等 8 个 plugin agent 已 ln -sf | best-practices §6.3 |
 | **Hooks** | `progress.jsonl append` / `parse-phase-end` / `cost-accumulate` 已 ship;`Stop`/`SubagentStop`/`SessionEnd` 都进 idle 列表(F1+F2 修复) | tech-design §6.2 |
