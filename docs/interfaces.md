@@ -1467,26 +1467,23 @@ ccteam mcp-serve                       # M2+:作为 ccteam-mcp 跑 stdio MCP 协
 ### 10.2 提交需求
 
 ```bash
-ccteam new "需求文本"
-ccteam new -f spec.md                            # 从文件提
-ccteam new --mode yolo "需求"                    # 覆盖默认 trust_mode
-
-# V0.2.2 F34 — slug 决策四层:
-ccteam new --slug ccteam-ui --team dev "..."     # Tier 1:显式 slug(B2 前缀语义);
-                                              #   `dev-ccteam-ui` 或 verbatim
-ccteam new --no-auto-slug "..."                  # Tier 4:跳过 LLM 智能 fallback,
-                                              #   走 deterministic `slugify_brief`
-ccteam new --auto-slug-model claude-sonnet-4-5-20251001 "..."
-                                              # Tier 3:override 默认 haiku
-                                              #   (env CCTEAM_AUTO_SLUG=off 全局禁)
+# V0.4.2 起 `ccteam new <slug>` 是 `ccteam init --in <projects_root>/<team>-<slug>/`
+# 的 thin wrapper。slug 必填 positional;V0.4.0 自由文本 brief + LLM auto-slug
+# 路径(--no-auto-slug / --auto-slug-model / CCTEAM_AUTO_SLUG env)F75 全删。
+# 在已有 git repo 上原地装 ccteam 用 `ccteam init`(无参,以 cwd 为目标)。
+ccteam init                                      # cwd 安装(slug = cwd basename, team = dev)
+ccteam init --slug myapp --team dev              # cwd 安装,显式 slug + team
+ccteam init --in /work/repos/myapp               # 在 /work/repos/myapp 安装
+ccteam new myapp --team dev                      # `ccteam init --in <projects_root>/dev-myapp/`
+ccteam init --force                              # 重跑 cwd 时全覆盖 workflow.yaml + agents
+ccteam init --reset-agents                       # 重跑 cwd 时只重写 .claude/agents/*.md
 ```
 
-**slug 决定优先级**(PRD `docs/v0-2-2/prd.md` §3.2):
+**slug 决定**(V0.4.2 简化):
 
-1. **Tier 1**:`--slug` 显式(零延迟,确定;B2 prefix — 已带 team prefix verbatim)
-2. **Tier 2**:meta-agent 派单工作流的 `ccteam-project-creator` skill 推荐 + 用户确认(零额外 LLM call)
-3. **Tier 3**:`ccteam new` 不带 `--slug` 时 shell-out `claude -p haiku`(2-5s,~$0.0001)+ Y/n,非 tty auto-accept
-4. **Tier 4**:LLM 不可用 / `--no-auto-slug` / env `CCTEAM_AUTO_SLUG=off` → `slugify_brief()` deterministic 兜底
+1. `ccteam init` 无 `--slug`:slug = cwd dir basename
+2. `ccteam init --slug NAME` 或 `ccteam new SLUG`:用户显式
+3. F22 team-prefix 不变:`ccteam new myapp --team dev` 落到 `~/projects/dev-myapp/`,user 给的 slug 缺前缀时自动补
 
 ### 10.3 查询状态
 

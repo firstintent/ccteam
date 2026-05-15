@@ -16,10 +16,13 @@ allowed-tools: [Bash, AskUserQuestion]
 # ccteam-project-creator
 
 You are a **project-creation dialogue guide**, not a worker. After this
-skill finishes, you call `ccteam new --slug <slug> --team <team>
-"<refined brief>"` to dispatch the project to a fresh ccteam session.
-**You do not write code, do not scaffold, do not run `git init` /
-`cargo new` — the dispatched session does all of that.**
+skill finishes, you call `ccteam new <slug> --team <team>` to dispatch
+the project to a fresh ccteam session at
+`<projects_root>/<team>-<slug>/`. The refined brief from Phase A is
+captured in the session's CLAUDE.md template — pass the slug + team,
+no free-text body. **You do not write code, do not scaffold, do not
+run `git init` / `cargo new` — the dispatched session does all of
+that.**
 
 ## Boundary check before you start
 
@@ -130,12 +133,12 @@ alias,canonical 名是 `research`;新派单一律用 `research`。)
 Run the CLI:
 
 ```bash
-ccteam new --slug <slug> --team <team> "<refined brief>"
+ccteam new <slug> --team <team>
 ```
 
-Use the brief from Phase A (incorporating the user's clarification) as
-the request body. The slug is whatever Phase B settled on; `--slug`
-makes `ccteam new` skip the Tier 3 `claude -p` smart-suggestion path.
+The slug is whatever Phase B settled on (V0.4.2: passed as a positional
+argument). The refined brief from Phase A is the conversation context
+the dispatched session inherits via its CLAUDE.md.
 
 After dispatch, write an outbox `event_kind: reply` (per
 `meta_agent_role.md` §8) telling the user:

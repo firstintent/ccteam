@@ -595,6 +595,25 @@ fn tool_new(paths: &CcteamPaths, args: &Value) -> Result<String> {
     }
     let slug = pick_unused_slug(paths, &prompt, &team)?;
     let project_dir = bootstrap_project(paths, &slug, &prompt, &team)?;
+    // V0.4.2 F73: register the new project in config.yaml so the
+    // daemon roster (which reads `config.yaml::projects[]` first)
+    // picks it up immediately. Without this, mcp-created projects
+    // are only visible via the legacy fs-walk fallback.
+    ccteam_core::upsert_project_in_config(
+        &paths.root,
+        ccteam_core::ProjectEntry {
+            slug: slug.clone(),
+            path: project_dir.clone(),
+            team: team.clone(),
+            installed_at: chrono::Utc::now(),
+        },
+    )
+    .with_context(|| {
+        format!(
+            "upsert project `{slug}` into {}",
+            ccteam_core::ccteam_config_path(&paths.root).display(),
+        )
+    })?;
     Ok(serde_json::to_string_pretty(&json!({
         "slug": slug,
         "workspace": project_dir.to_string_lossy(),

@@ -253,7 +253,10 @@ mod tests {
     fn render_role_prompt_includes_dev_and_research_team_options() {
         let body = render_meta_role_prompt();
         assert!(body.contains("research"));
-        assert!(body.contains("--team=dev") && body.contains("--team=research"));
+        // V0.4.2: switched to space-separated CLI flags
+        // (`--team dev` / `--team research`) when F75 simplified the
+        // `ccteam new` surface.
+        assert!(body.contains("--team dev") && body.contains("--team research"));
         assert!(
             body.contains("不确定要不要做") || body.contains("调研下"),
             "team-selection heuristics must include the unsure-idea / research signal",

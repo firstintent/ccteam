@@ -109,7 +109,7 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
     });
     let target_team = opts.team.clone().unwrap_or_else(|| "dev".to_string());
 
-    // -- 3. Refuse install in the ccteam repo itself -----------------
+    // -- 3a. Refuse install in the ccteam repo itself ----------------
     if is_ccteam_repo(&target) {
         return Err(anyhow::anyhow!(
             "refusing to install ccteam in the ccteam repo itself: {}\n\n\
@@ -118,6 +118,25 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
              and re-run).",
             target.display(),
         ));
+    }
+    // -- 3b. Refuse sensitive paths (HOME / filesystem root) ---------
+    refuse_sensitive_install_target(&target, opts.force)?;
+    // -- 3c. Fail-loud slug collision against config.yaml -----------
+    if let Some(existing) = ccteam_core::lookup_project_in_config(&paths.root, &target_slug)? {
+        let same_target = std::fs::canonicalize(&existing.path)
+            .ok()
+            .zip(std::fs::canonicalize(&target).ok())
+            .is_some_and(|(a, b)| a == b);
+        if !same_target && !opts.force {
+            return Err(anyhow::anyhow!(
+                "slug `{}` is already registered at {} in {}; refusing to overwrite the registry pointer to {}.\n\
+                 Pick a different slug with `--slug <other-name>`, or pass `--force` to retarget the existing entry.",
+                target_slug,
+                existing.path.display(),
+                ccteam_core::ccteam_config_path(&paths.root).display(),
+                target.display(),
+            ));
+        }
     }
 
     // -- 4. Project install pass ------------------------------------
@@ -260,6 +279,27 @@ fn resolve_install_target(paths: &CcteamPaths, opts: &InitOptions) -> Result<std
 /// loops per CLAUDE.md §六).
 fn is_ccteam_repo(dir: &std::path::Path) -> bool {
     dir.join("Cargo.toml").is_file() && dir.join("crates").join("ccteam-cli").is_dir()
+}
+
+/// V0.4.2 F72: refuse to install at the filesystem root or at
+/// `$HOME` — installing there would spam the user's home with a
+/// `.ccteam/` + `.claude/` skeleton and register every dotfile-bearing
+/// directory as one project. `--force` overrides.
+fn refuse_sensitive_install_target(target: &std::path::Path, force: bool) -> Result<()> {
+    let canonical = std::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
+    let is_root = canonical.parent().is_none();
+    let is_home = dirs::home_dir()
+        .and_then(|h| std::fs::canonicalize(&h).ok())
+        .is_some_and(|h| h == canonical);
+    if (is_root || is_home) && !force {
+        return Err(anyhow::anyhow!(
+            "refusing to install at {} — this looks like $HOME or the filesystem root.\n\
+             Make a subdirectory (`mkdir myapp && cd myapp && ccteam init`) or pass `--force` \
+             if you really mean to install here.",
+            target.display(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -2589,6 +2629,69 @@ mod tests {
             "USER AGENT\n",
             "agents must be overwritten by --reset-agents",
         );
+    }
+
+    /// V0.4.2 F72 (reviewer-blocker fix): `ccteam init` rejects a slug
+    /// collision when the existing registry entry points at a different
+    /// physical path. Same slug + same path is OK (refresh).
+    #[test]
+    fn run_init_rejects_slug_collision_at_different_path() {
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let first = tmp.path().join("first");
+        run_init(
+            &paths,
+            InitOptions {
+                install_in: Some(first.clone()),
+                slug: Some("conflicty".into()),
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+
+        let second = tmp.path().join("second");
+        let err = run_init(
+            &paths,
+            InitOptions {
+                install_in: Some(second),
+                slug: Some("conflicty".into()),
+                ..InitOptions::default()
+            },
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("already registered"),
+            "expected slug-collision error; got: {msg}",
+        );
+    }
+
+    /// Re-running on the SAME path with the same slug is a legitimate
+    /// refresh, not a collision.
+    #[test]
+    fn run_init_same_slug_same_path_is_refresh_not_collision() {
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let target = tmp.path().join("refreshable");
+        run_init(
+            &paths,
+            InitOptions {
+                install_in: Some(target.clone()),
+                slug: Some("refreshable".into()),
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+        // Second invocation: should succeed (refresh).
+        run_init(
+            &paths,
+            InitOptions {
+                install_in: Some(target),
+                slug: Some("refreshable".into()),
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
     }
 
     /// V0.4.2 F72: installing in the ccteam source repo itself is

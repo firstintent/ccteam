@@ -1343,20 +1343,32 @@ fn run_spawn(
 }
 
 fn run_new(slug: String, team: String) -> Result<()> {
-    if slug.trim().is_empty() {
+    let slug = slug.trim();
+    if slug.is_empty() {
         anyhow::bail!("ccteam new: slug must be non-empty");
+    }
+    if team.trim().is_empty() {
+        anyhow::bail!("ccteam new: --team must be non-empty");
     }
     let paths = CcteamPaths::from_env()?;
     // V0.4.2 F75: `ccteam new <slug>` delegates to `ccteam init` with
-    // `install_in = <projects_root>/<slug>`. Same install pipeline,
-    // same overwrite-strategy semantics — `ccteam new` exists only
-    // as the "I want a new dir under projects_root" entry point.
-    let target = paths.projects_root.join(&slug);
+    // `install_in = <projects_root>/<final_slug>`. Same install
+    // pipeline, same overwrite-strategy semantics. F22 invariant: if
+    // the user-supplied slug isn't already prefixed with `<team>-`,
+    // we prepend automatically so `~/.claude/rules/ccteam-lessons-
+    // <team>.md` paths globs still match.
+    let team_prefix = format!("{team}-");
+    let final_slug = if slug.starts_with(&team_prefix) {
+        slug.to_string()
+    } else {
+        format!("{team_prefix}{slug}")
+    };
+    let target = paths.projects_root.join(&final_slug);
     let report = commands::run_init(
         &paths,
         commands::InitOptions {
             install_in: Some(target),
-            slug: Some(slug),
+            slug: Some(final_slug),
             team: Some(team),
             ..commands::InitOptions::default()
         },

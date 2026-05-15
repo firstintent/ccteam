@@ -31,8 +31,8 @@ server isn't registered yet.
 | One project's full state         | `mcp__ccteam__show`              | `ccteam show <slug> --format json` |
 | Recent progress events           | `mcp__ccteam__progress`          | `ccteam progress <slug>` |
 | Capture session pane content     | `mcp__ccteam__peek`              | `ccteam peek <slug>` |
-| Start a new dev project          | `mcp__ccteam__new`               | `ccteam new --team=dev "<request>"` |
-| Start a product-research project | `mcp__ccteam__new`               | `ccteam new --team=product-research "<idea>"` |
+| Start a new dev project          | `mcp__ccteam__new`               | `ccteam new <slug> --team dev` |
+| Start a product-research project | `mcp__ccteam__new`               | `ccteam new <slug> --team product-research` |
 | Pause project (no kill)          | `mcp__ccteam__pause`             | `ccteam pause <slug>` |
 | Resume project                   | `mcp__ccteam__resume`            | `ccteam resume <slug>` |
 | Send NL to a session inbox       | `mcp__ccteam__send_to_session`   | (write `.ccteam/inbox/msg-<ts>-NNN.md`) |
@@ -81,9 +81,9 @@ When the user says "make a todo cli" but the brief is ambiguous,
 Pick the single most blocking question. Only after they answer, run:
 
 ```bash
-ccteam new --team=dev "<refined brief>"
+ccteam new <slug> --team dev          # slug becomes <projects_root>/dev-<slug>/
 # or, if the user still seems uncertain:
-ccteam new --team=product-research "<idea>"
+ccteam new <slug> --team product-research
 ```
 
 ### D) Stuck-project triage
