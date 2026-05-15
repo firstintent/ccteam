@@ -5,18 +5,18 @@
 
 ---
 
-## 一、当前状态(2026-05-14)
+## 一、当前状态(2026-05-15)
 
 | 项 | 值 |
 |---|---|
 | 仓库根 | 本会话 `cwd` 即是;显式查用 `git rev-parse --show-toplevel` |
-| 主分支 main HEAD | **以 `git rev-parse origin/main` 为准**(V0.4.0 ship 后) |
-| Workspace version | **`0.4.0`**(V0.4.0 架构级重构 ship) |
-| 测试 baseline | **`~770/0`**(`cargo test --workspace --locked` 排除已知 inotify flake;F64 `artifact_watcher_test` t02/t03/t05/t09 + F66 `orchestrator_thin_test` t01/t15 在 WSL inotify 资源受限的 host 上 hang,是 pre-existing 环境问题,不计入业务 failed) |
+| 主分支 main HEAD | **以 `git rev-parse origin/main` 为准**(V0.4.3 ship 后) |
+| Workspace version | **`0.4.3`**(V0.4.2 unified install + V0.4.3 slug-grammar hotfix) |
+| 测试 baseline | **`~720/0`**(`cargo test --workspace --locked` 排除已知 inotify flake + 65 个 pre-existing ccteam-web 端口绑定 flake;F64 `artifact_watcher_test` t02/t03/t05/t09 + F66 `orchestrator_thin_test` t01/t15 在 WSL inotify 资源受限的 host 上 hang,是 pre-existing 环境问题,不计入业务 failed) |
 | Clippy | 9 pre-existing errors(非本轮引入,sweep 时确认相同基线) |
-| 代码规模 | ~15 kLOC Rust + ~12 kLOC TypeScript(V0.4.0 净 -1100 LOC Rust:删 phase 系统 ~3500 LOC + 新增 ~2400 LOC workflow/watcher/orchestrator/MCP) |
-| 已 ship 里程碑 | **V0.1**:M0 / M0.5 / M1 / M2 / M2.3 / M3 / M4.1-M4.4 — 详 `docs/v0-1/README.md`<br>**V0.2**:M0.16-M0.23 — 详 `docs/v0-2/README.md`<br>**V0.2.2**:F34-F40 + F44 — 详 `docs/v0-2-2/README.md`<br>**V0.3**:M5.0-M5.4 — 详 `docs/v0-3/README.md`<br>**V0.3.1**:F46-F51 — 详 `docs/v0-3-1/README.md`<br>**V0.3.2**:F52-F59 — 详 `docs/v0-3-2/README.md`<br>**V0.4.0**:F60-F69(phase 系统全删 + workflow.yaml schema + artifact watcher inotify + 7 新 meta-agent MCP 工具 + thin orchestrator + WorkflowSummary API + WorkflowView SPA + 真实 CodexAdapter + legacy htmx 清理 + ship gate)— 详 `docs/v0-4-0/README.md` |
-| 当前 next | V0.4.1 候选:Codex CLI argv 标准化(F62 用 `extra_args` pass-through 推迟)、Codex executable bg-job 形态(目前 tmux+codex 而非 codex --bg)、workflow.yaml 条件分支(`if: artifact_count > N`)、`schedule` trigger 真实 cron(F63 留 `interval` 字段占位)、跨项目 artifact 共享、Gemini/GPT-4o CLI 第三方 executor、WSL inotify flake 根治(host-side 资源限制 vs 测试 architecture)。详见 `docs/v0-4-0/e2e-retro.md` §4 |
+| 代码规模 | ~15 kLOC Rust + ~12 kLOC TypeScript |
+| 已 ship 里程碑 | **V0.1-V0.3.2** 见各自 `docs/v0-X-Y/README.md`<br>**V0.4.0**:F60-F69(phase 全删 + workflow.yaml + artifact watcher + 17 MCP 工具 + thin orchestrator + WorkflowView SPA)<br>**V0.4.1**:UX 简化 patch(start 合并 web、send/spawn CLI、handle 干掉、daemon hot-reload、mcp 退出 deadlock fix)<br>**V0.4.2**:F72-F75 — `ccteam init` 三合一 + `~/.ccteam/config.yaml` 全局 SoT + `doctor --migrate-v041-to-v042` + `ccteam new` thin wrapper<br>**V0.4.3 hotfix**:F76 slug grammar validation + 优化 collision wording |
+| 当前 next | V0.4.4 候选:clap `-leading-dash` 用 `allow_hyphen_values`;`~/.claude/jobs/` GC(host 残留 289 entries);F73 daemon hot-load 局限(只走 ~/projects/`,不监 /tmp/ 等 adopted path)— 文档化或扩展;web token 自动复制到剪贴板;Codex CLI argv 标准化(F62 推迟);Codex bg-job 形态;workflow.yaml 条件分支;`schedule` 真实 cron;WSL inotify flake 根治 |
 | 永久 deferred | M2.2 agent_team enablement(spike A,Claude Code 无 first-class CLI surface — 见 `docs/v0-1/m2-agent-team-spike.md`)|
 
 **ccteam 是 Claude Code 之上的元工具,不是独立 AI 系统**(V0.4.0 后):每个项目用 `workflow.yaml` 声明 agent 拓扑(**无 prompt,只有连线 + trigger 类型 + 并发上限**),`.claude/agents/<role>.md` 定义每个 agent 行为;Rust orchestrator(binary 名 `ccteam`)读 workflow.yaml,通过 `ArtifactWatcher`(inotify/fsevents)监听文件系统控制平面 → 按 parallelism spawn Claude Code(`claude --bg --agent <role>`)或 Codex(tmux+codex)session,`progress.jsonl` 记录 7 类业务 event(workflow_start / agent_spawn / agent_done / artifact_received / gate_triggered / budget_exceeded / workflow_done + escalation);用户通过 meta-agent(常驻 ccteam-managed claude session)+ `ccteam-control` skill / `ccteam` MCP server(**17 个 `mcp__ccteam__*` 工具**)用自然语言对话操作;web UI(`ccteam web`,`crates/ccteam-web`)提供 WorkflowView(agent cards + artifact counts + gate 解锁)+ SSE live updates。详见 `docs/v0-4-0/prd.md` 完整架构哲学 + `docs/tech-design.md` §2.1 三层架构。
