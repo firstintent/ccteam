@@ -125,3 +125,104 @@ Note: scenario A/B/C didn't hot-load because their paths are `/tmp/...`, which t
 | F75 free-text rejection | **FAIL** (silently accepted; V0.4.3 hotfix) |
 | F73 daemon hot-load | PASS |
 | Residual mcp-serve | 0 |
+
+---
+
+## V0.4.3 Round-2 Hotfix Deploy Verify (2026-05-15)
+
+Host: `rob@192.168.1.19`  
+Source tree: `/vol4/1000/nasworkspace/ccteam`  
+Binary: `/vol4/1000/nasworkspace/ccteam/target/release/ccteam`
+
+### Step 1 — pull + build
+
+- HEAD on host after `git fetch origin && git reset --hard origin/main`: `f3c462f v0.4.3 hotfix: F76 — slug grammar validation at CLI boundary` — matches request
+- `cargo build --release -p ccteam-cli`: clean finish in 1m30s. **Note**: workspace version still `ccteam-core v0.4.2 / ccteam-cli v0.4.2` — F76 commit did NOT bump `workspace.package.version` to `0.4.3`. Binary embeds `0.4.2`. V0.4.4 candidate.
+
+### Step 2 — daemon stop + clean restart
+
+- `ccteam stop`: SIGTERM sent to pid `2796945`. `pgrep ccteam start` empty after 3s — clean.
+- `rm orchestrator.pid && nohup ccteam start`: 4 project event loops boot (`dev-hot-reload-test`, `dev-ui-quality`, `dev-v042test`, `dev-v043test`) — note `dev-v042test` was a round-1 leftover registered in `config.yaml`, see Step 5 cleanup.
+
+### Step 3 — F76 bad-slug rejection (4 cases)
+
+| input | result | error excerpt |
+|---|---|---|
+| `ccteam new "做一个 todo cli" --team dev` | **fail-loud, exit 1** | `slug must match [a-z0-9-]+ (lowercase ASCII, digits, dashes only); got "做一个 todo cli"` |
+| `ccteam new "BadSlug" --team dev` | **fail-loud, exit 1** | `slug must match [a-z0-9-]+ (lowercase ASCII, digits, dashes only); got "BadSlug"` |
+| `ccteam new -- "-leading-dash" --team dev` | **fail-loud, exit 1** | `slug must not start or end with \`-\`; got "-leading-dash"` |
+| `ccteam new "trailing-dash-" --team dev` | **fail-loud, exit 1** | `slug must not start or end with \`-\`; got "trailing-dash-"` |
+| post-check: `ls ~/projects/ \| grep -E "做\|Bad\|leading\|trailing"` | `no garbage dirs (good)` | — |
+
+**PASS** on all 4 grammar checks; clean error wording explicitly references `[a-z0-9-]+`.
+
+Minor footnote: bare `ccteam new "-leading-dash"` is intercepted by clap as `-l` short-flag before reaching F76. To exercise the validation path the caller must use `--`. This is clap-default behavior, not a F76 regression — V0.4.4 polish candidate (could set `Arg::allow_hyphen_values(true)` on the slug positional and let F76 own the message).
+
+### Step 4 — good slug still works
+
+- `ccteam new v043test --team dev` → header `ccteam init — fresh install`, target `~/projects/dev-v043test`, slug `dev-v043test` (F22 prefix applied), team `dev`. State.json + workflow.yaml + agents dir all scaffolded. config.yaml upserted. **PASS**.
+
+### Step 5 — round-1 garbage cleanup
+
+`~/projects/` before cleanup: `backup, dev-hot-reload-test, dev-ui-quality, dev-v042test, dev-v043test, meta, v042-scenarioB`.
+
+Round-1 test residues identified:
+- `~/projects/dev-v042test/` (test artifact)
+- `~/projects/v042-scenarioB/` (empty, test artifact — note: no `dev-` prefix because round-1 scenario B was created via `init --team dev` in cwd `/tmp/v042-scenarioB` which honors cwd basename without F22 prefix application — F22 only applies to `ccteam new`)
+- `/tmp/v042-collision`, `/tmp/v042-scenarioA`, `/tmp/v042-scenarioB`
+
+config.yaml stale entries: `v042-scenarioA`, `v042-scenarioB`, `dev-v042test`.
+
+Cleaned: `rm -rf` test dirs + manual rewrite of `~/.ccteam/config.yaml` (kept backup `.bak.v043`). Final projects[]: `dev-hot-reload-test`, `dev-ui-quality`, `meta`, `dev-v043test`.
+
+User projects (`dev-hot-reload-test`, `dev-ui-quality`, `meta`) untouched.
+
+No `~/projects/dev-做*` etc garbage found — round-1 scenarios A/B/C all used valid slugs, the F75 unicode-slug regression was only verified once and never persisted to `~/projects/`. Cleanup wasn't strictly required, but config.yaml stale entries removed for hygiene.
+
+### Step 6 — F72 improved slug-collision wording
+
+Trigger: `ccteam init --slug dev-v043test --in /tmp/v043-elsewhere --team dev` (slug owned by `~/projects/dev-v043test`, --in points elsewhere).
+
+Output:
+```
+Error: slug `dev-v043test` is already registered in /home/rob/.ccteam/config.yaml pointing at /home/rob/projects/dev-v043test, but this install would point it at /tmp/v043-elsewhere. Refusing to silently retarget.
+
+Resolve by either:
+  - pick a different slug:  `ccteam init --slug <other-name>` (or `--in <other-path>`),
+  - intentionally retarget: re-run with `--force` (the registry entry will be rewritten to /tmp/v043-elsewhere).
+```
+
+**PASS** — message names the registered path, the attempted path, the registry file, and two distinct resolution paths (rename vs retarget). Matches round-1 retro recommendation.
+
+Side note: `ccteam init --slug X` where X is in registry and cwd-or-target == registered path → "refresh" branch (no collision, no error). Only when target != registered does the collision fire. This is correct semantics; reviewer noted potential confusion but the F72 wording now makes it obvious.
+
+### Step 7 — residuals
+
+- `pgrep ccteam mcp-serve` → 0
+- `~/.claude/jobs/` → 289 entries (carry-over from earlier rounds; same as V0.4.2 round-1; V0.4.4 GC candidate still open)
+- `pgrep ccteam` → 1 process (`ccteam start` pid `2801657`) + 1 unrelated `claude daemon run`
+
+### Summary
+
+| check | result |
+|---|---|
+| HEAD `f3c462f` | yes |
+| Build v0.4.3 hotfix | yes (note: version string stuck at `0.4.2`) |
+| Daemon clean stop + restart | PASS |
+| F76 Chinese+space slug | **PASS fail-loud** |
+| F76 uppercase slug | **PASS fail-loud** |
+| F76 leading-dash slug | **PASS fail-loud** (needs `--` to bypass clap short-flag) |
+| F76 trailing-dash slug | **PASS fail-loud** |
+| No garbage `~/projects/<bad>` dirs | PASS |
+| Good slug still creates `dev-<slug>` (F22 prefix) | PASS |
+| F72 improved collision wording | PASS (clear "Resolve by either ...") |
+| Round-1 cleanup | done (`dev-v042test`, `v042-scenarioB`, `/tmp/v042-*` + config.yaml stale rows removed) |
+| Residual mcp-serve | 0 |
+| Residual `~/.claude/jobs/` | 289 (carryover) |
+
+### V0.4.4 hotfix candidates
+
+1. **`workspace.package.version` bump**: F76 commit shipped without bumping to `0.4.3`. Binary self-reports `0.4.2`. Need a follow-up bump commit OR ensure CLAUDE.md §五 "Patch 版本开发流程 → cargo bump" is checklist-enforced.
+2. **Clap short-flag swallows `-X` slugs**: leading-dash slug requires `--` separator before F76 sees it. Consider `Arg::allow_hyphen_values(true)` on slug positional in `ccteam new` to let F76 own the message.
+3. **`~/.claude/jobs/` GC** (carryover from round-1 retro): 289 stale entries on this host. Candidate: `ccteam doctor --gc-jobs` flag or auto-prune on `ccteam start`.
+4. **Hot-load scope doc note** (carryover from round-1 retro): daemon hot-loads `~/projects/<...>` but not `/tmp/<...>`. Worth a CLAUDE.md note.
