@@ -83,7 +83,25 @@ impl CcteamPaths {
         self.root.join("templates")
     }
 
+    /// Resolve a slug to its on-disk project directory.
+    ///
+    /// V0.4.4 F77: lazily consults `~/.ccteam/config.yaml::projects[]`
+    /// so V0.4.2 arbitrary-path installs (e.g. `/vol4/.../dex-ui`)
+    /// resolve correctly without each of the ~200 callsites having to
+    /// thread a registry. Falls back to `projects_root.join(slug)` when
+    /// the slug isn't registered (V0.1–V0.4.1 layout, in-flight
+    /// `ccteam init` before the registry write, and tests that pre-date
+    /// V0.4.2 config.yaml).
+    ///
+    /// Config reads are atomic-rename-safe (see `config::save`) and
+    /// cheap (< 10 KB file); a corrupt config silently falls back so
+    /// path resolution never panics from this method.
     pub fn project_dir(&self, slug: &str) -> PathBuf {
+        if let Ok(cfg) = crate::config::load(&self.root) {
+            if let Some(entry) = cfg.projects.into_iter().find(|p| p.slug == slug) {
+                return entry.path;
+            }
+        }
         self.projects_root.join(slug)
     }
 
@@ -214,35 +232,44 @@ pub fn session_context_from_cwd(cwd: &Path, paths: &CcteamPaths) -> Result<Proje
     {
         return Err(anyhow!("cwd must not contain `..`: {}", cwd.display()));
     }
-    let rel = cwd.strip_prefix(&paths.projects_root).with_context(|| {
-        format!(
-            "cwd {} is not under {}",
-            cwd.display(),
-            paths.projects_root.display()
+    // V0.4.4 F77: hooks fire from any cwd a Claude Code session opens
+    // — for V0.4.2 arbitrary-path installs (e.g. `/vol4/.../dex-ui`)
+    // the cwd is NOT under `paths.projects_root`. Walk upward looking
+    // for `<dir>/.ccteam/state.json`; the first hit is `project_dir`.
+    // Subsumes the V0.1-V0.4.1 `~/projects/<slug>/.ccteam/state.json`
+    // layout (the walk halts there too) so callers see one shape.
+    let (project_dir, rel) = find_project_root(cwd).ok_or_else(|| {
+        anyhow!(
+            "cwd {} is not under any ccteam project (no `.ccteam/state.json` found walking up; \
+             run `ccteam init` inside this directory or check `~/.ccteam/config.yaml`)",
+            cwd.display()
         )
     })?;
-    let mut comps = rel.components();
-    let slug = match comps.next() {
-        Some(std::path::Component::Normal(s)) => s
-            .to_str()
-            .ok_or_else(|| anyhow!("project slug path is not UTF-8: {}", cwd.display()))?
-            .to_string(),
-        _ => {
-            return Err(anyhow!(
-                "could not derive project slug from cwd {}",
-                cwd.display()
-            ))
-        }
-    };
-    let project_dir = paths.project_dir(&slug);
-    let state = ProjectState::load(&paths.project_state(&slug))?;
-    let sid = sid_from_components(comps);
+    let state = ProjectState::load(&CcteamPaths::project_state_in(&project_dir))
+        .with_context(|| format!("load state.json for project at {}", project_dir.display()))?;
+    let sid = sid_from_components(rel.components());
+    let _ = paths; // signature kept for API stability; slug-keyed paths read elsewhere
     Ok(ProjectSessionContext {
         slug: state.slug,
         sid,
         project_dir,
         team_kind: state.team_kind,
     })
+}
+
+/// Walk up from `cwd` searching for the closest directory `D` such
+/// that `D/.ccteam/state.json` exists. Returns `(D, rel)` where `rel`
+/// is the path from `D` down to `cwd` (empty if `cwd == D`).
+fn find_project_root(cwd: &Path) -> Option<(PathBuf, PathBuf)> {
+    let mut current: Option<&Path> = Some(cwd);
+    while let Some(dir) = current {
+        if CcteamPaths::project_state_in(dir).is_file() {
+            let rel = cwd.strip_prefix(dir).unwrap_or(Path::new("")).to_path_buf();
+            return Some((dir.to_path_buf(), rel));
+        }
+        current = dir.parent();
+    }
+    None
 }
 
 fn sid_from_components<'a>(
@@ -314,6 +341,96 @@ mod tests {
         assert_eq!(
             paths.progress_jsonl_for_context(&context),
             paths.progress_jsonl(slug),
+        );
+    }
+
+    /// V0.4.4 F77: hooks fire from an arbitrary install path
+    /// (e.g. `/vol4/.../dex-ui`) — cwd is NOT under `projects_root`.
+    /// `session_context_from_cwd` must walk up, find the project's
+    /// `.ccteam/state.json`, and return the real `project_dir`.
+    #[test]
+    fn f77_session_context_resolves_arbitrary_path_install() {
+        let tmp = TempDir::new().unwrap();
+        let paths = paths(&tmp);
+        let elsewhere = tmp.path().join("workspace").join("dex-ui");
+        std::fs::create_dir_all(elsewhere.join(".ccteam")).unwrap();
+        let slug = "dex-ui";
+        ProjectState::initial_for_team(slug.into(), "dev".into())
+            .save(&CcteamPaths::project_state_in(&elsewhere))
+            .unwrap();
+
+        let context = session_context_from_cwd(&elsewhere, &paths).unwrap();
+        assert_eq!(context.slug, slug);
+        assert_eq!(context.sid, None);
+        assert_eq!(context.project_dir, elsewhere);
+    }
+
+    /// V0.4.4 F77: when the hook's cwd is a *subdirectory* of an
+    /// arbitrary-path project (e.g. the Claude session is inside
+    /// `/vol4/.../dex-ui/src/main`), walk-up still finds the project
+    /// root and returns the project_dir + empty sid.
+    #[test]
+    fn f77_session_context_resolves_subdir_of_arbitrary_path_install() {
+        let tmp = TempDir::new().unwrap();
+        let paths = paths(&tmp);
+        let elsewhere = tmp.path().join("vol4").join("repos").join("api-svc");
+        let cwd = elsewhere.join("src").join("handlers");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(elsewhere.join(".ccteam")).unwrap();
+        let slug = "api-svc";
+        ProjectState::initial_for_team(slug.into(), "dev".into())
+            .save(&CcteamPaths::project_state_in(&elsewhere))
+            .unwrap();
+
+        let context = session_context_from_cwd(&cwd, &paths).unwrap();
+        assert_eq!(context.slug, slug);
+        assert_eq!(context.sid, None);
+        assert_eq!(context.project_dir, elsewhere);
+    }
+
+    /// V0.4.4 F77: cwd has no `.ccteam/state.json` upward → fail loud
+    /// with an actionable message (not the legacy "is not under
+    /// `projects_root`" which was both wrong and unhelpful).
+    #[test]
+    fn f77_session_context_fails_loud_outside_any_project() {
+        let tmp = TempDir::new().unwrap();
+        let paths = paths(&tmp);
+        let cwd = tmp.path().join("nowhere").join("nada");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let err = session_context_from_cwd(&cwd, &paths).unwrap_err();
+        let s = format!("{err:#}");
+        assert!(s.contains("no `.ccteam/state.json` found"), "got: {s}");
+    }
+
+    /// V0.4.4 F77: `paths.project_dir(slug)` consults
+    /// `~/.ccteam/config.yaml::projects[]` first, so arbitrary-path
+    /// installs route correctly without each call site needing fixup.
+    /// Falls back to `projects_root.join(slug)` when slug is not in
+    /// the registry.
+    #[test]
+    fn f77_project_dir_consults_config_registry() {
+        let tmp = TempDir::new().unwrap();
+        let paths = paths(&tmp);
+        let elsewhere = tmp.path().join("foo").join("bar");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::create_dir_all(&paths.root).unwrap();
+
+        crate::config::upsert_project(
+            &paths.root,
+            crate::config::ProjectEntry {
+                slug: "anywhere".into(),
+                path: elsewhere.clone(),
+                team: "dev".into(),
+                installed_at: chrono::Utc::now(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(paths.project_dir("anywhere"), elsewhere);
+        // Fallback for unregistered slugs preserves legacy layout.
+        assert_eq!(
+            paths.project_dir("unregistered"),
+            paths.projects_root.join("unregistered"),
         );
     }
 }
