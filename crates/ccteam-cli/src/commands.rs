@@ -3,7 +3,6 @@
 //! formatted string instead of printing) so unit tests don't need a
 //! real terminal or running orchestrator.
 
-use std::path::Path;
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
@@ -12,14 +11,14 @@ use serde_json::{json, Map, Value};
 
 use ccteam_core::tmux::TmuxSession;
 use ccteam_core::{
-    bootstrap_meta_project, bootstrap_project, current_ccteam_bin, install_ccteam_control_skill,
+    bootstrap_meta_project, current_ccteam_bin, install_ccteam_control_skill,
     install_ccteam_project_creator_skill, install_ccteam_team_author_skill,
-    migrate_legacy_skill_dirs, migrate_recommended_agent_symlinks, pick_unused_slug,
-    rewrite_legacy_hook_commands, session_name_for_project, user_claude_dir,
-    write_global_helper_templates, CcteamPaths, HookCmdRewriteAction, HookCmdRewriteReport,
-    InstallSkillOptions, LegacySkillAction, LegacySkillReport, MetaBootstrapReport,
-    MigrationReport, OutboxEventKind, OutboxMessage, PhaseState, ProjectState, SessionMailbox,
-    SkillInstallAction, TeamSpec, ToolSurfaceSnapshot, BUILTIN_SUBAGENTS,
+    migrate_legacy_skill_dirs, migrate_recommended_agent_symlinks, rewrite_legacy_hook_commands,
+    session_name_for_project, user_claude_dir, write_global_helper_templates, CcteamPaths,
+    HookCmdRewriteAction, HookCmdRewriteReport, InstallSkillOptions, LegacySkillAction,
+    LegacySkillReport, MetaBootstrapReport, MigrationReport, OutboxEventKind, OutboxMessage,
+    PhaseState, ProjectState, SessionMailbox, SkillInstallAction, ToolSurfaceSnapshot,
+    BUILTIN_SUBAGENTS,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -461,95 +460,18 @@ fn ask_yn(question: &str, yes_to_all: bool) -> Result<bool> {
     Ok(answer)
 }
 
-/// V0.2.2 F34: optional knobs for `run_new` covering the four-tier
-/// slug-decision stack (PRD §3.2):
+/// Resolve `team_kind` from the on-disk team registry. Built-in
+/// teams (`dev`, `meta-agent`) default to Workflow. Other teams must
+/// resolve via `~/.ccteam/teams/<team>/team.yaml` — when the lookup
+/// fails the caller (`refresh_state_team_kind`) preserves whatever
+/// `state.json::team_kind` already has, so a project saved as Flex
+/// stays Flex even when its team.yaml isn't on disk in this env.
 ///
-/// - `slug` set → Tier 1 (verbatim, B2 prefix semantics).
-/// - `slug` unset, tty + claude available + `!no_auto_slug` →
-///   Tier 3 (`claude -p` smart suggest + Y/n confirm).
-/// - `slug` unset and Tier 3 unavailable / declined →
-///   Tier 4 (`slugify_brief()` deterministic).
-///
-/// `RunNewOptions::default()` keeps the V0.2.1 behavior (no flag,
-/// no auto-suggest, deterministic Tier 4 from `slugify_brief`).
-#[derive(Debug, Clone, Copy, Default)]
-pub struct RunNewOptions<'a> {
-    pub slug: Option<&'a str>,
-    pub no_auto_slug: bool,
-    pub auto_slug_model: &'a str,
-}
-
-/// `ccteam new "request" --team <name>`. Bootstraps a project on disk
-/// and returns the chosen slug. Side effects: creates
-/// `~/projects/<slug>/...`. `team` is recorded in state.json so the
-/// orchestrator can route this project through the matching phase set.
-///
-/// **M3.3 fail-fast**: non-dev teams require a `team.yaml` to be
-/// loadable from `~/.ccteam/teams/<team>/team.yaml`. The dev team is
-/// grandfathered in (no team.yaml required) so legacy installs
-/// without `ccteam init` still work. Meta-agent is also allowed
-/// without a team.yaml — its bootstrap path is bespoke.
-///
-/// V0.2 §6.4 candidate 3: shipped seeds (dev / product-research /
-/// meta-agent) are stamped to disk inside `run_new` so a fresh
-/// install no longer needs an explicit `ccteam init` for the
-/// validation to find them.
-///
-/// V0.2.2 F34: takes `RunNewOptions` for the four-tier slug stack.
-pub fn run_new(
-    paths: &CcteamPaths,
-    request: &str,
-    team: &str,
-    opts: RunNewOptions<'_>,
-) -> Result<String> {
-    if request.trim().is_empty() {
-        bail!("ccteam new: request must be non-empty");
-    }
-    if team.trim().is_empty() {
-        bail!("ccteam new: --team must be non-empty");
-    }
-    // V0.4.0 F60: the shipped team seed writer was deleted with the
-    // phase machinery. Users running V0.4 against a fresh install must
-    // supply their own team.yaml via `ccteam doctor --reset-shipped-teams`
-    // (deprecated; will be replaced by `ccteam doctor --install-workflows`
-    // in F63) or by hand-editing `~/.ccteam/teams/<name>/team.yaml`.
-    ensure_team_resolvable(paths, team)?;
-    // V0.2.2 F40 — warn when the operator passed an alias instead of
-    // the canonical team name. The project still bootstraps under the
-    // alias (state.json::team / slug prefix preserve the typed string)
-    // so old muscle memory keeps working; the warn flags the
-    // transition path so new docs and skills migrate to the canonical
-    // name. Print to stderr (not via tracing) so users on plain
-    // installs without RUST_LOG see it.
-    if let Some(canonical) = find_alias_canonical(paths, team) {
-        if canonical != team {
-            eprintln!(
-                "ccteam new: `--team {team}` is a deprecated alias for `{canonical}`; \
-                 prefer `--team {canonical}` going forward",
-            );
-        }
-    }
-    let slug = decide_slug(paths, request, team, opts)?;
-    bootstrap_project(paths, &slug, request, team)?;
-    stamp_project_team_kind(paths, &slug, team)?;
-    Ok(slug)
-}
-
-fn stamp_project_team_kind(paths: &CcteamPaths, slug: &str, team: &str) -> Result<()> {
-    let kind = resolve_team_kind(paths, team)?;
-    let state_path = paths.project_state(slug);
-    let mut state = ProjectState::load(&state_path)?;
-    state.team_kind = kind;
-    state.save(&state_path)
-}
-
+/// V0.4.2 F75: the V0.4.0 `ensure_team_resolvable` fail-loud gate was
+/// dropped (it lived inside the deleted `run_new`); kind resolution
+/// itself is unchanged.
 fn resolve_team_kind(paths: &CcteamPaths, team: &str) -> Result<ccteam_core::TeamKind> {
     use ccteam_core::{default_user_staging_dir, resolve_team, TeamKind, TeamResolveContext};
-
-    // V0.4.0 F60: `dev` and `meta-agent` were previously seeded on disk
-    // by the shipped TEAM_BUNDLES writer. Now there's nothing to read,
-    // so default both to `Workflow` (the legacy phase-driven kind) —
-    // F66 will rewrite this dispatch path against `workflow.yaml`.
     if team == "dev" || team == ccteam_core::META_TEAM_NAME {
         return Ok(TeamKind::Workflow);
     }
@@ -558,309 +480,6 @@ fn resolve_team_kind(paths: &CcteamPaths, team: &str) -> Result<ccteam_core::Tea
     let spec =
         resolve_team(team, &ctx).with_context(|| format!("resolve team `{team}` for team kind"))?;
     Ok(spec.kind)
-}
-
-/// V0.2.2 F34 four-tier slug decision. Pure-ish (only LLM shell-out
-/// and stdin/stdout for confirmation if Tier 3 fires); test-friendly
-/// because the env / flag inputs all flow through `RunNewOptions` +
-/// `CCTEAM_AUTO_SLUG{,_BIN}` env vars.
-fn decide_slug(
-    paths: &CcteamPaths,
-    request: &str,
-    team: &str,
-    opts: RunNewOptions<'_>,
-) -> Result<String> {
-    // Tier 1: explicit --slug wins.
-    if let Some(raw) = opts.slug {
-        return ccteam_core::pick_unused_slug_verbatim(paths, raw, team);
-    }
-    // Tier 3: `claude -p` smart suggestion. Skip when `--no-auto-slug`,
-    // when the env disables it, or when claude is unreachable / non-tty.
-    let env_disables = std::env::var("CCTEAM_AUTO_SLUG")
-        .map(|v| v.eq_ignore_ascii_case("off") || v == "0")
-        .unwrap_or(false);
-    if !opts.no_auto_slug && !env_disables {
-        match try_smart_slug(request, opts.auto_slug_model) {
-            Ok(Some(suggestion)) => {
-                return ccteam_core::pick_unused_slug_verbatim(paths, &suggestion, team);
-            }
-            Ok(None) => {
-                // Smart path silently declined (eg user typed `n`); fall
-                // through to Tier 4 — printed reason already.
-            }
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    "ccteam new: smart slug suggestion unavailable; falling back to deterministic",
-                );
-            }
-        }
-    }
-    // Tier 4: token-aware deterministic.
-    pick_unused_slug(paths, request, team)
-}
-
-/// V0.2.2 F34 Tier 3 — shell out to `claude -p` for an LLM-quality
-/// slug suggestion, gated on tty / claude-on-PATH / env knobs.
-///
-/// Returns:
-/// - `Ok(Some(slug))` — `claude -p` produced a clean slug and (in tty
-///   contexts) the user accepted it.
-/// - `Ok(None)` — the user declined the suggestion in interactive mode.
-/// - `Err(_)` — every reason we want logged before falling through.
-///
-/// Test seam: `CCTEAM_AUTO_SLUG_BIN` overrides the resolved binary
-/// path (eg point at a stub script during integration tests so the
-/// tier is exercised without a real LLM).
-fn try_smart_slug(request: &str, model: &str) -> Result<Option<String>> {
-    use std::io::{self, BufRead, Write};
-    use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
-
-    // Resolve the binary. Honor a test override first.
-    let bin = match std::env::var("CCTEAM_AUTO_SLUG_BIN") {
-        Ok(v) if !v.is_empty() => v,
-        _ => match which_claude() {
-            Some(p) => p,
-            None => bail!("`claude` not on PATH (Tier 3 disabled)"),
-        },
-    };
-
-    let prompt = render_smart_slug_prompt(request);
-
-    eprintln!("[ccteam] querying claude for slug recommendation...");
-    let mut child = Command::new(&bin)
-        .args(["-p", "--model", model])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("spawn `{bin} -p`"))?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(prompt.as_bytes())
-            .context("write prompt to claude stdin")?;
-    }
-
-    // Wait up to 15s for the child. We poll instead of `child.wait()`
-    // so we can hard-kill on timeout.
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let output = loop {
-        match child.try_wait().context("poll claude child")? {
-            Some(_status) => break child.wait_with_output().context("collect claude output")?,
-            None => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    bail!("`claude -p` timed out after 15s; falling back to deterministic slug");
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        }
-    };
-
-    if !output.status.success() {
-        bail!(
-            "`claude -p` exited with non-zero status (`{:?}`): {}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-
-    let raw = String::from_utf8_lossy(&output.stdout).into_owned();
-    let suggestion = match sanitize_smart_slug(&raw) {
-        Some(s) => s,
-        None => bail!("`claude -p` returned no usable slug: {:?}", raw.trim()),
-    };
-
-    // Confirm in tty contexts; auto-accept when piped.
-    let tty = std::io::IsTerminal::is_terminal(&io::stdin());
-    if !tty {
-        eprintln!("[ccteam] suggested: {suggestion} (auto-accepted, non-tty)");
-        return Ok(Some(suggestion));
-    }
-
-    eprint!("[ccteam] suggested: {suggestion}\n[ccteam] accept? [Y/n] (rerun with --slug to override): ");
-    io::stderr().flush().ok();
-    let mut line = String::new();
-    let stdin = io::stdin();
-    stdin
-        .lock()
-        .read_line(&mut line)
-        .context("read confirmation")?;
-    let reply = line.trim().to_ascii_lowercase();
-    if reply.is_empty() || reply == "y" || reply == "yes" {
-        Ok(Some(suggestion))
-    } else {
-        eprintln!(
-            "[ccteam] declined; rerun with `--slug <name>` to set explicitly, or fall back to deterministic"
-        );
-        Ok(None)
-    }
-}
-
-/// Build the Tier 3 prompt. Pulled out so the integration tests can
-/// stub a deterministic `claude` echoing back a fixed slug without
-/// caring about the prompt body (PRD §3.2.3 keeps the wording stable).
-fn render_smart_slug_prompt(request: &str) -> String {
-    format!(
-        "Generate a 2-4 token kebab-case slug for a project with this brief:\n\
-         '{request}'\n\n\
-         Rules:\n\
-         - Capture the core noun/concept (brand name if present), not action verbs\n\
-         - Drop stop words (a, the, of, etc) and pure-digit tokens\n\
-         - Output ONLY the slug, no explanation, no quotes, no markdown\n\
-         Examples:\n\
-         - 'AI recipe generator from fridge photo' -> recipe-generator\n\
-         - 'Build a todo cli with ratatui' -> todo-cli\n\
-         - 'HermesTrade DEX prediction market' -> hermestrade-dex\n\
-         Slug:"
-    )
-}
-
-/// Lock the smart-slug output down to `[a-z0-9-]+`, len 2..=60. Strips
-/// trailing whitespace / quotes / `Slug:` echo, so the LLM has some
-/// slack but the disk layer doesn't see anything weird.
-fn sanitize_smart_slug(raw: &str) -> Option<String> {
-    let candidate = raw
-        .lines()
-        .map(|l| l.trim())
-        .find(|l| !l.is_empty())?
-        .trim_matches(|c: char| c == '"' || c == '\'' || c == '`' || c.is_ascii_whitespace())
-        .trim_start_matches("Slug:")
-        .trim();
-    let lowered = candidate.to_ascii_lowercase();
-    let cleaned: String = lowered
-        .chars()
-        .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-')
-        .collect();
-    let trimmed = cleaned.trim_matches('-');
-    if trimmed.len() < 2 || trimmed.len() > 60 {
-        return None;
-    }
-    if trimmed.chars().all(|c| c == '-') {
-        return None;
-    }
-    Some(trimmed.to_string())
-}
-
-/// Resolve `claude` via `which`. Returns `None` when not on PATH; the
-/// caller falls through to Tier 4. Stdlib only — no extra crate.
-fn which_claude() -> Option<String> {
-    let path_env = std::env::var_os("PATH")?;
-    for entry in std::env::split_paths(&path_env) {
-        let candidate = entry.join("claude");
-        if candidate.is_file() {
-            return candidate.to_str().map(String::from);
-        }
-    }
-    None
-}
-
-/// Resolve `team` against the on-disk team registry. Returns
-/// `Ok(())` when the team is bootable; otherwise returns a
-/// fail-fast error pointing the user at the missing team.yaml.
-///
-/// Resolution order:
-/// 1. `dev` and `meta-agent` always succeed (built-in / bespoke paths).
-/// 2. If `~/.ccteam/teams/<team>/team.yaml` is on disk, load + validate it.
-/// 3. V0.2.2 F40: scan every `~/.ccteam/teams/*/team.yaml` and accept
-///    `team` when it matches a `spec.aliases` entry. Lets old projects'
-///    `--team product-research` continue working after the canonical
-///    rename to `research` (warn-deprecated; see `run_new`).
-/// 4. Otherwise fail with a help message listing the teams currently
-///    on disk.
-fn ensure_team_resolvable(paths: &CcteamPaths, team: &str) -> Result<()> {
-    let user_staging = ccteam_core::default_user_staging_dir();
-    ensure_team_resolvable_with_user_staging(paths, team, &user_staging)
-}
-
-fn ensure_team_resolvable_with_user_staging(
-    paths: &CcteamPaths,
-    team: &str,
-    user_staging_dir: &Path,
-) -> Result<()> {
-    if team == "dev" || team == ccteam_core::META_TEAM_NAME {
-        return Ok(());
-    }
-    let yaml_path = paths.root.join("teams").join(team).join("team.yaml");
-    if yaml_path.exists() {
-        TeamSpec::load(&yaml_path)
-            .with_context(|| format!("ccteam new: failed to load {}", yaml_path.display()))?;
-        return Ok(());
-    }
-    let staging_yaml_path = user_staging_dir.join("teams").join(team).join("team.yaml");
-    if staging_yaml_path.exists() {
-        TeamSpec::load(&staging_yaml_path).with_context(|| {
-            format!("ccteam new: failed to load {}", staging_yaml_path.display())
-        })?;
-        return Ok(());
-    }
-    let ctx = ccteam_core::TeamResolveContext::for_orchestrator(&paths.root, user_staging_dir);
-    if ccteam_core::resolve_team(team, &ctx).is_ok() {
-        return Ok(());
-    }
-    let known = list_disk_teams(paths)
-        .ok()
-        .filter(|t| !t.is_empty())
-        .map(|t| t.join(", "))
-        .unwrap_or_else(|| "(none yet — run `ccteam doctor --reset-shipped-teams`)".into());
-    bail!(
-        "ccteam new: unknown team `{team}` — \
-         create {} (see docs/interfaces.md §5.5 for schema), \
-         then re-run.\n\
-         Teams currently on disk: {known}.",
-        yaml_path.display(),
-    )
-}
-
-/// V0.2.2 F40 — given a possible alias, return the canonical name of
-/// the team whose yaml lists it. Walks `<root>/teams/*/team.yaml`
-/// once. Yaml parse errors silently fall through to the next entry —
-/// the caller's failure path covers the no-match case.
-fn find_alias_canonical(paths: &CcteamPaths, alias: &str) -> Option<String> {
-    let teams_dir = paths.root.join("teams");
-    let entries = std::fs::read_dir(&teams_dir).ok()?;
-    for entry in entries.flatten() {
-        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            continue;
-        }
-        let yaml = entry.path().join("team.yaml");
-        if !yaml.exists() {
-            continue;
-        }
-        let spec = match TeamSpec::load(&yaml) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        if spec.aliases.iter().any(|a| a == alias) {
-            return Some(spec.name);
-        }
-    }
-    None
-}
-
-/// Enumerate teams discoverable under `<global_dir>/teams/<name>/team.yaml`.
-/// Used for error messages so users see what is actually available
-/// (V0.2 §6.4 candidate 3 — disk-driven team registry).
-fn list_disk_teams(paths: &CcteamPaths) -> Result<Vec<String>> {
-    let teams_dir = paths.root.join("teams");
-    let mut out = Vec::new();
-    let entries = match std::fs::read_dir(&teams_dir) {
-        Ok(e) => e,
-        Err(_) => return Ok(out),
-    };
-    for entry in entries.flatten() {
-        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
-            && entry.path().join("team.yaml").exists()
-        {
-            if let Some(name) = entry.file_name().to_str().map(String::from) {
-                out.push(name);
-            }
-        }
-    }
-    out.sort();
-    Ok(out)
 }
 
 /// `ccteam ls`. Returns either a human table or the interfaces.md §10.3
@@ -2598,20 +2217,14 @@ mod tests {
         }
     }
 
-    /// V0.2.2 F34: thin wrapper that defaults to deterministic Tier 4
-    /// (no auto-suggest) so unit tests don't accidentally shell-out to
-    /// `claude -p` on dev / CI machines that have it on PATH.
+    /// V0.4.2 F75: tests that previously used `run_new_t4` (the
+    /// Tier-4 deterministic slug wrapper) now bootstrap directly via
+    /// the core helper. Same effect for setup purposes — the
+    /// LLM/auto-slug path was removed with the rest of `run_new`.
     fn run_new_t4(paths: &CcteamPaths, request: &str, team: &str) -> Result<String> {
-        run_new(
-            paths,
-            request,
-            team,
-            RunNewOptions {
-                slug: None,
-                no_auto_slug: true,
-                auto_slug_model: "claude-haiku-4-5-20251001",
-            },
-        )
+        let slug = ccteam_core::pick_unused_slug(paths, request, team)?;
+        ccteam_core::bootstrap_project(paths, &slug, request, team)?;
+        Ok(slug)
     }
 
     #[test]
@@ -2628,101 +2241,6 @@ mod tests {
             msg.contains("ccteam-meta-cto"),
             "peek should target state.tmux_session, got: {msg}",
         );
-    }
-
-    #[test]
-    fn run_new_creates_slug_and_bootstrap_files() {
-        ensure_isolation();
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        let slug = run_new_t4(&paths, "Build a bookmark manager", "dev").unwrap();
-        // F22: slug now carries the team prefix so ~/.claude/rules/ccteam-lessons-dev.md
-        // `paths: ~/projects/dev-*` matches at session start.
-        // V0.2.2 F34: `slugify_brief` drops stop-words so `a` is filtered out.
-        assert!(
-            slug.starts_with("dev-build-bookmark-manager"),
-            "expected `dev-build-bookmark-manager*`, got {slug}",
-        );
-        let project = paths.project_dir(&slug);
-        assert!(project.join(".ccteam/spec.md").exists());
-        assert!(project.join(".ccteam/state.json").exists());
-        assert!(project.join(".claude/settings.json").exists());
-        assert!(project.join("CLAUDE.md").exists());
-    }
-
-    #[test]
-    fn run_new_rejects_empty_request() {
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        let err = run_new_t4(&paths, "   \n\t", "dev").unwrap_err();
-        assert!(format!("{err:#}").contains("non-empty"));
-    }
-
-    #[test]
-    fn run_new_rejects_empty_team() {
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        let err = run_new_t4(&paths, "build something", "  ").unwrap_err();
-        assert!(format!("{err:#}").contains("--team"));
-    }
-
-    #[test]
-    fn run_new_records_team_in_state_json() {
-        // M3.1 F12/F13: --team must persist into state.json so the
-        // orchestrator can route this project's phase set.
-        // V0.4.0 F60: shipped team bundles deleted — the user-authored
-        // team.yaml must already exist on disk before run_new.
-        ensure_isolation();
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        // Seed a minimal research team yaml by hand (F60 removed the
-        // shipped writer).
-        let yaml = paths.root.join("teams/research/team.yaml");
-        std::fs::create_dir_all(yaml.parent().unwrap()).unwrap();
-        std::fs::write(&yaml, "name: research\n").unwrap();
-        let slug = run_new_t4(&paths, "ai recipe generator idea", "research").unwrap();
-        let state = ProjectState::load(&paths.project_state(&slug)).unwrap();
-        assert_eq!(state.team, "research");
-    }
-
-    #[test]
-    fn run_new_rejects_unknown_team_with_helpful_error() {
-        // M3.3: unknown team must fail-fast with a clear pointer to
-        // ~/.ccteam/teams/<team>/team.yaml.
-        ensure_isolation();
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        let err = run_new_t4(&paths, "marketing copy idea", "marketing").unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("unknown team"), "got: {msg}");
-        assert!(msg.contains("marketing"), "should name the missing team");
-        assert!(
-            msg.contains("teams/marketing/team.yaml"),
-            "should point at the missing path",
-        );
-    }
-
-    #[test]
-    fn run_new_accepts_team_yaml_on_disk_for_user_team() {
-        // M3.3: a user-authored team (not shipped) becomes valid as
-        // soon as ~/.ccteam/teams/<team>/team.yaml is on disk. The
-        // fail-fast check loads + validates the YAML.
-        ensure_isolation();
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        let yaml_path = paths
-            .root
-            .join("teams")
-            .join("custom-team")
-            .join("team.yaml");
-        std::fs::create_dir_all(yaml_path.parent().unwrap()).unwrap();
-        std::fs::write(&yaml_path, "name: custom-team\nphase_dir: phases-custom\n").unwrap();
-        // V0.4.0 F60: bootstrap_project no longer requires phase
-        // template bundles, so run_new succeeds for any user-authored
-        // team whose team.yaml is on disk.
-        let slug = run_new_t4(&paths, "do a thing", "custom-team")
-            .expect("user-authored team.yaml should pass resolve");
-        assert!(slug.starts_with("custom-team-"), "got: {slug}");
     }
 
     #[test]
@@ -3660,125 +3178,4 @@ mod tests {
         assert!(parsed["config"].is_object());
     }
 
-    // -------------- V0.2.2 F34 — slug --slug flag + sanitize ---------------
-
-    #[test]
-    fn run_new_with_explicit_slug_uses_verbatim_path() {
-        ensure_isolation();
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        let slug = run_new(
-            &paths,
-            "literally anything goes here",
-            "dev",
-            RunNewOptions {
-                slug: Some("ccteam-ui"),
-                no_auto_slug: true,
-                auto_slug_model: "claude-haiku-4-5-20251001",
-            },
-        )
-        .unwrap();
-        assert_eq!(slug, "dev-ccteam-ui");
-        assert!(paths.project_dir(&slug).join(".ccteam/spec.md").exists());
-    }
-
-    #[test]
-    fn run_new_with_explicit_slug_keeps_team_prefix_when_present() {
-        ensure_isolation();
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        let slug = run_new(
-            &paths,
-            "irrelevant brief",
-            "dev",
-            RunNewOptions {
-                slug: Some("dev-explicit-name"),
-                no_auto_slug: true,
-                auto_slug_model: "claude-haiku-4-5-20251001",
-            },
-        )
-        .unwrap();
-        assert_eq!(slug, "dev-explicit-name");
-    }
-
-    #[test]
-    fn run_new_with_explicit_illegal_slug_fails_loud() {
-        ensure_isolation();
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        let err = run_new(
-            &paths,
-            "irrelevant",
-            "dev",
-            RunNewOptions {
-                slug: Some("Bad Slug!"),
-                no_auto_slug: true,
-                auto_slug_model: "claude-haiku-4-5-20251001",
-            },
-        )
-        .unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("[a-z0-9-]+"),
-            "expected fail-loud regex hint, got: {msg}",
-        );
-    }
-
-    #[test]
-    fn sanitize_smart_slug_accepts_clean_kebab() {
-        assert_eq!(
-            sanitize_smart_slug("hermestrade-dex\n"),
-            Some("hermestrade-dex".to_string())
-        );
-    }
-
-    #[test]
-    fn sanitize_smart_slug_strips_quotes_and_label_prefix() {
-        assert_eq!(
-            sanitize_smart_slug("\"todo-cli\""),
-            Some("todo-cli".to_string())
-        );
-        assert_eq!(
-            sanitize_smart_slug("Slug: ai-recipe-generator"),
-            Some("ai-recipe-generator".to_string())
-        );
-    }
-
-    #[test]
-    fn sanitize_smart_slug_takes_first_non_empty_line() {
-        let raw = "\n\nthe-slug\nignored explanation line\n";
-        assert_eq!(sanitize_smart_slug(raw), Some("the-slug".to_string()));
-    }
-
-    #[test]
-    fn sanitize_smart_slug_lowercases_and_drops_disallowed_chars() {
-        // Letters lowered, exclamation stripped → `hello-world`
-        assert_eq!(
-            sanitize_smart_slug("Hello-World!"),
-            Some("hello-world".to_string())
-        );
-    }
-
-    #[test]
-    fn sanitize_smart_slug_rejects_too_short_or_too_long() {
-        assert_eq!(sanitize_smart_slug("a"), None);
-        assert_eq!(sanitize_smart_slug(&"x".repeat(61)), None);
-        // Boundary: exactly 60 is fine.
-        assert_eq!(sanitize_smart_slug(&"x".repeat(60)), Some("x".repeat(60)));
-    }
-
-    #[test]
-    fn sanitize_smart_slug_rejects_empty_or_dash_only() {
-        assert_eq!(sanitize_smart_slug(""), None);
-        assert_eq!(sanitize_smart_slug("---"), None);
-    }
-
-    #[test]
-    fn render_smart_slug_prompt_embeds_brief_and_examples() {
-        let p = render_smart_slug_prompt("Build HermesTrade DEX home");
-        assert!(p.contains("Build HermesTrade DEX home"));
-        // The example anchors keep the prompt stable for tests + audits.
-        assert!(p.contains("HermesTrade DEX prediction market"));
-        assert!(p.contains("Slug:"));
-    }
 }
