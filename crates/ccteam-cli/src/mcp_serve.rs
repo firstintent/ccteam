@@ -89,7 +89,7 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Run `ccteam mcp-serve`. Reads JSON-RPC requests one per line from
 /// stdin; writes responses one per line to stdout.
 ///
-/// Returns when ANY of:
+/// Exits the process when ANY of:
 /// - stdin closes (parent disconnect, normal MCP shutdown)
 /// - SIGTERM (kernel via [`set_pdeathsig_sigterm`] when parent dies, or
 ///   explicit `kill -TERM`)
@@ -104,6 +104,16 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// EOF + `PR_SET_PDEATHSIG`. On WSL and some claude-spawn paths
 /// neither of those fires reliably, so without these belts mcp-serve
 /// processes pile up one-per-bg-job and exhaust file descriptors.
+///
+/// Why `std::process::exit(0)` and not `return Ok(())`: returning
+/// drops the tokio runtime, which then tries to join every spawned
+/// task — including the `tokio::io::stdin()` reader, which sits on a
+/// blocking-thread-pool syscall that can't be cancelled. The result
+/// is the process parks in `futex_wait` and needs SIGKILL to die.
+/// `exit(0)` skips runtime drop and unwinds via libc, which is the
+/// idiomatic shutdown for a stateless protocol adapter that owns no
+/// reverse-side state. Originally caught in the V0.4.1 round-2
+/// deploy-verify (host SIGTERM left mcp-serve in Sl/Ssl).
 pub async fn run_mcp_serve(paths: CcteamPaths) -> Result<()> {
     set_pdeathsig_sigterm();
     let original_ppid = current_ppid();
@@ -130,29 +140,32 @@ pub async fn run_mcp_serve(paths: CcteamPaths) -> Result<()> {
                     last_activity = Instant::now();
                     l
                 }
-                None => return Ok(()), // stdin EOF
+                None => {
+                    tracing::info!("mcp-serve: stdin EOF; exiting");
+                    std::process::exit(0);
+                }
             },
             _ = signal_recv(&mut sigterm) => {
-                tracing::info!("mcp-serve: SIGTERM (parent exited or explicit stop); shutting down");
-                return Ok(());
+                tracing::info!("mcp-serve: SIGTERM (parent exited or explicit stop); exiting");
+                std::process::exit(0);
             }
             _ = signal_recv(&mut sigint) => {
-                tracing::info!("mcp-serve: SIGINT; shutting down");
-                return Ok(());
+                tracing::info!("mcp-serve: SIGINT; exiting");
+                std::process::exit(0);
             }
             _ = health_ticker.tick() => {
                 if should_exit_for_orphan(original_ppid) {
                     tracing::info!(original_ppid, current_ppid = current_ppid(),
-                        "mcp-serve: parent reparented (orphan); shutting down");
-                    return Ok(());
+                        "mcp-serve: parent reparented (orphan); exiting");
+                    std::process::exit(0);
                 }
                 if last_activity.elapsed() >= idle_timeout {
                     tracing::info!(
                         idle_secs = last_activity.elapsed().as_secs(),
                         timeout_secs = idle_timeout.as_secs(),
-                        "mcp-serve: idle timeout reached; shutting down"
+                        "mcp-serve: idle timeout reached; exiting"
                     );
-                    return Ok(());
+                    std::process::exit(0);
                 }
                 continue;
             }
