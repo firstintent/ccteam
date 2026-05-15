@@ -14,12 +14,16 @@ pub mod actions;
 // agent. See module docs + docs/v0-4-0/prd.md §6.2.
 pub mod artifact_watcher;
 pub mod auto_loop;
+// V0.4.2 F73 — `~/.ccteam/config.yaml` global config + projects registry.
+pub mod config;
 pub mod cost;
 pub mod daemon;
 pub mod harness;
 pub mod inbox;
 pub mod memory_bridge;
 pub mod meta_agent;
+// V0.4.2 F74 — one-shot migration (V0.4.1 → V0.4.2 config.yaml fold).
+pub mod migration;
 pub mod orchestrator;
 pub mod paths;
 pub mod pending_inject;
@@ -48,6 +52,12 @@ pub use actions::{
     DecisionInput, SendOptions, SendResult,
 };
 pub use auto_loop::{AutoLoopDecision, AutoLoopFrontMatter, AutoLoopState};
+pub use config::{
+    append_project as append_project_to_config, config_path as ccteam_config_path,
+    load as load_ccteam_config, lookup_project as lookup_project_in_config,
+    remove_project as remove_project_from_config, save as save_ccteam_config,
+    upsert_project as upsert_project_in_config, CcteamConfig, ProjectEntry, CONFIG_FILENAME,
+};
 pub use cost::{classify as classify_cost, CostLevel, COST_MID_WARN_USD};
 pub use daemon::{
     check_health as check_daemon_health, check_health_at as check_daemon_health_at, heartbeat_path,
@@ -68,6 +78,9 @@ pub use inbox::{
 pub use memory_bridge::{
     install_into as install_memory_bridge_into, install_memory_bridge, InstallMemoryBridgeOptions,
     MemoryBridgeAction, MemoryBridgeReport,
+};
+pub use migration::{
+    migrate_v041_to_v042, render_migration_report, MigrationReport as V042MigrationReport,
 };
 pub use meta_agent::{
     bootstrap_meta_project, clean_stale_meta_layouts, meta_session_name, meta_slug,
@@ -90,8 +103,8 @@ pub use progress::{
     AgentSessionSummary,
 };
 pub use projects::{
-    bootstrap_project, pick_unused_slug, pick_unused_slug_verbatim, pre_trust_project, slugify,
-    slugify_brief,
+    bootstrap_project, bootstrap_project_at_dir, pick_unused_slug, pick_unused_slug_verbatim,
+    pre_trust_project, slugify, slugify_brief,
 };
 pub use queries::{
     collect_projects, collect_recent_events, workflow_summary, AgentStatus, ProjectSummary,

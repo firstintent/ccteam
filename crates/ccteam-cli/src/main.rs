@@ -35,14 +35,45 @@ enum Command {
     /// templates, and run a quick health check (claude / tmux /
     /// ccteam-on-PATH). Idempotent — safe to re-run.
     ///
-    /// V0.4.1: pass `-i` / `--interactive` to also prompt y/n for
-    /// optional installs (MCP, skill, meta-agent), or `-y` / `--yes`
+    /// V0.4.2 F72: `ccteam init` is the unified project install.
+    /// Defaults to installing in the current working directory (slug =
+    /// cwd basename). Use `--in <path>` to install elsewhere, `--slug
+    /// <name>` to override the derived slug. Re-running on a directory
+    /// that's already a ccteam project refreshes state.json and the
+    /// settings.json marker section but preserves `workflow.yaml` and
+    /// `.claude/agents/*.md` (use `--force` to overwrite them).
+    ///
+    /// V0.4.1: pass `-i` / `--interactive` to prompt y/n for optional
+    /// global installs (MCP, skill, meta-agent), or `-y` / `--yes`
     /// to install all of them without prompting.
     Init {
-        /// Overwrite existing global phase templates (default: skip if
-        /// already on disk so hand-edits stick).
+        /// V0.4.2 F72: install in this directory instead of the cwd.
+        /// Created if absent. Combine with `--slug` to override the
+        /// auto-derived slug (default: dir basename).
+        #[arg(long, value_name = "PATH")]
+        r#in: Option<PathBuf>,
+        /// V0.4.2 F72: explicit slug. When `--in` is absent and `--slug`
+        /// is given, ccteam installs at `<projects_root>/<slug>/`. When
+        /// `--in` is given, the slug overrides the dir-basename default.
+        #[arg(long, value_name = "NAME")]
+        slug: Option<String>,
+        /// V0.4.2 F72: team name for new installs (default `dev`).
+        /// Ignored on refresh — existing state.json::team is preserved
+        /// unless `--force`.
+        #[arg(long, value_name = "NAME")]
+        team: Option<String>,
+        /// Overwrite every ccteam-managed file: state.json, settings.json
+        /// marker section, workflow.yaml, .claude/agents/*.md, and
+        /// global helper templates. Without `--force` re-runs preserve
+        /// user-edited workflow.yaml + agents.
         #[arg(long, default_value_t = false)]
         force: bool,
+        /// V0.4.2 F72: only overwrite `.claude/agents/*.md` (keep
+        /// workflow.yaml + everything else). Use when the user edited
+        /// agents into something broken but wants to keep the workflow
+        /// shape.
+        #[arg(long, default_value_t = false)]
+        reset_agents: bool,
         /// V0.4.1: interactively prompt for each optional install step
         /// after the directory skeleton.
         #[arg(short = 'i', long, default_value_t = false)]
@@ -108,42 +139,21 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         web_token_file: Option<PathBuf>,
     },
-    /// Create a new project from a one-line request.
+    /// V0.4.2 F75: thin wrapper over `ccteam init --in
+    /// <projects_root>/<slug>` for users who prefer the "create a
+    /// new project somewhere central" mental model. Identical
+    /// semantics to running `ccteam init --slug <slug>` from any cwd
+    /// — see `ccteam init --help` for the full overwrite-strategy
+    /// surface.
+    ///
+    /// The V0.4.0 free-text request + LLM-auto-slug path was dropped
+    /// in V0.4.2: `slug` is required and explicit.
     New {
-        /// The request text. Ignored when `--file` is given.
-        request: Option<String>,
-        /// Read the request from a file instead of the positional arg.
-        #[arg(short, long, value_name = "PATH")]
-        file: Option<PathBuf>,
-        /// Team to run this project under. Default `dev` keeps the
-        /// shipped pipeline (plan-eng → implement → … → ship). Other
-        /// teams (research, design, ...) land in M3.4.
+        /// Project slug. Becomes the dir name under `projects_root`.
+        slug: String,
+        /// Team for the new install. Default `dev`.
         #[arg(long, default_value = "dev")]
         team: String,
-        /// V0.2.2 F34 Tier 1 — explicit slug override. When set, skips
-        /// the Tier 3 `claude -p` smart-suggest and Tier 4 deterministic
-        /// fallback. Validated `[a-z0-9-]+`, len ≤ 60. B2 prefix
-        /// semantics: if the value already starts with `<team>-` it's
-        /// kept verbatim, otherwise `<team>-` is prepended automatically
-        /// (PRD §3.2.1).
-        #[arg(long, value_name = "NAME")]
-        slug: Option<String>,
-        /// V0.2.2 F34 Tier 3 — when set, skip the `claude -p` smart-
-        /// suggest path and fall back directly to the deterministic
-        /// `slugify_brief()` Tier 4. Useful in scripts / CI where you
-        /// don't want the per-invocation LLM round trip.
-        #[arg(long, default_value_t = false)]
-        no_auto_slug: bool,
-        /// V0.2.2 F34 Tier 3 — model name passed to `claude -p` for
-        /// the smart-suggest fallback. Default `claude-haiku-4-5-20251001`
-        /// (cheapest + fastest viable). Override with eg
-        /// `claude-sonnet-4-5-20251001` for harder briefs.
-        #[arg(
-            long,
-            value_name = "MODEL",
-            default_value = "claude-haiku-4-5-20251001"
-        )]
-        auto_slug_model: String,
     },
     /// List all known projects.
     Ls {
@@ -308,6 +318,14 @@ enum Command {
         /// path or the degrade reason (tmux missing / font / IO).
         #[arg(long, value_name = "SLUG")]
         screenshot_smoke: Option<String>,
+        /// V0.4.2 F74: fold V0.4.1 project layout into the new
+        /// `~/.ccteam/config.yaml`. Walks `~/projects/*` and appends
+        /// every parseable `.ccteam/state.json` to `config.yaml::
+        /// projects[]`; folds `~/.ccteam/watchdog.yaml` into
+        /// `config.yaml::watchdog` and renames the old file to
+        /// `watchdog.yaml.migrated`. Idempotent.
+        #[arg(long, default_value_t = false)]
+        migrate_v041_to_v042: bool,
     },
     /// V0.2 M0.18.6: render the orchestrator's per-phase inject
     /// prompt (frontmatter-driven) plus the `@`-referenced phase
@@ -519,12 +537,24 @@ fn main() -> Result<()> {
     };
 
     match command {
-        Command::Init { force, interactive, yes } => {
+        Command::Init {
+            r#in,
+            slug,
+            team,
+            force,
+            reset_agents,
+            interactive,
+            yes,
+        } => {
             let paths = CcteamPaths::from_env()?;
             let report = commands::run_init(
                 &paths,
                 InitOptions {
+                    install_in: r#in,
+                    slug,
+                    team,
                     force,
+                    reset_agents,
                     interactive,
                     yes,
                 },
@@ -553,14 +583,7 @@ fn main() -> Result<()> {
                 token_file: web_token_file,
             },
         ),
-        Command::New {
-            request,
-            file,
-            team,
-            slug,
-            no_auto_slug,
-            auto_slug_model,
-        } => run_new(request, file, team, slug, no_auto_slug, auto_slug_model),
+        Command::New { slug, team } => run_new(slug, team),
         Command::Ls { format } => run_ls(format),
         Command::Status { tail } => run_status(tail),
         Command::Show { slug, format } => match slug {
@@ -626,6 +649,7 @@ fn main() -> Result<()> {
             validate_team,
             migrate_recommended_agents,
             screenshot_smoke,
+            migrate_v041_to_v042,
         } => {
             // V0.4.1 `--install-all` is sugar for the three first-run
             // flags. Explicit flags still win where set; we OR them.
@@ -644,6 +668,7 @@ fn main() -> Result<()> {
                 validate_team,
                 migrate_recommended_agents,
                 screenshot_smoke,
+                migrate_v041_to_v042,
             })
         }
         Command::Phase { cmd } => run_phase(cmd),
@@ -1317,46 +1342,38 @@ fn run_spawn(
     Ok(())
 }
 
-fn run_new(
-    request: Option<String>,
-    file: Option<PathBuf>,
-    team: String,
-    slug: Option<String>,
-    no_auto_slug: bool,
-    auto_slug_model: String,
-) -> Result<()> {
+fn run_new(slug: String, team: String) -> Result<()> {
+    let slug = slug.trim();
+    if slug.is_empty() {
+        anyhow::bail!("ccteam new: slug must be non-empty");
+    }
+    if team.trim().is_empty() {
+        anyhow::bail!("ccteam new: --team must be non-empty");
+    }
     let paths = CcteamPaths::from_env()?;
-    let body = match (file, request) {
-        (Some(path), _) => {
-            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?
-        }
-        (None, Some(text)) => text,
-        (None, None) => {
-            anyhow::bail!("ccteam new: provide a request as a positional arg or --file PATH")
-        }
+    // V0.4.2 F75: `ccteam new <slug>` delegates to `ccteam init` with
+    // `install_in = <projects_root>/<final_slug>`. Same install
+    // pipeline, same overwrite-strategy semantics. F22 invariant: if
+    // the user-supplied slug isn't already prefixed with `<team>-`,
+    // we prepend automatically so `~/.claude/rules/ccteam-lessons-
+    // <team>.md` paths globs still match.
+    let team_prefix = format!("{team}-");
+    let final_slug = if slug.starts_with(&team_prefix) {
+        slug.to_string()
+    } else {
+        format!("{team_prefix}{slug}")
     };
-    let opts = commands::RunNewOptions {
-        slug: slug.as_deref(),
-        no_auto_slug,
-        auto_slug_model: &auto_slug_model,
-    };
-    let slug = commands::run_new(&paths, body.trim(), &team, opts)?;
-    println!("created project {slug} (team: {team})");
-    println!(
-        "  spec   : {}",
-        paths.project_ccteam_dir(&slug).join("spec.md").display()
-    );
-    println!("  state  : {}", paths.project_state(&slug).display());
-    println!(
-        "  config : {}",
-        paths
-            .project_dir(&slug)
-            .join(".claude/settings.json")
-            .display()
-    );
-    println!(
-        "\nrun `ccteam start --foreground` (in another terminal) to dispatch the first phase."
-    );
+    let target = paths.projects_root.join(&final_slug);
+    let report = commands::run_init(
+        &paths,
+        commands::InitOptions {
+            install_in: Some(target),
+            slug: Some(final_slug),
+            team: Some(team),
+            ..commands::InitOptions::default()
+        },
+    )?;
+    print!("{report}");
     Ok(())
 }
 

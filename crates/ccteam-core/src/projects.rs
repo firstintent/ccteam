@@ -228,8 +228,29 @@ pub fn bootstrap_project(
     request: &str,
     team: &str,
 ) -> Result<PathBuf> {
-    let project_dir = paths.project_dir(slug);
-    let ccteam_dir = paths.project_ccteam_dir(slug);
+    bootstrap_project_at_dir(paths, &paths.project_dir(slug), slug, request, team)
+}
+
+/// V0.4.2 F72: `bootstrap_project` generalized to install at an
+/// arbitrary `target_dir`. Used by `ccteam init` to bring an existing
+/// repo under management without moving files. Side effects (helper
+/// templates, trust-marking) still use `paths.root` / `paths.projects_root`,
+/// since those are global concerns.
+///
+/// `target_dir` is created if it doesn't exist. Existing files inside
+/// it are left alone — this is the **fresh-install** path. Idempotent
+/// refresh of an already-installed project lives in `ccteam init`'s
+/// refresh helpers; this function assumes the caller already decided
+/// "this is a new install".
+pub fn bootstrap_project_at_dir(
+    paths: &CcteamPaths,
+    target_dir: &Path,
+    slug: &str,
+    request: &str,
+    team: &str,
+) -> Result<PathBuf> {
+    let project_dir = target_dir.to_path_buf();
+    let ccteam_dir = project_dir.join(".ccteam");
     std::fs::create_dir_all(&ccteam_dir)
         .with_context(|| format!("create {}", ccteam_dir.display()))?;
 
@@ -242,7 +263,7 @@ pub fn bootstrap_project(
         .with_context(|| format!("write {}", spec_path.display()))?;
 
     let state = ProjectState::initial_for_team(slug.to_string(), team.to_string());
-    state.save(&paths.project_state(slug))?;
+    state.save(&CcteamPaths::project_state_in(&project_dir))?;
 
     // V0.4.0 F60: the phase-template-driven `enabledPlugins` resolver
     // (`compute_enabled_plugins` + `load_phase_templates_for_bootstrap`)

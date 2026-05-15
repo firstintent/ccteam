@@ -152,7 +152,7 @@ Claude Code sessions directly.
 ```bash
 ccteam team init scratch --kind flex --author-name "$USER"
 ccteam team publish scratch --target local
-ccteam new "Investigate the migration plan" --team scratch --slug scratch-migration
+ccteam new migration --team scratch          # creates ~/projects/scratch-migration/
 ccteam session add scratch-migration --harness=claude
 ccteam session ls scratch-migration
 ```

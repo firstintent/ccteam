@@ -39,7 +39,7 @@
 1. **Phase A —— 需求澄清**:brief 单词级时用 `AskUserQuestion` 问一个最关键的澄清(只一个,不连珠炮)
 2. **Phase B —— slug 推荐**:基于 brief 算 2-4 token kebab-case slug,用 `AskUserQuestion` 给用户三选一(推荐 / 我来定 / 再来一个)
 3. **Phase C —— team 选择**:按下面"团队启发"决策默认推断;不确定时 `AskUserQuestion` 二选一
-4. **Phase D —— 派单**:`ccteam new --slug <slug> --team <team> "<refined brief>"`,然后在 outbox 写 `event_kind: reply` 告诉用户
+4. **Phase D —— 派单**:`ccteam new <slug> --team <team>`,然后在 outbox 写 `event_kind: reply` 告诉用户。V0.4.2 起 slug 是必填 positional;refined brief 通过 session CLAUDE.md 模板传入,不再走自由文本参数
 
 skill body 里详细约束 + 反例你都能直接读;遇到 mode 1 ad-hoc("先别建项目,直接帮我写一段")**不要**走 skill,直接对话回应即可。
 
@@ -71,7 +71,7 @@ ccteam V0.2.2 起 canonical team 名:**dev** + **research**。`product-research`
 - ❌ **不要**自己写完一份代码再"派给 ccteam"——那等于绕开整套 phase pipeline
 - ❌ **不要**自己起 `Agent(subagent_type=general-purpose)` / 调用 web 搜索工具做调研、市场分析、技术对比 —— 这是 research 团队的活,绕过 = 失去 6 phase pipeline + verdict 结构化判断 + 可审计调研记录
 - ✅ 识别项目级请求时,**默认走 `ccteam-project-creator` skill 派单**,让对应团队 session 干活
-- ✅ "调研 X" / "评估 X 值不值得" → 走 skill,skill 调 `ccteam new --team=research --slug=<name> "<brief>"`
+- ✅ "调研 X" / "评估 X 值不值得" → 走 skill,skill 调 `ccteam new <slug> --team research`
 - ✅ 只有用户**明确说"你直接帮我写 X"**(例:"先别建项目,你直接写一段 yaml 给我看")时才走 worker 路径——这种情况下你做完直接回答即可,不进 ccteam pipeline
 
 为什么?ccteam 的全套机制(progress.jsonl / phase 边界 / cost 累计 / context reset / Seed Gate / Critic)只在项目 session 里生效。你绕开它 = 失去这一切保障 = 退回到普通 claude 的体验。
@@ -79,16 +79,15 @@ ccteam V0.2.2 起 canonical team 名:**dev** + **research**。`product-research`
 ## 4. 派单工具(M1 用 Bash;M2.8+ 切 ccteam-mcp MCP)
 
 **派单走 `ccteam-project-creator` skill**(§2 已定),它内部用 `Bash` 调
-`ccteam new --slug <slug> --team <team> "<brief>"`。下面是 raw CLI 入口
-(skill 内部用,你也能在不需要 skill 流程时直接调,例:用户已给齐
-slug + team + brief):
+`ccteam new <slug> --team <team>`。下面是 raw CLI 入口(skill 内部用,
+你也能在不需要 skill 流程时直接调,例:用户已给齐 slug + team):
 
 ```bash
-# 立项 —— dev 路径(skill 内部 / 用户已给齐参数)
-ccteam new --slug todo-cli --team=dev "做一个 todo cli,本地存储,Rust + ratatui"
+# 立项 —— dev 路径(slug 自动加 team 前缀:dev-todo-cli)
+ccteam new todo-cli --team dev
 
-# 立项 —— research 路径(产研判断 idea 值不值得做)
-ccteam new --slug ai-recipe-generator --team=research "AI 菜谱生成器,拍冰箱照片自动写菜谱"
+# 立项 —— research 路径
+ccteam new ai-recipe-generator --team research
 
 # 看一项目
 ccteam show <slug> --format json | jq
@@ -100,11 +99,11 @@ ccteam ls --format json | jq
 ccteam progress <slug> --tail   # 流式;通常你不需要,因为关键事件会经 inbox 推到你这
 ```
 
-`--slug` 显式给定时跳过自动 slug 生成(Tier 1 PRD §3.2.1);不传 `--slug`
-时 `ccteam new` 在 tty 上下文会 shell-out `claude -p haiku` 智能推一个
-+ Y/n 确认(Tier 3),非 tty 自动接受;`--no-auto-slug` / 环境变量
-`CCTEAM_AUTO_SLUG=off` 强制走 deterministic Tier 4。skill 流程里
-**默认显式传 `--slug`**(用户在 Phase B 已确认),不再走 Tier 3。
+V0.4.2 起 `ccteam new` 是 `ccteam init --in <projects_root>/<team>-<slug>/`
+的 thin wrapper。slug 是必填 positional;不再有自由文本 brief 参数 +
+LLM 自动 slug 推荐(Tier 3 已删,V0.4.0 的 `claude -p haiku` 路径退役)。
+session CLAUDE.md 会从 phase B/D 的对话上下文写入 refined brief,session
+打开后自然看到。
 
 M2.8 之后会切到 `mcp__ccteam__new` / `mcp__ccteam__ls` 等结构化工具——比 shell parse 更鲁棒。届时本文件会被自动重写,你不必担心兼容。
 
