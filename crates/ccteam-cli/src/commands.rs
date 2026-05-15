@@ -19,7 +19,7 @@ use ccteam_core::{
     write_global_helper_templates, CcteamPaths, HookCmdRewriteAction, HookCmdRewriteReport,
     InstallSkillOptions, LegacySkillAction, LegacySkillReport, MetaBootstrapReport,
     MigrationReport, OutboxEventKind, OutboxMessage, PhaseState, ProjectState, SessionMailbox,
-    SkillInstallAction, TeamSpec, ToolSurfaceSnapshot, BUILTIN_SUBAGENTS, HELPER_TEMPLATES,
+    SkillInstallAction, TeamSpec, ToolSurfaceSnapshot, BUILTIN_SUBAGENTS,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -29,28 +29,55 @@ pub enum OutputFormat {
 }
 
 /// Options passed from the `ccteam init` argument parser.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct InitOptions {
-    /// Overwrite existing global phase templates instead of skipping
-    /// them (default: false, so hand edits stick across re-init).
+    /// V0.4.2 F72: install in this directory. `None` defaults to the
+    /// cwd (or, when `slug` is also Some, to
+    /// `<projects_root>/<slug>/`).
+    pub install_in: Option<std::path::PathBuf>,
+    /// V0.4.2 F72: slug override. When absent we derive from the
+    /// install target's dir basename.
+    pub slug: Option<String>,
+    /// V0.4.2 F72: team for new installs (default `dev`). On refresh
+    /// the existing `state.json::team` is preserved unless `force`.
+    pub team: Option<String>,
+    /// Overwrite every ccteam-managed file (state.json, settings.json
+    /// marker section, workflow.yaml, agents/*.md, helper templates).
+    /// Without `force` re-runs preserve user-edited workflow + agents.
     pub force: bool,
-    /// V0.4.1: when set, interactively prompt the user for each
-    /// optional install step (MCP, skill, meta-agent) after laying
-    /// down the directory skeleton.
+    /// V0.4.2 F72: reset only `.claude/agents/*.md` (keep workflow.yaml
+    /// + everything else).
+    pub reset_agents: bool,
+    /// V0.4.1: prompt y/n for each optional global install step (MCP,
+    /// skill, meta-agent) after the project install.
     pub interactive: bool,
-    /// V0.4.1: assume `yes` for every prompt the wizard would ask.
-    /// Implies `interactive` in the sense that all install steps run,
-    /// but skips the actual stdin prompts.
+    /// V0.4.1: assume `yes` for every install-step prompt. Implies
+    /// `interactive` but skips actual stdin.
     pub yes: bool,
 }
 
-/// `ccteam init`. Creates `~/.ccteam/{phases,progress,inbox,control,
-/// queue,memory,state}`, unpacks the embedded phase templates into
-/// `~/.ccteam/phases/`, and runs a quick health check. Returns a
-/// human-readable report.
+/// V0.4.2 F72: unified install command.
+///
+/// Three scenarios, one command:
+///
+/// 1. **Fresh cwd / fresh dir**: writes `.ccteam/state.json`,
+///    `workflow.yaml` scaffold, `.claude/settings.json`, `.claude/
+///    agents/*.md` scaffolds; appends to `~/.ccteam/config.yaml::
+///    projects[]`.
+/// 2. **Existing repo cwd** (no `.ccteam/` yet): same as (1) — never
+///    touches existing user files.
+/// 3. **Already-ccteam project cwd**: refreshes state.json + the
+///    settings.json ccteam-managed marker section; preserves
+///    `workflow.yaml` + `.claude/agents/*.md` unless `--force` (full
+///    overwrite) or `--reset-agents` (agents only).
+///
+/// Tool-level side effects (helper templates in `~/.ccteam/templates/`,
+/// optional MCP/skill/meta-agent install via `--interactive`/`--yes`)
+/// run on every invocation. They're idempotent and cheap.
 pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
     use std::process::Command;
 
+    // -- 1. Global ~/.ccteam/ skeleton (idempotent) -------------------
     for sub in [
         "phases",
         "templates",
@@ -65,11 +92,6 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
         let dir = paths.root.join(sub);
         std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     }
-
-    // V0.4.0 F60: phase template + shipped-team-bundle writers were
-    // deleted with the rest of the phase machinery. `ccteam init` now
-    // only lays down the directory skeleton + helper templates; F63
-    // reintroduces a workflow.yaml seed writer.
     write_global_helper_templates(&paths.root, opts.force).with_context(|| {
         format!(
             "unpack helper templates to {}",
@@ -77,18 +99,74 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
         )
     })?;
 
-    let bin = current_ccteam_bin().ok();
+    // -- 2. Resolve project install target ---------------------------
+    let target = resolve_install_target(paths, &opts)?;
+    let target_slug = opts.slug.clone().unwrap_or_else(|| {
+        target
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("project")
+            .to_string()
+    });
+    let target_team = opts.team.clone().unwrap_or_else(|| "dev".to_string());
 
+    // -- 3. Refuse install in the ccteam repo itself -----------------
+    if is_ccteam_repo(&target) {
+        return Err(anyhow::anyhow!(
+            "refusing to install ccteam in the ccteam repo itself: {}\n\n\
+             this directory contains the ccteam source — installing here would create \
+             a circular hook setup. Pick a different directory (or `cd` into your own project \
+             and re-run).",
+            target.display(),
+        ));
+    }
+
+    // -- 4. Project install pass ------------------------------------
+    let project_report = install_project_at(paths, &target, &target_slug, &target_team, &opts)?;
+
+    // -- 5. Upsert config.yaml::projects[] --------------------------
+    let entry = ccteam_core::ProjectEntry {
+        slug: project_report.slug.clone(),
+        path: target.clone(),
+        team: project_report.team.clone(),
+        installed_at: chrono::Utc::now(),
+    };
+    ccteam_core::upsert_project_in_config(&paths.root, entry)
+        .context("upsert project into ~/.ccteam/config.yaml")?;
+
+    // -- 6. Health check + optional wizard --------------------------
+    let bin = current_ccteam_bin().ok();
     let claude = Command::new("claude").arg("--version").output();
     let tmux = Command::new("tmux").arg("-V").output();
 
     let mut out = String::new();
-    out.push_str(&format!("✓ created {}\n", paths.root.display()));
     out.push_str(&format!(
-        "✓ unpacked {} helper templates → {}\n",
-        HELPER_TEMPLATES.len(),
-        paths.templates_dir().display()
+        "ccteam init — {}\n\n",
+        project_report.action_summary()
     ));
+    out.push_str(&format!("  target dir       {}\n", target.display()));
+    out.push_str(&format!("  slug             {}\n", project_report.slug));
+    out.push_str(&format!("  team             {}\n", project_report.team));
+    out.push_str(&format!(
+        "  state.json       {} ({})\n",
+        target.join(".ccteam").join("state.json").display(),
+        project_report.state_action,
+    ));
+    out.push_str(&format!(
+        "  workflow.yaml    {} ({})\n",
+        target.join("workflow.yaml").display(),
+        project_report.workflow_action,
+    ));
+    out.push_str(&format!(
+        "  agents dir       {} ({})\n",
+        target.join(".claude").join("agents").display(),
+        project_report.agents_action,
+    ));
+    out.push_str(&format!(
+        "  config.yaml      {} (upserted)\n",
+        ccteam_core::ccteam_config_path(&paths.root).display(),
+    ));
+
     out.push_str("\nhealth check:\n");
     match &claude {
         Ok(o) if o.status.success() => out.push_str(&format!(
@@ -112,19 +190,19 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
         None => out.push_str("  ccteam   : current_exe() failed (binary path unresolved)\n"),
     }
 
-    // V0.4.1 wizard: install MCP / skill / meta-agent with optional
-    // interactive prompts. Falls back to printing the manual next-step
-    // hints when neither flag is set (legacy behavior).
     if opts.interactive || opts.yes {
         out.push_str("\nfirst-run install:\n");
         let mut did_something = false;
 
         let do_skill = ask_yn("install ccteam-control skill (~/.claude/skills/)", opts.yes)?;
         if do_skill {
-            out.push_str(&render_install_skill_report(paths, &DoctorOptions {
-                install_skill: true,
-                ..Default::default()
-            })?);
+            out.push_str(&render_install_skill_report(
+                paths,
+                &DoctorOptions {
+                    install_skill: true,
+                    ..Default::default()
+                },
+            )?);
             did_something = true;
         }
         let do_mcp = ask_yn(
@@ -135,10 +213,7 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
             out.push_str(&render_install_mcp_report()?);
             did_something = true;
         }
-        let do_meta = ask_yn(
-            "bootstrap meta-agent project (~/projects/meta/)",
-            opts.yes,
-        )?;
+        let do_meta = ask_yn("bootstrap meta-agent project (~/projects/meta/)", opts.yes)?;
         if do_meta {
             out.push_str(&render_install_meta_agent_report(paths)?);
             did_something = true;
@@ -150,10 +225,213 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
     }
 
     out.push_str("\nnext:\n");
-    out.push_str("  ccteam new \"<your one-line request>\"\n");
-    out.push_str("  ccteam start                # boots orchestrator + web on 127.0.0.1:7331\n");
+    out.push_str("  - edit workflow.yaml + .claude/agents/<role>.md to your taste\n");
+    out.push_str("  - ccteam start                # boots orchestrator + web\n");
     Ok(out)
 }
+
+/// V0.4.2 F72: resolve where to install. Priority:
+///   1. `--in <path>`  (absolute or relative; created if absent)
+///   2. `--slug <name>` (→ `<projects_root>/<slug>/`)
+///   3. current working directory
+fn resolve_install_target(paths: &CcteamPaths, opts: &InitOptions) -> Result<std::path::PathBuf> {
+    if let Some(p) = &opts.install_in {
+        let abs = if p.is_absolute() {
+            p.clone()
+        } else {
+            std::env::current_dir()
+                .context("read cwd to resolve --in")?
+                .join(p)
+        };
+        std::fs::create_dir_all(&abs)
+            .with_context(|| format!("create --in target {}", abs.display()))?;
+        return Ok(abs);
+    }
+    if let Some(slug) = &opts.slug {
+        let target = paths.projects_root.join(slug);
+        std::fs::create_dir_all(&target)
+            .with_context(|| format!("create slug target {}", target.display()))?;
+        return Ok(target);
+    }
+    std::env::current_dir().context("read cwd as install target")
+}
+
+/// V0.4.2 F72: heuristic to detect the ccteam source repo so we don't
+/// accidentally install ccteam inside ccteam (creates circular hook
+/// loops per CLAUDE.md §六).
+fn is_ccteam_repo(dir: &std::path::Path) -> bool {
+    dir.join("Cargo.toml").is_file() && dir.join("crates").join("ccteam-cli").is_dir()
+}
+
+#[derive(Debug, Clone)]
+struct ProjectInstallReport {
+    slug: String,
+    team: String,
+    fresh: bool,
+    state_action: &'static str,
+    workflow_action: &'static str,
+    agents_action: &'static str,
+}
+
+impl ProjectInstallReport {
+    fn action_summary(&self) -> &'static str {
+        if self.fresh {
+            "fresh install"
+        } else {
+            "refresh"
+        }
+    }
+}
+
+/// V0.4.2 F72: lay down (or refresh) a ccteam project at `target`.
+fn install_project_at(
+    paths: &CcteamPaths,
+    target: &std::path::Path,
+    slug: &str,
+    team: &str,
+    opts: &InitOptions,
+) -> Result<ProjectInstallReport> {
+    let ccteam_dir = target.join(".ccteam");
+    let state_path = ccteam_dir.join("state.json");
+    let fresh = !state_path.exists();
+
+    let state_action: &'static str;
+    let workflow_action: &'static str;
+    let agents_action: &'static str;
+    let final_team: String;
+
+    if fresh {
+        ccteam_core::bootstrap_project_at_dir(
+            paths,
+            target,
+            slug,
+            "(installed via `ccteam init`)",
+            team,
+        )?;
+        scaffold_workflow_yaml(target, false)?;
+        let agent_count = scaffold_default_agents(target, false)?;
+        state_action = "created";
+        workflow_action = "scaffolded";
+        agents_action = if agent_count > 0 {
+            "scaffolded"
+        } else {
+            "scaffolded (0 — bug?)"
+        };
+        final_team = team.to_string();
+    } else {
+        let mut existing_state = ccteam_core::ProjectState::load(&state_path)
+            .with_context(|| format!("load existing {}", state_path.display()))?;
+        if opts.force || opts.team.is_some() {
+            existing_state.team = team.to_string();
+        }
+        existing_state.slug = slug.to_string();
+        existing_state.tmux_session = format!("ccteam-{slug}");
+        existing_state.save(&state_path)?;
+        final_team = existing_state.team.clone();
+        state_action = "refreshed";
+
+        workflow_action = if opts.force {
+            scaffold_workflow_yaml(target, true)?;
+            "overwritten (--force)"
+        } else {
+            "preserved"
+        };
+
+        agents_action = if opts.force || opts.reset_agents {
+            scaffold_default_agents(target, true)?;
+            if opts.force {
+                "overwritten (--force)"
+            } else {
+                "overwritten (--reset-agents)"
+            }
+        } else {
+            "preserved"
+        };
+    }
+
+    Ok(ProjectInstallReport {
+        slug: slug.to_string(),
+        team: final_team,
+        fresh,
+        state_action,
+        workflow_action,
+        agents_action,
+    })
+}
+
+/// V0.4.2 F72: write a minimal `workflow.yaml` example into `target`.
+/// Returns silently if the file already exists and `force` is false.
+fn scaffold_workflow_yaml(target: &std::path::Path, force: bool) -> Result<()> {
+    let path = target.join("workflow.yaml");
+    if path.exists() && !force {
+        return Ok(());
+    }
+    std::fs::write(&path, DEFAULT_WORKFLOW_YAML)
+        .with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+/// V0.4.2 F72: write minimal `.claude/agents/*.md` examples. Returns
+/// the count of files written. With `force=false`, existing files are
+/// preserved; with `force=true`, the shipped scaffolds always
+/// overwrite.
+fn scaffold_default_agents(target: &std::path::Path, force: bool) -> Result<usize> {
+    let agents_dir = target.join(".claude").join("agents");
+    std::fs::create_dir_all(&agents_dir)
+        .with_context(|| format!("create {}", agents_dir.display()))?;
+    let mut written = 0usize;
+    for (name, body) in DEFAULT_AGENT_SCAFFOLDS {
+        let path = agents_dir.join(name);
+        if path.exists() && !force {
+            continue;
+        }
+        std::fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
+        written += 1;
+    }
+    Ok(written)
+}
+
+const DEFAULT_WORKFLOW_YAML: &str = r#"# ccteam workflow.yaml (V0.4.0+ shape).
+# Edit this file to declare your project's agent topology. Each agent
+# is a role (filename of .claude/agents/<role>.md) with a trigger that
+# decides when ccteam spawns a session for it.
+#
+# Trigger grammar:
+#   manual                        # explicit `ccteam spawn <slug> <role>` only
+#   schedule                      # periodic (V0.4.1+ interval field)
+#   gate                          # waits for `trigger_gate` MCP / CLI call
+#   watch:.ccteam/issues/         # spawn one session per new file under the path
+#
+# Docs: docs/v0-4-0/prd.md §6, examples/workflows/*.yaml
+name: default-workflow
+description: |
+  Minimal starter workflow. Edit me — the manual `explorer` is a safe
+  default that won't spawn until you call `ccteam spawn <slug> explorer`.
+
+agents:
+  explorer:
+    trigger: manual
+    executor: claude
+"#;
+
+const DEFAULT_AGENT_SCAFFOLDS: &[(&str, &str)] = &[(
+    "explorer.md",
+    r#"# Explorer agent
+
+This file is the system prompt for the `explorer` role.
+
+You are a generalist working in this project. The user has just
+installed ccteam here via `ccteam init`. Start by reading the project
+layout (`ls`, `git log -5`, top-level README if present) and reporting
+what you find. Wait for further instructions from the inbox.
+
+## Tools
+
+You have access to ccteam's MCP toolset (`mcp__ccteam__*`) for
+inspecting other projects, sending messages, and triggering workflow
+gates. See ~/.claude/skills/ccteam-control/SKILL.md for usage patterns.
+"#,
+)];
 
 /// Prompt the user `<question> [Y/n]: ` and return their answer. With
 /// `yes_to_all = true`, skips the prompt and answers `true` (the
@@ -2593,11 +2871,21 @@ mod tests {
         );
     }
 
+    /// V0.4.2 F72: build `InitOptions` that targets a slug inside the
+    /// tempdir so tests don't accidentally try to install ccteam in
+    /// the ccteam repo cwd (which is fail-loud).
+    fn init_opts_targeting_tmp(tmp: &TempDir, slug: &str) -> InitOptions {
+        InitOptions {
+            install_in: Some(tmp.path().join(slug)),
+            ..InitOptions::default()
+        }
+    }
+
     #[test]
     fn run_init_creates_global_skeleton_and_unpacks_helpers() {
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
-        let report = run_init(&paths, InitOptions::default()).unwrap();
+        let report = run_init(&paths, init_opts_targeting_tmp(&tmp, "scaffold-demo")).unwrap();
         for sub in ["phases", "templates", "progress", "inbox", "control"] {
             assert!(
                 paths.root.join(sub).is_dir(),
@@ -2615,7 +2903,7 @@ mod tests {
             .templates_dir()
             .join("kickoff-reverse-interview.md")
             .is_file());
-        assert!(report.contains("helper templates"));
+        assert!(report.contains("ccteam init"));
         assert!(report.contains("next"));
     }
 
@@ -2626,21 +2914,189 @@ mod tests {
         // contract (skip-existing without --force; overwrite with).
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
-        run_init(&paths, InitOptions::default()).unwrap();
+        run_init(&paths, init_opts_targeting_tmp(&tmp, "idem-demo")).unwrap();
         let path = paths.templates_dir().join("review-with-user-loop.md");
         std::fs::write(&path, "USER EDIT").unwrap();
-        run_init(&paths, InitOptions::default()).unwrap();
+        run_init(&paths, init_opts_targeting_tmp(&tmp, "idem-demo")).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "USER EDIT");
         run_init(
             &paths,
             InitOptions {
                 force: true,
-                interactive: false,
-                yes: false,
+                install_in: Some(tmp.path().join("idem-demo")),
+                ..InitOptions::default()
             },
         )
         .unwrap();
         assert_ne!(std::fs::read_to_string(&path).unwrap(), "USER EDIT");
+    }
+
+    /// V0.4.2 F72: fresh install scaffolds the project skeleton AND
+    /// registers in config.yaml.
+    #[test]
+    fn run_init_fresh_install_scaffolds_and_registers() {
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let target = tmp.path().join("f72-fresh");
+        run_init(
+            &paths,
+            InitOptions {
+                install_in: Some(target.clone()),
+                slug: Some("f72-fresh".into()),
+                team: Some("dev".into()),
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(target.join(".ccteam").join("state.json").is_file());
+        assert!(target.join("workflow.yaml").is_file());
+        assert!(target.join(".claude").join("agents").join("explorer.md").is_file());
+
+        let cfg = ccteam_core::load_ccteam_config(&paths.root).unwrap();
+        assert_eq!(cfg.projects.len(), 1);
+        assert_eq!(cfg.projects[0].slug, "f72-fresh");
+        assert_eq!(cfg.projects[0].team, "dev");
+    }
+
+    /// V0.4.2 F72: re-running on an existing ccteam project preserves
+    /// user-edited workflow.yaml + agents/*.md.
+    #[test]
+    fn run_init_refresh_preserves_user_workflow_and_agents() {
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let target = tmp.path().join("f72-refresh");
+        run_init(
+            &paths,
+            InitOptions {
+                install_in: Some(target.clone()),
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+        std::fs::write(target.join("workflow.yaml"), "USER WORKFLOW\n").unwrap();
+        std::fs::write(
+            target.join(".claude").join("agents").join("explorer.md"),
+            "USER AGENT\n",
+        )
+        .unwrap();
+
+        // Re-run: refresh should preserve user files.
+        run_init(
+            &paths,
+            InitOptions {
+                install_in: Some(target.clone()),
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(target.join("workflow.yaml")).unwrap(),
+            "USER WORKFLOW\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join(".claude").join("agents").join("explorer.md"))
+                .unwrap(),
+            "USER AGENT\n"
+        );
+    }
+
+    /// V0.4.2 F72: `--force` re-runs overwrite user files.
+    #[test]
+    fn run_init_force_overwrites_user_workflow_and_agents() {
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let target = tmp.path().join("f72-force");
+        run_init(
+            &paths,
+            InitOptions {
+                install_in: Some(target.clone()),
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+        std::fs::write(target.join("workflow.yaml"), "USER WORKFLOW\n").unwrap();
+        run_init(
+            &paths,
+            InitOptions {
+                install_in: Some(target.clone()),
+                force: true,
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+        assert_ne!(
+            std::fs::read_to_string(target.join("workflow.yaml")).unwrap(),
+            "USER WORKFLOW\n"
+        );
+    }
+
+    /// V0.4.2 F72: `--reset-agents` rewrites agents but keeps
+    /// workflow.yaml untouched.
+    #[test]
+    fn run_init_reset_agents_only_overwrites_agents() {
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let target = tmp.path().join("f72-reset");
+        run_init(
+            &paths,
+            InitOptions {
+                install_in: Some(target.clone()),
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+        std::fs::write(target.join("workflow.yaml"), "USER WORKFLOW\n").unwrap();
+        std::fs::write(
+            target.join(".claude").join("agents").join("explorer.md"),
+            "USER AGENT\n",
+        )
+        .unwrap();
+        run_init(
+            &paths,
+            InitOptions {
+                install_in: Some(target.clone()),
+                reset_agents: true,
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(target.join("workflow.yaml")).unwrap(),
+            "USER WORKFLOW\n",
+            "workflow must survive --reset-agents",
+        );
+        assert_ne!(
+            std::fs::read_to_string(target.join(".claude").join("agents").join("explorer.md"))
+                .unwrap(),
+            "USER AGENT\n",
+            "agents must be overwritten by --reset-agents",
+        );
+    }
+
+    /// V0.4.2 F72: installing in the ccteam source repo itself is
+    /// fail-loud (CLAUDE.md §六 — avoids circular hook setup).
+    #[test]
+    fn run_init_refuses_to_install_in_ccteam_repo() {
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        // Plant the two markers `is_ccteam_repo` checks for.
+        let fake_repo = tmp.path().join("ccteam-mirror");
+        std::fs::create_dir_all(fake_repo.join("crates").join("ccteam-cli")).unwrap();
+        std::fs::write(fake_repo.join("Cargo.toml"), "[workspace]\n").unwrap();
+
+        let err = run_init(
+            &paths,
+            InitOptions {
+                install_in: Some(fake_repo),
+                ..InitOptions::default()
+            },
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("ccteam repo itself"),
+            "expected fail-loud message; got: {msg}",
+        );
     }
 
     #[test]

@@ -35,14 +35,45 @@ enum Command {
     /// templates, and run a quick health check (claude / tmux /
     /// ccteam-on-PATH). Idempotent — safe to re-run.
     ///
-    /// V0.4.1: pass `-i` / `--interactive` to also prompt y/n for
-    /// optional installs (MCP, skill, meta-agent), or `-y` / `--yes`
+    /// V0.4.2 F72: `ccteam init` is the unified project install.
+    /// Defaults to installing in the current working directory (slug =
+    /// cwd basename). Use `--in <path>` to install elsewhere, `--slug
+    /// <name>` to override the derived slug. Re-running on a directory
+    /// that's already a ccteam project refreshes state.json and the
+    /// settings.json marker section but preserves `workflow.yaml` and
+    /// `.claude/agents/*.md` (use `--force` to overwrite them).
+    ///
+    /// V0.4.1: pass `-i` / `--interactive` to prompt y/n for optional
+    /// global installs (MCP, skill, meta-agent), or `-y` / `--yes`
     /// to install all of them without prompting.
     Init {
-        /// Overwrite existing global phase templates (default: skip if
-        /// already on disk so hand-edits stick).
+        /// V0.4.2 F72: install in this directory instead of the cwd.
+        /// Created if absent. Combine with `--slug` to override the
+        /// auto-derived slug (default: dir basename).
+        #[arg(long, value_name = "PATH")]
+        r#in: Option<PathBuf>,
+        /// V0.4.2 F72: explicit slug. When `--in` is absent and `--slug`
+        /// is given, ccteam installs at `<projects_root>/<slug>/`. When
+        /// `--in` is given, the slug overrides the dir-basename default.
+        #[arg(long, value_name = "NAME")]
+        slug: Option<String>,
+        /// V0.4.2 F72: team name for new installs (default `dev`).
+        /// Ignored on refresh — existing state.json::team is preserved
+        /// unless `--force`.
+        #[arg(long, value_name = "NAME")]
+        team: Option<String>,
+        /// Overwrite every ccteam-managed file: state.json, settings.json
+        /// marker section, workflow.yaml, .claude/agents/*.md, and
+        /// global helper templates. Without `--force` re-runs preserve
+        /// user-edited workflow.yaml + agents.
         #[arg(long, default_value_t = false)]
         force: bool,
+        /// V0.4.2 F72: only overwrite `.claude/agents/*.md` (keep
+        /// workflow.yaml + everything else). Use when the user edited
+        /// agents into something broken but wants to keep the workflow
+        /// shape.
+        #[arg(long, default_value_t = false)]
+        reset_agents: bool,
         /// V0.4.1: interactively prompt for each optional install step
         /// after the directory skeleton.
         #[arg(short = 'i', long, default_value_t = false)]
@@ -527,12 +558,24 @@ fn main() -> Result<()> {
     };
 
     match command {
-        Command::Init { force, interactive, yes } => {
+        Command::Init {
+            r#in,
+            slug,
+            team,
+            force,
+            reset_agents,
+            interactive,
+            yes,
+        } => {
             let paths = CcteamPaths::from_env()?;
             let report = commands::run_init(
                 &paths,
                 InitOptions {
+                    install_in: r#in,
+                    slug,
+                    team,
                     force,
+                    reset_agents,
                     interactive,
                     yes,
                 },

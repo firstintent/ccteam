@@ -514,7 +514,7 @@ mod tests {
         // Project lives at tmp/external/myapp, NOT under projects_root.
         let external = tmp.path().join("external").join("myapp");
         std::fs::create_dir_all(external.join(".ccteam")).unwrap();
-        let mut state = ProjectState::initial("myapp".into());
+        let state = ProjectState::initial("myapp".into());
         state.save(&external.join(".ccteam").join("state.json"))
             .unwrap();
 
