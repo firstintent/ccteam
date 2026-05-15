@@ -768,17 +768,38 @@ fn run_phase(cmd: PhaseCommand) -> Result<()> {
 
 fn run_stop() -> Result<()> {
     let paths = CcteamPaths::from_env()?;
-    match ccteam_core::send_sigterm_to_pidfile(&paths)? {
-        Some(pid) => {
-            println!("ccteam stop: SIGTERM sent to orchestrator pid {pid}");
-            println!("tmux sessions are NOT killed — `ccteam start` will reattach to them.",);
-            Ok(())
-        }
+    let pid = match ccteam_core::send_sigterm_to_pidfile(&paths)? {
+        Some(pid) => pid,
         None => {
             println!("ccteam stop: no running orchestrator (pidfile absent or stale).");
-            Ok(())
+            return Ok(());
         }
+    };
+    println!("ccteam stop: SIGTERM sent to orchestrator pid {pid}");
+
+    // Block until the orchestrator actually exits — docker-stop style.
+    // The orchestrator removes its pidfile on graceful shutdown, so
+    // either an absent pidfile OR `kill -0 <pid>` returning false is
+    // proof of exit. 10s default covers a typical graceful shutdown;
+    // we never escalate to SIGKILL — CLAUDE.md §三 "永不主动 kill 长
+    // session" applies to ccteam's own daemon too (force-kill loses
+    // in-flight progress.jsonl writes).
+    let pidfile = ccteam_core::pidfile_path(&paths);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if !pidfile.exists() || !ccteam_core::daemon::pid_alive(pid) {
+            println!("ccteam stop: orchestrator exited.");
+            println!("tmux sessions are NOT killed — `ccteam start` will reattach to them.");
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(200));
     }
+    eprintln!(
+        "ccteam stop: pid {pid} still alive after 10s. Check the daemon log; \
+         resend with `kill -TERM {pid}` or inspect with `ps -p {pid}`."
+    );
+    println!("tmux sessions are NOT killed — `ccteam start` will reattach to them.");
+    Ok(())
 }
 
 fn run_doctor(opts: commands::DoctorOptions) -> Result<()> {
