@@ -55,57 +55,109 @@ pub struct ProjectSummary {
     pub stall_silent_seconds: u64,
 }
 
-/// Walk `~/.ccteam/projects/`-equivalent (the per-`ProjectState`
-/// `state.json` files under `paths.projects_root`), load each, and
-/// return one `ProjectSummary` per loadable project. Slug ordering is
-/// stable (sorted) so renderers don't need to re-sort.
+/// Enumerate projects under ccteam management.
 ///
-/// Skips entries that are not directories, lack a `state.json`, or
-/// whose `state.json` fails to parse — those get a warn-level log line
-/// but do not abort the walk. A missing `paths.projects_root`
-/// directory returns `Ok(Vec::new())` (a fresh install).
+/// V0.4.2 F73: `~/.ccteam/config.yaml::projects[]` is the canonical
+/// source. Each entry's `state.json` is loaded from its absolute
+/// `path` (which may live outside `paths.projects_root` — adopted
+/// repos in `~/code/...` etc.).
+///
+/// **Legacy fallback**: for slugs not yet registered, also walk
+/// `paths.projects_root` and include any directory whose
+/// `.ccteam/state.json` parses. This keeps V0.4.1 installs working
+/// until `ccteam doctor --migrate-v041-to-v042` (F74) folds them
+/// into config.yaml. After migration the walk finds nothing new and
+/// becomes a no-op.
+///
+/// Skips entries that lack `state.json` or whose `state.json` fails
+/// to parse — those get a warn-level log line but do not abort the
+/// walk. Slug ordering is stable (sorted) so renderers don't need
+/// to re-sort.
 pub fn collect_projects(paths: &CcteamPaths) -> Result<Vec<ProjectSummary>> {
-    let dir = &paths.projects_root;
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let Some(slug) = entry.file_name().to_str().map(String::from) else {
-            continue;
-        };
-        let state_path = paths.project_state(&slug);
+    let mut seen_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // 1. config.yaml::projects[] is the canonical SoT (V0.4.2 F73).
+    let cfg = crate::config::load(&paths.root).unwrap_or_else(|err| {
+        tracing::warn!(?err, "load config.yaml failed; treating registry as empty");
+        crate::config::CcteamConfig::default()
+    });
+    for entry in &cfg.projects {
+        let state_path = entry.path.join(".ccteam").join("state.json");
         if !state_path.exists() {
+            tracing::warn!(
+                slug = %entry.slug,
+                path = %entry.path.display(),
+                "registered project's state.json is missing; skipping (run `ccteam abandon {}` to clean up)",
+                entry.slug,
+            );
             continue;
         }
         let state = match ProjectState::load(&state_path) {
             Ok(s) => s,
             Err(err) => {
-                tracing::warn!(slug, error = %err, "skip project: state.json failed to load");
+                tracing::warn!(
+                    slug = %entry.slug,
+                    error = %err,
+                    "skip registered project: state.json load failed",
+                );
                 continue;
             }
         };
-        let now = Utc::now();
-        let age = now
-            .signed_duration_since(state.created_at)
-            .num_seconds()
-            .max(0) as u64;
-        let silent = state
-            .last_progress_event_at
-            .map(|t| now.signed_duration_since(t).num_seconds().max(0) as u64)
-            .unwrap_or(age);
-        out.push(ProjectSummary {
-            state,
-            age_seconds: age,
-            stall_silent_seconds: silent,
-        });
+        seen_slugs.insert(state.slug.clone());
+        out.push(summary_from_state(state));
     }
+
+    // 2. Legacy fallback: walk projects_root for unregistered slugs.
+    let dir = &paths.projects_root;
+    if dir.exists() {
+        for entry in
+            std::fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))?
+        {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let Some(slug) = entry.file_name().to_str().map(String::from) else {
+                continue;
+            };
+            if seen_slugs.contains(&slug) {
+                continue;
+            }
+            let state_path = paths.project_state(&slug);
+            if !state_path.exists() {
+                continue;
+            }
+            let state = match ProjectState::load(&state_path) {
+                Ok(s) => s,
+                Err(err) => {
+                    tracing::warn!(slug, error = %err, "skip project: state.json failed to load");
+                    continue;
+                }
+            };
+            out.push(summary_from_state(state));
+        }
+    }
+
     out.sort_by(|a, b| a.state.slug.cmp(&b.state.slug));
     Ok(out)
+}
+
+fn summary_from_state(state: ProjectState) -> ProjectSummary {
+    let now = Utc::now();
+    let age = now
+        .signed_duration_since(state.created_at)
+        .num_seconds()
+        .max(0) as u64;
+    let silent = state
+        .last_progress_event_at
+        .map(|t| now.signed_duration_since(t).num_seconds().max(0) as u64)
+        .unwrap_or(age);
+    ProjectSummary {
+        state,
+        age_seconds: age,
+        stall_silent_seconds: silent,
+    }
 }
 
 /// Tail the last `n` JSON-Lines events for a project.
@@ -450,6 +502,86 @@ mod tests {
         let out = collect_projects(&paths).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].state.slug, slug);
+    }
+
+    /// V0.4.2 F73: a project registered in config.yaml but living
+    /// outside `projects_root` (e.g. ~/code/<repo>) is still picked
+    /// up by collect_projects.
+    #[test]
+    fn collect_projects_reads_registered_project_outside_projects_root() {
+        let tmp = TempDir::new().unwrap();
+        let paths = fake_paths(tmp.path());
+        // Project lives at tmp/external/myapp, NOT under projects_root.
+        let external = tmp.path().join("external").join("myapp");
+        std::fs::create_dir_all(external.join(".ccteam")).unwrap();
+        let mut state = ProjectState::initial("myapp".into());
+        state.save(&external.join(".ccteam").join("state.json"))
+            .unwrap();
+
+        crate::config::append_project(
+            &paths.root,
+            crate::config::ProjectEntry {
+                slug: "myapp".into(),
+                path: external.clone(),
+                team: "dev".into(),
+                installed_at: Utc::now(),
+            },
+        )
+        .unwrap();
+
+        let out = collect_projects(&paths).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].state.slug, "myapp");
+    }
+
+    /// V0.4.2 F73 fallback path: legacy projects under `projects_root`
+    /// without a config.yaml entry are still discovered. A project
+    /// that exists in BOTH the registry and the walk path is reported
+    /// once (registry wins, no duplicate).
+    #[test]
+    fn collect_projects_dedups_registered_and_walked_slugs() {
+        let tmp = TempDir::new().unwrap();
+        let paths = fake_paths(tmp.path());
+        let slug = "shared";
+        // Live project under projects_root (legacy fs walk path).
+        let state_path = paths.project_state(slug);
+        let state = ProjectState::initial(slug.to_string());
+        state.save(&state_path).unwrap();
+        // Register the SAME slug in config.yaml pointing at the same dir.
+        crate::config::append_project(
+            &paths.root,
+            crate::config::ProjectEntry {
+                slug: slug.into(),
+                path: paths.project_dir(slug),
+                team: "dev".into(),
+                installed_at: Utc::now(),
+            },
+        )
+        .unwrap();
+
+        let out = collect_projects(&paths).unwrap();
+        assert_eq!(out.len(), 1, "registry hit must not double-count");
+        assert_eq!(out[0].state.slug, slug);
+    }
+
+    /// A registered project whose state.json went missing emits a
+    /// warn log but does NOT abort the walk.
+    #[test]
+    fn collect_projects_skips_registered_with_missing_state_json() {
+        let tmp = TempDir::new().unwrap();
+        let paths = fake_paths(tmp.path());
+        crate::config::append_project(
+            &paths.root,
+            crate::config::ProjectEntry {
+                slug: "ghost".into(),
+                path: tmp.path().join("nowhere"),
+                team: "dev".into(),
+                installed_at: Utc::now(),
+            },
+        )
+        .unwrap();
+        let out = collect_projects(&paths).unwrap();
+        assert!(out.is_empty(), "missing state.json is skipped, not fatal");
     }
 
     #[test]

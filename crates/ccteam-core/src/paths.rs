@@ -20,15 +20,27 @@ pub struct CcteamPaths {
 impl CcteamPaths {
     /// Resolve from the running user's home directory. Honors the
     /// `CCTEAM_HOME` and `CCTEAM_PROJECTS_ROOT` env vars for tests and
-    /// custom layouts.
+    /// custom layouts. V0.4.2 F73: when `CCTEAM_PROJECTS_ROOT` is not
+    /// set, fall back to `~/.ccteam/config.yaml::projects_root`
+    /// before defaulting to `$HOME/projects`.
     pub fn from_env() -> Result<Self> {
         let home = dirs::home_dir().ok_or_else(|| anyhow!("could not resolve home directory"))?;
         let root = std::env::var("CCTEAM_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| home.join(".ccteam"));
+        // Priority for projects_root:
+        //   1. CCTEAM_PROJECTS_ROOT env  (ad-hoc / test override)
+        //   2. ~/.ccteam/config.yaml::projects_root  (V0.4.2 F73 SoT)
+        //   3. $HOME/projects  (hardcoded fallback)
         let projects_root = std::env::var("CCTEAM_PROJECTS_ROOT")
+            .ok()
             .map(PathBuf::from)
-            .unwrap_or_else(|_| home.join("projects"));
+            .or_else(|| {
+                crate::config::load(&root)
+                    .ok()
+                    .and_then(|c| c.projects_root)
+            })
+            .unwrap_or_else(|| home.join("projects"));
         Ok(Self {
             root,
             projects_root,

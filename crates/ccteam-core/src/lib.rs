@@ -14,6 +14,8 @@ pub mod actions;
 // agent. See module docs + docs/v0-4-0/prd.md §6.2.
 pub mod artifact_watcher;
 pub mod auto_loop;
+// V0.4.2 F73 — `~/.ccteam/config.yaml` global config + projects registry.
+pub mod config;
 pub mod cost;
 pub mod daemon;
 pub mod harness;
@@ -48,6 +50,12 @@ pub use actions::{
     DecisionInput, SendOptions, SendResult,
 };
 pub use auto_loop::{AutoLoopDecision, AutoLoopFrontMatter, AutoLoopState};
+pub use config::{
+    append_project as append_project_to_config, config_path as ccteam_config_path,
+    load as load_ccteam_config, lookup_project as lookup_project_in_config,
+    remove_project as remove_project_from_config, save as save_ccteam_config,
+    upsert_project as upsert_project_in_config, CcteamConfig, ProjectEntry, CONFIG_FILENAME,
+};
 pub use cost::{classify as classify_cost, CostLevel, COST_MID_WARN_USD};
 pub use daemon::{
     check_health as check_daemon_health, check_health_at as check_daemon_health_at, heartbeat_path,
