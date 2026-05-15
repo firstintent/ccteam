@@ -10,9 +10,9 @@
 | 项 | 值 |
 |---|---|
 | 仓库根 | 本会话 `cwd` 即是;显式查用 `git rev-parse --show-toplevel` |
-| 主分支 main HEAD | **以 `git rev-parse origin/main` 为准**(V0.4.4 ship 后) |
-| Workspace version | **`0.4.4`**(V0.4.2 unified install + V0.4.3 slug-grammar + V0.4.4 F77 任意路径 hook + slug→path 中心化 hotfix) |
-| 测试 baseline | **`~705/0`**(`cargo test --workspace --locked` 排除已知 inotify flake + ccteam-web 端口绑定 flake;F64 `artifact_watcher_test` t02/t03/t05/t09 + F66 `orchestrator_thin_test` t01/t15 在 WSL inotify 资源受限的 host 上 hang,是 pre-existing 环境问题,不计入业务 failed) |
+| 主分支 main HEAD | **以 `git rev-parse origin/main` 为准**(V0.4.5 ship 后) |
+| Workspace version | **`0.4.5`**(V0.4.2 unified install + V0.4.3 slug-grammar + V0.4.4 F77 任意路径 hook + V0.4.5 F78 watcher 项目相对路径 + progress.jsonl 参数修复) |
+| 测试 baseline | **`707/0`**(`cargo test --workspace --locked` 仅剩 ccteam-web 端口绑定 flake 1 个;V0.4.5 F78 后 F64 `artifact_watcher_test` 全 10 个 + F66 `orchestrator_thin_test` 全 30 个都跑过,**不再需要 --skip** — 之前 hang 的根因是 orchestrator 把相对路径传给 inotify 在错位置 watch 引起的 backlog,不是 WSL 资源问题) |
 | Clippy | 9 pre-existing errors(非本轮引入,sweep 时确认相同基线) |
 | 代码规模 | ~15 kLOC Rust + ~12 kLOC TypeScript |
 | 已 ship 里程碑 | **V0.1-V0.3.2** 见各自 `docs/v0-X-Y/README.md`<br>**V0.4.0**:F60-F69(phase 全删 + workflow.yaml + artifact watcher + 17 MCP 工具 + thin orchestrator + WorkflowView SPA)<br>**V0.4.1**:UX 简化 patch(start 合并 web、send/spawn CLI、handle 干掉、daemon hot-reload、mcp 退出 deadlock fix)<br>**V0.4.2**:F72-F75 — `ccteam init` 三合一 + `~/.ccteam/config.yaml` 全局 SoT + `doctor --migrate-v041-to-v042` + `ccteam new` thin wrapper<br>**V0.4.3 hotfix**:F76 slug grammar validation + 优化 collision wording<br>**V0.4.4 hotfix**:F77 — `session_context_from_cwd` walk-up + `paths.project_dir(slug)` 走 config.yaml registry;V0.4.2 任意路径项目的 hooks / daemon / MCP 全部 SoT 化(202 个调用站点零改动跟进) |

@@ -231,10 +231,28 @@ impl Orchestrator {
         let project_dir = self.paths.project_dir(slug);
         let progress_path = self.paths.progress_jsonl(slug);
 
-        let spec = WorkflowSpec::load_for_project(&project_dir).map_err(|e| match e {
+        let mut spec = WorkflowSpec::load_for_project(&project_dir).map_err(|e| match e {
             WorkflowError::NotFound(p) => anyhow::anyhow!("workflow.yaml not found in {:?}", p),
             other => anyhow::anyhow!(other),
         })?;
+
+        // V0.4.5: workflow.yaml `watch:<rel>` paths are project-relative
+        // per PRD §6.1, but `ArtifactWatcher::new` (per its docstring)
+        // treats them literally. The previous version of this function
+        // passed the spec straight through, so the watcher installed
+        // inotify on `<daemon-cwd>/.ccteam/backlog/` (typically the
+        // ccteam repo) instead of `<project>/.ccteam/backlog/`. Writes
+        // inside the actual project went unnoticed and downstream
+        // `watch:` agents never triggered. Rewrite every relative
+        // Trigger::Watch path to absolute under project_dir before
+        // handing the spec to the watcher.
+        for (_role, agent) in spec.agents.iter_mut() {
+            if let Trigger::Watch(path) = &mut agent.trigger {
+                if !path.is_absolute() {
+                    *path = project_dir.join(&*path);
+                }
+            }
+        }
 
         progress::append_event(
             &progress_path,
@@ -246,7 +264,11 @@ impl Orchestrator {
             }),
         )?;
 
-        let (watcher, rx) = ArtifactWatcher::new(&spec, Some(project_dir.as_path()))?;
+        // V0.4.5: pass the progress.jsonl file (so the watcher can
+        // append `artifact_dir_created` events) — the previous version
+        // passed `project_dir` (a directory), which made
+        // `progress::append_event` fail with "open <project_dir>".
+        let (watcher, rx) = ArtifactWatcher::new(&spec, Some(progress_path.as_path()))?;
         let watcher_handle = watcher.start();
 
         self.dispatch_initial_triggers(slug, &spec).await?;
