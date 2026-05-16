@@ -518,6 +518,18 @@ fn tool_ls(paths: &CcteamPaths) -> Result<String> {
     let arr: Vec<Value> = projects
         .iter()
         .map(|p| {
+            // V0.4.6 F91 — cost_used_usd is now sourced from
+            // cost_summary (progress.jsonl-derived) rather than the
+            // frozen state field. F90 will surface the new
+            // cost_24h / cost_active fields here too; for now we
+            // keep the legacy `cost_used_usd` JSON key but populate
+            // it from `cost_total_usd` so the MCP shape is stable.
+            let cost = ccteam_core::cost_summary(
+                &p.state.slug,
+                &paths.progress_jsonl(&p.state.slug),
+                paths,
+            )
+            .unwrap_or_default();
             json!({
                 "slug": p.state.slug,
                 "team": p.state.team,
@@ -526,7 +538,9 @@ fn tool_ls(paths: &CcteamPaths) -> Result<String> {
                     ccteam_core::PhaseState::Idle => "idle",
                     ccteam_core::PhaseState::Done => "done",
                 },
-                "cost_used_usd": p.state.cost_used_usd,
+                "cost_used_usd": cost.cost_total_usd,
+                "cost_24h_usd": cost.cost_24h_usd,
+                "cost_active_usd": cost.cost_active_usd,
                 "tmux_session": p.state.tmux_session,
                 "age_seconds": p.age_seconds,
             })

@@ -147,6 +147,21 @@ pub struct ProjectState {
         skip_serializing_if = "is_zero_u32"
     )]
     pub auto_loop_cycle_count: u32,
+    /// V0.4.6 F91 — frozen cost accumulator. Pre-F91 this was bumped
+    /// by `Hook::CostAccumulate` (PostToolUse) and the F80 orchestrator
+    /// cleanup. F91 retired both write paths; the new SoT is
+    /// `cost_summary(slug, &progress_path, &paths)` which reads
+    /// `progress.jsonl::agent_done::cost_usd` (historical) plus each
+    /// open spawn's `~/.claude/jobs/<id>/state.json::cost_usd_total`
+    /// (live). The field stays for serde compat — `#[serde(default)]`
+    /// lets old state.json files load — but new writes never mutate it,
+    /// so values frozen at the moment of F91 ship will linger until
+    /// V0.5 drops the field entirely. Do **NOT** read this for cost in
+    /// new code; use [`crate::CostSummary`] / `cost_summary` instead.
+    #[deprecated(
+        note = "V0.4.6 F91: replaced by `cost_summary(...)`; field frozen pending V0.5 removal"
+    )]
+    #[serde(default)]
     pub cost_used_usd: f64,
     pub soft_warn_threshold_usd: f64,
     pub hard_kill_threshold_usd: f64,
@@ -199,6 +214,12 @@ impl ProjectState {
     /// through to state.json.
     pub fn initial_for_team(slug: String, team: String) -> Self {
         let now = Utc::now();
+        // V0.4.6 F91 — `cost_used_usd` is deprecated but still required
+        // by the struct literal. We initialize it to 0.0 (never bumped
+        // post-F91) and silence the deprecation warning at the single
+        // initialization site; readers go through `cost_summary` per
+        // the deprecation note.
+        #[allow(deprecated)]
         Self {
             tmux_session: format!("ccteam-{slug}"),
             slug,

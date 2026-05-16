@@ -129,7 +129,10 @@ pub fn load_config(paths: &CcteamPaths) -> Result<WatchdogConfig> {
             }
         }
         Err(err) => {
-            tracing::warn!(?err, "config.yaml load failed; falling back to watchdog.yaml");
+            tracing::warn!(
+                ?err,
+                "config.yaml load failed; falling back to watchdog.yaml"
+            );
         }
     }
     let path = config_path(paths);
@@ -350,19 +353,24 @@ fn scan_project(
         return Ok(());
     };
 
-    // Cost overrun (signal 3a) — emit unconditionally; `filter`
-    // applies the threshold.
+    // V0.4.6 F91 — cost overrun reads `cost_total_usd` from
+    // `cost_summary` (sourced from progress.jsonl + live state.json)
+    // instead of the now-frozen `state.cost_used_usd`. `filter` still
+    // applies the threshold; only the source changes.
+    let cost_total_usd = crate::queries::cost_summary(slug, &paths.progress_jsonl(slug), paths)
+        .map(|c| c.cost_total_usd)
+        .unwrap_or(0.0);
     alerts.push(WatchdogAlert {
         kind: AlertKind::CostOverrun,
         slug: Some(slug.to_string()),
         message: format!(
             "project `{slug}` cost_used_usd = {:.2} (phase `{}`)",
-            state.cost_used_usd,
+            cost_total_usd,
             display_phase(&state.current_phase),
         ),
         emitted_at: now_utc,
         details: serde_json::json!({
-            "cost_used_usd": state.cost_used_usd,
+            "cost_used_usd": cost_total_usd,
             "phase": state.current_phase,
             "team": state.team,
         }),
@@ -462,10 +470,7 @@ fn keep(alert: &WatchdogAlert, config: &WatchdogConfig) -> bool {
 /// `NeedsAttention` (the user has to see them) and `Progress` for the
 /// softer `AutoLoopCycle` / `PhaseDurationOverrun` (they describe state,
 /// no action mandated).
-pub fn push_alert_to_meta_outbox(
-    paths: &CcteamPaths,
-    alert: &WatchdogAlert,
-) -> Result<PathBuf> {
+pub fn push_alert_to_meta_outbox(paths: &CcteamPaths, alert: &WatchdogAlert) -> Result<PathBuf> {
     let slug = meta_slug();
     let outbox_dir = paths.project_ccteam_dir(&slug).join("outbox");
     std::fs::create_dir_all(&outbox_dir)
@@ -580,6 +585,29 @@ mod tests {
         let mut s = ProjectState::initial(slug.to_string());
         mutate(&mut s);
         s.save(&p.project_state(slug)).unwrap();
+    }
+
+    /// V0.4.6 F91 — write a synthetic `agent_done` event into the
+    /// project's `progress.jsonl` so `cost_summary` reports the given
+    /// cost. Pre-F91 these tests used `state.cost_used_usd` for the
+    /// same purpose; the watchdog now sources cost from progress
+    /// events, matching the production SoT.
+    fn write_cost_event(p: &CcteamPaths, slug: &str, cost_usd: f64) {
+        let path = p.progress_jsonl(slug);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        crate::progress::append_event(
+            &path,
+            &serde_json::json!({
+                "event": "agent_done",
+                "session_id": format!("{slug}-cost-fixture"),
+                "role": "fixture",
+                "status": "completed",
+                "cost_usd": cost_usd,
+                "slug": slug,
+                "ts": chrono::Utc::now().to_rfc3339(),
+            }),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -724,9 +752,12 @@ mod tests {
         crate::daemon::write_heartbeat(&p).unwrap();
         let slug = "dev-z";
         write_state(&p, slug, |s| {
-            s.cost_used_usd = 50.0;
             s.current_phase = "implement".into();
         });
+        // V0.4.6 F91 — watchdog reads cost via `cost_summary`
+        // (progress.jsonl-derived). Pre-F91 this test set
+        // `state.cost_used_usd = 50.0`; same shape now via the event.
+        write_cost_event(&p, slug, 50.0);
         let alp = auto_loop::path_in(&p.project_dir(slug));
         let mut als = AutoLoopState::new(slug.into(), "fix".into(), 3, "DONE".into());
         als.front.iteration = 3;
@@ -747,7 +778,10 @@ mod tests {
         let p = paths(&tmp);
         crate::daemon::write_heartbeat(&p).unwrap();
         let slug = "dev-cheap";
-        write_state(&p, slug, |s| s.cost_used_usd = 5.0);
+        write_state(&p, slug, |_| {});
+        // V0.4.6 F91 — write the cost event ($5.00) so cost_summary
+        // surfaces it; pre-F91 this used state.cost_used_usd = 5.0.
+        write_cost_event(&p, slug, 5.0);
         // No threshold ⇒ no alert.
         let cfg = WatchdogConfig::default();
         let alerts = scan(&p, &cfg).unwrap();

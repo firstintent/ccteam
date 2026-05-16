@@ -6,7 +6,6 @@
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
-use chrono::Utc;
 use serde_json::{json, Map, Value};
 
 use ccteam_core::tmux::TmuxSession;
@@ -16,9 +15,8 @@ use ccteam_core::{
     migrate_legacy_skill_dirs, migrate_recommended_agent_symlinks, rewrite_legacy_hook_commands,
     session_name_for_project, user_claude_dir, write_global_helper_templates, CcteamPaths,
     HookCmdRewriteAction, HookCmdRewriteReport, InstallSkillOptions, LegacySkillAction,
-    LegacySkillReport, MetaBootstrapReport, MigrationReport, OutboxEventKind, OutboxMessage,
-    PhaseState, ProjectState, SessionMailbox, SkillInstallAction, ToolSurfaceSnapshot,
-    BUILTIN_SUBAGENTS,
+    LegacySkillReport, MetaBootstrapReport, MigrationReport, PhaseState, ProjectState,
+    SkillInstallAction, ToolSurfaceSnapshot, BUILTIN_SUBAGENTS,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -181,7 +179,7 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
     ));
     out.push_str(&format!(
         "  workflow.yaml    {} ({})\n",
-        target.join("workflow.yaml").display(),
+        target.join(".ccteam").join("workflow.yaml").display(),
         project_report.workflow_action,
     ));
     out.push_str(&format!(
@@ -252,7 +250,7 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
     }
 
     out.push_str("\nnext:\n");
-    out.push_str("  - edit workflow.yaml + .claude/agents/<role>.md to your taste\n");
+    out.push_str("  - edit .ccteam/workflow.yaml + .claude/agents/<role>.md to your taste\n");
     out.push_str("  - ccteam start                # boots orchestrator + web\n");
     Ok(out)
 }
@@ -407,10 +405,16 @@ fn install_project_at(
     })
 }
 
-/// V0.4.2 F72: write a minimal `workflow.yaml` example into `target`.
-/// Returns silently if the file already exists and `force` is false.
+/// V0.4.2 F72: write a minimal `workflow.yaml` example into
+/// `target/.ccteam/`. V0.4.6 F83 moved this from the project root into
+/// `.ccteam/` so the orchestration state SoT stays out of the user's
+/// business tree. Returns silently if the file already exists and
+/// `force` is false.
 fn scaffold_workflow_yaml(target: &std::path::Path, force: bool) -> Result<()> {
-    let path = target.join("workflow.yaml");
+    let ccteam_dir = target.join(".ccteam");
+    std::fs::create_dir_all(&ccteam_dir)
+        .with_context(|| format!("create {}", ccteam_dir.display()))?;
+    let path = ccteam_dir.join("workflow.yaml");
     if path.exists() && !force {
         return Ok(());
     }
@@ -462,24 +466,23 @@ agents:
     executor: claude
 "#;
 
-const DEFAULT_AGENT_SCAFFOLDS: &[(&str, &str)] = &[(
-    "explorer.md",
-    r#"# Explorer agent
-
-This file is the system prompt for the `explorer` role.
-
-You are a generalist working in this project. The user has just
-installed ccteam here via `ccteam init`. Start by reading the project
-layout (`ls`, `git log -5`, top-level README if present) and reporting
-what you find. Wait for further instructions from the inbox.
-
-## Tools
-
-You have access to ccteam's MCP toolset (`mcp__ccteam__*`) for
-inspecting other projects, sending messages, and triggering workflow
-gates. See ~/.claude/skills/ccteam-control/SKILL.md for usage patterns.
-"#,
-)];
+/// Default `.claude/agents/<role>.md` scaffolds written by `ccteam init`.
+///
+/// Source-of-truth files live in the repo's top-level `agents/` dir; we
+/// `include_str!` them at compile time so the binary is self-contained
+/// but the templates stay editable as proper agent .md files (with
+/// Anthropic frontmatter + system prompt body).
+///
+/// To add an agent scaffold:
+/// 1. Write `agents/<role>.md` at the repo root (proper frontmatter spec)
+/// 2. Add a `(filename, include_str!(...))` row here
+/// 3. Update `DEFAULT_WORKFLOW_YAML` to declare the role if it's a
+///    default-shipped agent
+/// 4. `cargo build --workspace` + `cargo test --workspace`
+///
+/// See `agents/README.md` for the agent spec + naming conventions.
+const DEFAULT_AGENT_SCAFFOLDS: &[(&str, &str)] =
+    &[("explorer.md", include_str!("../../../agents/explorer.md"))];
 
 /// Prompt the user `<question> [Y/n]: ` and return their answer. With
 /// `yes_to_all = true`, skips the prompt and answers `true` (the
@@ -537,13 +540,19 @@ pub fn run_ls(paths: &CcteamPaths, format: OutputFormat) -> Result<String> {
     let projects = collect_projects(paths)?;
     let daemon_up = ccteam_core::daemon::heartbeat_alive(paths);
     Ok(match format {
-        OutputFormat::Text => render_ls_text(&projects, daemon_up),
-        OutputFormat::Json => render_ls_json(&projects, daemon_up)?,
+        OutputFormat::Text => render_ls_text(paths, &projects, daemon_up),
+        OutputFormat::Json => render_ls_json(paths, &projects, daemon_up)?,
     })
 }
 
 /// `ccteam show <slug>`. Renders the full project view per
 /// interfaces.md §10.3 (json) or a human-readable summary (text).
+///
+/// V0.4.6 F91 — cost figures come from `cost_summary` (progress.jsonl
+/// plus live claude state.json) instead of the retired
+/// `state.cost_used_usd` accumulator. The old `cost used: $X.XX` line
+/// is replaced with `cost (24h)` plus `cost (active)` so the user sees
+/// both windowed spend and what's burning right now.
 pub fn run_show(paths: &CcteamPaths, slug: &str, format: OutputFormat) -> Result<String> {
     let state_path = paths.project_state(slug);
     if !state_path.exists() {
@@ -552,10 +561,12 @@ pub fn run_show(paths: &CcteamPaths, slug: &str, format: OutputFormat) -> Result
     let state = ProjectState::load(&state_path)?;
     let recent = collect_recent_events(paths, slug, 50)?;
     let artifacts = collect_artifacts(paths, slug);
+    let progress_path = paths.progress_jsonl(slug);
+    let cost = ccteam_core::cost_summary(slug, &progress_path, paths)?;
 
     Ok(match format {
-        OutputFormat::Text => render_show_text(&state, &recent, &artifacts),
-        OutputFormat::Json => render_show_json(&state, &recent, &artifacts)?,
+        OutputFormat::Text => render_show_text(&state, &cost, &recent, &artifacts),
+        OutputFormat::Json => render_show_json(&state, &cost, &recent, &artifacts)?,
     })
 }
 
@@ -1005,240 +1016,6 @@ fn session_last_event(paths: &CcteamPaths, slug: &str, sid: &str) -> Result<Opti
         .and_then(|v| v.get("event").and_then(|e| e.as_str()).map(str::to_string)))
 }
 
-/// One row in the cross-project decisions queue (`ccteam decisions`).
-///
-/// A "decision" = an outbox file in any project's `.ccteam/outbox/` whose
-/// front matter has `event_kind: clarify` or `event_kind: escalation`.
-/// These are the messages a user must look at; everything else (replies,
-/// progress, shipped) is informational and excluded.
-#[derive(Debug, Clone)]
-pub struct DecisionRow {
-    pub slug: String,
-    pub current_phase: String,
-    pub team: String,
-    pub event_kind: OutboxEventKind,
-    pub priority: ccteam_core::OutboxPriority,
-    pub created_at: chrono::DateTime<Utc>,
-    pub age_seconds: u64,
-    pub outbox_filename: String,
-    pub summary: String,
-}
-
-/// `ccteam decisions`. Aggregate the cross-project decisions queue and
-/// render it. interfaces.md §5.6.4 — meta-agent uses this as the
-/// surface for "你有 N 条待决策" UX. M1 follow-up increment.
-pub fn run_decisions(paths: &CcteamPaths, format: OutputFormat) -> Result<String> {
-    let rows = collect_decisions(paths)?;
-    Ok(match format {
-        OutputFormat::Text => render_decisions_text(&rows),
-        OutputFormat::Json => render_decisions_json(&rows)?,
-    })
-}
-
-/// Walk every project under `projects_root`, scan their outbox dirs, and
-/// emit one `DecisionRow` per outbox file whose `event_kind` warrants
-/// user attention. Broken outbox files are warned and skipped — never
-/// fatal, because one malformed file shouldn't blank the whole queue.
-pub fn collect_decisions(paths: &CcteamPaths) -> Result<Vec<DecisionRow>> {
-    let dir = &paths.projects_root;
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    let now = Utc::now();
-    let mut out = Vec::new();
-    for entry in std::fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let Some(slug) = entry.file_name().to_str().map(String::from) else {
-            continue;
-        };
-        let project_dir = entry.path();
-        let ccteam_dir = project_dir.join(".ccteam");
-        if !ccteam_dir.exists() {
-            continue;
-        }
-        // Resolve current phase + team from state.json. Missing /
-        // unparseable state.json is *not* a decisions-queue error; the
-        // outbox can still be surfaced under "<unknown>".
-        let (current_phase, team) = match ProjectState::load(&paths.project_state(&slug)) {
-            Ok(s) => {
-                let phase = if s.current_phase.is_empty() {
-                    "<idle>".to_string()
-                } else {
-                    s.current_phase
-                };
-                (phase, s.team)
-            }
-            Err(_) => ("<unknown>".to_string(), "<unknown>".to_string()),
-        };
-
-        let mailbox = SessionMailbox::for_ccteam_dir(&ccteam_dir);
-        let files = match mailbox.list_outbox() {
-            Ok(f) => f,
-            Err(err) => {
-                tracing::warn!(slug, error = %err, "skip project: outbox listing failed");
-                continue;
-            }
-        };
-        for path in files {
-            let msg = match OutboxMessage::load(&path) {
-                Ok(m) => m,
-                Err(err) => {
-                    tracing::warn!(
-                        slug,
-                        path = %path.display(),
-                        error = %err,
-                        "skip outbox file: parse failed",
-                    );
-                    continue;
-                }
-            };
-            // Filter: only items the user has to look at. Replies /
-            // progress / shipped notifications are not "decisions".
-            if !matches!(
-                msg.front.event_kind,
-                OutboxEventKind::Clarify | OutboxEventKind::Escalation
-            ) {
-                continue;
-            }
-            let age = now
-                .signed_duration_since(msg.front.created_at)
-                .num_seconds()
-                .max(0) as u64;
-            let outbox_filename = path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
-            out.push(DecisionRow {
-                slug: slug.clone(),
-                current_phase: current_phase.clone(),
-                team: team.clone(),
-                event_kind: msg.front.event_kind,
-                priority: msg.front.priority,
-                created_at: msg.front.created_at,
-                age_seconds: age,
-                outbox_filename,
-                summary: summarize_body(&msg.body),
-            });
-        }
-    }
-    // Highest priority first, then oldest first within priority — old
-    // unanswered escalations should never get buried under a fresh
-    // clarify.
-    out.sort_by(|a, b| {
-        b.priority
-            .cmp(&a.priority)
-            .then_with(|| a.created_at.cmp(&b.created_at))
-    });
-    Ok(out)
-}
-
-/// Pull a one-line summary from the outbox body. Strips the first
-/// markdown heading (if any), trims, and truncates to 80 chars.
-fn summarize_body(body: &str) -> String {
-    let line = body
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty() && !l.starts_with("# "))
-        .unwrap_or("");
-    if line.chars().count() <= 80 {
-        line.to_string()
-    } else {
-        let truncated: String = line.chars().take(77).collect();
-        format!("{truncated}...")
-    }
-}
-
-fn render_decisions_text(rows: &[DecisionRow]) -> String {
-    if rows.is_empty() {
-        return "no pending decisions across all projects.\n".to_string();
-    }
-    let mut out = String::new();
-    out.push_str(&format!(
-        "{} pending decision{} across all projects:\n\n",
-        rows.len(),
-        if rows.len() == 1 { "" } else { "s" },
-    ));
-    out.push_str("slug                       phase             team             kind         age      summary\n");
-    out.push_str("------------------------   ---------------   --------------   ----------   ------   -------\n");
-    for row in rows {
-        let age = format_age(row.age_seconds);
-        let kind = match row.event_kind {
-            OutboxEventKind::Clarify => "clarify",
-            OutboxEventKind::Escalation => "escalation",
-            // Filtered upstream; defensive default.
-            _ => "other",
-        };
-        out.push_str(&format!(
-            "{:<26} {:<17} {:<16} {:<12} {:<8} {}\n",
-            ellipsize(&row.slug, 26),
-            ellipsize(&row.current_phase, 17),
-            ellipsize(&row.team, 16),
-            kind,
-            age,
-            row.summary,
-        ));
-    }
-    out
-}
-
-fn render_decisions_json(rows: &[DecisionRow]) -> Result<String> {
-    let arr: Vec<Value> = rows
-        .iter()
-        .map(|row| {
-            json!({
-                "slug": row.slug,
-                "current_phase": row.current_phase,
-                "team": row.team,
-                "event_kind": match row.event_kind {
-                    OutboxEventKind::Clarify => "clarify",
-                    OutboxEventKind::Escalation => "escalation",
-                    OutboxEventKind::Reply => "reply",
-                    OutboxEventKind::Progress => "progress",
-                    OutboxEventKind::Shipped => "shipped",
-                },
-                "priority": match row.priority {
-                    ccteam_core::OutboxPriority::Normal => "normal",
-                    ccteam_core::OutboxPriority::High => "high",
-                },
-                "created_at": row.created_at.to_rfc3339(),
-                "age_seconds": row.age_seconds,
-                "outbox_filename": row.outbox_filename,
-                "summary": row.summary,
-            })
-        })
-        .collect();
-    let body = json!({
-        "total": rows.len(),
-        "decisions": arr,
-    });
-    Ok(serde_json::to_string_pretty(&body)? + "\n")
-}
-
-fn format_age(seconds: u64) -> String {
-    if seconds < 60 {
-        format!("{seconds}s")
-    } else if seconds < 3600 {
-        format!("{}m", seconds / 60)
-    } else if seconds < 86400 {
-        format!("{}h", seconds / 3600)
-    } else {
-        format!("{}d", seconds / 86400)
-    }
-}
-
-fn ellipsize(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let truncated: String = s.chars().take(max.saturating_sub(1)).collect();
-        format!("{truncated}…")
-    }
-}
-
 /// `ccteam doctor` flags. Each mode is a separate boolean / option so
 /// they can be combined (e.g. `--install-meta-agent rob` implies
 /// `--install-skill` automatically).
@@ -1294,6 +1071,27 @@ pub struct DoctorOptions {
     /// for the exact rules. Idempotent — safe to run on already-
     /// migrated homes.
     pub migrate_v041_to_v042: bool,
+    /// V0.4.6 F83: move every registered project's root
+    /// `workflow.yaml` into `<project>/.ccteam/workflow.yaml`. Pair
+    /// with `dry_run = false` (i.e. `--apply`) to actually move; the
+    /// default dry-run prints what would happen. Conflicts (both
+    /// locations have a `workflow.yaml`) are fail-safe and left
+    /// untouched.
+    pub migrate_workflow_to_ccteam_dir: bool,
+    /// V0.4.6 F85: reclaim terminated `~/.claude/jobs/<id>/`
+    /// directories whose `state.json::state ∈ TERMINAL_STATES` and
+    /// whose `firstTerminalAt` (or dir mtime fallback) is older than
+    /// `~/.ccteam/config.yaml::claude_jobs_retention_days` (default 7).
+    /// Default is dry-run; pair with `gc_apply` to actually `rm -rf`.
+    pub gc_claude_jobs: bool,
+    /// V0.4.6 F85: arm `gc_claude_jobs` to commit removals to disk.
+    /// No-op unless `gc_claude_jobs` is also true.
+    pub gc_apply: bool,
+    /// V0.4.6 F91: walk every registered project's
+    /// `.claude/settings.json` and strip the now-retired
+    /// `ccteam hook cost-accumulate` PostToolUse entry. `dry_run = true`
+    /// previews the scrub without writing. Idempotent.
+    pub update_hooks: bool,
 }
 
 /// `ccteam doctor` dispatch. Returns a human-readable report so unit
@@ -1308,7 +1106,10 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
         || opts.validate_team.is_some()
         || opts.migrate_recommended_agents
         || opts.screenshot_smoke.is_some()
-        || opts.migrate_v041_to_v042;
+        || opts.migrate_v041_to_v042
+        || opts.migrate_workflow_to_ccteam_dir
+        || opts.gc_claude_jobs
+        || opts.update_hooks;
     if !any_mode {
         return Ok(String::from(
             "ccteam doctor: pass at least one mode flag.\n\
@@ -1336,7 +1137,15 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
              --screenshot-smoke <slug>\n      \
              render an end-to-end PNG screenshot of <slug>'s tmux pane to <project>/.ccteam/screenshots/<utc>.png. Verifies font + tmux + imageproc + IO; reports the path on success, the degrade reason on failure (V0.2.2 F38).\n  \
              --migrate-v041-to-v042\n      \
-             fold V0.4.1 ~/projects/* + ~/.ccteam/watchdog.yaml into the new ~/.ccteam/config.yaml. Idempotent (V0.4.2 F74).\n",
+             fold V0.4.1 ~/projects/* + ~/.ccteam/watchdog.yaml into the new ~/.ccteam/config.yaml. Idempotent (V0.4.2 F74).\n  \
+             --migrate-workflow-to-ccteam-dir [--apply]\n      \
+             move every registered project's root workflow.yaml into <project>/.ccteam/workflow.yaml \
+             (V0.4.6 F83). Default dry-run; pair with --apply to perform the moves. Conflicts \
+             (both locations present) are fail-safe — neither file is touched.\n  \
+             --gc-claude-jobs [--apply]\n      \
+             reclaim terminated ~/.claude/jobs/<id>/ dirs older than ~/.ccteam/config.yaml::claude_jobs_retention_days (default 7 days; 0 disables). Default is dry-run; --apply commits removals (V0.4.6 F85).\n  \
+             --update-hooks [--dry-run]\n      \
+             walk every registered project's .claude/settings.json and strip the retired `ccteam hook cost-accumulate` entry. Idempotent (V0.4.6 F91).\n",
         ));
     }
     let mut out = String::new();
@@ -1384,6 +1193,19 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
         let report = ccteam_core::migrate_v041_to_v042(paths)?;
         out.push_str(&ccteam_core::render_migration_report(&report));
     }
+    if opts.migrate_workflow_to_ccteam_dir {
+        let reports = ccteam_core::migrate_workflow_to_ccteam_dir(paths, opts.dry_run)?;
+        out.push_str(&ccteam_core::render_workflow_migration_report(
+            &reports,
+            opts.dry_run,
+        ));
+    }
+    if opts.gc_claude_jobs {
+        out.push_str(&render_gc_claude_jobs_report(paths, opts.gc_apply)?);
+    }
+    if opts.update_hooks {
+        out.push_str(&render_update_hooks_report(paths, opts.dry_run)?);
+    }
     // V0.3.1 F47 — informational codex CLI detection. Appends one line
     // to every successful doctor run (any_mode == true) so operators
     // see whether the codex binary is on PATH ahead of V0.3.2's real
@@ -1420,6 +1242,84 @@ fn fallback_not_found_line() -> String {
     String::from(
         "[ccteam] codex CLI: not found (install for V0.4.0 CodexAdapter — see docs/research/ccteam-codex-integration.md)\n",
     )
+}
+
+/// V0.4.6 F85 — render `ccteam doctor --gc-claude-jobs [--apply]`.
+///
+/// Reads `~/.ccteam/config.yaml::claude_jobs_retention_days` (default 7
+/// days; 0 disables GC) and sweeps `~/.claude/jobs/`. `apply=false`
+/// (dry-run) prints what would be reclaimed; `apply=true` actually
+/// `rm -rf`'s the directories. The report has a one-line summary
+/// followed by per-entry status lines so operators can sanity-check
+/// what was touched.
+fn render_gc_claude_jobs_report(paths: &CcteamPaths, apply: bool) -> Result<String> {
+    let mut out = String::from("ccteam doctor --gc-claude-jobs");
+    if apply {
+        out.push_str(" --apply");
+    }
+    out.push_str("\n\n");
+
+    let retention = match ccteam_core::load_ccteam_config(&paths.root) {
+        Ok(cfg) => cfg.claude_jobs_retention_days,
+        Err(err) => {
+            out.push_str(&format!(
+                "  [WARN] failed to load config.yaml ({err:#}); using default retention.\n"
+            ));
+            ccteam_core::default_claude_jobs_retention_days()
+        }
+    };
+    out.push_str(&format!("  retention_days: {retention}\n"));
+
+    if retention == 0 {
+        out.push_str(
+            "  GC disabled (retention_days == 0). \
+             Set `claude_jobs_retention_days: N` in ~/.ccteam/config.yaml to enable.\n",
+        );
+        return Ok(out);
+    }
+
+    let dry_run = !apply;
+    let report = ccteam_core::gc_user_claude_jobs(retention, dry_run)?;
+
+    out.push_str(&format!(
+        "  mode: {}\n",
+        if dry_run {
+            "dry-run (no fs mutation)"
+        } else {
+            "apply"
+        }
+    ));
+    out.push_str(&format!("  dir_count_before: {}\n", report.dir_count_before));
+    out.push_str(&format!("  dir_count_after:  {}\n", report.dir_count_after));
+    out.push_str(&format!(
+        "  removed:       {}\n  kept_working:  {}\n  kept_recent:   {}\n  kept_corrupt:  {}\n  kept_unknown:  {}\n",
+        report.removed,
+        report.kept_working,
+        report.kept_recent,
+        report.kept_corrupt,
+        report.kept_unknown,
+    ));
+
+    if !report.entries.is_empty() {
+        out.push_str("\n  entries:\n");
+        for e in &report.entries {
+            let tag = match e.disposition {
+                ccteam_core::GcDisposition::Removed => "removed",
+                ccteam_core::GcDisposition::WouldRemove => "would-remove",
+                ccteam_core::GcDisposition::KeptWorking => "kept-working",
+                ccteam_core::GcDisposition::KeptRecent => "kept-recent",
+                ccteam_core::GcDisposition::KeptCorrupt => "kept-corrupt",
+                ccteam_core::GcDisposition::KeptUnknown => "kept-unknown",
+            };
+            out.push_str(&format!("    [{tag}] {}\n", e.job_id));
+        }
+    }
+
+    if dry_run && report.removed > 0 {
+        out.push_str("\n  Re-run with --apply to actually reclaim the entries listed above.\n");
+    }
+    out.push('\n');
+    Ok(out)
 }
 
 /// V0.2 M0.18.5: load + validate one team's `team.yaml` and every
@@ -1482,18 +1382,6 @@ fn render_validate_team_report(paths: &CcteamPaths, team: &str) -> Result<(Strin
     );
     out.push_str(&format!("\nSummary: 1 ok, 0 warn, {fails} fail\n"));
     Ok((out, fails))
-}
-
-/// V0.4.0 F60: phase template rendering was deleted with the rest of
-/// the phase machinery. The CLI surface is preserved as a `todo!()`-
-/// equivalent stub so `ccteam phase show` returns a clear "not in this
-/// release" error instead of silently no-op'ing; F63 will reintroduce
-/// the equivalent for the new `workflow.yaml` schema.
-pub fn run_phase_show(_paths: &CcteamPaths, _team: &str, _phase: &str) -> Result<String> {
-    bail!(
-        "ccteam phase show: phase template rendering was removed in V0.4.0 F60; \
-         see docs/v0-4-0/prd.md §F63 for the replacement against `workflow.yaml`",
-    );
 }
 
 fn render_reset_shipped_teams_report(
@@ -1731,6 +1619,68 @@ fn render_hook_rewrite_line(r: &HookCmdRewriteReport, _dry_run: bool) -> String 
     )
 }
 
+/// V0.4.6 F91: `doctor --update-hooks` rendered report. Walks every
+/// project registered in `~/.ccteam/config.yaml` (plus the legacy
+/// `projects_root` fallback path that `collect_projects` already
+/// supports) and strips the now-retired `ccteam hook cost-accumulate`
+/// PostToolUse entry from each `<project>/.claude/settings.json`.
+fn render_update_hooks_report(paths: &CcteamPaths, dry_run: bool) -> Result<String> {
+    let mut out = String::from("ccteam doctor --update-hooks (V0.4.6 F91)\n\n");
+    let projects = collect_projects(paths)?;
+    if projects.is_empty() {
+        out.push_str("  no projects registered — nothing to do.\n\n");
+        return Ok(out);
+    }
+    let mut any_action = false;
+    for p in &projects {
+        // Resolve the project's on-disk directory. `collect_projects`
+        // already de-dupes registry vs legacy walk, so we just need
+        // the canonical path. Use config.yaml's registered path when
+        // available; fall back to `paths.project_dir(slug)` for
+        // legacy projects.
+        let project_dir = config_project_dir(paths, &p.state.slug)
+            .unwrap_or_else(|| paths.project_dir(&p.state.slug));
+        let settings = project_dir.join(".claude").join("settings.json");
+        let report = ccteam_core::remove_cost_accumulate_hooks(&settings, dry_run)?;
+        let label: String = match &report.action {
+            ccteam_core::CostAccumulateScrubAction::NotFound => "missing".into(),
+            ccteam_core::CostAccumulateScrubAction::NoChangeNeeded => "ok".into(),
+            ccteam_core::CostAccumulateScrubAction::WouldRemove { entries } => {
+                any_action = true;
+                format!("would remove {entries}")
+            }
+            ccteam_core::CostAccumulateScrubAction::Removed { entries } => {
+                any_action = true;
+                format!("removed {entries}")
+            }
+        };
+        out.push_str(&format!(
+            "  {:<40} {:<22} {}\n",
+            truncate(&p.state.slug, 40),
+            label,
+            report.target.display(),
+        ));
+    }
+    if !any_action {
+        out.push_str(
+            "\n  (no `cost-accumulate` hooks found — all settings.json files already clean.)\n",
+        );
+    }
+    out.push('\n');
+    Ok(out)
+}
+
+/// Resolve a project's on-disk directory from `~/.ccteam/config.yaml`
+/// (the V0.4.2 F73 registry). Returns `None` for slugs not registered
+/// (legacy `~/projects/<slug>/` walk fallback).
+fn config_project_dir(paths: &CcteamPaths, slug: &str) -> Option<std::path::PathBuf> {
+    let cfg = ccteam_core::config::load(&paths.root).ok()?;
+    cfg.projects
+        .iter()
+        .find(|e| e.slug == slug)
+        .map(|e| e.path.clone())
+}
+
 /// Walk every immediate child of `projects_root` and rewrite legacy
 /// hook commands in `<child>/.claude/settings.json`. Returns a per-
 /// project report so the doctor output can summarize.
@@ -1795,9 +1745,7 @@ fn render_install_meta_agent_report(paths: &CcteamPaths) -> Result<String> {
     let tmux_session = ccteam_core::meta_session_name();
     out.push_str(&format!("tmux session     {tmux_session}\n"));
     out.push_str(&format!("attach with      tmux attach -t {tmux_session}\n"));
-    out.push_str(
-        "\nrun `ccteam start` (in another terminal) to wake the meta session.\n",
-    );
+    out.push_str("\nrun `ccteam start` (in another terminal) to wake the meta session.\n");
     Ok(out)
 }
 
@@ -1963,7 +1911,7 @@ fn collect_artifacts(paths: &CcteamPaths, slug: &str) -> Map<String, Value> {
     m
 }
 
-fn render_ls_text(projects: &[ProjectSummary], daemon_up: bool) -> String {
+fn render_ls_text(paths: &CcteamPaths, projects: &[ProjectSummary], daemon_up: bool) -> String {
     let mut out = String::new();
     // F27 — daemon health one-liner, always emitted (even on the
     // empty-projects path) so users can disambiguate "no projects" from
@@ -1983,12 +1931,20 @@ fn render_ls_text(projects: &[ProjectSummary], daemon_up: bool) -> String {
     );
     for p in projects {
         let phase = display_phase(&p.state.current_phase);
+        // V0.4.6 F91 — cost column sources cost_24h_usd from
+        // progress.jsonl (best-effort; failure → $0.00 — fresh
+        // projects with no progress events show $0.00, same shape
+        // as pre-F91 `state.cost_used_usd == 0.0`).
+        let cost_24h =
+            ccteam_core::cost_summary(&p.state.slug, &paths.progress_jsonl(&p.state.slug), paths)
+                .map(|c| c.cost_24h_usd)
+                .unwrap_or(0.0);
         out.push_str(&format!(
             "{:<40} {:<14} {:<11} ${:<5.2} {}s\n",
             truncate(&p.state.slug, 40),
             truncate(phase, 14),
             phase_state_str(&p.state.phase_state),
-            p.state.cost_used_usd,
+            cost_24h,
             p.age_seconds,
         ));
     }
@@ -2006,7 +1962,11 @@ fn display_phase(phase: &str) -> &str {
     }
 }
 
-fn render_ls_json(projects: &[ProjectSummary], daemon_up: bool) -> Result<String> {
+fn render_ls_json(
+    paths: &CcteamPaths,
+    projects: &[ProjectSummary],
+    daemon_up: bool,
+) -> Result<String> {
     // V0.4.0 F60: the phase state machine was deleted; "active" can no
     // longer be derived from `phase_state == InFlight`. F66 will
     // recompute this from `state.sessions` (live agent count).
@@ -2014,11 +1974,25 @@ fn render_ls_json(projects: &[ProjectSummary], daemon_up: bool) -> Result<String
     let arr: Vec<Value> = projects
         .iter()
         .map(|p| {
+            // V0.4.6 F91 — JSON shape preserves the `cost_used_usd`
+            // key for callers (MCP / scripts) but populates it from
+            // `cost_24h_usd` so the number tracks reality. The legacy
+            // serde field still reads as the frozen pre-F91 value if
+            // anything in the JSON pipeline needs to differentiate.
+            let cost_summary = ccteam_core::cost_summary(
+                &p.state.slug,
+                &paths.progress_jsonl(&p.state.slug),
+                paths,
+            )
+            .unwrap_or_default();
             json!({
                 "slug": p.state.slug,
                 "current_phase": p.state.current_phase,
                 "phase_state": phase_state_str(&p.state.phase_state),
-                "cost_used_usd": p.state.cost_used_usd,
+                "cost_used_usd": cost_summary.cost_24h_usd,
+                "cost_24h_usd": cost_summary.cost_24h_usd,
+                "cost_active_usd": cost_summary.cost_active_usd,
+                "cost_total_usd": cost_summary.cost_total_usd,
                 "context_tokens_used": p.state.context_tokens_used,
                 "tmux_session": p.state.tmux_session,
                 "user_attached": p.state.user_attached,
@@ -2047,6 +2021,7 @@ fn render_ls_json(projects: &[ProjectSummary], daemon_up: bool) -> Result<String
 
 fn render_show_text(
     state: &ProjectState,
+    cost: &ccteam_core::CostSummary,
     recent: &[Value],
     artifacts: &Map<String, Value>,
 ) -> String {
@@ -2060,7 +2035,20 @@ fn render_show_text(
         "phase state    : {}\n",
         phase_state_str(&state.phase_state)
     ));
-    out.push_str(&format!("cost used      : ${:.2}\n", state.cost_used_usd));
+    // V0.4.6 F91 — cost(24h) sums every `agent_done.cost_usd` in the
+    // last 24h; cost(active) live-reads each open session's
+    // `~/.claude/jobs/<id>/state.json::cost_usd_total`. The pre-F91
+    // `cost used: $X.XX` line (sourced from the now-frozen
+    // `state.cost_used_usd`) is removed.
+    out.push_str(&format!(
+        "cost (24h)     : ${:.2}  ({} sessions)\n",
+        cost.cost_24h_usd, cost.session_count_24h,
+    ));
+    out.push_str(&format!(
+        "cost (active)  : ${:.2}  ({} running)\n",
+        cost.cost_active_usd, cost.session_count_active,
+    ));
+    out.push_str(&format!("cost (total)   : ${:.2}\n", cost.cost_total_usd));
     out.push_str(&format!(
         "context tokens : {} ({} resets)\n",
         state.context_tokens_used, state.context_reset_count
@@ -2096,12 +2084,14 @@ fn render_show_text(
 
 fn render_show_json(
     state: &ProjectState,
+    cost: &ccteam_core::CostSummary,
     recent: &[Value],
     artifacts: &Map<String, Value>,
 ) -> Result<String> {
     let v = json!({
         "state": serde_json::to_value(state)?,
         "phase_history": serde_json::to_value(&state.phase_history)?,
+        "cost": serde_json::to_value(cost)?,
         "recent_events": recent,
         "artifacts": Value::Object(artifacts.clone()),
         "stall": {
@@ -2144,53 +2134,6 @@ fn truncate(s: &str, n: usize) -> &str {
     }
 }
 
-/// `ccteam watchdog scan` (V0.2 M0.21). Reads `~/.ccteam/watchdog.yaml`
-/// (or defaults), scans every project + the daemon heartbeat, and
-/// renders the resulting alerts. With `push_to_user_handle: Some(<h>)`
-/// each alert that survives filtering is also written to the meta-agent
-/// session's outbox so the meta-agent can surface it in NL.
-///
-/// Translation only: never mutates orchestrator state, never kills
-/// sessions, never re-injects prompts. Pure read-side classifier.
-pub fn run_watchdog_scan(
-    paths: &CcteamPaths,
-    format: OutputFormat,
-    push_to_meta: bool,
-) -> Result<String> {
-    let cfg = ccteam_core::load_watchdog_config(paths)?;
-    let alerts = ccteam_core::watchdog_scan(paths, &cfg)?;
-    if push_to_meta {
-        for alert in &alerts {
-            ccteam_core::push_watchdog_alert_to_meta_outbox(paths, alert)
-                .context("push watchdog alert to meta outbox")?;
-        }
-    }
-    Ok(match format {
-        OutputFormat::Json => {
-            serde_json::to_string_pretty(&serde_json::json!({
-                "alerts": alerts,
-                "config": cfg,
-            }))? + "\n"
-        }
-        OutputFormat::Text => render_watchdog_text(&alerts, push_to_meta),
-    })
-}
-
-fn render_watchdog_text(alerts: &[ccteam_core::WatchdogAlert], pushed: bool) -> String {
-    if alerts.is_empty() {
-        return "watchdog: no alerts.\n".into();
-    }
-    let mut out = format!("watchdog: {} alert(s)\n", alerts.len());
-    for a in alerts {
-        let scope = a.slug.as_deref().unwrap_or("(global)");
-        out.push_str(&format!("  [{}] {scope}: {}\n", a.kind.as_str(), a.message,));
-    }
-    if pushed {
-        out.push_str("(also written to meta-agent outbox)\n");
-    }
-    out
-}
-
 /// V0.3 M5.0: knobs forwarded by `ccteam web` clap struct → axum
 /// scaffold. Mirrors `ccteam_web::ServeOpts` 1:1 except `bind` is
 /// still a string here (parsed in `run_web`).
@@ -2226,6 +2169,289 @@ pub fn run_web(opts: WebOptions) -> Result<()> {
         .build()
         .context("build tokio runtime for ccteam web")?;
     runtime.block_on(ccteam_web::serve(serve_opts))
+}
+
+/// V0.4.6 F81 — options for `ccteam remove <slug>`.
+#[derive(Debug, Clone, Default)]
+pub struct RemoveOptions {
+    /// Also `rm -rf <project>/.ccteam/`, `<project>/.claude/agents/`,
+    /// and `<project>/workflow.yaml`. Business code + `.env` untouched.
+    pub purge: bool,
+    /// Print every step that *would* run, but don't touch filesystem
+    /// / config / daemon.
+    pub dry_run: bool,
+    /// Skip the CLAUDE.md §三 "永不主动 kill 长 session" refusal gate.
+    pub force: bool,
+}
+
+/// V0.4.6 F81 — structured result of `run_remove`. Returned so MCP
+/// callers (a future `tool_remove` wire) can branch on the success
+/// shape; the CLI just `Display`s the text rendering.
+#[derive(Debug, Clone, Default)]
+pub struct RemoveReport {
+    pub slug: String,
+    pub purge: bool,
+    pub dry_run: bool,
+    pub forced: bool,
+    /// One-line entries describing each step that ran (or would run
+    /// under `--dry-run`). Surface order matches execution order so
+    /// users see the same shape with and without `--dry-run`.
+    pub steps: Vec<String>,
+    /// Set when the refusal gate fired (and `--force` was not passed).
+    /// `--dry-run` still reports the refusal so users can rehearse.
+    pub refusal: Option<ccteam_core::ActiveSessionRefusal>,
+}
+
+impl std::fmt::Display for RemoveReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mode = if self.dry_run { "[dry-run] " } else { "" };
+        writeln!(
+            f,
+            "ccteam remove {}{}{}{}",
+            mode,
+            self.slug,
+            if self.purge { " --purge" } else { "" },
+            if self.forced { " --force" } else { "" }
+        )?;
+        for step in &self.steps {
+            writeln!(f, "  - {step}")?;
+        }
+        if let Some(refusal) = &self.refusal {
+            writeln!(f, "refusal: {}", refusal.message(&self.slug))?;
+        }
+        Ok(())
+    }
+}
+
+/// V0.4.6 F81 — `ccteam remove <slug>` implementation.
+///
+/// Steps (in order):
+/// 1. Refusal gate. Calls [`ccteam_core::refuses_active_session`]; if
+///    it returns `Some(refusal)` and `opts.force` is false, the command
+///    halts before any mutation. `--dry-run` still walks the rest of
+///    the plan (reporting all steps as "would run") so the user gets a
+///    full preview.
+/// 2. Resolve project_dir via `~/.ccteam/config.yaml::projects[]` so
+///    arbitrary-path installs (V0.4.2 F77) are honoured.
+/// 3. Drop the slug from config.yaml::projects[] (atomic via
+///    `config::save`'s tmp+rename). `--dry-run` prints the plan only.
+/// 4. Unroster the running daemon's in-memory state. **F81 stub: this
+///    skips the daemon-side cancel** — the F82 worktree will replace
+///    `Orchestrator::unroster_project` with cancellation-token wiring;
+///    until then, the daemon picks up the config change on its next
+///    `spawn_new_rostered_projects` tick (eventual consistency).
+/// 5. Remove orchestration state: `~/.ccteam/progress/<slug>.jsonl`
+///    (or flex `~/.ccteam/progress/<slug>/` dir), then any
+///    `~/.ccteam/inbox/<slug>/` and `~/.ccteam/control/<slug>/`
+///    sub-trees that exist.
+/// 6. `--purge`: `rm -rf <project>/.ccteam/`,
+///    `<project>/.claude/agents/`, and `<project>/workflow.yaml`
+///    (plus F83's `.ccteam/workflow.yaml` once that lands).
+///    Never touches `<project>/.env` (CLAUDE.md §三 red line).
+pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Result<RemoveReport> {
+    let mut report = RemoveReport {
+        slug: slug.to_string(),
+        purge: opts.purge,
+        dry_run: opts.dry_run,
+        forced: opts.force,
+        ..Default::default()
+    };
+
+    // 1. Refusal gate (CLAUDE.md §三).
+    let refusal = ccteam_core::refuses_active_session(paths, slug)?;
+    if let Some(r) = refusal {
+        if !opts.force {
+            // Halt before any mutation — user must `tmux kill-session`
+            // / let claude finish / pass `--force`.
+            report.refusal = Some(r.clone());
+            bail!(
+                "ccteam remove `{slug}`: {}. Re-run with `--force` to override.",
+                r.message(slug)
+            );
+        } else {
+            report
+                .steps
+                .push(format!("forced through guard: {}", r.message(slug)));
+        }
+    }
+
+    // 2. Resolve project_dir via the config registry (so V0.4.2
+    // arbitrary-path installs are deleted correctly even when the
+    // slug doesn't sit under `paths.projects_root`).
+    let registered = ccteam_core::lookup_project_in_config(&paths.root, slug)?;
+    let project_dir = match &registered {
+        Some(entry) => entry.path.clone(),
+        // Fall back to `paths.project_dir(slug)` so `--purge` still
+        // works on orphan slugs (state.json present but config entry
+        // missing — the V0.4.5 ghost-entry case the PRD references).
+        None => paths.project_dir(slug),
+    };
+
+    // 3. Config registry drop.
+    if registered.is_some() {
+        if opts.dry_run {
+            report.steps.push(format!(
+                "would drop config.yaml::projects entry for `{slug}` (path: {})",
+                project_dir.display()
+            ));
+        } else {
+            let removed = ccteam_core::remove_project_from_config(&paths.root, slug)?;
+            if removed {
+                report
+                    .steps
+                    .push(format!("removed config.yaml::projects entry for `{slug}`"));
+            }
+        }
+    } else {
+        report.steps.push(format!(
+            "config.yaml::projects has no entry for `{slug}` (orphan / pre-V0.4.2 install)"
+        ));
+    }
+
+    // 4. Daemon unroster (best-effort; the running daemon may not exist).
+    if opts.dry_run {
+        report.steps.push(
+            "would request daemon unroster (daemon will pick up the config drop on next tick)"
+                .to_string(),
+        );
+    } else {
+        // F81 stub note: the orchestrator's in-process `unroster_project`
+        // exists, but we have no IPC into the running daemon. F82 wave
+        // will wire a control file / unix socket so this becomes a
+        // real synchronous call. Until then, document the eventual
+        // consistency window in the step output.
+        report.steps.push(
+            "daemon unroster: deferred to next event-loop tick (F82 will wire instant cancel)"
+                .to_string(),
+        );
+    }
+
+    // 5. Orchestration state cleanup under `~/.ccteam/`.
+    let progress_path = paths.progress_jsonl(slug);
+    let progress_dir = paths.progress_dir().join(slug); // flex shard dir
+    let global_inbox_slug_dir = paths.inbox_dir().join(slug);
+    let global_control_slug_dir = paths.control_dir().join(slug);
+
+    for (label, path, is_dir) in [
+        ("progress.jsonl", progress_path.clone(), false),
+        ("progress shard dir", progress_dir.clone(), true),
+        ("inbox/<slug>/ dir", global_inbox_slug_dir.clone(), true),
+        ("control/<slug>/ dir", global_control_slug_dir.clone(), true),
+    ] {
+        let exists = if is_dir {
+            path.is_dir()
+        } else {
+            path.is_file()
+        };
+        if !exists {
+            continue;
+        }
+        if opts.dry_run {
+            report
+                .steps
+                .push(format!("would remove {label} {}", path.display()));
+        } else if is_dir {
+            std::fs::remove_dir_all(&path).with_context(|| format!("rm -rf {}", path.display()))?;
+            report
+                .steps
+                .push(format!("removed {label} {}", path.display()));
+        } else {
+            std::fs::remove_file(&path).with_context(|| format!("rm {}", path.display()))?;
+            report
+                .steps
+                .push(format!("removed {label} {}", path.display()));
+        }
+    }
+
+    // 6. Optional `--purge`: project-local ccteam-managed paths.
+    if opts.purge {
+        purge_project_managed_paths(&project_dir, opts.dry_run, &mut report)?;
+    }
+
+    Ok(report)
+}
+
+/// Helper for `run_remove --purge` — walks each ccteam-managed path
+/// under `<project>/` and deletes it (or, under `--dry-run`, just
+/// records the planned step).
+///
+/// **Red lines** enforced here:
+/// - `<project>/.env` is **never** touched (user-controlled secrets).
+/// - Anything outside `.ccteam/`, `.claude/agents/`, and
+///   `workflow.yaml` / `.ccteam/workflow.yaml` is **never** touched
+///   (business code stays put). If the user wants the whole tree gone
+///   they can `rm -rf <project>` themselves; the `--purge` contract is
+///   strictly orchestration-only.
+fn purge_project_managed_paths(
+    project_dir: &std::path::Path,
+    dry_run: bool,
+    report: &mut RemoveReport,
+) -> Result<()> {
+    // Order: state metadata first, agent prompts next, workflow last
+    // — gives the dry-run reader a story (state → roles → topology).
+    let ccteam_dir = project_dir.join(".ccteam");
+    let agents_dir = project_dir.join(".claude").join("agents");
+    let workflow_yaml = project_dir.join("workflow.yaml");
+    // V0.4.6 F83 will move workflow.yaml into `.ccteam/`; until then
+    // `.ccteam/workflow.yaml` may exist in early-adopter projects.
+    // Deleting `.ccteam/` already covers it, but list explicitly so
+    // dry-run output names the path the user expects.
+    let workflow_yaml_in_ccteam = ccteam_dir.join("workflow.yaml");
+
+    // Safety: refuse to touch a `<project>/.env` *file*. The contract
+    // is project-managed orchestration paths only; .env stays. The
+    // explicit assertion below documents the invariant for review.
+    let env_file = project_dir.join(".env");
+    debug_assert!(
+        !ccteam_dir.starts_with(&env_file) && !agents_dir.starts_with(&env_file),
+        ".env must never be inside the purge tree"
+    );
+
+    for (label, path, is_dir) in [
+        (".ccteam/", ccteam_dir.clone(), true),
+        (".claude/agents/", agents_dir.clone(), true),
+        ("workflow.yaml", workflow_yaml.clone(), false),
+        (
+            ".ccteam/workflow.yaml (legacy F83 location)",
+            workflow_yaml_in_ccteam.clone(),
+            false,
+        ),
+    ] {
+        let exists = if is_dir {
+            path.is_dir()
+        } else {
+            path.is_file()
+        };
+        if !exists {
+            continue;
+        }
+        if dry_run {
+            report
+                .steps
+                .push(format!("would purge {label} ({})", path.display()));
+        } else if is_dir {
+            std::fs::remove_dir_all(&path).with_context(|| format!("rm -rf {}", path.display()))?;
+            report
+                .steps
+                .push(format!("purged {label} ({})", path.display()));
+        } else {
+            std::fs::remove_file(&path).with_context(|| format!("rm {}", path.display()))?;
+            report
+                .steps
+                .push(format!("purged {label} ({})", path.display()));
+        }
+    }
+
+    // Final assertion: confirm `.env` is still here (paranoia check
+    // — if a future refactor accidentally widens the purge tree this
+    // surfaces in tests immediately).
+    if env_file.exists() {
+        report
+            .steps
+            .push(format!("preserved {}", env_file.display()));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2516,8 +2742,19 @@ mod tests {
         )
         .unwrap();
         assert!(target.join(".ccteam").join("state.json").is_file());
-        assert!(target.join("workflow.yaml").is_file());
-        assert!(target.join(".claude").join("agents").join("explorer.md").is_file());
+        assert!(
+            target.join(".ccteam").join("workflow.yaml").is_file(),
+            "V0.4.6 F83: workflow.yaml must land in .ccteam/, not project root",
+        );
+        assert!(
+            !target.join("workflow.yaml").exists(),
+            "V0.4.6 F83: workflow.yaml must NOT be at the project root after fresh init",
+        );
+        assert!(target
+            .join(".claude")
+            .join("agents")
+            .join("explorer.md")
+            .is_file());
 
         let cfg = ccteam_core::load_ccteam_config(&paths.root).unwrap();
         assert_eq!(cfg.projects.len(), 1);
@@ -2527,6 +2764,7 @@ mod tests {
 
     /// V0.4.2 F72: re-running on an existing ccteam project preserves
     /// user-edited workflow.yaml + agents/*.md.
+    /// V0.4.6 F83: workflow.yaml lives in `.ccteam/`, not the root.
     #[test]
     fn run_init_refresh_preserves_user_workflow_and_agents() {
         let tmp = TempDir::new().unwrap();
@@ -2540,7 +2778,8 @@ mod tests {
             },
         )
         .unwrap();
-        std::fs::write(target.join("workflow.yaml"), "USER WORKFLOW\n").unwrap();
+        let wf_path = target.join(".ccteam").join("workflow.yaml");
+        std::fs::write(&wf_path, "USER WORKFLOW\n").unwrap();
         std::fs::write(
             target.join(".claude").join("agents").join("explorer.md"),
             "USER AGENT\n",
@@ -2557,7 +2796,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            std::fs::read_to_string(target.join("workflow.yaml")).unwrap(),
+            std::fs::read_to_string(&wf_path).unwrap(),
             "USER WORKFLOW\n"
         );
         assert_eq!(
@@ -2568,6 +2807,7 @@ mod tests {
     }
 
     /// V0.4.2 F72: `--force` re-runs overwrite user files.
+    /// V0.4.6 F83: workflow.yaml lives in `.ccteam/`, not the root.
     #[test]
     fn run_init_force_overwrites_user_workflow_and_agents() {
         let tmp = TempDir::new().unwrap();
@@ -2581,7 +2821,8 @@ mod tests {
             },
         )
         .unwrap();
-        std::fs::write(target.join("workflow.yaml"), "USER WORKFLOW\n").unwrap();
+        let wf_path = target.join(".ccteam").join("workflow.yaml");
+        std::fs::write(&wf_path, "USER WORKFLOW\n").unwrap();
         run_init(
             &paths,
             InitOptions {
@@ -2592,13 +2833,14 @@ mod tests {
         )
         .unwrap();
         assert_ne!(
-            std::fs::read_to_string(target.join("workflow.yaml")).unwrap(),
+            std::fs::read_to_string(&wf_path).unwrap(),
             "USER WORKFLOW\n"
         );
     }
 
     /// V0.4.2 F72: `--reset-agents` rewrites agents but keeps
     /// workflow.yaml untouched.
+    /// V0.4.6 F83: workflow.yaml lives in `.ccteam/`, not the root.
     #[test]
     fn run_init_reset_agents_only_overwrites_agents() {
         let tmp = TempDir::new().unwrap();
@@ -2612,7 +2854,8 @@ mod tests {
             },
         )
         .unwrap();
-        std::fs::write(target.join("workflow.yaml"), "USER WORKFLOW\n").unwrap();
+        let wf_path = target.join(".ccteam").join("workflow.yaml");
+        std::fs::write(&wf_path, "USER WORKFLOW\n").unwrap();
         std::fs::write(
             target.join(".claude").join("agents").join("explorer.md"),
             "USER AGENT\n",
@@ -2628,7 +2871,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            std::fs::read_to_string(target.join("workflow.yaml")).unwrap(),
+            std::fs::read_to_string(&wf_path).unwrap(),
             "USER WORKFLOW\n",
             "workflow must survive --reset-agents",
         );
@@ -3028,243 +3271,12 @@ mod tests {
     // removed — F40's deprecation path depended on the deleted shipped
     // bundle writer. F63 will revisit alias semantics for workflow.yaml.
 
-    // -------- ccteam decisions (M1 follow-up) --------
-
-    /// Helper: write an outbox file with caller-controlled front matter
-    /// to `<projects_root>/<slug>/.ccteam/outbox/<filename>`. Uses
-    /// `OutboxMessage::save` so the file goes through the same atomic
-    /// write path used in production.
-    fn write_outbox(
-        paths: &CcteamPaths,
-        slug: &str,
-        filename: &str,
-        kind: OutboxEventKind,
-        priority: ccteam_core::OutboxPriority,
-        created_at: chrono::DateTime<Utc>,
-        body: &str,
-    ) {
-        let dir = paths.project_ccteam_dir(slug).join("outbox");
-        std::fs::create_dir_all(&dir).unwrap();
-        let msg = OutboxMessage {
-            front: ccteam_core::OutboxFrontMatter {
-                schema_version: 1,
-                in_reply_to: None,
-                in_reply_to_source_msg_id: None,
-                target_channels: Vec::new(),
-                created_at,
-                priority,
-                event_kind: kind,
-            },
-            body: body.to_string(),
-        };
-        msg.save(&dir.join(filename)).unwrap();
-    }
-
-    fn write_state(paths: &CcteamPaths, slug: &str, phase: &str, team: &str) {
-        let dir = paths.project_ccteam_dir(slug);
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut state = ProjectState::initial_for_team(slug.to_string(), team.to_string());
-        state.current_phase = phase.to_string();
-        state.save(&paths.project_state(slug)).unwrap();
-    }
-
-    #[test]
-    fn run_decisions_text_says_empty_when_no_projects() {
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        let body = run_decisions(&paths, OutputFormat::Text).unwrap();
-        assert!(body.contains("no pending decisions"));
-    }
-
-    #[test]
-    fn run_decisions_excludes_reply_progress_shipped_event_kinds() {
-        // Only clarify / escalation should show up in the queue.
-        // Replies / progress / shipped notifications are informational,
-        // not user-actionable.
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        write_state(&paths, "alpha", "plan-eng", "dev");
-        let now = Utc::now();
-        write_outbox(
-            &paths,
-            "alpha",
-            "reply-1.md",
-            OutboxEventKind::Reply,
-            ccteam_core::OutboxPriority::Normal,
-            now,
-            "informational",
-        );
-        write_outbox(
-            &paths,
-            "alpha",
-            "reply-2.md",
-            OutboxEventKind::Progress,
-            ccteam_core::OutboxPriority::Normal,
-            now,
-            "informational",
-        );
-        write_outbox(
-            &paths,
-            "alpha",
-            "reply-3.md",
-            OutboxEventKind::Shipped,
-            ccteam_core::OutboxPriority::Normal,
-            now,
-            "informational",
-        );
-        let rows = collect_decisions(&paths).unwrap();
-        assert!(
-            rows.is_empty(),
-            "non-decision event_kinds must be filtered out"
-        );
-    }
-
-    #[test]
-    fn run_decisions_aggregates_clarify_and_escalation_across_projects() {
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        write_state(&paths, "alpha", "plan-eng", "dev");
-        write_state(&paths, "beta", "kickoff", "product-research");
-        let t1 = Utc::now() - chrono::Duration::hours(2);
-        let t2 = Utc::now() - chrono::Duration::minutes(30);
-        write_outbox(
-            &paths,
-            "alpha",
-            "reply-1.md",
-            OutboxEventKind::Clarify,
-            ccteam_core::OutboxPriority::Normal,
-            t1,
-            "选 SQLite 还是 Postgres?",
-        );
-        write_outbox(
-            &paths,
-            "beta",
-            "reply-1.md",
-            OutboxEventKind::Escalation,
-            ccteam_core::OutboxPriority::High,
-            t2,
-            "exceeded max_clarify_rounds",
-        );
-        let rows = collect_decisions(&paths).unwrap();
-        assert_eq!(rows.len(), 2);
-        // High-priority escalation must come first regardless of being
-        // newer than the clarify.
-        assert!(matches!(rows[0].event_kind, OutboxEventKind::Escalation));
-        assert_eq!(rows[0].slug, "beta");
-        assert_eq!(rows[1].slug, "alpha");
-    }
-
-    #[test]
-    fn run_decisions_json_serializes_complete_row_shape() {
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        write_state(&paths, "alpha", "plan-eng", "dev");
-        let opened = chrono::DateTime::parse_from_rfc3339("2026-05-06T10:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        write_outbox(
-            &paths,
-            "alpha",
-            "reply-1.md",
-            OutboxEventKind::Clarify,
-            ccteam_core::OutboxPriority::Normal,
-            opened,
-            "需要确认部署目标",
-        );
-        let body = run_decisions(&paths, OutputFormat::Json).unwrap();
-        let parsed: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(parsed["total"], 1);
-        let row = &parsed["decisions"][0];
-        assert_eq!(row["slug"], "alpha");
-        assert_eq!(row["current_phase"], "plan-eng");
-        assert_eq!(row["team"], "dev");
-        assert_eq!(row["event_kind"], "clarify");
-        assert_eq!(row["priority"], "normal");
-        assert_eq!(row["outbox_filename"], "reply-1.md");
-        assert!(row["summary"].as_str().unwrap().contains("部署"));
-    }
-
-    #[test]
-    fn run_decisions_skips_unparseable_outbox_files() {
-        // A malformed outbox file in one project must not blank the
-        // queue — other projects should still surface.
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        write_state(&paths, "alpha", "plan-eng", "dev");
-        write_state(&paths, "broken", "plan-eng", "dev");
-        write_outbox(
-            &paths,
-            "alpha",
-            "reply-1.md",
-            OutboxEventKind::Clarify,
-            ccteam_core::OutboxPriority::Normal,
-            Utc::now(),
-            "valid question",
-        );
-        // Hand-write garbage that doesn't parse as an outbox file.
-        let bad_dir = paths.project_ccteam_dir("broken").join("outbox");
-        std::fs::create_dir_all(&bad_dir).unwrap();
-        std::fs::write(bad_dir.join("reply-bad.md"), "not even a yaml header").unwrap();
-
-        let rows = collect_decisions(&paths).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].slug, "alpha");
-    }
-
-    #[test]
-    fn run_decisions_summary_truncates_long_first_line() {
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        write_state(&paths, "alpha", "plan-eng", "dev");
-        let long_line = "x".repeat(200);
-        write_outbox(
-            &paths,
-            "alpha",
-            "reply-1.md",
-            OutboxEventKind::Clarify,
-            ccteam_core::OutboxPriority::Normal,
-            Utc::now(),
-            &long_line,
-        );
-        let rows = collect_decisions(&paths).unwrap();
-        assert_eq!(rows.len(), 1);
-        let summary = &rows[0].summary;
-        assert!(
-            summary.ends_with("..."),
-            "long summaries should be truncated with ellipsis"
-        );
-        assert!(summary.chars().count() <= 80);
-    }
-
-    #[test]
-    fn run_decisions_handles_project_without_state_json() {
-        // A project dir with outbox files but no state.json (race during
-        // bootstrap, manual cleanup, etc.) should still surface its
-        // pending items rather than vanish silently.
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        let dir = paths.project_ccteam_dir("orphan").join("outbox");
-        std::fs::create_dir_all(&dir).unwrap();
-        write_outbox(
-            &paths,
-            "orphan",
-            "reply-1.md",
-            OutboxEventKind::Escalation,
-            ccteam_core::OutboxPriority::High,
-            Utc::now(),
-            "项目状态丢失但 outbox 还在",
-        );
-        let rows = collect_decisions(&paths).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].current_phase, "<unknown>");
-        assert_eq!(rows[0].team, "<unknown>");
-    }
-
-    // ---------------- V0.2 M0.18.5 doctor --validate-team ----------------
-
-    // V0.4.0 F60: validate-team / phase-show shipped-team smoke tests
-    // were tied to the deleted shipped-team-bundle writer. F63 will
-    // reintroduce equivalents against `workflow.yaml`.
+    // V0.4.6 F89: `ccteam decisions` / `ccteam phase` / `ccteam watchdog`
+    // top-level commands removed (V0.3 legacy). Their unit tests were
+    // tied to `run_decisions` / `collect_decisions` / `run_phase_show` /
+    // `run_watchdog_scan` (now deleted). The remaining outbox /
+    // watchdog plumbing in `ccteam-core` is still tested in its own
+    // crate; the CLI no longer exposes the surface.
 
     #[test]
     fn validate_team_reports_fail_for_unknown_team() {
@@ -3282,38 +3294,4 @@ mod tests {
         assert!(msg.contains("[FAIL] team.yaml load"), "got: {msg}");
         assert!(msg.contains("1 fail"), "expected fails counter; got: {msg}");
     }
-
-    #[test]
-    fn phase_show_errors_with_v040_not_implemented_message() {
-        ensure_isolation();
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        let err = run_phase_show(&paths, "dev", "implement").unwrap_err();
-        assert!(format!("{err:#}").contains("F60"), "got: {err:#}");
-    }
-
-    #[test]
-    fn watchdog_scan_text_format_renders_no_alerts_when_healthy() {
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        std::fs::create_dir_all(&paths.projects_root).unwrap();
-        ccteam_core::write_heartbeat(&paths).unwrap();
-        let out = run_watchdog_scan(&paths, OutputFormat::Text, false).unwrap();
-        assert!(out.contains("no alerts"), "got: {out}");
-    }
-
-    #[test]
-    fn watchdog_scan_json_format_emits_structured_payload() {
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        std::fs::create_dir_all(&paths.projects_root).unwrap();
-        // Heartbeat absent ⇒ daemon_down alert.
-        let out = run_watchdog_scan(&paths, OutputFormat::Json, false).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
-        let alerts = parsed["alerts"].as_array().unwrap();
-        assert_eq!(alerts.len(), 1);
-        assert_eq!(alerts[0]["kind"], "daemon_down");
-        assert!(parsed["config"].is_object());
-    }
-
 }

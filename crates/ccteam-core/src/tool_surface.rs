@@ -608,24 +608,165 @@ pub fn rewrite_legacy_hook_commands(
     })
 }
 
-/// V0.2.2 F44: rewrite one hook `command` string. Returns `None` when
-/// the command does not look like an F39-era `cct hook …` invocation
-/// (so the caller can leave it alone — preserves operator-authored
-/// hooks). Otherwise returns the rewritten string with the binary path
-/// swapped to `new_bin` (the canonical `ccteam` binary).
+/// V0.4.6 F91: outcome of a single project's `cost-accumulate` hook
+/// scrub. See [`remove_cost_accumulate_hooks`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CostAccumulateScrubAction {
+    /// `settings.json` absent — nothing to do.
+    NotFound,
+    /// No `cost-accumulate` hook entries found. Idempotent re-run after
+    /// success hits this branch.
+    NoChangeNeeded,
+    /// `dry_run = true` — would have removed N entries.
+    WouldRemove { entries: usize },
+    /// Removed N hook entries and atomically wrote the file.
+    Removed { entries: usize },
+}
+
+/// V0.4.6 F91: per-project report for [`remove_cost_accumulate_hooks`].
+#[derive(Debug, Clone)]
+pub struct CostAccumulateScrubReport {
+    pub target: PathBuf,
+    pub action: CostAccumulateScrubAction,
+}
+
+/// V0.4.6 F91: strip the legacy `ccteam hook cost-accumulate` hook entry
+/// from a project's `.claude/settings.json`. F91 retired the
+/// PostToolUse cost-accumulator (Claude itself reports cost on each
+/// `agent_done` event into `progress.jsonl`); existing projects need
+/// their settings.json cleaned so Claude Code doesn't keep firing the
+/// now-missing subcommand.
+///
+/// Detection rule: any `command` string ending with `hook cost-accumulate`
+/// (binary path prefix can be anything — `/usr/local/bin/ccteam hook
+/// cost-accumulate`, `ccteam hook cost-accumulate`, or even the legacy
+/// `cct hook cost-accumulate`). Inner hook entries matching the rule
+/// are removed; entries whose only-remaining sibling matrix collapses
+/// to empty are pruned too so the file shape stays clean.
+///
+/// Idempotent — re-runs after a successful scrub hit `NoChangeNeeded`.
+pub fn remove_cost_accumulate_hooks(
+    settings_path: &Path,
+    dry_run: bool,
+) -> Result<CostAccumulateScrubReport> {
+    if !settings_path.exists() {
+        return Ok(CostAccumulateScrubReport {
+            target: settings_path.to_path_buf(),
+            action: CostAccumulateScrubAction::NotFound,
+        });
+    }
+
+    let body = std::fs::read_to_string(settings_path)
+        .with_context(|| format!("read {}", settings_path.display()))?;
+    let mut v: serde_json::Value = serde_json::from_str(&body)
+        .with_context(|| format!("parse {}", settings_path.display()))?;
+
+    let mut removed = 0usize;
+    let Some(hooks) = v.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
+        return Ok(CostAccumulateScrubReport {
+            target: settings_path.to_path_buf(),
+            action: CostAccumulateScrubAction::NoChangeNeeded,
+        });
+    };
+    for (_event, list) in hooks.iter_mut() {
+        let Some(arr) = list.as_array_mut() else {
+            continue;
+        };
+        for entry in arr.iter_mut() {
+            let Some(inner_hooks) = entry.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
+                continue;
+            };
+            // Keep only the hook commands that aren't cost-accumulate.
+            let before = inner_hooks.len();
+            inner_hooks.retain(|hook| !hook_command_is_cost_accumulate(hook));
+            removed += before - inner_hooks.len();
+        }
+        // Drop now-empty inner hook lists so the settings.json shape
+        // stays clean (e.g. PostToolUse → [{}] with empty inner is
+        // semantically a no-op but ugly to leave behind).
+        arr.retain(|entry| {
+            entry
+                .get("hooks")
+                .and_then(|h| h.as_array())
+                .map(|a| !a.is_empty())
+                .unwrap_or(false)
+        });
+    }
+    // Drop now-empty top-level event arrays.
+    hooks.retain(|_event, list| list.as_array().map(|a| !a.is_empty()).unwrap_or(false));
+
+    if removed == 0 {
+        return Ok(CostAccumulateScrubReport {
+            target: settings_path.to_path_buf(),
+            action: CostAccumulateScrubAction::NoChangeNeeded,
+        });
+    }
+    if dry_run {
+        return Ok(CostAccumulateScrubReport {
+            target: settings_path.to_path_buf(),
+            action: CostAccumulateScrubAction::WouldRemove { entries: removed },
+        });
+    }
+
+    let body = serde_json::to_string_pretty(&v).context("serialize updated settings.json")?;
+    let tmp = settings_path.with_extension("json.ccteam-f91-scrub.tmp");
+    std::fs::write(&tmp, &body).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, settings_path)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), settings_path.display()))?;
+    Ok(CostAccumulateScrubReport {
+        target: settings_path.to_path_buf(),
+        action: CostAccumulateScrubAction::Removed { entries: removed },
+    })
+}
+
+/// Predicate: does this `hook` JSON entry invoke `ccteam hook
+/// cost-accumulate` (or the F39-era `cct` variant)? Matches both
+/// absolute-path and bare invocations, with or without a trailing
+/// space + args.
+fn hook_command_is_cost_accumulate(hook: &serde_json::Value) -> bool {
+    let Some(cmd) = hook.get("command").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    let trimmed = cmd.trim();
+    trimmed.ends_with(" hook cost-accumulate") || trimmed.contains(" hook cost-accumulate ")
+}
+
+/// V0.2.2 F44 + V0.4.6 F89: rewrite one hook `command` string.
+///
+/// Returns `None` when the command is already pointing at the new
+/// `<ccteam> internal hook …` form (idempotency) **or** does not look
+/// like a ccteam-managed hook (so operator-authored hooks survive
+/// untouched). Otherwise returns the rewritten string with the binary
+/// path swapped to `new_bin` and the post-binary tail rewritten to
+/// `internal hook …`.
+///
+/// Migration paths handled:
+/// - F44: `/.../cct hook …` (F39 binary name) → `/<new_bin> internal hook …`
+/// - F44: bare `cct hook …`                     → `<new_bin> internal hook …`
+/// - F89: `/.../ccteam hook …` (V0.4.5 path)    → `/<new_bin> internal hook …`
+/// - F89: bare `ccteam hook …`                  → `<new_bin> internal hook …`
 fn rewrite_one_hook_command(cmd: &str, new_bin: &str) -> Option<String> {
-    // Already pointing at the canonical `ccteam` binary? Idempotency.
-    if cmd.contains("/ccteam hook ") || cmd.starts_with("ccteam hook ") {
+    // Already on the new `internal hook` form? Idempotency.
+    if cmd.contains("/ccteam internal hook ") || cmd.starts_with("ccteam internal hook ") {
         return None;
     }
-    // Absolute path ending with `/cct hook …` (F39 binary name).
+    // F44 — absolute path ending with `/cct hook …` (F39 binary name).
     if let Some(idx) = cmd.find("/cct hook ") {
-        let tail = &cmd[idx + "/cct".len()..];
-        return Some(format!("{new_bin}{tail}"));
+        let after = &cmd[idx + "/cct hook ".len()..];
+        return Some(format!("{new_bin} internal hook {after}"));
     }
-    // Bare `cct hook …` with no path prefix (uncommon but legal).
+    // F44 — bare `cct hook …` with no path prefix (uncommon but legal).
     if let Some(rest) = cmd.strip_prefix("cct hook ") {
-        return Some(format!("{new_bin} hook {rest}"));
+        return Some(format!("{new_bin} internal hook {rest}"));
+    }
+    // F89 — absolute path ending with `/ccteam hook …` (V0.4.5 form).
+    if let Some(idx) = cmd.find("/ccteam hook ") {
+        let after = &cmd[idx + "/ccteam hook ".len()..];
+        return Some(format!("{new_bin} internal hook {after}"));
+    }
+    // F89 — bare `ccteam hook …` (V0.4.5 form, no path prefix).
+    if let Some(rest) = cmd.strip_prefix("ccteam hook ") {
+        return Some(format!("{new_bin} internal hook {rest}"));
     }
     None
 }
@@ -998,6 +1139,7 @@ mod tests {
 
     #[test]
     fn rewrite_legacy_hook_commands_swaps_absolute_path() {
+        // V0.4.6 F89: F44 rewriter now lands on `internal hook …` form.
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("settings.json");
         std::fs::write(&path, legacy_settings_json("/home/u/.cargo/bin/cct")).unwrap();
@@ -1006,7 +1148,7 @@ mod tests {
         assert_eq!(rep.action, HookCmdRewriteAction::Rewrote { entries: 3 });
         let body = std::fs::read_to_string(&path).unwrap();
         assert!(
-            body.contains("/home/u/.cargo/bin/ccteam hook load-context"),
+            body.contains("/home/u/.cargo/bin/ccteam internal hook load-context"),
             "got: {body}"
         );
         assert!(!body.contains("/cct hook"), "F39-era path survived: {body}");
@@ -1029,13 +1171,52 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_legacy_hook_commands_idempotent_when_already_ccteam() {
+    fn rewrite_legacy_hook_commands_idempotent_when_already_internal_hook() {
+        // V0.4.6 F89: idempotency anchor moved from `<bin> hook …` to
+        // `<bin> internal hook …`. A settings.json that's already been
+        // migrated to the new path must be a no-op the second pass.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("settings.json");
+        let already_migrated = r#"{
+  "hooks": {
+    "SessionStart": [
+      {"hooks": [
+        {"type": "command", "command": "/home/u/.cargo/bin/ccteam internal hook load-context"},
+        {"type": "command", "command": "/home/u/.cargo/bin/ccteam internal hook progress-append session_start"}
+      ]}
+    ],
+    "Stop": [
+      {"hooks": [{"type": "command", "command": "/home/u/.cargo/bin/ccteam internal hook parse-phase-end"}]}
+    ]
+  }
+}"#;
+        std::fs::write(&path, already_migrated).unwrap();
+        let new_bin = PathBuf::from("/home/u/.cargo/bin/ccteam");
+        let rep = rewrite_legacy_hook_commands(&path, &new_bin, false).unwrap();
+        assert_eq!(rep.action, HookCmdRewriteAction::NoChangeNeeded);
+    }
+
+    #[test]
+    fn rewrite_legacy_hook_commands_migrates_v045_ccteam_hook_to_internal() {
+        // V0.4.6 F89: V0.4.5 settings.json with `<bin> hook …` rewrites
+        // to `<bin> internal hook …`. Catches user upgrades that
+        // never ran `ccteam doctor --update-hooks` between V0.4.x and
+        // V0.4.6.
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("settings.json");
         std::fs::write(&path, legacy_settings_json("/home/u/.cargo/bin/ccteam")).unwrap();
         let new_bin = PathBuf::from("/home/u/.cargo/bin/ccteam");
         let rep = rewrite_legacy_hook_commands(&path, &new_bin, false).unwrap();
-        assert_eq!(rep.action, HookCmdRewriteAction::NoChangeNeeded);
+        assert_eq!(rep.action, HookCmdRewriteAction::Rewrote { entries: 3 });
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            body.contains("/home/u/.cargo/bin/ccteam internal hook load-context"),
+            "got: {body}"
+        );
+        assert!(
+            !body.contains("ccteam hook load-context"),
+            "V0.4.5 path must not survive: {body}",
+        );
     }
 
     #[test]
@@ -1052,7 +1233,17 @@ mod tests {
         let got = rewrite_one_hook_command("cct hook progress-append PreToolUse", "/x/ccteam");
         assert_eq!(
             got.as_deref(),
-            Some("/x/ccteam hook progress-append PreToolUse"),
+            Some("/x/ccteam internal hook progress-append PreToolUse"),
+        );
+    }
+
+    #[test]
+    fn rewrite_one_hook_command_handles_bare_ccteam_prefix() {
+        // V0.4.6 F89: V0.4.5's bare `ccteam hook …` form migrates too.
+        let got = rewrite_one_hook_command("ccteam hook progress-append PreToolUse", "/x/ccteam");
+        assert_eq!(
+            got.as_deref(),
+            Some("/x/ccteam internal hook progress-append PreToolUse"),
         );
     }
 

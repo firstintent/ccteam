@@ -2,6 +2,14 @@
 //! computes total cost (`crates/ccteam-hooks/src/cost.rs`); this
 //! module only classifies a known total against three buckets so the
 //! orchestrator's tick can act.
+//!
+//! V0.4.6 F91 — `state.cost_used_usd` is now a deprecated, frozen
+//! field. `classify` still reads it for legacy callers but the result
+//! will be stale post-F91; F84 introduces a `WorkflowSpec::budget`-
+//! driven replacement that consumes `cost_summary().cost_24h_usd`. The
+//! deprecation read here is silenced with `#[allow(deprecated)]` so
+//! the symbol can be removed cleanly in V0.5 alongside the struct
+//! field.
 
 use crate::state::ProjectState;
 
@@ -20,6 +28,7 @@ pub enum CostLevel {
 pub const COST_MID_WARN_USD: f64 = 50.0;
 
 pub fn classify(state: &ProjectState) -> CostLevel {
+    #[allow(deprecated)]
     let c = state.cost_used_usd;
     if c > state.hard_kill_threshold_usd {
         CostLevel::HardKill
@@ -42,6 +51,7 @@ mod tests {
 
     fn st(cost: f64) -> ProjectState {
         let now = Utc::now();
+        #[allow(deprecated)]
         ProjectState {
             slug: "demo".into(),
             team: "dev".into(),

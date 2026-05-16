@@ -28,17 +28,18 @@
 //! write-helper promotion to the read side), `docs/tech-design.md`
 //! §5.5 progress.jsonl SoT.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Duration, Timelike, Utc};
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::paths::CcteamPaths;
 use crate::progress::{
-    self, current_agent_sessions_with_liveness, escalation_count, workflow_cost_total,
-    AgentSessionStatus, AgentSessionSummary,
+    self, current_agent_sessions_with_liveness, escalation_count, open_agent_spawns,
+    workflow_cost_total, AgentSessionStatus, AgentSessionSummary,
 };
 use crate::state::ProjectState;
 use crate::team::TeamKind;
@@ -257,6 +258,163 @@ pub struct AgentStatus {
     pub last_session_status: Option<AgentSessionStatus>,
 }
 
+/// V0.4.6 F91 — cost aggregation surface. SoT is `progress.jsonl::agent_done`
+/// for historical totals and `~/.claude/jobs/<id>/state.json::cost_usd_total`
+/// (read live) for the active sessions.
+///
+/// Pre-F91 ccteam maintained `ProjectState::cost_used_usd` via the
+/// `cost-accumulate` PostToolUse hook + the F80 orchestrator bump on
+/// synthetic `agent_done`. Both paths were wedge-prone: hook misses,
+/// `claude --bg` argv drift, or daemon SIGKILL casualties left the
+/// number stale or low. F91 retires that accumulator entirely; the new
+/// source of truth is the per-event cost Claude itself reports, surfaced
+/// through this struct.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct CostSummary {
+    /// Sum of `cost_usd` across every `agent_done` event with `ts`
+    /// inside the last 24h (relative to wall-clock at the call). Events
+    /// with missing / unparseable `ts` are folded into the 24h bucket so
+    /// recent rows don't silently disappear when timestamps are absent.
+    pub cost_24h_usd: f64,
+    /// Sum of `cost_usd_total` (falling back to `cost_usd`) read live
+    /// from each currently-open agent session's
+    /// `~/.claude/jobs/<job_id>/state.json`. Missing files / unparseable
+    /// JSON / missing fields contribute 0.0 (no failure mode is fatal —
+    /// stale rows just under-report).
+    pub cost_active_usd: f64,
+    /// Sum of `cost_usd` across every `agent_done` event in the slice
+    /// (i.e. lifetime total recorded in this project's progress.jsonl).
+    /// Drives the "lifetime" headline + budget overruns that look beyond
+    /// the 24h window.
+    pub cost_total_usd: f64,
+    /// Number of `agent_done` events folded into [`cost_24h_usd`].
+    pub session_count_24h: u32,
+    /// Number of open `agent_spawn` events (no matching `agent_done`)
+    /// whose [`cost_active_usd`] contribution was probed.
+    pub session_count_active: u32,
+}
+
+/// Build a [`CostSummary`] for `slug` by reading `progress_path`
+/// (typically `paths.progress_jsonl(slug)`) and probing each open
+/// agent session's `~/.claude/jobs/<id>/state.json` for live cost.
+///
+/// `progress_path` is taken explicitly (instead of derived from
+/// `paths + slug`) so future flex-project callers can sum across
+/// per-sid streams without forcing this helper to know the team kind.
+/// For workflow projects pass `&paths.progress_jsonl(slug)` directly.
+///
+/// **Side-effect-free.** Reads `progress_path` once + one stat/read per
+/// open job_id. No mutation to state.json (per F91 — that path is
+/// being retired). Returns `Ok(default())` when progress.jsonl is
+/// missing rather than erroring; callers (CLI / SPA / budget cap) want
+/// a zeroed surface for fresh projects.
+pub fn cost_summary(slug: &str, progress_path: &Path, paths: &CcteamPaths) -> Result<CostSummary> {
+    // Tolerate missing files: a fresh project's progress.jsonl doesn't
+    // exist yet and that must surface as zeroed cost, not an error
+    // propagated up through `workflow_summary` / `ccteam show`.
+    let _ = (slug, paths); // slug/paths reserved for flex-project routing later.
+    let events = progress::read_all_events(progress_path).unwrap_or_default();
+    Ok(compute_cost_summary(&events, Utc::now(), |job_id| {
+        crate::claude_job::probe_job(job_id)
+    }))
+}
+
+/// Pure, IO-free core of [`cost_summary`]. Takes the parsed event slice,
+/// a wall-clock `now` for the 24h window, and a `probe` closure that
+/// resolves each open `job_id` to a `JobLiveness` so the helper can
+/// total live cost without depending on the filesystem.
+///
+/// Exposed so unit tests can drive both halves (event slice + probe
+/// outcome) deterministically. Production callers route through
+/// [`cost_summary`] which wires the closure to
+/// [`crate::claude_job::probe_job`].
+pub fn compute_cost_summary<F>(events: &[Value], now: DateTime<Utc>, probe: F) -> CostSummary
+where
+    F: Fn(Option<&str>) -> crate::claude_job::JobLiveness,
+{
+    let cutoff_24h = now - Duration::hours(24);
+
+    let mut cost_total_usd = 0.0;
+    let mut cost_24h_usd = 0.0;
+    let mut session_count_24h: u32 = 0;
+    for event in events {
+        if event.get("event").and_then(|s| s.as_str()) != Some("agent_done") {
+            continue;
+        }
+        let cost = event
+            .get("cost_usd")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        cost_total_usd += cost;
+
+        // 24h filter: events with missing or unparseable `ts` are
+        // counted in the 24h bucket (defensive — newly-written rows
+        // sometimes lack ts during transitional schemas; folding them
+        // in matches the "recent" intuition the dashboard / budget cap
+        // wants).
+        let in_window = match event.get("ts").and_then(|s| s.as_str()) {
+            Some(ts) => match DateTime::parse_from_rfc3339(ts) {
+                Ok(parsed) => parsed.with_timezone(&Utc) >= cutoff_24h,
+                Err(_) => true,
+            },
+            None => true,
+        };
+        if in_window {
+            cost_24h_usd += cost;
+            session_count_24h = session_count_24h.saturating_add(1);
+        }
+    }
+
+    // Active cost: probe each open agent_spawn's job_id. `Running`
+    // verdicts contribute 0.0 here because the live cost field on
+    // state.json gets read directly below via the inner classify; the
+    // closure abstraction lets tests stub the value.
+    let open = open_agent_spawns(events);
+    let mut cost_active_usd = 0.0;
+    let session_count_active = open.len() as u32;
+    for (_sid, job_id, _role) in open {
+        match probe(job_id.as_deref()) {
+            // Running session: read state.json directly for cost_usd
+            // (claude_job::probe_job returns Terminal only on terminal
+            // signals; live cost lives in state.json::cost_usd_total).
+            crate::claude_job::JobLiveness::Running => {
+                if let Some(id) = job_id.as_deref() {
+                    let path = crate::claude_job::job_state_path(id);
+                    if let Ok(raw) = std::fs::read_to_string(&path) {
+                        if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+                            cost_active_usd += v
+                                .get("cost_usd_total")
+                                .or_else(|| v.get("cost_usd"))
+                                .and_then(|n| n.as_f64())
+                                .unwrap_or(0.0);
+                        }
+                    }
+                }
+            }
+            // Terminal probes report cost via JobLiveness::Terminal —
+            // that cost is the same value we'd read from state.json,
+            // but for stale sessions Claude has already finalized it.
+            // Surface it under cost_active_usd so SPA / budget cap see
+            // it before the orchestrator's next poll writes the
+            // synthetic agent_done that retires the spawn.
+            crate::claude_job::JobLiveness::Terminal {
+                status: _,
+                cost_usd,
+            } => {
+                cost_active_usd += cost_usd;
+            }
+        }
+    }
+
+    CostSummary {
+        cost_24h_usd,
+        cost_active_usd,
+        cost_total_usd,
+        session_count_24h,
+        session_count_active,
+    }
+}
+
 /// Snapshot of one project's workflow state for the meta-agent / web
 /// dashboard. Cheap to compute (`O(N)` over progress events + one
 /// `read_dir` per agent's artifact directory) so callers can refresh
@@ -276,8 +434,15 @@ pub struct WorkflowSummary {
     /// agent's `input` AND `output` directories are stat-ed (if set
     /// in workflow.yaml). Missing dirs map to `0`.
     pub artifact_counts: HashMap<String, u64>,
-    /// Sum of cost across every `agent_done` event in the slice.
+    /// Sum of cost across every `agent_done` event in the slice. Kept
+    /// for SPA back-compat (mirrors `cost.cost_total_usd`); F90 will
+    /// transition the dashboard to read `cost.cost_24h_usd` directly.
     pub total_cost_usd: f64,
+    /// V0.4.6 F91 — cost SoT surface used by `ccteam show` + F84 budget
+    /// cap + F90 sparkline. Lives alongside `total_cost_usd` until F90
+    /// finishes the SPA cutover; both fields will report consistent
+    /// totals during the transition.
+    pub cost: CostSummary,
     /// Count of `escalation` events in the slice.
     pub escalation_count: u32,
     /// `role` → `"waiting"` / `"released"` / `"fired"`. Derived from
@@ -294,6 +459,7 @@ impl Default for WorkflowSummary {
             agents: Vec::new(),
             artifact_counts: HashMap::new(),
             total_cost_usd: 0.0,
+            cost: CostSummary::default(),
             escalation_count: 0,
             gate_states: HashMap::new(),
         }
@@ -343,6 +509,14 @@ pub fn workflow_summary(slug: &str, paths: &CcteamPaths) -> Result<WorkflowSumma
     };
 
     let total_cost_usd = workflow_cost_total(&events);
+    // V0.4.6 F91 — rich cost surface (24h / active / total). `cost`
+    // shares the same agent_done aggregation as `total_cost_usd`; the
+    // extra dimensions (24h window + live state.json probe) are what
+    // F84 budget cap + F90 sparkline consume. `total_cost_usd` stays
+    // for SPA back-compat until F90 finishes the cutover.
+    let cost = compute_cost_summary(&events, Utc::now(), |job_id| {
+        crate::claude_job::probe_job(job_id)
+    });
     let escalation_count = escalation_count(&events);
     // V0.4.5 F80 — liveness-aware accounting. Each open `agent_spawn`
     // is cross-referenced against `~/.claude/jobs/<job_id>/state.json`
@@ -442,6 +616,7 @@ pub fn workflow_summary(slug: &str, paths: &CcteamPaths) -> Result<WorkflowSumma
         agents,
         artifact_counts,
         total_cost_usd,
+        cost,
         escalation_count,
         gate_states,
     })
@@ -458,6 +633,56 @@ fn accumulate_session(status: &mut AgentStatus, session: &AgentSessionSummary) {
     }
 }
 
+// ---------------- V0.4.6 F91 cost SoT (F84 stub) ----------------
+
+/// Rolling cost roll-up surfaced to `ccteam show` + the F84 budget
+/// guard. **F84 stub**: this version only computes `cost_24h_usd` /
+/// `cost_total_usd` / `session_count_24h` from progress.jsonl, which
+/// is all F84's `enforce_budget` needs. F91's full impl (parallel
+/// worktree) extends with `cost_active_usd` / `session_count_active`
+/// by probing `~/.claude/jobs/<job_id>/state.json` for live sessions.
+///
+/// The fields that F84 doesn't read still ship here so the type
+/// signature already matches the final F91 contract; F91 will only
+/// touch the computation, not the shape. F84 unit tests assert
+/// directly on `cost_24h_usd` so they keep passing after F91 merge.
+/// V0.4.6 F84 — pure-event-slice helper derived from F91's
+/// [`compute_cost_summary`]. F84 budget enforcement reads progress
+/// events directly (no state.json probe) so we wrap the canonical
+/// helper with a stub probe that classifies every job as terminal-zero.
+/// This keeps F84 deterministic in unit tests while sharing the same
+/// 24h window + `cost_total_usd` logic F91 already validated.
+pub fn cost_summary_from_events(events: &[Value]) -> Result<CostSummary> {
+    Ok(compute_cost_summary(events, Utc::now(), |_| {
+        crate::claude_job::JobLiveness::Terminal {
+            status: "completed",
+            cost_usd: 0.0,
+        }
+    }))
+}
+
+/// V0.4.6 F84 — count `agent_spawn` events within `window` of now.
+/// Used by the spawn-rate budget cap. Events with missing /
+/// unparseable `ts` count as "recent" (defensive: prefer false
+/// positive trip over silent overrun).
+pub fn count_agent_spawns_within(events: &[Value], window: chrono::Duration) -> u32 {
+    let cutoff = Utc::now() - window;
+    let mut n = 0_u32;
+    for evt in events {
+        if evt.get("event").and_then(|s| s.as_str()) != Some("agent_spawn") {
+            continue;
+        }
+        let ts_raw = evt.get("ts").and_then(|s| s.as_str()).unwrap_or("");
+        let in_window = chrono::DateTime::parse_from_rfc3339(ts_raw)
+            .map(|dt| dt.with_timezone(&Utc) >= cutoff)
+            .unwrap_or(true);
+        if in_window {
+            n = n.saturating_add(1);
+        }
+    }
+    n
+}
+
 fn count_files_in_dir(dir: &std::path::Path) -> u64 {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return 0;
@@ -465,6 +690,363 @@ fn count_files_in_dir(dir: &std::path::Path) -> u64 {
     rd.flatten()
         .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
         .count() as u64
+}
+
+// ---------------- V0.4.6 F90 — WorkflowView panel helpers ----------------
+
+/// One watch-path entry surfaced by `GET
+/// /api/v1/projects/<slug>/artifact_queue`. Snapshot of "what files
+/// are sitting on this trigger path right now"; the SPA renders one
+/// row per entry with count + oldest age + freshest filename.
+///
+/// `path` is the workflow.yaml-relative watch path (e.g.
+/// `.ccteam/explore-requests/`). `oldest_age_seconds` and
+/// `newest_filename` are best-effort — set to `None` when the dir is
+/// empty or unreadable.
+#[derive(Debug, Clone, Serialize)]
+pub struct ArtifactQueueEntry {
+    /// Workflow.yaml-relative watch path (preserved verbatim from
+    /// `Trigger::Watch(<path>)`).
+    pub path: String,
+    /// Owning agent role (`workflow.yaml::agents.<role>` whose
+    /// trigger declares this watch). Multiple roles may share one
+    /// path; we list the first lexicographically and surface the
+    /// rest in `extra_roles` so the SPA can label correctly.
+    pub role: String,
+    /// Number of files currently in the dir. Hidden dotfiles included
+    /// (matches inotify's "new file" semantics).
+    pub file_count: u64,
+    /// Age of the oldest file in the dir, in seconds (best-effort
+    /// — derived from `mtime`, falls back to `None` when unreadable).
+    pub oldest_age_seconds: Option<u64>,
+    /// Basename of the newest file (most recently modified) in the
+    /// dir; `None` when the dir is empty.
+    pub newest_filename: Option<String>,
+}
+
+/// V0.4.6 F90 — enumerate every `Trigger::Watch(<path>)` in a project's
+/// workflow.yaml and stat each path against the filesystem. Read-only;
+/// no progress events written. Used by the WorkflowView's "Artifact
+/// Queue" panel.
+///
+/// Returns `Ok(vec![])` when the project has no workflow.yaml or no
+/// `Trigger::Watch` agents — UI shows an empty queue panel rather than
+/// 500-ing. Hard IO errors on individual dirs become `file_count=0`
+/// rather than aborting the whole call (one broken dir shouldn't blank
+/// the whole panel).
+///
+/// Output ordering: ASCII-sorted by `path`, then `role` as tiebreaker.
+pub fn artifact_queue(slug: &str, paths: &CcteamPaths) -> Result<Vec<ArtifactQueueEntry>> {
+    let project_dir = paths.project_dir(slug);
+    let spec = match WorkflowSpec::load_for_project(&project_dir) {
+        Ok(s) => s,
+        Err(WorkflowError::NotFound(_)) => return Ok(Vec::new()),
+        Err(err) => {
+            tracing::warn!(
+                slug,
+                error = %err,
+                "artifact_queue: workflow.yaml parse failed; returning empty queue"
+            );
+            return Ok(Vec::new());
+        }
+    };
+
+    let mut entries: Vec<ArtifactQueueEntry> = Vec::new();
+    for (role, agent) in &spec.agents {
+        if let Trigger::Watch(rel) = &agent.trigger {
+            let path_display = rel.display().to_string();
+            let dir = project_dir.join(rel);
+            let stat = stat_artifact_queue(&dir);
+            entries.push(ArtifactQueueEntry {
+                path: path_display,
+                role: role.clone(),
+                file_count: stat.file_count,
+                oldest_age_seconds: stat.oldest_age_seconds,
+                newest_filename: stat.newest_filename,
+            });
+        }
+    }
+    entries.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.role.cmp(&b.role)));
+    Ok(entries)
+}
+
+struct ArtifactQueueStat {
+    file_count: u64,
+    oldest_age_seconds: Option<u64>,
+    newest_filename: Option<String>,
+}
+
+fn stat_artifact_queue(dir: &std::path::Path) -> ArtifactQueueStat {
+    let now = std::time::SystemTime::now();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return ArtifactQueueStat {
+            file_count: 0,
+            oldest_age_seconds: None,
+            newest_filename: None,
+        };
+    };
+
+    let mut files: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
+    for entry in rd.flatten() {
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        files.push((entry.path(), mtime));
+    }
+
+    if files.is_empty() {
+        return ArtifactQueueStat {
+            file_count: 0,
+            oldest_age_seconds: None,
+            newest_filename: None,
+        };
+    }
+
+    let oldest_mtime = files.iter().map(|(_, m)| *m).min().unwrap();
+    let oldest_age_seconds = now.duration_since(oldest_mtime).ok().map(|d| d.as_secs());
+
+    let (newest_path, _) = files.iter().max_by_key(|(_, m)| *m).unwrap();
+    let newest_filename = newest_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(String::from);
+
+    ArtifactQueueStat {
+        file_count: files.len() as u64,
+        oldest_age_seconds,
+        newest_filename,
+    }
+}
+
+/// V0.4.6 F90 — one hourly cost bucket for the cost-history sparkline.
+///
+/// `hour` is the UTC hour-start RFC3339 timestamp (e.g.
+/// `"2026-05-15T14:00:00Z"`). `cost_usd` is the sum of every
+/// `agent_done.cost_usd` event whose `ts` falls inside `[hour,
+/// hour+1h)`.
+#[derive(Debug, Clone, Serialize)]
+pub struct CostHistoryBucket {
+    /// UTC hour-start RFC3339 timestamp.
+    pub hour: String,
+    /// Sum of `agent_done.cost_usd` across the hour.
+    pub cost_usd: f64,
+}
+
+/// V0.4.6 F90 — bucket the slug's progress.jsonl `agent_done` events
+/// by UTC hour over the most recent `window`. Returns one bucket per
+/// hour in the window (sparse hours filled with `cost_usd = 0.0` so
+/// the SPA can render an evenly-spaced sparkline without gap detection).
+///
+/// `window_hours` clamped to `[1, 24*30]` (cap at 30 days) to keep the
+/// payload bounded.
+///
+/// Returns `Ok(vec![])` when the project has no progress.jsonl.
+pub fn cost_history_buckets(
+    slug: &str,
+    paths: &CcteamPaths,
+    window_hours: u32,
+) -> Result<Vec<CostHistoryBucket>> {
+    let hours = window_hours.clamp(1, 24 * 30);
+    let now = chrono::Utc::now();
+    // Truncate `now` to the start of the current hour so bucket
+    // boundaries align cleanly.
+    let now_hour = now
+        .with_minute(0)
+        .and_then(|t| t.with_second(0))
+        .and_then(|t| t.with_nanosecond(0))
+        .unwrap_or(now);
+    let cutoff = now_hour - chrono::Duration::hours(hours as i64 - 1);
+
+    let path = paths.progress_jsonl(slug);
+    let events = if path.exists() {
+        progress::read_all_events(&path).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    // Pre-seed `hours` buckets so sparse data still renders a steady
+    // x-axis on the SPA sparkline.
+    let mut by_hour: BTreeMap<chrono::DateTime<Utc>, f64> = BTreeMap::new();
+    for i in 0..hours {
+        let hour = cutoff + chrono::Duration::hours(i as i64);
+        by_hour.insert(hour, 0.0);
+    }
+
+    for event in &events {
+        if event.get("event").and_then(|s| s.as_str()) != Some("agent_done") {
+            continue;
+        }
+        let Some(ts_str) = event.get("ts").and_then(|s| s.as_str()) else {
+            continue;
+        };
+        let Ok(ts) = chrono::DateTime::parse_from_rfc3339(ts_str) else {
+            continue;
+        };
+        let ts_utc = ts.with_timezone(&Utc);
+        if ts_utc < cutoff {
+            continue;
+        }
+        // Round down to hour start.
+        let hour = ts_utc
+            .with_minute(0)
+            .and_then(|t| t.with_second(0))
+            .and_then(|t| t.with_nanosecond(0))
+            .unwrap_or(ts_utc);
+        let cost = event
+            .get("cost_usd")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        *by_hour.entry(hour).or_insert(0.0) += cost;
+    }
+
+    let buckets: Vec<CostHistoryBucket> = by_hour
+        .into_iter()
+        .map(|(hour, cost)| CostHistoryBucket {
+            hour: hour.to_rfc3339(),
+            cost_usd: cost,
+        })
+        .collect();
+    Ok(buckets)
+}
+
+/// V0.4.6 F90 — per-active-session snapshot rendered inside each agent
+/// card's expanded "running sessions" list. Mirrors what
+/// `current_agent_sessions_with_liveness` returns, plus a live
+/// `cost_usd` read from `~/.claude/jobs/<job_id>/state.json`
+/// (best-effort: `0.0` when state.json missing / unparseable).
+#[derive(Debug, Clone, Serialize)]
+pub struct ActiveSessionInfo {
+    /// Agent role (matches `WorkflowSpec::agents` key).
+    pub role: String,
+    /// Internal session id (`agent_spawn::session_id`).
+    pub session_id: String,
+    /// Claude Code background job id, when the spawn was F61+; `None`
+    /// for legacy / Codex sessions.
+    pub job_id: Option<String>,
+    /// Cwd as reported by `state.json`; `None` when state.json is
+    /// missing or pre-cwd schema.
+    pub cwd: Option<String>,
+    /// `agent_spawn::ts` (RFC3339 string).
+    pub started_at: String,
+    /// Live cumulative cost from state.json (`cost_usd` or
+    /// `cost_usd_total`); `0.0` when state.json missing.
+    pub cost_usd: f64,
+}
+
+/// V0.4.6 F90 — enumerate every project's "open" agent_spawn (no
+/// matching agent_done) and decorate with live `state.json` data.
+/// Powers the agent card's expanded session list.
+///
+/// Read-only; no progress events written.
+pub fn active_sessions(slug: &str, paths: &CcteamPaths) -> Result<Vec<ActiveSessionInfo>> {
+    let progress_path = paths.progress_jsonl(slug);
+    if !progress_path.exists() {
+        return Ok(Vec::new());
+    }
+    let events = progress::read_all_events(&progress_path).unwrap_or_default();
+
+    // We need both the open spawn list AND each spawn's ts. Walk
+    // events twice cheaply (events are tail-only N=workflow life).
+    let opens = progress::open_agent_spawns(&events);
+
+    // Build a (sid -> ts) lookup from agent_spawn events.
+    let mut sid_to_ts: BTreeMap<String, String> = BTreeMap::new();
+    for event in &events {
+        if event.get("event").and_then(|s| s.as_str()) != Some("agent_spawn") {
+            continue;
+        }
+        let Some(sid) = event.get("session_id").and_then(|s| s.as_str()) else {
+            continue;
+        };
+        let ts = event
+            .get("ts")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
+        sid_to_ts.entry(sid.to_string()).or_insert(ts);
+    }
+
+    let mut out: Vec<ActiveSessionInfo> = Vec::new();
+    for (sid, job_id, role) in opens {
+        let started_at = sid_to_ts.get(&sid).cloned().unwrap_or_default();
+        // Probe state.json for live cwd + cost. We re-use the same
+        // parser claude_job uses (parse_cc_state_json reads the same
+        // `cost_usd*` keys + `cwd`/`workdir`).
+        let (cwd, cost_usd) = match &job_id {
+            Some(id) => probe_active_session_state(id),
+            None => (None, 0.0),
+        };
+        out.push(ActiveSessionInfo {
+            role,
+            session_id: sid,
+            job_id,
+            cwd,
+            started_at,
+            cost_usd,
+        });
+    }
+    // Sort: role, then started_at ascending so consecutive sessions of
+    // one role render together.
+    out.sort_by(|a, b| {
+        a.role
+            .cmp(&b.role)
+            .then_with(|| a.started_at.cmp(&b.started_at))
+    });
+    Ok(out)
+}
+
+fn probe_active_session_state(job_id: &str) -> (Option<String>, f64) {
+    let path = crate::harness::state_json_path(job_id);
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return (None, 0.0);
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+        return (None, 0.0);
+    };
+    let cwd = value
+        .get("cwd")
+        .or_else(|| value.get("workdir"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let cost_usd = value
+        .get("cost_usd")
+        .or_else(|| value.get("cost_usd_total"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    (cwd, cost_usd)
+}
+
+/// V0.4.6 F90 — read the tail of a claude bg job's `output.log`.
+/// `tail_lines` clamped to `[1, 5000]` to bound the JSON payload.
+///
+/// Returns `Ok((tail_string, total_lines))`. When `output.log` is
+/// missing returns `Ok(("", 0))` rather than 404 — the SPA's
+/// `FailureInspector` then surfaces a "no log available" hint.
+pub fn job_log_tail(job_id: &str, tail_lines: u32) -> Result<(String, u64)> {
+    let n = tail_lines.clamp(1, 5000) as usize;
+    let state_path = crate::harness::state_json_path(job_id);
+    // output.log lives in the same job dir as state.json. state_json_path
+    // returns `<base>/<job_id>/state.json`; replace the filename.
+    let Some(job_dir) = state_path.parent() else {
+        return Ok((String::new(), 0));
+    };
+    let log_path = job_dir.join("output.log");
+    if !log_path.exists() {
+        return Ok((String::new(), 0));
+    }
+    let body = std::fs::read_to_string(&log_path)
+        .with_context(|| format!("read {}", log_path.display()))?;
+    let lines: Vec<&str> = body.lines().collect();
+    let total = lines.len() as u64;
+    if lines.len() <= n {
+        return Ok((body, total));
+    }
+    let tail = lines[lines.len() - n..].join("\n");
+    Ok((tail, total))
 }
 
 #[cfg(test)]

@@ -52,18 +52,24 @@ pub mod watchdog;
 // V0.4.0 F63 — workflow.yaml schema + parser. Pure data + validation;
 // no IO side effects beyond reading the YAML file. See module docs.
 pub mod workflow;
+// V0.4.6 F82 — workflow.yaml file watcher (hot-reload trigger).
+pub mod workflow_watcher;
 
 pub use actions::{
     inject_decision, next_inbox_seq, pause, resume, send_to_session, send_to_session_with,
     DecisionInput, SendOptions, SendResult,
 };
 pub use auto_loop::{AutoLoopDecision, AutoLoopFrontMatter, AutoLoopState};
-pub use claude_job::{classify as classify_job_state, probe_job, probe_state_json, JobLiveness};
+pub use claude_job::{
+    classify as classify_job_state, gc_terminated_jobs, gc_user_claude_jobs, probe_job,
+    probe_state_json, GcDisposition, GcEntry, GcReport, JobLiveness,
+};
 pub use config::{
     append_project as append_project_to_config, config_path as ccteam_config_path,
-    load as load_ccteam_config, lookup_project as lookup_project_in_config,
-    remove_project as remove_project_from_config, save as save_ccteam_config,
-    upsert_project as upsert_project_in_config, CcteamConfig, ProjectEntry, CONFIG_FILENAME,
+    default_claude_jobs_retention_days, load as load_ccteam_config,
+    lookup_project as lookup_project_in_config, remove_project as remove_project_from_config,
+    save as save_ccteam_config, upsert_project as upsert_project_in_config, CcteamConfig,
+    ProjectEntry, CONFIG_FILENAME,
 };
 pub use cost::{classify as classify_cost, CostLevel, COST_MID_WARN_USD};
 pub use daemon::{
@@ -91,10 +97,12 @@ pub use meta_agent::{
     render_meta_role_prompt, MetaBootstrapReport, META_SESSION_NAME, META_SLUG, META_TEAM_NAME,
 };
 pub use migration::{
-    migrate_v041_to_v042, render_migration_report, MigrationReport as V042MigrationReport,
+    migrate_v041_to_v042, migrate_workflow_to_ccteam_dir, render_migration_report,
+    render_workflow_migration_report, MigrationReport as V042MigrationReport,
+    WorkflowMigrationAction, WorkflowMigrationReport,
 };
 pub use orchestrator::MAX_CONCURRENT_PROJECTS;
-pub use orchestrator::{Orchestrator, OrchestratorConfig, DEFAULT_CLAUDE_MODEL};
+pub use orchestrator::{CancelReason, Orchestrator, OrchestratorConfig, DEFAULT_CLAUDE_MODEL};
 pub use paths::{
     session_context_from_cwd, slug_from_project_dir, CcteamPaths, ProjectSessionContext,
 };
@@ -111,11 +119,14 @@ pub use progress::{
 };
 pub use projects::{
     bootstrap_project, bootstrap_project_at_dir, pick_unused_slug, pick_unused_slug_verbatim,
-    pre_trust_project, slugify, slugify_brief, validate_slug_format,
+    pre_trust_project, refuses_active_session, slugify, slugify_brief, validate_slug_format,
+    ActiveSessionRefusal,
 };
 pub use queries::{
-    collect_projects, collect_recent_events, workflow_summary, AgentStatus, ProjectSummary,
-    WorkflowSummary,
+    active_sessions, artifact_queue, collect_projects, collect_recent_events, compute_cost_summary,
+    cost_history_buckets, cost_summary, cost_summary_from_events, count_agent_spawns_within,
+    job_log_tail, workflow_summary, ActiveSessionInfo, AgentStatus, ArtifactQueueEntry,
+    CostHistoryBucket, CostSummary, ProjectSummary, WorkflowSummary,
 };
 pub use screenshot::{
     probe_font as probe_screenshot_font, render_screenshot, vt100_color_to_rgb, ScreenshotResult,
@@ -168,9 +179,10 @@ pub use tmux::{
 pub use tool_surface::{
     disable_tool_surface_bootstrap_for_tests, ensure_skills_placeholders,
     migrate_legacy_skill_dirs, migrate_recommended_agent_symlinks, missing_tools,
-    rewrite_legacy_hook_commands, user_claude_dir, HookCmdRewriteAction, HookCmdRewriteReport,
-    LegacySkillAction, LegacySkillReport, MigrationReport, MissingTool, ToolSurfaceSnapshot,
-    ToolsRequired, BUILTIN_SUBAGENTS,
+    remove_cost_accumulate_hooks, rewrite_legacy_hook_commands, user_claude_dir,
+    CostAccumulateScrubAction, CostAccumulateScrubReport, HookCmdRewriteAction,
+    HookCmdRewriteReport, LegacySkillAction, LegacySkillReport, MigrationReport, MissingTool,
+    ToolSurfaceSnapshot, ToolsRequired, BUILTIN_SUBAGENTS,
 };
 pub use watchdog::{
     config_path as watchdog_config_path, load_config as load_watchdog_config,
@@ -178,8 +190,15 @@ pub use watchdog::{
     AlertKind as WatchdogAlertKind, NotifyMode as WatchdogNotifyMode, WatchdogAlert,
     WatchdogConfig, DEFAULT_NOTIFY_ON_CYCLE_COUNT, WATCHDOG_CONFIG_FILENAME,
 };
-// V0.4.0 F63 — workflow.yaml schema.
-pub use workflow::{AgentSpec, Executor, OnTimeout, Trigger, WorkflowError, WorkflowSpec};
+// V0.4.0 F63 — workflow.yaml schema. V0.4.6 F84 adds `BudgetSpec`.
+pub use workflow::{
+    AgentSpec, BudgetSpec, Executor, OnTimeout, Trigger, WorkflowError, WorkflowSpec,
+};
+// V0.4.6 F82 — workflow.yaml file watcher.
+pub use workflow_watcher::{
+    WorkflowFileEvent, WorkflowFileEventKind, WorkflowFileWatcher,
+    DEBOUNCE_WINDOW as WORKFLOW_WATCHER_DEBOUNCE_WINDOW,
+};
 // V0.4.0 F64 — artifact watcher event types + watcher entry point.
 pub use artifact_watcher::{ArtifactEvent, ArtifactWatcher, WatchKind, DEBOUNCE_WINDOW};
 

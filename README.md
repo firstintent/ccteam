@@ -1,260 +1,128 @@
 # ccteam
 
-> **Autonomous project orchestrator built on Claude Code.** Hand it a one-line idea — it spins up a long-running tmux session, runs a multi-phase pipeline (plan → implement → test → fix → ship), and gets out of your way until the project ships or genuinely needs you.
-
-## What ccteam does
-
-ccteam is a meta-tool that **schedules Claude Code sessions across many projects in parallel**, accumulates lessons across them, and asks for your input only at decision points that actually need a human.
-
-You talk to a **meta-agent** — a permanent Claude Code session that understands your intent and dispatches projects on your behalf:
-
-```
-You:    "Make a Rust CLI for managing bookmarks, SQLite-backed."
-Meta:   "I'll dispatch the dev team. Slug = dev-bookmark-cli-rust-sqlite.
-         Tracking via `ccteam show dev-bookmark-cli-rust-sqlite`."
-[~30 minutes later]
-Meta:   "dev-bookmark-cli-rust-sqlite shipped. 22 tests green, $4.80
-         cost, retro lessons appended to ~/.claude/rules/ccteam-lessons-dev.md."
-```
-
-For uncertain ideas, ccteam ships a separate research team that produces a verdict before you commit:
-
-```
-You:    "I have an idea — AI recipe generator from fridge photos. Worth doing?"
-Meta:   "I'll route to product-research. It returns PASS/CONCERN/REJECT/CLARIFY."
-[product-research runs 5–6 phases, $1–3 cost]
-Meta:   "verdict: REJECT. Three saturated competitors plus per-photo cost is
-         prohibitive. Detailed rationale in ~/projects/product-research-…/.ccteam/
-         rationale.md. Lessons appended to product-research lessons file."
-```
-
-You can also **author your own teams** — describe a workflow in natural language and ccteam scaffolds a Claude Code plugin you can run, share, or publish:
-
-```
-You:    "I want a team for iterating an existing app: new requirement →
-         feasibility → architecture → implementation → tests → release."
-Meta:   "Drafting a custom team. Plugin manifest + 6 phase markdowns
-         under ~/.config/ccteam/teams/iter-app/. Run
-         `ccteam team publish iter-app --target local` when ready."
-```
-
-## Why ccteam
-
-If you've used Claude Code for serious work, you've hit some of these:
-
-- **AI still requires you as PM**: clarifying the same context, restating preferences, watching for drift
-- **The session stops mid-task waiting for input** you weren't there to give
-- **Bug-fix infinite loops**: re-running tests forever instead of escalating
-- **Many ideas, none ship**: focus only on one project at a time
-- **Some ideas aren't worth doing** but you only learn after burning a week
-- **Each new project starts from zero**: yesterday's lessons are forgotten
-
-ccteam attacks all of these with engineering discipline:
-
-| Pain | ccteam mechanism |
-|---|---|
-| AI requires you to PM | Meta-agent dispatcher; idle-aware injection; decisions queue |
-| Sessions stop waiting for input | Phases self-loop until they reach a structured exit (`phase_done` / `escalate` / `outbox-question`); `AskUserQuestion` is intercepted and rerouted to a structured decisions outbox |
-| Bug-fix infinite loops | Hard 3-strike fix-loop ceiling, then escalate with "what tried, what failed" |
-| Many ideas pile up | Long-running tmux sessions per project, queue with `max_concurrent_projects` |
-| Not every idea is worth doing | Separate `product-research` team produces a verdict before dev work |
-| Each project from zero | Cross-project memory via `~/.claude/rules/` + per-repo auto-memory |
-| Stuck and you don't notice | Watchdog scans all sessions, surfaces stalls / cost overruns / dead daemon |
-
-## Install
-
-**Requirements**: Linux or WSL2, `tmux ≥ 3.0`, Claude Code CLI `≥ 2.1.59`, `cargo` (stable Rust), `git`.
-
-```bash
-git clone git@github.com:firstintent/ccteam.git ~/workplace/agents/ccteam
-cd ~/workplace/agents/ccteam
-make install
-ccteam --version
-```
-
-One-time setup (idempotent — re-runs are no-ops):
-
-```bash
-make setup HANDLE=<your-handle>   # init + 4 doctor installs + tool-surface health check
-```
-
-`<your-handle>` is whatever you want to call yourself — snake_case, e.g. `cto` or `alice`.
-
-<details>
-<summary>What <code>make setup</code> runs (if you want to do it by hand)</summary>
-
-```bash
-ccteam init                                       # ~/.ccteam/ skeleton
-ccteam doctor --install-skill                     # ccteam-control skill (any claude session reaches ccteam)
-ccteam doctor --install-mcp                       # 9-tool MCP server in ~/.claude.json
-ccteam doctor --install-memory-bridge             # ~/.claude/rules/ccteam-lessons-<team>.md placeholders
-ccteam doctor --install-meta-agent <your-handle>  # bootstrap your meta-agent project
-ccteam doctor --tool-surface                      # health check (must be green)
-```
-
-</details>
-
-> **Upgrading from a pre-2026-05 ccteam?** Run `ccteam doctor --migrate-recommended-agents` once after the upgrade. Spawned project sessions now resolve plugin agents through Claude Code's plugin pipeline, so the legacy `~/.claude/agents/<name>.md` symlinks ccteam used to create are obsolete; this command removes them. User-authored agents are preserved.
+> **Autonomous multi-agent orchestrator built on Claude Code.** Declare a `workflow.yaml` — ccteam schedules `claude --bg` sessions per role, watches artifact directories for triggers, and asks for your input only when agents deadlock.
 
 ## Quick start
 
 ```bash
-# Terminal A — start the orchestrator (foreground; keep this open)
-make start                              # or: ccteam start --foreground
+# Install (per machine)
+ccteam doctor --install-all           # skill + MCP + meta-agent
 
-# Terminal B — talk to the meta-agent
-make attach HANDLE=<your-handle>        # or: tmux attach -t ccteam-meta-<your-handle>
-# Then type in natural language:
-#   "Make a markdown editor, web-based, single HTML file, no build step."
-# Or for fuzzy ideas:
-#   "I'm thinking of building X — should I bother?"
-# Or to author a custom team:
-#   "Help me design a workflow for iterating an existing app."
+# New project
+cd ~/projects/my-app && ccteam init   # writes .ccteam/workflow.yaml + .claude/agents/explorer.md
+ccteam start                          # daemon + web UI on http://localhost:7331
 ```
 
-Or from any other claude session anywhere on your machine:
+Edit `.ccteam/workflow.yaml` to declare your agent topology:
 
-```bash
-cd ~/anywhere
-claude
-# Then: "ccteam, what projects are running?"
-# Or:   "Dispatch a dev team to make a todo CLI in Python."
+```yaml
+name: my-app-loop
+budget:
+  max_cost_usd_per_24h: 5.00          # auto-disable if exceeded
+agents:
+  planner:
+    trigger: manual                   # explicit spawn only
+    executor: claude
+  builder:
+    trigger: watch:.ccteam/plans/     # spawn on new file in dir
+    parallelism: 2                    # up to 2 concurrent sessions
+  reviewer:
+    trigger: gate                     # wait for trigger_gate MCP call
 ```
 
-The meta-agent uses the `ccteam-control` skill plus the `ccteam-mcp` 9-tool MCP server you installed, so any Claude Code session understands ccteam.
+Each role has a system prompt at `.claude/agents/<role>.md` (Anthropic agent spec — name / description / tools / model / color frontmatter + body).
 
-## Web dashboard (V0.3)
+## Architecture
 
-A read+write web UI for browsing all projects, watching events stream live, and dispatching actions to running sessions:
-
-```bash
-# Local-only (no auth required)
-ccteam web --bind 127.0.0.1:7331
-# → open http://127.0.0.1:7331
-
-# LAN-accessible (auto-generates token at ~/.ccteam/web-token, mode 0600)
-ccteam web --bind 0.0.0.0:7331
-# → token printed to stderr; pass as ?token=ccteam:<token> on first visit
-#   (browser then stores HttpOnly cookie; subsequent navigation seamless)
-```
-
-Surface:
-
-- `/` — project list (slug / team / phase / last event / status badge / cost)
-- `/project/<slug>` — detail page (state + last 200 events + outbox + tmux pane screenshot)
-- Live updates via Server-Sent Events
-- Write actions: send `/btw <text>`, inject decisions, pause/resume per project
-
-V0.3.1 adds flex teams for manual multi-session work. A flex project has no phase DAG:
-ccteam keeps observability, harness snapshots, progress streams, and web controls while you drive
-Claude Code sessions directly.
-
-```bash
-ccteam team init scratch --kind flex --author-name "$USER"
-ccteam team publish scratch --target local
-ccteam new migration --team scratch          # creates ~/projects/scratch-migration/
-ccteam session add scratch-migration --harness=claude
-ccteam session ls scratch-migration
-```
-
-The dashboard shows `kind=flex`; `/project/<slug>` lists session cards, and
-`/session/<slug>/<sid>` shows that session's events, harness snapshot, pane snapshot, screenshot
-fallback, and sid-scoped `/btw` control.
-
-Security: non-loopback bind requires `Authorization: Bearer ccteam:<token>` (or the cookie set by the URL shim) on every request — this header doubles as the CSRF token for write actions, since browsers won't auto-attach `Authorization` on cross-origin form submissions. `--no-auth` opt-out shows a 5-second stderr countdown so accidents are recoverable. See [`docs/v0-3/prd.md §9`](docs/v0-3/prd.md) for the full threat model.
-
-## Built-in teams
-
-| Team | What it ships | When to use |
-|---|---|---|
-| `dev` | A working software project — plan → implement → test → fix → ship | You've decided what to build |
-| `product-research` | A verdict (PASS / CONCERN / REJECT / CLARIFY) with rationale — market signals, technical feasibility, differentiation | You're not sure if it's worth building |
-| Your own | Custom phase pipeline authored via the team factory; ships as a Claude Code plugin you can share | Your workflow doesn't fit dev / product-research |
-
-To author a custom team, ask the meta-agent:
+Three layers ([`docs/tech-design.md §2.1`](docs/tech-design.md)):
 
 ```
-"Design a team for me: <describe your workflow>"
+L0  user           — chat with meta-agent OR edit workflow.yaml directly
+L1  meta-agent     — singleton claude session + 17 mcp__ccteam__* tools
+L2  ccteam daemon  — Rust orchestrator, ArtifactWatcher, progress.jsonl SoT
+L3  project agents — `claude --bg --agent <role>` per workflow.yaml role
+                     (Codex executor uses tmux)
 ```
 
-The meta-agent walks you through phase definition, tools required, golden-rule constraints, and retro-schema fields, then scaffolds the plugin under `~/.config/ccteam/teams/<name>/`. Publish with:
+**No prompt injection** — agent behavior lives in `.claude/agents/<role>.md`. **No tmux long-sessions for Claude** — each spawn is a fresh `claude --bg` job, context resets cleanly. **All state in `progress.jsonl`** — 7 canonical workflow events, single source of truth.
 
-```bash
-ccteam team publish <name> --target local              # link into ccteam-local marketplace
-ccteam team publish <name> --target github --repo ...  # push to a GitHub repo as a shareable plugin
+5 canonical orchestration patterns ([`docs/orchestration-patterns.md`](docs/orchestration-patterns.md)) — Chaining / Routing / Parallelization / Orchestrator-Worker / Evaluator-Optimizer — all map to workflow.yaml + agent.md combinations.
+
+## What it gives you
+
+| Pain | ccteam answer |
+|---|---|
+| AI helper still asks me to project-manage | meta-agent dispatches; you supervise |
+| Multi-agent topology is brittle | workflow.yaml + ArtifactWatcher; hot-reload on edit |
+| Bug fixes loop forever | hard 3-strike escalation, then notify user |
+| Run-aways blow my budget | per-project `max_cost_usd_per_24h` auto-disable |
+| Daemon ungraceful shutdown loses state | F86 cancel token + 30s timeout fallback |
+| Stale `~/.claude/jobs/<id>/` accumulates | F85 GC at daemon startup + `doctor --gc-claude-jobs` |
+| Want to delete a project | `ccteam remove <slug>` with active-session red-line refusal |
+
+## Web UI
+
+`ccteam start` launches a SPA on `http://<host>:7331` (token auth on non-loopback). Four panels per workflow:
+
+- **WorkflowView** — agent cards with running / queued / cost + SSE live updates
+- **Artifact Queue** — pending files per watch dir + oldest age
+- **Events Timeline** — `progress.jsonl` tail with event-type colors
+- **Failure Inspector** — click errored agent → live tail of `~/.claude/jobs/<id>/output.log`
+- **Cost Sparkline** — 24h / 7d trend
+
+## Commands
+
+13 user-facing (see `ccteam --help`):
+
+```
+init   start  stop  new  ls  status  show  remove
+doctor web    team  session
 ```
 
-Anyone who installs your team-plugin via Claude Code's plugin commands gets a fully-functional ccteam team.
-
-## How it works
-
-ccteam is a **three-tier architecture**:
-
+8 internal (meta-agent / MCP / hooks):
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  User interaction layer                                     │
-│   ┌──────────────────┐    ┌──────────────────────────┐      │
-│   │ ccteam-meta-X    │    │ daily-driver claude      │      │
-│   │  (permanent NL   │    │  (any session, w/ skill  │      │
-│   │   dispatcher)    │    │   + MCP)                 │      │
-│   └──────────────────┘    └──────────────────────────┘      │
-└────────────────────────┬────────────────────────────────────┘
-                         │
-┌────────────────────────▼────────────────────────────────────┐
-│  Orchestration layer (Rust daemon)                          │
-│   - tmux long sessions per project                          │
-│   - file-system control plane (~/.ccteam/, progress.jsonl)  │
-│   - hooks-based state machine                               │
-│   - phase DAG per team, three-layer team resolution         │
-│     (project > user > repo)                                 │
-└────────────────────────┬────────────────────────────────────┘
-                         │
-┌────────────────────────▼────────────────────────────────────┐
-│  Per-project Claude Code session                            │
-│   - sub-skill auto-trigger at phase boundaries              │
-│   - golden-rule enforcement                                 │
-│   - structured exits: phase_done / escalate / outbox        │
-│   - Stop-hook-driven self-loop                              │
-└─────────────────────────────────────────────────────────────┘
+ccteam internal hook | mcp-serve | spawn | send | peek | attach | progress | resume
 ```
 
-Key invariants:
+Plus `ccteam-control` skill (loaded via `ccteam doctor --install-skill`) gives natural-language wrappers in any Claude Code session.
 
-- **`progress.jsonl` is the single source of state truth** — orchestrator never parses tmux output
-- **Long-running sessions, never killed** — soft warns at 5/15/30 min idle; only hard kill is at $200 cumulative cost
-- **Three-strike fix-loop** — same fix attempted ≤ 3 times, then escalates with diagnostics
-- **Phases self-loop** — when a phase doesn't produce a structured exit, the Stop hook reminds the model to continue (or escalates after a recursion guard fires); `AskUserQuestion` is intercepted at `PreToolUse` and rerouted to a decisions outbox so the user can answer asynchronously
-- **Cross-project memory via Claude Code's official mechanisms** — no self-built RAG; uses `~/.claude/rules/ccteam-lessons-<team>.md` (auto-loaded at session start) + per-repo auto-memory + optional [`claude-mem`](https://github.com/thedotmack/claude-mem) MCP for deep search
-- **Watchdog as translation layer** — surfaces stall / cost / daemon-down / auto-loop iteration alerts to the meta-agent; never mutates orchestrator state
+## Status
 
-For the full design and protocol reference, see [`docs/tech-design.md`](docs/tech-design.md) and [`docs/interfaces.md`](docs/interfaces.md).
+- **V0.4.6 shipped** (2026-05-16) — 11 findings F81-F91 (project lifecycle / workflow hot-reload / budget cap / graceful shutdown / cost SoT / Web panels / CLI slimming)
+- **755 passing / 1 known port-bind flake** in `cargo test --workspace`
+- **V1.0.0 goals** ([`docs/requirements.md §14-15`](docs/requirements.md)):
+  1. Run autonomously ≥7 days on real 20-100k LOC projects (token maxxing)
+  2. Extend to non-coding domains (research / content ops / investment analysis)
+
+Pre-v1.0 = development stage — breaking changes welcome, no migration debt ([`CLAUDE.md §五.3`](CLAUDE.md)).
 
 ## Documentation
 
-Full documentation index: [`docs/README.md`](docs/README.md).
+Full index: [`docs/README.md`](docs/README.md).
 
-| Doc | Audience | Purpose |
-|---|---|---|
-| [`docs/v0-1/user-quickstart.md`](docs/v0-1/user-quickstart.md) | end users | hands-on walkthrough — install through dispatching a dev project end-to-end |
-| [`docs/v0-2/team-factory-userguide.md`](docs/v0-2/team-factory-userguide.md) | end users | authoring and publishing your own teams |
-| [`docs/requirements.md`](docs/requirements.md) | contributors | user pain points (acceptance baseline) |
-| [`docs/tech-design.md`](docs/tech-design.md) | contributors | architecture, three-tier model, invariants |
-| [`docs/interfaces.md`](docs/interfaces.md) | contributors | protocol reference (state.json / phase YAML / events / CLI / MCP) |
-| [`docs/dev-coupling-audit.md`](docs/dev-coupling-audit.md) | contributors | F-finding tracker (cross-version) |
-| [`CLAUDE.md`](CLAUDE.md) | AI sessions | implementation rules + red lines (consumed by Claude Code in this repo) |
+| Doc | Use case |
+|---|---|
+| [`docs/v0-4-6/user-manual.md`](docs/v0-4-6/user-manual.md) | end-user command reference |
+| [`docs/orchestration-patterns.md`](docs/orchestration-patterns.md) | designing workflow.yaml topologies (5 patterns + split philosophy) |
+| [`docs/tech-design.md`](docs/tech-design.md) | architecture SoT |
+| [`docs/interfaces.md`](docs/interfaces.md) | protocol reference (YAML / JSON / CLI / hooks) |
+| [`docs/requirements.md`](docs/requirements.md) | 15 pain points (13 user + 2 V1.0.0 ultimate) |
+| [`CLAUDE.md`](CLAUDE.md) | implementation rules (consumed by Claude Code) |
 
 ## Contributing
 
-ccteam is itself developed using Claude Code under the worktree-per-task pattern.
+ccteam is developed using Claude Code under the worktree-per-task pattern.
 
-1. Fork + clone
-2. `git worktree add -b feat/your-thing /tmp/ccteam-feature origin/main`
-3. Read [`CLAUDE.md`](CLAUDE.md) and [`docs/README.md`](docs/README.md) — implementation rules apply equally to humans and AI
-4. Every PR maps to a pain point in `requirements.md` + a section in `tech-design.md` + a task in the current version's `dev-plan.md`
-5. `cargo test --workspace` must stay green; `cargo clippy --workspace --all-targets` no new warnings
-6. Open a PR; the maintainer reviews
+```bash
+git worktree add -b feat/your-thing /tmp/ccteam-feature origin/main
+# read CLAUDE.md + docs/README.md before changing code
+cargo test --workspace --locked   # must stay green
+cargo clippy --workspace --all-targets   # no new warnings
+```
 
-Documentation is in Chinese (the project's working language); commit messages and PR descriptions are in English.
+Every PR maps to: a pain point in `requirements.md` + a section in `tech-design.md` + a F-finding in `dev-coupling-audit.md` (if applicable).
+
+Docs / agent prompts in Chinese (working language); commit messages + PR descriptions in English.
 
 ## License
 
@@ -262,6 +130,5 @@ See [`LICENSE`](LICENSE).
 
 ## Acknowledgments
 
-- [Claude Code](https://code.claude.com/) — the runtime that makes this all possible
-- [`claude-plugins-official`](https://github.com/anthropics/claude-plugins) — many phase sub-skills are referenced from this marketplace
-- [OpenAI Symphony](https://github.com/openai/symphony) — long-term architectural reference for orchestration model
+- [Claude Code](https://code.claude.com/) — the runtime
+- [Anthropic *Building Effective Agents*](https://www.anthropic.com/engineering/building-effective-agents) — the 5-pattern taxonomy

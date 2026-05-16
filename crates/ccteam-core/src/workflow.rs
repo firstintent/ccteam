@@ -36,16 +36,78 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::path::{Path, PathBuf};
 
 /// Full `workflow.yaml` document.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct WorkflowSpec {
     /// Workflow identifier (unique within a project).
     pub name: String,
     /// Optional human-readable description for the meta-agent / UI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// V0.4.6 F82 — soft toggle. `false` makes the daemon skip rostering
+    /// this workflow (and tear down a running loop on hot-reload). The
+    /// project's `state.json`, `progress.jsonl`, and artifact dirs stay
+    /// intact; flipping back to `true` resumes from where the last loop
+    /// left off. Defaults to `true` for backwards compatibility with
+    /// V0.4.5 workflow.yaml files that omit the field.
+    ///
+    /// Skipped on serialize when `true` (the default) so round-trips
+    /// don't add boilerplate to hand-authored workflow.yaml files —
+    /// only the opt-out form `enabled: false` shows up in the
+    /// rendered YAML.
+    #[serde(
+        default = "default_enabled",
+        skip_serializing_if = "is_enabled_default"
+    )]
+    pub enabled: bool,
+    /// V0.4.6 F84: optional budget cap. When set, the orchestrator
+    /// runs `enforce_budget` at each tick; tripping a cap emits a
+    /// `budget_exceeded` event and flips `enabled: false` via the F82
+    /// `auto_disable_workflow` codepath. Default `None` (no budget,
+    /// V0.4.5 behaviour) keeps every existing workflow.yaml
+    /// unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<BudgetSpec>,
     /// Role → agent spec. `IndexMap` preserves YAML declaration order so
     /// trigger graph build is deterministic across runs.
     pub agents: IndexMap<String, AgentSpec>,
+}
+
+/// Default for `WorkflowSpec::enabled` when the YAML omits the field.
+/// `true` matches V0.4.5 behaviour (no field = run the workflow).
+fn default_enabled() -> bool {
+    true
+}
+
+/// Predicate paired with `default_enabled` so `enabled: true` (the
+/// default) is omitted from serialized YAML — only the opt-out form
+/// `enabled: false` is rendered.
+fn is_enabled_default(v: &bool) -> bool {
+    *v
+}
+
+/// V0.4.6 F84 — optional `budget` block under workflow.yaml top-level.
+///
+/// ```yaml
+/// budget:
+///   max_cost_usd_per_24h: 5.00         # rolling 24h cost cap
+///   max_agent_spawns_per_hour: 100     # rolling 1h spawn-rate cap
+/// ```
+///
+/// Both fields are optional; a missing field disables that specific
+/// cap (the other still trips). A missing `budget` block entirely
+/// (`None`) → no-op (PRD F84 验收 #4).
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct BudgetSpec {
+    /// Rolling 24h window cost cap (USD). Sum of `agent_done.cost_usd`
+    /// for events with `ts >= now - 24h` ≥ this value → trip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cost_usd_per_24h: Option<f64>,
+    /// Rolling 1h spawn count cap. Number of `agent_spawn` events with
+    /// `ts >= now - 1h` ≥ this value → trip. Defends against
+    /// self-excitation runaway (e.g. explorer writing to its own watch
+    /// dir — observed in dex-ui 2026-05-16 burning $1.10/4h).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_agent_spawns_per_hour: Option<u32>,
 }
 
 /// Per-agent role configuration.
@@ -184,8 +246,8 @@ fn parse_trigger(raw: &str) -> Result<Trigger, String> {
 /// Errors surfaced by [`WorkflowSpec::load`] / [`WorkflowSpec::validate`].
 #[derive(thiserror::Error, Debug)]
 pub enum WorkflowError {
-    /// Neither `<project>/workflow.yaml` nor
-    /// `<project>/.ccteam/workflow.yaml` exists.
+    /// Neither `<project>/.ccteam/workflow.yaml` (canonical) nor
+    /// `<project>/workflow.yaml` (legacy V0.4.0–V0.4.5 fallback) exists.
     #[error("workflow.yaml not found in {0:?}")]
     NotFound(PathBuf),
     /// Filesystem read failure (permissions, EIO, etc).
@@ -209,17 +271,18 @@ impl WorkflowSpec {
         Ok(spec)
     }
 
-    /// Discovery: probe `<project_dir>/workflow.yaml` then
-    /// `<project_dir>/.ccteam/workflow.yaml`. Returns
-    /// [`WorkflowError::NotFound`] when neither exists.
+    /// Discovery: probe `<project_dir>/.ccteam/workflow.yaml` first
+    /// (canonical V0.4.6+ location), then fall back to
+    /// `<project_dir>/workflow.yaml` (V0.4.0–V0.4.5 legacy; removed in
+    /// V0.5). Returns [`WorkflowError::NotFound`] when neither exists.
     pub fn load_for_project(project_dir: &Path) -> Result<Self, WorkflowError> {
-        let direct = project_dir.join("workflow.yaml");
-        if direct.exists() {
-            return Self::load(&direct);
-        }
         let nested = project_dir.join(".ccteam").join("workflow.yaml");
         if nested.exists() {
             return Self::load(&nested);
+        }
+        let direct = project_dir.join("workflow.yaml");
+        if direct.exists() {
+            return Self::load(&direct);
         }
         Err(WorkflowError::NotFound(project_dir.to_path_buf()))
     }
@@ -326,6 +389,8 @@ mod tests {
         let spec = WorkflowSpec {
             name: "x".into(),
             description: None,
+            enabled: true,
+            budget: None,
             agents: {
                 let mut m = IndexMap::new();
                 m.insert(
