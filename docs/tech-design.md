@@ -10,21 +10,23 @@
 
 每条原则都直接挂钩 `requirements.md` 中的某条痛点。
 
-| 原则 | 对应痛点 | 落地约束 |
+> **V0.4.0 起架构换血**:**phase DAG / `parallelism: solo/agent_team/multi_session` / 9 阶段流水线全 EOL**。新模型 = `workflow.yaml`(agent 拓扑 + `Trigger::{Manual,Schedule,Gate,Watch(PathBuf)}` + 每 agent `parallelism: u32`)+ `.claude/agents/<role>.md`(agent 行为 SoT)+ orchestrator 用 inotify ArtifactWatcher 把文件系统事件 fan-out 到 agent spawn。下面原则按 V0.4.6 现状重写;phase 时代等价机制保留在 §3.3 EOL 节作为历史。
+
+| 原则 | 对应痛点 | 落地约束（V0.4.6） |
 |---|---|---|
-| **守护进程化（daemonize）** | 痛点 9：AI 团队需要人来主持 | Orchestrator 独立于任何 Claude Code 主对话，作为 systemd / cron 长跑进程 |
-| **文件即状态机** | 痛点 7：进度永远不透明 | 一切状态可从文件系统恢复；进程重启不丢任务 |
-| **长 session 优先** | 痛点 8/9 + cache 复用降成本 | 每项目一个 tmux + `claude --dangerously-skip-permissions` 长 session；不用 `-p`，phase 切换靠 send-keys 注入；同 session 跨 phase 共享 prompt cache |
-| **三态 Seed Gate** | 痛点 6：不是每个想法都值得做 | 每个项目先过 PASS / REJECT / CLARIFY；REJECT 不下场，节省精力 |
-| **测试即验收** | 痛点 3：测试和质量是黑洞 | 自动化 fix loop 收敛后跑 test，全绿才标记 done；无主观 review |
-| **3-Strike 自愈再升级** | 痛点 4：bug 修复无限循环 | 失败先自己修 N 轮，撞顶才升级用户，并附"试过什么 / 卡在哪" |
-| **跨项目沉淀** | 痛点 10：每个新项目从零开始 | 复用官方 `~/.claude/CLAUDE.md` + `~/.claude/rules/ccteam-lessons-<team>.md` + per-repo auto-memory；retro phase 让 Claude 写，Seed/verdict phase 启动时官方机制自动注入（详见 §3.7） |
-| **零交互沙盒** | 痛点 8：每一步都点允许 | 项目级 Docker / 容器隔离 + 全放行 settings.json |
-| **决策点 ≤ 3** | 痛点 2：AI 仍要求我当 PM | 只有不可逆决策（架构、scope 大改、API 形态）才走 escalation |
-| **纵深防御替代人值守** | 痛点 11：关键节点不把控 | L1 架构约束（hooks + required_outputs）+ L2 多 agent 互检 + cross-cutting watcher（议事）+ L3 用户兜底（仅 deadlock 弹）；详见 §3.6 |
-| **pipeline 编排 sub-skill** | 痛点 12：工作流插件靠人手动调 | 9 主干 phase + 每 phase front matter `sub_skills` 字段；orchestrator 自动 trigger，产物自动接力；复用 gstack / claude-plugins-official 的 plugin，不重写；详见 §6.10 |
-| **并行规模自适应** | 痛点 13：大项目串行慢、并行规模选不对 | plan-eng 按 spec 复杂度选 `parallelism: solo / agent_team / multi_session`；subagent 任何粒度可叠加（ad-hoc，不在协议中声明）；三档叠加层级，不是互斥；详见 §3.3、§6.3、§6.11 |
-| **smart layer 只 translate,不 decide**（V0.2 M0.21） | watchdog / 后续 ux-helper 不能改 orchestrator 状态 | translation 层(meta-agent watchdog 等)只读取既有遥测,产出 NL 通知;**绝不**调 orchestrator API、写 progress.jsonl、kill session、re-inject prompt;**所有状态变更只能由 orchestrator + hooks 走;** 详见 §3.X |
+| **守护进程化（daemonize）** | 痛点 9：AI 团队需要人来主持 | Orchestrator 独立于任何 Claude Code 主对话，作为 systemd / cron 长跑进程；V0.4.6 F86 加 graceful shutdown cancel token，SIGTERM / `ccteam stop` 写 `/tmp/ccteam-<user>.shutdown` → daemon 收到 trigger → 所有 event_loop 优雅退 + 写 `workflow_done reason="shutdown"` |
+| **文件即状态机** | 痛点 7：进度永远不透明 | 一切状态可从文件系统恢复；进程重启不丢任务；**`progress.jsonl` 7 类业务事件（workflow_start / agent_spawn / agent_done / artifact_received / gate_triggered / budget_exceeded / workflow_done + escalation）是唯一 SoT**（§5.5） |
+| **声明式拓扑而非命令式 phase**（V0.4.0+） | 痛点 12 + 痛点 13 | `workflow.yaml::agents` 声明角色 + Trigger + parallelism + 可选 budget；orchestrator 用 ArtifactWatcher（inotify/fsevents）把文件系统事件 → agent spawn，不再用编排器维护 phase 状态机；agent 行为完全在 `.claude/agents/<role>.md` 内，与编排解耦 |
+| **bg-job 替代长 tmux session**（V0.4.0+） | 痛点 8/9 + Claude 后台模式成熟 | Claude agent 走 `claude --bg --agent <role>` 写 `~/.claude/jobs/<job_id>/state.json`（后台模式），orchestrator 读 state.json 拿 liveness + cost；**只有 Codex CLI adapter** 仍走 tmux + statusline 路径（独立 adapter，F62 推迟标准化）；旧版 tmux + statusline + `--dangerously-skip-permissions` 长 session 路径 EOL，但 §6.1 保留作历史 |
+| **多 trigger / 受控并发** | 痛点 13 | `Trigger::Watch(path)` + 每 agent `parallelism: u32` 上限（只对 Watch 触发有意义，其他 trigger 强制 ≤ 1）；Manual / Schedule / Gate 三类 trigger 各自语义清晰（§3.3） |
+| **3-Strike 自愈再升级** | 痛点 4：bug 修复无限循环 | F66 thin orchestrator 维护 per-role `fix_counts`，撞 3 次顶 → `escalation` 事件 + meta-agent inbox notify；**phase 概念已废**，fix-loop 改 "watch:fix-requests/ 上 fixer 写第 4 个 file → escalation" 形态（§3.5） |
+| **跨项目沉淀** | 痛点 10：每个新项目从零开始 | 复用官方 `~/.claude/CLAUDE.md` + `~/.claude/rules/ccteam-lessons-<team>.md` + per-repo auto-memory；每次 `claude --bg` 起新 job = 全新 1M context，加载机制自动注入；**ccteam-core 零 memory 检索代码**（§3.7） |
+| **零交互沙盒** | 痛点 8：每一步都点允许 | 项目级 Docker / 容器隔离 + Claude bg-job 默认 `--dangerously-skip-permissions`；每个项目根 / `.ccteam/`（V0.4.6 F83）隔离 |
+| **决策点 ≤ 3** | 痛点 2：AI 仍要求我当 PM | 只有不可逆决策（架构、scope 大改、API 形态）才走 escalation 事件 + meta-agent inbox |
+| **预算硬上限**（V0.4.6 F84） | 痛点 5 + 自激励 loop 防失控 | `workflow.yaml::budget.{max_cost_usd_per_24h, max_agent_spawns_per_hour}` 任一超限 → 写 `budget_exceeded` 事件 + 自动 `enabled: false` 优雅终止 event_loop；cost 数据源 V0.4.6 F91 已收敛（详 §6.X cost telemetry） |
+| **pipeline 编排 sub-skill** | 痛点 12：工作流插件靠人手动调 | agent 在自己的 `.claude/agents/<role>.md` 里声明 `Task(subagent_type=...)` 与 skill 调用；orchestrator 不再 phase-level 调度 sub-skill，而是 agent 内部决定何时调；复用 claude-plugins-official 的 plugin，不重写；详见 §6.10 |
+| **纵深防御替代人值守** | 痛点 11：关键节点不把控 | L1 架构约束（hooks + 危险命令拦截）+ L2 多 agent 互检（workflow 内 explorer / fixer / reviewer 多视角）+ L3 用户兜底（仅 escalation / budget_exceeded 弹）；详见 §3.6 |
+| **smart layer 只 translate，不 decide** | watchdog / 后续 ux-helper 不能改 orchestrator 状态 | translation 层只读取既有遥测，产出 NL 通知；**绝不**调 orchestrator API、写 progress.jsonl、kill session；**所有状态变更只能由 orchestrator + hooks 走；** 详见 §3.9 |
 
 ---
 
@@ -56,35 +58,43 @@
                              │ inbox/outbox 文件协议
                              ▼
 ┌──────────────────────────────────────────────────────────┐
-│  User Interaction Layer  (已 ship,M1)                   │
+│  User Interaction Layer  (已 ship,M1 + V0.4.0 重塑)     │
 │                                                          │
 │  ┌──────────────────────┐  ┌─────────────────────────┐  │
-│  │ meta-agent session   │  │ project sessions(N 条)│  │
-│  │ ccteam-meta-<user>   │  │ ccteam-<team>-<slug>    │  │
-│  │ - 常驻、永不 terminal│  │ - 每项目一条独立 tmux   │  │
-│  │ - NL 派单 / 跨项目   │  │ - 独立 progress.jsonl   │  │
-│  │   查询 / 监控         │  │ - 独立 phase DAG        │  │
-│  │ - 跨项目 lessons     │  │ - 独立 context cache    │  │
-│  │   via ~/.claude/rules │  │                         │  │
-│  │   (M4 已 ship)        │  │                         │  │
-│  │ - tmux attach 即对话 │  │ - tmux attach 即对话    │  │
+│  │ meta-agent session   │  │ project agent jobs(N 个)│  │
+│  │ ccteam-meta-<user>   │  │ ~/.claude/jobs/<job_id>/│  │
+│  │ - 常驻、永不 terminal│  │ - claude --bg --agent X │  │
+│  │ - NL 派单 / 跨项目   │  │ - state.json::cost_usd_ │  │
+│  │   查询 / 监控         │  │   total / state ∈ {     │  │
+│  │ - 跨项目 lessons     │  │   working/completed/    │  │
+│  │   via ~/.claude/rules │  │   errored/...}          │  │
+│  │   (M4 已 ship)        │  │ - workflow.yaml 描述拓扑│  │
+│  │ - tmux attach 即对话 │  │ - artifact 触发 spawn   │  │
+│  │   (meta 仍 tmux)     │  │ - codex adapter 仍 tmux │  │
 │  └──────────────────────┘  └─────────────────────────┘  │
 │                                                          │
 │  接入面契约:                                             │
-│  - ~/projects/<team>-<slug>/.ccteam/inbox/  &  outbox/   │
+│  - <project>/.ccteam/<artifact_dir>/  (Watch trigger SoT)│
+│  - <project>/.ccteam/workflow.yaml  (拓扑 SoT,V0.4.6 F83)│
+│  - <project>/.claude/agents/<role>.md  (agent 行为 SoT) │
 │  - ~/projects/<user>-meta/.ccteam/inbox/  &  outbox/     │
-│  (NL markdown + JSON 元数据,channel 层翻译外部消息进入) │
+│  (artifact 是文件,inbox/outbox 是 NL markdown)         │
 └──────────────────────────┬───────────────────────────────┘
-                           │ tmux send-keys / inbox watcher
+                           │ inotify ArtifactWatcher / inbox watcher
                            ▼
 ┌──────────────────────────────────────────────────────────┐
-│  Orchestration Layer  (已 ship,M0 + M0.5)               │
+│  Orchestration Layer  (V0.4.0 F66 thin orchestrator)    │
 │  - Rust orchestrator daemon(~/.ccteam/ 状态平面)        │
-│  - progress.jsonl 唯一状态事实来源(§5.5)                │
-│  - hooks(§6.2)/ auto_loop(§3.5)/ context reset(§6.9)│
-│  - cost / stall watchers(§6.8)                          │
-│  - tmux session lifecycle(§6.1)                         │
-│  - team abstraction(已 ship,M3,§3.3)                  │
+│  - progress.jsonl 7 类业务事件唯一 SoT(§5.5)            │
+│    workflow_start / agent_spawn / agent_done /          │
+│    artifact_received / gate_triggered / budget_exceeded │
+│    / workflow_done + escalation                         │
+│  - ArtifactWatcher(notify crate inotify/fsevents,F64)│
+│  - 每 workflow 一个 event_loop(JoinSet,F82 cancel       │
+│    token,F86 graceful shutdown)                         │
+│  - 17 个 mcp__ccteam__* tools(F65)                      │
+│  - hooks(§6.2)/ cost telemetry(F91,§6.X)            │
+│  - team abstraction(M3 已 ship,§3.2.2)                │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -111,11 +121,19 @@
 
 #### 2.1.3 进程视图(实施细节)
 
-上面是逻辑分层。**进程视图**对应 §6.1:每条 tmux 长 session(meta-agent
-session + 每个项目 session)是独立 OS 进程;Rust orchestrator 是另一个
-独立进程;channel adapter 进入 M2+ 后又是若干独立进程。所有进程之间用
-**文件系统协议**通信,**不用共享内存 / sockets / IPC**(§5 与 §3.1)。
+上面是逻辑分层。**进程视图**(V0.4.0 后):
+
+- **meta-agent session** 仍然是独立 tmux + claude 长进程(meta-agent 走 dispatcher role,事件循环不需要 bg-job 形态);
+- **项目 agent job** 走 `claude --bg --agent <role>`,每个 spawn 是一个独立 bg-job 进程,生命周期 = 一次 trigger → 一次 agent_done 即终止;**没有"项目长 session"概念了** — 项目持久化在 `<project>/.ccteam/state.json` + `<project>/.ccteam/workflow.yaml`,agent 进程都是短命的;
+- **Codex 例外**:Codex CLI adapter 仍走 tmux + statusline 长 session 路径(V0.4.0 trait stub,F62 推迟标准化),保留 §6.1 的 tmux 操作模板作历史;
+- **Rust orchestrator daemon** 是另一个独立进程(F66 thin 形态,只读 progress.jsonl + 文件系统 trigger,不维护 phase 状态机);
+- **channel adapter** 进入 M2+ 后又是若干独立进程。
+
+所有进程之间用**文件系统协议**通信,**不用共享内存 / sockets / IPC**(§5 与 §3.1)。
 进程崩溃只丢自己的进程内存,文件状态留给重启后恢复。
+V0.4.6 F86 加 graceful shutdown 后,daemon 收到 SIGTERM / `/tmp/ccteam-<user>.shutdown` →
+所有 event_loop 优雅退、`workflow_done reason="shutdown"` 写进 progress.jsonl、in-flight
+bg-job 留给下次启动 F80 phantom cleanup 补 synthetic agent_done(详 §6.X graceful shutdown)。
 
 ### 2.2 关键架构决策
 
@@ -134,15 +152,14 @@ session + 每个项目 session)是独立 OS 进程;Rust orchestrator 是另一�
 - 文件协议零依赖、可审计、可备份。
 - 真要外部 tracker，留作可选 adapter（M3+）。
 
-**为什么用 tmux 长 session 而非每 phase 一个 `claude -p` 子进程？**
+**V0.4.0 起改走 `claude --bg --agent` bg-job 形态(为什么不再用 tmux 长 session)：**
 
-- **prompt cache 复用**：Anthropic prompt cache TTL 5 分钟，命中后费用降到约 10%。每 phase 起新子进程意味着重读 CLAUDE.md / spec / 上游产物，反复触发冷启动；同 session 跨 phase 共享缓存，长跑项目（数小时-数天）累计省下大量成本。
-- **可观测性天然解决**：tmux 是终端 UI，用户 `ccteam attach <slug>` 立刻看到 Claude 在做什么；headless 子进程必须靠解析 stream-json 才能知情。
-- **可中断 / 可注入**：用户 attach 后直接键入指令纠偏（"等等，先别用 SQLite"），Ctrl+C 中断推理；headless 模式没有这个能力。
-- **detach 即守护**：tmux session 在用户断开后继续运行——这是 tmux 的本质优势，刚好契合"关掉电脑团队继续跑"。
-- **不限制 max_turns / max_budget**：长 session 模式下不再硬封顶（理由见 §6.8）；只保留 stall 检测作为软告警。
-
-**Trade-off**：长 session 上下文会膨胀，单 session 跑数日后可能逼近上限。应对见 §6.8 与 §8。
+- **后台模式成熟**:V0.4.0 时点 Claude Code 已成熟支持 `--bg --agent <role>` 写 `~/.claude/jobs/<job_id>/state.json`,可外部观测 liveness + 累计 cost,无需再靠 tmux UI / stream-json 解析。
+- **prompt cache 仍复用**:同一 claude binary process 内 cache 仍按 1M context 5min TTL 累加;`workflow.yaml` agent 触发短跑(每 spawn 通常 < 5min),命中冷启动概率低。
+- **agent 行为 SoT 分离**:`workflow.yaml` 只声明 trigger + 连线 + 并发上限,**不含 prompt**;agent 系统提示 / 工具表面在 `.claude/agents/<role>.md`(Claude Code first-class spec),编排器与 prompt 完全解耦。
+- **每次 spawn = 全新 1M context**:不需要 §6.9 旧版的"60% 阈值 + phase 边界 reset"复杂路径——bg-job 本身就是短命,context 不会撑爆。
+- **trade-off**:cache miss 频率比 V0.3 单长 session 高,但 spawn 也更短(workflow agent 平均 30s-5min);单次 spawn cost 易算清,F84 budget cap 直接套(workflow.yaml `max_cost_usd_per_24h`)。
+- **Codex CLI 适配器例外**:Codex 仍走 tmux + statusline(stable 后台模式 V0.4.6 时还没就绪),作为独立 adapter 路径保留,详 §6.1 历史小节。
 
 ---
 
@@ -184,78 +201,81 @@ created_at: 2026-05-04T10:23:00Z
 - 单进程拥有所有可变状态——抄 Symphony 的 "single GenServer" 思路，避免锁
 - 零运行时依赖,与产出项目的容器化路径正交
 
-**核心循环**（伪代码）：
+**核心循环**(V0.4.0 F66 thin orchestrator 形态,伪代码):
 ```rust
-async fn main_loop() {
+async fn run() -> Result<()> {
     let mut state = State::load_from_fs();          // 启动时从文件恢复
-    reattach_tmux_sessions(&mut state).await;       // 已存在的 session 直接续接
+    let mut tasks: JoinSet<()> = JoinSet::new();    // 每 workflow 一个 event_loop
+    let shutdown_token = Arc::new(Notify::new());   // V0.4.6 F86 graceful shutdown
+    let cancel_map = Arc::new(DashMap::new());      // F82 per-workflow cancel
+    install_signal_handlers(shutdown_token.clone());
+    spawn_artifact_watchers(&state).await;          // F64 inotify per Watch trigger
+    spawn_workflow_yaml_watchers(&state).await;     // F82 hot reload on workflow.yaml mtime
+    spawn_new_rostered_projects(&state, &mut tasks, cancel_map.clone()).await;
     loop {
-        poll_inbox(&mut state).await;               // 新想法 → seeding 队列
-        ensure_session_started(&mut state).await;   // 项目首启动 → 拉起 tmux + claude
-        dispatch_next_phase(&mut state).await;      // idle-aware send-keys 注入（见 §6.9）
-        consume_progress_jsonl(&mut state).await;   // inotify 读 hooks 写的事件流
-        detect_stall_and_warn(&mut state).await;    // 5/15/30 min 三档软告警
-        detect_user_attach(&mut state).await;       // 检测到人介入则暂停自动调度
-        reset_if_context_high(&mut state).await;    // phase 边界 + ctx > 60% → reset session
-        maybe_notify_user(&mut state).await;        // escalation / done
-        tokio::time::sleep(Duration::from_secs(30)).await;
+        select! {
+            _ = shutdown_token.notified() => {
+                // F86: graceful shutdown — cancel all event_loop,等 JoinSet 自然退,
+                // 30s timeout 后才走 abort_all() fallback
+                graceful_shutdown(&mut tasks, cancel_map, Duration::from_secs(30)).await;
+                return Ok(());
+            }
+            Some(result) = tasks.join_next() => {
+                // event_loop 自己退(workflow_done reason="disabled"/"shutdown"/"budget_exceeded")
+                // 或 panic → 记录,等 F82 watcher 重新 roster
+            }
+            _ = tokio::time::sleep(tick) => {
+                poll_global_inbox(&mut state).await;
+                spawn_new_rostered_projects(&state, &mut tasks, cancel_map.clone()).await;
+                enforce_budget(&state).await;          // F84 24h cost / 1h spawn rate
+                cleanup_stale_spawns(&state).await;    // F80 phantom agent_spawn 清理
+            }
+        }
+    }
+}
+
+// per-workflow event_loop(run_project 实质)
+async fn run_project(slug: &str, cancel: CancelToken) {
+    let workflow = WorkflowSpec::load(&project_dir)?;
+    if !workflow.enabled { return; }                 // F82
+    append_event(slug, "workflow_start", json!({...}));
+    let watch_rx = build_artifact_watchers(&workflow).await;
+    loop {
+        select! {
+            _ = cancel.cancelled() => {
+                append_event(slug, "workflow_done", json!({"reason": "shutdown"}));
+                return;
+            }
+            Some(artifact) = watch_rx.recv() => {
+                if running_for_role(slug, &artifact.role) >= parallelism(&artifact.role) { continue; }
+                let job_id = spawn_claude_bg(&workflow, &artifact).await?;
+                append_event(slug, "agent_spawn", json!({"role": ..., "job_id": ..., ...}));
+            }
+            // gate / manual / schedule triggers 走 MCP tool 或定时 tick
+        }
     }
 }
 ```
 
-**状态机**（per project，参考 Symphony Run attempt）：
+**状态模型**(V0.4.0 起):
 
-```
-inbox
-  └─ triage → seeding
-       └─ Seed phase → 
-            ├─ rejected   (终态，archive + 通知用户带理由)
-            ├─ clarify    (问用户一个问题，等回答，重跑 Seed)
-            └─ seeded → planning
-                 └─ Plan phase → planned
-                      └─ Dev phase → coding
-                           ├─ tests-pass → reviewing
-                           │    └─ Review phase →
-                           │         ├─ approved → shipped (终态)
-                           │         └─ blocked → coding (fix-loop, 上限 3)
-                           └─ tests-fail → fixing
-                                └─ Fix loop ≤ 3 轮 →
-                                     ├─ tests-pass → reviewing
-                                     └─ blocked → escalated (终态，通知用户)
-```
+- **`progress.jsonl` 是 SoT**:7 类业务事件(`workflow_start` / `agent_spawn` / `agent_done` / `artifact_received` / `gate_triggered` / `budget_exceeded` / `workflow_done` + `escalation`)实时累积;orchestrator 只读这一份做"哪些 agent 在跑、跑了多少、cost 多少"判定。
+- **`state.json` 退化为 serde-compat shell**:`current_phase` / `phase_history` / `decision_candidates` 等 V0.3 字段 `#[serde(skip_serializing_if = "Option::is_none")]` 保留**只读**,新写不带,旧 state.json 仍可读;F66 thin orchestrator 完全不消费它们。
+- **`session_handle` / `tmux_session` / `claude_pid` 路径退役**:F66 后 spawn 拿到的是 `~/.claude/jobs/<job_id>/state.json` 路径而非 PID;每个 `agent_spawn` 事件 payload 直接带 `job_id`,liveness 走 `claude_job::probe_job` 读 state.json(F80)。
 
-**单点 + claim 防重**：claim 粒度是**项目级**（每项目一个 tmux session 一个 claude 进程）。state.json 记录 `tmux_session: ccteam-<team>-<slug>`、`claude_pid`、`phase_state: in_flight | idle | fix_locked`。
+**单点 + claim 防重**(V0.4.6):claim 粒度是 **agent role 级**(同 role 并发上限 = `AgentSpec::parallelism`,只对 `Trigger::Watch` 有意义,其他 trigger 强制单实例)。orchestrator `running_for_role()` 扫 progress.jsonl 末尾事件,有 `agent_spawn` 但还没匹配 `agent_done` 就算 running。
 
-- `in_flight` = 已 send-keys 注入 phase prompt，等待 progress.jsonl 中出现 `phase_done` 或 `escalate` 事件
-- `idle` = 上一 phase 完成，session 还活着但没在跑——orchestrator 可以注入下一 phase
-- `fix_locked` = 当前在 fix-cycle 中，Stop hook 按 §3.5 的 ralph-loop 范式接管自循环；orchestrator **不**注入新 prompt，直到 progress.jsonl 出现 `phase_done`（测试绿）或 `escalate`（撞 3 次顶）
+**orchestrator 重启时**:F80 phantom cleanup 扫每个项目 progress.jsonl,凡 `agent_spawn` 无匹配 `agent_done` 且对应 `~/.claude/jobs/<job_id>/state.json` 已不存在或处 terminal state → 补 synthetic `agent_done status="cleanup"` + cost 0;ArtifactWatcher 重新装,event_loop 重新跑,完全无状态恢复负担。
 
-orchestrator 重启时：`tmux has-session` + `kill -0 <claude_pid>` 双重校验。session 还在 → 续接；进程不在 → 走 §6.1 的"极端情况——session 必须重启"路径用 `--resume` 恢复对话历史。
+#### 3.2.1 Evergreen 团队（meta-agent / 常驻 role）
 
-#### 3.2.1 Evergreen 团队(V0.2 §6.4 candidate 5)
+> **V0.4.0 起重塑**:phase DAG 全废后,evergreen 概念退化为"普通项目 + workflow.yaml 里用 `trigger: manual` 或 `trigger: watch` 跑事件循环"。`team.yaml::evergreen: true` 标志位仍 serde-compat 保留,但 orchestrator 不再据此分叉 — `process_meta_project` / `enforce_cost_thresholds` 等老路径在 F66 thin orchestrator 后不复存在。
 
-某些团队不走 phase DAG —— meta-agent 是事件循环 session,V0.3 watchdog /
-reviewer agent 同样会是常驻角色。这类 team 的 `team.yaml` 设
-`evergreen: true` + `cost_policy: {kind: none}` 后,orchestrator 会:
+V0.4.6 实际形态:meta-agent 是一个 workflow.yaml 配 `trigger: manual` 的 dispatcher agent + `<project>/.ccteam/inbox/` 作 Watch trigger 的接力跑者(用户写 inbox → ArtifactWatcher 触发 dispatcher agent 一次)。watchdog / reviewer 同理 — 在自家 workflow.yaml 用 `trigger: manual` + meta-agent 在自己 outbox 写 NL trigger,或用 `trigger: schedule`(V0.4.6 仍是 stub,V0.4.7+ 才有真 cron)。
 
-- `process_project` 早返,转到 `process_meta_project`(inbox drain +
-  context reset,§6.9)
-- `enforce_cost_thresholds` 跳过整个 cost 阶梯
-- `warn_if_stalled` 跳过 stall 警告(idle 是常态)
-- 不计入 `MAX_CONCURRENT_PROJECTS` 配额
+`teams/meta-agent.yaml` 是首个 evergreen 范例,V0.2 起作为 shipped seed 随 binary 发布;`Orchestrator::new` / `ccteam start` / `ccteam doctor --reset-shipped-teams` 都会把它写到 `~/.ccteam/teams/meta-agent/team.yaml`(只是种子,实际运行时编排器只看 workflow.yaml + state.json)。
 
-**红线**:`Orchestrator` / `process_project` / `enforce_cost_thresholds` /
-`warn_if_stalled` / `count_active_regular` 全部用 `is_evergreen(team)` 查
-TeamSpec.evergreen,**不许**回到 `state.team == META_TEAM_NAME` 字面量
-分叉(strategic doc §3 ccteam-core 红线)。`cost_policy` 两种 variant
-(`None` / `KillAt(Option<f64>)`)的语义在
-[interfaces.md §5.5](./interfaces.md#55-teamyaml-团队配置m31--m32--m33--v02-m016) 详述
-(PRD §6.4 草稿曾列第三个 `Track` variant 给 V0.3 watchdog,review 时删 —
-V0.3 真要 cost 追踪不杀时再定义具体行为)。
-
-`teams/meta-agent.yaml` 是首个 evergreen 范例,V0.2 起作为 shipped seed
-随 binary 发布;`Orchestrator::new` / `ccteam start` / `ccteam doctor
---reset-shipped-teams` 都会把它写到 `~/.ccteam/teams/meta-agent/team.yaml`。
+**红线**:`ccteam-core` 不出现 team 名字面量(M0.16 基线 V0.4.6 继续维持);团队特定行为靠用户写的 `workflow.yaml` + `.claude/agents/<role>.md`。
 
 #### 3.2.2 Team layout + TEAM_SOURCES(V0.2 §5.1 / §5.2)
 
@@ -304,151 +324,146 @@ source 的 `teams/*/team.yaml` 按 `spec.aliases` 匹配;
 `product-research` → `research`(详 `docs/v0-2-2/prd.md §9`)。`dev` 已经
 短,未做。
 
-### 3.3 Phase Pipeline（短期对标 gstack-auto）
+### 3.3 Workflow 拓扑（V0.4.0 起）
 
-每个 phase 是一个 markdown 文件 + YAML front matter（抄 Symphony 的 WORKFLOW.md 形态）。**完整字段定义、9 个 phase 列表、Seed verdict 输出格式 → [interfaces.md §5](./interfaces.md#5-phase-模板-schema)**。
+> **V0.4.0 起架构换血**:**Phase Pipeline EOL**。9 阶段(`01-seed` / `02-plan-eng` / `03-implement` / ... / `09-ship`)、phase YAML front matter(`required_inputs` / `required_outputs` / `parallelism: solo|agent_team|multi_session` / `verdict` / `auto_loop`)、`team.yaml::kind: workflow|multi_workflow|flex` 全废。新模型见下,旧 phase 字段仅作 §3.3 EOL 历史小节保留。
 
-phase 协议的核心架构选择（论证留本节,字段细节看 interfaces）:
+V0.4.0 起每个项目用 `<project>/.ccteam/workflow.yaml`(V0.4.6 F83 起 canonical 位置,旧 `<project>/workflow.yaml` fallback)声明 agent 拓扑 + trigger + 并发上限,**不含任何 prompt**;每个 agent 的系统提示 + 工具表面在 `<project>/.claude/agents/<role>.md`(Claude Code first-class spec)。完整 schema → **[interfaces.md §17](./interfaces.md#17-workflowyaml-schema)**。
 
-- **YAML front matter 是 orchestrator 的唯一解析入口**——`required_inputs` / `required_outputs` 给 L1 架构约束验证；`parallelism` / `agent_team` / `sub_skills` 给痛点 11/12/13 的实现层；`hooks` 给 phase 级生命周期。不解析 prompt body,prompt body 完全留给 claude。
-- **Seed 输出靠 YAML 决定走向（PASS/REJECT/CLARIFY），不依赖 LLM 自然语言判断**——orchestrator 只 parse front matter `verdict`，避免"AI 说话不算数"。
-- **`parallelism` 字段决定主框架并行粒度**(详见 §6.11):solo(已 ship,默认) / agent_team(永久 deferred,见 §6.3 模式 A 与 docs/v0-1/m2-agent-team-spike.md) / multi_session(未 ship,M4.8)。subagent **不在此声明**——任何 agent 都可 ad-hoc 通过 Task 工具启动,叠加在主框架之上。
-- **`team.yaml::kind` 决定团队姿态**(V0.3.1):`workflow` / `multi_workflow`
-  继续走 phase DAG;`flex` 没有 phase DAG,orchestrator 不注入 phase prompt /
-  auto_loop / golden_rules,但 hooks、progress、cost、silence classifier 与
-  web observability 保留。`kind` 是 team 级字段,与 phase 级 `parallelism`
-  正交。
+#### 3.3.1 `workflow.yaml` schema 速览
+
+```yaml
+name: dex-ui-autoloop                    # 必,workflow 标识
+description: explorer/fixer/master 自激励循环  # 可选,UI 用
+enabled: true                            # V0.4.6 F82,default true,false 时 daemon 跳过 roster
+budget:                                  # V0.4.6 F84,可选 budget cap
+  max_cost_usd_per_24h: 5.00
+  max_agent_spawns_per_hour: 100
+agents:                                  # role → AgentSpec,IndexMap 保留 YAML 顺序
+  explorer:
+    executor: claude                     # claude | codex(default claude)
+    trigger: manual                      # 或 schedule / gate / watch:<path>
+    parallelism: 1                       # 只对 watch trigger 有意义,其他强制 ≤1
+    output: .ccteam/fix-requests/
+    timeout: 30m
+    on_timeout: escalate                 # escalate | retry | skip
+  fixer:
+    trigger: watch:.ccteam/fix-requests/
+    parallelism: 3                       # 并发 3 个 fixer
+    input: .ccteam/fix-requests/
+    output: .ccteam/done/
+  master:
+    trigger: gate                        # 等 trigger_gate MCP 工具释放
+    input: .ccteam/done/
+```
+
+#### 3.3.2 `Trigger` 四类语义
+
+| Trigger | 语义 | 触发源 | 并发约束 |
+|---|---|---|---|
+| `manual` | 用户 / meta-agent 显式 `ccteam internal spawn <slug> <role>` 或 `mcp__ccteam__spawn_agent` | CLI / MCP / 用户 inbox 消息 | parallelism 强制 1 |
+| `schedule` | 定时 trigger;V0.4.0 - V0.4.6 仍 stub(meta-agent 手动触发),V0.4.7+ 接真 cron 解析 `AgentSpec::interval` | (未 ship) | parallelism 强制 1 |
+| `gate` | 等 `mcp__ccteam__trigger_gate` MCP 工具调用释放;释放后消费 input 目录所有 artifact 后再回 gated | MCP 工具 | parallelism 强制 1 |
+| `watch:<path>` | inotify(Linux)/ fsevents(macOS)监听项目相对路径,新文件 → spawn 一个 session | ArtifactWatcher(F64,V0.4.5 F78 修复项目相对路径) | `parallelism: u32` 上限内并发 |
+
+#### 3.3.3 与 `.claude/agents/<role>.md` 的解耦
+
+**红线**(F63 PRD):`workflow.yaml` 不许出现 `prompt:` / `system_prompt:` / `messages:` 字段 — 任何 PR 加这些 = schema violation。
+
+agent 行为完全靠 `.claude/agents/<role>.md`(Claude Code 官方 agent 文件格式):前置 YAML 声明 `name` / `description` / `tools` / `model`,正文是 system prompt。orchestrator 用 `claude --bg --agent <role> --workdir <project>` spawn 后,Claude Code 读这个文件加载 agent — ccteam 完全不解析 prompt 内容。
+
+这种解耦让用户改 prompt 不需要重启 orchestrator(V0.4.6 F82 workflow.yaml 热加载,prompt 改动 claude 下次 spawn 自动加载),改拓扑不需要改 prompt(workflow.yaml 调 trigger 路径,agent prompt 不变)。
+
+#### 3.3.4 V0.3.x phase pipeline(已 EOL)
+
+V0.3.2 及更早走 phase DAG + `team.yaml::kind: workflow`(phase 顺序) / `multi_workflow`(多 phase 序列) / `flex`(无 phase DAG)。9 个 phase(`01-seed` → `09-ship`)、`PHASE_DONE: <name>` / `ESCALATE: <prefix>` 协议关键字、auto_loop ralph-loop self-loop、golden_rules executor、Seed verdict YAML 解析等都依附 phase 边界。**V0.4.0 起全部废除**,旧 team.yaml 用 `ccteam doctor --migrate-phase-to-workflow` 一次性迁出生成 workflow.yaml 骨架 + `.claude/agents/<role>.md` 模板(prompt 语义需手动调,phase 顺序 → artifact-trigger 事件驱动)。
 
 ### 3.4 Workspace 隔离与并行
 
-**每项目一个 git worktree**（在 `~/projects/<team>-<slug>/`），独立分支。team 前缀（F22 已 ship）让 `~/.claude/rules/ccteam-lessons-<team>.md` 的 `paths:` frontmatter 能正确 scope 到该项目。
+**每项目一个目录**（V0.4.2 F72/F75 起,任意 cwd 经 `ccteam init` 即可成 ccteam 项目;新建走 `ccteam new <slug>` thin wrapper 写到 `~/projects/<team>-<slug>/`)。team 前缀（F22 已 ship）让 `~/.claude/rules/ccteam-lessons-<team>.md` 的 `paths:` frontmatter 能正确 scope 到该项目。
 
-**项目目录结构**：
+**项目目录结构(V0.4.6)**:
 ```
-~/projects/<team>-<slug>/
-├── src/                          # 实际代码
+<project>/                            # 任意路径(V0.4.4 F77 walk-up 支持)
+├── src/                              # 实际代码(business)
 ├── tests/
 ├── package.json / pyproject.toml
-├── CLAUDE.md                     # 项目级运营手册（自动生成）
-├── .ccteam/                      # ccteam 元数据（git 跟踪）
-│   ├── spec.md                   # 用户原始需求 + Seed 后澄清
-│   ├── plan-eng.md               # plan-eng phase 产物
-│   ├── architecture.md
-│   ├── implement-report.md
-│   ├── test-report.md
-│   ├── review-report.md
-│   ├── scorecard.md
-│   ├── state.json                # 状态机当前态
-│   └── escalation.md             # 触发用户介入时写这里
-└── .gitignore
+├── CLAUDE.md                         # 项目级运营手册（V0.4.6 不带 phase 字段,见 §6.5）
+├── .claude/                          # Claude Code 原生约定
+│   ├── agents/<role>.md              # V0.4.0 agent 行为 SoT
+│   └── settings.json                 # hook + enabledPlugins
+├── .ccteam/                          # ccteam orchestration state(gitignored)
+│   ├── workflow.yaml                 # V0.4.6 F83 canonical 位置
+│   ├── state.json                    # serde-compat shell(V0.4.0 后大部分字段 deprecated)
+│   ├── spawn_requests/<role>-<ts>.json  # `ccteam internal spawn` 触发的 marker
+│   ├── fix-requests/  done/  ...     # workflow.yaml `Trigger::Watch` 监听的 artifact dirs(用户定义)
+│   ├── outbox/                       # agent 写 NL 通知(meta-agent 翻译)
+│   └── inbox/                        # 用户写 / agent 间消息
+└── .gitignore                        # 包含 .ccteam/ 整段
 ```
 
-**并发模型**：
+**并发模型(V0.4.6)**:
+- **`AgentSpec::parallelism: u32`** 决定每 role 并发上限(只对 `Trigger::Watch` 有意义,其他强制 ≤1)
+- **`MAX_CONCURRENT_PROJECTS`**(~/.ccteam/config.yaml,default 3)决定 roster 上限
+- **`workflow.yaml::budget`**(V0.4.6 F84)是 per-project 软上限:`max_cost_usd_per_24h` + `max_agent_spawns_per_hour`,任一超限 → `budget_exceeded` 事件 + 自动 `enabled: false`
+- **CLAUDE.md §三红线 $200 物理上限**仍守 — 全 ccteam 进程合计累计 cost 超 → daemon 整体 alert(粒度比 budget cap 粗)
+
+orchestrator 每轮 tick 后按这几条做准入控制。**V0.4.0 起没有 max_turns 概念**(bg-job 自然短命,无需);budget 改 per-project YAML 声明而非全局 yaml。
+
+**为什么不用 Conductor**:Conductor 是 Anthropic 的多 session 工作区工具,但要求人在 IDE 里使用。ccteam 用 git worktree + 文件系统 trigger 取代 Conductor 的工作区隔离能力 — 比 IDE 更适合无人值守。
+
+### 3.5 Self-healing Fix Loop（V0.4.0 后形态）
+
+> **V0.4.0 起重写**:phase + ralph-loop self-loop EOL。Fix 是 workflow 拓扑里的一个 agent role(典型:`fixer` watch `fix-requests/`),撞 N 次顶由 thin orchestrator 计数后 escalate。
+
+**结构**(典型 workflow.yaml 形态):
 
 ```yaml
-# ~/.ccteam/config.yml
-max_concurrent_projects: 3            # 同时活跃的 tmux session 数
-max_total_claude_processes: 5          # 全局 claude 进程上限（每项目一个）
-soft_cost_warn_per_project_usd: 20     # 软告警阈值（不打断）
-hard_cost_kill_per_project_usd: 200    # 物理上限（防 bug 死循环才启用）
-stall_warn_minutes: 5                  # 5 分钟无事件 → 第一次告警
-stall_suspicious_minutes: 15           # 15 分钟无事件 → 标记可疑（仍不 kill）
-stall_escalate_minutes: 30             # 30 分钟以上 → 升级为 escalation
+agents:
+  explorer:
+    trigger: manual                  # 用户/meta 触发分析
+    output: .ccteam/fix-requests/    # 写 fix request artifact
+  fixer:
+    trigger: watch:.ccteam/fix-requests/
+    parallelism: 3                   # 最多 3 个 fixer 并行
+    input: .ccteam/fix-requests/
+    output: .ccteam/done/
+  master:                            # 可选 reviewer
+    trigger: gate
+    input: .ccteam/done/
 ```
 
-orchestrator 每轮 dispatch 时按这几条做准入控制。注意：**没有 max_turns、没有 max_budget 硬封顶**——长跑由用户决定何时介入。
+**事件流**:
+1. **explorer** 写 `.ccteam/fix-requests/req-001.md`(诊断 + plan)→ ArtifactWatcher inotify → orchestrator spawn `fixer` claude bg-job → progress.jsonl 加 `agent_spawn` 事件。
+2. **fixer** 读 input artifact → 改代码 → 跑测试 → 测试绿:写 `.ccteam/done/req-001.md`,bg-job 结束(`state.json::state="completed"`)→ Stop hook 写 `agent_done` 事件 + cost。
+3. **失败时**:fixer 自己决定写新 `fix-request` 重试(自激励 loop 必须配 F84 budget cap,否则 4h 烧 \$1.10 自激励 — 2026-05-16 dex-ui 实证)。
+4. **3-strike 计数**:F66 thin orchestrator 维护 per-role `fix_counts`(从 progress.jsonl `agent_done.status="errored"` 累加),撞 3 次顶 → 写 `escalation` 事件 + 推 meta-agent inbox notify;**不**自动停 workflow(F84 budget 才会优雅停)。
 
-**为什么不用 Conductor**：Conductor 是 Anthropic 的多 session 工作区工具，但要求人在 IDE 里使用。ccteam 用 tmux + git worktree 取代 Conductor 的工作区隔离能力——tmux 自带后台运行 + 随时 attach 的能力，比 IDE 更适合无人值守。
+**为什么这套替代 ralph-loop**:V0.4.0 后没有"长 session 内 Stop hook 拦截退出"概念了 — `claude --bg --agent` 每次 spawn 都是新进程,生命周期 = 一次 trigger → 一次 agent_done 即终止。"同一段 prompt 反复跑直到收敛"由 workflow 拓扑(fixer 反复触发自己,直到 explorer 不再写 fix-request)与 F84 budget cap 联合实现,**无需 ralph-loop hook**。
 
-### 3.5 Self-healing Fix Loop
+#### 3.5.1 escalation 事件
 
-**结构**（抄 gstack-auto 的 11a/11b/11c 但收紧）：
+V0.4.0 起 `escalation` 是 progress.jsonl 7 类业务事件之一,payload:
 
-```
-test-run phase
-  ├─ 全绿 → 进入 review
-  └─ 失败 → fix-cycle (n)
-       ├─ fix-plan: 读 test-report，写 fix-plan.md
-       ├─ implement-fix: 按 fix-plan 改代码
-       ├─ test-run: 重跑
-       │    ├─ 全绿 → review
-       │    └─ 失败 →
-       │         ├─ n < 3 → fix-cycle (n+1)
-       │         └─ n = 3 → escalated
-```
-
-**执行机制（混合模式）**：fix-cycle 不是"orchestrator 反复 send-keys 注入新的 fix prompt"——那样每轮都是一段独立 user 消息进对话历史，污染上下文也丢掉 cache 的近因优势。改用 [`ralph-loop`](https://github.com/anthropics/claude-plugins-official/tree/main/plugins/ralph-loop) 的 Stop hook 拦截范式：
-
-1. **进入 fix-cycle**：orchestrator 写状态文件 `~/projects/<team>-<slug>/.ccteam/fix-loop.state.md`，YAML front matter 含 `iteration: 1` / `max_iterations: 3` / `completion_signal: "TESTS_GREEN"`，正文是 fix prompt（**每轮开头先写 `.ccteam/fix-plan-<iteration>.md` 记录本轮诊断与修复方案** → 读 test-report → 改代码 → 重跑测试）。每轮独立的 fix-plan 文件让 escalation 收集（见下文）拿得到三次完整诊断。同时把 state.json 的 `phase_state` 切到 `fix_locked`（见 §3.2）。
-2. **首次注入**：orchestrator send-keys 一次，触发 fix prompt 跑第一轮。然后 orchestrator 完全退出 fix-cycle 的控制路径。
-3. **Stop hook 接管**：claude 想退出时 Stop hook 检查 `fix-loop.state.md`——若存在、未达 `max_iterations`、且最后一次 assistant 输出未含 `TESTS_GREEN`，**输出 `{"decision": "block", "reason": "<同一段 fix prompt>"}` 拦截退出并重喂**；同时 `iteration += 1`。这步直接复用 ralph-loop 的 hook 逻辑，cache 在同 session 内复用,fix 1 / 2 / 3 不会重读 plan 与代码上下文。
-4. **释放控制**：测试通过（claude 输出 `TESTS_GREEN`）或撞 `max_iterations` → Stop hook 删除状态文件、放行退出 → orchestrator 通过 progress.jsonl 上的 `phase_done` / `escalate` 事件感知并接管。
-
-**为什么混合**：phase 切换仍由 orchestrator 主控（因为 phase 间需要 reset context、跨项目调度、注入完全不同的下一段 prompt）；但单 phase 内的 fix-cycle 是"同一段 prompt 反复跑直到收敛"——这正是 ralph-loop 设计的形态。两者职责不冲突：orchestrator 管"phase 之间"，Stop hook 管"phase 内的自愈循环"。
-
-**Stop hook 复用**：直接抄 `~/.claude/plugins/marketplaces/claude-plugins-official/plugins/ralph-loop/hooks/stop-hook.sh`，改三点：
-- 状态文件路径换成 ccteam 约定（`fix-loop.state.md`，避免与 ralph-loop 的 `.claude/ralph-loop.local.md` 冲突）
-- 完成信号从 `<promise>...</promise>` 改成纯文本 `TESTS_GREEN`（约束简单、grep 即得）
-- 计数到顶或主动放弃时把 `escalate` 事件 append 到 `~/.ccteam/progress/<slug>.jsonl`，让 orchestrator 知道
-
-**fix-cycle 决策逻辑只能在一处**：Claude Code 允许一个 Stop hook entry 下挂多个 command（§6.2 settings.json 即如此——同时跑 `parse-phase-end.sh` 和异步的 `progress-append.sh Stop`），这没问题。但**fix-cycle 的"是否拦截退出 + 重喂"决策只能由 `parse-phase-end.sh` 单点输出**——同 entry 内多个 command 的执行顺序虽稳定，但只有第一个 stdout JSON 决策有效，其它 command 必须 `async: true` 仅做 append/log 类副作用。脚本内部判断"现在是不是 fix-cycle 模式"分支处理（fix-cycle → ralph 范式拦截重喂；非 fix-cycle → 解析 `PHASE_DONE` / `ESCALATE`）。
-
-**V0.2.2 F35 — silence classifier 兜底层（detached from fix-loop）**：
-ralph-loop / `auto_loop::decide` 只在 Stop hook 触发时跑（input = last
-assistant text），有两个失效场景:(1) API tool-call hang — `PreToolUse`
-后 `PostToolUse` / `Stop` 永不来,auto-loop 根本不触发;(2) send-keys
-路由错误 — `phase_inject` 发了但 prompt 落到 sub-agent 上下文,主 agent
-没 Stop。orchestrator daemon 主循环新增 `silence_classifier::classify`
-(deterministic,无 LLM),按 `progress.jsonl` 末事件 + 静默时长分 7 类
-(`Healthy` / `Terminal` / `SubagentBusy` / `SubagentRunaway` /
-`MidToolHung(tool)` / `PostStopLimbo` / `InjectLimbo`):前 3 类 noop,
-`SubagentRunaway` / `MidToolHung` 写 enriched
-`needs_attention.outbox.json`(meta-agent NL 翻译 + propose-confirm 三选
-一,**不**自动 act),两类 `*Limbo` 由 orchestrator 直接 deterministic
-re-inject 1 次(`MAX_LIMBO_RETRY`,per-phase 计数器存
-`<project>/.ccteam/limbo-retry-count.json`),超 cap 转 enriched escalate。
-红线:`silence_classifier` 不发 Ctrl-C / 不 kill / 不 LLM;`pane_tail` 只
-入 outbox payload 给人读,**不**进 orchestrator 状态机。详见
-`crates/ccteam-core/src/silence_classifier.rs` 与 `interfaces.md` §6.2.1。
-
-**escalation 触发时**，orchestrator 收集：
-- 最后一次 test-report.md
-- 三次 fix-plan.md 的诊断
-- 最近 200 行 progress.jsonl（hooks 事件流）
-- git diff 最近 3 commit
-- `tmux capture-pane -p -t ccteam-<team>-<slug>` 当前可见输出（最后一屏，给人看的上下文）
-
-打包成 telegram 消息：
-```
-🚨 项目 bookmark-mgr-a3f9 卡住了
-位置: implement (test 失败 3 次后)
-卡点: 数据库迁移在 sqlite 上跑不通，agent 三次方案都失败
-试过：
-  1. 改用 alembic 自动迁移 - 报 schema 冲突
-  2. 手写 raw SQL - 报 FK 约束
-  3. 切到内存 DB - 测试可过但 spec 要求持久化
-建议你：[A] 接受内存 DB（spec 让步）  [B] 我换用 better-sqlite3  [C] 我跳过这个项目去做下一个
+```json
+{
+  "ts": "2026-05-16T12:34:56Z",
+  "event": "escalation",
+  "kind": "fix_count_exceeded" | "manual" | "budget_exceeded_fallback",
+  "role": "fixer",
+  "count": 3,
+  "last_errors": ["test_foo failed", "test_bar failed", "test_baz failed"],
+  "recommendation": "..."  // 可选,explorer/master 写
+}
 ```
 
-**禁止静默重试**：fix loop 撞 3 次顶绝不静默重置——这是 ccteam 区别于"AI 永远说没事"的承诺。
+orchestrator 看到 → 推 meta-agent inbox 一条 enriched markdown(含最近 200 行 progress events + git diff 最近 3 commits + 最后 3 个 fix-request artifacts);meta-agent 看 NL 后回用户。
 
-#### V0.2 M0.19 — auto_loop default-on + Stop hook self-loop fallback
+**禁止静默重试**:撞 3 次顶绝不静默 — ccteam 区别于 "AI 永远说没事" 的承诺,V0.4.0 后仍守。
 
-**`PhaseTemplate.auto_loop` 默认 `true`**：每个 phase 自循环,撞 `auto_loop_max_iterations`(默认 3)顶才 escalate。phase yaml 显式 `auto_loop: false` 才 opt-out(evergreen 桥接 / ad-hoc diagnostic phase 用)。`completion_signal` 留空时 `effective_completion_signal()` 回退到 `PHASE_DONE: <phase-name>`,因此 phase yaml 不需要重复声明协议字面量。
+#### 3.5.2 V0.3 phase + ralph-loop self-loop(EOL)
 
-**Stop hook 三档兜底**(`crates/ccteam-hooks/src/parse_phase_end.rs`):
-
-1. **Auto-loop reinject**:`<project>/.ccteam/auto-loop.state.md` 存在 → 按 ralph-loop 范式重喂 prompt,撞顶时 emit escalate 事件。
-2. **PHASE_DONE / ESCALATE 解析**:assistant 末行匹配协议关键字 → 写 progress 事件,Continue。
-3. **Self-loop fallback**(V0.2 新增):前两档都没命中,且 `<project>/.ccteam/outbox/` 没有本 phase 内的 `clarify-* / escalation-* / reply-*` 新文件 → 区分两种情形:
-   - **第一次进入**(`stop_hook_active` 为 false / 缺):返回 exit 2 + stderr `phase 未正常收尾,请输出 PHASE_DONE / ESCALATE / 写 outbox 之一`。Claude Code 把 stderr 当 blockingError 注入下一轮(`hooks.ts:2784-2805`),assistant 被强制重选合法出口。
-   - **第二次进入**(`stop_hook_active` 为 true,L3 fail-safe):写 `<project>/.ccteam/needs_attention.outbox.json`(含 `last_assistant_message` + `tmux capture-pane` 末 30 行),不再 block。watchdog(M0.21)读这个文件 surface 给用户。
-
-**关键约束**:第三档**不**让 ccteam orchestrator 主动 send-keys 续 loop;Claude Code 自己接管循环。orchestrator 只在 progress.jsonl 出现 phase_done / escalate 事件时换 phase。`tmux capture-pane` 输出**只**写进 needs_attention 文件作为给用户看的 surface,不参与状态机决策(沿用"主路径不解析终端输出"红线)。
-
-#### V0.2 M0.19.3 — PreToolUse 拦截 AskUserQuestion
-
-`AskUserQuestion` 是 LLM 内部同步阻塞,Stop hook 不会触发。bootstrap 写 `<project>/.claude/settings.json` 时配 `PreToolUse` matcher `AskUserQuestion`,跑 `ccteam hook intercept-ask` 返回 `permissionDecision: deny`(reason 指引去 outbox)。LLM 收到 deny 立即改写 outbox。pair 的 prompt-layer 软约束在 team.yaml `golden_rules.protocol.forbid_ask_user_question` —— inject prompt 把 directive 文字写进协议红线段(progress.rs `build_phase_prompt_for_template_with_team`)。
+V0.3.2 及更早:phase pipeline + `auto_loop` default-on + Stop hook 三档兜底(Auto-loop reinject / PHASE_DONE-ESCALATE 解析 / self-loop fallback)+ silence classifier 7 类 + PreToolUse 拦截 AskUserQuestion 等机制全废,代码留 serde-compat shell 不调用。新建项目改写 workflow.yaml + `.claude/agents/<role>.md` 直接走 V0.4.0 模型。详 `docs/v0-4-0/migration-guide.md`。
 
 ### 3.6 三层防御协议（Defense in Depth）
 
@@ -540,28 +555,28 @@ L1 → L2 → L3，不并联。L2 启动前 L1 已通过；L3 启动前 L2 已�
 | 跨项目共享 | `~/.claude/rules/ccteam-lessons-<team>.md`(支持 `paths:` frontmatter scope) | 每 session 启动加载,匹配路径才生效 | retro phase prompt 引导 Claude 用 `Edit` 写入 marked section;Seed/verdict 自动注入 |
 
 **写入时机**(全部经 Claude session 内官方接口,不走 ccteam 代码):
-- 每个项目终态(shipped / rejected / escalated)触发 retro phase
-- phase prompt 引导 Claude:
+- 每个 agent 终态(`agent_done`)由 agent 自己决定是否写记忆 — 典型在 reviewer / master role 的 `.claude/agents/<role>.md` prompt 中引导 Claude:
   - 项目特定 lessons → `/memory` 写本仓 auto-memory(Claude 自主决策何时写)
   - 跨项目 lessons / 反模式 → `Edit ~/.claude/rules/ccteam-lessons-<team>.md`(限 `<!-- ccteam-managed:lessons -->` marked section,不污染用户其他段)
-- schema 字段从 `team.yaml.retro_schema[]` 读(已 ship,F20);dev 写 tech-stack/坑/成功设计/不要再做,
-  research 写方法学/数据源/假设结果
+- V0.3.x 版的 `team.yaml.retro_schema[]` 字段保留 serde-compat;V0.4.0 后 retro 由 agent prompt 自行约束(workflow.yaml 不再强制 retro phase)
 
 **召回时机**(全部经 Claude session 内官方接口):
-- Seed/verdict phase 启动时:rules 已通过加载机制自动注入(零 RPC),Claude 直接看到上下文
+- **每次 `claude --bg` 起新 job = 全新 1M context**:无需 V0.3 时代"60% 阈值 reset" 复杂逻辑 — bg-job 本身就短命(workflow agent 平均 30s-5min 即 agent_done),context 不会撑爆;新 job 启动时 Claude Code 加载机制自动注入 `~/.claude/rules/ccteam-lessons-<team>.md`(匹配 `paths:` frontmatter 的项目)+ per-repo `CLAUDE.md`,零 RPC。
 - 需深挖本项目历史 → Claude 用 `/memory` 浏览 + `Read` 读 topic 文件
-- 命中相似失败项目 → verdict 倾向 REJECT/CLARIFY
+- 跨项目相似失败 → reviewer agent 看 lessons 后建议 escalation
+
+**V0.3 → V0.4.0 reset 触发点变更**:V0.3 时代 "phase 边界 + context > 60% → /exit + 新 session + CLAUDE.md 桥接" 路径 EOL,因为 V0.4.0 起没有"长 session" 了 — 每次 `agent_spawn` 都是新 bg-job 进程,context 自然清零。CLAUDE.md 桥接退化为 agent prompt 模板里的 "如有未完成任务读 .ccteam/state.json 续上" 指引。
 
 **可选增强**(用户装了 [claude-mem](https://docs.claude-mem.ai/usage/search-tools)):
 - claude-mem 自带 5 个 hook(SessionStart/UserPromptSubmit/PostToolUse/Stop/SessionEnd)自动捕获,
   ccteam 不调任何 hook;暴露 4 个 read-only MCP tool(`search` / `timeline` / `get_observations` / `__IMPORTANT`)支持跨项目 FTS5 检索 + type 过滤(bugfix/feature/decision/discovery/refactor/change)
-- phase prompt 提示"如检测到 `mcp__*claude-mem*search` 工具,可用于跨项目深度检索",**LLM 自看 tool surface 决定调不调**;ccteam 不写检测代码,不写集成代码
+- agent prompt 提示"如检测到 `mcp__*claude-mem*search` 工具,可用于跨项目深度检索",**LLM 自看 tool surface 决定调不调**;ccteam 不写检测代码,不写集成代码
 - 用户没装则 100% 走默认路径,功能不受影响
 
-**ccteam 实际改动量**(已 ship,M4.1–M4.4):
-- M4.1 retro phase prompt(纯 markdown)
+**ccteam 实际改动量**(已 ship,M4.1–M4.4 + V0.4.0 沿用):
+- M4.1 retro guidance(V0.4.0 后并入 `.claude/agents/<role>.md` agent prompt 模板)
 - M4.2 `ccteam doctor --install-memory-bridge`(创建 rules 占位文件 + marked section + path frontmatter,**唯一一段 ccteam 代码**)
-- M4.3 Seed/verdict phase prompt(纯 markdown,含 conversation continuity——M4.6 已折叠进 M4.3)
+- M4.3 conversation continuity guidance(V0.4.0 后并入 agent prompt 模板)
 - M4.4 容器 bind-mount `~/.claude/` spike(已验证 rules + claude-mem hook 在 `--dangerously-skip-permissions` 容器内可见)
 
 ### 3.8 用户接口层
@@ -593,27 +608,47 @@ dumb router。这条贯彻到底,避免 Symphony 多层 agent 反模式
 
 **meta-agent session 与项目 session 的差异**:
 
-| 维度 | meta-agent session(L0.5) | 项目 session(L2) |
+| 维度 | meta-agent session(L0.5) | project agent bg-job(L2,V0.4.0+) |
 |---|---|---|
-| 生命周期 | 永不 terminal,跟用户 ccteam 实例同寿 | ship / abort 即终态 |
-| 行为模式 | 事件循环(等输入→处理→等输入)| phase DAG(plan-eng → ... → ship) |
-| 主要工具 | `ccteam-control` skill(已 ship,M1.8)/ `ccteam-mcp`(已 ship,M2.8)/ 跨项目 lessons(已 ship,M4 走 `~/.claude/rules/` + auto-memory)| 项目级文件操作 / 内嵌 plugin agents(已 ship,V0.2 M0.20 改走 `enabledPlugins` 写到 `<project>/.claude/settings.json`,Claude Code in-memory plugin pipeline 自动 namespace `<plugin>:<name>`,不再 ln -sf 进 `~/.claude/agents/`) |
-| context reset | 60% 阈值时桥接 CLAUDE.md(M0.10 已 ship);跨项目记忆通过 `~/.claude/rules/ccteam-lessons-<user>-meta.md` 滚动累积(M4 路径,无独立 conversation-log) | 60% 阈值时把当前 phase 进度写 CLAUDE.md(已 ship,M0.10) |
-| 用户 attach | `tmux attach -t ccteam-meta-<user>`,直接 NL 对话 | `tmux attach -t ccteam-<team>-<slug>`,可介入项目执行 |
+| 生命周期 | 永不 terminal,跟用户 ccteam 实例同寿 | 一次 trigger → 一次 agent_done 即终止 |
+| 行为模式 | 事件循环(等 inbox → 处理 → 等 inbox) | workflow.yaml trigger fires → spawn → 跑完即退 |
+| 进程形态 | tmux long session + `claude --dangerously-skip-permissions` | `claude --bg --agent <role>` 写 `~/.claude/jobs/<job_id>/state.json` |
+| 主要工具 | `ccteam-control` skill(M1.8 ✅)/ `ccteam-mcp`(M2 ✅,V0.4.0 起 **17** tools)/ `ccteam-creator` skill(V0.4.4 ✅)/ 跨项目 lessons(M4 ✅) | `.claude/agents/<role>.md` 声明工具 / 内嵌 plugin agents(V0.2 M0.20 走 `enabledPlugins`) |
+| context | 60% 阈值时桥接 `~/.claude/CLAUDE.md`(meta-agent 仍长跑,沿用 M0.10 路径) | 每次 spawn = 全新 1M context(无需 reset) |
+| 用户 attach | `tmux attach -t ccteam-meta-<user>`,直接 NL 对话 | bg-job 无 attach 概念,看 `ccteam show <slug>` / web SPA WorkflowView 实时观测 |
 
-#### CLI(已 ship,M0)
+#### CLI(V0.4.6 F89 后)
 
+V0.4.6 F89 把 CLI 切成 **9 user-facing** + `internal` 折叠组(meta-agent / MCP / hook installer 内部用)。`ccteam --help` 看到:
+
+**用户日常(9 个,V0.4.6)**:
 ```bash
-ccteam new "做一个本地书签管理器"     # 写 inbox(无 LLM,纯薄壳)
-ccteam ls                              # 查所有项目状态
-ccteam show <slug>                     # 详情
-ccteam progress <slug> --tail          # 实时 tail progress.jsonl
-ccteam answer <slug> "用 PWA"          # 回应 clarify 问题
-ccteam attach <slug> / peek <slug>     # 介入 / 瞄一眼
-ccteam start / stop                    # orchestrator 生命周期
+ccteam init                  # 一次性 setup ~/.ccteam/ + 当前目录变 ccteam 项目(V0.4.2 F72 三合一)
+ccteam start [--no-web]      # 起 orchestrator daemon + 嵌入 web UI(V0.4.1 合并)
+ccteam stop                  # F86 graceful shutdown:写 /tmp/ccteam-<user>.shutdown trigger
+ccteam new <slug>            # init thin wrapper:在 ~/projects/<team>-<slug>/ 起新项目(V0.4.2 F75)
+ccteam ls                    # 列所有 rostered 项目 + daemon health
+ccteam show <slug>           # 项目详情:cost / running agents / recent events / budget util
+ccteam remove <slug>         # V0.4.6 F81 un-roster:守 §三红线(活 session refuse)+ 可选 --purge
+ccteam doctor [--gc-claude-jobs|--install-mcp|...]  # 健康检查 + 维护工具
+ccteam web                   # 单独跑 web SPA(start 已含,这里给 headless server 用)
 ```
 
-**关键约束**:CLI 必须输出 LLM 友好的结构化数据——所有查询命令支持 `--format json`(详见 [interfaces.md §10](./interfaces.md#10-cli-命令签名))。理由:让用户自带 claude 通过 Bash 工具调时不用解析表格。
+**Internal(`ccteam internal <subcmd>`,V0.4.6 F89 折叠)**:
+```bash
+ccteam internal hook <progress-append|parse-phase-end|load-context|intercept-ask>
+ccteam internal mcp-serve                       # MCP stdio server,~/.claude.json wire
+ccteam internal spawn <slug> <role> [prompt]    # 手动 spawn,写 .ccteam/spawn_requests/<role>-<ts>.json
+ccteam internal send <slug> <body>              # 写项目 inbox,allow_hyphen_values(F87)
+ccteam internal attach <slug>                   # tmux attach(meta + codex 还用)
+ccteam internal peek <slug>                     # capture-pane 不 attach
+ccteam internal progress <slug> [--tail]
+ccteam internal resume <slug>
+```
+
+V0.4.5 的 `phase` / `decisions` / `watchdog scan` 三个 V0.3 legacy 子命令 F89 已删除;`ccteam hook progress-append` 等老顶层路径 V0.4.6 一版兼容(发 deprecation WARN),V0.5 删。
+
+**关键约束**:所有查询命令支持 `--format json`(详见 [interfaces.md §10](./interfaces.md#10-cli-命令签名)),让用户自带 claude 通过 Bash 工具调时不用解析表格。
 
 #### meta-agent session + inbox/outbox 协议 + ccteam-control skill(已 ship,M1)
 
@@ -643,11 +678,10 @@ ccteam start / stop                    # orchestrator 生命周期
   **强烈倾向直接复用开源方案**(Claude Code 官方 TG channel /
   python-telegram-bot 等),做最薄的 adapter 层:订阅外部消息 → 写到对应
   session 的 inbox / 从 outbox 推到对应 channel。无内嵌 LLM
-- **`ccteam-mcp` MCP server**(已 ship,M2):暴露 9 个 structured tool
-  (`ls` / `show` / `new` / `peek` / `progress` / `pause` / `resume` /
-  `inject_decision` / `send_to_session`,详见
-  [interfaces.md §12](./interfaces.md#12-ccteam-mcp-mcp-server-m2));
-  meta-agent 与用户 daily-driver claude 都受益(MCP 比 shell parse 更鲁棒)
+- **`ccteam-mcp` MCP server**(M2 ship,**V0.4.0 起 17 个 tool**):暴露
+  - **V0.3 时代 10 个 `mcp__ccteam__*`**:`ls` / `show` / `new` / `peek` / `progress` / `pause` / `resume` / `inject_decision` / `send_to_session` / `screenshot`(详见 [interfaces.md §12](./interfaces.md#12-ccteam-mcp-mcp-server-m2))
+  - **V0.4.0 F65 新加 7 个 workflow tool**:`spawn_agent` / `stop_agent` / `observe_agents` / `signal` / `set_parallelism` / `trigger_gate` / `get_artifact_summary`(在 `crates/ccteam-cli/src/mcp_workflow_tools.rs`)
+  - meta-agent 与用户 daily-driver claude 都受益(MCP 比 shell parse 更鲁棒)
 
 #### 为什么"用户自带 daily-driver claude"不再是核心入口
 
@@ -667,29 +701,29 @@ ccteam start / stop                    # orchestrator 生命周期
 这条**作为辅助路径保留**,但不是 ccteam 的核心入口。核心入口是
 meta-agent session + Channel Layer。
 
-#### Web 仪表盘(V0.3/V0.3.1 已 ship — workspace.version 0.3.1)
+#### Web 仪表盘(V0.3 起 ship,V0.4.0 重塑 + V0.4.6 F90 增强)
 
-V0.2 / V0.2.2 之前曾把 web 仪表盘剥离主线(`ccteam ls --format json` + 用户自带 claude 已覆盖"用人话汇报")。V0.3 重新评估:多项目并发(M3+ team factory ship 后用户实际跑 ≥ 3 项目)与离场场景下,「一屏看全局」需要可视化聚合;`ccteam ls` 表格在 ≥ 5 项目时阅读成本陡增。**因此 V0.3 ship `ccteam web`,作为第四类用户接入面**,与 CLI / MCP / filesystem 共存,各自最强项不同(终端 = power user 全控;MCP = meta-agent 自动化;filesystem = hooks / 调试;web = 一屏总览 + 局域网 / 手机访问)。
+**V0.3 vintage 是 askama SSR + htmx + vanilla CSS,V0.4.0 F69 已彻底删除** — 现行 `crates/ccteam-web/` 是 Vite + React TypeScript SPA,`build.rs` 在 `cargo build` 时自动跑 `npm run build`(本机 dev 可 `CCTEAM_SKIP_WEB_BUILD=1` 或 `--no-default-features` 跳过)。Backend 仍 axum + SSE,但只服务 SPA bundle(`/app/*` + `/assets/spa/*`)+ JSON API + SSE。`templates/{dashboard,project,session}.html` 已删,`templates/base.html` 留作 askama SSR fallback 给 `/health`、`/health-old`、deep-link 301 用。
 
-实现栈:axum 0.8 + askama 0.12 + htmx 2.0.4 + htmx-ext-sse 2.x(vendored,~60 KB)+ `notify` workspace + `futures` / `tokio-stream` for SSE bridging,无 npm / Vite / build toolchain;`include_bytes!` 把 htmx / htmx-ext-sse / CSS 打进 binary,模仿 V0.2.2 F38 vendored TTF 模式。`ccteam-web` 是独立 workspace crate,**dep 只**到 `ccteam-core`,不依赖 `ccteam-cli`(binary-as-library 反模式;`tests/dep_graph_test.rs` 锁红线)。
+**Authentication 路径**(从 V0.3 沿用):loopback 免 token、非 loopback 自动生成 `~/.ccteam/web-token` mode 0600 + 5s LAN-RCE 倒计时;URL shim `?token=ccteam:<hex>` → HttpOnly cookie + 303 → 干净 URL。V0.4.6 F88 起 `ccteam start` 输出 token 时同时 probe `xclip` / `wl-copy` / `pbcopy` / `clip.exe` 把 token 拷到剪贴板(`--no-clipboard` 关)。
 
-V0.3 ship 状态:
+**SPA 路由 4 页**:
+- `/app/` — projects list(WorkflowView 入口)
+- `/app/project/<slug>` — workflow view(agent cards + 4 panels,V0.4.6 F90)
+- `/app/project/<slug>/session/<sid>` — Codex tmux session 详情(legacy,保留)
+- `/app/settings` — token 管理
 
-| Milestone | 范围 | 已 ship |
-|---|---|---|
-| **M5.0** | crate scaffold + write helper promote 到 `ccteam-core::actions` + `GET /health` | ✅ |
-| **M5.1** | read-only dashboard:`GET /` 项目列表 + `GET /project/<slug>` 详情 + `GET /assets/{file}` 静态资源 + 状态 badge(F35 silence_classifier 只读复用)+ outbox 渲染(`SessionMailbox`)| ✅ |
-| **M5.2** | SSE 实时事件流(`/sse/all` + `/sse/project/<slug>` 单 `notify` watcher → `tokio::sync::broadcast` capacity `1024` fan-out;wire format `event: progress` + `data: <one-line-JSON>`,15s `: keepalive`)+ 按需 PNG 截图(`/screenshot/<slug>.png` 同步 `spawn_blocking` 调 F38 `render_screenshot`,F38 不可用 → 504 + plain-text reason,**不 polling**)| ✅ |
-| **M5.3** | 写动作(`POST /api/<slug>/{btw,inject_decision,pause,resume}` 全走 `ccteam_core::actions::*` M5.0 promote;handler boundary 校验长度 + path-traversal `..` + `<project>/.ccteam/` prefix)+ token 鉴权(loopback 免 token / 非 loopback 默认 token / `--no-auth` opt-out + 5s LAN-RCE 倒计时;`Authorization: Bearer ccteam:<token>`,`subtle::ConstantTimeEq` 比对,`~/.ccteam/web-token` mode 0600;浏览器 URL shim `?token=ccteam:<hex>` → HttpOnly `ccteam_token` cookie + 303 → 干净 URL;`/health` 例外免 auth)| ✅ |
-| **M5.4** | E2E + retro + workspace.version `0.2.2` → `0.3.0` ship gate(`tests/e2e_test.rs` 跨层 happy path canary;`docs/v0-3/e2e-retro.md` ship 报告)| ✅ |
-| **V0.3.1 F50/F51** | flex UI:dashboard `Kind` 列、`/project/<slug>` session cards、`/session/<slug>/<sid>` 详情、`/sse/project/<slug>/<sid>` sid filter、`/screenshot/<slug>-<sid>.png`、F51 flex e2e canary | ✅ |
+**V0.4.0 F69 + V0.4.6 F90 WorkflowView 4 个新面板**(代码 `crates/ccteam-web/web/src/components/`):
+- **ArtifactQueuePanel** — 每个 `Trigger::Watch(path)` agent 显示待处理 artifact 数 + 最旧文件 age + 最新文件名(后端 `GET /api/v1/projects/<slug>/artifact_queue` 实时 `fs::read_dir`)
+- **EventsTimelinePanel** — progress.jsonl 最近 100 行 + 颜色编码(绿色 `agent_done`、橙色 `gate_triggered`/`budget_exceeded`、红色 `escalation`)+ SSE 实时插
+- **FailureInspector** — errored agent card 点击 → `GET /api/v1/projects/<slug>/jobs/<job_id>/log?tail=200` 渲染 `~/.claude/jobs/<job_id>/output.log` 尾部(read-only)
+- **CostSparkline** — 24h + 7d SVG sparkline,数据源 F91 收敛后的 `workflow_summary.cost_24h_usd` + 历史 `progress.jsonl::agent_done.cost_usd` aggregated by hour(`GET /api/v1/projects/<slug>/cost_history?window=24h|7d`)
 
-V0.3 主要红线(详 PRD §3 / `interfaces.md` §15 / CLAUDE.md §三):
+**V0.4.5 F80 加 pulsing-dot 活动指示**(每个 agent card running session 有 active dot,SSE 推送)。
 
-- **`progress.jsonl` 是 SoT**:web 层走 `ccteam_core::collect_recent_events`,**不解析 tmux 终端输出**(M5.2 截图通过 `ccteam_core::render_screenshot` 内部 vt100 化)
-- **永不主动 kill**:M5.1 read-only;M5.2/M5.3 加 SSE / 写动作时仍守红线 — 仅走 `actions::*`(inbox + state.json 控制平面),不发 SIGINT / `tmux kill-session`
-- **status badge 是只读 label**:即使 `silence_classifier::classify` 返 `PostStopLimbo` / `SubagentRunaway`,web 层 **不**调 `LimboAction::from` / 重新注入 — orchestrator 持续走 F35 副作用路径
-- **dep graph**:`cargo tree -p ccteam-web | grep ccteam-cli` 必须 0 命中
+**Codex tmux SessionDetail / Terminal / Btw / Keyboard 组件保留** — Codex CLI adapter(F62 推迟)仍走 tmux 模式,这些组件复用,不算 dead code。
+
+**架构红线**(V0.4 维持):progress.jsonl 仍是 SoT;web 不解析 tmux 终端(SSE watcher 仅读 progress.jsonl);web 不 kill 长 session;web 不写跨项目记忆;`/api/v1/projects/<slug>/btw` 走跟 telegram channel + MCP `send_to_session` 完全相同的 inbox + watcher dispatch 路径;`cargo tree -p ccteam-web | grep ccteam-cli` 必须 0 命中(独立 dep graph 红线由 `tests/dep_graph_test.rs` 锁)。
 
 #### 前端层(可插拔)
 
@@ -792,17 +826,57 @@ M2+ channel layer 上线后会有 cron-style 自动触发(60s 默认推荐;
 
 **实施要点**:
 - 全部代码在 `crates/ccteam-core/src/watchdog.rs`(单文件,~600 行)
-- `crates/ccteam-cli/src/main.rs::Command::Watchdog::Scan` 暴露 CLI:
-  `ccteam watchdog scan [--push --user <handle>]`
-- meta-agent role prompt(§3.8 引用)新增 §7 描述 watchdog 角色边界
+- V0.4.6 F89 起 `ccteam watchdog scan` 顶层 CLI **已删除**(V0.3 legacy);
+  meta-agent 直接读 4 个数据源 NL 翻译,不再走专用子命令
 - `crates/ccteam-core/src/orchestrator.rs` **零** watchdog 引用
   (grep `watchdog` 命中 0 次是核心红线)
 
+### 3.10 项目生命周期(V0.4.6 F81-F83)
+
+V0.4.5 之前没有"删项目"命令,workflow.yaml 改一字段需要 daemon stop/start,workflow.yaml 位置又在项目根上和业务代码混淆。V0.4.6 三个 finding 一次解决:
+
+#### 3.10.1 `ccteam remove <slug>`(F81)
+
+```bash
+ccteam remove <slug> [--purge] [--dry-run] [--force]
+```
+
+- **always**:从 `~/.ccteam/config.yaml::projects[]` 删该 slug;
+  通过 F82 wiring 告知 daemon 热剔除(JoinSet abort + cancel token 优雅退);
+  删 `~/.ccteam/progress/<slug>.jsonl`、`~/.ccteam/inbox/<slug>/`、
+  `~/.ccteam/control/<slug>/`(如有)
+- **`--purge`**:同时 `rm -rf <project>/.ccteam/` + `<project>/.claude/agents/` + `<project>/workflow.yaml`(以及 `.ccteam/workflow.yaml`,F83 后 canonical 位置)。**业务代码 / .git/ / .env 永远保留**
+- **守 §三红线 refusal**:有活 tmux session / 活 claude bg job / 未匹配 `agent_spawn` 时 refuse,`--force` 才绕过
+
+衍生子命令 `ccteam abandon <slug>` PRD 中讨论后并入 `ccteam remove`(不加 `--purge` 等价 abandon — config 删但项目目录不动)。
+
+#### 3.10.2 `workflow.yaml` 热加载 + `enabled` 开关(F82)
+
+- **`WorkflowSpec::enabled: bool`**(default `true`,opt-out 形式 `enabled: false`)— V0.4.6 加在 schema 顶层,daemon 跳过 `enabled: false` 的 workflow,
+  仍在 roster 内但不跑(`workflow_done reason="disabled"` 写进 progress.jsonl)
+- **daemon 监听 workflow.yaml mtime + 内容 hash**:每个 rostered 项目装一个 inotify watch on `<project>/.ccteam/workflow.yaml`(F83 canonical 位置,旧位置 fallback);
+  改动 → 解析新 spec → diff 老 spec:
+  - `enabled: false` → cancel token trigger 优雅终止老 event_loop,写 `workflow_done reason="disabled"`
+  - `enabled: true` 且老 loop 在 → 替换 spec,trigger 变了重装 ArtifactWatcher
+  - `agents` 拓扑变 → 终止老 loop + 重启新 loop(干净)
+- **cancellation token 而非 `JoinSet::abort_handle()`** — abort_all 会硬中断 in-flight session,改用 `tokio::sync::Notify` cancel token,event_loop 在 `select!` 中等 token → 收到后写 `workflow_done` 事件 + clean exit
+
+#### 3.10.3 workflow.yaml 位置迁移到 `.ccteam/`(F83)
+
+- **新建项目**:`ccteam init` / `ccteam new` 写到 `<project>/.ccteam/workflow.yaml`(不再 root)
+- **`.gitignore` 整段已经包含 `.ccteam/`** — workflow.yaml 自然 gitignored(orchestration state 不入业务库,正合 CLAUDE.md §三红线)
+- **read 优先级**:`<project>/.ccteam/workflow.yaml` > `<project>/workflow.yaml`(旧位置 fallback,V0.5 删)
+- **migration**:`ccteam doctor --migrate-workflow-to-ccteam-dir` 把根上 workflow.yaml 移到 `.ccteam/`
+
+**红线**:`.ccteam/workflow.yaml` 是项目级 orchestration SoT,业务代码 / `.git/` / `.env` 永远不动。
+
 ---
 
-## 4. 关键流程
+## 4. 关键流程（V0.3 phase pipeline 历史）
 
-### 4.1 端到端：从想法到交付（Happy Path）
+> **V0.4.0 起 EOL**:9-phase happy path / Seed-Plan-Implement-Test 串行流 / "phase 间数据流" / "stall + cost 阈值告警" 全部 EOL — phase 概念已废。V0.4.6 实际形态:用户写 workflow.yaml + agent prompt → orchestrator 跑 ArtifactWatcher 触发 bg-job → progress.jsonl 7 类事件累积 → meta-agent 看事件 + 收 escalation/budget_exceeded notify。完整 V0.4.0 happy path 示例见 `docs/v0-4-0/prd.md` §3。下面 V0.3 流程作历史保留。
+
+### 4.1 端到端：从想法到交付（Happy Path，V0.3 历史）
 
 ```
 T+0:00  用户在 Telegram 发："做个本地书签管理器，离线可用"
@@ -910,9 +984,11 @@ if running_count < config.max_concurrent_projects:
 
 ## 6. Claude Code 扩展点映射
 
-### 6.1 Tmux 长 session 调用模板
+### 6.1 Tmux 长 session 调用模板（V0.3.x 历史 / Codex adapter 仍用）
 
-**为什么不用 `claude -p` 子进程**：每 phase 起新进程意味着重读 CLAUDE.md / spec / 上游产物，反复触发冷启动；prompt cache 5 分钟 TTL 命中不到。长跑项目（数小时-数天）改用一个**项目级长 session**——同 session 跨 phase 共享缓存，且天然支持随时 attach 观察与介入。
+> **V0.4.0 起标 historical**:Claude bg-job(`claude --bg --agent`)取代了项目级 tmux 长 session(详 §2.2 关键架构决策)。**meta-agent session 仍走 tmux**(事件循环需要长跑 + attach);**Codex CLI adapter 仍走 tmux**(独立 adapter,F62 推迟 bg-job 化)。下面模板保留作:(1) meta-agent / Codex adapter 实现参考;(2) 历史架构演进记录。常规项目 agent 现走 §3.3 workflow.yaml 触发 bg-job 路径,**不再 send-keys 长 session**。
+
+**为什么不用 `claude -p` 子进程**(V0.3 当年理由,V0.4.0 后 bg-job 已替代):每 phase 起新进程意味着重读 CLAUDE.md / spec / 上游产物,反复触发冷启动;prompt cache 5 分钟 TTL 命中不到。长跑项目(数小时-数天)改用一个**项目级长 session**——同 session 跨 phase 共享缓存,且天然支持随时 attach 观察与介入。
 
 #### 项目首次启动
 
@@ -1008,7 +1084,11 @@ orchestrator 通过 `PreToolUse` hook 检测最近一次输入源：若来自人
 
 **cost 来源关键事实**(写代码前必须知道):Claude Code **不**在 hook 输入里给 `cost_usd`——必须从 `transcript_path` 读 JSONL 解析 `usage.*` 自算。完整流程见 [interfaces.md §6.3](./interfaces.md#63-cost-accumulatesh-工作原理)。
 
-### 6.3 Multi-agent 编排（phase 内并行 + cross-cutting watcher）
+### 6.3 Multi-agent 编排（V0.4.0 起重塑;phase 内并行 + cross-cutting watcher 历史模型）
+
+> **V0.4.0 起重塑**:phase 概念已废,所以"phase 内并行" / "cross-cutting watcher" 都不再以这种形态存在。V0.4.0 后的多 agent 编排走 §3.3 workflow.yaml + `Trigger::Watch(path)` + `AgentSpec::parallelism: u32` — 一条 workflow.yaml 内多个 role(典型 explorer / fixer / reviewer / master)各自 trigger,fixer 并发 3 等并行靠 parallelism cap;cross-cutting watch 直接由 ArtifactWatcher 监听 artifact 目录实现(每写一个新 artifact spawn 一个对应 role 的 bg-job)。
+>
+> 下面三种模式作历史架构演进记录保留(V0.3.x 落地形态);新建项目用 workflow.yaml 拓扑替代。
 
 ccteam 用 multi-agent 编排同时承担两个不同目标——**质量**（痛点 11 L2，多视角议事）与**速度**（痛点 13 L 加速，多角色并行）。两个目标用同一个 Agent Teams 机制实现，但 phase prompt 中表达不同：
 
@@ -1129,21 +1209,21 @@ ccteam 只声明依赖。
 
 ### 6.5 项目级 CLAUDE.md（每项目自动生成）
 
-orchestrator 在 plan phase 后写入：
+`ccteam init` / `ccteam new` 在项目根生成(`<project>/CLAUDE.md`),内容不再带 phase 字段(V0.4.0 phase 概念已废):
 
 ```markdown
 # CLAUDE.md (auto-generated by ccteam)
 
 ## 项目上下文
 - slug: dev-bookmark-mgr-a3f9
-- 用户原始需求: 见 .ccteam/spec.md
-- 当前 phase: implement
-- 技术栈: Vite + Dexie + PWA（来自 plan-eng.md）
+- 用户原始需求: 见 .ccteam/spec.md(可选)
+- workflow 拓扑: 见 .ccteam/workflow.yaml(V0.4.6 F83 canonical 位置)
+- agent 行为: 见 .claude/agents/<role>.md(每 role 一份)
 
 ## 工作约定
-- 不要交互式询问。所有决策已在 .ccteam/plan-eng.md 中。
+- 不要交互式询问(`AskUserQuestion` 由 hook 拦截 → 写 .ccteam/outbox/ 反馈用户)。
 - 测试不过不算完成。
-- 修改 API 必须同步 .ccteam/api-contracts.md。
+- 修改 API 必须同步 .ccteam/api-contracts.md(如有)。
 
 ## 不做的事
 - 不要 git push（被 hook 拦截）
@@ -1151,7 +1231,22 @@ orchestrator 在 plan phase 后写入：
 - 不要碰其他项目目录
 
 ## 跨项目经验（来自 ~/.claude/rules/ccteam-lessons-<team>.md 自动注入 + per-repo auto-memory）
-{{ 召回的 top-3 patterns 摘要 }}
+{{ Claude Code 加载机制自动注入,无需 ccteam 检索 }}
+```
+
+agent prompt 在 `.claude/agents/<role>.md` 里:Claude Code 起 bg-job 时按 `--agent <role>` 参数读对应文件。例:
+
+```markdown
+---
+name: fixer
+description: Apply fix-request artifact and run tests
+tools: [Read, Write, Edit, Bash]
+model: claude-opus-4-5
+---
+
+You are a fixer agent. Read input artifact at `$CCTEAM_INPUT/<file>`,
+apply the suggested fix, run `npm test`, and write result to `$CCTEAM_OUTPUT/`.
+...
 ```
 
 ### 6.6 A2A bridge（可选，未 ship）
@@ -1160,23 +1255,22 @@ orchestrator 在 plan phase 后写入：
 
 ### 6.7 Skills 复用（gstack 模式）
 
-ccteam 出两个 skill:
+ccteam 出三个 skill(V0.4.4 起):
 
-#### `ccteam-phases`(phase prompt 分发,非守护模式 fallback)
+#### `ccteam-phases`(**V0.4.0 起 EOL**,phase 概念已废)
+
+V0.3.x 时代用户在自己 Claude Code 里 `/ccteam-implement` 跑单 phase 作 daemon fallback;V0.4.0 phase 全删后此 skill 失去意义。skill 目录留 marker(空 SKILL.md 标 EOL)以防工具 surface 校验告警,实际工作流已迁:
+- workflow 自动化 → `ccteam start` daemon + workflow.yaml + ArtifactWatcher
+- 手动单跑 → `ccteam internal spawn <slug> <role>` 直接触发一次 agent
+
+#### `ccteam-creator`(V0.4.4 ✅,**workflow.yaml + agent + skill 创建 dialogue 指引**)
 
 ```
-~/.claude/skills/ccteam-phases/
-├── SKILL.md           # 元数据
-└── phases/
-    ├── 02-plan-eng.md
-    ├── 03-implement.md
-    ├── 04-test-author.md
-    ├── 05-test-run.md
-    ├── 06-fix.md
-    └── 09-ship.md
+~/.claude/skills/ccteam-creator/
+└── SKILL.md           # 引用官方 workflow.yaml + agent spec,不复制
 ```
 
-用户在自己的 Claude Code 里手动喊 `/ccteam-implement` 等,跑单 phase——作为不起 daemon 的 fallback。product-research team 的 phase 序列(`01-kickoff` / `02-market-survey` / `03-differentiation-analysis` / `04-value-proposition` / `05-feasibility` / `06-verdict`)走 `phases-product-research/` 子目录。
+meta-agent / 用户日常 claude 装这个 skill 后可对话生成新项目的 workflow.yaml + `.claude/agents/<role>.md` 骨架。skill 内部引用 Claude Code 官方 agent file spec(不复制),ccteam 只补"agent 之间用 input/output artifact 接力"的连线指引。
 
 #### `ccteam-control`(已 ship,M1+,用户自带 claude 调度 ccteam 的入口)
 
@@ -1266,11 +1360,13 @@ orchestrator 是**所有 phase 派发 + inbox 派送**的单点 — daemon 死�
 
 **红线**:health check **只 stat heartbeat 文件**,不做任何 RPC / kill -0 / tmux capture-pane。pure stat 才能放在每个 MCP 调用的 hot path。daemon 启动时立即 touch 一次心跳文件(不等 30s),所以"刚起来的 daemon" 也立刻可观察。
 
-### 6.9 长跑鲁棒性（单一策略）
+### 6.9 长跑鲁棒性（V0.3 单长 session 策略,V0.4.0 起部分 EOL）
+
+> **V0.4.0 起部分 EOL**:本节"长 session 上下文膨胀 → 60% 阈值 + phase 边界 reset" 路径只适用 meta-agent + Codex tmux session。Claude bg-job 形态下每次 spawn = 全新 1M context,根本不撑爆,无需 reset。"Phase 注入:idle-aware" / "auto_loop 完结路径" / silence_classifier / pending-inject 等 V0.2.2 F35/F36 机制全部 EOL(phase + send-keys 长 session 消费者已废)。保留作历史架构记录 + Codex adapter 参考。
 
 针对长跑场景的两个典型问题，各采用一条最直接的路径——**不做多层兜底**。
 
-#### 长 session 上下文膨胀 → 60% 阈值 + phase 边界 reset
+#### 长 session 上下文膨胀 → 60% 阈值 + phase 边界 reset（V0.3 历史）
 
 - **默认开 1M 上下文**：避免短期内触顶。
 - **PostToolUse hook 持续累加**：每次 turn 的 `usage.input_tokens + cache_read_input_tokens` 写入 `state.json.context_tokens_used`。
@@ -1341,7 +1437,9 @@ fi
 
 **没产出三种合法出口任一 → Stop hook fallback 接管**:第一次 Stop 返回 exit 2 + stderr 强制 LLM 续聊,第二次 (`stop_hook_active=true`) 写 `<project>/.ccteam/needs_attention.outbox.json` 让 watchdog(M0.21)接力 surface 给用户。**永远不出现"silent halt"**——即使 LLM 反复输出纯文本问句,撞 cycle cap 也会硬 escalate。
 
-### 6.10 Sub-skill 自动调度（替人编排 plugin）
+### 6.10 Sub-skill 自动调度（V0.4.0 起 EOL）
+
+> **V0.4.0 起 EOL**:phase + `sub_skills` 字段都废后,sub-skill 调度不再由 orchestrator 在 phase 边界 trigger。新模型 = agent 在自己 `.claude/agents/<role>.md` 内决定何时 `Task(subagent_type=...)` 调 plugin agent / skill;orchestrator 完全不感知。下面 V0.3 设计保留作历史。
 
 ccteam 不重写 gstack / claude-plugins-official 的 skill；ccteam 的差异化是**替人 orchestrate 它们的调用时机与产物接力**——直接对应痛点 12。
 
@@ -1361,7 +1459,9 @@ ccteam 不重写 gstack / claude-plugins-official 的 skill；ccteam 的差异�
 
 两字段在 phase front matter 共存、互不冲突。
 
-### 6.11 Multi-session per project（痛点 13 大项目加速）
+### 6.11 Multi-session per project（V0.3.1 flex / V0.4.0 起重塑）
+
+> **V0.4.0 起重塑**:`team.yaml::kind: flex` + `ccteam session add` 的 adhoc multi-session 路径在 V0.4.0 phase + team.yaml::kind 全废后语义模糊。V0.4.6 时点 `Command::Session` CLI 仍在(给 Codex tmux adapter 用),但常规 Claude 项目改走 workflow.yaml `parallelism: u32` per role + bg-job 形态实现并发。痛点 13 fan-out / fan-in 概念 V0.4.6 仍未 ship,workflow.yaml 条件分支(V0.5 候选)落地后才能完整对标。下面保留作历史。
 
 V0.3.1 已 ship **adhoc flex multi-session**:只对 `kind: flex` 项目生效,
 用户显式 `ccteam session add <slug> --harness=claude` 创建
@@ -1467,7 +1567,9 @@ V0.3 候选(本里程碑不做):
 - `dependencies`(team-plugin 间依赖,eg 引用 `code-reviewer` plugin)
 - 多 phase 一次性 init(当前 V0.2 单 phase 起步,多 phase 走 skill 多轮 init)
 
-### 6.13 Web layer(V0.3/V0.3.1 已 ship)
+### 6.13 Web layer(V0.3 askama+htmx → V0.4.0 Vite+React SPA + V0.4.6 F90 panels)
+
+> **V0.4.0 起 SPA 重塑** + **V0.4.6 F90 加 4 个新面板**:askama+htmx vintage 已删,详 §3.8 "Web 仪表盘" 节当前形态;此节保留作 V0.3 vintage 历史(M5.0-M5.4 ship 时序 + 渲染栈演进)。
 
 V0.3 主线版本新加第四接入层(继 terminal / MCP / filesystem 之后),由 `crates/ccteam-web` crate 提供:
 
@@ -1484,6 +1586,47 @@ V0.3 主线版本新加第四接入层(继 terminal / MCP / filesystem 之后),�
   SSE / harness / screenshot / `/btw`),`crates/ccteam-web/tests/flex_e2e_test.rs`
   作为 F51 ship gate canary。
 - **架构红线**(V0.3 主线维持):progress.jsonl 仍是 SoT,web 不解析 tmux 终端(M5.2 SSE watcher 仅读 progress.jsonl,F38 截图内部 vt100 化非文本解析);web 不 kill 长 session;web 不写跨项目记忆;`/btw` 走跟 telegram channel + MCP `send_to_session` 完全相同的 inbox + idle dispatch 路径,不开新通路。
+
+### 6.14 Graceful shutdown(V0.4.6 F86)
+
+V0.4.5 daemon 收 SIGTERM 时直接 `JoinSet::abort_all()`,所有 event_loop 硬中断 → in-flight session 不写 `workflow_done`,下次启动靠 F80 phantom cleanup 补 synthetic agent_done。F80 是症状缓解,F86 才根治。
+
+**机制**:
+
+- **`Orchestrator::shutdown_token: Arc<Notify>`**(或 `watch::Sender<bool>`)— daemon 主循环 `select!` 中 arm 一条 `shutdown_token.notified()`
+- **`ccteam stop`** 不再 `kill PID` + poll pidfile,改:
+  - 写 `/tmp/ccteam-<user>.shutdown` trigger 文件 → daemon 文件 watcher 收到 → trigger Notify
+  - daemon 主循环 arm 触发 → cancel 所有 event_loop(用 F82 cancellation token,workflow_done reason="shutdown") → JoinSet `join_all()` 等所有 task 真正退出
+  - **timeout 30s 后才走 abort_all() fallback**(防卡死 event_loop 永远不返回)
+- **SIGTERM/SIGINT 兼容**:linux signal handler 也 trigger shutdown_token(双触发兼容 systemd / docker stop)
+
+**红线**:cancel token + Notify 用 `tokio::sync` 原语,不引入新依赖;`abort_all()` 仍作 30s timeout fallback 保留,不删 — 防 event_loop 自身卡死 await。
+
+**与 F80 phantom cleanup 关系**:F86 让 graceful 路径下 `workflow_done` 完整写入,F80 cleanup 在异常路径(panic / OOM kill / `-9`)仍作兜底。两层互不冲突。
+
+### 6.15 Cost telemetry(V0.4.6 F91 + V0.4.7 F92 known gap)
+
+V0.4.5 cost 三个数据源:
+1. `state.cost_used_usd`(per project,在 `~/.ccteam/projects/<slug>/state.json` 里)— 由 `Hook::CostAccumulate` 接收 stdin parse claude 输出累加
+2. `progress.jsonl::agent_done.cost_usd`(per session,F66 hook 写)
+3. `claude_job::probe_job` 读 `~/.claude/jobs/<id>/state.json::cost_usd_total`(F80 加)
+
+任一 hook miss → ccteam 端 cost 漂。**真实来源就是 Claude 自己写的 state.json**,ccteam 不该自己再算一份。
+
+**V0.4.6 F91 收敛**:
+
+- **删 cost 累加路径**:`Hook::CostAccumulate` enum branch + `ccteam_hooks::cost_accumulate` 函数 + `ccteam doctor --install-hooks` 模板里的 `cost-accumulate` hook 全删;`doctor --update-hooks` 同步清现有项目 settings.json
+- **`state.cost_used_usd` 字段保留 serde compat**:`#[serde(default)]` 接受老文件,写入路径不再 mutate(标 `#[deprecated]`,V0.5 删),读取路径(`workflow_summary` / `ccteam show`)改用:
+  ```rust
+  pub struct CostSummary {
+      pub cost_24h_usd: f64,      // sum progress.jsonl::agent_done.cost_usd within 24h
+      pub cost_active_usd: f64,    // sum live ~/.claude/jobs/<active>/state.json::cost_usd_total
+      pub cost_total_usd: f64,
+  }
+  ```
+- **F84 budget cap** 用 `cost_24h_usd` 判定;**F90 Cost sparkline** 用同源数据
+
+**已知 gap(V0.4.7 F92 候选)**:V0.4.6 仍有 `agent_done.cost_usd` 字段需要 hook 写 — 真实数据其实在 `~/.claude/jobs/<id>/linkScanPath` 下的 jsonl 里。F92 候选打算直接从那读,完全摆脱 hook 依赖。当前 V0.4.6 在 hook miss 场景下 `cost_24h_usd` 仍可能漂(已知 limitation,记录于 `docs/v0-4-6/prd.md F91 验收 #3`)。
 
 ---
 
