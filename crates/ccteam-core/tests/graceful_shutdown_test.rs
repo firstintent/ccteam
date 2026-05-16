@@ -27,9 +27,9 @@ use std::time::Duration;
 use indexmap::IndexMap;
 use serde_json::Value;
 use tempfile::TempDir;
-use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 
-use ccteam_core::orchestrator::{Orchestrator, OrchestratorConfig};
+use ccteam_core::orchestrator::{CancelReason, Orchestrator, OrchestratorConfig};
 use ccteam_core::workflow::{AgentSpec, Executor, Trigger, WorkflowSpec};
 use ccteam_core::CcteamPaths;
 
@@ -61,6 +61,8 @@ fn manual_spec(role: &str) -> WorkflowSpec {
     WorkflowSpec {
         name: "shutdown-test".into(),
         description: None,
+        enabled: true,
+        budget: None,
         agents,
     }
 }
@@ -102,7 +104,7 @@ async fn t01_stop_triggers_workflow_done_shutdown() {
 
     let orch = Arc::new(Orchestrator::new(paths, OrchestratorConfig::default()).unwrap());
 
-    let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
+    let (cancel_tx, cancel_rx) = oneshot::channel::<CancelReason>();
     let orch_for_task = Arc::clone(&orch);
     let slug_owned = slug.to_string();
     let task = tokio::spawn(async move {
@@ -113,7 +115,7 @@ async fn t01_stop_triggers_workflow_done_shutdown() {
 
     // Give the watcher a beat to register; then signal cancel.
     tokio::time::sleep(Duration::from_millis(120)).await;
-    let _ = cancel_tx.send(()).await;
+    let _ = cancel_tx.send(CancelReason::Shutdown);
 
     // Loop should drain quickly after the cancel signal.
     let res = tokio::time::timeout(Duration::from_secs(5), task)
@@ -153,7 +155,7 @@ async fn t02_stop_30s_timeout_falls_back_to_abort() {
     // a `TrySendError::Closed`, which the production `shutdown()`
     // logs-and-continues — proving the timeout path is reachable
     // without us bringing up an actual stalled event_loop.
-    let (tx, rx) = mpsc::channel::<()>(1);
+    let (tx, rx) = oneshot::channel::<CancelReason>();
     drop(rx);
     orch.test_register_cancel_handle("stuck-1", tx).await;
     assert_eq!(orch.test_cancel_handles_len().await, 1);
@@ -196,9 +198,9 @@ async fn t03_sigterm_equivalent_to_stop() {
     let (_pr, _cr, paths) = make_paths();
     let orch = Arc::new(Orchestrator::new(paths, OrchestratorConfig::default()).unwrap());
 
-    let mut receivers: Vec<mpsc::Receiver<()>> = Vec::new();
+    let mut receivers: Vec<oneshot::Receiver<CancelReason>> = Vec::new();
     for slug in ["alpha", "beta", "gamma"] {
-        let (tx, rx) = mpsc::channel::<()>(1);
+        let (tx, rx) = oneshot::channel::<CancelReason>();
         orch.test_register_cancel_handle(slug, tx).await;
         receivers.push(rx);
     }
@@ -208,18 +210,13 @@ async fn t03_sigterm_equivalent_to_stop() {
     slugs.sort();
     assert_eq!(slugs, vec!["alpha", "beta", "gamma"]);
 
-    // Every receiver got exactly one `()` and then the channel is
-    // closed (sender dropped after `shutdown` drained the map).
-    for mut rx in receivers {
-        let signal = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+    // Every receiver got exactly one CancelReason::Shutdown (oneshot
+    // is consumed; no follow-up recv after that).
+    for rx in receivers {
+        let signal = tokio::time::timeout(Duration::from_millis(200), rx)
             .await
             .expect("cancel signal never arrived");
-        assert_eq!(signal, Some(()));
-        // Sender dropped — next recv returns None.
-        let closed = tokio::time::timeout(Duration::from_millis(200), rx.recv())
-            .await
-            .expect("recv after drop hung");
-        assert_eq!(closed, None);
+        assert_eq!(signal.expect("sender dropped"), CancelReason::Shutdown);
     }
 
     // `cancel_event_loop` for an unknown slug returns false.
@@ -239,7 +236,7 @@ async fn t04_cancel_event_loop_drains_running_project() {
 
     let orch = Arc::new(Orchestrator::new(paths, OrchestratorConfig::default()).unwrap());
 
-    let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
+    let (cancel_tx, cancel_rx) = oneshot::channel::<CancelReason>();
     orch.test_register_cancel_handle(slug, cancel_tx).await;
     let orch_for_task = Arc::clone(&orch);
     let slug_owned = slug.to_string();
