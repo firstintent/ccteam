@@ -58,12 +58,16 @@ pub use actions::{
     DecisionInput, SendOptions, SendResult,
 };
 pub use auto_loop::{AutoLoopDecision, AutoLoopFrontMatter, AutoLoopState};
-pub use claude_job::{classify as classify_job_state, probe_job, probe_state_json, JobLiveness};
+pub use claude_job::{
+    classify as classify_job_state, gc_terminated_jobs, gc_user_claude_jobs, probe_job,
+    probe_state_json, GcDisposition, GcEntry, GcReport, JobLiveness,
+};
 pub use config::{
     append_project as append_project_to_config, config_path as ccteam_config_path,
-    load as load_ccteam_config, lookup_project as lookup_project_in_config,
-    remove_project as remove_project_from_config, save as save_ccteam_config,
-    upsert_project as upsert_project_in_config, CcteamConfig, ProjectEntry, CONFIG_FILENAME,
+    default_claude_jobs_retention_days, load as load_ccteam_config,
+    lookup_project as lookup_project_in_config, remove_project as remove_project_from_config,
+    save as save_ccteam_config, upsert_project as upsert_project_in_config, CcteamConfig,
+    ProjectEntry, CONFIG_FILENAME,
 };
 pub use cost::{classify as classify_cost, CostLevel, COST_MID_WARN_USD};
 pub use daemon::{

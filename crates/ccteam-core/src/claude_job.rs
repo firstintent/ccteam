@@ -48,8 +48,9 @@
 //!   migration path for pre-F80 `progress.jsonl` history beyond this
 //!   one-shot drain.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use anyhow::{Context, Result};
 use serde_json::Value;
 
 /// Outcome of a single liveness probe.
@@ -174,6 +175,294 @@ pub fn classify(value: &Value) -> JobLiveness {
 /// log the path don't need to import `harness` directly.
 pub fn job_state_path(job_id: &str) -> PathBuf {
     crate::harness::state_json_path(job_id)
+}
+
+// V0.4.6 F85 — `~/.claude/jobs/` GC.
+//
+// Long-lived hosts accumulate one subdirectory per finished `claude --bg`
+// session. F80 phantom-cleanup retired stale `agent_spawn` rows in
+// `progress.jsonl`, but it never touches `~/.claude/jobs/<id>/`. As a
+// result host inventories drift into the hundreds (289 entries observed
+// on the dev box on 2026-05-16) and `state.json` reads grow slower over
+// time. F85 reclaims that space by deleting `<jobs_dir>/<job_id>/` once
+// the job has been terminal for `retention_days`.
+//
+// Rules (PRD §F85 + dev-plan 阶段 7):
+//
+// 1. Walk every immediate child of `jobs_dir` (one dir per job id).
+// 2. Read `<entry>/state.json`. If absent, count it `corrupt` and skip.
+// 3. Parse JSON. On parse error, count it `corrupt` and skip.
+// 4. Classify state:
+//    - `working` → keep (active session; never kill long sessions, §三)
+//    - terminal (`completed` / `done` / `stopped` / `error` / `failed`
+//      / `crashed` / `killed`) AND `firstTerminalAt` >= retention cutoff
+//      → keep
+//    - terminal AND `firstTerminalAt` < retention cutoff → eligible
+//    - terminal without `firstTerminalAt` (legacy state.json) →
+//      fall back to the dir mtime
+// 5. Eligible entries are `rm -rf`'d unless `dry_run`.
+
+/// Terminal `state` strings the GC treats as "may be reclaimed once
+/// retention elapses". Mirrors the classifier above; kept private so the
+/// caller can't accidentally widen the set. `working` and unknown
+/// states are always preserved.
+const TERMINAL_STATES: &[&str] = &[
+    "completed",
+    "done",
+    "stopped",
+    "error",
+    "failed",
+    "crashed",
+    "killed",
+];
+
+/// Per-directory disposition for the GC report. `Removed` and
+/// `WouldRemove` carry the same payload — the only difference is whether
+/// `dry_run` was set.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GcDisposition {
+    /// Job dir was `rm -rf`'d (dry_run=false).
+    Removed,
+    /// Job dir would be removed but dry_run=true.
+    WouldRemove,
+    /// `state.json::state == "working"` — never touched.
+    KeptWorking,
+    /// Terminal but inside the retention window.
+    KeptRecent,
+    /// `state.json` missing or unparseable — preserved + WARN.
+    KeptCorrupt,
+    /// State is neither terminal nor `working` — preserved
+    /// defensively (e.g. forward-compat Claude states we don't know).
+    KeptUnknown,
+}
+
+/// One row of the GC report.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GcEntry {
+    pub job_id: String,
+    pub disposition: GcDisposition,
+}
+
+/// Summary of one GC sweep. `dir_count_before` counts the entries
+/// directly under `jobs_dir` at scan time (real or simulated removals
+/// don't double-count). `removed` matches `entries.iter().filter(|e|
+/// e.disposition == Removed || WouldRemove).count()`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GcReport {
+    /// Number of `<job_id>/` directories observed at scan time.
+    pub dir_count_before: usize,
+    /// Number of dirs after the sweep. In dry-run mode this equals
+    /// `dir_count_before` (we only count what *would* be removed).
+    pub dir_count_after: usize,
+    /// Count of dirs flagged for removal (or actually removed when
+    /// `!dry_run`).
+    pub removed: usize,
+    /// `dir_count_before - removed - (kept_corrupt + kept_unknown)`
+    /// equivalent; preserved separately for human-readable reports.
+    pub kept_working: usize,
+    pub kept_recent: usize,
+    pub kept_corrupt: usize,
+    pub kept_unknown: usize,
+    /// Whether the sweep was a no-op preview (no fs mutation).
+    pub dry_run: bool,
+    /// Per-entry detail; ordered as walked (no stable sort — caller
+    /// sorts if needed for golden tests).
+    pub entries: Vec<GcEntry>,
+}
+
+/// Walk `jobs_dir` and reclaim every `<id>/` whose `state.json` reports
+/// a terminal state older than `retention_days`. See module-level
+/// "V0.4.6 F85" doc for the full ruleset.
+///
+/// `retention_days == 0` short-circuits the entire sweep — GC is opt-in
+/// at every level, so `Config::claude_jobs_retention_days: 0` disables
+/// the feature without needing a separate flag.
+///
+/// Missing `jobs_dir` is not an error (fresh hosts haven't created it
+/// yet); the function returns an empty report. Real IO failures
+/// (`read_dir`, `remove_dir_all`) bubble.
+pub fn gc_terminated_jobs(jobs_dir: &Path, retention_days: u32, dry_run: bool) -> Result<GcReport> {
+    let mut report = GcReport {
+        dry_run,
+        ..GcReport::default()
+    };
+    if retention_days == 0 {
+        // Disabled — return an explicit zero-action report so callers
+        // can log "GC disabled" without inferring it from empty entries.
+        return Ok(report);
+    }
+    if !jobs_dir.exists() {
+        return Ok(report);
+    }
+
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(retention_days as i64);
+
+    let read_dir =
+        std::fs::read_dir(jobs_dir).with_context(|| format!("read_dir {}", jobs_dir.display()))?;
+
+    for entry in read_dir {
+        let entry = entry.with_context(|| format!("iter {}", jobs_dir.display()))?;
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(err) => {
+                tracing::warn!(?err, path = %path.display(), "claude_jobs gc: file_type failed; skipping");
+                continue;
+            }
+        };
+        if !file_type.is_dir() {
+            // `~/.claude/jobs/` is a directory of directories; any
+            // stray file (e.g. a leftover `.tmp` or operator artifact)
+            // is preserved untouched.
+            continue;
+        }
+        let job_id = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| path.display().to_string());
+
+        report.dir_count_before += 1;
+
+        let disposition = classify_dir_for_gc(&path, cutoff);
+        match &disposition {
+            GcDisposition::WouldRemove => {
+                report.removed += 1;
+                // dry_run — don't touch disk; dir_count_after stays
+                // equal to before for this entry.
+                report.dir_count_after += 1;
+            }
+            GcDisposition::Removed => {
+                // Unreachable here — classify_dir_for_gc never returns
+                // Removed; that conversion happens below.
+                unreachable!("classify_dir_for_gc never returns Removed");
+            }
+            GcDisposition::KeptWorking => {
+                report.kept_working += 1;
+                report.dir_count_after += 1;
+            }
+            GcDisposition::KeptRecent => {
+                report.kept_recent += 1;
+                report.dir_count_after += 1;
+            }
+            GcDisposition::KeptCorrupt => {
+                report.kept_corrupt += 1;
+                report.dir_count_after += 1;
+                tracing::warn!(
+                    job_id = %job_id,
+                    path = %path.display(),
+                    "claude_jobs gc: state.json missing/corrupt; preserving for manual inspection"
+                );
+            }
+            GcDisposition::KeptUnknown => {
+                report.kept_unknown += 1;
+                report.dir_count_after += 1;
+            }
+        }
+
+        let final_disposition = match disposition {
+            GcDisposition::WouldRemove if !dry_run => {
+                match std::fs::remove_dir_all(&path) {
+                    Ok(()) => {
+                        // Successful real remove: subtract back from the
+                        // after-count we provisionally bumped.
+                        report.dir_count_after -= 1;
+                        GcDisposition::Removed
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            ?err,
+                            job_id = %job_id,
+                            path = %path.display(),
+                            "claude_jobs gc: remove_dir_all failed; preserving entry"
+                        );
+                        // Failed real remove: keep counting it as
+                        // present, decrement `removed` because it
+                        // wasn't actually reclaimed.
+                        report.removed -= 1;
+                        report.kept_corrupt += 1;
+                        GcDisposition::KeptCorrupt
+                    }
+                }
+            }
+            other => other,
+        };
+
+        report.entries.push(GcEntry {
+            job_id,
+            disposition: final_disposition,
+        });
+    }
+
+    Ok(report)
+}
+
+/// Decide whether a `<jobs_dir>/<id>/` should be reclaimed.
+///
+/// Pure-ish (filesystem reads only; no mutation) so unit tests can
+/// drive every branch via a tempdir tree.
+fn classify_dir_for_gc(path: &Path, cutoff: chrono::DateTime<chrono::Utc>) -> GcDisposition {
+    let state_path = path.join("state.json");
+    let raw = match std::fs::read_to_string(&state_path) {
+        Ok(s) => s,
+        Err(_) => return GcDisposition::KeptCorrupt,
+    };
+    let value: Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return GcDisposition::KeptCorrupt,
+    };
+
+    let state_str = value
+        .get("state")
+        .and_then(|s| s.as_str())
+        .or_else(|| value.get("status").and_then(|s| s.as_str()))
+        .unwrap_or("working");
+
+    if state_str == "working" {
+        return GcDisposition::KeptWorking;
+    }
+    if !TERMINAL_STATES.contains(&state_str) {
+        return GcDisposition::KeptUnknown;
+    }
+
+    let terminal_at = value
+        .get("firstTerminalAt")
+        .and_then(|v| v.as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc));
+
+    let effective_terminal_at = terminal_at.or_else(|| dir_mtime_utc(path));
+
+    match effective_terminal_at {
+        Some(t) if t < cutoff => GcDisposition::WouldRemove,
+        Some(_) => GcDisposition::KeptRecent,
+        // No timestamp at all (corrupt fs metadata) — be conservative.
+        None => GcDisposition::KeptCorrupt,
+    }
+}
+
+fn dir_mtime_utc(path: &Path) -> Option<chrono::DateTime<chrono::Utc>> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta.modified().ok()?;
+    let dt: chrono::DateTime<chrono::Utc> = mtime.into();
+    Some(dt)
+}
+
+/// Convenience wrapper: GC the user's real `~/.claude/jobs/` (honoring
+/// `$CCTEAM_CLAUDE_JOBS_DIR` for tests). Daemon startup + the `ccteam
+/// doctor --gc-claude-jobs` CLI path both call this; the lower-level
+/// [`gc_terminated_jobs`] is exposed so test code (and any future GC
+/// caller wanting a custom path) can target a tempdir directly.
+pub fn gc_user_claude_jobs(retention_days: u32, dry_run: bool) -> Result<GcReport> {
+    let base = std::env::var_os(crate::harness::CLAUDE_JOBS_DIR_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_default()
+                .join(".claude")
+                .join("jobs")
+        });
+    gc_terminated_jobs(&base, retention_days, dry_run)
 }
 
 #[cfg(test)]

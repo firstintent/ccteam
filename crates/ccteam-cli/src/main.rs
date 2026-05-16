@@ -351,16 +351,26 @@ enum Command {
         migrate_v041_to_v042: bool,
         /// V0.4.6 F83: move every registered project's root
         /// `workflow.yaml` into `<project>/.ccteam/workflow.yaml`.
-        /// Default is dry-run; pass `--apply` (i.e. clear `--dry-run`'s
-        /// inverse semantics — see below) to actually move the files.
-        /// Conflicts (both locations populated) are fail-safe — neither
-        /// file is touched and the user is told to resolve by hand.
-        /// Idempotent.
+        /// Default is dry-run; pair with `--apply` to actually move
+        /// the files. Conflicts (both locations populated) are
+        /// fail-safe — neither file is touched and the user is told
+        /// to resolve by hand. Idempotent.
         #[arg(long, default_value_t = false)]
         migrate_workflow_to_ccteam_dir: bool,
-        /// V0.4.6 F83: pair with `--migrate-workflow-to-ccteam-dir` to
-        /// perform the moves instead of previewing them. Without this
-        /// flag the migration runs in dry-run mode.
+        /// V0.4.6 F85: reclaim terminated `~/.claude/jobs/<id>/`
+        /// directories older than
+        /// `~/.ccteam/config.yaml::claude_jobs_retention_days` (default
+        /// 7 days). Default is dry-run — prints what would be removed
+        /// without touching disk. Pair with `--apply` to actually
+        /// `rm -rf` eligible entries. Never touches dirs whose
+        /// `state.json::state == "working"` or whose `state.json` is
+        /// missing / unparseable.
+        #[arg(long, default_value_t = false)]
+        gc_claude_jobs: bool,
+        /// V0.4.6 F83/F85: pair with `--migrate-workflow-to-ccteam-dir`
+        /// or `--gc-claude-jobs` to commit changes to disk instead of
+        /// previewing them. Without it, those subcommands run as
+        /// dry-run.
         #[arg(long, default_value_t = false)]
         apply: bool,
     },
@@ -686,6 +696,7 @@ fn main() -> Result<()> {
             screenshot_smoke,
             migrate_v041_to_v042,
             migrate_workflow_to_ccteam_dir,
+            gc_claude_jobs,
             apply,
         } => {
             // V0.4.1 `--install-all` is sugar for the three first-run
@@ -693,12 +704,10 @@ fn main() -> Result<()> {
             let final_mcp = install_mcp || install_all;
             let final_skill = install_skill || install_all;
             let final_meta = install_meta_agent || install_all;
-            // V0.4.6 F83: `--apply` inverts the default dry-run for the
-            // F83 migration so users who forget `--apply` can preview
-            // safely. `--dry-run` still wins if explicitly set (e.g.
-            // `--migrate-workflow-to-ccteam-dir --apply --dry-run` will
-            // still dry-run, matching how `--migrate-v041-to-v042` honors
-            // the global `--dry-run` flag).
+            // V0.4.6 F83 + F85: `--apply` inverts default dry-run for
+            // both --migrate-workflow-to-ccteam-dir and --gc-claude-jobs
+            // so users previewing safely don't accidentally mutate disk.
+            // `--dry-run` still wins if explicitly set.
             let f83_dry_run = if migrate_workflow_to_ccteam_dir {
                 dry_run || !apply
             } else {
@@ -718,6 +727,8 @@ fn main() -> Result<()> {
                 screenshot_smoke,
                 migrate_v041_to_v042,
                 migrate_workflow_to_ccteam_dir,
+                gc_claude_jobs,
+                gc_apply: apply,
             })
         }
         Command::Phase { cmd } => run_phase(cmd),

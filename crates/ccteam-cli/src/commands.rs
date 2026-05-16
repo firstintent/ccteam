@@ -1307,6 +1307,15 @@ pub struct DoctorOptions {
     /// locations have a `workflow.yaml`) are fail-safe and left
     /// untouched.
     pub migrate_workflow_to_ccteam_dir: bool,
+    /// V0.4.6 F85: reclaim terminated `~/.claude/jobs/<id>/`
+    /// directories whose `state.json::state ∈ TERMINAL_STATES` and
+    /// whose `firstTerminalAt` (or dir mtime fallback) is older than
+    /// `~/.ccteam/config.yaml::claude_jobs_retention_days` (default 7).
+    /// Default is dry-run; pair with `gc_apply` to actually `rm -rf`.
+    pub gc_claude_jobs: bool,
+    /// V0.4.6 F85: arm `gc_claude_jobs` to commit removals to disk.
+    /// No-op unless `gc_claude_jobs` is also true.
+    pub gc_apply: bool,
 }
 
 /// `ccteam doctor` dispatch. Returns a human-readable report so unit
@@ -1322,7 +1331,8 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
         || opts.migrate_recommended_agents
         || opts.screenshot_smoke.is_some()
         || opts.migrate_v041_to_v042
-        || opts.migrate_workflow_to_ccteam_dir;
+        || opts.migrate_workflow_to_ccteam_dir
+        || opts.gc_claude_jobs;
     if !any_mode {
         return Ok(String::from(
             "ccteam doctor: pass at least one mode flag.\n\
@@ -1354,7 +1364,9 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
              --migrate-workflow-to-ccteam-dir [--apply]\n      \
              move every registered project's root workflow.yaml into <project>/.ccteam/workflow.yaml \
              (V0.4.6 F83). Default dry-run; pair with --apply to perform the moves. Conflicts \
-             (both locations present) are fail-safe — neither file is touched.\n",
+             (both locations present) are fail-safe — neither file is touched.\n  \
+             --gc-claude-jobs [--apply]\n      \
+             reclaim terminated ~/.claude/jobs/<id>/ dirs older than ~/.ccteam/config.yaml::claude_jobs_retention_days (default 7 days; 0 disables). Default is dry-run; --apply commits removals (V0.4.6 F85).\n",
         ));
     }
     let mut out = String::new();
@@ -1403,15 +1415,14 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
         out.push_str(&ccteam_core::render_migration_report(&report));
     }
     if opts.migrate_workflow_to_ccteam_dir {
-        // dry_run is the inverse of `--apply` semantics — the CLI flag
-        // is `--apply`, mapped onto `opts.dry_run` at the main.rs layer.
-        // (No new flag struct field needed: opts.dry_run already exists
-        // as the canonical doctor dry-run knob.)
         let reports = ccteam_core::migrate_workflow_to_ccteam_dir(paths, opts.dry_run)?;
         out.push_str(&ccteam_core::render_workflow_migration_report(
             &reports,
             opts.dry_run,
         ));
+    }
+    if opts.gc_claude_jobs {
+        out.push_str(&render_gc_claude_jobs_report(paths, opts.gc_apply)?);
     }
     // V0.3.1 F47 — informational codex CLI detection. Appends one line
     // to every successful doctor run (any_mode == true) so operators
@@ -1449,6 +1460,84 @@ fn fallback_not_found_line() -> String {
     String::from(
         "[ccteam] codex CLI: not found (install for V0.4.0 CodexAdapter — see docs/research/ccteam-codex-integration.md)\n",
     )
+}
+
+/// V0.4.6 F85 — render `ccteam doctor --gc-claude-jobs [--apply]`.
+///
+/// Reads `~/.ccteam/config.yaml::claude_jobs_retention_days` (default 7
+/// days; 0 disables GC) and sweeps `~/.claude/jobs/`. `apply=false`
+/// (dry-run) prints what would be reclaimed; `apply=true` actually
+/// `rm -rf`'s the directories. The report has a one-line summary
+/// followed by per-entry status lines so operators can sanity-check
+/// what was touched.
+fn render_gc_claude_jobs_report(paths: &CcteamPaths, apply: bool) -> Result<String> {
+    let mut out = String::from("ccteam doctor --gc-claude-jobs");
+    if apply {
+        out.push_str(" --apply");
+    }
+    out.push_str("\n\n");
+
+    let retention = match ccteam_core::load_ccteam_config(&paths.root) {
+        Ok(cfg) => cfg.claude_jobs_retention_days,
+        Err(err) => {
+            out.push_str(&format!(
+                "  [WARN] failed to load config.yaml ({err:#}); using default retention.\n"
+            ));
+            ccteam_core::default_claude_jobs_retention_days()
+        }
+    };
+    out.push_str(&format!("  retention_days: {retention}\n"));
+
+    if retention == 0 {
+        out.push_str(
+            "  GC disabled (retention_days == 0). \
+             Set `claude_jobs_retention_days: N` in ~/.ccteam/config.yaml to enable.\n",
+        );
+        return Ok(out);
+    }
+
+    let dry_run = !apply;
+    let report = ccteam_core::gc_user_claude_jobs(retention, dry_run)?;
+
+    out.push_str(&format!(
+        "  mode: {}\n",
+        if dry_run {
+            "dry-run (no fs mutation)"
+        } else {
+            "apply"
+        }
+    ));
+    out.push_str(&format!("  dir_count_before: {}\n", report.dir_count_before));
+    out.push_str(&format!("  dir_count_after:  {}\n", report.dir_count_after));
+    out.push_str(&format!(
+        "  removed:       {}\n  kept_working:  {}\n  kept_recent:   {}\n  kept_corrupt:  {}\n  kept_unknown:  {}\n",
+        report.removed,
+        report.kept_working,
+        report.kept_recent,
+        report.kept_corrupt,
+        report.kept_unknown,
+    ));
+
+    if !report.entries.is_empty() {
+        out.push_str("\n  entries:\n");
+        for e in &report.entries {
+            let tag = match e.disposition {
+                ccteam_core::GcDisposition::Removed => "removed",
+                ccteam_core::GcDisposition::WouldRemove => "would-remove",
+                ccteam_core::GcDisposition::KeptWorking => "kept-working",
+                ccteam_core::GcDisposition::KeptRecent => "kept-recent",
+                ccteam_core::GcDisposition::KeptCorrupt => "kept-corrupt",
+                ccteam_core::GcDisposition::KeptUnknown => "kept-unknown",
+            };
+            out.push_str(&format!("    [{tag}] {}\n", e.job_id));
+        }
+    }
+
+    if dry_run && report.removed > 0 {
+        out.push_str("\n  Re-run with --apply to actually reclaim the entries listed above.\n");
+    }
+    out.push('\n');
+    Ok(out)
 }
 
 /// V0.2 M0.18.5: load + validate one team's `team.yaml` and every

@@ -316,6 +316,49 @@ impl Orchestrator {
         let mut tasks: JoinSet<(String, Result<()>)> = JoinSet::new();
         let mut spawned: HashSet<String> = HashSet::new();
 
+        // V0.4.6 F85: one-shot `~/.claude/jobs/` GC at daemon startup.
+        // Runs on the blocking pool so the `read_dir` + `remove_dir_all`
+        // walk doesn't stall the event-loop. Reads the retention value
+        // from `~/.ccteam/config.yaml::claude_jobs_retention_days`
+        // (default 7 days; 0 disables GC). The sweep is best-effort:
+        // any IO error is logged + swallowed so a transient
+        // permissions glitch never blocks daemon boot.
+        let gc_paths_root = self.paths.root.clone();
+        tokio::task::spawn_blocking(move || {
+            let retention = match crate::config::load(&gc_paths_root) {
+                Ok(cfg) => cfg.claude_jobs_retention_days,
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        "claude_jobs gc: failed to load config; using default retention"
+                    );
+                    crate::config::default_claude_jobs_retention_days()
+                }
+            };
+            if retention == 0 {
+                tracing::info!("claude_jobs gc: disabled (retention == 0)");
+                return;
+            }
+            match crate::claude_job::gc_user_claude_jobs(retention, false) {
+                Ok(report) => {
+                    tracing::info!(
+                        retention_days = retention,
+                        dir_count_before = report.dir_count_before,
+                        dir_count_after = report.dir_count_after,
+                        removed = report.removed,
+                        kept_working = report.kept_working,
+                        kept_recent = report.kept_recent,
+                        kept_corrupt = report.kept_corrupt,
+                        kept_unknown = report.kept_unknown,
+                        "claude_jobs gc completed"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(?err, "claude_jobs gc failed; continuing daemon boot");
+                }
+            }
+        });
+
         self.spawn_new_rostered_projects(&mut tasks, &mut spawned, "startup");
 
         if let Err(err) = daemon::write_heartbeat(&self.paths) {

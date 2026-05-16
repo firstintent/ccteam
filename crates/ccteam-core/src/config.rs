@@ -40,7 +40,7 @@ pub const CONFIG_FILENAME: &str = "config.yaml";
 /// Top-level config schema. Future fields plug in as their own
 /// optional sections without breaking existing files — `serde(default)`
 /// on every collection guarantees an older config.yaml still parses.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CcteamConfig {
     /// Canonical base for `ccteam init --in <slug>`. When absent,
     /// `CcteamPaths::from_env` falls back to `$HOME/projects`.
@@ -59,6 +59,33 @@ pub struct CcteamConfig {
     /// `watchdog.yaml` directly).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watchdog: Option<crate::watchdog::WatchdogConfig>,
+
+    /// V0.4.6 F85: how many days a terminated `~/.claude/jobs/<id>/`
+    /// directory may live before the daemon's startup GC sweep (or
+    /// `ccteam doctor --gc-claude-jobs --apply`) reclaims it. Default
+    /// 7 days. Setting `0` disables GC entirely (every entry is
+    /// preserved), which is useful for forensic captures or shared
+    /// hosts where ccteam shouldn't touch sibling tools' state.
+    #[serde(default = "default_claude_jobs_retention_days")]
+    pub claude_jobs_retention_days: u32,
+}
+
+/// Default value for `claude_jobs_retention_days` when the field is
+/// absent from `config.yaml`. Kept as a free function so serde's
+/// `#[serde(default = "...")]` can reference it.
+pub fn default_claude_jobs_retention_days() -> u32 {
+    7
+}
+
+impl Default for CcteamConfig {
+    fn default() -> Self {
+        Self {
+            projects_root: None,
+            projects: Vec::new(),
+            watchdog: None,
+            claude_jobs_retention_days: default_claude_jobs_retention_days(),
+        }
+    }
 }
 
 /// One project registry entry. `path` is absolute; `team` mirrors
@@ -118,8 +145,7 @@ pub fn save(ccteam_root: &Path, cfg: &CcteamConfig) -> Result<()> {
             .with_context(|| format!("backup {} → {}", path.display(), bak.display()))?;
     }
     let tmp = path.with_extension("yaml.tmp");
-    std::fs::write(&tmp, yaml.as_bytes())
-        .with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::write(&tmp, yaml.as_bytes()).with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, &path)
         .with_context(|| format!("rename {} → {}", tmp.display(), path.display()))?;
     Ok(())
@@ -216,6 +242,7 @@ mod tests {
             projects_root: Some(PathBuf::from("/work/repos")),
             projects: vec![entry.clone()],
             watchdog: None,
+            claude_jobs_retention_days: default_claude_jobs_retention_days(),
         };
         save(tmp.path(), &cfg).unwrap();
         let loaded = load(tmp.path()).unwrap();
@@ -236,7 +263,10 @@ mod tests {
         )
         .unwrap();
         let bak = config_path(tmp.path()).with_extension("yaml.bak");
-        assert!(bak.is_file(), "save must keep a .bak after the first overwrite");
+        assert!(
+            bak.is_file(),
+            "save must keep a .bak after the first overwrite"
+        );
     }
 
     #[test]
