@@ -28,6 +28,9 @@ import { EventsLive } from "../components/EventsLive";
 import { BtwForm } from "../components/BtwForm";
 import { PauseResumeButtons } from "../components/PauseResumeButtons";
 import WorkflowView from "./WorkflowView";
+import ArtifactQueuePanel from "../components/ArtifactQueuePanel";
+import EventsTimelinePanel from "../components/EventsTimelinePanel";
+import CostSparkline from "../components/CostSparkline";
 
 /** Read `state.user_pause_pending` from the opaque `ProjectSummary.state`
  *  JSON blob without leaking the unknown shape through to consumers.
@@ -213,16 +216,35 @@ export default function ProjectDetail() {
         </nav>
       )}
 
-      {/* Workflow view (V0.4.0 F68) — renders agent cards + artifact
-          counts + gate chips. `workflow_summary` is null for legacy
-          projects without workflow.yaml; the component renders a
-          friendly "no workflow.yaml" hint in that case. */}
+      {/* Workflow view (V0.4.0 F68 + V0.4.6 F90) — renders agent cards
+          + artifact counts + gate chips. Each agent card expands on
+          click (F90) to show live session details. `workflow_summary`
+          is null for legacy projects without workflow.yaml; the
+          component renders a friendly "no workflow.yaml" hint in that
+          case. */}
       {summary.workflow_summary && (
         <WorkflowView
           slug={summary.slug}
           summary={summary.workflow_summary}
           onReload={triggerReload}
         />
+      )}
+
+      {/* V0.4.6 F90 — three new sibling panels (artifact queue, cost
+          sparkline, events timeline) wired only for workflow projects.
+          Legacy V0.3 sessions stay on the original two-column layout
+          below so flex-with-sessions surfaces aren't disrupted. */}
+      {summary.workflow_summary && (
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+          <ArtifactQueuePanel slug={summary.slug} reloadKey={reloadTick} />
+          <CostSparkline slug={summary.slug} reloadKey={reloadTick} />
+          <div className="min-h-[16rem] flex">
+            <EventsTimelinePanel
+              slug={summary.slug}
+              initialEvents={summary.events}
+            />
+          </div>
+        </div>
       )}
 
       {/* Main two-column layout: events + (BTW form + outbox) */}
