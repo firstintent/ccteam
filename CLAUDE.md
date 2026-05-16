@@ -43,6 +43,11 @@
 
 > **对照参考**(本地 clone,**`/references/` 已 gitignore**,不入库):`references/claude-code/`(Anthropic Claude Code 源码,bun + TypeScript)+ `references/codex/codex-rs/`(OpenAI Codex CLI Rust workspace)。做 HarnessAdapter / 协议适配 / hook 兼容性 / statusline-stdin shape 验证 等接口工作时翻;**不要把这两份源码当 ccteam 自己的依赖**(永久 deferred)。
 
+> **文档维护三类**(2026-05-16 加,新加文档 / 改版结束时按这分类):
+> 1. **`docs/` 根目录(全局文档)**— `requirements.md` / `tech-design.md` / `interfaces.md` / `dev-coupling-audit.md` / `ccteam-as-domain-agnostic-orchestrator.md` / `claude-code-best-practices.md` / `claude-code-tool-surface.md` / `README.md`。只放核心架构抽象设计;**每次 session 起手都装入上下文**;**与代码并列为唯一真理来源**。**每个版本 ship 后必更新**(改协议必同步 `interfaces.md`、改架构必同步 `tech-design.md`、加 finding 必更新 `dev-coupling-audit.md`)。
+> 2. **`docs/v0-x-x/` 版本文档**— `prd.md` / `dev-plan.md` / `user-manual.md` / `README.md`。**版本 ship 后冻结**,作为历史产品演进溯源,按需 on-demand 加载。下一个版本另开新目录,不改老版本。
+> 3. **`docs/research/` + `references/research/` 扩展研究**— 探索性笔记。**不更新**,按需 on-demand 加载。引用过时不算 bug,价值在于"那时怎么想的"。
+
 ---
 
 ## 三、不可触碰的架构红线
