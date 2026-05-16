@@ -181,7 +181,7 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
     ));
     out.push_str(&format!(
         "  workflow.yaml    {} ({})\n",
-        target.join("workflow.yaml").display(),
+        target.join(".ccteam").join("workflow.yaml").display(),
         project_report.workflow_action,
     ));
     out.push_str(&format!(
@@ -252,7 +252,7 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
     }
 
     out.push_str("\nnext:\n");
-    out.push_str("  - edit workflow.yaml + .claude/agents/<role>.md to your taste\n");
+    out.push_str("  - edit .ccteam/workflow.yaml + .claude/agents/<role>.md to your taste\n");
     out.push_str("  - ccteam start                # boots orchestrator + web\n");
     Ok(out)
 }
@@ -407,10 +407,16 @@ fn install_project_at(
     })
 }
 
-/// V0.4.2 F72: write a minimal `workflow.yaml` example into `target`.
-/// Returns silently if the file already exists and `force` is false.
+/// V0.4.2 F72: write a minimal `workflow.yaml` example into
+/// `target/.ccteam/`. V0.4.6 F83 moved this from the project root into
+/// `.ccteam/` so the orchestration state SoT stays out of the user's
+/// business tree. Returns silently if the file already exists and
+/// `force` is false.
 fn scaffold_workflow_yaml(target: &std::path::Path, force: bool) -> Result<()> {
-    let path = target.join("workflow.yaml");
+    let ccteam_dir = target.join(".ccteam");
+    std::fs::create_dir_all(&ccteam_dir)
+        .with_context(|| format!("create {}", ccteam_dir.display()))?;
+    let path = ccteam_dir.join("workflow.yaml");
     if path.exists() && !force {
         return Ok(());
     }
@@ -1294,6 +1300,13 @@ pub struct DoctorOptions {
     /// for the exact rules. Idempotent — safe to run on already-
     /// migrated homes.
     pub migrate_v041_to_v042: bool,
+    /// V0.4.6 F83: move every registered project's root
+    /// `workflow.yaml` into `<project>/.ccteam/workflow.yaml`. Pair
+    /// with `dry_run = false` (i.e. `--apply`) to actually move; the
+    /// default dry-run prints what would happen. Conflicts (both
+    /// locations have a `workflow.yaml`) are fail-safe and left
+    /// untouched.
+    pub migrate_workflow_to_ccteam_dir: bool,
 }
 
 /// `ccteam doctor` dispatch. Returns a human-readable report so unit
@@ -1308,7 +1321,8 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
         || opts.validate_team.is_some()
         || opts.migrate_recommended_agents
         || opts.screenshot_smoke.is_some()
-        || opts.migrate_v041_to_v042;
+        || opts.migrate_v041_to_v042
+        || opts.migrate_workflow_to_ccteam_dir;
     if !any_mode {
         return Ok(String::from(
             "ccteam doctor: pass at least one mode flag.\n\
@@ -1336,7 +1350,11 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
              --screenshot-smoke <slug>\n      \
              render an end-to-end PNG screenshot of <slug>'s tmux pane to <project>/.ccteam/screenshots/<utc>.png. Verifies font + tmux + imageproc + IO; reports the path on success, the degrade reason on failure (V0.2.2 F38).\n  \
              --migrate-v041-to-v042\n      \
-             fold V0.4.1 ~/projects/* + ~/.ccteam/watchdog.yaml into the new ~/.ccteam/config.yaml. Idempotent (V0.4.2 F74).\n",
+             fold V0.4.1 ~/projects/* + ~/.ccteam/watchdog.yaml into the new ~/.ccteam/config.yaml. Idempotent (V0.4.2 F74).\n  \
+             --migrate-workflow-to-ccteam-dir [--apply]\n      \
+             move every registered project's root workflow.yaml into <project>/.ccteam/workflow.yaml \
+             (V0.4.6 F83). Default dry-run; pair with --apply to perform the moves. Conflicts \
+             (both locations present) are fail-safe — neither file is touched.\n",
         ));
     }
     let mut out = String::new();
@@ -1383,6 +1401,17 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
     if opts.migrate_v041_to_v042 {
         let report = ccteam_core::migrate_v041_to_v042(paths)?;
         out.push_str(&ccteam_core::render_migration_report(&report));
+    }
+    if opts.migrate_workflow_to_ccteam_dir {
+        // dry_run is the inverse of `--apply` semantics — the CLI flag
+        // is `--apply`, mapped onto `opts.dry_run` at the main.rs layer.
+        // (No new flag struct field needed: opts.dry_run already exists
+        // as the canonical doctor dry-run knob.)
+        let reports = ccteam_core::migrate_workflow_to_ccteam_dir(paths, opts.dry_run)?;
+        out.push_str(&ccteam_core::render_workflow_migration_report(
+            &reports,
+            opts.dry_run,
+        ));
     }
     // V0.3.1 F47 — informational codex CLI detection. Appends one line
     // to every successful doctor run (any_mode == true) so operators
@@ -1795,9 +1824,7 @@ fn render_install_meta_agent_report(paths: &CcteamPaths) -> Result<String> {
     let tmux_session = ccteam_core::meta_session_name();
     out.push_str(&format!("tmux session     {tmux_session}\n"));
     out.push_str(&format!("attach with      tmux attach -t {tmux_session}\n"));
-    out.push_str(
-        "\nrun `ccteam start` (in another terminal) to wake the meta session.\n",
-    );
+    out.push_str("\nrun `ccteam start` (in another terminal) to wake the meta session.\n");
     Ok(out)
 }
 
@@ -2516,8 +2543,19 @@ mod tests {
         )
         .unwrap();
         assert!(target.join(".ccteam").join("state.json").is_file());
-        assert!(target.join("workflow.yaml").is_file());
-        assert!(target.join(".claude").join("agents").join("explorer.md").is_file());
+        assert!(
+            target.join(".ccteam").join("workflow.yaml").is_file(),
+            "V0.4.6 F83: workflow.yaml must land in .ccteam/, not project root",
+        );
+        assert!(
+            !target.join("workflow.yaml").exists(),
+            "V0.4.6 F83: workflow.yaml must NOT be at the project root after fresh init",
+        );
+        assert!(target
+            .join(".claude")
+            .join("agents")
+            .join("explorer.md")
+            .is_file());
 
         let cfg = ccteam_core::load_ccteam_config(&paths.root).unwrap();
         assert_eq!(cfg.projects.len(), 1);
@@ -2527,6 +2565,7 @@ mod tests {
 
     /// V0.4.2 F72: re-running on an existing ccteam project preserves
     /// user-edited workflow.yaml + agents/*.md.
+    /// V0.4.6 F83: workflow.yaml lives in `.ccteam/`, not the root.
     #[test]
     fn run_init_refresh_preserves_user_workflow_and_agents() {
         let tmp = TempDir::new().unwrap();
@@ -2540,7 +2579,8 @@ mod tests {
             },
         )
         .unwrap();
-        std::fs::write(target.join("workflow.yaml"), "USER WORKFLOW\n").unwrap();
+        let wf_path = target.join(".ccteam").join("workflow.yaml");
+        std::fs::write(&wf_path, "USER WORKFLOW\n").unwrap();
         std::fs::write(
             target.join(".claude").join("agents").join("explorer.md"),
             "USER AGENT\n",
@@ -2557,7 +2597,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            std::fs::read_to_string(target.join("workflow.yaml")).unwrap(),
+            std::fs::read_to_string(&wf_path).unwrap(),
             "USER WORKFLOW\n"
         );
         assert_eq!(
@@ -2568,6 +2608,7 @@ mod tests {
     }
 
     /// V0.4.2 F72: `--force` re-runs overwrite user files.
+    /// V0.4.6 F83: workflow.yaml lives in `.ccteam/`, not the root.
     #[test]
     fn run_init_force_overwrites_user_workflow_and_agents() {
         let tmp = TempDir::new().unwrap();
@@ -2581,7 +2622,8 @@ mod tests {
             },
         )
         .unwrap();
-        std::fs::write(target.join("workflow.yaml"), "USER WORKFLOW\n").unwrap();
+        let wf_path = target.join(".ccteam").join("workflow.yaml");
+        std::fs::write(&wf_path, "USER WORKFLOW\n").unwrap();
         run_init(
             &paths,
             InitOptions {
@@ -2592,13 +2634,14 @@ mod tests {
         )
         .unwrap();
         assert_ne!(
-            std::fs::read_to_string(target.join("workflow.yaml")).unwrap(),
+            std::fs::read_to_string(&wf_path).unwrap(),
             "USER WORKFLOW\n"
         );
     }
 
     /// V0.4.2 F72: `--reset-agents` rewrites agents but keeps
     /// workflow.yaml untouched.
+    /// V0.4.6 F83: workflow.yaml lives in `.ccteam/`, not the root.
     #[test]
     fn run_init_reset_agents_only_overwrites_agents() {
         let tmp = TempDir::new().unwrap();
@@ -2612,7 +2655,8 @@ mod tests {
             },
         )
         .unwrap();
-        std::fs::write(target.join("workflow.yaml"), "USER WORKFLOW\n").unwrap();
+        let wf_path = target.join(".ccteam").join("workflow.yaml");
+        std::fs::write(&wf_path, "USER WORKFLOW\n").unwrap();
         std::fs::write(
             target.join(".claude").join("agents").join("explorer.md"),
             "USER AGENT\n",
@@ -2628,7 +2672,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            std::fs::read_to_string(target.join("workflow.yaml")).unwrap(),
+            std::fs::read_to_string(&wf_path).unwrap(),
             "USER WORKFLOW\n",
             "workflow must survive --reset-agents",
         );
@@ -3315,5 +3359,4 @@ mod tests {
         assert_eq!(alerts[0]["kind"], "daemon_down");
         assert!(parsed["config"].is_object());
     }
-
 }

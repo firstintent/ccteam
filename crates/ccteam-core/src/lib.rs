@@ -91,7 +91,9 @@ pub use meta_agent::{
     render_meta_role_prompt, MetaBootstrapReport, META_SESSION_NAME, META_SLUG, META_TEAM_NAME,
 };
 pub use migration::{
-    migrate_v041_to_v042, render_migration_report, MigrationReport as V042MigrationReport,
+    migrate_v041_to_v042, migrate_workflow_to_ccteam_dir, render_migration_report,
+    render_workflow_migration_report, MigrationReport as V042MigrationReport,
+    WorkflowMigrationAction, WorkflowMigrationReport,
 };
 pub use orchestrator::MAX_CONCURRENT_PROJECTS;
 pub use orchestrator::{Orchestrator, OrchestratorConfig, DEFAULT_CLAUDE_MODEL};

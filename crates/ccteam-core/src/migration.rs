@@ -11,6 +11,12 @@
 //!    if present, and the old file is renamed to
 //!    `watchdog.yaml.migrated` so a future re-run is a no-op.
 //!
+//! V0.4.6 F83 adds [`migrate_workflow_to_ccteam_dir`], a separate
+//! one-shot migration that moves `<project>/workflow.yaml` (V0.4.0–
+//! V0.4.5 legacy location) to `<project>/.ccteam/workflow.yaml`
+//! (V0.4.6+ canonical) for every project registered in
+//! `config.yaml::projects[]`.
+//!
 //! Returns a [`MigrationReport`] describing what was changed so the
 //! `ccteam doctor` callsite can print a human-readable summary.
 
@@ -161,6 +167,164 @@ pub fn render_migration_report(report: &MigrationReport) -> String {
     out
 }
 
+// --------------------------------------------------------------------
+// V0.4.6 F83 — workflow.yaml → .ccteam/workflow.yaml migration
+// --------------------------------------------------------------------
+
+/// Per-project outcome of [`migrate_workflow_to_ccteam_dir`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkflowMigrationReport {
+    pub slug: String,
+    pub project_path: PathBuf,
+    pub action: WorkflowMigrationAction,
+}
+
+/// What happened for one project during F83 migration.
+///
+/// - `Moved`:      root `workflow.yaml` existed, `.ccteam/workflow.yaml`
+///                 did not → file was moved (or, in dry-run, would be).
+/// - `AlreadyAtCcteamDir`:
+///                 only `.ccteam/workflow.yaml` exists — already on the
+///                 canonical layout, nothing to do.
+/// - `NoWorkflow`: neither location has a `workflow.yaml` — likely a
+///                 V0.3 legacy project that never adopted the V0.4.0
+///                 schema. Reported but skipped.
+/// - `ConflictBothPresent`:
+///                 both root and `.ccteam/` versions exist — fail-safe,
+///                 leaves both untouched so the user can pick a winner.
+///                 No `--apply` will resolve this; user must `rm` one
+///                 by hand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowMigrationAction {
+    Moved { dry_run: bool },
+    AlreadyAtCcteamDir,
+    NoWorkflow,
+    ConflictBothPresent,
+}
+
+/// V0.4.6 F83: move every registered project's root `workflow.yaml`
+/// into `<project>/.ccteam/workflow.yaml`.
+///
+/// Behavior per project (driven by `config.yaml::projects[]`):
+///
+/// | root `workflow.yaml` | `.ccteam/workflow.yaml` | action |
+/// |---|---|---|
+/// | yes  | no  | move root → `.ccteam/` (or dry-run preview) |
+/// | no   | yes | `AlreadyAtCcteamDir` (no-op)                |
+/// | no   | no  | `NoWorkflow` (reported, no-op)              |
+/// | yes  | yes | `ConflictBothPresent` (fail-safe, no-op)    |
+///
+/// `dry_run = true` reports without touching the filesystem (the move
+/// branch still returns [`WorkflowMigrationAction::Moved`] but with
+/// `dry_run: true` so callers can render "would move ..." text).
+///
+/// Idempotent — re-running after a successful migration reports every
+/// project as `AlreadyAtCcteamDir`.
+pub fn migrate_workflow_to_ccteam_dir(
+    paths: &CcteamPaths,
+    dry_run: bool,
+) -> Result<Vec<WorkflowMigrationReport>> {
+    let cfg = config::load(&paths.root).context("load config.yaml")?;
+    let mut reports = Vec::with_capacity(cfg.projects.len());
+
+    for entry in &cfg.projects {
+        let root_yaml = entry.path.join("workflow.yaml");
+        let ccteam_dir = entry.path.join(".ccteam");
+        let nested_yaml = ccteam_dir.join("workflow.yaml");
+
+        let action = match (root_yaml.is_file(), nested_yaml.is_file()) {
+            (true, true) => WorkflowMigrationAction::ConflictBothPresent,
+            (false, true) => WorkflowMigrationAction::AlreadyAtCcteamDir,
+            (false, false) => WorkflowMigrationAction::NoWorkflow,
+            (true, false) => {
+                if !dry_run {
+                    std::fs::create_dir_all(&ccteam_dir)
+                        .with_context(|| format!("create {} for F83 move", ccteam_dir.display()))?;
+                    std::fs::rename(&root_yaml, &nested_yaml).with_context(|| {
+                        format!("rename {} → {}", root_yaml.display(), nested_yaml.display(),)
+                    })?;
+                }
+                WorkflowMigrationAction::Moved { dry_run }
+            }
+        };
+        reports.push(WorkflowMigrationReport {
+            slug: entry.slug.clone(),
+            project_path: entry.path.clone(),
+            action,
+        });
+    }
+    Ok(reports)
+}
+
+/// Render a `Vec<WorkflowMigrationReport>` to a stable human-readable
+/// block. Used by `ccteam doctor --migrate-workflow-to-ccteam-dir`.
+pub fn render_workflow_migration_report(
+    reports: &[WorkflowMigrationReport],
+    dry_run: bool,
+) -> String {
+    let header = if dry_run {
+        "ccteam doctor --migrate-workflow-to-ccteam-dir (dry-run)\n\n"
+    } else {
+        "ccteam doctor --migrate-workflow-to-ccteam-dir --apply\n\n"
+    };
+    let mut out = String::from(header);
+
+    if reports.is_empty() {
+        out.push_str("  no projects registered in config.yaml — nothing to migrate.\n");
+        return out;
+    }
+
+    let mut moved = 0usize;
+    let mut already = 0usize;
+    let mut no_workflow = 0usize;
+    let mut conflicts = 0usize;
+    for r in reports {
+        let prefix = format!("  - {} ({})", r.slug, r.project_path.display());
+        match &r.action {
+            WorkflowMigrationAction::Moved { dry_run: true } => {
+                out.push_str(&format!("{prefix}: would move workflow.yaml → .ccteam/\n"));
+                moved += 1;
+            }
+            WorkflowMigrationAction::Moved { dry_run: false } => {
+                out.push_str(&format!("{prefix}: moved workflow.yaml → .ccteam/\n"));
+                moved += 1;
+            }
+            WorkflowMigrationAction::AlreadyAtCcteamDir => {
+                out.push_str(&format!("{prefix}: already at .ccteam/ (no-op)\n"));
+                already += 1;
+            }
+            WorkflowMigrationAction::NoWorkflow => {
+                out.push_str(&format!(
+                    "{prefix}: no workflow.yaml at either location (no-op)\n"
+                ));
+                no_workflow += 1;
+            }
+            WorkflowMigrationAction::ConflictBothPresent => {
+                out.push_str(&format!(
+                    "{prefix}: CONFLICT — both locations have workflow.yaml; refusing to clobber, \
+                     resolve by hand\n"
+                ));
+                conflicts += 1;
+            }
+        }
+    }
+    out.push('\n');
+    out.push_str(&format!(
+        "  summary: {moved} moved, {already} already-migrated, \
+         {no_workflow} without workflow, {conflicts} conflict(s)\n",
+    ));
+    if dry_run && moved > 0 {
+        out.push_str("\nrerun with `--apply` to perform the moves.\n");
+    } else if conflicts > 0 {
+        out.push_str(
+            "\nWARNING: conflict(s) above are not auto-resolved — `rm` the stale copy first.\n",
+        );
+    } else if !dry_run {
+        out.push_str("\nrerun is safe — already-migrated projects are skipped.\n");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,7 +399,10 @@ mod tests {
         assert_eq!(w.notify_on_cycle_count, 5);
         assert!(matches!(w.notify_mode, watchdog::NotifyMode::Verbose));
 
-        assert!(!watchdog_path.exists(), "old watchdog.yaml must be archived");
+        assert!(
+            !watchdog_path.exists(),
+            "old watchdog.yaml must be archived"
+        );
         let archived = watchdog_path.with_extension("yaml.migrated");
         assert!(archived.is_file());
     }
