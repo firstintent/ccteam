@@ -5,13 +5,13 @@
 
 ---
 
-## 一、当前状态(2026-05-16)
+## 一、当前状态(2026-05-17)
 
 | 项 | 值 |
 |---|---|
 | 主分支 main HEAD | 以 `git rev-parse origin/main` 为准 |
 | Workspace version | **`0.4.6`** |
-| 测试 baseline | **`755/1`**(`cargo test --workspace --locked`,1 fail 是 ccteam-web 端口绑定 flake)|
+| 测试 baseline | **`750/1`**(`cargo test --workspace --locked`,1 fail 是 ccteam-web `workflow_summary_reflects_agent_spawn_and_done_events` running_count flake)|
 | Clippy | 0 errors + ~20 warnings(pre-existing doc-list drift)|
 | 代码规模 | ~17 kLOC Rust + ~14 kLOC TypeScript |
 | 当前最新版 | V0.4.6 (F81-F91) — 详 `docs/v0-4-6/README.md` |

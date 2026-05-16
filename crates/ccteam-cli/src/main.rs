@@ -627,11 +627,7 @@ enum HookCommand {
     /// `event_type` is the `event` field on the resulting JSONL record
     /// (e.g. "PreToolUse" / "Stop" / "session_start").
     ProgressAppend { event_type: String },
-    /// Stop hook: parse last assistant message for `PHASE_DONE: <phase>`
-    /// or `ESCALATE: <reason>` and emit the matching progress event.
-    ParsePhaseEnd,
     /// SessionStart hook: write the `<project>/.ccteam/ready` marker.
-    /// M0.10 extends this to bridge a pre-reset progress summary.
     LoadContext,
     /// V0.2 M0.19.3 PreToolUse hook for `AskUserQuestion`. Returns a
     /// `permissionDecision: deny` so the assistant routes through the
@@ -1034,30 +1030,6 @@ fn run_hook(cmd: HookCommand) -> Result<()> {
         HookCommand::ProgressAppend { event_type } => {
             let stdin = parse_hook_stdin_json()?;
             ccteam_hooks::progress_append(&paths, &event_type, &stdin)
-        }
-        HookCommand::ParsePhaseEnd => {
-            let stdin = parse_hook_stdin_json()?;
-            let decision = ccteam_hooks::parse_phase_end(&paths, &stdin)?;
-            match decision {
-                ccteam_hooks::ParseDecision::Continue => Ok(()),
-                ccteam_hooks::ParseDecision::Block { reason } => {
-                    let json = serde_json::json!({
-                        "decision": "block",
-                        "reason": reason,
-                    });
-                    println!("{}", serde_json::to_string(&json)?);
-                    Ok(())
-                }
-                ccteam_hooks::ParseDecision::BlockMissingOutput { stderr } => {
-                    // V0.2 M0.19: exit 2 + stderr is the Stop hook
-                    // contract Claude Code interprets as a blocking
-                    // system message (`hooks.ts:2784-2805`). The
-                    // assistant is forced to re-prompt with the
-                    // stderr text injected.
-                    eprintln!("{stderr}");
-                    std::process::exit(2);
-                }
-            }
         }
         HookCommand::LoadContext => {
             let stdin = parse_hook_stdin_json()?;

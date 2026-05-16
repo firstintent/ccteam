@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "ccteam hook handlers (progress-append, parse-phase-end, cost-accumulate)."
+description = "ccteam hook handlers (progress-append, load-context, intercept-ask)."
 
 [dependencies]
 ccteam-core.workspace = true

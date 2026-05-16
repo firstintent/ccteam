@@ -398,7 +398,7 @@ ccteam web                   # 单独跑 web SPA（start 已含，这里给 head
 
 **Internal**（`ccteam internal <subcmd>`，F89 折叠）：
 ```bash
-ccteam internal hook <progress-append|parse-phase-end|load-context|intercept-ask>
+ccteam internal hook <progress-append|load-context|intercept-ask>
 ccteam internal mcp-serve                       # MCP stdio server，~/.claude.json wire
 ccteam internal spawn <slug> <role> [prompt]    # 手动 spawn，写 .ccteam/spawn_requests/<role>-<ts>.json
 ccteam internal send <slug> <body>              # 写项目 inbox，allow_hyphen_values（F87）

@@ -370,7 +370,6 @@ Phase 模型 V0.4.0 F60 已删除,替换为 workflow.yaml + 事件驱动 agent �
     "Stop": [
       {
         "hooks": [
-          {"type": "command", "command": "ccteam internal hook parse-phase-end", "timeout": 10},
           {"type": "command", "command": "ccteam internal hook progress-append Stop", "async": true}
         ]
       }
