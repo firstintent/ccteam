@@ -365,6 +365,106 @@ fn t05_refuses_with_running_claude_bg() {
     );
 }
 
+/// Seed a fresh heartbeat file so `heartbeat_alive` returns true for the
+/// sandbox. Uses `ccteam_core::daemon::write_heartbeat` to keep the format
+/// in sync with the real daemon.
+fn seed_heartbeat(fx: &Fixture) {
+    ccteam_core::daemon::write_heartbeat(&fx.paths()).unwrap();
+}
+
+/// Compute the unroster trigger path the CLI writes (mirrors
+/// `commands::unroster_trigger_path`). Shares the USER env so the test
+/// process and the spawned ccteam subprocess agree on the path.
+fn unroster_trigger(slug: &str) -> std::path::PathBuf {
+    let user = std::env::var("USER").unwrap_or_else(|_| "ccteam".into());
+    std::path::PathBuf::from("/tmp").join(format!("ccteam-{user}.unroster.{slug}"))
+}
+
+/// t07: when the daemon heartbeat is fresh, `ccteam remove` writes the
+/// per-slug unroster trigger file and polls for it to disappear. A
+/// background "acker" thread simulates the daemon consuming the trigger.
+#[test]
+fn t07_remove_writes_unroster_trigger_when_daemon_alive() {
+    let fx = Fixture::new("dex-ui");
+    fx.seed_closed_progress();
+    seed_heartbeat(&fx);
+
+    let trigger = unroster_trigger(&fx.slug);
+    // Clean up any leftover from a prior run.
+    let _ = std::fs::remove_file(&trigger);
+
+    // Background thread simulates the daemon's poll_unroster_triggers task:
+    // it watches for the trigger file and deletes it within 20ms of creation.
+    let trigger_for_thread = trigger.clone();
+    let acker = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if trigger_for_thread.exists() {
+                let _ = std::fs::remove_file(&trigger_for_thread);
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        false
+    });
+
+    let out = fx
+        .cmd()
+        .args(["remove", &fx.slug])
+        .output()
+        .expect("spawn ccteam remove");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "remove should succeed with daemon alive; stderr: {stderr}; stdout: {stdout}",
+    );
+    let acked = acker.join().unwrap();
+    assert!(acked, "acker must have seen and deleted the trigger file");
+    assert!(
+        stdout.contains("acknowledged by daemon"),
+        "step 4 should report daemon acknowledgment; got: {stdout}",
+    );
+    assert!(!trigger.exists(), "trigger file must be gone after remove");
+}
+
+/// t08: when the daemon heartbeat is fresh but nothing acks the trigger
+/// (simulates a slow/stalled daemon), `ccteam remove` times out after 5s,
+/// self-cleans the trigger file, and reports the timeout.
+///
+/// Marked `#[ignore]` because the 5s CLI timeout makes this too slow for
+/// the default test run. Run explicitly with `cargo test -- --ignored t08`.
+#[test]
+#[ignore]
+fn t08_remove_timeout_when_daemon_unresponsive() {
+    let fx = Fixture::new("dex-ui");
+    fx.seed_closed_progress();
+    seed_heartbeat(&fx);
+
+    let trigger = unroster_trigger(&fx.slug);
+    let _ = std::fs::remove_file(&trigger);
+
+    let out = fx
+        .cmd()
+        .args(["remove", &fx.slug])
+        .output()
+        .expect("spawn ccteam remove");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "timeout must not fail the remove; stderr: {stderr}; stdout: {stdout}",
+    );
+    assert!(
+        stdout.contains("did not acknowledge"),
+        "timeout path must be reported; got: {stdout}",
+    );
+    assert!(
+        !trigger.exists(),
+        "trigger must be self-cleaned after timeout",
+    );
+}
+
 #[test]
 fn t06_force_overrides_refusal() {
     let fx = Fixture::new("dex-ui");

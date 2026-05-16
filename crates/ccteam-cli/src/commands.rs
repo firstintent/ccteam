@@ -2171,6 +2171,17 @@ pub fn run_web(opts: WebOptions) -> Result<()> {
     runtime.block_on(ccteam_web::serve(serve_opts))
 }
 
+/// Per-slug unroster trigger file. `ccteam remove` writes here; the
+/// daemon's `poll_unroster_triggers` task picks it up within 250ms
+/// and calls `unroster_project(CancelReason::Removed)`.
+///
+/// Convention mirrors `shutdown_trigger_path()` in main.rs: per-user
+/// namespace under `/tmp` keeps multi-operator hosts safe.
+pub(crate) fn unroster_trigger_path(slug: &str) -> std::path::PathBuf {
+    let user = std::env::var("USER").unwrap_or_else(|_| "ccteam".into());
+    std::path::PathBuf::from("/tmp").join(format!("ccteam-{user}.unroster.{slug}"))
+}
+
 /// V0.4.6 F81 — options for `ccteam remove <slug>`.
 #[derive(Debug, Clone, Default)]
 pub struct RemoveOptions {
@@ -2308,22 +2319,52 @@ pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Resul
         ));
     }
 
-    // 4. Daemon unroster (best-effort; the running daemon may not exist).
+    // 4. Daemon unroster. Write a per-slug trigger file; if the daemon
+    // is alive it polls for these every 250ms (same pattern as the F86
+    // shutdown trigger) and calls unroster_project(CancelReason::Removed).
+    let trigger_path = unroster_trigger_path(slug);
+    let daemon_up = ccteam_core::daemon::heartbeat_alive(paths);
     if opts.dry_run {
-        report.steps.push(
-            "would request daemon unroster (daemon will pick up the config drop on next tick)"
-                .to_string(),
-        );
+        report.steps.push(if daemon_up {
+            "would write unroster trigger + await daemon acknowledgment (≤5s)".to_string()
+        } else {
+            "would skip daemon unroster (daemon not running)".to_string()
+        });
+    } else if !daemon_up {
+        report
+            .steps
+            .push("daemon unroster: skipped (daemon not running)".to_string());
     } else {
-        // F81 stub note: the orchestrator's in-process `unroster_project`
-        // exists, but we have no IPC into the running daemon. F82 wave
-        // will wire a control file / unix socket so this becomes a
-        // real synchronous call. Until then, document the eventual
-        // consistency window in the step output.
-        report.steps.push(
-            "daemon unroster: deferred to next event-loop tick (F82 will wire instant cancel)"
-                .to_string(),
-        );
+        match std::fs::write(&trigger_path, slug) {
+            Err(err) => report.steps.push(format!(
+                "daemon unroster: trigger write failed ({err}); \
+                 daemon will pick up config drop on next rescan"
+            )),
+            Ok(()) => {
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let mut acknowledged = false;
+                while std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    if !trigger_path.exists() {
+                        acknowledged = true;
+                        break;
+                    }
+                }
+                if acknowledged {
+                    report
+                        .steps
+                        .push("daemon unroster: acknowledged by daemon".to_string());
+                } else {
+                    let _ = std::fs::remove_file(&trigger_path);
+                    report.steps.push(
+                        "daemon unroster: sent (daemon did not acknowledge in 5s; \
+                         will pick up on next rescan)"
+                            .to_string(),
+                    );
+                }
+            }
+        }
     }
 
     // 5. Orchestration state cleanup under `~/.ccteam/`.

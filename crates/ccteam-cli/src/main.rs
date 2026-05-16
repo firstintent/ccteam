@@ -1166,6 +1166,11 @@ fn run_start(
                 let _ = shutdown_tx.send(true);
             });
 
+            let unroster_task = {
+                let orch = std::sync::Arc::clone(&orchestrator);
+                tokio::spawn(poll_unroster_triggers(orch))
+            };
+
             let web_handle = if web.disabled {
                 None
             } else {
@@ -1173,6 +1178,7 @@ fn run_start(
                     Ok(o) => o,
                     Err(err) => {
                         signal_task.abort();
+                        unroster_task.abort();
                         return Err(err);
                     }
                 };
@@ -1203,6 +1209,7 @@ fn run_start(
                 }
             }
             signal_task.abort();
+            unroster_task.abort();
             orch_result
         })
     })();
@@ -1261,6 +1268,50 @@ async fn wait_for_shutdown_signal() {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => tracing::info!("ctrl+c received"),
             _ = trigger_poll => tracing::info!("shutdown via trigger file"),
+        }
+    }
+}
+
+/// Poll `/tmp/ccteam-<user>.unroster.<slug>` files every 250ms and,
+/// for each found, call `unroster_project(CancelReason::Removed)` then
+/// remove the trigger. Written by `ccteam remove` (commands::run_remove
+/// step 4); mirrors the F86 shutdown trigger pattern.
+async fn poll_unroster_triggers(orch: std::sync::Arc<Orchestrator>) {
+    let prefix = {
+        let user = std::env::var("USER").unwrap_or_else(|_| "ccteam".into());
+        format!("ccteam-{user}.unroster.")
+    };
+    let tmp = std::path::PathBuf::from("/tmp");
+    // Drain any stale trigger files left by a previous crashed daemon so
+    // a re-created project doesn't get instantly cancelled on startup —
+    // mirrors the stale-shutdown-trigger drain in `wait_for_shutdown_signal`.
+    if let Ok(entries) = std::fs::read_dir(&tmp) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with(&prefix) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    let mut ticker = tokio::time::interval(Duration::from_millis(250));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        let entries = match std::fs::read_dir(&tmp) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if let Some(slug) = name_str.strip_prefix(&prefix) {
+                let slug = slug.to_string();
+                let path = entry.path();
+                tracing::info!(slug, "unroster trigger observed; cancelling project loop");
+                orch.unroster_project(&slug, ccteam_core::CancelReason::Removed)
+                    .await;
+                let _ = std::fs::remove_file(&path);
+            }
         }
     }
 }
