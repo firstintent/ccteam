@@ -57,6 +57,7 @@ fn build_spec(name: &str, watchers: &[(&str, PathBuf)]) -> WorkflowSpec {
         name: name.to_string(),
         description: None,
         enabled: true,
+        budget: None,
         agents,
     }
 }
@@ -65,7 +66,12 @@ fn build_spec(name: &str, watchers: &[(&str, PathBuf)]) -> WorkflowSpec {
 /// is consumed by `start()`; the JoinHandle is returned so the test
 /// can choose to drop the rx (clean shutdown) or `tokio::time::timeout`
 /// on `recv()`.
-async fn spawn_for(spec: &WorkflowSpec) -> (tokio::sync::mpsc::Receiver<ccteam_core::ArtifactEvent>, tokio::task::JoinHandle<()>) {
+async fn spawn_for(
+    spec: &WorkflowSpec,
+) -> (
+    tokio::sync::mpsc::Receiver<ccteam_core::ArtifactEvent>,
+    tokio::task::JoinHandle<()>,
+) {
     let (watcher, rx) = ArtifactWatcher::new(spec, None).expect("build watcher");
     let handle = watcher.start();
     // Give the notify backend a moment to install the inotify watches
@@ -101,8 +107,8 @@ async fn drain_until_quiet(
             Ok(Some(_)) => {
                 count += 1;
             }
-            Ok(None) => break,    // sender dropped
-            Err(_) => break,      // quiet window with no events
+            Ok(None) => break, // sender dropped
+            Err(_) => break,   // quiet window with no events
         }
     }
     count
@@ -209,12 +215,8 @@ async fn t04_debounce_merges_rapid_writes() {
         "burst writes took {elapsed:?}; test assumes < 200ms",
     );
 
-    let count = drain_until_quiet(
-        &mut rx,
-        Duration::from_millis(800),
-        Duration::from_secs(2),
-    )
-    .await;
+    let count =
+        drain_until_quiet(&mut rx, Duration::from_millis(800), Duration::from_secs(2)).await;
     assert!(
         count <= 2,
         "debounce should merge ≤ 2 events from a 10-file burst; got {count}",
@@ -382,12 +384,8 @@ async fn t10_large_batch_debounce() {
         }
     }
 
-    let count = drain_until_quiet(
-        &mut rx,
-        Duration::from_millis(800),
-        Duration::from_secs(3),
-    )
-    .await;
+    let count =
+        drain_until_quiet(&mut rx, Duration::from_millis(800), Duration::from_secs(3)).await;
     assert!(
         count < 10,
         "debounce should keep 100-file burst under 10 events; got {count}",

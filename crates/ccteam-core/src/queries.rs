@@ -633,6 +633,56 @@ fn accumulate_session(status: &mut AgentStatus, session: &AgentSessionSummary) {
     }
 }
 
+// ---------------- V0.4.6 F91 cost SoT (F84 stub) ----------------
+
+/// Rolling cost roll-up surfaced to `ccteam show` + the F84 budget
+/// guard. **F84 stub**: this version only computes `cost_24h_usd` /
+/// `cost_total_usd` / `session_count_24h` from progress.jsonl, which
+/// is all F84's `enforce_budget` needs. F91's full impl (parallel
+/// worktree) extends with `cost_active_usd` / `session_count_active`
+/// by probing `~/.claude/jobs/<job_id>/state.json` for live sessions.
+///
+/// The fields that F84 doesn't read still ship here so the type
+/// signature already matches the final F91 contract; F91 will only
+/// touch the computation, not the shape. F84 unit tests assert
+/// directly on `cost_24h_usd` so they keep passing after F91 merge.
+/// V0.4.6 F84 — pure-event-slice helper derived from F91's
+/// [`compute_cost_summary`]. F84 budget enforcement reads progress
+/// events directly (no state.json probe) so we wrap the canonical
+/// helper with a stub probe that classifies every job as terminal-zero.
+/// This keeps F84 deterministic in unit tests while sharing the same
+/// 24h window + `cost_total_usd` logic F91 already validated.
+pub fn cost_summary_from_events(events: &[Value]) -> Result<CostSummary> {
+    Ok(compute_cost_summary(events, Utc::now(), |_| {
+        crate::claude_job::JobLiveness::Terminal {
+            status: "completed",
+            cost_usd: 0.0,
+        }
+    }))
+}
+
+/// V0.4.6 F84 — count `agent_spawn` events within `window` of now.
+/// Used by the spawn-rate budget cap. Events with missing /
+/// unparseable `ts` count as "recent" (defensive: prefer false
+/// positive trip over silent overrun).
+pub fn count_agent_spawns_within(events: &[Value], window: chrono::Duration) -> u32 {
+    let cutoff = Utc::now() - window;
+    let mut n = 0_u32;
+    for evt in events {
+        if evt.get("event").and_then(|s| s.as_str()) != Some("agent_spawn") {
+            continue;
+        }
+        let ts_raw = evt.get("ts").and_then(|s| s.as_str()).unwrap_or("");
+        let in_window = chrono::DateTime::parse_from_rfc3339(ts_raw)
+            .map(|dt| dt.with_timezone(&Utc) >= cutoff)
+            .unwrap_or(true);
+        if in_window {
+            n = n.saturating_add(1);
+        }
+    }
+    n
+}
+
 fn count_files_in_dir(dir: &std::path::Path) -> u64 {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return 0;

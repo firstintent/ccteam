@@ -122,8 +122,9 @@ pub use projects::{
     pre_trust_project, slugify, slugify_brief, validate_slug_format,
 };
 pub use queries::{
-    collect_projects, collect_recent_events, compute_cost_summary, cost_summary, workflow_summary,
-    AgentStatus, CostSummary, ProjectSummary, WorkflowSummary,
+    collect_projects, collect_recent_events, compute_cost_summary, cost_summary,
+    cost_summary_from_events, count_agent_spawns_within, workflow_summary, AgentStatus,
+    CostSummary, ProjectSummary, WorkflowSummary,
 };
 pub use screenshot::{
     probe_font as probe_screenshot_font, render_screenshot, vt100_color_to_rgb, ScreenshotResult,
@@ -187,8 +188,10 @@ pub use watchdog::{
     AlertKind as WatchdogAlertKind, NotifyMode as WatchdogNotifyMode, WatchdogAlert,
     WatchdogConfig, DEFAULT_NOTIFY_ON_CYCLE_COUNT, WATCHDOG_CONFIG_FILENAME,
 };
-// V0.4.0 F63 — workflow.yaml schema.
-pub use workflow::{AgentSpec, Executor, OnTimeout, Trigger, WorkflowError, WorkflowSpec};
+// V0.4.0 F63 — workflow.yaml schema. V0.4.6 F84 adds `BudgetSpec`.
+pub use workflow::{
+    AgentSpec, BudgetSpec, Executor, OnTimeout, Trigger, WorkflowError, WorkflowSpec,
+};
 // V0.4.6 F82 — workflow.yaml file watcher.
 pub use workflow_watcher::{
     WorkflowFileEvent, WorkflowFileEventKind, WorkflowFileWatcher,
