@@ -200,6 +200,8 @@ pub struct Orchestrator {
     /// `unroster_project` / `reload_project` take the entry out + send
     /// the reason; `run_project_with_cancel` selects on the receiver
     /// and writes `workflow_done` before returning.
+    /// F86 reuses this for `cancel_event_loop` + daemon-wide shutdown
+    /// (CancelReason::Shutdown).
     cancel_handles: Arc<Mutex<HashMap<String, oneshot::Sender<CancelReason>>>>,
     /// V0.4.6 F82 — shared "already-spawned" slug set. Promoted from
     /// the local `HashSet` inside `run` so `reload_project` can pop a
@@ -255,6 +257,74 @@ impl Orchestrator {
         &self.paths
     }
 
+    /// V0.4.6 F86 — F82 cancellation token stub. Sends a single `()` on
+    /// the cancel channel registered for `slug` (if any). Returns
+    /// `true` when a handle existed and the send was queued, `false`
+    /// when the slug is not currently registered (loop already exited
+    /// or never started).
+    ///
+    /// **F82 merge plan**: this signature is stable. When the F82 PR
+    /// lands its `CancellationToken` shape, swap the storage in
+    /// `cancel_handles` (and the `Sender` type in
+    /// [`Self::register_cancel_handle`]); the two public callers
+    /// ([`Self::shutdown`] and any future
+    /// `enforce_budget` / hot-reload path) stay untouched.
+    pub async fn cancel_event_loop(&self, slug: &str) -> bool {
+        let sender = {
+            let mut handles = self.cancel_handles.lock().await;
+            handles.remove(slug)
+        };
+        match sender {
+            Some(tx) => {
+                // F82's oneshot::Sender::send consumes self; reason maps
+                // to CancelReason::Shutdown for daemon-wide stop.
+                let _ = tx.send(CancelReason::Shutdown);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// V0.4.6 F86 — orchestrator-wide graceful shutdown. Walks every
+    /// registered cancel handle, fires it, and returns the slug list
+    /// for the caller's timeout/abort logic. Idempotent (re-entry
+    /// returns an empty vec).
+    pub async fn shutdown(&self) -> Vec<String> {
+        let handles: Vec<(String, oneshot::Sender<CancelReason>)> = {
+            let mut map = self.cancel_handles.lock().await;
+            map.drain().collect()
+        };
+        let mut slugs = Vec::with_capacity(handles.len());
+        for (slug, tx) in handles {
+            let _ = tx.send(CancelReason::Shutdown);
+            slugs.push(slug);
+        }
+        slugs
+    }
+
+    /// Test-only: register a cancel handle without going through
+    /// `run_project`. Used by `graceful_shutdown_test` to exercise the
+    /// public cancel path in isolation.
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn test_register_cancel_handle(
+        &self,
+        slug: &str,
+        tx: oneshot::Sender<CancelReason>,
+    ) {
+        self.cancel_handles
+            .lock()
+            .await
+            .insert(slug.to_string(), tx);
+    }
+
+    /// Test-only mirror of the run-loop helper so tests can assert
+    /// graceful-shutdown bookkeeping without bringing up the full
+    /// daemon.
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn test_cancel_handles_len(&self) -> usize {
+        self.cancel_handles.lock().await.len()
+    }
+
     fn adapter_for(&self, exec: Executor) -> Option<&Arc<dyn HarnessAdapter + Send + Sync>> {
         let key: &'static str = match exec {
             Executor::Claude => "claude",
@@ -283,7 +353,8 @@ impl Orchestrator {
     /// for graceful termination. Receiving on the channel writes a
     /// `workflow_done { reason }` event before returning Ok(()). Passing
     /// `None` keeps the V0.4.5 behaviour (loop ends naturally when
-    /// gates fire or the artifact channel closes).
+    /// gates fire or the artifact channel closes). F86 reuses this for
+    /// daemon-wide shutdown by sending `CancelReason::Shutdown`.
     ///
     /// **Returns Ok even on cancel** — cancellation is a normal exit,
     /// not an error. Real errors (workflow.yaml not found, artifact
@@ -510,9 +581,34 @@ impl Orchestrator {
         loop {
             tokio::select! {
                 _ = &mut shutdown => {
-                    tracing::info!("shutdown received; aborting project tasks (sessions remain alive)");
-                    tasks.abort_all();
-                    while tasks.join_next().await.is_some() {}
+                    // V0.4.6 F86 — graceful shutdown via cancel token.
+                    // Replaces the V0.4.5 hard `abort_all()` path that
+                    // dropped in-flight `workflow_done` writes and left
+                    // phantom `agent_spawn` rows for F80 to mop up next
+                    // start. The cancel path lets each `event_loop`
+                    // emit `workflow_done reason="shutdown"` cleanly.
+                    let slugs = self.shutdown().await;
+                    tracing::info!(
+                        count = slugs.len(),
+                        "graceful shutdown begin: cancel signals dispatched"
+                    );
+                    let timed = tokio::time::timeout(
+                        Duration::from_secs(30),
+                        async {
+                            while tasks.join_next().await.is_some() {}
+                        },
+                    )
+                    .await;
+                    if timed.is_err() {
+                        tracing::warn!(
+                            "graceful shutdown timeout (30s); falling back to abort_all() — \
+                             in-flight progress.jsonl writes may be lost for stalled loops"
+                        );
+                        tasks.abort_all();
+                        while tasks.join_next().await.is_some() {}
+                    } else {
+                        tracing::info!("graceful shutdown clean");
+                    }
                     daemon::remove_heartbeat(&self.paths);
                     return Ok(());
                 }
@@ -556,9 +652,9 @@ impl Orchestrator {
                     match joined {
                         Ok((slug, Ok(()))) => {
                             tracing::info!(slug, "project event loop ended cleanly");
-                            // V0.4.6 F82 — clear the orphaned cancel
-                            // sender so unroster_project doesn't trip
-                            // over a stale entry next time.
+                            // F82/F86: clear the orphaned cancel sender
+                            // so unroster_project / shutdown don't try
+                            // to send on a closed receiver.
                             self.cancel_handles.lock().await.remove(&slug);
                         }
                         Ok((slug, Err(err))) => {
@@ -659,10 +755,11 @@ impl Orchestrator {
                 _ => tracing::info!(slug, origin, "starting project event loop"),
             }
 
-            // V0.4.6 F82 — wire per-slug cancellation token. The
-            // sender goes into `self.cancel_handles` so
-            // `unroster_project` / `reload_project` can fire a
-            // graceful workflow_done.
+            // V0.4.6 F82/F86 — register per-slug cancellation token
+            // BEFORE spawning so a racing `unroster_project` /
+            // `reload_project` / `shutdown` can't miss the slug. The
+            // sender goes into `self.cancel_handles` so all three paths
+            // fire a graceful workflow_done.
             let (cancel_tx, cancel_rx) = oneshot::channel::<CancelReason>();
             self.cancel_handles
                 .lock()
@@ -795,6 +892,9 @@ impl Orchestrator {
         let mut ticker = tokio::time::interval(COMPLETION_POLL_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // F82/F86: cancellation is handled by the outer `select!` in
+        // `run_project_with_cancel`; here we just process artifact +
+        // completion ticks and exit naturally when `rx` closes.
         loop {
             tokio::select! {
                 maybe = rx.recv() => match maybe {

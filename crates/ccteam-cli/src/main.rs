@@ -895,36 +895,67 @@ fn run_session(action: SessionAction) -> Result<()> {
     }
 }
 
+/// V0.4.6 F86 — per-user shutdown trigger file. `ccteam stop` writes
+/// here; `ccteam start`'s daemon polls for its existence and routes
+/// the signal through the orchestrator's cancel-token path (graceful
+/// `workflow_done reason="shutdown"` per project) instead of the
+/// V0.4.5 SIGTERM + `JoinSet::abort_all()` hard cut.
+///
+/// Per-user namespace keeps two operators on the same host from
+/// stepping on each other's daemons.
+fn shutdown_trigger_path() -> PathBuf {
+    let user = std::env::var("USER").unwrap_or_else(|_| "ccteam".into());
+    PathBuf::from("/tmp").join(format!("ccteam-{user}.shutdown"))
+}
+
 fn run_stop() -> Result<()> {
     let paths = CcteamPaths::from_env()?;
-    let pid = match ccteam_core::send_sigterm_to_pidfile(&paths)? {
-        Some(pid) => pid,
-        None => {
+    // V0.4.6 F86 — write the trigger file first; the daemon's main
+    // loop polls for it and routes through the orchestrator's
+    // graceful cancel path. SIGTERM stays as the legacy fallback for
+    // systemd / docker stop (the daemon installs the same handler),
+    // but `ccteam stop` no longer needs a process signal — the file
+    // is enough.
+    let pidfile = ccteam_core::pidfile_path(&paths);
+    let pid = match ccteam_core::read_pidfile(&pidfile) {
+        Ok(pid) if ccteam_core::daemon::pid_alive(pid) => pid,
+        _ => {
             println!("ccteam stop: no running orchestrator (pidfile absent or stale).");
             return Ok(());
         }
     };
-    println!("ccteam stop: SIGTERM sent to orchestrator pid {pid}");
+
+    let trigger = shutdown_trigger_path();
+    std::fs::write(&trigger, format!("{}\n", std::process::id()))
+        .with_context(|| format!("write shutdown trigger {}", trigger.display()))?;
+    println!(
+        "ccteam stop: graceful shutdown trigger written to {}",
+        trigger.display()
+    );
+    println!("ccteam stop: orchestrator pid {pid} will drain projects (≤ 30s)…");
 
     // Block until the orchestrator actually exits — docker-stop style.
     // The orchestrator removes its pidfile on graceful shutdown, so
     // either an absent pidfile OR `kill -0 <pid>` returning false is
-    // proof of exit. 10s default covers a typical graceful shutdown;
-    // we never escalate to SIGKILL — CLAUDE.md §三 "永不主动 kill 长
-    // session" applies to ccteam's own daemon too (force-kill loses
-    // in-flight progress.jsonl writes).
-    let pidfile = ccteam_core::pidfile_path(&paths);
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    // proof of exit. V0.4.6 bumps the wait to 35s so the daemon's
+    // own 30s graceful timeout + abort-fallback path can complete
+    // before we surface a warning. We never escalate to SIGKILL —
+    // CLAUDE.md §三 "永不主动 kill 长 session" applies to ccteam's
+    // own daemon too.
+    let deadline = std::time::Instant::now() + Duration::from_secs(35);
     while std::time::Instant::now() < deadline {
         if !pidfile.exists() || !ccteam_core::daemon::pid_alive(pid) {
             println!("ccteam stop: orchestrator exited.");
+            // Best-effort: tidy the trigger file so the next start
+            // doesn't instantly shut itself down on a stale flag.
+            let _ = std::fs::remove_file(&trigger);
             println!("tmux sessions are NOT killed — `ccteam start` will reattach to them.");
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(200));
     }
     eprintln!(
-        "ccteam stop: pid {pid} still alive after 10s. Check the daemon log; \
+        "ccteam stop: pid {pid} still alive after 35s. Check the daemon log; \
          resend with `kill -TERM {pid}` or inspect with `ps -p {pid}`."
     );
     println!("tmux sessions are NOT killed — `ccteam start` will reattach to them.");
@@ -1122,6 +1153,31 @@ fn run_start(
 }
 
 async fn wait_for_shutdown_signal() {
+    // V0.4.6 F86 — `ccteam stop` writes `/tmp/ccteam-<user>.shutdown`
+    // instead of sending SIGTERM. The daemon polls for the file and
+    // collapses to the same shutdown path as SIGTERM (orchestrator
+    // graceful cancel via Notify channel). SIGTERM is retained for
+    // systemd / docker-stop callers; either trigger is sufficient.
+    let trigger = shutdown_trigger_path();
+    // Drain any stale trigger left by a previous run before we begin
+    // polling so we don't insta-shutdown on startup.
+    let _ = std::fs::remove_file(&trigger);
+    let trigger_poll = async {
+        let mut ticker = tokio::time::interval(Duration::from_millis(250));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            if trigger.exists() {
+                tracing::info!(
+                    path = %trigger.display(),
+                    "shutdown trigger file observed (ccteam stop)"
+                );
+                let _ = std::fs::remove_file(&trigger);
+                return;
+            }
+        }
+    };
+
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
@@ -1129,20 +1185,25 @@ async fn wait_for_shutdown_signal() {
             Ok(s) => s,
             Err(err) => {
                 tracing::warn!(?err, "could not install SIGTERM handler");
-                let _ = tokio::signal::ctrl_c().await;
-                tracing::info!("ctrl+c received");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => tracing::info!("ctrl+c received"),
+                    _ = trigger_poll => tracing::info!("shutdown via trigger file"),
+                }
                 return;
             }
         };
         tokio::select! {
             _ = tokio::signal::ctrl_c() => tracing::info!("ctrl+c received"),
             _ = sigterm.recv() => tracing::info!("SIGTERM received (ccteam stop)"),
+            _ = trigger_poll => tracing::info!("shutdown via trigger file"),
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = tokio::signal::ctrl_c().await;
-        tracing::info!("ctrl+c received");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => tracing::info!("ctrl+c received"),
+            _ = trigger_poll => tracing::info!("shutdown via trigger file"),
+        }
     }
 }
 
