@@ -612,11 +612,7 @@ fn main() -> Result<()> {
             let paths = CcteamPaths::from_env()?;
             run_send(&paths, &slug, role.as_deref(), no_spawn, &body)
         }
-        Command::Spawn {
-            slug,
-            role,
-            prompt,
-        } => {
+        Command::Spawn { slug, role, prompt } => {
             let paths = CcteamPaths::from_env()?;
             run_spawn(&paths, &slug, &role, prompt.as_deref())
         }
@@ -766,36 +762,67 @@ fn run_phase(cmd: PhaseCommand) -> Result<()> {
     }
 }
 
+/// V0.4.6 F86 — per-user shutdown trigger file. `ccteam stop` writes
+/// here; `ccteam start`'s daemon polls for its existence and routes
+/// the signal through the orchestrator's cancel-token path (graceful
+/// `workflow_done reason="shutdown"` per project) instead of the
+/// V0.4.5 SIGTERM + `JoinSet::abort_all()` hard cut.
+///
+/// Per-user namespace keeps two operators on the same host from
+/// stepping on each other's daemons.
+fn shutdown_trigger_path() -> PathBuf {
+    let user = std::env::var("USER").unwrap_or_else(|_| "ccteam".into());
+    PathBuf::from("/tmp").join(format!("ccteam-{user}.shutdown"))
+}
+
 fn run_stop() -> Result<()> {
     let paths = CcteamPaths::from_env()?;
-    let pid = match ccteam_core::send_sigterm_to_pidfile(&paths)? {
-        Some(pid) => pid,
-        None => {
+    // V0.4.6 F86 — write the trigger file first; the daemon's main
+    // loop polls for it and routes through the orchestrator's
+    // graceful cancel path. SIGTERM stays as the legacy fallback for
+    // systemd / docker stop (the daemon installs the same handler),
+    // but `ccteam stop` no longer needs a process signal — the file
+    // is enough.
+    let pidfile = ccteam_core::pidfile_path(&paths);
+    let pid = match ccteam_core::read_pidfile(&pidfile) {
+        Ok(pid) if ccteam_core::daemon::pid_alive(pid) => pid,
+        _ => {
             println!("ccteam stop: no running orchestrator (pidfile absent or stale).");
             return Ok(());
         }
     };
-    println!("ccteam stop: SIGTERM sent to orchestrator pid {pid}");
+
+    let trigger = shutdown_trigger_path();
+    std::fs::write(&trigger, format!("{}\n", std::process::id()))
+        .with_context(|| format!("write shutdown trigger {}", trigger.display()))?;
+    println!(
+        "ccteam stop: graceful shutdown trigger written to {}",
+        trigger.display()
+    );
+    println!("ccteam stop: orchestrator pid {pid} will drain projects (≤ 30s)…");
 
     // Block until the orchestrator actually exits — docker-stop style.
     // The orchestrator removes its pidfile on graceful shutdown, so
     // either an absent pidfile OR `kill -0 <pid>` returning false is
-    // proof of exit. 10s default covers a typical graceful shutdown;
-    // we never escalate to SIGKILL — CLAUDE.md §三 "永不主动 kill 长
-    // session" applies to ccteam's own daemon too (force-kill loses
-    // in-flight progress.jsonl writes).
-    let pidfile = ccteam_core::pidfile_path(&paths);
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    // proof of exit. V0.4.6 bumps the wait to 35s so the daemon's
+    // own 30s graceful timeout + abort-fallback path can complete
+    // before we surface a warning. We never escalate to SIGKILL —
+    // CLAUDE.md §三 "永不主动 kill 长 session" applies to ccteam's
+    // own daemon too.
+    let deadline = std::time::Instant::now() + Duration::from_secs(35);
     while std::time::Instant::now() < deadline {
         if !pidfile.exists() || !ccteam_core::daemon::pid_alive(pid) {
             println!("ccteam stop: orchestrator exited.");
+            // Best-effort: tidy the trigger file so the next start
+            // doesn't instantly shut itself down on a stale flag.
+            let _ = std::fs::remove_file(&trigger);
             println!("tmux sessions are NOT killed — `ccteam start` will reattach to them.");
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(200));
     }
     eprintln!(
-        "ccteam stop: pid {pid} still alive after 10s. Check the daemon log; \
+        "ccteam stop: pid {pid} still alive after 35s. Check the daemon log; \
          resend with `kill -TERM {pid}` or inspect with `ps -p {pid}`."
     );
     println!("tmux sessions are NOT killed — `ccteam start` will reattach to them.");
@@ -994,6 +1021,31 @@ fn run_start(
 }
 
 async fn wait_for_shutdown_signal() {
+    // V0.4.6 F86 — `ccteam stop` writes `/tmp/ccteam-<user>.shutdown`
+    // instead of sending SIGTERM. The daemon polls for the file and
+    // collapses to the same shutdown path as SIGTERM (orchestrator
+    // graceful cancel via Notify channel). SIGTERM is retained for
+    // systemd / docker-stop callers; either trigger is sufficient.
+    let trigger = shutdown_trigger_path();
+    // Drain any stale trigger left by a previous run before we begin
+    // polling so we don't insta-shutdown on startup.
+    let _ = std::fs::remove_file(&trigger);
+    let trigger_poll = async {
+        let mut ticker = tokio::time::interval(Duration::from_millis(250));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            if trigger.exists() {
+                tracing::info!(
+                    path = %trigger.display(),
+                    "shutdown trigger file observed (ccteam stop)"
+                );
+                let _ = std::fs::remove_file(&trigger);
+                return;
+            }
+        }
+    };
+
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
@@ -1001,20 +1053,25 @@ async fn wait_for_shutdown_signal() {
             Ok(s) => s,
             Err(err) => {
                 tracing::warn!(?err, "could not install SIGTERM handler");
-                let _ = tokio::signal::ctrl_c().await;
-                tracing::info!("ctrl+c received");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => tracing::info!("ctrl+c received"),
+                    _ = trigger_poll => tracing::info!("shutdown via trigger file"),
+                }
                 return;
             }
         };
         tokio::select! {
             _ = tokio::signal::ctrl_c() => tracing::info!("ctrl+c received"),
             _ = sigterm.recv() => tracing::info!("SIGTERM received (ccteam stop)"),
+            _ = trigger_poll => tracing::info!("shutdown via trigger file"),
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = tokio::signal::ctrl_c().await;
-        tracing::info!("ctrl+c received");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => tracing::info!("ctrl+c received"),
+            _ = trigger_poll => tracing::info!("shutdown via trigger file"),
+        }
     }
 }
 
@@ -1237,10 +1294,7 @@ fn run_send(
 ) -> Result<()> {
     let project_dir = paths.project_dir(slug);
     if !project_dir.exists() {
-        anyhow::bail!(
-            "no project `{slug}` at {}",
-            project_dir.display()
-        );
+        anyhow::bail!("no project `{slug}` at {}", project_dir.display());
     }
     let body = read_body_or_stdin(body)?;
     let body = body.trim();
@@ -1286,8 +1340,7 @@ fn run_send(
     };
     // Atomic write: .tmp then rename (matches inbox.rs::save).
     let tmp = path.with_extension("md.tmp");
-    std::fs::write(&tmp, &frontmatter)
-        .with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::write(&tmp, &frontmatter).with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, &path)
         .with_context(|| format!("rename {} → {}", tmp.display(), path.display()))?;
     println!("queued inbox message: {}", path.display());
@@ -1301,18 +1354,10 @@ fn run_send(
     Ok(())
 }
 
-fn run_spawn(
-    paths: &CcteamPaths,
-    slug: &str,
-    role: &str,
-    prompt: Option<&str>,
-) -> Result<()> {
+fn run_spawn(paths: &CcteamPaths, slug: &str, role: &str, prompt: Option<&str>) -> Result<()> {
     let project_dir = paths.project_dir(slug);
     if !project_dir.exists() {
-        anyhow::bail!(
-            "no project `{slug}` at {}",
-            project_dir.display()
-        );
+        anyhow::bail!("no project `{slug}` at {}", project_dir.display());
     }
     // Validate the role exists in workflow.yaml so we fail loud here
     // instead of letting the orchestrator silently delete the marker
@@ -1327,12 +1372,8 @@ fn run_spawn(
     }
 
     let bucket = project_dir.join(".ccteam").join("spawn_requests");
-    std::fs::create_dir_all(&bucket)
-        .with_context(|| format!("create {}", bucket.display()))?;
-    let session_id = format!(
-        "{role}-{}",
-        chrono::Utc::now().timestamp_micros()
-    );
+    std::fs::create_dir_all(&bucket).with_context(|| format!("create {}", bucket.display()))?;
+    let session_id = format!("{role}-{}", chrono::Utc::now().timestamp_micros());
     let marker = bucket.join(format!("{session_id}.json"));
 
     let resolved_prompt = match prompt {
@@ -1356,7 +1397,10 @@ fn run_spawn(
     println!("  session_id: {session_id}");
     if let Some(p) = resolved_prompt.as_deref() {
         let head: String = p.chars().take(80).collect();
-        println!("  prompt:     {head}{}", if p.len() > 80 { "…" } else { "" });
+        println!(
+            "  prompt:     {head}{}",
+            if p.len() > 80 { "…" } else { "" }
+        );
     } else {
         println!("  prompt:     <default kick prompt>");
     }
@@ -1370,8 +1414,8 @@ fn run_new(slug: String, team: String) -> Result<()> {
     // V0.4.3 F76: fail loud at the CLI boundary on invalid slug grammar
     // (whitespace / unicode / leading dash etc.) so we don't spawn
     // `~/projects/<garbage>/` and leave junk for the user to clean up.
-    let validated = ccteam_core::validate_slug_format(&slug)
-        .with_context(|| format!("ccteam new {slug:?}"))?;
+    let validated =
+        ccteam_core::validate_slug_format(&slug).with_context(|| format!("ccteam new {slug:?}"))?;
     let paths = CcteamPaths::from_env()?;
     // V0.4.2 F75: `ccteam new <slug>` delegates to `ccteam init` with
     // `install_in = <projects_root>/<final_slug>`. F22 invariant: if

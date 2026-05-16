@@ -161,6 +161,16 @@ pub struct Orchestrator {
     fail_counts: Arc<Mutex<HashMap<String, u32>>>,
     gate_states: Arc<Mutex<HashMap<String, GateState>>>,
     cost_accum: Arc<Mutex<f64>>,
+    /// V0.4.6 F86 — per-slug cancel channels for graceful shutdown.
+    /// `cancel_event_loop(slug)` sends on the matching `mpsc::Sender`;
+    /// the per-project `event_loop` selects on its `Receiver`, emits a
+    /// `workflow_done reason="shutdown"` event, and returns cleanly.
+    ///
+    /// **F82 stub**: when the F82 cancellation token PR merges, replace
+    /// the `mpsc::Sender<()>` type here with the shared cancel-token
+    /// shape. Public surface (`cancel_event_loop` / `shutdown`) is
+    /// signature-stable; only the storage shape changes.
+    cancel_handles: Arc<Mutex<HashMap<String, mpsc::Sender<()>>>>,
 }
 
 impl std::fmt::Debug for Orchestrator {
@@ -183,6 +193,18 @@ enum SessionStatus {
     },
 }
 
+/// V0.4.6 F86 — fold an optional `mpsc::Receiver<()>` into a
+/// `tokio::select!` arm. When `slot` is `None`, the future returned
+/// here is a pending stub that never resolves; when populated, it
+/// delegates to `recv().await`. Lets `event_loop` share one select
+/// shape whether or not the daemon supplied a cancel receiver.
+async fn recv_optional(slot: &mut Option<mpsc::Receiver<()>>) -> Option<()> {
+    match slot.as_mut() {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending::<Option<()>>().await,
+    }
+}
+
 impl Orchestrator {
     /// Build orchestrator; pre-register claude + codex adapters so the
     /// dispatch path never allocates one mid-flight.
@@ -200,11 +222,78 @@ impl Orchestrator {
             fail_counts: Arc::new(Mutex::new(HashMap::new())),
             gate_states: Arc::new(Mutex::new(HashMap::new())),
             cost_accum: Arc::new(Mutex::new(0.0)),
+            cancel_handles: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
     pub fn paths(&self) -> &CcteamPaths {
         &self.paths
+    }
+
+    /// V0.4.6 F86 — F82 cancellation token stub. Sends a single `()` on
+    /// the cancel channel registered for `slug` (if any). Returns
+    /// `true` when a handle existed and the send was queued, `false`
+    /// when the slug is not currently registered (loop already exited
+    /// or never started).
+    ///
+    /// **F82 merge plan**: this signature is stable. When the F82 PR
+    /// lands its `CancellationToken` shape, swap the storage in
+    /// `cancel_handles` (and the `Sender` type in
+    /// [`Self::register_cancel_handle`]); the two public callers
+    /// ([`Self::shutdown`] and any future
+    /// `enforce_budget` / hot-reload path) stay untouched.
+    pub async fn cancel_event_loop(&self, slug: &str) -> bool {
+        let sender = {
+            let mut handles = self.cancel_handles.lock().await;
+            handles.remove(slug)
+        };
+        match sender {
+            Some(tx) => {
+                // Channel is bounded(1); event_loop only reads once
+                // before breaking, so try_send is sufficient and avoids
+                // blocking the caller if the loop has already left the
+                // select arm.
+                let _ = tx.try_send(());
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// V0.4.6 F86 — orchestrator-wide graceful shutdown. Walks every
+    /// registered cancel handle, fires it, and returns the slug list
+    /// for the caller's timeout/abort logic. Idempotent (re-entry
+    /// returns an empty vec).
+    pub async fn shutdown(&self) -> Vec<String> {
+        let handles: Vec<(String, mpsc::Sender<()>)> = {
+            let mut map = self.cancel_handles.lock().await;
+            map.drain().collect()
+        };
+        let mut slugs = Vec::with_capacity(handles.len());
+        for (slug, tx) in handles {
+            let _ = tx.try_send(());
+            slugs.push(slug);
+        }
+        slugs
+    }
+
+    /// Test-only: register a cancel handle without going through
+    /// `run_project`. Used by `graceful_shutdown_test` to exercise the
+    /// public cancel path in isolation.
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn test_register_cancel_handle(&self, slug: &str, tx: mpsc::Sender<()>) {
+        self.cancel_handles
+            .lock()
+            .await
+            .insert(slug.to_string(), tx);
+    }
+
+    /// Test-only mirror of the run-loop helper so tests can assert
+    /// graceful-shutdown bookkeeping without bringing up the full
+    /// daemon.
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn test_cancel_handles_len(&self) -> usize {
+        self.cancel_handles.lock().await.len()
     }
 
     fn adapter_for(&self, exec: Executor) -> Option<&Arc<dyn HarnessAdapter + Send + Sync>> {
@@ -228,6 +317,20 @@ impl Orchestrator {
     // ---- public entry points ------------------------------------------------
 
     pub async fn run_project(&self, slug: &str) -> Result<()> {
+        self.run_project_with_cancel(slug, None).await
+    }
+
+    /// V0.4.6 F86 — same as [`run_project`] but takes an optional
+    /// cancellation receiver. When the daemon's [`shutdown`] is invoked,
+    /// the orchestrator sends `()` on the matching `Sender` and this
+    /// future returns cleanly after appending a
+    /// `workflow_done reason="shutdown"` row to the project's
+    /// `progress.jsonl`.
+    pub async fn run_project_with_cancel(
+        &self,
+        slug: &str,
+        cancel_rx: Option<mpsc::Receiver<()>>,
+    ) -> Result<()> {
         let project_dir = self.paths.project_dir(slug);
         let progress_path = self.paths.progress_jsonl(slug);
 
@@ -273,7 +376,7 @@ impl Orchestrator {
 
         self.dispatch_initial_triggers(slug, &spec).await?;
         let res = self
-            .event_loop(slug, &spec, &project_dir, &progress_path, rx)
+            .event_loop(slug, &spec, &project_dir, &progress_path, rx, cancel_rx)
             .await;
 
         watcher_handle.abort();
@@ -316,7 +419,8 @@ impl Orchestrator {
         let mut tasks: JoinSet<(String, Result<()>)> = JoinSet::new();
         let mut spawned: HashSet<String> = HashSet::new();
 
-        self.spawn_new_rostered_projects(&mut tasks, &mut spawned, "startup");
+        self.spawn_new_rostered_projects(&mut tasks, &mut spawned, "startup")
+            .await;
 
         if let Err(err) = daemon::write_heartbeat(&self.paths) {
             tracing::warn!(?err, "initial heartbeat write failed");
@@ -335,9 +439,34 @@ impl Orchestrator {
         loop {
             tokio::select! {
                 _ = &mut shutdown => {
-                    tracing::info!("shutdown received; aborting project tasks (sessions remain alive)");
-                    tasks.abort_all();
-                    while tasks.join_next().await.is_some() {}
+                    // V0.4.6 F86 — graceful shutdown via cancel token.
+                    // Replaces the V0.4.5 hard `abort_all()` path that
+                    // dropped in-flight `workflow_done` writes and left
+                    // phantom `agent_spawn` rows for F80 to mop up next
+                    // start. The cancel path lets each `event_loop`
+                    // emit `workflow_done reason="shutdown"` cleanly.
+                    let slugs = self.shutdown().await;
+                    tracing::info!(
+                        count = slugs.len(),
+                        "graceful shutdown begin: cancel signals dispatched"
+                    );
+                    let timed = tokio::time::timeout(
+                        Duration::from_secs(30),
+                        async {
+                            while tasks.join_next().await.is_some() {}
+                        },
+                    )
+                    .await;
+                    if timed.is_err() {
+                        tracing::warn!(
+                            "graceful shutdown timeout (30s); falling back to abort_all() — \
+                             in-flight progress.jsonl writes may be lost for stalled loops"
+                        );
+                        tasks.abort_all();
+                        while tasks.join_next().await.is_some() {}
+                    } else {
+                        tracing::info!("graceful shutdown clean");
+                    }
                     daemon::remove_heartbeat(&self.paths);
                     return Ok(());
                 }
@@ -347,15 +476,22 @@ impl Orchestrator {
                     }
                 }
                 _ = rescan_ticker.tick() => {
-                    self.spawn_new_rostered_projects(&mut tasks, &mut spawned, "rescan");
+                    self.spawn_new_rostered_projects(&mut tasks, &mut spawned, "rescan")
+                        .await;
                 }
                 Some(joined) = tasks.join_next() => {
                     match joined {
                         Ok((slug, Ok(()))) => {
                             tracing::info!(slug, "project event loop ended cleanly");
+                            // Loop returned cleanly without going
+                            // through `cancel_event_loop`; tidy up the
+                            // stale handle so a later shutdown doesn't
+                            // try to send on a closed receiver.
+                            self.cancel_handles.lock().await.remove(&slug);
                         }
                         Ok((slug, Err(err))) => {
                             tracing::warn!(slug, error = ?err, "project event loop errored");
+                            self.cancel_handles.lock().await.remove(&slug);
                         }
                         Err(je) if je.is_cancelled() => {}
                         Err(je) => {
@@ -372,7 +508,7 @@ impl Orchestrator {
     /// the periodic rescan tick (`origin = "rescan"`). Slugs without a
     /// `workflow.yaml` are skipped silently — those are legacy V0.3.x
     /// phase-driven projects with no event-loop equivalent.
-    fn spawn_new_rostered_projects(
+    async fn spawn_new_rostered_projects(
         self: &Arc<Self>,
         tasks: &mut JoinSet<(String, Result<()>)>,
         spawned: &mut HashSet<String>,
@@ -402,10 +538,20 @@ impl Orchestrator {
             } else {
                 tracing::info!(slug, "starting project event loop");
             }
+            // V0.4.6 F86 — register cancel handle BEFORE spawning so a
+            // racing `shutdown()` can't miss the slug. Bounded(1) is
+            // sufficient: `event_loop` reads once before breaking.
+            let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
+            self.cancel_handles
+                .lock()
+                .await
+                .insert(slug.clone(), cancel_tx);
             let orch = Arc::clone(self);
             let slug_for_task = slug.clone();
             tasks.spawn(async move {
-                let res = orch.run_project(&slug_for_task).await;
+                let res = orch
+                    .run_project_with_cancel(&slug_for_task, Some(cancel_rx))
+                    .await;
                 (slug_for_task, res)
             });
             spawned.insert(slug);
@@ -442,10 +588,15 @@ impl Orchestrator {
         project_dir: &std::path::Path,
         progress_path: &std::path::Path,
         mut rx: mpsc::Receiver<ArtifactEvent>,
+        cancel_rx: Option<mpsc::Receiver<()>>,
     ) -> Result<()> {
         let mut ticker = tokio::time::interval(COMPLETION_POLL_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // V0.4.6 F86 — fold the cancel receiver into the select. If the
+        // caller didn't supply one (test paths via `run_project`), wire a
+        // sentinel that never fires so the select arm is harmless.
+        let mut cancel_rx = cancel_rx;
         loop {
             tokio::select! {
                 maybe = rx.recv() => match maybe {
@@ -468,6 +619,23 @@ impl Orchestrator {
                     self.check_gates(slug, spec, project_dir, progress_path).await;
                     self.check_inbox(slug, spec, project_dir, progress_path).await;
                     self.check_workflow_done(slug, spec, progress_path).await;
+                }
+                // V0.4.6 F86 — graceful cancel arm. `cancel_rx.recv()`
+                // on `None` is an instantly-resolving `None`, so the
+                // helper below short-circuits when no receiver was wired.
+                Some(_) = recv_optional(&mut cancel_rx) => {
+                    tracing::info!(slug, "event_loop cancel received; emitting workflow_done reason=shutdown");
+                    let _ = progress::append_event(
+                        progress_path,
+                        &json!({
+                            "event": "workflow_done",
+                            "workflow": spec.name,
+                            "slug": slug,
+                            "reason": "shutdown",
+                            "ts": Utc::now().to_rfc3339(),
+                        }),
+                    );
+                    break;
                 }
             }
         }
