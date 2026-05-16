@@ -466,24 +466,23 @@ agents:
     executor: claude
 "#;
 
-const DEFAULT_AGENT_SCAFFOLDS: &[(&str, &str)] = &[(
-    "explorer.md",
-    r#"# Explorer agent
-
-This file is the system prompt for the `explorer` role.
-
-You are a generalist working in this project. The user has just
-installed ccteam here via `ccteam init`. Start by reading the project
-layout (`ls`, `git log -5`, top-level README if present) and reporting
-what you find. Wait for further instructions from the inbox.
-
-## Tools
-
-You have access to ccteam's MCP toolset (`mcp__ccteam__*`) for
-inspecting other projects, sending messages, and triggering workflow
-gates. See ~/.claude/skills/ccteam-control/SKILL.md for usage patterns.
-"#,
-)];
+/// Default `.claude/agents/<role>.md` scaffolds written by `ccteam init`.
+///
+/// Source-of-truth files live in the repo's top-level `agents/` dir; we
+/// `include_str!` them at compile time so the binary is self-contained
+/// but the templates stay editable as proper agent .md files (with
+/// Anthropic frontmatter + system prompt body).
+///
+/// To add an agent scaffold:
+/// 1. Write `agents/<role>.md` at the repo root (proper frontmatter spec)
+/// 2. Add a `(filename, include_str!(...))` row here
+/// 3. Update `DEFAULT_WORKFLOW_YAML` to declare the role if it's a
+///    default-shipped agent
+/// 4. `cargo build --workspace` + `cargo test --workspace`
+///
+/// See `agents/README.md` for the agent spec + naming conventions.
+const DEFAULT_AGENT_SCAFFOLDS: &[(&str, &str)] =
+    &[("explorer.md", include_str!("../../../agents/explorer.md"))];
 
 /// Prompt the user `<question> [Y/n]: ` and return their answer. With
 /// `yes_to_all = true`, skips the prompt and answers `true` (the
