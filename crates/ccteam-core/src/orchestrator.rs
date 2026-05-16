@@ -345,18 +345,11 @@ impl Orchestrator {
         &self.paths
     }
 
-    /// V0.4.6 F86 — F82 cancellation token stub. Sends a single `()` on
-    /// the cancel channel registered for `slug` (if any). Returns
-    /// `true` when a handle existed and the send was queued, `false`
-    /// when the slug is not currently registered (loop already exited
-    /// or never started).
-    ///
-    /// **F82 merge plan**: this signature is stable. When the F82 PR
-    /// lands its `CancellationToken` shape, swap the storage in
-    /// `cancel_handles` (and the `Sender` type in
-    /// [`Self::register_cancel_handle`]); the two public callers
-    /// ([`Self::shutdown`] and any future
-    /// `enforce_budget` / hot-reload path) stay untouched.
+    /// V0.4.6 F86 — F82 cancellation token alias. Sends
+    /// `CancelReason::Shutdown` on the cancel channel registered for
+    /// `slug` (if any). Returns `true` when a handle existed and the
+    /// send was queued, `false` when the slug is not currently
+    /// registered (loop already exited or never started).
     pub async fn cancel_event_loop(&self, slug: &str) -> bool {
         let sender = {
             let mut handles = self.cancel_handles.lock().await;
@@ -364,8 +357,6 @@ impl Orchestrator {
         };
         match sender {
             Some(tx) => {
-                // F82's oneshot::Sender::send consumes self; reason maps
-                // to CancelReason::Shutdown for daemon-wide stop.
                 let _ = tx.send(CancelReason::Shutdown);
                 true
             }

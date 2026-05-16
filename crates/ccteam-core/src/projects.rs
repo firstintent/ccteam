@@ -509,6 +509,169 @@ pub(crate) fn write_trust_entry(claude_json: &Path, project_dir: &Path) -> Resul
     Ok(())
 }
 
+/// V0.4.6 F81 — categorised liveness verdict for a project that
+/// `ccteam remove` is about to delete. Each variant maps to a concrete
+/// CLAUDE.md §三 "永不主动 kill 长 session" refusal reason; the CLI
+/// renders the message verbatim so the user sees how to drain the
+/// session before re-running.
+///
+/// The categorisation is intentionally narrow: each refusal pins one
+/// specific resource the user must clean up (tmux session id, claude
+/// bg job short id, or the open `agent_spawn` count). `--force`
+/// bypasses these checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActiveSessionRefusal {
+    /// A `tmux ls`-visible session named `ccteam-<slug>` is still
+    /// running. The user must `tmux kill-session -t <name>` first
+    /// (or attach + exit cleanly).
+    TmuxSessionAlive { session_name: String },
+    /// `~/.claude/jobs/<id>/state.json::cwd == project_dir` and
+    /// `state == "working"` — a live `claude --bg` worker. The user
+    /// should let it finish (or `claude stop <job_id>` first).
+    ClaudeBgJobAlive {
+        job_id: String,
+        state_json_path: PathBuf,
+    },
+    /// `progress.jsonl` shows N open `agent_spawn` rows with no
+    /// matching terminal `agent_done`. Often this resolves itself on
+    /// the next orchestrator tick (F80 cleanup); user should consult
+    /// `ccteam show <slug>` to decide.
+    OpenAgentSpawns { running_count: u32 },
+}
+
+impl ActiveSessionRefusal {
+    /// Human-readable reason for the refusal — the CLI prints this
+    /// verbatim (one line) so users see the exact tool surface they
+    /// need to touch.
+    pub fn message(&self, slug: &str) -> String {
+        match self {
+            Self::TmuxSessionAlive { session_name } => format!(
+                "refusing — tmux session `{session_name}` is still alive; \
+                 run `tmux kill-session -t {session_name}` first, or pass `--force`"
+            ),
+            Self::ClaudeBgJobAlive {
+                job_id,
+                state_json_path,
+            } => format!(
+                "refusing — claude --bg job `{job_id}` is still working for `{slug}` \
+                 (see {}); let it finish or pass `--force`",
+                state_json_path.display()
+            ),
+            Self::OpenAgentSpawns { running_count } => format!(
+                "refusing — progress.jsonl shows {running_count} running agent session(s) for \
+                 `{slug}`; run `ccteam show {slug}` to inspect or pass `--force`"
+            ),
+        }
+    }
+}
+
+/// V0.4.6 F81 — implement CLAUDE.md §三 "永不主动 kill 长 session" for
+/// the `ccteam remove <slug>` path. Three checks, returned in priority
+/// order so the user sees the most concrete refusal first:
+///
+/// 1. `ccteam-<slug>` tmux session alive (Codex flex sessions also
+///    surface here via `session_name_for_project`).
+/// 2. Any `~/.claude/jobs/<id>/state.json` with `cwd == project_dir` /
+///    `state == "working"` / no `firstTerminalAt` (live `claude --bg`).
+/// 3. `progress.jsonl` carries an open `agent_spawn` whose live job
+///    probe still reports `Running` (F80 liveness logic, so phantom
+///    rows from prior SIGKILL casualties don't block removal).
+///
+/// `Ok(None)` → safe to proceed (no active session detected).
+/// `Ok(Some(refusal))` → caller refuses unless `--force` is set.
+/// `Err(_)` → IO failure on the registry / progress file (callers
+/// should treat as fatal — silently degrading would risk deleting a
+/// project mid-session).
+///
+/// **Red line.** This function never modifies state. The caller is
+/// the only mutator; this helper is a pure read on filesystem + env.
+pub fn refuses_active_session(
+    paths: &CcteamPaths,
+    slug: &str,
+) -> Result<Option<ActiveSessionRefusal>> {
+    // 1. tmux session check — uses `session_name_for_project` so
+    // meta-agent layouts (`ccteam-meta-<handle>`) are detected too.
+    let tmux_name = crate::tmux::session_name_for_project(paths, slug);
+    let tmux = crate::tmux::TmuxSession::from_name(tmux_name.clone());
+    if tmux.exists() {
+        return Ok(Some(ActiveSessionRefusal::TmuxSessionAlive {
+            session_name: tmux_name,
+        }));
+    }
+
+    // 2. claude --bg job check — scan `~/.claude/jobs/*/state.json`
+    // (or the `CCTEAM_CLAUDE_JOBS_DIR` redirection). Match on
+    // canonical cwd; treat unparseable / missing entries as "no
+    // match" rather than IO-erroring (a corrupt state.json elsewhere
+    // shouldn't block removal of this project).
+    let project_dir = paths.project_dir(slug);
+    let canon_project = std::fs::canonicalize(&project_dir).unwrap_or(project_dir.clone());
+    let jobs_dir = std::env::var_os(crate::harness::CLAUDE_JOBS_DIR_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_default()
+                .join(".claude")
+                .join("jobs")
+        });
+    if let Ok(read) = std::fs::read_dir(&jobs_dir) {
+        for entry in read.flatten() {
+            let state_path = entry.path().join("state.json");
+            let Ok(body) = std::fs::read_to_string(&state_path) else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<Value>(&body) else {
+                continue;
+            };
+            let cwd = v.get("cwd").and_then(|s| s.as_str()).unwrap_or("");
+            if cwd.is_empty() {
+                continue;
+            }
+            let canon = std::fs::canonicalize(cwd).unwrap_or(PathBuf::from(cwd));
+            if canon != canon_project {
+                continue;
+            }
+            // Liveness: terminal job → ignore (firstTerminalAt set or
+            // state in terminal set). Use the same classifier the
+            // orchestrator + watcher consume so this stays consistent.
+            if matches!(
+                crate::claude_job::classify(&v),
+                crate::claude_job::JobLiveness::Running
+            ) {
+                let job_id = entry.file_name().to_string_lossy().to_string();
+                return Ok(Some(ActiveSessionRefusal::ClaudeBgJobAlive {
+                    job_id,
+                    state_json_path: state_path,
+                }));
+            }
+        }
+    }
+
+    // 3. progress.jsonl open `agent_spawn` check — F80 liveness logic
+    // so phantom rows (SIGKILL casualties) don't block. We use
+    // `current_agent_sessions_with_liveness` which the web/orchestrator
+    // already consume; this stays consistent with `workflow_summary`
+    // counts the user sees in `ccteam show`.
+    let progress_path = paths.progress_jsonl(slug);
+    if progress_path.exists() {
+        let events = crate::progress::read_all_events(&progress_path).unwrap_or_default();
+        let sessions = crate::progress::current_agent_sessions_with_liveness(&events, |job_id| {
+            crate::claude_job::probe_job(job_id)
+        });
+        let running = sessions
+            .iter()
+            .filter(|s| matches!(s.status, crate::progress::AgentSessionStatus::Running))
+            .count() as u32;
+        if running > 0 {
+            return Ok(Some(ActiveSessionRefusal::OpenAgentSpawns {
+                running_count: running,
+            }));
+        }
+    }
+
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::OnceLock;
