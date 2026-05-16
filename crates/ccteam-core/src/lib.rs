@@ -114,8 +114,9 @@ pub use projects::{
     pre_trust_project, slugify, slugify_brief, validate_slug_format,
 };
 pub use queries::{
-    collect_projects, collect_recent_events, workflow_summary, AgentStatus, ProjectSummary,
-    WorkflowSummary,
+    active_sessions, artifact_queue, collect_projects, collect_recent_events, cost_history_buckets,
+    cost_summary, job_log_tail, workflow_summary, ActiveSessionInfo, AgentStatus,
+    ArtifactQueueEntry, CostHistoryBucket, CostSummary, ProjectSummary, WorkflowSummary,
 };
 pub use screenshot::{
     probe_font as probe_screenshot_font, render_screenshot, vt100_color_to_rgb, ScreenshotResult,
