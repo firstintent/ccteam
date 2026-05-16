@@ -458,6 +458,117 @@ fn accumulate_session(status: &mut AgentStatus, session: &AgentSessionSummary) {
     }
 }
 
+// ---------------- V0.4.6 F91 cost SoT (F84 stub) ----------------
+
+/// Rolling cost roll-up surfaced to `ccteam show` + the F84 budget
+/// guard. **F84 stub**: this version only computes `cost_24h_usd` /
+/// `cost_total_usd` / `session_count_24h` from progress.jsonl, which
+/// is all F84's `enforce_budget` needs. F91's full impl (parallel
+/// worktree) extends with `cost_active_usd` / `session_count_active`
+/// by probing `~/.claude/jobs/<job_id>/state.json` for live sessions.
+///
+/// The fields that F84 doesn't read still ship here so the type
+/// signature already matches the final F91 contract; F91 will only
+/// touch the computation, not the shape. F84 unit tests assert
+/// directly on `cost_24h_usd` so they keep passing after F91 merge.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct CostSummary {
+    /// Sum of `agent_done.cost_usd` for events with `ts >= now - 24h`.
+    /// F84 budget guard reads this; F91 keeps the formula identical.
+    pub cost_24h_usd: f64,
+    /// Sum of running-session cost from probe of state.json (F91
+    /// computes this; F84 stub returns `0.0`).
+    pub cost_active_usd: f64,
+    /// Sum of `agent_done.cost_usd` across all time (full progress.jsonl).
+    pub cost_total_usd: f64,
+    /// Count of `agent_done` events within the 24h window.
+    pub session_count_24h: u32,
+    /// Count of running `agent_spawn` events without matching `agent_done`.
+    pub session_count_active: u32,
+}
+
+/// V0.4.6 F84 stub for F91 — read progress.jsonl + filter by 24h
+/// window. The parallel-worktree F91 will replace the body with a
+/// richer implementation that also reads state.json for active
+/// sessions; F84 only needs `cost_24h_usd` so this stub is sufficient
+/// for budget enforcement.
+///
+/// **Pure** modulo the file read. Treats absent / empty progress.jsonl
+/// as `CostSummary::default()` so a fresh project never trips a budget
+/// cap on its first tick (no events ⇒ cost == 0).
+///
+/// `slug` is taken for signature parity with F91's final form
+/// (which may need the slug for state.json path discovery via
+/// `paths.project_state(slug)`).
+#[allow(unused_variables)]
+pub fn cost_summary(
+    slug: &str,
+    progress_path: &std::path::Path,
+    paths: &CcteamPaths,
+) -> Result<CostSummary> {
+    let events = progress::read_all_events(progress_path).unwrap_or_default();
+    cost_summary_from_events(&events)
+}
+
+/// Pure inner helper: derive [`CostSummary`] from an in-memory event
+/// slice. Public to let unit tests skip the file IO. F84's
+/// `enforce_budget` calls the file-aware wrapper so it stays in line
+/// with F91's eventual file-based contract.
+pub fn cost_summary_from_events(events: &[Value]) -> Result<CostSummary> {
+    let now = Utc::now();
+    let cutoff_24h = now - chrono::Duration::hours(24);
+
+    let mut cost_24h_usd = 0.0_f64;
+    let mut cost_total_usd = 0.0_f64;
+    let mut session_count_24h = 0_u32;
+
+    for evt in events {
+        if evt.get("event").and_then(|s| s.as_str()) != Some("agent_done") {
+            continue;
+        }
+        let cost = evt.get("cost_usd").and_then(|n| n.as_f64()).unwrap_or(0.0);
+        cost_total_usd += cost;
+        let ts_raw = evt.get("ts").and_then(|s| s.as_str()).unwrap_or("");
+        let in_window = chrono::DateTime::parse_from_rfc3339(ts_raw)
+            .map(|dt| dt.with_timezone(&Utc) >= cutoff_24h)
+            .unwrap_or(true); // missing/unparseable ts → treat as "recent"
+        if in_window {
+            cost_24h_usd += cost;
+            session_count_24h = session_count_24h.saturating_add(1);
+        }
+    }
+
+    Ok(CostSummary {
+        cost_24h_usd,
+        cost_active_usd: 0.0, // F91 fills this from state.json
+        cost_total_usd,
+        session_count_24h,
+        session_count_active: 0, // F91 fills this from open_agent_spawns
+    })
+}
+
+/// V0.4.6 F84 — count `agent_spawn` events within `window` of now.
+/// Used by the spawn-rate budget cap. Events with missing /
+/// unparseable `ts` count as "recent" (defensive: prefer false
+/// positive trip over silent overrun).
+pub fn count_agent_spawns_within(events: &[Value], window: chrono::Duration) -> u32 {
+    let cutoff = Utc::now() - window;
+    let mut n = 0_u32;
+    for evt in events {
+        if evt.get("event").and_then(|s| s.as_str()) != Some("agent_spawn") {
+            continue;
+        }
+        let ts_raw = evt.get("ts").and_then(|s| s.as_str()).unwrap_or("");
+        let in_window = chrono::DateTime::parse_from_rfc3339(ts_raw)
+            .map(|dt| dt.with_timezone(&Utc) >= cutoff)
+            .unwrap_or(true);
+        if in_window {
+            n = n.saturating_add(1);
+        }
+    }
+    n
+}
+
 fn count_files_in_dir(dir: &std::path::Path) -> u64 {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return 0;

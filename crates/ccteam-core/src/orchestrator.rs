@@ -150,6 +150,94 @@ fn parse_inbox_routing_hints(raw: &str) -> (Option<String>, bool) {
     (target_role, no_spawn)
 }
 
+/// V0.4.6 F84 — discover the workflow.yaml location for a project
+/// (matches `WorkflowSpec::load_for_project`: prefer the root file,
+/// then `.ccteam/`). Returns `None` if neither exists.
+fn workflow_yaml_path_for(project_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let direct = project_dir.join("workflow.yaml");
+    if direct.exists() {
+        return Some(direct);
+    }
+    let nested = project_dir.join(".ccteam").join("workflow.yaml");
+    if nested.exists() {
+        return Some(nested);
+    }
+    None
+}
+
+/// V0.4.6 F84 — text-level patch of `enabled:` in workflow.yaml. The
+/// goal is to preserve user comments + key ordering (which a serde
+/// round-trip would lose). Logic:
+///
+/// 1. If a top-level `enabled:` line exists → rewrite its value to
+///    `false`.
+/// 2. Otherwise → insert `enabled: false` as a fresh top-level line
+///    near the top of the file (after `name:` if present, else line 1).
+///
+/// Idempotent: a file already at `enabled: false` is left unchanged
+/// (no write, no mtime bump, so an F82 watcher's debounce stays
+/// quiet).
+///
+/// Returns an error only on IO failure; missing patterns are handled
+/// by case (2) above so this never fails-loud on the YAML content
+/// shape.
+pub(crate) fn patch_workflow_yaml_enabled_false(path: &std::path::Path) -> std::io::Result<()> {
+    let content = std::fs::read_to_string(path)?;
+    let new = patch_enabled_false_in_yaml_str(&content);
+    if new == content {
+        return Ok(());
+    }
+    // Atomic-ish write: write to sibling .tmp then rename.
+    let tmp = path.with_extension("yaml.tmp.f84");
+    std::fs::write(&tmp, new)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Pure text transform — exposed for unit testing.
+pub(crate) fn patch_enabled_false_in_yaml_str(content: &str) -> String {
+    // Look for a top-level `enabled:` (zero-indent) line; only treat
+    // it as the workflow-level enabled when it's at column 0 to avoid
+    // touching nested `enabled:` inside agents.
+    let mut found = false;
+    let mut out_lines: Vec<String> = Vec::with_capacity(content.lines().count() + 1);
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        let leading = line.len() - trimmed.len();
+        if leading == 0 && trimmed.starts_with("enabled:") {
+            found = true;
+            // Preserve any trailing comment after the value.
+            let after_colon = trimmed.trim_start_matches("enabled:").trim_start();
+            // If there's a `#` comment, keep it.
+            if let Some(hash) = after_colon.find('#') {
+                let comment = &after_colon[hash..];
+                out_lines.push(format!("enabled: false  {}", comment));
+            } else {
+                out_lines.push("enabled: false".to_string());
+            }
+        } else {
+            out_lines.push(line.to_string());
+        }
+    }
+    if !found {
+        // Insert a fresh `enabled: false` line. Prefer "right after
+        // `name:`" so it sits with the rest of the top-level scalars;
+        // fall back to the very start.
+        let insert_at = out_lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("name:") && !l.starts_with(' '))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        out_lines.insert(insert_at, "enabled: false".to_string());
+    }
+    let mut joined = out_lines.join("\n");
+    // Preserve trailing newline if original had one.
+    if content.ends_with('\n') && !joined.ends_with('\n') {
+        joined.push('\n');
+    }
+    joined
+}
+
 /// V0.4.0 F66 thin orchestrator. Lifecycle-only — never injects prompt.
 pub struct Orchestrator {
     paths: CcteamPaths,
@@ -468,6 +556,23 @@ impl Orchestrator {
                     self.check_gates(slug, spec, project_dir, progress_path).await;
                     self.check_inbox(slug, spec, project_dir, progress_path).await;
                     self.check_workflow_done(slug, spec, progress_path).await;
+                    // V0.4.6 F84 — budget enforcement runs last so it
+                    // sees this tick's freshly-emitted agent_done /
+                    // agent_spawn events. Returning `Tripped` from
+                    // `enforce_budget` already wrote `budget_exceeded`
+                    // + flipped workflow.yaml `enabled: false`; F82's
+                    // hot-reload watcher (parallel worktree) will pick
+                    // up the disabled flag and cancel the loop. Until
+                    // F82 lands, the next `ccteam start` re-rosters
+                    // the project and sees `enabled: false`, so the
+                    // loop exits at startup (run_project early-return
+                    // in F82's task list).
+                    if let Err(err) = self
+                        .enforce_budget(slug, spec, project_dir, progress_path)
+                        .await
+                    {
+                        tracing::warn!(?err, slug, "enforce_budget failed");
+                    }
                 }
             }
         }
@@ -1338,6 +1443,154 @@ impl Orchestrator {
             .ok()
             .and_then(|s| s.parse::<f64>().ok())
             .unwrap_or(DEFAULT_BUDGET_LIMIT_USD)
+    }
+
+    /// V0.4.6 F84 — per-workflow budget enforcement.
+    ///
+    /// Reads `WorkflowSpec::budget` (no-op when `None` — `V0.4.5`
+    /// behaviour preserved per PRD §F84 验收 #4). When the rolling
+    /// 24h cost (`cost_summary.cost_24h_usd`) ≥ `max_cost_usd_per_24h`,
+    /// or the rolling 1h spawn count ≥ `max_agent_spawns_per_hour`,
+    /// emits a `budget_exceeded` event and flips
+    /// `workflow.yaml::enabled: false` so the F82 hot-reload watcher
+    /// cancels the event loop on next tick.
+    ///
+    /// **Idempotent**: a previously-disabled workflow re-reads
+    /// disabled and the orchestrator never reaches this call (loop
+    /// exits at `run_project`). If the user manually re-enables but
+    /// the 24h window still exceeds the cap (PRD F84 验收 #2), the
+    /// next tick re-trips — also writes a fresh `budget_exceeded`
+    /// event for audit.
+    ///
+    /// Returns `Ok(true)` when a cap tripped this tick, `Ok(false)`
+    /// otherwise. The caller (event_loop) doesn't act on the return
+    /// value; the hot-reload watcher reacts to the disabled flag.
+    pub async fn enforce_budget(
+        &self,
+        slug: &str,
+        spec: &WorkflowSpec,
+        project_dir: &std::path::Path,
+        progress_path: &std::path::Path,
+    ) -> Result<bool> {
+        let Some(budget) = &spec.budget else {
+            return Ok(false);
+        };
+
+        // F84 stub of F91 — read progress.jsonl once, derive both
+        // 24h cost and 1h spawn count from the same in-memory slice.
+        // When F91's full impl lands, replace the spawn-count line
+        // with whatever F91 publishes; the budget check shape is
+        // unchanged.
+        let events = progress::read_all_events(progress_path).unwrap_or_default();
+        let cost = queries::cost_summary_from_events(&events)?;
+
+        if let Some(cap) = budget.max_cost_usd_per_24h {
+            if cost.cost_24h_usd >= cap {
+                progress::append_event(
+                    progress_path,
+                    &json!({
+                        "event": "budget_exceeded",
+                        "slug": slug,
+                        "kind": "cost_24h",
+                        "value": cost.cost_24h_usd,
+                        "cap": cap,
+                        "ts": Utc::now().to_rfc3339(),
+                    }),
+                )?;
+                tracing::warn!(
+                    slug,
+                    cost_24h = cost.cost_24h_usd,
+                    cap,
+                    "budget cap tripped (cost_24h); auto-disabling workflow"
+                );
+                self.auto_disable_workflow(slug, "budget_exceeded", project_dir, progress_path)
+                    .await?;
+                return Ok(true);
+            }
+        }
+
+        if let Some(rate_cap) = budget.max_agent_spawns_per_hour {
+            let recent_spawns =
+                queries::count_agent_spawns_within(&events, chrono::Duration::hours(1));
+            if recent_spawns >= rate_cap {
+                progress::append_event(
+                    progress_path,
+                    &json!({
+                        "event": "budget_exceeded",
+                        "slug": slug,
+                        "kind": "spawn_rate",
+                        "value": recent_spawns,
+                        "cap": rate_cap,
+                        "ts": Utc::now().to_rfc3339(),
+                    }),
+                )?;
+                tracing::warn!(
+                    slug,
+                    recent_spawns,
+                    cap = rate_cap,
+                    "budget cap tripped (spawn_rate); auto-disabling workflow"
+                );
+                self.auto_disable_workflow(slug, "spawn_rate_exceeded", project_dir, progress_path)
+                    .await?;
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// V0.4.6 F84 — flip `workflow.yaml::enabled: false` + write a
+    /// `workflow_done reason=<reason>` event.
+    ///
+    /// **F82 stub**: F82's hot-reload watcher (parallel worktree) is
+    /// the real consumer — it observes the mtime change, cancels the
+    /// event loop, and the next roster scan sees `enabled: false` and
+    /// skips the project. Until F82 lands, the disabled flag is still
+    /// honoured on next `ccteam start` (run_project early-return
+    /// added by F82). The `workflow_done` event we emit here is the
+    /// audit trail for the budget trip; F82 may emit a second
+    /// `workflow_done reason="disabled"` when the watcher fires — both
+    /// are fine for the meta-agent / UI.
+    ///
+    /// Uses simple text-level mutation (`enabled: false` line insert
+    /// / replace) instead of full YAML round-trip via serde_yaml: the
+    /// latter rewrites the file with serde's normalised form, which
+    /// would clobber user comments + ordering. The mutation is
+    /// idempotent — already-disabled file is left untouched.
+    pub async fn auto_disable_workflow(
+        &self,
+        slug: &str,
+        reason: &str,
+        project_dir: &std::path::Path,
+        progress_path: &std::path::Path,
+    ) -> Result<()> {
+        let workflow_path = workflow_yaml_path_for(project_dir);
+        if let Some(path) = workflow_path {
+            if let Err(err) = patch_workflow_yaml_enabled_false(&path) {
+                tracing::warn!(
+                    slug,
+                    path = %path.display(),
+                    ?err,
+                    "auto_disable_workflow: yaml patch failed; will still emit workflow_done"
+                );
+            }
+        } else {
+            tracing::warn!(
+                slug,
+                "auto_disable_workflow: no workflow.yaml found in project_dir; emitting event only"
+            );
+        }
+
+        progress::append_event(
+            progress_path,
+            &json!({
+                "event": "workflow_done",
+                "slug": slug,
+                "reason": reason,
+                "ts": Utc::now().to_rfc3339(),
+            }),
+        )?;
+        Ok(())
     }
 
     /// Push a meta-agent `btw` escalation file into the inbox dir. F67

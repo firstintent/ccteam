@@ -36,16 +36,65 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::path::{Path, PathBuf};
 
 /// Full `workflow.yaml` document.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct WorkflowSpec {
     /// Workflow identifier (unique within a project).
     pub name: String,
     /// Optional human-readable description for the meta-agent / UI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// V0.4.6 F82: workflow-level on/off switch. `enabled: false` means
+    /// the orchestrator must not spawn new sessions for this project
+    /// (running sessions still drain naturally — never killed per
+    /// CLAUDE.md §三 "永不主动 kill 长 session"). Default `true` keeps
+    /// every existing workflow.yaml backwards-compatible.
+    ///
+    /// **F84 stub note**: F82 lands the watcher + cancel-token wiring
+    /// in a parallel worktree; this field is added here so F84's
+    /// `auto_disable_workflow` has a target to flip. F82 will consume
+    /// the same field with no further schema change.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// V0.4.6 F84: optional budget cap. When set, the orchestrator
+    /// runs [`enforce_budget`] at each tick; tripping a cap emits a
+    /// `budget_exceeded` event and flips `enabled: false` via the F82
+    /// `auto_disable_workflow` codepath. Default `None` (no budget,
+    /// V0.4.5 behaviour) keeps every existing workflow.yaml
+    /// unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<BudgetSpec>,
     /// Role → agent spec. `IndexMap` preserves YAML declaration order so
     /// trigger graph build is deterministic across runs.
     pub agents: IndexMap<String, AgentSpec>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// V0.4.6 F84 — optional `budget` block under workflow.yaml top-level.
+///
+/// ```yaml
+/// budget:
+///   max_cost_usd_per_24h: 5.00         # rolling 24h cost cap
+///   max_agent_spawns_per_hour: 100     # rolling 1h spawn-rate cap
+/// ```
+///
+/// Both fields are optional; a missing field disables that specific
+/// cap (the other still trips). A missing `budget` block entirely
+/// (`None`) → no-op (PRD F84 验收 #4).
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct BudgetSpec {
+    /// Rolling 24h window cost cap (USD). Sum of `agent_done.cost_usd`
+    /// for events with `ts >= now - 24h` ≥ this value → trip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cost_usd_per_24h: Option<f64>,
+    /// Rolling 1h spawn count cap. Number of `agent_spawn` events with
+    /// `ts >= now - 1h` ≥ this value → trip. Defends against
+    /// self-excitation runaway (e.g. explorer writing to its own watch
+    /// dir — observed in dex-ui 2026-05-16 burning $1.10/4h).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_agent_spawns_per_hour: Option<u32>,
 }
 
 /// Per-agent role configuration.
@@ -326,6 +375,8 @@ mod tests {
         let spec = WorkflowSpec {
             name: "x".into(),
             description: None,
+            enabled: true,
+            budget: None,
             agents: {
                 let mut m = IndexMap::new();
                 m.insert(

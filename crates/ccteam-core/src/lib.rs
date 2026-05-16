@@ -114,7 +114,8 @@ pub use projects::{
     pre_trust_project, slugify, slugify_brief, validate_slug_format,
 };
 pub use queries::{
-    collect_projects, collect_recent_events, workflow_summary, AgentStatus, ProjectSummary,
+    collect_projects, collect_recent_events, cost_summary, cost_summary_from_events,
+    count_agent_spawns_within, workflow_summary, AgentStatus, CostSummary, ProjectSummary,
     WorkflowSummary,
 };
 pub use screenshot::{
@@ -179,7 +180,10 @@ pub use watchdog::{
     WatchdogConfig, DEFAULT_NOTIFY_ON_CYCLE_COUNT, WATCHDOG_CONFIG_FILENAME,
 };
 // V0.4.0 F63 — workflow.yaml schema.
-pub use workflow::{AgentSpec, Executor, OnTimeout, Trigger, WorkflowError, WorkflowSpec};
+// V0.4.6 F84 — `BudgetSpec` for `WorkflowSpec::budget` optional cap.
+pub use workflow::{
+    AgentSpec, BudgetSpec, Executor, OnTimeout, Trigger, WorkflowError, WorkflowSpec,
+};
 // V0.4.0 F64 — artifact watcher event types + watcher entry point.
 pub use artifact_watcher::{ArtifactEvent, ArtifactWatcher, WatchKind, DEBOUNCE_WINDOW};
 
