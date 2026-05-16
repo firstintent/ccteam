@@ -1,5 +1,6 @@
 //! `ccteam` binary entry point.
 
+mod clipboard;
 mod commands;
 mod mcp_serve;
 // V0.4.0 F65 — meta-agent MCP workflow tools (7 new). Lives in its own
@@ -138,6 +139,12 @@ enum Command {
         /// `~/.ccteam/web-token`).
         #[arg(long, value_name = "PATH")]
         web_token_file: Option<PathBuf>,
+        /// V0.4.6 F88 — disable the auto-clipboard of the web bearer
+        /// token. Default behavior probes `xclip` / `wl-copy` /
+        /// `pbcopy` / `clip.exe` and copies on first hit; pass this
+        /// flag in CI / headless / unattended runs to skip the probe.
+        #[arg(long, default_value_t = false)]
+        no_clipboard: bool,
     },
     /// V0.4.2 F75: thin wrapper over `ccteam init --in
     /// <projects_root>/<slug>` for users who prefer the "create a
@@ -572,6 +579,7 @@ fn main() -> Result<()> {
             web_bind,
             web_no_auth,
             web_token_file,
+            no_clipboard,
         } => run_start(
             tick_seconds,
             skip_tool_check,
@@ -581,6 +589,7 @@ fn main() -> Result<()> {
                 bind: web_bind,
                 no_auth: web_no_auth,
                 token_file: web_token_file,
+                no_clipboard,
             },
         ),
         Command::New { slug, team } => run_new(slug, team),
@@ -866,6 +875,9 @@ struct StartWebOpts {
     bind: String,
     no_auth: bool,
     token_file: Option<PathBuf>,
+    /// V0.4.6 F88 — when true, skip the clipboard probe in
+    /// `print_web_banner` and just print the token. CI / unattended.
+    no_clipboard: bool,
 }
 
 fn run_start(
@@ -1056,7 +1068,19 @@ fn print_web_banner(paths: &CcteamPaths, web: &StartWebOpts) {
         match ccteam_web::token::generate_or_load_token(&token_path) {
             Ok(hex) => {
                 eprintln!("│  URL:   {display_url}/?token=ccteam:{hex}");
-                eprintln!("│  TOKEN: ccteam:{hex}");
+                // V0.4.6 F88 — auto-copy the token (full `ccteam:<hex>`
+                // form so it round-trips into a curl `-H` or a
+                // browser URL bar) unless --no-clipboard.
+                let token_str = format!("ccteam:{hex}");
+                let suffix = if web.no_clipboard {
+                    String::new()
+                } else {
+                    match clipboard::copy_to_clipboard(&token_str) {
+                        Some(provider) => format!("  (copied to clipboard via {provider})"),
+                        None => "  (clipboard unavailable; copy manually)".to_string(),
+                    }
+                };
+                eprintln!("│  TOKEN: {token_str}{suffix}");
                 eprintln!("│  FILE:  {}", token_path.display());
             }
             Err(err) => {
