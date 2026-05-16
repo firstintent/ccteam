@@ -732,13 +732,22 @@ impl Orchestrator {
                         Ok((slug, Ok(()))) => {
                             tracing::info!(slug, "project event loop ended cleanly");
                             // F82/F86: clear the orphaned cancel sender
-                            // so unroster_project / shutdown don't try
-                            // to send on a closed receiver.
-                            self.cancel_handles.lock().await.remove(&slug);
+                            // ONLY if no successor (`reload_project`) has
+                            // already re-registered for this slug — else
+                            // we'd silently drop the fresh tx and the new
+                            // loop's cancel_rx would resolve Err on the
+                            // next select! tick (V0.4.6 reload race bug
+                            // — observed dex-ui losing its loop within
+                            // 44µs of workflow.yaml mtime change).
+                            if !self.spawned.lock().await.contains(&slug) {
+                                self.cancel_handles.lock().await.remove(&slug);
+                            }
                         }
                         Ok((slug, Err(err))) => {
                             tracing::warn!(slug, error = ?err, "project event loop errored");
-                            self.cancel_handles.lock().await.remove(&slug);
+                            if !self.spawned.lock().await.contains(&slug) {
+                                self.cancel_handles.lock().await.remove(&slug);
+                            }
                         }
                         Err(je) if je.is_cancelled() => {}
                         Err(je) => {
