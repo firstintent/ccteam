@@ -184,8 +184,8 @@ fn parse_trigger(raw: &str) -> Result<Trigger, String> {
 /// Errors surfaced by [`WorkflowSpec::load`] / [`WorkflowSpec::validate`].
 #[derive(thiserror::Error, Debug)]
 pub enum WorkflowError {
-    /// Neither `<project>/workflow.yaml` nor
-    /// `<project>/.ccteam/workflow.yaml` exists.
+    /// Neither `<project>/.ccteam/workflow.yaml` (canonical) nor
+    /// `<project>/workflow.yaml` (legacy V0.4.0–V0.4.5 fallback) exists.
     #[error("workflow.yaml not found in {0:?}")]
     NotFound(PathBuf),
     /// Filesystem read failure (permissions, EIO, etc).
@@ -209,17 +209,18 @@ impl WorkflowSpec {
         Ok(spec)
     }
 
-    /// Discovery: probe `<project_dir>/workflow.yaml` then
-    /// `<project_dir>/.ccteam/workflow.yaml`. Returns
-    /// [`WorkflowError::NotFound`] when neither exists.
+    /// Discovery: probe `<project_dir>/.ccteam/workflow.yaml` first
+    /// (canonical V0.4.6+ location), then fall back to
+    /// `<project_dir>/workflow.yaml` (V0.4.0–V0.4.5 legacy; removed in
+    /// V0.5). Returns [`WorkflowError::NotFound`] when neither exists.
     pub fn load_for_project(project_dir: &Path) -> Result<Self, WorkflowError> {
-        let direct = project_dir.join("workflow.yaml");
-        if direct.exists() {
-            return Self::load(&direct);
-        }
         let nested = project_dir.join(".ccteam").join("workflow.yaml");
         if nested.exists() {
             return Self::load(&nested);
+        }
+        let direct = project_dir.join("workflow.yaml");
+        if direct.exists() {
+            return Self::load(&direct);
         }
         Err(WorkflowError::NotFound(project_dir.to_path_buf()))
     }

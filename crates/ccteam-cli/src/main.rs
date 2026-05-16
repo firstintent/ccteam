@@ -326,6 +326,20 @@ enum Command {
         /// `watchdog.yaml.migrated`. Idempotent.
         #[arg(long, default_value_t = false)]
         migrate_v041_to_v042: bool,
+        /// V0.4.6 F83: move every registered project's root
+        /// `workflow.yaml` into `<project>/.ccteam/workflow.yaml`.
+        /// Default is dry-run; pass `--apply` (i.e. clear `--dry-run`'s
+        /// inverse semantics — see below) to actually move the files.
+        /// Conflicts (both locations populated) are fail-safe — neither
+        /// file is touched and the user is told to resolve by hand.
+        /// Idempotent.
+        #[arg(long, default_value_t = false)]
+        migrate_workflow_to_ccteam_dir: bool,
+        /// V0.4.6 F83: pair with `--migrate-workflow-to-ccteam-dir` to
+        /// perform the moves instead of previewing them. Without this
+        /// flag the migration runs in dry-run mode.
+        #[arg(long, default_value_t = false)]
+        apply: bool,
     },
     /// V0.2 M0.18.6: render the orchestrator's per-phase inject
     /// prompt (frontmatter-driven) plus the `@`-referenced phase
@@ -612,11 +626,7 @@ fn main() -> Result<()> {
             let paths = CcteamPaths::from_env()?;
             run_send(&paths, &slug, role.as_deref(), no_spawn, &body)
         }
-        Command::Spawn {
-            slug,
-            role,
-            prompt,
-        } => {
+        Command::Spawn { slug, role, prompt } => {
             let paths = CcteamPaths::from_env()?;
             run_spawn(&paths, &slug, &role, prompt.as_deref())
         }
@@ -650,14 +660,27 @@ fn main() -> Result<()> {
             migrate_recommended_agents,
             screenshot_smoke,
             migrate_v041_to_v042,
+            migrate_workflow_to_ccteam_dir,
+            apply,
         } => {
             // V0.4.1 `--install-all` is sugar for the three first-run
             // flags. Explicit flags still win where set; we OR them.
             let final_mcp = install_mcp || install_all;
             let final_skill = install_skill || install_all;
             let final_meta = install_meta_agent || install_all;
+            // V0.4.6 F83: `--apply` inverts the default dry-run for the
+            // F83 migration so users who forget `--apply` can preview
+            // safely. `--dry-run` still wins if explicitly set (e.g.
+            // `--migrate-workflow-to-ccteam-dir --apply --dry-run` will
+            // still dry-run, matching how `--migrate-v041-to-v042` honors
+            // the global `--dry-run` flag).
+            let f83_dry_run = if migrate_workflow_to_ccteam_dir {
+                dry_run || !apply
+            } else {
+                dry_run
+            };
             run_doctor(commands::DoctorOptions {
-                dry_run,
+                dry_run: f83_dry_run,
                 force,
                 tool_surface,
                 install_skill: final_skill,
@@ -669,6 +692,7 @@ fn main() -> Result<()> {
                 migrate_recommended_agents,
                 screenshot_smoke,
                 migrate_v041_to_v042,
+                migrate_workflow_to_ccteam_dir,
             })
         }
         Command::Phase { cmd } => run_phase(cmd),
@@ -1237,10 +1261,7 @@ fn run_send(
 ) -> Result<()> {
     let project_dir = paths.project_dir(slug);
     if !project_dir.exists() {
-        anyhow::bail!(
-            "no project `{slug}` at {}",
-            project_dir.display()
-        );
+        anyhow::bail!("no project `{slug}` at {}", project_dir.display());
     }
     let body = read_body_or_stdin(body)?;
     let body = body.trim();
@@ -1286,8 +1307,7 @@ fn run_send(
     };
     // Atomic write: .tmp then rename (matches inbox.rs::save).
     let tmp = path.with_extension("md.tmp");
-    std::fs::write(&tmp, &frontmatter)
-        .with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::write(&tmp, &frontmatter).with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, &path)
         .with_context(|| format!("rename {} → {}", tmp.display(), path.display()))?;
     println!("queued inbox message: {}", path.display());
@@ -1301,18 +1321,10 @@ fn run_send(
     Ok(())
 }
 
-fn run_spawn(
-    paths: &CcteamPaths,
-    slug: &str,
-    role: &str,
-    prompt: Option<&str>,
-) -> Result<()> {
+fn run_spawn(paths: &CcteamPaths, slug: &str, role: &str, prompt: Option<&str>) -> Result<()> {
     let project_dir = paths.project_dir(slug);
     if !project_dir.exists() {
-        anyhow::bail!(
-            "no project `{slug}` at {}",
-            project_dir.display()
-        );
+        anyhow::bail!("no project `{slug}` at {}", project_dir.display());
     }
     // Validate the role exists in workflow.yaml so we fail loud here
     // instead of letting the orchestrator silently delete the marker
@@ -1327,12 +1339,8 @@ fn run_spawn(
     }
 
     let bucket = project_dir.join(".ccteam").join("spawn_requests");
-    std::fs::create_dir_all(&bucket)
-        .with_context(|| format!("create {}", bucket.display()))?;
-    let session_id = format!(
-        "{role}-{}",
-        chrono::Utc::now().timestamp_micros()
-    );
+    std::fs::create_dir_all(&bucket).with_context(|| format!("create {}", bucket.display()))?;
+    let session_id = format!("{role}-{}", chrono::Utc::now().timestamp_micros());
     let marker = bucket.join(format!("{session_id}.json"));
 
     let resolved_prompt = match prompt {
@@ -1356,7 +1364,10 @@ fn run_spawn(
     println!("  session_id: {session_id}");
     if let Some(p) = resolved_prompt.as_deref() {
         let head: String = p.chars().take(80).collect();
-        println!("  prompt:     {head}{}", if p.len() > 80 { "…" } else { "" });
+        println!(
+            "  prompt:     {head}{}",
+            if p.len() > 80 { "…" } else { "" }
+        );
     } else {
         println!("  prompt:     <default kick prompt>");
     }
@@ -1370,8 +1381,8 @@ fn run_new(slug: String, team: String) -> Result<()> {
     // V0.4.3 F76: fail loud at the CLI boundary on invalid slug grammar
     // (whitespace / unicode / leading dash etc.) so we don't spawn
     // `~/projects/<garbage>/` and leave junk for the user to clean up.
-    let validated = ccteam_core::validate_slug_format(&slug)
-        .with_context(|| format!("ccteam new {slug:?}"))?;
+    let validated =
+        ccteam_core::validate_slug_format(&slug).with_context(|| format!("ccteam new {slug:?}"))?;
     let paths = CcteamPaths::from_env()?;
     // V0.4.2 F75: `ccteam new <slug>` delegates to `ccteam init` with
     // `install_in = <projects_root>/<final_slug>`. F22 invariant: if

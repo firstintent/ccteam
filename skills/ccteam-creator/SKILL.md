@@ -158,8 +158,11 @@ agents:                             # required, ≥ 1 entry
 ```
 
 ### Path to write
-`<project>/workflow.yaml` (root) — orchestrator also accepts
-`<project>/.ccteam/workflow.yaml`. Pick root unless there's a reason.
+`<project>/.ccteam/workflow.yaml` (V0.4.6 F83+ canonical) — orchestrator
+also accepts the legacy `<project>/workflow.yaml` (V0.4.0–V0.4.5
+fallback, removed in V0.5). New workflows go in `.ccteam/`; the
+orchestrator's discovery order prefers `.ccteam/` when both are
+present.
 
 ### Validation
 Daemon parses on rescan (10s tick). On load you should see in the daemon
