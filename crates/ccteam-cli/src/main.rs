@@ -194,6 +194,11 @@ enum Command {
     /// hand-write the markdown frontmatter. Orchestrator auto-routes
     /// the message to a worker (or the meta-agent in V0.4.1+) on
     /// the next tick.
+    ///
+    /// F87: `disable_help_flag` so a literal `--help` in the body is
+    /// not intercepted by clap as the subcommand's own help. Users
+    /// who want help should run `ccteam help send` instead.
+    #[command(disable_help_flag = true)]
     Send {
         /// Project slug (or meta-agent handle for meta-agent inbox).
         slug: String,
@@ -206,13 +211,22 @@ enum Command {
         /// message is archived for audit only (no auto-spawn).
         #[arg(long, default_value_t = false)]
         no_spawn: bool,
-        /// Message body. Use `-` to read from stdin.
+        /// Message body. Use `-` to read from stdin. Leading hyphens
+        /// are accepted as literal text (F87) so `ccteam send <slug>
+        /// "--help"` forwards the string to the agent instead of
+        /// triggering ccteam's own help.
+        #[arg(allow_hyphen_values = true)]
         body: String,
     },
     /// Trigger a fresh spawn of `<role>` in `<slug>` with an optional
     /// kick prompt. Writes a `.ccteam/spawn_requests/<role>-<ts>.json`
     /// marker the orchestrator picks up on its next tick. CLI shortcut
     /// for the MCP `ccteam__spawn_agent` tool.
+    ///
+    /// F87: `disable_help_flag` so a literal `--help` in the prompt is
+    /// not intercepted by clap as the subcommand's own help. Users
+    /// who want help should run `ccteam help spawn` instead.
+    #[command(disable_help_flag = true)]
     Spawn {
         /// Project slug.
         slug: String,
@@ -220,7 +234,9 @@ enum Command {
         role: String,
         /// Optional initial prompt. Falls back to the default kick
         /// prompt when omitted (let the role's `.claude/agents/<role>.md`
-        /// drive). Use `-` to read from stdin.
+        /// drive). Use `-` to read from stdin. Leading hyphens are
+        /// accepted as literal text (F87).
+        #[arg(allow_hyphen_values = true)]
         prompt: Option<String>,
     },
     /// List the cross-project decisions queue — every project's
