@@ -10,16 +10,16 @@
     "SessionStart": [
       {
         "hooks": [
-          {"type": "command", "command": "__CCTEAM_BIN__ hook load-context", "timeout": 5},
-          {"type": "command", "command": "__CCTEAM_BIN__ hook progress-append session_start", "async": true}
+          {"type": "command", "command": "__CCTEAM_BIN__ internal hook load-context", "timeout": 5},
+          {"type": "command", "command": "__CCTEAM_BIN__ internal hook progress-append session_start", "async": true}
         ]
       }
     ],
     "Stop": [
       {
         "hooks": [
-          {"type": "command", "command": "__CCTEAM_BIN__ hook parse-phase-end", "timeout": 10},
-          {"type": "command", "command": "__CCTEAM_BIN__ hook progress-append Stop", "async": true}
+          {"type": "command", "command": "__CCTEAM_BIN__ internal hook parse-phase-end", "timeout": 10},
+          {"type": "command", "command": "__CCTEAM_BIN__ internal hook progress-append Stop", "async": true}
         ]
       }
     ],
@@ -27,42 +27,42 @@
       {
         "matcher": "idle_prompt|permission_prompt",
         "hooks": [
-          {"type": "command", "command": "__CCTEAM_BIN__ hook progress-append notification", "async": true}
+          {"type": "command", "command": "__CCTEAM_BIN__ internal hook progress-append notification", "async": true}
         ]
       }
     ],
     "PreToolUse": [
       {
         "hooks": [
-          {"type": "command", "command": "__CCTEAM_BIN__ hook progress-append PreToolUse", "async": true}
+          {"type": "command", "command": "__CCTEAM_BIN__ internal hook progress-append PreToolUse", "async": true}
         ]
       },
       {
         "matcher": "AskUserQuestion",
         "hooks": [
-          {"type": "command", "command": "__CCTEAM_BIN__ hook intercept-ask", "timeout": 5}
+          {"type": "command", "command": "__CCTEAM_BIN__ internal hook intercept-ask", "timeout": 5}
         ]
       }
     ],
     "PostToolUse": [
       {
         "hooks": [
-          {"type": "command", "command": "__CCTEAM_BIN__ hook progress-append PostToolUse", "async": true},
-          {"type": "command", "command": "__CCTEAM_BIN__ hook cost-accumulate", "async": true}
+          {"type": "command", "command": "__CCTEAM_BIN__ internal hook progress-append PostToolUse", "async": true},
+          {"type": "command", "command": "__CCTEAM_BIN__ internal hook cost-accumulate", "async": true}
         ]
       }
     ],
     "SubagentStop": [
       {
         "hooks": [
-          {"type": "command", "command": "__CCTEAM_BIN__ hook progress-append SubagentStop", "async": true}
+          {"type": "command", "command": "__CCTEAM_BIN__ internal hook progress-append SubagentStop", "async": true}
         ]
       }
     ],
     "SessionEnd": [
       {
         "hooks": [
-          {"type": "command", "command": "__CCTEAM_BIN__ hook progress-append SessionEnd", "async": true}
+          {"type": "command", "command": "__CCTEAM_BIN__ internal hook progress-append SessionEnd", "async": true}
         ]
       }
     ]

@@ -608,24 +608,42 @@ pub fn rewrite_legacy_hook_commands(
     })
 }
 
-/// V0.2.2 F44: rewrite one hook `command` string. Returns `None` when
-/// the command does not look like an F39-era `cct hook …` invocation
-/// (so the caller can leave it alone — preserves operator-authored
-/// hooks). Otherwise returns the rewritten string with the binary path
-/// swapped to `new_bin` (the canonical `ccteam` binary).
+/// V0.2.2 F44 + V0.4.6 F89: rewrite one hook `command` string.
+///
+/// Returns `None` when the command is already pointing at the new
+/// `<ccteam> internal hook …` form (idempotency) **or** does not look
+/// like a ccteam-managed hook (so operator-authored hooks survive
+/// untouched). Otherwise returns the rewritten string with the binary
+/// path swapped to `new_bin` and the post-binary tail rewritten to
+/// `internal hook …`.
+///
+/// Migration paths handled:
+/// - F44: `/.../cct hook …` (F39 binary name) → `/<new_bin> internal hook …`
+/// - F44: bare `cct hook …`                     → `<new_bin> internal hook …`
+/// - F89: `/.../ccteam hook …` (V0.4.5 path)    → `/<new_bin> internal hook …`
+/// - F89: bare `ccteam hook …`                  → `<new_bin> internal hook …`
 fn rewrite_one_hook_command(cmd: &str, new_bin: &str) -> Option<String> {
-    // Already pointing at the canonical `ccteam` binary? Idempotency.
-    if cmd.contains("/ccteam hook ") || cmd.starts_with("ccteam hook ") {
+    // Already on the new `internal hook` form? Idempotency.
+    if cmd.contains("/ccteam internal hook ") || cmd.starts_with("ccteam internal hook ") {
         return None;
     }
-    // Absolute path ending with `/cct hook …` (F39 binary name).
+    // F44 — absolute path ending with `/cct hook …` (F39 binary name).
     if let Some(idx) = cmd.find("/cct hook ") {
-        let tail = &cmd[idx + "/cct".len()..];
-        return Some(format!("{new_bin}{tail}"));
+        let after = &cmd[idx + "/cct hook ".len()..];
+        return Some(format!("{new_bin} internal hook {after}"));
     }
-    // Bare `cct hook …` with no path prefix (uncommon but legal).
+    // F44 — bare `cct hook …` with no path prefix (uncommon but legal).
     if let Some(rest) = cmd.strip_prefix("cct hook ") {
-        return Some(format!("{new_bin} hook {rest}"));
+        return Some(format!("{new_bin} internal hook {rest}"));
+    }
+    // F89 — absolute path ending with `/ccteam hook …` (V0.4.5 form).
+    if let Some(idx) = cmd.find("/ccteam hook ") {
+        let after = &cmd[idx + "/ccteam hook ".len()..];
+        return Some(format!("{new_bin} internal hook {after}"));
+    }
+    // F89 — bare `ccteam hook …` (V0.4.5 form, no path prefix).
+    if let Some(rest) = cmd.strip_prefix("ccteam hook ") {
+        return Some(format!("{new_bin} internal hook {rest}"));
     }
     None
 }
@@ -998,6 +1016,7 @@ mod tests {
 
     #[test]
     fn rewrite_legacy_hook_commands_swaps_absolute_path() {
+        // V0.4.6 F89: F44 rewriter now lands on `internal hook …` form.
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("settings.json");
         std::fs::write(&path, legacy_settings_json("/home/u/.cargo/bin/cct")).unwrap();
@@ -1006,7 +1025,7 @@ mod tests {
         assert_eq!(rep.action, HookCmdRewriteAction::Rewrote { entries: 3 });
         let body = std::fs::read_to_string(&path).unwrap();
         assert!(
-            body.contains("/home/u/.cargo/bin/ccteam hook load-context"),
+            body.contains("/home/u/.cargo/bin/ccteam internal hook load-context"),
             "got: {body}"
         );
         assert!(!body.contains("/cct hook"), "F39-era path survived: {body}");
@@ -1029,13 +1048,52 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_legacy_hook_commands_idempotent_when_already_ccteam() {
+    fn rewrite_legacy_hook_commands_idempotent_when_already_internal_hook() {
+        // V0.4.6 F89: idempotency anchor moved from `<bin> hook …` to
+        // `<bin> internal hook …`. A settings.json that's already been
+        // migrated to the new path must be a no-op the second pass.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("settings.json");
+        let already_migrated = r#"{
+  "hooks": {
+    "SessionStart": [
+      {"hooks": [
+        {"type": "command", "command": "/home/u/.cargo/bin/ccteam internal hook load-context"},
+        {"type": "command", "command": "/home/u/.cargo/bin/ccteam internal hook progress-append session_start"}
+      ]}
+    ],
+    "Stop": [
+      {"hooks": [{"type": "command", "command": "/home/u/.cargo/bin/ccteam internal hook parse-phase-end"}]}
+    ]
+  }
+}"#;
+        std::fs::write(&path, already_migrated).unwrap();
+        let new_bin = PathBuf::from("/home/u/.cargo/bin/ccteam");
+        let rep = rewrite_legacy_hook_commands(&path, &new_bin, false).unwrap();
+        assert_eq!(rep.action, HookCmdRewriteAction::NoChangeNeeded);
+    }
+
+    #[test]
+    fn rewrite_legacy_hook_commands_migrates_v045_ccteam_hook_to_internal() {
+        // V0.4.6 F89: V0.4.5 settings.json with `<bin> hook …` rewrites
+        // to `<bin> internal hook …`. Catches user upgrades that
+        // never ran `ccteam doctor --update-hooks` between V0.4.x and
+        // V0.4.6.
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("settings.json");
         std::fs::write(&path, legacy_settings_json("/home/u/.cargo/bin/ccteam")).unwrap();
         let new_bin = PathBuf::from("/home/u/.cargo/bin/ccteam");
         let rep = rewrite_legacy_hook_commands(&path, &new_bin, false).unwrap();
-        assert_eq!(rep.action, HookCmdRewriteAction::NoChangeNeeded);
+        assert_eq!(rep.action, HookCmdRewriteAction::Rewrote { entries: 3 });
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            body.contains("/home/u/.cargo/bin/ccteam internal hook load-context"),
+            "got: {body}"
+        );
+        assert!(
+            !body.contains("ccteam hook load-context"),
+            "V0.4.5 path must not survive: {body}",
+        );
     }
 
     #[test]
@@ -1052,7 +1110,17 @@ mod tests {
         let got = rewrite_one_hook_command("cct hook progress-append PreToolUse", "/x/ccteam");
         assert_eq!(
             got.as_deref(),
-            Some("/x/ccteam hook progress-append PreToolUse"),
+            Some("/x/ccteam internal hook progress-append PreToolUse"),
+        );
+    }
+
+    #[test]
+    fn rewrite_one_hook_command_handles_bare_ccteam_prefix() {
+        // V0.4.6 F89: V0.4.5's bare `ccteam hook …` form migrates too.
+        let got = rewrite_one_hook_command("ccteam hook progress-append PreToolUse", "/x/ccteam");
+        assert_eq!(
+            got.as_deref(),
+            Some("/x/ccteam internal hook progress-append PreToolUse"),
         );
     }
 
