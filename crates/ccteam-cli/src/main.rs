@@ -242,6 +242,45 @@ enum Command {
     /// tmux sessions — `ccteam start` reattaches to them on next launch
     /// (M1.5).
     Stop,
+    /// V0.4.6 F81 — un-roster a project: drop the slug from
+    /// `~/.ccteam/config.yaml::projects[]`, scrub the orchestration
+    /// state (`~/.ccteam/progress/<slug>.jsonl`, `~/.ccteam/inbox/<slug>/`,
+    /// `~/.ccteam/control/<slug>/`), and ask the running daemon to
+    /// hot-unroster the loop (F82 wiring). With `--purge`, also
+    /// `rm -rf <project>/.ccteam/`, `<project>/.claude/agents/`, and
+    /// `<project>/workflow.yaml` (and `.ccteam/workflow.yaml` per F83).
+    ///
+    /// **Red lines** (CLAUDE.md §三):
+    /// - Refuses when an active tmux session, claude --bg job, or
+    ///   open `agent_spawn` row points at the project. `--force`
+    ///   overrides this guard.
+    /// - **Never deletes `<project>/.env`** — user secrets stay
+    ///   regardless of `--purge`.
+    /// - **Never touches business code** — only ccteam-managed paths
+    ///   under `.ccteam/`, `.claude/agents/`, and `workflow.yaml`.
+    Remove {
+        /// Project slug as listed in `ccteam ls` / registered under
+        /// `~/.ccteam/config.yaml::projects[]`.
+        slug: String,
+        /// Also delete `<project>/.ccteam/`, `<project>/.claude/agents/`,
+        /// and `<project>/workflow.yaml` (and `.ccteam/workflow.yaml`
+        /// per F83). Default leaves the project directory contents
+        /// alone (config-only deregister, equivalent to the
+        /// "abandon" verb in the PRD).
+        #[arg(long, default_value_t = false)]
+        purge: bool,
+        /// Print every step that would change the filesystem / config /
+        /// daemon roster, but don't touch anything. Combine with
+        /// `--purge` to see the full clobber list.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Skip the CLAUDE.md §三 "永不主动 kill 长 session" refusal
+        /// gate (tmux / claude bg / open spawn checks). Use only when
+        /// you've already drained the project's live work and the
+        /// guard is a false positive.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
     /// Health checks + tool-surface maintenance.
     Doctor {
         /// Print + return what would happen without touching the
@@ -636,6 +675,25 @@ fn main() -> Result<()> {
             runtime.block_on(mcp_serve::run_mcp_serve(paths))
         }
         Command::Stop => run_stop(),
+        Command::Remove {
+            slug,
+            purge,
+            dry_run,
+            force,
+        } => {
+            let paths = CcteamPaths::from_env()?;
+            let report = commands::run_remove(
+                &paths,
+                &slug,
+                commands::RemoveOptions {
+                    purge,
+                    dry_run,
+                    force,
+                },
+            )?;
+            print!("{report}");
+            Ok(())
+        }
         Command::Doctor {
             dry_run,
             force,

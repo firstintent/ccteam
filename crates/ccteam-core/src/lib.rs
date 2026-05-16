@@ -111,7 +111,8 @@ pub use progress::{
 };
 pub use projects::{
     bootstrap_project, bootstrap_project_at_dir, pick_unused_slug, pick_unused_slug_verbatim,
-    pre_trust_project, slugify, slugify_brief, validate_slug_format,
+    pre_trust_project, refuses_active_session, slugify, slugify_brief, validate_slug_format,
+    ActiveSessionRefusal,
 };
 pub use queries::{
     collect_projects, collect_recent_events, workflow_summary, AgentStatus, ProjectSummary,

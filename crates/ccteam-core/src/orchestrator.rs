@@ -207,6 +207,68 @@ impl Orchestrator {
         &self.paths
     }
 
+    /// V0.4.6 F81 — request that the orchestrator stop tracking `slug`
+    /// (used by `ccteam remove` once `~/.ccteam/config.yaml::projects[]`
+    /// no longer carries the slug). Returns `Ok(true)` if the slug
+    /// had in-memory state worth dropping, `Ok(false)` otherwise.
+    ///
+    /// **F81 stub — F82 will replace.** Wave-2 work (this finding)
+    /// runs in parallel with F82's cancellation-token rewrite; the
+    /// production version will tear down the project's `tokio::spawn`
+    /// task via the F82 cancel channel and emit a `workflow_done
+    /// reason="removed"` event. This stub only clears the in-memory
+    /// HashMap entries (`running`, `pending`, `fail_counts`,
+    /// `gate_states`) so the orchestrator's next tick rediscovers
+    /// "slug is gone" from the config registry on its own. Daemons
+    /// running V0.4.5 keep working until the rostered loop's next
+    /// `spawn_new_rostered_projects` pass sees the config no longer
+    /// lists `slug` — same eventual-consistency window the user
+    /// already accepts on `ccteam start` restart.
+    pub async fn unroster_project(&self, slug: &str) -> Result<bool> {
+        let mut touched = false;
+        {
+            let mut running = self.running.lock().await;
+            if running.remove(slug).is_some() {
+                touched = true;
+            }
+        }
+        {
+            let mut pending = self.pending.lock().await;
+            if pending.remove(slug).is_some() {
+                touched = true;
+            }
+        }
+        {
+            let mut fails = self.fail_counts.lock().await;
+            // gate / fail-count keys are `<slug>::<role>` — strip every
+            // entry beginning with `<slug>::`.
+            let prefix = format!("{slug}::");
+            let drained: Vec<String> = fails
+                .keys()
+                .filter(|k| k.starts_with(&prefix))
+                .cloned()
+                .collect();
+            for k in drained {
+                fails.remove(&k);
+                touched = true;
+            }
+        }
+        {
+            let mut gates = self.gate_states.lock().await;
+            let prefix = format!("{slug}::");
+            let drained: Vec<String> = gates
+                .keys()
+                .filter(|k| k.starts_with(&prefix))
+                .cloned()
+                .collect();
+            for k in drained {
+                gates.remove(&k);
+                touched = true;
+            }
+        }
+        Ok(touched)
+    }
+
     fn adapter_for(&self, exec: Executor) -> Option<&Arc<dyn HarnessAdapter + Send + Sync>> {
         let key: &'static str = match exec {
             Executor::Claude => "claude",

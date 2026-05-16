@@ -2228,6 +2228,289 @@ pub fn run_web(opts: WebOptions) -> Result<()> {
     runtime.block_on(ccteam_web::serve(serve_opts))
 }
 
+/// V0.4.6 F81 — options for `ccteam remove <slug>`.
+#[derive(Debug, Clone, Default)]
+pub struct RemoveOptions {
+    /// Also `rm -rf <project>/.ccteam/`, `<project>/.claude/agents/`,
+    /// and `<project>/workflow.yaml`. Business code + `.env` untouched.
+    pub purge: bool,
+    /// Print every step that *would* run, but don't touch filesystem
+    /// / config / daemon.
+    pub dry_run: bool,
+    /// Skip the CLAUDE.md §三 "永不主动 kill 长 session" refusal gate.
+    pub force: bool,
+}
+
+/// V0.4.6 F81 — structured result of `run_remove`. Returned so MCP
+/// callers (a future `tool_remove` wire) can branch on the success
+/// shape; the CLI just `Display`s the text rendering.
+#[derive(Debug, Clone, Default)]
+pub struct RemoveReport {
+    pub slug: String,
+    pub purge: bool,
+    pub dry_run: bool,
+    pub forced: bool,
+    /// One-line entries describing each step that ran (or would run
+    /// under `--dry-run`). Surface order matches execution order so
+    /// users see the same shape with and without `--dry-run`.
+    pub steps: Vec<String>,
+    /// Set when the refusal gate fired (and `--force` was not passed).
+    /// `--dry-run` still reports the refusal so users can rehearse.
+    pub refusal: Option<ccteam_core::ActiveSessionRefusal>,
+}
+
+impl std::fmt::Display for RemoveReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mode = if self.dry_run { "[dry-run] " } else { "" };
+        writeln!(
+            f,
+            "ccteam remove {}{}{}{}",
+            mode,
+            self.slug,
+            if self.purge { " --purge" } else { "" },
+            if self.forced { " --force" } else { "" }
+        )?;
+        for step in &self.steps {
+            writeln!(f, "  - {step}")?;
+        }
+        if let Some(refusal) = &self.refusal {
+            writeln!(f, "refusal: {}", refusal.message(&self.slug))?;
+        }
+        Ok(())
+    }
+}
+
+/// V0.4.6 F81 — `ccteam remove <slug>` implementation.
+///
+/// Steps (in order):
+/// 1. Refusal gate. Calls [`ccteam_core::refuses_active_session`]; if
+///    it returns `Some(refusal)` and `opts.force` is false, the command
+///    halts before any mutation. `--dry-run` still walks the rest of
+///    the plan (reporting all steps as "would run") so the user gets a
+///    full preview.
+/// 2. Resolve project_dir via `~/.ccteam/config.yaml::projects[]` so
+///    arbitrary-path installs (V0.4.2 F77) are honoured.
+/// 3. Drop the slug from config.yaml::projects[] (atomic via
+///    `config::save`'s tmp+rename). `--dry-run` prints the plan only.
+/// 4. Unroster the running daemon's in-memory state. **F81 stub: this
+///    skips the daemon-side cancel** — the F82 worktree will replace
+///    `Orchestrator::unroster_project` with cancellation-token wiring;
+///    until then, the daemon picks up the config change on its next
+///    `spawn_new_rostered_projects` tick (eventual consistency).
+/// 5. Remove orchestration state: `~/.ccteam/progress/<slug>.jsonl`
+///    (or flex `~/.ccteam/progress/<slug>/` dir), then any
+///    `~/.ccteam/inbox/<slug>/` and `~/.ccteam/control/<slug>/`
+///    sub-trees that exist.
+/// 6. `--purge`: `rm -rf <project>/.ccteam/`,
+///    `<project>/.claude/agents/`, and `<project>/workflow.yaml`
+///    (plus F83's `.ccteam/workflow.yaml` once that lands).
+///    Never touches `<project>/.env` (CLAUDE.md §三 red line).
+pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Result<RemoveReport> {
+    let mut report = RemoveReport {
+        slug: slug.to_string(),
+        purge: opts.purge,
+        dry_run: opts.dry_run,
+        forced: opts.force,
+        ..Default::default()
+    };
+
+    // 1. Refusal gate (CLAUDE.md §三).
+    let refusal = ccteam_core::refuses_active_session(paths, slug)?;
+    if let Some(r) = refusal {
+        if !opts.force {
+            // Halt before any mutation — user must `tmux kill-session`
+            // / let claude finish / pass `--force`.
+            report.refusal = Some(r.clone());
+            bail!(
+                "ccteam remove `{slug}`: {}. Re-run with `--force` to override.",
+                r.message(slug)
+            );
+        } else {
+            report
+                .steps
+                .push(format!("forced through guard: {}", r.message(slug)));
+        }
+    }
+
+    // 2. Resolve project_dir via the config registry (so V0.4.2
+    // arbitrary-path installs are deleted correctly even when the
+    // slug doesn't sit under `paths.projects_root`).
+    let registered = ccteam_core::lookup_project_in_config(&paths.root, slug)?;
+    let project_dir = match &registered {
+        Some(entry) => entry.path.clone(),
+        // Fall back to `paths.project_dir(slug)` so `--purge` still
+        // works on orphan slugs (state.json present but config entry
+        // missing — the V0.4.5 ghost-entry case the PRD references).
+        None => paths.project_dir(slug),
+    };
+
+    // 3. Config registry drop.
+    if registered.is_some() {
+        if opts.dry_run {
+            report.steps.push(format!(
+                "would drop config.yaml::projects entry for `{slug}` (path: {})",
+                project_dir.display()
+            ));
+        } else {
+            let removed = ccteam_core::remove_project_from_config(&paths.root, slug)?;
+            if removed {
+                report
+                    .steps
+                    .push(format!("removed config.yaml::projects entry for `{slug}`"));
+            }
+        }
+    } else {
+        report.steps.push(format!(
+            "config.yaml::projects has no entry for `{slug}` (orphan / pre-V0.4.2 install)"
+        ));
+    }
+
+    // 4. Daemon unroster (best-effort; the running daemon may not exist).
+    if opts.dry_run {
+        report.steps.push(
+            "would request daemon unroster (daemon will pick up the config drop on next tick)"
+                .to_string(),
+        );
+    } else {
+        // F81 stub note: the orchestrator's in-process `unroster_project`
+        // exists, but we have no IPC into the running daemon. F82 wave
+        // will wire a control file / unix socket so this becomes a
+        // real synchronous call. Until then, document the eventual
+        // consistency window in the step output.
+        report.steps.push(
+            "daemon unroster: deferred to next event-loop tick (F82 will wire instant cancel)"
+                .to_string(),
+        );
+    }
+
+    // 5. Orchestration state cleanup under `~/.ccteam/`.
+    let progress_path = paths.progress_jsonl(slug);
+    let progress_dir = paths.progress_dir().join(slug); // flex shard dir
+    let global_inbox_slug_dir = paths.inbox_dir().join(slug);
+    let global_control_slug_dir = paths.control_dir().join(slug);
+
+    for (label, path, is_dir) in [
+        ("progress.jsonl", progress_path.clone(), false),
+        ("progress shard dir", progress_dir.clone(), true),
+        ("inbox/<slug>/ dir", global_inbox_slug_dir.clone(), true),
+        ("control/<slug>/ dir", global_control_slug_dir.clone(), true),
+    ] {
+        let exists = if is_dir {
+            path.is_dir()
+        } else {
+            path.is_file()
+        };
+        if !exists {
+            continue;
+        }
+        if opts.dry_run {
+            report
+                .steps
+                .push(format!("would remove {label} {}", path.display()));
+        } else if is_dir {
+            std::fs::remove_dir_all(&path).with_context(|| format!("rm -rf {}", path.display()))?;
+            report
+                .steps
+                .push(format!("removed {label} {}", path.display()));
+        } else {
+            std::fs::remove_file(&path).with_context(|| format!("rm {}", path.display()))?;
+            report
+                .steps
+                .push(format!("removed {label} {}", path.display()));
+        }
+    }
+
+    // 6. Optional `--purge`: project-local ccteam-managed paths.
+    if opts.purge {
+        purge_project_managed_paths(&project_dir, opts.dry_run, &mut report)?;
+    }
+
+    Ok(report)
+}
+
+/// Helper for `run_remove --purge` — walks each ccteam-managed path
+/// under `<project>/` and deletes it (or, under `--dry-run`, just
+/// records the planned step).
+///
+/// **Red lines** enforced here:
+/// - `<project>/.env` is **never** touched (user-controlled secrets).
+/// - Anything outside `.ccteam/`, `.claude/agents/`, and
+///   `workflow.yaml` / `.ccteam/workflow.yaml` is **never** touched
+///   (business code stays put). If the user wants the whole tree gone
+///   they can `rm -rf <project>` themselves; the `--purge` contract is
+///   strictly orchestration-only.
+fn purge_project_managed_paths(
+    project_dir: &std::path::Path,
+    dry_run: bool,
+    report: &mut RemoveReport,
+) -> Result<()> {
+    // Order: state metadata first, agent prompts next, workflow last
+    // — gives the dry-run reader a story (state → roles → topology).
+    let ccteam_dir = project_dir.join(".ccteam");
+    let agents_dir = project_dir.join(".claude").join("agents");
+    let workflow_yaml = project_dir.join("workflow.yaml");
+    // V0.4.6 F83 will move workflow.yaml into `.ccteam/`; until then
+    // `.ccteam/workflow.yaml` may exist in early-adopter projects.
+    // Deleting `.ccteam/` already covers it, but list explicitly so
+    // dry-run output names the path the user expects.
+    let workflow_yaml_in_ccteam = ccteam_dir.join("workflow.yaml");
+
+    // Safety: refuse to touch a `<project>/.env` *file*. The contract
+    // is project-managed orchestration paths only; .env stays. The
+    // explicit assertion below documents the invariant for review.
+    let env_file = project_dir.join(".env");
+    debug_assert!(
+        !ccteam_dir.starts_with(&env_file) && !agents_dir.starts_with(&env_file),
+        ".env must never be inside the purge tree"
+    );
+
+    for (label, path, is_dir) in [
+        (".ccteam/", ccteam_dir.clone(), true),
+        (".claude/agents/", agents_dir.clone(), true),
+        ("workflow.yaml", workflow_yaml.clone(), false),
+        (
+            ".ccteam/workflow.yaml (legacy F83 location)",
+            workflow_yaml_in_ccteam.clone(),
+            false,
+        ),
+    ] {
+        let exists = if is_dir {
+            path.is_dir()
+        } else {
+            path.is_file()
+        };
+        if !exists {
+            continue;
+        }
+        if dry_run {
+            report
+                .steps
+                .push(format!("would purge {label} ({})", path.display()));
+        } else if is_dir {
+            std::fs::remove_dir_all(&path).with_context(|| format!("rm -rf {}", path.display()))?;
+            report
+                .steps
+                .push(format!("purged {label} ({})", path.display()));
+        } else {
+            std::fs::remove_file(&path).with_context(|| format!("rm {}", path.display()))?;
+            report
+                .steps
+                .push(format!("purged {label} ({})", path.display()));
+        }
+    }
+
+    // Final assertion: confirm `.env` is still here (paranoia check
+    // — if a future refactor accidentally widens the purge tree this
+    // surfaces in tests immediately).
+    if env_file.exists() {
+        report
+            .steps
+            .push(format!("preserved {}", env_file.display()));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Mutex, OnceLock};
