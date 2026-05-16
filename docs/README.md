@@ -16,6 +16,7 @@
 | [`research/claude-code-orchestration-patterns.md`](research/claude-code-orchestration-patterns.md) | Claude Code 编排模式目录 | 拆分哲学(按上下文不按角色)+ 5 种 canonical 模式(Chaining / Routing / Parallel / Orchestrator-Worker / Evaluator-Optimizer)在 Claude Code 上的具体形态 |
 | [`research/omc-orchestration-modes.md`](research/omc-orchestration-modes.md) | OMC 8 mode 全谱 | 调研 `oh-my-claudecode` 8 种 mode 的轴向分类、嵌套关系、composability;给 ccteam 未来模式扩展的具体启发 |
 | [`research/omc-vs-ccteam-orchestration.md`](research/omc-vs-ccteam-orchestration.md) | OMC vs ccteam 架构对比 | prompt-as-orchestrator vs code-as-orchestrator 两条路线深度对比 + 维度评估表 |
+| [`research/v047-pattern-rust-vs-skill-split.md`](research/v047-pattern-rust-vs-skill-split.md) | V0.4.7 模式扩展分层决策 | 4 项候选(extends / evaluator sugar / fan_out / router agent)的 Rust schema vs Skill prompt 分层 + 优先级 + 三个隐藏陷阱 + dev-plan 草稿 |
 | [`dev-coupling-audit.md`](dev-coupling-audit.md) | F-finding 累积(跨版本) | 改 ccteam-core 之前 |
 | [`ccteam-as-domain-agnostic-orchestrator.md`](ccteam-as-domain-agnostic-orchestrator.md) | team 泛化 charter | 加新 team 之前 |
 | [`claude-code-best-practices.md`](claude-code-best-practices.md) | Claude Code 实践参考 | 改 phase prompt / hooks / context 时 |
