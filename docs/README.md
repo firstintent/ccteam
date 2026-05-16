@@ -10,7 +10,7 @@
 
 | 文件 | 角色 | 何时读 |
 |---|---|---|
-| [`requirements.md`](requirements.md) | 13 痛点的不可变源 | 验收基准;PR 描述映射用 |
+| [`requirements.md`](requirements.md) | 15 痛点(13 用户痛点 + 2 个 V1.0.0 终极目标) | 验收基准;PR 描述映射用 |
 | [`tech-design.md`](tech-design.md) | 架构 SoT | 改架构前必看 |
 | [`interfaces.md`](interfaces.md) | 协议 SoT(YAML / JSON / CLI / hooks / state) | 改 schema 必同步 |
 | [`dev-coupling-audit.md`](dev-coupling-audit.md) | F-finding 累积(跨版本) | 改 `ccteam-core` 前 |

@@ -28,7 +28,7 @@
 | # | 文档 | 何时读 |
 |---|---|---|
 | 0 | `docs/README.md` — 全局文档索引 + 维护规约 | 加 / 改 / 归档文档前 |
-| 1 | `docs/requirements.md` — 13 痛点 | 验收基准;PR 描述映射用 |
+| 1 | `docs/requirements.md` — 15 痛点(13 用户痛点 + 2 个 V1.0.0 终极目标) | 验收基准;PR 描述映射用 |
 | 2 | `docs/tech-design.md` — 架构 SoT | 改架构前必看;§3.7 Cross-project Memory / §3.8 用户接口层 / §6 扩展点 |
 | 3 | `docs/interfaces.md` — 协议参考 | 改 schema / CLI / MCP / hooks 时同步 |
 | 4 | `docs/v0-2/README.md` — V0.2 文档入口 + V0.3 deferred 列表 | 当前最新版,V0.2 ship 状态 / V0.3 候选 |
@@ -91,10 +91,11 @@
    - `docs/v0-1/development-plan.md` 某条任务(例:`Closes M4.1`)/ `dev-coupling-audit.md` 某条 F-finding
    - 改协议(YAML 字段、JSON shape、文件路径、CLI 签名)→ **必须同步 `interfaces.md`**
 2. **commit message 用英语**;文档与 phase prompt 用中文
-3. **不写 backwards-compat shim**;`ccteam-core` 不写废弃代码 stub;CLAUDE.md §五.3
-4. **优先编辑现有文件,不轻易新建**;phase 模板优先 `@~/.claude/plugins/.../<file>` 引用而非复制
-5. **测试不过不算完成**;`cargo test --workspace` 退步 = block;clippy 不能新增 warning
-6. **大需求时让 Claude 反向面试自己**(plan-eng phase template 已实现机制)
+3. **Pre-v1.0 = 开发阶段,不留技术债**(2026-05-16 加):ccteam 在 v1.0 之前没有真实用户群,**允许大胆做更好的抽象**。**不做历史功能迁移**(deprecated field 直接删 / breaking API rename 不留 alias / `#[serde(default)]` compat 只在数据迁移成本 > 重新启动成本 时才用)。后果:每个版本 ship 后,**主动**砍掉上版本因迁移保留的兼容代码;tier-1 文档**只描述当前架构**,EOL 内容去版本 dir 不在全局文档保留 deprecation banner。
+4. **不写 backwards-compat shim**;`ccteam-core` 不写废弃代码 stub;CLAUDE.md §五.3
+5. **优先编辑现有文件,不轻易新建**
+6. **测试不过不算完成**;`cargo test --workspace` 退步 = block;clippy 不能新增 warning
+7. **大需求时让 Claude 反向面试自己**(plan-eng phase template 已实现机制)
 
 ### 多 session 并行编辑同一仓库
 

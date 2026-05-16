@@ -310,6 +310,43 @@ ccteam 主动开了 4 个 tmux session 并行——后端 1 个、前端 1 个�
 
 ---
 
+### 痛点 14:Claude Code(以及任何单体 AI 助手)做不了真大型软件系统(V1.0.0 目标)
+
+**用户场景**:
+> "我能用 Claude Code 写个 todo CLI、做个 Telegram bot、修个小 bug。但我手上是一个 100k+ LOC 的电商后台 / 实时交易系统 / 多服务架构 — Claude Code 单 session 跑半小时 context 就漂,改完 OAuth 模块忘了 mobile 端要同步改 schema,改完一个 bug 引入回归不被发现。我不需要再'对话式 AI 助手',我需要一个 **24×7 跑着的开发团队**,能自己做 N 周长跑、能多 agent 在多模块并行不踩对方脚、能自己跑回归、能撞到不会的 stack 自己换路。"
+
+**问题本质**:**Claude Code 是会话式工具,不是自助运行的开发团队**。它优秀地解决单次"我提问 + AI 回答 + 我审 + 我接受"的小循环,但有三个根本限制:
+- **单 session 上下文容量有限**(即使 1M 也撑不过几天的工作流);长 session 必然 context drift
+- **没有并行机制**:多个独立子模块要改 → 用户串行问 → 等;Agent Teams / subagent 只在单 session 内部并行,跨 session 协作要用户手工 orchestrate
+- **没有持续运行的"团队感"**:无 daemon 长跑、无 24h 自动 budget、无 agent 之间的稳定 artifact 协议、无 fix-loop escalation 机制
+
+**ccteam 的回应 — Token Maxxing**:**把"用户 + 单 AI 助手"形态升级成"用户 + 多 agent 自助团队 + 7×24 daemon"**。核心机制:
+- 投足够 token(预算管理 + budget shaping 不止 trip + disable,而是 throttle/reprioritize)
+- 多 agent 并行 + workflow.yaml fan-out + artifact-driven 协作 → 把大问题切到 N 个独立子模块
+- 长跑 daemon + meta-agent 总管 → 撞死路自己换 stack 试 / 撞不会的 RFC 自己研究
+- artifact 文件 + progress.jsonl 是跨 session 的"团队共识"载体,context 漂掉无所谓 — 下个 spawn 读 artifact 就有共识
+
+**V1.0.0 目标**:
+- 能让 ccteam **连续自助跑 ≥7 天**做一个真实项目(20-100k LOC,有 DB + API + frontend + e2e test),期间用户 ≤5 次拍板
+- 期间产物能 ship(测试通过 + lint 通过 + deploy 通过 + 无回归);token 预算用户可配 + 撞 cap 优雅 throttle 不爆
+- **维护**也能跑:对已 ship 的项目持续跑 bug 修复 / 依赖升级 / 性能优化 / 安全补丁(meta-agent 自己识别 issue → 调度 agent 修 → 提 PR)
+
+### 痛点 15:自动化只服务"开发软件",拓不到其他领域(V1.0.0 目标)
+
+**用户场景**:
+> "AI 自动化只解决了'写代码'。我做研究 / 内容运营 / 投资分析 / 实验室自动化 — 这些也是'目标 + 多步骤 + agent 之间协作'的工作流,凭什么没有同样的自助团队?Claude / Cursor / Codex 都只配了'编程域'的工具(Read/Edit/Bash),没人给我配'研究域'的工具(scrape / paper search / dataset / 回测引擎),也没人教 LLM 怎么编排研究流程。"
+
+**问题本质**:**自动化工作流系统当前全部锁死在编程域**。但"目标 + 多步骤 + agent 协作"是通用模式 — 研究、运营、投资、实验室、法务、客服都符合。锁死在编程域是因为 AI agent 默认工具集(Read/Write/Edit/Bash + git)只方便操作"文本文件 + 命令行" — 这恰好覆盖编程,不覆盖其他。
+
+**ccteam 的回应 — 数据驱动的领域抽象**:ccteam-core 从设计上**零编程域字面量**(strategic doc §1 红线):workflow.yaml + team.yaml + `.claude/agents/<role>.md` + MCP 工具接入 = 任何领域可创建自己的多 agent 团队。Token maxxing 让"对话式 wizard 创建领域 team"也变成 N 分钟级体验。
+
+**V1.0.0 目标**:
+- 出 **3 个非编程领域的官方 team**(候选:研究 / 内容运营 / 投资分析,各自 starter workflow.yaml + agents + MCP 工具集)
+- **用户能在 30 分钟内**用 `ccteam team init` + 对话式 wizard 创建自己领域的 team(`ccteam-creator` skill 升级 → 不需要懂 YAML / Rust,自然语言对话定义拓扑)
+- 跑通第一个**非编程**项目(典型:用户描述"我想跑一个每天爬 5 个财经网站 + 写一篇市场摘要 + 发到 Telegram 的工作流",30 分钟内 ccteam 跑起来)
+
+---
+
 ## 三、用户对"理想体验"的描述
 
 如果让目标用户用一句话描述他想要的工具，他会说：
