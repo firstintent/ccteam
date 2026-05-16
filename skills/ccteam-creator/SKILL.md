@@ -84,14 +84,52 @@ Decision flow per agent:
 `parallelism > 1` is **only** legal with `watch:` (validate() rejects
 otherwise). Leave it unset for the other three.
 
+### ⚠️ Self-excitation pitfall (`watch:` triggers)
+
+A `watch:<dir>/` trigger fires on **every** filesystem event under
+`<dir>/` — including `Modify` events emitted by `notify` whenever a
+file inside is rewritten (e.g. `jq '.field=X' f.json > f.tmp && mv
+f.tmp f.json`). If the agent's own body mutates files inside its
+*own* watched dir, you get an infinite loop: agent runs → updates an
+artifact's status → watcher fires → spawns the agent again.
+
+**Real incident** (dex-ui 2026-05-16): explorer's `.ccteam/backlog/`
+watch self-excited via Step 6 (status updates) + Step 7 (new
+scenarios). Burst climbed from 1/min to 8/min over 4 h, 45 successful
+spawns + 80 stale-spawn errors, $1.10 burned. fixer + master had the
+same issue on `issues/` and `prs/`.
+
+**Pattern to apply** (when an agent must mutate the artifact source):
+
+| Role of dir | Watched? | Who writes |
+|---|---|---|
+| tracking artifacts (mutable state) | NO | the agent itself |
+| trigger markers (write-once tiny JSON) | YES | upstream agent / human |
+
+So split the QA loop's `backlog/` (tracking, unwatched) from a
+new `explore-requests/` (markers, watched). Upstream writes a marker
+file like `planner-<ts>.json` containing `{requested_by, at,
+reason}`. The downstream agent reads + immediately archives the
+marker to `<dir>.archived/` (outside the watched tree) before doing
+any real work — so a re-fire on the same marker cannot happen.
+
+Rule of thumb: **an agent must never write a file into its own
+watched dir**, even transiently. If it has to leave a status
+breadcrumb, put it in a sibling unwatched dir.
+
 ### Common topologies
 
 | Topology | Agents + triggers |
 |---|---|
-| **QA loop** | planner:manual; explorer:watch:.ccteam/backlog/; fixer:watch:.ccteam/issues/ (parallelism:2); master:watch:.ccteam/prs/ |
+| **QA loop** | planner:manual; explorer:watch:.ccteam/explore-requests/; fixer:watch:.ccteam/fix-requests/ (parallelism:2); master:watch:.ccteam/merge-requests/ |
 | **Single watchdog** | watchdog:schedule (interval:"2h") |
 | **Review chain** | writer:manual; reviewer:watch:.ccteam/drafts/; shipper:gate |
 | **Data pipeline** | collector:schedule; processor:watch:input/; emitter:watch:processed/ |
+
+The QA loop row above pairs each `watch:<dir>` with a separate
+tracking dir (`backlog/` / `issues/` / `prs/`) that the corresponding
+agent mutates freely. See the dex-ui workflow.yaml for a worked
+example with the marker payload shape.
 
 ---
 
