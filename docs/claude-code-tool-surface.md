@@ -1,11 +1,14 @@
 # Claude Code 工具触发面 — ccteam 自治编排的能力地图
 
-> 本文档面向 **phase 模板作者**和 **director-claude / orchestrator 设计者**,
-> 解决一个核心问题:在 ccteam 长会话里,**谁能触发什么命令、怎么触发**。
+> 本文档面向 **`workflow.yaml` / `.claude/agents/<role>.md` 作者**和 **meta-agent / orchestrator 设计者**(V0.4.0+),
+> 解决一个核心问题:在 ccteam 编排的 Claude Code session 里,**谁能触发什么命令、怎么触发**。
 >
-> 不读这份文档的后果:phase markdown 里写"请用 `/review` 检查代码",运行
+> 不读这份文档的后果:role.md 里写"请用 `/review` 检查代码",运行
 > 时模型把 `/review` 当死字符输出 → orchestrator 拿不到 review report →
-> 整条流水线静默失败。
+> 整条 workflow 静默失败。
+>
+> **V0.4.0 架构补充**:Claude Code 的工具触发面与 ccteam workflow.yaml 的
+> 映射,详见文末《workflow.yaml trigger ↔ Claude Code 工具触发面》新节。
 
 ---
 
@@ -14,26 +17,28 @@
 ```
 ┌──────────────────────────── Claude Code 的"命令" ────────────────────────────┐
 │                                                                              │
-│   通道 1:prompt 内自调          通道 2:TUI-only            通道 3:director  │
-│   (模型自己发工具调用)          (键盘 / send-keys 输入)    -claude(M1+)    │
+│   通道 1:prompt 内自调          通道 2:TUI-only            通道 3:meta-agent│
+│   (模型自己发工具调用)          (键盘 / send-keys 输入)    (V0.4.0+)        │
 │                                                                              │
-│   • Agent / Task                  • /exit                   • 跨 phase 路由 │
-│   • Skill                         • /clear                  • 元决策(下一  │
-│   • MCP tools                     • /compact                  步该 fix 还是 │
-│   • 内置 (Read/Edit/Bash/...)     • /reload-plugins           ship)         │
+│   • Agent / Task                  • /exit                   • workflow 编排  │
+│   • Skill                         • /clear                  • spawn/stop_agent│
+│   • MCP tools                     • /compact                • signal / gate  │
+│   • 内置 (Read/Edit/Bash/...)     • /reload-plugins         • set_parallelism│
 │                                   • /agents                                  │
 │                                   • /help                                    │
 │                                   • /memory                                  │
-│                                   • /btw(idle-aware 注入用) │              │
-│   ✅ phase markdown 直接编排      ❌ 模型摸不到             ⏳ M1+ 才上线    │
-│   ✅ cache 命中、tmux 可见        ✅ orchestrator send-keys                  │
+│                                   • /btw(meta-agent → signal) │             │
+│   ✅ role.md 直接编排             ❌ 模型摸不到             ✅ 17 个 MCP 工具│
+│   ✅ cache 命中                   ✅ orchestrator send-keys ✅ 事件驱动      │
 │   ✅ 便宜、可观测                                                            │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
 **关键事实**:模型把 `/review` 字面写在回答里**完全没效果**。slash command
 是 Claude Code TUI 的输入解析器拦截的,只接受**人类键盘输入或 tmux send-keys**,
-不接受模型输出的字符串。
+不接受模型输出的字符串。V0.4.0+ 里 `claude --bg --agent <role>` 是无 TUI
+的后台 session,**通道 2 的 slash command 在 bg session 上下文里不存在**——
+所有控制路径必须走通道 1(role 自调工具)或通道 3(meta-agent 调 MCP 工具)。
 
 ---
 
@@ -83,16 +88,16 @@ command 触发后的特殊上下文里可调,**不进全局 Task subagent 注册
 
 | 方案 | 怎么做 | 评价 |
 |---|---|---|
-| A. 启用 in-memory plugin pipeline | spawned session 的 `<project>/.claude/settings.json` 写 `enabledPlugins: {"<plugin>@<mkt>": true}`,Claude Code 自动 namespace `<plugin>:<name>`,phase markdown 用裸名仍可调 | ✅ V0.2 M0.20 起的官方路径;ccteam `bootstrap_project` 自动据 phase YAML 写 |
-| B. `@文件引用` + general-purpose 执行 | phase markdown 里写 "请用 Task(subagent_type='general-purpose'),把 `@~/.claude/plugins/.../agents/code-reviewer.md` 的内容当作 system prompt,review 当前 diff" | ✅ 零安装,但每次都走 general-purpose,损失了 plugin agent 的 model / color / tools 配置 |
-| C. orchestrator send-keys 触发 slash command | tmux send-keys `/review-pr <args>`,plugin 自己的 prompt body 在 TUI 上下文里能调它的私有 agent | ⚠️ 阻塞长会话当前 turn,只适合 phase 边界 |
+| A. 启用 in-memory plugin pipeline | spawned session 的 `<project>/.claude/settings.json` 写 `enabledPlugins: {"<plugin>@<mkt>": true}`,Claude Code 自动 namespace `<plugin>:<name>`,role.md 用裸名仍可调 | ✅ V0.2 M0.20 起的官方路径;V0.4.0+ `bootstrap_project` 自动据 workflow.yaml + role.md 写 |
+| B. `@文件引用` + general-purpose 执行 | role.md 里写 "请用 Task(subagent_type='general-purpose'),把 `@~/.claude/plugins/.../agents/code-reviewer.md` 的内容当作 system prompt,review 当前 diff" | ✅ 零安装,但每次都走 general-purpose,损失了 plugin agent 的 model / color / tools 配置 |
+| C. orchestrator send-keys 触发 slash command | tmux send-keys `/review-pr <args>`,plugin 自己的 prompt body 在 TUI 上下文里能调它的私有 agent | ⚠️ 只在 Codex executor(tmux)适用;V0.4.0+ Claude Code 走 `--bg` 没 TUI,此路不通 |
 
 **ccteam 的设计选择**:V0.2 M0.20 起 `bootstrap_project` 用方案 A
 (`enabledPlugins` 写到 spawned session 的 settings.json,plugin pipeline
 自动加载 + namespace);**V0.1 的 ln -sf 路径已删除**,旧 ccteam 用户用
 `ccteam doctor --migrate-recommended-agents` 一次性清理 `~/.claude/agents/`
-里残留的 ccteam 创建的 symlink。方案 B 仍然作为零安装兜底;方案 C 留给
-director-claude(通道 3)在跨 phase 路由时调用。
+里残留的 ccteam 创建的 symlink。方案 B 仍然作为零安装兜底;方案 C 仅
+适用 Codex executor(tmux 容器,有 TUI),V0.4.0+ Claude bg agent 不走此路。
 
 #### 1.1.4 验证示例(无需任何 plugin,直接可跑)
 
@@ -189,12 +194,14 @@ Claude Code 对 `~/.claude/skills/`、项目 `.claude/skills/`、`--add-dir`
 即使一开始没文件。
 
 **对 ccteam 的架构含义**:
-- ccteam M1+ 可以做**按 phase 懒注入 skill** —— 比如 `review` phase 触发
-  前,orchestrator 把一份"针对当前 phase 定制的 review skill"写进
-  `<project>/.claude/skills/phase-review/SKILL.md`,长会话立即可调。
-- 不需要为了"让模型用某个能力"重启长会话或破坏 prompt cache。
+- ccteam V0.4.0+ 可以做**按 role 懒注入 skill** —— 比如某 `reviewer` role
+  spawn 前,meta-agent 用 `mcp__ccteam__spawn_agent` 触发前,先把一份
+  "针对当前 review 定制的 skill"写进 `<project>/.claude/skills/<name>/SKILL.md`,
+  spawned session 立即可调。
+- 不需要为了"让模型用某个能力"重启 session 或破坏 prompt cache。
 - Plugin **不能**中途装(需要重启);已装 plugin 可以通过 send-keys
-  `/reload-plugins` 不丢 context 地刷新它的 skills/agents/hooks/MCP/LSP。
+  `/reload-plugins` 不丢 context 地刷新它的 skills/agents/hooks/MCP/LSP
+  (仅适用 Codex executor 的 tmux session;Claude bg session 不走此路)。
 - Agent 文件(`~/.claude/agents/<name>.md`)文档没明说是否实时监听 ——
   **需要实测**,见下面探针。
 
@@ -216,36 +223,34 @@ Claude Code 对 `~/.claude/skills/`、项目 `.claude/skills/`、`--add-dir`
   V0.1 ccteam 靠 startup 前 ln -sf 这条路曾经可行,**V0.2 M0.20 改走
   in-memory plugin pipeline**(`enabledPlugins` 写到 spawned session
   的 settings.json,Claude Code session 启动时一次性加载 enabled plugin)
-  —— ccteam-core 不再写 `~/.claude/agents/`
+  —— ccteam-core 不再写 `~/.claude/agents/`;**V0.4.0+ 用 role.md
+  + workflow.yaml 替代,role 行为定义直接在 `<project>/.claude/agents/<role>.md`
+  里**(由用户 / meta-agent 写,ccteam-core 零注入 prompt)
 
 #### 1.2.6 给 ccteam `bootstrap_project` 的强约束
 
-agent / plugin 必须 startup 前注册,`bootstrap_project` 的执行顺序必须是:
+agent / plugin 必须 startup 前注册,`bootstrap_project` 的执行顺序必须是
+(V0.4.0+):
 
 ```
 ccteam new <brief>
-  ├─ 1. 创建 ~/projects/<slug>/ 目录与子目录
-  ├─ 2. 写 spec.md / CLAUDE.md / phase 模板 / settings.json
-  │       (含 `enabledPlugins`,V0.2 M0.20)
+  ├─ 1. 创建 ~/projects/<team>-<slug>/ 目录与子目录
+  ├─ 2. 写 workflow.yaml / .claude/agents/<role>.md / CLAUDE.md / settings.json
+  │       (含 `enabledPlugins`)
   ├─ 3. 写 ~/.claude.json 的 hasTrustDialogAccepted
   ├─ 4. mkdir -p ~/.claude/skills/ <project>/.claude/skills/(占位让监听挂上)
-  └─ 5. 由 orchestrator ensure_session 触发 tmux new-session(claude TUI 启动,
-        plugin pipeline 加载 enabledPlugins 并 namespace 每个 plugin agent)
+  └─ 5. orchestrator 启动 ArtifactWatcher,等 trigger 满足时 spawn
+        `claude --bg --agent <role>`(每个 session 启动加载 enabledPlugins
+        并 namespace 每个 plugin agent)
 ```
 
-第 4 步**必须**在第 6 步之前;第 5 步是为了让 skill 后续懒注入能命中
+第 4 步**必须**在第 5 步之前;预创建空目录是为了让 skill 后续懒注入能命中
 (§1.2.4 实时监听只对会话启动时已存在的目录生效)。
 
-如果运行中需要新增 agent(M2 director-claude 决定切到一个新 agent),
-**只有两条路**:
-
-- **重启长会话**(`/exit` + 新 session)—— 不丢 progress.jsonl 但丢
-  prompt cache、丢 in-flight context
-- **send-keys `/reload-plugins`** —— 不丢 cache,但会把已装 plugin 全部
-  reload 一遍(plugin 状态回 idle)
-
-两条都贵,所以 M1 优先把"会用到的全部 agent"在 `bootstrap_project`
-阶段一次性 ln 齐。
+V0.4.0+ 里**每个 agent role 是独立短命 session**——新增 role 只需写
+新 `.claude/agents/<role>.md` + 更新 workflow.yaml(orchestrator hot-reload
+机制 detect 后下一次 trigger 即生效),**不需要重启 / reload-plugins**;
+这是 thin orchestrator 比 V0.3.x 长会话设计的核心优势。
 
 #### 1.2.7 `Task` ≠ `TaskCreate` — 容易踩的命名坑
 
@@ -257,7 +262,7 @@ ccteam new <brief>
 | `Task` / `Agent` | 启动一个 subagent 跑一个任务 | `subagent_type`, `description`, `prompt` |
 | `TaskCreate` | 在任务管理列表里**创建一条 todo**(不是启动 agent) | `subject`, `description`, `activeForm` |
 
-phase markdown 写 prompt 时要明确说 "用 `Task` 工具" 或 "用 `Agent` 工具"
+role.md 写 prompt 时要明确说 "用 `Task` 工具" 或 "用 `Agent` 工具"
 (取决于当前会话哪个名字暴露出来——两个名字其实是同一个工具的别名)。
 **不要写"用 TaskCreate"——那是另一个工具,会创建 todo 而不是 launch agent**。
 也避免写"用 Task tool"再加上 `subject` / `description` 参数,模型可能挑错。
@@ -283,7 +288,7 @@ MCP server 注册的 tool 在模型看来就是普通工具,工具名形如
 | `claude-mem` | M3 | `mcp__plugin_claude-mem_mcp-search__search` 等 |
 | Playwright | 按需 | `mcp__plugin_playwright_playwright__browser_*` |
 | GitHub | M4+ | 优先 `gh` CLI(见最佳实践 §4.3) |
-| `ccteam-mcp`(自建) | M2 | `mcp__ccteam__ls` / `__show` / `__new` 等 |
+| `ccteam-mcp`(自建) | M2 / V0.4.0 | **17 个工具** `mcp__ccteam__ls` / `show` / `new` / `spawn_agent` / `stop_agent` / `observe_agents` / `signal` / `set_parallelism` / `trigger_gate` / `get_artifact_summary` 等(见 `docs/v0-4-0/prd.md §6.3` 完整清单) |
 
 #### 1.3.2 验证示例(假设已装 Playwright MCP)
 
@@ -297,7 +302,7 @@ MCP server 注册的 tool 在模型看来就是普通工具,工具名形如
 ### 1.4 内置工具
 
 `Bash` / `Read` / `Edit` / `Write` / `Grep` / `Glob` / `WebFetch` /
-`WebSearch` / `TodoWrite` / `NotebookEdit` 等。phase markdown 里通常
+`WebSearch` / `TodoWrite` / `NotebookEdit` 等。role.md 里通常
 不需要显式说"用 Bash 工具"——模型会自己挑。**但有几个场景值得显式约束**:
 
 - 让模型用 `Bash("gh pr create ...")` 而不是手搓 PR 模板 → 让 GitHub
@@ -310,8 +315,12 @@ MCP server 注册的 tool 在模型看来就是普通工具,工具名形如
 ## 通道 2 — TUI-only(只能 orchestrator send-keys)
 
 下面这些 slash command **模型完全摸不到**——把字面字符串 `/exit` 写进
-回答里,Claude Code 不会把它解析回命令,只会显示成普通文本。**phase
-markdown 里写这些 = 静默失败**。
+回答里,Claude Code 不会把它解析回命令,只会显示成普通文本。**role.md
+里写这些 = 静默失败**。
+
+**V0.4.0+ 适用范围限制**:Claude bg agent(`claude --bg --agent <role>`)
+**没有 TUI**——通道 2 在这种 session 上下文里完全不存在。通道 2 仅适用于
+**Codex executor**(tmux 容器)+ meta-agent / 调试用 long-running session。
 
 | 命令 | 用途 | 谁该触发 |
 |---|---|---|
@@ -327,17 +336,21 @@ markdown 里写这些 = 静默失败**。
 ### 2.1 orchestrator 怎么触发
 
 `crates/ccteam-core/src/tmux.rs` 的 `send_keys()`——把字面字符串送进
-tmux 第一个 pane 再发 Enter。orchestrator 已经在用这条路:
+tmux 第一个 pane 再发 Enter。V0.4.0+ 仍保留这条路给 Codex executor 容器:
 
-- 注入 phase prompt(idle 时直接 send-keys,忙时套 `/btw`)
-- context reset(send-keys `/exit` → wait_for_ready 新 session)
+- Codex agent session 的运维注入(`/exit` reset 等)
+- 调试 / 手动操作场景
 
-### 2.2 phase markdown 应该怎么"间接"触发它们
+**V0.4.0+ Claude agent 不走 tmux** —— `claude --bg --agent <role>` 由
+supervisor 接管,生命周期通过 `~/.claude/jobs/<job_id>/state.json` + 文件系统
+artifact 控制;phase prompt 注入与 context reset 路径已 EOL。
 
-**纠正前文一个误导**:之前写过"phase 用 ESCALATE 请 orchestrator 做
-`/exit` reset"。这是错的——**orchestrator 是 Rust 程序,没有 agent,
-读 ESCALATE 只能字符串匹配,看不懂自然语言**。所以"请 orchestrator 触发
-context reset"这种文字它压根理解不了。
+### 2.2 role.md 应该怎么"间接"触发它们(V0.4.0+)
+
+**V0.4.0+ 重写**:role 一般**不应**请求通道 2 命令——`claude --bg --agent`
+没 TUI,且 V0.4.0 没有"phase prompt 注入"这条路径。role 如需协调下一步,
+通过**产 artifact 文件**让下游 role 的 `trigger: watch:<dir>` 触发,
+或**escalate event** 写入 progress.jsonl 让 meta-agent 决策。
 
 正确分工是这样的:
 
@@ -345,122 +358,107 @@ context reset"这种文字它压根理解不了。
 
 | 谁触发 | 怎么触发 | 例子 |
 |---|---|---|
-| **orchestrator deterministic 监控** | 读 progress.jsonl 里 PostToolUse hook 累加的 `context_tokens_used` / `cost_used_usd`,跨阈值就 send-keys | context > 60% → `/exit` + 新 session(tech-design §6.9);cost > $200 → 硬终止 |
-| **orchestrator 安装态变化** | 装/卸 plugin 后 send-keys `/reload-plugins` | M2 自动安装 agent 时 |
-| **director-claude(M1+)** | 短命 claude 解读 progress.jsonl,产出结构化决策事件,orchestrator 据事件 send-keys | 决定下 phase 前先 send `/review-pr`(plugin slash command) |
-| **人** | tmux attach 手动键入 | 调试用 |
+| **orchestrator deterministic 监控** | 读 progress.jsonl 里 PostToolUse hook 累加的 `context_tokens_used` / `cost_used_usd`,跨阈值采取行动 | cost > $200 → 硬终止;V0.4.0+ 通过 supervisor 终结 `--bg` session,不再 send-keys `/exit` |
+| **orchestrator 安装态变化**(仅 Codex tmux) | 装/卸 plugin 后 send-keys `/reload-plugins` | 仅 Codex agent;Claude bg session 不走此路 |
+| **meta-agent / 用户**(V0.4.0+ 替代 M1+ director-claude) | meta-agent 解读 progress.jsonl + 用户对话,调 `mcp__ccteam__spawn_agent` / `signal` / `trigger_gate` / `set_parallelism` | 决定起下一个 role、解锁 gate、调并发上限 |
+| **人** | tmux attach 手动键入(Codex)、`ccteam web` UI、meta-agent 对话 | 调试 / 操作 |
 
-#### 2.2.2 ESCALATE 的真正用途 — 用户决策回路,不是命令请求
+#### 2.2.2 ESCALATE 的真正用途 — 用户 / meta-agent 决策回路,不是命令请求
 
-phase 该用 ESCALATE 的场景是**只有人能决定的事**:spec 不清、关键技术
-选型卡住、外部依赖缺失。**不是用来请求 TUI 命令**——那是 orchestrator
-自己的监控职责。
+role 该用 ESCALATE(写 `escalation` event 到 progress.jsonl)的场景是
+**只有人 / meta-agent 能决定的事**:spec 不清、关键技术选型卡住、外部依赖缺失。
+**不是用来请求 TUI 命令**——那是 orchestrator 自己的监控职责。
 
 ```
 ✅ ESCALATE: spec.md 仅含 "mdeditor",无法做技术选型。需澄清:
    (1) 目标平台?(2) 目标用户?(3) 核心场景?(4) 关键约束?
 
-✅ ESCALATE: fix-loop 已撞 3 轮顶,根本原因疑似 plan-eng 阶段技术选型
-   错误,建议人工 review 后回退到 plan-eng 重做。
+✅ ESCALATE: fix-loop 已撞 3 轮顶,根本原因疑似 planner role 选型错误,
+   建议 meta-agent 用 spawn_agent 起新一轮 planner 重做。
 
 ❌ ESCALATE: 当前 context 已 70%,请 reset
-   (orchestrator 看 context_tokens_used 自决,不需要 phase 请求)
+   (V0.4.0+ 单 agent session 独立 context,supervisor 决定回收,role 不请求)
 
 ❌ ESCALATE: 请 send-keys /reload-plugins
-   (phase 不该指挥 orchestrator 做哪条命令)
+   (role 不该指挥 orchestrator 做哪条命令)
 ```
 
-#### 2.2.3 ESCALATE 的字符串语法约定
+#### 2.2.3 ESCALATE 的字符串语法约定(V0.4.0+)
 
-`crates/ccteam-hooks/src/parse_phase_end.rs` 现在认的是:
-
-```
-ESCALATE: <reason — 自由文本>
-```
-
-orchestrator 默认行为(M0):写 escalation event,phase 标 escalated,停掉
-自动调度。**不解析 reason 内容**;reason 是给人看的(M0 inbox / M1
-Telegram)。**M1+ director-claude 才解读 reason 决定下一步路由**——但即
-使解读了,output 也是结构化 `director_decision` 事件,orchestrator 仍
-做的是字符串路由(看 `next_phase` 字段),不解读 reason。
-
-如果未来要给 ESCALATE 加结构化指令通道(让 phase 显式请求"回退到
-plan-eng"),正确做法是**扩协议**:
+V0.4.0+ escalation 通过 `escalation` event 写入 progress.jsonl(7 类业务
+event 之一),reason 字段为自由文本:
 
 ```
-ESCALATE: REVERT_TO_PHASE plan-eng — fix-loop 撞顶,根因在选型
-ESCALATE: NEED_USER_INPUT — spec 不清,问题:[...]
-ESCALATE: ABORT — 超出 ccteam 当前能力,人工接手
+{"type":"escalation","role":"planner","sid":"...","reason":"<自由文本>","ts":"..."}
 ```
 
-orchestrator 字符串匹配前缀(`REVERT_TO_PHASE` / `NEED_USER_INPUT` /
-`ABORT`)做对应路由——**仍然是 dumb 路由,仍然不需要 LLM 解读**。这
-扩展未来想做时,要同步 update 三处:`parse-phase-end` 解析、`interfaces.md`
-ESCALATE 语法节、phase 模板里的 ESCALATE 写法示例。M0 不需要,先用自由
-文本。
+orchestrator 行为:event 落档,**不解析 reason 内容**;meta-agent 通过
+`mcp__ccteam__get_progress` / `observe_agents` 读到 escalation,自然语言决策
+后调 `spawn_agent` / `signal` / `trigger_gate` 等下一步。**meta-agent 是 V0.4.0
+的"决策大脑"**,取代了 V0.3.x 草案的 director-claude 设计(后者已废)。
 
 ---
 
-## 通道 3 — director-claude(M1+ 计划)
+## 通道 3 — meta-agent(V0.4.0+,事件驱动 + MCP 工具)
+
+> **V0.3.x 草案的 "director-claude"(短命 LLM 做 phase 路由)已废**:
+> V0.4.0 thin orchestrator 是**纯事件驱动**(`ArtifactWatcher` + workflow.yaml
+> trigger),**不需要 LLM 做下一步路由决策**——下一 agent 由 watch trigger
+> 自动起,gate 由 `trigger_gate` 解锁,异常由 meta-agent 用 MCP 工具处理。
 
 ### 3.1 解决什么问题
 
-通道 1 只能让长会话内的 Claude **在当前 phase 内**做工具决策——它
-看不到"下一步该跑哪个 phase"这个层面。phase DAG 在 M0 是写死的
-(plan-eng → implement → ...),但真实工作里有很多分支:
+通道 1 让 spawn 的 role agent **在自己的 session 内**做工具决策——但用户
+需要一个**跨 workflow / 跨 session 的对话面**:看进度、调并发、起新 role、
+解锁 gate、escalation 处置。这是 **meta-agent**(常驻 ccteam-managed claude
+session,装 `ccteam` MCP server)的职责。
 
-- 测试只挂 1 条:跳过 fix-loop 直接 ship?
-- review 里发现架构问题:回 plan-eng 还是局部改?
-- spec 改了:从头重跑还是只跑增量?
+### 3.2 设计形态(V0.4.0 已 ship)
 
-这些路由决策**不属于任何单个 phase**——它们是 phase 之间的元决策。
-
-### 3.2 设计形态(草案,等用户拍板)
-
-- **触发**:每次 `phase_done` / `escalate` 事件被 hook 写入 progress.jsonl
-  之后,orchestrator 在派发下一 phase 之前,先跑一个**短命 claude**
-  (类似 M1 的 cost-watcher / drift-detector)
-- **输入**:project 当前 state.json + progress.jsonl 尾部 + 上一 phase
-  的产物文件
-- **输出**:一个**结构化决策事件**,`event: "director_decision"`,字段:
-  - `next_phase`:下一阶段名(可以是 DAG 里的下一个,也可以是回退 / 跳跃)
-  - `inject_extra`:可选,要追加在下一 phase prompt 前的额外指令
-    (例:"先 `/review` 再做 ship",`/review` 由 send-keys 注入)
-  - `rationale`:一句话理由,落 progress.jsonl
-- **约束**:决策必须落 progress.jsonl(不写暗状态);跑完即退(不持有
-  上下文);最多 30 秒(避免拖慢主流程)
+- **触发**:用户与 meta-agent 自然语言对话(本机 Claude Code session 装
+  `mcp__ccteam__*` 17 工具),meta-agent 调工具操作 orchestrator
+- **工具能力**(部分,完整见 `docs/v0-4-0/prd.md §6.3`):
+  - `spawn_agent(role, project_slug, input_path?)` — 立即派发 agent,不等 trigger
+  - `stop_agent(session_id)` — 软停 agent(写 stop signal 文件)
+  - `observe_agents(project_slug)` — 列当前 session 状态
+  - `signal(session_id, message)` — 给 agent 投递侧带消息(类似 `/btw`)
+  - `set_parallelism(role, n)` — 动态调 role 的 parallelism 上限
+  - `trigger_gate(gate_name, project_slug)` — 解锁 Gate
+  - `get_artifact_summary(project_slug, path)` — 读 artifact 目录摘要
+- **约束**:meta-agent 所有操作落 progress.jsonl(`agent_spawn` / `gate_triggered`
+  等 event);不持有 workflow 状态(`workflow.yaml` 是 SoT)
 
 ### 3.3 与通道 1、2 的边界
 
 | 决策类型 | 谁来 | 前置条件 |
 |---|---|---|
-| 当前 phase 里要不要调 code-reviewer / code-simplifier | 通道 1(长会话内 Claude 自决) | spawned session settings.json 有 `enabledPlugins` 启用对应 plugin(见 §6.2) |
-| 要不要 `/exit` reset / `/reload-plugins` | 通道 2(orchestrator,看 cost / context 阈值机械触发) | — |
-| 下一 phase 走 fix 还是 ship,要不要 inject `/review-pr` 等 TUI 命令 | 通道 3(director-claude) | M1+ |
+| role 内调 code-reviewer / code-simplifier 等 subagent | 通道 1(spawn 的 role 自决) | spawned session settings.json 有 `enabledPlugins` 启用对应 plugin(见 §6.2) |
+| Codex tmux session 的 `/exit` reset / `/reload-plugins` | 通道 2(仅 Codex executor) | Codex agent 而非 Claude bg agent |
+| 起 / 停 agent、调 parallelism、解锁 gate、escalation 处置 | 通道 3(meta-agent + MCP 工具) | meta-agent 装 ccteam-mcp 17 工具 |
 
-**重要的架构后果**:Plugin agent 不是"装了 plugin 就能调"——spawned project
-session 必须显式 enable plugin pipeline 才进通道 1。**V0.2 M0.20 起
-`bootstrap_project` 自动据 phase YAML `tools_required.subagents` 写
-`enabledPlugins` 到 `<project>/.claude/settings.json`**,session 启动时
-plugin pipeline 加载 + namespace,phase markdown 用 `Task(subagent_type=...)`
-即可调。否则只能 fallback 到通道 3 的 send-keys `/review-pr`。
+**重要的架构后果**:Plugin agent 不是"装了 plugin 就能调"——spawned
+session 必须显式 enable plugin pipeline 才进通道 1。**V0.4.0+
+`bootstrap_project` 据 workflow.yaml + role.md 解析依赖,自动写
+`enabledPlugins` 到 `<project>/.claude/settings.json`**;session 启动时
+plugin pipeline 加载 + namespace,role.md 用 `Task(subagent_type=...)`
+即可调。
 
-### 3.4 与 sub_skills 的边界(M2)
+### 3.4 与 workflow.yaml gate trigger 的关系
 
-sub_skills 是 phase front matter 里**声明式**指定的 plugin 触发,固定:
-"phase X 完了一定 trigger Y"。director-claude 是**条件式**:"看了 X
-的产出,决定是不是 trigger Y、以及触不触发 Z"。两者不冲突——sub_skills
-管"惯例必走的路",director 管"按情况选路"。
+gate trigger 是 workflow.yaml 里 **声明式** 的人工节点——某 role 的
+`trigger: gate` 表示该 role 等 meta-agent / 人调 `trigger_gate` 才起。
+这是 V0.4.0 把"哪些点必须人决策"显式写进 workflow 拓扑的设计;
+不需要 LLM 决策路由,只需要 gate 这一种条件触发即可。
 
 ### 3.5 不做什么
 
-- ❌ 不替长会话内 Claude 做工具选择(那是通道 1 的职责,放到外层就丢了 cache)
-- ❌ 不持有 phase 之间的内存状态(progress.jsonl 才是 truth source)
-- ❌ 不参与 cost / stall 监控(那是 cost-watcher / stall-watcher 的活)
+- ❌ 不替 spawn role 内的 Claude 做工具选择(那是通道 1 的职责)
+- ❌ 不持有 workflow 状态(`workflow.yaml` + progress.jsonl 才是 SoT)
+- ❌ 不参与 cost / stall 监控(orchestrator deterministic 监控的活)
 
 ---
 
-## 工具清单 — phase 模板作者参考
+## 工具清单 — workflow.yaml + role.md 作者参考(V0.4.0+)
 
 ### 6.1 默认可用的 subagent(Task 直接可调)
 
@@ -478,8 +476,8 @@ sub_skills 是 phase front matter 里**声明式**指定的 plugin 触发,固定
 **装了 plugin 也不能直接 Task 调**(见 §1.1.2),除非 enable plugin pipeline。
 ccteam V0.2 M0.20 起走**官方 in-memory plugin pipeline 路径**——不再 ln -sf。
 
-**ccteam 自治调用**:`bootstrap_project` 写 `<project>/.claude/settings.json`
-时,根据 phase YAML `tools_required.subagents` 解析出依赖的 Claude Code plugin
+**ccteam 自治调用**(V0.4.0+):`bootstrap_project` 写 `<project>/.claude/settings.json`
+时,根据 workflow.yaml + role.md 解析依赖的 Claude Code plugin
 (静态映射表:`crates/ccteam-core/src/plugin_resolution.rs`),写入
 `enabledPlugins`:
 
@@ -495,19 +493,19 @@ ccteam V0.2 M0.20 起走**官方 in-memory plugin pipeline 路径**——不再 
 
 Claude Code session 启动时 plugin pipeline 自动加载 enabled plugin,
 **namespace 加 `<plugin>:` 前缀**(eg `pr-review-toolkit:code-reviewer`);
-phase markdown 用裸名 `Task(subagent_type="code-reviewer")` 仍然可调,
+role.md 用裸名 `Task(subagent_type="code-reviewer")` 仍然可调,
 plugin pipeline 自匹配。
 
-| 来源 plugin | agent 文件 → subagent_type | ccteam 用例 |
+| 来源 plugin | agent 文件 → subagent_type | ccteam V0.4.0+ 用例 |
 |---|---|---|
-| `feature-dev` | `code-architect` | plan-eng |
-| `feature-dev` | `code-explorer` | 项目延续场景的 plan-eng |
-| `pr-review-toolkit` | `code-reviewer` | implement / review phase |
-| `pr-review-toolkit` | `silent-failure-hunter` | review phase |
-| `pr-review-toolkit` | `pr-test-analyzer` | review phase |
-| `pr-review-toolkit` | `type-design-analyzer` | review phase |
-| `pr-review-toolkit` | `comment-analyzer` | review phase |
-| `code-simplifier` | `code-simplifier` | review 后打磨 |
+| `feature-dev` | `code-architect` | `planner` / `architect` role |
+| `feature-dev` | `code-explorer` | `explorer` role |
+| `pr-review-toolkit` | `code-reviewer` | `implementer` / `reviewer` role |
+| `pr-review-toolkit` | `silent-failure-hunter` | `reviewer` role |
+| `pr-review-toolkit` | `pr-test-analyzer` | `reviewer` role |
+| `pr-review-toolkit` | `type-design-analyzer` | `reviewer` role |
+| `pr-review-toolkit` | `comment-analyzer` | `reviewer` role |
+| `code-simplifier` | `code-simplifier` | `polisher` role |
 
 **用户需先装上游 plugin**:`claude /plugin add pr-review-toolkit@claude-plugins-official`
 (以及 `feature-dev` / `code-simplifier`)——**只一次,装在 user level
@@ -540,29 +538,30 @@ plugin pipeline 自匹配。
 | GitHub | M4+ | 倾向用 `gh` CLI 替代 | — |
 | `ccteam-mcp` | M2(自建) | 用户自带 claude 调度 ccteam | `ls` / `show` / `new` / `peek` / `progress` |
 
-### 6.5 phase markdown 引用语法速查
+### 6.5 role.md 引用语法速查(V0.4.0+)
 
 | 目的 | 写法 |
 |---|---|
-| 引用某个文件让模型读 | `@.ccteam/spec.md` |
+| 引用某个文件让模型读 | `@spec.md` / `@$CCTEAM_INPUT/<artifact>` |
 | 引用 plugin 里某个 agent 文件让模型按里面规程办 | `@~/.claude/plugins/marketplaces/claude-plugins-official/plugins/feature-dev/agents/code-architect.md` |
 | 让模型主动 launch subagent(默认 5 个) | "请使用 Task 工具,subagent_type='general-purpose'/'Explore'/'Plan'/'claude-code-guide'/'statusline-setup',..." |
 | 让模型主动 launch plugin subagent(必须先 §6.2 enable plugin pipeline) | "请使用 Task 工具,subagent_type='code-reviewer',..." |
 | 模型按 plugin agent 规程办但不显式调 subagent | "请读 `@~/.claude/plugins/.../agents/code-reviewer.md`,严格按其指引 review 当前 diff" |
 | 让模型用 skill | "请使用 Skill 工具调用 <name> skill" |
 | 让模型用 MCP tool | "请使用 mcp__\<server>__\<tool> 工具,..." |
-| 让 orchestrator 触发 TUI 命令 | 在 phase 末尾 ESCALATE,告诉 orchestrator 该做什么 |
+| 让模型产 artifact 触发下游 role | "完成后写到 `$CCTEAM_OUTPUT/<file>`"(watch trigger 自动驱动下游) |
+| 异常上报 | 写 `escalation` event(progress.jsonl),meta-agent 看到自决策 |
 
 ### 6.6 怎么发现新工具
 
 人工开发时**不要凭训练记忆猜工具名**。在长会话里检查可用工具:
 
 - 看每个 system-reminder 块开头的 available-skills 列表
-- 在 phase 调试期,跑一次 `Task(subagent_type="general-purpose",
+- 调试期,跑一次 `Task(subagent_type="general-purpose",
   prompt="列出你这个会话里能调的所有 mcp__ 开头的工具,以及所有
   subagent_type 列表")`,把返回结果存到 `docs/claude-code-tool-surface.md` §6 更新
-- ccteam 自身的 `ccteam doctor`(M1+)会汇报当前可见的 plugin / agent /
-  MCP server,并和 phase 模板里的依赖做交叉检查
+- ccteam 自身的 `ccteam doctor` 会汇报当前可见的 plugin / agent /
+  MCP server,并和 workflow.yaml + role.md 里的依赖做交叉检查
 
 ---
 
@@ -570,10 +569,65 @@ plugin pipeline 自匹配。
 
 | 现象 | 根因 | 对策 |
 |---|---|---|
-| phase markdown 写 "请 `/review`",模型却没有动作 | 模型摸不到 slash command | 改为 "请用 Task 工具调 code-reviewer subagent" + §6.2 plugin pipeline 启用 |
-| `Task(subagent_type="code-reviewer")` 报 "Agent type not found, Available: general-purpose, Explore, Plan, claude-code-guide, statusline-setup" | **装了 plugin 不等于 Task 能调它的 agent**(spawned session 没启用 plugin pipeline) | spawned session 的 `<project>/.claude/settings.json` 加 `enabledPlugins: {"<plugin>@<mkt>": true}`(ccteam V0.2 M0.20 自动做);旧 ccteam 用户跑 `ccteam doctor --migrate-recommended-agents` 清理残留 ln -sf;临时兜底用方案 B(`@文件引用` + Task general-purpose) |
-| `Skill(skill="review-pr")` 报 InputValidationError | `review-pr` 是 plugin 的 slash command 不是 Skill;`commands/<name>.md` 文件不被 Skill 工具识别 | 这条只能走通道 2(orchestrator send-keys `/review-pr`),phase markdown 别让模型自己调 |
+| role.md 写 "请 `/review`",模型却没有动作 | 模型摸不到 slash command | 改为 "请用 Task 工具调 code-reviewer subagent" + §6.2 plugin pipeline 启用 |
+| `Task(subagent_type="code-reviewer")` 报 "Agent type not found, Available: general-purpose, Explore, Plan, claude-code-guide, statusline-setup" | **装了 plugin 不等于 Task 能调它的 agent**(spawned session 没启用 plugin pipeline) | spawned session 的 `<project>/.claude/settings.json` 加 `enabledPlugins: {"<plugin>@<mkt>": true}`(ccteam V0.4.0+ 自动据 workflow.yaml + role.md 写);临时兜底用方案 B(`@文件引用` + Task general-purpose) |
+| `Skill(skill="review-pr")` 报 InputValidationError | `review-pr` 是 plugin 的 slash command 不是 Skill;`commands/<name>.md` 文件不被 Skill 工具识别 | role.md 别让模型自己调;Codex agent 走 send-keys |
 | `Skill(skill="X")` 报 InputValidationError | skill 名字写错 / 当前会话没加载到 system-reminder 列表 | §1.2.2 的探针实测当前可调 skill |
 | `mcp__foo__bar` 报工具不存在 | MCP server 没连 | 检查项目 `.mcp.json` + `ccteam doctor` |
-| 模型在回答里写了 `/exit` 但会话没退 | TUI-only 命令模型摸不到 | 改成 ESCALATE 或让 orchestrator send-keys |
-| 长会话 context 涨到 80% 才发现没 reset | 通道 2 没自动触发 | orchestrator 60% 阈值要在 PostToolUse hook 里检查(已在 tech-design §6.9) |
+| 模型在回答里写了 `/exit` 但会话没退 | TUI-only 命令模型摸不到 | V0.4.0+ Claude bg session 没 TUI,role 应通过产 artifact 触发下游 / escalate event 协调 |
+| Claude bg session 跑飞 / 一直不结束 | role.md 缺 completion criterion;或 `timeout` 字段没设 | role.md 明确 "done 条件";workflow.yaml 为该 role 配 `timeout` + `on_timeout: escalate` |
+
+---
+
+## workflow.yaml trigger ↔ Claude Code 工具触发面(V0.4.0+ 映射)
+
+V0.4.0 把"何时起 agent"的决策从 phase DAG 改为 **workflow.yaml trigger**,
+本节解释这层抽象怎么落到 Claude Code 的工具触发面上。
+
+### 三种 trigger 的工具触发后果
+
+| trigger 类型 | 触发条件 | spawn 时 ccteam 注入 env | role.md 应该用的工具 |
+|---|---|---|---|
+| `watch:<path>` | inotify 检测到 `<path>` 下新文件写入完成(`IN_CLOSE_WRITE`,200ms debounce) | `CCTEAM_INPUT=<path>`(role.md 用 `Read` / `Glob` 扫输入)、`CCTEAM_OUTPUT=<output>` | 通常 `Read $CCTEAM_INPUT/<file>` + 处理 + `Write $CCTEAM_OUTPUT/<artifact>` |
+| `schedule` | 定时(`interval: 5m` 等)或 meta-agent 调 `spawn_agent` 主动触发 | `CCTEAM_OUTPUT=<output>` (input 通常没意义) | 自主任务(crawler / monitor 类),用 `Bash` / `WebFetch` 拉数据,`Write` 出 artifact |
+| `gate` | meta-agent / 人调 `mcp__ccteam__trigger_gate(gate_name, slug)` 后才起 | `CCTEAM_OUTPUT=<output>` + `CCTEAM_INPUT=<input>`(若声明) | 通常做"最终把关"(ship / publish 类),输出落地 + 通过 `Bash` 调外部命令(`gh pr create` / `npm publish` 等) |
+
+### spawn 时的完整 env 注入(V0.4.0 实测)
+
+```
+CCTEAM_PROJECT_SLUG=<team>-<slug>
+CCTEAM_INPUT=<project_root>/<workflow.yaml::agents.<role>.input>
+CCTEAM_OUTPUT=<project_root>/<workflow.yaml::agents.<role>.output>
+CCTEAM_JOB_ID=<uuid>
+CCTEAM_ROLE=<role>
+```
+
+role.md 里**直接引用** `$CCTEAM_INPUT` / `$CCTEAM_OUTPUT` 比硬编码路径好——
+项目名 / 路径 schema 升级时 role.md 无需改。
+
+### artifact 通信(role 之间的"消息")
+
+V0.4.0 红线:role 之间**只通过文件系统 artifact 通信**,不用 MCP 直接 RPC。
+具体做法:
+
+- upstream role `Write $CCTEAM_OUTPUT/<filename>` → 关文件
+- ArtifactWatcher 200ms 后发 `ArtifactEvent` → orchestrator 检查
+  `parallelism` → spawn downstream role(其 `trigger: watch:<那个 output 目录>`)
+- downstream role 启动时拿到 `CCTEAM_INPUT=<刚才那个 output 目录>`,`Read` /
+  `Glob` 自己消费
+
+这就是为什么 role.md 应该用 `Read` / `Glob` / `Write` 这几个内置工具操作
+artifact —— 这些工具直接和 Claude Code prompt cache 友好,且 ArtifactWatcher
+依赖文件系统事件,不依赖 MCP。
+
+### 与通道 1/2/3 的对应
+
+| workflow.yaml 概念 | 对应工具触发面 |
+|---|---|
+| `workflow.yaml::agents.<role>.executor: claude` | spawn `claude --bg --agent <role>`;**通道 1** 全开(role 可调 Task / Skill / MCP / 内置),**通道 2 不可用**(没 TUI) |
+| `workflow.yaml::agents.<role>.executor: codex` | spawn tmux + codex;**通道 1** 部分开(看 Codex 支持哪些工具),**通道 2 可用**(tmux send-keys) |
+| `workflow.yaml::agents.<role>.trigger: gate` | 由 **通道 3**(meta-agent + `mcp__ccteam__trigger_gate`)解锁后才起 |
+| role 产 artifact → 下游 `trigger: watch:*` | 完全 orchestrator deterministic(ArtifactWatcher),**不经任何 LLM 决策** |
+| escalation event 落 progress.jsonl | **通道 3** meta-agent 用 `observe_agents` / `get_progress` 读到自决策 |
+
+详 `docs/v0-4-0/prd.md §6` 完整架构 + `docs/interfaces.md` workflow.yaml schema。

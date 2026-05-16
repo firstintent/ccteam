@@ -18,7 +18,7 @@ context 包括：每条消息、每次文件读取、每次命令输出。一次
 - 用 status line 持续追踪 context 使用率
 - 参考 `/en/context-window`、`/en/statusline`、`/en/costs#reduce-token-usage`
 
-> **ccteam 映射**：本约束直接驱动了 tech-design.md §6.9 的「1M context + 60% 阈值在 phase 边界 reset」策略。
+> **ccteam 映射**(V0.4.0+)：本约束直接驱动了 tech-design.md §6.9 的「1M context + 60% 阈值,触发 reset」策略。V0.4.0 起 phase 机制已删除,reset 触发点改为 `agent_done` 事件或 supervisor 重启 `claude --bg --agent <role>` session 时(每个 agent session 独立 context,跨 agent 隔离即天然 reset)。
 
 ---
 
@@ -36,7 +36,7 @@ context 包括：每条消息、每次文件读取、每次命令输出。一次
 
 UI 验证可用 [Claude in Chrome](/en/chrome) 扩展（自动开 tab 测 UI 迭代）。
 
-> **ccteam 映射**：requirements.md 痛点 3「测试和质量是黑洞」+ tech-design.md §3.6「测试即验收」直接来自此原则。phase 协议必须强制每个产出 phase 都带可执行验证。
+> **ccteam 映射**(V0.4.0+)：requirements.md 痛点 3「测试和质量是黑洞」+ tech-design.md §3.6「测试即验收」直接来自此原则。V0.4.0 后协议要求:每个 `.claude/agents/<role>.md` 中产出 artifact 的 role,prompt 里要写明产物的可执行验证条目;下游 role 的 `trigger: watch:<artifact-dir>` 可挂检验型 agent(如 `verifier`)做闭环。
 
 ---
 
@@ -59,7 +59,7 @@ UI 验证可用 [Claude in Chrome](/en/chrome) 扩展（自动开 tab 测 UI 迭
 - 一句话能描述 diff → 跳过 plan
 - 跨多文件、不熟悉的代码、方案不确定 → **必须** plan
 
-> **ccteam 映射**：tech-design.md §3.3 的 9 阶段流水线（seed → plan-ceo → plan-eng → implement → test → fix → review → score → ship）就是这个 4-step 的细化版。每个 phase 之间的明确分隔即是"分离 research 与 implementation"的工程化体现。
+> **ccteam 映射**(V0.4.0+)：**9 阶段 phase 流水线已 EOL**。V0.4.0 重构后,explore/plan/implement 的分离改由 `workflow.yaml` 里多个 agent role 拓扑 + artifact 文件传递实现:例如 `explorer`(role,产 `findings/`)→ `planner`(`trigger: watch:findings/`,产 `plans/`)→ `implementer`(`trigger: watch:plans/`,改源码)。每个 agent 跑在独立 `claude --bg` session,context 天然隔离 = "分离 research 与 implementation" 的事件驱动工程化。
 
 ---
 
@@ -82,7 +82,7 @@ UI 验证可用 [Claude in Chrome](/en/chrome) 扩展（自动开 tab 测 UI 迭
 - **管道喂数据**：`cat error.log | claude`
 - **让 Claude 自己拉**：告诉它用 Bash / MCP / Read 自取
 
-> **ccteam 映射**：phase 模板的 prompt 必须用 `@.ccteam/phases/<phase>.md`、`@.ccteam/plan-eng.md` 引用而不是粘大段文本（tech-design.md §6.1）——这条最佳实践直接驱动了「短 send-keys + @文件引用」的注入协议。
+> **ccteam 映射**(V0.4.0+)：`.claude/agents/<role>.md` 中如需引用大段背景,用 `@<file>` 让 Claude Code 自己读,而非把整篇粘进 role prompt(role.md 越短 cache 越好,触发越准)。**V0.4.0 取消 send-keys 注入**——agent 通过 `claude --bg --agent <role>` 启动,prompt = role.md;orchestrator 只通过 env(`CCTEAM_INPUT`/`CCTEAM_OUTPUT`)告诉 agent artifact 路径,不再发"短 send-keys 命令"。
 
 ---
 
@@ -180,7 +180,7 @@ disable-model-invocation: true   # 有副作用 → 仅手动触发
 ---
 ```
 
-> **ccteam 映射**：tech-design §6.7 — 把 ccteam phase 模板做成 skill 包 `~/.claude/skills/ccteam-phases/`，作为非守护进程模式 fallback。
+> **ccteam 映射**(V0.4.0+)：自带 skill 在 repo 根 `skills/` 目录(`ccteam-control` / `ccteam-team-author` / `ccteam-project-creator` / `ccteam-creator`),作为 meta-agent 操作 ccteam 的对话向导。**phase 模板做 skill 的旧方案已 EOL**——V0.4.0 后没有 phase 概念。
 
 ### 4.7 创建 subagent
 
@@ -205,7 +205,7 @@ model: opus
 
 类型语言项目装 [code intelligence plugin](https://code.claude.com/docs/en/discover-plugins#code-intelligence)：精准符号导航 + 编辑后自动错误检测。
 
-> **ccteam 映射**：`claude-plugins-official` 是 ccteam phase 实现的复用源（CLAUDE.md §3.7）。
+> **ccteam 映射**(V0.4.0+)：`claude-plugins-official` 仍是 ccteam 推荐的 agent / hook / skill 复用源(CLAUDE.md §3.7)。spawned project session 通过 `enabledPlugins` 字段在 `<project>/.claude/settings.json` 里启用,plugin agent 可直接被 role 通过 `Task(subagent_type=...)` 调用。
 
 ### 何时用哪个扩展机制（决策参考）
 
@@ -243,7 +243,7 @@ Keep interviewing until we've covered everything, then write a complete spec to 
 
 完成后**起新会话**用 spec 实现——干净 context。
 
-> **ccteam 映射**：Seed phase 的 CLARIFY 路径就是这个范式的工程化——但 ccteam 强约束「只问一个问题」（tech-design §3.3）。
+> **ccteam 映射**(V0.4.0+)：**Seed phase 已 EOL**。V0.4.0 后反向面试由 **meta-agent** 承担——`mcp__ccteam__*` 17 个工具加上常驻 meta-agent claude session,用户输入模糊需求时,meta-agent 用 `AskUserQuestion` 工具反向澄清,确认后再用 `workflow.yaml` + `.claude/agents/*.md` 起项目(详 `skills/ccteam-creator/`)。
 
 ---
 
@@ -267,9 +267,9 @@ Keep interviewing until we've covered everything, then write a complete spec to 
 - CLAUDE.md 里加压缩偏好：`"When compacting, always preserve the full list of modified files and any test commands"`
 - 临时问题用 `/btw`：答案在 dismissible overlay，**不进 context history**
 
-> **ccteam 映射**：
-> - `/btw` 在 tech-design §6.9 被用作「忙时排队注入 phase prompt」的关键命令——本最佳实践直接给出了这条机制的官方语义
-> - context 60% reset 的策略是「auto compact 自动处理」对长跑场景不够用之后的工程升级（不依赖自动 compact，主动在 phase 边界做）
+> **ccteam 映射**(V0.4.0+)：
+> - V0.4.0 后**没有 send-keys 注入 phase prompt 这条路径**——`claude --bg --agent <role>` 启动时 role.md 就是 prompt;orchestrator 不再"忙时排队"长 prompt。`/btw` 由 meta-agent 用 `mcp__ccteam__signal` 工具调,等价于"给某 agent 投递一条侧带消息"
+> - context 60% reset 策略升级:每个 agent session 独立 context,自然就是天然 reset 单位;触发点改为 `agent_done` 事件后 supervisor 决定是否回收 session,而非 phase 边界主动 compact
 
 ### 6.3 用 subagent 做调查
 
@@ -334,10 +334,10 @@ CI / pre-commit hook / 脚本里的标准用法。
 
 测试反向：Session A 写测试 → Session B 写代码让测试过。
 
-> **ccteam 映射**：
-> - tech-design §3.4「git worktree + tmux」= worktrees 模式的工程化
-> - tech-design §6.3 Agent Teams 仅在 phase 内启用——全局调度是 orchestrator
-> - Writer/Reviewer 模式 = ccteam 的 implement → review phase 边界的最佳实践原型
+> **ccteam 映射**(V0.4.0+)：
+> - tech-design §3.4「git worktree」继续有效;V0.4.0 后 tmux 仅作 Codex executor 容器(`claude --bg --agent` 不依赖 tmux,supervisor 接管)
+> - **Agent Teams 概念已并入 workflow.yaml**——一个 workflow 即一组 role 的拓扑,全局调度由 thin orchestrator 按 artifact-trigger 驱动
+> - Writer/Reviewer 模式 = workflow.yaml 写两个 role:`writer`(产 `drafts/`)+ `reviewer`(`trigger: watch:drafts/`,产 `reviews/`),orchestrator 自动驱动 — Claude Code 最佳实践直接成为 V0.4.0 拓扑原型
 
 ### 7.3 跨文件 fan-out
 
@@ -378,7 +378,7 @@ claude --permission-mode auto -p "fix all lint errors"
 | **The trust-then-verify gap** | 看起来对、edge case 崩 | **必须**给验证手段 |
 | **The infinite exploration** | 让 Claude "调研"未限范围，读爆 context | 限范围 + 用 subagent |
 
-> **ccteam 映射**：这 5 条几乎一一对应 requirements.md 的 10 条用户痛点中的 4–7 条——ccteam 的 phase 协议、3-strike 升级、子项目隔离设计目标就是把这些失败模式工程化消除。
+> **ccteam 映射**(V0.4.0+)：这 5 条几乎一一对应 requirements.md 的 10 条用户痛点中的 4–7 条——V0.4.0 工程化对策:**每 agent 独立 session**(根治 kitchen-sink),**3-strike escalate → meta-agent / 用户**(根治 correcting-over-and-over),**workflow.yaml 极简没有 prompt**(根治 over-specified),**`.claude/agents/*.md` 显式列 acceptance**(根治 trust-then-verify),**artifact-trigger 限定 watch 路径**(根治 infinite exploration)。
 
 ---
 
@@ -409,19 +409,19 @@ claude --permission-mode auto -p "fix all lint errors"
 
 ## 附录 A：ccteam 设计决策 → 最佳实践对照速查
 
-| ccteam 设计 | 来自最佳实践哪条 | 工程化升级 |
+| ccteam 设计(V0.4.0+) | 来自最佳实践哪条 | 工程化升级 |
 |---|---|---|
-| 9 阶段 phase 流水线 | §2「先探索再规划再编码」 | 从 4 步细化到 9 步，每步独立产物可验证 |
-| 测试即验收 | §1「给验证方法」 | 把"应该"升级为"必须"——不通过不交付 |
-| `@文件引用` 注入 prompt | §3「@ 引用文件」 | send-keys 长度限制 + tech-design §6.1 |
-| 项目级 CLAUDE.md 自动生成 | §4.1 + §6.2 「压缩偏好」 | 60% reset 时作为「桥梁」 |
+| `workflow.yaml` agent 拓扑 + artifact-trigger | §2「先探索再规划再编码」 | 把 4 步泛化为任意 role DAG;每个 role 独立 session 天然分离 research / implementation |
+| 测试即验收 | §1「给验证方法」 | role.md 必写产物验证;下游 `verifier` role 可做闭环 |
+| `@文件引用` 注入 role.md | §3「@ 引用文件」 | role.md 越短 cache 越好 |
+| 项目级 CLAUDE.md 自动生成 | §4.1 + §6.2 「压缩偏好」 | meta-agent + role.md 共享 CLAUDE.md 桥接 |
 | `--dangerously-skip-permissions` + 容器 | §4.2 「sandboxing」 | 给最终用户产出的项目专用 |
-| progress.jsonl + Stop hook | §4.5 「hooks deterministic」 | 状态机唯一事实来源 |
-| 复用 ralph-loop / feature-dev / pr-review-toolkit | §4.7 + §4.8 | plugin 不是依赖、是参考实现 |
-| 忙时 `/btw` 排队注入 | §6.2 「`/btw` 不进 history」 | tech-design §6.9 |
-| tmux 长 session（不用 `claude -p`） | §7.2 「parallel sessions」 worktrees 范式 | 工程化为「关电脑也跑」 |
-| Seed phase 的 CLARIFY 单问 | §5.2 「让 Claude 反向面试」 | 强约束只问一个 |
-| 3-strike 自愈 + 升级 | §8 「correcting over and over」 | `/clear` 升级为「升级给用户 + 报告 try 过什么」 |
+| progress.jsonl + business-event hook | §4.5 「hooks deterministic」 | 7 类 workflow event 唯一事实来源 |
+| 复用 plugin 的 agent / hook / skill | §4.7 + §4.8 | plugin 不是依赖、是参考实现;spawned session 用 `enabledPlugins` 启用 |
+| meta-agent 调 `signal` 投递侧带消息 | §6.2 「`/btw` 不进 history」 | `mcp__ccteam__signal` 抽象 `/btw` |
+| `claude --bg --agent` + supervisor | §7.2 「parallel sessions」 worktrees 范式 | 工程化为「100 agent 并发,关电脑也跑」 |
+| meta-agent CLARIFY 反向面试 | §5.2 「让 Claude 反向面试」 | `skills/ccteam-creator` 引导 |
+| 3-strike escalate + meta-agent / 用户 | §8 「correcting over and over」 | escalation event 上 progress.jsonl 落档 |
 
 ---
 
