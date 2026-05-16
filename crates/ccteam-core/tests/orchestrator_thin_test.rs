@@ -1528,14 +1528,13 @@ async fn t35_agent_spawn_event_carries_job_id_field() {
 
 #[tokio::test]
 #[serial]
-async fn t36_phantom_cleanup_bumps_project_state_cost_in_sync() {
-    // Cost-aggregation fix: when poll_completions writes the synthetic
-    // `agent_done`, it must also bump `state.cost_used_usd` so the
-    // dashboard column (sourced from ProjectState) and the web UI
-    // (sourced from progress.jsonl) report the same total. For this
-    // case we use a state.json with non-zero cost so the bump is
-    // observable; the phantom path itself reports cost_usd = 0 by
-    // design (sigkill → no cost recorded).
+async fn t36_phantom_cleanup_records_cost_in_progress_for_cost_summary() {
+    // V0.4.6 F91 — when poll_completions writes the synthetic
+    // `agent_done`, the cost shipped on that event is the SoT for
+    // `cost_summary`. Pre-F91 the orchestrator also bumped
+    // `state.cost_used_usd`; F91 retired that path (state field is
+    // frozen serde-compat), so the assertion now reads through
+    // `cost_summary(slug, …)` — same downstream surface, new source.
     use ccteam_core::state::ProjectState;
 
     let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_WATCH_FIXER);
@@ -1594,10 +1593,13 @@ async fn t36_phantom_cleanup_bumps_project_state_cost_in_sync() {
     assert_eq!(done["status"], "error", "failed state.json maps to error");
     assert!((done["cost_usd"].as_f64().unwrap() - 1.25).abs() < 1e-9);
 
-    let state = ProjectState::load(&paths.project_state(&slug)).unwrap();
+    // F91: state.cost_used_usd stays at 0.0 (frozen / no longer
+    // mutated). The new SoT — cost_summary — surfaces the cost via
+    // its `cost_total_usd` field, reading from progress.jsonl.
+    let cost = ccteam_core::cost_summary(&slug, &progress, &paths).unwrap();
     assert!(
-        (state.cost_used_usd - 1.25).abs() < 1e-9,
-        "state.cost_used_usd must mirror the agent_done cost, got {}",
-        state.cost_used_usd,
+        (cost.cost_total_usd - 1.25).abs() < 1e-9,
+        "cost_summary.cost_total_usd must reflect the agent_done cost, got {}",
+        cost.cost_total_usd,
     );
 }

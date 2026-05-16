@@ -769,14 +769,13 @@ impl Orchestrator {
         for (role, handle, cost_usd, status) in finished {
             if let Some(c) = cost_usd {
                 *self.cost_accum.lock().await += c;
-                // V0.4.5 F80 — keep `state.cost_used_usd` (read by
-                // `ccteam show <slug>` + the dashboard cost column)
-                // in sync with the `agent_done` cost the web UI
-                // already aggregates from progress.jsonl. Pre-F80
-                // these two surfaces diverged: hooks updated
-                // state.cost_used_usd from the per-tool cost feed,
-                // but agent_done cost lived only in the event log.
-                self.bump_project_state_cost(slug, c).await;
+                // V0.4.6 F91 — `state.cost_used_usd` is deprecated; the
+                // cost SoT is now the `agent_done` event below plus the
+                // live `cost_summary` API (which reads progress.jsonl +
+                // `~/.claude/jobs/<id>/state.json`). The pre-F91 F80
+                // bump is retired so we don't keep mutating a frozen
+                // field. `cost_accum` (in-memory tick budget) is still
+                // updated for legacy budget checks that read it.
             }
             let _ = progress::append_event(
                 progress_path,
@@ -812,36 +811,6 @@ impl Orchestrator {
 
         self.check_gates(slug, spec, project_dir, progress_path)
             .await;
-    }
-
-    /// V0.4.5 F80 — best-effort bump of `state.cost_used_usd` on disk
-    /// so the dashboard cost column (sourced from `ProjectState`) and
-    /// the web UI workflow card (sourced from progress.jsonl
-    /// `agent_done.cost_usd`) report the same number. Read-modify-write
-    /// is wrapped in `ProjectState::save` which is atomic + makes a
-    /// `.bak`; a missing `state.json` (test fixtures, transient race)
-    /// is silently skipped — the source-of-truth event log already has
-    /// the cost. Errors log but never bubble; the orchestrator's
-    /// dispatch loop must not stall on cost-bookkeeping.
-    async fn bump_project_state_cost(&self, slug: &str, delta: f64) {
-        if delta <= 0.0 {
-            return;
-        }
-        let state_path = self.paths.project_state(slug);
-        if !state_path.exists() {
-            return;
-        }
-        let mut state = match crate::state::ProjectState::load(&state_path) {
-            Ok(s) => s,
-            Err(err) => {
-                tracing::warn!(slug, ?err, "F80 cost bump: load state.json failed");
-                return;
-            }
-        };
-        state.cost_used_usd += delta;
-        if let Err(err) = state.save(&state_path) {
-            tracing::warn!(slug, ?err, "F80 cost bump: save state.json failed");
-        }
     }
 
     /// Scan `.ccteam/spawn_requests/*.json` markers written by the F65

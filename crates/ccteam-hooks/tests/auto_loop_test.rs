@@ -32,6 +32,9 @@ impl Fixture {
         let project_dir = paths.project_dir(slug);
         std::fs::create_dir_all(project_dir.join(".ccteam")).unwrap();
         let now = Utc::now();
+        // V0.4.6 F91 — `cost_used_usd` is deprecated but still part of
+        // the struct shape; silence the warn at this fixture site.
+        #[allow(deprecated)]
         ProjectState {
             slug: slug.into(),
             team: "dev".into(),

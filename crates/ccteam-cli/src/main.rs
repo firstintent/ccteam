@@ -326,6 +326,13 @@ enum Command {
         /// `watchdog.yaml.migrated`. Idempotent.
         #[arg(long, default_value_t = false)]
         migrate_v041_to_v042: bool,
+        /// V0.4.6 F91: walk every registered project's
+        /// `.claude/settings.json` and strip the legacy
+        /// `ccteam hook cost-accumulate` PostToolUse entry. Idempotent —
+        /// re-runs after success are no-ops. Pair with `--dry-run` to
+        /// preview the scrub.
+        #[arg(long, default_value_t = false)]
+        update_hooks: bool,
     },
     /// V0.2 M0.18.6: render the orchestrator's per-phase inject
     /// prompt (frontmatter-driven) plus the `@`-referenced phase
@@ -509,10 +516,6 @@ enum HookCommand {
     /// Stop hook: parse last assistant message for `PHASE_DONE: <phase>`
     /// or `ESCALATE: <reason>` and emit the matching progress event.
     ParsePhaseEnd,
-    /// PostToolUse hook: refresh state.json `context_tokens_used` from
-    /// the latest assistant message's `usage.*`. Dollar costs land in
-    /// M0.14.
-    CostAccumulate,
     /// SessionStart hook: write the `<project>/.ccteam/ready` marker.
     /// M0.10 extends this to bridge a pre-reset progress summary.
     LoadContext,
@@ -612,11 +615,7 @@ fn main() -> Result<()> {
             let paths = CcteamPaths::from_env()?;
             run_send(&paths, &slug, role.as_deref(), no_spawn, &body)
         }
-        Command::Spawn {
-            slug,
-            role,
-            prompt,
-        } => {
+        Command::Spawn { slug, role, prompt } => {
             let paths = CcteamPaths::from_env()?;
             run_spawn(&paths, &slug, &role, prompt.as_deref())
         }
@@ -650,6 +649,7 @@ fn main() -> Result<()> {
             migrate_recommended_agents,
             screenshot_smoke,
             migrate_v041_to_v042,
+            update_hooks,
         } => {
             // V0.4.1 `--install-all` is sugar for the three first-run
             // flags. Explicit flags still win where set; we OR them.
@@ -669,6 +669,7 @@ fn main() -> Result<()> {
                 migrate_recommended_agents,
                 screenshot_smoke,
                 migrate_v041_to_v042,
+                update_hooks,
             })
         }
         Command::Phase { cmd } => run_phase(cmd),
@@ -840,10 +841,6 @@ fn run_hook(cmd: HookCommand) -> Result<()> {
                     std::process::exit(2);
                 }
             }
-        }
-        HookCommand::CostAccumulate => {
-            let stdin = parse_hook_stdin_json()?;
-            ccteam_hooks::cost_accumulate(&paths, &stdin)
         }
         HookCommand::LoadContext => {
             let stdin = parse_hook_stdin_json()?;
@@ -1237,10 +1234,7 @@ fn run_send(
 ) -> Result<()> {
     let project_dir = paths.project_dir(slug);
     if !project_dir.exists() {
-        anyhow::bail!(
-            "no project `{slug}` at {}",
-            project_dir.display()
-        );
+        anyhow::bail!("no project `{slug}` at {}", project_dir.display());
     }
     let body = read_body_or_stdin(body)?;
     let body = body.trim();
@@ -1286,8 +1280,7 @@ fn run_send(
     };
     // Atomic write: .tmp then rename (matches inbox.rs::save).
     let tmp = path.with_extension("md.tmp");
-    std::fs::write(&tmp, &frontmatter)
-        .with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::write(&tmp, &frontmatter).with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, &path)
         .with_context(|| format!("rename {} → {}", tmp.display(), path.display()))?;
     println!("queued inbox message: {}", path.display());
@@ -1301,18 +1294,10 @@ fn run_send(
     Ok(())
 }
 
-fn run_spawn(
-    paths: &CcteamPaths,
-    slug: &str,
-    role: &str,
-    prompt: Option<&str>,
-) -> Result<()> {
+fn run_spawn(paths: &CcteamPaths, slug: &str, role: &str, prompt: Option<&str>) -> Result<()> {
     let project_dir = paths.project_dir(slug);
     if !project_dir.exists() {
-        anyhow::bail!(
-            "no project `{slug}` at {}",
-            project_dir.display()
-        );
+        anyhow::bail!("no project `{slug}` at {}", project_dir.display());
     }
     // Validate the role exists in workflow.yaml so we fail loud here
     // instead of letting the orchestrator silently delete the marker
@@ -1327,12 +1312,8 @@ fn run_spawn(
     }
 
     let bucket = project_dir.join(".ccteam").join("spawn_requests");
-    std::fs::create_dir_all(&bucket)
-        .with_context(|| format!("create {}", bucket.display()))?;
-    let session_id = format!(
-        "{role}-{}",
-        chrono::Utc::now().timestamp_micros()
-    );
+    std::fs::create_dir_all(&bucket).with_context(|| format!("create {}", bucket.display()))?;
+    let session_id = format!("{role}-{}", chrono::Utc::now().timestamp_micros());
     let marker = bucket.join(format!("{session_id}.json"));
 
     let resolved_prompt = match prompt {
@@ -1356,7 +1337,10 @@ fn run_spawn(
     println!("  session_id: {session_id}");
     if let Some(p) = resolved_prompt.as_deref() {
         let head: String = p.chars().take(80).collect();
-        println!("  prompt:     {head}{}", if p.len() > 80 { "…" } else { "" });
+        println!(
+            "  prompt:     {head}{}",
+            if p.len() > 80 { "…" } else { "" }
+        );
     } else {
         println!("  prompt:     <default kick prompt>");
     }
@@ -1370,8 +1354,8 @@ fn run_new(slug: String, team: String) -> Result<()> {
     // V0.4.3 F76: fail loud at the CLI boundary on invalid slug grammar
     // (whitespace / unicode / leading dash etc.) so we don't spawn
     // `~/projects/<garbage>/` and leave junk for the user to clean up.
-    let validated = ccteam_core::validate_slug_format(&slug)
-        .with_context(|| format!("ccteam new {slug:?}"))?;
+    let validated =
+        ccteam_core::validate_slug_format(&slug).with_context(|| format!("ccteam new {slug:?}"))?;
     let paths = CcteamPaths::from_env()?;
     // V0.4.2 F75: `ccteam new <slug>` delegates to `ccteam init` with
     // `install_in = <projects_root>/<final_slug>`. F22 invariant: if

@@ -608,6 +608,129 @@ pub fn rewrite_legacy_hook_commands(
     })
 }
 
+/// V0.4.6 F91: outcome of a single project's `cost-accumulate` hook
+/// scrub. See [`remove_cost_accumulate_hooks`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CostAccumulateScrubAction {
+    /// `settings.json` absent — nothing to do.
+    NotFound,
+    /// No `cost-accumulate` hook entries found. Idempotent re-run after
+    /// success hits this branch.
+    NoChangeNeeded,
+    /// `dry_run = true` — would have removed N entries.
+    WouldRemove { entries: usize },
+    /// Removed N hook entries and atomically wrote the file.
+    Removed { entries: usize },
+}
+
+/// V0.4.6 F91: per-project report for [`remove_cost_accumulate_hooks`].
+#[derive(Debug, Clone)]
+pub struct CostAccumulateScrubReport {
+    pub target: PathBuf,
+    pub action: CostAccumulateScrubAction,
+}
+
+/// V0.4.6 F91: strip the legacy `ccteam hook cost-accumulate` hook entry
+/// from a project's `.claude/settings.json`. F91 retired the
+/// PostToolUse cost-accumulator (Claude itself reports cost on each
+/// `agent_done` event into `progress.jsonl`); existing projects need
+/// their settings.json cleaned so Claude Code doesn't keep firing the
+/// now-missing subcommand.
+///
+/// Detection rule: any `command` string ending with `hook cost-accumulate`
+/// (binary path prefix can be anything — `/usr/local/bin/ccteam hook
+/// cost-accumulate`, `ccteam hook cost-accumulate`, or even the legacy
+/// `cct hook cost-accumulate`). Inner hook entries matching the rule
+/// are removed; entries whose only-remaining sibling matrix collapses
+/// to empty are pruned too so the file shape stays clean.
+///
+/// Idempotent — re-runs after a successful scrub hit `NoChangeNeeded`.
+pub fn remove_cost_accumulate_hooks(
+    settings_path: &Path,
+    dry_run: bool,
+) -> Result<CostAccumulateScrubReport> {
+    if !settings_path.exists() {
+        return Ok(CostAccumulateScrubReport {
+            target: settings_path.to_path_buf(),
+            action: CostAccumulateScrubAction::NotFound,
+        });
+    }
+
+    let body = std::fs::read_to_string(settings_path)
+        .with_context(|| format!("read {}", settings_path.display()))?;
+    let mut v: serde_json::Value = serde_json::from_str(&body)
+        .with_context(|| format!("parse {}", settings_path.display()))?;
+
+    let mut removed = 0usize;
+    let Some(hooks) = v.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
+        return Ok(CostAccumulateScrubReport {
+            target: settings_path.to_path_buf(),
+            action: CostAccumulateScrubAction::NoChangeNeeded,
+        });
+    };
+    for (_event, list) in hooks.iter_mut() {
+        let Some(arr) = list.as_array_mut() else {
+            continue;
+        };
+        for entry in arr.iter_mut() {
+            let Some(inner_hooks) = entry.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
+                continue;
+            };
+            // Keep only the hook commands that aren't cost-accumulate.
+            let before = inner_hooks.len();
+            inner_hooks.retain(|hook| !hook_command_is_cost_accumulate(hook));
+            removed += before - inner_hooks.len();
+        }
+        // Drop now-empty inner hook lists so the settings.json shape
+        // stays clean (e.g. PostToolUse → [{}] with empty inner is
+        // semantically a no-op but ugly to leave behind).
+        arr.retain(|entry| {
+            entry
+                .get("hooks")
+                .and_then(|h| h.as_array())
+                .map(|a| !a.is_empty())
+                .unwrap_or(false)
+        });
+    }
+    // Drop now-empty top-level event arrays.
+    hooks.retain(|_event, list| list.as_array().map(|a| !a.is_empty()).unwrap_or(false));
+
+    if removed == 0 {
+        return Ok(CostAccumulateScrubReport {
+            target: settings_path.to_path_buf(),
+            action: CostAccumulateScrubAction::NoChangeNeeded,
+        });
+    }
+    if dry_run {
+        return Ok(CostAccumulateScrubReport {
+            target: settings_path.to_path_buf(),
+            action: CostAccumulateScrubAction::WouldRemove { entries: removed },
+        });
+    }
+
+    let body = serde_json::to_string_pretty(&v).context("serialize updated settings.json")?;
+    let tmp = settings_path.with_extension("json.ccteam-f91-scrub.tmp");
+    std::fs::write(&tmp, &body).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, settings_path)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), settings_path.display()))?;
+    Ok(CostAccumulateScrubReport {
+        target: settings_path.to_path_buf(),
+        action: CostAccumulateScrubAction::Removed { entries: removed },
+    })
+}
+
+/// Predicate: does this `hook` JSON entry invoke `ccteam hook
+/// cost-accumulate` (or the F39-era `cct` variant)? Matches both
+/// absolute-path and bare invocations, with or without a trailing
+/// space + args.
+fn hook_command_is_cost_accumulate(hook: &serde_json::Value) -> bool {
+    let Some(cmd) = hook.get("command").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    let trimmed = cmd.trim();
+    trimmed.ends_with(" hook cost-accumulate") || trimmed.contains(" hook cost-accumulate ")
+}
+
 /// V0.2.2 F44: rewrite one hook `command` string. Returns `None` when
 /// the command does not look like an F39-era `cct hook …` invocation
 /// (so the caller can leave it alone — preserves operator-authored
