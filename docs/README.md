@@ -11,7 +11,8 @@
 | 文件 | 角色 | 何时读 |
 |---|---|---|
 | [`requirements.md`](requirements.md) | 15 痛点(13 用户痛点 + 2 个 V1.0.0 终极目标) | 验收基准;PR 描述映射用 |
-| [`tech-design.md`](tech-design.md) | 架构 SoT | 改架构前必看 |
+| [`orchestration-patterns.md`](orchestration-patterns.md) | 5 模式编排目录 + 拆分哲学(ccteam 后续迭代的模式选型字典) | 加 workflow 模板 / 设计新 finding / 拓展新领域 team 前 |
+| [`tech-design.md`](tech-design.md) | 架构 SoT(workflow.yaml + ArtifactWatcher + thin orchestrator 怎么实现 5 模式) | 改架构前必看 |
 | [`interfaces.md`](interfaces.md) | 协议 SoT(YAML / JSON / CLI / hooks / state) | 改 schema 必同步 |
 | [`dev-coupling-audit.md`](dev-coupling-audit.md) | F-finding 累积(跨版本) | 改 `ccteam-core` 前 |
 | [`ccteam-as-domain-agnostic-orchestrator.md`](ccteam-as-domain-agnostic-orchestrator.md) | team 泛化 charter | 加新 team 前 |
@@ -26,8 +27,7 @@
 | [`research/thin-harness-fat-skills-architecture-improvement.md`](research/thin-harness-fat-skills-architecture-improvement.md) | Thin Harness + Fat Skills 架构改进建议 |
 | [`research/ccteam-codex-integration.md`](research/ccteam-codex-integration.md) | Codex 作为控制端 / sidecar / worker 的路径 |
 | [`research/ccteam-ast-grep-integration.md`](research/ccteam-ast-grep-integration.md) | ast-grep 集成分析(结构搜索 / 规则 / codemod) |
-| [`research/claude-code-orchestration-patterns.md`](research/claude-code-orchestration-patterns.md) | Claude Code 编排模式 5 种 canonical 形态 |
-| [`research/omc-orchestration-modes.md`](research/omc-orchestration-modes.md) | OMC 8 mode 全谱调研 |
+| [`research/omc-orchestration-modes.md`](research/omc-orchestration-modes.md) | OMC 8 mode 全谱调研(为 [`../orchestration-patterns.md`](orchestration-patterns.md) 提供素材) |
 | [`research/omc-vs-ccteam-orchestration.md`](research/omc-vs-ccteam-orchestration.md) | prompt-as-orchestrator vs code-as-orchestrator 对比 |
 
 ## 版本归档(`v0-x-x/`)

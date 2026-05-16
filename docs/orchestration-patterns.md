@@ -1,17 +1,23 @@
-# Claude Code 之上的编排模式 —— 拆分哲学 + 5 模式目录
+# 编排模式 —— 拆分哲学 + 5 模式目录(ccteam 设计依据)
 
-> **调研主题**:在 Claude Code 之上构建多 agent 系统的两个核心问题:
-> 1. **什么时候该拆 agent?**(设计哲学 — "按上下文拆,不按角色拆")
-> 2. **拆完了怎么编排?**(模式目录 — 5 种标准编排模式)
+> **角色**:tier-1 全局文档。ccteam 后续所有 workflow 设计、agent 拓扑、自动化迭代**都基于本文的 5 模式 + 拆分哲学**;新加 workflow 模板 / 重做 fix-loop / 拓展非编程领域 team 都先回到本文校准。
+>
+> **回答两个核心问题**:
+> 1. **什么时候该拆 agent?**(§一 设计哲学 — "按上下文拆,不按角色拆")
+> 2. **拆完了怎么编排?**(§二 5 种 canonical 模式)
 >
 > **资料来源**:
-> - 「如何设计 Multi-Agent」+「超有用的 5 种编排模式」短文(2026-05 大模型大鱼公众号)
-> - Anthropic Engineering Blog "Building Effective Agents"(canonical 5-pattern taxonomy)
-> - 本仓 [`omc-orchestration-modes.md`](omc-orchestration-modes.md) — OMC 8 mode 全谱
-> - 本仓 [`omc-vs-ccteam-orchestration.md`](omc-vs-ccteam-orchestration.md) — OMC 与 ccteam 架构深度对比
-> - `oh-my-claudecode@4.13.7` `skills/team/SKILL.md`(1040 行 prompt-as-orchestrator 标杆)
+> - Anthropic Engineering Blog *"Building Effective Agents"*(canonical 5-pattern taxonomy)
+> - 大模型大鱼 2026-05《如何设计 Multi-Agent》+《超有用的 5 种编排模式》短文
+> - 配套研究:`research/omc-orchestration-modes.md`(OMC 8 mode 深拆)+ `research/omc-vs-ccteam-orchestration.md`(prompt-as-orchestrator vs code-as-orchestrator 路线对比)
 >
-> **范围**:本文聚焦"模式分类 + 拆分判定 + 在 Claude Code 原语上的映射"。OMC 8 个 mode 的逐个深拆见配套 `omc-orchestration-modes.md`;OMC vs ccteam 实现路线对比见 `omc-vs-ccteam-orchestration.md`,本文不复述。
+> **跟其他全局文档的关系**:
+> - `requirements.md` 给"用户痛点 + V1.0.0 终极目标"
+> - **本文给"模式选型字典"** — 解决"该痛点应该用哪种编排模式"
+> - `tech-design.md` 给"ccteam 当前架构 = workflow.yaml + ArtifactWatcher + thin orchestrator"作为承载层
+> - `interfaces.md` 给"workflow.yaml schema / Trigger / parallelism" 等具体协议
+>
+> ccteam 加新 finding / 新 team / 新 workflow 时:**先回本文识别走哪条模式**,再到 tech-design / interfaces 找具体怎么写。
 
 ---
 
@@ -198,28 +204,29 @@ ccteam 的对策(架构红线):**所有 state 进 `progress.jsonl` 一种文件*
 
 ---
 
-## 五、对 ccteam 的具体启发(V0.4.6+ 候选)
+## 五、ccteam 对 5 模式的承载现状 + 后续迭代方向
 
-只列前面 `omc-orchestration-modes.md §四` 没覆盖的、本文从 5-模式视角浮现的新点。不要求采纳。
+V0.4.6 ccteam 通过 `workflow.yaml` + Trigger 4 类 + parallelism 字段承载 5 模式如下;**缺口即下个版本设计输入**:
 
-1. **"按上下文拆"反推 `ccteam-creator` skill 的 dialogue 流程** — V0.4.0 推出 `workflow.yaml` 后,用户写工作流容易按 role 直觉拆(plan / build / test / review)。`ccteam-creator` skill 可以加一条强制 dialogue:**先问"两个 agent 间有多少信息重叠"再决定拆不拆**;给出 §1.3 的 checklist 让用户走一遍
+| 模式 | V0.4.6 承载 | 缺口 → 下版本设计输入 |
+|---|---|---|
+| **Chaining** | `Trigger::Watch(<dir>)` 接力 + artifact 文件 = 串行管道 | ✅ 充分,无需改 |
+| **Routing** | 静态:`workflow.yaml` 写死 role;动态:meta-agent + MCP `spawn_agent` 临时调度 | **缺动态路由 sugar**:`workflow.yaml` 应加 `agent.router: <expr>` 字段,orchestrator 解析后 LLM 推理选具体 agent |
+| **Parallelization (segment)** | `agent.parallelism: u32` + `Trigger::Watch(<dir>)` fan-out = 多文件并行 | ✅ 充分(每个新 artifact 触发独立 session) |
+| **Parallelization (vote)** | **完全缺失** | 加 `agent.fan_out: { count: 3, merge: vote\|best\|concat }` 语法 — 同 prompt fork N 个,merge 策略由 orchestrator 实现 |
+| **Orchestrator-Worker** | meta-agent + 17 MCP `mcp__ccteam__*` 工具 = orchestrator 层;workflow.yaml 各 agent = worker 层 | ✅ 充分,这是 ccteam 主流形态 |
+| **Evaluator-Optimizer** | `fix_counts` 3-strike → escalation 是隐含的 evaluator-optimizer | **缺显式 sugar**:加 `agent.evaluates: <target>` + `max_iterations: N` + `on_max_exceeded: escalate\|accept` 让 reviewer 多轮可声明 |
 
-2. **Routing 模式是 V0.4.0 的盲点** — `workflow.yaml` 只支持写死 role(静态路由);OMC 的"任务特征 → role 动态路由"在 ccteam 里只能靠 meta-agent 临时调度。可以加 `workflow.yaml` `agent.router: <expr>` 字段(类似 F62 的 condition expression),由 orchestrator 解析后 LLM 推理选具体 agent
+**两条横向迭代方向**:
 
-3. **Parallel (vote) 在 ccteam 完全缺失** — `workflow.yaml` 表达不了"同 prompt fork 3 个 agent 然后投票"。这是 OMC `ccg` 的等价。V0.4.x 可以加 `agent.fan_out: { count: 3, merge: vote | best | concat }` 语法
+1. **"按上下文拆"反推 `ccteam-creator` skill dialogue** — 用户写 workflow.yaml 容易按 role 直觉拆(planner / builder / tester / reviewer)。`ccteam-creator` skill 应在 dialogue 中强制走 §1.3 checklist:"两个 agent 间有多少信息重叠?"重叠 >50% 就合并 — 默认行为应是 monolithic agent + subagent 内 ad-hoc 拆,不是 workflow.yaml 切 N 个 role。
 
-4. **Evaluator-Optimizer 显式化** — `workflow.yaml` `budget.fix_loop_attempts` 是隐含的 evaluator-optimizer,但用户写起来不容易表达"reviewer 多轮"模式。可以加 sugar 语法:
-   ```yaml
-   agents:
-     - name: reviewer
-       evaluates: implementor
-       max_iterations: 3
-       on_max_exceeded: escalate
-   ```
+2. **Composability**(ccteam 最弱) — 当前必须重写整个 workflow.yaml 才能复合两个模式。设计 `workflow.yaml::extends: <path>` + override 语法,让常见 composition(ralph-shell / vote-merger / evaluator-loop)模板化。OMC 的 `/team ralph` 一行命令复合两个模式是参考形态。
 
-5. **Composability 是 ccteam 最弱的一面** — OMC 高级用户 `/team ralph` 一行命令复合两个模式;ccteam 必须重写整个 `workflow.yaml` 才能复合。V0.4.6+ 可以考虑 workflow include / mixin(`extends: ../shared/ralph-shell.yaml` + override),让常见 composition 模板化
-
-6. **"按上下文边界"反推 phase 删除是对的** — V0.4.0 把 phase 整个删了,转 artifact-event-driven。从"按上下文拆"角度看,phase 强制把一个连续任务切成 N 段(每段独立 agent context),反而违反原则。**workflow.yaml 的 event-driven 才是更原生的表达** — 同一 agent 可以跨多个 trigger,context 自然延续
+**架构红线**(本文 §1.4 + §4.4 引申):
+- 5 模式可叠加但 state 必须收敛 — ccteam 所有 state 进 `progress.jsonl`,**绝不**为新模式开新 state 文件(OMC `cancel/SKILL.md` 387 行膨胀是反面教材)
+- Evaluator-Optimizer 必须 hard cap — `fix_counts` 3-strike escalation 是 V0.4.0 红线,任何新增 evaluator 模式遵守同样 cap
+- "按上下文拆"是 phase 删除(V0.4.0 F60)的根本论证 — workflow.yaml event-driven 才是更原生表达,不要走回头路
 
 ---
 
@@ -241,8 +248,8 @@ ccteam 的对策(架构红线):**所有 state 进 `progress.jsonl` 一种文件*
 | 按上下文拆不按角色拆 + checklist | 「如何设计 Multi-Agent」(2026-05 大模型大鱼公众号) |
 | 5 种编排模式分类 + 用例描述 | 「超有用的 5 种编排模式」(同上) |
 | Canonical 5-pattern 术语 | Anthropic Engineering Blog "Building Effective Agents"(2024-12) |
-| OMC 8 mode 全谱 + composability 三层 | [`omc-orchestration-modes.md`](omc-orchestration-modes.md) §一 §三 |
-| OMC vs ccteam 编排架构两条路线 | [`omc-vs-ccteam-orchestration.md`](omc-vs-ccteam-orchestration.md) §四 |
+| OMC 8 mode 全谱 + composability 三层 | [`research/omc-orchestration-modes.md`](research/omc-orchestration-modes.md) §一 §三 |
+| OMC vs ccteam 编排架构两条路线 | [`research/omc-vs-ccteam-orchestration.md`](research/omc-vs-ccteam-orchestration.md) §四 |
 | OMC team 7-phase pipeline + 5-stage routing 表 | `oh-my-claudecode@4.13.7` `skills/team/SKILL.md` |
 | OMC `.omc/handoffs/<stage>.md` handoff 机制 | 同上 §"Stage Handoff Convention" |
 | `team ralph` composition(横切修饰符) | 同上 §"Team + Ralph Composition" |

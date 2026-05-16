@@ -29,22 +29,23 @@
 |---|---|---|
 | 0 | `docs/README.md` — 全局文档索引 + 维护规约 | 加 / 改 / 归档文档前 |
 | 1 | `docs/requirements.md` — 15 痛点(13 用户痛点 + 2 个 V1.0.0 终极目标) | 验收基准;PR 描述映射用 |
-| 2 | `docs/tech-design.md` — 架构 SoT | 改架构前必看;§3.7 Cross-project Memory / §3.8 用户接口层 / §6 扩展点 |
-| 3 | `docs/interfaces.md` — 协议参考 | 改 schema / CLI / MCP / hooks 时同步 |
-| 4 | `docs/v0-2/README.md` — V0.2 文档入口 + V0.3 deferred 列表 | 当前最新版,V0.2 ship 状态 / V0.3 候选 |
-| 5 | `docs/v0-1/README.md` — V0.1 历史归档入口 | 看 V0.1 决策依据(M0-M4.4)|
-| 6 | `docs/dev-coupling-audit.md` — F-finding 解耦审计 | 改 `ccteam-core` 之前;新发现加 F<N> |
-| 7 | `docs/ccteam-as-domain-agnostic-orchestrator.md` — 团队泛化论证 | M5+ 加新 team / 改 `ccteam-core` 红线时 |
-| 8 | `docs/claude-code-best-practices.md` | 改 phase prompt / hooks / context 管理时 |
-| 9 | `docs/claude-code-tool-surface.md` | 改 phase YAML `tools_required` / sub-skill 时 |
-| 10 | `references/research/claude-code-memory-research.md` §六 | M4 任何记忆相关改动前 |
+| 2 | `docs/orchestration-patterns.md` — 5 模式编排目录 + 拆分哲学 | 加 workflow 模板 / 设计新 finding / 拓展新领域 team 前 |
+| 3 | `docs/tech-design.md` — 架构 SoT(workflow.yaml 怎么实现 5 模式) | 改架构前必看 |
+| 4 | `docs/interfaces.md` — 协议参考(YAML / JSON / CLI / hooks / state) | 改 schema 必同步 |
+| 5 | `docs/dev-coupling-audit.md` — F-finding 累积(跨版本)| 改 `ccteam-core` 之前;新发现加 F<N> |
+| 6 | `docs/ccteam-as-domain-agnostic-orchestrator.md` — 团队泛化论证 | 加新 team / 改 `ccteam-core` 红线时 |
+| 7 | `docs/claude-code-best-practices.md` | 改 agent prompt / hooks / context 管理时 |
+| 8 | `docs/claude-code-tool-surface.md` | 改 workflow.yaml + `.claude/agents/<role>.md` 时 |
+| 9 | `docs/v0-4-6/README.md` — V0.4.6 文档入口(当前版本) | 看 V0.4.6 状态 + V0.4.7 候选 |
+| 10 | `docs/v0-1/README.md` — V0.1 历史归档入口 | 看 V0.1 决策依据(M0-M4.4)|
+| 11 | `references/research/claude-code-memory-research.md` §六 | 记忆相关改动前 |
 
 > **session 起手 30 秒 onboarding**:`git rev-parse origin/main` 看 HEAD → `cargo test --workspace 2>&1 \| grep -E "^test result" \| awk '{p+=$4;f+=$6}END{print p,f}'` 看 baseline → 读 `docs/v0-2/README.md` 看当前版状态 + V0.3 候选 → 读用户的具体诉求 → 干。
 
 > **对照参考**(本地 clone,**`/references/` 已 gitignore**,不入库):`references/claude-code/`(Anthropic Claude Code 源码,bun + TypeScript)+ `references/codex/codex-rs/`(OpenAI Codex CLI Rust workspace)。做 HarnessAdapter / 协议适配 / hook 兼容性 / statusline-stdin shape 验证 等接口工作时翻;**不要把这两份源码当 ccteam 自己的依赖**(永久 deferred)。
 
 > **文档维护三类**(2026-05-16 加,新加文档 / 改版结束时按这分类):
-> 1. **`docs/` 根目录(全局文档)**— `requirements.md` / `tech-design.md` / `interfaces.md` / `dev-coupling-audit.md` / `ccteam-as-domain-agnostic-orchestrator.md` / `claude-code-best-practices.md` / `claude-code-tool-surface.md` / `README.md`。只放核心架构抽象设计;**每次 session 起手都装入上下文**;**与代码并列为唯一真理来源**。**每个版本 ship 后必更新**(改协议必同步 `interfaces.md`、改架构必同步 `tech-design.md`、加 finding 必更新 `dev-coupling-audit.md`)。
+> 1. **`docs/` 根目录(全局文档)**— `requirements.md` / `orchestration-patterns.md` / `tech-design.md` / `interfaces.md` / `dev-coupling-audit.md` / `ccteam-as-domain-agnostic-orchestrator.md` / `claude-code-best-practices.md` / `claude-code-tool-surface.md` / `README.md`。只放核心架构抽象设计;**每次 session 起手都装入上下文**;**与代码并列为唯一真理来源**。**每个版本 ship 后必更新**(改协议必同步 `interfaces.md`、改架构必同步 `tech-design.md`、加 finding 必更新 `dev-coupling-audit.md`、加 workflow 拓扑必参考 `orchestration-patterns.md`)。
 > 2. **`docs/v0-x-x/` 版本文档**— `prd.md` / `dev-plan.md` / `user-manual.md` / `README.md`。**版本 ship 后冻结**,作为历史产品演进溯源,按需 on-demand 加载。下一个版本另开新目录,不改老版本。
 > 3. **`docs/research/` + `references/research/` 扩展研究**— 探索性笔记。**不更新**,按需 on-demand 加载。引用过时不算 bug,价值在于"那时怎么想的"。
 
