@@ -84,9 +84,14 @@ enum Command {
         #[arg(short = 'y', long, default_value_t = false)]
         yes: bool,
     },
+    /// **DEPRECATED** in V0.4.6 (F89) — moved to `ccteam internal hook`.
+    /// Old invocation path is preserved one release for back-compat;
+    /// emits a stderr WARN on use and will be removed in V0.5.
+    ///
     /// Hook handlers invoked by Claude Code per project settings.json.
     /// Each subcommand reads stdin JSON (the Claude Code hook payload)
     /// and performs its side effect; stdout is normally empty.
+    #[command(hide = true)]
     Hook {
         #[command(subcommand)]
         cmd: HookCommand,
@@ -184,18 +189,32 @@ enum Command {
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
     },
+    /// **DEPRECATED** in V0.4.6 (F89) — moved to `ccteam internal attach`.
+    ///
     /// Attach to a project's tmux session (`tmux attach`).
+    #[command(hide = true)]
     Attach { slug: String },
+    /// **DEPRECATED** in V0.4.6 (F89) — moved to `ccteam internal peek`.
+    ///
     /// Capture the project's pane content without attaching.
+    #[command(hide = true)]
     Peek { slug: String },
+    /// **DEPRECATED** in V0.4.6 (F89) — moved to `ccteam internal progress`.
+    ///
     /// Print the project's progress.jsonl, optionally tailing.
+    #[command(hide = true)]
     Progress {
         slug: String,
         #[arg(long)]
         tail: bool,
     },
+    /// **DEPRECATED** in V0.4.6 (F89) — moved to `ccteam internal resume`.
+    ///
     /// Resume a paused / escalated project (re-arm phase_state=idle).
+    #[command(hide = true)]
     Resume { slug: String },
+    /// **DEPRECATED** in V0.4.6 (F89) — moved to `ccteam internal send`.
+    ///
     /// Send a free-form message to a project's inbox. Wraps the
     /// MCP-equivalent `send_to_session` so users don't have to
     /// hand-write the markdown frontmatter. Orchestrator auto-routes
@@ -205,7 +224,8 @@ enum Command {
     /// F87: `disable_help_flag` so a literal `--help` in the body is
     /// not intercepted by clap as the subcommand's own help. Users
     /// who want help should run `ccteam help send` instead.
-    #[command(disable_help_flag = true)]
+    /// F89: hidden from top-level help (use `ccteam internal send`).
+    #[command(hide = true, disable_help_flag = true)]
     Send {
         /// Project slug (or meta-agent handle for meta-agent inbox).
         slug: String,
@@ -225,6 +245,8 @@ enum Command {
         #[arg(allow_hyphen_values = true)]
         body: String,
     },
+    /// **DEPRECATED** in V0.4.6 (F89) — moved to `ccteam internal spawn`.
+    ///
     /// Trigger a fresh spawn of `<role>` in `<slug>` with an optional
     /// kick prompt. Writes a `.ccteam/spawn_requests/<role>-<ts>.json`
     /// marker the orchestrator picks up on its next tick. CLI shortcut
@@ -233,7 +255,8 @@ enum Command {
     /// F87: `disable_help_flag` so a literal `--help` in the prompt is
     /// not intercepted by clap as the subcommand's own help. Users
     /// who want help should run `ccteam help spawn` instead.
-    #[command(disable_help_flag = true)]
+    /// F89: hidden from top-level help (use `ccteam internal spawn`).
+    #[command(hide = true, disable_help_flag = true)]
     Spawn {
         /// Project slug.
         slug: String,
@@ -246,20 +269,22 @@ enum Command {
         #[arg(allow_hyphen_values = true)]
         prompt: Option<String>,
     },
-    /// List the cross-project decisions queue — every project's
-    /// outbox file with `event_kind: clarify | escalation`. Surfaces
-    /// pending user-decision points across all running projects so the
-    /// meta-agent can offer "you have N pending decisions, want to
-    /// walk through them?" on attach (interfaces.md §5.6.4).
-    Decisions {
-        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
-        format: OutputFormat,
-    },
+    /// **DEPRECATED** in V0.4.6 (F89) — moved to `ccteam internal mcp-serve`.
+    ///
     /// M2.5: run the ccteam MCP server (stdio JSON-RPC). Wired into
     /// `~/.claude.json` `mcpServers.ccteam` by `ccteam doctor
     /// --install-mcp` so daily-driver claude sessions and the meta
     /// agent both see the 9-tool surface (interfaces §12).
+    #[command(hide = true)]
     McpServe,
+    /// Internal commands — hook handlers + meta-agent / MCP integration
+    /// points. Not user-facing day to day; meta-agent and the
+    /// `ccteam-control` skill drive these. Run `ccteam internal --help`
+    /// for the list.
+    Internal {
+        #[command(subcommand)]
+        cmd: InternalCommand,
+    },
     /// Stop the running orchestrator daemon. Sends SIGTERM via the
     /// pidfile so the loop drains gracefully. Does **not** kill any
     /// tmux sessions — `ccteam start` reattaches to them on next launch
@@ -374,23 +399,6 @@ enum Command {
         #[arg(long, default_value_t = false)]
         apply: bool,
     },
-    /// V0.2 M0.18.6: render the orchestrator's per-phase inject
-    /// prompt (frontmatter-driven) plus the `@`-referenced phase
-    /// markdown body for visual debugging. Pure read-only — does not
-    /// touch any session.
-    Phase {
-        #[command(subcommand)]
-        cmd: PhaseCommand,
-    },
-    /// V0.2 M0.21: translation layer that surfaces project anomalies
-    /// (auto-loop cycle / cost / phase duration / daemon down /
-    /// needs_attention.outbox) to the meta-agent as NL notifications.
-    /// Pure read-only — never mutates orchestrator state, never kills
-    /// sessions, never re-injects prompts.
-    Watchdog {
-        #[command(subcommand)]
-        cmd: WatchdogCommand,
-    },
     /// V0.2 M0.22: author + publish a ccteam team as a Claude Code
     /// plugin. `init` scaffolds the staging tree under
     /// `~/.config/ccteam/teams/<name>/`; `publish` links it into the
@@ -430,32 +438,52 @@ enum Command {
     },
 }
 
+/// V0.4.6 F89: subcommands hidden under `ccteam internal`. Each mirrors
+/// a former top-level command 1:1 — the old top-level names stay as
+/// hidden aliases that emit a one-line stderr deprecation WARN and route
+/// to the same handler. V0.5 will retire the top-level aliases.
 #[derive(Subcommand)]
-enum WatchdogCommand {
-    /// Scan all projects + daemon heartbeat once and print every alert
-    /// that survives `~/.ccteam/watchdog.yaml` filtering. With
-    /// With `--push` each alert is also appended to the canonical
-    /// meta-agent session's outbox at `~/projects/meta/.ccteam/outbox/`.
-    Scan {
-        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
-        format: OutputFormat,
-        /// Also write each surviving alert to the canonical meta-agent
-        /// outbox (`~/projects/meta/.ccteam/outbox/`). V0.4.1: handle
-        /// dropped — one ccteam install = one meta-agent.
-        #[arg(long, default_value_t = false)]
-        push: bool,
+enum InternalCommand {
+    /// Hook handlers invoked by Claude Code per project settings.json.
+    /// Each subcommand reads stdin JSON (the Claude Code hook payload)
+    /// and performs its side effect; stdout is normally empty.
+    Hook {
+        #[command(subcommand)]
+        cmd: HookCommand,
     },
-}
-
-#[derive(Subcommand)]
-enum PhaseCommand {
-    /// Render `<team>` `<phase>`'s inject prompt + body. Useful when
-    /// authoring phase yamls / debugging unexpected phase behavior.
-    Show {
-        /// Team name as registered under `~/.ccteam/teams/`.
-        team: String,
-        /// Phase name (e.g. `implement`, not the prefixed filename).
-        phase: String,
+    /// Run the ccteam MCP server (stdio JSON-RPC). Wired into
+    /// `~/.claude.json` `mcpServers.ccteam` by `ccteam doctor
+    /// --install-mcp` so daily-driver claude sessions and the meta
+    /// agent both see the 17-tool surface (interfaces §12).
+    McpServe,
+    /// Attach to a project's tmux session (`tmux attach`).
+    Attach { slug: String },
+    /// Capture the project's pane content without attaching.
+    Peek { slug: String },
+    /// Print the project's progress.jsonl, optionally tailing.
+    Progress {
+        slug: String,
+        #[arg(long)]
+        tail: bool,
+    },
+    /// Resume a paused / escalated project (re-arm phase_state=idle).
+    Resume { slug: String },
+    /// Send a free-form message to a project's inbox.
+    Send {
+        slug: String,
+        #[arg(short = 'r', long)]
+        role: Option<String>,
+        #[arg(long, default_value_t = false)]
+        no_spawn: bool,
+        body: String,
+    },
+    /// Trigger a fresh spawn of `<role>` in `<slug>` with an optional
+    /// kick prompt. Writes a `.ccteam/spawn_requests/<role>-<ts>.json`
+    /// marker the orchestrator picks up on its next tick.
+    Spawn {
+        slug: String,
+        role: String,
+        prompt: Option<String>,
     },
 }
 
@@ -609,7 +637,10 @@ fn main() -> Result<()> {
             print!("{report}");
             Ok(())
         }
-        Command::Hook { cmd } => run_hook(cmd),
+        Command::Hook { cmd } => {
+            warn_deprecated_top_level("hook", "internal hook");
+            run_hook(cmd)
+        }
         Command::Start {
             foreground: _,
             tick_seconds,
@@ -640,17 +671,20 @@ fn main() -> Result<()> {
             None => show_slug_picker(),
         },
         Command::Attach { slug } => {
-            let paths = CcteamPaths::from_env()?;
-            commands::run_attach(&paths, &slug)
+            warn_deprecated_top_level("attach", "internal attach");
+            run_attach(&slug)
         }
-        Command::Peek { slug } => run_peek(&slug),
+        Command::Peek { slug } => {
+            warn_deprecated_top_level("peek", "internal peek");
+            run_peek(&slug)
+        }
         Command::Progress { slug, tail } => {
-            let paths = CcteamPaths::from_env()?;
-            commands::run_progress(&paths, &slug, tail)
+            warn_deprecated_top_level("progress", "internal progress");
+            run_progress(&slug, tail)
         }
         Command::Resume { slug } => {
-            let paths = CcteamPaths::from_env()?;
-            commands::run_resume(&paths, &slug)
+            warn_deprecated_top_level("resume", "internal resume");
+            run_resume(&slug)
         }
         Command::Send {
             slug,
@@ -658,28 +692,20 @@ fn main() -> Result<()> {
             no_spawn,
             body,
         } => {
+            warn_deprecated_top_level("send", "internal send");
             let paths = CcteamPaths::from_env()?;
             run_send(&paths, &slug, role.as_deref(), no_spawn, &body)
         }
         Command::Spawn { slug, role, prompt } => {
+            warn_deprecated_top_level("spawn", "internal spawn");
             let paths = CcteamPaths::from_env()?;
             run_spawn(&paths, &slug, &role, prompt.as_deref())
         }
-        Command::Decisions { format } => {
-            let paths = CcteamPaths::from_env()?;
-            let body = commands::run_decisions(&paths, format)?;
-            print!("{body}");
-            Ok(())
-        }
         Command::McpServe => {
-            init_tracing();
-            let paths = CcteamPaths::from_env()?;
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .context("build tokio runtime for mcp-serve")?;
-            runtime.block_on(mcp_serve::run_mcp_serve(paths))
+            warn_deprecated_top_level("mcp-serve", "internal mcp-serve");
+            run_mcp_serve()
         }
+        Command::Internal { cmd } => run_internal(cmd),
         Command::Stop => run_stop(),
         Command::Doctor {
             dry_run,
@@ -731,8 +757,6 @@ fn main() -> Result<()> {
                 gc_apply: apply,
             })
         }
-        Command::Phase { cmd } => run_phase(cmd),
-        Command::Watchdog { cmd } => run_watchdog(cmd),
         Command::Team { cmd } => run_team(cmd),
         Command::Session { action } => run_session(action),
         Command::Web {
@@ -750,15 +774,66 @@ fn main() -> Result<()> {
     }
 }
 
-fn run_watchdog(cmd: WatchdogCommand) -> Result<()> {
-    let paths = CcteamPaths::from_env()?;
+/// V0.4.6 F89 — dispatch `ccteam internal <subcmd>`. Mirrors the
+/// old top-level commands 1:1; old top-level entry points emit a
+/// stderr deprecation WARN before reaching the same handlers.
+fn run_internal(cmd: InternalCommand) -> Result<()> {
     match cmd {
-        WatchdogCommand::Scan { format, push } => {
-            let body = commands::run_watchdog_scan(&paths, format, push)?;
-            print!("{body}");
-            Ok(())
+        InternalCommand::Hook { cmd } => run_hook(cmd),
+        InternalCommand::McpServe => run_mcp_serve(),
+        InternalCommand::Attach { slug } => run_attach(&slug),
+        InternalCommand::Peek { slug } => run_peek(&slug),
+        InternalCommand::Progress { slug, tail } => run_progress(&slug, tail),
+        InternalCommand::Resume { slug } => run_resume(&slug),
+        InternalCommand::Send {
+            slug,
+            role,
+            no_spawn,
+            body,
+        } => {
+            let paths = CcteamPaths::from_env()?;
+            run_send(&paths, &slug, role.as_deref(), no_spawn, &body)
+        }
+        InternalCommand::Spawn { slug, role, prompt } => {
+            let paths = CcteamPaths::from_env()?;
+            run_spawn(&paths, &slug, &role, prompt.as_deref())
         }
     }
+}
+
+/// V0.4.6 F89 — print a stderr deprecation WARN when an old top-level
+/// command is used. The handler still runs; V0.5 will remove the old
+/// entry points entirely (see `docs/v0-4-6/prd.md` F89).
+fn warn_deprecated_top_level(old: &str, new: &str) {
+    eprintln!(
+        "ccteam: WARN `ccteam {old}` is deprecated; use `ccteam {new}` instead. \
+         The legacy alias will be removed in V0.5.",
+    );
+}
+
+fn run_mcp_serve() -> Result<()> {
+    init_tracing();
+    let paths = CcteamPaths::from_env()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime for mcp-serve")?;
+    runtime.block_on(mcp_serve::run_mcp_serve(paths))
+}
+
+fn run_attach(slug: &str) -> Result<()> {
+    let paths = CcteamPaths::from_env()?;
+    commands::run_attach(&paths, slug)
+}
+
+fn run_progress(slug: &str, tail: bool) -> Result<()> {
+    let paths = CcteamPaths::from_env()?;
+    commands::run_progress(&paths, slug, tail)
+}
+
+fn run_resume(slug: &str) -> Result<()> {
+    let paths = CcteamPaths::from_env()?;
+    commands::run_resume(&paths, slug)
 }
 
 fn run_team(cmd: TeamCommand) -> Result<()> {
@@ -812,17 +887,6 @@ fn run_session(action: SessionAction) -> Result<()> {
         SessionAction::Ls { slug } => commands::run_session_ls(&slug),
         SessionAction::Attach { slug, sid } => commands::run_session_attach(&slug, &sid),
         SessionAction::Rm { slug, sid } => commands::run_session_rm(&slug, &sid),
-    }
-}
-
-fn run_phase(cmd: PhaseCommand) -> Result<()> {
-    let paths = CcteamPaths::from_env()?;
-    match cmd {
-        PhaseCommand::Show { team, phase } => {
-            let body = commands::run_phase_show(&paths, &team, &phase)?;
-            print!("{body}");
-            Ok(())
-        }
     }
 }
 

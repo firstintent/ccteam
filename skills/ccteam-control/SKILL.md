@@ -15,19 +15,37 @@ registered the server (M2.5), every claude session sees nine
 json` path below stays as a fallback for sessions where the MCP
 server isn't registered yet.
 
+**V0.4.6 F89 — CLI surface reorg.** The `ccteam` top-level CLI now
+exposes only user-facing commands (`init / start / stop / new / ls
+/ status / show / doctor / web` and the V0.4.6 `remove`). Hook
+handlers and meta-agent integration points (`spawn / send / peek
+/ attach / progress / resume / mcp-serve / hook`) moved under
+`ccteam internal <subcmd>`. The legacy top-level names still work
+in V0.4.6 with a stderr deprecation WARN; V0.5 will remove them.
+
+When you need to shell out, prefer the new path:
+
+```bash
+ccteam internal peek <slug>          # was: ccteam peek <slug>
+ccteam internal progress <slug>      # was: ccteam progress <slug>
+ccteam internal resume <slug>        # was: ccteam resume <slug>
+ccteam internal send <slug> "<body>" # was: ccteam send <slug> "<body>"
+ccteam internal spawn <slug> <role>  # was: ccteam spawn <slug> <role>
+```
+
 ## Capability index — MCP first, Bash fallback
 
 | What you want | MCP tool (preferred) | Bash fallback |
 |---|---|---|
 | List all projects                | `mcp__ccteam__ls`                | `ccteam ls --format json` |
 | One project's full state         | `mcp__ccteam__show`              | `ccteam show <slug> --format json` |
-| Recent progress events           | `mcp__ccteam__progress`          | `ccteam progress <slug>` |
-| Capture session pane content     | `mcp__ccteam__peek`              | `ccteam peek <slug>` |
+| Recent progress events           | `mcp__ccteam__progress`          | `ccteam internal progress <slug>` |
+| Capture session pane content     | `mcp__ccteam__peek`              | `ccteam internal peek <slug>` |
 | Start a new dev project          | `mcp__ccteam__new`               | `ccteam new <slug> --team dev` |
 | Start a product-research project | `mcp__ccteam__new`               | `ccteam new <slug> --team product-research` |
 | Pause project (no kill)          | `mcp__ccteam__pause`             | `ccteam pause <slug>` |
-| Resume project                   | `mcp__ccteam__resume`            | `ccteam resume <slug>` |
-| Send NL to a session inbox       | `mcp__ccteam__send_to_session`   | (write `.ccteam/inbox/msg-<ts>-NNN.md`) |
+| Resume project                   | `mcp__ccteam__resume`            | `ccteam internal resume <slug>` |
+| Send NL to a session inbox       | `mcp__ccteam__send_to_session`   | `ccteam internal send <slug> "<body>"` (or write `.ccteam/inbox/msg-<ts>-NNN.md` directly) |
 | Inject ESCALATE-style decision   | `mcp__ccteam__inject_decision`   | (compose body manually + send_to_session) |
 | Health checks                    | (Bash only)                      | `ccteam doctor --tool-surface` |
 | Install meta-agent               | (Bash only)                      | `ccteam doctor --install-meta-agent <handle>` |
@@ -82,13 +100,13 @@ ccteam new <slug> --team product-research
 
 ```bash
 ccteam show <slug> --format json | jq '{phase: .state.current_phase, fix_count: .state.auto_loop_cycle_count, recent: .recent_events[-5:]}'
-ccteam peek <slug>
+ccteam internal peek <slug>
 ```
 
 Combine the two outputs and recommend exactly **one** of:
-- `ccteam attach <slug>` — user wants to drive
+- `ccteam internal attach <slug>` — user wants to drive
 - `ccteam pause <slug>` — pause and think
-- `ccteam resume <slug>` after fixing — back to autonomous
+- `ccteam internal resume <slug>` after fixing — back to autonomous
 
 ## Decision principles
 

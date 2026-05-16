@@ -189,6 +189,10 @@ mod tests {
 
     #[test]
     fn template_session_start_uses_absolute_ccteam_path() {
+        // V0.4.6 F89: hook commands now route through the `internal`
+        // subcommand. Old top-level `ccteam hook …` stays accepted at
+        // dispatch time (with stderr WARN), but freshly rendered
+        // settings.json uses the new path.
         let body = render_project_settings(
             Path::new("/usr/local/bin/ccteam"),
             &SettingsEnv::default(),
@@ -204,8 +208,8 @@ mod tests {
         assert_eq!(
             cmds,
             vec![
-                "/usr/local/bin/ccteam hook load-context",
-                "/usr/local/bin/ccteam hook progress-append session_start"
+                "/usr/local/bin/ccteam internal hook load-context",
+                "/usr/local/bin/ccteam internal hook progress-append session_start"
             ],
         );
     }
@@ -216,9 +220,15 @@ mod tests {
             PROJECT_SETTINGS_JSON.contains("__CCTEAM_BIN__"),
             "template should reference __CCTEAM_BIN__ placeholder",
         );
+        // V0.4.6 F89: template wires the new `internal hook` path. The
+        // old bare `ccteam hook` form must not survive the migration.
         assert!(
             !PROJECT_SETTINGS_JSON.contains("\"ccteam hook"),
             "template should not embed bare `ccteam hook` — see render_project_settings",
+        );
+        assert!(
+            !PROJECT_SETTINGS_JSON.contains(" ccteam hook"),
+            "template must use new `ccteam internal hook` form (V0.4.6 F89)",
         );
         // F44 sweep guard: F39's `{{CCT_BIN}}` placeholder must not return.
         assert!(

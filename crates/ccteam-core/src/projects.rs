@@ -993,9 +993,13 @@ mod tests {
             cmd.starts_with('/'),
             "settings.json hook command must be an absolute path, got: {cmd}",
         );
+        // V0.4.6 F89: fresh settings.json renders use the new
+        // `internal hook …` path. Old `hook …` form would still resolve
+        // via the deprecated top-level alias, but new installs should
+        // produce the new form.
         assert!(
-            cmd.ends_with(" hook load-context"),
-            "settings.json hook command should still invoke `hook load-context`, got: {cmd}",
+            cmd.ends_with(" internal hook load-context"),
+            "settings.json hook command should invoke `internal hook load-context`, got: {cmd}",
         );
         // Reject the placeholder having survived the render — that's the
         // PATH-dependent failure mode we're guarding against.
