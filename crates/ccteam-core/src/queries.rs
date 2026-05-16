@@ -29,16 +29,17 @@
 //! §5.5 progress.jsonl SoT.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::paths::CcteamPaths;
 use crate::progress::{
-    self, current_agent_sessions_with_liveness, escalation_count, workflow_cost_total,
-    AgentSessionStatus, AgentSessionSummary,
+    self, current_agent_sessions_with_liveness, escalation_count, open_agent_spawns,
+    workflow_cost_total, AgentSessionStatus, AgentSessionSummary,
 };
 use crate::state::ProjectState;
 use crate::team::TeamKind;
@@ -257,6 +258,163 @@ pub struct AgentStatus {
     pub last_session_status: Option<AgentSessionStatus>,
 }
 
+/// V0.4.6 F91 — cost aggregation surface. SoT is `progress.jsonl::agent_done`
+/// for historical totals and `~/.claude/jobs/<id>/state.json::cost_usd_total`
+/// (read live) for the active sessions.
+///
+/// Pre-F91 ccteam maintained `ProjectState::cost_used_usd` via the
+/// `cost-accumulate` PostToolUse hook + the F80 orchestrator bump on
+/// synthetic `agent_done`. Both paths were wedge-prone: hook misses,
+/// `claude --bg` argv drift, or daemon SIGKILL casualties left the
+/// number stale or low. F91 retires that accumulator entirely; the new
+/// source of truth is the per-event cost Claude itself reports, surfaced
+/// through this struct.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct CostSummary {
+    /// Sum of `cost_usd` across every `agent_done` event with `ts`
+    /// inside the last 24h (relative to wall-clock at the call). Events
+    /// with missing / unparseable `ts` are folded into the 24h bucket so
+    /// recent rows don't silently disappear when timestamps are absent.
+    pub cost_24h_usd: f64,
+    /// Sum of `cost_usd_total` (falling back to `cost_usd`) read live
+    /// from each currently-open agent session's
+    /// `~/.claude/jobs/<job_id>/state.json`. Missing files / unparseable
+    /// JSON / missing fields contribute 0.0 (no failure mode is fatal —
+    /// stale rows just under-report).
+    pub cost_active_usd: f64,
+    /// Sum of `cost_usd` across every `agent_done` event in the slice
+    /// (i.e. lifetime total recorded in this project's progress.jsonl).
+    /// Drives the "lifetime" headline + budget overruns that look beyond
+    /// the 24h window.
+    pub cost_total_usd: f64,
+    /// Number of `agent_done` events folded into [`cost_24h_usd`].
+    pub session_count_24h: u32,
+    /// Number of open `agent_spawn` events (no matching `agent_done`)
+    /// whose [`cost_active_usd`] contribution was probed.
+    pub session_count_active: u32,
+}
+
+/// Build a [`CostSummary`] for `slug` by reading `progress_path`
+/// (typically `paths.progress_jsonl(slug)`) and probing each open
+/// agent session's `~/.claude/jobs/<id>/state.json` for live cost.
+///
+/// `progress_path` is taken explicitly (instead of derived from
+/// `paths + slug`) so future flex-project callers can sum across
+/// per-sid streams without forcing this helper to know the team kind.
+/// For workflow projects pass `&paths.progress_jsonl(slug)` directly.
+///
+/// **Side-effect-free.** Reads `progress_path` once + one stat/read per
+/// open job_id. No mutation to state.json (per F91 — that path is
+/// being retired). Returns `Ok(default())` when progress.jsonl is
+/// missing rather than erroring; callers (CLI / SPA / budget cap) want
+/// a zeroed surface for fresh projects.
+pub fn cost_summary(slug: &str, progress_path: &Path, paths: &CcteamPaths) -> Result<CostSummary> {
+    // Tolerate missing files: a fresh project's progress.jsonl doesn't
+    // exist yet and that must surface as zeroed cost, not an error
+    // propagated up through `workflow_summary` / `ccteam show`.
+    let _ = (slug, paths); // slug/paths reserved for flex-project routing later.
+    let events = progress::read_all_events(progress_path).unwrap_or_default();
+    Ok(compute_cost_summary(&events, Utc::now(), |job_id| {
+        crate::claude_job::probe_job(job_id)
+    }))
+}
+
+/// Pure, IO-free core of [`cost_summary`]. Takes the parsed event slice,
+/// a wall-clock `now` for the 24h window, and a `probe` closure that
+/// resolves each open `job_id` to a `JobLiveness` so the helper can
+/// total live cost without depending on the filesystem.
+///
+/// Exposed so unit tests can drive both halves (event slice + probe
+/// outcome) deterministically. Production callers route through
+/// [`cost_summary`] which wires the closure to
+/// [`crate::claude_job::probe_job`].
+pub fn compute_cost_summary<F>(events: &[Value], now: DateTime<Utc>, probe: F) -> CostSummary
+where
+    F: Fn(Option<&str>) -> crate::claude_job::JobLiveness,
+{
+    let cutoff_24h = now - Duration::hours(24);
+
+    let mut cost_total_usd = 0.0;
+    let mut cost_24h_usd = 0.0;
+    let mut session_count_24h: u32 = 0;
+    for event in events {
+        if event.get("event").and_then(|s| s.as_str()) != Some("agent_done") {
+            continue;
+        }
+        let cost = event
+            .get("cost_usd")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        cost_total_usd += cost;
+
+        // 24h filter: events with missing or unparseable `ts` are
+        // counted in the 24h bucket (defensive — newly-written rows
+        // sometimes lack ts during transitional schemas; folding them
+        // in matches the "recent" intuition the dashboard / budget cap
+        // wants).
+        let in_window = match event.get("ts").and_then(|s| s.as_str()) {
+            Some(ts) => match DateTime::parse_from_rfc3339(ts) {
+                Ok(parsed) => parsed.with_timezone(&Utc) >= cutoff_24h,
+                Err(_) => true,
+            },
+            None => true,
+        };
+        if in_window {
+            cost_24h_usd += cost;
+            session_count_24h = session_count_24h.saturating_add(1);
+        }
+    }
+
+    // Active cost: probe each open agent_spawn's job_id. `Running`
+    // verdicts contribute 0.0 here because the live cost field on
+    // state.json gets read directly below via the inner classify; the
+    // closure abstraction lets tests stub the value.
+    let open = open_agent_spawns(events);
+    let mut cost_active_usd = 0.0;
+    let session_count_active = open.len() as u32;
+    for (_sid, job_id, _role) in open {
+        match probe(job_id.as_deref()) {
+            // Running session: read state.json directly for cost_usd
+            // (claude_job::probe_job returns Terminal only on terminal
+            // signals; live cost lives in state.json::cost_usd_total).
+            crate::claude_job::JobLiveness::Running => {
+                if let Some(id) = job_id.as_deref() {
+                    let path = crate::claude_job::job_state_path(id);
+                    if let Ok(raw) = std::fs::read_to_string(&path) {
+                        if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+                            cost_active_usd += v
+                                .get("cost_usd_total")
+                                .or_else(|| v.get("cost_usd"))
+                                .and_then(|n| n.as_f64())
+                                .unwrap_or(0.0);
+                        }
+                    }
+                }
+            }
+            // Terminal probes report cost via JobLiveness::Terminal —
+            // that cost is the same value we'd read from state.json,
+            // but for stale sessions Claude has already finalized it.
+            // Surface it under cost_active_usd so SPA / budget cap see
+            // it before the orchestrator's next poll writes the
+            // synthetic agent_done that retires the spawn.
+            crate::claude_job::JobLiveness::Terminal {
+                status: _,
+                cost_usd,
+            } => {
+                cost_active_usd += cost_usd;
+            }
+        }
+    }
+
+    CostSummary {
+        cost_24h_usd,
+        cost_active_usd,
+        cost_total_usd,
+        session_count_24h,
+        session_count_active,
+    }
+}
+
 /// Snapshot of one project's workflow state for the meta-agent / web
 /// dashboard. Cheap to compute (`O(N)` over progress events + one
 /// `read_dir` per agent's artifact directory) so callers can refresh
@@ -276,8 +434,15 @@ pub struct WorkflowSummary {
     /// agent's `input` AND `output` directories are stat-ed (if set
     /// in workflow.yaml). Missing dirs map to `0`.
     pub artifact_counts: HashMap<String, u64>,
-    /// Sum of cost across every `agent_done` event in the slice.
+    /// Sum of cost across every `agent_done` event in the slice. Kept
+    /// for SPA back-compat (mirrors `cost.cost_total_usd`); F90 will
+    /// transition the dashboard to read `cost.cost_24h_usd` directly.
     pub total_cost_usd: f64,
+    /// V0.4.6 F91 — cost SoT surface used by `ccteam show` + F84 budget
+    /// cap + F90 sparkline. Lives alongside `total_cost_usd` until F90
+    /// finishes the SPA cutover; both fields will report consistent
+    /// totals during the transition.
+    pub cost: CostSummary,
     /// Count of `escalation` events in the slice.
     pub escalation_count: u32,
     /// `role` → `"waiting"` / `"released"` / `"fired"`. Derived from
@@ -294,6 +459,7 @@ impl Default for WorkflowSummary {
             agents: Vec::new(),
             artifact_counts: HashMap::new(),
             total_cost_usd: 0.0,
+            cost: CostSummary::default(),
             escalation_count: 0,
             gate_states: HashMap::new(),
         }
@@ -343,6 +509,14 @@ pub fn workflow_summary(slug: &str, paths: &CcteamPaths) -> Result<WorkflowSumma
     };
 
     let total_cost_usd = workflow_cost_total(&events);
+    // V0.4.6 F91 — rich cost surface (24h / active / total). `cost`
+    // shares the same agent_done aggregation as `total_cost_usd`; the
+    // extra dimensions (24h window + live state.json probe) are what
+    // F84 budget cap + F90 sparkline consume. `total_cost_usd` stays
+    // for SPA back-compat until F90 finishes the cutover.
+    let cost = compute_cost_summary(&events, Utc::now(), |job_id| {
+        crate::claude_job::probe_job(job_id)
+    });
     let escalation_count = escalation_count(&events);
     // V0.4.5 F80 — liveness-aware accounting. Each open `agent_spawn`
     // is cross-referenced against `~/.claude/jobs/<job_id>/state.json`
@@ -442,6 +616,7 @@ pub fn workflow_summary(slug: &str, paths: &CcteamPaths) -> Result<WorkflowSumma
         agents,
         artifact_counts,
         total_cost_usd,
+        cost,
         escalation_count,
         gate_states,
     })

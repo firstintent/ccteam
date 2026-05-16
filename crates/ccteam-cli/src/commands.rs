@@ -541,13 +541,19 @@ pub fn run_ls(paths: &CcteamPaths, format: OutputFormat) -> Result<String> {
     let projects = collect_projects(paths)?;
     let daemon_up = ccteam_core::daemon::heartbeat_alive(paths);
     Ok(match format {
-        OutputFormat::Text => render_ls_text(&projects, daemon_up),
-        OutputFormat::Json => render_ls_json(&projects, daemon_up)?,
+        OutputFormat::Text => render_ls_text(paths, &projects, daemon_up),
+        OutputFormat::Json => render_ls_json(paths, &projects, daemon_up)?,
     })
 }
 
 /// `ccteam show <slug>`. Renders the full project view per
 /// interfaces.md §10.3 (json) or a human-readable summary (text).
+///
+/// V0.4.6 F91 — cost figures come from `cost_summary` (progress.jsonl
+/// plus live claude state.json) instead of the retired
+/// `state.cost_used_usd` accumulator. The old `cost used: $X.XX` line
+/// is replaced with `cost (24h)` plus `cost (active)` so the user sees
+/// both windowed spend and what's burning right now.
 pub fn run_show(paths: &CcteamPaths, slug: &str, format: OutputFormat) -> Result<String> {
     let state_path = paths.project_state(slug);
     if !state_path.exists() {
@@ -556,10 +562,12 @@ pub fn run_show(paths: &CcteamPaths, slug: &str, format: OutputFormat) -> Result
     let state = ProjectState::load(&state_path)?;
     let recent = collect_recent_events(paths, slug, 50)?;
     let artifacts = collect_artifacts(paths, slug);
+    let progress_path = paths.progress_jsonl(slug);
+    let cost = ccteam_core::cost_summary(slug, &progress_path, paths)?;
 
     Ok(match format {
-        OutputFormat::Text => render_show_text(&state, &recent, &artifacts),
-        OutputFormat::Json => render_show_json(&state, &recent, &artifacts)?,
+        OutputFormat::Text => render_show_text(&state, &cost, &recent, &artifacts),
+        OutputFormat::Json => render_show_json(&state, &cost, &recent, &artifacts)?,
     })
 }
 
@@ -1080,6 +1088,11 @@ pub struct DoctorOptions {
     /// V0.4.6 F85: arm `gc_claude_jobs` to commit removals to disk.
     /// No-op unless `gc_claude_jobs` is also true.
     pub gc_apply: bool,
+    /// V0.4.6 F91: walk every registered project's
+    /// `.claude/settings.json` and strip the now-retired
+    /// `ccteam hook cost-accumulate` PostToolUse entry. `dry_run = true`
+    /// previews the scrub without writing. Idempotent.
+    pub update_hooks: bool,
 }
 
 /// `ccteam doctor` dispatch. Returns a human-readable report so unit
@@ -1096,7 +1109,8 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
         || opts.screenshot_smoke.is_some()
         || opts.migrate_v041_to_v042
         || opts.migrate_workflow_to_ccteam_dir
-        || opts.gc_claude_jobs;
+        || opts.gc_claude_jobs
+        || opts.update_hooks;
     if !any_mode {
         return Ok(String::from(
             "ccteam doctor: pass at least one mode flag.\n\
@@ -1130,7 +1144,9 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
              (V0.4.6 F83). Default dry-run; pair with --apply to perform the moves. Conflicts \
              (both locations present) are fail-safe — neither file is touched.\n  \
              --gc-claude-jobs [--apply]\n      \
-             reclaim terminated ~/.claude/jobs/<id>/ dirs older than ~/.ccteam/config.yaml::claude_jobs_retention_days (default 7 days; 0 disables). Default is dry-run; --apply commits removals (V0.4.6 F85).\n",
+             reclaim terminated ~/.claude/jobs/<id>/ dirs older than ~/.ccteam/config.yaml::claude_jobs_retention_days (default 7 days; 0 disables). Default is dry-run; --apply commits removals (V0.4.6 F85).\n  \
+             --update-hooks [--dry-run]\n      \
+             walk every registered project's .claude/settings.json and strip the retired `ccteam hook cost-accumulate` entry. Idempotent (V0.4.6 F91).\n",
         ));
     }
     let mut out = String::new();
@@ -1187,6 +1203,9 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
     }
     if opts.gc_claude_jobs {
         out.push_str(&render_gc_claude_jobs_report(paths, opts.gc_apply)?);
+    }
+    if opts.update_hooks {
+        out.push_str(&render_update_hooks_report(paths, opts.dry_run)?);
     }
     // V0.3.1 F47 — informational codex CLI detection. Appends one line
     // to every successful doctor run (any_mode == true) so operators
@@ -1601,6 +1620,68 @@ fn render_hook_rewrite_line(r: &HookCmdRewriteReport, _dry_run: bool) -> String 
     )
 }
 
+/// V0.4.6 F91: `doctor --update-hooks` rendered report. Walks every
+/// project registered in `~/.ccteam/config.yaml` (plus the legacy
+/// `projects_root` fallback path that `collect_projects` already
+/// supports) and strips the now-retired `ccteam hook cost-accumulate`
+/// PostToolUse entry from each `<project>/.claude/settings.json`.
+fn render_update_hooks_report(paths: &CcteamPaths, dry_run: bool) -> Result<String> {
+    let mut out = String::from("ccteam doctor --update-hooks (V0.4.6 F91)\n\n");
+    let projects = collect_projects(paths)?;
+    if projects.is_empty() {
+        out.push_str("  no projects registered — nothing to do.\n\n");
+        return Ok(out);
+    }
+    let mut any_action = false;
+    for p in &projects {
+        // Resolve the project's on-disk directory. `collect_projects`
+        // already de-dupes registry vs legacy walk, so we just need
+        // the canonical path. Use config.yaml's registered path when
+        // available; fall back to `paths.project_dir(slug)` for
+        // legacy projects.
+        let project_dir = config_project_dir(paths, &p.state.slug)
+            .unwrap_or_else(|| paths.project_dir(&p.state.slug));
+        let settings = project_dir.join(".claude").join("settings.json");
+        let report = ccteam_core::remove_cost_accumulate_hooks(&settings, dry_run)?;
+        let label: String = match &report.action {
+            ccteam_core::CostAccumulateScrubAction::NotFound => "missing".into(),
+            ccteam_core::CostAccumulateScrubAction::NoChangeNeeded => "ok".into(),
+            ccteam_core::CostAccumulateScrubAction::WouldRemove { entries } => {
+                any_action = true;
+                format!("would remove {entries}")
+            }
+            ccteam_core::CostAccumulateScrubAction::Removed { entries } => {
+                any_action = true;
+                format!("removed {entries}")
+            }
+        };
+        out.push_str(&format!(
+            "  {:<40} {:<22} {}\n",
+            truncate(&p.state.slug, 40),
+            label,
+            report.target.display(),
+        ));
+    }
+    if !any_action {
+        out.push_str(
+            "\n  (no `cost-accumulate` hooks found — all settings.json files already clean.)\n",
+        );
+    }
+    out.push('\n');
+    Ok(out)
+}
+
+/// Resolve a project's on-disk directory from `~/.ccteam/config.yaml`
+/// (the V0.4.2 F73 registry). Returns `None` for slugs not registered
+/// (legacy `~/projects/<slug>/` walk fallback).
+fn config_project_dir(paths: &CcteamPaths, slug: &str) -> Option<std::path::PathBuf> {
+    let cfg = ccteam_core::config::load(&paths.root).ok()?;
+    cfg.projects
+        .iter()
+        .find(|e| e.slug == slug)
+        .map(|e| e.path.clone())
+}
+
 /// Walk every immediate child of `projects_root` and rewrite legacy
 /// hook commands in `<child>/.claude/settings.json`. Returns a per-
 /// project report so the doctor output can summarize.
@@ -1831,7 +1912,7 @@ fn collect_artifacts(paths: &CcteamPaths, slug: &str) -> Map<String, Value> {
     m
 }
 
-fn render_ls_text(projects: &[ProjectSummary], daemon_up: bool) -> String {
+fn render_ls_text(paths: &CcteamPaths, projects: &[ProjectSummary], daemon_up: bool) -> String {
     let mut out = String::new();
     // F27 — daemon health one-liner, always emitted (even on the
     // empty-projects path) so users can disambiguate "no projects" from
@@ -1851,12 +1932,20 @@ fn render_ls_text(projects: &[ProjectSummary], daemon_up: bool) -> String {
     );
     for p in projects {
         let phase = display_phase(&p.state.current_phase);
+        // V0.4.6 F91 — cost column sources cost_24h_usd from
+        // progress.jsonl (best-effort; failure → $0.00 — fresh
+        // projects with no progress events show $0.00, same shape
+        // as pre-F91 `state.cost_used_usd == 0.0`).
+        let cost_24h =
+            ccteam_core::cost_summary(&p.state.slug, &paths.progress_jsonl(&p.state.slug), paths)
+                .map(|c| c.cost_24h_usd)
+                .unwrap_or(0.0);
         out.push_str(&format!(
             "{:<40} {:<14} {:<11} ${:<5.2} {}s\n",
             truncate(&p.state.slug, 40),
             truncate(phase, 14),
             phase_state_str(&p.state.phase_state),
-            p.state.cost_used_usd,
+            cost_24h,
             p.age_seconds,
         ));
     }
@@ -1874,7 +1963,11 @@ fn display_phase(phase: &str) -> &str {
     }
 }
 
-fn render_ls_json(projects: &[ProjectSummary], daemon_up: bool) -> Result<String> {
+fn render_ls_json(
+    paths: &CcteamPaths,
+    projects: &[ProjectSummary],
+    daemon_up: bool,
+) -> Result<String> {
     // V0.4.0 F60: the phase state machine was deleted; "active" can no
     // longer be derived from `phase_state == InFlight`. F66 will
     // recompute this from `state.sessions` (live agent count).
@@ -1882,11 +1975,25 @@ fn render_ls_json(projects: &[ProjectSummary], daemon_up: bool) -> Result<String
     let arr: Vec<Value> = projects
         .iter()
         .map(|p| {
+            // V0.4.6 F91 — JSON shape preserves the `cost_used_usd`
+            // key for callers (MCP / scripts) but populates it from
+            // `cost_24h_usd` so the number tracks reality. The legacy
+            // serde field still reads as the frozen pre-F91 value if
+            // anything in the JSON pipeline needs to differentiate.
+            let cost_summary = ccteam_core::cost_summary(
+                &p.state.slug,
+                &paths.progress_jsonl(&p.state.slug),
+                paths,
+            )
+            .unwrap_or_default();
             json!({
                 "slug": p.state.slug,
                 "current_phase": p.state.current_phase,
                 "phase_state": phase_state_str(&p.state.phase_state),
-                "cost_used_usd": p.state.cost_used_usd,
+                "cost_used_usd": cost_summary.cost_24h_usd,
+                "cost_24h_usd": cost_summary.cost_24h_usd,
+                "cost_active_usd": cost_summary.cost_active_usd,
+                "cost_total_usd": cost_summary.cost_total_usd,
                 "context_tokens_used": p.state.context_tokens_used,
                 "tmux_session": p.state.tmux_session,
                 "user_attached": p.state.user_attached,
@@ -1915,6 +2022,7 @@ fn render_ls_json(projects: &[ProjectSummary], daemon_up: bool) -> Result<String
 
 fn render_show_text(
     state: &ProjectState,
+    cost: &ccteam_core::CostSummary,
     recent: &[Value],
     artifacts: &Map<String, Value>,
 ) -> String {
@@ -1928,7 +2036,20 @@ fn render_show_text(
         "phase state    : {}\n",
         phase_state_str(&state.phase_state)
     ));
-    out.push_str(&format!("cost used      : ${:.2}\n", state.cost_used_usd));
+    // V0.4.6 F91 — cost(24h) sums every `agent_done.cost_usd` in the
+    // last 24h; cost(active) live-reads each open session's
+    // `~/.claude/jobs/<id>/state.json::cost_usd_total`. The pre-F91
+    // `cost used: $X.XX` line (sourced from the now-frozen
+    // `state.cost_used_usd`) is removed.
+    out.push_str(&format!(
+        "cost (24h)     : ${:.2}  ({} sessions)\n",
+        cost.cost_24h_usd, cost.session_count_24h,
+    ));
+    out.push_str(&format!(
+        "cost (active)  : ${:.2}  ({} running)\n",
+        cost.cost_active_usd, cost.session_count_active,
+    ));
+    out.push_str(&format!("cost (total)   : ${:.2}\n", cost.cost_total_usd));
     out.push_str(&format!(
         "context tokens : {} ({} resets)\n",
         state.context_tokens_used, state.context_reset_count
@@ -1964,12 +2085,14 @@ fn render_show_text(
 
 fn render_show_json(
     state: &ProjectState,
+    cost: &ccteam_core::CostSummary,
     recent: &[Value],
     artifacts: &Map<String, Value>,
 ) -> Result<String> {
     let v = json!({
         "state": serde_json::to_value(state)?,
         "phase_history": serde_json::to_value(&state.phase_history)?,
+        "cost": serde_json::to_value(cost)?,
         "recent_events": recent,
         "artifacts": Value::Object(artifacts.clone()),
         "stall": {

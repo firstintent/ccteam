@@ -123,12 +123,19 @@ async fn v0_3_happy_path_dashboard_project_sse_and_btw() {
     disable_tool_surface_bootstrap_for_tests();
     bootstrap_project(&paths, slug, "v0.3 e2e canary", "dev").unwrap();
 
-    // Stamp a recognisable phase + cost so the project detail page
-    // has something concrete to assert on.
+    // Stamp a recognisable phase so the project detail page has
+    // something concrete to assert on. V0.4.6 F91 — `cost_used_usd`
+    // is deprecated; we still set the field on the legacy serde path
+    // so the JSON round-trip stays representative of files in the
+    // wild, but the web cost label now comes from `cost_summary`
+    // (synthetic `agent_done` events seeded below).
     let state_path = paths.project_state(slug);
     let mut state = ProjectState::load(&state_path).unwrap();
     state.current_phase = "implement".into();
-    state.cost_used_usd = 0.42;
+    #[allow(deprecated)]
+    {
+        state.cost_used_usd = 0.42;
+    }
     state.save(&state_path).unwrap();
 
     // Pre-create progress.jsonl as zero bytes so the watcher's

@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use tempfile::TempDir;
 
 use ccteam_core::{CcteamPaths, Parallelism, PhaseState, ProjectState, TeamKind};
-use ccteam_hooks::{cost_accumulate, load_context, parse_phase_end, progress_append};
+use ccteam_hooks::{load_context, parse_phase_end, progress_append};
 
 struct Fixture {
     _tmp: TempDir,
@@ -39,6 +39,11 @@ impl Fixture {
         std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
 
         let now = Utc::now();
+        // V0.4.6 F91 — `cost_used_usd` is deprecated; we still set it
+        // in struct literals because the field is non-Option<…> for
+        // serde compat. The single-attribute allow silences the warning
+        // in fixtures (the field is never read post-F91).
+        #[allow(deprecated)]
         let state = ProjectState {
             slug: slug.into(),
             team: "dev".into(),
@@ -377,42 +382,17 @@ fn parse_phase_end_handles_claude_code_2x_schema() {
     assert_eq!(events[0]["phase"], "ship");
 }
 
-#[test]
-fn cost_accumulate_handles_claude_code_2x_schema() {
-    // Same regression target on the cost path — pre-fix, scan_transcript
-    // returned (0.0, 0) for every real session because no top-level
-    // `type` matched `"message"`.
-    let fx = Fixture::new("bookmark-mgr-a3f9");
-    let live_shape = json!({
-        "type": "assistant",
-        "message": {
-            "type": "message",
-            "role": "assistant",
-            "model": "claude-opus-4-7",
-            "content": [{"type": "text", "text": "ok"}],
-            "usage": {
-                "input_tokens": 100,
-                "output_tokens": 50,
-                "cache_read_input_tokens": 1000,
-                "cache_creation_input_tokens": 200
-            }
-        }
-    });
-    fx.write_transcript(&[live_shape]);
-
-    let stdin = json!({
-        "cwd": fx.project_dir,
-        "transcript_path": fx.transcript_path,
-    });
-    cost_accumulate(&fx.paths, &stdin).unwrap();
-    let state = fx.read_state();
-    assert!(
-        state.cost_used_usd > 0.0,
-        "cost must be non-zero after one assistant turn, got: ${}",
-        state.cost_used_usd
-    );
-    assert!(state.context_tokens_used > 0);
-}
+// V0.4.6 F91 — the PostToolUse `cost_accumulate` hook (and the
+// `ccteam_hooks::cost` module that backed it) was deleted; Claude
+// itself reports cost on each `agent_done` event in `progress.jsonl`
+// and `~/.claude/jobs/<id>/state.json::cost_usd_total` is the live
+// source for active sessions. The pre-F91 tests
+// (`cost_accumulate_handles_claude_code_2x_schema`,
+// `cost_accumulate_updates_context_tokens_from_latest_usage`,
+// `cost_accumulate_sums_dollars_across_all_assistant_turns`,
+// `cost_accumulate_no_op_when_no_assistant_message_yet`) covered the
+// retired transcript scanner; their replacements live in
+// `crates/ccteam-core/tests/cost_summary_test.rs` (the new SoT).
 
 #[test]
 fn parse_phase_end_returns_block_missing_output_when_no_sigil_no_outbox() {
@@ -465,105 +445,10 @@ fn parse_phase_end_uses_only_the_most_recent_assistant_message() {
     assert_eq!(events[0]["phase"], "implement");
 }
 
-#[test]
-fn cost_accumulate_updates_context_tokens_from_latest_usage() {
-    let fx = Fixture::new("bookmark-mgr-a3f9");
-    fx.write_transcript(&[assistant_message(
-        "ack",
-        Some(json!({
-            "input_tokens": 1000,
-            "output_tokens": 200,
-            "cache_read_input_tokens": 80_000,
-            "cache_creation_input_tokens": 5_000
-        })),
-    )]);
-    let stdin = json!({
-        "cwd": fx.project_dir,
-        "transcript_path": fx.transcript_path,
-    });
-
-    cost_accumulate(&fx.paths, &stdin).unwrap();
-    let s = fx.read_state();
-    assert_eq!(s.context_tokens_used, 1000 + 80_000 + 5_000);
-    assert_eq!(s.last_event_type.as_deref(), Some("PostToolUse"));
-    assert!(s.last_progress_event_at.is_some());
-}
-
-#[test]
-fn cost_accumulate_sums_dollars_across_all_assistant_turns() {
-    use ccteam_hooks::cost::{message_cost_usd, scan_transcript};
-    let fx = Fixture::new("cost-sum");
-    fx.write_transcript(&[
-        json!({
-            "type": "message",
-            "message": {
-                "role": "assistant",
-                "model": "claude-sonnet-4-6",
-                "usage": {
-                    "input_tokens": 1_000,
-                    "output_tokens": 200,
-                    "cache_read_input_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                }
-            }
-        }),
-        json!({
-            "type": "message",
-            "message": {
-                "role": "assistant",
-                "model": "claude-opus-4-7",
-                "usage": {
-                    "input_tokens": 500,
-                    "output_tokens": 100,
-                    "cache_read_input_tokens": 80_000,
-                    "cache_creation_input_tokens": 0,
-                }
-            }
-        }),
-    ]);
-
-    let (total, last_tokens) = scan_transcript(&fx.transcript_path).unwrap();
-    // sonnet turn: 1000 * 3 / 1e6  +  200 * 15 / 1e6  = 0.003 + 0.003 = 0.006
-    // opus turn:   500 * 15 / 1e6  +  100 * 75 / 1e6  +  80000 * 1.5 / 1e6
-    //            = 0.0075 + 0.0075 + 0.12 = 0.135
-    let expected = 0.006 + 0.135;
-    assert!(
-        (total - expected).abs() < 1e-6,
-        "total {total} ≉ expected {expected}",
-    );
-    assert_eq!(last_tokens, 500 + 80_000);
-
-    // Smoke: message_cost_usd on a single message also works
-    let opus_msg = json!({
-        "model": "claude-opus-4-7",
-        "usage": {"input_tokens": 1_000_000, "output_tokens": 0,
-                  "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
-    });
-    assert!((message_cost_usd(&opus_msg) - 15.0).abs() < 1e-6);
-
-    let stdin = json!({
-        "cwd": fx.project_dir,
-        "transcript_path": fx.transcript_path,
-    });
-    cost_accumulate(&fx.paths, &stdin).unwrap();
-    let s = fx.read_state();
-    assert!((s.cost_used_usd - expected).abs() < 1e-6);
-    assert_eq!(s.context_tokens_used, last_tokens);
-}
-
-#[test]
-fn cost_accumulate_no_op_when_no_assistant_message_yet() {
-    let fx = Fixture::new("bookmark-mgr-a3f9");
-    std::fs::write(&fx.transcript_path, "").unwrap();
-    let stdin = json!({
-        "cwd": fx.project_dir,
-        "transcript_path": fx.transcript_path,
-    });
-
-    cost_accumulate(&fx.paths, &stdin).unwrap();
-    let s = fx.read_state();
-    assert_eq!(s.context_tokens_used, 0);
-}
+// V0.4.6 F91 — see comment above. The previous
+// `cost_accumulate_*` battery exercised the retired transcript
+// scanner; the replacements live in
+// `crates/ccteam-core/tests/cost_summary_test.rs`.
 
 #[test]
 fn load_context_writes_ready_marker_under_dot_ccteam() {

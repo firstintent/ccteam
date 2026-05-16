@@ -13,6 +13,10 @@ use ccteam_core::{
 
 fn sample_state() -> ProjectState {
     let t0 = Utc.with_ymd_and_hms(2026, 5, 4, 10, 23, 0).unwrap();
+    // V0.4.6 F91 — `cost_used_usd` deprecated; we still set it on the
+    // struct literal because the field stays for serde compat. The
+    // single allow scopes the warning to the construction site.
+    #[allow(deprecated)]
     ProjectState {
         slug: "bookmark-mgr-a3f9".into(),
         team: "dev".into(),
@@ -93,7 +97,11 @@ fn second_save_rotates_previous_to_bak_then_writes_new() {
     assert!(!bak.exists(), "first save must not produce a .bak");
 
     let mut v2 = v1.clone();
-    v2.cost_used_usd = 9.99;
+    // V0.4.6 F91 — field deprecated; allow mutation on this F91-compat test.
+    #[allow(deprecated)]
+    {
+        v2.cost_used_usd = 9.99;
+    }
     v2.save(&main).unwrap();
 
     assert!(
@@ -131,13 +139,20 @@ fn load_falls_back_to_bak_when_main_missing() {
 
     sample_state().save(&main).unwrap();
     let mut v2 = sample_state();
-    v2.cost_used_usd = 7.5;
+    // V0.4.6 F91 — field deprecated; allow access on this compat test.
+    #[allow(deprecated)]
+    {
+        v2.cost_used_usd = 7.5;
+    }
     v2.save(&main).unwrap();
 
     std::fs::remove_file(&main).unwrap();
 
     let loaded = ProjectState::load(&main).unwrap();
-    assert_eq!(loaded.cost_used_usd, sample_state().cost_used_usd);
+    #[allow(deprecated)]
+    {
+        assert_eq!(loaded.cost_used_usd, sample_state().cost_used_usd);
+    }
 }
 
 #[test]

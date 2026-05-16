@@ -392,6 +392,13 @@ enum Command {
         /// missing / unparseable.
         #[arg(long, default_value_t = false)]
         gc_claude_jobs: bool,
+        /// V0.4.6 F91: walk every registered project's
+        /// `.claude/settings.json` and strip the legacy
+        /// `ccteam hook cost-accumulate` PostToolUse entry. Idempotent —
+        /// re-runs after success are no-ops. Pair with `--dry-run` to
+        /// preview the scrub.
+        #[arg(long, default_value_t = false)]
+        update_hooks: bool,
         /// V0.4.6 F83/F85: pair with `--migrate-workflow-to-ccteam-dir`
         /// or `--gc-claude-jobs` to commit changes to disk instead of
         /// previewing them. Without it, those subcommands run as
@@ -584,10 +591,6 @@ enum HookCommand {
     /// Stop hook: parse last assistant message for `PHASE_DONE: <phase>`
     /// or `ESCALATE: <reason>` and emit the matching progress event.
     ParsePhaseEnd,
-    /// PostToolUse hook: refresh state.json `context_tokens_used` from
-    /// the latest assistant message's `usage.*`. Dollar costs land in
-    /// M0.14.
-    CostAccumulate,
     /// SessionStart hook: write the `<project>/.ccteam/ready` marker.
     /// M0.10 extends this to bridge a pre-reset progress summary.
     LoadContext,
@@ -723,6 +726,7 @@ fn main() -> Result<()> {
             migrate_v041_to_v042,
             migrate_workflow_to_ccteam_dir,
             gc_claude_jobs,
+            update_hooks,
             apply,
         } => {
             // V0.4.1 `--install-all` is sugar for the three first-run
@@ -755,6 +759,7 @@ fn main() -> Result<()> {
                 migrate_workflow_to_ccteam_dir,
                 gc_claude_jobs,
                 gc_apply: apply,
+                update_hooks,
             })
         }
         Command::Team { cmd } => run_team(cmd),
@@ -964,10 +969,6 @@ fn run_hook(cmd: HookCommand) -> Result<()> {
                     std::process::exit(2);
                 }
             }
-        }
-        HookCommand::CostAccumulate => {
-            let stdin = parse_hook_stdin_json()?;
-            ccteam_hooks::cost_accumulate(&paths, &stdin)
         }
         HookCommand::LoadContext => {
             let stdin = parse_hook_stdin_json()?;

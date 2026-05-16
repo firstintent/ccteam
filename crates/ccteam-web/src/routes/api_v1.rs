@@ -144,6 +144,18 @@ fn build_projects(app: &AppState) -> anyhow::Result<Vec<DashboardRow>> {
             Some(ts) => recent_event_summary(ts, s.stall_silent_seconds),
             None => "—".to_string(),
         };
+        // V0.4.6 F91 — dashboard cost column reads `cost_total_usd`
+        // from `cost_summary` (progress.jsonl + live claude state.json)
+        // instead of the now-frozen `state.cost_used_usd`. A missing
+        // progress file folds to 0.00 — same shape pre-F91 fresh
+        // projects displayed.
+        let cost_total = ccteam_core::cost_summary(
+            &s.state.slug,
+            &app.paths.progress_jsonl(&s.state.slug),
+            &app.paths,
+        )
+        .map(|c| c.cost_total_usd)
+        .unwrap_or(0.0);
         rows.push(DashboardRow {
             slug: s.state.slug.clone(),
             team: s.state.team.clone(),
@@ -151,7 +163,7 @@ fn build_projects(app: &AppState) -> anyhow::Result<Vec<DashboardRow>> {
             last_event_label,
             badge_class: badge.css_class(),
             badge_label: badge.label(),
-            cost_label: format!("{:.2}", s.state.cost_used_usd),
+            cost_label: format!("{:.2}", cost_total),
         });
     }
     Ok(rows)
@@ -216,6 +228,12 @@ async fn handle_project(
         }
     };
 
+    // V0.4.6 F91 — cost_label sources `cost_total_usd` from
+    // `cost_summary` (progress.jsonl + live state.json). Pre-F91 this
+    // line read `state.cost_used_usd`, which is now frozen.
+    let cost_total = ccteam_core::cost_summary(&slug, &app.paths.progress_jsonl(&slug), &app.paths)
+        .map(|c| c.cost_total_usd)
+        .unwrap_or(0.0);
     let summary = ProjectSummary {
         slug: state.slug.clone(),
         team: state.team.clone(),
@@ -223,7 +241,7 @@ async fn handle_project(
         is_flex: state.team_kind == TeamKind::Flex,
         badge_class: badge.css_class(),
         badge_label: badge.label(),
-        cost_label: format!("{:.2}", state.cost_used_usd),
+        cost_label: format!("{:.2}", cost_total),
         created_at: state.created_at.to_rfc3339(),
         sessions,
         state: state_value,
@@ -295,10 +313,21 @@ async fn handle_session(
         .unwrap_or(0);
     let badge = status_badge(&state, &status_events, silent);
     let snapshot = load_harness_snapshot(&app, &slug, &sid);
+    // V0.4.6 F91 — when no live harness snapshot is available, fall
+    // back to `cost_total_usd` from `cost_summary` instead of the
+    // frozen `state.cost_used_usd`. Both numbers are project-wide
+    // (not session-specific) — session-granular cost is the snapshot's
+    // job.
     let cost_label = snapshot
         .as_ref()
         .map(|snap| format!("{:.2}", snap.cost_usd_total))
-        .unwrap_or_else(|| format!("{:.2}", state.cost_used_usd));
+        .unwrap_or_else(|| {
+            let total =
+                ccteam_core::cost_summary(&slug, &app.paths.progress_jsonl(&slug), &app.paths)
+                    .map(|c| c.cost_total_usd)
+                    .unwrap_or(0.0);
+            format!("{:.2}", total)
+        });
 
     let detail = SessionDetail {
         slug: state.slug.clone(),
@@ -347,9 +376,20 @@ fn session_cards(app: &AppState, state: &ProjectState) -> Vec<SessionCard> {
                 })
                 .unwrap_or(0);
             let badge = status_badge(state, &events, silent);
+            // V0.4.6 F91 — fallback path tracks `cost_total_usd` from
+            // `cost_summary` instead of the frozen state field.
             let cost_label = load_harness_snapshot(app, &state.slug, sid)
                 .map(|snap| format!("{:.2}", snap.cost_usd_total))
-                .unwrap_or_else(|| format!("{:.2}", state.cost_used_usd));
+                .unwrap_or_else(|| {
+                    let total = ccteam_core::cost_summary(
+                        &state.slug,
+                        &app.paths.progress_jsonl(&state.slug),
+                        &app.paths,
+                    )
+                    .map(|c| c.cost_total_usd)
+                    .unwrap_or(0.0);
+                    format!("{:.2}", total)
+                });
             SessionCard {
                 sid: sid.clone(),
                 harness: harness_label(record.harness).to_string(),

@@ -122,8 +122,8 @@ pub use projects::{
     pre_trust_project, slugify, slugify_brief, validate_slug_format,
 };
 pub use queries::{
-    collect_projects, collect_recent_events, workflow_summary, AgentStatus, ProjectSummary,
-    WorkflowSummary,
+    collect_projects, collect_recent_events, compute_cost_summary, cost_summary, workflow_summary,
+    AgentStatus, CostSummary, ProjectSummary, WorkflowSummary,
 };
 pub use screenshot::{
     probe_font as probe_screenshot_font, render_screenshot, vt100_color_to_rgb, ScreenshotResult,
@@ -176,9 +176,10 @@ pub use tmux::{
 pub use tool_surface::{
     disable_tool_surface_bootstrap_for_tests, ensure_skills_placeholders,
     migrate_legacy_skill_dirs, migrate_recommended_agent_symlinks, missing_tools,
-    rewrite_legacy_hook_commands, user_claude_dir, HookCmdRewriteAction, HookCmdRewriteReport,
-    LegacySkillAction, LegacySkillReport, MigrationReport, MissingTool, ToolSurfaceSnapshot,
-    ToolsRequired, BUILTIN_SUBAGENTS,
+    remove_cost_accumulate_hooks, rewrite_legacy_hook_commands, user_claude_dir,
+    CostAccumulateScrubAction, CostAccumulateScrubReport, HookCmdRewriteAction,
+    HookCmdRewriteReport, LegacySkillAction, LegacySkillReport, MigrationReport, MissingTool,
+    ToolSurfaceSnapshot, ToolsRequired, BUILTIN_SUBAGENTS,
 };
 pub use watchdog::{
     config_path as watchdog_config_path, load_config as load_watchdog_config,

@@ -47,8 +47,7 @@
     "PostToolUse": [
       {
         "hooks": [
-          {"type": "command", "command": "__CCTEAM_BIN__ internal hook progress-append PostToolUse", "async": true},
-          {"type": "command", "command": "__CCTEAM_BIN__ internal hook cost-accumulate", "async": true}
+          {"type": "command", "command": "__CCTEAM_BIN__ internal hook progress-append PostToolUse", "async": true}
         ]
       }
     ],
