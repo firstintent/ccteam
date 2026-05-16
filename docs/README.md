@@ -1,61 +1,82 @@
 # ccteam docs 索引
 
-文档分两类:**跨版本 SoT**(根目录,长期维护)+ **版本归档**(`v<major>-<minor>/` 子目录)。
+文档分三类(CLAUDE.md §二 文档维护规则):
 
-## 跨版本 SoT(根目录,长期维护)
+1. **全局文档**(本目录根)— 每 session 起手装入上下文;与代码并列**唯一真理来源**;每版本 ship 后必更新
+2. **版本归档**(`v0-x-x/` 子目录)— ship 后冻结,历史溯源,按需加载
+3. **扩展研究**(`research/` + `references/research/`)— 探索性,不更新,按需加载
+
+## 全局文档(根目录)
 
 | 文件 | 角色 | 何时读 |
 |---|---|---|
 | [`requirements.md`](requirements.md) | 13 痛点的不可变源 | 验收基准;PR 描述映射用 |
 | [`tech-design.md`](tech-design.md) | 架构 SoT | 改架构前必看 |
 | [`interfaces.md`](interfaces.md) | 协议 SoT(YAML / JSON / CLI / hooks / state) | 改 schema 必同步 |
-| [`research/architecture-analysis.md`](research/architecture-analysis.md) | 架构分析 | 面向架构师快速理解当前实现 |
-| [`research/thin-harness-fat-skills-architecture-improvement.md`](research/thin-harness-fat-skills-architecture-improvement.md) | 架构改进建议 | 评估 Thin Harness + Fat Skills 对 ccteam 的启发 |
-| [`research/ccteam-codex-integration.md`](research/ccteam-codex-integration.md) | Codex 集成方案 | 设计 Codex 作为控制端、review/QA sidecar 与未来 worker provider 的路径 |
-| [`research/ccteam-ast-grep-integration.md`](research/ccteam-ast-grep-integration.md) | ast-grep 集成分析 | 评估 AST 结构搜索、规则和 codemod 对 ccteam + Claude Code/Codex 的增强 |
-| [`research/claude-code-orchestration-patterns.md`](research/claude-code-orchestration-patterns.md) | Claude Code 编排模式目录 | 拆分哲学(按上下文不按角色)+ 5 种 canonical 模式(Chaining / Routing / Parallel / Orchestrator-Worker / Evaluator-Optimizer)在 Claude Code 上的具体形态 |
-| [`research/omc-orchestration-modes.md`](research/omc-orchestration-modes.md) | OMC 8 mode 全谱 | 调研 `oh-my-claudecode` 8 种 mode 的轴向分类、嵌套关系、composability;给 ccteam 未来模式扩展的具体启发 |
-| [`research/omc-vs-ccteam-orchestration.md`](research/omc-vs-ccteam-orchestration.md) | OMC vs ccteam 架构对比 | prompt-as-orchestrator vs code-as-orchestrator 两条路线深度对比 + 维度评估表 |
-| [`dev-coupling-audit.md`](dev-coupling-audit.md) | F-finding 累积(跨版本) | 改 ccteam-core 之前 |
-| [`ccteam-as-domain-agnostic-orchestrator.md`](ccteam-as-domain-agnostic-orchestrator.md) | team 泛化 charter | 加新 team 之前 |
-| [`claude-code-best-practices.md`](claude-code-best-practices.md) | Claude Code 实践参考 | 改 phase prompt / hooks / context 时 |
-| [`claude-code-tool-surface.md`](claude-code-tool-surface.md) | Claude Code 工具表参考 | 改 phase YAML `tools_required` / sub-skill 时 |
+| [`dev-coupling-audit.md`](dev-coupling-audit.md) | F-finding 累积(跨版本) | 改 `ccteam-core` 前 |
+| [`ccteam-as-domain-agnostic-orchestrator.md`](ccteam-as-domain-agnostic-orchestrator.md) | team 泛化 charter | 加新 team 前 |
+| [`claude-code-best-practices.md`](claude-code-best-practices.md) | Claude Code 实践参考 | 改 agent prompt / hooks / context 管理时 |
+| [`claude-code-tool-surface.md`](claude-code-tool-surface.md) | Claude Code 工具表参考 | 改 workflow.yaml + `.claude/agents/<role>.md` 时 |
 
-## 版本归档
+## 扩展研究(`research/`)
 
-每发布一个版本,该版本所有规划 / 设计 / retro / userguide 都归档到 `v<major>-<minor>/` 子目录。
+| 文件 | 内容 |
+|---|---|
+| [`research/architecture-analysis.md`](research/architecture-analysis.md) | 架构分析(面向架构师快速理解当前实现) |
+| [`research/thin-harness-fat-skills-architecture-improvement.md`](research/thin-harness-fat-skills-architecture-improvement.md) | Thin Harness + Fat Skills 架构改进建议 |
+| [`research/ccteam-codex-integration.md`](research/ccteam-codex-integration.md) | Codex 作为控制端 / sidecar / worker 的路径 |
+| [`research/ccteam-ast-grep-integration.md`](research/ccteam-ast-grep-integration.md) | ast-grep 集成分析(结构搜索 / 规则 / codemod) |
+| [`research/claude-code-orchestration-patterns.md`](research/claude-code-orchestration-patterns.md) | Claude Code 编排模式 5 种 canonical 形态 |
+| [`research/omc-orchestration-modes.md`](research/omc-orchestration-modes.md) | OMC 8 mode 全谱调研 |
+| [`research/omc-vs-ccteam-orchestration.md`](research/omc-vs-ccteam-orchestration.md) | prompt-as-orchestrator vs code-as-orchestrator 对比 |
+
+## 版本归档(`v0-x-x/`)
 
 | 版本 | 入口 | 状态 |
 |---|---|---|
-| **V0.1** | [`v0-1/README.md`](v0-1/README.md) | 已 ship(M0-M4.4)。历史归档 |
-| **V0.2** | [`v0-2/README.md`](v0-2/README.md) | 已 ship(M0.16-M0.23)。历史归档 |
-| **V0.2.1** | (并入 `v0-2/`)| 已 ship(F26-F33 dust patch),docs 折在 `v0-2/e2e-retro.md §6` |
-| **V0.2.2** | [`v0-2-2/README.md`](v0-2-2/README.md) | 已 ship(F34-F40 + 配套 3 项,7 PR;首例 patch 独立目录)|
-| V0.3 | (未启动) | 候选方向见 `v0-2/README.md` "V0.3 deferred" 段 + `v0-2-2/prd.md §11` |
+| **V0.1** | [`v0-1/README.md`](v0-1/README.md) | M0-M4.4。phase 流水线 + 跨项目记忆原始版本 |
+| **V0.2** | [`v0-2/README.md`](v0-2/README.md) | M0.16-M0.23。plugin pipeline + team-factory |
+| **V0.2.2** | [`v0-2-2/README.md`](v0-2-2/README.md) | F34-F40。`ccteam-project-creator` skill |
+| **V0.3** | [`v0-3/README.md`](v0-3/README.md) | M5。Web UI + JSON API + `kind: flex` team |
+| **V0.3.1** | [`v0-3-1/README.md`](v0-3-1/README.md) | F46-F51。flex team + HarnessAdapter spike |
+| **V0.3.2** | [`v0-3-2/README.md`](v0-3-2/README.md) | F52-F59。SPA + write-action forms + htmx retirement |
+| **V0.4.0** | [`v0-4-0/README.md`](v0-4-0/README.md) | F60-F69。phase 全删 + workflow.yaml + artifact watcher + thin orchestrator + 17 MCP 工具 + WorkflowView SPA |
+| **V0.4.1** | [`v0-4-1/`](v0-4-1/) | UX 简化 patch(`start` 合并 web、`send`/`spawn` CLI、handle 删、daemon hot-reload、MCP 退出 deadlock fix) |
+| **V0.4.2** | [`v0-4-2/`](v0-4-2/) | F72-F75。`ccteam init` 三合一 + `~/.ccteam/config.yaml` 全局 SoT + `doctor --migrate-v041-to-v042` + `ccteam new` thin wrapper |
+| **V0.4.3** | [`v0-4-3/README.md`](v0-4-3/README.md) | F76。slug grammar validation + collision wording 优化 |
+| **V0.4.4** | [`v0-4-4/README.md`](v0-4-4/README.md) | F77。`session_context_from_cwd` walk-up + `paths.project_dir(slug)` 走 config.yaml registry |
+| **V0.4.5** | [`v0-4-5/README.md`](v0-4-5/README.md) | F78 + F80。watcher 项目相对路径修复 + phantom agent_spawn cleanup |
+| **V0.4.6** | [`v0-4-6/README.md`](v0-4-6/README.md) | F81-F91 (11 个 finding)。lifecycle / 用户痛点根治 / 运维收敛 — **当前版本** |
 
 ## 文档维护规约
 
-**版本化文档归档**:
-- 每个版本发布后,PRD / dev-plan / 各 design 子文档 / retro / userguide / e2e 报告 → 该版本的 `v<major>-<minor>/`
-- 版本目录加一份 `README.md` 索引 + V0.3+ deferred 项,确保每条 deferred 都有归宿
+### 三类的更新节奏
 
-**跨版本 SoT 持续维护**:
-- 改架构 / 协议 / 红线 → tech-design.md / interfaces.md / requirements.md 同步,版本归档不重复维护
-- F-finding 累加进 dev-coupling-audit.md(跨版本通用),关闭时标 PR + 版本
+- **全局文档** — 每版本 ship 后**必更新**:
+  - 改协议(YAML 字段 / JSON shape / 文件路径 / CLI 签名 / hooks)→ 同步 `interfaces.md`
+  - 改架构(orchestrator 流 / Phase 模型 / 团队拓扑)→ 同步 `tech-design.md`
+  - 加 finding → 同步 `dev-coupling-audit.md`(关闭时标 PR + 版本)
+- **版本归档** — ship 后**冻结**。即使发现回头看错了,也写在下个版本的归档里更正,**不动旧版本目录**。
+- **研究文档** — **不更新**。引用过时不算 bug,价值在于"那时怎么想的"。
 
-**禁忌**:
-- 不再维护"全局 development-plan.md"(已归档 V0.1,V0.2 起每版本独立 dev-plan)
-- 不在根目录囤"未来版本意图"(V0.3 候选放 `v0-2/README.md` 末尾,V0.3 启动时迁到 `v0-3/prd.md`)
-- 不在版本归档目录里改跨版本 SoT(双 source 对齐难)
+### 版本归档的标准内容
 
-**Patch 版本目录约定(V0.2.2 起)**:
-- **小 patch**(< 4 finding,纯 dust 修):docs 折在 `v0-<minor>/e2e-retro.md §<patch>` 段,**不独立目录**(参考 V0.2.1)
-- **大 patch**(≥ 4 finding,含逻辑变更 / 新机制):**单独目录** `v0-<minor>-<patch>/`,内含 `prd.md` + `dev-plan.md` + 可选 `feedback.md` / `e2e-retro.md`(参考 V0.2.2)
-- 大 patch 目录独立维护,跟 minor 版本归档同等地位
+- `README.md` — 入口 + 概述 + finding 列表 + 与上版本关系
+- `prd.md` — 产品需求 + 痛点 + 验收标准
+- `dev-plan.md` — 实现路径 + 文件改动 + 测试矩阵 + 迁移策略
+- `user-manual.md` — 用户操作手册(简明命令清单 + 升级路径 + 故障排除)
+- 可选:`e2e-retro.md` / `deploy-verify.md` / `feedback.md` / `migration-guide.md`
 
-**新增 V0.3 时的步骤**:
-1. `mkdir docs/v0-3/`
-2. 把 v0-2/README.md "V0.3 deferred" 段迁到 v0-3/prd.md
-3. 写 v0-3/dev-plan.md / v0-3/README.md
-4. 跨版本 SoT(tech-design / interfaces)在 V0.3 ship 各 milestone 时同步更新
-5. V0.3 ship 后,v0-3/ 进入"历史归档"状态
+### 新版本启动步骤
+
+1. `mkdir docs/v0-X-Y/`(版本号严格按 `vMAJOR-MINOR-PATCH`)
+2. 把上版本 `README.md` 末尾的 "当前 next" / "V0.X 候选" 段迁到本版本 `prd.md`
+3. 写 `dev-plan.md` 后再动代码(doc-first 原则,见 CLAUDE.md §五 "Patch 版本开发流程")
+4. 版本 ship 后,本目录的 4 个全局 SoT 文档同步更新(如有协议/架构变化)
+5. 当前版本 README.md "当前 next" 段记下个版本候选
+
+### 禁忌
+
+- **不再维护"全局 development-plan.md"** — V0.2 起每版本独立 `dev-plan.md`(V0.1 老 development-plan.md 在 `v0-1/` 历史归档)
+- **不在版本归档里改全局 SoT** — 双 source 对齐难
+- **不在 `research/` 改实现细节** — 那是研究笔记;实现细节属于全局 SoT

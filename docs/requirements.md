@@ -295,19 +295,18 @@ ccteam 主动开了 4 个 tmux session 并行——后端 1 个、前端 1 个�
 
 具体例子：implement phase 启动 Agent Teams，`backend-dev` / `frontend-dev` / `reviewer` 三 agent 并行；**backend-dev 内部**同时用 `Task` 工具启 subagent 研究"我们 codebase 怎么用 SQLAlchemy"。两者**同时发生**，职责互不重叠——Agent Teams 做**横向多角色**，subagent 做**纵向 context 节流**。三档机制可以**逐层嵌套**，不是 either-or。
 
-**ccteam 设计的回应**：
-- **plan-eng 阶段决定主框架并行粒度**——根据 spec 复杂度估算，phase front matter 输出 `parallelism: solo | agent_team | multi_session`。
-- **subagent 不在 phase 协议中声明**——任何 agent 在任何 phase 都可 ad-hoc 启 subagent（`Task` 工具），不需要 phase 协议许可，叠加在主框架之上。
-- **三档实现节奏**：
-  - **solo（M0 默认）**：主线串行，可叠加 ad-hoc subagent。
-  - **agent_team（M2）**：phase 内启 Agent Teams（已规划在 tech-design §6.3），叠加 subagent。
-  - **multi_session（M3）**：同项目开 N 个 tmux session，每 session 跑一个子模块的 phase 流；通过 `.ccteam/sub-modules/<name>/` 隔离；phase 边界 sync（plan-eng 完成后 fan-out，review/ship 前 fan-in）。
-- **资源约束**：`config.yml` 加 `max_sessions_per_project: 4` / `max_subagents_per_phase: 5` 兜底。
+**ccteam 设计的回应**(V0.4.0+ workflow.yaml 架构):
+- **workflow.yaml 声明并行拓扑** — 每个 agent 的 `parallelism: u32` 字段决定该 role 同时可跑几个 session;`trigger: watch:<dir>/` 决定 fan-out 触发条件(每个新 artifact 一个 session)。系统**事件驱动**,无需在 plan 阶段预先决定"主框架"档次。
+- **subagent 不在 workflow 协议中声明** — 任何 agent 内部都可 ad-hoc 启 subagent(`Task` 工具),不需要 workflow.yaml 许可,叠加在主框架之上。
+- **三档自然落到 workflow 语义**:
+  - **solo** = `parallelism: 1` + 串行 watch dir
+  - **agent_team** = 同一 watch dir 多 role 监听(fan-out 一次 → N agent 并行处理) + 后续 gate trigger 收敛
+  - **multi_session** = 同一 role `parallelism > 1`(同时跑 N session 处理 backlog)
+- **资源约束**:`workflow.yaml::budget`(V0.4.6 F84)`max_cost_usd_per_24h` / `max_agent_spawns_per_hour` 自动 trip + auto-disable;daemon 全局 `MAX_CONCURRENT_PROJECTS: 3` 硬上限。
 
-**边界——这条不解决什么**：
-- 不解决**自动任务分解**（M5 才碰）——本痛点假设 plan-eng 已能识别"有 N 个独立子模块"。
-- 不解决**子模块接口同步**（API 契约管理也是 M5）。
-- M0/M1 不引入 multi_session per project——默认 solo + 偶尔 subagent 够用。
+**边界 — 这条不解决什么**:
+- 不解决**自动任务分解**(workflow.yaml 拓扑要 ccteam-creator skill / 人手工写) — 本痛点假设 workflow.yaml 已声明好 fan-out 拓扑。
+- 不解决**子模块接口同步**(role 之间通过 artifact 文件协作,无 RPC/IPC 内层契约管理)。
 
 ---
 
@@ -327,7 +326,7 @@ ccteam 主动开了 4 个 tmux session 并行——后端 1 个、前端 1 个�
 | **决策频次** | 极低——AI 自检处理大多数；用户上推典型 0-2 次/项目 |
 | **AI 自检层** | 多 agent 互检（architect / critic / designer / security / scope-watcher）+ 架构约束（写死的红线）；agent 议出共识就过——这层处理 95%+ 决策 |
 | **工作流编排** | 系统自己串主干 phase + sub-skill 自动 trigger + 产物自动接力；用户只提需求，不需要触发任何命令、不需要记任何工具放在哪个 phase |
-| **并行规模** | 系统按 spec 复杂度自动选 `parallelism: solo / agent_team / multi_session`；subagent 任何粒度都可叠加；用户不感知"何时用哪档" |
+| **并行规模** | workflow.yaml 声明 `parallelism: u32` + `trigger: watch:<dir>/`,fan-out 事件驱动;subagent 任何粒度都可叠加;用户不感知"何时用哪档" |
 | **用户兜底层** | agent 议不出共识时 push：摆 2-3 个选项 + 推荐 + 一句话 tweak；24h 不响应默认通过；可调 agent 自信阈值（yolo / balanced / careful） |
 | **失败处理** | AI 自己尝试 N 轮后才来找我，并附"试过什么 / 卡在哪" |
 | **多项目** | 排队执行，自动推进，不需要我手动调度 |
@@ -387,7 +386,7 @@ ccteam 的定位是：
 | 想法可行性 | 用户自己判断 | AI 自动评估，否掉无效想法 |
 | 方向校准 | 持续在场把控 | L1 架构约束 + L2 多 agent 互检 + L3 用户兜底（三层纵深防御） |
 | 工作流编排 | 用户手动调命令（知道哪个何时用、产物怎么接） | 系统预编排 phase pipeline + sub-skill 自动 trigger + 产物自动接力；新工具加入由 ccteam 决定挂载点 |
-| 并行规模 | 用户手动决定单线 / 多线、何时开多 session | 系统按 spec 复杂度自动选 `solo / agent_team / multi_session`；三档可叠加 subagent |
+| 并行规模 | 用户手动决定单线 / 多线、何时开多 session | workflow.yaml 声明 `parallelism: u32` + `trigger: watch:<dir>/`,事件驱动 fan-out;subagent 可叠加 |
 | 经验沉淀 | 项目内文档 | 跨项目自动复用 |
 | 目标用户 | 想当 team-lead 的人 | **不想**当 team-lead 但**仍要在 AI 团队议不出来时拍板**的人 |
 

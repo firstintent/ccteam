@@ -72,6 +72,49 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
 
 ---
 
+## V0.3.2+ 索引(F52-F91)
+
+> **2026-05-16 V0.4.6 docs tier-3 sweep 加**:V0.3.2 起 finding 详细描述 + 修复路径**直接住版本目录** `docs/v0-X-Y/{prd.md,dev-plan.md}`,本文不再 inline 重复(节省维护成本)。本节只给一行索引 + 状态 + 链接。F1-F51 历史 detail 块**保留作 V0.1-V0.3.1 考古**。
+>
+> **V0.4.0 起 phase 流水线 EOL**:F60 整删 `phases/` 模块 + `golden_rules` + `dag.rs` + `subskill` 等。F1-F33 中大量 finding(`FIX_PHASE_NAME` / `M0_PHASE_DAG` / `current_phase` 等)所**关闭的代码本身 V0.4.0 已经物理删除**,本节不再 backport — 历史描述按"那时怎么想的"保留。
+
+| Finding | 版本 | 状态 | 摘要 |
+|---|---|---|---|
+| F52-F59 | V0.3.2 | closed | SPA + write-action forms + htmx retirement → `docs/v0-3-2/{prd,dev-plan}.md` |
+| F60 | V0.4.0 | closed | phase 全删 → workflow.yaml 架构,见 `docs/v0-4-0/prd.md` §1 |
+| F61-F69 | V0.4.0 | closed | 17 MCP 工具 + ArtifactWatcher + thin orchestrator + WorkflowView SPA + claude --bg adapter → `docs/v0-4-0/{prd,dev-plan}.md` |
+| F70-F71 | (skip) | — | 编号跳号(V0.4.0 docs 准备阶段保留) |
+| F72-F75 | V0.4.2 | closed | `ccteam init` 三合一 + `~/.ccteam/config.yaml` + `doctor --migrate-v041-to-v042` + `ccteam new` thin wrapper → `docs/v0-4-2/prd.md` |
+| F76 | V0.4.3 | closed | slug grammar validation → `docs/v0-4-3/README.md` |
+| F77 | V0.4.4 | closed | `session_context_from_cwd` walk-up + `paths.project_dir(slug)` 走 config.yaml → `docs/v0-4-4/README.md` |
+| F78 | V0.4.5 | closed | watcher 项目相对路径修复 + progress.jsonl 参数对齐 → `docs/v0-4-5/README.md` |
+| F79 | (skip) | — | 编号跳号 |
+| F80 | V0.4.5 | closed | phantom `agent_spawn` cleanup(`claude_job::probe_job` + synthetic agent_done)→ `docs/v0-4-5/README.md` |
+| **F81** | V0.4.6 | **closed** | `ccteam remove <slug>` lifecycle + active-session refusal → `docs/v0-4-6/prd.md` F81 |
+| **F82** | V0.4.6 | **closed** | workflow.yaml `enabled` + 热加载(`oneshot::Receiver<CancelReason>` + `WorkflowFileWatcher`)→ `docs/v0-4-6/prd.md` F82 |
+| **F83** | V0.4.6 | **closed** | workflow.yaml 默认住 `.ccteam/`(root fallback)+ `doctor --migrate-workflow-to-ccteam-dir` → `docs/v0-4-6/prd.md` F83 |
+| **F84** | V0.4.6 | **closed** | `BudgetSpec`(`max_cost_usd_per_24h` / `max_agent_spawns_per_hour`)→ auto-disable workflow → `docs/v0-4-6/prd.md` F84 |
+| **F85** | V0.4.6 | **closed** | `~/.claude/jobs/` GC + `doctor --gc-claude-jobs` + daemon 启动 sweep → `docs/v0-4-6/prd.md` F85 |
+| **F86** | V0.4.6 | **closed** | daemon graceful shutdown(cancel token + 30s timeout fallback + trigger file `/tmp/ccteam-<user>.shutdown`)→ `docs/v0-4-6/prd.md` F86 |
+| **F87** | V0.4.6 | **closed** | clap `allow_hyphen_values` + `disable_help_flag` 在 `send` / `spawn` → `docs/v0-4-6/prd.md` F87 |
+| **F88** | V0.4.6 | **closed** | web bearer token 自动 clipboard(xclip → xsel → wl-copy → pbcopy → clip.exe fallback chain)→ `docs/v0-4-6/prd.md` F88 |
+| **F89** | V0.4.6 | **closed** | CLI 瘦身:删 V0.3 legacy(`phase` / `decisions` / `watchdog`),`hook` / `mcp-serve` / `spawn` / `send` / `peek` / `attach` / `progress` / `resume` 移到 `ccteam internal <subcmd>` 隐藏分组(老顶层保留 + WARN 到 V0.5)→ `docs/v0-4-6/prd.md` F89 |
+| **F90** | V0.4.6 | **closed** | Web WorkflowView 4 新面板(ArtifactQueuePanel / EventsTimelinePanel / FailureInspector / CostSparkline)+ 4 新 API endpoint → `docs/v0-4-6/prd.md` F90 |
+| **F91** | V0.4.6 | **closed** | cost SoT 收敛(删 `Hook::CostAccumulate` + `cost_summary` 实时读 `~/.claude/jobs/<id>/state.json::cost_usd_total`;`state.cost_used_usd` 字段 deprecated 但 serde-compat)→ `docs/v0-4-6/prd.md` F91 |
+| **F92** | V0.4.7 候选 | **open** | 真 cost 数据源(host `state.json` 没有 `cost_usd_total` 字段 — 真实数据在 `linkScanPath` jsonl event 的 Anthropic `usage` 字段)— 2026-05-16 V0.4.6 E2E 发现 |
+
+## V0.4.6 摘要更新
+
+| 优先级 | 数量 | 编号 |
+|---|---|---|
+| **P0 阻塞泛化(剩余)** | 0 | — |
+| **P1 该做但可后置(剩余)** | 3 | F15(M1+ block-push 时做)、F17、F23(conditional;待 spike 重跑) |
+| **V0.4.7 候选** | 1 | F92(真 cost 数据源)|
+| **N/A 已是领域无关** | 2 | F14, F19 |
+| **已修复**(F1-F91 + V0.2 §6 反模式 8 条)| **~85** | 见上表 + V0.2 §6 候选状态表 |
+
+---
+
 ## P0 — 阻塞泛化
 
 ### F1 — `FIX_PHASE_NAME` / `FIX_LOOP_MAX_ITERATIONS` 字符串耦合 fix-loop 触发(**已修复:M3.1 加 phase YAML 字段;触发逻辑早于 2026-05-06 已切到 `template.auto_loop`;2026-05-07 rename PR 完成命名层 sweep**)
