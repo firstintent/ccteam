@@ -1,13 +1,20 @@
 # ccteam 作为领域无关编排层
 
-> **实施状态(2026-05-06)**:本文档原是 M3 团队抽象的 charter。**M3 已落地**
-> (commit `0d88ddc` PR #7 + 后续 M3.x 子 PR ship,详见 `docs/v0-1/docs/v0-1/development-plan.md` §5)
-> ——`team.yaml` schema、`--team` CLI、phase DAG inference、product-research
-> 团队作为首个非 dev 团队都已 ship;关联 dev-coupling 审计 13/23 条已关闭(详见
-> `docs/dev-coupling-audit.md` 摘要表)。**M4 跨项目记忆**走官方 `~/.claude/rules/`
-> + per-repo auto-memory 路径,亦已 ship(M4.1–M4.4)。本文继续保留作为团队
-> 抽象的**永久 charter**——未来再加新团队(marketing / ops / ...)时,§1 责任
-> 分界表 / §2 团队扩展契约 / §3 显式拒绝清单仍是**首要参考**。
+> **实施状态(2026-05-16,V0.4.6)**:本文档原是 M3 团队抽象的 charter。
+> **M3 已落地**(commit `0d88ddc` PR #7 + 后续 M3.x 子 PR ship);**V0.4.0 phase
+> 机制彻底拆除,换 workflow.yaml + ArtifactWatcher + thin orchestrator 数据驱
+> 动架构**(F60-F69);**V0.4.5 F78 watcher 项目相对路径修复 + F80 phantom
+> agent_spawn cleanup**。已 ship 版本:V0.1–V0.4.6(V0.4.0 phase→workflow 重
+> 构 / V0.4.1 UX 简化 / V0.4.2 ccteam init + 全局 config.yaml / V0.4.3 slug
+> grammar / V0.4.4 任意路径 hook / V0.4.5 watcher + phantom cleanup / V0.4.6
+> workflow.yaml `enabled` + 热加载 + budget + `ccteam remove`)。**dev-coupling
+> 审计**(`docs/dev-coupling-audit.md`):F1-F91 共 57 条 distinct findings,~88
+> 已 close,剩余 F15(M1+ deferred)/ F17(P2 边角)/ F23(spike conditional)/
+> V0.4.6 in-flight。**M4 跨项目记忆**走官方 `~/.claude/rules/` + per-repo
+> auto-memory(M4.1–M4.4)亦已 ship。本文继续保留作为团队抽象的**永久 charter**
+> ——未来再加新团队(marketing / ops / ...)时,§1 责任分界表 / §2 团队扩展契
+> 约 / §3 显式拒绝清单仍是**首要参考**;**§1.4 workflow-as-data 红线**(V0.4.6
+> 新增)钉死 workflow.yaml 不许写 prompt 字面量。
 >
 > 本文回答一个问题:**ccteam 当前长得像"一个 dev 团队的编排器",但它的核心
 > 编排机制实际上与"做软件"这个领域无关——把 phase 集合换一组,同一台机器
@@ -36,12 +43,16 @@
   这种硬编码、fix-loop 完成信号 `TESTS_GREEN`、6 维评分维度、推荐 plugin
   agent 清单、artifact 文件命名(`spec.md` / `plan-eng.md` / ...)、危险命令
   拦截清单、Critic 视角集——这些假设了"你在做软件"。
-- **当前代码用"约定假设"代替了"显式参数"**(2026-05-05 写,M3 已修):
-  `orchestrator.rs` 当时写死 dev pipeline 的 6-phase DAG,`fix_loop.rs` 写死
-  `TESTS_GREEN`,`commands.rs` 写死要找的 artifact 名。M3 已把 DAG 提取为
-  `crates/ccteam-core/src/dag.rs`(从 phase 模板推断);`completion_signal` 移到
-  phase YAML;**仅 `collect_artifacts` 仍硬编码 dev artifact 列表**(F8 待修)。
-  长期 `ccteam-core` 已基本无 dev 字面量,F1 / F8 收口后清零。
+- **当前代码用"约定假设"代替了"显式参数"**(2026-05-05 原写,V0.4.0 重构后整
+  段失效但保留作历史):`orchestrator.rs` 原写死 dev pipeline 的 6-phase DAG,
+  `fix_loop.rs` 写死 `TESTS_GREEN`,`commands.rs` 写死要找的 artifact 名。
+  M3 把 DAG 提取为 `crates/ccteam-core/src/dag.rs`(从 phase 模板推断);
+  F8(`collect_artifacts` 硬编码 artifact 列表)2026-05-07 PR close;
+  F1 / F5-F7 / F18(`fix_loop` → `auto_loop` 命名 sweep)2026-05-07 rename PR close。
+  **V0.4.0(F60-F69)整套 phase 状态机彻底拆除** —— `orchestrator.rs` 2713 LOC
+  → ~820 LOC thin orchestrator,改读 workflow.yaml + ArtifactWatcher fsevents
+  事件驱动;`fix_loop.rs` / `auto_loop.rs` 全删;`dag.rs` 全删。`ccteam-core`
+  无 dev 字面量,**workflow.yaml 是数据驱动入口**(§2.1)。
 - **首个非 dev 团队选 research**——工具面与 dev 重叠最多(同一批 plugin
   agent 复用率高、不需要新 MCP),但**完成信号**(tests pass → "3 个一手数
   据来源经过 Critic 交叉验证")与 **fix-loop 语义**(改代码 → 重设假设 +
@@ -65,15 +76,16 @@
 
 | 概念 | 归类 | 论证 |
 |---|---|---|
-| `state.json` 字段 `slug` / `tmux_session` / `claude_session_id` / `claude_pid` / `phase_state` / `parallelism` | 🟢 | 进程身份与执行栈状态——所有团队共用 |
-| `state.json` 字段 `current_phase` | 🟢 | 字段是 mechanism;**取值范围**(`plan-eng` / `implement` / ...)由 team 注入 → 取值是 🟡 |
-| `state.json` 字段 `phase_history[]` | 🟢 | 时间序列状态记录,所有团队共用 |
-| `state.json` 字段 `cost_used_usd` / `soft_warn_threshold_usd` / `hard_kill_threshold_usd` | 🟢 | $ 与 token 是 LLM 推理的物理事实,不分领域 |
+| `state.json` 字段 `slug` / `tmux_session` / `claude_session_id` / `claude_pid` / `parallelism` | 🟢 | 进程身份与执行栈状态——所有团队共用 |
+| `state.json` 字段 `current_phase` | 🟢→**V0.4.0+ deprecated** | serde-compat 字段保留,新写不带;F66 thin orchestrator 完全不消费 |
+| `state.json` 字段 `phase_history[]` | 🟢→**V0.4.0+ deprecated** | 同上,业务 SoT 改 progress.jsonl |
+| `state.json` 字段 `phase_state`(枚举 `in_flight` / `idle` / `fix_locked` / `auto_locked`) | 🟡→**V0.4.0+ deprecated** | V0.4.0 phase 状态机拆除;字段 serde-compat 仅 |
+| `state.json` 字段 `cost_used_usd` / `soft_warn_threshold_usd` / `hard_kill_threshold_usd` | 🟢 | $ 与 token 是 LLM 推理的物理事实,不分领域;**V0.4.5 起 cost_used_usd 改从 progress.jsonl agent_spawn 汇总** |
 | `state.json` 字段 `context_tokens_used` / `context_reset_threshold_tokens` / `context_reset_count` | 🟢 | claude 进程级别的事实 |
 | `state.json` 字段 `last_progress_event_at` / `last_event_type` / `user_attached` / `user_pause_pending` | 🟢 | 调度器时间线事实 |
-| `state.json` 字段 `fix_cycle_count` | 🟡 | "fix"是 dev 团队的概念名;mechanism 是"phase 内自循环计数",字段应改名 `auto_loop_iterations` 或挪进 `phase_state` 内嵌(详见 §B.1) |
-| `phase_state` 枚举 `in_flight` / `idle` / `fix_locked` | 🟡 | mechanism 通用,但 `fix_locked` 命名假设了"fix 阶段才会自循环"——其它团队的 critic-loop / experiment-loop 也需要同样语义,改名 `auto_locked` 更准 |
-| `parallelism` 枚举 `solo` / `agent_team` / `multi_session` | 🟢 | 三档并行规模是抽象的执行栈拓扑,与领域无关 |
+| `state.json` 字段 `fix_cycle_count` | 🟡→**V0.4.0+ deprecated** | "fix"语义死随 V0.4.0 phase 拆除;serde-compat 仅 |
+| `parallelism` 枚举 `solo` / `agent_team` / `multi_session` | 🟢 | 三档并行规模是抽象的执行栈拓扑;V0.4.0+ 由 workflow.yaml `AgentSpec::parallelism` 数据驱动 |
+| `state.json` 字段 `sessions{}` / `next_sid_seq{}`(V0.3.1+ flex multi-session) | 🟢 | flex team 多 harness session 状态记录 |
 
 ### 1.2 progress.jsonl 事件类型
 
@@ -82,46 +94,97 @@
 | `session_start` / `SessionEnd` | 🟢 | claude 进程生命周期 |
 | `PreToolUse` / `PostToolUse` / `SubagentStop` | 🟢 | Claude Code hook 透传 |
 | `Stop` / `notification` | 🟢 | idle 信号 |
-| `phase_inject` / `phase_done` | 🟢 | 调度器→执行体的握手协议 |
-| `escalate` | 🟢 | 调度器层语义,**reason 字段内容**与"该升级到哪个修复路径"是 🟡(详见 §1.6 ESCALATE 语法) |
-| `phase_milestone` | 🟢 | 自由文本进度标记;团队怎么用是 🔴 |
+| `phase_inject` / `phase_done` / `phase_milestone` / `golden_rules_check` | **V0.4.0+ EOL**(F60) | phase 机制 V0.4.0 拆除;旧 progress.jsonl 仍可读但新写不出 |
+| `workflow_start` / `agent_spawn` / `agent_done` / `artifact_received` / `gate_triggered` / `budget_exceeded` / `workflow_done` | 🟢(V0.4.0 引入,**7 类业务 event**) | 调度器→执行体的握手协议;`reason` / `role` 字段内容是 🟡 |
+| `escalation` | 🟢 | 调度器层语义,**reason 字段内容**与"该升级到哪个修复路径"是 🟡(详见 §1.6 ESCALATE 语法) |
 | `watcher_concern` / `watcher_block` | 🟢 | mechanism;具体哪些 watcher、看什么是 🟡 |
 | `context_reset` | 🟢 | 60% 阈值机制 |
 
-### 1.3 phase YAML front matter 字段
+### 1.3 workflow.yaml schema(V0.4.0+ 主拓扑入口)
+
+**V0.4.0 F63 起,workflow.yaml 是项目拓扑 SoT**;phase YAML 已 EOL(下表 1.3a 仅作历史)。
 
 | 字段 | 归类 | 论证 |
 |---|---|---|
-| `name` | 🟢 | 字段是 mechanism;取值是 🟡 |
-| `required_inputs` / `required_outputs` | 🟢 | L1 架构约束的 mechanism;具体路径是 🟡 |
-| `soft_cost_warn_usd` / `stall_warn_minutes` | 🟢 | 调度器观测阈值 |
-| `parallelism` / `agent_team` | 🟢 | 执行栈拓扑 |
-| `sub_skills[]` | 🟢 | mechanism;清单内容(`code-reviewer` / ...)是 🟡 |
-| `hooks.before` / `hooks.after` | 🟢 | mechanism;脚本路径是 🔴 |
-| `tools_required`(M0.5 引入) | 🟢 | 启动期可达性校验的 mechanism;清单内容是 🟡 |
-| **新字段** `completion_signal`(由本文档建议) | 🟢 | mechanism;取值(dev=`TESTS_GREEN` / research=`HYPOTHESES_VALIDATED` / ...)是 🟡 |
+| `WorkflowSpec::name` | 🟢 | 字段是 mechanism;取值是 🟡 |
+| `WorkflowSpec::description` | 🟢 | 给 meta-agent / UI 看;内容是 🟡 |
+| `WorkflowSpec::enabled`(V0.4.6 F82) | 🟢 | 软开关 + 热加载;所有团队共用 |
+| `WorkflowSpec::budget`(V0.4.6 F84) | 🟢 | rolling cap;数字由 team / 项目注入 → 取值是 🟡 |
+| `WorkflowSpec::agents{role: AgentSpec}`(IndexMap) | 🟢 | 字段 + 顺序语义是 mechanism;role 名是 🟡 |
+| `AgentSpec::executor`(`claude` / `codex`) | 🟢 | HarnessAdapter 选择 |
+| `AgentSpec::trigger`(`manual` / `schedule` / `gate` / `watch:<path>`)| 🟢 | 4 类触发语义全 mechanism;`watch:` 路径是 🟡 |
+| `AgentSpec::parallelism: Option<u32>` | 🟢 | 通用并发上限;仅 `Watch` 触发有意义 |
+| `AgentSpec::input` / `AgentSpec::output`(项目相对路径) | 🟢 | 字段名是 mechanism;路径是 🟡 |
+| `AgentSpec::interval`(opaque string,V0.4.6 还未 cron 化) | 🟢 | `schedule` 配套;数字是 🟡 |
+| `AgentSpec::timeout` + `on_timeout`(`escalate` / `retry` / `skip`) | 🟢 | watchdog 三档语义全通用 |
+| **prompt 内容字段** | **明令禁止** | 见 §1.4 workflow-as-data 红线 |
 
-### 1.4 orchestrator 决策点(`orchestrator.rs` / `fix_loop.rs`)
+#### 1.3a phase YAML 字段(**V0.4.0+ EOL**,仅作历史)
+
+`team.yaml::kind: workflow`(phase 驱动)在 V0.4.0 终结。下表保留为 V0.1-V0.3 旧字段索引。
+
+| 字段 | 归类 | 论证 |
+|---|---|---|
+| `name` / `required_inputs` / `required_outputs` / `soft_cost_warn_usd` / `stall_warn_minutes` / `parallelism` / `agent_team` / `sub_skills[]` / `hooks.before` / `hooks.after` / `tools_required` / `completion_signal` | **V0.4.0+ EOL**(F60) | phase YAML 全部废,旧 `phases/` 目录 V0.4.0 PR #1 删 |
+
+### 1.4 Workflow-as-data 红线(V0.4.6 加固)
+
+> **核心红线**:workflow.yaml 是**拓扑数据**——连线 + trigger 类型 + 并发上限 +
+> 软开关 + budget,**绝不出现 prompt 字面量**。agent 行为 prompt 住 `.claude/agents/
+> <role>.md`(那是 LLM-prompt content 层,**由 Claude Code 加载,不由 ccteam 解析**)。
+> ccteam orchestrator **不读 prompt,不路由 prompt,不在状态机里做"如果 prompt
+> 提到 X 就 Y"判断**——orchestrator 是文件系统事件调度器,不是 NL 中间件。
+
+**workflow.yaml 字段允许出现什么**:
+
+| 项 | 归类 | 允许? |
+|---|---|---|
+| 拓扑(`agents{role: ...}` IndexMap) | mechanism | ✅ |
+| trigger 类型(`manual` / `schedule` / `gate` / `watch:<path>`) | mechanism | ✅ |
+| `enabled: bool` 软开关 + 热加载 | 🟢 orchestrator-level | ✅ |
+| `budget: {max_cost_usd_per_24h, max_agent_spawns_per_hour}` | 🟢 orchestrator-level | ✅ |
+| `parallelism: u32` 并发上限 | 🟢 orchestrator-level | ✅ |
+| `executor: claude|codex` harness 选择 | 🟢 orchestrator-level | ✅ |
+| `input` / `output` 路径 | 🟢 数据流契约 | ✅ |
+| `timeout` + `on_timeout` watchdog | 🟢 orchestrator-level | ✅ |
+| **agent 行为指令 / prompt 文字 / role 描述长文本** | LLM-content 层 | ❌ → `.claude/agents/<role>.md` |
+| **决策树 / 状态机分支描述** | LLM-content 层 | ❌ → meta-agent CLAUDE.md or agent.md |
+| **"如果 X 就 Y"条件分支字面量** | 工作流条件 | ❌(workflow.yaml 条件分支是 V0.5+ 候选,仍走数据 schema 不写 prompt)|
+
+**违反这条红线的 PR 应被拒收**——orchestrator 解析 prompt 内容等于在 ccteam-core
+内嵌 LLM,违反 §3 显式拒绝清单(无新增条目但精神一致)+ Symphony 反模式红线
+(channel adapter 进程内不嵌 LLM,§7.4)。`.claude/agents/<role>.md` 是 Claude
+Code 的官方 subagent definition 路径,ccteam 只负责文件存在性校验(`ccteam doctor
+--validate-workflow`),不负责语义解析。
+
+**工程含义**:
+- `crates/ccteam-core/src/workflow.rs::WorkflowSpec` 是上述字段的 SoT,新字段加入
+  前先回本节问"这是拓扑数据还是 prompt 内容?"
+- `ccteam-creator` skill(V0.4.4)生成 workflow.yaml 时严格按上表;`.claude/agents/
+  <role>.md` 由用户/skill 手写,ccteam 不读
+- meta-agent dispatch 时**不**解析 `<role>.md` 内容 — 只看 workflow.yaml 拓扑 + 通
+  过 `mcp__ccteam__spawn_agent(role=...)` 派单,Claude Code 自行加载 `<role>.md`
+
+### 1.5 orchestrator 决策点(thin orchestrator;F66 V0.4.0)
 
 | 决策点 | 归类 | 论证 |
 |---|---|---|
-| `decide_tick` 的状态机分支(NoOp / Advance / Escalate / Dispatch) | 🟢 | 通用状态转移 |
-| `next_phase()` —— 给当前 phase 找下一个 phase | 🟢 | 查表 mechanism;**表本身**(`M0_PHASE_DAG`)是 🟡——必须可换 |
-| `is_terminal()` —— 判断终态 | 🟡 | 当前实现把 `ship` passed 当终态;mechanism 应该改为"DAG 终点 + escalated"——`ship` 是 dev 团队的终点名 |
-| `FIRST_PHASE = "plan-eng"` | 🟡 | 应改为"DAG 第一个节点",让 team 配置注入 |
-| `FIX_PHASE_NAME = "fix"` 触发 fix-loop | 🟡 | mechanism 是"某些 phase 标记为 'auto-loop',进入时写 ralph state"——phase 模板用 `auto_loop: true` 字段触发更通用 |
-| `FIX_LOOP_MAX_ITERATIONS = 3` | 🟢 | 通用上限;团队可在 phase 模板里覆盖 |
-| `completion_signal: "TESTS_GREEN"`(`fix_loop::FixLoopState::new`) | 🟡 | 应来自 phase 模板 `completion_signal` 字段,而非硬编码 |
+| `decide_tick` 的状态机分支(NoOp / Advance / Escalate / Dispatch) | **V0.4.0+ EOL** | F66 thin orchestrator 改读 workflow.yaml + ArtifactWatcher 事件驱动;`decide_tick` 全删 |
+| `next_phase()` / `is_terminal()` / `FIRST_PHASE` / `FIX_PHASE_NAME` / `FIX_LOOP_MAX_ITERATIONS` / `M0_PHASE_DAG` / `completion_signal: "TESTS_GREEN"` | **V0.4.0+ EOL**(F60 phase machinery removal + 2026-05-07 fix→auto rename PR) | 整组 phase 状态机字面量随 V0.4.0 拆除;无 backwards-compat shim |
+| `dag.rs::PhaseDag::infer_from_templates` | **V0.4.0+ EOL**(F60) | DAG inference 死随 phase 拆除;workflow.yaml `agents` IndexMap 保留 YAML 声明顺序作 trigger 图,无需 DAG inference |
+| `WorkflowSpec::enabled`(V0.4.6 F82)+ 热加载 | 🟢 | mechanism 通用;workflow 实例软开关,所有团队共用 |
+| `WorkflowSpec::budget`(V0.4.6 F84)| 🟢 | rolling 24h cost cap + 1h spawn cap;数字由 team / 项目配置 → 取值是 🟡 |
+| ArtifactWatcher inotify/fsevents 触发 | 🟢 | 文件系统是控制平面(tech-design §2.2 红线);watch 路径是 🟡 |
 | 60% reset 阈值 | 🟢 | claude 进程级事实 |
 | idle-aware 注入(Stop/notification → 直注;否则 /btw) | 🟢 | mechanism |
-| cost ladder 阈值($20 / $50 / $200) | 🟢 | 默认值是 mechanism;数字本身可由 `~/.ccteam/config.yml` 与 phase 模板覆盖 |
+| cost ladder 阈值($20 / $50 / $200) | 🟢 | 默认值是 mechanism;数字本身可由 `~/.ccteam/config.yaml` 与 workflow.yaml `budget` 覆盖 |
 | stall ladder(5/15/30 min) | 🟢 | 同上 |
 
-### 1.5 Hook 与文件路径
+### 1.6 Hook 与文件路径
 
 | 文件 / 路径 | 归类 | 论证 |
 |---|---|---|
-| `~/.ccteam/{inbox,queue,control,phases,progress}` | 🟢 | 全局编排层布局(M4 后无 `memory/` — 跨项目记忆走官方 `~/.claude/CLAUDE.md` + `~/.claude/rules/`) |
+| `~/.ccteam/{inbox,queue,control,progress}` | 🟢 | 全局编排层布局(M4 后无 `memory/`、V0.4.0 后无 `phases/` — 跨项目记忆走官方 `~/.claude/CLAUDE.md` + `~/.claude/rules/`;V0.4.2+ 加 `~/.ccteam/config.yaml` 全局 SoT 注册表 + V0.4.6 加 `~/.ccteam/projects/<slug>/`(state.json / progress / inbox / control 全在此)|
 | `~/projects/<slug>/.ccteam/state.json` | 🟢 | 项目元数据 mechanism |
 | `~/projects/<slug>/.ccteam/spec.md` | 🟡 | 字段名是 mechanism;research 团队等价物可能叫 `topic.md` / `brief.md`——应在 team 配置中声明 |
 | `~/projects/<slug>/.ccteam/<phase>-report.md` | 🟢 | 命名 pattern 是 mechanism(`<phase>-report.md`);具体哪些 phase 是 🟡 |
@@ -131,7 +194,7 @@
 | `security_reminder_hook.py`(plugin) | 🔴 | 完全 dev-specific |
 | project CLAUDE.md "不要 git push / 测试不过不算完成" | 🔴 | dev 团队 CLAUDE.md 模板;research 团队需另一份 |
 
-### 1.6 ESCALATE grammar(M0.5.4 引入,本文档加固)
+### 1.7 ESCALATE grammar(M0.5.4 引入,本文档加固)
 
 | 语法档 | 归类 | 论证 |
 |---|---|---|
@@ -141,7 +204,7 @@
 | **建议新增** `ESCALATE: HYPOTHESIS_REJECTED — <reason>` 等团队特化前缀 | 🟡 | mechanism 是"team 可注册自己的前缀";前缀本身是团队语义 |
 | 无前缀时降级为 `NEED_USER_INPUT` | 🟢 | mechanism |
 
-### 1.7 防御层(L1 / L2 / L3)与 watcher
+### 1.8 防御层(L1 / L2 / L3)与 watcher
 
 | 概念 | 归类 | 论证 |
 |---|---|---|
@@ -154,7 +217,7 @@
 | L3 用户 fork 决策 | 🟢 | 通用 |
 | 信任档位 `yolo` / `balanced` / `careful` | 🟢 | 通用 |
 
-### 1.8 CLI 命令
+### 1.9 CLI 命令
 
 | 命令 | 归类 | 论证 |
 |---|---|---|
@@ -164,7 +227,7 @@
 | ~~`ccteam memory rebuild`~~ | — | M4 简化后无自建索引,该命令不存在;跨项目检索走 Claude session 内官方 `/memory` + 可选 `mcp__*claude-mem*search` |
 | `ccteam fork-reply`(M1+) | 🟢 | 通用 |
 
-### 1.9 跨项目记忆
+### 1.10 跨项目记忆
 
 > **2026-05-06 重塑**:M4 不再自建索引/向量库,完全复用 Claude Code 官方机制。
 > 详见 `docs/tech-design.md §3.7` + `references/research/claude-code-memory-research.md` §六。
@@ -184,39 +247,65 @@
 要在 ccteam 上跑一支新团队,必须交付以下 7 件东西。**少一件,orchestrator 拒绝
 启动**(`ccteam doctor --team <name>` 失败 → `ccteam start --team <name>` fail-fast)。
 
-> ✅ **M3 已落地这套契约**(2026-05-06):`team.yaml` schema(retro_schema /
-> critic_dimensions / escalate_grammar_extensions / golden_rules / phase_dir /
-> verdict_schema)+ `--team` CLI + 团队特定 phase 集 + product-research 作为首个
-> 非 dev 团队全部 ship。本节继续作为新团队加入的契约骨架——加 marketing / ops
-> 时仍按此 7 件清单交付。
+> ✅ **M3 已落地 phase-driven 契约**(2026-05-06);**V0.4.0 重构为 workflow-driven**
+> (F60-F69):phase 集合 EOL,改 workflow.yaml + `.claude/agents/<role>.md` 数据驱动。
+> `team.yaml` 仍保留(retro_schema / critic_dimensions / escalate_grammar_extensions /
+> golden_rules / verdict_schema)作 V0.4.0 后**向后兼容仅**;新团队走 workflow.yaml +
+> agents.md。本节继续作为新团队加入的契约骨架——加 marketing / ops 时仍按此清单交付。
 
-### 2.1 phase 集合(目录与命名)
+### 2.1 Workflow 拓扑(`workflow.yaml` 是数据驱动入口)
 
-```
-phases-<team>/
-├── 00-<entry>.md
-├── 01-<...>.md
-├── ...
-└── NN-<terminal>.md
+V0.4.0 起,新团队**不**再交付 `phases-<team>/` 目录;改交付:
+
+1. **`team.yaml::workflows[]`** — 声明本团队可用的 workflow 实例(team-level registry,
+   `~/.ccteam/teams/<team>.yaml`)。每条引用一个 workflow.yaml 模板路径 + 描述。
+2. **项目实例 `<project>/.ccteam/workflow.yaml`**(V0.4.6 F83 起从 root 迁入 `.ccteam/`)
+   — 由 `ccteam init` / `ccteam new` 或 `ccteam-creator` skill 生成,包含具体 agent
+   拓扑 + trigger + parallelism + budget。**完整 schema** 见 §1.3 表;字段表 + 红线见 §1.4。
+3. **`.claude/agents/<role>.md`** — 每个 workflow 引用的 role,在 `.claude/agents/`
+   下有同名 markdown(Claude Code 官方 subagent definition 路径)。**这是 agent 行为
+   SoT**(prompt + tools + role description),由用户 / `ccteam-creator` 手写,
+   **ccteam 不读、不解析、不修改**。
+
+**workflow.yaml 骨架示例**(V0.4.6,与 `crates/ccteam-core/src/workflow.rs::WorkflowSpec` 一致):
+
+```yaml
+name: dex-ui-autoloop
+description: "DEX UI 自循环改 bug pipeline"   # meta-agent / UI 看
+enabled: true                                  # F82 软开关
+budget:                                        # F84 双 cap
+  max_cost_usd_per_24h: 5.00
+  max_agent_spawns_per_hour: 100
+agents:
+  explorer:
+    executor: claude
+    trigger: watch:.ccteam/issues/             # inotify trigger
+    parallelism: 2
+    input: .ccteam/issues/
+    output: .ccteam/fix-requests/
+    timeout: 30m
+    on_timeout: escalate
+  fixer:
+    executor: claude
+    trigger: gate                              # 等 trigger_gate MCP
+    input: .ccteam/fix-requests/
+    output: .ccteam/fixes/
 ```
 
 约定:
-- **目录命名** `phases-<team>/`(`phases-dev/` / `phases-research/` / `phases-marketing/`)。
-  当前主线 `phases/` 在迁移期 alias 为 `phases-dev/`(详见 §B 审计建议)。
-- **文件命名**:`NN-<phase-name>.md`,`NN` 是排序前缀(orchestrator 按文件名排序
-  推断 happy-path DAG;非线性 DAG 由 `next_phase` 字段在 front matter 显式声明)。
-- **front matter 必含字段**:
-  - `name`(必须与文件名 `<phase-name>` 一致)
-  - `required_inputs[]` / `required_outputs[]`
-  - `parallelism: solo | agent_team | multi_session`
-  - **新增** `completion_signal: <SIGIL>`——本 phase 视作"内部循环成功完成"
-    时 claude 必须输出的 token(替代 `fix_loop.rs` 里硬编码的 `TESTS_GREEN`)
-  - **新增** `auto_loop: bool`(默认 `false`)——`true` 时进入 phase 自动写
-    `<project>/.ccteam/auto-loop.state.md`(取代 `fix-loop.state.md`),Stop hook
-    按 ralph 范式拦截重喂;`max_iterations` 与 `completion_signal` 来自本字段
-  - `tools_required: { subagents, skills, mcp }`(M0.5 已有)
-- 至少有一个 phase 标记为终态(下一节点 `next_phase: ~`),作为 ship 等价物。
-- 至少有一个 retro phase——为跨项目记忆提供产出(详见 §2.6)。
+- **agents 是 IndexMap**(YAML 声明顺序保留)→ trigger 图按声明顺序 deterministic build
+- **至少一个 agent** 必须有非空 trigger;否则 `ccteam doctor --validate-workflow` fail
+- **role 名** 必须与 `.claude/agents/<role>.md` 文件名匹配(orchestrator 启动期 +
+  spawn 前各校验一次;缺文件 → fail-fast)
+- **trigger 4 类**:`manual`(meta-agent 显式派单)/ `schedule`(V0.4.1 cron,opaque
+  interval)/ `gate`(等 `trigger_gate` MCP)/ `watch:<path>`(inotify)
+- **数据驱动红线** — workflow.yaml 字段表里**不**允许 prompt 字面量;详见 §1.4
+
+### 2.1a phase 集合(目录与命名,**V0.4.0+ EOL**,仅作历史)
+
+V0.1-V0.3 旧 `phases-<team>/` 约定保留作历史索引;V0.3.2 → V0.4.0 升级路径见
+CLAUDE.md §六(`ccteam doctor --migrate-phase-to-workflow`)。新团队**不**用 phase
+约定。
 
 ### 2.2 `tools_required` 清单
 
@@ -321,25 +410,29 @@ escalate_prefixes:
 orchestrator 解析 `parse-phase-end` 时按团队声明的前缀分发——前缀本身是数据,
 分发逻辑是 mechanism。
 
-### 2.5 完成信号定义(替代 dev "tests pass")
+### 2.5 完成信号定义(**V0.4.0 后向后兼容仅;新 team 改 workflow.yaml + agent.md**)
 
-每团队必须声明:
+> V0.4.0 phase 拆除后,"phase completion_signal" 概念失效。新 team 不再声明
+> `completion_signal` / `on_loop_exhaust` —— workflow.yaml 通过 trigger 类型 +
+> `parallelism` 表达启停语义,`workflow_done` event 由 thin orchestrator 在所有
+> `gate` agent 完成时自动写。**本节保留为 V0.1-V0.3 团队的语义参考。**
+
+V0.1-V0.3 phase 驱动时代,每团队必须声明:
 
 1. **何时本项目算 done**——通常是 phase DAG 走到终态 phase 且无 escalate。
 2. **每个 phase 的 `completion_signal`** —— ralph-loop / Stop hook 据此判定退出
    vs 重喂。dev 团队 fix phase 用 `TESTS_GREEN`;research synthesis phase 可能
    用 `INSIGHTS_TRIANGULATED`。
-3. **自循环 phase 的失败兜底**——例如 research 的 primary 数据收集 phase 在
-   max_iterations 仍未拿到 ≥3 来源时,orchestrator 是 escalate 给用户、还是
-   自动放弃这个项目。每团队在 `team.yaml` 选 `on_loop_exhaust: escalate | abort`。
+3. **自循环 phase 的失败兜底** + `on_loop_exhaust: escalate | abort`。
 
 ### 2.6 推荐 plugin / agent 安装清单
 
 每团队提供 `team.yaml.recommended_agents`,`ccteam doctor --install-recommended-agents
---team <name>` 据此 ln -sf。dev 团队的 8 个 agent(M0.5.1)只是 dev 实例;research
-团队需要的可能完全不同(详见 §C 起草 phase 集时给出的初始清单)。
+--team <name>` 据此 ln -sf。**V0.4.0 后**:**首要交付改为 `.claude/agents/<role>.md`
+(workflow.yaml 引用的 role 必须各有同名 md)**;`recommended_agents` 字段仍保留作
+V0.1-V0.3 兼容,但新团队**优先**靠 `.claude/agents/` SoT 而非 ccteam-managed lnish。
 
-清单要素:
+清单要素(V0.1-V0.3 兼容字段):
 - agent 来源(`claude-plugins-official:<plugin>/agents/<name>` / 自带脚本路径)
 - 默认挂载 phase(信息性,不强制)
 - 用一句话说明何时该被调用(给 LLM 决策时读)
@@ -362,13 +455,20 @@ orchestrator 解析 `parse-phase-end` 时按团队声明的前缀分发——前
 ```yaml
 # ~/.ccteam/teams/<team-name>.yaml(规范化文件名;M3 已落地 — 见 `teams/dev.yaml` / `teams/product-research.yaml`)
 name: research
-phase_dir: phases-research                # 相对 ccteam 安装目录
-entry_phase: 00-topic                     # 等价 dev 的 plan-eng
-critic_dimensions: [...]                  # §2.3
-escalate_prefixes: [...]                  # §2.4
-completion_signal_default: PHASE_DONE     # phase 没声明时的兜底
-on_loop_exhaust: escalate                 # §2.5
-recommended_agents: [...]                 # §2.6
+# V0.4.0+ 主字段:
+workflows:                                # team-level workflow registry(V0.4.0+)
+  - name: idea-validation
+    template: workflow-templates/research-validation.yaml
+  - name: synthesis
+    template: workflow-templates/research-synthesis.yaml
+# V0.4.0+ 后向后兼容仅(V0.1-V0.3 phase-driven 字段;新 team 可以不填):
+phase_dir: phases-research                # ⚠️ V0.4.0+ EOL,新 team 改 workflow.yaml
+entry_phase: 00-topic                     # ⚠️ V0.4.0+ EOL
+completion_signal_default: PHASE_DONE     # ⚠️ V0.4.0+ EOL
+on_loop_exhaust: escalate                 # ⚠️ V0.4.0+ EOL
+critic_dimensions: [...]                  # §2.3 — M5+ Critic 启用时仍读
+escalate_prefixes: [...]                  # §2.4 — workflow event escalation 仍读
+recommended_agents: [...]                 # §2.6 — V0.4.0+ 主要靠 .claude/agents/<role>.md SoT
 recommended_skills: [...]
 recommended_mcp: [...]
 # M4 走官方 ~/.claude/rules/ + per-repo auto-memory,无 memory_namespace 字段;
@@ -487,24 +587,22 @@ danger_command_patterns:                  # 替代 dev 的 git push 拦截
 (2 文件)+ `crates/ccteam-hooks/src/`(5 文件)+ `crates/ccteam-core/src/
 templates/settings.json` + `phases/`(6 文件)+ 顶层 `CLAUDE.md` 与 `docs/`。
 
-按优先级分布(**2026-05-06 post-M3/M4 sweep**):
+按优先级分布(**2026-05-16 post-V0.4.6 sweep**;详情见 `docs/dev-coupling-audit.md`):
 
 | 优先级 | 数量 | 编号 | 含义 |
 |---|---|---|---|
-| **P0 阻塞泛化(剩余)** | 1 | F1 | 仅剩 F1 触发逻辑切换:`if phase == FIX_PHASE_NAME` 改 `if template.auto_loop` |
-| **P1 剩余** | 6 | F5, F6, F7, F8, F15, F23(conditional) | fix_loop→auto_loop 重命名 / `collect_artifacts` 自动扫 / settings 危险命令 / 容器 bind-mount spike |
-| **P2 边角(剩余)** | 2 | F17, F18 | fix_loop→auto_loop 重命名时一并 |
+| **P0 阻塞泛化(剩余)** | 0 | — | F1 已在 2026-05-07 rename PR + V0.4.0 F60 phase 拆除时彻底消解 |
+| **P1 剩余** | 2 | F15, F23(conditional) | settings 危险命令模板(M1+)/ 容器 bind-mount spike |
+| **P2 边角(剩余)** | 1 | F17 | 测试硬编码 phase 名(V0.4.0 F60 phase 拆除后 N/A) |
 | **N/A 已是领域无关** | 2 | F14, F19 | F19 在 M3 docs 落地后重新评估 |
-| **已修复** | 12 | F2/F3/F4/F9/F10/F11/F12/F13/F16/F20/F21/F22 | M3/M4 ship 后批量关闭(详情见 audit 文档每条 status 注解) |
+| **已修复** | ~50 | F1-F13 / F18 / F20-F51 / F60-F69 / F80 等 | M3/M4 ship + 2026-05-07 rename PR + V0.2/V0.3/V0.4.0 patch 一波波关闭(详情见 audit 文档) |
+| **V0.4.6 in-flight** | 3 | F82, F84, F91+ | workflow.yaml `enabled` 热加载 / budget cap / SPA 配套 |
 
-**P0 剩余**(1 条):F1 — `auto_loop` phase YAML 字段已加(M3.1)且 `teams/dev.yaml` /
-`phases/06-fix.md` 已声明,但 orchestrator 触发分支仍是 `if phase == FIX_PHASE_NAME`
-字符串字面量。修完即可彻底从 ccteam-core 抹去 "fix" 字面量。
-
-**§B 元发现(对 §A 的反馈;2026-05-06 update)**:`pub use ... M0_PHASE_DAG, FIRST_PHASE`
-原暴露 dev 假设到 lib 接口表面 —— **已在 M3.1 处理**,常量删除,改为
-`PhaseDag::infer_from_templates`(`crates/ccteam-core/src/dag.rs`)。lib API breaking
-change 已发生,无 backwards-compat shim,符合 CLAUDE.md §五.3。
+**§B 元发现(对 §A 的反馈;V0.4.0 update)**:`pub use ... M0_PHASE_DAG, FIRST_PHASE`
+原暴露 dev 假设到 lib 接口表面 —— **M3.1 处理**(常量删除,改 `PhaseDag::infer_from_templates`);
+**V0.4.0 F60 进一步拆除 `dag.rs` 整文件 + phase 模板系统**,改 `crates/ccteam-core/src/
+workflow.rs::WorkflowSpec` 为 lib 主接口。两次 lib API breaking change 均无 backwards-compat
+shim,符合 CLAUDE.md §五.3。
 
 审计过程中**没有发现**需要修订 §1 责任分界表或 §2 团队扩展契约的位置——
 所有发现都能映射到现有分类。这是抽象切对的好信号。M3/M4 ship 后的 post-sweep
@@ -512,56 +610,26 @@ change 已发生,无 backwards-compat shim,符合 CLAUDE.md §五.3。
 
 ---
 
-## 5. 首个非 dev 团队的选择论证
+## 5. 首个非 dev 团队的选择论证(**M3 已实证;本节压缩**)
 
-> **2026-05-06 实际落点**:M3 ship 的首个非 dev 团队是 **`product-research`**
-> (产品研究 — "should we build this idea?"),`teams/product-research.yaml` +
-> `phases-product-research/` 6 phase pipeline。是本节论证的 "research" 类的具
-> 体落点;选 product-research 而非泛 research 是因为它能直接对接 dev pipeline
-> (verdict.md PASS → 派给 dev,REJECT → 终止),首个非 dev 团队就拿到了 multi-team
-> 协作的实证。本节其余论证不变 — 工具面重叠 / 完成信号难点 / Critic 维度难
-> 点都被 product-research 验证。
-
-候选:research / marketing / ops。
-
-**选 research 优先**,理由:
-
-### 5.1 工具面与 dev 重叠最多——验证 mechanism 复用率
-
-- `code-explorer` 在 research 里就是"已有资料探索"的 agent——同一个 plugin
-  agent 直接 ln -sf,只换上下文 prompt。
-- `pr-test-analyzer` / `silent-failure-hunter` 在 research 里没有等价物——验证
-  "推荐 agent 清单按 team 切换"机制能正确识别"这个 agent 不该装到 research"。
-- 不需要新 MCP——dev 已有的 Playwright / GitHub MCP 不是必须;Telegram bot
-  (M1+) research 同样用得上。
-- 结论:research 不引入"全新工具栈"的复杂度,纯粹考验"已有工具该不该换名 /
-  换组合"的抽象——正适合验证 §2 团队扩展契约。
-
-### 5.2 难点集中在"完成信号"和"Critic 维度"——暴露抽象漏洞
-
-- dev 完成信号是物理事实(测试退出码 = 0);research 完成信号是判断("3 个一手
-  来源经过交叉验证")——逼迫 `completion_signal` 字段从硬编码 `TESTS_GREEN` 升
-  级为 phase 模板可注入。
-- dev 6 维 Critic 评 code 品质;research Critic 评 method 品质——逼迫 critic_dimensions
-  从硬编码升级为 team 配置。
-- dev fix-loop 重喂修代码;research 假设被反驳要回 hypothesis phase 重设——逼迫
-  `FixLoopState` 从"复读 prompt"升级为"phase DAG 上的 revert 路由",
-  正好对应 §2.4 ESCALATE grammar 扩展。
-
-### 5.3 marketing / ops 留到 research 验证之后
-
-- **marketing**:涉及外部副作用(发邮件 / publish 帖子),需要更严格的 L1 危险
-  命令拦截 + 用户预审环节;现在 ccteam 还没把"发布前必经用户拍板"做成 mechanism。
-  让 research 先暴露 §2.4 ESCALATE grammar 抽象漏洞,再做 marketing。
-- **ops**:on-call / 故障响应类工作,完成信号是"系统恢复 / SLO 达标"——需要
-  external monitor 接入(监控指标),ccteam 当前没有 metric MCP。可作 M5+ 探索。
-
-### 5.4 验证目标(research 团队 ship 后,本文档 §1/§2 应被回填)
-
-- §1 责任分界表:每条 🟡 的 phase 模板 / team 配置注入路径已实证可行
-- §2 团队扩展契约:7 件东西每件都对 research 团队有具体填充
-- §3 显式拒绝清单:research 团队没有让任何条目松动
-- §4 审计发现:对应 P0 项已在 research 上线前修复
+> **2026-05-06 落点**:M3 ship 的首个非 dev 团队是 **`product-research`**
+> (`teams/product-research.yaml` + 6 phase pipeline),选它(而非泛 research)
+> 因为能直接对接 dev pipeline(verdict.md PASS → 派给 dev,REJECT → 终止),
+> 首个非 dev 团队就拿到了 multi-team 协作的实证。
+>
+> **论证浓缩**(详细原文可看 git history):
+> - **工具面重叠**:`code-explorer` 在 research 里就是"已有资料探索"agent,plugin
+>   ln -sf 复用零改动 → 验证"推荐清单按 team 切换"机制
+> - **抽象漏洞暴露**:research 完成信号是判断(非物理事实)→ 逼 `completion_signal`
+>   字段化;Critic 评 method 品质 → 逼 `critic_dimensions` 数据化;假设被反驳要回
+>   hypothesis 重设 → 逼 ESCALATE grammar §2.4 扩展
+> - **marketing / ops 后置**:marketing 需要"发布前用户拍板"mechanism(未做),
+>   ops 需要 metric MCP(未做),M5+ 探索
+>
+> **验证结论**:§1 责任分界表 / §2 团队扩展契约 / §3 显式拒绝清单**均无需修订** —
+> product-research 落地全程未让 ccteam-core 出现新 dev 假设。抽象切对了。
+> V0.4.0 重构后,workflow.yaml 数据驱动进一步降低了团队扩展门槛(无需再写新
+> phase 集 + 新 fix-loop 状态机)。
 
 ---
 
@@ -778,9 +846,10 @@ prompt,而不是适配器代码。
    概念。引入新概念必须在 §1 加一行(注明🟢/🟡/🔴),否则无法 review。
 2. **§B 审计的发现可以反过来修订 §1 / §2**——发现某条机制的 dev 假设比预
    想深,本文档要更新,不要硬塞 audit 节。
-3. **本文档不超过 800 行**——超出说明在重复 tech-design / interfaces;砍
-   重复内容,留指针。(M3 reorder + meta-agent pattern 落地后从 558 → 720+;
-   2026-05-06 M3/M4 ship 后回填实施状态注解 → 780+,接近阈值。下一次重大
-   扩展前,**先砍**那些已经过时的论证文字 — 例如 §5 论证 research vs marketing
-   的优先级在 product-research ship 后已可大幅压缩)
+3. **本文档不超过 900 行**——超出说明在重复 tech-design / interfaces;砍
+   重复内容,留指针。(M3 reorder + meta-agent pattern → 720+;2026-05-06 M3/M4
+   ship 实施状态注解 → 780+;**2026-05-16 V0.4.6 sync**:加 §1.3 workflow.yaml
+   schema + §1.4 workflow-as-data 红线 + §2.1 workflow 拓扑重写;同时压缩 §5 论
+   证文字 → 860 行,留 40 行 headroom。下一次重大扩展前,**先砍**那些已经过时
+   的论证文字 — 例如 §2.5 完成信号已 V0.4.0 向后兼容仅,可进一步压缩)
 4. **commit message 用英文,文档内容用中文**(沿袭仓库现状)。
