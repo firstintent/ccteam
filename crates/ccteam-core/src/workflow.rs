@@ -43,9 +43,38 @@ pub struct WorkflowSpec {
     /// Optional human-readable description for the meta-agent / UI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// V0.4.6 F82 — soft toggle. `false` makes the daemon skip rostering
+    /// this workflow (and tear down a running loop on hot-reload). The
+    /// project's `state.json`, `progress.jsonl`, and artifact dirs stay
+    /// intact; flipping back to `true` resumes from where the last loop
+    /// left off. Defaults to `true` for backwards compatibility with
+    /// V0.4.5 workflow.yaml files that omit the field.
+    ///
+    /// Skipped on serialize when `true` (the default) so round-trips
+    /// don't add boilerplate to hand-authored workflow.yaml files —
+    /// only the opt-out form `enabled: false` shows up in the
+    /// rendered YAML.
+    #[serde(
+        default = "default_enabled",
+        skip_serializing_if = "is_enabled_default"
+    )]
+    pub enabled: bool,
     /// Role → agent spec. `IndexMap` preserves YAML declaration order so
     /// trigger graph build is deterministic across runs.
     pub agents: IndexMap<String, AgentSpec>,
+}
+
+/// Default for `WorkflowSpec::enabled` when the YAML omits the field.
+/// `true` matches V0.4.5 behaviour (no field = run the workflow).
+fn default_enabled() -> bool {
+    true
+}
+
+/// Predicate paired with `default_enabled` so `enabled: true` (the
+/// default) is omitted from serialized YAML — only the opt-out form
+/// `enabled: false` is rendered.
+fn is_enabled_default(v: &bool) -> bool {
+    *v
 }
 
 /// Per-agent role configuration.
@@ -326,6 +355,7 @@ mod tests {
         let spec = WorkflowSpec {
             name: "x".into(),
             description: None,
+            enabled: true,
             agents: {
                 let mut m = IndexMap::new();
                 m.insert(

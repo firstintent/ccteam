@@ -52,6 +52,8 @@ pub mod watchdog;
 // V0.4.0 F63 — workflow.yaml schema + parser. Pure data + validation;
 // no IO side effects beyond reading the YAML file. See module docs.
 pub mod workflow;
+// V0.4.6 F82 — workflow.yaml file watcher (hot-reload trigger).
+pub mod workflow_watcher;
 
 pub use actions::{
     inject_decision, next_inbox_seq, pause, resume, send_to_session, send_to_session_with,
@@ -94,7 +96,7 @@ pub use migration::{
     migrate_v041_to_v042, render_migration_report, MigrationReport as V042MigrationReport,
 };
 pub use orchestrator::MAX_CONCURRENT_PROJECTS;
-pub use orchestrator::{Orchestrator, OrchestratorConfig, DEFAULT_CLAUDE_MODEL};
+pub use orchestrator::{CancelReason, Orchestrator, OrchestratorConfig, DEFAULT_CLAUDE_MODEL};
 pub use paths::{
     session_context_from_cwd, slug_from_project_dir, CcteamPaths, ProjectSessionContext,
 };
@@ -180,6 +182,11 @@ pub use watchdog::{
 };
 // V0.4.0 F63 — workflow.yaml schema.
 pub use workflow::{AgentSpec, Executor, OnTimeout, Trigger, WorkflowError, WorkflowSpec};
+// V0.4.6 F82 — workflow.yaml file watcher.
+pub use workflow_watcher::{
+    WorkflowFileEvent, WorkflowFileEventKind, WorkflowFileWatcher,
+    DEBOUNCE_WINDOW as WORKFLOW_WATCHER_DEBOUNCE_WINDOW,
+};
 // V0.4.0 F64 — artifact watcher event types + watcher entry point.
 pub use artifact_watcher::{ArtifactEvent, ArtifactWatcher, WatchKind, DEBOUNCE_WINDOW};
 

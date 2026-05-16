@@ -27,7 +27,7 @@ use std::time::Duration;
 use anyhow::Result;
 use chrono::Utc;
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinSet;
 
 use crate::artifact_watcher::{ArtifactEvent, ArtifactWatcher};
@@ -38,6 +38,7 @@ use crate::paths::CcteamPaths;
 use crate::progress;
 use crate::queries;
 use crate::workflow::{AgentSpec, Executor, Trigger, WorkflowError, WorkflowSpec};
+use crate::workflow_watcher::{WorkflowFileEvent, WorkflowFileWatcher};
 
 /// Hard cap on concurrent project sessions (excluding the meta-agent).
 pub const MAX_CONCURRENT_PROJECTS: usize = 3;
@@ -150,6 +151,39 @@ fn parse_inbox_routing_hints(raw: &str) -> (Option<String>, bool) {
     (target_role, no_spawn)
 }
 
+/// V0.4.6 F82 — reason a project event_loop was asked to terminate
+/// gracefully. The variant is recorded as `reason: "<value>"` on the
+/// `workflow_done` event so postmortem reads can distinguish "user
+/// disabled the workflow" from "daemon graceful shutdown" from "budget
+/// cap auto-disable".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelReason {
+    /// `workflow.yaml::enabled: false` flipped while loop was running.
+    Disabled,
+    /// `ccteam remove <slug>` (F81 wave 2) tore the project out.
+    Removed,
+    /// Spec changed in a way the watcher can't apply in-place (e.g.
+    /// agents topology mutated); old loop ends + new one starts.
+    Reloaded,
+    /// Daemon-wide graceful shutdown (F86 wave 2 entry point).
+    Shutdown,
+    /// Budget cap tripped (F84 wave 2 entry point).
+    BudgetExceeded,
+}
+
+impl CancelReason {
+    /// Wire-format string written to `progress.jsonl::workflow_done.reason`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Removed => "removed",
+            Self::Reloaded => "reloaded",
+            Self::Shutdown => "shutdown",
+            Self::BudgetExceeded => "budget_exceeded",
+        }
+    }
+}
+
 /// V0.4.0 F66 thin orchestrator. Lifecycle-only — never injects prompt.
 pub struct Orchestrator {
     paths: CcteamPaths,
@@ -161,6 +195,18 @@ pub struct Orchestrator {
     fail_counts: Arc<Mutex<HashMap<String, u32>>>,
     gate_states: Arc<Mutex<HashMap<String, GateState>>>,
     cost_accum: Arc<Mutex<f64>>,
+    /// V0.4.6 F82 — per-slug cancellation senders. Filled by
+    /// `spawn_new_rostered_projects` when a project event_loop starts.
+    /// `unroster_project` / `reload_project` take the entry out + send
+    /// the reason; `run_project_with_cancel` selects on the receiver
+    /// and writes `workflow_done` before returning.
+    cancel_handles: Arc<Mutex<HashMap<String, oneshot::Sender<CancelReason>>>>,
+    /// V0.4.6 F82 — shared "already-spawned" slug set. Promoted from
+    /// the local `HashSet` inside `run` so `reload_project` can pop a
+    /// slug out + let the next rescan re-spawn it. `unroster_project`
+    /// also removes the entry so F81 `ccteam remove` doesn't leak a
+    /// ghost slug in the daemon's view.
+    spawned: Arc<Mutex<HashSet<String>>>,
 }
 
 impl std::fmt::Debug for Orchestrator {
@@ -200,6 +246,8 @@ impl Orchestrator {
             fail_counts: Arc::new(Mutex::new(HashMap::new())),
             gate_states: Arc::new(Mutex::new(HashMap::new())),
             cost_accum: Arc::new(Mutex::new(0.0)),
+            cancel_handles: Arc::new(Mutex::new(HashMap::new())),
+            spawned: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -228,6 +276,23 @@ impl Orchestrator {
     // ---- public entry points ------------------------------------------------
 
     pub async fn run_project(&self, slug: &str) -> Result<()> {
+        self.run_project_with_cancel(slug, None).await
+    }
+
+    /// V0.4.6 F82 — same as [`run_project`] but selects on `cancel_rx`
+    /// for graceful termination. Receiving on the channel writes a
+    /// `workflow_done { reason }` event before returning Ok(()). Passing
+    /// `None` keeps the V0.4.5 behaviour (loop ends naturally when
+    /// gates fire or the artifact channel closes).
+    ///
+    /// **Returns Ok even on cancel** — cancellation is a normal exit,
+    /// not an error. Real errors (workflow.yaml not found, artifact
+    /// watcher init failure) still bubble.
+    pub async fn run_project_with_cancel(
+        &self,
+        slug: &str,
+        cancel_rx: Option<oneshot::Receiver<CancelReason>>,
+    ) -> Result<()> {
         let project_dir = self.paths.project_dir(slug);
         let progress_path = self.paths.progress_jsonl(slug);
 
@@ -235,6 +300,26 @@ impl Orchestrator {
             WorkflowError::NotFound(p) => anyhow::anyhow!("workflow.yaml not found in {:?}", p),
             other => anyhow::anyhow!(other),
         })?;
+
+        // V0.4.6 F82 — `enabled: false` short-circuits roster: write
+        // `workflow_done reason="disabled"` and return. The project's
+        // workflow.yaml + state.json + progress.jsonl are otherwise
+        // untouched, so flipping the field back to `true` (with the
+        // workflow_watcher re-running this function) resumes cleanly.
+        if !spec.enabled {
+            tracing::info!(slug, "workflow disabled (enabled: false); skipping roster");
+            progress::append_event(
+                &progress_path,
+                &json!({
+                    "event": "workflow_done",
+                    "workflow": spec.name,
+                    "slug": slug,
+                    "reason": "disabled",
+                    "ts": Utc::now().to_rfc3339(),
+                }),
+            )?;
+            return Ok(());
+        }
 
         // V0.4.5: workflow.yaml `watch:<rel>` paths are project-relative
         // per PRD §6.1, but `ArtifactWatcher::new` (per its docstring)
@@ -272,9 +357,49 @@ impl Orchestrator {
         let watcher_handle = watcher.start();
 
         self.dispatch_initial_triggers(slug, &spec).await?;
-        let res = self
-            .event_loop(slug, &spec, &project_dir, &progress_path, rx)
-            .await;
+
+        let event_loop_fut = self.event_loop(slug, &spec, &project_dir, &progress_path, rx);
+
+        let res = match cancel_rx {
+            Some(rx) => {
+                tokio::select! {
+                    res = event_loop_fut => res,
+                    recv_res = rx => {
+                        // Sender dropped without sending (orchestrator
+                        // didn't intend cancel) → treat as natural end.
+                        // Sender sent a reason → write workflow_done + return.
+                        match recv_res {
+                            Ok(reason) => {
+                                tracing::info!(
+                                    slug,
+                                    reason = reason.as_str(),
+                                    "event_loop cancellation received",
+                                );
+                                let _ = progress::append_event(
+                                    &progress_path,
+                                    &json!({
+                                        "event": "workflow_done",
+                                        "workflow": spec.name,
+                                        "slug": slug,
+                                        "reason": reason.as_str(),
+                                        "ts": Utc::now().to_rfc3339(),
+                                    }),
+                                );
+                                Ok(())
+                            }
+                            Err(_canceled) => {
+                                tracing::debug!(
+                                    slug,
+                                    "cancel sender dropped; event_loop ends naturally",
+                                );
+                                Ok(())
+                            }
+                        }
+                    }
+                }
+            }
+            None => event_loop_fut.await,
+        };
 
         watcher_handle.abort();
         res
@@ -314,9 +439,16 @@ impl Orchestrator {
         F: std::future::Future<Output = ()> + Send + 'static,
     {
         let mut tasks: JoinSet<(String, Result<()>)> = JoinSet::new();
-        let mut spawned: HashSet<String> = HashSet::new();
 
-        self.spawn_new_rostered_projects(&mut tasks, &mut spawned, "startup");
+        self.spawn_new_rostered_projects(&mut tasks, "startup")
+            .await;
+
+        // V0.4.6 F82 — install the workflow.yaml file watcher across
+        // every rostered project so edits hot-reload without daemon
+        // restart. We rebuild the watcher whenever the rescan tick
+        // picks up new slugs (cheaper than incrementally registering)
+        // — see `rebuild_workflow_watcher` for the swap mechanic.
+        let (mut workflow_watcher_rx, _watcher_handle) = self.start_workflow_watcher().await;
 
         if let Err(err) = daemon::write_heartbeat(&self.paths) {
             tracing::warn!(?err, "initial heartbeat write failed");
@@ -347,15 +479,48 @@ impl Orchestrator {
                     }
                 }
                 _ = rescan_ticker.tick() => {
-                    self.spawn_new_rostered_projects(&mut tasks, &mut spawned, "rescan");
+                    let newly_added = self
+                        .spawn_new_rostered_projects(&mut tasks, "rescan")
+                        .await;
+                    if newly_added > 0 {
+                        // Rebuild the file watcher so the new slugs
+                        // pick up workflow.yaml edits immediately.
+                        let (new_rx, _new_handle) = self.start_workflow_watcher().await;
+                        workflow_watcher_rx = new_rx;
+                    }
+                }
+                Some(evt) = workflow_watcher_rx.recv() => {
+                    tracing::info!(
+                        slug = evt.slug.as_str(),
+                        ?evt.kind,
+                        "workflow.yaml change detected; reloading project",
+                    );
+                    let slug = evt.slug.clone();
+                    self.reload_project(&slug).await;
+                    // Re-spawn immediately so reload latency stays
+                    // well under the 5s acceptance bar (rather than
+                    // waiting up to ROSTER_RESCAN_INTERVAL=10s).
+                    let _ = self
+                        .spawn_new_rostered_projects(&mut tasks, "reload")
+                        .await;
+                    // Rebuild watcher so the just-reloaded slug
+                    // (which lost its registration via remove_project)
+                    // is observed again on subsequent edits.
+                    let (new_rx, _new_handle) = self.start_workflow_watcher().await;
+                    workflow_watcher_rx = new_rx;
                 }
                 Some(joined) = tasks.join_next() => {
                     match joined {
                         Ok((slug, Ok(()))) => {
                             tracing::info!(slug, "project event loop ended cleanly");
+                            // V0.4.6 F82 — clear the orphaned cancel
+                            // sender so unroster_project doesn't trip
+                            // over a stale entry next time.
+                            self.cancel_handles.lock().await.remove(&slug);
                         }
                         Ok((slug, Err(err))) => {
                             tracing::warn!(slug, error = ?err, "project event loop errored");
+                            self.cancel_handles.lock().await.remove(&slug);
                         }
                         Err(je) if je.is_cancelled() => {}
                         Err(je) => {
@@ -367,28 +532,75 @@ impl Orchestrator {
         }
     }
 
+    /// V0.4.6 F82 — build a [`WorkflowFileWatcher`] across every
+    /// slug currently in `self.spawned`. Called on daemon startup +
+    /// after each rescan that picks up a new slug.
+    ///
+    /// Returns `(receiver, JoinHandle)`. The handle is intentionally
+    /// not awaited; dropping it is fine because the watcher task
+    /// keeps running as long as the receiver is alive (it polls
+    /// `tx.is_closed()` and exits when the orchestrator's receiver
+    /// drops).
+    async fn start_workflow_watcher(
+        self: &Arc<Self>,
+    ) -> (
+        mpsc::Receiver<WorkflowFileEvent>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let slugs: Vec<String> = self.spawned.lock().await.iter().cloned().collect();
+        let projects: Vec<(String, PathBuf)> = slugs
+            .into_iter()
+            .map(|s| {
+                let dir = self.paths.project_dir(&s);
+                (s, dir)
+            })
+            .collect();
+        match WorkflowFileWatcher::new(&projects) {
+            Ok((watcher, rx)) => (rx, watcher.start()),
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    "workflow_watcher: failed to build; hot-reload disabled"
+                );
+                // Return a closed channel — the select arm becomes
+                // dormant but the orchestrator keeps running.
+                let (_tx, rx) = mpsc::channel::<WorkflowFileEvent>(1);
+                let handle = tokio::spawn(async {});
+                (rx, handle)
+            }
+        }
+    }
+
     /// Walk the projects root and spawn event loops for slugs not yet
-    /// in `spawned`. Shared between startup (`origin = "startup"`) and
-    /// the periodic rescan tick (`origin = "rescan"`). Slugs without a
+    /// in `self.spawned`. Shared between startup (`origin = "startup"`),
+    /// the periodic rescan tick (`origin = "rescan"`), and the F82
+    /// reload path (`origin = "reload"`). Slugs without a
     /// `workflow.yaml` are skipped silently — those are legacy V0.3.x
     /// phase-driven projects with no event-loop equivalent.
-    fn spawn_new_rostered_projects(
+    ///
+    /// Returns the number of newly-spawned slugs so the caller (the
+    /// main `run` loop) can decide whether to rebuild the
+    /// workflow file watcher.
+    async fn spawn_new_rostered_projects(
         self: &Arc<Self>,
         tasks: &mut JoinSet<(String, Result<()>)>,
-        spawned: &mut HashSet<String>,
         origin: &'static str,
-    ) {
+    ) -> usize {
         let projects = match queries::collect_projects(&self.paths) {
             Ok(p) => p,
             Err(err) => {
                 tracing::warn!(?err, origin, "collect_projects failed; roster unchanged");
-                return;
+                return 0;
             }
         };
+        let mut newly_added = 0;
         for proj in projects {
             let slug = proj.state.slug.clone();
-            if spawned.contains(&slug) {
-                continue;
+            {
+                let s = self.spawned.lock().await;
+                if s.contains(&slug) {
+                    continue;
+                }
             }
             let project_dir = self.paths.project_dir(&slug);
             if !project_dir.join("workflow.yaml").exists()
@@ -397,19 +609,113 @@ impl Orchestrator {
                 tracing::debug!(slug, "no workflow.yaml; skipping (pre-V0.4.0 project)");
                 continue;
             }
-            if origin == "rescan" {
-                tracing::info!(slug, "hot-loaded new project; starting event loop");
-            } else {
-                tracing::info!(slug, "starting project event loop");
+            match origin {
+                "startup" => tracing::info!(slug, "starting project event loop"),
+                "rescan" => tracing::info!(slug, "hot-loaded new project; starting event loop"),
+                "reload" => tracing::info!(slug, "reload re-spawning project event loop"),
+                _ => tracing::info!(slug, origin, "starting project event loop"),
             }
+
+            // V0.4.6 F82 — wire per-slug cancellation token. The
+            // sender goes into `self.cancel_handles` so
+            // `unroster_project` / `reload_project` can fire a
+            // graceful workflow_done.
+            let (cancel_tx, cancel_rx) = oneshot::channel::<CancelReason>();
+            self.cancel_handles
+                .lock()
+                .await
+                .insert(slug.clone(), cancel_tx);
+
             let orch = Arc::clone(self);
             let slug_for_task = slug.clone();
             tasks.spawn(async move {
-                let res = orch.run_project(&slug_for_task).await;
+                let res = orch
+                    .run_project_with_cancel(&slug_for_task, Some(cancel_rx))
+                    .await;
                 (slug_for_task, res)
             });
-            spawned.insert(slug);
+            self.spawned.lock().await.insert(slug);
+            newly_added += 1;
         }
+        newly_added
+    }
+
+    // ---- V0.4.6 F82: lifecycle control surface --------------------------
+
+    /// V0.4.6 F82 — gracefully terminate a project event_loop. Used by
+    /// F81 `ccteam remove <slug>`, F84 budget cap, F86 graceful daemon
+    /// shutdown. Behaviour:
+    ///
+    /// 1. Look up + remove the cancel sender from `self.cancel_handles`.
+    /// 2. Send `reason` through the channel — the running
+    ///    `run_project_with_cancel` selects on it, appends a
+    ///    `workflow_done { reason }` event to progress.jsonl, and
+    ///    returns Ok(()).
+    /// 3. The orchestrator's main `run` loop will see the task end via
+    ///    `tasks.join_next` shortly after.
+    /// 4. The slug stays in `self.spawned` so the rescan tick doesn't
+    ///    re-add it — F81 is supposed to be terminal.
+    ///
+    /// **Returns true iff a cancel was sent.** Returns false when:
+    /// - The slug had no event_loop running (not in cancel_handles).
+    /// - The cancel sender was already taken (raced with another caller).
+    /// - The task receiver was dropped before we sent (rare; usually
+    ///   means the loop already ended naturally).
+    pub async fn unroster_project(&self, slug: &str, reason: CancelReason) -> bool {
+        let maybe_tx = self.cancel_handles.lock().await.remove(slug);
+        let Some(tx) = maybe_tx else {
+            tracing::debug!(slug, "unroster_project: no cancel handle (already ended)");
+            return false;
+        };
+        if tx.send(reason).is_err() {
+            tracing::debug!(
+                slug,
+                reason = reason.as_str(),
+                "unroster_project: receiver dropped (loop already ended)",
+            );
+            return false;
+        }
+        tracing::info!(
+            slug,
+            reason = reason.as_str(),
+            "unroster_project: cancel sent"
+        );
+        true
+    }
+
+    /// V0.4.6 F82 — terminate the current event_loop AND clear the
+    /// `spawned` entry so the next rescan / manual `spawn_new_*` call
+    /// re-spawns from the on-disk `workflow.yaml`. Used by the F82
+    /// workflow.yaml file watcher (edit → reload) and by F84
+    /// budget-exceeded → enabled=false flip.
+    ///
+    /// Mirror of [`unroster_project`] semantics except: the slug is
+    /// also removed from `self.spawned` so it can be re-rostered.
+    ///
+    /// Always uses [`CancelReason::Reloaded`] — callers that need a
+    /// specific reason (`Disabled`, `BudgetExceeded`) should call
+    /// [`unroster_project`] explicitly with the right variant.
+    pub async fn reload_project(&self, slug: &str) -> bool {
+        let cancelled = self.unroster_project(slug, CancelReason::Reloaded).await;
+        // Remove from `spawned` regardless of cancel success — a slug
+        // that ended naturally still needs the `spawned` entry cleared
+        // before a fresh task can take its place.
+        self.spawned.lock().await.remove(slug);
+        cancelled
+    }
+
+    /// V0.4.6 F82 — accessor for the per-slug cancel-handle map size,
+    /// used by tests + future F86 shutdown to count live event_loops
+    /// before firing the global cancel.
+    pub async fn rostered_slug_count(&self) -> usize {
+        self.cancel_handles.lock().await.len()
+    }
+
+    /// V0.4.6 F82 — true iff the slug has a live cancellation handle
+    /// registered (i.e. its event_loop is running). Used by F86
+    /// shutdown to enumerate slugs to cancel.
+    pub async fn is_slug_rostered(&self, slug: &str) -> bool {
+        self.cancel_handles.lock().await.contains_key(slug)
     }
 
     // ---- dispatch helpers ---------------------------------------------------
@@ -1472,5 +1778,29 @@ impl Orchestrator {
         let mut keys: Vec<_> = self.adapters.keys().copied().collect();
         keys.sort();
         keys
+    }
+
+    // ---- V0.4.6 F82 test hooks ----------------------------------------
+
+    /// Test seam: register a `cancel_tx` against a slug without going
+    /// through the real `spawn_new_rostered_projects` flow. Used by
+    /// `workflow_enabled_test.rs` to simulate a "loop is running"
+    /// state before exercising `unroster_project` / `reload_project`.
+    pub async fn test_cancel_handles_insert(&self, slug: &str, tx: oneshot::Sender<CancelReason>) {
+        self.cancel_handles
+            .lock()
+            .await
+            .insert(slug.to_string(), tx);
+    }
+
+    /// Test seam: mark a slug as already-spawned so `reload_project`
+    /// has something to remove.
+    pub async fn test_spawned_insert(&self, slug: &str) {
+        self.spawned.lock().await.insert(slug.to_string());
+    }
+
+    /// Test seam: read the `spawned` set membership.
+    pub async fn test_spawned_contains(&self, slug: &str) -> bool {
+        self.spawned.lock().await.contains(slug)
     }
 }

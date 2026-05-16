@@ -161,6 +161,7 @@ fn watch_spec(role: &str, watch_rel: &str, parallelism: Option<u32>) -> Workflow
     WorkflowSpec {
         name: "test-workflow".into(),
         description: None,
+        enabled: true,
         agents,
     }
 }
@@ -183,6 +184,7 @@ fn manual_spec(role: &str) -> WorkflowSpec {
     WorkflowSpec {
         name: "test-manual-workflow".into(),
         description: None,
+        enabled: true,
         agents,
     }
 }
@@ -205,6 +207,7 @@ fn gate_spec(role: &str, input_rel: &str) -> WorkflowSpec {
     WorkflowSpec {
         name: "test-gate-workflow".into(),
         description: None,
+        enabled: true,
         agents,
     }
 }
@@ -728,6 +731,7 @@ agents:
     let spec = WorkflowSpec {
         name: "multi".into(),
         description: None,
+        enabled: true,
         agents,
     };
     let progress = orch.paths().progress_jsonl(&slug);
@@ -1283,6 +1287,7 @@ async fn t31_inbox_target_role_routes_explicitly() {
     let spec = WorkflowSpec {
         name: "dual".into(),
         description: None,
+        enabled: true,
         agents,
     };
     let progress = orch.paths().progress_jsonl(&slug);
