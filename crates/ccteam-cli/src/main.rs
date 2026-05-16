@@ -326,6 +326,21 @@ enum Command {
         /// `watchdog.yaml.migrated`. Idempotent.
         #[arg(long, default_value_t = false)]
         migrate_v041_to_v042: bool,
+        /// V0.4.6 F85: reclaim terminated `~/.claude/jobs/<id>/`
+        /// directories older than
+        /// `~/.ccteam/config.yaml::claude_jobs_retention_days` (default
+        /// 7 days). Default is dry-run — prints what would be removed
+        /// without touching disk. Pair with `--apply` to actually
+        /// `rm -rf` eligible entries. Never touches dirs whose
+        /// `state.json::state == "working"` or whose `state.json` is
+        /// missing / unparseable.
+        #[arg(long, default_value_t = false)]
+        gc_claude_jobs: bool,
+        /// V0.4.6 F85: commit GC removals to disk. No-op unless paired
+        /// with `--gc-claude-jobs`. Without it, the GC sweep is a
+        /// dry-run preview.
+        #[arg(long, default_value_t = false)]
+        apply: bool,
     },
     /// V0.2 M0.18.6: render the orchestrator's per-phase inject
     /// prompt (frontmatter-driven) plus the `@`-referenced phase
@@ -650,6 +665,8 @@ fn main() -> Result<()> {
             migrate_recommended_agents,
             screenshot_smoke,
             migrate_v041_to_v042,
+            gc_claude_jobs,
+            apply,
         } => {
             // V0.4.1 `--install-all` is sugar for the three first-run
             // flags. Explicit flags still win where set; we OR them.
@@ -669,6 +686,8 @@ fn main() -> Result<()> {
                 migrate_recommended_agents,
                 screenshot_smoke,
                 migrate_v041_to_v042,
+                gc_claude_jobs,
+                gc_apply: apply,
             })
         }
         Command::Phase { cmd } => run_phase(cmd),
