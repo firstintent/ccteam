@@ -13,135 +13,74 @@
 
 ### 1.1 全局目录(`~/.ccteam/`)
 
-> **V0.2 M0.17.1 layout shift**:每个 team 整目录,phase markdowns 在
-> `teams/<name>/phases/`(原 `phases/` / `phases-product-research/` 仓根铺平)。
-> 旧 yaml 的 `phase_dir: phases-<team>` 在 `TeamSpec::parse` 自动重写
-> 为 `phases`(legacy compat)。
-
 ```
 ~/.ccteam/
-├── config.yml             # 全局配置(并发上限、API key、bot token、信任档位、模型单价表)
+├── config.yaml            # 全局配置(并发上限、信任档位、模型单价表;V0.4.2 F73)
 ├── inbox/                 # 待 triage 的需求
 ├── queue/                 # 阶段队列
-├── teams/                 # **V0.2 M0.17:每个 team 单一目录**
-│   ├── dev/
-│   │   ├── team.yaml      # 详见 §5.5
-│   │   └── phases/        # phase 模板(`team.yaml.phase_dir`,默认 `phases`)
-│   │       ├── 02-plan-eng.md
-│   │       ├── 03-implement.md
-│   │       └── ...
-│   ├── product-research/
-│   │   ├── team.yaml
-│   │   └── phases/
-│   ├── meta-agent/
-│   │   └── team.yaml      # evergreen,无 phases/(M0.16)
-│   └── <user-team>/       # 用户自建 team(staging 经 ~/.config/ccteam/teams/)
-├── templates/             # M2.4+: phase 可 @ 引用的 prompt 片段(原生 @,orchestrator 不解析)
-│   ├── review-with-user-loop.md
-│   └── kickoff-reverse-interview.md
+├── teams/                 # 每个 team 单一目录
+│   ├── dev/team.yaml      # 详见 §5.5
+│   ├── meta-agent/team.yaml
+│   └── <user-team>/
+├── templates/             # phase 可 @ 引用的 prompt 片段
 ├── control/               # 用户 → orchestrator 控制信号(详见 §3.3)
-# 跨项目记忆走官方 ~/.claude/CLAUDE.md + ~/.claude/rules/ + per-repo auto-memory(M4),
-# 不在 ~/.ccteam/ 下;详见 tech-design §3.7。
+# 跨项目记忆走官方 ~/.claude/CLAUDE.md + ~/.claude/rules/ + per-repo auto-memory,详 tech-design §3.7。
 ├── progress/
-│   ├── <slug>.jsonl       # workflow / multi_workflow 项目事件流(详见 §4)
-│   └── <slug>/<sid>.jsonl # V0.3.1 F49 flex 项目每 session 独立事件流
-├── harness/               # V0.3.1 F46:Claude Code statusline-command 双写镜像
-│   ├── <slug>-<sid>.json  #   每 (slug, sid) 最新 harness snapshot;读侧 = ccteam-web `/sse/harness/...`
-│   └── _meta-<handle>.json #  meta-agent 项目(单 session,sid 视作 "default")
+│   ├── <slug>.jsonl       # workflow 项目事件流(详见 §4)
+│   └── <slug>/<sid>.jsonl # flex 项目每 session 独立事件流
+├── harness/               # Codex CLI adapter 写;Claude session 改读 ~/.claude/jobs/
+│   └── <slug>-<sid>.json
 ├── log/
 │   └── <slug>/            # stream-json 归档(可选,调试用)
 ├── tmux/
-│   └── <slug>.layout      # 项目 tmux pane 布局模板
+│   └── <slug>.layout
 └── state/
-    └── orchestrator.json  # orchestrator 自身 in-memory 状态的快照
+    └── orchestrator.json
 ```
 
-**Team 解析三层优先级**(V0.2 M0.17.3,`team_resolver.rs`):
+**Team 解析三层优先级**(`team_resolver.rs`):
 
 ```
 const TEAM_SOURCES: &[TeamSource] = &[
     TeamSource::Project,  // <project_dir>/.ccteam/team/team.yaml(per-project override)
     TeamSource::User,     // ~/.config/ccteam/teams/<name>/team.yaml(staging)
-                          // V0.3:+ ~/.claude/plugins/marketplaces/*/plugins/<team>/team.yaml
+                          // + ~/.claude/plugins/marketplaces/*/plugins/<team>/team.yaml
     TeamSource::Repo,     // ~/.ccteam/teams/<name>/team.yaml(shipped seeds)
 ];
 ```
 
-First-source-wins,整团维度替换(撞名 project 完全覆盖 user / repo,**不**字段级合并)。
-读容错(yaml 错 → warn + 下一层),写严格(`save_team` 拒绝覆盖现存的不可解析
-yaml)。
+First-source-wins,整团维度替换。读容错(yaml 错 → warn + 下一层),写严格。
 
 ### 1.2 项目级目录(`~/projects/<team>-<slug>/`)
-
-> **2026-05-06 F22**:项目目录现在带 `<team>-` 前缀(如 `~/projects/dev-todo-cli/`、
-> `~/projects/product-research-ai-recipe/`),让 `~/.claude/rules/ccteam-lessons-<team>.md`
-> 的 `paths: ~/projects/<team>-*` frontmatter 在 phase Claude session 启动时正确匹配。
-> meta-agent 项目仍走 `<handle>-meta` 后缀约定(rules 不 scope 到 meta)。
-> 历史项目目录(F22 之前创建)保持原名,通过 state.json `team` 字段识别身份。
 
 ```
 ~/projects/<team>-<slug>/
 ├── src/                          # 实际代码
 ├── tests/
-├── package.json / pyproject.toml
 ├── CLAUDE.md                     # 项目级运营手册(自动生成,详见 tech-design §6.5)
-├── workflow.yaml                 # V0.4.0 F63 引入;V0.4.6 F83 起住 `.ccteam/`,本根位置作 V0.5 删期 fallback(详见 §17)
-├── .ccteam/                      # ccteam 元数据(git 跟踪)
-│   ├── workflow.yaml             # V0.4.6 F83:workflow.yaml 默认位置(canonical;.gitignore 包 `.ccteam/`,自然不入业务库)
-│   ├── spec.md                   # (V0.4.0 F60 起 phase 系统 EOL;以下 plan-*/implement-report 等历史产物保留作 free-form 上下文)
-│   ├── plan-ceo.md
-│   ├── plan-eng.md
-│   ├── architecture.md
-│   ├── implement-report.md
-│   ├── test-report.md
-│   ├── review-report.md
-│   ├── scorecard.md              # M2+
-│   ├── code-review.md            # sub-skill 产物示例(V0.4.0 F60 后 EOL,详见 §7)
+├── .ccteam/                      # ccteam 元数据
+│   ├── workflow.yaml             # canonical 位置(F83;详见 §17)
 │   ├── state.json                # 项目级状态机(详见 §2.1)
 │   ├── escalation.md             # 触发用户介入时写这里
-│   ├── fix-loop.state.md         # fix-cycle 内部状态(V0.4.0 F60 后 EOL)
-│   ├── spawn_requests/           # V0.4.0 F65:MCP `spawn_agent` marker 桶(详见 §12.2)
-│   ├── stop_signal/              # V0.4.0 F65:MCP `stop_agent` marker 桶
-│   ├── signal/                   # V0.4.0 F65:MCP `signal` marker 桶
-│   ├── gate_override/            # V0.4.0 F65:MCP `trigger_gate` marker
-│   ├── workflow_overrides.json   # V0.4.0 F65:MCP `set_parallelism` 覆写
-│   ├── sessions/                 # V0.3.1 F49 flex-only adhoc session cwd
+│   ├── spawn_requests/           # MCP `spawn_agent` marker 桶(详见 §12.2)
+│   ├── stop_signal/              # MCP `stop_agent` marker 桶
+│   ├── signal/                   # MCP `signal` marker 桶
+│   ├── gate_override/            # MCP `trigger_gate` marker
+│   ├── workflow_overrides.json   # MCP `set_parallelism` 覆写
+│   ├── sessions/                 # flex-only adhoc session cwd
 │   │   └── <sid>/                # 例 claude-1;内含本 session inbox/outbox
 │   └── ready                     # SessionStart hook 写出的就绪标记
 ├── .claude/
-│   ├── agents/                   # V0.4.0 F63:每个 workflow agent 一份 `<role>.md`(prompt body 在此,不在 workflow.yaml)
+│   ├── agents/                   # 每个 workflow agent 一份 `<role>.md`(prompt body 在此,不在 workflow.yaml)
 │   │   └── <role>.md
 │   └── settings.json             # 详见 §6.1
 └── .gitignore
 ```
 
-### 1.3 Multi-session 项目子模块布局(`parallelism: multi_session`)
+### 1.3 Flex adhoc multi-session 布局(`kind: flex`)
 
-仅当 `parallelism: multi_session` 时启用(M3+)。在 §1.2 基础上扩展:
-
-```
-~/projects/<slug>/
-├── .ccteam/
-│   ├── state.json                # master state(项目级,详见 §2.2)
-│   ├── interface-contracts.md    # 子模块间接口契约(fan-out 时定下,fan-in 时验证)
-│   └── sub-modules/
-│       ├── backend-api/
-│       │   ├── state.json        # sub-module state(与单 session 一致;详见 §2.3)
-│       │   └── progress.jsonl    # 本子模块独立事件流
-│       ├── frontend-dashboard/
-│       ├── mobile-app/
-│       └── docs/
-├── backend-api/                  # 子模块代码(独立目录)
-├── frontend-dashboard/
-├── mobile-app/
-└── docs/
-```
-
-### 1.4 Flex adhoc multi-session 布局(`kind: flex`)
-
-`kind: flex` 是 V0.3.1 的手动 session farm:不走 phase DAG,但保留 hooks /
-progress.jsonl / cost / silence classifier / web observability。它不同于
-§1.3 的 `parallelism: multi_session` fan-out/fan-in 项目形态。
+`kind: flex` 是手动 session farm:无 workflow.yaml driven 派发,但保留 hooks /
+progress.jsonl / cost / silence classifier / web observability。
 
 ```
 ~/projects/<team>-<slug>/
@@ -162,13 +101,13 @@ progress.jsonl / cost / silence classifier / web observability。它不同于
 `ccteam session add <slug> --harness=claude` 分配单调递增 sid
 `<harness>-<n>`、创建 `<project>/.ccteam/sessions/<sid>/`、启动 tmux
 `ccteam-<slug>-<sid>` 并写入 `state.json::sessions`。`session rm` 是
-V0.3.1 唯一自动关闭 harness session 的路径,且必须由用户显式触发。
+唯一自动关闭 harness session 的路径,且必须由用户显式触发。
 
 ---
 
 ## 2. State 协议
 
-### 2.1 项目级 `state.json`(单 session 项目)
+### 2.1 项目级 `state.json`
 
 ```json
 {
@@ -177,23 +116,8 @@ V0.3.1 唯一自动关闭 harness session 的路径,且必须由用户显式触�
   "team_kind": "workflow",
   "created_at": "2026-05-04T10:23:00Z",
   "tmux_session": "ccteam-bookmark-mgr-a3f9",
-  "claude_session_id": "abc123-def-456",
-  "claude_pid": 12345,
-  "phase_state": "in_flight",
-  "current_phase": "implement",
-  "parallelism": "solo",
-  "phase_history": [
-    {"phase": "seed",     "status": "passed", "duration_s": 90, "cost_usd": 0.12},
-    {"phase": "plan-ceo", "status": "passed", "duration_s": 45, "cost_usd": 0.08},
-    {"phase": "plan-eng", "status": "passed", "duration_s": 60, "cost_usd": 0.15}
-  ],
-  "fix_cycle_count": 0,
-  "cost_used_usd": 1.23,
   "soft_warn_threshold_usd": 20.0,
   "hard_kill_threshold_usd": 200.0,
-  "context_tokens_used": 142000,
-  "context_reset_threshold_tokens": 600000,
-  "context_reset_count": 0,
   "last_progress_event_at": "2026-05-04T11:23:45Z",
   "last_event_type": "Stop",
   "last_user_interaction_at": "2026-05-04T10:23:00Z",
@@ -204,58 +128,16 @@ V0.3.1 唯一自动关闭 harness session 的路径,且必须由用户显式触�
 }
 ```
 
-> **V0.4.0 F60+F66+F67 deprecated 字段**(`current_phase` / `phase_state` /
-> `phase_history` / `decision_candidates` / `fix_cycle_count`):随 phase
-> 机制 EOL。新写**不**带这些字段(全部 `#[serde(default,
-> skip_serializing_if = ...)]`);老 state.json 仍可读(serde-compat,
-> 不破老文件)。F66 thin orchestrator 完全不消费它们(只读
-> `~/.ccteam/progress/<slug>.jsonl` workflow domain 业务 SoT;详见 §4.1)。
-> V0.5 删字段定义。
+**`team` 字段**:指定项目跑哪个团队的 workflow / agents(默认 `dev`)。
 
-**`phase_state` 枚举**(V0.4.0+ deprecated):`in_flight` / `idle` / `fix_locked`(详见 tech-design §3.2)。新写省略。
+**`team_kind` 字段**:`workflow` | `multi_workflow` | `flex`。从 `team.yaml::kind` 缓存到 state,供 hooks 判断 flex 路径。默认 `workflow`,默认值时省略。
 
-**`parallelism` 枚举**:`solo` / `agent_team` / `multi_session`(详见 §5.1 phase schema)。V0.4.0+ workflow.yaml `agents.<role>.parallelism` 走 `AgentSpec` 字段(详见 §17.2),非这里。
-
-**`team` 字段**(M3.1 F13):指定项目跑哪个团队的 phase 集合(默认 `dev`,M3.4 加 `research` 等)。serde 默认值 `"dev"`,所以 M3.1 之前写出的 state.json 自动以 dev 团队加载,无需迁移脚本。
-
-**`team_kind` 字段**(V0.3.1 F49):项目创建/首次 `session` 操作时从
-`team.yaml::kind` 缓存到 state,供 hooks 在不跑 team resolver 的情况下判断 flex
-路径。serde 默认 `workflow`,并在默认值时可省略。
-
-**`sessions` / `next_sid_seq` 字段**(V0.3.1 F49):flex 项目的 master session
-registry。`sessions` 是 `{ "<sid>": { "harness": "claude", "tmux_session":
-"ccteam-<slug>-<sid>", "started_at": "...", "pid": 12345|null } }`;
-`next_sid_seq` 是每 harness 的下一个编号,删除 session 不递减,确保 sid 不复用。
-workflow / multi_workflow 项目保持空对象或省略。
+**`sessions` / `next_sid_seq` 字段**(flex 项目):master session registry。
+`sessions` shape `{ "<sid>": { "harness": "claude", "tmux_session": "ccteam-<slug>-<sid>", "started_at": "...", "pid": 12345|null } }`;
+`next_sid_seq` 是每 harness 的下一个编号(删除 session 不递减,sid 不复用)。
+workflow 项目保持空对象或省略。
 
 **原子写入**:`.tmp` + `rename`;启动校验 schema,损坏走 backup。
-
-### 2.2 Master `state.json`(`parallelism: multi_session`)
-
-在 §2.1 基础上扩展子模块状态摘要:
-
-```json
-{
-  "slug": "saas-platform-x9f2",
-  "parallelism": "multi_session",
-  "current_phase": "fan-out",
-  "phase_state": "in_flight",
-  "sub_modules": {
-    "backend-api":          {"current_phase": "implement", "phase_state": "in_flight"},
-    "frontend-dashboard":   {"current_phase": "implement", "phase_state": "idle"},
-    "mobile-app":           {"current_phase": "test-run",  "phase_state": "in_flight"},
-    "docs":                 {"current_phase": "ship",      "phase_state": "idle"}
-  },
-  "max_sessions_per_project": 4,
-  "...": "上述 §2.1 字段全部保留"
-}
-```
-
-**项目级 phase 序列**:`plan` → `fan-out` → `implement-parallel` → `fan-in` → `review` → `ship`。
-
-### 2.3 Sub-module `state.json`(multi-session 内)
-
-字段与 §2.1 完全相同;只是粒度是子模块而非项目。
 
 ---
 
@@ -427,27 +309,16 @@ interfaces §3.4.3"。具体写哪些事件:
 
 ## 4. Progress.jsonl 事件流
 
-workflow / multi_workflow 项目使用一个 `~/.ccteam/progress/<slug>.jsonl`。
+workflow 项目使用一个 `~/.ccteam/progress/<slug>.jsonl`。
 flex 项目使用每 session 一个 `~/.ccteam/progress/<slug>/<sid>.jsonl`,读侧按
 `ts` 聚合。**这是 orchestrator 唯一的状态事实来源**——tmux 终端输出只给人看,
-不解析;`~/.ccteam/harness/*.json` 只服务展示。
-
-> **V0.4.0 F60+F66+F67**:phase 机制(`phase_inject` / `phase_done` /
-> `phase_milestone` / `golden_rules_check` / `phase_done_pending` /
-> `subskill_*` / `escalate(kind=revert|abort|insufficient_clarification|
-> need_user_input)`)整组事件随 phase 状态机一并 EOL。F66 thin
-> orchestrator 写 7 类 workflow-driven event;F66 fix-loop 写
-> 第 8 类 `escalation` event。下文 §4.1 给出新清单(workflow
-> domain)与仍保留的 hook-domain 事件(`PreToolUse` / `PostToolUse` /
-> `SubagentStop` / `Stop` / `SessionEnd` / `user_attach`)。
-> V0.4.0 ESCALATE grammar(§4.1.1)目前未使用,保留以备 V0.4.1+
-> 决策点恢复。
+不解析。
 
 ### 4.1 事件类型(完整清单)
 
-V0.4.0 起 progress.jsonl 由两个域共同写入:
+progress.jsonl 由两个域共同写入:
 
-**workflow domain**(F66 orchestrator 写,共 7 类 + F66 fix-loop 第 8 类 `escalation`):
+**workflow domain**(orchestrator 写,共 7 类 + fix-loop 第 8 类 `escalation`):
 
 ```jsonl
 {"ts":"2026-05-10T09:00:00Z","event":"workflow_start","workflow":"watcher","slug":"dev-foo"}
@@ -465,30 +336,30 @@ V0.4.0 起 progress.jsonl 由两个域共同写入:
 | event | 必有字段 | 选填字段 | 写入时机 |
 |---|---|---|---|
 | `workflow_start` | `workflow` (`WorkflowSpec::name`), `slug`, `ts` | — | `Orchestrator::run_project` 入口,加载 workflow.yaml 成功后 |
-| `agent_spawn` | `role`, `session_id`, `executor` (`claude`\|`codex`), `slug`, `ts` | `tmux_session` (claude 用 `ccteam-<slug>-<sid>` 占位;codex 写真名),`job_id` (V0.4.5 F80;Claude Code `--bg` 返回的短 hash,如 `"9432490e"`,codex 行为 `null`) | `HarnessAdapter::spawn_session` 返回 `Ok(handle)` 后 |
-| `agent_done` | `role`, `session_id`, `status` (`completed`\|`stopped`\|`error`\|`killed`), `cost_usd` (f64;无 cost 时 `0.0`), `slug`, `ts` | — | (a) `session_state_path` 文件 `status` ∈ {`stopped`, `completed`, `error`} 时,poll 一次;(b) **V0.4.5 F80**:`poll_completions` 发现 progress.jsonl 含 open `agent_spawn` 但其 `job_id` 对应的 `~/.claude/jobs/<id>/state.json` 已 terminal(`firstTerminalAt` 非空 / state ∈ {done, failed, crashed, stopped} / 文件不存在),orchestrator 合成 `agent_done`,`status: "killed"` 用于 SIGKILL 死亡的 phantom row(防止 web UI 显示僵尸 running)|
+| `agent_spawn` | `role`, `session_id`, `executor` (`claude`\|`codex`), `slug`, `ts` | `tmux_session` (claude 用 `ccteam-<slug>-<sid>` 占位;codex 写真名),`job_id` (Claude Code `--bg` 返回的短 hash,如 `"9432490e"`,codex 行为 `null`) | `HarnessAdapter::spawn_session` 返回 `Ok(handle)` 后 |
+| `agent_done` | `role`, `session_id`, `status` (`completed`\|`stopped`\|`error`\|`killed`), `cost_usd` (f64;无 cost 时 `0.0`), `slug`, `ts` | — | (a) `session_state_path` 文件 `status` ∈ {`stopped`, `completed`, `error`} 时,poll 一次;(b) `poll_completions` 发现 progress.jsonl 含 open `agent_spawn` 但其 `job_id` 对应的 `~/.claude/jobs/<id>/state.json` 已 terminal,orchestrator 合成 `agent_done`,`status: "killed"` 用于 SIGKILL 死亡的 phantom row(防止 web UI 显示僵尸 running) |
 | `artifact_received` | `role`, `artifact_path` (abs), `slug`, `ts` | — | `ArtifactWatcher` 通过 mpsc 投递 `ArtifactEvent` 后,orchestrator 立刻 append(spawn 决策之前) |
 | `gate_triggered` | `role`, `forced` (bool), `threshold_met` (bool), `slug`, `ts` | — | `check_gates` 解锁 Gate 时;`forced=true` 表示 `.ccteam/gate_override/<role>` marker 触发 |
 | `budget_exceeded` | `role`, `cost_used_usd` (f64), `budget_limit_usd` (f64), `slug`, `ts` | — | `try_spawn` 内 budget guard 拦截 spawn 时(运行 session 永不被 kill) |
-| `workflow_done` | `workflow`, `slug`, `ts` | `reason` (V0.4.6 F82/F84/F86;见下) | 所有 Gate role 都进入 Fired 状态且无 running session 时,幂等 emit 一次;V0.4.6 起也由 cancel-token 路径写出(reason 必填) |
+| `workflow_done` | `workflow`, `slug`, `ts` | `reason` (见下) | 所有 Gate role 都进入 Fired 状态且无 running session 时,幂等 emit 一次;cancel-token 路径写出时 reason 必填 |
 | `escalation` | `kind` (`spawn_failed` 等), `role`, `consecutive_failures` (u32), `slug`, `ts` | — | `bump_fail_count` 每次 +1;`>= MAX_CONSECUTIVE_SPAWN_FAILURES` 时另发 `send_btw_escalation` 到 meta-agent inbox |
 
-**V0.4.6 `workflow_done.reason` 枚举**(`CancelReason::as_str`,
+**`workflow_done.reason` 枚举**(`CancelReason::as_str`,
 `crates/ccteam-core/src/orchestrator.rs`):
 
-| reason | 触发 finding | 写入路径 |
-|---|---|---|
-| (空) | check_workflow_done 自然完成 | 所有 Gate Fired + 无 running session 时,本字段缺省 |
-| `disabled` | F82 | `workflow.yaml::enabled: false` 热改 → cancel-token → 写 done |
-| `removed` | F81 | `ccteam remove <slug>` → unroster → cancel-token |
-| `reloaded` | F82 | agents 拓扑突变,老 loop 退场 + 新 loop 起 |
-| `shutdown` | F86 | `ccteam stop` / SIGTERM / `/tmp/ccteam-<user>.shutdown` trigger graceful shutdown |
-| `budget_exceeded` | F84 | `budget.max_cost_usd_per_24h` 或 `max_agent_spawns_per_hour` trip → 自动 `enabled=false` → cancel-token |
+| reason | 触发 |
+|---|---|
+| (空) | check_workflow_done 自然完成(所有 Gate Fired + 无 running session) |
+| `disabled` | `workflow.yaml::enabled: false` 热改 → cancel-token → 写 done |
+| `removed` | `ccteam remove <slug>` → unroster → cancel-token |
+| `reloaded` | agents 拓扑突变,老 loop 退场 + 新 loop 起 |
+| `shutdown` | `ccteam stop` / SIGTERM / `/tmp/ccteam-<user>.shutdown` trigger graceful shutdown |
+| `budget_exceeded` | `budget.max_cost_usd_per_24h` 或 `max_agent_spawns_per_hour` trip → 自动 `enabled=false` → cancel-token |
 
-**V0.4.6 F84 `budget_exceeded` 事件**:`workflow_done reason="budget_exceeded"` 之前先 emit 一行
-`{"event":"budget_exceeded","role":<trigger_role|null>,"cost_used_usd":<sum_24h>,"budget_limit_usd":<cap>,"slug":...}`(已有该 event 行,V0.4.6 起 budget guard 在 spawn 之外也消费它判 24h 滑窗 cost / 1h spawn count cap)。
+`budget_exceeded` 事件先于 `workflow_done reason="budget_exceeded"` emit 一行
+`{"event":"budget_exceeded","role":<trigger_role|null>,"cost_used_usd":<sum_24h>,"budget_limit_usd":<cap>,"slug":...}`(budget guard 在 spawn 之外也消费它判 24h 滑窗 cost / 1h spawn count cap)。
 
-**hook domain**(Claude Code / Codex hook 写,V0.4.0 保留;详见 §6.2):
+**hook domain**(Claude Code / Codex hook 写;详见 §6.2):
 
 ```jsonl
 {"ts":"2026-05-10T09:00:00Z","event":"PreToolUse","tool":"Edit","path":"src/lib.rs"}
@@ -500,54 +371,36 @@ V0.4.0 起 progress.jsonl 由两个域共同写入:
 {"ts":"...","event":"user_attach","detected_by":"PreToolUse-input-source"}
 ```
 
-(V0.4.0 F60 起 `session_start` 仍由 orchestrator 写;`SubagentStop` /
-`Stop` / `SessionEnd` / `notification` 由 `idle_aware_message` /
-`is_idle` / `subagent_active` 等 idle 探测消费,见 `progress.rs`。)
-
-### 4.1.1 ESCALATE grammar(M0.5.4)
-
-`Stop` hook 在 claude 最后一行匹配前缀,解析为下面三档之一,落 `event: "escalate"` 时附带 `kind` 与可选 `target_phase`。**纯字符串前缀匹配,orchestrator 不读自然语言**(详见 [docs/claude-code-tool-surface.md §2.2.3](./claude-code-tool-surface.md))。
-
-| ESCALATE 末行 | `kind` | `target_phase` | orchestrator 行为(M0/M1) |
-|---|---|---|---|
-| `ESCALATE: REVERT_TO_PHASE <phase> — <reason>` | `revert` | `<phase>` | M1+:set current_phase=`<phase>`,phase_state=Idle,re-dispatch;M0 仍走通用 escalation(写 escalation.md,等用户) |
-| `ESCALATE: NEED_USER_INPUT — <questions>` | `need_user_input` | `null` | 写 escalation.md,inbox 等用户 |
-| `ESCALATE: ABORT — <reason>` | `abort` | `null` | 项目永久标 escalated,M0 等同 NEED_USER_INPUT |
-| `ESCALATE: INSUFFICIENT_CLARIFICATION — <last_question>` | `insufficient_clarification` | `null` | M2.3+:phase 已撞 `max_clarify_rounds` 上限,best-effort artifact 已产出;orchestrator 写 escalation.md,outbox `event_kind: escalation`,等用户决定继续 / 接受 / abort(详见 §5.6.2) |
-| `ESCALATE: PHASE_DONE_PENDING — <reason>` | (special — emits standalone `phase_done_pending` event, not `escalate`) | `null` | M3.6 ✅:phase 产出 required_outputs 但部分子任务 defer。Stop hook 从 reason 解析 outbox 文件名(`reply-*.md` / `clarify-*.md` / `escalation-*.md`),写 `event: "phase_done_pending"` 含 `phase` / `open_decisions[]` / `reason` 三字段;orchestrator 走 `TickAction::AdvancePhasePending`,看下 phase `required_inputs` 与 `open_decisions` 静态交集决定 advance / 切 `PhaseState::DonePending` 阻塞(`ccteam resume` 清除) |
-| `ESCALATE: <free text>`(无前缀) | `need_user_input` | `null` | 等同显式 NEED_USER_INPUT,reason 是整段文本 |
-
-分隔符:em dash `—`(U+2014)、`--`、` - `(单 dash 必须前后有空格——这是为了不切碎 `plan-eng` 这类 phase 名)。
-
-**phase 模板作者写 ESCALATE 的原则**:能用前缀就用前缀(orchestrator 路由更精确);不确定就裸写文本(降级为 NEED_USER_INPUT)。**不要**把 ESCALATE 当成 RPC 通道来请求 `/exit`、`/reload-plugins` 等 TUI 命令——那是 orchestrator 的监控职责(详见 [docs/claude-code-tool-surface.md §2.2.2](./claude-code-tool-surface.md))。
+(`session_start` 由 orchestrator 写;`SubagentStop` / `Stop` / `SessionEnd` /
+`notification` 由 `idle_aware_message` / `is_idle` / `subagent_active` 等 idle
+探测消费,见 `progress.rs`。)
 
 ### 4.2 写入责任
 
 | 事件 | 写入方 |
 |---|---|
-| `workflow_start` / `workflow_done` | F66 orchestrator(`Orchestrator::run_project` 入口 / `check_workflow_done` 守门) |
-| `agent_spawn` | F66 orchestrator(`HarnessAdapter::spawn_session` 返回 Ok 后) |
-| `agent_done` | F66 orchestrator(`poll_completions` 检测到 session state.json `status` ∈ {`completed`, `stopped`, `error`}) |
-| `artifact_received` | F66 orchestrator(`ArtifactWatcher` mpsc 投递后) |
-| `gate_triggered` | F66 orchestrator(`check_gates` 释放 Gate 时) |
-| `budget_exceeded` | F66 orchestrator(`try_spawn` budget guard) |
-| `escalation` | F66 orchestrator(`bump_fail_count`,fix-loop 3-strike 与 `spawn_session` 持续失败) |
-| `session_start` / `PreToolUse` / `PostToolUse` / `SubagentStop` / `Stop` / `SessionEnd` / `notification` / `user_attach` | Claude Code / Codex hooks 与启动器(详见 §6.2;V0.4.0 保留不变) |
+| `workflow_start` / `workflow_done` | orchestrator(`Orchestrator::run_project` 入口 / `check_workflow_done` 守门) |
+| `agent_spawn` | orchestrator(`HarnessAdapter::spawn_session` 返回 Ok 后) |
+| `agent_done` | orchestrator(`poll_completions` 检测到 session state.json `status` ∈ {`completed`, `stopped`, `error`}) |
+| `artifact_received` | orchestrator(`ArtifactWatcher` mpsc 投递后) |
+| `gate_triggered` | orchestrator(`check_gates` 释放 Gate 时) |
+| `budget_exceeded` | orchestrator(`try_spawn` budget guard) |
+| `escalation` | orchestrator(`bump_fail_count`,fix-loop 3-strike 与 `spawn_session` 持续失败) |
+| `session_start` / `PreToolUse` / `PostToolUse` / `SubagentStop` / `Stop` / `SessionEnd` / `notification` / `user_attach` | Claude Code / Codex hooks 与启动器(详见 §6.2) |
 
 ### 4.3 消费方
 
 - **orchestrator** 自身(读 progress.jsonl 用于 budget guard / fix-loop 计数 /
   workflow_done 幂等保护):见 `ccteam_core::progress::read_all_events`
   与 `Orchestrator::cumulative_cost_from_progress`
-- **`ccteam_core::progress`**(F67):暴露 `workflow_cost_total` /
+- **`ccteam_core::progress`**:暴露 `workflow_cost_total` /
   `current_agent_sessions` / `escalation_count` 三组聚合,
   pure-function 接口供 web 与 meta-agent 查询(见 §4.4 + `queries::workflow_summary`)
-- **`ccteam_core::queries::workflow_summary`**(F67):合并 workflow.yaml
-  规格与 progress.jsonl 事件,生成 `WorkflowSummary { workflow_name,
-  agents[], artifact_counts, total_cost_usd, escalation_count,
-  gate_states }`;F68 SPA 消费
-- **MCP `observe_agents`**(F65):读 `state.json::sessions` 列出运行
-  session;cost / status 字段 V0.4.1 起改读 `agent_done` 事件
+- **`ccteam_core::queries::workflow_summary`**:合并 workflow.yaml 规格与
+  progress.jsonl 事件,生成 `WorkflowSummary { workflow_name, agents[],
+  artifact_counts, total_cost_usd, escalation_count, gate_states }`;SPA 消费
+- **MCP `observe_agents`**:读 `state.json::sessions` 列出运行 session;cost /
+  status 字段读 `agent_done` 事件
 - **用户 dashboard pane**:`tail -f progress/<slug>.jsonl | jq -c '.event + ":" + (.role // .tool // "")'`
 - **retro / lessons writer**:作为项目历史输入,通过 Claude session
   `/memory` + `Edit ~/.claude/rules/ccteam-lessons-<team>.md` 写入
