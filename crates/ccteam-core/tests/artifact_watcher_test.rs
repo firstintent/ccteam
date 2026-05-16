@@ -56,6 +56,7 @@ fn build_spec(name: &str, watchers: &[(&str, PathBuf)]) -> WorkflowSpec {
     WorkflowSpec {
         name: name.to_string(),
         description: None,
+        enabled: true,
         agents,
     }
 }
