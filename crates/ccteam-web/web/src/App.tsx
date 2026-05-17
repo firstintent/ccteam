@@ -20,6 +20,7 @@ import { WorkspaceSidebar } from "./components/WorkspaceSidebar";
 import Dashboard from "./pages/Dashboard";
 import ProjectDetail from "./pages/ProjectDetail";
 import SessionDetail from "./pages/SessionDetail";
+import SessionsListPage from "./pages/SessionsListPage";
 import TeamsListPage from "./pages/TeamsListPage";
 import TeamDetailPage from "./pages/TeamDetailPage";
 import { TokenEntryPage } from "./components/TokenEntryPage";
@@ -143,6 +144,7 @@ export default function App() {
                   <Route path="/p/:slug/s/:sid" element={<SessionDetail />} />
                   <Route path="/teams" element={<TeamsListPage />} />
                   <Route path="/teams/:name" element={<TeamDetailPage />} />
+                  <Route path="/sessions" element={<SessionsListPage />} />
                   <Route path="*" element={<PlaceholderPage label="route" />} />
                 </Routes>
               }

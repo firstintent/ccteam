@@ -218,7 +218,14 @@ async fn get_api_v1_session_detail_returns_harness_snapshot() {
 }
 
 #[tokio::test]
-async fn get_api_v1_session_detail_404_for_non_flex_project() {
+async fn get_api_v1_session_detail_404_for_unknown_workflow_sid() {
+    // V0.5.1 F103c: workflow projects now resolve a SessionDetail
+    // when an `agent_spawn` for the sid exists in progress.jsonl.
+    // Unknown sids still 404 — there's nothing to anchor the detail
+    // shape on. (Pre-F103c this test asserted "non-flex always
+    // 404'd"; the workflow branch in `handle_session` flipped that
+    // contract, so the test is reframed to keep covering the
+    // 404-on-missing-sid path.)
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
     fixture_project(&paths, "demo");

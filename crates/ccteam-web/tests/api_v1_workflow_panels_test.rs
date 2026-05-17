@@ -367,3 +367,193 @@ agents:
 
     std::env::remove_var("CCTEAM_CLAUDE_JOBS_DIR");
 }
+
+// ----- V0.5.1 F103a — aggregate /api/v1/sessions/active -----
+
+/// No projects → empty array (200 OK).
+#[tokio::test]
+async fn t05_sessions_active_aggregate_empty_when_no_projects() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let addr = spawn(AppState::new(paths)).await;
+    let resp = client()
+        .get(format!("http://{addr}/api/v1/sessions/active"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert!(body.as_array().unwrap().is_empty());
+}
+
+/// One project with an open agent_spawn → aggregate returns 1 row
+/// with the project's slug attached. Mirrors t04's fixture shape so
+/// the new handler exercises the same probe path.
+#[tokio::test]
+#[serial(claude_jobs_env)]
+async fn t06_sessions_active_aggregate_flattens_across_projects() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    fixture_project(&paths, "team-e");
+    write_workflow_yaml(
+        &paths,
+        "team-e",
+        "\
+name: team-e
+agents:
+  planner:
+    trigger: manual
+",
+    );
+
+    let jobs_root = tmp.path().join("claude-jobs");
+    fs::create_dir_all(&jobs_root).unwrap();
+    let job_dir = jobs_root.join("job-e1");
+    fs::create_dir_all(&job_dir).unwrap();
+    fs::write(
+        job_dir.join("state.json"),
+        r#"{"state":"working","cost_usd":0.55,"cwd":"/tmp/team-e"}"#,
+    )
+    .unwrap();
+    std::env::set_var("CCTEAM_CLAUDE_JOBS_DIR", &jobs_root);
+
+    append_event(
+        &paths,
+        "team-e",
+        json!({
+            "event": "agent_spawn",
+            "role": "planner",
+            "session_id": "planner-e1",
+            "job_id": "job-e1",
+            "ts": "2026-05-17T10:00:00Z",
+        }),
+    );
+
+    let addr = spawn(AppState::new(paths)).await;
+    let resp = client()
+        .get(format!("http://{addr}/api/v1/sessions/active"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let arr = body.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    let row = &arr[0];
+    assert_eq!(row["slug"], "team-e");
+    assert_eq!(row["session_id"], "planner-e1");
+    assert_eq!(row["role"], "planner");
+    assert_eq!(row["job_id"], "job-e1");
+    assert!((row["cost_usd"].as_f64().unwrap() - 0.55).abs() < 1e-6);
+    assert_eq!(row["cwd"], "/tmp/team-e");
+
+    std::env::remove_var("CCTEAM_CLAUDE_JOBS_DIR");
+}
+
+// ----- V0.5.1 F103c — workflow SessionDetail -----
+
+/// Pre-F103c regression guard: flex SessionDetail flow stays
+/// unchanged — `kind=="flex"` and harness/tmux fields populated from
+/// the SessionRecord registry.
+#[tokio::test]
+async fn t07_session_detail_flex_branch_unchanged() {
+    use ccteam_core::{HarnessKind, ProjectState, SessionRecord, TeamKind};
+    use std::collections::BTreeMap;
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let slug = "flex-demo";
+    let sid = "claude-1";
+    let mut state = ProjectState::initial_for_team(slug.into(), "flex".into());
+    state.team_kind = TeamKind::Flex;
+    let mut sessions = BTreeMap::new();
+    sessions.insert(
+        sid.to_string(),
+        SessionRecord {
+            harness: HarnessKind::Claude,
+            tmux_session: format!("ccteam-{slug}-{sid}"),
+            started_at: chrono::Utc::now(),
+            pid: None,
+            job_id: None,
+        },
+    );
+    state.sessions = sessions;
+    state.next_sid_seq.insert(HarnessKind::Claude, 2);
+    fs::create_dir_all(paths.project_ccteam_dir(slug)).unwrap();
+    state.save(&paths.project_state(slug)).unwrap();
+
+    let addr = spawn(AppState::new(paths)).await;
+    let resp = client()
+        .get(format!(
+            "http://{addr}/api/v1/projects/{slug}/sessions/{sid}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["kind"], "flex");
+    assert_eq!(body["slug"], slug);
+    assert_eq!(body["sid"], sid);
+    assert!(body["events"].is_array());
+}
+
+/// Workflow project (default team_kind) with one `agent_spawn` event
+/// → SessionDetail returns 200 with `kind="workflow"`, `harness=null`,
+/// and started_at sourced from the spawn event.
+#[tokio::test]
+async fn t08_session_detail_workflow_branch_returns_200() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    fixture_project(&paths, "team-f");
+    append_event(
+        &paths,
+        "team-f",
+        json!({
+            "event": "agent_spawn",
+            "role": "planner",
+            "session_id": "planner-f1",
+            "job_id": "job-f1",
+            "ts": "2026-05-17T11:00:00Z",
+        }),
+    );
+
+    let addr = spawn(AppState::new(paths)).await;
+    let resp = client()
+        .get(format!(
+            "http://{addr}/api/v1/projects/team-f/sessions/planner-f1"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["kind"], "workflow");
+    assert_eq!(body["slug"], "team-f");
+    assert_eq!(body["sid"], "planner-f1");
+    assert!(body["harness_snapshot"].is_null());
+    assert_eq!(body["started_at"], "2026-05-17T11:00:00Z");
+    // Events should include the agent_spawn row for the session.
+    let events = body["events"].as_array().unwrap();
+    assert!(
+        events.iter().any(|e| e["event"] == "agent_spawn"),
+        "events list includes the agent_spawn row"
+    );
+}
+
+/// Workflow project with no matching agent_spawn for the requested
+/// sid → 404 (we don't synthesise a SessionDetail from nothing).
+#[tokio::test]
+async fn t09_session_detail_workflow_404_on_unknown_sid() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    fixture_project(&paths, "team-g");
+    let addr = spawn(AppState::new(paths)).await;
+    let resp = client()
+        .get(format!(
+            "http://{addr}/api/v1/projects/team-g/sessions/ghost"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}

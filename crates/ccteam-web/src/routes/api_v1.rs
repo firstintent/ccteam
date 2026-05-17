@@ -73,6 +73,11 @@ pub fn router() -> Router<AppState> {
             "/api/v1/projects/{slug}/jobs/{job_id}/log",
             get(handle_job_log),
         )
+        // V0.5.1 F103a — aggregate active sessions across every project.
+        .route(
+            "/api/v1/sessions/active",
+            get(handle_active_sessions_aggregate),
+        )
 }
 
 /// JSON returned by `GET /api/v1/projects/{slug}`.
@@ -301,14 +306,12 @@ async fn handle_session(
                 .into_response();
         }
     };
+    // V0.5.1 F103c — Workflow / multi_workflow projects: synthesize a
+    // SessionDetail from the `agent_spawn` event in progress.jsonl so
+    // the SPA can deep-link into workflow sessions instead of 404'ing.
+    // Pre-F103c only flex was supported.
     if state.team_kind != TeamKind::Flex {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": format!("project {slug} is not a flex project")
-            })),
-        )
-            .into_response();
+        return build_workflow_session_detail(&app, &state, &slug, &sid);
     }
     let Some(record) = state.sessions.get(&sid) else {
         return (
@@ -368,6 +371,143 @@ async fn handle_session(
         events: events_to_rows(&status_events[display_start..]),
         outbox: session_outbox_rows(&app.paths, &slug, &sid, DEFAULT_OUTBOX_LIMIT),
         harness_snapshot: snapshot.map(snapshot_view),
+    };
+    Json(detail).into_response()
+}
+
+/// V0.5.1 F103c — build a SessionDetail for a workflow/multi_workflow
+/// project session. Sources:
+///
+/// - progress.jsonl `agent_spawn` event for `<sid>` provides `role` +
+///   `started_at` (+ `job_id` when present).
+/// - `~/.claude/jobs/<job_id>/state.json` (when job_id known) provides
+///   model + live cost.
+///
+/// `harness_snapshot` is left `null` — workflow projects don't write
+/// the F90 mirror file, and the SPA hides the HarnessPanel + terminal
+/// mount for workflow sessions. Outbox / event rows come from the
+/// project-wide progress.jsonl, filtered down to entries carrying the
+/// matching `session_id`.
+fn build_workflow_session_detail(
+    app: &AppState,
+    state: &ProjectState,
+    slug: &str,
+    sid: &str,
+) -> axum::response::Response {
+    let progress_path = app.paths.progress_jsonl(slug);
+    if !progress_path.exists() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": format!("session not found: {slug}/{sid}")
+            })),
+        )
+            .into_response();
+    }
+    let events: Vec<serde_json::Value> = match std::fs::read_to_string(&progress_path) {
+        Ok(body) => body
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect(),
+        Err(err) => {
+            tracing::error!(slug, sid, %err, "workflow session: progress.jsonl read failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("progress.jsonl read failed for {slug}: {err}")
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Find the `agent_spawn` event for <sid>. If we can't find one,
+    // 404 — synthesising a SessionDetail from later events would lose
+    // the role / started_at anchor the SPA expects.
+    let Some(spawn) = events.iter().find(|e| {
+        e.get("event").and_then(|s| s.as_str()) == Some("agent_spawn")
+            && e.get("session_id").and_then(|s| s.as_str()) == Some(sid)
+    }) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": format!("session not found: {slug}/{sid}")
+            })),
+        )
+            .into_response();
+    };
+    let role = spawn
+        .get("role")
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+    let started_at = spawn
+        .get("ts")
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // Probe state.json for live cost when we know the job_id. We
+    // re-use the active_sessions row for this session if it's still
+    // open — that's already decorated with model + cwd + cost.
+    let live = ccteam_core::active_sessions(slug, &app.paths)
+        .ok()
+        .and_then(|rows| rows.into_iter().find(|r| r.session_id == sid));
+    let cost_label = live
+        .as_ref()
+        .map(|r| format!("{:.2}", r.cost_usd))
+        .unwrap_or_else(|| "0.00".to_string());
+    // `tmux_session` is the project-level session (workflow project
+    // shares one tmux session across spawns). `harness` is "claude"
+    // since workflow spawns go through `claude --bg --agent <role>`.
+    let tmux_session = state.tmux_session.clone();
+
+    // Filter events down to those carrying this session_id (covers
+    // agent_spawn / agent_done / any optional ad-hoc events that
+    // happen to be sid-scoped). Returns the project tail when no
+    // sid-scoped rows exist so the SPA's EventsLive isn't empty.
+    let sid_events: Vec<serde_json::Value> = events
+        .iter()
+        .filter(|e| e.get("session_id").and_then(|s| s.as_str()) == Some(sid))
+        .cloned()
+        .collect();
+    let event_rows = if sid_events.is_empty() {
+        events_to_rows(&events[events.len().saturating_sub(PROJECT_EVENT_DISPLAY_LIMIT)..])
+    } else {
+        events_to_rows(&sid_events[sid_events.len().saturating_sub(PROJECT_EVENT_DISPLAY_LIMIT)..])
+    };
+
+    // Status: still-open spawn → "ok" (live); otherwise default to
+    // "ok" too — workflow `agent_done.status` already maps via the
+    // project-wide badge. Fine-grained per-session badging is a flex
+    // feature we deliberately don't replicate here.
+    let label: &'static str = if live.is_some() { "live" } else { "done" };
+    let cls: &'static str = if live.is_some() { "badge-ok" } else { "badge-neutral" };
+
+    let kind = team_kind_label(state.team_kind).to_string();
+    let detail = SessionDetail {
+        slug: slug.to_string(),
+        sid: sid.to_string(),
+        team: state.team.clone(),
+        kind,
+        harness: format!(
+            "claude{}",
+            if role.is_empty() {
+                String::new()
+            } else {
+                format!("/{role}")
+            }
+        ),
+        harness_class: "harness-claude",
+        tmux_session,
+        started_at,
+        status_class: cls,
+        status_label: label,
+        cost_label,
+        events: event_rows,
+        outbox: outbox_rows(&app.paths, slug, DEFAULT_OUTBOX_LIMIT),
+        harness_snapshot: None,
     };
     Json(detail).into_response()
 }
@@ -614,6 +754,62 @@ async fn handle_active_sessions(
                 .into_response()
         }
     }
+}
+
+/// V0.5.1 F103a — aggregate active sessions row decorated with the
+/// owning project slug. Shape on the wire is
+/// `ActiveSessionInfo & { slug: String }` flattened, so the SPA can
+/// route directly to `/p/<slug>/s/<session_id>` without a second
+/// lookup.
+#[derive(Serialize)]
+pub struct ActiveSessionWithSlug {
+    pub slug: String,
+    #[serde(flatten)]
+    pub session: ActiveSessionInfo,
+}
+
+/// `GET /api/v1/sessions/active`
+///
+/// V0.5.1 F103a — flattens [`ccteam_core::active_sessions`] across
+/// every registered project so the SPA's `/sessions` top-level tab
+/// can render one global card list without coordinating per-project
+/// fetches. Per-project errors are logged (`tracing::warn`) but do
+/// not fail the request — the response carries every project's rows
+/// that loaded successfully.
+async fn handle_active_sessions_aggregate(State(app): State<AppState>) -> impl IntoResponse {
+    let summaries = match ccteam_core::collect_projects(&app.paths) {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::error!(?err, "GET /api/v1/sessions/active collect_projects failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("{err}")})),
+            )
+                .into_response();
+        }
+    };
+    let mut out: Vec<ActiveSessionWithSlug> = Vec::new();
+    for s in summaries {
+        let slug = s.state.slug;
+        match ccteam_core::active_sessions(&slug, &app.paths) {
+            Ok(rows) => {
+                for r in rows {
+                    out.push(ActiveSessionWithSlug {
+                        slug: slug.clone(),
+                        session: r,
+                    });
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    slug = %slug,
+                    %err,
+                    "aggregate active_sessions: per-project build failed",
+                );
+            }
+        }
+    }
+    Json(out).into_response()
 }
 
 /// Query parameters for `jobs/<job_id>/log`. `tail` is the line count;

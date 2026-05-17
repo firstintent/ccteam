@@ -37,7 +37,7 @@
 // `/sse/project/<slug>` topic (`useProgressStream`) and via the
 // parent page's REST refetch on `reloadTick`.
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type {
   AgentSessionStatus,
   AgentStatus,
@@ -151,6 +151,18 @@ function AgentCard({
         >
           {agent.role}
         </span>
+        {/* V0.5.1 F103b — explicit running count badge alongside the
+            pulse dot. The dot alone was easy to miss in dense grids;
+            the numeric badge makes "this card has live work" legible
+            at a glance. */}
+        {isActive && (
+          <span
+            data-testid={`running-badge-${agent.role}`}
+            className="shrink-0 inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-mono uppercase tracking-wider border text-status-running border-status-running/40 bg-status-running/10"
+          >
+            {agent.running_count} running
+          </span>
+        )}
         {isGate && (
           <span
             className={
@@ -403,11 +415,31 @@ export default function WorkflowView({ slug, summary, onReload }: Props) {
   const [active, setActive] = useState<ActiveSessionInfo[]>([]);
   const [expandedRole, setExpandedRole] = useState<string | null>(null);
   const [inspectJobId, setInspectJobId] = useState<string | null>(null);
+  // V0.5.1 F103b — auto-expand the first running role once per slug
+  // mount. We track "have we auto-expanded yet" so subsequent SSE-driven
+  // refetches don't override an explicit user collapse.
+  const autoExpandedRef = useRef(false);
+  useEffect(() => {
+    autoExpandedRef.current = false;
+  }, [slug]);
   useEffect(() => {
     let cancelled = false;
     fetchActiveSessions(slug)
       .then((rows) => {
-        if (!cancelled) setActive(rows);
+        if (cancelled) return;
+        setActive(rows);
+        // V0.5.1 F103b — auto-expand the first role with a live spawn
+        // so the user lands on `/p/<slug>` and immediately sees the
+        // running session info instead of a folded-up card. Only fires
+        // once per slug mount; user toggles (collapse / expand other
+        // cards) keep working from then on.
+        if (!autoExpandedRef.current) {
+          const firstRunning = rows[0]?.role;
+          if (firstRunning) {
+            setExpandedRole((prev) => prev ?? firstRunning);
+          }
+          autoExpandedRef.current = true;
+        }
       })
       .catch(() => {
         // Silent — expansion shows "no running sessions" until the next

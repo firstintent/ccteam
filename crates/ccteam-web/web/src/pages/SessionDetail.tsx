@@ -8,11 +8,17 @@
 // Layout:
 //   - top:     status row (slug / sid / harness / tmux_session /
 //              started_at / cost_label + status badge + PauseResumeButtons)
-//   - middle:  HarnessPanel + terminal mount
+//   - middle:  HarnessPanel + terminal mount  (flex only)
 //   - below:   EventsLive (scope=session) + BtwForm (sid-scoped) + Outbox
 //
-// Only flex projects return a SessionDetail; non-flex slugs 404 at
-// the API and surface as "Not found" here.
+// Pre-V0.5.1: only flex projects returned a SessionDetail; non-flex
+// slugs 404'd at the API. V0.5.1 F103c added workflow / multi_workflow
+// support — the JSON's `kind` field discriminates ("flex" |
+// "workflow" | "multi_workflow"). For non-flex kinds we hide the
+// HarnessPanel + TerminalView (no harness mirror file, no tmux mount)
+// and surface a small notice; the EventsLive + BtwForm + Outbox panels
+// stay because workflow sessions still emit progress events and accept
+// btw injections.
 //
 // `paused` defaults `false`: the F52 SessionDetail JSON doesn't surface
 // the pause flag yet (the orchestrator's user_pause_pending is
@@ -152,6 +158,11 @@ export default function SessionDetail() {
     return <div className="p-6 text-text-dim text-sm">no data</div>;
   }
 
+  // V0.5.1 F103c — `kind === "flex"` means full SessionDetail (with
+  // HarnessPanel + terminal mount); workflow / multi_workflow projects
+  // come through the new core branch and have no harness mirror / no
+  // tmux mount. The boolean keeps the JSX below readable.
+  const isFlex = detail.kind === "flex";
   return (
     <div className="flex flex-col h-full min-h-0 overflow-auto p-4 gap-4">
       {/* TOP — identity row + pause/resume */}
@@ -184,19 +195,33 @@ export default function SessionDetail() {
         />
       </header>
 
-      {/* MIDDLE — harness panel + terminal placeholder */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        <HarnessPanel
-          slug={detail.slug}
-          sid={detail.sid}
-          snapshot={detail.harness_snapshot}
-        />
-        <TerminalView
-          slug={detail.slug}
-          sid={detail.sid}
-          className="lg:col-span-2 border border-surface-700/40 rounded-md bg-surface-950 min-h-[16rem]"
-        />
-      </div>
+      {/* V0.5.1 F103c — workflow / multi_workflow sessions don't have a
+          harness mirror file or a tmux mount; surface a small notice
+          and skip the HarnessPanel + TerminalView rows. */}
+      {!isFlex && (
+        <div
+          data-testid="workflow-session-notice"
+          className="text-[11px] text-text-dim font-mono px-2 py-1 border border-surface-700/40 rounded-md bg-surface-850"
+        >
+          Workflow session — harness/terminal mount disabled (flex-only feature).
+        </div>
+      )}
+
+      {/* MIDDLE — harness panel + terminal placeholder (flex only). */}
+      {isFlex && (
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+          <HarnessPanel
+            slug={detail.slug}
+            sid={detail.sid}
+            snapshot={detail.harness_snapshot}
+          />
+          <TerminalView
+            slug={detail.slug}
+            sid={detail.sid}
+            className="lg:col-span-2 border border-surface-700/40 rounded-md bg-surface-950 min-h-[16rem]"
+          />
+        </div>
+      )}
 
       {/* BELOW — events + (BTW + outbox). The session-scoped BtwForm
           routes to `/api/<slug>/<sid>/btw` (per V0.3.1 F50 session
