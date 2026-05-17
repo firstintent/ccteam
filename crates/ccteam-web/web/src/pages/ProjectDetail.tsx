@@ -24,11 +24,11 @@ import {
   type OutboxRow,
   type SessionCard,
 } from "../lib/detailApi";
-import { EventsLive } from "../components/EventsLive";
 import { BtwForm } from "../components/BtwForm";
 import { PauseResumeButtons } from "../components/PauseResumeButtons";
 import WorkflowView from "./WorkflowView";
 import ArtifactQueuePanel from "../components/ArtifactQueuePanel";
+import ArtifactStatusPanel from "../components/ArtifactStatusPanel";
 import EventsTimelinePanel from "../components/EventsTimelinePanel";
 import CostSparkline from "../components/CostSparkline";
 
@@ -237,21 +237,18 @@ export default function ProjectDetail() {
       {summary.workflow_summary && (
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
           <ArtifactQueuePanel slug={summary.slug} reloadKey={reloadTick} />
+          <ArtifactStatusPanel slug={summary.slug} reloadKey={reloadTick} />
           <CostSparkline slug={summary.slug} reloadKey={reloadTick} />
-          <div className="min-h-[16rem] flex">
-            <EventsTimelinePanel
-              slug={summary.slug}
-              initialEvents={summary.events}
-            />
-          </div>
         </div>
       )}
 
-      {/* Main two-column layout: events + (BTW form + outbox) */}
+      {/* Main two-column layout: events timeline + (BTW form + outbox).
+          The timeline panel is bounded to 24rem so a long event tail
+          scrolls internally instead of stretching the whole page. */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 min-h-0 flex-1">
-        <div className="lg:col-span-2 min-h-[24rem] flex">
-          <EventsLive
-            scope={{ kind: "project", slug: summary.slug }}
+        <div className="lg:col-span-2 h-[24rem] flex">
+          <EventsTimelinePanel
+            slug={summary.slug}
             initialEvents={summary.events}
           />
         </div>

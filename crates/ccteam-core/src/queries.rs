@@ -822,6 +822,104 @@ fn stat_artifact_queue(dir: &std::path::Path) -> ArtifactQueueStat {
     }
 }
 
+// ---------------- artifact status (issue/PR/backlog count panel) ----------------
+
+/// One artifact directory's status-grouped counts. Project-agnostic:
+/// just groups `*.json` files in `<dir>` by their top-level string
+/// `.status` field. Files without `.status` are excluded.
+///
+/// `total` = sum of every value in `counts`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ArtifactStatusGroup {
+    /// Project-relative dir (e.g. `.ccteam/issues`).
+    pub dir: String,
+    /// Sum of `counts.values()`.
+    pub total: u64,
+    /// Distinct `.status` string → file count.
+    pub counts: BTreeMap<String, u64>,
+}
+
+/// Enumerate immediate subdirs of `<project>/.ccteam/` and, for each
+/// non-infrastructure subdir, count `*.json` files grouped by their
+/// top-level string `.status` field. Empty groups (no `.status`-bearing
+/// files) are omitted.
+///
+/// Discovery skips hidden dirs (`.X`), trigger marker dirs
+/// (`*-requests`), archived dirs (`*.archived`), and known
+/// infrastructure (`rules`, `inbox`, `outbox`, `spawn_requests`).
+///
+/// Used by the web dashboard's "Artifact Status" panel to surface
+/// open/fixing/closed/needs-human counts (or any project-defined status
+/// enum) without ccteam-core knowing the schema.
+///
+/// Ordering: ASCII-sorted by `dir`.
+pub fn artifact_status(slug: &str, paths: &CcteamPaths) -> Result<Vec<ArtifactStatusGroup>> {
+    let root = paths.project_dir(slug).join(".ccteam");
+    let Ok(rd) = std::fs::read_dir(&root) else {
+        return Ok(Vec::new());
+    };
+
+    let mut groups: Vec<ArtifactStatusGroup> = Vec::new();
+    for entry in rd.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if !ft.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(String::from) else {
+            continue;
+        };
+        if is_infra_dir(&name) {
+            continue;
+        }
+        let counts = count_statuses(&entry.path());
+        if counts.is_empty() {
+            continue;
+        }
+        let total = counts.values().sum();
+        groups.push(ArtifactStatusGroup {
+            dir: format!(".ccteam/{name}"),
+            total,
+            counts,
+        });
+    }
+    groups.sort_by(|a, b| a.dir.cmp(&b.dir));
+    Ok(groups)
+}
+
+fn is_infra_dir(name: &str) -> bool {
+    name.starts_with('.')
+        || name.ends_with(".archived")
+        || name.ends_with("-requests")
+        || matches!(name, "rules" | "inbox" | "outbox" | "spawn_requests")
+}
+
+fn count_statuses(dir: &Path) -> BTreeMap<String, u64> {
+    let mut counts: BTreeMap<String, u64> = BTreeMap::new();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return counts;
+    };
+    for entry in rd.flatten() {
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&content) else {
+            continue;
+        };
+        let Some(status) = value.get("status").and_then(|s| s.as_str()) else {
+            continue;
+        };
+        *counts.entry(status.to_string()).or_insert(0) += 1;
+    }
+    counts
+}
+
 /// V0.4.6 F90 — one hourly cost bucket for the cost-history sparkline.
 ///
 /// `hour` is the UTC hour-start RFC3339 timestamp (e.g.
@@ -1219,6 +1317,82 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0]["i"], 1);
         assert_eq!(out[1]["i"], 2);
+    }
+
+    #[test]
+    fn artifact_status_groups_by_top_level_status_field() {
+        let tmp = TempDir::new().unwrap();
+        let paths = fake_paths(tmp.path());
+        let slug = "dev-foo";
+        let ccteam = paths.project_dir(slug).join(".ccteam");
+
+        // issues/: 2 open, 1 closed, plus one file without `.status`
+        // (should be excluded) and one non-JSON file (ignored).
+        let issues = ccteam.join("issues");
+        fs::create_dir_all(&issues).unwrap();
+        fs::write(issues.join("1.json"), json!({"status": "open"}).to_string()).unwrap();
+        fs::write(issues.join("2.json"), json!({"status": "open"}).to_string()).unwrap();
+        fs::write(
+            issues.join("3.json"),
+            json!({"status": "closed"}).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            issues.join("4.json"),
+            json!({"title": "no status"}).to_string(),
+        )
+        .unwrap();
+        fs::write(issues.join("README.md"), "not json").unwrap();
+
+        // prs/: 1 merged.
+        let prs = ccteam.join("prs");
+        fs::create_dir_all(&prs).unwrap();
+        fs::write(
+            prs.join("100.json"),
+            json!({"status": "merged"}).to_string(),
+        )
+        .unwrap();
+
+        // Infrastructure dirs must be ignored even with status-bearing
+        // JSON inside (would otherwise produce noise rows).
+        for skip in [
+            "explore-requests",
+            "fix-requests",
+            "issues.archived",
+            "rules",
+            "inbox",
+            "outbox",
+            "spawn_requests",
+        ] {
+            let d = ccteam.join(skip);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("x.json"), json!({"status": "noise"}).to_string()).unwrap();
+        }
+        // Hidden dir likewise ignored.
+        fs::create_dir_all(ccteam.join(".cache")).unwrap();
+        fs::write(
+            ccteam.join(".cache").join("x.json"),
+            json!({"status": "noise"}).to_string(),
+        )
+        .unwrap();
+
+        let out = artifact_status(slug, &paths).unwrap();
+        assert_eq!(out.len(), 2, "got groups: {out:?}");
+        assert_eq!(out[0].dir, ".ccteam/issues");
+        assert_eq!(out[0].total, 3);
+        assert_eq!(out[0].counts.get("open"), Some(&2));
+        assert_eq!(out[0].counts.get("closed"), Some(&1));
+        assert_eq!(out[1].dir, ".ccteam/prs");
+        assert_eq!(out[1].total, 1);
+        assert_eq!(out[1].counts.get("merged"), Some(&1));
+    }
+
+    #[test]
+    fn artifact_status_returns_empty_when_no_ccteam_dir() {
+        let tmp = TempDir::new().unwrap();
+        let paths = fake_paths(tmp.path());
+        let out = artifact_status("nope", &paths).unwrap();
+        assert!(out.is_empty());
     }
 
     #[test]

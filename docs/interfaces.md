@@ -1288,6 +1288,7 @@ XSS tradeoff:token 出现在 HTML attribute 而非纯 HttpOnly cookie。
 | GET | `/api/v1/projects/{slug}` | `ProjectSummary` | §16.2;§15.3 / §15.3.1 数据的 SPA 形态 |
 | GET | `/api/v1/projects/{slug}/sessions/{sid}` | `SessionDetail` | §16.3;flex session detail 数据(`team_kind != flex` ⇒ 404) |
 | GET | `/api/v1/projects/{slug}/artifact_queue` | `Vec<ArtifactQueueEntry>` | V0.4.6 F90:每个 `Trigger::Watch` 路径的 `{dir, count, oldest_age_s, newest_filename}`,实时 `fs::read_dir`(WorkflowView Artifact Queue 面板)|
+| GET | `/api/v1/projects/{slug}/artifact_status` | `Vec<ArtifactStatusGroup>` | 扫 `<project>/.ccteam/<dir>/*.json` 按 top-level `.status` 字段分组计数(`{dir, total, counts: {status -> count}}`);跳过 `*-requests` / `*.archived` / `rules` / `inbox` / `outbox` / `spawn_requests` / 隐藏目录。零 schema 假设——任何带 `status` 字段的 JSON artifact 都被通用计数(WorkflowView Artifact Status 面板,对位旧 moongpt-harness 的 issue/PR/backlog 计数视图)|
 | GET | `/api/v1/projects/{slug}/cost_history?window=24h\|7d` | `Vec<{hour_ts, cost_usd}>` | V0.4.6 F90:cost trend mini sparkline 数据源;按小时桶聚合 `progress.jsonl::agent_done.cost_usd`(F91 cost SoT) |
 | GET | `/api/v1/projects/{slug}/sessions/active` | `Vec<ActiveSession>` | V0.4.6 F90:per-role live session 列表(`{role, job_id, started_at, cwd, cost_usd}`),WorkflowView agent card 展开消费 |
 | GET | `/api/v1/projects/{slug}/jobs/{job_id}/log?tail=200` | `{job_id, log: string, lines}` | V0.4.6 F90:read-only 读 `~/.claude/jobs/<job_id>/output.log` 尾部;errored agent card 点击 Failure Inspector 用 |

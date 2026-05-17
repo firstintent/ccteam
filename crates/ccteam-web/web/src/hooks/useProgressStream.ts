@@ -47,6 +47,12 @@ export type ProgressEvent = {
   detail: string;
   slug?: string;
   sid?: string;
+  /** Hook payload — present on PreToolUse / PostToolUse events. */
+  tool?: string;
+  /** Hook payload — Bash command line on tool_use events. */
+  cmd?: string;
+  /** Hook payload — relative file path on Read/Edit/Write tool_use events. */
+  file_path?: string;
 };
 
 /** Discriminated union — match the server's three SSE routes 1:1. */

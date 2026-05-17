@@ -58,6 +58,10 @@ pub fn router() -> Router<AppState> {
             get(handle_artifact_queue),
         )
         .route(
+            "/api/v1/projects/{slug}/artifact_status",
+            get(handle_artifact_status),
+        )
+        .route(
             "/api/v1/projects/{slug}/cost_history",
             get(handle_cost_history),
         )
@@ -491,6 +495,36 @@ async fn handle_artifact_queue(
         Ok(entries) => Json(entries).into_response(),
         Err(err) => {
             tracing::error!(slug, %err, "artifact_queue build failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("{err}")})),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// `GET /api/v1/projects/<slug>/artifact_status`
+///
+/// Response: `Vec<ArtifactStatusGroup>` — one entry per non-infra
+/// subdir of `<project>/.ccteam/` containing `*.json` files with a
+/// top-level string `.status` field. Counts are grouped by status
+/// value. Empty result is valid (200 OK).
+async fn handle_artifact_status(
+    State(app): State<AppState>,
+    Path(slug): Path<String>,
+) -> impl IntoResponse {
+    if !app.paths.project_state(&slug).exists() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("project not found: {slug}")})),
+        )
+            .into_response();
+    }
+    match ccteam_core::artifact_status(&slug, &app.paths) {
+        Ok(groups) => Json(groups).into_response(),
+        Err(err) => {
+            tracing::error!(slug, %err, "artifact_status build failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": format!("{err}")})),

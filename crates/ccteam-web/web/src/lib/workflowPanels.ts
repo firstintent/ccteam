@@ -80,6 +80,22 @@ export function fetchArtifactQueue(slug: string): Promise<ArtifactQueueEntry[]> 
   );
 }
 
+/** One artifact-status group. Matches Rust `ArtifactStatusGroup` 1:1. */
+export interface ArtifactStatusGroup {
+  /** Project-relative dir, e.g. ".ccteam/issues" */
+  dir: string;
+  /** Sum of every value in `counts` */
+  total: number;
+  /** Distinct `.status` string -> file count */
+  counts: Record<string, number>;
+}
+
+export function fetchArtifactStatus(slug: string): Promise<ArtifactStatusGroup[]> {
+  return fetchJson<ArtifactStatusGroup[]>(
+    `/api/v1/projects/${encodeURIComponent(slug)}/artifact_status`,
+  );
+}
+
 export function fetchCostHistory(
   slug: string,
   window: "24h" | "7d" = "24h",

@@ -123,10 +123,11 @@ pub use projects::{
     ActiveSessionRefusal,
 };
 pub use queries::{
-    active_sessions, artifact_queue, collect_projects, collect_recent_events, compute_cost_summary,
-    cost_history_buckets, cost_summary, cost_summary_from_events, count_agent_spawns_within,
-    job_log_tail, workflow_summary, ActiveSessionInfo, AgentStatus, ArtifactQueueEntry,
-    CostHistoryBucket, CostSummary, ProjectSummary, WorkflowSummary,
+    active_sessions, artifact_queue, artifact_status, collect_projects, collect_recent_events,
+    compute_cost_summary, cost_history_buckets, cost_summary, cost_summary_from_events,
+    count_agent_spawns_within, job_log_tail, workflow_summary, ActiveSessionInfo, AgentStatus,
+    ArtifactQueueEntry, ArtifactStatusGroup, CostHistoryBucket, CostSummary, ProjectSummary,
+    WorkflowSummary,
 };
 pub use screenshot::{
     probe_font as probe_screenshot_font, render_screenshot, vt100_color_to_rgb, ScreenshotResult,
