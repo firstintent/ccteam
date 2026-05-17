@@ -247,9 +247,12 @@ export default function ProjectDetail() {
         </div>
       )}
 
-      {/* Row 4 — Events Timeline, full width, bounded to 24rem so the
-          tail scrolls internally instead of stretching the page. */}
-      <div className="h-[24rem] flex min-h-0">
+      {/* Row 4 — Events Timeline, full width. Each row is ~25 px
+          (text-xs + py-1 + divide-y), so 80rem ≈ 50 rows visible.
+          The list itself is overflow-auto, so longer tails scroll
+          inside. `max-h` caps to viewport minus a header allowance
+          on shorter screens. */}
+      <div className="h-[80rem] max-h-[calc(100vh-10rem)] flex min-h-0">
         <EventsTimelinePanel
           slug={summary.slug}
           initialEvents={summary.events}
