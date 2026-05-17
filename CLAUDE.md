@@ -10,11 +10,11 @@
 | 项 | 值 |
 |---|---|
 | 主分支 main HEAD | 以 `git rev-parse origin/main` 为准 |
-| Workspace version | **`0.5.0`** |
-| 测试 baseline | **`931/1`**(`cargo test --workspace --locked --no-fail-fast`,1 fail 是 ccteam-web `workflow_summary_reflects_agent_spawn_and_done_events` running_count flake)|
+| Workspace version | **`0.5.1`** |
+| 测试 baseline | **`942/1`**(`cargo test --workspace --locked --no-fail-fast`,1 fail 是 ccteam-web `workflow_summary_reflects_agent_spawn_and_done_events` running_count flake)|
 | Clippy | 0 errors + 18 warnings(pre-existing doc-list drift)|
-| 代码规模 | ~19 kLOC Rust + ~15 kLOC TypeScript |
-| 当前最新版 | **V0.5.0**(F92 + F93a + F93b + F94 + F95 + F96 + F97 + F100 + F101)— 详 `docs/v0-5-0/README.md` |
+| 代码规模 | ~19 kLOC Rust + ~16 kLOC TypeScript |
+| 当前最新版 | **V0.5.1**(F92 + F93a + F93b + F94 + F95 + F96 + F97 + F100 + F101 + F103 + F104 + F105)— 详 `docs/v0-5-1/README.md`(host E2E 暴露的 SPA 可见性 + `--env` argv bug)|
 | V0.5.x 延期候选 | F98 plan-approval↔outbox 联动;Routing/Evaluator-Optimizer sugar — 详 `docs/v0-5-0/prd.md` 末段 + `docs/orchestration-patterns.md §五` |
 | 历史版本 | V0.1 → V0.4.5 见各自 `docs/v0-X-Y/README.md` |
 
