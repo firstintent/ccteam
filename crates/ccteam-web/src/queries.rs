@@ -74,6 +74,12 @@ pub fn events_to_rows(events: &[Value]) -> Vec<EventRow> {
                 .unwrap_or("(unknown)")
                 .to_string(),
             detail: short_detail(e),
+            tool: e.get("tool").and_then(|s| s.as_str()).map(String::from),
+            cmd: e.get("cmd").and_then(|s| s.as_str()).map(String::from),
+            file_path: e
+                .get("file_path")
+                .and_then(|s| s.as_str())
+                .map(String::from),
         })
         .collect()
 }

@@ -249,10 +249,12 @@ export default function ProjectDetail() {
 
       {/* Row 4 — Events Timeline, full width. Each row is ~25 px
           (text-xs + py-1 + divide-y), so 80rem ≈ 50 rows visible.
-          The list itself is overflow-auto, so longer tails scroll
-          inside. `max-h` caps to viewport minus a header allowance
-          on shorter screens. */}
-      <div className="h-[80rem] max-h-[calc(100vh-10rem)] flex min-h-0">
+          Inline style instead of Tailwind arbitrary classes — JIT
+          purging stripped `h-[80rem]` + the calc() bracket. */}
+      <div
+        className="flex min-h-0"
+        style={{ height: "80rem", maxHeight: "calc(100vh - 8rem)" }}
+      >
         <EventsTimelinePanel
           slug={summary.slug}
           initialEvents={summary.events}

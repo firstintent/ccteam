@@ -63,6 +63,15 @@ pub struct EventRow {
     pub ts: String,
     pub event: String,
     pub detail: String,
+    /// Hook payload (`PreToolUse` / `PostToolUse`) — preserved so the
+    /// SPA's events panel can render tool-use rows the same way for
+    /// REST-seeded and SSE-pushed events.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cmd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
 }
 
 #[derive(Serialize)]
