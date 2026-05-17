@@ -27,7 +27,6 @@ import {
 import { BtwForm } from "../components/BtwForm";
 import { PauseResumeButtons } from "../components/PauseResumeButtons";
 import WorkflowView from "./WorkflowView";
-import ArtifactQueuePanel from "../components/ArtifactQueuePanel";
 import ArtifactStatusPanel from "../components/ArtifactStatusPanel";
 import EventsTimelinePanel from "../components/EventsTimelinePanel";
 import CostSparkline from "../components/CostSparkline";
@@ -185,17 +184,15 @@ export default function ProjectDetail() {
 
   return (
     <div className="flex flex-col h-full min-h-0 overflow-auto p-4 gap-4">
-      {/* TOP — identity row + pause/resume */}
+      {/* TOP — slim identity row. team/kind shown only on hover so we
+          spend the prime real estate on the panels below. */}
       <header className="flex flex-wrap items-baseline gap-3">
-        <h1 className="text-lg font-semibold text-text-bright">
+        <h1
+          className="text-lg font-semibold text-text-bright"
+          title={`team=${summary.team} · kind=${summary.kind}`}
+        >
           {summary.slug}
         </h1>
-        <span className="text-xs text-text-secondary font-mono">
-          team={summary.team}
-        </span>
-        <span className="text-xs text-text-secondary font-mono">
-          kind={summary.kind}
-        </span>
         <StatusBadge cls={summary.badge_class} label={summary.badge_label} />
         <span className="text-xs text-text-dim font-mono ml-auto">
           cost ${summary.cost_label}
@@ -216,30 +213,30 @@ export default function ProjectDetail() {
         </nav>
       )}
 
-      {/* Workflow view (V0.4.0 F68 + V0.4.6 F90) — renders agent cards
-          + artifact counts + gate chips. Each agent card expands on
-          click (F90) to show live session details. `workflow_summary`
-          is null for legacy projects without workflow.yaml; the
-          component renders a friendly "no workflow.yaml" hint in that
-          case. */}
+      {/* High-signal panels at the top: cost trend (2-col, wide) +
+          artifact status counts (1-col). ArtifactQueuePanel was dropped
+          — marker dirs are almost always empty, and the per-trigger
+          watch path is already surfaced on the WorkflowView agent cards
+          below. */}
+      {summary.workflow_summary && (
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+          <div className="lg:col-span-2">
+            <CostSparkline slug={summary.slug} reloadKey={reloadTick} />
+          </div>
+          <ArtifactStatusPanel slug={summary.slug} reloadKey={reloadTick} />
+        </div>
+      )}
+
+      {/* Workflow view — agent cards + per-trigger watch counts +
+          gate chips. `workflow_summary` is null for legacy projects
+          without workflow.yaml; the component renders a friendly
+          "no workflow.yaml" hint in that case. */}
       {summary.workflow_summary && (
         <WorkflowView
           slug={summary.slug}
           summary={summary.workflow_summary}
           onReload={triggerReload}
         />
-      )}
-
-      {/* V0.4.6 F90 — three new sibling panels (artifact queue, cost
-          sparkline, events timeline) wired only for workflow projects.
-          Legacy V0.3 sessions stay on the original two-column layout
-          below so flex-with-sessions surfaces aren't disrupted. */}
-      {summary.workflow_summary && (
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-          <ArtifactQueuePanel slug={summary.slug} reloadKey={reloadTick} />
-          <ArtifactStatusPanel slug={summary.slug} reloadKey={reloadTick} />
-          <CostSparkline slug={summary.slug} reloadKey={reloadTick} />
-        </div>
       )}
 
       {/* Main two-column layout: events timeline + (BTW form + outbox).
