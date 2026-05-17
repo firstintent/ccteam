@@ -213,24 +213,13 @@ export default function ProjectDetail() {
         </nav>
       )}
 
-      {/* High-signal panels at the top: cost trend (2-col, wide) +
-          artifact status counts (1-col). ArtifactQueuePanel was dropped
-          — marker dirs are almost always empty, and the per-trigger
-          watch path is already surfaced on the WorkflowView agent cards
-          below. */}
+      {/* Row 1 — Cost Trend, full width. Sparkline benefits the most
+          from horizontal space. */}
       {summary.workflow_summary && (
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-          <div className="lg:col-span-2">
-            <CostSparkline slug={summary.slug} reloadKey={reloadTick} />
-          </div>
-          <ArtifactStatusPanel slug={summary.slug} reloadKey={reloadTick} />
-        </div>
+        <CostSparkline slug={summary.slug} reloadKey={reloadTick} />
       )}
 
-      {/* Workflow view — agent cards + per-trigger watch counts +
-          gate chips. `workflow_summary` is null for legacy projects
-          without workflow.yaml; the component renders a friendly
-          "no workflow.yaml" hint in that case. */}
+      {/* Row 2 — Workflow agent topology, full width. */}
       {summary.workflow_summary && (
         <WorkflowView
           slug={summary.slug}
@@ -239,25 +228,32 @@ export default function ProjectDetail() {
         />
       )}
 
-      {/* Main two-column layout: events timeline + (BTW form + outbox).
-          The timeline panel is bounded to 24rem so a long event tail
-          scrolls internally instead of stretching the whole page. */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 min-h-0 flex-1">
-        <div className="lg:col-span-2 h-[24rem] flex">
-          <EventsTimelinePanel
-            slug={summary.slug}
-            initialEvents={summary.events}
-          />
+      {/* Row 3 — Artifact Status (2-col, wide so backlog's 4 status
+          pills don't wrap) + operator side rail with BTW + Outbox. */}
+      {summary.workflow_summary && (
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+          <div className="lg:col-span-2">
+            <ArtifactStatusPanel slug={summary.slug} reloadKey={reloadTick} />
+          </div>
+          <div className="flex flex-col gap-4">
+            <section className="border border-surface-700/40 rounded-md bg-surface-850 p-3">
+              <h3 className="text-xs uppercase tracking-wide text-text-secondary mb-2">
+                BTW (inject note)
+              </h3>
+              <BtwForm slug={summary.slug} onSuccess={triggerReload} />
+            </section>
+            <OutboxList rows={summary.outbox} />
+          </div>
         </div>
-        <div className="min-h-[24rem] flex flex-col gap-4">
-          <section className="border border-surface-700/40 rounded-md bg-surface-850 p-3">
-            <h3 className="text-xs uppercase tracking-wide text-text-secondary mb-2">
-              BTW (inject note)
-            </h3>
-            <BtwForm slug={summary.slug} onSuccess={triggerReload} />
-          </section>
-          <OutboxList rows={summary.outbox} />
-        </div>
+      )}
+
+      {/* Row 4 — Events Timeline, full width, bounded to 24rem so the
+          tail scrolls internally instead of stretching the page. */}
+      <div className="h-[24rem] flex min-h-0">
+        <EventsTimelinePanel
+          slug={summary.slug}
+          initialEvents={summary.events}
+        />
       </div>
     </div>
   );

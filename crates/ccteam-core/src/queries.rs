@@ -1033,6 +1033,17 @@ pub struct ActiveSessionInfo {
     /// Live cumulative cost from state.json (`cost_usd` or
     /// `cost_usd_total`); `0.0` when state.json missing.
     pub cost_usd: f64,
+    /// Model id extracted from `state.json::respawnFlags` (value
+    /// following `--model`). `None` when flag absent / state.json
+    /// unreadable.
+    pub model: Option<String>,
+    /// Estimated context-window remaining percentage in `[0.0, 100.0]`,
+    /// derived from the most recent `message.usage` block in the
+    /// session JSONL transcript (`linkScanPath`) divided by the model's
+    /// context window size. `None` until the transcript has been
+    /// written (i.e. the agent hasn't yet completed its first turn) or
+    /// when the model id is unknown.
+    pub context_remaining_pct: Option<f64>,
 }
 
 /// V0.4.6 F90 — enumerate every project's "open" agent_spawn (no
@@ -1074,17 +1085,19 @@ pub fn active_sessions(slug: &str, paths: &CcteamPaths) -> Result<Vec<ActiveSess
         // Probe state.json for live cwd + cost. We re-use the same
         // parser claude_job uses (parse_cc_state_json reads the same
         // `cost_usd*` keys + `cwd`/`workdir`).
-        let (cwd, cost_usd) = match &job_id {
+        let probe = match &job_id {
             Some(id) => probe_active_session_state(id),
-            None => (None, 0.0),
+            None => SessionProbe::default(),
         };
         out.push(ActiveSessionInfo {
             role,
             session_id: sid,
             job_id,
-            cwd,
+            cwd: probe.cwd,
             started_at,
-            cost_usd,
+            cost_usd: probe.cost_usd,
+            model: probe.model,
+            context_remaining_pct: probe.context_remaining_pct,
         });
     }
     // Sort: role, then started_at ascending so consecutive sessions of
@@ -1097,13 +1110,21 @@ pub fn active_sessions(slug: &str, paths: &CcteamPaths) -> Result<Vec<ActiveSess
     Ok(out)
 }
 
-fn probe_active_session_state(job_id: &str) -> (Option<String>, f64) {
+#[derive(Debug, Default)]
+struct SessionProbe {
+    cwd: Option<String>,
+    cost_usd: f64,
+    model: Option<String>,
+    context_remaining_pct: Option<f64>,
+}
+
+fn probe_active_session_state(job_id: &str) -> SessionProbe {
     let path = crate::harness::state_json_path(job_id);
     let Ok(raw) = std::fs::read_to_string(&path) else {
-        return (None, 0.0);
+        return SessionProbe::default();
     };
     let Ok(value) = serde_json::from_str::<Value>(&raw) else {
-        return (None, 0.0);
+        return SessionProbe::default();
     };
     let cwd = value
         .get("cwd")
@@ -1115,7 +1136,131 @@ fn probe_active_session_state(job_id: &str) -> (Option<String>, f64) {
         .or_else(|| value.get("cost_usd_total"))
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0);
-    (cwd, cost_usd)
+    let model = model_from_respawn_flags(&value);
+    let context_remaining_pct = model
+        .as_deref()
+        .and_then(|m| context_remaining_for(&value, m));
+
+    SessionProbe {
+        cwd,
+        cost_usd,
+        model,
+        context_remaining_pct,
+    }
+}
+
+/// Find the value immediately after `--model` in
+/// `state.json::respawnFlags`. Returns `None` when the array is
+/// missing or the flag isn't present.
+fn model_from_respawn_flags(state: &Value) -> Option<String> {
+    let flags = state.get("respawnFlags")?.as_array()?;
+    let mut it = flags.iter();
+    while let Some(item) = it.next() {
+        if item.as_str() == Some("--model") {
+            return it.next().and_then(|v| v.as_str()).map(String::from);
+        }
+    }
+    None
+}
+
+/// Model id → context window size in tokens. Claude Code's `[1m]`
+/// suffix marks the 1M-context tier; everything else gets the standard
+/// 200K window. Unknown providers fall back to 200K as well — the
+/// percentage will still be useful as a relative trend even if the
+/// absolute cap is wrong.
+fn context_window_size(model: &str) -> u64 {
+    if model.contains("[1m]") {
+        1_000_000
+    } else {
+        200_000
+    }
+}
+
+/// Best-effort compute the context-remaining percentage by tailing
+/// the session JSONL (`linkScanPath`) and reading the most recent
+/// `message.usage` block. Returns `None` when the path is missing,
+/// the file empty, or no `usage` block can be located.
+fn context_remaining_for(state: &Value, model: &str) -> Option<f64> {
+    let jsonl = state.get("linkScanPath")?.as_str()?;
+    let usage = last_usage_in_jsonl(std::path::Path::new(jsonl))?;
+    let used = usage.input_tokens
+        + usage.cache_creation_input_tokens
+        + usage.cache_read_input_tokens
+        + usage.output_tokens;
+    let window = context_window_size(model);
+    if window == 0 {
+        return None;
+    }
+    let pct = 100.0 * (1.0 - (used as f64 / window as f64));
+    Some(pct.clamp(0.0, 100.0))
+}
+
+#[derive(Debug, Default)]
+struct UsageTokens {
+    input_tokens: u64,
+    cache_creation_input_tokens: u64,
+    cache_read_input_tokens: u64,
+    output_tokens: u64,
+}
+
+/// Find the most recent `.message.usage` object in a Claude Code
+/// session JSONL. Reads the tail (last 64 KiB) so we don't pay for
+/// long-running sessions whose transcripts grow to tens of MB.
+fn last_usage_in_jsonl(path: &std::path::Path) -> Option<UsageTokens> {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL_BYTES: u64 = 64 * 1024;
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(TAIL_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = String::new();
+    file.read_to_string(&mut buf).ok()?;
+
+    // Walk lines newest → oldest, parse each as JSON, and stop at the
+    // first one carrying `.message.usage`. The tail slice may start
+    // mid-line; we skip the first (possibly truncated) line on the
+    // backwards walk to avoid mis-parsing a partial JSON object.
+    let lines: Vec<&str> = buf.lines().collect();
+    let skip_first = start > 0;
+    for (idx, line) in lines.iter().enumerate().rev() {
+        if skip_first && idx == 0 {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        let Some(usage) = value
+            .get("message")
+            .and_then(|m| m.get("usage"))
+            .filter(|u| u.is_object())
+        else {
+            continue;
+        };
+        return Some(UsageTokens {
+            input_tokens: usage
+                .get("input_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            cache_creation_input_tokens: usage
+                .get("cache_creation_input_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            cache_read_input_tokens: usage
+                .get("cache_read_input_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            output_tokens: usage
+                .get("output_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+        });
+    }
+    None
 }
 
 /// V0.4.6 F90 — read the tail of a claude bg job's `output.log`.
@@ -1385,6 +1530,103 @@ mod tests {
         assert_eq!(out[1].dir, ".ccteam/prs");
         assert_eq!(out[1].total, 1);
         assert_eq!(out[1].counts.get("merged"), Some(&1));
+    }
+
+    #[test]
+    fn model_from_respawn_flags_extracts_value() {
+        let v = json!({
+            "respawnFlags": [
+                "--agent", "explorer",
+                "--dangerously-skip-permissions",
+                "--model", "deepseek-v4-pro[1m]",
+            ]
+        });
+        assert_eq!(
+            model_from_respawn_flags(&v),
+            Some("deepseek-v4-pro[1m]".into())
+        );
+    }
+
+    #[test]
+    fn model_from_respawn_flags_none_when_flag_missing() {
+        let v = json!({"respawnFlags": ["--agent", "explorer"]});
+        assert_eq!(model_from_respawn_flags(&v), None);
+    }
+
+    #[test]
+    fn context_window_size_matches_1m_suffix() {
+        assert_eq!(context_window_size("claude-opus-4-7[1m]"), 1_000_000);
+        assert_eq!(context_window_size("deepseek-v4-pro[1m]"), 1_000_000);
+        assert_eq!(context_window_size("claude-sonnet-4-6"), 200_000);
+        assert_eq!(context_window_size("unknown"), 200_000);
+    }
+
+    #[test]
+    fn last_usage_in_jsonl_finds_most_recent() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        let body = format!(
+            "{}\n{}\n{}\n",
+            json!({"type": "user", "message": {"role": "user", "content": "hi"}}),
+            json!({
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "usage": {
+                        "input_tokens": 100,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 1000,
+                        "output_tokens": 50
+                    }
+                }
+            }),
+            json!({
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "usage": {
+                        "input_tokens": 200,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 5000,
+                        "output_tokens": 100
+                    }
+                }
+            }),
+        );
+        fs::write(&path, body).unwrap();
+        let usage = last_usage_in_jsonl(&path).unwrap();
+        // Newest wins.
+        assert_eq!(usage.input_tokens, 200);
+        assert_eq!(usage.cache_read_input_tokens, 5000);
+        assert_eq!(usage.output_tokens, 100);
+    }
+
+    #[test]
+    fn context_remaining_for_computes_percentage() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        // 100K context used out of 1M (deepseek [1m]) → 90% remaining.
+        let usage = json!({
+            "type": "assistant",
+            "message": {
+                "usage": {
+                    "input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 100_000,
+                    "output_tokens": 0
+                }
+            }
+        });
+        fs::write(&path, format!("{usage}\n")).unwrap();
+        let state = json!({"linkScanPath": path.to_str().unwrap()});
+        let pct = context_remaining_for(&state, "deepseek-v4-pro[1m]").unwrap();
+        assert!((pct - 90.0).abs() < 0.01, "got {pct}");
+    }
+
+    #[test]
+    fn context_remaining_for_none_when_jsonl_missing() {
+        let state = json!({"linkScanPath": "/no/such/path.jsonl"});
+        assert_eq!(context_remaining_for(&state, "claude-sonnet-4-6"), None);
     }
 
     #[test]

@@ -47,6 +47,11 @@ export interface ActiveSessionInfo {
   cwd: string | null;
   started_at: string;
   cost_usd: number;
+  /** Model id parsed from `state.json::respawnFlags[--model]`. */
+  model: string | null;
+  /** Context-window remaining percentage `[0, 100]`, or null when the
+   *  session transcript isn't yet written / parseable. */
+  context_remaining_pct: number | null;
 }
 
 /** Response shape from `jobs/<job_id>/log`. */

@@ -210,6 +210,21 @@ function AgentCard({
                   <span className="text-text-dim truncate" title={s.cwd ?? ""}>
                     cwd: {basename(s.cwd)}
                   </span>
+                  {(s.model || s.context_remaining_pct != null) && (
+                    <span
+                      className="text-text-dim truncate"
+                      title="model | context-window remaining"
+                    >
+                      {s.model ?? "—"}
+                      {s.context_remaining_pct != null && (
+                        <>
+                          {" | Context: "}
+                          {Math.round(s.context_remaining_pct)}
+                          {"% remaining"}
+                        </>
+                      )}
+                    </span>
+                  )}
                 </div>
                 <div className="flex flex-col items-end shrink-0">
                   <span className="text-text-dim">
