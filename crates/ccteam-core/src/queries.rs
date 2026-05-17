@@ -366,37 +366,27 @@ where
     }
 
     // Active cost: probe each open agent_spawn's job_id. `Running`
-    // verdicts contribute 0.0 here because the live cost field on
-    // state.json gets read directly below via the inner classify; the
-    // closure abstraction lets tests stub the value.
+    // verdicts route through `transcript_scanner::session_cost_from_jsonl`
+    // because state.json::cost_usd_total reads `0` on the host (V0.4.6
+    // probe). `Terminal` verdicts carry the same transcript-derived cost
+    // (claude_job::classify now does the fallback internally) so we can
+    // surface it for stale sessions before the synthetic agent_done is
+    // written.
     let open = open_agent_spawns(events);
     let mut cost_active_usd = 0.0;
     let session_count_active = open.len() as u32;
     for (_sid, job_id, _role) in open {
         match probe(job_id.as_deref()) {
-            // Running session: read state.json directly for cost_usd
-            // (claude_job::probe_job returns Terminal only on terminal
-            // signals; live cost lives in state.json::cost_usd_total).
             crate::claude_job::JobLiveness::Running => {
                 if let Some(id) = job_id.as_deref() {
                     let path = crate::claude_job::job_state_path(id);
                     if let Ok(raw) = std::fs::read_to_string(&path) {
                         if let Ok(v) = serde_json::from_str::<Value>(&raw) {
-                            cost_active_usd += v
-                                .get("cost_usd_total")
-                                .or_else(|| v.get("cost_usd"))
-                                .and_then(|n| n.as_f64())
-                                .unwrap_or(0.0);
+                            cost_active_usd += crate::claude_job::resolve_cost_usd(&v);
                         }
                     }
                 }
             }
-            // Terminal probes report cost via JobLiveness::Terminal —
-            // that cost is the same value we'd read from state.json,
-            // but for stale sessions Claude has already finalized it.
-            // Surface it under cost_active_usd so SPA / budget cap see
-            // it before the orchestrator's next poll writes the
-            // synthetic agent_done that retires the spawn.
             crate::claude_job::JobLiveness::Terminal {
                 status: _,
                 cost_usd,

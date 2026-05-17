@@ -1092,6 +1092,10 @@ pub struct DoctorOptions {
     /// `ccteam hook cost-accumulate` PostToolUse entry. `dry_run = true`
     /// previews the scrub without writing. Idempotent.
     pub update_hooks: bool,
+    /// V0.5.0 F92: print the embedded `pricing.json::schema_version`
+    /// alongside today's date and WARN when the embedded table is
+    /// older than 180 days. Pure-readout — no fs mutation.
+    pub check_pricing_version: bool,
 }
 
 /// `ccteam doctor` dispatch. Returns a human-readable report so unit
@@ -1109,7 +1113,8 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
         || opts.migrate_v041_to_v042
         || opts.migrate_workflow_to_ccteam_dir
         || opts.gc_claude_jobs
-        || opts.update_hooks;
+        || opts.update_hooks
+        || opts.check_pricing_version;
     if !any_mode {
         return Ok(String::from(
             "ccteam doctor: pass at least one mode flag.\n\
@@ -1145,7 +1150,9 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
              --gc-claude-jobs [--apply]\n      \
              reclaim terminated ~/.claude/jobs/<id>/ dirs older than ~/.ccteam/config.yaml::claude_jobs_retention_days (default 7 days; 0 disables). Default is dry-run; --apply commits removals (V0.4.6 F85).\n  \
              --update-hooks [--dry-run]\n      \
-             walk every registered project's .claude/settings.json and strip the retired `ccteam hook cost-accumulate` entry. Idempotent (V0.4.6 F91).\n",
+             walk every registered project's .claude/settings.json and strip the retired `ccteam hook cost-accumulate` entry. Idempotent (V0.4.6 F91).\n  \
+             --check-pricing-version\n      \
+             print the embedded pricing.json schema_version next to today's date; WARN when the embedded table is older than 180 days (V0.5.0 F92).\n",
         ));
     }
     let mut out = String::new();
@@ -1205,6 +1212,9 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
     }
     if opts.update_hooks {
         out.push_str(&render_update_hooks_report(paths, opts.dry_run)?);
+    }
+    if opts.check_pricing_version {
+        out.push_str(&render_check_pricing_version_report());
     }
     // V0.3.1 F47 — informational codex CLI detection. Appends one line
     // to every successful doctor run (any_mode == true) so operators
@@ -1289,7 +1299,10 @@ fn render_gc_claude_jobs_report(paths: &CcteamPaths, apply: bool) -> Result<Stri
             "apply"
         }
     ));
-    out.push_str(&format!("  dir_count_before: {}\n", report.dir_count_before));
+    out.push_str(&format!(
+        "  dir_count_before: {}\n",
+        report.dir_count_before
+    ));
     out.push_str(&format!("  dir_count_after:  {}\n", report.dir_count_after));
     out.push_str(&format!(
         "  removed:       {}\n  kept_working:  {}\n  kept_recent:   {}\n  kept_corrupt:  {}\n  kept_unknown:  {}\n",
@@ -1668,6 +1681,46 @@ fn render_update_hooks_report(paths: &CcteamPaths, dry_run: bool) -> Result<Stri
     }
     out.push('\n');
     Ok(out)
+}
+
+/// V0.5.0 F92: print the embedded `pricing.json::schema_version`
+/// alongside today's date. WARN when the table is older than 180 days
+/// so operators upgrade ccteam before the dollar numbers drift far
+/// from anthropic.com.
+fn render_check_pricing_version_report() -> String {
+    let mut out = String::from("ccteam doctor --check-pricing-version (V0.5.0 F92)\n\n");
+    let version = ccteam_core::pricing_schema_version();
+    let today = chrono::Utc::now().date_naive();
+    out.push_str(&format!("  pricing.json schema_version: {version}\n"));
+    out.push_str(&format!("  today (UTC):                 {today}\n"));
+
+    // The version is authored as `YYYY-MM-DD`. Anything else is a build
+    // error (the embedded JSON would fail to parse) — but if a future
+    // schema ever loosens the format we tolerate the parse miss with a
+    // soft note rather than panicking the doctor command.
+    match chrono::NaiveDate::parse_from_str(version, "%Y-%m-%d") {
+        Ok(authored) => {
+            let age_days = (today - authored).num_days();
+            out.push_str(&format!("  age:                         {age_days} days\n"));
+            if age_days > 180 {
+                out.push_str(&format!(
+                    "\n  [WARN] pricing.json is {age_days} days old (> 180). \
+                     Upgrade ccteam to refresh the bundled rate sheet \
+                     (see crates/ccteam-core/src/pricing.json).\n",
+                ));
+            } else {
+                out.push_str("\n  pricing table is fresh (< 180 days).\n");
+            }
+        }
+        Err(_) => {
+            out.push_str(
+                "\n  [note] schema_version did not parse as YYYY-MM-DD; \
+                 staleness check skipped.\n",
+            );
+        }
+    }
+    out.push('\n');
+    out
 }
 
 /// Resolve a project's on-disk directory from `~/.ccteam/config.yaml`
@@ -2341,8 +2394,7 @@ pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Resul
                  daemon will pick up config drop on next rescan"
             )),
             Ok(()) => {
-                let deadline =
-                    std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
                 let mut acknowledged = false;
                 while std::time::Instant::now() < deadline {
                     std::thread::sleep(std::time::Duration::from_millis(100));

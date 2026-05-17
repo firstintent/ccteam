@@ -21,12 +21,32 @@
 //! - `t05_doctor_update_hooks_removes_cost_accumulate` — settings.json
 //!   containing the legacy `ccteam hook cost-accumulate` PostToolUse
 //!   entry is scrubbed by `remove_cost_accumulate_hooks`.
+//!
+//! V0.5.0 F92 — six new tests covering the transcript-jsonl cost path:
+//!
+//! - `t06_linkScanPath_present_sums_usage` — happy path: state.json has
+//!   linkScanPath + respawnFlags --model; transcript has multi-turn
+//!   usage; computed cost within ±5% of hand-calculated dollars.
+//! - `t07_state_json_field_zero_falls_back_to_transcript` — pure
+//!   pricing path through `classify` when state.json's cost field is 0.
+//! - `t08_linkScanPath_missing_falls_back_to_state_json` — no
+//!   linkScanPath, no sessionId, only state.json::cost_usd_total = 0.42
+//!   → cost = 0.42.
+//! - `t09_memoize_second_call_no_reread` — second `sum_usage` call on
+//!   same fixture file doesn't re-open the file (`file_read_count`).
+//! - `t10_multi_model_pricing` — per-1M-token dollar values for
+//!   sonnet-4-6 / opus-4-7 / haiku-4-5 within $0.01 of hand-calculated.
+//! - `t11_budget_cap_triggers_with_transcript_cost` — transcript-derived
+//!   cost flows into `compute_cost_summary().cost_active_usd` so the F84
+//!   budget cap path can compare against threshold.
 
 use std::fs;
 
+use ccteam_core::transcript_scanner::{file_read_count, reset_cache_for_tests};
 use ccteam_core::{
-    compute_cost_summary, cost_summary, progress, remove_cost_accumulate_hooks, CcteamPaths,
-    CostAccumulateScrubAction, JobLiveness, ProjectState,
+    compute_cost_summary, cost_summary, estimate_cost, progress, remove_cost_accumulate_hooks,
+    session_cost_from_jsonl, CcteamPaths, CostAccumulateScrubAction, JobLiveness, ProjectState,
+    Usage,
 };
 use chrono::{Duration, Utc};
 use serde_json::json;
@@ -253,5 +273,255 @@ fn t05_doctor_update_hooks_removes_cost_accumulate() {
         matches!(again.action, CostAccumulateScrubAction::NoChangeNeeded),
         "second scrub must be no-op, got {:?}",
         again.action,
+    );
+}
+
+// ============================================================
+// V0.5.0 F92 — transcript-jsonl cost source tests (t06..t11).
+// One test per acceptance bullet in `docs/v0-5-0/prd.md` §F92 §验收.
+// ============================================================
+
+/// Build a transcript JSONL with `turns` rows; each row carries one
+/// `message.usage` block with the supplied counters. Returns the path
+/// the body was written to.
+fn write_transcript(path: &std::path::Path, turns: &[(u64, u64, u64, u64)]) {
+    let mut body = String::new();
+    for &(input, cache_create, cache_read, output) in turns {
+        let line = json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "usage": {
+                    "input_tokens": input,
+                    "cache_creation_input_tokens": cache_create,
+                    "cache_read_input_tokens": cache_read,
+                    "output_tokens": output,
+                }
+            }
+        });
+        body.push_str(&line.to_string());
+        body.push('\n');
+    }
+    fs::write(path, body).unwrap();
+}
+
+#[test]
+fn t06_link_scan_path_present_sums_usage() {
+    reset_cache_for_tests();
+    let tmp = TempDir::new().unwrap();
+    let transcript = tmp.path().join("sess.jsonl");
+    // Three assistant turns on sonnet-4-6 (input $3 / cache-create $3.75
+    // / cache-read $0.30 / output $15 per 1M).
+    write_transcript(
+        &transcript,
+        &[
+            (10_000, 0, 0, 5_000),
+            (5_000, 1_000, 2_000, 3_000),
+            (0, 0, 8_000, 1_000),
+        ],
+    );
+
+    // Hand-calc expected dollars for sonnet-4-6:
+    //   input  = (10_000 + 5_000 + 0)        * 3.00  / 1M = 0.045
+    //   create = (0 + 1_000 + 0)             * 3.75  / 1M = 0.00375
+    //   read   = (0 + 2_000 + 8_000)         * 0.30  / 1M = 0.003
+    //   output = (5_000 + 3_000 + 1_000)     * 15.00 / 1M = 0.135
+    //   total  ≈ 0.18675
+    let expected = 0.045 + 0.00375 + 0.003 + 0.135;
+
+    let state = json!({
+        "linkScanPath": transcript.to_str().unwrap(),
+        "respawnFlags": ["--model", "claude-sonnet-4-6"],
+        "state": "working",
+    });
+    let got = session_cost_from_jsonl(&state, "claude-sonnet-4-6").unwrap();
+    let drift = (got - expected).abs() / expected;
+    assert!(
+        drift < 0.05,
+        "expected ${expected:.6} ± 5%, got ${got:.6} (drift={drift})",
+    );
+}
+
+#[test]
+fn t07_state_json_field_zero_falls_back_to_transcript() {
+    reset_cache_for_tests();
+    let tmp = TempDir::new().unwrap();
+    let transcript = tmp.path().join("sess.jsonl");
+    write_transcript(&transcript, &[(1_000_000, 0, 0, 0)]);
+    // input_tokens × $5 / 1M on opus-4-7 = $5.00.
+    let state = json!({
+        "linkScanPath": transcript.to_str().unwrap(),
+        "respawnFlags": ["--model", "claude-opus-4-7"],
+        "state": "working",
+        // Per F92 PRD: state.json's own cost reads 0 in production.
+        "cost_usd_total": 0,
+        "firstTerminalAt": "2026-05-15T12:00:00Z",
+    });
+    let liveness = ccteam_core::classify_job_state(&state);
+    let cost = match liveness {
+        JobLiveness::Terminal { cost_usd, .. } => cost_usd,
+        JobLiveness::Running => panic!("expected terminal verdict from firstTerminalAt"),
+    };
+    // Within 1 cent of $5.00.
+    assert!(
+        (cost - 5.0).abs() < 0.01,
+        "expected ~$5.00 from transcript fallback, got ${cost}",
+    );
+}
+
+#[test]
+fn t08_link_scan_path_missing_falls_back_to_state_json() {
+    reset_cache_for_tests();
+    ccteam_core::reset_link_scan_warn_for_tests();
+    // No linkScanPath, no cwd / sessionId, only state.json's cost field.
+    let state = json!({
+        "sessionId": "t08-unique-sid",
+        "state": "done",
+        "cost_usd_total": 0.42,
+    });
+    let before = ccteam_core::link_scan_warn_count();
+    let liveness = ccteam_core::classify_job_state(&state);
+    let after = ccteam_core::link_scan_warn_count();
+    match liveness {
+        JobLiveness::Terminal { cost_usd, status } => {
+            assert_eq!(status, "completed");
+            assert!(
+                (cost_usd - 0.42).abs() < 1e-9,
+                "expected 0.42 fallback, got {cost_usd}",
+            );
+        }
+        other => panic!("expected terminal, got {other:?}"),
+    }
+    assert_eq!(
+        after - before,
+        1,
+        "expected exactly one WARN for the linkScanPath miss; got delta {}",
+        after - before,
+    );
+    // Re-classify with the same session id — WARN dedup must suppress
+    // a second emit.
+    let liveness2 = ccteam_core::classify_job_state(&state);
+    let after2 = ccteam_core::link_scan_warn_count();
+    assert!(matches!(liveness2, JobLiveness::Terminal { .. }));
+    assert_eq!(
+        after2 - after,
+        0,
+        "second classify of same sid must not re-WARN; got delta {}",
+        after2 - after,
+    );
+}
+
+#[test]
+fn t09_memoize_second_call_no_reread() {
+    reset_cache_for_tests();
+    let tmp = TempDir::new().unwrap();
+    let transcript = tmp.path().join("sess.jsonl");
+    write_transcript(&transcript, &[(1_000, 0, 0, 500)]);
+    let state = json!({
+        "linkScanPath": transcript.to_str().unwrap(),
+        "respawnFlags": ["--model", "claude-sonnet-4-6"],
+    });
+    let first = session_cost_from_jsonl(&state, "claude-sonnet-4-6").unwrap();
+    let reads_after_first = file_read_count();
+    assert!(reads_after_first >= 1, "first call must read disk");
+    let second = session_cost_from_jsonl(&state, "claude-sonnet-4-6").unwrap();
+    let reads_after_second = file_read_count();
+    assert!(
+        (first - second).abs() < 1e-12,
+        "memoized result must equal first ({first} vs {second})",
+    );
+    assert_eq!(
+        reads_after_first, reads_after_second,
+        "second call must NOT re-read the file (cache miss leaked through)",
+    );
+}
+
+#[test]
+fn t10_multi_model_pricing() {
+    // Pure pricing.rs — no IO. Each row = 1M input tokens × per-1M
+    // input rate from anthropic.com/pricing on 2026-05-17.
+    let one_m_input = Usage {
+        input_tokens: 1_000_000,
+        ..Default::default()
+    };
+    assert!(
+        (estimate_cost("claude-sonnet-4-6", &one_m_input) - 3.0).abs() < 0.01,
+        "sonnet-4-6 input != $3 / 1M",
+    );
+    assert!(
+        (estimate_cost("claude-opus-4-7", &one_m_input) - 5.0).abs() < 0.01,
+        "opus-4-7 input != $5 / 1M",
+    );
+    assert!(
+        (estimate_cost("claude-haiku-4-5", &one_m_input) - 1.0).abs() < 0.01,
+        "haiku-4-5 input != $1 / 1M",
+    );
+
+    // Output side too — opus-4-7 output is $25 / 1M.
+    let one_m_output = Usage {
+        output_tokens: 1_000_000,
+        ..Default::default()
+    };
+    assert!(
+        (estimate_cost("claude-opus-4-7", &one_m_output) - 25.0).abs() < 0.01,
+        "opus-4-7 output != $25 / 1M",
+    );
+    // 1M-context suffix passes through.
+    assert!(
+        (estimate_cost("claude-opus-4-7[1m]", &one_m_output) - 25.0).abs() < 0.01,
+        "opus-4-7[1m] suffix must resolve to opus-4-7",
+    );
+}
+
+#[test]
+fn t11_budget_cap_triggers_with_transcript_cost() {
+    // Drive `compute_cost_summary` end-to-end: one open agent_spawn
+    // whose `probe` returns `Terminal { cost_usd: <transcript-derived> }`
+    // — that's the same value F84 watchdog reads to compare against
+    // `max_cost_usd_per_24h`.
+    reset_cache_for_tests();
+    let tmp = TempDir::new().unwrap();
+    let transcript = tmp.path().join("sess.jsonl");
+    // sonnet-4-6, output_tokens = 14_000 → 14_000 × $15 / 1M = $0.21.
+    write_transcript(&transcript, &[(0, 0, 0, 14_000)]);
+    let state = json!({
+        "linkScanPath": transcript.to_str().unwrap(),
+        "respawnFlags": ["--model", "claude-sonnet-4-6"],
+        "state": "working",
+    });
+    // The Running closure path in compute_cost_summary reads the
+    // state.json via job_state_path(job_id) on the host; in tests we
+    // route through the `probe` closure with the same transcript-derived
+    // cost — that's how `claude_job::resolve_cost_usd` would yield it on
+    // a fresh state.json::cost_usd_total == 0.
+    let transcript_cost =
+        session_cost_from_jsonl(&state, "claude-sonnet-4-6").expect("transcript cost");
+    let threshold = 0.10_f64;
+
+    let now = Utc::now();
+    let events = vec![json!({
+        "event": "agent_spawn",
+        "session_id": "sid-budget",
+        "role": "fixer",
+        "job_id": "job-budget",
+        "ts": now.to_rfc3339(),
+    })];
+    let summary = compute_cost_summary(&events, now, |_job_id| JobLiveness::Terminal {
+        status: "completed",
+        cost_usd: transcript_cost,
+    });
+    // F84 watchdog compares `cost_total_usd` (running 24h budget) and
+    // `cost_active_usd`. With one open spawn, the live cost lands in
+    // `cost_active_usd`; the budget cap kicks at that level.
+    assert!(
+        summary.cost_active_usd > threshold,
+        "expected cost_active_usd > ${threshold}, got ${}",
+        summary.cost_active_usd,
+    );
+    // Hand-check: $14_000 × $15 / 1M = $0.21 ± 2¢ (drift for f64 ops).
+    assert!(
+        (summary.cost_active_usd - 0.21).abs() < 0.02,
+        "expected ~$0.21 from transcript flow, got ${}",
+        summary.cost_active_usd,
     );
 }

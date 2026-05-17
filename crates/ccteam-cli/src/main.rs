@@ -438,6 +438,12 @@ enum Command {
         /// preview the scrub.
         #[arg(long, default_value_t = false)]
         update_hooks: bool,
+        /// V0.5.0 F92: print the embedded `pricing.json` schema_version
+        /// next to today's date and WARN when the table is older than
+        /// 180 days. No fs mutation; pure readout to remind operators
+        /// to upgrade ccteam when the bundled rate sheet ages out.
+        #[arg(long, default_value_t = false)]
+        check_pricing_version: bool,
         /// V0.4.6 F83/F85: pair with `--migrate-workflow-to-ccteam-dir`
         /// or `--gc-claude-jobs` to commit changes to disk instead of
         /// previewing them. Without it, those subcommands run as
@@ -781,6 +787,7 @@ fn main() -> Result<()> {
             migrate_workflow_to_ccteam_dir,
             gc_claude_jobs,
             update_hooks,
+            check_pricing_version,
             apply,
         } => {
             // V0.4.1 `--install-all` is sugar for the three first-run
@@ -814,6 +821,7 @@ fn main() -> Result<()> {
                 gc_claude_jobs,
                 gc_apply: apply,
                 update_hooks,
+                check_pricing_version,
             })
         }
         Command::Team { cmd } => run_team(cmd),

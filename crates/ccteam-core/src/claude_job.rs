@@ -48,7 +48,9 @@
 //!   migration path for pre-F80 `progress.jsonl` history beyond this
 //!   one-shot drain.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -131,12 +133,17 @@ pub fn probe_state_json(path: &std::path::Path) -> JobLiveness {
 
 /// Pure classifier — useful for unit tests that already have the
 /// parsed `Value` in hand (no IO).
+///
+/// V0.5.0 F92: `cost_usd` is derived from the transcript JSONL
+/// (`linkScanPath` or cwd+sessionId fallback) via
+/// [`crate::transcript_scanner::session_cost_from_jsonl`] when the
+/// state.json's own `cost_usd` / `cost_usd_total` field is `0.0` or
+/// missing — that field reads `0` on the host even for sessions that
+/// burned real dollars. We log a WARN once per session id on
+/// `linkScanPath` miss and then surface the state.json value (typically
+/// `0.0`) rather than fabricating a number.
 pub fn classify(value: &Value) -> JobLiveness {
-    let cost_usd = value
-        .get("cost_usd")
-        .or_else(|| value.get("cost_usd_total"))
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0);
+    let cost_usd = resolve_cost_usd(value);
 
     // F80 — Claude Code 2.1.x writes `firstTerminalAt` once the
     // session enters a terminal state. Non-null → finished, even if
@@ -168,6 +175,121 @@ pub fn classify(value: &Value) -> JobLiveness {
         };
     }
     JobLiveness::Running
+}
+
+/// V0.5.0 F92 — derive `cost_usd` for a parsed `state.json` Value.
+///
+/// Resolution order:
+/// 1. Try the transcript JSONL via `linkScanPath` (or cwd+sessionId
+///    fallback) — sums every `message.usage` block, prices via
+///    `pricing.json`. This is the **authoritative** path: state.json's
+///    own `cost_usd_total` reads `0` in production even when real
+///    dollars have accrued (V0.4.6 dex-ui probe).
+/// 2. Fall back to state.json's `cost_usd` / `cost_usd_total` field
+///    when the transcript can't be located. Emit a WARN-once-per-session
+///    so operators can spot misconfigurations.
+///
+/// Returns `0.0` when neither source produces a number.
+pub(crate) fn resolve_cost_usd(value: &Value) -> f64 {
+    let state_cost = value
+        .get("cost_usd")
+        .or_else(|| value.get("cost_usd_total"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+
+    let model = model_from_state(value).unwrap_or_else(|| "claude-sonnet-4-6".to_string());
+    match crate::transcript_scanner::session_cost_from_jsonl(value, &model) {
+        Some(t_cost) if t_cost > 0.0 => t_cost,
+        Some(_zero) => {
+            // Transcript present but zero usage so far (fresh session,
+            // no assistant turn yet). Honor state.json's value — for
+            // some workflows the orchestrator finalizes there before
+            // the transcript catches up.
+            state_cost
+        }
+        None => {
+            // No transcript path resolvable → WARN-once + state.json
+            // fallback. On the host the fallback is usually 0.0; for
+            // unit tests with a hand-crafted state.json::cost_usd it
+            // surfaces that value (still WARN, since the WARN is about
+            // the missing transcript link, not the cost number).
+            warn_link_scan_miss_once(value);
+            state_cost
+        }
+    }
+}
+
+/// Extract the model id following `--model` in
+/// `state.json::respawnFlags`. Mirrors `queries::model_from_respawn_flags`
+/// but is duplicated here because making it `pub` in queries would leak
+/// an internal helper to the public surface; the snippet is six lines.
+fn model_from_state(state: &Value) -> Option<String> {
+    let flags = state.get("respawnFlags")?.as_array()?;
+    let mut it = flags.iter();
+    while let Some(item) = it.next() {
+        if item.as_str() == Some("--model") {
+            return it.next().and_then(|v| v.as_str()).map(String::from);
+        }
+    }
+    None
+}
+
+/// Dedup set for the WARN-once-per-session "linkScanPath missing" log.
+/// Lives at module scope so tests can clear it deterministically via
+/// [`reset_link_scan_warn_for_tests`].
+static LINK_SCAN_SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn warn_link_scan_miss_once(value: &Value) {
+    let key = value
+        .get("sessionId")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| {
+            value
+                .get("cwd")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| "<unknown>".to_string())
+        });
+    let lock = LINK_SCAN_SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut set = lock.lock().expect("warn-once mutex poisoned");
+    if set.insert(key.clone()) {
+        let path = value
+            .get("linkScanPath")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        tracing::warn!(
+            session_id = %key,
+            link_scan_path = %path,
+            "linkScanPath missing or jsonl unresolvable; falling back to state.json cost (likely 0)",
+        );
+        #[cfg(any(test, feature = "test-util"))]
+        LINK_SCAN_WARN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Test-only counter — increments each time `warn_link_scan_miss_once`
+/// actually emits a WARN (i.e. the dedup set was extended). Lets tests
+/// assert "WARN emitted exactly once" without a tracing subscriber.
+#[cfg(any(test, feature = "test-util"))]
+static LINK_SCAN_WARN_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Read the WARN counter (test-only).
+#[cfg(any(test, feature = "test-util"))]
+pub fn link_scan_warn_count() -> usize {
+    LINK_SCAN_WARN_COUNT.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Reset both the WARN counter and the dedup set so multi-test
+/// interleaving stays deterministic. Test-only.
+#[cfg(any(test, feature = "test-util"))]
+pub fn reset_link_scan_warn_for_tests() {
+    LINK_SCAN_WARN_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+    let lock = LINK_SCAN_SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    if let Ok(mut s) = lock.lock() {
+        s.clear();
+    }
 }
 
 /// Resolve the absolute state.json path for a `(job_id)`. Thin

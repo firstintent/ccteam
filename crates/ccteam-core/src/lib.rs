@@ -34,6 +34,8 @@ pub mod orchestrator;
 pub mod paths;
 pub mod pending_inject;
 pub mod plugin_resolution;
+// V0.5.0 F92 — bundled Anthropic price table + token → dollar estimator.
+pub mod pricing;
 pub mod progress;
 pub mod projects;
 pub mod queries;
@@ -48,6 +50,8 @@ pub mod team_resolver;
 pub mod templates;
 pub mod tmux;
 pub mod tool_surface;
+// V0.5.0 F92 — cumulative-cost scanner over Claude Code transcript JSONLs.
+pub mod transcript_scanner;
 pub mod watchdog;
 // V0.4.0 F63 — workflow.yaml schema + parser. Pure data + validation;
 // no IO side effects beyond reading the YAML file. See module docs.
@@ -64,6 +68,8 @@ pub use claude_job::{
     classify as classify_job_state, gc_terminated_jobs, gc_user_claude_jobs, probe_job,
     probe_state_json, GcDisposition, GcEntry, GcReport, JobLiveness,
 };
+#[cfg(any(test, feature = "test-util"))]
+pub use claude_job::{link_scan_warn_count, reset_link_scan_warn_for_tests};
 pub use config::{
     append_project as append_project_to_config, config_path as ccteam_config_path,
     default_claude_jobs_retention_days, load as load_ccteam_config,
@@ -113,6 +119,7 @@ pub use pending_inject::{
 pub use plugin_resolution::{
     lookup_plugin_agent, plugins_to_enable, PluginAgent, KNOWN_PLUGIN_AGENTS,
 };
+pub use pricing::{estimate_cost, pricing_schema_version, ModelPrices, Usage};
 pub use progress::{
     current_agent_sessions, escalation_count, workflow_cost_total, AgentSessionStatus,
     AgentSessionSummary,
@@ -185,6 +192,7 @@ pub use tool_surface::{
     HookCmdRewriteReport, LegacySkillAction, LegacySkillReport, MigrationReport, MissingTool,
     ToolSurfaceSnapshot, ToolsRequired, BUILTIN_SUBAGENTS,
 };
+pub use transcript_scanner::{resolve_jsonl_path, session_cost_from_jsonl};
 pub use watchdog::{
     config_path as watchdog_config_path, load_config as load_watchdog_config,
     push_alert_to_meta_outbox as push_watchdog_alert_to_meta_outbox, scan as watchdog_scan,

@@ -1,0 +1,69 @@
+{
+  "schema_version": "2026-05-17",
+  "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
+  "currency": "USD",
+  "unit": "per_1m_tokens",
+  "models": {
+    "claude-opus-4-7": {
+      "input_per_1m": 5.0,
+      "cache_creation_per_1m": 6.25,
+      "cache_read_per_1m": 0.5,
+      "output_per_1m": 25.0
+    },
+    "claude-opus-4-6": {
+      "input_per_1m": 5.0,
+      "cache_creation_per_1m": 6.25,
+      "cache_read_per_1m": 0.5,
+      "output_per_1m": 25.0
+    },
+    "claude-opus-4-5": {
+      "input_per_1m": 5.0,
+      "cache_creation_per_1m": 6.25,
+      "cache_read_per_1m": 0.5,
+      "output_per_1m": 25.0
+    },
+    "claude-opus-4-1": {
+      "input_per_1m": 15.0,
+      "cache_creation_per_1m": 18.75,
+      "cache_read_per_1m": 1.5,
+      "output_per_1m": 75.0
+    },
+    "claude-opus-4": {
+      "input_per_1m": 15.0,
+      "cache_creation_per_1m": 18.75,
+      "cache_read_per_1m": 1.5,
+      "output_per_1m": 75.0
+    },
+    "claude-sonnet-4-6": {
+      "input_per_1m": 3.0,
+      "cache_creation_per_1m": 3.75,
+      "cache_read_per_1m": 0.3,
+      "output_per_1m": 15.0
+    },
+    "claude-sonnet-4-5": {
+      "input_per_1m": 3.0,
+      "cache_creation_per_1m": 3.75,
+      "cache_read_per_1m": 0.3,
+      "output_per_1m": 15.0
+    },
+    "claude-sonnet-4": {
+      "input_per_1m": 3.0,
+      "cache_creation_per_1m": 3.75,
+      "cache_read_per_1m": 0.3,
+      "output_per_1m": 15.0
+    },
+    "claude-haiku-4-5": {
+      "input_per_1m": 1.0,
+      "cache_creation_per_1m": 1.25,
+      "cache_read_per_1m": 0.1,
+      "output_per_1m": 5.0
+    },
+    "claude-haiku-3-5": {
+      "input_per_1m": 0.8,
+      "cache_creation_per_1m": 1.0,
+      "cache_read_per_1m": 0.08,
+      "output_per_1m": 4.0
+    }
+  },
+  "fallback_model": "claude-sonnet-4-6"
+}
