@@ -8,7 +8,6 @@ mod mcp_serve;
 // while the workflow tools accumulate in lockstep with the F66
 // orchestrator.
 mod mcp_workflow_tools;
-mod team_factory_cli;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -500,14 +499,6 @@ enum Command {
         #[arg(long, default_value_t = false)]
         apply: bool,
     },
-    /// V0.2 M0.22: author + publish a ccteam team as a Claude Code
-    /// plugin. `init` scaffolds the staging tree under
-    /// `~/.config/ccteam/teams/<name>/`; `publish` links it into the
-    /// `ccteam-local` marketplace or pushes it to a GitHub repo.
-    Team {
-        #[command(subcommand)]
-        cmd: TeamCommand,
-    },
     /// V0.3.1 F49 — adhoc multi-session primitives for `kind: flex`
     /// teams. `add --harness claude` creates a registered tmux session;
     /// `add --harness codex` still returns the V0.3.2 stub error.
@@ -585,44 +576,6 @@ enum InternalCommand {
         slug: String,
         role: String,
         prompt: Option<String>,
-    },
-}
-
-#[derive(Subcommand)]
-enum TeamCommand {
-    /// Scaffold a new team plugin staging tree at
-    /// `~/.config/ccteam/teams/<name>/`. Creates plugin.json + team.yaml
-    /// + a starter phase + README. Idempotent.
-    Init {
-        /// Team / plugin name (ascii lower / digit / `-` / `_`).
-        name: String,
-        /// One-line plugin description.
-        #[arg(long, default_value = "")]
-        description: String,
-        /// Plugin manifest `author.name`. Required.
-        #[arg(long)]
-        author_name: String,
-        /// Plugin manifest `author.email` (optional).
-        #[arg(long)]
-        author_email: Option<String>,
-        /// Plugin manifest `version` (optional, eg `0.1.0`).
-        #[arg(long)]
-        version: Option<String>,
-        /// Team execution kind. `flex` skips phase scaffolding.
-        #[arg(long, value_enum, default_value_t = team_factory_cli::TeamKindArg::Workflow)]
-        kind: team_factory_cli::TeamKindArg,
-    },
-    /// Publish a staged team. `--target local` symlinks staging into
-    /// `~/.claude/plugins/marketplaces/ccteam-local/plugins/<name>/`;
-    /// `--target github --repo <owner>/<name>` runs `gh repo create`
-    /// + push. Validates the staging tree before any side-effect.
-    Publish {
-        name: String,
-        #[arg(long, value_enum, default_value_t = team_factory_cli::PublishTargetArg::Local)]
-        target: team_factory_cli::PublishTargetArg,
-        /// `<owner>/<name>` repo coordinate (required for `--target github`).
-        #[arg(long)]
-        repo: Option<String>,
     },
 }
 
@@ -911,7 +864,6 @@ fn main() -> Result<()> {
                 check_pricing_version,
             })
         }
-        Command::Team { cmd } => run_team(cmd),
         Command::Session { action } => run_session(action),
         Command::Web {
             bind,
@@ -988,39 +940,6 @@ fn run_progress(slug: &str, tail: bool) -> Result<()> {
 fn run_resume(slug: &str) -> Result<()> {
     let paths = CcteamPaths::from_env()?;
     commands::run_resume(&paths, slug)
-}
-
-fn run_team(cmd: TeamCommand) -> Result<()> {
-    match cmd {
-        TeamCommand::Init {
-            name,
-            description,
-            author_name,
-            author_email,
-            version,
-            kind,
-        } => {
-            let body = team_factory_cli::run_team_init(&team_factory_cli::TeamInitArgs {
-                name,
-                description,
-                author_name,
-                author_email,
-                version,
-                kind,
-            })?;
-            print!("{body}");
-            Ok(())
-        }
-        TeamCommand::Publish { name, target, repo } => {
-            let body = team_factory_cli::run_team_publish(&team_factory_cli::TeamPublishArgs {
-                name,
-                target,
-                repo,
-            })?;
-            print!("{body}");
-            Ok(())
-        }
-    }
 }
 
 /// V0.3.1 F49 — dispatch `ccteam session <action>` to the flex

@@ -1050,11 +1050,15 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_project_writes_helper_templates_to_global_dir() {
-        // M2.4: bootstrap_project ensures ~/.ccteam/templates/ is
-        // populated with the embedded helper templates so phase
-        // markdown's `@~/.ccteam/templates/<name>` reference resolves
-        // even when the user skipped `ccteam init`.
+    fn bootstrap_project_creates_templates_dir() {
+        // M2.4 / V0.5.0 F101: bootstrap_project ensures
+        // ~/.ccteam/templates/ exists so phase markdown's
+        // `@~/.ccteam/templates/<name>` reference resolves even when
+        // the user skipped `ccteam init`. F101 deleted the V0.2-era
+        // helper template payloads (`review-with-user-loop.md` /
+        // `kickoff-reverse-interview.md`), leaving an empty
+        // HELPER_TEMPLATES — but the directory itself still gets
+        // created so future helpers can land alongside per-user files.
         ensure_isolation();
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = CcteamPaths {
@@ -1064,32 +1068,10 @@ mod tests {
         bootstrap_project(&paths, "demo", "demo request", "dev").unwrap();
         let templates = paths.root.join("templates");
         assert!(
-            templates.join("review-with-user-loop.md").is_file(),
-            "review-with-user-loop.md missing from {}",
+            templates.is_dir(),
+            "~/.ccteam/templates/ should exist after bootstrap; got {}",
             templates.display(),
         );
-        assert!(
-            templates.join("kickoff-reverse-interview.md").is_file(),
-            "kickoff-reverse-interview.md missing",
-        );
-    }
-
-    #[test]
-    fn bootstrap_project_helper_templates_do_not_overwrite_user_edits() {
-        ensure_isolation();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let paths = CcteamPaths {
-            root: tmp.path().join("home"),
-            projects_root: tmp.path().join("projects"),
-        };
-        // First bootstrap stamps fresh templates.
-        bootstrap_project(&paths, "demo", "demo request", "dev").unwrap();
-        let path = paths.root.join("templates/review-with-user-loop.md");
-        std::fs::write(&path, "USER EDIT\n").unwrap();
-        // Second project bootstrap (e.g. user runs `ccteam new` again)
-        // must not clobber the user edit.
-        bootstrap_project(&paths, "demo2", "another request", "dev").unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "USER EDIT\n");
     }
 
     // ---------------- V0.2 M0.16.3: claude_md_template ----------------

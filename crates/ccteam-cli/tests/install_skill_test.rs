@@ -1,10 +1,12 @@
-//! V0.5.0 F93a — `ccteam doctor --install-skill [NAME]` test harness.
+//! V0.5.0 F93a + F100 — `ccteam doctor --install-skill [NAME]` test harness.
 //!
 //! V0.4.6 (`--install-skill` flag was bool) installed three skills:
 //! `ccteam-control`, `ccteam-team-author`, `ccteam-project-creator`.
-//! V0.5.0 F93a adds `ccteam-team` as a fourth shipped skill (the
-//! primary-path entry for `/ccteam:team`). The flag was upgraded to
-//! `Option<String>` so users can install one at a time
+//! V0.5.0 F93a added `ccteam-team` as a fourth shipped skill; F100 then
+//! merged `ccteam-team-author` + `ccteam-project-creator` into
+//! `ccteam-creator`, landing the V0.5.0 final set at **three** entries:
+//!   `ccteam-control` / `ccteam-creator` / `ccteam-team`
+//! The flag stayed `Option<String>` so users can install one at a time
 //! (`--install-skill ccteam-team`) or all (`--install-skill all` /
 //! plain `--install-skill`).
 //!
@@ -34,11 +36,11 @@ fn run_ccteam(args: &[&str], tmp: &TempDir) -> std::process::Output {
 }
 
 #[test]
-fn install_skill_default_lays_down_all_four_shipped_skills() {
-    // V0.5.0 F93a: `--install-skill` with no value (or `all`) writes
+fn install_skill_default_lays_down_all_three_shipped_skills() {
+    // V0.5.0 F100: `--install-skill` with no value (or `all`) writes
     // every shipped skill into `~/.claude/skills/<name>/SKILL.md`. The
-    // V0.5.0 set is 4 entries:
-    //   ccteam-control / ccteam-team-author / ccteam-project-creator / ccteam-team
+    // V0.5.0 set is 3 entries:
+    //   ccteam-control / ccteam-creator / ccteam-team
     //
     // Regression guard: if a future patch drops one from
     // `render_install_skill_report`, this test fires.
@@ -51,12 +53,7 @@ fn install_skill_default_lays_down_all_four_shipped_skills() {
         "doctor --install-skill should succeed; stdout={stdout}; stderr={stderr}",
     );
     let claude = tmp.path().join("isolated").join(".claude");
-    for skill in [
-        "ccteam-control",
-        "ccteam-team-author",
-        "ccteam-project-creator",
-        "ccteam-team",
-    ] {
+    for skill in ["ccteam-control", "ccteam-creator", "ccteam-team"] {
         let target = claude.join("skills").join(skill).join("SKILL.md");
         assert!(
             target.is_file(),
@@ -69,18 +66,13 @@ fn install_skill_default_lays_down_all_four_shipped_skills() {
 #[test]
 fn install_skill_all_explicit_value_matches_default() {
     // `--install-skill all` is the explicit form of the bare flag.
-    // Same 4-skill default set must land.
+    // Same 3-skill default set must land.
     let tmp = TempDir::new().unwrap();
     let out = run_ccteam(&["doctor", "--install-skill", "all"], &tmp);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "doctor failed: {stdout}");
     let claude = tmp.path().join("isolated").join(".claude");
-    for skill in [
-        "ccteam-control",
-        "ccteam-team-author",
-        "ccteam-project-creator",
-        "ccteam-team",
-    ] {
+    for skill in ["ccteam-control", "ccteam-creator", "ccteam-team"] {
         assert!(claude.join("skills").join(skill).join("SKILL.md").is_file());
     }
 }
@@ -88,8 +80,8 @@ fn install_skill_all_explicit_value_matches_default() {
 #[test]
 fn install_skill_single_name_writes_just_that_skill() {
     // V0.5.0 F93a: `--install-skill ccteam-team` is single-skill mode —
-    // only the named skill lands; the other three shipped skills are
-    // NOT written.
+    // only the named skill lands; the other shipped skills are NOT
+    // written.
     let tmp = TempDir::new().unwrap();
     let out = run_ccteam(&["doctor", "--install-skill", "ccteam-team"], &tmp);
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -108,11 +100,7 @@ fn install_skill_single_name_writes_just_that_skill() {
         "ccteam-team SKILL.md should have been written; stdout={stdout}",
     );
     // Other shipped skills should NOT be present in single-skill mode.
-    for other in [
-        "ccteam-control",
-        "ccteam-team-author",
-        "ccteam-project-creator",
-    ] {
+    for other in ["ccteam-control", "ccteam-creator"] {
         assert!(
             !claude.join("skills").join(other).join("SKILL.md").exists(),
             "expected single-skill mode to skip {other} but it landed; stdout={stdout}",
@@ -156,8 +144,8 @@ fn install_skill_is_idempotent_when_rerun() {
 
 #[test]
 fn install_skill_unknown_name_errors_with_friendly_message() {
-    // V0.5.0 F93a: a bogus skill name (e.g. typo) should bail with a
-    // helpful message listing the four canonical names. Don't bury the
+    // V0.5.0 F100: a bogus skill name (e.g. typo) should bail with a
+    // helpful message listing the three canonical names. Don't bury the
     // user in a stack trace.
     let tmp = TempDir::new().unwrap();
     let out = run_ccteam(&["doctor", "--install-skill", "ccteam-bogus"], &tmp);

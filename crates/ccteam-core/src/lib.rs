@@ -45,7 +45,6 @@ pub mod skill;
 pub mod stall;
 pub mod state;
 pub mod team;
-pub mod team_factory;
 pub mod team_resolver;
 // V0.5.0 F95 — Anthropic Agent Teams config/inbox/task parsers (pure
 // diff helpers). The wiring into the daemon-level watcher lives in
@@ -156,12 +155,10 @@ pub use silence_classifier::{
     SilenceClass, LIMBO_RETRY_FILE, MAX_LIMBO_RETRY,
 };
 pub use skill::{
-    install_ccteam_control_skill, install_ccteam_project_creator_skill,
-    install_ccteam_team_author_skill, install_ccteam_team_skill,
+    install_ccteam_control_skill, install_ccteam_creator_skill, install_ccteam_team_skill,
     install_into as install_skill_into, install_skill_body_into, InstallSkillOptions,
-    InstallSkillReport, SkillInstallAction, CCTEAM_CONTROL_SKILL_NAME,
-    CCTEAM_PROJECT_CREATOR_SKILL_NAME, CCTEAM_TEAM_AUTHOR_SKILL_NAME, CCTEAM_TEAM_SKILL_NAME,
-    LEGACY_SKILL_NAMES,
+    InstallSkillReport, SkillInstallAction, CCTEAM_CONTROL_SKILL_NAME, CCTEAM_CREATOR_SKILL_NAME,
+    CCTEAM_TEAM_SKILL_NAME, LEGACY_SKILL_NAMES,
 };
 pub use stall::{
     classify as classify_stall, classify_with_thresholds, silent_seconds, StallLevel,
@@ -174,11 +171,6 @@ pub use team::{
     CostPolicy, CriticDimensionSpec, CriticStrictness, DefaultSessionSpec, DomainRule,
     EscalateGrammarExtension, EscalateRoute, GoldenRuleEnforcement, HarnessKind, ProtocolRule,
     RetroFieldKind, RetroFieldSpec, TeamGoldenRules, TeamKind, TeamSpec,
-};
-pub use team_factory::{
-    init_team_staging, publish_team, staging_dir_for, validate_staged_team, InitReport,
-    PhaseScaffold, PluginAuthor, PluginManifest, PublishInput, PublishReport, PublishTarget,
-    TeamInitInput,
 };
 pub use team_resolver::{
     default_user_staging_dir, discover_team_names, resolve_team, save_team, TeamResolveContext,

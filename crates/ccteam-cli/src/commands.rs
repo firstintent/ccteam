@@ -11,14 +11,13 @@ use serde_json::{json, Map, Value};
 use ccteam_core::tmux::TmuxSession;
 use ccteam_core::{
     bootstrap_meta_project, current_ccteam_bin, install_ccteam_control_skill,
-    install_ccteam_project_creator_skill, install_ccteam_team_author_skill,
-    install_ccteam_team_skill, migrate_legacy_skill_dirs, migrate_recommended_agent_symlinks,
-    rewrite_legacy_hook_commands, session_name_for_project, user_claude_dir,
-    write_global_helper_templates, CcteamPaths, HookCmdRewriteAction, HookCmdRewriteReport,
-    InstallSkillOptions, LegacySkillAction, LegacySkillReport, MetaBootstrapReport,
-    MigrationReport, PhaseState, ProjectState, SkillInstallAction, ToolSurfaceSnapshot,
-    BUILTIN_SUBAGENTS, CCTEAM_CONTROL_SKILL_NAME, CCTEAM_PROJECT_CREATOR_SKILL_NAME,
-    CCTEAM_TEAM_AUTHOR_SKILL_NAME, CCTEAM_TEAM_SKILL_NAME,
+    install_ccteam_creator_skill, install_ccteam_team_skill, migrate_legacy_skill_dirs,
+    migrate_recommended_agent_symlinks, rewrite_legacy_hook_commands, session_name_for_project,
+    user_claude_dir, write_global_helper_templates, CcteamPaths, HookCmdRewriteAction,
+    HookCmdRewriteReport, InstallSkillOptions, LegacySkillAction, LegacySkillReport,
+    MetaBootstrapReport, MigrationReport, PhaseState, ProjectState, SkillInstallAction,
+    ToolSurfaceSnapshot, BUILTIN_SUBAGENTS, CCTEAM_CONTROL_SKILL_NAME, CCTEAM_CREATOR_SKILL_NAME,
+    CCTEAM_TEAM_SKILL_NAME,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -1847,31 +1846,16 @@ fn render_gc_claude_jobs_report(paths: &CcteamPaths, apply: bool) -> Result<Stri
 ///    are user territory; `docs/v0-2/phase-prompt-architecture.md` §9 docks
 ///    this as warn-not-fail by design).
 fn render_validate_team_report(paths: &CcteamPaths, team: &str) -> Result<(String, u32)> {
-    use ccteam_core::{
-        default_user_staging_dir, resolve_team, staging_dir_for, validate_staged_team,
-        TeamResolveContext,
-    };
+    use ccteam_core::{default_user_staging_dir, resolve_team, TeamResolveContext};
 
     let mut out = format!("ccteam doctor --validate-team {team}\n\n");
     let mut fails = 0u32;
     let user_staging = default_user_staging_dir();
     let ctx = TeamResolveContext::for_orchestrator(&paths.root, &user_staging);
 
-    // V0.2 M0.22.4: when a staged plugin tree exists at the user
-    // layer, run the plugin manifest checks before resolving the
-    // TeamSpec — operators authoring a team plugin want both the
-    // plugin schema findings and the phase IO findings in one report.
-    let staged = staging_dir_for(team, None);
-    if staged.join(".claude-plugin/plugin.json").exists() {
-        out.push_str("# Plugin manifest checks (staged tree)\n");
-        for line in validate_staged_team(&staged)? {
-            if line.starts_with("[FAIL]") {
-                fails += 1;
-            }
-            out.push_str(&format!("{line}\n"));
-        }
-        out.push('\n');
-    }
+    // V0.5.0 F100: plugin manifest staging check removed alongside the
+    // `ccteam team init/publish` factory. doctor now only validates
+    // the resolved team.yaml.
 
     match resolve_team(team, &ctx) {
         Ok(s) => out.push_str(&format!("[OK] team.yaml resolves; name=`{}`\n", s.name)),
@@ -2006,17 +1990,13 @@ fn render_install_skill_report(paths: &CcteamPaths, opts: &DoctorOptions) -> Res
         let mut out = format!("ccteam doctor --install-skill {selector}\n\n");
         let target = match selector_lc.as_str() {
             CCTEAM_CONTROL_SKILL_NAME => install_ccteam_control_skill(install_opts)?,
-            CCTEAM_TEAM_AUTHOR_SKILL_NAME => install_ccteam_team_author_skill(install_opts)?,
-            CCTEAM_PROJECT_CREATOR_SKILL_NAME => {
-                install_ccteam_project_creator_skill(install_opts)?
-            }
+            CCTEAM_CREATOR_SKILL_NAME => install_ccteam_creator_skill(install_opts)?,
             CCTEAM_TEAM_SKILL_NAME => install_ccteam_team_skill(install_opts)?,
             other => bail!(
                 "ccteam doctor --install-skill {other}: unknown skill name; expected one of \
-                 `all` / {ctrl} / {ta} / {pc} / {tt}",
+                 `all` / {ctrl} / {creator} / {tt}",
                 ctrl = CCTEAM_CONTROL_SKILL_NAME,
-                ta = CCTEAM_TEAM_AUTHOR_SKILL_NAME,
-                pc = CCTEAM_PROJECT_CREATOR_SKILL_NAME,
+                creator = CCTEAM_CREATOR_SKILL_NAME,
                 tt = CCTEAM_TEAM_SKILL_NAME,
             ),
         };
@@ -2032,26 +2012,20 @@ fn render_install_skill_report(paths: &CcteamPaths, opts: &DoctorOptions) -> Res
 
     let mut out = String::from("ccteam doctor --install-skill\n\n");
 
-    // V0.2.2 F44: install all shipped skills under their canonical
-    // ccteam-* names (reverting F39's `cct-*` rename). V0.5.0 F93a
-    // adds `ccteam-team` to the default set.
+    // V0.5.0 F100: 3 shipped skills (down from 5). Legacy F39 `cct-*`
+    // and V0.2/V0.2.2 `ccteam-team-author` + `ccteam-project-creator`
+    // are swept by the F44 reverse migration below.
     let control = install_ccteam_control_skill(install_opts)?;
     out.push_str(&format!(
         "  ccteam-control          {label}  {}\n",
         control.target.display(),
         label = skill_install_label(&control.action),
     ));
-    let team_author = install_ccteam_team_author_skill(install_opts)?;
+    let creator = install_ccteam_creator_skill(install_opts)?;
     out.push_str(&format!(
-        "  ccteam-team-author      {label}  {}\n",
-        team_author.target.display(),
-        label = skill_install_label(&team_author.action),
-    ));
-    let project_creator = install_ccteam_project_creator_skill(install_opts)?;
-    out.push_str(&format!(
-        "  ccteam-project-creator  {label}  {}\n",
-        project_creator.target.display(),
-        label = skill_install_label(&project_creator.action),
+        "  ccteam-creator          {label}  {}\n",
+        creator.target.display(),
+        label = skill_install_label(&creator.action),
     ));
     let team_skill = install_ccteam_team_skill(install_opts)?;
     out.push_str(&format!(
@@ -3379,29 +3353,29 @@ mod tests {
                 paths.root.join(sub).display()
             );
         }
-        // V0.4.0 F60: phase template writing removed (F63 reintroduces
-        // workflow seeds). Only helper templates land via init now.
-        assert!(paths
-            .templates_dir()
-            .join("review-with-user-loop.md")
-            .is_file());
-        assert!(paths
-            .templates_dir()
-            .join("kickoff-reverse-interview.md")
-            .is_file());
+        // V0.5.0 F101: phase-era helper templates (review-with-user-loop,
+        // kickoff-reverse-interview) deleted; HELPER_TEMPLATES is empty,
+        // so init no longer stamps anything under ~/.ccteam/templates/
+        // beyond what other writers seed there.
         assert!(report.contains("ccteam init"));
         assert!(report.contains("next"));
     }
 
     #[test]
-    fn run_init_is_idempotent_and_preserves_user_edits() {
-        // V0.4.0 F60: phase template writer removed; the
-        // helper-template writer still uses the same idempotency
-        // contract (skip-existing without --force; overwrite with).
+    fn run_init_is_idempotent_and_preserves_user_workflow_yaml() {
+        // V0.5.0 F101: HELPER_TEMPLATES is empty so the V0.4.x
+        // `~/.ccteam/templates/review-with-user-loop.md` idempotency
+        // probe is gone. workflow.yaml is the new canonical
+        // "preserve without --force, overwrite with --force" artifact —
+        // it's user-territory by design (see `force_overwrites_user_workflow_and_agents`).
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
         run_init(&paths, init_opts_targeting_tmp(&tmp, "idem-demo")).unwrap();
-        let path = paths.templates_dir().join("review-with-user-loop.md");
+        let path = tmp
+            .path()
+            .join("idem-demo")
+            .join(".ccteam")
+            .join("workflow.yaml");
         std::fs::write(&path, "USER EDIT").unwrap();
         run_init(&paths, init_opts_targeting_tmp(&tmp, "idem-demo")).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "USER EDIT");
@@ -4105,19 +4079,19 @@ mod tests {
         assert_eq!(state.slug, "meta");
         assert_eq!(state.tmux_session, "ccteam-meta");
 
-        // Skill landed under the redirected ~/.claude/. F44 reverts F39:
-        // both shipped skills are written under canonical ccteam-* names.
+        // Skill landed under the redirected ~/.claude/. V0.5.0 F100
+        // shipped set: ccteam-control / ccteam-creator / ccteam-team.
         let control = tmp.path().join("skills/ccteam-control/SKILL.md");
         assert!(
             control.is_file(),
             "ccteam-control SKILL.md not written: {}",
             control.display()
         );
-        let team_author = tmp.path().join("skills/ccteam-team-author/SKILL.md");
+        let creator = tmp.path().join("skills/ccteam-creator/SKILL.md");
         assert!(
-            team_author.is_file(),
-            "ccteam-team-author SKILL.md not written: {}",
-            team_author.display(),
+            creator.is_file(),
+            "ccteam-creator SKILL.md not written: {}",
+            creator.display(),
         );
 
         std::env::remove_var("CLAUDE_CONFIG_HOME");
@@ -4180,12 +4154,9 @@ mod tests {
         assert!(report.contains("install-skill"));
         assert!(!report.contains("install-meta-agent"));
 
-        // F44 reverts F39: shipped skills land under canonical ccteam-* names.
+        // V0.5.0 F100: shipped skills land under canonical ccteam-* names.
         assert!(tmp.path().join("skills/ccteam-control/SKILL.md").is_file());
-        assert!(tmp
-            .path()
-            .join("skills/ccteam-team-author/SKILL.md")
-            .is_file());
+        assert!(tmp.path().join("skills/ccteam-creator/SKILL.md").is_file());
         std::env::remove_var("CLAUDE_CONFIG_HOME");
     }
 

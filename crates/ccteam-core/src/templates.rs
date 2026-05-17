@@ -44,16 +44,14 @@ pub const PROJECT_SETTINGS_AGENT_TEAM_JSON: &str =
 /// `@~/.ccteam/templates/<on_disk_filename>` and Claude Code's native
 /// `@` mechanism inlines the body at prompt-build time. The orchestrator
 /// does not parse these — they're pure Claude Code surface.
-pub const HELPER_TEMPLATES: &[(&str, &str)] = &[
-    (
-        "review-with-user-loop.md",
-        include_str!("templates/review_with_user_loop.md"),
-    ),
-    (
-        "kickoff-reverse-interview.md",
-        include_str!("templates/kickoff_reverse_interview.md"),
-    ),
-];
+///
+/// V0.5.0 F101: the V0.2-era helpers `review-with-user-loop.md` and
+/// `kickoff-reverse-interview.md` were removed alongside the phase-era
+/// meta-agent reshape. memory_bridge_*.md lives in `memory_bridge.rs`
+/// and is written to `~/.claude/rules/`, not `~/.ccteam/templates/`,
+/// so it does not belong in this list. The list stays as a single
+/// const so future helpers can be added back in one place.
+pub const HELPER_TEMPLATES: &[(&str, &str)] = &[];
 
 /// Resolve the path to the running ccteam binary. Falls back from
 /// canonicalized to raw `current_exe()` because `canonicalize` rejects
