@@ -1216,6 +1216,31 @@ fn run_start(
                 tokio::spawn(poll_unroster_triggers(orch))
             };
 
+            // V0.5.0 F95 — global `~/.claude/teams/` watcher mirrors 5
+            // `team_*` events into `~/.ccteam/teams-progress.jsonl` for
+            // the web `/teams` tab to consume. Fire-and-forget: the task
+            // owns its notify watcher, exits on runtime shutdown.
+            let _agent_teams_watcher_task =
+                match ccteam_core::AgentTeamsWatcherConfig::from_env() {
+                    Ok(cfg) => match ccteam_core::AgentTeamsWatcher::new(cfg) {
+                        Ok(watcher) => Some(watcher.start()),
+                        Err(err) => {
+                            tracing::warn!(
+                                ?err,
+                                "F95 AgentTeamsWatcher::new failed; team-events disabled",
+                            );
+                            None
+                        }
+                    },
+                    Err(err) => {
+                        tracing::warn!(
+                            ?err,
+                            "F95 AgentTeamsWatcherConfig::from_env failed; team-events disabled",
+                        );
+                        None
+                    }
+                };
+
             let web_handle = if web.disabled {
                 None
             } else {
