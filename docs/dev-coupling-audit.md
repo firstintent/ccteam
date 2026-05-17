@@ -148,10 +148,15 @@ V0.4.6 起 audit 文档**只列 open finding** + V0.3.2+ 索引(见 §"V0.3.2+ �
 - **位置**:`crates/ccteam-core/src/claude_job.rs::probe_state_json` + `orchestrator.rs::poll_completions` F80 stale-spawn cleanup
 - **症状**:dex-ui qa-autoloop 实测,daemon 重启后 11 个 claude `--bg-spare` worker 在 OS 仍存活(`ps -ef | grep bg-spare` cwd=dex-ui 都列出),但其 state.json **`state: "working"` 且 `updatedAt` 冻结于 daemon 上次活跃时刻**(75+ min 前)。F80 现行 cleanup 只在 `state.json::probe_state_json` 返回 `JobLiveness::Terminal` 时合成 `agent_done`;`state=working` 一律视作 `Running`,无 staleness 判断 → progress.jsonl 永远缺这些 spawn 的 done 事件 → web UI 显示 ghost-running 长期不消。手动 `kill -TERM <pid>` + 手写 `agent_done` 才恢复一致(本次 F102 现场)。
 - **触发场景**:daemon 重启 / SIGKILL / pty-host parent 死亡时,claude `--bg-spare` worker 可孤儿存活但停止心跳 state.json。同样可能在 claude 内部死锁 / 长 hang 时复现。
-- **修复方向**:`probe_state_json` 加第三档判据:
-  - `state=working && updatedAt > stale_threshold(默认 5 min)` → `JobLiveness::Terminal{status: "killed", cost_usd: 0.0}`(treat as crashed)
-  - 可选增强:同时 `kill -0 <pid>` 探活(需 claude state.json 暴露 PID;现行无,需 claude-code 改 schema 或我们 patch)。先靠 updatedAt 阈值足够。
-- **测试**:加 unit 覆盖:write `state: working, updatedAt: now-10min` 的 state.json → probe 返回 Terminal{killed}。orchestrator_thin_test 加 integration:模拟 stuck worker → poll_completions 后 progress.jsonl 有合成 agent_done。
+- **修复方向**(refined per 2026-05-17 live observation):**不能只看 state.json::updatedAt** — 实测 cliVersion 2.1.143 下,agent 在长 phase 期间 state.json `state=working, detail="starting…"` 一冻就是 5+ min,但 progress.jsonl 同期持续有 `PreToolUse` / `PostToolUse` 事件。state.json 只在 claude lifecycle event 时更新,不在 tool use 时更新。单纯阈值会**误杀**活 agent。
+- **正确判据**:`probe_state_json` + 跨表查 progress.jsonl:
+  - 对每个 open `agent_spawn`(无匹配 `agent_done`),取 `spawn.ts`
+  - 在同 slug 的 progress.jsonl 找 ts > `spawn.ts` 的任意 `PreToolUse` / `PostToolUse` / `Stop` hook 事件
+  - **有**且最新 ts < 30 min 前 → Running
+  - **无**任何 hook event > spawn.ts 持续 30 min → 视作 stuck,合成 `agent_done{status: "killed"}`
+  - 阈值可项目级配(`workflow.yaml::stale_no_progress_minutes`,默认 30)
+- **替代/补充**:让 ccteam 的 hook 自身写一个 per-session liveness 文件(`~/.ccteam/heartbeats/<sid>`),每次 PreToolUse touch 一下。orchestrator 看 mtime。比绕 progress.jsonl 干净,但加新文件协议;先看 progress-jsonl 跨表方案能不能直接落。
+- **测试**:unit 覆盖 `probe_with_progress_cross_ref`(stub progress events for sid → 期望 Running)+ integration:模拟 spawn 但永不写 hook event,> 30 min 后 poll_completions 合成 done。
 - **优先级**:**P1**(任何 daemon 重启都暴露;影响 UI 一致性 + parallelism 计数 + cost 双重计入)。V0.4.6 dex-ui qa-autoloop 实测踩到。
 - **关联**:V0.4.6 `5da83dc` parallelism race fix 修了**race 路径**;F102 修**daemon-restart-leftover 路径**。两者互补,合并解决 dex-ui 长期"幽灵 session"问题。
 
