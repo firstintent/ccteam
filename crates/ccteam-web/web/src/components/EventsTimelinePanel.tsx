@@ -86,7 +86,7 @@ export function EventsTimelinePanel({
   const view = merged.slice(-tailRows).reverse();
 
   return (
-    <section className="border border-surface-700/40 rounded-md bg-surface-850 flex flex-col min-h-0">
+    <section className="border border-surface-700/40 rounded-md bg-surface-850 flex flex-col min-h-0 h-full w-full">
       <header className="flex items-center justify-between px-3 py-2 border-b border-surface-700/30 shrink-0">
         <h3 className="text-xs uppercase tracking-wide text-text-secondary">
           Events Timeline
