@@ -8,7 +8,9 @@
 use std::fs;
 
 use super::*;
-use crate::teams::discovery::{compute_definition_backed, definition_md_target};
+use crate::teams::discovery::{
+    compute_definition_backed, compute_definition_backed_with_scope, definition_md_target,
+};
 use crate::teams::inbox::{filter_since, recent_preview};
 use crate::teams::subagent_resolver::{candidate_paths, parse_definition, ResolvedScope};
 
@@ -24,6 +26,70 @@ fn compute_definition_backed_distinguishes_adhoc_from_definition() {
     assert!(!compute_definition_backed(None));
     assert!(compute_definition_backed(Some("code-reviewer")));
     assert!(compute_definition_backed(Some("security-reviewer")));
+}
+
+#[test]
+fn compute_definition_backed_recognises_anthropic_explore_builtin() {
+    // V0.5.1 F104b — `Explore` and `explore` are Anthropic built-in
+    // subagent types (no `.claude/agents/Explore.md` ships) and must
+    // be treated as ad-hoc so the SPA doesn't render "definition
+    // missing".
+    assert!(!compute_definition_backed(Some("Explore")));
+    assert!(!compute_definition_backed(Some("explore")));
+}
+
+#[test]
+fn compute_definition_backed_with_scope_falls_back_to_adhoc_when_md_absent() {
+    // V0.5.1 F104b — any unknown `agentType` (not in the F95 allowlist)
+    // is normally treated as definition-backed. But if NO
+    // `.claude/agents/<agentType>.md` resolves on the scope chain, the
+    // scope-aware variant downgrades to ad-hoc so the SPA never tries
+    // to render a "missing definition" warning for a teammate the
+    // resolver can't find.
+    let tmp = tempfile::tempdir().unwrap();
+    // No agents dir created, so `code-reviewer.md` doesn't exist
+    // anywhere on the scope chain.
+    assert!(!compute_definition_backed_with_scope(
+        Some("code-reviewer"),
+        tmp.path(),
+        None,
+    ));
+}
+
+#[test]
+fn compute_definition_backed_with_scope_returns_true_when_md_resolves() {
+    // V0.5.1 F104b — `code-reviewer.md` exists in user scope; should
+    // stay definition-backed.
+    let tmp = tempfile::tempdir().unwrap();
+    let agents = tmp.path().join("agents");
+    fs::create_dir_all(&agents).unwrap();
+    fs::write(agents.join("code-reviewer.md"), "---\nname: x\n---\nbody\n").unwrap();
+    assert!(compute_definition_backed_with_scope(
+        Some("code-reviewer"),
+        tmp.path(),
+        None,
+    ));
+}
+
+#[test]
+fn compute_definition_backed_with_scope_short_circuits_for_allowlist() {
+    // Allowlist matches (general-purpose / team-lead / Explore /
+    // explore / None) should return false regardless of the scope
+    // chain, without any IO. Tempdir is empty so any IO that does
+    // happen still works deterministically.
+    let tmp = tempfile::tempdir().unwrap();
+    for t in ["general-purpose", "team-lead", "Explore", "explore"] {
+        assert!(!compute_definition_backed_with_scope(
+            Some(t),
+            tmp.path(),
+            None,
+        ));
+    }
+    assert!(!compute_definition_backed_with_scope(
+        None,
+        tmp.path(),
+        None
+    ));
 }
 
 #[test]

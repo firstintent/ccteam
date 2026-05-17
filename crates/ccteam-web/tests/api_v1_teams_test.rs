@@ -268,7 +268,32 @@ async fn detail_returns_config_task_counts_and_recent_messages() {
     for m in members {
         // All roblog teammates are ad-hoc.
         assert_eq!(m["definition_backed"], false);
+        // V0.5.1 F104a — wire shape is snake_case for the SPA.
+        // Anthropic's camelCase `agentType` MUST NOT leak through.
+        let obj = m.as_object().unwrap();
+        assert!(
+            !obj.contains_key("agentType"),
+            "wire shape must use snake_case; agentType leaked",
+        );
+        assert!(
+            obj.contains_key("agent_type"),
+            "wire shape must expose agent_type (snake_case)",
+        );
+        // Non-null (every roblog member has agentType set in the
+        // fixture).
+        assert!(
+            m["agent_type"].is_string(),
+            "member {} agent_type must be a string, got {:?}",
+            m["name"],
+            m["agent_type"]
+        );
     }
+    // Also check the TeamConfig top-level fields renamed in F104a.
+    let cfg_obj = body["config"].as_object().unwrap();
+    assert!(!cfg_obj.contains_key("createdAt"));
+    assert!(!cfg_obj.contains_key("leadAgentId"));
+    assert!(cfg_obj.contains_key("created_at"));
+    assert!(cfg_obj.contains_key("lead_agent_id"));
     assert_eq!(body["task_count"]["completed"], 1);
     assert_eq!(body["task_count"]["in_progress"], 1);
     assert_eq!(body["task_count"]["pending"], 1);
@@ -382,6 +407,90 @@ async fn inbox_without_teammate_merges_every_inbox() {
 }
 
 #[tokio::test]
+async fn detail_explore_builtin_serializes_as_adhoc_with_snake_case_agent_type() {
+    // V0.5.1 F104 — host probe of `openhuman-codebase-research` shows
+    // every teammate as `agentType: "Explore"` (Anthropic built-in).
+    // Verify end-to-end:
+    //   - wire field is `agent_type: "Explore"` (snake_case)
+    //   - `definition_backed: false` (allowlist match)
+    //   - definition endpoint returns 404 ad-hoc (no spurious
+    //     "definition missing" warning path)
+    let (tmp, state) = sandbox();
+    let team_dir = tmp
+        .path()
+        .join(".claude")
+        .join("teams")
+        .join("openhuman-codebase-research");
+    fs::create_dir_all(team_dir.join("inboxes")).unwrap();
+    fs::write(
+        team_dir.join("config.json"),
+        r#"{
+            "name": "openhuman-codebase-research",
+            "createdAt": 1779000000000,
+            "leadAgentId": "team-lead@openhuman-codebase-research",
+            "members": [
+                {
+                    "agentId": "team-lead@openhuman-codebase-research",
+                    "name": "team-lead",
+                    "agentType": "team-lead",
+                    "model": "sonnet",
+                    "joinedAt": 1779000000000,
+                    "cwd": "/home/rob/projects/openhuman",
+                    "subscriptions": []
+                },
+                {
+                    "agentId": "rust-core-explorer@openhuman-codebase-research",
+                    "name": "rust-core-explorer",
+                    "agentType": "Explore",
+                    "model": "haiku",
+                    "color": "blue",
+                    "joinedAt": 1779000010000,
+                    "cwd": "/home/rob/projects/openhuman",
+                    "subscriptions": [],
+                    "backendType": "in-process"
+                }
+            ]
+        }"#,
+    )
+    .unwrap();
+    let addr = spawn(state).await;
+    let resp = client()
+        .get(format!(
+            "http://{addr}/api/v1/teams/openhuman-codebase-research"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let members = body["config"]["members"].as_array().unwrap();
+    let explorer = members
+        .iter()
+        .find(|m| m["name"] == "rust-core-explorer")
+        .unwrap();
+    // Snake-case wire shape.
+    let obj = explorer.as_object().unwrap();
+    assert!(!obj.contains_key("agentType"));
+    assert_eq!(explorer["agent_type"], "Explore");
+    assert_eq!(explorer["model"], "haiku");
+    assert_eq!(explorer["backend_type"], "in-process");
+    // F104b allowlist: Explore → ad-hoc.
+    assert_eq!(explorer["definition_backed"], false);
+
+    // Definition endpoint short-circuits with 404 ad_hoc.
+    let resp2 = client()
+        .get(format!(
+            "http://{addr}/api/v1/teams/openhuman-codebase-research/member/rust-core-explorer/definition"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), 404);
+    let body2: Value = resp2.json().await.unwrap();
+    assert_eq!(body2["ad_hoc"], true);
+}
+
+#[tokio::test]
 async fn definition_returns_404_for_adhoc_teammate() {
     let (tmp, state) = sandbox();
     stage_roblog(&tmp);
@@ -429,7 +538,14 @@ async fn definition_returns_parsed_markdown_for_definition_backed() {
 }
 
 #[tokio::test]
-async fn definition_flags_missing_when_md_file_is_absent() {
+async fn definition_returns_adhoc_404_when_md_file_is_absent() {
+    // V0.5.1 F104b — `compute_definition_backed_with_scope` falls
+    // back to ad-hoc when no `.md` resolves on the scope chain. The
+    // member is therefore treated as ad-hoc (404 with `ad_hoc: true`)
+    // instead of `definition_backed: true + definition_missing: true`.
+    // This keeps the SPA from rendering a "definition missing"
+    // warning for built-in subagent types Anthropic ships without a
+    // shipped .md (e.g. `Explore`).
     let (tmp, state) = sandbox();
     stage_definition_team(&tmp);
     let addr = spawn(state).await;
@@ -440,10 +556,9 @@ async fn definition_flags_missing_when_md_file_is_absent() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.status(), 404);
     let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["definition_missing"], true);
-    assert!(body["definition"].is_null());
+    assert_eq!(body["ad_hoc"], true);
 }
 
 #[tokio::test]

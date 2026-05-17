@@ -12,11 +12,11 @@
 //! V0.5.0 F100 — 5 skills reduced to 3:
 //! `ccteam-control` (CLI/MCP wrap),
 //! `ccteam-creator` (new project + workflow/agent/skill scaffold),
-//! `ccteam-team` (`/ccteam:team` in current session).
+//! `ccteam-team` (`/ccteam-team` in current session).
 //! The deleted `ccteam-team-author` (V0.2 team plugin factory) and
 //! `ccteam-project-creator` (V0.2.2 four-phase dispatch dialogue) bodies
 //! are folded into `ccteam-creator` step 1/2/3/4 and the
-//! `/ccteam:team` skill respectively.
+//! `/ccteam-team` skill respectively.
 
 use std::path::{Path, PathBuf};
 
@@ -37,7 +37,7 @@ pub const CCTEAM_CONTROL_SKILL_NAME: &str = "ccteam-control";
 pub const CCTEAM_CREATOR_SKILL_NAME: &str = "ccteam-creator";
 
 /// V0.5.0 F93a — `ccteam-team` skill name. Primary path for the
-/// agent-team mode: `/ccteam:team "<task>"` in the user's current
+/// agent-team mode: `/ccteam-team "<task>"` in the user's current
 /// Claude session spawns an Anthropic Agent Team in-process without
 /// any ccteam workflow.yaml / `ccteam init` step. SKILL.md ships under
 /// `<repo>/skills/ccteam-team/SKILL.md`.
@@ -77,7 +77,7 @@ pub const CCTEAM_CREATOR_SKILL_MD: &str = include_str!(concat!(
     "/../../skills/ccteam-creator/SKILL.md"
 ));
 
-/// Embedded `SKILL.md` body for the V0.5.0 F93a `/ccteam:team` skill.
+/// Embedded `SKILL.md` body for the V0.5.0 F93a `/ccteam-team` skill.
 pub const CCTEAM_TEAM_SKILL_MD: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../skills/ccteam-team/SKILL.md"
@@ -130,7 +130,7 @@ pub fn install_ccteam_creator_skill(opts: InstallSkillOptions) -> Result<Install
 /// V0.5.0 F93a: install the `ccteam-team` skill into
 /// `~/.claude/skills/ccteam-team/SKILL.md`. Same idempotent semantics
 /// as the other shipped skills. Entry point for the V0.5.0 primary
-/// path — once installed, `/ccteam:team "<task>"` in any Claude
+/// path — once installed, `/ccteam-team "<task>"` in any Claude
 /// session in any git repo spawns an Anthropic Agent Team in-process.
 pub fn install_ccteam_team_skill(opts: InstallSkillOptions) -> Result<InstallSkillReport> {
     let claude = user_claude_dir().context("resolve ~/.claude/")?;
@@ -329,7 +329,7 @@ mod tests {
         assert!(body.contains("Worker Preamble"));
         // The entry syntax block must include all four forms documented
         // in the PRD F93a §需求.
-        for form in ["/ccteam:team <task>", "N \"<task>\"", "N:role", "auto"] {
+        for form in ["/ccteam-team <task>", "N \"<task>\"", "N:role", "auto"] {
             assert!(body.contains(form), "missing entry syntax form: {form}");
         }
     }

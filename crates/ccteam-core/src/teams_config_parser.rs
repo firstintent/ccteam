@@ -14,9 +14,13 @@
 //!    `Result<TeamConfigSnapshot>`. The caller WARNs once and degrades
 //!    the team to mtime-only watch (still in discovery list, but
 //!    events suppressed) instead of panicking.
-//! 3. **`definition_backed` rule** — `agentType ∈ {"general-purpose",
-//!    "team-lead"}` ⇒ `false` (ad-hoc / lead). Anything else ⇒ `true`
-//!    (definition-backed subagent). PRD F95 §需求 .4.
+//! 3. **`definition_backed` rule** (V0.5.1 F104b widened) —
+//!    `agentType ∈ {"general-purpose", "team-lead", "Explore",
+//!    "explore"}` ⇒ `false` (ad-hoc / lead / Anthropic built-in).
+//!    Anything else ⇒ `true` (definition-backed subagent). Pure rule —
+//!    callers that have access to the filesystem can additionally fall
+//!    back to `false` when the candidate `.claude/agents/<agentType>.md`
+//!    doesn't resolve in any scope (web crate path; emit stays pure).
 //!
 //! ## V0.5.0 SoT
 //!
@@ -100,12 +104,26 @@ pub fn parse_config(bytes: &[u8]) -> Result<TeamConfigSnapshot> {
     })
 }
 
-/// True when `agentType` is **not** one of the ad-hoc / lead markers
-/// (`general-purpose`, `team-lead`). PRD F95 §需求 .4 — F96 Web
-/// Topology uses this to decide whether to show "↗ definition link" or
-/// "📝 ad-hoc badge".
+/// True when `agentType` is **not** one of the ad-hoc / lead / built-in
+/// markers (`general-purpose`, `team-lead`, `Explore`, `explore`).
+///
+/// **V0.5.1 F104b** — the allowlist widened to include Anthropic's
+/// built-in `Explore` subagent type (host probe of
+/// `openhuman-codebase-research` showed `agentType: "Explore"` per
+/// teammate). Built-in subagent types ship with Claude Code itself, so
+/// there's no `.claude/agents/Explore.md` to render — treating them as
+/// ad-hoc keeps the F96 Topology card from emitting a spurious
+/// "definition missing" warning.
+///
+/// **Pure rule** — F95 emit path stays IO-free. Callers that have
+/// access to `~/.claude/` may layer a file-exists fallback on top
+/// (the web `compute_definition_backed_with_scope` does so), but this
+/// function deliberately never touches the filesystem.
 pub fn definition_backed_for(agent_type: &str) -> bool {
-    !matches!(agent_type, "general-purpose" | "team-lead")
+    !matches!(
+        agent_type,
+        "general-purpose" | "team-lead" | "Explore" | "explore"
+    )
 }
 
 /// Diff `prev` against `next` and produce the list of events the
@@ -228,6 +246,17 @@ mod tests {
         // subagent type" → definition-backed = true. This is the safer
         // default; F96 still needs to render a badge.
         assert!(definition_backed_for(""));
+    }
+
+    #[test]
+    fn definition_backed_rule_excludes_anthropic_explore_builtin() {
+        // V0.5.1 F104b — host probe of `openhuman-codebase-research`
+        // shows every teammate as `agentType: "Explore"` (Anthropic
+        // built-in subagent type). There's no `.claude/agents/Explore.md`
+        // to resolve, so the allowlist must treat both casings as
+        // ad-hoc.
+        assert!(!definition_backed_for("Explore"));
+        assert!(!definition_backed_for("explore"));
     }
 
     #[test]

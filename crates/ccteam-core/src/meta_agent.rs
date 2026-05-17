@@ -255,7 +255,7 @@ mod tests {
         // V0.5.0 F101: the role prompt's routing tree should explicitly
         // delegate new-project creation to the `ccteam-creator` skill
         // and bounce agent-team requests to the user's own session via
-        // `/ccteam:team`. Pin both so a future edit can't silently drop
+        // `/ccteam-team`. Pin both so a future edit can't silently drop
         // either delegation arm.
         let body = render_meta_role_prompt();
         assert!(
@@ -263,8 +263,8 @@ mod tests {
             "role prompt must point at the ccteam-creator skill for new projects",
         );
         assert!(
-            body.contains("/ccteam:team"),
-            "role prompt must mention the /ccteam:team skill for agent-team requests",
+            body.contains("/ccteam-team"),
+            "role prompt must mention the /ccteam-team skill for agent-team requests",
         );
         // memory_bridge_*.md is the cross-project memory contract; it
         // must survive the F101 reshape (red line).

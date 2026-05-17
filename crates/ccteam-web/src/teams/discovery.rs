@@ -17,11 +17,24 @@
 //! schema even though the actual computation is host-side once F95
 //! ships; until then F96 derives it inline for the API surface):
 //!
-//! - `agentType ∈ {"general-purpose", "team-lead"}` → `false` (ad-hoc;
-//!   prompt is inline in `config.json::members[i].prompt`).
+//! - `agentType ∈ {"general-purpose", "team-lead", "Explore",
+//!   "explore"}` → `false` (ad-hoc / lead / Anthropic built-in;
+//!   prompt is inline in `config.json::members[i].prompt`). The
+//!   `Explore` widening (V0.5.1 F104b) keeps the SPA from rendering
+//!   "definition missing" for built-in subagent types Anthropic ships
+//!   without a `.md` file.
 //! - Anything else (`"code-reviewer"`, `"security-reviewer"`, ...) →
-//!   `true` (definition-backed; F96 SPA renders an
-//!   `↗ definition` link).
+//!   only `true` when an actual `.claude/agents/<agentType>.md` exists
+//!   on the scope chain (project → user → plugin → managed). If the
+//!   file is missing in every scope, the V0.5.1 F104b safer-default
+//!   downgrades the member to ad-hoc so the SPA renders the inline
+//!   prompt path instead of a spurious "missing" warning.
+//!
+//! **Wire shape (V0.5.1 F104a)** — serialized JSON for the SPA uses
+//! snake_case field names (`agent_id`, `agent_type`, `joined_at`,
+//! `tmux_pane_id`, `backend_type`, `plan_mode_required`, `created_at`,
+//! `lead_agent_id`, `lead_session_id`). Anthropic's upstream camelCase
+//! shape is still accepted on deserialize via `serde(alias)`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -49,6 +62,12 @@ pub struct TeamListEntry {
 /// Parsed `<claude_home>/teams/<team>/config.json`. Shape mirrors the
 /// host live-probe (see fixture). All fields are owned `String`s so
 /// the struct is `Serialize` for the wire + reusable across requests.
+///
+/// **Wire shape (V0.5.1 F104a)**: serialized field names are snake_case
+/// for the SPA (`/api/v1/teams/<name>` consumer). Anthropic's
+/// `config.json` on disk is still camelCase — each renamed field
+/// carries a `serde(alias = "<camelCase>")` so the deserializer
+/// accepts the upstream shape unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TeamConfig {
     pub name: String,
@@ -56,11 +75,11 @@ pub struct TeamConfig {
     pub description: Option<String>,
     /// JS `Date.now()` in ms. Optional so a malformed config still
     /// renders cards.
-    #[serde(default, rename = "createdAt")]
+    #[serde(default, alias = "createdAt")]
     pub created_at: Option<i64>,
-    #[serde(default, rename = "leadAgentId")]
+    #[serde(default, alias = "leadAgentId")]
     pub lead_agent_id: Option<String>,
-    #[serde(default, rename = "leadSessionId")]
+    #[serde(default, alias = "leadSessionId")]
     pub lead_session_id: Option<String>,
     #[serde(default)]
     pub members: Vec<MemberView>,
@@ -68,36 +87,42 @@ pub struct TeamConfig {
 
 /// One `config.json::members[i]` entry, decorated with the
 /// F96-derived `definition_backed` flag.
+///
+/// Wire shape: snake_case (see [`TeamConfig`] for the V0.5.1 F104a
+/// rationale). Anthropic's camelCase input keys (`agentId`,
+/// `agentType`, `joinedAt`, `tmuxPaneId`, `backendType`,
+/// `planModeRequired`) are accepted on deserialization via
+/// `serde(alias)` so the upstream `config.json` parses unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MemberView {
-    #[serde(rename = "agentId")]
+    #[serde(alias = "agentId")]
     pub agent_id: String,
     pub name: String,
-    #[serde(default, rename = "agentType")]
+    #[serde(default, alias = "agentType")]
     pub agent_type: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
     pub color: Option<String>,
-    /// JS `Date.now()` in ms; lead's `joinedAt` doubles as
-    /// `createdAt` for the team.
-    #[serde(default, rename = "joinedAt")]
+    /// JS `Date.now()` in ms; lead's `joined_at` doubles as
+    /// `created_at` for the team.
+    #[serde(default, alias = "joinedAt")]
     pub joined_at: Option<i64>,
     #[serde(default)]
     pub cwd: Option<String>,
-    /// Set on ad-hoc teammates (`agentType ∈ {"general-purpose",
+    /// Set on ad-hoc teammates (`agent_type ∈ {"general-purpose",
     /// "team-lead"}`). Definition-backed members get their full
-    /// prompt from `.claude/agents/<agentType>.md`, so this field
+    /// prompt from `.claude/agents/<agent_type>.md`, so this field
     /// is absent.
     #[serde(default)]
     pub prompt: Option<String>,
     #[serde(default)]
     pub subscriptions: Vec<String>,
-    #[serde(default, rename = "tmuxPaneId")]
+    #[serde(default, alias = "tmuxPaneId")]
     pub tmux_pane_id: Option<String>,
-    #[serde(default, rename = "backendType")]
+    #[serde(default, alias = "backendType")]
     pub backend_type: Option<String>,
-    #[serde(default, rename = "planModeRequired")]
+    #[serde(default, alias = "planModeRequired")]
     pub plan_mode_required: Option<bool>,
     /// Computed by `compute_definition_backed`. Wire-visible so the
     /// SPA Topology can branch on it directly.
@@ -109,12 +134,46 @@ fn default_definition_backed() -> bool {
     false
 }
 
-/// PRD §F95 `definition_backed` rule.
+/// PRD §F95 `definition_backed` rule — pure allowlist form. Returns
+/// `false` for `None` / `general-purpose` / `team-lead` / `Explore` /
+/// `explore` (V0.5.1 F104b widened allowlist). Use
+/// [`compute_definition_backed_with_scope`] when you have access to
+/// `~/.claude/` and want the safer file-exists fallback for unknown
+/// built-ins.
 pub fn compute_definition_backed(agent_type: Option<&str>) -> bool {
     match agent_type {
         None => false,
-        Some(t) => !matches!(t, "general-purpose" | "team-lead"),
+        Some(t) => ccteam_core::teams_config_parser::definition_backed_for(t),
     }
+}
+
+/// V0.5.1 F104b — scope-aware `definition_backed` decision. Same as
+/// [`compute_definition_backed`] when the allowlist already rules the
+/// type out, otherwise checks the F96 scope chain (project → user →
+/// plugin → managed) for `.claude/agents/<agentType>.md` and returns
+/// `false` when no candidate resolves. Keeps the SPA Topology card
+/// from rendering "definition missing" warnings for any built-in
+/// subagent type Anthropic adds in the future (`Coder`, `Doc`, …).
+///
+/// `member_cwd` is the parsed member's `cwd` (project-scope override);
+/// pass `None` when the member entry has no cwd.
+pub fn compute_definition_backed_with_scope(
+    agent_type: Option<&str>,
+    claude_home: &Path,
+    member_cwd: Option<&Path>,
+) -> bool {
+    let Some(t) = agent_type else {
+        return false;
+    };
+    if !ccteam_core::teams_config_parser::definition_backed_for(t) {
+        return false;
+    }
+    // Allowlist says "should be backed by a .md file" — verify one
+    // actually exists somewhere on the scope chain. If not, downgrade
+    // to ad-hoc so the SPA doesn't try to fetch `.../definition` and
+    // render a spurious "missing" warning.
+    let candidates = crate::teams::subagent_resolver::candidate_paths(claude_home, member_cwd, t);
+    candidates.iter().any(|(_, p)| p.exists())
 }
 
 /// `<claude_home>/teams/` → enumerate every direct subdir whose
@@ -145,7 +204,7 @@ pub fn discover_teams(claude_home: &Path) -> Result<Vec<TeamListEntry>> {
             // Skip non-team dirs that happen to live alongside.
             continue;
         }
-        match load_team_config_from(&cfg_path) {
+        match load_team_config_from(claude_home, &cfg_path) {
             Ok(cfg) => {
                 let last_activity = cfg
                     .members
@@ -186,16 +245,21 @@ pub fn discover_teams(claude_home: &Path) -> Result<Vec<TeamListEntry>> {
 /// with `members[].definition_backed` filled in.
 pub fn load_team_config(claude_home: &Path, name: &str) -> Result<TeamConfig> {
     let path = teams_root(claude_home).join(name).join("config.json");
-    load_team_config_from(&path)
+    load_team_config_from(claude_home, &path)
 }
 
-pub(crate) fn load_team_config_from(path: &Path) -> Result<TeamConfig> {
+pub(crate) fn load_team_config_from(claude_home: &Path, path: &Path) -> Result<TeamConfig> {
     let body = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let mut cfg: TeamConfig =
         serde_json::from_str(&body).with_context(|| format!("parse {}", path.display()))?;
     // Decorate members with the derived `definition_backed` flag.
+    // V0.5.1 F104b: scope-aware so unknown built-in subagent types
+    // (e.g. `Explore`) fall back to ad-hoc rendering instead of a
+    // spurious "definition missing" warning.
     for m in &mut cfg.members {
-        m.definition_backed = compute_definition_backed(m.agent_type.as_deref());
+        let cwd = m.cwd.as_deref().map(std::path::Path::new);
+        m.definition_backed =
+            compute_definition_backed_with_scope(m.agent_type.as_deref(), claude_home, cwd);
     }
     Ok(cfg)
 }

@@ -85,6 +85,33 @@ describe("TeamTopology", () => {
     expect(html).toContain("↗ definition");
   });
 
+  // V0.5.1 F104b — Anthropic's built-in `Explore` subagent type ships
+  // without a `.claude/agents/Explore.md`. Backend now flags these as
+  // `definition_backed: false`, so the SPA renders the ad-hoc badge
+  // and shows the real agent_type label (NOT "unknown") and the
+  // model. The "↗ definition" / "definition missing" path is never
+  // taken.
+  it("renders Explore built-in teammates as ad-hoc with their real label", () => {
+    const cfg = config([
+      member({
+        name: "rust-core-explorer",
+        agent_type: "Explore",
+        model: "haiku",
+        definition_backed: false,
+      }),
+    ]);
+    const html = renderTopology(cfg);
+    expect(html).toContain("data-testid=\"member-card-rust-core-explorer\"");
+    // Real agent_type / model labels show, not the "unknown" fallback.
+    expect(html).toContain("Explore");
+    expect(html).toContain("haiku");
+    expect(html).not.toContain("unknown");
+    // Ad-hoc badge wins, definition link / missing banner absent.
+    expect(html).toContain("data-testid=\"badge-adhoc\"");
+    expect(html).not.toContain("data-testid=\"badge-definition\"");
+    expect(html).not.toContain("data-testid=\"definition-missing\"");
+  });
+
   it("renders 'idle' state badge when teammate is in the idle set", () => {
     const cfg = config([
       member({ name: "researcher", backend_type: "in-process" }),
