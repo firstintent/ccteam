@@ -1,0 +1,288 @@
+[
+  {
+    "from": "frontend-dev",
+    "text": "{\"type\":\"idle_notification\",\"from\":\"frontend-dev\",\"timestamp\":\"2026-05-16T13:45:19.594Z\",\"idleReason\":\"available\"}",
+    "timestamp": "2026-05-16T13:45:19.594Z",
+    "color": "green",
+    "read": true
+  },
+  {
+    "from": "reviewer",
+    "text": "reviewer 已就绪，按以下状态等待：\n\n- 文档熟悉完毕：architecture.md, invariants.md, 审查维度已加载\n- 任务状态：T0-T4 pending，T5 被阻塞\n- 当前阶段：等待 frontend-dev 完成开发\n\n将在收到 frontend-dev 的审查请求后立即启动审查流程。",
+    "summary": "Reviewer 确认就绪，等待开发完成",
+    "timestamp": "2026-05-16T13:46:39.238Z",
+    "color": "yellow",
+    "read": true
+  },
+  {
+    "from": "reviewer",
+    "text": "{\"type\":\"idle_notification\",\"from\":\"reviewer\",\"timestamp\":\"2026-05-16T13:46:41.274Z\",\"idleReason\":\"available\"}",
+    "timestamp": "2026-05-16T13:46:41.274Z",
+    "color": "yellow",
+    "read": true
+  },
+  {
+    "from": "researcher",
+    "text": "## 调研完成：技术栈调研报告\n\n目标：为 frontend-dev 提供可执行的方案\n\n### 核心结论\n\n**1. Next.js 15 + MDX 博客架构**\nVelite 作为内容层的选择是正确的。与直接用 `@next/mdx` 相比，Velite 提供：Zod schema 校验 + 自动类型生成 + asset 资源处理（hash + copy to public）+ 内置 TOC/excerpt/metadata 生成。博客路由使用 `generateStaticParams` + `dynamicParams = false` 做全静态生成。\n\n架构文档的流程图（content/ → Velite → `.velite/*.json` → Next.js）完全正确，无需修改。\n\n**2. Velite 配置**\n- 推荐配置两个 collections: `posts`（文章）和 `pages`（独立页面）\n- 关键 schema 字段：`s.slug()`（唯一性校验）、`s.image()`（自动 blurDataURL）、`s.metadata()`（readingTime）、`s.toc()`（目录）、`s.markdown()`（渲染）\n- Build 集成：在 `next.config.ts` 中通过 `velite.build()` 在 dev/build 时自动运行\n- `.gitignore` 添加 `.velite` + `public/static`\n\n**3. Shiki 代码高亮**\n- 推荐 `@shikijs/rehype` 作为 Velite markdown 的 rehype plugin\n- 双主题配置：`themes: { light: 'vitesse-light', dark: 'vitesse-dark' }`（或 `github-light` + `github-dark-dimmed`）\n- CSS 方案：`.dark .shiki, .dark .shiki span { color: var(--shiki-dark) !important; }`\n- 构建时完成高亮，运行时零开销\n\n**4. Tailwind typography**\n- 基础：`prose dark:prose-invert max-w-none`\n- 推荐：`prose lg:prose-lg` 响应式字号\n- 可用 `@utility` 自定义 prose 色彩（Tailwind v4）\n- 装饰组合：`prose-headings:font-bold prose-a:text-blue-600 prose-code:rounded prose-pre:border`\n\n**5. 暗色模式（next-themes）**\n- `attribute=\"class\"` + `defaultTheme=\"system\"` → 与 Tailwind 兼容\n- 根 layout 必须：`<html suppressHydrationWarning>` + `<ThemeProvider>`\n- FOUC 自动防护（生产构建无闪烁）\n- 主题切换组件：`useTheme()` + 客户端 mounted guard\n\n**6. Mintlify 设计语言参考**\n从 Mintlify 网站分析提炼：\n- 布局：双栏导航，慷慨留白，卡片层级（featured > grid）\n- 元数据模式：日期 → 阅读时间 → 标题 → 摘要\n- 分类标签筛选，完整 dark mode\n- 推荐 roblog 配色方向在报告正文中\n\n### 推荐的技术栈包依赖\n- `dependencies`: next 15, react 19, react-dom 19, next-themes\n- `devDependencies`: typescript, velite, tailwindcss 4, @tailwindcss/typography, @shikijs/rehype\n\n### 关键决策（已写入调研记录）\n| # | 决策 | 理由 |\n|---|------|------|\n| 1 | 用 Velite 而非 `@next/mdx` | 类型安全 + 资源处理 + TOC/excerpt 自动生成 |\n| 2 | 内容用 `.md`（非 `.mdx`） | 博客不需要嵌入 React 组件，降低复杂度 |\n| 3 | `@shikijs/rehype` 在 Velite 层做高亮 | 构建时完成，运行时零开销 |\n| 4 | `next-themes` + `attribute=\"class\"` | 与 Tailwind 无缝集成 |\n| 5 | `vitesse-light` + `vitesse-dark` Shiki 主题 | 温暖干净，亮暗对比自然 |\n\n### 风险/缺口\n1. Velite 的 `s.mdx()` 输出字符串而非 React 组件——如果后期需要嵌入式组件，需重新评估方案\n2. Tailwind v4 的 `@utility` 语法仍在演进，自定义 prose 主题可能需要调试\n3. 建议先建一个最小可运行的 MVP（1 篇文章能渲染）再往下推进\n\n### 文件位置\n- task_plan: `.plans/roblog/researcher/research-tech-stack/task_plan.md`（全部打勾）\n- progress: `.plans/roblog/researcher/research-tech-stack/progress.md`（已更新）\n- 根 progress: `.plans/roblog/researcher/progress.md`（已更新）\n\n### 环境副作用\nnone",
+    "summary": "技术栈调研完成，6 个方向全部覆盖",
+    "timestamp": "2026-05-16T13:47:22.273Z",
+    "color": "blue",
+    "read": true
+  },
+  {
+    "from": "researcher",
+    "text": "{\"type\":\"idle_notification\",\"from\":\"researcher\",\"timestamp\":\"2026-05-16T13:47:26.316Z\",\"idleReason\":\"available\"}",
+    "timestamp": "2026-05-16T13:47:26.316Z",
+    "color": "blue",
+    "read": true
+  },
+  {
+    "from": "frontend-dev",
+    "text": "T1: 项目脚手架 — 完成。\n\n## 完成内容\n\n1. **初始化**：Next.js 15.5.18 (via create-next-app@15)\n2. **依赖全部安装完成**（共 473 packages）：\n   - runtime: next, react, react-dom, next-themes, rehype-stringify, unified\n   - dev: velite, shiki, @shikijs/rehype, tailwindcss@4, @tailwindcss/postcss, @tailwindcss/typography, typescript\n3. **目录结构创建**：content/, src/app/, src/components/, src/lib/\n4. **全局配置完成**：next.config.ts, globals.css (Tailwind v4 + dark mode variant), Tailwind typography plugin 安装\n5. **构建脚本更新**：`npm run build` = `velite build && next build`\n6. `npm run dev` 验证通过，启动时间 1.8s，无错误\n\n## 关键发现\n\n- `create-next-app@latest` 会安装 Next.js 16（不兼容），需显式用 `@15` 锁定版本\n- Tailwind v4 使用 `@import \"tailwindcss\"` 而非 v3 的 `@tailwind` directives\n- dark mode variant 需要用 `@custom-variant dark (&:where(.dark, .dark *))`\n\n## 文档位置\n- task plan: `.plans/roblog/frontend-dev/task-scaffold/task_plan.md`（已全部勾选）\n- findings: `.plans/roblog/frontend-dev/task-scaffold/findings.md`\n- progress: `.plans/roblog/frontend-dev/task-scaffold/progress.md`\n\n## 环境副作用\n- 无（所有依赖已安装，无需额外步骤）\n- `npm run build` 当前会失败（无 velite.config.ts），T2 中会补全\n\n## 下一步\n按照计划，T1 不需要审查。是否继续开始 T2（内容层 - Velite 配置 + MDX 解析）？",
+    "summary": "T1 脚手架搭建完成，汇报结果",
+    "timestamp": "2026-05-16T13:52:24.828Z",
+    "color": "green",
+    "read": true
+  },
+  {
+    "from": "frontend-dev",
+    "text": "T2: 内容层（Velite + MDX 解析）— 完成。\n\n## 完成内容\n\n1. **velite.config.ts** — 创建 posts + pages 两个 collections\n2. **Shiki 双主题代码高亮** — vitese-light + vitesse-dark，在 `s.mdx()` 中通过 `@shikijs/rehype` 配置\n3. **TypeScript 类型** — Velite 自动生成 `.velite/index.d.ts`，添加 `@velite/*` 路径别名\n4. **内容查询层** — `src/lib/content.ts` 提供类型安全的 `posts`/`pages`/`getPostBySlug`/`getAllTags`\n5. **示例内容** — `content/posts/hello-world.md` + `content/pages/about.md`\n6. **Tailwind typography** — 通过 CSS `@plugin \"@tailwindcss/typography\"` 注册\n7. **验证通过** — `velite build` 成功（~7s），`npm run dev` 启动成功，无错误\n\n## 关键发现\n\n- `s.slug()` **不**自动从文件名生成 slug，需在 frontmatter 显式设置（slug: hello-world）\n- `@tailwindcss/typography` 在 Tailwind v4 中用 `@plugin` CSS 指令注册，不再需要 tailwind.config.ts\n- Shiki 输出使用 CSS 变量实现双主题：`--shiki-dark-bg` / `--shiki-dark` 等\n\n## 文档位置\n- task plan: `.plans/roblog/frontend-dev/task-content-layer/task_plan.md`\n- findings: `.plans/roblog/frontend-dev/task-content-layer/findings.md`\n- progress: `.plans/roblog/frontend-dev/task-content-layer/progress.md`\n\n## 环境副作用\n- `velite build` 已运行一次，生成了 `.velite/` 目录（在 `.gitignore` 中）\n- `npm run build` 现在可完整执行（velite build + next build）\n\n## 下一步\nT3 和 T4 待开始。T3（博客页面）包含首页、文章详情页、TOC 导航。由于这是大功能，完成后需要 reviewer 审查——我先确认你的意见后开始 T3？",
+    "summary": "T2 内容层完成，汇报结果",
+    "timestamp": "2026-05-16T13:56:15.763Z",
+    "color": "green",
+    "read": true
+  },
+  {
+    "from": "frontend-dev",
+    "text": "{\"type\":\"idle_notification\",\"from\":\"frontend-dev\",\"timestamp\":\"2026-05-16T13:56:18.673Z\",\"idleReason\":\"available\"}",
+    "timestamp": "2026-05-16T13:56:18.673Z",
+    "color": "green",
+    "read": true
+  },
+  {
+    "from": "pm",
+    "text": "{\"type\":\"idle_notification\",\"from\":\"pm\",\"timestamp\":\"2026-05-16T13:57:37.327Z\",\"idleReason\":\"available\"}",
+    "timestamp": "2026-05-16T13:57:37.327Z",
+    "color": "purple",
+    "read": true
+  },
+  {
+    "from": "frontend-dev",
+    "text": "team-lead，你在下发 T2 时我们的消息交叉了。T2 实际已完成（参见我稍早的完成汇报）。你的新要求我已补上：\n\n## 变更摘要\n\n**已补充的字段：**\n- `author: s.string().optional()` \n- `image: s.image().optional()` — Velite 自动处理 blurDataURL\n- `metadata: s.metadata()` — 自动计算 readingTime + wordCount\n\n**字段重命名：**\n- `body` → `content`（与你的要求一致）\n\n**验证结果：**\n- `velite build` 成功，输出包含所有新字段\n- `npm run build` 成功（velite + next build 均通过）\n- 输出示例：`author: \"rob\"`, `metadata: { readingTime: 1, wordCount: 68 }`\n\n## 是否需要 reviewer？\n你说 T2 完成后需要 reviewer 审查。我现在联系 reviewer 开始审查，还是按计划直接开始 T3？",
+    "summary": "T2 字段补齐完毕，询问审查安排",
+    "timestamp": "2026-05-16T13:58:31.929Z",
+    "color": "green",
+    "read": true
+  },
+  {
+    "from": "frontend-dev",
+    "text": "{\"type\":\"idle_notification\",\"from\":\"frontend-dev\",\"timestamp\":\"2026-05-16T13:58:35.878Z\",\"idleReason\":\"available\"}",
+    "timestamp": "2026-05-16T13:58:35.878Z",
+    "color": "green",
+    "read": true
+  },
+  {
+    "from": "reviewer",
+    "text": "T2 内容层审查完成。\n\n**Verdict: [WARN]**\n- 1 HIGH: 缺失 Shiki 暗色模式 CSS\n- 1 MEDIUM: RehypeShiki 配置重复\n- 2 LOW: 冗余依赖、next-themes 未集成\n\n详见 `.plans/roblog/reviewer/review-content-layer/findings.md`\n异常提醒：cross-reference 已追加到 frontend-dev 的 findings.md。\n\n预计 frontend-dev 修复 HIGH 问题后即可合并。是否启动 custodian 巡检由你决定。",
+    "summary": "T2 review complete: [WARN] - report written",
+    "timestamp": "2026-05-16T14:02:02.789Z",
+    "color": "yellow",
+    "read": true
+  },
+  {
+    "from": "reviewer",
+    "text": "{\"type\":\"idle_notification\",\"from\":\"reviewer\",\"timestamp\":\"2026-05-16T14:02:05.970Z\",\"idleReason\":\"available\",\"summary\":\"[to frontend-dev] T2 content layer review: [WARN] - missing Shiki dark CSS\"}",
+    "timestamp": "2026-05-16T14:02:05.970Z",
+    "color": "yellow",
+    "read": true
+  },
+  {
+    "from": "frontend-dev",
+    "text": "T3: 博客页面 — 完成。同时 T2 审查问题已处理。\n\n## T3 完成内容\n\n**页面路由（7 个静态页面）：**\n| 路由 | 类型 | 说明 |\n|------|------|------|\n| / | Static | 文章列表（title/date/readingTime/description/tags） |\n| /posts/hello-world | SSG | 文章详情（MDX 渲染 + Shiki 代码高亮 + prose 排版） |\n| /about | Static | About 页面 |\n| /404 | Static | 404 页面 |\n\n**组件：**\n- `Header` — sticky top, 博客名 + About 链接 + ThemeToggle\n- `Footer` — 页脚\n- `ThemeToggle` — next-themes 暗色切换（sun/moon icons, hydration safe）\n- `MDXContent` — 客户端运行时 MDX 渲染（new Function + react/jsx-runtime）\n- `Providers` — ThemeProvider 封装\n\n## T2 审查（reviewer: [WARN]）— 已全部修复\n\n| 问题 | 严重度 | 状态 | 修复方式 |\n|------|--------|------|---------|\n| 缺失 Shiki 暗色 CSS | HIGH | 已修复 | globals.css 添加 `.dark .shiki` 规则 |\n| RehypeShiki 配置重复 | MEDIUM | 已修复 | velite.config.ts DRY 提取共享变量 |\n| next-themes 未集成 | LOW | 已修复 | T3 已添加 Providers + ThemeToggle |\n| unified/rehype-stringify 冗余 | LOW | 保留 | unified 用于 velite.config.ts 类型 |\n| 非 git 仓库 | INFO | 保留 | 后续由 team-lead 处理 |\n\n## 文档\n- task-pages plan: `.plans/roblog/frontend-dev/task-pages/task_plan.md`\n- findings: `.plans/roblog/frontend-dev/task-pages/findings.md`\n- 架构更新: `.plans/roblog/docs/architecture.md`（§组件图和§数据流已重写）\n\n## 环境副作用\n- 无（npm run build 已通过，全部静态生成）\n\n## 下一步建议\nT4（视觉打磨）包含排版精调、暗色模式完善和动画。这是一个 UI 打磨任务，是否现在开始？或者先由 reviewer 审查 T3？",
+    "summary": "T3 完成 + T2 审查修复汇报",
+    "timestamp": "2026-05-16T14:04:04.290Z",
+    "color": "green",
+    "read": true
+  },
+  {
+    "from": "frontend-dev",
+    "text": "{\"type\":\"idle_notification\",\"from\":\"frontend-dev\",\"timestamp\":\"2026-05-16T14:04:07.846Z\",\"idleReason\":\"available\",\"summary\":\"[to reviewer] 请求审查 T2：内容层基\"}",
+    "timestamp": "2026-05-16T14:04:07.846Z",
+    "color": "green",
+    "read": true
+  },
+  {
+    "from": "frontend-dev",
+    "text": "{\"type\":\"idle_notification\",\"from\":\"frontend-dev\",\"timestamp\":\"2026-05-16T14:04:21.901Z\",\"idleReason\":\"available\",\"summary\":\"[to reviewer] T2 审查问题已全部修复\"}",
+    "timestamp": "2026-05-16T14:04:21.901Z",
+    "color": "green",
+    "read": true
+  },
+  {
+    "from": "frontend-dev",
+    "text": "{\"type\":\"idle_notification\",\"from\":\"frontend-dev\",\"timestamp\":\"2026-05-16T14:04:27.639Z\",\"idleReason\":\"available\"}",
+    "timestamp": "2026-05-16T14:04:27.639Z",
+    "color": "green",
+    "read": true
+  },
+  {
+    "from": "reviewer",
+    "text": "{\"type\":\"idle_notification\",\"from\":\"reviewer\",\"timestamp\":\"2026-05-16T14:04:46.558Z\",\"idleReason\":\"available\",\"summary\":\"[to frontend-dev] T2 review fixes verified, all CLOSED\"}",
+    "timestamp": "2026-05-16T14:04:46.558Z",
+    "color": "yellow",
+    "read": true
+  },
+  {
+    "from": "reviewer",
+    "text": "T3 博客页面审查完成。\n\n**Verdict: [OK]**\n- 0 CRITICAL, 0 HIGH\n- 1 MEDIUM: MDXContent catch 静默失败\n- 1 LOW: ThemeToggle 占位符偏移\n- 3 INFO: 未映射 a->Link、品牌名硬编码、INV-3 合规\n\n详见 `.plans/roblog/reviewer/review-pages/findings.md`\n\n这份比 T2 干净很多。[OK] 通过。T4 完成后继续 T5 全栈审查。",
+    "summary": "T3 review: [OK] - ready to merge",
+    "timestamp": "2026-05-16T14:06:37.450Z",
+    "color": "yellow",
+    "read": true
+  },
+  {
+    "from": "reviewer",
+    "text": "{\"type\":\"idle_notification\",\"from\":\"reviewer\",\"timestamp\":\"2026-05-16T14:06:40.140Z\",\"idleReason\":\"available\",\"summary\":\"[to frontend-dev] T3 pages review: [OK] - no HIGH issues\"}",
+    "timestamp": "2026-05-16T14:06:40.140Z",
+    "color": "yellow",
+    "read": true
+  },
+  {
+    "from": "frontend-dev",
+    "text": "T4: 视觉打磨 — 完成。\n\n## 已执行操作\n\n**T3 审查请求：** 已发给 reviewer\n**T2 修复确认：** 已发给 reviewer（HIGH Shiki CSS 已在 T3 中修复）\n\n**T4 视觉打磨：**\n\n**CSS 变更（`src/app/globals.css`）：**\n| 类别 | 变更 |\n|------|------|\n| Prose 链接 | blue-600/blue-400 配色 + border-bottom hover 动效 |\n| Inline code | bg `#f3f4f6` / `#1f2937`(dark)，`rounded` + padding |\n| 代码块 | `border` + `rounded-lg` + `p-4`，暗色 border `#374151` |\n| Blockquote | italic + 3px border，暗色 border `#4b5563` |\n| 标题 | font-weight 600 + letter-spacing 负值 |\n| 主题切换 | body `transition: background-color 0.3s ease` |\n| 页面动画 | main `fade-in 0.4s ease-out`（纯 CSS keyframes） |\n\n**未做的决策（按 PM spec）：**\n- TOC 侧边导航 — P2，短文章不需要\n- 复杂动画库 — 保持纯 CSS，无额外依赖\n- prose 字体大小 — Tailwind v4 默认已合适\n\n## 所有任务总览\n\n| 任务 | 状态 | 审查 |\n|------|------|------|\n| T1 脚手架 | done | 小任务免审 |\n| T2 内容层 | done | [WARN] → [REVIEW-FIX] 已修复已通知 |\n| T3 页面 | done | **已发给 reviewer 审查中** |\n| T4 视觉打磨 | done | **需要 reviewer 审查（RD-1/RD-2）** |\n| T5 全栈审查 | pending | |\n\nT3 和 T4 都完成了，等 reviewer 的结果。需要我发 T4 审查请求给 reviewer 吗？还是先等 T3 的结果？",
+    "summary": "T4 完成 + 所有任务状态总览",
+    "timestamp": "2026-05-16T14:06:47.989Z",
+    "color": "green",
+    "read": true
+  },
+  {
+    "from": "frontend-dev",
+    "text": "{\"type\":\"idle_notification\",\"from\":\"frontend-dev\",\"timestamp\":\"2026-05-16T14:06:50.049Z\",\"idleReason\":\"available\",\"summary\":\"[to reviewer] 请求审查 T3：博客页面\"}",
+    "timestamp": "2026-05-16T14:06:50.049Z",
+    "color": "green",
+    "read": true
+  },
+  {
+    "from": "frontend-dev",
+    "text": "{\"type\":\"idle_notification\",\"from\":\"frontend-dev\",\"timestamp\":\"2026-05-16T14:06:53.993Z\",\"idleReason\":\"available\"}",
+    "timestamp": "2026-05-16T14:06:53.993Z",
+    "color": "green",
+    "read": true
+  },
+  {
+    "from": "frontend-dev",
+    "text": "{\"type\":\"idle_notification\",\"from\":\"frontend-dev\",\"timestamp\":\"2026-05-16T14:07:43.241Z\",\"idleReason\":\"available\",\"summary\":\"[to reviewer] T3 审查问题已修复\"}",
+    "timestamp": "2026-05-16T14:07:43.241Z",
+    "color": "green",
+    "read": true
+  },
+  {
+    "from": "reviewer",
+    "text": "{\"type\":\"idle_notification\",\"from\":\"reviewer\",\"timestamp\":\"2026-05-16T14:07:52.679Z\",\"idleReason\":\"available\",\"summary\":\"[to frontend-dev] T3 fixes verified, all CLOSED\"}",
+    "timestamp": "2026-05-16T14:07:52.679Z",
+    "color": "yellow",
+    "read": true
+  },
+  {
+    "from": "frontend-dev",
+    "text": "{\"type\":\"idle_notification\",\"from\":\"frontend-dev\",\"timestamp\":\"2026-05-16T14:07:55.265Z\",\"idleReason\":\"available\",\"summary\":\"[to reviewer] 请求审查 T4：视觉打磨\"}",
+    "timestamp": "2026-05-16T14:07:55.265Z",
+    "color": "green",
+    "read": true
+  },
+  {
+    "from": "frontend-dev",
+    "text": "{\"type\":\"idle_notification\",\"from\":\"frontend-dev\",\"timestamp\":\"2026-05-16T14:07:57.988Z\",\"idleReason\":\"available\"}",
+    "timestamp": "2026-05-16T14:07:57.988Z",
+    "color": "green",
+    "read": true
+  },
+  {
+    "from": "reviewer",
+    "text": "T4 视觉打磨审查完成。\n\n**Verdict: [OK]**\n- 0 CRITICAL, 0 HIGH\n- 1 MEDIUM: prefers-reduced-motion 未尊重\n- 1 LOW: body transition 首屏可能闪烁\n- 2 INFO: fade-in 闪白、doc-code 一致\n\n详见 `.plans/roblog/reviewer/review-styling/findings.md`\n\nT1-T4 全部审查通过。T5（全栈审查）可以启动了——需要我启动吗？",
+    "summary": "T4 review: [OK] - T5 ready",
+    "timestamp": "2026-05-16T14:08:58.549Z",
+    "color": "yellow",
+    "read": true
+  },
+  {
+    "from": "reviewer",
+    "text": "{\"type\":\"idle_notification\",\"from\":\"reviewer\",\"timestamp\":\"2026-05-16T14:09:00.823Z\",\"idleReason\":\"available\",\"summary\":\"[to frontend-dev] T4 styling review: [OK] - 0 HIGH, 1 MEDIUM\"}",
+    "timestamp": "2026-05-16T14:09:00.823Z",
+    "color": "yellow",
+    "read": true
+  },
+  {
+    "from": "frontend-dev",
+    "text": "{\"type\":\"idle_notification\",\"from\":\"frontend-dev\",\"timestamp\":\"2026-05-16T14:09:43.926Z\",\"idleReason\":\"available\",\"summary\":\"[to reviewer] T4 审查 MEDIUM 问题已修复\"}",
+    "timestamp": "2026-05-16T14:09:43.926Z",
+    "color": "green",
+    "read": true
+  },
+  {
+    "from": "reviewer",
+    "text": "{\"type\":\"idle_notification\",\"from\":\"reviewer\",\"timestamp\":\"2026-05-16T14:09:57.081Z\",\"idleReason\":\"available\",\"summary\":\"[to frontend-dev] T4 fix verified, CLOSED\"}",
+    "timestamp": "2026-05-16T14:09:57.081Z",
+    "color": "yellow",
+    "read": true
+  },
+  {
+    "from": "frontend-dev",
+    "text": "所有任务层审查闭环：\n\n| 任务 | 审查 | 状态 |\n|------|------|------|\n| T2 content-layer | [WARN] → [REVIEW-FIX] | CLOSED verified |\n| T3 pages | [OK] → [REVIEW-FIX] | CLOSED verified |\n| T4 styling | [OK] → [REVIEW-FIX] | CLOSED verified |\n\n无残留 open finding。**可以进行 T5 全栈审查。**",
+    "summary": "所有审查闭环，T5 已就绪",
+    "timestamp": "2026-05-16T14:10:00.994Z",
+    "color": "green",
+    "read": true
+  },
+  {
+    "from": "frontend-dev",
+    "text": "{\"type\":\"idle_notification\",\"from\":\"frontend-dev\",\"timestamp\":\"2026-05-16T14:10:03.152Z\",\"idleReason\":\"available\"}",
+    "timestamp": "2026-05-16T14:10:03.152Z",
+    "color": "green",
+    "read": true
+  },
+  {
+    "from": "frontend-dev",
+    "text": "{\"type\":\"idle_notification\",\"from\":\"frontend-dev\",\"timestamp\":\"2026-05-16T14:10:06.905Z\",\"idleReason\":\"available\"}",
+    "timestamp": "2026-05-16T14:10:06.905Z",
+    "color": "green",
+    "read": true
+  },
+  {
+    "from": "reviewer",
+    "text": "T5 全栈最终审查完成。\n\n## 最终裁决：[OK]\n\n### 核活结果\n6/6 历史 findings 全部 CLOSED。无幻影台账。\n\n### 审查概览\n\n**安全检查：**\n- 硬编码密钥：PASS\n- XSS：ACCEPTABLE（仅作者写 content/）\n- 路径穿越：PASS\n- 依赖安全：PASS\n- 输入校验：PASS\n\n**不变量：**\n- INV-1 XSS：合规（安全假设需记录 → HIGH#1）\n- INV-2 frontmatter 校验：合规 ✅\n- INV-3 静态生成：合规 ✅\n- INV-4 Lighthouse：无自动化检测 → HIGH#2\n\n**Doc-Code：** 完全一致 ✅\n\n**维度评分：**\n| RD-1 视觉 | RD-2 阅读 | RD-3 质量 | RD-4 性能 |\n|-----------|-----------|-----------|-----------|\n| ADEQUATE | ADEQUATE | STRONG | STRONG |\n\n### 新发现\n- **[HIGH] INV-1 安全假设未文档化** — 当前\"只有作者写内容\"的假设未记录，未来引入用户输入会失效\n- **[HIGH] INV-4 无自动化检测** — Lighthouse >= 90 无验证手段\n- **[MEDIUM] Fragment import 模式** — TS 无法静态追踪 new Function 中的使用\n- **[INFO] 3 项** — getAllTags 死代码、rehype-stringify 可能冗余、非 git 仓库\n\n两个 HIGH 均为系统级文档/自动化缺失，不是代码 bug。合并不受阻。\n\n完整报告：`.plans/roblog/reviewer/review-full/findings.md`\n\n### 发布前建议\n1. 补充 invariants.md 中 INV-1 的安全假设说明\n2. 手动跑一次 Lighthouse\n3. git init + 首次提交\n4. 确认 rehype-stringify 是否为冗余",
+    "summary": "T5 full-stack review: [OK] - ready for release",
+    "timestamp": "2026-05-16T14:11:46.206Z",
+    "color": "yellow",
+    "read": true
+  },
+  {
+    "from": "reviewer",
+    "text": "{\"type\":\"idle_notification\",\"from\":\"reviewer\",\"timestamp\":\"2026-05-16T14:11:52.691Z\",\"idleReason\":\"available\",\"summary\":\"[to frontend-dev] T5 [OK] - all reviews complete\"}",
+    "timestamp": "2026-05-16T14:11:52.691Z",
+    "color": "yellow",
+    "read": true
+  },
+  {
+    "from": "reviewer",
+    "text": "{\"type\":\"idle_notification\",\"from\":\"reviewer\",\"timestamp\":\"2026-05-16T14:11:55.374Z\",\"idleReason\":\"available\"}",
+    "timestamp": "2026-05-16T14:11:55.374Z",
+    "color": "yellow",
+    "read": true
+  },
+  {
+    "from": "frontend-dev",
+    "text": "所有工作完成，最终状态汇报。\n\n## Project State\n\n- **所有任务**: T0-T5 全部完成\n- **审查**: T2/T3/T4/T5 全部 [OK] 或已修复至 [CLOSED]\n- **Git**: git init + MVP commit 完成（78 files, 14247 insertions）\n\n## Project Files (MVP)\n\n```\nblog/\n  content/\n    posts/hello-world.md       -- 示例文章\n    pages/about.md             -- 关于页面\n  src/\n    app/\n      layout.tsx               -- Root layout (Header/Footer/Providers)\n      page.tsx                 -- 首页文章列表\n      not-found.tsx            -- 404\n      posts/[slug]/page.tsx    -- 文章详情 (SSG)\n      about/page.tsx           -- About\n    components/\n      header.tsx               -- 导航栏\n      footer.tsx               -- 页脚\n      theme-toggle.tsx         -- 暗色切换\n      mdx-content.tsx          -- MDX 渲染\n      providers.tsx            -- ThemeProvider\n    lib/content.ts             -- 内容查询层\n  velite.config.ts\n  next.config.ts\n  package.json\n  src/app/globals.css\n```\n\n## 剩余工作（team-lead 决定）\n1. Lighthouse 性能检查（reviewer 建议）\n2. 部署到 Vercel\n3. 内容填充（真实文章替换示例）\n\n## 环境副作用\n- 无。（`npm run dev` 可启动，`npm run build` 可构建，`velite build` 和 `next build` 均已集成）\n- 所有依赖已安装（473 packages）\n- 共 7 个静态页面，102kB shared JS\n\nfrontend-dev 任务全部完成。感谢协作。",
+    "summary": "开发收官，最终状态汇报",
+    "timestamp": "2026-05-16T14:12:08.629Z",
+    "color": "green",
+    "read": true
+  },
+  {
+    "from": "frontend-dev",
+    "text": "{\"type\":\"idle_notification\",\"from\":\"frontend-dev\",\"timestamp\":\"2026-05-16T14:12:12.541Z\",\"idleReason\":\"available\"}",
+    "timestamp": "2026-05-16T14:12:12.541Z",
+    "color": "green",
+    "read": true
+  }
+]
