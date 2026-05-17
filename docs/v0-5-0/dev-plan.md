@@ -39,6 +39,9 @@
 | `agents/__lead.md`(新)| Anthropic agent spec 模板,沿用 F89 explorer.md pattern;include_str! 嵌入 binary;**body 必须包含 Anthropic 两类 teammate spawn pattern 指导**(definition: Task tool with subagent_type=role / ad-hoc: Task with subagent_type=general-purpose + 完整 inline prompt)+ Worker Preamble boilerplate |
 | `crates/ccteam-core/src/workflow.rs::SuggestedTeammate`(新结构)| `{ role: String, kind: enum {Definition, AdHoc}, spawn_brief: String, adhoc_model: Option<String>, adhoc_color: Option<String>, adhoc_tools: Option<Vec<String>> }` |
 | `crates/ccteam-cli/src/commands.rs::run_init` | 加 `--mode <artifact-driven\|agent-team>` flag;agent-team 走新 init 路径,写 `__lead.md` + agent-team workflow.yaml 模板 |
+| `crates/ccteam-cli/src/commands.rs::run_start` | agent-team mode 分支:打印 spawn preview → `[Y/n/attach]` confirm(`--no-confirm`/`-y`/`--attach`/`--dry-run` 跳过)→ spawn lead → `attach` 选项 exec `claude attach <id>` |
+| `crates/ccteam-cli/src/commands.rs::run_attach`(新)| 用户面 `ccteam attach <slug>` 命令:读 team snapshot → exec `claude attach <lead-session-id>`;artifact-driven mode 返 friendly error |
+| `crates/ccteam-cli/src/main.rs` clap 子命令 | 加 `Attach { slug }`(user-facing,F89 用户面命令族)|
 | `crates/ccteam-cli/src/commands.rs::DEFAULT_AGENT_SCAFFOLDS` | 加 `("__lead.md", include_str!("../../../agents/__lead.md"))` 条目(F89 数组) |
 | `crates/ccteam-core/src/orchestrator.rs` | 加 `spawn_agent_team_lead(slug, spec)` 函数;agent-team mode 项目跳过 ArtifactWatcher 装,只装 lead session;lead spawn 时 env 注入 `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` |
 | `crates/ccteam-core/tests/agent_team_spawn_test.rs`(新)| 8 测试覆盖:schema parse / 缺 mode 默认 artifact-driven / lead spawn env / lead_seed 写到 inputs / __lead.md 用户改 body 警告 |

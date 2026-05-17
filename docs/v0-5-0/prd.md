@@ -180,26 +180,148 @@ Worker Preamble (always include in ad-hoc teammate prompts):
 - "When blocked or idle, send `idle_notification` and wait."
 - "When done, set task status: completed via TaskUpdate."
 - [borrow OMC §"Agent Preamble" 30-line pattern verbatim]
+
+## Plan-first Protocol (CRITICAL — user-in-control)
+
+If `agent_team.auto_spawn_teammates: false` (the default), you MUST
+output a team plan as your VERY FIRST assistant message and then STOP.
+Do NOT call the Task tool yet.
+
+Template for your first message:
+```
+TEAM PLAN
+=========
+Proposed teammates:
+  1. <role> (<kind>, model=<X>, color=<Y>) — <one-line brief>
+  2. ...
+
+Spawn order: <sequential | parallel>
+Plan-approval policy: <require | autonomous>
+Rationale: <why these roles, why this composition>
+
+WAITING for user confirmation. Reply with:
+  - "go" / "yes" / "approve"  → spawn teammates per plan
+  - free text                  → revise plan based on feedback
+  - silence (10 min default)   → I will write ESCALATE to outbox
 ```
 
-#### orchestrator 行为
+After outputting the plan, do NOT call Task or any other action tool.
+Wait for the next user-turn message. User can reply via:
+  - `ccteam attach <slug>` and typing directly (interactive)
+  - `ccteam send <slug> "go"` (async, written to your inbox)
+  - V0.5.x F98: web SPA "Approve plan" button (writes to outbox)
+
+Only after the user replies with approval (or explicit revision instructions
+followed by another approval round) MAY you start calling Task.
+
+If `agent_team.auto_spawn_teammates: true`, skip this protocol — proceed
+directly to spawning per lead_seed + suggested_teammates.
+```
+
+#### orchestrator 行为 — user-controlled spawn flow
+
+`ccteam start <slug>` 改为 **user-in-control** UX(不是无声后台启动):
+
+```
+$ ccteam start flaky-test-debate
+  ✓ Loaded .ccteam/workflow.yaml — mode=agent-team, team_name=flaky-test-debate
+  ✓ Loaded .claude/agents/__lead.md — model=sonnet, tools=[...]
+  ✓ Suggested teammates: 3 definition + 2 ad-hoc
+
+  About to spawn lead session:
+    claude --bg --agent __lead \
+      --env CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 \
+      --env CLAUDE_CODE_TEAMMATE_MODE=in-process
+    Initial user-turn (lead_seed):
+      "<truncated to 200 char>"
+
+  Proceed? [Y/n/attach]
+```
+
+3 choice:
+- **`Y`(默认)**:spawn → 打印 attach 命令 + web URL → daemon 接管。User-in-control:用户**明确确认**了 spawn 动作,不是 ccteam 单方决定。
+- **`n`**:取消,什么都不动。
+- **`attach`**:spawn 后 ccteam 进程 exec `claude attach <lead-session-id>`,用户立刻进入 lead 交互 session 看初始化。`Ctrl+B D`(in-process)/ `←` 空 prompt(claude native)detach 后 daemon 接管,lead 继续 bg 跑。
+
+Spawn 完成后输出:
+```
+  ✓ Lead session spawned: 8e4bab09-...
+  Manage the team with:
+    ccteam attach flaky-test-debate     # re-attach interactive
+    ccteam send flaky-test-debate "..."  # message without attaching
+    ccteam web                          # http://localhost:7331/teams/flaky-test-debate
+    ccteam stop flaky-test-debate       # cleanup team + lead
+```
+
+CLI flags 跳过确认(脚本化):
+- `--no-confirm` / `-y`:跳过 prompt,默认 `Y` 行为
+- `--attach`:跳过 prompt,直接走 `attach` 行为
+- `--dry-run`:只打印将执行的命令 + suggested teammates,不 spawn
+
+Orchestrator 内部:
 - 解析 `mode: agent-team` → 跳过 ArtifactWatcher 安装,改装"lead 单 session 看护"
-- spawn lead:`claude --bg --agent __lead --env CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 --env CLAUDE_CODE_TEAMMATE_MODE=<mode>` + 把 `lead_seed` 作为初始 user-turn message 写入 lead 的 `~/.claude/jobs/<id>/inputs/`(或 stdin pipe)
-- lead 自己 spawn teammate;ccteam 不干预 teammate 拓扑
+- spawn lead:`claude --bg --agent __lead --env CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 --env CLAUDE_CODE_TEAMMATE_MODE=<mode>` + 把 `lead_seed` 作为初始 user-turn message 写 lead 的 `~/.claude/jobs/<id>/inputs/`(或 stdin pipe)
+- lead 启动后 plan-first protocol 默认开 — lead 输出 plan 后**停**等用户回复
+- lead 自己 spawn teammate(plan 批准后);ccteam 不干预 teammate 拓扑
 - lead 退出(状态 done / failed)→ workflow_done event reason="lead_exited"
+
+#### `ccteam attach <slug>` 新命令(F89 用户面命令族补)
+
+```
+$ ccteam attach flaky-test-debate
+  ✓ Lead session id: 8e4bab09-...
+  ✓ Status: waiting_for_plan_approval (since 2 min ago)
+  Attaching... (Ctrl+B D or ← on empty prompt to detach back to background)
+
+  [interactive Claude session UI]
+```
+
+实现:
+- 读 `<project>/.ccteam/team-snapshot.json::lead_session_id`(F93 snapshot)
+- exec `claude attach <id>`(官方 Agent View 命令)
+- artifact-driven mode 跑此命令 → friendly error "artifact-driven mode has no single lead; use `ccteam show <slug>` to list active sessions"
+
+`ccteam-cli/src/commands.rs::run_attach` 加分支判断:
+```rust
+match workflow.mode {
+    WorkflowMode::AgentTeam => {
+        let lead_id = read_lead_session_id(slug)?;
+        Command::new("claude").args(["attach", &lead_id]).exec();
+    }
+    WorkflowMode::ArtifactDriven => bail!("artifact-driven mode has no lead"),
+}
+```
+
+#### Schema 加一项
+
+```yaml
+agent_team:
+  ...
+  auto_spawn_teammates: false   # 默认 false → lead 走 plan-first protocol(用户确认才动)
+                                # true → lead 看 lead_seed 自决直接 spawn(熟用户 + 确定性任务)
+```
+
+红线:即使 `auto_spawn_teammates: true`,lead 仍需在 `.ccteam/outbox/team-bootstrap-<ts>.md` 写一份"团队已起,以下为 spawn 列表" 给用户事后追溯;web SPA Topology 把这视为 audit log。
 
 ### 验收
 1. `ccteam init --mode agent-team my-debate` 生成 4 个文件:`.ccteam/workflow.yaml`(mode=agent-team)+ `.claude/agents/__lead.md` + `.ccteam/inbox/`(空目录,沿用)+ 注册到 `~/.ccteam/config.yaml`
-2. `ccteam start` 后 `ccteam show my-debate` 显示 lead session id + state=working
-3. lead session 接收到 `lead_seed` 作为 user-turn(verify via `claude attach <lead-id>` 看 transcript)
-4. lead spawn teammate 后 `~/.claude/teams/my-debate/config.json` 出现,members 数 == workflow.yaml agents 数 + 1(lead)
-5. teammate 跑 `claude --bg` 在自己 `~/.claude/jobs/<id>/` 起 process(F92 cost 跟踪到位)
-6. workflow.yaml 改 `enabled: false`(F82 hot-reload)→ lead 收 cancel token graceful exit + workflow_done reason="disabled"
-7. `mode` 字段缺失 → 解析为 `artifact-driven`,完全向后兼容 V0.4.6
+2. `ccteam start my-debate` 触发 confirm prompt(`[Y/n/attach]`);`Y` → spawn + 打印 attach 命令;`attach` → spawn + 直接 exec `claude attach <id>`;`n` → 取消无副作用
+3. `--no-confirm` / `-y` 跳过 prompt;`--attach` 直接走 attach 路径;`--dry-run` 只打印不 spawn
+4. spawn 后 `ccteam show my-debate` 显示 lead session id + state=`waiting_for_plan_approval`(plan-first protocol)
+5. `ccteam attach my-debate` 解析 lead_session_id 并 exec `claude attach <id>`;artifact-driven mode 报 friendly error
+6. **plan-first 验证**:lead spawn 后 5 分钟内 attach,lead 第一条 message 必须是"TEAM PLAN ===" 格式且 `~/.claude/teams/<>/config.json::members[]` 只含 lead 一个 entry(teammate 没起)
+7. 用户回复 `go` / `ccteam send my-debate "go"` → lead 收到后开始 spawn teammate;`~/.claude/teams/<>/config.json` 5s 内出现新 members
+8. `auto_spawn_teammates: true` workflow.yaml → lead 不停 plan,直接 spawn,但 `.ccteam/outbox/team-bootstrap-<ts>.md` 文件落地(audit log)
+9. lead spawn teammate 后 `~/.claude/teams/my-debate/config.json` 出现,members 数 == workflow.yaml suggested_teammates 数 + 1(lead)
+10. teammate 跑 `claude --bg` 在自己 `~/.claude/jobs/<id>/` 起 process(F92 cost 跟踪到位)
+11. workflow.yaml 改 `enabled: false`(F82 hot-reload)→ lead 收 cancel token graceful exit + workflow_done reason="disabled"
+12. `mode` 字段缺失 → 解析为 `artifact-driven`,完全向后兼容 V0.4.6
 
 ### 红线
 - `__lead` 是 ccteam-managed role;**用户不应该写自己的 `__lead.md`**;`ccteam doctor --validate-team` 警告若发现用户改了 `__lead.md` body
 - `lead_seed` 是 user-turn message,**不是 system prompt** — 守 CLAUDE.md §三 "永不向 session 注入 system prompt"
+- **User-in-control 红线**:`ccteam start` 默认 confirm prompt;脚本化要显式 `-y`。不允许"silent spawn"或"启动时无任何输出后直接进入 daemon"。
+- **Plan-first 红线**:`auto_spawn_teammates: false` 是默认值;改 true 必须显式声明(不能 omit 字段隐式 true)。`__lead.md` body 必须包含 plan-first 协议(`ccteam doctor --validate-team` 检查 hash)。
 
 ---
 
