@@ -1,0 +1,75 @@
+{
+  "_schema": "ccteam qa-autoloop config v1 — fill in every TODO before launching the workflow",
+
+  "name": "TODO-project-slug",
+  "description": "TODO short one-liner about what this project is",
+
+  "_local_path_note": "absolute path to the project's git working tree on this machine; agents cd here on every step",
+  "local_path": "TODO-/absolute/path/to/repo",
+
+  "_fix_disabled_note": "set to true to pause the fixer (e.g. during a release freeze); tester + releaser still run",
+  "fix_disabled": false,
+
+  "github": {
+    "owner": "TODO-org-or-user",
+    "repo": "TODO-repo-name",
+    "fix_base_branch": "main",
+    "production_branch": "main",
+    "fix_branch_prefix": "fix/issue-"
+  },
+
+  "_deploy_note": "deploy provider. Set kind=none for projects without a staging deploy (releaser will skip the deploy + acceptance steps).",
+  "deploy": {
+    "kind": "vercel",
+    "project_id": "TODO-deploy-platform-project-id",
+    "staging_domain": "TODO-staging.example.com",
+    "production_domain": "TODO-prod.example.com",
+    "staging_git_branch": "main",
+    "staging_target": "staging",
+    "production_target": "production"
+  },
+
+  "test": {
+    "_note": "tester + releaser only ever hit staging_url (RED LINE: never automate against production)",
+    "staging_url": "https://TODO-staging.example.com",
+    "production_url": "https://TODO-prod.example.com",
+    "active_env": "staging"
+  },
+
+  "_frontend_test_note": "framework + entry point for UI tests. Set kind=none for backend-only projects.",
+  "frontend_test": {
+    "kind": "playwright",
+    "test_root": "tests/e2e",
+    "browser": "chromium",
+    "headless": true
+  },
+
+  "_backend_test_note": "optional. If your project ships a CLI/SDK used as the test harness, declare it here. Tester will probe it; otherwise skip.",
+  "backend_test": {
+    "kind": "none",
+    "cli": "TODO-cli-binary-name (or omit this block)",
+    "cli_repo": "https://github.com/TODO/cli-repo",
+    "api_url": "https://TODO-api.example.com",
+    "env": "testnet"
+  },
+
+  "_review_note": "review surface for fixer's PRs. Copilot = GitHub Copilot code review, codereview-bot = generic auto-reviewer, human = wait for manual approval (releaser will park PRs until human acks).",
+  "review": {
+    "reviewer": "copilot",
+    "approve_strategy": "wait-for-approval"
+  },
+
+  "issue_tracker": {
+    "kind": "local",
+    "dir": ".ccteam/issues",
+    "_note": "Issues live as per-file JSON under .ccteam/issues/<id>.json. GitHub Issues NOT used as the tracker — only PRs hit GitHub."
+  },
+
+  "artifact_dirs": {
+    "backlog": ".ccteam/backlog",
+    "issues": ".ccteam/issues",
+    "prs": ".ccteam/prs",
+    "acceptance": ".ccteam/acceptance",
+    "screenshots": "/tmp/screenshots/TODO-project-slug"
+  }
+}
