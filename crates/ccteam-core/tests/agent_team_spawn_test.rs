@@ -21,7 +21,8 @@
 use std::path::Path;
 
 use ccteam_core::workflow::{
-    AgentTeamSpec, SuggestedTeammate, SuggestedTeammateKind, WorkflowMode, WorkflowSpec,
+    AgentTeamSpec, CleanupOnStop, SuggestedTeammate, SuggestedTeammateKind, WorkflowMode,
+    WorkflowSpec,
 };
 
 #[test]
@@ -96,7 +97,7 @@ agents: {}
     assert_eq!(team.team_name, "flaky-debate");
     assert!(team.lead_seed.contains("Investigate why"));
     assert_eq!(team.teammate_mode.as_deref(), Some("in-process"));
-    assert_eq!(team.cleanup_on_stop.as_deref(), Some("force-kill"));
+    assert_eq!(team.cleanup_on_stop, CleanupOnStop::ForceKill);
     assert!(!team.auto_spawn_teammates);
     assert_eq!(team.suggested_teammates.len(), 2);
     assert_eq!(team.suggested_teammates[0].role, "code-reviewer");
@@ -331,7 +332,7 @@ fn agent_team_spec_round_trips_through_serde() {
         team_name: "x".into(),
         lead_seed: "do thing".into(),
         teammate_mode: Some("in-process".into()),
-        cleanup_on_stop: Some("force-kill".into()),
+        cleanup_on_stop: CleanupOnStop::ForceKill,
         snapshot_path: Some(std::path::PathBuf::from(".ccteam/team-snapshot.json")),
         suggested_teammates: vec![SuggestedTeammate {
             role: "r1".into(),

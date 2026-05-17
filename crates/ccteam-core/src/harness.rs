@@ -546,7 +546,9 @@ pub fn parse_cc_state_json(raw: &str) -> Result<HarnessSnapshot, HarnessError> {
 /// Returns `None` on missing field, wrong type, or unparseable body
 /// (parse failures are swallowed because callers — `shutdown_session`
 /// — must remain idempotent).
-fn parse_pid_from_state(raw: &str) -> Option<i32> {
+///
+/// V0.5.0 F97 — exposed for `ccteam stop <slug>` force-kill path.
+pub fn parse_pid_from_state(raw: &str) -> Option<i32> {
     let value: serde_json::Value = serde_json::from_str(raw).ok()?;
     value.get("pid").and_then(|v| v.as_i64()).and_then(|n| {
         if n > 0 && n <= i32::MAX as i64 {
@@ -570,6 +572,22 @@ fn sigterm_pid(pid: i32) -> std::io::Result<()> {
     }
     let err = std::io::Error::last_os_error();
     // ESRCH = "no such process" — already dead, idempotent success.
+    if err.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(err)
+}
+
+/// V0.5.0 F97 — SIGKILL the given pid. Used by `ccteam stop <slug>
+/// --cleanup force-kill` (the default) + by the `ask-lead` timeout
+/// fallback. Idempotent: ESRCH (no such process) is success.
+pub fn sigkill_pid(pid: i32) -> std::io::Result<()> {
+    // SAFETY: `libc::kill` is FFI-safe.
+    let rc = unsafe { libc::kill(pid, libc::SIGKILL) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
     if err.raw_os_error() == Some(libc::ESRCH) {
         return Ok(());
     }

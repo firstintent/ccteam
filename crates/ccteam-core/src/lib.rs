@@ -91,9 +91,10 @@ pub use daemon::{
     HEARTBEAT_NAME, PIDFILE_NAME,
 };
 pub use harness::{
-    parse_cc_state_json, state_json_path, ClaudeCodeAdapter, CodexAdapter, HarnessAdapter,
-    HarnessError, HarnessSnapshot, SessionHandle, SpawnOpts, SubagentState, CLAUDE_BIN_ENV,
-    CLAUDE_JOBS_DIR_ENV, CODEX_STATUS_MARKER, CODEX_STATUS_TAIL_LINES, DEFAULT_CLAUDE_SID,
+    parse_cc_state_json, parse_pid_from_state, sigkill_pid, state_json_path, ClaudeCodeAdapter,
+    CodexAdapter, HarnessAdapter, HarnessError, HarnessSnapshot, SessionHandle, SpawnOpts,
+    SubagentState, CLAUDE_BIN_ENV, CLAUDE_JOBS_DIR_ENV, CODEX_STATUS_MARKER,
+    CODEX_STATUS_TAIL_LINES, DEFAULT_CLAUDE_SID,
 };
 pub use inbox::{
     inbox_filename, outbox_filename, InboxAttachment, InboxFrontMatter, InboxMessage,
@@ -205,8 +206,9 @@ pub use watchdog::{
 };
 // V0.4.0 F63 — workflow.yaml schema. V0.4.6 F84 adds `BudgetSpec`.
 // V0.5.0 F93b adds `WorkflowMode` / `AgentTeamSpec` / `SuggestedTeammate`.
+// V0.5.0 F97 adds `CleanupOnStop`.
 pub use workflow::{
-    AgentSpec, AgentTeamSpec, BudgetSpec, Executor, OnTimeout, SuggestedTeammate,
+    AgentSpec, AgentTeamSpec, BudgetSpec, CleanupOnStop, Executor, OnTimeout, SuggestedTeammate,
     SuggestedTeammateKind, Trigger, WorkflowError, WorkflowMode, WorkflowSpec,
 };
 // V0.4.6 F82 — workflow.yaml file watcher.

@@ -599,11 +599,18 @@ fork_timeout_hours: 24            # L3 默认通过超时(careful 模式忽略)
 ccteam start                           # 启动 orchestrator + web UI(默认 127.0.0.1:7331)
 ccteam start --no-web                  # 只跑 orchestrator
 ccteam start --no-clipboard            # 不尝试把 web bearer token 复制到 clipboard
+ccteam start <slug>                    # V0.5.0 F93b:agent-team mode 项目 spawn lead([Y/n/attach])
+ccteam start <slug> --no-confirm       # F93b 脚本化跳过提示
+ccteam start <slug> --attach           # F93b spawn + exec claude attach
+ccteam start <slug> --dry-run          # F93b 只打印 preview
+ccteam start --restart-team <slug>     # V0.5.0 F97:复活 detached / sleep-唤醒后的 lead(读 snapshot + probe_job)
 ccteam stop                            # 优雅停机(保留 tmux session)
+ccteam stop <slug>                     # V0.5.0 F97:依 workflow.yaml::cleanup_on_stop 处理(force-kill / ask-lead / leave-running)
+ccteam stop <slug> --stop-timeout 120  # V0.5.0 F97:ask-lead 模式自定义等待秒数(默认 60)
 ccteam internal mcp-serve              # 作为 ccteam-mcp 跑 stdio MCP 协议(详见 §12)
 ```
 
-`ccteam stop` 行为详见 §10.6 末。
+`ccteam stop` 行为详见 §10.6 末 + §17.1.4(`cleanup_on_stop` 策略)。
 
 ### 10.2 提交需求
 
@@ -1439,11 +1446,20 @@ SPA 用此值判断是否需要 token-entry flow。auth_layer 仍 gates 此 endp
 ```yaml
 name: <string>            # 必填。workflow 标识(项目内唯一)
 description: <string>     # 可选。供 meta-agent / web UI 展示
+mode: <variant>           # V0.5.0 F93b:可选,默认 artifact-driven。详 §17.1.2
 enabled: <bool>           # V0.4.6 F82:可选,默认 true。false → daemon 跳过 roster + 热改时优雅 cancel 老 loop(写 `workflow_done reason="disabled"`)。`true`(默认值)序列化时省略(只 opt-out 行 `enabled: false` 渲染)
 budget:                   # V0.4.6 F84:可选,默认 None(no-op)。详 §17.2.1
   max_cost_usd_per_24h: <f64>      # 滑窗 24h cost cap;sum(progress.jsonl::agent_done.cost_usd 24h 内) >= 此值 → trip
   max_agent_spawns_per_hour: <u32> # 滑窗 1h spawn rate cap;count(agent_spawn 1h 内) >= 此值 → trip
-agents:                   # 必填。map<role-name, AgentSpec>;非空
+agent_team:               # V0.5.0 F93b:可选,仅 mode: agent-team 时填。详 §17.1.3
+  team_name: <string>
+  lead_seed: <multi-line>
+  teammate_mode: <string>
+  cleanup_on_stop: <variant>  # V0.5.0 F97:force-kill | ask-lead | leave-running
+  snapshot_path: <path>
+  suggested_teammates: [<SuggestedTeammate>]
+  auto_spawn_teammates: <bool>
+agents:                   # 必填(artifact-driven mode);agent-team mode 可空。map<role-name, AgentSpec>
   <role-name>: <AgentSpec>
   ...
 ```
@@ -1467,6 +1483,54 @@ agents:                   # 必填。map<role-name, AgentSpec>;非空
 
 `BudgetSpec::None`(`budget` 字段不写)等价 V0.4.5 行为(no budget cap)。
 F84 budget guard 在 `try_spawn` 入口跑;cost 数据源走 F91 cost SoT(`agent_done.cost_usd` 24h 聚合 + active `~/.claude/jobs/<id>/state.json::cost_usd_total`)。
+
+### 17.1.2 V0.5.0 F93b `WorkflowMode` 字段
+
+| 值 | 行为 |
+|---|---|
+| `artifact-driven`(默认,V0.4.0 行为)| `ArtifactWatcher` + trigger graph drive 派发;`agents:` 必非空;`agent_team:` 不允许 |
+| `agent-team`(V0.5.0 F93b)| ccteam-managed `__lead` Claude bg session + Anthropic native Agent Teams 工具;`agents:` 可空(lead 驱动 runtime 拓扑);`agent_team:` 必填 |
+
+`mode` 字段缺失序列化时省略(只显式 `mode: agent-team` 渲染)。V0.4.6 workflow.yaml 不需要任何改动跑 V0.5.0 binary。
+
+### 17.1.3 V0.5.0 F93b `AgentTeamSpec` 字段 + F97 `CleanupOnStop`
+
+| 字段 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `team_name` | `String` | 必填 | = `~/.claude/teams/<team_name>/` dir 名,Anthropic 1:1 绑定;**F97 cold-reload 字段**(改了必须 `--restart-team`)|
+| `lead_seed` | `String` | 必填 | user-turn 消息,**非**系统提示;orchestrator spawn 时写到 lead stdin。**F97 hot-reload 字段**(daemon 下个 tick 写 lead `.ccteam/inbox/`,无需重启)|
+| `teammate_mode` | `Option<String>` | `None`(等价 `"in-process"`)| `CLAUDE_CODE_TEAMMATE_MODE` env 注入;`in-process` / `tmux` / `auto`。F97 hot-reload 字段 |
+| `cleanup_on_stop` | `CleanupOnStop` | `ForceKill` | V0.5.0 F97:`force-kill`(SIGKILL lead pid) / `ask-lead`(写 cleanup 消息 + 等 `workflow_done`,默认 60s timeout) / `leave-running`(只清 watch,留 lead 跑);见 §17.1.4 |
+| `snapshot_path` | `Option<PathBuf>` | `None`(等价 `.ccteam/team-snapshot.json`)| F93 stickiness:workflow.yaml 解析后冻结,team 生命周期内不重读;`--restart-team` 读这里复活 |
+| `suggested_teammates` | `Vec<SuggestedTeammate>` | `[]` | 声明式 teammate 列表(可空,lead 自由组队)。**F97**:`role` / `kind` / `spawn_brief` cold-reload;`adhoc_model` / `adhoc_color` / `adhoc_tools` hot-reload |
+| `auto_spawn_teammates` | `bool` | `false` | Plan-first Protocol gate:`false`(默认)= lead 必须等 user `go`;`true` = lead 自决直接 spawn(写 `.ccteam/outbox/team-bootstrap-<ts>.md` audit)。F97 hot-reload 字段 |
+
+`SuggestedTeammate` 字段:`role`(必)/`kind`(`definition` \| `ad-hoc`,必)/`spawn_brief`(必)/`adhoc_model`(ad-hoc 必填,其他可选)/`adhoc_color`(可选)/`adhoc_tools`(可选 `Vec<String>`)。
+
+### 17.1.4 V0.5.0 F97 `CleanupOnStop` + 热加载分类
+
+`cleanup_on_stop` 取值(YAML 标量,`#[serde(rename_all = "kebab-case")]`):
+
+| 值 | `ccteam stop <slug>` 行为 |
+|---|---|
+| `force-kill`(默认) | 读 `~/.claude/jobs/<lead_id>/state.json::pid` → `libc::kill(pid, SIGKILL)`(ESRCH idempotent success);清 `.ccteam/team-snapshot.json` + `state.json::detached=false` |
+| `ask-lead` | 写 `.ccteam/inbox/<ts>-stop-request.md`(user-turn message,**非** system prompt);轮询 `~/.ccteam/progress/<slug>.jsonl` 每 500ms 等 `workflow_done` 计数增加,默认 60s timeout(`--stop-timeout <secs>` CLI 覆盖);timeout 退化 `force-kill` + WARN |
+| `leave-running` | 不 kill;保留 snapshot(`--restart-team` 复活用);`state.json::detached = true`(plain `ccteam start <slug>` 会 refuse 引导 `--restart-team`)|
+
+`AgentTeamSpec::classify_reload(other) -> Option<String>` — F97 hot-reload 分类:
+
+| 字段变化 | 分类 | 处理 |
+|---|---|---|
+| `team_name` | **COLD** | daemon emit `workflow_done reason="cold_reload_required"` + 清 watcher;user 必须 `ccteam start --restart-team <slug>` |
+| `suggested_teammates[].role` | COLD | 同上 |
+| `suggested_teammates[].kind` | COLD | 同上 |
+| `suggested_teammates[].spawn_brief` | COLD | 同上 |
+| `suggested_teammates` 数量变化 | COLD | 同上 |
+| `lead_seed` | **HOT** | daemon 写 `.ccteam/inbox/<ts>-reload-update.md`,lead 下次 tick 拾取;event loop **不** cancel |
+| `teammate_mode` | HOT | 同上(env-only,运行中改不重启) |
+| `cleanup_on_stop` | HOT | `ccteam stop` 时才读 |
+| `auto_spawn_teammates` | HOT | 下次 plan 时才读 |
+| `suggested_teammates[].adhoc_color` / `.adhoc_tools` / `.adhoc_model` | HOT | cosmetic / UI 元数据 |
 
 ### 17.2 `AgentSpec` 字段
 

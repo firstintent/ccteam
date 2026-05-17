@@ -4,6 +4,7 @@
 //! real terminal or running orchestrator.
 
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Map, Value};
@@ -681,6 +682,13 @@ pub struct StartAgentTeamOptions {
     /// Print spawn preview + exit; do not spawn. Useful for previews
     /// / CI / docs.
     pub dry_run: bool,
+    /// V0.5.0 F97 — revive a `leave-running` detached project. Reads
+    /// `.ccteam/team-snapshot.json::lead_session_id`, probes the bg
+    /// job's `state.json` for liveness, and:
+    /// - **Running**: re-arms F95 watch entries, clears `detached`
+    ///   marker in `state.json`, prints attach hint. NO new spawn.
+    /// - **Terminal**: WARN + fall through to the normal spawn flow.
+    pub restart_team: bool,
 }
 
 /// V0.5.0 F93b — `ccteam start <slug>` for agent-team mode projects.
@@ -724,6 +732,40 @@ pub fn run_start_agent_team(
              `ccteam start` (no slug) to start the daemon.",
         ),
     };
+
+    // ---- V0.5.0 F97 — `--restart-team` revive path -----------------------
+    let mut restart_prelude = String::new();
+    if opts.restart_team {
+        let outcome = run_restart_team(paths, slug, &project_dir, team_spec)?;
+        match outcome {
+            RestartTeamOutcome::ResumedAlive(body) => return Ok(body),
+            RestartTeamOutcome::FellThroughToSpawn(prelude) => {
+                // Lead is terminal; print the WARN prelude then continue
+                // with the normal spawn flow below. Stash a copy so the
+                // returned body (dry-run / test inspection) includes it.
+                print!("{prelude}");
+                restart_prelude = prelude;
+            }
+        }
+    } else {
+        // V0.5.0 F97 — refuse plain `ccteam start <slug>` when the project
+        // is in the `leave-running` detached state. The user must
+        // explicitly invoke `--restart-team` (avoids accidentally
+        // spawning a second lead while the first is still alive).
+        let state_path = paths.project_state(slug);
+        if let Ok(state) = ccteam_core::ProjectState::load(&state_path) {
+            if state.detached {
+                bail!(
+                    "project `{slug}` is in detached state \
+                     (last `ccteam stop` used `cleanup_on_stop: leave-running`).\n  \
+                     To re-attach the existing lead: `ccteam start --restart-team {slug}`\n  \
+                     To force a fresh lead (and orphan the old one): edit \
+                     state.json::detached → false, then re-run.",
+                );
+            }
+        }
+    }
+
     let lead_md_path = project_dir.join(".claude").join("agents").join("__lead.md");
     let lead_md_exists = lead_md_path.exists();
     let teammate_mode = team_spec
@@ -786,7 +828,7 @@ pub fn run_start_agent_team(
     // ---- 2. Dry-run / non-interactive bypasses --------------------------
     if opts.dry_run {
         preview.push_str("\n  --dry-run set — preview only, lead not spawned.\n");
-        return Ok(preview);
+        return Ok(format!("{restart_prelude}{preview}"));
     }
 
     let choice = resolve_start_choice(&opts)?;
@@ -797,7 +839,9 @@ pub fn run_start_agent_team(
         StartChoice::Confirmed => "default",
         StartChoice::AttachAfterSpawn => "attach",
         StartChoice::Cancelled => {
-            return Ok(format!("{preview}\n  Cancelled. No side effects.\n"));
+            return Ok(format!(
+                "{restart_prelude}{preview}\n  Cancelled. No side effects.\n"
+            ));
         }
     };
 
@@ -831,7 +875,7 @@ pub fn run_start_agent_team(
             bail!("claude attach exited with {status}");
         }
     }
-    Ok(format!("{preview}{report}"))
+    Ok(format!("{restart_prelude}{preview}{report}"))
 }
 
 /// V0.5.0 F93b — `[Y/n/attach]` prompt resolution. Returns the
@@ -950,7 +994,7 @@ fn spawn_agent_team_lead(
         "lead_session_id": lead_id,
         "team_name": team_spec.team_name,
         "teammate_mode": teammate_mode,
-        "cleanup_on_stop": team_spec.cleanup_on_stop.clone().unwrap_or_else(|| "force-kill".into()),
+        "cleanup_on_stop": team_spec.cleanup_on_stop.as_str(),
         "auto_spawn_teammates": team_spec.auto_spawn_teammates,
         "suggested_teammates": team_spec.suggested_teammates,
         "spawned_at": chrono::Utc::now().to_rfc3339(),
@@ -984,6 +1028,435 @@ fn parse_backgrounded_short_id(stdout: &str) -> Option<String> {
         }
     }
     None
+}
+
+// =====================================================================
+// V0.5.0 F97 — Advanced path lifecycle: cleanup_on_stop strategies
+// + --restart-team revive + hot-reload cold/hot diff
+// =====================================================================
+
+/// V0.5.0 F97 — `ccteam stop <slug>` flags.
+#[derive(Debug, Clone, Copy)]
+pub struct StopSlugOptions {
+    /// Wait budget for `cleanup_on_stop: ask-lead` to see a
+    /// `workflow_done` event from the lead before falling back to
+    /// `force-kill`. Default 60s (set by clap default in `main.rs`).
+    pub stop_timeout: Duration,
+}
+
+impl Default for StopSlugOptions {
+    fn default() -> Self {
+        Self {
+            stop_timeout: Duration::from_secs(60),
+        }
+    }
+}
+
+/// V0.5.0 F97 — `ccteam stop <slug>` for agent-team mode projects.
+///
+/// 1. Load `<slug>`'s `workflow.yaml`; bail if `mode != agent-team`.
+/// 2. Load `.ccteam/team-snapshot.json` to discover the lead session
+///    id + frozen cleanup strategy. Snapshot wins over workflow.yaml
+///    if they disagree (PRD F93 stickiness).
+/// 3. Dispatch on `cleanup_on_stop`:
+///    - `ForceKill`: SIGKILL the lead bg job pid; clear snapshot.
+///    - `AskLead`: write a user-turn cleanup message to
+///      `.ccteam/inbox/`; poll `~/.ccteam/progress/<slug>.jsonl` for
+///      `workflow_done`; on timeout, fall back to `ForceKill` + WARN.
+///    - `LeaveRunning`: clear snapshot, set `state.json::detached =
+///      true`, leave the lead alive.
+///
+/// Returns the rendered report so tests can inspect it without going
+/// through TTY. Production caller in main.rs just prints + exits.
+pub fn run_stop_slug(paths: &CcteamPaths, slug: &str, opts: StopSlugOptions) -> Result<String> {
+    let project_dir = paths.project_dir(slug);
+    if !project_dir.exists() {
+        bail!(
+            "no project at `{slug}`: {} not found.",
+            project_dir.display(),
+        );
+    }
+    let spec = ccteam_core::WorkflowSpec::load_for_project(&project_dir)
+        .with_context(|| format!("load workflow.yaml for {slug}"))?;
+    let team_spec = match (&spec.mode, &spec.agent_team) {
+        (ccteam_core::WorkflowMode::AgentTeam, Some(t)) => t,
+        (ccteam_core::WorkflowMode::AgentTeam, None) => {
+            bail!("workflow.yaml mode: agent-team but agent_team block missing — schema bug?",)
+        }
+        (ccteam_core::WorkflowMode::ArtifactDriven, _) => bail!(
+            "project `{slug}` is in artifact-driven mode; `ccteam stop <slug>` is only\n  \
+             implemented for agent-team mode. For daemon shutdown run `ccteam stop` (no slug).",
+        ),
+    };
+
+    let snapshot_path = project_dir.join(".ccteam").join("team-snapshot.json");
+    let snapshot = if snapshot_path.exists() {
+        let raw = std::fs::read_to_string(&snapshot_path)
+            .with_context(|| format!("read {}", snapshot_path.display()))?;
+        Some(
+            serde_json::from_str::<Value>(&raw)
+                .with_context(|| format!("parse {}", snapshot_path.display()))?,
+        )
+    } else {
+        None
+    };
+    let lead_id = snapshot
+        .as_ref()
+        .and_then(|s| s.get("lead_session_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    // Snapshot wins (F93 stickiness); fall back to workflow.yaml.
+    let cleanup = snapshot
+        .as_ref()
+        .and_then(|s| s.get("cleanup_on_stop"))
+        .and_then(|v| v.as_str())
+        .map(parse_cleanup_str)
+        .unwrap_or(Ok(team_spec.cleanup_on_stop))
+        .unwrap_or(team_spec.cleanup_on_stop);
+
+    let mut report = String::new();
+    report.push_str(&format!(
+        "ccteam stop {slug} — agent-team mode (cleanup_on_stop={})\n",
+        cleanup.as_str(),
+    ));
+    match cleanup {
+        ccteam_core::CleanupOnStop::ForceKill => {
+            force_kill_lead(paths, slug, &snapshot_path, lead_id.as_deref(), &mut report)?;
+        }
+        ccteam_core::CleanupOnStop::AskLead => {
+            ask_lead_cleanup(
+                paths,
+                slug,
+                &project_dir,
+                &snapshot_path,
+                lead_id.as_deref(),
+                opts.stop_timeout,
+                &mut report,
+            )?;
+        }
+        ccteam_core::CleanupOnStop::LeaveRunning => {
+            leave_running(paths, slug, &snapshot_path, lead_id.as_deref(), &mut report)?;
+        }
+    }
+    Ok(report)
+}
+
+fn parse_cleanup_str(raw: &str) -> Result<ccteam_core::CleanupOnStop> {
+    match raw {
+        "force-kill" => Ok(ccteam_core::CleanupOnStop::ForceKill),
+        "ask-lead" => Ok(ccteam_core::CleanupOnStop::AskLead),
+        "leave-running" => Ok(ccteam_core::CleanupOnStop::LeaveRunning),
+        other => bail!("unknown cleanup_on_stop `{other}`"),
+    }
+}
+
+/// V0.5.0 F97 — `ForceKill` cleanup path. Reads
+/// `~/.claude/jobs/<lead_id>/state.json::pid` and SIGKILLs the pid;
+/// idempotent on missing state.json / dead pid. Always clears the
+/// project's `team-snapshot.json` (so the next `ccteam start <slug>`
+/// scaffolds a fresh lead) and resets `state.json::detached = false`.
+fn force_kill_lead(
+    paths: &CcteamPaths,
+    slug: &str,
+    snapshot_path: &std::path::Path,
+    lead_id: Option<&str>,
+    report: &mut String,
+) -> Result<()> {
+    if let Some(id) = lead_id {
+        let state_path = ccteam_core::state_json_path(id);
+        match std::fs::read_to_string(&state_path) {
+            Ok(raw) => match ccteam_core::parse_pid_from_state(&raw) {
+                Some(pid) => match ccteam_core::sigkill_pid(pid) {
+                    Ok(()) => {
+                        report.push_str(&format!("  ✓ SIGKILL pid {pid} (lead bg job {id})\n",))
+                    }
+                    Err(err) => report.push_str(&format!(
+                        "  ! SIGKILL pid {pid} failed: {err} (continuing)\n",
+                    )),
+                },
+                None => report.push_str(&format!(
+                    "  · state.json for {id} has no pid; nothing to kill\n",
+                )),
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => report.push_str(&format!(
+                "  · state.json for lead {id} absent; already terminated\n",
+            )),
+            Err(err) => report.push_str(&format!(
+                "  ! read state.json for {id} failed: {err} (continuing)\n",
+            )),
+        }
+    } else {
+        report.push_str("  · no lead_session_id in snapshot (already cleaned up?)\n");
+    }
+    clear_team_snapshot(snapshot_path, report)?;
+    clear_detached_marker(paths, slug, report)?;
+    Ok(())
+}
+
+/// V0.5.0 F97 — `AskLead` cleanup path. Writes a user-turn cleanup
+/// message to the lead's `.ccteam/inbox/` (the lead picks it up on
+/// the next idle tick via its F87 intercept-ask hook + native message
+/// surfacing). Polls `~/.ccteam/progress/<slug>.jsonl` for a
+/// `workflow_done` event; on timeout, falls back to `force-kill` with
+/// a WARN.
+///
+/// **CLAUDE.md §三 红线**: this is a *user-turn message*, not a system
+/// prompt — same red line as F93b `lead_seed`.
+fn ask_lead_cleanup(
+    paths: &CcteamPaths,
+    slug: &str,
+    project_dir: &std::path::Path,
+    snapshot_path: &std::path::Path,
+    lead_id: Option<&str>,
+    timeout: Duration,
+    report: &mut String,
+) -> Result<()> {
+    let inbox_dir = project_dir.join(".ccteam").join("inbox");
+    std::fs::create_dir_all(&inbox_dir)
+        .with_context(|| format!("create {}", inbox_dir.display()))?;
+    let now = chrono::Utc::now();
+    let filename = format!("{}-stop-request.md", now.format("%Y%m%dT%H%M%SZ"),);
+    let msg_path = inbox_dir.join(&filename);
+    let body = "\
+---
+source: ccteam-stop
+priority: normal
+---
+
+# ccteam stop — cleanup request
+
+Clean up the team — stop all teammates, persist context (use SendMessage / \
+TaskUpdate / Mailbox notes as appropriate), then exit. When done, allow \
+this session to terminate so ccteam can write `workflow_done`.
+
+This is a user-turn message from ccteam (`cleanup_on_stop: ask-lead`). It is \
+NOT a system prompt; honor it the same way you'd honor a direct user request.
+";
+    std::fs::write(&msg_path, body).with_context(|| format!("write {}", msg_path.display()))?;
+    report.push_str(&format!(
+        "  ✓ Wrote cleanup request to {}\n",
+        msg_path.display(),
+    ));
+    report.push_str(&format!(
+        "  · Waiting up to {}s for lead to emit workflow_done…\n",
+        timeout.as_secs(),
+    ));
+
+    let progress_path = paths.progress_jsonl(slug);
+    let baseline_count = count_workflow_done(&progress_path);
+    let start = Instant::now();
+    let mut saw_done = false;
+    while start.elapsed() < timeout {
+        let current = count_workflow_done(&progress_path);
+        if current > baseline_count {
+            saw_done = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    if saw_done {
+        report.push_str("  ✓ Lead emitted workflow_done; cleanup complete\n");
+        clear_team_snapshot(snapshot_path, report)?;
+        clear_detached_marker(paths, slug, report)?;
+        return Ok(());
+    }
+
+    // Timeout — fall back to force-kill (still write the audit line).
+    report.push_str(&format!(
+        "  ! WARN: timeout after {}s without workflow_done; falling back to force-kill\n",
+        timeout.as_secs(),
+    ));
+    force_kill_lead(paths, slug, snapshot_path, lead_id, report)
+}
+
+/// V0.5.0 F97 — `LeaveRunning` cleanup path. Drops the F95 watch
+/// entries (clears `.ccteam/team-snapshot.json`) but leaves the lead
+/// bg job + teammates running. Marks `state.json::detached = true` so
+/// the next plain `ccteam start <slug>` refuses with a friendly error
+/// (avoiding a "two leads concurrently" surprise).
+fn leave_running(
+    paths: &CcteamPaths,
+    slug: &str,
+    snapshot_path: &std::path::Path,
+    lead_id: Option<&str>,
+    report: &mut String,
+) -> Result<()> {
+    // We keep the snapshot file in place because --restart-team needs to
+    // read lead_session_id back. Instead we set a `detached` marker in
+    // state.json so a fresh `ccteam start <slug>` refuses. We also do
+    // NOT kill the lead. The F95 watcher is global and reacts to the
+    // teams root; the daemon-side per-project state we toggle is the
+    // `detached` field.
+    set_detached_marker(paths, slug, true, report)?;
+    if let Some(id) = lead_id {
+        report.push_str(&format!("  ✓ Lead session id: {id} (still running)\n",));
+        report.push_str(&format!(
+            "    Reconnect with `ccteam start --restart-team {slug}` or `claude attach {id}`\n",
+        ));
+    } else {
+        report.push_str("  · No lead_session_id in snapshot — nothing to leave running.\n");
+    }
+    let _ = snapshot_path; // snapshot is preserved (used by --restart-team)
+    Ok(())
+}
+
+/// Helper — remove `.ccteam/team-snapshot.json` if it exists.
+fn clear_team_snapshot(snapshot_path: &std::path::Path, report: &mut String) -> Result<()> {
+    match std::fs::remove_file(snapshot_path) {
+        Ok(()) => report.push_str(&format!("  ✓ Cleared {}\n", snapshot_path.display(),)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            report.push_str(&format!("  · {} already absent\n", snapshot_path.display(),))
+        }
+        Err(err) => report.push_str(&format!(
+            "  ! remove {} failed: {err} (continuing)\n",
+            snapshot_path.display(),
+        )),
+    }
+    Ok(())
+}
+
+/// Helper — flip `state.json::detached` to the given value. Used by
+/// `LeaveRunning` (true) + force-kill / ask-lead success (false).
+fn set_detached_marker(
+    paths: &CcteamPaths,
+    slug: &str,
+    detached: bool,
+    report: &mut String,
+) -> Result<()> {
+    let state_path = paths.project_state(slug);
+    if !state_path.exists() {
+        // No state.json: nothing to mark. Best-effort.
+        return Ok(());
+    }
+    let mut state = ccteam_core::ProjectState::load(&state_path)
+        .with_context(|| format!("load {}", state_path.display()))?;
+    if state.detached == detached {
+        return Ok(());
+    }
+    state.detached = detached;
+    state
+        .save(&state_path)
+        .with_context(|| format!("save {}", state_path.display()))?;
+    report.push_str(&format!("  ✓ state.json::detached = {detached}\n",));
+    Ok(())
+}
+
+fn clear_detached_marker(paths: &CcteamPaths, slug: &str, report: &mut String) -> Result<()> {
+    set_detached_marker(paths, slug, false, report)
+}
+
+/// Helper — count the `workflow_done` events currently in a project's
+/// `progress.jsonl`. Used by `ask-lead` to detect "lead emitted
+/// workflow_done after my cleanup request" via baseline-delta polling.
+fn count_workflow_done(progress_path: &std::path::Path) -> usize {
+    let Ok(content) = std::fs::read_to_string(progress_path) else {
+        return 0;
+    };
+    content
+        .lines()
+        .filter(|l| {
+            let trimmed = l.trim();
+            if trimmed.is_empty() {
+                return false;
+            }
+            serde_json::from_str::<Value>(trimmed)
+                .ok()
+                .and_then(|v| v.get("event").and_then(|s| s.as_str()).map(String::from))
+                .map(|kind| kind == "workflow_done")
+                .unwrap_or(false)
+        })
+        .count()
+}
+
+/// V0.5.0 F97 — `ccteam start --restart-team <slug>` outcome variants.
+#[derive(Debug)]
+enum RestartTeamOutcome {
+    /// Lead bg job is still alive; watch re-armed without spawning.
+    /// Contained body is the full rendered report for the caller.
+    ResumedAlive(String),
+    /// Lead bg job has exited; caller should fall through to the
+    /// normal spawn flow. Contained string is the rendered WARN
+    /// prelude that should be printed before the spawn preview.
+    FellThroughToSpawn(String),
+}
+
+/// V0.5.0 F97 — execute the `--restart-team` revive logic. Reads
+/// `.ccteam/team-snapshot.json`, probes the bg job's `state.json` for
+/// liveness, and either:
+/// - Returns `ResumedAlive` after re-arming the F95 watch + clearing
+///   `state.json::detached`. No spawn.
+/// - Returns `FellThroughToSpawn` (with a WARN body) so the caller
+///   continues to the normal spawn flow.
+fn run_restart_team(
+    paths: &CcteamPaths,
+    slug: &str,
+    project_dir: &std::path::Path,
+    _team_spec: &ccteam_core::AgentTeamSpec,
+) -> Result<RestartTeamOutcome> {
+    let snapshot_path = project_dir.join(".ccteam").join("team-snapshot.json");
+    if !snapshot_path.exists() {
+        bail!(
+            "--restart-team requires a prior team-snapshot.json at {}.\n  \
+             This file is written on the first `ccteam start {slug}` spawn.\n  \
+             If this is a fresh project, drop `--restart-team` and run \
+             `ccteam start {slug}` to spawn a new lead.",
+            snapshot_path.display(),
+        );
+    }
+    let raw = std::fs::read_to_string(&snapshot_path)
+        .with_context(|| format!("read {}", snapshot_path.display()))?;
+    let snapshot: Value =
+        serde_json::from_str(&raw).with_context(|| format!("parse {}", snapshot_path.display()))?;
+    let lead_id = snapshot
+        .get("lead_session_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "team-snapshot.json at {} missing `lead_session_id` field; \
+                 cannot restart without a lead id.",
+                snapshot_path.display(),
+            )
+        })?;
+    let liveness = ccteam_core::probe_job(Some(lead_id));
+    match liveness {
+        ccteam_core::JobLiveness::Running => {
+            // Lead is alive; re-arm the watch (clear detached marker).
+            let mut report = String::new();
+            report.push_str(&format!(
+                "ccteam start --restart-team {slug} — agent-team mode\n\n",
+            ));
+            report.push_str(&format!(
+                "  ✓ team-snapshot.json found; lead_session_id={lead_id}\n",
+            ));
+            report.push_str("  ✓ probe_job() == Running; lead bg job alive. Skipping spawn.\n");
+            // Clear detached marker if set (F97 LeaveRunning recovery).
+            clear_detached_marker(paths, slug, &mut report)?;
+            report.push_str("\n  Manage the team with:\n");
+            report.push_str(&format!("    ccteam attach {slug}    # interactive\n",));
+            report.push_str(&format!(
+                "    ccteam internal send {slug} \"...\"   # async\n",
+            ));
+            report.push_str(&format!("    ccteam stop {slug}    # cleanup\n",));
+            print!("{report}");
+            Ok(RestartTeamOutcome::ResumedAlive(report))
+        }
+        ccteam_core::JobLiveness::Terminal { status, .. } => {
+            // Lead is terminal — render a WARN prelude and let the
+            // caller fall through to the spawn flow.
+            let mut prelude = String::new();
+            prelude.push_str(&format!(
+                "ccteam start --restart-team {slug} — agent-team mode\n\n",
+            ));
+            prelude.push_str(&format!(
+                "  ! WARN: Previous lead exited (status={status}); spawning fresh lead.\n",
+            ));
+            // Clear stale detached marker before the new spawn.
+            clear_detached_marker(paths, slug, &mut prelude)?;
+            Ok(RestartTeamOutcome::FellThroughToSpawn(prelude))
+        }
+    }
 }
 
 /// `ccteam attach <slug>`. Resolves the underlying session medium and
@@ -4262,5 +4735,426 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("[FAIL] team.yaml load"), "got: {msg}");
         assert!(msg.contains("1 fail"), "expected fails counter; got: {msg}");
+    }
+
+    // =====================================================================
+    // V0.5.0 F97 — `ccteam stop <slug>` + `--restart-team` lifecycle tests
+    // =====================================================================
+
+    /// Build a `cleanup_on_stop: <strategy>` agent-team project at
+    /// `<paths.projects_root>/<slug>/`. Returns the project_dir.
+    fn install_team_project(paths: &CcteamPaths, slug: &str, cleanup: &str) -> std::path::PathBuf {
+        let target = paths.projects_root.join(slug);
+        run_init(
+            paths,
+            InitOptions {
+                install_in: Some(target.clone()),
+                slug: Some(slug.into()),
+                mode: InitMode::AgentTeam,
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+        // Replace cleanup_on_stop line in the scaffolded workflow.yaml.
+        let wf = target.join(".ccteam").join("workflow.yaml");
+        let raw = std::fs::read_to_string(&wf).unwrap();
+        let replaced = raw.replace(
+            "cleanup_on_stop: force-kill",
+            &format!("cleanup_on_stop: {cleanup}"),
+        );
+        std::fs::write(&wf, replaced).unwrap();
+        target
+    }
+
+    /// Write a fake `team-snapshot.json` (no live bg job behind it —
+    /// just enough metadata for `run_stop_slug` to dispatch on cleanup
+    /// strategy). For `ask-lead`/`leave-running` tests we don't need
+    /// a real `~/.claude/jobs/<id>/state.json` — the missing file
+    /// surfaces as "already cleaned up" in the report.
+    fn write_fake_snapshot(
+        project_dir: &std::path::Path,
+        slug: &str,
+        lead_id: &str,
+        cleanup: &str,
+    ) {
+        let snap_dir = project_dir.join(".ccteam");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        let body = json!({
+            "slug": slug,
+            "lead_session_id": lead_id,
+            "team_name": slug,
+            "teammate_mode": "in-process",
+            "cleanup_on_stop": cleanup,
+            "auto_spawn_teammates": false,
+            "suggested_teammates": [],
+            "spawned_at": "2026-05-17T12:00:00Z",
+        });
+        std::fs::write(
+            snap_dir.join("team-snapshot.json"),
+            serde_json::to_string_pretty(&body).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Helper: write a fake `~/.claude/jobs/<id>/state.json` with a pid
+    /// that's guaranteed to be invalid (1) so SIGKILL is a no-op. Uses
+    /// `$CCTEAM_CLAUDE_JOBS_DIR` so we don't touch the real host dir.
+    /// **NOTE**: this mutates env, so callers should hold env_lock().
+    fn install_fake_state_json(jobs_root: &std::path::Path, lead_id: &str, pid: i32) {
+        let dir = jobs_root.join(lead_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("state.json"),
+            serde_json::to_string_pretty(&json!({
+                "state": "working",
+                "pid": pid,
+                "daemonShort": lead_id,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cleanup_on_stop_force_kill_kills_and_clears_snapshot() {
+        ensure_isolation();
+        let _g = env_lock().lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let slug = "force-kill-team";
+        let project_dir = install_team_project(&paths, slug, "force-kill");
+        write_fake_snapshot(&project_dir, slug, "abc123", "force-kill");
+
+        // Point CCTEAM_CLAUDE_JOBS_DIR at a temp dir + write a fake
+        // state.json with pid=1 (kernel-reserved; SIGKILL → ESRCH on
+        // Linux, our sigkill_pid maps that to Ok). This validates the
+        // "kill happens; force-kill path doesn't blow up on stale pid".
+        let jobs_root = tmp.path().join("claude-jobs");
+        std::env::set_var("CCTEAM_CLAUDE_JOBS_DIR", &jobs_root);
+        install_fake_state_json(&jobs_root, "abc123", 1);
+
+        let report = run_stop_slug(&paths, slug, StopSlugOptions::default()).unwrap();
+        std::env::remove_var("CCTEAM_CLAUDE_JOBS_DIR");
+
+        assert!(
+            report.contains("cleanup_on_stop=force-kill"),
+            "report header missing strategy; got: {report}",
+        );
+        assert!(
+            report.contains("SIGKILL pid 1") || report.contains("already terminated"),
+            "report should mention SIGKILL / already terminated; got: {report}",
+        );
+        // Snapshot must be cleared.
+        let snap = project_dir.join(".ccteam").join("team-snapshot.json");
+        assert!(
+            !snap.exists(),
+            "force-kill must clear team-snapshot.json; still exists",
+        );
+    }
+
+    #[test]
+    fn cleanup_on_stop_ask_lead_writes_inbox_and_falls_back_on_timeout() {
+        ensure_isolation();
+        let _g = env_lock().lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let slug = "ask-lead-team";
+        let project_dir = install_team_project(&paths, slug, "ask-lead");
+        write_fake_snapshot(&project_dir, slug, "leadAlive1", "ask-lead");
+        // No progress.jsonl writes happening → timeout will fire.
+
+        let report = run_stop_slug(
+            &paths,
+            slug,
+            StopSlugOptions {
+                stop_timeout: std::time::Duration::from_millis(800),
+            },
+        )
+        .unwrap();
+
+        // Inbox message must be written.
+        let inbox_dir = project_dir.join(".ccteam").join("inbox");
+        let entries: Vec<_> = std::fs::read_dir(&inbox_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with("stop-request.md"))
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "exactly one stop-request.md must land in inbox; got {entries:?}",
+        );
+        let body =
+            std::fs::read_to_string(entries[0].path()).expect("inbox message must be readable");
+        assert!(
+            body.contains("Clean up the team"),
+            "inbox message body should ask for cleanup; got: {body}",
+        );
+        assert!(
+            body.contains("NOT a system prompt"),
+            "red line: inbox message must be marked as user-turn, not system prompt",
+        );
+
+        // Report mentions timeout + force-kill fallback.
+        assert!(
+            report.contains("timeout"),
+            "report should mention timeout; got: {report}",
+        );
+        assert!(
+            report.contains("force-kill") || report.contains("SIGKILL"),
+            "fallback path should mention force-kill; got: {report}",
+        );
+    }
+
+    #[test]
+    fn cleanup_on_stop_ask_lead_succeeds_when_workflow_done_appears() {
+        ensure_isolation();
+        let _g = env_lock().lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let slug = "ask-lead-success";
+        let project_dir = install_team_project(&paths, slug, "ask-lead");
+        write_fake_snapshot(&project_dir, slug, "leadAlive2", "ask-lead");
+
+        // Pre-write one workflow_done event so count_workflow_done's
+        // delta check (current > baseline) sees it on the very first
+        // tick — simulates the lead beating the polling loop.
+        let progress_path = paths.progress_jsonl(slug);
+        std::fs::create_dir_all(progress_path.parent().unwrap()).unwrap();
+        // First baseline write (counts as 0 because run_stop_slug
+        // reads the file BEFORE writing the inbox message, so we need
+        // the new event to appear AFTER. Use a background thread.)
+        let progress_path_for_thread = progress_path.clone();
+        let _h = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            ccteam_core::progress::append_event(
+                &progress_path_for_thread,
+                &json!({
+                    "event": "workflow_done",
+                    "reason": "cleanup_complete",
+                    "ts": "2026-05-17T12:01:00Z",
+                }),
+            )
+            .unwrap();
+        });
+
+        let report = run_stop_slug(
+            &paths,
+            slug,
+            StopSlugOptions {
+                stop_timeout: std::time::Duration::from_secs(5),
+            },
+        )
+        .unwrap();
+
+        assert!(
+            report.contains("workflow_done"),
+            "report should mention workflow_done observed; got: {report}",
+        );
+        assert!(
+            !report.contains("timeout"),
+            "successful path must not mention timeout; got: {report}",
+        );
+    }
+
+    #[test]
+    fn cleanup_on_stop_leave_running_keeps_lead_alive_and_marks_detached() {
+        ensure_isolation();
+        let _g = env_lock().lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let slug = "leave-running-team";
+        let project_dir = install_team_project(&paths, slug, "leave-running");
+        write_fake_snapshot(&project_dir, slug, "leadLive3", "leave-running");
+
+        let report = run_stop_slug(&paths, slug, StopSlugOptions::default()).unwrap();
+
+        // Snapshot MUST still exist (used by --restart-team).
+        let snap = project_dir.join(".ccteam").join("team-snapshot.json");
+        assert!(
+            snap.exists(),
+            "leave-running must NOT clear team-snapshot.json (needed for restart-team)",
+        );
+        // Report mentions restart-team hint.
+        assert!(
+            report.contains("--restart-team"),
+            "leave-running report should reference --restart-team; got: {report}",
+        );
+        // state.json::detached must be set.
+        let state = ccteam_core::ProjectState::load(&paths.project_state(slug)).unwrap();
+        assert!(
+            state.detached,
+            "leave-running must set state.json::detached = true",
+        );
+    }
+
+    #[test]
+    fn restart_team_resumes_alive_lead_without_spawning() {
+        ensure_isolation();
+        let _g = env_lock().lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let slug = "restart-alive";
+        let project_dir = install_team_project(&paths, slug, "leave-running");
+        write_fake_snapshot(&project_dir, slug, "stillAlive4", "leave-running");
+
+        // Plant a "Running" state.json so probe_job returns
+        // JobLiveness::Running.
+        let jobs_root = tmp.path().join("claude-jobs");
+        std::env::set_var("CCTEAM_CLAUDE_JOBS_DIR", &jobs_root);
+        let dir = jobs_root.join("stillAlive4");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("state.json"),
+            r#"{"state":"working","pid":99999,"daemonShort":"stillAlive4"}"#,
+        )
+        .unwrap();
+
+        // Mark detached so --restart-team has something to clear.
+        let mut state = ccteam_core::ProjectState::load(&paths.project_state(slug)).unwrap();
+        state.detached = true;
+        state.save(&paths.project_state(slug)).unwrap();
+
+        // Set CCTEAM_CLAUDE_BIN to a non-existent path so any attempt to
+        // spawn would fail loudly (proves we never even tried).
+        std::env::set_var("CCTEAM_CLAUDE_BIN", "/nonexistent/should-never-run");
+
+        let report = run_start_agent_team(
+            &paths,
+            slug,
+            StartAgentTeamOptions {
+                restart_team: true,
+                no_confirm: true,
+                ..Default::default()
+            },
+        );
+        std::env::remove_var("CCTEAM_CLAUDE_BIN");
+        std::env::remove_var("CCTEAM_CLAUDE_JOBS_DIR");
+
+        let body = report.unwrap();
+        assert!(
+            body.contains("Skipping spawn") || body.contains("lead bg job alive"),
+            "report must indicate no spawn happened; got: {body}",
+        );
+        assert!(
+            body.contains("stillAlive4"),
+            "report must mention lead id; got: {body}",
+        );
+        // detached marker must be cleared.
+        let state_after = ccteam_core::ProjectState::load(&paths.project_state(slug)).unwrap();
+        assert!(
+            !state_after.detached,
+            "restart-team must clear detached marker on success",
+        );
+    }
+
+    #[test]
+    fn restart_team_falls_through_to_spawn_when_lead_terminal() {
+        ensure_isolation();
+        let _g = env_lock().lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let slug = "restart-dead";
+        let project_dir = install_team_project(&paths, slug, "leave-running");
+        write_fake_snapshot(&project_dir, slug, "deadLead5", "leave-running");
+
+        // Plant a "Terminal" state.json (job_id has no state.json file
+        // at all → probe_job returns Terminal { status: "killed" }).
+        let jobs_root = tmp.path().join("claude-jobs");
+        std::env::set_var("CCTEAM_CLAUDE_JOBS_DIR", &jobs_root);
+        // Do NOT create the file — absent file → Terminal.
+
+        // Use --dry-run so we don't actually try to spawn (we only
+        // want to verify the WARN prelude + dry-run preview happens
+        // after the fall-through).
+        let report = run_start_agent_team(
+            &paths,
+            slug,
+            StartAgentTeamOptions {
+                restart_team: true,
+                dry_run: true,
+                ..Default::default()
+            },
+        );
+        std::env::remove_var("CCTEAM_CLAUDE_JOBS_DIR");
+
+        let body = report.unwrap();
+        assert!(
+            body.contains("Previous lead exited") || body.contains("spawning fresh lead"),
+            "should print fall-through WARN; got: {body}",
+        );
+        assert!(
+            body.contains("mode=agent-team"),
+            "should fall through to standard preview; got: {body}",
+        );
+    }
+
+    #[test]
+    fn restart_team_fails_when_snapshot_missing() {
+        ensure_isolation();
+        let _g = env_lock().lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let slug = "restart-no-snapshot";
+        install_team_project(&paths, slug, "force-kill");
+        // No snapshot written.
+
+        let err = run_start_agent_team(
+            &paths,
+            slug,
+            StartAgentTeamOptions {
+                restart_team: true,
+                ..Default::default()
+            },
+        )
+        .expect_err("--restart-team without snapshot must fail");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("team-snapshot.json"),
+            "error must mention snapshot; got: {msg}",
+        );
+        assert!(
+            msg.contains("ccteam start") || msg.contains("--restart-team"),
+            "error must hint at recovery; got: {msg}",
+        );
+    }
+
+    #[test]
+    fn plain_start_refuses_when_project_is_detached() {
+        ensure_isolation();
+        let _g = env_lock().lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let slug = "detached-refuse";
+        let project_dir = install_team_project(&paths, slug, "leave-running");
+        write_fake_snapshot(&project_dir, slug, "leadX6", "leave-running");
+
+        // Mark detached (simulates a prior leave-running stop).
+        let mut state = ccteam_core::ProjectState::load(&paths.project_state(slug)).unwrap();
+        state.detached = true;
+        state.save(&paths.project_state(slug)).unwrap();
+
+        // Plain `ccteam start <slug>` (no --restart-team) must refuse.
+        let err = run_start_agent_team(
+            &paths,
+            slug,
+            StartAgentTeamOptions {
+                restart_team: false,
+                no_confirm: true,
+                ..Default::default()
+            },
+        )
+        .expect_err("plain start on detached project must refuse");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("detached"),
+            "error must mention detached state; got: {msg}",
+        );
+        assert!(
+            msg.contains("--restart-team"),
+            "error must point at --restart-team; got: {msg}",
+        );
     }
 }

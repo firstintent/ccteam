@@ -1,6 +1,6 @@
 # V0.5.0 — PRD
 
-5 个 finding。F92 是 prerequisite,F93/F94/F95 是 agent-team mode 核心,F96 是用户感知层。
+9 个 finding。F92 是 prerequisite,F93/F94/F95 是 agent-team mode 核心,F96 是用户感知层,F97 完善 advanced path lifecycle,F100/F101 清残留 + 重塑 meta-agent。
 
 ---
 
@@ -196,7 +196,7 @@ agent_team:
     Spawn the suggested teammates below; have them debate competing
     hypotheses; require plan approval before any teammate writes code.
   teammate_mode: in-process            # in-process | tmux | auto;写到 lead 的 env CLAUDE_CODE_TEAMMATE_MODE
-  cleanup_on_stop: force-kill          # MVP 只支持 force-kill;F97 加 ask-lead / leave-running
+  cleanup_on_stop: force-kill          # F97 三选一:force-kill | ask-lead | leave-running
   snapshot_path: .ccteam/team-snapshot.json  # F93 stickiness — workflow.yaml 解析后冻结,team 生命周期内不重读
 
   # 建议的 teammate 列表(可选)— lead 按 Anthropic 两类 teammate spawn pattern 选择:
@@ -694,6 +694,109 @@ UI 行为:
 
 ---
 
+## F97 — Advanced path lifecycle 完善(`cleanup_on_stop` 3 策略 + `--restart-team` + hot-reload 约束)
+
+### 痛点
+
+V0.5.0 F93b MVP 的 `ccteam stop <slug>` + `ccteam start <slug>` 是 force-kill + 单一 spawn 路径:
+- **没有 graceful cleanup**:`ccteam stop` 总是 SIGKILL,lead 没机会 persist context / 通知 teammate
+- **没有 sleep-resume**:机器 sleep 唤醒后 `claude --bg` 还活着,但 ccteam 不知道怎么"重连"那个 lead — 现在只能 `ccteam stop` 再起新的(浪费 context + 没法跨 day 接 token-maxxing)
+- **hot-reload 半工作**:`agent_team.lead_seed` 改了 ccteam 没动作;`team_name` 改了直接坏(snapshot mismatch,lead 找错 ~/.claude/teams/ dir)
+
+V1.0.0 token-maxxing(`requirements.md §14`)要求"unattended for hours / days" — F97 是这个能力的基础设施。
+
+### 需求
+
+#### 1. `cleanup_on_stop` 3 策略
+
+`AgentTeamSpec::cleanup_on_stop` 从 `Option<String>` 改为 `CleanupOnStop` 枚举(`#[serde(rename_all = "kebab-case")]`):
+
+| 值 | 行为 |
+|---|---|
+| **`force-kill`**(默认,V0.4.6 compat)| SIGKILL lead bg job 的 pid(读 `~/.claude/jobs/<id>/state.json::pid`);清 `.ccteam/team-snapshot.json`;teammates 跟随 lead 进程树死亡(in-process / tmux mode) |
+| **`ask-lead`**(F97 新)| 写 `.ccteam/inbox/<ts>-stop-request.md`(user-turn message "Clean up the team — stop all teammates, persist context, then exit");轮询 `progress.jsonl` 等 `workflow_done`,默认 60s timeout(`--stop-timeout` 覆盖);timeout 退化 force-kill + WARN |
+| **`leave-running`**(F97 新)| 保留 snapshot + 设 `state.json::detached: true`;不 kill lead;打印 "Lead session id: <id>; reconnect with `ccteam start --restart-team <slug>` or `claude attach <id>`" |
+
+`ask-lead` 红线(同 F93b `lead_seed`):**写的是 user-turn message,不是 system prompt**。CLAUDE.md §三 "orchestrator 永不向 session 注入 system prompt"。
+
+#### 2. `ccteam start --restart-team <slug>`
+
+机器 sleep / 跨 day 续命用例:用户 detached 一个 team(`cleanup_on_stop: leave-running` + `ccteam stop`),后来想继续监视。
+
+`--restart-team` 行为:
+- 读 `.ccteam/team-snapshot.json::lead_session_id`
+- `ccteam_core::probe_job(lead_id)` 检 bg job liveness
+- **`Running`**:re-arm F95 watch + 清 `state.json::detached`,**不 spawn**;打印 attach hint
+- **`Terminal`**:WARN "Previous lead exited (status=X); spawning fresh lead",回落到正常 `--mode agent-team` spawn 流
+- **snapshot 缺失**:friendly error 引导用 `ccteam start <slug>`(无 `--restart-team`)起新 team
+
+#### 3. plain `ccteam start <slug>` 在 detached 状态下拒绝
+
+防止"两个 lead 同 team 并存"(用户忘了 detach 状态又起新):
+
+```
+$ ccteam start my-team
+Error: project `my-team` is in detached state (last `ccteam stop` used `cleanup_on_stop: leave-running`).
+  To re-attach the existing lead: `ccteam start --restart-team my-team`
+  To force a fresh lead (and orphan the old one): edit state.json::detached → false, then re-run.
+```
+
+#### 4. workflow.yaml hot-reload 约束(F82 扩展)
+
+V0.4.6 F82 对 artifact-driven workflow 的 hot-reload 是"blanket re-roster"。Agent-team mode 拓扑住 `~/.claude/teams/<>/config.json`(Anthropic SoT,lead 写),workflow.yaml 编辑 ≠ 立即生效。
+
+新增 `AgentTeamSpec::classify_reload(old, new) -> Option<String>`:
+
+**HOT(下个 watcher tick 写 lead inbox,不 cancel event loop)**:
+- `agent_team.lead_seed`(主要 hot 用途 — 用户改了任务方向,推到 lead)
+- `agent_team.teammate_mode`(env-only,运行中改无意义但不 fail)
+- `agent_team.cleanup_on_stop`(`ccteam stop` 时才读)
+- `agent_team.auto_spawn_teammates`(下次 plan 时才读)
+- `suggested_teammates[].adhoc_model` / `.adhoc_color` / `.adhoc_tools`(cosmetic)
+
+**COLD(emit `workflow_done reason="cold_reload_required"` + 清 watcher,不 re-roster)**:
+- `agent_team.team_name`(`~/.claude/teams/<>/` dir 名,baked at spawn)
+- `suggested_teammates[].role` / `.kind` / `.spawn_brief`(topology)
+- `workflow.yaml::mode`
+
+cold-path 之后 user 必须显式 `ccteam start --restart-team <slug>`。`reason="cold_reload_required"` 进 progress.jsonl,web SPA + CLI surface 都能看到这个 gate。
+
+### 实现位置
+
+| 文件 | 改动 |
+|---|---|
+| `crates/ccteam-core/src/workflow.rs` | `CleanupOnStop` 枚举;`AgentTeamSpec::cleanup_on_stop` 从 `Option<String>` 改 `CleanupOnStop`(`#[serde(default)]` → `ForceKill`);`AgentTeamSpec::classify_reload` 方法 |
+| `crates/ccteam-core/src/state.rs` | `ProjectState::detached: bool`(`#[serde(default, skip_serializing_if = is_false)]`)|
+| `crates/ccteam-core/src/harness.rs` | 暴露 `pub fn sigkill_pid` + `pub fn parse_pid_from_state` |
+| `crates/ccteam-core/src/orchestrator.rs` | hot-reload 分支:`handle_agent_team_reload` + `AgentTeamReloadOutcome` + `snapshot_to_team_spec` helper |
+| `crates/ccteam-cli/src/main.rs::Stop` | `<slug>` arg + `--stop-timeout` flag;`Start` 加 `--restart-team` flag |
+| `crates/ccteam-cli/src/commands.rs` | `run_stop_slug` 函数 + `StopSlugOptions`;3 个 cleanup helper(`force_kill_lead` / `ask_lead_cleanup` / `leave_running`);`run_restart_team` + `RestartTeamOutcome`;`run_start_agent_team` 加 `restart_team` 分支 + detached refusal |
+| `crates/ccteam-core/src/templates/workflow.agent-team.yaml` | 更新 cleanup_on_stop 注释 + hot-reload 规则文档 |
+| `crates/ccteam-core/tests/agent_team_lifecycle_test.rs`(新)| 16 测试 cover cleanup_on_stop 解析 / classify_reload hot/cold / 默认值 |
+| `crates/ccteam-cli/src/commands.rs::tests::*` | 8 测试 cover run_stop_slug 3 策略 / run_restart_team 3 outcome / detached refusal |
+
+### 验收
+
+1. `workflow.yaml` `cleanup_on_stop: ask-lead` 解析 + `ccteam stop <slug>` 写 inbox 消息(不 SIGKILL)
+2. `cleanup_on_stop: leave-running` + `ccteam stop` → lead bg process 仍 alive,snapshot 保留,state.json::detached=true
+3. `cleanup_on_stop: force-kill`(默认 + V0.4.6 compat)→ SIGKILL pid + 清 snapshot,行为未变
+4. `ccteam start --restart-team <slug>` 在 healthy lead 上 → re-arm watch 不 spawn,清 detached
+5. `--restart-team` 在 terminal lead 上 → WARN + 回落 spawn 流
+6. `--restart-team` 无 snapshot → friendly error
+7. workflow.yaml `lead_seed` 改 → 下个 watcher tick 写 lead inbox(不 force-kill,event loop 继续)
+8. workflow.yaml `suggested_teammates[].role` 改 → `workflow_done reason="cold_reload_required"`,event loop cancel,不 re-spawn
+9. CLI `--stop-timeout <secs>` 覆盖默认 60s wait(ask-lead path)
+10. plain `ccteam start <slug>` 在 detached 项目上 → 拒绝 + 指向 `--restart-team`
+
+### 红线
+
+- **No backwards-compat shim**:`cleanup_on_stop` 直接从 `Option<String>` 改 `CleanupOnStop` 枚举。V0.4.6 工程没有这个字段(`Option::None`)的 yaml,`#[serde(default)]` fall through 到 `ForceKill`。不留双形 shape(CLAUDE.md §五)
+- **ask-lead 不注入 system prompt**:cleanup 消息是 user-turn,通过 `.ccteam/inbox/<ts>-stop-request.md`(lead 自己 hook / next-turn 拾取)。同 F93b `lead_seed` 红线
+- **leave-running 不孤立 daemon**:`ProjectState::detached` 标记是 SoT;plain `ccteam start <slug>` 必须 refuse(避免"两个 lead 并存"),`--restart-team` 是显式 opt-in 路径
+- **hot-reload cold-path 不静默继续**:topology 改 → 必须 emit cold_reload_required + 清 watcher,user 必须显式 `--restart-team`(不允许 ccteam 自动 spawn 第二个 lead)
+
+---
+
 ## F100 — Skill surface refactor(5 → 3)
 
 ### 痛点
@@ -849,12 +952,6 @@ V0.4.6 era meta-agent 仍按 V0.2 模型行事,导致:
 ---
 
 ## V0.5.x 延期 finding 草案
-
-### F97 — Lifecycle 完善
-- `cleanup_on_stop: ask-lead` — `ccteam stop` 给 lead 发 user-turn "Clean up the team",lead 走 native cleanup 流程
-- `cleanup_on_stop: leave-running` — `ccteam stop` 只断 ccteam 监听,lead + teammate 继续跑(用户可后续 `claude attach` 或 `ccteam start --reconnect`)
-- `--restart-team` — 机器 sleep 后 `claude respawn --all` 不够(Agent Teams 限制),ccteam 重起 lead + 用 last team config 重建 teammate
-- hot-reload 约束:`agent_team.teammate_mode` / `default_model` / `lead_seed` 可热改;`agents` 拓扑改强制 force-kill + 重起 team
 
 ### F98 — plan-approval ↔ outbox 联动
 扩 F87 `intercept-ask` hook 覆盖 lead 的 plan-approval 决策:

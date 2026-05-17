@@ -5,12 +5,13 @@
 | Wave | 内容 | 占比 | 并行度 |
 |---|---|---|---|
 | Wave 0 | F92 真 cost 数据源 — 共享 prerequisite | 8% | 单 subagent,1-2 天 |
-| Wave 1 | F95 全局 watcher + F93a skill(`/ccteam:team`)+ F96 web 3 面板 — **primary path 闭环** | 50% | 3 subagent 并行,3-4 天 |
-| Wave 2 | F93b workflow.yaml `mode: agent-team` + `__lead.md` bg spawn + `ccteam start/attach` + F94 hook 注入 — **advanced path** | 20% | 2 subagent 并行,2-3 天 |
+| Wave 1 | F95 全局 watcher + F93a skill(`/ccteam:team`)+ F96 web 3 面板 — **primary path 闭环** | 45% | 3 subagent 并行,3-4 天 |
+| Wave 2 | F93b workflow.yaml `mode: agent-team` + `__lead.md` bg spawn + `ccteam start/attach` + F94 hook 注入 — **advanced path** | 18% | 2 subagent 并行,2-3 天 |
+| Wave 2.5 | **F97 advanced path lifecycle** — `cleanup_on_stop` 3 策略 + `--restart-team` + hot-reload 约束 | 7% | 单 subagent,4-5 小时(mid-cycle 入版本)|
 | **Wave 3**(新)| **F100 Skill surface refactor + F101 Meta-agent 角色重塑** — 清 V0.2/V0.3 phase 残留,简化 surface | 15% | 2-3 subagent 并行,1-2 天 |
 | Wave 4 | integration + host E2E + 文档同步 + ship | 7% | 主 session,1-2 天 |
 
-总:T+11 天,baseline 750 → ~810(F100 删 team_factory_xdg_test.rs 减部分;F101 不增减测试)。
+总:T+11.5 天,baseline 750 → ~931(F92/F93/F94/F95/F96/F97 新测试;F100 删 team_factory_xdg_test.rs 减部分;F101 不增减测试)。
 
 ---
 
@@ -126,6 +127,35 @@ Wave 1 ship + 用户用上 primary path 后,接续做 advanced path 给 automati
 
 ---
 
+## Wave 2.5 — F97 Advanced path lifecycle 完善(mid-cycle 入版本)
+
+Wave 2 advanced path 起来后,补 3 个生命周期 gap:graceful stop / sleep-resume / hot-reload 约束。单 subagent,~4-5 小时。
+
+### F97 — `cleanup_on_stop` 3 策略 + `--restart-team` + hot-reload diff
+
+| 文件 | 改动 |
+|---|---|
+| `crates/ccteam-core/src/workflow.rs` | `CleanupOnStop` 枚举(`force-kill` / `ask-lead` / `leave-running`,`#[serde(rename_all = "kebab-case")]`);`AgentTeamSpec::cleanup_on_stop` 从 `Option<String>` 改 `CleanupOnStop`(`#[serde(default)]` → `ForceKill`);`AgentTeamSpec::classify_reload(other)` 方法 |
+| `crates/ccteam-core/src/state.rs` | `ProjectState::detached: bool`(`#[serde(default, skip_serializing_if = is_false)]`)|
+| `crates/ccteam-core/src/harness.rs` | 暴露 `pub fn sigkill_pid` + `pub fn parse_pid_from_state`(F97 force-kill / pid probe 复用)|
+| `crates/ccteam-core/src/orchestrator.rs` | hot-reload 分支:`handle_agent_team_reload` 方法读 workflow.yaml + snapshot → 调 `classify_reload` → `AgentTeamReloadOutcome::{HotApplied, ColdRequired, NotApplicable}`;`snapshot_to_team_spec` 反序列化 helper |
+| `crates/ccteam-cli/src/main.rs::Stop` | `<slug>` arg + `--stop-timeout <secs>`(默认 60);`Start` 加 `--restart-team` flag |
+| `crates/ccteam-cli/src/commands.rs` | `run_stop_slug` + `StopSlugOptions`;3 个 cleanup helper(`force_kill_lead` / `ask_lead_cleanup` / `leave_running`);`run_restart_team` + `RestartTeamOutcome::{ResumedAlive, FellThroughToSpawn}`;`run_start_agent_team` 加 `restart_team` 分支 + detached refusal |
+| `crates/ccteam-core/src/templates/workflow.agent-team.yaml` | cleanup_on_stop 3 策略注释 + hot-reload HOT/COLD 字段表 |
+| `crates/ccteam-core/tests/agent_team_lifecycle_test.rs`(新)| 16 测试:cleanup_on_stop 3 解析 + 默认 + unknown error;classify_reload HOT lead_seed / teammate_mode / cleanup_on_stop / adhoc_color;COLD team_name / role / kind / spawn_brief / count;空 diff |
+| `crates/ccteam-cli/src/commands.rs::tests::*` | 8 测试:force-kill 路径 SIGKILL + 清 snapshot;ask-lead 写 inbox + timeout 退化 force-kill;ask-lead workflow_done 命中跳过 force-kill;leave-running 留 snapshot + 设 detached;restart-team alive lead 不 spawn + 清 detached;restart-team terminal lead WARN + 回落;restart-team 无 snapshot friendly error;plain start 在 detached 上 refuse |
+
+### 验收
+1-10:见 PRD F97 §验收(`cleanup_on_stop: ask-lead` 不 SIGKILL / `leave-running` lead 存活 / `--restart-team` 复活 / cold-reload event / detached refusal 等)
+
+### 风险
+- **`ask-lead` 依赖 lead 自觉读 inbox** — 当前 `__lead.md` 模板里没显式说 "ccteam writes stop requests to .ccteam/inbox/<ts>-stop-request.md, you must pick those up"。Wave 4 host E2E 时验证 + 必要时 patch `__lead.md`
+- **`probe_job` Terminal 误判** — Anthropic state.json schema 漂移可能让 `firstTerminalAt` 解析错。F80 测试覆盖了 stable shape,host E2E 再验
+
+**估工**:单 subagent,4-5 小时(本文件作者执行)。
+
+---
+
 ## Wave 3 — Skill + Meta-agent refactor(F100 + F101)
 
 2-3 subagent 并行(F100 删除任务可分两路:skill/teams 一路,team_factory_cli/rs 一路;F101 单独一路 rewrite meta_agent_role.md)。
@@ -212,9 +242,10 @@ Wave 1 ship + 用户用上 primary path 后,接续做 advanced path 给 automati
 |---|---|---|
 | Rust unit | +30 | F92 6 / F93b 12 / F94 6 / F95 6 / F96 — / 共享 helper |
 | Rust integration | +12 | spawn lead + 装 hook + 镜像 event;F92 host fixture;mode 切换;skill install |
+| Rust F97 lifecycle | +24 | 16 lifecycle (cleanup_on_stop 解析 + classify_reload hot/cold) + 8 CLI (run_stop_slug + restart-team + detached refusal) |
 | Web API | +10 | 5 endpoints × 2 cases |
 | Web SPA component | +15 | 3 面板 × 5 |
-| **总新增** | **+67** | baseline 750 → ~817 |
+| **总新增** | **+91** | baseline 750 → ~931 |
 
 测试运行:`cargo test --workspace --locked` + `npm test --prefix crates/ccteam-web/web/spa`。
 
@@ -254,7 +285,6 @@ Wave 1 ship + 用户用上 primary path 后,接续做 advanced path 给 automati
 
 - **V0.4.6 全部保留** — `mode` 字段缺失 = `artifact-driven`,V0.4.6 跑得动 V0.5.0 binary 不需要改 workflow.yaml
 - **V0.5.1+ 候选**:
-  - F97 Advanced path lifecycle 完善(3 cleanup 策略 + restart-team + orphan scan)
   - F98 plan-approval ↔ outbox 联动
   - F99 Claude Code 版本 gating doctor 检测
   - `orchestration-patterns.md §五` 剩余:动态 Routing sugar / Evaluator-Optimizer 显式 sugar / workflow.yaml `extends`

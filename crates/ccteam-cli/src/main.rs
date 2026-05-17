@@ -186,6 +186,16 @@ enum Command {
         /// the spawn preview + exit. Does not spawn anything.
         #[arg(long, default_value_t = false)]
         dry_run: bool,
+        /// V0.5.0 F97: revive an agent-team mode project after a
+        /// `ccteam stop --cleanup leave-running` (or after the host
+        /// rebooted while the lead was still alive). Reads
+        /// `.ccteam/team-snapshot.json::lead_session_id`, probes the
+        /// `claude --bg` job's `state.json`, and re-arms the F95 watch
+        /// without spawning a new lead. If the prior lead is terminal,
+        /// emits a WARN and falls through to the normal
+        /// `--mode agent-team` spawn flow.
+        #[arg(long, default_value_t = false)]
+        restart_team: bool,
     },
     /// V0.4.2 F75: thin wrapper over `ccteam init --in
     /// <projects_root>/<slug>` for users who prefer the "create a
@@ -325,11 +335,39 @@ enum Command {
         #[command(subcommand)]
         cmd: InternalCommand,
     },
-    /// Stop the running orchestrator daemon. Sends SIGTERM via the
-    /// pidfile so the loop drains gracefully. Does **not** kill any
-    /// tmux sessions — `ccteam start` reattaches to them on next launch
-    /// (M1.5).
-    Stop,
+    /// Stop the running orchestrator daemon, OR (V0.5.0 F97) tear
+    /// down one agent-team project's lead session per its workflow.yaml
+    /// `cleanup_on_stop:` strategy.
+    ///
+    /// Without `<slug>`: legacy V0.4.6 behavior — write the per-user
+    /// graceful shutdown trigger; daemon drains every project
+    /// gracefully; tmux sessions are NOT killed.
+    ///
+    /// With `<slug>` (V0.5.0 F97): dispatch on the project's
+    /// `workflow.yaml::agent_team.cleanup_on_stop`:
+    ///   - `force-kill` (default, V0.4.6 compat): SIGKILL the lead
+    ///     bg job + clear `.ccteam/team-snapshot.json`.
+    ///   - `ask-lead`: write a user-turn cleanup message into
+    ///     `.ccteam/inbox/`; wait up to `--stop-timeout` seconds for
+    ///     the lead to emit `workflow_done`; on timeout fall back to
+    ///     `force-kill` with a WARN.
+    ///   - `leave-running`: drop the F95 watch entries + mark the
+    ///     project `detached: true` in `state.json`, but leave the lead
+    ///     bg job + teammates alive. Subsequent `ccteam start <slug>`
+    ///     refuses unless `--restart-team` is set.
+    Stop {
+        /// V0.5.0 F97: per-slug stop. Reads
+        /// `<project>/.ccteam/workflow.yaml::agent_team.cleanup_on_stop`
+        /// to choose the strategy. Without this argument the daemon
+        /// shutdown trigger is written (legacy V0.4.6 behavior).
+        slug: Option<String>,
+        /// V0.5.0 F97: seconds to wait for the lead to emit
+        /// `workflow_done` when `cleanup_on_stop: ask-lead`. After this
+        /// budget elapses, ccteam falls back to `force-kill` with a WARN.
+        /// Ignored for other cleanup strategies.
+        #[arg(long, value_name = "SECONDS", default_value_t = 60)]
+        stop_timeout: u64,
+    },
     /// V0.4.6 F81 — un-roster a project: drop the slug from
     /// `~/.ccteam/config.yaml::projects[]`, scrub the orchestration
     /// state (`~/.ccteam/progress/<slug>.jsonl`, `~/.ccteam/inbox/<slug>/`,
@@ -704,11 +742,14 @@ fn main() -> Result<()> {
             no_confirm,
             attach,
             dry_run,
+            restart_team,
         } => match slug {
             Some(s) => {
                 // V0.5.0 F93b: per-slug spawn flow. Reads workflow.yaml
                 // to decide; agent-team mode does the [Y/n/attach]
                 // spawn; artifact-driven mode bails with friendly hint.
+                // V0.5.0 F97: --restart-team revives a `leave-running`
+                // detached lead by re-arming the watch without spawning.
                 let paths = CcteamPaths::from_env()?;
                 let body = commands::run_start_agent_team(
                     &paths,
@@ -717,6 +758,7 @@ fn main() -> Result<()> {
                         no_confirm,
                         attach,
                         dry_run,
+                        restart_team,
                     },
                 )?;
                 if dry_run {
@@ -777,7 +819,23 @@ fn main() -> Result<()> {
             run_mcp_serve()
         }
         Command::Internal { cmd } => run_internal(cmd),
-        Command::Stop => run_stop(),
+        Command::Stop { slug, stop_timeout } => match slug {
+            // V0.5.0 F97 — per-slug agent-team cleanup.
+            Some(s) => {
+                let paths = CcteamPaths::from_env()?;
+                let body = commands::run_stop_slug(
+                    &paths,
+                    &s,
+                    commands::StopSlugOptions {
+                        stop_timeout: Duration::from_secs(stop_timeout),
+                    },
+                )?;
+                print!("{body}");
+                Ok(())
+            }
+            // V0.4.6 daemon graceful shutdown.
+            None => run_stop(),
+        },
         Command::Remove {
             slug,
             purge,

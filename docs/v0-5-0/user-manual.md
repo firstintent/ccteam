@@ -107,10 +107,12 @@ $ ccteam start my-debate
 ### 后续操作
 
 ```
-ccteam attach my-debate     # re-attach 已跑的 lead session
-ccteam send my-debate "go"  # 异步给 lead 写消息(不 attach)
-ccteam web                  # 开浏览器看 /teams/my-debate
-ccteam stop my-debate       # 杀 lead + teammate(force-kill)
+ccteam attach my-debate                       # re-attach 已跑的 lead session
+ccteam send my-debate "go"                    # 异步给 lead 写消息(不 attach)
+ccteam web                                    # 开浏览器看 /teams/my-debate
+ccteam stop my-debate                         # 依 workflow.yaml::cleanup_on_stop 处理
+ccteam stop my-debate --stop-timeout 120      # F97 ask-lead 模式延长等待
+ccteam start --restart-team my-debate         # F97 复活 detached / sleep-唤醒 后的 lead
 ```
 
 ### Plan-first Protocol(advanced path 默认开)
@@ -119,16 +121,66 @@ ccteam stop my-debate       # 杀 lead + teammate(force-kill)
 
 熟用户 + 确定性任务:workflow.yaml 设 `auto_spawn_teammates: true` → lead 自决直接 spawn,但仍写 `.ccteam/outbox/team-bootstrap-<ts>.md` 留 audit log。
 
+### V0.5.0 F97 — `cleanup_on_stop` 3 策略
+
+`workflow.yaml::agent_team.cleanup_on_stop` 取三值之一,决定 `ccteam stop <slug>` 行为:
+
+| 值 | 行为 | 用例 |
+|---|---|---|
+| `force-kill`(默认) | SIGKILL lead bg job + 清 snapshot;teammate 跟 lead 进程树死 | 一次性任务,跑完即销 |
+| `ask-lead` | 写 user-turn 消息到 `.ccteam/inbox/<ts>-stop-request.md`;轮询 `progress.jsonl` 等 lead emit `workflow_done`,默认 60s timeout(`--stop-timeout <secs>` 覆盖);timeout 退化 force-kill + WARN | 想 graceful persist context(lead 自己整理 task / send 总结消息再退) |
+| `leave-running` | 不 kill;清 ccteam 监听 + 设 `state.json::detached`;lead + teammate 继续跑 | 机器 sleep / 跨设备 / 跨 day token-maxxing |
+
+`leave-running` + 后续 `ccteam start --restart-team <slug>` 是 V1.0.0 token-maxxing(用户长时间不在,机器自跑 N 天)的基础设施:
+
+```
+$ ccteam stop my-debate           # cleanup_on_stop: leave-running → 不 kill
+  Lead session id: 8e4bab09-...
+  Reconnect with `ccteam start --restart-team my-debate` or `claude attach 8e4bab09-...`
+
+# 几小时 / 几天后机器唤醒:
+$ ccteam start --restart-team my-debate
+  ✓ team-snapshot.json found; lead_session_id=8e4bab09-...
+  ✓ probe_job() == Running; lead bg job alive. Skipping spawn.
+  → ccteam 重新接管监视(无新 spawn,无 context 浪费)
+```
+
+注:plain `ccteam start <slug>`(无 `--restart-team`)在 detached 项目上**拒绝**(避免起第二个 lead 跟原来的并存):
+
+```
+$ ccteam start my-debate
+Error: project `my-debate` is in detached state (last `ccteam stop` used `cleanup_on_stop: leave-running`).
+  To re-attach the existing lead: `ccteam start --restart-team my-debate`
+  To force a fresh lead (and orphan the old one): edit state.json::detached → false, then re-run.
+```
+
+### V0.5.0 F97 — workflow.yaml hot-reload 约束
+
+Agent-team mode workflow.yaml 改动 daemon 实时响应,但**只**对"hot"字段直接生效;改"cold"字段触发 `workflow_done reason="cold_reload_required"` event + 清 watcher,你必须显式 `ccteam start --restart-team` 才会起新 lead 匹配新拓扑。
+
+| 字段 | HOT / COLD | 修改后行为 |
+|---|---|---|
+| `agent_team.lead_seed` | HOT | daemon 下个 tick 写 `.ccteam/inbox/<ts>-reload-update.md`,lead 下次拾取看到新方向 |
+| `agent_team.teammate_mode` | HOT | env-only,记录但运行中不重启(下次 spawn 才生效)|
+| `agent_team.cleanup_on_stop` | HOT | `ccteam stop` 时才读 |
+| `agent_team.auto_spawn_teammates` | HOT | 下次 plan 时才读 |
+| `suggested_teammates[].adhoc_color` / `.adhoc_tools` | HOT | cosmetic / web UI 元数据 |
+| `agent_team.team_name` | **COLD** | 改 `~/.claude/teams/<>/` 目标 dir → 必须 fresh lead |
+| `suggested_teammates[].role` / `.kind` / `.spawn_brief` | **COLD** | topology 变化 → 必须 fresh lead |
+| `workflow.yaml::mode` | **COLD** | 工作模式切换 → 必须 fresh lead |
+
 ---
 
 ## 四、选型决策树
 
-| 你的情况 | 用哪条 |
+| 你的情况 | 用哪条 + 配置 |
 |---|---|
 | 在 project session 里临时想起几个 agent 协作 | Primary `/ccteam:team` |
 | 已在 Claude session 里,不想切流程 | Primary |
-| 要长时间不在,机器自跑数天 | Advanced `ccteam init --mode agent-team` |
-| 要 hot-reload teammate 拓扑(改 workflow.yaml + 重启) | Advanced |
+| 要长时间不在,机器自跑数天 | Advanced + `cleanup_on_stop: leave-running` + 唤醒后 `ccteam start --restart-team` |
+| 要 graceful persist context 再退 | Advanced + `cleanup_on_stop: ask-lead`(可选 `--stop-timeout`) |
+| 要 hot-reload teammate **拓扑**(role/kind/spawn_brief 改) | Advanced + cold-reload 流程:改 workflow.yaml → 等 `workflow_done reason=cold_reload_required` → `ccteam start --restart-team` |
+| 要 hot-reload **lead_seed**(任务方向变更) | Advanced — 直接编辑 workflow.yaml,daemon 下个 tick 自动写 lead inbox |
 | 要 per-project budget cap 自动 disable | Advanced(F84 budget cap 仍是 ccteam-only 能力) |
 | 要 cron / scheduled 触发 | Advanced |
 | 关心 cost(实际跑了多少钱) | 任意路径,V0.5.0 F92 给真数据 |
@@ -224,7 +276,6 @@ V0.4.6 → V0.5.0 **breaking change**(pre-v1.0,不留 alias):
 ## 十一、V0.5.x 候选(延期)
 
 详 `prd.md §V0.5.x 延期 finding 草案` + `orchestration-patterns.md §五`:
-- F97 Advanced path lifecycle(`cleanup_on_stop: ask-lead` / `leave-running`;`--restart-team`;orphan scan)
 - F98 plan-approval ↔ outbox 联动(扩 F87 `intercept-ask`)
 - F99 Claude Code 版本 gating(`doctor --check-agent-teams`)
 - Routing(动态)sugar:`agent.router: <expr>`

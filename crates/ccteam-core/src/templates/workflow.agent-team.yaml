@@ -35,6 +35,9 @@ agent_team:
 
   # User-turn message written to the lead's stdin on spawn.
   # NOT a system prompt — the __lead.md spec is fixed across runs.
+  #
+  # F97 hot-reload: changing lead_seed in-flight applies via lead inbox
+  # on the next tick (no restart needed).
   lead_seed: |
     <describe the team's mission here>
 
@@ -45,12 +48,40 @@ agent_team:
   # in-process | tmux | auto
   teammate_mode: in-process
 
-  # MVP only supports force-kill on `ccteam stop <slug>`.
+  # V0.5.0 F97 — `ccteam stop <slug>` strategy:
+  #   force-kill    (default + V0.4.6 compat) SIGKILL the lead bg job.
+  #                 Teammates die with the lead (in-process / tmux mode
+  #                 binds them to the lead's PID tree).
+  #   ask-lead      Write a user-turn cleanup message to .ccteam/inbox/;
+  #                 wait up to `--stop-timeout` seconds (default 60s)
+  #                 for the lead to emit `workflow_done`; on timeout
+  #                 fall back to force-kill with a WARN. Best for
+  #                 graceful context persistence.
+  #   leave-running Drop ccteam's watch + mark `state.json::detached`;
+  #                 leave the lead bg job + teammates alive. Resume
+  #                 later via `ccteam start --restart-team <slug>`.
+  #                 Best for "machine sleep / cron" workflows where
+  #                 you want the team to keep running across human
+  #                 sessions.
   cleanup_on_stop: force-kill
 
   # Snapshot path (relative to project root). workflow.yaml is parsed
   # once at spawn; the resolved spec is frozen to this file so
   # mid-flight workflow.yaml edits don't affect the running team.
+  #
+  # V0.5.0 F97 hot-reload rules:
+  #   HOT (apply via lead inbox on next tick, no restart):
+  #     - agent_team.lead_seed
+  #     - agent_team.teammate_mode
+  #     - agent_team.cleanup_on_stop
+  #     - agent_team.auto_spawn_teammates
+  #     - suggested_teammates[].adhoc_model / .adhoc_color / .adhoc_tools
+  #   COLD (require fresh lead via `ccteam start --restart-team`):
+  #     - agent_team.team_name
+  #     - suggested_teammates[].role / .kind / .spawn_brief
+  #     - workflow.yaml::mode itself
+  # Cold-path changes emit `workflow_done reason="cold_reload_required"`
+  # and clear the watcher; you must run --restart-team to apply.
   snapshot_path: .ccteam/team-snapshot.json
 
   # Default false — lead must wait for user approval before spawning

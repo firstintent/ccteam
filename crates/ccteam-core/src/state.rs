@@ -181,6 +181,16 @@ pub struct ProjectState {
     /// decremented on `session rm`, so removed sids are never reused.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub next_sid_seq: BTreeMap<HarnessKind, u64>,
+    /// V0.5.0 F97 — agent-team mode marker for `cleanup_on_stop:
+    /// leave-running`. When `true`, `ccteam stop <slug>` dropped the
+    /// ccteam-side watch but left the lead bg job alive; a subsequent
+    /// `ccteam start <slug>` (without `--restart-team`) must refuse to
+    /// avoid spawning a second lead while the first is still running.
+    /// `#[serde(default)]` keeps old state.json files loadable.
+    /// Skipped on serialize when `false` (the default) so V0.4.6
+    /// state.json files don't accumulate the field unnecessarily.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub detached: bool,
 }
 
 fn default_team() -> String {
@@ -201,6 +211,10 @@ fn is_default_team_kind(kind: &TeamKind) -> bool {
 
 fn is_zero_u32(n: &u32) -> bool {
     *n == 0
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl ProjectState {
@@ -246,6 +260,7 @@ impl ProjectState {
             user_pause_pending: false,
             sessions: BTreeMap::new(),
             next_sid_seq: BTreeMap::new(),
+            detached: false,
         }
     }
 

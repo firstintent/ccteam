@@ -37,7 +37,7 @@ use crate::inbox::{InboxMessage, SessionMailbox};
 use crate::paths::CcteamPaths;
 use crate::progress;
 use crate::queries;
-use crate::workflow::{AgentSpec, Executor, Trigger, WorkflowError, WorkflowSpec};
+use crate::workflow::{AgentSpec, Executor, Trigger, WorkflowError, WorkflowMode, WorkflowSpec};
 use crate::workflow_watcher::{WorkflowFileEvent, WorkflowFileWatcher};
 
 /// Hard cap on concurrent project sessions (excluding the meta-agent).
@@ -182,6 +182,111 @@ impl CancelReason {
             Self::BudgetExceeded => "budget_exceeded",
         }
     }
+}
+
+/// V0.5.0 F97 — `handle_agent_team_reload` outcome variants. Caller
+/// (the daemon's main loop) dispatches on these to decide whether to
+/// keep the running event loop (`HotApplied`), cancel without
+/// re-spawning (`ColdRequired`), or fall through to the V0.4.6
+/// blanket re-roster (`NotApplicable`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentTeamReloadOutcome {
+    /// Hot diff written to lead inbox. Caller MUST NOT cancel the
+    /// running event_loop; the lead picks up the change on its next
+    /// idle tick via its `.ccteam/inbox/` polling.
+    HotApplied,
+    /// Cold diff (topology change). `workflow_done
+    /// reason="cold_reload_required"` already emitted. Caller MUST
+    /// cancel the running event_loop and MUST NOT re-spawn; user
+    /// must run `ccteam start --restart-team <slug>`.
+    ColdRequired,
+    /// Not an agent-team-mode reload (artifact-driven, missing
+    /// snapshot, or parse failure). Caller falls back to the V0.4.6
+    /// blanket re-roster path.
+    NotApplicable,
+}
+
+/// V0.5.0 F97 — best-effort reconstruction of `AgentTeamSpec` from
+/// `.ccteam/team-snapshot.json`. The snapshot is a JSON blob written
+/// by `spawn_agent_team_lead` containing the frozen
+/// `cleanup_on_stop` + `suggested_teammates` + `team_name` +
+/// `lead_session_id` + `teammate_mode`. We only need enough fields to
+/// drive `AgentTeamSpec::classify_reload`; missing optional fields
+/// default to sensible values.
+fn snapshot_to_team_spec(snapshot: &serde_json::Value) -> Option<crate::AgentTeamSpec> {
+    use crate::{
+        workflow::{CleanupOnStop, SuggestedTeammate, SuggestedTeammateKind},
+        AgentTeamSpec,
+    };
+    let team_name = snapshot.get("team_name")?.as_str()?.to_string();
+    let teammate_mode = snapshot
+        .get("teammate_mode")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let cleanup_on_stop = match snapshot
+        .get("cleanup_on_stop")
+        .and_then(|v| v.as_str())
+        .unwrap_or("force-kill")
+    {
+        "ask-lead" => CleanupOnStop::AskLead,
+        "leave-running" => CleanupOnStop::LeaveRunning,
+        _ => CleanupOnStop::ForceKill,
+    };
+    let auto_spawn_teammates = snapshot
+        .get("auto_spawn_teammates")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let suggested_teammates = snapshot
+        .get("suggested_teammates")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| {
+                    let role = t.get("role")?.as_str()?.to_string();
+                    let kind = match t.get("kind")?.as_str()? {
+                        "ad-hoc" => SuggestedTeammateKind::AdHoc,
+                        _ => SuggestedTeammateKind::Definition,
+                    };
+                    let spawn_brief = t
+                        .get("spawn_brief")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    Some(SuggestedTeammate {
+                        role,
+                        kind,
+                        spawn_brief,
+                        adhoc_model: t
+                            .get("adhoc_model")
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
+                        adhoc_color: t
+                            .get("adhoc_color")
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
+                        adhoc_tools: t.get("adhoc_tools").and_then(|v| {
+                            v.as_array().map(|arr| {
+                                arr.iter()
+                                    .filter_map(|x| x.as_str().map(String::from))
+                                    .collect()
+                            })
+                        }),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(AgentTeamSpec {
+        team_name,
+        // lead_seed isn't snapshotted — `classify_reload` doesn't look
+        // at it (it's a hot field), so empty is fine for the diff.
+        lead_seed: String::new(),
+        teammate_mode,
+        cleanup_on_stop,
+        snapshot_path: None,
+        suggested_teammates,
+        auto_spawn_teammates,
+    })
 }
 
 /// V0.5.0 F95 + F94 — Anthropic Agent Teams event mirror. Six
@@ -816,6 +921,48 @@ impl Orchestrator {
                         "workflow.yaml change detected; reloading project",
                     );
                     let slug = evt.slug.clone();
+                    // V0.5.0 F97 — agent-team mode workflows have
+                    // bespoke hot/cold-reload rules. Classify the diff
+                    // before the blanket re-roster:
+                    //   - hot (lead_seed / cosmetic) → write inbox msg,
+                    //     do NOT cancel the running event loop.
+                    //   - cold (team_name / topology) → emit
+                    //     workflow_done reason="cold_reload_required",
+                    //     clear watch, do NOT re-roster. User must
+                    //     explicitly run `ccteam start --restart-team`.
+                    //   - everything else (artifact-driven, or
+                    //     agent-team without a frozen snapshot yet) →
+                    //     fall through to the V0.4.6 blanket re-roster.
+                    let agent_team_outcome = self
+                        .handle_agent_team_reload(&slug)
+                        .await;
+                    match agent_team_outcome {
+                        AgentTeamReloadOutcome::HotApplied => {
+                            // No cancel / re-roster needed; the diff
+                            // was applied via lead inbox.
+                            continue;
+                        }
+                        AgentTeamReloadOutcome::ColdRequired => {
+                            // workflow_done already emitted; cancel
+                            // the running loop but do NOT re-spawn —
+                            // user must run --restart-team explicitly.
+                            self.unroster_project(
+                                &slug,
+                                CancelReason::Reloaded,
+                            )
+                            .await;
+                            self.spawned.lock().await.remove(&slug);
+                            // Rebuild watcher so the next workflow.yaml
+                            // edit on this slug is still observed.
+                            let (new_rx, _new_handle) = self.start_workflow_watcher().await;
+                            workflow_watcher_rx = new_rx;
+                            continue;
+                        }
+                        AgentTeamReloadOutcome::NotApplicable => {
+                            // artifact-driven or no frozen snapshot —
+                            // fall through to the V0.4.6 path below.
+                        }
+                    }
                     self.reload_project(&slug).await;
                     // Re-spawn immediately so reload latency stays
                     // well under the 5s acceptance bar (rather than
@@ -1046,6 +1193,147 @@ impl Orchestrator {
     /// shutdown to enumerate slugs to cancel.
     pub async fn is_slug_rostered(&self, slug: &str) -> bool {
         self.cancel_handles.lock().await.contains_key(slug)
+    }
+
+    /// V0.5.0 F97 — agent-team mode hot-reload dispatch. Reads the
+    /// project's workflow.yaml + `.ccteam/team-snapshot.json` (the
+    /// frozen `AgentTeamSpec` from the last spawn) and classifies the
+    /// diff:
+    ///
+    /// - **Hot**: writes a user-turn `.ccteam/inbox/<ts>-reload-*.md`
+    ///   so the lead picks the new `lead_seed` / cosmetic tweak on its
+    ///   next turn. Returns [`AgentTeamReloadOutcome::HotApplied`].
+    /// - **Cold**: emits
+    ///   `workflow_done reason="cold_reload_required"` to
+    ///   `progress.jsonl` so the operator's web SPA + CLI surface
+    ///   show the gate. Caller cancels the loop and DOES NOT
+    ///   re-spawn — user must run
+    ///   `ccteam start --restart-team <slug>` to bring up a fresh
+    ///   lead matching the new topology. Returns
+    ///   [`AgentTeamReloadOutcome::ColdRequired`].
+    /// - **Not applicable**: artifact-driven workflow, OR agent-team
+    ///   workflow without a `.ccteam/team-snapshot.json` (no spawn
+    ///   yet — let the V0.4.6 blanket re-roster proceed).
+    ///   Returns [`AgentTeamReloadOutcome::NotApplicable`].
+    async fn handle_agent_team_reload(&self, slug: &str) -> AgentTeamReloadOutcome {
+        let project_dir = self.paths.project_dir(slug);
+        let spec = match WorkflowSpec::load_for_project(&project_dir) {
+            Ok(s) => s,
+            Err(err) => {
+                tracing::warn!(
+                    slug,
+                    ?err,
+                    "F97 agent-team reload: parse failed; \
+                                            falling back to blanket re-roster"
+                );
+                return AgentTeamReloadOutcome::NotApplicable;
+            }
+        };
+        let WorkflowMode::AgentTeam = spec.mode else {
+            return AgentTeamReloadOutcome::NotApplicable;
+        };
+        let Some(new_team) = spec.agent_team.as_ref() else {
+            return AgentTeamReloadOutcome::NotApplicable;
+        };
+
+        let snapshot_path = project_dir.join(".ccteam").join("team-snapshot.json");
+        let raw = match std::fs::read_to_string(&snapshot_path) {
+            Ok(s) => s,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                tracing::debug!(
+                    slug,
+                    "F97 agent-team reload: no team-snapshot.json yet (lead not spawned); \
+                     deferring to blanket re-roster",
+                );
+                return AgentTeamReloadOutcome::NotApplicable;
+            }
+            Err(err) => {
+                tracing::warn!(slug, ?err, "F97 agent-team reload: snapshot read failed");
+                return AgentTeamReloadOutcome::NotApplicable;
+            }
+        };
+        let snapshot: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::warn!(slug, ?err, "F97 agent-team reload: snapshot parse failed");
+                return AgentTeamReloadOutcome::NotApplicable;
+            }
+        };
+        // Reconstruct the OLD spec from the snapshot for diffing.
+        let Some(old_team) = snapshot_to_team_spec(&snapshot) else {
+            tracing::warn!(slug, "F97 agent-team reload: snapshot schema unrecognized");
+            return AgentTeamReloadOutcome::NotApplicable;
+        };
+
+        let progress_path = self.paths.progress_jsonl(slug);
+        match old_team.classify_reload(new_team) {
+            Some(reason) => {
+                tracing::info!(
+                    slug,
+                    reason = reason.as_str(),
+                    "F97 agent-team reload: cold reload required",
+                );
+                let _ = progress::append_event(
+                    &progress_path,
+                    &json!({
+                        "event": "workflow_done",
+                        "workflow": spec.name,
+                        "slug": slug,
+                        "reason": "cold_reload_required",
+                        "detail": reason,
+                        "hint": format!(
+                            "Run `ccteam start --restart-team {slug}` to spawn a fresh \
+                             lead matching the new topology.",
+                        ),
+                        "ts": Utc::now().to_rfc3339(),
+                    }),
+                );
+                AgentTeamReloadOutcome::ColdRequired
+            }
+            None => {
+                // Hot reload: write the new lead_seed / cosmetic
+                // tweak to the lead's inbox.
+                let inbox_dir = project_dir.join(".ccteam").join("inbox");
+                if let Err(err) = std::fs::create_dir_all(&inbox_dir) {
+                    tracing::warn!(
+                        slug,
+                        ?err,
+                        path = %inbox_dir.display(),
+                        "F97 agent-team reload: failed to create inbox dir",
+                    );
+                    return AgentTeamReloadOutcome::NotApplicable;
+                }
+                let now = Utc::now();
+                let filename = format!("{}-reload-update.md", now.format("%Y%m%dT%H%M%SZ"),);
+                let msg_path = inbox_dir.join(&filename);
+                let body = format!(
+                    "---\nsource: ccteam-reload\npriority: normal\n---\n\n\
+                     # workflow.yaml hot-reload\n\n\
+                     The project's workflow.yaml `agent_team.lead_seed` (or a cosmetic \
+                     teammate field) was updated. Treat the following as the new \
+                     user-turn message and continue your existing plan accordingly. \
+                     This is NOT a system prompt; honor it the same way you would a \
+                     direct user request.\n\n\
+                     ## Updated lead_seed\n\n{}\n",
+                    new_team.lead_seed,
+                );
+                if let Err(err) = std::fs::write(&msg_path, body) {
+                    tracing::warn!(
+                        slug,
+                        ?err,
+                        path = %msg_path.display(),
+                        "F97 agent-team reload: failed to write inbox message",
+                    );
+                    return AgentTeamReloadOutcome::NotApplicable;
+                }
+                tracing::info!(
+                    slug,
+                    path = %msg_path.display(),
+                    "F97 agent-team reload: hot diff applied via lead inbox",
+                );
+                AgentTeamReloadOutcome::HotApplied
+            }
+        }
     }
 
     // ---- dispatch helpers ---------------------------------------------------

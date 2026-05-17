@@ -123,6 +123,65 @@ fn is_mode_default(v: &WorkflowMode) -> bool {
     matches!(v, WorkflowMode::ArtifactDriven)
 }
 
+/// V0.5.0 F97 — `cleanup_on_stop` strategy for the agent-team mode
+/// `ccteam stop <slug>` flow. F93b MVP only honored a single value
+/// (`force-kill`); F97 expands the choice into a typed enum so the CLI
+/// can dispatch on `Self::*`.
+///
+/// Default is [`Self::ForceKill`] — matches V0.4.6 behavior + the F93b
+/// MVP semantics so workflow.yaml files written before F97 continue to
+/// behave the same way. There is **no backwards-compat shim** for the
+/// old `Option<String>` shape (CLAUDE.md §五: pre-v1.0 is dev-stage,
+/// no migration shims allowed); the type change is hard.
+///
+/// Wire form (YAML scalar):
+///
+/// ```yaml
+/// cleanup_on_stop: force-kill      # default; SIGKILL the lead bg job
+/// cleanup_on_stop: ask-lead        # write user-turn cleanup message
+/// cleanup_on_stop: leave-running   # detach watcher; keep lead alive
+/// ```
+///
+/// Behavior dispatch lives in `crates/ccteam-cli/src/commands.rs::run_stop_slug`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CleanupOnStop {
+    /// V0.4.6 compat: SIGKILL the lead bg job + scrub
+    /// `.ccteam/team-snapshot.json`. Teammates die with the lead
+    /// because Anthropic's in-process / tmux mode binds them to the
+    /// lead's PID tree.
+    #[default]
+    ForceKill,
+    /// F97: write a user-turn cleanup message to
+    /// `.ccteam/inbox/<ts>-stop-request.md`. The lead picks it up on
+    /// the next turn, runs its native cleanup flow, writes
+    /// `workflow_done` to `progress.jsonl`, and exits. ccteam waits up
+    /// to `--stop-timeout` seconds (default 60) for that event; on
+    /// timeout, falls back to `ForceKill` with a WARN.
+    AskLead,
+    /// F97: drop F95 watcher entries + clear the project's daemon-side
+    /// registration, but leave the lead bg job + teammate sessions
+    /// running. The user can re-attach later with
+    /// `ccteam start --restart-team <slug>` or `claude attach <id>`.
+    /// The project's `state.json` records `detached: true` so a
+    /// subsequent plain `ccteam start <slug>` refuses with a friendly
+    /// error pointing at `--restart-team`.
+    LeaveRunning,
+}
+
+impl CleanupOnStop {
+    /// Wire-format scalar — the same kebab-case shape `serde` uses.
+    /// Used by `team-snapshot.json` serializer + log lines without
+    /// going through full `serde_yaml` round-trip.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ForceKill => "force-kill",
+            Self::AskLead => "ask-lead",
+            Self::LeaveRunning => "leave-running",
+        }
+    }
+}
+
 /// Default for `WorkflowSpec::enabled` when the YAML omits the field.
 /// `true` matches V0.4.5 behaviour (no field = run the workflow).
 fn default_enabled() -> bool {
@@ -171,7 +230,7 @@ pub struct BudgetSpec {
 ///   lead_seed: |                      # user-turn message to the lead
 ///     Investigate why integration tests in src/auth/ flake.
 ///   teammate_mode: in-process         # in-process | tmux | auto
-///   cleanup_on_stop: force-kill       # MVP: force-kill only
+///   cleanup_on_stop: force-kill       # force-kill | ask-lead | leave-running (F97)
 ///   snapshot_path: .ccteam/team-snapshot.json
 ///   suggested_teammates: []           # optional declarative list
 ///   auto_spawn_teammates: false       # default — plan-first gate
@@ -198,11 +257,17 @@ pub struct AgentTeamSpec {
     /// teammate in its own tmux pane) / `auto` (lead decides).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub teammate_mode: Option<String>,
-    /// What to do when the user runs `ccteam stop <slug>`. MVP
-    /// only supports `force-kill` (SIGKILL the lead). F97 will add
-    /// `ask-lead` / `leave-running`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cleanup_on_stop: Option<String>,
+    /// V0.5.0 F97 — what to do when the user runs `ccteam stop <slug>`.
+    /// `force-kill` (default + V0.4.6 compat) SIGKILLs the lead;
+    /// `ask-lead` writes a user-turn cleanup message to the lead's
+    /// `.ccteam/inbox/` and waits for `workflow_done`; `leave-running`
+    /// drops the F95 watcher entries but leaves the lead bg job +
+    /// teammates alive for a later `ccteam start --restart-team`.
+    /// `#[serde(default)]` keeps V0.4.6 workflow.yaml without the field
+    /// loadable as `ForceKill` (no migration shim needed; CLAUDE.md §
+    /// 五 "no backwards-compat shim").
+    #[serde(default)]
+    pub cleanup_on_stop: CleanupOnStop,
     /// V0.5.0 F93 stickiness — workflow.yaml is parsed once at spawn;
     /// the resolved spec is frozen to this snapshot path so mid-flight
     /// edits to workflow.yaml don't affect the running team. Default
@@ -224,6 +289,72 @@ pub struct AgentTeamSpec {
     /// silently omitted to enable autonomous spawn.
     #[serde(default)]
     pub auto_spawn_teammates: bool,
+}
+
+impl AgentTeamSpec {
+    /// V0.5.0 F97 — classify a workflow.yaml `agent_team:` diff into
+    /// hot vs cold reload. Returns `Some(reason)` when a cold reload
+    /// is required (caller emits
+    /// `workflow_done reason="cold_reload_required"` + suggests
+    /// `ccteam start --restart-team <slug>`); `None` means the diff
+    /// is hot and the orchestrator can apply it on the next tick by
+    /// writing a user-turn message to the lead's inbox.
+    ///
+    /// **Cold fields** (require fresh `__lead` spawn):
+    /// - `team_name` — the `~/.claude/teams/<>/` dir name is baked
+    ///   into the bg job at spawn time.
+    /// - `suggested_teammates[].role` / `.kind` / `.spawn_brief` —
+    ///   topology changes require the lead to re-plan from scratch
+    ///   (Plan-first Protocol can't reliably diff a half-spawned team).
+    ///
+    /// **Hot fields** (apply via lead inbox on next tick):
+    /// - `lead_seed` — sent as a new user-turn message.
+    /// - `teammate_mode` — env-var only relevant at spawn time, but
+    ///   we still classify it as hot (no point restarting just for an
+    ///   env hint that's already cached on the bg job).
+    /// - `suggested_teammates[].adhoc_model` / `.adhoc_color` /
+    ///   `.adhoc_tools` — cosmetic / UI-only metadata.
+    /// - `cleanup_on_stop` — picked up at `ccteam stop` time, not at
+    ///   spawn time.
+    /// - `auto_spawn_teammates` — Plan-first protocol gate is decided
+    ///   on the next plan emission; hot-reload safe.
+    pub fn classify_reload(&self, other: &Self) -> Option<String> {
+        if self.team_name != other.team_name {
+            return Some(format!(
+                "team_name changed `{}` → `{}`",
+                self.team_name, other.team_name,
+            ));
+        }
+        if self.suggested_teammates.len() != other.suggested_teammates.len() {
+            return Some(format!(
+                "suggested_teammates count {} → {}",
+                self.suggested_teammates.len(),
+                other.suggested_teammates.len(),
+            ));
+        }
+        for (a, b) in self
+            .suggested_teammates
+            .iter()
+            .zip(other.suggested_teammates.iter())
+        {
+            if a.role != b.role {
+                return Some(format!(
+                    "suggested_teammates[].role changed `{}` → `{}`",
+                    a.role, b.role,
+                ));
+            }
+            if a.kind != b.kind {
+                return Some(format!("suggested_teammates[`{}`].kind changed", a.role,));
+            }
+            if a.spawn_brief != b.spawn_brief {
+                return Some(format!(
+                    "suggested_teammates[`{}`].spawn_brief changed",
+                    a.role,
+                ));
+            }
+        }
+        None
+    }
 }
 
 /// V0.5.0 F93b — one entry under `agent_team.suggested_teammates`.

@@ -70,6 +70,7 @@ impl Fixture {
             user_pause_pending: false,
             sessions: BTreeMap::new(),
             next_sid_seq: BTreeMap::new(),
+            detached: false,
         };
         state.save(&state_path).unwrap();
 
