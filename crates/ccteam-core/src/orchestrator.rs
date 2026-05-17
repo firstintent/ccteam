@@ -1230,14 +1230,38 @@ impl Orchestrator {
             extra_args: vec![kick],
         };
 
+        // Atomic check-and-spawn: hold the `running` lock from the
+        // parallelism gate through the handle insert. dispatch_artifact's
+        // pre-check is the fast-path; this is the authoritative gate that
+        // prevents two concurrent dispatchers from both seeing the slot
+        // free and over-committing past `agent.parallelism`. (Race observed
+        // on dex-ui: two releaser markers landing ~1.5s apart bypassed the
+        // pre-check and produced 2 running with parallelism=1.)
+        //
+        // Race-loss path bails silently — the marker file remains in
+        // `.ccteam/triggers/<role>/` and the agent already-spawned for
+        // the winning marker will sweep it on its next directory scan, so
+        // no work is dropped.
+        let mut running = self.running.lock().await;
+        let max_par = agent.parallelism.unwrap_or(1).max(1) as usize;
+        let running_count = running.get(role).map(|v| v.len()).unwrap_or(0);
+        if running_count >= max_par {
+            tracing::debug!(
+                role,
+                running_count,
+                max_par,
+                "spawn race lost: another dispatcher claimed the slot; skipping"
+            );
+            return Ok(());
+        }
+
         match adapter.spawn_session(opts) {
             Ok(handle) => {
-                self.running
-                    .lock()
-                    .await
+                running
                     .entry(role.to_string())
                     .or_default()
                     .push(handle.clone());
+                drop(running);
                 self.fail_counts.lock().await.insert(role.to_string(), 0);
                 // V0.4.5 F80 — record `job_id` on the agent_spawn so
                 // the read-side (queries::workflow_summary) and
@@ -1263,6 +1287,7 @@ impl Orchestrator {
                 Ok(())
             }
             Err(err) => {
+                drop(running);
                 tracing::warn!(role, ?err, "spawn_session failed");
                 self.bump_fail_count(slug, role, progress_path).await?;
                 Ok(())
@@ -1327,6 +1352,18 @@ impl Orchestrator {
         progress_path: &std::path::Path,
     ) {
         let mut finished: Vec<(String, SessionHandle, Option<f64>, String)> = Vec::new();
+        // Snapshot in-memory sids BEFORE the cleanup loop empties them
+        // — otherwise the stale-spawn pass below would treat sessions
+        // we're about to write `agent_done` for as "untracked" and emit
+        // a duplicate synthetic done, double-draining pending and
+        // over-committing past `agent.parallelism`.
+        let in_memory_sids: std::collections::HashSet<String> = {
+            let running = self.running.lock().await;
+            running
+                .values()
+                .flat_map(|v| v.iter().map(|h| h.sid.clone()))
+                .collect()
+        };
         {
             let mut running = self.running.lock().await;
             for (role, handles) in running.iter_mut() {
@@ -1355,16 +1392,12 @@ impl Orchestrator {
         // never repopulated on daemon restart); this is purely about
         // the progress-jsonl event log.
         let events = progress::read_all_events(progress_path).unwrap_or_default();
-        let in_memory_sids: std::collections::HashSet<String> = {
-            let running = self.running.lock().await;
-            running
-                .values()
-                .flat_map(|v| v.iter().map(|h| h.sid.clone()))
-                .collect()
-        };
         for (sid, job_id, role) in progress::open_agent_spawns(&events) {
             if in_memory_sids.contains(&sid) {
                 continue; // genuinely tracked by this orchestrator instance
+                          // (snapshot taken before in-memory cleanup, so
+                          // sessions transitioning to Done in this tick
+                          // are still excluded)
             }
             let verdict = crate::claude_job::probe_job(job_id.as_deref());
             let crate::claude_job::JobLiveness::Terminal { status, cost_usd } = verdict else {

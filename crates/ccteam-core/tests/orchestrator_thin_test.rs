@@ -384,6 +384,54 @@ async fn t05_parallelism_limit_respected() {
     assert_eq!(orch.test_pending_count("fixer").await, 1);
 }
 
+/// Regression test for the check-then-act race in dispatch_artifact.
+/// Two markers landing concurrently both observed running_count=0
+/// past the fast-path check; without the atomic gate inside
+/// try_spawn_with_prompt, both would spawn even with parallelism=1.
+/// Live repro on dex-ui showed 2 releaser sessions running with
+/// parallelism=1 declared.
+#[tokio::test]
+async fn t05b_parallelism_race_holds_under_concurrent_dispatch() {
+    use std::sync::Arc;
+    let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_WATCH_FIXER);
+    let (orch, claude, _codex) = build_orchestrator(paths);
+    let spec = Arc::new(watch_spec("fixer", "issues", Some(1)));
+    let progress = orch.paths().progress_jsonl(&slug);
+
+    let orch = Arc::new(orch);
+    let pdir = Arc::new(pdir);
+    let progress = Arc::new(progress);
+    let slug = Arc::new(slug);
+
+    let mut handles = Vec::new();
+    for i in 0..4 {
+        let orch = Arc::clone(&orch);
+        let spec = Arc::clone(&spec);
+        let pdir = Arc::clone(&pdir);
+        let progress = Arc::clone(&progress);
+        let slug = Arc::clone(&slug);
+        handles.push(tokio::spawn(async move {
+            let evt = ArtifactEvent {
+                role: "fixer".into(),
+                artifact_path: pdir.join(format!("issues/{i}.md")),
+                event_kind: WatchKind::Created,
+            };
+            orch.test_handle_artifact_event(&slug, &spec, &pdir, &progress, evt)
+                .await
+                .unwrap();
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    assert_eq!(
+        claude.spawn_count(),
+        1,
+        "concurrent dispatchers must collectively spawn at most parallelism=1"
+    );
+}
+
 #[tokio::test]
 async fn t06_gate_trigger_fires_on_input_satisfied() {
     let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_GATE_SHIPPER);
