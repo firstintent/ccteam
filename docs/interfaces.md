@@ -307,7 +307,7 @@ progress.jsonl 由两个域共同写入:
 
 来源优先级:
 - F94 hook(`TaskCreated` / `TaskCompleted` / `TeammateIdle`) — 仅 F93b advanced path 装(`ccteam init --mode agent-team` 用 `settings.agent-team.json`)
-- F95 watcher 全局 fallback(对所有 host `~/.claude/teams/`) — primary path(`/ccteam:team` skill)的唯一来源
+- F95 watcher 全局 fallback(对所有 host `~/.claude/teams/`) — primary path(`/ccteam-team` skill)的唯一来源
 - F94 hook 失败 → F95 watcher 接管 `team_task_*`(`team_teammate_idle` 没 fallback)
 
 **hook domain**(Claude Code / Codex hook 写;详见 §6.2):

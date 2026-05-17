@@ -66,7 +66,7 @@
 | 机制 | 用途 |
 |---|---|
 | **CLAUDE.md** | 项目级 / 用户级持久指令 |
-| **Skills**(repo 根 `skills/`,V0.5.0 F100 5→3)| `ccteam-control`(CLI / MCP wrap)/ `ccteam-creator`(new project + workflow + agent + skill 对话向导)/ `ccteam-team`(`/ccteam:team` 当前 session 起 Anthropic Agent Team)|
+| **Skills**(repo 根 `skills/`,V0.5.0 F100 5→3)| `ccteam-control`(CLI / MCP wrap)/ `ccteam-creator`(new project + workflow + agent + skill 对话向导)/ `ccteam-team`(`/ccteam-team` 当前 session 起 Anthropic Agent Team)|
 | **MCP** | `ccteam` 17 工具(`mcp__ccteam__*`);可选 `claude-mem`(LLM 自看 surface 决定是否调)|
 | **Subagents** | agent 内 `Task(subagent_type=...)` ad-hoc 节流;8 个 plugin agent 已 ln -sf |
 | **Hooks** | `ccteam internal hook progress-append / load-context / intercept-ask`(F89 隐藏)|

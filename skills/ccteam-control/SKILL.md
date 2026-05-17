@@ -16,7 +16,7 @@ This skill is one of three shipped V0.5.0 skills. Pick by intent:
 | Intent | Skill | Quick example |
 |---|---|---|
 | Create a new ccteam project / scaffold workflow.yaml / scaffold agents / scaffold project-local skills | **`ccteam-creator`** | "make a new ccteam project for X" / "add a QA loop to this repo" |
-| Spin up an Anthropic Agent Team in the current Claude session (no `ccteam init` needed) | **`ccteam-team`** | `/ccteam:team "fix all TS errors"` |
+| Spin up an Anthropic Agent Team in the current Claude session (no `ccteam init` needed) | **`ccteam-team`** | `/ccteam-team "fix all TS errors"` |
 | **Inspect / control existing ccteam projects (this skill)** | **`ccteam-control`** | "what's the cost on todo-cli?" / "pause bookmark-mgr" |
 
 If the user wants something this skill *doesn't* cover, point them at

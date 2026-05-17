@@ -168,7 +168,7 @@ CLAUDE.md 在每次会话开头加载。包括：Bash 命令、code style、work
 
 `.claude/skills/<name>/SKILL.md`。Claude 自动在相关时应用,或 `/skill-name` 显式调用。frontmatter 支持 `disable-model-invocation: true`(有副作用时仅手动触发)。
 
-> **ccteam 映射**:自带 skill 在 repo 根 `skills/`(V0.5.0 F100 由 5 个精简到 3 个:`ccteam-control` / `ccteam-creator` / `ccteam-team`),分别对应 CLI/MCP 控制、创建新项目 + workflow + agent 对话向导、`/ccteam:team` 在当前 session 起 Anthropic Agent Team。meta-agent 优先 delegate 到这三个 skill。
+> **ccteam 映射**:自带 skill 在 repo 根 `skills/`(V0.5.0 F100 由 5 个精简到 3 个:`ccteam-control` / `ccteam-creator` / `ccteam-team`),分别对应 CLI/MCP 控制、创建新项目 + workflow + agent 对话向导、`/ccteam-team` 在当前 session 起 Anthropic Agent Team。meta-agent 优先 delegate 到这三个 skill。
 
 ### 4.7 创建 subagent
 

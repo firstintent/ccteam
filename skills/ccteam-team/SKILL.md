@@ -1,12 +1,12 @@
 ---
 name: ccteam-team
-description: Start an Anthropic Agent Team in the current Claude session via the `/ccteam:team` entry. Use when the user says "起一个 team", "spawn a team to do X", "并行调研 X", "team N:role <task>", "make a 3-debugger swarm", or otherwise asks to spin up multiple teammates working under the current session as lead. V0.5.0 primary path — works in any git repo, no `ccteam init` / `workflow.yaml` required. Uses Anthropic native `TeamCreate` + `Task` tools; the current session becomes the team-lead in-process.
+description: Start an Anthropic Agent Team in the current Claude session via the `/ccteam-team` entry. Use when the user says "起一个 team", "spawn a team to do X", "并行调研 X", "team N:role <task>", "make a 3-debugger swarm", or otherwise asks to spin up multiple teammates working under the current session as lead. V0.5.0 primary path — works in any git repo, no `ccteam init` / `workflow.yaml` required. Uses Anthropic native `TeamCreate` + `Task` tools; the current session becomes the team-lead in-process.
 ---
 
-# ccteam-team — `/ccteam:team` in current session
+# ccteam-team — `/ccteam-team` in current session
 
 V0.5.0 primary path (95% 用户). 用户已在项目 session 里(`cd ~/projects/blog && claude`),
-直接输入 `/ccteam:team "<task>"` 就把当前 turn 升级成 team-lead,native `TeamCreate` +
+直接输入 `/ccteam-team "<task>"` 就把当前 turn 升级成 team-lead,native `TeamCreate` +
 `Task` spawn teammates。**不切 session、不出 terminal、零 ccteam workflow.yaml 依赖**。
 
 ## V0.5.0 skill family (you are here)
@@ -23,20 +23,20 @@ V0.5.0 primary path (95% 用户). 用户已在项目 session 里(`cd ~/projects/
 ## 入口语法
 
 ```
-/ccteam:team <task>                              # auto N + auto roles
-/ccteam:team N "<task>"                          # N teammates, you decide roles
-/ccteam:team N:role "<task>"                     # N teammates, all role=<role>
-/ccteam:team auto "<task>"                       # explicit alias of form 1
+/ccteam-team <task>                              # auto N + auto roles
+/ccteam-team N "<task>"                          # N teammates, you decide roles
+/ccteam-team N:role "<task>"                     # N teammates, all role=<role>
+/ccteam-team auto "<task>"                       # explicit alias of form 1
 ```
 
 例:
 
 | 输入 | 解析 |
 |---|---|
-| `/ccteam:team "fix all TS errors"` | auto N + auto roles |
-| `/ccteam:team 3 "refactor auth with security + tests"` | 3 mixed teammates |
-| `/ccteam:team 3:debugger "fix build errors in src/"` | 3 个 debugger 并行 |
-| `/ccteam:team 5:reviewer "review the new API design"` | 5 个 reviewer debate |
+| `/ccteam-team "fix all TS errors"` | auto N + auto roles |
+| `/ccteam-team 3 "refactor auth with security + tests"` | 3 mixed teammates |
+| `/ccteam-team 3:debugger "fix build errors in src/"` | 3 个 debugger 并行 |
+| `/ccteam-team 5:reviewer "review the new API design"` | 5 个 reviewer debate |
 
 ## 协议
 
@@ -210,7 +210,7 @@ ccteam doctor --install-skill all   # 装 ccteam-team / ccteam-creator / ccteam-
 ccteam start                        # 启 daemon(可选,纯 web 可视化用)
 ```
 
-之后任意 git repo 跑 `/ccteam:team <task>` 都自动落 web。
+之后任意 git repo 跑 `/ccteam-team <task>` 都自动落 web。
 
 ## Skill 不做什么(刻意省略)
 

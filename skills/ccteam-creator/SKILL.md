@@ -35,7 +35,7 @@ shape).
 | Spin up an Anthropic Agent Team in the current Claude session | `ccteam-team` |
 
 If the user wants to *start* a quick team in their current session
-without persistent ccteam state, point them at `/ccteam:team` (the
+without persistent ccteam state, point them at `/ccteam-team` (the
 `ccteam-team` skill). If the user wants to *create a long-running
 ccteam project* with `workflow.yaml` + `ccteam start` orchestration,
 this skill is the right place.
@@ -441,4 +441,4 @@ triggers) or `ccteam spawn <slug> <role>` (manual).
 - `@docs/interfaces.md` — protocol-level field meanings
 - `@CLAUDE.md` §三 — architectural red lines (file system as control plane, etc.)
 - `@skills/ccteam-control/SKILL.md` — sibling skill (manage existing projects)
-- `@skills/ccteam-team/SKILL.md` — sibling skill (`/ccteam:team` in current session)
+- `@skills/ccteam-team/SKILL.md` — sibling skill (`/ccteam-team` in current session)

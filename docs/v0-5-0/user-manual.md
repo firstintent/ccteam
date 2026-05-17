@@ -23,7 +23,7 @@ ccteam doctor --install-skill all
 
 ---
 
-## 二、Primary path:`/ccteam:team` skill(95% 用户)
+## 二、Primary path:`/ccteam-team` skill(95% 用户)
 
 最贴近 Claude Code 原生习惯 — `cd project → claude → 输入 prompt`。team 在当前 session 里跑,关 session 即停(对齐 Anthropic + OMC 行为)。
 
@@ -32,7 +32,7 @@ ccteam doctor --install-skill all
 ```
 $ cd ~/projects/blog
 $ claude
-> /ccteam:team "build a Next.js blog with researcher + frontend-dev + reviewer"
+> /ccteam-team "build a Next.js blog with researcher + frontend-dev + reviewer"
 ```
 
 Claude 当前 turn 升级为 lead,输出 `TEAM PLAN ===` 框,**STOP 等 user 确认**:
@@ -54,10 +54,10 @@ Reply 'go' / 'yes' / 'approve' to spawn, or free text to revise.
 ### 入口语法
 
 ```
-/ccteam:team <task>                 # 自动决定 N + 角色
-/ccteam:team N "<task>"             # 指定 N 个 teammate
-/ccteam:team N:role "<task>"        # 指定 N 个 + 主角色(如 3:debugger)
-/ccteam:team auto "<task>"          # auto 别名(同第一个)
+/ccteam-team <task>                 # 自动决定 N + 角色
+/ccteam-team N "<task>"             # 指定 N 个 teammate
+/ccteam-team N:role "<task>"        # 指定 N 个 + 主角色(如 3:debugger)
+/ccteam-team auto "<task>"          # auto 别名(同第一个)
 ```
 
 ### web 可视化(同步发生)
@@ -67,7 +67,7 @@ $ ccteam start    # 起 daemon(无 slug 参数,只跑全局 watcher + web)
 # 浏览器开 http://localhost:7331/teams → 看 host 所有 team 实时
 ```
 
-ccteam daemon 跑着的情况下,**任何** `/ccteam:team` 起的 team 都会自动在 web `/teams` tab 出现 — 3 面板(Topology / TaskBoard / Mailbox)实时更新。**这是 ccteam 跟 OMC 等竞品的核心差异** — 跨设备 + 长跑可视化 + 多 team 总览 + 未读消息高亮。
+ccteam daemon 跑着的情况下,**任何** `/ccteam-team` 起的 team 都会自动在 web `/teams` tab 出现 — 3 面板(Topology / TaskBoard / Mailbox)实时更新。**这是 ccteam 跟 OMC 等竞品的核心差异** — 跨设备 + 长跑可视化 + 多 team 总览 + 未读消息高亮。
 
 ---
 
@@ -175,7 +175,7 @@ Agent-team mode workflow.yaml 改动 daemon 实时响应,但**只**对"hot"字�
 
 | 你的情况 | 用哪条 + 配置 |
 |---|---|
-| 在 project session 里临时想起几个 agent 协作 | Primary `/ccteam:team` |
+| 在 project session 里临时想起几个 agent 协作 | Primary `/ccteam-team` |
 | 已在 Claude session 里,不想切流程 | Primary |
 | 要长时间不在,机器自跑数天 | Advanced + `cleanup_on_stop: leave-running` + 唤醒后 `ccteam start --restart-team` |
 | 要 graceful persist context 再退 | Advanced + `cleanup_on_stop: ask-lead`(可选 `--stop-timeout`) |
@@ -218,12 +218,12 @@ V0.5.0 加新顶级 tab。任何 host `~/.claude/teams/<>/` 出现的 team(不�
 
 | Skill | 用途 | 装到 |
 |---|---|---|
-| `ccteam-team` | `/ccteam:team` 在 session 里起 agent team(primary path) | `~/.claude/skills/ccteam-team/` |
+| `ccteam-team` | `/ccteam-team` 在 session 里起 agent team(primary path) | `~/.claude/skills/ccteam-team/` |
 | `ccteam-creator` | 新建 ccteam project(workflow.yaml + agents + skill scaffold)| `~/.claude/skills/ccteam-creator/` |
 | `ccteam-control` | wrap ccteam CLI + 17 MCP 工具(`mcp__ccteam__*`),任意 session 可用 | `~/.claude/skills/ccteam-control/` |
 
 V0.4.6 的 `ccteam-team-author` + `ccteam-project-creator` 已删(V0.5.0 F100):
-- 起 team 改用 `/ccteam:team` skill
+- 起 team 改用 `/ccteam-team` skill
 - 新 project 改用 `ccteam-creator` skill 或 `ccteam init --mode agent-team` CLI
 
 **没有 deprecation alias** — `ccteam team init` / `ccteam team publish` 子命令直接删,不留警告。
@@ -236,7 +236,7 @@ V0.2 的 meta-agent 是 "全权调度 + phase 流水线 + 项目创建" singleto
 
 | V0.5.0 meta-agent 不再做 | 改成 |
 |---|---|
-| 自己起 team(phase pipeline)| delegate 到 `/ccteam:team` skill(让用户在 project session 里跑) |
+| 自己起 team(phase pipeline)| delegate 到 `/ccteam-team` skill(让用户在 project session 里跑) |
 | 自己起 project(4-phase dialogue)| delegate 到 `ccteam-creator` skill |
 | 自己跑 ccteam 命令 | 优先 delegate 到 `ccteam-control` skill;长查询走 web UI |
 | Phase 调度 / Seed Gate / kickoff reverse interview | **删了**(V0.4 已删 phase 模型;V0.5.0 删残留) |
@@ -249,7 +249,7 @@ V0.2 的 meta-agent 是 "全权调度 + phase 流水线 + 项目创建" singleto
 
 | 症状 | 排查 |
 |---|---|
-| `/ccteam:team` 不出 | `ls ~/.claude/skills/ccteam-team/` 不存在 → `ccteam doctor --install-skill all` |
+| `/ccteam-team` 不出 | `ls ~/.claude/skills/ccteam-team/` 不存在 → `ccteam doctor --install-skill all` |
 | Web `/teams` tab 空 | ccteam daemon 没跑(`ccteam start` 启 daemon)或 `~/.claude/teams/` 真没东西 |
 | Cost 显示 0 | `ccteam doctor --check-pricing-version` 看 pricing 是否过期;`grep linkScanPath ~/.claude/jobs/<id>/state.json` 看 transcript 路径是否有值 |
 | `ccteam init --mode agent-team` 报错 | Claude Code 版本不够 (≥ 2.1.32 需要),或 `agents/__lead.md` 模板缺(`ccteam doctor --install-agents`) |
@@ -266,7 +266,7 @@ V0.4.6 → V0.5.0 **breaking change**(pre-v1.0,不留 alias):
 - workflow.yaml `mode` 字段可选(`#[serde(default)]` → `artifact-driven`)— **V0.4.6 工程的 workflow.yaml 不需要任何改动**,跑 V0.5.0 binary 无缝
 
 新感觉到的能力:
-- `/ccteam:team` in Claude session
+- `/ccteam-team` in Claude session
 - `~/.claude/teams/` 全可视化(无论谁起的 team)
 - Real cost(V0.4.6 显示永远 0;V0.5.0 实数据)
 - meta-agent 不再"独占"项目创建 — 让 skill 接手

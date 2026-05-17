@@ -34,14 +34,14 @@ ccteam `cost_summary`(`crates/ccteam-core/src/cost_summary.rs`)目前读 state.j
 
 ---
 
-## F93a — `/ccteam:team` skill(**Primary path**,95% 用户)
+## F93a — `/ccteam-team` skill(**Primary path**,95% 用户)
 
 ### 用户场景
 
 ```
 $ cd ~/projects/blog
 $ claude
-> /ccteam:team "build a Next.js blog with researcher / frontend-dev / reviewer roles"
+> /ccteam-team "build a Next.js blog with researcher / frontend-dev / reviewer roles"
 ```
 
 Claude session 当前 turn 直接变成 lead,native TeamCreate + Task spawn,**不切 session、不出 terminal**。
@@ -52,21 +52,21 @@ Claude session 当前 turn 直接变成 lead,native TeamCreate + Task spawn,**�
 
 ### 需求
 
-新建 `skills/ccteam-team/SKILL.md`(repo 根 `skills/`,沿用 V0.4.6 `ccteam-control` / `ccteam-creator` 4 个 skill 的 pattern),通过 `ccteam doctor --install-skill` 装到 `~/.claude/agents/` 或 plugin marketplace(具体路径 dev-plan 定),用户在任何 Claude session 里 `/ccteam:team <args>` 调用。
+新建 `skills/ccteam-team/SKILL.md`(repo 根 `skills/`,沿用 V0.4.6 `ccteam-control` / `ccteam-creator` 4 个 skill 的 pattern),通过 `ccteam doctor --install-skill` 装到 `~/.claude/agents/` 或 plugin marketplace(具体路径 dev-plan 定),用户在任何 Claude session 里 `/ccteam-team <args>` 调用。
 
 #### Skill 入口语法
 
 ```
-/ccteam:team <task>                              # 自动决定 N + 角色
-/ccteam:team N "<task>"                          # 指定 N 个 teammate
-/ccteam:team N:role "<task>"                     # 指定 N 个 + 主角色
-/ccteam:team auto "<task>"                       # auto 别名(同第一个)
+/ccteam-team <task>                              # 自动决定 N + 角色
+/ccteam-team N "<task>"                          # 指定 N 个 teammate
+/ccteam-team N:role "<task>"                     # 指定 N 个 + 主角色
+/ccteam-team auto "<task>"                       # auto 别名(同第一个)
 ```
 
 例:
-- `/ccteam:team "fix all TS errors across the project"` → 自动选 N + executor
-- `/ccteam:team 3:debugger "fix build errors in src/"` → 3 个 debugger 并行
-- `/ccteam:team 5 "refactor auth with security review + tests"` → 5 个 mixed role
+- `/ccteam-team "fix all TS errors across the project"` → 自动选 N + executor
+- `/ccteam-team 3:debugger "fix build errors in src/"` → 3 个 debugger 并行
+- `/ccteam-team 5 "refactor auth with security review + tests"` → 5 个 mixed role
 
 #### Skill body 核心内容(SKILL.md 200-300 行)
 
@@ -130,18 +130,18 @@ ccteam **不在 skill 里**写 OMC 的 5-stage 强 pipeline(`team-plan → team-
 
 Skill path 跟 ccteam daemon **完全解耦** — daemon 不知道 user 起了什么 team,纯靠 F95 全局 watcher 发现 `~/.claude/teams/<new-team>/` 出现 → 立刻加 watch + emit `team_member_joined` → F96 web `/teams` tab 刷出新卡片。
 
-用户**只需要**在某个时刻跑过一次 `ccteam start`(启 daemon)+ `ccteam doctor --install-skill`(装 skill);后续每次 `/ccteam:team` 都自动落到 web。
+用户**只需要**在某个时刻跑过一次 `ccteam start`(启 daemon)+ `ccteam doctor --install-skill`(装 skill);后续每次 `/ccteam-team` 都自动落到 web。
 
 ### 验收(F93a)
 
-1. `ccteam doctor --install-skill` 后,任意 Claude session 输入 `/ccteam:team --help` 出 skill 说明
-2. `/ccteam:team "test task"` 在普通 git repo 项目(无 ccteam 注册)能起 team — 不依赖任何 ccteam config
+1. `ccteam doctor --install-skill` 后,任意 Claude session 输入 `/ccteam-team --help` 出 skill 说明
+2. `/ccteam-team "test task"` 在普通 git repo 项目(无 ccteam 注册)能起 team — 不依赖任何 ccteam config
 3. Plan-first:Claude 第一 message 是 `TEAM PLAN ===` 格式,不立刻 Task spawn(实测看 transcript)
 4. `go` 回复后:native TeamCreate 调用,`~/.claude/teams/<derived-slug>/config.json` 5s 内出现
 5. 每个 teammate prompt 含 Worker Preamble 30 行(verify `~/.claude/teams/<>/config.json::members[i].prompt`)
 6. daemon 跑着 → web `/teams` 5s 内出现该 team 卡片(F95 全局 watcher 发现)
 7. Skill 不写任何 ccteam-managed 文件 — 不动 `.ccteam/`,不动 `~/.ccteam/config.yaml`
-8. `/ccteam:team 3:debugger "fix TS errors"` 形式 → Claude 解析 N=3 + role=debugger,plan 含 3 个 debugger teammate
+8. `/ccteam-team 3:debugger "fix TS errors"` 形式 → Claude 解析 N=3 + role=debugger,plan 含 3 个 debugger teammate
 
 ### 红线(F93a)
 
@@ -166,7 +166,7 @@ Skill path 跟 ccteam daemon **完全解耦** — daemon 不知道 user 起了�
 
 Primary path 的 limitation:
 - Session 关掉就停(Anthropic native 限制)
-- 没有 declarative 模板复用 — 每次 task 都得想 `/ccteam:team` 怎么写
+- 没有 declarative 模板复用 — 每次 task 都得想 `/ccteam-team` 怎么写
 - 没有 budget cap(F84 不适用)
 - 没有 hot-reload(改团队组成要新起 session)
 
@@ -459,7 +459,7 @@ F95 watcher 能拿到 4 类 event(member_joined/left, message_sent, task_created
 且 hook 比 watcher 快 — task created/completed 通过 hook 是 0-延迟,通过 watcher 要等 inotify event(通常 <100ms 但偶有 lag)。
 
 ### 需求
-`crates/ccteam-core/src/templates/settings.json` 加 3 hook,**仅 F93b advanced path 装**(`ccteam init --mode agent-team` 工厂条件渲染);F93a skill path(用户在 session 里跑 `/ccteam:team`)**不装 hook** — 走 F95 全局 watcher fallback。
+`crates/ccteam-core/src/templates/settings.json` 加 3 hook,**仅 F93b advanced path 装**(`ccteam init --mode agent-team` 工厂条件渲染);F93a skill path(用户在 session 里跑 `/ccteam-team`)**不装 hook** — 走 F95 全局 watcher fallback。
 
 为什么不装 skill path 的 hook:F93a skill 不写任何 settings.json,这是 primary path 红线("不修改用户 Claude session 行为")。idle event watcher 拿不到 → web Topology 节点徽章降级到"working/idle 二元状态 + 30s 无消息推断 idle"。可接受。
 
@@ -490,7 +490,7 @@ F95 watcher 能拿到 4 类 event(member_joined/left, message_sent, task_created
 
 ### 验收
 1. F93b advanced path 起的 ccteam-managed team(`ccteam init --mode agent-team`)→ `.claude/settings.json` 含 3 个新 hook
-2. F93a primary skill path 起的 team(`/ccteam:team`)→ user's project `.claude/settings.json` **不**含新 hook;F95 全局 watcher 仍能拿 5 类 event
+2. F93a primary skill path 起的 team(`/ccteam-team`)→ user's project `.claude/settings.json` **不**含新 hook;F95 全局 watcher 仍能拿 5 类 event
 3. lead `TaskCreate` → `progress.jsonl` 出现 `team_task_created` 一行,延迟 <50ms(对比 watcher ~100-200ms)
 4. teammate `TeammateIdle` → `team_teammate_idle` event 出现(仅 F93b path);F95 watcher 不会重复 emit(去重 by event_id + ts)
 5. hook 失败(测试时 deliberately 杀 hook process)→ F95 watcher fallback 接管 `team_task_created` / `team_task_completed`(idle 没 fallback,degrade)
@@ -815,7 +815,7 @@ V0.4.0+ ccteam = workflow.yaml(声明)+ artifact watcher(observe)+ skill(对话�
 → skill surface 简化到 **3 个职责清晰的 skill**:
 1. **`ccteam-control`** — wrap ccteam CLI + MCP 工具,任意 session 可用
 2. **`ccteam-creator`** — 一切"创建"任务(new project + workflow + agent + project-local skill)
-3. **`ccteam-team`** — V0.5.0 F93a primary path,`/ccteam:team` 在用户 session 起 agent team
+3. **`ccteam-team`** — V0.5.0 F93a primary path,`/ccteam-team` 在用户 session 起 agent team
 
 ### 需求
 
@@ -873,7 +873,7 @@ V0.4.0+ ccteam = workflow.yaml(声明)+ artifact watcher(observe)+ skill(对话�
 
 ### 痛点
 
-V0.2 era meta-agent 设计为**全权 phase 调度 + 项目创建 + 跑命令**的 singleton coordinator(`teams/meta-agent/team.yaml` + `meta_agent_role.md` 303 行 + 26 处 phase 提及)。V0.4.0 删 phase 模型后,meta-agent 的"phase pipeline 调度"职责失效;V0.5.0 引入 `/ccteam:team` 后,"当 agent team lead" 职责也转给用户当前 session。
+V0.2 era meta-agent 设计为**全权 phase 调度 + 项目创建 + 跑命令**的 singleton coordinator(`teams/meta-agent/team.yaml` + `meta_agent_role.md` 303 行 + 26 处 phase 提及)。V0.4.0 删 phase 模型后,meta-agent 的"phase pipeline 调度"职责失效;V0.5.0 引入 `/ccteam-team` 后,"当 agent team lead" 职责也转给用户当前 session。
 
 V0.4.6 era meta-agent 仍按 V0.2 模型行事,导致:
 - meta_agent_role.md 描述 V0.2 phase / seed gate / kickoff reverse interview 等过时概念
@@ -886,7 +886,7 @@ V0.4.6 era meta-agent 仍按 V0.2 模型行事,导致:
 |---|---|
 | Singleton coordinator,全权调度 | **轻量 router** — 接到请求 → 判断 → delegate 到 skill / 引导用户切 session |
 | 自己跑 phase pipeline | 不跑;phase 模型 V0.4.0 已删 |
-| 自己当 agent team lead | 不当;`/ccteam:team` 在用户项目 session 跑 |
+| 自己当 agent team lead | 不当;`/ccteam-team` 在用户项目 session 跑 |
 | 自己起 project(4-phase dialogue)| **delegate 到 `ccteam-creator` skill** |
 | 自己跑 ccteam 命令 | 优先 delegate 到 `ccteam-control` skill;长查询走 web UI |
 | **cross-project memory bridge** | 保留(memory_bridge_*.md 仍有效) |
@@ -918,7 +918,7 @@ V0.4.6 era meta-agent 仍按 V0.2 模型行事,导致:
 2. 创建新项目 / 设计 workflow → invoke `ccteam-creator` skill(走 step 1/2/3/4 dialogue)
 
 3. 起 agent team(并行 review / debate / vote)→ **告诉用户**:
-   "去你的项目 session(`cd <project> && claude`),输入 `/ccteam:team "<task>"`。
+   "去你的项目 session(`cd <project> && claude`),输入 `/ccteam-team "<task>"`。
    web UI 会自动显示该 team。我不在用户项目 session 里跑这个 skill。"
 
 4. 项目 lifecycle(start/stop/show/remove)→ 自己跑 ccteam CLI(`ccteam-control` skill 也可)
@@ -939,8 +939,8 @@ V0.4.6 era meta-agent 仍按 V0.2 模型行事,导致:
 ### 验收
 1. `wc -l crates/ccteam-core/src/templates/meta_agent_role.md` ≤ 160
 2. `grep -ciE "phase[^a-z]|PHASE_DONE|ESCALATE" crates/ccteam-core/src/templates/meta_agent_role.md` == 0
-3. `ccteam doctor --install-meta-agent` 后,新 meta-agent CLAUDE.md 含新 routing 决策树(verify 关键字 "delegate skill" / "/ccteam:team" / "cross-project memory bridge")
-4. meta-agent session 收到 "创建一个 agent team 调研 X" → 回复 "去你的项目 session 跑 `/ccteam:team`",不自己 spawn(verify by attaching + 发请求看 transcript)
+3. `ccteam doctor --install-meta-agent` 后,新 meta-agent CLAUDE.md 含新 routing 决策树(verify 关键字 "delegate skill" / "/ccteam-team" / "cross-project memory bridge")
+4. meta-agent session 收到 "创建一个 agent team 调研 X" → 回复 "去你的项目 session 跑 `/ccteam-team`",不自己 spawn(verify by attaching + 发请求看 transcript)
 5. meta-agent session 收到 "新项目" → invoke `ccteam-creator` skill(verify Task tool call)
 6. `kickoff_reverse_interview.md` / `review_with_user_loop.md` 文件不存在;`meta_agent.rs` build 通过(无悬挂引用)
 

@@ -13,12 +13,12 @@
 
 V0.5.0 提供**两条 user path**,分层清晰:
 
-### 🟢 Primary path:**`/ccteam:team` skill in current Claude session**(95% 用户)
+### 🟢 Primary path:**`/ccteam-team` skill in current Claude session**(95% 用户)
 
 ```
 $ cd ~/projects/blog
 $ claude
-> /ccteam:team "build a Next.js blog: researcher, frontend-dev, reviewer"
+> /ccteam-team "build a Next.js blog: researcher, frontend-dev, reviewer"
 Claude (becomes team lead via native TeamCreate):
   TEAM PLAN
   =========
@@ -36,7 +36,7 @@ Claude: [native TeamCreate + 3 × Task(team_name, name, prompt)]
 同时(daemon 已 `ccteam start` 跑着):
 - ccteam daemon 全局 watch `~/.claude/teams/blog-team/`
 - ccteam web `http://localhost:7331/teams/blog-team` 实时可视化(Topology + Task Board + Mailbox)
-- 关 session 后 team 暂停;`claude attach <id>` 或 `/ccteam:team` 在新 session 里 resume
+- 关 session 后 team 暂停;`claude attach <id>` 或 `/ccteam-team` 在新 session 里 resume
 
 这条 path **完全对齐** OMC `/oh-my-claudecode:team` 用户体感 + **超过 OMC** 的长跑可视化能力。
 
@@ -71,13 +71,13 @@ $ ccteam attach my-debate               # 或后续任意时刻 attach
 | # | 标题 | 所属 path | 一句话 |
 |---|---|---|---|
 | **F92** | 真 cost 数据源(linkScanPath jsonl)| 两条 path 共享 | `state.json::cost_usd_total` 实测为 0,真数据在 transcript jsonl `usage`;`cost_summary` 切源;F96 teammate cost / F84 budget cap 前置项 |
-| **F93** | `/ccteam:team` skill 工厂(**primary path**) + `mode: agent-team` workflow.yaml + `__lead.md`(**advanced path**)| 两条 path 共建 | 共享 `agents/__lead.md` body(skill 加载 / advanced 当 system prompt);Worker Preamble + Plan-first Protocol + definition vs ad-hoc 两类 teammate 支持;skill 安装通过 `ccteam doctor --install-skill` |
+| **F93** | `/ccteam-team` skill 工厂(**primary path**) + `mode: agent-team` workflow.yaml + `__lead.md`(**advanced path**)| 两条 path 共建 | 共享 `agents/__lead.md` body(skill 加载 / advanced 当 system prompt);Worker Preamble + Plan-first Protocol + definition vs ad-hoc 两类 teammate 支持;skill 安装通过 `ccteam doctor --install-skill` |
 | **F94** | Agent Teams 3 hook 镜像(精度提升)| Advanced path 装(skill 不动 settings.json) | 仅 ccteam-spawned `__lead` session 的 project settings.json 装 `TeammateIdle` / `TaskCreated` / `TaskCompleted`;Primary path 走 F95 watcher fallback;6 类 event 总数 |
 | **F95** | 全局 watcher — 读 `~/.claude/teams/` SoT(**MVP 核心,两条 path 共享**)| 两条 path 共享 | daemon 全局扫 `~/.claude/teams/<>/` + `inboxes/<teammate>.json` + `~/.claude/tasks/<>/`;5 类 team event 镜像到 `progress.jsonl`。**完全独立于 ccteam workflow** — 无论 user 怎么起 team,都看得到 |
 | **F96** | Web SPA Teams tab + 3 新面板(覆盖所有 host teams)| 两条 path 共享 | 新顶级 `/teams` tab;详情页 Team Topology + Task Board + Mailbox(`read: false` 高亮)+ 5 API + SSE。**核心差异化** vs OMC(无可视化)+ vs Claude Code native(关终端就丢)|
 | **F97** | Advanced path lifecycle 完善 — `cleanup_on_stop` 3 策略 + `--restart-team` + hot-reload 约束 | Advanced path | `CleanupOnStop` 枚举(force-kill / ask-lead / leave-running);`ccteam start --restart-team` 通过 snapshot + `probe_job` 复活;`AgentTeamSpec::classify_reload` 区分 hot(lead_seed → inbox 写)vs cold(team_name/topology → `workflow_done reason=cold_reload_required`)。V1.0.0 token-maxxing 基础设施 |
 | **F100** | Skill surface refactor(5 → 3)| 全局 | 删 `ccteam-team-author` skill 整目录 + `ccteam team init/publish` CLI + `team_factory*.rs` + `teams/dev|research|research-academic/` V0.2 phase 残留;合并 `ccteam-project-creator` 到 `ccteam-creator`(4-phase dialogue 改名 step 1-4);重写 `ccteam-control` 清 phase;V0.5.0 ship 后只剩 `ccteam-control` / `ccteam-creator` / `ccteam-team` 3 skill |
-| **F101** | Meta-agent 角色重塑 — 轻量 router + memory bridge + dashboard | 全局 | `meta_agent_role.md` 303 → ~150 行,删 26 处 phase 提及;删 `kickoff_reverse_interview.md` + `review_with_user_loop.md` V0.2 残留;meta-agent 不再 enforce phase / 不再当 agent team lead,delegate 到 `/ccteam:team` skill + `ccteam-creator` skill;保留 cross-project memory bridge + dashboard chat |
+| **F101** | Meta-agent 角色重塑 — 轻量 router + memory bridge + dashboard | 全局 | `meta_agent_role.md` 303 → ~150 行,删 26 处 phase 提及;删 `kickoff_reverse_interview.md` + `review_with_user_loop.md` V0.2 残留;meta-agent 不再 enforce phase / 不再当 agent team lead,delegate 到 `/ccteam-team` skill + `ccteam-creator` skill;保留 cross-project memory bridge + dashboard chat |
 
 ### V0.5.x 延期
 
@@ -91,7 +91,7 @@ $ ccteam attach my-debate               # 或后续任意时刻 attach
 
 | 维度 | OMC `/team` | Anthropic native | ccteam V0.5.0 |
 |---|---|---|---|
-| 在 session 起 team(habit-aligned)| ✅ | ✅ | ✅ Primary path `/ccteam:team` |
+| 在 session 起 team(habit-aligned)| ✅ | ✅ | ✅ Primary path `/ccteam-team` |
 | Worker Preamble + Plan-first | ✅ | ❌ | ✅(borrow OMC)|
 | Long-running unattended | ❌ user session 一关就停 | ❌ same | ✅ Advanced path:`ccteam start` bg `__lead` + `claude attach` |
 | **跨设备可视化** | ❌ pure CLI | ❌ in-process/tmux 限本机终端 | ✅ web SPA on `http://<host>:7331/teams/` |
@@ -109,7 +109,7 @@ $ ccteam attach my-debate               # 或后续任意时刻 attach
 
 | 缺口(V0.4.6) | V0.5.0 解决? |
 |---|---|
-| Parallelization(vote)| ✅ Primary `/ccteam:team` skill 自然支持(lead 自决)|
+| Parallelization(vote)| ✅ Primary `/ccteam-team` skill 自然支持(lead 自决)|
 | Composability | ⚠️ 部分(skill 内 lead 可 native compose;跨 workflow 仍 V0.5.x)|
 | Routing(动态)| ❌ V0.5.x `agent.router: <expr>` sugar |
 | Evaluator-Optimizer 显式 sugar | ❌ V0.5.x |

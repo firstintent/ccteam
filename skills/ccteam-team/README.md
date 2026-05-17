@@ -8,21 +8,21 @@ V0.5.0 F93a primary path:在用户当前 Claude session 里起一个 Anthropic A
 ## 入口语法
 
 ```
-/ccteam:team <task>                              # auto N + auto roles
-/ccteam:team N "<task>"                          # N teammates, you decide roles
-/ccteam:team N:role "<task>"                     # N teammates, all role=<role>
-/ccteam:team auto "<task>"                       # explicit alias of form 1
+/ccteam-team <task>                              # auto N + auto roles
+/ccteam-team N "<task>"                          # N teammates, you decide roles
+/ccteam-team N:role "<task>"                     # N teammates, all role=<role>
+/ccteam-team auto "<task>"                       # explicit alias of form 1
 ```
 
 ## Trigger examples
 
 | 输入 | 效果 |
 |---|---|
-| `/ccteam:team "build a Next.js blog with researcher / frontend / reviewer"` | auto 3-role team |
-| `/ccteam:team 3 "fix TS errors across src/"` | 3 teammates, mixed |
-| `/ccteam:team 3:debugger "fix build errors in src/auth/"` | 3 个 debugger 并行 |
-| `/ccteam:team 5:reviewer "review the new API design"` | 5 个 reviewer debate |
-| `/ccteam:team auto "investigate why integration tests flake"` | auto N + roles |
+| `/ccteam-team "build a Next.js blog with researcher / frontend / reviewer"` | auto 3-role team |
+| `/ccteam-team 3 "fix TS errors across src/"` | 3 teammates, mixed |
+| `/ccteam-team 3:debugger "fix build errors in src/auth/"` | 3 个 debugger 并行 |
+| `/ccteam-team 5:reviewer "review the new API design"` | 5 个 reviewer debate |
+| `/ccteam-team auto "investigate why integration tests flake"` | auto N + roles |
 
 ## Plan-first protocol(红线)
 

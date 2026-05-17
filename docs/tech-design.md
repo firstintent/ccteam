@@ -51,7 +51,7 @@ Orchestration Layer (F66 thin orchestrator)
 | 层 | 谁负责 | 内嵌 LLM? | 何时落地 |
 |---|---|---|---|
 | Channel | 翻译外部消息系统 ↔ inbox/outbox 文件协议；无业务语义 | ❌（Symphony 反模式禁止） | M2+ stub，首选复用开源方案 |
-| User Interaction | LLM 驱动的对话与决策（meta-agent + 项目 agent bg-job + agent-team teammate）；**所有 NL 理解、任务调度、记忆调用都发生在这一层**。V0.5.0 F101: meta-agent 重新定位为**轻量 router + cross-project memory bridge + dashboard chat**(不再当 phase pipeline coordinator,也不当 agent team lead;创建项目走 `ccteam-creator` skill,起 agent team 让用户在自己 session 跑 `/ccteam:team`) | ✅ 但**只通过 ccteam-managed claude session 落地**，不是适配器进程内的 LLM | 项目 agent ✓（M0）；meta-agent ✓（M1） |
+| User Interaction | LLM 驱动的对话与决策（meta-agent + 项目 agent bg-job + agent-team teammate）；**所有 NL 理解、任务调度、记忆调用都发生在这一层**。V0.5.0 F101: meta-agent 重新定位为**轻量 router + cross-project memory bridge + dashboard chat**(不再当 phase pipeline coordinator,也不当 agent team lead;创建项目走 `ccteam-creator` skill,起 agent team 让用户在自己 session 跑 `/ccteam-team`) | ✅ 但**只通过 ccteam-managed claude session 落地**，不是适配器进程内的 LLM | 项目 agent ✓（M0）；meta-agent ✓（M1） |
 | Orchestration | Rust 编排状态机 / 文件系统状态平面 / 进程生命周期 / hooks 反射 | ❌（永远是 Rust） | ✓（M0 + M0.5） |
 
 #### 2.1.2 进程视图
@@ -801,7 +801,7 @@ V0.5.0 F100 删除整套:`crates/ccteam-core/src/team_factory.rs` /
 
 替代:
 - **创建新项目** → `skills/ccteam-creator/` step 1/2/3/4 对话(吸收原 `ccteam-project-creator`)
-- **在当前 session 起 agent team** → `/ccteam:team` skill(V0.5.0 F93a)
+- **在当前 session 起 agent team** → `/ccteam-team` skill(V0.5.0 F93a)
 - **自定义 workflow / agent / project-local skill** → `skills/ccteam-creator/` 同一向导
 
 实施位置见 `crates/ccteam-core/src/skill.rs` + `crates/ccteam-cli/src/commands.rs` 的

@@ -5,7 +5,7 @@
 | Wave | 内容 | 占比 | 并行度 |
 |---|---|---|---|
 | Wave 0 | F92 真 cost 数据源 — 共享 prerequisite | 8% | 单 subagent,1-2 天 |
-| Wave 1 | F95 全局 watcher + F93a skill(`/ccteam:team`)+ F96 web 3 面板 — **primary path 闭环** | 45% | 3 subagent 并行,3-4 天 |
+| Wave 1 | F95 全局 watcher + F93a skill(`/ccteam-team`)+ F96 web 3 面板 — **primary path 闭环** | 45% | 3 subagent 并行,3-4 天 |
 | Wave 2 | F93b workflow.yaml `mode: agent-team` + `__lead.md` bg spawn + `ccteam start/attach` + F94 hook 注入 — **advanced path** | 18% | 2 subagent 并行,2-3 天 |
 | Wave 2.5 | **F97 advanced path lifecycle** — `cleanup_on_stop` 3 策略 + `--restart-team` + hot-reload 约束 | 7% | 单 subagent,4-5 小时(mid-cycle 入版本)|
 | **Wave 3**(新)| **F100 Skill surface refactor + F101 Meta-agent 角色重塑** — 清 V0.2/V0.3 phase 残留,简化 surface | 15% | 2-3 subagent 并行,1-2 天 |
@@ -45,7 +45,7 @@
 - F96 web API `GET /api/v1/teams` 返回 shape
 - F93a skill 不依赖前两个(纯 SKILL.md 内容)
 
-### F93a — `/ccteam:team` skill(Primary path)
+### F93a — `/ccteam-team` skill(Primary path)
 
 | 文件 | 改动 |
 |---|---|
@@ -259,7 +259,7 @@ Wave 2 advanced path 起来后,补 3 个生命周期 gap:graceful stop / sleep-r
 | `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` 改名废弃 | 锁 Claude Code 版本下限到 V0.5.0 ship 时 stable;F99 加 doctor 检测 |
 | F92 pricing.json 跟 Anthropic 公开价漂移 | pricing.json 内嵌 schema_version + ship date;`doctor --check-pricing-version` 半年触发 WARN |
 | **F93a skill body vs F93b `__lead.md` body 双源漂移** | dev-plan 强制:相同 boilerplate(Worker Preamble / Plan-first Protocol)单一源,两端 `include_str!` 同一文件 |
-| Skill `/ccteam:team` 跟用户已有 `/team` skill 冲突 | namespace 用 `ccteam:team`;`ccteam doctor --install-skill` 装时检查 collision 并提示 |
+| Skill `/ccteam-team` 跟用户已有 `/team` skill 冲突 | namespace 用 `ccteam:team`;`ccteam doctor --install-skill` 装时检查 collision 并提示 |
 | `__lead.md` 用户改坏(advanced path)| `ccteam doctor --validate-team` 加 `__lead.md` body hash check;改了 WARN,不 fail |
 | 3 个新 web 面板大幅扩 SPA 体积 | React lazy + code splitting,`/teams` 路由才加载 chunk |
 | Wave 1 / Wave 2 双 path 共享 `agents/__lead.md` 但路径不同(skill 加载 vs system prompt 装载)| 设计阶段定:`agents/__lead.md` 作为 system prompt 给 advanced path 用;skill body 直接 include 同一文件作为 supplemental — 同一份 boilerplate 双用 |
@@ -273,7 +273,7 @@ Wave 2 advanced path 起来后,补 3 个生命周期 gap:graceful stop / sleep-r
 | **doc review** | 本 PRD + dev-plan 用户 review,确认 双 path 边界 / red lines | T+0 |
 | **Wave 0** | F92 单 subagent + ship merge | T+2 天 |
 | **Wave 1 并行 3 subagent** | F93a skill + F95 watcher + F96 web | T+5 天 |
-| **Wave 1 ship intermediate** | host E2E:roblog team 在 web 出现 + `/ccteam:team` 在新 repo 起 team | T+5 天(中检验) |
+| **Wave 1 ship intermediate** | host E2E:roblog team 在 web 出现 + `/ccteam-team` 在新 repo 起 team | T+5 天(中检验) |
 | **Wave 2 并行 2 subagent** | F93b CLI factory + F94 hook 注入 | T+7 天 |
 | **Wave 3 并行 2-3 subagent** | F100 skill refactor(删 team-author + 合并 project-creator + 清 phase)+ F101 meta_agent_role 重写 | T+9 天 |
 | **Wave 4** | integration + 文档 + ship + tag | T+11 天 |
@@ -301,5 +301,5 @@ Wave 2 advanced path 起来后,补 3 个生命周期 gap:graceful stop / sleep-r
 4. **不**让 F92 影响调用方签名;数据源切换内部完成
 5. **不**让 web SPA agent-team 面板影响 artifact-driven workflow 渲染路径
 6. **Primary path 零 ccteam workflow 依赖** — F93a skill 在任何 git repo / 任何路径下都跑得起来
-7. **`/ccteam:team` 不修改用户 settings.json** — hook 注入是 F93b advanced 专属
-8. **Wave 1 ship 后用户应立刻可用**(`/ccteam:team` 跑通)— 不等 Wave 2 advanced path
+7. **`/ccteam-team` 不修改用户 settings.json** — hook 注入是 F93b advanced 专属
+8. **Wave 1 ship 后用户应立刻可用**(`/ccteam-team` 跑通)— 不等 Wave 2 advanced path
