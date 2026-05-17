@@ -430,7 +430,7 @@ agent_team:
 红线:即使 `auto_spawn_teammates: true`,lead 仍需在 `.ccteam/outbox/team-bootstrap-<ts>.md` 写一份"团队已起,以下为 spawn 列表" 给用户事后追溯;web SPA Topology 把这视为 audit log。
 
 ### 验收
-1. `ccteam init --mode agent-team my-debate` 生成 4 个文件:`.ccteam/workflow.yaml`(mode=agent-team)+ `.claude/agents/__lead.md` + `.ccteam/inbox/`(空目录,沿用)+ 注册到 `~/.ccteam/config.yaml`
+1. `cd my-debate && ccteam init --mode agent-team`(或 `ccteam init --slug my-debate --mode agent-team`)生成 4 个文件:`.ccteam/workflow.yaml`(mode=agent-team)+ `.claude/agents/__lead.md` + `.ccteam/inbox/`(空目录,沿用)+ 注册到 `~/.ccteam/config.yaml`。**注:`ccteam init` 没有 positional slug 参数;从 cwd basename 推导,或用 `--slug` 显式覆盖**
 2. `ccteam start my-debate` 触发 confirm prompt(`[Y/n/attach]`);`Y` → spawn + 打印 attach 命令;`attach` → spawn + 直接 exec `claude attach <id>`;`n` → 取消无副作用
 3. `--no-confirm` / `-y` 跳过 prompt;`--attach` 直接走 attach 路径;`--dry-run` 只打印不 spawn
 4. spawn 后 `ccteam show my-debate` 显示 lead session id + state=`waiting_for_plan_approval`(plan-first protocol)

@@ -78,12 +78,18 @@ ccteam daemon 跑着的情况下,**任何** `/ccteam-team` 起的 team 都会自
 ### 起 team
 
 ```
-$ ccteam init --mode agent-team my-debate
-  ✓ Wrote my-debate/.ccteam/workflow.yaml (mode=agent-team)
-  ✓ Wrote my-debate/.claude/agents/__lead.md
-  ✓ Registered to ~/.ccteam/config.yaml
+# `ccteam init` 没有 positional slug — 用 --slug 显式指定,或 cd 进项目目录
+$ mkdir my-debate && cd my-debate
+$ ccteam init --mode agent-team
+  ✓ Wrote .ccteam/workflow.yaml (mode=agent-team)
+  ✓ Wrote .claude/agents/__lead.md
+  ✓ Registered to ~/.ccteam/config.yaml (slug derived from cwd basename = my-debate)
 
-$ vim my-debate/.ccteam/workflow.yaml
+# 或一行命令 ——
+# $ ccteam init --slug my-debate --mode agent-team
+# 安装到 <projects_root>/my-debate/(走 ~/.ccteam/config.yaml::projects_root)
+
+$ vim .ccteam/workflow.yaml
   # 编辑 agent_team.lead_seed / suggested_teammates / budget.max_cost_usd_per_24h
 
 $ ccteam start my-debate

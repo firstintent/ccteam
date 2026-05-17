@@ -43,10 +43,11 @@ Claude: [native TeamCreate + 3 × Task(team_name, name, prompt)]
 ### 🟡 Advanced path:**workflow.yaml `mode: agent-team` + bg `__lead`**(automation use case only)
 
 ```
-$ ccteam init --mode agent-team my-debate
-$ vim my-debate/.ccteam/workflow.yaml  # 声明 suggested_teammates / lead_seed / budget cap
-$ ccteam start my-debate                # [Y/n/attach] confirm prompt
-$ ccteam attach my-debate               # 或后续任意时刻 attach
+$ mkdir my-debate && cd my-debate     # ccteam init 从 cwd basename 推 slug
+$ ccteam init --mode agent-team       # 或 ccteam init --slug my-debate --mode agent-team
+$ vim .ccteam/workflow.yaml           # 声明 suggested_teammates / lead_seed / budget cap
+$ ccteam start my-debate              # [Y/n/attach] confirm prompt
+$ ccteam attach my-debate             # 或后续任意时刻 attach
 ```
 
 适用场景:**用户长时间不在,机器自跑** N 天(对应 `requirements.md §14` V1.0.0 token-maxxing 终极目标的 building block)。普通用户用不到 — 用 primary path 即可。
