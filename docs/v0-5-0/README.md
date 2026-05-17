@@ -41,7 +41,7 @@ V0.4.6 `workflow.yaml` 隐式一种 mode = **artifact-driven**(ArtifactWatcher i
 | # | 标题 | 一句话 |
 |---|---|---|
 | **F92** | 真 cost 数据源(linkScanPath jsonl) | `~/.claude/jobs/<>/state.json::cost_usd_total` 实测为 0,真数据在 transcript jsonl `usage`;ccteam `cost_summary` 切源;F96 teammate cost 显示前置项 |
-| **F93** | workflow.yaml `mode: agent-team` schema + `__lead` role 工厂 | `ccteam init --mode agent-team` 生成 `__lead.md` + agent-team workflow.yaml;orchestrator `claude --bg --agent __lead` spawn 长跑 lead;`lead_seed` user-turn 注入(不是 system prompt);**factory 是必需 — 用户不再每次手敲自然语言起团队** |
+| **F93** | workflow.yaml `mode: agent-team` schema + `__lead` role 工厂 | `ccteam init --mode agent-team` 生成 `__lead.md` + agent-team workflow.yaml;orchestrator `claude --bg --agent __lead` spawn 长跑 lead;`lead_seed` user-turn 注入(不是 system prompt);**支持 Anthropic 两类 teammate**:definition-backed(引用 `.claude/agents/<role>.md` frontmatter+body)+ ad-hoc(lead 临时写 prompt,roblog 用法);workflow.yaml `suggested_teammates[]` 声明 `kind: definition\|ad-hoc` |
 | **F94** | Agent Teams 3 hook 镜像 + 6 类新 event(精度提升)| `TeammateIdle` / `TaskCreated` / `TaskCompleted` hook 装到 ccteam-spawned __lead session;补 F95 watcher 拿不到的 `team_teammate_idle` 信号;TaskCreate/Complete 延迟从 ~100ms 降到 <50ms |
 | **F95** | ArtifactWatcher 扩展 — 读 `~/.claude/teams/` SoT(MVP 核心)| watch `config.json`(member 拓扑)+ `inboxes/<teammate>.json`(mailbox 数组,含 `read` 状态)+ `tasks/<>/`(task);diff → 镜像 5 类 team event 到 `progress.jsonl`。覆盖 ccteam-managed team **和** 用户 interactive team 两种,**只读** |
 | **F96** | Web SPA Teams tab + 3 新面板(覆盖所有 host teams)| 新顶级 `/teams` tab(平 `/projects`)列出所有 `~/.claude/teams/<>/`;详情页 = Team Topology(节点图)+ Task Board(Kanban)+ Mailbox Stream(消息时间线,高亮未读);4 API endpoints + SSE。**核心差异化** vs OMC(无可视化) |

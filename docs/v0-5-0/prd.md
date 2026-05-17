@@ -67,24 +67,57 @@ agent_team:
   team_name: flaky-test-debate         # 必填,= ~/.claude/teams/<team_name>/ dir 名
   lead_seed: |                         # user-turn message,不是 system prompt
     Investigate why integration tests in src/auth/ flake intermittently.
-    Suggested teammates (use TeammateAdd):
-      - auth-expert (model: sonnet, color: blue)
-      - network-expert (model: sonnet, color: green)
-      - test-runner (model: sonnet, color: yellow)
-    Have them debate competing hypotheses; require plan approval.
+    Spawn the suggested teammates below; have them debate competing
+    hypotheses; require plan approval before any teammate writes code.
   teammate_mode: in-process            # in-process | tmux | auto;写到 lead 的 env CLAUDE_CODE_TEAMMATE_MODE
   cleanup_on_stop: force-kill          # MVP 只支持 force-kill;F97 加 ask-lead / leave-running
   snapshot_path: .ccteam/team-snapshot.json  # F93 stickiness — workflow.yaml 解析后冻结,team 生命周期内不重读
 
-# `agents:` 不再列举具体 teammate — 让 lead 决定。workflow.yaml 只用 lead_seed 表达意图。
-# 如果用户想强制某些 teammate 必有,在 lead_seed 里用 "MUST spawn the following teammates: ..." 表达。
+  # 建议的 teammate 列表(可选)— lead 按 Anthropic 两类 teammate spawn pattern 选择:
+  suggested_teammates:
+    # ---- definition-backed teammate ----
+    # 引用 .claude/agents/<role>.md 文件;Claude 自动:
+    #   - 用 frontmatter 的 tools 限制 teammate 工具(SendMessage/TaskCreate 等团队工具始终保留)
+    #   - 用 frontmatter 的 model 跑 teammate
+    #   - 把 .md body **append** 到 teammate system prompt(不是替换)
+    #   - skills + mcpServers frontmatter **不生效**(teammate 走 project/user settings)
+    - role: code-reviewer              # → .claude/agents/code-reviewer.md 必须存在
+      kind: definition
+      spawn_brief: |                   # spawn 时给 teammate 的 task description(append 在 .md body 之后)
+        Review the auth changes specifically; security focus.
+
+    # ---- ad-hoc teammate ----
+    # 没有对应 .md 文件;lead 临时写完整 prompt(roblog team 全部 5 个 member 都是这类)
+    # config.json::members[i].agentType 通常是 "general-purpose"
+    - role: db-expert
+      kind: ad-hoc
+      spawn_brief: |
+        You are a PostgreSQL expert investigating auth_sessions table
+        for race conditions. Tools: Read, Bash, Grep. Report findings
+        via SendMessage to team-lead.
+      adhoc_model: sonnet              # ad-hoc 必须自己指定 model(没 .md frontmatter)
+      adhoc_color: purple              # 可选,UI 显示用
+      adhoc_tools: [Read, Grep, Bash]  # 可选;默认 lead's permission inheritance
+
+  # 全部省略 suggested_teammates 也合法 — lead 完全从 lead_seed 自然语言决定 team 组成。
+  # 但 V0.5.0 推荐 declarative 写法以获得 hot-reload 时的 diff 计算 + 跨 workflow 复用。
 ```
 
-**注意 schema 变化**(跟早期草案不同):
-- 删除 `agent_team.agents:` map(原想在 schema 里枚举 teammate)— 改由 lead 决定 + Anthropic config.json 落地
-- 加 `agent_team.team_name`(必填,跟 Anthropic dir 同名,no implicit derivation)
-- 加 `agent_team.snapshot_path` — 借鉴 OMC `resolved_routing` stickiness,workflow.yaml 改动不影响跑着的 team(F82 hot-reload 在 agent-team mode 走 force-restart)
-- 删除 `default_model` / `require_plan_approval`(让 lead 在 lead_seed 里决定,不写 schema)
+**注意 schema 关键决策**:
+- `team_name` 必填,跟 Anthropic dir 1:1 绑定;不同名 ccteam 找不到 SoT
+- `suggested_teammates` 可选;省略 = lead 自由决定;给了 = lead 优先按列表 spawn(可微调)
+- `kind: definition` vs `kind: ad-hoc` 显式标注 — 让 F95 watcher 知道该 member 是否会有 `.claude/agents/<role>.md` 作为 prompt 来源
+- `snapshot_path` 借鉴 OMC `resolved_routing` stickiness — workflow.yaml 改动**不影响**跑着的 team(F82 hot-reload 在 agent-team mode 走 force-restart)
+- 不出现 `default_model` / `require_plan_approval` — 留 lead 在 lead_seed 决定
+
+#### Definition-backed vs Ad-hoc 决策树
+
+| 选 definition 用于 | 选 ad-hoc 用于 |
+|---|---|
+| 跨 workflow 复用的 role(如 `code-reviewer`, `security-reviewer`, `test-engineer`) | 一次性 / 项目特化的 role(如 `roblog-pm`, `flaky-test-debugger`)|
+| 想让 ccteam web Topology 链接到 .md 文件 | role 行为完全在 spawn_brief 里写清楚 |
+| 想跟 Anthropic `claude /agents` 命令同源管理 | 不想为 one-shot teammate 维护 .md 文件 |
+| 想让 frontmatter `tools` 强制约束 | 想 inherit lead's permissions |
 
 #### `__lead` role 模板
 
@@ -108,7 +141,46 @@ You are the team lead for a ccteam-managed agent-team workflow. ...
 `ccteam init --mode agent-team <slug>` 工厂:
 1. 写 `<project>/.ccteam/workflow.yaml`(从 `crates/ccteam-core/src/templates/workflow.agent-team.yaml` 模板)
 2. 写 `<project>/.claude/agents/__lead.md`(从 `agents/__lead.md` `include_str!`)
-3. **不写**业务 teammate `.md` — 由用户在 dialogue 中由 `ccteam-creator` skill 加(沿用 F89 模式)
+3. **不写**业务 teammate `.md` — 由用户决定 definition 还是 ad-hoc:
+   - 想用 definition-backed 的 role(如 `code-reviewer`)→ 用 `ccteam-creator` skill 在 `.claude/agents/code-reviewer.md` 写 frontmatter + body(沿用 F89 模式)
+   - 想用 ad-hoc 的 role → 在 workflow.yaml `suggested_teammates` 里直接写 `kind: ad-hoc` + `spawn_brief`,不开 .md 文件
+
+`__lead.md` 系统 prompt 必须明确告诉 lead 两种 spawn pattern(F93 核心交付):
+
+```markdown
+# `__lead.md` body 节选(模板示例)
+
+You are the team lead. Your project is at `<cwd>`. workflow.yaml is at
+`.ccteam/workflow.yaml`. Read it to discover `agent_team.suggested_teammates`.
+
+For each entry in suggested_teammates:
+
+- If `kind: definition`:
+    - Verify `.claude/agents/<role>.md` exists (project / user / plugin scope).
+    - Spawn via Task tool with `subagent_type: "<role>"`. Append the
+      `spawn_brief` as additional instructions in the prompt (Claude
+      already appends the .md body, you only add task-specific brief).
+    - Honor frontmatter tools / model — DO NOT override unless user
+      explicitly asks. Note: skills / mcpServers in frontmatter are
+      ignored when running as teammate (teammate uses project/user
+      settings instead).
+
+- If `kind: ad-hoc`:
+    - Generate the full system prompt for this teammate inline,
+      combining `spawn_brief` with team protocol boilerplate (see Worker
+      Preamble section below — adapted from OMC team SKILL.md).
+    - Spawn via Task tool with `subagent_type: "general-purpose"` and
+      `model: "<adhoc_model>"` / `tools: <adhoc_tools>` / your generated
+      prompt. ccteam web Topology will tag this teammate as "ad-hoc"
+      (no .md link).
+
+Worker Preamble (always include in ad-hoc teammate prompts):
+- "You are a TEAM WORKER, not a leader. NEVER spawn sub-agents."
+- "ALL progress goes via SendMessage to team-lead."
+- "When blocked or idle, send `idle_notification` and wait."
+- "When done, set task status: completed via TaskUpdate."
+- [borrow OMC §"Agent Preamble" 30-line pattern verbatim]
+```
 
 #### orchestrator 行为
 - 解析 `mode: agent-team` → 跳过 ArtifactWatcher 安装,改装"lead 单 session 看护"
@@ -248,14 +320,22 @@ F95 watcher 能拿到 4 类 event(member_joined/left, message_sent, task_created
 
 ### `progress.jsonl` event 镜像
 
-5 类 team event(沿用早期草案):
+5 类 team event(F95 全部 watcher-emit;F94 加第 6 类 `team_teammate_idle`):
+
 | event | 来源 | payload |
 |---|---|---|
-| `team_member_joined` | F95 config.json diff | `{ team_name, teammate_name, agent_id, agent_type, model, color, started_at }` |
+| `team_member_joined` | F95 config.json diff | `{ team_name, teammate_name, agent_id, agent_type, model, color, cwd, backend_type, definition_backed, started_at }` |
 | `team_member_left` | F95 config.json diff(member 消失)| `{ team_name, teammate_name }` |
-| `team_message_sent` | F95 inboxes/ 新文件 | `{ team_name, from, to, summary_truncated, ts }` |
+| `team_message_sent` | F95 inboxes/ 新文件 | `{ team_name, from, to, text_truncated, ts, color }` |
 | `team_task_created` | F95 tasks/ 新文件(status: pending) | `{ team_name, task_id, title, assignee?, dependencies[] }` |
 | `team_task_completed` | F95 tasks/ modify(status: completed) | `{ team_name, task_id, result_summary?, completed_at }` |
+
+**`definition_backed` 字段计算逻辑**(F95 emit `team_member_joined` 时):
+- 若 `config.json::members[i].agentType` 不是 `"general-purpose"` 且 `"team-lead"` 之外的值(如 `"code-reviewer"` / `"security-reviewer"`)— 视为 definition-backed,字段 = `true`
+- 否则(`agentType` ∈ {`general-purpose`, `team-lead`})— ad-hoc 或 lead,字段 = `false`
+- F96 Web Topology 用此字段决定显示"↗ definition link"还是"📝 ad-hoc badge"
+
+`ccteam-core/src/orchestrator.rs::Event` enum 加 5 变体(`#[serde(rename = "team_*")]`)。
 
 `ccteam-core/src/orchestrator.rs::Event` enum 加 5 变体(`#[serde(rename = "team_*")]`)。
 
@@ -298,12 +378,20 @@ ccteam web header tabs:
 - 头像色(`config.json::members[].color`)
 - `model`(`config.json::members[].model` — 直接读,可能是 `sonnet`/`opus`/自定义 `deepseek-v4-pro[1m]`)
 - `agentType`(`team-lead` / `general-purpose` / 自定义 subagent name)
+- **prompt 来源徽章**(关键差异化):
+  - `agentType ∈ {"general-purpose", "team-lead"}` → 显示 "📝 **ad-hoc**" badge,click 展开 inline prompt(从 config.json::members[i].prompt 读,KB 级,展开为 modal)
+  - `agentType` 是其他值(如 `code-reviewer`)→ 显示 "↗ **definition**:`.claude/agents/<agentType>.md`" 超链接,click 在 web SPA 打开 .md 文件渲染(支持 frontmatter 解析 + body markdown render)+ 标注 "skills / mcpServers fields not applied when running as teammate"
 - 当前 activity(从 `~/.claude/jobs/<leadSessionId>/state.json` Haiku summary 同源)
 - cost(F92 数据源 — `linkScanPath` jsonl 算)
 - 状态色:`backendType == "in-process"` → 蓝;`backendType == "tmux"` → 绿;config 中消失 → 灰;最近 30s `idle_notification` → 黄
 - `cwd` 文本(member working dir,长路径截尾)
 
 边线 = `members[].subscriptions[]`(Anthropic schema 已有,默认空表示订阅 lead);hover 显示最近 3 条 from-this-node 的消息(从 inboxes/ 反向拉)。
+
+**ad-hoc vs definition 数据流**:
+- ad-hoc:整 prompt 在 config.json 里,F96 直接 render(无外部依赖)
+- definition:config.json 只存 agentType + spawn 时 lead 给的 task brief,完整 prompt 在 `.claude/agents/<role>.md`,F96 要新加 `GET /api/v1/teams/<name>/member/<n>/definition` endpoint 返回 .md 文件内容(query subagent scope:project → user → plugin → managed)
+- definition .md 文件不存在(被删了等错位场景)→ Topology 显示 "↗ ⚠️ definition file missing: `.claude/agents/<agentType>.md`",team 仍可观察但 prompt 来源不明
 
 #### 2. Task Board 面板
 Kanban 3 列:Pending / In Progress / Completed(数据源 = `~/.claude/tasks/<team>/*.json`)。每个 task 卡显示:
@@ -332,24 +420,27 @@ UI 行为:
 
 #### API endpoints
 
-新加 4 个 ccteam web API:
+新加 5 个 ccteam web API:
 - `GET /api/v1/teams` — 列出 host 所有 team(从 F95 discovery)
 - `GET /api/v1/teams/<name>` — 单 team 详情(config + tasks 计数 + 最近消息)
 - `GET /api/v1/teams/<name>/tasks` — 全 task 列表
 - `GET /api/v1/teams/<name>/inbox?teammate=<n>&since=<ts>` — mailbox 拉取(支持 since cursor)
+- `GET /api/v1/teams/<name>/member/<teammate_name>/definition` — 仅 definition-backed teammate 返回 `.claude/agents/<agentType>.md` 文件内容(parsed: `{frontmatter: {...}, body: <markdown>, skills_not_applied: [...], mcp_servers_not_applied: [...]}`);ad-hoc 直接 404 + 引导调 inbox 取 inline prompt
 
 #### SSE wiring
 新加 SSE channel:`/api/v1/teams/<name>/events`,推送 6 类 team event(F95 提供 5 类 + F94 提供 `team_teammate_idle`)— 镜像到 progress.jsonl 后由 web backend forward。
 
 ### 验收
-1. host 跑过 agent team(如 roblog)→ ccteam web `/teams` tab 显示 roblog 卡片(4 members)
-2. 点 roblog 进详情页 → Team Topology 5s 内 render lead + researcher + frontend-dev + reviewer + pm 五节点
-3. roblog tasks/ 加文件 → Task Board 5s 内出现新 task 卡(Pending 列)
-4. teammate 间 SendMessage 落 inboxes/ → Mailbox Stream 5s 内出现消息
-5. host 同时有 2+ agent team → `/teams` tab 列两个,不串味
-6. ccteam-managed agent-team workflow(F93/F94 落地后)+ host interactive team(用户自起)同时存在 → 两者都在 `/teams` tab(无区分,**ccteam 视所有 team 为平等可视化对象**)
-7. SSE 断线 → 面板"reconnecting...",5s 内自动重连
-8. 跨浏览器:Chrome / Firefox / Safari 最新版 + iOS Safari(响应式)
+1. host 跑过 agent team(如 roblog,5 members 全 ad-hoc)→ ccteam web `/teams` tab 显示 roblog 卡片
+2. 点 roblog 进详情页 → Team Topology 5s 内 render 5 节点;**所有节点显示 "📝 ad-hoc" badge**(agentType 均为 `general-purpose` / `team-lead`)
+3. 起一个测试 team 用 definition-backed teammate(workflow.yaml `kind: definition` + `.claude/agents/code-reviewer.md` 存在)→ Topology 该节点显示 "↗ definition" 链接,click 打开 modal render .md frontmatter + body
+4. definition .md 文件被删除 → Topology 节点显示 warning "definition file missing"
+5. roblog tasks/ 加文件 → Task Board 5s 内出现新 task 卡(Pending 列)
+6. teammate 间 SendMessage 落 inboxes/ → Mailbox Stream 5s 内出现消息;`read: false` 高亮
+7. host 同时有 2+ agent team → `/teams` tab 列两个,不串味
+8. ccteam-managed agent-team workflow(F93 起的)+ host interactive team(用户自起)同时存在 → 两者都在 `/teams` tab(无区分,**ccteam 视所有 team 为平等可视化对象**)
+9. SSE 断线 → 面板"reconnecting...",5s 内自动重连
+10. 跨浏览器:Chrome / Firefox / Safari 最新版 + iOS Safari(响应式)
 
 ---
 

@@ -35,8 +35,9 @@
 |---|---|
 | `crates/ccteam-core/src/workflow.rs::WorkflowSpec` | 加 `pub mode: WorkflowMode`(enum `ArtifactDriven` / `AgentTeam`)+ `pub agent_team: Option<AgentTeamSpec>` |
 | `crates/ccteam-core/src/workflow.rs::AgentTeamSpec`(新)| `lead_seed: String` / `teammate_mode: TeammateMode` / `default_model: Option<String>` / `require_plan_approval: bool` / `cleanup_on_stop: CleanupOnStop` |
-| `crates/ccteam-core/src/templates/workflow.agent-team.yaml`(新)| 默认模板,`ccteam init --mode agent-team` 用 |
-| `agents/__lead.md`(新)| Anthropic agent spec 模板,沿用 F89 explorer.md pattern;include_str! 嵌入 binary |
+| `crates/ccteam-core/src/templates/workflow.agent-team.yaml`(新)| 默认模板,`ccteam init --mode agent-team` 用;含 `suggested_teammates` 注释示例(definition + ad-hoc 各一个) |
+| `agents/__lead.md`(新)| Anthropic agent spec 模板,沿用 F89 explorer.md pattern;include_str! 嵌入 binary;**body 必须包含 Anthropic 两类 teammate spawn pattern 指导**(definition: Task tool with subagent_type=role / ad-hoc: Task with subagent_type=general-purpose + 完整 inline prompt)+ Worker Preamble boilerplate |
+| `crates/ccteam-core/src/workflow.rs::SuggestedTeammate`(新结构)| `{ role: String, kind: enum {Definition, AdHoc}, spawn_brief: String, adhoc_model: Option<String>, adhoc_color: Option<String>, adhoc_tools: Option<Vec<String>> }` |
 | `crates/ccteam-cli/src/commands.rs::run_init` | 加 `--mode <artifact-driven\|agent-team>` flag;agent-team 走新 init 路径,写 `__lead.md` + agent-team workflow.yaml 模板 |
 | `crates/ccteam-cli/src/commands.rs::DEFAULT_AGENT_SCAFFOLDS` | 加 `("__lead.md", include_str!("../../../agents/__lead.md"))` 条目(F89 数组) |
 | `crates/ccteam-core/src/orchestrator.rs` | 加 `spawn_agent_team_lead(slug, spec)` 函数;agent-team mode 项目跳过 ArtifactWatcher 装,只装 lead session;lead spawn 时 env 注入 `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` |
@@ -67,7 +68,7 @@
 | 文件 | 改动 |
 |---|---|
 | `crates/ccteam-core/src/artifact_watcher.rs` | 加 `add_agent_teams_discovery()` — daemon 启动 + 60s 周期扫 `~/.claude/teams/*/config.json` |
-| `crates/ccteam-core/src/teams_config_parser.rs`(新)| 解析 `~/.claude/teams/<>/config.json`,提取 `members[]` + 每 member 全字段(agentId/name/color/agentType/model/cwd/tmuxPaneId/subscriptions/backendType/planModeRequired);diff snapshot → emit `team_member_joined` / `team_member_left` |
+| `crates/ccteam-core/src/teams_config_parser.rs`(新)| 解析 `~/.claude/teams/<>/config.json`,提取 `members[]` + 每 member 全字段(agentId/name/color/agentType/model/cwd/tmuxPaneId/subscriptions/backendType/planModeRequired);**计算 `definition_backed: bool`** = `agentType` ∉ `{"general-purpose", "team-lead"}`;diff snapshot → emit `team_member_joined` / `team_member_left` |
 | `crates/ccteam-core/src/teams_inbox_parser.rs`(新)| 解析 `~/.claude/teams/<>/inboxes/<teammate>.json` 数组;diff snapshot by timestamp → 新 message → emit `team_message_sent`(`text` 截 200 char);**识别 `text` 是 JSON-stringified `idle_notification` 类系统消息 → 分流到 F94 event(不进 mailbox stream)** |
 | `crates/ccteam-core/src/teams_task_parser.rs`(新)| 解析 `~/.claude/tasks/<>/<id>.json`;监 dir 新文件 + modify;diff `status` 状态机(pending/in_progress/completed)→ emit `team_task_created` / `team_task_completed` |
 | `crates/ccteam-core/tests/agent_teams_watcher_test.rs`(新)| 全用 host fixture(`references/claude-code/teams-samples/`)— config.json 加 member / inbox 加 message / task status 流转 / schema 解析失败 graceful |
@@ -82,7 +83,8 @@
 
 | 文件 | 改动 |
 |---|---|
-| `crates/ccteam-web/src/api_v1.rs` | 加 4 endpoint:`GET /api/v1/teams`(列表)/ `/teams/<name>`(单 team)/ `/teams/<name>/tasks` / `/teams/<name>/inbox?teammate=&since=` |
+| `crates/ccteam-web/src/api_v1.rs` | 加 5 endpoint:`GET /api/v1/teams`(列表)/ `/teams/<name>`(单 team)/ `/teams/<name>/tasks` / `/teams/<name>/inbox?teammate=&since=` / `/teams/<name>/member/<n>/definition`(definition-backed 返回 .md 解析,ad-hoc 404) |
+| `crates/ccteam-web/src/subagent_resolver.rs`(新)| 按 Claude Code subagent scope 顺序(project `.claude/agents/` → user `~/.claude/agents/` → plugin → managed)解析 `<agentType>.md` 路径 + 解析 frontmatter + 标注 `skills` / `mcpServers` "not applied as teammate" |
 | `crates/ccteam-web/src/sse.rs` | 加 `/api/v1/teams/<name>/events` SSE channel,推 6 类 team event(F95 5 + F94 1) |
 | `crates/ccteam-web/web/spa/src/pages/TeamsListPage.tsx`(新)| `/teams` 顶级 tab,列出 host 所有 team 卡片(name / 描述 / member 数 / 最新活动 ts) |
 | `crates/ccteam-web/web/spa/src/pages/TeamDetailPage.tsx`(新)| `/teams/<name>` 详情页,3 面板 layout |
