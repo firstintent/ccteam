@@ -123,7 +123,7 @@ $ ccteam attach my-debate               # 或后续任意时刻 attach
 |---|---|
 | `prd.md` | F92-F96 5 个 finding 产品需求 + 验收 + V0.5.x 延期 finding 草案。**§ F93a 是 skill primary path,§ F93b 是 advanced CLI factory** |
 | `dev-plan.md` | 实现路径 + wave 划分 + 测试矩阵。**Wave 1 = skill + 全局 watcher + web(覆盖 95% 用户),Wave 2 = advanced CLI** |
-| `user-manual.md`(ship 后写)| Primary path 入门 + advanced path 选型决策树 |
+| `user-manual.md` | Primary path 入门 + advanced path 选型决策树 + 故障排除 + V0.4.6→V0.5.0 升级注 — V0.5.0 ship 后写完 |
 
 ---
 

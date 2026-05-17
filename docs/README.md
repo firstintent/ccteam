@@ -48,7 +48,7 @@
 | **V0.4.4** | [`v0-4-4/README.md`](v0-4-4/README.md) | F77。`session_context_from_cwd` walk-up + `paths.project_dir(slug)` 走 config.yaml registry |
 | **V0.4.5** | [`v0-4-5/README.md`](v0-4-5/README.md) | F78 + F80。watcher 项目相对路径修复 + phantom agent_spawn cleanup |
 | **V0.4.6** | [`v0-4-6/README.md`](v0-4-6/README.md) | F81-F91 (11 个 finding)。lifecycle / 用户痛点根治 / 运维收敛 — **当前 ship 版本** |
-| **V0.5.0** | [`v0-5-0/README.md`](v0-5-0/README.md) | F92-F96。真 cost 数据源 + Agent Teams 集成(workflow.yaml mode + `__lead` role + 3 hook 镜像 + 3 web 面板)— **doc-first 立项中**,代码未动 |
+| **V0.5.0** | [`v0-5-0/README.md`](v0-5-0/README.md) | F92 + F93a + F93b + F94 + F95 + F96 + F100 + F101。真 cost 数据源 + Agent Teams 集成(primary skill `/ccteam:team` + advanced `mode: agent-team` workflow + `__lead` role + 3 hook 镜像 + web `/teams` tab + 3 面板)+ skill surface 5→3 + meta-agent 重塑 — **当前 ship 版本** |
 
 ## 文档维护规约
 
