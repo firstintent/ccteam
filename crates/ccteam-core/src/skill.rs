@@ -33,6 +33,13 @@ pub const CCTEAM_TEAM_AUTHOR_SKILL_NAME: &str = "ccteam-team-author";
 /// flow with a structured AskUserQuestion-driven UX.
 pub const CCTEAM_PROJECT_CREATOR_SKILL_NAME: &str = "ccteam-project-creator";
 
+/// V0.5.0 F93a — `ccteam-team` skill name. Primary path for the
+/// agent-team mode: `/ccteam:team "<task>"` in the user's current
+/// Claude session spawns an Anthropic Agent Team in-process without
+/// any ccteam workflow.yaml / `ccteam init` step. SKILL.md ships under
+/// `<repo>/skills/ccteam-team/SKILL.md` alongside its README.
+pub const CCTEAM_TEAM_SKILL_NAME: &str = "ccteam-team";
+
 /// V0.2.2 F44: legacy V0.2.2 (F39'd) skill directory names that
 /// `ccteam doctor` migrates back. Exposed so the migration helper can
 /// scan for stale `cct-*` installs without re-declaring the names.
@@ -58,6 +65,12 @@ pub const CCTEAM_TEAM_AUTHOR_SKILL_MD: &str = include_str!(concat!(
 pub const CCTEAM_PROJECT_CREATOR_SKILL_MD: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../skills/ccteam-project-creator/SKILL.md"
+));
+
+/// Embedded `SKILL.md` body for the V0.5.0 F93a `/ccteam:team` skill.
+pub const CCTEAM_TEAM_SKILL_MD: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../skills/ccteam-team/SKILL.md"
 ));
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -117,6 +130,16 @@ pub fn install_ccteam_project_creator_skill(
         CCTEAM_PROJECT_CREATOR_SKILL_MD,
         opts,
     )
+}
+
+/// V0.5.0 F93a: install the `ccteam-team` skill into
+/// `~/.claude/skills/ccteam-team/SKILL.md`. Same idempotent semantics
+/// as the other shipped skills. Entry point for the V0.5.0 primary
+/// path — once installed, `/ccteam:team "<task>"` in any Claude
+/// session in any git repo spawns an Anthropic Agent Team in-process.
+pub fn install_ccteam_team_skill(opts: InstallSkillOptions) -> Result<InstallSkillReport> {
+    let claude = user_claude_dir().context("resolve ~/.claude/")?;
+    install_skill_body_into(&claude, CCTEAM_TEAM_SKILL_NAME, CCTEAM_TEAM_SKILL_MD, opts)
 }
 
 /// Test-injectable variant: write into `<claude_dir>/skills/...` so unit
@@ -321,6 +344,59 @@ mod tests {
             tmp.path(),
             CCTEAM_PROJECT_CREATOR_SKILL_NAME,
             CCTEAM_PROJECT_CREATOR_SKILL_MD,
+            InstallSkillOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(r2.action, SkillInstallAction::AlreadyPresent);
+    }
+
+    // ----------------- V0.5.0 F93a ccteam-team skill -----------------
+
+    #[test]
+    fn ccteam_team_skill_installs_under_canonical_dir() {
+        // V0.5.0 F93a: ccteam-team skill ships the `/ccteam:team`
+        // primary-path entry. The body must declare the canonical
+        // `name: ccteam-team` frontmatter so Claude Code's skill loader
+        // picks it up, and must contain the plan-first protocol +
+        // Worker Preamble that the skill is designed around.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let report = install_skill_body_into(
+            tmp.path(),
+            CCTEAM_TEAM_SKILL_NAME,
+            CCTEAM_TEAM_SKILL_MD,
+            InstallSkillOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(report.action, SkillInstallAction::Wrote);
+        assert!(report.target.exists());
+        let body = std::fs::read_to_string(&report.target).unwrap();
+        assert!(body.starts_with("---\nname: ccteam-team"));
+        // Plan-first protocol is the F93a red line — verify it's
+        // literally in the skill body so a future edit can't silently
+        // drop it.
+        assert!(body.contains("TEAM PLAN"));
+        assert!(body.contains("Worker Preamble"));
+        // The entry syntax block must include all four forms documented
+        // in the PRD F93a §需求.
+        for form in ["/ccteam:team <task>", "N \"<task>\"", "N:role", "auto"] {
+            assert!(body.contains(form), "missing entry syntax form: {form}");
+        }
+    }
+
+    #[test]
+    fn ccteam_team_skill_install_is_idempotent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        install_skill_body_into(
+            tmp.path(),
+            CCTEAM_TEAM_SKILL_NAME,
+            CCTEAM_TEAM_SKILL_MD,
+            InstallSkillOptions::default(),
+        )
+        .unwrap();
+        let r2 = install_skill_body_into(
+            tmp.path(),
+            CCTEAM_TEAM_SKILL_NAME,
+            CCTEAM_TEAM_SKILL_MD,
             InstallSkillOptions::default(),
         )
         .unwrap();

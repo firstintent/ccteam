@@ -344,10 +344,19 @@ enum Command {
         /// agents/skills + MCP servers) and print a markdown report.
         #[arg(long, default_value_t = false)]
         tool_surface: bool,
-        /// Install the `ccteam-control` skill at
-        /// `~/.claude/skills/ccteam-control/SKILL.md` (M1.8). Idempotent.
-        #[arg(long, default_value_t = false)]
-        install_skill: bool,
+        /// Install ccteam skills under `~/.claude/skills/<name>/SKILL.md`.
+        /// M1.8 + V0.5.0 F93a. Default (no value) installs every shipped
+        /// skill (`ccteam-control` / `ccteam-team-author` /
+        /// `ccteam-project-creator` / `ccteam-team`). Pass a single skill
+        /// name (e.g. `--install-skill ccteam-team`) to install just one.
+        /// Pass `--install-skill all` for the explicit default. Idempotent.
+        #[arg(
+            long,
+            value_name = "NAME",
+            num_args = 0..=1,
+            default_missing_value = "all",
+        )]
+        install_skill: Option<String>,
         /// Bootstrap the canonical meta-agent project at
         /// `~/projects/meta/` with the dispatcher role prompt +
         /// inbox/outbox dirs. Also installs the `ccteam-control` skill.
@@ -792,8 +801,21 @@ fn main() -> Result<()> {
         } => {
             // V0.4.1 `--install-all` is sugar for the three first-run
             // flags. Explicit flags still win where set; we OR them.
+            //
+            // V0.5.0 F93a: `install_skill` is now `Option<String>`. The
+            // flag is "passed" when `Some(_)`; we keep a derived bool
+            // so `--install-all` + `--install-meta-agent` plumbing
+            // doesn't have to chase the optional name through every
+            // call site.
             let final_mcp = install_mcp || install_all;
-            let final_skill = install_skill || install_all;
+            let final_skill = install_skill.is_some() || install_all;
+            // None = caller didn't pass --install-skill at all; treat
+            // --install-all as the implicit "all". A non-"all" value
+            // narrows the selection to a single shipped skill.
+            let install_skill_only = install_skill
+                .as_deref()
+                .filter(|s| !s.eq_ignore_ascii_case("all"))
+                .map(|s| s.to_string());
             let final_meta = install_meta_agent || install_all;
             // V0.4.6 F83 + F85: `--apply` inverts default dry-run for
             // both --migrate-workflow-to-ccteam-dir and --gc-claude-jobs
@@ -809,6 +831,7 @@ fn main() -> Result<()> {
                 force,
                 tool_surface,
                 install_skill: final_skill,
+                install_skill_only,
                 install_meta_agent: final_meta,
                 install_mcp: final_mcp,
                 install_memory_bridge,

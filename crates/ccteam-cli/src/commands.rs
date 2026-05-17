@@ -12,11 +12,13 @@ use ccteam_core::tmux::TmuxSession;
 use ccteam_core::{
     bootstrap_meta_project, current_ccteam_bin, install_ccteam_control_skill,
     install_ccteam_project_creator_skill, install_ccteam_team_author_skill,
-    migrate_legacy_skill_dirs, migrate_recommended_agent_symlinks, rewrite_legacy_hook_commands,
-    session_name_for_project, user_claude_dir, write_global_helper_templates, CcteamPaths,
-    HookCmdRewriteAction, HookCmdRewriteReport, InstallSkillOptions, LegacySkillAction,
-    LegacySkillReport, MetaBootstrapReport, MigrationReport, PhaseState, ProjectState,
-    SkillInstallAction, ToolSurfaceSnapshot, BUILTIN_SUBAGENTS,
+    install_ccteam_team_skill, migrate_legacy_skill_dirs, migrate_recommended_agent_symlinks,
+    rewrite_legacy_hook_commands, session_name_for_project, user_claude_dir,
+    write_global_helper_templates, CcteamPaths, HookCmdRewriteAction, HookCmdRewriteReport,
+    InstallSkillOptions, LegacySkillAction, LegacySkillReport, MetaBootstrapReport,
+    MigrationReport, PhaseState, ProjectState, SkillInstallAction, ToolSurfaceSnapshot,
+    BUILTIN_SUBAGENTS, CCTEAM_CONTROL_SKILL_NAME, CCTEAM_PROJECT_CREATOR_SKILL_NAME,
+    CCTEAM_TEAM_AUTHOR_SKILL_NAME, CCTEAM_TEAM_SKILL_NAME,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -219,7 +221,7 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
         out.push_str("\nfirst-run install:\n");
         let mut did_something = false;
 
-        let do_skill = ask_yn("install ccteam-control skill (~/.claude/skills/)", opts.yes)?;
+        let do_skill = ask_yn("install ccteam skills (~/.claude/skills/)", opts.yes)?;
         if do_skill {
             out.push_str(&render_install_skill_report(
                 paths,
@@ -1024,12 +1026,24 @@ pub struct DoctorOptions {
     pub dry_run: bool,
     pub force: bool,
     pub tool_surface: bool,
-    /// M1.8: install `~/.claude/skills/ccteam-control/SKILL.md`
-    /// and `~/.claude/skills/ccteam-team-author/SKILL.md`, plus run the
-    /// V0.2.2 (F39'd) → V0.2.2 (F44'd) reverse migration (cleanup of
-    /// legacy `cct-*` skill dirs and stale settings.json hook command
-    /// paths).
+    /// M1.8: install ccteam skills under `~/.claude/skills/<name>/SKILL.md`,
+    /// plus run the V0.2.2 (F39'd) → V0.2.2 (F44'd) reverse migration
+    /// (cleanup of legacy `cct-*` skill dirs and stale settings.json
+    /// hook command paths).
+    ///
+    /// V0.5.0 F93a: pair with `install_skill_only = Some("<name>")` to
+    /// install just one named skill. Default (`install_skill_only = None`)
+    /// installs every shipped skill: `ccteam-control`, `ccteam-team-author`,
+    /// `ccteam-project-creator`, and the V0.5.0 `ccteam-team` primary-path
+    /// entry.
     pub install_skill: bool,
+    /// V0.5.0 F93a: when `install_skill == true` and this is `Some(name)`,
+    /// install only the named skill (one of `ccteam-control` /
+    /// `ccteam-team-author` / `ccteam-project-creator` / `ccteam-team` /
+    /// `all`). `None` or `Some("all")` install every shipped skill. The
+    /// CLI flag is `--install-skill [NAME]` (no value = install all,
+    /// matches the V0.4.6 behavior).
+    pub install_skill_only: Option<String>,
     /// V0.4.1: bootstrap the meta-agent project at `~/projects/meta/`.
     /// `true` triggers `install_skill` regardless of its standalone
     /// flag. (Pre-V0.4.1 this was `Option<String>` for a per-user handle
@@ -1123,10 +1137,12 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
              --tool-surface\n      \
              cross-check phase templates' tools_required against current reachability — \
              plugin-pipeline-aware (V0.2 M0.20).\n  \
-             --install-skill [--force]\n      \
-             write ~/.claude/skills/ccteam-{control,team-author,project-creator}/SKILL.md (M1.8); \
-             also runs the V0.2.2 (F39'd) → V0.2.2 (F44'd) reverse migration (legacy `cct-*` skill dirs + \
-             stale settings.json hook command paths).\n  \
+             --install-skill [NAME] [--force]\n      \
+             write ~/.claude/skills/ccteam-{control,team-author,project-creator,team}/SKILL.md \
+             (M1.8 + V0.5.0 F93a). Pass NAME=all (or omit) for every shipped skill; pass a \
+             single skill name (`ccteam-team` etc.) to install just one. Default installs run \
+             the V0.2.2 (F39'd) → V0.2.2 (F44'd) reverse migration (legacy `cct-*` skill dirs + \
+             stale settings.json hook command paths); single-skill installs skip the migration.\n  \
              --install-meta-agent\n      \
              bootstrap the canonical meta-agent project at ~/projects/meta/. Implies --install-skill. (V0.4.1: handle dropped — one ccteam install = one meta-agent.)\n  \
              --install-mcp\n      \
@@ -1492,10 +1508,51 @@ fn render_install_skill_report(paths: &CcteamPaths, opts: &DoctorOptions) -> Res
         force: opts.force,
         dry_run: opts.dry_run,
     };
+
+    // V0.5.0 F93a: classify the selector. `None` / `Some("all")` ⇒
+    // install every shipped skill (V0.4.6 behavior + new ccteam-team).
+    // `Some("<name>")` ⇒ install just that one and skip F44 migration
+    // because the migration touches every shipped skill name.
+    let selector = opts.install_skill_only.as_deref().unwrap_or("all");
+    let selector_lc = selector.to_ascii_lowercase();
+    let install_all = selector_lc.is_empty() || selector_lc == "all";
+
+    if !install_all {
+        // Single-skill mode — short header so the report makes it clear
+        // we deliberately skipped the other shipped skills + the F44
+        // legacy reverse migration.
+        let mut out = format!("ccteam doctor --install-skill {selector}\n\n");
+        let target = match selector_lc.as_str() {
+            CCTEAM_CONTROL_SKILL_NAME => install_ccteam_control_skill(install_opts)?,
+            CCTEAM_TEAM_AUTHOR_SKILL_NAME => install_ccteam_team_author_skill(install_opts)?,
+            CCTEAM_PROJECT_CREATOR_SKILL_NAME => {
+                install_ccteam_project_creator_skill(install_opts)?
+            }
+            CCTEAM_TEAM_SKILL_NAME => install_ccteam_team_skill(install_opts)?,
+            other => bail!(
+                "ccteam doctor --install-skill {other}: unknown skill name; expected one of \
+                 `all` / {ctrl} / {ta} / {pc} / {tt}",
+                ctrl = CCTEAM_CONTROL_SKILL_NAME,
+                ta = CCTEAM_TEAM_AUTHOR_SKILL_NAME,
+                pc = CCTEAM_PROJECT_CREATOR_SKILL_NAME,
+                tt = CCTEAM_TEAM_SKILL_NAME,
+            ),
+        };
+        out.push_str(&format!(
+            "  {name:<22}  {label}  {}\n",
+            target.target.display(),
+            name = selector_lc,
+            label = skill_install_label(&target.action),
+        ));
+        out.push('\n');
+        return Ok(out);
+    }
+
     let mut out = String::from("ccteam doctor --install-skill\n\n");
 
     // V0.2.2 F44: install all shipped skills under their canonical
-    // ccteam-* names (reverting F39's `cct-*` rename).
+    // ccteam-* names (reverting F39's `cct-*` rename). V0.5.0 F93a
+    // adds `ccteam-team` to the default set.
     let control = install_ccteam_control_skill(install_opts)?;
     out.push_str(&format!(
         "  ccteam-control          {label}  {}\n",
@@ -1513,6 +1570,12 @@ fn render_install_skill_report(paths: &CcteamPaths, opts: &DoctorOptions) -> Res
         "  ccteam-project-creator  {label}  {}\n",
         project_creator.target.display(),
         label = skill_install_label(&project_creator.action),
+    ));
+    let team_skill = install_ccteam_team_skill(install_opts)?;
+    out.push_str(&format!(
+        "  ccteam-team             {label}  {}\n",
+        team_skill.target.display(),
+        label = skill_install_label(&team_skill.action),
     ));
     out.push('\n');
 

@@ -148,9 +148,11 @@ pub use silence_classifier::{
 };
 pub use skill::{
     install_ccteam_control_skill, install_ccteam_project_creator_skill,
-    install_ccteam_team_author_skill, install_into as install_skill_into, install_skill_body_into,
-    InstallSkillOptions, InstallSkillReport, SkillInstallAction, CCTEAM_CONTROL_SKILL_NAME,
-    CCTEAM_PROJECT_CREATOR_SKILL_NAME, CCTEAM_TEAM_AUTHOR_SKILL_NAME, LEGACY_SKILL_NAMES,
+    install_ccteam_team_author_skill, install_ccteam_team_skill,
+    install_into as install_skill_into, install_skill_body_into, InstallSkillOptions,
+    InstallSkillReport, SkillInstallAction, CCTEAM_CONTROL_SKILL_NAME,
+    CCTEAM_PROJECT_CREATOR_SKILL_NAME, CCTEAM_TEAM_AUTHOR_SKILL_NAME, CCTEAM_TEAM_SKILL_NAME,
+    LEGACY_SKILL_NAMES,
 };
 pub use stall::{
     classify as classify_stall, classify_with_thresholds, silent_seconds, StallLevel,
