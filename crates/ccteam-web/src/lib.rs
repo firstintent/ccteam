@@ -41,6 +41,7 @@ pub mod queries;
 pub mod routes;
 pub mod state;
 pub mod status;
+pub mod teams;
 pub mod token;
 pub mod views;
 pub mod watcher;
@@ -81,7 +82,9 @@ impl Default for ServeOpts {
             // deployments are LAN-reachable out of the box. Auth is
             // automatically enabled on non-loopback (see `serve()`'s
             // auth heuristic table), so token-on-disk is the gate.
-            bind: "0.0.0.0:7331".parse().expect("hardcoded unspecified parses"),
+            bind: "0.0.0.0:7331"
+                .parse()
+                .expect("hardcoded unspecified parses"),
             no_auth: false,
             token_file: None,
             no_auth_grace_secs: Some(5),

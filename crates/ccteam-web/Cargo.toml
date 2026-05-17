@@ -25,8 +25,16 @@ web-bundle = []
 ccteam-core.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
+# V0.5.0 F96 — resolve `~/.claude/` root (Anthropic Agent Teams SoT).
+# `CCTEAM_CLAUDE_HOME` env override is the test seam so tempdirs can
+# sandbox the entire teams data layer.
+dirs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# V0.5.0 F96 — Agent Teams `.claude/agents/<agentType>.md` frontmatter
+# parsing (Anthropic teammate definitions). `subagent_resolver` splits
+# `--- yaml --- body` and feeds the front block through `serde_yaml`.
+serde_yaml.workspace = true
 serde_urlencoded = "0.7"
 tokio.workspace = true
 notify.workspace = true

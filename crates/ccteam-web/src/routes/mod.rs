@@ -25,6 +25,9 @@ pub mod pty_ws;
 pub mod screenshot;
 pub mod session;
 pub mod sse;
+// V0.5.0 F96 — Agent Teams JSON API + SSE channel.
+pub mod teams_api;
+pub mod teams_sse;
 
 /// Compose every M5.x sub-router available at the current ship state.
 /// `health` is state-less (M5.0 contract) so it merges in without an
@@ -44,6 +47,9 @@ pub fn stateful_router() -> Router<AppState> {
         .merge(actions::router())
         .merge(api_v1::router())
         .merge(pty_ws::router())
+        // V0.5.0 F96 — Agent Teams surface.
+        .merge(teams_api::router())
+        .merge(teams_sse::router())
 }
 
 /// Stateless routers (currently just `/health`). M5.3 keeps `/health`

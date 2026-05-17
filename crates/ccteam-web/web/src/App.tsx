@@ -13,13 +13,15 @@
 // and the gate flips on the next render.
 
 import { useEffect, useState } from "react";
-import { Route, Routes, useMatch } from "react-router-dom";
+import { Link, Route, Routes, useLocation, useMatch } from "react-router-dom";
 import { TopBar } from "./components/TopBar";
 import { ContentSplit } from "./components/ContentSplit";
 import { WorkspaceSidebar } from "./components/WorkspaceSidebar";
 import Dashboard from "./pages/Dashboard";
 import ProjectDetail from "./pages/ProjectDetail";
 import SessionDetail from "./pages/SessionDetail";
+import TeamsListPage from "./pages/TeamsListPage";
+import TeamDetailPage from "./pages/TeamDetailPage";
 import { TokenEntryPage } from "./components/TokenEntryPage";
 import { useAuthState } from "./hooks/useAuthState";
 import { fetchDashboard, type DashboardRow } from "./lib/dashboardApi";
@@ -81,11 +83,53 @@ function PersistentSidebar() {
   return <WorkspaceSidebar projects={projects} activeSlug={activeSlug} />;
 }
 
+/** V0.5.0 F96 — top-level tab nav. Sits below the TopBar so the
+ *  Teams tab is discoverable without surgery on TopBar's chrome.
+ *  Sections are derived from URL pathname so deep-links land on the
+ *  right tab without prop-drilling. */
+function PrimaryTabs() {
+  const location = useLocation();
+  const path = location.pathname;
+  const active = path.startsWith("/teams")
+    ? "teams"
+    : path.startsWith("/s/") || path.startsWith("/sessions")
+      ? "sessions"
+      : "projects";
+  const tabs: Array<{ key: string; label: string; to: string }> = [
+    { key: "projects", label: "Projects", to: "/" },
+    { key: "teams", label: "Teams", to: "/teams" },
+    { key: "sessions", label: "Sessions", to: "/sessions" },
+  ];
+  return (
+    <nav
+      data-testid="primary-tabs"
+      className="flex items-center gap-1 px-3 h-9 border-b border-surface-700/30 bg-surface-900 shrink-0"
+    >
+      {tabs.map((t) => (
+        <Link
+          key={t.key}
+          to={t.to}
+          data-testid={`tab-${t.key}`}
+          aria-current={active === t.key ? "page" : undefined}
+          className={`px-3 h-7 flex items-center text-xs font-mono rounded-md transition-colors ${
+            active === t.key
+              ? "bg-surface-800 text-text-primary"
+              : "text-text-dim hover:text-text-secondary hover:bg-surface-800/60"
+          }`}
+        >
+          {t.label}
+        </Link>
+      ))}
+    </nav>
+  );
+}
+
 export default function App() {
   return (
     <TokenEntryGate>
       <div className="h-dvh flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset">
         <TopBar />
+        <PrimaryTabs />
         <div className="flex flex-1 min-h-0">
           <PersistentSidebar />
           <div className="flex-1 flex flex-col min-h-0 min-w-0">
@@ -97,6 +141,8 @@ export default function App() {
                   <Route path="/" element={<Dashboard />} />
                   <Route path="/p/:slug" element={<ProjectDetail />} />
                   <Route path="/p/:slug/s/:sid" element={<SessionDetail />} />
+                  <Route path="/teams" element={<TeamsListPage />} />
+                  <Route path="/teams/:name" element={<TeamDetailPage />} />
                   <Route path="*" element={<PlaceholderPage label="route" />} />
                 </Routes>
               }
