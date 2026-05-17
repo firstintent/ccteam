@@ -247,14 +247,13 @@ export default function ProjectDetail() {
         </div>
       )}
 
-      {/* Row 4 — Events Timeline, full width. Each row is ~25 px
-          (text-xs + py-1 + divide-y), so 80rem ≈ 50 rows visible.
-          Inline style instead of Tailwind arbitrary classes — JIT
-          purging stripped `h-[80rem]` + the calc() bracket. */}
-      <div
-        className="flex min-h-0"
-        style={{ height: "80rem", maxHeight: "calc(100vh - 8rem)" }}
-      >
+      {/* Row 4 — Events Timeline, full width. 400rem (~6400 px) so
+          the panel reserves enough height for the full 100-event tail
+          without internal scrolling; the outer `overflow-auto` parent
+          handles vertical paging — operator scrolls the whole page
+          like a doc. Inline style: JIT purges arbitrary classes in
+          production. */}
+      <div className="flex" style={{ height: "400rem" }}>
         <EventsTimelinePanel
           slug={summary.slug}
           initialEvents={summary.events}
