@@ -1177,12 +1177,12 @@ fn context_window_size(model: &str) -> u64 {
 }
 
 /// Best-effort compute the context-remaining percentage by tailing
-/// the session JSONL (`linkScanPath`) and reading the most recent
-/// `message.usage` block. Returns `None` when the path is missing,
-/// the file empty, or no `usage` block can be located.
+/// the session JSONL and reading the most recent `message.usage`
+/// block. Returns `None` when the JSONL can't be located, the file
+/// empty, or no `usage` block exists.
 fn context_remaining_for(state: &Value, model: &str) -> Option<f64> {
-    let jsonl = state.get("linkScanPath")?.as_str()?;
-    let usage = last_usage_in_jsonl(std::path::Path::new(jsonl))?;
+    let path = session_jsonl_path(state)?;
+    let usage = last_usage_in_jsonl(&path)?;
     let used = usage.input_tokens
         + usage.cache_creation_input_tokens
         + usage.cache_read_input_tokens
@@ -1193,6 +1193,32 @@ fn context_remaining_for(state: &Value, model: &str) -> Option<f64> {
     }
     let pct = 100.0 * (1.0 - (used as f64 / window as f64));
     Some(pct.clamp(0.0, 100.0))
+}
+
+/// Resolve the absolute path of a Claude Code session transcript.
+///
+/// Prefers `state.json::linkScanPath` when populated (authoritative,
+/// updated by claude-code's link-scan worker). When that field is
+/// absent or null — which happens for freshly spawned agents before
+/// the link-scan worker first ticks — derives the path from
+/// `~/.claude/projects/<cwd-with-/-as-->/<sessionId>.jsonl`, matching
+/// the layout claude-code uses on disk.
+fn session_jsonl_path(state: &Value) -> Option<std::path::PathBuf> {
+    if let Some(p) = state.get("linkScanPath").and_then(|v| v.as_str()) {
+        if !p.is_empty() {
+            return Some(std::path::PathBuf::from(p));
+        }
+    }
+    let cwd = state.get("cwd").and_then(|v| v.as_str())?;
+    let session_id = state.get("sessionId").and_then(|v| v.as_str())?;
+    let home = dirs::home_dir()?;
+    let encoded = cwd.replace('/', "-");
+    Some(
+        home.join(".claude")
+            .join("projects")
+            .join(encoded)
+            .join(format!("{session_id}.jsonl")),
+    )
 }
 
 #[derive(Debug, Default)]
@@ -1621,6 +1647,31 @@ mod tests {
         let state = json!({"linkScanPath": path.to_str().unwrap()});
         let pct = context_remaining_for(&state, "deepseek-v4-pro[1m]").unwrap();
         assert!((pct - 90.0).abs() < 0.01, "got {pct}");
+    }
+
+    #[test]
+    fn session_jsonl_path_prefers_link_scan_path_when_present() {
+        let v = json!({
+            "linkScanPath": "/abs/path/to/session.jsonl",
+            "cwd": "/anywhere",
+            "sessionId": "uuid",
+        });
+        let p = session_jsonl_path(&v).unwrap();
+        assert_eq!(p.to_str().unwrap(), "/abs/path/to/session.jsonl");
+    }
+
+    #[test]
+    fn session_jsonl_path_derives_from_cwd_and_session_id_when_link_scan_null() {
+        let v = json!({
+            "linkScanPath": null,
+            "cwd": "/vol4/1000/nasworkspace/dex-ui",
+            "sessionId": "c77f601e-1f7d-4449-a2b4-222f5a63ba1f",
+        });
+        let p = session_jsonl_path(&v).unwrap();
+        // Derived path ends in the encoded cwd + session id.
+        let suffix = "/.claude/projects/-vol4-1000-nasworkspace-dex-ui/\
+                      c77f601e-1f7d-4449-a2b4-222f5a63ba1f.jsonl";
+        assert!(p.to_str().unwrap().ends_with(suffix), "got {}", p.display());
     }
 
     #[test]
