@@ -1,4 +1,4 @@
-# V0.5.0 — Agent Teams skill + 长跑可视化 + 真 cost
+# V0.5.0 — Agent Teams skill + 长跑可视化 + 真 cost + skill/meta-agent 全面重塑
 
 > **立项主线**:让用户在自己习惯的 `cd → claude → /<command>` 流里起 agent team,ccteam **不要拽用户出 session**;ccteam 的差异化价值是**长跑可视化** + **跨设备 / 跨重启监控**,不是抢 lead 控制权。
 >
@@ -75,6 +75,8 @@ $ ccteam attach my-debate               # 或后续任意时刻 attach
 | **F94** | Agent Teams 3 hook 镜像(精度提升)| Advanced path 装(skill 不动 settings.json) | 仅 ccteam-spawned `__lead` session 的 project settings.json 装 `TeammateIdle` / `TaskCreated` / `TaskCompleted`;Primary path 走 F95 watcher fallback;6 类 event 总数 |
 | **F95** | 全局 watcher — 读 `~/.claude/teams/` SoT(**MVP 核心,两条 path 共享**)| 两条 path 共享 | daemon 全局扫 `~/.claude/teams/<>/` + `inboxes/<teammate>.json` + `~/.claude/tasks/<>/`;5 类 team event 镜像到 `progress.jsonl`。**完全独立于 ccteam workflow** — 无论 user 怎么起 team,都看得到 |
 | **F96** | Web SPA Teams tab + 3 新面板(覆盖所有 host teams)| 两条 path 共享 | 新顶级 `/teams` tab;详情页 Team Topology + Task Board + Mailbox(`read: false` 高亮)+ 5 API + SSE。**核心差异化** vs OMC(无可视化)+ vs Claude Code native(关终端就丢)|
+| **F100** | Skill surface refactor(5 → 3)| 全局 | 删 `ccteam-team-author` skill 整目录 + `ccteam team init/publish` CLI + `team_factory*.rs` + `teams/dev|research|research-academic/` V0.2 phase 残留;合并 `ccteam-project-creator` 到 `ccteam-creator`(4-phase dialogue 改名 step 1-4);重写 `ccteam-control` 清 phase;V0.5.0 ship 后只剩 `ccteam-control` / `ccteam-creator` / `ccteam-team` 3 skill |
+| **F101** | Meta-agent 角色重塑 — 轻量 router + memory bridge + dashboard | 全局 | `meta_agent_role.md` 303 → ~150 行,删 26 处 phase 提及;删 `kickoff_reverse_interview.md` + `review_with_user_loop.md` V0.2 残留;meta-agent 不再 enforce phase / 不再当 agent team lead,delegate 到 `/ccteam:team` skill + `ccteam-creator` skill;保留 cross-project memory bridge + dashboard chat |
 
 ### V0.5.x 延期
 

@@ -694,6 +694,160 @@ UI 行为:
 
 ---
 
+## F100 — Skill surface refactor(5 → 3)
+
+### 痛点
+
+V0.4.6 ship 时 `skills/` 4 个 skill 累积了 V0.1-V0.3 phase-era 残留:
+- `ccteam-control`(147 行)— 5 处 phase 提及
+- `ccteam-creator`(284 行)— 11 处 phase 提及
+- `ccteam-project-creator`(162 行)— 17 处 phase 提及(整 skill 围绕"4-phase dialogue"概念命名,跟 V0.4.0 已删的 ccteam phase 模型混淆)
+- `ccteam-team-author`(140 行)— **23 处 phase 提及**(整个 skill 围绕 V0.2 team plugin + phase pipeline 概念,V0.4.0 后 100% 失效)
+
+加上 V0.5.0 新加的 `ccteam-team` skill,5 个 skill 互相重叠 + 概念漂移。
+
+### 设计原则
+V0.4.0+ ccteam = workflow.yaml(声明)+ artifact watcher(observe)+ skill(对话向导)+ V0.5.0 agent-team mode(在 session 起 team)。**没有 phase 模型,没有 team plugin 工厂**。
+
+→ skill surface 简化到 **3 个职责清晰的 skill**:
+1. **`ccteam-control`** — wrap ccteam CLI + MCP 工具,任意 session 可用
+2. **`ccteam-creator`** — 一切"创建"任务(new project + workflow + agent + project-local skill)
+3. **`ccteam-team`** — V0.5.0 F93a primary path,`/ccteam:team` 在用户 session 起 agent team
+
+### 需求
+
+#### 删除清单
+
+| 路径 | 行动 | 原因 |
+|---|---|---|
+| `skills/ccteam-team-author/` 整目录 | **rm -rf** | V0.2 team plugin 工厂概念失效,phase pipeline 模型 V0.4.0 已删 |
+| `skills/ccteam-project-creator/` 整目录 | **rm -rf**(内容合并到 ccteam-creator)| 合并 — 都是 "creator" 族 |
+| `crates/ccteam-cli/src/team_factory_cli.rs` | rm | `ccteam team init/publish` CLI 实现,跟 team-author 配套 |
+| `crates/ccteam-core/src/team_factory.rs` | rm | 同上 lib 端 |
+| `crates/ccteam-core/tests/team_factory_xdg_test.rs` | rm | 测试 |
+| `crates/ccteam-cli/src/main.rs::Team*` clap 子命令 | rm | 用户面 CLI 命令 `ccteam team ...` |
+| `teams/dev/` 整目录 | rm -rf | V0.2 phase team 模板,team-author 配套 |
+| `teams/research/` 整目录 | rm -rf | 同上 |
+| `teams/research-academic/` 整目录 | rm -rf | V0.2 phase team(上次 phase hook cleanup 时已提及)|
+| **保留**:`teams/meta-agent/` | — | F101 处理(meta-agent 重塑)|
+
+#### 重写清单
+
+| 路径 | 行数 | 关键改动 |
+|---|---|---|
+| `skills/ccteam-control/SKILL.md` | 147 → ~120 | 删 5 处 phase 提及;加 V0.5.0 skill family 速查(指向 `ccteam-creator` / `ccteam-team`);更新 17 MCP 工具列表(若 V0.5.0 加新 tool 同步)|
+| `skills/ccteam-creator/SKILL.md` | 284 → ~300(合并)| 吸收 `ccteam-project-creator` 162 行的 4-step new-project dialogue + 自身的 workflow/agent/skill 生成 dialogue;**dialogue 步骤改名 step 1/2/3/4 避免跟 V0.4.0 已删的 phase 混淆**;删 11 处 phase 提及 + 删对 `ccteam-team-author` 引用 |
+| `skills/ccteam-team/SKILL.md` | (新)~250 | V0.5.0 F93a primary path 入口 — 详 F93a 节 |
+
+#### docs 同步
+
+| 文件 | 改动 |
+|---|---|
+| `CLAUDE.md §四 Skills` | 4 skill 改 3 skill |
+| `docs/claude-code-best-practices.md:171` | 同上 |
+| `docs/tech-design.md §X.X` team factory 段落 | 删 |
+| `docs/v0-4-6/user-manual.md:173` `ccteam team init/publish/show` | 加注 "V0.5.0 removed" + 引导用 `ccteam-team` skill |
+| `docs/requirements.md:345` `ccteam team init` wizard 引用 | 改为 `ccteam-creator` skill |
+| `docs/interfaces.md:651` `ccteam team / session` | 改 — 去 team subcommand |
+| `docs/research/*.md` 引用 | research 文档**不更新**(按 docs/README.md 三类规则,research 是探索性,不进 SoT)|
+
+### 验收
+1. `ls skills/` 出 3 项(ccteam-control / ccteam-creator / ccteam-team)
+2. `grep -rciE "phase[^a-z]|PHASE_DONE|ESCALATE" skills/` 总和 ≤2(只允许 V0.5.0 plan-first protocol 提"approval phase"语义,非 V0.2 phase 模型)
+3. `cargo build --workspace` 通过 — team_factory_cli.rs / team_factory.rs 删后无悬挂引用
+4. `cargo test --workspace --locked` baseline 不退步(team_factory_xdg_test.rs 删了 -1 testcase 是预期)
+5. `ccteam --help` 不出 `team` 子命令(改 advanced path `ccteam init --mode agent-team`)
+6. `ls teams/` 只剩 `meta-agent/`(F101 决定其最终去向)
+7. CLAUDE.md §四 Skills 行 grep 不出 `ccteam-team-author` / `ccteam-project-creator`
+
+### 红线
+- **不留 deprecation alias** — `ccteam team init` CLI 直接删,不加 stderr warning;V0.5.0 是 minor bump 允许 breaking(pre-v1.0 §五.3)
+- **不动 research 文档** — `docs/research/*.md` 提到老 skill 名也不改(那是当时的探索快照,改了反而失实)
+
+---
+
+## F101 — Meta-agent 角色重塑
+
+### 痛点
+
+V0.2 era meta-agent 设计为**全权 phase 调度 + 项目创建 + 跑命令**的 singleton coordinator(`teams/meta-agent/team.yaml` + `meta_agent_role.md` 303 行 + 26 处 phase 提及)。V0.4.0 删 phase 模型后,meta-agent 的"phase pipeline 调度"职责失效;V0.5.0 引入 `/ccteam:team` 后,"当 agent team lead" 职责也转给用户当前 session。
+
+V0.4.6 era meta-agent 仍按 V0.2 模型行事,导致:
+- meta_agent_role.md 描述 V0.2 phase / seed gate / kickoff reverse interview 等过时概念
+- 用户跟 meta-agent 对话期望它"调度并执行",但 V0.4.0+ 它该 "delegate 到 skill / 引导用户切 session"
+- `ccteam doctor --install-meta-agent` 自动生成的 CLAUDE.md 包含大段过时指令
+
+### V0.5.0 重新定位:**轻量 routing + dashboard chat + cross-project memory bridge**
+
+| V0.2-V0.4.6 | V0.5.0 |
+|---|---|
+| Singleton coordinator,全权调度 | **轻量 router** — 接到请求 → 判断 → delegate 到 skill / 引导用户切 session |
+| 自己跑 phase pipeline | 不跑;phase 模型 V0.4.0 已删 |
+| 自己当 agent team lead | 不当;`/ccteam:team` 在用户项目 session 跑 |
+| 自己起 project(4-phase dialogue)| **delegate 到 `ccteam-creator` skill** |
+| 自己跑 ccteam 命令 | 优先 delegate 到 `ccteam-control` skill;长查询走 web UI |
+| **cross-project memory bridge** | 保留(memory_bridge_*.md 仍有效) |
+| **dashboard chat**(用户问 "ccteam 现在咋样")| 保留,但建议 web UI 作为主入口 |
+
+### 需求
+
+#### 重写
+
+| 文件 | 行数 | 改动 |
+|---|---|---|
+| `crates/ccteam-core/src/templates/meta_agent_role.md` | **303 → ~150** | 删 26 处 phase 提及;删 V0.2 "Seed Gate" / "kickoff reverse interview" / phase pipeline 调度 决策树;改为 V0.5.0 routing 决策树(4 步:分类请求 → delegate skill 或引导切 session → 必要时 cross-project memory bridge 注入 → 提示 web UI 查全局)|
+| `crates/ccteam-core/src/templates/kickoff_reverse_interview.md` | — | **删** — V0.2 反向访谈对话,V0.5.0 用 `ccteam-creator` skill 的 step 1/2/3/4 替代 |
+| `crates/ccteam-core/src/templates/review_with_user_loop.md` | — | **删** — V0.2 review loop,V0.4.0 phase 删除后失效 |
+| `crates/ccteam-core/src/templates/memory_bridge_dev.md` | — | **保留**(跨项目记忆仍有效)|
+| `crates/ccteam-core/src/templates/memory_bridge_research.md` | — | **保留** |
+| `crates/ccteam-core/src/templates/settings.json` | — | review — 确认不含 phase hook(应已被上次 phase hook cleanup 清掉)|
+| `teams/meta-agent/team.yaml` | — | 简化 — 删 phase 字段,只保留 meta-agent 身份元数据 |
+| `crates/ccteam-core/src/meta_agent.rs` | — | review + 清 phase 引用;`MetaAgentRoleContext` 类型可能需要去 phase 字段 |
+
+#### 新 routing 决策树(meta_agent_role.md 核心内容)
+
+```
+用户请求 → meta-agent 判断:
+
+1. 信息查询(ls / 状态 / cost) → 直接回答(调 ccteam CLI / 读 progress.jsonl)
+   或建议 "去 http://localhost:7331" 看 web
+
+2. 创建新项目 / 设计 workflow → invoke `ccteam-creator` skill(走 step 1/2/3/4 dialogue)
+
+3. 起 agent team(并行 review / debate / vote)→ **告诉用户**:
+   "去你的项目 session(`cd <project> && claude`),输入 `/ccteam:team "<task>"`。
+   web UI 会自动显示该 team。我不在用户项目 session 里跑这个 skill。"
+
+4. 项目 lifecycle(start/stop/show/remove)→ 自己跑 ccteam CLI(`ccteam-control` skill 也可)
+
+5. 跨项目记忆 / 个人偏好 → 读 memory_bridge_*.md + 写入新 fact(meta-agent 是 cross-project context 的持有者)
+
+6. 卡住的项目 / 异常 → 看 outbox / progress.jsonl,提建议或建议 user 干预
+```
+
+#### docs 同步
+
+| 文件 | 改动 |
+|---|---|
+| `CLAUDE.md §一` meta-agent 描述 | 调:从"全权调度"改"轻量 router";确保 §三 红线 "新建项目走 `<projects_root>/<team>-<slug>/`" 仍 honor |
+| `docs/tech-design.md §2.1` 3-layer 架构 | L1 meta-agent 描述更新:从"phase 调度 + 项目创建 + 跑命令"改"routing + memory bridge + dashboard" |
+| `docs/v0-4-6/README.md`(若有 meta-agent 引用)| 不动(版本归档,frozen)|
+
+### 验收
+1. `wc -l crates/ccteam-core/src/templates/meta_agent_role.md` ≤ 160
+2. `grep -ciE "phase[^a-z]|PHASE_DONE|ESCALATE" crates/ccteam-core/src/templates/meta_agent_role.md` == 0
+3. `ccteam doctor --install-meta-agent` 后,新 meta-agent CLAUDE.md 含新 routing 决策树(verify 关键字 "delegate skill" / "/ccteam:team" / "cross-project memory bridge")
+4. meta-agent session 收到 "创建一个 agent team 调研 X" → 回复 "去你的项目 session 跑 `/ccteam:team`",不自己 spawn(verify by attaching + 发请求看 transcript)
+5. meta-agent session 收到 "新项目" → invoke `ccteam-creator` skill(verify Task tool call)
+6. `kickoff_reverse_interview.md` / `review_with_user_loop.md` 文件不存在;`meta_agent.rs` build 通过(无悬挂引用)
+
+### 红线
+- **不删 meta-agent singleton 本身** — 仍是 ccteam 的 cross-project 入口;只重新定位职责
+- **memory bridge 是核心保留功能** — 删除任何 memory_bridge 文件 = 破红线
+- **`teams/meta-agent/team.yaml` 保留**(简化版),作为 V0.5.0+ meta-agent 配置 SoT;F100 删的是 `teams/dev/research/research-academic/`,不是 meta-agent
+
+---
+
 ## V0.5.x 延期 finding 草案
 
 ### F97 — Lifecycle 完善

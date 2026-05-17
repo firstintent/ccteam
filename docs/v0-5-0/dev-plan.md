@@ -1,15 +1,16 @@
 # V0.5.0 — dev-plan
 
-**Wave 重排** — primary path skill 先做(用户立刻拿到价值),advanced CLI factory 后做。
+**Wave 重排** — primary path skill 先做(用户立刻拿到价值),advanced CLI factory + skill/meta-agent 重构后做。
 
 | Wave | 内容 | 占比 | 并行度 |
 |---|---|---|---|
-| Wave 0 | F92 真 cost 数据源 — 共享 prerequisite | 10% | 单 subagent,1-2 天 |
-| Wave 1 | F95 全局 watcher + F93a skill(`/ccteam:team`)+ F96 web 3 面板 — **primary path 闭环** | 60% | 3 subagent 并行,3-4 天 |
-| Wave 2 | F93b workflow.yaml `mode: agent-team` + `__lead.md` bg spawn + `ccteam start/attach` + F94 hook 注入 — **advanced path** | 25% | 2 subagent 并行,2-3 天 |
-| Wave 3 | integration + host E2E + 文档同步 + ship | 5% | 主 session,1-2 天 |
+| Wave 0 | F92 真 cost 数据源 — 共享 prerequisite | 8% | 单 subagent,1-2 天 |
+| Wave 1 | F95 全局 watcher + F93a skill(`/ccteam:team`)+ F96 web 3 面板 — **primary path 闭环** | 50% | 3 subagent 并行,3-4 天 |
+| Wave 2 | F93b workflow.yaml `mode: agent-team` + `__lead.md` bg spawn + `ccteam start/attach` + F94 hook 注入 — **advanced path** | 20% | 2 subagent 并行,2-3 天 |
+| **Wave 3**(新)| **F100 Skill surface refactor + F101 Meta-agent 角色重塑** — 清 V0.2/V0.3 phase 残留,简化 surface | 15% | 2-3 subagent 并行,1-2 天 |
+| Wave 4 | integration + host E2E + 文档同步 + ship | 7% | 主 session,1-2 天 |
 
-总:T+9 天,baseline 750 → ~815。
+总:T+11 天,baseline 750 → ~810(F100 删 team_factory_xdg_test.rs 减部分;F101 不增减测试)。
 
 ---
 
@@ -125,7 +126,73 @@ Wave 1 ship + 用户用上 primary path 后,接续做 advanced path 给 automati
 
 ---
 
-## Wave 3 — Integration + ship
+## Wave 3 — Skill + Meta-agent refactor(F100 + F101)
+
+2-3 subagent 并行(F100 删除任务可分两路:skill/teams 一路,team_factory_cli/rs 一路;F101 单独一路 rewrite meta_agent_role.md)。
+
+### F100 — Skill surface refactor
+
+#### 删除任务
+
+| 路径 | 工具 | 备注 |
+|---|---|---|
+| `skills/ccteam-team-author/` | `git rm -rf` | 整目录 |
+| `skills/ccteam-project-creator/` | `git rm -rf` | 整目录,内容先吸进 ccteam-creator |
+| `crates/ccteam-cli/src/team_factory_cli.rs` | `git rm` | + 同步 `crates/ccteam-cli/src/main.rs` 删 `Team*` clap 子命令 + `mod team_factory_cli` |
+| `crates/ccteam-core/src/team_factory.rs` | `git rm` | + 同步 `crates/ccteam-core/src/lib.rs` 删 `pub mod team_factory` |
+| `crates/ccteam-core/tests/team_factory_xdg_test.rs` | `git rm` | 测试 |
+| `teams/dev/` | `git rm -rf` | V0.2 phase team |
+| `teams/research/` | `git rm -rf` | V0.2 phase team |
+| `teams/research-academic/` | `git rm -rf` | V0.2 phase team(上次 phase hook cleanup 已提及)|
+
+#### 重写任务
+
+| 文件 | 来源 | 改动 |
+|---|---|---|
+| `skills/ccteam-control/SKILL.md` | 147 → ~120 行 | 删 5 处 phase 提及;V0.5.0 skill family 速查表(链 `ccteam-creator` 创项目 / `ccteam-team` 起 team);17 MCP 工具列表 review |
+| `skills/ccteam-creator/SKILL.md` | 284 + 162 → ~300 行(合并)| 吸 `ccteam-project-creator` 的 step 1/2/3/4 new-project dialogue(原"4-phase"改名 step,避免跟 V0.4.0 已删 ccteam phase 混淆);保留自身的 workflow.yaml + agent.md + skill scaffold dialogue;删 11 处 phase 提及 + 删对 `ccteam-team-author` 引用 |
+
+#### docs 同步
+
+| 文件 | 改动 |
+|---|---|
+| `CLAUDE.md §四 Skills` | 4 skill → 3 skill |
+| `docs/claude-code-best-practices.md:171` | 同上 |
+| `docs/tech-design.md` | 删 team factory 段落(line ~807, 833) |
+| `docs/v0-4-6/user-manual.md:173` | `ccteam team init/publish/show` 加 "V0.5.0 removed" 注释,引导用 `ccteam-team` skill |
+| `docs/requirements.md:345` | `ccteam team init` → `ccteam-creator` skill 引用 |
+| `docs/interfaces.md:651` | 去 `team` subcommand |
+| `docs/research/*.md` | **不更新**(research 文档按规则不进 SoT)|
+
+**估工**:F100 1-2 subagent 并行(删除 + 重写两路),1-1.5 天。
+
+### F101 — Meta-agent 角色重塑
+
+#### 重写
+
+| 文件 | 行数 | 改动 |
+|---|---|---|
+| `crates/ccteam-core/src/templates/meta_agent_role.md` | **303 → ~150** | 删 26 处 phase 提及;删 V0.2 "Seed Gate" / kickoff 段;改 V0.5.0 routing 决策树(详 PRD F101)|
+| `crates/ccteam-core/src/templates/kickoff_reverse_interview.md` | rm | V0.2 反向访谈,V0.5.0 `ccteam-creator` skill step 1-4 替代 |
+| `crates/ccteam-core/src/templates/review_with_user_loop.md` | rm | V0.2 review loop,V0.4.0 phase 删后失效 |
+| `crates/ccteam-core/src/templates/memory_bridge_dev.md` | 保留 | cross-project memory 仍有效 |
+| `crates/ccteam-core/src/templates/memory_bridge_research.md` | 保留 | 同上 |
+| `crates/ccteam-core/src/templates/settings.json` | 审查 | 确认无 phase hook 引用(上次 phase hook cleanup 应已清)|
+| `teams/meta-agent/team.yaml` | 简化 | 删 phase 字段,保留 name/description/cwd 等身份元数据 |
+| `crates/ccteam-core/src/meta_agent.rs` | 审查 + 改 | grep `phase` / `kickoff` / `review_with_user_loop` 引用,逐处删 |
+
+#### docs 同步
+
+| 文件 | 改动 |
+|---|---|
+| `CLAUDE.md §一` 表 + 描述段 | meta-agent 从"全权调度"改"轻量 router + memory bridge + dashboard" |
+| `docs/tech-design.md §2.1` 3-layer 描述 | L1 meta-agent 角色更新 |
+
+**估工**:F101 单 subagent,1 天(重写 meta_agent_role.md 是核心,3 文件删除 + 1 文件简化 + 1 文件审查是辅助)。
+
+---
+
+## Wave 4 — Integration + ship
 
 - 全 wave merge + host E2E(用 host roblog team 实际验证 F95/F96)
 - bug fix loop
@@ -177,8 +244,9 @@ Wave 1 ship + 用户用上 primary path 后,接续做 advanced path 给 automati
 | **Wave 1 并行 3 subagent** | F93a skill + F95 watcher + F96 web | T+5 天 |
 | **Wave 1 ship intermediate** | host E2E:roblog team 在 web 出现 + `/ccteam:team` 在新 repo 起 team | T+5 天(中检验) |
 | **Wave 2 并行 2 subagent** | F93b CLI factory + F94 hook 注入 | T+7 天 |
-| **Wave 3** | integration + 文档 + ship + tag | T+9 天 |
-| **CLAUDE.md baseline 回填** | 新测试数 + V0.5.0 进当前最新版字段 | ship 后 |
+| **Wave 3 并行 2-3 subagent** | F100 skill refactor(删 team-author + 合并 project-creator + 清 phase)+ F101 meta_agent_role 重写 | T+9 天 |
+| **Wave 4** | integration + 文档 + ship + tag | T+11 天 |
+| **CLAUDE.md baseline 回填** | 新测试数(预计 ~810,-5 from team_factory_xdg_test rm)+ V0.5.0 进当前最新版字段 | ship 后 |
 
 ---
 
