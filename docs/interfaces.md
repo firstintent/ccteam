@@ -676,7 +676,7 @@ ccteam ls / show / status              # 查询(详见 §10.3)
 ccteam pause <slug>                    # 暂停项目(不杀 session;走 `state.user_pause_pending=true`)
 ccteam remove <slug> [--purge] [--dry-run] [--force]   # un-roster 项目(详见 §10.X remove)
 ccteam doctor [flags]                  # 维护(详见 §10.6)
-ccteam team / session                  # team factory / flex session 管理
+ccteam session                         # flex session 管理(V0.5.0 F100: team factory 已删,见 §10.6 末)
 ccteam web                             # 单独跑 web(`ccteam start` 默认带)
 ```
 

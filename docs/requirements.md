@@ -342,7 +342,7 @@ ccteam 主动开了 4 个 tmux session 并行——后端 1 个、前端 1 个�
 
 **V1.0.0 目标**:
 - 出 **3 个非编程领域的官方 team**(候选:研究 / 内容运营 / 投资分析,各自 starter workflow.yaml + agents + MCP 工具集)
-- **用户能在 30 分钟内**用 `ccteam team init` + 对话式 wizard 创建自己领域的 team(`ccteam-creator` skill 升级 → 不需要懂 YAML / Rust,自然语言对话定义拓扑)
+- **用户能在 30 分钟内**用 `ccteam-creator` skill(V0.5.0 F100 起合并自 `ccteam-project-creator` + `ccteam-team-author`)+ 对话式 wizard 创建自己领域的 workflow / agent 拓扑 → 不需要懂 YAML / Rust,自然语言对话定义
 - 跑通第一个**非编程**项目(典型:用户描述"我想跑一个每天爬 5 个财经网站 + 写一篇市场摘要 + 发到 Telegram 的工作流",30 分钟内 ccteam 跑起来)
 
 ---

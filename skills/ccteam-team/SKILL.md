@@ -9,6 +9,14 @@ V0.5.0 primary path (95% 用户). 用户已在项目 session 里(`cd ~/projects/
 直接输入 `/ccteam:team "<task>"` 就把当前 turn 升级成 team-lead,native `TeamCreate` +
 `Task` spawn teammates。**不切 session、不出 terminal、零 ccteam workflow.yaml 依赖**。
 
+## V0.5.0 skill family (you are here)
+
+| 意图 | Skill |
+|---|---|
+| **当前 session 起 agent team(本 skill)** | **`ccteam-team`** |
+| 想**新建一个 ccteam 项目**(`ccteam new` + 长 running workflow.yaml + ccteam start) | `ccteam-creator`(走 step 1/2/3/4 对话) |
+| **管理已有 ccteam 项目**(ls / show / pause / resume / send / 注入决策) | `ccteam-control`(CLI + MCP wrap) |
+
 跟 `ccteam-creator`(创 workflow / 项目)和 `ccteam-control`(管 daemon / MCP)互补:
 本 skill 只负责"在当前 session 里起一个 team"。
 

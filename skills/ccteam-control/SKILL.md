@@ -1,29 +1,42 @@
 ---
 name: ccteam-control
-description: Manage ccteam projects from any Claude Code session. Use when the user asks about ccteam status, wants to start a new ccteam project, needs to inspect / pause / resume an active ccteam project, or asks for advice on intervening when a project is stuck. Primary consumer is the ccteam meta-agent session; secondary consumer is the user's own daily-driver claude.
+description: Manage ccteam projects from any Claude Code session via the `ccteam` CLI and `mcp__ccteam__*` MCP tools. Use when the user asks about ccteam status, wants to inspect / pause / resume an active ccteam project, needs cost / progress info, or asks for advice on intervening when a project is stuck. Primary consumer is the ccteam meta-agent session; secondary consumer is the user's own daily-driver Claude.
 ---
 
 # ccteam-control
 
 ccteam is an autonomous project orchestrator built on Claude Code.
-This skill makes ccteam reachable from any claude session via the
-`ccteam` CLI.
+This skill makes ccteam reachable from any Claude session via the
+`ccteam` CLI + `mcp__ccteam__*` MCP tool surface.
 
-**Prefer the MCP server.** Once `ccteam doctor --install-mcp` has
-registered the server (M2.5), every claude session sees nine
-`mcp__ccteam__*` tools — call those first. The `Bash` + `--format
-json` path below stays as a fallback for sessions where the MCP
-server isn't registered yet.
+## V0.5.0 skill family (you are here)
 
-**V0.4.6 F89 — CLI surface reorg.** The `ccteam` top-level CLI now
-exposes only user-facing commands (`init / start / stop / new / ls
-/ status / show / doctor / web` and the V0.4.6 `remove`). Hook
-handlers and meta-agent integration points (`spawn / send / peek
-/ attach / progress / resume / mcp-serve / hook`) moved under
-`ccteam internal <subcmd>`. The legacy top-level names still work
-in V0.4.6 with a stderr deprecation WARN; V0.5 will remove them.
+This skill is one of three shipped V0.5.0 skills. Pick by intent:
 
-When you need to shell out, prefer the new path:
+| Intent | Skill | Quick example |
+|---|---|---|
+| Create a new ccteam project / scaffold workflow.yaml / scaffold agents / scaffold project-local skills | **`ccteam-creator`** | "make a new ccteam project for X" / "add a QA loop to this repo" |
+| Spin up an Anthropic Agent Team in the current Claude session (no `ccteam init` needed) | **`ccteam-team`** | `/ccteam:team "fix all TS errors"` |
+| **Inspect / control existing ccteam projects (this skill)** | **`ccteam-control`** | "what's the cost on todo-cli?" / "pause bookmark-mgr" |
+
+If the user wants something this skill *doesn't* cover, point them at
+the sibling skill rather than improvising. The three skills are
+intentionally narrow.
+
+## MCP server is preferred; Bash is the fallback
+
+Once `ccteam doctor --install-mcp` has registered the MCP server, every
+Claude session sees `mcp__ccteam__*` tools — call those first. The
+`Bash` + `--format json` path stays as a fallback for sessions where the
+MCP server isn't registered yet.
+
+**V0.4.6 F89 CLI surface reorg.** The top-level `ccteam` CLI exposes
+only user-facing commands (`init` / `start` / `stop` / `new` / `ls` /
+`status` / `show` / `doctor` / `web` / `remove`). Hook handlers and
+meta-agent integration points (`spawn` / `send` / `peek` / `attach` /
+`progress` / `resume` / `mcp-serve` / `hook`) live under `ccteam
+internal <subcmd>`. V0.5.0 dropped the legacy top-level aliases —
+prefer the new path:
 
 ```bash
 ccteam internal peek <slug>          # was: ccteam peek <slug>
@@ -41,17 +54,16 @@ ccteam internal spawn <slug> <role>  # was: ccteam spawn <slug> <role>
 | One project's full state         | `mcp__ccteam__show`              | `ccteam show <slug> --format json` |
 | Recent progress events           | `mcp__ccteam__progress`          | `ccteam internal progress <slug>` |
 | Capture session pane content     | `mcp__ccteam__peek`              | `ccteam internal peek <slug>` |
-| Start a new dev project          | `mcp__ccteam__new`               | `ccteam new <slug> --team dev` |
-| Start a product-research project | `mcp__ccteam__new`               | `ccteam new <slug> --team product-research` |
+| Start a new project (delegate)   | `mcp__ccteam__new`               | `ccteam new <slug>` (and see `ccteam-creator` skill for the dialogue) |
 | Pause project (no kill)          | `mcp__ccteam__pause`             | `ccteam pause <slug>` |
 | Resume project                   | `mcp__ccteam__resume`            | `ccteam internal resume <slug>` |
 | Send NL to a session inbox       | `mcp__ccteam__send_to_session`   | `ccteam internal send <slug> "<body>"` (or write `.ccteam/inbox/msg-<ts>-NNN.md` directly) |
-| Inject ESCALATE-style decision   | `mcp__ccteam__inject_decision`   | (compose body manually + send_to_session) |
+| Inject a structured decision     | `mcp__ccteam__inject_decision`   | (compose body manually + send_to_session) |
 | Health checks                    | (Bash only)                      | `ccteam doctor --tool-surface` |
-| Install meta-agent               | (Bash only)                      | `ccteam doctor --install-meta-agent <handle>` |
+| Install meta-agent               | (Bash only)                      | `ccteam doctor --install-meta-agent` |
 
 When the MCP server is registered, `ccteam doctor --install-mcp` (run
-once) wires `mcpServers.ccteam` into `~/.claude.json`. Existing claude
+once) wires `mcpServers.ccteam` into `~/.claude.json`. Existing Claude
 sessions need `/reload-mcp`; new sessions pick it up immediately.
 
 ## Typical workflows
@@ -59,47 +71,23 @@ sessions need `/reload-mcp`; new sessions pick it up immediately.
 ### A) Cross-project status report
 
 ```bash
-ccteam ls --format json | jq '.projects[] | {slug, current_phase, phase_state, cost_used_usd, age_seconds}'
+ccteam ls --format json | jq '.projects[] | {slug, cost_used_usd, age_seconds, stall_level}'
 ```
 
 Then narrate the table to the user — call out anything in
 `stall_level: "warn"` or higher.
 
-### B) Team selection (M3+)
-
-ccteam now ships two teams: `dev` (build the thing) and
-`product-research` (decide whether the thing is worth building).
-Pick by reading the user's intent:
-
-| Signal | Team |
-|---|---|
-| User wants code, brief is concrete | `dev` |
-| User is unsure if the idea is worth doing / wants market validation | `product-research` |
-| Brief is one or two words ("做个 todo") | Ask one disambiguating question first |
-
-product-research is cheap (hours, not days), produces
-`verdict.md` + `rationale.md` + `next-steps.md`, and may auto-suggest
-spawning a follow-on dev project if PASS / CONCERN.
-
-### C) Pre-launch clarification
+### B) Pre-launch clarification
 
 When the user says "make a todo cli" but the brief is ambiguous,
-**ask one clarifying question** before dispatch:
+**delegate to `ccteam-creator`** rather than asking yourself. The creator
+skill is the dialogue specialist (step 1/2/3/4); this skill is the
+control / status specialist.
 
-> Web app or CLI? Local-only or cloud-sync? Tech-stack preference?
-
-Pick the single most blocking question. Only after they answer, run:
-
-```bash
-ccteam new <slug> --team dev          # slug becomes <projects_root>/dev-<slug>/
-# or, if the user still seems uncertain:
-ccteam new <slug> --team product-research
-```
-
-### D) Stuck-project triage
+### C) Stuck-project triage
 
 ```bash
-ccteam show <slug> --format json | jq '{phase: .state.current_phase, fix_count: .state.auto_loop_cycle_count, recent: .recent_events[-5:]}'
+ccteam show <slug> --format json | jq '{cost: .state.cost_used_usd, fix_count: .state.auto_loop_cycle_count, recent: .recent_events[-5:]}'
 ccteam internal peek <slug>
 ```
 
@@ -113,35 +101,34 @@ Combine the two outputs and recommend exactly **one** of:
 - **Attach vs peek vs pause** — `attach` if the user will drive in
   real-time, `peek` if they only want to look, `pause` if they want
   ccteam to stop dispatching while they decide.
-- **One question at a time** — clarification phases must surface a
+- **One question at a time** — clarification turns must surface a
   single question. Don't batch.
-- **Don't show progress.jsonl raw** — it's noisy. Summarize milestones
-  (phase transitions, escalations, ship events) in NL.
+- **Don't show `progress.jsonl` raw** — it's noisy. Summarize key
+  events (agent spawn / done, escalations, ship events) in NL.
 
 ## What this skill cannot do
 
 - It cannot `attach` for the user — `tmux attach` is a TTY interaction;
   the user must run it in their own terminal.
-- It cannot edit `~/projects/<slug>/.ccteam/` metadata directly. All
+- It cannot edit `<project>/.ccteam/` metadata directly. All
   control flows through the CLI (or `~/.ccteam/control/` files for
-  M2+ asynchronous control).
+  asynchronous control signals).
 - It cannot start the ccteam orchestrator daemon — that's `ccteam
-  start --foreground` and is an ops decision, not an agent decision.
+  start` and is an ops decision, not an agent decision.
 
 ## Meta-agent specifics
 
-When this skill is loaded inside a ccteam meta-agent session:
+When this skill is loaded inside the ccteam meta-agent session:
 
-1. Prefer `mcp__ccteam__new` dispatch over doing the work yourself.
-   The meta-agent role prompt (CLAUDE.md) covers the
-   dispatcher-not-worker rule — this skill is the tool list the
+1. Prefer `mcp__ccteam__*` over Bash. The meta-agent role prompt covers
+   the dispatcher-not-worker rule — this skill is the tool list the
    dispatcher uses.
-2. After every dispatch / status reply, write an outbox file at
-   `~/projects/<user>-meta/.ccteam/outbox/reply-<ts>-<seq>.md` per
+2. After every status reply, write an outbox file at
+   `~/projects/meta/.ccteam/outbox/reply-<ts>-<seq>.md` per
    `docs/interfaces.md` §3.4.3.
-3. When the user has resolved a project's clarify/escalation, use
+3. When the user has resolved a project's clarify / escalation, use
    `mcp__ccteam__inject_decision` (or its Bash equivalent) to push
-   the resolution back into the project session — it constructs an
-   ESCALATE-style markdown payload (interfaces §4.1.1) and atomically
+   the resolution back into the project session — it constructs a
+   structured decision payload (interfaces §4.1.1) and atomically
    writes it to the project's inbox so the orchestrator delivers it
    on the next tick.

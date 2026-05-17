@@ -791,46 +791,21 @@ orchestrator 是**所有 agent spawn + inbox 派送**的单点 — daemon 死了
 
 **红线**：health check **只 stat heartbeat 文件**，不做任何 RPC / kill -0 / tmux capture-pane。pure stat 才能放在每个 MCP 调用的 hot path。daemon 启动时立即 touch 一次心跳文件（不等 30s），所以"刚起来的 daemon"也立刻可观察。
 
-### 6.9 Team factory（用户自定义 team 落地为 plugin）
+### 6.9 ~~Team factory~~（V0.5.0 F100 移除）
 
-**复用 Claude Code plugin 格式，不发明 ccteam 私有打包**。
+V0.2 M0.22 引入的 `ccteam team init/publish` 工厂 + `ccteam-team-author` skill +
+`teams/dev|research|research-academic/` 模板,在 V0.4.0 删 phase 模型后已基本失效。
+V0.5.0 F100 删除整套:`crates/ccteam-core/src/team_factory.rs` /
+`crates/ccteam-cli/src/team_factory_cli.rs` / `skills/ccteam-team-author/` /
+`skills/ccteam-project-creator/`(合并进 `ccteam-creator`)/ `teams/dev|research|research-academic/`。
 
-#### 三阶段流水线
+替代:
+- **创建新项目** → `skills/ccteam-creator/` step 1/2/3/4 对话(吸收原 `ccteam-project-creator`)
+- **在当前 session 起 agent team** → `/ccteam:team` skill(V0.5.0 F93a)
+- **自定义 workflow / agent / project-local skill** → `skills/ccteam-creator/` 同一向导
 
-```text
-            interview                 init                  publish
-meta-agent ───────────►  CLI/factory ───────►  staging ──────────────►  marketplace / GitHub
-  (skill)                              ~/.config/ccteam/teams/<name>/
-```
-
-1. **Interview** — 元 agent 跑 `ccteam-creator` skill，跟用户对话收集 metadata（name / description / author）+ agent 列表 + tools + golden_rules + retro_schema + verdict_schema。一次一题，默认值能用就用。
-2. **Init** — `ccteam team init <name>` 落 staging 树到 `~/.config/ccteam/teams/<name>/`，内含：
-   - `.claude-plugin/plugin.json`（Claude Code plugin manifest 严格 schema：`name` / `description` / `author`）
-   - `team.yaml`（ccteam team 配置，作为 plugin 顶级 unknown 字段；zod 默认 strip，plugin pipeline 加载时忽略）
-   - `agents/<role>.md`（frontmatter + 正文领域模板）
-   - `README.md`
-3. **Publish** — `ccteam team publish <name> --target {local|github}`：
-   - `local`：软链 staging 到 `~/.claude/plugins/marketplaces/ccteam-local/plugins/<name>/`，产出 directory-source 标识 `<name>@ccteam-local`（用户 `claude /plugin enable` 启用）
-   - `github`：`gh repo create` + push，产出 GitHub URL（用户 `claude /plugin add <owner>/<repo>` 拉取）
-
-#### 关键设计决策
-
-- **不在 ccteam 自营 marketplace 注册中心**：用 Claude Code 已有的 `directory` source 作 `ccteam-local`，远程走 `gh repo` + `github` source。
-- **`team.yaml` 不走 plugin `settings` 注入**：plugin loader 只 allowlist `agent` key，其他 strip。改作 plugin 根目录顶级 unknown 文件，ccteam 自己读（`team_resolver`）。
-- **plugin manifest schema 借鉴 `claude-plugins-official`**：所有都只用 `name` / `description` / `author { name, email? }` + 偶有 `version`。`PluginManifest` struct 严格 serialize 这四个字段，反序列化 lenient（unknown 字段忽略，符合 zod default strip）。
-- **`enabledPlugins` 复用 plugin pipeline**：工厂产物的 `team.yaml` 声明依赖，`bootstrap_project` 写 `<project>/.claude/settings.json` 时由 `plugin_resolution` 推断。工厂自身不直接管理 plugin pipeline。
-
-#### 红线
-
-- ccteam-core 不出现 team 名字面量（M0.16 基线）— 工厂代码也不许；团队特定行为靠用户写的 `team.yaml`。
-- 不 vendor `claude-plugins-official` — 工厂模板可写 `tools_required.subagents: [code-reviewer]` 引用 plugin agent，**不**把 plugin source 拷到工厂产物。
-- `--target github` 用户未 `gh auth login` → fail-loud，不试图绕过；不嵌入凭证。
-
-#### 实现位置
-
-- `crates/ccteam-core/src/team_factory.rs` — `init_team_staging` / `publish_team` / `validate_staged_team` 主路径；`PluginManifest` / `AgentScaffold` / `PublishTarget` 数据类型。
-- `crates/ccteam-core/src/templates/ccteam_team_author_skill.md` — meta-agent 用的 dialogue skill。
-- `crates/ccteam-cli/src/team_factory_cli.rs` — `ccteam team init` / `ccteam team publish` CLI 包装。
+实施位置见 `crates/ccteam-core/src/skill.rs` + `crates/ccteam-cli/src/commands.rs` 的
+`render_install_skill_report`。
 
 ### 6.10 Multi-session per project（Codex adapter / 未来 fan-out）
 

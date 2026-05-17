@@ -170,7 +170,8 @@ ccteam web                                 # 单独起 web(脱离 start)
 ccteam doctor [<flags>]                    # 见 §9
 
 # 团队 / flex session
-ccteam team init/publish/show
+# V0.5.0 移除: `ccteam team init/publish/show` 整套子命令删除(team factory 不再维护)。
+# 创建新项目 / 自定义 workflow 改走 `ccteam-creator` skill,起 agent team 改走 `/ccteam:team` skill。
 ccteam session add/ls/attach/rm <slug>
 ```
 

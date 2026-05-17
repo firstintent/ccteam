@@ -19,7 +19,7 @@
 | V0.5.x 延期候选 | F97 lifecycle 完善;F98 plan-approval↔outbox 联动;F99 Claude Code 版本 gating;Routing/Evaluator-Optimizer sugar — 详 `docs/v0-5-0/prd.md` 末段 + `docs/orchestration-patterns.md §五` |
 | 历史版本 | V0.1 → V0.4.5 见各自 `docs/v0-X-Y/README.md` |
 
-**ccteam 是 Claude Code 之上的元工具**(V0.4.0+):每个项目用 `workflow.yaml` 声明 agent 拓扑(**无 prompt,只有 trigger + 并发上限**),`.claude/agents/<role>.md` 定义 agent 行为;Rust orchestrator 通过 `ArtifactWatcher`(inotify)监听文件系统控制平面 → spawn `claude --bg --agent <role>`(或 Codex tmux session);`progress.jsonl` 记录 7 类业务 event 为唯一状态 SoT;用户通过 meta-agent + `ccteam-control` skill + 17 个 `mcp__ccteam__*` 工具操作;web UI 提供 4 面板 + SSE。详 `docs/tech-design.md` §2.1。
+**ccteam 是 Claude Code 之上的元工具**(V0.4.0+):每个项目用 `workflow.yaml` 声明 agent 拓扑(**无 prompt,只有 trigger + 并发上限**),`.claude/agents/<role>.md` 定义 agent 行为;Rust orchestrator 通过 `ArtifactWatcher`(inotify)监听文件系统控制平面 → spawn `claude --bg --agent <role>`(或 Codex tmux session);`progress.jsonl` 记录 7 类业务 event 为唯一状态 SoT;用户通过 meta-agent(V0.5.0 F101 重定位为**轻量 router + memory bridge + dashboard**,不再自起 phase pipeline)+ `ccteam-control` skill + 17 个 `mcp__ccteam__*` 工具操作;web UI 提供 4 面板 + SSE。详 `docs/tech-design.md` §2.1。
 
 ## 二、必读文档(按推荐顺序)
 
@@ -67,7 +67,7 @@
 | 机制 | 用途 |
 |---|---|
 | **CLAUDE.md** | 项目级 / 用户级持久指令 |
-| **Skills**(repo 根 `skills/`)| `ccteam-control` / `ccteam-team-author` / `ccteam-project-creator` / `ccteam-creator`(创建 workflow + agent + skill dialogue 指引)|
+| **Skills**(repo 根 `skills/`,V0.5.0 F100 5→3)| `ccteam-control`(CLI / MCP wrap)/ `ccteam-creator`(new project + workflow + agent + skill 对话向导)/ `ccteam-team`(`/ccteam:team` 当前 session 起 Anthropic Agent Team)|
 | **MCP** | `ccteam` 17 工具(`mcp__ccteam__*`);可选 `claude-mem`(LLM 自看 surface 决定是否调)|
 | **Subagents** | agent 内 `Task(subagent_type=...)` ad-hoc 节流;8 个 plugin agent 已 ln -sf |
 | **Hooks** | `ccteam internal hook progress-append / load-context / intercept-ask`(F89 隐藏)|
