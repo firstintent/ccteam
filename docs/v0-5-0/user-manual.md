@@ -277,7 +277,6 @@ V0.4.6 → V0.5.0 **breaking change**(pre-v1.0,不留 alias):
 
 详 `prd.md §V0.5.x 延期 finding 草案` + `orchestration-patterns.md §五`:
 - F98 plan-approval ↔ outbox 联动(扩 F87 `intercept-ask`)
-- F99 Claude Code 版本 gating(`doctor --check-agent-teams`)
 - Routing(动态)sugar:`agent.router: <expr>`
 - Evaluator-Optimizer 显式 sugar
 

@@ -84,7 +84,6 @@ $ ccteam attach my-debate               # 或后续任意时刻 attach
 | # | 标题 | 为什么延期 |
 |---|---|---|
 | **F98** | plan-approval ↔ outbox 联动(扩 F87 intercept-ask)| MVP 走 native plan-approval(lead 自决)|
-| **F99** | Claude Code 版本 gating + `doctor --check-agent-teams` | MVP 假定 user 已升 ≥2.1.32 |
 
 ---
 

@@ -15,7 +15,7 @@
 | Clippy | 0 errors + 18 warnings(pre-existing doc-list drift)|
 | 代码规模 | ~19 kLOC Rust + ~15 kLOC TypeScript |
 | 当前最新版 | **V0.5.0**(F92 + F93a + F93b + F94 + F95 + F96 + F97 + F100 + F101)— 详 `docs/v0-5-0/README.md` |
-| V0.5.x 延期候选 | F98 plan-approval↔outbox 联动;F99 Claude Code 版本 gating;Routing/Evaluator-Optimizer sugar — 详 `docs/v0-5-0/prd.md` 末段 + `docs/orchestration-patterns.md §五` |
+| V0.5.x 延期候选 | F98 plan-approval↔outbox 联动;Routing/Evaluator-Optimizer sugar — 详 `docs/v0-5-0/prd.md` 末段 + `docs/orchestration-patterns.md §五` |
 | 历史版本 | V0.1 → V0.4.5 见各自 `docs/v0-X-Y/README.md` |
 
 **ccteam 是 Claude Code 之上的元工具**(V0.4.0+):每个项目用 `workflow.yaml` 声明 agent 拓扑(**无 prompt,只有 trigger + 并发上限**),`.claude/agents/<role>.md` 定义 agent 行为;Rust orchestrator 通过 `ArtifactWatcher`(inotify)监听文件系统控制平面 → spawn `claude --bg --agent <role>`(或 Codex tmux session);`progress.jsonl` 记录 7 类业务 event 为唯一状态 SoT;用户通过 meta-agent(V0.5.0 F101 重定位为**轻量 router + memory bridge + dashboard**,不再自起 phase pipeline)+ `ccteam-control` skill + 17 个 `mcp__ccteam__*` 工具操作;web UI 提供 4 面板 + SSE。详 `docs/tech-design.md` §2.1。

@@ -958,10 +958,7 @@ V0.4.6 era meta-agent 仍按 V0.2 模型行事,导致:
 - 默认 lead autonomously decides(MVP 行为)
 - 设 `agent_team.plan_review_mode: user-via-outbox` → lead 收到 teammate plan 时,**不自决**,改写 `.ccteam/outbox/plan-approval-<teammate>-<ts>.md` → 用户在 web SPA / `ccteam send <slug> approve|reject:<reason>` 决策
 
-### F99 — Claude Code 版本 gating
-- `ccteam doctor --check-agent-teams` 检测 `claude --version` ≥ 2.1.32(`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` 引入版本)
-- `ccteam init --mode agent-team` 若版本不够 → refuse + 提示用户升级 Claude Code
-- pricing version check(F92 内嵌 pricing.json 版本)半年 stale 触发 WARN
+(F99 Claude Code 版本 gating 已 drop — V0.5.0 假定 user 已升 ≥ 2.1.32,不做 doctor 检测;F92 pricing 版本 staleness 检测已在 `ccteam doctor --check-pricing-version` 中实现)
 
 ---
 
