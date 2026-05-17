@@ -571,17 +571,11 @@ pub fn workflow_summary(slug: &str, paths: &CcteamPaths) -> Result<WorkflowSumma
         let mut last_by_role: HashMap<&str, &AgentSessionSummary> = HashMap::new();
         for session in &sessions {
             let Some(status) = by_role.get_mut(session.role.as_str()) else {
-                // session.role not in spec — surface as a synthetic
-                // role row so the UI can see it (orphan agent).
-                let entry = by_role.entry(session.role.as_str()).or_insert(AgentStatus {
-                    role: session.role.clone(),
-                    running_count: 0,
-                    queued_count: 0,
-                    total_cost_usd: 0.0,
-                    last_session_status: None,
-                });
-                accumulate_session(entry, session);
-                last_by_role.insert(session.role.as_str(), session);
+                // session.role not in current workflow.yaml — orphan from a
+                // rename / removal. Skip the agent-card grid entry (the
+                // historical events still surface in Events Timeline);
+                // `workflow_cost_total` already aggregated the cost from
+                // the raw event stream.
                 continue;
             };
             accumulate_session(status, session);
