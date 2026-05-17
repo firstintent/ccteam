@@ -454,6 +454,14 @@ fn typed_team_event_round_trips_watcher_emitted_payloads() {
             TeamEvent::TeamTaskCompleted { .. } => {
                 variants.insert("team_task_completed");
             }
+            // V0.5.0 F94 — hook-emitted; not produced by the watcher's
+            // discovery / dispatch passes, so the round-trip survey
+            // here doesn't exercise it. The dedicated F94
+            // `event_team_test.rs` covers serde round-trip for this
+            // variant.
+            TeamEvent::TeamTeammateIdle { .. } => {
+                variants.insert("team_teammate_idle");
+            }
         }
     }
     for v in [

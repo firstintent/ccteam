@@ -184,10 +184,18 @@ impl CancelReason {
     }
 }
 
-/// V0.5.0 F95 — Anthropic Agent Teams event mirror. Five variants
-/// emitted by [`crate::AgentTeamsWatcher`] into
-/// `~/.ccteam/teams-progress.jsonl`. F94 (Wave 2) adds a sixth
-/// `TeamTeammateIdle` — intentionally absent here.
+/// V0.5.0 F95 + F94 — Anthropic Agent Teams event mirror. Six
+/// variants. The first five (F95) are emitted by
+/// [`crate::AgentTeamsWatcher`] into `~/.ccteam/teams-progress.jsonl`
+/// from filesystem watching of `~/.claude/teams/<team>/`. The sixth
+/// (`TeamTeammateIdle`, F94 Wave 2) is hook-only — Anthropic's idle
+/// state is an in-memory signal not surfaced through the
+/// `config.json` / `inboxes/` / `tasks/` files the watcher reads, so
+/// the `TeammateIdle` hook is the only way to capture it. F93b
+/// advanced-path projects install the F94 hook via
+/// `settings.agent-team.json`; F93a primary-path sessions
+/// don't install hooks and have to degrade their idle inference to
+/// 30s-no-message heuristics.
 ///
 /// **Why a typed enum on top of `serde_json::Value`**: the watcher
 /// writes events as untyped JSON (the legacy approach used by every
@@ -197,7 +205,7 @@ impl CancelReason {
 /// byte-for-byte, so a consumer can `serde_json::from_value` directly
 /// without reflowing the watcher's emit path.
 ///
-/// PRD: `docs/v0-5-0/prd.md` §F95 `event` table.
+/// PRD: `docs/v0-5-0/prd.md` §F95 + §F94 `event` table.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "event")]
 pub enum TeamEvent {
@@ -258,6 +266,26 @@ pub enum TeamEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         result_summary: Option<String>,
         completed_at: String,
+        ts: String,
+    },
+    /// V0.5.0 F94 — emitted by the F93b advanced-path `TeammateIdle`
+    /// hook (`settings.agent-team.json`). The lead uses this to detect
+    /// "all teammates idle but tasks pending" stall conditions.
+    /// Hook-only: there is no fallback path because Anthropic's idle
+    /// signal is not persisted to disk.
+    #[serde(rename = "team_teammate_idle")]
+    TeamTeammateIdle {
+        team_name: String,
+        teammate_name: String,
+        /// Hook payload's `idleReason` field (typically `"available"`
+        /// or `"waiting"`). Optional because the Anthropic hook
+        /// surface is still in flux.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        idle_reason: Option<String>,
+        /// RFC3339 timestamp from the hook payload (when the teammate
+        /// transitioned into idle state).
+        idle_since: String,
+        /// RFC3339 timestamp the hook subprocess wrote the event.
         ts: String,
     },
 }

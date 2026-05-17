@@ -285,6 +285,31 @@ progress.jsonl 由两个域共同写入:
 `budget_exceeded` 事件先于 `workflow_done reason="budget_exceeded"` emit 一行
 `{"event":"budget_exceeded","role":<trigger_role|null>,"cost_used_usd":<sum_24h>,"budget_limit_usd":<cap>,"slug":...}`(budget guard 在 spawn 之外也消费它判 24h 滑窗 cost / 1h spawn count cap)。
 
+**team domain**(V0.5.0 F95 + F94 — Anthropic Agent Teams 镜像,共 6 类):
+
+```jsonl
+{"ts":"...","event":"team_member_joined","team_name":"roblog","teammate_name":"pm","agent_id":"...","agent_type":"general-purpose","model":"sonnet","color":"orange","cwd":"/home/.../roblog","backend_type":"in-process","definition_backed":false,"started_at":"...","ts":"..."}
+{"ts":"...","event":"team_member_left","team_name":"roblog","teammate_name":"pm","ts":"..."}
+{"ts":"...","event":"team_message_sent","team_name":"roblog","from":"pm","to":"team-lead","text_truncated":"...","msg_ts":"...","color":"orange","read":false,"ts":"..."}
+{"ts":"...","event":"team_task_created","team_name":"roblog","task_id":"42","title":"do thing","assignee":"pm","dependencies":[],"ts":"..."}
+{"ts":"...","event":"team_task_completed","team_name":"roblog","task_id":"42","result_summary":"done","completed_at":"...","ts":"..."}
+{"ts":"...","event":"team_teammate_idle","team_name":"roblog","teammate_name":"pm","idle_reason":"available","idle_since":"...","ts":"..."}
+```
+
+| event | 必有字段 | 选填字段 | 写入时机 |
+|---|---|---|---|
+| `team_member_joined` | `team_name`, `teammate_name`, `agent_id`, `agent_type`, `model`, `cwd`, `backend_type`, `definition_backed`, `started_at`, `ts` | `color` | F95 `AgentTeamsWatcher` 检测到 `~/.claude/teams/<team>/config.json::members[]` 新增条目;cold-start 时每个 member emit 一次 |
+| `team_member_left` | `team_name`, `teammate_name`, `ts` | — | F95 watcher 检测到 `members[]` 中条目消失 |
+| `team_message_sent` | `team_name`, `from`, `to`, `text_truncated`, `msg_ts`, `ts` | `color`, `read` | F95 watcher 检测到 `~/.claude/teams/<team>/inboxes/<teammate>.json` 追加新 message |
+| `team_task_created` | `team_name`, `task_id`, `title`, `ts` | `assignee`, `dependencies` | 优先 F94 hook(`TaskCreated`,advanced path);F95 watcher fallback `~/.claude/tasks/<team>/<id>.json::status: pending` |
+| `team_task_completed` | `team_name`, `task_id`, `completed_at`, `ts` | `result_summary` | 优先 F94 hook(`TaskCompleted`);F95 watcher fallback `status: completed` 变化 |
+| `team_teammate_idle` | `team_name`, `teammate_name`, `idle_since`, `ts` | `idle_reason` | F94 hook only(`TeammateIdle`)— Anthropic 的 idle 是内存状态,watcher 拿不到 |
+
+来源优先级:
+- F94 hook(`TaskCreated` / `TaskCompleted` / `TeammateIdle`) — 仅 F93b advanced path 装(`ccteam init --mode agent-team` 用 `settings.agent-team.json`)
+- F95 watcher 全局 fallback(对所有 host `~/.claude/teams/`) — primary path(`/ccteam:team` skill)的唯一来源
+- F94 hook 失败 → F95 watcher 接管 `team_task_*`(`team_teammate_idle` 没 fallback)
+
 **hook domain**(Claude Code / Codex hook 写;详见 §6.2):
 
 ```jsonl
@@ -312,6 +337,9 @@ progress.jsonl 由两个域共同写入:
 | `gate_triggered` | orchestrator(`check_gates` 释放 Gate 时) |
 | `budget_exceeded` | orchestrator(`try_spawn` budget guard) |
 | `escalation` | orchestrator(`bump_fail_count`,fix-loop 3-strike 与 `spawn_session` 持续失败) |
+| `team_member_joined` / `team_member_left` / `team_message_sent` | F95 `AgentTeamsWatcher`(watcher only;Anthropic 没对应 hook surface) |
+| `team_task_created` / `team_task_completed` | F94 hook 优先(advanced path),F95 watcher fallback |
+| `team_teammate_idle` | F94 hook only(`TeammateIdle`,仅 advanced path 装) |
 | `session_start` / `PreToolUse` / `PostToolUse` / `SubagentStop` / `Stop` / `SessionEnd` / `notification` / `user_attach` | Claude Code / Codex hooks 与启动器(详见 §6.2) |
 
 ### 4.3 消费方

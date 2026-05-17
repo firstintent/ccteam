@@ -61,8 +61,10 @@ fn manual_spec(role: &str) -> WorkflowSpec {
     WorkflowSpec {
         name: "shutdown-test".into(),
         description: None,
+        mode: ccteam_core::WorkflowMode::default(),
         enabled: true,
         budget: None,
+        agent_team: None,
         agents,
     }
 }

@@ -185,8 +185,9 @@ pub use team_resolver::{
     TeamSource, TEAM_SOURCES,
 };
 pub use templates::{
-    current_ccteam_bin, render_project_settings, write_global_helper_templates,
-    write_project_settings, EnabledPluginsSetting, SettingsEnv, HELPER_TEMPLATES,
+    current_ccteam_bin, render_project_settings, render_project_settings_agent_team,
+    write_global_helper_templates, write_project_settings, write_project_settings_agent_team,
+    EnabledPluginsSetting, SettingsEnv, HELPER_TEMPLATES, PROJECT_SETTINGS_AGENT_TEAM_JSON,
     PROJECT_SETTINGS_JSON,
 };
 pub use tmux::{
@@ -211,8 +212,10 @@ pub use watchdog::{
     WatchdogConfig, DEFAULT_NOTIFY_ON_CYCLE_COUNT, WATCHDOG_CONFIG_FILENAME,
 };
 // V0.4.0 F63 — workflow.yaml schema. V0.4.6 F84 adds `BudgetSpec`.
+// V0.5.0 F93b adds `WorkflowMode` / `AgentTeamSpec` / `SuggestedTeammate`.
 pub use workflow::{
-    AgentSpec, BudgetSpec, Executor, OnTimeout, Trigger, WorkflowError, WorkflowSpec,
+    AgentSpec, AgentTeamSpec, BudgetSpec, Executor, OnTimeout, SuggestedTeammate,
+    SuggestedTeammateKind, Trigger, WorkflowError, WorkflowMode, WorkflowSpec,
 };
 // V0.4.6 F82 — workflow.yaml file watcher.
 pub use workflow_watcher::{

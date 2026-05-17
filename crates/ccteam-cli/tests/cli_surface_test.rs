@@ -45,12 +45,16 @@ fn t01_help_user_facing_only() {
     // Deprecated top-level aliases are hidden — they still work but
     // are no longer listed in the top-level help to keep the user
     // surface clean (V0.4.6 F89).
+    //
+    // V0.5.0 F93b: `attach` is promoted back to user-facing because
+    // agent-team mode needs `ccteam attach <slug>` as a primary entry
+    // point (see PRD F93b §验收 5). The `internal attach` alias stays
+    // as a hidden compat path.
     let deprecated = [
         "hook",
         "spawn",
         "send",
         "peek",
-        "attach",
         "progress",
         "resume",
         "mcp-serve",

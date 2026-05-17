@@ -27,6 +27,22 @@ pub enum OutputFormat {
     Json,
 }
 
+/// V0.5.0 F93b — `ccteam init --mode <variant>` selector.
+///
+/// Default is `ArtifactDriven` (V0.4.6 behavior preserved). `AgentTeam`
+/// switches the init scaffold to the agent-team mode: the
+/// `workflow.agent-team.yaml` template, the `__lead.md` agent
+/// scaffold, and the `settings.agent-team.json` settings template
+/// (with F94 hooks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum InitMode {
+    /// V0.4.0 default. ArtifactWatcher + trigger graph drive spawns.
+    #[default]
+    ArtifactDriven,
+    /// V0.5.0 F93b. `__lead` session under Anthropic Agent Teams.
+    AgentTeam,
+}
+
 /// Options passed from the `ccteam init` argument parser.
 #[derive(Debug, Clone, Default)]
 pub struct InitOptions {
@@ -53,6 +69,11 @@ pub struct InitOptions {
     /// V0.4.1: assume `yes` for every install-step prompt. Implies
     /// `interactive` but skips actual stdin.
     pub yes: bool,
+    /// V0.5.0 F93b — workflow mode for the scaffolded workflow.yaml.
+    /// Defaults to `ArtifactDriven`. `AgentTeam` writes the
+    /// `workflow.agent-team.yaml` template + `__lead.md` scaffold +
+    /// `settings.agent-team.json` (with F94 hooks).
+    pub mode: InitMode,
 }
 
 /// V0.4.2 F72: unified install command.
@@ -356,8 +377,20 @@ fn install_project_at(
             "(installed via `ccteam init`)",
             team,
         )?;
-        scaffold_workflow_yaml(target, false)?;
-        let agent_count = scaffold_default_agents(target, false)?;
+        scaffold_workflow_yaml(target, false, opts.mode)?;
+        let agent_count = scaffold_default_agents(target, false, opts.mode)?;
+        if matches!(opts.mode, InitMode::AgentTeam) {
+            scaffold_agent_team_inbox(target)?;
+            // V0.5.0 F94: agent-team mode needs the variant
+            // `.claude/settings.json` (TeammateIdle / TaskCreated /
+            // TaskCompleted hooks). `bootstrap_project_at_dir` already
+            // wrote the V0.4.6 settings.json; overwrite it with the
+            // agent-team variant.
+            ccteam_core::write_project_settings_agent_team(
+                target,
+                &ccteam_core::EnabledPluginsSetting::default(),
+            )?;
+        }
         state_action = "created";
         workflow_action = "scaffolded";
         agents_action = if agent_count > 0 {
@@ -379,14 +412,14 @@ fn install_project_at(
         state_action = "refreshed";
 
         workflow_action = if opts.force {
-            scaffold_workflow_yaml(target, true)?;
+            scaffold_workflow_yaml(target, true, opts.mode)?;
             "overwritten (--force)"
         } else {
             "preserved"
         };
 
         agents_action = if opts.force || opts.reset_agents {
-            scaffold_default_agents(target, true)?;
+            scaffold_default_agents(target, true, opts.mode)?;
             if opts.force {
                 "overwritten (--force)"
             } else {
@@ -395,6 +428,15 @@ fn install_project_at(
         } else {
             "preserved"
         };
+        // V0.5.0 F94: same as fresh-install branch — agent-team mode
+        // needs the agent-team settings.json hook set. Idempotent
+        // overwrite under `--force` only (preserve user edits otherwise).
+        if matches!(opts.mode, InitMode::AgentTeam) && opts.force {
+            ccteam_core::write_project_settings_agent_team(
+                target,
+                &ccteam_core::EnabledPluginsSetting::default(),
+            )?;
+        }
     }
 
     Ok(ProjectInstallReport {
@@ -412,7 +454,11 @@ fn install_project_at(
 /// `.ccteam/` so the orchestration state SoT stays out of the user's
 /// business tree. Returns silently if the file already exists and
 /// `force` is false.
-fn scaffold_workflow_yaml(target: &std::path::Path, force: bool) -> Result<()> {
+///
+/// V0.5.0 F93b: `mode` selects between the V0.4.6 default template
+/// (`DEFAULT_WORKFLOW_YAML`) and the `workflow.agent-team.yaml`
+/// template (advanced agent-team mode).
+fn scaffold_workflow_yaml(target: &std::path::Path, force: bool, mode: InitMode) -> Result<()> {
     let ccteam_dir = target.join(".ccteam");
     std::fs::create_dir_all(&ccteam_dir)
         .with_context(|| format!("create {}", ccteam_dir.display()))?;
@@ -420,8 +466,11 @@ fn scaffold_workflow_yaml(target: &std::path::Path, force: bool) -> Result<()> {
     if path.exists() && !force {
         return Ok(());
     }
-    std::fs::write(&path, DEFAULT_WORKFLOW_YAML)
-        .with_context(|| format!("write {}", path.display()))?;
+    let body = match mode {
+        InitMode::ArtifactDriven => DEFAULT_WORKFLOW_YAML,
+        InitMode::AgentTeam => DEFAULT_AGENT_TEAM_WORKFLOW_YAML,
+    };
+    std::fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
 
@@ -429,7 +478,10 @@ fn scaffold_workflow_yaml(target: &std::path::Path, force: bool) -> Result<()> {
 /// the count of files written. With `force=false`, existing files are
 /// preserved; with `force=true`, the shipped scaffolds always
 /// overwrite.
-fn scaffold_default_agents(target: &std::path::Path, force: bool) -> Result<usize> {
+///
+/// V0.5.0 F93b: `mode == AgentTeam` additionally writes `__lead.md`
+/// (the ccteam-managed lead agent spec).
+fn scaffold_default_agents(target: &std::path::Path, force: bool, mode: InitMode) -> Result<usize> {
     let agents_dir = target.join(".claude").join("agents");
     std::fs::create_dir_all(&agents_dir)
         .with_context(|| format!("create {}", agents_dir.display()))?;
@@ -442,7 +494,30 @@ fn scaffold_default_agents(target: &std::path::Path, force: bool) -> Result<usiz
         std::fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
         written += 1;
     }
+    if matches!(mode, InitMode::AgentTeam) {
+        let path = agents_dir.join("__lead.md");
+        if !path.exists() || force {
+            std::fs::write(&path, AGENT_TEAM_LEAD_MD)
+                .with_context(|| format!("write {}", path.display()))?;
+            written += 1;
+        }
+    }
     Ok(written)
+}
+
+/// V0.5.0 F93b: create the `.ccteam/inbox/` directory + a `.gitkeep`
+/// sentinel so an empty inbox round-trips through `git`. This is the
+/// dir the lead writes outbox messages into (and the user's
+/// `ccteam send <slug>` writes inbox messages into for the lead to
+/// poll). Idempotent.
+fn scaffold_agent_team_inbox(target: &std::path::Path) -> Result<()> {
+    let inbox = target.join(".ccteam").join("inbox");
+    std::fs::create_dir_all(&inbox).with_context(|| format!("create {}", inbox.display()))?;
+    let sentinel = inbox.join(".gitkeep");
+    if !sentinel.exists() {
+        std::fs::write(&sentinel, "").with_context(|| format!("write {}", sentinel.display()))?;
+    }
+    Ok(())
 }
 
 const DEFAULT_WORKFLOW_YAML: &str = r#"# ccteam workflow.yaml (V0.4.0+ shape).
@@ -483,8 +558,28 @@ agents:
 /// 4. `cargo build --workspace` + `cargo test --workspace`
 ///
 /// See `agents/README.md` for the agent spec + naming conventions.
-const DEFAULT_AGENT_SCAFFOLDS: &[(&str, &str)] =
+///
+/// V0.5.0 F93b note: `__lead.md` is NOT in this list — it ships with
+/// agent-team mode only and is conditionally written by
+/// `scaffold_default_agents` when `mode == AgentTeam`. `doctor
+/// --install-agents` (V0.5.x F93x) will pull it from
+/// [`AGENT_TEAM_LEAD_MD`] independently.
+pub(crate) const DEFAULT_AGENT_SCAFFOLDS: &[(&str, &str)] =
     &[("explorer.md", include_str!("../../../agents/explorer.md"))];
+
+/// V0.5.0 F93b — embedded `__lead.md` body (ccteam-managed agent-team
+/// lead spec). Written into `.claude/agents/__lead.md` by
+/// `ccteam init --mode agent-team`. The body is treated as
+/// ccteam-owned; `ccteam doctor --validate-team` (V0.5.x) will warn
+/// if the user has hand-modified it.
+pub(crate) const AGENT_TEAM_LEAD_MD: &str = include_str!("../../../agents/__lead.md");
+
+/// V0.5.0 F93b — embedded `workflow.agent-team.yaml` body. Written by
+/// `ccteam init --mode agent-team`. Contains the `mode: agent-team` +
+/// `agent_team:` schema with one definition + one commented ad-hoc
+/// teammate example.
+pub(crate) const DEFAULT_AGENT_TEAM_WORKFLOW_YAML: &str =
+    include_str!("../../ccteam-core/src/templates/workflow.agent-team.yaml");
 
 /// Prompt the user `<question> [Y/n]: ` and return their answer. With
 /// `yes_to_all = true`, skips the prompt and answers `true` (the
@@ -572,19 +667,356 @@ pub fn run_show(paths: &CcteamPaths, slug: &str, format: OutputFormat) -> Result
     })
 }
 
+/// V0.5.0 F93b — `ccteam start <slug>` flags. Drives the
+/// `[Y/n/attach]` confirmation prompt + the `--no-confirm` / `--attach`
+/// / `--dry-run` script-mode bypasses.
+#[derive(Debug, Clone, Default)]
+pub struct StartAgentTeamOptions {
+    /// Skip the `[Y/n/attach]` prompt; default to `Y` behaviour
+    /// (spawn + print attach hint). Matches `--no-confirm` / `-y`.
+    pub no_confirm: bool,
+    /// Skip the `[Y/n/attach]` prompt and go straight to the `attach`
+    /// branch (spawn + exec `claude attach <id>`).
+    pub attach: bool,
+    /// Print spawn preview + exit; do not spawn. Useful for previews
+    /// / CI / docs.
+    pub dry_run: bool,
+}
+
+/// V0.5.0 F93b — `ccteam start <slug>` for agent-team mode projects.
+///
+/// 1. Load `<slug>`'s `workflow.yaml`; bail if `mode != agent-team`.
+/// 2. Print spawn preview (workflow.yaml summary, `__lead.md` model,
+///    suggested teammates count, spawn argv preview).
+/// 3. Prompt `[Y/n/attach]` (TTY interactive) unless `no_confirm` /
+///    `attach` / `dry_run` selected.
+/// 4. On Y: spawn `claude --bg --agent __lead`, write
+///    `.ccteam/team-snapshot.json::lead_session_id`, print attach hint.
+/// 5. On attach: spawn (same as Y), then exec `claude attach <id>`.
+/// 6. On n: cancel, no side effects.
+///
+/// **Returns the formatted preview/report** so unit tests can inspect
+/// the rendered output without going through TTY. Production caller
+/// in main.rs just prints + exits.
+pub fn run_start_agent_team(
+    paths: &CcteamPaths,
+    slug: &str,
+    opts: StartAgentTeamOptions,
+) -> Result<String> {
+    let project_dir = paths.project_dir(slug);
+    if !project_dir.exists() {
+        bail!(
+            "no project at `{slug}`: {} not found. \
+             Run `ccteam init --mode agent-team --slug {slug}` first.",
+            project_dir.display(),
+        );
+    }
+    let spec = ccteam_core::WorkflowSpec::load_for_project(&project_dir)
+        .with_context(|| format!("load workflow.yaml for {slug}"))?;
+    let team_spec = match (&spec.mode, &spec.agent_team) {
+        (ccteam_core::WorkflowMode::AgentTeam, Some(t)) => t,
+        (ccteam_core::WorkflowMode::AgentTeam, None) => {
+            bail!("workflow.yaml mode: agent-team but agent_team block missing — schema bug?",)
+        }
+        (ccteam_core::WorkflowMode::ArtifactDriven, _) => bail!(
+            "project `{slug}` is in artifact-driven mode; `ccteam start <slug>` is only\n  \
+             implemented for agent-team mode. For artifact-driven projects run\n  \
+             `ccteam start` (no slug) to start the daemon.",
+        ),
+    };
+    let lead_md_path = project_dir.join(".claude").join("agents").join("__lead.md");
+    let lead_md_exists = lead_md_path.exists();
+    let teammate_mode = team_spec
+        .teammate_mode
+        .clone()
+        .unwrap_or_else(|| "in-process".to_string());
+
+    // ---- 1. Render preview ---------------------------------------------
+    let mut preview = String::new();
+    preview.push_str(&format!("ccteam start {slug} — agent-team mode\n\n"));
+    preview.push_str(&format!(
+        "  ✓ Loaded {}\n",
+        project_dir.join(".ccteam").join("workflow.yaml").display(),
+    ));
+    preview.push_str(&format!(
+        "      mode=agent-team team_name={}\n",
+        team_spec.team_name,
+    ));
+    if lead_md_exists {
+        preview.push_str(&format!("  ✓ Loaded {}\n", lead_md_path.display(),));
+    } else {
+        preview.push_str(&format!(
+            "  ! Missing {} — re-run `ccteam init --mode agent-team --slug {slug} --force`\n",
+            lead_md_path.display(),
+        ));
+    }
+    let (def_count, adhoc_count) =
+        team_spec
+            .suggested_teammates
+            .iter()
+            .fold((0u32, 0u32), |(d, a), t| match t.kind {
+                ccteam_core::SuggestedTeammateKind::Definition => (d + 1, a),
+                ccteam_core::SuggestedTeammateKind::AdHoc => (d, a + 1),
+            });
+    preview.push_str(&format!(
+        "  ✓ Suggested teammates: {def_count} definition + {adhoc_count} ad-hoc\n",
+    ));
+    preview.push_str("\n  About to spawn lead session:\n");
+    preview.push_str("    claude --bg --agent __lead \\\n");
+    preview.push_str("      --env CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 \\\n");
+    preview.push_str(&format!(
+        "      --env CLAUDE_CODE_TEAMMATE_MODE={teammate_mode}\n",
+    ));
+    // Truncate the lead_seed preview to 200 chars for the console.
+    let seed_preview: String = team_spec
+        .lead_seed
+        .chars()
+        .take(200)
+        .collect::<String>()
+        .replace('\n', " ");
+    let seed_preview = if team_spec.lead_seed.chars().count() > 200 {
+        format!("{seed_preview}…")
+    } else {
+        seed_preview
+    };
+    preview.push_str(&format!(
+        "    Initial user-turn (lead_seed):\n      \"{seed_preview}\"\n",
+    ));
+
+    // ---- 2. Dry-run / non-interactive bypasses --------------------------
+    if opts.dry_run {
+        preview.push_str("\n  --dry-run set — preview only, lead not spawned.\n");
+        return Ok(preview);
+    }
+
+    let choice = resolve_start_choice(&opts)?;
+
+    // ---- 3. Confirm or fall through to spawn ----------------------------
+    print!("{preview}");
+    let action = match choice {
+        StartChoice::Confirmed => "default",
+        StartChoice::AttachAfterSpawn => "attach",
+        StartChoice::Cancelled => {
+            return Ok(format!("{preview}\n  Cancelled. No side effects.\n"));
+        }
+    };
+
+    // ---- 4. Spawn the lead ----------------------------------------------
+    let mut report = String::new();
+    let lead_id = spawn_agent_team_lead(paths, slug, team_spec, &teammate_mode)
+        .with_context(|| format!("spawn __lead for {slug}"))?;
+    report.push_str(&format!("  ✓ Lead session spawned: {lead_id}\n"));
+    report.push_str("\n  Manage the team with:\n");
+    report.push_str(&format!("    ccteam attach {slug}    # interactive\n",));
+    report.push_str(&format!(
+        "    ccteam internal send {slug} \"go\"   # async\n",
+    ));
+    report.push_str(&format!(
+        "    ccteam web                          # http://localhost:7331/teams/{}\n",
+        team_spec.team_name,
+    ));
+    report.push_str(
+        "    ccteam internal hook progress-append … (advanced path 3 hooks already installed)\n",
+    );
+    report.push_str(&format!("    ccteam stop {slug}    # cleanup\n",));
+
+    print!("{report}");
+    if action == "attach" {
+        eprintln!("→ claude attach {lead_id}");
+        let status = Command::new("claude")
+            .args(["attach", &lead_id])
+            .status()
+            .context("spawn claude attach (--attach branch)")?;
+        if !status.success() {
+            bail!("claude attach exited with {status}");
+        }
+    }
+    Ok(format!("{preview}{report}"))
+}
+
+/// V0.5.0 F93b — `[Y/n/attach]` prompt resolution. Returns the
+/// resolved action without performing any side effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartChoice {
+    /// `Y` branch — spawn + print attach hint.
+    Confirmed,
+    /// `attach` branch — spawn + exec `claude attach <id>`.
+    AttachAfterSpawn,
+    /// `n` branch — cancel, no side effects.
+    Cancelled,
+}
+
+fn resolve_start_choice(opts: &StartAgentTeamOptions) -> Result<StartChoice> {
+    if opts.attach {
+        return Ok(StartChoice::AttachAfterSpawn);
+    }
+    if opts.no_confirm {
+        return Ok(StartChoice::Confirmed);
+    }
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        // Non-tty without explicit flag: default to confirmed to keep
+        // scripted callers (CI smoke tests, doctor smoke flow) from
+        // hanging on stdin.
+        eprintln!(
+            "  · stdin is not a tty + no --no-confirm/--attach/--dry-run set;\n  \
+             defaulting to confirmed spawn. Pass --dry-run to preview.",
+        );
+        return Ok(StartChoice::Confirmed);
+    }
+    print!("\n  Proceed? [Y/n/attach]: ");
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .context("read [Y/n/attach] answer from stdin")?;
+    let trimmed = line.trim().to_ascii_lowercase();
+    Ok(match trimmed.as_str() {
+        "" | "y" | "yes" | "ok" => StartChoice::Confirmed,
+        "attach" | "a" => StartChoice::AttachAfterSpawn,
+        "n" | "no" | "cancel" => StartChoice::Cancelled,
+        other => bail!(
+            "unrecognized answer `{other}`: expected one of \
+             `Y` / `n` / `attach` (default `Y`)",
+        ),
+    })
+}
+
+/// V0.5.0 F93b — spawn the `__lead` Claude bg session for a project.
+///
+/// The exact argv form is:
+///
+/// ```text
+/// claude --bg --agent __lead --dangerously-skip-permissions \
+///        --env CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 \
+///        --env CLAUDE_CODE_TEAMMATE_MODE=<mode> \
+///        "<lead_seed body>"
+/// ```
+///
+/// `lead_seed` is passed as the positional user-turn message (NOT as a
+/// system prompt — CLAUDE.md §三 红线). The harness's
+/// `--dangerously-skip-permissions` is set per the existing
+/// [`ClaudeCodeAdapter`] pattern; team-mode env vars are passed via
+/// `--env` flags so they reach the spawned bg job process.
+///
+/// Returns the `daemonShort` job id from `claude --bg`'s stdout
+/// (first line `backgrounded · <id>`). Writes
+/// `.ccteam/team-snapshot.json` containing the lead id + the resolved
+/// (frozen) `AgentTeamSpec`.
+///
+/// Test override: `$CCTEAM_CLAUDE_BIN` swaps in a fake script, same
+/// pattern as the regular `ClaudeCodeAdapter`.
+fn spawn_agent_team_lead(
+    paths: &CcteamPaths,
+    slug: &str,
+    team_spec: &ccteam_core::AgentTeamSpec,
+    teammate_mode: &str,
+) -> Result<String> {
+    let project_dir = paths.project_dir(slug);
+    let bin = std::env::var(ccteam_core::CLAUDE_BIN_ENV).unwrap_or_else(|_| "claude".to_string());
+    let mut cmd = Command::new(&bin);
+    cmd.arg("--bg")
+        .arg("--agent")
+        .arg("__lead")
+        .arg("--dangerously-skip-permissions")
+        .arg("--env")
+        .arg("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1")
+        .arg("--env")
+        .arg(format!("CLAUDE_CODE_TEAMMATE_MODE={teammate_mode}"))
+        .arg(&team_spec.lead_seed);
+    cmd.current_dir(&project_dir);
+    let output = cmd
+        .output()
+        .with_context(|| format!("invoke `{bin} --bg --agent __lead`"))?;
+    if !output.status.success() {
+        bail!(
+            "claude --bg --agent __lead exited non-zero ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim(),
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lead_id = parse_backgrounded_short_id(&stdout).ok_or_else(|| {
+        anyhow::anyhow!(
+            "claude --bg stdout missing `backgrounded · <id>` line: {}",
+            stdout.trim(),
+        )
+    })?;
+
+    // Write snapshot.
+    let snapshot_path = project_dir.join(".ccteam").join("team-snapshot.json");
+    let snapshot = serde_json::json!({
+        "slug": slug,
+        "lead_session_id": lead_id,
+        "team_name": team_spec.team_name,
+        "teammate_mode": teammate_mode,
+        "cleanup_on_stop": team_spec.cleanup_on_stop.clone().unwrap_or_else(|| "force-kill".into()),
+        "auto_spawn_teammates": team_spec.auto_spawn_teammates,
+        "suggested_teammates": team_spec.suggested_teammates,
+        "spawned_at": chrono::Utc::now().to_rfc3339(),
+    });
+    if let Some(parent) = snapshot_path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    std::fs::write(&snapshot_path, serde_json::to_string_pretty(&snapshot)?)
+        .with_context(|| format!("write {}", snapshot_path.display()))?;
+
+    Ok(lead_id)
+}
+
+/// V0.5.0 F93b — duplicated locally from
+/// `ccteam_core::harness::parse_backgrounded_short_id` because that
+/// fn is `pub(crate)`. The format is "backgrounded · <id>" on the
+/// first non-empty line.
+fn parse_backgrounded_short_id(stdout: &str) -> Option<String> {
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Match `backgrounded · <id>` (Anthropic uses U+00B7 MIDDLE DOT).
+        if let Some(rest) = trimmed.strip_prefix("backgrounded · ") {
+            return Some(rest.trim().to_string());
+        }
+        // Forwards-compat: also accept ascii fallback for stub scripts.
+        if let Some(rest) = trimmed.strip_prefix("backgrounded ") {
+            return Some(rest.trim().to_string());
+        }
+    }
+    None
+}
+
 /// `ccteam attach <slug>`. Resolves the underlying session medium and
 /// dispatches:
 ///
-/// 1. If a tmux session named `ccteam-<slug>` exists → `tmux attach -t …`
+/// 1. V0.5.0 F93b — if the project's workflow.yaml has
+///    `mode: agent-team`, read the lead session id from
+///    `.ccteam/team-snapshot.json::lead_session_id` and exec
+///    `claude attach <id>`. Friendly-error if the snapshot is missing
+///    or the lead id is not yet populated (lead not spawned).
+/// 2. If a tmux session named `ccteam-<slug>` exists → `tmux attach -t …`
 ///    (V0.3.x meta-agent + legacy projects).
-/// 2. Else if the project's latest `agent_spawn` event in
+/// 3. Else if the project's latest `agent_spawn` event in
 ///    `progress.jsonl` carries a `claude --bg` `job_id` → `claude attach
 ///    <job_id>` (V0.4.0 worker default).
-/// 3. Else → fail-loud "no live session for <slug>".
+/// 4. Else → fail-loud "no live session for <slug>".
 ///
 /// Always prints the underlying command before exec'ing so the operator
 /// learns the lower-level tool.
 pub fn run_attach(paths: &CcteamPaths, slug: &str) -> Result<()> {
+    // V0.5.0 F93b: agent-team mode dispatches to the lead session.
+    if let Some(lead_id) = read_agent_team_lead_session_id(paths, slug)? {
+        eprintln!("→ claude attach {lead_id}");
+        let status = Command::new("claude")
+            .args(["attach", &lead_id])
+            .status()
+            .context("spawn claude attach")?;
+        if !status.success() {
+            bail!("claude attach exited with {status}");
+        }
+        return Ok(());
+    }
+
     let tmux_session = TmuxSession::from_name(session_name_for_project(paths, slug));
     if tmux_session.exists() {
         eprintln!("→ tmux attach -t {}", tmux_session.name());
@@ -620,6 +1052,55 @@ pub fn run_attach(paths: &CcteamPaths, slug: &str) -> Result<()> {
         "no live session for `{slug}`: tmux session `{}` not running, no `claude --bg` job recorded in progress.jsonl. Spawn one with `ccteam spawn {slug} <role>`.",
         tmux_session.name()
     )
+}
+
+/// V0.5.0 F93b — probe whether a project is in agent-team mode and
+/// return its lead session id from `.ccteam/team-snapshot.json`.
+///
+/// Returns:
+///   - `Ok(Some(id))` — project is agent-team mode AND has been started
+///     (snapshot exists, `lead_session_id` populated).
+///   - `Ok(None)` — project is artifact-driven OR no project exists at
+///     `<slug>` (let the caller fall through to tmux / bg paths).
+///   - `Err(_)` — project is agent-team mode but snapshot is missing /
+///     `lead_session_id` not yet written (lead hasn't been started yet).
+fn read_agent_team_lead_session_id(paths: &CcteamPaths, slug: &str) -> Result<Option<String>> {
+    let project_dir = paths.project_dir(slug);
+    if !project_dir.exists() {
+        return Ok(None);
+    }
+    let spec = match ccteam_core::WorkflowSpec::load_for_project(&project_dir) {
+        Ok(spec) => spec,
+        Err(_) => return Ok(None),
+    };
+    if !matches!(spec.mode, ccteam_core::WorkflowMode::AgentTeam) {
+        return Ok(None);
+    }
+    let snapshot_path = project_dir.join(".ccteam").join("team-snapshot.json");
+    if !snapshot_path.exists() {
+        bail!(
+            "project `{slug}` is in agent-team mode but has no team-snapshot.json yet.\n  \
+             Start the lead session first:  ccteam start {slug}\n  \
+             (snapshot is written by `ccteam start` after spawning the __lead session.)",
+        );
+    }
+    let body = std::fs::read_to_string(&snapshot_path)
+        .with_context(|| format!("read {}", snapshot_path.display()))?;
+    let v: serde_json::Value = serde_json::from_str(&body)
+        .with_context(|| format!("parse {}", snapshot_path.display()))?;
+    let lead_id = v
+        .get("lead_session_id")
+        .and_then(|s| s.as_str())
+        .map(String::from);
+    match lead_id {
+        Some(id) if !id.is_empty() => Ok(Some(id)),
+        _ => bail!(
+            "project `{slug}` team-snapshot.json has no `lead_session_id` yet.\n  \
+             The lead session may have failed to spawn. Check `ccteam show {slug}` and\n  \
+             `cat {}` for diagnostics.",
+            snapshot_path.display(),
+        ),
+    }
 }
 
 /// Walk `progress.jsonl` newest-first, find the most recent
@@ -2916,6 +3397,311 @@ mod tests {
         assert_eq!(cfg.projects.len(), 1);
         assert_eq!(cfg.projects[0].slug, "f72-fresh");
         assert_eq!(cfg.projects[0].team, "dev");
+    }
+
+    /// V0.5.0 F93b — `ccteam init --mode agent-team` scaffolds the
+    /// 4 required artifacts: `workflow.yaml` (with `mode: agent-team`),
+    /// `__lead.md`, `.ccteam/inbox/`, and registers in config.yaml.
+    /// Also writes the F94 `settings.agent-team.json` template
+    /// (with `TeammateIdle` / `TaskCreated` / `TaskCompleted` hooks).
+    #[test]
+    fn run_init_agent_team_mode_writes_four_files() {
+        ensure_isolation();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let target = tmp.path().join("my-debate");
+        run_init(
+            &paths,
+            InitOptions {
+                install_in: Some(target.clone()),
+                slug: Some("my-debate".into()),
+                mode: InitMode::AgentTeam,
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+        // 1. workflow.yaml exists with mode: agent-team
+        let wf = target.join(".ccteam").join("workflow.yaml");
+        assert!(wf.is_file(), "workflow.yaml must land in .ccteam/");
+        let body = std::fs::read_to_string(&wf).unwrap();
+        assert!(
+            body.contains("mode: agent-team"),
+            "workflow.yaml must declare mode: agent-team; got: {body}",
+        );
+        // 2. __lead.md scaffold
+        let lead = target.join(".claude").join("agents").join("__lead.md");
+        assert!(
+            lead.is_file(),
+            "__lead.md must be scaffolded in agent-team mode"
+        );
+        let lead_body = std::fs::read_to_string(&lead).unwrap();
+        assert!(
+            lead_body.contains("name: __lead"),
+            "__lead.md must have Anthropic frontmatter",
+        );
+        // 3. .ccteam/inbox/.gitkeep sentinel
+        let inbox = target.join(".ccteam").join("inbox");
+        assert!(inbox.is_dir(), "inbox dir must be created");
+        assert!(
+            inbox.join(".gitkeep").is_file(),
+            ".ccteam/inbox/.gitkeep sentinel must be written",
+        );
+        // 4. config.yaml registry entry
+        let cfg = ccteam_core::load_ccteam_config(&paths.root).unwrap();
+        assert_eq!(cfg.projects.len(), 1);
+        assert_eq!(cfg.projects[0].slug, "my-debate");
+        // 5. F94: settings.agent-team.json template wrote 3 hooks
+        let settings_path = target.join(".claude").join("settings.json");
+        assert!(settings_path.is_file());
+        let settings_body = std::fs::read_to_string(&settings_path).unwrap();
+        for hook in ["TeammateIdle", "TaskCreated", "TaskCompleted"] {
+            assert!(
+                settings_body.contains(hook),
+                "settings.json (agent-team) must include `{hook}` hook; got: {settings_body}",
+            );
+        }
+    }
+
+    /// V0.5.0 F93b — `ccteam init` without `--mode` defaults to
+    /// artifact-driven; no `__lead.md` is scaffolded.
+    #[test]
+    fn run_init_default_mode_does_not_scaffold_lead() {
+        ensure_isolation();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let target = tmp.path().join("artifact-default");
+        run_init(
+            &paths,
+            InitOptions {
+                install_in: Some(target.clone()),
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+        let lead = target.join(".claude").join("agents").join("__lead.md");
+        assert!(
+            !lead.exists(),
+            "__lead.md must NOT be scaffolded in default mode"
+        );
+        let wf = target.join(".ccteam").join("workflow.yaml");
+        let body = std::fs::read_to_string(&wf).unwrap();
+        assert!(
+            !body.contains("mode: agent-team"),
+            "default workflow.yaml must NOT declare agent-team mode",
+        );
+        // No F94 hooks in default settings.json.
+        let settings_body =
+            std::fs::read_to_string(target.join(".claude").join("settings.json")).unwrap();
+        assert!(
+            !settings_body.contains("TeammateIdle"),
+            "default settings.json must NOT include team_* hooks",
+        );
+    }
+
+    /// V0.5.0 F93b — `ccteam start <slug> --dry-run` prints the spawn
+    /// preview without spawning. The `<slug>` must point at an
+    /// agent-team mode project.
+    #[test]
+    fn run_start_agent_team_dry_run_prints_preview() {
+        ensure_isolation();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let target = tmp.path().join("dry-run-team");
+        run_init(
+            &paths,
+            InitOptions {
+                install_in: Some(target.clone()),
+                slug: Some("dry-run-team".into()),
+                mode: InitMode::AgentTeam,
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+        // Point projects_root at the install target via config.yaml
+        // entry (run_init already upserts it). For run_start, the slug
+        // must resolve via `paths.project_dir(slug)`.
+        // Our test paths.projects_root is `tmp/projects/`, but the
+        // install went into `tmp/dry-run-team/`. We need either to
+        // install under projects_root OR override paths to point there.
+        // Re-init under projects_root for proper slug resolution:
+        let target2 = paths.projects_root.join("dry-run-team-2");
+        run_init(
+            &paths,
+            InitOptions {
+                install_in: Some(target2.clone()),
+                slug: Some("dry-run-team-2".into()),
+                mode: InitMode::AgentTeam,
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+        // Customize the workflow.yaml lead_seed for assertion clarity.
+        let wf = target2.join(".ccteam").join("workflow.yaml");
+        let raw = std::fs::read_to_string(&wf).unwrap();
+        std::fs::write(
+            &wf,
+            raw.replace(
+                "<describe the team's mission here>",
+                "INVESTIGATE THE BUG IN AUTH",
+            ),
+        )
+        .unwrap();
+        let out = run_start_agent_team(
+            &paths,
+            "dry-run-team-2",
+            StartAgentTeamOptions {
+                dry_run: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(out.contains("mode=agent-team"), "preview must mention mode");
+        assert!(
+            out.contains("INVESTIGATE THE BUG IN AUTH") || out.contains("Suggested teammates"),
+            "preview must echo lead_seed; got: {out}",
+        );
+        assert!(
+            out.contains("dry-run set"),
+            "dry-run preview must include the cancellation note; got: {out}",
+        );
+        // Snapshot must NOT have been written (dry-run).
+        let snapshot = target2.join(".ccteam").join("team-snapshot.json");
+        assert!(
+            !snapshot.exists(),
+            "dry-run must not write team-snapshot.json",
+        );
+    }
+
+    /// V0.5.0 F93b — `ccteam start <slug>` against an artifact-driven
+    /// project returns a friendly error pointing at `ccteam start`
+    /// (no slug, daemon mode).
+    #[test]
+    fn run_start_agent_team_rejects_artifact_driven_project() {
+        ensure_isolation();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let slug = "artifact-rej";
+        let target = paths.projects_root.join(slug);
+        run_init(
+            &paths,
+            InitOptions {
+                install_in: Some(target),
+                slug: Some(slug.into()),
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+        let err = run_start_agent_team(
+            &paths,
+            slug,
+            StartAgentTeamOptions {
+                dry_run: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("artifact-driven"),
+            "error must mention artifact-driven; got: {msg}",
+        );
+    }
+
+    /// V0.5.0 F93b — `ccteam attach <slug>` against an agent-team
+    /// project without a written snapshot returns a friendly error
+    /// telling the user to run `ccteam start <slug>` first.
+    #[test]
+    fn run_attach_agent_team_missing_snapshot_errors_with_hint() {
+        ensure_isolation();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let slug = "no-snapshot";
+        let target = paths.projects_root.join(slug);
+        run_init(
+            &paths,
+            InitOptions {
+                install_in: Some(target),
+                slug: Some(slug.into()),
+                mode: InitMode::AgentTeam,
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+        let err = run_attach(&paths, slug).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("team-snapshot") || msg.contains("ccteam start"),
+            "error must mention snapshot / hint at `ccteam start`; got: {msg}",
+        );
+    }
+
+    /// V0.5.0 F93b — `ccteam attach <slug>` against an agent-team
+    /// project WITH a snapshot containing `lead_session_id` reads
+    /// the lead id and would exec `claude attach <id>`. We can't
+    /// actually exec here, but `read_agent_team_lead_session_id`
+    /// is testable directly.
+    #[test]
+    fn read_agent_team_lead_session_id_resolves_from_snapshot() {
+        ensure_isolation();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let slug = "with-snapshot";
+        let target = paths.projects_root.join(slug);
+        run_init(
+            &paths,
+            InitOptions {
+                install_in: Some(target.clone()),
+                slug: Some(slug.into()),
+                mode: InitMode::AgentTeam,
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+        // Fake snapshot writeup.
+        let snapshot_path = target.join(".ccteam").join("team-snapshot.json");
+        std::fs::write(
+            &snapshot_path,
+            serde_json::json!({
+                "slug": slug,
+                "lead_session_id": "deadbeef123",
+                "team_name": "with-snapshot",
+                "teammate_mode": "in-process",
+                "cleanup_on_stop": "force-kill",
+                "auto_spawn_teammates": false,
+                "suggested_teammates": [],
+                "spawned_at": "2026-05-17T12:00:00Z",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let lead_id = read_agent_team_lead_session_id(&paths, slug)
+            .unwrap()
+            .unwrap();
+        assert_eq!(lead_id, "deadbeef123");
+    }
+
+    /// V0.5.0 F93b — for artifact-driven projects,
+    /// `read_agent_team_lead_session_id` returns Ok(None) so the
+    /// caller falls through to the tmux / bg path (V0.4.6 behavior
+    /// preserved).
+    #[test]
+    fn read_agent_team_lead_session_id_returns_none_for_artifact_driven() {
+        ensure_isolation();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let slug = "art-fall";
+        let target = paths.projects_root.join(slug);
+        run_init(
+            &paths,
+            InitOptions {
+                install_in: Some(target),
+                slug: Some(slug.into()),
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+        let res = read_agent_team_lead_session_id(&paths, slug).unwrap();
+        assert!(res.is_none(), "artifact-driven must return None");
     }
 
     /// V0.4.2 F72: re-running on an existing ccteam project preserves

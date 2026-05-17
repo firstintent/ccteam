@@ -43,6 +43,15 @@ pub struct WorkflowSpec {
     /// Optional human-readable description for the meta-agent / UI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// V0.5.0 F93b — workflow execution mode. `artifact-driven` (the
+    /// V0.4.6 default) drives spawns from `ArtifactWatcher` + trigger
+    /// graph; `agent-team` runs a single ccteam-managed `__lead`
+    /// session under Anthropic's experimental Agent Teams surface
+    /// (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`). Defaults to
+    /// `ArtifactDriven` via `#[serde(default)]` so V0.4.6 workflow.yaml
+    /// files that omit the field stay backwards-compatible.
+    #[serde(default, skip_serializing_if = "is_mode_default")]
+    pub mode: WorkflowMode,
     /// V0.4.6 F82 — soft toggle. `false` makes the daemon skip rostering
     /// this workflow (and tear down a running loop on hot-reload). The
     /// project's `state.json`, `progress.jsonl`, and artifact dirs stay
@@ -67,9 +76,51 @@ pub struct WorkflowSpec {
     /// unaffected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<BudgetSpec>,
+    /// V0.5.0 F93b — populated when `mode: agent-team`. Lead session
+    /// config (`team_name`, `lead_seed`, `teammate_mode`, etc.) plus
+    /// the optional declarative `suggested_teammates` list. `None` in
+    /// `artifact-driven` mode (the V0.4.6 default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_team: Option<AgentTeamSpec>,
     /// Role → agent spec. `IndexMap` preserves YAML declaration order so
     /// trigger graph build is deterministic across runs.
+    ///
+    /// V0.5.0 F93b — empty in `mode: agent-team` workflows (the lead +
+    /// teammates are runtime topology, not declarative). Schema
+    /// validation allows an empty `agents` map only when
+    /// `mode == AgentTeam`.
+    #[serde(default)]
     pub agents: IndexMap<String, AgentSpec>,
+}
+
+/// V0.5.0 F93b — workflow execution mode discriminator.
+///
+/// `artifact-driven` is the V0.4.0 default: `ArtifactWatcher` drives
+/// dispatch from the `Trigger::*` enum and the `agents:` map. The
+/// daemon polls `state.json` for completion and writes the 7 canonical
+/// events to `progress.jsonl`.
+///
+/// `agent-team` is V0.5.0 F93b: the orchestrator spawns a single
+/// `__lead` Claude session with `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`
+/// and the lead in turn decides team composition via Anthropic's
+/// native `TeamCreate` + `Task` tools. The 6 `team_*` events
+/// (F95 + F94) replace the spawn/done axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkflowMode {
+    /// V0.4.0 default. Driven by `ArtifactWatcher` + trigger graph.
+    #[default]
+    ArtifactDriven,
+    /// V0.5.0 F93b. Driven by a single ccteam-managed `__lead`
+    /// session under Anthropic Agent Teams.
+    AgentTeam,
+}
+
+/// Predicate paired with `WorkflowMode::default()` so an explicit
+/// `mode: artifact-driven` is also omitted from serialized YAML —
+/// only the opt-in `mode: agent-team` line is rendered.
+fn is_mode_default(v: &WorkflowMode) -> bool {
+    matches!(v, WorkflowMode::ArtifactDriven)
 }
 
 /// Default for `WorkflowSpec::enabled` when the YAML omits the field.
@@ -108,6 +159,123 @@ pub struct BudgetSpec {
     /// dir — observed in dex-ui 2026-05-16 burning $1.10/4h).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_agent_spawns_per_hour: Option<u32>,
+}
+
+/// V0.5.0 F93b — populated when `WorkflowSpec::mode == AgentTeam`.
+///
+/// Mirrors PRD §F93b schema (`docs/v0-5-0/prd.md` lines 184-230):
+///
+/// ```yaml
+/// agent_team:
+///   team_name: flaky-test-debate     # = ~/.claude/teams/<team_name>/
+///   lead_seed: |                      # user-turn message to the lead
+///     Investigate why integration tests in src/auth/ flake.
+///   teammate_mode: in-process         # in-process | tmux | auto
+///   cleanup_on_stop: force-kill       # MVP: force-kill only
+///   snapshot_path: .ccteam/team-snapshot.json
+///   suggested_teammates: []           # optional declarative list
+///   auto_spawn_teammates: false       # default — plan-first gate
+/// ```
+///
+/// Schema red lines (CLAUDE.md §三 + PRD §F93b 红线):
+/// - `team_name` is the Anthropic `~/.claude/teams/<team_name>/` dir
+///   name — must match for the F95 watcher to mirror events
+/// - `lead_seed` is a **user-turn message**, not a system prompt
+/// - `auto_spawn_teammates: false` is the default; Plan-first Protocol
+///   requires explicit user approval before the lead spawns teammates
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct AgentTeamSpec {
+    /// Anthropic team name (= `~/.claude/teams/<team_name>/` dir).
+    /// Must be unique under that root. Required.
+    pub team_name: String,
+    /// User-turn message the orchestrator writes into the lead's
+    /// input pipe on spawn. NOT a system prompt — the `__lead.md`
+    /// system prompt is unchanged across all workflows. CLAUDE.md §三
+    /// 红线: "永不向 session 注入 system prompt".
+    pub lead_seed: String,
+    /// `CLAUDE_CODE_TEAMMATE_MODE` env value passed to the lead.
+    /// `in-process` (default, Anthropic native) / `tmux` (each
+    /// teammate in its own tmux pane) / `auto` (lead decides).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub teammate_mode: Option<String>,
+    /// What to do when the user runs `ccteam stop <slug>`. MVP
+    /// only supports `force-kill` (SIGKILL the lead). F97 will add
+    /// `ask-lead` / `leave-running`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_on_stop: Option<String>,
+    /// V0.5.0 F93 stickiness — workflow.yaml is parsed once at spawn;
+    /// the resolved spec is frozen to this snapshot path so mid-flight
+    /// edits to workflow.yaml don't affect the running team. Default
+    /// `.ccteam/team-snapshot.json` relative to project root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_path: Option<PathBuf>,
+    /// Optional declarative teammate list. Empty / omitted = lead
+    /// decides composition entirely from `lead_seed`. Present = lead
+    /// follows the list (with minor adjustments allowed). See PRD
+    /// "Definition-backed vs Ad-hoc 决策树".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suggested_teammates: Vec<SuggestedTeammate>,
+    /// Default `false` — Plan-first Protocol gates spawn on user
+    /// approval. `true` = lead self-decides composition from
+    /// `lead_seed` and spawns immediately (writes an audit log to
+    /// `.ccteam/outbox/team-bootstrap-<ts>.md`).
+    ///
+    /// V0.5.0 F93b 红线: explicit `true` only; the field cannot be
+    /// silently omitted to enable autonomous spawn.
+    #[serde(default)]
+    pub auto_spawn_teammates: bool,
+}
+
+/// V0.5.0 F93b — one entry under `agent_team.suggested_teammates`.
+/// Read by `__lead` at startup; either a definition-backed role
+/// (file at `.claude/agents/<role>.md`) or an ad-hoc role (entire
+/// prompt inlined in `spawn_brief`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SuggestedTeammate {
+    /// Role name (Anthropic teammate `name` field). For
+    /// `kind: definition`, must match the `.claude/agents/<role>.md`
+    /// filename basename.
+    pub role: String,
+    /// Whether the teammate is backed by a `.claude/agents/<role>.md`
+    /// definition or is ad-hoc (prompt inlined here).
+    pub kind: SuggestedTeammateKind,
+    /// Task-specific brief the lead appends to the teammate's prompt
+    /// at `Task` invocation time. For `kind: definition`, this is
+    /// merely the per-spawn brief (Claude already appends the .md body).
+    /// For `kind: ad-hoc`, this is the entire teammate prompt
+    /// (after the Worker Preamble inlined by the lead).
+    pub spawn_brief: String,
+    /// ad-hoc only — model id (e.g. `sonnet`, `opus`, `haiku`).
+    /// Required when `kind: ad-hoc`; ignored when `kind: definition`
+    /// (the .md frontmatter `model` field wins).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adhoc_model: Option<String>,
+    /// ad-hoc only — UI accent color shown on the web Topology panel.
+    /// Optional even for ad-hoc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adhoc_color: Option<String>,
+    /// ad-hoc only — tool list passed to `Task` (overrides lead's
+    /// permission inheritance). Omitted = inherit lead's permissions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adhoc_tools: Option<Vec<String>>,
+}
+
+/// V0.5.0 F93b — `SuggestedTeammate::kind` discriminator.
+///
+/// `definition`: `.claude/agents/<role>.md` exists; the lead uses
+/// `Task(subagent_type: "<role>", ...)` and Claude auto-appends the
+/// .md body to the teammate's system prompt.
+///
+/// `ad-hoc`: no .md file; the lead inlines the entire teammate prompt
+/// (Worker Preamble + `spawn_brief`) and calls
+/// `Task(subagent_type: "general-purpose", model: "<adhoc_model>", ...)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SuggestedTeammateKind {
+    /// `.claude/agents/<role>.md` exists.
+    Definition,
+    /// No .md file; prompt inlined in `spawn_brief`.
+    AdHoc,
 }
 
 /// Per-agent role configuration.
@@ -296,12 +464,57 @@ impl WorkflowSpec {
     ///    valid `.claude/agents/<role>.md` filename).
     /// 4. `parallelism > 1` only allowed with `Trigger::Watch`;
     ///    `schedule` / `gate` / `manual` are single-instance.
-    /// 5. `agents` map must be non-empty.
+    /// 5. `agents` map must be non-empty (artifact-driven only).
+    /// 6. V0.5.0 F93b — `mode: agent-team` requires `agent_team` block;
+    ///    `agent-team.team_name` + `lead_seed` non-empty. `agents` may
+    ///    be empty in this mode (the lead drives spawn at runtime).
     pub fn validate(&self) -> Result<(), WorkflowError> {
-        if self.agents.is_empty() {
-            return Err(WorkflowError::ValidationFailed(
-                "workflow must declare at least one agent".to_string(),
-            ));
+        match self.mode {
+            WorkflowMode::ArtifactDriven => {
+                if self.agents.is_empty() {
+                    return Err(WorkflowError::ValidationFailed(
+                        "workflow must declare at least one agent".to_string(),
+                    ));
+                }
+                if self.agent_team.is_some() {
+                    return Err(WorkflowError::ValidationFailed(
+                        "agent_team block is only valid when mode: agent-team".to_string(),
+                    ));
+                }
+            }
+            WorkflowMode::AgentTeam => {
+                let team = self.agent_team.as_ref().ok_or_else(|| {
+                    WorkflowError::ValidationFailed(
+                        "mode: agent-team requires an `agent_team` block".to_string(),
+                    )
+                })?;
+                if team.team_name.trim().is_empty() {
+                    return Err(WorkflowError::ValidationFailed(
+                        "agent_team.team_name must be non-empty".to_string(),
+                    ));
+                }
+                validate_role_name(&team.team_name).map_err(|_| {
+                    WorkflowError::ValidationFailed(format!(
+                        "agent_team.team_name `{name}`: only [a-z0-9_-] allowed (must map to \
+                         ~/.claude/teams/<team_name>/ dir)",
+                        name = team.team_name,
+                    ))
+                })?;
+                if team.lead_seed.trim().is_empty() {
+                    return Err(WorkflowError::ValidationFailed(
+                        "agent_team.lead_seed must be a non-empty user-turn message".to_string(),
+                    ));
+                }
+                for t in &team.suggested_teammates {
+                    validate_role_name(&t.role)?;
+                    if matches!(t.kind, SuggestedTeammateKind::AdHoc) && t.adhoc_model.is_none() {
+                        return Err(WorkflowError::ValidationFailed(format!(
+                            "suggested_teammate `{role}`: kind: ad-hoc requires adhoc_model",
+                            role = t.role,
+                        )));
+                    }
+                }
+            }
         }
         for (role, spec) in &self.agents {
             validate_role_name(role)?;
@@ -389,8 +602,10 @@ mod tests {
         let spec = WorkflowSpec {
             name: "x".into(),
             description: None,
+            mode: WorkflowMode::ArtifactDriven,
             enabled: true,
             budget: None,
+            agent_team: None,
             agents: {
                 let mut m = IndexMap::new();
                 m.insert(

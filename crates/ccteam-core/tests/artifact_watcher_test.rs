@@ -56,8 +56,10 @@ fn build_spec(name: &str, watchers: &[(&str, PathBuf)]) -> WorkflowSpec {
     WorkflowSpec {
         name: name.to_string(),
         description: None,
+        mode: ccteam_core::WorkflowMode::default(),
         enabled: true,
         budget: None,
+        agent_team: None,
         agents,
     }
 }

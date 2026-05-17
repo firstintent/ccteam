@@ -26,6 +26,15 @@ use serde_json::Value;
 /// (which Claude Code inherits and may not include the ccteam install dir).
 pub const PROJECT_SETTINGS_JSON: &str = include_str!("templates/settings.json");
 
+/// V0.5.0 F93b + F94 — per-project `.claude/settings.json` template for
+/// `mode: agent-team` workflows. Same shape as
+/// [`PROJECT_SETTINGS_JSON`] (`__CCTEAM_BIN__` placeholder) plus three
+/// new hook entries: `TeammateIdle`, `TaskCreated`, `TaskCompleted`.
+/// Used only by `ccteam init --mode agent-team` (per PRD F94 红线:
+/// advanced path only).
+pub const PROJECT_SETTINGS_AGENT_TEAM_JSON: &str =
+    include_str!("templates/settings.agent-team.json");
+
 /// M2.4: helper templates that user-authored agent / workflow markdown
 /// can `@`-reference. Shipped inside the binary so a fresh install (or
 /// `ccteam doctor`) can stamp them into `~/.ccteam/templates/` without
@@ -83,6 +92,35 @@ pub fn render_project_settings(
     extra_env: &SettingsEnv,
     enabled: &EnabledPluginsSetting,
 ) -> Result<String> {
+    render_settings_template(PROJECT_SETTINGS_JSON, ccteam_bin, extra_env, enabled)
+}
+
+/// V0.5.0 F93b + F94 — same as [`render_project_settings`] but
+/// renders the agent-team template (with `TeammateIdle` /
+/// `TaskCreated` / `TaskCompleted` hooks). Used by
+/// `ccteam init --mode agent-team`.
+pub fn render_project_settings_agent_team(
+    ccteam_bin: &Path,
+    extra_env: &SettingsEnv,
+    enabled: &EnabledPluginsSetting,
+) -> Result<String> {
+    render_settings_template(
+        PROJECT_SETTINGS_AGENT_TEAM_JSON,
+        ccteam_bin,
+        extra_env,
+        enabled,
+    )
+}
+
+/// Shared implementation for [`render_project_settings`] +
+/// [`render_project_settings_agent_team`]. Takes the raw template
+/// `&str` so callers pick which placeholder text to substitute into.
+fn render_settings_template(
+    template: &str,
+    ccteam_bin: &Path,
+    extra_env: &SettingsEnv,
+    enabled: &EnabledPluginsSetting,
+) -> Result<String> {
     let bin = ccteam_bin.to_str().ok_or_else(|| {
         anyhow!(
             "ccteam binary path not valid UTF-8: {}",
@@ -94,7 +132,7 @@ pub fn render_project_settings(
             "ccteam binary path contains characters that can't be embedded in settings.json: {bin}"
         ));
     }
-    let body = PROJECT_SETTINGS_JSON.replace("__CCTEAM_BIN__", bin);
+    let body = template.replace("__CCTEAM_BIN__", bin);
     let mut v: Value = serde_json::from_str(&body)
         .with_context(|| format!("rendered settings.json is not valid JSON (bin={bin})"))?;
     if let Some(env) = v.get_mut("env").and_then(|e| e.as_object_mut()) {
@@ -125,6 +163,33 @@ pub fn render_project_settings(
 /// re-running after a ccteam upgrade refreshes paths and the
 /// plugin set.
 pub fn write_project_settings(project_dir: &Path, enabled: &EnabledPluginsSetting) -> Result<()> {
+    write_settings_template(project_dir, enabled, ProjectSettingsKind::ArtifactDriven)
+}
+
+/// V0.5.0 F93b + F94 — same as [`write_project_settings`] but writes
+/// the agent-team variant of the settings template (with
+/// `TeammateIdle` / `TaskCreated` / `TaskCompleted` hooks per F94).
+/// Used by `ccteam init --mode agent-team`. Idempotent.
+pub fn write_project_settings_agent_team(
+    project_dir: &Path,
+    enabled: &EnabledPluginsSetting,
+) -> Result<()> {
+    write_settings_template(project_dir, enabled, ProjectSettingsKind::AgentTeam)
+}
+
+/// V0.5.0 F93b — discriminator for [`write_project_settings`] +
+/// [`write_project_settings_agent_team`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectSettingsKind {
+    ArtifactDriven,
+    AgentTeam,
+}
+
+fn write_settings_template(
+    project_dir: &Path,
+    enabled: &EnabledPluginsSetting,
+    kind: ProjectSettingsKind,
+) -> Result<()> {
     let dir = project_dir.join(".claude");
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let path = dir.join("settings.json");
@@ -133,7 +198,12 @@ pub fn write_project_settings(project_dir: &Path, enabled: &EnabledPluginsSettin
         ccteam_home: std::env::var("CCTEAM_HOME").ok(),
         ccteam_projects_root: std::env::var("CCTEAM_PROJECTS_ROOT").ok(),
     };
-    let body = render_project_settings(&bin, &extra, enabled)?;
+    let body = match kind {
+        ProjectSettingsKind::ArtifactDriven => render_project_settings(&bin, &extra, enabled)?,
+        ProjectSettingsKind::AgentTeam => {
+            render_project_settings_agent_team(&bin, &extra, enabled)?
+        }
+    };
     std::fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }

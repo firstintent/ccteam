@@ -77,8 +77,10 @@ fn manual_spec_with_budget(role: &str, budget: Option<BudgetSpec>) -> WorkflowSp
     WorkflowSpec {
         name: "test-budget".into(),
         description: None,
+        mode: ccteam_core::WorkflowMode::default(),
         enabled: true,
         budget,
+        agent_team: None,
         agents,
     }
 }

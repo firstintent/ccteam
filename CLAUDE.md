@@ -10,12 +10,12 @@
 | 项 | 值 |
 |---|---|
 | 主分支 main HEAD | 以 `git rev-parse origin/main` 为准 |
-| Workspace version | **`0.4.6`** |
-| 测试 baseline | **`750/1`**(`cargo test --workspace --locked`,1 fail 是 ccteam-web `workflow_summary_reflects_agent_spawn_and_done_events` running_count flake)|
-| Clippy | 0 errors + ~20 warnings(pre-existing doc-list drift)|
+| Workspace version | **`0.4.6`**(V0.5.0 in flight — 不 bump 到 ship)|
+| 测试 baseline | **`936/1`**(`cargo test --workspace --locked --no-fail-fast`,1 fail 是 ccteam-web `workflow_summary_reflects_agent_spawn_and_done_events` running_count flake)|
+| Clippy | 0 errors + 18 warnings(pre-existing doc-list drift)|
 | 代码规模 | ~17 kLOC Rust + ~14 kLOC TypeScript |
 | 当前最新版 | V0.4.6 (F81-F91) — 详 `docs/v0-4-6/README.md` |
-| V0.5.0 立项 | F92-F96 真 cost 数据源(linkScanPath jsonl)+ Agent Teams 集成(`mode: agent-team` workflow + `__lead` role + 3 hook 镜像 + 3 web 面板)— doc-first 阶段,详 `docs/v0-5-0/README.md` |
+| V0.5.0 进行中 | F92 ✓ / F93a ✓ / F95 ✓ / F96 ✓(Wave 1 ship 后);F93b + F94 ✓(Wave 2);F100 + F101 待 Wave 3 — 详 `docs/v0-5-0/README.md` |
 | V0.5.x 延期候选 | F97 lifecycle 完善;F98 plan-approval↔outbox 联动;F99 Claude Code 版本 gating;Routing/Evaluator-Optimizer sugar — 详 `docs/v0-5-0/prd.md` 末段 + `docs/orchestration-patterns.md §五` |
 | 历史版本 | V0.1 → V0.4.5 见各自 `docs/v0-X-Y/README.md` |
 

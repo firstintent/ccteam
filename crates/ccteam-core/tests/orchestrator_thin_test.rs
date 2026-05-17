@@ -161,8 +161,10 @@ fn watch_spec(role: &str, watch_rel: &str, parallelism: Option<u32>) -> Workflow
     WorkflowSpec {
         name: "test-workflow".into(),
         description: None,
+        mode: ccteam_core::WorkflowMode::default(),
         enabled: true,
         budget: None,
+        agent_team: None,
         agents,
     }
 }
@@ -185,8 +187,10 @@ fn manual_spec(role: &str) -> WorkflowSpec {
     WorkflowSpec {
         name: "test-manual-workflow".into(),
         description: None,
+        mode: ccteam_core::WorkflowMode::default(),
         enabled: true,
         budget: None,
+        agent_team: None,
         agents,
     }
 }
@@ -209,8 +213,10 @@ fn gate_spec(role: &str, input_rel: &str) -> WorkflowSpec {
     WorkflowSpec {
         name: "test-gate-workflow".into(),
         description: None,
+        mode: ccteam_core::WorkflowMode::default(),
         enabled: true,
         budget: None,
+        agent_team: None,
         agents,
     }
 }
@@ -782,8 +788,10 @@ agents:
     let spec = WorkflowSpec {
         name: "multi".into(),
         description: None,
+        mode: ccteam_core::WorkflowMode::default(),
         enabled: true,
         budget: None,
+        agent_team: None,
         agents,
     };
     let progress = orch.paths().progress_jsonl(&slug);
@@ -1339,8 +1347,10 @@ async fn t31_inbox_target_role_routes_explicitly() {
     let spec = WorkflowSpec {
         name: "dual".into(),
         description: None,
+        mode: ccteam_core::WorkflowMode::default(),
         enabled: true,
         budget: None,
+        agent_team: None,
         agents,
     };
     let progress = orch.paths().progress_jsonl(&slug);

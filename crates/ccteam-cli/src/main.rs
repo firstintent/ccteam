@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use ccteam_core::{CcteamPaths, Orchestrator, OrchestratorConfig};
-use commands::{InitOptions, OutputFormat};
+use commands::{InitMode, InitOptions, OutputFormat};
 
 #[derive(Parser)]
 #[command(
@@ -83,6 +83,12 @@ enum Command {
         /// would ask. Useful in scripts / CI.
         #[arg(short = 'y', long, default_value_t = false)]
         yes: bool,
+        /// V0.5.0 F93b: workflow mode for the scaffolded workflow.yaml.
+        /// `artifact-driven` (default) writes the V0.4.6 trigger-graph
+        /// template. `agent-team` writes the `workflow.agent-team.yaml`
+        /// template + `__lead.md` scaffold + `.ccteam/inbox/`.
+        #[arg(long, value_enum, default_value_t = InitMode::ArtifactDriven)]
+        mode: InitMode,
     },
     /// **DEPRECATED** in V0.4.6 (F89) — moved to `ccteam internal hook`.
     /// Old invocation path is preserved one release for back-compat;
@@ -101,7 +107,22 @@ enum Command {
     /// supported mode — `ccteam start` is enough; the `--foreground`
     /// flag is accepted for back-compat but no longer required.
     /// Pass `--no-web` to run orchestrator only.
+    ///
+    /// V0.5.0 F93b: when a positional `<slug>` is supplied AND that
+    /// project's workflow.yaml has `mode: agent-team`, `ccteam start`
+    /// switches into "spawn the lead session" flow:
+    ///   - prints a spawn preview (workflow.yaml summary + lead spec)
+    ///   - prompts `[Y/n/attach]` (TTY interactive)
+    ///   - on Y → spawn lead bg session + print attach hint
+    ///   - on attach → spawn + exec `claude attach <id>`
+    ///   - on n → cancel, no side effects
+    ///
+    /// Use `--no-confirm`/`-y` / `--attach` / `--dry-run` to skip the
+    /// prompt in scripted callers.
     Start {
+        /// V0.5.0 F93b: project slug to spawn an agent-team lead for.
+        /// Omit to run the daemon (V0.4.6 behavior).
+        slug: Option<String>,
         /// Back-compat no-op: foreground is the only mode.
         #[arg(long, default_value_t = false, hide = true)]
         foreground: bool,
@@ -150,6 +171,21 @@ enum Command {
         /// flag in CI / headless / unattended runs to skip the probe.
         #[arg(long, default_value_t = false)]
         no_clipboard: bool,
+        /// V0.5.0 F93b: when used with a positional `<slug>`, skip the
+        /// `[Y/n/attach]` confirmation prompt and proceed with the
+        /// default `Y` (spawn + print attach hint). Useful for CI /
+        /// scripts.
+        #[arg(short = 'y', long, default_value_t = false)]
+        no_confirm: bool,
+        /// V0.5.0 F93b: when used with a positional `<slug>`, skip the
+        /// prompt and go straight to the `attach` branch (spawn + exec
+        /// `claude attach <id>`).
+        #[arg(long, default_value_t = false)]
+        attach: bool,
+        /// V0.5.0 F93b: when used with a positional `<slug>`, print
+        /// the spawn preview + exit. Does not spawn anything.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
     },
     /// V0.4.2 F75: thin wrapper over `ccteam init --in
     /// <projects_root>/<slug>` for users who prefer the "create a
@@ -189,10 +225,14 @@ enum Command {
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
     },
-    /// **DEPRECATED** in V0.4.6 (F89) — moved to `ccteam internal attach`.
+    /// Attach to a project's session.
     ///
-    /// Attach to a project's tmux session (`tmux attach`).
-    #[command(hide = true)]
+    /// V0.5.0 F93b: when `<slug>` points at an agent-team mode project,
+    /// reads the lead session id from
+    /// `.ccteam/team-snapshot.json::lead_session_id` and execs
+    /// `claude attach <id>`. For artifact-driven projects, falls back
+    /// to tmux session attach (V0.3.x compat) or the latest
+    /// `claude --bg` job id (V0.4.0 default).
     Attach { slug: String },
     /// **DEPRECATED** in V0.4.6 (F89) — moved to `ccteam internal peek`.
     ///
@@ -673,6 +713,7 @@ fn main() -> Result<()> {
             reset_agents,
             interactive,
             yes,
+            mode,
         } => {
             let paths = CcteamPaths::from_env()?;
             let report = commands::run_init(
@@ -685,6 +726,7 @@ fn main() -> Result<()> {
                     reset_agents,
                     interactive,
                     yes,
+                    mode,
                 },
             )?;
             print!("{report}");
@@ -695,6 +737,7 @@ fn main() -> Result<()> {
             run_hook(cmd)
         }
         Command::Start {
+            slug,
             foreground: _,
             tick_seconds,
             skip_tool_check,
@@ -704,18 +747,42 @@ fn main() -> Result<()> {
             web_no_auth,
             web_token_file,
             no_clipboard,
-        } => run_start(
-            tick_seconds,
-            skip_tool_check,
-            claude_argv,
-            StartWebOpts {
-                disabled: no_web,
-                bind: web_bind,
-                no_auth: web_no_auth,
-                token_file: web_token_file,
-                no_clipboard,
-            },
-        ),
+            no_confirm,
+            attach,
+            dry_run,
+        } => match slug {
+            Some(s) => {
+                // V0.5.0 F93b: per-slug spawn flow. Reads workflow.yaml
+                // to decide; agent-team mode does the [Y/n/attach]
+                // spawn; artifact-driven mode bails with friendly hint.
+                let paths = CcteamPaths::from_env()?;
+                let body = commands::run_start_agent_team(
+                    &paths,
+                    &s,
+                    commands::StartAgentTeamOptions {
+                        no_confirm,
+                        attach,
+                        dry_run,
+                    },
+                )?;
+                if dry_run {
+                    print!("{body}");
+                }
+                Ok(())
+            }
+            None => run_start(
+                tick_seconds,
+                skip_tool_check,
+                claude_argv,
+                StartWebOpts {
+                    disabled: no_web,
+                    bind: web_bind,
+                    no_auth: web_no_auth,
+                    token_file: web_token_file,
+                    no_clipboard,
+                },
+            ),
+        },
         Command::New { slug, team } => run_new(slug, team),
         Command::Ls { format } => run_ls(format),
         Command::Status { tail } => run_status(tail),
@@ -723,10 +790,7 @@ fn main() -> Result<()> {
             Some(s) => run_show(&s, format),
             None => show_slug_picker(),
         },
-        Command::Attach { slug } => {
-            warn_deprecated_top_level("attach", "internal attach");
-            run_attach(&slug)
-        }
+        Command::Attach { slug } => run_attach(&slug),
         Command::Peek { slug } => {
             warn_deprecated_top_level("peek", "internal peek");
             run_peek(&slug)
