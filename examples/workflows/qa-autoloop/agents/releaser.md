@@ -27,7 +27,7 @@ color: red
 - 监听:`.ccteam/triggers/releaser/`(fixer drop marker)
 - 写入:`.ccteam/prs/`(status / merged_at / accepted 更新)
 - 写入:`.ccteam/issues/`(closed_at / 重新 open 等)
-- 写入:`.ccteam/backlog/`(failed → pending 重置)
+- 写入:`.ccteam/backlog/`(failed/tested-with-failure → pending 重置;沿 extends 链 skipped → pending)
 - 写入:`.ccteam/acceptance/`(验收 run 记录)
 - 写入:`.ccteam/triggers/tester/<ts>.json`(marker,唤醒 tester 复验 reset 后的 backlog)
 - 写入:`.ccteam/triggers/fixer/<id>.json`(marker,唤醒 fixer 复修 acceptance 失败的 issue)
@@ -253,6 +253,24 @@ for IID in $ISSUE_IDS; do
       echo "backlog ${SCENARIO} reset → pending(重新验证)"
       RESET_SCENARIOS="${RESET_SCENARIOS} ${SCENARIO}"
     fi
+    # 沿 extends 链解禁 skipped 子场景:它们的 SKIP 理由通常是
+    # "fix not yet on dev",fix 已部署 → 必须让 tester 复验,否则永远不会再被选中。
+    # extends 字段是逗号分隔字符串(如 "E1528,E1496,E1506")。
+    for BF in .ccteam/backlog/*.json; do
+      [ -e "$BF" ] || continue
+      CHILD_STATUS=$(jq -r '.status' "$BF")
+      [ "$CHILD_STATUS" = "skipped" ] || continue
+      CHILD_EXTENDS=$(jq -r '.extends // ""' "$BF" | tr -d ' ')
+      case ",${CHILD_EXTENDS}," in
+        *",${SCENARIO},"*)
+          CHILD_ID=$(jq -r '.id' "$BF")
+          jq '.status = "pending" | .last_run = null | .result_summary = "Reset by releaser (parent '"${SCENARIO}"' fix deployed)"' \
+            "$BF" > .tmp.json && mv .tmp.json "$BF"
+          echo "  backlog ${CHILD_ID}(extends ${SCENARIO})reset → pending"
+          RESET_SCENARIOS="${RESET_SCENARIOS} ${CHILD_ID}"
+          ;;
+      esac
+    done
   fi
 done
 
