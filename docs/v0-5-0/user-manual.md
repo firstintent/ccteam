@@ -98,7 +98,9 @@ $ ccteam start my-debate
   ✓ Suggested teammates: 3 definition + 2 ad-hoc
 
   About to spawn lead session:
-    claude --bg --agent __lead --env CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1
+    env CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 \
+        CLAUDE_CODE_TEAMMATE_MODE=in-process \
+      claude --bg --agent __lead --dangerously-skip-permissions <lead_seed>
 
   Proceed? [Y/n/attach]
 ```

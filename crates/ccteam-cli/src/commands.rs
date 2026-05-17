@@ -804,10 +804,8 @@ pub fn run_start_agent_team(
         "  ✓ Suggested teammates: {def_count} definition + {adhoc_count} ad-hoc\n",
     ));
     preview.push_str("\n  About to spawn lead session:\n");
-    preview.push_str("    claude --bg --agent __lead \\\n");
-    preview.push_str("      --env CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 \\\n");
     preview.push_str(&format!(
-        "      --env CLAUDE_CODE_TEAMMATE_MODE={teammate_mode}\n",
+        "    env CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 \\\n        CLAUDE_CODE_TEAMMATE_MODE={teammate_mode} \\\n      claude --bg --agent __lead --dangerously-skip-permissions <lead_seed>\n",
     ));
     // Truncate the lead_seed preview to 200 chars for the console.
     let seed_preview: String = team_spec
@@ -931,17 +929,19 @@ fn resolve_start_choice(opts: &StartAgentTeamOptions) -> Result<StartChoice> {
 /// The exact argv form is:
 ///
 /// ```text
-/// claude --bg --agent __lead --dangerously-skip-permissions \
-///        --env CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 \
-///        --env CLAUDE_CODE_TEAMMATE_MODE=<mode> \
-///        "<lead_seed body>"
+/// env CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 \
+///     CLAUDE_CODE_TEAMMATE_MODE=<mode> \
+///   claude --bg --agent __lead --dangerously-skip-permissions \
+///     "<lead_seed body>"
 /// ```
 ///
 /// `lead_seed` is passed as the positional user-turn message (NOT as a
 /// system prompt — CLAUDE.md §三 红线). The harness's
 /// `--dangerously-skip-permissions` is set per the existing
-/// [`ClaudeCodeAdapter`] pattern; team-mode env vars are passed via
-/// `--env` flags so they reach the spawned bg job process.
+/// [`ClaudeCodeAdapter`] pattern. Team-mode env vars are set on the
+/// spawned process via `Command::env()` — V0.5.0 F93b initially used
+/// `--env KEY=VAL` argv flags but Claude Code's CLI does not accept
+/// those, causing the spawn to exit-1 before init (host probe 2026-05-18).
 ///
 /// Returns the `daemonShort` job id from `claude --bg`'s stdout
 /// (first line `backgrounded · <id>`). Writes
@@ -963,12 +963,10 @@ fn spawn_agent_team_lead(
         .arg("--agent")
         .arg("__lead")
         .arg("--dangerously-skip-permissions")
-        .arg("--env")
-        .arg("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1")
-        .arg("--env")
-        .arg(format!("CLAUDE_CODE_TEAMMATE_MODE={teammate_mode}"))
         .arg(&team_spec.lead_seed);
-    cmd.current_dir(&project_dir);
+    cmd.env("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1")
+        .env("CLAUDE_CODE_TEAMMATE_MODE", teammate_mode)
+        .current_dir(&project_dir);
     let output = cmd
         .output()
         .with_context(|| format!("invoke `{bin} --bg --agent __lead`"))?;

@@ -355,9 +355,9 @@ $ ccteam start flaky-test-debate
   ✓ Suggested teammates: 3 definition + 2 ad-hoc
 
   About to spawn lead session:
-    claude --bg --agent __lead \
-      --env CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 \
-      --env CLAUDE_CODE_TEAMMATE_MODE=in-process
+    env CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 \
+        CLAUDE_CODE_TEAMMATE_MODE=in-process \
+      claude --bg --agent __lead --dangerously-skip-permissions <lead_seed>
     Initial user-turn (lead_seed):
       "<truncated to 200 char>"
 
@@ -386,7 +386,7 @@ CLI flags 跳过确认(脚本化):
 
 Orchestrator 内部:
 - 解析 `mode: agent-team` → 跳过 ArtifactWatcher 安装,改装"lead 单 session 看护"
-- spawn lead:`claude --bg --agent __lead --env CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 --env CLAUDE_CODE_TEAMMATE_MODE=<mode>` + 把 `lead_seed` 作为初始 user-turn message 写 lead 的 `~/.claude/jobs/<id>/inputs/`(或 stdin pipe)
+- spawn lead:`env CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 CLAUDE_CODE_TEAMMATE_MODE=<mode> claude --bg --agent __lead --dangerously-skip-permissions <lead_seed>`(env 通过 Rust `Command::env()` 设到进程,**不是** `--env` argv flag —— `claude` CLI 不支持那个语法)
 - lead 启动后 plan-first protocol 默认开 — lead 输出 plan 后**停**等用户回复
 - lead 自己 spawn teammate(plan 批准后);ccteam 不干预 teammate 拓扑
 - lead 退出(状态 done / failed)→ workflow_done event reason="lead_exited"
