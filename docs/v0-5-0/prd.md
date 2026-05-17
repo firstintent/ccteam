@@ -34,17 +34,143 @@ ccteam `cost_summary`(`crates/ccteam-core/src/cost_summary.rs`)目前读 state.j
 
 ---
 
-## F93 — workflow.yaml `mode: agent-team` schema + `__lead` role 工厂
+## F93a — `/ccteam:team` skill(**Primary path**,95% 用户)
+
+### 用户场景
+
+```
+$ cd ~/projects/blog
+$ claude
+> /ccteam:team "build a Next.js blog with researcher / frontend-dev / reviewer roles"
+```
+
+Claude session 当前 turn 直接变成 lead,native TeamCreate + Task spawn,**不切 session、不出 terminal**。
 
 ### 痛点
-官方 Agent Teams 起团队靠用户每次手敲自然语言:
+
+用户日常习惯是 `cd project → claude → 输入 prompt`。原 V0.5.0 PRD F93 设计要求 `ccteam init --mode agent-team` + 编辑 workflow.yaml + `ccteam start <slug>` 起 bg lead session,**违背习惯太大**。OMC `/oh-my-claudecode:team N:role "task"` 才是对的模板 — 在用户现有 session 里跑,无新流程负担。
+
+### 需求
+
+新建 `skills/ccteam-team/SKILL.md`(repo 根 `skills/`,沿用 V0.4.6 `ccteam-control` / `ccteam-creator` 4 个 skill 的 pattern),通过 `ccteam doctor --install-skill` 装到 `~/.claude/agents/` 或 plugin marketplace(具体路径 dev-plan 定),用户在任何 Claude session 里 `/ccteam:team <args>` 调用。
+
+#### Skill 入口语法
+
 ```
-"I'm designing a CLI tool... Create an agent team to explore this from
-different angles: one teammate on UX, one on technical architecture,
-one playing devil's advocate."
+/ccteam:team <task>                              # 自动决定 N + 角色
+/ccteam:team N "<task>"                          # 指定 N 个 teammate
+/ccteam:team N:role "<task>"                     # 指定 N 个 + 主角色
+/ccteam:team auto "<task>"                       # auto 别名(同第一个)
 ```
 
-每次重起会话都要重打;无版本控制;teammate 拓扑漂移;无法在多项目间复用模板。**且**关闭终端后没有长跑可视化,history 滚走就找不回(F96 MVP 已解后半句)。
+例:
+- `/ccteam:team "fix all TS errors across the project"` → 自动选 N + executor
+- `/ccteam:team 3:debugger "fix build errors in src/"` → 3 个 debugger 并行
+- `/ccteam:team 5 "refactor auth with security review + tests"` → 5 个 mixed role
+
+#### Skill body 核心内容(SKILL.md 200-300 行)
+
+1. **Parse args** — 解析 N / role / task
+2. **Quick context analysis**(可选) — Explore agent 扫 README / 项目根,产出 1-2 段 context
+3. **Output TEAM PLAN** — 严格 plan-first protocol:
+   ```
+   TEAM PLAN
+   =========
+   Team name: <derived-slug>(从 task 推导,如 "fix-ts-errors")
+   Proposed teammates:
+     1. <name>(kind=ad-hoc, model=sonnet, color=blue)— <one-line brief>
+     2. ...
+   Spawn order: parallel | sequential
+   Rationale: <为什么这些 role,这种组合>
+
+   Reply 'go' / 'yes' / 'approve' to spawn, or free text to revise.
+   ```
+   **STOP — 不调 Task,等用户回复**(对齐 Anthropic plan-approval 文化)。
+4. **On user 'go'**:
+   - native `TeamCreate({team_name, description})` — 当前 session 升级成 lead
+   - 每个 teammate:`Task({subagent_type, team_name, name, prompt})` parallel spawn
+   - **definition-backed**:`subagent_type: <role>`,prompt = spawn_brief(Claude 自动 append .md body)
+   - **ad-hoc**:`subagent_type: "general-purpose"` + 完整 inline prompt(Worker Preamble + spawn_brief)
+5. **Worker Preamble**(每个 teammate prompt 头注入,~30 行,中文化 OMC pattern):
+   ```
+   你是 team "<team_name>" 的 worker,名字 "<worker_name>"。你向 team-lead 汇报。
+
+   == 工作协议 ==
+   1. CLAIM:用 TaskList 看 owner==你的 pending task,TaskUpdate 标 in_progress
+   2. WORK:用你的工具 (Read/Write/Edit/Bash) 执行,**绝不 spawn sub-agent**
+   3. COMPLETE:TaskUpdate status=completed
+   4. REPORT:SendMessage to team-lead "完成 #ID: <一句话总结>"
+   5. NEXT:回 step 1,无更多任务则发 idle_notification
+
+   == 红线 ==
+   - 不 spawn sub-agent / 不调 Task tool 起子任务
+   - 不跑 team orchestration 命令(`$team` / `$autopilot` / `omc team` 等)
+   - 所有进度走 SendMessage 给 team-lead,不要默默工作
+   - 用绝对路径
+
+   == 错误处理(3-strike)==
+   第 1 次失败 → 读错误,定位根因
+   第 2 次同错 → 换方案
+   第 3 次 → SendMessage to team-lead 上报
+   ```
+6. **Monitor loop** — Claude lead 监听 SendMessage 自动 deliver + 定期 TaskList,协调 / 重分配 / 处理 idle
+7. **Completion** — 全 task done → SendMessage shutdown_request → 等 shutdown_response → TeamDelete
+
+ccteam **不在 skill 里**写 OMC 的 5-stage 强 pipeline(`team-plan → team-prd → exec → verify → fix`)。skill 鼓励 shape-agnostic — pipeline / debate / parallel review / vote 都行,lead 自决。
+
+#### Skill 不做什么(刻意省略)
+
+- **不写 workflow.yaml** — primary path 不需要 ccteam project 概念,用户在 git repo 起 team 就行,无注册步骤
+- **不写 `.ccteam/team-snapshot.json`** — Anthropic 的 `~/.claude/teams/<>/config.json` 是 SoT
+- **不装 hook** — F94 hook 只 advanced path 装;skill path 走 F95 watcher 拿事件
+- **不开 bg lead** — current session IS the lead(用户关 session 团队就停,跟 Anthropic / OMC native 行为一致)
+- **不管 cost cap** — Anthropic 自己有 usage limit;F84 budget cap 只 advanced path 用
+
+#### ccteam daemon + web 怎么配合
+
+Skill path 跟 ccteam daemon **完全解耦** — daemon 不知道 user 起了什么 team,纯靠 F95 全局 watcher 发现 `~/.claude/teams/<new-team>/` 出现 → 立刻加 watch + emit `team_member_joined` → F96 web `/teams` tab 刷出新卡片。
+
+用户**只需要**在某个时刻跑过一次 `ccteam start`(启 daemon)+ `ccteam doctor --install-skill`(装 skill);后续每次 `/ccteam:team` 都自动落到 web。
+
+### 验收(F93a)
+
+1. `ccteam doctor --install-skill` 后,任意 Claude session 输入 `/ccteam:team --help` 出 skill 说明
+2. `/ccteam:team "test task"` 在普通 git repo 项目(无 ccteam 注册)能起 team — 不依赖任何 ccteam config
+3. Plan-first:Claude 第一 message 是 `TEAM PLAN ===` 格式,不立刻 Task spawn(实测看 transcript)
+4. `go` 回复后:native TeamCreate 调用,`~/.claude/teams/<derived-slug>/config.json` 5s 内出现
+5. 每个 teammate prompt 含 Worker Preamble 30 行(verify `~/.claude/teams/<>/config.json::members[i].prompt`)
+6. daemon 跑着 → web `/teams` 5s 内出现该 team 卡片(F95 全局 watcher 发现)
+7. Skill 不写任何 ccteam-managed 文件 — 不动 `.ccteam/`,不动 `~/.ccteam/config.yaml`
+8. `/ccteam:team 3:debugger "fix TS errors"` 形式 → Claude 解析 N=3 + role=debugger,plan 含 3 个 debugger teammate
+
+### 红线(F93a)
+
+- **不强制 ccteam project 注册** — Primary path **零 ccteam workflow.yaml 依赖**;skill 在任何 git repo / 任何路径下都跑得起来
+- **不修改用户 Claude session 行为** — skill 只是 "supplemental instructions" 注入 current turn;detach skill 后 session 回到正常 chat
+- **Plan-first 不可绕过** — skill body 强制写明"必须先输出 TEAM PLAN 然后 STOP";如发现 Claude 跳过此步直接 Task spawn,改 skill body 加更强约束
+
+---
+
+## F93b — workflow.yaml `mode: agent-team` schema + `__lead` role 工厂(**Advanced path**,automation)
+
+### 适用场景
+
+**用户长时间不在,机器自跑 N 天**(对应 `requirements.md §14` V1.0.0 token-maxxing 终极目标的 building block)。例:
+- 每日 0 点起一个 "fix-yesterday-CI-failures" team,跑完写 report,team 自杀
+- 长跑 24h debate team 对一个复杂决策做并行 hypothesis investigation
+- `requirements.md` 痛点 14 的"开发团队 24×7 自助运行大型软件"
+
+**普通用户**(habit-aligned 95%)**不需要**走这条 path,用 F93a skill 即可。
+
+### 痛点
+
+Primary path 的 limitation:
+- Session 关掉就停(Anthropic native 限制)
+- 没有 declarative 模板复用 — 每次 task 都得想 `/ccteam:team` 怎么写
+- 没有 budget cap(F84 不适用)
+- 没有 hot-reload(改团队组成要新起 session)
+
+Advanced path 在这些维度补全。
 
 ### 设计原则:Anthropic 是 SoT,ccteam 读不写
 
@@ -333,7 +459,9 @@ F95 watcher 能拿到 4 类 event(member_joined/left, message_sent, task_created
 且 hook 比 watcher 快 — task created/completed 通过 hook 是 0-延迟,通过 watcher 要等 inotify event(通常 <100ms 但偶有 lag)。
 
 ### 需求
-`crates/ccteam-core/src/templates/settings.json` 加 3 hook,**仅 ccteam-spawned `__lead` session 的项目装**(F93 工厂条件渲染);interactive team(用户自起)没装 hook,ccteam 自动走 F95 watcher fallback,功能 degrade 但不挂。
+`crates/ccteam-core/src/templates/settings.json` 加 3 hook,**仅 F93b advanced path 装**(`ccteam init --mode agent-team` 工厂条件渲染);F93a skill path(用户在 session 里跑 `/ccteam:team`)**不装 hook** — 走 F95 全局 watcher fallback。
+
+为什么不装 skill path 的 hook:F93a skill 不写任何 settings.json,这是 primary path 红线("不修改用户 Claude session 行为")。idle event watcher 拿不到 → web Topology 节点徽章降级到"working/idle 二元状态 + 30s 无消息推断 idle"。可接受。
 
 ```json
 "TeammateIdle": [
@@ -361,10 +489,10 @@ F95 watcher 能拿到 4 类 event(member_joined/left, message_sent, task_created
 `ccteam-core/src/orchestrator.rs::Event` enum 加 6 变体(`#[serde(rename = "team_*")]`)。
 
 ### 验收
-1. ccteam-managed agent-team workflow(F93 spawn 出的 __lead session)→ `.claude/settings.json` 含 3 个新 hook
-2. interactive team(用户自起,F93 不参与)→ `.claude/settings.json` 不含新 hook;F95 watcher 仍能拿 5 类 event
+1. F93b advanced path 起的 ccteam-managed team(`ccteam init --mode agent-team`)→ `.claude/settings.json` 含 3 个新 hook
+2. F93a primary skill path 起的 team(`/ccteam:team`)→ user's project `.claude/settings.json` **不**含新 hook;F95 全局 watcher 仍能拿 5 类 event
 3. lead `TaskCreate` → `progress.jsonl` 出现 `team_task_created` 一行,延迟 <50ms(对比 watcher ~100-200ms)
-4. teammate `TeammateIdle` → `team_teammate_idle` event 出现;F95 watcher 不会重复 emit(去重 by event_id + ts)
+4. teammate `TeammateIdle` → `team_teammate_idle` event 出现(仅 F93b path);F95 watcher 不会重复 emit(去重 by event_id + ts)
 5. hook 失败(测试时 deliberately 杀 hook process)→ F95 watcher fallback 接管 `team_task_created` / `team_task_completed`(idle 没 fallback,degrade)
 6. 6 个 event 全在 `interfaces.md §6.4` event 表更新
 7. 老 7 event(F60+)不破:agent-team hook 失败不影响 artifact-driven workflow
