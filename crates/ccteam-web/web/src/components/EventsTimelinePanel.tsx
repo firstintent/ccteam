@@ -52,19 +52,17 @@ const severityClass: Record<Severity, string> = {
   error: "border-l-2 border-status-error bg-status-error/5",
 };
 
-function truncate(s: string, n: number): string {
-  return s.length > n ? s.slice(0, n - 1) + "…" : s;
-}
-
 /** Tool-use events (PreToolUse / PostToolUse) wire-encode the tool name
  *  in `tool` and (for Bash) the command in `cmd`. `detail` is empty for
  *  hook-driven events, so the row would render a blank right column
- *  without this fallback. */
+ *  without this fallback. Full string is returned — visual truncation
+ *  is handled by the row's CSS (`truncate` Tailwind class), so wide
+ *  layouts show more of the command and narrow layouts ellipsize. */
 export function detailLabel(ev: ProgressEvent): string {
   if (ev.event === "PreToolUse" || ev.event === "PostToolUse") {
     const tool = ev.tool ?? "?";
     const arg = ev.cmd ?? ev.file_path;
-    return arg ? `${tool}: ${truncate(arg, 80)}` : tool;
+    return arg ? `${tool}: ${arg}` : tool;
   }
   return ev.detail ?? "";
 }
@@ -116,13 +114,16 @@ export function EventsTimelinePanel({
             <li
               key={`${ev.ts}-${i}`}
               className={
-                "pl-2 pr-1 py-1 flex gap-2 whitespace-pre " +
+                "pl-2 pr-1 py-1 flex gap-2 items-baseline " +
                 severityClass[severity]
               }
             >
               <span className="text-text-dim shrink-0">{ev.ts}</span>
               <span className="text-text-bright shrink-0">{ev.event}</span>
-              <span className="text-text-secondary truncate">
+              <span
+                className="text-text-secondary truncate flex-1 min-w-0"
+                title={detailLabel(ev)}
+              >
                 {detailLabel(ev)}
               </span>
             </li>
