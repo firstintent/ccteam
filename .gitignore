@@ -15,3 +15,4 @@
 
 # Project-local gh CLI config (workspace-level GH_CONFIG_DIR; see .claude/settings.local.json)
 .gh/
+readme.local.txt
