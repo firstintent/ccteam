@@ -15,7 +15,8 @@
 | Clippy | 0 errors + ~20 warnings(pre-existing doc-list drift)|
 | 代码规模 | ~17 kLOC Rust + ~14 kLOC TypeScript |
 | 当前最新版 | V0.4.6 (F81-F91) — 详 `docs/v0-4-6/README.md` |
-| V0.4.7 候选 | F92 真 cost 数据源(linkScanPath jsonl);Codex bg-job 形态;workflow.yaml extends/fan-out vote/evaluator sugar — 详 `docs/orchestration-patterns.md §五` |
+| V0.5.0 立项 | F92-F96 真 cost 数据源(linkScanPath jsonl)+ Agent Teams 集成(`mode: agent-team` workflow + `__lead` role + 3 hook 镜像 + 3 web 面板)— doc-first 阶段,详 `docs/v0-5-0/README.md` |
+| V0.5.x 延期候选 | F97 lifecycle 完善;F98 plan-approval↔outbox 联动;F99 Claude Code 版本 gating;Routing/Evaluator-Optimizer sugar — 详 `docs/v0-5-0/prd.md` 末段 + `docs/orchestration-patterns.md §五` |
 | 历史版本 | V0.1 → V0.4.5 见各自 `docs/v0-X-Y/README.md` |
 
 **ccteam 是 Claude Code 之上的元工具**(V0.4.0+):每个项目用 `workflow.yaml` 声明 agent 拓扑(**无 prompt,只有 trigger + 并发上限**),`.claude/agents/<role>.md` 定义 agent 行为;Rust orchestrator 通过 `ArtifactWatcher`(inotify)监听文件系统控制平面 → spawn `claude --bg --agent <role>`(或 Codex tmux session);`progress.jsonl` 记录 7 类业务 event 为唯一状态 SoT;用户通过 meta-agent + `ccteam-control` skill + 17 个 `mcp__ccteam__*` 工具操作;web UI 提供 4 面板 + SSE。详 `docs/tech-design.md` §2.1。
@@ -34,6 +35,7 @@
 | 7 | `docs/claude-code-best-practices.md` | 改 agent prompt / hooks / context 管理时 |
 | 8 | `docs/claude-code-tool-surface.md` | 改 workflow.yaml + agent .md 时 |
 | 9 | `docs/v0-4-6/README.md` | 看当前版本状态 |
+| 10 | `docs/v0-5-0/README.md` | 看立项中下个版本(agent-team mode + 真 cost)|
 
 **起手 30 秒**:`git log -1` 看 HEAD → `cargo test --workspace 2>&1 | awk '/^test result/{p+=$4;f+=$6}END{print p,f}'` 校 755/1 → 读用户诉求 → 干。
 

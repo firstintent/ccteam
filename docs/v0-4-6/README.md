@@ -33,3 +33,11 @@
 ## 与 V0.4.5 的关系
 
 V0.4.5 已 ship(F77 hook walk-up + F78 watcher path + F80 phantom cleanup)。V0.4.6 是 V0.4.5 落地暴露的用户体验 + 运维痛点根治,**不修 V0.4.5 已 ship 的红线**。
+
+## 下个版本:V0.5.0 已立项
+
+V0.4.6 ship 后(2026-05-16),下一个版本是 **V0.5.0**,doc-first 阶段(代码未动):
+- **F92** 真 cost 数据源 —— V0.4.6 host E2E 实测发现 `state.json::cost_usd_total` 始终为 0(本版 F91 cost SoT 收敛后才暴露),真数据在 `linkScanPath` jsonl 的 `usage` 字段。先修 F92,后续 budget / Sparkline 才靠谱
+- **F93-F96** Agent Teams 集成 —— 官方 Agent Teams(v2.1.32+)的 teammate-to-teammate mailbox + shared task list 通信模式好用,但 factory + 长跑可视化是痛点;ccteam 加 `mode: agent-team` workflow + `__lead` role + 3 hook 镜像 + 3 web 面板补上
+
+详 `docs/v0-5-0/README.md` + `docs/v0-5-0/prd.md`。
