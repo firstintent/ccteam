@@ -1514,6 +1514,43 @@ fn run_status(tail: usize) -> Result<()> {
     }
     println!();
 
+    // V0.4.7 — running sessions across all projects. Reuses the
+    // same `active_sessions` core function the web dashboard reads,
+    // so CLI / SPA never drift on what they think is alive.
+    if !projects.is_empty() {
+        let mut rows: Vec<(String, ccteam_core::ActiveSessionInfo)> = Vec::new();
+        for p in &projects {
+            match ccteam_core::active_sessions(&p.state.slug, &paths) {
+                Ok(list) => rows.extend(list.into_iter().map(|s| (p.state.slug.clone(), s))),
+                Err(_) => continue,
+            }
+        }
+        if !rows.is_empty() {
+            println!("  running sessions ({}):", rows.len());
+            for (slug, s) in &rows {
+                let model = s.model.as_deref().unwrap_or("—");
+                let ctx = s
+                    .context_remaining_pct
+                    .map(|p| format!("ctx {:>3.0}%", p))
+                    .unwrap_or_else(|| "ctx   —".into());
+                let age = parse_rfc3339_age_secs(&s.started_at)
+                    .map(humanize_secs)
+                    .unwrap_or_else(|| "?".into());
+                let short_job = s
+                    .job_id
+                    .as_deref()
+                    .map(|j| j.chars().take(8).collect::<String>())
+                    .unwrap_or_else(|| "—".into());
+                println!(
+                    "    {:<24}  {:<10}  {:<8}  {:<22}  {}  ${:>6.2}  {} ago",
+                    slug, s.role, short_job, model, ctx, s.cost_usd, age
+                );
+            }
+            println!("    tip: `claude attach <id>` to take over a session live");
+            println!();
+        }
+    }
+
     // Recent events across all projects (merged)
     if tail > 0 && !projects.is_empty() {
         println!("  recent events (last {}):", tail);
@@ -1564,6 +1601,21 @@ fn run_status(tail: usize) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Parse an RFC3339 timestamp + return seconds-since for the
+/// status / show table. Returns None on unparseable input.
+fn parse_rfc3339_age_secs(ts: &str) -> Option<u64> {
+    let dt = chrono::DateTime::parse_from_rfc3339(ts).ok()?;
+    let now = chrono::Utc::now();
+    let secs = now
+        .signed_duration_since(dt.with_timezone(&chrono::Utc))
+        .num_seconds();
+    if secs < 0 {
+        Some(0)
+    } else {
+        Some(secs as u64)
+    }
 }
 
 fn humanize_secs(s: u64) -> String {

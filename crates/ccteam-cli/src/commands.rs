@@ -660,10 +660,11 @@ pub fn run_show(paths: &CcteamPaths, slug: &str, format: OutputFormat) -> Result
     let artifacts = collect_artifacts(paths, slug);
     let progress_path = paths.progress_jsonl(slug);
     let cost = ccteam_core::cost_summary(slug, &progress_path, paths)?;
+    let sessions = ccteam_core::active_sessions(slug, paths).unwrap_or_default();
 
     Ok(match format {
-        OutputFormat::Text => render_show_text(&state, &cost, &recent, &artifacts),
-        OutputFormat::Json => render_show_json(&state, &cost, &recent, &artifacts)?,
+        OutputFormat::Text => render_show_text(&state, &cost, &recent, &artifacts, &sessions),
+        OutputFormat::Json => render_show_json(&state, &cost, &recent, &artifacts, &sessions)?,
     })
 }
 
@@ -2616,11 +2617,37 @@ fn render_ls_json(
     Ok(serde_json::to_string_pretty(&v)?)
 }
 
+fn parse_rfc3339_age_secs(ts: &str) -> Option<u64> {
+    let dt = chrono::DateTime::parse_from_rfc3339(ts).ok()?;
+    let now = chrono::Utc::now();
+    let secs = now
+        .signed_duration_since(dt.with_timezone(&chrono::Utc))
+        .num_seconds();
+    if secs < 0 {
+        Some(0)
+    } else {
+        Some(secs as u64)
+    }
+}
+
+fn humanize_secs_local(s: u64) -> String {
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m", s / 60)
+    } else if s < 86400 {
+        format!("{}h", s / 3600)
+    } else {
+        format!("{}d", s / 86400)
+    }
+}
+
 fn render_show_text(
     state: &ProjectState,
     cost: &ccteam_core::CostSummary,
     recent: &[Value],
     artifacts: &Map<String, Value>,
+    sessions: &[ccteam_core::ActiveSessionInfo],
 ) -> String {
     let mut out = String::new();
     out.push_str(&format!("# {} ({})\n\n", state.slug, state.tmux_session));
@@ -2670,6 +2697,33 @@ fn render_show_text(
             out.push_str(&format!("  {:<18} {}\n", k, v.as_str().unwrap_or("<?>")));
         }
     }
+
+    out.push_str(&format!("\nactive sessions ({}):\n", sessions.len()));
+    if sessions.is_empty() {
+        out.push_str("  (none running)\n");
+    } else {
+        for s in sessions {
+            let model = s.model.as_deref().unwrap_or("—");
+            let ctx = s
+                .context_remaining_pct
+                .map(|p| format!("ctx {:>3.0}%", p))
+                .unwrap_or_else(|| "ctx   —".into());
+            let age = parse_rfc3339_age_secs(&s.started_at)
+                .map(humanize_secs_local)
+                .unwrap_or_else(|| "?".into());
+            let short_job = s
+                .job_id
+                .as_deref()
+                .map(|j| j.chars().take(8).collect::<String>())
+                .unwrap_or_else(|| "—".into());
+            out.push_str(&format!(
+                "  {:<10}  {:<8}  {:<22}  {}  ${:>6.2}  {} ago\n",
+                s.role, short_job, model, ctx, s.cost_usd, age
+            ));
+        }
+        out.push_str("\n  tip: `claude attach <id>` to take over a session live\n");
+    }
+
     out.push_str(&format!("\nrecent events ({}):\n", recent.len()));
     for e in recent {
         let ts = e.get("ts").and_then(|s| s.as_str()).unwrap_or("???");
@@ -2684,6 +2738,7 @@ fn render_show_json(
     cost: &ccteam_core::CostSummary,
     recent: &[Value],
     artifacts: &Map<String, Value>,
+    sessions: &[ccteam_core::ActiveSessionInfo],
 ) -> Result<String> {
     let v = json!({
         "state": serde_json::to_value(state)?,
@@ -2691,6 +2746,7 @@ fn render_show_json(
         "cost": serde_json::to_value(cost)?,
         "recent_events": recent,
         "artifacts": Value::Object(artifacts.clone()),
+        "active_sessions": serde_json::to_value(sessions)?,
         "stall": {
             "level": "ok",
             "silent_seconds": 0,
