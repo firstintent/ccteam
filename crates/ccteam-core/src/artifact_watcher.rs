@@ -45,9 +45,10 @@
 //! See also `docs/v0-4-0/prd.md` §F64 + §6.2, `dev-plan.md` §6,
 //! `docs/dev-coupling-audit.md` F64.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc as stdmpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Poll interval inside the watcher's blocking loop. The thread wakes
@@ -363,6 +364,636 @@ fn match_root<'a>(
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// V0.5.0 F95 — global Anthropic Agent Teams watcher.
+//
+// Distinct from the per-workflow `ArtifactWatcher` above: this layer is
+// **not bound to any ccteam project**. It scans `~/.claude/teams/*/` —
+// Anthropic Agent Teams' on-disk SoT — and mirrors topology / message
+// / task events into `~/.ccteam/teams-progress.jsonl` (the global team
+// progress stream, per `paths::teams_progress_path`).
+//
+// Red lines (PRD V0.5.0 F95 §需求):
+//   1. Read-only against `~/.claude/teams/` and `~/.claude/tasks/`.
+//   2. Schema-failure tolerance — WARN once + degrade to mtime-only.
+//   3. idle_notification filtering — system messages routed to F94
+//      `team_teammate_idle` (Wave 2), not F95 `team_message_sent`.
+//   4. 60s discovery rescan picks up new teams without daemon restart.
+//
+// See `docs/v0-5-0/prd.md` §F95 + `docs/v0-5-0/dev-plan.md` Wave 1.
+// ---------------------------------------------------------------------------
+
+/// How often `AgentTeamsWatcher` rescans `~/.claude/teams/` to pick up
+/// newly-created team directories (PRD F95 §验收 .6: 60s).
+pub const TEAMS_DISCOVERY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Per-team snapshot tracked by the watcher. We hold the previous
+/// parse output so the next inotify (or rescan) tick can diff against
+/// it without re-reading historical events.
+#[derive(Debug, Default)]
+struct TeamState {
+    /// Latest parsed `config.json`. `None` when the file is missing or
+    /// schema-broken — the watcher degrades to mtime-only until parse
+    /// recovers (PRD F95 §需求 .4).
+    config: Option<crate::teams_config_parser::TeamConfigSnapshot>,
+    /// Inbox snapshots keyed by teammate name. Cold-discovery seeds
+    /// these with the current file contents so historical messages
+    /// don't flood `progress.jsonl` on daemon restart.
+    inboxes: BTreeMap<String, crate::teams_inbox_parser::InboxSnapshot>,
+    /// Per-task file snapshots keyed by task id (the file stem). Used
+    /// by `teams_task_parser::diff_task` to compute status transitions.
+    tasks: BTreeMap<String, crate::teams_task_parser::TaskFile>,
+    /// Has `WARN`-once already fired for `config.json` schema breakage?
+    /// Reset on successful re-parse.
+    config_warned: bool,
+}
+
+/// Shared map of `<team_name>` → [`TeamState`]. The notify callback +
+/// the tokio discovery loop both hold this behind a `Mutex` so that
+/// inotify events arriving mid-rescan can't race the discovery pass.
+type SharedTeams = Arc<Mutex<BTreeMap<String, TeamState>>>;
+
+/// V0.5.0 F95 — config for the global Anthropic Agent Teams watcher.
+/// Mostly path overrides so integration tests can point at a temp
+/// `~/.claude/teams/` clone.
+#[derive(Debug, Clone)]
+pub struct AgentTeamsWatcherConfig {
+    /// `~/.claude/teams/` (override via `CCTEAM_AGENT_TEAMS_ROOT`).
+    pub teams_root: PathBuf,
+    /// `~/.claude/tasks/` (override via `CCTEAM_AGENT_TASKS_ROOT`).
+    pub tasks_root: PathBuf,
+    /// Destination for `team_*` events
+    /// (`~/.ccteam/teams-progress.jsonl`).
+    pub progress_path: PathBuf,
+    /// Rescan interval. Defaults to [`TEAMS_DISCOVERY_INTERVAL`];
+    /// tests override to single-digit milliseconds.
+    pub discovery_interval: Duration,
+}
+
+impl AgentTeamsWatcherConfig {
+    /// Resolve from the running user's environment (the default path
+    /// production daemon uses). Honours `CCTEAM_AGENT_TEAMS_ROOT` /
+    /// `CCTEAM_AGENT_TASKS_ROOT` / `CCTEAM_HOME` for test isolation.
+    pub fn from_env() -> Result<Self> {
+        Ok(Self {
+            teams_root: crate::paths::agent_teams_root()?,
+            tasks_root: crate::paths::agent_tasks_root()?,
+            progress_path: crate::paths::teams_progress_path()?,
+            discovery_interval: TEAMS_DISCOVERY_INTERVAL,
+        })
+    }
+}
+
+/// Global watcher for `~/.claude/teams/*/`.
+///
+/// Lifecycle:
+///
+/// 1. [`AgentTeamsWatcher::new`] resolves paths + installs the inotify
+///    watch on `<teams_root>` itself (recursive). It does NOT touch
+///    the filesystem if the root is missing — a daemon started before
+///    the first Agent Teams session has nothing to watch and the
+///    discovery loop will pick it up later.
+/// 2. [`AgentTeamsWatcher::start`] spawns the tokio task that drives
+///    discovery + reactive diffing. The returned `JoinHandle` is
+///    discarded by the daemon (fire-and-forget); a graceful shutdown
+///    drops the watcher → the task notices via `tx.is_closed()` and
+///    exits.
+///
+/// Drop semantics: dropping the watcher drops the notify watcher
+/// (sync mpsc receiver hangs up) and the tokio task exits on its
+/// next wake.
+pub struct AgentTeamsWatcher {
+    config: AgentTeamsWatcherConfig,
+    _watcher: Option<RecommendedWatcher>,
+    event_rx: stdmpsc::Receiver<notify::Result<notify::Event>>,
+    teams: SharedTeams,
+    /// Cancellation flag used by tests to gracefully drop the
+    /// discovery loop without waiting for the long interval.
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl AgentTeamsWatcher {
+    /// Build a fresh watcher. If `teams_root` does not exist, the
+    /// returned watcher will rely entirely on its periodic discovery
+    /// rescan (it's legitimate for the first ccteam run to predate
+    /// any Anthropic Agent Teams session).
+    pub fn new(config: AgentTeamsWatcherConfig) -> Result<Self> {
+        let (event_tx, event_rx) = stdmpsc::channel::<notify::Result<notify::Event>>();
+        let watcher = if config.teams_root.exists() {
+            let mut w: RecommendedWatcher = notify::recommended_watcher(move |res| {
+                let _ = event_tx.send(res);
+            })
+            .context("agent_teams_watcher: initialize notify::RecommendedWatcher")?;
+            w.watch(&config.teams_root, RecursiveMode::Recursive)
+                .with_context(|| format!("watch {}", config.teams_root.display()))?;
+            // tasks_root is optional — Anthropic only creates it the
+            // first time a task is recorded. If absent, the discovery
+            // loop will re-attempt the watch each tick.
+            if config.tasks_root.exists() {
+                if let Err(err) = w.watch(&config.tasks_root, RecursiveMode::Recursive) {
+                    tracing::warn!(
+                        path = %config.tasks_root.display(),
+                        error = %err,
+                        "agent_teams_watcher: failed to watch tasks_root; will retry on discovery",
+                    );
+                }
+            }
+            Some(w)
+        } else {
+            tracing::info!(
+                path = %config.teams_root.display(),
+                "agent_teams_watcher: teams_root absent at startup; will be discovered later",
+            );
+            None
+        };
+
+        Ok(Self {
+            config,
+            _watcher: watcher,
+            event_rx,
+            teams: Arc::new(Mutex::new(BTreeMap::new())),
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
+    }
+
+    /// Shareable cancellation handle. Tests flip this to make the
+    /// discovery loop exit without waiting for its next interval.
+    pub fn cancel_handle(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.cancel.clone()
+    }
+
+    /// Spawn the discovery + dispatch loop. The task owns the notify
+    /// watcher (kept in scope) + the std mpsc receiver. It exits when:
+    ///
+    /// 1. `cancel` flips to `true` (tests / graceful daemon shutdown), or
+    /// 2. the std-mpsc sender is dropped (notify watcher died).
+    ///
+    /// Returns the `JoinHandle` so callers can `.await` it in tests;
+    /// production daemon drops it.
+    pub fn start(self) -> tokio::task::JoinHandle<()> {
+        let AgentTeamsWatcher {
+            config,
+            _watcher,
+            event_rx,
+            teams,
+            cancel,
+        } = self;
+        tokio::task::spawn_blocking(move || {
+            // Keep the notify watcher in scope so the OS-level watch
+            // registration stays alive for the loop's lifetime.
+            let _watcher = _watcher;
+
+            // Cold-start discovery so daemon log can announce
+            // "discovered N agent teams" and the SoT picks up
+            // pre-existing teams. Errors here are non-fatal; the
+            // discovery loop will retry.
+            if let Err(err) = run_discovery(&config, &teams) {
+                tracing::warn!(
+                    error = %err,
+                    "agent_teams_watcher: initial discovery failed",
+                );
+            }
+
+            let mut last_discovery = Instant::now();
+            loop {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                // Bounded wait: either we get an inotify event, or
+                // we time out and rerun discovery if due.
+                let timeout = config
+                    .discovery_interval
+                    .saturating_sub(last_discovery.elapsed())
+                    .max(WATCHER_SHUTDOWN_POLL);
+                let recv = event_rx.recv_timeout(timeout);
+                match recv {
+                    Ok(Ok(ev)) => {
+                        for path in &ev.paths {
+                            if let Err(err) = dispatch_path(&config, &teams, path) {
+                                tracing::warn!(
+                                    path = %path.display(),
+                                    error = %err,
+                                    "agent_teams_watcher: dispatch failed",
+                                );
+                            }
+                        }
+                    }
+                    Ok(Err(err)) => {
+                        tracing::warn!(?err, "agent_teams_watcher: notify reported error");
+                    }
+                    Err(stdmpsc::RecvTimeoutError::Timeout) => {}
+                    Err(stdmpsc::RecvTimeoutError::Disconnected) => break,
+                }
+
+                // Periodic discovery (also fires after the first
+                // timeout). Picks up newly-created teams without a
+                // daemon restart.
+                if last_discovery.elapsed() >= config.discovery_interval {
+                    if let Err(err) = run_discovery(&config, &teams) {
+                        tracing::warn!(
+                            error = %err,
+                            "agent_teams_watcher: periodic discovery failed",
+                        );
+                    }
+                    last_discovery = Instant::now();
+                }
+            }
+        })
+    }
+
+    /// **Test-only**: dispatch the given list of paths against the
+    /// current in-memory state — no extra discovery pass. The caller
+    /// is expected to drive `test_run_discovery` themselves when they
+    /// want cold-seeding to run first; this entry point models a pure
+    /// "inotify event for path X arrived" tick.
+    ///
+    /// Returns every event currently on disk in `progress_path` (the
+    /// whole file, not just events appended by this call) so the
+    /// assertions stay simple.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn test_tick(&self, paths: &[PathBuf]) -> Result<Vec<serde_json::Value>> {
+        for p in paths {
+            dispatch_path(&self.config, &self.teams, p)?;
+        }
+        let body = std::fs::read_to_string(&self.config.progress_path).unwrap_or_default();
+        let out = body
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        Ok(out)
+    }
+
+    /// **Test-only**: discover-only entry point (no notify dispatch).
+    /// Useful when the test wants to assert "cold-start picked up N
+    /// teams" or to seed inbox/task baselines before the next tick.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn test_run_discovery(&self) -> Result<()> {
+        run_discovery(&self.config, &self.teams)
+    }
+}
+
+/// Scan `<teams_root>` for `<name>/config.json`, install any newly
+/// discovered teams, and remove watchers for deleted ones. Emits
+/// `team_member_joined` events on cold-start (PRD F95 §验收 .2) and
+/// emits `team_member_left` for every member of a team that
+/// disappeared between two discovery passes.
+fn run_discovery(config: &AgentTeamsWatcherConfig, teams: &SharedTeams) -> Result<()> {
+    if !config.teams_root.exists() {
+        return Ok(());
+    }
+    let mut live: HashSet<String> = HashSet::new();
+    let entries = match std::fs::read_dir(&config.teams_root) {
+        Ok(e) => e,
+        // Race: dir was removed between exists() and read_dir.
+        // Defensive: treat as "no teams".
+        Err(_) => return Ok(()),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let config_path = path.join("config.json");
+        if !config_path.is_file() {
+            continue;
+        }
+        live.insert(name.to_string());
+        // Refresh config snapshot + emit joined events. We lock once
+        // per team to keep critical sections short.
+        sync_team_config(config, teams, name, &config_path)?;
+        // Seed inboxes (cold) so historical messages don't replay.
+        let inbox_dir = path.join("inboxes");
+        if inbox_dir.is_dir() {
+            if let Ok(rd) = std::fs::read_dir(&inbox_dir) {
+                for inbox in rd.flatten() {
+                    let p = inbox.path();
+                    if p.extension().and_then(|s| s.to_str()) == Some("json") {
+                        seed_inbox_snapshot(teams, name, &p)?;
+                    }
+                }
+            }
+        }
+        // Seed task snapshots (cold).
+        let tasks_dir = config.tasks_root.join(name);
+        if tasks_dir.is_dir() {
+            if let Ok(rd) = std::fs::read_dir(&tasks_dir) {
+                for task in rd.flatten() {
+                    let p = task.path();
+                    let Some(fname) = p.file_name().and_then(|s| s.to_str()) else {
+                        continue;
+                    };
+                    if crate::teams_task_parser::is_sibling_file(fname) {
+                        continue;
+                    }
+                    if p.extension().and_then(|s| s.to_str()) == Some("json") {
+                        seed_task_snapshot(teams, name, &p)?;
+                    }
+                }
+            }
+        }
+    }
+
+    // Anything in our state map that isn't live anymore → emit
+    // member_left for each known member, then drop.
+    let gone: Vec<String> = {
+        let teams_guard = teams.lock().expect("teams mutex poisoned");
+        teams_guard
+            .keys()
+            .filter(|n| !live.contains(*n))
+            .cloned()
+            .collect()
+    };
+    for name in gone {
+        let lost_members = {
+            let mut teams_guard = teams.lock().expect("teams mutex poisoned");
+            teams_guard
+                .remove(&name)
+                .and_then(|st| st.config)
+                .map(|s| s.members)
+                .unwrap_or_default()
+        };
+        for (_id, m) in lost_members {
+            let event = serde_json::json!({
+                "event": "team_member_left",
+                "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "team_name": name,
+                "teammate_name": m.name,
+            });
+            let _ = crate::progress::append_event(&config.progress_path, &event);
+        }
+    }
+
+    tracing::info!(
+        count = live.len(),
+        path = %config.teams_root.display(),
+        "agent_teams_watcher: discovered {} agent teams",
+        live.len(),
+    );
+    Ok(())
+}
+
+/// Read `<team>/config.json`, diff against the cached snapshot,
+/// append events to `progress_path`, and update the cached snapshot.
+/// Schema breakage WARNs once + sets `config_warned=true`; subsequent
+/// breakage on the same file is silent until a successful re-parse
+/// resets the flag.
+fn sync_team_config(
+    config: &AgentTeamsWatcherConfig,
+    teams: &SharedTeams,
+    name: &str,
+    config_path: &Path,
+) -> Result<()> {
+    let bytes = match std::fs::read(config_path) {
+        Ok(b) => b,
+        Err(err) => {
+            tracing::warn!(
+                path = %config_path.display(),
+                error = %err,
+                "agent_teams_watcher: failed to read config.json",
+            );
+            return Ok(());
+        }
+    };
+    let snap = match crate::teams_config_parser::parse_config(&bytes) {
+        Ok(s) => s,
+        Err(err) => {
+            let mut guard = teams.lock().expect("teams mutex poisoned");
+            let st = guard.entry(name.to_string()).or_default();
+            if !st.config_warned {
+                tracing::warn!(
+                    team = name,
+                    path = %config_path.display(),
+                    error = %err,
+                    "agent_teams_watcher: config.json schema broken; degrading to mtime-only",
+                );
+                st.config_warned = true;
+            }
+            return Ok(());
+        }
+    };
+    let events = {
+        let mut guard = teams.lock().expect("teams mutex poisoned");
+        let st = guard.entry(name.to_string()).or_default();
+        st.config_warned = false;
+        let prev = st.config.clone().unwrap_or_default();
+        let events = crate::teams_config_parser::diff_snapshots(&prev, &snap);
+        st.config = Some(snap);
+        events
+    };
+    for event in events {
+        crate::progress::append_event(&config.progress_path, &event)?;
+    }
+    Ok(())
+}
+
+/// Cold-start seed: read the inbox once and store it as the baseline
+/// so subsequent diffs only emit *new* messages. Without this, the
+/// first dispatch tick would replay every historical message into
+/// `teams-progress.jsonl`.
+fn seed_inbox_snapshot(teams: &SharedTeams, team_name: &str, inbox_path: &Path) -> Result<()> {
+    let Some(teammate) = inbox_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(String::from)
+    else {
+        return Ok(());
+    };
+    let bytes = match std::fs::read(inbox_path) {
+        Ok(b) => b,
+        Err(_) => return Ok(()),
+    };
+    let snap = match crate::teams_inbox_parser::parse_inbox(&bytes) {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::warn!(
+                path = %inbox_path.display(),
+                error = %err,
+                "agent_teams_watcher: inbox schema broken; skipping seed",
+            );
+            return Ok(());
+        }
+    };
+    let mut guard = teams.lock().expect("teams mutex poisoned");
+    let st = guard.entry(team_name.to_string()).or_default();
+    st.inboxes.entry(teammate).or_insert(snap);
+    Ok(())
+}
+
+/// Cold-start seed: read each task file once and store its body so
+/// subsequent diff_task calls have a proper `prev`. We skip
+/// `.lock` / `.highwatermark` (PRD F95 §需求 .2).
+fn seed_task_snapshot(teams: &SharedTeams, team_name: &str, task_path: &Path) -> Result<()> {
+    let Some(stem) = task_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(String::from)
+    else {
+        return Ok(());
+    };
+    let bytes = match std::fs::read(task_path) {
+        Ok(b) => b,
+        Err(_) => return Ok(()),
+    };
+    let task = match crate::teams_task_parser::parse_task(&bytes) {
+        Ok(t) => t,
+        Err(err) => {
+            tracing::warn!(
+                path = %task_path.display(),
+                error = %err,
+                "agent_teams_watcher: task schema broken; skipping seed",
+            );
+            return Ok(());
+        }
+    };
+    let mut guard = teams.lock().expect("teams mutex poisoned");
+    let st = guard.entry(team_name.to_string()).or_default();
+    st.tasks.entry(stem).or_insert(task);
+    Ok(())
+}
+
+/// Dispatch a notify event path to the right diff parser. Decides
+/// based on path shape:
+///
+/// - `<teams_root>/<team>/config.json` → `sync_team_config`.
+/// - `<teams_root>/<team>/inboxes/<teammate>.json` → inbox diff.
+/// - `<tasks_root>/<team>/<id>.json` → task diff.
+/// - Anything else (e.g. transcript files) → ignored.
+fn dispatch_path(config: &AgentTeamsWatcherConfig, teams: &SharedTeams, path: &Path) -> Result<()> {
+    // Skip sibling files unconditionally.
+    if let Some(fname) = path.file_name().and_then(|s| s.to_str()) {
+        if crate::teams_task_parser::is_sibling_file(fname) {
+            return Ok(());
+        }
+    }
+
+    if let Ok(rel) = path.strip_prefix(&config.teams_root) {
+        let mut comps = rel.components();
+        let Some(std::path::Component::Normal(team_os)) = comps.next() else {
+            return Ok(());
+        };
+        let team = team_os.to_string_lossy().to_string();
+        let rest: Vec<_> = comps.collect();
+        match rest.as_slice() {
+            // <team>/config.json
+            [std::path::Component::Normal(file)] if file.to_string_lossy() == "config.json" => {
+                sync_team_config(config, teams, &team, path)?;
+            }
+            // <team>/inboxes/<teammate>.json
+            [std::path::Component::Normal(dir), std::path::Component::Normal(file)]
+                if dir.to_string_lossy() == "inboxes" =>
+            {
+                let fname = file.to_string_lossy().to_string();
+                if let Some(teammate) = fname.strip_suffix(".json") {
+                    dispatch_inbox(config, teams, &team, teammate, path)?;
+                }
+            }
+            // Anything else under <team>/... is not an F95 SoT file.
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    if let Ok(rel) = path.strip_prefix(&config.tasks_root) {
+        let mut comps = rel.components();
+        let Some(std::path::Component::Normal(team_os)) = comps.next() else {
+            return Ok(());
+        };
+        let team = team_os.to_string_lossy().to_string();
+        let rest: Vec<_> = comps.collect();
+        if let [std::path::Component::Normal(file)] = rest.as_slice() {
+            let fname = file.to_string_lossy().to_string();
+            if crate::teams_task_parser::is_sibling_file(&fname) {
+                return Ok(());
+            }
+            if let Some(task_id) = fname.strip_suffix(".json") {
+                dispatch_task(config, teams, &team, task_id, path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn dispatch_inbox(
+    config: &AgentTeamsWatcherConfig,
+    teams: &SharedTeams,
+    team_name: &str,
+    teammate: &str,
+    inbox_path: &Path,
+) -> Result<()> {
+    let bytes = match std::fs::read(inbox_path) {
+        Ok(b) => b,
+        Err(_) => return Ok(()), // delete races handled defensively
+    };
+    let next = match crate::teams_inbox_parser::parse_inbox(&bytes) {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::warn!(
+                path = %inbox_path.display(),
+                error = %err,
+                "agent_teams_watcher: inbox schema broken; skipping",
+            );
+            return Ok(());
+        }
+    };
+    let events = {
+        let mut guard = teams.lock().expect("teams mutex poisoned");
+        let st = guard.entry(team_name.to_string()).or_default();
+        let prev = st.inboxes.get(teammate).cloned().unwrap_or_default();
+        let events = crate::teams_inbox_parser::diff_inbox(&prev, &next, team_name, teammate);
+        st.inboxes.insert(teammate.to_string(), next);
+        events
+    };
+    for event in events {
+        crate::progress::append_event(&config.progress_path, &event)?;
+    }
+    Ok(())
+}
+
+fn dispatch_task(
+    config: &AgentTeamsWatcherConfig,
+    teams: &SharedTeams,
+    team_name: &str,
+    task_id: &str,
+    task_path: &Path,
+) -> Result<()> {
+    let bytes = match std::fs::read(task_path) {
+        Ok(b) => b,
+        // Defensive: file may have been removed between notify event
+        // dispatch and our read. Drop cached snapshot so a future
+        // re-creation is treated as cold.
+        Err(_) => {
+            let mut guard = teams.lock().expect("teams mutex poisoned");
+            if let Some(st) = guard.get_mut(team_name) {
+                st.tasks.remove(task_id);
+            }
+            return Ok(());
+        }
+    };
+    let next = match crate::teams_task_parser::parse_task(&bytes) {
+        Ok(t) => t,
+        Err(err) => {
+            tracing::warn!(
+                path = %task_path.display(),
+                error = %err,
+                "agent_teams_watcher: task schema broken; skipping",
+            );
+            return Ok(());
+        }
+    };
+    let events = {
+        let mut guard = teams.lock().expect("teams mutex poisoned");
+        let st = guard.entry(team_name.to_string()).or_default();
+        let prev = st.tasks.get(task_id).cloned();
+        let events = crate::teams_task_parser::diff_task(prev.as_ref(), &next, team_name);
+        st.tasks.insert(task_id.to_string(), next);
+        events
+    };
+    for event in events {
+        crate::progress::append_event(&config.progress_path, &event)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

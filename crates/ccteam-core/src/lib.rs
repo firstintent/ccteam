@@ -47,6 +47,13 @@ pub mod state;
 pub mod team;
 pub mod team_factory;
 pub mod team_resolver;
+// V0.5.0 F95 — Anthropic Agent Teams config/inbox/task parsers (pure
+// diff helpers). The wiring into the daemon-level watcher lives in
+// `artifact_watcher::AgentTeamsWatcher`; these modules are kept
+// IO-free so unit tests can hammer the diff logic with fixtures.
+pub mod teams_config_parser;
+pub mod teams_inbox_parser;
+pub mod teams_task_parser;
 pub mod templates;
 pub mod tmux;
 pub mod tool_surface;
@@ -108,7 +115,9 @@ pub use migration::{
     WorkflowMigrationAction, WorkflowMigrationReport,
 };
 pub use orchestrator::MAX_CONCURRENT_PROJECTS;
-pub use orchestrator::{CancelReason, Orchestrator, OrchestratorConfig, DEFAULT_CLAUDE_MODEL};
+pub use orchestrator::{
+    CancelReason, Orchestrator, OrchestratorConfig, TeamEvent, DEFAULT_CLAUDE_MODEL,
+};
 pub use paths::{
     session_context_from_cwd, slug_from_project_dir, CcteamPaths, ProjectSessionContext,
 };
@@ -212,6 +221,9 @@ pub use workflow_watcher::{
 };
 // V0.4.0 F64 — artifact watcher event types + watcher entry point.
 pub use artifact_watcher::{ArtifactEvent, ArtifactWatcher, WatchKind, DEBOUNCE_WINDOW};
+// V0.5.0 F95 — global Anthropic Agent Teams watcher entry points.
+pub use artifact_watcher::{AgentTeamsWatcher, AgentTeamsWatcherConfig, TEAMS_DISCOVERY_INTERVAL};
+pub use paths::{agent_tasks_root, agent_teams_root, teams_progress_path};
 
 /// Crate version, identical to the workspace package version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

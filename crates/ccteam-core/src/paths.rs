@@ -182,6 +182,24 @@ impl CcteamPaths {
         self.root.join("harness")
     }
 
+    /// `~/.ccteam/teams-progress.jsonl` — V0.5.0 F95 global progress
+    /// stream for Anthropic Agent Teams events (`team_member_joined`
+    /// / `team_member_left` / `team_message_sent` / `team_task_created`
+    /// / `team_task_completed`).
+    ///
+    /// Distinct from per-project `progress.jsonl`: an Agent Team is
+    /// owned by Anthropic (`~/.claude/teams/<name>/`), not by any
+    /// ccteam workflow. Mixing team events into a project file would
+    /// conflate streams. F96 web SPA reads this global file on
+    /// `/teams` tab; per-project progress stays untouched.
+    ///
+    /// **Architectural red line** (CLAUDE.md §三): writes here are the
+    /// only state side-effect F95 watcher takes; `~/.claude/teams/`
+    /// itself is strictly read-only (Anthropic SoT).
+    pub fn teams_progress_jsonl(&self) -> PathBuf {
+        self.root.join("teams-progress.jsonl")
+    }
+
     /// V0.2.2 F38: Build a unique PNG path under
     /// `<project>/.ccteam/screenshots/<utc>.png`. The timestamp is
     /// the same compact RFC3339-no-colons format used by inbox
@@ -205,6 +223,40 @@ pub struct ProjectSessionContext {
     pub sid: Option<String>,
     pub project_dir: PathBuf,
     pub team_kind: TeamKind,
+}
+
+/// V0.5.0 F95 — resolve the **global** Anthropic Agent Teams progress
+/// stream path (`~/.ccteam/teams-progress.jsonl`). F96 SSE channel
+/// reads this file; F95 watcher writes it. Pure: honours `CCTEAM_HOME`
+/// for tests (via [`CcteamPaths::from_env`]).
+///
+/// Returns an error only if home-dir resolution fails (extremely rare
+/// — same failure mode that breaks every other ccteam command).
+pub fn teams_progress_path() -> Result<PathBuf> {
+    Ok(CcteamPaths::from_env()?.teams_progress_jsonl())
+}
+
+/// V0.5.0 F95 — default `~/.claude/teams/` root that the global
+/// agent-teams watcher discovers. Anthropic writes config / inboxes
+/// under this path; `~/.claude/tasks/<team>/` is sibling-but-separate.
+/// Honours `CCTEAM_AGENT_TEAMS_ROOT` for tests so we don't have to
+/// touch the user's real `~/.claude/` during integration tests.
+pub fn agent_teams_root() -> Result<PathBuf> {
+    if let Ok(p) = std::env::var("CCTEAM_AGENT_TEAMS_ROOT") {
+        return Ok(PathBuf::from(p));
+    }
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("could not resolve home directory"))?;
+    Ok(home.join(".claude").join("teams"))
+}
+
+/// V0.5.0 F95 — sibling task-list root for Anthropic Agent Teams. Same
+/// override env (`CCTEAM_AGENT_TASKS_ROOT`) for tests.
+pub fn agent_tasks_root() -> Result<PathBuf> {
+    if let Ok(p) = std::env::var("CCTEAM_AGENT_TASKS_ROOT") {
+        return Ok(PathBuf::from(p));
+    }
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("could not resolve home directory"))?;
+    Ok(home.join(".claude").join("tasks"))
 }
 
 /// Read a project's slug by loading `<project_dir>/.ccteam/state.json`.

@@ -184,6 +184,84 @@ impl CancelReason {
     }
 }
 
+/// V0.5.0 F95 — Anthropic Agent Teams event mirror. Five variants
+/// emitted by [`crate::AgentTeamsWatcher`] into
+/// `~/.ccteam/teams-progress.jsonl`. F94 (Wave 2) adds a sixth
+/// `TeamTeammateIdle` — intentionally absent here.
+///
+/// **Why a typed enum on top of `serde_json::Value`**: the watcher
+/// writes events as untyped JSON (the legacy approach used by every
+/// other event in this file), but F96 web SPA + cross-crate test
+/// suites benefit from a compile-time-checked schema. The enum
+/// `#[serde(tag = "event")]` shape matches the on-wire format
+/// byte-for-byte, so a consumer can `serde_json::from_value` directly
+/// without reflowing the watcher's emit path.
+///
+/// PRD: `docs/v0-5-0/prd.md` §F95 `event` table.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "event")]
+pub enum TeamEvent {
+    #[serde(rename = "team_member_joined")]
+    TeamMemberJoined {
+        team_name: String,
+        teammate_name: String,
+        agent_id: String,
+        agent_type: String,
+        model: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        color: Option<String>,
+        cwd: String,
+        backend_type: String,
+        definition_backed: bool,
+        /// RFC3339 derived from `members[i].joinedAt`.
+        started_at: String,
+        /// RFC3339 timestamp the watcher emitted this event.
+        ts: String,
+    },
+    #[serde(rename = "team_member_left")]
+    TeamMemberLeft {
+        team_name: String,
+        teammate_name: String,
+        ts: String,
+    },
+    #[serde(rename = "team_message_sent")]
+    TeamMessageSent {
+        team_name: String,
+        from: String,
+        to: String,
+        /// `text` truncated to
+        /// `teams_inbox_parser::MAX_TEXT_LEN` chars (≤200).
+        text_truncated: String,
+        /// Anthropic-recorded message timestamp (ISO-8601).
+        msg_ts: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        color: Option<String>,
+        #[serde(default)]
+        read: bool,
+        ts: String,
+    },
+    #[serde(rename = "team_task_created")]
+    TeamTaskCreated {
+        team_name: String,
+        task_id: String,
+        title: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        assignee: Option<String>,
+        #[serde(default)]
+        dependencies: Vec<String>,
+        ts: String,
+    },
+    #[serde(rename = "team_task_completed")]
+    TeamTaskCompleted {
+        team_name: String,
+        task_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        result_summary: Option<String>,
+        completed_at: String,
+        ts: String,
+    },
+}
+
 /// V0.4.6 F84 — discover the workflow.yaml location for a project
 /// (matches `WorkflowSpec::load_for_project`: prefer the root file,
 /// then `.ccteam/`). Returns `None` if neither exists.
@@ -385,11 +463,7 @@ impl Orchestrator {
     /// `run_project`. Used by `graceful_shutdown_test` to exercise the
     /// public cancel path in isolation.
     #[cfg(any(test, feature = "test-util"))]
-    pub async fn test_register_cancel_handle(
-        &self,
-        slug: &str,
-        tx: oneshot::Sender<CancelReason>,
-    ) {
+    pub async fn test_register_cancel_handle(&self, slug: &str, tx: oneshot::Sender<CancelReason>) {
         self.cancel_handles
             .lock()
             .await
