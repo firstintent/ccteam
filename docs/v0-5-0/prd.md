@@ -44,7 +44,13 @@ different angles: one teammate on UX, one on technical architecture,
 one playing devil's advocate."
 ```
 
-每次重起会话都要重打;无版本控制;teammate 拓扑漂移;无法在多项目间复用模板。
+每次重起会话都要重打;无版本控制;teammate 拓扑漂移;无法在多项目间复用模板。**且**关闭终端后没有长跑可视化,history 滚走就找不回(F96 MVP 已解后半句)。
+
+### 设计原则:Anthropic 是 SoT,ccteam 读不写
+
+实地探测 host `~/.claude/teams/roblog/config.json` 发现 Anthropic 已经把完整 team 元数据落到文件(name / description / leadAgentId / leadSessionId / members[] + 每 member 的 agentId/name/color/agentType/model/prompt/cwd/planModeRequired/backendType/tmuxPaneId/subscriptions)。
+
+→ **ccteam 不复刻 member 拓扑**。workflow.yaml `agent_team.agents:` 是给 lead 看的**启动意图**(初始 brief),`~/.claude/teams/<team_name>/config.json` 是**运行时 SoT**。lead 可中途增删 member、改 model、调 prompt,ccteam 通过 F95 watcher 镜像变化,**绝不写**这份文件。
 
 ### 需求
 `workflow.yaml` 加 `mode` 顶层字段(`#[serde(default = "default_mode_artifact_driven")]`),取值 `artifact-driven` / `agent-team`。
@@ -52,29 +58,33 @@ one playing devil's advocate."
 #### Schema(完整示例)
 
 ```yaml
-name: flaky-test-debate
+name: flaky-test-debate                # ccteam project slug
 mode: agent-team
 budget:
   max_cost_usd_per_24h: 10.00
 
 agent_team:
-  lead_seed: |
+  team_name: flaky-test-debate         # 必填,= ~/.claude/teams/<team_name>/ dir 名
+  lead_seed: |                         # user-turn message,不是 system prompt
     Investigate why integration tests in src/auth/ flake intermittently.
-    Spawn teammates per workflow.yaml agents:; have them debate
-    competing hypotheses; converge on root cause; require plan approval.
-  teammate_mode: tmux                # in-process | tmux | auto
-  default_model: sonnet              # 选填,缺省 inherit lead 的 /model
-  require_plan_approval: true        # lead 要审 teammate plan
-  cleanup_on_stop: force-kill        # MVP 只支持 force-kill
+    Suggested teammates (use TeammateAdd):
+      - auth-expert (model: sonnet, color: blue)
+      - network-expert (model: sonnet, color: green)
+      - test-runner (model: sonnet, color: yellow)
+    Have them debate competing hypotheses; require plan approval.
+  teammate_mode: in-process            # in-process | tmux | auto;写到 lead 的 env CLAUDE_CODE_TEAMMATE_MODE
+  cleanup_on_stop: force-kill          # MVP 只支持 force-kill;F97 加 ask-lead / leave-running
+  snapshot_path: .ccteam/team-snapshot.json  # F93 stickiness — workflow.yaml 解析后冻结,team 生命周期内不重读
 
-agents:
-  auth-expert:
-    teammate_name: auth-expert       # 选填,默认 = role name
-  network-expert: {}
-  db-expert: {}
-  test-runner: {}
-  devil-advocate: {}
+# `agents:` 不再列举具体 teammate — 让 lead 决定。workflow.yaml 只用 lead_seed 表达意图。
+# 如果用户想强制某些 teammate 必有,在 lead_seed 里用 "MUST spawn the following teammates: ..." 表达。
 ```
+
+**注意 schema 变化**(跟早期草案不同):
+- 删除 `agent_team.agents:` map(原想在 schema 里枚举 teammate)— 改由 lead 决定 + Anthropic config.json 落地
+- 加 `agent_team.team_name`(必填,跟 Anthropic dir 同名,no implicit derivation)
+- 加 `agent_team.snapshot_path` — 借鉴 OMC `resolved_routing` stickiness,workflow.yaml 改动不影响跑着的 team(F82 hot-reload 在 agent-team mode 走 force-restart)
+- 删除 `default_model` / `require_plan_approval`(让 lead 在 lead_seed 里决定,不写 schema)
 
 #### `__lead` role 模板
 
@@ -121,13 +131,15 @@ You are the team lead for a ccteam-managed agent-team workflow. ...
 
 ---
 
-## F94 — Agent Teams 3 hook 镜像 + 5 新 event 类型
+## F94 — Agent Teams 3 hook 镜像 + 精度提升
 
 ### 痛点
-官方 Agent Teams 的 3 hook(`TeammateIdle` / `TaskCreated` / `TaskCompleted`)是 ccteam 唯一能可靠观察 team 内部事件的接口。不装这 3 hook,ccteam 只能扫 `~/.claude/teams/<>/config.json` mtime,丢细粒度。
+F95 watcher 能拿到 4 类 event(member_joined/left, message_sent, task_created/completed),但**`team_teammate_idle` watcher 拿不到** — Anthropic 的 idle 是 in-memory 状态,只通过 `TeammateIdle` hook 通知。idle 是 lead 判断"team 整体卡住"的关键信号(所有 teammate 都 idle 而 task 没完 → lead 该干预)。
+
+且 hook 比 watcher 快 — task created/completed 通过 hook 是 0-延迟,通过 watcher 要等 inotify event(通常 <100ms 但偶有 lag)。
 
 ### 需求
-`crates/ccteam-core/src/templates/settings.json` 加 3 hook(仅 agent-team mode 项目装,artifact-driven 项目不装):
+`crates/ccteam-core/src/templates/settings.json` 加 3 hook,**仅 ccteam-spawned `__lead` session 的项目装**(F93 工厂条件渲染);interactive team(用户自起)没装 hook,ccteam 自动走 F95 watcher fallback,功能 degrade 但不挂。
 
 ```json
 "TeammateIdle": [
@@ -141,60 +153,123 @@ You are the team lead for a ccteam-managed agent-team workflow. ...
 ]
 ```
 
-`progress.jsonl` SoT 加 5 类新 event:
+`progress.jsonl` 6 类 team event(F95 提供 5 类 + 本 F94 加 1 类):
 
+| event | 优先来源 | fallback | 备注 |
+|---|---|---|---|
+| `team_member_joined` | F95 config.json watcher | — | watcher only(没对应 hook)|
+| `team_member_left` | F95 config.json watcher | — | watcher only |
+| `team_message_sent` | F95 inboxes/<teammate>.json watcher | — | watcher only |
+| `team_task_created` | F94 `TaskCreated` hook | F95 tasks/ watcher | hook 优先,缺失 fallback |
+| `team_task_completed` | F94 `TaskCompleted` hook | F95 tasks/ watcher 检测 status 变化 | hook 优先,缺失 fallback |
+| `team_teammate_idle` | F94 `TeammateIdle` hook | — | hook only(watcher 拿不到 in-memory idle 信号)|
+
+`ccteam-core/src/orchestrator.rs::Event` enum 加 6 变体(`#[serde(rename = "team_*")]`)。
+
+### 验收
+1. ccteam-managed agent-team workflow(F93 spawn 出的 __lead session)→ `.claude/settings.json` 含 3 个新 hook
+2. interactive team(用户自起,F93 不参与)→ `.claude/settings.json` 不含新 hook;F95 watcher 仍能拿 5 类 event
+3. lead `TaskCreate` → `progress.jsonl` 出现 `team_task_created` 一行,延迟 <50ms(对比 watcher ~100-200ms)
+4. teammate `TeammateIdle` → `team_teammate_idle` event 出现;F95 watcher 不会重复 emit(去重 by event_id + ts)
+5. hook 失败(测试时 deliberately 杀 hook process)→ F95 watcher fallback 接管 `team_task_created` / `team_task_completed`(idle 没 fallback,degrade)
+6. 6 个 event 全在 `interfaces.md §6.4` event 表更新
+7. 老 7 event(F60+)不破:agent-team hook 失败不影响 artifact-driven workflow
+
+---
+
+## F95 — ArtifactWatcher 扩展 — 读取 `~/.claude/teams/` SoT(MVP 核心)
+
+### 痛点
+官方 Agent Teams 已经把完整 team 元数据落到文件,但没有可视化/长跑监听机制 — 关闭终端就看不到。ccteam 直接读这些文件就能做长跑可视化,**无需**等 F93 factory / F94 hook 注入。
+
+### 设计原则
+`~/.claude/teams/<>/config.json` + `inboxes/` + `~/.claude/tasks/<>/` = **Anthropic SoT**;ccteam **只读**镜像到 `progress.jsonl`(ccteam SoT)。
+
+### Anthropic 实地 schema(host roblog team probe)
+
+**`~/.claude/teams/<team_name>/config.json`** — 团队元 SoT:
+```json
+{
+  "name": "roblog",
+  "description": "...",
+  "createdAt": <epoch_ms>,
+  "leadAgentId": "team-lead@roblog",
+  "leadSessionId": "<uuid>",
+  "members": [
+    {
+      "agentId": "<role>@<team>",
+      "name": "<role>",
+      "color": "blue|green|yellow|purple|...",
+      "agentType": "team-lead|general-purpose|<subagent-name>",
+      "model": "sonnet|opus|<arbitrary-string>",
+      "prompt": "<full-system-prompt-string>",
+      "cwd": "<absolute-path>",
+      "tmuxPaneId": "in-process|<pane-id>",
+      "subscriptions": ["<teammate-name>", ...],
+      "joinedAt": <epoch_ms>,
+      "backendType": "in-process|tmux",
+      "planModeRequired": false
+    }
+  ]
+}
+```
+
+**`~/.claude/teams/<team_name>/inboxes/<teammate>.json`** — per-teammate 收件箱(**单 JSON 文件,不是目录**):
+```json
+[
+  {
+    "from": "<sender-teammate-name>",
+    "text": "<message-body>",      // 纯文本或 JSON-stringified 系统消息(idle_notification 等)
+    "timestamp": "<ISO-8601>",
+    "color": "<sender-color>",     // denormalized 方便 UI
+    "read": <bool>                  // Anthropic 跟踪已读状态
+  },
+  ...
+]
+```
+
+**`~/.claude/tasks/<team_name>/`** — 任务列表:
+- `<id>.json` 每个 task 一个文件(自增数字 id)
+- `.highwatermark` byte cursor(per-task 增量读取标记)
+- `.lock` 并发锁
+
+### 需求
+扩展 `crates/ccteam-core/src/artifact_watcher.rs`,加 **agent-teams discovery + watch** 层(MVP **全局扫所有 ~/.claude/teams/<>/**,不绑 ccteam workflow):
+
+1. **discovery**:daemon 启动时 + 周期扫(60s)`~/.claude/teams/*/config.json`,发现新 team → 加 watch;team 整目录消失(TeamDelete)→ remove watch
+2. **per-team watch target**:
+   - `~/.claude/teams/<name>/config.json`(file watch)→ diff `members[]` by agentId → emit `team_member_joined` / `team_member_left`(payload 含 member 全字段:name/color/model/agentType/cwd/backendType 等)
+   - `~/.claude/teams/<name>/inboxes/<teammate>.json`(file watch per teammate)→ 解析 JSON array,跟上次快照 diff(by timestamp)→ 新增 message → emit `team_message_sent`(`{ team_name, from, to: <teammate>, text_truncated: <200char>, ts, color }`)
+   - `~/.claude/tasks/<name>/*.json`(dir watch,新文件 + modify)→ 解析后 emit `team_task_created`(status==pending) / `team_task_completed`(status==completed)
+3. **只读**:绝不写 `~/.claude/teams/` 或 `~/.claude/tasks/`;官方明确警告"don't edit by hand, overwritten on state update"
+4. **错误韧性**:任一文件 schema 解析失败 → WARN 一次,该 team degrade 到 mtime-only(仍在 web 列表,但事件 emit 暂停);恢复后自动 resume
+5. **完整 read 已读状态**:`read: bool` 字段传给 web,Mailbox UI 高亮未读消息(差异化 vs 官方 in-process 模式自动标已读)
+6. **idle_notification 解析**:`text` 字段可能是 JSON-stringified 系统消息(实测含 `{"type":"idle_notification", "from":"...", "idleReason":"available"}`)— ccteam 识别这类系统消息分流到 `team_teammate_idle` event(不进 mailbox stream,进 Topology 状态徽章)
+
+### `progress.jsonl` event 镜像
+
+5 类 team event(沿用早期草案):
 | event | 来源 | payload |
 |---|---|---|
-| `team_member_joined` | F95 watcher 监 `~/.claude/teams/<>/config.json` mtime → diff members | `{ teammate_name, agent_id, agent_type, started_at }` |
-| `team_message_sent` | F95 watcher 扫 teammate transcript jsonl 找 SendMessage tool_use | `{ from, to, summary }`(摘要由 Haiku 一句话,避免泄露全文) |
-| `team_task_created` | Hook | `{ task_id, title, assignee?, dependencies[] }` |
-| `team_task_completed` | Hook | `{ task_id, result_summary }` |
-| `team_teammate_idle` | Hook | `{ teammate_name, reason }` |
+| `team_member_joined` | F95 config.json diff | `{ team_name, teammate_name, agent_id, agent_type, model, color, started_at }` |
+| `team_member_left` | F95 config.json diff(member 消失)| `{ team_name, teammate_name }` |
+| `team_message_sent` | F95 inboxes/ 新文件 | `{ team_name, from, to, summary_truncated, ts }` |
+| `team_task_created` | F95 tasks/ 新文件(status: pending) | `{ team_name, task_id, title, assignee?, dependencies[] }` |
+| `team_task_completed` | F95 tasks/ modify(status: completed) | `{ team_name, task_id, result_summary?, completed_at }` |
 
 `ccteam-core/src/orchestrator.rs::Event` enum 加 5 变体(`#[serde(rename = "team_*")]`)。
 
 ### 验收
-1. agent-team mode 项目 `.claude/settings.json` 含 3 个新 hook;artifact-driven 项目不含
-2. lead 创建 1 task → `progress.jsonl` 出现 `{"event": "team_task_created", ...}` 一行
-3. teammate 完成 task → `team_task_completed` 一行,`task_id` 同 created 的 id 一致
-4. teammate idle → `team_teammate_idle` 一行,`reason` 字段非空
-5. 5 个 event 全在 `interfaces.md §6.4`(progress.jsonl event 表)更新
-6. 老的 7 event(F60+)不破:agent-team 项目跑 artifact 模式 hook 失败 不影响 artifact-driven 项目
+1. daemon 启动后,`~/.claude/teams/` 有 N 个 team dir → daemon log 出现 `discovered N agent teams`,inotify watch list 加 N 条
+2. host roblog team(已存在,4 members)→ ccteam web `/api/v1/teams` 立刻列出 roblog;web `/teams/roblog` 详情页 5s 内 render 4 members
+3. lead 在某 team 加新 member → 5s 内 ccteam `progress.jsonl` 出现 `team_member_joined`
+4. teammate 间 SendMessage 落 inboxes/ → 5s 内 `team_message_sent` 出现
+5. `~/.claude/teams/<>/config.json` schema 改 → 解析失败 WARN 一次,team 仍在 web 列表(degrade 到 mtime-only)
+6. 新 team 创建(`~/.claude/teams/<new-name>/` 出现)→ 60s discovery 周期内被加 watch,无需重启 daemon
 
 ---
 
-## F95 — ArtifactWatcher 扩展到 `~/.claude/teams/` + `~/.claude/tasks/`
-
-### 痛点
-F94 三 hook 只覆盖 `Teammate*` / `Task*` 事件;**teammate 之间 SendMessage 没有官方 hook**(只在 lead 的 transcript jsonl 出现)。ccteam 需要扫 transcript jsonl 才能镜像 mailbox。
-
-且 `~/.claude/teams/<>/config.json` 是团队拓扑的 SoT(members 列表),mtime 变化要被 ccteam 立即知道。
-
-### 需求
-扩展 `crates/ccteam-core/src/artifact_watcher.rs`:
-
-1. **新 watch target**(`mode: agent-team` 项目才装):
-   - `~/.claude/teams/<workflow-name>/config.json`(file watch,mtime+content hash)
-   - `~/.claude/tasks/<workflow-name>/*.json`(directory watch,新文件 + modify)
-   - 每个 teammate 的 transcript jsonl(动态加 watch,teammate spawn 后由 hook 通知 ccteam 加 watch;teammate 退出后 remove watch)
-
-2. **handler**:
-   - `config.json` 变 → diff members 数组 → 发 `team_member_joined` 或 `team_member_left` event
-   - `tasks/*.json` 新增 → 解析后写 `team_task_created`(冗余 hook,作为 safety net;hook 失败仍可恢复)
-   - transcript jsonl tail → 找 `tool_use: SendMessage` block → 提取 `to` / `body`,起一个 Haiku one-shot 总结 body → 写 `team_message_sent` event
-
-3. **只读**:**绝不写**任何 Anthropic-owned 文件(`~/.claude/teams/` + `~/.claude/tasks/`);官方明确警告"don't edit by hand"
-
-### 验收
-1. agent-team mode workflow 起后,inotify 表里出现 3 类新 watch
-2. lead spawn 1 teammate → `team_member_joined` event 5s 内落 `progress.jsonl`
-3. teammate A `SendMessage` to teammate B → `team_message_sent` event 落,from/to/summary 字段非空
-4. hook 失败(测试时 deliberately 杀 hook process)→ `tasks/*.json` 仍能被 watcher fallback 捕获
-5. `~/.claude/teams/<>/config.json` schema 改(模拟 Anthropic 升级)→ ccteam 解析失败时**WARN 而非 panic**,镜像 degrade 到 mtime-only
-
----
-
-## F96 — Web SPA 3 新面板
+## F96 — Web SPA 3 新面板(覆盖所有 host teams,不止 ccteam-managed)
 
 ### 痛点
 Agent Teams 自带 UI(in-process Shift+Down 切换 / tmux 分屏)在长跑场景下不好用:
@@ -202,47 +277,79 @@ Agent Teams 自带 UI(in-process Shift+Down 切换 / tmux 分屏)在长跑场景
 - 历史 task 完成后从 list 滚走
 - 多 team 并跑没有总览
 - mailbox 消息没法回看
+- 跨设备 / 远程访问完全没有
+
+这是 ccteam 跟 OMC 等竞品的核心差异化卖点(OMC 团队 1040 行 SKILL.md 完全没可视化层)。
 
 ### 需求
-ccteam web SPA 在 `mode: agent-team` workflow 详情页加 3 面板(artifact-driven 页保持现状):
+ccteam web SPA **独立于 workflow 项目**,加一个 **Teams 顶级 tab**(沿用 V0.4.6 的 Projects/Sessions/Settings tab 结构):
+
+```
+ccteam web header tabs:
+  Projects  Teams  Sessions  Settings
+                ↑ 新
+```
+
+`Teams` tab 列出 host 上所有 `~/.claude/teams/<>/` 发现的 team(F95 discovery 提供),每项点进去看详情页(3 面板):
 
 #### 1. Team Topology 面板
-节点图:lead 居中,N teammate 围绕。每节点显示:
-- `name`(workflow.yaml `agents.<role>.teammate_name`)
-- 头像色(`color` frontmatter,沿用 V0.4.0 模式)
-- model(从 `~/.claude/jobs/<id>/state.json` 读)
-- 当前 activity(Haiku 摘要,跟 agent view 同源)
-- cost(F92 数据源)
-- 状态色:working / waiting-input / idle / completed / failed
+节点图:lead 居中,N teammate 围绕(数据源 = `config.json::members[]`)。每节点显示:
+- `name`(Anthropic config member.name)
+- 头像色(`config.json::members[].color`)
+- `model`(`config.json::members[].model` — 直接读,可能是 `sonnet`/`opus`/自定义 `deepseek-v4-pro[1m]`)
+- `agentType`(`team-lead` / `general-purpose` / 自定义 subagent name)
+- 当前 activity(从 `~/.claude/jobs/<leadSessionId>/state.json` Haiku summary 同源)
+- cost(F92 数据源 — `linkScanPath` jsonl 算)
+- 状态色:`backendType == "in-process"` → 蓝;`backendType == "tmux"` → 绿;config 中消失 → 灰;最近 30s `idle_notification` → 黄
+- `cwd` 文本(member working dir,长路径截尾)
 
-边线条颜色按消息流频次,鼠标 hover 显示最近 SendMessage 摘要。
+边线 = `members[].subscriptions[]`(Anthropic schema 已有,默认空表示订阅 lead);hover 显示最近 3 条 from-this-node 的消息(从 inboxes/ 反向拉)。
 
 #### 2. Task Board 面板
-Kanban 3 列:Pending / In Progress / Completed。每个 task 卡显示:
-- task title
-- assignee teammate(头像)
-- 依赖图标(若 `dependencies[]` 非空)
-- 创建时间 + 完成时间(若已完成)
+Kanban 3 列:Pending / In Progress / Completed(数据源 = `~/.claude/tasks/<team>/*.json`)。每个 task 卡显示:
+- task title(JSON `title` / `subject` 字段)
+- assignee teammate(JSON `owner` / `assignee` 字段)
+- 依赖图标(`dependencies[]` 或 `blockedBy[]` 非空)
+- 创建时间 + 完成时间(`status` 状态机:pending → in_progress → completed)
+- 头像色取自 owner 在 config.json 的 color
 
-点击 task 卡 → 展开 task body + 历史相关 message。
+点击 task 卡 → 展开 task `description` + 历史相关 message(filter mailbox by task_id,若 message text 含 `#<task_id>`)。
 
 #### 3. Mailbox Stream 面板
-时间线,from → to 消息流。支持:
-- 按 teammate 对过滤
+时间线,from → to 消息流(数据源 = 所有 `~/.claude/teams/<>/inboxes/<teammate>.json` JSON array,按 timestamp merge sort)。**实测 schema**:
+```json
+{ "from": "<teammate>", "text": "...", "timestamp": "ISO-8601", "color": "<sender-color>", "read": <bool> }
+```
+
+UI 行为:
+- **未读高亮**:`read: false` 行加边框,Mailbox tab badge 显示未读数
+- **idle_notification 分流**:`text` 字段是 JSON-stringified `{type: idle_notification}` 系统消息 → 不进 Mailbox Stream,改用 Topology 节点徽章
+- 按 teammate 对过滤(from / to 任一)
 - 按时间倒序 / 正序
-- 搜索消息摘要
+- 搜索 message text 关键词
 - 折叠老消息(>1h)
+- **不**改 Anthropic 的 `read` 状态(只读)— 想标已读需用户走 native Claude Code attach 流
+
+#### API endpoints
+
+新加 4 个 ccteam web API:
+- `GET /api/v1/teams` — 列出 host 所有 team(从 F95 discovery)
+- `GET /api/v1/teams/<name>` — 单 team 详情(config + tasks 计数 + 最近消息)
+- `GET /api/v1/teams/<name>/tasks` — 全 task 列表
+- `GET /api/v1/teams/<name>/inbox?teammate=<n>&since=<ts>` — mailbox 拉取(支持 since cursor)
 
 #### SSE wiring
-复用 F90 SSE 推送基础设施(`/api/v1/projects/<slug>/events`),不开新通道。3 面板订阅同一 SSE stream,前端按 event type 路由更新。
+新加 SSE channel:`/api/v1/teams/<name>/events`,推送 6 类 team event(F95 提供 5 类 + F94 提供 `team_teammate_idle`)— 镜像到 progress.jsonl 后由 web backend forward。
 
 ### 验收
-1. agent-team workflow 起后 web SPA 详情页显示 3 个新面板;artifact-driven 工作流页面不变(SPA 检测 `mode` 字段路由)
-2. Team Topology:lead spawn 5 teammate → 节点图 5s 内显示 6 个节点 + 边线连接
-3. Task Board:lead create 3 task → Pending 列出现 3 卡;teammate 完成 1 个 → 该卡移到 Completed 列
-4. Mailbox:teammate A → B 发消息 → Stream 出现一行,可点击展开
-5. SSE 断线 → 面板显示"reconnecting...",5s 内自动重连,无数据丢失(后端从 last_event_id resume)
-6. 跨浏览器:Chrome / Firefox / Safari 最新版 + iOS Safari(响应式)
+1. host 跑过 agent team(如 roblog)→ ccteam web `/teams` tab 显示 roblog 卡片(4 members)
+2. 点 roblog 进详情页 → Team Topology 5s 内 render lead + researcher + frontend-dev + reviewer + pm 五节点
+3. roblog tasks/ 加文件 → Task Board 5s 内出现新 task 卡(Pending 列)
+4. teammate 间 SendMessage 落 inboxes/ → Mailbox Stream 5s 内出现消息
+5. host 同时有 2+ agent team → `/teams` tab 列两个,不串味
+6. ccteam-managed agent-team workflow(F93/F94 落地后)+ host interactive team(用户自起)同时存在 → 两者都在 `/teams` tab(无区分,**ccteam 视所有 team 为平等可视化对象**)
+7. SSE 断线 → 面板"reconnecting...",5s 内自动重连
+8. 跨浏览器:Chrome / Firefox / Safari 最新版 + iOS Safari(响应式)
 
 ---
 

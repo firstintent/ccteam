@@ -25,22 +25,33 @@ V0.4.6 `workflow.yaml` 隐式一种 mode = **artifact-driven**(ArtifactWatcher i
 
 ## 二、Finding 列表
 
-### MVP(本版本必交付)
+### 设计原则:Anthropic 是 SoT,ccteam 只读 + 工厂 + 可视化
+
+实地探测 host `~/.claude/teams/roblog/` 发现 Anthropic 已经把完整 team 元数据落文件:
+- `config.json` — members 拓扑(每 member 含 agentId/name/color/agentType/model/prompt/cwd/tmuxPaneId/subscriptions/backendType/planModeRequired)
+- `inboxes/<teammate>.json` — **单文件 per 收件人,数组 of messages**(`from`/`text`/`timestamp`/`color`/`read`)
+- `~/.claude/tasks/<team_name>/<id>.json` — 任务文件
+
+→ ccteam **绝不复刻**这些结构;F95 watcher 读 + 镜像到 `progress.jsonl`,F96 web 可视化。但 ccteam **加价值**:(1)workflow.yaml 把 lead 启动意图版本化(F93);(2)hook 精度补 watcher 拿不到的 idle 信号(F94);(3)长跑 + 跨设备 web 可视化(F96)。
+
+**V0.5.0 完整交付** — 5 finding 全做。
+
+### MVP(V0.5.0 完整交付)
 
 | # | 标题 | 一句话 |
 |---|---|---|
-| **F92** | 真 cost 数据源(linkScanPath jsonl) | `~/.claude/jobs/<>/state.json::cost_usd_total` 实测为 0,真实 cost 在 transcript jsonl 的 `usage` 字段;ccteam `cost_summary` 切到这个源。**agent-team mode 的预置项**(否则 budget cap + Cost Sparkline 都假数据) |
-| **F93** | workflow.yaml `mode: agent-team` schema + `__lead` role | 新顶层 `mode` 字段;`agent_team` 子表声明 `lead_seed` / `teammate_mode` / `default_model` / `require_plan_approval` / `cleanup_on_stop`;`__lead` role 默认模板 + `ccteam init --mode agent-team` 工厂 |
-| **F94** | Agent Teams 3 hook 镜像 + 5 新 event 类型 | `templates/settings.json` 加 `TeammateIdle` / `TaskCreated` / `TaskCompleted` hook(沿用 `__CCTEAM_BIN__ internal hook progress-append <event>` pattern);`progress.jsonl` 加 `team_task_created` / `team_task_completed` / `team_teammate_idle` / `team_member_joined` / `team_message_sent` 五类 |
-| **F95** | ArtifactWatcher 扩展到 `~/.claude/teams/` + `~/.claude/tasks/` | 监 `config.json` 变化 → `team_member_joined`;监 `tasks/<team>/*` → 镜像 task event。只读不写 — Anthropic 是源,ccteam 是镜 |
-| **F96** | Web SPA 3 新面板 | **Team Topology**(节点图:lead + teammate,显示 model / 当前 activity / cost / 状态)+ **Task Board**(Kanban 3 列 + 依赖图)+ **Mailbox Stream**(消息时间线);复用 F90 SSE 推送 |
+| **F92** | 真 cost 数据源(linkScanPath jsonl) | `~/.claude/jobs/<>/state.json::cost_usd_total` 实测为 0,真数据在 transcript jsonl `usage`;ccteam `cost_summary` 切源;F96 teammate cost 显示前置项 |
+| **F93** | workflow.yaml `mode: agent-team` schema + `__lead` role 工厂 | `ccteam init --mode agent-team` 生成 `__lead.md` + agent-team workflow.yaml;orchestrator `claude --bg --agent __lead` spawn 长跑 lead;`lead_seed` user-turn 注入(不是 system prompt);**factory 是必需 — 用户不再每次手敲自然语言起团队** |
+| **F94** | Agent Teams 3 hook 镜像 + 6 类新 event(精度提升)| `TeammateIdle` / `TaskCreated` / `TaskCompleted` hook 装到 ccteam-spawned __lead session;补 F95 watcher 拿不到的 `team_teammate_idle` 信号;TaskCreate/Complete 延迟从 ~100ms 降到 <50ms |
+| **F95** | ArtifactWatcher 扩展 — 读 `~/.claude/teams/` SoT(MVP 核心)| watch `config.json`(member 拓扑)+ `inboxes/<teammate>.json`(mailbox 数组,含 `read` 状态)+ `tasks/<>/`(task);diff → 镜像 5 类 team event 到 `progress.jsonl`。覆盖 ccteam-managed team **和** 用户 interactive team 两种,**只读** |
+| **F96** | Web SPA Teams tab + 3 新面板(覆盖所有 host teams)| 新顶级 `/teams` tab(平 `/projects`)列出所有 `~/.claude/teams/<>/`;详情页 = Team Topology(节点图)+ Task Board(Kanban)+ Mailbox Stream(消息时间线,高亮未读);4 API endpoints + SSE。**核心差异化** vs OMC(无可视化) |
 
-### V0.5.x 延期(MVP 后打磨)
+### V0.5.x 延期(后续打磨)
 
 | # | 标题 | 为什么延期 |
 |---|---|---|
-| **F97** | Lifecycle 完善 — `cleanup_on_stop` 3 策略 / `--restart-team` / hot-reload 约束 | MVP 用 `force-kill` 简化语义;`ask-lead` + `leave-running` 需要跟 lead LLM 协同测试 |
-| **F98** | plan-approval ↔ outbox 联动(扩 F87 intercept-ask)| MVP 走 native plan-approval(lead 自决);要走 outbox 让用户 review 需要扩 hook |
+| **F97** | Lifecycle 完善 — `cleanup_on_stop` 3 策略(`ask-lead` / `leave-running`)/ `--restart-team` / orphan scan(借 OMC `cleanup-orphans.mjs` pattern)| MVP `force-kill` + ccteam doctor `--gc-orphan-teammates` 已够用;3 策略 + restart 需要更多用户反馈打磨 |
+| **F98** | plan-approval ↔ outbox 联动(扩 F87 intercept-ask)| MVP 走 native plan-approval(lead 自决);outbox 模式需更多 hook 改造 |
 | **F99** | Claude Code 版本 gating + `doctor --check-agent-teams` | MVP 假定 user 已升 ≥2.1.32;正式 gating 在 V0.5.1 |
 
 ---

@@ -60,36 +60,40 @@
 
 ## Wave 2 — observation(F95)
 
-### F95 — ArtifactWatcher 扩展
+### F95 — ArtifactWatcher 扩展(实测 schema 后简化)
+
+实测发现 mailbox 是 `inboxes/<teammate>.json` **单文件** per 收件人,不是目录;message 已带 `from/text/timestamp/color/read` 字段。**不需要扫 teammate transcript jsonl**,**不需要 Haiku summarize** — 直接读文件 + 截前 200 char 即可。
 
 | 文件 | 改动 |
 |---|---|
-| `crates/ccteam-core/src/artifact_watcher.rs` | 加 `add_agent_teams_watches(slug, workflow_name)` 函数:`~/.claude/teams/<workflow_name>/config.json` + `~/.claude/tasks/<workflow_name>/` + 动态 teammate transcript |
-| `crates/ccteam-core/src/teams_config_parser.rs`(新)| 解析 `~/.claude/teams/<>/config.json`,提取 `members[]`;diff 老快照 → emit `team_member_joined` / `team_member_left` |
-| `crates/ccteam-core/src/transcript_send_message_scanner.rs`(新)| tail 单个 teammate transcript jsonl,找 `tool_use: SendMessage`,提取 from(jsonl 文件归属)/to(arg)/body;调 Haiku 总结(`crates/ccteam-core/src/summarize.rs` 复用或新建) |
-| `crates/ccteam-core/src/summarize.rs`(新或复用)| Haiku 一句话总结 message body;走 Anthropic API |
-| `crates/ccteam-core/tests/agent_teams_watcher_test.rs`(新)| config.json mtime 变 / SendMessage 解析 / Anthropic schema 兼容 fallback |
+| `crates/ccteam-core/src/artifact_watcher.rs` | 加 `add_agent_teams_discovery()` — daemon 启动 + 60s 周期扫 `~/.claude/teams/*/config.json` |
+| `crates/ccteam-core/src/teams_config_parser.rs`(新)| 解析 `~/.claude/teams/<>/config.json`,提取 `members[]` + 每 member 全字段(agentId/name/color/agentType/model/cwd/tmuxPaneId/subscriptions/backendType/planModeRequired);diff snapshot → emit `team_member_joined` / `team_member_left` |
+| `crates/ccteam-core/src/teams_inbox_parser.rs`(新)| 解析 `~/.claude/teams/<>/inboxes/<teammate>.json` 数组;diff snapshot by timestamp → 新 message → emit `team_message_sent`(`text` 截 200 char);**识别 `text` 是 JSON-stringified `idle_notification` 类系统消息 → 分流到 F94 event(不进 mailbox stream)** |
+| `crates/ccteam-core/src/teams_task_parser.rs`(新)| 解析 `~/.claude/tasks/<>/<id>.json`;监 dir 新文件 + modify;diff `status` 状态机(pending/in_progress/completed)→ emit `team_task_created` / `team_task_completed` |
+| `crates/ccteam-core/tests/agent_teams_watcher_test.rs`(新)| 全用 host fixture(`references/claude-code/teams-samples/`)— config.json 加 member / inbox 加 message / task status 流转 / schema 解析失败 graceful |
 
-**估工**:1 个 subagent,2-3 天(Haiku summarize 是新依赖,需要测试覆盖)。
+**估工**:1 个 subagent,1-2 天(Haiku 不需要 + 文件 schema 已 probe → 比原计划简单)。
 
 ---
 
 ## Wave 3 — UI(F96)
 
-### F96 — Web SPA 3 面板
+### F96 — Web SPA Teams tab + 3 面板
 
 | 文件 | 改动 |
 |---|---|
-| `crates/ccteam-web/src/api_v1.rs` | 加 endpoint `GET /api/v1/projects/<slug>/team`:返回 lead + members + tasks + messages snapshot |
-| `crates/ccteam-web/src/sse.rs` | 5 新 event 透传到 SSE stream(已有 SSE 基础设施支持任意 event,工作主要在前端) |
-| `crates/ccteam-web/web/spa/src/panels/TeamTopology.tsx`(新)| D3 force-directed graph;节点 = teammate;边 = 消息流频次 |
-| `crates/ccteam-web/web/spa/src/panels/TaskBoard.tsx`(新)| Kanban 3 列;DnD 不支持(MVP 只展示,不让用户改 task 状态) |
-| `crates/ccteam-web/web/spa/src/panels/MailboxStream.tsx`(新)| 时间线 + 过滤 + 搜索 |
-| `crates/ccteam-web/web/spa/src/pages/WorkflowDetailPage.tsx` | 检测 `workflow.mode === "agent-team"` → 渲染 3 新面板;否则渲染 V0.4.6 原 4 面板 |
-| `crates/ccteam-web/tests/api_v1_team_test.rs`(新)| /api/v1/projects/<slug>/team 4 测试:lead 在 / lead 不在 / 多 teammate / 解析失败 graceful |
-| `crates/ccteam-web/web/spa/test/panels/*.test.tsx` | 每面板 component test 5+ 个 |
+| `crates/ccteam-web/src/api_v1.rs` | 加 4 endpoint:`GET /api/v1/teams`(列表)/ `/teams/<name>`(单 team)/ `/teams/<name>/tasks` / `/teams/<name>/inbox?teammate=&since=` |
+| `crates/ccteam-web/src/sse.rs` | 加 `/api/v1/teams/<name>/events` SSE channel,推 6 类 team event(F95 5 + F94 1) |
+| `crates/ccteam-web/web/spa/src/pages/TeamsListPage.tsx`(新)| `/teams` 顶级 tab,列出 host 所有 team 卡片(name / 描述 / member 数 / 最新活动 ts) |
+| `crates/ccteam-web/web/spa/src/pages/TeamDetailPage.tsx`(新)| `/teams/<name>` 详情页,3 面板 layout |
+| `crates/ccteam-web/web/spa/src/panels/TeamTopology.tsx`(新)| D3 force-directed graph;节点 = teammate(从 config.json::members[]);边 = subscriptions[] |
+| `crates/ccteam-web/web/spa/src/panels/TaskBoard.tsx`(新)| Kanban 3 列(pending/in_progress/completed);卡片含 task title / owner / 依赖 |
+| `crates/ccteam-web/web/spa/src/panels/MailboxStream.tsx`(新)| 时间线 + 未读高亮(`read: false`)+ 按 teammate 对过滤 + 搜索 |
+| `crates/ccteam-web/web/spa/src/AppRoutes.tsx` | header tabs 加 Teams 项;路由 `/teams` + `/teams/:name` |
+| `crates/ccteam-web/tests/api_v1_teams_test.rs`(新)| 4 endpoint × 3-4 测试(空 / 1 team / 多 team / schema 兼容 fallback) |
+| `crates/ccteam-web/web/spa/test/panels/*.test.tsx` | 每面板 component test 5+ 个;**fixtures 用 references/claude-code/teams-samples/** |
 
-**估工**:1 个前端 + 1 个 API subagent 并行,3-4 天。
+**估工**:1 个前端 + 1 个 API subagent 并行,3 天(schema 已 probe → 比原计划清晰)。
 
 ---
 

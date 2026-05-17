@@ -29,6 +29,7 @@
 | [`research/ccteam-ast-grep-integration.md`](research/ccteam-ast-grep-integration.md) | ast-grep 集成分析(结构搜索 / 规则 / codemod) |
 | [`research/omc-orchestration-modes.md`](research/omc-orchestration-modes.md) | OMC 8 mode 全谱调研(为 [`../orchestration-patterns.md`](orchestration-patterns.md) 提供素材) |
 | [`research/omc-vs-ccteam-orchestration.md`](research/omc-vs-ccteam-orchestration.md) | prompt-as-orchestrator vs code-as-orchestrator 对比 |
+| [`research/omc-team-comparison.md`](research/omc-team-comparison.md) | OMC team SKILL.md vs Anthropic Agent Teams 实测 schema vs ccteam V0.5.0 落地对照(V0.5.0 立项依据)|
 
 ## 版本归档(`v0-x-x/`)
 
