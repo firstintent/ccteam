@@ -31,9 +31,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// One-shot setup: create `~/.ccteam/` skeleton, unpack phase
-    /// templates, and run a quick health check (claude / tmux /
-    /// ccteam-on-PATH). Idempotent — safe to re-run.
+    /// One-shot setup: create `~/.ccteam/` skeleton, stamp the per-project
+    /// `workflow.yaml` + `.claude/agents/` scaffolds, and run a quick
+    /// health check (claude / tmux / ccteam-on-PATH). Idempotent —
+    /// safe to re-run.
     ///
     /// V0.4.2 F72: `ccteam init` is the unified project install.
     /// Defaults to installing in the current working directory (slug =

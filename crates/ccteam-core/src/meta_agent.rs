@@ -80,9 +80,7 @@ pub fn clean_stale_meta_layouts(paths: &CcteamPaths) -> Result<Vec<PathBuf>> {
         return Ok(Vec::new());
     }
     let mut removed = Vec::new();
-    for entry in
-        std::fs::read_dir(root).with_context(|| format!("read_dir {}", root.display()))?
-    {
+    for entry in std::fs::read_dir(root).with_context(|| format!("read_dir {}", root.display()))? {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
             continue;
@@ -231,16 +229,19 @@ mod tests {
     }
 
     #[test]
-    fn render_role_prompt_includes_seven_required_chapters() {
+    fn render_role_prompt_includes_v050_required_chapters() {
+        // V0.5.0 F101: meta-agent reshape — chapters reduced to 5
+        // (identity / routing / dispatcher discipline / inbox-outbox /
+        // dashboard). The V0.2-era "派单工具" + "监控规则" + 7-chapter
+        // outline is gone with the phase-pipeline coordinator role.
         let body = render_meta_role_prompt();
         for required in [
             "你是谁",
-            "决策树",
+            "路由决策树",
             "克制规则",
-            "派单工具",
-            "监控规则",
             "inbox",
             "outbox",
+            "dashboard chat",
         ] {
             assert!(
                 body.contains(required),
@@ -250,16 +251,26 @@ mod tests {
     }
 
     #[test]
-    fn render_role_prompt_includes_dev_and_research_team_options() {
+    fn render_role_prompt_routes_via_v050_skills() {
+        // V0.5.0 F101: the role prompt's routing tree should explicitly
+        // delegate new-project creation to the `ccteam-creator` skill
+        // and bounce agent-team requests to the user's own session via
+        // `/ccteam:team`. Pin both so a future edit can't silently drop
+        // either delegation arm.
         let body = render_meta_role_prompt();
-        assert!(body.contains("research"));
-        // V0.4.2: switched to space-separated CLI flags
-        // (`--team dev` / `--team research`) when F75 simplified the
-        // `ccteam new` surface.
-        assert!(body.contains("--team dev") && body.contains("--team research"));
         assert!(
-            body.contains("不确定要不要做") || body.contains("调研下"),
-            "team-selection heuristics must include the unsure-idea / research signal",
+            body.contains("ccteam-creator"),
+            "role prompt must point at the ccteam-creator skill for new projects",
+        );
+        assert!(
+            body.contains("/ccteam:team"),
+            "role prompt must mention the /ccteam:team skill for agent-team requests",
+        );
+        // memory_bridge_*.md is the cross-project memory contract; it
+        // must survive the F101 reshape (red line).
+        assert!(
+            body.contains("memory_bridge_dev.md") || body.contains("memory_bridge"),
+            "role prompt must keep the cross-project memory bridge reference",
         );
     }
 

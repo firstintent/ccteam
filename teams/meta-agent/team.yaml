@@ -1,11 +1,9 @@
 name: meta-agent
-description: User-facing NL dispatcher session. Long-running event loop, no phase DAG.
+description: User-facing NL dispatcher session. Long-running event loop; V0.5.0 F101 — lightweight router + cross-project memory bridge + dashboard chat.
 
-# V0.2 §6.4 candidate 5 — declarative replacement for the old
-# `if state.team == META_TEAM_NAME` branches in orchestrator.rs.
-# Evergreen sessions never reach a phase-DAG terminal state and are
-# dispatched through process_meta_project (inbox drain + context
-# reset) rather than the AdvancePhase / DispatchPhase loop.
+# Evergreen session — meta-agent runs as one long tmux session.
+# `process_meta_project` (inbox drain + context reset) dispatches it
+# rather than any pipeline / DAG loop.
 evergreen: true
 
 # Cost is the user's running tab here, not a per-project budget —
@@ -14,35 +12,30 @@ evergreen: true
 cost_policy:
   kind: none
 
-# Phase markdown directory — declared for schema completeness even
-# though meta-agent ships no phase templates (phase set is empty).
-# load_team_runtimes treats `evergreen: true` as exempt from the
-# phase_dir-must-exist check. V0.2 M0.17.2: `phase_dir` is now
-# relative to the team directory (~/.ccteam/teams/meta-agent/).
+# Directory declared for schema completeness even though meta-agent
+# ships nothing here. `load_team_runtimes` treats `evergreen: true`
+# as exempt from the must-exist check; the dir name is relative to
+# the team directory (`~/.ccteam/teams/meta-agent/`).
 phase_dir: phases
 
-# Auto-managed CLAUDE.md template (M0.16.3) — body lives in
-# crates/ccteam-core/src/templates/meta_agent_role.md so the
-# meta-agent's role prompt stays the source of truth for the
-# session's CLAUDE.md. `claude_md_template` is left empty so
-# bootstrap_meta_project keeps owning the CLAUDE.md write path
-# (renders the role prompt instead of using the team's template).
+# Auto-managed CLAUDE.md template — body lives in
+# `crates/ccteam-core/src/templates/meta_agent_role.md` so the
+# meta-agent's role prompt stays the SoT for the session's CLAUDE.md.
+# Leaving `claude_md_template` empty keeps `bootstrap_meta_project`
+# the owner of the CLAUDE.md write path (renders the role prompt
+# instead of using the team's template).
 claude_md_template: ""
 
-# No retro / critic / escalate-grammar / verdict — meta-agent is a
-# session, not a phase pipeline.
+# V0.5.0 F101: meta-agent is now a router/memory-bridge/dashboard
+# session, not a pipeline. retro / critic / escalate-grammar / verdict
+# schemas are empty and the V0.2 `forbid_ask_user_question` golden
+# rule was dropped — the new role prompt (`meta_agent_role.md`)
+# documents inbox/outbox semantics directly, no rule injection
+# needed.
 retro_schema: []
 critic_dimensions: []
 escalate_grammar_extensions: []
 verdict_schema: []
-
-# V0.2 M0.19.4: meta-agent has no phase pipeline but the same
-# self-loop protocol applies to its dispatcher prompt — every
-# AskUserQuestion attempt has to route through the outbox so an
-# offline user never freezes the long-running session.
 golden_rules:
-  protocol:
-    - rule_id: forbid_ask_user_question
-      enforce: prompt_directive
-      directive: "禁用 AskUserQuestion / 纯文本问句。询问用户唯一合法出口是写 .ccteam/outbox/clarify-<ts>.md(配 PHASE_DONE_PENDING 或 ESCALATE NEED_USER_INPUT)。"
+  protocol: []
   domain: []

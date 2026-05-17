@@ -206,10 +206,14 @@ fn write_settings_template(
     Ok(())
 }
 
-/// M2.4: write the embedded `HELPER_TEMPLATES` into
-/// `<global_dir>/templates/<filename>` so user-authored markdown's
-/// `@~/.ccteam/templates/<filename>` reference resolves. Idempotent;
-/// `force == false` preserves operator hand-edits.
+/// M2.4 / V0.5.0 F101: ensure `<global_dir>/templates/` exists + write
+/// any embedded payloads in [`HELPER_TEMPLATES`] so user-authored
+/// markdown's `@~/.ccteam/templates/<filename>` reference resolves.
+/// Idempotent; `force == false` preserves operator hand-edits.
+///
+/// V0.5.0 F101 emptied `HELPER_TEMPLATES`, so the writer now just
+/// guarantees the directory exists. Future helpers added back to the
+/// list will be stamped here automatically.
 pub fn write_global_helper_templates(global_dir: &Path, force: bool) -> Result<()> {
     let dir = global_dir.join("templates");
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
