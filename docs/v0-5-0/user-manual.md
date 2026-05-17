@@ -263,6 +263,7 @@ V0.2 的 meta-agent 是 "全权调度 + phase 流水线 + 项目创建" singleto
 | `ccteam init --mode agent-team` 报错 | Claude Code 版本不够 (≥ 2.1.32 需要),或 `agents/__lead.md` 模板缺(`ccteam doctor --install-agents`) |
 | Team mailbox 消息没显示 | `~/.claude/teams/<>/inboxes/<teammate>.json` 文件是否 schema 改了?ccteam degrade 到 mtime-only,daemon log 有 WARN |
 | `cargo test` 跑出 ~60 reqwest 502 | host 设了 `HTTP_PROXY` 转 localhost — `unset HTTP_PROXY HTTPS_PROXY` 再跑 |
+| Lead 报 `Team "<name>" already exists at ~/.claude/teams/<name>/config.json` | 上次 spawn 死前已写 team config 残留(V0.5.1 F105 前死 lead 也可能;`ccteam stop` **设计上不清** `~/.claude/teams/`,该路径是 Anthropic SoT)。**手工清**:`rm -rf ~/.claude/teams/<team_name>/` 然后回 lead session 让它 retry TeamCreate。或者改 workflow.yaml::agent_team.team_name 用新名 |
 
 ---
 
