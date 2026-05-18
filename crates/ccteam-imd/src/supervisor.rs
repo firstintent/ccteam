@@ -237,6 +237,13 @@ impl BotSupervisor {
         self.state.lock().await.handle.clone()
     }
 
+    /// Snapshot the live per-bot state — used by the daemon tick when
+    /// calling [`decide`] (pure function; needs a current view of
+    /// `handle` + `restarts` + flags to make the right call).
+    pub async fn state_snapshot(&self) -> BotState {
+        self.state.lock().await.clone()
+    }
+
     /// Idempotent: start the underlying tmux session via
     /// `adapter.start_thread` if not already running.
     pub async fn ensure_started(&self) -> Result<()> {

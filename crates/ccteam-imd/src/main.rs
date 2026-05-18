@@ -115,6 +115,7 @@ fn main() -> Result<()> {
                 } else {
                     Some(std::time::Duration::from_secs(max_seconds))
                 },
+                adapter_factory: None,
             }))?;
         }
         Command::Register {
