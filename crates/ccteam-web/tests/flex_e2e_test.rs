@@ -21,8 +21,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use ccteam_core::{
-    CcteamPaths, CodexAdapter, HarnessAdapter, HarnessKind, HarnessSnapshot, ProjectState,
-    SessionRecord, SpawnOpts, TeamKind,
+    CcteamPaths, HarnessKind, HarnessSnapshot, ProjectState, SessionRecord, SpawnCtx, TeamKind,
 };
 use ccteam_web::{router_with_state, AppState};
 use reqwest::redirect::Policy;
@@ -320,29 +319,27 @@ async fn v0_3_1_flex_dashboard_session_sse_harness_and_actions() {
 }
 
 #[test]
-fn v0_4_0_codex_adapter_is_no_longer_trait_stub() {
-    // V0.4.0 F62 replaces V0.3.1's NotImplemented stub with a real
-    // tmux + codex CLI implementation. This regression guard pins
-    // that contract: the pure-Rust `ingest_snapshot` path is now
-    // permissive (returns a fallback snapshot for empty pane bodies)
-    // and never produces `NotImplemented`. Spawn / shutdown surfaces
-    // are tmux-dependent and live under the `codex-tests` feature.
-    let adapter = CodexAdapter::new();
-    let snap = adapter
-        .ingest_snapshot("")
-        .expect("ingest fallback must succeed post-F62");
+fn v0_6_0_codex_exec_adapter_pane_ingest_is_permissive() {
+    // V0.6.0 F107 — `ingest_snapshot` was dropped from the trait
+    // surface (Option C: 5-method trait alignment with Codex
+    // ThreadManager). Codex pane-capture parsing now lives as a free
+    // fn in `ccteam_core::execution::codex_exec::ingest_codex_pane`.
+    // This regression guard preserves the V0.4.0 F62 contract: empty
+    // pane bodies return a permissive fallback snapshot (model =
+    // "codex", context_pct = 0), never `NotImplemented`.
+    let snap = ccteam_core::execution::codex_exec::ingest_codex_pane("")
+        .expect("ingest fallback must succeed post-F107");
     assert_eq!(snap.harness, "codex");
     assert_eq!(snap.model_display_name, "codex");
     assert_eq!(snap.context_used_pct, 0);
-    // SpawnOpts still round-trip cleanly — schema unchanged across
-    // F62. (We do NOT call spawn_session here; that's covered by the
-    // codex-tests feature-gated integration test.)
-    let _opts = SpawnOpts {
-        harness: "codex",
+
+    // SpawnCtx (replaces V0.4.0 SpawnOpts on the trait surface) still
+    // round-trips cleanly through the Wave 1 schema.
+    let _ctx = SpawnCtx {
         slug: "flex-e2e".into(),
         sid: "codex-1".into(),
         cwd: std::env::temp_dir(),
-        role: String::new(),
+        project_dir: std::env::temp_dir(),
         extra_args: Vec::new(),
     };
 }

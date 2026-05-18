@@ -27,8 +27,10 @@ use tempfile::TempDir;
 
 use ccteam_core::artifact_watcher::{ArtifactEvent, WatchKind};
 use ccteam_core::harness::{
-    HarnessAdapter, HarnessError, HarnessSnapshot, SessionHandle, SpawnOpts,
+    AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, SessionHandle,
+    SpawnCtx, ThreadEvent, ThreadHandle, TurnId, TurnInput,
 };
+use futures::stream::{self, BoxStream};
 use ccteam_core::orchestrator::{Orchestrator, OrchestratorConfig};
 use ccteam_core::workflow::{AgentSpec, Executor, Trigger, WorkflowSpec};
 use ccteam_core::CcteamPaths;
@@ -37,9 +39,16 @@ use ccteam_core::CcteamPaths;
 // MockAdapter
 // =====================================================================
 
-/// Test double — records every `spawn_session` call, returns a fake
-/// [`SessionHandle`]. The next-fail counter lets a test set up "first N
+/// Test double — records every `start_thread` call, returns a fake
+/// [`ThreadHandle`]. The next-fail counter lets a test set up "first N
 /// spawns must fail" scenarios for escalation coverage.
+///
+/// V0.6.0 F107 migration: this impl drives the new 5-method
+/// HarnessAdapter trait. `vendor()` is derived from `name`
+/// (`"claude"` / `"codex"` substring); `start_thread` mirrors the old
+/// `spawn_session` semantics; `close_thread` increments the shutdown
+/// guard counter (red-line "orchestrator must never call close_thread
+/// on its own" still applies).
 #[derive(Clone, Default)]
 struct MockAdapter {
     name: &'static str,
@@ -72,38 +81,78 @@ impl MockAdapter {
     }
 }
 
+#[async_trait::async_trait]
 impl HarnessAdapter for MockAdapter {
     fn name(&self) -> &'static str {
         self.name
     }
-    fn ingest_snapshot(&self, _raw: &str) -> Result<HarnessSnapshot, HarnessError> {
-        Err(HarnessError::IngestFailed("mock".into()))
+
+    fn vendor(&self) -> AgentVendor {
+        if self.name.contains("codex") {
+            AgentVendor::Codex
+        } else {
+            AgentVendor::Claude
+        }
     }
-    fn spawn_session(&self, opts: SpawnOpts) -> Result<SessionHandle, HarnessError> {
+
+    async fn start_thread(
+        &self,
+        _spec: &AgentSpecBrief,
+        ctx: &SpawnCtx,
+    ) -> Result<ThreadHandle, HarnessError> {
         if self.fail_remaining.load(Ordering::SeqCst) > 0 {
             self.fail_remaining.fetch_sub(1, Ordering::SeqCst);
             return Err(HarnessError::SpawnFailed("mock fail".into()));
         }
         let n = self.seq.fetch_add(1, Ordering::SeqCst);
-        let sid = opts.sid;
-        let exec = match opts.harness {
-            "codex" => "codex",
-            _ => "claude",
+        let sid = ctx.sid.clone();
+        let exec = if self.name.contains("codex") {
+            "codex"
+        } else {
+            "claude"
         };
         self.spawned
             .lock()
             .unwrap()
-            .push((opts.slug.clone(), sid.clone(), exec.to_string()));
-        Ok(SessionHandle {
-            tmux_session: format!("mock-{}-{}-{}", opts.slug, exec, n),
-            harness: self.name.to_string(),
-            sid,
-            pid: Some(10_000 + n as u32),
+            .push((ctx.slug.clone(), sid.clone(), exec.to_string()));
+        let tmux_session = format!("mock-{}-{}-{}", ctx.slug, exec, n);
+        let identity = if exec == "claude" {
+            // Bg adapters use job_id as identity.
+            format!("mock-job-{n}")
+        } else {
+            tmux_session.clone()
+        };
+        Ok(ThreadHandle {
+            vendor: self.vendor(),
+            mode: ExecutionMode::Bg,
+            identity,
             started_at: chrono::Utc::now(),
-            job_id: None,
+            raw_extras: serde_json::json!({
+                "tmux_session": tmux_session,
+                "pid": 10_000u64 + n,
+            }),
         })
     }
-    fn shutdown_session(&self, _handle: &SessionHandle) -> Result<(), HarnessError> {
+
+    async fn submit_turn(
+        &self,
+        h: &ThreadHandle,
+        _input: TurnInput,
+    ) -> Result<TurnId, HarnessError> {
+        Ok(TurnId::new(format!("mock-turn-{}", h.identity)))
+    }
+
+    fn events(&self, _h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
+        Box::pin(stream::empty())
+    }
+
+    async fn resume_thread(&self, _persistent_id: &str) -> Result<ThreadHandle, HarnessError> {
+        Err(HarnessError::NotImplemented {
+            reason: "MockAdapter does not implement resume_thread".to_string(),
+        })
+    }
+
+    async fn close_thread(&self, _h: &ThreadHandle) -> Result<(), HarnessError> {
         self.shutdown_calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -1539,29 +1588,50 @@ async fn t35_agent_spawn_event_carries_job_id_field() {
     // The default MockAdapter returns `job_id: None`; use a custom
     // adapter that returns a fixed string and verify it round-trips.
     use ccteam_core::harness::{
-        HarnessAdapter, HarnessError, HarnessSnapshot, SessionHandle, SpawnOpts,
+        AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx,
+        ThreadEvent, ThreadHandle, TurnId, TurnInput,
     };
+    use futures::stream::{self, BoxStream};
 
     #[derive(Default)]
     struct JobIdMockAdapter;
+    #[async_trait::async_trait]
     impl HarnessAdapter for JobIdMockAdapter {
         fn name(&self) -> &'static str {
             "claude-mock"
         }
-        fn ingest_snapshot(&self, _raw: &str) -> Result<HarnessSnapshot, HarnessError> {
-            Err(HarnessError::IngestFailed("mock".into()))
+        fn vendor(&self) -> AgentVendor {
+            AgentVendor::Claude
         }
-        fn spawn_session(&self, opts: SpawnOpts) -> Result<SessionHandle, HarnessError> {
-            Ok(SessionHandle {
-                tmux_session: format!("mock-{}", opts.sid),
-                harness: "claude-mock".into(),
-                sid: opts.sid,
-                job_id: Some("abc12345".into()),
-                pid: None,
+        async fn start_thread(
+            &self,
+            _spec: &AgentSpecBrief,
+            ctx: &SpawnCtx,
+        ) -> Result<ThreadHandle, HarnessError> {
+            Ok(ThreadHandle {
+                vendor: AgentVendor::Claude,
+                mode: ExecutionMode::Bg,
+                identity: "abc12345".into(),
                 started_at: chrono::Utc::now(),
+                raw_extras: serde_json::json!({"tmux_session": format!("mock-{}", ctx.sid)}),
             })
         }
-        fn shutdown_session(&self, _h: &SessionHandle) -> Result<(), HarnessError> {
+        async fn submit_turn(
+            &self,
+            h: &ThreadHandle,
+            _input: TurnInput,
+        ) -> Result<TurnId, HarnessError> {
+            Ok(TurnId::new(format!("mock-{}", h.identity)))
+        }
+        fn events(&self, _h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
+            Box::pin(stream::empty())
+        }
+        async fn resume_thread(&self, _persistent_id: &str) -> Result<ThreadHandle, HarnessError> {
+            Err(HarnessError::NotImplemented {
+                reason: "mock".to_string(),
+            })
+        }
+        async fn close_thread(&self, _h: &ThreadHandle) -> Result<(), HarnessError> {
             Ok(())
         }
     }

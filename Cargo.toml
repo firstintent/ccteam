@@ -35,6 +35,14 @@ regex = { version = "1", default-features = false, features = ["std", "perf"] }
 # and the variant set is exhaustive without per-call format!() boilerplate.
 thiserror = "1"
 
+# V0.6.0 F107 — async trait methods on HarnessAdapter (5-method
+# thread/turn shape). `async fn` in traits requires `async-trait`
+# crate until Rust's native AFIT stabilizes object-safety + dyn use.
+async-trait = "0.1"
+# V0.6.0 F107 — `BoxStream<'static, ThreadEvent>` return for the
+# events() trait method.
+futures = { version = "0.3", default-features = false, features = ["std"] }
+
 # V0.3 M5.0 — web UI (axum + askama). Pinned per `docs/v0-3/prd.md`
 # §3.2.2; minor bumps in M5.x must update the table there.
 axum = "0.8"
