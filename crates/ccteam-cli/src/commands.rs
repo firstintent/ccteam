@@ -3383,6 +3383,92 @@ impl std::fmt::Display for RemoveReport {
     }
 }
 
+// -------------------------------------------------------------------------
+// V0.6.0 Wave 3 F112 §C — `ccteam prefs` admin surface.
+//
+// Reads / writes `~/.ccteam/preferences.toml`. Today only the
+// fallback section has user-visible keys; V0.7+ can add more by
+// extending the parse_key match arm + emitting a friendly diagnostic
+// for unknown keys.
+// -------------------------------------------------------------------------
+
+/// Format the active preferences for `ccteam prefs show`. Includes
+/// the resolved file path so the user knows what was loaded.
+pub fn run_prefs_show(paths: &CcteamPaths) -> Result<String> {
+    let prefs = ccteam_core::preferences::load_or_default(&paths.root);
+    let path = ccteam_core::preferences::preferences_path(&paths.root);
+    let exists_marker = if path.exists() {
+        "loaded"
+    } else {
+        "defaults (file not present)"
+    };
+    let body = toml::to_string_pretty(&prefs).context("serialize preferences for display")?;
+    Ok(format!(
+        "# ccteam preferences ({exists_marker})\n# path: {}\n\n{body}",
+        path.display()
+    ))
+}
+
+/// Look up a dotted preference key. Returns the textual value or an
+/// error if the key is unknown.
+pub fn run_prefs_get(paths: &CcteamPaths, key: &str) -> Result<String> {
+    let prefs = ccteam_core::preferences::load_or_default(&paths.root);
+    match key {
+        "fallback.on_claude_quota" => Ok(match prefs.fallback.on_claude_quota {
+            ccteam_core::preferences::OnClaudeQuota::Off => "off".to_string(),
+            ccteam_core::preferences::OnClaudeQuota::Codex => "codex".to_string(),
+        }),
+        "fallback.codex.enabled_for_roles" => {
+            Ok(prefs.fallback.codex.enabled_for_roles.join(","))
+        }
+        other => Err(anyhow::anyhow!(
+            "unknown preference key: {other}\n\
+             supported keys:\n  - fallback.on_claude_quota  (off|codex)\n  \
+             - fallback.codex.enabled_for_roles  (comma list; empty = all roles)"
+        )),
+    }
+}
+
+/// Persist one preference change to `~/.ccteam/preferences.toml`.
+/// Returns a one-line confirmation suitable for stdout.
+pub fn run_prefs_set(paths: &CcteamPaths, key: &str, value: &str) -> Result<String> {
+    let mut prefs = ccteam_core::preferences::load_or_default(&paths.root);
+    match key {
+        "fallback.on_claude_quota" => {
+            prefs.fallback.on_claude_quota = match value.trim().to_lowercase().as_str() {
+                "off" => ccteam_core::preferences::OnClaudeQuota::Off,
+                "codex" => ccteam_core::preferences::OnClaudeQuota::Codex,
+                other => {
+                    return Err(anyhow::anyhow!(
+                        "fallback.on_claude_quota: unsupported value {other:?} \
+                         (expected `off` or `codex`)"
+                    ));
+                }
+            };
+        }
+        "fallback.codex.enabled_for_roles" => {
+            prefs.fallback.codex.enabled_for_roles = if value.trim().is_empty() {
+                Vec::new()
+            } else {
+                value
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            };
+        }
+        other => {
+            return Err(anyhow::anyhow!(
+                "unknown preference key: {other}\n\
+                 supported keys:\n  - fallback.on_claude_quota  (off|codex)\n  \
+                 - fallback.codex.enabled_for_roles  (comma list; empty = all roles)"
+            ));
+        }
+    }
+    ccteam_core::preferences::save(&paths.root, &prefs)?;
+    Ok(format!("set {key} = {value}"))
+}
+
 /// V0.4.6 F81 — `ccteam remove <slug>` implementation.
 ///
 /// Steps (in order):

@@ -94,6 +94,61 @@ kind 决策:
 
 **这一步禁止调 `TeamCreate` / `Task`** — 等用户回复。
 
+### 3.5 Codex critic teammate(V0.6.0 Wave 3 F112 §D — 当 N ≥ 3 时自动加入)
+
+When the parsed team size `N ≥ 3`, ccteam-team probes for the Codex
+CLI **once** per `/ccteam-team` invocation:
+
+```bash
+codex --version 2>/dev/null && codex login status 2>/dev/null
+```
+
+- Both succeed → automatically reserve **one** of the N teammate
+  slots for a `codex-critic` (the remaining `N-1` are Claude). The
+  TEAM PLAN must list it as:
+  `<N>. codex-critic (kind=ad-hoc, vendor=codex, color=red) — second-opinion
+   reviewer on every artifact the other teammates produce`
+- Either probe fails → silently fall back to all-Claude composition
+  for this run; no error surfaced. (User can re-run after installing
+  / `codex login`.)
+- `N < 3` → no codex critic auto-added (too small a team to spare a
+  slot for adversarial review). User can still ask "加个 codex
+  critic" as free-text revision to force one in.
+
+**Test override**: `$CCTEAM_CODEX_BIN` overrides the binary lookup —
+unit / e2e tests use a fake binary so the probe doesn't depend on a
+real `codex` install.
+
+The Codex critic teammate is **not** spawned via the Anthropic
+`Task` tool — that surface targets Claude-only subagents. Instead,
+the team-lead session runs the Codex teammate from skill body
+directly via Bash, in parallel with the Claude `Task` spawns:
+
+```bash
+CODEX_BIN="${CCTEAM_CODEX_BIN:-codex}"
+"$CODEX_BIN" exec --json --skip-git-repo-check <<'PROMPT' &
+You are the codex-critic teammate of team "<slug>". Your job is to
+review every artifact the other teammates produce and surface
+adversarial concerns (security, perf, edge-case correctness). Reply
+in <= 200 words per artifact. Don't write files — text only.
+
+Task: <task body>
+PROMPT
+echo "codex-critic spawned (PID $!)"
+```
+
+The team-lead session captures stdout/stderr to a temp file the
+synthesis loop polls. **No tmux** — `codex exec --json` is one-shot
+process, output is captured directly. Future Wave (F112 §D follow-up
+in V0.7) will route this through the daemon's `CodexExecAdapter` so
+cost accounting is unified.
+
+If `ccteam-imd` daemon is running and exposes
+`mcp__ccteam__advise_parallel`, the skill MAY prefer that path
+instead — daemon-side cost rollup + persistent log. Detection: a
+previous turn in this session must have registered the MCP tool;
+otherwise stay on the direct Bash spawn.
+
 ### 4. 等用户回复
 
 合法回复:

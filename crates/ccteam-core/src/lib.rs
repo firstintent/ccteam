@@ -43,6 +43,12 @@ pub mod mode_inferrer;
 pub mod orchestrator;
 pub mod paths;
 pub mod pending_inject;
+// V0.6.0 Wave 3 F112 §C — `~/.ccteam/preferences.toml` user-opt-in
+// fallback knobs (vendor swap on Claude quota exceed).
+pub mod preferences;
+// V0.6.0 Wave 3 F112 §B — auto-critic vendor decision (used by the
+// `ccteam-creator` skill Phase 3.5).
+pub mod auto_critic;
 pub mod plugin_resolution;
 pub mod progress;
 pub mod projects;

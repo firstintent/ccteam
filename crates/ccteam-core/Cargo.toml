@@ -50,6 +50,13 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 imageproc = { version = "0.25", default-features = false }
 ab_glyph = "0.2"
 
+# V0.6.0 Wave 3 F112 §C — `~/.ccteam/preferences.toml` runtime parser
+# + serializer (vendor fallback prefs). Promoted from dev-dependencies
+# so `preferences::load` / `preferences::save` are available in non-test
+# orchestrator code. `parse` + `display` features cover read + atomic
+# write; pretty-print yields stable round-trippable output.
+toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
+
 [dev-dependencies]
 tempfile = "3"
 
@@ -59,11 +66,9 @@ tempfile = "3"
 # dev-dependency for cargo dedup.
 serial_test = "3"
 
-# V0.6.0 Wave 2 F114 — persona_test.rs parses
-# `skills/ccteam-creator/personas/manifest.toml` to verify every
-# persona id has matching zh/en role.md files. Test-only dep —
-# runtime ccteam-core does not need a TOML parser.
-toml = { version = "0.8", default-features = false, features = ["parse"] }
+# V0.6.0 Wave 2 F114 / Wave 3 F112 — `toml` is now a runtime dep
+# (preferences.rs); persona_test.rs continues to use it via the
+# runtime entry, no separate dev-dep needed.
 
 [features]
 default = ["test-util"]
