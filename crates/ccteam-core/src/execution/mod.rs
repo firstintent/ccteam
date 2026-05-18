@@ -14,6 +14,10 @@
 pub mod claude_bg;
 pub mod claude_tui;
 pub mod codex_exec;
+// V0.6.0 F108 / F118 — chat-mode helpers consumed by ClaudeTuiAdapter.
+pub mod session_recovery;
+pub mod transcript_tail;
+pub mod turns_mirror;
 
 pub use claude_bg::ClaudeBgAdapter;
 pub use claude_tui::ClaudeTuiAdapter;

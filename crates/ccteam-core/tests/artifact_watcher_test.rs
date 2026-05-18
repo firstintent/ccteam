@@ -61,6 +61,7 @@ fn build_spec(name: &str, watchers: &[(&str, PathBuf)]) -> WorkflowSpec {
         budget: None,
         budgets_v060: None,
         agent_team: None,
+        chat: None,
         agents,
     }
 }

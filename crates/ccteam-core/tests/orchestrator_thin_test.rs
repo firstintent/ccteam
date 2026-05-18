@@ -30,10 +30,10 @@ use ccteam_core::harness::{
     AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, SessionHandle,
     SpawnCtx, ThreadEvent, ThreadHandle, TurnId, TurnInput,
 };
-use futures::stream::{self, BoxStream};
 use ccteam_core::orchestrator::{Orchestrator, OrchestratorConfig};
 use ccteam_core::workflow::{AgentSpec, Executor, Trigger, WorkflowSpec};
 use ccteam_core::{cost_summary, CcteamPaths};
+use futures::stream::{self, BoxStream};
 
 // =====================================================================
 // MockAdapter
@@ -215,6 +215,7 @@ fn watch_spec(role: &str, watch_rel: &str, parallelism: Option<u32>) -> Workflow
         budget: None,
         budgets_v060: None,
         agent_team: None,
+        chat: None,
         agents,
     }
 }
@@ -242,6 +243,7 @@ fn manual_spec(role: &str) -> WorkflowSpec {
         budget: None,
         budgets_v060: None,
         agent_team: None,
+        chat: None,
         agents,
     }
 }
@@ -269,6 +271,7 @@ fn gate_spec(role: &str, input_rel: &str) -> WorkflowSpec {
         budget: None,
         budgets_v060: None,
         agent_team: None,
+        chat: None,
         agents,
     }
 }
@@ -845,6 +848,7 @@ agents:
         budget: None,
         budgets_v060: None,
         agent_team: None,
+        chat: None,
         agents,
     };
     let progress = orch.paths().progress_jsonl(&slug);
@@ -1405,6 +1409,7 @@ async fn t31_inbox_target_role_routes_explicitly() {
         budget: None,
         budgets_v060: None,
         agent_team: None,
+        chat: None,
         agents,
     };
     let progress = orch.paths().progress_jsonl(&slug);

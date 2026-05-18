@@ -116,6 +116,14 @@ pub fn is_idle(last: Option<&Value>) -> bool {
             | "SessionEnd"
             | "phase_done"
             | "escalate"
+            // V0.6.0 F108 — chat-mode terminal boundaries. After a turn
+            // completes / session resets / compaction lands, the TUI
+            // session is waiting for the next user input → idle.
+            | CHAT_TURN_COMPLETED
+            | CHAT_SESSION_STARTED
+            | CHAT_SESSION_RESET
+            | CHAT_SESSION_RESET_WITH_RECOVERY
+            | CHAT_COMPACT_DONE
     )
 }
 
@@ -171,6 +179,135 @@ pub fn idle_aware_message(prompt: &str, idle: bool) -> String {
     } else {
         format!("/btw {prompt}")
     }
+}
+
+// ---------------- V0.6.0 F108 / F118 chat-mode event kinds ----------------
+
+/// `chat_session_started` — Claude Code TUI session has spawned (tmux up,
+/// SessionStart hook fired). Payload: `{role, project_dir, ts}`.
+pub const CHAT_SESSION_STARTED: &str = "chat_session_started";
+
+/// `chat_turn_user_prompt` — user submitted a turn (UserPromptSubmit hook).
+/// Payload: `{role, prompt_excerpt, turn_id, ts}`.
+pub const CHAT_TURN_USER_PROMPT: &str = "chat_turn_user_prompt";
+
+/// `chat_turn_completed` — assistant turn finished (Stop hook). Payload:
+/// `{role, turn_id, usage: UnifiedTokenUsage, ts}`.
+pub const CHAT_TURN_COMPLETED: &str = "chat_turn_completed";
+
+/// `chat_session_reset` — user / orchestrator issued `/clear` or `/new`
+/// inside the TUI session. Payload: `{role, ts}`.
+pub const CHAT_SESSION_RESET: &str = "chat_session_reset";
+
+/// `chat_session_reset_with_recovery` — F118: session-id was invalidated
+/// (compaction failure, transcript corruption, manual rebuild) and the
+/// orchestrator rehydrated last-N turns from `<bot>/turns.jsonl` into a
+/// fresh tmux session. Payload: `{role, recovered_turns, ts}`.
+pub const CHAT_SESSION_RESET_WITH_RECOVERY: &str = "chat_session_reset_with_recovery";
+
+/// `chat_compact_done` — Claude Code finished a `/compact` (PreCompact +
+/// PostCompact hooks bracket the operation). Payload: `{role, ts}`.
+pub const CHAT_COMPACT_DONE: &str = "chat_compact_done";
+
+/// `chat_hop_escalate` — bot consulted another bot via `@<handle>` >=
+/// `hop_limit` times; orchestrator emits this so the meta-agent / UI can
+/// surface the hop-loop. Payload: `{role, hop_count, last_bot, ts}`.
+pub const CHAT_HOP_ESCALATE: &str = "chat_hop_escalate";
+
+/// Build a `chat_session_started` event JSON. `role` is the bot handle
+/// (`workflow.yaml mode: chat` `bot_name`); `project_dir` is the
+/// ccteam-managed project root.
+pub fn build_chat_session_started_event(role: &str, project_dir: &str) -> Value {
+    serde_json::json!({
+        "event": CHAT_SESSION_STARTED,
+        "role": role,
+        "project_dir": project_dir,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
+/// Build a `chat_turn_user_prompt` event JSON. `prompt_excerpt` should
+/// be a short (<= 256 char) summary to keep progress.jsonl scannable —
+/// the full prompt lives in the bot's `turns.jsonl` mirror.
+pub fn build_chat_turn_user_prompt_event(role: &str, turn_id: &str, prompt_excerpt: &str) -> Value {
+    let trimmed: String = prompt_excerpt.chars().take(256).collect();
+    serde_json::json!({
+        "event": CHAT_TURN_USER_PROMPT,
+        "role": role,
+        "turn_id": turn_id,
+        "prompt_excerpt": trimmed,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
+/// Build a `chat_turn_completed` event JSON. The `usage` field uses
+/// `serde_json::to_value(UnifiedTokenUsage)` so the wire shape matches
+/// the rest of the cost pipeline.
+pub fn build_chat_turn_completed_event(
+    role: &str,
+    turn_id: &str,
+    usage: &crate::harness::UnifiedTokenUsage,
+) -> Value {
+    serde_json::json!({
+        "event": CHAT_TURN_COMPLETED,
+        "role": role,
+        "turn_id": turn_id,
+        "usage": serde_json::to_value(usage).unwrap_or(Value::Null),
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
+/// Build a `chat_session_reset` event JSON.
+pub fn build_chat_session_reset_event(role: &str) -> Value {
+    serde_json::json!({
+        "event": CHAT_SESSION_RESET,
+        "role": role,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
+/// Build a `chat_session_reset_with_recovery` event JSON (F118).
+pub fn build_chat_session_reset_with_recovery_event(role: &str, recovered_turns: usize) -> Value {
+    serde_json::json!({
+        "event": CHAT_SESSION_RESET_WITH_RECOVERY,
+        "role": role,
+        "recovered_turns": recovered_turns,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
+/// Build a `chat_compact_done` event JSON.
+pub fn build_chat_compact_done_event(role: &str) -> Value {
+    serde_json::json!({
+        "event": CHAT_COMPACT_DONE,
+        "role": role,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
+/// Build a `chat_hop_escalate` event JSON.
+pub fn build_chat_hop_escalate_event(role: &str, hop_count: u32, last_bot: &str) -> Value {
+    serde_json::json!({
+        "event": CHAT_HOP_ESCALATE,
+        "role": role,
+        "hop_count": hop_count,
+        "last_bot": last_bot,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
+/// True if `kind` is one of the F108/F118 chat-mode event names.
+pub fn is_chat_event(kind: &str) -> bool {
+    matches!(
+        kind,
+        CHAT_SESSION_STARTED
+            | CHAT_TURN_USER_PROMPT
+            | CHAT_TURN_COMPLETED
+            | CHAT_SESSION_RESET
+            | CHAT_SESSION_RESET_WITH_RECOVERY
+            | CHAT_COMPACT_DONE
+            | CHAT_HOP_ESCALATE
+    )
 }
 
 // ---------------- V0.4.0 F67 workflow event aggregations ----------------
@@ -553,6 +690,102 @@ mod tests {
     fn subagent_active_ignores_non_task_pretool() {
         let events = [pretool_other("Read"), pretool_other("Edit")];
         assert!(!subagent_active(&events));
+    }
+
+    // ---------------- V0.6.0 F108 chat-mode event builders ----------------
+
+    #[test]
+    fn chat_event_constants_match_expected_strings() {
+        assert_eq!(CHAT_SESSION_STARTED, "chat_session_started");
+        assert_eq!(CHAT_TURN_USER_PROMPT, "chat_turn_user_prompt");
+        assert_eq!(CHAT_TURN_COMPLETED, "chat_turn_completed");
+        assert_eq!(CHAT_SESSION_RESET, "chat_session_reset");
+        assert_eq!(
+            CHAT_SESSION_RESET_WITH_RECOVERY,
+            "chat_session_reset_with_recovery"
+        );
+        assert_eq!(CHAT_COMPACT_DONE, "chat_compact_done");
+        assert_eq!(CHAT_HOP_ESCALATE, "chat_hop_escalate");
+    }
+
+    #[test]
+    fn is_chat_event_recognises_all_seven() {
+        for kind in [
+            CHAT_SESSION_STARTED,
+            CHAT_TURN_USER_PROMPT,
+            CHAT_TURN_COMPLETED,
+            CHAT_SESSION_RESET,
+            CHAT_SESSION_RESET_WITH_RECOVERY,
+            CHAT_COMPACT_DONE,
+            CHAT_HOP_ESCALATE,
+        ] {
+            assert!(is_chat_event(kind), "{kind} should be a chat event");
+        }
+        assert!(!is_chat_event("Stop"));
+        assert!(!is_chat_event("agent_done"));
+    }
+
+    #[test]
+    fn build_chat_session_started_event_shape() {
+        let ev = build_chat_session_started_event("alice", "/home/u/projects/dev-foo");
+        assert_eq!(ev["event"], CHAT_SESSION_STARTED);
+        assert_eq!(ev["role"], "alice");
+        assert_eq!(ev["project_dir"], "/home/u/projects/dev-foo");
+        assert!(ev["ts"].is_string());
+    }
+
+    #[test]
+    fn build_chat_turn_user_prompt_event_truncates_long_excerpt() {
+        let long = "x".repeat(1000);
+        let ev = build_chat_turn_user_prompt_event("bob", "turn-42", &long);
+        assert_eq!(ev["event"], CHAT_TURN_USER_PROMPT);
+        let excerpt = ev["prompt_excerpt"].as_str().unwrap();
+        assert_eq!(excerpt.chars().count(), 256);
+    }
+
+    #[test]
+    fn build_chat_turn_completed_event_carries_usage() {
+        let usage = crate::harness::UnifiedTokenUsage::default();
+        let ev = build_chat_turn_completed_event("carol", "turn-7", &usage);
+        assert_eq!(ev["event"], CHAT_TURN_COMPLETED);
+        assert_eq!(ev["turn_id"], "turn-7");
+        assert!(ev["usage"].is_object());
+    }
+
+    #[test]
+    fn build_chat_hop_escalate_event_shape() {
+        let ev = build_chat_hop_escalate_event("dora", 3, "eve");
+        assert_eq!(ev["event"], CHAT_HOP_ESCALATE);
+        assert_eq!(ev["hop_count"], 3);
+        assert_eq!(ev["last_bot"], "eve");
+    }
+
+    #[test]
+    fn is_idle_treats_chat_terminal_boundaries_as_idle() {
+        for kind in [
+            CHAT_TURN_COMPLETED,
+            CHAT_SESSION_STARTED,
+            CHAT_SESSION_RESET,
+            CHAT_SESSION_RESET_WITH_RECOVERY,
+            CHAT_COMPACT_DONE,
+        ] {
+            let e = json!({"event": kind});
+            assert!(is_idle(Some(&e)), "{kind} should be treated as idle");
+        }
+    }
+
+    #[test]
+    fn is_idle_treats_chat_user_prompt_as_busy() {
+        // User just submitted a turn → claude is processing → busy.
+        let e = json!({"event": CHAT_TURN_USER_PROMPT});
+        assert!(!is_idle(Some(&e)));
+    }
+
+    #[test]
+    fn build_chat_session_reset_with_recovery_event_carries_count() {
+        let ev = build_chat_session_reset_with_recovery_event("frank", 12);
+        assert_eq!(ev["event"], CHAT_SESSION_RESET_WITH_RECOVERY);
+        assert_eq!(ev["recovered_turns"], 12);
     }
 
     #[test]
