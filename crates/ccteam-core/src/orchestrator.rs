@@ -33,6 +33,7 @@ use tokio::task::JoinSet;
 use crate::artifact_watcher::{ArtifactEvent, ArtifactWatcher};
 use crate::daemon;
 use crate::execution::{ClaudeBgAdapter, CodexExecAdapter};
+use crate::handoff;
 use crate::harness::{
     AgentSpecBrief, HarnessAdapter, SessionHandle, SpawnCtx, ThreadEvent, UnifiedTokenUsage,
 };
@@ -40,6 +41,7 @@ use crate::inbox::{InboxMessage, SessionMailbox};
 use crate::paths::CcteamPaths;
 use crate::progress;
 use crate::queries;
+use crate::spawn_brief::{render_spawn_brief, SpawnContext as SpawnBriefContext};
 use crate::workflow::{AgentSpec, Executor, Trigger, WorkflowError, WorkflowMode, WorkflowSpec};
 use crate::workflow_watcher::{WorkflowFileEvent, WorkflowFileWatcher};
 
@@ -1545,7 +1547,27 @@ impl Orchestrator {
         };
 
         let sid = format!("{}-{}", role, self.next_role_seq().await);
-        let kick = prompt.unwrap_or_else(|| Self::DEFAULT_KICK_PROMPT.to_string());
+        let raw_kick = prompt.unwrap_or_else(|| Self::DEFAULT_KICK_PROMPT.to_string());
+        // V0.6.0 F115 — expand `{{include_prev_handoffs}}` + other
+        // spawn-brief tokens. Hot path (no `{{` in prompt) is a cheap
+        // string clone; the disk read inside `read_concat` only fires
+        // when the directive is present. Failures (corrupt handoff
+        // dir, IO error) fall back to the raw kick so a single bad
+        // handoff doc never wedges spawn.
+        let kick = {
+            let brief_ctx = SpawnBriefContext::new(
+                project_dir.to_path_buf(),
+                slug.to_string(),
+                role.to_string(),
+            );
+            match render_spawn_brief(&raw_kick, &brief_ctx) {
+                Ok(rendered) => rendered,
+                Err(err) => {
+                    tracing::warn!(role, ?err, "render_spawn_brief failed; using raw kick");
+                    raw_kick
+                }
+            }
+        };
         // V0.6.0 F107 — orchestrator now drives the new
         // HarnessAdapter trait (5-method thread/turn shape). Build a
         // SpawnCtx + AgentSpecBrief, call start_thread().await, then
@@ -1727,15 +1749,27 @@ impl Orchestrator {
         )?;
 
         if cur >= MAX_CONSECUTIVE_SPAWN_FAILURES {
-            self.send_btw_escalation(
+            // V0.6.0 F115 — attach the most recent handoff trace so the
+            // meta-agent / web UI can answer "why did it loop". We look
+            // up the project dir for this slug (and degrade gracefully
+            // when it can't be resolved or no handoffs exist).
+            let project_dir = self.paths.project_dir(slug);
+            let trace = handoff::read_concat(
+                &project_dir,
                 slug,
-                &format!(
-                    "role `{}` failed to spawn {} consecutive times — orchestrator escalating \
-                     per fix-loop 3-strike rule.",
-                    role, cur
-                ),
+                handoff::DEFAULT_INCLUDE_LAST_N,
             )
-            .await;
+            .unwrap_or_default();
+            let mut body = format!(
+                "role `{}` failed to spawn {} consecutive times — orchestrator escalating \
+                 per fix-loop 3-strike rule.",
+                role, cur
+            );
+            if !trace.is_empty() {
+                body.push_str("\n\n---\n## Recent handoff trace\n\n");
+                body.push_str(&trace);
+            }
+            self.send_btw_escalation(slug, &body).await;
         }
         Ok(())
     }
