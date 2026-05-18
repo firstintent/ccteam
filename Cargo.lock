@@ -406,6 +406,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "ccteam-imd"
+version = "0.5.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "ccteam-core",
+ "ccteam-cost",
+ "chrono",
+ "clap",
+ "dirs",
+ "futures",
+ "libc",
+ "notify",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "ccteam-web"
 version = "0.5.1"
 dependencies = [

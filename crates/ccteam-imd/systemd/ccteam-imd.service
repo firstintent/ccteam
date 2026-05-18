@@ -1,0 +1,25 @@
+[Unit]
+Description=ccteam IM-bot daemon (Telegram / Slack / Discord bridge)
+Documentation=https://github.com/yourorg/ccteam/blob/main/crates/ccteam-imd/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/ccteam-imd run --foreground
+Restart=on-failure
+RestartSec=5
+# Don't fight with `ccteam start`'s tmux sessions — supervisor cleanup is graceful.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+# Allow daemon to read credentials.json + write heartbeat + tmux send-keys.
+ReadWritePaths=%h/.ccteam
+ReadOnlyPaths=%h/.ccteam/im/credentials.json
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
