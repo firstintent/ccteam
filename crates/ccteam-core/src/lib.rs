@@ -27,6 +27,8 @@ pub mod harness;
 // V0.6.0 F107 — adapter implementations behind the new HarnessAdapter
 // trait (claude_bg / claude_tui stub / codex_exec).
 pub mod execution;
+// V0.6.0 F115 — agent handoff doc mechanism (`.ccteam/handoffs/`).
+pub mod handoff;
 pub mod inbox;
 pub mod memory_bridge;
 pub mod meta_agent;
@@ -42,6 +44,9 @@ pub mod queries;
 pub mod screenshot;
 pub mod silence_classifier;
 pub mod skill;
+// V0.6.0 F115 — spawn-brief template renderer
+// (`{{include_prev_handoffs}}` token).
+pub mod spawn_brief;
 pub mod stall;
 pub mod state;
 pub mod team;
@@ -105,6 +110,14 @@ pub use harness::{
 // V0.6.0 F107 — adapter impls. Public so consumers (orchestrator,
 // `ccteam-cli` commands) can wire them by concrete type when needed.
 pub use execution::{ClaudeBgAdapter, ClaudeTuiAdapter, CodexExecAdapter};
+// V0.6.0 F115 — handoff doc mechanism.
+pub use handoff::{
+    handoff_path, handoffs_dir, list_handoffs, read_concat as read_handoffs_concat,
+    write_handoff, WriteHandoffOptions, DEFAULT_INCLUDE_LAST_N as DEFAULT_HANDOFF_INCLUDE_LAST_N,
+    HANDOFFS_DIRNAME, HANDOFF_TEMPLATE,
+};
+// V0.6.0 F115 — spawn-brief template renderer.
+pub use spawn_brief::{render_spawn_brief, SpawnContext as SpawnBriefContext};
 pub use inbox::{
     inbox_filename, outbox_filename, InboxAttachment, InboxFrontMatter, InboxMessage,
     OutboxEventKind, OutboxFrontMatter, OutboxMessage, OutboxPriority, SessionMailbox,
