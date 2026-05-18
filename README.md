@@ -1,134 +1,70 @@
 # ccteam
 
-> **Autonomous multi-agent orchestrator built on Claude Code.** Declare a `workflow.yaml` — ccteam schedules `claude --bg` sessions per role, watches artifact directories for triggers, and asks for your input only when agents deadlock.
+> **在 Claude session 里一句话召唤 AI 团队 — 接进你的 IM,跨设备 24/7 替你干活。**
 
-## Quick start
+![demo](docs/v0-6-0/demos/30s-tg-bot-team.gif)
+
+> _GIF wave 2 ship 后填_
+
+## 5 分钟上手
 
 ```bash
-# Install (per machine)
-ccteam doctor --install-all           # skill + MCP + meta-agent
-
-# New project
-cd ~/projects/my-app && ccteam init   # writes .ccteam/workflow.yaml + .claude/agents/explorer.md
-ccteam start                          # daemon + web UI on http://localhost:7331
+# 0. 先装 Claude Code:https://code.claude.com/docs/install
+# 1. 起 Claude session
+claude
+# 2. 在 session 里装 ccteam plugin
+/plugin install ccteam
+# 3. 一次性绑你的 IM(TG / Slack / Discord 任选)
+/ccteam-im-setup
+# 4. 起第一个 AI 助理(自然语言对话起 bot)
+/ccteam-creator "做个 TG 私聊助理 bot,帮我管邮件"
 ```
 
-Edit `.ccteam/workflow.yaml` to declare your agent topology:
+→ 详 [quickstart](docs/quickstart.md)(5 步收到 bot 第一条 IM 回话)。
 
-```yaml
-name: my-app-loop
-budget:
-  max_cost_usd_per_24h: 5.00          # auto-disable if exceeded
-agents:
-  planner:
-    trigger: manual                   # explicit spawn only
-    executor: claude
-  builder:
-    trigger: watch:.ccteam/plans/     # spawn on new file in dir
-    parallelism: 2                    # up to 2 concurrent sessions
-  reviewer:
-    trigger: gate                     # wait for trigger_gate MCP call
-```
+## 5 种用法,任你挑
 
-Each role has a system prompt at `.claude/agents/<role>.md` (Anthropic agent spec — name / description / tools / model / color frontmatter + body).
+| 用法 | 一句话场景 | 怎么起 |
+|---|---|---|
+| **Solo Sidekick** | Claude 写代码时临时召唤一个帮手 | `/ccteam <自然语言>` |
+| **Team Sprint** | 几小时冲一波,3-5 agent 并行 | `/ccteam-team 3 "<task>"` |
+| **Overnight Builder** | 丢任务睡觉去,长跑几小时到几天 | `/ccteam-creator "夜里跑 …"` |
+| **Pocket Assistant** ⭐ | 手机 IM 私聊一个 AI 助理 | `/ccteam-creator "做个 TG 助理"` |
+| **IM Squad** | IM 群里多个 bot 互相 @ 协作 | `/ccteam-creator "做个 TG 多 bot 团队"` |
 
-## Architecture
+⭐ **V0.6 旗舰场景。Pocket Assistant + IM Squad 让 AI 团队跨进你的 IM**,跨设备 24/7 替你干活 — 这是 ccteam 跟 ChatGPT / Cursor / Devin 的关键差异:bot 跑在**你电脑上**,能动你的文件 / 跑你的命令 / 看你的代码,手机只是入口。
 
-Three layers ([`docs/tech-design.md §2.1`](docs/tech-design.md)):
+## 三种跟 ccteam 对话的方式
 
-```
-L0  user           — chat with meta-agent OR edit workflow.yaml directly
-L1  meta-agent     — singleton claude session + 17 mcp__ccteam__* tools
-L2  ccteam daemon  — Rust orchestrator, ArtifactWatcher, progress.jsonl SoT
-L3  project agents — `claude --bg --agent <role>` per workflow.yaml role
-                     (Codex executor uses tmux)
-```
+- 🟢 **Claude session 内**:`/ccteam <自然语言>` 总入口(发啥都行)
+- 🟢 **IM 端**:私聊 bot 或群里 `@ccteam <NL admin>`
+- 🟡 **Web 仪表板**:`http://localhost:7331`(只看不操作)
 
-**No prompt injection** — agent behavior lives in `.claude/agents/<role>.md`. **No tmux long-sessions for Claude** — each spawn is a fresh `claude --bg` job, context resets cleanly. **All state in `progress.jsonl`** — 7 canonical workflow events, single source of truth.
+> 你**不需要**学一堆 CLI 命令,也**不需要**写任何 yaml 配置。所有 setup 都通过 Claude session 对话生成。
 
-5 canonical orchestration patterns ([`docs/orchestration-patterns.md`](docs/orchestration-patterns.md)) — Chaining / Routing / Parallelization / Orchestrator-Worker / Evaluator-Optimizer — all map to workflow.yaml + agent.md combinations.
+## 文档
 
-## What it gives you
-
-| Pain | ccteam answer |
+| 想干什么 | 读这个 |
 |---|---|
-| AI helper still asks me to project-manage | meta-agent dispatches; you supervise |
-| Multi-agent topology is brittle | workflow.yaml + ArtifactWatcher; hot-reload on edit |
-| Bug fixes loop forever | hard 3-strike escalation, then notify user |
-| Run-aways blow my budget | per-project `max_cost_usd_per_24h` auto-disable |
-| Daemon ungraceful shutdown loses state | F86 cancel token + 30s timeout fallback |
-| Stale `~/.claude/jobs/<id>/` accumulates | F85 GC at daemon startup + `doctor --gc-claude-jobs` |
-| Want to delete a project | `ccteam remove <slug>` with active-session red-line refusal |
-
-## Web UI
-
-`ccteam start` launches a SPA on `http://<host>:7331` (token auth on non-loopback). Four panels per workflow:
-
-- **WorkflowView** — agent cards with running / queued / cost + SSE live updates
-- **Artifact Queue** — pending files per watch dir + oldest age
-- **Events Timeline** — `progress.jsonl` tail with event-type colors
-- **Failure Inspector** — click errored agent → live tail of `~/.claude/jobs/<id>/output.log`
-- **Cost Sparkline** — 24h / 7d trend
-
-## Commands
-
-13 user-facing (see `ccteam --help`):
-
-```
-init   start  stop  new  ls  status  show  remove
-doctor web    team  session
-```
-
-8 internal (meta-agent / MCP / hooks):
-```
-ccteam internal hook | mcp-serve | spawn | send | peek | attach | progress | resume
-```
-
-Plus `ccteam-control` skill (loaded via `ccteam doctor --install-skill`) gives natural-language wrappers in any Claude Code session.
+| 5 分钟跑通第一个 bot | [docs/quickstart.md](docs/quickstart.md) |
+| 完整 5 种 preset 使用手册 | [docs/user-manual.md](docs/user-manual.md) |
+| 抄一份现成的 use case | [docs/recipes.md](docs/recipes.md) |
+| 出错查不到 | [docs/troubleshooting.md](docs/troubleshooting.md) |
+| 高级定制 / Codex 集成 | [docs/advanced/](docs/advanced/) |
+| 看代码 / 改 ccteam | [docs/architecture/](docs/architecture/) |
 
 ## Status
 
-- **V0.4.6 shipped** (2026-05-16) — 11 findings F81-F91 (project lifecycle / workflow hot-reload / budget cap / graceful shutdown / cost SoT / Web panels / CLI slimming)
-- **755 passing / 1 known port-bind flake** in `cargo test --workspace`
-- **V1.0.0 goals** ([`docs/requirements.md §14-15`](docs/requirements.md)):
-  1. Run autonomously ≥7 days on real 20-100k LOC projects (token maxxing)
-  2. Extend to non-coding domains (research / content ops / investment analysis)
+**V0.6.0 蓄势中**(2026-05 立项)— Epic A 5 min 起第一个 IM bot · Epic B bot 在 IM 像真人助理 · Epic C 中文用户能用(铺底)。详 [docs/v0-6-0/README.md](docs/v0-6-0/README.md)。
 
-Pre-v1.0 = development stage — breaking changes welcome, no migration debt ([`CLAUDE.md §五.3`](CLAUDE.md)).
-
-## Documentation
-
-Full index: [`docs/README.md`](docs/README.md).
-
-| Doc | Use case |
-|---|---|
-| [`docs/v0-4-6/user-manual.md`](docs/v0-4-6/user-manual.md) | end-user command reference |
-| [`docs/orchestration-patterns.md`](docs/orchestration-patterns.md) | designing workflow.yaml topologies (5 patterns + split philosophy) |
-| [`docs/tech-design.md`](docs/tech-design.md) | architecture SoT |
-| [`docs/interfaces.md`](docs/interfaces.md) | protocol reference (YAML / JSON / CLI / hooks) |
-| [`docs/requirements.md`](docs/requirements.md) | 15 pain points (13 user + 2 V1.0.0 ultimate) |
-| [`CLAUDE.md`](CLAUDE.md) | implementation rules (consumed by Claude Code) |
-
-## Contributing
-
-ccteam is developed using Claude Code under the worktree-per-task pattern.
-
-```bash
-git worktree add -b feat/your-thing /tmp/ccteam-feature origin/main
-# read CLAUDE.md + docs/README.md before changing code
-cargo test --workspace --locked   # must stay green
-cargo clippy --workspace --all-targets   # no new warnings
-```
-
-Every PR maps to: a pain point in `requirements.md` + a section in `tech-design.md` + a F-finding in `dev-coupling-audit.md` (if applicable).
-
-Docs / agent prompts in Chinese (working language); commit messages + PR descriptions in English.
+**V0.5.1 in production**(2026-05 ship)— 升级 V0.6 **0 用户操作**:工具名 / skill 入口 / workflow.yaml 全兼容。
 
 ## License
 
-See [`LICENSE`](LICENSE).
+详 [LICENSE](LICENSE)。
 
-## Acknowledgments
+## 致谢
 
-- [Claude Code](https://code.claude.com/) — the runtime
-- [Anthropic *Building Effective Agents*](https://www.anthropic.com/engineering/building-effective-agents) — the 5-pattern taxonomy
+- [Claude Code](https://code.claude.com/) — 运行时
+- [openhuman/channels](https://github.com/openhuman/channels) — 14+ IM 平台 Rust 抽象
+- Anthropic *Building Effective Agents* — 5 编排模式 taxonomy
