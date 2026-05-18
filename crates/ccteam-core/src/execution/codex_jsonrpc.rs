@@ -1,0 +1,393 @@
+//! V0.6.0 Wave 3 F112 — thin JSON-RPC client over a Unix Domain Socket
+//! for talking to `codex app-server --listen unix://<sock>`.
+//!
+//! Codex's wire format is "JSON-RPC lite" — line-delimited JSON, no
+//! `jsonrpc: "2.0"` discriminator. Each line is either:
+//!
+//! - **Request**:      `{ "id": <int>, "method": "<m>", "params": {...} }`
+//! - **Response**:     `{ "id": <int>, "result": {...} }`
+//! - **Response err**: `{ "id": <int>, "error": {...} }`
+//! - **Notification**: `{ "method": "<m>", "params": {...} }` (no `id`)
+//!
+//! ## Concurrency shape
+//!
+//! Each connection owns two background tasks:
+//!
+//! - **Writer task** — drains an `mpsc<Vec<u8>>` of pre-serialised
+//!   JSONL frames into the socket. Letting callers push bytes via
+//!   channel (instead of holding a `Mutex<WriteHalf>`) keeps `call()`
+//!   non-blocking even when the kernel buffer back-pressures.
+//! - **Reader task** — parses each inbound line, then dispatches to
+//!   pending oneshots (responses) or the broadcast (notifications).
+//!
+//! Tests drive the client against a hand-rolled UDS scripted server in
+//! `tests/codex_jsonrpc_test.rs` so we don't depend on a real codex
+//! `app-server` process.
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
+
+use anyhow::{anyhow, Context, Result};
+use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
+use tokio::task::JoinHandle;
+
+/// Broadcast buffer size for incoming notifications. Codex bursts items
+/// per turn so 256 is comfortable headroom for a single subscriber.
+const NOTIFICATION_BUFFER: usize = 256;
+
+/// Outbound buffer size: how many JSONL frames may be queued by `call()`
+/// before backpressure. 64 is plenty — callers serialise per-turn.
+const WRITER_BUFFER: usize = 64;
+
+type Pending = HashMap<i64, oneshot::Sender<Result<Value, JsonRpcError>>>;
+
+/// Parsed JSON-RPC error body. `code` is optional in codex's "lite"
+/// dialect; only `message` is mandatory.
+#[derive(Debug, Clone)]
+pub struct JsonRpcError {
+    pub code: Option<i64>,
+    pub message: String,
+    pub data: Option<Value>,
+}
+
+impl std::fmt::Display for JsonRpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.code {
+            Some(c) => write!(f, "jsonrpc error {c}: {}", self.message),
+            None => write!(f, "jsonrpc error: {}", self.message),
+        }
+    }
+}
+
+impl std::error::Error for JsonRpcError {}
+
+/// Server → client notification (`method` + `params`, no `id`).
+#[derive(Debug, Clone)]
+pub struct Notification {
+    pub method: String,
+    pub params: Value,
+}
+
+/// Thin JSON-RPC client over an existing connection (UDS today; the
+/// surface is transport-agnostic — reader/writer task ownership of the
+/// concrete halves keeps the public API channel-based, so a future
+/// stdio / TCP transport drops in without API churn).
+pub struct CodexJsonRpcClient {
+    out: mpsc::Sender<Vec<u8>>,
+    next_id: AtomicI64,
+    pending: Arc<Mutex<Pending>>,
+    notifications: broadcast::Sender<Notification>,
+    _writer_task: JoinHandle<()>,
+    _reader_task: JoinHandle<()>,
+}
+
+impl CodexJsonRpcClient {
+    /// Connect to `codex app-server` over a UDS socket. Both reader and
+    /// writer background tasks are spawned immediately.
+    pub async fn connect_uds(socket_path: &Path) -> Result<Self> {
+        let stream = UnixStream::connect(socket_path).await.with_context(|| {
+            format!(
+                "connect codex app-server UDS at {}",
+                socket_path.display()
+            )
+        })?;
+        let (read_half, write_half) = stream.into_split();
+        Ok(Self::spawn(read_half, write_half))
+    }
+
+    /// Build a client around an arbitrary split read/write pair.
+    /// Tests use this with a `tokio::io::duplex` pair for scripted
+    /// peers.
+    pub fn spawn<R, W>(reader: R, writer: W) -> Self
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let pending: Arc<Mutex<Pending>> = Arc::new(Mutex::new(HashMap::new()));
+        let (notif_tx, _) = broadcast::channel(NOTIFICATION_BUFFER);
+        let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(WRITER_BUFFER);
+
+        let writer_task = tokio::spawn(run_writer_loop(writer, out_rx));
+        let reader_task = tokio::spawn(run_reader_loop(
+            reader,
+            Arc::clone(&pending),
+            notif_tx.clone(),
+        ));
+
+        Self {
+            out: out_tx,
+            next_id: AtomicI64::new(1),
+            pending,
+            notifications: notif_tx,
+            _writer_task: writer_task,
+            _reader_task: reader_task,
+        }
+    }
+
+    /// Issue a JSON-RPC request and await the matching response. `params`
+    /// may be `Value::Null` for no-param methods (codex tolerates either
+    /// omission or null).
+    pub async fn call(&self, method: &str, params: Value) -> Result<Value> {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut guard = self.pending.lock().await;
+            guard.insert(id, tx);
+        }
+
+        let mut frame = json!({
+            "id": id,
+            "method": method,
+        });
+        if !params.is_null() {
+            frame["params"] = params;
+        }
+        let mut line = serde_json::to_vec(&frame)?;
+        line.push(b'\n');
+
+        self.out
+            .send(line)
+            .await
+            .with_context(|| format!("send jsonrpc request {method}"))?;
+
+        match rx.await {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => Err(anyhow!(e)),
+            Err(_) => Err(anyhow!(
+                "jsonrpc reader task dropped pending request id={id} method={method}"
+            )),
+        }
+    }
+
+    /// Subscribe to server-side notifications (push events outside the
+    /// request/response cycle). Returns a fresh receiver — multiple
+    /// subscribers are supported.
+    pub fn subscribe(&self) -> broadcast::Receiver<Notification> {
+        self.notifications.subscribe()
+    }
+
+    /// Send a one-way notification (no id, no response expected).
+    /// Codex's app-server protocol doesn't have client-originated
+    /// notifications today, but the wire allows them — keep the
+    /// helper for future use (e.g. `client/cancel`).
+    pub async fn notify(&self, method: &str, params: Value) -> Result<()> {
+        let mut frame = json!({ "method": method });
+        if !params.is_null() {
+            frame["params"] = params;
+        }
+        let mut line = serde_json::to_vec(&frame)?;
+        line.push(b'\n');
+        self.out
+            .send(line)
+            .await
+            .with_context(|| format!("send jsonrpc notification {method}"))?;
+        Ok(())
+    }
+}
+
+async fn run_writer_loop<W: AsyncWrite + Unpin + Send>(
+    mut writer: W,
+    mut rx: mpsc::Receiver<Vec<u8>>,
+) {
+    while let Some(buf) = rx.recv().await {
+        if let Err(err) = writer.write_all(&buf).await {
+            tracing::warn!(error = %err, "jsonrpc: writer error, stopping");
+            break;
+        }
+        if let Err(err) = writer.flush().await {
+            tracing::warn!(error = %err, "jsonrpc: writer flush error");
+        }
+    }
+    let _ = writer.shutdown().await;
+}
+
+async fn run_reader_loop<R: AsyncRead + Unpin + Send>(
+    reader: R,
+    pending: Arc<Mutex<Pending>>,
+    notifications: broadcast::Sender<Notification>,
+) {
+    let buf = BufReader::new(reader);
+    let mut lines = buf.lines();
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<Value>(trimmed) {
+                    Ok(v) => dispatch(v, &pending, &notifications).await,
+                    Err(err) => {
+                        tracing::warn!(error = %err, line = %trimmed, "jsonrpc: parse failure");
+                    }
+                }
+            }
+            Ok(None) => {
+                tracing::debug!("jsonrpc: peer closed");
+                break;
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "jsonrpc: read error");
+                break;
+            }
+        }
+    }
+}
+
+async fn dispatch(
+    v: Value,
+    pending: &Arc<Mutex<Pending>>,
+    notifications: &broadcast::Sender<Notification>,
+) {
+    // Response: has `id` AND (`result` or `error`).
+    if let Some(id) = v.get("id").and_then(|x| x.as_i64()) {
+        if v.get("result").is_some() || v.get("error").is_some() {
+            let tx = { pending.lock().await.remove(&id) };
+            if let Some(tx) = tx {
+                let outcome = if let Some(err) = v.get("error") {
+                    Err(JsonRpcError {
+                        code: err.get("code").and_then(|c| c.as_i64()),
+                        message: err
+                            .get("message")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("(no message)")
+                            .to_string(),
+                        data: err.get("data").cloned(),
+                    })
+                } else {
+                    Ok(v.get("result").cloned().unwrap_or(Value::Null))
+                };
+                let _ = tx.send(outcome);
+            } else {
+                tracing::debug!(id, "jsonrpc: response for unknown id");
+            }
+            return;
+        }
+    }
+    // Notification: has `method` but no result/error.
+    if let Some(method) = v.get("method").and_then(|m| m.as_str()) {
+        let params = v.get("params").cloned().unwrap_or(Value::Null);
+        let _ = notifications.send(Notification {
+            method: method.to_string(),
+            params,
+        });
+        return;
+    }
+    tracing::debug!(value = %v, "jsonrpc: unrecognised frame");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jsonrpc_error_display_with_code() {
+        let e = JsonRpcError {
+            code: Some(-32601),
+            message: "method not found".into(),
+            data: None,
+        };
+        assert!(e.to_string().contains("-32601"));
+        assert!(e.to_string().contains("method not found"));
+    }
+
+    #[test]
+    fn jsonrpc_error_display_without_code() {
+        let e = JsonRpcError {
+            code: None,
+            message: "boom".into(),
+            data: None,
+        };
+        assert!(e.to_string().contains("boom"));
+    }
+
+    /// Smoke-test the spawn + call + notification round trip using
+    /// `tokio::io::duplex` for a scripted in-process peer.
+    #[tokio::test]
+    async fn call_response_roundtrip() {
+        // client_side: read = client's reads (peer writes), write = client's writes (peer reads)
+        let (client_rw, mut peer_rw) = tokio::io::duplex(4096);
+        let (client_r, client_w) = tokio::io::split(client_rw);
+        let client = CodexJsonRpcClient::spawn(client_r, client_w);
+
+        // Peer task: read one line, respond with matching id.
+        let peer = tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+            let (pr, mut pw) = tokio::io::split(&mut peer_rw);
+            let mut pr = BufReader::new(pr);
+            let mut buf = String::new();
+            pr.read_line(&mut buf).await.unwrap();
+            let req: Value = serde_json::from_str(buf.trim()).unwrap();
+            let id = req["id"].as_i64().unwrap();
+            assert_eq!(req["method"], "thread/start");
+            let resp = json!({
+                "id": id,
+                "result": { "thread": { "thread_id": "t-1" } }
+            });
+            let mut line = serde_json::to_vec(&resp).unwrap();
+            line.push(b'\n');
+            pw.write_all(&line).await.unwrap();
+            pw.flush().await.unwrap();
+            // Also push a notification.
+            let notif = json!({
+                "method": "thread/started",
+                "params": { "thread_id": "t-1" }
+            });
+            let mut line = serde_json::to_vec(&notif).unwrap();
+            line.push(b'\n');
+            pw.write_all(&line).await.unwrap();
+            pw.flush().await.unwrap();
+            // Keep peer alive briefly so notification reaches subscriber.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        });
+
+        let mut rx = client.subscribe();
+        let result = client
+            .call("thread/start", json!({ "cwd": "/tmp" }))
+            .await
+            .unwrap();
+        assert_eq!(result["thread"]["thread_id"], "t-1");
+
+        let notif = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(notif.method, "thread/started");
+        assert_eq!(notif.params["thread_id"], "t-1");
+
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn call_error_response_propagates() {
+        let (client_rw, mut peer_rw) = tokio::io::duplex(4096);
+        let (client_r, client_w) = tokio::io::split(client_rw);
+        let client = CodexJsonRpcClient::spawn(client_r, client_w);
+        let peer = tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+            let (pr, mut pw) = tokio::io::split(&mut peer_rw);
+            let mut pr = BufReader::new(pr);
+            let mut buf = String::new();
+            pr.read_line(&mut buf).await.unwrap();
+            let req: Value = serde_json::from_str(buf.trim()).unwrap();
+            let id = req["id"].as_i64().unwrap();
+            let resp = json!({
+                "id": id,
+                "error": { "code": -32601, "message": "method not found" }
+            });
+            let mut line = serde_json::to_vec(&resp).unwrap();
+            line.push(b'\n');
+            pw.write_all(&line).await.unwrap();
+            pw.flush().await.unwrap();
+        });
+
+        let err = client.call("bogus", Value::Null).await.unwrap_err();
+        assert!(err.to_string().contains("method not found"));
+        peer.await.unwrap();
+    }
+}

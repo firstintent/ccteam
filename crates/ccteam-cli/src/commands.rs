@@ -2117,6 +2117,15 @@ pub struct DoctorOptions {
     /// alongside today's date and WARN when the embedded table is
     /// older than 180 days. Pure-readout — no fs mutation.
     pub check_pricing_version: bool,
+    /// V0.6.0 Wave 3 F112: probe `codex --version` and warn when the
+    /// binary is missing or older than the minimum supported
+    /// (`0.131`). Pure-readout — no fs mutation.
+    pub check_codex_version: bool,
+    /// V0.6.0 Wave 3 F112: probe `codex login status` and surface
+    /// whether the operator is logged in (ChatGPT / API key) so
+    /// mode-3 codex bot path knows to error early. Pure-readout — no
+    /// fs mutation.
+    pub check_codex_auth: bool,
 }
 
 /// `ccteam doctor` dispatch. Returns a human-readable report so unit
@@ -2135,7 +2144,9 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
         || opts.migrate_workflow_to_ccteam_dir
         || opts.gc_claude_jobs
         || opts.update_hooks
-        || opts.check_pricing_version;
+        || opts.check_pricing_version
+        || opts.check_codex_version
+        || opts.check_codex_auth;
     if !any_mode {
         return Ok(String::from(
             "ccteam doctor: pass at least one mode flag.\n\
@@ -2238,6 +2249,12 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
     }
     if opts.check_pricing_version {
         out.push_str(&render_check_pricing_version_report());
+    }
+    if opts.check_codex_version {
+        out.push_str(&render_check_codex_version_report());
+    }
+    if opts.check_codex_auth {
+        out.push_str(&render_check_codex_auth_report());
     }
     // V0.3.1 F47 — informational codex CLI detection. Appends one line
     // to every successful doctor run (any_mode == true) so operators
@@ -2766,6 +2783,177 @@ fn render_check_pricing_version_report() -> String {
     }
     out.push('\n');
     out
+}
+
+/// V0.6.0 Wave 3 F112 — probe `codex --version` and emit a single
+/// report block. Minimum supported: `0.131` (the version that
+/// stabilised `--json` + `app-server daemon` UX). Versions <0.131 WARN
+/// but don't fail; missing `codex` binary surfaces an ERROR line so
+/// the operator knows mode-3 codex bot path will degrade.
+fn render_check_codex_version_report() -> String {
+    const MIN_MAJOR: u32 = 0;
+    const MIN_MINOR: u32 = 131;
+    let mut out = String::from("ccteam doctor --check-codex-version (V0.6.0 Wave 3 F112)\n\n");
+    let output = Command::new("codex").arg("--version").output();
+    match output {
+        Ok(o) if o.status.success() => {
+            let line = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            out.push_str(&format!("  codex --version: {line}\n"));
+            match parse_codex_semver(&line) {
+                Some((maj, min, _patch)) => {
+                    if (maj, min) >= (MIN_MAJOR, MIN_MINOR) {
+                        out.push_str(&format!(
+                            "  [OK] codex {maj}.{min} ≥ {MIN_MAJOR}.{MIN_MINOR} (mode-3 \
+                             codex bot path supported).\n"
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "  [WARN] codex {maj}.{min} < {MIN_MAJOR}.{MIN_MINOR} — upgrade \
+                             codex for mode-3 bot path + `codex exec --json` stability.\n"
+                        ));
+                    }
+                }
+                None => {
+                    out.push_str(
+                        "  [note] could not parse semver from `codex --version` output; \
+                         staleness check skipped.\n",
+                    );
+                }
+            }
+        }
+        Ok(o) => {
+            out.push_str(&format!(
+                "  [ERROR] `codex --version` exited {} — mode-3 codex bot path will degrade.\n",
+                o.status.code().unwrap_or(-1)
+            ));
+            out.push_str(&format!(
+                "  stderr: {}\n",
+                String::from_utf8_lossy(&o.stderr).trim()
+            ));
+        }
+        Err(err) => {
+            out.push_str(&format!(
+                "  [ERROR] codex CLI not installed (`{err}`) — V0.6 Codex features will \
+                 fallback or skip.\n"
+            ));
+        }
+    }
+    out.push('\n');
+    out
+}
+
+/// V0.6.0 Wave 3 F112 — probe `codex login status` and emit a single
+/// report block. Parses one of:
+///
+/// - `Logged in using ChatGPT`           → OK
+/// - `Logged in using API key`           → OK
+/// - `Not logged in` / `Logged out`      → WARN (operator action needed)
+///
+/// A missing `codex` binary errors out so the operator sees the same
+/// remediation as `--check-codex-version`.
+fn render_check_codex_auth_report() -> String {
+    let mut out = String::from("ccteam doctor --check-codex-auth (V0.6.0 Wave 3 F112)\n\n");
+    let output = Command::new("codex").args(["login", "status"]).output();
+    match output {
+        Ok(o) => {
+            let combined = format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            );
+            out.push_str(&format!("  codex login status: {}\n", combined.trim()));
+            let status = classify_codex_auth(&combined);
+            match status {
+                CodexAuthStatus::LoggedIn(via) => {
+                    out.push_str(&format!(
+                        "  [OK] codex authenticated via {via} — mode-3 codex bot path enabled.\n"
+                    ));
+                }
+                CodexAuthStatus::LoggedOut => {
+                    out.push_str(
+                        "  [WARN] codex is not logged in. Run `codex login` to enable Codex \
+                         features (mode-3 bot path + /ccteam-advise codex dual-probe).\n",
+                    );
+                }
+                CodexAuthStatus::Unknown => {
+                    out.push_str(
+                        "  [note] could not parse `codex login status` output; assume logged \
+                         out and re-run after `codex login`.\n",
+                    );
+                }
+            }
+        }
+        Err(err) => {
+            out.push_str(&format!(
+                "  [ERROR] `codex login status` failed: {err} — install codex first.\n"
+            ));
+        }
+    }
+    out.push('\n');
+    out
+}
+
+/// Parse "codex 0.131.0" or "0.131.0 (...)". Returns `(major, minor,
+/// patch)` on success.
+pub fn parse_codex_semver(line: &str) -> Option<(u32, u32, u32)> {
+    // Scan for the first `<digits>.<digits>.<digits>` triple.
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+                i += 1;
+            }
+            let slice = &line[start..i];
+            let parts: Vec<&str> = slice.split('.').collect();
+            if parts.len() >= 3 {
+                if let (Ok(maj), Ok(min), Ok(patch)) = (
+                    parts[0].parse::<u32>(),
+                    parts[1].parse::<u32>(),
+                    parts[2].split(|c: char| !c.is_ascii_digit()).next().unwrap_or("0").parse::<u32>(),
+                ) {
+                    return Some((maj, min, patch));
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Outcome of parsing `codex login status` output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodexAuthStatus {
+    LoggedIn(String),
+    LoggedOut,
+    Unknown,
+}
+
+/// Classify the combined stdout+stderr of `codex login status`. We
+/// check the "logged out" branch FIRST because "Not logged in" is a
+/// substring of "logged in" — a naive `contains("logged in")` would
+/// misclassify the negative path.
+pub fn classify_codex_auth(combined: &str) -> CodexAuthStatus {
+    let lower = combined.to_ascii_lowercase();
+    if lower.contains("not logged in")
+        || lower.contains("logged out")
+        || lower.contains("no credentials")
+        || lower.contains("please run `codex login`")
+    {
+        return CodexAuthStatus::LoggedOut;
+    }
+    if lower.contains("logged in") {
+        let via = if lower.contains("chatgpt") {
+            "ChatGPT"
+        } else if lower.contains("api key") || lower.contains("api-key") {
+            "API key"
+        } else {
+            "(unspecified)"
+        };
+        return CodexAuthStatus::LoggedIn(via.to_string());
+    }
+    CodexAuthStatus::Unknown
 }
 
 /// Resolve a project's on-disk directory from `~/.ccteam/config.yaml`

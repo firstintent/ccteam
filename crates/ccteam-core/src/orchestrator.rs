@@ -35,7 +35,8 @@ use crate::daemon;
 use crate::execution::{ClaudeBgAdapter, CodexExecAdapter};
 use crate::handoff;
 use crate::harness::{
-    AgentSpecBrief, HarnessAdapter, SessionHandle, SpawnCtx, ThreadEvent, UnifiedTokenUsage,
+    AgentSpecBrief, AgentVendor, HarnessAdapter, SessionHandle, SpawnCtx, ThreadEvent,
+    UnifiedTokenUsage,
 };
 use crate::inbox::{InboxMessage, SessionMailbox};
 use crate::paths::CcteamPaths;
@@ -53,6 +54,21 @@ pub const MAX_CONCURRENT_PROJECTS: usize = 3;
 /// vendor, model) -> f64`. Wave 1 returns 0 because the active
 /// agent_done driver is still the F80 `claude_job::probe_job` poller
 /// which reads `cost_usd` from `state.json` directly.
+/// V0.6.0 Wave 3 F112 — derive vendor string from a
+/// [`SessionHandle::harness`] tag. Used to annotate `agent_done`
+/// events with the per-vendor key consumed by
+/// [`crate::queries::CostSummary::cost_24h_by_vendor`] + per-vendor
+/// budget caps. Anything starting with `"codex"` is classified codex;
+/// everything else is claude.
+pub fn vendor_from_harness(harness: &str) -> &'static str {
+    if harness.starts_with("codex") {
+        "codex"
+    } else {
+        "claude"
+    }
+}
+
+#[allow(dead_code)] // Retained for transitional `translate_thread_event` callers; Wave 3 prefers ccteam_cost::estimate_cost.
 fn usage_to_cost_placeholder(_usage: &UnifiedTokenUsage) -> f64 {
     0.0
 }
@@ -1676,24 +1692,44 @@ impl Orchestrator {
         role: &str,
         sid: &str,
         slug: &str,
+        vendor: AgentVendor,
     ) -> Option<serde_json::Value> {
+        let vendor_str = match vendor {
+            AgentVendor::Claude => "claude",
+            AgentVendor::Codex => "codex",
+        };
         match evt {
             ThreadEvent::ThreadStarted { .. } => None,
-            ThreadEvent::TurnCompleted { usage, .. } => Some(json!({
-                "event": "agent_done",
-                "role": role,
-                "session_id": sid,
-                "status": "completed",
-                "cost_usd": usage_to_cost_placeholder(usage),
-                "slug": slug,
-                "ts": Utc::now().to_rfc3339(),
-            })),
+            ThreadEvent::TurnCompleted { usage, .. } => {
+                let cost = ccteam_cost::estimate_cost(
+                    usage,
+                    match vendor {
+                        AgentVendor::Claude => ccteam_cost::Vendor::Claude,
+                        AgentVendor::Codex => ccteam_cost::Vendor::Codex,
+                    },
+                    // Wave 3: model identity isn't on ThreadEvent; the
+                    // pricing table falls back to per-vendor default
+                    // when the model string is unknown.
+                    "",
+                );
+                Some(json!({
+                    "event": "agent_done",
+                    "role": role,
+                    "session_id": sid,
+                    "status": "completed",
+                    "cost_usd": cost,
+                    "vendor": vendor_str,
+                    "slug": slug,
+                    "ts": Utc::now().to_rfc3339(),
+                }))
+            }
             ThreadEvent::TurnFailed { err, .. } => Some(json!({
                 "event": "agent_done",
                 "role": role,
                 "session_id": sid,
                 "status": "errored",
                 "error": err.message,
+                "vendor": vendor_str,
                 "slug": slug,
                 "ts": Utc::now().to_rfc3339(),
             })),
@@ -1703,6 +1739,7 @@ impl Orchestrator {
                 "session_id": sid,
                 "status": "errored",
                 "error": err.message,
+                "vendor": vendor_str,
                 "slug": slug,
                 "ts": Utc::now().to_rfc3339(),
             })),
@@ -1712,6 +1749,7 @@ impl Orchestrator {
             | ThreadEvent::ItemCompleted { .. } => None,
         }
     }
+
 
     /// Monotonic microsecond sequence — collision-free across one
     /// orchestrator instance; F67 may swap in a counter map.
@@ -1876,6 +1914,7 @@ impl Orchestrator {
                     "session_id": handle.sid,
                     "status": status,
                     "cost_usd": cost_usd.unwrap_or(0.0),
+                    "vendor": vendor_from_harness(&handle.harness),
                     "slug": slug,
                     "ts": Utc::now().to_rfc3339(),
                 }),
@@ -2427,17 +2466,60 @@ impl Orchestrator {
         project_dir: &std::path::Path,
         progress_path: &std::path::Path,
     ) -> Result<bool> {
+        // F84 stub of F91 — read progress.jsonl once, derive both
+        // 24h cost and 1h spawn count from the same in-memory slice.
+        let events = progress::read_all_events(progress_path).unwrap_or_default();
+        let cost = queries::cost_summary_from_events(&events)?;
+
+        // V0.6.0 Wave 3 F112 — per-vendor caps (preferred). Checked
+        // first so a vendor-specific overrun trips an auto-disable
+        // even if the legacy flat cap is unset.
+        if let Some(budgets) = &spec.budgets_v060 {
+            for (vendor_key, cap_opt) in [
+                ("claude", budgets.claude.max_cost_usd_per_24h),
+                ("codex", budgets.codex.max_cost_usd_per_24h),
+            ] {
+                let Some(cap) = cap_opt else { continue };
+                let value = cost
+                    .cost_24h_by_vendor
+                    .get(vendor_key)
+                    .copied()
+                    .unwrap_or(0.0);
+                if value >= cap {
+                    progress::append_event(
+                        progress_path,
+                        &json!({
+                            "event": "budget_exceeded",
+                            "slug": slug,
+                            "kind": "cost_24h_per_vendor",
+                            "vendor": vendor_key,
+                            "value": value,
+                            "cap": cap,
+                            "ts": Utc::now().to_rfc3339(),
+                        }),
+                    )?;
+                    tracing::warn!(
+                        slug,
+                        vendor = vendor_key,
+                        value,
+                        cap,
+                        "per-vendor budget cap tripped; auto-disabling workflow"
+                    );
+                    self.auto_disable_workflow(
+                        slug,
+                        "budget_exceeded_per_vendor",
+                        project_dir,
+                        progress_path,
+                    )
+                    .await?;
+                    return Ok(true);
+                }
+            }
+        }
+
         let Some(budget) = &spec.budget else {
             return Ok(false);
         };
-
-        // F84 stub of F91 — read progress.jsonl once, derive both
-        // 24h cost and 1h spawn count from the same in-memory slice.
-        // When F91's full impl lands, replace the spawn-count line
-        // with whatever F91 publishes; the budget check shape is
-        // unchanged.
-        let events = progress::read_all_events(progress_path).unwrap_or_default();
-        let cost = queries::cost_summary_from_events(&events)?;
 
         if let Some(cap) = budget.max_cost_usd_per_24h {
             if cost.cost_24h_usd >= cap {

@@ -282,7 +282,15 @@ mod codex_tmux {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn codex_exec_submit_turn_not_implemented_wave1() {
+async fn codex_exec_submit_turn_returns_synthetic_turn_id_wave3() {
+    // Wave 3: submit_turn spawns `codex exec --json` (or the fake bin
+    // pointed at by CCTEAM_CODEX_BIN). The TurnId is synthesised
+    // monotonically per adapter instance regardless of whether the
+    // subprocess succeeds — `events()` is the channel that reports
+    // success/failure. We point CCTEAM_CODEX_BIN at `/bin/true` so the
+    // process exits cleanly and the test doesn't depend on a real
+    // codex install.
+    std::env::set_var(ccteam_core::execution::codex_app_server::CODEX_BIN_ENV, "/bin/true");
     let h = ThreadHandle {
         vendor: AgentVendor::Codex,
         mode: ExecutionMode::Bg,
@@ -290,11 +298,32 @@ async fn codex_exec_submit_turn_not_implemented_wave1() {
         started_at: chrono::Utc::now(),
         raw_extras: serde_json::json!({}),
     };
-    let err = CodexExecAdapter::new()
+    let tid = CodexExecAdapter::new()
         .submit_turn(&h, ccteam_core::harness::TurnInput::UserText("hi".into()))
         .await
-        .expect_err("Wave 3 fills");
-    assert!(matches!(err, HarnessError::NotImplemented { .. }));
+        .expect("Wave 3 submit_turn returns synthetic TurnId");
+    assert!(tid.0.starts_with("codex-exec-"));
+    std::env::remove_var(ccteam_core::execution::codex_app_server::CODEX_BIN_ENV);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn codex_exec_resume_thread_synthesises_handle_wave3() {
+    let h = CodexExecAdapter::new()
+        .resume_thread("01988f74-0d1f-7e80-a-b-c")
+        .await
+        .expect("resume returns synthesised handle");
+    assert_eq!(h.vendor, AgentVendor::Codex);
+    assert_eq!(h.identity, "01988f74-0d1f-7e80-a-b-c");
+    assert_eq!(h.raw_extras["resumed"], true);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn codex_exec_resume_thread_rejects_empty_persistent_id() {
+    let err = CodexExecAdapter::new()
+        .resume_thread("")
+        .await
+        .expect_err("empty id should error");
+    assert!(matches!(err, HarnessError::SpawnFailed(_)));
 }
 
 #[tokio::test(flavor = "current_thread")]
