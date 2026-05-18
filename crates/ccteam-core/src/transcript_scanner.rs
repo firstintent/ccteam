@@ -15,7 +15,7 @@
 //!    `queries::session_jsonl_path` and Claude Code's on-disk layout).
 //! 2. Streams every `message.usage` block in the file, sums the four
 //!    token counters across **all** turns, then converts to dollars via
-//!    [`crate::pricing::estimate_cost`].
+//!    [`ccteam_cost::estimate_cost`].
 //! 3. Memoizes the result keyed by `(path, mtime, len)`. The second
 //!    call on an unchanged file returns the cached sum without
 //!    re-reading. When the file has grown, we read **only the appended
@@ -42,7 +42,7 @@ use std::time::SystemTime;
 
 use serde_json::Value;
 
-use crate::pricing::{estimate_cost, Usage};
+use ccteam_cost::{estimate_cost, UnifiedTokenUsage as Usage, Vendor};
 
 /// Memoization key. `mtime` is encoded as `u64` nanos-since-epoch so
 /// the type is `Hash + Eq` without leaning on `SystemTime`'s `Hash`
@@ -98,7 +98,11 @@ pub fn reset_cache_for_tests() {
 pub fn session_cost_from_jsonl(state: &Value, model: &str) -> Option<f64> {
     let path = resolve_jsonl_path(state)?;
     let usage = sum_usage_with_cache(&path)?;
-    Some(estimate_cost(model, &usage))
+    // Transcript JSONLs are Claude-only — `state.json::respawnFlags`
+    // is a Claude-CLI artifact. Hardcode Vendor::Claude; Codex sessions
+    // route their cost through `agent_done.cost_usd` direct from the
+    // exec stream and never touch this scanner.
+    Some(estimate_cost(&usage, Vendor::Claude, model))
 }
 
 /// Resolve the absolute jsonl transcript path. Prefer
@@ -232,11 +236,22 @@ fn read_usage_from_offset(path: &Path, offset: u64) -> Option<Usage> {
 }
 
 fn merge_usage(a: &Usage, b: &Usage) -> Usage {
+    fn add_opt(x: Option<u64>, y: Option<u64>) -> Option<u64> {
+        match (x, y) {
+            (Some(a), Some(b)) => Some(a + b),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        }
+    }
     Usage {
         input_tokens: a.input_tokens + b.input_tokens,
-        cache_creation_input_tokens: a.cache_creation_input_tokens + b.cache_creation_input_tokens,
-        cache_read_input_tokens: a.cache_read_input_tokens + b.cache_read_input_tokens,
+        cached_input_tokens: a.cached_input_tokens + b.cached_input_tokens,
         output_tokens: a.output_tokens + b.output_tokens,
+        cache_creation_input_tokens: add_opt(
+            a.cache_creation_input_tokens,
+            b.cache_creation_input_tokens,
+        ),
+        reasoning_output_tokens: add_opt(a.reasoning_output_tokens, b.reasoning_output_tokens),
     }
 }
 

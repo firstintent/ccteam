@@ -11,14 +11,14 @@ use serde_json::{json, Map, Value};
 
 use ccteam_core::tmux::TmuxSession;
 use ccteam_core::{
-    bootstrap_meta_project, current_ccteam_bin, install_ccteam_control_skill,
+    bootstrap_meta_project, cost_summary, current_ccteam_bin, install_ccteam_control_skill,
     install_ccteam_creator_skill, install_ccteam_team_skill, migrate_legacy_skill_dirs,
-    migrate_recommended_agent_symlinks, rewrite_legacy_hook_commands, session_name_for_project,
-    user_claude_dir, write_global_helper_templates, CcteamPaths, HookCmdRewriteAction,
-    HookCmdRewriteReport, InstallSkillOptions, LegacySkillAction, LegacySkillReport,
-    MetaBootstrapReport, MigrationReport, PhaseState, ProjectState, SkillInstallAction,
-    ToolSurfaceSnapshot, BUILTIN_SUBAGENTS, CCTEAM_CONTROL_SKILL_NAME, CCTEAM_CREATOR_SKILL_NAME,
-    CCTEAM_TEAM_SKILL_NAME,
+    migrate_recommended_agent_symlinks, pricing_schema_version, rewrite_legacy_hook_commands,
+    session_name_for_project, user_claude_dir, write_global_helper_templates, CcteamPaths,
+    HookCmdRewriteAction, HookCmdRewriteReport, InstallSkillOptions, LegacySkillAction,
+    LegacySkillReport, MetaBootstrapReport, MigrationReport, PhaseState, ProjectState,
+    SkillInstallAction, ToolSurfaceSnapshot, BUILTIN_SUBAGENTS, CCTEAM_CONTROL_SKILL_NAME,
+    CCTEAM_CREATOR_SKILL_NAME, CCTEAM_TEAM_SKILL_NAME,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -659,7 +659,7 @@ pub fn run_show(paths: &CcteamPaths, slug: &str, format: OutputFormat) -> Result
     let recent = collect_recent_events(paths, slug, 50)?;
     let artifacts = collect_artifacts(paths, slug);
     let progress_path = paths.progress_jsonl(slug);
-    let cost = ccteam_core::cost_summary(slug, &progress_path, paths)?;
+    let cost = cost_summary(slug, &progress_path, paths)?;
     let sessions = ccteam_core::active_sessions(slug, paths).unwrap_or_default();
 
     Ok(match format {
@@ -2725,7 +2725,7 @@ fn render_update_hooks_report(paths: &CcteamPaths, dry_run: bool) -> Result<Stri
 /// from anthropic.com.
 fn render_check_pricing_version_report() -> String {
     let mut out = String::from("ccteam doctor --check-pricing-version (V0.5.0 F92)\n\n");
-    let version = ccteam_core::pricing_schema_version();
+    let version = pricing_schema_version();
     let today = chrono::Utc::now().date_naive();
     out.push_str(&format!("  pricing.json schema_version: {version}\n"));
     out.push_str(&format!("  today (UTC):                 {today}\n"));
@@ -2742,7 +2742,7 @@ fn render_check_pricing_version_report() -> String {
                 out.push_str(&format!(
                     "\n  [WARN] pricing.json is {age_days} days old (> 180). \
                      Upgrade ccteam to refresh the bundled rate sheet \
-                     (see crates/ccteam-core/src/pricing.json).\n",
+                     (see crates/ccteam-cost/pricing/anthropic.toml + openai.toml).\n",
                 ));
             } else {
                 out.push_str("\n  pricing table is fresh (< 180 days).\n");
@@ -3025,7 +3025,7 @@ fn render_ls_text(paths: &CcteamPaths, projects: &[ProjectSummary], daemon_up: b
         // projects with no progress events show $0.00, same shape
         // as pre-F91 `state.cost_used_usd == 0.0`).
         let cost_24h =
-            ccteam_core::cost_summary(&p.state.slug, &paths.progress_jsonl(&p.state.slug), paths)
+            cost_summary(&p.state.slug, &paths.progress_jsonl(&p.state.slug), paths)
                 .map(|c| c.cost_24h_usd)
                 .unwrap_or(0.0);
         out.push_str(&format!(
@@ -3068,7 +3068,7 @@ fn render_ls_json(
             // `cost_24h_usd` so the number tracks reality. The legacy
             // serde field still reads as the frozen pre-F91 value if
             // anything in the JSON pipeline needs to differentiate.
-            let cost_summary = ccteam_core::cost_summary(
+            let cost_summary = cost_summary(
                 &p.state.slug,
                 &paths.progress_jsonl(&p.state.slug),
                 paths,

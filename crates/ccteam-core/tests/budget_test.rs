@@ -80,6 +80,7 @@ fn manual_spec_with_budget(role: &str, budget: Option<BudgetSpec>) -> WorkflowSp
         mode: ccteam_core::WorkflowMode::default(),
         enabled: true,
         budget,
+        budgets_v060: None,
         agent_team: None,
         agents,
     }

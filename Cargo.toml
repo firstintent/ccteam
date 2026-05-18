@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/ccteam-core",
+    "crates/ccteam-cost",
     "crates/ccteam-cli",
     "crates/ccteam-hooks",
     "crates/ccteam-web",
@@ -15,6 +16,7 @@ license = "MIT"
 
 [workspace.dependencies]
 ccteam-core = { path = "crates/ccteam-core" }
+ccteam-cost = { path = "crates/ccteam-cost" }
 ccteam-hooks = { path = "crates/ccteam-hooks" }
 ccteam-web = { path = "crates/ccteam-web" }
 

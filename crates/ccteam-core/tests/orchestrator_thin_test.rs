@@ -33,7 +33,7 @@ use ccteam_core::harness::{
 use futures::stream::{self, BoxStream};
 use ccteam_core::orchestrator::{Orchestrator, OrchestratorConfig};
 use ccteam_core::workflow::{AgentSpec, Executor, Trigger, WorkflowSpec};
-use ccteam_core::CcteamPaths;
+use ccteam_core::{cost_summary, CcteamPaths};
 
 // =====================================================================
 // MockAdapter
@@ -213,6 +213,7 @@ fn watch_spec(role: &str, watch_rel: &str, parallelism: Option<u32>) -> Workflow
         mode: ccteam_core::WorkflowMode::default(),
         enabled: true,
         budget: None,
+        budgets_v060: None,
         agent_team: None,
         agents,
     }
@@ -239,6 +240,7 @@ fn manual_spec(role: &str) -> WorkflowSpec {
         mode: ccteam_core::WorkflowMode::default(),
         enabled: true,
         budget: None,
+        budgets_v060: None,
         agent_team: None,
         agents,
     }
@@ -265,6 +267,7 @@ fn gate_spec(role: &str, input_rel: &str) -> WorkflowSpec {
         mode: ccteam_core::WorkflowMode::default(),
         enabled: true,
         budget: None,
+        budgets_v060: None,
         agent_team: None,
         agents,
     }
@@ -840,6 +843,7 @@ agents:
         mode: ccteam_core::WorkflowMode::default(),
         enabled: true,
         budget: None,
+        budgets_v060: None,
         agent_team: None,
         agents,
     };
@@ -1399,6 +1403,7 @@ async fn t31_inbox_target_role_routes_explicitly() {
         mode: ccteam_core::WorkflowMode::default(),
         enabled: true,
         budget: None,
+        budgets_v060: None,
         agent_team: None,
         agents,
     };
@@ -1734,7 +1739,7 @@ async fn t36_phantom_cleanup_records_cost_in_progress_for_cost_summary() {
     // F91: state.cost_used_usd stays at 0.0 (frozen / no longer
     // mutated). The new SoT — cost_summary — surfaces the cost via
     // its `cost_total_usd` field, reading from progress.jsonl.
-    let cost = ccteam_core::cost_summary(&slug, &progress, &paths).unwrap();
+    let cost = cost_summary(&slug, &progress, &paths).unwrap();
     assert!(
         (cost.cost_total_usd - 1.25).abs() < 1e-9,
         "cost_summary.cost_total_usd must reflect the agent_done cost, got {}",

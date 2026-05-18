@@ -234,19 +234,12 @@ pub struct SpawnCtx {
     pub extra_args: Vec<String>,
 }
 
-/// Unified token-usage shape — stub. Cost-crater teammate will move the
-/// canonical definition into `crates/ccteam-cost/src/lib.rs` and this
-/// local stub becomes `pub use ccteam_cost::UnifiedTokenUsage`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct UnifiedTokenUsage {
-    pub input_tokens: u64,
-    pub cached_input_tokens: u64,
-    pub output_tokens: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_creation_input_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning_output_tokens: Option<u64>,
-}
+/// V0.6.0 F107 — canonical [`UnifiedTokenUsage`] lives in `ccteam-cost`
+/// (`crates/ccteam-cost/src/pricing.rs`) so cost / pricing logic and
+/// vendor accounting stay in one crate. Re-exported here so trait users
+/// can `use ccteam_core::harness::UnifiedTokenUsage` without depending
+/// on `ccteam-cost` directly.
+pub use ccteam_cost::UnifiedTokenUsage;
 
 /// Minimal agent spec passed into [`HarnessAdapter::start_thread`].
 /// Wave 1 keeps this thin — Wave 2 / Wave 3 will extend with persona /

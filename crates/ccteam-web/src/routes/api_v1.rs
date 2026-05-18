@@ -28,8 +28,8 @@ use axum::{
     Json, Router,
 };
 use ccteam_core::{
-    ActiveSessionInfo, ArtifactQueueEntry, CostHistoryBucket, HarnessKind, HarnessSnapshot,
-    ProjectState, TeamKind, WorkflowSummary,
+    cost_history_buckets, cost_summary, ActiveSessionInfo, ArtifactQueueEntry, CostHistoryBucket,
+    HarnessKind, HarnessSnapshot, ProjectState, TeamKind, WorkflowSummary,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -178,7 +178,7 @@ fn build_projects(app: &AppState) -> anyhow::Result<Vec<DashboardRow>> {
         // instead of the now-frozen `state.cost_used_usd`. A missing
         // progress file folds to 0.00 — same shape pre-F91 fresh
         // projects displayed.
-        let cost_total = ccteam_core::cost_summary(
+        let cost_total = cost_summary(
             &s.state.slug,
             &app.paths.progress_jsonl(&s.state.slug),
             &app.paths,
@@ -260,7 +260,7 @@ async fn handle_project(
     // V0.4.6 F91 — cost_label sources `cost_total_usd` from
     // `cost_summary` (progress.jsonl + live state.json). Pre-F91 this
     // line read `state.cost_used_usd`, which is now frozen.
-    let cost_total = ccteam_core::cost_summary(&slug, &app.paths.progress_jsonl(&slug), &app.paths)
+    let cost_total = cost_summary(&slug, &app.paths.progress_jsonl(&slug), &app.paths)
         .map(|c| c.cost_total_usd)
         .unwrap_or(0.0);
     let summary = ProjectSummary {
@@ -350,7 +350,7 @@ async fn handle_session(
         .map(|snap| format!("{:.2}", snap.cost_usd_total))
         .unwrap_or_else(|| {
             let total =
-                ccteam_core::cost_summary(&slug, &app.paths.progress_jsonl(&slug), &app.paths)
+                cost_summary(&slug, &app.paths.progress_jsonl(&slug), &app.paths)
                     .map(|c| c.cost_total_usd)
                     .unwrap_or(0.0);
             format!("{:.2}", total)
@@ -545,7 +545,7 @@ fn session_cards(app: &AppState, state: &ProjectState) -> Vec<SessionCard> {
             let cost_label = load_harness_snapshot(app, &state.slug, sid)
                 .map(|snap| format!("{:.2}", snap.cost_usd_total))
                 .unwrap_or_else(|| {
-                    let total = ccteam_core::cost_summary(
+                    let total = cost_summary(
                         &state.slug,
                         &app.paths.progress_jsonl(&state.slug),
                         &app.paths,
@@ -711,7 +711,7 @@ async fn handle_cost_history(
         "7d" | "168h" => (24 * 7u32, "7d"),
         _ => (24u32, "24h"),
     };
-    match ccteam_core::cost_history_buckets(&slug, &app.paths, window_hours) {
+    match cost_history_buckets(&slug, &app.paths, window_hours) {
         Ok(buckets) => Json(CostHistoryResponse {
             window: normalized.to_string(),
             buckets,

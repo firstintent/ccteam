@@ -37,8 +37,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 // returns ≥ 2 hits.
 use ccteam_core::actions;
 use ccteam_core::{
-    bootstrap_project, check_daemon_health, pick_unused_slug, render_screenshot, CcteamPaths,
-    DaemonHealth, SendOptions,
+    bootstrap_project, check_daemon_health, cost_summary, pick_unused_slug, render_screenshot,
+    CcteamPaths, DaemonHealth, SendOptions,
 };
 
 use crate::commands::{collect_projects, collect_recent_events, run_peek, run_show, OutputFormat};
@@ -524,7 +524,7 @@ fn tool_ls(paths: &CcteamPaths) -> Result<String> {
             // cost_24h / cost_active fields here too; for now we
             // keep the legacy `cost_used_usd` JSON key but populate
             // it from `cost_total_usd` so the MCP shape is stable.
-            let cost = ccteam_core::cost_summary(
+            let cost = cost_summary(
                 &p.state.slug,
                 &paths.progress_jsonl(&p.state.slug),
                 paths,

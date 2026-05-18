@@ -1,0 +1,76 @@
+# Anthropic Claude rate sheet — dollars per 1M tokens.
+#
+# Source: https://platform.claude.com/docs/en/about-claude/pricing
+# Verified against site on the schema_version date below; bump
+# `schema_version` to today's YYYY-MM-DD when refreshing the numbers.
+#
+# Field semantics (matches `ccteam_cost::pricing::ModelPrices`):
+#   - input_per_1m            standard prompt input tokens
+#   - cached_input_per_1m     prompt tokens served from cache_read
+#                              (Anthropic's "cache_read_input_tokens" bucket)
+#   - cache_creation_per_1m   1h ephemeral cache *write* cost
+#                              (Anthropic's "cache_creation_input_tokens" bucket)
+#   - output_per_1m           model output tokens
+
+schema_version = "2026-05-17"
+fallback_model = "claude-sonnet-4-6"
+
+[models."claude-opus-4-7"]
+input_per_1m = 5.0
+cached_input_per_1m = 0.5
+cache_creation_per_1m = 6.25
+output_per_1m = 25.0
+
+[models."claude-opus-4-6"]
+input_per_1m = 5.0
+cached_input_per_1m = 0.5
+cache_creation_per_1m = 6.25
+output_per_1m = 25.0
+
+[models."claude-opus-4-5"]
+input_per_1m = 5.0
+cached_input_per_1m = 0.5
+cache_creation_per_1m = 6.25
+output_per_1m = 25.0
+
+[models."claude-opus-4-1"]
+input_per_1m = 15.0
+cached_input_per_1m = 1.5
+cache_creation_per_1m = 18.75
+output_per_1m = 75.0
+
+[models."claude-opus-4"]
+input_per_1m = 15.0
+cached_input_per_1m = 1.5
+cache_creation_per_1m = 18.75
+output_per_1m = 75.0
+
+[models."claude-sonnet-4-6"]
+input_per_1m = 3.0
+cached_input_per_1m = 0.3
+cache_creation_per_1m = 3.75
+output_per_1m = 15.0
+
+[models."claude-sonnet-4-5"]
+input_per_1m = 3.0
+cached_input_per_1m = 0.3
+cache_creation_per_1m = 3.75
+output_per_1m = 15.0
+
+[models."claude-sonnet-4"]
+input_per_1m = 3.0
+cached_input_per_1m = 0.3
+cache_creation_per_1m = 3.75
+output_per_1m = 15.0
+
+[models."claude-haiku-4-5"]
+input_per_1m = 1.0
+cached_input_per_1m = 0.1
+cache_creation_per_1m = 1.25
+output_per_1m = 5.0
+
+[models."claude-haiku-3-5"]
+input_per_1m = 0.8
+cached_input_per_1m = 0.08
+cache_creation_per_1m = 1.0
+output_per_1m = 4.0
