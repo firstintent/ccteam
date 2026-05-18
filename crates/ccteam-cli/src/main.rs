@@ -537,6 +537,16 @@ enum Command {
         /// to upgrade ccteam when the bundled rate sheet ages out.
         #[arg(long, default_value_t = false)]
         check_pricing_version: bool,
+        /// V0.6.0 Wave 3 F112: probe `codex --version` and warn when
+        /// older than 0.131 (minimum supported by Wave 3 mode-3 codex
+        /// bot path). No fs mutation. Pairs with --check-codex-auth.
+        #[arg(long, default_value_t = false)]
+        check_codex_version: bool,
+        /// V0.6.0 Wave 3 F112: probe `codex login status` and report
+        /// whether the operator is logged in to ChatGPT / API. No fs
+        /// mutation. Pairs with --check-codex-version.
+        #[arg(long, default_value_t = false)]
+        check_codex_auth: bool,
         /// V0.4.6 F83/F85: pair with `--migrate-workflow-to-ccteam-dir`
         /// or `--gc-claude-jobs` to commit changes to disk instead of
         /// previewing them. Without it, those subcommands run as
@@ -581,6 +591,39 @@ enum Command {
         /// it on `ServeOpts` for shape stability.
         #[arg(long, value_name = "PATH")]
         token_file: Option<PathBuf>,
+    },
+    /// V0.6.0 Wave 3 F112 §C — read / write `~/.ccteam/preferences.toml`.
+    /// Today the only user-visible knob is `fallback.on_claude_quota`
+    /// (`off` | `codex`); V0.7+ will fold in additional opt-in
+    /// preferences. Without args, prints the current preferences.
+    Prefs {
+        #[command(subcommand)]
+        action: Option<PrefsAction>,
+    },
+}
+
+/// V0.6.0 Wave 3 F112 §C — `ccteam prefs` subcommand surface.
+#[derive(Subcommand)]
+enum PrefsAction {
+    /// Pretty-print the active preferences (defaults shown when the
+    /// file is absent).
+    Show,
+    /// Look up a single preference by dotted key. Supported keys today:
+    ///   - `fallback.on_claude_quota`
+    Get {
+        /// Dotted preference key.
+        key: String,
+    },
+    /// Set one preference by dotted key. Writes
+    /// `~/.ccteam/preferences.toml` atomically. Supported keys today:
+    ///   - `fallback.on_claude_quota`  (values: `off` | `codex`)
+    ///   - `fallback.codex.enabled_for_roles` (comma-separated list,
+    ///     or empty string to mean "all roles")
+    Set {
+        /// Dotted preference key.
+        key: String,
+        /// New value.
+        value: String,
     },
 }
 
@@ -912,6 +955,8 @@ fn main() -> Result<()> {
             gc_claude_jobs,
             update_hooks,
             check_pricing_version,
+            check_codex_version,
+            check_codex_auth,
             apply,
         } => {
             // V0.4.1 `--install-all` is sugar for the three first-run
@@ -960,6 +1005,8 @@ fn main() -> Result<()> {
                 gc_apply: apply,
                 update_hooks,
                 check_pricing_version,
+                check_codex_version,
+                check_codex_auth,
             })
         }
         Command::Session { action } => run_session(action),
@@ -975,6 +1022,26 @@ fn main() -> Result<()> {
                 no_auth,
                 token_file,
             })
+        }
+        Command::Prefs { action } => {
+            let paths = CcteamPaths::from_env()?;
+            match action {
+                None | Some(PrefsAction::Show) => {
+                    let out = commands::run_prefs_show(&paths)?;
+                    print!("{out}");
+                    Ok(())
+                }
+                Some(PrefsAction::Get { key }) => {
+                    let out = commands::run_prefs_get(&paths, &key)?;
+                    println!("{out}");
+                    Ok(())
+                }
+                Some(PrefsAction::Set { key, value }) => {
+                    let out = commands::run_prefs_set(&paths, &key, &value)?;
+                    println!("{out}");
+                    Ok(())
+                }
+            }
         }
     }
 }

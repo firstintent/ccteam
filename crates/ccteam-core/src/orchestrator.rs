@@ -32,13 +32,15 @@ use tokio::task::JoinSet;
 
 use crate::artifact_watcher::{ArtifactEvent, ArtifactWatcher};
 use crate::daemon;
-use crate::execution::{ClaudeBgAdapter, CodexExecAdapter};
+use crate::execution::{ClaudeBgAdapter, ClaudeTuiAdapter, CodexExecAdapter};
 use crate::handoff;
 use crate::harness::{
-    AgentSpecBrief, HarnessAdapter, SessionHandle, SpawnCtx, ThreadEvent, UnifiedTokenUsage,
+    AgentSpecBrief, AgentVendor, HarnessAdapter, SessionHandle, SpawnCtx, ThreadEvent,
+    UnifiedTokenUsage,
 };
 use crate::inbox::{InboxMessage, SessionMailbox};
 use crate::paths::CcteamPaths;
+use crate::preferences;
 use crate::progress;
 use crate::queries;
 use crate::spawn_brief::{render_spawn_brief, SpawnContext as SpawnBriefContext};
@@ -53,6 +55,21 @@ pub const MAX_CONCURRENT_PROJECTS: usize = 3;
 /// vendor, model) -> f64`. Wave 1 returns 0 because the active
 /// agent_done driver is still the F80 `claude_job::probe_job` poller
 /// which reads `cost_usd` from `state.json` directly.
+/// V0.6.0 Wave 3 F112 — derive vendor string from a
+/// [`SessionHandle::harness`] tag. Used to annotate `agent_done`
+/// events with the per-vendor key consumed by
+/// [`crate::queries::CostSummary::cost_24h_by_vendor`] + per-vendor
+/// budget caps. Anything starting with `"codex"` is classified codex;
+/// everything else is claude.
+pub fn vendor_from_harness(harness: &str) -> &'static str {
+    if harness.starts_with("codex") {
+        "codex"
+    } else {
+        "claude"
+    }
+}
+
+#[allow(dead_code)] // Retained for transitional `translate_thread_event` callers; Wave 3 prefers ccteam_cost::estimate_cost.
 fn usage_to_cost_placeholder(_usage: &UnifiedTokenUsage) -> f64 {
     0.0
 }
@@ -633,6 +650,35 @@ impl Orchestrator {
         self.adapters.get(key)
     }
 
+    /// V0.6.0 Wave 3 — dispatch helper that picks the right adapter for
+    /// the `(executor, workflow_mode)` pair. mode 3 (`Chat`) overrides
+    /// the per-executor bg/exec default with the long-running TUI adapter
+    /// (Claude) or AppServer adapter (Codex; Wave 3 codex-exec teammate).
+    ///
+    /// Per the Wave 3 e2e-wiring contract: the orchestrator currently
+    /// short-circuits `WorkflowMode::Chat` (lifecycle owned by
+    /// `ccteam-imd`); this helper is the seam future spawn paths reach
+    /// through once orchestrator-owned chat scenarios land.
+    pub fn pick_adapter(
+        &self,
+        exec: Executor,
+        mode: WorkflowMode,
+    ) -> Option<Arc<dyn HarnessAdapter + Send + Sync>> {
+        match (exec, mode) {
+            (Executor::Claude, WorkflowMode::Chat) => {
+                Some(Arc::new(ClaudeTuiAdapter::new()) as Arc<dyn HarnessAdapter + Send + Sync>)
+            }
+            (Executor::Codex, WorkflowMode::Chat) => {
+                // CodexAppServerAdapter ships with Wave 3 codex-exec-impl
+                // teammate; until that lands, fall back to the bg adapter
+                // so the dispatch table never returns None for a known
+                // (vendor, mode) pair.
+                self.adapter_for(Executor::Codex).cloned()
+            }
+            _ => self.adapter_for(exec).cloned(),
+        }
+    }
+
     /// Test-only adapter override; production CLI never calls this.
     #[cfg(any(test, feature = "test-util"))]
     pub fn set_adapter(&mut self, exec: Executor, adapter: Arc<dyn HarnessAdapter + Send + Sync>) {
@@ -719,6 +765,23 @@ impl Orchestrator {
                 "ts": Utc::now().to_rfc3339(),
             }),
         )?;
+
+        // V0.6.0 Wave 3 — `mode: chat` is owned by `ccteam-imd` end to
+        // end. The daemon spawns the tmux session via
+        // `ClaudeTuiAdapter::start_thread`, drives turns from IM input,
+        // and tails `turns.jsonl` for outbound. Orchestrator's role is
+        // limited to logging `workflow_start` (above) so the project
+        // appears in `ccteam status`; it must NOT enter the artifact
+        // event loop nor attempt to spawn agents (the spec's `agents`
+        // map is allowed to be empty in mode: chat per workflow.rs
+        // validation).
+        if matches!(spec.mode, WorkflowMode::Chat) {
+            tracing::info!(
+                slug,
+                "mode: chat workflow — ccteam-imd owns lifecycle; orchestrator exiting"
+            );
+            return Ok(());
+        }
 
         // V0.4.5: pass the progress.jsonl file (so the watcher can
         // append `artifact_dir_created` events) — the previous version
@@ -1516,32 +1579,73 @@ impl Orchestrator {
             .await
             .unwrap_or(0.0);
         let budget = self.budget_limit_for_project(project_dir);
+        // V0.6.0 Wave 3 F112 §C — vendor_fallback hook. When the
+        // cumulative Claude cost trips the cap AND the user opted in
+        // via `~/.ccteam/preferences.toml::fallback.on_claude_quota
+        // = "codex"`, we DON'T hard-stop: we swap this role's adapter
+        // to Codex on this spawn, keep the workflow alive, and write
+        // a `budget_exceeded` event tagged `vendor: claude` +
+        // `vendor_fallback_to: codex` so the audit trail still shows
+        // the cap. The original V0.5.x hard-stop path (no prefs / off /
+        // role not eligible) is otherwise unchanged.
+        let prefs = preferences::load_or_default(&self.paths.root);
+        let mut effective_executor = agent.executor;
         if cost_so_far >= budget {
-            progress::append_event(
-                progress_path,
-                &json!({
-                    "event": "budget_exceeded",
-                    "role": role,
-                    "cost_used_usd": cost_so_far,
-                    "budget_limit_usd": budget,
-                    "slug": slug,
-                    "ts": Utc::now().to_rfc3339(),
-                }),
-            )?;
-            self.send_btw_escalation(
-                slug,
-                &format!(
-                    "budget exceeded for role `{}` (used ${:.2} of ${:.2}); spawn blocked. \
-                     Running sessions left intact.",
-                    role, cost_so_far, budget
-                ),
-            )
-            .await;
-            return Ok(());
+            let claude_vendor = matches!(agent.executor, Executor::Claude);
+            let want_fallback = claude_vendor && prefs.codex_fallback_enabled_for(role);
+            let codex_adapter_present = self.adapter_for(Executor::Codex).is_some();
+            if want_fallback && codex_adapter_present {
+                progress::append_event(
+                    progress_path,
+                    &json!({
+                        "event": "budget_exceeded",
+                        "role": role,
+                        "cost_used_usd": cost_so_far,
+                        "budget_limit_usd": budget,
+                        "slug": slug,
+                        "vendor": "claude",
+                        "vendor_fallback_to": "codex",
+                        "ts": Utc::now().to_rfc3339(),
+                    }),
+                )?;
+                tracing::warn!(
+                    role,
+                    cost_so_far,
+                    budget,
+                    "claude quota tripped; swapping to codex for this spawn (prefs opt-in)"
+                );
+                effective_executor = Executor::Codex;
+            } else {
+                progress::append_event(
+                    progress_path,
+                    &json!({
+                        "event": "budget_exceeded",
+                        "role": role,
+                        "cost_used_usd": cost_so_far,
+                        "budget_limit_usd": budget,
+                        "slug": slug,
+                        "vendor": match agent.executor {
+                            Executor::Claude => "claude",
+                            Executor::Codex => "codex",
+                        },
+                        "ts": Utc::now().to_rfc3339(),
+                    }),
+                )?;
+                self.send_btw_escalation(
+                    slug,
+                    &format!(
+                        "budget exceeded for role `{}` (used ${:.2} of ${:.2}); spawn blocked. \
+                         Running sessions left intact.",
+                        role, cost_so_far, budget
+                    ),
+                )
+                .await;
+                return Ok(());
+            }
         }
 
-        let Some(adapter) = self.adapter_for(agent.executor) else {
-            tracing::warn!(role, executor = ?agent.executor, "no adapter registered");
+        let Some(adapter) = self.adapter_for(effective_executor) else {
+            tracing::warn!(role, executor = ?effective_executor, "no adapter registered");
             self.bump_fail_count(slug, role, progress_path).await?;
             return Ok(());
         };
@@ -1632,7 +1736,7 @@ impl Orchestrator {
                         "session_id": handle.sid,
                         "tmux_session": handle.tmux_session,
                         "job_id": handle.job_id,
-                        "executor": match agent.executor {
+                        "executor": match effective_executor {
                             Executor::Claude => "claude",
                             Executor::Codex => "codex",
                         },
@@ -1676,24 +1780,44 @@ impl Orchestrator {
         role: &str,
         sid: &str,
         slug: &str,
+        vendor: AgentVendor,
     ) -> Option<serde_json::Value> {
+        let vendor_str = match vendor {
+            AgentVendor::Claude => "claude",
+            AgentVendor::Codex => "codex",
+        };
         match evt {
             ThreadEvent::ThreadStarted { .. } => None,
-            ThreadEvent::TurnCompleted { usage, .. } => Some(json!({
-                "event": "agent_done",
-                "role": role,
-                "session_id": sid,
-                "status": "completed",
-                "cost_usd": usage_to_cost_placeholder(usage),
-                "slug": slug,
-                "ts": Utc::now().to_rfc3339(),
-            })),
+            ThreadEvent::TurnCompleted { usage, .. } => {
+                let cost = ccteam_cost::estimate_cost(
+                    usage,
+                    match vendor {
+                        AgentVendor::Claude => ccteam_cost::Vendor::Claude,
+                        AgentVendor::Codex => ccteam_cost::Vendor::Codex,
+                    },
+                    // Wave 3: model identity isn't on ThreadEvent; the
+                    // pricing table falls back to per-vendor default
+                    // when the model string is unknown.
+                    "",
+                );
+                Some(json!({
+                    "event": "agent_done",
+                    "role": role,
+                    "session_id": sid,
+                    "status": "completed",
+                    "cost_usd": cost,
+                    "vendor": vendor_str,
+                    "slug": slug,
+                    "ts": Utc::now().to_rfc3339(),
+                }))
+            }
             ThreadEvent::TurnFailed { err, .. } => Some(json!({
                 "event": "agent_done",
                 "role": role,
                 "session_id": sid,
                 "status": "errored",
                 "error": err.message,
+                "vendor": vendor_str,
                 "slug": slug,
                 "ts": Utc::now().to_rfc3339(),
             })),
@@ -1703,6 +1827,7 @@ impl Orchestrator {
                 "session_id": sid,
                 "status": "errored",
                 "error": err.message,
+                "vendor": vendor_str,
                 "slug": slug,
                 "ts": Utc::now().to_rfc3339(),
             })),
@@ -1712,6 +1837,7 @@ impl Orchestrator {
             | ThreadEvent::ItemCompleted { .. } => None,
         }
     }
+
 
     /// Monotonic microsecond sequence — collision-free across one
     /// orchestrator instance; F67 may swap in a counter map.
@@ -1876,6 +2002,7 @@ impl Orchestrator {
                     "session_id": handle.sid,
                     "status": status,
                     "cost_usd": cost_usd.unwrap_or(0.0),
+                    "vendor": vendor_from_harness(&handle.harness),
                     "slug": slug,
                     "ts": Utc::now().to_rfc3339(),
                 }),
@@ -2427,17 +2554,60 @@ impl Orchestrator {
         project_dir: &std::path::Path,
         progress_path: &std::path::Path,
     ) -> Result<bool> {
+        // F84 stub of F91 — read progress.jsonl once, derive both
+        // 24h cost and 1h spawn count from the same in-memory slice.
+        let events = progress::read_all_events(progress_path).unwrap_or_default();
+        let cost = queries::cost_summary_from_events(&events)?;
+
+        // V0.6.0 Wave 3 F112 — per-vendor caps (preferred). Checked
+        // first so a vendor-specific overrun trips an auto-disable
+        // even if the legacy flat cap is unset.
+        if let Some(budgets) = &spec.budgets_v060 {
+            for (vendor_key, cap_opt) in [
+                ("claude", budgets.claude.max_cost_usd_per_24h),
+                ("codex", budgets.codex.max_cost_usd_per_24h),
+            ] {
+                let Some(cap) = cap_opt else { continue };
+                let value = cost
+                    .cost_24h_by_vendor
+                    .get(vendor_key)
+                    .copied()
+                    .unwrap_or(0.0);
+                if value >= cap {
+                    progress::append_event(
+                        progress_path,
+                        &json!({
+                            "event": "budget_exceeded",
+                            "slug": slug,
+                            "kind": "cost_24h_per_vendor",
+                            "vendor": vendor_key,
+                            "value": value,
+                            "cap": cap,
+                            "ts": Utc::now().to_rfc3339(),
+                        }),
+                    )?;
+                    tracing::warn!(
+                        slug,
+                        vendor = vendor_key,
+                        value,
+                        cap,
+                        "per-vendor budget cap tripped; auto-disabling workflow"
+                    );
+                    self.auto_disable_workflow(
+                        slug,
+                        "budget_exceeded_per_vendor",
+                        project_dir,
+                        progress_path,
+                    )
+                    .await?;
+                    return Ok(true);
+                }
+            }
+        }
+
         let Some(budget) = &spec.budget else {
             return Ok(false);
         };
-
-        // F84 stub of F91 — read progress.jsonl once, derive both
-        // 24h cost and 1h spawn count from the same in-memory slice.
-        // When F91's full impl lands, replace the spawn-count line
-        // with whatever F91 publishes; the budget check shape is
-        // unchanged.
-        let events = progress::read_all_events(progress_path).unwrap_or_default();
-        let cost = queries::cost_summary_from_events(&events)?;
 
         if let Some(cap) = budget.max_cost_usd_per_24h {
             if cost.cost_24h_usd >= cap {

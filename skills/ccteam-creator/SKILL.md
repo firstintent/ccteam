@@ -116,6 +116,46 @@ If no persona is a clean fit, ask the user to pick from the top 3
 candidates. **Do not invent a new persona** — V0.7 will add a
 `/ccteam-creator-persona-new` flow; for V0.6 the library is fixed.
 
+## Phase 3.5 — Codex auto-critic detection (V0.6.0 Wave 3 F112 §B)
+
+When the matched persona's role hints at adversarial / second-opinion
+work, ccteam-creator silently consults the Codex CLI and — if it's
+installed and authenticated — vendors that one role on Codex. The
+user never sees `vendor: codex` in YAML during the dialogue; it just
+shows up as a one-line "Codex critic: auto-enabled" note in Phase 4.
+
+**Trigger roles** (LLM-matched against persona id + tags):
+
+- `code-critic`
+- `reviewer` / `code-reviewer` / `pr-reviewer`
+- `architect` / `architecture-reviewer`
+- any persona tagged `critic` or `second-opinion`
+
+**Detection probe** (run once per `ccteam-creator` dialogue):
+
+```bash
+codex --version 2>/dev/null && codex login status 2>/dev/null
+```
+
+- Both succeed → set `auto_critic_vendor = "codex"` for the matched
+  role; the workflow.yaml render in Phase 5.3 injects
+  `agents.<role>.executor: codex`. PROJECT PLAN line:
+  "Codex critic: auto-enabled".
+- Either fails → silent fallback to `vendor: claude` for that role;
+  PROJECT PLAN line: "Codex critic: unavailable (codex CLI not
+  installed / not authenticated)". User can opt in later via
+  `ccteam doctor --check-codex-version` + `--check-codex-auth`.
+- Persona is not a critic-flavoured role → PROJECT PLAN line:
+  "Codex critic: not applicable" (or omit entirely for brevity).
+
+**Test override**: when `$CCTEAM_CODEX_BIN` is set, treat that path
+as the codex binary. Unit / e2e tests inject a fake binary that
+returns success without burning real Codex inference cost.
+
+The persona `.md` body copied in Phase 5.4 is unchanged — vendor
+selection is purely a `workflow.yaml::agents.<role>.executor: codex`
+injection. The user does not edit YAML at any point.
+
 ---
 
 # Phase 4 — Output PROJECT PLAN (plan-first)

@@ -31,6 +31,7 @@ async fn daemon_runs_and_writes_heartbeat() {
         registry: None,
         tick: Duration::from_millis(40),
         max_runtime: Some(Duration::from_millis(150)),
+        adapter_factory: None,
     };
     run_daemon(args).await.unwrap();
     let hb = imd_heartbeat_path();

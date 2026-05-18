@@ -1,51 +1,107 @@
-//! V0.6.0 F107 — `CodexExecAdapter` (replaces V0.5.x `CodexAdapter`).
+//! V0.6.0 F107 + Wave 3 F112 — `CodexExecAdapter` (replaces V0.5.x
+//! `CodexAdapter`).
 //!
-//! Wave 1 parity with V0.5.1 behaviour:
+//! ## Lifecycle (Wave 3)
 //!
 //! - `start_thread`: `tmux new-session -d -s ccteam-<slug>-<sid> -c <cwd>
-//!   codex <extra_args...>` — codex has no `--bg` surface today, so we
-//!   keep the V0.4.0 F62 tmux long-session container. Initial state
-//!   observer file `~/.ccteam/codex/<sid>/state.json` is written
-//!   best-effort.
+//!   codex <extra_args...>` — codex's interactive shell stays the V0.5.1
+//!   tmux long-session container so the cost-status pane keeps working.
+//!   Wave 3's per-turn `codex exec --json` subprocess is launched
+//!   **independently** from this container; the tmux pane is just a
+//!   convenient place for the `CODEX_STATUS:` observer line to surface.
+//! - `submit_turn` (Wave 3): spawn `codex exec --json [prompt]` (or
+//!   `codex resume <id> --json [prompt]` when `raw_extras.resumed`).
+//!   Stdout JSONL is translated to [`ThreadEvent`]s and pushed into a
+//!   per-thread broadcast so `events()` can drain.
+//! - `events` (Wave 3): subscribe to the per-thread broadcast.
+//! - `resume_thread` (Wave 3): synthesise a [`ThreadHandle`] whose
+//!   `raw_extras.resumed == true` and `identity = persistent_id`; the
+//!   *next* `submit_turn` invokes `codex resume <id>` instead of
+//!   `codex exec`.
 //! - `close_thread`: send `q` + Enter (codex's documented quit
 //!   keybinding), 500 ms grace, then `tmux kill-session -t <name>`
-//!   fallback.
-//! - `events`: empty stream for Wave 1; Wave 3 F112 fills with `codex
-//!   exec --json` stdout JSONL → [`crate::harness::ThreadEvent`].
-//! - `submit_turn` / `resume_thread`: Wave 1 stub
-//!   `HarnessError::NotImplemented`; Wave 3 F112 fills both via `codex
-//!   exec --json` stdin pipe + `codex resume <UUID>`.
+//!   fallback (parity with V0.5.1).
 //!
-//! Free helpers ([`parse_status_line`], [`snapshot_from_status`]) are
-//! kept `pub` so non-trait callers (web layer, cost summary) can
-//! consume codex status without going through the trait. V0.6.0 F107
-//! drops `ingest_snapshot` from the trait surface — direct fn calls
-//! are the new convention.
+//! ## Test hooks
+//!
+//! - `CCTEAM_CODEX_BIN` env override redirects the per-turn subprocess
+//!   from the real `codex` binary to a fake script that emits
+//!   deterministic JSONL. Used by `tests/codex_exec_test.rs`.
 
-use std::process::Command;
+use std::collections::HashMap;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use futures::stream::{self, BoxStream};
+use futures::stream::{self, BoxStream, StreamExt};
+use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::{broadcast, Mutex};
 
+use crate::execution::codex_app_server::CODEX_BIN_ENV;
 use crate::harness::{
     pluck_f64, pluck_pct, pluck_str, AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter,
-    HarnessError, HarnessSnapshot, SpawnCtx, ThreadEvent, ThreadHandle, TurnId, TurnInput,
-    CODEX_STATUS_MARKER,
+    HarnessError, HarnessSnapshot, SpawnCtx, ThreadErrorEvent, ThreadEvent, ThreadHandle,
+    ThreadItem, ThreadItemDetails, TurnId, TurnInput, UnifiedTokenUsage, CODEX_STATUS_MARKER,
 };
 use crate::paths::CcteamPaths;
 use crate::tmux::{session_name_for_slug, TmuxSession};
 
-/// V0.6.0 F107 [`HarnessAdapter`] for OpenAI's `codex` CLI (tmux
-/// long-session container; Wave 3 F112 will add `codex exec --json` +
-/// `codex app-server` UDS paths).
-#[derive(Debug, Default, Clone, Copy)]
-pub struct CodexExecAdapter;
+/// Per-thread event broadcast buffer. Codex bursts items per turn so
+/// 256 lines of headroom is comfortable for a single subscriber.
+const EVENT_CHANNEL_BUFFER: usize = 256;
+
+/// V0.6.0 F107 + Wave 3 F112 [`HarnessAdapter`] for OpenAI's `codex`
+/// CLI. Combines a tmux long-session container (for the cost-status
+/// pane) with per-turn `codex exec --json` subprocesses (for the
+/// actual prompting + structured event stream).
+#[derive(Clone, Default)]
+pub struct CodexExecAdapter {
+    /// Per-thread broadcast — populated lazily on the first
+    /// `submit_turn` (or `events()` call) for a given thread identity.
+    /// `Arc<Mutex<...>>` so `Clone` + `Send + Sync` constraints from
+    /// `HarnessAdapter` hold without leaking dyn-state to the caller.
+    threads: Arc<Mutex<HashMap<String, broadcast::Sender<ThreadEvent>>>>,
+    /// Monotonic turn counter for synthesising `TurnId` when codex's
+    /// JSONL stream omits one.
+    turn_seq: Arc<AtomicU64>,
+}
+
+impl std::fmt::Debug for CodexExecAdapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CodexExecAdapter").finish_non_exhaustive()
+    }
+}
 
 impl CodexExecAdapter {
-    pub const fn new() -> Self {
-        Self
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Resolve the codex binary path. Honors `CCTEAM_CODEX_BIN` env
+    /// override (hermetic tests) before falling back to PATH's `codex`.
+    fn codex_bin() -> String {
+        std::env::var(CODEX_BIN_ENV).unwrap_or_else(|_| "codex".to_string())
+    }
+
+    /// Get (or create) the broadcast sender for a thread identity.
+    async fn channel_for(&self, identity: &str) -> broadcast::Sender<ThreadEvent> {
+        let mut guard = self.threads.lock().await;
+        if let Some(s) = guard.get(identity) {
+            return s.clone();
+        }
+        let (tx, _) = broadcast::channel(EVENT_CHANNEL_BUFFER);
+        guard.insert(identity.to_string(), tx.clone());
+        tx
+    }
+
+    /// Mint the next synthetic turn id.
+    fn next_turn_id(&self) -> TurnId {
+        let n = self.turn_seq.fetch_add(1, Ordering::SeqCst);
+        TurnId(format!("codex-exec-{n}"))
     }
 
     /// Resolve `~/.ccteam/codex/<sid>/state.json` for a session.
@@ -196,27 +252,182 @@ impl HarnessAdapter for CodexExecAdapter {
 
     async fn submit_turn(
         &self,
-        _h: &ThreadHandle,
-        _input: TurnInput,
+        h: &ThreadHandle,
+        input: TurnInput,
     ) -> Result<TurnId, HarnessError> {
-        Err(HarnessError::NotImplemented {
-            reason: "Wave 3 F112 fills CodexExecAdapter::submit_turn via `codex exec --json` \
-                     stdin pipe + thread/start UDS"
-                .to_string(),
-        })
+        let prompt = render_prompt(&input)?;
+        let resume_id = h
+            .raw_extras
+            .get("resumed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+            .then(|| {
+                h.raw_extras
+                    .get("thread_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&h.identity)
+                    .to_string()
+            });
+        let argv = build_exec_argv(resume_id.as_deref());
+        let bin = Self::codex_bin();
+        let tx = self.channel_for(&h.identity).await;
+        let turn_id = self.next_turn_id();
+
+        let mut child = tokio::process::Command::new(&bin)
+            .args(&argv)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|err| {
+                HarnessError::SubmitFailed(format!("spawn {bin} {argv:?}: {err}"))
+            })?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            let prompt_clone = prompt.clone();
+            tokio::spawn(async move {
+                if let Err(err) = stdin.write_all(prompt_clone.as_bytes()).await {
+                    tracing::warn!(error = %err, "codex exec: stdin write failed");
+                }
+                let _ = stdin.shutdown().await;
+            });
+        }
+
+        let stdout = child.stdout.take().ok_or_else(|| {
+            HarnessError::SubmitFailed("codex exec: missing stdout pipe".to_string())
+        })?;
+        let stderr = child.stderr.take();
+
+        // Spawn a reader task that translates JSONL → ThreadEvent and
+        // pushes into the per-thread broadcast. Detached — the events()
+        // stream is the synchronisation point for callers that care.
+        let turn_id_for_task = turn_id.clone();
+        let tx_for_task = tx.clone();
+        tokio::spawn(async move {
+            let buf = BufReader::new(stdout);
+            let mut lines = buf.lines();
+            let mut saw_completion = false;
+            loop {
+                match lines.next_line().await {
+                    Ok(Some(line)) => {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        match serde_json::from_str::<Value>(trimmed) {
+                            Ok(v) => {
+                                for evt in translate_jsonl_event(&v, &turn_id_for_task) {
+                                    if matches!(
+                                        evt,
+                                        ThreadEvent::TurnCompleted { .. }
+                                            | ThreadEvent::TurnFailed { .. }
+                                    ) {
+                                        saw_completion = true;
+                                    }
+                                    let _ = tx_for_task.send(evt);
+                                }
+                            }
+                            Err(err) => {
+                                tracing::debug!(
+                                    line = %trimmed,
+                                    error = %err,
+                                    "codex exec: skipping non-JSON line"
+                                );
+                            }
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "codex exec: stdout read error");
+                        break;
+                    }
+                }
+            }
+            let status = child.wait().await;
+            if !saw_completion {
+                match status {
+                    Ok(s) if s.success() => {
+                        let _ = tx_for_task.send(ThreadEvent::TurnCompleted {
+                            turn_id: turn_id_for_task.0.clone(),
+                            usage: UnifiedTokenUsage::default(),
+                        });
+                    }
+                    Ok(s) => {
+                        let _ = tx_for_task.send(ThreadEvent::TurnFailed {
+                            turn_id: turn_id_for_task.0.clone(),
+                            err: ThreadErrorEvent {
+                                kind: "nonzero_exit".into(),
+                                message: format!(
+                                    "codex exec exited with {} (no turn.completed seen)",
+                                    s.code().unwrap_or(-1)
+                                ),
+                            },
+                        });
+                    }
+                    Err(err) => {
+                        let _ = tx_for_task.send(ThreadEvent::TurnFailed {
+                            turn_id: turn_id_for_task.0.clone(),
+                            err: ThreadErrorEvent {
+                                kind: "wait_failed".into(),
+                                message: err.to_string(),
+                            },
+                        });
+                    }
+                }
+            }
+        });
+
+        if let Some(stderr) = stderr {
+            tokio::spawn(async move {
+                let buf = BufReader::new(stderr);
+                let mut lines = buf.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if !line.trim().is_empty() {
+                        tracing::warn!(stderr = %line, "codex exec stderr");
+                    }
+                }
+            });
+        }
+
+        Ok(turn_id)
     }
 
-    fn events(&self, _h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
-        // Wave 1: empty stream. Wave 3 F112 will populate from `codex
-        // exec --json` stdout JSONL → ThreadEvent translation.
-        Box::pin(stream::empty())
+    fn events(&self, h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
+        let adapter = self.clone();
+        let identity = h.identity.clone();
+        let setup = async move { adapter.channel_for(&identity).await.subscribe() };
+        let s = stream::once(setup).flat_map(|rx| {
+            stream::unfold(rx, |mut rx| async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(evt) => return Some((evt, rx)),
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!(n, "codex_exec events subscriber lagged");
+                            continue;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return None,
+                    }
+                }
+            })
+        });
+        Box::pin(s)
     }
 
-    async fn resume_thread(&self, _persistent_id: &str) -> Result<ThreadHandle, HarnessError> {
-        Err(HarnessError::NotImplemented {
-            reason: "Wave 3 F112 fills CodexExecAdapter::resume_thread via `codex resume \
-                     <UUID>`"
-                .to_string(),
+    async fn resume_thread(&self, persistent_id: &str) -> Result<ThreadHandle, HarnessError> {
+        if persistent_id.is_empty() {
+            return Err(HarnessError::SpawnFailed(
+                "codex resume: persistent_id is empty".into(),
+            ));
+        }
+        Ok(ThreadHandle {
+            vendor: AgentVendor::Codex,
+            mode: ExecutionMode::Bg,
+            identity: persistent_id.to_string(),
+            started_at: Utc::now(),
+            raw_extras: serde_json::json!({
+                "thread_id": persistent_id,
+                "resumed": true,
+            }),
         })
     }
 
@@ -246,6 +457,188 @@ impl HarnessAdapter for CodexExecAdapter {
         .await
         .map_err(|err| HarnessError::ShutdownFailed(format!("join blocking close: {err}")))?
     }
+}
+
+/// Build `codex exec --json` (or `codex resume <id> --json`) argv.
+/// The prompt itself is piped via stdin so we don't have to escape
+/// shell metacharacters on the command line.
+pub fn build_exec_argv(resume_id: Option<&str>) -> Vec<String> {
+    let mut argv: Vec<String> = Vec::new();
+    if let Some(id) = resume_id {
+        argv.push("resume".to_string());
+        argv.push(id.to_string());
+    } else {
+        argv.push("exec".to_string());
+    }
+    argv.push("--json".to_string());
+    // Pipe prompt via stdin (`codex exec -`).
+    argv.push("-".to_string());
+    argv
+}
+
+/// Convert a [`TurnInput`] into a single prompt string suitable for
+/// piping into `codex exec` over stdin. Mirrors the codex-app-server
+/// adapter's `turn_input_to_items` but flattens to one text blob since
+/// `codex exec` only accepts text on stdin.
+pub fn render_prompt(input: &TurnInput) -> Result<String, HarnessError> {
+    Ok(match input {
+        TurnInput::UserText(t) => t.clone(),
+        TurnInput::Artifact(p) => {
+            let body = std::fs::read_to_string(p)
+                .map_err(|e| HarnessError::SubmitFailed(format!("read artifact: {e}")))?;
+            format!("<artifact path=\"{}\">\n{body}\n</artifact>", p.display())
+        }
+        TurnInput::SystemDirective(d) => {
+            return Err(HarnessError::SubmitFailed(format!(
+                "codex exec: SystemDirective '{d}' not supported (codex has no slash-command \
+                 surface; wrap as user text instead)"
+            )))
+        }
+        TurnInput::Image(p) => format!("[image: {}]", p.display()),
+        TurnInput::ToolResult { call_id, content } => serde_json::to_string(&serde_json::json!({
+            "call_id": call_id,
+            "content": content,
+        }))
+        .unwrap_or_else(|_| "{}".to_string()),
+    })
+}
+
+/// Translate one parsed `codex exec --json` JSONL value into zero or
+/// more [`ThreadEvent`]s. The codex stream uses dot-separated `type`
+/// discriminators (`thread.started`, `item.started`, etc.); see
+/// `references/codex/codex-rs/exec/src/exec_events.rs`.
+pub fn translate_jsonl_event(v: &Value, turn_id: &TurnId) -> Vec<ThreadEvent> {
+    let Some(kind) = v.get("type").and_then(|t| t.as_str()) else {
+        return vec![];
+    };
+    match kind {
+        "thread.started" => {
+            let tid = v
+                .get("thread_id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            vec![ThreadEvent::ThreadStarted { thread_id: tid }]
+        }
+        "turn.started" => vec![ThreadEvent::TurnStarted {
+            turn_id: turn_id.0.clone(),
+        }],
+        "turn.completed" => {
+            let usage = v
+                .get("usage")
+                .and_then(|u| serde_json::from_value(u.clone()).ok())
+                .unwrap_or_default();
+            vec![ThreadEvent::TurnCompleted {
+                turn_id: turn_id.0.clone(),
+                usage,
+            }]
+        }
+        "turn.failed" => vec![ThreadEvent::TurnFailed {
+            turn_id: turn_id.0.clone(),
+            err: ThreadErrorEvent {
+                kind: "turn_failed".into(),
+                message: v
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("(no message)")
+                    .to_string(),
+            },
+        }],
+        "item.started" | "item.updated" | "item.completed" => {
+            let item = parse_jsonl_item(v.get("item").unwrap_or(v));
+            let evt = match kind {
+                "item.started" => ThreadEvent::ItemStarted { item },
+                "item.updated" => ThreadEvent::ItemUpdated { item },
+                _ => ThreadEvent::ItemCompleted { item },
+            };
+            vec![evt]
+        }
+        "error" => vec![ThreadEvent::Error(ThreadErrorEvent {
+            kind: "codex_error".into(),
+            message: v
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("(no message)")
+                .to_string(),
+        })],
+        _ => vec![],
+    }
+}
+
+fn parse_jsonl_item(item: &Value) -> ThreadItem {
+    let id = item
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let kind = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let details = match kind {
+        "agent_message" => ThreadItemDetails::AgentMessage(
+            item.get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        ),
+        "reasoning" => ThreadItemDetails::Reasoning(
+            item.get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        ),
+        "command_execution" => ThreadItemDetails::CommandExecution {
+            cmd: item
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            status: item
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("in_progress")
+                .to_string(),
+        },
+        "file_change" => {
+            let path = item
+                .get("changes")
+                .and_then(|c| c.get(0))
+                .and_then(|c| c.get("path"))
+                .and_then(|v| v.as_str())
+                .map(std::path::PathBuf::from)
+                .unwrap_or_default();
+            let kind = item
+                .get("changes")
+                .and_then(|c| c.get(0))
+                .and_then(|c| c.get("kind"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("update")
+                .to_string();
+            ThreadItemDetails::FileChange { path, kind }
+        }
+        "mcp_tool_call" => ThreadItemDetails::ToolCall {
+            name: item
+                .get("tool")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            args: item.get("arguments").cloned().unwrap_or(Value::Null),
+        },
+        "web_search" => ThreadItemDetails::WebSearch {
+            query: item
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        },
+        "error" => ThreadItemDetails::Error(
+            item.get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        ),
+        _ => ThreadItemDetails::AgentMessage(String::new()),
+    };
+    ThreadItem { id, details }
 }
 
 /// Send `q` + Enter to the named tmux session — codex's standard

@@ -25,11 +25,15 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::Result;
-use ccteam_core::harness::ThreadHandle;
+use anyhow::{anyhow, Context, Result};
+use ccteam_core::harness::{
+    AgentSpecBrief, HarnessAdapter, SpawnCtx, ThreadHandle, TurnId, TurnInput,
+};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 
 use crate::{imd_heartbeat_path, BotRegistration};
 
@@ -156,6 +160,394 @@ fn signal_present(bot_dir: &Path, name: &str) -> bool {
 pub struct SupervisorSnapshot {
     /// `(slug, role) -> action`.
     pub actions: HashMap<String, SupervisorAction>,
+}
+
+/// V0.6.0 Wave 3 — per-bot supervisor that owns one
+/// [`HarnessAdapter`] thread (tmux session) end to end.
+///
+/// One [`BotSupervisor`] per [`BotRegistration`]. The daemon builds
+/// these on boot, wires each one's outbound tail task, and routes
+/// inbound mailbox envelopes through [`BotSupervisor::handle_inbound`].
+///
+/// Lifecycle:
+///   1. `ensure_started()` (or `start()` directly) — calls
+///      `adapter.start_thread` once and stashes the `ThreadHandle`.
+///   2. `handle_inbound(payload)` — calls `adapter.submit_turn` with the
+///      mailbox content as `TurnInput::UserText`.
+///   3. `shutdown()` — calls `adapter.close_thread` and clears state.
+///   4. `restart()` — close + start (used when heartbeat goes stale).
+///
+/// All adapter calls go through the [`HarnessAdapter`] trait — no
+/// `ccteam_core::execution::*` import lives in this crate (red line
+/// enforced by `tests/dep_graph_test.rs`). Tests inject a stub adapter.
+pub struct BotSupervisor {
+    /// Registration this supervisor binds to.
+    pub reg: BotRegistration,
+    /// Projects root (`<projects_root>/<slug>/.ccteam/chat/<role>/`).
+    pub projects_root: PathBuf,
+    /// Wave 3 — the adapter the daemon picked for this vendor/mode
+    /// pair. Owned via `Arc` so the supervisor can hand a clone to
+    /// the outbound tail task.
+    pub adapter: Arc<dyn HarnessAdapter + Send + Sync>,
+    /// Active runtime state (handle + restart history + flags).
+    state: Mutex<BotState>,
+}
+
+impl std::fmt::Debug for BotSupervisor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BotSupervisor")
+            .field("slug", &self.reg.workflow_slug)
+            .field("role", &self.reg.role)
+            .field("vendor", &self.reg.vendor)
+            .field("adapter", &self.adapter.name())
+            .finish_non_exhaustive()
+    }
+}
+
+impl BotSupervisor {
+    /// Build a fresh supervisor for `reg`, using `adapter` for every
+    /// HarnessAdapter call. Initial state is empty (no handle).
+    pub fn new(
+        reg: BotRegistration,
+        projects_root: impl Into<PathBuf>,
+        adapter: Arc<dyn HarnessAdapter + Send + Sync>,
+    ) -> Self {
+        Self {
+            reg,
+            projects_root: projects_root.into(),
+            adapter,
+            state: Mutex::new(BotState::default()),
+        }
+    }
+
+    /// `<projects_root>/<slug>/`.
+    pub fn project_dir(&self) -> PathBuf {
+        self.projects_root.join(&self.reg.workflow_slug)
+    }
+
+    /// True iff `start_thread` has been called and `close_thread` has
+    /// not since.
+    pub async fn is_started(&self) -> bool {
+        self.state.lock().await.handle.is_some()
+    }
+
+    /// Snapshot of the current [`ThreadHandle`] (clone of the internal
+    /// state). `None` when the bot isn't running.
+    pub async fn current_handle(&self) -> Option<ThreadHandle> {
+        self.state.lock().await.handle.clone()
+    }
+
+    /// Snapshot the live per-bot state — used by the daemon tick when
+    /// calling [`decide`] (pure function; needs a current view of
+    /// `handle` + `restarts` + flags to make the right call).
+    pub async fn state_snapshot(&self) -> BotState {
+        self.state.lock().await.clone()
+    }
+
+    /// Idempotent: start the underlying tmux session via
+    /// `adapter.start_thread` if not already running.
+    pub async fn ensure_started(&self) -> Result<()> {
+        {
+            let st = self.state.lock().await;
+            if st.handle.is_some() {
+                return Ok(());
+            }
+        }
+        let spec = AgentSpecBrief {
+            role: self.reg.role.clone(),
+        };
+        let project_dir = self.project_dir();
+        let ctx = SpawnCtx {
+            slug: self.reg.workflow_slug.clone(),
+            sid: format!(
+                "{}-{}",
+                self.reg.workflow_slug, self.reg.role
+            ),
+            cwd: project_dir.clone(),
+            project_dir,
+            extra_args: Vec::new(),
+        };
+        let handle = self
+            .adapter
+            .start_thread(&spec, &ctx)
+            .await
+            .with_context(|| {
+                format!(
+                    "start_thread for {}/{} via {}",
+                    self.reg.workflow_slug,
+                    self.reg.role,
+                    self.adapter.name()
+                )
+            })?;
+        let mut st = self.state.lock().await;
+        st.handle = Some(handle);
+        tracing::info!(
+            slug = %self.reg.workflow_slug,
+            role = %self.reg.role,
+            adapter = self.adapter.name(),
+            "bot supervisor started thread"
+        );
+        Ok(())
+    }
+
+    /// Submit one mailbox payload to the bot via
+    /// `adapter.submit_turn(TurnInput::UserText(payload))`.
+    ///
+    /// Returns an error when the thread isn't started yet — callers
+    /// typically `ensure_started().await?` first.
+    pub async fn handle_inbound(&self, payload: String) -> Result<TurnId> {
+        let handle = {
+            let st = self.state.lock().await;
+            st.handle
+                .clone()
+                .ok_or_else(|| anyhow!("bot {}/{} not started", self.reg.workflow_slug, self.reg.role))?
+        };
+        let id = self
+            .adapter
+            .submit_turn(&handle, TurnInput::UserText(payload))
+            .await
+            .with_context(|| {
+                format!(
+                    "submit_turn for {}/{}",
+                    self.reg.workflow_slug, self.reg.role
+                )
+            })?;
+        tracing::debug!(
+            slug = %self.reg.workflow_slug,
+            role = %self.reg.role,
+            turn = %id.0,
+            "submitted user turn"
+        );
+        Ok(id)
+    }
+
+    /// Gracefully close the underlying thread (`adapter.close_thread`)
+    /// and clear local state. Idempotent — calling on a stopped
+    /// supervisor is a no-op.
+    pub async fn shutdown(&self) -> Result<()> {
+        let handle = {
+            let mut st = self.state.lock().await;
+            st.shutting_down = true;
+            st.handle.take()
+        };
+        if let Some(h) = handle {
+            self.adapter
+                .close_thread(&h)
+                .await
+                .with_context(|| {
+                    format!(
+                        "close_thread for {}/{}",
+                        self.reg.workflow_slug, self.reg.role
+                    )
+                })?;
+            tracing::info!(
+                slug = %self.reg.workflow_slug,
+                role = %self.reg.role,
+                "bot supervisor closed thread"
+            );
+        }
+        Ok(())
+    }
+
+    /// Close-then-start cycle for stale-heartbeat recovery. Records the
+    /// restart in the rolling-hour budget.
+    pub async fn restart(&self) -> Result<()> {
+        // Close first.
+        let handle = self.state.lock().await.handle.take();
+        if let Some(h) = handle {
+            // Best-effort close; we proceed to start even if close fails
+            // (the tmux session may already be dead, which is exactly
+            // why we're restarting).
+            if let Err(err) = self.adapter.close_thread(&h).await {
+                tracing::warn!(
+                    slug = %self.reg.workflow_slug,
+                    role = %self.reg.role,
+                    error = %err,
+                    "close_thread during restart failed; proceeding to start"
+                );
+            }
+        }
+        // Record this restart for budget tracking.
+        {
+            let mut st = self.state.lock().await;
+            st.restarts.push(Instant::now());
+            // Trim to last hour to keep the vec bounded.
+            st.restarts.retain(|t| t.elapsed() < Duration::from_secs(3600));
+        }
+        // Start.
+        self.ensure_started().await
+    }
+
+    /// Apply one supervisor decision (called per supervisor tick by
+    /// the daemon). Returns the action that was applied for logging.
+    pub async fn apply_action(&self, action: SupervisorAction) -> Result<SupervisorAction> {
+        match action {
+            SupervisorAction::Spawn => {
+                self.ensure_started().await?;
+            }
+            SupervisorAction::Restart => {
+                self.restart().await?;
+            }
+            SupervisorAction::Shutdown => {
+                self.shutdown().await?;
+            }
+            SupervisorAction::Drain => {
+                // No close — just flag so future handle_inbound calls
+                // refuse new turns. (V0.6 Wave 3: enforcement landed in
+                // handle_inbound is intentionally minimal — Wave 4
+                // policy hook decides the drain UX.)
+                let mut st = self.state.lock().await;
+                st.draining = true;
+            }
+            SupervisorAction::Quarantine | SupervisorAction::NoOp => {}
+        }
+        Ok(action)
+    }
+}
+
+#[cfg(test)]
+mod bot_supervisor_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use ccteam_core::harness::{
+        AgentVendor, ExecutionMode, HarnessError, ThreadEvent, ThreadHandle,
+    };
+    use futures::stream::BoxStream;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tempfile::TempDir;
+
+    /// Stub HarnessAdapter that records every call. The supervisor
+    /// can't tell it apart from the real `ClaudeTuiAdapter` — exactly
+    /// the integration contract the e2e mock test exercises.
+    #[derive(Debug, Default)]
+    pub struct StubAdapter {
+        pub starts: AtomicUsize,
+        pub submits: AtomicUsize,
+        pub closes: AtomicUsize,
+        pub fail_start: bool,
+    }
+
+    #[async_trait]
+    impl HarnessAdapter for StubAdapter {
+        fn name(&self) -> &'static str {
+            "stub"
+        }
+        fn vendor(&self) -> AgentVendor {
+            AgentVendor::Claude
+        }
+        async fn start_thread(
+            &self,
+            spec: &AgentSpecBrief,
+            ctx: &SpawnCtx,
+        ) -> Result<ThreadHandle, HarnessError> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            if self.fail_start {
+                return Err(HarnessError::SpawnFailed("stub-fail".into()));
+            }
+            Ok(ThreadHandle {
+                vendor: AgentVendor::Claude,
+                mode: ExecutionMode::Chat,
+                identity: format!("stub-{}-{}", ctx.slug, spec.role),
+                started_at: chrono::Utc::now(),
+                raw_extras: serde_json::json!({"slug": ctx.slug, "role": spec.role}),
+            })
+        }
+        async fn submit_turn(
+            &self,
+            _h: &ThreadHandle,
+            _input: TurnInput,
+        ) -> Result<TurnId, HarnessError> {
+            self.submits.fetch_add(1, Ordering::SeqCst);
+            Ok(TurnId::new("stub-turn"))
+        }
+        fn events(&self, _h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
+            Box::pin(futures::stream::empty())
+        }
+        async fn resume_thread(&self, _id: &str) -> Result<ThreadHandle, HarnessError> {
+            Err(HarnessError::NotImplemented { reason: "stub".into() })
+        }
+        async fn close_thread(&self, _h: &ThreadHandle) -> Result<(), HarnessError> {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn reg() -> BotRegistration {
+        BotRegistration {
+            workflow_slug: "dev-foo".into(),
+            role: "lead".into(),
+            vendor: AgentVendor::Claude,
+            persona_id: None,
+            im_platform: "mock".into(),
+            im_chat_id: "1".into(),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn ensure_started_is_idempotent() {
+        let stub = Arc::new(StubAdapter::default());
+        let tmp = TempDir::new().unwrap();
+        let sup = BotSupervisor::new(reg(), tmp.path(), stub.clone());
+        sup.ensure_started().await.unwrap();
+        sup.ensure_started().await.unwrap();
+        assert_eq!(stub.starts.load(Ordering::SeqCst), 1);
+        assert!(sup.is_started().await);
+    }
+
+    #[tokio::test]
+    async fn handle_inbound_calls_submit_turn() {
+        let stub = Arc::new(StubAdapter::default());
+        let tmp = TempDir::new().unwrap();
+        let sup = BotSupervisor::new(reg(), tmp.path(), stub.clone());
+        sup.ensure_started().await.unwrap();
+        let id = sup.handle_inbound("hello".into()).await.unwrap();
+        assert_eq!(id.0, "stub-turn");
+        assert_eq!(stub.submits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn handle_inbound_errors_when_not_started() {
+        let stub = Arc::new(StubAdapter::default());
+        let tmp = TempDir::new().unwrap();
+        let sup = BotSupervisor::new(reg(), tmp.path(), stub.clone());
+        assert!(sup.handle_inbound("x".into()).await.is_err());
+        assert_eq!(stub.submits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_then_idempotent() {
+        let stub = Arc::new(StubAdapter::default());
+        let tmp = TempDir::new().unwrap();
+        let sup = BotSupervisor::new(reg(), tmp.path(), stub.clone());
+        sup.ensure_started().await.unwrap();
+        sup.shutdown().await.unwrap();
+        sup.shutdown().await.unwrap();
+        assert_eq!(stub.closes.load(Ordering::SeqCst), 1);
+        assert!(!sup.is_started().await);
+    }
+
+    #[tokio::test]
+    async fn restart_closes_then_starts() {
+        let stub = Arc::new(StubAdapter::default());
+        let tmp = TempDir::new().unwrap();
+        let sup = BotSupervisor::new(reg(), tmp.path(), stub.clone());
+        sup.ensure_started().await.unwrap();
+        sup.restart().await.unwrap();
+        assert_eq!(stub.starts.load(Ordering::SeqCst), 2);
+        assert_eq!(stub.closes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn apply_action_dispatches() {
+        let stub = Arc::new(StubAdapter::default());
+        let tmp = TempDir::new().unwrap();
+        let sup = BotSupervisor::new(reg(), tmp.path(), stub.clone());
+        sup.apply_action(SupervisorAction::Spawn).await.unwrap();
+        assert_eq!(stub.starts.load(Ordering::SeqCst), 1);
+        sup.apply_action(SupervisorAction::Shutdown).await.unwrap();
+        assert_eq!(stub.closes.load(Ordering::SeqCst), 1);
+    }
 }
 
 #[cfg(test)]
