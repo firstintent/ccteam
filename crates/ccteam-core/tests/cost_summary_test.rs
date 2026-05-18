@@ -1,5 +1,5 @@
 //! V0.4.6 F91 — integration tests for the new cost SoT
-//! (`ccteam_core::cost_summary` / `compute_cost_summary` /
+//! (`ccteam_core` `cost_summary` / `compute_cost_summary` /
 //! `CostSummary`). These replace the deleted `cost_accumulate_*`
 //! battery in `crates/ccteam-hooks/tests/hooks_test.rs`.
 //!
@@ -46,7 +46,7 @@ use ccteam_core::transcript_scanner::{file_read_count, reset_cache_for_tests};
 use ccteam_core::{
     compute_cost_summary, cost_summary, estimate_cost, progress, remove_cost_accumulate_hooks,
     session_cost_from_jsonl, CcteamPaths, CostAccumulateScrubAction, JobLiveness, ProjectState,
-    Usage,
+    Usage, Vendor,
 };
 use chrono::{Duration, Utc};
 use serde_json::json;
@@ -445,15 +445,15 @@ fn t10_multi_model_pricing() {
         ..Default::default()
     };
     assert!(
-        (estimate_cost("claude-sonnet-4-6", &one_m_input) - 3.0).abs() < 0.01,
+        (estimate_cost(&one_m_input, Vendor::Claude, "claude-sonnet-4-6") - 3.0).abs() < 0.01,
         "sonnet-4-6 input != $3 / 1M",
     );
     assert!(
-        (estimate_cost("claude-opus-4-7", &one_m_input) - 5.0).abs() < 0.01,
+        (estimate_cost(&one_m_input, Vendor::Claude, "claude-opus-4-7") - 5.0).abs() < 0.01,
         "opus-4-7 input != $5 / 1M",
     );
     assert!(
-        (estimate_cost("claude-haiku-4-5", &one_m_input) - 1.0).abs() < 0.01,
+        (estimate_cost(&one_m_input, Vendor::Claude, "claude-haiku-4-5") - 1.0).abs() < 0.01,
         "haiku-4-5 input != $1 / 1M",
     );
 
@@ -463,12 +463,12 @@ fn t10_multi_model_pricing() {
         ..Default::default()
     };
     assert!(
-        (estimate_cost("claude-opus-4-7", &one_m_output) - 25.0).abs() < 0.01,
+        (estimate_cost(&one_m_output, Vendor::Claude, "claude-opus-4-7") - 25.0).abs() < 0.01,
         "opus-4-7 output != $25 / 1M",
     );
     // 1M-context suffix passes through.
     assert!(
-        (estimate_cost("claude-opus-4-7[1m]", &one_m_output) - 25.0).abs() < 0.01,
+        (estimate_cost(&one_m_output, Vendor::Claude, "claude-opus-4-7[1m]") - 25.0).abs() < 0.01,
         "opus-4-7[1m] suffix must resolve to opus-4-7",
     );
 }

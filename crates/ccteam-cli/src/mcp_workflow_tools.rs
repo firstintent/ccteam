@@ -4,13 +4,13 @@
 //! (the long-lived CC session a user attaches to) can drive a v0.4.0
 //! workflow project end-to-end through natural language:
 //!
-//! - `ccteam__spawn_agent` — immediately dispatch one agent session
-//! - `ccteam__stop_agent` — soft-stop a running session (file marker)
-//! - `ccteam__observe_agents` — list running sessions + status
-//! - `ccteam__signal` — pause / resume / btw / interrupt a session
-//! - `ccteam__set_parallelism` — hot-tune per-role parallelism cap
-//! - `ccteam__trigger_gate` — manually release a gate trigger
-//! - `ccteam__get_artifact_summary` — count + latest per artifact dir
+//! - `ccteam__workflow_spawn_agent` — immediately dispatch one agent session
+//! - `ccteam__workflow_stop_agent` — soft-stop a running session (file marker)
+//! - `ccteam__workflow_observe_agents` — list running sessions + status
+//! - `ccteam__workflow_signal` — pause / resume / btw / interrupt a session
+//! - `ccteam__workflow_set_parallelism` — hot-tune per-role parallelism cap
+//! - `ccteam__workflow_trigger_gate` — manually release a gate trigger
+//! - `ccteam__workflow_get_artifact_summary` — count + latest per artifact dir
 //!
 //! ## Red lines (PRD v0-4-0 §F65)
 //!
@@ -98,7 +98,7 @@ fn opt_string(args: &Value, name: &str) -> Option<String> {
 
 // =============== Tool implementations ===============
 
-/// `ccteam__spawn_agent`: enqueue a spawn request for role `role` in
+/// `ccteam__workflow_spawn_agent`: enqueue a spawn request for role `role` in
 /// `slug`. Validates the role exists in `workflow.yaml`; writes a
 /// pending-spawn marker to `.ccteam/spawn_requests/<role>-<ts>.json`
 /// so F66's tick picks it up.
@@ -141,7 +141,7 @@ pub fn tool_spawn_agent(paths: &CcteamPaths, args: &Value) -> Result<String> {
     }))?)
 }
 
-/// `ccteam__stop_agent`: write a soft-stop marker. F66's orchestrator
+/// `ccteam__workflow_stop_agent`: write a soft-stop marker. F66's orchestrator
 /// reads `.ccteam/stop_signal/<role>_<sid>` and tears down the
 /// matching session (SessionHandle::shutdown). `session_id == None`
 /// means "stop all sessions of this role" — the marker filename uses
@@ -178,7 +178,7 @@ pub fn tool_stop_agent(paths: &CcteamPaths, args: &Value) -> Result<String> {
     }))?)
 }
 
-/// `ccteam__observe_agents`: one-shot read of the project's current
+/// `ccteam__workflow_observe_agents`: one-shot read of the project's current
 /// agent sessions. Source of truth is `state.json::sessions` (V0.3.1
 /// F49 registry); per-harness state files provide cost / status when
 /// available. Returns empty `agents` array when no sessions registered.
@@ -241,7 +241,7 @@ pub fn tool_observe_agents(paths: &CcteamPaths, args: &Value) -> Result<String> 
     }))?)
 }
 
-/// `ccteam__signal`: send a control signal to a running agent.
+/// `ccteam__workflow_signal`: send a control signal to a running agent.
 ///
 /// - `pause` / `resume` / `interrupt` write a marker under
 ///   `.ccteam/signal/<role>_<sid>`; F66 reads + applies SIGSTOP /
@@ -316,7 +316,7 @@ pub fn tool_signal(paths: &CcteamPaths, args: &Value) -> Result<String> {
     }
 }
 
-/// `ccteam__set_parallelism`: hot-tune the per-role parallelism cap.
+/// `ccteam__workflow_set_parallelism`: hot-tune the per-role parallelism cap.
 /// Writes a merge-friendly `.ccteam/workflow_overrides.json` with
 /// shape `{"<role>": {"parallelism": N}}`. F66 reloads this file each
 /// tick.
@@ -377,7 +377,7 @@ pub fn tool_set_parallelism(paths: &CcteamPaths, args: &Value) -> Result<String>
     }))?)
 }
 
-/// `ccteam__trigger_gate`: write a release marker for the named gate
+/// `ccteam__workflow_trigger_gate`: write a release marker for the named gate
 /// role. F66 reads `.ccteam/gate_override/<role>` next tick and spawns
 /// the gate-trigger agent regardless of input artifact state when
 /// `force == true`.
@@ -409,7 +409,7 @@ pub fn tool_trigger_gate(paths: &CcteamPaths, args: &Value) -> Result<String> {
     }))?)
 }
 
-/// `ccteam__get_artifact_summary`: stat-only summary of each artifact
+/// `ccteam__workflow_get_artifact_summary`: stat-only summary of each artifact
 /// directory declared in `workflow.yaml`. Returns `{artifacts: {}}`
 /// when no agent declares an `input`/`output` dir.
 ///
@@ -515,7 +515,7 @@ fn scan_dir(dir: &Path) -> Result<(usize, Option<String>, Option<String>, u64)> 
 pub fn workflow_tool_definitions() -> Vec<Value> {
     vec![
         json!({
-            "name": "ccteam__spawn_agent",
+            "name": "ccteam__workflow_spawn_agent",
             "description": "V0.4.0 F65: enqueue a spawn request for a named agent role in a workflow project. Writes a marker under <project>/.ccteam/spawn_requests/ that the F66 orchestrator picks up on its next tick. Returns {ok, session_id, marker}. Validates role exists in workflow.yaml; errors when role is unknown.",
             "inputSchema": json!({
                 "type": "object",
@@ -531,7 +531,7 @@ pub fn workflow_tool_definitions() -> Vec<Value> {
             }),
         }),
         json!({
-            "name": "ccteam__stop_agent",
+            "name": "ccteam__workflow_stop_agent",
             "description": "V0.4.0 F65: soft-stop one or all running sessions of a role. Writes <project>/.ccteam/stop_signal/<role>_<sid>; F66 reads + tears down the matching session. session_id omitted = stop all sessions of this role.",
             "inputSchema": json!({
                 "type": "object",
@@ -547,12 +547,12 @@ pub fn workflow_tool_definitions() -> Vec<Value> {
             }),
         }),
         json!({
-            "name": "ccteam__observe_agents",
+            "name": "ccteam__workflow_observe_agents",
             "description": "V0.4.0 F65: one-shot snapshot of the project's currently registered agent sessions. Reads state.json::sessions (V0.3.1 F49 registry). Returns {agents: [{session_id, role, harness, tmux_session, started_at, pid, status}]}. Empty array when no sessions registered.",
             "inputSchema": object_schema_one("slug", "Project slug."),
         }),
         json!({
-            "name": "ccteam__signal",
+            "name": "ccteam__workflow_signal",
             "description": "V0.4.0 F65: send a control signal to a running agent. Signals: pause|resume|interrupt write marker files under .ccteam/signal/ for F66 to apply SIGSTOP/SIGCONT/SIGINT to the harness pid; btw routes through the inbox so idle-aware injection delivers the message.",
             "inputSchema": json!({
                 "type": "object",
@@ -577,7 +577,7 @@ pub fn workflow_tool_definitions() -> Vec<Value> {
             }),
         }),
         json!({
-            "name": "ccteam__set_parallelism",
+            "name": "ccteam__workflow_set_parallelism",
             "description": "V0.4.0 F65: hot-tune a workflow agent role's parallelism cap. Atomically rewrites <project>/.ccteam/workflow_overrides.json; F66 reloads the file each tick. Range 1-50.",
             "inputSchema": json!({
                 "type": "object",
@@ -595,7 +595,7 @@ pub fn workflow_tool_definitions() -> Vec<Value> {
             }),
         }),
         json!({
-            "name": "ccteam__trigger_gate",
+            "name": "ccteam__workflow_trigger_gate",
             "description": "V0.4.0 F65: manually release a gate-triggered agent role. Writes <project>/.ccteam/gate_override/<role>; F66 spawns the gate agent on the next tick. `force=true` instructs F66 to skip its automatic input-satisfaction check.",
             "inputSchema": json!({
                 "type": "object",
@@ -611,7 +611,7 @@ pub fn workflow_tool_definitions() -> Vec<Value> {
             }),
         }),
         json!({
-            "name": "ccteam__get_artifact_summary",
+            "name": "ccteam__workflow_get_artifact_summary",
             "description": "V0.4.0 F65: stat-only summary of each artifact directory declared in workflow.yaml. Returns {artifacts: {<dir>: {count, latest, latest_mtime, size_bytes, exists}}}. Skips file contents (O(n) on inodes).",
             "inputSchema": object_schema_one("slug", "Project slug."),
         }),
@@ -636,13 +636,13 @@ fn object_schema_one(name: &str, desc: &str) -> Value {
 /// the legacy M2.5 dispatch table.
 pub fn dispatch(paths: &CcteamPaths, name: &str, args: &Value) -> Result<Option<String>> {
     let body = match name {
-        "ccteam__spawn_agent" => tool_spawn_agent(paths, args)?,
-        "ccteam__stop_agent" => tool_stop_agent(paths, args)?,
-        "ccteam__observe_agents" => tool_observe_agents(paths, args)?,
-        "ccteam__signal" => tool_signal(paths, args)?,
-        "ccteam__set_parallelism" => tool_set_parallelism(paths, args)?,
-        "ccteam__trigger_gate" => tool_trigger_gate(paths, args)?,
-        "ccteam__get_artifact_summary" => tool_get_artifact_summary(paths, args)?,
+        "ccteam__workflow_spawn_agent" => tool_spawn_agent(paths, args)?,
+        "ccteam__workflow_stop_agent" => tool_stop_agent(paths, args)?,
+        "ccteam__workflow_observe_agents" => tool_observe_agents(paths, args)?,
+        "ccteam__workflow_signal" => tool_signal(paths, args)?,
+        "ccteam__workflow_set_parallelism" => tool_set_parallelism(paths, args)?,
+        "ccteam__workflow_trigger_gate" => tool_trigger_gate(paths, args)?,
+        "ccteam__workflow_get_artifact_summary" => tool_get_artifact_summary(paths, args)?,
         _ => return Ok(None),
     };
     Ok(Some(body))
@@ -655,11 +655,11 @@ pub fn dispatch(paths: &CcteamPaths, name: &str, args: &Value) -> Result<Option<
 pub fn requires_daemon(name: &str) -> bool {
     matches!(
         name,
-        "ccteam__spawn_agent"
-            | "ccteam__stop_agent"
-            | "ccteam__signal"
-            | "ccteam__set_parallelism"
-            | "ccteam__trigger_gate"
+        "ccteam__workflow_spawn_agent"
+            | "ccteam__workflow_stop_agent"
+            | "ccteam__workflow_signal"
+            | "ccteam__workflow_set_parallelism"
+            | "ccteam__workflow_trigger_gate"
     )
 }
 
@@ -714,13 +714,13 @@ agents:
         let names: std::collections::BTreeSet<&str> =
             defs.iter().map(|t| t["name"].as_str().unwrap()).collect();
         for required in [
-            "ccteam__spawn_agent",
-            "ccteam__stop_agent",
-            "ccteam__observe_agents",
-            "ccteam__signal",
-            "ccteam__set_parallelism",
-            "ccteam__trigger_gate",
-            "ccteam__get_artifact_summary",
+            "ccteam__workflow_spawn_agent",
+            "ccteam__workflow_stop_agent",
+            "ccteam__workflow_observe_agents",
+            "ccteam__workflow_signal",
+            "ccteam__workflow_set_parallelism",
+            "ccteam__workflow_trigger_gate",
+            "ccteam__workflow_get_artifact_summary",
         ] {
             assert!(names.contains(required), "missing tool {required}");
         }
@@ -976,18 +976,18 @@ agents:
     #[test]
     fn requires_daemon_only_for_mutating_tools() {
         for t in [
-            "ccteam__spawn_agent",
-            "ccteam__stop_agent",
-            "ccteam__signal",
-            "ccteam__set_parallelism",
-            "ccteam__trigger_gate",
+            "ccteam__workflow_spawn_agent",
+            "ccteam__workflow_stop_agent",
+            "ccteam__workflow_signal",
+            "ccteam__workflow_set_parallelism",
+            "ccteam__workflow_trigger_gate",
         ] {
             assert!(requires_daemon(t), "{t} should require daemon");
         }
         for t in [
-            "ccteam__observe_agents",
-            "ccteam__get_artifact_summary",
-            "ccteam__ls",
+            "ccteam__workflow_observe_agents",
+            "ccteam__workflow_get_artifact_summary",
+            "ccteam__admin_ls",
         ] {
             assert!(!requires_daemon(t), "{t} should not require daemon");
         }
@@ -1003,12 +1003,12 @@ agents:
         write_workflow_yaml(&paths.project_dir(slug), DEMO_WF);
         let out = dispatch(
             &paths,
-            "ccteam__get_artifact_summary",
+            "ccteam__workflow_get_artifact_summary",
             &json!({ "slug": slug }),
         )
         .unwrap();
         assert!(out.is_some());
-        let none = dispatch(&paths, "ccteam__ls", &json!({})).unwrap();
+        let none = dispatch(&paths, "ccteam__admin_ls", &json!({})).unwrap();
         assert!(none.is_none());
     }
 }

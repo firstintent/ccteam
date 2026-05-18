@@ -64,17 +64,37 @@
 
 ---
 
-## 二、5 个用户面 preset(替代"3 mode + 5 pattern"内部概念)
+## 二、三轴模型:应用场景 / 编排模式 / 技术执行模式
 
-用户**只选 preset**,不直接选 mode / pattern。每 preset = 默认 surface × pattern × persona 组合配方,由 `ccteam-creator` skill 在 dialogue 中自动推断:
+V0.6.0 起 ccteam 明确**分三轴**:
 
-| Preset | 一句话场景 | hello world | 内部映射 |
+| 轴 | 维度 | V0.6.0 取值 | 性质 |
 |---|---|---|---|
-| **Solo Sidekick** | 在 Claude 里临时召唤一个帮手干小事 | V0.5 已有(`Task` 工具)| in-proc / single agent |
-| **Team Sprint** | 几小时冲一波,3-5 agent 并行干一件事 | `/ccteam-team 3 "task"`(V0.5 已有)| in-proc / Orchestrator-Worker |
-| **Overnight Builder** | 丢个任务睡觉去,长跑几小时到几天 | `/ccteam-creator "夜里跑 qa-loop"` | bg / Chaining + Refine |
-| **Pocket Assistant**(V0.6 旗舰)| 手机 IM 私聊一个 AI 助理 | `/ccteam-creator "做个 TG 助理 bot"` | chat (DM) / Routing |
-| **IM Squad** | IM 群里多个 bot 互相 @ 协作 | `/ccteam-creator "做个 TG 多 bot 团队"` | chat (group + bot-to-bot) / Orchestrator-Worker |
+| **轴 C:应用场景** | 终端用户面看到的"我能干啥" | 5 preset(下表)+ V0.7 加 | **开放**:N 取值,通过 persona + template 注册 |
+| **轴 B:编排模式** | 多 agent 之间怎么串/并/评 | Anthropic 5(Chaining / Routing / Parallelization / Orchestrator-Worker / Evaluator-Optimizer) | **封闭**:5 种,详 `docs/orchestration-patterns.md` |
+| **轴 A:技术执行模式** | ccteam 怎么物理 host claude 进程 | 3 种(下下表)| **封闭**:3 种,V1.0 可能扩 |
+
+### 5 用户面 preset(应用场景轴,V0.6 ship 范围)
+
+用户**只选 preset**,不直接选 mode / pattern。每 preset = `(场景, 编排模式, 技术模式)` 三轴 cell 配方,`ccteam-creator` skill 在 NL dialogue 自动推断:
+
+| Preset | 一句话场景 | hello world | 编排模式 | 技术模式 |
+|---|---|---|---|---|
+| **Solo Sidekick** | 在 Claude 里临时召唤一个帮手干小事 | V0.5 已有(`Task` 工具)| (单 agent,无编排)| **1. in-proc** |
+| **Team Sprint** | 几小时冲一波,3-5 agent 并行干一件事 | `/ccteam-team 3 "task"` | Orchestrator-Worker + Parallelization | **1. in-proc** |
+| **Overnight Builder** | 丢任务睡觉去,长跑几小时到几天 | `/ccteam-creator "qa-loop:test-fix-release"` | Chaining + Evaluator-Optimizer | **2. bg** |
+| **Pocket Assistant**(V0.6 旗舰)| 手机 IM 私聊一个 AI 助理 | `/ccteam-creator "做个 TG 助理 bot"` | Routing | **3. tmux-bot** |
+| **IM Squad** | IM 群里多个 bot 互相 @ 协作 | `/ccteam-creator "做个 TG 多 bot 团队"` | Orchestrator-Worker + Evaluator-Optimizer | **3. tmux-bot** |
+
+### 3 技术执行模式(技术轴,V0.6 ship 范围)
+
+| # | 名 | 物理形态 | 进程生命周期 |
+|---|---|---|---|
+| **1** | **in-proc** | 用户已有 claude session 内 `Task(subagent_type=...)` / `TeamCreate` native;ccteam 作 cc 插件/skill 提供模板 + 起临时 teammate | 与用户 session 同生灭;**ccteam 不起 daemon** |
+| **2** | **bg** | `claude --bg --agent <role> --dangerously-skip-permissions` 多 session 协作,artifact 接力,workflow.yaml 编排 | 每 spawn 短命(30s-5min agent_done);ccteam Rust daemon 长跑 + ArtifactWatcher |
+| **3** | **tmux-bot** | per-bot 一个 tmux long-session,内跑 `claude` TUI 长跑进程;每 session = 1 个 bot;bot ↔ bot 通过 IM group 交流 | tmux + claude 24/7 长跑;ccteam-imd 守护 + Reply Listener |
+
+**关键直觉**:用户不需要懂三轴 — `ccteam-creator` skill 在 NL dialogue 中**反向推断**(用户说"想做个 TG 助理"→ Pocket Assistant preset → Routing 编排 → mode 3 tmux-bot 技术);用户从未读"mode 3"这串字。
 
 ---
 
@@ -284,10 +304,11 @@ ccteam/
 
 | 决策 | 上版选 | 本版改 | 理由 |
 |---|---|---|---|
-| 模式 3 execution runtime | tmux send-keys(A)| **Agent SDK / `claude -p --resume` + stream-json(B)** | cc-expert WebFetch 验证 session jsonl 路径 0 文档化;architect "internal-not-API";researcher OMC mailbox-trigger 模式更稳 |
-| 模式 3 input 面 | send-keys | **stream-json stdin pipe + JSON-mailbox-trigger 组合** | send-keys 仅传短 trigger("read your mailbox"),内容写 mailbox 文件;0 escape 雷区 |
-| 模式 3 output 面 | parse session jsonl(Anthropic internal)| **stream-json 官方 schema + ccteam-owned `turns.jsonl`** | A5 architect:ccteam-owned SoT 让 R1/R2 红线在模式 3 真正站住 |
+| 模式 3 execution runtime(Wave 1 amendment 2026-05-19)| Agent SDK / `claude -p --resume` + stream-json(B)| **tmux 长跑 + send-keys -l 直送 user content + dual-track(Claude Code 官方 hooks 快 event + transcript jsonl byte-offset 增量读 → 镜像 ccteam-owned turns.jsonl)+ slash 命令透明透传(C)** | 综合 ccgram + OMC 已 production 验证;`-p --resume` 每 turn 冷启 prompt cache 失效 + slash 命令不透传(用户面 UX 退化)+ mailbox-trigger 让短文本走 Read tool 增加 turn cost;tmux 长跑 + send-keys -l 直送是双方共识 + Claude Code hooks 官方文档化 fast event 通道 |
+| 模式 3 input 面 | stream-json stdin pipe + JSON-mailbox-trigger | **`tmux send-keys -l` 直送 user content + Enter(text);`/compact /new /clear` 透明透传;附件走 attachments dir + send-keys "read file at ..."** | send-keys -l literal 模式 0 escape 雷区(ccgram + OMC 验证);slash 透传保用户面 UX 一致;attachment 仅在非文本场景用 |
+| 模式 3 output 面 | stream-json 官方 schema + ccteam-owned turns.jsonl | **Claude Code 官方 hooks(UserPromptSubmit / Stop / SubagentStop / SessionStart / PostToolUse)作 fast event 通道 + byte-offset 增量读 transcript jsonl → 镜像 ccteam-owned `turns.jsonl`(R2 SoT)** | hooks 已文档化 + 低延迟 turn boundary;transcript polling 拿 full content;ccteam-owned `turns.jsonl` 让 R1/R2 红线在模式 3 站住(F118 重建从 turns.jsonl 读) |
 | MCP namespace rename | breaking `ccteam` → `ct` | **取消;保 `ccteam` namespace,只加子前缀** | PM + cc-expert + codex-expert 共识 + 用户低门槛 override:rename 用户净损失 |
+| F111 MCP namespace | breaking `ccteam` → `ct` rename | **取消;保 `ccteam`,只加 group 子前缀(`workflow_` / `chat_` / `advise_` / `admin_` / `screenshot` 5 group)** | PM + cc-expert + codex-expert 共识:V0.5 用户肌肉记忆破坏不抵 4 字符省。Wave 1 落实:16 tool 加子前缀 + `screenshot` 单成员 group 保 V0.5 名 + `CCTEAM_DISABLE_TOOLS` group enum(非 glob)|
 | F109 IM bridge 自造 | tokio task + `tgbot` crate | **统一 `openhuman/channels` Rust crate(全 14+ IM 含 Telegram);`claude-plugins-official/telegram` 作 backup transport** | 用户 directive:不造轮子;统一 transport 一处实现 bot-to-bot routing;V0.7 国内 IM 零代码启用 |
 | Codex 集成深度 | Option A(模式 2 only)| **Option B(完整:trait + 2 adapter + 双 pricing + 4 用户场景)** | 用户拍板;不集成 V0.6.0 ship 后被定义为"只支持 Claude 的小众工具"(researcher R9 表)|
 | user surface 主入口 | `ccteam` CLI 命令 | **Claude session 内 `/ccteam-*` slash + meta-agent NL + MCP tool** | 用户硬约束:"低门槛 + Claude-Code-native UX";13 lock decisions L2 |

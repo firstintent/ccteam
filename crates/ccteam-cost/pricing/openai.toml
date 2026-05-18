@@ -1,0 +1,40 @@
+# OpenAI rate sheet — dollars per 1M tokens.
+#
+# Source: openai.com/api/pricing (legacy section for o3 / o3-mini /
+# gpt-4o / gpt-4o-mini as of 2026-05). Verified May 2026 against
+# pricepertoken.com mirrors + the o3-mini launch announcement.
+#
+# Reasoning tokens (o-series hidden CoT) are billed at the standard
+# output rate, so `reasoning_per_1m == output_per_1m` for o3 / o3-mini.
+# gpt-4o family is not a reasoning model — `reasoning_per_1m` is omitted.
+#
+# Cached input discount (prompt cache hit):
+#   - o3:           75% off input  ($0.50 vs $2.00)
+#   - o3-mini:      50% off input  ($0.55 vs $1.10)
+#   - gpt-4o:       50% off input  ($1.25 vs $2.50)
+#   - gpt-4o-mini:  50% off input  ($0.075 vs $0.15)
+
+schema_version = "2026-05-19"
+fallback_model = "o3"
+
+[models."o3"]
+input_per_1m = 2.0
+cached_input_per_1m = 0.5
+output_per_1m = 8.0
+reasoning_per_1m = 8.0
+
+[models."o3-mini"]
+input_per_1m = 1.1
+cached_input_per_1m = 0.55
+output_per_1m = 4.4
+reasoning_per_1m = 4.4
+
+[models."gpt-4o"]
+input_per_1m = 2.5
+cached_input_per_1m = 1.25
+output_per_1m = 10.0
+
+[models."gpt-4o-mini"]
+input_per_1m = 0.15
+cached_input_per_1m = 0.075
+output_per_1m = 0.6

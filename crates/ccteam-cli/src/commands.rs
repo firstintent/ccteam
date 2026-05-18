@@ -11,14 +11,14 @@ use serde_json::{json, Map, Value};
 
 use ccteam_core::tmux::TmuxSession;
 use ccteam_core::{
-    bootstrap_meta_project, current_ccteam_bin, install_ccteam_control_skill,
+    bootstrap_meta_project, cost_summary, current_ccteam_bin, install_ccteam_control_skill,
     install_ccteam_creator_skill, install_ccteam_team_skill, migrate_legacy_skill_dirs,
-    migrate_recommended_agent_symlinks, rewrite_legacy_hook_commands, session_name_for_project,
-    user_claude_dir, write_global_helper_templates, CcteamPaths, HookCmdRewriteAction,
-    HookCmdRewriteReport, InstallSkillOptions, LegacySkillAction, LegacySkillReport,
-    MetaBootstrapReport, MigrationReport, PhaseState, ProjectState, SkillInstallAction,
-    ToolSurfaceSnapshot, BUILTIN_SUBAGENTS, CCTEAM_CONTROL_SKILL_NAME, CCTEAM_CREATOR_SKILL_NAME,
-    CCTEAM_TEAM_SKILL_NAME,
+    migrate_recommended_agent_symlinks, pricing_schema_version, rewrite_legacy_hook_commands,
+    session_name_for_project, user_claude_dir, write_global_helper_templates, CcteamPaths,
+    HookCmdRewriteAction, HookCmdRewriteReport, InstallSkillOptions, LegacySkillAction,
+    LegacySkillReport, MetaBootstrapReport, MigrationReport, PhaseState, ProjectState,
+    SkillInstallAction, ToolSurfaceSnapshot, BUILTIN_SUBAGENTS, CCTEAM_CONTROL_SKILL_NAME,
+    CCTEAM_CREATOR_SKILL_NAME, CCTEAM_TEAM_SKILL_NAME,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -659,7 +659,7 @@ pub fn run_show(paths: &CcteamPaths, slug: &str, format: OutputFormat) -> Result
     let recent = collect_recent_events(paths, slug, 50)?;
     let artifacts = collect_artifacts(paths, slug);
     let progress_path = paths.progress_jsonl(slug);
-    let cost = ccteam_core::cost_summary(slug, &progress_path, paths)?;
+    let cost = cost_summary(slug, &progress_path, paths)?;
     let sessions = ccteam_core::active_sessions(slug, paths).unwrap_or_default();
 
     Ok(match format {
@@ -1746,8 +1746,8 @@ pub fn run_resume(paths: &CcteamPaths, slug: &str) -> Result<()> {
 /// still uses tmux + `codex` CLI.
 pub fn run_session_add(slug: &str, harness: ccteam_core::HarnessKind, role: String) -> Result<()> {
     use ccteam_core::{
-        harness_sid_prefix, ClaudeCodeAdapter, CodexAdapter, HarnessAdapter, HarnessKind,
-        SessionRecord, SpawnOpts, TeamKind,
+        harness_sid_prefix, AgentSpecBrief, ClaudeBgAdapter, CodexExecAdapter, HarnessAdapter,
+        HarnessKind, SessionHandle, SessionRecord, SpawnCtx, TeamKind,
     };
 
     let paths = CcteamPaths::from_env()?;
@@ -1765,38 +1765,50 @@ pub fn run_session_add(slug: &str, harness: ccteam_core::HarnessKind, role: Stri
     std::fs::create_dir_all(session_dir.join("outbox"))
         .with_context(|| format!("create {}", session_dir.join("outbox").display()))?;
 
-    // Adapter dispatch — every harness shares the SpawnOpts schema so
-    // the call sites differ only in which `Adapter::new()` runs. V0.4.0
-    // F61 routes the claude branch to `claude --bg` (capturing job_id);
-    // V0.4.0 F62 keeps the codex branch on tmux.
-    let handle = match harness {
-        HarnessKind::Claude => {
-            let adapter = ClaudeCodeAdapter::new();
-            adapter
-                .spawn_session(SpawnOpts {
-                    harness: adapter.name(),
-                    slug: slug.to_string(),
-                    sid: sid.clone(),
-                    cwd: session_dir.clone(),
-                    role: role.clone(),
-                    extra_args: Vec::new(),
-                })
-                .map_err(|err| anyhow::anyhow!("{err}"))?
-        }
-        HarnessKind::Codex => {
-            let adapter = CodexAdapter::new();
-            adapter
-                .spawn_session(SpawnOpts {
-                    harness: adapter.name(),
-                    slug: slug.to_string(),
-                    sid: sid.clone(),
-                    cwd: session_dir.clone(),
-                    role: String::new(),
-                    extra_args: Vec::new(),
-                })
-                .map_err(|err| anyhow::anyhow!("{err}"))?
-        }
+    // V0.6.0 F107 — adapter dispatch goes through the new 5-method
+    // HarnessAdapter trait. We need a tokio runtime to drive
+    // `start_thread().await`; `run_session_add` is sync CLI surface
+    // so we spin up a current_thread runtime locally rather than
+    // making the whole CLI async.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime for start_thread")?;
+
+    let brief = AgentSpecBrief {
+        role: match harness {
+            HarnessKind::Claude => role.clone(),
+            // Codex has no role surface yet (V0.4.0 F62); pass empty.
+            HarnessKind::Codex => String::new(),
+        },
     };
+    let ctx = SpawnCtx {
+        slug: slug.to_string(),
+        sid: sid.clone(),
+        cwd: session_dir.clone(),
+        project_dir: paths.project_dir(slug),
+        extra_args: Vec::new(),
+    };
+
+    let thread_handle = runtime.block_on(async {
+        match harness {
+            HarnessKind::Claude => {
+                let adapter = ClaudeBgAdapter::new();
+                adapter
+                    .start_thread(&brief, &ctx)
+                    .await
+                    .map_err(|err| anyhow::anyhow!("{err}"))
+            }
+            HarnessKind::Codex => {
+                let adapter = CodexExecAdapter::new();
+                adapter
+                    .start_thread(&brief, &ctx)
+                    .await
+                    .map_err(|err| anyhow::anyhow!("{err}"))
+            }
+        }
+    })?;
+    let handle = SessionHandle::from_thread_handle(&thread_handle, &sid);
 
     let was_empty = state.sessions.is_empty();
     if was_empty {
@@ -1882,7 +1894,10 @@ pub fn run_session_attach(slug: &str, sid: &str) -> Result<()> {
 /// Gracefully shut down one registered flex session and scrub it from
 /// `state.json::sessions[]`.
 pub fn run_session_rm(slug: &str, sid: &str) -> Result<()> {
-    use ccteam_core::{ClaudeCodeAdapter, CodexAdapter, HarnessAdapter, SessionHandle};
+    use ccteam_core::{
+        AgentVendor, ClaudeBgAdapter, CodexExecAdapter, ExecutionMode, HarnessAdapter,
+        ThreadHandle,
+    };
 
     let paths = CcteamPaths::from_env()?;
     let state_path = paths.project_state(slug);
@@ -1897,22 +1912,53 @@ pub fn run_session_rm(slug: &str, sid: &str) -> Result<()> {
             available_sids(&state)
         )
     })?;
-    let handle = SessionHandle {
-        tmux_session: record.tmux_session.clone(),
-        harness: ccteam_core::harness_sid_prefix(record.harness).into(),
-        sid: sid.to_string(),
-        job_id: record.job_id.clone(),
-        pid: record.pid,
-        started_at: record.started_at,
+
+    // V0.6.0 F107 — close_thread goes through the new trait.
+    // Reconstitute a ThreadHandle from the persisted SessionRecord
+    // shape so the adapter has everything it needs (identity =
+    // job_id for bg / tmux_session for codex; raw_extras carry the
+    // tmux_session + pid).
+    let (vendor, mode, identity) = match record.harness {
+        ccteam_core::HarnessKind::Claude => (
+            AgentVendor::Claude,
+            ExecutionMode::Bg,
+            record.job_id.clone().unwrap_or_default(),
+        ),
+        ccteam_core::HarnessKind::Codex => (
+            AgentVendor::Codex,
+            ExecutionMode::Bg,
+            record.tmux_session.clone(),
+        ),
     };
-    match record.harness {
-        ccteam_core::HarnessKind::Claude => ClaudeCodeAdapter::new()
-            .shutdown_session(&handle)
-            .map_err(|err| anyhow::anyhow!("{err}"))?,
-        ccteam_core::HarnessKind::Codex => CodexAdapter::new()
-            .shutdown_session(&handle)
-            .map_err(|err| anyhow::anyhow!("{err}"))?,
+    let mut extras = serde_json::json!({"tmux_session": record.tmux_session.clone()});
+    if let Some(pid) = record.pid {
+        extras["pid"] = serde_json::json!(pid);
     }
+    let thread_handle = ThreadHandle {
+        vendor,
+        mode,
+        identity,
+        started_at: record.started_at,
+        raw_extras: extras,
+    };
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime for close_thread")?;
+
+    runtime.block_on(async {
+        match record.harness {
+            ccteam_core::HarnessKind::Claude => ClaudeBgAdapter::new()
+                .close_thread(&thread_handle)
+                .await
+                .map_err(|err| anyhow::anyhow!("{err}")),
+            ccteam_core::HarnessKind::Codex => CodexExecAdapter::new()
+                .close_thread(&thread_handle)
+                .await
+                .map_err(|err| anyhow::anyhow!("{err}")),
+        }
+    })?;
     state.sessions.remove(sid);
     state.save(&state_path)?;
     println!("removed session {sid} from {slug}");
@@ -2679,7 +2725,7 @@ fn render_update_hooks_report(paths: &CcteamPaths, dry_run: bool) -> Result<Stri
 /// from anthropic.com.
 fn render_check_pricing_version_report() -> String {
     let mut out = String::from("ccteam doctor --check-pricing-version (V0.5.0 F92)\n\n");
-    let version = ccteam_core::pricing_schema_version();
+    let version = pricing_schema_version();
     let today = chrono::Utc::now().date_naive();
     out.push_str(&format!("  pricing.json schema_version: {version}\n"));
     out.push_str(&format!("  today (UTC):                 {today}\n"));
@@ -2696,7 +2742,7 @@ fn render_check_pricing_version_report() -> String {
                 out.push_str(&format!(
                     "\n  [WARN] pricing.json is {age_days} days old (> 180). \
                      Upgrade ccteam to refresh the bundled rate sheet \
-                     (see crates/ccteam-core/src/pricing.json).\n",
+                     (see crates/ccteam-cost/pricing/anthropic.toml + openai.toml).\n",
                 ));
             } else {
                 out.push_str("\n  pricing table is fresh (< 180 days).\n");
@@ -2979,7 +3025,7 @@ fn render_ls_text(paths: &CcteamPaths, projects: &[ProjectSummary], daemon_up: b
         // projects with no progress events show $0.00, same shape
         // as pre-F91 `state.cost_used_usd == 0.0`).
         let cost_24h =
-            ccteam_core::cost_summary(&p.state.slug, &paths.progress_jsonl(&p.state.slug), paths)
+            cost_summary(&p.state.slug, &paths.progress_jsonl(&p.state.slug), paths)
                 .map(|c| c.cost_24h_usd)
                 .unwrap_or(0.0);
         out.push_str(&format!(
@@ -3022,7 +3068,7 @@ fn render_ls_json(
             // `cost_24h_usd` so the number tracks reality. The legacy
             // serde field still reads as the frozen pre-F91 value if
             // anything in the JSON pipeline needs to differentiate.
-            let cost_summary = ccteam_core::cost_summary(
+            let cost_summary = cost_summary(
                 &p.state.slug,
                 &paths.progress_jsonl(&p.state.slug),
                 paths,
