@@ -3,10 +3,11 @@
 //!
 //! Confirms the wire contract that interfaces.md §12 promises:
 //! - `initialize` returns `protocolVersion` + `tools` capability;
-//! - `tools/list` enumerates exactly 17 tools, all `ccteam__*`
+//! - `tools/list` enumerates exactly 24 tools, all `ccteam__*`
 //!   (M2.5 shipped 9; V0.2.2 F38 added `ccteam__screenshot` → 10;
-//!   V0.4.0 F65 added 7 workflow tools → 17);
-//! - `tools/call ccteam__ls` returns a JSON-encoded projects list as
+//!   V0.4.0 F65 added 7 workflow tools → 17; V0.6.0 Wave 1 F111
+//!   added 5 chat stubs + 2 advise stubs → 24);
+//! - `tools/call ccteam__admin_ls` returns a JSON-encoded projects list as
 //!   the first content[].text;
 //! - V0.4.0 F65 `tools/call` smokes for the 7 new workflow tools
 //!   exercise the marker-file side effects so a future refactor that
@@ -118,7 +119,8 @@ fn mcp_serve_initialize_returns_protocol_version_and_tools_cap() {
 fn mcp_serve_tools_list_returns_full_tool_set() {
     // M2.5 shipped 9 tools; V0.2.2 F38 added `ccteam__screenshot` for
     // a total of 10. V0.4.0 F65 added 7 workflow-control tools for a
-    // total of 17. Bump this when a new tool lands.
+    // total of 17. V0.6.0 Wave 1 F111 added 5 chat stubs + 2 advise
+    // stubs for a total of 24. Bump this when a new tool lands.
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().join("home");
     let projects = tmp.path().join("projects");
@@ -136,30 +138,39 @@ fn mcp_serve_tools_list_returns_full_tool_set() {
     let tools = resp["result"]["tools"].as_array().unwrap();
     assert_eq!(
         tools.len(),
-        17,
-        "M2.5 9 + V0.2.2 F38 screenshot + V0.4.0 F65 7-tool workflow surface"
+        24,
+        "M2.5 9 + V0.2.2 F38 screenshot + V0.4.0 F65 7-tool workflow surface + V0.6.0 Wave 1 (5 chat + 2 advise stubs)"
     );
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     for required in [
         // M2.5 / V0.2.2.
-        "ccteam__ls",
-        "ccteam__show",
-        "ccteam__new",
-        "ccteam__peek",
-        "ccteam__progress",
-        "ccteam__pause",
-        "ccteam__resume",
-        "ccteam__send_to_session",
-        "ccteam__inject_decision",
+        "ccteam__admin_ls",
+        "ccteam__workflow_show",
+        "ccteam__workflow_new",
+        "ccteam__workflow_peek",
+        "ccteam__workflow_progress",
+        "ccteam__workflow_pause",
+        "ccteam__workflow_resume",
+        "ccteam__workflow_send_to_session",
+        "ccteam__workflow_inject_decision",
         "ccteam__screenshot",
         // V0.4.0 F65.
-        "ccteam__spawn_agent",
-        "ccteam__stop_agent",
-        "ccteam__observe_agents",
-        "ccteam__signal",
-        "ccteam__set_parallelism",
-        "ccteam__trigger_gate",
-        "ccteam__get_artifact_summary",
+        "ccteam__workflow_spawn_agent",
+        "ccteam__workflow_stop_agent",
+        "ccteam__workflow_observe_agents",
+        "ccteam__workflow_signal",
+        "ccteam__workflow_set_parallelism",
+        "ccteam__workflow_trigger_gate",
+        "ccteam__workflow_get_artifact_summary",
+        // V0.6.0 Wave 1 (F111) chat stubs.
+        "ccteam__chat_send_input",
+        "ccteam__chat_lifecycle",
+        "ccteam__chat_session_reset",
+        "ccteam__chat_list_bots",
+        "ccteam__chat_show_turn_log",
+        // V0.6.0 Wave 1 (F111) advise stubs.
+        "ccteam__advise_vote",
+        "ccteam__advise_parallel",
     ] {
         assert!(names.contains(&required), "missing tool: {required}");
     }
@@ -187,7 +198,7 @@ fn mcp_serve_tools_call_ls_returns_empty_projects_for_fresh_root() {
         "jsonrpc": "2.0",
         "id": 1,
         "method": "tools/call",
-        "params": { "name": "ccteam__ls", "arguments": {} }
+        "params": { "name": "ccteam__admin_ls", "arguments": {} }
     }));
     let resp = srv.recv();
     let text = resp["result"]["content"][0]["text"].as_str().unwrap();
@@ -266,7 +277,7 @@ fn t_spawn_agent_returns_session_id() {
     let mut srv = McpServer::spawn(&home, &projects);
     let body = call_tool(
         &mut srv,
-        "ccteam__spawn_agent",
+        "ccteam__workflow_spawn_agent",
         json!({ "slug": "demo", "role": "fixer" }),
     );
     assert_eq!(body["ok"], true);
@@ -292,7 +303,7 @@ fn t_observe_agents_empty() {
     let mut srv = McpServer::spawn(&home, &projects);
     let body = call_tool(
         &mut srv,
-        "ccteam__observe_agents",
+        "ccteam__workflow_observe_agents",
         json!({ "slug": "demo" }),
     );
     assert_eq!(
@@ -313,7 +324,7 @@ fn t_set_parallelism_writes_override_file() {
     let mut srv = McpServer::spawn(&home, &projects);
     let body = call_tool(
         &mut srv,
-        "ccteam__set_parallelism",
+        "ccteam__workflow_set_parallelism",
         json!({ "slug": "demo", "role": "fixer", "parallelism": 7 }),
     );
     assert_eq!(body["ok"], true);
@@ -339,7 +350,7 @@ fn t_get_artifact_summary_empty_dirs() {
     let mut srv = McpServer::spawn(&home, &projects);
     let body = call_tool(
         &mut srv,
-        "ccteam__get_artifact_summary",
+        "ccteam__workflow_get_artifact_summary",
         json!({ "slug": "demo" }),
     );
     let artifacts = body["artifacts"].as_object().unwrap();
@@ -364,7 +375,7 @@ fn t_trigger_gate_writes_marker() {
     let mut srv = McpServer::spawn(&home, &projects);
     let body = call_tool(
         &mut srv,
-        "ccteam__trigger_gate",
+        "ccteam__workflow_trigger_gate",
         json!({ "slug": "demo", "role": "shipper", "force": true }),
     );
     assert_eq!(body["ok"], true);
@@ -390,7 +401,7 @@ fn t_signal_btw_writes_inbox() {
     let mut srv = McpServer::spawn(&home, &projects);
     let body = call_tool(
         &mut srv,
-        "ccteam__signal",
+        "ccteam__workflow_signal",
         json!({
             "slug": "demo",
             "role": "fixer",

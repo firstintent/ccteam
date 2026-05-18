@@ -8,6 +8,12 @@ mod mcp_serve;
 // while the workflow tools accumulate in lockstep with the F66
 // orchestrator.
 mod mcp_workflow_tools;
+// V0.6.0 Wave 1 (F108 / F111 / F112) — chat / advise tool stubs +
+// ToolGroup enum + CCTEAM_DISABLE_TOOLS filter. Wave 2/3 fills the
+// chat / advise dispatch handlers.
+mod mcp_advise_tools;
+mod mcp_chat_tools;
+mod mcp_tool_groups;
 
 use std::path::PathBuf;
 use std::time::Duration;

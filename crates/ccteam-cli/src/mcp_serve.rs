@@ -46,6 +46,11 @@ use crate::commands::{collect_projects, collect_recent_events, run_peek, run_sho
 // dedicated module so `mcp_serve.rs` stays focused on the M2.5 protocol
 // surface.
 use crate::mcp_workflow_tools;
+// V0.6.0 Wave 1 (F108 / F111 / F112) — chat / advise tool stubs +
+// CCTEAM_DISABLE_TOOLS group filter. Wave 2/3 fills the chat / advise
+// dispatch handlers; Wave 1 lands stubs so the tool surface shape +
+// group disable env are usable end-to-end.
+use crate::{mcp_advise_tools, mcp_chat_tools, mcp_tool_groups};
 
 /// Stable MCP protocol version this server speaks. Newer client versions
 /// downgrade gracefully because we never advertise capabilities we don't
@@ -311,35 +316,44 @@ fn initialize_response() -> Value {
 }
 
 fn tools_list_response() -> Value {
-    json!({ "tools": tool_definitions() })
+    // V0.6.0 F111 — honour `CCTEAM_DISABLE_TOOLS` group enum
+    // (`workflow`, `chat`, `advise`, `screenshot`, `admin`). The
+    // filter runs on every `tools/list` so users can toggle groups
+    // without restarting `ccteam mcp-serve`.
+    let disabled = mcp_tool_groups::disabled_groups_from_env();
+    let tools = mcp_tool_groups::filter_by_disabled(tool_definitions(), &disabled);
+    json!({ "tools": tools })
 }
 
 /// Single source of truth for the MCP tool surface. M2.5 shipped 9
 /// tools; V0.2.2 F38 added `ccteam__screenshot` → 10; V0.4.0 F65 adds
 /// 7 workflow-control tools (`spawn_agent` / `stop_agent` /
 /// `observe_agents` / `signal` / `set_parallelism` / `trigger_gate` /
-/// `get_artifact_summary`) → 17 total. Schemas mirror interfaces.md
-/// §12.2.
+/// `get_artifact_summary`) → 17. V0.6.0 Wave 1 (F111) adds 5 chat
+/// stubs + 2 advise stubs → **24 total**. All tools carry a group
+/// sub-prefix (`admin_`, `workflow_`, `chat_`, `advise_`) except
+/// `ccteam__screenshot` which keeps its single-member-group name
+/// for V0.5 muscle memory. Schemas mirror interfaces.md §12.2.
 fn tool_definitions() -> Vec<Value> {
     let mut tools: Vec<Value> = vec![
         // Read-only inspection.
         json!({
-            "name": "ccteam__ls",
+            "name": "ccteam__admin_ls",
             "description": "List every ccteam project under ~/projects/ with its current phase, state, cost, and stall level. Equivalent to `ccteam ls --format json`.",
             "inputSchema": object_schema(&[]),
         }),
         json!({
-            "name": "ccteam__show",
+            "name": "ccteam__workflow_show",
             "description": "Return the full state.json + recent progress events + artifact list for a single project. Equivalent to `ccteam show <slug> --format json`.",
-            "inputSchema": object_schema(&[("slug", "string", "Project slug, as listed by ccteam__ls.")]),
+            "inputSchema": object_schema(&[("slug", "string", "Project slug, as listed by ccteam__admin_ls.")]),
         }),
         json!({
-            "name": "ccteam__peek",
+            "name": "ccteam__workflow_peek",
             "description": "Capture the current tmux pane contents for a project session (one-shot, no attach). Useful when you want to see what claude is showing without interrupting.",
             "inputSchema": object_schema(&[("slug", "string", "Project slug.")]),
         }),
         json!({
-            "name": "ccteam__progress",
+            "name": "ccteam__workflow_progress",
             "description": "Return the last N progress.jsonl events for a project. Default N=50.",
             "inputSchema": json!({
                 "type": "object",
@@ -352,7 +366,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         // Lifecycle.
         json!({
-            "name": "ccteam__new",
+            "name": "ccteam__workflow_new",
             "description": "Create a new ccteam project from a free-text request. Returns the assigned slug and project directory. Defaults team=dev (M3 will accept other teams).",
             "inputSchema": json!({
                 "type": "object",
@@ -364,18 +378,18 @@ fn tool_definitions() -> Vec<Value> {
             }),
         }),
         json!({
-            "name": "ccteam__pause",
+            "name": "ccteam__workflow_pause",
             "description": "Pause auto-dispatch for one project (sets user_pause_pending). Does not kill the tmux session.",
             "inputSchema": object_schema(&[("slug", "string", "Project slug.")]),
         }),
         json!({
-            "name": "ccteam__resume",
+            "name": "ccteam__workflow_resume",
             "description": "Resume an escalated / paused project (clears user_pause_pending and archives any escalation.md so the daemon's next tick re-dispatches the current phase).",
             "inputSchema": object_schema(&[("slug", "string", "Project slug.")]),
         }),
         // M2.5 new pair.
         json!({
-            "name": "ccteam__send_to_session",
+            "name": "ccteam__workflow_send_to_session",
             "description": "Atomically write a markdown message into a session's .ccteam/inbox/. The orchestrator's next inotify wake delivers it via tmux send-keys. Use for free-form NL into project or meta-agent sessions.",
             "inputSchema": json!({
                 "type": "object",
@@ -388,7 +402,7 @@ fn tool_definitions() -> Vec<Value> {
             }),
         }),
         json!({
-            "name": "ccteam__inject_decision",
+            "name": "ccteam__workflow_inject_decision",
             "description": "Inject a structured ESCALATE-style decision into a project session's inbox. Used when the meta-agent has resolved a clarify/escalation and wants the project session to act on the resolution.",
             "inputSchema": json!({
                 "type": "object",
@@ -404,7 +418,7 @@ fn tool_definitions() -> Vec<Value> {
             }),
         }),
         // V0.2.2 F38 — terminal screenshot. Read-only (no daemon
-        // requirement); mirrors `ccteam__peek` semantics.
+        // requirement); mirrors `ccteam__workflow_peek` semantics.
         json!({
             "name": "ccteam__screenshot",
             "description": "Render the current tmux pane of a project to a PNG under <project>/.ccteam/screenshots/<utc>.png. Pure Rust pipeline (vt100 → imageproc), no system deps. Returns the absolute path on success or a reason on graceful degrade. V0.2.2 F38.",
@@ -423,6 +437,13 @@ fn tool_definitions() -> Vec<Value> {
     ];
     // V0.4.0 F65 — append the 7 workflow-control tools.
     tools.extend(mcp_workflow_tools::workflow_tool_definitions());
+    // V0.6.0 Wave 1 (F108 / F112) — append chat (5) + advise (2)
+    // stubs. Wave 2 / Wave 3 swap the dispatch handlers from
+    // NotImplemented to real implementations; the schemas + names
+    // freeze here so skills / agent prompts compile against the
+    // final surface.
+    tools.extend(mcp_chat_tools::chat_tool_definitions());
+    tools.extend(mcp_advise_tools::advise_tool_definitions());
     tools
 }
 
@@ -449,24 +470,24 @@ async fn call_tool(paths: &CcteamPaths, params: &Value) -> Result<Vec<Value>> {
         .ok_or_else(|| anyhow!("tools/call missing `name`"))?;
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
     match name {
-        "ccteam__ls" => Ok(text_content(tool_ls(paths)?)),
-        "ccteam__show" => Ok(text_content(tool_show(paths, &args)?)),
-        "ccteam__peek" => Ok(text_content(tool_peek(paths, &args)?)),
-        "ccteam__progress" => Ok(text_content(tool_progress(paths, &args)?)),
-        "ccteam__new" => Ok(text_content(tool_new(paths, &args)?)),
-        "ccteam__pause" => {
+        "ccteam__admin_ls" => Ok(text_content(tool_ls(paths)?)),
+        "ccteam__workflow_show" => Ok(text_content(tool_show(paths, &args)?)),
+        "ccteam__workflow_peek" => Ok(text_content(tool_peek(paths, &args)?)),
+        "ccteam__workflow_progress" => Ok(text_content(tool_progress(paths, &args)?)),
+        "ccteam__workflow_new" => Ok(text_content(tool_new(paths, &args)?)),
+        "ccteam__workflow_pause" => {
             require_healthy_daemon(paths)?;
             Ok(text_content(tool_pause(paths, &args)?))
         }
-        "ccteam__resume" => {
+        "ccteam__workflow_resume" => {
             require_healthy_daemon(paths)?;
             Ok(text_content(tool_resume(paths, &args)?))
         }
-        "ccteam__send_to_session" => {
+        "ccteam__workflow_send_to_session" => {
             require_healthy_daemon(paths)?;
             Ok(text_content(tool_send_to_session(paths, &args)?))
         }
-        "ccteam__inject_decision" => {
+        "ccteam__workflow_inject_decision" => {
             require_healthy_daemon(paths)?;
             Ok(text_content(tool_inject_decision(paths, &args)?))
         }
@@ -483,10 +504,20 @@ async fn call_tool(paths: &CcteamPaths, params: &Value) -> Result<Vec<Value>> {
             if mcp_workflow_tools::requires_daemon(other) {
                 require_healthy_daemon(paths)?;
             }
-            match mcp_workflow_tools::dispatch(paths, other, &args)? {
-                Some(body) => Ok(text_content(body)),
-                None => Err(anyhow!("unknown tool: {other}")),
+            if let Some(body) = mcp_workflow_tools::dispatch(paths, other, &args)? {
+                return Ok(text_content(body));
             }
+            // V0.6.0 Wave 1 — chat / advise stubs land here. Both
+            // dispatchers return Ok(None) for tools that aren't
+            // theirs, so the fall-through to `unknown tool` below
+            // is preserved for genuine typos.
+            if let Some(body) = mcp_chat_tools::dispatch(other, &args)? {
+                return Ok(text_content(body));
+            }
+            if let Some(body) = mcp_advise_tools::dispatch(other, &args)? {
+                return Ok(text_content(body));
+            }
+            Err(anyhow!("unknown tool: {other}"))
         }
     }
 }
@@ -867,9 +898,10 @@ mod tests {
     #[test]
     fn tool_definitions_count_matches_spec() {
         // M2.5 brief: 9 tools. V0.2.2 F38 adds `ccteam__screenshot` →
-        // 10. V0.4.0 F65 adds 7 workflow tools → 17 total. Bump this
-        // when a new tool lands.
-        assert_eq!(tool_definitions().len(), 17);
+        // 10. V0.4.0 F65 adds 7 workflow tools → 17. V0.6.0 Wave 1
+        // (F111) adds 5 chat stubs + 2 advise stubs → 24 total. Bump
+        // this when a new tool lands.
+        assert_eq!(tool_definitions().len(), 24);
     }
 
     #[test]
@@ -878,7 +910,7 @@ mod tests {
         let mut names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), 17, "tool names must be unique");
+        assert_eq!(names.len(), 24, "tool names must be unique");
         for tool in &tools {
             assert!(tool["name"].as_str().unwrap().starts_with("ccteam__"));
             assert_eq!(tool["inputSchema"]["type"], "object");
@@ -978,7 +1010,8 @@ mod tests {
     #[tokio::test]
     async fn handle_tools_list_returns_full_tool_set() {
         // M2.5: 9 tools. V0.2.2 F38: +1 (`ccteam__screenshot`) → 10.
-        // V0.4.0 F65: +7 workflow tools → 17.
+        // V0.4.0 F65: +7 workflow tools → 17. V0.6.0 Wave 1 (F111):
+        // +5 chat stubs +2 advise stubs → 24.
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = CcteamPaths {
             root: tmp.path().join("home"),
@@ -992,12 +1025,15 @@ mod tests {
         });
         let resp = handle_request(&paths, &req).await.unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 17);
+        assert_eq!(tools.len(), 24);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"ccteam__screenshot"));
         // V0.4.0 F65 — spot-check one of the new tools is in the list.
-        assert!(names.contains(&"ccteam__spawn_agent"));
-        assert!(names.contains(&"ccteam__get_artifact_summary"));
+        assert!(names.contains(&"ccteam__workflow_spawn_agent"));
+        assert!(names.contains(&"ccteam__workflow_get_artifact_summary"));
+        // V0.6.0 Wave 1 — chat / advise stubs present.
+        assert!(names.contains(&"ccteam__chat_send_input"));
+        assert!(names.contains(&"ccteam__advise_vote"));
     }
 
     #[tokio::test]
@@ -1056,7 +1092,7 @@ mod tests {
             "jsonrpc": "2.0",
             "id": 3,
             "method": "tools/call",
-            "params": { "name": "ccteam__ls", "arguments": {} }
+            "params": { "name": "ccteam__admin_ls", "arguments": {} }
         });
         let resp = handle_request(&paths, &req).await.unwrap();
         let content = resp["result"]["content"][0]["text"].as_str().unwrap();
@@ -1097,7 +1133,7 @@ mod tests {
             "id": 7,
             "method": "tools/call",
             "params": {
-                "name": "ccteam__send_to_session",
+                "name": "ccteam__workflow_send_to_session",
                 "arguments": { "session": "demo", "body": "hello from MCP" }
             }
         });
@@ -1127,7 +1163,7 @@ mod tests {
             "id": 8,
             "method": "tools/call",
             "params": {
-                "name": "ccteam__inject_decision",
+                "name": "ccteam__workflow_inject_decision",
                 "arguments": {
                     "slug": "demo",
                     "escalate_kind": "revert_to_phase",
@@ -1161,7 +1197,7 @@ mod tests {
             "id": 70,
             "method": "tools/call",
             "params": {
-                "name": "ccteam__send_to_session",
+                "name": "ccteam__workflow_send_to_session",
                 "arguments": { "session": "demo", "body": "ignored" }
             }
         });
@@ -1186,7 +1222,7 @@ mod tests {
             projects_root: tmp.path().join("projects"),
         };
         bootstrap_project(&paths, "demo", "demo request", "dev").unwrap();
-        for tool in ["ccteam__pause", "ccteam__resume"] {
+        for tool in ["ccteam__workflow_pause", "ccteam__workflow_resume"] {
             let req = json!({
                 "jsonrpc": "2.0",
                 "id": 71,
@@ -1214,7 +1250,7 @@ mod tests {
             "jsonrpc": "2.0",
             "id": 72,
             "method": "tools/call",
-            "params": { "name": "ccteam__ls", "arguments": {} }
+            "params": { "name": "ccteam__admin_ls", "arguments": {} }
         });
         let resp = handle_request(&paths, &req).await.unwrap();
         assert_eq!(resp["result"]["isError"], false);
@@ -1290,7 +1326,7 @@ mod tests {
             "id": 9,
             "method": "tools/call",
             "params": {
-                "name": "ccteam__inject_decision",
+                "name": "ccteam__workflow_inject_decision",
                 "arguments": { "slug": "demo", "escalate_kind": "fly_to_mars" }
             }
         });
