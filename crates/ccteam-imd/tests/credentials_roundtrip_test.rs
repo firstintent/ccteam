@@ -1,5 +1,13 @@
 //! V0.6.0 Wave 2 F117 — integration tests for credentials persistence.
 //! Uses a tempdir to avoid touching the real `~/.ccteam/im/`.
+//!
+//! **MERGE INSTRUCTION** (imd's reply confirms): fold the
+//! `write_creates_parent_dir` test into imd's
+//! `crates/ccteam-imd/tests/credentials_test.rs` (it's the only
+//! coverage gap — imd's `save()` calls `fs::create_dir_all(parent)`
+//! but never asserts that branch). The other three tests
+//! (round-trip / 0600 / missing→default) are already covered by
+//! imd's file. Then `git rm` this file.
 
 use ccteam_imd::credentials::{
     load_credentials_from, save, write_credentials_to, Credentials, TelegramCreds,

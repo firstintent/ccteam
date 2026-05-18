@@ -77,7 +77,12 @@ impl TelegramCreds {
 
 /// Deprecated alias for [`TelegramCreds`]. Kept on the wave-2/creator
 /// branch only — the imd-teammate branch lands `TelegramCreds` as the
-/// canonical name. Will be deleted at merge time.
+/// canonical name.
+///
+/// **MERGE INSTRUCTION**: Delete this alias. Zero in-tree callers
+/// remain after the rename sweep; `cargo build -p ccteam-imd`
+/// post-merge will fail loudly on any out-of-tree consumer that still
+/// uses the old name (none expected at this stage).
 #[deprecated(note = "renamed to TelegramCreds to match the imd-teammate branch")]
 pub type TelegramCredentials = TelegramCreds;
 
@@ -107,8 +112,10 @@ pub fn default_path() -> PathBuf {
     base.join(".ccteam").join("im").join("credentials.json")
 }
 
-/// Wave-2/creator-branch alias for [`default_path`]. Deleted at
-/// merge time — call sites should migrate to `default_path()`.
+/// Wave-2/creator-branch alias for [`default_path`].
+///
+/// **MERGE INSTRUCTION**: Delete this fn alias. Zero in-tree callers
+/// remain after the rename sweep.
 #[deprecated(note = "use `default_path()` to match the imd-teammate branch")]
 pub fn credentials_path() -> PathBuf {
     default_path()

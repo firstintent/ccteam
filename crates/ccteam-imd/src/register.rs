@@ -1,6 +1,16 @@
 //! V0.6.0 Wave 2 F114 — `register_bot()` API consumed by
 //! `ccteam-creator` Phase 5.
 //!
+//! **MERGE INSTRUCTION**: Delete this entire file when merging
+//! wave-2/creator into the imd-teammate branch. `register_bot` /
+//! `BotRegistration` / `AgentVendor` all live in imd's
+//! `crates/ccteam-imd/src/lib.rs` (~160 lines). This file exists
+//! purely so wave-2/creator compiles + ccteam-creator SKILL.md
+//! references resolve before the two branches merge. Post-merge:
+//! `git rm crates/ccteam-imd/src/register.rs` + remove the
+//! `pub mod register;` line from lib.rs + drop the `pub use
+//! register::...` re-exports.
+//!
 //! **Signature aligned with the in-flight imd-teammate branch
 //! (`v0-6-0-wave-2-imd`)** so the two waves' commits merge without an
 //! API rewrite. The shape is:
