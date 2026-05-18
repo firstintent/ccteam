@@ -102,11 +102,7 @@ async fn claude_bg_start_thread_parses_backgrounded_marker() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(
-            &fake_claude,
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
+        std::fs::set_permissions(&fake_claude, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     let _bin = EnvGuard::set(CLAUDE_BIN_ENV, fake_claude.to_str().unwrap());
@@ -130,7 +126,10 @@ async fn claude_bg_start_thread_parses_backgrounded_marker() {
     assert_eq!(handle.mode, ExecutionMode::Bg);
     assert_eq!(handle.identity, "deadbeef");
     assert_eq!(
-        handle.raw_extras.get("tmux_session").and_then(|v| v.as_str()),
+        handle
+            .raw_extras
+            .get("tmux_session")
+            .and_then(|v| v.as_str()),
         Some("ccteam-demo-claude-1")
     );
 }
@@ -204,7 +203,10 @@ async fn claude_bg_submit_turn_synthesises_turn_id() {
 #[test]
 fn parse_backgrounded_short_id_extracts_marker() {
     let out = "warning: bla\nbackgrounded · 9432490e\n  attach hint\n";
-    assert_eq!(parse_backgrounded_short_id(out).as_deref(), Some("9432490e"));
+    assert_eq!(
+        parse_backgrounded_short_id(out).as_deref(),
+        Some("9432490e")
+    );
 }
 
 // =====================================================================
@@ -240,17 +242,16 @@ mod codex_tmux {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(
-                &fake_codex,
-                std::fs::Permissions::from_mode(0o755),
-            )
-            .unwrap();
+            std::fs::set_permissions(&fake_codex, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let prev_path = std::env::var_os("PATH");
         let new_path = format!(
             "{}:{}",
             tmp.path().display(),
-            prev_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()
+            prev_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default()
         );
         std::env::set_var("PATH", &new_path);
 
@@ -313,13 +314,13 @@ async fn codex_exec_close_thread_idempotent_on_missing_session() {
 }
 
 // =====================================================================
-// 4. ClaudeTuiAdapter all 5 methods return NotImplemented
+// 4. ClaudeTuiAdapter Wave 2 surface — name / vendor / empty-role guard
 // =====================================================================
 
 #[tokio::test(flavor = "current_thread")]
-async fn claude_tui_stub_all_methods_not_implemented() {
+async fn claude_tui_rejects_empty_role() {
     let brief = AgentSpecBrief {
-        role: "helpful-bot".into(),
+        role: String::new(),
     };
     let ctx = SpawnCtx {
         slug: "demo".into(),
@@ -328,47 +329,32 @@ async fn claude_tui_stub_all_methods_not_implemented() {
         project_dir: std::env::temp_dir(),
         extra_args: vec![],
     };
-    let h = ThreadHandle {
-        vendor: AgentVendor::Claude,
-        mode: ExecutionMode::Chat,
-        identity: "tmux-session".into(),
-        started_at: chrono::Utc::now(),
-        raw_extras: serde_json::json!({}),
-    };
-
-    let adapter = ClaudeTuiAdapter::new();
-    assert!(matches!(
-        adapter.start_thread(&brief, &ctx).await,
-        Err(HarnessError::NotImplemented { .. })
-    ));
-    assert!(matches!(
-        adapter
-            .submit_turn(&h, ccteam_core::harness::TurnInput::UserText("x".into()))
-            .await,
-        Err(HarnessError::NotImplemented { .. })
-    ));
-    assert!(matches!(
-        adapter.resume_thread("any-sid").await,
-        Err(HarnessError::NotImplemented { .. })
-    ));
-    assert!(matches!(
-        adapter.close_thread(&h).await,
-        Err(HarnessError::NotImplemented { .. })
-    ));
-    // events() is non-fallible — must return an empty stream (not
-    // panic, not loop).
-    let _stream = adapter.events(&h);
+    let err = ClaudeTuiAdapter::new()
+        .start_thread(&brief, &ctx)
+        .await
+        .expect_err("empty role must error");
+    match err {
+        HarnessError::SpawnFailed(msg) => assert!(msg.contains("non-empty role")),
+        other => panic!("expected SpawnFailed, got {other:?}"),
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn claude_tui_not_implemented_carries_wave2_marker() {
+async fn claude_tui_resume_missing_session_reports_not_implemented() {
+    // Wave 2: resume_thread w/o a live tmux session falls back to a
+    // structured NotImplemented so the caller knows to invoke
+    // start_thread + session_recovery::build_recovery_prompt.
     let adapter = ClaudeTuiAdapter::new();
-    let err = adapter.resume_thread("ignored").await.unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("Wave 2") || msg.contains("F108"),
-        "stub reason must reference Wave 2 / F108: got {msg}"
-    );
+    let err = adapter
+        .resume_thread("ccteam-chat-nope-ghost")
+        .await
+        .unwrap_err();
+    match err {
+        HarnessError::NotImplemented { reason } => {
+            assert!(reason.contains("session_recovery"));
+        }
+        other => panic!("expected NotImplemented, got {other:?}"),
+    }
 }
 
 // =====================================================================

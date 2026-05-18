@@ -687,6 +687,16 @@ enum HookCommand {
     /// outbox / clarify protocol instead of synchronously waiting on
     /// an offline user.
     InterceptAsk,
+    /// V0.6.0 F108 — `mode: chat` Claude Code hook callback. Each
+    /// hook event arg maps to one ccteam `chat_*` progress.jsonl
+    /// emission. See `ccteam_hooks::chat_progress` for the dispatch
+    /// table.
+    ChatProgress {
+        /// The hook-event arg (e.g. `session-start`, `user-prompt`,
+        /// `stop`, `subagent-stop`, `tool-use`, `session-end`,
+        /// `pre-compact`, `post-compact`).
+        event: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -1119,6 +1129,10 @@ fn run_hook(cmd: HookCommand) -> Result<()> {
             println!("{}", serde_json::to_string(&decision)?);
             Ok(())
         }
+        HookCommand::ChatProgress { event } => {
+            let stdin = parse_hook_stdin_json()?;
+            ccteam_hooks::handle_chat_progress(&paths, &event, &stdin)
+        }
     }
 }
 
@@ -1226,26 +1240,25 @@ fn run_start(
             // `team_*` events into `~/.ccteam/teams-progress.jsonl` for
             // the web `/teams` tab to consume. Fire-and-forget: the task
             // owns its notify watcher, exits on runtime shutdown.
-            let _agent_teams_watcher_task =
-                match ccteam_core::AgentTeamsWatcherConfig::from_env() {
-                    Ok(cfg) => match ccteam_core::AgentTeamsWatcher::new(cfg) {
-                        Ok(watcher) => Some(watcher.start()),
-                        Err(err) => {
-                            tracing::warn!(
-                                ?err,
-                                "F95 AgentTeamsWatcher::new failed; team-events disabled",
-                            );
-                            None
-                        }
-                    },
+            let _agent_teams_watcher_task = match ccteam_core::AgentTeamsWatcherConfig::from_env() {
+                Ok(cfg) => match ccteam_core::AgentTeamsWatcher::new(cfg) {
+                    Ok(watcher) => Some(watcher.start()),
                     Err(err) => {
                         tracing::warn!(
                             ?err,
-                            "F95 AgentTeamsWatcherConfig::from_env failed; team-events disabled",
+                            "F95 AgentTeamsWatcher::new failed; team-events disabled",
                         );
                         None
                     }
-                };
+                },
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        "F95 AgentTeamsWatcherConfig::from_env failed; team-events disabled",
+                    );
+                    None
+                }
+            };
 
             let web_handle = if web.disabled {
                 None

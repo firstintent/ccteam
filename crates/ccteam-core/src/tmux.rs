@@ -230,10 +230,27 @@ impl TmuxSession {
     /// setting (`base-index 1` in tmux.conf would otherwise break a
     /// hard-coded `:0` target).
     pub fn send_keys(&self, text: &str) -> Result<()> {
-        if !self.exists() {
-            bail!("send_keys: session does not exist: {}", self.name);
-        }
+        self.send_keys_literal(text)?;
+        self.send_keys_enter()
+    }
 
+    /// V0.6.0 F108 — literal send only (no trailing Enter). The
+    /// `send-keys -l` flag tells tmux to interpret every byte as a key
+    /// literally, so embedded control chars, slashes, quotes, and emoji
+    /// arrive in the TUI exactly as authored. Use this when the caller
+    /// needs to compose a multi-step input (e.g. paste text → press a
+    /// specific control sequence before Enter).
+    ///
+    /// The `ClaudeTuiAdapter::submit_turn` flow is the primary
+    /// consumer: user content goes through `send_keys_literal` and the
+    /// submit is finalized by [`Self::send_keys_enter`]. Keeping the
+    /// two halves separate is what lets `/exit` / `/compact` / `/new`
+    /// flow through Claude transparently (ccgram + OMC verified
+    /// pattern — see `references/oh-my-claudecode/` SessionMonitor).
+    pub fn send_keys_literal(&self, text: &str) -> Result<()> {
+        if !self.exists() {
+            bail!("send_keys_literal: session does not exist: {}", self.name);
+        }
         let output = Command::new("tmux")
             .args(["send-keys", "-t", &self.name, "-l", "--", text])
             .output()
@@ -242,7 +259,15 @@ impl TmuxSession {
             let stderr = String::from_utf8_lossy(&output.stderr);
             bail!("tmux send-keys (-l) failed: {}", stderr);
         }
+        Ok(())
+    }
 
+    /// V0.6.0 F108 — press Enter only. Paired with
+    /// [`Self::send_keys_literal`] for explicit two-step submit.
+    pub fn send_keys_enter(&self) -> Result<()> {
+        if !self.exists() {
+            bail!("send_keys_enter: session does not exist: {}", self.name);
+        }
         let output = Command::new("tmux")
             .args(["send-keys", "-t", &self.name, "Enter"])
             .output()

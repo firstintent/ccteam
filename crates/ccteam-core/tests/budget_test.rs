@@ -82,6 +82,7 @@ fn manual_spec_with_budget(role: &str, budget: Option<BudgetSpec>) -> WorkflowSp
         budget,
         budgets_v060: None,
         agent_team: None,
+        chat: None,
         agents,
     }
 }

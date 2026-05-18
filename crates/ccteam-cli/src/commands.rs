@@ -731,6 +731,11 @@ pub fn run_start_agent_team(
              implemented for agent-team mode. For artifact-driven projects run\n  \
              `ccteam start` (no slug) to start the daemon.",
         ),
+        (ccteam_core::WorkflowMode::Chat, _) => bail!(
+            "project `{slug}` is in chat mode (V0.6.0 F108); `ccteam start <slug>` is not\n  \
+             the chat-mode entry point. Bots are launched via the IM channel + \n  \
+             `ccteam-imd` daemon, not the agent-team start flow.",
+        ),
     };
 
     // ---- V0.5.0 F97 — `--restart-team` revive path -----------------------
@@ -1084,6 +1089,11 @@ pub fn run_stop_slug(paths: &CcteamPaths, slug: &str, opts: StopSlugOptions) -> 
         (ccteam_core::WorkflowMode::ArtifactDriven, _) => bail!(
             "project `{slug}` is in artifact-driven mode; `ccteam stop <slug>` is only\n  \
              implemented for agent-team mode. For daemon shutdown run `ccteam stop` (no slug).",
+        ),
+        (ccteam_core::WorkflowMode::Chat, _) => bail!(
+            "project `{slug}` is in chat mode (V0.6.0 F108); `ccteam stop <slug>` is not\n  \
+             the chat-mode shutdown path. Use the IM channel `/stop` directive or\n  \
+             kill the bot's tmux session directly.",
         ),
     };
 
@@ -1895,8 +1905,7 @@ pub fn run_session_attach(slug: &str, sid: &str) -> Result<()> {
 /// `state.json::sessions[]`.
 pub fn run_session_rm(slug: &str, sid: &str) -> Result<()> {
     use ccteam_core::{
-        AgentVendor, ClaudeBgAdapter, CodexExecAdapter, ExecutionMode, HarnessAdapter,
-        ThreadHandle,
+        AgentVendor, ClaudeBgAdapter, CodexExecAdapter, ExecutionMode, HarnessAdapter, ThreadHandle,
     };
 
     let paths = CcteamPaths::from_env()?;
@@ -3024,10 +3033,9 @@ fn render_ls_text(paths: &CcteamPaths, projects: &[ProjectSummary], daemon_up: b
         // progress.jsonl (best-effort; failure → $0.00 — fresh
         // projects with no progress events show $0.00, same shape
         // as pre-F91 `state.cost_used_usd == 0.0`).
-        let cost_24h =
-            cost_summary(&p.state.slug, &paths.progress_jsonl(&p.state.slug), paths)
-                .map(|c| c.cost_24h_usd)
-                .unwrap_or(0.0);
+        let cost_24h = cost_summary(&p.state.slug, &paths.progress_jsonl(&p.state.slug), paths)
+            .map(|c| c.cost_24h_usd)
+            .unwrap_or(0.0);
         out.push_str(&format!(
             "{:<40} {:<14} {:<11} ${:<5.2} {}s\n",
             truncate(&p.state.slug, 40),
@@ -3068,12 +3076,9 @@ fn render_ls_json(
             // `cost_24h_usd` so the number tracks reality. The legacy
             // serde field still reads as the frozen pre-F91 value if
             // anything in the JSON pipeline needs to differentiate.
-            let cost_summary = cost_summary(
-                &p.state.slug,
-                &paths.progress_jsonl(&p.state.slug),
-                paths,
-            )
-            .unwrap_or_default();
+            let cost_summary =
+                cost_summary(&p.state.slug, &paths.progress_jsonl(&p.state.slug), paths)
+                    .unwrap_or_default();
             json!({
                 "slug": p.state.slug,
                 "current_phase": p.state.current_phase,
