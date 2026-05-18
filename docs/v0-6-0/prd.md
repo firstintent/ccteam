@@ -49,6 +49,8 @@ sub-skill 仍保留(高级用户 deep-link):
 | `skills/ccteam-im-setup/SKILL.md`(新)| ~200 行 onboarding dialog(详 F117)|
 | `skills/ccteam-advise/SKILL.md`(新)| ~100 行 Codex + Claude parallel advisor 模式 |
 | `crates/ccteam-cli/src/commands.rs::run_doctor` | `--install-skill all` 装 5 skill(总入口 + 4 sub);保留 single-skill flag |
+| `crates/ccteam-cli/src/mcp_chat_tools.rs`(新;Wave 1 落)| `chat_*` 5 工具 stub schema + dispatcher。`/ccteam <create-workflow>` 路径 NL 推断到 Pocket Assistant / IM Squad preset 后,sub-skill 调本 stub 接口(Wave 2 F108 填实)|
+| `crates/ccteam-cli/src/mcp_advise_tools.rs`(新;Wave 1 落)| `advise_*` 2 工具 stub schema + dispatcher。`/ccteam <advise>` 路径走本 stub(Wave 3 F112 §A 填实)|
 
 #### 验收
 

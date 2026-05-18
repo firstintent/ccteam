@@ -193,9 +193,10 @@ pub use team_resolver::{
     TeamSource, TEAM_SOURCES,
 };
 pub use templates::{
-    current_ccteam_bin, render_project_settings, render_project_settings_agent_team,
-    write_global_helper_templates, write_project_settings, write_project_settings_agent_team,
-    EnabledPluginsSetting, SettingsEnv, HELPER_TEMPLATES, PROJECT_SETTINGS_AGENT_TEAM_JSON,
+    current_ccteam_bin, merge_project_mcp_json, render_project_mcp_json,
+    render_project_settings, render_project_settings_agent_team, write_global_helper_templates,
+    write_project_settings, write_project_settings_agent_team, EnabledPluginsSetting, SettingsEnv,
+    CCTEAM_MCP_SERVER_KEY, HELPER_TEMPLATES, PROJECT_SETTINGS_AGENT_TEAM_JSON,
     PROJECT_SETTINGS_JSON,
 };
 pub use tmux::{

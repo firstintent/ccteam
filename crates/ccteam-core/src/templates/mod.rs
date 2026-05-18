@@ -19,12 +19,18 @@ use std::path::Path;
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 
+// V0.6.0 F111 — per-project `.mcp.json` template + merge helper.
+pub mod project_mcp_json;
+pub use project_mcp_json::{
+    merge_project_mcp_json, render_project_mcp_json, CCTEAM_MCP_SERVER_KEY,
+};
+
 /// Per-project `.claude/settings.json` template. The template uses
 /// `__CCTEAM_BIN__` everywhere a real install would name the absolute
 /// `ccteam` binary path; we substitute the running binary's absolute path
 /// at write time so hook subprocesses don't depend on the user's PATH
 /// (which Claude Code inherits and may not include the ccteam install dir).
-pub const PROJECT_SETTINGS_JSON: &str = include_str!("templates/settings.json");
+pub const PROJECT_SETTINGS_JSON: &str = include_str!("settings.json");
 
 /// V0.5.0 F93b + F94 — per-project `.claude/settings.json` template for
 /// `mode: agent-team` workflows. Same shape as
@@ -33,7 +39,7 @@ pub const PROJECT_SETTINGS_JSON: &str = include_str!("templates/settings.json");
 /// Used only by `ccteam init --mode agent-team` (per PRD F94 红线:
 /// advanced path only).
 pub const PROJECT_SETTINGS_AGENT_TEAM_JSON: &str =
-    include_str!("templates/settings.agent-team.json");
+    include_str!("settings.agent-team.json");
 
 /// M2.4: helper templates that user-authored agent / workflow markdown
 /// can `@`-reference. Shipped inside the binary so a fresh install (or
