@@ -1,0 +1,21 @@
+[package]
+name = "ccteam-imd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ccteam IM-daemon helpers: Telegram / Slack / Discord onboarding flows, credential persistence under ~/.ccteam/im/, bot registration API consumed by ccteam-creator. V0.6.0 Wave 2."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+dirs.workspace = true
+thiserror.workspace = true
+reqwest = { workspace = true, features = ["json"] }
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

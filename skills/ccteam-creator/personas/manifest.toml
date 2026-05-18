@@ -1,0 +1,83 @@
+# V0.6.0 Wave 2 F114 — persona registry consumed by `ccteam-creator`
+# Phase 3 (persona match).
+#
+# Each [[persona]] entry describes a prefab `.claude/agents/<role>.md`
+# template the skill can copy into a new project. The skill chooses
+# from this list by LLM match against the user's NL intent + optional
+# direct user pick.
+#
+# Fields:
+# - id            : kebab-case directory name under personas/
+# - label_en      : human-readable English name (shown in PROJECT PLAN)
+# - label_zh      : 中文标签(同上)
+# - description   : one-line capsule used by the LLM matcher
+# - tags          : free-form intent tags (coding / writing / chat / ...)
+# - default_mode  : kebab-case CreatorMode the persona is naturally
+#                   paired with (in-proc / bg / chat-dm / chat-group)
+# - codex_eligible: true if this persona benefits from auto-vendoring
+#                   an OpenAI Codex critic alongside the Claude main
+#                   (Phase 4 plan-output flips a "Codex critic: 自动启用"
+#                   line based on this + presence of `codex` binary)
+
+[[persona]]
+id = "tech-helper"
+label_en = "Tech Helper"
+label_zh = "技术助手"
+description = "General programming Q&A, code reading, light implementation guidance"
+tags = ["coding", "qa", "support"]
+default_mode = "chat-dm"
+codex_eligible = true
+
+[[persona]]
+id = "writing-assistant"
+label_en = "Writing Assistant"
+label_zh = "写作助手"
+description = "Drafts and revises prose — blog posts, emails, social"
+tags = ["writing", "editing"]
+default_mode = "chat-dm"
+codex_eligible = false
+
+[[persona]]
+id = "translator"
+label_en = "Translator"
+label_zh = "翻译"
+description = "Bi-directional translation (Chinese ↔ English) with idiom + tone preservation"
+tags = ["writing", "translation"]
+default_mode = "chat-dm"
+codex_eligible = false
+
+[[persona]]
+id = "tutor"
+label_en = "Tutor"
+label_zh = "学习辅导"
+description = "Patient explainer; breaks down concepts and quizzes back"
+tags = ["learning", "qa"]
+default_mode = "chat-dm"
+codex_eligible = false
+
+[[persona]]
+id = "project-lead"
+label_en = "Project Lead"
+label_zh = "项目监工"
+description = "Tracks deliverables; nudges on stalled tasks; weekly summary"
+tags = ["scheduling", "monitoring", "support"]
+default_mode = "chat-dm"
+codex_eligible = false
+
+[[persona]]
+id = "customer-support"
+label_en = "Customer Support"
+label_zh = "客服"
+description = "Triages questions, answers FAQ, escalates per playbook"
+tags = ["support", "qa"]
+default_mode = "chat-dm"
+codex_eligible = false
+
+[[persona]]
+id = "code-critic"
+label_en = "Code Critic"
+label_zh = "代码 critic"
+description = "Reviews diffs for security, style, regressions. Pairs well with a Codex second-opinion"
+tags = ["coding", "qa", "review"]
+default_mode = "in-proc"
+codex_eligible = true
