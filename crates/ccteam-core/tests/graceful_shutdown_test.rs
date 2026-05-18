@@ -64,6 +64,7 @@ fn manual_spec(role: &str) -> WorkflowSpec {
         mode: ccteam_core::WorkflowMode::default(),
         enabled: true,
         budget: None,
+        budgets_v060: None,
         agent_team: None,
         agents,
     }

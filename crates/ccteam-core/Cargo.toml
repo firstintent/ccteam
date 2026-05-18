@@ -7,6 +7,12 @@ license.workspace = true
 description = "ccteam orchestrator core: state machine, protocol types, tmux wrapper, hook schemas."
 
 [dependencies]
+# V0.6.0 Wave 1 — pricing / cost-level / budget moved out so dual-vendor
+# (Anthropic + OpenAI) tables share one surface. ccteam-core re-exports
+# UnifiedTokenUsage / estimate_cost / CostLevel from this crate for
+# backward-compat with V0.5.x callers.
+ccteam-cost.workspace = true
+
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true

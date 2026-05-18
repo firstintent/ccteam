@@ -22,7 +22,6 @@ pub mod auto_loop;
 pub mod claude_job;
 // V0.4.2 F73 — `~/.ccteam/config.yaml` global config + projects registry.
 pub mod config;
-pub mod cost;
 pub mod daemon;
 pub mod harness;
 pub mod inbox;
@@ -34,8 +33,6 @@ pub mod orchestrator;
 pub mod paths;
 pub mod pending_inject;
 pub mod plugin_resolution;
-// V0.5.0 F92 — bundled Anthropic price table + token → dollar estimator.
-pub mod pricing;
 pub mod progress;
 pub mod projects;
 pub mod queries;
@@ -83,7 +80,10 @@ pub use config::{
     save as save_ccteam_config, upsert_project as upsert_project_in_config, CcteamConfig,
     ProjectEntry, CONFIG_FILENAME,
 };
-pub use cost::{classify as classify_cost, CostLevel, COST_MID_WARN_USD};
+// V0.6.0 Wave 1 — cost classification moved to `ccteam-cost`. Re-export
+// for V0.5.x callers; the new signature is
+// `classify(cost, soft_warn, hard_kill)` (primitives, not `&ProjectState`).
+pub use ccteam_cost::{classify as classify_cost, CostLevel, COST_MID_WARN_USD};
 pub use daemon::{
     check_health as check_daemon_health, check_health_at as check_daemon_health_at, heartbeat_path,
     pidfile_path, read_pidfile, remove_heartbeat, remove_pidfile, send_sigterm_to_pidfile,
@@ -128,7 +128,13 @@ pub use pending_inject::{
 pub use plugin_resolution::{
     lookup_plugin_agent, plugins_to_enable, PluginAgent, KNOWN_PLUGIN_AGENTS,
 };
-pub use pricing::{estimate_cost, pricing_schema_version, ModelPrices, Usage};
+// V0.6.0 Wave 1 — pricing moved to `ccteam-cost` with dual-vendor
+// (Anthropic + OpenAI) tables. The V0.5.x `Usage` type was renamed
+// `UnifiedTokenUsage`; alias here so V0.5 callers reading
+// `ccteam_core::Usage` keep compiling.
+pub use ccteam_cost::{
+    estimate_cost, pricing_schema_version, ModelPrices, UnifiedTokenUsage as Usage, Vendor,
+};
 pub use progress::{
     current_agent_sessions, escalation_count, workflow_cost_total, AgentSessionStatus,
     AgentSessionSummary,

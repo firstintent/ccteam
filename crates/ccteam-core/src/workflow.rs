@@ -76,6 +76,14 @@ pub struct WorkflowSpec {
     /// unaffected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<BudgetSpec>,
+    /// V0.6.0 Wave 1 — per-vendor budget split. When `Some`, takes
+    /// precedence over the V0.5 flat `budget` field; `claude` half is
+    /// the V0.5-equivalent path and `codex` adds the Codex-vendor cap.
+    /// `None` keeps the V0.5 flat-budget semantics (Wave 2 / V0.7
+    /// deprecates `BudgetSpec`). `#[serde(default)]` so V0.5 files
+    /// without this key still parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budgets_v060: Option<ccteam_cost::Budgets>,
     /// V0.5.0 F93b — populated when `mode: agent-team`. Lead session
     /// config (`team_name`, `lead_seed`, `teammate_mode`, etc.) plus
     /// the optional declarative `suggested_teammates` list. `None` in
@@ -736,6 +744,7 @@ mod tests {
             mode: WorkflowMode::ArtifactDriven,
             enabled: true,
             budget: None,
+            budgets_v060: None,
             agent_team: None,
             agents: {
                 let mut m = IndexMap::new();
