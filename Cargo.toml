@@ -6,6 +6,8 @@ members = [
     "crates/ccteam-cli",
     "crates/ccteam-hooks",
     "crates/ccteam-web",
+    # V0.6.0 Wave 2 F109/F116 — IM-bot daemon + supervisor.
+    "crates/ccteam-imd",
 ]
 
 [workspace.package]

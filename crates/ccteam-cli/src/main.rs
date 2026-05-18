@@ -551,6 +551,15 @@ enum Command {
         #[command(subcommand)]
         action: SessionAction,
     },
+    /// V0.6.0 Wave 2 F109 — start / stop / status the `ccteam-imd`
+    /// IM-bot daemon (Telegram / Slack / Discord bridge). Thin wrapper
+    /// that exec's the standalone `ccteam-imd` binary; the daemon
+    /// itself is a separate crate (`crates/ccteam-imd/`) so the CLI
+    /// stays free of `reqwest` / IM transitive deps.
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
     /// V0.3 M5.0: serve the ccteam web UI (read + restricted-write,
     /// `docs/v0-3/prd.md` §3-§6). M5.0 ships the scaffold + `/health`
     /// endpoint only; dashboard / SSE / write actions land in M5.1-3.
@@ -622,6 +631,20 @@ enum InternalCommand {
         role: String,
         prompt: Option<String>,
     },
+}
+
+/// V0.6.0 Wave 2 F109 — `ccteam daemon` subcommand surface. Each variant
+/// delegates to the standalone `ccteam-imd` binary via `Command::new`
+/// (no workspace dep — keeps `reqwest` out of `ccteam-cli`'s closure).
+#[derive(Subcommand)]
+enum DaemonAction {
+    /// Start `ccteam-imd run --foreground` in a child process.
+    Start,
+    /// SIGTERM the running daemon (best-effort; reads pid from
+    /// `~/.ccteam/state/imd.pid` if present, otherwise scans pgrep).
+    Stop,
+    /// Print daemon status (heartbeat freshness + registered bots).
+    Status,
 }
 
 /// V0.3.1 F49 — `ccteam session` subcommand surface for flex teams.
@@ -930,6 +953,7 @@ fn main() -> Result<()> {
             })
         }
         Command::Session { action } => run_session(action),
+        Command::Daemon { action } => run_daemon_cmd(action),
         Command::Web {
             bind,
             no_auth,
@@ -990,6 +1014,46 @@ fn run_mcp_serve() -> Result<()> {
         .build()
         .context("build tokio runtime for mcp-serve")?;
     runtime.block_on(mcp_serve::run_mcp_serve(paths))
+}
+
+/// V0.6.0 Wave 2 F109 — dispatch `ccteam daemon <action>` by exec'ing
+/// `ccteam-imd <action>` as a child process. We do NOT link
+/// `ccteam-imd` into the CLI crate (keeps reqwest / IM transitive
+/// deps out of the daily-driver `ccteam` binary's closure).
+fn run_daemon_cmd(action: DaemonAction) -> Result<()> {
+    use std::process::Command as ProcCommand;
+    let bin = std::env::var("CCTEAM_IMD_BIN").unwrap_or_else(|_| "ccteam-imd".to_string());
+    let mut cmd = ProcCommand::new(&bin);
+    match action {
+        DaemonAction::Start => {
+            cmd.args(["run", "--foreground"]);
+        }
+        DaemonAction::Stop => {
+            // No subcommand on ccteam-imd for stop yet — SIGTERM via
+            // pgrep is the cheapest reliable path that doesn't
+            // require a pidfile-writing daemon. Users on systemd
+            // should `systemctl --user stop ccteam-imd` instead.
+            let out = ProcCommand::new("pkill")
+                .args(["-TERM", "-x", "ccteam-imd"])
+                .status();
+            match out {
+                Ok(s) if s.success() => println!("ccteam-imd: SIGTERM sent"),
+                Ok(_) => println!("ccteam-imd: no running process found"),
+                Err(err) => println!("ccteam-imd: pkill failed: {err}"),
+            }
+            return Ok(());
+        }
+        DaemonAction::Status => {
+            cmd.arg("status");
+        }
+    }
+    let status = cmd
+        .status()
+        .with_context(|| format!("exec `{bin}` (set CCTEAM_IMD_BIN to override)"))?;
+    if !status.success() {
+        anyhow::bail!("{bin} exited with {status}");
+    }
+    Ok(())
 }
 
 fn run_attach(slug: &str) -> Result<()> {

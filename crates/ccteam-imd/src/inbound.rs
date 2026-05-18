@@ -1,0 +1,328 @@
+//! Inbound pipeline: IM event → security check → router → bot mailbox.
+//!
+//! The daemon owns one [`tokio::sync::mpsc::Receiver<ChannelMessage>`]
+//! per active Channel. Each received message runs through
+//! [`process_inbound`] which composes three-layer security, the
+//! router, and the per-bot mailbox writer.
+//!
+//! The actual `HarnessAdapter::submit_turn` call is performed by the
+//! daemon's supervisor (it owns the active [`ccteam_core::harness::ThreadHandle`]
+//! per bot); this module's responsibility ends at writing the
+//! mailbox file the adapter watches.
+
+use std::fs;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
+
+use crate::nl_admin;
+use crate::router::{self, HandleMap, Route};
+use crate::three_layer_sec::{SecOutcome, ThreeLayerSec};
+use crate::transport::ChannelMessage;
+
+/// One mailbox envelope dropped into
+/// `<project>/.ccteam/chat/<bot>/inbox/msg-<ts>-<seq>.md`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboxEnvelope {
+    /// IM platform name.
+    pub platform: String,
+    /// Sender id (post-ACL).
+    pub sender: String,
+    /// Hop counter (bot-to-bot loop guard).
+    pub hop: u8,
+    /// RFC3339 receipt timestamp.
+    pub received_at: chrono::DateTime<chrono::Utc>,
+    /// Where to send the reply.
+    pub reply_target: String,
+    /// Sanitized payload.
+    pub payload: String,
+    /// Original platform message id (echo suppression).
+    pub message_id: String,
+}
+
+/// Result of one inbound processing pass.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InboundOutcome {
+    /// Wrote a mailbox file for a bot session; daemon should kick the
+    /// per-bot supervisor.
+    DroppedToBot {
+        /// project slug.
+        slug: String,
+        /// bot role.
+        role: String,
+        /// path of the written envelope.
+        path: PathBuf,
+    },
+    /// Routed to admin handler.
+    Admin {
+        /// `@ccteam <verb_and_args>` payload.
+        verb_and_args: String,
+    },
+    /// Dropped by router (unknown handle, no mention, hop budget).
+    Dropped {
+        /// reason.
+        reason: String,
+    },
+    /// Rejected by the three-layer security.
+    Rejected {
+        /// which layer.
+        layer: String,
+    },
+}
+
+/// Per-bot mailbox path resolver. The daemon owns this; it's a
+/// closure-style trait so tests can substitute a tempdir-based
+/// implementation.
+pub trait MailboxResolver: Send + Sync {
+    /// Return `<project>/.ccteam/chat/<bot>/inbox/` for the given
+    /// (slug, role).
+    fn inbox_dir(&self, slug: &str, role: &str) -> Result<PathBuf>;
+}
+
+/// Default resolver: rooted at `<projects_root>/<slug>/.ccteam/chat/<role>/inbox/`.
+/// `projects_root` is normally `~/projects` (production) but tests
+/// pass an override via [`Self::with_projects_root`].
+pub struct DefaultMailboxResolver {
+    projects_root: PathBuf,
+}
+
+impl DefaultMailboxResolver {
+    /// Build pointing at `~/projects` (or `/` if HOME is unset).
+    pub fn new() -> Self {
+        let projects_root = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("/"))
+            .join("projects");
+        Self { projects_root }
+    }
+
+    /// Build pointing at an explicit projects root (tests).
+    pub fn with_projects_root(projects_root: impl Into<PathBuf>) -> Self {
+        Self {
+            projects_root: projects_root.into(),
+        }
+    }
+}
+
+impl Default for DefaultMailboxResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MailboxResolver for DefaultMailboxResolver {
+    fn inbox_dir(&self, slug: &str, role: &str) -> Result<PathBuf> {
+        Ok(self
+            .projects_root
+            .join(slug)
+            .join(".ccteam")
+            .join("chat")
+            .join(role)
+            .join("inbox"))
+    }
+}
+
+/// Process one inbound IM event end-to-end.
+pub async fn process_inbound(
+    msg: &ChannelMessage,
+    sec: &Arc<Mutex<ThreeLayerSec>>,
+    handles: &HandleMap,
+    mailbox: &dyn MailboxResolver,
+    hop: u8,
+    seq: u64,
+) -> Result<InboundOutcome> {
+    // Layer 1 + 2 + 3 (ACL → rate limit → sanitize).
+    let outcome = {
+        let mut s = sec.lock().await;
+        s.evaluate(&msg.channel, &msg.sender, &msg.content)
+    };
+    let payload = match outcome {
+        SecOutcome::Accept { payload } => payload,
+        SecOutcome::AclDenied => {
+            return Ok(InboundOutcome::Rejected {
+                layer: "acl".into(),
+            })
+        }
+        SecOutcome::RateLimited => {
+            return Ok(InboundOutcome::Rejected {
+                layer: "rate_limit".into(),
+            })
+        }
+        SecOutcome::BadSignature(reason) => {
+            return Ok(InboundOutcome::Rejected {
+                layer: format!("signature:{reason}"),
+            })
+        }
+        SecOutcome::EmptyAfterSanitize => {
+            return Ok(InboundOutcome::Rejected {
+                layer: "sanitize_empty".into(),
+            })
+        }
+    };
+
+    let route = router::route(&payload, handles, hop);
+    match route {
+        Route::Drop { reason } => Ok(InboundOutcome::Dropped { reason }),
+        Route::Admin { verb_and_args } => {
+            tracing::info!(verb = %verb_and_args, "admin command parsed: {:?}", nl_admin::parse(&verb_and_args));
+            Ok(InboundOutcome::Admin { verb_and_args })
+        }
+        Route::Bot {
+            slug,
+            role,
+            payload: stripped,
+        } => {
+            let dir = mailbox.inbox_dir(&slug, &role)?;
+            fs::create_dir_all(&dir)
+                .with_context(|| format!("mkdir -p {}", dir.display()))?;
+            let ts = Utc::now().format("%Y%m%dT%H%M%S").to_string();
+            let path = dir.join(format!("msg-{ts}-{seq:03}.md"));
+            let env = InboxEnvelope {
+                platform: msg.channel.clone(),
+                sender: msg.sender.clone(),
+                hop,
+                received_at: Utc::now(),
+                reply_target: msg.reply_target.clone(),
+                payload: stripped.clone(),
+                message_id: msg.id.clone(),
+            };
+            let body = render_envelope(&env);
+            fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
+            tracing::debug!(slug, role, path = %path.display(), "dropped mailbox envelope");
+            Ok(InboundOutcome::DroppedToBot { slug, role, path })
+        }
+    }
+}
+
+/// Render a human-readable + machine-parseable Markdown envelope.
+/// Front-matter YAML header carries the structured metadata; body is
+/// the sanitized payload.
+fn render_envelope(env: &InboxEnvelope) -> String {
+    let yaml = serde_yaml::to_string(env).unwrap_or_default();
+    format!("---\n{yaml}---\n\n{}\n", env.payload)
+}
+
+/// Parse an envelope back out (round-trip helper for tests + the
+/// outbound echo-suppression module).
+pub fn parse_envelope(text: &str) -> Result<InboxEnvelope> {
+    let body = text
+        .strip_prefix("---\n")
+        .ok_or_else(|| anyhow::anyhow!("missing front-matter prefix"))?;
+    let end = body
+        .find("\n---\n")
+        .ok_or_else(|| anyhow::anyhow!("missing front-matter terminator"))?;
+    let yaml = &body[..end];
+    let env: InboxEnvelope = serde_yaml::from_str(yaml).context("parse front-matter")?;
+    Ok(env)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::acl::AclPolicy;
+    use tempfile::TempDir;
+
+    fn sample_msg(platform: &str, content: &str) -> ChannelMessage {
+        ChannelMessage {
+            id: "x".into(),
+            sender: "alice".into(),
+            reply_target: "alice".into(),
+            content: content.into(),
+            channel: platform.into(),
+            timestamp: 0,
+            thread_ts: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn drops_when_no_mention() {
+        let sec = Arc::new(Mutex::new(ThreeLayerSec::new(AclPolicy::default())));
+        let tmp = TempDir::new().unwrap();
+        let mailbox = DefaultMailboxResolver::with_projects_root(tmp.path());
+        let res = process_inbound(
+            &sample_msg("telegram", "hello world"),
+            &sec,
+            &HandleMap::new(),
+            &mailbox,
+            0,
+            1,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(res, InboundOutcome::Dropped { .. }));
+    }
+
+    #[tokio::test]
+    async fn drops_envelope_to_mailbox() {
+        let sec = Arc::new(Mutex::new(ThreeLayerSec::new(AclPolicy::default())));
+        let tmp = TempDir::new().unwrap();
+        let mailbox = DefaultMailboxResolver::with_projects_root(tmp.path());
+        let mut handles = HandleMap::new();
+        handles.insert("lead", "dev-foo", "lead");
+        let res = process_inbound(
+            &sample_msg("telegram", "@lead please plan"),
+            &sec,
+            &handles,
+            &mailbox,
+            0,
+            7,
+        )
+        .await
+        .unwrap();
+        match res {
+            InboundOutcome::DroppedToBot { slug, role, path } => {
+                assert_eq!(slug, "dev-foo");
+                assert_eq!(role, "lead");
+                assert!(path.exists());
+                let body = fs::read_to_string(&path).unwrap();
+                let env = parse_envelope(&body).unwrap();
+                assert_eq!(env.payload, "please plan");
+                assert_eq!(env.platform, "telegram");
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_route_short_circuits() {
+        let sec = Arc::new(Mutex::new(ThreeLayerSec::new(AclPolicy::default())));
+        let tmp = TempDir::new().unwrap();
+        let mailbox = DefaultMailboxResolver::with_projects_root(tmp.path());
+        let res = process_inbound(
+            &sample_msg("telegram", "@ccteam status"),
+            &sec,
+            &HandleMap::new(),
+            &mailbox,
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+        match res {
+            InboundOutcome::Admin { verb_and_args } => assert_eq!(verb_and_args, "status"),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_limit_layer_rejects() {
+        let sec = Arc::new(Mutex::new(ThreeLayerSec {
+            acl: AclPolicy::default(),
+            rate: crate::rate_limit::RateLimiter::new(1, std::time::Duration::from_secs(60)),
+        }));
+        let tmp = TempDir::new().unwrap();
+        let mailbox = DefaultMailboxResolver::with_projects_root(tmp.path());
+        let mut handles = HandleMap::new();
+        handles.insert("lead", "dev-foo", "lead");
+        let m = sample_msg("telegram", "@lead one");
+        let _ = process_inbound(&m, &sec, &handles, &mailbox, 0, 1).await.unwrap();
+        let res = process_inbound(&m, &sec, &handles, &mailbox, 0, 2).await.unwrap();
+        match res {
+            InboundOutcome::Rejected { layer } => assert_eq!(layer, "rate_limit"),
+            other => panic!("got {other:?}"),
+        }
+    }
+}
