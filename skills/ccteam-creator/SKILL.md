@@ -213,9 +213,13 @@ The pool is the scientist-nickname list in
 ## 5.6  Register the bot
 
 For chat presets, call `ccteam_imd::register_bot(slug, persona_id,
-vendor, im_platform)` → `BotRegistration`. Embed the returned
-`bot_handle` into the rendered `workflow.yaml` (the
-`chat.bot_name` field).
+vendor, im_platform, im_chat_id)` → `Result<PathBuf>`. `im_chat_id`
+comes from the `TelegramCredentials::owner_chat_id()` helper on the
+credential record persisted in 5.1. The `bot_handle` is **not**
+returned from this call — it's resolved by the daemon-side router
+from the rendered `workflow.yaml`'s `chat.bot_name` field at the
+next registry-watcher tick. Embed the minted handle (from 5.5) into
+the `chat.bot_name` slot of the YAML before writing it out in 5.3.
 
 ## 5.7  Project-level `.mcp.json`
 

@@ -14,7 +14,7 @@ fn round_trip_telegram_credentials() {
         telegram: Some(TelegramCredentials {
             bot_token: "12345:secret_token_value".into(),
             bot_username: "@helpful_assistant".into(),
-            owner_chat_id: 1234567890,
+            allowed_chat_ids: vec!["1234567890".into()],
         }),
     };
 

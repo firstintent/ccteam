@@ -1,94 +1,107 @@
 //! V0.6.0 Wave 2 F114 — `register_bot()` API consumed by
 //! `ccteam-creator` Phase 5.
 //!
-//! Returns a [`BotRegistration`] handle that captures the
-//! `(workflow_slug, role, vendor, im_platform, bot_handle)` quintuple
-//! the daemon needs to wire the IM bridge to the spawned session. The
-//! current Wave 2 implementation is a thin facade over
-//! [`crate::credentials`] — the actual bridge wire-up (long-poll loop,
-//! webhook receiver, etc.) is being landed by the `imd` teammate in
-//! parallel under the same crate.
+//! **Signature aligned with the in-flight imd-teammate branch
+//! (`v0-6-0-wave-2-imd`)** so the two waves' commits merge without an
+//! API rewrite. The shape is:
 //!
-//! ## Signature stability
+//! ```ignore
+//! pub fn register_bot(
+//!     workflow_slug: &str,
+//!     role: &str,
+//!     vendor: AgentVendor,
+//!     im_platform: &str,    // "telegram" | "slack" | "discord" | "mock"
+//!     im_chat_id: &str,     // platform-specific id captured by onboarding
+//! ) -> Result<PathBuf>      // registry file path
+//! ```
 //!
-//! Locked across V0.6.x. Future variants (Slack, Discord, multi-bot
-//! per workflow) extend [`BotRegistration`] rather than changing the
-//! call shape so `ccteam-creator` does not need to track this crate's
-//! point releases.
+//! The Wave-2 imd branch ships the full registry-on-disk
+//! implementation (`~/.ccteam/im/registrations/<slug>__<role>.json`)
+//! plus `unregister_bot` + `list_bots`. This stub returns the path it
+//! *would* have written but does not persist — sufficient for the
+//! ccteam-creator skill to compile + test against the locked
+//! signature before the two branches merge.
+
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::credentials::{load_credentials, ImPlatform};
+use crate::credentials::ImPlatform;
 
-/// Vendor of the underlying agent runtime — same shape as the
-/// `ccteam-core::harness::AgentVendor` enum but kept independent here
-/// so this crate doesn't pull in ccteam-core as a dep.
+/// Vendor of the underlying agent runtime. Mirrors
+/// `ccteam-core::harness::AgentVendor` shape; duplicated here so this
+/// crate doesn't depend on ccteam-core (which would create a workspace
+/// cycle).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum BotVendor {
+pub enum AgentVendor {
     Claude,
     Codex,
 }
 
-/// Result of [`register_bot`]. Embedded in the rendered
-/// `workflow.yaml` (`chat.bot_name`) and surfaced to the user in the
-/// "好了,在 TG 找 @xxx 私聊试试" reply.
+/// On-disk shape of a single bot registration entry. Persisted as
+/// JSON under `~/.ccteam/im/registrations/<slug>__<role>.json` by
+/// imd's daemon-side writer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BotRegistration {
     pub workflow_slug: String,
     pub role: String,
-    pub vendor: BotVendor,
-    pub im_platform: ImPlatform,
-    /// `@`-prefixed handle the user can address in their IM client.
-    pub bot_handle: String,
+    pub vendor: AgentVendor,
+    #[serde(default)]
+    pub persona_id: Option<String>,
+    /// `"telegram"` / `"slack"` / `"discord"` / `"mock"`. Stringly
+    /// typed at the registry boundary so adding new platforms doesn't
+    /// require a schema bump.
+    pub im_platform: String,
+    pub im_chat_id: String,
+    pub created_at: String,
 }
 
 /// Errors returned by [`register_bot`].
 #[derive(Debug, Error)]
 pub enum RegisterError {
-    #[error("no credentials found for platform {0:?} — run `/ccteam-im-setup` first")]
-    MissingCredentials(ImPlatform),
-    #[error("credentials store unreadable: {0}")]
-    CredentialsRead(#[source] anyhow::Error),
+    #[error("invalid im_platform `{0}` — expected telegram / slack / discord / mock")]
+    UnknownPlatform(String),
+    #[error("registry path resolution failed: {0}")]
+    Path(#[source] anyhow::Error),
 }
 
-/// Register a bot for `workflow_slug` / `role` against the IM
-/// platform whose credentials are already in
-/// `~/.ccteam/im/credentials.json`. Pure synchronous lookup — does
-/// **not** spin up the daemon-side bridge; the daemon picks the
-/// registration up from the rendered `workflow.yaml` at next reload.
+/// Register a bot for `workflow_slug` / `role` against an IM platform.
 ///
-/// `vendor` discriminates Claude vs Codex so future pricing /
-/// capability checks (Codex has no chat tools today) can be enforced
-/// here. Currently both vendors are accepted unconditionally.
+/// **Stub semantics**: returns the path the imd daemon's registry
+/// writer *would* persist to (`~/.ccteam/im/registrations/<slug>__<role>.json`)
+/// without actually creating the file. The full implementation lives
+/// in the imd-teammate branch (`v0-6-0-wave-2-imd`); when those two
+/// commits merge, this stub is replaced verbatim. The signature is
+/// frozen across the merge so the ccteam-creator skill compiles
+/// against either side without modification.
+///
+/// `im_chat_id` is the platform-specific identifier captured by
+/// [`crate::onboarding::telegram_setup`] (`TelegramCredentials::owner_chat_id`).
 pub fn register_bot(
     workflow_slug: &str,
     role: &str,
-    vendor: BotVendor,
-    im_platform: ImPlatform,
-) -> Result<BotRegistration, RegisterError> {
-    let creds = load_credentials().map_err(RegisterError::CredentialsRead)?;
-    let bot_handle = match im_platform {
-        ImPlatform::Telegram => creds
-            .telegram
-            .as_ref()
-            .map(|c| c.bot_username.clone())
-            .ok_or(RegisterError::MissingCredentials(ImPlatform::Telegram))?,
-        ImPlatform::Slack | ImPlatform::Discord => {
-            // V0.7: implement Slack / Discord credential lookup. For
-            // now treat as missing so ccteam-creator's user-facing
-            // error message is consistent.
-            return Err(RegisterError::MissingCredentials(im_platform));
-        }
+    vendor: AgentVendor,
+    im_platform: &str,
+    im_chat_id: &str,
+) -> Result<PathBuf, RegisterError> {
+    // Sanity-check the platform string against the known enum so
+    // typos surface here rather than at daemon-watcher time.
+    match im_platform {
+        "telegram" => Some(ImPlatform::Telegram),
+        "slack" => Some(ImPlatform::Slack),
+        "discord" => Some(ImPlatform::Discord),
+        "mock" => None, // accepted for tests; no ImPlatform mapping
+        other => return Err(RegisterError::UnknownPlatform(other.to_string())),
     };
-    Ok(BotRegistration {
-        workflow_slug: workflow_slug.into(),
-        role: role.into(),
-        vendor,
-        im_platform,
-        bot_handle,
-    })
+    let _ = (vendor, im_chat_id); // explicit-use to silence unused-arg lints
+    let base = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    Ok(base
+        .join(".ccteam")
+        .join("im")
+        .join("registrations")
+        .join(format!("{workflow_slug}__{role}.json")))
 }
 
 #[cfg(test)]
@@ -96,16 +109,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registration_serialises_round_trip() {
+    fn registration_round_trip() {
         let r = BotRegistration {
             workflow_slug: "my-bot".into(),
-            role: "helper".into(),
-            vendor: BotVendor::Claude,
-            im_platform: ImPlatform::Telegram,
-            bot_handle: "@helpful_assistant".into(),
+            role: "tech-helper".into(),
+            vendor: AgentVendor::Claude,
+            persona_id: Some("tech-helper".into()),
+            im_platform: "telegram".into(),
+            im_chat_id: "1234567890".into(),
+            created_at: "2026-05-19T10:00:00Z".into(),
         };
         let s = serde_json::to_string(&r).unwrap();
         let back: BotRegistration = serde_json::from_str(&s).unwrap();
         assert_eq!(r, back);
+    }
+
+    #[test]
+    fn register_bot_returns_path_under_registrations() {
+        let p = register_bot(
+            "demo",
+            "tech-helper",
+            AgentVendor::Claude,
+            "telegram",
+            "987",
+        )
+        .unwrap();
+        let s = p.to_string_lossy();
+        assert!(s.ends_with("registrations/demo__tech-helper.json"));
+    }
+
+    #[test]
+    fn register_bot_rejects_unknown_platform() {
+        let err = register_bot("demo", "r", AgentVendor::Claude, "fax", "x").unwrap_err();
+        assert!(matches!(err, RegisterError::UnknownPlatform(_)));
     }
 }

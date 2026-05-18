@@ -82,7 +82,7 @@ pub async fn telegram_setup_with_base(
     Ok(TelegramCredentials {
         bot_token: token.into(),
         bot_username,
-        owner_chat_id,
+        allowed_chat_ids: vec![owner_chat_id.to_string()],
     })
 }
 

@@ -46,16 +46,37 @@ impl ImPlatform {
 
 /// Telegram-specific credential record. Stored under the `telegram`
 /// key of [`Credentials`].
+///
+/// Schema is aligned with the in-flight imd-teammate branch
+/// (`v0-6-0-wave-2-imd`) so merging the two branches is a no-op
+/// rather than a struct-rename diff. Notably `allowed_chat_ids` is a
+/// `Vec<String>` (not a single `i64`) so the daemon-side router can
+/// extend the ACL without a schema migration when the user adds
+/// secondary recipients.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TelegramCredentials {
     /// Bot token from @BotFather (`<botid>:<hash>`).
     pub bot_token: String,
-    /// Bot handle returned by `getMe`, including leading `@`.
+    /// Bot handle returned by `getMe`, including leading `@`. Kept as
+    /// a convenience for the skill UX ("在 TG 找 @xxx") even though
+    /// imd's daemon path only reads `allowed_chat_ids` directly.
+    #[serde(default)]
     pub bot_username: String,
-    /// First captured chat_id from the long-poll `getUpdates` window.
-    /// Used as the default ACL entry for `chat-pocket.yaml` and as
-    /// the `owner` when sending unsolicited DMs.
-    pub owner_chat_id: i64,
+    /// chat_ids the bot is permitted to talk to. Index 0 is the first
+    /// captured chat_id from onboarding (the "owner" chat).
+    /// Stringly-typed because Slack / Discord chat ids are not always
+    /// numeric.
+    #[serde(default)]
+    pub allowed_chat_ids: Vec<String>,
+}
+
+impl TelegramCredentials {
+    /// Convenience accessor — the first chat_id captured during
+    /// onboarding, used as the "owner" everywhere unsolicited DMs are
+    /// sent. Returns `None` only on pathologically empty records.
+    pub fn owner_chat_id(&self) -> Option<&str> {
+        self.allowed_chat_ids.first().map(|s| s.as_str())
+    }
 }
 
 /// Top-level credentials document persisted to
@@ -148,7 +169,7 @@ mod tests {
             telegram: Some(TelegramCredentials {
                 bot_token: "123:abc".into(),
                 bot_username: "@helpful_assistant".into(),
-                owner_chat_id: 987,
+                allowed_chat_ids: vec!["987".into()],
             }),
         };
         let dir = tempfile::tempdir().unwrap();
@@ -156,6 +177,7 @@ mod tests {
         write_credentials_to(&p, &c).unwrap();
         let back = load_credentials_from(&p).unwrap();
         assert_eq!(c, back);
+        assert_eq!(c.telegram.as_ref().unwrap().owner_chat_id(), Some("987"));
     }
 
     #[cfg(unix)]

@@ -35,4 +35,4 @@ pub use credentials::{
     TelegramCredentials,
 };
 pub use onboarding::{telegram_setup, OnboardingError};
-pub use register::{register_bot, BotRegistration, RegisterError};
+pub use register::{register_bot, AgentVendor, BotRegistration, RegisterError};
