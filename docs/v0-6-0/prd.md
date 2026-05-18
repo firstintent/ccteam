@@ -407,81 +407,147 @@ pub struct UnifiedTokenUsage {
 
 ---
 
-### F108 — 模式 3 走 Agent SDK / `claude -p --resume` + JSON-mailbox-trigger(弃 tmux send-keys)
+### F108 — 模式 3 走 tmux 长跑 + `send-keys -l` 直送 + dual-track transcript polling(Wave 1 amendment)
+
+> **Amended 2026-05-19** by Wave 1 architect after `references/` 比对(ccgram + OMC)
+> + Claude Code 官方 hooks 文档化 + ccteam-imd supervisor 模式收敛。前版"Agent SDK / `claude
+> -p --resume` + stream-json + JSON-mailbox-trigger"路径在工程上跟用户面 UX 冲突
+> (用户输 slash 命令 `/compact /new /clear` 必须**透明透传**给 Claude TUI;`-p --resume`
+> 每 turn 都冷启 + 重 parse session jsonl,prompt cache 利用率差;mailbox-trigger 让
+> user content 走 Read 工具一跳,长链路 reasoning 多个 tool_use 步骤,turn cost 翻倍)。
+> Wave 1 落 `ClaudeTuiAdapter` STUB(`crates/ccteam-core/src/execution/claude_tui.rs`);
+> Wave 2 F108 填 impl。
 
 #### 痛点
 
-V0.6.0 PRD 上版 F108 用 tmux send-keys + session jsonl tail 实现模式 3:
-- input 面 send-keys 喂 TUI long-running `claude` — **未文档化**,cc-expert WebFetch 验全 6 篇 Claude Code 官方文档零命中
-- output 面 `~/.claude/projects/<...>/<sid>.jsonl` — **未文档化**(Anthropic 内部 logging 文件)
-- `/compact /new /clear` 副作用监听 — 无 stable contract
+V0.6.0 上版"PRD F108"(Agent SDK / `claude -p --resume` + stream-json)在试做时暴露 3 个
+工程不可控:
 
-3 方独立给出 **"路径错误,改 Agent SDK / `claude -p --resume`"** 建议:cc-expert WebFetch + architect "internal-not-API" + researcher OMC `tmux-comm.ts` mailbox-trigger 模式。
+1. **slash 命令不透传 = 用户面 UX 退化**:`-p` 模式 prompt 进 stdin pipe,用户在 IM 发
+   `/compact` 想触发 Claude 内置压缩走不通(`/compact` 是 TUI slash,`-p` 不识别)。
+2. **每 turn 冷启 + 重 parse session jsonl = prompt cache 失效**:`-p --resume <sid>` 每次
+   都重新加载 session(`~/.claude/projects/<...>/<sid>.jsonl`),turn 2 起 cache_read_tokens
+   应该 ≥80% 但实测<20%(reload 时 ephemeral cache 不命中)。
+3. **JSON-mailbox-trigger 让短消息 user content 走 Read 工具**= 多 1 个 tool_use step =
+   每 turn cost ~2x,且在 chat 模式下让 reasoning trace 充斥 file read 噪音。
 
-#### 需求
+ccgram(production验证)+ OMC(production验证)走的是**完全相反**的路径:tmux 长跑
++ `tmux send-keys -l` 直送 user content + 用 Claude Code 官方 hooks(`UserPromptSubmit`
+/ `Stop` / `SubagentStop` / `SessionStart` / `PostToolUse`)作 fast event 通道 + byte-offset
+增量读 `~/.claude/projects/<encoded-cwd>/<session_id>.jsonl` 镜像到 ccteam-owned
+`turns.jsonl`(R2 SoT)作 full content 通道。这是已经 production-verified 的 dual-track 模式。
 
-**A. 模式 3 input/output 平面切到 Anthropic 官方文档化路径**:
+#### 需求(改 — 落 tmux 长跑 + send-keys -l + dual-track)
+
+**A. input = `tmux send-keys -l <session> <user_content>` + Enter 直送**
+
+用户在 IM 发文本 → ccteam-imd 收到 → `tmux send-keys -l -- <user_content>` 直接送给
+Claude TUI(literal 模式,0 escape 雷区,ccgram + OMC production 验证)。
+
+- 文本 user content 全部走 send-keys -l(包括多行 code block / unicode emoji / 长消息)
+- attachment(图片 / 文件)走 mailbox 模式 `<.ccteam/im/<bot>/attachments/<file>` + 一句
+  send-keys "read the file I placed at <path>" 触发 Read tool
+- **slash 命令 `/compact` `/new` `/clear` 透明透传** — 用户 IM 发啥 ccteam-imd 都 send-keys
+  原样,不过滤;ccteam 通过 `SessionStart` hook 副作用观察 `chat_session_reset` 等事件并
+  emit 到 progress.jsonl
 
 ```
-input  = stdin pipe + `claude -p --resume <sid> --input-format stream-json`
-         (Anthropic Agent SDK + cli-reference 全文档化)
-output = stream-json events 流(stream_event / system/init / system/api_retry 全官方 schema)
+ccteam-imd recv "@helpful-bot /compact please"
+  ↓ tmux send-keys -l -t ccteam-chat-foo-helpful-bot -- "/compact please"
+  ↓ tmux send-keys -t ccteam-chat-foo-helpful-bot Enter
+  → Claude TUI 执行 /compact → SessionStart hook 触发 → ccteam-imd 写
+    `progress.jsonl::chat_session_reset { reason: "user-compact" }`
+  → bot 在 IM 回复"已压缩,我们继续"
 ```
 
-**B. JSON-mailbox-trigger 模式**(researcher R4#1,OMC `tmux-comm.ts` lift):
+**B. output dual-track**(借 ccgram pattern):
 
-stdin pipe 直接传 user content 仍有 quoting / escape 边界(尤其 multi-line / code block / unicode emoji)。借鉴 OMC:
+- **Track 1 — fast event(structured business events)**:Claude Code 官方 hooks
+  `UserPromptSubmit` / `Stop` / `SubagentStop` / `SessionStart` / `PostToolUse` 配上
+  ccteam 提供的处理器(`ccteam internal hook chat-progress <event>`)→ 写
+  `progress.jsonl` 业务事件(`chat_turn_started` / `chat_turn_completed` /
+  `chat_session_reset` / `chat_tool_use` / `chat_subagent_done` 等)。**已文档化**
+  (Claude Code 官方 hooks reference)+ **低延迟**(hook 在 turn boundary 立即 fire)。
 
-```
-1. ccteam-imd 收到 IM 消息:
-2. 写文件 <project>/.ccteam/im/<bot>/inbox/msg-<ts>-<seq>.md(完整 user content)
-3. stdin 给 claude 进程发短 trigger:"read mailbox: msg-<ts>-<seq>"
-4. claude 在 turn 内调内置 Read 工具读文件,**避免 stdin escape 雷区**
-```
+- **Track 2 — full content(conversation history mirror)**:byte-offset 增量读
+  `~/.claude/projects/<encoded-cwd>/<session_id>.jsonl`,cursor 文件
+  `<.ccteam/chat/<bot>/transcript-cursor.json` 记上次读到的字节偏移,每次只 read 增量,
+  parse `message` / `tool_use` / `tool_result` 行 → 镜像到 ccteam-owned
+  `<.ccteam/chat/<bot>/turns.jsonl`(schema = ccteam 控制,不依赖 Anthropic 内部格式):
 
-这样 user content 走文件传(0 escape 问题),trigger 走 stdin(短,确定性强)。**Fuzz test 范围缩小 90%**。
+  ```jsonl
+  {"turn_id":"...","ts":"...","role":"user","content":"...","vendor":"claude"}
+  {"turn_id":"...","ts":"...","role":"assistant","content":"...","usage":{...},"tool_calls":[...]}
+  ```
 
-**C. ccteam-owned `<project>/.ccteam/chat/<bot>/turns.jsonl` 作 conversation SoT**(architect A5#5):
+  ccteam-imd 拿 `turns.jsonl` 增量行 → `send_message` 回 IM。session-id 失效 / Anthropic
+  改 transcript 格式 → 从 `turns.jsonl` 重建 conversation(F118 详),**ccteam-owned SoT
+  让 R1/R2 红线在模式 3 真正站住**(architect A5#5)。
 
-不依赖 `~/.claude/projects/<...>/<sid>.jsonl`(Anthropic 内部)。ccteam 自己写一份 conversation 历史 jsonl,每 turn 一行:
+**C. ccteam-owned `<.ccteam/chat/<bot>/turns.jsonl>` 作 conversation SoT**
 
-```jsonl
-{"turn_id":"...","ts":"...","user":"...","assistant":"...","usage":{...},"tool_calls":[...],"vendor":"claude"}
-```
+同上 B Track 2。这是 R1/R2 红线在模式 3 的落地。
 
-session-id 失效 / Anthropic 改格式 / 磁盘 fsck 丢文件 → 从 `turns.jsonl` 重建 conversation(F118 详),**不再是失忆灾难**。
-
-**D. `ClaudeStreamJsonAdapter` impl `HarnessAdapter` trait**:
+**D. `ClaudeTuiAdapter` impl `HarnessAdapter` trait**(Wave 1 STUB landed):
 
 ```rust
-// crates/ccteam-core/src/execution/claude_stream_json.rs
-impl HarnessAdapter for ClaudeStreamJsonAdapter {
+// crates/ccteam-core/src/execution/claude_tui.rs (Wave 1 STUB; Wave 2 fills body)
+impl HarnessAdapter for ClaudeTuiAdapter {
+    fn name(&self) -> &'static str { "claude-tui" }
+    fn vendor(&self) -> AgentVendor { AgentVendor::Claude }
+
     async fn start_thread(&self, spec, ctx) -> Result<ThreadHandle> {
-        // spawn `claude -p --resume <sid?> --input-format stream-json --output-format stream-json`
-        // stdin pipe + stdout/stderr pipe
-        // 返回 SessionHandle { vendor: Claude, mode: Chat, identity: pid+sid }
+        let tmux_session = format!("ccteam-chat-{}-{}", ctx.slug, spec.role);
+        ensure_hooks_installed(&ctx.project_dir)?;   // 写 .claude/settings.json hook 段
+        tmux_new_session_detached(
+            &tmux_session, &ctx.cwd,
+            "claude --dangerously-skip-permissions"
+        ).await?;
+        Ok(ThreadHandle {
+            vendor: AgentVendor::Claude,
+            mode: ExecutionMode::Chat,
+            identity: tmux_session,
+            ..
+        })
     }
 
     async fn submit_turn(&self, h, input) -> Result<TurnId> {
-        let mailbox_path = write_to_mailbox(&h, &input)?;
-        let trigger = format!("read mailbox: {}", mailbox_path.file_name());
-        self.send_stdin_line(h, &trigger).await?;
-        Ok(TurnId::new())
+        match input {
+            TurnInput::UserText(s) => {
+                tmux_send_keys_literal(&h.identity, &s).await?;
+                tmux_send_keys_enter(&h.identity).await?;
+            }
+            TurnInput::Artifact(p) => {
+                let s = format!("Look at the file I just placed at {}", p.display());
+                tmux_send_keys_literal(&h.identity, &s).await?;
+                tmux_send_keys_enter(&h.identity).await?;
+            }
+            TurnInput::SystemDirective(d) => {
+                // slash 命令透明:用户发 `compact` 我们送 `/compact`
+                tmux_send_keys_literal(&h.identity, &format!("/{}", d)).await?;
+                tmux_send_keys_enter(&h.identity).await?;
+            }
+            ..
+        }
+        Ok(TurnId::new(generate_turn_id()))
     }
 
     fn events(&self, h) -> BoxStream<'static, ThreadEvent> {
-        // tail stdout stream-json events,翻译成 ThreadEvent
-        // 同时 append to <project>/.ccteam/chat/<bot>/turns.jsonl
+        // Wave 2 merge:track 1 (hooks → progress.jsonl tail) + track 2
+        // (transcript jsonl byte-offset polling → turns.jsonl mirror)
+        merge(progress_jsonl_tail(h), transcript_polling_tail(h))
     }
 
     async fn close_thread(&self, h) -> Result<()> {
-        self.send_stdin_eof(h).await?;
-        // 进程退出;session-id 写持久化 ~/.ccteam/im/<bot>/session-id
+        tmux_send_keys_literal(&h.identity, "/exit").await?;
+        tmux_send_keys_enter(&h.identity).await?;
+        sleep(500ms).await;
+        tmux_kill_session_if_exists(&h.identity).await
     }
 }
 ```
 
-#### `workflow.yaml mode: chat` schema(收紧版,藏字段)
+#### `workflow.yaml mode: chat` schema(收紧版,藏字段 — 不变)
 
 ```yaml
 version: 0.6
@@ -493,23 +559,25 @@ agents:
 
 所有 advanced 字段 `#[serde(default)]`;`ccteam-creator` skill 自动写,用户从不 vim。
 
-#### 文件清单
+#### 文件清单(Wave 2 — Wave 1 已 STUB land claude_tui.rs)
 
 | 文件 | 改动 |
 |---|---|
-| `crates/ccteam-core/src/execution/claude_stream_json.rs`(新)| ~400 行(替代上版 1100 行的 tmux_interactive.rs) |
-| `crates/ccteam-core/src/execution/mailbox.rs`(新)| JSON-mailbox-trigger 读写 |
-| `crates/ccteam-core/src/execution/turns_jsonl.rs`(新)| ccteam-owned chat history SoT |
+| `crates/ccteam-core/src/execution/claude_tui.rs`(Wave 1 STUB → Wave 2 填)| ~500 行 |
+| `crates/ccteam-core/src/execution/transcript_tail.rs`(新,Wave 2)| byte-offset incremental read transcript jsonl |
+| `crates/ccteam-core/src/execution/turns_mirror.rs`(新,Wave 2)| 写 ccteam-owned turns.jsonl SoT |
+| `crates/ccteam-core/src/execution/attachments.rs`(新,Wave 2)| 非文本附件 mailbox(图片 / 大文件)|
 | `crates/ccteam-core/src/workflow_schema.rs` | `mode: chat` schema 字段全 `serde(default)` 收紧 |
-| `crates/ccteam-core/src/progress_event.rs` | 加 4 chat_* event 类型(turn / reset / compact_done / hop_escalate)|
-| `crates/ccteam-core/tests/claude_stream_json_test.rs`(新)| 6 测试 |
+| `crates/ccteam-core/src/progress_event.rs` | 加 chat_* event 类型(turn_started / turn_completed / session_reset / hop_escalate)|
+| `crates/ccteam-hooks/src/chat_progress.rs`(新,Wave 2)| Claude Code hooks → progress.jsonl 业务事件桥接 |
+| `crates/ccteam-core/tests/claude_tui_test.rs`(新,Wave 2)| 6 测试 |
 
-#### 验收
+#### 验收(Wave 2)
 
 1. host probe:多轮 chat session,turn 2 起 prompt cache hit(transcript `cache_read_input_tokens > 0`)
-2. `/compact` 触发后,后续 turn input_tokens 显著下降 < 前 turn 1/3
+2. `/compact` 透明透传 + `SessionStart` hook 副作用 emit `chat_session_reset`,后续 turn input_tokens 显著下降 < 前 turn 1/3
 3. session-id 失效 mock test:删 Anthropic `~/.claude/projects/...` → 从 `turns.jsonl` 重建 conversation,无丢失
-4. JSON-mailbox-trigger:200 sample unicode / emoji / multi-line / code-block input,0 pane corruption / 0 escape error
+4. send-keys -l 直送:200 sample unicode / emoji / multi-line / code-block input,0 pane corruption / 0 escape error
 5. `cargo test`: baseline +6 通过
 
 #### 不在范围
@@ -563,12 +631,38 @@ crates/ccteam-imd/
 
 两 path 互斥(避免同 bot token 双重 webhook 竞争);切换走 onboarding skill 状态文件 `~/.ccteam/im/transport.toml`。
 
-**D. bot-to-bot @ routing + hop_limit**(IM Squad 完整体验)
+**D. bot-to-bot @ routing + hop_limit — 100% 走 IM group**(IM Squad 完整体验,Wave 1 amendment)
+
+> **Amended 2026-05-19**:bot-to-bot 路由**不走 cross-tmux IPC / FleetView
+> SendMessage** — SendMessage 是 Claude Code in-proc 限定的 teammate-comms API,
+> 跨 tmux session(每 bot 一个 detached `claude` TUI 进程)物理上不工作。100%
+> 通过 IM group message 链路。IM history 即完整对话链,无 hidden channel,user
+> 可见每一步,debug 时直接翻 TG 群消息记录。
 
 借 Codex `AgentPath` 模式(researcher R11.A,codex-expert CX6#1):
-- 每 bot turn 启动时获得 path(`/root/turn-1`)
-- bot 输出 `@critic_bot` → router 解析 → 给 critic 新 turn,path = `/root/turn-1/turn-2`
-- path depth ≥ `hop_limit`(默认 3,workflow.yaml `agents.<role>.hop_limit` 可覆盖)→ escalate 给 user("该话题 bot 间已链 3 轮,请人工介入"+ TG 自动 @ user)
+
+```
+user 在 TG 群 @helpful_bot:"review my plan"
+  ↓ ccteam-imd 收到 group msg @helpful_bot,path = /root/turn-1
+  ↓ tmux send-keys -l → helpful_bot TUI
+  → helpful_bot 输出 "@critic_bot please review my plan: <text>"
+  ↓ ccteam-imd 解析 transcript 中的 @critic_bot mention
+  → ccteam-imd 在 TG 群里发消息 "@critic_bot please review my plan: <text>"
+    (来源标 helpful_bot,path = /root/turn-1/turn-2)
+  ↓ ccteam-imd 收到 group msg @critic_bot,tmux send-keys -l → critic_bot TUI
+  → critic_bot 回 "Looks good but..."
+  ↓ ccteam-imd 发回 TG 群(来源标 critic_bot)
+  → user 看见完整对话链(@helpful_bot → @critic_bot → 回 user)
+```
+
+- 每条 bot output IM 消息都带 path header(`X-Ccteam-Path: /root/turn-1/turn-2`,
+  group 显示时藏起来,debug 时用 `ccteam-control show-trail` 看)
+- path depth ≥ `hop_limit`(默认 3,workflow.yaml `agents.<role>.hop_limit` 可覆盖)
+  → ccteam-imd 在群里发 "⚠️ bot 间已链 3 轮,@<user> 请人工介入(链路:
+  `/root/turn-1/turn-2/turn-3`)" + 不再 forward 给下一 bot
+- bot 间通信走 IM = ccteam-imd 一处实现 routing / hop_limit / NL admin,**不需要**
+  cross-tmux IPC mechanism(避免发明 `~/.ccteam/im/<bot>/inbox/` 文件通道 + 自造
+  消息序号 + 自造去重 — 全部 IM 平台已经做完了)
 
 #### 文件清单
 

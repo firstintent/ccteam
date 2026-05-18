@@ -1746,8 +1746,8 @@ pub fn run_resume(paths: &CcteamPaths, slug: &str) -> Result<()> {
 /// still uses tmux + `codex` CLI.
 pub fn run_session_add(slug: &str, harness: ccteam_core::HarnessKind, role: String) -> Result<()> {
     use ccteam_core::{
-        harness_sid_prefix, ClaudeCodeAdapter, CodexAdapter, HarnessAdapter, HarnessKind,
-        SessionRecord, SpawnOpts, TeamKind,
+        harness_sid_prefix, AgentSpecBrief, ClaudeBgAdapter, CodexExecAdapter, HarnessAdapter,
+        HarnessKind, SessionHandle, SessionRecord, SpawnCtx, TeamKind,
     };
 
     let paths = CcteamPaths::from_env()?;
@@ -1765,38 +1765,50 @@ pub fn run_session_add(slug: &str, harness: ccteam_core::HarnessKind, role: Stri
     std::fs::create_dir_all(session_dir.join("outbox"))
         .with_context(|| format!("create {}", session_dir.join("outbox").display()))?;
 
-    // Adapter dispatch — every harness shares the SpawnOpts schema so
-    // the call sites differ only in which `Adapter::new()` runs. V0.4.0
-    // F61 routes the claude branch to `claude --bg` (capturing job_id);
-    // V0.4.0 F62 keeps the codex branch on tmux.
-    let handle = match harness {
-        HarnessKind::Claude => {
-            let adapter = ClaudeCodeAdapter::new();
-            adapter
-                .spawn_session(SpawnOpts {
-                    harness: adapter.name(),
-                    slug: slug.to_string(),
-                    sid: sid.clone(),
-                    cwd: session_dir.clone(),
-                    role: role.clone(),
-                    extra_args: Vec::new(),
-                })
-                .map_err(|err| anyhow::anyhow!("{err}"))?
-        }
-        HarnessKind::Codex => {
-            let adapter = CodexAdapter::new();
-            adapter
-                .spawn_session(SpawnOpts {
-                    harness: adapter.name(),
-                    slug: slug.to_string(),
-                    sid: sid.clone(),
-                    cwd: session_dir.clone(),
-                    role: String::new(),
-                    extra_args: Vec::new(),
-                })
-                .map_err(|err| anyhow::anyhow!("{err}"))?
-        }
+    // V0.6.0 F107 — adapter dispatch goes through the new 5-method
+    // HarnessAdapter trait. We need a tokio runtime to drive
+    // `start_thread().await`; `run_session_add` is sync CLI surface
+    // so we spin up a current_thread runtime locally rather than
+    // making the whole CLI async.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime for start_thread")?;
+
+    let brief = AgentSpecBrief {
+        role: match harness {
+            HarnessKind::Claude => role.clone(),
+            // Codex has no role surface yet (V0.4.0 F62); pass empty.
+            HarnessKind::Codex => String::new(),
+        },
     };
+    let ctx = SpawnCtx {
+        slug: slug.to_string(),
+        sid: sid.clone(),
+        cwd: session_dir.clone(),
+        project_dir: paths.project_dir(slug),
+        extra_args: Vec::new(),
+    };
+
+    let thread_handle = runtime.block_on(async {
+        match harness {
+            HarnessKind::Claude => {
+                let adapter = ClaudeBgAdapter::new();
+                adapter
+                    .start_thread(&brief, &ctx)
+                    .await
+                    .map_err(|err| anyhow::anyhow!("{err}"))
+            }
+            HarnessKind::Codex => {
+                let adapter = CodexExecAdapter::new();
+                adapter
+                    .start_thread(&brief, &ctx)
+                    .await
+                    .map_err(|err| anyhow::anyhow!("{err}"))
+            }
+        }
+    })?;
+    let handle = SessionHandle::from_thread_handle(&thread_handle, &sid);
 
     let was_empty = state.sessions.is_empty();
     if was_empty {
@@ -1882,7 +1894,10 @@ pub fn run_session_attach(slug: &str, sid: &str) -> Result<()> {
 /// Gracefully shut down one registered flex session and scrub it from
 /// `state.json::sessions[]`.
 pub fn run_session_rm(slug: &str, sid: &str) -> Result<()> {
-    use ccteam_core::{ClaudeCodeAdapter, CodexAdapter, HarnessAdapter, SessionHandle};
+    use ccteam_core::{
+        AgentVendor, ClaudeBgAdapter, CodexExecAdapter, ExecutionMode, HarnessAdapter,
+        ThreadHandle,
+    };
 
     let paths = CcteamPaths::from_env()?;
     let state_path = paths.project_state(slug);
@@ -1897,22 +1912,53 @@ pub fn run_session_rm(slug: &str, sid: &str) -> Result<()> {
             available_sids(&state)
         )
     })?;
-    let handle = SessionHandle {
-        tmux_session: record.tmux_session.clone(),
-        harness: ccteam_core::harness_sid_prefix(record.harness).into(),
-        sid: sid.to_string(),
-        job_id: record.job_id.clone(),
-        pid: record.pid,
-        started_at: record.started_at,
+
+    // V0.6.0 F107 — close_thread goes through the new trait.
+    // Reconstitute a ThreadHandle from the persisted SessionRecord
+    // shape so the adapter has everything it needs (identity =
+    // job_id for bg / tmux_session for codex; raw_extras carry the
+    // tmux_session + pid).
+    let (vendor, mode, identity) = match record.harness {
+        ccteam_core::HarnessKind::Claude => (
+            AgentVendor::Claude,
+            ExecutionMode::Bg,
+            record.job_id.clone().unwrap_or_default(),
+        ),
+        ccteam_core::HarnessKind::Codex => (
+            AgentVendor::Codex,
+            ExecutionMode::Bg,
+            record.tmux_session.clone(),
+        ),
     };
-    match record.harness {
-        ccteam_core::HarnessKind::Claude => ClaudeCodeAdapter::new()
-            .shutdown_session(&handle)
-            .map_err(|err| anyhow::anyhow!("{err}"))?,
-        ccteam_core::HarnessKind::Codex => CodexAdapter::new()
-            .shutdown_session(&handle)
-            .map_err(|err| anyhow::anyhow!("{err}"))?,
+    let mut extras = serde_json::json!({"tmux_session": record.tmux_session.clone()});
+    if let Some(pid) = record.pid {
+        extras["pid"] = serde_json::json!(pid);
     }
+    let thread_handle = ThreadHandle {
+        vendor,
+        mode,
+        identity,
+        started_at: record.started_at,
+        raw_extras: extras,
+    };
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime for close_thread")?;
+
+    runtime.block_on(async {
+        match record.harness {
+            ccteam_core::HarnessKind::Claude => ClaudeBgAdapter::new()
+                .close_thread(&thread_handle)
+                .await
+                .map_err(|err| anyhow::anyhow!("{err}")),
+            ccteam_core::HarnessKind::Codex => CodexExecAdapter::new()
+                .close_thread(&thread_handle)
+                .await
+                .map_err(|err| anyhow::anyhow!("{err}")),
+        }
+    })?;
     state.sessions.remove(sid);
     state.save(&state_path)?;
     println!("removed session {sid} from {slug}");

@@ -284,9 +284,9 @@ ccteam/
 
 | 决策 | 上版选 | 本版改 | 理由 |
 |---|---|---|---|
-| 模式 3 execution runtime | tmux send-keys(A)| **Agent SDK / `claude -p --resume` + stream-json(B)** | cc-expert WebFetch 验证 session jsonl 路径 0 文档化;architect "internal-not-API";researcher OMC mailbox-trigger 模式更稳 |
-| 模式 3 input 面 | send-keys | **stream-json stdin pipe + JSON-mailbox-trigger 组合** | send-keys 仅传短 trigger("read your mailbox"),内容写 mailbox 文件;0 escape 雷区 |
-| 模式 3 output 面 | parse session jsonl(Anthropic internal)| **stream-json 官方 schema + ccteam-owned `turns.jsonl`** | A5 architect:ccteam-owned SoT 让 R1/R2 红线在模式 3 真正站住 |
+| 模式 3 execution runtime(Wave 1 amendment 2026-05-19)| Agent SDK / `claude -p --resume` + stream-json(B)| **tmux 长跑 + send-keys -l 直送 user content + dual-track(Claude Code 官方 hooks 快 event + transcript jsonl byte-offset 增量读 → 镜像 ccteam-owned turns.jsonl)+ slash 命令透明透传(C)** | 综合 ccgram + OMC 已 production 验证;`-p --resume` 每 turn 冷启 prompt cache 失效 + slash 命令不透传(用户面 UX 退化)+ mailbox-trigger 让短文本走 Read tool 增加 turn cost;tmux 长跑 + send-keys -l 直送是双方共识 + Claude Code hooks 官方文档化 fast event 通道 |
+| 模式 3 input 面 | stream-json stdin pipe + JSON-mailbox-trigger | **`tmux send-keys -l` 直送 user content + Enter(text);`/compact /new /clear` 透明透传;附件走 attachments dir + send-keys "read file at ..."** | send-keys -l literal 模式 0 escape 雷区(ccgram + OMC 验证);slash 透传保用户面 UX 一致;attachment 仅在非文本场景用 |
+| 模式 3 output 面 | stream-json 官方 schema + ccteam-owned turns.jsonl | **Claude Code 官方 hooks(UserPromptSubmit / Stop / SubagentStop / SessionStart / PostToolUse)作 fast event 通道 + byte-offset 增量读 transcript jsonl → 镜像 ccteam-owned `turns.jsonl`(R2 SoT)** | hooks 已文档化 + 低延迟 turn boundary;transcript polling 拿 full content;ccteam-owned `turns.jsonl` 让 R1/R2 红线在模式 3 站住(F118 重建从 turns.jsonl 读) |
 | MCP namespace rename | breaking `ccteam` → `ct` | **取消;保 `ccteam` namespace,只加子前缀** | PM + cc-expert + codex-expert 共识 + 用户低门槛 override:rename 用户净损失 |
 | F109 IM bridge 自造 | tokio task + `tgbot` crate | **统一 `openhuman/channels` Rust crate(全 14+ IM 含 Telegram);`claude-plugins-official/telegram` 作 backup transport** | 用户 directive:不造轮子;统一 transport 一处实现 bot-to-bot routing;V0.7 国内 IM 零代码启用 |
 | Codex 集成深度 | Option A(模式 2 only)| **Option B(完整:trait + 2 adapter + 双 pricing + 4 用户场景)** | 用户拍板;不集成 V0.6.0 ship 后被定义为"只支持 Claude 的小众工具"(researcher R9 表)|

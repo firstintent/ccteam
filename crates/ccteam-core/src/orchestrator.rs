@@ -32,7 +32,10 @@ use tokio::task::JoinSet;
 
 use crate::artifact_watcher::{ArtifactEvent, ArtifactWatcher};
 use crate::daemon;
-use crate::harness::{ClaudeCodeAdapter, CodexAdapter, HarnessAdapter, SessionHandle, SpawnOpts};
+use crate::execution::{ClaudeBgAdapter, CodexExecAdapter};
+use crate::harness::{
+    AgentSpecBrief, HarnessAdapter, SessionHandle, SpawnCtx, ThreadEvent, UnifiedTokenUsage,
+};
 use crate::inbox::{InboxMessage, SessionMailbox};
 use crate::paths::CcteamPaths;
 use crate::progress;
@@ -43,6 +46,15 @@ use crate::workflow_watcher::{WorkflowFileEvent, WorkflowFileWatcher};
 /// Hard cap on concurrent project sessions (excluding the meta-agent).
 pub const MAX_CONCURRENT_PROJECTS: usize = 3;
 
+/// V0.6.0 F107 — placeholder cost-from-usage estimator. Cost-crater
+/// teammate will replace this with `ccteam_cost::estimate_cost(&usage,
+/// vendor, model) -> f64`. Wave 1 returns 0 because the active
+/// agent_done driver is still the F80 `claude_job::probe_job` poller
+/// which reads `cost_usd` from `state.json` directly.
+fn usage_to_cost_placeholder(_usage: &UnifiedTokenUsage) -> f64 {
+    0.0
+}
+
 /// Production model id; `[1m]` opts in to Claude Code's 1M context.
 pub const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-4-6[1m]";
 
@@ -51,7 +63,7 @@ pub const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-4-6[1m]";
 /// sessions are never killed.
 pub const DEFAULT_BUDGET_LIMIT_USD: f64 = 200.0;
 
-/// Consecutive `spawn_session` failures (per role) before meta-agent
+/// Consecutive `start_thread` failures (per role) before meta-agent
 /// escalation. CLAUDE.md §三 fix-loop 3-strike rule.
 pub const MAX_CONSECUTIVE_SPAWN_FAILURES: u32 = 3;
 
@@ -536,8 +548,8 @@ impl Orchestrator {
     pub fn new(paths: CcteamPaths, config: OrchestratorConfig) -> Result<Self> {
         let mut adapters: HashMap<&'static str, Arc<dyn HarnessAdapter + Send + Sync>> =
             HashMap::new();
-        adapters.insert("claude", Arc::new(ClaudeCodeAdapter::new()));
-        adapters.insert("codex", Arc::new(CodexAdapter::new()));
+        adapters.insert("claude", Arc::new(ClaudeBgAdapter::new()));
+        adapters.insert("codex", Arc::new(CodexExecAdapter::new()));
         Ok(Self {
             paths,
             config,
@@ -1534,15 +1546,20 @@ impl Orchestrator {
 
         let sid = format!("{}-{}", role, self.next_role_seq().await);
         let kick = prompt.unwrap_or_else(|| Self::DEFAULT_KICK_PROMPT.to_string());
-        let opts = SpawnOpts {
-            harness: match agent.executor {
-                Executor::Claude => "claude-code",
-                Executor::Codex => "codex",
-            },
+        // V0.6.0 F107 — orchestrator now drives the new
+        // HarnessAdapter trait (5-method thread/turn shape). Build a
+        // SpawnCtx + AgentSpecBrief, call start_thread().await, then
+        // translate ThreadHandle → SessionHandle for the in-memory
+        // running map + state.json registry (which still expect the
+        // V0.4.0 shape — zero behaviour change downstream).
+        let brief = AgentSpecBrief {
+            role: role.to_string(),
+        };
+        let ctx = SpawnCtx {
             slug: slug.to_string(),
             sid: sid.clone(),
             cwd: project_dir.to_path_buf(),
-            role: role.to_string(),
+            project_dir: project_dir.to_path_buf(),
             extra_args: vec![kick],
         };
 
@@ -1571,8 +1588,9 @@ impl Orchestrator {
             return Ok(());
         }
 
-        match adapter.spawn_session(opts) {
-            Ok(handle) => {
+        match adapter.start_thread(&brief, &ctx).await {
+            Ok(thread_handle) => {
+                let handle = SessionHandle::from_thread_handle(&thread_handle, &sid);
                 running
                     .entry(role.to_string())
                     .or_default()
@@ -1604,10 +1622,72 @@ impl Orchestrator {
             }
             Err(err) => {
                 drop(running);
-                tracing::warn!(role, ?err, "spawn_session failed");
+                tracing::warn!(role, ?err, "start_thread failed");
                 self.bump_fail_count(slug, role, progress_path).await?;
                 Ok(())
             }
+        }
+    }
+
+    /// V0.6.0 F107 — translate a [`ThreadEvent`] into a `progress.jsonl`
+    /// business event. Wave 1 helper used by future adapters whose
+    /// `events()` stream is non-empty (Wave 2 / Wave 3); the legacy F80
+    /// `claude_job::probe_job` poller in [`Self::poll_completions`] is
+    /// the active driver during Wave 1 (zero behaviour change vs.
+    /// V0.5.1).
+    ///
+    /// Translation rules (R2 SoT — never delete `progress.jsonl`
+    /// write path):
+    ///
+    /// - [`ThreadEvent::ThreadStarted`] → noop (`agent_spawn` is
+    ///   written by `try_spawn` immediately after `start_thread`).
+    /// - [`ThreadEvent::TurnCompleted`] → `agent_done` with
+    ///   `status="completed"` + `cost_usd = usage_to_cost(usage,
+    ///   vendor)`.
+    /// - [`ThreadEvent::TurnFailed`] / [`ThreadEvent::Error`] →
+    ///   `agent_done` with `status="errored"` + `error=err.message`.
+    /// - `Item*` → Wave 1 noop (Wave 2 will surface `chat_*` event
+    ///   types).
+    #[allow(dead_code)] // Wave 2 / Wave 3 will activate this driver.
+    pub(crate) fn translate_thread_event(
+        evt: &ThreadEvent,
+        role: &str,
+        sid: &str,
+        slug: &str,
+    ) -> Option<serde_json::Value> {
+        match evt {
+            ThreadEvent::ThreadStarted { .. } => None,
+            ThreadEvent::TurnCompleted { usage, .. } => Some(json!({
+                "event": "agent_done",
+                "role": role,
+                "session_id": sid,
+                "status": "completed",
+                "cost_usd": usage_to_cost_placeholder(usage),
+                "slug": slug,
+                "ts": Utc::now().to_rfc3339(),
+            })),
+            ThreadEvent::TurnFailed { err, .. } => Some(json!({
+                "event": "agent_done",
+                "role": role,
+                "session_id": sid,
+                "status": "errored",
+                "error": err.message,
+                "slug": slug,
+                "ts": Utc::now().to_rfc3339(),
+            })),
+            ThreadEvent::Error(err) => Some(json!({
+                "event": "agent_done",
+                "role": role,
+                "session_id": sid,
+                "status": "errored",
+                "error": err.message,
+                "slug": slug,
+                "ts": Utc::now().to_rfc3339(),
+            })),
+            ThreadEvent::TurnStarted { .. }
+            | ThreadEvent::ItemStarted { .. }
+            | ThreadEvent::ItemUpdated { .. }
+            | ThreadEvent::ItemCompleted { .. } => None,
         }
     }
 

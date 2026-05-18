@@ -25,6 +25,9 @@ pub mod config;
 pub mod cost;
 pub mod daemon;
 pub mod harness;
+// V0.6.0 F107 — adapter implementations behind the new HarnessAdapter
+// trait (claude_bg / claude_tui stub / codex_exec).
+pub mod execution;
 pub mod inbox;
 pub mod memory_bridge;
 pub mod meta_agent;
@@ -91,11 +94,15 @@ pub use daemon::{
     HEARTBEAT_NAME, PIDFILE_NAME,
 };
 pub use harness::{
-    parse_cc_state_json, parse_pid_from_state, sigkill_pid, state_json_path, ClaudeCodeAdapter,
-    CodexAdapter, HarnessAdapter, HarnessError, HarnessSnapshot, SessionHandle, SpawnOpts,
-    SubagentState, CLAUDE_BIN_ENV, CLAUDE_JOBS_DIR_ENV, CODEX_STATUS_MARKER,
-    CODEX_STATUS_TAIL_LINES, DEFAULT_CLAUDE_SID,
+    parse_cc_state_json, parse_pid_from_state, sigkill_pid, state_json_path, AgentSpecBrief,
+    AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, HarnessSnapshot, SessionHandle,
+    SpawnCtx, SpawnOpts, SubagentState, ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadItem,
+    ThreadItemDetails, TurnId, TurnInput, UnifiedTokenUsage, CLAUDE_BIN_ENV, CLAUDE_JOBS_DIR_ENV,
+    CODEX_STATUS_MARKER, CODEX_STATUS_TAIL_LINES, DEFAULT_CLAUDE_SID,
 };
+// V0.6.0 F107 — adapter impls. Public so consumers (orchestrator,
+// `ccteam-cli` commands) can wire them by concrete type when needed.
+pub use execution::{ClaudeBgAdapter, ClaudeTuiAdapter, CodexExecAdapter};
 pub use inbox::{
     inbox_filename, outbox_filename, InboxAttachment, InboxFrontMatter, InboxMessage,
     OutboxEventKind, OutboxFrontMatter, OutboxMessage, OutboxPriority, SessionMailbox,

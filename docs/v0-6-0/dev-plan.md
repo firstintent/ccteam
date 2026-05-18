@@ -93,17 +93,25 @@ trait 签名锁定(PRD §F107 接口)— wave 2/3 不许改 signature(改 = wave
 
 ### 4 subagent 并行拆
 
-#### Subagent A:F108 ClaudeStreamJsonAdapter + F118 session recovery
+#### Subagent A:F108 ClaudeTuiAdapter + F118 session recovery
+
+> **Amended 2026-05-19** by Wave 1 architect:F108 改 tmux 长跑 + send-keys -l +
+> dual-track(prd.md F108)。文件 rename:`claude_stream_json.rs` → `claude_tui.rs`
+> (Wave 1 已 STUB land);`mailbox.rs` → `attachments.rs`(只处理非文本附件,文本
+> 走 send-keys -l 直送);加 `transcript_tail.rs`(byte-offset 增量读 Anthropic 内部
+> session jsonl)+ `turns_mirror.rs`(写 ccteam-owned `turns.jsonl` SoT)。
 
 | 文件 | 改动 |
 |---|---|
-| `crates/ccteam-core/src/execution/claude_stream_json.rs`(新)| `ClaudeStreamJsonAdapter` impl,~400 行 |
-| `crates/ccteam-core/src/execution/mailbox.rs`(新)| JSON-mailbox-trigger 读写,~150 行 |
-| `crates/ccteam-core/src/execution/turns_jsonl.rs`(新)| ccteam-owned chat history SoT,~200 行 |
-| `crates/ccteam-core/src/execution/session_recovery.rs`(新,F118)| last-N turn 重建逻辑 |
+| `crates/ccteam-core/src/execution/claude_tui.rs`(Wave 1 STUB → Wave 2 填)| `ClaudeTuiAdapter` impl,~500 行 |
+| `crates/ccteam-core/src/execution/transcript_tail.rs`(新)| byte-offset 增量读 `~/.claude/projects/<encoded-cwd>/<sid>.jsonl` + cursor 文件 `transcript-cursor.json`,~200 行 |
+| `crates/ccteam-core/src/execution/turns_mirror.rs`(新)| 镜像 parse 后的 transcript 行到 ccteam-owned `<.ccteam/chat/<bot>/turns.jsonl>` SoT,~150 行 |
+| `crates/ccteam-core/src/execution/attachments.rs`(新)| 非文本附件(图片 / 大文件)mailbox(text 走 send-keys -l 直送,无 mailbox),~100 行 |
+| `crates/ccteam-core/src/execution/session_recovery.rs`(新,F118)| last-N turn 重建逻辑(读 ccteam-owned `turns.jsonl`) |
 | `crates/ccteam-core/src/workflow_schema.rs` | `mode: chat` schema 字段 `#[serde(default)]` 收紧 |
 | `crates/ccteam-core/src/progress_event.rs` | 加 4 chat_* event 类型 |
-| `crates/ccteam-core/tests/claude_stream_json_test.rs`(新)| 8 测试 |
+| `crates/ccteam-hooks/src/chat_progress.rs`(新)| Claude Code 官方 hooks(UserPromptSubmit / Stop / SubagentStop / SessionStart / PostToolUse)→ progress.jsonl chat_* 业务事件桥接 |
+| `crates/ccteam-core/tests/claude_tui_test.rs`(新)| 8 测试 |
 
 **估工**:3-4 天。
 
