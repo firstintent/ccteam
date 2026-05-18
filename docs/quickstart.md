@@ -1,0 +1,120 @@
+# Quickstart — 5 分钟在 TG 收到你第一个 AI 助理的回话
+
+> 本文档单一目标:从 0 到 **你手机 TG 收到 bot 第一条回话**,5 步,5 分钟。
+>
+> 卡住任何一步?跳到 [troubleshooting.md](troubleshooting.md) 搜对应章节。
+
+## 你需要
+
+- Claude Code(`claude` CLI),装好登好。没装看 [code.claude.com/docs/install](https://code.claude.com/docs/install)。
+- Telegram 账号 + 手机装 Telegram app。macOS / Linux 主机(Windows 走 WSL2)。
+
+---
+
+## Step 1 — 装 ccteam plugin(30 秒)
+
+任意 terminal 起 Claude session:
+
+```bash
+$ claude
+```
+
+在 session 里输入:
+
+```
+/plugin install ccteam
+```
+
+预期输出:
+
+```
+✓ Installed ccteam@0.6.0
+  • 5 slash commands registered: /ccteam, /ccteam-team, /ccteam-creator, /ccteam-control, /ccteam-im-setup
+  • mcp__ccteam__* tools available
+```
+
+→ 卡了?见 [troubleshooting.md](troubleshooting.md) "plugin install 失败"。
+
+---
+
+## Step 2 — 绑定你的 TG bot(2 分钟)
+
+```
+/ccteam-im-setup
+```
+
+向导引导你:浏览器自动开 [@BotFather](https://t.me/BotFather) → 发 `/newbot` → 起名(如 `my_helper_bot`)→ 复制 token 粘回 Claude → 向导在 TG 监听 30 秒,你随便发条 `hi`,它自动抓 `chat_id`。
+
+预期结束:
+
+```
+✓ Telegram bot 已绑定:@my_helper_bot
+✓ chat_id 抓到:123456789
+✓ Daemon ccteam-imd 已起
+现在可以跟 @my_helper_bot 私聊:https://t.me/my_helper_bot
+```
+
+→ 卡了?见 [troubleshooting.md](troubleshooting.md) "TG token 拿不到 / chat_id 抓不到"。
+
+---
+
+## Step 3 — 让 ccteam 做一个 Pocket Assistant(1 分钟)
+
+```
+/ccteam-creator "做个 TG 私聊助理 bot,帮我每天读邮件 + 看 GitHub PR + 早 7 点发摘要"
+```
+
+ccteam-creator 自动判定是 **Pocket Assistant** preset,问 2-3 个问题:
+
+```
+Creator: persona 模板?推荐 "Personal Workflow Assistant"(中文)
+         其他选项:Technical Helper / Writing Coach / Translator / Study Buddy
+You:     用 Personal Workflow Assistant
+
+Creator: 24h cost cap?建议 $2 起步(用得多再调)
+You:     $2
+
+Creator: 计划:Preset = Pocket Assistant · Persona = Personal Workflow Assistant(中文)
+         · IM = TG @my_helper_bot(私聊)· cap = $2/24h。回 "go" 起。
+You:     go
+```
+
+预期:
+
+```
+✓ Workflow created: helper-bot
+✓ Bot @my_helper_bot is now live
+✓ Web dashboard: http://localhost:7331/p/helper-bot
+```
+
+---
+
+## Step 4 — 去 TG 私聊它(30 秒)
+
+打开 Telegram,搜 `@my_helper_bot`(你 Step 2 起的名字),点 Start。
+
+发条消息:
+
+```
+你好,你能帮我做啥?
+```
+
+预期:几秒内收到 bot 自我介绍 + 列能力清单。
+
+🎉 **完成。你的第一个 AI 助理已经在 TG 里跑起来了。**
+
+---
+
+## Step 5 — 跨设备试试(可选)
+
+笔记本继续开着,掏手机走开,继续在 TG 跟 bot 聊。bot 仍然回。bot 跑在**你电脑上**(能动文件 / 跑命令),手机只是入口 — 这是跟 ChatGPT app 拉开差异的关键。
+
+---
+
+## 接下来读什么
+
+- 想跑别的 use case?→ [recipes.md](recipes.md)(代码审查 bot / 翻译 bot / 日报助手等 10 个现成模板)
+- 想了解全部 5 种用法?→ [user-manual.md](user-manual.md)
+- 想给 bot 换 persona / 加能力?→ [user-manual.md](user-manual.md) §2.4 Pocket Assistant
+- 装 Codex 让两个 LLM 互审?→ [advanced/multi-llm-codex.md](advanced/multi-llm-codex.md)
+- 出错?→ [troubleshooting.md](troubleshooting.md)

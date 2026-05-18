@@ -1,114 +1,300 @@
-# V0.6.0 — 三执行模式定型 + 模式 3 (chat / IM) 落地 + MCP 优化
+# V0.6.0 — 从开发者元工具到产品可用 AI 团队
 
-> **立项主线**:把"ccteam 是 Claude Code 之上的编排层"这句话**显式拆成三种执行模式**,每种锚到 Claude Code 一个执行原语;红线按模式重新 scope;模式 3(chat / IM bot)是本版新落地能力;MCP 顺带按 OMC 借鉴优化。
+> **立项主线**(转 product 视角的 3 Epic):
+> - **Epic A — 5 min 起第一个 IM bot**(Pocket Assistant preset,V0.6 旗舰场景)
+> - **Epic B — bot 在 IM 里像真人助理**(rich media / 错误回流 / session 恢复 / NL admin)
+> - **Epic C — 中文用户能用**(铺底:lift `openhuman/channels` 14+ IM 平台抽象 → V0.7 国内 IM 专项零成本启动)
 >
-> **不立项**:任何会破坏现有模式 2(artifact-driven workflow)行为的改动。Wave 1 trait 抽离要求 `cargo test --workspace` 数字**完全持平**,不得退步。
+> **一句 value prop**:在 Claude session 里**一句话**召唤 AI 团队 — 接进你的 IM,跨设备 24/7 替你干活。
 >
-> **doc-first 原则**:本 PR 只 land `docs/v0-6-0/`(README + PRD + dev-plan),代码改动按 3 个 wave 跟进 PR。
+> **硬约束**(memory: `feedback_low_friction_claude_code_native`):用户禁止写复杂 yaml / 学多 ccteam CLI 命令;主 UX 入口 = Claude session 内 skill + slash + MCP tool。`ccteam` CLI 退守 install / health / system admin。
+>
+> **5 团队 review 收敛**(architect / cc-expert / pm / researcher / codex-expert)详 V0.6.0 review session;本文档为 synthesize 后的最终立项。
 
 ---
 
-## 一、三执行模式定型(本版核心)
+## 一、Epic 主线(替代上版 F-finding 顶层结构)
 
-ccteam 在 Claude Code 之上提供三种 agent 执行模式,**锚到 Claude Code 三种执行原语**:
+### Epic A — 5 min 起第一个 IM bot
 
-| 模式 | 直观场景 | spawn 原语 | input 面 | output 面 | context 生命周期 |
-|---|---|---|---|---|---|
-| **1. in-proc team** | CC 插件 / skill,一句话起临时 team(`/ccteam-team "fix TS errors"`)| `Task(subagent_type=…)` | tool args | tool result | parent session 内,死则同死 |
-| **2. bg sessions** | 长跑自动化工作流(qa-loop:test→fix→release)| `claude --bg --agent <role>` | `.ccteam/inbox/*.md`(artifact)| `progress.jsonl` + state.json | **每次 spawn fresh 1M context** |
-| **3. tmux sessions** | 随叫随到 chat agent team(TG 群里多 bot,@ 召唤,bot 间互 @)| 长跑 `claude`(交互模式,常驻 tmux pane)| `tmux send-keys`(含 `/new` `/compact`)| `~/.claude/projects/<…>/<session-id>.jsonl`(Anthropic 官方 session 格式)| `/new` 重置 / `/compact` 摘要,**在线管理** |
+**目标**:**普通用户在 5 分钟内**完成"打开 Claude session → 在 TG 收到 bot 第一条回话"的全过程。
 
-每模式自带的 control plane / cost model 详 `prd.md §F106`。
+衡量指标:
+- 步数 ≤ 5(对比当前 PRD 14 步)
+- 0 行 yaml 编辑(全部 skill dialogue 自动生成)
+- 0 个用户面新概念(mode 1/2/3 / hop_limit / compact_every_turns 全藏)
+- 第一个 wow ≤ 5 分钟
 
----
+实施手段:
+- F113 `/ccteam` 总入口 slash dispatcher + 5 sub-skill(Solo / Team / Overnight / Pocket / Squad)
+- F114 `ccteam-creator` 复活 + NL 自动 mode 推断
+- F117 `/ccteam-im-setup` 一次性 onboarding(TG token / Lark token 一次绑定,后续 chat workflow 自动复用)
+- F109 lift `claude-plugins-official/telegram`(零代码 TG 路径)+ `openhuman/channels` Rust crate(14+ IM 多平台)
 
-## 二、红线按模式重新 scope(配套改动)
+### Epic B — bot 像真人助理
 
-现有 7 条红线大多写于 V0.1-V0.4 的模式 2 语境,V0.6 显式标注每条**适用哪些模式**:
+**目标**:用户在 IM 里跟 bot 互动**感觉像真人**(对比"AI 客服式僵硬体验")。
 
-| 红线 | 当前措辞 | 模式 1 | 模式 2 | 模式 3 |
-|---|---|---|---|---|
-| 文件系统是控制平面 | 全局 | N/A(in-proc)| **输入 + 输出都是** | **输出 SoT 是**(session jsonl);输入是 send-keys |
-| `progress.jsonl` 唯一 state SoT | 全局 | N/A | **是**(SoT)| **业务事件 SoT**;对话原文走 session jsonl,**不重抄** |
-| 每次 spawn = fresh 1M context | 全局 | parent session,无 spawn | **守** | **不适用** — chat 场景就是要复用,显式 `/compact` `/new` 管理 |
-| 不解析 tmux 输出 | 全局 | N/A | **守** | **守** — 读 session jsonl 替代,**不 scrape pane** |
-| 永不主动 kill 长 session | 全局 | N/A | **守**(F84 budget cap 唯一例外)| **守** + `/compact` `/new` 是合法状态操作,非 kill |
-| fix-loop 3 次必 escalate | 全局 | parent 自决 | **守** | **守** + bot-to-bot @ ping-pong **hop_limit 同等 escalate** |
-| `ccteam-core` 零 team 名字面量 | 全局 | **守** | **守** | **守** |
+衡量指标:
+- DM + group + bot-to-bot @ 全场景支持(V0.6.0 完整 IM Squad 体验)
+- 错误回流 IM(bot 自己开口说"我刚失忆了 / 撞 budget cap / 配置坏了",不让用户去翻 log)
+- session 失效后 last-N turn 回放(F115 handoff 机制延伸)
+- rich media(图片 / 文件)传递
+- Codex 自动当 critic / second-opinion(用户不感知,F112 §C-D)
 
-详 PRD §F106。
+实施手段:
+- F108 模式 3 走 **Agent SDK / `claude -p --resume <sid>` + stream-json**(弃 tmux send-keys)+ **JSON-mailbox-trigger**(OMC `tmux-comm.ts` 模式)
+- F112 Codex 集成 Option B 完整(`CodexExecAdapter` + `CodexAppServerAdapter` + `vendor: AgentVendor` enum)
+- F115 `.ccteam/handoffs/<workflow>/<stage>.md` 决策摘要机制(researcher R4#3)
+- F116 `ccteam-imd` 独立 supervisor daemon binary(borrowed OMC `reply-listener.ts` 模式)
+- F118 chat session 失效 last-N turn 重建(基于 progress.jsonl + ccteam-owned `<project>/.ccteam/chat/<bot>/turns.jsonl`)
 
----
+### Epic C — 中文用户能用(V0.6.0 铺底,V0.7 专项)
 
-## 三、模式 3 是本版的新落地
+**目标**:V0.6.0 ship 时**架构准备就绪**让 V0.7 国内 IM(WeChat / 飞书 / DingTalk / QQ)零成本接入。
 
-模式 1 已由 V0.5.0 `ccteam-team` skill 落地;模式 2 是 V0.4.x → V0.5.x 主线。**模式 3 之前没有**。
+**V0.6.0 范围(铺底)**:
+- F109 lift `openhuman/channels` Rust crate 时**带全 14+ provider 模块**(Lark / DingTalk / QQ 等都已实现),只用 `--feature` 门控编译;V0.7 启用对应 feature 即可
+- 中文文档先行(`docs/quickstart.md` / `user-manual.md` 中文版默认,英文翻译跟随)
+- bot persona 预设库含**中文 prefab**(技术助手 / 写作 / 翻译 / 学习辅导 5 个中文 persona)
 
-落地范围:
-- `ExecutionAdapter` trait 抽出(F107) — 现有 `BgSpawner` 改造对接,**行为零变化**。模式 3 / 模式 1 复用此 trait
-- `TmuxInteractiveAdapter`(F108) — 长跑 `claude` 进程 + send-keys 输入 + session jsonl tail 输出
-- `ccteam-im-bridge` crate(F109) — 第一个目标 IM 是 Telegram(`tgbot` crate 已成熟);Slack / Discord / IRC 留 trait 扩展点
-
-**用户视角**:
-```
-$ ccteam new my-tg-bots --mode chat                # 新模式
-$ vim .ccteam/workflow.yaml                        # 声明 bot roster + IM channel binding
-$ ccteam start my-tg-bots
-# 然后 TG 群里 @bot-name "..." → bot 在 tmux 里 long-running claude session 处理 → 回 TG
-# bot-to-bot @ 自动路由
-```
-
-模式 3 **不复用模式 2 的 inbox watcher**(那是 fresh-context 触发,模式 3 是 stdin 喂)。但**复用** progress.jsonl(业务事件)/ MCP 控制面(user 远程看哪个 bot 在干嘛)/ web UI(panel 加 Chat View tab)。
+**V0.7 范围(不在本版)**:
+- 国内 IM 平台启用(WeChat 个人灰路径 + 飞书 + DingTalk + QQ)
+- 国内云部署文档(走 ngrok / cloudflared 替代)
 
 ---
 
-## 四、MCP 优化(顺带)
+## 二、5 个用户面 preset(替代"3 mode + 5 pattern"内部概念)
 
-借鉴 OMC `mcp__t__*` / `mcp__team__*` 模式,**单 server + 子前缀**重组:
+用户**只选 preset**,不直接选 mode / pattern。每 preset = 默认 surface × pattern × persona 组合配方,由 `ccteam-creator` skill 在 dialogue 中自动推断:
 
-| 改动 | 现状 | V0.6.0 后 |
-|---|---|---|
-| Server name | `ccteam` | `ct`(节省 4 字符 × 17 工具 × N session)|
-| Tool 命名 | `mcp__ccteam__ls` `mcp__ccteam__spawn_agent` 平铺 | `mcp__ct__workflow_ls` `mcp__ct__workflow_spawn_agent` `mcp__ct__chat_send_input`(子前缀)|
-| 选择性禁用 | 无,17 工具全发布 | `CCTEAM_DISABLE_TOOLS=chat_*,screenshot` env-driven |
-| 项目级注册 | 只 `~/.claude.json`(user-global)| `ccteam init` 落项目 `.mcp.json`;user-global 保留作 fallback |
-
-**Breaking**:`mcp__ccteam__*` → `mcp__ct__*`。pre-v1.0 不留 alias(CLAUDE.md §五:no backwards-compat shim)。meta-agent / `ccteam-control` skill / 测试同步改。
-
----
-
-## 五、Findings 索引
-
-| F | 主题 | 性质 | Wave |
+| Preset | 一句话场景 | hello world | 内部映射 |
 |---|---|---|---|
-| F106 | 三执行模式定型 + 红线按模式 scope 重写 | 纯文档 | 跟随各 wave |
-| F107 | `ExecutionAdapter` trait 抽离 + `BgSpawner` 改造对接 | 重构(零行为变化)| Wave 1 |
-| F108 | `TmuxInteractiveAdapter` 实现(模式 3 执行 runtime)| 新增 | Wave 2 |
-| F109 | `ccteam-im-bridge` crate(模式 3 IM 触发源,TG 起步)| 新增 | Wave 2 |
-| F110 | MCP namespace `ccteam` → `ct` + 子前缀工具命名 | Breaking | Wave 3 |
-| F111 | MCP 工具粒度配置(`CCTEAM_DISABLE_TOOLS` + 项目级 `.mcp.json`)| 新增 | Wave 3 |
+| **Solo Sidekick** | 在 Claude 里临时召唤一个帮手干小事 | V0.5 已有(`Task` 工具)| in-proc / single agent |
+| **Team Sprint** | 几小时冲一波,3-5 agent 并行干一件事 | `/ccteam-team 3 "task"`(V0.5 已有)| in-proc / Orchestrator-Worker |
+| **Overnight Builder** | 丢个任务睡觉去,长跑几小时到几天 | `/ccteam-creator "夜里跑 qa-loop"` | bg / Chaining + Refine |
+| **Pocket Assistant**(V0.6 旗舰)| 手机 IM 私聊一个 AI 助理 | `/ccteam-creator "做个 TG 助理 bot"` | chat (DM) / Routing |
+| **IM Squad** | IM 群里多个 bot 互相 @ 协作 | `/ccteam-creator "做个 TG 多 bot 团队"` | chat (group + bot-to-bot) / Orchestrator-Worker |
+
+---
+
+## 三、用户面入口(全部 Claude session 内,0 ccteam CLI)
+
+```
+/ccteam <NL>                          # 总入口 NL dispatcher(F113)→ 路由到下方
+/ccteam-team <NL>                     # 起临时 team(V0.5 已有,扩展 vote mode + Codex 自动)
+/ccteam-creator <NL>                  # NL 对话起 workflow(V0.5 砍掉,V0.6 复活 + auto mode)
+/ccteam-control <NL>                  # 项目状态查看 / 暂停 / 恢复(V0.5 已有)
+/ccteam-im-setup                      # TG / Lark / Slack 一次性 token 绑定 onboarding
+/ccteam-advise <hard question>        # Codex + Claude 并行 advisor(vote 模式,F112)
+```
+
+IM 端:
+```
+TG bot 群里:@ccteam pause helpful-bot          # NL admin,im-bridge 走 meta-agent NL 路由
+TG bot 群里:@ccteam list bots                  # 同上
+TG bot DM:                                     # 直接跟 bot 对话(F112 模式 3 DM)
+```
+
+`ccteam` CLI 仅保留 admin:
+```
+ccteam doctor                          # 健康检查 + 一次性安装
+ccteam daemon {start|stop|status}      # 系统级 daemon 管理
+```
+其他 `ccteam new` / `ccteam start <slug>` / `ccteam internal *` 等命令仍存在(Rust binary 内),但 **user-manual.md 不教**,只在 troubleshooting / advanced 出现。
+
+---
+
+## 四、核心架构改动(转 product-ready)
+
+### 4.1 ExecutionAdapter trait 对齐 Codex `ThreadManager`(F107)
+
+弃 PRD 上版的 "新建 `ExecutionAdapter` trait + 三 LifecycleOp enum"。改为**扩展现有 `HarnessAdapter` trait**(`crates/ccteam-core/src/harness.rs:75` V0.4.0 已落)+ **对齐 Codex `ThreadManager::{submit, next_event}`**:
+
+```rust
+pub trait HarnessAdapter: Send + Sync {
+    async fn start_thread(&self, spec: &AgentSpec, ctx: &SpawnCtx) -> Result<ThreadHandle>;
+    async fn submit_turn(&self, h: &ThreadHandle, input: TurnInput) -> Result<TurnId>;
+    fn events(&self, h: &ThreadHandle) -> BoxStream<'static, ThreadEvent>;
+    async fn resume_thread(&self, persistent_id: &str) -> Result<ThreadHandle>;
+    async fn close_thread(&self, h: &ThreadHandle) -> Result<()>;
+}
+
+pub enum TurnInput {
+    UserText(String),
+    Artifact(PathBuf),                // bg mode inbox
+    SystemDirective(String),          // /compact /new /clear 退化为特殊 turn
+    Image(PathBuf),                   // rich media
+}
+
+pub struct SessionHandle {
+    pub vendor: AgentVendor,           // Claude | Codex
+    pub mode: ExecutionMode,           // InProc | Bg | Chat
+    pub identity: String,
+}
+```
+
+`/compact /new /clear` 不再是独立 `LifecycleOp` enum,而是 `TurnInput::SystemDirective("compact")` 特殊 turn — adapter 内部翻译为 backend-specific 操作(Claude → `/compact` slash;Codex → `compact_remote` API)。**统一 mode 2 + mode 3 = "all chat is a turn sequence"**。
+
+### 4.2 模式 3 执行路径:Agent SDK / `claude -p --resume`(F108 重写)
+
+弃 PRD 上版的 "tmux send-keys + session jsonl tail"。改为:
+- **input** 面:`claude -p --resume <sid> --input-format stream-json --output-format stream-json` stdin pipe(Anthropic 官方文档化路径)+ **JSON-mailbox-trigger 模式**(写 `<.ccteam/im/<bot>/inbox/msg-<ts>.md>` + 一个短 send-keys "read your mailbox" 触发,OMC `tmux-comm.ts` 抄)
+- **output** 面:stream-json events 流(`stream_event` / `system/init` / `system/api_retry` 全部官方文档化 schema)
+- **lifecycle** 操作:Agent SDK `compact` API 直接调,弃 `/compact` slash 命令模拟
+- **tmux 退居** dev-time attach 调试入口,**不**作 production 控制平面
+
+### 4.3 Codex 集成 Option B 完整(F112)
+
+`vendor: AgentVendor { Claude, Codex }` 作 trait 一等公民。新增 adapter:
+- `CodexExecAdapter`(模式 2 codex,走 `codex exec --json`)
+- `CodexAppServerAdapter`(模式 3 codex,走 `codex app-server` UDS JSON-RPC v2)
+- 复用 Codex `agent_max_depth` recursion guard
+- 复用 Codex 50+ scientist nickname 池子作 bot_name 自动生成(`agent_naming.rs`)
+- 借鉴 Codex `AgentPath` 层次树作 hop_limit 红线实现
+
+cost 双 pricing table:`crates/ccteam-cost/pricing/{anthropic,openai}.toml`;`budgets.claude.max_cost_usd_per_24h` / `budgets.codex.max_cost_usd_per_24h` 各管各的。
+
+**Codex 用户面 4 个可见场景**(其他全自动):
+- A. `/ccteam-advise <hard question>` parallel voting(Claude + Codex 并行,合成显示)
+- B. Auto-critic:用户起 critic / reviewer / architect role 时,如装 codex + auth ok → 自动赋 vendor: codex(`ccteam-creator` 内部决策,user 不见 yaml 字段)
+- C. Claude quota 触顶 opt-in fallback(默认 off,prefs 启用)
+- D. `/ccteam-team` 内置 Codex critic teammate(if available)
+
+### 4.4 IM bridge:**lift,不造**(F109 重写)
+
+**核心 directive**:不自造 channels 轮子。
+
+**统一 transport = `openhuman/channels` Rust crate**(14+ IM 平台:Telegram / Slack / Discord / Lark / DingTalk / QQ / Signal / iMessage / Matrix / WhatsApp / Email / IRC / Mattermost / Web)。`Channel` trait + `SendMessage` + `ChannelMessage` 抽象在 `traits.rs:5-60`;每 provider 走 Cargo feature gate;event bus + supervisor pattern 已实现。
+
+```
+ccteam-imd(独立 daemon binary,V0.6.0 F116)
+├── 依赖 openhuman/channels(Rust crate,统一 trait)
+│   ├── feature=telegram  # V0.6.0
+│   ├── feature=slack     # V0.6.0
+│   ├── feature=discord   # V0.6.0
+│   ├── feature=lark      # V0.7
+│   ├── feature=dingtalk  # V0.7
+│   ├── feature=qq        # V0.7
+│   └── ...
+├── bot-to-bot @ routing / hop_limit / mailbox 协调 / NL admin / @ccteam 解析
+│   (ccteam-imd 一处实现,跨所有 IM 平台统一)
+└── HarnessAdapter trait 调用(F107)— 把 inbound 消息翻译成 turn input
+```
+
+**`claude-plugins-official/telegram` 留作 backup**(用户 directive):
+- 默认 V0.6.0 走 openhuman / `ccteam-imd`;`/ccteam-im-setup` 默认 transport = `openhuman/telegram`
+- 用户偏好 Anthropic 全栈 / openhuman bug fallback:`/ccteam-im-setup --transport official-telegram` 切官方 MCP 路径(`claude --channels plugin:telegram@claude-plugins-official`)
+- 两 path 互斥(避免同 bot token 双重 webhook 竞争);切换走 onboarding skill,不让用户编辑配置
+
+**架构收益**(为啥统一比"TG 官方 + 其他 openhuman"好):
+- bot-to-bot @ routing / hop_limit / `@ccteam` NL admin / mailbox 协调 **一处实现**,跨所有 IM 平台一致
+- V0.7 国内 IM 启用零代码(只 cargo feature 切换 + token onboarding 测试)
+- 单一 daemon(`ccteam-imd`)替代"ccteam daemon + Anthropic 官方 TG MCP server"双进程
+- TG 特定逻辑(pairing/allowlist)若 openhuman/telegram 暂缺,ccteam-imd 上层补,**不分两套实现**
+
+### 4.5 F110 MCP namespace rename 取消
+
+**收 review 反馈**:`mcp__ccteam__*` → `mcp__ct__*` 节省 4 字符是 dev-cost 优化,**对 V0.5 用户是肌肉记忆破坏**;`ct` 1 年后用户记不住代表啥。**保留** `mcp__ccteam__*` namespace;F110 只保留 "**子前缀分组**" 部分:`mcp__ccteam__workflow_ls` / `mcp__ccteam__chat_send_input` 等。
+
+### 4.6 F111 + F114 等其他改进
 
 详 `prd.md`。
 
 ---
 
-## 六、不在本版
+## 五、红线按"模式 × vendor"双轴 scope 重写(F106 重写)
 
-- 模式 3 跨 session chat memory 重建(session-id 失效时,从 progress.jsonl 重放业务事件作 system prompt) — 延 V0.6.1
-- IM bridge 多平台扩展(Slack / Discord) — 延 V0.7.x;V0.6.0 只落 TG + trait
-- V0.5.x 延期 F98(plan-approval↔outbox 联动)— 见 `docs/v0-5-0/prd.md` 末段,本版仍不动
-- mcp `ct` 之外的拆 server(多 server / standalone server)— 见决策记录 §七,本版不拆
+原 V0.6.0 红线只按模式 scope。Codex 加入后必须按 vendor 也 scope:
+
+| 红线 | 模式 1 in-proc | 模式 2 bg | 模式 3 chat |
+|---|---|---|---|
+| R1 文件系统是控制平面 | — | **Claude+Codex 同**(artifact)| Claude: stream-json + ccteam-owned `turns.jsonl`;Codex: app-server UDS + `turns.jsonl` |
+| R2 progress.jsonl 唯一 state SoT | — | **守(双 vendor)** | **业务事件 SoT 守**;对话原文走 ccteam-owned `turns.jsonl`(取代依赖 Anthropic 内部 `~/.claude/projects/`)|
+| R3 每次 spawn = fresh 1M context | — | **Claude 守;Codex `codex exec resume <tid>` 实现可复用,trait 决定,用户不见** | **不适用** — chat 复用 context 是 feature |
+| R4 不解析 tmux 输出 | — | 守 | 守 — 读 stream-json + `turns.jsonl`,**不 scrape pane** |
+| R5 永不主动 kill 长 session | 守 | 守(`--max-budget-usd` 平台兜底替代 F84 强制 kill)| 守 + `/compact /new` 是合法 turn,非 kill |
+| R6 fix-loop 3 次必 escalate | 守 | 守 | 守 + **AgentPath depth limit**(借 Codex AgentRegistry 实现)替代平铺 fix_counts 红线 |
+| R7 `ccteam-core` 零 team 名字面量 | 守 | 守 | 守 |
+| R8 跨项目记忆走官方接口 | **Claude: `~/.claude/CLAUDE.md`** / **Codex: `~/.codex/AGENTS.md`**;`ccteam init` 落 AGENTS.md → CLAUDE.md POSIX symlink | 同上 | 同上 |
+| R9 新建项目走 `<projects_root>/<team>-<slug>/` | — | 守 | 守 |
 
 ---
 
-## 七、决策记录(为什么这么做)
+## 六、Findings 索引(F106-F118,Epic 下的实施手段)
 
-| 决策 | 选项 A | 选项 B | 选了 | 理由 |
+| F | 主题 | 性质 | Epic | Wave |
 |---|---|---|---|---|
-| 模式 3 执行 runtime | `claude --resume` + stream-json 长跑 | Agent SDK adapter 进程内 agent loop | **A** | 跟现有 tmux pane plumbing 顺,Claude Code 全栈(skills / hooks / MCP)零损耗 |
-| 模式 3 input 面 | send-keys | stdin pipe(`--input-format stream-json`)| **send-keys** | 复用 tmux 已有基础设施;stdin 模式将来可加 |
-| 模式 3 output 面 | parse session jsonl | parse tmux capture-pane | **session jsonl** | 守"不解析 tmux 输出"红线;Anthropic 官方格式比 ANSI 文本稳定 |
-| MCP server 拆 | 单 server `ct` + 子前缀 | 拆 2 server(`ct` + `ct_chat`)| **单 server** | `.mcp.json` 单条目;`CCTEAM_DISABLE_TOOLS` 抵消 tool list 长度风险 |
-| MCP namespace 长度 | `t`(1 字母)| `ct`(2 字母)| **`ct`** | `t` 容易撞别人(OMC 已占);`ct` 是"ccteam"缩 |
-| Breaking vs alias | 留 `ccteam__*` alias 一版 | 直接 breaking | **直接 breaking** | pre-v1.0 + CLAUDE.md §五 no shim |
-| 模式 3 落地深度 | trait + adapter stub | trait + adapter + TG bridge 全栈 | **全栈** | trait + 一个真实 adapter 才能验证 trait 设计;TG 是最低复杂度 IM 选择 |
+| F106 | 红线按"模式 × vendor"双轴 scope 重写 | 文档 | A/B/C | 跟随 |
+| F107 | 扩展 `HarnessAdapter` 对齐 Codex `ThreadManager`;5 方法 trait + vendor enum | 重构 | B | 1 |
+| F108 | 模式 3 走 `claude -p --resume` + stream-json + JSON-mailbox-trigger(弃 tmux send-keys)| 新增 | B | 2 |
+| F109 | IM bridge 统一 `openhuman/channels` Rust crate(主路径,14+ IM 平台);`claude-plugins-official/telegram` 作 backup | 新增 | A/C | 2 |
+| ~~F110~~ | ~~MCP namespace ccteam → ct rename~~ | **取消** | — | — |
+| F111 | MCP 工具子前缀 + group disable env + 项目级 `.mcp.json` | 改进 | A | 3 |
+| F112 | Codex 集成 Option B 完整:trait + 2 adapter + 双 pricing + 4 用户场景 | 新增 | B | 2 |
+| F113 | `/ccteam` 总入口 NL dispatcher slash + 5 sub-skill | 新增 | A | 1-2 |
+| F114 | `ccteam-creator` 复活 + NL 自动 mode 推断 + persona 预设库 | 新增 | A | 2 |
+| F115 | `.ccteam/handoffs/<workflow>/<stage>.md` 决策摘要机制 | 新增 | B | 2 |
+| F116 | `ccteam-imd` 独立 supervisor daemon binary(borrowed OMC `reply-listener.ts`)| 新增 | A/B | 2 |
+| F117 | `/ccteam-im-setup` 一次性 IM token onboarding skill | 新增 | A | 2 |
+| F118 | chat session 失效 last-N turn 重建(ccteam-owned `turns.jsonl` SoT)| 新增 | B | 3 |
+
+---
+
+## 七、文档套件(本版产物)
+
+PM 提议的 5 用户面文档全部产出:
+
+```
+ccteam/
+├── README.md                              ≤80 行 [V0.6.0 REWRITE,产品 pitch + 5 行 install + link]
+└── docs/
+    ├── quickstart.md                      ≤120 行 [V0.6.0 NEW,Pocket Assistant 场景 5-step]
+    ├── user-manual.md                     ≤300 行 [V0.6.0 REWRITE V0.5,5 preset 各一节]
+    ├── recipes.md                         ≤500 行 [V0.6.0 NEW,8-10 ready preset 模板]
+    ├── troubleshooting.md                 ≤400 行 [V0.6.0 NEW,50+ 故障条目]
+    ├── advanced/                          [V0.6.0 NEW]
+    │   ├── customize-workflow.md
+    │   ├── multi-llm-codex.md             [Codex 集成手册]
+    │   └── presets-reference.md
+    ├── v0-6-0/                            [本 PR dev 归档,ship 后冻结]
+    │   ├── README.md(本文件)
+    │   ├── prd.md
+    │   ├── dev-plan.md
+    │   └── host-probe.md(wave 4 验证产物)
+    └── architecture/(重组,纯 dev docs)
+```
+
+**用户面 13 项内部术语永久从用户面文档清出**(详 PM PM11):mode 1/2/3、progress.jsonl、send-keys、session jsonl tail、ExecutionAdapter、fix_count、escalation event、hop_limit、compact_every_turns、F-number、`mcp__ccteam__chat_session_reset_force`、`cleanup_on_stop: leave-running`、5 编排 × 3 执行矩阵。
+
+---
+
+## 八、不在本版
+
+- **国内 IM 启用**(WeChat / 飞书 / DingTalk / QQ)— V0.7 专项;V0.6.0 铺底使 V0.7 几乎零成本
+- **chat memory 跨设备同步**(`<project>/.ccteam/chat/<bot>/turns.jsonl` 已是 SoT,但跨机同步走 git / rsync / 云盘是 V0.7 工具支持)
+- **6 号编排模式 HITL / Approval Gating**(researcher R10 提)— V0.6.1 立项 F119
+- **monorepo-aware `.mcp.json`**(researcher R6#4 提)— V0.7+
+- **`ccteam migrate-from claude` 反向 import**(codex-expert CX6#5 提)— V0.7+
+- **V0.5.x 延期 F98**(plan-approval↔outbox 联动)— 与 F119 合并 V0.6.1
+
+---
+
+## 九、决策记录修订(对上版 README §七)
+
+| 决策 | 上版选 | 本版改 | 理由 |
+|---|---|---|---|
+| 模式 3 execution runtime | tmux send-keys(A)| **Agent SDK / `claude -p --resume` + stream-json(B)** | cc-expert WebFetch 验证 session jsonl 路径 0 文档化;architect "internal-not-API";researcher OMC mailbox-trigger 模式更稳 |
+| 模式 3 input 面 | send-keys | **stream-json stdin pipe + JSON-mailbox-trigger 组合** | send-keys 仅传短 trigger("read your mailbox"),内容写 mailbox 文件;0 escape 雷区 |
+| 模式 3 output 面 | parse session jsonl(Anthropic internal)| **stream-json 官方 schema + ccteam-owned `turns.jsonl`** | A5 architect:ccteam-owned SoT 让 R1/R2 红线在模式 3 真正站住 |
+| MCP namespace rename | breaking `ccteam` → `ct` | **取消;保 `ccteam` namespace,只加子前缀** | PM + cc-expert + codex-expert 共识 + 用户低门槛 override:rename 用户净损失 |
+| F109 IM bridge 自造 | tokio task + `tgbot` crate | **统一 `openhuman/channels` Rust crate(全 14+ IM 含 Telegram);`claude-plugins-official/telegram` 作 backup transport** | 用户 directive:不造轮子;统一 transport 一处实现 bot-to-bot routing;V0.7 国内 IM 零代码启用 |
+| Codex 集成深度 | Option A(模式 2 only)| **Option B(完整:trait + 2 adapter + 双 pricing + 4 用户场景)** | 用户拍板;不集成 V0.6.0 ship 后被定义为"只支持 Claude 的小众工具"(researcher R9 表)|
+| user surface 主入口 | `ccteam` CLI 命令 | **Claude session 内 `/ccteam-*` slash + meta-agent NL + MCP tool** | 用户硬约束:"低门槛 + Claude-Code-native UX";13 lock decisions L2 |
+| 用户面概念 | mode 1/2/3 + 5 编排 + 4 trigger + N MCP 工具 = 8+ 概念 | **5 preset(用户只选 preset)+ `/ccteam` 一个总入口 slash** | architect A9 + PM PM10 8→2-axis 压缩;用户低门槛 override |
+| DM vs group | group 优先,DM 延 V0.6.1 | **DM + group + bot-to-bot @ 全起 V0.6.0** | 用户拍板:R6#1 完整 IM Squad 体验是 V0.6.0 锁定卖点 |
+| 5 用户文档 | docs/v0-x-y/ 内 user-manual.md | **5 份文档独立 docs/ 根 + advanced/ + v0-6-0/(dev archive)分离** | PM PM11 |
+
+---
+
+详 `prd.md`(Epic 详细需求 + 12 finding 实施)+ `dev-plan.md`(4 wave 修订)。
