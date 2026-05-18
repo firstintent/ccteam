@@ -39,6 +39,7 @@ use crate::harness::{
 };
 use crate::inbox::{InboxMessage, SessionMailbox};
 use crate::paths::CcteamPaths;
+use crate::preferences;
 use crate::progress;
 use crate::queries;
 use crate::spawn_brief::{render_spawn_brief, SpawnContext as SpawnBriefContext};
@@ -1516,32 +1517,73 @@ impl Orchestrator {
             .await
             .unwrap_or(0.0);
         let budget = self.budget_limit_for_project(project_dir);
+        // V0.6.0 Wave 3 F112 §C — vendor_fallback hook. When the
+        // cumulative Claude cost trips the cap AND the user opted in
+        // via `~/.ccteam/preferences.toml::fallback.on_claude_quota
+        // = "codex"`, we DON'T hard-stop: we swap this role's adapter
+        // to Codex on this spawn, keep the workflow alive, and write
+        // a `budget_exceeded` event tagged `vendor: claude` +
+        // `vendor_fallback_to: codex` so the audit trail still shows
+        // the cap. The original V0.5.x hard-stop path (no prefs / off /
+        // role not eligible) is otherwise unchanged.
+        let prefs = preferences::load_or_default(&self.paths.root);
+        let mut effective_executor = agent.executor;
         if cost_so_far >= budget {
-            progress::append_event(
-                progress_path,
-                &json!({
-                    "event": "budget_exceeded",
-                    "role": role,
-                    "cost_used_usd": cost_so_far,
-                    "budget_limit_usd": budget,
-                    "slug": slug,
-                    "ts": Utc::now().to_rfc3339(),
-                }),
-            )?;
-            self.send_btw_escalation(
-                slug,
-                &format!(
-                    "budget exceeded for role `{}` (used ${:.2} of ${:.2}); spawn blocked. \
-                     Running sessions left intact.",
-                    role, cost_so_far, budget
-                ),
-            )
-            .await;
-            return Ok(());
+            let claude_vendor = matches!(agent.executor, Executor::Claude);
+            let want_fallback = claude_vendor && prefs.codex_fallback_enabled_for(role);
+            let codex_adapter_present = self.adapter_for(Executor::Codex).is_some();
+            if want_fallback && codex_adapter_present {
+                progress::append_event(
+                    progress_path,
+                    &json!({
+                        "event": "budget_exceeded",
+                        "role": role,
+                        "cost_used_usd": cost_so_far,
+                        "budget_limit_usd": budget,
+                        "slug": slug,
+                        "vendor": "claude",
+                        "vendor_fallback_to": "codex",
+                        "ts": Utc::now().to_rfc3339(),
+                    }),
+                )?;
+                tracing::warn!(
+                    role,
+                    cost_so_far,
+                    budget,
+                    "claude quota tripped; swapping to codex for this spawn (prefs opt-in)"
+                );
+                effective_executor = Executor::Codex;
+            } else {
+                progress::append_event(
+                    progress_path,
+                    &json!({
+                        "event": "budget_exceeded",
+                        "role": role,
+                        "cost_used_usd": cost_so_far,
+                        "budget_limit_usd": budget,
+                        "slug": slug,
+                        "vendor": match agent.executor {
+                            Executor::Claude => "claude",
+                            Executor::Codex => "codex",
+                        },
+                        "ts": Utc::now().to_rfc3339(),
+                    }),
+                )?;
+                self.send_btw_escalation(
+                    slug,
+                    &format!(
+                        "budget exceeded for role `{}` (used ${:.2} of ${:.2}); spawn blocked. \
+                         Running sessions left intact.",
+                        role, cost_so_far, budget
+                    ),
+                )
+                .await;
+                return Ok(());
+            }
         }
 
-        let Some(adapter) = self.adapter_for(agent.executor) else {
-            tracing::warn!(role, executor = ?agent.executor, "no adapter registered");
+        let Some(adapter) = self.adapter_for(effective_executor) else {
+            tracing::warn!(role, executor = ?effective_executor, "no adapter registered");
             self.bump_fail_count(slug, role, progress_path).await?;
             return Ok(());
         };
@@ -1632,7 +1674,7 @@ impl Orchestrator {
                         "session_id": handle.sid,
                         "tmux_session": handle.tmux_session,
                         "job_id": handle.job_id,
-                        "executor": match agent.executor {
+                        "executor": match effective_executor {
                             Executor::Claude => "claude",
                             Executor::Codex => "codex",
                         },

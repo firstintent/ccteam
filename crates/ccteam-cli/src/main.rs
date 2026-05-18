@@ -582,6 +582,39 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         token_file: Option<PathBuf>,
     },
+    /// V0.6.0 Wave 3 F112 §C — read / write `~/.ccteam/preferences.toml`.
+    /// Today the only user-visible knob is `fallback.on_claude_quota`
+    /// (`off` | `codex`); V0.7+ will fold in additional opt-in
+    /// preferences. Without args, prints the current preferences.
+    Prefs {
+        #[command(subcommand)]
+        action: Option<PrefsAction>,
+    },
+}
+
+/// V0.6.0 Wave 3 F112 §C — `ccteam prefs` subcommand surface.
+#[derive(Subcommand)]
+enum PrefsAction {
+    /// Pretty-print the active preferences (defaults shown when the
+    /// file is absent).
+    Show,
+    /// Look up a single preference by dotted key. Supported keys today:
+    ///   - `fallback.on_claude_quota`
+    Get {
+        /// Dotted preference key.
+        key: String,
+    },
+    /// Set one preference by dotted key. Writes
+    /// `~/.ccteam/preferences.toml` atomically. Supported keys today:
+    ///   - `fallback.on_claude_quota`  (values: `off` | `codex`)
+    ///   - `fallback.codex.enabled_for_roles` (comma-separated list,
+    ///     or empty string to mean "all roles")
+    Set {
+        /// Dotted preference key.
+        key: String,
+        /// New value.
+        value: String,
+    },
 }
 
 /// V0.4.6 F89: subcommands hidden under `ccteam internal`. Each mirrors
@@ -975,6 +1008,26 @@ fn main() -> Result<()> {
                 no_auth,
                 token_file,
             })
+        }
+        Command::Prefs { action } => {
+            let paths = CcteamPaths::from_env()?;
+            match action {
+                None | Some(PrefsAction::Show) => {
+                    let out = commands::run_prefs_show(&paths)?;
+                    print!("{out}");
+                    Ok(())
+                }
+                Some(PrefsAction::Get { key }) => {
+                    let out = commands::run_prefs_get(&paths, &key)?;
+                    println!("{out}");
+                    Ok(())
+                }
+                Some(PrefsAction::Set { key, value }) => {
+                    let out = commands::run_prefs_set(&paths, &key, &value)?;
+                    println!("{out}");
+                    Ok(())
+                }
+            }
         }
     }
 }
