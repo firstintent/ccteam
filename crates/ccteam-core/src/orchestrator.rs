@@ -32,7 +32,7 @@ use tokio::task::JoinSet;
 
 use crate::artifact_watcher::{ArtifactEvent, ArtifactWatcher};
 use crate::daemon;
-use crate::execution::{ClaudeBgAdapter, CodexExecAdapter};
+use crate::execution::{ClaudeBgAdapter, ClaudeTuiAdapter, CodexExecAdapter};
 use crate::handoff;
 use crate::harness::{
     AgentSpecBrief, AgentVendor, HarnessAdapter, SessionHandle, SpawnCtx, ThreadEvent,
@@ -650,6 +650,35 @@ impl Orchestrator {
         self.adapters.get(key)
     }
 
+    /// V0.6.0 Wave 3 — dispatch helper that picks the right adapter for
+    /// the `(executor, workflow_mode)` pair. mode 3 (`Chat`) overrides
+    /// the per-executor bg/exec default with the long-running TUI adapter
+    /// (Claude) or AppServer adapter (Codex; Wave 3 codex-exec teammate).
+    ///
+    /// Per the Wave 3 e2e-wiring contract: the orchestrator currently
+    /// short-circuits `WorkflowMode::Chat` (lifecycle owned by
+    /// `ccteam-imd`); this helper is the seam future spawn paths reach
+    /// through once orchestrator-owned chat scenarios land.
+    pub fn pick_adapter(
+        &self,
+        exec: Executor,
+        mode: WorkflowMode,
+    ) -> Option<Arc<dyn HarnessAdapter + Send + Sync>> {
+        match (exec, mode) {
+            (Executor::Claude, WorkflowMode::Chat) => {
+                Some(Arc::new(ClaudeTuiAdapter::new()) as Arc<dyn HarnessAdapter + Send + Sync>)
+            }
+            (Executor::Codex, WorkflowMode::Chat) => {
+                // CodexAppServerAdapter ships with Wave 3 codex-exec-impl
+                // teammate; until that lands, fall back to the bg adapter
+                // so the dispatch table never returns None for a known
+                // (vendor, mode) pair.
+                self.adapter_for(Executor::Codex).cloned()
+            }
+            _ => self.adapter_for(exec).cloned(),
+        }
+    }
+
     /// Test-only adapter override; production CLI never calls this.
     #[cfg(any(test, feature = "test-util"))]
     pub fn set_adapter(&mut self, exec: Executor, adapter: Arc<dyn HarnessAdapter + Send + Sync>) {
@@ -736,6 +765,23 @@ impl Orchestrator {
                 "ts": Utc::now().to_rfc3339(),
             }),
         )?;
+
+        // V0.6.0 Wave 3 — `mode: chat` is owned by `ccteam-imd` end to
+        // end. The daemon spawns the tmux session via
+        // `ClaudeTuiAdapter::start_thread`, drives turns from IM input,
+        // and tails `turns.jsonl` for outbound. Orchestrator's role is
+        // limited to logging `workflow_start` (above) so the project
+        // appears in `ccteam status`; it must NOT enter the artifact
+        // event loop nor attempt to spawn agents (the spec's `agents`
+        // map is allowed to be empty in mode: chat per workflow.rs
+        // validation).
+        if matches!(spec.mode, WorkflowMode::Chat) {
+            tracing::info!(
+                slug,
+                "mode: chat workflow — ccteam-imd owns lifecycle; orchestrator exiting"
+            );
+            return Ok(());
+        }
 
         // V0.4.5: pass the progress.jsonl file (so the watcher can
         // append `artifact_dir_created` events) — the previous version

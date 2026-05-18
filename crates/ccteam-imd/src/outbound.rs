@@ -92,6 +92,44 @@ pub fn read_new_rows(path: &std::path::Path, cursor: &TailCursor) -> Result<(Vec
     Ok((rows, TailCursor { position: consumed }))
 }
 
+/// V0.6.0 Wave 3 — push every assistant row in `rows` to `channel`
+/// addressed at `recipient`. Honors the [`should_forward`] filter so
+/// `user` / `tool` rows are skipped. Per-row send errors are logged
+/// but do not abort the forward loop (one flake shouldn't stall the
+/// whole bot). Returns the count of rows successfully dispatched.
+///
+/// The daemon resolves `(channel, recipient)` per-bot from the
+/// [`crate::BotRegistration`] (`im_platform` → channel impl,
+/// `im_chat_id` → recipient string).
+pub async fn forward_new_rows(
+    rows: &[TurnRow],
+    channel: &dyn crate::transport::Channel,
+    recipient: &str,
+    inbound_message_ids: &[String],
+) -> usize {
+    let mut sent = 0;
+    for row in rows {
+        if !should_forward(row, inbound_message_ids) {
+            continue;
+        }
+        let mut msg = crate::transport::SendMessage::new(row.content.clone(), recipient);
+        msg.thread_ts = row.thread_ts.clone();
+        match channel.send(&msg).await {
+            Ok(_) => {
+                sent += 1;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    recipient,
+                    "outbound forward failed; continuing"
+                );
+            }
+        }
+    }
+    sent
+}
+
 /// Filter: only `role == "assistant"` rows are forwarded to IM, and
 /// we suppress turns whose `reply_to` matches a message id we
 /// dropped inbound (echo suppression).
@@ -182,6 +220,42 @@ mod tests {
         let (rows, _) = read_new_rows(&path, &cur).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].content, "b");
+    }
+
+    #[tokio::test]
+    async fn forward_new_rows_dispatches_assistant_only() {
+        use crate::transport::providers::mock::MockChannel;
+        let channel = MockChannel::new();
+        let rows = vec![
+            TurnRow {
+                role: "assistant".into(),
+                content: "reply-1".into(),
+                reply_to: None,
+                thread_ts: None,
+                reply_target: None,
+            },
+            TurnRow {
+                role: "user".into(),
+                content: "u-1".into(),
+                reply_to: None,
+                thread_ts: None,
+                reply_target: None,
+            },
+            TurnRow {
+                role: "assistant".into(),
+                content: "reply-2".into(),
+                reply_to: None,
+                thread_ts: None,
+                reply_target: None,
+            },
+        ];
+        let sent = forward_new_rows(&rows, &channel, "user-alice", &[]).await;
+        assert_eq!(sent, 2);
+        let out = channel.outbox().await;
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].content, "reply-1");
+        assert_eq!(out[1].content, "reply-2");
+        assert_eq!(out[0].recipient, "user-alice");
     }
 
     #[test]
