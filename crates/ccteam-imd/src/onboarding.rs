@@ -18,7 +18,19 @@
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::credentials::TelegramCredentials;
+use crate::credentials::TelegramCreds;
+
+/// Wrapper around [`TelegramCreds`] that carries the `bot_username`
+/// returned by `getMe` for the skill UX ("在 TG 找 @xxx"). Kept off
+/// the on-disk [`TelegramCreds`] struct so credentials.json stays
+/// minimal (per imd's reply: "don't add bot_username to TelegramCreds
+/// because that's the on-disk schema").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelegramSetupResult {
+    pub creds: TelegramCreds,
+    /// Bot handle from `getMe`, including leading `@`.
+    pub bot_username: String,
+}
 
 /// Default Telegram Bot API root.
 pub const TELEGRAM_API_BASE: &str = "https://api.telegram.org";
@@ -47,7 +59,7 @@ pub enum OnboardingError {
 pub async fn telegram_setup(
     token: &str,
     poll_seconds: u64,
-) -> Result<TelegramCredentials, OnboardingError> {
+) -> Result<TelegramSetupResult, OnboardingError> {
     telegram_setup_with_base(token, poll_seconds, TELEGRAM_API_BASE).await
 }
 
@@ -56,7 +68,7 @@ pub async fn telegram_setup_with_base(
     token: &str,
     poll_seconds: u64,
     api_base: &str,
-) -> Result<TelegramCredentials, OnboardingError> {
+) -> Result<TelegramSetupResult, OnboardingError> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(poll_seconds + 10))
         .build()?;
@@ -79,10 +91,12 @@ pub async fn telegram_setup_with_base(
     // Step 2: getUpdates long-poll for first chat_id.
     let owner_chat_id = poll_first_chat_id(&client, token, api_base, poll_seconds).await?;
 
-    Ok(TelegramCredentials {
-        bot_token: token.into(),
+    Ok(TelegramSetupResult {
+        creds: TelegramCreds {
+            bot_token: token.into(),
+            allowed_chat_ids: vec![owner_chat_id.to_string()],
+        },
         bot_username,
-        allowed_chat_ids: vec![owner_chat_id.to_string()],
     })
 }
 

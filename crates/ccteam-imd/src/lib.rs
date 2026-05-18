@@ -31,8 +31,10 @@ pub mod onboarding;
 pub mod register;
 
 pub use credentials::{
-    credentials_path, load_credentials, write_credentials, Credentials, ImPlatform,
-    TelegramCredentials,
+    default_path, load_credentials, save, write_credentials, Credentials, ImPlatform,
+    TelegramCreds,
 };
-pub use onboarding::{telegram_setup, OnboardingError};
+#[allow(deprecated)]
+pub use credentials::{credentials_path, TelegramCredentials};
+pub use onboarding::{telegram_setup, OnboardingError, TelegramSetupResult};
 pub use register::{register_bot, AgentVendor, BotRegistration, RegisterError};

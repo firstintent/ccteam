@@ -97,8 +97,24 @@ While it's running, tell the user:
 >   - 切换 transport:`/ccteam-im-setup --transport official-telegram`
 ```
 
-Call `ccteam_imd::credentials::write_credentials(&Credentials {
-telegram: Some(...), .. })` to persist.
+Persist via either of these (same behaviour):
+
+```rust
+// imd-teammate-branch canonical name:
+ccteam_imd::credentials::save(
+    &ccteam_imd::credentials::default_path(),
+    &Credentials { telegram: Some(result.creds), ..Default::default() },
+)?;
+
+// or the wave-2/creator-branch convenience wrapper:
+ccteam_imd::credentials::write_credentials(
+    &Credentials { telegram: Some(result.creds), ..Default::default() },
+)?;
+```
+
+`result.bot_username` (carried separately on `TelegramSetupResult`,
+not on the on-disk `TelegramCreds`) is used for the user-facing
+"在 TG 找 @xxx" reply line — it's not persisted to credentials.json.
 
 ### 2d. Error handling
 
@@ -121,11 +137,14 @@ The credentials file lives at `~/.ccteam/im/credentials.json` with
 {
   "telegram": {
     "bot_token": "1234:abcd...",
-    "bot_username": "@helpful_assistant",
-    "owner_chat_id": 987654321
+    "allowed_chat_ids": ["987654321"]
   }
 }
 ```
+
+(`bot_username` is **not** persisted — it's a transient field on the
+in-memory `TelegramSetupResult`. The daemon only needs the token +
+chat_id ACL.)
 
 **Do not**:
 - write the token into env vars (users shouldn't have to learn `.bashrc`)

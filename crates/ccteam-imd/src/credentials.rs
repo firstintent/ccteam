@@ -49,19 +49,15 @@ impl ImPlatform {
 ///
 /// Schema is aligned with the in-flight imd-teammate branch
 /// (`v0-6-0-wave-2-imd`) so merging the two branches is a no-op
-/// rather than a struct-rename diff. Notably `allowed_chat_ids` is a
-/// `Vec<String>` (not a single `i64`) so the daemon-side router can
-/// extend the ACL without a schema migration when the user adds
-/// secondary recipients.
+/// rather than a struct-rename diff. **Strictly on-disk only** —
+/// transient bookkeeping like `bot_username` that onboarding wants
+/// to surface to the user lives on a `TelegramSetupResult` wrapper
+/// in `onboarding.rs` (per imd's reply: "don't add bot_username to
+/// `TelegramCreds` because that's the on-disk schema").
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TelegramCredentials {
+pub struct TelegramCreds {
     /// Bot token from @BotFather (`<botid>:<hash>`).
     pub bot_token: String,
-    /// Bot handle returned by `getMe`, including leading `@`. Kept as
-    /// a convenience for the skill UX ("在 TG 找 @xxx") even though
-    /// imd's daemon path only reads `allowed_chat_ids` directly.
-    #[serde(default)]
-    pub bot_username: String,
     /// chat_ids the bot is permitted to talk to. Index 0 is the first
     /// captured chat_id from onboarding (the "owner" chat).
     /// Stringly-typed because Slack / Discord chat ids are not always
@@ -70,7 +66,7 @@ pub struct TelegramCredentials {
     pub allowed_chat_ids: Vec<String>,
 }
 
-impl TelegramCredentials {
+impl TelegramCreds {
     /// Convenience accessor — the first chat_id captured during
     /// onboarding, used as the "owner" everywhere unsolicited DMs are
     /// sent. Returns `None` only on pathologically empty records.
@@ -79,15 +75,21 @@ impl TelegramCredentials {
     }
 }
 
+/// Deprecated alias for [`TelegramCreds`]. Kept on the wave-2/creator
+/// branch only — the imd-teammate branch lands `TelegramCreds` as the
+/// canonical name. Will be deleted at merge time.
+#[deprecated(note = "renamed to TelegramCreds to match the imd-teammate branch")]
+pub type TelegramCredentials = TelegramCreds;
+
 /// Top-level credentials document persisted to
 /// `~/.ccteam/im/credentials.json`. Each platform key is `Option` so
 /// partial onboarding state round-trips cleanly.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Credentials {
-    pub telegram: Option<TelegramCredentials>,
-    // V0.7: pub slack: Option<SlackCredentials>,
-    // V0.7: pub discord: Option<DiscordCredentials>,
+    pub telegram: Option<TelegramCreds>,
+    // V0.7: pub slack: Option<SlackCreds>,
+    // V0.7: pub discord: Option<DiscordCreds>,
 }
 
 /// Resolve the absolute path to the credentials file
@@ -95,16 +97,28 @@ pub struct Credentials {
 /// equivalents via the `dirs` crate. Falls back to `/tmp` on systems
 /// without a home directory (tests rely on env-var overrides
 /// upstream, so this is best-effort only).
-pub fn credentials_path() -> PathBuf {
+///
+/// Two names for the same function — `default_path` is the imd-
+/// teammate branch's canonical name; `credentials_path` is the
+/// historical name kept for the wave-2/creator-side call sites. The
+/// merge keeps `default_path` and drops the alias.
+pub fn default_path() -> PathBuf {
     let base = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
     base.join(".ccteam").join("im").join("credentials.json")
+}
+
+/// Wave-2/creator-branch alias for [`default_path`]. Deleted at
+/// merge time — call sites should migrate to `default_path()`.
+#[deprecated(note = "use `default_path()` to match the imd-teammate branch")]
+pub fn credentials_path() -> PathBuf {
+    default_path()
 }
 
 /// Load the credentials document from disk. Returns
 /// `Ok(Credentials::default())` when the file does not exist (first
 /// run); returns an error only on read / parse failure.
 pub fn load_credentials() -> Result<Credentials> {
-    load_credentials_from(&credentials_path())
+    load_credentials_from(&default_path())
 }
 
 /// Like [`load_credentials`] but with an explicit path — used by
@@ -123,11 +137,25 @@ pub fn load_credentials_from(path: &std::path::Path) -> Result<Credentials> {
 /// Persist `creds` to `~/.ccteam/im/credentials.json` with 0600
 /// permissions. Creates the parent dir if missing. Atomic-ish:
 /// writes to `<path>.tmp` then renames.
-pub fn write_credentials(creds: &Credentials) -> Result<()> {
-    write_credentials_to(&credentials_path(), creds)
+///
+/// Wave-2/creator name; the imd-teammate branch exposes the same
+/// behaviour as `save(path, creds)`. The merge keeps `save` + this
+/// wrapper (per imd's reply: "your onboarding can keep
+/// `write_credentials` as a thin wrapper").
+pub fn write_credentials(creds: &Credentials) -> Result<PathBuf> {
+    let p = default_path();
+    save(&p, creds)?;
+    Ok(p)
 }
 
-/// Like [`write_credentials`] but with an explicit path.
+/// imd-teammate-branch canonical name for [`write_credentials_to`].
+/// Takes an explicit path so callers can stage credentials under a
+/// tempdir for tests.
+pub fn save(path: &std::path::Path, creds: &Credentials) -> Result<()> {
+    write_credentials_to(path, creds)
+}
+
+/// Like [`save`] under the wave-2/creator name. Deleted at merge time.
 pub fn write_credentials_to(path: &std::path::Path, creds: &Credentials) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("mkdir -p {parent:?}"))?;
@@ -166,15 +194,14 @@ mod tests {
     #[test]
     fn round_trip_telegram() {
         let c = Credentials {
-            telegram: Some(TelegramCredentials {
+            telegram: Some(TelegramCreds {
                 bot_token: "123:abc".into(),
-                bot_username: "@helpful_assistant".into(),
                 allowed_chat_ids: vec!["987".into()],
             }),
         };
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("creds.json");
-        write_credentials_to(&p, &c).unwrap();
+        save(&p, &c).unwrap();
         let back = load_credentials_from(&p).unwrap();
         assert_eq!(c, back);
         assert_eq!(c.telegram.as_ref().unwrap().owner_chat_id(), Some("987"));

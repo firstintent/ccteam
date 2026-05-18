@@ -2,7 +2,7 @@
 //! Uses a tempdir to avoid touching the real `~/.ccteam/im/`.
 
 use ccteam_imd::credentials::{
-    load_credentials_from, write_credentials_to, Credentials, TelegramCredentials,
+    load_credentials_from, save, write_credentials_to, Credentials, TelegramCreds,
 };
 
 #[test]
@@ -11,14 +11,13 @@ fn round_trip_telegram_credentials() {
     let p = dir.path().join("creds.json");
 
     let creds = Credentials {
-        telegram: Some(TelegramCredentials {
+        telegram: Some(TelegramCreds {
             bot_token: "12345:secret_token_value".into(),
-            bot_username: "@helpful_assistant".into(),
             allowed_chat_ids: vec!["1234567890".into()],
         }),
     };
 
-    write_credentials_to(&p, &creds).unwrap();
+    save(&p, &creds).unwrap();
     let back = load_credentials_from(&p).unwrap();
     assert_eq!(creds, back);
 }
