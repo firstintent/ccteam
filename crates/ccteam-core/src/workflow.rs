@@ -90,6 +90,12 @@ pub struct WorkflowSpec {
     /// `artifact-driven` mode (the V0.4.6 default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_team: Option<AgentTeamSpec>,
+    /// V0.6.0 F108 — populated when `mode: chat`. Holds the bot handle
+    /// plus chat-mode tunables (compact cadence, hop limit, recovery
+    /// window, optional ACL). `None` in `artifact-driven` /
+    /// `agent-team` modes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat: Option<ChatSpec>,
     /// Role → agent spec. `IndexMap` preserves YAML declaration order so
     /// trigger graph build is deterministic across runs.
     ///
@@ -122,6 +128,10 @@ pub enum WorkflowMode {
     /// V0.5.0 F93b. Driven by a single ccteam-managed `__lead`
     /// session under Anthropic Agent Teams.
     AgentTeam,
+    /// V0.6.0 F108. Long-running Claude Code TUI session (tmux +
+    /// send-keys -l) acting as a chat bot. User talks to it via IM
+    /// (`ccteam-imd`); each turn is one tmux send-keys + Stop hook.
+    Chat,
 }
 
 /// Predicate paired with `WorkflowMode::default()` so an explicit
@@ -399,6 +409,81 @@ pub struct SuggestedTeammate {
     pub adhoc_tools: Option<Vec<String>>,
 }
 
+/// V0.6.0 F108 — populated when `WorkflowSpec::mode == Chat`.
+///
+/// ```yaml
+/// mode: chat
+/// chat:
+///   bot_name: alice                # optional; falls back to creator pool
+///   compact_every_turns: 50        # optional; None = let Claude auto-compact
+///   hop_limit: 3                   # default 3
+///   recover_last_n_turns: 20       # F118 — turns rehydrated on session-id loss
+///   chat_acl:                      # optional; default None = allow any IM user
+///     allow_users:   ["@alice", "@bob"]
+///     allow_groups:  ["@dev-team"]
+/// ```
+///
+/// All fields default via `#[serde(default)]` so a bare `chat:` block
+/// (or no `chat:` field at all when [`crate::workflow::WorkflowMode::Chat`]
+/// is the mode) still parses. Wave 2 `ClaudeTuiAdapter` consumes
+/// `compact_every_turns` / `recover_last_n_turns`; the imd / creator
+/// teammates consume `bot_name` / `chat_acl`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+pub struct ChatSpec {
+    /// Bot handle (also the agent role name → `.claude/agents/<bot>.md`).
+    /// Defaults to `None` so `ccteam-creator` can pick from the naming
+    /// pool at scaffold time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot_name: Option<String>,
+    /// V0.6.0 F108: turn count after which the orchestrator issues a
+    /// `/compact` SystemDirective to the TUI session. `None` = let
+    /// Claude Code auto-compact at its own threshold (default ~25%
+    /// context remaining).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_every_turns: Option<u32>,
+    /// V0.6.0 F108: bot-to-bot consultation hop ceiling (`@<bot>` mention
+    /// chain). When the chain reaches this depth the orchestrator emits
+    /// `chat_hop_escalate` instead of forwarding. Defaults to 3 via
+    /// [`default_hop_limit`].
+    #[serde(default = "default_hop_limit")]
+    pub hop_limit: u32,
+    /// V0.6.0 F118: how many turns from `<bot>/turns.jsonl` the
+    /// recovery flow rehydrates into the new tmux session when the
+    /// previous session-id is invalidated. Defaults to 20 via
+    /// [`default_recover_last_n_turns`].
+    #[serde(default = "default_recover_last_n_turns")]
+    pub recover_last_n_turns: usize,
+    /// V0.6.0 F108: optional IM-side ACL. `None` = allow any user /
+    /// group the IM channel hands us (Wave 2 default; F113 hardens).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_acl: Option<ChatAcl>,
+}
+
+/// V0.6.0 F108 hop-limit default — 3 hops matches the V0.4.x fix-loop
+/// escalate cadence (CLAUDE.md §三 红线 "fix-loop 撞 3 次必 escalate").
+pub fn default_hop_limit() -> u32 {
+    3
+}
+
+/// V0.6.0 F118 recover_last_n_turns default — 20 turns covers a typical
+/// chat session (~5 minutes of conversation) without exceeding Claude's
+/// initial-context budget.
+pub fn default_recover_last_n_turns() -> usize {
+    20
+}
+
+/// V0.6.0 F108 — optional ACL gate for `mode: chat` bots. Empty vecs
+/// match nothing (use `None` on [`ChatSpec::chat_acl`] for "allow
+/// anyone"). Each `@handle` entry is matched verbatim against the IM
+/// payload's user/group identifier.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+pub struct ChatAcl {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_users: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_groups: Vec<String>,
+}
+
 /// V0.5.0 F93b — `SuggestedTeammate::kind` discriminator.
 ///
 /// `definition`: `.claude/agents/<role>.md` exists; the lead uses
@@ -621,6 +706,34 @@ impl WorkflowSpec {
                     ));
                 }
             }
+            WorkflowMode::Chat => {
+                // V0.6.0 F108: `agents` may be empty (the bot is the
+                // sole live actor; `.claude/agents/<bot>.md` carries
+                // its definition). `chat:` block is optional — when
+                // absent, all defaults apply.
+                if self.agent_team.is_some() {
+                    return Err(WorkflowError::ValidationFailed(
+                        "agent_team block is only valid when mode: agent-team".to_string(),
+                    ));
+                }
+                if let Some(chat) = self.chat.as_ref() {
+                    if let Some(ref bot) = chat.bot_name {
+                        validate_role_name(bot).map_err(|_| {
+                            WorkflowError::ValidationFailed(format!(
+                                "chat.bot_name `{bot}`: only [a-z0-9_-] allowed (must map to \
+                                 .claude/agents/<bot>.md filename)"
+                            ))
+                        })?;
+                    }
+                    if chat.hop_limit == 0 {
+                        return Err(WorkflowError::ValidationFailed(
+                            "chat.hop_limit must be >= 1 (0 disables bot-to-bot consultation \
+                             entirely; use omit-field if that's what you want)"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
             WorkflowMode::AgentTeam => {
                 let team = self.agent_team.as_ref().ok_or_else(|| {
                     WorkflowError::ValidationFailed(
@@ -746,6 +859,7 @@ mod tests {
             budget: None,
             budgets_v060: None,
             agent_team: None,
+            chat: None,
             agents: {
                 let mut m = IndexMap::new();
                 m.insert(

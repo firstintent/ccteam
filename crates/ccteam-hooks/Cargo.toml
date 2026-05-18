@@ -16,3 +16,7 @@ anyhow.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# V0.6.0 F108 — chat_progress integration tests share env vars
+# (`CCTEAM_CHAT_ROLE`, `CCTEAM_HOME`) and must serialize on the same
+# process-wide mutex to avoid cross-test bleed.
+serial_test = "3"

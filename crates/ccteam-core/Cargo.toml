@@ -59,6 +59,12 @@ tempfile = "3"
 # dev-dependency for cargo dedup.
 serial_test = "3"
 
+# V0.6.0 Wave 2 F114 — persona_test.rs parses
+# `skills/ccteam-creator/personas/manifest.toml` to verify every
+# persona id has matching zh/en role.md files. Test-only dep —
+# runtime ccteam-core does not need a TOML parser.
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+
 [features]
 default = ["test-util"]
 # V0.4.0 F62 — gates CodexAdapter integration tests

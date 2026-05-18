@@ -25,6 +25,19 @@ pub use project_mcp_json::{
     merge_project_mcp_json, render_project_mcp_json, CCTEAM_MCP_SERVER_KEY,
 };
 
+// V0.6.0 Wave 2 F114 — `ccteam-creator` preset workflow.yaml templates.
+// Five presets (inproc-solo / inproc-team / bg-overnight / chat-pocket /
+// chat-squad) rendered via dep-free `{{var}}` substitution. The skill
+// picks a preset from `mode_inferrer` + persona, fills `TemplateCtx`,
+// calls `render(preset, &ctx)`, then writes the result to
+// `<project>/.ccteam/workflow.yaml`.
+pub mod workflow_templates;
+pub use workflow_templates::{
+    default_ctx as default_workflow_ctx, render as render_workflow_template,
+    Preset as WorkflowPreset, RenderError as WorkflowTemplateRenderError,
+    TemplateCtx as WorkflowTemplateCtx,
+};
+
 /// Per-project `.claude/settings.json` template. The template uses
 /// `__CCTEAM_BIN__` everywhere a real install would name the absolute
 /// `ccteam` binary path; we substitute the running binary's absolute path

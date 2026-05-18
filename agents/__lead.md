@@ -246,6 +246,32 @@ require new tasks:
 After step 4, you (the lead session) return to normal chat state.
 `ccteam stop <slug>` will cleanup remaining state.
 
+## Stage handoff doc (F115)
+
+V0.6.0 F115 — 每完成一个 stage / wave / fix-loop iteration,**写一份 handoff doc** 到:
+
+`<project>/.ccteam/handoffs/<workflow-slug>/stage-<N>-<role>.md`
+
+10-30 行 markdown,bullet 风格,5 段:
+
+```markdown
+<!-- ccteam handoff -->
+# Stage <N>: <Stage Name> (<role>)
+
+**Decided**: 你选了什么方案
+**Rejected**: 你拒了什么方案 + 为啥
+**Risks**: 留给下一步的风险
+**Files changed**: 文件 + why
+**Remaining**: 还没干的事
+```
+
+下一 stage 的 spawn prompt(workflow.yaml 配 `{{include_prev_handoffs}}` token)
+会自动注入前 3 个 handoff,避免 context compact 后丢决策。fix-loop 撞 3 次
+escalate 时,handoff 摘要也会自动 attach 到 meta-agent inbox 让用户看到
+完整决策 trace。
+
+借 OMC `.omc/handoffs/<stage>.md` pattern(`references/oh-my-claudecode/skills/team/SKILL.md`)。
+
 ## What you do NOT do
 
 - Do NOT call `TeamCreate` before user approval (Plan-first 红线).

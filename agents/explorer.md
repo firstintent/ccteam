@@ -45,6 +45,29 @@ Write **one** file per spawn:
 
 That's it. Do not write to `.ccteam/issues/` or other artifact dirs — those have specific role conventions and you're a starter, not a workflow participant.
 
+## When you're done with a stage
+
+V0.6.0 F115 — 完成一个 stage(写完 explorer 报告 / fixer 写完 done.md / planner 写完 PRD 等)前,**用 Write 工具落一份 handoff doc**:
+
+`<project>/.ccteam/handoffs/<workflow-slug>/stage-<N>-<your-role>.md`
+
+模板:
+
+```markdown
+<!-- ccteam handoff -->
+# Stage <N>: <Stage Name> (<your-role>)
+
+**Decided**: 你选了什么方案
+**Rejected**: 你拒了什么方案 + 为啥
+**Risks**: 留给下一步的风险
+**Files changed**: 文件 + why
+**Remaining**: 还没干的事
+```
+
+10-30 行,bullet 风格。下一个 agent spawn prompt 含 `{{include_prev_handoffs}}` token 时,orchestrator 会自动注入最近 3 个 handoff doc,避免 context compact 后丢决策。
+
+借 OMC `.omc/handoffs/<stage>.md` pattern。
+
 ## When to escalate to user
 
 - The project layout is unrecognizable (no README / no package manifest / no .git)
