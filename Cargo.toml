@@ -5,6 +5,7 @@ members = [
     "crates/ccteam-cost",
     "crates/ccteam-cli",
     "crates/ccteam-hooks",
+    "crates/ccteam-imd",
     "crates/ccteam-web",
     # V0.6.0 Wave 2 F109/F116 — IM-bot daemon + supervisor.
     "crates/ccteam-imd",
@@ -20,6 +21,7 @@ license = "MIT"
 ccteam-core = { path = "crates/ccteam-core" }
 ccteam-cost = { path = "crates/ccteam-cost" }
 ccteam-hooks = { path = "crates/ccteam-hooks" }
+ccteam-imd = { path = "crates/ccteam-imd" }
 ccteam-web = { path = "crates/ccteam-web" }
 
 tokio = { version = "1", features = ["full"] }

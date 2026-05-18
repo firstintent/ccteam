@@ -9,6 +9,9 @@
 //! shape (F63) and artifact-trigger watcher (F64).
 
 pub mod actions;
+// V0.6.0 Wave 2 F114 — scientist nickname pool used by ccteam-creator
+// when minting bot handles for new chat workflows.
+pub mod agent_naming;
 // V0.4.0 F64 — artifact-trigger filesystem watcher (inotify / fsevents).
 // Emits ArtifactEvent for every workflow.yaml `Trigger::Watch(<path>)`
 // agent. See module docs + docs/v0-4-0/prd.md §6.2.
@@ -34,6 +37,9 @@ pub mod memory_bridge;
 pub mod meta_agent;
 // V0.4.2 F74 — one-shot migration (V0.4.1 → V0.4.2 config.yaml fold).
 pub mod migration;
+// V0.6.0 Wave 2 F114 — rule-based NL intent → ExecutionMode inferrer
+// used by the `ccteam-creator` skill's Phase 2.
+pub mod mode_inferrer;
 pub mod orchestrator;
 pub mod paths;
 pub mod pending_inject;
@@ -206,12 +212,15 @@ pub use team_resolver::{
     TeamSource, TEAM_SOURCES,
 };
 pub use templates::{
-    current_ccteam_bin, merge_project_mcp_json, render_project_mcp_json,
-    render_project_settings, render_project_settings_agent_team, write_global_helper_templates,
-    write_project_settings, write_project_settings_agent_team, EnabledPluginsSetting, SettingsEnv,
-    CCTEAM_MCP_SERVER_KEY, HELPER_TEMPLATES, PROJECT_SETTINGS_AGENT_TEAM_JSON,
-    PROJECT_SETTINGS_JSON,
+    current_ccteam_bin, default_workflow_ctx, merge_project_mcp_json, render_project_mcp_json,
+    render_project_settings, render_project_settings_agent_team, render_workflow_template,
+    write_global_helper_templates, write_project_settings, write_project_settings_agent_team,
+    EnabledPluginsSetting, SettingsEnv, WorkflowPreset, WorkflowTemplateCtx,
+    WorkflowTemplateRenderError, CCTEAM_MCP_SERVER_KEY, HELPER_TEMPLATES,
+    PROJECT_SETTINGS_AGENT_TEAM_JSON, PROJECT_SETTINGS_JSON,
 };
+pub use agent_naming::{pick_unused_bot_name, SCIENTIST_NAMES};
+pub use mode_inferrer::{infer_mode, CreatorMode, InferenceResult, Intent, Presence, Timeline};
 pub use tmux::{
     capture_pane_tail, capture_pane_tail_from_session, capture_pane_with_ansi,
     capture_pane_with_ansi_from_session, pid_is_alive, query_pane_dims,
