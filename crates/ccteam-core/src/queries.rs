@@ -292,6 +292,21 @@ pub struct CostSummary {
     /// Number of open `agent_spawn` events (no matching `agent_done`)
     /// whose [`cost_active_usd`] contribution was probed.
     pub session_count_active: u32,
+    /// V0.6.0 Wave 3 F112 — per-vendor breakdown of the 24h cost
+    /// bucket. Keys are JSON-lowercased vendor names (`"claude"`,
+    /// `"codex"`). The aggregate `cost_24h_usd` remains the sum across
+    /// all vendors (consumers tolerant of the legacy single-vendor
+    /// shape see no diff). Empty when no `agent_done` event in the
+    /// 24h window carried a `vendor` field — V0.5.x events lacking
+    /// `vendor` are silently folded into `cost_24h_usd` only.
+    #[serde(default)]
+    pub cost_24h_by_vendor: std::collections::BTreeMap<String, f64>,
+    /// V0.6.0 Wave 3 F112 — per-vendor lifetime cost. Same vendor-key
+    /// semantics as `cost_24h_by_vendor`. Drives the
+    /// `ccteam-control show-cost` per-vendor breakdown and the
+    /// per-vendor budget cap check.
+    #[serde(default)]
+    pub cost_total_by_vendor: std::collections::BTreeMap<String, f64>,
 }
 
 /// Build a [`CostSummary`] for `slug` by reading `progress_path`
@@ -337,6 +352,10 @@ where
     let mut cost_total_usd = 0.0;
     let mut cost_24h_usd = 0.0;
     let mut session_count_24h: u32 = 0;
+    let mut cost_24h_by_vendor: std::collections::BTreeMap<String, f64> =
+        std::collections::BTreeMap::new();
+    let mut cost_total_by_vendor: std::collections::BTreeMap<String, f64> =
+        std::collections::BTreeMap::new();
     for event in events {
         if event.get("event").and_then(|s| s.as_str()) != Some("agent_done") {
             continue;
@@ -346,6 +365,16 @@ where
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0);
         cost_total_usd += cost;
+        // V0.6.0 Wave 3 F112: optional `vendor` field on `agent_done`.
+        // V0.5.x events lack this field; they contribute to the
+        // aggregate cost_total_usd / cost_24h_usd but not the per-
+        // vendor breakdown (the F84 per-vendor budget caps therefore
+        // only act on V0.6+ events, matching the per-vendor opt-in
+        // shape of `Budgets { claude, codex }`).
+        let vendor = event.get("vendor").and_then(|v| v.as_str());
+        if let Some(v) = vendor {
+            *cost_total_by_vendor.entry(v.to_string()).or_insert(0.0) += cost;
+        }
 
         // 24h filter: events with missing or unparseable `ts` are
         // counted in the 24h bucket (defensive — newly-written rows
@@ -362,6 +391,9 @@ where
         if in_window {
             cost_24h_usd += cost;
             session_count_24h = session_count_24h.saturating_add(1);
+            if let Some(v) = vendor {
+                *cost_24h_by_vendor.entry(v.to_string()).or_insert(0.0) += cost;
+            }
         }
     }
 
@@ -402,6 +434,8 @@ where
         cost_total_usd,
         session_count_24h,
         session_count_active,
+        cost_24h_by_vendor,
+        cost_total_by_vendor,
     }
 }
 

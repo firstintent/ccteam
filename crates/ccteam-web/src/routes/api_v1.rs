@@ -111,6 +111,13 @@ pub struct ProjectSummary {
     pub events: Vec<EventRow>,
     pub outbox: Vec<OutboxRow>,
     pub workflow_summary: Option<WorkflowSummary>,
+    /// V0.6.0 Wave 3 F112 — per-vendor 24h cost breakdown
+    /// (`{"claude": <f64>, "codex": <f64>}`). Pre-V0.6 `agent_done`
+    /// events lacked a `vendor` field and contribute only to the
+    /// aggregate `cost_label`; this map is empty when the project
+    /// hasn't run any V0.6+ vendor-tagged turns yet.
+    #[serde(default)]
+    pub cost_24h_by_vendor: std::collections::BTreeMap<String, f64>,
 }
 
 /// JSON returned by `GET /api/v1/projects/{slug}/sessions/{sid}`.
@@ -260,9 +267,12 @@ async fn handle_project(
     // V0.4.6 F91 — cost_label sources `cost_total_usd` from
     // `cost_summary` (progress.jsonl + live state.json). Pre-F91 this
     // line read `state.cost_used_usd`, which is now frozen.
-    let cost_total = cost_summary(&slug, &app.paths.progress_jsonl(&slug), &app.paths)
-        .map(|c| c.cost_total_usd)
-        .unwrap_or(0.0);
+    // V0.6.0 Wave 3 F112 — also surface `cost_24h_by_vendor` to drive
+    // the SPA's per-vendor split and `/ccteam-advise` UI.
+    let cost = cost_summary(&slug, &app.paths.progress_jsonl(&slug), &app.paths)
+        .unwrap_or_default();
+    let cost_total = cost.cost_total_usd;
+    let cost_24h_by_vendor = cost.cost_24h_by_vendor.clone();
     let summary = ProjectSummary {
         slug: state.slug.clone(),
         team: state.team.clone(),
@@ -277,6 +287,7 @@ async fn handle_project(
         events: event_rows,
         outbox,
         workflow_summary,
+        cost_24h_by_vendor,
     };
     Json(summary).into_response()
 }

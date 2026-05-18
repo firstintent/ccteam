@@ -537,6 +537,16 @@ enum Command {
         /// to upgrade ccteam when the bundled rate sheet ages out.
         #[arg(long, default_value_t = false)]
         check_pricing_version: bool,
+        /// V0.6.0 Wave 3 F112: probe `codex --version` and warn when
+        /// older than 0.131 (minimum supported by Wave 3 mode-3 codex
+        /// bot path). No fs mutation. Pairs with --check-codex-auth.
+        #[arg(long, default_value_t = false)]
+        check_codex_version: bool,
+        /// V0.6.0 Wave 3 F112: probe `codex login status` and report
+        /// whether the operator is logged in to ChatGPT / API. No fs
+        /// mutation. Pairs with --check-codex-version.
+        #[arg(long, default_value_t = false)]
+        check_codex_auth: bool,
         /// V0.4.6 F83/F85: pair with `--migrate-workflow-to-ccteam-dir`
         /// or `--gc-claude-jobs` to commit changes to disk instead of
         /// previewing them. Without it, those subcommands run as
@@ -945,6 +955,8 @@ fn main() -> Result<()> {
             gc_claude_jobs,
             update_hooks,
             check_pricing_version,
+            check_codex_version,
+            check_codex_auth,
             apply,
         } => {
             // V0.4.1 `--install-all` is sugar for the three first-run
@@ -993,6 +1005,8 @@ fn main() -> Result<()> {
                 gc_apply: apply,
                 update_hooks,
                 check_pricing_version,
+                check_codex_version,
+                check_codex_auth,
             })
         }
         Command::Session { action } => run_session(action),
