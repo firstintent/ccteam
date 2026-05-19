@@ -7,10 +7,13 @@
 # against an already-deployed remote (see `deploy-to-nas.sh`) or, with
 # `CCTEAM_PROBE_LOCAL=1`, against the local checkout for dry-run.
 #
-# V0.6.1 F119 — pocket-assistant / im-squad now actively manage the
-# ccteam-imd daemon lifecycle: spawn → health-wait → exercise → stop +
-# capture daemon stderr on crash. `CCTEAM_PROBE_SKIP_DAEMON_START=1`
-# leaves daemon management to the caller.
+# V0.6.1 F119 / F130 — pocket-assistant / im-squad now actively manage
+# the combined ccteam daemon lifecycle: spawn (`ccteam start --no-web`)
+# → heartbeat-wait → exercise → `ccteam stop` + capture daemon stderr
+# on crash. F130 folded the standalone `ccteam-imd` binary into
+# `ccteam start`, so the probe no longer manages a separate IMD
+# process. `CCTEAM_PROBE_SKIP_DAEMON_START=1` still leaves daemon
+# management to the caller.
 #
 # V0.6.1 F120 — overnight-builder now scaffolds a fake artifact-driven
 # workflow under `/tmp/host-probe-overnight/`, plants a stub claude
@@ -47,9 +50,10 @@
 #   CCTEAM_PROBE_LOCAL           — "1" runs scenarios locally (no SSH).
 #                                  Used by `cargo` callers to dry-run the
 #                                  script during PR review.
-#   CCTEAM_PROBE_SKIP_DAEMON_START — "1" leaves ccteam-imd daemon lifecycle
-#                                    to the caller (F119); the script
-#                                    assumes a daemon is already running.
+#   CCTEAM_PROBE_SKIP_DAEMON_START — "1" leaves combined-daemon (orchestrator
+#                                    + IMD) lifecycle to the caller
+#                                    (F119/F130); the script assumes the
+#                                    daemon is already running.
 #
 # Each scenario function MUST be safe to skip independently. A
 # scenario records `status=skip` with a reason when its prerequisites
@@ -171,15 +175,17 @@ mark() {
     echo "$2" > "$OUT_DIR/$1/status"
 }
 
-# ---------- F119 daemon-lifecycle snippets ----------
+# ---------- V0.6.1 F130 daemon-lifecycle snippets ----------
 #
-# `daemon_start_snippet <scenario>` returns a bash snippet that:
-#   - spawns `ccteam-imd run` in background (writes pid + stderr to /tmp)
-#   - polls `ccteam-imd health --timeout-seconds 30` for readiness
-#   - on health failure: dumps daemon stderr, kills the pid, exits 11
+# F130 folded the standalone `ccteam-imd` binary into `ccteam start`
+# (single process: orchestrator + web + IMD supervisor as 3 tokio
+# tasks sharing one shutdown channel). The probe now starts the
+# combined daemon via `ccteam start --no-web` (web rolled in but
+# mode-3 probes don't need the UI listener) and waits on the IMD
+# heartbeat file directly — no separate `ccteam-imd health` binary.
 #
-# When CCTEAM_PROBE_SKIP_DAEMON_START=1, the snippet becomes a no-op
-# stub so callers managing their own daemons aren't disturbed.
+# When CCTEAM_PROBE_SKIP_DAEMON_START=1, the snippets become no-op
+# stubs so callers managing their own daemons aren't disturbed.
 daemon_start_snippet() {
     local scenario="$1"
     local pidfile="/tmp/ccteam-imd-probe-$scenario.pid"
@@ -191,20 +197,35 @@ EOF
         return
     fi
     cat <<EOF
-echo "[probe/$scenario] F119: starting ccteam-imd daemon"
-nohup ./target/release/ccteam-imd run --tick-seconds 2 \\
+echo "[probe/$scenario] F130: starting combined ccteam daemon (orchestrator + IMD)"
+nohup ./target/release/ccteam start --no-web \\
     >/tmp/ccteam-imd-probe-$scenario.stdout 2>$stderrfile &
 echo \$! > $pidfile
 echo "[probe/$scenario] daemon pid=\$(cat $pidfile)"
-if ! ./target/release/ccteam-imd health --timeout-seconds 30 --poll-ms 200; then
-    echo "[probe/$scenario] F119: health-wait FAILED — dumping last 50 lines of daemon stderr:"
+# Wait for the IMD heartbeat file the supervisor task refreshes each
+# tick (same path the V0.6.0 standalone daemon wrote).
+heartbeat="\$HOME/.ccteam/state/imd.heartbeat"
+started_at=\$(date +%s)
+ready=0
+for _i in \$(seq 1 150); do
+    if [[ -f "\$heartbeat" ]]; then
+        mtime=\$(stat -c %Y "\$heartbeat" 2>/dev/null || stat -f %m "\$heartbeat" 2>/dev/null || echo 0)
+        if (( mtime >= started_at )); then
+            ready=1
+            break
+        fi
+    fi
+    sleep 0.2
+done
+if (( ready != 1 )); then
+    echo "[probe/$scenario] F130: heartbeat-wait FAILED — dumping last 50 lines of daemon stderr:"
     echo "=== DAEMON STDERR (tail 50) ==="
     tail -50 $stderrfile 2>/dev/null || true
     echo "=== END DAEMON STDERR ==="
     kill -TERM \$(cat $pidfile) 2>/dev/null || true
     exit 11
 fi
-echo "[probe/$scenario] F119: daemon ready"
+echo "[probe/$scenario] F130: daemon ready (heartbeat at \$heartbeat)"
 EOF
 }
 
@@ -219,18 +240,25 @@ EOF
         return
     fi
     cat <<EOF
-echo "[probe/$scenario] F119: stopping ccteam-imd daemon"
+echo "[probe/$scenario] F130: stopping combined ccteam daemon"
 if [[ -f $pidfile ]]; then
     PID=\$(cat $pidfile)
-    kill -TERM \$PID 2>/dev/null || true
-    for _i in 1 2 3 4 5; do
+    # \`ccteam stop\` writes the shutdown trigger that drains
+    # orchestrator + IMD + web together (F86 graceful path).
+    ./target/release/ccteam stop >/dev/null 2>&1 || true
+    for _i in 1 2 3 4 5 6 7 8 9 10; do
         if ! kill -0 \$PID 2>/dev/null; then
             break
         fi
         sleep 1
     done
     if kill -0 \$PID 2>/dev/null; then
-        echo "[probe/$scenario] F119: daemon did not exit gracefully; SIGKILL"
+        echo "[probe/$scenario] F130: daemon did not exit gracefully; SIGTERM"
+        kill -TERM \$PID 2>/dev/null || true
+        sleep 2
+    fi
+    if kill -0 \$PID 2>/dev/null; then
+        echo "[probe/$scenario] F130: still alive; SIGKILL"
         kill -KILL \$PID 2>/dev/null || true
     fi
     rm -f $pidfile
@@ -298,8 +326,10 @@ probe_overnight_builder() {
         mkdir -p $PROJ/.ccteam/triggers/worker
         mkdir -p $PROJ/.claude/agents
 
-        # Stash the abs path to the ccteam + ccteam-imd binaries before
-        # any cd, so background invocations are unambiguous.
+        # Stash the abs path to the ccteam binary before any cd, so
+        # background invocations are unambiguous. (V0.6.1 F130: the
+        # standalone `ccteam-imd` binary is gone; supervisor now runs
+        # inside `ccteam start`.)
         CCTEAM_BIN="$(pwd)/target/release/ccteam"
 
         # F120 step 1 — write the worker agent profile only here;
@@ -362,9 +392,13 @@ agents:
     parallelism: 1
 YAML
 
-        # F120 step 3c — start orchestrator (no-web). It scans
+        # F120 step 3c — start orchestrator (no-web, no-imd). It scans
         # CCTEAM_HOME/config.yaml::projects[] for the registered slug.
-        nohup "$CCTEAM_BIN" start --no-web --tick-seconds 1 \
+        # V0.6.1 F130: `--no-imd` also skips the IMD supervisor task so
+        # the overnight probe stays strictly orchestrator-only and the
+        # supervisor's `~/.ccteam/state/imd.heartbeat` doesn't touch
+        # the real $HOME during the probe.
+        nohup "$CCTEAM_BIN" start --no-web --no-imd --tick-seconds 1 \
             >$ROOT/start.stdout 2>$ROOT/start.stderr &
         ORCH_PID=$!
         echo $ORCH_PID > $ROOT/orch.pid
@@ -448,7 +482,9 @@ probe_pocket_assistant() {
             echo '[probe] pocket-assistant: real TG e2e against @web3op_bot'
             echo '[probe] expects ~/.ccteam/im/credentials.json on remote'
             test -f \$HOME/.ccteam/im/credentials.json || { echo 'missing credentials.json'; exit 9; }
-            ./target/release/ccteam-imd status 2>&1 || true
+            # V0.6.1 F130 — daemon status via heartbeat freshness (no
+            # \`ccteam-imd status\` subcommand anymore).
+            stat -c '%y %n' \$HOME/.ccteam/state/imd.heartbeat 2>/dev/null || true
             $(daemon_stop_snippet pocket-assistant)
         "
         fetch_daemon_stderr pocket-assistant
@@ -464,8 +500,8 @@ probe_pocket_assistant() {
         remote_run pocket-assistant "
             $(daemon_start_snippet pocket-assistant)
             echo '[probe] pocket-assistant: mock channel e2e'
-            echo '[probe] F119 daemon-up smoke: status output + heartbeat fresh'
-            ./target/release/ccteam-imd status 2>&1 | head -10 || true
+            echo '[probe] F130 daemon-up smoke: heartbeat fresh'
+            stat -c '%y %n' \$HOME/.ccteam/state/imd.heartbeat 2>/dev/null || true
             $(daemon_stop_snippet pocket-assistant)
         "
         fetch_daemon_stderr pocket-assistant
@@ -481,7 +517,7 @@ probe_im_squad() {
             $(daemon_start_snippet im-squad)
             echo '[probe] im-squad: real TG group + 2 bots'
             test -f \$HOME/.ccteam/im/credentials.json || { echo 'missing credentials.json'; exit 9; }
-            ./target/release/ccteam-imd status 2>&1 || true
+            stat -c '%y %n' \$HOME/.ccteam/state/imd.heartbeat 2>/dev/null || true
             $(daemon_stop_snippet im-squad)
         "
         fetch_daemon_stderr im-squad
@@ -497,8 +533,8 @@ probe_im_squad() {
         remote_run im-squad "
             $(daemon_start_snippet im-squad)
             echo '[probe] im-squad: mock channel + 2-bot routing'
-            echo '[probe] F119 daemon-up smoke: status output + heartbeat fresh'
-            ./target/release/ccteam-imd status 2>&1 | head -10 || true
+            echo '[probe] F130 daemon-up smoke: heartbeat fresh'
+            stat -c '%y %n' \$HOME/.ccteam/state/imd.heartbeat 2>/dev/null || true
             $(daemon_stop_snippet im-squad)
         "
         fetch_daemon_stderr im-squad

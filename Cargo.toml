@@ -5,10 +5,10 @@ members = [
     "crates/ccteam-cost",
     "crates/ccteam-cli",
     "crates/ccteam-hooks",
+    # V0.6.0 Wave 2 F109/F116 — IM-bot daemon + supervisor.
+    # V0.6.1 F130: library-only (binary folded into `ccteam start`).
     "crates/ccteam-imd",
     "crates/ccteam-web",
-    # V0.6.0 Wave 2 F109/F116 — IM-bot daemon + supervisor.
-    "crates/ccteam-imd",
 ]
 
 [workspace.package]

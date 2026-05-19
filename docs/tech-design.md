@@ -53,11 +53,11 @@
 
 ### 2.1 三层架构（Channel / Interaction / Orchestration）
 
-V0.6.0 起 **Channel Layer 实化为 `ccteam-imd` 独立 supervisor daemon binary**(F116)+ 统一 `openhuman/channels` Rust crate 14+ IM 平台(F109);**HarnessAdapter trait 是 5-method thread/turn 接口对齐 Codex `ThreadManager::{submit, next_event}`**(F107);新增**模式 3 chat 形态**(F108):per-bot tmux 长 session + Claude TUI 长跑 + dual-track hooks+transcript 镜像 ccteam-owned `turns.jsonl`。
+V0.6.0 起 **Channel Layer 实化为 `ccteam-imd` supervisor**(F116;V0.6.1 F130 折入 `ccteam start` 单进程,作为 tokio task 与 orchestrator + web 共享 shutdown channel,独立 binary 已删)+ 统一 `openhuman/channels` Rust crate 14+ IM 平台(F109);**HarnessAdapter trait 是 5-method thread/turn 接口对齐 Codex `ThreadManager::{submit, next_event}`**(F107);新增**模式 3 chat 形态**(F108):per-bot tmux 长 session + Claude TUI 长跑 + dual-track hooks+transcript 镜像 ccteam-owned `turns.jsonl`。
 
 ```
-Channel Layer (V0.6.0 F109+F116 实化)  →  inbox/outbox 文件协议 + IM event bus
-   ccteam-imd daemon binary
+Channel Layer (V0.6.0 F109+F116 实化;V0.6.1 F130 single-process)  →  inbox/outbox 文件协议 + IM event bus
+   ccteam-imd supervisor task (in-process tokio task inside `ccteam start`)
      ├── openhuman/channels Rust crate (telegram/slack/discord/lark/dingtalk/qq/...)
      ├── Reply Listener (borrowed OMC reply-listener.ts) + bot-to-bot @ routing + hop_limit
      └── HarnessAdapter trait 调用(把 inbound IM 消息翻译成 TurnInput)
