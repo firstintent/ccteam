@@ -41,9 +41,11 @@ use ccteam_core::harness::{
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 
+use crate::bot_mpsc::OutboundItem;
+use crate::latency::now_unix_ms;
 use crate::{imd_heartbeat_path, BotRegistration};
 
 /// V0.6.1 F136 — interval between per-bot heartbeat writes. Picked so
@@ -219,6 +221,14 @@ pub struct BotSupervisor {
     /// no source rows to dispatch. Lifetime mirrors the heartbeat
     /// writer.
     events_task: Mutex<Option<JoinHandle<()>>>,
+    /// V0.6.1 fast-path — direct mpsc to the per-bot outbound dispatcher
+    /// (see [`crate::bot_mpsc`]). The daemon's main loop populates this
+    /// via [`set_outbound_tx`] right after the supervisor starts. When
+    /// `None`, the events consumer just appends `turns.jsonl` (the
+    /// safety-net `drain_outboxes` pass will pick rows up later); when
+    /// `Some`, the events consumer additionally sends each assistant
+    /// row through the channel for ~immediate dispatch.
+    outbound_tx: Mutex<Option<mpsc::Sender<OutboundItem>>>,
 }
 
 impl std::fmt::Debug for BotSupervisor {
@@ -247,7 +257,17 @@ impl BotSupervisor {
             state: Mutex::new(BotState::default()),
             heartbeat_task: Mutex::new(None),
             events_task: Mutex::new(None),
+            outbound_tx: Mutex::new(None),
         }
+    }
+
+    /// V0.6.1 fast-path — daemon main loop calls this once per bot
+    /// right after `ensure_started` succeeds. From the next event onward
+    /// the events consumer enqueues each assistant row into `tx` so the
+    /// per-bot outbound dispatcher can fire `channel.send` immediately
+    /// (skipping the safety-net 60s `drain_outboxes` scan).
+    pub async fn set_outbound_tx(&self, tx: mpsc::Sender<OutboundItem>) {
+        *self.outbound_tx.lock().await = Some(tx);
     }
 
     /// `<projects_root>/<slug>/.ccteam/chat/<role>/`. Helper so the
@@ -417,6 +437,10 @@ impl BotSupervisor {
             ccteam_core::harness::AgentVendor::Codex => "codex",
         }
         .to_string();
+        // V0.6.1 fast-path — clone the outbound sender (if registered)
+        // so each event can fan out into the per-bot dispatcher without
+        // re-locking. `None` keeps the legacy drain_outboxes safety net.
+        let outbound_tx = self.outbound_tx.lock().await.clone();
         let task = tokio::spawn(async move {
             let mut stream = adapter.events(&handle);
             while let Some(evt) = stream.next().await {
@@ -446,6 +470,13 @@ impl BotSupervisor {
                 let append_t0 = std::time::Instant::now();
                 match turns_mirror::append_turn(&project_dir, &role, &record) {
                     Ok(path) => {
+                        // Capture post-append file size for the outbound
+                        // cursor — the dispatcher persists this on
+                        // successful TG ack so a daemon restart re-sends
+                        // only un-acked rows.
+                        let cursor_after = std::fs::metadata(&path)
+                            .map(|m| m.len())
+                            .unwrap_or(0);
                         tracing::info!(
                             event = "latency",
                             stage = "turn.done",
@@ -455,9 +486,36 @@ impl BotSupervisor {
                             vendor = %vendor,
                             assistant_len,
                             append_ms = append_t0.elapsed().as_millis() as u64,
+                            cursor_after,
                             path = %path.display(),
                             "latency turn.done"
                         );
+                        // V0.6.1 fast-path — fan out to the per-bot
+                        // outbound dispatcher if it's wired. Safety-net
+                        // `drain_outboxes` still covers the `None` case
+                        // (e.g. supervisor restart mid-turn).
+                        if let Some(tx) = outbound_tx.as_ref() {
+                            let item = OutboundItem {
+                                turn_id: turn_id_log.clone(),
+                                role: "assistant".into(),
+                                content: record.assistant.clone(),
+                                cursor_after,
+                                enqueue_unix_ms: now_unix_ms(),
+                            };
+                            // `try_send` because the dispatcher is
+                            // bounded; if it's backlogged the safety-net
+                            // drain_outboxes pass will still pick this
+                            // row up from disk later.
+                            if let Err(err) = tx.try_send(item) {
+                                tracing::warn!(
+                                    event = "latency",
+                                    stage = "turn.done.mpsc_full",
+                                    turn_id = %turn_id_log,
+                                    error = %err,
+                                    "latency turn.done (outbound mpsc full; safety-net drain will retry)"
+                                );
+                            }
+                        }
                     }
                     Err(err) => {
                         tracing::warn!(

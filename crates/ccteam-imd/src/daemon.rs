@@ -28,13 +28,14 @@ use std::time::{Duration, SystemTime};
 use anyhow::Result;
 use ccteam_core::execution::ClaudeTuiAdapter;
 use ccteam_core::harness::{AgentVendor, HarnessAdapter};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 
 use crate::acl::AclPolicy;
+use crate::bot_mpsc::{bot_key, BotChannelMap, BotChannels, InboxItem, OutboundItem, CHANNEL_BUF};
 use crate::credentials::{self, Credentials};
 use crate::inbound::{
     auto_route_dm_mention, parse_envelope, process_inbound_admin_aware, DefaultMailboxResolver,
-    MailboxResolver,
+    InboundOutcome, MailboxResolver,
 };
 use crate::latency::now_unix_ms;
 use crate::nl_admin::AdminExecutor;
@@ -279,12 +280,21 @@ where
     ));
     let executor = Arc::new(AdminExecutor::new(projects_root.clone()));
 
+    // V0.6.1 fast-path — per-bot in-process mpsc channels. The daemon's
+    // inbound consumer + each BotSupervisor's events consumer push items
+    // into the right entry; per-bot inbox/outbound dispatcher tasks
+    // (spawned by `ensure_bot_channels`) drain them and call the
+    // adapter / IM channel directly. drain_inboxes / drain_outboxes
+    // stay alive as a slow safety net (see `SAFETY_NET_TICK`).
+    let bot_channels: BotChannelMap = Arc::new(Mutex::new(HashMap::new()));
+
     let inbound_consumer = spawn_inbound_consumer(
         inbound_rx,
         channels.clone(),
         sec.clone(),
         mailbox.clone(),
         executor.clone(),
+        bot_channels.clone(),
     );
 
     // V0.6.1 F134 — outbound forwarder runs per supervisor tick (inside
@@ -298,6 +308,14 @@ where
 
     let mut ticker = tokio::time::interval(args.tick);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // V0.6.1 fast-path — drain_inboxes / drain_outboxes downgraded to a
+    // safety net: the hot path is per-bot mpsc dispatchers spawned in
+    // `ensure_bot_channels`. This slower ticker only fires every 60s to
+    // catch orphan files from a daemon crash mid-handle or any mpsc
+    // race miss. Aligned with `STALE_THRESHOLD` (60s) so a stuck bot
+    // re-triggering a Restart still gets one safety-net drain pass.
+    let mut safety_net_ticker = tokio::time::interval(SAFETY_NET_TICK);
+    safety_net_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let started = std::time::Instant::now();
     let mut shutdown: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(shutdown);
@@ -316,8 +334,14 @@ where
                     }
                 };
                 tick_supervisors(&bots, &registry, Some(&projects_root), &factory).await;
-                drain_inboxes(&bots, &registry, &projects_root).await;
-                drain_outboxes(&bots, &channels, &projects_root).await;
+                ensure_bot_channels(
+                    &bots,
+                    &registry,
+                    &channels,
+                    &bot_channels,
+                    &projects_root,
+                )
+                .await;
 
                 if let Some(max) = args.max_runtime {
                     if started.elapsed() >= max {
@@ -325,6 +349,17 @@ where
                         break Ok(());
                     }
                 }
+            }
+            _ = safety_net_ticker.tick() => {
+                let bots = match list_bots() {
+                    Ok(b) => b,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "list_bots failed (safety net)");
+                        Vec::new()
+                    }
+                };
+                drain_inboxes(&bots, &registry, &projects_root).await;
+                drain_outboxes(&bots, &channels, &projects_root).await;
             }
             _ = &mut shutdown => {
                 tracing::info!("ccteam-imd: shutdown signalled; exiting cleanly");
@@ -349,6 +384,13 @@ where
 /// fills the listener `await`s on `send`, which is what we want
 /// (backpressure, not silent drop).
 const INBOUND_BUF: usize = 64;
+
+/// V0.6.1 fast-path — safety-net `drain_*` cadence. The hot path is
+/// per-bot mpsc dispatchers (see [`crate::bot_mpsc`]); this slow tick
+/// only catches orphan envelope files from a daemon crash mid-handle
+/// or any mpsc race miss. 60s matches the supervisor's
+/// `STALE_THRESHOLD` so a Restart cycle still sees one drain pass.
+pub(crate) const SAFETY_NET_TICK: Duration = Duration::from_secs(60);
 
 /// V0.6.1 F132 — assemble the Channel set the daemon listens on.
 ///
@@ -387,6 +429,7 @@ fn spawn_inbound_consumer(
     sec: Arc<Mutex<ThreeLayerSec>>,
     mailbox: Arc<dyn MailboxResolver>,
     executor: Arc<AdminExecutor>,
+    bot_channels: BotChannelMap,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut seq: u64 = 0;
@@ -439,6 +482,43 @@ fn spawn_inbound_consumer(
                         admin_side_effect = ?admin.as_ref().map(|r| &r.side_effect),
                         "latency imd.route.done"
                     );
+                    // V0.6.1 fast-path — if the outcome routed to a
+                    // bot AND that bot's mpsc is wired, push directly
+                    // into the per-bot inbox dispatcher. Falls through
+                    // silently when the dispatcher isn't ready yet —
+                    // the safety-net `drain_inboxes` tick picks the
+                    // envelope up from disk next pass.
+                    if let InboundOutcome::DroppedToBot { slug, role, path, payload, cid: item_cid } = outcome {
+                        let guard = bot_channels.lock().await;
+                        if let Some(ch) = guard.get(&bot_key(&slug, &role)) {
+                            let item = InboxItem {
+                                cid: item_cid,
+                                slug: slug.clone(),
+                                role: role.clone(),
+                                payload,
+                                path,
+                                enqueue_unix_ms: now_unix_ms(),
+                            };
+                            if let Err(err) = ch.inbox_tx.try_send(item) {
+                                tracing::warn!(
+                                    event = "latency",
+                                    stage = "imd.mpsc_full",
+                                    cid = %cid,
+                                    slug = %slug,
+                                    role = %role,
+                                    error = %err,
+                                    "latency imd inbox mpsc full; safety-net drain will retry"
+                                );
+                            }
+                        } else {
+                            tracing::debug!(
+                                cid = %cid,
+                                slug = %slug,
+                                role = %role,
+                                "imd: bot mpsc not yet wired; safety-net drain will pick this up"
+                            );
+                        }
+                    }
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -473,6 +553,246 @@ fn build_handle_map() -> HandleMap {
         }
     }
     map
+}
+
+/// V0.6.1 fast-path — for every bot that is `is_started()`:
+///
+/// 1. If `<slug>/<role>` has no entry in `bot_channels` yet, build a
+///    fresh `(inbox_tx, outbound_tx)` pair, spawn the per-bot inbox
+///    consumer + outbound dispatcher tasks, and register the senders
+///    so the daemon's inbound consumer + the supervisor's events
+///    consumer can route into them.
+/// 2. Push the outbound sender clone onto the supervisor so its
+///    next event-stream item fans out into the dispatcher.
+///
+/// Idempotent on subsequent ticks: existing entries short-circuit.
+/// Bots that haven't yet started skip silently — the safety-net
+/// `drain_inboxes` pass will still pick up any queued envelopes for
+/// them once they boot, and the inbox consumer's `try_send` falls
+/// through to `tracing::debug!` when an inbox_tx isn't wired.
+async fn ensure_bot_channels(
+    bots: &[BotRegistration],
+    registry: &Arc<Mutex<SupervisorRegistry>>,
+    channels: &ChannelMap,
+    bot_channels: &BotChannelMap,
+    projects_root: &Path,
+) {
+    for bot in bots {
+        let sup = {
+            let reg = registry.lock().await;
+            match reg.lookup(bot) {
+                Some(s) => s,
+                None => continue,
+            }
+        };
+        if !sup.is_started().await {
+            continue;
+        }
+        let key = bot_key(&bot.workflow_slug, &bot.role);
+        {
+            let guard = bot_channels.lock().await;
+            if guard.contains_key(&key) {
+                continue;
+            }
+        }
+        let Some(channel) = channels.get(&bot.im_platform).cloned() else {
+            tracing::debug!(
+                slug = %bot.workflow_slug,
+                role = %bot.role,
+                platform = %bot.im_platform,
+                "imd: ensure_bot_channels: no IM channel for bot's platform; skipping fast-path"
+            );
+            continue;
+        };
+
+        let (inbox_tx, inbox_rx) = mpsc::channel::<InboxItem>(CHANNEL_BUF);
+        let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundItem>(CHANNEL_BUF);
+
+        // Inbox dispatcher: drain the channel, call
+        // `supervisor.handle_inbound`, `unlink` the envelope on success.
+        let sup_for_inbox = sup.clone();
+        let slug_log = bot.workflow_slug.clone();
+        let role_log = bot.role.clone();
+        tokio::spawn(spawn_inbox_dispatcher(
+            inbox_rx,
+            sup_for_inbox,
+            slug_log,
+            role_log,
+        ));
+
+        // Outbound dispatcher: drain the channel, call
+        // `channel.send`, persist the cursor on successful TG ack.
+        let chat_id = bot.im_chat_id.clone();
+        let platform = bot.im_platform.clone();
+        let cursor_path =
+            outbound::outbound_cursor_path(projects_root, &bot.workflow_slug, &bot.role);
+        let slug_log = bot.workflow_slug.clone();
+        let role_log = bot.role.clone();
+        tokio::spawn(spawn_outbound_dispatcher(
+            outbound_rx,
+            channel,
+            chat_id,
+            platform,
+            cursor_path,
+            slug_log,
+            role_log,
+        ));
+
+        // Tell the supervisor about the outbound side so its events
+        // consumer can fan out from the next ItemCompleted onward.
+        sup.set_outbound_tx(outbound_tx.clone()).await;
+
+        // Register both senders so the inbound consumer + future ticks
+        // see them.
+        bot_channels.lock().await.insert(
+            key,
+            BotChannels {
+                inbox_tx,
+                outbound_tx,
+            },
+        );
+        tracing::info!(
+            slug = %bot.workflow_slug,
+            role = %bot.role,
+            platform = %bot.im_platform,
+            "imd: V0.6.1 fast-path per-bot mpsc wired"
+        );
+    }
+}
+
+/// V0.6.1 fast-path — per-bot inbox dispatcher task body. Drains
+/// [`InboxItem`]s from `rx`, calls
+/// [`BotSupervisor::handle_inbound`], `unlink`s the envelope file on
+/// success (and on error too — the alternative is re-delivering on
+/// every safety-net pass, which would double-submit a slow tmux reply).
+async fn spawn_inbox_dispatcher(
+    mut rx: mpsc::Receiver<InboxItem>,
+    sup: Arc<BotSupervisor>,
+    slug_log: String,
+    role_log: String,
+) {
+    while let Some(item) = rx.recv().await {
+        let queue_age_ms = now_unix_ms().saturating_sub(item.enqueue_unix_ms) as u64;
+        let submit_t0 = std::time::Instant::now();
+        match sup.handle_inbound(item.payload).await {
+            Ok(turn_id) => {
+                tracing::info!(
+                    event = "latency",
+                    stage = "imd.inbox.dispatch",
+                    cid = %item.cid,
+                    turn_id = %turn_id.0,
+                    slug = %slug_log,
+                    role = %role_log,
+                    queue_age_ms,
+                    submit_ms = submit_t0.elapsed().as_millis() as u64,
+                    file = %item.path.display(),
+                    "latency imd.inbox.dispatch (mpsc)"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    event = "latency",
+                    stage = "imd.inbox.dispatch.err",
+                    cid = %item.cid,
+                    slug = %slug_log,
+                    role = %role_log,
+                    queue_age_ms,
+                    submit_ms = submit_t0.elapsed().as_millis() as u64,
+                    error = %err,
+                    "latency imd.inbox.dispatch (mpsc, failed)"
+                );
+            }
+        }
+        // `unlink` regardless of submit outcome — re-delivery on safety
+        // net would double-submit. Failed sends are tracked via
+        // `chat_session_reset` / hook progress, not by retrying the
+        // mailbox file. Best-effort: ignore IO errors here.
+        let _ = std::fs::remove_file(&item.path);
+    }
+    tracing::debug!(slug = %slug_log, role = %role_log, "imd: inbox dispatcher exited");
+}
+
+/// V0.6.1 fast-path — per-bot outbound dispatcher task body. Drains
+/// [`OutboundItem`]s from `rx`, calls `channel.send`, persists the
+/// outbound cursor on successful TG ack so a daemon restart re-sends
+/// only un-acked rows.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_outbound_dispatcher(
+    mut rx: mpsc::Receiver<OutboundItem>,
+    channel: Arc<dyn Channel + Send + Sync>,
+    chat_id: String,
+    platform: String,
+    cursor_path: PathBuf,
+    slug_log: String,
+    role_log: String,
+) {
+    while let Some(item) = rx.recv().await {
+        if item.role != "assistant" {
+            // Non-assistant rows still advance the cursor so we don't
+            // re-read them on safety-net drain.
+            let _ = outbound::save_cursor(
+                &cursor_path,
+                &outbound::TailCursor {
+                    position: item.cursor_after,
+                },
+            );
+            continue;
+        }
+        let tail_age_ms = now_unix_ms().saturating_sub(item.enqueue_unix_ms) as u64;
+        let send_t0 = std::time::Instant::now();
+        let msg = crate::transport::SendMessage::new(item.content.clone(), &chat_id);
+        match channel.send(&msg).await {
+            Ok(tg_msg_id) => {
+                tracing::info!(
+                    event = "latency",
+                    stage = "imd.outbound.dispatch",
+                    turn_id = %item.turn_id,
+                    slug = %slug_log,
+                    role = %role_log,
+                    platform = %platform,
+                    tail_age_ms,
+                    send_ms = send_t0.elapsed().as_millis() as u64,
+                    tg_msg_id = tg_msg_id.as_deref().unwrap_or(""),
+                    content_len = item.content.len(),
+                    "latency imd.outbound.dispatch (mpsc)"
+                );
+                if let Err(err) = outbound::save_cursor(
+                    &cursor_path,
+                    &outbound::TailCursor {
+                        position: item.cursor_after,
+                    },
+                ) {
+                    tracing::warn!(
+                        slug = %slug_log,
+                        role = %role_log,
+                        error = %err,
+                        "imd: outbound dispatcher save_cursor failed"
+                    );
+                }
+            }
+            Err(err) => {
+                // Don't advance cursor on failure — safety-net
+                // drain_outboxes will retry from the previous cursor
+                // position next minute. (Note: rows that arrived AFTER
+                // this one through the mpsc still get processed; if
+                // those succeed and advance cursor past this row, the
+                // failed row is lost. Acceptable trade-off vs.
+                // serialized retry loop for V0.6.1.)
+                tracing::warn!(
+                    event = "latency",
+                    stage = "imd.outbound.dispatch.err",
+                    turn_id = %item.turn_id,
+                    slug = %slug_log,
+                    role = %role_log,
+                    tail_age_ms,
+                    send_ms = send_t0.elapsed().as_millis() as u64,
+                    error = %err,
+                    "latency imd.outbound.dispatch (mpsc, failed)"
+                );
+            }
+        }
+    }
+    tracing::debug!(slug = %slug_log, role = %role_log, "imd: outbound dispatcher exited");
 }
 
 /// V0.6.1 F132 — once per tick, for each registered bot:

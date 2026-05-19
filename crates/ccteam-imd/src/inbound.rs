@@ -56,6 +56,16 @@ pub enum InboundOutcome {
         role: String,
         /// path of the written envelope.
         path: PathBuf,
+        /// V0.6.1 fast-path — the router-stripped payload, carried out
+        /// alongside the file path so the daemon's per-bot inbox
+        /// dispatcher doesn't have to re-read + parse the envelope on
+        /// every message. The on-disk envelope still holds the same
+        /// payload for safety-net `drain_inboxes` recovery.
+        payload: String,
+        /// V0.6.1 fast-path — the originating IM platform's message id
+        /// (e.g. `tg-{message_id}`). Used as the latency-log `cid` field
+        /// in the downstream mpsc dispatcher.
+        cid: String,
     },
     /// Routed to admin handler.
     Admin {
@@ -279,7 +289,13 @@ pub async fn process_inbound(
                 path = %path.display(),
                 "latency imd.mailbox.write"
             );
-            Ok(InboundOutcome::DroppedToBot { slug, role, path })
+            Ok(InboundOutcome::DroppedToBot {
+                slug,
+                role,
+                path,
+                payload: stripped,
+                cid: msg.id.clone(),
+            })
         }
     }
 }
@@ -409,7 +425,7 @@ mod tests {
         .await
         .unwrap();
         match res {
-            InboundOutcome::DroppedToBot { slug, role, path } => {
+            InboundOutcome::DroppedToBot { slug, role, path, .. } => {
                 assert_eq!(slug, "dev-foo");
                 assert_eq!(role, "lead");
                 assert!(path.exists());

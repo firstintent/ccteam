@@ -41,11 +41,13 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::stream::BoxStream;
+use notify::{EventKind, RecursiveMode, Watcher};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use crate::execution::transcript_tail::{
-    self, cursor_path, discover_active_session, PendingTools, TranscriptCursor,
+    self, anthropic_project_dir, cursor_path, discover_active_session, encode_project_cwd,
+    PendingTools, TranscriptCursor,
 };
 use crate::execution::turns_mirror;
 use crate::harness::{
@@ -372,9 +374,33 @@ impl HarnessAdapter for ClaudeTuiAdapter {
     }
 }
 
-/// Background polling loop: walks the Anthropic transcript jsonl for
-/// the bot's most recent session and pushes parsed events through `tx`.
-/// Exits when `tx` is closed (the consumer dropped the stream).
+/// V0.6.1 — background event-driven tail of the Anthropic transcript
+/// jsonl for the bot's active session. Uses `notify` (inotify on Linux,
+/// FSEvents on macOS) to watch the **parent directory**
+/// `~/.claude/projects/<encoded-cwd>/` for `CREATE` + `MODIFY` events,
+/// so the typical wake latency drops from ~500ms (the previous poll
+/// sleep) to a few ms.
+///
+/// Architecture:
+///
+/// - One watcher per `(project_dir, cwd, role)` triple, scoped to the
+///   parent dir non-recursively. `CREATE(<new-sid>.jsonl)` signals
+///   session rotation (`/clear` / `/compact`); `MODIFY(<sid>.jsonl)`
+///   signals new content on the current session. Both reduce to one
+///   `read_new` call against the affected path; mismatched sid →
+///   reset cursor + clear pending tools.
+/// - A 2-second safety-net poll runs in parallel via `tokio::select!`
+///   to catch any missed inotify event (rare on local fs, but possible
+///   when running under network mounts or some container layers).
+/// - `transcript_tail::read_new` — the actual byte-cursor incremental
+///   read with UTF-8 boundary safety + half-flushed line tolerance +
+///   tool-pairing across cycles — is unchanged. Only the **wakeup**
+///   mechanism changes here.
+///
+/// Cold-start (Anthropic projects dir doesn't exist yet) is handled by
+/// briefly polling until the dir appears, after which the watcher is
+/// installed and the loop becomes event-driven. Exits when `tx` is
+/// closed (the consumer dropped the stream).
 async fn tail_loop(
     project_dir: PathBuf,
     cwd: PathBuf,
@@ -384,16 +410,191 @@ async fn tail_loop(
     let cursor_file = cursor_path(&project_dir, &role);
     let mut cursor = TranscriptCursor::load(&cursor_file).unwrap_or_default();
     let mut pending = PendingTools::new();
-    // Defensive backoff if Anthropic projects dir is missing (e.g.
-    // hermetic test env without ~/.claude).
+
+    // Resolve `~/.claude/projects/<encoded-cwd>/`. Wait for it to exist
+    // — Claude creates it on the first write of the first session.
+    let parent_dir = match anthropic_project_dir(&cwd) {
+        Some(p) => p,
+        None => {
+            tracing::warn!(
+                cwd = %cwd.display(),
+                role,
+                "claude-tui tail: HOME unset; cannot resolve anthropic projects dir"
+            );
+            return;
+        }
+    };
+    while !parent_dir.exists() {
+        if tx.is_closed() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Bridge `notify` (sync callback) to a tokio mpsc the async loop
+    // can `select!` on. Channel capacity 64 absorbs a burst of
+    // CREATE/MODIFY events without blocking the watcher thread; the
+    // safety-net poll catches anything we drop on overflow.
+    let (evt_tx, mut evt_rx) = mpsc::channel::<notify::Event>(64);
+    let watcher_result = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if let Ok(event) = res {
+            // try_send so a saturated channel doesn't block the
+            // watcher dispatcher thread; safety-net poll picks up
+            // anything dropped.
+            let _ = evt_tx.try_send(event);
+        }
+    });
+    let mut watcher = match watcher_result {
+        Ok(w) => w,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "claude-tui tail: notify watcher creation failed; falling back to plain polling"
+            );
+            // Best-effort fallback to the legacy polling path —
+            // shouldn't realistically happen on supported platforms.
+            tail_loop_polling(project_dir, cwd, role, tx).await;
+            return;
+        }
+    };
+    if let Err(err) = watcher.watch(&parent_dir, RecursiveMode::NonRecursive) {
+        tracing::warn!(
+            path = %parent_dir.display(),
+            error = %err,
+            "claude-tui tail: watch() failed; falling back to plain polling"
+        );
+        drop(watcher);
+        tail_loop_polling(project_dir, cwd, role, tx).await;
+        return;
+    }
+    tracing::info!(
+        path = %parent_dir.display(),
+        role,
+        "claude-tui tail: inotify watcher armed (parent dir CREATE+MODIFY)"
+    );
+
+    // One initial sweep — `read_new` against the most-recently-modified
+    // session file. Catches any content written between Claude start
+    // and our watcher arming.
+    if let Some((sid, path)) = discover_active_session(&cwd) {
+        if cursor.session_id != sid {
+            cursor.session_id = sid;
+            cursor.byte_offset = 0;
+            cursor.last_event_id = None;
+            cursor.project_encoded = encode_project_cwd(&cwd);
+            pending.clear();
+        }
+        drain_path(&path, &mut cursor, &mut pending, &cursor_file, &tx).await;
+    }
+
+    loop {
+        if tx.is_closed() {
+            return;
+        }
+        tokio::select! {
+            evt = evt_rx.recv() => {
+                let Some(evt) = evt else { return };
+                // Only act on CREATE (rotation) + MODIFY (content
+                // append). Other event kinds (Remove, Access, Other)
+                // are noise for our use case.
+                if !matches!(evt.kind, EventKind::Create(_) | EventKind::Modify(_)) {
+                    continue;
+                }
+                for affected in evt.paths.iter() {
+                    if affected.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                        continue;
+                    }
+                    let Some(sid) = affected.file_stem().and_then(|s| s.to_str()) else {
+                        continue;
+                    };
+                    if cursor.session_id != sid {
+                        // Rotation (or initial session bind) — `/clear`
+                        // / `/compact` creates a fresh sid.jsonl whose
+                        // CREATE event lands here.
+                        cursor.session_id = sid.to_string();
+                        cursor.byte_offset = 0;
+                        cursor.last_event_id = None;
+                        cursor.project_encoded = encode_project_cwd(&cwd);
+                        pending.clear();
+                    }
+                    drain_path(affected, &mut cursor, &mut pending, &cursor_file, &tx).await;
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                // Safety-net poll. inotify rarely drops events on local
+                // ext4/btrfs, but a half-flushed line that didn't fire
+                // a MODIFY yet, or a fs that buffers writes, can leave
+                // bytes on disk we haven't observed. Just re-discover +
+                // read_new; usually a no-op.
+                if let Some((sid, path)) = discover_active_session(&cwd) {
+                    if cursor.session_id != sid {
+                        cursor.session_id = sid;
+                        cursor.byte_offset = 0;
+                        cursor.last_event_id = None;
+                        cursor.project_encoded = encode_project_cwd(&cwd);
+                        pending.clear();
+                    }
+                    drain_path(&path, &mut cursor, &mut pending, &cursor_file, &tx).await;
+                }
+            }
+        }
+    }
+}
+
+/// Shared between the inotify-driven path and the safety-net branch:
+/// one `read_new` call, persist cursor, forward events. Returns when
+/// `tx.send` errors (consumer dropped).
+async fn drain_path(
+    transcript_path: &Path,
+    cursor: &mut TranscriptCursor,
+    pending: &mut PendingTools,
+    cursor_file: &Path,
+    tx: &mpsc::Sender<ThreadEvent>,
+) {
+    match transcript_tail::read_new(transcript_path, cursor, std::mem::take(pending)).await {
+        Ok(Some(delta)) => {
+            *pending = delta.pending_tools;
+            cursor.byte_offset = delta.new_offset;
+            cursor.last_event_id = delta.last_event_id;
+            let _ = cursor.save(cursor_file);
+            for ev in delta.events {
+                if tx.send(ev).await.is_err() {
+                    return;
+                }
+            }
+        }
+        Ok(None) => {
+            // file vanished mid-read (e.g. test cleanup) — no-op
+        }
+        Err(err) => {
+            tracing::debug!(
+                path = %transcript_path.display(),
+                error = %err,
+                "claude-tui tail: read_new failed; retry on next event"
+            );
+        }
+    }
+}
+
+/// Polling-only fallback if `notify` fails to arm (e.g. unsupported
+/// kernel / sandboxed environment). Same shape as the pre-V0.6.1
+/// polling loop with a tighter post-success interval (50ms instead of
+/// the legacy 500ms) so even the fallback path has lower latency.
+async fn tail_loop_polling(
+    project_dir: PathBuf,
+    cwd: PathBuf,
+    role: String,
+    tx: mpsc::Sender<ThreadEvent>,
+) {
+    let cursor_file = cursor_path(&project_dir, &role);
+    let mut cursor = TranscriptCursor::load(&cursor_file).unwrap_or_default();
+    let mut pending = PendingTools::new();
     let mut sleep_ms: u64 = 200;
 
     loop {
         if tx.is_closed() {
             return;
         }
-        // Re-discover the active session-id every iteration so a
-        // `/clear` that rotates the file picks up the new sid.
         let (sid, transcript_path) = match discover_active_session(&cwd) {
             Some(pair) => pair,
             None => {
@@ -404,7 +605,6 @@ async fn tail_loop(
         };
 
         if cursor.session_id != sid {
-            // Rotation — start fresh on the new file.
             cursor.session_id = sid.clone();
             cursor.byte_offset = 0;
             cursor.last_event_id = None;
@@ -425,7 +625,8 @@ async fn tail_loop(
                         return;
                     }
                 }
-                sleep_ms = 500;
+                // V0.6.1: tighter post-success interval (was 500ms).
+                sleep_ms = 50;
             }
             Ok(None) => {
                 sleep_ms = (sleep_ms * 2).min(2000);
@@ -435,6 +636,7 @@ async fn tail_loop(
             }
         }
         tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+        let _ = role;
     }
 }
 

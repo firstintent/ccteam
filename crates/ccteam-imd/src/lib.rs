@@ -26,6 +26,7 @@
 #![warn(missing_docs)]
 
 pub mod acl;
+pub mod bot_mpsc;
 pub mod credentials;
 pub mod daemon;
 pub mod inbound;
