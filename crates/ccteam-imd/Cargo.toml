@@ -4,11 +4,12 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "V0.6.0 Wave 2 F109/F116 — IM-bot daemon (Telegram / Slack / Discord) + per-bot tmux supervisor"
+description = "V0.6.0 Wave 2 F109/F116 — IM-bot daemon (Telegram / Slack / Discord) + per-bot tmux supervisor (V0.6.1 F130: library only; binary folded into `ccteam start`)"
 
-[[bin]]
-name = "ccteam-imd"
-path = "src/main.rs"
+# V0.6.1 F130 — `[[bin]]` removed. The IMD supervisor loop runs inside
+# `ccteam start` as one tokio task alongside the orchestrator and the
+# embedded web UI, all sharing one shutdown channel. Library entry:
+# `ccteam_imd::run_daemon_with_shutdown`.
 
 [dependencies]
 # Trait + types only — no `crate::execution::*` direct dep (HarnessAdapter red line).

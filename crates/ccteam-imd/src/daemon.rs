@@ -19,7 +19,9 @@
 //! `AgentVendor::Claude`; tests inject a stub).
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -148,8 +150,19 @@ impl SupervisorRegistry {
     }
 }
 
-/// Run the daemon. Returns `Ok(())` on graceful shutdown.
-pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
+/// Run the daemon with a caller-supplied shutdown future. Returns
+/// `Ok(())` on graceful shutdown (either the shutdown future resolves
+/// or `args.max_runtime` elapses).
+///
+/// V0.6.1 F130 — this is the supervisor-loop core, callable from both
+/// the standalone `ccteam-imd` historical entry point and from the
+/// merged `ccteam start` daemon (which folds IMD as one tokio task
+/// alongside orchestrator + web, all sharing a single
+/// `tokio::sync::watch` shutdown channel).
+pub async fn run_daemon_with_shutdown<F>(args: DaemonArgs, shutdown: F) -> Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     let creds = credentials::load(args.credentials.as_deref())?;
     let initial = list_bots()?;
     tracing::info!(
@@ -171,6 +184,7 @@ pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let started = std::time::Instant::now();
+    let mut shutdown: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(shutdown);
 
     loop {
         tokio::select! {
@@ -194,12 +208,26 @@ pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
                     }
                 }
             }
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("SIGINT received; graceful shutdown");
+            _ = &mut shutdown => {
+                tracing::info!("ccteam-imd: shutdown signalled; exiting cleanly");
                 return Ok(());
             }
         }
     }
+}
+
+/// Run the daemon with the default SIGINT (ctrl-C) shutdown trigger.
+///
+/// Preserved as the lib-level entry point used by integration tests
+/// that don't supply their own shutdown future. V0.6.1 F130 folded the
+/// `ccteam-imd` binary into `ccteam start`, so production now goes via
+/// [`run_daemon_with_shutdown`] with the shared `watch::channel`
+/// shutdown signal.
+pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
+    run_daemon_with_shutdown(args, async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await
 }
 
 /// V0.6.0 Wave 3 — per-tick driver. Registers any new bots with the

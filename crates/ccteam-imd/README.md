@@ -69,19 +69,38 @@ tests/
 
 ## Usage
 
+> **V0.6.1 F130** — the standalone `ccteam-imd` binary has been removed.
+> The supervisor loop now runs inside `ccteam start` as one tokio task
+> alongside the orchestrator and the embedded web UI, sharing one
+> shutdown channel.
+
 ```bash
-# One-shot
-ccteam-imd run --foreground
+# Start the combined daemon (orchestrator + web + IMD supervisor)
+ccteam start
 
-# Register a bot (idempotent; daemon picks up via registry watcher)
-ccteam-imd register --slug dev-foo --role lead --vendor claude
+# Orchestrator + web only (skip IM bridge)
+ccteam start --no-imd
 
-# Status
-ccteam-imd status
+# Orchestrator + IMD only (skip web UI)
+ccteam start --no-web
 
-# Linux systemd unit
-sudo cp systemd/ccteam-imd.service /etc/systemd/system/
-systemctl --user enable --now ccteam-imd
+# Register a bot (idempotent; supervisor task picks up via registry watcher).
+# Today this is driven through the `ccteam-creator` / `ccteam-im-setup`
+# skills + the library API `ccteam_imd::register_bot`; the previous
+# `ccteam-imd register` CLI subcommand was removed with the binary.
+
+# Liveness
+ls -l ~/.ccteam/state/imd.heartbeat
+```
+
+Library entry for embedding (used by `ccteam start`):
+
+```rust
+use ccteam_imd::{run_daemon_with_shutdown, DaemonArgs};
+run_daemon_with_shutdown(DaemonArgs::default(), async {
+    let _ = tokio::signal::ctrl_c().await;
+})
+.await?;
 ```
 
 ## Files / paths

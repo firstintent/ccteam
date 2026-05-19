@@ -147,3 +147,19 @@ V0.6.0 4-wave 范式;V0.6.1 patch 压成 **3 wave**:
 ---
 
 详 `prd.md` + `dev-plan.md`。
+
+---
+
+## 七、Ship-day fix-in-version(2026-05-19 user directive)
+
+V0.6.1 tag 已落(`v0.6.1` / commit `95916d3`),但 ship-day 用户上手后发现 2 个 daemon / probe 体验问题,本版**就地修复**(版本号不动,patch in-place):
+
+| F | 主题 | 性质 | Wave / 单线 |
+|---|---|---|---|
+| F130 | `ccteam-imd` 折入 `ccteam start`(单进程:orchestrator + web + IMD supervisor 3 个 tokio 任务;独立 `ccteam-imd` 二进制删;`--no-imd` 跳过)| 进程模型简化 | ship-day fix |
+| F131 | host-probe `remote_run` 单引号包裹 bug 修(`bash -c '<heredoc>'` 嵌套引号 escape)| bug fix | ship-day fix |
+
+**决策**:
+- F130 = 用户上手时遇到僵尸进程排查痛点 → 单进程 daemon 让管理优雅(对照 V0.4.x web fold-into-start 范式)。Pre-v1.0 no-shim:`[[bin]] ccteam-imd` 直接删,无 alias,无 `ccteam daemon` 子命令(folded into `ccteam start` 即足)。
+- F131 = probe 实跑暴露的 shell quoting 转义错(详 wave-3 ship-day log)。
+

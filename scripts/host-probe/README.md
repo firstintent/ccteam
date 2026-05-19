@@ -47,26 +47,29 @@ CCTEAM_PROBE_REAL_TG=1 \
   locally (no SSH; `NAS_PATH` is interpreted as the repo root).
   Used for PR-review dry-run of script changes without touching
   the NAS.
-- `CCTEAM_PROBE_SKIP_DAEMON_START` (V0.6.1 F119) — when `1`, the
-  `pocket-assistant` / `im-squad` scenarios skip the new
-  daemon-spawn + health-wait + stop block and assume the caller
-  has a `ccteam-imd` daemon already running. Default is `0`
-  (probe owns lifecycle).
+- `CCTEAM_PROBE_SKIP_DAEMON_START` (V0.6.1 F119 / F130) — when `1`,
+  the `pocket-assistant` / `im-squad` scenarios skip the
+  daemon-spawn + heartbeat-wait + stop block and assume the caller
+  has a combined `ccteam start` daemon already running. Default is
+  `0` (probe owns lifecycle).
 
-## V0.6.1 F119 — daemon lifecycle in mode-3 probes
+## V0.6.1 F119 / F130 — daemon lifecycle in mode-3 probes
 
-`pocket-assistant` and `im-squad` now own the `ccteam-imd` daemon
-end-to-end:
+`pocket-assistant` and `im-squad` own the combined ccteam daemon
+end-to-end. V0.6.1 F130 folded the standalone `ccteam-imd` binary
+into `ccteam start` (one process: orchestrator + web + IMD
+supervisor as 3 tokio tasks sharing one shutdown channel), so the
+probe lifecycle is now:
 
-1. `nohup ./target/release/ccteam-imd run --tick-seconds 2 &` →
-   stash pid + stderr to `/tmp/ccteam-imd-probe-<scenario>.{pid,stderr}`.
-2. `./target/release/ccteam-imd health --timeout-seconds 30 --poll-ms 200`
-   blocks until the daemon writes a heartbeat with `mtime ≥` the
-   moment the health check started (rejects stale heartbeats from
-   prior runs).
+1. `nohup ./target/release/ccteam start --no-web &` → stash pid +
+   stderr to `/tmp/ccteam-imd-probe-<scenario>.{pid,stderr}`.
+2. Poll `~/.ccteam/state/imd.heartbeat` for a fresh mtime (`>=` the
+   moment the probe started), with a 30s timeout. Rejects stale
+   heartbeats from prior runs without needing a dedicated CLI.
 3. Run the scenario's bot interactions.
-4. `kill -TERM <pid>`; wait 5s for graceful exit; `kill -KILL` if
-   still alive; tail stderr into the scenario log.
+4. `./target/release/ccteam stop` (F86 graceful drain) → wait 10s →
+   `kill -TERM` fallback → `kill -KILL` last resort; tail stderr
+   into the scenario log.
 
 `run-probes.sh` then `scp`s `/tmp/ccteam-imd-probe-<scenario>.stderr`
 back into `<out>/<scenario>/daemon-stderr.log` so post-mortems are

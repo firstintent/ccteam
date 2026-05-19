@@ -212,8 +212,11 @@ pub fn wait_for_health(started_at: SystemTime, timeout: Duration, poll: Duration
     }
 }
 
-/// Re-export the main daemon entry so `main.rs` stays a thin shim.
-pub use daemon::{run_daemon, DaemonArgs};
+/// Re-export the daemon entry points. `run_daemon_with_shutdown` is the
+/// V0.6.1 F130 form `ccteam start` consumes (caller-supplied shutdown
+/// future); `run_daemon` is the SIGINT-only convenience wrapper kept
+/// for the existing integration-test surface.
+pub use daemon::{run_daemon, run_daemon_with_shutdown, DaemonArgs};
 
 #[cfg(test)]
 mod tests {

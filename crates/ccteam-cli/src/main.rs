@@ -159,6 +159,13 @@ enum Command {
         /// via a separate `ccteam web` invocation).
         #[arg(long, default_value_t = false)]
         no_web: bool,
+        /// V0.6.1 F130 — skip starting the embedded `ccteam-imd`
+        /// IM-bot supervisor (Telegram / Slack / Discord bridge). The
+        /// supervisor lives in the same process as the orchestrator
+        /// (no separate `ccteam-imd` binary anymore); pass this to
+        /// run orchestrator-only without IM transport.
+        #[arg(long, default_value_t = false)]
+        no_imd: bool,
         /// Embedded web UI bind address. Default `0.0.0.0:7331` so
         /// host deployments are LAN-reachable out of the box; auth is
         /// auto-enabled on non-loopback binds and the token lands in
@@ -565,15 +572,6 @@ enum Command {
         #[command(subcommand)]
         action: SessionAction,
     },
-    /// V0.6.0 Wave 2 F109 — start / stop / status the `ccteam-imd`
-    /// IM-bot daemon (Telegram / Slack / Discord bridge). Thin wrapper
-    /// that exec's the standalone `ccteam-imd` binary; the daemon
-    /// itself is a separate crate (`crates/ccteam-imd/`) so the CLI
-    /// stays free of `reqwest` / IM transitive deps.
-    Daemon {
-        #[command(subcommand)]
-        action: DaemonAction,
-    },
     /// V0.3 M5.0: serve the ccteam web UI (read + restricted-write,
     /// `docs/versions/v0-3/prd.md` §3-§6). M5.0 ships the scaffold + `/health`
     /// endpoint only; dashboard / SSE / write actions land in M5.1-3.
@@ -723,20 +721,6 @@ enum InternalCommand {
     },
 }
 
-/// V0.6.0 Wave 2 F109 — `ccteam daemon` subcommand surface. Each variant
-/// delegates to the standalone `ccteam-imd` binary via `Command::new`
-/// (no workspace dep — keeps `reqwest` out of `ccteam-cli`'s closure).
-#[derive(Subcommand)]
-enum DaemonAction {
-    /// Start `ccteam-imd run --foreground` in a child process.
-    Start,
-    /// SIGTERM the running daemon (best-effort; reads pid from
-    /// `~/.ccteam/state/imd.pid` if present, otherwise scans pgrep).
-    Stop,
-    /// Print daemon status (heartbeat freshness + registered bots).
-    Status,
-}
-
 /// V0.3.1 F49 — `ccteam session` subcommand surface for flex teams.
 #[derive(Subcommand)]
 enum SessionAction {
@@ -864,6 +848,7 @@ fn main() -> Result<()> {
             skip_tool_check,
             claude_argv,
             no_web,
+            no_imd,
             web_bind,
             web_no_auth,
             web_token_file,
@@ -906,6 +891,7 @@ fn main() -> Result<()> {
                     token_file: web_token_file,
                     no_clipboard,
                 },
+                StartImdOpts { disabled: no_imd },
             ),
         },
         Command::New { slug, team } => run_new(slug, team),
@@ -1057,7 +1043,6 @@ fn main() -> Result<()> {
             })
         }
         Command::Session { action } => run_session(action),
-        Command::Daemon { action } => run_daemon_cmd(action),
         Command::Web {
             bind,
             no_auth,
@@ -1181,45 +1166,10 @@ fn run_mcp_serve() -> Result<()> {
     runtime.block_on(mcp_serve::run_mcp_serve(paths))
 }
 
-/// V0.6.0 Wave 2 F109 — dispatch `ccteam daemon <action>` by exec'ing
-/// `ccteam-imd <action>` as a child process. We do NOT link
-/// `ccteam-imd` into the CLI crate (keeps reqwest / IM transitive
-/// deps out of the daily-driver `ccteam` binary's closure).
-fn run_daemon_cmd(action: DaemonAction) -> Result<()> {
-    use std::process::Command as ProcCommand;
-    let bin = std::env::var("CCTEAM_IMD_BIN").unwrap_or_else(|_| "ccteam-imd".to_string());
-    let mut cmd = ProcCommand::new(&bin);
-    match action {
-        DaemonAction::Start => {
-            cmd.args(["run", "--foreground"]);
-        }
-        DaemonAction::Stop => {
-            // No subcommand on ccteam-imd for stop yet — SIGTERM via
-            // pgrep is the cheapest reliable path that doesn't
-            // require a pidfile-writing daemon. Users on systemd
-            // should `systemctl --user stop ccteam-imd` instead.
-            let out = ProcCommand::new("pkill")
-                .args(["-TERM", "-x", "ccteam-imd"])
-                .status();
-            match out {
-                Ok(s) if s.success() => println!("ccteam-imd: SIGTERM sent"),
-                Ok(_) => println!("ccteam-imd: no running process found"),
-                Err(err) => println!("ccteam-imd: pkill failed: {err}"),
-            }
-            return Ok(());
-        }
-        DaemonAction::Status => {
-            cmd.arg("status");
-        }
-    }
-    let status = cmd
-        .status()
-        .with_context(|| format!("exec `{bin}` (set CCTEAM_IMD_BIN to override)"))?;
-    if !status.success() {
-        anyhow::bail!("{bin} exited with {status}");
-    }
-    Ok(())
-}
+// V0.6.1 F130 — `ccteam daemon {start,stop,status}` removed. The IMD
+// supervisor now lives inside `ccteam start` as one tokio task, so
+// lifecycle = `ccteam start` / `ccteam stop` (same as orchestrator +
+// web). Status check is `ccteam doctor` (heartbeat file probe).
 
 fn run_attach(slug: &str) -> Result<()> {
     let paths = CcteamPaths::from_env()?;
@@ -1369,11 +1319,20 @@ struct StartWebOpts {
     no_clipboard: bool,
 }
 
+/// V0.6.1 F130 — IMD supervisor task knobs. Today the only operator
+/// switch is `disabled` (mirror of `--no-imd`); future knobs (custom
+/// credentials path, custom registry root) attach here without changing
+/// `run_start`'s signature.
+struct StartImdOpts {
+    disabled: bool,
+}
+
 fn run_start(
     tick_seconds: u64,
     skip_tool_check: bool,
     claude_argv_flag: Option<String>,
     web: StartWebOpts,
+    imd: StartImdOpts,
 ) -> Result<()> {
     init_tracing();
     let paths = CcteamPaths::from_env()?;
@@ -1499,6 +1458,25 @@ fn run_start(
                 }))
             };
 
+            // V0.6.1 F130 — IMD supervisor as a third tokio task sharing
+            // the same shutdown channel. Mirrors the web_handle pattern
+            // above; binary `ccteam-imd` no longer exists.
+            let imd_handle = if imd.disabled {
+                tracing::info!("ccteam start: --no-imd set; IMD supervisor task skipped");
+                None
+            } else {
+                let mut rx = shutdown_rx.clone();
+                Some(tokio::spawn(async move {
+                    ccteam_imd::run_daemon_with_shutdown(
+                        ccteam_imd::DaemonArgs::default(),
+                        async move {
+                            let _ = rx.changed().await;
+                        },
+                    )
+                    .await
+                }))
+            };
+
             let orch_shutdown = {
                 let mut rx = shutdown_rx.clone();
                 async move {
@@ -1514,6 +1492,17 @@ fn run_start(
                     Ok(Err(err)) => tracing::warn!(?err, "ccteam web exited with error"),
                     Err(je) if je.is_cancelled() => {}
                     Err(je) => tracing::warn!(?je, "ccteam web task panicked"),
+                }
+            }
+            // V0.6.1 F130 — drain the IMD task on the same shutdown
+            // boundary so a slow supervisor tick can finish before the
+            // runtime exits.
+            if let Some(h) = imd_handle {
+                match h.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => tracing::warn!(?err, "ccteam-imd exited with error"),
+                    Err(je) if je.is_cancelled() => {}
+                    Err(je) => tracing::warn!(?je, "ccteam-imd task panicked"),
                 }
             }
             signal_task.abort();
