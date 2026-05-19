@@ -167,7 +167,8 @@ pub use plugin_resolution::{
 // `UnifiedTokenUsage`; alias here so V0.5 callers reading
 // `ccteam_core::Usage` keep compiling.
 pub use ccteam_cost::{
-    estimate_cost, pricing_schema_version, ModelPrices, UnifiedTokenUsage as Usage, Vendor,
+    estimate_cost, pricing_schema_version, pricing_schema_version_for, ModelPrices,
+    UnifiedTokenUsage as Usage, Vendor,
 };
 pub use progress::{
     current_agent_sessions, escalation_count, workflow_cost_total, AgentSessionStatus,

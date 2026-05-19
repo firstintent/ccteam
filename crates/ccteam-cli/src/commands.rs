@@ -13,12 +13,13 @@ use ccteam_core::tmux::TmuxSession;
 use ccteam_core::{
     bootstrap_meta_project, cost_summary, current_ccteam_bin, install_ccteam_control_skill,
     install_ccteam_creator_skill, install_ccteam_team_skill, migrate_legacy_skill_dirs,
-    migrate_recommended_agent_symlinks, pricing_schema_version, rewrite_legacy_hook_commands,
-    session_name_for_project, user_claude_dir, write_global_helper_templates, CcteamPaths,
-    HookCmdRewriteAction, HookCmdRewriteReport, InstallSkillOptions, LegacySkillAction,
-    LegacySkillReport, MetaBootstrapReport, MigrationReport, PhaseState, ProjectState,
-    SkillInstallAction, ToolSurfaceSnapshot, BUILTIN_SUBAGENTS, CCTEAM_CONTROL_SKILL_NAME,
-    CCTEAM_CREATOR_SKILL_NAME, CCTEAM_TEAM_SKILL_NAME,
+    migrate_recommended_agent_symlinks, pricing_schema_version, pricing_schema_version_for,
+    rewrite_legacy_hook_commands, session_name_for_project, user_claude_dir,
+    write_global_helper_templates, CcteamPaths, HookCmdRewriteAction, HookCmdRewriteReport,
+    InstallSkillOptions, LegacySkillAction, LegacySkillReport, MetaBootstrapReport,
+    MigrationReport, PhaseState, ProjectState, SkillInstallAction, ToolSurfaceSnapshot, Vendor,
+    BUILTIN_SUBAGENTS, CCTEAM_CONTROL_SKILL_NAME, CCTEAM_CREATOR_SKILL_NAME,
+    CCTEAM_TEAM_SKILL_NAME,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -2133,7 +2134,7 @@ pub struct DoctorOptions {
 
 /// `ccteam doctor` dispatch. Returns a human-readable report so unit
 /// tests don't need to capture stdout.
-pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
+pub fn run_doctor(paths: &CcteamPaths, mut opts: DoctorOptions) -> Result<String> {
     let any_mode = opts.tool_surface
         || opts.install_skill
         || opts.install_meta_agent
@@ -2150,47 +2151,13 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
         || opts.check_pricing_version
         || opts.check_codex_version
         || opts.check_codex_auth;
+    // V0.6.1 F121 — `ccteam doctor` with no mode flag implicitly runs
+    // the pricing staleness check so operators see ageing rate sheets
+    // without having to remember `--check-pricing-version`. The opt-in
+    // mutation modes still require an explicit flag, and the help text
+    // is appended after the report so first-time users discover them.
     if !any_mode {
-        return Ok(String::from(
-            "ccteam doctor: pass at least one mode flag.\n\
-             \n\
-             modes:\n  \
-             --tool-surface\n      \
-             cross-check phase templates' tools_required against current reachability — \
-             plugin-pipeline-aware (V0.2 M0.20).\n  \
-             --install-skill [NAME] [--force]\n      \
-             write ~/.claude/skills/ccteam-{control,team-author,project-creator,team}/SKILL.md \
-             (M1.8 + V0.5.0 F93a). Pass NAME=all (or omit) for every shipped skill; pass a \
-             single skill name (`ccteam-team` etc.) to install just one. Default installs run \
-             the V0.2.2 (F39'd) → V0.2.2 (F44'd) reverse migration (legacy `cct-*` skill dirs + \
-             stale settings.json hook command paths); single-skill installs skip the migration.\n  \
-             --install-meta-agent\n      \
-             bootstrap the canonical meta-agent project at ~/projects/meta/. Implies --install-skill. (V0.4.1: handle dropped — one ccteam install = one meta-agent.)\n  \
-             --install-mcp\n      \
-             register `mcpServers.ccteam` in ~/.claude.json so daily-driver claude + meta-agent see the 9-tool MCP server (M2.5).\n  \
-             --install-memory-bridge [--dry-run]\n      \
-             write ~/.claude/rules/ccteam-lessons-<team>.md placeholders for every team with non-empty retro_schema (M4.2; V0.2 M0.16.2 — disk-driven team discovery).\n  \
-             --reset-shipped-teams [--force]\n      \
-             re-seed shipped team templates (~/.ccteam/teams/<name>/team.yaml + ~/.ccteam/<phase_dir>/*.md) from the in-binary bundle. Without --force, operator hand-edits are preserved; with --force, every shipped file is overwritten (V0.2 M0.16.2).\n  \
-             --validate-team <name>\n      \
-             load + validate one team's team.yaml + phase markdown set (V0.2 M0.18.5). Reports per-phase frontmatter health, IO contract consistency between adjacent phases, and warns on body-level protocol-keyword residue.\n  \
-             --migrate-recommended-agents [--dry-run]\n      \
-             remove stale ~/.claude/agents/<name>.md symlinks left by the V0.1 ln -sf path. One-time cleanup after upgrading to V0.2 plugin pipeline (V0.2 M0.20).\n  \
-             --screenshot-smoke <slug>\n      \
-             render an end-to-end PNG screenshot of <slug>'s tmux pane to <project>/.ccteam/screenshots/<utc>.png. Verifies font + tmux + imageproc + IO; reports the path on success, the degrade reason on failure (V0.2.2 F38).\n  \
-             --migrate-v041-to-v042\n      \
-             fold V0.4.1 ~/projects/* + ~/.ccteam/watchdog.yaml into the new ~/.ccteam/config.yaml. Idempotent (V0.4.2 F74).\n  \
-             --migrate-workflow-to-ccteam-dir [--apply]\n      \
-             move every registered project's root workflow.yaml into <project>/.ccteam/workflow.yaml \
-             (V0.4.6 F83). Default dry-run; pair with --apply to perform the moves. Conflicts \
-             (both locations present) are fail-safe — neither file is touched.\n  \
-             --gc-claude-jobs [--apply]\n      \
-             reclaim terminated ~/.claude/jobs/<id>/ dirs older than ~/.ccteam/config.yaml::claude_jobs_retention_days (default 7 days; 0 disables). Default is dry-run; --apply commits removals (V0.4.6 F85).\n  \
-             --update-hooks [--dry-run]\n      \
-             walk every registered project's .claude/settings.json and strip the retired `ccteam hook cost-accumulate` entry. Idempotent (V0.4.6 F91).\n  \
-             --check-pricing-version\n      \
-             print the embedded pricing.json schema_version next to today's date; WARN when the embedded table is older than 180 days (V0.5.0 F92).\n",
-        ));
+        opts.check_pricing_version = true;
     }
     let mut out = String::new();
     if opts.tool_surface {
@@ -2265,8 +2232,59 @@ pub fn run_doctor(paths: &CcteamPaths, opts: DoctorOptions) -> Result<String> {
     // CodexAdapter impl. **Never fails the doctor exit code** —
     // `which codex` returning non-zero is the expected state today.
     out.push_str(&render_codex_detection_line());
+    // V0.6.1 F121 — when the caller passed no mode flag we ran the
+    // implicit pricing-staleness check; append the help block so
+    // first-time users still discover the explicit mode flags.
+    if !any_mode {
+        out.push_str(NO_MODE_HELP);
+    }
     Ok(out)
 }
+
+/// V0.6.1 F121 — help text appended after the implicit pricing check
+/// when `ccteam doctor` is invoked with no mode flag.
+const NO_MODE_HELP: &str = "\nccteam doctor: pass at least one mode flag for the opt-in checks below.\n\
+     \n\
+     modes:\n  \
+     --tool-surface\n      \
+     cross-check phase templates' tools_required against current reachability — \
+     plugin-pipeline-aware (V0.2 M0.20).\n  \
+     --install-skill [NAME] [--force]\n      \
+     write ~/.claude/skills/ccteam-{control,team-author,project-creator,team}/SKILL.md \
+     (M1.8 + V0.5.0 F93a). Pass NAME=all (or omit) for every shipped skill; pass a \
+     single skill name (`ccteam-team` etc.) to install just one. Default installs run \
+     the V0.2.2 (F39'd) → V0.2.2 (F44'd) reverse migration (legacy `cct-*` skill dirs + \
+     stale settings.json hook command paths); single-skill installs skip the migration.\n  \
+     --install-meta-agent\n      \
+     bootstrap the canonical meta-agent project at ~/projects/meta/. Implies --install-skill. (V0.4.1: handle dropped — one ccteam install = one meta-agent.)\n  \
+     --install-mcp\n      \
+     register `mcpServers.ccteam` in ~/.claude.json so daily-driver claude + meta-agent see the 9-tool MCP server (M2.5).\n  \
+     --install-memory-bridge [--dry-run]\n      \
+     write ~/.claude/rules/ccteam-lessons-<team>.md placeholders for every team with non-empty retro_schema (M4.2; V0.2 M0.16.2 — disk-driven team discovery).\n  \
+     --reset-shipped-teams [--force]\n      \
+     re-seed shipped team templates (~/.ccteam/teams/<name>/team.yaml + ~/.ccteam/<phase_dir>/*.md) from the in-binary bundle. Without --force, operator hand-edits are preserved; with --force, every shipped file is overwritten (V0.2 M0.16.2).\n  \
+     --validate-team <name>\n      \
+     load + validate one team's team.yaml + phase markdown set (V0.2 M0.18.5). Reports per-phase frontmatter health, IO contract consistency between adjacent phases, and warns on body-level protocol-keyword residue.\n  \
+     --migrate-recommended-agents [--dry-run]\n      \
+     remove stale ~/.claude/agents/<name>.md symlinks left by the V0.1 ln -sf path. One-time cleanup after upgrading to V0.2 plugin pipeline (V0.2 M0.20).\n  \
+     --screenshot-smoke <slug>\n      \
+     render an end-to-end PNG screenshot of <slug>'s tmux pane to <project>/.ccteam/screenshots/<utc>.png. Verifies font + tmux + imageproc + IO; reports the path on success, the degrade reason on failure (V0.2.2 F38).\n  \
+     --migrate-v041-to-v042\n      \
+     fold V0.4.1 ~/projects/* + ~/.ccteam/watchdog.yaml into the new ~/.ccteam/config.yaml. Idempotent (V0.4.2 F74).\n  \
+     --migrate-workflow-to-ccteam-dir [--apply]\n      \
+     move every registered project's root workflow.yaml into <project>/.ccteam/workflow.yaml \
+     (V0.4.6 F83). Default dry-run; pair with --apply to perform the moves. Conflicts \
+     (both locations present) are fail-safe — neither file is touched.\n  \
+     --gc-claude-jobs [--apply]\n      \
+     reclaim terminated ~/.claude/jobs/<id>/ dirs older than ~/.ccteam/config.yaml::claude_jobs_retention_days (default 7 days; 0 disables). Default is dry-run; --apply commits removals (V0.4.6 F85).\n  \
+     --update-hooks [--dry-run]\n      \
+     walk every registered project's .claude/settings.json and strip the retired `ccteam hook cost-accumulate` entry. Idempotent (V0.4.6 F91).\n  \
+     --check-pricing-version\n      \
+     print the embedded pricing.json schema_version next to today's date; WARN at >180 days, ERROR at >365 days (V0.5.0 F92 / V0.6.1 F121). Runs implicitly when no mode flag is passed.\n  \
+     --check-codex-version\n      \
+     probe `codex --version` and WARN when older than 0.131 (V0.6.0 Wave 3 F112).\n  \
+     --check-codex-auth\n      \
+     probe `codex login status` and report whether the operator is logged in (V0.6.0 Wave 3 F112).\n";
 
 /// V0.3.1 F47 — pure informational `which codex` detection. Returns
 /// a single line ending with `\n`. The lookup uses `Command::new("which")`
@@ -2748,44 +2766,153 @@ fn render_update_hooks_report(paths: &CcteamPaths, dry_run: bool) -> Result<Stri
     Ok(out)
 }
 
-/// V0.5.0 F92: print the embedded `pricing.json::schema_version`
-/// alongside today's date. WARN when the table is older than 180 days
-/// so operators upgrade ccteam before the dollar numbers drift far
-/// from anthropic.com.
-fn render_check_pricing_version_report() -> String {
-    let mut out = String::from("ccteam doctor --check-pricing-version (V0.5.0 F92)\n\n");
-    let version = pricing_schema_version();
-    let today = chrono::Utc::now().date_naive();
-    out.push_str(&format!("  pricing.json schema_version: {version}\n"));
-    out.push_str(&format!("  today (UTC):                 {today}\n"));
+/// V0.6.1 F121 — pricing staleness classifier thresholds (days since
+/// `schema_version` for the embedded rate sheet).
+const PRICING_WARN_DAYS: i64 = 180;
+const PRICING_ERROR_DAYS: i64 = 365;
 
-    // The version is authored as `YYYY-MM-DD`. Anything else is a build
-    // error (the embedded JSON would fail to parse) — but if a future
-    // schema ever loosens the format we tolerate the parse miss with a
-    // soft note rather than panicking the doctor command.
-    match chrono::NaiveDate::parse_from_str(version, "%Y-%m-%d") {
-        Ok(authored) => {
-            let age_days = (today - authored).num_days();
-            out.push_str(&format!("  age:                         {age_days} days\n"));
-            if age_days > 180 {
+/// V0.6.1 F121 — per-vendor pricing classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PricingStaleness {
+    /// `age_days <= 180`.
+    Ok,
+    /// `180 < age_days <= 365` — pricing aging, refresh on next ccteam upgrade.
+    Warn,
+    /// `age_days > 365` — ship blocker, embedded table must be re-pulled.
+    Error,
+    /// `schema_version` failed to parse as `YYYY-MM-DD` (defensive: a
+    /// future schema loosening must not panic the doctor command).
+    Unparsed,
+}
+
+impl PricingStaleness {
+    fn classify(age_days: i64) -> Self {
+        if age_days > PRICING_ERROR_DAYS {
+            Self::Error
+        } else if age_days > PRICING_WARN_DAYS {
+            Self::Warn
+        } else {
+            Self::Ok
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ok => "OK",
+            Self::Warn => "warn pricing aging",
+            Self::Error => "ERROR ship needs re-pull",
+            Self::Unparsed => "note unparsed schema_version",
+        }
+    }
+}
+
+/// V0.6.1 F121 — read the `CCTEAM_TEST_NOW=YYYY-MM-DD` env override
+/// when present so tests can pin "today" deterministically. Falls back
+/// to UTC `today`.
+fn doctor_today() -> chrono::NaiveDate {
+    if let Ok(raw) = std::env::var("CCTEAM_TEST_NOW") {
+        if let Ok(d) = chrono::NaiveDate::parse_from_str(raw.trim(), "%Y-%m-%d") {
+            return d;
+        }
+    }
+    chrono::Utc::now().date_naive()
+}
+
+/// V0.5.0 F92 / V0.6.1 F121 — classify each vendor's embedded pricing
+/// table against today and emit one line per vendor:
+///
+/// ```text
+/// [pricing.anthropic] pulled 2026-05-19 (now -0d, OK)
+/// [pricing.openai]    pulled 2026-02-19 (now -90d, warn pricing aging)
+/// [pricing.openai]    pulled 2024-12-19 (now -365d, ERROR ship needs re-pull)
+/// ```
+///
+/// `age_days <= 180` → OK; `180 < age_days <= 365` → warn (pricing aging);
+/// `age_days > 365` → ERROR (ship needs a re-pull).
+///
+/// The `CCTEAM_TEST_NOW` env override pins "today" so tests can stamp
+/// the three states deterministically.
+fn render_check_pricing_version_report() -> String {
+    let mut out = String::from("ccteam doctor --check-pricing-version (V0.5.0 F92 / V0.6.1 F121)\n\n");
+    let today = doctor_today();
+    let mut worst = PricingStaleness::Ok;
+    for (label, vendor) in [
+        ("pricing.anthropic", Vendor::Claude),
+        ("pricing.openai", Vendor::Codex),
+    ] {
+        let pulled = pricing_schema_version_for(vendor);
+        match chrono::NaiveDate::parse_from_str(pulled, "%Y-%m-%d") {
+            Ok(authored) => {
+                let age_days = (today - authored).num_days();
+                let state = PricingStaleness::classify(age_days);
                 out.push_str(&format!(
-                    "\n  [WARN] pricing.json is {age_days} days old (> 180). \
-                     Upgrade ccteam to refresh the bundled rate sheet \
-                     (see crates/ccteam-cost/pricing/anthropic.toml + openai.toml).\n",
+                    "  [{label}] pulled {pulled} (now -{age_days}d, {})\n",
+                    state.label(),
                 ));
-            } else {
-                out.push_str("\n  pricing table is fresh (< 180 days).\n");
+                if state_severity(state) > state_severity(worst) {
+                    worst = state;
+                }
+            }
+            Err(_) => {
+                out.push_str(&format!(
+                    "  [{label}] pulled {pulled} (now ??d, {})\n",
+                    PricingStaleness::Unparsed.label(),
+                ));
+                if state_severity(PricingStaleness::Unparsed) > state_severity(worst) {
+                    worst = PricingStaleness::Unparsed;
+                }
             }
         }
-        Err(_) => {
+    }
+    match worst {
+        PricingStaleness::Ok => {
+            out.push_str(&format!(
+                "\n  pricing tables fresh (≤ {PRICING_WARN_DAYS} days).\n",
+            ));
+        }
+        PricingStaleness::Warn => {
+            out.push_str(&format!(
+                "\n  [WARN] one or more pricing tables older than {PRICING_WARN_DAYS} days. \
+                 Upgrade ccteam to refresh the bundled rate sheet \
+                 (see crates/ccteam-cost/pricing/anthropic.toml + openai.toml).\n",
+            ));
+        }
+        PricingStaleness::Error => {
+            out.push_str(&format!(
+                "\n  [ERROR] one or more pricing tables older than {PRICING_ERROR_DAYS} days — \
+                 ship blocker. Re-pull the rate sheets in \
+                 crates/ccteam-cost/pricing/{{anthropic,openai}}.toml \
+                 (bump `schema_version` to today's YYYY-MM-DD).\n",
+            ));
+        }
+        PricingStaleness::Unparsed => {
             out.push_str(
-                "\n  [note] schema_version did not parse as YYYY-MM-DD; \
-                 staleness check skipped.\n",
+                "\n  [note] one or more `schema_version` values did not parse as YYYY-MM-DD; \
+                 staleness check skipped for those vendors.\n",
             );
         }
     }
+    // V0.5.x callers (and the V0.6.0 wave-1 baseline) still expect to
+    // see the overall "newer of the two" date for tooling that scrapes
+    // the report; preserve a trailing single line referencing the
+    // existing `pricing_schema_version()` accessor so the API is not
+    // silently retired by the F121 rewrite.
+    out.push_str(&format!(
+        "\n  pricing_schema_version() (newer of the two): {}\n",
+        pricing_schema_version(),
+    ));
     out.push('\n');
     out
+}
+
+/// V0.6.1 F121 — severity ordering for the worst-of summary line.
+fn state_severity(s: PricingStaleness) -> u8 {
+    match s {
+        PricingStaleness::Ok => 0,
+        PricingStaleness::Unparsed => 1,
+        PricingStaleness::Warn => 2,
+        PricingStaleness::Error => 3,
+    }
 }
 
 /// V0.6.0 Wave 3 F112 — probe `codex --version` and emit a single
@@ -4922,18 +5049,26 @@ mod tests {
     }
 
     #[test]
-    fn run_doctor_no_flags_help_text_does_not_print_codex_line() {
-        // The help-text early-return path is a usage error, not a
-        // health check — codex detection is gated on `any_mode == true`
-        // (see `run_doctor` source). Pin that contract so a future
-        // refactor doesn't accidentally surface the line in the help
-        // text and confuse first-time users.
+    fn run_doctor_no_flags_runs_implicit_pricing_check_with_help() {
+        // V0.6.1 F121 — `ccteam doctor` without a mode flag now
+        // implicitly runs the pricing-staleness check so operators see
+        // ageing rate sheets without having to remember the explicit
+        // flag. The help block is appended after the report so
+        // first-time users still discover the opt-in mutation modes.
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
         let body = run_doctor(&paths, DoctorOptions::default()).unwrap();
         assert!(
-            !body.contains("[ccteam] codex CLI:"),
-            "help-text path must NOT include codex detection; got:\n{body}",
+            body.contains("ccteam doctor --check-pricing-version"),
+            "no-flag invocation must run implicit pricing check; got:\n{body}",
+        );
+        assert!(
+            body.contains("[pricing.anthropic]") && body.contains("[pricing.openai]"),
+            "implicit pricing check must emit both vendor rows; got:\n{body}",
+        );
+        assert!(
+            body.contains("pass at least one mode flag"),
+            "no-flag invocation must still surface the help block; got:\n{body}",
         );
     }
 
