@@ -175,6 +175,7 @@ async fn adapter_returns_spawn_failed_when_socket_missing() {
         cwd: std::env::temp_dir(),
         project_dir: std::env::temp_dir(),
         extra_args: vec![],
+        model_id: None,
     };
     let err = adapter.start_thread(&spec, &ctx).await.unwrap_err();
     assert!(matches!(err, HarnessError::SpawnFailed(_)));
@@ -206,6 +207,7 @@ async fn adapter_start_thread_against_scripted_peer() {
         cwd: std::env::temp_dir(),
         project_dir: std::env::temp_dir(),
         extra_args: vec![],
+        model_id: None,
     };
     let h = adapter.start_thread(&spec, &ctx).await.unwrap();
     assert_eq!(h.vendor, AgentVendor::Codex);

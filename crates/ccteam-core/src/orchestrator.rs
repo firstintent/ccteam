@@ -1687,6 +1687,11 @@ impl Orchestrator {
             cwd: project_dir.to_path_buf(),
             project_dir: project_dir.to_path_buf(),
             extra_args: vec![kick],
+            // Wave 4 D14 — plumb the workflow-declared model id so the
+            // adapter can spawn the right model and `ccteam_cost` can
+            // price against the actual model instead of the vendor
+            // fallback. `None` = vendor default.
+            model_id: agent.model.clone(),
         };
 
         // Atomic check-and-spawn: hold the `running` lock from the
@@ -1781,6 +1786,11 @@ impl Orchestrator {
         sid: &str,
         slug: &str,
         vendor: AgentVendor,
+        // Wave 4 D14 — the concrete model id the agent was spawned
+        // against (plumbed from `SpawnCtx::model_id`). When `None`,
+        // `ccteam_cost::estimate_cost` falls back to the vendor's
+        // `fallback_model` (legacy V0.5 behaviour).
+        model: Option<&str>,
     ) -> Option<serde_json::Value> {
         let vendor_str = match vendor {
             AgentVendor::Claude => "claude",
@@ -1795,10 +1805,9 @@ impl Orchestrator {
                         AgentVendor::Claude => ccteam_cost::Vendor::Claude,
                         AgentVendor::Codex => ccteam_cost::Vendor::Codex,
                     },
-                    // Wave 3: model identity isn't on ThreadEvent; the
-                    // pricing table falls back to per-vendor default
-                    // when the model string is unknown.
-                    "",
+                    // Wave 4 D14: real model id now plumbed (`""` =
+                    // vendor fallback for legacy callers).
+                    model.unwrap_or(""),
                 );
                 Some(json!({
                     "event": "agent_done",

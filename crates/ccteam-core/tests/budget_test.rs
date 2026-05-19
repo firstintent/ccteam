@@ -65,6 +65,7 @@ fn manual_spec_with_budget(role: &str, budget: Option<BudgetSpec>) -> WorkflowSp
         role.into(),
         AgentSpec {
             executor: Executor::Claude,
+            model: None,
             trigger: Trigger::Manual,
             parallelism: None,
             input: None,

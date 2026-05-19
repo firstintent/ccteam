@@ -50,6 +50,7 @@ async fn start_thread_spawns_tmux_and_returns_handle() {
         cwd: tmp.path().to_path_buf(),
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec![],
+        model_id: None,
     };
     let handle = ClaudeTuiAdapter::new()
         .start_thread(&brief, &ctx)
@@ -94,6 +95,7 @@ async fn submit_turn_sends_literal_text_to_tmux_pane() {
         cwd: tmp.path().to_path_buf(),
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec![],
+        model_id: None,
     };
     let handle = ClaudeTuiAdapter::new()
         .start_thread(&brief, &ctx)
@@ -138,6 +140,7 @@ async fn submit_turn_artifact_uses_read_protocol() {
         cwd: tmp.path().to_path_buf(),
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec![],
+        model_id: None,
     };
     let handle = ClaudeTuiAdapter::new()
         .start_thread(&brief, &ctx)
