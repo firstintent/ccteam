@@ -210,7 +210,7 @@ CLAUDE.md 在每次会话开头加载。包括：Bash 命令、code style、work
 
 完成后**起新会话**用 spec 实现——干净 context。
 
-> **ccteam 映射**:反向面试由 **meta-agent** 承担——用户模糊需求时 meta-agent 用 `AskUserQuestion` 澄清,确认后再用 `mcp__ccteam__new` 起项目(详 `skills/ccteam-creator/`)。
+> **ccteam 映射**:反向面试由 **meta-agent** 承担——用户模糊需求时 meta-agent 用 `AskUserQuestion` 澄清,确认后再用 `mcp__ccteam__workflow_new` 起项目(详 `skills/ccteam-creator/`)。
 
 ---
 
@@ -234,7 +234,7 @@ CLAUDE.md 在每次会话开头加载。包括：Bash 命令、code style、work
 - CLAUDE.md 里加压缩偏好：`"When compacting, always preserve the full list of modified files and any test commands"`
 - 临时问题用 `/btw`：答案在 dismissible overlay，**不进 context history**
 
-> **ccteam 映射**:`/btw` 由 meta-agent 用 `mcp__ccteam__signal` 调,等价于"给某 agent 投递侧带消息";context reset 单位 = 每个 agent session,supervisor 在 `agent_done` 时决定回收。
+> **ccteam 映射**:`/btw` 由 meta-agent 用 `mcp__ccteam__workflow_signal` 调,等价于"给某 agent 投递侧带消息";context reset 单位 = 每个 agent session,supervisor 在 `agent_done` 时决定回收。
 
 ### 6.3 用 subagent 做调查
 

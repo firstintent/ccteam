@@ -176,7 +176,7 @@ pub enum QuotaFallbackDecision {
 /// Inputs:
 ///
 /// - `budget_tripped` — `cost_so_far >= budget_limit` (caller has
-///    already done the comparison).
+///   already done the comparison).
 /// - `current_executor_is_claude` — `agent.executor == Executor::Claude`.
 /// - `role` — agent role (used for prefs eligibility check).
 /// - `prefs` — the user's `~/.ccteam/preferences.toml` body.

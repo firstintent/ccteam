@@ -1,8 +1,29 @@
 # ccteam 技术实现方案
 
-> 本文档基于 [requirements.md](./requirements.md)（已确认的用户痛点），以 Claude Code 为执行 agent，给出 ccteam 当前 (V0.4.6) 的技术架构、组件分解、数据协议、扩展点映射。
+> 本文档基于 [requirements.md](./requirements.md)（已确认的用户痛点），以 Claude Code 为执行 agent，给出 ccteam 当前 (V0.6.0) 的技术架构、组件分解、数据协议、扩展点映射。
 >
-> **核心问题**：用户用一句自然语言提需求，系统自动产出可运行软件——且**不需要主对话窗口在线**、**多项目自动排队**、**测试不过不交付**、**经验跨项目沉淀**。
+> **核心问题**：用户用一句自然语言提需求，系统自动产出可运行软件——且**不需要主对话窗口在线**、**多项目自动排队**、**测试不过不交付**、**经验跨项目沉淀**；V0.6.0 起扩展到 **24/7 长跑 IM bot 形态**(模式 3),`vendor: {claude, codex}` 双 LLM 一等公民。
+
+---
+
+## 0. 红线表(V0.6.0 F106 双轴 scope)
+
+> 详 `docs/v0-6-0/README.md §五`;CLAUDE.md §三 是简版镜像。任何 PR 违反红线 = block。
+
+| 红线 | 模式 1 in-proc | 模式 2 bg(Claude / Codex)| 模式 3 chat(Claude / Codex)|
+|---|---|---|---|
+| R1 文件系统是控制平面 | — | 守(artifact 双 vendor) | 守 — Claude: tmux 长 session + transcript jsonl byte-offset 增量读;Codex: app-server UDS;两 vendor 共写 ccteam-owned `<project>/.ccteam/chat/<bot>/turns.jsonl` |
+| R2 `progress.jsonl` 唯一 state SoT | — | 守(双 vendor) | 业务事件 SoT 守(7 类 + `chat_session_reset` / `turn_done`);对话原文走 `turns.jsonl` |
+| R3 No prompt injection | 守 | 守 | 守 — `/compact /new /clear` 完全透传 |
+| R4 每次 spawn = fresh 1M context | — | Claude: `claude --bg`(无 `--resume`);Codex: trait 决定可复用,用户不见 yaml | 不适用 — chat 复用 context 是 feature |
+| R5 永不主动 kill 长 session | 守 | per-vendor `budgets.{claude,codex}.max_cost_usd_per_24h` 触顶 → F84 auto-disable | tmux 长跑 24/7;`/compact /new` 是合法 turn |
+| R6 不解析 tmux 终端输出 | — | 守 | 守 — 读 transcript jsonl + Claude Code 官方 hooks fast event 通道;`tmux capture-pane` 仅 dev-time 调试 + screenshot 只读 |
+| R7 fix-loop 3 次必 escalate | 守 | 守(`fix_counts` map) | 守 + AgentPath depth limit(借 Codex `agent_max_depth`)替代平铺 fix_counts |
+| R8 `ccteam-core` 零 team 名字面量 | 守 | 守 | 守 |
+| R9 跨项目记忆走官方接口 | 守 | Claude: `~/.claude/{CLAUDE.md,rules}`;Codex: `~/.codex/AGENTS.md`(`ccteam init` 落 symlink)| 同 |
+| R10 新建项目走 `<projects_root>/<team>-<slug>/` | — | 守 | per-bot tmux session = `<project>/<bot>`;IM bot 落 `.ccteam/chat/<bot>/` |
+
+**vendor 列补充**(V0.6 F107 / F112):**不 vendor** Claude / Codex 二进制(`references/` git-ignore,实际 spawn 走 `$PATH` binary + `CCTEAM_{CLAUDE,CODEX}_BIN` env override);`vendor: AgentVendor::{Claude, Codex}` enum 是 trait 一等公民,无 default。
 
 ---
 
@@ -32,19 +53,57 @@
 
 ### 2.1 三层架构（Channel / Interaction / Orchestration）
 
+V0.6.0 起 **Channel Layer 实化为 `ccteam-imd` 独立 supervisor daemon binary**(F116)+ 统一 `openhuman/channels` Rust crate 14+ IM 平台(F109);**HarnessAdapter trait 是 5-method thread/turn 接口对齐 Codex `ThreadManager::{submit, next_event}`**(F107);新增**模式 3 chat 形态**(F108):per-bot tmux 长 session + Claude TUI 长跑 + dual-track hooks+transcript 镜像 ccteam-owned `turns.jsonl`。
+
 ```
-Channel Layer (M2+ stub)  →  inbox/outbox 文件协议
-   Telegram / Feishu / Slack / email      (dumb router，无内嵌 LLM)
+Channel Layer (V0.6.0 F109+F116 实化)  →  inbox/outbox 文件协议 + IM event bus
+   ccteam-imd daemon binary
+     ├── openhuman/channels Rust crate (telegram/slack/discord/lark/dingtalk/qq/...)
+     ├── Reply Listener (borrowed OMC reply-listener.ts) + bot-to-bot @ routing + hop_limit
+     └── HarnessAdapter trait 调用(把 inbound IM 消息翻译成 TurnInput)
         ↓
-User Interaction Layer (M1)
-   meta-agent session (ccteam-meta-<user>) + project agent bg-jobs (~/.claude/jobs/<job_id>/)
-   接入面契约：<project>/.ccteam/{workflow.yaml, <artifact_dir>/, inbox/, outbox/} + .claude/agents/<role>.md
-        ↓ inotify ArtifactWatcher / inbox watcher
+User Interaction Layer (M1, V0.6 F108 扩 chat)
+   meta-agent session + project agent bg-jobs (~/.claude/jobs/<job_id>/)
+   + V0.6 F108: per-bot tmux long-session (claude TUI 24/7)
+   + V0.6 F112: Codex adapter(`codex exec` bg / `codex app-server` UDS chat)
+   接入面契约：<project>/.ccteam/{workflow.yaml, <artifact_dir>/, inbox/, outbox/,
+                                  chat/<bot>/turns.jsonl, handoffs/<workflow>/<stage>.md}
+                + .claude/agents/<role>.md
+        ↓ inotify ArtifactWatcher / inbox watcher / Claude Code hooks(模式 3 fast event)
 Orchestration Layer (F66 thin orchestrator)
-   Rust daemon + progress.jsonl 7 类业务事件 SoT + ArtifactWatcher (F64)
+   Rust daemon + progress.jsonl 业务事件 SoT(7 类 + chat_session_reset + turn_done)
+   + ArtifactWatcher (F64)
    每 workflow 一个 event_loop (JoinSet + F82 cancel token + F86 graceful shutdown)
-   17 个 mcp__ccteam__* tools (F65) + hooks (§6.4) + cost telemetry (F91, §6.12)
+   24 个 mcp__ccteam__{workflow_,chat_,advise_,admin_,screenshot}* tools (F111 子前缀分组)
+   + hooks (§6.4) + cost telemetry (F91 + V0.6 F112 双 pricing table, §6.12)
 ```
+
+**HarnessAdapter trait**(V0.4.0 落地 `crates/ccteam-core/src/harness.rs:75`,V0.6 F107 重写对齐 Codex `ThreadManager`):
+
+```rust
+pub trait HarnessAdapter: Send + Sync {
+    async fn start_thread(&self, spec: &AgentSpec, ctx: &SpawnCtx) -> Result<ThreadHandle>;
+    async fn submit_turn(&self, h: &ThreadHandle, input: TurnInput) -> Result<TurnId>;
+    fn events(&self, h: &ThreadHandle) -> BoxStream<'static, ThreadEvent>;
+    async fn resume_thread(&self, persistent_id: &str) -> Result<ThreadHandle>;
+    async fn close_thread(&self, h: &ThreadHandle) -> Result<()>;
+}
+
+pub enum TurnInput {
+    UserText(String),
+    Artifact(PathBuf),           // bg mode inbox
+    SystemDirective(String),     // /compact /new /clear 退化为特殊 turn
+    Image(PathBuf),              // rich media(F108)
+}
+
+pub struct ThreadHandle {
+    pub vendor: AgentVendor,     // Claude | Codex
+    pub mode: ExecutionMode,     // InProc | Bg | Chat
+    pub identity: String,
+}
+```
+
+`/compact /new /clear` 不再是独立 `LifecycleOp` enum,而是 `TurnInput::SystemDirective("compact")` 特殊 turn — adapter 内部翻译为 backend-specific 操作(Claude → `/compact` slash 透传;Codex → `compact_remote` API)。**统一模式 2 + 模式 3 = "all chat is a turn sequence"**。
 
 #### 2.1.1 三层各自的职责边界
 
@@ -185,12 +244,17 @@ const TEAM_SOURCES: &[TeamSource] = &[
 name: dex-ui-autoloop                    # 必，workflow 标识
 description: explorer/fixer/master 自激励循环  # 可选，UI 用
 enabled: true                            # F82，default true，false 时 daemon 跳过 roster
-budget:                                  # F84，可选 budget cap
-  max_cost_usd_per_24h: 5.00
-  max_agent_spawns_per_hour: 100
+mode: bg                                 # V0.6 F108：bg | chat；default bg
+budget:                                  # F84 + V0.6 F112 双 vendor cap
+  claude:                                #   per-vendor 子表（V0.6 F112）
+    max_cost_usd_per_24h: 5.00
+    max_agent_spawns_per_hour: 100
+  codex:
+    max_cost_usd_per_24h: 5.00
 agents:                                  # role → AgentSpec，IndexMap 保留 YAML 顺序
   explorer:
     executor: claude                     # claude | codex（default claude）
+    vendor: claude                       # V0.6 F107 trait 一等公民，无 default
     trigger: manual                      # 或 schedule / gate / watch:<path>
     parallelism: 1                       # 只对 watch trigger 有意义，其他强制 ≤1
     output: .ccteam/fix-requests/
@@ -206,13 +270,30 @@ agents:                                  # role → AgentSpec，IndexMap 保留 
     input: .ccteam/done/
 ```
 
+**V0.6 F108 + F114 chat-mode 扩展**（`mode: chat` 时启用顶层 `chat:` 段）：
+
+```yaml
+mode: chat
+vendor: claude                           # workflow 顶层 vendor 默认（agent 可单独覆盖）
+chat:
+  bot_name: pocket-bot                   # tmux session 名 + IM bot identity
+  compact_every_turns: 50                # 自动 /compact 触发阈值（adapter 内部，用户不感知）
+  hop_limit: 4                           # bot-to-bot @ routing 深度上限（借 Codex AgentPath）
+  recover_last_n_turns: 10               # F118 chat session 失效后从 turns.jsonl 重建 N 条
+  chat_acl:                              # 谁可以 DM / 群内 @ 这个 bot（F117 onboarding 落）
+    dm_allowlist: [u123, u456]
+    group_allowlist: [tg_chat_-100xxx]
+```
+
+详后面 "chat-mode design" 章节。完整 schema → **[interfaces.md §17](./interfaces.md#17-workflowyaml-schema)**。
+
 #### 3.3.2 `Trigger` 四类语义
 
 | Trigger | 语义 | 触发源 | 并发约束 |
 |---|---|---|---|
-| `manual` | 用户 / meta-agent 显式 `ccteam internal spawn <slug> <role>` 或 `mcp__ccteam__spawn_agent` | CLI / MCP / 用户 inbox 消息 | parallelism 强制 1 |
+| `manual` | 用户 / meta-agent 显式 `ccteam internal spawn <slug> <role>` 或 `mcp__ccteam__workflow_spawn_agent` | CLI / MCP / 用户 inbox 消息 | parallelism 强制 1 |
 | `schedule` | 定时 trigger；V0.4.6 仍 stub（meta-agent 手动触发），V0.4.7+ 接真 cron 解析 `AgentSpec::interval` | (未 ship) | parallelism 强制 1 |
-| `gate` | 等 `mcp__ccteam__trigger_gate` MCP 工具调用释放；释放后消费 input 目录所有 artifact 后再回 gated | MCP 工具 | parallelism 强制 1 |
+| `gate` | 等 `mcp__ccteam__workflow_trigger_gate` MCP 工具调用释放；释放后消费 input 目录所有 artifact 后再回 gated | MCP 工具 | parallelism 强制 1 |
 | `watch:<path>` | inotify（Linux）/ fsevents（macOS）监听项目相对路径，新文件 → spawn 一个 session | ArtifactWatcher（F64，F78 修复项目相对路径） | `parallelism: u32` 上限内并发 |
 
 #### 3.3.3 与 `.claude/agents/<role>.md` 的解耦
@@ -559,14 +640,14 @@ T+0:00  用户在 meta-agent inbox（或 channel adapter）说："做个本地�
 T+0:01  meta-agent dispatcher 看 inbox，问 1-2 clarify（如有），调 ccteam new <slug>
 T+0:02  ccteam new 写 ~/projects/dev-bookmark-mgr-a3f9/，生成 workflow.yaml + agent 模板
 T+0:03  ccteam doctor --install-memory-bridge（首次）；orchestrator 把项目 roster 入队
-T+0:05  ArtifactWatcher 装好；meta-agent 调 mcp__ccteam__spawn_agent role=planner 启 plan agent
+T+0:05  ArtifactWatcher 装好；meta-agent 调 mcp__ccteam__workflow_spawn_agent role=planner 启 plan agent
 T+0:10  planner 写 .ccteam/specs/spec.md + .ccteam/specs/plan.md
 T+0:11  ArtifactWatcher inotify trigger explorer（watch:.ccteam/specs/）→ spawn explorer
 T+0:30  explorer 写 .ccteam/fix-requests/F1.md（首批待办）
 T+0:31  ArtifactWatcher trigger fixer（watch:.ccteam/fix-requests/，parallelism=3）→ spawn 3 fixer 并发
 T+1:30  fixer 们陆续写 .ccteam/done/F1.md ...；agent_done 事件累积
 T+1:31  ArtifactWatcher trigger reviewer（watch:.ccteam/done/）→ spawn reviewer
-T+1:50  reviewer PASS → 通过 mcp__ccteam__trigger_gate 释放 master agent
+T+1:50  reviewer PASS → 通过 mcp__ccteam__workflow_trigger_gate 释放 master agent
 T+2:00  master 跑 ship workflow：git tag v0.1.0，写 .claude/rules/ccteam-lessons-dev.md（marked section）
 T+2:05  workflow_done 事件；meta-agent 翻译给用户：✅ bookmark-mgr 已交付
 ```
@@ -607,11 +688,14 @@ T+2:05  workflow_done 事件；meta-agent 翻译给用户：✅ bookmark-mgr 已
 
 ## 6. Claude Code 扩展点映射
 
-### 6.1 Tmux 长 session（Codex adapter 用）
+### 6.1 Tmux 长 session（meta-agent / Codex adapter / V0.6 mode 3 Claude bot）
 
 > 常规 Claude 项目走 §3.3 workflow.yaml + bg-job 路径。tmux 长 session
-> **仅 meta-agent 与 Codex CLI adapter 在用**：meta-agent 需要事件循环 + 用户 attach，
-> Codex 的后台模式尚未标准化（F62 推迟）。下面模板写给这两个 consumer。
+> **三个 consumer 在用**：meta-agent 需要事件循环 + 用户 attach；Codex CLI adapter
+> 模式 2/3（F62 推迟标准化的 bg → V0.6 F112 落地 Option B）；**V0.6 F108 起 mode 3
+> Claude bot 也用 tmux 长 session**（per-bot 一个 tmux session + `claude` TUI 24/7 长跑，
+> dual-track:Claude Code 官方 hooks 快 event 通道 + transcript jsonl byte-offset 增量读
+> → 镜像 ccteam-owned `<project>/.ccteam/chat/<bot>/turns.jsonl`)。下面模板写给所有 consumer。
 
 **meta-agent session 启动**：
 ```bash
@@ -622,15 +706,30 @@ tmux new-session -d \
 # 用户 ccteam start 时自动起；ccteam stop 时 SIGTERM
 ```
 
-**Codex tmux adapter**：
+**Codex tmux adapter**(V0.6 F112 Option B mode 3 走 app-server,留 tmux 作 mode 2 退路 + dev attach):
 ```bash
 SESSION="ccteam-codex-<slug>"
 tmux new-session -d -s "${SESSION}" -c "${PROJECT_DIR}" "codex --bypass"
-# orchestrator 通过 send-keys + capture-pane 控制 + 观测
-# 状态写 .ccteam/sessions/<sid>/state.json（codex adapter trait 实现）
+# V0.6 mode 3 优先走 codex app-server UDS JSON-RPC v2,tmux 仅 dev attach
+# 状态写 .ccteam/sessions/<sid>/state.json(codex adapter trait 实现)
 ```
 
-**关键约束**（两个 consumer 都遵守）：
+**V0.6 mode 3 Claude bot tmux**(F108 决策 flip — 不走 `claude -p --resume` + stream-json,改回 tmux 长跑 + send-keys -l):
+```bash
+SESSION="<project>/<bot_name>"          # 例:pocket-bot
+tmux new-session -d -s "${SESSION}" -c "${PROJECT_DIR}" \
+  "claude --dangerously-skip-permissions"
+# 输入面:tmux send-keys -l 直送 user content + Enter(text);
+#         /compact /new /clear 透明透传;附件走 attachments dir
+# 输出面:Claude Code 官方 hooks(UserPromptSubmit / Stop / SubagentStop /
+#         SessionStart / PostToolUse)作 fast event 通道 + byte-offset 增量读
+#         transcript jsonl → 镜像 ccteam-owned turns.jsonl(R2 SoT)
+# F118 chat 失效:从 turns.jsonl tail `recover_last_n_turns` 行重建 context
+```
+
+理由(综合 ccgram + OMC production 验证):`-p --resume` 每 turn 冷启 prompt cache 失效 + slash 命令不透传(用户面 UX 退化)+ mailbox-trigger 让短文本走 Read tool 增加 turn cost;tmux 长跑 + send-keys -l 直送是双方共识 + Claude Code hooks 官方文档化 fast event 通道。详 `docs/v0-6-0/README.md §九 决策记录修订`。
+
+**关键约束**(三个 consumer 都遵守):
 - ✅ 用 `--dangerously-skip-permissions`（消灭弹窗，痛点 8）
 - ❌ **不**用 `claude -p`（失去 attach / 介入能力）
 - ❌ **不**设 `--max-turns`（用户要求长跑，由 stall + 成本上限兜底）
@@ -712,16 +811,69 @@ apply the suggested fix, run `npm test`, and write result to `$CCTEAM_OUTPUT/`.
 
 | MCP | 用途 | 出处 |
 |---|---|---|
-| **Telegram bot** | 通知 + 接收用户消息 | Channel Layer M2+ stub |
+| **Telegram bot** | V0.6 起统一走 `ccteam-imd` daemon + `openhuman/channels` Rust crate(F109/F116);`claude-plugins-official/telegram` 作 backup transport | 用户偏好 backup 时 `/ccteam-im-setup --transport official-telegram` 切换 |
 | **claude-mem** | 跨项目记忆**可选增强**（read-only MCP search / timeline / get_observations + 自带 hook 自动捕获）；ccteam 不写集成代码，LLM 自看 tool surface 决定用不用 | 已 ship 为可选项（M4）——默认路径走官方 `~/.claude/rules/` + auto-memory，装了 claude-mem 自动叠加 |
 | **Playwright** | E2E 测试（前端项目） | 已有 |
 | **GitHub** | PR 创建、issue 管理 | 可选（优先 `gh` CLI） |
 
-#### 提供的 MCP：`ccteam-mcp`
+#### 提供的 MCP:`ccteam-mcp`(V0.6 F111 24 工具,5 group 子前缀分组)
 
 详见 §3.8 "Channel adapters + ccteam-mcp MCP server" 与 [interfaces.md §12](./interfaces.md#12-ccteam-mcp-mcp-server-m2)。
 
+V0.6 F111 起所有工具加 group 子前缀,**server name 不变**(`ccteam`),用户 `~/.claude.json` 配置零 break:
+
+| Group(子前缀) | 工具数 | 例 |
+|---|---|---|
+| `workflow_` | 13 | `mcp__ccteam__workflow_{show,peek,progress,new,pause,resume,send_to_session,inject_decision,spawn_agent,stop_agent,observe_agents,signal,set_parallelism,trigger_gate,get_artifact_summary}` |
+| `chat_` | 5 | `mcp__ccteam__chat_{send_input,lifecycle,session_reset,list_bots,show_turn_log}` |
+| `advise_` | 2 | `mcp__ccteam__advise_{vote,parallel}` |
+| `admin_` | 1 | `mcp__ccteam__admin_ls` |
+| `screenshot`(单成员独立 group)| 1 | `mcp__ccteam__screenshot` |
+
+**总计 22 + (V0.4.0 F65 7 个 workflow 新增已含)** = 24 工具(具体清单见 `interfaces.md §12`)。`CCTEAM_DISABLE_TOOLS` env 用 group enum(非 glob,防 typo):`CCTEAM_DISABLE_TOOLS=advise,chat` 关掉两组。F110 上版的 `ccteam` → `ct` namespace rename **取消**(V0.5 用户肌肉记忆 override 4 字符节省)。
+
 **实现形态**：`ccteam-mcp` 与 `ccteam-core` 同 workspace（lib + 多 binary），通过 `ccteam internal mcp-serve` 子命令暴露——读写同一份 state.json / progress.jsonl，为 `ccteam tui`（未 ship） / `ccteam web` 三种前端共用 `ccteam-core` lib API（详见 §3.8 前端层小节），MCP 只是把这套 API 套上 MCP wire protocol 给外部 LLM 消费。
+
+---
+
+### 6.5a chat-mode design(V0.6 F108 + F109 + F112 + F116 + F118)
+
+模式 3 = **tmux 长 session + claude TUI 长跑(per bot) + dual-track 观测 + ccteam-owned `turns.jsonl` + ccteam-imd Reply Listener**;**bot-to-bot 100% 走 IM group**(no in-process IPC,no cross-tmux SendMessage — IM history = 完整对话链,hop_limit 在 group msg 链上数)。
+
+**输入面**(`HarnessAdapter::submit_turn`):
+- `TurnInput::UserText(s)` → `tmux send-keys -l "$s" Enter`(literal 模式,0 escape 雷区,ccgram + OMC production 验证)
+- `TurnInput::SystemDirective("compact"|"new"|"clear")` → `tmux send-keys -l "/compact" Enter` 透明透传(ccteam 不主动调也不过滤;通过 SessionStart hook 观察副作用 emit `chat_session_reset` event)
+- `TurnInput::Image(path)` / `TurnInput::Artifact(path)` → 写 `<bot>/attachments/<ts>` + `tmux send-keys -l "Read $path" Enter`
+
+**输出面**(dual-track 观测 — `HarnessAdapter::events` 合流):
+- Track A:Claude Code 官方 hooks(`UserPromptSubmit` / `Stop` / `SubagentStop` / `SessionStart` / `PostToolUse`)作 fast event 通道,**低延迟 turn boundary 信号**;每 hook 触发 `ccteam internal hook chat-event-append` 写一行入 turns.jsonl(只 metadata,无 content)
+- Track B:byte-offset 增量读 transcript jsonl(`~/.claude/projects/<encoded>/<sid>.jsonl`)→ 抽出 full message content → **镜像写入** ccteam-owned `<project>/.ccteam/chat/<bot>/turns.jsonl`(R2 SoT,**不依赖** Anthropic 内部目录长期可读)
+
+**lifecycle 操作**:
+- compact: `compact_every_turns` 阈值由 adapter 内部计数(用户不感知);触发时 `submit_turn(SystemDirective("compact"))` 走 send-keys 透传
+- session reset 重建(F118): `recover_last_n_turns` 配置;chat session 失效(TUI 崩溃 / OOM / SIGKILL / manual `/clear`)后,新 session 起,从 turns.jsonl tail 读 N 行 → `submit_turn(UserText("[Recovery] previous N turns: ...\n继续对话"))` 重建 context;`progress.jsonl` 写 `chat_session_reset { bot, recovered_turns: N }` event
+
+**bot-to-bot @ routing**(F109 + ccteam-imd 一处实现):
+- IM group 内 `@<bot_name> <msg>` → ccteam-imd 解析 → 查 chat_acl group_allowlist → submit_turn 到对应 bot tmux session
+- `hop_limit` 借 Codex `AgentPath` 层次树实现(同条 IM msg chain 上数,**不**在 in-process fix_counts 计)
+- `@ccteam <NL admin>` 走 meta-agent NL routing(eg `@ccteam pause helpful-bot` / `@ccteam list bots`)
+
+**handoff 机制**(F115):多 bot 协作时,**stage 切换** 写 `<project>/.ccteam/handoffs/<workflow>/<stage>.md` 决策摘要(researcher / writer / reviewer 链);下一 stage bot `submit_turn(UserText("@读 handoffs/.../planner.md"))`,**不**再让用户在 IM 里粘贴上下文。
+
+**进程拓扑**:
+```
+ccteam-imd daemon (F116)              <- supervisor binary;openhuman/channels event bus
+  ├── reply_listener task             <- borrowed OMC reply-listener.ts 模式
+  ├── per-channel adapter task        <- telegram / slack / discord / lark / ...
+  └── HarnessAdapter call → ccteam-core orchestrator
+            ↓ tmux send-keys
+ccteam-core orchestrator              <- 项目 daemon(每 workflow 一个 event_loop)
+  └── per-bot tmux long-session       <- 名 = "<project>/<bot_name>"
+        └── claude TUI 长跑           <- 24/7;Claude Code hooks 同时写 progress.jsonl
+              ↑ transcript jsonl polling(byte-offset 增量)→ turns.jsonl
+```
+
+**红线对齐**(详 §0):R1 文件系统控制平面 ✓(send-keys + turns.jsonl);R2 progress.jsonl 唯一 SoT ✓(业务事件) + turns.jsonl(对话原文);R3 no prompt injection ✓(`/compact` 等透传);R5 永不主动 kill ✓(`/compact /new` 是合法 turn);R6 不解析 tmux 终端输出 ✓(读 transcript jsonl + hooks,**不** scrape pane);R7 fix-loop 3 次 escalate ✓(AgentPath depth limit 替代平铺 fix_counts)。
 
 ### 6.6 A2A bridge（可选，未 ship）
 

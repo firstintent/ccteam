@@ -119,8 +119,8 @@ pub enum WatchKind {
 ///
 /// Construct with [`ArtifactWatcher::new`] (registers notify watchers
 /// + mkdirs missing dirs), then consume with [`ArtifactWatcher::start`]
-/// to spawn the tokio debouncer task. The returned
-/// `mpsc::Receiver<ArtifactEvent>` is the orchestrator's input edge.
+///   to spawn the tokio debouncer task. The returned
+///   `mpsc::Receiver<ArtifactEvent>` is the orchestrator's input edge.
 ///
 /// **Drop semantics**: dropping the `mpsc::Receiver` causes the next
 /// `tx.send()` in the spawned task to fail, which exits the task.

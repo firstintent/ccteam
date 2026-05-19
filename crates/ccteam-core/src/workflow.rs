@@ -21,7 +21,7 @@
 //!
 //! - `manual`            — explicit `ccteam trigger <role>` invocation.
 //! - `schedule`          — periodic; V0.4.0 stub (meta-agent triggers
-//!                         manually); V0.4.1 will wire `interval` cron.
+//!   manually); V0.4.1 will wire `interval` cron.
 //! - `gate`              — wait until `trigger_gate` MCP tool releases.
 //! - `watch:<path>`      — inotify on artifact dir; new file → spawn.
 //!

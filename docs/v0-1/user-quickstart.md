@@ -142,7 +142,7 @@ claude
 > ccteam 现在跑了什么项目?
 ```
 
-claude 会自动加载 `ccteam-control` skill(已通过 `--install-skill` 装),用 `mcp__ccteam__ls` 拿项目列表,然后用自然语言告诉你。**它跟入口 A 的 meta-agent 看到的是同一份状态**(都通过 `~/.ccteam/` + MCP 看)。
+claude 会自动加载 `ccteam-control` skill(已通过 `--install-skill` 装),用 `mcp__ccteam__admin_ls` 拿项目列表,然后用自然语言告诉你。**它跟入口 A 的 meta-agent 看到的是同一份状态**(都通过 `~/.ccteam/` + MCP 看)。
 
 差别是:
 - 入口 A 是**常驻**的 meta-agent — 它有跨 session 累积的上下文
@@ -161,7 +161,7 @@ meta-agent / skilled claude 走 dispatch 决策树:
 1. **是问答还是项目请求?** — 这是项目请求。
 2. **派 dev 还是 product-research?** — Brief 具体(明确技术栈),派 dev。
 3. **CLARIFY 一轮**(若 brief 太短) — 例如对"做个 todo"它会反问"web 还是 CLI?"。
-4. **执行**:`mcp__ccteam__new(team="dev", brief="<refined>")`。
+4. **执行**:`mcp__ccteam__workflow_new(team="dev", brief="<refined>")`。
 5. **回执**:它会告诉你 slug,例如 `slug = todo-cli-rust-sqlite-add-list-done-rm`。
 
 **常见模式**:
@@ -180,7 +180,7 @@ meta-agent / skilled claude 走 dispatch 决策树:
 > 这个项目现在到哪步了?
 ```
 
-meta-agent 调 `mcp__ccteam__show <slug>`,告诉你:
+meta-agent 调 `mcp__ccteam__workflow_show <slug>`,告诉你:
 
 - `current_phase`(plan-eng / implement / test-author / test-run / fix / ship)
 - `phase_state`(in_flight / idle)
@@ -193,7 +193,7 @@ meta-agent 调 `mcp__ccteam__show <slug>`,告诉你:
 > 我想看看它现在 claude 在干啥
 ```
 
-→ `mcp__ccteam__peek` 抓项目 tmux pane 的当前内容回给你,不打扰它。
+→ `mcp__ccteam__workflow_peek` 抓项目 tmux pane 的当前内容回给你,不打扰它。
 
 ```
 > 我要 attach 进去自己看
@@ -337,7 +337,7 @@ meta-agent 调 `ccteam decisions` → 列出所有项目的 pending 问题:
 > 那个 API 成本问题,接受。我们用 GPT-4o-mini 控成本
 ```
 
-meta-agent 把决策注入项目 inbox(`mcp__ccteam__inject_decision`),orchestrator 下个 tick 推给项目 session,phase 推进到 verdict。
+meta-agent 把决策注入项目 inbox(`mcp__ccteam__workflow_inject_decision`),orchestrator 下个 tick 推给项目 session,phase 推进到 verdict。
 
 ### 6.5 verdict 出来后
 

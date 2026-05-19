@@ -29,7 +29,7 @@
 
 - **`SessionHandle::from_thread_handle` 翻译层** — Wave 1 留作 `#[allow(dead_code)]` helper。Wave 2 起 `translate_thread_events` 翻译 task 会真用;若 ThreadHandle.raw_extras 字段不全可能引入 panic。Wave 2 architect 接手时跑 host probe 验。
 - **orchestrator 主循环仍用 F80 `claude_job::probe_job` poll** — Wave 1 没切到 `events()` stream;Wave 2 切换时需谨防 progress.jsonl `agent_spawn` / `agent_done` 顺序漂移。
-- **Tier-1 docs unprefixed tool name drift** — `docs/interfaces.md` / `docs/claude-code-tool-surface.md` / `docs/v0-1/user-quickstart.md` / `skills/ccteam-control/SKILL.md` 仍引用 V0.5 `mcp__ccteam__ls` 等。Wave 4 doc-sweep finding 必清。
+- **Tier-1 docs unprefixed tool name drift** — `docs/interfaces.md` / `docs/claude-code-tool-surface.md` / `docs/v0-1/user-quickstart.md` / `skills/ccteam-control/SKILL.md` 仍引用 V0.5 `mcp__ccteam__admin_ls` 等。Wave 4 doc-sweep finding 必清。
 - **OpenAI pricing 数据源** — cost-crater Plan 阶段 WebSearch 2026-05-19 openai.com + pricepertoken.com mirrors。3-6 个月需 verify 一次;Wave 4 加 `ccteam doctor --check-pricing-version` 警告(已有 schema_version 字段,doctor 检查脚手架就行)。
 - **TG bot token 还没就位** — Wave 2 IM bridge host probe 走 mock-only;real host probe 待 user paste token 后单跑(`/ccteam-im-setup` 一次性 onboarding)。已在 `host-probe.md` 标 TODO。
 

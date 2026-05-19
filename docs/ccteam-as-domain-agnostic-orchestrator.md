@@ -98,7 +98,7 @@ definition 路径,ccteam 只负责文件存在性校验(`ccteam doctor
 --validate-workflow`),不负责语义解析。`crates/ccteam-core/src/workflow.rs::
 WorkflowSpec` 是 SoT,新字段加入前先回本节问"这是拓扑数据还是 prompt 内容?"
 meta-agent dispatch 时**不**解析 `<role>.md` 内容 — 只看 workflow.yaml 拓扑 +
-通过 `mcp__ccteam__spawn_agent(role=...)` 派单。
+通过 `mcp__ccteam__workflow_spawn_agent(role=...)` 派单。
 
 ### 1.5 orchestrator 决策点(thin orchestrator)
 
