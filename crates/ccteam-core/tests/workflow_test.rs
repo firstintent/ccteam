@@ -440,3 +440,98 @@ agents: {}
     let err = WorkflowSpec::load(&path).expect_err("empty agents map must fail");
     assert!(matches!(err, WorkflowError::ValidationFailed(_)));
 }
+
+// ---------------------------------------------------------------------
+// t18 — V0.6.1 F124 narrow scope: `mode: human-approval` parses,
+// validates, and round-trips. The orchestrator-side HITL gate
+// (pending-drain skip + `plan_decision_required` emission) is
+// covered by orchestrator integration tests; this test pins the
+// schema contract.
+// ---------------------------------------------------------------------
+#[test]
+fn t18_human_approval_mode_round_trip() {
+    use ccteam_core::workflow::WorkflowMode;
+    let yaml = r#"
+name: critical-migration
+mode: human-approval
+agents:
+  migrator:
+    trigger: manual
+"#;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("workflow.yaml");
+    std::fs::write(&path, yaml).unwrap();
+    let spec = WorkflowSpec::load(&path).expect("human-approval mode must parse");
+    assert_eq!(spec.mode, WorkflowMode::HumanApproval);
+    assert_eq!(spec.agents.len(), 1);
+
+    // Round-trip: serialize → re-parse, mode must survive.
+    let rendered = serde_yaml::to_string(&spec).expect("serialize");
+    assert!(
+        rendered.contains("mode: human-approval"),
+        "expected kebab-case `human-approval` in rendered yaml; got:\n{rendered}"
+    );
+    let dest = tmp.path().join("round-trip.yaml");
+    std::fs::write(&dest, &rendered).unwrap();
+    let reparsed = WorkflowSpec::load(&dest).expect("re-parse round-trip");
+    assert_eq!(spec, reparsed);
+}
+
+// ---------------------------------------------------------------------
+// t19 — V0.6.1 F124: `mode: human-approval` requires at least one
+// agent (same structural rule as artifact-driven; the HITL gate
+// runs over the existing roster).
+// ---------------------------------------------------------------------
+#[test]
+fn t19_human_approval_requires_agents() {
+    let yaml = r#"
+name: empty-hitl
+mode: human-approval
+agents: {}
+"#;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("workflow.yaml");
+    std::fs::write(&path, yaml).unwrap();
+    let err = WorkflowSpec::load(&path)
+        .expect_err("mode: human-approval with empty agents must be rejected");
+    match err {
+        WorkflowError::ValidationFailed(msg) => {
+            assert!(msg.contains("human-approval"), "got: {msg}");
+            assert!(msg.contains("at least one agent"), "got: {msg}");
+        }
+        other => panic!("expected ValidationFailed, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------
+// t20 — V0.6.1 F124: `mode: human-approval` + `agent_team:` block
+// is a schema bug (agent_team is exclusive to mode: agent-team).
+// ---------------------------------------------------------------------
+#[test]
+fn t20_human_approval_rejects_agent_team_block() {
+    let yaml = r#"
+name: bad-hitl
+mode: human-approval
+agent_team:
+  team_name: nope
+  lead_seed: |
+    irrelevant
+agents:
+  migrator:
+    trigger: manual
+"#;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("workflow.yaml");
+    std::fs::write(&path, yaml).unwrap();
+    let err = WorkflowSpec::load(&path)
+        .expect_err("agent_team block under mode: human-approval must be rejected");
+    match err {
+        WorkflowError::ValidationFailed(msg) => {
+            assert!(
+                msg.contains("agent_team") && msg.contains("agent-team"),
+                "got: {msg}"
+            );
+        }
+        other => panic!("expected ValidationFailed, got {other:?}"),
+    }
+}

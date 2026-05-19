@@ -63,6 +63,7 @@
 | **新建项目走 `<projects_root>/<team>-<slug>/`** | — | 守(`pick_unused_slug` 强制 team 前缀)| 守(per-bot tmux session = `<project>/<bot>`,IM bot 落 `.ccteam/chat/<bot>/`)|
 | **root README.md MUST be English** | 守 | 守 | 守 |
 | **README.md 不含版本进展/状态信息** | 守 | 守 | 守 |
+| **HITL approval state SoT**(V0.6.1 F124 narrow scope;`mode: human-approval` 第 4 mode 与 1/2/3 并列)| — | progress.jsonl::plan_decision(F98 IM round-trip 写;orchestrator 等到事件再 drain pending)| 同 |
 
 **README / 版本进展红线**(V0.6.1 F126):
 - root `README.md` = OSS 主入口,必须英文。`docs/{quickstart,user-manual,recipes,troubleshooting}.md` + `docs/advanced/*` 持续中文(国内用户面);所有版本归档 `docs/v0-X-Y/` 中英不限(开发过程语)。

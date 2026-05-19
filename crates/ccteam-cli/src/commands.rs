@@ -737,6 +737,12 @@ pub fn run_start_agent_team(
              the chat-mode entry point. Bots are launched via the IM channel + \n  \
              `ccteam-imd` daemon, not the agent-team start flow.",
         ),
+        (ccteam_core::WorkflowMode::HumanApproval, _) => bail!(
+            "project `{slug}` is in human-approval mode (V0.6.1 F124); `ccteam start <slug>`\n  \
+             is only implemented for agent-team mode. For human-approval projects run\n  \
+             `ccteam start` (no slug) to start the daemon — the HITL gate fires on each\n  \
+             agent_done via the F98 plan-approval IM round-trip.",
+        ),
     };
 
     // ---- V0.5.0 F97 — `--restart-team` revive path -----------------------
@@ -1095,6 +1101,11 @@ pub fn run_stop_slug(paths: &CcteamPaths, slug: &str, opts: StopSlugOptions) -> 
             "project `{slug}` is in chat mode (V0.6.0 F108); `ccteam stop <slug>` is not\n  \
              the chat-mode shutdown path. Use the IM channel `/stop` directive or\n  \
              kill the bot's tmux session directly.",
+        ),
+        (ccteam_core::WorkflowMode::HumanApproval, _) => bail!(
+            "project `{slug}` is in human-approval mode (V0.6.1 F124); `ccteam stop <slug>`\n  \
+             is only implemented for agent-team mode. For daemon shutdown run\n  \
+             `ccteam stop` (no slug).",
         ),
     };
 
