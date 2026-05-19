@@ -1,21 +1,23 @@
 # ccteam 故障排查手册
 
-> V0.6.0 起。主入口都在 Claude session 内:`/ccteam-doctor`(诊断)、`/ccteam-control`(运行时)、`/ccteam-creator`(新建项目)、`/ccteam-team`(临时 team)、`/ccteam-im-setup`(TG 配置)。**先跑 `/ccteam-doctor` —— 80% 卡点它自动检出**;还卡再查本手册。
+> V0.6.1 起。主入口都在 Claude session 内:`/ccteam-control`(运行时)、`/ccteam-creator`(新建项目)、`/ccteam-team`(临时 team)、`/ccteam-im-setup`(TG 配置)、`/ccteam-advise`(双 LLM 投票)+ 总入口 `/ccteam <NL>`。**诊断**走 **CLI**:在任意终端跑 `ccteam doctor`(详细诊断,80% 卡点它自动检出);Claude session 内可以 `Bash("ccteam doctor")` 一键调用。还卡再查本手册。
 >
-> 进阶 fix path:`docs/versions/v0-6-0/prd.md` 找 F-finding,`docs/claude-code-tool-surface.md` 看平台原语,`docs/orchestration-patterns.md` 看拓扑选择。
+> **V0.6.1 ship policy 提示**:本手册示例以 `ccteam doctor` 命令行为准;V0.6.0 早期文档曾写 `/ccteam-doctor` slash 形式,**该 slash 不存在**(F127 manual-prover sweep 校正)。
+>
+> 进阶 fix path:`docs/versions/v0-6-1/prd.md` 找 F-finding,`docs/claude-code-tool-surface.md` 看平台原语,`docs/orchestration-patterns.md` 看拓扑选择。
 
 ---
 
 ## A. 安装 / 初始化(15 条)
 
-### A1. `/ccteam-doctor` 报 "claude CLI not found"
+### A1. `ccteam doctor` 报 "claude CLI not found"
 **原因**:系统 PATH 里没有 `claude` 可执行文件,或刚装好但当前 shell 没 reload。
 **修复**:1) 终端 `which claude` 确认;2) 没装就 `npm i -g @anthropic-ai/claude-code`;3) 装了找不到就 `hash -r` 或重启 Claude session。
 **相关**:A2(版本过低)。
 
-### A2. `/ccteam-doctor` 报 "claude version too old, need ≥ 2.1.139"
-**原因**:V0.6.0 依赖 agent-view / `--bg` 等新特性,旧版没有。
-**修复**:`claude update` 升 stable → 重启 Claude session → 重跑 `/ccteam-doctor`。
+### A2. `ccteam doctor` 报 "claude version too old, need ≥ 2.1.139"
+**原因**:V0.6.0+ 依赖 agent-view / `--bg` 等新特性,旧版没有。
+**修复**:`claude update` 升 stable → 重启 Claude session → 重跑 `ccteam doctor`。
 **相关**:A1。
 
 ### A3. `/plugin install ccteam@claude-plugins-official` 失败
@@ -25,7 +27,7 @@
 
 ### A4. `/mcp` 列表里没 `mcp__ct__*` 工具
 **原因**:MCP 没注册到 `.mcp.json` 或 `~/.claude.json`,或 plugin 装完没 reload。
-**修复**:1) `/ccteam-doctor --install-mcp`;2) `/reload-mcp` 或重启 Claude session;3) 项目级 `.mcp.json` 残缺 → 删后重 `/ccteam-doctor --install-mcp`。
+**修复**:1) `ccteam doctor --install-mcp`;2) `/reload-mcp` 或重启 Claude session;3) 项目级 `.mcp.json` 残缺 → 删后重 `ccteam doctor --install-mcp`。
 **相关**:D1。
 
 ### A5. `~/.claude.json` 损坏,Claude 一启动就崩
@@ -33,7 +35,7 @@
 **修复**:1) `cp ~/.claude.json ~/.claude.json.bak`;2) `jq . ~/.claude.json` 看哪行错;3) 实在修不了删掉重启 Claude(会生空 stub,要重登录)。
 **相关**:A3。
 
-### A6. `/ccteam-doctor` 报 "supervisor not running"
+### A6. `ccteam doctor` 报 "supervisor not running"
 **原因**:Claude Code 后台 supervisor(管 `--bg` session 的常驻进程)没启或被杀。
 **修复**:1) 终端 `claude agents` —— 打开 agent view 时 supervisor 自启;2) 仍失败 `pkill -f "claude.*daemon"` 后再开。
 **相关**:B1。
@@ -65,7 +67,7 @@
 
 ### A12. 项目 `.mcp.json` 跟其他 MCP server 冲突
 **原因**:你装了 `serena` / `omc` 等同时注册项目级 `.mcp.json`,合并后字段互踩。
-**修复**:1) `/ccteam-doctor` 自动合并不覆盖;2) 手查 `.mcp.json` 里 `mcpServers.ct` 是否齐全;3) 仍冲突:`ct` 仅 user-global 注册,其他保留项目级。
+**修复**:1) `ccteam doctor` 自动合并不覆盖;2) 手查 `.mcp.json` 里 `mcpServers.ccteam` 是否齐全;3) 仍冲突:`ccteam` 仅 user-global 注册,其他保留项目级。
 **相关**:A4。
 
 ### A13. 跨设备 — 一台机器装了在另一台没有
@@ -222,7 +224,7 @@
 
 ### D1. `/mcp` 显示 `ct` server "disconnected"
 **原因**:`mcp-serve` 子进程没起或被 kill;`.mcp.json` 路径不对。
-**修复**:1) 重启 Claude session 通常自愈;2) `/ccteam-doctor --install-mcp` 重写注册;3) `claude --debug "mcp"` 看启动错误。
+**修复**:1) 重启 Claude session 通常自愈;2) `ccteam doctor --install-mcp` 重写注册;3) `claude --debug "mcp"` 看启动错误。
 **相关**:A4。
 
 ### D2. `claude -p --resume <sid>` 报 "session not found"
@@ -232,7 +234,7 @@
 
 ### D3. 自定义 `.claude/agents/<role>.md` 不生效
 **原因**:agent 文件只在 session 启动时扫一次;新加文件需重 spawn。
-**修复**:1) `/ccteam-control restart-bot <name>` 重 spawn;2) frontmatter 有 yaml 错会被静默忽略 — `/ccteam-doctor` 会 lint。
+**修复**:1) `/ccteam-control restart-bot <name>` 重 spawn;2) frontmatter 有 yaml 错会被静默忽略 — `ccteam doctor` 会 lint。
 **相关**:`docs/claude-code-tool-surface.md` §1.2.4。
 
 ### D4. PreToolUse / PostToolUse hook 不 fire
@@ -251,12 +253,12 @@
 
 ### E1. workflow.yaml 标 `vendor: codex` 但 spawn 报 "codex not found"
 **原因**:Codex CLI 没装在 PATH。
-**修复**:1) `npm i -g @openai/codex` 或 `brew install --cask codex`;2) `/ccteam-doctor` 自动检测并降级用 claude;3) 想坚持 codex:装完重启 Claude session。
+**修复**:1) `npm i -g @openai/codex` 或 `brew install --cask codex`;2) `ccteam doctor` 自动检测并降级用 claude;3) 想坚持 codex:装完重启 Claude session。
 **相关**:E2 / A15。
 
 ### E2. codex auth 缺 / 过期
 **原因**:`codex login` 没跑过,或 OAuth token 过期。
-**修复**:终端 `codex login`,按提示 OAuth;`/ccteam-doctor --check-codex` 验证。
+**修复**:终端 `codex login`,按提示 OAuth;`ccteam doctor --check-codex` 验证。
 **相关**:E1。
 
 ### E3. codex 报 "sandbox denied"
@@ -278,6 +280,6 @@
 
 ## 仍未解决?
 
-1. 在 Claude session 跑 `/ccteam-doctor --full` 收集所有诊断信息
+1. 在终端跑 `ccteam doctor --full` 收集所有诊断信息(Claude session 内 `Bash("ccteam doctor --full")` 亦可)
 2. 仍卡:把诊断输出贴 GitHub issue,或 ccteam 用户群 @ 维护者
-3. 进阶 fix:`docs/versions/v0-6-0/prd.md` 找对应 F-finding;`docs/claude-code-tool-surface.md` 看平台原语;`docs/dev-coupling-audit.md` 看历史已修类似问题
+3. 进阶 fix:`docs/versions/v0-6-1/prd.md` 找对应 F-finding;`docs/claude-code-tool-surface.md` 看平台原语;`docs/dev-coupling-audit.md` 看历史已修类似问题

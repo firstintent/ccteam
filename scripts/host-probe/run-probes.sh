@@ -302,20 +302,10 @@ probe_overnight_builder() {
         # any cd, so background invocations are unambiguous.
         CCTEAM_BIN="$(pwd)/target/release/ccteam"
 
-        # F120 step 1 — minimal artifact-driven workflow.yaml
-        cat > $PROJ/workflow.yaml <<YAML
-name: overnight-probe
-description: |
-  F120 host-probe minimal artifact-driven workflow. One worker agent
-  fires on a trigger marker; the stub claude binary terminates
-  instantly so agent_done lands within the probe deadline.
-agents:
-  worker:
-    executor: claude
-    trigger: watch:.ccteam/triggers/worker/
-    parallelism: 1
-YAML
-
+        # F120 step 1 — write the worker agent profile only here;
+        # the workflow.yaml lands AFTER `ccteam init` (which scaffolds
+        # a default workflow at `.ccteam/workflow.yaml` and would
+        # otherwise stomp our probe definition). V0.6.1 F127 fix.
         cat > $PROJ/.claude/agents/worker.md <<MD
 # worker
 
@@ -342,8 +332,38 @@ STUB
 
         echo "[probe/overnight] scaffold ready at $PROJ (root=$ROOT)"
 
-        # F120 step 3 — start orchestrator (no-web). It scans
-        # CCTEAM_PROJECTS_ROOT for projects.
+        # F120 step 3a — register the probe project in
+        # $CCTEAM_HOME/config.yaml so the orchestrator picks it up.
+        # Without this `ccteam init` call the project is invisible to
+        # the daemon (it scans the registry, not projects_root
+        # directly). V0.6.1 F127 manual-prover fix.
+        "$CCTEAM_BIN" init --in $PROJ --slug overnight-probe --team dev \
+            >$ROOT/init.stdout 2>$ROOT/init.stderr || {
+            echo "[probe/overnight] FAIL: ccteam init exit=$?"
+            tail -20 $ROOT/init.stderr
+            exit 1
+        }
+
+        # F120 step 3b — overwrite the scaffolded workflow.yaml at the
+        # canonical F83 path with our probe workflow (worker on
+        # `watch:.ccteam/triggers/worker/`). `ccteam init` always
+        # writes the default explorer-manual scaffold; we re-stamp
+        # afterwards. V0.6.1 F127 manual-prover fix.
+        cat > $PROJ/.ccteam/workflow.yaml <<YAML
+name: overnight-probe
+description: |
+  F120 host-probe minimal artifact-driven workflow. One worker agent
+  fires on a trigger marker; the stub claude binary terminates
+  instantly so agent_done lands within the probe deadline.
+agents:
+  worker:
+    executor: claude
+    trigger: watch:.ccteam/triggers/worker/
+    parallelism: 1
+YAML
+
+        # F120 step 3c — start orchestrator (no-web). It scans
+        # CCTEAM_HOME/config.yaml::projects[] for the registered slug.
         nohup "$CCTEAM_BIN" start --no-web --tick-seconds 1 \
             >$ROOT/start.stdout 2>$ROOT/start.stderr &
         ORCH_PID=$!
