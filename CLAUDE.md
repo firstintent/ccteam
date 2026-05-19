@@ -10,15 +10,16 @@
 | 项 | 值 |
 |---|---|
 | 主分支 main HEAD | 以 `git rev-parse origin/main` 为准 |
-| Workspace version | **`0.6.0`** |
-| 测试 baseline | **`1282/1`**(`cargo test --workspace --locked --no-fail-fast`,1 fail 是 ccteam-web `workflow_summary_reflects_agent_spawn_and_done_events` running_count flake)|
-| Clippy | **0 errors + 0 warnings**(`-D warnings` clean;Wave 4 doc-list drift 清零)|
-| 代码规模 | ~70 kLOC Rust(workspace,不含 references)|
-| 当前最新版 | **V0.6.0**(Epic A + B + C 铺底 + F106 / F107 / F108 / F109 / F111 / F112 / F113 / F114 / F115 / F116 / F117 / F118)— 详 `docs/versions/v0-6-0/README.md`(F110 namespace rename 取消;5 preset / 3 mode × 2 vendor 矩阵;`ccteam-imd` 独立 daemon + tmux 长 session + dual-track hooks+transcript;Codex Option B 完整)|
-| V0.6.x 延期候选 | F98 plan-approval↔outbox 联动 + F119 6 号编排模式 HITL — 详 `docs/versions/v0-6-0/README.md §八`;V0.7 主线 = Epic C 国内 IM(WeChat / 飞书 / DingTalk / QQ)启用 + chat memory 跨设备同步 |
-| 历史版本 | V0.1 → V0.5.1 见各自 `docs/versions/v0-X-Y/README.md` |
+| Workspace version | **`0.6.1`** |
+| 测试 baseline | **`1365/1`**(`cargo test --workspace --locked --no-fail-fast`,1 fail 是 ccteam-web `workflow_summary_reflects_agent_spawn_and_done_events` running_count flake)|
+| Clippy | **0 errors + 0 warnings**(`-D warnings` clean)|
+| 代码规模 | ~73 kLOC Rust(workspace,不含 references)|
+| 当前最新版 | **V0.6.1**(Epic D cleanup + Epic E user-claim + Epic F plan-approval / F98 + F119 + F120 + F121 + F122 + F123 + F124 + F125 + F126 + F127 + F128 + F129)— 详 `docs/versions/v0-6-1/README.md`(probe daemon+health / overnight-builder real workflow / `ccteam doctor --check-pricing-version` / CodexAppServerAdapter → progress.jsonl bridge / 5 demo GIF / `mode: human-approval` 第 4 mode / EN-only README + 红线 / `/ccteam-control change-persona + add-tool` / `@ccteam` IM NL admin / plan-approval ↔ IM outbox round-trip)|
+| V0.6.x 延期候选 | 空(本版闭所有 retained risk)|
+| V0.7 主线候选 | Epic C 国内 IM(WeChat / 飞书 / DingTalk / QQ)启用 + chat memory 跨设备同步 + monorepo-aware `.mcp.json` + migrate-from-claude + 6 号编排模式深化(HumanApproval × bg/chat 矩阵全开) |
+| 历史版本 | V0.1 → V0.6.0 见各自 `docs/versions/v0-X-Y/README.md` |
 
-**ccteam 是 Claude Code 之上的元工具**(V0.4.0+,V0.6.0 起转 product-ready 元 AI 团队):每个项目用 `workflow.yaml` 声明 agent 拓扑(**无 prompt,只有 trigger + 并发上限 + `mode: chat`/`vendor: claude\|codex` for V0.6 mode 3**),`.claude/agents/<role>.md` 定义 agent 行为;Rust orchestrator 通过 `ArtifactWatcher`(inotify)监听文件系统控制平面 → spawn `claude --bg --agent <role>`(mode 2)/ 进 tmux 长 session `claude` TUI(mode 3,V0.6 F108)/ `codex exec --json` / `codex app-server` UDS(V0.6 F112);`progress.jsonl` 记录 7 类业务 event + 新增 `chat_session_reset` / `turn_done` 为唯一状态 SoT(mode 3 对话原文走 ccteam-owned `<project>/.ccteam/chat/<bot>/turns.jsonl`);用户通过 meta-agent + `ccteam-control` skill + **24 个 `mcp__ccteam__{workflow_,chat_,advise_,admin_,screenshot}*` 子前缀分组工具**(V0.6 F111)操作;`ccteam-imd` 独立 supervisor daemon(V0.6 F116)守 IM bridge,统一 `openhuman/channels` Rust crate 14+ IM 平台(V0.6 F109);web UI 提供 4 面板 + SSE。详 `docs/tech-design.md` §2.1。
+**ccteam 是 Claude Code 之上的元工具**(V0.4.0+,V0.6.0 起转 product-ready 元 AI 团队):每个项目用 `workflow.yaml` 声明 agent 拓扑(**无 prompt,只有 trigger + 并发上限 + `mode: chat`/`vendor: claude\|codex` for V0.6 mode 3 + V0.6.1 F124 `mode: human-approval` 第 4 mode + V0.6.1 F98 `plan_approval:` block**),`.claude/agents/<role>.md` 定义 agent 行为;Rust orchestrator 通过 `ArtifactWatcher`(inotify)监听文件系统控制平面 → spawn `claude --bg --agent <role>`(mode 2)/ 进 tmux 长 session `claude` TUI(mode 3,V0.6 F108)/ `codex exec --json` / `codex app-server` UDS(V0.6 F112 + V0.6.1 F122 progress.jsonl bridge);`progress.jsonl` 记录 7 类业务 event + `chat_session_reset` / `turn_done` + V0.6.1 新增 `plan_pending` / `plan_decision` / `plan_timeout`(F98)+ `persona_changed` / `tool_added`(F128)为唯一状态 SoT(mode 3 对话原文走 ccteam-owned `<project>/.ccteam/chat/<bot>/turns.jsonl`);用户通过 meta-agent + `ccteam-control` skill + **26 个 `mcp__ccteam__{workflow_,chat_,advise_,admin_,screenshot}*` 子前缀分组工具**(V0.6 F111 24 + V0.6.1 F128 `admin_change_persona` + `admin_add_tool`)操作 + V0.6.1 F129 `@ccteam <NL>` IM mention 路径(pause/resume/list/cost/stop everything 5 keyword admin);`ccteam-imd` 独立 supervisor daemon(V0.6 F116)守 IM bridge,统一 `openhuman/channels` Rust crate 14+ IM 平台(V0.6 F109);web UI 提供 4 面板 + SSE。详 `docs/tech-design.md` §2.1。
 
 ## 二、必读文档(按推荐顺序)
 
@@ -33,10 +34,11 @@
 | 6 | `docs/ccteam-as-domain-agnostic-orchestrator.md` | 加新 team / 改红线时 |
 | 7 | `docs/claude-code-best-practices.md` | 改 agent prompt / hooks / context 管理时 |
 | 8 | `docs/claude-code-tool-surface.md` | 改 workflow.yaml + agent .md 时 |
-| 9 | `docs/versions/v0-6-0/README.md` | 看当前版本(V0.6.0 Epic A/B/C + F106-F118 + 4-wave 范式)|
-| 10 | `docs/versions/v0-6-0/{wave-1,wave-2,wave-3}-handoff.md` | 看每 wave Decided / Rejected / Risks / Files / Remaining 五段 |
+| 9 | `docs/versions/v0-6-1/README.md` | 看当前版本(V0.6.1 Epic D/E/F + F98 + F119-F129 + 3-wave 范式)|
+| 10 | `docs/versions/v0-6-1/{wave-1,wave-2,wave-3}-handoff.md` | 看每 wave Decided / Rejected / Risks / Files / Remaining 五段 |
+| 11 | `docs/versions/v0-6-0/README.md` | 上一 minor(V0.6.0 Epic A/B/C + F106-F118 + 4-wave 范式)|
 
-**起手 30 秒**:`git log -1` 看 HEAD → `cargo test --workspace 2>&1 | awk '/^test result/{p+=$4;f+=$6}END{print p,f}'` 校 1282/1 → 读用户诉求 → 干。
+**起手 30 秒**:`git log -1` 看 HEAD → `cargo test --workspace 2>&1 | awk '/^test result/{p+=$4;f+=$6}END{print p,f}'` 校 1365/1 → 读用户诉求 → 干。
 
 **对照参考**(`references/` gitignore 不入库):`references/claude-code/`(Anthropic Claude Code 源码)+ `references/codex/codex-rs/`。HarnessAdapter / 协议适配时翻;**不**当 ccteam 依赖。
 
@@ -81,7 +83,7 @@
 |---|---|
 | **CLAUDE.md** | 项目级 / 用户级持久指令 |
 | **Skills**(repo 根 `skills/`,V0.6.0 F113 总入口 + 5 sub-skill)| `/ccteam` 总入口 NL dispatcher / `ccteam-control` / `ccteam-creator` / `ccteam-team` / `ccteam-im-setup`(F117 一次性 IM token onboarding)/ `ccteam-advise`(F112 Codex parallel vote)|
-| **MCP** | `ccteam` 24 工具,V0.6 F111 5 group 子前缀:`mcp__ccteam__{workflow_,chat_,advise_,admin_,screenshot}*`;`CCTEAM_DISABLE_TOOLS` group enum(非 glob);可选 `claude-mem`(LLM 自看 surface 决定是否调)|
+| **MCP** | `ccteam` 26 工具(V0.6 F111 24 + V0.6.1 F128 `admin_change_persona` + `admin_add_tool`),5 group 子前缀:`mcp__ccteam__{workflow_,chat_,advise_,admin_,screenshot}*`;`CCTEAM_DISABLE_TOOLS` group enum(非 glob);可选 `claude-mem`(LLM 自看 surface 决定是否调)|
 | **Subagents** | agent 内 `Task(subagent_type=...)` ad-hoc 节流;8 个 plugin agent 已 ln -sf |
 | **Hooks** | `ccteam internal hook progress-append / load-context / intercept-ask`(F89 隐藏)|
 | **Plugins** | `~/.claude/plugins/marketplaces/claude-plugins-official/`;按需 ln -sf,**不 vendor** |

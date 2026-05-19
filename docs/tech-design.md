@@ -74,7 +74,7 @@ Orchestration Layer (F66 thin orchestrator)
    Rust daemon + progress.jsonl 业务事件 SoT(7 类 + chat_session_reset + turn_done)
    + ArtifactWatcher (F64)
    每 workflow 一个 event_loop (JoinSet + F82 cancel token + F86 graceful shutdown)
-   24 个 mcp__ccteam__{workflow_,chat_,advise_,admin_,screenshot}* tools (F111 子前缀分组)
+   26 个 mcp__ccteam__{workflow_,chat_,advise_,admin_,screenshot}* tools (V0.6 F111 24 + V0.6.1 F128 +2)
    + hooks (§6.4) + cost telemetry (F91 + V0.6 F112 双 pricing table, §6.12)
 ```
 
@@ -270,7 +270,29 @@ agents:                                  # role → AgentSpec，IndexMap 保留 
     input: .ccteam/done/
 ```
 
-**V0.6 F108 + F114 chat-mode 扩展**（`mode: chat` 时启用顶层 `chat:` 段）：
+**V0.6.1 F124 + F98 HITL 扩展**（`mode: human-approval` 或 per-agent `plan_approval:` block;两者独立可叠加）：
+
+```yaml
+mode: human-approval                     # V0.6.1 F124：第 4 mode,workflow-level gate
+                                          # 每个 agent_done 后 orchestrator emit
+                                          # plan_decision_required + park pending
+                                          # 直到 plan_decision 落 progress.jsonl
+agents:
+  reviewer:
+    trigger: watch:.ccteam/reviews/
+    plan_approval:                       # V0.6.1 F98:per-agent gate(可独立于 mode)
+      enabled: true                      # default true(写 block 即 opt-in)
+      outbox: telegram                   # registered IM transport
+      timeout_min: 60                    # 0 = 不超时
+      on_timeout: escalate               # escalate | auto-approve | reject
+    tools:                               # V0.6.1 F128:admin_add_tool 写入位置
+      - ReadFile
+      - WebFetch
+```
+
+`mode: human-approval` 用于"每 step 都要 approve"(workflow-level);`plan_approval:` 用于"这个 agent 写完 plan 才要 approve"(agent-level)。两者共享 `plan_pending` / `plan_decision` / `plan_timeout` 三 progress event,完整 IM round-trip flow 详 §6.7。
+
+**V0.6 F108 + F114 chat-mode 扩展**(`mode: chat` 时启用顶层 `chat:` 段):
 
 ```yaml
 mode: chat
@@ -816,7 +838,7 @@ apply the suggested fix, run `npm test`, and write result to `$CCTEAM_OUTPUT/`.
 | **Playwright** | E2E 测试（前端项目） | 已有 |
 | **GitHub** | PR 创建、issue 管理 | 可选（优先 `gh` CLI） |
 
-#### 提供的 MCP:`ccteam-mcp`(V0.6 F111 24 工具,5 group 子前缀分组)
+#### 提供的 MCP:`ccteam-mcp`(V0.6 F111 24 工具 + V0.6.1 F128 +2 admin tool = 26 工具,5 group 子前缀分组)
 
 详见 §3.8 "Channel adapters + ccteam-mcp MCP server" 与 [interfaces.md §12](./interfaces.md#12-ccteam-mcp-mcp-server-m2)。
 
@@ -830,7 +852,7 @@ V0.6 F111 起所有工具加 group 子前缀,**server name 不变**(`ccteam`),�
 | `admin_` | 1 | `mcp__ccteam__admin_ls` |
 | `screenshot`(单成员独立 group)| 1 | `mcp__ccteam__screenshot` |
 
-**总计 22 + (V0.4.0 F65 7 个 workflow 新增已含)** = 24 工具(具体清单见 `interfaces.md §12`)。`CCTEAM_DISABLE_TOOLS` env 用 group enum(非 glob,防 typo):`CCTEAM_DISABLE_TOOLS=advise,chat` 关掉两组。F110 上版的 `ccteam` → `ct` namespace rename **取消**(V0.5 用户肌肉记忆 override 4 字符节省)。
+**总计 V0.6 F111 24 + V0.6.1 F128 +2(`admin_change_persona` + `admin_add_tool`)= 26 工具**(具体清单见 `interfaces.md §12`)。`CCTEAM_DISABLE_TOOLS` env 用 group enum(非 glob,防 typo):`CCTEAM_DISABLE_TOOLS=advise,chat` 关掉两组。F110 上版的 `ccteam` → `ct` namespace rename **取消**(V0.5 用户肌肉记忆 override 4 字符节省)。
 
 **实现形态**：`ccteam-mcp` 与 `ccteam-core` 同 workspace（lib + 多 binary），通过 `ccteam internal mcp-serve` 子命令暴露——读写同一份 state.json / progress.jsonl，为 `ccteam tui`（未 ship） / `ccteam web` 三种前端共用 `ccteam-core` lib API（详见 §3.8 前端层小节），MCP 只是把这套 API 套上 MCP wire protocol 给外部 LLM 消费。
 
@@ -1005,6 +1027,99 @@ V0.4.5 cost 三个数据源：
 - **F84 budget cap** 用 `cost_24h_usd` 判定；**F90 Cost sparkline** 用同源数据
 
 **已知 gap（F92 候选）**：V0.4.6 仍有 `agent_done.cost_usd` 字段需要 hook 写 — 真实数据其实在 `~/.claude/jobs/<id>/linkScanPath` 下的 jsonl 里。F92 候选打算直接从那读，完全摆脱 hook 依赖。当前 V0.4.6 在 hook miss 场景下 `cost_24h_usd` 仍可能漂（已知 limitation，记录于 `docs/versions/v0-4-6/prd.md F91 验收 #3`）。
+
+### 6.13 Plan-approval ↔ IM outbox round-trip(V0.6.1 F98 + F124)
+
+V0.5 长跑 workflow 写 plan 时 user 无 IM 通道审批,夜里改方向无落点;V0.6.1 F98 + F124 闭环。两 finding 协作:**F124** 拥有 `WorkflowMode::HumanApproval` 第 4 mode + orchestrator dispatch arm,**F98** 拥有 per-agent `plan_approval:` block + state machine + IM round-trip。两者独立可叠加(mode 4 用于 workflow-level step gate,plan_approval 用于 agent-level plan gate;两者共享 `plan_pending` / `plan_decision` / `plan_timeout` 三 progress event)。
+
+**Engine 解耦**:`crates/ccteam-core/src/plan_approval.rs`(710 行)是 pure state machine,跟 orchestrator 完全解耦;无 IO,无 LLM 调用。orchestrator 在主 loop tick 调 `engine.step(now, events)` → 返回需要写出的 actions(emit event / 写 decision file)。
+
+**完整 flow**:
+
+```
+agent                       orchestrator                 ccteam-imd                 user IM
+  │                              │                          │                          │
+  │ write plan.md                │                          │                          │
+  ├─────────────────────────────►│                          │                          │
+  │                              │  artifact watcher fires  │                          │
+  │                              │  emit plan_pending event │                          │
+  │                              ├─────────────────────────►│                          │
+  │                              │  park pending-spawn (mode=human-approval)            │
+  │                              │  agent enters paused                                  │
+  │                              │                          │  resolve outbox channel  │
+  │                              │                          │  send IM message:        │
+  │                              │                          │  "[<wf>] <agent> wrote   │
+  │                              │                          │   plan: ...\n\nReply     │
+  │                              │                          │   APPROVE / REJECT       │
+  │                              │                          │   [<reason>] / EDIT      │
+  │                              │                          │   <comment> in 60min"    │
+  │                              │                          ├─────────────────────────►│
+  │                              │                          │                          │
+  │                              │                          │◄─── "APPROVE" reply ─────┤
+  │                              │                          │  inbound parse           │
+  │                              │  emit plan_decision      │                          │
+  │                              │◄─────────────────────────┤                          │
+  │                              │  write decision file:    │                          │
+  │                              │  .ccteam/plan-decisions/ │                          │
+  │                              │    <plan_id>.md          │                          │
+  │ inbox-style read decision    │                          │                          │
+  │◄─────────────────────────────┤  resume agent            │                          │
+```
+
+**Decision grammar**(IM-side parser,case-insensitive,trim 后正则):
+- `APPROVE` → `{decision: approve}`
+- `REJECT` / `REJECT <reason>` → `{decision: reject, comment?: <reason>}`
+- `EDIT <comment>` → `{decision: edit, comment: <comment>}`
+
+**Timeout 策略**(`PlanApprovalSpec::on_timeout`):
+- `escalate`(默认)— emit `plan_timeout` + 推 meta-agent inbox + agent 持续 paused
+- `auto-approve` — 自动 inject APPROVE decision + resume
+- `reject` — 自动 inject REJECT decision(reason: timeout)+ resume
+
+**红线**:
+- `progress.jsonl` 是 SoT(`plan_pending` / `plan_decision` / `plan_timeout`);不在 state.json / TUI pane / SSE 加 hidden state
+- decision 走 **文件**(`.ccteam/plan-decisions/<plan_id>.md`),agent 按标准 inbox-style read 取 — **不**向 stdin / tmux pane 注入 prompt(R3 no prompt injection)
+- engine 是 pure state machine — 不在内部 spawn IM call;orchestrator 持有 ccteam-imd outbox handle,看 engine output actions 翻 IM payload
+- `mode: human-approval` 与 `plan_approval:` 可独立使用(mode 4 是 workflow-level step gate;`plan_approval:` 是 agent-level plan gate);两者叠加 = workflow 每 step 都要 approve + agent 写 plan 时再 approve(critical migration scenario)
+
+**Tests**:`crates/ccteam-core/tests/plan_approval_test.rs`(434 行,9 tests)— schema round-trip / parser / APPROVE happy path with progress.jsonl ordering / REJECT-with-reason / 3 timeout modes / unknown-plan no-op / idempotent re-decide。
+
+### 6.14 Admin actions:change-persona + add-tool(V0.6.1 F128)
+
+user-manual.md §2.4 长写 `/ccteam-control change-persona <bot> "..."` + `add-tool <bot> "..."` 但 V0.6.0 ship 时无实现。F128 闭这个 drift。
+
+**架构选择**:
+- daemon-side **只做文件 mutation**(`<project>/.claude/agents/<bot>.md` rewrite / `workflow.yaml::agents[bot].tools` append)— 不调 LLM
+- skill-side(`ccteam-control` SKILL.md)做 **NL → markdown** merge prompt(用户的 client-side Claude LLM 解读 NL,合成新 persona markdown 后传 MCP)
+- 这种分工避免 daemon 进程内的 LLM 调用(R3 + R4:fresh context per spawn + no prompt injection)
+
+**MCP 工具**(`crates/ccteam-cli/src/mcp_admin_tools.rs`):
+- `mcp__ccteam__admin_change_persona { slug, bot, new_persona_md }` — 读 `.claude/agents/<bot>.md`,替换 body(保留 frontmatter `name` / `tools` / `model`),写回,emit `persona_changed`
+- `mcp__ccteam__admin_add_tool { slug, bot, tool_description }` — 读 `workflow.yaml`,parse `agents[bot].tools:` list,去重 append,写回,emit `tool_added`
+
+**生效路径**:bot 下次 turn 起 spawn 时 Claude Code 读新 `.claude/agents/<bot>.md`;workflow.yaml 走 F82 热加载(daemon inotify watch workflow.yaml → diff → 无 cold-reload-required 字段变化 = hot reload)。
+
+**测试**:`crates/ccteam-core/tests/admin_change_persona_test.rs` + `admin_add_tool_test.rs`(共 295 行)— mock skill output,verify file diff + event shape。
+
+### 6.15 IM NL admin via meta-agent(V0.6.1 F129)
+
+user-manual.md §3.2 写 IM 群内 `@ccteam pause <bot>` / `cost today` / `list bots` / `stop everything` 等 NL admin,但 V0.6 ccteam-imd inbound router 只识别 `@<bot>` route to bot,不识别 `@ccteam` mention。F129 加 `@ccteam` mention 路径。
+
+**位置**:`crates/ccteam-imd/src/{inbound, nl_admin}.rs`。inbound 检测 `@ccteam <NL>` mention pattern,在 `@<bot>` route **之前**(避免 `@ccteam` 误 fallthrough 到 bot)。
+
+**5 keyword admin action**(simple keyword match;复杂的留 `Task(subagent_type=ccteam-control)` 路径):
+
+| NL pattern | MCP tool | 危险动作 |
+|---|---|---|
+| `pause <slug>` | `mcp__ccteam__workflow_pause` | no |
+| `resume <slug>` | `mcp__ccteam__workflow_resume` | no |
+| `list bots` / `ls` | `mcp__ccteam__workflow_show` + bot 状态 aggregate | no |
+| `cost today` / `cost <slug>` | cost summary aggregate | no |
+| `stop everything` / `kill all` | admin_stop_all | **yes — 2 步 confirm flow**(回 "Are you sure? Reply CONFIRM";only 二次 CONFIRM 才执行)|
+
+**hop_limit 不消耗**:meta-agent admin path 不走 AgentPath 层次树(不算 bot-to-bot hop)。
+
+**Tests**:`crates/ccteam-imd/tests/im_nl_admin_test.rs`(367 行)— mock TG inbound w/ 5 NL admin path + 危险 confirm flow。
 
 ---
 

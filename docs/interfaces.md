@@ -269,6 +269,14 @@ progress.jsonl 由两个域共同写入:
 | `budget_exceeded` | `role`, `cost_used_usd` (f64), `budget_limit_usd` (f64), `slug`, `ts` | — | `try_spawn` 内 budget guard 拦截 spawn 时(运行 session 永不被 kill) |
 | `workflow_done` | `workflow`, `slug`, `ts` | `reason` (见下) | 所有 Gate role 都进入 Fired 状态且无 running session 时,幂等 emit 一次;cancel-token 路径写出时 reason 必填 |
 | `escalation` | `kind` (`spawn_failed` 等), `role`, `consecutive_failures` (u32), `slug`, `ts` | — | `bump_fail_count` 每次 +1;`>= MAX_CONSECUTIVE_SPAWN_FAILURES` 时另发 `send_btw_escalation` 到 meta-agent inbox |
+| `chat_session_reset` (V0.6 F108) | `role`, `slug`, `ts` | — | chat-mode bot 经 `/clear` / `/new` 重置 — SessionStart hook 观察副作用,`ccteam-imd` 写 |
+| `chat_session_reset_with_recovery` (V0.6 F118) | `role`, `recovered_turns` (usize), `slug`, `ts` | — | chat session id 失效后从 `turns.jsonl` tail 重建 `recover_last_n_turns` 行 context;新 TUI session 起后 emit |
+| `turn_done` (V0.6 F108) | `role`, `vendor`, `cost_usd`, `slug`, `ts` | `thread_id`, `model` | chat-mode bot 一 turn 完成(Stop hook + transcript tail);Codex app-server 由 F122 bridge 同写 |
+| `plan_pending` (V0.6.1 F98) | `plan_id`, `agent`, `plan_path`, `slug`, `ts` | `head_excerpt` | agent 写 `.ccteam/plans/<role>-<ts>.md` plan → orchestrator artifact watcher 触发 + agent 进 paused;`ccteam-imd` 消费推 IM |
+| `plan_decision` (V0.6.1 F98) | `plan_id`, `decision` (`approve`\|`reject`\|`edit`), `by`, `slug`, `ts` | `comment` | user IM reply `APPROVE` / `REJECT [<reason>]` / `EDIT <comment>` → `ccteam-imd` inbound parse → emit;orchestrator 消费 → resume agent |
+| `plan_timeout` (V0.6.1 F98) | `plan_id`, `agent`, `on_timeout` (`escalate`\|`auto-approve`\|`reject`), `slug`, `ts` | — | `timeout_min` elapsed without reply;后续走 `on_timeout` 策略(escalate 推 meta-agent / auto-approve / reject 自动 inject plan_decision) |
+| `persona_changed` (V0.6.1 F128) | `bot`, `persona_path`, `bytes_written`, `slug`, `ts` | — | `mcp__ccteam__admin_change_persona` 改 `.claude/agents/<bot>.md` 成功后 |
+| `tool_added` (V0.6.1 F128) | `bot`, `tool_added`, `full_tool_list`, `was_duplicate`, `slug`, `ts` | — | `mcp__ccteam__admin_add_tool` 给 workflow.yaml `agents[bot].tools:` append 后 |
 
 **`workflow_done.reason` 枚举**(`CancelReason::as_str`,
 `crates/ccteam-core/src/orchestrator.rs`):
@@ -826,9 +834,9 @@ orchestrator 识别 `state.team == "meta-agent"` 走 `process_meta_project` 分�
 
 由 `ccteam doctor --install-mcp` 写入(M2 release)。`ccteam mcp-serve` 是 binary 子命令,stdio 协议。
 
-### 12.2 暴露的 tool 清单(M2.5 起 9 tool;V0.2.2 F38 起 10 tool;V0.4.0 F65 起 17 tool;**V0.6 F111 起 24 tool**,5 group 子前缀分组)
+### 12.2 暴露的 tool 清单(M2.5 起 9 tool;V0.2.2 F38 起 10 tool;V0.4.0 F65 起 17 tool;V0.6 F111 起 24 tool;**V0.6.1 F128 起 26 tool**,5 group 子前缀分组)
 
-V0.6 F111 起所有 MCP 工具加 group 子前缀,server name 保持 `ccteam`;**F110 上版的 `ccteam` → `ct` rename 取消**(V0.5 用户肌肉记忆 override 4 字符节省)。Group enum(非 glob,防 typo)走 `CCTEAM_DISABLE_TOOLS` env 关组(eg `CCTEAM_DISABLE_TOOLS=advise,chat`)。Group 列表:`workflow_`(13)、`chat_`(5)、`advise_`(2)、`admin_`(1)、`screenshot`(单成员独立 group,保 V0.5 名)。
+V0.6 F111 起所有 MCP 工具加 group 子前缀,server name 保持 `ccteam`;**F110 上版的 `ccteam` → `ct` rename 取消**(V0.5 用户肌肉记忆 override 4 字符节省)。Group enum(非 glob,防 typo)走 `CCTEAM_DISABLE_TOOLS` env 关组(eg `CCTEAM_DISABLE_TOOLS=advise,chat`)。Group 列表:`workflow_`(15)、`chat_`(5)、`advise_`(2)、`admin_`(3:V0.6 1 + V0.6.1 F128 2)、`screenshot`(单成员独立 group,保 V0.5 名)。
 
 | Tool 名 | Group | 对应 CLI / 行为 | 入参 | 返回 |
 |---|---|---|---|---|
@@ -861,6 +869,15 @@ V0.6 F111 起所有 MCP 工具加 group 子前缀,server name 保持 `ccteam`;**
 | `ccteam__chat_show_turn_log`(F118)| `chat_` | 读 `turns.jsonl` tail(默认 30 turn) | `{slug: string, bot: string, last_n?: integer}` | `{slug, bot, turns: [{ts, role, content, turn_id}]}` |
 | `ccteam__advise_vote`(F112 §A)| `advise_` | `/ccteam-advise <hard question>` parallel voting(Claude + Codex 并行);合成 vote 输出 | `{question: string, voters?: ["claude","codex"], rounds?: integer}` | `{question, verdicts: [{vendor, verdict, rationale}], consensus, dissent}` |
 | `ccteam__advise_parallel`(F112 §A)| `advise_` | 并行两 vendor 独立答(无 vote 合成);用户面用于 second-opinion 对照阅读 | `{question: string, vendors?: ["claude","codex"]}` | `{question, answers: [{vendor, text, cost_usd}]}` |
+
+**V0.6.1 F128 admin extension**(`admin_` group +2 → 3 tools;`mcp_admin_tools.rs`):
+
+| Tool 名 | Group | 行为 | 入参 | 返回 |
+|---|---|---|---|---|
+| `ccteam__admin_change_persona`(F128)| `admin_` | 改 `<project>/.claude/agents/<bot>.md` persona body;skill 侧 NL → markdown merge,daemon 只做文件 mutate;emit `progress.jsonl::persona_changed` | `{slug: string, bot: string, new_persona_md: string}` | `{ok: bool, slug, bot, persona_path, bytes_written}` |
+| `ccteam__admin_add_tool`(F128)| `admin_` | 给 `workflow.yaml` 内某 agent `tools:` list append 一个 tool;parse + 去重 append + 回写;emit `progress.jsonl::tool_added` | `{slug: string, bot: string, tool_description: string}` | `{ok: bool, slug, bot, tool_added, full_tool_list, was_duplicate}` |
+
+F128 红线:两工具走 `admin_` group(`CCTEAM_DISABLE_TOOLS=admin` 可关组);**daemon 不调 LLM** — `change-persona` 的 NL → markdown 解读住 `ccteam-control` skill prompt(client-side);daemon-side 只接 `new_persona_md` 完整内容写盘。事件 `persona_changed` / `tool_added` 是状态 SoT;bot 下次 turn 即 read 新文件。`/ccteam-control change-persona <bot> "<NL>"` + `/ccteam-control add-tool <bot> "<NL>"` 是 user-facing 入口(详 `skills/ccteam-control/SKILL.md`)。
 
 V0.2.2 F38 红线:`screenshot` 是**只读**(daemon-independent),与 `peek` 同档,失败永不阻塞主路径(catch_unwind 兜 vt100/imageproc panic;tmux/font/IO 失败一律 `Ok(None)` → `{ok:false, reason}`)。截图字节流仅用于渲染,**不进入** `progress.jsonl` / `state.json` / state machine(CLAUDE.md §三红线"永不解析 tmux 终端输出")。字体走 vendored JetBrains Mono Regular(OFL,见 `LICENSES.md`),`CCTEAM_SCREENSHOT_FONT_TTF` env 可运行时覆盖(eg 切到 CJK / emoji 覆盖字体)。`ccteam doctor --screenshot-smoke <slug>` 跑端到端验证。
 
@@ -1498,14 +1515,16 @@ agents:                   # 必填(artifact-driven mode);agent-team mode 可空�
 `BudgetSpec::None`(`budget` 字段不写)等价 V0.4.5 行为(no budget cap)。
 F84 budget guard 在 `try_spawn` 入口跑;cost 数据源走 F91 cost SoT(`agent_done.cost_usd` 24h 聚合 + active `~/.claude/jobs/<id>/state.json::cost_usd_total`)。
 
-### 17.1.2 V0.5.0 F93b `WorkflowMode` 字段
+### 17.1.2 `WorkflowMode` 字段(V0.5.0 F93b 引入,V0.6.0 F108 / V0.6.1 F124 扩展)
 
 | 值 | 行为 |
 |---|---|
 | `artifact-driven`(默认,V0.4.0 行为)| `ArtifactWatcher` + trigger graph drive 派发;`agents:` 必非空;`agent_team:` 不允许 |
 | `agent-team`(V0.5.0 F93b)| ccteam-managed `__lead` Claude bg session + Anthropic native Agent Teams 工具;`agents:` 可空(lead 驱动 runtime 拓扑);`agent_team:` 必填 |
+| `chat`(V0.6.0 F108)| 长跑 chat-mode bot(per-bot tmux + `claude` TUI 24/7),User 用 IM (`ccteam-imd`) 互动;每 turn = 1 tmux send-keys + 1 Stop hook;`agents:` 必非空(每个 agent = 1 个 bot)|
+| `human-approval`(V0.6.1 F124 narrow scope)| Artifact-driven roster + 每个 `agent_done` 后 HITL gate;orchestrator 检到 step done → emit `plan_decision_required`(F98 IM 路径消费)→ park pending-spawn queue 直到 `plan_decision` 落 `progress.jsonl`。F124 owns mode enum + dispatch arm + drain guard;F98 owns IM round-trip + decision injection |
 
-`mode` 字段缺失序列化时省略(只显式 `mode: agent-team` 渲染)。V0.4.6 workflow.yaml 不需要任何改动跑 V0.5.0 binary。
+`mode` 字段缺失序列化时省略(只显式 `mode: agent-team` / `mode: chat` / `mode: human-approval` 渲染)。V0.4.6 workflow.yaml 不需要任何改动跑 V0.5.0+ binary。`mode: human-approval` 与 `agents[*].plan_approval:` 可独立使用 — mode 用于"每 step 都要 approve"(workflow-level gate),`plan_approval:` 用于"这个 agent 写完 plan 才要 approve"(agent-level gate)。两者共享 `plan_pending` / `plan_decision` / `plan_timeout` 三 progress event。
 
 ### 17.1.3 V0.5.0 F93b `AgentTeamSpec` 字段 + F97 `CleanupOnStop`
 
@@ -1558,10 +1577,43 @@ F84 budget guard 在 `try_spawn` 入口跑;cost 数据源走 F91 cost SoT(`agent
 | `interval` | duration string | `None` | 仅 `trigger: schedule` 有效(V0.4.0 占位,V0.4.1 接 cron)|
 | `timeout` | duration string | `None` | 单 session 软超时(F64+ watchdog 消费)|
 | `on_timeout` | `escalate` \| `retry` \| `skip` | `None`(等价 `escalate`) | 超时动作 |
+| `plan_approval` | `Option<PlanApprovalSpec>` | `None`(opt-in)| V0.6.1 F98:此 agent 写 `.ccteam/plans/<role>-<ts>.md` plan → 走 IM approval 路径才能 resume。详 §17.2.2 |
+| `tools` | `Vec<String>` | `[]` | V0.6.1 F128 `admin_add_tool` 写入位置;workflow-level tool override(daemon spawn 时合并 `.claude/agents/<role>.md` frontmatter `tools:`)|
 
 **红线(schema 级 hard error)**:`workflow.yaml` 内**不允许**出现
 `prompt:` / `system_prompt:` / `messages:` 字段——所有 prompt 内容
 住在 `.claude/agents/<role>.md`,不进 workflow.yaml。
+
+### 17.2.2 V0.6.1 F98 `PlanApprovalSpec` 字段(per-agent plan-approval gate)
+
+```yaml
+agents:
+  reviewer:
+    trigger: watch:.ccteam/reviews/
+    plan_approval:
+      enabled: true        # 默认 true(写 block 即 opt-in)
+      outbox: telegram     # registered IM transport(`ccteam-imd` 解析 → 具体 Channel + recipient)
+      timeout_min: 60      # approval window(0 = 不超时)
+      on_timeout: escalate # escalate | auto-approve | reject
+```
+
+| 字段 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `enabled` | `bool` | `true`(presence implies opt-in) | 临时关 gate 但保留其他配置:`enabled: false` |
+| `outbox` | `String` | 必填 | IM 通道 id(`telegram` / `slack` / 等);`ccteam-imd` 内 outbox resolver 映射 → Channel + recipient |
+| `timeout_min` | `u32` | `60` | 不收回 reply 的窗口(分);`0` 关超时(永等)|
+| `on_timeout` | `PlanApprovalOnTimeout` | `escalate` | `escalate`(写 plan_timeout + 推 meta-agent inbox + 保 paused)/ `auto-approve`(自动 inject APPROVE)/ `reject`(自动 inject REJECT,reason: timeout)|
+
+**flow**(详 tech-design §6.7):
+
+1. agent 在 `<project>/.ccteam/plans/<role>-<ts>.md` 写 plan markdown
+2. orchestrator artifact watcher 检到 → emit `plan_pending { plan_id, agent, plan_path, head_excerpt }` + agent enter `paused` state
+3. ccteam-imd consume event → 走 outbox 发 IM:`[<workflow>] <agent> wrote plan:\n<head -20 plan>\n\nReply APPROVE / REJECT [<reason>] / EDIT <comment> within <timeout_min>min.`
+4. user IM reply → ccteam-imd inbound parse → emit `plan_decision { plan_id, decision: approve|reject|edit, comment?, by }` + write decision to `<project>/.ccteam/plan-decisions/<plan_id>.md`
+5. orchestrator consume `plan_decision` → resume agent + agent reads decision file via standard inbox-style read(**no prompt injection**)
+6. `timeout_min` elapsed without reply → emit `plan_timeout`,走 `on_timeout` 策略
+
+**红线**:`progress.jsonl` 是 SoT(`plan_pending` / `plan_decision` / `plan_timeout`);decision 内容走文件(`.ccteam/plan-decisions/<plan_id>.md`)— 不向 agent stdin / tmux pane 注入 prompt。decision parser grammar:`APPROVE` / `REJECT [<reason>]` / `EDIT <comment>`(case-insensitive,trim 后正则 match)。完整 state machine 详 `crates/ccteam-core/src/plan_approval.rs`。
 
 ### 17.3 `trigger` 标量字符串语法
 
