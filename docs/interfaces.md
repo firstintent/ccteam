@@ -262,7 +262,7 @@ progress.jsonl 由两个域共同写入:
 | event | 必有字段 | 选填字段 | 写入时机 |
 |---|---|---|---|
 | `workflow_start` | `workflow` (`WorkflowSpec::name`), `slug`, `ts` | — | `Orchestrator::run_project` 入口,加载 workflow.yaml 成功后 |
-| `agent_spawn` | `role`, `session_id`, `executor` (`claude`\|`codex`), `slug`, `ts` | `tmux_session` (claude 用 `ccteam-<slug>-<sid>` 占位;codex 写真名),`job_id` (Claude Code `--bg` 返回的短 hash,如 `"9432490e"`,codex 行为 `null`) | `HarnessAdapter::spawn_session` 返回 `Ok(handle)` 后 |
+| `agent_spawn` | `role`, `session_id`, `executor` (`claude`\|`codex`), `slug`, `ts` | `tmux_session` (claude 用 `ccteam-<slug>-<sid>` 占位;codex 写真名),`job_id` (Claude Code `--bg` 返回的短 hash,如 `"9432490e"`,codex 行为 `null`) | `HarnessAdapter::start_thread` 返回 `Ok(handle)` 后 |
 | `agent_done` | `role`, `session_id`, `status` (`completed`\|`stopped`\|`error`\|`killed`), `cost_usd` (f64;无 cost 时 `0.0`), `slug`, `ts` | — | (a) `session_state_path` 文件 `status` ∈ {`stopped`, `completed`, `error`} 时,poll 一次;(b) `poll_completions` 发现 progress.jsonl 含 open `agent_spawn` 但其 `job_id` 对应的 `~/.claude/jobs/<id>/state.json` 已 terminal,orchestrator 合成 `agent_done`,`status: "killed"` 用于 SIGKILL 死亡的 phantom row(防止 web UI 显示僵尸 running) |
 | `artifact_received` | `role`, `artifact_path` (abs), `slug`, `ts` | — | `ArtifactWatcher` 通过 mpsc 投递 `ArtifactEvent` 后,orchestrator 立刻 append(spawn 决策之前) |
 | `gate_triggered` | `role`, `forced` (bool), `threshold_met` (bool), `slug`, `ts` | — | `check_gates` 解锁 Gate 时;`forced=true` 表示 `.ccteam/gate_override/<role>` marker 触发 |
@@ -331,12 +331,12 @@ progress.jsonl 由两个域共同写入:
 | 事件 | 写入方 |
 |---|---|
 | `workflow_start` / `workflow_done` | orchestrator(`Orchestrator::run_project` 入口 / `check_workflow_done` 守门) |
-| `agent_spawn` | orchestrator(`HarnessAdapter::spawn_session` 返回 Ok 后) |
+| `agent_spawn` | orchestrator(`HarnessAdapter::start_thread` 返回 Ok 后) |
 | `agent_done` | orchestrator(`poll_completions` 检测到 session state.json `status` ∈ {`completed`, `stopped`, `error`}) |
 | `artifact_received` | orchestrator(`ArtifactWatcher` mpsc 投递后) |
 | `gate_triggered` | orchestrator(`check_gates` 释放 Gate 时) |
 | `budget_exceeded` | orchestrator(`try_spawn` budget guard) |
-| `escalation` | orchestrator(`bump_fail_count`,fix-loop 3-strike 与 `spawn_session` 持续失败) |
+| `escalation` | orchestrator(`bump_fail_count`,fix-loop 3-strike 与 `start_thread` 持续失败) |
 | `team_member_joined` / `team_member_left` / `team_message_sent` | F95 `AgentTeamsWatcher`(watcher only;Anthropic 没对应 hook surface) |
 | `team_task_created` / `team_task_completed` | F94 hook 优先(advanced path),F95 watcher fallback |
 | `team_teammate_idle` | F94 hook only(`TeammateIdle`,仅 advanced path 装) |

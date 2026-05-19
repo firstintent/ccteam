@@ -714,7 +714,7 @@ tmux new-session -d -s "${SESSION}" -c "${PROJECT_DIR}" "codex --bypass"
 # 状态写 .ccteam/sessions/<sid>/state.json(codex adapter trait 实现)
 ```
 
-**V0.6 mode 3 Claude bot tmux**(F108 决策 flip — 不走 `claude -p --resume` + stream-json,改回 tmux 长跑 + send-keys -l):
+**V0.6 mode 3 Claude bot tmux**(F108 决策 — tmux 长跑 + send-keys -l):
 ```bash
 SESSION="<project>/<bot_name>"          # 例:pocket-bot
 tmux new-session -d -s "${SESSION}" -c "${PROJECT_DIR}" \

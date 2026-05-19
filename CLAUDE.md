@@ -61,6 +61,12 @@
 | **`ccteam-core` 零 team 名字面量** | 守 | 守 | 守 |
 | **跨项目记忆走官方接口** | 守 | Claude: `~/.claude/CLAUDE.md` + `~/.claude/rules/*.md`;Codex: `~/.codex/AGENTS.md`(`ccteam init` 落 AGENTS.md → CLAUDE.md POSIX symlink)| 同 |
 | **新建项目走 `<projects_root>/<team>-<slug>/`** | — | 守(`pick_unused_slug` 强制 team 前缀)| 守(per-bot tmux session = `<project>/<bot>`,IM bot 落 `.ccteam/chat/<bot>/`)|
+| **root README.md MUST be English** | 守 | 守 | 守 |
+| **README.md 不含版本进展/状态信息** | 守 | 守 | 守 |
+
+**README / 版本进展红线**(V0.6.1 F126):
+- root `README.md` = OSS 主入口,必须英文。`docs/{quickstart,user-manual,recipes,troubleshooting}.md` + `docs/advanced/*` 持续中文(国内用户面);所有版本归档 `docs/v0-X-Y/` 中英不限(开发过程语)。
+- root `README.md` **不**含 `Status` / `V0.x.y in production` / `shipped 日期` / `baseline 数字` / `candidate finding` 列表等版本进展段。版本进展全部去 `docs/v0-X-Y/README.md`(每版本独立 dir);F-finding 索引去 `docs/dev-coupling-audit.md`。README 是产品介绍,**始终反映当前可用状态**,不夹版本时间轴。
 
 **vendor 红线补充**(V0.6 F107 / F112):
 - ccteam **不 vendor** Claude / Codex 二进制(`references/{claude-code,codex/codex-rs}/` git-ignore 不入库,仅协议参考;实际 spawn 走 `$PATH` 内 `claude` / `codex` binary + `CCTEAM_{CLAUDE,CODEX}_BIN` env override)
