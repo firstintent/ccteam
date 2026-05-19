@@ -125,6 +125,84 @@ impl MailboxResolver for DefaultMailboxResolver {
     }
 }
 
+/// V0.6.1 F135 — DM auto-route preprocessor.
+///
+/// Mutates `msg.content` in-place by prepending `@<role> ` when:
+/// 1. The content has no existing `@<handle>` mention, AND
+/// 2. Exactly one registered bot's `(im_platform, im_chat_id)` matches
+///    `(msg.channel, msg.reply_target)`.
+///
+/// The router contract drops "no @mention" messages; without this
+/// preprocessor a user DMing a single bot would have to type
+/// `@<role> hi` to be heard, which defeats the "natural DM" UX
+/// promise. The 2+ bot case (group with multiple bots sharing a
+/// chat_id) still falls through to the router's drop path so explicit
+/// @ mentions remain the disambiguator there.
+///
+/// Helper [`has_at_mention`] does the @ detection; kept public so
+/// unit tests can probe the boundary cases (e.g. bare "@" with no
+/// handle char).
+pub fn auto_route_dm_mention(
+    msg: &mut ChannelMessage,
+    bots: &[crate::BotRegistration],
+) {
+    if has_at_mention(&msg.content) {
+        return;
+    }
+    let matches: Vec<&crate::BotRegistration> = bots
+        .iter()
+        .filter(|b| b.im_platform == msg.channel && b.im_chat_id == msg.reply_target)
+        .collect();
+    match matches.len() {
+        1 => {
+            let role = matches[0].role.clone();
+            let new_content = format!("@{} {}", role, msg.content.trim_start());
+            tracing::info!(
+                slug = %matches[0].workflow_slug,
+                role = %role,
+                platform = %msg.channel,
+                chat_id = %msg.reply_target,
+                "imd: F135 DM auto-route prepended @{}",
+                role
+            );
+            msg.content = new_content;
+        }
+        0 => {
+            tracing::debug!(
+                platform = %msg.channel,
+                chat_id = %msg.reply_target,
+                "imd: F135 DM auto-route skipped (no bot bound to this chat)"
+            );
+        }
+        n => {
+            tracing::debug!(
+                count = n,
+                platform = %msg.channel,
+                chat_id = %msg.reply_target,
+                "imd: F135 DM auto-route skipped (multiple bots share chat_id; group-style @ required)"
+            );
+        }
+    }
+}
+
+/// V0.6.1 F135 — true iff `text` contains an `@` followed by at least
+/// one alphanumeric / `_` / `-` char. Mirrors the router's
+/// `parse_first_mention` handle-char rules so we don't double-@ on
+/// content that already starts with a mention.
+pub fn has_at_mention(text: &str) -> bool {
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '@' {
+            if let Some(&next_ch) = chars.peek() {
+                if next_ch.is_ascii_alphanumeric() || next_ch == '_' || next_ch == '-' {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Process one inbound IM event end-to-end.
 pub async fn process_inbound(
     msg: &ChannelMessage,
