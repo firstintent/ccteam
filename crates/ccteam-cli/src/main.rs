@@ -558,6 +558,21 @@ enum Command {
         /// mutation. Pairs with --check-codex-version.
         #[arg(long, default_value_t = false)]
         check_codex_auth: bool,
+        /// V0.6.1 F139: materialize the `~/.ccteam/hooks/hook.sh`
+        /// daemon-aware Claude Code hook dispatcher (idempotent, chmod
+        /// 0755). Run after a ccteam binary upgrade to refresh the
+        /// script body. `ccteam init` already does this on first
+        /// install.
+        #[arg(long, default_value_t = false)]
+        install_hooks: bool,
+        /// V0.6.1 F139: rewrite every registered project's
+        /// `.claude/settings.json` so hook commands invoke
+        /// `~/.ccteam/hooks/hook.sh` instead of the V0.4.6 / V0.6.0
+        /// `<ccteam-bin> internal hook ...` form (or older `cct hook
+        /// ...` / `ccteam hook ...` forms). Idempotent; pair with
+        /// `--dry-run` to preview without writing.
+        #[arg(long, default_value_t = false)]
+        migrate_hook_commands: bool,
         /// V0.4.6 F83/F85: pair with `--migrate-workflow-to-ccteam-dir`
         /// or `--gc-claude-jobs` to commit changes to disk instead of
         /// previewing them. Without it, those subcommands run as
@@ -990,6 +1005,8 @@ fn main() -> Result<()> {
             check_pricing_version,
             check_codex_version,
             check_codex_auth,
+            install_hooks,
+            migrate_hook_commands,
             apply,
         } => {
             // V0.4.1 `--install-all` is sugar for the three first-run
@@ -1040,6 +1057,8 @@ fn main() -> Result<()> {
                 check_pricing_version,
                 check_codex_version,
                 check_codex_auth,
+                install_hooks,
+                migrate_hook_commands,
             })
         }
         Command::Session { action } => run_session(action),
@@ -1283,26 +1302,28 @@ fn run_doctor(opts: commands::DoctorOptions) -> Result<()> {
 
 fn run_hook(cmd: HookCommand) -> Result<()> {
     let paths = CcteamPaths::from_env()?;
-
-    match cmd {
+    // V0.6.1 F139: dispatch through the shared `ccteam_hooks::dispatch`
+    // entry so the CLI fallback and the daemon HTTP route share one
+    // codepath. `intercept-ask` returns a JSON decision that we echo to
+    // stdout; the other hooks are side-effect-only.
+    let (kind, action, needs_stdin): (&str, Option<&str>, bool) = match &cmd {
         HookCommand::ProgressAppend { event_type } => {
-            let stdin = parse_hook_stdin_json()?;
-            ccteam_hooks::progress_append(&paths, &event_type, &stdin)
+            ("progress-append", Some(event_type.as_str()), true)
         }
-        HookCommand::LoadContext => {
-            let stdin = parse_hook_stdin_json()?;
-            ccteam_hooks::load_context(&paths, &stdin)
-        }
-        HookCommand::InterceptAsk => {
-            let decision = ccteam_hooks::intercept_ask_decision();
-            println!("{}", serde_json::to_string(&decision)?);
-            Ok(())
-        }
-        HookCommand::ChatProgress { event } => {
-            let stdin = parse_hook_stdin_json()?;
-            ccteam_hooks::handle_chat_progress(&paths, &event, &stdin)
-        }
+        HookCommand::LoadContext => ("load-context", None, true),
+        HookCommand::InterceptAsk => ("intercept-ask", None, false),
+        HookCommand::ChatProgress { event } => ("chat-progress", Some(event.as_str()), true),
+    };
+    let stdin = if needs_stdin {
+        parse_hook_stdin_json()?
+    } else {
+        serde_json::Value::Null
+    };
+    let response = ccteam_hooks::dispatch(&paths, kind, action, &stdin)?;
+    if let Some(value) = response {
+        println!("{}", serde_json::to_string(&value)?);
     }
+    Ok(())
 }
 
 fn parse_hook_stdin_json() -> Result<serde_json::Value> {

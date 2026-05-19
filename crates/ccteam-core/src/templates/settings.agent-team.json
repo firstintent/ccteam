@@ -10,15 +10,15 @@
     "SessionStart": [
       {
         "hooks": [
-          {"type": "command", "command": "__CCTEAM_BIN__ internal hook load-context", "timeout": 5},
-          {"type": "command", "command": "__CCTEAM_BIN__ internal hook progress-append session_start", "async": true}
+          {"type": "command", "command": "__CCTEAM_HOOK_SH__ load-context", "timeout": 5},
+          {"type": "command", "command": "__CCTEAM_HOOK_SH__ progress-append session_start", "async": true}
         ]
       }
     ],
     "Stop": [
       {
         "hooks": [
-          {"type": "command", "command": "__CCTEAM_BIN__ internal hook progress-append Stop", "async": true}
+          {"type": "command", "command": "__CCTEAM_HOOK_SH__ progress-append Stop", "async": true}
         ]
       }
     ],
@@ -26,62 +26,62 @@
       {
         "matcher": "idle_prompt|permission_prompt",
         "hooks": [
-          {"type": "command", "command": "__CCTEAM_BIN__ internal hook progress-append notification", "async": true}
+          {"type": "command", "command": "__CCTEAM_HOOK_SH__ progress-append notification", "async": true}
         ]
       }
     ],
     "PreToolUse": [
       {
         "hooks": [
-          {"type": "command", "command": "__CCTEAM_BIN__ internal hook progress-append PreToolUse", "async": true}
+          {"type": "command", "command": "__CCTEAM_HOOK_SH__ progress-append PreToolUse", "async": true}
         ]
       },
       {
         "matcher": "AskUserQuestion",
         "hooks": [
-          {"type": "command", "command": "__CCTEAM_BIN__ internal hook intercept-ask", "timeout": 5}
+          {"type": "command", "command": "__CCTEAM_HOOK_SH__ intercept-ask", "timeout": 5}
         ]
       }
     ],
     "PostToolUse": [
       {
         "hooks": [
-          {"type": "command", "command": "__CCTEAM_BIN__ internal hook progress-append PostToolUse", "async": true}
+          {"type": "command", "command": "__CCTEAM_HOOK_SH__ progress-append PostToolUse", "async": true}
         ]
       }
     ],
     "SubagentStop": [
       {
         "hooks": [
-          {"type": "command", "command": "__CCTEAM_BIN__ internal hook progress-append SubagentStop", "async": true}
+          {"type": "command", "command": "__CCTEAM_HOOK_SH__ progress-append SubagentStop", "async": true}
         ]
       }
     ],
     "SessionEnd": [
       {
         "hooks": [
-          {"type": "command", "command": "__CCTEAM_BIN__ internal hook progress-append SessionEnd", "async": true}
+          {"type": "command", "command": "__CCTEAM_HOOK_SH__ progress-append SessionEnd", "async": true}
         ]
       }
     ],
     "TeammateIdle": [
       {
         "hooks": [
-          {"type": "command", "command": "__CCTEAM_BIN__ internal hook progress-append team_teammate_idle", "async": true}
+          {"type": "command", "command": "__CCTEAM_HOOK_SH__ progress-append team_teammate_idle", "async": true}
         ]
       }
     ],
     "TaskCreated": [
       {
         "hooks": [
-          {"type": "command", "command": "__CCTEAM_BIN__ internal hook progress-append team_task_created", "async": true}
+          {"type": "command", "command": "__CCTEAM_HOOK_SH__ progress-append team_task_created", "async": true}
         ]
       }
     ],
     "TaskCompleted": [
       {
         "hooks": [
-          {"type": "command", "command": "__CCTEAM_BIN__ internal hook progress-append team_task_completed", "async": true}
+          {"type": "command", "command": "__CCTEAM_HOOK_SH__ progress-append team_task_completed", "async": true}
         ]
       }
     ]

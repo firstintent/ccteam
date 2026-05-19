@@ -1121,13 +1121,23 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_project_settings_uses_absolute_ccteam_path() {
+    fn bootstrap_project_settings_routes_through_hook_sh() {
+        // V0.6.1 F139: fresh settings.json renders route hook commands
+        // through `~/.ccteam/hooks/hook.sh` (the daemon-aware wrapper)
+        // instead of cold-spawning `ccteam internal hook ...`.
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = CcteamPaths {
             root: tmp.path().join("home"),
             projects_root: tmp.path().join("projects"),
         };
-        bootstrap_project(&paths, "demo", "demo request", "dev").unwrap();
+        // Point CCTEAM_HOME at the tempdir so `effective_hook_sh_path`
+        // returns the predictable per-test path.
+        std::env::set_var("CCTEAM_HOME", &paths.root);
+        let expected_hook = paths.hooks_script();
+        let result = bootstrap_project(&paths, "demo", "demo request", "dev");
+        std::env::remove_var("CCTEAM_HOME");
+        result.unwrap();
+
         let settings = paths.project_dir("demo").join(".claude/settings.json");
         let body = std::fs::read_to_string(&settings).unwrap();
         let v: Value = serde_json::from_str(&body).unwrap();
@@ -1138,23 +1148,22 @@ mod tests {
             cmd.starts_with('/'),
             "settings.json hook command must be an absolute path, got: {cmd}",
         );
-        // V0.4.6 F89: fresh settings.json renders use the new
-        // `internal hook …` path. Old `hook …` form would still resolve
-        // via the deprecated top-level alias, but new installs should
-        // produce the new form.
         assert!(
-            cmd.ends_with(" internal hook load-context"),
-            "settings.json hook command should invoke `internal hook load-context`, got: {cmd}",
+            cmd.contains(expected_hook.to_str().unwrap()),
+            "settings.json hook should invoke {}, got: {cmd}",
+            expected_hook.display(),
         );
-        // Reject the placeholder having survived the render — that's the
-        // PATH-dependent failure mode we're guarding against.
         assert!(
-            !cmd.contains("{{CCT_BIN}}"),
-            "settings.json placeholder should be substituted, got: {cmd}",
+            cmd.ends_with(" load-context"),
+            "settings.json SessionStart[0] should pass `load-context`, got: {cmd}",
+        );
+        assert!(
+            !cmd.contains("__CCTEAM_HOOK_SH__"),
+            "placeholder should be substituted, got: {cmd}",
         );
         assert!(
             !cmd.contains("__CCTEAM_BIN__"),
-            "legacy F39 placeholder should not return, got: {cmd}",
+            "retired F89 placeholder should not return, got: {cmd}",
         );
     }
 }

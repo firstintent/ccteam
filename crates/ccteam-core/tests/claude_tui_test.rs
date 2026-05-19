@@ -216,7 +216,7 @@ fn chat_session_name_format_is_stable() {
 #[test]
 fn ensure_chat_hooks_creates_settings_with_all_events() {
     let tmp = tempfile::TempDir::new().unwrap();
-    ensure_chat_hooks_installed(tmp.path(), "/usr/local/bin/ccteam").unwrap();
+    ensure_chat_hooks_installed(tmp.path(), "/home/u/.ccteam/hooks/hook.sh").unwrap();
     let body = std::fs::read_to_string(tmp.path().join(".claude/settings.json")).unwrap();
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     let hooks = v.get("hooks").expect("hooks key");
@@ -247,7 +247,7 @@ fn ensure_chat_hooks_preserves_unrelated_top_level_keys() {
         r#"{"someOtherKey": {"x": 1}}"#,
     )
     .unwrap();
-    ensure_chat_hooks_installed(tmp.path(), "/usr/local/bin/ccteam").unwrap();
+    ensure_chat_hooks_installed(tmp.path(), "/home/u/.ccteam/hooks/hook.sh").unwrap();
     let v: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(tmp.path().join(".claude/settings.json")).unwrap(),
     )

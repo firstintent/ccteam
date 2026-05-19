@@ -278,9 +278,12 @@ fn settings_agent_team_template_has_three_new_hooks() {
 }
 
 #[test]
-fn render_project_settings_agent_team_substitutes_bin_path() {
+fn render_project_settings_agent_team_substitutes_hook_sh_path() {
+    // V0.6.1 F139 — agent-team hook commands route through
+    // `~/.ccteam/hooks/hook.sh` (the daemon-aware wrapper) instead of
+    // cold-spawning `<bin> internal hook ...` every firing.
     let body = ccteam_core::render_project_settings_agent_team(
-        Path::new("/usr/local/bin/ccteam"),
+        Path::new("/home/u/.ccteam/hooks/hook.sh"),
         &ccteam_core::SettingsEnv::default(),
         &ccteam_core::EnabledPluginsSetting::default(),
     )
@@ -291,21 +294,21 @@ fn render_project_settings_agent_team_substitutes_bin_path() {
         .expect("TeammateIdle command");
     assert_eq!(
         teammate_idle,
-        "/usr/local/bin/ccteam internal hook progress-append team_teammate_idle",
+        "/home/u/.ccteam/hooks/hook.sh progress-append team_teammate_idle",
     );
     let task_created = v["hooks"]["TaskCreated"][0]["hooks"][0]["command"]
         .as_str()
         .unwrap();
     assert_eq!(
         task_created,
-        "/usr/local/bin/ccteam internal hook progress-append team_task_created",
+        "/home/u/.ccteam/hooks/hook.sh progress-append team_task_created",
     );
     let task_completed = v["hooks"]["TaskCompleted"][0]["hooks"][0]["command"]
         .as_str()
         .unwrap();
     assert_eq!(
         task_completed,
-        "/usr/local/bin/ccteam internal hook progress-append team_task_completed",
+        "/home/u/.ccteam/hooks/hook.sh progress-append team_task_completed",
     );
 }
 

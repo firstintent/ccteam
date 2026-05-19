@@ -28,6 +28,11 @@ pub enum OutputFormat {
     Json,
 }
 
+// V0.6.1 F139 — `install_hooks` + `HOOK_DISPATCHER_SH` live in
+// `ccteam_core::hooks_dispatcher` so the embedded script can be tested
+// alongside the rest of core's bootstrap-template machinery.
+pub use ccteam_core::{install_hooks, InstallHooksAction, HOOK_DISPATCHER_SH};
+
 /// V0.5.0 F93b — `ccteam init --mode <variant>` selector.
 ///
 /// Default is `ArtifactDriven` (V0.4.6 behavior preserved). `AgentTeam`
@@ -119,6 +124,12 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
             paths.templates_dir().display()
         )
     })?;
+
+    // V0.6.1 F139 — materialize the per-hook dispatcher script. This
+    // must run before `install_project_at` so the freshly-rendered
+    // `.claude/settings.json` hook commands point at a file that
+    // actually exists.
+    install_hooks(paths).context("install ~/.ccteam/hooks/hook.sh dispatcher")?;
 
     // -- 2. Resolve project install target ---------------------------
     let target = resolve_install_target(paths, &opts)?;
@@ -2141,6 +2152,16 @@ pub struct DoctorOptions {
     /// mode-3 codex bot path knows to error early. Pure-readout — no
     /// fs mutation.
     pub check_codex_auth: bool,
+    /// V0.6.1 F139: materialize the `~/.ccteam/hooks/hook.sh` daemon
+    /// dispatcher (idempotent, chmod 0755). Use after a ccteam binary
+    /// upgrade ships a new script body.
+    pub install_hooks: bool,
+    /// V0.6.1 F139: rewrite every registered project's
+    /// `.claude/settings.json` to invoke `~/.ccteam/hooks/hook.sh`
+    /// instead of `<ccteam-bin> internal hook ...` (or older V0.4.x
+    /// `ccteam hook ...` / F39 `cct hook ...` forms). Idempotent; pair
+    /// with `--dry-run` to preview.
+    pub migrate_hook_commands: bool,
 }
 
 /// `ccteam doctor` dispatch. Returns a human-readable report so unit
@@ -2161,7 +2182,9 @@ pub fn run_doctor(paths: &CcteamPaths, mut opts: DoctorOptions) -> Result<String
         || opts.update_hooks
         || opts.check_pricing_version
         || opts.check_codex_version
-        || opts.check_codex_auth;
+        || opts.check_codex_auth
+        || opts.install_hooks
+        || opts.migrate_hook_commands;
     // V0.6.1 F121 — `ccteam doctor` with no mode flag implicitly runs
     // the pricing staleness check so operators see ageing rate sheets
     // without having to remember `--check-pricing-version`. The opt-in
@@ -2237,6 +2260,12 @@ pub fn run_doctor(paths: &CcteamPaths, mut opts: DoctorOptions) -> Result<String
     if opts.check_codex_auth {
         out.push_str(&render_check_codex_auth_report());
     }
+    if opts.install_hooks {
+        out.push_str(&render_install_hooks_report(paths)?);
+    }
+    if opts.migrate_hook_commands {
+        out.push_str(&render_migrate_hook_commands_report(paths, opts.dry_run)?);
+    }
     // V0.3.1 F47 — informational codex CLI detection. Appends one line
     // to every successful doctor run (any_mode == true) so operators
     // see whether the codex binary is on PATH ahead of V0.3.2's real
@@ -2295,7 +2324,14 @@ const NO_MODE_HELP: &str = "\nccteam doctor: pass at least one mode flag for the
      --check-codex-version\n      \
      probe `codex --version` and WARN when older than 0.131 (V0.6.0 Wave 3 F112).\n  \
      --check-codex-auth\n      \
-     probe `codex login status` and report whether the operator is logged in (V0.6.0 Wave 3 F112).\n";
+     probe `codex login status` and report whether the operator is logged in (V0.6.0 Wave 3 F112).\n  \
+     --install-hooks\n      \
+     materialize ~/.ccteam/hooks/hook.sh (the daemon-aware Claude Code hook dispatcher; V0.6.1 F139). \
+     Idempotent; chmod 0755. `ccteam init` already does this on first install.\n  \
+     --migrate-hook-commands [--dry-run]\n      \
+     rewrite every registered project's .claude/settings.json so hook commands invoke \
+     ~/.ccteam/hooks/hook.sh instead of the V0.4.6 / V0.6.0 `<ccteam-bin> internal hook ...` form \
+     (V0.6.1 F139). Idempotent.\n";
 
 /// V0.3.1 F47 — pure informational `which codex` detection. Returns
 /// a single line ending with `\n`. The lookup uses `Command::new("which")`
@@ -2651,13 +2687,14 @@ fn render_f44_migration(paths: &CcteamPaths, opts: &DoctorOptions) -> Result<Str
         );
     }
 
-    // 2. Stale settings.json hook command paths. Use the orchestrator's
-    // resolved projects root so test fixtures get the tempdir; tests
-    // don't otherwise mutate `~/projects/`.
-    let new_bin = current_ccteam_bin().ok();
-    if let Some(bin) = new_bin.as_ref() {
+    // 2. Stale settings.json hook command paths. V0.6.1 F139 — rewrite
+    // targets are now the `~/.ccteam/hooks/hook.sh` wrapper, not the
+    // bare ccteam binary, so users upgrading from V0.6.0 (or earlier)
+    // get pointed at the daemon-aware dispatcher.
+    let hook_sh = paths.hooks_script();
+    {
         let hook_reports =
-            scan_project_settings_for_hook_rewrite(&paths.projects_root, bin, opts.dry_run)?;
+            scan_project_settings_for_hook_rewrite(&paths.projects_root, &hook_sh, opts.dry_run)?;
         if hook_reports.is_empty() {
             out.push_str("  legacy hooks     no project `settings.json` files found.\n");
         } else {
@@ -2687,8 +2724,6 @@ fn render_f44_migration(paths: &CcteamPaths, opts: &DoctorOptions) -> Result<Str
                 ));
             }
         }
-    } else {
-        out.push_str("  legacy hooks     could not resolve `ccteam` binary — skipped.\n");
     }
     out.push('\n');
     Ok(out)
@@ -2772,6 +2807,86 @@ fn render_update_hooks_report(paths: &CcteamPaths, dry_run: bool) -> Result<Stri
         out.push_str(
             "\n  (no `cost-accumulate` hooks found — all settings.json files already clean.)\n",
         );
+    }
+    out.push('\n');
+    Ok(out)
+}
+
+/// V0.6.1 F139 — `ccteam doctor --install-hooks` report. Materializes
+/// `<paths.root>/hooks/hook.sh` from the embedded template and chmod
+/// 0755. Idempotent.
+fn render_install_hooks_report(paths: &CcteamPaths) -> Result<String> {
+    let mut out = String::from("ccteam doctor --install-hooks (V0.6.1 F139)\n\n");
+    let (path, action) = install_hooks(paths)?;
+    let label = match action {
+        InstallHooksAction::Created => "created",
+        InstallHooksAction::Updated => "updated (script body differed)",
+        InstallHooksAction::Unchanged => "ok (already current)",
+    };
+    out.push_str(&format!("  hook.sh           {label}\n"));
+    out.push_str(&format!("  target            {}\n", path.display()));
+    out.push_str(&format!(
+        "  size              {} bytes\n",
+        HOOK_DISPATCHER_SH.len()
+    ));
+    out.push('\n');
+    out.push_str(
+        "  this script is the per-hook entry. Project `.claude/settings.json`\n  \
+         hooks point at it; it POSTs Claude Code hook stdin to the long-running\n  \
+         daemon's `/internal/hook/:kind[/:action]` route (~10 ms) and falls\n  \
+         back to `ccteam internal hook ...` when the daemon is down (~200 ms).\n\n",
+    );
+    out.push_str(
+        "  next, point legacy project settings.json files at the new wrapper:\n      \
+         ccteam doctor --migrate-hook-commands [--dry-run]\n\n",
+    );
+    Ok(out)
+}
+
+/// V0.6.1 F139 — `ccteam doctor --migrate-hook-commands` report.
+/// Rewrites every registered project's `.claude/settings.json` so hook
+/// command strings invoke `~/.ccteam/hooks/hook.sh` instead of the
+/// V0.4.6 / V0.6.0 `<ccteam-bin> internal hook ...` form (or older
+/// `cct hook ...` / `ccteam hook ...` forms). Pair with `--dry-run` to
+/// preview without writing. Idempotent.
+fn render_migrate_hook_commands_report(paths: &CcteamPaths, dry_run: bool) -> Result<String> {
+    let mut out = String::from("ccteam doctor --migrate-hook-commands (V0.6.1 F139)\n\n");
+    let hook_sh = paths.hooks_script();
+    if !hook_sh.exists() {
+        out.push_str(&format!(
+            "  WARNING: {} does not exist yet — run\n           ccteam doctor --install-hooks\n           first so the rewriter has a real target.\n\n",
+            hook_sh.display(),
+        ));
+    }
+    let reports =
+        scan_project_settings_for_hook_rewrite(&paths.projects_root, &hook_sh, dry_run)?;
+    if reports.is_empty() {
+        out.push_str("  no project `settings.json` files found.\n\n");
+        return Ok(out);
+    }
+    let mut touched = 0usize;
+    for r in &reports {
+        let line = render_hook_rewrite_line(r, dry_run);
+        out.push_str(&line);
+        if matches!(
+            r.action,
+            HookCmdRewriteAction::Rewrote { .. } | HookCmdRewriteAction::WouldRewrite { .. }
+        ) {
+            touched += 1;
+        }
+    }
+    if touched == 0 {
+        out.push_str(
+            "\n  (all settings.json files already invoke hook.sh — nothing to migrate.)\n",
+        );
+    } else if dry_run {
+        out.push_str(&format!(
+            "\n  {touched} settings.json file(s) would be rewritten — re-run without --dry-run to apply.\n",
+        ));
+    } else {
+        out.push_str(&format!(
+            "\n  {touched} settings.json file(s) rewritten.\n",
+        ));
     }
     out.push('\n');
     Ok(out)
@@ -3118,7 +3233,7 @@ fn config_project_dir(paths: &CcteamPaths, slug: &str) -> Option<std::path::Path
 /// project report so the doctor output can summarize.
 fn scan_project_settings_for_hook_rewrite(
     projects_root: &std::path::Path,
-    new_bin: &std::path::Path,
+    new_hook_sh: &std::path::Path,
     dry_run: bool,
 ) -> Result<Vec<HookCmdRewriteReport>> {
     let mut out: Vec<HookCmdRewriteReport> = Vec::new();
@@ -3138,7 +3253,7 @@ fn scan_project_settings_for_hook_rewrite(
         if !settings.exists() {
             continue;
         }
-        let report = rewrite_legacy_hook_commands(&settings, new_bin, dry_run)?;
+        let report = rewrite_legacy_hook_commands(&settings, new_hook_sh, dry_run)?;
         out.push(report);
     }
     Ok(out)

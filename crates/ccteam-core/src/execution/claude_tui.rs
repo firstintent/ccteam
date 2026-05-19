@@ -70,16 +70,20 @@ pub fn chat_session_name(slug: &str, role: &str) -> String {
     format!("ccteam-chat-{slug}-{role}")
 }
 
-/// V0.6.0 F108 — write / merge the chat-progress hooks into
-/// `<project>/.claude/settings.json` so Claude Code calls back into
-/// `ccteam internal hook chat-progress <event>` for the lifecycle
-/// events the orchestrator needs.
+/// V0.6.0 F108 / V0.6.1 F139 — write / merge the chat-progress hooks
+/// into `<project>/.claude/settings.json`. As of F139 the hook command
+/// invokes the per-host `~/.ccteam/hooks/hook.sh` wrapper (HTTP-to-
+/// daemon fast path + CLI fallback) instead of the cold-spawn
+/// `<bin> internal hook chat-progress <event>` form.
+///
+/// `hook_sh` is the absolute path to the dispatcher
+/// (`~/.ccteam/hooks/hook.sh` in production; tests pin a fake path).
 ///
 /// Idempotent: existing hooks for other events are preserved; existing
 /// chat-progress entries are replaced.
 pub fn ensure_chat_hooks_installed(
     project_dir: &Path,
-    ccteam_bin: &str,
+    hook_sh: &str,
 ) -> Result<(), HarnessError> {
     let settings_dir = project_dir.join(".claude");
     std::fs::create_dir_all(&settings_dir)
@@ -118,7 +122,7 @@ pub fn ensure_chat_hooks_installed(
             "matcher": "*",
             "hooks": [{
                 "type": "command",
-                "command": format!("{ccteam_bin} internal hook chat-progress {arg}"),
+                "command": format!("{hook_sh} chat-progress {arg}"),
             }],
         }]);
         hooks_obj.insert((*event).to_string(), entry);
@@ -136,9 +140,17 @@ fn claude_bin() -> String {
 }
 
 fn ccteam_bin_for_hooks() -> String {
-    // Tests pin a fake ccteam binary path via env when they want hooks
-    // to point at a stub; production picks the live ccteam on PATH.
-    std::env::var("CCTEAM_BIN").unwrap_or_else(|_| "ccteam".to_string())
+    // V0.6.1 F139 — chat-mode hooks now invoke the wrapper script
+    // (`~/.ccteam/hooks/hook.sh`) rather than the ccteam binary. The
+    // wrapper itself handles the HTTP-to-daemon round-trip + CLI
+    // fallback. Tests pin a fake path via `CCTEAM_HOOK_SH`; otherwise
+    // resolve from `CcteamPaths::from_env()`.
+    if let Ok(path) = std::env::var("CCTEAM_HOOK_SH") {
+        return path;
+    }
+    crate::CcteamPaths::from_env()
+        .map(|paths| paths.hooks_script().display().to_string())
+        .unwrap_or_else(|_| "ccteam".to_string())
 }
 
 #[async_trait]
