@@ -94,6 +94,14 @@ log() { printf '[%s] %s\n' "$(date -u +%H:%M:%SZ)" "$*"; }
 # ccteam-web tests false-positive 502 against proxied connections).
 remote_run() {
     # remote_run <scenario> <bash-script>
+    #
+    # V0.6.1 F131 — script is delivered to bash via STDIN (heredoc),
+    # NOT via `bash -c '$script'`. The old single-quote wrap broke
+    # whenever $script contained a literal `'` (e.g.
+    # `echo '[probe] ...'`), causing the outer wrap to close
+    # prematurely. That truncated probe scripts mid-flight, leaving
+    # daemon_stop_snippet unexecuted → zombie ccteam-imd processes.
+    # The heredoc + `bash -s` form is fully quote-transparent.
     local scenario="$1"; shift
     local script="$1"
     local d="$OUT_DIR/$scenario"
@@ -108,16 +116,15 @@ remote_run() {
         (
             cd "$local_root"
             env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
-                bash -c "$script"
-        ) >"$d/log" 2>&1
+                bash -s
+        ) <<< "$script" >"$d/log" 2>&1
         echo $? > "$d/rc"
     else
-        echo "ssh $NAS_HOST 'cd $NAS_PATH && ...'" > "$d/cmd.txt"
+        echo "ssh $NAS_HOST 'cd $NAS_PATH && bash -s <<< <script>'" > "$d/cmd.txt"
         printf '%s\n' "$script" >> "$d/cmd.txt"
-        ssh "$NAS_HOST" bash -s <<EOF >"$d/log" 2>&1
+        ssh "$NAS_HOST" "cd $NAS_PATH && env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy bash -s" >"$d/log" 2>&1 <<EOF
 set -uo pipefail
-cd "$NAS_PATH"
-env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy bash -c '$script'
+$script
 EOF
         echo $? > "$d/rc"
     fi
