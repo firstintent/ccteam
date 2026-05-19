@@ -16,3 +16,8 @@
 # Project-local gh CLI config (workspace-level GH_CONFIG_DIR; see .claude/settings.local.json)
 .gh/
 readme.local.txt
+
+# Host-probe scratch output (per-run logs + cost snapshots from
+# scripts/host-probe/run-probes.sh). Real demo GIFs land in
+# docs/v0-6-0/demos/ when V0.6.1 records them.
+.probe-results/

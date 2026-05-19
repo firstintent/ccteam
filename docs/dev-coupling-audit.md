@@ -102,6 +102,20 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
 | **F90** | V0.4.6 | **closed** | Web WorkflowView 4 新面板(ArtifactQueuePanel / EventsTimelinePanel / FailureInspector / CostSparkline)+ 4 新 API endpoint → `docs/v0-4-6/prd.md` F90 |
 | **F91** | V0.4.6 | **closed** | cost SoT 收敛(删 `Hook::CostAccumulate` + `cost_summary` 实时读 `~/.claude/jobs/<id>/state.json::cost_usd_total`;`state.cost_used_usd` 字段 deprecated 但 serde-compat)→ `docs/v0-4-6/prd.md` F91 |
 | **F92** | V0.4.7 候选 | **open** | 真 cost 数据源(host `state.json` 没有 `cost_usd_total` 字段 — 真实数据在 `linkScanPath` jsonl event 的 Anthropic `usage` 字段)— 2026-05-16 V0.4.6 E2E 发现 |
+| F93-F105 | V0.5.0 / V0.5.1 | closed | 详 `docs/v0-5-0/README.md` + `docs/v0-5-1/README.md`(F92 真 cost + agent-team mode + meta-agent reposition + host E2E SPA 可见性 + `--env` argv bug 等)|
+| **F106** | V0.6.0 | ✓ shipped wave-跟随 | 红线表按"模式 × vendor"双轴 scope 重写 — `docs/tech-design.md §0` + CLAUDE.md §三;V0.6.0 ship 后所有 PR 必按双轴 check |
+| **F107** | V0.6.0 | ✓ shipped wave 1 | `HarnessAdapter` trait Option C:扩展现有 trait 对齐 Codex `ThreadManager`(5 方法 thread/turn 接口 + `TurnInput` enum + `AgentVendor` enum + `ExecutionMode { InProc \| Bg \| Chat }`)— `crates/ccteam-core/src/harness.rs` |
+| **F108** | V0.6.0 | ✓ shipped wave 2 | 模式 3 执行路径 Option C 决策 flip:**tmux 长 session + send-keys -l 直送 user content + dual-track(Claude Code 官方 hooks fast event 通道 + transcript jsonl byte-offset 增量读 → 镜像 ccteam-owned `turns.jsonl`)+ slash 命令透明透传**(综合 ccgram + OMC production 验证;弃上版 `claude -p --resume` + stream-json) |
+| **F109** | V0.6.0 | ✓ shipped wave 2 | IM bridge 统一 `openhuman/channels` Rust crate(14+ IM 平台 cargo feature 门控);`claude-plugins-official/telegram` 作 backup transport(`/ccteam-im-setup --transport official-telegram` 切)|
+| ~~**F110**~~ | — | **取消** | MCP namespace `ccteam` → `ct` rename **取消**(V0.5 用户肌肉记忆 override 4 字符节省);只保留 F110 "子前缀分组" 部分 → F111 |
+| **F111** | V0.6.0 | ✓ shipped wave 3 | MCP 工具子前缀分组(5 group:`workflow_/chat_/advise_/admin_/screenshot`)+ `CCTEAM_DISABLE_TOOLS` group enum + 项目级 `.mcp.json`;server name 保持 `ccteam`;V0.5 用户配置零 break — `crates/ccteam-cli/src/{mcp_serve,mcp_workflow_tools,mcp_chat_tools,mcp_advise_tools,mcp_tool_groups}.rs` |
+| **F112** | V0.6.0 | ✓ shipped wave 3 | Codex 集成 Option B 完整:`vendor: AgentVendor { Claude, Codex }` trait 一等公民 + `CodexExecAdapter`(模式 2 `codex exec --json`)+ `CodexAppServerAdapter`(模式 3 UDS JSON-RPC v2)+ 双 pricing table(`crates/ccteam-cost/pricing/{anthropic,openai}.toml`)+ per-vendor budget caps + 4 用户场景(advise vote / auto-critic / quota fallback / `/ccteam-team` Codex critic)|
+| **F113** | V0.6.0 | ✓ shipped wave 1-2 | `/ccteam` 总入口 NL dispatcher slash + 5 sub-skill(Solo / Team / Overnight / Pocket / Squad)— `skills/ccteam/`(总入口 + 路由到 sub-skill)|
+| **F114** | V0.6.0 | ✓ shipped wave 2 | `ccteam-creator` skill 复活 + NL 自动 mode 推断(用户说"想做个 TG 助理"→ Pocket Assistant preset → Routing 编排 → mode 3 tmux-bot)+ persona 预设库(技术助手 / 写作 / 翻译 / 学习辅导 5 个中文 persona)|
+| **F115** | V0.6.0 | ✓ shipped wave 2 | `.ccteam/handoffs/<workflow>/<stage>.md` 决策摘要机制(researcher / writer / reviewer 链 stage 切换时落 markdown,下 stage bot `@读 handoffs/<stage>.md` 重建上下文,**不**再用户在 IM 粘贴)|
+| **F116** | V0.6.0 | ✓ shipped wave 2 | `ccteam-imd` 独立 supervisor daemon binary(borrowed OMC `reply-listener.ts` 模式)— `crates/ccteam-imd/`,workspace member,守 openhuman/channels event bus + per-channel adapter task + HarnessAdapter call;替代"ccteam daemon + Anthropic 官方 TG MCP server"双进程 |
+| **F117** | V0.6.0 | ✓ shipped wave 2 | `/ccteam-im-setup` 一次性 IM token onboarding skill(TG getMe + getUpdates auto-detect chat_id;后续 chat workflow 自动复用)— `skills/ccteam-im-setup/SKILL.md` |
+| **F118** | V0.6.0 | ✓ shipped wave 3 | chat session 失效 last-N turn 重建(ccteam-owned `<project>/.ccteam/chat/<bot>/turns.jsonl` SoT;`recover_last_n_turns` 配置;新 TUI session 起后 submit `[Recovery] previous N turns: ...` turn 重建 context;`progress.jsonl` 写 `chat_session_reset { bot, recovered_turns: N }` event)|
 
 ## V0.4.6 摘要更新
 

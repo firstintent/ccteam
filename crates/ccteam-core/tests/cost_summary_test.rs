@@ -474,6 +474,67 @@ fn t10_multi_model_pricing() {
 }
 
 #[test]
+fn per_vendor_model_specific_pricing() {
+    // Wave 4 D14 — `SpawnCtx::model_id` is now plumbed through to
+    // `translate_thread_event` → `estimate_cost`. This test pins the
+    // *per-model* rates so a regression that quietly falls back to
+    // the vendor's `fallback_model` (the V0.5 behaviour) is caught.
+    //
+    // Each assertion uses 1M of a single token kind to make the
+    // expected dollars trivially readable against the rate sheet.
+    let one_m_input = Usage {
+        input_tokens: 1_000_000,
+        ..Default::default()
+    };
+    let one_m_output = Usage {
+        output_tokens: 1_000_000,
+        ..Default::default()
+    };
+
+    // Claude: model-specific differences must not collapse to fallback.
+    let opus_in = estimate_cost(&one_m_input, Vendor::Claude, "claude-opus-4-7");
+    let haiku_in = estimate_cost(&one_m_input, Vendor::Claude, "claude-haiku-4-5");
+    assert!(
+        opus_in > haiku_in,
+        "opus-4-7 input (${opus_in}) should be 5× haiku-4-5 input (${haiku_in}); \
+         if equal, model_id was dropped and we hit fallback_model",
+    );
+    assert!(
+        (opus_in - 5.0).abs() < 0.01,
+        "opus-4-7 input != $5/1M: ${opus_in}"
+    );
+    assert!(
+        (haiku_in - 1.0).abs() < 0.01,
+        "haiku-4-5 input != $1/1M: ${haiku_in}"
+    );
+
+    // Codex: o3 vs gpt-4o-mini differ by ~13× on input — same drop
+    // test.
+    let o3_in = estimate_cost(&one_m_input, Vendor::Codex, "o3");
+    let mini_in = estimate_cost(&one_m_input, Vendor::Codex, "gpt-4o-mini");
+    assert!(
+        o3_in > mini_in,
+        "o3 input (${o3_in}) > gpt-4o-mini input (${mini_in}); if equal, fallback hit",
+    );
+    assert!((o3_in - 2.0).abs() < 0.01, "o3 input != $2/1M: ${o3_in}");
+    assert!(
+        (mini_in - 0.15).abs() < 0.01,
+        "gpt-4o-mini input != $0.15/1M: ${mini_in}",
+    );
+
+    // Empty model string -> vendor fallback (legacy V0.5 callers).
+    // For Codex the fallback is o3, so empty "" should equal the o3
+    // rate. This is the exact knob Wave 4 D14 removes for production
+    // callers but keeps as a compatibility escape hatch.
+    let codex_empty_out = estimate_cost(&one_m_output, Vendor::Codex, "");
+    let o3_out = estimate_cost(&one_m_output, Vendor::Codex, "o3");
+    assert!(
+        (codex_empty_out - o3_out).abs() < 0.01,
+        "empty model string must fall back to vendor fallback_model (o3)",
+    );
+}
+
+#[test]
 fn t11_budget_cap_triggers_with_transcript_cost() {
     // Drive `compute_cost_summary` end-to-end: one open agent_spawn
     // whose `probe` returns `Terminal { cost_usd: <transcript-derived> }`

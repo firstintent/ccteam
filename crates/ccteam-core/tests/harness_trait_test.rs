@@ -116,6 +116,7 @@ async fn claude_bg_start_thread_parses_backgrounded_marker() {
         cwd: tmp.path().to_path_buf(),
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec!["initial prompt".into()],
+        model_id: None,
     };
 
     let handle = ClaudeBgAdapter::new()
@@ -145,6 +146,7 @@ async fn claude_bg_start_thread_rejects_empty_role() {
         cwd: std::env::temp_dir(),
         project_dir: std::env::temp_dir(),
         extra_args: vec![],
+        model_id: None,
     };
     let err = ClaudeBgAdapter::new()
         .start_thread(&brief, &ctx)
@@ -264,6 +266,7 @@ mod codex_tmux {
             cwd: tmp.path().to_path_buf(),
             project_dir: tmp.path().to_path_buf(),
             extra_args: vec![],
+            model_id: None,
         };
 
         let adapter = CodexExecAdapter::new();
@@ -357,6 +360,7 @@ async fn claude_tui_rejects_empty_role() {
         cwd: std::env::temp_dir(),
         project_dir: std::env::temp_dir(),
         extra_args: vec![],
+        model_id: None,
     };
     let err = ClaudeTuiAdapter::new()
         .start_thread(&brief, &ctx)

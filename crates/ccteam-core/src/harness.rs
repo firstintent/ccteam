@@ -100,11 +100,11 @@ pub enum AgentVendor {
 /// re-deriving from `vendor + adapter name`:
 ///
 /// - `InProc`  — V0.5 `Task` tool / in-process subagent (no adapter,
-///               kept here for orthogonality of [`ThreadHandle`]).
+///   kept here for orthogonality of [`ThreadHandle`]).
 /// - `Bg`      — `claude --bg` background job, `codex exec --json`,
-///               single-turn fresh-context spawn.
+///   single-turn fresh-context spawn.
 /// - `Chat`    — long-running tmux + claude TUI / `codex app-server`
-///               UDS; multi-turn with context reuse (Wave 2 F108).
+///   UDS; multi-turn with context reuse (Wave 2 F108).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ExecutionMode {
@@ -225,6 +225,13 @@ pub struct ThreadErrorEvent {
 
 /// Spawn context for [`HarnessAdapter::start_thread`]. Replaces the
 /// V0.5.x [`SpawnOpts`] on the trait surface.
+///
+/// **Wave 4 D14 fixup** — `model_id` was added so the adapter and the
+/// downstream cost-estimation path (`ccteam_cost::estimate_cost`) can
+/// account against the *actual* model the agent is configured to run,
+/// instead of the vendor's fallback model.  `None` means "use the
+/// vendor's default" (legacy V0.5 callers + tests that don't care about
+/// per-model cost accuracy).
 #[derive(Debug, Clone)]
 pub struct SpawnCtx {
     pub slug: String,
@@ -232,6 +239,12 @@ pub struct SpawnCtx {
     pub cwd: PathBuf,
     pub project_dir: PathBuf,
     pub extra_args: Vec<String>,
+    /// Concrete model id (e.g. `"claude-sonnet-4-5"`, `"gpt-5-codex"`)
+    /// the adapter should use for this thread. `None` = vendor default
+    /// (resolved at adapter level). Plumbed through to `ccteam-cost`
+    /// for per-model pricing instead of falling back to the vendor's
+    /// `fallback_model`.
+    pub model_id: Option<String>,
 }
 
 /// V0.6.0 F107 — canonical [`UnifiedTokenUsage`] lives in `ccteam-cost`

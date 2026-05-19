@@ -425,9 +425,16 @@ where
     current_agent_sessions_inner(events, Some(&liveness))
 }
 
-fn current_agent_sessions_inner(
+/// Closure type alias for the optional liveness probe injected into
+/// `current_agent_sessions_inner`. Carries an explicit lifetime so the
+/// caller's closure does not need to be `'static` (the public
+/// `current_agent_sessions_with_liveness` helper takes a generic `F: Fn`
+/// and reborrows it as a short-lived trait object).
+pub type LivenessProbe<'a> = dyn Fn(Option<&str>) -> crate::claude_job::JobLiveness + 'a;
+
+fn current_agent_sessions_inner<'a>(
     events: &[Value],
-    liveness: Option<&dyn Fn(Option<&str>) -> crate::claude_job::JobLiveness>,
+    liveness: Option<&LivenessProbe<'a>>,
 ) -> Vec<AgentSessionSummary> {
     // `BTreeMap` keyed by session_id keeps a single entry per session
     // (the last terminal `agent_done` wins if for some reason two

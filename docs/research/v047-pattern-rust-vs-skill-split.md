@@ -126,7 +126,7 @@ name: router
 description: 看任务特征选 role,通过 spawn_agent 派出去
 ---
 
-你的工作:读输入,判断该让谁处理,然后调用 `mcp__ccteam__spawn_agent(role=...)`。
+你的工作:读输入,判断该让谁处理,然后调用 `mcp__ccteam__workflow_spawn_agent(role=...)`。
 
 判断规则(按优先级):
 - 任务含"refactor / 跨文件" → architect

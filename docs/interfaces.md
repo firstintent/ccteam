@@ -826,27 +826,41 @@ orchestrator 识别 `state.team == "meta-agent"` 走 `process_meta_project` 分�
 
 由 `ccteam doctor --install-mcp` 写入(M2 release)。`ccteam mcp-serve` 是 binary 子命令,stdio 协议。
 
-### 12.2 暴露的 tool 清单(M2.5 起 9 tool;V0.2.2 F38 起 10 tool;V0.4.0 F65 起 17 tool)
+### 12.2 暴露的 tool 清单(M2.5 起 9 tool;V0.2.2 F38 起 10 tool;V0.4.0 F65 起 17 tool;**V0.6 F111 起 24 tool**,5 group 子前缀分组)
 
-| Tool 名 | 对应 CLI / 行为 | 入参 | 返回 |
-|---|---|---|---|
-| `ccteam__ls` | `ccteam ls --format json` | `{}` | §10.3 ls JSON schema(扩 `team`) |
-| `ccteam__show` | `ccteam show <slug> --format json` | `{slug: string}` | §10.3 show JSON schema |
-| `ccteam__new` | `ccteam new "..."` | `{prompt: string, team?: string}` | `{slug: string, workspace: string}` |
-| `ccteam__peek` | `ccteam peek <slug>` | `{slug: string}` | tmux capture-pane stdout 字符串 |
-| `ccteam__progress` | `ccteam progress <slug>` | `{slug: string, last_n?: number}` | `{events: [...]}` |
-| `ccteam__pause` | 设 `state.user_pause_pending=true` | `{slug: string}` | `{ok: bool, slug: string, user_pause_pending: bool}` |
-| `ccteam__resume` | `ccteam resume <slug>` | `{slug: string}` | `{ok: bool, slug: string}` |
-| `ccteam__send_to_session`(M2.5 新)| 原子写 `<session>/.ccteam/inbox/msg-<ts>-NNN.md`(§3.4.2)| `{session: string, body: string, content_type?: "text"\|"markdown"}` | `{ok: bool, session: string, inbox_file: string}` |
-| `ccteam__inject_decision`(M2.5 新)| 构造 ESCALATE-shape payload(§4.1.1),走 `send_to_session` 落 inbox | `{slug: string, escalate_kind: "revert_to_phase"\|"need_user_input"\|"abort"\|"insufficient_clarification"\|"phase_done_pending", args?: {target_phase?: string, reason?: string}}` | `{ok: bool, slug: string, inbox_file: string}` |
+V0.6 F111 起所有 MCP 工具加 group 子前缀,server name 保持 `ccteam`;**F110 上版的 `ccteam` → `ct` rename 取消**(V0.5 用户肌肉记忆 override 4 字符节省)。Group enum(非 glob,防 typo)走 `CCTEAM_DISABLE_TOOLS` env 关组(eg `CCTEAM_DISABLE_TOOLS=advise,chat`)。Group 列表:`workflow_`(13)、`chat_`(5)、`advise_`(2)、`admin_`(1)、`screenshot`(单成员独立 group,保 V0.5 名)。
+
+| Tool 名 | Group | 对应 CLI / 行为 | 入参 | 返回 |
+|---|---|---|---|---|
+| `ccteam__admin_ls` | `admin_` | `ccteam ls --format json` | `{}` | §10.3 ls JSON schema(扩 `team`) |
+| `ccteam__workflow_show` | `ccteam show <slug> --format json` | `{slug: string}` | §10.3 show JSON schema |
+| `ccteam__workflow_new` | `ccteam new "..."` | `{prompt: string, team?: string}` | `{slug: string, workspace: string}` |
+| `ccteam__workflow_peek` | `ccteam peek <slug>` | `{slug: string}` | tmux capture-pane stdout 字符串 |
+| `ccteam__workflow_progress` | `ccteam progress <slug>` | `{slug: string, last_n?: number}` | `{events: [...]}` |
+| `ccteam__workflow_pause` | 设 `state.user_pause_pending=true` | `{slug: string}` | `{ok: bool, slug: string, user_pause_pending: bool}` |
+| `ccteam__workflow_resume` | `ccteam resume <slug>` | `{slug: string}` | `{ok: bool, slug: string}` |
+| `ccteam__workflow_send_to_session`(M2.5 新)| 原子写 `<session>/.ccteam/inbox/msg-<ts>-NNN.md`(§3.4.2)| `{session: string, body: string, content_type?: "text"\|"markdown"}` | `{ok: bool, session: string, inbox_file: string}` |
+| `ccteam__workflow_inject_decision`(M2.5 新)| 构造 ESCALATE-shape payload(§4.1.1),走 `send_to_session` 落 inbox | `{slug: string, escalate_kind: "revert_to_phase"\|"need_user_input"\|"abort"\|"insufficient_clarification"\|"phase_done_pending", args?: {target_phase?: string, reason?: string}}` | `{ok: bool, slug: string, inbox_file: string}` |
 | `ccteam__screenshot`(V0.2.2 F38)| `tmux capture-pane -e` → `vt100::Parser` → `imageproc` → 写 `<project>/.ccteam/screenshots/<utc>.png` | `{slug: string, lines?: number}`(`lines` 默认 50) | 成功:`{ok: true, slug: string, path: string}`;graceful degrade:`{ok: false, slug: string, reason: string}` |
-| `ccteam__spawn_agent`(V0.4.0 F65)| 在 `<project>/.ccteam/spawn_requests/<role>-<ts>.json` 写 spawn marker;F66 orchestrator 每 tick 消费 | `{slug: string, role: string, overrides?: object}` | `{ok: bool, slug, role, session_id, marker, note}` |
-| `ccteam__stop_agent`(V0.4.0 F65)| 在 `<project>/.ccteam/stop_signal/<role>_<sid>` 写 soft-stop marker;`session_id` 为空 = 停该 role 所有 session(filename 用 `__all__` 占位)| `{slug: string, role: string, session_id?: string}` | `{ok: bool, slug, role, session_id, marker, note}` |
-| `ccteam__observe_agents`(V0.4.0 F65)| 一次性读 `state.json::sessions`(V0.3.1 F49 registry);F66 会扩展 record 加 `role`/`status` | `{slug: string}` | `{slug, agents: [{session_id, role, harness, tmux_session, started_at, pid, status}]}` |
-| `ccteam__signal`(V0.4.0 F65)| `pause`/`resume`/`interrupt` → `<project>/.ccteam/signal/<role>_<sid>` marker(F66 转 SIGSTOP/SIGCONT/SIGINT);`btw` → `actions::send_to_session_with` 走 inbox | `{slug: string, role: string, session_id?: string, signal: "pause"\|"resume"\|"btw"\|"interrupt", message?: string}` | `{ok: bool, slug, role, session_id, signal, marker/inbox_file}` |
-| `ccteam__set_parallelism`(V0.4.0 F65)| 原子合并写 `<project>/.ccteam/workflow_overrides.json`(F66 每 tick reload);1≤N≤50 | `{slug: string, role: string, parallelism: integer}` | `{ok: bool, slug, role, parallelism, overrides_file}` |
-| `ccteam__trigger_gate`(V0.4.0 F65)| 写 `<project>/.ccteam/gate_override/<role>`;`force=true` instruct F66 跳过 input-satisfaction check | `{slug: string, role: string, force?: boolean}` | `{ok: bool, slug, role, force, marker, note}` |
-| `ccteam__get_artifact_summary`(V0.4.0 F65)| stat-only(O(n) on inode,不读 file 内容)遍历 `workflow.yaml` 所有 agent 的 `input`/`output` 目录 | `{slug: string}` | `{slug, artifacts: {<dir>: {count, latest, latest_mtime, size_bytes, exists}}}` |
+| `ccteam__workflow_spawn_agent`(V0.4.0 F65)| 在 `<project>/.ccteam/spawn_requests/<role>-<ts>.json` 写 spawn marker;F66 orchestrator 每 tick 消费 | `{slug: string, role: string, overrides?: object}` | `{ok: bool, slug, role, session_id, marker, note}` |
+| `ccteam__workflow_stop_agent`(V0.4.0 F65)| 在 `<project>/.ccteam/stop_signal/<role>_<sid>` 写 soft-stop marker;`session_id` 为空 = 停该 role 所有 session(filename 用 `__all__` 占位)| `{slug: string, role: string, session_id?: string}` | `{ok: bool, slug, role, session_id, marker, note}` |
+| `ccteam__workflow_observe_agents`(V0.4.0 F65)| 一次性读 `state.json::sessions`(V0.3.1 F49 registry);F66 会扩展 record 加 `role`/`status` | `{slug: string}` | `{slug, agents: [{session_id, role, harness, tmux_session, started_at, pid, status}]}` |
+| `ccteam__workflow_signal`(V0.4.0 F65)| `pause`/`resume`/`interrupt` → `<project>/.ccteam/signal/<role>_<sid>` marker(F66 转 SIGSTOP/SIGCONT/SIGINT);`btw` → `actions::send_to_session_with` 走 inbox | `{slug: string, role: string, session_id?: string, signal: "pause"\|"resume"\|"btw"\|"interrupt", message?: string}` | `{ok: bool, slug, role, session_id, signal, marker/inbox_file}` |
+| `ccteam__workflow_set_parallelism`(V0.4.0 F65)| 原子合并写 `<project>/.ccteam/workflow_overrides.json`(F66 每 tick reload);1≤N≤50 | `{slug: string, role: string, parallelism: integer}` | `{ok: bool, slug, role, parallelism, overrides_file}` |
+| `ccteam__workflow_trigger_gate`(V0.4.0 F65)| 写 `<project>/.ccteam/gate_override/<role>`;`force=true` instruct F66 跳过 input-satisfaction check | `{slug: string, role: string, force?: boolean}` | `{ok: bool, slug, role, force, marker, note}` |
+| `ccteam__workflow_get_artifact_summary`(V0.4.0 F65)| stat-only(O(n) on inode,不读 file 内容)遍历 `workflow.yaml` 所有 agent 的 `input`/`output` 目录 | `{slug: string}` | `{slug, artifacts: {<dir>: {count, latest, latest_mtime, size_bytes, exists}}}` |
+
+注:上表 `workflow_*` 16 行 + `screenshot` 1 行 + `admin_ls` 1 行 = V0.5 既有 18 工具(F65 后 17 + screenshot)迁子前缀后形态。下表为 V0.6 F108 / F112 / F114 / F118 新增 7 工具,分 `chat_` + `advise_` 两 group:
+
+| Tool 名(V0.6 新增) | Group | 行为 | 入参 | 返回 |
+|---|---|---|---|---|
+| `ccteam__chat_send_input`(F108 + F114)| `chat_` | 把 `TurnInput::UserText` 推给 chat-mode bot(per-bot tmux session);adapter 内 `tmux send-keys -l` 直送 + Enter;返回 turn_id(写 turns.jsonl) | `{slug: string, bot: string, body: string, content_type?: "text"\|"markdown"}` | `{ok: bool, slug, bot, turn_id, turns_jsonl: string}` |
+| `ccteam__chat_lifecycle`(F108)| `chat_` | 调 chat lifecycle op:`compact`(→ `/compact` 透传)/ `new`(→ `/new`)/ `clear`(→ `/clear`);SessionStart hook 观察副作用 emit `chat_session_reset` event | `{slug: string, bot: string, op: "compact"\|"new"\|"clear"}` | `{ok: bool, slug, bot, op, emitted_event?: "chat_session_reset"}` |
+| `ccteam__chat_session_reset`(F118)| `chat_` | chat session 失效后从 `<project>/.ccteam/chat/<bot>/turns.jsonl` tail `recover_last_n_turns` 行重建 context;新起 TUI session + submit `[Recovery] previous N turns: ...` turn | `{slug: string, bot: string, n?: integer}` | `{ok: bool, slug, bot, recovered_turns: integer, new_session_id: string}` |
+| `ccteam__chat_list_bots`(F108)| `chat_` | 枚举项目所有 `mode: chat` agent + 对应 tmux session 状态 | `{slug: string}` | `{slug, bots: [{name, vendor, tmux_session, alive: bool, last_turn_at, total_turns}]}` |
+| `ccteam__chat_show_turn_log`(F118)| `chat_` | 读 `turns.jsonl` tail(默认 30 turn) | `{slug: string, bot: string, last_n?: integer}` | `{slug, bot, turns: [{ts, role, content, turn_id}]}` |
+| `ccteam__advise_vote`(F112 §A)| `advise_` | `/ccteam-advise <hard question>` parallel voting(Claude + Codex 并行);合成 vote 输出 | `{question: string, voters?: ["claude","codex"], rounds?: integer}` | `{question, verdicts: [{vendor, verdict, rationale}], consensus, dissent}` |
+| `ccteam__advise_parallel`(F112 §A)| `advise_` | 并行两 vendor 独立答(无 vote 合成);用户面用于 second-opinion 对照阅读 | `{question: string, vendors?: ["claude","codex"]}` | `{question, answers: [{vendor, text, cost_usd}]}` |
 
 V0.2.2 F38 红线:`screenshot` 是**只读**(daemon-independent),与 `peek` 同档,失败永不阻塞主路径(catch_unwind 兜 vt100/imageproc panic;tmux/font/IO 失败一律 `Ok(None)` → `{ok:false, reason}`)。截图字节流仅用于渲染,**不进入** `progress.jsonl` / `state.json` / state machine(CLAUDE.md §三红线"永不解析 tmux 终端输出")。字体走 vendored JetBrains Mono Regular(OFL,见 `LICENSES.md`),`CCTEAM_SCREENSHOT_FONT_TTF` env 可运行时覆盖(eg 切到 CJK / emoji 覆盖字体)。`ccteam doctor --screenshot-smoke <slug>` 跑端到端验证。
 
@@ -854,7 +868,7 @@ V0.2.2 F38 红线:`screenshot` 是**只读**(daemon-independent),与 `peek` 同�
 让 meta-agent 把用户的回复 / 决策推送回项目 session,**adapter 进程内不做
 任何 NL 解析 / LLM 调用**,Symphony 反模式禁止(tech-design §3.1)。
 
-`ccteam__inject_decision` 内部是 `send_to_session` 的 thin wrapper —— 把
+`ccteam__workflow_inject_decision` 内部是 `send_to_session` 的 thin wrapper —— 把
 `escalate_kind` 翻成 markdown payload(显式标记 `**META-AGENT DECISION**`
 + ESCALATE shape),然后走同一条 inbox 路径。
 
@@ -965,12 +979,12 @@ pub fn peek_pane(slug: &str, lines: Option<usize>) -> Result<PaneCapture, CoreEr
 
 | MCP tool(§12.2) | `ccteam-core` 函数 |
 |---|---|
-| `ccteam__ls` | `list_projects()` |
-| `ccteam__show` | `get_state(slug)` |
-| `ccteam__new` | `submit_inbox(spec)` |
-| `ccteam__peek` | `peek_pane(slug, lines)` |
-| `ccteam__progress` | `tail_progress(slug, last_n)` |
-| `ccteam__pause` / `ccteam__resume` | `submit_control(slug, Pause/Resume)` |
+| `ccteam__admin_ls` | `list_projects()` |
+| `ccteam__workflow_show` | `get_state(slug)` |
+| `ccteam__workflow_new` | `submit_inbox(spec)` |
+| `ccteam__workflow_peek` | `peek_pane(slug, lines)` |
+| `ccteam__workflow_progress` | `tail_progress(slug, last_n)` |
+| `ccteam__workflow_pause` / `ccteam__workflow_resume` | `submit_control(slug, Pause/Resume)` |
 
 → M2 实现 `ccteam-mcp` 时是**薄壳**,不复制业务逻辑。
 
