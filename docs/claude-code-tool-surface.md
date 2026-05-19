@@ -180,7 +180,7 @@ MCP server 注册的 tool 在模型看来就是普通工具,工具名形如
 | `claude-mem` | M3 | `mcp__plugin_claude-mem_mcp-search__search` 等 |
 | Playwright | 按需 | `mcp__plugin_playwright_playwright__browser_*` |
 | GitHub | M4+ | 优先 `gh` CLI(见最佳实践 §4.3) |
-| `ccteam-mcp`(自建) | M2 / V0.4.0 | **17 个工具** `mcp__ccteam__admin_ls` / `show` / `new` / `spawn_agent` / `stop_agent` / `observe_agents` / `signal` / `set_parallelism` / `trigger_gate` / `get_artifact_summary` 等(见 `docs/versions/v0-4-0/prd.md §6.3` 完整清单) |
+| `ccteam-mcp`(自建) | M2 / V0.4.0 / V0.6 / V0.6.1 | **26 个工具**(V0.6 F111 24 + V0.6.1 F128 +2)5 group 子前缀:`mcp__ccteam__{workflow_(15), chat_(5), advise_(2), admin_(3), screenshot(1)}*`(见 `interfaces.md §12.2` 完整清单);高频 `workflow_show` / `workflow_spawn_agent` / `chat_send_input` / `advise_vote` / `admin_change_persona` |
 
 #### 1.3.2 验证示例(假设已装 Playwright MCP)
 
@@ -255,7 +255,7 @@ MCP server 注册的 tool 在模型看来就是普通工具,工具名形如
 
 通道 1 让 spawn 的 role agent 在自己的 session 内做工具决策——但用户需要一个**跨 workflow / 跨 session 的对话面**:看进度、调并发、起新 role、解锁 gate、escalation 处置。这是 **meta-agent**(常驻 ccteam-managed claude session,装 `ccteam` MCP server)的职责。
 
-**17 个 mcp__ccteam__\* 工具完整清单见 interfaces.md §12.2**;高频:`spawn_agent` / `stop_agent` / `observe_agents` / `signal` / `set_parallelism` / `trigger_gate` / `get_artifact_summary`。约束:meta-agent 所有操作落 progress.jsonl(`agent_spawn` / `gate_triggered` 等 event);不持有 workflow 状态(`workflow.yaml` 是 SoT)。
+**26 个 mcp__ccteam__\* 工具完整清单见 interfaces.md §12.2**(V0.6 F111 24 + V0.6.1 F128 +2);高频:`workflow_spawn_agent` / `workflow_stop_agent` / `workflow_observe_agents` / `workflow_signal` / `workflow_set_parallelism` / `workflow_trigger_gate` / `workflow_get_artifact_summary` / V0.6 `chat_send_input` / `advise_vote` / V0.6.1 `admin_change_persona` / `admin_add_tool`。约束:meta-agent 所有操作落 progress.jsonl(`agent_spawn` / `gate_triggered` / V0.6.1 `plan_pending` / `plan_decision` / `persona_changed` / `tool_added` 等 event);不持有 workflow 状态(`workflow.yaml` 是 SoT)。
 
 ### 3.1 与通道 1、2 的边界
 
