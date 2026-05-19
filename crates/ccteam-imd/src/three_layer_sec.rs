@@ -166,9 +166,10 @@ mod tests {
 
     #[test]
     fn rate_limit_eventually_triggers() {
+        use crate::rate_limit::DEFAULT_MAX_PER_MINUTE;
         let mut sec = open_sec();
-        // Default cap = 10/min — burst 11.
-        for _ in 0..10 {
+        // Burst (DEFAULT_MAX_PER_MINUTE + 1) — the last one trips.
+        for _ in 0..DEFAULT_MAX_PER_MINUTE {
             assert!(matches!(
                 sec.evaluate("telegram", "u1", "msg"),
                 SecOutcome::Accept { .. }

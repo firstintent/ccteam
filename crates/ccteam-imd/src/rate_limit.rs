@@ -7,8 +7,13 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-/// Default cap matching OMC reply-listener (10 messages per 60 s).
-pub const DEFAULT_MAX_PER_MINUTE: usize = 10;
+/// Default cap. V0.6.1 raised from 10 to 600 (10/sec sustained) — the
+/// original OMC value silently dropped messages during normal personal-bot
+/// usage (a user firing 11 pings in <60s saw nothing, no reply, no error
+/// — see investigation in commit fixing rate-limit message loss). 600/min
+/// preserves the layer as an abuse circuit-breaker against a stuck IM
+/// loop without throttling real humans.
+pub const DEFAULT_MAX_PER_MINUTE: usize = 600;
 
 /// Per-sender sliding-window limiter. `sender_id` identifies the IM
 /// user (e.g. Telegram user_id, Slack user id) — not the bot slug.
