@@ -19,6 +19,9 @@ pub mod assets;
 pub mod dashboard;
 pub mod harness_sse;
 pub mod health;
+// V0.6.1 F139 — `POST /internal/hook/:kind[/:action]` daemon-side hook
+// dispatcher (replaces per-hook `ccteam internal hook ...` cold spawn).
+pub mod internal_hook;
 pub mod pane_snapshot;
 pub mod project;
 pub mod pty_ws;
@@ -45,6 +48,7 @@ pub fn stateful_router() -> Router<AppState> {
         .merge(pane_snapshot::router())
         .merge(screenshot::router())
         .merge(actions::router())
+        .merge(internal_hook::router())
         .merge(api_v1::router())
         .merge(pty_ws::router())
         // V0.5.0 F96 — Agent Teams surface.

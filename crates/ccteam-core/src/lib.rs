@@ -36,6 +36,10 @@ pub mod harness;
 pub mod execution;
 // V0.6.0 F115 — agent handoff doc mechanism (`.ccteam/handoffs/`).
 pub mod handoff;
+// V0.6.1 F139 — embedded `~/.ccteam/hooks/hook.sh` dispatcher + install
+// helper. Routes Claude Code hooks through the long-running daemon's
+// HTTP server for a ~20× latency reduction.
+pub mod hooks_dispatcher;
 pub mod inbox;
 pub mod memory_bridge;
 pub mod meta_agent;
@@ -136,6 +140,8 @@ pub use handoff::{
     WriteHandoffOptions, DEFAULT_INCLUDE_LAST_N as DEFAULT_HANDOFF_INCLUDE_LAST_N,
     HANDOFFS_DIRNAME, HANDOFF_TEMPLATE,
 };
+// V0.6.1 F139 — `~/.ccteam/hooks/hook.sh` dispatcher install entry.
+pub use hooks_dispatcher::{install_hooks, InstallHooksAction, HOOK_DISPATCHER_SH};
 // V0.6.0 F115 — spawn-brief template renderer.
 pub use inbox::{
     inbox_filename, outbox_filename, InboxAttachment, InboxFrontMatter, InboxMessage,

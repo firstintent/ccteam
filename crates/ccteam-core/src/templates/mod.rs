@@ -38,11 +38,20 @@ pub use workflow_templates::{
     TemplateCtx as WorkflowTemplateCtx,
 };
 
-/// Per-project `.claude/settings.json` template. The template uses
-/// `__CCTEAM_BIN__` everywhere a real install would name the absolute
-/// `ccteam` binary path; we substitute the running binary's absolute path
-/// at write time so hook subprocesses don't depend on the user's PATH
-/// (which Claude Code inherits and may not include the ccteam install dir).
+/// Per-project `.claude/settings.json` template.
+///
+/// V0.6.1 F139: hook commands route through a single shell wrapper
+/// (`__CCTEAM_HOOK_SH__`, materialized at `~/.ccteam/hooks/hook.sh` by
+/// `ccteam init` / `ccteam doctor --install-hooks`). The wrapper POSTs
+/// the hook stdin to the long-running ccteam daemon's
+/// `/internal/hook/:kind[/:action]` route so per-hook latency drops from
+/// ~200 ms (cold Rust binary spawn) to ~10 ms (curl round-trip). The
+/// wrapper falls back to `ccteam internal hook ...` when the daemon is
+/// down so the behaviour matches the pre-F139 path. Pre-F139 templates
+/// substituted `__CCTEAM_BIN__` with the absolute `ccteam` binary path;
+/// the `rewrite_legacy_hook_commands` rewriter (`tool_surface.rs`) +
+/// `ccteam doctor --migrate-hook-commands` rewrite older renders into
+/// the new shape.
 pub const PROJECT_SETTINGS_JSON: &str = include_str!("settings.json");
 
 /// V0.5.0 F93b + F94 — per-project `.claude/settings.json` template for
@@ -99,17 +108,25 @@ pub struct EnabledPluginsSetting {
     pub plugin_ids: std::collections::BTreeSet<String>,
 }
 
-/// Render `PROJECT_SETTINGS_JSON` with `__CCTEAM_BIN__` replaced by the
-/// given absolute binary path, `extra_env` merged into the top-level
-/// `env` block, and `enabled` written under `enabledPlugins`. Validates
-/// that the rewritten body is still valid JSON so a path with
-/// shell-hostile characters can't silently corrupt the settings file.
+/// Render `PROJECT_SETTINGS_JSON` with `__CCTEAM_HOOK_SH__` replaced by
+/// the given absolute path to the `ccteam` hook dispatcher
+/// (`~/.ccteam/hooks/hook.sh` in a real install), `extra_env` merged
+/// into the top-level `env` block, and `enabled` written under
+/// `enabledPlugins`. Validates that the rewritten body is still valid
+/// JSON so a path with shell-hostile characters can't silently corrupt
+/// the settings file.
+///
+/// V0.6.1 F139 swap: the V0.4.6 `__CCTEAM_BIN__` placeholder (substituted
+/// with the absolute ccteam binary path) is retired. Hook commands now
+/// invoke a thin shell wrapper that routes through the long-running
+/// daemon's HTTP server (`POST /internal/hook/...`) with a CLI fallback,
+/// shaving ~190 ms per hook firing.
 pub fn render_project_settings(
-    ccteam_bin: &Path,
+    hook_sh: &Path,
     extra_env: &SettingsEnv,
     enabled: &EnabledPluginsSetting,
 ) -> Result<String> {
-    render_settings_template(PROJECT_SETTINGS_JSON, ccteam_bin, extra_env, enabled)
+    render_settings_template(PROJECT_SETTINGS_JSON, hook_sh, extra_env, enabled)
 }
 
 /// V0.5.0 F93b + F94 — same as [`render_project_settings`] but
@@ -117,13 +134,13 @@ pub fn render_project_settings(
 /// `TaskCreated` / `TaskCompleted` hooks). Used by
 /// `ccteam init --mode agent-team`.
 pub fn render_project_settings_agent_team(
-    ccteam_bin: &Path,
+    hook_sh: &Path,
     extra_env: &SettingsEnv,
     enabled: &EnabledPluginsSetting,
 ) -> Result<String> {
     render_settings_template(
         PROJECT_SETTINGS_AGENT_TEAM_JSON,
-        ccteam_bin,
+        hook_sh,
         extra_env,
         enabled,
     )
@@ -134,24 +151,24 @@ pub fn render_project_settings_agent_team(
 /// `&str` so callers pick which placeholder text to substitute into.
 fn render_settings_template(
     template: &str,
-    ccteam_bin: &Path,
+    hook_sh: &Path,
     extra_env: &SettingsEnv,
     enabled: &EnabledPluginsSetting,
 ) -> Result<String> {
-    let bin = ccteam_bin.to_str().ok_or_else(|| {
+    let hook = hook_sh.to_str().ok_or_else(|| {
         anyhow!(
-            "ccteam binary path not valid UTF-8: {}",
-            ccteam_bin.display()
+            "ccteam hook.sh path not valid UTF-8: {}",
+            hook_sh.display()
         )
     })?;
-    if bin.contains('"') || bin.contains('\\') {
+    if hook.contains('"') || hook.contains('\\') {
         return Err(anyhow!(
-            "ccteam binary path contains characters that can't be embedded in settings.json: {bin}"
+            "ccteam hook.sh path contains characters that can't be embedded in settings.json: {hook}"
         ));
     }
-    let body = template.replace("__CCTEAM_BIN__", bin);
+    let body = template.replace("__CCTEAM_HOOK_SH__", hook);
     let mut v: Value = serde_json::from_str(&body)
-        .with_context(|| format!("rendered settings.json is not valid JSON (bin={bin})"))?;
+        .with_context(|| format!("rendered settings.json is not valid JSON (hook_sh={hook})"))?;
     if let Some(env) = v.get_mut("env").and_then(|e| e.as_object_mut()) {
         if let Some(home) = &extra_env.ccteam_home {
             env.insert("CCTEAM_HOME".into(), Value::String(home.clone()));
@@ -210,19 +227,29 @@ fn write_settings_template(
     let dir = project_dir.join(".claude");
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let path = dir.join("settings.json");
-    let bin = current_ccteam_bin()?;
+    let hook_sh = effective_hook_sh_path()?;
     let extra = SettingsEnv {
         ccteam_home: std::env::var("CCTEAM_HOME").ok(),
         ccteam_projects_root: std::env::var("CCTEAM_PROJECTS_ROOT").ok(),
     };
     let body = match kind {
-        ProjectSettingsKind::ArtifactDriven => render_project_settings(&bin, &extra, enabled)?,
+        ProjectSettingsKind::ArtifactDriven => render_project_settings(&hook_sh, &extra, enabled)?,
         ProjectSettingsKind::AgentTeam => {
-            render_project_settings_agent_team(&bin, &extra, enabled)?
+            render_project_settings_agent_team(&hook_sh, &extra, enabled)?
         }
     };
     std::fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
     Ok(())
+}
+
+/// V0.6.1 F139 — resolve the absolute path to `~/.ccteam/hooks/hook.sh`
+/// honouring `CCTEAM_HOME` (test seam + ops override). Used by
+/// [`write_project_settings`] so freshly-rendered settings.json files
+/// point at the dispatcher actually materialized on disk by
+/// `ccteam init` / `ccteam doctor --install-hooks`.
+fn effective_hook_sh_path() -> Result<std::path::PathBuf> {
+    let paths = crate::CcteamPaths::from_env()?;
+    Ok(paths.hooks_script())
 }
 
 /// M2.4 / V0.5.0 F101: ensure `<global_dir>/templates/` exists + write
@@ -254,7 +281,7 @@ mod tests {
     #[test]
     fn template_is_valid_json_with_expected_hook_keys() {
         let body = render_project_settings(
-            Path::new("/usr/local/bin/ccteam"),
+            Path::new("/home/u/.ccteam/hooks/hook.sh"),
             &SettingsEnv::default(),
             &EnabledPluginsSetting::default(),
         )
@@ -279,13 +306,13 @@ mod tests {
     }
 
     #[test]
-    fn template_session_start_uses_absolute_ccteam_path() {
-        // V0.4.6 F89: hook commands now route through the `internal`
-        // subcommand. Old top-level `ccteam hook …` stays accepted at
-        // dispatch time (with stderr WARN), but freshly rendered
-        // settings.json uses the new path.
+    fn template_session_start_routes_through_hook_sh() {
+        // V0.6.1 F139: hook commands now route through the
+        // `~/.ccteam/hooks/hook.sh` wrapper (HTTP-to-daemon + CLI
+        // fallback) instead of cold-spawning `ccteam internal hook ...`
+        // every firing.
         let body = render_project_settings(
-            Path::new("/usr/local/bin/ccteam"),
+            Path::new("/home/u/.ccteam/hooks/hook.sh"),
             &SettingsEnv::default(),
             &EnabledPluginsSetting::default(),
         )
@@ -299,27 +326,31 @@ mod tests {
         assert_eq!(
             cmds,
             vec![
-                "/usr/local/bin/ccteam internal hook load-context",
-                "/usr/local/bin/ccteam internal hook progress-append session_start"
+                "/home/u/.ccteam/hooks/hook.sh load-context",
+                "/home/u/.ccteam/hooks/hook.sh progress-append session_start"
             ],
         );
     }
 
     #[test]
-    fn raw_template_uses_placeholder_not_bare_ccteam() {
+    fn raw_template_uses_hook_sh_placeholder() {
         assert!(
-            PROJECT_SETTINGS_JSON.contains("__CCTEAM_BIN__"),
-            "template should reference __CCTEAM_BIN__ placeholder",
+            PROJECT_SETTINGS_JSON.contains("__CCTEAM_HOOK_SH__"),
+            "template should reference __CCTEAM_HOOK_SH__ placeholder (V0.6.1 F139)",
         );
-        // V0.4.6 F89: template wires the new `internal hook` path. The
-        // old bare `ccteam hook` form must not survive the migration.
+        // V0.4.6 F89 / V0.6.1 F139: legacy bare `ccteam hook` forms
+        // must not survive the migration.
         assert!(
             !PROJECT_SETTINGS_JSON.contains("\"ccteam hook"),
-            "template should not embed bare `ccteam hook` — see render_project_settings",
+            "template should not embed bare `ccteam hook`",
         );
         assert!(
             !PROJECT_SETTINGS_JSON.contains(" ccteam hook"),
-            "template must use new `ccteam internal hook` form (V0.4.6 F89)",
+            "template must not embed bare `ccteam hook` form",
+        );
+        assert!(
+            !PROJECT_SETTINGS_JSON.contains("__CCTEAM_BIN__"),
+            "V0.4.6 `__CCTEAM_BIN__` placeholder was retired by F139",
         );
         // F44 sweep guard: F39's `{{CCT_BIN}}` placeholder must not return.
         assert!(
@@ -331,7 +362,7 @@ mod tests {
     #[test]
     fn render_project_settings_rejects_quoted_path() {
         let err = render_project_settings(
-            Path::new("/tmp/has\"quote/ccteam"),
+            Path::new("/tmp/has\"quote/hook.sh"),
             &SettingsEnv::default(),
             &EnabledPluginsSetting::default(),
         )
@@ -346,7 +377,7 @@ mod tests {
             ccteam_projects_root: Some("/tmp/sandbox/projects".into()),
         };
         let body = render_project_settings(
-            Path::new("/usr/local/bin/ccteam"),
+            Path::new("/home/u/.ccteam/hooks/hook.sh"),
             &env,
             &EnabledPluginsSetting::default(),
         )
@@ -361,7 +392,7 @@ mod tests {
     #[test]
     fn render_project_settings_omits_env_when_default() {
         let body = render_project_settings(
-            Path::new("/usr/local/bin/ccteam"),
+            Path::new("/home/u/.ccteam/hooks/hook.sh"),
             &SettingsEnv::default(),
             &EnabledPluginsSetting::default(),
         )
@@ -373,7 +404,7 @@ mod tests {
     #[test]
     fn render_project_settings_omits_enabled_plugins_when_empty() {
         let body = render_project_settings(
-            Path::new("/usr/local/bin/ccteam"),
+            Path::new("/home/u/.ccteam/hooks/hook.sh"),
             &SettingsEnv::default(),
             &EnabledPluginsSetting::default(),
         )
@@ -392,7 +423,7 @@ mod tests {
             .plugin_ids
             .insert("feature-dev@claude-plugins-official".into());
         let body = render_project_settings(
-            Path::new("/usr/local/bin/ccteam"),
+            Path::new("/home/u/.ccteam/hooks/hook.sh"),
             &SettingsEnv::default(),
             &enabled,
         )

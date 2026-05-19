@@ -83,6 +83,24 @@ impl CcteamPaths {
         self.root.join("templates")
     }
 
+    /// `~/.ccteam/hooks/` — V0.6.1 F139 directory holding the
+    /// `hook.sh` dispatcher (the single shell wrapper every Claude Code
+    /// hook command in a ccteam project invokes). Materialized by
+    /// `ccteam init` and `ccteam doctor --install-hooks`.
+    pub fn hooks_dir(&self) -> PathBuf {
+        self.root.join("hooks")
+    }
+
+    /// `~/.ccteam/hooks/hook.sh` — V0.6.1 F139 dispatcher script the
+    /// project-level `.claude/settings.json` hook commands point at. The
+    /// script POSTs the Claude Code hook stdin to the long-running
+    /// daemon's `/internal/hook/:kind[/:action]` route (fast path) and
+    /// falls back to `ccteam internal hook ...` when the daemon is
+    /// unreachable. ~20× faster than a per-hook Rust binary spawn.
+    pub fn hooks_script(&self) -> PathBuf {
+        self.hooks_dir().join("hook.sh")
+    }
+
     /// Resolve a slug to its on-disk project directory.
     ///
     /// V0.4.4 F77: lazily consults `~/.ccteam/config.yaml::projects[]`
