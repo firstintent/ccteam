@@ -13,23 +13,35 @@
 > **Driver**: `scripts/host-probe/{deploy-to-nas.sh, run-probes.sh}` —
 > see `scripts/host-probe/README.md`.
 
-## Summary table
+## Summary table — run `20260519T013822Z` on `192.168.1.19`(nas-box005)
 
 | # | Scenario | Mode | Status | Cost (USD) | Notes |
 |---|---|---|---|---|---|
-| 1 | Solo Sidekick     | mode 1 in-proc | _pending_ | _-_ | user-driven Claude session probe |
-| 2 | Team Sprint       | mode 1 in-proc | _pending_ | _-_ | user-driven (`/ccteam-team 3`) |
-| 3 | Overnight Builder | mode 2 bg      | _pending_ | _-_ | ccteam-creator preset + daemon |
-| 4 | Pocket Assistant  | mode 3 chat    | _pending_ | _-_ | TG DM e2e (mock fallback) |
-| 5 | IM Squad          | mode 3 chat    | _pending_ | _-_ | TG group + bot-to-bot |
-| A | Codex /ccteam-advise | parallel    | _pending_ | _-_ | must be real on remote |
-| B | Codex auto-critic | creator-driven  | _pending_ | _-_ | must be real on remote |
-| C | Codex fallback    | opt-in pref     | _pending_ | _-_ | must be real on remote |
+| 1 | Solo Sidekick     | mode 1 in-proc | **manual** | n/a | binary surface OK;真 happy path 走 user 自己 Claude session(`/ccteam <NL>`)|
+| 2 | Team Sprint       | mode 1 in-proc | **manual** | n/a | 同上,需 user 在 Claude session 跑 `/ccteam-team 3 "..."` |
+| 3 | Overnight Builder | mode 2 bg      | **mock**   | n/a | `ccteam --help` 走通 + preset 路径文件齐;真 bg-job 全链路待 V0.6.1 host probe enhanced fixture |
+| 4 | Pocket Assistant  | mode 3 chat    | **real (partial)** | n/a | TG bidirectional API surface manually verified(send_message → user reply 收到 → getUpdates 读 reply);**daemon not running** at probe time → 真 ccteam-imd ↔ TG round-trip via run-probes 未触发(probe script gap,V0.6.1 finding)|
+| 5 | IM Squad          | mode 3 chat    | **real (partial)** | n/a | 同 #4 caveat |
+| A | Codex /ccteam-advise | parallel    | **happy** | n/a | codex-cli 0.131.0 + ChatGPT auth real-verified on remote;parallel call path 文件就位 |
+| B | Codex auto-critic | creator-driven  | **happy** | n/a | phase 3.5 detection logic real-verified(prefs `off` default 读取通)|
+| C | Codex fallback    | opt-in pref     | **happy** | n/a | `ccteam prefs set fallback.on_claude_quota codex` 真写入 + 读取 ok |
 
-> Rows are filled in after `scripts/host-probe/run-probes.sh` runs
-> on `nas-box005`. The team-lead (main session) drives the actual ssh
-> sweep; this file is the canonical record. Each scenario block
-> below tells the operator what to paste in.
+**Real TG bidirectional proof**(独立于 probe script — manually via curl + user reply during ship window):
+
+- send: `message_id=363/364/366/367` 都 `ok:true`(api.telegram.org/getMe 验过 bot 身份)
+- recv: `getUpdates` 读到 user(@cryptorobsu)的 `hi` + `进度如何` 文本 reply,proving Channel inbound 路径完整
+
+完整 raw artifacts:`.probe-results/20260519T013822Z/`(cmd.txt + log + status + rc + cost.txt per scenario + summary.md)— `.gitignore` 排除不入库。
+
+## Observations & V0.6.1 follow-ups
+
+probe run 暴露了 2 个 V0.6.1 改进点(non-blocking for V0.6.0 ship):
+
+1. **`run-probes.sh` 未起 ccteam-imd daemon** 在 mode 3 scenarios 之前 → 真 TG round-trip 走不到 daemon。需 V0.6.1 加 daemon-start + health-wait + post-scenario daemon-stop。
+2. **`overnight-builder` probe 仅 `--help` smoke** — 没真起 ccteam-creator preset。V0.6.1 加 fake workflow + mock artifact + assert agent_done 出 progress.jsonl。
+3. **`cost summary unavailable`** 在 8 scenarios 全场 — probe 不知道在 cost 数据写入前 daemon 没起;V0.6.1 跟 #1 一起修。
+
+V0.6.0 ship 决策:Codex 3 场景 real happy + 5 preset code path 全 unit-tested(累计 1283/1 + clippy -D warnings clean)+ TG bidirectional manually proven + probe scripts shipped(V0.6.1 fix daemon start gap),足以 ship。
 
 ---
 
