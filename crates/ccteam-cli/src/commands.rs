@@ -2833,7 +2833,8 @@ fn doctor_today() -> chrono::NaiveDate {
 /// The `CCTEAM_TEST_NOW` env override pins "today" so tests can stamp
 /// the three states deterministically.
 fn render_check_pricing_version_report() -> String {
-    let mut out = String::from("ccteam doctor --check-pricing-version (V0.5.0 F92 / V0.6.1 F121)\n\n");
+    let mut out =
+        String::from("ccteam doctor --check-pricing-version (V0.5.0 F92 / V0.6.1 F121)\n\n");
     let today = doctor_today();
     let mut worst = PricingStaleness::Ok;
     for (label, vendor) in [
@@ -3041,7 +3042,11 @@ pub fn parse_codex_semver(line: &str) -> Option<(u32, u32, u32)> {
                 if let (Ok(maj), Ok(min), Ok(patch)) = (
                     parts[0].parse::<u32>(),
                     parts[1].parse::<u32>(),
-                    parts[2].split(|c: char| !c.is_ascii_digit()).next().unwrap_or("0").parse::<u32>(),
+                    parts[2]
+                        .split(|c: char| !c.is_ascii_digit())
+                        .next()
+                        .unwrap_or("0")
+                        .parse::<u32>(),
                 ) {
                     return Some((maj, min, patch));
                 }
@@ -3736,9 +3741,7 @@ pub fn run_prefs_get(paths: &CcteamPaths, key: &str) -> Result<String> {
             ccteam_core::preferences::OnClaudeQuota::Off => "off".to_string(),
             ccteam_core::preferences::OnClaudeQuota::Codex => "codex".to_string(),
         }),
-        "fallback.codex.enabled_for_roles" => {
-            Ok(prefs.fallback.codex.enabled_for_roles.join(","))
-        }
+        "fallback.codex.enabled_for_roles" => Ok(prefs.fallback.codex.enabled_for_roles.join(",")),
         other => Err(anyhow::anyhow!(
             "unknown preference key: {other}\n\
              supported keys:\n  - fallback.on_claude_quota  (off|codex)\n  \
@@ -3785,6 +3788,84 @@ pub fn run_prefs_set(paths: &CcteamPaths, key: &str, value: &str) -> Result<Stri
     }
     ccteam_core::preferences::save(&paths.root, &prefs)?;
     Ok(format!("set {key} = {value}"))
+}
+
+// -------------------------------------------------------------------------
+// V0.6.1 F128 — `ccteam admin change-persona` / `ccteam admin add-tool`.
+//
+// Both subcommands edit `<project>/.claude/agents/<bot>.md` and emit a
+// `persona_changed` / `tool_added` event to the project's
+// `progress.jsonl`. The same code path backs the MCP
+// `ccteam__admin_change_persona` / `ccteam__admin_add_tool` tools (see
+// `mcp_admin_tools.rs`).
+// -------------------------------------------------------------------------
+
+/// V0.6.1 F128 — replace `<project>/.claude/agents/<bot>.md` with
+/// `new_persona_md` and emit a `persona_changed` event. Returns the
+/// stdout body the CLI prints on success (pretty JSON).
+pub fn run_admin_change_persona(
+    paths: &CcteamPaths,
+    slug: &str,
+    bot: &str,
+    new_persona_md: &str,
+) -> Result<String> {
+    let project_dir = paths.project_dir(slug);
+    if !project_dir.exists() {
+        return Err(anyhow::anyhow!(
+            "no project named `{slug}` (looked under {})",
+            project_dir.display()
+        ));
+    }
+    let written = ccteam_core::admin_actions::change_persona(&project_dir, bot, new_persona_md)?;
+    let bytes = new_persona_md.len();
+    let event = ccteam_core::admin_actions::build_persona_changed_event(bot, &written, bytes);
+    ccteam_core::progress::append_event(&paths.progress_jsonl(slug), &event)?;
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "ok": true,
+        "slug": slug,
+        "bot": bot,
+        "path": written.display().to_string(),
+        "bytes_written": bytes,
+        "event": event,
+    }))?)
+}
+
+/// V0.6.1 F128 — append `tool_descriptor` to the bot's
+/// `.claude/agents/<bot>.md` frontmatter `tools:` CSV and emit a
+/// `tool_added` event. Idempotent — re-adding sets
+/// `already_present: true`.
+pub fn run_admin_add_tool(
+    paths: &CcteamPaths,
+    slug: &str,
+    bot: &str,
+    tool_descriptor: &str,
+) -> Result<String> {
+    let project_dir = paths.project_dir(slug);
+    if !project_dir.exists() {
+        return Err(anyhow::anyhow!(
+            "no project named `{slug}` (looked under {})",
+            project_dir.display()
+        ));
+    }
+    let res = ccteam_core::admin_actions::add_tool(&project_dir, bot, tool_descriptor)?;
+    let event = ccteam_core::admin_actions::build_tool_added_event(
+        bot,
+        &res.path,
+        &res.added,
+        &res.new_tools_csv,
+        res.already_present,
+    );
+    ccteam_core::progress::append_event(&paths.progress_jsonl(slug), &event)?;
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "ok": true,
+        "slug": slug,
+        "bot": bot,
+        "path": res.path.display().to_string(),
+        "tool": res.added,
+        "tools_csv": res.new_tools_csv,
+        "already_present": res.already_present,
+        "event": event,
+    }))?)
 }
 
 /// V0.4.6 F81 — `ccteam remove <slug>` implementation.

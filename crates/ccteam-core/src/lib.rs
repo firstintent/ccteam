@@ -9,6 +9,10 @@
 //! shape (F63) and artifact-trigger watcher (F64).
 
 pub mod actions;
+// V0.6.1 F128 — file-mutation helpers for `/ccteam-control
+// change-persona` + `add-tool` MCP admin tools. Pure IO over a chat
+// bot's `.claude/agents/<bot>.md` definition file.
+pub mod admin_actions;
 // V0.6.0 Wave 2 F114 — scientist nickname pool used by ccteam-creator
 // when minting bot handles for new chat workflows.
 pub mod agent_naming;
@@ -114,8 +118,8 @@ pub use harness::{
     parse_cc_state_json, parse_pid_from_state, sigkill_pid, state_json_path, AgentSpecBrief,
     AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, HarnessSnapshot, SessionHandle,
     SpawnCtx, SpawnOpts, SubagentState, ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadItem,
-    ThreadItemDetails, TurnId, TurnInput, CLAUDE_BIN_ENV, CLAUDE_JOBS_DIR_ENV,
-    CODEX_STATUS_MARKER, CODEX_STATUS_TAIL_LINES, DEFAULT_CLAUDE_SID,
+    ThreadItemDetails, TurnId, TurnInput, CLAUDE_BIN_ENV, CLAUDE_JOBS_DIR_ENV, CODEX_STATUS_MARKER,
+    CODEX_STATUS_TAIL_LINES, DEFAULT_CLAUDE_SID,
 };
 // `UnifiedTokenUsage` re-exported below via `ccteam_cost::{..., UnifiedTokenUsage as Usage}`
 // — the canonical home is the ccteam-cost crate (V0.6.0 F107).
@@ -124,12 +128,11 @@ pub use harness::{
 pub use execution::{ClaudeBgAdapter, ClaudeTuiAdapter, CodexExecAdapter};
 // V0.6.0 F115 — handoff doc mechanism.
 pub use handoff::{
-    handoff_path, handoffs_dir, list_handoffs, read_concat as read_handoffs_concat,
-    write_handoff, WriteHandoffOptions, DEFAULT_INCLUDE_LAST_N as DEFAULT_HANDOFF_INCLUDE_LAST_N,
+    handoff_path, handoffs_dir, list_handoffs, read_concat as read_handoffs_concat, write_handoff,
+    WriteHandoffOptions, DEFAULT_INCLUDE_LAST_N as DEFAULT_HANDOFF_INCLUDE_LAST_N,
     HANDOFFS_DIRNAME, HANDOFF_TEMPLATE,
 };
 // V0.6.0 F115 — spawn-brief template renderer.
-pub use spawn_brief::{render_spawn_brief, SpawnContext as SpawnBriefContext};
 pub use inbox::{
     inbox_filename, outbox_filename, InboxAttachment, InboxFrontMatter, InboxMessage,
     OutboxEventKind, OutboxFrontMatter, OutboxMessage, OutboxPriority, SessionMailbox,
@@ -162,14 +165,17 @@ pub use pending_inject::{
 pub use plugin_resolution::{
     lookup_plugin_agent, plugins_to_enable, PluginAgent, KNOWN_PLUGIN_AGENTS,
 };
+pub use spawn_brief::{render_spawn_brief, SpawnContext as SpawnBriefContext};
 // V0.6.0 Wave 1 — pricing moved to `ccteam-cost` with dual-vendor
 // (Anthropic + OpenAI) tables. The V0.5.x `Usage` type was renamed
 // `UnifiedTokenUsage`; alias here so V0.5 callers reading
 // `ccteam_core::Usage` keep compiling.
+pub use agent_naming::{pick_unused_bot_name, SCIENTIST_NAMES};
 pub use ccteam_cost::{
     estimate_cost, pricing_schema_version, pricing_schema_version_for, ModelPrices,
     UnifiedTokenUsage as Usage, Vendor,
 };
+pub use mode_inferrer::{infer_mode, CreatorMode, InferenceResult, Intent, Presence, Timeline};
 pub use progress::{
     current_agent_sessions, escalation_count, workflow_cost_total, AgentSessionStatus,
     AgentSessionSummary,
@@ -226,8 +232,6 @@ pub use templates::{
     WorkflowTemplateRenderError, CCTEAM_MCP_SERVER_KEY, HELPER_TEMPLATES,
     PROJECT_SETTINGS_AGENT_TEAM_JSON, PROJECT_SETTINGS_JSON,
 };
-pub use agent_naming::{pick_unused_bot_name, SCIENTIST_NAMES};
-pub use mode_inferrer::{infer_mode, CreatorMode, InferenceResult, Intent, Presence, Timeline};
 pub use tmux::{
     capture_pane_tail, capture_pane_tail_from_session, capture_pane_with_ansi,
     capture_pane_with_ansi_from_session, pid_is_alive, query_pane_dims,

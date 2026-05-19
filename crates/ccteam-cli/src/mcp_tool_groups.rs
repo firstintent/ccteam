@@ -8,14 +8,17 @@
 //! clean env-driven way to disable categories the user doesn't care
 //! about (e.g. `CCTEAM_DISABLE_TOOLS=chat,screenshot`).
 //!
-//! Wave 1 model:
+//! V0.6.0 Wave 1 model:
 //! - 1 admin tool (`ls`)
 //! - 15 workflow tools (V0.5 9 + V0.4 F65 7, minus screenshot)
 //! - 1 screenshot tool
 //! - 5 chat stubs (Wave 2 F108)
 //! - 2 advise stubs (Wave 3 F112)
 //!
-//! Total: 24 tools registered Wave 1. Disabling a group hides every
+//! V0.6.1 F128 grows admin group 1 → 3 (`change_persona` +
+//! `add_tool` real implementations).
+//!
+//! Total: 26 tools registered (V0.6.1). Disabling a group hides every
 //! tool in that group from `tools/list`; `tools/call` against a
 //! disabled tool falls through to the standard "unknown tool" error.
 
@@ -218,10 +221,7 @@ mod tests {
         disabled.insert(ToolGroup::Chat);
         disabled.insert(ToolGroup::Screenshot);
         let kept = filter_by_disabled(tools, &disabled);
-        let names: Vec<&str> = kept
-            .iter()
-            .map(|t| t["name"].as_str().unwrap())
-            .collect();
+        let names: Vec<&str> = kept.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert_eq!(
             names,
             vec![
@@ -253,10 +253,7 @@ mod tests {
         ] {
             assert_eq!(ToolGroup::parse(g.as_str()), Some(g));
             // Case insensitive.
-            assert_eq!(
-                ToolGroup::parse(&g.as_str().to_uppercase()),
-                Some(g)
-            );
+            assert_eq!(ToolGroup::parse(&g.as_str().to_uppercase()), Some(g));
         }
     }
 }

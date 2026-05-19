@@ -59,8 +59,49 @@ ccteam internal spawn <slug> <role>  # was: ccteam spawn <slug> <role>
 | Resume project                   | `mcp__ccteam__workflow_resume`            | `ccteam internal resume <slug>` |
 | Send NL to a session inbox       | `mcp__ccteam__workflow_send_to_session`   | `ccteam internal send <slug> "<body>"` (or write `.ccteam/inbox/msg-<ts>-NNN.md` directly) |
 | Inject a structured decision     | `mcp__ccteam__workflow_inject_decision`   | (compose body manually + send_to_session) |
+| **Change bot persona** (V0.6.1 F128)  | `mcp__ccteam__admin_change_persona` | `ccteam admin change-persona <slug> <bot> -` (full markdown via stdin) |
+| **Add tool to a bot** (V0.6.1 F128)   | `mcp__ccteam__admin_add_tool`     | `ccteam admin add-tool <slug> <bot> <ToolName>` |
 | Health checks                    | (Bash only)                      | `ccteam doctor --tool-surface` |
 | Install meta-agent               | (Bash only)                      | `ccteam doctor --install-meta-agent` |
+
+## V0.6.1 F128 — `change-persona` and `add-tool` subcommands
+
+Two new operations land in V0.6.1 to back the `/ccteam-control` slash
+forms documented in `docs/user-manual.md §2.4`:
+
+```
+/ccteam-control change-persona helper-bot "改成英文 + 更幽默"
+/ccteam-control add-tool helper-bot "scan ~/Downloads for new PDFs and summarize"
+```
+
+**Translation rules (skill-side — no LLM call inside the daemon):**
+
+1. **`change-persona <bot> "<NL description>"`** — read the existing
+   `<project>/.claude/agents/<bot>.md` first (use `Read` tool), merge
+   the user's NL request into the persona body (keep the existing
+   YAML frontmatter intact unless the request explicitly changes
+   `name` / `description` / `tools` / `model`), then call:
+   - MCP: `mcp__ccteam__admin_change_persona({slug, bot, new_persona_md: "<full file content>"})`
+   - Bash: `ccteam admin change-persona <slug> <bot> -` and pipe the
+     full markdown on stdin.
+2. **`add-tool <bot> "<NL capability>"`** — translate the NL into a
+   Claude Code tool name (e.g. `Read`, `WebFetch`, `Bash`) — if it
+   maps cleanly to one, call:
+   - MCP: `mcp__ccteam__admin_add_tool({slug, bot, tool_descriptor: "WebFetch"})`
+   - Bash: `ccteam admin add-tool <slug> <bot> WebFetch`
+
+   For abilities that need more than a tool grant (e.g. "scan
+   ~/Downloads for new PDFs"), grant `Bash` / `Read` / `Glob` as the
+   minimum tool set and then **also** call `change-persona` to add a
+   short body instruction describing the new capability. Don't just
+   append free-form text into the `tools:` list — Claude Code reads
+   it as a CSV of tool names, not prose.
+
+**On success** both tools emit a `progress.jsonl` event
+(`persona_changed` / `tool_added`) the web / meta-agent surfaces; the
+bot's next turn picks up the new persona or tool list automatically
+(Claude Code re-reads `.claude/agents/<bot>.md` on each `Task` /
+session boundary).
 
 When the MCP server is registered, `ccteam doctor --install-mcp` (run
 once) wires `mcpServers.ccteam` into `~/.claude.json`. Existing Claude
