@@ -43,6 +43,10 @@ pub mod mode_inferrer;
 pub mod orchestrator;
 pub mod paths;
 pub mod pending_inject;
+// V0.6.1 F98 — plan-approval ↔ outbox engine. Pure state machine over
+// `<project>/.ccteam/plans/*.md` + IM decision strings; emits
+// `plan_pending` / `plan_decision` / `plan_timeout` to progress.jsonl.
+pub mod plan_approval;
 // V0.6.0 Wave 3 F112 §C — `~/.ccteam/preferences.toml` user-opt-in
 // fallback knobs (vendor swap on Claude quota exceed).
 pub mod preferences;

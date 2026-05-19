@@ -51,6 +51,7 @@ fn build_spec(name: &str, watchers: &[(&str, PathBuf)]) -> WorkflowSpec {
                 interval: None,
                 timeout: None,
                 on_timeout: None,
+                plan_approval: None,
             },
         );
     }

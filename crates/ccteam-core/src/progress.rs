@@ -296,6 +296,84 @@ pub fn build_chat_hop_escalate_event(role: &str, hop_count: u32, last_bot: &str)
     })
 }
 
+// ---------------- V0.6.1 F98 plan-approval event kinds ----------------
+
+/// `plan_pending` — agent wrote a plan markdown to
+/// `<project>/.ccteam/plans/<agent>-*.md` and the orchestrator has
+/// noticed it. Payload:
+/// `{plan_id, agent, plan_path, outbox, timeout_min, ts}`.
+pub const PLAN_PENDING: &str = "plan_pending";
+
+/// `plan_decision` — user replied `APPROVE` / `REJECT` / `EDIT
+/// <comment>` via the configured IM outbox; the engine has translated
+/// it to a decision file the agent reads on resume. Payload:
+/// `{plan_id, agent, decision, comment?, ts}`.
+pub const PLAN_DECISION: &str = "plan_decision";
+
+/// `plan_timeout` — `timeout_min` elapsed without a user reply.
+/// Payload: `{plan_id, agent, on_timeout, ts}`. The engine may emit a
+/// follow-up `plan_decision` synthesized from `on_timeout: auto-approve
+/// | reject`, or leave the plan paused when `on_timeout: escalate`.
+pub const PLAN_TIMEOUT: &str = "plan_timeout";
+
+/// True if `kind` is one of the F98 plan-approval event names.
+pub fn is_plan_event(kind: &str) -> bool {
+    matches!(kind, PLAN_PENDING | PLAN_DECISION | PLAN_TIMEOUT)
+}
+
+/// Build a `plan_pending` event JSON.
+pub fn build_plan_pending_event(
+    plan_id: &str,
+    agent: &str,
+    plan_path: &str,
+    outbox: &str,
+    timeout_min: u32,
+) -> Value {
+    serde_json::json!({
+        "event": PLAN_PENDING,
+        "plan_id": plan_id,
+        "agent": agent,
+        "plan_path": plan_path,
+        "outbox": outbox,
+        "timeout_min": timeout_min,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
+/// Build a `plan_decision` event JSON. `comment` is the optional
+/// free-text trailer parsed from `EDIT <comment>` or `REJECT <reason>`.
+pub fn build_plan_decision_event(
+    plan_id: &str,
+    agent: &str,
+    decision: &str,
+    comment: Option<&str>,
+) -> Value {
+    let mut v = serde_json::json!({
+        "event": PLAN_DECISION,
+        "plan_id": plan_id,
+        "agent": agent,
+        "decision": decision,
+        "ts": Utc::now().to_rfc3339(),
+    });
+    if let Some(c) = comment {
+        v.as_object_mut()
+            .unwrap()
+            .insert("comment".to_string(), Value::String(c.to_string()));
+    }
+    v
+}
+
+/// Build a `plan_timeout` event JSON.
+pub fn build_plan_timeout_event(plan_id: &str, agent: &str, on_timeout: &str) -> Value {
+    serde_json::json!({
+        "event": PLAN_TIMEOUT,
+        "plan_id": plan_id,
+        "agent": agent,
+        "on_timeout": on_timeout,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
 /// True if `kind` is one of the F108/F118 chat-mode event names.
 pub fn is_chat_event(kind: &str) -> bool {
     matches!(

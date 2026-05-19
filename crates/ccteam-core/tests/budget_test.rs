@@ -73,6 +73,7 @@ fn manual_spec_with_budget(role: &str, budget: Option<BudgetSpec>) -> WorkflowSp
             interval: None,
             timeout: None,
             on_timeout: None,
+            plan_approval: None,
         },
     );
     WorkflowSpec {
