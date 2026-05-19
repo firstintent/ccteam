@@ -19,10 +19,10 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use crate::nl_admin;
+use crate::nl_admin::{self, AdminExecutor, AdminReply};
 use crate::router::{self, HandleMap, Route};
 use crate::three_layer_sec::{SecOutcome, ThreeLayerSec};
-use crate::transport::ChannelMessage;
+use crate::transport::{Channel, ChannelMessage, SendMessage};
 
 /// One mailbox envelope dropped into
 /// `<project>/.ccteam/chat/<bot>/inbox/msg-<ts>-<seq>.md`.
@@ -176,8 +176,7 @@ pub async fn process_inbound(
             payload: stripped,
         } => {
             let dir = mailbox.inbox_dir(&slug, &role)?;
-            fs::create_dir_all(&dir)
-                .with_context(|| format!("mkdir -p {}", dir.display()))?;
+            fs::create_dir_all(&dir).with_context(|| format!("mkdir -p {}", dir.display()))?;
             let ts = Utc::now().format("%Y%m%dT%H%M%S").to_string();
             let path = dir.join(format!("msg-{ts}-{seq:03}.md"));
             let env = InboxEnvelope {
@@ -195,6 +194,55 @@ pub async fn process_inbound(
             Ok(InboundOutcome::DroppedToBot { slug, role, path })
         }
     }
+}
+
+/// V0.6.1 F129 — admin-aware wrapper around [`process_inbound`].
+///
+/// When the inbound router classifies a message as `@ccteam` admin
+/// traffic, this helper:
+///
+/// 1. Parses the NL via [`nl_admin::parse`].
+/// 2. Runs the parsed command through `executor` (writes signal
+///    files / pulls registry / queues confirm prompts).
+/// 3. Sends the reply text back through `channel` to
+///    `msg.reply_target` so the user sees the outcome in the same
+///    chat.
+///
+/// Returns the executor's [`AdminReply`] alongside the original
+/// [`InboundOutcome`] so callers (tests + the daemon) can assert
+/// side-effects without re-parsing the reply string.
+///
+/// Non-admin outcomes (bot routing, drops, sec rejections) pass
+/// through with `admin_reply = None`. Admin replies do **not** bump
+/// the hop counter — the F129 acceptance spec calls out that
+/// meta-agent admin paths must not consume the bot-to-bot hop
+/// budget, and this wrapper never re-routes through the bot mailbox.
+#[allow(clippy::too_many_arguments)]
+pub async fn process_inbound_admin_aware(
+    msg: &ChannelMessage,
+    sec: &Arc<Mutex<ThreeLayerSec>>,
+    handles: &HandleMap,
+    mailbox: &dyn MailboxResolver,
+    executor: &AdminExecutor,
+    channel: &dyn Channel,
+    hop: u8,
+    seq: u64,
+) -> Result<(InboundOutcome, Option<AdminReply>)> {
+    let outcome = process_inbound(msg, sec, handles, mailbox, hop, seq).await?;
+    let admin_reply = match &outcome {
+        InboundOutcome::Admin { verb_and_args } => {
+            let cmd = nl_admin::parse(verb_and_args);
+            let reply = executor.execute(cmd, &msg.reply_target).await;
+            let out = SendMessage::new(reply.message.clone(), msg.reply_target.clone())
+                .in_thread(msg.thread_ts.clone());
+            if let Err(err) = channel.send(&out).await {
+                tracing::warn!(error = %err, "admin reply send failed");
+            }
+            Some(reply)
+        }
+        _ => None,
+    };
+    Ok((outcome, admin_reply))
 }
 
 /// Render a human-readable + machine-parseable Markdown envelope.
@@ -318,8 +366,12 @@ mod tests {
         let mut handles = HandleMap::new();
         handles.insert("lead", "dev-foo", "lead");
         let m = sample_msg("telegram", "@lead one");
-        let _ = process_inbound(&m, &sec, &handles, &mailbox, 0, 1).await.unwrap();
-        let res = process_inbound(&m, &sec, &handles, &mailbox, 0, 2).await.unwrap();
+        let _ = process_inbound(&m, &sec, &handles, &mailbox, 0, 1)
+            .await
+            .unwrap();
+        let res = process_inbound(&m, &sec, &handles, &mailbox, 0, 2)
+            .await
+            .unwrap();
         match res {
             InboundOutcome::Rejected { layer } => assert_eq!(layer, "rate_limit"),
             other => panic!("got {other:?}"),

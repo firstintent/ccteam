@@ -39,7 +39,7 @@ fn admin_pause_round_trip() {
             cmd,
             AdminCmd::Pause {
                 slug: "dev-foo".into(),
-                role: "lead".into()
+                role: Some("lead".into()),
             }
         );
     } else {
