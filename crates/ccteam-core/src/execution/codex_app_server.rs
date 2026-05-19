@@ -12,7 +12,13 @@
 //!   carries the codex `thread_id`.
 //! - `submit_turn`: `turn/start` with `[{type:"text", text:...}]`.
 //! - `events`: subscribe to broadcast notifications, translate
-//!   `item/*` + `turn/*` notifications → [`ThreadEvent`].
+//!   `item/*` + `turn/*` notifications → [`ThreadEvent`]. **V0.6.1 F122**:
+//!   also mirror the key boundary events (`turn/completed` / `turn/failed`
+//!   / `error`) into the project's `progress.jsonl` as `agent_done`
+//!   entries tagged `vendor: codex` so the `cost_24h_by_vendor["codex"]`
+//!   roll-up + budget cap surfaces stay live without the orchestrator
+//!   needing to wire a separate poller (the V0.6.0 Wave 3 D9 retained
+//!   risk).
 //! - `resume_thread`: `thread/resume` with the persistent id.
 //! - `close_thread`: `thread/archive` + `thread/unsubscribe` (best-effort).
 //!
@@ -29,6 +35,7 @@
 //! probe codex without touching tmux. The orchestrator's mode-3
 //! dispatch (e2e-wiring's territory) decides which adapter to mount.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -44,6 +51,8 @@ use crate::harness::{
     ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails, TurnId, TurnInput,
     UnifiedTokenUsage,
 };
+use crate::paths::CcteamPaths;
+use crate::progress::append_event;
 
 /// Env override for the UDS path the adapter dials. Tests set this to
 /// a tempdir socket; production resolves
@@ -56,18 +65,45 @@ pub const APP_SERVER_SOCKET_ENV: &str = "CCTEAM_CODEX_APP_SERVER_SOCKET";
 /// real codex.
 pub const CODEX_BIN_ENV: &str = "CCTEAM_CODEX_BIN";
 
+/// V0.6.1 F122 — per-thread context the adapter consults when bridging
+/// boundary events into `progress.jsonl`. Populated by `start_thread`
+/// from the [`SpawnCtx`]; consumed by the `events()` stream the first
+/// time a notification matches the thread.
+///
+/// `progress_path` lands at `~/.ccteam/progress/<slug>.jsonl`
+/// (resolved via [`CcteamPaths::from_env`]) so the bridge stays
+/// consistent with the orchestrator's own writes. Tests inject a
+/// custom ctx via [`CodexAppServerAdapter::register_bridge_for_test`].
+#[derive(Debug, Clone)]
+pub struct ProgressBridgeCtx {
+    pub progress_path: PathBuf,
+    pub role: String,
+    pub sid: String,
+    pub slug: String,
+    pub model: Option<String>,
+}
+
 /// V0.6.0 F112 [`HarnessAdapter`] that drives mode-3 codex bot sessions
 /// via `codex app-server` UDS. The adapter is stateless across threads
 /// — each `start_thread` lazily connects (and caches) a client per
 /// process so reused for `submit_turn` / `events` / `close_thread`.
+///
+/// **V0.6.1 F122**: holds an optional `bridges` map keyed by codex
+/// `thread_id`. Each entry carries the project's `progress.jsonl`
+/// path + role/sid/slug/model so the `events()` stream can mirror
+/// `turn/completed` / `turn/failed` notifications into `agent_done`
+/// rows tagged `vendor: codex`. Without an entry the stream behaves
+/// exactly like V0.6.0 (translation only — no IO side effect).
 #[derive(Clone, Default)]
 pub struct CodexAppServerAdapter {
     inner: Arc<Mutex<Option<Arc<CodexJsonRpcClient>>>>,
+    bridges: Arc<Mutex<HashMap<String, ProgressBridgeCtx>>>,
 }
 
 impl std::fmt::Debug for CodexAppServerAdapter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CodexAppServerAdapter").finish_non_exhaustive()
+        f.debug_struct("CodexAppServerAdapter")
+            .finish_non_exhaustive()
     }
 }
 
@@ -86,7 +122,10 @@ impl CodexAppServerAdapter {
         let home = std::env::var_os("CODEX_HOME")
             .map(PathBuf::from)
             .or_else(|| dirs::home_dir().map(|h| h.join(".codex")))?;
-        Some(home.join("app-server-control").join("app-server-control.sock"))
+        Some(
+            home.join("app-server-control")
+                .join("app-server-control.sock"),
+        )
     }
 
     /// Lazily connect (or reuse) the JSON-RPC client. Spawning the
@@ -107,12 +146,14 @@ impl CodexAppServerAdapter {
                     .to_string(),
             )
         })?;
-        let client = CodexJsonRpcClient::connect_uds(&path).await.map_err(|err| {
-            HarnessError::SpawnFailed(format!(
-                "connect codex app-server at {}: {err:#}",
-                path.display()
-            ))
-        })?;
+        let client = CodexJsonRpcClient::connect_uds(&path)
+            .await
+            .map_err(|err| {
+                HarnessError::SpawnFailed(format!(
+                    "connect codex app-server at {}: {err:#}",
+                    path.display()
+                ))
+            })?;
         let shared = Arc::new(client);
         *guard = Some(Arc::clone(&shared));
         Ok(shared)
@@ -122,6 +163,30 @@ impl CodexAppServerAdapter {
     /// dead reader task). Next call to `client()` will re-dial.
     pub async fn forget_client(&self) {
         *self.inner.lock().await = None;
+    }
+
+    /// V0.6.1 F122 — register a progress bridge for `thread_id`. Called
+    /// from `start_thread` after the codex `thread/start` response lands;
+    /// also exposed for tests that skip the spawn dance and want to
+    /// drive the events stream directly.
+    pub async fn register_bridge(&self, thread_id: String, ctx: ProgressBridgeCtx) {
+        self.bridges.lock().await.insert(thread_id, ctx);
+    }
+
+    /// V0.6.1 F122 — test escape hatch. Equivalent to [`register_bridge`]
+    /// but named so production call sites (orchestrator wiring) don't
+    /// reach for it by accident.
+    #[doc(hidden)]
+    pub async fn register_bridge_for_test(&self, thread_id: String, ctx: ProgressBridgeCtx) {
+        self.register_bridge(thread_id, ctx).await;
+    }
+
+    async fn bridge_for(&self, thread_id: &str) -> Option<ProgressBridgeCtx> {
+        self.bridges.lock().await.get(thread_id).cloned()
+    }
+
+    async fn drop_bridge(&self, thread_id: &str) {
+        self.bridges.lock().await.remove(thread_id);
     }
 }
 
@@ -160,6 +225,24 @@ impl HarnessAdapter for CodexAppServerAdapter {
                 "thread/start response missing thread.thread_id: {result}"
             ))
         })?;
+        // V0.6.1 F122 — register a progress bridge so the events()
+        // stream can mirror turn boundaries into progress.jsonl.
+        // CcteamPaths resolution honours CCTEAM_HOME so test runs land
+        // in their tempdir layout; production lands in ~/.ccteam/progress/.
+        if let Ok(paths) = CcteamPaths::from_env() {
+            let progress_path = paths.progress_jsonl(&ctx.slug);
+            self.register_bridge(
+                thread_id.clone(),
+                ProgressBridgeCtx {
+                    progress_path,
+                    role: spec.role.clone(),
+                    sid: ctx.sid.clone(),
+                    slug: ctx.slug.clone(),
+                    model: ctx.model_id.clone(),
+                },
+            )
+            .await;
+        }
         Ok(ThreadHandle {
             vendor: AgentVendor::Codex,
             mode: ExecutionMode::Chat,
@@ -198,7 +281,8 @@ impl HarnessAdapter for CodexAppServerAdapter {
     }
 
     fn events(&self, h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
-        let adapter = self.clone();
+        let adapter_setup = self.clone();
+        let adapter_bridge = self.clone();
         let thread_id = h.identity.clone();
         // Build a futures stream by chaining: (1) one-shot setup that
         // either yields an Error event or returns a broadcast receiver,
@@ -207,7 +291,7 @@ impl HarnessAdapter for CodexAppServerAdapter {
         // Error event and stop — orchestrator's progress.jsonl poller
         // remains the state-transition SoT (Wave 1 contract).
         let setup = async move {
-            match adapter.client().await {
+            match adapter_setup.client().await {
                 Ok(c) => Ok(c.subscribe()),
                 Err(err) => Err(ThreadErrorEvent {
                     kind: "connect".into(),
@@ -217,18 +301,66 @@ impl HarnessAdapter for CodexAppServerAdapter {
         };
         let s = stream::once(setup).flat_map(move |outcome| {
             let thread_id = thread_id.clone();
+            let adapter_bridge = adapter_bridge.clone();
             match outcome {
-                Err(err) => stream::iter(vec![ThreadEvent::Error(err)]).boxed(),
+                Err(err) => {
+                    // F122: connect failures still bridge to progress.jsonl
+                    // when a bridge ctx is registered (e.g. a test that
+                    // registers manually and then drops the peer). Fire
+                    // a best-effort write before yielding the Error event.
+                    let adapter_for_err = adapter_bridge.clone();
+                    let wanted = thread_id.clone();
+                    let err_for_evt = err.clone();
+                    let s = stream::once(async move {
+                        if let Some(ctx) = adapter_for_err.bridge_for(&wanted).await {
+                            if let Some(line) = build_progress_line(
+                                &ThreadEvent::Error(err_for_evt.clone()),
+                                &wanted,
+                                &ctx,
+                            ) {
+                                let _ = append_event(&ctx.progress_path, &line);
+                            }
+                            adapter_for_err.drop_bridge(&wanted).await;
+                        }
+                        ThreadEvent::Error(err_for_evt)
+                    });
+                    s.boxed()
+                }
                 Ok(rx) => {
-                    let s = stream::unfold(rx, move |mut rx| {
+                    let s = stream::unfold((rx, adapter_bridge), move |(mut rx, bridge)| {
                         let wanted = thread_id.clone();
                         async move {
                             loop {
                                 match rx.recv().await {
                                     Ok(notif) => {
-                                        if let Some(evt) = translate_notification(&notif, &wanted)
+                                        if let Some(evt) =
+                                            translate_notification(&notif, &wanted)
                                         {
-                                            return Some((evt, rx));
+                                            if let Some(ctx) = bridge.bridge_for(&wanted).await {
+                                                if let Some(line) =
+                                                    build_progress_line(&evt, &wanted, &ctx)
+                                                {
+                                                    if let Err(err) = append_event(
+                                                        &ctx.progress_path,
+                                                        &line,
+                                                    ) {
+                                                        tracing::warn!(
+                                                            thread_id = %wanted,
+                                                            error = %err,
+                                                            "codex bridge: append progress.jsonl failed"
+                                                        );
+                                                    }
+                                                    // Terminal events: drop
+                                                    // the bridge so we don't
+                                                    // double-write if codex
+                                                    // re-fires the same
+                                                    // notification.
+                                                    if is_terminal_progress(&evt) {
+                                                        bridge.drop_bridge(&wanted).await;
+                                                    }
+                                                }
+                                            }
+                                            return Some((evt, (rx, bridge)));
                                         }
                                     }
                                     Err(
@@ -387,15 +519,15 @@ pub fn translate_notification(notif: &Notification, wanted: &str) -> Option<Thre
                     .to_string(),
             },
         }),
-        "item/started" => translate_item_event(&notif.params, |item| {
-            ThreadEvent::ItemStarted { item }
-        }),
-        "item/updated" => translate_item_event(&notif.params, |item| {
-            ThreadEvent::ItemUpdated { item }
-        }),
-        "item/completed" => translate_item_event(&notif.params, |item| {
-            ThreadEvent::ItemCompleted { item }
-        }),
+        "item/started" => {
+            translate_item_event(&notif.params, |item| ThreadEvent::ItemStarted { item })
+        }
+        "item/updated" => {
+            translate_item_event(&notif.params, |item| ThreadEvent::ItemUpdated { item })
+        }
+        "item/completed" => {
+            translate_item_event(&notif.params, |item| ThreadEvent::ItemCompleted { item })
+        }
         "item/agentMessage/delta" => {
             let delta = notif
                 .params
@@ -419,11 +551,91 @@ pub fn translate_notification(notif: &Notification, wanted: &str) -> Option<Thre
     }
 }
 
+/// V0.6.1 F122 — translate a [`ThreadEvent`] into the `progress.jsonl`
+/// row the cost/budget pipelines consume. Mirrors the orchestrator's
+/// own `translate_thread_event` shape (vendor-tagged `agent_done`) so
+/// `compute_cost_summary` rolls codex turns into
+/// `cost_24h_by_vendor["codex"]` without any consumer-side changes.
+///
+/// Returns `None` for events the bridge intentionally does **not**
+/// surface (`ThreadStarted` is covered by `agent_spawn`; `Item*` /
+/// `TurnStarted` are presentation-only and noisy).
+pub fn build_progress_line(
+    evt: &ThreadEvent,
+    thread_id: &str,
+    ctx: &ProgressBridgeCtx,
+) -> Option<Value> {
+    match evt {
+        ThreadEvent::TurnCompleted { turn_id, usage } => {
+            let cost = ccteam_cost::estimate_cost(
+                usage,
+                ccteam_cost::Vendor::Codex,
+                ctx.model.as_deref().unwrap_or(""),
+            );
+            Some(json!({
+                "event": "agent_done",
+                "role": ctx.role,
+                "session_id": ctx.sid,
+                "slug": ctx.slug,
+                "status": "completed",
+                "vendor": "codex",
+                "cost_usd": cost,
+                "thread_id": thread_id,
+                "turn_id": turn_id,
+                "usage": serde_json::to_value(usage).unwrap_or(Value::Null),
+                "ts": Utc::now().to_rfc3339(),
+            }))
+        }
+        ThreadEvent::TurnFailed { turn_id, err } => Some(json!({
+            "event": "agent_done",
+            "role": ctx.role,
+            "session_id": ctx.sid,
+            "slug": ctx.slug,
+            "status": "errored",
+            "vendor": "codex",
+            "error": err.message,
+            "thread_id": thread_id,
+            "turn_id": turn_id,
+            "ts": Utc::now().to_rfc3339(),
+        })),
+        ThreadEvent::Error(err) => Some(json!({
+            "event": "agent_done",
+            "role": ctx.role,
+            "session_id": ctx.sid,
+            "slug": ctx.slug,
+            "status": "errored",
+            "vendor": "codex",
+            "error": err.message,
+            "thread_id": thread_id,
+            "ts": Utc::now().to_rfc3339(),
+        })),
+        ThreadEvent::ThreadStarted { .. }
+        | ThreadEvent::TurnStarted { .. }
+        | ThreadEvent::ItemStarted { .. }
+        | ThreadEvent::ItemUpdated { .. }
+        | ThreadEvent::ItemCompleted { .. } => None,
+    }
+}
+
+/// V0.6.1 F122 — return `true` for events that close out a thread from
+/// the bridge's point of view. After a terminal write the bridge drops
+/// its ctx so a duplicate `turn/completed` notification (codex
+/// app-server may re-broadcast on resubscribe) doesn't double-count.
+fn is_terminal_progress(evt: &ThreadEvent) -> bool {
+    matches!(
+        evt,
+        ThreadEvent::TurnCompleted { .. } | ThreadEvent::TurnFailed { .. } | ThreadEvent::Error(_)
+    )
+}
+
 fn translate_item_event(
     params: &Value,
     ctor: fn(ThreadItem) -> ThreadEvent,
 ) -> Option<ThreadEvent> {
-    let item_val = params.get("item").cloned().unwrap_or_else(|| params.clone());
+    let item_val = params
+        .get("item")
+        .cloned()
+        .unwrap_or_else(|| params.clone());
     let id = item_val
         .get("id")
         .or_else(|| params.get("item_id"))
@@ -482,10 +694,7 @@ fn translate_item_event(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string(),
-            args: item_val
-                .get("arguments")
-                .cloned()
-                .unwrap_or(Value::Null),
+            args: item_val.get("arguments").cloned().unwrap_or(Value::Null),
         },
         Some("web_search") | Some("webSearch") => ThreadItemDetails::WebSearch {
             query: item_val
@@ -523,11 +732,10 @@ fn pluck_turn_id(v: &Value) -> Option<String> {
 }
 
 fn pluck_usage(v: &Value) -> Option<UnifiedTokenUsage> {
-    let raw = v.get("usage").cloned().or_else(|| {
-        v.get("turn")
-            .and_then(|t| t.get("usage"))
-            .cloned()
-    })?;
+    let raw = v
+        .get("usage")
+        .cloned()
+        .or_else(|| v.get("turn").and_then(|t| t.get("usage")).cloned())?;
     serde_json::from_value(raw).ok()
 }
 
