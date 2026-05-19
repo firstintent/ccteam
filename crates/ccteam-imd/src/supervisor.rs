@@ -223,12 +223,18 @@ pub struct BotSupervisor {
     events_task: Mutex<Option<JoinHandle<()>>>,
     /// V0.6.1 fast-path — direct mpsc to the per-bot outbound dispatcher
     /// (see [`crate::bot_mpsc`]). The daemon's main loop populates this
-    /// via [`set_outbound_tx`] right after the supervisor starts. When
-    /// `None`, the events consumer just appends `turns.jsonl` (the
+    /// via [`set_outbound_tx`] right after the supervisor starts; the
+    /// events consumer must therefore read the current value **per
+    /// event** (not just at task-spawn time) to pick up the late
+    /// wiring. Held as `Arc<Mutex<_>>` so the spawned events task can
+    /// clone the Arc once and lock-read fresh values on every
+    /// `ItemCompleted`.
+    ///
+    /// When `None`, the events consumer just appends `turns.jsonl` (the
     /// safety-net `drain_outboxes` pass will pick rows up later); when
     /// `Some`, the events consumer additionally sends each assistant
     /// row through the channel for ~immediate dispatch.
-    outbound_tx: Mutex<Option<mpsc::Sender<OutboundItem>>>,
+    outbound_tx: Arc<Mutex<Option<mpsc::Sender<OutboundItem>>>>,
 }
 
 impl std::fmt::Debug for BotSupervisor {
@@ -257,7 +263,7 @@ impl BotSupervisor {
             state: Mutex::new(BotState::default()),
             heartbeat_task: Mutex::new(None),
             events_task: Mutex::new(None),
-            outbound_tx: Mutex::new(None),
+            outbound_tx: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -437,10 +443,14 @@ impl BotSupervisor {
             ccteam_core::harness::AgentVendor::Codex => "codex",
         }
         .to_string();
-        // V0.6.1 fast-path — clone the outbound sender (if registered)
-        // so each event can fan out into the per-bot dispatcher without
-        // re-locking. `None` keeps the legacy drain_outboxes safety net.
-        let outbound_tx = self.outbound_tx.lock().await.clone();
+        // V0.6.1 fast-path — clone the **Arc** so the task can lock-read
+        // the latest sender per event. The daemon's main loop sets the
+        // inner `Some(tx)` via `set_outbound_tx` AFTER `ensure_started`
+        // (and therefore after this task is already spawned); cloning
+        // the value at spawn time would freeze it at `None` and silently
+        // disable the fast path. Locking per event is fine — this is a
+        // tokio Mutex held only for a `clone()`, single-task contention.
+        let outbound_tx_arc = self.outbound_tx.clone();
         let task = tokio::spawn(async move {
             let mut stream = adapter.events(&handle);
             while let Some(evt) = stream.next().await {
@@ -491,10 +501,14 @@ impl BotSupervisor {
                             "latency turn.done"
                         );
                         // V0.6.1 fast-path — fan out to the per-bot
-                        // outbound dispatcher if it's wired. Safety-net
+                        // outbound dispatcher if it's wired. Read the
+                        // current `outbound_tx` per event (NOT once at
+                        // spawn time) — the daemon may set it after
+                        // this task already started. Safety-net
                         // `drain_outboxes` still covers the `None` case
                         // (e.g. supervisor restart mid-turn).
-                        if let Some(tx) = outbound_tx.as_ref() {
+                        let tx_now = outbound_tx_arc.lock().await.clone();
+                        if let Some(tx) = tx_now {
                             let item = OutboundItem {
                                 turn_id: turn_id_log.clone(),
                                 role: "assistant".into(),
