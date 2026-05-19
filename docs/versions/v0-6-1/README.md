@@ -1,5 +1,8 @@
 # V0.6.1 — End-to-end user-usable + 全文档清晰 + 遗留全完成
 
+> **Status**:**SHIPPED 2026-05-19**(`git tag v0.6.1`,commit `95916d3`)。
+> Baseline 1365/1 · clippy `-D warnings` clean · 26 MCP tools · 12 finding · 3-wave 压缩范式 · ship-gate via E2E 8-path sim PASS。
+>
 > **立项决策(`2026-05-19` 用户拍板)**:
 > - **不留遗留** — V0.6 retained 6 finding + V0.5 deferred F98 + 3 doc-quality 新 finding + 2 user-manual-claim 实现 finding = **12 finding 全 ship V0.6.1**(版本号保 patch,scope 接近 minor)
 > - **EN-only root README** — CLAUDE.md 加红线 "root README.md MUST be English",删现 CN README,落 EN 版
