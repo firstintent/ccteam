@@ -50,7 +50,7 @@ use crate::mcp_workflow_tools;
 // CCTEAM_DISABLE_TOOLS group filter. Wave 2/3 fills the chat / advise
 // dispatch handlers; Wave 1 lands stubs so the tool surface shape +
 // group disable env are usable end-to-end.
-use crate::{mcp_advise_tools, mcp_chat_tools, mcp_tool_groups};
+use crate::{mcp_admin_tools, mcp_advise_tools, mcp_chat_tools, mcp_tool_groups};
 
 /// Stable MCP protocol version this server speaks. Newer client versions
 /// downgrade gracefully because we never advertise capabilities we don't
@@ -330,10 +330,12 @@ fn tools_list_response() -> Value {
 /// 7 workflow-control tools (`spawn_agent` / `stop_agent` /
 /// `observe_agents` / `signal` / `set_parallelism` / `trigger_gate` /
 /// `get_artifact_summary`) → 17. V0.6.0 Wave 1 (F111) adds 5 chat
-/// stubs + 2 advise stubs → **24 total**. All tools carry a group
-/// sub-prefix (`admin_`, `workflow_`, `chat_`, `advise_`) except
-/// `ccteam__screenshot` which keeps its single-member-group name
-/// for V0.5 muscle memory. Schemas mirror interfaces.md §12.2.
+/// stubs + 2 advise stubs → 24. V0.6.1 F128 adds 2 admin mutators
+/// (`admin_change_persona` + `admin_add_tool`) → **26 total**. All
+/// tools carry a group sub-prefix (`admin_`, `workflow_`, `chat_`,
+/// `advise_`) except `ccteam__screenshot` which keeps its
+/// single-member-group name for V0.5 muscle memory. Schemas mirror
+/// interfaces.md §12.2.
 fn tool_definitions() -> Vec<Value> {
     let mut tools: Vec<Value> = vec![
         // Read-only inspection.
@@ -444,6 +446,11 @@ fn tool_definitions() -> Vec<Value> {
     // final surface.
     tools.extend(mcp_chat_tools::chat_tool_definitions());
     tools.extend(mcp_advise_tools::advise_tool_definitions());
+    // V0.6.1 F128 — `admin_change_persona` + `admin_add_tool` real
+    // tools land here. The pre-existing `admin_ls` stays inline above
+    // (it's the V0.5 read-only entry; the two F128 mutators move the
+    // admin group from 1 → 3 tools).
+    tools.extend(mcp_admin_tools::admin_tool_definitions());
     tools
 }
 
@@ -504,6 +511,13 @@ async fn call_tool(paths: &CcteamPaths, params: &Value) -> Result<Vec<Value>> {
             if mcp_workflow_tools::requires_daemon(other) {
                 require_healthy_daemon(paths)?;
             }
+            // V0.6.1 F128 — admin mutator tools (`change_persona` /
+            // `add_tool`) gate on live daemon, mirroring the
+            // workflow mutators above. `admin_ls` stays inline and
+            // is read-only so it does not gate.
+            if mcp_admin_tools::requires_daemon(other) {
+                require_healthy_daemon(paths)?;
+            }
             if let Some(body) = mcp_workflow_tools::dispatch(paths, other, &args)? {
                 return Ok(text_content(body));
             }
@@ -515,6 +529,11 @@ async fn call_tool(paths: &CcteamPaths, params: &Value) -> Result<Vec<Value>> {
                 return Ok(text_content(body));
             }
             if let Some(body) = mcp_advise_tools::dispatch(other, &args)? {
+                return Ok(text_content(body));
+            }
+            // V0.6.1 F128 — admin mutators (after the daemon gate
+            // above).
+            if let Some(body) = mcp_admin_tools::dispatch(paths, other, &args)? {
                 return Ok(text_content(body));
             }
             Err(anyhow!("unknown tool: {other}"))
@@ -555,12 +574,8 @@ fn tool_ls(paths: &CcteamPaths) -> Result<String> {
             // cost_24h / cost_active fields here too; for now we
             // keep the legacy `cost_used_usd` JSON key but populate
             // it from `cost_total_usd` so the MCP shape is stable.
-            let cost = cost_summary(
-                &p.state.slug,
-                &paths.progress_jsonl(&p.state.slug),
-                paths,
-            )
-            .unwrap_or_default();
+            let cost = cost_summary(&p.state.slug, &paths.progress_jsonl(&p.state.slug), paths)
+                .unwrap_or_default();
             json!({
                 "slug": p.state.slug,
                 "team": p.state.team,
@@ -899,9 +914,10 @@ mod tests {
     fn tool_definitions_count_matches_spec() {
         // M2.5 brief: 9 tools. V0.2.2 F38 adds `ccteam__screenshot` →
         // 10. V0.4.0 F65 adds 7 workflow tools → 17. V0.6.0 Wave 1
-        // (F111) adds 5 chat stubs + 2 advise stubs → 24 total. Bump
-        // this when a new tool lands.
-        assert_eq!(tool_definitions().len(), 24);
+        // (F111) adds 5 chat stubs + 2 advise stubs → 24. V0.6.1 F128
+        // adds 2 admin mutators (`change_persona` + `add_tool`) → 26.
+        // Bump this when a new tool lands.
+        assert_eq!(tool_definitions().len(), 26);
     }
 
     #[test]
@@ -910,7 +926,7 @@ mod tests {
         let mut names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), 24, "tool names must be unique");
+        assert_eq!(names.len(), 26, "tool names must be unique");
         for tool in &tools {
             assert!(tool["name"].as_str().unwrap().starts_with("ccteam__"));
             assert_eq!(tool["inputSchema"]["type"], "object");
@@ -1011,7 +1027,8 @@ mod tests {
     async fn handle_tools_list_returns_full_tool_set() {
         // M2.5: 9 tools. V0.2.2 F38: +1 (`ccteam__screenshot`) → 10.
         // V0.4.0 F65: +7 workflow tools → 17. V0.6.0 Wave 1 (F111):
-        // +5 chat stubs +2 advise stubs → 24.
+        // +5 chat stubs +2 advise stubs → 24. V0.6.1 F128: +2 admin
+        // mutators (`change_persona` + `add_tool`) → 26.
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = CcteamPaths {
             root: tmp.path().join("home"),
@@ -1025,7 +1042,7 @@ mod tests {
         });
         let resp = handle_request(&paths, &req).await.unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 24);
+        assert_eq!(tools.len(), 26);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"ccteam__screenshot"));
         // V0.4.0 F65 — spot-check one of the new tools is in the list.

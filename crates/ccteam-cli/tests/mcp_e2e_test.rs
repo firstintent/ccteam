@@ -3,10 +3,11 @@
 //!
 //! Confirms the wire contract that interfaces.md §12 promises:
 //! - `initialize` returns `protocolVersion` + `tools` capability;
-//! - `tools/list` enumerates exactly 24 tools, all `ccteam__*`
+//! - `tools/list` enumerates exactly 26 tools, all `ccteam__*`
 //!   (M2.5 shipped 9; V0.2.2 F38 added `ccteam__screenshot` → 10;
 //!   V0.4.0 F65 added 7 workflow tools → 17; V0.6.0 Wave 1 F111
-//!   added 5 chat stubs + 2 advise stubs → 24);
+//!   added 5 chat stubs + 2 advise stubs → 24; V0.6.1 F128 adds
+//!   2 admin mutators → 26);
 //! - `tools/call ccteam__admin_ls` returns a JSON-encoded projects list as
 //!   the first content[].text;
 //! - V0.4.0 F65 `tools/call` smokes for the 7 new workflow tools
@@ -120,7 +121,9 @@ fn mcp_serve_tools_list_returns_full_tool_set() {
     // M2.5 shipped 9 tools; V0.2.2 F38 added `ccteam__screenshot` for
     // a total of 10. V0.4.0 F65 added 7 workflow-control tools for a
     // total of 17. V0.6.0 Wave 1 F111 added 5 chat stubs + 2 advise
-    // stubs for a total of 24. Bump this when a new tool lands.
+    // stubs for a total of 24. V0.6.1 F128 adds 2 admin mutators
+    // (`change_persona` + `add_tool`) for a total of 26. Bump this
+    // when a new tool lands.
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().join("home");
     let projects = tmp.path().join("projects");
@@ -138,8 +141,8 @@ fn mcp_serve_tools_list_returns_full_tool_set() {
     let tools = resp["result"]["tools"].as_array().unwrap();
     assert_eq!(
         tools.len(),
-        24,
-        "M2.5 9 + V0.2.2 F38 screenshot + V0.4.0 F65 7-tool workflow surface + V0.6.0 Wave 1 (5 chat + 2 advise stubs)"
+        26,
+        "M2.5 9 + V0.2.2 F38 screenshot + V0.4.0 F65 7-tool workflow surface + V0.6.0 Wave 1 (5 chat + 2 advise stubs) + V0.6.1 F128 (2 admin mutators)"
     );
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     for required in [
@@ -171,6 +174,9 @@ fn mcp_serve_tools_list_returns_full_tool_set() {
         // V0.6.0 Wave 1 (F111) advise stubs.
         "ccteam__advise_vote",
         "ccteam__advise_parallel",
+        // V0.6.1 F128 admin mutators.
+        "ccteam__admin_change_persona",
+        "ccteam__admin_add_tool",
     ] {
         assert!(names.contains(&required), "missing tool: {required}");
     }

@@ -14,6 +14,10 @@ mod mcp_workflow_tools;
 mod mcp_advise_tools;
 mod mcp_chat_tools;
 mod mcp_tool_groups;
+// V0.6.1 F128 — `ccteam__admin_change_persona` +
+// `ccteam__admin_add_tool` real implementations (mutate
+// `.claude/agents/<bot>.md` + emit progress events).
+mod mcp_admin_tools;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -600,6 +604,49 @@ enum Command {
         #[command(subcommand)]
         action: Option<PrefsAction>,
     },
+    /// V0.6.1 F128 — chat-mode bot admin operations exposed as a
+    /// CLI surface for parity with the MCP tools
+    /// (`mcp__ccteam__admin_change_persona` /
+    /// `mcp__ccteam__admin_add_tool`). The `/ccteam-control` skill
+    /// is the primary user-facing entry point; this CLI form is the
+    /// scripted fallback when MCP is not registered.
+    Admin {
+        #[command(subcommand)]
+        action: AdminAction,
+    },
+}
+
+/// V0.6.1 F128 — `ccteam admin` subcommand surface (chat-mode bot
+/// persona / tool-list editing). Mirrors
+/// `mcp__ccteam__admin_change_persona` / `mcp__ccteam__admin_add_tool`.
+#[derive(Subcommand)]
+enum AdminAction {
+    /// Replace a chat-mode bot's persona file
+    /// (`<project>/.claude/agents/<bot>.md`). `new_persona_md` is the
+    /// FULL replacement file content (YAML frontmatter + body); the
+    /// caller is responsible for assembling it. The bot picks up the
+    /// new persona on the next turn / `/clear`.
+    ChangePersona {
+        /// Project slug.
+        slug: String,
+        /// Bot persona id (matches `.claude/agents/<bot>.md`).
+        bot: String,
+        /// Complete replacement file content. Use `-` to read from
+        /// stdin (skill / scripted callers prefer this so multi-line
+        /// markdown does not bloat the argv).
+        new_persona_md: String,
+    },
+    /// Append a tool to a chat-mode bot's `.claude/agents/<bot>.md`
+    /// frontmatter `tools:` CSV. Idempotent — re-adding an existing
+    /// tool is a no-op. Bot picks up the new list on the next turn.
+    AddTool {
+        /// Project slug.
+        slug: String,
+        /// Bot persona id.
+        bot: String,
+        /// Tool descriptor (verbatim — taken as-is into the CSV).
+        tool_descriptor: String,
+    },
 }
 
 /// V0.6.0 Wave 3 F112 §C — `ccteam prefs` subcommand surface.
@@ -1043,6 +1090,47 @@ fn main() -> Result<()> {
                 }
             }
         }
+        Command::Admin { action } => {
+            let paths = CcteamPaths::from_env()?;
+            match action {
+                AdminAction::ChangePersona {
+                    slug,
+                    bot,
+                    new_persona_md,
+                } => {
+                    let body = read_inline_or_stdin(&new_persona_md)?;
+                    let out = commands::run_admin_change_persona(&paths, &slug, &bot, &body)?;
+                    println!("{out}");
+                    Ok(())
+                }
+                AdminAction::AddTool {
+                    slug,
+                    bot,
+                    tool_descriptor,
+                } => {
+                    let out = commands::run_admin_add_tool(&paths, &slug, &bot, &tool_descriptor)?;
+                    println!("{out}");
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+/// V0.6.1 F128 — `ccteam admin change-persona` accepts the persona
+/// body either inline (small descriptions) or as `-` to read from
+/// stdin (full multi-line markdown without argv bloat). Mirrors the
+/// `git commit -F -` convention.
+fn read_inline_or_stdin(arg: &str) -> Result<String> {
+    if arg == "-" {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .context("read persona body from stdin")?;
+        Ok(buf)
+    } else {
+        Ok(arg.to_string())
     }
 }
 
