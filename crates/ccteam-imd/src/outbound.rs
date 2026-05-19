@@ -55,6 +55,58 @@ pub fn turns_jsonl_path(projects_root: &std::path::Path, slug: &str, role: &str)
         .join("turns.jsonl")
 }
 
+/// V0.6.1 F134 — persistent byte-offset state for one bot's
+/// `turns.jsonl` tailer. Stored at
+/// `<projects_root>/<slug>/.ccteam/chat/<role>/outbound.cursor` as a
+/// JSON blob `{"position": N}` (serde-derived on [`TailCursor`]).
+///
+/// Daemon restart re-loads this file so messages forwarded across a
+/// previous run aren't re-sent to the user. Missing / malformed file
+/// → fall back to the zero cursor (re-forward everything; safer than
+/// dropping content silently, and `turns.jsonl` grows monotonically
+/// so a stale cursor would only ever under-skip, never over-skip).
+pub fn outbound_cursor_path(
+    projects_root: &std::path::Path,
+    slug: &str,
+    role: &str,
+) -> PathBuf {
+    projects_root
+        .join(slug)
+        .join(".ccteam")
+        .join("chat")
+        .join(role)
+        .join("outbound.cursor")
+}
+
+/// Load a [`TailCursor`] from disk. Missing file or parse failure
+/// returns the default (position = 0).
+pub fn load_cursor(path: &std::path::Path) -> TailCursor {
+    if !path.exists() {
+        return TailCursor::default();
+    }
+    match fs::read_to_string(path) {
+        Ok(body) => serde_json::from_str(&body).unwrap_or_default(),
+        Err(err) => {
+            tracing::warn!(error = %err, path = %path.display(), "imd: outbound: load_cursor read failed");
+            TailCursor::default()
+        }
+    }
+}
+
+/// Persist a [`TailCursor`] to disk. Creates the parent directory if
+/// missing. Errors propagate so the caller can warn-log; persistence
+/// failure is not fatal (the worst case is re-forwarding a few rows
+/// next tick if the cursor doesn't land).
+pub fn save_cursor(path: &std::path::Path, cursor: &TailCursor) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("mkdir -p {}", parent.display()))?;
+    }
+    let body = serde_json::to_string(cursor).context("serialize TailCursor")?;
+    fs::write(path, body).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
 /// Read every new line since `cursor.position`, returning the parsed
 /// rows + the new cursor position (advanced to EOF). Missing file is
 /// not an error — returns an empty Vec.

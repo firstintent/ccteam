@@ -33,9 +33,11 @@ use tokio::sync::Mutex;
 use crate::acl::AclPolicy;
 use crate::credentials::{self, Credentials};
 use crate::inbound::{
-    parse_envelope, process_inbound_admin_aware, DefaultMailboxResolver, MailboxResolver,
+    auto_route_dm_mention, parse_envelope, process_inbound_admin_aware, DefaultMailboxResolver,
+    MailboxResolver,
 };
 use crate::nl_admin::AdminExecutor;
+use crate::outbound;
 use crate::router::HandleMap;
 use crate::supervisor::{self, BotSupervisor};
 use crate::three_layer_sec::ThreeLayerSec;
@@ -284,6 +286,15 @@ where
         executor.clone(),
     );
 
+    // V0.6.1 F134 — outbound forwarder runs per supervisor tick (inside
+    // the `loop` below). Log once at startup so operators see the
+    // wiring is live; per-dispatch logs live in `drain_outboxes`.
+    tracing::info!(
+        channels = channels.len(),
+        bots = initial.len(),
+        "imd: F134 outbound forwarder spawned (per-tick drain_outboxes)"
+    );
+
     let mut ticker = tokio::time::interval(args.tick);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -305,6 +316,7 @@ where
                 };
                 tick_supervisors(&bots, &registry, Some(&projects_root), &factory).await;
                 drain_inboxes(&bots, &registry, &projects_root).await;
+                drain_outboxes(&bots, &channels, &projects_root).await;
 
                 if let Some(max) = args.max_runtime {
                     if started.elapsed() >= max {
@@ -377,8 +389,15 @@ fn spawn_inbound_consumer(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut seq: u64 = 0;
-        while let Some(msg) = rx.recv().await {
+        while let Some(mut msg) = rx.recv().await {
             seq = seq.wrapping_add(1);
+            // V0.6.1 F135 — DM auto-route: when exactly one registered
+            // bot owns this (channel, chat_id), prepend `@<role> ` so
+            // the router resolves the message to that bot. List_bots()
+            // is a small disk read; V0.6.1 IM traffic volume keeps it
+            // cheap (single-bot host probe), V0.7 will cache.
+            let bots_for_route = list_bots().unwrap_or_default();
+            auto_route_dm_mention(&mut msg, &bots_for_route);
             let handles = build_handle_map();
             let Some(channel) = channels.get(&msg.channel).cloned() else {
                 tracing::debug!(
@@ -543,6 +562,88 @@ async fn drain_inboxes(
                     "imd: remove inbox file failed"
                 );
             }
+        }
+    }
+}
+
+/// V0.6.1 F134 — once per tick, for each registered bot:
+///
+/// - Read `<projects_root>/<slug>/.ccteam/chat/<role>/turns.jsonl`
+///   from the persisted byte-offset cursor,
+/// - For every new `assistant` row, dispatch through the Channel
+///   matching `bot.im_platform` to `bot.im_chat_id`,
+/// - Persist the new cursor so a daemon restart doesn't re-forward.
+///
+/// Errors at each stage are warn-logged and the loop continues — one
+/// flaky bot must not stall the rest. Missing channels (e.g. bot
+/// registered to slack but creds.json only configures telegram) are
+/// debug-logged and skipped silently.
+async fn drain_outboxes(
+    bots: &[BotRegistration],
+    channels: &ChannelMap,
+    projects_root: &Path,
+) {
+    for bot in bots {
+        let Some(channel) = channels.get(&bot.im_platform) else {
+            tracing::debug!(
+                slug = %bot.workflow_slug,
+                role = %bot.role,
+                platform = %bot.im_platform,
+                "imd: F134 outbound: no channel registered for bot's platform; skipping"
+            );
+            continue;
+        };
+        let path = outbound::turns_jsonl_path(projects_root, &bot.workflow_slug, &bot.role);
+        let cursor_path =
+            outbound::outbound_cursor_path(projects_root, &bot.workflow_slug, &bot.role);
+        let cursor = outbound::load_cursor(&cursor_path);
+        let (rows, new_cursor) = match outbound::read_new_rows(&path, &cursor) {
+            Ok(x) => x,
+            Err(err) => {
+                tracing::warn!(
+                    slug = %bot.workflow_slug,
+                    role = %bot.role,
+                    error = %err,
+                    "imd: F134 outbound: read_new_rows failed; continuing"
+                );
+                continue;
+            }
+        };
+        if rows.is_empty() {
+            // Still persist a cursor advance on truncation (read_new_rows
+            // rewinds to 0 on shrink — record the new position so we
+            // don't keep rewinding on every tick).
+            if new_cursor.position != cursor.position {
+                if let Err(err) = outbound::save_cursor(&cursor_path, &new_cursor) {
+                    tracing::warn!(
+                        slug = %bot.workflow_slug,
+                        role = %bot.role,
+                        error = %err,
+                        "imd: F134 outbound: save_cursor (truncation rewind) failed"
+                    );
+                }
+            }
+            continue;
+        }
+        let sent =
+            outbound::forward_new_rows(&rows, channel.as_ref(), &bot.im_chat_id, &[]).await;
+        if sent > 0 {
+            tracing::info!(
+                slug = %bot.workflow_slug,
+                role = %bot.role,
+                platform = %bot.im_platform,
+                chat_id = %bot.im_chat_id,
+                "imd: F134 outbound forwarded {} rows",
+                sent
+            );
+        }
+        if let Err(err) = outbound::save_cursor(&cursor_path, &new_cursor) {
+            tracing::warn!(
+                slug = %bot.workflow_slug,
+                role = %bot.role,
+                error = %err,
+                "imd: F134 outbound: save_cursor failed"
+            );
         }
     }
 }
