@@ -372,16 +372,23 @@ YAML
 
         sleep 3
         touch $PROJ/.ccteam/triggers/worker/wake.md
-        echo "[probe/overnight] trigger placed; polling progress.jsonl"
+        # V0.6.1 host-probe fix: progress.jsonl lives at
+        # $CCTEAM_HOME/progress/<slug>.jsonl (not $PROJ/.ccteam/),
+        # per ccteam-core append_event impl. Earlier probe checked
+        # the wrong path and always reported FAIL even when the
+        # orchestrator was working.
+        PROGRESS=$CCTEAM_HOME/progress/overnight-probe.jsonl
+
+        echo "[probe/overnight] trigger placed; polling $PROGRESS"
 
         SPAWN_SEEN=0
         DONE_SEEN=0
         for i in $(seq 1 60); do
-            if [[ -f $PROJ/.ccteam/progress.jsonl ]]; then
-                if grep -q "\"event\":\"agent_spawn\"" $PROJ/.ccteam/progress.jsonl 2>/dev/null; then
+            if [[ -f $PROGRESS ]]; then
+                if grep -q "\"event\":\"agent_spawn\"" $PROGRESS 2>/dev/null; then
                     SPAWN_SEEN=1
                 fi
-                if grep -q "\"event\":\"agent_done\"" $PROJ/.ccteam/progress.jsonl 2>/dev/null; then
+                if grep -q "\"event\":\"agent_done\"" $PROGRESS 2>/dev/null; then
                     DONE_SEEN=1
                     break
                 fi
@@ -390,13 +397,13 @@ YAML
         done
 
         echo "[probe/overnight] progress.jsonl dump:"
-        if [[ -f $PROJ/.ccteam/progress.jsonl ]]; then
-            cat $PROJ/.ccteam/progress.jsonl
+        if [[ -f $PROGRESS ]]; then
+            cat $PROGRESS
             echo "[probe/overnight] event types observed:"
-            (command -v jq >/dev/null && jq -r .event $PROJ/.ccteam/progress.jsonl | sort -u) \
-                || grep -oE "\"event\":\"[^\"]*\"" $PROJ/.ccteam/progress.jsonl | sort -u
+            (command -v jq >/dev/null && jq -r .event $PROGRESS | sort -u) \
+                || grep -oE "\"event\":\"[^\"]*\"" $PROGRESS | sort -u
         else
-            echo "[probe/overnight] progress.jsonl was never created"
+            echo "[probe/overnight] progress.jsonl was never created at $PROGRESS"
         fi
 
         kill -TERM $ORCH_PID 2>/dev/null || true
