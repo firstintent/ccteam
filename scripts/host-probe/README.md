@@ -43,6 +43,53 @@ CCTEAM_PROBE_REAL_TG=1 \
   `im-squad` use the real Telegram channel instead of the mock
   channel. Default is mock — wave-4 ship gate accepts mock for
   Telegram scenarios per the wave-4 handoff.
+- `CCTEAM_PROBE_LOCAL` (V0.6.1 F119) — when `1`, scenarios run
+  locally (no SSH; `NAS_PATH` is interpreted as the repo root).
+  Used for PR-review dry-run of script changes without touching
+  the NAS.
+- `CCTEAM_PROBE_SKIP_DAEMON_START` (V0.6.1 F119) — when `1`, the
+  `pocket-assistant` / `im-squad` scenarios skip the new
+  daemon-spawn + health-wait + stop block and assume the caller
+  has a `ccteam-imd` daemon already running. Default is `0`
+  (probe owns lifecycle).
+
+## V0.6.1 F119 — daemon lifecycle in mode-3 probes
+
+`pocket-assistant` and `im-squad` now own the `ccteam-imd` daemon
+end-to-end:
+
+1. `nohup ./target/release/ccteam-imd run --tick-seconds 2 &` →
+   stash pid + stderr to `/tmp/ccteam-imd-probe-<scenario>.{pid,stderr}`.
+2. `./target/release/ccteam-imd health --timeout-seconds 30 --poll-ms 200`
+   blocks until the daemon writes a heartbeat with `mtime ≥` the
+   moment the health check started (rejects stale heartbeats from
+   prior runs).
+3. Run the scenario's bot interactions.
+4. `kill -TERM <pid>`; wait 5s for graceful exit; `kill -KILL` if
+   still alive; tail stderr into the scenario log.
+
+`run-probes.sh` then `scp`s `/tmp/ccteam-imd-probe-<scenario>.stderr`
+back into `<out>/<scenario>/daemon-stderr.log` so post-mortems are
+self-contained.
+
+## V0.6.1 F120 — overnight-builder real workflow
+
+The `overnight-builder` scenario is no longer a `ccteam --help`
+smoke. It now:
+
+1. Scaffolds `/tmp/host-probe-overnight/` with an isolated
+   `CCTEAM_HOME` + `CCTEAM_PROJECTS_ROOT`, a 1-agent
+   artifact-driven `workflow.yaml`, and `.claude/agents/worker.md`.
+2. Plants a stub `claude` binary (via `CCTEAM_CLAUDE_BIN`) that
+   prints `backgrounded · <id>` + writes a synthetic
+   `state.json`, so the orchestrator's `poll_completions` emits
+   `agent_done` without burning real LLM cost.
+3. Backgrounds `ccteam start --no-web --tick-seconds 1`, drops a
+   trigger marker, polls `progress.jsonl` for both `agent_spawn`
+   and `agent_done` (60s deadline).
+4. Exit codes: `0` = both events, `2` = spawn only (partial), `1` =
+   neither (orchestrator didn't pick up the trigger). The wrapper
+   marks status `happy` / `partial` / `fail` accordingly.
 
 ## Output layout
 

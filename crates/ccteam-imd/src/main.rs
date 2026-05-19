@@ -6,7 +6,7 @@ use anyhow::Result;
 use ccteam_core::harness::AgentVendor;
 use ccteam_imd::{
     daemon::{run_daemon, DaemonArgs},
-    imd_heartbeat_path, list_bots, register_bot, unregister_bot,
+    imd_heartbeat_path, list_bots, register_bot, unregister_bot, wait_for_health, HealthResult,
 };
 use clap::{Parser, Subcommand};
 
@@ -78,6 +78,22 @@ enum Command {
     },
     /// Print the daemon status (heartbeat freshness + registered bots).
     Status,
+    /// V0.6.1 F119 — block until the daemon publishes a *fresh*
+    /// heartbeat (mtime ≥ the moment this command started), or the
+    /// timeout elapses.
+    ///
+    /// `exit 0` = ready; `exit 1` = timed out. Scripted callers like
+    /// `scripts/host-probe/run-probes.sh` use this to wait after
+    /// spawning the daemon before exercising mode-3 scenarios.
+    Health {
+        /// Maximum seconds to wait for a fresh heartbeat (default 30).
+        #[arg(long, default_value_t = 30)]
+        timeout_seconds: u64,
+        /// Poll interval in milliseconds between filesystem checks
+        /// (default 200ms; tests may shorten).
+        #[arg(long, default_value_t = 200)]
+        poll_ms: u64,
+    },
 }
 
 fn parse_vendor(s: &str) -> Result<AgentVendor, String> {
@@ -149,6 +165,31 @@ fn main() -> Result<()> {
                     "  {}/{} → {} (chat_id={})",
                     reg.workflow_slug, reg.role, reg.im_platform, reg.im_chat_id
                 );
+            }
+        }
+        Command::Health {
+            timeout_seconds,
+            poll_ms,
+        } => {
+            let started = std::time::SystemTime::now();
+            let result = wait_for_health(
+                started,
+                std::time::Duration::from_secs(timeout_seconds),
+                std::time::Duration::from_millis(poll_ms),
+            );
+            match result {
+                HealthResult::Ready => {
+                    let hb = imd_heartbeat_path();
+                    println!("daemon: ready (heartbeat at {})", hb.display());
+                }
+                HealthResult::Timeout => {
+                    let hb = imd_heartbeat_path();
+                    eprintln!(
+                        "daemon: NOT READY after {timeout_seconds}s (no fresh heartbeat at {})",
+                        hb.display()
+                    );
+                    std::process::exit(1);
+                }
             }
         }
     }
