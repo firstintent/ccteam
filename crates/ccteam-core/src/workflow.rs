@@ -119,6 +119,17 @@ pub struct WorkflowSpec {
 /// and the lead in turn decides team composition via Anthropic's
 /// native `TeamCreate` + `Task` tools. The 6 `team_*` events
 /// (F95 + F94) replace the spawn/done axis.
+///
+/// `human-approval` is V0.6.1 F124 narrow scope: artifact-driven roster
+/// where every agent step completion gates on an explicit
+/// `plan_decision` event (F98 plan-approval path; CLAUDE.md §三 红线
+/// "HITL approval state SoT = progress.jsonl::plan_decision"). The
+/// orchestrator never auto-drains the per-role `pending` queue in this
+/// mode — it emits a `plan_decision_required` event after each
+/// `agent_done` and waits for the F98 IM round-trip to inject
+/// `plan_decision`. Useful for critical workflows (large refactors /
+/// migrations) where the user wants to approve every step before the
+/// next agent spawns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum WorkflowMode {
@@ -132,6 +143,14 @@ pub enum WorkflowMode {
     /// send-keys -l) acting as a chat bot. User talks to it via IM
     /// (`ccteam-imd`); each turn is one tmux send-keys + Stop hook.
     Chat,
+    /// V0.6.1 F124 narrow scope. Artifact-driven roster with a
+    /// human-in-the-loop gate after every `agent_done`. Orchestrator
+    /// emits `plan_decision_required` (consumed by F98 plan-approval
+    /// IM path) and parks the pending-spawn queue until a
+    /// `plan_decision` event lands in `progress.jsonl`. The full
+    /// APPROVE/REJECT round-trip lives in F98; F124 owns the mode
+    /// enum, dispatch arm, and `pending`-drain guard.
+    HumanApproval,
 }
 
 /// Predicate paired with `WorkflowMode::default()` so an explicit
@@ -741,6 +760,26 @@ impl WorkflowSpec {
                                 .to_string(),
                         ));
                     }
+                }
+            }
+            WorkflowMode::HumanApproval => {
+                // V0.6.1 F124 narrow scope — same structural rules as
+                // ArtifactDriven (the roster must declare at least one
+                // agent; `agent_team` block is invalid). The HITL gate
+                // lives in the orchestrator dispatch path
+                // (`poll_completions` skips the pending-drain when
+                // `mode == HumanApproval` and emits
+                // `plan_decision_required`); the parser stays purely
+                // structural.
+                if self.agents.is_empty() {
+                    return Err(WorkflowError::ValidationFailed(
+                        "mode: human-approval requires at least one agent".to_string(),
+                    ));
+                }
+                if self.agent_team.is_some() {
+                    return Err(WorkflowError::ValidationFailed(
+                        "agent_team block is only valid when mode: agent-team".to_string(),
+                    ));
                 }
             }
             WorkflowMode::AgentTeam => {

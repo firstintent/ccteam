@@ -675,6 +675,19 @@ impl Orchestrator {
                 // (vendor, mode) pair.
                 self.adapter_for(Executor::Codex).cloned()
             }
+            (_, WorkflowMode::HumanApproval) => {
+                // V0.6.1 F124 narrow scope — `mode: human-approval`
+                // shares spawn mechanics with the per-executor bg
+                // default (ClaudeBgAdapter / CodexExecAdapter). The
+                // HITL gate is enforced at `poll_completions` time
+                // (pending-drain skipped + `plan_decision_required`
+                // emitted), not at adapter selection. TODO(F124 full
+                // scope, post-F98): introduce a dedicated
+                // `HumanApprovalAdapter` wrapper that delegates spawn
+                // to the inner adapter but tags spawn metadata for the
+                // IM round-trip + plan_decision injection.
+                self.adapter_for(exec).cloned()
+            }
             _ => self.adapter_for(exec).cloned(),
         }
     }
@@ -1539,6 +1552,41 @@ impl Orchestrator {
             return Ok(());
         }
 
+        // V0.6.1 F124 narrow scope — `mode: human-approval` requires
+        // an explicit `plan_decision` before spawning. Park the
+        // artifact event on the pending queue (capacity-permitting)
+        // and emit `plan_decision_required`; F98 plan-approval's IM
+        // round-trip writes a `spawn_requests/*.json` marker on
+        // APPROVE which `check_spawn_requests` consumes on the next
+        // tick. REJECT drops the queued event without spawning.
+        if matches!(spec.mode, WorkflowMode::HumanApproval) {
+            self.pending
+                .lock()
+                .await
+                .entry(role.clone())
+                .or_default()
+                .push_back(evt);
+            let pending_count = self
+                .pending
+                .lock()
+                .await
+                .get(&role)
+                .map(|q| q.len())
+                .unwrap_or(0);
+            let _ = progress::append_event(
+                progress_path,
+                &json!({
+                    "event": "plan_decision_required",
+                    "role": role,
+                    "slug": slug,
+                    "pending_count": pending_count,
+                    "reason": "mode: human-approval — artifact-triggered spawn requires APPROVE",
+                    "ts": Utc::now().to_rfc3339(),
+                }),
+            );
+            return Ok(());
+        }
+
         self.try_spawn(slug, &role, agent, project_dir, progress_path)
             .await
     }
@@ -2019,6 +2067,37 @@ impl Orchestrator {
 
             if status == "completed" || status == "stopped" {
                 self.fail_counts.lock().await.insert(role.clone(), 0);
+            }
+
+            // V0.6.1 F124 narrow scope — `mode: human-approval` gates
+            // the pending-drain on an explicit `plan_decision` event.
+            // Skip the auto-drain here and emit
+            // `plan_decision_required` so the F98 plan-approval IM
+            // path can prompt the user. When APPROVE lands, F98 writes
+            // a `plan_decision` event + a `spawn_requests/*.json`
+            // marker that `check_spawn_requests` picks up on the next
+            // tick. The `pending` queue stays intact across the gate
+            // so REJECT can drop the queued event without spawning.
+            if matches!(spec.mode, WorkflowMode::HumanApproval) {
+                let pending_count = self
+                    .pending
+                    .lock()
+                    .await
+                    .get(&role)
+                    .map(|q| q.len())
+                    .unwrap_or(0);
+                let _ = progress::append_event(
+                    progress_path,
+                    &json!({
+                        "event": "plan_decision_required",
+                        "role": role,
+                        "slug": slug,
+                        "pending_count": pending_count,
+                        "reason": "mode: human-approval — next step requires APPROVE",
+                        "ts": Utc::now().to_rfc3339(),
+                    }),
+                );
+                continue;
             }
 
             // Drain one pending event for this role, if any.
