@@ -176,21 +176,40 @@
 
 **目标**:F127 manual-prover 跑通 + 5 demo GIF 录 + tier-1 doc 最终同步 → version bump + tag + push。
 
-### Teammate W3-T1: `manual-prover` — F127
+### Teammate W3-T1: `manual-prover` — F127(扩展为端到端用户操作模拟)
 
 **Worktree**:`git worktree add -b v061-w3-manual-prover /tmp/ccteam-v061-w3-manual-prover origin/main`
+
+**重要 ship policy(用户 2026-05-19 拍板)**:V0.6.1 在 E2E sim 100% clean 之前**不 tag v0.6.1**;sim 发现 bug **在同版本修**(no V0.6.2 bump,no V0.7 split),iterative sim-fix-resim 直到清。
+
 **Briefing**:
-- 读 `docs/versions/v0-6-1/prd.md` §F127
-- 逐节扫 `docs/user-manual.md` + `docs/quickstart.md` + `docs/troubleshooting.md` + `docs/advanced/*.md`
+- 读 `docs/versions/v0-6-1/prd.md` §F127(含用户额外要求段)
+- 逐节扫 `docs/user-manual.md` + `docs/quickstart.md` + `docs/troubleshooting.md` + `docs/recipes.md` + `docs/advanced/*.md`
 - 每 verifiable claim 起一行 `.audit/manual-prover-report.md` + 验证命令 + status
-- claim 未实现 → coord with `control-ext` / `im-nl-admin` teammate(已 land,本 wave 跑时);claim 实现差 → 直接 fix;claim 写错 → 改 user-manual.md
+- claim 未实现 → fix in 本 wave;claim 实现差 → 直接 fix;claim 写错 → 改 user-manual.md
 - `/ccteam-doctor` claim 在 troubleshooting.md L1 — 改成 `ccteam doctor` CLI 或新增 `/ccteam-doctor` slash skill(简单 wrapper around `ccteam-control` skill)
-- nas-box005 真跑 host probe 验证
+
+**E2E sim scope(扩,逐 preset 完整 user journey)**:
+1. **Solo Sidekick**:本机 Claude session 跑 `/ccteam "扫 TODO"` → verify agent done + 结果回主 session
+2. **Team Sprint**:`/ccteam-team 3 "<task>"` → 3 teammate 起 + fleetview 可见 + 完成
+3. **Overnight Builder**:`/ccteam-creator "夜里跑 qa-loop"` → daemon spawn + cost cap auto-pause verify
+4. **Pocket Assistant**:`/ccteam-im-setup` + `/ccteam-creator "TG 助理 bot"` → TG DM round-trip + `/ccteam-control change-persona` + `add-tool` 改活 bot
+5. **IM Squad**:multi-bot TG group + `@ccteam pause/resume/list bots/cost today/stop everything` NL admin
+6. **Plan-approval flow**:workflow.yaml `plan_approval:` agent 写 plan → TG message → `APPROVE` → resume
+7. **Codex paths**:`/ccteam-advise` + auto-critic + opt-in fallback
+8. **HITL mode**:`mode: human-approval` workflow round-trip
+
+发现的 bug **iterative fix in 本 wave**(可能多轮):
+- 简单 bug(typo / NL 路由 / event format)直接 commit 本 worktree
+- 中等 bug(orchestrator state / adapter)如 in scope of 已 ship F# → fix in 本 PR;否则 SendMessage team-lead 决策(临时 fix-teammate 或主 session 接)
+- 严重 bug(架构层) → SendMessage team-lead + TG ping
 
 **Acceptance**:
 - `.audit/manual-prover-report.md` 每 claim 行 status ∈ {PASS,FIXED,N/A};0 FAIL
-- baseline ≥ Wave 2
-- nas-box005 host probe 全 12 finding rc=0 + cost.txt 非 0(F119 enhanced script 已 land)
+- E2E sim 8 个 path 每个出 1 行 PASS/N/A status(N/A 限于"需 user 私设 IM token 才能跑"等环境约束;真 bug 必 fix)
+- baseline ≥ Wave 2 数字
+- nas-box005 host probe 跑通(F119 enhanced script + plan-approval flow + HITL mode)
+- **PR title 含 `[ship-gate-pass]` 后缀**,告知主 session 可以 tag v0.6.1
 
 ### Teammate W3-T2: `demo-recorder` — F123
 

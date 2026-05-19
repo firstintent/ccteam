@@ -241,7 +241,19 @@ V0.6.0 root README 是 CN(`# ccteam` / `> **Claude Code 之上的 multi-agent �
 
 ---
 
-### F127 — user-manual.md 100% 亲测可用 sweep
+### F127 — user-manual.md 100% 亲测可用 sweep + 端到端用户操作模拟
+
+#### 用户额外要求(2026-05-19 加)
+
+> "v0-6-1 开发完成后,做完善的端到端测试,模拟用户的操作,发现问题,在原版本上修复,不要再发新版"
+
+**ship policy 红线**:V0.6.1 在 E2E sim 100% clean 之前**不 tag,不 push v0.6.1**。E2E sim 发现的任何 bug → 在 V0.6.1 同版本修(no V0.6.2 bump,no V0.7 split);iterative sim-fix-resim 直到清。
+
+E2E sim 范围比"line-by-line user-manual.md verify"更宽:
+- 模拟 5 preset 完整 user journey(install → 配置 → 起 workflow → IM 互动 → cost 查看 → 改 persona → 停)
+- 覆盖 docs/{quickstart,user-manual,recipes,troubleshooting}.md 所有 claim
+- 跑通 host probe(nas-box005)+ local probe 各 1 轮
+- Issues 立刻 fix(coord with 主 session + 必要时 spawn 临时 fix-teammate),fix 后 retest 整路径
 
 #### 痛点
 
