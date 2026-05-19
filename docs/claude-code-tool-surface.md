@@ -180,7 +180,7 @@ MCP server 注册的 tool 在模型看来就是普通工具,工具名形如
 | `claude-mem` | M3 | `mcp__plugin_claude-mem_mcp-search__search` 等 |
 | Playwright | 按需 | `mcp__plugin_playwright_playwright__browser_*` |
 | GitHub | M4+ | 优先 `gh` CLI(见最佳实践 §4.3) |
-| `ccteam-mcp`(自建) | M2 / V0.4.0 | **17 个工具** `mcp__ccteam__admin_ls` / `show` / `new` / `spawn_agent` / `stop_agent` / `observe_agents` / `signal` / `set_parallelism` / `trigger_gate` / `get_artifact_summary` 等(见 `docs/v0-4-0/prd.md §6.3` 完整清单) |
+| `ccteam-mcp`(自建) | M2 / V0.4.0 | **17 个工具** `mcp__ccteam__admin_ls` / `show` / `new` / `spawn_agent` / `stop_agent` / `observe_agents` / `signal` / `set_parallelism` / `trigger_gate` / `get_artifact_summary` 等(见 `docs/versions/v0-4-0/prd.md §6.3` 完整清单) |
 
 #### 1.3.2 验证示例(假设已装 Playwright MCP)
 
@@ -401,4 +401,4 @@ artifact —— 这些工具直接和 Claude Code prompt cache 友好,且 Artifa
 | role 产 artifact → 下游 `trigger: watch:*` | 完全 orchestrator deterministic(ArtifactWatcher),**不经任何 LLM 决策** |
 | escalation event 落 progress.jsonl | **通道 3** meta-agent 用 `observe_agents` / `get_progress` 读到自决策 |
 
-详 `docs/v0-4-0/prd.md §6` 完整架构 + `docs/interfaces.md` workflow.yaml schema。
+详 `docs/versions/v0-4-0/prd.md §6` 完整架构 + `docs/interfaces.md` workflow.yaml schema。

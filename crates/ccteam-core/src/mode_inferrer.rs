@@ -18,7 +18,7 @@
 //! the skill's branching is reproducible across sessions (no hidden
 //! prompt drift between Phase 2 invocations).
 //!
-//! See `docs/v0-6-0/prd.md` F114 §"Phase 2: Mode inference" for the
+//! See `docs/versions/v0-6-0/prd.md` F114 §"Phase 2: Mode inference" for the
 //! authoritative decision table.
 //!
 //! ## Naming note

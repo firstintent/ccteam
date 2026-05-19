@@ -10,7 +10,7 @@ isn't a "cargo test pass only" paper release.
 | Path                | Role |
 |---------------------|------|
 | `deploy-to-nas.sh`  | rsync-equivalent: `git fetch` + `git reset --hard <ref>` on the remote, then `cargo build --release`. Idempotent; safe to re-run before each probe sweep. |
-| `run-probes.sh`     | Executes the 5 preset + 3 Codex scenarios over ssh, writes per-scenario `cmd.txt`, `log`, `cost.txt`, `status` into `./.probe-results/<UTC>/`, and produces a `summary.md` that the operator pastes back into `docs/v0-6-0/host-probe.md`. |
+| `run-probes.sh`     | Executes the 5 preset + 3 Codex scenarios over ssh, writes per-scenario `cmd.txt`, `log`, `cost.txt`, `status` into `./.probe-results/<UTC>/`, and produces a `summary.md` that the operator pastes back into `docs/versions/v0-6-0/host-probe.md`. |
 | `README.md`         | This file. |
 
 ## Typical operator flow
@@ -143,7 +143,7 @@ Run on a fresh probe host before the first deploy:
 ## Co-ordination with V0.6.1
 
 GIF recording of the 8 scenarios is deferred to V0.6.1 post-ship —
-see `docs/v0-6-0/demos/README.md`. The probe scripts here capture
+see `docs/versions/v0-6-0/demos/README.md`. The probe scripts here capture
 text logs + cost snapshots that are sufficient for the V0.6.0
 ship-readiness gate; visual demos can be re-shot off the same
 scripts later.

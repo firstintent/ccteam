@@ -4,7 +4,7 @@
 //! battery in `crates/ccteam-hooks/tests/hooks_test.rs`.
 //!
 //! Coverage rationale (one test per documented invariant in
-//! `docs/v0-4-6/dev-plan.md` §4 / `docs/v0-4-6/prd.md` F91):
+//! `docs/versions/v0-4-6/dev-plan.md` §4 / `docs/versions/v0-4-6/prd.md` F91):
 //!
 //! - `t01_cost_summary_basic` — 5 `agent_done` events at $0.10 each →
 //!   `cost_total = $0.50`, `cost_24h = $0.50` (all events freshly
@@ -278,7 +278,7 @@ fn t05_doctor_update_hooks_removes_cost_accumulate() {
 
 // ============================================================
 // V0.5.0 F92 — transcript-jsonl cost source tests (t06..t11).
-// One test per acceptance bullet in `docs/v0-5-0/prd.md` §F92 §验收.
+// One test per acceptance bullet in `docs/versions/v0-5-0/prd.md` §F92 §验收.
 // ============================================================
 
 /// Build a transcript JSONL with `turns` rows; each row carries one

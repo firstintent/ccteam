@@ -32,7 +32,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 // V0.3 M5.0 (F45 promote): write-helper logic lives in
 // `ccteam_core::actions`; the wrappers below stay thin (args parse +
 // JSON encode + delegate). Web-side consumers (`crates/ccteam-web`)
-// pick up the same import line in M5.3 (`docs/v0-3/dev-plan.md` §5
+// pick up the same import line in M5.3 (`docs/versions/v0-3/dev-plan.md` §5
 // #4.3) — at which point `git grep -nE 'use ccteam_core::actions'`
 // returns ≥ 2 hits.
 use ccteam_core::actions;

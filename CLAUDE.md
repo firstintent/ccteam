@@ -1,7 +1,7 @@
 # CLAUDE.md — ccteam 实现导引
 
 > 本文档面向**下一次接手 ccteam 实现的 Claude session**。每次起手必读。
-> 历史里程碑 + 升级 migration 见 `docs/v0-X-Y/README.md`,本文只描述**当前状态 + 红线 + 纪律**。
+> 历史里程碑 + 升级 migration 见 `docs/versions/v0-X-Y/README.md`,本文只描述**当前状态 + 红线 + 纪律**。
 
 ---
 
@@ -14,9 +14,9 @@
 | 测试 baseline | **`1282/1`**(`cargo test --workspace --locked --no-fail-fast`,1 fail 是 ccteam-web `workflow_summary_reflects_agent_spawn_and_done_events` running_count flake)|
 | Clippy | **0 errors + 0 warnings**(`-D warnings` clean;Wave 4 doc-list drift 清零)|
 | 代码规模 | ~70 kLOC Rust(workspace,不含 references)|
-| 当前最新版 | **V0.6.0**(Epic A + B + C 铺底 + F106 / F107 / F108 / F109 / F111 / F112 / F113 / F114 / F115 / F116 / F117 / F118)— 详 `docs/v0-6-0/README.md`(F110 namespace rename 取消;5 preset / 3 mode × 2 vendor 矩阵;`ccteam-imd` 独立 daemon + tmux 长 session + dual-track hooks+transcript;Codex Option B 完整)|
-| V0.6.x 延期候选 | F98 plan-approval↔outbox 联动 + F119 6 号编排模式 HITL — 详 `docs/v0-6-0/README.md §八`;V0.7 主线 = Epic C 国内 IM(WeChat / 飞书 / DingTalk / QQ)启用 + chat memory 跨设备同步 |
-| 历史版本 | V0.1 → V0.5.1 见各自 `docs/v0-X-Y/README.md` |
+| 当前最新版 | **V0.6.0**(Epic A + B + C 铺底 + F106 / F107 / F108 / F109 / F111 / F112 / F113 / F114 / F115 / F116 / F117 / F118)— 详 `docs/versions/v0-6-0/README.md`(F110 namespace rename 取消;5 preset / 3 mode × 2 vendor 矩阵;`ccteam-imd` 独立 daemon + tmux 长 session + dual-track hooks+transcript;Codex Option B 完整)|
+| V0.6.x 延期候选 | F98 plan-approval↔outbox 联动 + F119 6 号编排模式 HITL — 详 `docs/versions/v0-6-0/README.md §八`;V0.7 主线 = Epic C 国内 IM(WeChat / 飞书 / DingTalk / QQ)启用 + chat memory 跨设备同步 |
+| 历史版本 | V0.1 → V0.5.1 见各自 `docs/versions/v0-X-Y/README.md` |
 
 **ccteam 是 Claude Code 之上的元工具**(V0.4.0+,V0.6.0 起转 product-ready 元 AI 团队):每个项目用 `workflow.yaml` 声明 agent 拓扑(**无 prompt,只有 trigger + 并发上限 + `mode: chat`/`vendor: claude\|codex` for V0.6 mode 3**),`.claude/agents/<role>.md` 定义 agent 行为;Rust orchestrator 通过 `ArtifactWatcher`(inotify)监听文件系统控制平面 → spawn `claude --bg --agent <role>`(mode 2)/ 进 tmux 长 session `claude` TUI(mode 3,V0.6 F108)/ `codex exec --json` / `codex app-server` UDS(V0.6 F112);`progress.jsonl` 记录 7 类业务 event + 新增 `chat_session_reset` / `turn_done` 为唯一状态 SoT(mode 3 对话原文走 ccteam-owned `<project>/.ccteam/chat/<bot>/turns.jsonl`);用户通过 meta-agent + `ccteam-control` skill + **24 个 `mcp__ccteam__{workflow_,chat_,advise_,admin_,screenshot}*` 子前缀分组工具**(V0.6 F111)操作;`ccteam-imd` 独立 supervisor daemon(V0.6 F116)守 IM bridge,统一 `openhuman/channels` Rust crate 14+ IM 平台(V0.6 F109);web UI 提供 4 面板 + SSE。详 `docs/tech-design.md` §2.1。
 
@@ -33,8 +33,8 @@
 | 6 | `docs/ccteam-as-domain-agnostic-orchestrator.md` | 加新 team / 改红线时 |
 | 7 | `docs/claude-code-best-practices.md` | 改 agent prompt / hooks / context 管理时 |
 | 8 | `docs/claude-code-tool-surface.md` | 改 workflow.yaml + agent .md 时 |
-| 9 | `docs/v0-6-0/README.md` | 看当前版本(V0.6.0 Epic A/B/C + F106-F118 + 4-wave 范式)|
-| 10 | `docs/v0-6-0/{wave-1,wave-2,wave-3}-handoff.md` | 看每 wave Decided / Rejected / Risks / Files / Remaining 五段 |
+| 9 | `docs/versions/v0-6-0/README.md` | 看当前版本(V0.6.0 Epic A/B/C + F106-F118 + 4-wave 范式)|
+| 10 | `docs/versions/v0-6-0/{wave-1,wave-2,wave-3}-handoff.md` | 看每 wave Decided / Rejected / Risks / Files / Remaining 五段 |
 
 **起手 30 秒**:`git log -1` 看 HEAD → `cargo test --workspace 2>&1 | awk '/^test result/{p+=$4;f+=$6}END{print p,f}'` 校 1282/1 → 读用户诉求 → 干。
 
@@ -42,12 +42,12 @@
 
 **文档维护三类**:
 1. **`docs/` 根目录(全局)**— 每 session 装入上下文 + 与代码并列 SoT + 每版本 ship 后必更新
-2. **`docs/v0-x-x/`(版本归档)**— ship 后冻结,按需加载,**不动老版本**
+2. **`docs/versions/v0-x-x/`(版本归档)**— ship 后冻结,按需加载,**不动老版本**
 3. **`research/`(扩展研究)**— 不更新,按需加载
 
 ## 三、不可触碰的架构红线
 
-源 `docs/tech-design.md`,V0.6.0 F106 起按 **"模式 × vendor"双轴 scope**(详 `docs/v0-6-0/README.md §五`)。任何 PR 不得违反:
+源 `docs/tech-design.md`,V0.6.0 F106 起按 **"模式 × vendor"双轴 scope**(详 `docs/versions/v0-6-0/README.md §五`)。任何 PR 不得违反:
 
 | 红线 | 模式 1 in-proc | 模式 2 bg(Claude / Codex)| 模式 3 chat(Claude / Codex)|
 |---|---|---|---|
@@ -66,8 +66,8 @@
 | **HITL approval state SoT**(V0.6.1 F124 narrow scope;`mode: human-approval` 第 4 mode 与 1/2/3 并列)| — | progress.jsonl::plan_decision(F98 IM round-trip 写;orchestrator 等到事件再 drain pending)| 同 |
 
 **README / 版本进展红线**(V0.6.1 F126):
-- root `README.md` = OSS 主入口,必须英文。`docs/{quickstart,user-manual,recipes,troubleshooting}.md` + `docs/advanced/*` 持续中文(国内用户面);所有版本归档 `docs/v0-X-Y/` 中英不限(开发过程语)。
-- root `README.md` **不**含 `Status` / `V0.x.y in production` / `shipped 日期` / `baseline 数字` / `candidate finding` 列表等版本进展段。版本进展全部去 `docs/v0-X-Y/README.md`(每版本独立 dir);F-finding 索引去 `docs/dev-coupling-audit.md`。README 是产品介绍,**始终反映当前可用状态**,不夹版本时间轴。
+- root `README.md` = OSS 主入口,必须英文。`docs/{quickstart,user-manual,recipes,troubleshooting}.md` + `docs/advanced/*` 持续中文(国内用户面);所有版本归档 `docs/versions/v0-X-Y/` 中英不限(开发过程语)。
+- root `README.md` **不**含 `Status` / `V0.x.y in production` / `shipped 日期` / `baseline 数字` / `candidate finding` 列表等版本进展段。版本进展全部去 `docs/versions/v0-X-Y/README.md`(每版本独立 dir);F-finding 索引去 `docs/dev-coupling-audit.md`。README 是产品介绍,**始终反映当前可用状态**,不夹版本时间轴。
 
 **vendor 红线补充**(V0.6 F107 / F112):
 - ccteam **不 vendor** Claude / Codex 二进制(`references/{claude-code,codex/codex-rs}/` git-ignore 不入库,仅协议参考;实际 spawn 走 `$PATH` 内 `claude` / `codex` binary + `CCTEAM_{CLAUDE,CODEX}_BIN` env override)
@@ -103,7 +103,7 @@
 
 ### Patch 版本(V0.x.y)开发流程
 
-1. **doc-first**:PRD + dev-plan 落 `docs/v0-x-y/`,用户 review 后才动代码
+1. **doc-first**:PRD + dev-plan 落 `docs/versions/v0-x-y/`,用户 review 后才动代码
 2. **worktree-per-finding** + subagent 派工(briefing 含 PRD section + 验收条目)
 3. **PR review/fix/merge** + `workspace.package.version` bump,commit 用 `vX.Y.Z:` 前缀
 4. **CLAUDE.md baseline 回填**:`cargo test --workspace` 通过新数后改本文 §一表格
@@ -112,7 +112,7 @@
 
 V0.6.0 走通的 4-wave 流程,V0.6.x patch + V0.7 minor 起点直接复用:
 
-1. **doc-first kick-off**:Epic + PRD + dev-plan 同落 `docs/v0-x-0/`(Epic 替代上版 F-finding 顶层结构);多 agent review 收敛(architect / cc-expert / pm / researcher / codex-expert)→ `README.md` synthesize
+1. **doc-first kick-off**:Epic + PRD + dev-plan 同落 `docs/versions/v0-x-0/`(Epic 替代上版 F-finding 顶层结构);多 agent review 收敛(architect / cc-expert / pm / researcher / codex-expert)→ `README.md` synthesize
 2. **wave-by-wave worktree 并行**:每 wave 一份 `wave-N-handoff.md`(Decided / Rejected / Risks / Files / Remaining 五段固定)+ 一个 PR;subagent 派工 briefing 必含 wave acceptance gate + 上 wave handoff link
 3. **per-wave PR review**:CR(architect)+ implementation(worktree)+ doc-syncer(本 wave)三角分工;CR 不动 docs,doc-syncer 不动 host probe,worktree 不跨 wave 修代码
 4. **final wave = doc-syncer + host-probe 双线收尾**:Tier-1 docs sync(本文件 §一 baseline + tech-design / interfaces / dev-coupling-audit / claude-code-tool-surface)+ MCP tool name / config schema sweep + clippy 0-warning gate + version bump + tag
@@ -130,7 +130,7 @@ V0.6.0 走通的 4-wave 流程,V0.6.x patch + V0.7 minor 起点直接复用:
 - **`claude --bg --agent` CLI 形态可能漂移** — `CCTEAM_CLAUDE_BIN` + `CCTEAM_CLAUDE_JOBS_DIR` env override 让测试不依赖真实 binary;生产改 `state_json_path` + `spawn_session` argv 即可,无需重构上层
 - **本文件 ≤200 行** — 越长 cache 越贵,Claude 越忽略
 
-历史版本升级 migration(V0.1 → V0.4.5)详各 `docs/v0-X-Y/README.md`,不在此重复。
+历史版本升级 migration(V0.1 → V0.4.5)详各 `docs/versions/v0-X-Y/README.md`,不在此重复。
 
 ## 七、Rust 代码格式化约定
 

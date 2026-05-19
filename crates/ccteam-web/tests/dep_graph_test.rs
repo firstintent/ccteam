@@ -2,7 +2,7 @@
 //! `ccteam-cli` (binary-as-library is a dep-graph anti-pattern; the
 //! two crates are siblings — both fan in to `ccteam-core`).
 //!
-//! `docs/v0-3/prd.md` §3.2.3 + `docs/dev-coupling-audit.md` F45 lock
+//! `docs/versions/v0-3/prd.md` §3.2.3 + `docs/dev-coupling-audit.md` F45 lock
 //! the rule. This test runs `cargo tree -p ccteam-web` and asserts no
 //! `ccteam-cli` line appears anywhere in the output.
 //!

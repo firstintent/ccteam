@@ -43,14 +43,14 @@ P0 + 同 PR 关闭;**2026-05-08 V0.2 e2e retro**:加 F26-F33 八条 V0.2.1 候�
 | **N/A 已是领域无关** | 2 | F14, F19(M3 docs sweep 后)|
 | **已修复** | 44 | F1 / F5 / F6 / F7 / F18(2026-05-07 rename PR;F1 触发逻辑实际早 M3.1 已切到 template.auto_loop,本 PR 完成命名层 sweep)、F2 / F3 / F4(M3.1 dag.rs)、F8(2026-05-07 directory scan)、F9 / F10 / F11(M3.4 team-aware bootstrap;F11 dev 仍裸 `phases/` 但非阻塞)、F12 / F13(M3.3 `--team` CLI + `state.team`)、F16(M3.4 phase 模板 team 化)、F20(M3.1+M3.4 retro_schema 数据形式 + product-research 填字段 + M4.1 phase 消费)、F21(@a5fb21d)、F22(PR #12)、**F24 / F25(2026-05-08 M0.23 PR)**、**F26 / F27 / F28 / F29 / F30 / F31 / F32 / F33(2026-05-08 V0.2.1 patch)**、**F34 / F35 / F36 / F37 / F38 / F39 / F40(2026-05-09 V0.2.2 patch — 7 finding 跨 7 PR)**、**F41 / F42 / F43(2026-05-09 V0.2.2 e2e retro patch)**、**F46 / F47 / F48 / F49 / F50 / F51(2026-05-10 V0.3.1 patch)** |
 
-### V0.2 §6 反模式候选状态(docs/v0-2/prd.md)
+### V0.2 §6 反模式候选状态(docs/versions/v0-2/prd.md)
 
 PRD V0.2 §6 列了 8 条 ccteam-core 反模式候选清理任务,跟 F-finding
 独立编号但同源(都是"领域字面量泄漏到 core"):
 
 | 候选 | 描述 | 状态 |
 |---|---|---|
-| 1 + 8 | 协议关键字 `PHASE_DONE` / `ESCALATE` 三处镜像 → 单一 source | **2026-05-08 关闭(M0.18):inject prompt template + frontmatter `completion_signal` / `escalate_grammar_ref` 单一 source;phase markdown 正文清理协议关键词;`build_phase_prompt_for_template` 是唯一 protocol literal 拼装位置;详 `docs/v0-2/phase-prompt-architecture.md`** |
+| 1 + 8 | 协议关键字 `PHASE_DONE` / `ESCALATE` 三处镜像 → 单一 source | **2026-05-08 关闭(M0.18):inject prompt template + frontmatter `completion_signal` / `escalate_grammar_ref` 单一 source;phase markdown 正文清理协议关键词;`build_phase_prompt_for_template` 是唯一 protocol literal 拼装位置;详 `docs/versions/v0-2/phase-prompt-architecture.md`** |
 | 2 | `render_project_claude_md` `match team` 写死 | **2026-05-07 关闭(M0.16.3)** |
 | 3 | `TEAM_BUNDLES` 编译时常量 → seed-only | **2026-05-07 关闭(M0.16.2)** |
 | 5 | meta-agent `if team == META_TEAM_NAME` 5 处分叉 | **2026-05-07 关闭(M0.16.1)** |
@@ -74,35 +74,35 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
 
 ## V0.3.2+ 索引(F52-F91)
 
-> **2026-05-16 V0.4.6 docs tier-3 sweep 加**:V0.3.2 起 finding 详细描述 + 修复路径**直接住版本目录** `docs/v0-X-Y/{prd.md,dev-plan.md}`,本文不再 inline 重复(节省维护成本)。本节只给一行索引 + 状态 + 链接。F1-F51 历史 detail 块**保留作 V0.1-V0.3.1 考古**。
+> **2026-05-16 V0.4.6 docs tier-3 sweep 加**:V0.3.2 起 finding 详细描述 + 修复路径**直接住版本目录** `docs/versions/v0-X-Y/{prd.md,dev-plan.md}`,本文不再 inline 重复(节省维护成本)。本节只给一行索引 + 状态 + 链接。F1-F51 历史 detail 块**保留作 V0.1-V0.3.1 考古**。
 >
 > **V0.4.0 起 phase 流水线 EOL**:F60 整删 `phases/` 模块 + `golden_rules` + `dag.rs` + `subskill` 等。F1-F33 中大量 finding(`FIX_PHASE_NAME` / `M0_PHASE_DAG` / `current_phase` 等)所**关闭的代码本身 V0.4.0 已经物理删除**,本节不再 backport — 历史描述按"那时怎么想的"保留。
 
 | Finding | 版本 | 状态 | 摘要 |
 |---|---|---|---|
-| F52-F59 | V0.3.2 | closed | SPA + write-action forms + htmx retirement → `docs/v0-3-2/{prd,dev-plan}.md` |
-| F60 | V0.4.0 | closed | phase 全删 → workflow.yaml 架构,见 `docs/v0-4-0/prd.md` §1 |
-| F61-F69 | V0.4.0 | closed | 17 MCP 工具 + ArtifactWatcher + thin orchestrator + WorkflowView SPA + claude --bg adapter → `docs/v0-4-0/{prd,dev-plan}.md` |
+| F52-F59 | V0.3.2 | closed | SPA + write-action forms + htmx retirement → `docs/versions/v0-3-2/{prd,dev-plan}.md` |
+| F60 | V0.4.0 | closed | phase 全删 → workflow.yaml 架构,见 `docs/versions/v0-4-0/prd.md` §1 |
+| F61-F69 | V0.4.0 | closed | 17 MCP 工具 + ArtifactWatcher + thin orchestrator + WorkflowView SPA + claude --bg adapter → `docs/versions/v0-4-0/{prd,dev-plan}.md` |
 | F70-F71 | (skip) | — | 编号跳号(V0.4.0 docs 准备阶段保留) |
-| F72-F75 | V0.4.2 | closed | `ccteam init` 三合一 + `~/.ccteam/config.yaml` + `doctor --migrate-v041-to-v042` + `ccteam new` thin wrapper → `docs/v0-4-2/prd.md` |
-| F76 | V0.4.3 | closed | slug grammar validation → `docs/v0-4-3/README.md` |
-| F77 | V0.4.4 | closed | `session_context_from_cwd` walk-up + `paths.project_dir(slug)` 走 config.yaml → `docs/v0-4-4/README.md` |
-| F78 | V0.4.5 | closed | watcher 项目相对路径修复 + progress.jsonl 参数对齐 → `docs/v0-4-5/README.md` |
+| F72-F75 | V0.4.2 | closed | `ccteam init` 三合一 + `~/.ccteam/config.yaml` + `doctor --migrate-v041-to-v042` + `ccteam new` thin wrapper → `docs/versions/v0-4-2/prd.md` |
+| F76 | V0.4.3 | closed | slug grammar validation → `docs/versions/v0-4-3/README.md` |
+| F77 | V0.4.4 | closed | `session_context_from_cwd` walk-up + `paths.project_dir(slug)` 走 config.yaml → `docs/versions/v0-4-4/README.md` |
+| F78 | V0.4.5 | closed | watcher 项目相对路径修复 + progress.jsonl 参数对齐 → `docs/versions/v0-4-5/README.md` |
 | F79 | (skip) | — | 编号跳号 |
-| F80 | V0.4.5 | closed | phantom `agent_spawn` cleanup(`claude_job::probe_job` + synthetic agent_done)→ `docs/v0-4-5/README.md` |
-| **F81** | V0.4.6 | **closed** | `ccteam remove <slug>` lifecycle + active-session refusal → `docs/v0-4-6/prd.md` F81 |
-| **F82** | V0.4.6 | **closed** | workflow.yaml `enabled` + 热加载(`oneshot::Receiver<CancelReason>` + `WorkflowFileWatcher`)→ `docs/v0-4-6/prd.md` F82 |
-| **F83** | V0.4.6 | **closed** | workflow.yaml 默认住 `.ccteam/`(root fallback)+ `doctor --migrate-workflow-to-ccteam-dir` → `docs/v0-4-6/prd.md` F83 |
-| **F84** | V0.4.6 | **closed** | `BudgetSpec`(`max_cost_usd_per_24h` / `max_agent_spawns_per_hour`)→ auto-disable workflow → `docs/v0-4-6/prd.md` F84 |
-| **F85** | V0.4.6 | **closed** | `~/.claude/jobs/` GC + `doctor --gc-claude-jobs` + daemon 启动 sweep → `docs/v0-4-6/prd.md` F85 |
-| **F86** | V0.4.6 | **closed** | daemon graceful shutdown(cancel token + 30s timeout fallback + trigger file `/tmp/ccteam-<user>.shutdown`)→ `docs/v0-4-6/prd.md` F86 |
-| **F87** | V0.4.6 | **closed** | clap `allow_hyphen_values` + `disable_help_flag` 在 `send` / `spawn` → `docs/v0-4-6/prd.md` F87 |
-| **F88** | V0.4.6 | **closed** | web bearer token 自动 clipboard(xclip → xsel → wl-copy → pbcopy → clip.exe fallback chain)→ `docs/v0-4-6/prd.md` F88 |
-| **F89** | V0.4.6 | **closed** | CLI 瘦身:删 V0.3 legacy(`phase` / `decisions` / `watchdog`),`hook` / `mcp-serve` / `spawn` / `send` / `peek` / `attach` / `progress` / `resume` 移到 `ccteam internal <subcmd>` 隐藏分组(老顶层保留 + WARN 到 V0.5)→ `docs/v0-4-6/prd.md` F89 |
-| **F90** | V0.4.6 | **closed** | Web WorkflowView 4 新面板(ArtifactQueuePanel / EventsTimelinePanel / FailureInspector / CostSparkline)+ 4 新 API endpoint → `docs/v0-4-6/prd.md` F90 |
-| **F91** | V0.4.6 | **closed** | cost SoT 收敛(删 `Hook::CostAccumulate` + `cost_summary` 实时读 `~/.claude/jobs/<id>/state.json::cost_usd_total`;`state.cost_used_usd` 字段 deprecated 但 serde-compat)→ `docs/v0-4-6/prd.md` F91 |
+| F80 | V0.4.5 | closed | phantom `agent_spawn` cleanup(`claude_job::probe_job` + synthetic agent_done)→ `docs/versions/v0-4-5/README.md` |
+| **F81** | V0.4.6 | **closed** | `ccteam remove <slug>` lifecycle + active-session refusal → `docs/versions/v0-4-6/prd.md` F81 |
+| **F82** | V0.4.6 | **closed** | workflow.yaml `enabled` + 热加载(`oneshot::Receiver<CancelReason>` + `WorkflowFileWatcher`)→ `docs/versions/v0-4-6/prd.md` F82 |
+| **F83** | V0.4.6 | **closed** | workflow.yaml 默认住 `.ccteam/`(root fallback)+ `doctor --migrate-workflow-to-ccteam-dir` → `docs/versions/v0-4-6/prd.md` F83 |
+| **F84** | V0.4.6 | **closed** | `BudgetSpec`(`max_cost_usd_per_24h` / `max_agent_spawns_per_hour`)→ auto-disable workflow → `docs/versions/v0-4-6/prd.md` F84 |
+| **F85** | V0.4.6 | **closed** | `~/.claude/jobs/` GC + `doctor --gc-claude-jobs` + daemon 启动 sweep → `docs/versions/v0-4-6/prd.md` F85 |
+| **F86** | V0.4.6 | **closed** | daemon graceful shutdown(cancel token + 30s timeout fallback + trigger file `/tmp/ccteam-<user>.shutdown`)→ `docs/versions/v0-4-6/prd.md` F86 |
+| **F87** | V0.4.6 | **closed** | clap `allow_hyphen_values` + `disable_help_flag` 在 `send` / `spawn` → `docs/versions/v0-4-6/prd.md` F87 |
+| **F88** | V0.4.6 | **closed** | web bearer token 自动 clipboard(xclip → xsel → wl-copy → pbcopy → clip.exe fallback chain)→ `docs/versions/v0-4-6/prd.md` F88 |
+| **F89** | V0.4.6 | **closed** | CLI 瘦身:删 V0.3 legacy(`phase` / `decisions` / `watchdog`),`hook` / `mcp-serve` / `spawn` / `send` / `peek` / `attach` / `progress` / `resume` 移到 `ccteam internal <subcmd>` 隐藏分组(老顶层保留 + WARN 到 V0.5)→ `docs/versions/v0-4-6/prd.md` F89 |
+| **F90** | V0.4.6 | **closed** | Web WorkflowView 4 新面板(ArtifactQueuePanel / EventsTimelinePanel / FailureInspector / CostSparkline)+ 4 新 API endpoint → `docs/versions/v0-4-6/prd.md` F90 |
+| **F91** | V0.4.6 | **closed** | cost SoT 收敛(删 `Hook::CostAccumulate` + `cost_summary` 实时读 `~/.claude/jobs/<id>/state.json::cost_usd_total`;`state.cost_used_usd` 字段 deprecated 但 serde-compat)→ `docs/versions/v0-4-6/prd.md` F91 |
 | **F92** | V0.4.7 候选 | **open** | 真 cost 数据源(host `state.json` 没有 `cost_usd_total` 字段 — 真实数据在 `linkScanPath` jsonl event 的 Anthropic `usage` 字段)— 2026-05-16 V0.4.6 E2E 发现 |
-| F93-F105 | V0.5.0 / V0.5.1 | closed | 详 `docs/v0-5-0/README.md` + `docs/v0-5-1/README.md`(F92 真 cost + agent-team mode + meta-agent reposition + host E2E SPA 可见性 + `--env` argv bug 等)|
+| F93-F105 | V0.5.0 / V0.5.1 | closed | 详 `docs/versions/v0-5-0/README.md` + `docs/versions/v0-5-1/README.md`(F92 真 cost + agent-team mode + meta-agent reposition + host E2E SPA 可见性 + `--env` argv bug 等)|
 | **F106** | V0.6.0 | ✓ shipped wave-跟随 | 红线表按"模式 × vendor"双轴 scope 重写 — `docs/tech-design.md §0` + CLAUDE.md §三;V0.6.0 ship 后所有 PR 必按双轴 check |
 | **F107** | V0.6.0 | ✓ shipped wave 1 | `HarnessAdapter` trait Option C:扩展现有 trait 对齐 Codex `ThreadManager`(5 方法 thread/turn 接口 + `TurnInput` enum + `AgentVendor` enum + `ExecutionMode { InProc \| Bg \| Chat }`)— `crates/ccteam-core/src/harness.rs` |
 | **F108** | V0.6.0 | ✓ shipped wave 2 | 模式 3 执行路径 Option C 决策 flip:**tmux 长 session + send-keys -l 直送 user content + dual-track(Claude Code 官方 hooks fast event 通道 + transcript jsonl byte-offset 增量读 → 镜像 ccteam-owned `turns.jsonl`)+ slash 命令透明透传**(综合 ccgram + OMC production 验证;弃上版 `claude -p --resume` + stream-json) |
@@ -132,7 +132,7 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
 
 ## 当前 open finding(V0.4.6)
 
-V0.4.6 起 audit 文档**只列 open finding** + V0.3.2+ 索引(见 §"V0.3.2+ 索引");已 close finding 的详细描述住版本 dir(`docs/v0-X-Y/{prd,dev-plan}.md`)。CLAUDE.md §五.3 "Pre-v1.0 不留技术债"原则:本节不保留任何已 close finding 的描述。
+V0.4.6 起 audit 文档**只列 open finding** + V0.3.2+ 索引(见 §"V0.3.2+ 索引");已 close finding 的详细描述住版本 dir(`docs/versions/v0-X-Y/{prd,dev-plan}.md`)。CLAUDE.md §五.3 "Pre-v1.0 不留技术债"原则:本节不保留任何已 close finding 的描述。
 
 ### F15 — settings.json 模板未含危险命令拦截(P1)
 
@@ -148,7 +148,7 @@ V0.4.6 起 audit 文档**只列 open finding** + V0.3.2+ 索引(见 §"V0.3.2+ �
 ### F23 — 容器 bind-mount `~/.claude/rules/`(P1 conditional)
 
 - **位置**:N/A(spike 验证)
-- **状态**:F22 修复后 spike §4 已解锁,等谁跑一次容器内 `--dangerously-skip-permissions` 验证 `~/.claude/rules/*.md` 是否被 Claude Code 当 context 注入。spike 失败才升 P0;详 `docs/v0-1/m4-spike.md` §4。
+- **状态**:F22 修复后 spike §4 已解锁,等谁跑一次容器内 `--dangerously-skip-permissions` 验证 `~/.claude/rules/*.md` 是否被 Claude Code 当 context 注入。spike 失败才升 P0;详 `docs/versions/v0-1/m4-spike.md` §4。
 
 ### F92 — cost 数据源真相(V0.4.7 候选)
 
@@ -178,6 +178,6 @@ V0.4.6 起 audit 文档**只列 open finding** + V0.3.2+ 索引(见 §"V0.3.2+ �
 
 ## 历史(F1-F91)
 
-完整 finding 历史 detail 已**移到版本 dir**(`docs/v0-X-Y/{prd,dev-plan}.md`),按 ship 时间顺序索引在上面 "V0.3.2+ 索引" 表 + V0.2 §6 反模式状态表里。本文不再 inline 重复(CLAUDE.md §二 三类文档维护规则 + §五.3 "Pre-v1.0 不留技术债")。
+完整 finding 历史 detail 已**移到版本 dir**(`docs/versions/v0-X-Y/{prd,dev-plan}.md`),按 ship 时间顺序索引在上面 "V0.3.2+ 索引" 表 + V0.2 §6 反模式状态表里。本文不再 inline 重复(CLAUDE.md §二 三类文档维护规则 + §五.3 "Pre-v1.0 不留技术债")。
 
 V0.1-V0.3.1 时代的 finding 详细 audit 文本(F1-F51)2026-05-16 删除前最后版本见 git history(`107ccb2` 之前);其论点已被 V0.4.0 F60 phase 删除 + V0.4.0+ workflow.yaml 架构整体 supersede。

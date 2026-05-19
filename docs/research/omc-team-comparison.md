@@ -1,6 +1,6 @@
 # OMC team vs ccteam V0.5.0 agent-team mode
 
-> **角色**:研究笔记。读完后回 `docs/v0-5-0/prd.md` 看 ccteam 怎么落地。**不更新**(按 ccteam 文档维护三类规则:research 是探索性,不进 SoT)。
+> **角色**:研究笔记。读完后回 `docs/versions/v0-5-0/prd.md` 看 ccteam 怎么落地。**不更新**(按 ccteam 文档维护三类规则:research 是探索性,不进 SoT)。
 >
 > **资料**:
 > - `references/omc/skills/team/SKILL.md` 1040 行 — `Yeachan-Heo/oh-my-claudecode@main:skills/team/SKILL.md`(2026-05-17 镜像)
@@ -173,5 +173,5 @@ ccteam V0.5.0 学习的是**这几层**(尤其 worker preamble + snapshot + orph
 - Anthropic 实测 sample:
   - `references/claude-code/teams-samples/config-roblog.json`(team config 完整)
   - `references/claude-code/teams-samples/inbox-team-lead.json`(team-lead 收件箱,39 条消息)
-- ccteam V0.5.0 PRD:`docs/v0-5-0/prd.md`(借鉴 / 差异 落实)
+- ccteam V0.5.0 PRD:`docs/versions/v0-5-0/prd.md`(借鉴 / 差异 落实)
 - ccteam 设计哲学:`docs/orchestration-patterns.md`(5 模式 + 拆分原则)

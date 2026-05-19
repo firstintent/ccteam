@@ -284,6 +284,6 @@ omc_run_team_cleanup  →  kill + rm 状态
 | `runtime-v2.ts` 是算子库不是 daemon | `oh-my-claudecode/src/team/runtime-v2.ts:886/1695/1921/2186`(exports) |
 | sentinel-gate 是硬约束 | `oh-my-claudecode/src/team/sentinel-gate.ts`(177 LOC)|
 | Stage handoff `.omc/handoffs/<stage>.md` | `SKILL.md:151-185` |
-| ccteam Rust orchestrator 模型 | `CLAUDE.md §一/§三` + `docs/v0-4-0/README.md` |
+| ccteam Rust orchestrator 模型 | `CLAUDE.md §一/§三` + `docs/versions/v0-4-0/README.md` |
 | ccteam 文件系统是控制平面 | `CLAUDE.md §三` 红线 |
 | ccteam 17 MCP 工具 | `CLAUDE.md §一` workspace 描述 |

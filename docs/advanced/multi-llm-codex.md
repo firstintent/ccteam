@@ -2,7 +2,7 @@
 
 > **Audience**:已用过 V0.5.x ccteam,想理解 V0.6.0 引入的 Codex 集成怎么工作 + 怎么定制 / 双 vendor workflow 调优 / cross-vendor 限制的高级用户。新手不必读这篇 — Codex 在默认场景下对你**完全透明**。
 >
-> **Source of truth**:`docs/v0-6-0/{README,prd}.md` §F107 / F108 / F112。本文是消化版,优先以 prd 为准。
+> **Source of truth**:`docs/versions/v0-6-0/{README,prd}.md` §F107 / F108 / F112。本文是消化版,优先以 prd 为准。
 
 ---
 
@@ -267,7 +267,7 @@ Windows 无 POSIX symlink → 副本 + git pre-commit hook 守同步(`scripts/sy
 
 ## See also
 
-- `docs/v0-6-0/prd.md` §F107 / F108 / F112 — 完整 finding 设计
+- `docs/versions/v0-6-0/prd.md` §F107 / F108 / F112 — 完整 finding 设计
 - `docs/orchestration-patterns.md` §五 — 5 拓扑 × 3 执行模式适用矩阵全表
-- `docs/v0-6-0/README.md` §4.3 — Codex 4 用户可见场景的 UX 决策记录
+- `docs/versions/v0-6-0/README.md` §4.3 — Codex 4 用户可见场景的 UX 决策记录
 - `CLAUDE.md` §三 红线表 — R3 / R4 / R6 / R8 在模式 × vendor 下的措辞

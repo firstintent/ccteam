@@ -17,7 +17,7 @@
 //! binaries, asserting on their behavior in CI is brittle. We rely on
 //! manual smoke (Linux/WSL/macOS) at ship time.
 //!
-//! Spec: `docs/v0-4-6/prd.md` F88, `docs/v0-4-6/dev-plan.md` 阶段 9.
+//! Spec: `docs/versions/v0-4-6/prd.md` F88, `docs/versions/v0-4-6/dev-plan.md` 阶段 9.
 
 use std::io::Write;
 use std::process::{Command, Stdio};

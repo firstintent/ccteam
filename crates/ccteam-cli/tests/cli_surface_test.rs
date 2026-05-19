@@ -1,7 +1,7 @@
 //! V0.4.6 F89 — CLI surface tests for the `internal` subcommand
 //! reorganization.
 //!
-//! Tests (from `docs/v0-4-6/dev-plan.md` §10):
+//! Tests (from `docs/versions/v0-4-6/dev-plan.md` §10):
 //!
 //! 1. `t01_help_user_facing_only` — `ccteam --help` lists only the
 //!    user-facing surface plus the `internal` umbrella, hiding the

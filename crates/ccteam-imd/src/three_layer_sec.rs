@@ -109,7 +109,7 @@ pub fn verify_slack_signature_stub(
     }
     // No HMAC backend wired yet; conservative deny by default.
     // Slack inbound HTTP receiver is V0.7 scope per
-    // docs/v0-6-0/wave-2-decisions.md §5.
+    // docs/versions/v0-6-0/wave-2-decisions.md §5.
     false
 }
 

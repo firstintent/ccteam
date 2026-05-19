@@ -284,7 +284,7 @@ escalate 时,handoff 摘要也会自动 attach 到 meta-agent inbox 让用户看
 
 ## References
 
-- Agent Teams design: docs/v0-5-0/prd.md §F93b
+- Agent Teams design: docs/versions/v0-5-0/prd.md §F93b
 - Worker Preamble origin: skills/ccteam-team/SKILL.md §6 (duplicated
   intentionally — see top-of-file note)
 - Architecture red lines: CLAUDE.md §三

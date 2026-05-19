@@ -87,7 +87,7 @@ echo '{}' > ~/projects/dev-ui-quality/.ccteam/gate_override/shipper
 
 shipper 启动,读取 verdict 列表执行发布动作。
 
-## workflow.yaml 字段速查（详见 `docs/v0-4-0/user-manual.md`）
+## workflow.yaml 字段速查（详见 `docs/versions/v0-4-0/user-manual.md`）
 
 ```yaml
 name: <string>                     # workflow 名，唯一标识
@@ -163,9 +163,9 @@ agent 在 prompt 里直接引用 `$CCTEAM_INPUT` / `$CCTEAM_OUTPUT` 即可。
 
 ## 进一步阅读
 
-- [`../../docs/v0-4-0/user-manual.md`](../../docs/v0-4-0/user-manual.md) —
+- [`../../docs/versions/v0-4-0/user-manual.md`](../../docs/versions/v0-4-0/user-manual.md) —
   V0.4.0 完整用户手册
-- [`../../docs/v0-4-0/prd.md`](../../docs/v0-4-0/prd.md) —
+- [`../../docs/versions/v0-4-0/prd.md`](../../docs/versions/v0-4-0/prd.md) —
   架构哲学 + 核心抽象 + 三层架构
-- [`../../docs/v0-4-0/migration-guide.md`](../../docs/v0-4-0/migration-guide.md) —
+- [`../../docs/versions/v0-4-0/migration-guide.md`](../../docs/versions/v0-4-0/migration-guide.md) —
   V0.3.x phase 驱动项目迁移指南

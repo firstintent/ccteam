@@ -341,7 +341,7 @@ fn snapshot_to_team_spec(snapshot: &serde_json::Value) -> Option<crate::AgentTea
 /// byte-for-byte, so a consumer can `serde_json::from_value` directly
 /// without reflowing the watcher's emit path.
 ///
-/// PRD: `docs/v0-5-0/prd.md` §F95 + §F94 `event` table.
+/// PRD: `docs/versions/v0-5-0/prd.md` §F95 + §F94 `event` table.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "event")]
 pub enum TeamEvent {

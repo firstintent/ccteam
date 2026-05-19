@@ -256,6 +256,6 @@ V0.4.6 ccteam 通过 `workflow.yaml` + Trigger 4 类 + parallelism 字段承载 
 | OMC `ccg` vote / advisor 模式 | `skills/ccg/SKILL.md`(详 `omc-orchestration-modes.md` §2.3) |
 | OMC `ultrawork` parallel + worktree 隔离 | `skills/ultrawork/SKILL.md` + `src/team/git-worktree.ts` |
 | OMC `ralph` boulder-never-stops + polite-stop 抗体 | `skills/ralph/SKILL.md`(详 `omc-orchestration-modes.md` §2.6) |
-| ccteam workflow.yaml + Rust orchestrator | `CLAUDE.md §一` + `docs/v0-4-0/README.md` |
+| ccteam workflow.yaml + Rust orchestrator | `CLAUDE.md §一` + `docs/versions/v0-4-0/README.md` |
 | ccteam fix-loop hard cap 红线 | `CLAUDE.md §三` |
-| ccteam phase 删除决策 | `docs/v0-4-0/prd.md` |
+| ccteam phase 删除决策 | `docs/versions/v0-4-0/prd.md` |

@@ -40,7 +40,7 @@
 //!    syntax errors are logged + the old loop is left running (F82 PRD
 //!    §validation #4 fail-safe).
 //!
-//! See also `docs/v0-4-6/prd.md` §F82 + dev-plan §阶段 1.
+//! See also `docs/versions/v0-4-6/prd.md` §F82 + dev-plan §阶段 1.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

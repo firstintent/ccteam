@@ -571,7 +571,7 @@ enum Command {
         action: DaemonAction,
     },
     /// V0.3 M5.0: serve the ccteam web UI (read + restricted-write,
-    /// `docs/v0-3/prd.md` §3-§6). M5.0 ships the scaffold + `/health`
+    /// `docs/versions/v0-3/prd.md` §3-§6). M5.0 ships the scaffold + `/health`
     /// endpoint only; dashboard / SSE / write actions land in M5.1-3.
     Web {
         /// Listen address. Default `0.0.0.0:7331` so host deployments
@@ -1075,7 +1075,7 @@ fn run_internal(cmd: InternalCommand) -> Result<()> {
 
 /// V0.4.6 F89 — print a stderr deprecation WARN when an old top-level
 /// command is used. The handler still runs; V0.5 will remove the old
-/// entry points entirely (see `docs/v0-4-6/prd.md` F89).
+/// entry points entirely (see `docs/versions/v0-4-6/prd.md` F89).
 fn warn_deprecated_top_level(old: &str, new: &str) {
     eprintln!(
         "ccteam: WARN `ccteam {old}` is deprecated; use `ccteam {new}` instead. \

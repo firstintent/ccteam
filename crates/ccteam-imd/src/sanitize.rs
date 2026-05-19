@@ -1,7 +1,7 @@
 //! Content sanitization for IM → tmux injection.
 //!
 //! Mirrors `references/oh-my-claudecode/src/notifications/reply-listener.ts`
-//! `sanitizeReplyInput()` (see `docs/v0-6-0/wave-2-decisions.md` §4 for
+//! `sanitizeReplyInput()` (see `docs/versions/v0-6-0/wave-2-decisions.md` §4 for
 //! the OMC parity contract).
 //!
 //! Two-layer model:

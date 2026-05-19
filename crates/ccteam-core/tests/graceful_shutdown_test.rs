@@ -2,7 +2,7 @@
 //!
 //! Replaces the V0.4.5 hard-abort path that dropped in-flight
 //! `workflow_done` writes and left phantom `agent_spawn` rows for F80
-//! cleanup. Test matrix from `docs/v0-4-6/dev-plan.md §6`:
+//! cleanup. Test matrix from `docs/versions/v0-4-6/dev-plan.md §6`:
 //!
 //! - `t01_stop_triggers_workflow_done_shutdown` — cancel signal emits
 //!   `workflow_done reason="shutdown"` to progress.jsonl

@@ -8,7 +8,7 @@
 
 ## 0. 红线表(V0.6.0 F106 双轴 scope)
 
-> 详 `docs/v0-6-0/README.md §五`;CLAUDE.md §三 是简版镜像。任何 PR 违反红线 = block。
+> 详 `docs/versions/v0-6-0/README.md §五`;CLAUDE.md §三 是简版镜像。任何 PR 违反红线 = block。
 
 | 红线 | 模式 1 in-proc | 模式 2 bg(Claude / Codex)| 模式 3 chat(Claude / Codex)|
 |---|---|---|---|
@@ -652,7 +652,7 @@ T+2:00  master 跑 ship workflow：git tag v0.1.0，写 .claude/rules/ccteam-les
 T+2:05  workflow_done 事件；meta-agent 翻译给用户：✅ bookmark-mgr 已交付
 ```
 
-整个过程中**用户只看到 2 条消息**（提需求 + 收结果）。**完整 happy path 示例** 见 `docs/v0-4-0/prd.md` §3。
+整个过程中**用户只看到 2 条消息**（提需求 + 收结果）。**完整 happy path 示例** 见 `docs/versions/v0-4-0/prd.md` §3。
 
 ### 4.2 失败与升级
 
@@ -727,7 +727,7 @@ tmux new-session -d -s "${SESSION}" -c "${PROJECT_DIR}" \
 # F118 chat 失效:从 turns.jsonl tail `recover_last_n_turns` 行重建 context
 ```
 
-理由(综合 ccgram + OMC production 验证):`-p --resume` 每 turn 冷启 prompt cache 失效 + slash 命令不透传(用户面 UX 退化)+ mailbox-trigger 让短文本走 Read tool 增加 turn cost;tmux 长跑 + send-keys -l 直送是双方共识 + Claude Code hooks 官方文档化 fast event 通道。详 `docs/v0-6-0/README.md §九 决策记录修订`。
+理由(综合 ccgram + OMC production 验证):`-p --resume` 每 turn 冷启 prompt cache 失效 + slash 命令不透传(用户面 UX 退化)+ mailbox-trigger 让短文本走 Read tool 增加 turn cost;tmux 长跑 + send-keys -l 直送是双方共识 + Claude Code hooks 官方文档化 fast event 通道。详 `docs/versions/v0-6-0/README.md §九 决策记录修订`。
 
 **关键约束**(三个 consumer 都遵守):
 - ✅ 用 `--dangerously-skip-permissions`（消灭弹窗，痛点 8）
@@ -1004,7 +1004,7 @@ V0.4.5 cost 三个数据源：
   ```
 - **F84 budget cap** 用 `cost_24h_usd` 判定；**F90 Cost sparkline** 用同源数据
 
-**已知 gap（F92 候选）**：V0.4.6 仍有 `agent_done.cost_usd` 字段需要 hook 写 — 真实数据其实在 `~/.claude/jobs/<id>/linkScanPath` 下的 jsonl 里。F92 候选打算直接从那读，完全摆脱 hook 依赖。当前 V0.4.6 在 hook miss 场景下 `cost_24h_usd` 仍可能漂（已知 limitation，记录于 `docs/v0-4-6/prd.md F91 验收 #3`）。
+**已知 gap（F92 候选）**：V0.4.6 仍有 `agent_done.cost_usd` 字段需要 hook 写 — 真实数据其实在 `~/.claude/jobs/<id>/linkScanPath` 下的 jsonl 里。F92 候选打算直接从那读，完全摆脱 hook 依赖。当前 V0.4.6 在 hook miss 场景下 `cost_24h_usd` 仍可能漂（已知 limitation，记录于 `docs/versions/v0-4-6/prd.md F91 验收 #3`）。
 
 ---
 
@@ -1015,18 +1015,18 @@ V0.4.5 cost 三个数据源：
 
 | 里程碑 | 主目标 | 状态 | 详情 |
 |---|---|---|---|
-| **M0** | 单项目 CLI MVP | 已 ship | [docs/v0-1/development-plan.md](./v0-1/development-plan.md) |
+| **M0** | 单项目 CLI MVP | 已 ship | [docs/versions/v0-1/development-plan.md](./v0-1/development-plan.md) |
 | **M0.5** | 工具表面 | 已 ship | 同上 |
 | **M1** | meta-agent + decisions queue + inbox/outbox | 已 ship | 同上 |
 | **M2** | sub-skill auto-trigger + ccteam-mcp 9 tools | 已 ship | 同上 |
 | **M2.3** | golden_rules executor（L1 强化） | 已 ship | 同上 |
 | **M3** | team abstraction + product-research team | 已 ship | 同上 |
 | **M4.1-M4.4** | 跨项目记忆（官方 rules + auto-memory + 可选 claude-mem） | 已 ship | 同上 |
-| **V0.2** | 8 milestone（plugin pipeline / team factory / watchdog 等） | 已 ship | [docs/v0-2/dev-plan.md](./v0-2/dev-plan.md) |
-| **V0.3 / V0.3.1 / V0.3.2** | web SPA + flex multi-session + htmx 退役 | 已 ship | `docs/v0-3*/` |
-| **V0.4.0** | workflow.yaml + ArtifactWatcher + 17 MCP + thin orchestrator + SPA WorkflowView | 已 ship | [docs/v0-4-0/prd.md](./v0-4-0/prd.md) |
-| **V0.4.1-V0.4.5** | UX 简化 + unified install + slug grammar + walk-up + F80 phantom cleanup | 已 ship | 各版本 `docs/v0-4-x/` |
-| **V0.4.6** | F81 remove / F82 enabled+hot-reload / F83 .ccteam/ / F84 budget / F86 graceful / F89 CLI / F90 panels / F91 cost | 已 ship | [docs/v0-4-6/](./v0-4-6/) |
+| **V0.2** | 8 milestone（plugin pipeline / team factory / watchdog 等） | 已 ship | [docs/versions/v0-2/dev-plan.md](./v0-2/dev-plan.md) |
+| **V0.3 / V0.3.1 / V0.3.2** | web SPA + flex multi-session + htmx 退役 | 已 ship | `docs/versions/v0-3*/` |
+| **V0.4.0** | workflow.yaml + ArtifactWatcher + 17 MCP + thin orchestrator + SPA WorkflowView | 已 ship | [docs/versions/v0-4-0/prd.md](./v0-4-0/prd.md) |
+| **V0.4.1-V0.4.5** | UX 简化 + unified install + slug grammar + walk-up + F80 phantom cleanup | 已 ship | 各版本 `docs/versions/v0-4-x/` |
+| **V0.4.6** | F81 remove / F82 enabled+hot-reload / F83 .ccteam/ / F84 budget / F86 graceful / F89 CLI / F90 panels / F91 cost | 已 ship | [docs/versions/v0-4-6/](./v0-4-6/) |
 | **M4.5-M4.6** | 多 audit 投票 + anti-leniency | 未 ship | (未规划到具体版本) |
 | **V0.4.7+** | F92 cost from jobs/linkScanPath / 真 cron schedule / workflow.yaml 条件分支 / fan-out multi-session | 未 ship | V0.5 候选 |
 

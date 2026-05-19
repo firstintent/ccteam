@@ -14,7 +14,7 @@ pub mod actions;
 pub mod agent_naming;
 // V0.4.0 F64 — artifact-trigger filesystem watcher (inotify / fsevents).
 // Emits ArtifactEvent for every workflow.yaml `Trigger::Watch(<path>)`
-// agent. See module docs + docs/v0-4-0/prd.md §6.2.
+// agent. See module docs + docs/versions/v0-4-0/prd.md §6.2.
 pub mod artifact_watcher;
 pub mod auto_loop;
 // V0.4.5 F80 — Liveness probe for `claude --bg` background jobs.

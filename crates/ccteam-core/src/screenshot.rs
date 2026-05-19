@@ -1,6 +1,6 @@
 //! V0.2.2 F38 — terminal screenshot pipeline (vt100 + imageproc DIY).
 //!
-//! Pipeline (`docs/v0-2-2/prd.md` §7.2.3):
+//! Pipeline (`docs/versions/v0-2-2/prd.md` §7.2.3):
 //!
 //! ```text
 //! tmux capture-pane -e ──▶ vt100::Parser ──▶ cell grid

@@ -49,7 +49,7 @@ tracing.workspace = true
 futures = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 
-# V0.3 M5.0 — pinned per docs/v0-3/prd.md §3.2.2.
+# V0.3 M5.0 — pinned per docs/versions/v0-3/prd.md §3.2.2.
 # V0.3.2 F56 — enable `ws` feature so `axum::extract::ws::WebSocketUpgrade`
 # is available for the PTY relay endpoints.
 axum = { workspace = true, features = ["ws"] }

@@ -23,7 +23,7 @@
 //! - corrupt / unparseable files surface as logged warnings + skipped
 //!   entries; never panics or crashes the caller.
 //!
-//! Architecture refs: `docs/v0-3/prd.md` §4 (M5.1 dashboard data
+//! Architecture refs: `docs/versions/v0-3/prd.md` §4 (M5.1 dashboard data
 //! source), `docs/dev-coupling-audit.md` F45 (extends the M5.0
 //! write-helper promotion to the read side), `docs/tech-design.md`
 //! §5.5 progress.jsonl SoT.

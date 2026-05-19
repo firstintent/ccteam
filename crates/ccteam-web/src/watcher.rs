@@ -1,6 +1,6 @@
 //! V0.3 M5.2 — file watcher → broadcast pump.
 //!
-//! Architecture (per `docs/v0-3/prd.md` §5.2.1-§5.2.2):
+//! Architecture (per `docs/versions/v0-3/prd.md` §5.2.1-§5.2.2):
 //!
 //! ```text
 //! ~/.ccteam/progress/<slug>.jsonl    (fs)

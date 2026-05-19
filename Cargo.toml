@@ -49,7 +49,7 @@ async-trait = "0.1"
 # events() trait method.
 futures = { version = "0.3", default-features = false, features = ["std"] }
 
-# V0.3 M5.0 — web UI (axum + askama). Pinned per `docs/v0-3/prd.md`
+# V0.3 M5.0 — web UI (axum + askama). Pinned per `docs/versions/v0-3/prd.md`
 # §3.2.2; minor bumps in M5.x must update the table there.
 axum = "0.8"
 askama = "0.12"

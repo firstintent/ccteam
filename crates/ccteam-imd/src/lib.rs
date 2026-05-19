@@ -11,7 +11,7 @@
 //!   under `~/.ccteam/imd/registry/<slug>/<role>.json`.
 //! - [`run_daemon`] — the main event loop (clap-driven from `main.rs`).
 //!
-//! Architectural red lines (see `docs/v0-6-0/wave-2-decisions.md`):
+//! Architectural red lines (see `docs/versions/v0-6-0/wave-2-decisions.md`):
 //!
 //! - **`ccteam-core` stays openhuman-free.** The dependency graph
 //!   integration test `tests/dep_graph_test.rs` enforces this.

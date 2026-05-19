@@ -23,7 +23,7 @@
 //!   `state.json` mutations) so the orchestrator's existing inotify +
 //!   send-keys delivery picks the change up unchanged.
 //!
-//! Architecture refs: `docs/v0-3/prd.md` §3.2.3,
+//! Architecture refs: `docs/versions/v0-3/prd.md` §3.2.3,
 //! `docs/dev-coupling-audit.md` F45,
 //! `docs/tech-design.md` §6.4 channel layer.
 

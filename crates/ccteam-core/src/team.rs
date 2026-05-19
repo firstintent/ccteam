@@ -143,7 +143,7 @@ pub struct DomainRule {
 }
 
 /// V0.2 M0.18: structured team-level golden rules with protocol /
-/// domain split (docs/v0-2/phase-prompt-architecture.md §6).
+/// domain split (docs/versions/v0-2/phase-prompt-architecture.md §6).
 ///
 /// **Legacy compat**: a flat `Vec<GoldenRule>` in pre-V0.2 yamls is
 /// deserialized as `protocol` with `enforce: cmd_check` so M3.x team
@@ -461,7 +461,7 @@ pub struct TeamSpec {
     pub escalate_grammar_extensions: Vec<EscalateGrammarExtension>,
 
     /// Team-wide default `golden_rules` (V0.2 M0.18: structured —
-    /// `protocol` / `domain` split, docs/v0-2/phase-prompt-architecture.md §6).
+    /// `protocol` / `domain` split, docs/versions/v0-2/phase-prompt-architecture.md §6).
     /// Phase YAML's `golden_rules` takes priority — phases that
     /// declare their own rules ignore the team default entirely (no
     /// merge, see strategic doc §3.4 "不预设质量评分维度"). Empty =

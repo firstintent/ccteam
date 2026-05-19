@@ -3,7 +3,7 @@
 //! Each MCP tool exposed by `ccteam mcp-serve` belongs to exactly one
 //! group: `admin`, `workflow`, `screenshot`, `chat`, `advise`. The
 //! server name remains `ccteam` (V0.5 user muscle memory preserved —
-//! see `docs/v0-6-0/README.md` §九 F111 decision). Group prefixes
+//! see `docs/versions/v0-6-0/README.md` §九 F111 decision). Group prefixes
 //! make the tool surface scannable in `/mcp` listings and give us a
 //! clean env-driven way to disable categories the user doesn't care
 //! about (e.g. `CCTEAM_DISABLE_TOOLS=chat,screenshot`).

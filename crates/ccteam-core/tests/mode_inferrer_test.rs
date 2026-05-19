@@ -1,6 +1,6 @@
 //! V0.6.0 Wave 2 F114 — integration tests for the NL → CreatorMode
 //! inferrer. Mirrors the cells of the decision table in
-//! `docs/v0-6-0/prd.md` F114 §"Phase 2: Mode inference" so a future
+//! `docs/versions/v0-6-0/prd.md` F114 §"Phase 2: Mode inference" so a future
 //! table edit forces a corresponding test update.
 
 use ccteam_core::{infer_mode, CreatorMode, InferenceResult, Intent, Presence, Timeline};

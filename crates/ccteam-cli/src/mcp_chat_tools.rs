@@ -2,7 +2,7 @@
 //!
 //! These 5 tools back the chat workflow surface (mode 3 — `claude -p
 //! --resume <sid>` + stream-json + JSON-mailbox-trigger; see
-//! `docs/v0-6-0/prd.md` F108). Wave 1 registers the schemas and a
+//! `docs/versions/v0-6-0/prd.md` F108). Wave 1 registers the schemas and a
 //! `NotImplemented` dispatcher so:
 //!
 //! - the tool list shape locked here doesn't bikeshed in Wave 2

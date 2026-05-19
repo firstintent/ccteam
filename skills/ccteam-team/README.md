@@ -51,5 +51,5 @@ ccteam doctor --install-skill ccteam-team
 
 ## 参考
 
-- `docs/v0-5-0/prd.md` §F93a — SoT
-- `docs/v0-5-0/dev-plan.md` Wave 1 — 实施
+- `docs/versions/v0-5-0/prd.md` §F93a — SoT
+- `docs/versions/v0-5-0/dev-plan.md` Wave 1 — 实施

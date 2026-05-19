@@ -41,7 +41,7 @@
 //! cookie-only would not save us. Inlining doesn't materially worsen
 //! the threat model.
 //!
-//! Architecture refs: `docs/v0-3/prd.md` §6.2.4 / §6.2.5 / §9.
+//! Architecture refs: `docs/versions/v0-3/prd.md` §6.2.4 / §6.2.5 / §9.
 
 use std::net::SocketAddr;
 

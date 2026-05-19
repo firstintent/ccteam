@@ -3,7 +3,7 @@
 文档分三类(CLAUDE.md §二 文档维护规则):
 
 1. **全局文档**(本目录根)— 每 session 起手装入上下文;与代码并列**唯一真理来源**;每版本 ship 后必更新
-2. **版本归档**(`v0-x-x/` 子目录)— ship 后冻结,历史溯源,按需加载
+2. **版本归档**(`versions/v0-x-x/` 子目录)— ship 后冻结,历史溯源,按需加载
 3. **扩展研究**(`research/` + `references/research/`)— 探索性,不更新,按需加载
 
 ## 全局文档(根目录)
@@ -31,25 +31,27 @@
 | [`research/omc-vs-ccteam-orchestration.md`](research/omc-vs-ccteam-orchestration.md) | prompt-as-orchestrator vs code-as-orchestrator 对比 |
 | [`research/omc-team-comparison.md`](research/omc-team-comparison.md) | OMC team SKILL.md vs Anthropic Agent Teams 实测 schema vs ccteam V0.5.0 落地对照(V0.5.0 立项依据)|
 
-## 版本归档(`v0-x-x/`)
+## 版本归档(`versions/v0-x-x/`)
 
 | 版本 | 入口 | 状态 |
 |---|---|---|
-| **V0.1** | [`v0-1/README.md`](v0-1/README.md) | M0-M4.4。phase 流水线 + 跨项目记忆原始版本 |
-| **V0.2** | [`v0-2/README.md`](v0-2/README.md) | M0.16-M0.23。plugin pipeline + team-factory |
-| **V0.2.2** | [`v0-2-2/README.md`](v0-2-2/README.md) | F34-F40。`ccteam-project-creator` skill |
-| **V0.3** | [`v0-3/README.md`](v0-3/README.md) | M5。Web UI + JSON API + `kind: flex` team |
-| **V0.3.1** | [`v0-3-1/README.md`](v0-3-1/README.md) | F46-F51。flex team + HarnessAdapter spike |
-| **V0.3.2** | [`v0-3-2/README.md`](v0-3-2/README.md) | F52-F59。SPA + write-action forms + htmx retirement |
-| **V0.4.0** | [`v0-4-0/README.md`](v0-4-0/README.md) | F60-F69。phase 全删 + workflow.yaml + artifact watcher + thin orchestrator + 17 MCP 工具 + WorkflowView SPA |
-| **V0.4.1** | [`v0-4-1/`](v0-4-1/) | UX 简化 patch(`start` 合并 web、`send`/`spawn` CLI、handle 删、daemon hot-reload、MCP 退出 deadlock fix) |
-| **V0.4.2** | [`v0-4-2/`](v0-4-2/) | F72-F75。`ccteam init` 三合一 + `~/.ccteam/config.yaml` 全局 SoT + `doctor --migrate-v041-to-v042` + `ccteam new` thin wrapper |
-| **V0.4.3** | [`v0-4-3/README.md`](v0-4-3/README.md) | F76。slug grammar validation + collision wording 优化 |
-| **V0.4.4** | [`v0-4-4/README.md`](v0-4-4/README.md) | F77。`session_context_from_cwd` walk-up + `paths.project_dir(slug)` 走 config.yaml registry |
-| **V0.4.5** | [`v0-4-5/README.md`](v0-4-5/README.md) | F78 + F80。watcher 项目相对路径修复 + phantom agent_spawn cleanup |
-| **V0.4.6** | [`v0-4-6/README.md`](v0-4-6/README.md) | F81-F91 (11 个 finding)。lifecycle / 用户痛点根治 / 运维收敛 — **当前 ship 版本** |
-| **V0.5.0** | [`v0-5-0/README.md`](v0-5-0/README.md) | F92 + F93a + F93b + F94 + F95 + F96 + F97 + F100 + F101。真 cost 数据源 + Agent Teams 集成(primary skill `/ccteam-team` + advanced `mode: agent-team` workflow + `__lead` role + 3 hook 镜像 + web `/teams` tab + 3 面板)+ advanced path lifecycle + skill surface 5→3 + meta-agent 重塑 |
-| **V0.5.1** | [`v0-5-1/README.md`](v0-5-1/README.md) | F103 + F104 + F105。Sessions visibility(`/sessions` tab + WorkflowView auto-expand + workflow project SessionDetail)+ Web Topology fixes(`agent_type` snake_case + `Explore` 内置 subagent allowlist)+ `--env` argv bug fix(`claude` CLI 不支持 `--env`,改用 `Command::env()`)— **当前 ship 版本** |
+| **V0.1** | [`versions/v0-1/README.md`](versions/v0-1/README.md) | M0-M4.4。phase 流水线 + 跨项目记忆原始版本 |
+| **V0.2** | [`versions/v0-2/README.md`](versions/v0-2/README.md) | M0.16-M0.23。plugin pipeline + team-factory |
+| **V0.2.2** | [`versions/v0-2-2/README.md`](versions/v0-2-2/README.md) | F34-F40。`ccteam-project-creator` skill |
+| **V0.3** | [`versions/v0-3/README.md`](versions/v0-3/README.md) | M5。Web UI + JSON API + `kind: flex` team |
+| **V0.3.1** | [`versions/v0-3-1/README.md`](versions/v0-3-1/README.md) | F46-F51。flex team + HarnessAdapter spike |
+| **V0.3.2** | [`versions/v0-3-2/README.md`](versions/v0-3-2/README.md) | F52-F59。SPA + write-action forms + htmx retirement |
+| **V0.4.0** | [`versions/v0-4-0/README.md`](versions/v0-4-0/README.md) | F60-F69。phase 全删 + workflow.yaml + artifact watcher + thin orchestrator + 17 MCP 工具 + WorkflowView SPA |
+| **V0.4.1** | [`versions/v0-4-1/`](versions/v0-4-1/) | UX 简化 patch(`start` 合并 web、`send`/`spawn` CLI、handle 删、daemon hot-reload、MCP 退出 deadlock fix) |
+| **V0.4.2** | [`versions/v0-4-2/`](versions/v0-4-2/) | F72-F75。`ccteam init` 三合一 + `~/.ccteam/config.yaml` 全局 SoT + `doctor --migrate-v041-to-v042` + `ccteam new` thin wrapper |
+| **V0.4.3** | [`versions/v0-4-3/README.md`](versions/v0-4-3/README.md) | F76。slug grammar validation + collision wording 优化 |
+| **V0.4.4** | [`versions/v0-4-4/README.md`](versions/v0-4-4/README.md) | F77。`session_context_from_cwd` walk-up + `paths.project_dir(slug)` 走 config.yaml registry |
+| **V0.4.5** | [`versions/v0-4-5/README.md`](versions/v0-4-5/README.md) | F78 + F80。watcher 项目相对路径修复 + phantom agent_spawn cleanup |
+| **V0.4.6** | [`versions/v0-4-6/README.md`](versions/v0-4-6/README.md) | F81-F91 (11 个 finding)。lifecycle / 用户痛点根治 / 运维收敛 — **当前 ship 版本** |
+| **V0.5.0** | [`versions/v0-5-0/README.md`](versions/v0-5-0/README.md) | F92 + F93a + F93b + F94 + F95 + F96 + F97 + F100 + F101。真 cost 数据源 + Agent Teams 集成(primary skill `/ccteam-team` + advanced `mode: agent-team` workflow + `__lead` role + 3 hook 镜像 + web `/teams` tab + 3 面板)+ advanced path lifecycle + skill surface 5→3 + meta-agent 重塑 |
+| **V0.5.1** | [`versions/v0-5-1/README.md`](versions/v0-5-1/README.md) | F103 + F104 + F105。Sessions visibility(`/sessions` tab + WorkflowView auto-expand + workflow project SessionDetail)+ Web Topology fixes(`agent_type` snake_case + `Explore` 内置 subagent allowlist)+ `--env` argv bug fix(`claude` CLI 不支持 `--env`,改用 `Command::env()`)|
+| **V0.6.0** | [`versions/v0-6-0/README.md`](versions/v0-6-0/README.md) | F106-F118(F110 取消)。Epic A "5 min IM bot" + Epic B "bot 像真人助理" + Epic C "中文用户能用"。`HarnessAdapter` 5-method trait + tmux 长跑 mode 3 + Codex Option B + per-vendor budget caps + `ccteam-imd` daemon + 24 MCP 工具 5 group + 5 user-facing preset。Minor 版本 4-wave 范式起点。|
+| **V0.6.1** | [`versions/v0-6-1/README.md`](versions/v0-6-1/README.md) | F98 + F119-F129(12 finding)。Cleanup & honesty + User-claim 实现 + Plan/Approval 落地。EN-only root README + CLAUDE.md 2 红线;`/ccteam-control change-persona/add-tool` + `@ccteam` IM NL admin;plan-approval ↔ outbox + `mode: human-approval`;`docs/v0-X-Y/` → `docs/versions/v0-X-Y/` 归档迁移。3 wave 流程压缩 + 端到端用户操作模拟收尾。**当前 ship 版本** |
 
 ## 文档维护规约
 
@@ -72,7 +74,7 @@
 
 ### 新版本启动步骤
 
-1. `mkdir docs/v0-X-Y/`(版本号严格按 `vMAJOR-MINOR-PATCH`)
+1. `mkdir docs/versions/v0-X-Y/`(版本号严格按 `vMAJOR-MINOR-PATCH`)
 2. 把上版本 `README.md` 末尾的 "当前 next" / "V0.X 候选" 段迁到本版本 `prd.md`
 3. 写 `dev-plan.md` 后再动代码(doc-first 原则,见 CLAUDE.md §五 "Patch 版本开发流程")
 4. 版本 ship 后,本目录的 4 个全局 SoT 文档同步更新(如有协议/架构变化)
@@ -80,6 +82,6 @@
 
 ### 禁忌
 
-- **不再维护"全局 development-plan.md"** — V0.2 起每版本独立 `dev-plan.md`(V0.1 老 development-plan.md 在 `v0-1/` 历史归档)
+- **不再维护"全局 development-plan.md"** — V0.2 起每版本独立 `dev-plan.md`(V0.1 老 development-plan.md 在 `versions/v0-1/` 历史归档)
 - **不在版本归档里改全局 SoT** — 双 source 对齐难
 - **不在 `research/` 改实现细节** — 那是研究笔记;实现细节属于全局 SoT

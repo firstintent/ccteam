@@ -1,6 +1,6 @@
 //! V0.4.0 F67 — workflow event aggregation tests.
 //!
-//! Cases per `docs/v0-4-0/dev-plan.md` §9.1 #8.5. Each case is a pure
+//! Cases per `docs/versions/v0-4-0/dev-plan.md` §9.1 #8.5. Each case is a pure
 //! function call against synthesised `Value` events — no tmux, no
 //! claude binary, no inotify (so the F64 flake on WSL never touches
 //! this suite).
@@ -13,8 +13,8 @@
 //!   projects (t05 + t10); the workflow view never panics when the
 //!   project's progress.jsonl is fresh.
 //!
-//! Architecture refs: `docs/v0-4-0/prd.md` §F67,
-//! `docs/v0-4-0/dev-plan.md` §9,
+//! Architecture refs: `docs/versions/v0-4-0/prd.md` §F67,
+//! `docs/versions/v0-4-0/dev-plan.md` §9,
 //! `docs/dev-coupling-audit.md` F67.
 
 use std::collections::HashMap;
@@ -510,7 +510,7 @@ agents:
 // `current_agent_sessions_with_liveness` (pure modulo the injected
 // liveness probe).
 //
-// Architecture refs: `docs/v0-4-0/prd.md` §6, `docs/dev-coupling-audit.md`
+// Architecture refs: `docs/versions/v0-4-0/prd.md` §6, `docs/dev-coupling-audit.md`
 // F80, `CLAUDE.md` §三.
 // =====================================================================
 

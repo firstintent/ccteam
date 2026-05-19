@@ -532,7 +532,7 @@ const DEFAULT_WORKFLOW_YAML: &str = r#"# ccteam workflow.yaml (V0.4.0+ shape).
 #   gate                          # waits for `trigger_gate` MCP / CLI call
 #   watch:.ccteam/issues/         # spawn one session per new file under the path
 #
-# Docs: docs/v0-4-0/prd.md §6, examples/workflows/*.yaml
+# Docs: docs/versions/v0-4-0/prd.md §6, examples/workflows/*.yaml
 name: default-workflow
 description: |
   Minimal starter workflow. Edit me — the manual `explorer` is a safe
@@ -2418,7 +2418,7 @@ fn render_gc_claude_jobs_report(paths: &CcteamPaths, apply: bool) -> Result<Stri
 ///    bootstrapped artifact like `.ccteam/spec.md`)
 /// 4. phase body residue: protocol literals (`PHASE_DONE: <name>` /
 ///    `ESCALATE:`) inside the body trigger a warn (not error — bodies
-///    are user territory; `docs/v0-2/phase-prompt-architecture.md` §9 docks
+///    are user territory; `docs/versions/v0-2/phase-prompt-architecture.md` §9 docks
 ///    this as warn-not-fail by design).
 fn render_validate_team_report(paths: &CcteamPaths, team: &str) -> Result<(String, u32)> {
     use ccteam_core::{default_user_staging_dir, resolve_team, TeamResolveContext};

@@ -42,7 +42,7 @@
 //!    Debounce is per-path, not global — two roles watching different
 //!    dirs never block each other.
 //!
-//! See also `docs/v0-4-0/prd.md` §F64 + §6.2, `dev-plan.md` §6,
+//! See also `docs/versions/v0-4-0/prd.md` §F64 + §6.2, `dev-plan.md` §6,
 //! `docs/dev-coupling-audit.md` F64.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -382,7 +382,7 @@ fn match_root<'a>(
 //      `team_teammate_idle` (Wave 2), not F95 `team_message_sent`.
 //   4. 60s discovery rescan picks up new teams without daemon restart.
 //
-// See `docs/v0-5-0/prd.md` §F95 + `docs/v0-5-0/dev-plan.md` Wave 1.
+// See `docs/versions/v0-5-0/prd.md` §F95 + `docs/versions/v0-5-0/dev-plan.md` Wave 1.
 // ---------------------------------------------------------------------------
 
 /// How often `AgentTeamsWatcher` rescans `~/.claude/teams/` to pick up

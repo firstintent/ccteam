@@ -2,7 +2,7 @@
 
 > V0.6.0 起。主入口都在 Claude session 内:`/ccteam-doctor`(诊断)、`/ccteam-control`(运行时)、`/ccteam-creator`(新建项目)、`/ccteam-team`(临时 team)、`/ccteam-im-setup`(TG 配置)。**先跑 `/ccteam-doctor` —— 80% 卡点它自动检出**;还卡再查本手册。
 >
-> 进阶 fix path:`docs/v0-6-0/prd.md` 找 F-finding,`docs/claude-code-tool-surface.md` 看平台原语,`docs/orchestration-patterns.md` 看拓扑选择。
+> 进阶 fix path:`docs/versions/v0-6-0/prd.md` 找 F-finding,`docs/claude-code-tool-surface.md` 看平台原语,`docs/orchestration-patterns.md` 看拓扑选择。
 
 ---
 
@@ -41,7 +41,7 @@
 ### A7. `/ccteam-creator` 起新项目报 "Team already exists"
 **原因**:上次新建留下的 `~/.claude/teams/<name>/` 残留,或 `~/projects/<slug>/` 已存在。
 **修复**:1) 重选另一个 slug;2) 想用同名:手动 `rm -rf ~/.claude/teams/<name> ~/projects/<slug>` 后重起。
-**相关**:`docs/v0-5-1/` troubleshoot 同类。
+**相关**:`docs/versions/v0-5-1/` troubleshoot 同类。
 
 ### A8. 跟 BotFather 要 TG bot token 拿不到
 **原因**:TG 没注册 / @BotFather 没回 / 超出 20 bot 上限。
@@ -125,12 +125,12 @@
 ### B8. bot 看不到图片 / 文件
 **原因**:V0.6.0 mode 3 只支持 text;富媒体延 V0.7.x。
 **修复**:1) 图片 OCR 后粘贴文字;2) 文件放服务器 + URL 让 bot fetch。
-**相关**:`docs/v0-6-0/prd.md` F109 不在范围。
+**相关**:`docs/versions/v0-6-0/prd.md` F109 不在范围。
 
 ### B9. bot 在 DM(私聊)里不回
 **原因**:V0.6.0 mode 3 只支持 group chat,DM 是 V0.6.1。
 **修复**:把 bot 加群后 @ 它;DM 场景等 V0.6.1。
-**相关**:`docs/v0-6-0/prd.md` F109。
+**相关**:`docs/versions/v0-6-0/prd.md` F109。
 
 ### B10. bot 突然回乱码 / 内部错误
 **原因**:模型 API 抽风(rate limit / overload / 内容审核)。
@@ -150,7 +150,7 @@
 ### B13. bot 回复夹了 `<thinking>` / 内部标记
 **原因**:模型未屏蔽 thinking 段,或 system prompt 没拦。
 **修复**:1) 通常 ccteam 自动剥;漏的请报 issue;2) workflow.yaml 加 `strip_thinking: true`。
-**相关**:`docs/v0-6-0/prd.md` F108。
+**相关**:`docs/versions/v0-6-0/prd.md` F108。
 
 ### B14. 群里多人同时 @bot,谁先谁后
 **原因**:bot 单 session 串行处理 turn。
@@ -214,7 +214,7 @@
 ### C10. 想完全 dry-run 不花钱
 **原因**:验证 workflow 而不调真实模型。
 **修复**:1) `/ccteam-control dry-run <slug>` — 只校验 yaml + 列将 spawn 的 role,不调 model;2) 单 bot:`CCTEAM_DRY_RUN=1` env。
-**相关**:`docs/v0-6-0/dev-plan.md` validation 节。
+**相关**:`docs/versions/v0-6-0/dev-plan.md` validation 节。
 
 ---
 
@@ -262,7 +262,7 @@
 ### E3. codex 报 "sandbox denied"
 **原因**:codex 默认 `--sandbox read-only`,不允许写文件。
 **修复**:1) workflow.yaml `agents.<role>.codex_sandbox: workspace-write`;2) 危险场景才用 `danger-full-access`,且仅在容器里。
-**相关**:`docs/v0-6-0/prd.md` Codex sandbox 表。
+**相关**:`docs/versions/v0-6-0/prd.md` Codex sandbox 表。
 
 ### E4. codex 比 claude 慢 3-5×
 **原因**:Codex 默认走 OpenAI Responses API,首 token 延迟比 Anthropic 高;且 V0.6.0 还没接 Codex 的 prompt cache。
@@ -280,4 +280,4 @@
 
 1. 在 Claude session 跑 `/ccteam-doctor --full` 收集所有诊断信息
 2. 仍卡:把诊断输出贴 GitHub issue,或 ccteam 用户群 @ 维护者
-3. 进阶 fix:`docs/v0-6-0/prd.md` 找对应 F-finding;`docs/claude-code-tool-surface.md` 看平台原语;`docs/dev-coupling-audit.md` 看历史已修类似问题
+3. 进阶 fix:`docs/versions/v0-6-0/prd.md` 找对应 F-finding;`docs/claude-code-tool-surface.md` 看平台原语;`docs/dev-coupling-audit.md` 看历史已修类似问题

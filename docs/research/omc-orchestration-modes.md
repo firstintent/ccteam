@@ -345,5 +345,5 @@ ccteam meta-agent 的等价痛点:**meta-agent 切到另一个项目 / 自己 co
 | Pipeline / Ultrapilot legacy state | `skills/cancel/SKILL.md`(`.omc/state/ultrapilot-state.json` / `pipeline-state.json` 清理) |
 | Resolved routing snapshot | `src/team/stage-router.ts::buildResolvedRoutingSnapshot()` |
 | CLI worker contract(文件契约 vs 终端解析) | `src/team/cli-worker-contract.ts` |
-| ccteam V0.4.0 当前架构 | `CLAUDE.md §一/§三` + `docs/v0-4-0/README.md` |
+| ccteam V0.4.0 当前架构 | `CLAUDE.md §一/§三` + `docs/versions/v0-4-0/README.md` |
 | ccteam 三层架构红线 | `CLAUDE.md §三`(progress.jsonl SoT、文件系统控制平面、escalate 不静默) |

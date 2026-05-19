@@ -1,6 +1,6 @@
 //! V0.4.6 F83 — `workflow.yaml` location migration tests.
 //!
-//! Coverage matrix (5 cases) — see `docs/v0-4-6/dev-plan.md` §3.
+//! Coverage matrix (5 cases) — see `docs/versions/v0-4-6/dev-plan.md` §3.
 //!
 //! Validates:
 //! 1. `WorkflowSpec::load_for_project` priority — `.ccteam/` first,

@@ -5,7 +5,7 @@ description: ccteam 总入口 NL dispatcher。用户在 Claude session 内输入
 
 # /ccteam — NL dispatcher
 
-V0.6.0 旗舰入口。用户**无需记多个 slash 名**,在 Claude session 内一句话描述需求,本 skill 自动判别意图 + 透传 NL 到对应 sub-skill。设计目标(详 `docs/v0-6-0/prd.md` F113):
+V0.6.0 旗舰入口。用户**无需记多个 slash 名**,在 Claude session 内一句话描述需求,本 skill 自动判别意图 + 透传 NL 到对应 sub-skill。设计目标(详 `docs/versions/v0-6-0/prd.md` F113):
 
 - 用户说"我想做个 TG 助理 bot" → 路由 `/ccteam-creator` → Pocket Assistant preset
 - 用户说"fix all TS errors" → 路由 `/ccteam-team 3 "fix all TS errors"`
@@ -71,7 +71,7 @@ V0.6.0 旗舰入口。用户**无需记多个 slash 名**,在 Claude session 内
 **Wave 1 缺失 sub-skill 处理**:当路由目标是 Wave 2/3 才落地的 `/ccteam-creator` / `/ccteam-im-setup` / `/ccteam-advise` 时,告诉用户:
 
 > 这个意图对应的 sub-skill (`<name>`) 是 V0.6.0 Wave 2/3 才落地的部分。Wave 1 你可以:
-> - 用 `ccteam new "<NL>"` CLI 起新项目(create-workflow 临时替代,见 `docs/v0-1/user-quickstart.md`)
+> - 用 `ccteam new "<NL>"` CLI 起新项目(create-workflow 临时替代,见 `docs/versions/v0-1/user-quickstart.md`)
 > - 用 `ccteam doctor --install-mcp` 装 MCP 后让 daily-driver Claude 直接 `mcp__ccteam__chat_send_input(...)` 调用(stub 返 NotImplemented,但 schema 已锁)
 > - 用 `/ccteam-team` 临时起一个 advisor teammate(advise 临时替代)
 > 完整 NL 路径 V0.6.0 Wave 2/3 上线后请重试 `/ccteam <NL>`。
@@ -105,8 +105,8 @@ V0.6.0 旗舰入口。用户**无需记多个 slash 名**,在 Claude session 内
 
 ## Where to look in the repo
 
-- `@docs/v0-6-0/prd.md` — F113 完整需求 + 验收
-- `@docs/v0-6-0/README.md` §三 — 用户面入口 + 5 sub-skill 一览
+- `@docs/versions/v0-6-0/prd.md` — F113 完整需求 + 验收
+- `@docs/versions/v0-6-0/README.md` §三 — 用户面入口 + 5 sub-skill 一览
 - `@skills/ccteam-team/SKILL.md` — start-team 详细行为
 - `@skills/ccteam-control/SKILL.md` — monitor / status-debug 详细行为
 - `@skills/ccteam-creator/SKILL.md` — Wave 2 复活后填实(目前 V0.5 砍掉态)

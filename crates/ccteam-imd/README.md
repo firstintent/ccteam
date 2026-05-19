@@ -22,7 +22,7 @@ ccteam-managed long-running chat sessions (`mode: chat` bots).
 
 ## Architecture decisions
 
-See `docs/v0-6-0/wave-2-decisions.md`:
+See `docs/versions/v0-6-0/wave-2-decisions.md`:
 
 - **Option C openhuman integration** — vendor trait + slim TG / Slack /
   Discord providers in-crate (avoids openhuman's heavy transitive

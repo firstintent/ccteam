@@ -12,7 +12,7 @@
 //! that surface behind a 256-bit secret that only a user with shell
 //! access to the host can read (mode 0600 enforced + warned).
 //!
-//! Architecture refs: `docs/v0-3/prd.md` §6.2.4, §9.1.1.
+//! Architecture refs: `docs/versions/v0-3/prd.md` §6.2.4, §9.1.1.
 
 use std::fs::OpenOptions;
 use std::io::{Read, Write};

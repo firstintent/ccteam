@@ -2,7 +2,7 @@
 
 > **A multi-agent orchestrator on top of Claude Code** — one tool, three tiers: in-proc temporary helpers / bg long-running workflows / IM bots running 24/7.
 
-![demo](docs/v0-6-0/demos/30s-tg-bot-team.gif)
+![demo](docs/versions/v0-6-0/demos/30s-tg-bot-team.gif)
 
 ## Three runtime modes (the core of ccteam)
 
@@ -77,4 +77,4 @@ See [LICENSE](LICENSE). Built on [Claude Code](https://code.claude.com/) (the ru
 
 ---
 
-See [docs/v0-6-1/README.md](docs/v0-6-1/README.md) for current release notes.
+See [docs/versions/v0-6-1/README.md](docs/versions/v0-6-1/README.md) for current release notes.

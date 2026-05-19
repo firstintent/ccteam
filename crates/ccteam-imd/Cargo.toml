@@ -36,7 +36,7 @@ reqwest = { workspace = true, features = ["json"] }
 # UNIX-only signalling for graceful supervisor SIGTERM (libc::kill).
 libc = "0.2"
 
-# V0.6.0 Wave 2 Option-C decision (docs/v0-6-0/wave-2-decisions.md §3):
+# V0.6.0 Wave 2 Option-C decision (docs/versions/v0-6-0/wave-2-decisions.md §3):
 # The Channel trait + slim TG/Slack/Discord providers live in-crate
 # under src/transport/{traits,providers/*}.rs with reference attribution
 # to references/openhuman/src/openhuman/channels/. We do NOT pull

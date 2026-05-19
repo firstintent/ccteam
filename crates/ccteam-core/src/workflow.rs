@@ -27,8 +27,8 @@
 //!
 //! ## See also
 //!
-//! - `docs/v0-4-0/prd.md` §6.1 (full schema spec)
-//! - `docs/v0-4-0/dev-plan.md` §5 (PR #4 task list)
+//! - `docs/versions/v0-4-0/prd.md` §6.1 (full schema spec)
+//! - `docs/versions/v0-4-0/dev-plan.md` §5 (PR #4 task list)
 //! - `docs/interfaces.md` §17 (workflow.yaml schema reference)
 
 use indexmap::IndexMap;
@@ -259,7 +259,7 @@ pub struct BudgetSpec {
 
 /// V0.5.0 F93b — populated when `WorkflowSpec::mode == AgentTeam`.
 ///
-/// Mirrors PRD §F93b schema (`docs/v0-5-0/prd.md` lines 184-230):
+/// Mirrors PRD §F93b schema (`docs/versions/v0-5-0/prd.md` lines 184-230):
 ///
 /// ```yaml
 /// agent_team:

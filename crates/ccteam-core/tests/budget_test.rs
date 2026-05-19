@@ -1,7 +1,7 @@
 //! V0.4.6 F84 — `max_cost_usd_per_24h` + `max_agent_spawns_per_hour`
 //! budget caps.
 //!
-//! Coverage matrix (4 cases) — see `docs/v0-4-6/dev-plan.md` §F84 测试矩阵.
+//! Coverage matrix (4 cases) — see `docs/versions/v0-4-6/dev-plan.md` §F84 测试矩阵.
 //!
 //! ## What these tests verify
 //!

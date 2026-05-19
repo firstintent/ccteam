@@ -1,6 +1,6 @@
 //! V0.4.0 F63 — `workflow.yaml` schema + parser tests.
 //!
-//! Coverage matrix (15 cases) — see `docs/v0-4-0/dev-plan.md` §5.1 #4.6.
+//! Coverage matrix (15 cases) — see `docs/versions/v0-4-0/dev-plan.md` §5.1 #4.6.
 
 use std::path::{Path, PathBuf};
 

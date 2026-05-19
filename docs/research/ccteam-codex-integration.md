@@ -753,7 +753,7 @@ Codex skills/plugin 与 Claude skills/plugin 一样是可执行工作流资产�
 | `docs/interfaces.md` | phase YAML 增加 `runner/sandbox/gate` 字段时 |
 | `docs/claude-code-tool-surface.md` | 如果 Claude session 调用 Codex MCP server |
 | `docs/ccteam-as-domain-agnostic-orchestrator.md` | 如果 Codex worker provider 成为通用 mechanism |
-| `docs/v0-3/prd.md` | 如果纳入 V0.3 milestone |
+| `docs/versions/v0-3/prd.md` | 如果纳入 V0.3 milestone |
 
 本文在实现前保持 research/RFC 性质。
 

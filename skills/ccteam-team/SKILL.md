@@ -298,8 +298,8 @@ ccteam start                        # 启 daemon(可选,纯 web 可视化用)
 
 ## Where to look in the repo
 
-- `@docs/v0-5-0/prd.md` §F93a — 本 skill 设计 SoT
-- `@docs/v0-5-0/dev-plan.md` Wave 1 — 实施细节
+- `@docs/versions/v0-5-0/prd.md` §F93a — 本 skill 设计 SoT
+- `@docs/versions/v0-5-0/dev-plan.md` Wave 1 — 实施细节
 - `@CLAUDE.md` §三 — 架构红线
 - `@skills/ccteam-control/SKILL.md` — sibling skill(管 daemon)
 - `@skills/ccteam-creator/SKILL.md` — sibling skill(创 workflow / 项目)

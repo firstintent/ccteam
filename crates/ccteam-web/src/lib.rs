@@ -3,7 +3,7 @@
 //! Single entry: [`serve`]. Wired up by `ccteam-cli` via
 //! `commands::run_web` so the binary stays a thin protocol adapter.
 //!
-//! Ship state (per `docs/v0-3/prd.md` §3 / §4 / §5 / §6):
+//! Ship state (per `docs/versions/v0-3/prd.md` §3 / §4 / §5 / §6):
 //!
 //! - **M5.0** — `GET /health` + bind / shutdown plumbing.
 //! - **M5.1** — `GET /` dashboard, `GET /project/<slug>` detail

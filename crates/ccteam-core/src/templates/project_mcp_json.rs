@@ -16,7 +16,7 @@
 //!   Linear, etc.).
 //!
 //! Wave 1 lands this helper alone; Wave 2 wires it into the
-//! `ccteam-creator` skill execute phase (per `docs/v0-6-0/prd.md` F111
+//! `ccteam-creator` skill execute phase (per `docs/versions/v0-6-0/prd.md` F111
 //! file clean list).
 
 use std::path::Path;

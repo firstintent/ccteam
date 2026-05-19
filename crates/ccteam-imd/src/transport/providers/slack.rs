@@ -3,7 +3,7 @@
 //!
 //! No Socket Mode in V0.6 (avoids `tokio-tungstenite`); polling is
 //! enough for the host-probe scope. Switch to Socket Mode is a V0.7
-//! decision per `docs/v0-6-0/wave-2-decisions.md` §5.
+//! decision per `docs/versions/v0-6-0/wave-2-decisions.md` §5.
 
 use std::collections::HashMap;
 use std::sync::Arc;

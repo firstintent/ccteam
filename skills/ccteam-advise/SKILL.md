@@ -181,7 +181,7 @@ cost, deeper exploration."
 
 ## Where to look in the repo
 
-- `@docs/v0-6-0/prd.md` §F112 §A — skill design SoT
+- `@docs/versions/v0-6-0/prd.md` §F112 §A — skill design SoT
 - `@crates/ccteam-cli/src/mcp_advise_tools.rs` — MCP tools the
   daemon registers (`ccteam__advise_vote` / `ccteam__advise_parallel`)
 - `@crates/ccteam-core/src/execution/codex_exec.rs` — the

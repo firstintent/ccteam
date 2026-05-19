@@ -8,7 +8,7 @@
 //!
 //! Unknown tokens are silently dropped (PRD F111 §B: the filter is
 //! best-effort UX, not a security boundary). The acceptance script
-//! at `docs/v0-6-0/dev-plan.md` Wave 1 §F #6 invokes the matching
+//! at `docs/versions/v0-6-0/dev-plan.md` Wave 1 §F #6 invokes the matching
 //! test name.
 
 use std::collections::HashSet;

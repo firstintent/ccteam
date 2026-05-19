@@ -1,7 +1,7 @@
 //! Channel trait + per-platform providers.
 //!
 //! V0.6.0 Wave 2 Option-C implementation
-//! (see `docs/v0-6-0/wave-2-decisions.md` §3). The [`Channel`] trait
+//! (see `docs/versions/v0-6-0/wave-2-decisions.md` §3). The [`Channel`] trait
 //! and the three providers (telegram / slack / discord) are vendored
 //! from `references/openhuman/src/openhuman/channels/` with shell
 //! reductions:

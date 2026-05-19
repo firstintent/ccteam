@@ -213,7 +213,7 @@ description: 看任务特征选 role,通过 spawn_agent 派出去
 
 ## 七、对 dev-plan 的具体输入
 
-下面是直接可贴进 `docs/v0-4-7/dev-plan.md`(假设 V0.4.7 启动时新建)的草稿:
+下面是直接可贴进 `docs/versions/v0-4-7/dev-plan.md`(假设 V0.4.7 启动时新建)的草稿:
 
 ```markdown
 ## V0.4.7 — 模式扩展
@@ -267,4 +267,4 @@ description: 看任务特征选 role,通过 spawn_agent 派出去
 | OMC role-router resolved snapshot 模式 | [`omc-vs-ccteam-orchestration.md`](omc-vs-ccteam-orchestration.md) §4.2 + §四.4 启发 |
 | OMC `omc.jsonc` precedence chain | `oh-my-claudecode/skills/team/SKILL.md` §"Role-Based Routing" |
 | ccteam fix-loop hard cap 红线 | `CLAUDE.md §三` |
-| ccteam workflow.yaml 当前 schema | `docs/v0-4-0/prd.md` + `docs/interfaces.md` |
+| ccteam workflow.yaml 当前 schema | `docs/versions/v0-4-0/prd.md` + `docs/interfaces.md` |

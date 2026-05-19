@@ -1,6 +1,6 @@
 //! V0.4.0 F66 — thin orchestrator integration tests.
 //!
-//! Coverage matrix (20 cases) — see `docs/v0-4-0/dev-plan.md` §8.1 #7.9.
+//! Coverage matrix (20 cases) — see `docs/versions/v0-4-0/dev-plan.md` §8.1 #7.9.
 //!
 //! These tests exercise the new artifact-trigger dispatch loop without
 //! touching tmux: a `MockAdapter` implementing [`HarnessAdapter`] is

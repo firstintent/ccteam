@@ -25,7 +25,7 @@
 #   $OUT_DIR/<scenario>/daemon-stderr.log  — F119 daemon stderr (when spawned)
 #   $OUT_DIR/<scenario>/status             — "happy" | "mock" | "skip" | "fail"
 #   $OUT_DIR/summary.md                    — table the team-lead pastes into
-#                                            docs/v0-6-X/host-probe.md
+#                                            docs/versions/v0-6-X/host-probe.md
 #
 # Usage:
 #   scripts/host-probe/run-probes.sh [SCENARIO...]
@@ -582,4 +582,4 @@ log "writing summary.md"
     done
 } > "$OUT_DIR/summary.md"
 
-log "done — paste $OUT_DIR/summary.md into docs/v0-6-X/host-probe.md"
+log "done — paste $OUT_DIR/summary.md into docs/versions/v0-6-X/host-probe.md"

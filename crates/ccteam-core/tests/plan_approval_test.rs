@@ -8,7 +8,7 @@
 //!   5. assert decision file body + progress.jsonl event ordering
 //!   6. separate scenario: 60min timeout w/ on_timeout=escalate
 //!
-//! Acceptance per `docs/v0-6-1/prd.md` §F98:
+//! Acceptance per `docs/versions/v0-6-1/prd.md` §F98:
 //!   ✓ workflow.yaml `plan_approval:` block round-trips through serde
 //!   ✓ plan write → IM body contains plan head + APPROVE/REJECT/EDIT hint
 //!   ✓ APPROVE → orchestrator inject decision + agent resume path

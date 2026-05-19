@@ -8,7 +8,7 @@
 //! write-action POST in one sequenced run, with the disk side-effect
 //! of the POST observable afterwards.
 //!
-//! The brief (`docs/v0-3/dev-plan.md` §6 #5.1) explicitly orders the
+//! The brief (`docs/versions/v0-3/dev-plan.md` §6 #5.1) explicitly orders the
 //! sequence:
 //!
 //!   GET /                  → 301 /app/
