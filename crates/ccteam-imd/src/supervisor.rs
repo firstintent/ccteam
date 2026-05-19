@@ -5,8 +5,12 @@
 //! 1. Refreshes the daemon-global heartbeat file each tick
 //!    (`~/.ccteam/state/imd.heartbeat`).
 //! 2. For every registered bot, checks the per-bot heartbeat
-//!    (`<project>/.ccteam/chat/<bot>/heartbeat`) — written by the
-//!    `claude-tui` adapter (tui-impl teammate's F108 work).
+//!    (`<project>/.ccteam/chat/<bot>/heartbeat`) — V0.6.1 F136
+//!    writes this file via a 5s-tick task spawned inside
+//!    [`BotSupervisor::ensure_started`] (lifetime tied to the
+//!    adapter handle; aborted on `shutdown` / `restart`). Before
+//!    F136 the production daemon never wrote it, so `decide()` ran
+//!    a ~65s restart loop on every healthy bot.
 //! 3. If a per-bot heartbeat is missing or older than [`STALE_THRESHOLD`],
 //!    initiates a graceful close → restart cycle.
 //! 4. Honors `signals/shutdown.signal` (final stop) and
@@ -29,13 +33,24 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, Context, Result};
+use ccteam_core::execution::turns_mirror::{self, TurnRecord};
 use ccteam_core::harness::{
-    AgentSpecBrief, HarnessAdapter, SpawnCtx, ThreadHandle, TurnId, TurnInput,
+    AgentSpecBrief, HarnessAdapter, SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails,
+    TurnId, TurnInput,
 };
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 
 use crate::{imd_heartbeat_path, BotRegistration};
+
+/// V0.6.1 F136 — interval between per-bot heartbeat writes. Picked so
+/// 6 cycles fit comfortably inside [`STALE_THRESHOLD`] (60s) — one
+/// missed tick from a busy task scheduler still leaves five healthy
+/// writes inside the stale window.
+pub const HEARTBEAT_TICK: Duration = Duration::from_secs(5);
 
 /// Per-bot heartbeat older than this triggers restart.
 pub const STALE_THRESHOLD: Duration = Duration::from_secs(60);
@@ -191,6 +206,19 @@ pub struct BotSupervisor {
     pub adapter: Arc<dyn HarnessAdapter + Send + Sync>,
     /// Active runtime state (handle + restart history + flags).
     state: Mutex<BotState>,
+    /// V0.6.1 F136 — periodic heartbeat-writer task. Touches
+    /// `<bot_dir>/heartbeat` every [`HEARTBEAT_TICK`] so the
+    /// supervisor's `decide()` doesn't see the file as stale and
+    /// trigger a needless restart loop. Lifetime tracks the underlying
+    /// thread: spawned in `ensure_started`, aborted in `shutdown` /
+    /// `restart`.
+    heartbeat_task: Mutex<Option<JoinHandle<()>>>,
+    /// V0.6.1 F137 — `events()` → `turns_mirror::append_turn` bridge.
+    /// Without this task the ccteam-owned `turns.jsonl` mirror never
+    /// gets populated, which leaves the F134 outbound forwarder with
+    /// no source rows to dispatch. Lifetime mirrors the heartbeat
+    /// writer.
+    events_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl std::fmt::Debug for BotSupervisor {
@@ -217,7 +245,15 @@ impl BotSupervisor {
             projects_root: projects_root.into(),
             adapter,
             state: Mutex::new(BotState::default()),
+            heartbeat_task: Mutex::new(None),
+            events_task: Mutex::new(None),
         }
+    }
+
+    /// `<projects_root>/<slug>/.ccteam/chat/<role>/`. Helper so the
+    /// background tasks share one resolution path with `decide`.
+    fn bot_dir(&self) -> PathBuf {
+        bot_dir(&self.projects_root, &self.reg)
     }
 
     /// `<projects_root>/<slug>/`.
@@ -284,14 +320,170 @@ impl BotSupervisor {
                 )
             })?;
         let mut st = self.state.lock().await;
-        st.handle = Some(handle);
+        st.handle = Some(handle.clone());
+        drop(st);
         tracing::info!(
             slug = %self.reg.workflow_slug,
             role = %self.reg.role,
             adapter = self.adapter.name(),
             "bot supervisor started thread"
         );
+
+        // V0.6.1 F136 — start the heartbeat writer if it isn't already
+        // running. Aborted on shutdown / restart so a stale heartbeat
+        // from a closed session can't keep the supervisor pinned.
+        self.spawn_heartbeat_writer().await;
+        // V0.6.1 F137 — start the events → turns_mirror consumer so
+        // assistant replies land in `<project>/.ccteam/chat/<role>/turns.jsonl`,
+        // which is the source-of-truth the F134 outbound forwarder
+        // tails.
+        self.spawn_events_consumer(handle).await;
         Ok(())
+    }
+
+    /// V0.6.1 F136 — idempotent spawn of the per-bot heartbeat writer.
+    /// Writes a fresh UTC timestamp to `<bot_dir>/heartbeat` every
+    /// [`HEARTBEAT_TICK`]. Survives transient `std::fs::write` failures
+    /// (warn-logged) — the next tick will retry.
+    async fn spawn_heartbeat_writer(&self) {
+        let mut guard = self.heartbeat_task.lock().await;
+        if guard.as_ref().is_some_and(|h| !h.is_finished()) {
+            return;
+        }
+        let bot_dir = self.bot_dir();
+        let slug = self.reg.workflow_slug.clone();
+        let role = self.reg.role.clone();
+        let handle = tokio::spawn(async move {
+            // Best-effort `mkdir -p` once at task start — the heartbeat
+            // file's parent dir may not exist yet on first spawn (the
+            // bot_dir is otherwise created lazily by inbox / outbound
+            // writers).
+            if let Err(err) = std::fs::create_dir_all(&bot_dir) {
+                tracing::warn!(
+                    slug = %slug,
+                    role = %role,
+                    path = %bot_dir.display(),
+                    error = %err,
+                    "imd: heartbeat writer mkdir failed"
+                );
+            }
+            let path = bot_dir.join("heartbeat");
+            let mut ticker = tokio::time::interval(HEARTBEAT_TICK);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                let now = chrono::Utc::now().to_rfc3339();
+                if let Err(err) = std::fs::write(&path, &now) {
+                    tracing::warn!(
+                        slug = %slug,
+                        role = %role,
+                        path = %path.display(),
+                        error = %err,
+                        "imd: heartbeat write failed"
+                    );
+                }
+            }
+        });
+        *guard = Some(handle);
+        tracing::info!(
+            slug = %self.reg.workflow_slug,
+            role = %self.reg.role,
+            tick_secs = HEARTBEAT_TICK.as_secs(),
+            "imd: bot heartbeat writer spawned"
+        );
+    }
+
+    /// V0.6.1 F137 — idempotent spawn of the
+    /// `adapter.events()` → `turns_mirror::append_turn` bridge.
+    ///
+    /// For every `ItemCompleted` event carrying `AgentMessage(text)`,
+    /// build a [`TurnRecord`] and append it to the bot's
+    /// `turns.jsonl`. User-side text never flows through the
+    /// transcript event stream (the user input goes via `submit_turn`
+    /// → tmux send-keys, never replayed back through `events()`), so
+    /// only assistant rows land here; that's exactly what
+    /// `forward_new_rows` filters on downstream.
+    async fn spawn_events_consumer(&self, handle: ThreadHandle) {
+        let mut guard = self.events_task.lock().await;
+        if guard.as_ref().is_some_and(|h| !h.is_finished()) {
+            return;
+        }
+        let adapter = self.adapter.clone();
+        let project_dir = self.project_dir();
+        let slug = self.reg.workflow_slug.clone();
+        let role = self.reg.role.clone();
+        let vendor = match self.reg.vendor {
+            ccteam_core::harness::AgentVendor::Claude => "claude",
+            ccteam_core::harness::AgentVendor::Codex => "codex",
+        }
+        .to_string();
+        let task = tokio::spawn(async move {
+            let mut stream = adapter.events(&handle);
+            while let Some(evt) = stream.next().await {
+                let item = match evt {
+                    ThreadEvent::ItemCompleted { item } => item,
+                    _ => continue,
+                };
+                let text = match item.details {
+                    ThreadItemDetails::AgentMessage(s) => s,
+                    _ => continue,
+                };
+                if text.is_empty() {
+                    continue;
+                }
+                let record = TurnRecord {
+                    turn_id: item.id,
+                    ts: chrono::Utc::now(),
+                    vendor: vendor.clone(),
+                    role: role.clone(),
+                    user: String::new(),
+                    assistant: text,
+                    usage: Value::Null,
+                    tool_calls: Vec::new(),
+                };
+                match turns_mirror::append_turn(&project_dir, &role, &record) {
+                    Ok(path) => {
+                        tracing::debug!(
+                            slug = %slug,
+                            role = %role,
+                            path = %path.display(),
+                            "imd: turns_mirror append (F137)"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            slug = %slug,
+                            role = %role,
+                            error = %err,
+                            "imd: turns_mirror append failed"
+                        );
+                    }
+                }
+            }
+            tracing::debug!(
+                slug = %slug,
+                role = %role,
+                "imd: turns mirror consumer stream ended"
+            );
+        });
+        *guard = Some(task);
+        tracing::info!(
+            slug = %self.reg.workflow_slug,
+            role = %self.reg.role,
+            "imd: turns mirror consumer spawned"
+        );
+    }
+
+    /// Abort the heartbeat + events background tasks, if any are
+    /// running. Used by `shutdown` and `restart` to keep stale tasks
+    /// from racing the fresh thread.
+    async fn abort_background_tasks(&self) {
+        if let Some(h) = self.heartbeat_task.lock().await.take() {
+            h.abort();
+        }
+        if let Some(h) = self.events_task.lock().await.take() {
+            h.abort();
+        }
     }
 
     /// Submit one mailbox payload to the bot via
@@ -329,6 +521,9 @@ impl BotSupervisor {
     /// and clear local state. Idempotent — calling on a stopped
     /// supervisor is a no-op.
     pub async fn shutdown(&self) -> Result<()> {
+        // V0.6.1 F136 / F137 — kill background tasks BEFORE close so
+        // a final heartbeat write doesn't race the tmux teardown.
+        self.abort_background_tasks().await;
         let handle = {
             let mut st = self.state.lock().await;
             st.shutting_down = true;
@@ -356,6 +551,10 @@ impl BotSupervisor {
     /// Close-then-start cycle for stale-heartbeat recovery. Records the
     /// restart in the rolling-hour budget.
     pub async fn restart(&self) -> Result<()> {
+        // V0.6.1 F136 / F137 — abort the previous thread's background
+        // tasks before tearing it down; `ensure_started` will respawn
+        // them against the fresh handle.
+        self.abort_background_tasks().await;
         // Close first.
         let handle = self.state.lock().await.handle.take();
         if let Some(h) = handle {
