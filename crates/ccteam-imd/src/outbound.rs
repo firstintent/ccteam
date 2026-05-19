@@ -14,7 +14,16 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// One row in `turns.jsonl` (subset we care about — extras tolerated).
+///
+/// V0.6.1 ship-day F138 — accepts both the legacy schema (`role` +
+/// `content` fields) AND the canonical `turns_mirror::TurnRecord`
+/// schema (`assistant` field with separate `user` field for the
+/// user-side prompt). turns_mirror is the SoT writer (F137); the
+/// `From<RawRecord>` conversion below derives `role = "assistant"`
+/// when `assistant` is non-empty and uses it as `content`. The legacy
+/// `role`/`content` path is preserved for tests that hand-build rows.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "RawRecord")]
 pub struct TurnRow {
     /// "user" / "assistant" / "tool" — only `assistant` is forwarded.
     pub role: String,
@@ -33,6 +42,58 @@ pub struct TurnRow {
     /// through by the tui adapter).
     #[serde(default)]
     pub reply_target: Option<String>,
+}
+
+/// Wire-format raw record union. Either schema parses; `Into<TurnRow>`
+/// normalizes to the outbound view (role + content).
+#[derive(Debug, Clone, Deserialize)]
+struct RawRecord {
+    /// Legacy / hand-built: explicit role.
+    #[serde(default)]
+    role: String,
+    /// Legacy / hand-built: explicit content.
+    #[serde(default)]
+    content: String,
+    /// Canonical turns_mirror schema: assistant-side text.
+    #[serde(default)]
+    assistant: String,
+    /// Canonical turns_mirror schema: user-side text (skipped for
+    /// outbound — only assistant rows forward).
+    #[serde(default)]
+    #[allow(dead_code)]
+    user: String,
+    #[serde(default)]
+    reply_to: Option<String>,
+    #[serde(default)]
+    thread_ts: Option<String>,
+    #[serde(default)]
+    reply_target: Option<String>,
+}
+
+impl From<RawRecord> for TurnRow {
+    fn from(raw: RawRecord) -> Self {
+        // Prefer explicit (role + content) when present — keeps the
+        // legacy in-crate test fixtures working unchanged. Otherwise
+        // synthesize from turns_mirror's (assistant) field.
+        let (role, content) = if !raw.role.is_empty() && !raw.content.is_empty() {
+            (raw.role, raw.content)
+        } else if !raw.assistant.is_empty() {
+            ("assistant".to_string(), raw.assistant)
+        } else if !raw.user.is_empty() {
+            // User-side row from turns_mirror — outbound filter drops
+            // these, but we deserialize cleanly so the cursor advances.
+            ("user".to_string(), String::new())
+        } else {
+            (raw.role, raw.content)
+        };
+        TurnRow {
+            role,
+            content,
+            reply_to: raw.reply_to,
+            thread_ts: raw.thread_ts,
+            reply_target: raw.reply_target,
+        }
+    }
 }
 
 /// Tailer state for one bot. Persisted between daemon ticks so we
