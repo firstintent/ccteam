@@ -2581,8 +2581,19 @@ impl Orchestrator {
                 .join(&handle.sid)
                 .join("state.json");
         }
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+        // V0.6.1 — also honor `CCTEAM_CLAUDE_JOBS_DIR` (the same env
+        // that claude_job::probe_job + harness.rs::CLAUDE_JOBS_DIR_ENV
+        // consult). Without this, hermetic host-probe scripts that set
+        // CCTEAM_CLAUDE_JOBS_DIR could write fake state.json files
+        // there, but the orchestrator's primary poll_completions still
+        // looked under $HOME/.claude/jobs/<id>/ and saw nothing — only
+        // the F80 stale-spawn fallback (which does honor the env) ever
+        // detected completions. F120 host-probe surfaced this split.
         let id = handle.job_id.as_deref().unwrap_or("__no_job_id__");
+        if let Ok(custom) = std::env::var(crate::harness::CLAUDE_JOBS_DIR_ENV) {
+            return PathBuf::from(custom).join(id).join("state.json");
+        }
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
         home.join(".claude")
             .join("jobs")
             .join(id)
