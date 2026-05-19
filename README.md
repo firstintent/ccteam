@@ -76,9 +76,9 @@ claude
 
 ## Status
 
-**V0.6.0 蓄势中**(2026-05 立项)— Epic A 5 min 起第一个 IM bot · Epic B bot 在 IM 像真人助理 · Epic C 中文用户能用(铺底)。详 [docs/v0-6-0/README.md](docs/v0-6-0/README.md)。
+**V0.6.0 in production**(2026-05-19 shipped,`git tag v0.6.0`)— Epic A 5 min 起第一个 IM bot · Epic B bot 在 IM 像真人助理 · Epic C 中文用户能用(铺底)。`HarnessAdapter` 5-method trait + tmux 长跑 mode 3 + Codex Option B + per-vendor budget caps + ccteam-imd daemon。baseline 1283/1 · clippy `-D warnings` clean · 4 wave handoff doc 全 land。详 [docs/v0-6-0/README.md](docs/v0-6-0/README.md) + [wave-4-handoff.md](docs/v0-6-0/wave-4-handoff.md)。
 
-**V0.5.1 in production**(2026-05 ship)— 升级 V0.6 **0 用户操作**:工具名 / skill 入口 / workflow.yaml 全兼容。
+**V0.6.1 蓄势中** — F119 probe daemon-start / F120 overnight-builder full probe / F121 pricing version check / F122 mode-3 Codex bridge / F123 demo GIF 录制 / F98 plan-approval↔outbox / F124 HITL Approval Gating(详 wave-4-handoff §Remaining)。
 
 ## License
 
