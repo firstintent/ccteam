@@ -79,7 +79,7 @@ pub const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-4-6[1m]";
 
 /// Default budget ceiling (USD). Mirrors CLAUDE.md §三 "项目累计 cost
 /// > $200 物理上限". F66 only blocks new spawns at this line — running
-/// sessions are never killed.
+/// > sessions are never killed.
 pub const DEFAULT_BUDGET_LIMIT_USD: f64 = 200.0;
 
 /// Consecutive `start_thread` failures (per role) before meta-agent

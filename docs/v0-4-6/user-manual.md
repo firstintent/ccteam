@@ -106,7 +106,7 @@ agents:
 
   reviewer:
     executor: claude
-    trigger: gate                # 等 `mcp__ccteam__trigger_gate` 触发
+    trigger: gate                # 等 `mcp__ccteam__workflow_trigger_gate` 触发
 
   master:
     executor: claude
@@ -121,8 +121,8 @@ agents:
 **`enabled` + `budget` 热加载** — 改 yaml 存盘,2-5s 内 daemon 检测 + 优雅 reload(`workflow_done reason="reloaded"`)。**无需 `ccteam stop/start`**。
 
 Trigger 速查:
-- `manual` — 只有 `mcp__ccteam__spawn_agent` 或 `ccteam internal spawn` 才起
-- `gate` — 等 `mcp__ccteam__trigger_gate` 触发(workflow 的"等所有上游搞完才放行"语义)
+- `manual` — 只有 `mcp__ccteam__workflow_spawn_agent` 或 `ccteam internal spawn` 才起
+- `gate` — 等 `mcp__ccteam__workflow_trigger_gate` 触发(workflow 的"等所有上游搞完才放行"语义)
 - `schedule` — 间隔触发(`interval: <秒>`)
 - `watch:<relative-path>/` — `<project>/<path>` 下任何新文件 → spawn 一个 session 处理它
 

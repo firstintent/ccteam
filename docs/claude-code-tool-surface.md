@@ -180,7 +180,7 @@ MCP server 注册的 tool 在模型看来就是普通工具,工具名形如
 | `claude-mem` | M3 | `mcp__plugin_claude-mem_mcp-search__search` 等 |
 | Playwright | 按需 | `mcp__plugin_playwright_playwright__browser_*` |
 | GitHub | M4+ | 优先 `gh` CLI(见最佳实践 §4.3) |
-| `ccteam-mcp`(自建) | M2 / V0.4.0 | **17 个工具** `mcp__ccteam__ls` / `show` / `new` / `spawn_agent` / `stop_agent` / `observe_agents` / `signal` / `set_parallelism` / `trigger_gate` / `get_artifact_summary` 等(见 `docs/v0-4-0/prd.md §6.3` 完整清单) |
+| `ccteam-mcp`(自建) | M2 / V0.4.0 | **17 个工具** `mcp__ccteam__admin_ls` / `show` / `new` / `spawn_agent` / `stop_agent` / `observe_agents` / `signal` / `set_parallelism` / `trigger_gate` / `get_artifact_summary` 等(见 `docs/v0-4-0/prd.md §6.3` 完整清单) |
 
 #### 1.3.2 验证示例(假设已装 Playwright MCP)
 
@@ -237,7 +237,7 @@ MCP server 注册的 tool 在模型看来就是普通工具,工具名形如
 |---|---|
 | **orchestrator deterministic 监控** | 读 progress.jsonl 跨阈值采取行动(cost > $200 → 硬终止;通过 supervisor 终结 `--bg` session) |
 | **orchestrator 安装态变化**(仅 Codex tmux) | 装/卸 plugin 后 send-keys `/reload-plugins` |
-| **meta-agent / 用户** | 调 `mcp__ccteam__spawn_agent` / `signal` / `trigger_gate` / `set_parallelism` |
+| **meta-agent / 用户** | 调 `mcp__ccteam__workflow_spawn_agent` / `signal` / `trigger_gate` / `set_parallelism` |
 | **人** | tmux attach 手动键入(Codex)、`ccteam web` UI、meta-agent 对话 |
 
 **ESCALATE 的真正用途** — 只有人 / meta-agent 能决定的事(spec 不清、技术选型卡住、外部依赖缺失),通过 `escalation` event 写入 progress.jsonl(reason 自由文本)。orchestrator 不解析 reason 内容;meta-agent 用 `mcp__ccteam__get_progress` / `observe_agents` 读到后自然语言决策,调 `spawn_agent` / `signal` / `trigger_gate`。
@@ -361,7 +361,7 @@ ccteam 把"何时起 agent"的决策放在 **workflow.yaml trigger**,本节解�
 |---|---|---|---|
 | `watch:<path>` | inotify 检测到 `<path>` 下新文件写入完成(`IN_CLOSE_WRITE`,200ms debounce) | `CCTEAM_INPUT=<path>`(role.md 用 `Read` / `Glob` 扫输入)、`CCTEAM_OUTPUT=<output>` | 通常 `Read $CCTEAM_INPUT/<file>` + 处理 + `Write $CCTEAM_OUTPUT/<artifact>` |
 | `schedule` | 定时(`interval: 5m` 等)或 meta-agent 调 `spawn_agent` 主动触发 | `CCTEAM_OUTPUT=<output>` (input 通常没意义) | 自主任务(crawler / monitor 类),用 `Bash` / `WebFetch` 拉数据,`Write` 出 artifact |
-| `gate` | meta-agent / 人调 `mcp__ccteam__trigger_gate(gate_name, slug)` 后才起 | `CCTEAM_OUTPUT=<output>` + `CCTEAM_INPUT=<input>`(若声明) | 通常做"最终把关"(ship / publish 类),输出落地 + 通过 `Bash` 调外部命令(`gh pr create` / `npm publish` 等) |
+| `gate` | meta-agent / 人调 `mcp__ccteam__workflow_trigger_gate(gate_name, slug)` 后才起 | `CCTEAM_OUTPUT=<output>` + `CCTEAM_INPUT=<input>`(若声明) | 通常做"最终把关"(ship / publish 类),输出落地 + 通过 `Bash` 调外部命令(`gh pr create` / `npm publish` 等) |
 
 ### spawn 时的完整 env 注入(V0.4.0 实测)
 
@@ -397,7 +397,7 @@ artifact —— 这些工具直接和 Claude Code prompt cache 友好,且 Artifa
 |---|---|
 | `workflow.yaml::agents.<role>.executor: claude` | spawn `claude --bg --agent <role>`;**通道 1** 全开(role 可调 Task / Skill / MCP / 内置),**通道 2 不可用**(没 TUI) |
 | `workflow.yaml::agents.<role>.executor: codex` | spawn tmux + codex;**通道 1** 部分开(看 Codex 支持哪些工具),**通道 2 可用**(tmux send-keys) |
-| `workflow.yaml::agents.<role>.trigger: gate` | 由 **通道 3**(meta-agent + `mcp__ccteam__trigger_gate`)解锁后才起 |
+| `workflow.yaml::agents.<role>.trigger: gate` | 由 **通道 3**(meta-agent + `mcp__ccteam__workflow_trigger_gate`)解锁后才起 |
 | role 产 artifact → 下游 `trigger: watch:*` | 完全 orchestrator deterministic(ArtifactWatcher),**不经任何 LLM 决策** |
 | escalation event 落 progress.jsonl | **通道 3** meta-agent 用 `observe_agents` / `get_progress` 读到自决策 |
 

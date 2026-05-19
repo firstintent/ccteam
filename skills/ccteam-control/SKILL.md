@@ -50,15 +50,15 @@ ccteam internal spawn <slug> <role>  # was: ccteam spawn <slug> <role>
 
 | What you want | MCP tool (preferred) | Bash fallback |
 |---|---|---|
-| List all projects                | `mcp__ccteam__ls`                | `ccteam ls --format json` |
-| One project's full state         | `mcp__ccteam__show`              | `ccteam show <slug> --format json` |
-| Recent progress events           | `mcp__ccteam__progress`          | `ccteam internal progress <slug>` |
-| Capture session pane content     | `mcp__ccteam__peek`              | `ccteam internal peek <slug>` |
-| Start a new project (delegate)   | `mcp__ccteam__new`               | `ccteam new <slug>` (and see `ccteam-creator` skill for the dialogue) |
-| Pause project (no kill)          | `mcp__ccteam__pause`             | `ccteam pause <slug>` |
-| Resume project                   | `mcp__ccteam__resume`            | `ccteam internal resume <slug>` |
-| Send NL to a session inbox       | `mcp__ccteam__send_to_session`   | `ccteam internal send <slug> "<body>"` (or write `.ccteam/inbox/msg-<ts>-NNN.md` directly) |
-| Inject a structured decision     | `mcp__ccteam__inject_decision`   | (compose body manually + send_to_session) |
+| List all projects                | `mcp__ccteam__admin_ls`                | `ccteam ls --format json` |
+| One project's full state         | `mcp__ccteam__workflow_show`              | `ccteam show <slug> --format json` |
+| Recent progress events           | `mcp__ccteam__workflow_progress`          | `ccteam internal progress <slug>` |
+| Capture session pane content     | `mcp__ccteam__workflow_peek`              | `ccteam internal peek <slug>` |
+| Start a new project (delegate)   | `mcp__ccteam__workflow_new`               | `ccteam new <slug>` (and see `ccteam-creator` skill for the dialogue) |
+| Pause project (no kill)          | `mcp__ccteam__workflow_pause`             | `ccteam pause <slug>` |
+| Resume project                   | `mcp__ccteam__workflow_resume`            | `ccteam internal resume <slug>` |
+| Send NL to a session inbox       | `mcp__ccteam__workflow_send_to_session`   | `ccteam internal send <slug> "<body>"` (or write `.ccteam/inbox/msg-<ts>-NNN.md` directly) |
+| Inject a structured decision     | `mcp__ccteam__workflow_inject_decision`   | (compose body manually + send_to_session) |
 | Health checks                    | (Bash only)                      | `ccteam doctor --tool-surface` |
 | Install meta-agent               | (Bash only)                      | `ccteam doctor --install-meta-agent` |
 
@@ -127,7 +127,7 @@ When this skill is loaded inside the ccteam meta-agent session:
    `~/projects/meta/.ccteam/outbox/reply-<ts>-<seq>.md` per
    `docs/interfaces.md` §3.4.3.
 3. When the user has resolved a project's clarify / escalation, use
-   `mcp__ccteam__inject_decision` (or its Bash equivalent) to push
+   `mcp__ccteam__workflow_inject_decision` (or its Bash equivalent) to push
    the resolution back into the project session — it constructs a
    structured decision payload (interfaces §4.1.1) and atomically
    writes it to the project's inbox so the orchestrator delivers it

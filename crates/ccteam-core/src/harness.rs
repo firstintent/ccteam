@@ -100,11 +100,11 @@ pub enum AgentVendor {
 /// re-deriving from `vendor + adapter name`:
 ///
 /// - `InProc`  — V0.5 `Task` tool / in-process subagent (no adapter,
-///               kept here for orthogonality of [`ThreadHandle`]).
+///   kept here for orthogonality of [`ThreadHandle`]).
 /// - `Bg`      — `claude --bg` background job, `codex exec --json`,
-///               single-turn fresh-context spawn.
+///   single-turn fresh-context spawn.
 /// - `Chat`    — long-running tmux + claude TUI / `codex app-server`
-///               UDS; multi-turn with context reuse (Wave 2 F108).
+///   UDS; multi-turn with context reuse (Wave 2 F108).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ExecutionMode {

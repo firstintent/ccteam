@@ -181,19 +181,16 @@ pub struct WorkflowMigrationReport {
 
 /// What happened for one project during F83 migration.
 ///
-/// - `Moved`:      root `workflow.yaml` existed, `.ccteam/workflow.yaml`
-///                 did not → file was moved (or, in dry-run, would be).
-/// - `AlreadyAtCcteamDir`:
-///                 only `.ccteam/workflow.yaml` exists — already on the
-///                 canonical layout, nothing to do.
+/// - `Moved`: root `workflow.yaml` existed, `.ccteam/workflow.yaml`
+///   did not → file was moved (or, in dry-run, would be).
+/// - `AlreadyAtCcteamDir`: only `.ccteam/workflow.yaml` exists — already
+///   on the canonical layout, nothing to do.
 /// - `NoWorkflow`: neither location has a `workflow.yaml` — likely a
-///                 V0.3 legacy project that never adopted the V0.4.0
-///                 schema. Reported but skipped.
-/// - `ConflictBothPresent`:
-///                 both root and `.ccteam/` versions exist — fail-safe,
-///                 leaves both untouched so the user can pick a winner.
-///                 No `--apply` will resolve this; user must `rm` one
-///                 by hand.
+///   V0.3 legacy project that never adopted the V0.4.0 schema. Reported
+///   but skipped.
+/// - `ConflictBothPresent`: both root and `.ccteam/` versions exist —
+///   fail-safe, leaves both untouched so the user can pick a winner. No
+///   `--apply` will resolve this; user must `rm` one by hand.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkflowMigrationAction {
     Moved { dry_run: bool },
