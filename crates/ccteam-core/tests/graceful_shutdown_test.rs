@@ -49,6 +49,7 @@ fn manual_spec(role: &str) -> WorkflowSpec {
         role.into(),
         AgentSpec {
             executor: Executor::Claude,
+            model: None,
             trigger: Trigger::Manual,
             parallelism: None,
             input: None,

@@ -198,6 +198,7 @@ fn watch_spec(role: &str, watch_rel: &str, parallelism: Option<u32>) -> Workflow
         role.into(),
         AgentSpec {
             executor: Executor::Claude,
+            model: None,
             trigger: Trigger::Watch(PathBuf::from(watch_rel)),
             parallelism,
             input: Some(PathBuf::from(watch_rel)),
@@ -226,6 +227,7 @@ fn manual_spec(role: &str) -> WorkflowSpec {
         role.into(),
         AgentSpec {
             executor: Executor::Claude,
+            model: None,
             trigger: Trigger::Manual,
             parallelism: None,
             input: None,
@@ -254,6 +256,7 @@ fn gate_spec(role: &str, input_rel: &str) -> WorkflowSpec {
         role.into(),
         AgentSpec {
             executor: Executor::Claude,
+            model: None,
             trigger: Trigger::Gate,
             parallelism: None,
             input: Some(PathBuf::from(input_rel)),
@@ -818,6 +821,7 @@ agents:
         "agentA".into(),
         AgentSpec {
             executor: Executor::Claude,
+            model: None,
             trigger: Trigger::Watch(PathBuf::from("dirA")),
             parallelism: Some(1),
             input: Some(PathBuf::from("dirA")),
@@ -831,6 +835,7 @@ agents:
         "agentB".into(),
         AgentSpec {
             executor: Executor::Claude,
+            model: None,
             trigger: Trigger::Watch(PathBuf::from("dirB")),
             parallelism: Some(1),
             input: Some(PathBuf::from("dirB")),
@@ -1391,6 +1396,7 @@ async fn t31_inbox_target_role_routes_explicitly() {
             role.into(),
             AgentSpec {
                 executor: Executor::Claude,
+                model: None,
                 trigger: Trigger::Manual,
                 parallelism: None,
                 input: None,

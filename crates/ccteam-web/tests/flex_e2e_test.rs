@@ -341,5 +341,6 @@ fn v0_6_0_codex_exec_adapter_pane_ingest_is_permissive() {
         cwd: std::env::temp_dir(),
         project_dir: std::env::temp_dir(),
         extra_args: Vec::new(),
+        model_id: None,
     };
 }

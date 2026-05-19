@@ -266,6 +266,10 @@ impl BotSupervisor {
             cwd: project_dir.clone(),
             project_dir,
             extra_args: Vec::new(),
+            // Wave 4 D14 — chat supervisor has no spec.model on hand;
+            // adapter falls back to vendor default. The orchestrator
+            // path (try_spawn_with_prompt) plumbs through workflow.yaml.
+            model_id: None,
         };
         let handle = self
             .adapter

@@ -509,6 +509,15 @@ pub struct AgentSpec {
     /// YAML field is omitted — Codex is opt-in.
     #[serde(default)]
     pub executor: Executor,
+    /// Concrete model id to run this role under (e.g.
+    /// `"claude-sonnet-4-5"`, `"claude-opus-4-7"`, `"gpt-5-codex"`).
+    /// `None` (YAML field omitted) = vendor-default model.
+    ///
+    /// Wave 4 D14 — threaded through `SpawnCtx::model_id` so cost
+    /// estimation accounts against the actual model instead of the
+    /// vendor's `fallback_model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// What triggers a new session of this role. See [`Trigger`].
     pub trigger: Trigger,
     /// Max concurrent sessions of this role. Only meaningful for
@@ -866,6 +875,7 @@ mod tests {
                     "explorer".into(),
                     AgentSpec {
                         executor: Executor::Claude,
+                        model: None,
                         trigger: parsed,
                         parallelism: None,
                         input: None,

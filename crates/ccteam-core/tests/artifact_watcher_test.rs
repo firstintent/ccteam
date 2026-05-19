@@ -43,6 +43,7 @@ fn build_spec(name: &str, watchers: &[(&str, PathBuf)]) -> WorkflowSpec {
             (*role).to_string(),
             AgentSpec {
                 executor: Executor::Claude,
+                model: None,
                 trigger: Trigger::Watch(root.clone()),
                 parallelism: None,
                 input: None,

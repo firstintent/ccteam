@@ -1798,6 +1798,9 @@ pub fn run_session_add(slug: &str, harness: ccteam_core::HarnessKind, role: Stri
         cwd: session_dir.clone(),
         project_dir: paths.project_dir(slug),
         extra_args: Vec::new(),
+        // Wave 4 D14 — session-add CLI doesn't carry workflow.yaml's
+        // model field; adapter falls back to vendor default.
+        model_id: None,
     };
 
     let thread_handle = runtime.block_on(async {
