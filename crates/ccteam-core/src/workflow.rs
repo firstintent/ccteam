@@ -545,6 +545,92 @@ pub struct AgentSpec {
     /// What to do when `timeout` elapses. Default `Escalate`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_timeout: Option<OnTimeout>,
+    /// V0.6.1 F98 — optional plan-approval gate. When `enabled: true`,
+    /// any plan markdown the agent writes to
+    /// `<project>/.ccteam/plans/<agent>-*.md` pauses the agent until
+    /// the user replies APPROVE / REJECT / EDIT through the configured
+    /// IM outbox (or `timeout_min` elapses, in which case `on_timeout`
+    /// fires). Pure schema field here — the engine lives in
+    /// [`crate::plan_approval`] and the IM wiring in `ccteam-imd`.
+    ///
+    /// ```yaml
+    /// agents:
+    ///   reviewer:
+    ///     plan_approval:
+    ///       enabled: true
+    ///       outbox: telegram
+    ///       timeout_min: 60
+    ///       on_timeout: escalate
+    /// ```
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_approval: Option<PlanApprovalSpec>,
+}
+
+/// V0.6.1 F98 — per-agent plan-approval policy.
+///
+/// Mirrors the prd.md §F98 schema:
+///
+/// ```yaml
+/// plan_approval:
+///   enabled: true
+///   outbox: telegram     # registered IM transport
+///   timeout_min: 60      # 0 disables the timeout entirely
+///   on_timeout: escalate # | auto-approve | reject
+/// ```
+///
+/// Red lines (CLAUDE.md §三 + prd.md §F98):
+/// - `progress.jsonl` is the SoT — every state transition emits one of
+///   `plan_pending` / `plan_decision` / `plan_timeout` (see
+///   [`crate::progress::PLAN_PENDING`] etc.).
+/// - No prompt injection — the engine only writes the decision file at
+///   `<project>/.ccteam/plan-decisions/<plan_id>.md`; the agent picks
+///   it up via the standard inbox-style read.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PlanApprovalSpec {
+    /// Master toggle. Defaults to `true` when the block is present —
+    /// the only reason to write `plan_approval:` is to opt in. Setting
+    /// it explicitly to `false` lets a workflow temporarily disable
+    /// the gate without removing the rest of the config.
+    #[serde(default = "default_plan_approval_enabled")]
+    pub enabled: bool,
+    /// Outbox channel id (e.g. `telegram`, `slack`). The IM-side
+    /// resolver in `ccteam-imd` maps this to a concrete `Channel`
+    /// implementation + recipient. Required.
+    pub outbox: String,
+    /// Approval window in minutes. `0` disables the timeout (the
+    /// engine never emits `plan_timeout`). Defaults to 60 via
+    /// [`default_plan_approval_timeout_min`].
+    #[serde(default = "default_plan_approval_timeout_min")]
+    pub timeout_min: u32,
+    /// What happens when `timeout_min` elapses without a user reply.
+    /// Defaults to [`PlanApprovalOnTimeout::Escalate`].
+    #[serde(default)]
+    pub on_timeout: PlanApprovalOnTimeout,
+}
+
+/// V0.6.1 F98 — `on_timeout` policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum PlanApprovalOnTimeout {
+    /// Emit `plan_timeout` + push an escalation message to the
+    /// meta-agent inbox. The agent stays paused.
+    #[default]
+    Escalate,
+    /// Treat as APPROVE — inject an approve decision and resume.
+    AutoApprove,
+    /// Treat as REJECT — inject a reject decision (reason: timeout).
+    Reject,
+}
+
+/// Default `plan_approval.enabled` (= `true`). Presence of the block
+/// implies opt-in.
+fn default_plan_approval_enabled() -> bool {
+    true
+}
+
+/// Default `plan_approval.timeout_min` (= 60).
+fn default_plan_approval_timeout_min() -> u32 {
+    60
 }
 
 /// Harness binary executor.
@@ -883,6 +969,7 @@ mod tests {
                         interval: None,
                         timeout: None,
                         on_timeout: None,
+                        plan_approval: None,
                     },
                 );
                 m

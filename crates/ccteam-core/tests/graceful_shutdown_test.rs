@@ -57,6 +57,7 @@ fn manual_spec(role: &str) -> WorkflowSpec {
             interval: None,
             timeout: None,
             on_timeout: None,
+            plan_approval: None,
         },
     );
     WorkflowSpec {
