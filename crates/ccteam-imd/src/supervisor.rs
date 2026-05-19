@@ -431,6 +431,8 @@ impl BotSupervisor {
                 if text.is_empty() {
                     continue;
                 }
+                let assistant_len = text.len();
+                let turn_id_log = item.id.clone();
                 let record = TurnRecord {
                     turn_id: item.id,
                     ts: chrono::Utc::now(),
@@ -441,21 +443,31 @@ impl BotSupervisor {
                     usage: Value::Null,
                     tool_calls: Vec::new(),
                 };
+                let append_t0 = std::time::Instant::now();
                 match turns_mirror::append_turn(&project_dir, &role, &record) {
                     Ok(path) => {
-                        tracing::debug!(
+                        tracing::info!(
+                            event = "latency",
+                            stage = "turn.done",
+                            turn_id = %turn_id_log,
                             slug = %slug,
                             role = %role,
+                            vendor = %vendor,
+                            assistant_len,
+                            append_ms = append_t0.elapsed().as_millis() as u64,
                             path = %path.display(),
-                            "imd: turns_mirror append (F137)"
+                            "latency turn.done"
                         );
                     }
                     Err(err) => {
                         tracing::warn!(
+                            event = "latency",
+                            stage = "turn.done.err",
+                            turn_id = %turn_id_log,
                             slug = %slug,
                             role = %role,
                             error = %err,
-                            "imd: turns_mirror append failed"
+                            "latency turn.done (append failed)"
                         );
                     }
                 }

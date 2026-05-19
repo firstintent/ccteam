@@ -253,6 +253,7 @@ pub async fn process_inbound(
             role,
             payload: stripped,
         } => {
+            let t0 = std::time::Instant::now();
             let dir = mailbox.inbox_dir(&slug, &role)?;
             fs::create_dir_all(&dir).with_context(|| format!("mkdir -p {}", dir.display()))?;
             let ts = Utc::now().format("%Y%m%dT%H%M%S").to_string();
@@ -268,7 +269,16 @@ pub async fn process_inbound(
             };
             let body = render_envelope(&env);
             fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
-            tracing::debug!(slug, role, path = %path.display(), "dropped mailbox envelope");
+            tracing::info!(
+                event = "latency",
+                stage = "imd.mailbox.write",
+                cid = %msg.id,
+                slug = %slug,
+                role = %role,
+                elapsed_ms = t0.elapsed().as_millis() as u64,
+                path = %path.display(),
+                "latency imd.mailbox.write"
+            );
             Ok(InboundOutcome::DroppedToBot { slug, role, path })
         }
     }

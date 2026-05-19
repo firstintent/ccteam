@@ -29,6 +29,7 @@ pub mod acl;
 pub mod credentials;
 pub mod daemon;
 pub mod inbound;
+pub mod latency;
 pub mod nl_admin;
 pub mod outbound;
 pub mod rate_limit;

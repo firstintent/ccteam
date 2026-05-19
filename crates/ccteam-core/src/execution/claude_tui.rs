@@ -254,12 +254,15 @@ impl HarnessAdapter for ClaudeTuiAdapter {
                 format!("Tool result for {call_id}: {body}")
             }
         };
+        let sendkeys_t0 = std::time::Instant::now();
         session
             .send_keys_literal(&text)
             .map_err(|e| HarnessError::SubmitFailed(format!("send_keys -l: {e}")))?;
+        let literal_ms = sendkeys_t0.elapsed().as_millis() as u64;
         session
             .send_keys_enter()
             .map_err(|e| HarnessError::SubmitFailed(format!("send_keys Enter: {e}")))?;
+        let total_ms = sendkeys_t0.elapsed().as_millis() as u64;
         // Synthesize a turn id from the wall clock + a short random
         // suffix derived from the system nanos — keeps the adapter
         // dep-light (no uuid crate) while staying unique enough for
@@ -268,7 +271,30 @@ impl HarnessAdapter for ClaudeTuiAdapter {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        Ok(TurnId::new(format!("turn-{nanos:x}")))
+        let turn_id = format!("turn-{nanos:x}");
+        let role = h
+            .raw_extras
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let slug = h
+            .raw_extras
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        tracing::info!(
+            event = "latency",
+            stage = "claude.sendkeys",
+            turn_id = %turn_id,
+            slug = %slug,
+            role = %role,
+            session = %h.identity,
+            content_len = text.len(),
+            literal_ms,
+            total_ms,
+            "latency claude.sendkeys"
+        );
+        Ok(TurnId::new(turn_id))
     }
 
     fn events(&self, h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {

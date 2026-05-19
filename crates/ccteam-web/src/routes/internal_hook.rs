@@ -66,16 +66,54 @@ fn dispatch(
     action: Option<&str>,
     body: Option<Value>,
 ) -> Response {
+    let t0 = std::time::Instant::now();
     let stdin = body.unwrap_or(Value::Null);
+    // Try to pull session id / role from the Claude Code hook stdin
+    // payload — useful for joining hook latency rows to other stages.
+    // Best-effort: any field missing → empty string.
+    let session_id = stdin
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let cwd = stdin.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
     match ccteam_hooks::dispatch(&app.paths, kind, action, &stdin) {
-        Ok(Some(decision)) => Json(decision).into_response(),
-        Ok(None) => Json(json!({})).into_response(),
-        Err(err) => {
-            tracing::warn!(
+        Ok(Some(decision)) => {
+            tracing::info!(
+                event = "latency",
+                stage = "hook.recv",
                 kind = %kind,
                 action = action.unwrap_or(""),
+                session_id = %session_id,
+                cwd = %cwd,
+                elapsed_ms = t0.elapsed().as_millis() as u64,
+                decision = true,
+                "latency hook.recv"
+            );
+            Json(decision).into_response()
+        }
+        Ok(None) => {
+            tracing::info!(
+                event = "latency",
+                stage = "hook.recv",
+                kind = %kind,
+                action = action.unwrap_or(""),
+                session_id = %session_id,
+                cwd = %cwd,
+                elapsed_ms = t0.elapsed().as_millis() as u64,
+                decision = false,
+                "latency hook.recv"
+            );
+            Json(json!({})).into_response()
+        }
+        Err(err) => {
+            tracing::warn!(
+                event = "latency",
+                stage = "hook.recv.err",
+                kind = %kind,
+                action = action.unwrap_or(""),
+                elapsed_ms = t0.elapsed().as_millis() as u64,
                 error = %err,
-                "internal hook dispatch failed",
+                "latency hook.recv (failed)"
             );
             // 5xx so the script's fallback branch fires through the CLI;
             // the CLI re-runs `dispatch` and surfaces the same error on

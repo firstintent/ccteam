@@ -36,6 +36,7 @@ use crate::inbound::{
     auto_route_dm_mention, parse_envelope, process_inbound_admin_aware, DefaultMailboxResolver,
     MailboxResolver,
 };
+use crate::latency::now_unix_ms;
 use crate::nl_admin::AdminExecutor;
 use crate::outbound;
 use crate::router::HandleMap;
@@ -391,6 +392,15 @@ fn spawn_inbound_consumer(
         let mut seq: u64 = 0;
         while let Some(mut msg) = rx.recv().await {
             seq = seq.wrapping_add(1);
+            let cid = msg.id.clone();
+            let route_t0 = std::time::Instant::now();
+            tracing::info!(
+                event = "latency",
+                stage = "imd.route.begin",
+                cid = %cid,
+                channel = %msg.channel,
+                "latency imd.route.begin"
+            );
             // V0.6.1 F135 — DM auto-route: when exactly one registered
             // bot owns this (channel, chat_id), prepend `@<role> ` so
             // the router resolves the message to that bot. List_bots()
@@ -420,14 +430,25 @@ fn spawn_inbound_consumer(
             .await
             {
                 Ok((outcome, admin)) => {
-                    tracing::debug!(
-                        ?outcome,
+                    tracing::info!(
+                        event = "latency",
+                        stage = "imd.route.done",
+                        cid = %cid,
+                        elapsed_ms = route_t0.elapsed().as_millis() as u64,
+                        outcome = ?outcome,
                         admin_side_effect = ?admin.as_ref().map(|r| &r.side_effect),
-                        "imd: inbound processed"
+                        "latency imd.route.done"
                     );
                 }
                 Err(err) => {
-                    tracing::warn!(error = %err, "imd: process_inbound failed");
+                    tracing::warn!(
+                        event = "latency",
+                        stage = "imd.route.err",
+                        cid = %cid,
+                        elapsed_ms = route_t0.elapsed().as_millis() as u64,
+                        error = %err,
+                        "latency imd.route.err"
+                    );
                 }
             }
         }
@@ -525,24 +546,39 @@ async fn drain_inboxes(
                         );
                         continue;
                     }
+                    let cid = env.message_id.clone();
+                    let received_ms =
+                        env.received_at.timestamp_millis().max(0) as u128;
+                    let queue_age_ms =
+                        now_unix_ms().saturating_sub(received_ms) as u64;
+                    let drain_t0 = std::time::Instant::now();
                     match sup.handle_inbound(env.payload).await {
-                        Ok(_id) => {
+                        Ok(id) => {
                             tracing::info!(
+                                event = "latency",
+                                stage = "imd.inbox.drain",
+                                cid = %cid,
+                                turn_id = %id.0,
                                 slug = %bot.workflow_slug,
                                 role = %bot.role,
+                                queue_age_ms,
+                                submit_ms = drain_t0.elapsed().as_millis() as u64,
                                 file = %path.display(),
-                                "imd: dispatched mailbox to bot {}/{}",
-                                bot.workflow_slug,
-                                bot.role
+                                "latency imd.inbox.drain"
                             );
                         }
                         Err(err) => {
                             tracing::warn!(
+                                event = "latency",
+                                stage = "imd.inbox.drain.err",
+                                cid = %cid,
                                 slug = %bot.workflow_slug,
                                 role = %bot.role,
+                                queue_age_ms,
+                                submit_ms = drain_t0.elapsed().as_millis() as u64,
                                 file = %path.display(),
                                 error = %err,
-                                "imd: handle_inbound failed (deleting envelope anyway)"
+                                "latency imd.inbox.drain (failed; deleting envelope anyway)"
                             );
                         }
                     }
@@ -624,6 +660,27 @@ async fn drain_outboxes(
                 }
             }
             continue;
+        }
+        // Latency: log per-row tail age so we can see how long each
+        // assistant row sat in turns.jsonl before this tick picked it
+        // up. Bounded by `args.tick` (5s default) but a busy daemon
+        // with many bots can drift higher; this log makes it visible.
+        for row in &rows {
+            let tail_age_ms = row.ts.map(|t| {
+                crate::latency::now_unix_ms()
+                    .saturating_sub(t.timestamp_millis().max(0) as u128) as u64
+            });
+            tracing::info!(
+                event = "latency",
+                stage = "outbound.tail",
+                turn_id = %row.turn_id.clone().unwrap_or_default(),
+                slug = %bot.workflow_slug,
+                role = %bot.role,
+                role_field = %row.role,
+                tail_age_ms = tail_age_ms.unwrap_or(0),
+                content_len = row.content.len(),
+                "latency outbound.tail"
+            );
         }
         let sent =
             outbound::forward_new_rows(&rows, channel.as_ref(), &bot.im_chat_id, &[]).await;

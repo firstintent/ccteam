@@ -10,12 +10,13 @@
 //! end-to-end verification ships post-token-paste.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
+use crate::latency::now_unix_ms;
 use crate::transport::{Channel, ChannelMessage, SendMessage};
 
 /// `getUpdates` long-poll seconds.
@@ -111,10 +112,21 @@ impl Channel for TelegramChannel {
             // Telegram supports reply_to_message_id for in-thread replies.
             "reply_to_message_id": message.thread_ts.as_ref().and_then(|s| s.parse::<i64>().ok()),
         });
+        let t0 = Instant::now();
         let resp = self.http.post(&url).json(&body).send().await?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
+        let send_http_ms = t0.elapsed().as_millis() as u64;
         if !status.is_success() {
+            tracing::warn!(
+                event = "latency",
+                stage = "tg.egress",
+                recipient = %message.recipient,
+                status = %status,
+                send_http_ms,
+                content_len = message.content.len(),
+                "latency tg.egress (failed)"
+            );
             anyhow::bail!("telegram sendMessage {} → {}: {}", message.recipient, status, text);
         }
         // Best-effort: pluck message_id without a full type.
@@ -122,6 +134,15 @@ impl Channel for TelegramChannel {
             .ok()
             .and_then(|v| v.get("result").and_then(|r| r.get("message_id")).and_then(|n| n.as_i64()))
             .map(|n| n.to_string());
+        tracing::info!(
+            event = "latency",
+            stage = "tg.egress",
+            recipient = %message.recipient,
+            tg_msg_id = id.as_deref().unwrap_or(""),
+            send_http_ms,
+            content_len = message.content.len(),
+            "latency tg.egress"
+        );
         Ok(id)
     }
 
@@ -183,8 +204,24 @@ impl Channel for TelegramChannel {
                                 .map(|u| u.id.to_string())
                                 .unwrap_or_else(|| "anonymous".to_string())
                         });
+                    let cid = format!("tg-{}", m.message_id);
+                    let recv_ms = now_unix_ms();
+                    let tg_date_ms = (m.date.max(0) as u128).saturating_mul(1000);
+                    let tg_age_ms = recv_ms.saturating_sub(tg_date_ms);
+                    let content_len = m.text.as_ref().map(|s| s.len()).unwrap_or(0);
+                    tracing::info!(
+                        event = "latency",
+                        stage = "tg.ingress",
+                        cid = %cid,
+                        chat_id = %chat_id,
+                        sender = %sender,
+                        recv_ms = recv_ms as u64,
+                        tg_age_ms = tg_age_ms as u64,
+                        content_len,
+                        "latency tg.ingress"
+                    );
                     let payload = ChannelMessage {
-                        id: format!("tg-{}", m.message_id),
+                        id: cid,
                         sender,
                         reply_target: chat_id.clone(),
                         content: m.text.unwrap_or_default(),

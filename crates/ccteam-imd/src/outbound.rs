@@ -11,7 +11,10 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+use crate::latency::now_unix_ms;
 
 /// One row in `turns.jsonl` (subset we care about — extras tolerated).
 ///
@@ -42,6 +45,14 @@ pub struct TurnRow {
     /// through by the tui adapter).
     #[serde(default)]
     pub reply_target: Option<String>,
+    /// Latency: turn id (carried from turns_mirror) so per-row dispatch
+    /// logs can correlate back to the `turn.done` Stage F event.
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    /// Latency: timestamp the row was written (turns_mirror `ts`).
+    /// Used to compute `tail_age_ms` = `now - ts` at outbound dispatch.
+    #[serde(default)]
+    pub ts: Option<DateTime<Utc>>,
 }
 
 /// Wire-format raw record union. Either schema parses; `Into<TurnRow>`
@@ -68,6 +79,12 @@ struct RawRecord {
     thread_ts: Option<String>,
     #[serde(default)]
     reply_target: Option<String>,
+    /// turns_mirror schema field.
+    #[serde(default)]
+    turn_id: String,
+    /// turns_mirror schema field (RFC3339).
+    #[serde(default)]
+    ts: Option<DateTime<Utc>>,
 }
 
 impl From<RawRecord> for TurnRow {
@@ -92,6 +109,12 @@ impl From<RawRecord> for TurnRow {
             reply_to: raw.reply_to,
             thread_ts: raw.thread_ts,
             reply_target: raw.reply_target,
+            turn_id: if raw.turn_id.is_empty() {
+                None
+            } else {
+                Some(raw.turn_id)
+            },
+            ts: raw.ts,
         }
     }
 }
@@ -225,17 +248,38 @@ pub async fn forward_new_rows(
         if !should_forward(row, inbound_message_ids) {
             continue;
         }
+        let tail_age_ms = row.ts.map(|t| {
+            now_unix_ms().saturating_sub(t.timestamp_millis().max(0) as u128) as u64
+        });
+        let turn_id_log = row.turn_id.clone().unwrap_or_default();
         let mut msg = crate::transport::SendMessage::new(row.content.clone(), recipient);
         msg.thread_ts = row.thread_ts.clone();
+        let send_t0 = std::time::Instant::now();
         match channel.send(&msg).await {
-            Ok(_) => {
+            Ok(tg_msg_id) => {
                 sent += 1;
+                tracing::info!(
+                    event = "latency",
+                    stage = "outbound.send",
+                    turn_id = %turn_id_log,
+                    recipient,
+                    tail_age_ms = tail_age_ms.unwrap_or(0),
+                    send_ms = send_t0.elapsed().as_millis() as u64,
+                    tg_msg_id = tg_msg_id.as_deref().unwrap_or(""),
+                    content_len = row.content.len(),
+                    "latency outbound.send"
+                );
             }
             Err(err) => {
                 tracing::warn!(
-                    error = %err,
+                    event = "latency",
+                    stage = "outbound.send.err",
+                    turn_id = %turn_id_log,
                     recipient,
-                    "outbound forward failed; continuing"
+                    tail_age_ms = tail_age_ms.unwrap_or(0),
+                    send_ms = send_t0.elapsed().as_millis() as u64,
+                    error = %err,
+                    "latency outbound.send (failed)"
                 );
             }
         }
@@ -346,6 +390,8 @@ mod tests {
                 reply_to: None,
                 thread_ts: None,
                 reply_target: None,
+                turn_id: None,
+                ts: None,
             },
             TurnRow {
                 role: "user".into(),
@@ -353,6 +399,8 @@ mod tests {
                 reply_to: None,
                 thread_ts: None,
                 reply_target: None,
+                turn_id: None,
+                ts: None,
             },
             TurnRow {
                 role: "assistant".into(),
@@ -360,6 +408,8 @@ mod tests {
                 reply_to: None,
                 thread_ts: None,
                 reply_target: None,
+                turn_id: None,
+                ts: None,
             },
         ];
         let sent = forward_new_rows(&rows, &channel, "user-alice", &[]).await;
@@ -379,6 +429,8 @@ mod tests {
             reply_to: None,
             thread_ts: None,
             reply_target: None,
+            turn_id: None,
+            ts: None,
         };
         let user = TurnRow {
             role: "user".into(),
@@ -386,6 +438,8 @@ mod tests {
             reply_to: None,
             thread_ts: None,
             reply_target: None,
+            turn_id: None,
+            ts: None,
         };
         assert!(should_forward(&assistant, &[]));
         assert!(!should_forward(&user, &[]));
