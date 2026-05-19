@@ -30,9 +30,29 @@ use ccteam_core::execution::ClaudeTuiAdapter;
 use ccteam_core::harness::{AgentVendor, HarnessAdapter};
 use tokio::sync::Mutex;
 
+use crate::acl::AclPolicy;
 use crate::credentials::{self, Credentials};
+use crate::inbound::{
+    parse_envelope, process_inbound_admin_aware, DefaultMailboxResolver, MailboxResolver,
+};
+use crate::nl_admin::AdminExecutor;
+use crate::router::HandleMap;
 use crate::supervisor::{self, BotSupervisor};
+use crate::three_layer_sec::ThreeLayerSec;
+use crate::transport::providers::telegram::TelegramChannel;
+use crate::transport::{Channel, ChannelMessage};
 use crate::{list_bots, BotRegistration};
+
+/// V0.6.1 F132 — keyed map of live IM Channels, keyed by
+/// `ChannelMessage::channel` (`"telegram"`, `"slack"`, `"discord"`,
+/// `"mock"`).
+///
+/// Built once at daemon startup from [`Credentials`], or test-injected
+/// via [`DaemonArgs::channels_override`]. The daemon spawns one
+/// `Channel::listen` task per entry and a single inbound consumer
+/// that demultiplexes messages back to the right Channel for
+/// admin-reply send-back.
+pub type ChannelMap = HashMap<String, Arc<dyn Channel + Send + Sync>>;
 
 /// Builds the production [`HarnessAdapter`] for one bot's `vendor`.
 ///
@@ -80,6 +100,13 @@ pub struct DaemonArgs {
     /// instantiate one [`HarnessAdapter`] per registered bot.
     /// `None` → [`default_adapter_factory`].
     pub adapter_factory: Option<AdapterFactory>,
+    /// V0.6.1 F132 — test-only override for the Channel set. When
+    /// `Some`, the daemon skips credential-driven channel construction
+    /// and uses these channels verbatim (keyed by `ChannelMessage::channel`
+    /// — `"telegram"`, `"mock"`, …). Production callers leave this
+    /// `None`; the daemon then builds a [`TelegramChannel`] from
+    /// `credentials.json` when `creds.telegram.is_some()`.
+    pub channels_override: Option<ChannelMap>,
 }
 
 impl std::fmt::Debug for DaemonArgs {
@@ -90,6 +117,10 @@ impl std::fmt::Debug for DaemonArgs {
             .field("tick", &self.tick)
             .field("max_runtime", &self.max_runtime)
             .field("adapter_factory", &self.adapter_factory.is_some())
+            .field(
+                "channels_override",
+                &self.channels_override.as_ref().map(|m| m.len()),
+            )
             .finish()
     }
 }
@@ -102,6 +133,7 @@ impl Default for DaemonArgs {
             tick: Duration::from_secs(5),
             max_runtime: None,
             adapter_factory: None,
+            channels_override: None,
         }
     }
 }
@@ -148,6 +180,13 @@ impl SupervisorRegistry {
     pub fn all(&self) -> Vec<Arc<BotSupervisor>> {
         self.inner.values().cloned().collect()
     }
+
+    /// V0.6.1 F132 — lookup the live supervisor for `reg` (used by the
+    /// inbox drain pass which iterates the registry and dispatches each
+    /// mailbox envelope to the matching `BotSupervisor::handle_inbound`).
+    pub fn lookup(&self, reg: &BotRegistration) -> Option<Arc<BotSupervisor>> {
+        self.inner.get(&Self::key(reg)).cloned()
+    }
 }
 
 /// Run the daemon with a caller-supplied shutdown future. Returns
@@ -180,13 +219,78 @@ where
     let registry: Arc<Mutex<SupervisorRegistry>> =
         Arc::new(Mutex::new(SupervisorRegistry::default()));
 
+    // V0.6.1 F132 — projects_root used for both supervisor bot_dir
+    // resolution and the mailbox writer. Mirrors `tick_supervisors`'s
+    // fallback so test and production paths share one root.
+    let projects_root: PathBuf = args.registry.clone().unwrap_or_else(|| {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("/"))
+            .join("projects")
+    });
+
+    // V0.6.1 F132 — build the Channel set: test override (MockChannel
+    // injection) wins; otherwise auto-construct from credentials. Only
+    // telegram lights up in V0.6.1 — slack / discord stay dark until
+    // their producers register credentials (matches the host-probe
+    // shape that landed in F121).
+    let channels: ChannelMap = build_channels(&args, &creds, &initial);
+
+    // V0.6.1 F132 — spawn one `Channel::listen` task per active
+    // channel. Each listener pushes ChannelMessages into a shared mpsc
+    // that the inbound consumer drains.
+    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel::<ChannelMessage>(INBOUND_BUF);
+    let mut listener_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    for (name, ch) in channels.iter() {
+        let tx = inbound_tx.clone();
+        let ch = ch.clone();
+        let name_log = name.clone();
+        listener_handles.push(tokio::spawn(async move {
+            if let Err(err) = ch.listen(tx).await {
+                tracing::warn!(
+                    channel = %name_log,
+                    error = %err,
+                    "imd: channel listener exited with error"
+                );
+            } else {
+                tracing::debug!(channel = %name_log, "imd: channel listener exited cleanly");
+            }
+        }));
+        tracing::info!(
+            channel = %name,
+            bots = initial.len(),
+            "imd: {} channel listener spawned bots={}",
+            name,
+            initial.len()
+        );
+    }
+    // Drop our extra clone so the consumer's `recv()` returns `None`
+    // once every listener exits.
+    drop(inbound_tx);
+
+    // V0.6.1 F132 — shared inbound state (sec layer, mailbox writer,
+    // admin executor). `Arc` so the consumer task owns its own clones
+    // without re-locking the daemon loop.
+    let sec = Arc::new(Mutex::new(ThreeLayerSec::new(AclPolicy::default())));
+    let mailbox: Arc<dyn MailboxResolver> = Arc::new(DefaultMailboxResolver::with_projects_root(
+        projects_root.clone(),
+    ));
+    let executor = Arc::new(AdminExecutor::new(projects_root.clone()));
+
+    let inbound_consumer = spawn_inbound_consumer(
+        inbound_rx,
+        channels.clone(),
+        sec.clone(),
+        mailbox.clone(),
+        executor.clone(),
+    );
+
     let mut ticker = tokio::time::interval(args.tick);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let started = std::time::Instant::now();
     let mut shutdown: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(shutdown);
 
-    loop {
+    let result = loop {
         tokio::select! {
             _ = ticker.tick() => {
                 if let Err(err) = supervisor::refresh_global_heartbeat() {
@@ -199,18 +303,245 @@ where
                         Vec::new()
                     }
                 };
-                tick_supervisors(&bots, &registry, args.registry.as_deref(), &factory).await;
+                tick_supervisors(&bots, &registry, Some(&projects_root), &factory).await;
+                drain_inboxes(&bots, &registry, &projects_root).await;
 
                 if let Some(max) = args.max_runtime {
                     if started.elapsed() >= max {
                         tracing::info!("max_runtime reached; exiting");
-                        return Ok(());
+                        break Ok(());
                     }
                 }
             }
             _ = &mut shutdown => {
                 tracing::info!("ccteam-imd: shutdown signalled; exiting cleanly");
-                return Ok(());
+                break Ok(());
+            }
+        }
+    };
+
+    // V0.6.1 F132 — abort listener + consumer tasks on shutdown so the
+    // daemon doesn't leak background tokio tasks. `JoinHandle::abort`
+    // is best-effort but matches the rest of the F130 supervisor's
+    // shutdown semantics.
+    for h in listener_handles {
+        h.abort();
+    }
+    inbound_consumer.abort();
+    result
+}
+
+/// V0.6.1 F132 — channel-listener mpsc buffer. 64 is enough headroom
+/// for a slow consumer to lag behind a burst without dropping; if it
+/// fills the listener `await`s on `send`, which is what we want
+/// (backpressure, not silent drop).
+const INBOUND_BUF: usize = 64;
+
+/// V0.6.1 F132 — assemble the Channel set the daemon listens on.
+///
+/// Resolution order:
+/// 1. `args.channels_override` (tests inject `MockChannel`),
+/// 2. `creds.telegram` → build a [`TelegramChannel`] with the union of
+///    the user-configured allowlist + every registered telegram bot's
+///    `im_chat_id`,
+/// 3. (slack / discord — TODO in V0.7: providers exist but the host
+///    probe's first round only exercises telegram).
+fn build_channels(args: &DaemonArgs, creds: &Credentials, bots: &[BotRegistration]) -> ChannelMap {
+    if let Some(ch) = args.channels_override.clone() {
+        return ch;
+    }
+    let mut out: ChannelMap = HashMap::new();
+    if let Some(tg) = creds.telegram.as_ref() {
+        let mut allowed = tg.allowed_chat_ids.clone();
+        for b in bots.iter().filter(|b| b.im_platform == "telegram") {
+            allowed.push(b.im_chat_id.clone());
+        }
+        allowed.sort();
+        allowed.dedup();
+        let ch = Arc::new(TelegramChannel::new(tg.bot_token.clone(), allowed));
+        out.insert("telegram".to_string(), ch as Arc<dyn Channel + Send + Sync>);
+    }
+    out
+}
+
+/// V0.6.1 F132 — drain the mpsc receiving from every listener, routing
+/// each `ChannelMessage` through the security + admin + mailbox path.
+/// Side-effects ultimately land as one mailbox `.md` file per inbound
+/// bot turn (consumed in the next [`drain_inboxes`] tick).
+fn spawn_inbound_consumer(
+    mut rx: tokio::sync::mpsc::Receiver<ChannelMessage>,
+    channels: ChannelMap,
+    sec: Arc<Mutex<ThreeLayerSec>>,
+    mailbox: Arc<dyn MailboxResolver>,
+    executor: Arc<AdminExecutor>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut seq: u64 = 0;
+        while let Some(msg) = rx.recv().await {
+            seq = seq.wrapping_add(1);
+            let handles = build_handle_map();
+            let Some(channel) = channels.get(&msg.channel).cloned() else {
+                tracing::debug!(
+                    channel = %msg.channel,
+                    sender = %msg.sender,
+                    "imd: no Channel for inbound msg.channel; dropping"
+                );
+                continue;
+            };
+            match process_inbound_admin_aware(
+                &msg,
+                &sec,
+                &handles,
+                mailbox.as_ref(),
+                executor.as_ref(),
+                channel.as_ref(),
+                0,
+                seq,
+            )
+            .await
+            {
+                Ok((outcome, admin)) => {
+                    tracing::debug!(
+                        ?outcome,
+                        admin_side_effect = ?admin.as_ref().map(|r| &r.side_effect),
+                        "imd: inbound processed"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "imd: process_inbound failed");
+                }
+            }
+        }
+        tracing::debug!("imd: inbound consumer exited (all senders closed)");
+    })
+}
+
+/// V0.6.1 F132 — build a [`HandleMap`] from the current registry so
+/// the router can resolve `@<role>` mentions to `(slug, role)`.
+///
+/// V0.6.1 keeps it simple: each registered bot's `role` becomes a
+/// handle. Two bots sharing the same role across different slugs
+/// **collide** here (last-wins) — workflow.yaml's `chat_handle` field
+/// (V0.7) will land per-bot custom handles. For F132 the typical
+/// production registry has one bot ("web3op_bot") on one slug, so the
+/// collision is theoretical until V0.7.
+fn build_handle_map() -> HandleMap {
+    let mut map = HandleMap::new();
+    if let Ok(bots) = list_bots() {
+        for b in bots {
+            map.insert(&b.role, &b.workflow_slug, &b.role);
+        }
+    }
+    map
+}
+
+/// V0.6.1 F132 — once per tick, for each registered bot:
+///
+/// - List `<projects_root>/<slug>/.ccteam/chat/<role>/inbox/*.md`,
+/// - Sort by file name (timestamp prefix gives FIFO order),
+/// - For each: parse envelope, hand the payload to
+///   [`BotSupervisor::handle_inbound`] (which calls `submit_turn`
+///   under the hood), then `unlink` the file regardless of whether
+///   the submit succeeded (one-shot semantics — re-tries would
+///   double-submit a slow tmux reply).
+async fn drain_inboxes(
+    bots: &[BotRegistration],
+    registry: &Arc<Mutex<SupervisorRegistry>>,
+    projects_root: &Path,
+) {
+    let supervisors: Vec<(BotRegistration, Arc<BotSupervisor>)> = {
+        let reg = registry.lock().await;
+        bots.iter()
+            .filter_map(|b| reg.lookup(b).map(|s| (b.clone(), s)))
+            .collect()
+    };
+    for (bot, sup) in supervisors {
+        let inbox = projects_root
+            .join(&bot.workflow_slug)
+            .join(".ccteam")
+            .join("chat")
+            .join(&bot.role)
+            .join("inbox");
+        if !inbox.exists() {
+            continue;
+        }
+        let mut entries: Vec<_> = match std::fs::read_dir(&inbox) {
+            Ok(rd) => rd.filter_map(|e| e.ok()).collect(),
+            Err(err) => {
+                tracing::warn!(
+                    path = %inbox.display(),
+                    error = %err,
+                    "imd: read_dir inbox failed"
+                );
+                continue;
+            }
+        };
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("md") {
+                continue;
+            }
+            let body = match std::fs::read_to_string(&path) {
+                Ok(b) => b,
+                Err(err) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %err,
+                        "imd: read inbox file failed"
+                    );
+                    continue;
+                }
+            };
+            match parse_envelope(&body) {
+                Ok(env) => {
+                    if !sup.is_started().await {
+                        // Supervisor not up yet — defer to next tick so
+                        // `tick_supervisors`' Spawn action lands first.
+                        tracing::debug!(
+                            slug = %bot.workflow_slug,
+                            role = %bot.role,
+                            file = %path.display(),
+                            "imd: bot not started; deferring mailbox dispatch"
+                        );
+                        continue;
+                    }
+                    match sup.handle_inbound(env.payload).await {
+                        Ok(_id) => {
+                            tracing::info!(
+                                slug = %bot.workflow_slug,
+                                role = %bot.role,
+                                file = %path.display(),
+                                "imd: dispatched mailbox to bot {}/{}",
+                                bot.workflow_slug,
+                                bot.role
+                            );
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                slug = %bot.workflow_slug,
+                                role = %bot.role,
+                                file = %path.display(),
+                                error = %err,
+                                "imd: handle_inbound failed (deleting envelope anyway)"
+                            );
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %err,
+                        "imd: parse_envelope failed; deleting"
+                    );
+                }
+            }
+            if let Err(err) = std::fs::remove_file(&path) {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "imd: remove inbox file failed"
+                );
             }
         }
     }
@@ -314,6 +645,7 @@ mod tests {
             tick: Duration::from_millis(50),
             max_runtime: Some(Duration::from_millis(120)),
             adapter_factory: None,
+            channels_override: None,
         };
         run_daemon(args).await.unwrap();
         // Heartbeat was written at least once.
@@ -411,12 +743,16 @@ mod tests {
         assert_eq!(adapter.closes.load(Ordering::SeqCst), 1);
 
         // Drop in a fresh heartbeat: next tick is a NoOp.
-        let bot_dir = projects
-            .path()
-            .join("dev-foo/.ccteam/chat/lead");
+        let bot_dir = projects.path().join("dev-foo/.ccteam/chat/lead");
         std::fs::create_dir_all(&bot_dir).unwrap();
         std::fs::write(bot_dir.join("heartbeat"), "x").unwrap();
-        tick_supervisors(std::slice::from_ref(&bot), &registry, Some(projects.path()), &adapter_factory).await;
+        tick_supervisors(
+            std::slice::from_ref(&bot),
+            &registry,
+            Some(projects.path()),
+            &adapter_factory,
+        )
+        .await;
         assert_eq!(adapter.starts.load(Ordering::SeqCst), 2, "no new start");
 
         // Verify the supervisor is registered + holds a live handle.
@@ -444,16 +780,26 @@ mod tests {
             created_at: chrono::Utc::now(),
         };
         // Tick 1: Spawn.
-        tick_supervisors(std::slice::from_ref(&bot), &registry, Some(projects.path()), &adapter_factory).await;
+        tick_supervisors(
+            std::slice::from_ref(&bot),
+            &registry,
+            Some(projects.path()),
+            &adapter_factory,
+        )
+        .await;
         assert_eq!(adapter.starts.load(Ordering::SeqCst), 1);
 
         // Drop shutdown.signal; next tick → Shutdown action.
-        let sig_dir = projects
-            .path()
-            .join("dev-foo/.ccteam/chat/lead/signals");
+        let sig_dir = projects.path().join("dev-foo/.ccteam/chat/lead/signals");
         std::fs::create_dir_all(&sig_dir).unwrap();
         std::fs::write(sig_dir.join("shutdown.signal"), "").unwrap();
-        tick_supervisors(std::slice::from_ref(&bot), &registry, Some(projects.path()), &adapter_factory).await;
+        tick_supervisors(
+            std::slice::from_ref(&bot),
+            &registry,
+            Some(projects.path()),
+            &adapter_factory,
+        )
+        .await;
         assert_eq!(adapter.closes.load(Ordering::SeqCst), 1);
         let supervisors = registry.lock().await.all();
         assert!(!supervisors[0].is_started().await);

@@ -152,14 +152,16 @@ V0.6.0 4-wave 范式;V0.6.1 patch 压成 **3 wave**:
 
 ## 七、Ship-day fix-in-version(2026-05-19 user directive)
 
-V0.6.1 tag 已落(`v0.6.1` / commit `95916d3`),但 ship-day 用户上手后发现 2 个 daemon / probe 体验问题,本版**就地修复**(版本号不动,patch in-place):
+V0.6.1 tag 已落(`v0.6.1` / commit `95916d3`),但 ship-day 用户上手后发现 3 个 daemon / probe / IM 体验问题,本版**就地修复**(版本号不动,patch in-place):
 
 | F | 主题 | 性质 | Wave / 单线 |
 |---|---|---|---|
 | F130 | `ccteam-imd` 折入 `ccteam start`(单进程:orchestrator + web + IMD supervisor 3 个 tokio 任务;独立 `ccteam-imd` 二进制删;`--no-imd` 跳过)| 进程模型简化 | ship-day fix |
 | F131 | host-probe `remote_run` 单引号包裹 bug 修(`bash -c '<heredoc>'` 嵌套引号 escape)| bug fix | ship-day fix |
+| F132 | IMD inbound wire — `run_daemon_with_shutdown` 现在 spawn `Channel::listen` task + mpsc 消费者 + 每 tick `drain_inboxes`(`<projects>/<slug>/.ccteam/chat/<role>/inbox/*.md` → `BotSupervisor::handle_inbound` → `submit_turn`)| critical user-facing bug fix | ship-day fix |
 
 **决策**:
 - F130 = 用户上手时遇到僵尸进程排查痛点 → 单进程 daemon 让管理优雅(对照 V0.4.x web fold-into-start 范式)。Pre-v1.0 no-shim:`[[bin]] ccteam-imd` 直接删,无 alias,无 `ccteam daemon` 子命令(folded into `ccteam start` 即足)。
 - F131 = probe 实跑暴露的 shell quoting 转义错(详 wave-3 ship-day log)。
+- F132 = NAS user-chat test 发现 `web3op_bot` 收到 TG message 但完全无反应。Root cause:`TelegramChannel::listen()`(getUpdates long-poll)+ `process_inbound_admin_aware`(mailbox writer)+ `BotSupervisor::handle_inbound`(`submit_turn` → tmux pane)三段代码都存在,但 `run_daemon_with_shutdown` 旧版只 tick supervisors,**从未 spawn channel listener,也从未读 inbox 目录**。F132 daemon 现在:(1) 启动时按 `creds.telegram` + 注册 bot 的 `im_chat_id` allowlist 构造 `TelegramChannel`,spawn `listen` task,(2) 单一 inbound consumer task 把 mpsc 中的 `ChannelMessage` 走 `process_inbound_admin_aware`,(3) 每 supervisor tick 后立刻 `drain_inboxes` — 排序 inbox `.md` 文件、调用 `handle_inbound`、删除文件(one-shot)。Test injection 通过新 `DaemonArgs::channels_override` field(MockChannel 注入)。新 integ test `crates/ccteam-imd/tests/inbound_wiring_test.rs::daemon_wires_mock_channel_to_supervisor_inbox` 端到端 assert 一条 MockChannel `@lead` 消息 → mailbox file 出现 → 删除 → stub adapter `submit_turn` 计数 += 1 + payload 是 stripped(`"please look at this"`)。**Outbound (turns.jsonl → sendMessage) wire-up 不在 F132 scope** — 函数 `outbound::forward_new_rows` 已实现但同样未被 daemon 调用;留给 follow-up(NAS 用户已可见 bot tmux pane 接收到自己消息这一半 round-trip)。
 
