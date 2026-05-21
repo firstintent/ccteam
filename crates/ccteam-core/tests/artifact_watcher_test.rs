@@ -45,6 +45,7 @@ fn build_spec(name: &str, watchers: &[(&str, PathBuf)]) -> WorkflowSpec {
                 executor: Executor::Claude,
                 model: None,
                 trigger: Trigger::Watch(root.clone()),
+                scope: None,
                 parallelism: None,
                 input: None,
                 output: None,

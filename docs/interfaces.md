@@ -1571,6 +1571,7 @@ F84 budget guard 在 `try_spawn` 入口跑;cost 数据源走 F91 cost SoT(`agent
 |---|---|---|---|
 | `executor` | `claude` \| `codex` | `claude` | 选择哪个 harness 二进制(F61 ClaudeCodeAdapter / F62 CodexAdapter)|
 | `trigger` | scalar string | 必填 | 见 §17.3 |
+| `scope` | path | `None`(项目根) | V0.6.2:此 agent 的 harness session 的代码 cwd(相对项目根)。设了 → `SpawnCtx.cwd = project_dir.join(scope)`,大代码库 agent 起步即锁定到与其 role 相关的子树——每次 spawn 的爆炸半径收窄,红线 R3 "fresh 1M context" 指向小子树而非整个 repo root;Claude Code 仍向上走目录树加载沿途 `CLAUDE.md`,root context 不丢。`validate()` 拒绝绝对路径与含 `..` 的路径(path-traversal guard);目录不存在是运行期问题 → 普通 spawn 失败 → `fail_counts` 3-strike escalate |
 | `parallelism` | `u32` | `None`(等价 1) | 同时最多多少个 session 实例。`> 1` **仅** `watch:` 合法 |
 | `input` | path | `None` | artifact 输入目录(相对项目根),F64 watcher 派发时通过 `CCTEAM_INPUT` env 注入 spawned harness |
 | `output` | path | `None` | artifact 输出目录,通过 `CCTEAM_OUTPUT` 注入 |

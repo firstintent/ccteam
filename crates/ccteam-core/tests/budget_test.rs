@@ -67,6 +67,7 @@ fn manual_spec_with_budget(role: &str, budget: Option<BudgetSpec>) -> WorkflowSp
             executor: Executor::Claude,
             model: None,
             trigger: Trigger::Manual,
+            scope: None,
             parallelism: None,
             input: None,
             output: None,
