@@ -92,7 +92,7 @@
 
 1. **每个 PR 描述映射**:`requirements.md` 某条痛点 + `tech-design.md` 某节 + `dev-coupling-audit.md` 某 F-finding;改协议必同步 `interfaces.md`
 2. **commit 用英语**;文档与 agent prompt 用中文
-3. **Pre-v1.0 = 开发阶段,不留技术债**:无真实用户群,**允许大胆做更好的抽象**。**不做历史迁移**(deprecated 直接删 / breaking rename 不留 alias / `#[serde(default)]` compat 仅在迁移成本 > 重启成本 时用)。tier-1 文档**只描述当前架构**,EOL 内容去版本 dir
+3. **Pre-v1.0 = 开发阶段,不留技术债**:无真实用户群,**允许大胆做更好的抽象**。**不做历史迁移** — 当新版本与旧版本状态数据不兼容时,**不写迁移步骤、也不写兼容代码分支**,直接采取「清除旧版数据(`~/.ccteam/` + 各项目 `.ccteam/`)→ 重新 `ccteam init` 安装」的重装策略;deprecated 直接删,breaking rename 不留 alias。tier-1 文档**只描述当前架构**,EOL 内容去版本 dir
 4. **不写 backwards-compat shim**
 5. **优先编辑现有文件,不轻易新建**
 6. **测试不过不算完成** — `cargo test --workspace` 退步 = block;clippy 不能新增 warning
