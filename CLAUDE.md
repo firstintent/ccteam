@@ -11,7 +11,7 @@
 |---|---|
 | 主分支 main HEAD | 以 `git rev-parse origin/main` 为准 |
 | Workspace version | **`0.6.2`** |
-| 测试 baseline | **`1410/1`**(`cargo test --workspace --locked --no-fail-fast`,1 fail 是 ccteam-web `workflow_summary_reflects_agent_spawn_and_done_events` running_count flake)|
+| 测试 baseline | **`1412/1`**(`cargo test --workspace --locked --no-fail-fast`,1 fail 是 ccteam-web `workflow_summary_reflects_agent_spawn_and_done_events` running_count flake)|
 | Clippy | **0 errors + 0 warnings**(`-D warnings` clean)|
 | 代码规模 | ~73 kLOC Rust(workspace,不含 references)|
 | 当前最新版 | **V0.6.2**(F140 per-role 代码 `scope` — 大型代码库:`AgentSpec.scope` 把每次 spawn 的 `cwd` 钉到与 role 相关的子树,收窄爆炸半径;红线 R3 给 fresh 1M 窗口,但 fresh≠scoped。源自 Anthropic《How Claude Code works in large codebases》—— harness 套 harness 下 ccteam 只吸收"拓扑"这一条)— 详 `docs/versions/v0-6-2/README.md` |
@@ -83,7 +83,7 @@
 | 机制 | 用途 |
 |---|---|
 | **CLAUDE.md** | 项目级 / 用户级持久指令 |
-| **Skills**(repo 根 `skills/`,V0.6.0 F113 总入口 + 5 sub-skill)| `/ccteam` 总入口 NL dispatcher / `ccteam-control` / `ccteam-creator` / `ccteam-team` / `ccteam-im-setup`(F117 一次性 IM token onboarding)/ `ccteam-advise`(F112 Codex parallel vote)|
+| **Skills**(repo 根 `skills/`,V0.6.0 F113 总入口 + 6 sub-skill)| `/ccteam` 总入口 NL dispatcher / `ccteam-control` / `ccteam-creator` / `ccteam-team` / `ccteam-im-setup`(F117 一次性 IM token onboarding)/ `ccteam-advise`(F112 Codex parallel vote)/ `ccteam-scan`(V0.6.2 F141 大型代码库导航性体检 — 只读 audit)|
 | **MCP** | `ccteam` 26 工具(V0.6 F111 24 + V0.6.1 F128 `admin_change_persona` + `admin_add_tool`),5 group 子前缀:`mcp__ccteam__{workflow_,chat_,advise_,admin_,screenshot}*`;`CCTEAM_DISABLE_TOOLS` group enum(非 glob);可选 `claude-mem`(LLM 自看 surface 决定是否调)|
 | **Subagents** | agent 内 `Task(subagent_type=...)` ad-hoc 节流;8 个 plugin agent 已 ln -sf |
 | **Hooks** | `ccteam internal hook progress-append / load-context / intercept-ask`(F89 隐藏)|

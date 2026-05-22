@@ -213,10 +213,10 @@ pub use silence_classifier::{
     SilenceClass, LIMBO_RETRY_FILE, MAX_LIMBO_RETRY,
 };
 pub use skill::{
-    install_ccteam_control_skill, install_ccteam_creator_skill, install_ccteam_team_skill,
-    install_into as install_skill_into, install_skill_body_into, InstallSkillOptions,
-    InstallSkillReport, SkillInstallAction, CCTEAM_CONTROL_SKILL_NAME, CCTEAM_CREATOR_SKILL_NAME,
-    CCTEAM_TEAM_SKILL_NAME, LEGACY_SKILL_NAMES,
+    install_ccteam_control_skill, install_ccteam_creator_skill, install_ccteam_scan_skill,
+    install_ccteam_team_skill, install_into as install_skill_into, install_skill_body_into,
+    InstallSkillOptions, InstallSkillReport, SkillInstallAction, CCTEAM_CONTROL_SKILL_NAME,
+    CCTEAM_CREATOR_SKILL_NAME, CCTEAM_SCAN_SKILL_NAME, CCTEAM_TEAM_SKILL_NAME, LEGACY_SKILL_NAMES,
 };
 pub use stall::{
     classify as classify_stall, classify_with_thresholds, silent_seconds, StallLevel,
