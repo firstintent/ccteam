@@ -20,8 +20,8 @@
 //! ## Trigger forms (YAML scalar string)
 //!
 //! - `manual`            — explicit `ccteam trigger <role>` invocation.
-//! - `schedule`          — periodic; V0.4.0 stub (meta-agent triggers
-//!   manually); V0.4.1 will wire `interval` cron.
+//! - `schedule`          — periodic; fires on the 5-field cron
+//!   expression in `AgentSpec::schedule` (V0.6.3 F140).
 //! - `gate`              — wait until `trigger_gate` MCP tool releases.
 //! - `watch:<path>`      — inotify on artifact dir; new file → spawn.
 //!
@@ -552,11 +552,23 @@ pub struct AgentSpec {
     /// via `CCTEAM_OUTPUT` env var.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<PathBuf>,
-    /// Schedule interval (e.g. `"5m"`, `"1h"`) when
-    /// `trigger == Trigger::Schedule`. Ignored otherwise. V0.4.0 keeps
-    /// this as opaque string; cron / duration parsing lands in V0.4.1.
+    /// V0.6.3 F140 — standard 5-field cron expression
+    /// (`minute hour day-of-month month day-of-week`) for
+    /// `trigger == Trigger::Schedule` agents. Required when the
+    /// trigger is `schedule`; ignored (and rejected by `validate()`)
+    /// for any other trigger. The orchestrator tick evaluates this
+    /// against a per-`(project, role)` last-fire timestamp persisted
+    /// in `state.json` with skip-missed semantics — see
+    /// [`crate::cron::Schedule`].
+    ///
+    /// ```yaml
+    /// agents:
+    ///   nightly-audit:
+    ///     trigger: schedule
+    ///     schedule: "0 3 * * *"   # 03:00 daily
+    /// ```
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub interval: Option<String>,
+    pub schedule: Option<String>,
     /// Optional per-session timeout (duration string). V0.4.0 carries
     /// the field for later watchdog consumption.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -682,7 +694,7 @@ pub enum OnTimeout {
 ///
 /// ```yaml
 /// trigger: manual            # explicit ccteam trigger <role>
-/// trigger: schedule          # periodic (interval field + V0.4.1 cron)
+/// trigger: schedule          # periodic (5-field cron in `schedule:`)
 /// trigger: gate              # wait for trigger_gate MCP call
 /// trigger: watch:.ccteam/issues/  # inotify on path
 /// ```
@@ -690,8 +702,10 @@ pub enum OnTimeout {
 pub enum Trigger {
     /// Meta-agent / user explicitly invokes `ccteam trigger <role>`.
     Manual,
-    /// Periodic. V0.4.0 = meta-agent-only manual trigger placeholder;
-    /// V0.4.1 wires actual scheduler reading `AgentSpec::interval`.
+    /// Periodic. V0.6.3 F140 wires the real cron scheduler: the agent
+    /// fires on the standard 5-field cron expression in
+    /// `AgentSpec::schedule`, evaluated each orchestrator tick with
+    /// skip-missed semantics (no backfill across daemon downtime).
     Schedule,
     /// Wait for `trigger_gate` MCP call to release. Requires `input`
     /// dir so the agent has artifacts to consume on release.
@@ -919,7 +933,29 @@ impl WorkflowSpec {
                         )));
                     }
                 }
-                Trigger::Manual | Trigger::Schedule => {}
+                Trigger::Schedule => {
+                    // V0.6.3 F140 — `schedule` agents must declare a
+                    // valid 5-field cron expression; parse it eagerly
+                    // so a bad cron string fails workflow load rather
+                    // than silently never firing.
+                    match &spec.schedule {
+                        Some(expr) => {
+                            crate::cron::Schedule::parse(expr).map_err(|e| {
+                                WorkflowError::ValidationFailed(format!(
+                                    "agent `{role}`: trigger `schedule` has invalid \
+                                     `schedule:` expression: {e}"
+                                ))
+                            })?;
+                        }
+                        None => {
+                            return Err(WorkflowError::ValidationFailed(format!(
+                                "agent `{role}`: trigger `schedule` requires a 5-field cron \
+                                 `schedule:` expression (e.g. `schedule: \"*/5 * * * *\"`)"
+                            )));
+                        }
+                    }
+                }
+                Trigger::Manual => {}
             }
             if let Some(n) = spec.parallelism {
                 if n > 1 && !matches!(spec.trigger, Trigger::Watch(_)) {
@@ -1005,7 +1041,7 @@ mod tests {
                         parallelism: None,
                         input: None,
                         output: None,
-                        interval: None,
+                        schedule: None,
                         timeout: None,
                         on_timeout: None,
                         plan_approval: None,
@@ -1022,6 +1058,75 @@ mod tests {
     fn parse_trigger_unknown_form_errors() {
         assert!(parse_trigger("foo").is_err());
         assert!(parse_trigger("cron:5m").is_err());
+    }
+
+    /// V0.6.3 F140 — build a single-agent `trigger: schedule`
+    /// workflow with the given (optional) cron expression.
+    fn schedule_only_workflow(role: &str, cron: Option<&str>) -> WorkflowSpec {
+        let mut m = IndexMap::new();
+        m.insert(
+            role.into(),
+            AgentSpec {
+                executor: Executor::Claude,
+                model: None,
+                trigger: Trigger::Schedule,
+                parallelism: None,
+                input: None,
+                output: None,
+                schedule: cron.map(|s| s.to_string()),
+                timeout: None,
+                on_timeout: None,
+                plan_approval: None,
+            },
+        );
+        WorkflowSpec {
+            name: "x".into(),
+            description: None,
+            mode: WorkflowMode::ArtifactDriven,
+            enabled: true,
+            budget: None,
+            budgets_v060: None,
+            agent_team: None,
+            chat: None,
+            agents: m,
+        }
+    }
+
+    #[test]
+    fn validate_schedule_trigger_accepts_valid_cron() {
+        assert!(schedule_only_workflow("auditor", Some("*/5 * * * *"))
+            .validate()
+            .is_ok());
+        assert!(schedule_only_workflow("auditor", Some("0 3 * * *"))
+            .validate()
+            .is_ok());
+    }
+
+    #[test]
+    fn validate_schedule_trigger_rejects_missing_schedule() {
+        let err = schedule_only_workflow("auditor", None)
+            .validate()
+            .unwrap_err();
+        match err {
+            WorkflowError::ValidationFailed(msg) => {
+                assert!(msg.contains("schedule"), "got: {msg}");
+            }
+            other => panic!("expected ValidationFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_schedule_trigger_rejects_bad_cron() {
+        // 6-field (seconds) form — rejected by the 5-field gate.
+        let err = schedule_only_workflow("auditor", Some("0 */5 * * * *"))
+            .validate()
+            .unwrap_err();
+        assert!(matches!(err, WorkflowError::ValidationFailed(_)));
+        // Garbage cron.
+        let err = schedule_only_workflow("auditor", Some("99 * * * *"))
+            .validate()
+            .unwrap_err();
+        assert!(matches!(err, WorkflowError::ValidationFailed(_)));
     }
 
     #[test]

@@ -17,6 +17,8 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 chrono.workspace = true
+# V0.6.3 F140 — standard 5-field cron parsing for `trigger: schedule`.
+croner.workspace = true
 dirs.workspace = true
 notify.workspace = true
 tokio.workspace = true

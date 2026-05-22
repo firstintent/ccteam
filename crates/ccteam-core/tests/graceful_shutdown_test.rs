@@ -54,7 +54,7 @@ fn manual_spec(role: &str) -> WorkflowSpec {
             parallelism: None,
             input: None,
             output: None,
-            interval: None,
+            schedule: None,
             timeout: None,
             on_timeout: None,
             plan_approval: None,

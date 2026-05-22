@@ -29,6 +29,8 @@ pub mod auto_loop;
 pub mod claude_job;
 // V0.4.2 F73 — `~/.ccteam/config.yaml` global config + projects registry.
 pub mod config;
+// V0.6.3 F140 — `trigger: schedule` cron evaluation (5-field, skip-missed).
+pub mod cron;
 pub mod daemon;
 pub mod harness;
 // V0.6.0 F107 — adapter implementations behind the new HarnessAdapter
@@ -112,6 +114,8 @@ pub use config::{
     save as save_ccteam_config, upsert_project as upsert_project_in_config, CcteamConfig,
     ProjectEntry, CONFIG_FILENAME,
 };
+// V0.6.3 F140 — `trigger: schedule` cron evaluation.
+pub use cron::{Schedule, ScheduleError};
 // V0.6.0 Wave 1 — cost classification moved to `ccteam-cost`. Re-export
 // for V0.5.x callers; the new signature is
 // `classify(cost, soft_warn, hard_kill)` (primitives, not `&ProjectState`).

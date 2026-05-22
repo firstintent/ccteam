@@ -70,7 +70,7 @@ fn manual_spec_with_budget(role: &str, budget: Option<BudgetSpec>) -> WorkflowSp
             parallelism: None,
             input: None,
             output: None,
-            interval: None,
+            schedule: None,
             timeout: None,
             on_timeout: None,
             plan_approval: None,

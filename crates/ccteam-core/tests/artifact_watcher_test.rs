@@ -48,7 +48,7 @@ fn build_spec(name: &str, watchers: &[(&str, PathBuf)]) -> WorkflowSpec {
                 parallelism: None,
                 input: None,
                 output: None,
-                interval: None,
+                schedule: None,
                 timeout: None,
                 on_timeout: None,
                 plan_approval: None,

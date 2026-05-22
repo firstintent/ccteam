@@ -539,7 +539,7 @@ const DEFAULT_WORKFLOW_YAML: &str = r#"# ccteam workflow.yaml (V0.4.0+ shape).
 #
 # Trigger grammar:
 #   manual                        # explicit `ccteam spawn <slug> <role>` only
-#   schedule                      # periodic (V0.4.1+ interval field)
+#   schedule                      # periodic; needs `schedule:` 5-field cron
 #   gate                          # waits for `trigger_gate` MCP / CLI call
 #   watch:.ccteam/issues/         # spawn one session per new file under the path
 #

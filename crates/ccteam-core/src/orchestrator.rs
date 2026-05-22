@@ -1431,8 +1431,19 @@ impl Orchestrator {
     async fn dispatch_initial_triggers(&self, slug: &str, spec: &WorkflowSpec) -> Result<()> {
         for (role, agent) in &spec.agents {
             match &agent.trigger {
-                Trigger::Manual | Trigger::Schedule => {
+                Trigger::Manual => {
                     tracing::info!(slug, role = role.as_str(), "waiting for explicit trigger");
+                }
+                Trigger::Schedule => {
+                    // V0.6.3 F140 — the per-tick `check_schedules` pass
+                    // anchors the cursor on first observation and fires
+                    // on cron-due. Nothing to register here.
+                    tracing::info!(
+                        slug,
+                        role = role.as_str(),
+                        schedule = agent.schedule.as_deref().unwrap_or(""),
+                        "schedule agent registered"
+                    );
                 }
                 Trigger::Gate => {
                     self.gate_states
@@ -1483,6 +1494,10 @@ impl Orchestrator {
                     self.poll_completions(slug, spec, project_dir, progress_path).await;
                     self.check_spawn_requests(slug, spec, project_dir, progress_path).await;
                     self.check_gates(slug, spec, project_dir, progress_path).await;
+                    // V0.6.3 F140 — cron-scheduled agents. Runs after
+                    // gates so a tick that just released a gate still
+                    // re-checks schedules in the same pass.
+                    self.check_schedules(slug, spec, project_dir, progress_path).await;
                     self.check_inbox(slug, spec, project_dir, progress_path).await;
                     self.check_workflow_done(slug, spec, progress_path).await;
                     // V0.4.6 F84 — budget enforcement runs last so it
@@ -1894,7 +1909,6 @@ impl Orchestrator {
             | ThreadEvent::ItemCompleted { .. } => None,
         }
     }
-
 
     /// Monotonic microsecond sequence — collision-free across one
     /// orchestrator instance; F67 may swap in a counter map.
@@ -2467,6 +2481,154 @@ impl Orchestrator {
         }
     }
 
+    /// V0.6.3 F140 — fire `trigger: schedule` agents whose cron
+    /// expression is due.
+    ///
+    /// ## skip-missed semantics
+    ///
+    /// Each `(project, role)` pair has a `last_fire` timestamp
+    /// persisted in `<project>/.ccteam/state.json::schedule_last_fire`.
+    /// Per tick, for every schedule agent:
+    ///
+    /// - **first observation** (`last_fire` absent) — record
+    ///   `last_fire = now` and do NOT spawn. The next occurrence is
+    ///   then computed forward from daemon start, so a cold start
+    ///   never fires on boot.
+    /// - **subsequent ticks** — fire iff
+    ///   [`crate::cron::Schedule::is_due`] returns `true` (the next
+    ///   cron slot after `last_fire` is `<= now`). On fire, advance
+    ///   `last_fire` to `now` — NOT to the missed slot — so a daemon
+    ///   that was down across many slots fires exactly once on
+    ///   restart-after-due, then resumes the normal cadence. No
+    ///   backfill, no restart storm.
+    ///
+    /// `parallelism` is forced to 1: `try_spawn`'s `running`-map gate
+    /// already caps schedule agents at one live session (validate()
+    /// rejects `parallelism > 1` for non-watch triggers), so a slow
+    /// agent that overruns its next cron slot simply skips that slot.
+    ///
+    /// `progress.jsonl` stays the SoT — the spawn emits `agent_spawn`
+    /// through the normal `try_spawn` path; `state.json` only carries
+    /// the scheduler's bookkeeping cursor.
+    async fn check_schedules(
+        &self,
+        slug: &str,
+        spec: &WorkflowSpec,
+        project_dir: &std::path::Path,
+        progress_path: &std::path::Path,
+    ) {
+        // Fast path: no schedule agents → no state.json IO at all.
+        let has_schedule = spec
+            .agents
+            .values()
+            .any(|a| matches!(a.trigger, Trigger::Schedule));
+        if !has_schedule {
+            return;
+        }
+
+        let state_path = crate::paths::CcteamPaths::project_state_in(project_dir);
+        let mut state = match crate::state::ProjectState::load(&state_path) {
+            Ok(s) => s,
+            Err(err) => {
+                tracing::warn!(
+                    slug,
+                    ?err,
+                    "F140 check_schedules: state.json load failed; skipping this tick"
+                );
+                return;
+            }
+        };
+
+        let now = Utc::now();
+        let mut state_dirty = false;
+        // Roles to spawn after we drop nothing — `try_spawn` is async
+        // and takes `&self`; collect first so the borrow of `state` is
+        // released cleanly before each spawn.
+        let mut due_roles: Vec<String> = Vec::new();
+
+        for (role, agent) in &spec.agents {
+            if !matches!(agent.trigger, Trigger::Schedule) {
+                continue;
+            }
+            // workflow.yaml validate() guarantees a parseable 5-field
+            // cron for every schedule agent; re-parse defensively so a
+            // hot-reload race that slipped a bad spec past us only
+            // skips this role rather than panicking the loop.
+            let Some(expr) = agent.schedule.as_deref() else {
+                continue;
+            };
+            let sched = match crate::cron::Schedule::parse(expr) {
+                Ok(s) => s,
+                Err(err) => {
+                    tracing::warn!(
+                        slug,
+                        role = role.as_str(),
+                        ?err,
+                        "F140 check_schedules: unparseable schedule; skipping role"
+                    );
+                    continue;
+                }
+            };
+
+            match state.schedule_last_fire.get(role).copied() {
+                None => {
+                    // First observation — seed the cursor, do not fire.
+                    state.schedule_last_fire.insert(role.clone(), now);
+                    state_dirty = true;
+                    tracing::info!(
+                        slug,
+                        role = role.as_str(),
+                        schedule = expr,
+                        "F140 schedule registered; cursor anchored to now"
+                    );
+                }
+                Some(last_fire) => {
+                    if sched.is_due(Some(last_fire), now) {
+                        // Advance the cursor to `now` (skip-missed) and
+                        // queue the spawn.
+                        state.schedule_last_fire.insert(role.clone(), now);
+                        state_dirty = true;
+                        due_roles.push(role.clone());
+                    }
+                }
+            }
+        }
+
+        // Persist the cursor BEFORE spawning so a crash between the
+        // save and the spawn errs on the side of skip-missed (the
+        // missed slot is dropped) rather than a double-fire.
+        if state_dirty {
+            if let Err(err) = state.save(&state_path) {
+                tracing::warn!(
+                    slug,
+                    ?err,
+                    "F140 check_schedules: state.json save failed; \
+                     schedule cursors not advanced this tick"
+                );
+                // Bail without spawning — next tick retries cleanly.
+                return;
+            }
+        }
+
+        for role in due_roles {
+            let Some(agent) = spec.agents.get(&role) else {
+                continue;
+            };
+            tracing::info!(slug, role = role.as_str(), "F140 schedule due; spawning");
+            if let Err(err) = self
+                .try_spawn(slug, &role, agent, project_dir, progress_path)
+                .await
+            {
+                tracing::warn!(
+                    slug,
+                    role = role.as_str(),
+                    ?err,
+                    "F140 schedule spawn failed"
+                );
+            }
+        }
+    }
+
     /// Idempotent: emits `workflow_done` exactly once when every gate
     /// agent is Fired AND has no running session. Uses sentinel key
     /// `__workflow_done__` to guard against double-emit.
@@ -2917,6 +3079,18 @@ impl Orchestrator {
         progress_path: &std::path::Path,
     ) {
         self.check_inbox(slug, spec, project_dir, progress_path)
+            .await;
+    }
+
+    /// V0.6.3 F140 — drive one `check_schedules` pass (cron tick).
+    pub async fn test_check_schedules(
+        &self,
+        slug: &str,
+        spec: &WorkflowSpec,
+        project_dir: &std::path::Path,
+        progress_path: &std::path::Path,
+    ) {
+        self.check_schedules(slug, spec, project_dir, progress_path)
             .await;
     }
 
