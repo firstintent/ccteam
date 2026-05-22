@@ -67,6 +67,8 @@ First-source-wins,整团维度替换。读容错(yaml 错 → warn + 下一层),
 │   ├── signal/                   # MCP `signal` marker 桶
 │   ├── gate_override/            # MCP `trigger_gate` marker
 │   ├── workflow_overrides.json   # MCP `set_parallelism` 覆写
+│   ├── webhooks/                 # V0.6.3 F141: webhook ingress payload 桶(`trigger: watch:` 消费)
+│   ├── webhook-token             # V0.6.3 F141: per-project webhook secret(64 hex,mode 0600)
 │   ├── sessions/                 # flex-only adhoc session cwd
 │   │   └── <sid>/                # 例 claude-1;内含本 session inbox/outbox
 │   └── ready                     # SessionStart hook 写出的就绪标记
@@ -1039,6 +1041,7 @@ pub fn peek_pane(slug: &str, lines: Option<usize>) -> Result<PaneCapture, CoreEr
 | `POST` | `/api/{slug}/{sid}/pause` | 303 / 4xx | `text/plain`(error) | V0.3.1 F50:sid 校验后走 project-level pause,返回 `/session/{slug}/{sid}` |
 | `POST` | `/api/{slug}/resume` | 303 / 4xx | `text/plain`(error) | 空 body;详 §15.7 |
 | `POST` | `/api/{slug}/{sid}/resume` | 303 / 4xx | `text/plain`(error) | V0.3.1 F50:sid 校验后走 project-level resume,返回 `/session/{slug}/{sid}` |
+| `POST` | `/webhook/{project}/{token}` | 202 / 401 / 413 / 5xx | `application/json`(202)/ `text/plain`(401 / 413 / 5xx) | V0.6.3 F141:外部系统(CI / GitHub / 监控)的 HTTP→文件入口;详 §15.9。`auth_layer` **例外**(自带 per-project token)|
 
 ### 15.2 dashboard 行(`/` 表格)
 
@@ -1336,6 +1339,57 @@ session cookie 有效。理由:
 XSS tradeoff:token 出现在 HTML attribute 而非纯 HttpOnly cookie。
 被 XSS'd 时攻击者本来就能同源 fetch + 自动 cookie,所以 inline 不
 增加 threat surface。
+
+### 15.9 Webhook ingress(V0.6.3 F141)
+
+`POST /webhook/{project}/{token}` 让外部系统(CI 红 / GitHub PR 开 /
+CVE 监控)触发 ccteam agent。它是一个 **HTTP→文件薄入口**,**不是**新
+的 `Trigger` 变体 —— payload 落 `<project>/.ccteam/webhooks/`,agent 用
+现成的 `trigger: watch:.ccteam/webhooks/` 消费(Channel Layer 是 dumb
+router,无内嵌 LLM)。
+
+**鉴权(token-only,无 HMAC 签名)**:
+
+- per-project secret:64 hex 字符,存 `<project>/.ccteam/webhook-token`
+  (Unix mode 0600),首次 webhook 请求时 lazy 生成(`ccteam show` 也会
+  生成并打印 URL)。
+- `{token}` 路径段与 secret **constant-time** 比对(`subtle::ct_eq`)。
+- token 在 URL path → 要求 HTTPS 部署;请求签名留作未来按需。
+- 路由挂在 `auth_layer` bearer gate **之外**(自带 per-project token),
+  非 loopback bind 开 web token 时仍可达。
+
+**请求 / 响应**:
+
+| 情况 | 状态码 | body |
+|---|---|---|
+| 合法 token | `202 Accepted` | `{"ok":true,"file":"<abs path>"}` |
+| token 错 / 缺 / 未知 project | `401 Unauthorized` | `text/plain` `unauthorized`(不落文件;不区分 bad-token 与 unknown-project,防 slug 枚举)|
+| body > 256 KiB | `413 Payload Too Large` | `text/plain` |
+| 写文件失败 | `500` | `text/plain` |
+
+**落盘格式** —— `<project>/.ccteam/webhooks/<rfc3339-ms-no-colons>-<rand>.json`,
+原子写(`.tmp` + rename):
+
+```json
+{
+  "received_at": "2026-05-22T10:30:00.123Z",
+  "project": "dev-foo",
+  "headers": { "x-github-event": "push", "user-agent": "..." },
+  "payload": { "ref": "refs/heads/main", "...": "..." }
+}
+```
+
+`headers` 只收 allow-list(`content-type` / `user-agent` /
+`x-github-event` / `x-github-delivery` / `x-gitlab-event` /
+`x-event-key`)。`payload` 非 JSON body 退化为原始字符串。
+
+**安全**:payload 当不可信外部输入 —— 限长 256 KiB、**绝不进 spawn
+argv**(只写文件,agent 自己 `Read`),与 inbox 同级别处理。对外可达性
+(反代 / 隧道 / HTTPS)是部署问题,ccteam 只提供 endpoint。
+
+`ccteam show <slug>` / `ccteam show <slug> --format json` 打印该项目的
+webhook 相对 URL(`/webhook/<slug>/<secret>`)+ secret;operator 自行
+拼 `http(s)://<host>:<port>` 前缀。
 
 ---
 

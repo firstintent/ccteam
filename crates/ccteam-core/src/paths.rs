@@ -218,6 +218,24 @@ impl CcteamPaths {
         self.root.join("teams-progress.jsonl")
     }
 
+    /// V0.6.3 F141 — `<project>/.ccteam/webhooks/` directory holding
+    /// webhook-ingress payload files written by the `POST
+    /// /webhook/:project/:token` route. An agent consumes them via the
+    /// existing `trigger: watch:.ccteam/webhooks/` — webhook is a thin
+    /// HTTP→file entry point, **not** a new `Trigger` variant.
+    pub fn project_webhooks_dir(&self, slug: &str) -> PathBuf {
+        self.project_ccteam_dir(slug).join("webhooks")
+    }
+
+    /// V0.6.3 F141 — `<project>/.ccteam/webhook-token` file holding the
+    /// per-project webhook secret (64 hex chars, mode 0600). Generated
+    /// lazily on first webhook request, mirroring `~/.ccteam/web-token`.
+    /// The `:token` path segment of `POST /webhook/:project/:token` is
+    /// constant-time compared against this file's content.
+    pub fn project_webhook_token(&self, slug: &str) -> PathBuf {
+        self.project_ccteam_dir(slug).join("webhook-token")
+    }
+
     /// V0.2.2 F38: Build a unique PNG path under
     /// `<project>/.ccteam/screenshots/<utc>.png`. The timestamp is
     /// the same compact RFC3339-no-colons format used by inbox
