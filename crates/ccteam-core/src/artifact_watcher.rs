@@ -67,7 +67,7 @@ use serde_json::json;
 use tokio::sync::mpsc;
 
 use crate::progress;
-use crate::workflow::{Trigger, WorkflowSpec};
+use crate::workflow::{Trigger, WorkflowSpec, SQUAD_ROUTE_SENTINEL};
 
 /// Debounce window per `(watch_root, role)`. Two rapid filesystem
 /// events on the same watch root inside this window collapse to one
@@ -164,9 +164,19 @@ impl ArtifactWatcher {
     /// says they're project-relative). Caller is responsible for
     /// joining them to the project root before passing the spec in;
     /// `new` consumes the spec as-given and treats `path` literally.
+    ///
+    /// V0.6.3 F143 — when `spec.squad` is `Some`, the caller passes the
+    /// absolute squad routing dir (`<project>/.ccteam/squad/`) as
+    /// `squad_root`. The watcher registers it as an extra root tagged
+    /// with the [`SQUAD_ROUTE_SENTINEL`] role; the orchestrator's
+    /// `handle_artifact_event` recognizes the sentinel and parses the
+    /// `<member>--*.md` filename prefix to pick the real target role.
+    /// Squad members do NOT each declare a `trigger: watch:` — being
+    /// listed in `squad.members` is the declaration.
     pub fn new(
         spec: &WorkflowSpec,
         progress_path: Option<&Path>,
+        squad_root: Option<&Path>,
     ) -> Result<(Self, mpsc::Receiver<ArtifactEvent>)> {
         // Collect (root, role) entries in YAML declaration order.
         // `WorkflowSpec::agents` is an IndexMap so this iteration is
@@ -176,6 +186,14 @@ impl ArtifactWatcher {
         for (role, agent) in &spec.agents {
             if let Trigger::Watch(path) = &agent.trigger {
                 roots.push((path.clone(), role.clone()));
+            }
+        }
+        // V0.6.3 F143 — squad routing dir. Appended last so an explicit
+        // `watch:` agent root that happens to alias it still wins the
+        // YAML-order match in `match_root`.
+        if spec.squad.is_some() {
+            if let Some(squad) = squad_root {
+                roots.push((squad.to_path_buf(), SQUAD_ROUTE_SENTINEL.to_string()));
             }
         }
 

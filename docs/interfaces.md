@@ -1550,6 +1550,10 @@ agent_team:               # V0.5.0 F93b:可选,仅 mode: agent-team 时填。详
   snapshot_path: <path>
   suggested_teammates: [<SuggestedTeammate>]
   auto_spawn_teammates: <bool>
+squad:                    # V0.6.3 F143:可选,默认 None。跨 session 运行时路由。详 §17.1.5
+  leader: <role-name>
+  members: [<role-name>, ...]
+  hop_limit: <u32>
 agents:                   # 必填(artifact-driven mode);agent-team mode 可空。map<role-name, AgentSpec>
   <role-name>: <AgentSpec>
   ...
@@ -1624,6 +1628,38 @@ F84 budget guard 在 `try_spawn` 入口跑;cost 数据源走 F91 cost SoT(`agent
 | `cleanup_on_stop` | HOT | `ccteam stop` 时才读 |
 | `auto_spawn_teammates` | HOT | 下次 plan 时才读 |
 | `suggested_teammates[].adhoc_color` / `.adhoc_tools` / `.adhoc_model` | HOT | cosmetic / UI 元数据 |
+
+### 17.1.5 V0.6.3 F143 `SquadSpec` 字段(跨 session 运行时路由)
+
+```yaml
+squad:
+  leader: coordinator              # 运行时分发子任务的 role
+  members: [backend, frontend]     # leader 可路由到的 member role 集合
+  hop_limit: 3                     # 路由回路深度上限(默认 3)
+agents:
+  coordinator:
+    trigger: watch:.ccteam/issues/
+  backend:
+    trigger: manual                # member 不需声明 watch:.ccteam/squad/
+  frontend:
+    trigger: manual
+```
+
+| 字段 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `leader` | `String` | 必填 | 运行时分发子任务的 role;必须也在 `agents:` 中声明 |
+| `members` | `Vec<String>` | 必填(非空) | leader 可路由的 member role 集合;每项必须也在 `agents:` 中声明 |
+| `hop_limit` | `u32` | `3` | `leader→member→leader` 回路深度上限;路由 artifact 跳数到达此值 → emit `escalation`(不 spawn) |
+
+**模型:** `squad:` 叠加在 V0.4.0 artifact-driven roster 之上 —— `leader` 与每个 `members[]` 都**必须**同时作为普通 agent 在 `agents:` 下声明。squad 块只加一个能力:`leader` 可在**运行时**决定哪个 `member` 接手某个子任务,而非只能写死 `output:` 目录。
+
+**声明式拓扑红线:** member 集合静态固定在 `members:`,可路由目标范围读 workflow.yaml 即可审计;只有**分发**动态。这是 CLAUDE.md「声明式拓扑」红线的 sanctioned trade-off。
+
+**路由协议(无 prompt injection):** leader 通过往**固定的 squad 路由目录** `<project>/.ccteam/squad/` 写一个文件名为 `<member>--<rest>.md` 的 artifact 来路由子任务。target 标签是**文件名前缀**(`ls` 可见,无需解析文件正文)。orchestrator 的 `ArtifactWatcher` 监 squad 路由目录;检到新 `<member>--*.md` 文件 → 解析前缀 → spawn 该 member role。member **不**各自声明 `trigger: watch:.ccteam/squad/` —— 列入 `squad.members` 即声明。
+
+**深度上限(R7):** 路由 artifact 文件名可携带跳数:`<member>--h<N>--<rest>.md`(`h<N>` 段省略 = 跳数 0,即 leader 首次分发)。跳数到达 `hop_limit` 时,orchestrator emit 一条 `escalation`(`kind: "squad_hop_limit"`)而非 spawn,使 `leader→member→leader` 回路有界。前缀不在 `members:` 内的路由文件同样 emit `escalation`(`kind: "squad_unknown_target"`)+ 推 meta-agent inbox,不 spawn。
+
+**校验**(`WorkflowSpec::validate` → `validate_squad`):`squad:` 只在 `mode: artifact-driven` / `human-approval`(有静态 agent roster 的 mode)合法;`leader` 与每个 `members[]` 必须是已声明 agent role;`members` 非空;`hop_limit >= 1`。任一不满足 → `ValidationFailed`。
 
 ### 17.2 `AgentSpec` 字段
 
@@ -1707,6 +1743,7 @@ agents:
 4. `trigger: gate` 必须有 `input`。
 5. `parallelism > 1` 只允许 `watch:` trigger;`schedule` / `gate` / `manual` 单实例。
 6. V0.6.3 F140:`trigger: schedule` 必须有合法 `schedule:`(标准 5 段 cron;缺失或解析失败 → `ValidationFailed`)。
+7. V0.6.3 F143:`squad:` 只在 `mode: artifact-driven` / `human-approval` 合法;`leader` + 每个 `members[]` 必须是已声明 agent role;`members` 非空;`hop_limit >= 1`。详 §17.1.5。
 
 ### 17.5 `WorkflowError` 变体
 
@@ -1715,7 +1752,7 @@ agents:
 | `NotFound(PathBuf)` | `load_for_project` 两处都不存在 |
 | `ReadFailed(io::Error)` | 文件系统读失败(权限 / EIO 等)|
 | `ParseFailed(serde_yaml::Error)` | YAML 语法 / 未知 enum 变体(如 `executor: unknown`)|
-| `ValidationFailed(String)` | 上述 5 条结构校验失败,String 携带 role + 原因 |
+| `ValidationFailed(String)` | 上述 7 条结构校验失败,String 携带 role + 原因 |
 
 ### 17.6 Fixture 参考
 

@@ -218,6 +218,7 @@ fn watch_spec(role: &str, watch_rel: &str, parallelism: Option<u32>) -> Workflow
         budgets_v060: None,
         agent_team: None,
         chat: None,
+        squad: None,
         agents,
     }
 }
@@ -248,6 +249,7 @@ fn manual_spec(role: &str) -> WorkflowSpec {
         budgets_v060: None,
         agent_team: None,
         chat: None,
+        squad: None,
         agents,
     }
 }
@@ -278,6 +280,7 @@ fn gate_spec(role: &str, input_rel: &str) -> WorkflowSpec {
         budgets_v060: None,
         agent_team: None,
         chat: None,
+        squad: None,
         agents,
     }
 }
@@ -859,6 +862,7 @@ agents:
         budgets_v060: None,
         agent_team: None,
         chat: None,
+        squad: None,
         agents,
     };
     let progress = orch.paths().progress_jsonl(&slug);
@@ -1422,6 +1426,7 @@ async fn t31_inbox_target_role_routes_explicitly() {
         budgets_v060: None,
         agent_team: None,
         chat: None,
+        squad: None,
         agents,
     };
     let progress = orch.paths().progress_jsonl(&slug);
@@ -1769,7 +1774,11 @@ async fn t36_phantom_cleanup_records_cost_in_progress_for_cost_summary() {
 // ============================================================
 
 /// Helper: build a `WorkflowMode::HumanApproval` watch-trigger spec.
-fn human_approval_watch_spec(role: &str, watch_rel: &str, parallelism: Option<u32>) -> WorkflowSpec {
+fn human_approval_watch_spec(
+    role: &str,
+    watch_rel: &str,
+    parallelism: Option<u32>,
+) -> WorkflowSpec {
     let mut spec = watch_spec(role, watch_rel, parallelism);
     spec.mode = ccteam_core::WorkflowMode::HumanApproval;
     spec
@@ -1919,6 +1928,7 @@ fn schedule_spec(role: &str, cron: &str) -> WorkflowSpec {
         budgets_v060: None,
         agent_team: None,
         chat: None,
+        squad: None,
         agents,
     }
 }

@@ -69,6 +69,7 @@ fn manual_spec(role: &str) -> WorkflowSpec {
         budgets_v060: None,
         agent_team: None,
         chat: None,
+        squad: None,
         agents,
     }
 }
