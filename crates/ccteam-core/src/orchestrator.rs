@@ -1732,7 +1732,14 @@ impl Orchestrator {
         let ctx = SpawnCtx {
             slug: slug.to_string(),
             sid: sid.clone(),
-            cwd: project_dir.to_path_buf(),
+            // V0.6.2 — `cwd` is the agent's `scope` subdirectory joined
+            // onto the project root (or the root itself when `scope` is
+            // unset). Scoping each spawn to the slice of the tree
+            // relevant to its role keeps the fresh-1M-context window
+            // (red line R3) pointed at a small subtree instead of the
+            // whole repo root; Claude Code still walks *up* and loads
+            // every CLAUDE.md along the way.
+            cwd: agent.cwd(project_dir),
             project_dir: project_dir.to_path_buf(),
             extra_args: vec![kick],
             // Wave 4 D14 — plumb the workflow-declared model id so the

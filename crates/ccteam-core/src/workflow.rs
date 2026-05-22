@@ -539,6 +539,24 @@ pub struct AgentSpec {
     pub model: Option<String>,
     /// What triggers a new session of this role. See [`Trigger`].
     pub trigger: Trigger,
+    /// V0.6.2 — optional code subdirectory (relative to the project
+    /// root) the spawned harness session runs in. `None` (field
+    /// omitted) = project root, the V0.6.1 default and backwards-compat
+    /// path. When set, `SpawnCtx.cwd = project_dir.join(scope)` so a
+    /// large-codebase agent starts scoped to the slice of the tree
+    /// relevant to its role: every spawn's blast radius shrinks and the
+    /// red-line "fresh 1M context" (R3) now points at a small subtree
+    /// instead of the whole repo root. Claude Code still walks *up* the
+    /// directory tree and loads every `CLAUDE.md` it finds along the
+    /// way, so root-level context is never lost.
+    ///
+    /// `validate()` rejects absolute paths and any `..` component
+    /// (path-traversal guard — a workflow.yaml can never point a
+    /// spawned session outside the project tree). Existence of the
+    /// directory is a runtime concern: a missing `scope` dir surfaces
+    /// as an ordinary spawn failure → `fail_counts` → 3-strike escalate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<PathBuf>,
     /// Max concurrent sessions of this role. Only meaningful for
     /// `Trigger::Watch`; validate() rejects `> 1` for other triggers.
     /// `None` semantics = "single instance" (caller treats `None` as 1).
@@ -583,6 +601,19 @@ pub struct AgentSpec {
     /// ```
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_approval: Option<PlanApprovalSpec>,
+}
+
+impl AgentSpec {
+    /// V0.6.2 — resolve the working directory a spawned harness session
+    /// runs in. `scope` (when set) is joined onto the project root;
+    /// `None` resolves to the project root itself (the V0.6.1 default).
+    /// Callers pass the result straight into [`crate::SpawnCtx::cwd`].
+    pub fn cwd(&self, project_dir: &Path) -> PathBuf {
+        match &self.scope {
+            Some(scope) => project_dir.join(scope),
+            None => project_dir.to_path_buf(),
+        }
+    }
 }
 
 /// V0.6.1 F98 — per-agent plan-approval policy.
@@ -921,6 +952,9 @@ impl WorkflowSpec {
                 }
                 Trigger::Manual | Trigger::Schedule => {}
             }
+            if let Some(scope) = &spec.scope {
+                validate_scope(role, scope)?;
+            }
             if let Some(n) = spec.parallelism {
                 if n > 1 && !matches!(spec.trigger, Trigger::Watch(_)) {
                     return Err(WorkflowError::ValidationFailed(format!(
@@ -948,6 +982,34 @@ fn validate_role_name(role: &str) -> Result<(), WorkflowError> {
                  (only [a-z0-9_-] permitted)"
             )));
         }
+    }
+    Ok(())
+}
+
+/// V0.6.2 — [`AgentSpec::scope`] must be a relative path that stays
+/// inside the project root. Absolute paths and any `..` component are
+/// rejected so a `workflow.yaml` can never point a spawned harness
+/// session outside the project tree (path-traversal guard).
+fn validate_scope(role: &str, scope: &Path) -> Result<(), WorkflowError> {
+    if scope.as_os_str().is_empty() {
+        return Err(WorkflowError::ValidationFailed(format!(
+            "agent `{role}`: `scope` must not be empty (omit the field for project root)"
+        )));
+    }
+    if scope.is_absolute() {
+        return Err(WorkflowError::ValidationFailed(format!(
+            "agent `{role}`: `scope` must be relative to the project root, got absolute `{}`",
+            scope.display()
+        )));
+    }
+    if scope
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(WorkflowError::ValidationFailed(format!(
+            "agent `{role}`: `scope` must stay inside the project root (no `..`), got `{}`",
+            scope.display()
+        )));
     }
     Ok(())
 }
@@ -1002,6 +1064,7 @@ mod tests {
                         executor: Executor::Claude,
                         model: None,
                         trigger: parsed,
+                        scope: None,
                         parallelism: None,
                         input: None,
                         output: None,
@@ -1022,6 +1085,109 @@ mod tests {
     fn parse_trigger_unknown_form_errors() {
         assert!(parse_trigger("foo").is_err());
         assert!(parse_trigger("cron:5m").is_err());
+    }
+
+    // V0.6.2 — per-role `scope` (code subdirectory the spawn runs in).
+
+    fn agent_with_scope(scope: Option<&str>) -> AgentSpec {
+        AgentSpec {
+            executor: Executor::Claude,
+            model: None,
+            trigger: Trigger::Manual,
+            scope: scope.map(PathBuf::from),
+            parallelism: None,
+            input: None,
+            output: None,
+            interval: None,
+            timeout: None,
+            on_timeout: None,
+            plan_approval: None,
+        }
+    }
+
+    fn workflow_with(role: &str, agent: AgentSpec) -> WorkflowSpec {
+        let mut agents = IndexMap::new();
+        agents.insert(role.into(), agent);
+        WorkflowSpec {
+            name: "x".into(),
+            description: None,
+            mode: WorkflowMode::ArtifactDriven,
+            enabled: true,
+            budget: None,
+            budgets_v060: None,
+            agent_team: None,
+            chat: None,
+            agents,
+        }
+    }
+
+    #[test]
+    fn cwd_none_scope_resolves_to_project_root() {
+        let agent = agent_with_scope(None);
+        assert_eq!(
+            agent.cwd(Path::new("/p/proj")),
+            PathBuf::from("/p/proj"),
+            "omitted scope must keep the V0.6.1 project-root cwd"
+        );
+    }
+
+    #[test]
+    fn cwd_some_scope_joins_under_project_root() {
+        let agent = agent_with_scope(Some("services/payments"));
+        assert_eq!(
+            agent.cwd(Path::new("/p/proj")),
+            PathBuf::from("/p/proj/services/payments")
+        );
+    }
+
+    #[test]
+    fn validate_accepts_relative_scope() {
+        let spec = workflow_with("editor", agent_with_scope(Some("crates/api")));
+        assert!(spec.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_scope_with_parent_dir() {
+        let spec = workflow_with("editor", agent_with_scope(Some("../escape")));
+        assert!(matches!(
+            spec.validate().unwrap_err(),
+            WorkflowError::ValidationFailed(_)
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_absolute_scope() {
+        let spec = workflow_with("editor", agent_with_scope(Some("/etc")));
+        assert!(matches!(
+            spec.validate().unwrap_err(),
+            WorkflowError::ValidationFailed(_)
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_empty_scope() {
+        let spec = workflow_with("editor", agent_with_scope(Some("")));
+        assert!(matches!(
+            spec.validate().unwrap_err(),
+            WorkflowError::ValidationFailed(_)
+        ));
+    }
+
+    #[test]
+    fn scope_round_trips_through_yaml() {
+        let yaml = "\
+name: scoped
+agents:
+  editor:
+    trigger: manual
+    scope: services/payments
+";
+        let spec: WorkflowSpec = serde_yaml::from_str(yaml).expect("parse");
+        assert_eq!(
+            spec.agents["editor"].scope,
+            Some(PathBuf::from("services/payments"))
+        );
+        spec.validate().expect("validate");
     }
 
     #[test]
