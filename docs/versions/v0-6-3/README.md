@@ -1,8 +1,8 @@
 # ccteam V0.6.3 — 外部触发 + vendor 接缝健壮性 + 跨 session 路由
 
-> **状态:PRD 草案,待 review。** doc-first —— review 通过后才动代码(CLAUDE.md §五 patch 流程)。
+> **状态:SHIPPED 2026-05-22(branch `claude/v0.6.3`)。** 四个 finding 全部合入 + 通过集成 gate。
 > **来源:** Multica(`multica-ai/multica`)对比调研 → 经「harness 套 harness」设计哲学筛子取四条最高价值点(对比分析为 session 内研究,未入库)。
-> **基线:** 起点 V0.6.1,test baseline `1403/1`,clippy 0 warning。
+> **基线:** test `1403/1` → `1462/1`(+59,四 finding 各带回归测试);clippy 0 warning;workspace version `0.6.1` → `0.6.3`。
 
 ---
 
@@ -157,8 +157,21 @@
 
 ---
 
-## 7. 待确认事项(review 前)
+## 7. Shipped notes(closeout 2026-05-22)
 
-1. **版本号:** 当前 workspace 是 `0.6.1`,`docs/versions/` 最新是 `v0-6-1`,**无 v0.6.2** —— 本 PRD 按用户指定走 `0.6.3`。若是笔误应为 `0.6.2`,review 时说明即改(rename 分支 + dir + 版本串)。
-2. **F142 未知 job 状态**:非终态续 probe vs 当终态 —— PRD 倾向前者,待拍板。
-3. **F143 三个开放设计点**(见 §4)。
+PRD §7 三个待确认项,实施时的最终决定:
+
+1. **版本号** —— 按用户指定走 `0.6.3`(跳过 `0.6.2`;`docs/versions/` 无 v0-6-2 目录)。
+2. **F142 未知 job 状态** —— 落「非终态续 probe + warn-once」。实施中另发现:代码库 vendor 输出解析全程走 `serde_json::Value`-plucking,**没有 strict serde enum** 可挂 `#[serde(other)]` —— 「未知字段忽略」一半本就由构造成立;F142 实际增量是把静默降级变成 warn-once 可观测 + 回归测试锁死。PRD §3 的 intent 达成。
+3. **F143 三个开放设计点** —— 全按 PRD §4 倾向落地:target 标签用文件名前缀 `<member>--*.md`(非 frontmatter);`squad.members` 静态声明即「接受 routed 输入」声明,member 不另写 `trigger: watch`;hop count 编码进文件名 `<member>--h<N>--*`,`hop_limit` 默认 3,超限发 `escalation`(`kind: squad_hop_limit`),未知 member 前缀发 `kind: squad_unknown_target`。
+
+### 合入提交(linear history,branch `claude/v0.6.3`)
+
+| Finding | commit |
+|---|---|
+| F141 webhook ingress | `de6fee7` |
+| F140 cron scheduler | `1b4e1c1` |
+| F142 vendor-seam forward-compat | `483bad2` |
+| F143 squad routing | `40f6031` |
+
+集成 gate:`cargo test --workspace --locked --no-fail-fast` → 1462 pass / 1 fail(已知 flake `workflow_summary_reflects_agent_spawn_and_done_events`);`cargo clippy --workspace --all-targets -- -D warnings` → 0。
