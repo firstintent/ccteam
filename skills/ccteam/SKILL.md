@@ -1,6 +1,6 @@
 ---
 name: ccteam
-description: ccteam 总入口 NL dispatcher。用户在 Claude session 内输入 `/ccteam <自然语言>` 触发,本 skill 把 NL 意图分类到 7 类(start-team / create-workflow / configure-im / monitor / advise / status-debug / other)并路由到对应 sub-skill。Use when 用户说"起一个 team / 做个 TG 助理 bot / 跑 qa-loop / 看 ccteam 状态 / 投票决定 / second opinion / 暂停 X / 为啥撞 budget"等任何 ccteam 相关意图。7 intents 全部对应实工 skill,不再有 placeholder fallback。
+description: ccteam 总入口 NL dispatcher。用户在 Claude session 内输入 `/ccteam <自然语言>` 触发,本 skill 把 NL 意图分类到 8 类(start-team / create-workflow / configure-im / monitor / code-scan / advise / status-debug / other)并路由到对应 sub-skill。Use when 用户说"起一个 team / 做个 TG 助理 bot / 跑 qa-loop / 看 ccteam 状态 / 扫一下代码 / 摸底新项目 / 投票决定 / second opinion / 暂停 X / 为啥撞 budget"等任何 ccteam 相关意图。所有 ship intent 对应实工 skill,不再有 placeholder fallback。
 ---
 
 # /ccteam — NL dispatcher
@@ -14,7 +14,7 @@ V0.6.0 旗舰入口。用户**无需记多个 slash 名**,在 Claude session 内
 
 灵感来源:OMC `README:231` "No commands to memorize, just describe what you want" 已市场验证。
 
-## V0.6.0 skill 家族(本 skill 所处位置)
+## skill 家族(本 skill 所处位置)
 
 | 用户意图 | Skill | 状态 |
 |---|---|---|
@@ -24,6 +24,7 @@ V0.6.0 旗舰入口。用户**无需记多个 slash 名**,在 Claude session 内
 | 查项目状态 / pause / resume / 跨项目 ls | `ccteam-control` | 已 ship |
 | TG / Lark / Slack 一次性 token 绑定 | `ccteam-im-setup` | 已 ship |
 | Claude + Codex 并行 advisor + 投票 | `ccteam-advise` | 已 ship |
+| 扫代码摸底 / 大码库 audit | `ccteam-scan`(V0.6.2 F141 + V0.6.5 F157)| 已 ship |
 
 ## When to invoke
 
@@ -38,7 +39,7 @@ V0.6.0 旗舰入口。用户**无需记多个 slash 名**,在 Claude session 内
 
 ## Step 1: 意图分类
 
-对收到的 NL,落 7 类之一(优先级从上到下,匹配第一条即停):
+对收到的 NL,落 8 类之一(优先级从上到下,匹配第一条即停):
 
 | # | 意图 | 触发关键词 / 模式 | 示例 |
 |---|---|---|---|
@@ -46,13 +47,16 @@ V0.6.0 旗舰入口。用户**无需记多个 slash 名**,在 Claude session 内
 | 2 | **create-workflow** | "做个 bot" / "做个 IM 助理" / "夜里跑 X" / "长跑监控 X" / "建 workflow" / "Pocket Assistant" / "Overnight" / "做个 TG 群多 bot" | `/ccteam "做个 TG 助理 bot"` |
 | 3 | **configure-im** | "绑 TG token" / "换 Slack" / "我的 chat_id" / "IM 设置" / "怎么对接 Lark" | `/ccteam "绑 TG token"` |
 | 4 | **monitor** | "我的项目状态" / "ls all" / "跑得怎样" / "看 X 项目" / "现在哪些 team 在跑" | `/ccteam "我哪些项目还活着"` |
-| 5 | **advise** | "second opinion" / "投票决定" / "Codex + Claude 各给" / "两边都问下" / "advise X" | `/ccteam "Claude + Codex 各给一个方案"` |
-| 6 | **status-debug** | "为啥撞 budget" / "看 log" / "stop X" / "pause X" / "resume X" / "X 卡住了" | `/ccteam "为啥撞 budget"` |
-| 7 | **other** | 不在以上 6 类 | "你好 / ccteam 是什么 / hi" |
+| 5 | **code-scan** | "扫一下代码" / "摸底新项目" / "scan code" / "audit codebase" / "这仓库是个啥" / "看看这代码用了啥" / "navigability audit" / "我的 monorepo 怎么接 ccteam" / "workflow.yaml 的 scope 该填什么" | `/ccteam "扫一下代码"` |
+| 6 | **advise** | "second opinion" / "投票决定" / "Codex + Claude 各给" / "两边都问下" / "advise X" | `/ccteam "Claude + Codex 各给一个方案"` |
+| 7 | **status-debug** | "为啥撞 budget" / "看 log" / "stop X" / "pause X" / "resume X" / "X 卡住了" | `/ccteam "为啥撞 budget"` |
+| 8 | **other** | 不在以上 7 类 | "你好 / ccteam 是什么 / hi" |
 
 歧义启发式:
 - 同时匹配 start-team + create-workflow:看是否提到"持久 / 长跑 / IM / bot" → create-workflow;否则 → start-team
 - 同时匹配 monitor + status-debug:有具体 slug 提及 → status-debug;泛指 → monitor
+- 同时匹配 code-scan + start-team:动词是"扫 / 看 / 摸底 / audit"(只读)→ code-scan;动词是"改 / 修 / 重构 / fix"(写)→ start-team
+- code-scan default 走 `--quick`(60-90s 摸底);用户明说"大码库 / monorepo / scope / navigability / 完整 audit" → 不带 `--quick`,走 audit mode
 
 ## Step 2: 路由到 sub-skill
 
@@ -62,9 +66,10 @@ V0.6.0 旗舰入口。用户**无需记多个 slash 名**,在 Claude session 内
 | 2 create-workflow | `/ccteam-creator <NL>` | 原 NL 原样 |
 | 3 configure-im | `/ccteam-im-setup` | 透传 token / IM 平台 hint |
 | 4 monitor | `/ccteam-control <NL>` | 原 NL,如有 slug 提取 |
-| 5 advise | `/ccteam-advise <NL>` | 原 NL 原样 |
-| 6 status-debug | `/ccteam-control <NL>` | 提取 slug + 动作 |
-| 7 other | Step 3 fallback dialog | — |
+| 5 code-scan | `/ccteam-scan --quick` (default) 或 `/ccteam-scan` (用户明说大码库 / audit) | 仓库路径(默认当前 cwd) |
+| 6 advise | `/ccteam-advise <NL>` | 原 NL 原样 |
+| 7 status-debug | `/ccteam-control <NL>` | 提取 slug + 动作 |
+| 8 other | Step 3 fallback dialog | — |
 
 ## Step 3: Fallback dialog(意图分类失败 / 用户 NL 含糊)
 
@@ -75,14 +80,16 @@ V0.6.0 旗舰入口。用户**无需记多个 slash 名**,在 Claude session 内
 > (b) 做个 IM bot 助理(私聊 / 群内多 bot)
 > (c) 看 ccteam 项目状态 / 暂停 / 恢复
 > (d) Claude + Codex 双方咨询(advise / second opinion)
+> (e) 摸底新代码库 / 扫一下代码(快速 60-90s 报告)
 >
-> 选个字母回我(`a` / `b` / `c` / `d`),或重新描述一下你想做啥。
+> 选个字母回我(`a` / `b` / `c` / `d` / `e`),或重新描述一下你想做啥。
 
 收到字母:
 - `a` → 走 start-team 路径,问"具体要 team 干啥?(描述任务)"
 - `b` → 走 create-workflow 路径
 - `c` → 走 monitor 路径
 - `d` → 走 advise 路径
+- `e` → 走 code-scan 路径(`/ccteam-scan --quick`)
 
 收到完整重述 → 重跑 Step 1。
 
@@ -91,20 +98,22 @@ V0.6.0 旗舰入口。用户**无需记多个 slash 名**,在 Claude session 内
 - **不直接调 MCP tool 或 Bash 命令** — 只做 NL 分类 + slash 路由;真正执行由 sub-skill 负责
 - **不维护多轮对话状态** — 一次 turn 做一次分类 + 路由;后续多轮归 sub-skill
 - **不做 voice / 图片 / 多模态 input**(V0.7+)
-- **不接受 skill 自定义注册** — 5 sub-skill 固定,用户不能 `/ccteam-add-skill <name>`(由 V0.6.0 PRD F113 §"不在范围"锁定)
+- **不接受 skill 自定义注册** — 6 sub-skill 固定(team / creator / control / im-setup / advise / scan),用户不能 `/ccteam-add-skill <name>`(由 V0.6.0 PRD F113 §"不在范围"锁定)
 
 ## Where to look in the repo
 
-- `@docs/versions/v0-6-0/prd.md` — F113 完整需求 + 验收
-- `@docs/versions/v0-6-0/README.md` §三 — 用户面入口 + 5 sub-skill 一览
+- `@docs/versions/v0-6-0/prd.md` — F113 完整需求 + 验收(dispatcher 初版)
+- `@docs/versions/v0-6-5/prd.md` — F157 code-scan intent 接入
+- `@docs/versions/v0-6-0/README.md` §三 — 用户面入口 + sub-skill 一览
 - `@skills/ccteam-team/SKILL.md` — start-team 详细行为
 - `@skills/ccteam-control/SKILL.md` — monitor / status-debug 详细行为
 - `@skills/ccteam-creator/SKILL.md` — create-workflow 详细行为
+- `@skills/ccteam-scan/SKILL.md` — code-scan 详细行为(quick + audit 两 mode)
 
 ## 当前状态
 
 - ✅ frontmatter + 意图分类提示词 + 路由表 + fallback dialog 全落
-- ✅ `/ccteam-creator` / `/ccteam-im-setup` / `/ccteam-advise` sub-skill body 已 ship
-- ✅ 7 intents 全部对应实工 skill,不再有 placeholder fallback
+- ✅ `/ccteam-creator` / `/ccteam-im-setup` / `/ccteam-advise` / `/ccteam-scan` sub-skill body 均已 ship
+- ✅ 8 intents(7 work + 1 fallback)全部对应实工 skill,不再有 placeholder
 
 本 dispatcher 在所有 sub-skill 前面加一层 NL→slash 翻译,体验从"记多个 slash"→"说人话"。
