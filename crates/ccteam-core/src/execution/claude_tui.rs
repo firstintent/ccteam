@@ -83,10 +83,7 @@ pub fn chat_session_name(slug: &str, role: &str) -> String {
 ///
 /// Idempotent: existing hooks for other events are preserved; existing
 /// chat-progress entries are replaced.
-pub fn ensure_chat_hooks_installed(
-    project_dir: &Path,
-    hook_sh: &str,
-) -> Result<(), HarnessError> {
+pub fn ensure_chat_hooks_installed(project_dir: &Path, hook_sh: &str) -> Result<(), HarnessError> {
     let settings_dir = project_dir.join(".claude");
     std::fs::create_dir_all(&settings_dir)
         .map_err(|e| HarnessError::Io(format!("create {}: {e}", settings_dir.display())))?;
@@ -141,6 +138,43 @@ fn claude_bin() -> String {
     std::env::var(CLAUDE_BIN_ENV).unwrap_or_else(|_| "claude".to_string())
 }
 
+/// F164 — Probe whether a tmux session's pane process looks like a
+/// running `claude` process.
+///
+/// Algorithm (no pane content read — red line compliant):
+/// 1. `tmux list-panes -F "#{pane_pid}"` → get pane PID(s).
+/// 2. For each PID: `ps -p <pid> -o comm=` to read the command name.
+/// 3. Accept if the `comm` field **contains** the string "claude"
+///    (covers `claude`, `claude-code`, etc.).
+///
+/// Returns `false` when the session has no panes, all pids are gone,
+/// or none match. Does **not** read pane text content.
+fn is_pane_running_claude(session: &TmuxSession) -> bool {
+    let pids = session.list_pane_pids();
+    if pids.is_empty() {
+        return false;
+    }
+    for pid in pids {
+        if pid == 0 {
+            continue;
+        }
+        let Ok(output) = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "comm="])
+            .output()
+        else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let comm = String::from_utf8_lossy(&output.stdout);
+        if comm.trim().contains("claude") {
+            return true;
+        }
+    }
+    false
+}
+
 fn ccteam_bin_for_hooks() -> String {
     // V0.6.1 F139 — chat-mode hooks now invoke the wrapper script
     // (`~/.ccteam/hooks/hook.sh`) rather than the ccteam binary. The
@@ -181,19 +215,68 @@ impl HarnessAdapter for ClaudeTuiAdapter {
         turns_mirror::ensure_dir(&ctx.project_dir, &spec.role)
             .map_err(|e| HarnessError::Io(e.to_string()))?;
 
-        // 3. Spawn tmux session running `<claude> --dangerously-skip-permissions`.
+        // 3. Spawn (or reattach) the tmux session running
+        //    `<claude> --dangerously-skip-permissions`.
+        //
+        //    F164 — Instead of hard-failing when the session already exists
+        //    (which caused bot permanent failure after daemon restart on
+        //    nas-box005, 2026-05-23), we probe liveness and either reattach
+        //    or recreate:
+        //
+        //    a) Session exists + pane process is `claude` → reattach:
+        //       skip spawning a new process, just update hooks and return a
+        //       handle pointing at the existing session.
+        //    b) Session exists + pane is dead (pid gone / comm ≠ "claude")
+        //       → recreate: kill the stale tmux session (it's an orphan,
+        //       not a running bot — not a violation of the "永不主动 kill
+        //       长 session" red line), then fall through to new-session.
+        //    c) Session absent → normal new-session path.
         let session_name = chat_session_name(&ctx.slug, &spec.role);
         let session = TmuxSession::from_name(session_name.clone());
+
         if session.exists() {
-            return Err(HarnessError::SpawnFailed(format!(
-                "tmux session already exists: {session_name} (call resume_thread instead)"
-            )));
+            if is_pane_running_claude(&session) {
+                // (a) Alive & healthy — reattach.
+                let pids = session.list_pane_pids();
+                let pane_pid = pids.first().copied();
+                tracing::info!(
+                    event = "session_reattached",
+                    session = %session_name,
+                    slug = %ctx.slug,
+                    role = %spec.role,
+                    pane_pid = ?pane_pid,
+                    "claude-tui: reattached to existing tmux session (pane claude process alive)"
+                );
+            } else {
+                // (b) Dead pane — recreate.
+                let pids = session.list_pane_pids();
+                let old_pane_pid = pids.first().copied();
+                tracing::info!(
+                    event = "session_recreated",
+                    session = %session_name,
+                    slug = %ctx.slug,
+                    role = %spec.role,
+                    old_pane_pid = ?old_pane_pid,
+                    "claude-tui: killing stale tmux session (dead pane), recreating"
+                );
+                session
+                    .kill()
+                    .map_err(|e| HarnessError::SpawnFailed(format!("tmux kill stale: {e}")))?;
+                // Fall through to new-session below.
+                let bin = claude_bin();
+                let argv: Vec<&str> = vec![&bin, "--dangerously-skip-permissions"];
+                session
+                    .start(&ctx.cwd, &argv)
+                    .map_err(|e| HarnessError::SpawnFailed(format!("tmux start: {e}")))?;
+            }
+        } else {
+            // (c) Absent — normal new session.
+            let bin = claude_bin();
+            let argv: Vec<&str> = vec![&bin, "--dangerously-skip-permissions"];
+            session
+                .start(&ctx.cwd, &argv)
+                .map_err(|e| HarnessError::SpawnFailed(format!("tmux start: {e}")))?;
         }
-        let bin = claude_bin();
-        let argv: Vec<&str> = vec![&bin, "--dangerously-skip-permissions"];
-        session
-            .start(&ctx.cwd, &argv)
-            .map_err(|e| HarnessError::SpawnFailed(format!("tmux start: {e}")))?;
 
         // 4. Heartbeat file — lightweight liveness marker the imd watch
         //    + meta-agent dashboard can poll.
