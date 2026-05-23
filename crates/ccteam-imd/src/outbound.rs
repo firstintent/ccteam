@@ -8,11 +8,13 @@
 
 use std::fs;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 
 use crate::latency::now_unix_ms;
 
@@ -149,11 +151,7 @@ pub fn turns_jsonl_path(projects_root: &std::path::Path, slug: &str, role: &str)
 /// → fall back to the zero cursor (re-forward everything; safer than
 /// dropping content silently, and `turns.jsonl` grows monotonically
 /// so a stale cursor would only ever under-skip, never over-skip).
-pub fn outbound_cursor_path(
-    projects_root: &std::path::Path,
-    slug: &str,
-    role: &str,
-) -> PathBuf {
+pub fn outbound_cursor_path(projects_root: &std::path::Path, slug: &str, role: &str) -> PathBuf {
     projects_root
         .join(slug)
         .join(".ccteam")
@@ -178,30 +176,164 @@ pub fn load_cursor(path: &std::path::Path) -> TailCursor {
 }
 
 /// Persist a [`TailCursor`] to disk. Creates the parent directory if
-/// missing. Errors propagate so the caller can warn-log; persistence
-/// failure is not fatal (the worst case is re-forwarding a few rows
-/// next tick if the cursor doesn't land).
-pub fn save_cursor(path: &std::path::Path, cursor: &TailCursor) -> Result<()> {
+/// missing. Low-level helper — does **not** enforce monotonicity, and
+/// is not safe to call concurrently from multiple writers against the
+/// same path.
+///
+/// Production code should go through [`OutboundCursor`] instead, which
+/// owns the in-memory truth, serializes writers via an async mutex,
+/// and exposes [`OutboundCursor::try_advance`] (monotonic) +
+/// [`OutboundCursor::force_set`] (for the truncation-rewind case).
+/// Direct callers of `save_cursor` are limited to (a) tests and (b)
+/// startup paths that initialize the cursor from a known value before
+/// any concurrent writers exist.
+pub fn save_cursor(path: &Path, cursor: &TailCursor) -> Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("mkdir -p {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| format!("mkdir -p {}", parent.display()))?;
     }
     let body = serde_json::to_string(cursor).context("serialize TailCursor")?;
     fs::write(path, body).with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
 
-/// Read every new line since `cursor.position`, returning the parsed
-/// rows + the new cursor position (advanced to EOF). Missing file is
-/// not an error — returns an empty Vec.
-pub fn read_new_rows(path: &std::path::Path, cursor: &TailCursor) -> Result<(Vec<TurnRow>, TailCursor)> {
+/// Per-bot outbound cursor with **async-serialized monotonic
+/// advance**. This is the synchronization primitive that closes the
+/// fast-path × safety-net duplicate-send race in
+/// [`crate::daemon::spawn_outbound_dispatcher`] +
+/// [`crate::daemon::drain_outboxes`].
+///
+/// The two writers share an `Arc<OutboundCursor>` (constructed once
+/// per bot in `ensure_bot_channels`). Both call:
+///
+/// - [`current`](Self::current) before sending a row to TG — skip
+///   when `row_end_pos <= cursor.current()`, the other writer already
+///   delivered it. Closes the per-row double-send window.
+/// - [`try_advance`](Self::try_advance) after a successful TG send —
+///   monotonic, no rewinds. Closes the cursor-rewind loop that
+///   produced the unbounded "大量重复消息" flood on NAS-latency
+///   environments.
+///
+/// Truncation is handled out-of-band via
+/// [`force_set`](Self::force_set), called by `drain_outboxes` when it
+/// detects `turns.jsonl` shrank below the current cursor (file
+/// rotated / manually edited). Without an explicit reset the
+/// monotonic guard would otherwise keep re-reading from byte 0 every
+/// tick and re-forward the rotated content forever.
+///
+/// Disk persistence is best-effort: write errors warn-log but never
+/// fail the in-memory advance. The worst case on disk-write failure
+/// is re-forwarding the most recent row on daemon restart — still
+/// bounded, still monotonic.
+#[derive(Debug)]
+pub struct OutboundCursor {
+    path: PathBuf,
+    state: Mutex<TailCursor>,
+}
+
+impl OutboundCursor {
+    /// Construct, seeding from disk if `path` exists. Missing / corrupt
+    /// file → zero cursor (re-forward everything from start; matches
+    /// [`load_cursor`] semantics).
+    pub fn load_from_disk(path: PathBuf) -> Arc<Self> {
+        let initial = load_cursor(&path);
+        Arc::new(Self {
+            path,
+            state: Mutex::new(initial),
+        })
+    }
+
+    /// Current in-memory position. Cheap to call (short lock); use
+    /// before each TG send for per-row dedup.
+    pub async fn current(&self) -> u64 {
+        self.state.lock().await.position
+    }
+
+    /// Monotonic advance. Returns `true` iff `new_pos` was strictly
+    /// greater than the prior position and was applied. Persists to
+    /// disk under the same lock so disk == memory after this call
+    /// returns. Persistence errors are logged but don't fail the
+    /// advance — the in-memory truth still moves forward.
+    pub async fn try_advance(&self, new_pos: u64) -> bool {
+        let mut guard = self.state.lock().await;
+        if new_pos <= guard.position {
+            return false;
+        }
+        guard.position = new_pos;
+        self.persist_locked(&guard);
+        true
+    }
+
+    /// Unconditional reset — `new_pos` may be smaller than the current
+    /// position. Used only when `drain_outboxes` detects truncation
+    /// (`turns.jsonl` shrunk below the cursor). Persists to disk.
+    pub async fn force_set(&self, new_pos: u64) {
+        let mut guard = self.state.lock().await;
+        guard.position = new_pos;
+        self.persist_locked(&guard);
+    }
+
+    /// Backing-file path (read-only — needed by tests / debug logs).
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn persist_locked(&self, cursor: &TailCursor) {
+        if let Some(parent) = self.path.parent() {
+            if let Err(err) = fs::create_dir_all(parent) {
+                tracing::warn!(
+                    error = %err,
+                    parent = %parent.display(),
+                    "imd: outbound cursor mkdir failed"
+                );
+                return;
+            }
+        }
+        let body = match serde_json::to_string(cursor) {
+            Ok(b) => b,
+            Err(err) => {
+                tracing::warn!(error = %err, "imd: outbound cursor serialize failed");
+                return;
+            }
+        };
+        if let Err(err) = fs::write(&self.path, body) {
+            tracing::warn!(
+                error = %err,
+                path = %self.path.display(),
+                "imd: outbound cursor persist failed (in-memory advance still in effect)"
+            );
+        }
+    }
+}
+
+/// Per-row scan output: parsed row plus the byte position **after**
+/// that row (i.e. where the next row would start). Used by both the
+/// fast-path dispatcher and `drain_outboxes` to dedup-check each row
+/// individually against [`OutboundCursor::current`] before sending.
+#[derive(Debug, Clone)]
+pub struct IndexedRow {
+    /// Parsed `turns.jsonl` row.
+    pub row: TurnRow,
+    /// Byte offset of the first byte AFTER this row's terminating
+    /// newline. Suitable as a [`TailCursor::position`] value once the
+    /// row has been confirmed delivered.
+    pub end_pos: u64,
+}
+
+/// Read every new line since `cursor.position`, returning each parsed
+/// row together with its post-row byte offset, plus the final cursor
+/// (= EOF at read time). Missing file → empty Vec. File shorter than
+/// `cursor.position` (truncation) → rewinds `start` to 0 and reads
+/// the whole file; callers should treat that as a truncation signal
+/// and call [`OutboundCursor::force_set`] before advancing.
+pub fn read_new_rows_indexed(
+    path: &Path,
+    cursor: &TailCursor,
+) -> Result<(Vec<IndexedRow>, TailCursor)> {
     if !path.exists() {
         return Ok((vec![], cursor.clone()));
     }
-    let mut f = fs::File::open(path)
-        .with_context(|| format!("open {}", path.display()))?;
+    let mut f = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let len = f.metadata()?.len();
-    // File truncated / replaced → rewind.
     let start = if cursor.position > len {
         0
     } else {
@@ -219,13 +351,23 @@ pub fn read_new_rows(path: &std::path::Path, cursor: &TailCursor) -> Result<(Vec
             continue;
         }
         match serde_json::from_str::<TurnRow>(trimmed) {
-            Ok(row) => rows.push(row),
+            Ok(row) => rows.push(IndexedRow {
+                row,
+                end_pos: consumed,
+            }),
             Err(err) => {
                 tracing::warn!(error = %err, line = %trimmed, "malformed turns.jsonl row; skipping");
             }
         }
     }
     Ok((rows, TailCursor { position: consumed }))
+}
+
+/// Backwards-compat wrapper — strips per-row positions. Kept so the
+/// existing test suite and any external callers still compile.
+pub fn read_new_rows(path: &Path, cursor: &TailCursor) -> Result<(Vec<TurnRow>, TailCursor)> {
+    let (indexed, end) = read_new_rows_indexed(path, cursor)?;
+    Ok((indexed.into_iter().map(|i| i.row).collect(), end))
 }
 
 /// V0.6.0 Wave 3 — push every assistant row in `rows` to `channel`
@@ -248,9 +390,9 @@ pub async fn forward_new_rows(
         if !should_forward(row, inbound_message_ids) {
             continue;
         }
-        let tail_age_ms = row.ts.map(|t| {
-            now_unix_ms().saturating_sub(t.timestamp_millis().max(0) as u128) as u64
-        });
+        let tail_age_ms = row
+            .ts
+            .map(|t| now_unix_ms().saturating_sub(t.timestamp_millis().max(0) as u128) as u64);
         let turn_id_log = row.turn_id.clone().unwrap_or_default();
         let mut msg = crate::transport::SendMessage::new(row.content.clone(), recipient);
         msg.thread_ts = row.thread_ts.clone();
@@ -443,5 +585,102 @@ mod tests {
         };
         assert!(should_forward(&assistant, &[]));
         assert!(!should_forward(&user, &[]));
+    }
+
+    // ── OutboundCursor: the synchronization primitive that closes the
+    //    fast-path × safety-net race ─────────────────────────────────
+
+    #[tokio::test]
+    async fn outbound_cursor_try_advance_is_monotonic() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("c.json");
+        let cur = OutboundCursor::load_from_disk(path.clone());
+        assert_eq!(cur.current().await, 0);
+        assert!(cur.try_advance(100).await);
+        assert_eq!(cur.current().await, 100);
+        // Smaller / equal advances are rejected — the cursor never rewinds.
+        assert!(!cur.try_advance(50).await);
+        assert!(!cur.try_advance(100).await);
+        assert_eq!(cur.current().await, 100);
+        // Larger advance applies.
+        assert!(cur.try_advance(200).await);
+        assert_eq!(cur.current().await, 200);
+        // Disk reflects the latest accepted value.
+        let on_disk = load_cursor(&path);
+        assert_eq!(on_disk.position, 200);
+    }
+
+    #[tokio::test]
+    async fn outbound_cursor_force_set_allows_rewind() {
+        // Truncation path: turns.jsonl was rotated to a smaller file
+        // and the cursor must reset below its current value. try_advance
+        // alone would refuse; force_set is the explicit escape hatch.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("c.json");
+        let cur = OutboundCursor::load_from_disk(path.clone());
+        assert!(cur.try_advance(500).await);
+        cur.force_set(40).await;
+        assert_eq!(cur.current().await, 40);
+        // Subsequent monotonic advance from the lower baseline works.
+        assert!(cur.try_advance(60).await);
+        assert_eq!(cur.current().await, 60);
+        let on_disk = load_cursor(&path);
+        assert_eq!(on_disk.position, 60);
+    }
+
+    #[tokio::test]
+    async fn outbound_cursor_concurrent_advance_converges_to_max() {
+        // Two writers (fast-path dispatcher + safety-net drain) racing
+        // against the same cursor must never produce a rewind. Spawn
+        // many interleaved try_advance calls and assert the final
+        // value is the max of all proposed positions.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("c.json");
+        let cur = OutboundCursor::load_from_disk(path.clone());
+
+        let mut tasks = Vec::new();
+        for n in (1u64..=50).rev() {
+            let c = cur.clone();
+            tasks.push(tokio::spawn(async move {
+                c.try_advance(n).await;
+            }));
+        }
+        for n in 1u64..=50 {
+            let c = cur.clone();
+            tasks.push(tokio::spawn(async move {
+                c.try_advance(n).await;
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        assert_eq!(cur.current().await, 50);
+        let on_disk = load_cursor(&path);
+        assert_eq!(on_disk.position, 50);
+    }
+
+    #[tokio::test]
+    async fn outbound_cursor_seeds_from_existing_disk_value() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("c.json");
+        save_cursor(&path, &TailCursor { position: 777 }).unwrap();
+        let cur = OutboundCursor::load_from_disk(path);
+        assert_eq!(cur.current().await, 777);
+    }
+
+    #[test]
+    fn indexed_rows_report_post_row_offsets() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("t.jsonl");
+        let body = "{\"role\":\"assistant\",\"content\":\"a\"}\n{\"role\":\"assistant\",\"content\":\"b\"}\n";
+        fs::write(&path, body).unwrap();
+        let (rows, end) = read_new_rows_indexed(&path, &TailCursor::default()).unwrap();
+        assert_eq!(rows.len(), 2);
+        // The first row's end_pos is the second row's start.
+        assert!(rows[0].end_pos > 0);
+        assert!(rows[0].end_pos < rows[1].end_pos);
+        // The last row's end_pos equals the final cursor (EOF).
+        assert_eq!(rows[1].end_pos, end.position);
+        assert_eq!(end.position as usize, body.len());
     }
 }

@@ -336,7 +336,7 @@ dependencies = [
 
 [[package]]
 name = "ccteam-cli"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "anyhow",
  "ccteam-core",
@@ -357,7 +357,7 @@ dependencies = [
 
 [[package]]
 name = "ccteam-core"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "ab_glyph",
  "anyhow",
@@ -387,7 +387,7 @@ dependencies = [
 
 [[package]]
 name = "ccteam-cost"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -397,7 +397,7 @@ dependencies = [
 
 [[package]]
 name = "ccteam-hooks"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "anyhow",
  "ccteam-core",
@@ -411,7 +411,7 @@ dependencies = [
 
 [[package]]
 name = "ccteam-imd"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -437,7 +437,7 @@ dependencies = [
 
 [[package]]
 name = "ccteam-web"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "anyhow",
  "askama",
