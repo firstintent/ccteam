@@ -1,10 +1,10 @@
-# ccteam V0.6.5 — V0.6 收尾:MCP 桥补全 + advise 落地 + UX cohesion + F113 验收补做
+# ccteam V0.6.5 — V0.6 收尾:MCP 桥补全 + advise 落地 + UX cohesion + 运维健壮性
 
-> **状态:doc-first / Wave 0**(本 PR 范围 = `README.md` + `prd.md` + `dev-plan.md`,代码 PR 走后续 Wave 1-3)。
-> **主题:** **关 V0.6 的账**。V0.6.0 立项时承诺的 chat-mode end-to-end onboarding(从 `/ccteam-creator` 跑下来到 TG 收回复)从未真正通过 ── 长期被「老用户手工补 registration 文件」掩盖,2026-05-23 nas-box005 的 Telegram duplicate flood 调研把 chain of root causes 全暴露出来。本版把 V0.6.0 Wave 2/3 应交未交的 MCP `chat_*` / `advise_*` 表面 + creator 注册桥 + advise vote + UX 决策树 + F113 验收 #5 (50-query intent test)一次合上。
+> **状态:doc-first / Wave 0**(本 PR 范围 = `README.md` + `prd.md` + `dev-plan.md` + `dev-kickoff.md`,代码 PR 走后续 Wave 1-4)。
+> **主题:** **关 V0.6 的账 + 关运维实战发现的账**。V0.6.0 立项时承诺的 chat-mode end-to-end onboarding(从 `/ccteam-creator` 跑下来到 TG 收回复)从未真正通过 ── 长期被「老用户手工补 registration 文件」掩盖,2026-05-23 nas-box005 的 Telegram duplicate flood 调研把整条 root-cause chain 全暴露出来,顺带发现 daemon 不响应 SIGINT/SIGTERM、claude-tui adapter 无法重附接已存在 tmux session 两个运维 blocker。本版把 V0.6.0 Wave 2/3 应交未交的 MCP `chat_*` / `advise_*` 表面 + creator 注册桥 + advise vote + UX 决策树 + F113 验收 #5 (50-query intent test) + 运维 robustness 双 finding 一次性合上。**所有 wave 必须在本版内完成,不留任何遗留给未来版本。**
 > **基线起点:** workspace `0.6.4` / test `1482 / 1`(V0.6.4 ship 数 + 那次 OutboundCursor PR 的 7 新测试)/ clippy `-D warnings` clean。
-> **基线目标:** workspace `0.6.5` / test ≥ `1530 / 1`(+48 估算,见各 Epic 验收)/ clippy `-D warnings` clean。
-> **痛点对应:** 13 用户痛点中 ── 痛点 4 (零摩擦上手)、痛点 5 (能否真正在 IM 闭环)、痛点 6 (跨 vendor 第二意见)、痛点 11 (Skill / 入口可发现性)。
+> **基线目标:** workspace `0.6.5` / test ≥ `1540 / 1`(+58 估算,见各 Epic 验收)/ clippy `-D warnings` clean。
+> **痛点对应:** 13 用户痛点中 ── 痛点 4 (零摩擦上手)、痛点 5 (能否真正在 IM 闭环)、痛点 6 (跨 vendor 第二意见)、痛点 9 (24/7 daemon 真能被运维)、痛点 11 (Skill / 入口可发现性)、痛点 14 (长跑可靠性)。
 
 ---
 
@@ -29,8 +29,10 @@
 |  | **F160** | CLAUDE.md §一 baseline 更新 + skill 状态注释清理 | S |
 |  | **F161** | `/ccteam` dispatcher 文案 drift sweep(6 处 stale Wave 1 fallback)| XS |
 |  | **F162** | F113 验收 #5 补做:50-query intent classifier accuracy test ≥90% | M |
+| **H — 运维健壮性**(P1,2026-05-23 实战发现)| **F163** | `ccteam start` 优雅响应 SIGINT/SIGTERM(关闭 tokio runtime + 清理 pidfile + 释放 web port + 关 tmux 子进程)| S |
+|  | **F164** | `claude-tui::start_thread` 自动重附接已存在 `ccteam-chat-<slug>-<role>` tmux session(daemon 重启不必人工 kill-session)| M |
 
-**总计** 17 finding · 3 Epic · 估算 9-12 工作日(单线作业)或 4-5 天(并行 worktree)。
+**总计** 19 finding · 4 Epic · 估算 10-13 工作日(单线作业)或 5 天(并行 worktree)。
 
 ---
 
@@ -40,10 +42,13 @@ V0.6.0 立项 PRD 里 F108 / F112 / F113 / F114 / F117 都明确承诺过 Wave 2
 
 - F113 验收 #5 "50-query intent classification ≥90%" 在 v0-6-0 PRD line 61 是 ship gate,Wave 4 doc-syncer 时没补、V0.6.1-V0.6.3 三个 patch 也都没补 ── 这是 V0.6.0 的欠债。
 - `/ccteam-creator` Phase 5.6 说 "call `ccteam_imd::register_bot(...)`" ── Rust 函数存在但**没人能从 Claude TUI 外部调到它**(没 MCP / 没 CLI 子命令)。这条桥从 V0.6.0 立项以来就是断的。
+- V0.6.4 OutboundCursor PR ship + nas-box005 真机部署过程中**实战发现**两个运维 blocker(F163 / F164):daemon 不响应任何 graceful shutdown 信号(只能 SIGKILL,丢 in-memory state、留孤儿 pidfile),`claude-tui::start_thread` 看到已存在的 ccteam tmux session 直接报错而不是 reattach(daemon 重启周期里 bot 永久失能,必须人工 `tmux kill-session`)。这些不是 V0.6.0 PRD 承诺的 ── 是 ship 后**首次真生产部署**才出现的。但运维不通,用户面 chat onboarding(F148)就无法完整 ship。
 
-把这些归到 V0.7.0 等于把"V0.6 闭环"主题往后推一个 minor。V0.6.5 单独 ship 这 17 条,让 V0.6 真正闭环,V0.7.0 才能干净地开新主题(国内 IM / monorepo `.mcp.json` / chat memory sync / 第 4 mode HumanApproval 深化)。
+把这些归到 V0.7.0 等于把"V0.6 闭环"主题往后推一个 minor。V0.6.5 单独 ship 这 19 条,让 V0.6 真正闭环,V0.7.0 才能干净地开新主题(国内 IM / monorepo `.mcp.json` / chat memory sync / 第 4 mode HumanApproval 深化)。
 
 **与 CLAUDE.md §五 "pre-v1.0 不留技术债" 原则一致** ── 不写 backward-compat shim、不留 deprecated alias;workflow.yaml / registry schema 直接前进。
+
+**Strict no-wave-leftover 规矩**(本版自我加严):Wave 1-4 任何 finding 验收不过 → block 本版 ship,不允许 "下版本再补"。要么 finding 在本版做完,要么 finding 主动 EOL 删除。
 
 ---
 
@@ -54,7 +59,9 @@ V0.6.0 立项 PRD 里 F108 / F112 / F113 / F114 / F117 都明确承诺过 Wave 2
 | 4 (零摩擦上手) | F157 / F158 / F159 | `ccteam-scan --quick` 是新用户 60 秒看到 value 的零依赖路径;决策树替代 mode/preset/recipe 三层认知 |
 | 5 (IM 闭环) | F146 / F147 / F148 / F151 | chat MCP 桥补全后,**从未跑通**的 `/ccteam-creator → daemon → TG` end-to-end 第一次真正可重现 |
 | 6 (跨 vendor 第二意见) | F152 / F153 / F154 / F155 | advise vote / parallel MCP 真实现,Codex auto-critic 验证 |
+| 9 (24/7 daemon 可运维) | F163 / F164 | SIGINT/SIGTERM 优雅退出;daemon 重启自动 reattach tmux,无需人工 `tmux kill-session` |
 | 11 (Skill / 入口可发现性) | F149 / F158 / F160 / F161 | 用户面文档 + dispatcher 文案对齐当前真实状态;F113 验收 #5 补做让"分类准"有数字 |
+| 14 (长跑可靠性) | F163 / F164 / F162 | 配合 9:graceful restart 让 chat bot 真能 7x24 跑;intent 准确度有 baseline 数字 |
 
 ---
 
@@ -66,8 +73,8 @@ V0.6.0 立项 PRD 里 F108 / F112 / F113 / F114 / F117 都明确承诺过 Wave 2
 | `progress.jsonl` 是唯一 state SoT | F146-F151 不写 progress | bot lifecycle 事件由 BotSupervisor 自己写 progress,MCP 工具不直接写 |
 | No prompt injection | F147 `chat_send_input` 写 mailbox 文件 | mailbox 是已有路径,与 inbox 同级别处理;不向 tmux pane 直接 send-keys system prompt |
 | 每次 spawn = fresh 1M context(bg 模式) | 不触及 | chat 模式 spawn 复用 context 是 feature(CLAUDE.md §三 原文) |
-| 永不主动 kill 长 session | F146-F151 不 kill | `chat_lifecycle.stop` 走 graceful `close_thread`;`chat_reset` 同 |
-| 不解析 tmux 终端输出 | 不触及 | F147 走 mailbox 写文件,不 scrape |
+| 永不主动 kill 长 session | F146-F151 不 kill;**F163 graceful shutdown 也守** | `chat_lifecycle.stop` / `chat_reset` 走 graceful `close_thread`;F163 SIGTERM handler 走 watch::channel cancel + 等 task graceful drop,**不直接 kill tmux**(tmux session 由 user 决定;daemon stop ≠ bot session stop)|
+| 不解析 tmux 终端输出 | 不触及 | F147 走 mailbox 写文件;**F164 reattach 用 `tmux has-session -t <name>` 退出码探测,不读 pane content** |
 | fix-loop 撞 3 次必 escalate | 不触及 | 本版无 fix-loop 改 |
 | `ccteam-core` 零 team 名字面量 | 不触及 | 本版 ccteam-core 改动仅在 cli / imd / mcp 层 |
 | 跨项目记忆走官方接口 | 不触及 | 本版不改 `~/.claude/CLAUDE.md` / `~/.codex/AGENTS.md` 处理 |
@@ -100,15 +107,18 @@ V0.6.0 立项 PRD 里 F108 / F112 / F113 / F114 / F117 都明确承诺过 Wave 2
 
 ## 5. Ship gate(V0.6.5 → main)
 
-1. **baseline**:`cargo test --workspace --locked --no-fail-fast` ≥ **1530 / 1**(1482 起点 + 各 finding 验收测试)
+1. **baseline**:`cargo test --workspace --locked --no-fail-fast` ≥ **1540 / 1**(1482 起点 + 各 finding 验收测试)
 2. **clippy**:`cargo clippy --workspace --all-targets --locked -- -D warnings` 0 命中
 3. **`/ccteam-creator` end-to-end**:fresh machine + 零手工写文件 → `/ccteam-creator "做个 TG 助理"` → `go` → daemon 起 → TG 双向通(测试人确认)
 4. **F113 验收 #5 数字**:`scripts/host-probe/intent-accuracy.sh` 输出 ≥ 90% accuracy + confusion matrix 落 `docs/versions/v0-6-5/intent-accuracy.md`
-5. **tier-1 docs 文案 grep**:
+5. **F163 graceful shutdown 验证**:`ccteam start` 收 SIGTERM → 5s 内退出(进程消失)+ pidfile 自动 unlink + web port 7331 立即释放 + 无 zombie 子进程;**有自动化 test 覆盖**(`crates/ccteam-cli/tests/graceful_shutdown_test.rs`)
+6. **F164 tmux reattach 验证**:create 一个 `ccteam-chat-foo-bar` tmux session,跑 `start_thread(slug=foo, role=bar)` → 不报错 + 复用同 session pid(`tmux list-sessions -F "#{session_id}"` 前后一致)
+7. **tier-1 docs 文案 grep**:
    - `grep -rn "Wave [123]\|wave2-not-ready\|Wave 3.*未落地" skills/*/SKILL.md` 全 0 命中
    - `grep -rn "mode:.*chat\|preset:.*chat-pocket" docs/{quickstart,user-manual}.md README.md` 全 0 命中(决策树取代,内部架构词汇下沉到 docs/advanced/)
-6. **CLAUDE.md §一 baseline 表更新到 V0.6.5 数字** + §四 skill 状态注释清理
-7. **`cargo run --release -- doctor`** 输出含 "MCP tool surface: 26 active, 0 stubs"(原 9 个 stub 全实现)
+8. **CLAUDE.md §一 baseline 表更新到 V0.6.5 数字** + §四 skill 状态注释清理
+9. **`cargo run --release -- doctor`** 输出含 "MCP tool surface: 26 active, 0 stubs"(原 9 个 stub 全实现)
+10. **F148 / F157 / F162 / F163 / F164 host-probe 全部签字**(`docs/versions/v0-6-5/host-probe.md` 收齐每条 finding 一行 OK/Fail + log path)
 
 ---
 
@@ -119,30 +129,37 @@ V0.6.0 立项 PRD 里 F108 / F112 / F113 / F114 / F117 都明确承诺过 Wave 2
 ```
 Wave 0  doc-first(本 PR)
         ├── README.md           ← 本文件
-        ├── prd.md              ← 17 finding 完整需求
-        └── dev-plan.md         ← worktree-per-epic + acceptance gate
+        ├── prd.md              ← 19 finding 完整需求
+        ├── dev-plan.md         ← worktree-per-finding + acceptance gate
+        └── dev-kickoff.md      ← 新会话开发提示词(主会话 agent-team / subagent 模式)
 
-Wave 1  Epic E(MCP chat 桥 + creator)── P0 解今晚 flood 真因
-        worktree-per-finding F146-F151,串行依赖 F146 → F148
+Wave 1  Epic E(MCP chat 桥 + creator)+ Epic H(运维健壮性)── P0
+        worktree-per-finding F146-F151 + F163 + F164,7 个 worktree 并行
+        串行依赖:F146 → F148;F163/F164 独立可并行
 
-Wave 2  Epic F(advise + Codex critic)── 并行
+Wave 2  Epic F(advise + Codex critic)
         worktree-per-finding F152-F156,F152/F153 可并行
 
 Wave 3  Epic G(UX cohesion + F113 验收)
-        F157-F160 并行;F161 文案 sweep;F162 intent fixture + 跑 + 报告
+        F157-F162 全并行
 
 Wave 4  doc-syncer + host-probe + ship gate
         CLAUDE.md baseline 回填 + tier-1 docs 同步 + version bump 0.6.4 → 0.6.5
+        nas-box005 真机跑 F148/F157/F162/F163/F164 host-probe,签字落
+        docs/versions/v0-6-5/host-probe.md
 ```
 
 每 Wave PR 必须 baseline ≥ 上 Wave 数字 + clippy 0 警告,否则不发。
+
+**Strict no-wave-leftover**:本版**不允许**把任何 finding 推到 V0.6.6 / V0.7。验收不过的 finding → 主会话 escalate 给用户 → 当场决策(继续做 / 主动 EOL 删除),不写 "TODO ship in V0.6.6"。
 
 ---
 
 ## 7. Doc-first 完成判据(本 PR 验收)
 
 - [ ] `README.md`(本文件)落
-- [ ] `prd.md` 17 finding 各章节完整(痛点 / 现状缺口 / 设计 / 文件 / 验收 / 风险)
+- [ ] `prd.md` 19 finding 各章节完整(痛点 / 现状缺口 / 设计 / 文件 / 验收 / 风险)
 - [ ] `dev-plan.md` 含 4 Wave + worktree 分配 + acceptance gate
+- [ ] `dev-kickoff.md` ── 新会话开发提示词,要求用 agent-team / subagent 防主会话 context 膨胀
 - [ ] CLAUDE.md `§一 当前状态` 表 `当前最新版` 行**暂不动**(代码 ship 后回填)
-- [ ] 用户 review pass → merge → Wave 1 kick-off
+- [ ] 用户 review pass → merge → 新会话执行 Wave 1-4

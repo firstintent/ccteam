@@ -1,8 +1,10 @@
-# V0.6.5 — Dev Plan(4 Wave / worktree-per-finding)
+# V0.6.5 — Dev Plan(4 Wave / worktree-per-finding · 19 finding · 4 Epic)
 
-> **Plan-first 原则**(CLAUDE.md §五):本文件 + `README.md` + `prd.md` user review pass 后才进 Wave 1。
+> **Plan-first 原则**(CLAUDE.md §五):本文件 + `README.md` + `prd.md` + `dev-kickoff.md` user review pass 后才进 Wave 1。
 > **Pre-v1.0 不留技术债**:`workflow.yaml` / BotRegistration / MCP tool schema 直接前进;移除 `chat_lifecycle` STUB 时**不留 deprecated alias**;旧 user 手工 poke 的 registry JSON 文件 schema 不变,自然兼容。
 > **多 session 并行**:worktree-per-finding,主仓 `main` 不变 dirty;每 Wave 完成 PR 提交后再开下 Wave。
+> **Strict no-wave-leftover**:任何 finding 验收不过 ── 主会话 escalate 给用户 → 当场决策(继续做 / 主动 EOL 删除),**禁止**写 "TODO ship in V0.6.6 / V0.7"。本版收账,不开新账。
+> **执行模型**:主会话用 agent-team / Task subagent 派工各 worktree,主会话只做 dispatch + acceptance gate 验,不读各 worktree 实现细节,防 context 膨胀。详 `dev-kickoff.md`。
 
 ---
 
@@ -15,9 +17,9 @@
 
 ---
 
-## Wave 1 — Epic E:MCP chat 桥 + creator 通路(P0)
+## Wave 1 — Epic E(MCP chat 桥 + creator)+ Epic H(运维健壮性)(P0)
 
-**目标**:V0.6.0 立项就承诺、从未真正交付的 `/ccteam-creator` end-to-end onboarding 这次走通。今晚 2026-05-23 Telegram duplicate flood 的最深 root cause 关上。Wave 1 完成后第一次:fresh machine + 零手工编辑 → `/ccteam-creator` → daemon → TG 收回复。
+**目标**:V0.6.0 立项就承诺、从未真正交付的 `/ccteam-creator` end-to-end onboarding 这次走通,同时关掉 2026-05-23 nas-box005 实战发现的两条运维 blocker(SIGTERM 不响应 + tmux session 不 reattach)。Wave 1 完成后第一次:fresh machine + 零手工编辑 → `/ccteam-creator` → daemon → TG 收回复;daemon restart 周期里 bot 自动 reattach 老 tmux 不失能。
 
 ### 串行 + 并行依赖
 
@@ -27,9 +29,11 @@ F146 (register/list/unregister MCP)
 F148 (creator Phase 5.6 真调 F146)  ──┐
 F151 (remove --purge 也清 registry)  ──┴── 各自 worktree,F148/F151 可并行
   ↓
-F147 (send_input/history/reset MCP)  ── 独立 worktree(可与 F148/F151 并行)
+F147 (send_input/history/reset MCP)  ── 独立(可与 F148/F151 并行)
 F149 (/ccteam dispatcher 文案 sweep) ── 独立(F146 ship 后才动)
 F150 (/ccteam-control 接 admin_*)    ── 独立(全 wave 任何时点都可启)
+F163 (SIGINT/SIGTERM graceful)       ── 独立(完全不动 chat 路径)
+F164 (claude-tui reattach)           ── 独立(完全不动 MCP 路径)
 ```
 
 ### 工作树分配
@@ -41,20 +45,25 @@ F150 (/ccteam-control 接 admin_*)    ── 独立(全 wave 任何时点都可�
 | W1-T3 `creator-bridge` | `v065-w1-creator-bridge` | **F148** + **F151** | (F148) `/ccteam-creator` SKILL.md Phase 5.6/5.9 文案改 + e2e_creator_full_path_test.rs (stub TG/claude);(F151) `cmd_remove::purge` 加 `imd/registry/<slug>/` + 优先 MCP unregister fallback fs delete | 1.5 d |
 | W1-T4 `dispatcher-sweep` | `v065-w1-dispatcher-sweep` | **F149** | `skills/ccteam/SKILL.md` 6 处 stale Wave 1 fallback 删除;intent table 描述对齐当前实状态 | 0.5 d |
 | W1-T5 `control-admin-smoke` | `v065-w1-control-admin` | **F150** | audit `skills/ccteam-control/SKILL.md` MCP 调用 + 6 个 admin_* smoke test + `docs/user-manual.md` admin 段 | 1 d |
+| W1-T6 `graceful-shutdown` | `v065-w1-graceful-shutdown` | **F163** | `run_start` 加 `tokio::signal::ctrl_c()` + SIGTERM listener + watch::channel cancel + 5s timeout abort + pidfile unlink + 不 kill tmux 子进程;`graceful_shutdown_test.rs` 子进程 spawn + kill -TERM + 5s 验 ps clear | 1 d |
+| W1-T7 `tmux-reattach` | `v065-w1-tmux-reattach` | **F164** | `claude_tui::start_thread` 加 "session exists → 健康检查 → reattach OR recreate dead";`TmuxSession::list_pane_pids()` + `kill()` helpers;两个 test case(alive reattach / dead recreate);**不**改 `resume_thread` | 1.5 d |
 
-**并行**:T1 / T4 / T5 三人 day1 同时起;T2 day1 等 T1 框架定下来(共享 mcp_chat_tools.rs 文件);T3 day2 等 T1 PR merge 后启(依赖 chat_register_bot MCP)。
+**并行**:T1 / T4 / T5 / T6 / T7 day1 同时起;T2 day1 等 T1 框架定下来(共享 mcp_chat_tools.rs 文件);T3 day2 等 T1 PR merge 后启(依赖 chat_register_bot MCP)。
 
 ### Wave 1 PR 合入顺序
 
-1. **T1 F146** → merge first(基础设施)
-2. **T2 F147** + **T3 F148+F151** + **T4 F149** + **T5 F150** → 并行 PR,各自 review pass 后 merge
+1. **T1 F146** → merge first(基础设施,F147/F148/F151 都依赖)
+2. **T6 F163** + **T7 F164** + **T4 F149** + **T5 F150** → 并行 PR,各自 review pass 后 merge(都不依赖 T1)
+3. **T2 F147** + **T3 F148+F151** → 并行 PR(F148 依赖 T1)
 
 ### Wave 1 验收
 
-- `cargo test --workspace --locked --no-fail-fast` ≥ **1506 / 1**(1482 + 24 新测试估算)
+- `cargo test --workspace --locked --no-fail-fast` ≥ **1516 / 1**(1482 + 34 新测试:F146 +6 / F147 +8 / F148 +2 / F150 +6 / F151 +2 / F163 +4 / F164 +6)
 - clippy `-D warnings` clean
-- F148 e2e_creator_full_path_test.rs 通过(stub adapter)
-- **真机 host-probe**(nas-box005,fresh wipe):走通 `/ccteam-creator` + TG round-trip,**手动签字** → `docs/versions/v0-6-5/wave-1-handoff.md`
+- F148 `e2e_creator_full_path_test.rs` 通过(stub adapter)
+- F163 `graceful_shutdown_test.rs` 通过
+- F164 `claude_tui_reattach_test.rs`(alive + dead 双 case)通过
+- **真机 host-probe**(nas-box005,fresh wipe):走通 `/ccteam-creator` + TG round-trip + SIGTERM graceful + tmux reattach,**手动签字** → `docs/versions/v0-6-5/wave-1-handoff.md`
 - 每 PR 描述含 `prd.md` finding 链接 + verification log + `git push -u origin <branch>`(per V0.6 学到的陷阱)
 
 ### Wave 1 handoff 文档
@@ -87,7 +96,7 @@ F150 (/ccteam-control 接 admin_*)    ── 独立(全 wave 任何时点都可�
 
 ### Wave 2 验收
 
-- baseline ≥ **1524 / 1**(1506 + 18 新测试)
+- baseline ≥ **1534 / 1**(1516 + 18 新测试)
 - clippy clean
 - F152 真路径(Codex installed)+ Codex-unavailable path 双 e2e
 - `ccteam doctor --check-codex-auto-critic` exit code 行为正确
@@ -114,7 +123,7 @@ F150 (/ccteam-control 接 admin_*)    ── 独立(全 wave 任何时点都可�
 
 ### Wave 3 验收
 
-- baseline ≥ **1530 / 1**(1524 + 6 新测试)
+- baseline ≥ **1540 / 1**(1534 + 6 新测试)
 - clippy clean
 - F162 `intent-accuracy.md` 落,accuracy ≥ **0.90**(< 0.90 不阻 ship 但单独 finding 跟)
 - F157 `ccteam-scan --quick` 在 sample repo 90s 内出报告(host-probe)
@@ -145,12 +154,15 @@ F150 (/ccteam-control 接 admin_*)    ── 独立(全 wave 任何时点都可�
 
 ### Wave 4 ship gate(per README §5,prd.md §Ship gate)
 
-merge 前 8 项全 ✓:
+merge 前 11 项全 ✓:
 
-- [ ] cargo test ≥ 1530 / 1
+- [ ] cargo test ≥ **1540 / 1**
 - [ ] clippy `-D warnings` clean
 - [ ] F148 host-probe(nas-box005 fresh)pass + 手动签字
+- [ ] F157 host-probe(`scan --quick` ≤90s 出报告)pass + 手动签字
 - [ ] F162 intent-accuracy.md ≥ 0.90
+- [ ] F163 host-probe(`kill -TERM` 5s graceful)pass + 手动签字
+- [ ] F164 host-probe(daemon restart reattach)pass + 手动签字
 - [ ] tier-1 docs grep clean
 - [ ] CLAUDE.md §一 baseline 表更新
 - [ ] `ccteam doctor` 报告 MCP "26 active, 0 stubs"
@@ -163,13 +175,14 @@ merge 前 8 项全 ✓:
 | Wave | Teammates | Calendar days | 累计 baseline 增量 |
 |---|---|---|---|
 | 0 (doc-first) | 1 | 0.5 | — |
-| 1 (Epic E) | 5 parallel | 2.5 (T1 + T2/T3 后续) | +24 测试 → 1506/1 |
-| 2 (Epic F) | 3 parallel | 2 | +18 测试 → 1524/1 |
-| 3 (Epic G) | 4 parallel | 2 | +6 测试 → 1530/1 |
-| 4 (doc-syncer) | 1 | 1 | — |
-| **总计** | 5 peak / 13 unique role | **8 calendar days** | **+48 测试** |
+| 1 (Epic E + Epic H) | 7 parallel | 2.5 (T1 + T2/T3 后续) | +34 测试 → 1516/1 |
+| 2 (Epic F) | 3 parallel | 2 | +18 测试 → 1534/1 |
+| 3 (Epic G) | 4 parallel | 2 | +6 测试 → 1540/1 |
+| 4 (doc-syncer + host-probe) | 1 | 1 | — |
+| **总计** | 7 peak / 15 unique worktree role | **8 calendar days** | **+58 测试** |
 
-**单线作业** estimate:9-12 天(无 worktree 并行)。
+**单线作业** estimate:10-13 天(无 worktree 并行)。
+**主会话 + agent-team 并行 estimate**:5 calendar days(主会话不读 worktree 实现,只 dispatch + verify)。
 
 ---
 
