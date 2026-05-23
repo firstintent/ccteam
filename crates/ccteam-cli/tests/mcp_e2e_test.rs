@@ -3,11 +3,13 @@
 //!
 //! Confirms the wire contract that interfaces.md §12 promises:
 //! - `initialize` returns `protocolVersion` + `tools` capability;
-//! - `tools/list` enumerates exactly 26 tools, all `ccteam__*`
+//! - `tools/list` enumerates exactly 27 tools, all `ccteam__*`
 //!   (M2.5 shipped 9; V0.2.2 F38 added `ccteam__screenshot` → 10;
 //!   V0.4.0 F65 added 7 workflow tools → 17; V0.6.0 Wave 1 F111
 //!   added 5 chat stubs + 2 advise stubs → 24; V0.6.1 F128 adds
-//!   2 admin mutators → 26);
+//!   2 admin mutators → 26; V0.6.5 F146 swapped `chat_lifecycle`
+//!   stub for `chat_register_bot` + `chat_unregister_bot` real
+//!   tools → 27);
 //! - `tools/call ccteam__admin_ls` returns a JSON-encoded projects list as
 //!   the first content[].text;
 //! - V0.4.0 F65 `tools/call` smokes for the 7 new workflow tools
@@ -122,8 +124,10 @@ fn mcp_serve_tools_list_returns_full_tool_set() {
     // a total of 10. V0.4.0 F65 added 7 workflow-control tools for a
     // total of 17. V0.6.0 Wave 1 F111 added 5 chat stubs + 2 advise
     // stubs for a total of 24. V0.6.1 F128 adds 2 admin mutators
-    // (`change_persona` + `add_tool`) for a total of 26. Bump this
-    // when a new tool lands.
+    // (`change_persona` + `add_tool`) for a total of 26. V0.6.5 F146
+    // swapped the `chat_lifecycle` stub for `chat_register_bot` +
+    // `chat_unregister_bot` real tools (no deprecated alias) → 27.
+    // Bump this when a new tool lands.
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().join("home");
     let projects = tmp.path().join("projects");
@@ -141,8 +145,8 @@ fn mcp_serve_tools_list_returns_full_tool_set() {
     let tools = resp["result"]["tools"].as_array().unwrap();
     assert_eq!(
         tools.len(),
-        26,
-        "M2.5 9 + V0.2.2 F38 screenshot + V0.4.0 F65 7-tool workflow surface + V0.6.0 Wave 1 (5 chat + 2 advise stubs) + V0.6.1 F128 (2 admin mutators)"
+        27,
+        "M2.5 9 + V0.2.2 F38 screenshot + V0.4.0 F65 7-tool workflow surface + V0.6.0 Wave 1 (5 chat + 2 advise stubs) + V0.6.1 F128 (2 admin mutators) + V0.6.5 F146 (chat -1/+2 net +1)"
     );
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     for required in [
@@ -165,9 +169,12 @@ fn mcp_serve_tools_list_returns_full_tool_set() {
         "ccteam__workflow_set_parallelism",
         "ccteam__workflow_trigger_gate",
         "ccteam__workflow_get_artifact_summary",
-        // V0.6.0 Wave 1 (F111) chat stubs.
+        // V0.6.0 Wave 1 (F111) chat group — V0.6.5 F146 swapped
+        // `chat_lifecycle` STUB for `chat_register_bot` +
+        // `chat_unregister_bot` real tools (no deprecated alias).
         "ccteam__chat_send_input",
-        "ccteam__chat_lifecycle",
+        "ccteam__chat_register_bot",
+        "ccteam__chat_unregister_bot",
         "ccteam__chat_session_reset",
         "ccteam__chat_list_bots",
         "ccteam__chat_show_turn_log",
@@ -180,6 +187,11 @@ fn mcp_serve_tools_list_returns_full_tool_set() {
     ] {
         assert!(names.contains(&required), "missing tool: {required}");
     }
+    // V0.6.5 F146 — removed without alias.
+    assert!(
+        !names.contains(&"ccteam__chat_lifecycle"),
+        "chat_lifecycle was removed in V0.6.5 F146 (no deprecated alias per CLAUDE.md §五 #4)"
+    );
     // Schema sanity: every tool must declare `inputSchema.type=object`.
     for tool in tools {
         assert_eq!(

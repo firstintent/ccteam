@@ -18,7 +18,11 @@
 //! V0.6.1 F128 grows admin group 1 → 3 (`change_persona` +
 //! `add_tool` real implementations).
 //!
-//! Total: 26 tools registered (V0.6.1). Disabling a group hides every
+//! V0.6.5 F146 swaps the `chat_lifecycle` STUB for real
+//! `chat_register_bot` + `chat_unregister_bot` tools (no deprecated
+//! alias — CLAUDE.md §五 #4) growing the chat group 5 → 6.
+//!
+//! Total: 27 tools registered (V0.6.5). Disabling a group hides every
 //! tool in that group from `tools/list`; `tools/call` against a
 //! disabled tool falls through to the standard "unknown tool" error.
 
