@@ -5,7 +5,7 @@ description: "One-time IM token onboarding for ccteam chat bots. Walks the user 
 
 # /ccteam-im-setup — one-time IM token onboarding
 
-V0.6.0 Wave 2 F117. Standalone skill that any other skill (notably
+Shipped via F117 (V0.6.0). Standalone skill that any other skill (notably
 `ccteam-creator` Phase 5.1) can invoke to make sure
 `~/.ccteam/im/credentials.json` has the platform the rest of the
 flow needs. **Idempotent** — re-running for a platform that's

@@ -218,7 +218,7 @@ Windows 无 POSIX symlink → 副本 + git pre-commit hook 守同步(`scripts/sy
 |---|---|---|
 | **模式 1 in-proc team(同 parent session)** | ✗ **永远不可能** | Anthropic 官方 `TeamCreate` 文档明示 "workers are Claude sessions";Codex 同理只能 spawn Codex 子 thread。**没有任何技术路径**让一个 Claude session 把 Codex 作 in-proc teammate。详 prd CC9 |
 | **模式 2 bg sessions 跨 vendor** | ✓ | ccteam orchestrator 是外置中转;`.ccteam/inbox/*.md` 触发 fresh `claude --bg` / `codex exec`;`progress.jsonl::agent_done.vendor` 字段区分 |
-| **模式 3 chat bots 跨 vendor**(同 TG 群)| V0.7+ | V0.6.0 chat mode 锁 Claude(F108);Codex chat 需 F112 wave 3 `CodexAppServerAdapter` |
+| **模式 3 chat bots 跨 vendor**(同 TG 群)| V0.7+ | V0.6.0 chat mode 锁 Claude(F108);Codex chat 需 F112 `CodexAppServerAdapter`(已 ship V0.6.0) |
 | **Auto-fallback Claude↔Codex**(同任务自动切)| ⚠ opt-in only | 场景 C,默认 off;两边 system prompt 不同 + sandbox 不同 + cost model 不同,**自动切换会让 debug 极难找根因** — 用户显式开 |
 
 #### Cross-vendor 桥协议(mode 2 跨 vendor 时)
@@ -238,7 +238,7 @@ Windows 无 POSIX symlink → 副本 + git pre-commit hook 守同步(`scripts/sy
 |---|---|---|
 | Chaining × mode 1 × Codex | ⚠ | Codex 原生 `spawn_agent` 但 ccteam-team skill 是 Claude session-local — 跨 vendor in-proc 不可行(CC9) |
 | Chaining × mode 2 × Codex | ✓ | `codex exec` artifact-driven,行为对齐 Claude |
-| Chaining × mode 3 × Codex | ✗(V0.6.0) | 需 `CodexAppServerAdapter`,F112 wave 3 |
+| Chaining × mode 3 × Codex | ✗(V0.6.0) | 需 `CodexAppServerAdapter`,F112(已 ship V0.6.0) |
 | Routing × all × Codex | ⚠ | Codex routing config-driven(role.toml 选模型),跟 Claude SKILL.md prompt-driven routing **不等价**;用户面统一走 `ccteam-creator` 自动选,内部 routing 各管各 |
 | Parallel-vote × mode 1 × Codex | ✓ | 场景 A `/ccteam-advise` 头条用例 |
 | Parallel-segment × mode 2 × mixed | ✓ | git worktree per agent,vendor 标在 progress event |
@@ -247,7 +247,7 @@ Windows 无 POSIX symlink → 副本 + git pre-commit hook 守同步(`scripts/sy
 | Evaluator-Optimizer × mode 1 × mixed | ✗ | 同 CC9 |
 | **In-proc 跨 vendor 任意 cell** | ✗ **永远** | 物理不可能 |
 
-**总计 30 cell 状态**:✓ 11 / ⚠ 2 / ✗ 4(mode 1 跨 vendor 全 ✗,共 5 cell;mode 3 Codex 单 vendor V0.6.0 共 5 cell ✗ 等 Wave 3);其余 V0.6.0 不展开。
+**总计 30 cell 状态**:✓ 11 / ⚠ 2 / ✗ 4(mode 1 跨 vendor 全 ✗,共 5 cell;mode 3 Codex 单 vendor V0.6.0 共 5 cell ✗ 已 ship via F112);其余 V0.6.0 不展开。
 
 ---
 

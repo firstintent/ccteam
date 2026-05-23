@@ -94,7 +94,7 @@ kind 决策:
 
 **这一步禁止调 `TeamCreate` / `Task`** — 等用户回复。
 
-### 3.5 Codex critic teammate(V0.6.0 Wave 3 F112 §D — 当 N ≥ 3 时自动加入)
+### 3.5 Codex critic teammate(F112 §D — 当 N ≥ 3 时自动加入)
 
 When the parsed team size `N ≥ 3`, ccteam-team probes for the Codex
 CLI **once** per `/ccteam-team` invocation:
@@ -147,15 +147,14 @@ against a stub codex via `$CCTEAM_CODEX_BIN`.
 
 **Daemon-routed variant (deferred)**: routing this spawn through the
 daemon's `CodexExecAdapter` (so cost accounting is unified with the
-F84 budget rollup) is a follow-up to F112 §D. It is **explicitly
-deferred** past V0.6.5 — the daemon-side `mcp__ccteam__advise_*`
-dispatch is still a `NotImplemented` stub on `main` (F152/F153 land
-its real impl in V0.6.5 Wave 2 parallel, but cost-accounting + the
-team-3-reviewer routing on top sits behind that landing). Track in
-the V0.7 epic backlog.
+F84 budget rollup) is a follow-up to F112 §D. The daemon-side
+`mcp__ccteam__advise_*` dispatch shipped via F152/F153 in V0.6.5;
+unifying the team-3-reviewer routing through it (with cost-accounting
+on top) is **explicitly deferred** to V0.7+ and tracked in the
+backlog.
 
 If `ccteam-imd` daemon is running and exposes
-`mcp__ccteam__advise_parallel` (V0.6.5 F153 onwards), the skill MAY
+`mcp__ccteam__advise_parallel` (shipped F153, V0.6.5), the skill MAY
 prefer that path instead — daemon-side cost rollup + persistent log.
 Detection: a previous turn in this session must have registered the
 MCP tool; otherwise stay on the direct Bash spawn.
@@ -310,7 +309,7 @@ ccteam start                        # 启 daemon(可选,纯 web 可视化用)
 ## Where to look in the repo
 
 - `@docs/versions/v0-5-0/prd.md` §F93a — 本 skill 设计 SoT
-- `@docs/versions/v0-5-0/dev-plan.md` Wave 1 — 实施细节
+- `@docs/versions/v0-5-0/dev-plan.md` §"Primary path 闭环" — 实施细节
 - `@CLAUDE.md` §三 — 架构红线
 - `@skills/ccteam-control/SKILL.md` — sibling skill(管 daemon)
 - `@skills/ccteam-creator/SKILL.md` — sibling skill(创 workflow / 项目)
