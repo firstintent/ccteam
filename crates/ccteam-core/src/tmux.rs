@@ -137,6 +137,34 @@ impl TmuxSession {
         Ok(())
     }
 
+    /// F164 — Return the PIDs of all panes in this session via
+    /// `tmux list-panes -t <name> -F "#{pane_pid}"`.
+    ///
+    /// Returns an empty `Vec` when the session doesn't exist, has no
+    /// panes, or the invocation fails. Never panics.
+    ///
+    /// **Red line**: only pane PID numbers are extracted; no pane text
+    /// content is read. This is an allowed metadata query distinct from
+    /// the banned `tmux capture-pane` (CLAUDE.md §三).
+    pub fn list_pane_pids(&self) -> Vec<u32> {
+        if !self.exists() {
+            return vec![];
+        }
+        let Ok(output) = Command::new("tmux")
+            .args(["list-panes", "-t", &self.name, "-F", "#{pane_pid}"])
+            .output()
+        else {
+            return vec![];
+        };
+        if !output.status.success() {
+            return vec![];
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+            .collect()
+    }
+
     /// `tmux kill-session -t <name>`. Tolerates a missing session
     /// (returns Ok) so callers can use `kill` as idempotent cleanup.
     pub fn kill(&self) -> Result<()> {
