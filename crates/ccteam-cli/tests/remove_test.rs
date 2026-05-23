@@ -493,3 +493,164 @@ fn t06_force_overrides_refusal() {
         "config.yaml::projects must drop the slug under --force",
     );
 }
+
+// ─────────────────────────── V0.6.5 F151 ────────────────────────────
+//
+// `ccteam remove <slug> --purge` must also clean
+// `~/.ccteam/imd/registry/<slug>/` (registration JSON + heartbeat
+// sidecars). Without `--purge` the registry stays put so a re-init
+// of the same slug can resume the existing chat bots.
+
+/// Seed an imd/registry/<slug>/<role>.json + matching heartbeat
+/// sidecar — mirrors the on-disk shape F146's `register_bot_checked_in`
+/// produces.
+fn seed_imd_registry(fx: &Fixture, role: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    use ccteam_core::harness::AgentVendor;
+    let outcome = ccteam_imd::register_bot_checked_in(
+        &fx.ccteam_home,
+        &fx.slug,
+        role,
+        AgentVendor::Claude,
+        "telegram",
+        "42",
+        Some(role),
+    )
+    .expect("seed registry");
+    let reg_path = match outcome {
+        ccteam_imd::RegisterOutcome::Registered(p) => p,
+        ccteam_imd::RegisterOutcome::AlreadyRegistered(p) => p,
+    };
+    // Drop a heartbeat sidecar so we can assert it gets cleaned too.
+    let hb = ccteam_imd::bot_heartbeat_path_in(&fx.ccteam_home, &fx.slug, role);
+    std::fs::write(&hb, chrono::Utc::now().to_rfc3339()).unwrap();
+    assert!(reg_path.exists(), "fixture: registration JSON seeded");
+    assert!(hb.exists(), "fixture: heartbeat seeded");
+    (reg_path, hb)
+}
+
+#[test]
+fn t09_purge_cleans_imd_registry_dir() {
+    let fx = Fixture::new("dex-bot");
+    fx.seed_closed_progress();
+    // Seed two roles under the slug — proves the per-role unregister
+    // loop + final rm -rf both work.
+    let (reg_a, hb_a) = seed_imd_registry(&fx, "helper");
+    let (reg_b, hb_b) = seed_imd_registry(&fx, "critic");
+    let slug_dir = ccteam_imd::registry_root_in(&fx.ccteam_home).join(&fx.slug);
+    assert!(slug_dir.is_dir(), "fixture: imd/registry/<slug>/ seeded");
+
+    let out = fx
+        .cmd()
+        .args(["remove", &fx.slug, "--purge"])
+        .output()
+        .expect("spawn ccteam remove --purge");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "remove --purge should succeed; stderr: {stderr}; stdout: {stdout}",
+    );
+
+    // Every role file + heartbeat gone.
+    assert!(
+        !reg_a.exists(),
+        "imd/registry/<slug>/helper.json should be purged"
+    );
+    assert!(
+        !reg_b.exists(),
+        "imd/registry/<slug>/critic.json should be purged"
+    );
+    assert!(
+        !hb_a.exists(),
+        "imd/registry/<slug>/helper.heartbeat should be purged"
+    );
+    assert!(
+        !hb_b.exists(),
+        "imd/registry/<slug>/critic.heartbeat should be purged"
+    );
+    // The slug dir itself gone.
+    assert!(
+        !slug_dir.exists(),
+        "imd/registry/<slug>/ dir should be purged; still at {}",
+        slug_dir.display()
+    );
+    // Progress log mentions the purge so the user can see what happened.
+    assert!(
+        stdout.contains("imd/registry/dex-bot/"),
+        "purge step must be reported; got: {stdout}",
+    );
+}
+
+#[test]
+fn t10_remove_without_purge_keeps_imd_registry() {
+    let fx = Fixture::new("dex-bot");
+    fx.seed_closed_progress();
+    let (reg_path, hb_path) = seed_imd_registry(&fx, "helper");
+    let slug_dir = ccteam_imd::registry_root_in(&fx.ccteam_home).join(&fx.slug);
+
+    let out = fx
+        .cmd()
+        .args(["remove", &fx.slug])
+        .output()
+        .expect("spawn ccteam remove");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "remove (no --purge) should succeed; stderr: {stderr}; stdout: {stdout}",
+    );
+
+    // Without --purge the imd/registry/<slug>/ tree must survive so a
+    // re-`ccteam init` of the same slug picks up where it left off.
+    assert!(
+        reg_path.exists(),
+        "imd/registry/<slug>/helper.json must survive without --purge",
+    );
+    assert!(
+        hb_path.exists(),
+        "imd/registry/<slug>/helper.heartbeat must survive without --purge",
+    );
+    assert!(
+        slug_dir.is_dir(),
+        "imd/registry/<slug>/ must survive without --purge",
+    );
+    // Step list must NOT mention the imd/registry purge step.
+    assert!(
+        !stdout.contains("imd/registry/"),
+        "non-purge run must not touch imd/registry/; got: {stdout}",
+    );
+}
+
+#[test]
+fn t11_purge_dry_run_reports_imd_registry_count() {
+    let fx = Fixture::new("dex-bot");
+    fx.seed_closed_progress();
+    let (reg_path, hb_path) = seed_imd_registry(&fx, "helper");
+
+    let out = fx
+        .cmd()
+        .args(["remove", &fx.slug, "--purge", "--dry-run"])
+        .output()
+        .expect("spawn ccteam remove --purge --dry-run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "dry-run --purge should succeed; stderr: {stderr}; stdout: {stdout}",
+    );
+
+    // Filesystem untouched under --dry-run.
+    assert!(
+        reg_path.exists(),
+        "dry-run must not delete registration JSON"
+    );
+    assert!(
+        hb_path.exists(),
+        "dry-run must not delete heartbeat sidecar"
+    );
+    // PRD §F151 acceptance #1 — output names the dir + JSON count.
+    assert!(
+        stdout.contains("would purge imd/registry/dex-bot/") && stdout.contains("1 JSON file"),
+        "dry-run must preview imd/registry/<slug>/ with count; got: {stdout}",
+    );
+}
