@@ -177,9 +177,19 @@ pub fn cursor_path(project_dir: &Path, bot_role: &str) -> PathBuf {
     super::turns_mirror::chat_dir(project_dir, bot_role).join("transcript-cursor.json")
 }
 
-/// Pick the most recently-modified `<sid>.jsonl` under
-/// `~/.claude/projects/<encoded>/`. Returns `None` when the dir is
-/// missing or empty.
+/// Pick the most recently-modified **main-session** `<sid>.jsonl`
+/// under `~/.claude/projects/<encoded>/`. Returns `None` when the dir
+/// is missing, empty, or contains only subagent jsonls.
+///
+/// **Subagent filter**: claude's Task tool spawns subagents into the
+/// same project dir, each writing its own `<sid>.jsonl`. Without the
+/// filter, `discover_active_session` returned whichever was most
+/// recently modified — including subagents — and the tail loop
+/// alternated between main and subagent files, re-emitting events
+/// each time. The filter skips any jsonl whose first line declares
+/// `"type":"agent-setting"` (the marker Anthropic writes for
+/// subagent sessions). Main-session jsonls carry `"type":"last-prompt"`
+/// or `"type":"summary"` and pass through.
 pub fn discover_active_session(cwd: &Path) -> Option<(String, PathBuf)> {
     let dir = anthropic_project_dir(cwd)?;
     let entries = std::fs::read_dir(&dir).ok()?;
@@ -194,12 +204,43 @@ pub fn discover_active_session(cwd: &Path) -> Option<(String, PathBuf)> {
         };
         let Ok(meta) = ent.metadata() else { continue };
         let Ok(mtime) = meta.modified() else { continue };
+        if is_subagent_jsonl(&path) {
+            continue;
+        }
         match &best {
             Some((t, _, _)) if *t >= mtime => {}
             _ => best = Some((mtime, stem.to_string(), path)),
         }
     }
     best.map(|(_, sid, p)| (sid, p))
+}
+
+/// Check whether a jsonl file is a subagent transcript (Task-tool
+/// spawn) rather than a main claude chat session. Subagents are
+/// internal — their assistant messages must NOT be forwarded to the
+/// user-facing IM channel.
+///
+/// Heuristic: subagent jsonls open with a `"type":"agent-setting"`
+/// record (Anthropic-internal marker). Main-session jsonls open with
+/// `"type":"last-prompt"`, `"type":"summary"`, or a user/assistant
+/// record. We read the first line only and look for the subagent
+/// marker as a substring — a parse-free check that survives schema
+/// drift on other fields and tolerates very long lines.
+///
+/// Files that error on read are treated as **not** subagents
+/// (fail-safe — better to tail a possibly-irrelevant file once than
+/// to silently drop a real session).
+pub fn is_subagent_jsonl(path: &Path) -> bool {
+    use std::io::{BufRead, BufReader};
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut first_line = String::new();
+    if BufReader::new(file).read_line(&mut first_line).is_err() {
+        return false;
+    }
+    first_line.contains("\"type\":\"agent-setting\"")
+        || first_line.contains("\"type\": \"agent-setting\"")
 }
 
 /// In-memory carry-over for `tool_use` ↔ `tool_result` pairing across
@@ -537,6 +578,72 @@ mod tests {
         // Same-sid call is a no-op.
         assert!(!c.switch_session("session-A", "-proj".into()));
         assert_eq!(c.byte_offset, 500);
+    }
+
+    /// The architectural primary defense against the NAS duplicate flood:
+    /// subagent jsonls (`"type":"agent-setting"` first line) must be
+    /// filtered out so `discover_active_session` never picks them.
+    /// Without this filter, `tail_loop` oscillates between main and
+    /// subagent sessions and re-emits each on every switch.
+    #[test]
+    fn is_subagent_jsonl_detects_agent_setting_marker() {
+        let tmp = TempDir::new().unwrap();
+        let subagent = tmp.path().join("sa.jsonl");
+        std::fs::write(
+            &subagent,
+            r#"{"type":"agent-setting","sessionId":"sa-1","cwd":"/x"}
+{"type":"user","sessionId":"sa-1"}
+"#,
+        )
+        .unwrap();
+        assert!(is_subagent_jsonl(&subagent));
+
+        let main = tmp.path().join("main.jsonl");
+        std::fs::write(
+            &main,
+            r#"{"type":"last-prompt","sessionId":"main-1"}
+{"type":"user","sessionId":"main-1"}
+"#,
+        )
+        .unwrap();
+        assert!(!is_subagent_jsonl(&main));
+
+        // Tolerate the spaced JSON variant some serializers produce.
+        let spaced = tmp.path().join("spaced.jsonl");
+        std::fs::write(&spaced, r#"{"type": "agent-setting","sessionId":"sa-2"}"#).unwrap();
+        assert!(is_subagent_jsonl(&spaced));
+
+        // Missing / empty file → fail-safe to not-a-subagent.
+        let missing = tmp.path().join("missing.jsonl");
+        assert!(!is_subagent_jsonl(&missing));
+    }
+
+    /// Regression: `discover_active_session` must skip subagent jsonls
+    /// even when they are the most-recently-modified file in the dir.
+    /// This is the actual NAS-flood root cause condition — subagents
+    /// write more frequently than the main session during a busy team
+    /// orchestration.
+    #[test]
+    fn discover_skips_subagent_jsonls_even_when_newest() {
+        let tmp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", tmp_home.path());
+        let cwd = Path::new("/home/test/proj");
+        let dir = anthropic_project_dir(cwd).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Write the main session FIRST (so its mtime is older).
+        let main_path = dir.join("main-sid.jsonl");
+        std::fs::write(&main_path, r#"{"type":"last-prompt","sessionId":"main-sid"}"#).unwrap();
+
+        // Then write a subagent jsonl — newer mtime.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let sa_path = dir.join("subagent-sid.jsonl");
+        std::fs::write(&sa_path, r#"{"type":"agent-setting","sessionId":"subagent-sid"}"#).unwrap();
+
+        let (picked_sid, picked_path) =
+            discover_active_session(cwd).expect("should pick the main session, not the subagent");
+        assert_eq!(picked_sid, "main-sid");
+        assert_eq!(picked_path, main_path);
     }
 
     #[test]
