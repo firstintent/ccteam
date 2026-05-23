@@ -179,36 +179,61 @@ fn legacy_v05_unprefixed_names_are_gone() {
 }
 
 #[test]
-fn chat_and_advise_stubs_are_registered_and_return_not_implemented() {
-    // V0.6.5 F147 — `chat_send_input` is now a real tool, but
-    // `advise_vote` remains a Wave-3 stub. Spot-check both group
-    // shapes: schema is listed, `tools/call` against the stub returns
-    // a graceful NotImplemented body (not a JSON-RPC error), AND
-    // `tools/call` against the real tool reaches its dispatcher
-    // (returns `ok: true` on a valid mailbox write).
+fn chat_and_advise_real_tools_dispatch_through_server() {
+    // V0.6.5 F147 + F152 — both `chat_send_input` (F147) and
+    // `advise_vote` (F152) are real tools backed by file-system
+    // control plane (chat) / per-vendor advisor calls + budget ledger
+    // (advise). Spot-check both group shapes:
+    //
+    // - Schema is listed.
+    // - `tools/call advise_vote` with a pre-seeded budget-exceeded
+    //   ledger returns a structured `ok:false, error:budget_exceeded`
+    //   body without invoking any vendor subprocess (so the test is
+    //   hermetic — no `claude` / `codex` binary required on PATH).
+    // - `tools/call chat_send_input` exercises the happy path so we
+    //   can be sure the dispatcher is still wired.
     let names = list_tool_names();
     assert!(names.contains(&"ccteam__chat_send_input".to_string()));
     assert!(names.contains(&"ccteam__advise_vote".to_string()));
+    assert!(names.contains(&"ccteam__advise_parallel".to_string()));
 
     let (_tmp, home, projects) = tmp_paths();
+    // Pre-seed the advise budget ledger so the vote call refuses
+    // pre-spawn (no real `claude` / `codex` binary needed).
+    std::fs::create_dir_all(&home).unwrap();
+    for _ in 0..15 {
+        ccteam_core::advise::append_budget_sample(
+            &home,
+            ccteam_core::harness::AgentVendor::Claude,
+            0.10,
+        )
+        .unwrap();
+    }
     let mut srv = McpServer::spawn(&home, &projects);
-    // advise_vote — still a stub.
+    // advise_vote — budget gate triggers `ok:false` body.
     srv.send(&json!({
         "jsonrpc": "2.0", "id": 2,
         "method": "tools/call",
-        "params": { "name": "ccteam__advise_vote", "arguments": {} }
+        "params": {
+            "name": "ccteam__advise_vote",
+            "arguments": { "question": "Should I pick A or B?", "max_cost_usd": 0.50 }
+        }
     }));
     let resp = srv.recv();
     assert_eq!(
         resp["result"]["isError"], false,
-        "stub ccteam__advise_vote should land as result not isError"
+        "advise_vote with budget_exceeded should land as result, not isError"
     );
     let text = resp["result"]["content"][0]["text"]
         .as_str()
         .expect("content[0].text");
     assert!(
-        text.contains("NotImplemented"),
-        "advise_vote body should mention NotImplemented; got: {text}"
+        text.contains("budget_exceeded"),
+        "advise_vote body should report budget_exceeded; got: {text}"
+    );
+    assert!(
+        text.contains("\"ok\": false"),
+        "advise_vote body should carry ok:false; got: {text}"
     );
 
     // chat_send_input — F147 real tool. Exercise the happy path so
