@@ -851,6 +851,15 @@ orchestrator 识别 `state.team == "meta-agent"` 走 `process_meta_project` 分�
 
 由 `ccteam doctor --install-mcp` 写入(M2 release)。`ccteam mcp-serve` 是 binary 子命令,stdio 协议。
 
+**V0.6.5 F165 — wire 通道纪律**:
+
+- **stdout** = MCP 协议 wire(line-delimited JSON-RPC 2.0;每行 1 个 frame,`\n` 结尾,不可有 LOG / 任何非 JSON 字节)
+- **stderr** = tracing / 错误日志通道(`RUST_LOG=info` 默认在这里;operator 可 `2>` 重定向)
+- ccteam `init_tracing_stderr()` 把 `tracing_subscriber::fmt` writer 钉到 stderr(`crates/ccteam-cli/src/main.rs`),`run_mcp_serve()` 必经此路径
+- 其他子命令(`ccteam start` daemon / `ccteam web`)继续用 stdout writer——它们的 stdout 是 human / journalctl readout,不是 wire 协议
+
+历史 bug(F165):`init_tracing()` 默认 stdout,在 `tools/list` 第一次 register call 时 `ccteam_imd::register_bot_checked_in` 等 `info!` 会抢 JSON-RPC frame channel,client 解析 first stdout line 失败。F147 测试用 `RUST_LOG=error` env 绕开;F165 根治。
+
 ### 12.2 暴露的 tool 清单(M2.5 起 9 tool;V0.2.2 F38 起 10 tool;V0.4.0 F65 起 17 tool;V0.6 F111 起 24 tool;**V0.6.1 F128 起 26 tool**,5 group 子前缀分组)
 
 V0.6 F111 起所有 MCP 工具加 group 子前缀,server name 保持 `ccteam`;**F110 上版的 `ccteam` → `ct` rename 取消**(V0.5 用户肌肉记忆 override 4 字符节省)。Group enum(非 glob,防 typo)走 `CCTEAM_DISABLE_TOOLS` env 关组(eg `CCTEAM_DISABLE_TOOLS=advise,chat`)。Group 列表:`workflow_`(15)、`chat_`(5)、`advise_`(2)、`admin_`(3:V0.6 1 + V0.6.1 F128 2)、`screenshot`(单成员独立 group,保 V0.5 名)。
