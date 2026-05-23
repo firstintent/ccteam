@@ -71,7 +71,7 @@ fn manual_spec_with_budget(role: &str, budget: Option<BudgetSpec>) -> WorkflowSp
             parallelism: None,
             input: None,
             output: None,
-            interval: None,
+            schedule: None,
             timeout: None,
             on_timeout: None,
             plan_approval: None,
@@ -86,6 +86,7 @@ fn manual_spec_with_budget(role: &str, budget: Option<BudgetSpec>) -> WorkflowSp
         budgets_v060: None,
         agent_team: None,
         chat: None,
+        squad: None,
         agents,
     }
 }

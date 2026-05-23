@@ -174,6 +174,19 @@ pub fn classify(value: &Value) -> JobLiveness {
             cost_usd,
         };
     }
+    // V0.6.3 F144 — forward-compat: a `state` string we don't recognise
+    // (and that isn't the canonical `working`) is treated as
+    // **non-terminal** — we keep probing on the next tick rather than
+    // synthesising a premature `agent_done` that would strand a phantom
+    // job. Warn once so a Claude Code state-vocabulary drift surfaces in
+    // the logs without flooding every poll.
+    if state_str != "working" {
+        crate::vendor_compat::warn_unknown_vendor_token(
+            "claude_job_state",
+            state_str,
+            "treating as non-terminal (job stays Running); will keep probing",
+        );
+    }
     JobLiveness::Running
 }
 
@@ -688,6 +701,58 @@ mod tests {
         match classify(&v) {
             JobLiveness::Terminal { cost_usd, .. } => assert_eq!(cost_usd, 0.0),
             other => panic!("expected terminal, got {other:?}"),
+        }
+    }
+
+    // V0.6.3 F144 — forward-compat regression tests. Anthropic may ship
+    // a `claude` CLI that writes a `state.json` with an unknown `state`
+    // value and/or extra fields; ccteam must not panic and must NOT
+    // mistake the unknown state for "done" (that would strand a phantom
+    // job in `progress.jsonl`).
+
+    #[test]
+    fn classify_unknown_state_stays_non_terminal() {
+        // A future Claude Code state vocabulary value.
+        let v = json!({
+            "state": "suspended_for_review",
+            "firstTerminalAt": null,
+            "cost_usd": 0.5,
+        });
+        assert_eq!(
+            classify(&v),
+            JobLiveness::Running,
+            "unknown job state must stay non-terminal so the orchestrator keeps probing"
+        );
+    }
+
+    #[test]
+    fn classify_unknown_state_with_future_fields_does_not_panic() {
+        // Synthetic "future" state.json: unknown state + extra fields
+        // ccteam has never seen.
+        let v = json!({
+            "state": "hibernating",
+            "firstTerminalAt": null,
+            "cost_usd": 1.0,
+            "future_field_a": {"nested": [1, 2, 3]},
+            "schema_version": 99,
+            "respawnPolicy": "lunar",
+        });
+        // The assertion is simply "does not panic" + correct degradation.
+        assert_eq!(classify(&v), JobLiveness::Running);
+    }
+
+    #[test]
+    fn classify_unknown_state_via_first_terminal_at_still_terminal() {
+        // Even with an unknown `state`, a non-null `firstTerminalAt`
+        // remains an authoritative terminal signal (vendor's own
+        // end-of-session stamp). Unknown != "ignore every signal".
+        let v = json!({
+            "state": "winding_down",
+            "firstTerminalAt": "2026-05-22T12:00:00Z",
+        });
+        match classify(&v) {
+            JobLiveness::Terminal { status, .. } => assert_eq!(status, "completed"),
+            other => panic!("expected terminal via firstTerminalAt, got {other:?}"),
         }
     }
 }

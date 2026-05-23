@@ -204,7 +204,7 @@ fn watch_spec(role: &str, watch_rel: &str, parallelism: Option<u32>) -> Workflow
             parallelism,
             input: Some(PathBuf::from(watch_rel)),
             output: None,
-            interval: None,
+            schedule: None,
             timeout: None,
             on_timeout: None,
             plan_approval: None,
@@ -219,6 +219,7 @@ fn watch_spec(role: &str, watch_rel: &str, parallelism: Option<u32>) -> Workflow
         budgets_v060: None,
         agent_team: None,
         chat: None,
+        squad: None,
         agents,
     }
 }
@@ -235,7 +236,7 @@ fn manual_spec(role: &str) -> WorkflowSpec {
             parallelism: None,
             input: None,
             output: None,
-            interval: None,
+            schedule: None,
             timeout: None,
             on_timeout: None,
             plan_approval: None,
@@ -250,6 +251,7 @@ fn manual_spec(role: &str) -> WorkflowSpec {
         budgets_v060: None,
         agent_team: None,
         chat: None,
+        squad: None,
         agents,
     }
 }
@@ -266,7 +268,7 @@ fn gate_spec(role: &str, input_rel: &str) -> WorkflowSpec {
             parallelism: None,
             input: Some(PathBuf::from(input_rel)),
             output: None,
-            interval: None,
+            schedule: None,
             timeout: None,
             on_timeout: None,
             plan_approval: None,
@@ -281,6 +283,7 @@ fn gate_spec(role: &str, input_rel: &str) -> WorkflowSpec {
         budgets_v060: None,
         agent_team: None,
         chat: None,
+        squad: None,
         agents,
     }
 }
@@ -833,7 +836,7 @@ agents:
             parallelism: Some(1),
             input: Some(PathBuf::from("dirA")),
             output: None,
-            interval: None,
+            schedule: None,
             timeout: None,
             on_timeout: None,
             plan_approval: None,
@@ -849,7 +852,7 @@ agents:
             parallelism: Some(1),
             input: Some(PathBuf::from("dirB")),
             output: None,
-            interval: None,
+            schedule: None,
             timeout: None,
             on_timeout: None,
             plan_approval: None,
@@ -864,6 +867,7 @@ agents:
         budgets_v060: None,
         agent_team: None,
         chat: None,
+        squad: None,
         agents,
     };
     let progress = orch.paths().progress_jsonl(&slug);
@@ -1412,7 +1416,7 @@ async fn t31_inbox_target_role_routes_explicitly() {
                 parallelism: None,
                 input: None,
                 output: None,
-                interval: None,
+                schedule: None,
                 timeout: None,
                 on_timeout: None,
                 plan_approval: None,
@@ -1428,6 +1432,7 @@ async fn t31_inbox_target_role_routes_explicitly() {
         budgets_v060: None,
         agent_team: None,
         chat: None,
+        squad: None,
         agents,
     };
     let progress = orch.paths().progress_jsonl(&slug);
@@ -1775,7 +1780,11 @@ async fn t36_phantom_cleanup_records_cost_in_progress_for_cost_summary() {
 // ============================================================
 
 /// Helper: build a `WorkflowMode::HumanApproval` watch-trigger spec.
-fn human_approval_watch_spec(role: &str, watch_rel: &str, parallelism: Option<u32>) -> WorkflowSpec {
+fn human_approval_watch_spec(
+    role: &str,
+    watch_rel: &str,
+    parallelism: Option<u32>,
+) -> WorkflowSpec {
     let mut spec = watch_spec(role, watch_rel, parallelism);
     spec.mode = ccteam_core::WorkflowMode::HumanApproval;
     spec
@@ -1893,3 +1902,189 @@ async fn t32_f124_poll_completions_skips_drain_under_human_approval() {
     );
 }
 
+// =====================================================================
+// V0.6.3 F142 — `trigger: schedule` cron scheduler
+// =====================================================================
+
+/// Build a single-agent `trigger: schedule` workflow with the given
+/// 5-field cron expression.
+fn schedule_spec(role: &str, cron: &str) -> WorkflowSpec {
+    let mut agents = IndexMap::new();
+    agents.insert(
+        role.into(),
+        AgentSpec {
+            executor: Executor::Claude,
+            model: None,
+            trigger: Trigger::Schedule,
+            scope: None,
+            parallelism: None,
+            input: None,
+            output: None,
+            schedule: Some(cron.to_string()),
+            timeout: None,
+            on_timeout: None,
+            plan_approval: None,
+        },
+    );
+    WorkflowSpec {
+        name: "test-schedule-workflow".into(),
+        description: None,
+        mode: ccteam_core::WorkflowMode::default(),
+        enabled: true,
+        budget: None,
+        budgets_v060: None,
+        agent_team: None,
+        chat: None,
+        squad: None,
+        agents,
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn t40_schedule_first_tick_seeds_cursor_no_spawn() {
+    // V0.6.3 F142 — a cold start must NOT fire on the first tick: the
+    // scheduler anchors `last_fire = now` so the next occurrence is
+    // computed forward from daemon start.
+    use ccteam_core::state::ProjectState;
+
+    let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_MANUAL_EXPLORER);
+    ProjectState::initial(slug.clone())
+        .save(&paths.project_state(&slug))
+        .unwrap();
+    let (orch, claude, _codex) = build_orchestrator(paths);
+    let spec = schedule_spec("auditor", "*/5 * * * *");
+    let progress = orch.paths().progress_jsonl(&slug);
+
+    orch.test_check_schedules(&slug, &spec, &pdir, &progress)
+        .await;
+
+    assert_eq!(
+        claude.spawn_count(),
+        0,
+        "first tick must seed cursor, not spawn"
+    );
+    // Cursor was anchored.
+    let state = ProjectState::load(&pdir.join(".ccteam").join("state.json")).unwrap();
+    assert!(
+        state.schedule_last_fire.contains_key("auditor"),
+        "schedule_last_fire cursor must be seeded on first observation"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn t41_schedule_fires_when_due() {
+    // V0.6.3 F142 — once the cron slot after `last_fire` is reached,
+    // the next tick spawns the agent through the normal path.
+    use ccteam_core::state::ProjectState;
+
+    let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_MANUAL_EXPLORER);
+    // Pre-seed a `last_fire` far in the past so `*/5 * * * *` is due.
+    let mut state = ProjectState::initial(slug.clone());
+    state.schedule_last_fire.insert(
+        "auditor".into(),
+        chrono::Utc::now() - chrono::Duration::hours(1),
+    );
+    state.save(&paths.project_state(&slug)).unwrap();
+
+    let (orch, claude, _codex) = build_orchestrator(paths);
+    let spec = schedule_spec("auditor", "*/5 * * * *");
+    let progress = orch.paths().progress_jsonl(&slug);
+
+    orch.test_check_schedules(&slug, &spec, &pdir, &progress)
+        .await;
+
+    assert_eq!(
+        claude.spawn_count(),
+        1,
+        "due schedule agent must spawn once"
+    );
+    // agent_spawn event emitted to progress.jsonl (SoT red line).
+    let events = read_events(&progress);
+    assert!(
+        events.iter().any(
+            |e| e.get("event").and_then(Value::as_str) == Some("agent_spawn")
+                && e.get("role").and_then(Value::as_str) == Some("auditor")
+        ),
+        "agent_spawn for auditor must hit progress.jsonl"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn t42_schedule_no_double_fire_on_restart() {
+    // V0.6.3 F142 acceptance gate — restart does not double-fire and
+    // does not backfill. A tick that fires advances `last_fire` to
+    // `now`; the immediately-following tick (same minute) must NOT
+    // re-spawn, and the missed slots from the downtime are dropped.
+    use ccteam_core::state::ProjectState;
+
+    let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_MANUAL_EXPLORER);
+    // last_fire 3 hours ago — a naive backfill would owe ~36 firings.
+    let mut state = ProjectState::initial(slug.clone());
+    state.schedule_last_fire.insert(
+        "auditor".into(),
+        chrono::Utc::now() - chrono::Duration::hours(3),
+    );
+    state.save(&paths.project_state(&slug)).unwrap();
+
+    let (orch, claude, _codex) = build_orchestrator(paths);
+    let spec = schedule_spec("auditor", "*/5 * * * *");
+    let progress = orch.paths().progress_jsonl(&slug);
+
+    // Tick 1 — due: fires exactly once (skip-missed, no backfill).
+    orch.test_check_schedules(&slug, &spec, &pdir, &progress)
+        .await;
+    assert_eq!(
+        claude.spawn_count(),
+        1,
+        "down-3h restart fires exactly once, not once-per-missed-slot"
+    );
+
+    // Tick 2 — immediately after (same minute): cursor advanced to
+    // `now`, next `*/5` slot not yet reached → no second spawn.
+    orch.test_check_schedules(&slug, &spec, &pdir, &progress)
+        .await;
+    assert_eq!(
+        claude.spawn_count(),
+        1,
+        "restart must not double-fire: cursor advanced to now"
+    );
+
+    // Simulate a daemon restart: a fresh Orchestrator over the SAME
+    // project dir re-reads the persisted cursor. Still no re-fire.
+    let paths2 = CcteamPaths {
+        root: orch.paths().root.clone(),
+        projects_root: orch.paths().projects_root.clone(),
+    };
+    let (orch2, claude2, _c2) = build_orchestrator(paths2);
+    orch2
+        .test_check_schedules(&slug, &spec, &pdir, &progress)
+        .await;
+    assert_eq!(
+        claude2.spawn_count(),
+        0,
+        "daemon restart re-reads persisted cursor; no backfill, no double-fire"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn t43_schedule_no_state_json_is_graceful() {
+    // V0.6.3 F142 — a schedule workflow whose project has no
+    // state.json yet must not panic; the tick simply skips.
+    let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_MANUAL_EXPLORER);
+    let (orch, claude, _codex) = build_orchestrator(paths);
+    let spec = schedule_spec("auditor", "*/5 * * * *");
+    let progress = orch.paths().progress_jsonl(&slug);
+
+    // No ProjectState::save — state.json is absent.
+    orch.test_check_schedules(&slug, &spec, &pdir, &progress)
+        .await;
+    assert_eq!(
+        claude.spawn_count(),
+        0,
+        "missing state.json must skip cleanly"
+    );
+}

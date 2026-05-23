@@ -49,7 +49,7 @@ fn build_spec(name: &str, watchers: &[(&str, PathBuf)]) -> WorkflowSpec {
                 parallelism: None,
                 input: None,
                 output: None,
-                interval: None,
+                schedule: None,
                 timeout: None,
                 on_timeout: None,
                 plan_approval: None,
@@ -65,6 +65,7 @@ fn build_spec(name: &str, watchers: &[(&str, PathBuf)]) -> WorkflowSpec {
         budgets_v060: None,
         agent_team: None,
         chat: None,
+        squad: None,
         agents,
     }
 }
@@ -79,7 +80,7 @@ async fn spawn_for(
     tokio::sync::mpsc::Receiver<ccteam_core::ArtifactEvent>,
     tokio::task::JoinHandle<()>,
 ) {
-    let (watcher, rx) = ArtifactWatcher::new(spec, None).expect("build watcher");
+    let (watcher, rx) = ArtifactWatcher::new(spec, None, None).expect("build watcher");
     let handle = watcher.start();
     // Give the notify backend a moment to install the inotify watches
     // before the test starts writing files. 100ms is well under
@@ -129,7 +130,7 @@ async fn t01_watch_creates_missing_dir() {
 
     let spec = build_spec("t01", &[("explorer", watch_root.clone())]);
     let (_watcher, _rx) =
-        ArtifactWatcher::new(&spec, None).expect("constructor must mkdir missing roots");
+        ArtifactWatcher::new(&spec, None, None).expect("constructor must mkdir missing roots");
 
     assert!(
         watch_root.exists(),
@@ -285,7 +286,7 @@ async fn t07_nonexistent_root_dir() {
     assert!(!watch_root.parent().unwrap().exists());
 
     let spec = build_spec("t07", &[("explorer", watch_root.clone())]);
-    let (_watcher, _rx) = ArtifactWatcher::new(&spec, None).expect("mkdir -p must succeed");
+    let (_watcher, _rx) = ArtifactWatcher::new(&spec, None, None).expect("mkdir -p must succeed");
 
     assert!(watch_root.exists(), "deep watch root must be created");
     assert!(watch_root.is_dir());

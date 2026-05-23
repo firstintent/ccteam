@@ -71,6 +71,7 @@ impl Fixture {
             sessions: BTreeMap::new(),
             next_sid_seq: BTreeMap::new(),
             detached: false,
+            schedule_last_fire: BTreeMap::new(),
         };
         state.save(&state_path).unwrap();
 

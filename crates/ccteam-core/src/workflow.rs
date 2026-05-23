@@ -20,8 +20,8 @@
 //! ## Trigger forms (YAML scalar string)
 //!
 //! - `manual`            — explicit `ccteam trigger <role>` invocation.
-//! - `schedule`          — periodic; V0.4.0 stub (meta-agent triggers
-//!   manually); V0.4.1 will wire `interval` cron.
+//! - `schedule`          — periodic; fires on the 5-field cron
+//!   expression in `AgentSpec::schedule` (V0.6.3 F142).
 //! - `gate`              — wait until `trigger_gate` MCP tool releases.
 //! - `watch:<path>`      — inotify on artifact dir; new file → spawn.
 //!
@@ -96,6 +96,15 @@ pub struct WorkflowSpec {
     /// `agent-team` modes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat: Option<ChatSpec>,
+    /// V0.6.3 F145 — optional cross-session runtime routing block. When
+    /// `Some`, the orchestrator watches a fixed squad routing dir
+    /// (`<project>/.ccteam/squad/`) and dispatches each new
+    /// `<member>--*.md` artifact the `leader` writes to the named
+    /// `member` role — runtime routing layered over a *statically
+    /// declared* member set. `None` (the V0.6.1 default) keeps the
+    /// V0.4.0 static `output:`-wired topology. See [`SquadSpec`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub squad: Option<SquadSpec>,
     /// Role → agent spec. `IndexMap` preserves YAML declaration order so
     /// trigger graph build is deterministic across runs.
     ///
@@ -503,6 +512,110 @@ pub struct ChatAcl {
     pub allow_groups: Vec<String>,
 }
 
+/// V0.6.3 F145 — cross-session runtime routing block.
+///
+/// ```yaml
+/// squad:
+///   leader: coordinator        # role that routes work at runtime
+///   members: [backend, frontend, docs]
+/// ```
+///
+/// ## Model
+///
+/// `squad:` is layered *on top of* the V0.4.0 artifact-driven roster —
+/// `leader` and every `members[]` entry MUST also be declared as
+/// ordinary agents under `agents:`. The squad block adds one capability:
+/// the `leader` can decide at runtime which `member` handles a sub-task,
+/// instead of writing to a statically-wired `output:` dir.
+///
+/// **Membership is static + declarative** (CLAUDE.md 红线 "声明式拓扑"):
+/// the set of routable targets is fixed in `members:` and stays
+/// auditable by reading workflow.yaml. Only *dispatch* is dynamic — the
+/// leader picks a target by the filename it writes.
+///
+/// ## Routing protocol (no prompt injection)
+///
+/// The leader routes by writing an artifact named `<member>--<rest>.md`
+/// into the squad routing dir (`<project>/.ccteam/squad/`). The target
+/// is a **filename prefix** — visible in `ls`, no file-body parsing.
+/// The orchestrator's `ArtifactWatcher` watches that dir; on a new
+/// `<member>--*.md` file it parses the prefix and spawns that member
+/// role. Members do NOT declare a separate `trigger: watch:` on the
+/// routing dir — being listed in `members:` IS the declaration.
+///
+/// ## Depth bound (CLAUDE.md 红线 R7)
+///
+/// A `leader→member→leader` cycle is bounded by [`SquadSpec::hop_limit`]:
+/// each routed artifact carries a hop count in its filename
+/// (`<member>--h<N>--<rest>.md`); when `<N>` reaches the limit the
+/// orchestrator emits an `escalation` event instead of spawning.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SquadSpec {
+    /// Role that routes work at runtime. Must also appear as a key in
+    /// the top-level `agents:` map.
+    pub leader: String,
+    /// Roles the leader may route sub-tasks to. Each entry must also
+    /// appear as a key in the top-level `agents:` map. Non-empty.
+    pub members: Vec<String>,
+    /// Routing-cycle depth ceiling. A routed artifact whose hop count
+    /// reaches this value triggers an `escalation` event instead of a
+    /// spawn. Defaults to 3 via [`default_hop_limit`] — matches the
+    /// V0.4.x fix-loop / mode-3 `chat.hop_limit` escalate cadence.
+    #[serde(default = "default_hop_limit")]
+    pub hop_limit: u32,
+}
+
+impl SquadSpec {
+    /// Is `role` a routable member of this squad?
+    pub fn is_member(&self, role: &str) -> bool {
+        self.members.iter().any(|m| m == role)
+    }
+}
+
+/// V0.6.3 F145 — squad routing directory, relative to project root.
+/// The leader writes `<member>--*.md` artifacts here; the orchestrator's
+/// `ArtifactWatcher` watches it and dispatches each new file to the
+/// named member role.
+pub const SQUAD_ROUTING_DIR: &str = ".ccteam/squad";
+
+/// V0.6.3 F145 — sentinel role string the `ArtifactWatcher` tags squad
+/// routing-dir events with. `handle_artifact_event` branches on this
+/// to run prefix-routing instead of a normal role lookup. The routing
+/// branch is keyed on this exact constant, never on user roster
+/// contents, so it can never collide with a declared role.
+pub const SQUAD_ROUTE_SENTINEL: &str = "__squad_route__";
+
+/// V0.6.3 F145 — parse a squad routing artifact filename into its
+/// `(target_role, hop_count)` pair.
+///
+/// Grammar (filename, not path; `.md` extension stripped here):
+///
+/// ```text
+/// <member>--<rest>            hop 0 (the leader's first dispatch)
+/// <member>--h<N>--<rest>      hop N (a re-route; N is a decimal u32)
+/// ```
+///
+/// The target tag is a **filename prefix** (CLAUDE.md 红线 R3 — the
+/// routing decision is only "which filename the leader writes"; no
+/// file-body parsing, no prompt injection). Returns `None` when the
+/// name has no `--` separator (not a routed artifact) or the member
+/// segment is empty.
+pub fn parse_squad_route(file_name: &str) -> Option<(String, u32)> {
+    // Strip a trailing `.md` so callers can pass the raw filename.
+    let stem = file_name.strip_suffix(".md").unwrap_or(file_name);
+    let (member, rest) = stem.split_once("--")?;
+    if member.is_empty() {
+        return None;
+    }
+    // Optional `h<N>--` hop segment immediately after the member tag.
+    let hop = rest
+        .split_once("--")
+        .and_then(|(head, _)| head.strip_prefix('h'))
+        .and_then(|n| n.parse::<u32>().ok())
+        .unwrap_or(0);
+    Some((member.to_string(), hop))
+}
+
 /// V0.5.0 F93b — `SuggestedTeammate::kind` discriminator.
 ///
 /// `definition`: `.claude/agents/<role>.md` exists; the lead uses
@@ -570,11 +683,23 @@ pub struct AgentSpec {
     /// via `CCTEAM_OUTPUT` env var.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<PathBuf>,
-    /// Schedule interval (e.g. `"5m"`, `"1h"`) when
-    /// `trigger == Trigger::Schedule`. Ignored otherwise. V0.4.0 keeps
-    /// this as opaque string; cron / duration parsing lands in V0.4.1.
+    /// V0.6.3 F142 — standard 5-field cron expression
+    /// (`minute hour day-of-month month day-of-week`) for
+    /// `trigger == Trigger::Schedule` agents. Required when the
+    /// trigger is `schedule`; ignored (and rejected by `validate()`)
+    /// for any other trigger. The orchestrator tick evaluates this
+    /// against a per-`(project, role)` last-fire timestamp persisted
+    /// in `state.json` with skip-missed semantics — see
+    /// [`crate::cron::Schedule`].
+    ///
+    /// ```yaml
+    /// agents:
+    ///   nightly-audit:
+    ///     trigger: schedule
+    ///     schedule: "0 3 * * *"   # 03:00 daily
+    /// ```
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub interval: Option<String>,
+    pub schedule: Option<String>,
     /// Optional per-session timeout (duration string). V0.4.0 carries
     /// the field for later watchdog consumption.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -713,7 +838,7 @@ pub enum OnTimeout {
 ///
 /// ```yaml
 /// trigger: manual            # explicit ccteam trigger <role>
-/// trigger: schedule          # periodic (interval field + V0.4.1 cron)
+/// trigger: schedule          # periodic (5-field cron in `schedule:`)
 /// trigger: gate              # wait for trigger_gate MCP call
 /// trigger: watch:.ccteam/issues/  # inotify on path
 /// ```
@@ -721,8 +846,10 @@ pub enum OnTimeout {
 pub enum Trigger {
     /// Meta-agent / user explicitly invokes `ccteam trigger <role>`.
     Manual,
-    /// Periodic. V0.4.0 = meta-agent-only manual trigger placeholder;
-    /// V0.4.1 wires actual scheduler reading `AgentSpec::interval`.
+    /// Periodic. V0.6.3 F142 wires the real cron scheduler: the agent
+    /// fires on the standard 5-field cron expression in
+    /// `AgentSpec::schedule`, evaluated each orchestrator tick with
+    /// skip-missed semantics (no backfill across daemon downtime).
     Schedule,
     /// Wait for `trigger_gate` MCP call to release. Requires `input`
     /// dir so the agent has artifacts to consume on release.
@@ -950,7 +1077,29 @@ impl WorkflowSpec {
                         )));
                     }
                 }
-                Trigger::Manual | Trigger::Schedule => {}
+                Trigger::Schedule => {
+                    // V0.6.3 F142 — `schedule` agents must declare a
+                    // valid 5-field cron expression; parse it eagerly
+                    // so a bad cron string fails workflow load rather
+                    // than silently never firing.
+                    match &spec.schedule {
+                        Some(expr) => {
+                            crate::cron::Schedule::parse(expr).map_err(|e| {
+                                WorkflowError::ValidationFailed(format!(
+                                    "agent `{role}`: trigger `schedule` has invalid \
+                                     `schedule:` expression: {e}"
+                                ))
+                            })?;
+                        }
+                        None => {
+                            return Err(WorkflowError::ValidationFailed(format!(
+                                "agent `{role}`: trigger `schedule` requires a 5-field cron \
+                                 `schedule:` expression (e.g. `schedule: \"*/5 * * * *\"`)"
+                            )));
+                        }
+                    }
+                }
+                Trigger::Manual => {}
             }
             if let Some(scope) = &spec.scope {
                 validate_scope(role, scope)?;
@@ -963,6 +1112,63 @@ impl WorkflowSpec {
                     )));
                 }
             }
+        }
+        self.validate_squad()?;
+        Ok(())
+    }
+
+    /// V0.6.3 F145 — structural validation of the optional `squad:`
+    /// block. A `None` squad is a no-op (V0.6.1 behaviour). When set:
+    ///
+    /// 1. `squad:` is only valid in a mode that carries an `agents:`
+    ///    map (`artifact-driven` / `human-approval`) — `chat` and
+    ///    `agent-team` have no static roster to route into.
+    /// 2. `leader` must be a declared agent role.
+    /// 3. `members` must be non-empty.
+    /// 4. Every `members[]` entry must be a declared agent role.
+    /// 5. `hop_limit` must be `>= 1` (0 would escalate on the first
+    ///    routed file — pointless; omit the field for the default 3).
+    ///
+    /// Rule 4 is what makes a routed artifact whose filename prefix is
+    /// not a squad member rejectable at dispatch time: the watcher
+    /// only ever spawns a prefix that is in `members`, and `members`
+    /// is validated here against `agents`.
+    fn validate_squad(&self) -> Result<(), WorkflowError> {
+        let Some(squad) = self.squad.as_ref() else {
+            return Ok(());
+        };
+        if !matches!(
+            self.mode,
+            WorkflowMode::ArtifactDriven | WorkflowMode::HumanApproval
+        ) {
+            return Err(WorkflowError::ValidationFailed(
+                "squad block is only valid in mode: artifact-driven or human-approval \
+                 (chat / agent-team have no static agent roster to route into)"
+                    .to_string(),
+            ));
+        }
+        if !self.agents.contains_key(&squad.leader) {
+            return Err(WorkflowError::ValidationFailed(format!(
+                "squad.leader `{}` is not a declared agent role",
+                squad.leader,
+            )));
+        }
+        if squad.members.is_empty() {
+            return Err(WorkflowError::ValidationFailed(
+                "squad.members must list at least one routable member role".to_string(),
+            ));
+        }
+        for member in &squad.members {
+            if !self.agents.contains_key(member) {
+                return Err(WorkflowError::ValidationFailed(format!(
+                    "squad.members entry `{member}` is not a declared agent role"
+                )));
+            }
+        }
+        if squad.hop_limit == 0 {
+            return Err(WorkflowError::ValidationFailed(
+                "squad.hop_limit must be >= 1 (omit the field for the default 3)".to_string(),
+            ));
         }
         Ok(())
     }
@@ -1056,6 +1262,7 @@ mod tests {
             budgets_v060: None,
             agent_team: None,
             chat: None,
+            squad: None,
             agents: {
                 let mut m = IndexMap::new();
                 m.insert(
@@ -1068,7 +1275,7 @@ mod tests {
                         parallelism: None,
                         input: None,
                         output: None,
-                        interval: None,
+                        schedule: None,
                         timeout: None,
                         on_timeout: None,
                         plan_approval: None,
@@ -1087,6 +1294,40 @@ mod tests {
         assert!(parse_trigger("cron:5m").is_err());
     }
 
+    /// V0.6.3 F143 — build a single-agent `trigger: schedule`
+    /// workflow with the given (optional) cron expression.
+    fn schedule_only_workflow(role: &str, cron: Option<&str>) -> WorkflowSpec {
+        let mut m = IndexMap::new();
+        m.insert(
+            role.into(),
+            AgentSpec {
+                executor: Executor::Claude,
+                model: None,
+                trigger: Trigger::Schedule,
+                scope: None,
+                parallelism: None,
+                input: None,
+                output: None,
+                schedule: cron.map(|s| s.to_string()),
+                timeout: None,
+                on_timeout: None,
+                plan_approval: None,
+            },
+        );
+        WorkflowSpec {
+            name: "x".into(),
+            description: None,
+            mode: WorkflowMode::ArtifactDriven,
+            enabled: true,
+            budget: None,
+            budgets_v060: None,
+            agent_team: None,
+            chat: None,
+            squad: None,
+            agents: m,
+        }
+    }
+
     // V0.6.2 — per-role `scope` (code subdirectory the spawn runs in).
 
     fn agent_with_scope(scope: Option<&str>) -> AgentSpec {
@@ -1098,7 +1339,7 @@ mod tests {
             parallelism: None,
             input: None,
             output: None,
-            interval: None,
+            schedule: None,
             timeout: None,
             on_timeout: None,
             plan_approval: None,
@@ -1117,8 +1358,46 @@ mod tests {
             budgets_v060: None,
             agent_team: None,
             chat: None,
+            squad: None,
             agents,
         }
+    }
+
+    #[test]
+    fn validate_schedule_trigger_accepts_valid_cron() {
+        assert!(schedule_only_workflow("auditor", Some("*/5 * * * *"))
+            .validate()
+            .is_ok());
+        assert!(schedule_only_workflow("auditor", Some("0 3 * * *"))
+            .validate()
+            .is_ok());
+    }
+
+    #[test]
+    fn validate_schedule_trigger_rejects_missing_schedule() {
+        let err = schedule_only_workflow("auditor", None)
+            .validate()
+            .unwrap_err();
+        match err {
+            WorkflowError::ValidationFailed(msg) => {
+                assert!(msg.contains("schedule"), "got: {msg}");
+            }
+            other => panic!("expected ValidationFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_schedule_trigger_rejects_bad_cron() {
+        // 6-field (seconds) form — rejected by the 5-field gate.
+        let err = schedule_only_workflow("auditor", Some("0 */5 * * * *"))
+            .validate()
+            .unwrap_err();
+        assert!(matches!(err, WorkflowError::ValidationFailed(_)));
+        // Garbage cron.
+        let err = schedule_only_workflow("auditor", Some("99 * * * *"))
+            .validate()
+            .unwrap_err();
+        assert!(matches!(err, WorkflowError::ValidationFailed(_)));
     }
 
     #[test]
@@ -1204,5 +1483,214 @@ agents:
         assert!(validate_role_name("my agent").is_err());
         assert!(validate_role_name("agent.x").is_err());
         assert!(validate_role_name("").is_err());
+    }
+
+    // ---- V0.6.3 F145 squad routing ------------------------------------
+
+    /// Build an artifact-driven workflow with a `manual` agent per role
+    /// in `roles` plus an optional `squad:` block.
+    fn squad_workflow(roles: &[&str], squad: Option<SquadSpec>) -> WorkflowSpec {
+        let mut m = IndexMap::new();
+        for role in roles {
+            m.insert(
+                (*role).into(),
+                AgentSpec {
+                    executor: Executor::Claude,
+                    model: None,
+                    trigger: Trigger::Manual,
+                    scope: None,
+                    parallelism: None,
+                    input: None,
+                    output: None,
+                    schedule: None,
+                    timeout: None,
+                    on_timeout: None,
+                    plan_approval: None,
+                },
+            );
+        }
+        WorkflowSpec {
+            name: "x".into(),
+            description: None,
+            mode: WorkflowMode::ArtifactDriven,
+            enabled: true,
+            budget: None,
+            budgets_v060: None,
+            agent_team: None,
+            chat: None,
+            squad,
+            agents: m,
+        }
+    }
+
+    #[test]
+    fn squad_block_parses_from_yaml() {
+        let yaml = r#"
+name: routed
+squad:
+  leader: coordinator
+  members: [backend, frontend]
+agents:
+  coordinator:
+    trigger: manual
+  backend:
+    trigger: manual
+  frontend:
+    trigger: manual
+"#;
+        let spec: WorkflowSpec = serde_yaml::from_str(yaml).unwrap();
+        spec.validate().unwrap();
+        let squad = spec.squad.expect("squad block parsed");
+        assert_eq!(squad.leader, "coordinator");
+        assert_eq!(squad.members, vec!["backend", "frontend"]);
+        // hop_limit defaults to 3.
+        assert_eq!(squad.hop_limit, 3);
+        assert!(squad.is_member("backend"));
+        assert!(!squad.is_member("coordinator"));
+    }
+
+    #[test]
+    fn squad_block_round_trips_and_omits_when_absent() {
+        let no_squad = squad_workflow(&["a"], None);
+        let rendered = serde_yaml::to_string(&no_squad).unwrap();
+        assert!(!rendered.contains("squad"), "absent squad must not render");
+    }
+
+    #[test]
+    fn validate_squad_accepts_declared_roles() {
+        let spec = squad_workflow(
+            &["coordinator", "backend", "frontend"],
+            Some(SquadSpec {
+                leader: "coordinator".into(),
+                members: vec!["backend".into(), "frontend".into()],
+                hop_limit: 3,
+            }),
+        );
+        assert!(spec.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_squad_rejects_undeclared_leader() {
+        let spec = squad_workflow(
+            &["backend"],
+            Some(SquadSpec {
+                leader: "ghost".into(),
+                members: vec!["backend".into()],
+                hop_limit: 3,
+            }),
+        );
+        let err = spec.validate().unwrap_err();
+        match err {
+            WorkflowError::ValidationFailed(msg) => {
+                assert!(msg.contains("ghost"), "got: {msg}");
+            }
+            other => panic!("expected ValidationFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_squad_rejects_undeclared_member() {
+        let spec = squad_workflow(
+            &["coordinator", "backend"],
+            Some(SquadSpec {
+                leader: "coordinator".into(),
+                members: vec!["backend".into(), "phantom".into()],
+                hop_limit: 3,
+            }),
+        );
+        let err = spec.validate().unwrap_err();
+        match err {
+            WorkflowError::ValidationFailed(msg) => {
+                assert!(msg.contains("phantom"), "got: {msg}");
+            }
+            other => panic!("expected ValidationFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_squad_rejects_empty_members() {
+        let spec = squad_workflow(
+            &["coordinator"],
+            Some(SquadSpec {
+                leader: "coordinator".into(),
+                members: vec![],
+                hop_limit: 3,
+            }),
+        );
+        assert!(matches!(
+            spec.validate().unwrap_err(),
+            WorkflowError::ValidationFailed(_)
+        ));
+    }
+
+    #[test]
+    fn validate_squad_rejects_zero_hop_limit() {
+        let spec = squad_workflow(
+            &["coordinator", "backend"],
+            Some(SquadSpec {
+                leader: "coordinator".into(),
+                members: vec!["backend".into()],
+                hop_limit: 0,
+            }),
+        );
+        assert!(matches!(
+            spec.validate().unwrap_err(),
+            WorkflowError::ValidationFailed(_)
+        ));
+    }
+
+    #[test]
+    fn validate_squad_rejected_in_chat_mode() {
+        let mut spec = squad_workflow(
+            &["coordinator", "backend"],
+            Some(SquadSpec {
+                leader: "coordinator".into(),
+                members: vec!["backend".into()],
+                hop_limit: 3,
+            }),
+        );
+        spec.mode = WorkflowMode::Chat;
+        assert!(matches!(
+            spec.validate().unwrap_err(),
+            WorkflowError::ValidationFailed(_)
+        ));
+    }
+
+    #[test]
+    fn parse_squad_route_hop_zero() {
+        let (target, hop) = parse_squad_route("backend--task.md").unwrap();
+        assert_eq!(target, "backend");
+        assert_eq!(hop, 0);
+    }
+
+    #[test]
+    fn parse_squad_route_with_hop_segment() {
+        let (target, hop) = parse_squad_route("frontend--h2--retry-layout.md").unwrap();
+        assert_eq!(target, "frontend");
+        assert_eq!(hop, 2);
+    }
+
+    #[test]
+    fn parse_squad_route_tolerates_missing_md_suffix() {
+        let (target, hop) = parse_squad_route("docs--write").unwrap();
+        assert_eq!(target, "docs");
+        assert_eq!(hop, 0);
+    }
+
+    #[test]
+    fn parse_squad_route_rejects_non_routed_names() {
+        // No `--` separator → not a routed artifact.
+        assert!(parse_squad_route("plain.md").is_none());
+        // Empty member segment.
+        assert!(parse_squad_route("--task.md").is_none());
+    }
+
+    #[test]
+    fn parse_squad_route_hop_segment_must_be_numeric() {
+        // `hx` is not a valid hop segment → treated as part of the
+        // body, hop stays 0.
+        let (target, hop) = parse_squad_route("backend--hx--task.md").unwrap();
+        assert_eq!(target, "backend");
+        assert_eq!(hop, 0);
     }
 }

@@ -547,7 +547,20 @@ pub fn translate_notification(notif: &Notification, wanted: &str) -> Option<Thre
                 },
             })
         }
-        _ => None,
+        // V0.6.3 F144 — forward-compat: a `codex app-server` notification
+        // `method` we don't yet propagate is **skipped** (`None`) so the
+        // event stream is never broken — the orchestrator's
+        // `progress.jsonl` poller stays the state-transition SoT for
+        // anything we don't translate. Warn once per unknown method so a
+        // Codex app-server protocol drift surfaces in the logs.
+        other => {
+            crate::vendor_compat::warn_unknown_vendor_token(
+                "codex_app_server_notification",
+                other,
+                "skipping this notification; event stream continues",
+            );
+            None
+        }
     }
 }
 
@@ -710,7 +723,19 @@ fn translate_item_event(
                 .unwrap_or("")
                 .to_string(),
         ),
-        _ => ThreadItemDetails::AgentMessage(String::new()),
+        // V0.6.3 F144 — forward-compat: a present-but-unrecognised item
+        // `type` degrades to an empty agent message and warns once. A
+        // missing `type` (`None`) is a shape gap, not a vocabulary
+        // drift, so it stays silent.
+        Some(other) => {
+            crate::vendor_compat::warn_unknown_vendor_token(
+                "codex_app_server_item",
+                other,
+                "degraded to empty agent message",
+            );
+            ThreadItemDetails::AgentMessage(String::new())
+        }
+        None => ThreadItemDetails::AgentMessage(String::new()),
     };
     Some(ctor(ThreadItem { id, details }))
 }
@@ -842,6 +867,72 @@ mod tests {
                 match item.details {
                     ThreadItemDetails::AgentMessage(s) => assert_eq!(s, "hello"),
                     _ => panic!("expected agent_message"),
+                }
+            }
+            _ => panic!("expected ItemCompleted"),
+        }
+    }
+
+    // V0.6.3 F144 — forward-compat regression tests. Codex's app-server
+    // protocol may grow a notification method or item type ccteam
+    // doesn't translate; the seam must skip it (no panic, stream keeps
+    // flowing) and warn once.
+
+    #[test]
+    fn translate_unknown_notification_method_is_skipped() {
+        let n = Notification {
+            method: "thread/checkpoint/created".into(),
+            params: json!({ "thread_id": "t-1", "checkpoint_id": "c-1" }),
+        };
+        assert!(
+            translate_notification(&n, "t-1").is_none(),
+            "unknown notification method must be skipped"
+        );
+    }
+
+    #[test]
+    fn translate_known_notification_with_future_fields_does_not_panic() {
+        let n = Notification {
+            method: "turn/completed".into(),
+            params: json!({
+                "thread_id": "t-1",
+                "turn_id": "u-1",
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                    // A future usage field codex may add.
+                    "speculative_tokens": 99,
+                },
+                // A future top-level field.
+                "carbon_grams": 0.001,
+            }),
+        };
+        let e = translate_notification(&n, "t-1").unwrap();
+        match e {
+            ThreadEvent::TurnCompleted { turn_id, usage } => {
+                assert_eq!(turn_id, "u-1");
+                assert_eq!(usage.input_tokens, 10);
+            }
+            _ => panic!("expected TurnCompleted"),
+        }
+    }
+
+    #[test]
+    fn translate_item_unknown_type_degrades_to_empty_message() {
+        let n = Notification {
+            method: "item/completed".into(),
+            params: json!({
+                "thread_id": "t-1",
+                "item": { "id": "i-2", "type": "quantum_blob", "data": [1, 2] }
+            }),
+        };
+        let e = translate_notification(&n, "t-1").unwrap();
+        match e {
+            ThreadEvent::ItemCompleted { item } => {
+                assert_eq!(item.id, "i-2");
+                match item.details {
+                    ThreadItemDetails::AgentMessage(s) => assert_eq!(s, ""),
+                    other => panic!("expected empty agent message, got {other:?}"),
                 }
             }
             _ => panic!("expected ItemCompleted"),

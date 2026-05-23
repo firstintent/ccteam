@@ -5,20 +5,20 @@
 
 ---
 
-## 一、当前状态(2026-05-21)
+## 一、当前状态(2026-05-23)
 
 | 项 | 值 |
 |---|---|
 | 主分支 main HEAD | 以 `git rev-parse origin/main` 为准 |
-| Workspace version | **`0.6.2`** |
-| 测试 baseline | **`1412/1`**(`cargo test --workspace --locked --no-fail-fast`,1 fail 是 ccteam-web `workflow_summary_reflects_agent_spawn_and_done_events` running_count flake)|
+| Workspace version | **`0.6.3`** |
+| 测试 baseline | **`1471/1`**(`cargo test --workspace --locked --no-fail-fast`,1 fail 是 ccteam-web `workflow_summary_reflects_agent_spawn_and_done_events` running_count flake)|
 | Clippy | **0 errors + 0 warnings**(`-D warnings` clean)|
 | 代码规模 | ~73 kLOC Rust(workspace,不含 references)|
-| 当前最新版 | **V0.6.2**(F140 per-role 代码 `scope` — 大型代码库:`AgentSpec.scope` 把每次 spawn 的 `cwd` 钉到与 role 相关的子树,收窄爆炸半径;红线 R3 给 fresh 1M 窗口,但 fresh≠scoped。源自 Anthropic《How Claude Code works in large codebases》—— harness 套 harness 下 ccteam 只吸收"拓扑"这一条)— 详 `docs/versions/v0-6-2/README.md` |
-| 上一版 | **V0.6.1**(Epic D cleanup + Epic E user-claim + Epic F plan-approval / F98 + F119-F139)— 详 `docs/versions/v0-6-1/README.md` |
+| 当前最新版 | **V0.6.3**(F142 `Trigger::Schedule` 接真 cron + F143 webhook ingress + F144 vendor 接缝 forward-compat + F145 `squad:` 跨 session 运行时路由)— 详 `docs/versions/v0-6-3/README.md` |
+| 上一版 | **V0.6.2**(F140 per-role 代码 `scope` — 大型代码库:`AgentSpec.scope` 把每次 spawn 的 `cwd` 钉到与 role 相关的子树,收窄爆炸半径;源自 Anthropic《How Claude Code works in large codebases》)— 详 `docs/versions/v0-6-2/README.md` |
 | V0.6.x 延期候选 | 空(本版闭所有 retained risk)|
 | V0.7 主线候选 | Epic C 国内 IM(WeChat / 飞书 / DingTalk / QQ)启用 + chat memory 跨设备同步 + monorepo-aware `.mcp.json` + migrate-from-claude + 6 号编排模式深化(HumanApproval × bg/chat 矩阵全开) |
-| 历史版本 | V0.1 → V0.6.0 见各自 `docs/versions/v0-X-Y/README.md` |
+| 历史版本 | V0.1 → V0.6.1 见各自 `docs/versions/v0-X-Y/README.md` |
 
 **ccteam 是 Claude Code 之上的元工具**(V0.4.0+,V0.6.0 起转 product-ready 元 AI 团队):每个项目用 `workflow.yaml` 声明 agent 拓扑(**无 prompt,只有 trigger + 并发上限 + `mode: chat`/`vendor: claude\|codex` for V0.6 mode 3 + V0.6.1 F124 `mode: human-approval` 第 4 mode + V0.6.1 F98 `plan_approval:` block**),`.claude/agents/<role>.md` 定义 agent 行为;Rust orchestrator 通过 `ArtifactWatcher`(inotify)监听文件系统控制平面 → spawn `claude --bg --agent <role>`(mode 2)/ 进 tmux 长 session `claude` TUI(mode 3,V0.6 F108)/ `codex exec --json` / `codex app-server` UDS(V0.6 F112 + V0.6.1 F122 progress.jsonl bridge);`progress.jsonl` 记录 7 类业务 event + `chat_session_reset` / `turn_done` + V0.6.1 新增 `plan_pending` / `plan_decision` / `plan_timeout`(F98)+ `persona_changed` / `tool_added`(F128)为唯一状态 SoT(mode 3 对话原文走 ccteam-owned `<project>/.ccteam/chat/<bot>/turns.jsonl`);用户通过 meta-agent + `ccteam-control` skill + **26 个 `mcp__ccteam__{workflow_,chat_,advise_,admin_,screenshot}*` 子前缀分组工具**(V0.6 F111 24 + V0.6.1 F128 `admin_change_persona` + `admin_add_tool`)操作 + V0.6.1 F129 `@ccteam <NL>` IM mention 路径(pause/resume/list/cost/stop everything 5 keyword admin);`ccteam-imd` supervisor(V0.6 F116;V0.6.1 F130 折入 `ccteam start` 作为单 tokio 任务,标准二进制已删,`--no-imd` 跳过)守 IM bridge,统一 `openhuman/channels` Rust crate 14+ IM 平台(V0.6 F109);web UI 提供 4 面板 + SSE。详 `docs/tech-design.md` §2.1。
 
@@ -35,11 +35,11 @@
 | 6 | `docs/ccteam-as-domain-agnostic-orchestrator.md` | 加新 team / 改红线时 |
 | 7 | `docs/claude-code-best-practices.md` | 改 agent prompt / hooks / context 管理时 |
 | 8 | `docs/claude-code-tool-surface.md` | 改 workflow.yaml + agent .md 时 |
-| 9 | `docs/versions/v0-6-1/README.md` | 看当前版本(V0.6.1 Epic D/E/F + F98 + F119-F129 + 3-wave 范式)|
-| 10 | `docs/versions/v0-6-1/{wave-1,wave-2,wave-3}-handoff.md` | 看每 wave Decided / Rejected / Risks / Files / Remaining 五段 |
-| 11 | `docs/versions/v0-6-0/README.md` | 上一 minor(V0.6.0 Epic A/B/C + F106-F118 + 4-wave 范式)|
+| 9 | `docs/versions/v0-6-3/README.md` | 看当前版本(V0.6.3 patch:F142 cron + F143 webhook + F144 vendor-seam + F145 squad routing)|
+| 10 | `docs/versions/v0-6-2/README.md` | 上一版(V0.6.2 patch:F140 per-role `scope`)|
+| 11 | `docs/versions/v0-6-1/README.md` | 上上版(V0.6.1 Epic D/E/F + F98 + F119-F139)|
 
-**起手 30 秒**:`git log -1` 看 HEAD → `cargo test --workspace 2>&1 | awk '/^test result/{p+=$4;f+=$6}END{print p,f}'` 校 1365/1 → 读用户诉求 → 干。
+**起手 30 秒**:`git log -1` 看 HEAD → `cargo test --workspace 2>&1 | awk '/^test result/{p+=$4;f+=$6}END{print p,f}'` 校 1471/1 → 读用户诉求 → 干。
 
 **对照参考**(`references/` gitignore 不入库):`references/claude-code/`(Anthropic Claude Code 源码)+ `references/codex/codex-rs/`。HarnessAdapter / 协议适配时翻;**不**当 ccteam 依赖。
 
@@ -93,7 +93,7 @@
 
 1. **每个 PR 描述映射**:`requirements.md` 某条痛点 + `tech-design.md` 某节 + `dev-coupling-audit.md` 某 F-finding;改协议必同步 `interfaces.md`
 2. **commit 用英语**;文档与 agent prompt 用中文
-3. **Pre-v1.0 = 开发阶段,不留技术债**:无真实用户群,**允许大胆做更好的抽象**。**不做历史迁移**(deprecated 直接删 / breaking rename 不留 alias / `#[serde(default)]` compat 仅在迁移成本 > 重启成本 时用)。tier-1 文档**只描述当前架构**,EOL 内容去版本 dir
+3. **Pre-v1.0 = 开发阶段,不留技术债**:无真实用户群,**允许大胆做更好的抽象**。**不做历史迁移** — 当新版本与旧版本状态数据不兼容时,**不写迁移步骤、也不写兼容代码分支**,直接采取「清除旧版数据(`~/.ccteam/` + 各项目 `.ccteam/`)→ 重新 `ccteam init` 安装」的重装策略;deprecated 直接删,breaking rename 不留 alias。tier-1 文档**只描述当前架构**,EOL 内容去版本 dir
 4. **不写 backwards-compat shim**
 5. **优先编辑现有文件,不轻易新建**
 6. **测试不过不算完成** — `cargo test --workspace` 退步 = block;clippy 不能新增 warning

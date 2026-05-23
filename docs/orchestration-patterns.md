@@ -153,6 +153,7 @@ agents:
 - **OMC 落地**:`skills/team/SKILL.md` 1040 行 + `src/team/` 20 kLOC substrate;control flow 100% 在 SKILL.md(LLM 在 conversation turn 里推理)
 - **ccteam 落地**:`crates/ccteam-core` Rust orchestrator + `workflow.yaml` 声明 + `progress.jsonl` SoT;control flow 100% 在 Rust 代码
 - **何时用**:任务大、子任务多、要长跑(选 ccteam 路线)/ 要快速迭代多 provider hybrid(选 OMC 路线)
+- **V0.6.3 F145 squad 路由(artifact-driven 模式的细化,非新 mode)**:workflow.yaml 顶层 `squad: { leader, members, hop_limit }` 块让 orchestrator-worker 的 worker 选择从**静态接线**(只能写死的 `output:` 目录)扩到**运行时 dispatch**(leader 写 `<member>--*.md` 进 `.ccteam/squad/`,ArtifactWatcher 按文件名前缀 spawn 对应 member)。同一条 artifact-as-control-plane 红线 + 同样的 code-as-orchestrator 形态;`members:` 静态声明保证拓扑可审计、不开 prompt-injection 面;`hop_limit`(默认 3)按 R7 红线发 `escalation` 事件兜底 routing 回路。**不是第 6 种 mode** —— 是 Orchestrator-Worker 在 ccteam 上的「动态 dispatch」分支。
 
 ### 2.5 Evaluator-Optimizer(生成-评估循环)
 
@@ -239,7 +240,7 @@ V0.4.6 ccteam 通过 `workflow.yaml` + Trigger 4 类 + parallelism 字段承载 
 | 模式 | V0.4.6 承载 | 缺口 → 下版本设计输入 |
 |---|---|---|
 | **Chaining** | `Trigger::Watch(<dir>)` 接力 + artifact 文件 = 串行管道 | ✅ 充分,无需改 |
-| **Routing** | 静态:`workflow.yaml` 写死 role;动态:meta-agent + MCP `spawn_agent` 临时调度 | **缺动态路由 sugar**:`workflow.yaml` 应加 `agent.router: <expr>` 字段,orchestrator 解析后 LLM 推理选具体 agent |
+| **Routing** | 静态:`workflow.yaml` 写死 role;动态 dispatch:V0.6.3 F145 `squad: { leader, members, hop_limit }` —— leader 运行时挑 member,membership 仍静态;动态 spawn:meta-agent + MCP `spawn_agent` 临时调度 | **仍缺 LLM-driven router sugar**:`agent.router: <expr>` 让 orchestrator 解析后 LLM 推理选 agent(F143 是声明集合内的 leader dispatch,不替代任意 expr 路由) |
 | **Parallelization (segment)** | `agent.parallelism: u32` + `Trigger::Watch(<dir>)` fan-out = 多文件并行 | ✅ 充分(每个新 artifact 触发独立 session) |
 | **Parallelization (vote)** | **完全缺失** | 加 `agent.fan_out: { count: 3, merge: vote\|best\|concat }` 语法 — 同 prompt fork N 个,merge 策略由 orchestrator 实现 |
 | **Orchestrator-Worker** | meta-agent + 17 MCP `mcp__ccteam__*` 工具 = orchestrator 层;workflow.yaml 各 agent = worker 层 | ✅ 充分,这是 ccteam 主流形态 |

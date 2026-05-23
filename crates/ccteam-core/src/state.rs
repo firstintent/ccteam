@@ -191,6 +191,16 @@ pub struct ProjectState {
     /// state.json files don't accumulate the field unnecessarily.
     #[serde(default, skip_serializing_if = "is_false")]
     pub detached: bool,
+    /// V0.6.3 F142 — per-`role` last-fire timestamp for
+    /// `trigger: schedule` agents. Keyed by the workflow.yaml role
+    /// name; the value is the UTC instant the orchestrator last
+    /// spawned that schedule agent (or first observed it on a cold
+    /// start). The cron scheduler reads this to enforce skip-missed
+    /// semantics — see [`crate::cron::Schedule::is_due`]. Empty for
+    /// projects with no schedule agents; skipped on serialize when
+    /// empty so non-schedule projects don't accumulate the field.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub schedule_last_fire: BTreeMap<String, DateTime<Utc>>,
 }
 
 fn default_team() -> String {
@@ -261,6 +271,7 @@ impl ProjectState {
             sessions: BTreeMap::new(),
             next_sid_seq: BTreeMap::new(),
             detached: false,
+            schedule_last_fire: BTreeMap::new(),
         }
     }
 

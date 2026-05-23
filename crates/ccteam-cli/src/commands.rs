@@ -539,7 +539,7 @@ const DEFAULT_WORKFLOW_YAML: &str = r#"# ccteam workflow.yaml (V0.4.0+ shape).
 #
 # Trigger grammar:
 #   manual                        # explicit `ccteam spawn <slug> <role>` only
-#   schedule                      # periodic (V0.4.1+ interval field)
+#   schedule                      # periodic; needs `schedule:` 5-field cron
 #   gate                          # waits for `trigger_gate` MCP / CLI call
 #   watch:.ccteam/issues/         # spawn one session per new file under the path
 #
@@ -674,10 +674,34 @@ pub fn run_show(paths: &CcteamPaths, slug: &str, format: OutputFormat) -> Result
     let cost = cost_summary(slug, &progress_path, paths)?;
     let sessions = ccteam_core::active_sessions(slug, paths).unwrap_or_default();
 
+    // V0.6.3 F143 — webhook ingress path. The relative URL is stable
+    // (`/webhook/<slug>/<secret>`); the operator prepends their own
+    // `http(s)://<host>:<port>` (external reachability is a deployment
+    // concern, not ccteam's). The secret is generated-or-loaded here so
+    // a fresh `ccteam show` surfaces a usable URL before the first POST.
+    let webhook = resolve_webhook_info(paths, slug);
+
     Ok(match format {
-        OutputFormat::Text => render_show_text(&state, &cost, &recent, &artifacts, &sessions),
-        OutputFormat::Json => render_show_json(&state, &cost, &recent, &artifacts, &sessions)?,
+        OutputFormat::Text => {
+            render_show_text(&state, &cost, &recent, &artifacts, &sessions, &webhook)
+        }
+        OutputFormat::Json => {
+            render_show_json(&state, &cost, &recent, &artifacts, &sessions, &webhook)?
+        }
     })
+}
+
+/// V0.6.3 F143 — `(relative_url, secret)` for the project's webhook
+/// ingress, or `None` if the secret could not be generated/read.
+fn resolve_webhook_info(paths: &CcteamPaths, slug: &str) -> Option<(String, String)> {
+    let token_path = paths.project_webhook_token(slug);
+    match ccteam_web::routes::webhook::generate_or_load_secret(&token_path) {
+        Ok(secret) => Some((format!("/webhook/{slug}/{secret}"), secret)),
+        Err(err) => {
+            eprintln!("ccteam show: could not resolve webhook secret: {err}");
+            None
+        }
+    }
 }
 
 /// V0.5.0 F93b — `ccteam start <slug>` flags. Drives the
@@ -3600,6 +3624,7 @@ fn render_show_text(
     recent: &[Value],
     artifacts: &Map<String, Value>,
     sessions: &[ccteam_core::ActiveSessionInfo],
+    webhook: &Option<(String, String)>,
 ) -> String {
     let mut out = String::new();
     out.push_str(&format!("# {} ({})\n\n", state.slug, state.tmux_session));
@@ -3676,6 +3701,15 @@ fn render_show_text(
         out.push_str("\n  tip: `claude attach <id>` to take over a session live\n");
     }
 
+    // V0.6.3 F143 — webhook ingress URL (relative; operator prepends
+    // their own scheme+host). Treat the secret like the web token —
+    // print it so the operator can wire CI / monitors against it.
+    if let Some((url, _)) = webhook {
+        out.push_str("\nwebhook ingress:\n");
+        out.push_str(&format!("  POST <host>{url}\n"));
+        out.push_str("  (HTTP→file entry point; agent watches .ccteam/webhooks/)\n");
+    }
+
     out.push_str(&format!("\nrecent events ({}):\n", recent.len()));
     for e in recent {
         let ts = e.get("ts").and_then(|s| s.as_str()).unwrap_or("???");
@@ -3691,7 +3725,12 @@ fn render_show_json(
     recent: &[Value],
     artifacts: &Map<String, Value>,
     sessions: &[ccteam_core::ActiveSessionInfo],
+    webhook: &Option<(String, String)>,
 ) -> Result<String> {
+    let webhook_json = match webhook {
+        Some((url, secret)) => json!({ "url_path": url, "secret": secret }),
+        None => Value::Null,
+    };
     let v = json!({
         "state": serde_json::to_value(state)?,
         "phase_history": serde_json::to_value(&state.phase_history)?,
@@ -3699,6 +3738,7 @@ fn render_show_json(
         "recent_events": recent,
         "artifacts": Value::Object(artifacts.clone()),
         "active_sessions": serde_json::to_value(sessions)?,
+        "webhook": webhook_json,
         "stall": {
             "level": "ok",
             "silent_seconds": 0,
@@ -4438,6 +4478,11 @@ mod tests {
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["state"]["slug"], slug);
         assert_eq!(v["artifacts"]["spec"], ".ccteam/spec.md");
+        // V0.6.3 F143 — `webhook` block carries the relative ingress
+        // URL + the generated per-project secret.
+        let url = v["webhook"]["url_path"].as_str().unwrap();
+        assert!(url.starts_with(&format!("/webhook/{slug}/")), "got {url}");
+        assert_eq!(v["webhook"]["secret"].as_str().unwrap().len(), 64);
     }
 
     #[test]

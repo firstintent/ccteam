@@ -655,6 +655,28 @@ mod tests {
         assert!(matches!(err, HarnessError::IngestFailed(_)));
     }
 
+    /// V0.6.3 F144 — forward-compat: a future `claude` CLI that adds
+    /// unknown fields to `state.json` must still parse cleanly. The
+    /// `Value`-plucking parser ignores anything it doesn't recognise.
+    #[test]
+    fn parse_state_json_with_future_fields_does_not_panic() {
+        let raw = r#"{
+            "status": "running",
+            "model": "Claude Opus 5",
+            "context_pct": 12,
+            "cost_usd": 0.3,
+            "pid": 777,
+            "newFutureField": {"deeply": {"nested": [1, 2, 3]}},
+            "schema_version": 42,
+            "rateLimitTier": "platinum"
+        }"#;
+        let snap = parse_cc_state_json(raw).expect("future fields must not break parsing");
+        assert_eq!(snap.model_display_name, "Claude Opus 5");
+        assert_eq!(snap.context_used_pct, 12);
+        // The unknown fields survive verbatim in `raw` for forensics.
+        assert_eq!(snap.raw["schema_version"], 42);
+    }
+
     #[test]
     fn parse_pid_from_state_extracts_integer() {
         let raw = r#"{"pid": 4242, "status": "running"}"#;

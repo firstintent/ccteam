@@ -562,7 +562,19 @@ pub fn translate_jsonl_event(v: &Value, turn_id: &TurnId) -> Vec<ThreadEvent> {
                 .unwrap_or("(no message)")
                 .to_string(),
         })],
-        _ => vec![],
+        // V0.6.3 F144 — forward-compat: a `codex exec --json` event
+        // `type` we don't translate is **skipped** (empty event vec) so
+        // the stream keeps flowing for the events we *do* understand.
+        // Warn once per unknown kind so a Codex CLI event-vocabulary
+        // drift is visible without flooding the log per JSONL line.
+        other => {
+            crate::vendor_compat::warn_unknown_vendor_token(
+                "codex_exec_event",
+                other,
+                "skipping this event; rest of the stream is unaffected",
+            );
+            vec![]
+        }
     }
 }
 
@@ -636,7 +648,17 @@ fn parse_jsonl_item(item: &Value) -> ThreadItem {
                 .unwrap_or("")
                 .to_string(),
         ),
-        _ => ThreadItemDetails::AgentMessage(String::new()),
+        // V0.6.3 F144 — forward-compat: an unrecognised item `type`
+        // degrades to an empty agent message (no panic, no stream
+        // break). Warn once so a Codex item-vocabulary drift is visible.
+        other => {
+            crate::vendor_compat::warn_unknown_vendor_token(
+                "codex_exec_item",
+                other,
+                "degraded to empty agent message",
+            );
+            ThreadItemDetails::AgentMessage(String::new())
+        }
     };
     ThreadItem { id, details }
 }
@@ -688,5 +710,52 @@ mod tests {
         let snap = snapshot_from_status(None);
         assert_eq!(snap.harness, "codex");
         assert_eq!(snap.model_display_name, "codex");
+    }
+
+    // V0.6.3 F144 — forward-compat regression tests. OpenAI may ship a
+    // `codex` CLI that emits a `--json` event with an unknown `type`
+    // and/or extra fields; ccteam must skip it (no panic, no broken
+    // stream) and warn once.
+
+    #[test]
+    fn translate_unknown_jsonl_event_type_is_skipped() {
+        let v = serde_json::json!({
+            "type": "turn.checkpoint",
+            "checkpoint_id": "ckpt-42",
+            "future_field": {"a": 1},
+        });
+        let evts = translate_jsonl_event(&v, &TurnId("t-1".into()));
+        assert!(evts.is_empty(), "unknown event type must be skipped");
+    }
+
+    #[test]
+    fn translate_known_event_with_extra_fields_does_not_panic() {
+        // A known event carrying future extra fields must still parse.
+        let v = serde_json::json!({
+            "type": "thread.started",
+            "thread_id": "th-1",
+            "future_field": [1, 2, 3],
+            "schema_version": 7,
+        });
+        let evts = translate_jsonl_event(&v, &TurnId("t-1".into()));
+        assert!(matches!(
+            evts.as_slice(),
+            [ThreadEvent::ThreadStarted { .. }]
+        ));
+    }
+
+    #[test]
+    fn parse_jsonl_item_unknown_type_degrades_to_empty_message() {
+        let item = serde_json::json!({
+            "id": "i-9",
+            "type": "holographic_artifact",
+            "payload": {"unknown": true},
+        });
+        let parsed = parse_jsonl_item(&item);
+        assert_eq!(parsed.id, "i-9");
+        match parsed.details {
+            ThreadItemDetails::AgentMessage(s) => assert_eq!(s, ""),
+            other => panic!("expected empty agent message, got {other:?}"),
+        }
     }
 }

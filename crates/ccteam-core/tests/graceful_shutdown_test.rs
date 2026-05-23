@@ -55,7 +55,7 @@ fn manual_spec(role: &str) -> WorkflowSpec {
             parallelism: None,
             input: None,
             output: None,
-            interval: None,
+            schedule: None,
             timeout: None,
             on_timeout: None,
             plan_approval: None,
@@ -70,6 +70,7 @@ fn manual_spec(role: &str) -> WorkflowSpec {
         budgets_v060: None,
         agent_team: None,
         chat: None,
+        squad: None,
         agents,
     }
 }

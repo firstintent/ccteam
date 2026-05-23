@@ -800,7 +800,17 @@ impl Orchestrator {
         // append `artifact_dir_created` events) — the previous version
         // passed `project_dir` (a directory), which made
         // `progress::append_event` fail with "open <project_dir>".
-        let (watcher, rx) = ArtifactWatcher::new(&spec, Some(progress_path.as_path()))?;
+        //
+        // V0.6.3 F145 — when a `squad:` block is declared, hand the
+        // absolute squad routing dir to the watcher so the leader's
+        // `<member>--*.md` artifacts surface as `ArtifactEvent`s tagged
+        // with the squad route sentinel.
+        let squad_root = spec
+            .squad
+            .as_ref()
+            .map(|_| project_dir.join(crate::workflow::SQUAD_ROUTING_DIR));
+        let (watcher, rx) =
+            ArtifactWatcher::new(&spec, Some(progress_path.as_path()), squad_root.as_deref())?;
         let watcher_handle = watcher.start();
 
         self.dispatch_initial_triggers(slug, &spec).await?;
@@ -1431,8 +1441,19 @@ impl Orchestrator {
     async fn dispatch_initial_triggers(&self, slug: &str, spec: &WorkflowSpec) -> Result<()> {
         for (role, agent) in &spec.agents {
             match &agent.trigger {
-                Trigger::Manual | Trigger::Schedule => {
+                Trigger::Manual => {
                     tracing::info!(slug, role = role.as_str(), "waiting for explicit trigger");
+                }
+                Trigger::Schedule => {
+                    // V0.6.3 F142 — the per-tick `check_schedules` pass
+                    // anchors the cursor on first observation and fires
+                    // on cron-due. Nothing to register here.
+                    tracing::info!(
+                        slug,
+                        role = role.as_str(),
+                        schedule = agent.schedule.as_deref().unwrap_or(""),
+                        "schedule agent registered"
+                    );
                 }
                 Trigger::Gate => {
                     self.gate_states
@@ -1483,6 +1504,10 @@ impl Orchestrator {
                     self.poll_completions(slug, spec, project_dir, progress_path).await;
                     self.check_spawn_requests(slug, spec, project_dir, progress_path).await;
                     self.check_gates(slug, spec, project_dir, progress_path).await;
+                    // V0.6.3 F142 — cron-scheduled agents. Runs after
+                    // gates so a tick that just released a gate still
+                    // re-checks schedules in the same pass.
+                    self.check_schedules(slug, spec, project_dir, progress_path).await;
                     self.check_inbox(slug, spec, project_dir, progress_path).await;
                     self.check_workflow_done(slug, spec, progress_path).await;
                     // V0.4.6 F84 — budget enforcement runs last so it
@@ -1517,6 +1542,17 @@ impl Orchestrator {
         evt: ArtifactEvent,
     ) -> Result<()> {
         let role = evt.role.clone();
+
+        // V0.6.3 F145 — squad runtime routing. The watcher tags events
+        // from `<project>/.ccteam/squad/` with the route sentinel; the
+        // real target role is the `<member>--*.md` filename prefix the
+        // leader chose at runtime.
+        if role == crate::workflow::SQUAD_ROUTE_SENTINEL {
+            return self
+                .handle_squad_route(slug, spec, project_dir, progress_path, &evt)
+                .await;
+        }
+
         let Some(agent) = spec.agents.get(&role) else {
             tracing::warn!(role = role.as_str(), "artifact event for unknown role");
             return Ok(());
@@ -1588,6 +1624,164 @@ impl Orchestrator {
         }
 
         self.try_spawn(slug, &role, agent, project_dir, progress_path)
+            .await
+    }
+
+    /// V0.6.3 F145 — dispatch a squad routing artifact.
+    ///
+    /// The leader writes `<member>--*.md` (optionally `<member>--h<N>--*`
+    /// for a re-route) into `<project>/.ccteam/squad/`. This method:
+    ///
+    /// 1. parses the `(target_role, hop)` pair from the filename prefix
+    ///    (no file-body parsing — CLAUDE.md 红线 R3);
+    /// 2. rejects a prefix that is not a declared `squad.members` role
+    ///    (the static membership set is the auditable allow-list);
+    /// 3. enforces the [`SquadSpec::hop_limit`] depth bound — a routed
+    ///    file whose hop count has reached the limit emits an
+    ///    `escalation` event instead of spawning (CLAUDE.md 红线 R7);
+    /// 4. otherwise spawns the target member through the normal
+    ///    `try_spawn` path (`agent_spawn` → `progress.jsonl`).
+    async fn handle_squad_route(
+        &self,
+        slug: &str,
+        spec: &WorkflowSpec,
+        project_dir: &std::path::Path,
+        progress_path: &std::path::Path,
+        evt: &ArtifactEvent,
+    ) -> Result<()> {
+        let Some(squad) = spec.squad.as_ref() else {
+            // Watcher tagged a sentinel event but the spec has no
+            // squad block — should not happen (the watcher only
+            // registers the squad root when `spec.squad.is_some()`).
+            tracing::warn!(slug, "squad route event but workflow declares no squad");
+            return Ok(());
+        };
+
+        let file_name = evt
+            .artifact_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+
+        let Some((target, hop)) = crate::workflow::parse_squad_route(file_name) else {
+            // Not a routed artifact (no `<member>--` prefix) — ignore.
+            tracing::debug!(
+                slug,
+                file = file_name,
+                "squad route: filename has no `<member>--` prefix; ignoring"
+            );
+            return Ok(());
+        };
+
+        progress::append_event(
+            progress_path,
+            &json!({
+                "event": "artifact_received",
+                "role": crate::workflow::SQUAD_ROUTE_SENTINEL,
+                "squad_target": target,
+                "hop": hop,
+                "artifact_path": evt.artifact_path,
+                "slug": slug,
+                "ts": Utc::now().to_rfc3339(),
+            }),
+        )?;
+
+        // Rule 2 — reject a prefix that is not a declared member. The
+        // member set is validated against `agents` at workflow load, so
+        // a member that passes here is guaranteed to resolve below.
+        if !squad.is_member(&target) {
+            progress::append_event(
+                progress_path,
+                &json!({
+                    "event": "escalation",
+                    "kind": "squad_unknown_target",
+                    "squad_target": target,
+                    "artifact_path": evt.artifact_path,
+                    "slug": slug,
+                    "ts": Utc::now().to_rfc3339(),
+                }),
+            )?;
+            self.send_btw_escalation(
+                slug,
+                &format!(
+                    "squad routing artifact `{file_name}` names target `{target}` which is not \
+                     a declared squad member ({:?}); dropped.",
+                    squad.members,
+                ),
+            )
+            .await;
+            return Ok(());
+        }
+
+        // Rule 3 — depth bound. A routed file at hop >= hop_limit
+        // escalates instead of spawning, so a leader→member→leader
+        // cycle is bounded (CLAUDE.md 红线 R7).
+        if hop >= squad.hop_limit {
+            progress::append_event(
+                progress_path,
+                &json!({
+                    "event": "escalation",
+                    "kind": "squad_hop_limit",
+                    "squad_target": target,
+                    "hop": hop,
+                    "hop_limit": squad.hop_limit,
+                    "artifact_path": evt.artifact_path,
+                    "slug": slug,
+                    "ts": Utc::now().to_rfc3339(),
+                }),
+            )?;
+            self.send_btw_escalation(
+                slug,
+                &format!(
+                    "squad routing depth limit reached: artifact `{file_name}` is at hop {hop} \
+                     (limit {}); target `{target}` not spawned. A leader→member→leader cycle \
+                     is escalating per the fix-loop 3-strike rule.",
+                    squad.hop_limit,
+                ),
+            )
+            .await;
+            return Ok(());
+        }
+
+        let Some(agent) = spec.agents.get(&target) else {
+            // Unreachable given load-time validation, but degrade
+            // gracefully rather than panic on a hot-reload race.
+            tracing::warn!(
+                slug,
+                target = target.as_str(),
+                "squad route: member passed validation but missing from agents map"
+            );
+            return Ok(());
+        };
+
+        tracing::info!(
+            slug,
+            target = target.as_str(),
+            hop,
+            "squad route: dispatching member"
+        );
+
+        let max_par = agent.parallelism.unwrap_or(1).max(1) as usize;
+        let running_count = self
+            .running
+            .lock()
+            .await
+            .get(&target)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        if running_count >= max_par {
+            // Reuse the standard pending-queue back-pressure path — a
+            // squad-routed event waits its turn just like a watch event.
+            self.pending
+                .lock()
+                .await
+                .entry(target.clone())
+                .or_default()
+                .push_back(evt.clone());
+            return Ok(());
+        }
+
+        self.try_spawn(slug, &target, agent, project_dir, progress_path)
             .await
     }
 
@@ -1901,7 +2095,6 @@ impl Orchestrator {
             | ThreadEvent::ItemCompleted { .. } => None,
         }
     }
-
 
     /// Monotonic microsecond sequence — collision-free across one
     /// orchestrator instance; F67 may swap in a counter map.
@@ -2474,6 +2667,154 @@ impl Orchestrator {
         }
     }
 
+    /// V0.6.3 F142 — fire `trigger: schedule` agents whose cron
+    /// expression is due.
+    ///
+    /// ## skip-missed semantics
+    ///
+    /// Each `(project, role)` pair has a `last_fire` timestamp
+    /// persisted in `<project>/.ccteam/state.json::schedule_last_fire`.
+    /// Per tick, for every schedule agent:
+    ///
+    /// - **first observation** (`last_fire` absent) — record
+    ///   `last_fire = now` and do NOT spawn. The next occurrence is
+    ///   then computed forward from daemon start, so a cold start
+    ///   never fires on boot.
+    /// - **subsequent ticks** — fire iff
+    ///   [`crate::cron::Schedule::is_due`] returns `true` (the next
+    ///   cron slot after `last_fire` is `<= now`). On fire, advance
+    ///   `last_fire` to `now` — NOT to the missed slot — so a daemon
+    ///   that was down across many slots fires exactly once on
+    ///   restart-after-due, then resumes the normal cadence. No
+    ///   backfill, no restart storm.
+    ///
+    /// `parallelism` is forced to 1: `try_spawn`'s `running`-map gate
+    /// already caps schedule agents at one live session (validate()
+    /// rejects `parallelism > 1` for non-watch triggers), so a slow
+    /// agent that overruns its next cron slot simply skips that slot.
+    ///
+    /// `progress.jsonl` stays the SoT — the spawn emits `agent_spawn`
+    /// through the normal `try_spawn` path; `state.json` only carries
+    /// the scheduler's bookkeeping cursor.
+    async fn check_schedules(
+        &self,
+        slug: &str,
+        spec: &WorkflowSpec,
+        project_dir: &std::path::Path,
+        progress_path: &std::path::Path,
+    ) {
+        // Fast path: no schedule agents → no state.json IO at all.
+        let has_schedule = spec
+            .agents
+            .values()
+            .any(|a| matches!(a.trigger, Trigger::Schedule));
+        if !has_schedule {
+            return;
+        }
+
+        let state_path = crate::paths::CcteamPaths::project_state_in(project_dir);
+        let mut state = match crate::state::ProjectState::load(&state_path) {
+            Ok(s) => s,
+            Err(err) => {
+                tracing::warn!(
+                    slug,
+                    ?err,
+                    "F140 check_schedules: state.json load failed; skipping this tick"
+                );
+                return;
+            }
+        };
+
+        let now = Utc::now();
+        let mut state_dirty = false;
+        // Roles to spawn after we drop nothing — `try_spawn` is async
+        // and takes `&self`; collect first so the borrow of `state` is
+        // released cleanly before each spawn.
+        let mut due_roles: Vec<String> = Vec::new();
+
+        for (role, agent) in &spec.agents {
+            if !matches!(agent.trigger, Trigger::Schedule) {
+                continue;
+            }
+            // workflow.yaml validate() guarantees a parseable 5-field
+            // cron for every schedule agent; re-parse defensively so a
+            // hot-reload race that slipped a bad spec past us only
+            // skips this role rather than panicking the loop.
+            let Some(expr) = agent.schedule.as_deref() else {
+                continue;
+            };
+            let sched = match crate::cron::Schedule::parse(expr) {
+                Ok(s) => s,
+                Err(err) => {
+                    tracing::warn!(
+                        slug,
+                        role = role.as_str(),
+                        ?err,
+                        "F140 check_schedules: unparseable schedule; skipping role"
+                    );
+                    continue;
+                }
+            };
+
+            match state.schedule_last_fire.get(role).copied() {
+                None => {
+                    // First observation — seed the cursor, do not fire.
+                    state.schedule_last_fire.insert(role.clone(), now);
+                    state_dirty = true;
+                    tracing::info!(
+                        slug,
+                        role = role.as_str(),
+                        schedule = expr,
+                        "F140 schedule registered; cursor anchored to now"
+                    );
+                }
+                Some(last_fire) => {
+                    if sched.is_due(Some(last_fire), now) {
+                        // Advance the cursor to `now` (skip-missed) and
+                        // queue the spawn.
+                        state.schedule_last_fire.insert(role.clone(), now);
+                        state_dirty = true;
+                        due_roles.push(role.clone());
+                    }
+                }
+            }
+        }
+
+        // Persist the cursor BEFORE spawning so a crash between the
+        // save and the spawn errs on the side of skip-missed (the
+        // missed slot is dropped) rather than a double-fire.
+        if state_dirty {
+            if let Err(err) = state.save(&state_path) {
+                tracing::warn!(
+                    slug,
+                    ?err,
+                    "F140 check_schedules: state.json save failed; \
+                     schedule cursors not advanced this tick"
+                );
+                // Bail without spawning — next tick retries cleanly.
+                return;
+            }
+        }
+
+        for role in due_roles {
+            let Some(agent) = spec.agents.get(&role) else {
+                continue;
+            };
+            tracing::info!(slug, role = role.as_str(), "F140 schedule due; spawning");
+            if let Err(err) = self
+                .try_spawn(slug, &role, agent, project_dir, progress_path)
+                .await
+            {
+                tracing::warn!(
+                    slug,
+                    role = role.as_str(),
+                    ?err,
+                    "F140 schedule spawn failed"
+                );
+            }
+        }
+    }
+
     /// Idempotent: emits `workflow_done` exactly once when every gate
     /// agent is Fired AND has no running session. Uses sentinel key
     /// `__workflow_done__` to guard against double-emit.
@@ -2924,6 +3265,18 @@ impl Orchestrator {
         progress_path: &std::path::Path,
     ) {
         self.check_inbox(slug, spec, project_dir, progress_path)
+            .await;
+    }
+
+    /// V0.6.3 F142 — drive one `check_schedules` pass (cron tick).
+    pub async fn test_check_schedules(
+        &self,
+        slug: &str,
+        spec: &WorkflowSpec,
+        project_dir: &std::path::Path,
+        progress_path: &std::path::Path,
+    ) {
+        self.check_schedules(slug, spec, project_dir, progress_path)
             .await;
     }
 
