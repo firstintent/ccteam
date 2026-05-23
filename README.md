@@ -1,80 +1,63 @@
 # ccteam
 
-> **A multi-agent orchestrator on top of Claude Code** — one tool, three tiers: in-proc temporary helpers / bg long-running workflows / IM bots running 24/7.
+> **A multi-agent orchestrator on top of Claude Code** — describe what you want, ccteam picks the command. No YAML. No CLI flags to memorize.
 
 ![demo](docs/versions/v0-6-0/demos/30s-tg-bot-team.gif)
 
-## Three runtime modes (the core of ccteam)
+## What do you want to do?
 
-ccteam adds **three multi-agent runtime modes** to Claude Code, each for a different cadence:
+Pick the row that matches your goal. The right column is the command — copy-paste into any Claude session.
 
-| # | Mode | How it's hosted | Typical use |
-|---|---|---|---|
-| **1** | **Lightweight (in-proc)** | Inside an existing Claude session; ccteam acts as a plugin/skill that spawns temporary teammates via the native `Task` tool, sharing the session lifecycle | Summoning helpers while coding / a quick 3–5 agent burst |
-| **2** | **bg workflow orchestration** | Multiple `claude --bg --agent <role>` sessions collaborating through a `workflow.yaml` of triggers; file artifacts pass the baton; the ccteam Rust daemon runs long while bg jobs come and go | Power users running long workflows in a domain (qa-loop: test-fix-release / self-driving builds) |
-| **3** | **IM bots (tmux-resident)** | Long-running tmux + `claude` TUI sessions, one per agent bot, always on; bots talk to each other in an IM group by @-mentioning | Chatting privately with an AI assistant on your phone / a multi-bot team collaborating across devices in an IM group |
+```
+You want to do                                 → Run this
+──────────────────────────────────────────────────────────────────────
+Get a feel for a new codebase / repo audit      /ccteam-scan
+Build / fix / refactor (watching it work)       /ccteam-team "<task>"
+Review a PR / get a second opinion              /ccteam-advise "<PR or path>"
+A private IM assistant (24/7, always on)        /ccteam-creator "build me a <X> assistant"
+A multi-bot IM round-table                      /ccteam-creator "a few bots in a group"
+Run a long task overnight (hands-off)           /ccteam-creator "<task>, run while I sleep"
+List / pause / resume / check spending          /ccteam-control list | pause | cost
+Wire up an IM token (Telegram / Slack / Discord)  /ccteam-im-setup
+Not sure? Just describe it in natural language  /ccteam "<what you want>"
+```
 
-The three modes are fixed at the bottom; **the application layer on top is open** — the five presets below ship as a starter set, and the `ccteam-creator` skill can generate new scenarios from a natural-language description.
+> Each command is a Claude Code slash command. Type it in a `claude` session — `/ccteam <NL>` is the universal entry; the others let you skip the router when you already know the path.
 
-## 5-minute quickstart (pick an entry point by mode)
+## Get started
 
 ```bash
-# 0. Install Claude Code + the ccteam plugin first.
-# https://code.claude.com/docs/install
+# 0. Install Claude Code first: https://code.claude.com/docs/install
 claude
 /plugin install ccteam
 
-# === Mode 1: summon a temporary helper inside an existing session ===
-/ccteam "clean up all the TypeScript errors here"
-# Or burst a few agents in parallel:
-/ccteam-team 3 "refactor the src/auth submodule"
-
-# === Mode 2: kick off a bg long-running workflow ===
-/ccteam-creator "overnight qa-loop: run tests on every commit, auto-fix on failure"
-
-# === Mode 3: hook up IM bots ===
-/ccteam-im-setup                            # one-time bind for TG/Slack/Discord
-/ccteam-creator "build me a TG DM assistant that helps manage my email"
+# 1. Try the universal entry — describe what you want in any language:
+/ccteam "scan this repo and tell me what it does"
+/ccteam "fix the TypeScript errors in src/"
+/ccteam "build a Telegram bot that summarizes my GitHub PRs at 7am"
 ```
 
-→ See [quickstart](docs/quickstart.md) for the full walkthrough.
-
-## 5 presets, pick whichever fits
-
-Each preset is a recommended "mode × orchestration pattern × persona" recipe; `ccteam-creator` wires it up through NL dialogue:
-
-| Preset | One-line scenario | How to launch | Mode |
-|---|---|---|---|
-| **Solo Sidekick** | Summon a single helper while coding with Claude | `/ccteam <natural language>` | 1 |
-| **Team Sprint** | A few-hour burst with 3–5 agents in parallel | `/ccteam-team 3 "<task>"` | 1 |
-| **Overnight Builder** | Drop a task and go to sleep; runs for hours to days | `/ccteam-creator "overnight ..."` | 2 |
-| **Pocket Assistant** ⭐ | A private AI assistant in your phone IM | `/ccteam-creator "build a TG assistant"` | 3 |
-| **IM Squad** ⭐ | Multiple bots in an IM group @-mentioning each other | `/ccteam-creator "build a multi-bot TG team"` | 3 |
-
-⭐ flagship scenarios. Mode 3 brings your AI team into IM, working on your behalf across devices 24/7 — the difference vs. ChatGPT / Cursor / Devin: the bots run **on your computer**, can touch your files, run your commands, read your code; your phone is just the entry point.
+The 5-minute walkthrough for "private IM assistant" (the flagship use case) lives in [docs/quickstart.md](docs/quickstart.md).
 
 ## Three ways to talk to ccteam
 
-- 🟢 **Inside a Claude session**: `/ccteam <natural language>` is the universal entry point (works for modes 1/2/3)
-- 🟢 **From IM** (mode 3): DM a bot, or `@ccteam <NL admin>` in a group
-- 🟡 **Web dashboard** (modes 2/3): `http://localhost:7331` (read-only)
+- **Inside a Claude session** — `/ccteam <NL>` is the universal entry; the per-task slash commands above are shortcuts.
+- **From IM** — DM your bot directly, or `@ccteam <NL admin>` inside a group for control (`pause`, `cost`, `list`, `stop everything`, …).
+- **Web dashboard** (read-only) — `http://localhost:7331` to watch workflows, transcripts, and 24h spend.
 
-> You **do not** need to learn CLI commands, and you **do not** need to write any YAML. All setup happens through dialogue inside a Claude session.
+The AI runs on **your computer** — it can read your files, run your commands, touch your code. Your phone / IM is just the entry point; close the laptop lid and the workflow keeps running.
 
 ## Docs
 
 | What you want | Read this |
 |---|---|
-| Get the first preset running in 5 minutes | [docs/quickstart.md](docs/quickstart.md) |
-| Full 3-mode + 5-preset user manual | [docs/user-manual.md](docs/user-manual.md) |
+| Decision tree — task to command (with examples) | [docs/task-to-command.md](docs/task-to-command.md) |
+| 5-minute walkthrough for the flagship IM-bot use case | [docs/quickstart.md](docs/quickstart.md) |
+| Full user manual (every scenario, every flag) | [docs/user-manual.md](docs/user-manual.md) |
 | Copy-paste a ready-made use case | [docs/recipes.md](docs/recipes.md) |
-| Something broke and you cannot find it | [docs/troubleshooting.md](docs/troubleshooting.md) |
+| Something broke | [docs/troubleshooting.md](docs/troubleshooting.md) |
 | Advanced customization / Codex integration | [docs/advanced/](docs/advanced/) |
 
 ## License & acknowledgements
 
-See [LICENSE](LICENSE). Built on [Claude Code](https://code.claude.com/) (the runtime) and [openhuman/channels](https://github.com/openhuman/channels) (14+ IM platforms in Rust); orchestration taxonomy from Anthropic's *Building Effective Agents*; mode-3 IM bot pattern (tmux + send-keys + transcript polling) inspired by `ccgram` and `oh-my-claudecode`.
-
----
-
-See [docs/versions/v0-6-1/README.md](docs/versions/v0-6-1/README.md) for current release notes.
+See [LICENSE](LICENSE). Built on [Claude Code](https://code.claude.com/) (the runtime) and [openhuman/channels](https://github.com/openhuman/channels) (14+ IM platforms in Rust); orchestration taxonomy from Anthropic's *Building Effective Agents*; IM-bot pattern (tmux + send-keys + transcript polling) inspired by `ccgram` and `oh-my-claudecode`.

@@ -1,6 +1,12 @@
+---
+audience: contributors
+---
+
 # 编排模式 —— 拆分哲学 + 5 模式目录(ccteam 设计依据)
 
-> **角色**:tier-1 全局文档。ccteam 后续所有 workflow 设计、agent 拓扑、自动化迭代**都基于本文的 5 模式 + 拆分哲学**;新加 workflow 模板 / 重做 fix-loop / 拓展非编程领域 team 都先回到本文校准。
+> **角色**:tier-1 全局文档,**面向 contributor**(ccteam 维护者 / 新 workflow 设计者)。日常**用户**用 ccteam 不需要读本文 —— 用户面入口是 [task-to-command.md](task-to-command.md)(决策树)+ [quickstart.md](quickstart.md) + [user-manual.md](user-manual.md)。
+>
+> ccteam 后续所有 workflow 设计、agent 拓扑、自动化迭代**都基于本文的 5 模式 + 拆分哲学**;新加 workflow 模板 / 重做 fix-loop / 拓展非编程领域 team 都先回到本文校准。
 >
 > **回答两个核心问题**:
 > 1. **什么时候该拆 agent?**(§一 设计哲学 — "按上下文拆,不按角色拆")
