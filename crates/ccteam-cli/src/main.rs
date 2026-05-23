@@ -1506,28 +1506,57 @@ fn run_start(
             };
             let orch_result = orchestrator.run(orch_shutdown).await;
 
+            // F163 — drain web + IMD tasks with a 5s hard timeout each.
+            // The orchestrator already did its own 30s graceful drain for
+            // project loops; web/imd should respond quickly to the
+            // shutdown channel. If they don't, abort to unblock the
+            // pidfile cleanup and port release.
+            const TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
             // Drain the web task once shutdown propagates.
             if let Some(h) = web_handle {
-                match h.await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(err)) => tracing::warn!(?err, "ccteam web exited with error"),
-                    Err(je) if je.is_cancelled() => {}
-                    Err(je) => tracing::warn!(?je, "ccteam web task panicked"),
+                match tokio::time::timeout(TASK_DRAIN_TIMEOUT, h).await {
+                    Ok(Ok(Ok(()))) => {}
+                    Ok(Ok(Err(err))) => tracing::warn!(?err, "ccteam web exited with error"),
+                    Ok(Err(je)) if je.is_cancelled() => {}
+                    Ok(Err(je)) => tracing::warn!(?je, "ccteam web task panicked"),
+                    Err(_) => {
+                        tracing::warn!(
+                            timeout_secs = TASK_DRAIN_TIMEOUT.as_secs(),
+                            "ccteam web drain timed out; aborting (port will be released by OS)"
+                        );
+                    }
                 }
             }
             // V0.6.1 F130 — drain the IMD task on the same shutdown
             // boundary so a slow supervisor tick can finish before the
-            // runtime exits.
+            // runtime exits. F163: capped at 5s to avoid hanging on
+            // a slow Telegram long-poll wakeup.
             if let Some(h) = imd_handle {
-                match h.await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(err)) => tracing::warn!(?err, "ccteam-imd exited with error"),
-                    Err(je) if je.is_cancelled() => {}
-                    Err(je) => tracing::warn!(?je, "ccteam-imd task panicked"),
+                match tokio::time::timeout(TASK_DRAIN_TIMEOUT, h).await {
+                    Ok(Ok(Ok(()))) => {}
+                    Ok(Ok(Err(err))) => tracing::warn!(?err, "ccteam-imd exited with error"),
+                    Ok(Err(je)) if je.is_cancelled() => {}
+                    Ok(Err(je)) => tracing::warn!(?je, "ccteam-imd task panicked"),
+                    Err(_) => {
+                        tracing::warn!(
+                            timeout_secs = TASK_DRAIN_TIMEOUT.as_secs(),
+                            "ccteam-imd drain timed out; aborting"
+                        );
+                    }
                 }
             }
             signal_task.abort();
             unroster_task.abort();
+
+            // F163 — explicit log: tmux sessions are intentionally left
+            // running. Daemon stop ≠ bot session stop (CLAUDE.md §三 red
+            // line: 永不主动 kill 长 session).
+            tracing::info!(
+                "graceful shutdown complete; tmux sessions (if any) left running intentionally — \
+                 `ccteam start` will reattach to them"
+            );
+
             orch_result
         })
     })();
