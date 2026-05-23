@@ -852,7 +852,7 @@ apply the suggested fix, run `npm test`, and write result to `$CCTEAM_OUTPUT/`.
 | **Playwright** | E2E 测试（前端项目） | 已有 |
 | **GitHub** | PR 创建、issue 管理 | 可选（优先 `gh` CLI） |
 
-#### 提供的 MCP:`ccteam-mcp`(V0.6 F111 24 工具 + V0.6.1 F128 +2 admin tool = 26 工具,5 group 子前缀分组)
+#### 提供的 MCP:`ccteam-mcp`(V0.6.5 收官 = 27 工具,**0 STUB**,5 group 子前缀分组)
 
 详见 §3.8 "Channel adapters + ccteam-mcp MCP server" 与 [interfaces.md §12](./interfaces.md#12-ccteam-mcp-mcp-server-m2)。
 
@@ -860,13 +860,15 @@ V0.6 F111 起所有工具加 group 子前缀,**server name 不变**(`ccteam`),�
 
 | Group(子前缀) | 工具数 | 例 |
 |---|---|---|
-| `workflow_` | 13 | `mcp__ccteam__workflow_{show,peek,progress,new,pause,resume,send_to_session,inject_decision,spawn_agent,stop_agent,observe_agents,signal,set_parallelism,trigger_gate,get_artifact_summary}` |
-| `chat_` | 5 | `mcp__ccteam__chat_{send_input,lifecycle,session_reset,list_bots,show_turn_log}` |
-| `advise_` | 2 | `mcp__ccteam__advise_{vote,parallel}` |
-| `admin_` | 1 | `mcp__ccteam__admin_ls` |
+| `workflow_` | 15 | `mcp__ccteam__workflow_{show,peek,progress,new,pause,resume,send_to_session,inject_decision,spawn_agent,stop_agent,observe_agents,signal,set_parallelism,trigger_gate,get_artifact_summary}` |
+| `chat_` | 6 | `mcp__ccteam__chat_{register_bot,unregister_bot,list_bots,send_input,history,reset}`(V0.6.5 F146/F147:`chat_lifecycle` STUB 拆为原子 register/unregister + `list_bots` 升真,`send_input` 升真,`session_reset`→`reset` / `show_turn_log`→`history` rename 无 alias)|
+| `advise_` | 2 | `mcp__ccteam__advise_{vote,parallel}`(V0.6.5 F152/F153 升真:`vote` = Claude+Codex 并行 advisor + 第三次 Claude verdict synthesis;`parallel` = N-of-N 原文返回;budget gate `<ccteam_root>/cost-budget.json`)|
+| `admin_` | 3 | `mcp__ccteam__admin_{ls,change_persona,add_tool}` |
 | `screenshot`(单成员独立 group)| 1 | `mcp__ccteam__screenshot` |
 
-**总计 V0.6 F111 24 + V0.6.1 F128 +2(`admin_change_persona` + `admin_add_tool`)= 26 工具**(具体清单见 `interfaces.md §12`)。`CCTEAM_DISABLE_TOOLS` env 用 group enum(非 glob,防 typo):`CCTEAM_DISABLE_TOOLS=advise,chat` 关掉两组。F110 上版的 `ccteam` → `ct` namespace rename **取消**(V0.5 用户肌肉记忆 override 4 字符节省)。
+**总计 V0.6.5 收官 27 工具,0 STUB,0 deprecated alias**(V0.6 F111 24 + V0.6.1 F128 +2 admin + V0.6.5 F146 chat +1 [register/unregister 拆 1 → 2,net +1] + F152/F153 advise 升真 — 详 `interfaces.md §12`)。`CCTEAM_DISABLE_TOOLS` env 用 group enum(非 glob,防 typo):`CCTEAM_DISABLE_TOOLS=advise,chat` 关掉两组。F110 上版的 `ccteam` → `ct` namespace rename **取消**(V0.5 用户肌肉记忆 override 4 字符节省)。
+
+**Wire 协议纪律(V0.6.5 F165)**:`ccteam mcp-serve` stdout 是 line-delimited JSON-RPC frame channel,**所有 tracing / 日志走 stderr**(`init_tracing_stderr()`),否则 first `tools/list` 那次 `register_bot` 之类的 `info!` 会污染 frame parse → MCP client 解析挂。其他子命令(`ccteam start` / `ccteam web`)stdout 继续是 human readable。`RUST_LOG=error` 不再是 MCP test 的必经环境(F165 前 F147 等用过这个 workaround)。
 
 **实现形态**：`ccteam-mcp` 与 `ccteam-core` 同 workspace（lib + 多 binary），通过 `ccteam internal mcp-serve` 子命令暴露——读写同一份 state.json / progress.jsonl，为 `ccteam tui`（未 ship） / `ccteam web` 三种前端共用 `ccteam-core` lib API（详见 §3.8 前端层小节），MCP 只是把这套 API 套上 MCP wire protocol 给外部 LLM 消费。
 
@@ -1134,6 +1136,29 @@ user-manual.md §3.2 写 IM 群内 `@ccteam pause <bot>` / `cost today` / `list 
 **hop_limit 不消耗**:meta-agent admin path 不走 AgentPath 层次树(不算 bot-to-bot hop)。
 
 **Tests**:`crates/ccteam-imd/tests/im_nl_admin_test.rs`(367 行)— mock TG inbound w/ 5 NL admin path + 危险 confirm flow。
+
+### 6.16 运维健壮性(V0.6.5 F163 + F164)
+
+V0.6.4 nas-box005 真生产部署 surfaces 两个长跑 daemon 用 blocker — daemon 不响应任何 graceful shutdown 信号(只能 SIGKILL,丢 in-memory state、留孤儿 pidfile);`claude-tui::start_thread` 看到已存在的 ccteam tmux session 直接报错而非 reattach(daemon 重启周期里 bot 永久失能,必须人工 `tmux kill-session`)。F163 + F164 在 V0.6.5 把这两个洞合上。
+
+**F163 — `ccteam start` graceful drain**:
+
+实际 PRD 写"加 SIGINT/SIGTERM 处理",写代码时发现 `wait_for_shutdown_signal()` 已经存在 —— 真 blocker 是 daemon 主循环退出后 `web_handle.await` / `imd_handle.await` 无界等(axum / IMD long-poll 不主动 wake 当 shutdown channel 触发)→ 进程挂死。
+- 修法:`TASK_DRAIN_TIMEOUT = Duration::from_secs(5)` 套在两个 await 点;timeout branch 走 WARN log + 继续 pidfile cleanup + port 释放
+- **不 kill tmux**:`tracing::info!("tmux sessions left running intentionally")` 加进 shutdown 路径(CLAUDE.md §三 "永不主动 kill 长 session" 守);tmux session 是 user-owned 资源,daemon stop ≠ bot session stop;F164 reattach 下次 daemon 启动自动接管
+- 自动化 test:`crates/ccteam-cli/tests/graceful_shutdown_test.rs` 4 cases(SIGTERM / SIGINT / `/tmp/ccteam-<user>.shutdown` 触发文件 / tmux 存活验证)
+- 行为契约:`docs/interfaces.md §CLI lifecycle` 新增 `stop` 行(5s drain timeout / pidfile unlink / port 立即释放 / tmux 不 kill)
+
+**F164 — `claude_tui::start_thread` reattach 已存在 tmux session**:
+
+3-path 决策:
+- (a) session 已存在 + pane comm 含 `claude` → reattach(不开新进程,更新 hooks + 返 existing handle)
+- (b) session 已存在 + pane 已死 → `tmux kill-session` then new session
+- (c) session 不存在 → new session
+
+健康检查走 `is_pane_running_claude(session) -> bool` helper,用 `ps -o comm=` 拿 pane pid 的 process name —— **不读 pane 内容**(CLAUDE.md §三 "不解析 tmux 终端输出" 守)。Hijack 风险:user 手工 `tmux new-session -s ccteam-chat-foo-bar` 然后跑 claude 会被 ccteam 当作已注册 bot adopt;接受这个 trade-off(documented in `claude_tui.rs` comment)—— ccteam-managed session 名按 `ccteam-chat-<slug>-<role>` 约定,hijack 需用户主动作意。
+
+不动 `resume_thread`(那条路径正常 stop+start 周期已经良性)。`TmuxSession::list_pane_pids()` 加 helper via `tmux list-panes -F "#{pane_pid}"`。Tests:`crates/ccteam-core/tests/claude_tui_reattach_test.rs` 6 cases(alive / dead / fresh / hijack-doc 等)。
 
 ---
 

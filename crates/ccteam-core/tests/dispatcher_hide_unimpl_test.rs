@@ -107,7 +107,13 @@ fn dispatcher_unimpl_intent_does_not_appear_in_routing_table() {
         let routing_section_marker = "step 2: 路由到 sub-skill";
         if let Some(idx) = lower.find(routing_section_marker) {
             // Take the next 400 chars as the routing table region.
-            let end = (idx + 400).min(body.len());
+            // Walk to nearest UTF-8 char boundary at-or-below the target
+            // byte (SKILL.md is mixed CJK + ASCII; raw `idx + 400` can
+            // land mid-codepoint and panic — V0.6.5 W4a fix).
+            let mut end = (idx + 400).min(body.len());
+            while end > idx && !body.is_char_boundary(end) {
+                end -= 1;
+            }
             let region = &body[idx..end];
             assert!(
                 !region.to_lowercase().contains(label),

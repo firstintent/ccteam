@@ -860,9 +860,9 @@ orchestrator 识别 `state.team == "meta-agent"` 走 `process_meta_project` 分�
 
 历史 bug(F165):`init_tracing()` 默认 stdout,在 `tools/list` 第一次 register call 时 `ccteam_imd::register_bot_checked_in` 等 `info!` 会抢 JSON-RPC frame channel,client 解析 first stdout line 失败。F147 测试用 `RUST_LOG=error` env 绕开;F165 根治。
 
-### 12.2 暴露的 tool 清单(M2.5 起 9 tool;V0.2.2 F38 起 10 tool;V0.4.0 F65 起 17 tool;V0.6 F111 起 24 tool;**V0.6.1 F128 起 26 tool**,5 group 子前缀分组)
+### 12.2 暴露的 tool 清单(M2.5 起 9 tool;V0.2.2 F38 起 10 tool;V0.4.0 F65 起 17 tool;V0.6 F111 起 24 tool;V0.6.1 F128 起 26 tool;**V0.6.5 F146/F147/F152/F153 收官 27 tool,0 STUB,0 deprecated alias**,5 group 子前缀分组)
 
-V0.6 F111 起所有 MCP 工具加 group 子前缀,server name 保持 `ccteam`;**F110 上版的 `ccteam` → `ct` rename 取消**(V0.5 用户肌肉记忆 override 4 字符节省)。Group enum(非 glob,防 typo)走 `CCTEAM_DISABLE_TOOLS` env 关组(eg `CCTEAM_DISABLE_TOOLS=advise,chat`)。Group 列表:`workflow_`(15)、`chat_`(5)、`advise_`(2)、`admin_`(3:V0.6 1 + V0.6.1 F128 2)、`screenshot`(单成员独立 group,保 V0.5 名)。
+V0.6 F111 起所有 MCP 工具加 group 子前缀,server name 保持 `ccteam`;**F110 上版的 `ccteam` → `ct` rename 取消**(V0.5 用户肌肉记忆 override 4 字符节省)。Group enum(非 glob,防 typo)走 `CCTEAM_DISABLE_TOOLS` env 关组(eg `CCTEAM_DISABLE_TOOLS=advise,chat`)。Group 列表:`workflow_`(15)、`chat_`(6 — V0.6.5 F146 拆 `chat_lifecycle` 为 register/unregister + F147 `_session_reset`→`_reset` / `_show_turn_log`→`_history` rename,全升真)、`advise_`(2 — V0.6.5 F152/F153 升真)、`admin_`(3:V0.6 1 + V0.6.1 F128 2)、`screenshot`(单成员独立 group,保 V0.5 名)。
 
 | Tool 名 | Group | 对应 CLI / 行为 | 入参 | 返回 |
 |---|---|---|---|---|
@@ -884,7 +884,7 @@ V0.6 F111 起所有 MCP 工具加 group 子前缀,server name 保持 `ccteam`;**
 | `ccteam__workflow_trigger_gate`(V0.4.0 F65)| 写 `<project>/.ccteam/gate_override/<role>`;`force=true` instruct F66 跳过 input-satisfaction check | `{slug: string, role: string, force?: boolean}` | `{ok: bool, slug, role, force, marker, note}` |
 | `ccteam__workflow_get_artifact_summary`(V0.4.0 F65)| stat-only(O(n) on inode,不读 file 内容)遍历 `workflow.yaml` 所有 agent 的 `input`/`output` 目录 | `{slug: string}` | `{slug, artifacts: {<dir>: {count, latest, latest_mtime, size_bytes, exists}}}` |
 
-注:上表 `workflow_*` 16 行 + `screenshot` 1 行 + `admin_ls` 1 行 = V0.5 既有 18 工具(F65 后 17 + screenshot)迁子前缀后形态。下表为 V0.6 F108 / F112 / F114 / F118 新增 `chat_` + `advise_` 两 group;V0.6.5 F146 把 `chat_lifecycle` STUB 拆为 `chat_register_bot` / `chat_unregister_bot` 原子工具(无 deprecated alias — CLAUDE.md §五 #4)+ `chat_list_bots` 升真实现,chat group 由 5 → 6;V0.6.5 F147 把 `chat_send_input` STUB 升真实现 + 把 `chat_session_reset` → `chat_reset`、`chat_show_turn_log` → `chat_history`(rename,无 alias);chat group 维持 6 → 总 27 工具:
+注:上表 `workflow_*` 15 行 + `screenshot` 1 行 + `admin_ls` 1 行 = V0.5 既有 17 工具(F65 后)迁子前缀后形态。下表为 V0.6 F108 / F112 / F114 / F118 新增 `chat_` + `advise_` 两 group;V0.6.5 F146 把 `chat_lifecycle` STUB 拆为 `chat_register_bot` / `chat_unregister_bot` 原子工具(无 deprecated alias — CLAUDE.md §五 #4)+ `chat_list_bots` 升真实现,chat group 由 5 → 6;V0.6.5 F147 把 `chat_send_input` STUB 升真实现 + 把 `chat_session_reset` → `chat_reset`、`chat_show_turn_log` → `chat_history`(rename,无 alias);chat group 维持 6 → 总 27 工具:
 
 | Tool 名(V0.6 新增) | Group | 行为 | 入参 | 返回 |
 |---|---|---|---|---|
