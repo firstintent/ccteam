@@ -100,6 +100,25 @@ V0.6.0 旗舰入口。用户**无需记多个 slash 名**,在 Claude session 内
 - **不做 voice / 图片 / 多模态 input**(V0.7+)
 - **不接受 skill 自定义注册** — 6 sub-skill 固定(team / creator / control / im-setup / advise / scan),用户不能 `/ccteam-add-skill <name>`(由 V0.6.0 PRD F113 §"不在范围"锁定)
 
+## Red line — 未实现 intent **直接隐藏不渲染**(V0.6.5 F159)
+
+任何尚未 ship 的 intent **必须直接从 dispatcher 表面消失**,不得以下列任一形式向用户暴露:
+
+- 路由表 / Step 1 意图表里出现该 intent 行
+- Step 3 fallback dialog 4-options 列出该 intent
+- "V0.7 即将支持" / "敬请期待" 等任何 forward-looking 文案
+- 路由到未实现 sub-skill 后由 sub-skill 报 "尚未实现"(这种 dead-end 是用户视角最差的体验)
+
+**Ship gate**:每个新 intent 进 dispatcher 前必须先确认 ──
+1. 对应 sub-skill 的 SKILL.md body 已写完(真路径,非半成品)
+2. sub-skill 依赖的 MCP 工具 dispatch 真实现(返真结果,不是错误 stub)
+3. 真路径在 host probe 验过
+
+满足 3 条才把 intent 加进 Step 1 表 + Step 2 路由表 + Step 3 fallback 字母选项。Dispatcher
+4-options 动态按 NL 推断 + ship 状态选出最相关的 4 个(V0.6.5 ship 后 7 intent 全可见)。
+
+V0.6.6+ 新 intent ship 前 4-options 表 / 路由表里**不能预占行**;ship 当天才加进来。
+
 ## Where to look in the repo
 
 - `@docs/versions/v0-6-0/prd.md` — F113 完整需求 + 验收(dispatcher 初版)

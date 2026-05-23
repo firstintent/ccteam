@@ -5,7 +5,7 @@ description: "NL dialogue to start a new ccteam project / workflow / IM bot. Pul
 
 # /ccteam-creator — NL bootstrap for ccteam projects
 
-V0.6.0 Wave 2 F114 — supersedes the V0.5 step-1/2/3/4 dispatch
+Shipped via F114 (V0.6.0) — supersedes the V0.5 step-1/2/3/4 dispatch
 dialogue with an LLM-driven NL flow that infers everything the user
 shouldn't have to specify (execution mode, preset, persona),
 surfaces a PROJECT PLAN, and only executes after `go`.
@@ -19,7 +19,7 @@ surfaces a PROJECT PLAN, and only executes after `go`.
 | **Start a new project / workflow / IM bot (this skill)** | **`ccteam-creator`** |
 | Manage existing ccteam projects | `ccteam-control` |
 | One-shot IM token onboarding | `ccteam-im-setup` |
-| Codex + Claude parallel advisor | `ccteam-advise` (Wave 3) |
+| Codex + Claude parallel advisor | `ccteam-advise` |
 
 If the user wants to *start* a short-lived team in their current
 Claude session without persistent ccteam state, point them at
@@ -116,7 +116,7 @@ If no persona is a clean fit, ask the user to pick from the top 3
 candidates. **Do not invent a new persona** — V0.7 will add a
 `/ccteam-creator-persona-new` flow; for V0.6 the library is fixed.
 
-## Phase 3.5 — Codex auto-critic detection (V0.6.0 Wave 3 F112 §B)
+## Phase 3.5 — Codex auto-critic detection (F112 §B, shipped V0.6.0)
 
 When the matched persona's role hints at adversarial / second-opinion
 work, ccteam-creator silently consults the Codex CLI and — if it's
@@ -387,5 +387,5 @@ Never silently re-execute Phase 5 steps that already ran — if
   for V0.6.
 - **Voice / multi-modal input** — V0.7+ (text only).
 - **Cross-vendor agent vendoring** — Codex critic auto-enable is
-  declarative (a hint in PROJECT PLAN); actual Codex vendoring lands
-  in F112 (Wave 3).
+  declarative (a hint in PROJECT PLAN); actual Codex vendoring shipped
+  via F112 (V0.6.0).
