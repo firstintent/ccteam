@@ -252,14 +252,54 @@ The pool is the scientist-nickname list in
 
 ## 5.6  Register the bot
 
-For chat presets, call `ccteam_imd::register_bot(slug, persona_id,
-vendor, im_platform, im_chat_id)` → `Result<PathBuf>`. `im_chat_id`
-comes from the `TelegramCredentials::owner_chat_id()` helper on the
-credential record persisted in 5.1. The `bot_handle` is **not**
-returned from this call — it's resolved by the daemon-side router
-from the rendered `workflow.yaml`'s `chat.bot_name` field at the
-next registry-watcher tick. Embed the minted handle (from 5.5) into
-the `chat.bot_name` slot of the YAML before writing it out in 5.3.
+For chat presets, invoke the **`mcp__ccteam__chat_register_bot`** MCP
+tool. The skill is LLM-driven and cannot call Rust functions directly
+— the registry is reached only through this MCP wire. V0.6.5 F146
+implemented the real handler that writes
+`~/.ccteam/imd/registry/<workflow_slug>/<role>.json`; the daemon's
+registry watcher picks it up and spawns the tmux session.
+
+`im_chat_id` comes from `~/.ccteam/im/credentials.json` written in
+Phase 5.1: take `telegram.allowed_chat_ids[0]` (cast to string —
+Telegram chat ids are i64, but the MCP wire expects a string).
+
+```json
+{
+  "name": "mcp__ccteam__chat_register_bot",
+  "arguments": {
+    "workflow_slug": "<slug from 5.2>",
+    "role": "<persona_id from Phase 3>",
+    "vendor": "claude",
+    "im_platform": "telegram",
+    "im_chat_id": "<allowed_chat_ids[0]>",
+    "persona_id": "<persona_id from Phase 3>"
+  }
+}
+```
+
+**Vendor must be lowercase** (`"claude"` or `"codex"`). The daemon's
+`BotRegistration` deserialize trips on PascalCase `"Claude"` (Bug A
+from V0.6.5 NAS deploy session); the F146 dispatcher lowercases
+defensively, but stick to lowercase in the call to be explicit.
+
+**Error handling:**
+
+- Response `{"ok": true, "path": "..."}` → continue to Phase 5.7.
+- Response `{"ok": false, "error": "already_registered", "path": "..."}`
+  → **idempotent OK**, this is a re-run of the same creator dialogue;
+  log the line `Bot already registered at <path>; reusing` and
+  continue. **Do not** call `chat_unregister_bot` to retry — that
+  would race the daemon's tmux session.
+- Any other error (validation, IO) → **STOP**. Surface to user:
+  `"registry write failed: <error from response>"`. Do not proceed
+  to Phase 5.7 / 5.8 — leaving a half-installed bot with workflow.yaml
+  but no registration is worse than failing the dialogue.
+
+The `bot_handle` is **not** an input to this call — it's resolved by
+the daemon-side router from the rendered `workflow.yaml`'s
+`chat.bot_name` field at the next registry-watcher tick. Embed the
+minted handle (from 5.5) into the `chat.bot_name` slot of the YAML
+before writing it out in 5.3.
 
 ## 5.7  Project-level `.mcp.json`
 
@@ -285,9 +325,14 @@ will roster the new workflow.
   Slug:   <slug>
   Mode:   <preset>
   Persona: <label>
+  Bot 注册到 ~/.ccteam/imd/registry/<slug>/<role>.json ✓
 
 在 <IM platform> 私聊 <@handle> 就能开聊。要看状态:
   /ccteam-control show <slug>
+
+要卸载这个 bot:
+  invoke mcp__ccteam__chat_unregister_bot{workflow_slug: <slug>, role: <role>}
+  (or `ccteam remove <slug> --purge` to wipe everything for the slug)
 ```
 
 (English equivalent if the user wrote in English.)

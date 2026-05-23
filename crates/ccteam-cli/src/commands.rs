@@ -2889,8 +2889,7 @@ fn render_migrate_hook_commands_report(paths: &CcteamPaths, dry_run: bool) -> Re
             hook_sh.display(),
         ));
     }
-    let reports =
-        scan_project_settings_for_hook_rewrite(&paths.projects_root, &hook_sh, dry_run)?;
+    let reports = scan_project_settings_for_hook_rewrite(&paths.projects_root, &hook_sh, dry_run)?;
     if reports.is_empty() {
         out.push_str("  no project `settings.json` files found.\n\n");
         return Ok(out);
@@ -2915,9 +2914,7 @@ fn render_migrate_hook_commands_report(paths: &CcteamPaths, dry_run: bool) -> Re
             "\n  {touched} settings.json file(s) would be rewritten — re-run without --dry-run to apply.\n",
         ));
     } else {
-        out.push_str(&format!(
-            "\n  {touched} settings.json file(s) rewritten.\n",
-        ));
+        out.push_str(&format!("\n  {touched} settings.json file(s) rewritten.\n",));
     }
     out.push('\n');
     Ok(out)
@@ -4213,9 +4210,108 @@ pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Resul
     // 6. Optional `--purge`: project-local ccteam-managed paths.
     if opts.purge {
         purge_project_managed_paths(&project_dir, opts.dry_run, &mut report)?;
+        // V0.6.5 F151 — also clean `~/.ccteam/imd/registry/<slug>/`. The
+        // F146 registry is the daemon's bot lifecycle SoT, so without
+        // this cleanup `list_bots()` still surfaces stale BotRegistration
+        // entries after the workflow.yaml is gone → daemon can spawn an
+        // orphan tmux session.
+        purge_imd_registry_for_slug(&paths.root, slug, opts.dry_run, &mut report)?;
     }
 
     Ok(report)
+}
+
+/// V0.6.5 F151 — purge `~/.ccteam/imd/registry/<slug>/`.
+///
+/// **Strategy:** for each registered role under the slug, call
+/// [`ccteam_imd::unregister_bot_in`] first — this is the in-process
+/// equivalent of the `chat_unregister_bot` MCP tool. It deletes the
+/// `<role>.json` registry file *and* the `<role>.heartbeat` sidecar,
+/// which is exactly what the daemon's registry watcher observes to
+/// close the tmux session gracefully. After all roles are unregistered
+/// (or if the registry dir is empty / malformed), `rm -rf` the
+/// `<slug>/` dir to clean any leftover files (e.g. stale heartbeats
+/// from a previous unregister/re-register cycle that left a sidecar
+/// orphan).
+///
+/// Works whether the daemon is running or not — `unregister_bot_in`
+/// is pure file IO, no daemon RPC.
+fn purge_imd_registry_for_slug(
+    ccteam_root: &std::path::Path,
+    slug: &str,
+    dry_run: bool,
+    report: &mut RemoveReport,
+) -> Result<()> {
+    let slug_dir = ccteam_imd::registry_root_in(ccteam_root).join(slug);
+    if !slug_dir.exists() {
+        // Nothing to clean — non-chat slug or already pristine. Stay
+        // silent (don't add a "nothing to do" step row that clutters
+        // dry-run output).
+        return Ok(());
+    }
+
+    // Enumerate roles via list_bots_in (so we route through the F146
+    // MCP-equivalent surface). Falls back to empty list on parse errors;
+    // the final rm -rf still catches whatever remains.
+    let bots = ccteam_imd::list_bots_in(ccteam_root, Some(slug)).unwrap_or_default();
+    let role_count = bots.len();
+
+    if dry_run {
+        // Count JSON files even if list_bots_in skipped malformed rows.
+        let json_count = std::fs::read_dir(&slug_dir)
+            .map(|it| {
+                it.filter_map(|e| e.ok())
+                    .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("json"))
+                    .count()
+            })
+            .unwrap_or(0);
+        let noun = if json_count == 1 {
+            "JSON file"
+        } else {
+            "JSON files"
+        };
+        report.steps.push(format!(
+            "would purge imd/registry/{slug}/ ({json_count} {noun})"
+        ));
+        return Ok(());
+    }
+
+    // Step 6a — per-role unregister (MCP-equivalent in-process call).
+    // Idempotent miss is fine; just records the path that *was* there.
+    for reg in bots {
+        match ccteam_imd::unregister_bot_in(ccteam_root, &reg.workflow_slug, &reg.role) {
+            Ok((removed, path)) => {
+                if removed {
+                    report.steps.push(format!(
+                        "unregistered bot `{}` (deleted {})",
+                        reg.role,
+                        path.display()
+                    ));
+                }
+            }
+            Err(err) => {
+                // Don't bail — the rm -rf below is the fallback.
+                report.steps.push(format!(
+                    "unregister bot `{}` failed ({err}); will fall back to rm -rf",
+                    reg.role
+                ));
+            }
+        }
+    }
+
+    // Step 6b — final sweep. Catches: heartbeat sidecars whose
+    // registration JSON was already gone, malformed registration
+    // files list_bots_in skipped, or the empty slug dir itself.
+    if slug_dir.exists() {
+        std::fs::remove_dir_all(&slug_dir)
+            .with_context(|| format!("rm -rf {}", slug_dir.display()))?;
+        report.steps.push(format!(
+            "purged imd/registry/{slug}/ ({role_count} role{} cleared)",
+            if role_count == 1 { "" } else { "s" }
+        ));
+    }
+
+    Ok(())
 }
 
 /// Helper for `run_remove --purge` — walks each ccteam-managed path
