@@ -331,11 +331,13 @@ fn tools_list_response() -> Value {
 /// `observe_agents` / `signal` / `set_parallelism` / `trigger_gate` /
 /// `get_artifact_summary`) → 17. V0.6.0 Wave 1 (F111) adds 5 chat
 /// stubs + 2 advise stubs → 24. V0.6.1 F128 adds 2 admin mutators
-/// (`admin_change_persona` + `admin_add_tool`) → **26 total**. All
-/// tools carry a group sub-prefix (`admin_`, `workflow_`, `chat_`,
-/// `advise_`) except `ccteam__screenshot` which keeps its
-/// single-member-group name for V0.5 muscle memory. Schemas mirror
-/// interfaces.md §12.2.
+/// (`admin_change_persona` + `admin_add_tool`) → 26. V0.6.5 F146
+/// swaps `chat_lifecycle` STUB for real `chat_register_bot` +
+/// `chat_unregister_bot` (no deprecated alias — CLAUDE.md §五 #4)
+/// → **27 total**. All tools carry a group sub-prefix (`admin_`,
+/// `workflow_`, `chat_`, `advise_`) except `ccteam__screenshot`
+/// which keeps its single-member-group name for V0.5 muscle memory.
+/// Schemas mirror interfaces.md §12.2.
 fn tool_definitions() -> Vec<Value> {
     let mut tools: Vec<Value> = vec![
         // Read-only inspection.
@@ -521,11 +523,13 @@ async fn call_tool(paths: &CcteamPaths, params: &Value) -> Result<Vec<Value>> {
             if let Some(body) = mcp_workflow_tools::dispatch(paths, other, &args)? {
                 return Ok(text_content(body));
             }
-            // V0.6.0 Wave 1 — chat / advise stubs land here. Both
-            // dispatchers return Ok(None) for tools that aren't
-            // theirs, so the fall-through to `unknown tool` below
-            // is preserved for genuine typos.
-            if let Some(body) = mcp_chat_tools::dispatch(other, &args)? {
+            // V0.6.5 F146 — chat group: real register / unregister /
+            // list_bots dispatchers + 3 F147-pending stubs. The
+            // dispatcher returns Ok(None) for tools that aren't ours
+            // so the fall-through to `unknown tool` below is preserved
+            // for genuine typos. None of the chat tools currently gate
+            // on a live daemon (file-system control plane only).
+            if let Some(body) = mcp_chat_tools::dispatch(paths, other, &args)? {
                 return Ok(text_content(body));
             }
             if let Some(body) = mcp_advise_tools::dispatch(other, &args)? {
@@ -916,8 +920,10 @@ mod tests {
         // 10. V0.4.0 F65 adds 7 workflow tools → 17. V0.6.0 Wave 1
         // (F111) adds 5 chat stubs + 2 advise stubs → 24. V0.6.1 F128
         // adds 2 admin mutators (`change_persona` + `add_tool`) → 26.
+        // V0.6.5 F146 chat group net +1 (removed `chat_lifecycle`,
+        // added `chat_register_bot` + `chat_unregister_bot`) → 27.
         // Bump this when a new tool lands.
-        assert_eq!(tool_definitions().len(), 26);
+        assert_eq!(tool_definitions().len(), 27);
     }
 
     #[test]
@@ -926,7 +932,7 @@ mod tests {
         let mut names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), 26, "tool names must be unique");
+        assert_eq!(names.len(), 27, "tool names must be unique");
         for tool in &tools {
             assert!(tool["name"].as_str().unwrap().starts_with("ccteam__"));
             assert_eq!(tool["inputSchema"]["type"], "object");
@@ -1028,7 +1034,9 @@ mod tests {
         // M2.5: 9 tools. V0.2.2 F38: +1 (`ccteam__screenshot`) → 10.
         // V0.4.0 F65: +7 workflow tools → 17. V0.6.0 Wave 1 (F111):
         // +5 chat stubs +2 advise stubs → 24. V0.6.1 F128: +2 admin
-        // mutators (`change_persona` + `add_tool`) → 26.
+        // mutators (`change_persona` + `add_tool`) → 26. V0.6.5 F146:
+        // chat group went from 5 → 6 (removed `chat_lifecycle`,
+        // added `chat_register_bot` + `chat_unregister_bot`) → 27.
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = CcteamPaths {
             root: tmp.path().join("home"),
@@ -1042,7 +1050,7 @@ mod tests {
         });
         let resp = handle_request(&paths, &req).await.unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 26);
+        assert_eq!(tools.len(), 27);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"ccteam__screenshot"));
         // V0.4.0 F65 — spot-check one of the new tools is in the list.
@@ -1051,6 +1059,11 @@ mod tests {
         // V0.6.0 Wave 1 — chat / advise stubs present.
         assert!(names.contains(&"ccteam__chat_send_input"));
         assert!(names.contains(&"ccteam__advise_vote"));
+        // V0.6.5 F146 — chat register / unregister land here, and the
+        // old `chat_lifecycle` is gone (no deprecated alias).
+        assert!(names.contains(&"ccteam__chat_register_bot"));
+        assert!(names.contains(&"ccteam__chat_unregister_bot"));
+        assert!(!names.contains(&"ccteam__chat_lifecycle"));
     }
 
     #[tokio::test]

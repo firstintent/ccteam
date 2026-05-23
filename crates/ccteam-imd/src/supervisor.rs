@@ -35,8 +35,8 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{anyhow, Context, Result};
 use ccteam_core::execution::turns_mirror::{self, TurnRecord};
 use ccteam_core::harness::{
-    AgentSpecBrief, HarnessAdapter, SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails,
-    TurnId, TurnInput,
+    AgentSpecBrief, HarnessAdapter, SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails, TurnId,
+    TurnInput,
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -321,10 +321,7 @@ impl BotSupervisor {
         let project_dir = self.project_dir();
         let ctx = SpawnCtx {
             slug: self.reg.workflow_slug.clone(),
-            sid: format!(
-                "{}-{}",
-                self.reg.workflow_slug, self.reg.role
-            ),
+            sid: format!("{}-{}", self.reg.workflow_slug, self.reg.role),
             cwd: project_dir.clone(),
             project_dir,
             extra_args: Vec::new(),
@@ -408,6 +405,21 @@ impl BotSupervisor {
                         "imd: heartbeat write failed"
                     );
                 }
+                // V0.6.5 F146 — also touch the sidecar registry
+                // heartbeat under `~/.ccteam/imd/registry/<slug>/<role>.heartbeat`
+                // so a separate MCP-tool process can read `running`
+                // status off disk without RPCing the daemon. Best-effort
+                // — failure here doesn't kill the per-bot heartbeat
+                // above (which the supervisor's stale-restart logic
+                // relies on).
+                if let Err(err) = crate::touch_bot_heartbeat(&slug, &role) {
+                    tracing::warn!(
+                        slug = %slug,
+                        role = %role,
+                        error = %err,
+                        "imd: registry heartbeat write failed"
+                    );
+                }
             }
         });
         *guard = Some(handle);
@@ -484,9 +496,7 @@ impl BotSupervisor {
                         // cursor — the dispatcher persists this on
                         // successful TG ack so a daemon restart re-sends
                         // only un-acked rows.
-                        let cursor_after = std::fs::metadata(&path)
-                            .map(|m| m.len())
-                            .unwrap_or(0);
+                        let cursor_after = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                         tracing::info!(
                             event = "latency",
                             stage = "turn.done",
@@ -578,9 +588,13 @@ impl BotSupervisor {
     pub async fn handle_inbound(&self, payload: String) -> Result<TurnId> {
         let handle = {
             let st = self.state.lock().await;
-            st.handle
-                .clone()
-                .ok_or_else(|| anyhow!("bot {}/{} not started", self.reg.workflow_slug, self.reg.role))?
+            st.handle.clone().ok_or_else(|| {
+                anyhow!(
+                    "bot {}/{} not started",
+                    self.reg.workflow_slug,
+                    self.reg.role
+                )
+            })?
         };
         let id = self
             .adapter
@@ -614,15 +628,12 @@ impl BotSupervisor {
             st.handle.take()
         };
         if let Some(h) = handle {
-            self.adapter
-                .close_thread(&h)
-                .await
-                .with_context(|| {
-                    format!(
-                        "close_thread for {}/{}",
-                        self.reg.workflow_slug, self.reg.role
-                    )
-                })?;
+            self.adapter.close_thread(&h).await.with_context(|| {
+                format!(
+                    "close_thread for {}/{}",
+                    self.reg.workflow_slug, self.reg.role
+                )
+            })?;
             tracing::info!(
                 slug = %self.reg.workflow_slug,
                 role = %self.reg.role,
@@ -659,7 +670,8 @@ impl BotSupervisor {
             let mut st = self.state.lock().await;
             st.restarts.push(Instant::now());
             // Trim to last hour to keep the vec bounded.
-            st.restarts.retain(|t| t.elapsed() < Duration::from_secs(3600));
+            st.restarts
+                .retain(|t| t.elapsed() < Duration::from_secs(3600));
         }
         // Start.
         self.ensure_started().await
@@ -751,7 +763,9 @@ mod bot_supervisor_tests {
             Box::pin(futures::stream::empty())
         }
         async fn resume_thread(&self, _id: &str) -> Result<ThreadHandle, HarnessError> {
-            Err(HarnessError::NotImplemented { reason: "stub".into() })
+            Err(HarnessError::NotImplemented {
+                reason: "stub".into(),
+            })
         }
         async fn close_thread(&self, _h: &ThreadHandle) -> Result<(), HarnessError> {
             self.closes.fetch_add(1, Ordering::SeqCst);
@@ -877,7 +891,10 @@ mod tests {
             handle: Some(fake_handle()),
             ..Default::default()
         };
-        assert_eq!(decide(tmp.path(), &reg, &st, SystemTime::now()), SupervisorAction::Shutdown);
+        assert_eq!(
+            decide(tmp.path(), &reg, &st, SystemTime::now()),
+            SupervisorAction::Shutdown
+        );
     }
 
     #[test]
@@ -895,7 +912,10 @@ mod tests {
             handle: Some(fake_handle()),
             ..Default::default()
         };
-        assert_eq!(decide(tmp.path(), &reg, &st, SystemTime::now()), SupervisorAction::Drain);
+        assert_eq!(
+            decide(tmp.path(), &reg, &st, SystemTime::now()),
+            SupervisorAction::Drain
+        );
     }
 
     #[test]
@@ -916,7 +936,10 @@ mod tests {
             handle: Some(fake_handle()),
             ..Default::default()
         };
-        assert_eq!(decide(tmp.path(), &reg, &st, SystemTime::now()), SupervisorAction::Restart);
+        assert_eq!(
+            decide(tmp.path(), &reg, &st, SystemTime::now()),
+            SupervisorAction::Restart
+        );
     }
 
     #[test]
@@ -930,7 +953,10 @@ mod tests {
             handle: Some(fake_handle()),
             ..Default::default()
         };
-        assert_eq!(decide(tmp.path(), &reg, &st, SystemTime::now()), SupervisorAction::NoOp);
+        assert_eq!(
+            decide(tmp.path(), &reg, &st, SystemTime::now()),
+            SupervisorAction::NoOp
+        );
     }
 
     #[test]
