@@ -1,0 +1,216 @@
+# tests/intent-corpus.yaml
+#
+# V0.6.5 F162 — 50-query intent classifier accuracy corpus.
+#
+# Each query maps to one of the 7 ccteam dispatcher intents (per
+# skills/ccteam/SKILL.md routing table + F157 code-scan addition).
+# Designed to exercise the static routing table embedded in
+# scripts/host-probe/intent-accuracy.sh (mock mode) and optionally
+# a live `claude --print` dispatcher pass (--real mode).
+#
+# Distribution: 7 intents x 7-8 queries each = 50 entries.
+# Languages: mixed zh/cn + en, including a handful of misspellings and
+# colloquial phrasing.
+#
+# Schema (per query):
+#   - query: <NL string>
+#     expected_intent: <one of: start-team|create-workflow|configure-im
+#                              |monitor|advise|status-debug|code-scan>
+#     lang: zh | en
+#
+# Ship gate: overall accuracy >= 0.90 (F113 验收 #5; see
+# docs/versions/v0-6-5/prd.md §F162).
+queries:
+  # ─────────────────────────────────────────────────────────────
+  # 1. start-team  (7 entries)
+  #    Trigger: "起 team / swarm / fix all X / 并行 / 重构 / qa"
+  # ─────────────────────────────────────────────────────────────
+  - query: "起一个 team 帮我 fix 所有 TS 编译错误"
+    expected_intent: start-team
+    lang: zh
+  - query: "fix all TS errors"
+    expected_intent: start-team
+    lang: en
+  - query: "并行 3 个 agent 重构这个 module"
+    expected_intent: start-team
+    lang: zh
+  - query: "swarm 5 个 worker refactor crates/ccteam-core"
+    expected_intent: start-team
+    lang: en
+  - query: "team 3:dev,reviewer,qa 跑 qa-loop"
+    expected_intent: start-team
+    lang: zh
+  - query: "qa loop on the new payment flow"
+    expected_intent: start-team
+    lang: en
+  - query: "起 4 个 teammate 修这一批 lint warning"
+    expected_intent: start-team
+    lang: zh
+
+  # ─────────────────────────────────────────────────────────────
+  # 2. create-workflow  (7 entries)
+  #    Trigger: "做个 bot / IM 助理 / 夜里跑 / 长跑监控 / Pocket
+  #              Assistant / Overnight"
+  # ─────────────────────────────────────────────────────────────
+  - query: "我想做个 TG 助理 bot"
+    expected_intent: create-workflow
+    lang: zh
+  - query: "build a telegram assistant bot for me"
+    expected_intent: create-workflow
+    lang: en
+  - query: "做个 IM 群里多 bot 一起聊天的项目"
+    expected_intent: create-workflow
+    lang: zh
+  - query: "set up an overnight builder that runs every night at 2am"
+    expected_intent: create-workflow
+    lang: en
+  - query: "建一个 workflow 长跑监控我的 cron 错误"
+    expected_intent: create-workflow
+    lang: zh
+  - query: "I want a Pocket Assistant style chat bot"
+    expected_intent: create-workflow
+    lang: en
+  - query: "搞个 Lark 私聊助理,24/7 在线"
+    expected_intent: create-workflow
+    lang: zh
+
+  # ─────────────────────────────────────────────────────────────
+  # 3. configure-im  (7 entries)
+  #    Trigger: "绑 token / 换 Slack / chat_id / IM 设置 / 对接 Lark"
+  # ─────────────────────────────────────────────────────────────
+  - query: "绑 TG token"
+    expected_intent: configure-im
+    lang: zh
+  - query: "怎么对接 Lark"
+    expected_intent: configure-im
+    lang: zh
+  - query: "set up my slack token"
+    expected_intent: configure-im
+    lang: en
+  - query: "我的 chat_id 是多少"
+    expected_intent: configure-im
+    lang: zh
+  - query: "换 Slack workspace 重新绑"
+    expected_intent: configure-im
+    lang: zh
+  - query: "register my telegram bot token here"
+    expected_intent: configure-im
+    lang: en
+  - query: "IM 设置在哪 / 怎么改"
+    expected_intent: configure-im
+    lang: zh
+
+  # ─────────────────────────────────────────────────────────────
+  # 4. monitor  (7 entries)
+  #    Trigger: "项目状态 / ls / 跑得怎样 / 看 X 项目 / 哪些 team 在跑"
+  # ─────────────────────────────────────────────────────────────
+  - query: "我哪些项目还活着"
+    expected_intent: monitor
+    lang: zh
+  - query: "ls all my running projects"
+    expected_intent: monitor
+    lang: en
+  - query: "现在哪些 team 在跑"
+    expected_intent: monitor
+    lang: zh
+  - query: "show me the status of all workflows"
+    expected_intent: monitor
+    lang: en
+  - query: "我项目跑得怎么样了"
+    expected_intent: monitor
+    lang: zh
+  - query: "list all active ccteam sessions"
+    expected_intent: monitor
+    lang: en
+  - query: "看一下整体跑得怎样"
+    expected_intent: monitor
+    lang: zh
+
+  # ─────────────────────────────────────────────────────────────
+  # 5. advise  (7 entries)
+  #    Trigger: "second opinion / 投票决定 / Codex + Claude 各给 /
+  #              两边都问下 / advise X"
+  # ─────────────────────────────────────────────────────────────
+  - query: "Claude + Codex 都看看 A vs B"
+    expected_intent: advise
+    lang: zh
+  - query: "give me a second opinion on this PR"
+    expected_intent: advise
+    lang: en
+  - query: "两边都问下,我选哪个方案"
+    expected_intent: advise
+    lang: zh
+  - query: "Codex 和 Claude 各给一个方案对比下"
+    expected_intent: advise
+    lang: zh
+  - query: "advise me on this architecture decision"
+    expected_intent: advise
+    lang: en
+  - query: "投票决定下这个 refactor 要不要做"
+    expected_intent: advise
+    lang: zh
+  - query: "ask both models which approach is better"
+    expected_intent: advise
+    lang: en
+
+  # ─────────────────────────────────────────────────────────────
+  # 6. status-debug  (7 entries)
+  #    Trigger: "为啥撞 budget / 看 log / stop X / pause X /
+  #              resume X / X 卡住了"
+  # ─────────────────────────────────────────────────────────────
+  - query: "为啥 dev-foo 撞 budget 了"
+    expected_intent: status-debug
+    lang: zh
+  - query: "pause dev-foo right now"
+    expected_intent: status-debug
+    lang: en
+  - query: "resume my-bot-slug 项目"
+    expected_intent: status-debug
+    lang: zh
+  - query: "stop the overnight-builder workflow"
+    expected_intent: status-debug
+    lang: en
+  - query: "pocket-asst-xyz 卡住了 看看 log"
+    expected_intent: status-debug
+    lang: zh
+  - query: "why did im-squad-abc hit cost cap"
+    expected_intent: status-debug
+    lang: en
+  - query: "暂停 dev-foo"
+    expected_intent: status-debug
+    lang: zh
+
+  # ─────────────────────────────────────────────────────────────
+  # 7. code-scan  (V0.6.5 new, 7 entries)
+  #    Trigger: "扫一下代码 / 摸底新项目 / scan code / audit codebase"
+  # ─────────────────────────────────────────────────────────────
+  - query: "扫一下这个代码库"
+    expected_intent: code-scan
+    lang: zh
+  - query: "scan code for me"
+    expected_intent: code-scan
+    lang: en
+  - query: "摸底一下这个新项目"
+    expected_intent: code-scan
+    lang: zh
+  - query: "audit this codebase quickly"
+    expected_intent: code-scan
+    lang: en
+  - query: "帮我先看下这仓库长啥样"
+    expected_intent: code-scan
+    lang: zh
+  - query: "quick scan of this repo, what is it"
+    expected_intent: code-scan
+    lang: en
+  - query: "新项目刚 clone 下来,先 audit 一下"
+    expected_intent: code-scan
+    lang: zh
+
+  # ─────────────────────────────────────────────────────────────
+  # Padding to hit exactly 50 entries (currently 7x7 = 49).
+  # Extra entry is a mid-difficulty start-team to give the
+  # largest "real work" intent one more sample.
+  # ─────────────────────────────────────────────────────────────
+  - query: "组个小队把所有 clippy warning 清掉"
+    expected_intent: start-team
+    lang: zh
