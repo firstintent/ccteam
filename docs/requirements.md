@@ -167,6 +167,11 @@ ccteam 服务于「**想做软件、但不想（也不应）成为项目经理**
 **用户真正的诉求：**
 > "团队的运转**不依赖我在场**。我下班关电脑，早上起来看结果。"
 
+**ccteam 当前进展**(V0.6.3 起两条外部触发源补齐):
+- **F140 真 cron**(`Trigger::Schedule` 接 5 段 cron + `croner` crate + skip-missed 语义)— 让 schedule trigger 从 V0.4.6 stub 落地为可定时巡检 / 夜间任务的真实触发。
+- **F141 webhook ingress**(`POST /webhook/:project/:token` 挂 daemon web server,落 `.ccteam/webhooks/` 由 watch trigger 消费)— 让 CI 红 / CVE / PR-open 等外部系统事件能直接推 ccteam,不再依赖人手动触发。
+- 痛点 9 的"用户在场当 team-lead"主诉求由 V0.6.0 起的 mode 2/3 + meta-agent + IM bot 已大头解决;F140/F141 补齐"团队还需要被外部世界触发"这一维。
+
 ---
 
 ### 痛点 10：每个新项目都从零开始
@@ -305,7 +310,7 @@ ccteam 主动开了 4 个 tmux session 并行——后端 1 个、前端 1 个�
 - **资源约束**:`workflow.yaml::budget`(V0.4.6 F84)`max_cost_usd_per_24h` / `max_agent_spawns_per_hour` 自动 trip + auto-disable;daemon 全局 `MAX_CONCURRENT_PROJECTS: 3` 硬上限。
 
 **边界 — 这条不解决什么**:
-- 不解决**自动任务分解**(workflow.yaml 拓扑要 ccteam-creator skill / 人手工写) — 本痛点假设 workflow.yaml 已声明好 fan-out 拓扑。
+- 不解决**自动任务分解**(workflow.yaml 拓扑要 ccteam-creator skill / 人手工写) — 本痛点假设 workflow.yaml 已声明好 fan-out 拓扑。**V0.6.3 F143 进展**:顶层 `squad: { leader, members, hop_limit }` 块补齐**跨 session 运行时路由** —— leader 在运行时挑哪个 member 接活(写 `<member>--*.md` artifact),由 orchestrator 按文件名前缀 dispatch。membership 仍**静态声明在 workflow.yaml**(可审计、不开 prompt-injection 面),F143 关掉的是**运行时 dispatch**,**不是**自动 decomposition —— 这条边界仍成立。
 - 不解决**子模块接口同步**(role 之间通过 artifact 文件协作,无 RPC/IPC 内层契约管理)。
 
 ---
@@ -325,6 +330,8 @@ ccteam 主动开了 4 个 tmux session 并行——后端 1 个、前端 1 个�
 - 多 agent 并行 + workflow.yaml fan-out + artifact-driven 协作 → 把大问题切到 N 个独立子模块
 - 长跑 daemon + meta-agent 总管 → 撞死路自己换 stack 试 / 撞不会的 RFC 自己研究
 - artifact 文件 + progress.jsonl 是跨 session 的"团队共识"载体,context 漂掉无所谓 — 下个 spawn 读 artifact 就有共识
+
+**长跑维护方向的 V0.6.3 进展**:F140 真 cron(定时巡检 / 夜间依赖升级) + F141 webhook ingress(CI 红 / CVE / PR-open 等外部事件触发) + F142 vendor-seam forward-compat(`vendor_compat::warn_unknown_vendor_token` warn-once;未知 Claude job state → 非终态续 probe,未知 Codex event → skip + warn,不让上游 CLI 节奏外的新字段 / 新 enum 值把 daemon 干 panic)—— 三条都服务"长跑可靠性",但**距 V1.0.0 ≥7 天连续自助跑**仍有距离(关键缺口在 budget shaping / 跨模块语义同步,见上)。
 
 **V1.0.0 目标**:
 - 能让 ccteam **连续自助跑 ≥7 天**做一个真实项目(20-100k LOC,有 DB + API + frontend + e2e test),期间用户 ≤5 次拍板
