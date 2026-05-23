@@ -172,12 +172,15 @@ fn mcp_serve_tools_list_returns_full_tool_set() {
         // V0.6.0 Wave 1 (F111) chat group — V0.6.5 F146 swapped
         // `chat_lifecycle` STUB for `chat_register_bot` +
         // `chat_unregister_bot` real tools (no deprecated alias).
+        // V0.6.5 F147 renamed `chat_session_reset` → `chat_reset` and
+        // `chat_show_turn_log` → `chat_history` (no aliases —
+        // CLAUDE.md §五 #4).
         "ccteam__chat_send_input",
         "ccteam__chat_register_bot",
         "ccteam__chat_unregister_bot",
-        "ccteam__chat_session_reset",
+        "ccteam__chat_reset",
         "ccteam__chat_list_bots",
-        "ccteam__chat_show_turn_log",
+        "ccteam__chat_history",
         // V0.6.0 Wave 1 (F111) advise stubs.
         "ccteam__advise_vote",
         "ccteam__advise_parallel",
@@ -191,6 +194,15 @@ fn mcp_serve_tools_list_returns_full_tool_set() {
     assert!(
         !names.contains(&"ccteam__chat_lifecycle"),
         "chat_lifecycle was removed in V0.6.5 F146 (no deprecated alias per CLAUDE.md §五 #4)"
+    );
+    // V0.6.5 F147 — renamed without alias.
+    assert!(
+        !names.contains(&"ccteam__chat_session_reset"),
+        "chat_session_reset was renamed to chat_reset in V0.6.5 F147 (no deprecated alias)"
+    );
+    assert!(
+        !names.contains(&"ccteam__chat_show_turn_log"),
+        "chat_show_turn_log was renamed to chat_history in V0.6.5 F147 (no deprecated alias)"
     );
     // Schema sanity: every tool must declare `inputSchema.type=object`.
     for tool in tools {

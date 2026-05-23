@@ -64,6 +64,15 @@ pub const MAX_RESTARTS_PER_HOUR: usize = 6;
 pub const SHUTDOWN_SIGNAL: &str = "shutdown.signal";
 /// Name of the drain-mode signal file (`drain.signal`).
 pub const DRAIN_SIGNAL: &str = "drain.signal";
+/// V0.6.5 F147 — name of the session-reset signal file
+/// (`reset.signal`). When present in `<bot_dir>/signals/`, the next
+/// supervisor tick archives the bot's `turns.jsonl`, closes the active
+/// tmux session, force-resets the outbound + transcript cursors to 0
+/// (V0.6.4 Bug B防线 — prevents the new session's first burst of
+/// transcript bytes from getting deduped against the old cursor), and
+/// starts a fresh thread. The signal file is unlinked after the reset
+/// completes so the next tick doesn't loop.
+pub const RESET_SIGNAL: &str = "reset.signal";
 
 /// Per-bot runtime state held by the supervisor.
 #[derive(Debug, Clone, Default)]
@@ -93,6 +102,13 @@ pub enum SupervisorAction {
     Quarantine,
     /// Initial spawn (no handle yet).
     Spawn,
+    /// V0.6.5 F147 — user-requested session reset
+    /// (`signals/reset.signal`). Archive `turns.jsonl`, close + start a
+    /// fresh thread, and reset the outbound + transcript cursors to 0.
+    /// Differs from `Restart`: doesn't count against the per-hour
+    /// restart budget (this is an intentional user action, not a flap),
+    /// and ALWAYS archives so the new session starts on a clean mirror.
+    ResetSession,
 }
 
 /// Refresh the daemon-global heartbeat file. Creates parent dir.
@@ -126,6 +142,15 @@ pub fn decide(
     // Layer B — drain mode.
     if signal_present(&bot_dir, DRAIN_SIGNAL) {
         return SupervisorAction::Drain;
+    }
+
+    // V0.6.5 F147 — explicit user reset wins over the heartbeat-stale
+    // restart loop, but loses to shutdown / drain (terminal states).
+    // Independent of restart budget — a manual reset is an intentional
+    // action, not a flap, and should always succeed even when the bot
+    // has burned through its hourly Restart budget.
+    if signal_present(&bot_dir, RESET_SIGNAL) {
+        return SupervisorAction::ResetSession;
     }
 
     // Layer C — restart budget exhausted → quarantine.
@@ -677,6 +702,134 @@ impl BotSupervisor {
         self.ensure_started().await
     }
 
+    /// V0.6.5 F147 — execute a user-requested session reset.
+    ///
+    /// Sequence:
+    /// 1. Abort heartbeat + events background tasks against the old
+    ///    handle (mirrors `restart` / `shutdown`).
+    /// 2. Archive the current `turns.jsonl` into
+    ///    `<bot_dir>/archive/turns-<unix-ms>.jsonl` so the new session
+    ///    starts on an empty mirror (post-condition the F147 acceptance
+    ///    spec asserts).
+    /// 3. Clear the **on-disk** `transcript-cursor.json` (V0.6.4 Bug B
+    ///    防线 — the new session writes a fresh `<sid>.jsonl` whose
+    ///    byte offsets start at 0; leaving the old `prior_offsets`
+    ///    around would make the tail loop dedup-skip new content as
+    ///    "already seen" the moment Anthropic happens to re-pick a
+    ///    historical sid). The **in-memory** OutboundCursor is reset by
+    ///    the daemon's tick handler before calling this method (it
+    ///    owns the `Arc<OutboundCursor>` via `bot_channels`).
+    /// 4. Best-effort `close_thread` on the old handle. We proceed to
+    ///    start even on close failure — the tmux session may already
+    ///    be dead from a prior crash, which is one of the legitimate
+    ///    reasons users hit reset.
+    /// 5. Unlink the `signals/reset.signal` file so the next tick
+    ///    doesn't loop.
+    /// 6. `ensure_started` against a fresh handle.
+    ///
+    /// Returns the path of the archived `turns.jsonl` (or `None` when
+    /// the file didn't exist — fresh bot that received a reset before
+    /// any turn was taken).
+    pub async fn reset_session(&self) -> Result<Option<PathBuf>> {
+        self.abort_background_tasks().await;
+
+        // 2. Archive the existing turns.jsonl.
+        let bot_dir = self.bot_dir();
+        let turns_path = bot_dir.join("turns.jsonl");
+        let archived = if turns_path.exists() {
+            let archive_dir = bot_dir.join("archive");
+            fs::create_dir_all(&archive_dir)
+                .with_context(|| format!("mkdir -p {}", archive_dir.display()))?;
+            let unix_ms = chrono::Utc::now().timestamp_millis();
+            let dest = archive_dir.join(format!("turns-{unix_ms}.jsonl"));
+            fs::rename(&turns_path, &dest).with_context(|| {
+                format!("rename {} -> {}", turns_path.display(), dest.display())
+            })?;
+            tracing::info!(
+                slug = %self.reg.workflow_slug,
+                role = %self.reg.role,
+                from = %turns_path.display(),
+                to = %dest.display(),
+                "F147 reset: archived turns.jsonl"
+            );
+            Some(dest)
+        } else {
+            None
+        };
+
+        // 3. Clear the on-disk transcript cursor (V0.6.4 Bug B防线 — see
+        // doc-comment above). Best-effort: a missing / corrupt cursor
+        // file would have been treated as fresh anyway, so we don't
+        // fail the reset for a `remove_file` error here.
+        let cursor_file = bot_dir.join("transcript-cursor.json");
+        if cursor_file.exists() {
+            if let Err(err) = fs::remove_file(&cursor_file) {
+                tracing::warn!(
+                    slug = %self.reg.workflow_slug,
+                    role = %self.reg.role,
+                    path = %cursor_file.display(),
+                    error = %err,
+                    "F147 reset: transcript cursor unlink failed (continuing)"
+                );
+            }
+        }
+
+        // Also clear the disk outbound.cursor so a daemon restart between
+        // here and the next outbound dispatch starts from 0 too. The
+        // in-memory cursor is reset by the daemon-side coordinator (sees
+        // `ResetSession` returned from `apply_action` and calls
+        // `force_set(0)` on the shared `OutboundCursor` Arc).
+        let outbound_cursor_file = bot_dir.join("outbound.cursor");
+        if outbound_cursor_file.exists() {
+            if let Err(err) = fs::remove_file(&outbound_cursor_file) {
+                tracing::warn!(
+                    slug = %self.reg.workflow_slug,
+                    role = %self.reg.role,
+                    path = %outbound_cursor_file.display(),
+                    error = %err,
+                    "F147 reset: outbound cursor unlink failed (continuing)"
+                );
+            }
+        }
+
+        // 4. Close the old handle (best-effort).
+        let handle = self.state.lock().await.handle.take();
+        if let Some(h) = handle {
+            if let Err(err) = self.adapter.close_thread(&h).await {
+                tracing::warn!(
+                    slug = %self.reg.workflow_slug,
+                    role = %self.reg.role,
+                    error = %err,
+                    "F147 reset: close_thread failed; proceeding to start"
+                );
+            }
+        }
+
+        // 5. Unlink the signal so the next tick doesn't re-trigger.
+        let sig = bot_dir.join("signals").join(RESET_SIGNAL);
+        if sig.exists() {
+            if let Err(err) = fs::remove_file(&sig) {
+                tracing::warn!(
+                    slug = %self.reg.workflow_slug,
+                    role = %self.reg.role,
+                    path = %sig.display(),
+                    error = %err,
+                    "F147 reset: signal unlink failed (next tick may re-trigger)"
+                );
+            }
+        }
+
+        // 6. Fresh start.
+        self.ensure_started().await?;
+        tracing::info!(
+            slug = %self.reg.workflow_slug,
+            role = %self.reg.role,
+            archived = ?archived.as_ref().map(|p| p.display().to_string()),
+            "F147 reset: session restart complete"
+        );
+        Ok(archived)
+    }
+
     /// Apply one supervisor decision (called per supervisor tick by
     /// the daemon). Returns the action that was applied for logging.
     pub async fn apply_action(&self, action: SupervisorAction) -> Result<SupervisorAction> {
@@ -697,6 +850,14 @@ impl BotSupervisor {
                 // policy hook decides the drain UX.)
                 let mut st = self.state.lock().await;
                 st.draining = true;
+            }
+            SupervisorAction::ResetSession => {
+                // V0.6.5 F147 — the daemon's tick handler is responsible
+                // for resetting the in-memory `OutboundCursor` (it owns
+                // the `Arc<OutboundCursor>` via `bot_channels`) before
+                // we get here. This method just covers the bot-side
+                // teardown + archive + transcript-cursor wipe.
+                self.reset_session().await?;
             }
             SupervisorAction::Quarantine | SupervisorAction::NoOp => {}
         }

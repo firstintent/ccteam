@@ -333,7 +333,14 @@ where
                         Vec::new()
                     }
                 };
-                tick_supervisors(&bots, &registry, Some(&projects_root), &factory).await;
+                tick_supervisors(
+                    &bots,
+                    &registry,
+                    Some(&projects_root),
+                    &factory,
+                    Some(&bot_channels),
+                )
+                .await;
                 ensure_bot_channels(
                     &bots,
                     &registry,
@@ -1116,11 +1123,23 @@ pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
 /// supervisor registry, then for each known bot calls
 /// `decide(...)` against its live state and applies the resulting
 /// action through the supervisor (`apply_action`).
+///
+/// V0.6.5 F147 — when `bot_channels` is provided **and** the
+/// supervisor's decision is `ResetSession`, we force-reset the
+/// in-memory `OutboundCursor` (Bug B防线) before calling
+/// `apply_action`. The supervisor handles the on-disk side
+/// (archive + transcript cursor wipe + close + start) but cannot reach
+/// the cursor `Arc` itself — `bot_channels` owns those handles. When
+/// `bot_channels` is `None` (legacy callers / tests without an outbound
+/// pipeline wired), the cursor reset is skipped and the supervisor's
+/// disk-side wipe still applies; the next `load_from_disk` will pick
+/// up the cleared cursor on the next daemon restart.
 pub(crate) async fn tick_supervisors(
     bots: &[BotRegistration],
     registry: &Arc<Mutex<SupervisorRegistry>>,
     projects_root_override: Option<&Path>,
     factory: &AdapterFactory,
+    bot_channels: Option<&BotChannelMap>,
 ) {
     let owned;
     let projects_root: &Path = match projects_root_override {
@@ -1156,6 +1175,30 @@ pub(crate) async fn tick_supervisors(
             ?action,
             "supervisor decision"
         );
+
+        // V0.6.5 F147 — Bug B防线: reset the in-memory OutboundCursor
+        // BEFORE the supervisor archives + restarts so any concurrent
+        // events-task push that lands during the gap is dedup-checked
+        // against position 0 (the post-reset baseline), not the
+        // pre-reset position that would silently drop new content.
+        if action == supervisor::SupervisorAction::ResetSession {
+            if let Some(ch_map) = bot_channels {
+                let key = bot_key(&bot.workflow_slug, &bot.role);
+                let cursor_opt = {
+                    let guard = ch_map.lock().await;
+                    guard.get(&key).map(|c| c.outbound_cursor.clone())
+                };
+                if let Some(cur) = cursor_opt {
+                    cur.force_set(0).await;
+                    tracing::info!(
+                        slug = %bot.workflow_slug,
+                        role = %bot.role,
+                        "F147 reset: in-memory OutboundCursor force-reset to 0 (Bug B防线)"
+                    );
+                }
+            }
+        }
+
         if let Err(err) = sup.apply_action(action.clone()).await {
             tracing::warn!(
                 slug = %bot.workflow_slug,
@@ -1278,6 +1321,7 @@ mod tests {
             &registry,
             Some(projects.path()),
             &adapter_factory,
+            None,
         )
         .await;
         assert_eq!(adapter.starts.load(Ordering::SeqCst), 1);
@@ -1288,6 +1332,7 @@ mod tests {
             &registry,
             Some(projects.path()),
             &adapter_factory,
+            None,
         )
         .await;
         assert_eq!(adapter.starts.load(Ordering::SeqCst), 2);
@@ -1302,6 +1347,7 @@ mod tests {
             &registry,
             Some(projects.path()),
             &adapter_factory,
+            None,
         )
         .await;
         assert_eq!(adapter.starts.load(Ordering::SeqCst), 2, "no new start");
@@ -1336,6 +1382,7 @@ mod tests {
             &registry,
             Some(projects.path()),
             &adapter_factory,
+            None,
         )
         .await;
         assert_eq!(adapter.starts.load(Ordering::SeqCst), 1);
@@ -1349,6 +1396,7 @@ mod tests {
             &registry,
             Some(projects.path()),
             &adapter_factory,
+            None,
         )
         .await;
         assert_eq!(adapter.closes.load(Ordering::SeqCst), 1);

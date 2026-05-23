@@ -152,10 +152,7 @@ impl MailboxResolver for DefaultMailboxResolver {
 /// Helper [`has_at_mention`] does the @ detection; kept public so
 /// unit tests can probe the boundary cases (e.g. bare "@" with no
 /// handle char).
-pub fn auto_route_dm_mention(
-    msg: &mut ChannelMessage,
-    bots: &[crate::BotRegistration],
-) {
+pub fn auto_route_dm_mention(msg: &mut ChannelMessage, bots: &[crate::BotRegistration]) {
     if has_at_mention(&msg.content) {
         return;
     }
@@ -352,7 +349,12 @@ pub async fn process_inbound_admin_aware(
 /// Render a human-readable + machine-parseable Markdown envelope.
 /// Front-matter YAML header carries the structured metadata; body is
 /// the sanitized payload.
-fn render_envelope(env: &InboxEnvelope) -> String {
+///
+/// V0.6.5 F147 — `pub` so the MCP `chat_send_input` tool can hand-build
+/// an envelope and drop it into the mailbox directly (bypassing the IM
+/// security pipeline, since the caller is the meta-agent host process
+/// already running with full local trust).
+pub fn render_envelope(env: &InboxEnvelope) -> String {
     let yaml = serde_yaml::to_string(env).unwrap_or_default();
     format!("---\n{yaml}---\n\n{}\n", env.payload)
 }
@@ -425,7 +427,9 @@ mod tests {
         .await
         .unwrap();
         match res {
-            InboundOutcome::DroppedToBot { slug, role, path, .. } => {
+            InboundOutcome::DroppedToBot {
+                slug, role, path, ..
+            } => {
                 assert_eq!(slug, "dev-foo");
                 assert_eq!(role, "lead");
                 assert!(path.exists());
