@@ -95,6 +95,11 @@ pub struct BotChannels {
     /// Outbound side — `BotSupervisor::spawn_events_consumer` pushes
     /// here after appending `turns.jsonl`.
     pub outbound_tx: mpsc::Sender<OutboundItem>,
+    /// Per-bot outbound cursor — owned by the dispatcher AND read by
+    /// the safety-net `drain_outboxes` so both writers go through a
+    /// single monotonic primitive (closes the fast-path × drain race
+    /// that produced the NAS-environment duplicate-message flood).
+    pub outbound_cursor: Arc<crate::outbound::OutboundCursor>,
 }
 
 /// `<slug>/<role>` → channels. Shared across the daemon's inbound

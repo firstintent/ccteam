@@ -359,7 +359,7 @@ where
                     }
                 };
                 drain_inboxes(&bots, &registry, &projects_root).await;
-                drain_outboxes(&bots, &channels, &projects_root).await;
+                drain_outboxes(&bots, &channels, &bot_channels, &projects_root).await;
             }
             _ = &mut shutdown => {
                 tracing::info!("ccteam-imd: shutdown signalled; exiting cleanly");
@@ -488,7 +488,14 @@ fn spawn_inbound_consumer(
                     // silently when the dispatcher isn't ready yet —
                     // the safety-net `drain_inboxes` tick picks the
                     // envelope up from disk next pass.
-                    if let InboundOutcome::DroppedToBot { slug, role, path, payload, cid: item_cid } = outcome {
+                    if let InboundOutcome::DroppedToBot {
+                        slug,
+                        role,
+                        path,
+                        payload,
+                        cid: item_cid,
+                    } = outcome
+                    {
                         let guard = bot_channels.lock().await;
                         if let Some(ch) = guard.get(&bot_key(&slug, &role)) {
                             let item = InboxItem {
@@ -621,11 +628,15 @@ async fn ensure_bot_channels(
         ));
 
         // Outbound dispatcher: drain the channel, call
-        // `channel.send`, persist the cursor on successful TG ack.
+        // `channel.send`, advance the shared OutboundCursor on
+        // successful TG ack. The cursor is also handed to
+        // drain_outboxes (via bot_channels) so both writers share the
+        // same monotonic primitive.
         let chat_id = bot.im_chat_id.clone();
         let platform = bot.im_platform.clone();
         let cursor_path =
             outbound::outbound_cursor_path(projects_root, &bot.workflow_slug, &bot.role);
+        let outbound_cursor = outbound::OutboundCursor::load_from_disk(cursor_path);
         let slug_log = bot.workflow_slug.clone();
         let role_log = bot.role.clone();
         tokio::spawn(spawn_outbound_dispatcher(
@@ -633,7 +644,7 @@ async fn ensure_bot_channels(
             channel,
             chat_id,
             platform,
-            cursor_path,
+            outbound_cursor.clone(),
             slug_log,
             role_log,
         ));
@@ -642,13 +653,14 @@ async fn ensure_bot_channels(
         // consumer can fan out from the next ItemCompleted onward.
         sup.set_outbound_tx(outbound_tx.clone()).await;
 
-        // Register both senders so the inbound consumer + future ticks
-        // see them.
+        // Register both senders + the shared cursor so the inbound
+        // consumer + future ticks (and drain_outboxes) see them.
         bot_channels.lock().await.insert(
             key,
             BotChannels {
                 inbox_tx,
                 outbound_tx,
+                outbound_cursor,
             },
         );
         tracing::info!(
@@ -713,29 +725,44 @@ async fn spawn_inbox_dispatcher(
 }
 
 /// V0.6.1 fast-path — per-bot outbound dispatcher task body. Drains
-/// [`OutboundItem`]s from `rx`, calls `channel.send`, persists the
-/// outbound cursor on successful TG ack so a daemon restart re-sends
-/// only un-acked rows.
-#[allow(clippy::too_many_arguments)]
+/// [`OutboundItem`]s from `rx`, calls `channel.send`, advances the
+/// shared [`OutboundCursor`] on success.
+///
+/// **Dedup invariant**: before sending, the dispatcher checks whether
+/// the safety-net `drain_outboxes` has already covered this row (via
+/// `cursor.current() >= item.cursor_after`). If so, skip the send
+/// entirely — TG already received this content from the other path.
+/// Combined with [`OutboundCursor::try_advance`]'s monotonic guard,
+/// this gives both writers a single source of truth and closes both
+/// the cursor-rewind loop and the per-row double-send window that
+/// the NAS-environment bug exposed.
 async fn spawn_outbound_dispatcher(
     mut rx: mpsc::Receiver<OutboundItem>,
     channel: Arc<dyn Channel + Send + Sync>,
     chat_id: String,
     platform: String,
-    cursor_path: PathBuf,
+    cursor: Arc<outbound::OutboundCursor>,
     slug_log: String,
     role_log: String,
 ) {
     while let Some(item) = rx.recv().await {
-        if item.role != "assistant" {
-            // Non-assistant rows still advance the cursor so we don't
-            // re-read them on safety-net drain.
-            let _ = outbound::save_cursor(
-                &cursor_path,
-                &outbound::TailCursor {
-                    position: item.cursor_after,
-                },
+        // Already covered by drain_outboxes — skip the redundant TG
+        // send. Without this check, both paths would deliver the same
+        // row on overlap.
+        if item.cursor_after <= cursor.current().await {
+            tracing::debug!(
+                slug = %slug_log,
+                role = %role_log,
+                turn_id = %item.turn_id,
+                cursor_after = item.cursor_after,
+                "imd: outbound dispatcher skipped (cursor already advanced past this row)"
             );
+            continue;
+        }
+        if item.role != "assistant" {
+            // Non-assistant rows still advance the cursor so the
+            // safety-net drain doesn't re-read them.
+            cursor.try_advance(item.cursor_after).await;
             continue;
         }
         let tail_age_ms = now_unix_ms().saturating_sub(item.enqueue_unix_ms) as u64;
@@ -756,28 +783,11 @@ async fn spawn_outbound_dispatcher(
                     content_len = item.content.len(),
                     "latency imd.outbound.dispatch (mpsc)"
                 );
-                if let Err(err) = outbound::save_cursor(
-                    &cursor_path,
-                    &outbound::TailCursor {
-                        position: item.cursor_after,
-                    },
-                ) {
-                    tracing::warn!(
-                        slug = %slug_log,
-                        role = %role_log,
-                        error = %err,
-                        "imd: outbound dispatcher save_cursor failed"
-                    );
-                }
+                cursor.try_advance(item.cursor_after).await;
             }
             Err(err) => {
-                // Don't advance cursor on failure — safety-net
-                // drain_outboxes will retry from the previous cursor
-                // position next minute. (Note: rows that arrived AFTER
-                // this one through the mpsc still get processed; if
-                // those succeed and advance cursor past this row, the
-                // failed row is lost. Acceptable trade-off vs.
-                // serialized retry loop for V0.6.1.)
+                // Don't advance cursor on failure — the safety-net
+                // drain will retry from the previous cursor position.
                 tracing::warn!(
                     event = "latency",
                     stage = "imd.outbound.dispatch.err",
@@ -867,10 +877,8 @@ async fn drain_inboxes(
                         continue;
                     }
                     let cid = env.message_id.clone();
-                    let received_ms =
-                        env.received_at.timestamp_millis().max(0) as u128;
-                    let queue_age_ms =
-                        now_unix_ms().saturating_sub(received_ms) as u64;
+                    let received_ms = env.received_at.timestamp_millis().max(0) as u128;
+                    let queue_age_ms = now_unix_ms().saturating_sub(received_ms) as u64;
                     let drain_t0 = std::time::Instant::now();
                     match sup.handle_inbound(env.payload).await {
                         Ok(id) => {
@@ -937,6 +945,7 @@ async fn drain_inboxes(
 async fn drain_outboxes(
     bots: &[BotRegistration],
     channels: &ChannelMap,
+    bot_channels: &BotChannelMap,
     projects_root: &Path,
 ) {
     for bot in bots {
@@ -950,45 +959,91 @@ async fn drain_outboxes(
             continue;
         };
         let path = outbound::turns_jsonl_path(projects_root, &bot.workflow_slug, &bot.role);
-        let cursor_path =
-            outbound::outbound_cursor_path(projects_root, &bot.workflow_slug, &bot.role);
-        let cursor = outbound::load_cursor(&cursor_path);
-        let (rows, new_cursor) = match outbound::read_new_rows(&path, &cursor) {
-            Ok(x) => x,
-            Err(err) => {
-                tracing::warn!(
-                    slug = %bot.workflow_slug,
-                    role = %bot.role,
-                    error = %err,
-                    "imd: F134 outbound: read_new_rows failed; continuing"
-                );
-                continue;
+
+        // Prefer the shared OutboundCursor owned by the fast-path
+        // dispatcher (so we update the same in-memory state and the
+        // dispatcher's pre-send dedup check sees our progress
+        // immediately). If the fast-path hasn't been wired yet
+        // (supervisor still starting up), fall back to a freshly
+        // loaded cursor — it's a transient state during startup and
+        // the next tick will pick up the shared one.
+        let key = bot_key(&bot.workflow_slug, &bot.role);
+        let cursor: Arc<outbound::OutboundCursor> = {
+            let guard = bot_channels.lock().await;
+            match guard.get(&key) {
+                Some(ch) => ch.outbound_cursor.clone(),
+                None => {
+                    let cursor_path = outbound::outbound_cursor_path(
+                        projects_root,
+                        &bot.workflow_slug,
+                        &bot.role,
+                    );
+                    outbound::OutboundCursor::load_from_disk(cursor_path)
+                }
             }
         };
-        if rows.is_empty() {
-            // Still persist a cursor advance on truncation (read_new_rows
-            // rewinds to 0 on shrink — record the new position so we
-            // don't keep rewinding on every tick).
-            if new_cursor.position != cursor.position {
-                if let Err(err) = outbound::save_cursor(&cursor_path, &new_cursor) {
+
+        let start = cursor.current().await;
+        let (rows, _eof) =
+            match outbound::read_new_rows_indexed(&path, &outbound::TailCursor { position: start })
+            {
+                Ok(x) => x,
+                Err(err) => {
                     tracing::warn!(
                         slug = %bot.workflow_slug,
                         role = %bot.role,
                         error = %err,
-                        "imd: F134 outbound: save_cursor (truncation rewind) failed"
+                        "imd: F134 outbound: read_new_rows_indexed failed; continuing"
                     );
+                    continue;
                 }
-            }
+            };
+
+        // Truncation handling: if turns.jsonl shrunk below the current
+        // cursor, read_new_rows_indexed rewinds `start` to 0 internally
+        // and returns rows from the new (shorter) file. We mirror that
+        // rewind in the OutboundCursor via `force_set(0)` so the
+        // per-row dedup check below doesn't reject the post-truncation
+        // content (which has byte offsets smaller than the pre-rotation
+        // cursor). After force_set(0), each forwarded row advances the
+        // cursor row-by-row via try_advance, the same as steady-state.
+        //
+        // Trade-off: post-rotation content gets forwarded once; the
+        // user may see duplicates of pre-rotation content. That is
+        // acceptable for the rare rotation case and matches the V0.6.1
+        // policy. The NAS-bug we are closing here is the *unbounded*
+        // re-forward loop, not the one-shot rotation re-send.
+        let file_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if start > 0 && file_len < start {
+            cursor.force_set(0).await;
+            tracing::info!(
+                slug = %bot.workflow_slug,
+                role = %bot.role,
+                old_position = start,
+                new_eof = file_len,
+                "imd: F134 outbound: turns.jsonl truncation detected; cursor force-reset to 0"
+            );
+        }
+
+        if rows.is_empty() {
             continue;
         }
-        // Latency: log per-row tail age so we can see how long each
-        // assistant row sat in turns.jsonl before this tick picked it
-        // up. Bounded by `args.tick` (5s default) but a busy daemon
-        // with many bots can drift higher; this log makes it visible.
-        for row in &rows {
+
+        let mut sent = 0usize;
+        for indexed in &rows {
+            let row = &indexed.row;
+            let row_end = indexed.end_pos;
+
+            // Per-row dedup: the dispatcher may have advanced the
+            // cursor past this row between read and now. Skip both
+            // the TG send AND the cursor write in that case.
+            if row_end <= cursor.current().await {
+                continue;
+            }
+
             let tail_age_ms = row.ts.map(|t| {
-                crate::latency::now_unix_ms()
-                    .saturating_sub(t.timestamp_millis().max(0) as u128) as u64
+                crate::latency::now_unix_ms().saturating_sub(t.timestamp_millis().max(0) as u128)
+                    as u64
             });
             tracing::info!(
                 event = "latency",
@@ -1001,9 +1056,35 @@ async fn drain_outboxes(
                 content_len = row.content.len(),
                 "latency outbound.tail"
             );
+
+            if !outbound::should_forward(row, &[]) {
+                cursor.try_advance(row_end).await;
+                continue;
+            }
+
+            let mut msg = crate::transport::SendMessage::new(row.content.clone(), &bot.im_chat_id);
+            msg.thread_ts = row.thread_ts.clone();
+            match channel.send(&msg).await {
+                Ok(_tg_msg_id) => {
+                    cursor.try_advance(row_end).await;
+                    sent += 1;
+                }
+                Err(err) => {
+                    // Stop advancing on send failure so a later tick
+                    // retries from the same position. Continuing to
+                    // later rows would orphan this one behind a higher
+                    // cursor.
+                    tracing::warn!(
+                        slug = %bot.workflow_slug,
+                        role = %bot.role,
+                        error = %err,
+                        "imd: F134 outbound: channel.send failed; halting drain for this bot"
+                    );
+                    break;
+                }
+            }
         }
-        let sent =
-            outbound::forward_new_rows(&rows, channel.as_ref(), &bot.im_chat_id, &[]).await;
+
         if sent > 0 {
             tracing::info!(
                 slug = %bot.workflow_slug,
@@ -1012,14 +1093,6 @@ async fn drain_outboxes(
                 chat_id = %bot.im_chat_id,
                 "imd: F134 outbound forwarded {} rows",
                 sent
-            );
-        }
-        if let Err(err) = outbound::save_cursor(&cursor_path, &new_cursor) {
-            tracing::warn!(
-                slug = %bot.workflow_slug,
-                role = %bot.role,
-                error = %err,
-                "imd: F134 outbound: save_cursor failed"
             );
         }
     }

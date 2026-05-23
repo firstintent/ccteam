@@ -170,7 +170,10 @@ async fn daemon_forwards_turns_jsonl_to_channel() {
         2,
         "expected 2 assistant rows forwarded (got {}): {:?}",
         outbox.len(),
-        outbox.iter().map(|m| m.content.as_str()).collect::<Vec<_>>()
+        outbox
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
     );
     assert_eq!(outbox[0].content, "hello from the bot");
     assert_eq!(outbox[0].recipient, "chat-42");
@@ -244,6 +247,200 @@ async fn daemon_no_op_when_turns_jsonl_missing() {
     assert!(
         outbox.is_empty(),
         "expected no forwards when turns.jsonl missing (got {:?})",
-        outbox.iter().map(|m| m.content.as_str()).collect::<Vec<_>>()
+        outbox
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
     );
+}
+
+/// Regression: turns.jsonl truncated below the persisted cursor must
+/// not produce an unbounded re-forward loop on each safety-net tick.
+///
+/// Before the OutboundCursor refactor, the dispatcher's `save_cursor`
+/// had an in-function monotonic guard that silently dropped writes
+/// smaller than the on-disk value. That guard incidentally killed
+/// `drain_outboxes`'s truncation-rewind branch — the cursor could
+/// never decrease, so every subsequent drain saw the stale large
+/// cursor, `read_new_rows` rewound to 0 (because cursor > len),
+/// re-read the post-truncation rows, re-forwarded them, and the
+/// rejected `save_cursor(small)` left the cursor stale for the next
+/// tick. Repeat forever → flood of duplicates on the IM channel.
+///
+/// Fix: `OutboundCursor::force_set` is the explicit truncation escape
+/// hatch; `drain_outboxes` detects shrink via `file_len < cursor.current`
+/// and calls it before forwarding. After this, the cursor sits at the
+/// new EOF and subsequent ticks find nothing new.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drain_handles_truncation_without_repeat_forwarding() {
+    let _g = env_lock();
+    let home = isolate_home();
+    let projects_root = home.path().join("projects");
+    std::fs::create_dir_all(&projects_root).unwrap();
+
+    register_bot(
+        "dev-trunc",
+        "lead",
+        AgentVendor::Claude,
+        "telegram",
+        "chat-99",
+    )
+    .unwrap();
+
+    // Seed turns.jsonl with one short post-truncation row.
+    let chat_dir = projects_root.join("dev-trunc/.ccteam/chat/lead");
+    std::fs::create_dir_all(&chat_dir).unwrap();
+    let turns_path = chat_dir.join("turns.jsonl");
+    let row = r#"{"role":"assistant","content":"post-rotation reply"}"#;
+    std::fs::write(&turns_path, format!("{row}\n")).unwrap();
+    let new_eof = std::fs::metadata(&turns_path).unwrap().len();
+
+    // Seed an outbound.cursor that points well past the new EOF —
+    // simulates a turns.jsonl that was much longer before and got
+    // rotated / truncated while the daemon was offline.
+    let cursor_path = outbound::outbound_cursor_path(&projects_root, "dev-trunc", "lead");
+    std::fs::write(&cursor_path, r#"{"position": 10000}"#).unwrap();
+    assert!(
+        new_eof < 10000,
+        "test pre-condition: new EOF < stale cursor"
+    );
+
+    let mock = Arc::new(MockChannel::new());
+    let mut channels: ChannelMap = std::collections::HashMap::new();
+    channels.insert(
+        "telegram".to_string(),
+        mock.clone() as Arc<dyn Channel + Send + Sync>,
+    );
+    let adapter = Arc::new(QuietAdapter::default());
+    let adapter_factory: AdapterFactory = {
+        let cloned = adapter.clone();
+        Arc::new(move |_| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
+    };
+    let args = DaemonArgs {
+        credentials: None,
+        registry: Some(projects_root.clone()),
+        tick: Duration::from_millis(50),
+        max_runtime: Some(Duration::from_millis(600)),
+        adapter_factory: Some(adapter_factory),
+        channels_override: Some(channels),
+    };
+    run_daemon_with_shutdown(args, async {
+        futures::future::pending::<()>().await;
+    })
+    .await
+    .unwrap();
+
+    // The post-truncation row is forwarded EXACTLY ONCE, not on every
+    // tick. (Pre-fix this would be 1 forward per safety-net pass — and
+    // since the safety_net_ticker tokio::interval fires immediately on
+    // first poll, even a short test run would see >= 1 duplicate.)
+    let outbox = mock.outbox().await;
+    assert_eq!(
+        outbox.len(),
+        1,
+        "expected exactly 1 forward post-truncation (got {}): {:?}",
+        outbox.len(),
+        outbox
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    // Cursor should sit at the new EOF — not stuck at the stale 10000
+    // and not stuck at 0 (which would re-forward next tick).
+    let body = std::fs::read_to_string(&cursor_path).unwrap();
+    let cursor: outbound::TailCursor = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        cursor.position, new_eof,
+        "cursor should land at the new EOF ({} bytes)",
+        new_eof
+    );
+}
+
+/// Regression: pre-seeded cursor at EOF must not produce a single
+/// forward on the drain pass. Models the steady-state case where the
+/// fast-path dispatcher already delivered every row and persisted the
+/// cursor; the safety-net drain should see "nothing new" and stay
+/// quiet. Pre-fix, a race between the fast-path's per-row save and
+/// the drain's batch save could rewind the cursor under the EOF and
+/// produce a duplicate forward — this exercises the dedup-against-
+/// current-cursor invariant from the OutboundCursor refactor.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drain_no_op_when_cursor_already_at_eof() {
+    let _g = env_lock();
+    let home = isolate_home();
+    let projects_root = home.path().join("projects");
+    std::fs::create_dir_all(&projects_root).unwrap();
+
+    register_bot(
+        "dev-eof",
+        "lead",
+        AgentVendor::Claude,
+        "telegram",
+        "chat-eof",
+    )
+    .unwrap();
+
+    let chat_dir = projects_root.join("dev-eof/.ccteam/chat/lead");
+    std::fs::create_dir_all(&chat_dir).unwrap();
+    let turns_path = chat_dir.join("turns.jsonl");
+    std::fs::write(
+        &turns_path,
+        concat!(
+            r#"{"role":"assistant","content":"already delivered 1"}"#,
+            "\n",
+            r#"{"role":"assistant","content":"already delivered 2"}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    let eof = std::fs::metadata(&turns_path).unwrap().len();
+
+    // Cursor pre-positioned at EOF — simulates the steady-state where
+    // the fast-path dispatcher already shipped every row.
+    let cursor_path = outbound::outbound_cursor_path(&projects_root, "dev-eof", "lead");
+    std::fs::write(&cursor_path, format!(r#"{{"position": {eof}}}"#)).unwrap();
+
+    let mock = Arc::new(MockChannel::new());
+    let mut channels: ChannelMap = std::collections::HashMap::new();
+    channels.insert(
+        "telegram".to_string(),
+        mock.clone() as Arc<dyn Channel + Send + Sync>,
+    );
+    let adapter = Arc::new(QuietAdapter::default());
+    let adapter_factory: AdapterFactory = {
+        let cloned = adapter.clone();
+        Arc::new(move |_| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
+    };
+    let args = DaemonArgs {
+        credentials: None,
+        registry: Some(projects_root.clone()),
+        tick: Duration::from_millis(50),
+        max_runtime: Some(Duration::from_millis(400)),
+        adapter_factory: Some(adapter_factory),
+        channels_override: Some(channels),
+    };
+    run_daemon_with_shutdown(args, async {
+        futures::future::pending::<()>().await;
+    })
+    .await
+    .unwrap();
+
+    let outbox = mock.outbox().await;
+    assert!(
+        outbox.is_empty(),
+        "drain must not re-forward when cursor is already at EOF (got {:?})",
+        outbox
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    // Cursor should remain at EOF — drain saw no new rows so it didn't
+    // call try_advance; the value is preserved.
+    let body = std::fs::read_to_string(&cursor_path).unwrap();
+    let cursor: outbound::TailCursor = serde_json::from_str(&body).unwrap();
+    assert_eq!(cursor.position, eof);
 }

@@ -46,6 +46,22 @@ use crate::harness::{ThreadEvent, ThreadItem, ThreadItemDetails};
 /// Persistent cursor written to
 /// `<project>/.ccteam/chat/<bot>/transcript-cursor.json`. Stored as
 /// JSON (not jsonl) — small, single-record state.
+///
+/// **Multi-session aware** (NAS flood fix): the cursor tracks a
+/// per-session-id `byte_offset` map (`prior_offsets`) plus a `current`
+/// `(session_id, byte_offset)` pointer. This closes a duplicate-emit
+/// bug that surfaces when the user's main claude session spawns
+/// Task-tool subagents — each subagent writes its own jsonl into the
+/// same `~/.claude/projects/<encoded-cwd>/` dir, so
+/// [`discover_active_session`] (picks most-recently-modified jsonl)
+/// oscillates between the main session and subagent jsonls. With the
+/// old single-cursor design, every oscillation reset
+/// `byte_offset = 0` and re-emitted all events of the newly-picked
+/// session → 15× duplicate Telegram sends per round-trip.
+///
+/// With per-sid tracking, switching to a known sid resumes from its
+/// persisted offset (no re-emit), and a genuinely-new sid starts at
+/// 0 once (the legitimate `/clear` or `/compact` rotation case).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TranscriptCursor {
     /// Encoded cwd path component (slashes → dashes; matches Anthropic
@@ -56,13 +72,28 @@ pub struct TranscriptCursor {
     /// session has been associated yet.
     #[serde(default)]
     pub session_id: String,
-    /// Byte offset we've parsed up to inside `<sid>.jsonl`.
+    /// Byte offset we've parsed up to inside the **current**
+    /// `<session_id>.jsonl`. Use [`switch_session`](Self::switch_session)
+    /// when transitioning to a different sid — never set this to 0
+    /// directly on a switch, or duplicates will surface for any sid
+    /// we've already drained.
     #[serde(default)]
     pub byte_offset: u64,
     /// Last event uuid we saw. Defensive — lets a future migration
     /// detect a duplicate-emit bug without scanning the whole tail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_event_id: Option<String>,
+    /// Per-sid byte offsets for sessions we've previously tailed.
+    /// `switch_session` reads / writes this map so we resume on
+    /// re-entry instead of restarting from byte 0.
+    ///
+    /// Bounded growth: `~/.claude/projects/<encoded>/` accumulates
+    /// jsonls over a project's lifetime (one per `claude` invocation +
+    /// one per Task-tool subagent). Realistically O(100s) entries per
+    /// active project; entries are small (sid string + u64) so the
+    /// JSON file stays well under a few KB.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub prior_offsets: HashMap<String, u64>,
 }
 
 impl TranscriptCursor {
@@ -92,6 +123,34 @@ impl TranscriptCursor {
             .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
         Ok(())
     }
+
+    /// Transition the cursor to `new_sid`. Saves the current sid's
+    /// `byte_offset` into [`prior_offsets`](Self::prior_offsets) so a
+    /// later return to the same sid resumes — never re-reads.
+    ///
+    /// - Same `new_sid` as current: no-op (returns `false`).
+    /// - Known `new_sid` in `prior_offsets`: resumes at that offset
+    ///   (no re-emit).
+    /// - Unknown `new_sid`: starts at 0 (legitimate fresh session).
+    ///
+    /// Always clears [`last_event_id`](Self::last_event_id) on a real
+    /// switch since per-session uuids don't carry over. Caller still
+    /// owns persisting via [`save`](Self::save).
+    pub fn switch_session(&mut self, new_sid: &str, project_encoded: String) -> bool {
+        if self.session_id == new_sid {
+            return false;
+        }
+        if !self.session_id.is_empty() {
+            self.prior_offsets
+                .insert(self.session_id.clone(), self.byte_offset);
+        }
+        let resume_offset = self.prior_offsets.get(new_sid).copied().unwrap_or(0);
+        self.session_id = new_sid.to_string();
+        self.byte_offset = resume_offset;
+        self.last_event_id = None;
+        self.project_encoded = project_encoded;
+        true
+    }
 }
 
 /// Encode a cwd path the way Anthropic does for
@@ -118,9 +177,19 @@ pub fn cursor_path(project_dir: &Path, bot_role: &str) -> PathBuf {
     super::turns_mirror::chat_dir(project_dir, bot_role).join("transcript-cursor.json")
 }
 
-/// Pick the most recently-modified `<sid>.jsonl` under
-/// `~/.claude/projects/<encoded>/`. Returns `None` when the dir is
-/// missing or empty.
+/// Pick the most recently-modified **main-session** `<sid>.jsonl`
+/// under `~/.claude/projects/<encoded>/`. Returns `None` when the dir
+/// is missing, empty, or contains only subagent jsonls.
+///
+/// **Subagent filter**: claude's Task tool spawns subagents into the
+/// same project dir, each writing its own `<sid>.jsonl`. Without the
+/// filter, `discover_active_session` returned whichever was most
+/// recently modified — including subagents — and the tail loop
+/// alternated between main and subagent files, re-emitting events
+/// each time. The filter skips any jsonl whose first line declares
+/// `"type":"agent-setting"` (the marker Anthropic writes for
+/// subagent sessions). Main-session jsonls carry `"type":"last-prompt"`
+/// or `"type":"summary"` and pass through.
 pub fn discover_active_session(cwd: &Path) -> Option<(String, PathBuf)> {
     let dir = anthropic_project_dir(cwd)?;
     let entries = std::fs::read_dir(&dir).ok()?;
@@ -135,12 +204,43 @@ pub fn discover_active_session(cwd: &Path) -> Option<(String, PathBuf)> {
         };
         let Ok(meta) = ent.metadata() else { continue };
         let Ok(mtime) = meta.modified() else { continue };
+        if is_subagent_jsonl(&path) {
+            continue;
+        }
         match &best {
             Some((t, _, _)) if *t >= mtime => {}
             _ => best = Some((mtime, stem.to_string(), path)),
         }
     }
     best.map(|(_, sid, p)| (sid, p))
+}
+
+/// Check whether a jsonl file is a subagent transcript (Task-tool
+/// spawn) rather than a main claude chat session. Subagents are
+/// internal — their assistant messages must NOT be forwarded to the
+/// user-facing IM channel.
+///
+/// Heuristic: subagent jsonls open with a `"type":"agent-setting"`
+/// record (Anthropic-internal marker). Main-session jsonls open with
+/// `"type":"last-prompt"`, `"type":"summary"`, or a user/assistant
+/// record. We read the first line only and look for the subagent
+/// marker as a substring — a parse-free check that survives schema
+/// drift on other fields and tolerates very long lines.
+///
+/// Files that error on read are treated as **not** subagents
+/// (fail-safe — better to tail a possibly-irrelevant file once than
+/// to silently drop a real session).
+pub fn is_subagent_jsonl(path: &Path) -> bool {
+    use std::io::{BufRead, BufReader};
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut first_line = String::new();
+    if BufReader::new(file).read_line(&mut first_line).is_err() {
+        return false;
+    }
+    first_line.contains("\"type\":\"agent-setting\"")
+        || first_line.contains("\"type\": \"agent-setting\"")
 }
 
 /// In-memory carry-over for `tool_use` ↔ `tool_result` pairing across
@@ -428,17 +528,143 @@ mod tests {
     fn cursor_round_trips_through_disk() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("c.json");
+        let mut prior = HashMap::new();
+        prior.insert("old-sid-1".to_string(), 100u64);
+        prior.insert("old-sid-2".to_string(), 250u64);
         let c = TranscriptCursor {
             project_encoded: "-foo".into(),
             session_id: "abc".into(),
             byte_offset: 4242,
             last_event_id: Some("ev-1".into()),
+            prior_offsets: prior,
         };
         c.save(&path).unwrap();
         let back = TranscriptCursor::load(&path).unwrap();
         assert_eq!(back.byte_offset, 4242);
         assert_eq!(back.session_id, "abc");
         assert_eq!(back.last_event_id.as_deref(), Some("ev-1"));
+        assert_eq!(back.prior_offsets.get("old-sid-1"), Some(&100));
+        assert_eq!(back.prior_offsets.get("old-sid-2"), Some(&250));
+    }
+
+    /// Regression: switching between a known sid and a different sid
+    /// must NOT reset byte_offset to 0 on re-entry. This is the bug
+    /// that caused the NAS Telegram duplicate flood — `discover_active_session`
+    /// returns the most-recently-modified jsonl, which oscillates
+    /// between the main claude session and Task-tool subagent jsonls.
+    /// Each oscillation previously triggered `byte_offset = 0` and a
+    /// full re-read of the newly-picked session.
+    #[test]
+    fn switch_session_resumes_known_sid() {
+        let mut c = TranscriptCursor::default();
+        // Bind to session A at offset 500.
+        assert!(c.switch_session("session-A", "-proj".into()));
+        c.byte_offset = 500;
+
+        // Switch to session B (subagent jsonl). A's offset is persisted.
+        assert!(c.switch_session("session-B", "-proj".into()));
+        assert_eq!(c.byte_offset, 0, "unseen sid starts at 0");
+        assert_eq!(c.prior_offsets.get("session-A"), Some(&500));
+        c.byte_offset = 300;
+
+        // Switch back to A — must resume at 500, NOT restart at 0.
+        assert!(c.switch_session("session-A", "-proj".into()));
+        assert_eq!(
+            c.byte_offset, 500,
+            "returning to a known sid must resume — restarting would re-emit all events"
+        );
+        assert_eq!(c.prior_offsets.get("session-B"), Some(&300));
+
+        // Same-sid call is a no-op.
+        assert!(!c.switch_session("session-A", "-proj".into()));
+        assert_eq!(c.byte_offset, 500);
+    }
+
+    /// The architectural primary defense against the NAS duplicate flood:
+    /// subagent jsonls (`"type":"agent-setting"` first line) must be
+    /// filtered out so `discover_active_session` never picks them.
+    /// Without this filter, `tail_loop` oscillates between main and
+    /// subagent sessions and re-emits each on every switch.
+    #[test]
+    fn is_subagent_jsonl_detects_agent_setting_marker() {
+        let tmp = TempDir::new().unwrap();
+        let subagent = tmp.path().join("sa.jsonl");
+        std::fs::write(
+            &subagent,
+            r#"{"type":"agent-setting","sessionId":"sa-1","cwd":"/x"}
+{"type":"user","sessionId":"sa-1"}
+"#,
+        )
+        .unwrap();
+        assert!(is_subagent_jsonl(&subagent));
+
+        let main = tmp.path().join("main.jsonl");
+        std::fs::write(
+            &main,
+            r#"{"type":"last-prompt","sessionId":"main-1"}
+{"type":"user","sessionId":"main-1"}
+"#,
+        )
+        .unwrap();
+        assert!(!is_subagent_jsonl(&main));
+
+        // Tolerate the spaced JSON variant some serializers produce.
+        let spaced = tmp.path().join("spaced.jsonl");
+        std::fs::write(&spaced, r#"{"type": "agent-setting","sessionId":"sa-2"}"#).unwrap();
+        assert!(is_subagent_jsonl(&spaced));
+
+        // Missing / empty file → fail-safe to not-a-subagent.
+        let missing = tmp.path().join("missing.jsonl");
+        assert!(!is_subagent_jsonl(&missing));
+    }
+
+    /// Regression: `discover_active_session` must skip subagent jsonls
+    /// even when they are the most-recently-modified file in the dir.
+    /// This is the actual NAS-flood root cause condition — subagents
+    /// write more frequently than the main session during a busy team
+    /// orchestration.
+    #[test]
+    fn discover_skips_subagent_jsonls_even_when_newest() {
+        let tmp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", tmp_home.path());
+        let cwd = Path::new("/home/test/proj");
+        let dir = anthropic_project_dir(cwd).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Write the main session FIRST (so its mtime is older).
+        let main_path = dir.join("main-sid.jsonl");
+        std::fs::write(&main_path, r#"{"type":"last-prompt","sessionId":"main-sid"}"#).unwrap();
+
+        // Then write a subagent jsonl — newer mtime.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let sa_path = dir.join("subagent-sid.jsonl");
+        std::fs::write(&sa_path, r#"{"type":"agent-setting","sessionId":"subagent-sid"}"#).unwrap();
+
+        let (picked_sid, picked_path) =
+            discover_active_session(cwd).expect("should pick the main session, not the subagent");
+        assert_eq!(picked_sid, "main-sid");
+        assert_eq!(picked_path, main_path);
+    }
+
+    #[test]
+    fn switch_session_clears_last_event_id_only_on_real_switch() {
+        let mut c = TranscriptCursor {
+            session_id: "sid".into(),
+            byte_offset: 42,
+            last_event_id: Some("ev".into()),
+            ..Default::default()
+        };
+        assert!(!c.switch_session("sid", "-proj".into()));
+        assert_eq!(
+            c.last_event_id.as_deref(),
+            Some("ev"),
+            "no-op switch keeps last_event_id intact"
+        );
+        assert!(c.switch_session("other", "-proj".into()));
+        assert!(
+            c.last_event_id.is_none(),
+            "real switch clears last_event_id — uuids don't cross sessions"
+        );
     }
 
     #[test]
