@@ -240,7 +240,157 @@ Web **只看不操作**。所有控制走 Claude session slash 或 IM。
 
 ---
 
-## §4 Cost 透明
+## §4 Admin 操作参考(`mcp__ccteam__admin_*` + `mcp__ccteam__workflow_*`)
+
+> 所有 admin 操作的首选路径是 **MCP 工具**(`mcp__ccteam__*`)。如果 MCP 未注册(尚未跑 `ccteam doctor --install-mcp`),可用对应的 Bash fallback。
+
+### §4.1 暂停 / 恢复 workflow
+
+**暂停**(停止自动派任务,但不 kill tmux session):
+
+```
+/ccteam-control pause <slug>
+```
+
+底层调用:
+
+| MCP 工具 | Bash fallback |
+|---|---|
+| `mcp__ccteam__workflow_pause { "slug": "<slug>" }` | `ccteam pause <slug>` |
+
+返回:`{ "ok": true, "slug": "...", "user_pause_pending": true }`
+
+**恢复**(清除暂停,下一个 orchestrator tick 重启派任务):
+
+```
+/ccteam-control resume <slug>
+```
+
+| MCP 工具 | Bash fallback |
+|---|---|
+| `mcp__ccteam__workflow_resume { "slug": "<slug>" }` | `ccteam internal resume <slug>` |
+
+返回:`{ "ok": true, "slug": "..." }`
+
+---
+
+### §4.2 列出所有 workflow(查看状态)
+
+```
+/ccteam-control list
+```
+
+| MCP 工具 | Bash fallback |
+|---|---|
+| `mcp__ccteam__admin_ls {}` | `ccteam ls --format json` |
+
+返回示例:
+
+```json
+{
+  "projects": [
+    {
+      "slug": "dev-helper",
+      "team": "dev",
+      "phase_state": "idle",
+      "cost_used_usd": 0.83,
+      "cost_24h_usd": 0.83,
+      "cost_active_usd": 0.0
+    }
+  ],
+  "orchestrator": {
+    "daemon_health": { "status": "healthy", "age_secs": 12 }
+  }
+}
+```
+
+---
+
+### §4.3 今日 Cost(`@ccteam cost today`)
+
+**Claude session**:
+
+```
+/ccteam-control show-cost
+```
+
+**IM 端**:
+
+```
+@ccteam cost today
+```
+
+底层都调 `mcp__ccteam__admin_ls`,从响应里读每个 project 的 `cost_24h_usd`。  
+`cost_24h_usd` = 最近 24h 内的 token 花费;`cost_used_usd` = 项目生命周期累计。
+
+---
+
+### §4.4 紧急停止 workflow(`@ccteam stop everything`)
+
+**单个 role 全停**:
+
+```
+/ccteam-control stop <slug> <role>
+```
+
+| MCP 工具 | Bash fallback |
+|---|---|
+| `mcp__ccteam__workflow_stop_agent { "slug": "...", "role": "..." }` | `ccteam internal stop <slug> <role>` |
+
+`session_id` 省略 = 停该 role 下所有 session。  
+底层写 `.ccteam/stop_signal/<role>___all__` 标记文件,orchestrator 在下一 tick 拆除 session。
+
+**IM 端 stop everything**(需 CONFIRM 二次确认,防误触):
+
+```
+@ccteam stop everything
+# bot 回: "Are you sure? Reply CONFIRM to stop all."
+CONFIRM
+```
+
+---
+
+### §4.5 修改 bot Persona(`change-persona`)
+
+修改某个 chat-mode bot 的行为、语言、工具集:
+
+```
+/ccteam-control change-persona <bot> "<NL 描述你想改什么>"
+```
+
+skill 会:
+1. 读 `<project>/.claude/agents/<bot>.md`(当前 persona)
+2. 把你的 NL 合并进 persona body
+3. 调 MCP 工具写回:
+
+| MCP 工具 | Bash fallback |
+|---|---|
+| `mcp__ccteam__admin_change_persona { "slug": "...", "bot": "...", "new_persona_md": "<完整 md>" }` | `ccteam admin change-persona <slug> <bot> -`(full markdown via stdin)|
+
+**`new_persona_md` 必须是完整文件内容**(YAML frontmatter + body),skill 负责组装;MCP 工具直接写文件,不做 NL parse。
+
+成功后 `progress.jsonl` 追加 `persona_changed` 事件,bot 下次 turn 自动 pick up 新 persona。
+
+---
+
+### §4.6 给 bot 加工具(`add-tool`)
+
+```
+/ccteam-control add-tool <bot> "<NL 描述能力>"
+```
+
+skill 把 NL 翻译成 Claude Code 工具名(如 `WebFetch`、`Bash`)后调:
+
+| MCP 工具 | Bash fallback |
+|---|---|
+| `mcp__ccteam__admin_add_tool { "slug": "...", "bot": "...", "tool_descriptor": "WebFetch" }` | `ccteam admin add-tool <slug> <bot> WebFetch` |
+
+操作是幂等的 — 重复加同一工具不报错(返回 `already_present: true`)。  
+成功后 `progress.jsonl` 追加 `tool_added` 事件。
+
+---
+
+## §5 Cost 透明
 
 ccteam 默认每个 workflow 有 24h cost cap(creator 起项目时问你)。
 
@@ -265,7 +415,7 @@ qa-loop          $4.12    $5.00     ↘ -3%      ⚠ 82% of cap
 
 ---
 
-## §5 从 V0.5 升级到 V0.6 — 0 用户操作
+## §6 从 V0.5 升级到 V0.6 — 0 用户操作
 
 V0.6 升级**完全无感**:
 
@@ -278,7 +428,7 @@ V0.6 升级**完全无感**:
 
 ---
 
-## §6 接下来去哪
+## §7 接下来去哪
 
 | 想干什么 | 读这个 |
 |---|---|
