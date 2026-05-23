@@ -51,6 +51,7 @@ fn manual_spec(role: &str) -> WorkflowSpec {
             executor: Executor::Claude,
             model: None,
             trigger: Trigger::Manual,
+            scope: None,
             parallelism: None,
             input: None,
             output: None,

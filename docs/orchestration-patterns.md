@@ -61,6 +61,34 @@
 - Subagent / Task() 调用本身有启动成本(prompt 重新 brief),拆得越细,这部分越烧
 - ccteam 架构红线:文件系统是控制平面、`progress.jsonl` SoT —— 拆 agent 就要新增 trigger / artifact / event,**拆是有成本的,不要 default 拆**
 
+### 1.5 大型代码库:`scope` 切口 + explorer→artifact→editor(V0.6.2)
+
+**分层认知**:ccteam 是 outer harness,底层 Claude Code / Codex 是 inner harness。Anthropic《How Claude Code works in large codebases》整篇讲的是 **inner harness**(CLAUDE.md / hooks / skills / plugins / LSP / within-session subagent)—— 那是项目仓库 + Claude Code 自己的职责,**ccteam 不重复造**。ccteam 唯一不可替代的价值,是 inner harness 结构上看不见的东西:**拓扑**。
+
+**那篇文章对 ccteam 的唯一真空白**:文章压在一句 —— "Claude 的能力 = 找到正确 context 的能力;太多则退化,太少则盲目"。inner harness 管的是单 agent 窗口内的 context;ccteam 管的是**跨 agent 的 context —— 靠切口**。ccteam 红线 R3"每次 spawn = fresh 1M context"给的是干净窗口,但 **fresh ≠ scoped**:一个干净的 1M 窗口对着百万行的仓库根,光"找路"就烧穿预算。R3 给干净窗口,scoping 给一个小的东西去看 —— ccteam 有前者,V0.6.2 前缺后者。
+
+落地是**一条代码 + 一个模板**:
+
+1. **`scope` 切口(代码)** —— `AgentSpec.scope`(`docs/interfaces.md` §17.2)把每次 spawn 的 cwd 钉到与该 role 相关的子树。这是**纯拓扑决策**:inner harness 只看见自己一个 session,结构上做不到;只有 spawn 多 agent 的这层能给每个 agent 定切口。Claude Code 仍自动向上 walk 目录树、加载沿途 `CLAUDE.md`,root context 不丢。
+
+2. **explorer→artifact→editor(模板)** —— 文章把 subagent 列为对抗 context 约束的核武器:"read-only subagent 画子系统地图、findings 落文件,主 agent 拿全图再编辑"。**这正是 ccteam 的 artifact-driven 拓扑**:explorer role(read-only、宽 scope)→ 写 codebase-map artifact → editor role(窄 scope)trigger 在该 artifact 上消费。ccteam 天生就是这条 subagent 建议的多-agent 泛化版。大代码库的 workflow 默认就该是这个切分,而**不是一个胖 agent 端到端**。
+
+```yaml
+# 大代码库模板:explorer 画图 → editor 按图改(各锁 scope)
+name: large-codebase
+agents:
+  explorer:                       # read-only 调研,产出子系统地图
+    trigger: manual
+    scope: services/payments      # cwd 锁这一子树(仍 walk-up 加载 root CLAUDE.md)
+    output: .ccteam/maps          # 地图 artifact 落这里
+  editor:                         # 拿地图,窄 scope 落编辑
+    trigger: watch:.ccteam/maps   # explorer 写完地图即触发
+    scope: services/payments
+    input: .ccteam/maps
+```
+
+**克制(不吸收的)**:文章关于 CLAUDE.md 内容生成 / LSP / `permissions.deny` / 结构化搜索 MCP 的建议,ccteam 一律不吸收 —— 那些是 inner harness / 项目仓库的职责;ccteam 代笔 `CLAUDE.md` 内容还会撞"no prompt injection"红线。ccteam 顶多在 `ccteam doctor` 里**提示**缺失,不**拥有**。
+
 ---
 
 ## 二、五种编排模式 —— 在 Claude Code 上的具体形态
@@ -125,7 +153,7 @@
 - **OMC 落地**:`skills/team/SKILL.md` 1040 行 + `src/team/` 20 kLOC substrate;control flow 100% 在 SKILL.md(LLM 在 conversation turn 里推理)
 - **ccteam 落地**:`crates/ccteam-core` Rust orchestrator + `workflow.yaml` 声明 + `progress.jsonl` SoT;control flow 100% 在 Rust 代码
 - **何时用**:任务大、子任务多、要长跑(选 ccteam 路线)/ 要快速迭代多 provider hybrid(选 OMC 路线)
-- **V0.6.3 F143 squad 路由(artifact-driven 模式的细化,非新 mode)**:workflow.yaml 顶层 `squad: { leader, members, hop_limit }` 块让 orchestrator-worker 的 worker 选择从**静态接线**(只能写死的 `output:` 目录)扩到**运行时 dispatch**(leader 写 `<member>--*.md` 进 `.ccteam/squad/`,ArtifactWatcher 按文件名前缀 spawn 对应 member)。同一条 artifact-as-control-plane 红线 + 同样的 code-as-orchestrator 形态;`members:` 静态声明保证拓扑可审计、不开 prompt-injection 面;`hop_limit`(默认 3)按 R7 红线发 `escalation` 事件兜底 routing 回路。**不是第 6 种 mode** —— 是 Orchestrator-Worker 在 ccteam 上的「动态 dispatch」分支。
+- **V0.6.3 F145 squad 路由(artifact-driven 模式的细化,非新 mode)**:workflow.yaml 顶层 `squad: { leader, members, hop_limit }` 块让 orchestrator-worker 的 worker 选择从**静态接线**(只能写死的 `output:` 目录)扩到**运行时 dispatch**(leader 写 `<member>--*.md` 进 `.ccteam/squad/`,ArtifactWatcher 按文件名前缀 spawn 对应 member)。同一条 artifact-as-control-plane 红线 + 同样的 code-as-orchestrator 形态;`members:` 静态声明保证拓扑可审计、不开 prompt-injection 面;`hop_limit`(默认 3)按 R7 红线发 `escalation` 事件兜底 routing 回路。**不是第 6 种 mode** —— 是 Orchestrator-Worker 在 ccteam 上的「动态 dispatch」分支。
 
 ### 2.5 Evaluator-Optimizer(生成-评估循环)
 
@@ -212,7 +240,7 @@ V0.4.6 ccteam 通过 `workflow.yaml` + Trigger 4 类 + parallelism 字段承载 
 | 模式 | V0.4.6 承载 | 缺口 → 下版本设计输入 |
 |---|---|---|
 | **Chaining** | `Trigger::Watch(<dir>)` 接力 + artifact 文件 = 串行管道 | ✅ 充分,无需改 |
-| **Routing** | 静态:`workflow.yaml` 写死 role;动态 dispatch:V0.6.3 F143 `squad: { leader, members, hop_limit }` —— leader 运行时挑 member,membership 仍静态;动态 spawn:meta-agent + MCP `spawn_agent` 临时调度 | **仍缺 LLM-driven router sugar**:`agent.router: <expr>` 让 orchestrator 解析后 LLM 推理选 agent(F143 是声明集合内的 leader dispatch,不替代任意 expr 路由) |
+| **Routing** | 静态:`workflow.yaml` 写死 role;动态 dispatch:V0.6.3 F145 `squad: { leader, members, hop_limit }` —— leader 运行时挑 member,membership 仍静态;动态 spawn:meta-agent + MCP `spawn_agent` 临时调度 | **仍缺 LLM-driven router sugar**:`agent.router: <expr>` 让 orchestrator 解析后 LLM 推理选 agent(F143 是声明集合内的 leader dispatch,不替代任意 expr 路由) |
 | **Parallelization (segment)** | `agent.parallelism: u32` + `Trigger::Watch(<dir>)` fan-out = 多文件并行 | ✅ 充分(每个新 artifact 触发独立 session) |
 | **Parallelization (vote)** | **完全缺失** | 加 `agent.fan_out: { count: 3, merge: vote\|best\|concat }` 语法 — 同 prompt fork N 个,merge 策略由 orchestrator 实现 |
 | **Orchestrator-Worker** | meta-agent + 17 MCP `mcp__ccteam__*` 工具 = orchestrator 层;workflow.yaml 各 agent = worker 层 | ✅ 充分,这是 ccteam 主流形态 |

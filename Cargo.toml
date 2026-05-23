@@ -32,7 +32,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
-# V0.6.3 F140 — standard 5-field cron parsing for `trigger: schedule`
+# V0.6.3 F142 — standard 5-field cron parsing for `trigger: schedule`
 # agents. `croner` is maintained (3.x), lightweight, and depends only
 # on `chrono` (already a workspace dep) + build-time derive macros.
 croner = "3"

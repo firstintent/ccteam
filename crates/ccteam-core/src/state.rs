@@ -191,7 +191,7 @@ pub struct ProjectState {
     /// state.json files don't accumulate the field unnecessarily.
     #[serde(default, skip_serializing_if = "is_false")]
     pub detached: bool,
-    /// V0.6.3 F140 — per-`role` last-fire timestamp for
+    /// V0.6.3 F142 — per-`role` last-fire timestamp for
     /// `trigger: schedule` agents. Keyed by the workflow.yaml role
     /// name; the value is the UTC instant the orchestrator last
     /// spawned that schedule agent (or first observed it on a cold

@@ -310,7 +310,7 @@ ccteam 主动开了 4 个 tmux session 并行——后端 1 个、前端 1 个�
 - **资源约束**:`workflow.yaml::budget`(V0.4.6 F84)`max_cost_usd_per_24h` / `max_agent_spawns_per_hour` 自动 trip + auto-disable;daemon 全局 `MAX_CONCURRENT_PROJECTS: 3` 硬上限。
 
 **边界 — 这条不解决什么**:
-- 不解决**自动任务分解**(workflow.yaml 拓扑要 ccteam-creator skill / 人手工写) — 本痛点假设 workflow.yaml 已声明好 fan-out 拓扑。**V0.6.3 F143 进展**:顶层 `squad: { leader, members, hop_limit }` 块补齐**跨 session 运行时路由** —— leader 在运行时挑哪个 member 接活(写 `<member>--*.md` artifact),由 orchestrator 按文件名前缀 dispatch。membership 仍**静态声明在 workflow.yaml**(可审计、不开 prompt-injection 面),F143 关掉的是**运行时 dispatch**,**不是**自动 decomposition —— 这条边界仍成立。
+- 不解决**自动任务分解**(workflow.yaml 拓扑要 ccteam-creator skill / 人手工写) — 本痛点假设 workflow.yaml 已声明好 fan-out 拓扑。**V0.6.3 F145 进展**:顶层 `squad: { leader, members, hop_limit }` 块补齐**跨 session 运行时路由** —— leader 在运行时挑哪个 member 接活(写 `<member>--*.md` artifact),由 orchestrator 按文件名前缀 dispatch。membership 仍**静态声明在 workflow.yaml**(可审计、不开 prompt-injection 面),F143 关掉的是**运行时 dispatch**,**不是**自动 decomposition —— 这条边界仍成立。
 - 不解决**子模块接口同步**(role 之间通过 artifact 文件协作,无 RPC/IPC 内层契约管理)。
 
 ---

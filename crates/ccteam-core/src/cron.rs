@@ -1,4 +1,4 @@
-//! V0.6.3 F140 — `trigger: schedule` cron evaluation.
+//! V0.6.3 F142 — `trigger: schedule` cron evaluation.
 //!
 //! Closes the V0.4.6 stub: `Trigger::Schedule` agents declare a
 //! standard 5-field cron expression in `workflow.yaml`

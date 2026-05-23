@@ -29,7 +29,7 @@ pub mod auto_loop;
 pub mod claude_job;
 // V0.4.2 F73 — `~/.ccteam/config.yaml` global config + projects registry.
 pub mod config;
-// V0.6.3 F140 — `trigger: schedule` cron evaluation (5-field, skip-missed).
+// V0.6.3 F142 — `trigger: schedule` cron evaluation (5-field, skip-missed).
 pub mod cron;
 pub mod daemon;
 pub mod harness;
@@ -87,7 +87,7 @@ pub mod teams_task_parser;
 pub mod templates;
 pub mod tmux;
 pub mod tool_surface;
-// V0.6.3 F142 — vendor-seam forward-compatibility warn-once helper.
+// V0.6.3 F144 — vendor-seam forward-compatibility warn-once helper.
 pub mod vendor_compat;
 // V0.5.0 F92 — cumulative-cost scanner over Claude Code transcript JSONLs.
 pub mod transcript_scanner;
@@ -116,7 +116,7 @@ pub use config::{
     save as save_ccteam_config, upsert_project as upsert_project_in_config, CcteamConfig,
     ProjectEntry, CONFIG_FILENAME,
 };
-// V0.6.3 F140 — `trigger: schedule` cron evaluation.
+// V0.6.3 F142 — `trigger: schedule` cron evaluation.
 pub use cron::{Schedule, ScheduleError};
 // V0.6.0 Wave 1 — cost classification moved to `ccteam-cost`. Re-export
 // for V0.5.x callers; the new signature is
@@ -219,10 +219,10 @@ pub use silence_classifier::{
     SilenceClass, LIMBO_RETRY_FILE, MAX_LIMBO_RETRY,
 };
 pub use skill::{
-    install_ccteam_control_skill, install_ccteam_creator_skill, install_ccteam_team_skill,
-    install_into as install_skill_into, install_skill_body_into, InstallSkillOptions,
-    InstallSkillReport, SkillInstallAction, CCTEAM_CONTROL_SKILL_NAME, CCTEAM_CREATOR_SKILL_NAME,
-    CCTEAM_TEAM_SKILL_NAME, LEGACY_SKILL_NAMES,
+    install_ccteam_control_skill, install_ccteam_creator_skill, install_ccteam_scan_skill,
+    install_ccteam_team_skill, install_into as install_skill_into, install_skill_body_into,
+    InstallSkillOptions, InstallSkillReport, SkillInstallAction, CCTEAM_CONTROL_SKILL_NAME,
+    CCTEAM_CREATOR_SKILL_NAME, CCTEAM_SCAN_SKILL_NAME, CCTEAM_TEAM_SKILL_NAME, LEGACY_SKILL_NAMES,
 };
 pub use stall::{
     classify as classify_stall, classify_with_thresholds, silent_seconds, StallLevel,

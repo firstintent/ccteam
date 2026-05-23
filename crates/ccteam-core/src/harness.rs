@@ -655,7 +655,7 @@ mod tests {
         assert!(matches!(err, HarnessError::IngestFailed(_)));
     }
 
-    /// V0.6.3 F142 — forward-compat: a future `claude` CLI that adds
+    /// V0.6.3 F144 — forward-compat: a future `claude` CLI that adds
     /// unknown fields to `state.json` must still parse cleanly. The
     /// `Value`-plucking parser ignores anything it doesn't recognise.
     #[test]

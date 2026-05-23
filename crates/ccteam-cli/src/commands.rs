@@ -12,14 +12,14 @@ use serde_json::{json, Map, Value};
 use ccteam_core::tmux::TmuxSession;
 use ccteam_core::{
     bootstrap_meta_project, cost_summary, current_ccteam_bin, install_ccteam_control_skill,
-    install_ccteam_creator_skill, install_ccteam_team_skill, migrate_legacy_skill_dirs,
-    migrate_recommended_agent_symlinks, pricing_schema_version, pricing_schema_version_for,
-    rewrite_legacy_hook_commands, session_name_for_project, user_claude_dir,
-    write_global_helper_templates, CcteamPaths, HookCmdRewriteAction, HookCmdRewriteReport,
-    InstallSkillOptions, LegacySkillAction, LegacySkillReport, MetaBootstrapReport,
-    MigrationReport, PhaseState, ProjectState, SkillInstallAction, ToolSurfaceSnapshot, Vendor,
-    BUILTIN_SUBAGENTS, CCTEAM_CONTROL_SKILL_NAME, CCTEAM_CREATOR_SKILL_NAME,
-    CCTEAM_TEAM_SKILL_NAME,
+    install_ccteam_creator_skill, install_ccteam_scan_skill, install_ccteam_team_skill,
+    migrate_legacy_skill_dirs, migrate_recommended_agent_symlinks, pricing_schema_version,
+    pricing_schema_version_for, rewrite_legacy_hook_commands, session_name_for_project,
+    user_claude_dir, write_global_helper_templates, CcteamPaths, HookCmdRewriteAction,
+    HookCmdRewriteReport, InstallSkillOptions, LegacySkillAction, LegacySkillReport,
+    MetaBootstrapReport, MigrationReport, PhaseState, ProjectState, SkillInstallAction,
+    ToolSurfaceSnapshot, Vendor, BUILTIN_SUBAGENTS, CCTEAM_CONTROL_SKILL_NAME,
+    CCTEAM_CREATOR_SKILL_NAME, CCTEAM_SCAN_SKILL_NAME, CCTEAM_TEAM_SKILL_NAME,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -674,7 +674,7 @@ pub fn run_show(paths: &CcteamPaths, slug: &str, format: OutputFormat) -> Result
     let cost = cost_summary(slug, &progress_path, paths)?;
     let sessions = ccteam_core::active_sessions(slug, paths).unwrap_or_default();
 
-    // V0.6.3 F141 — webhook ingress path. The relative URL is stable
+    // V0.6.3 F143 — webhook ingress path. The relative URL is stable
     // (`/webhook/<slug>/<secret>`); the operator prepends their own
     // `http(s)://<host>:<port>` (external reachability is a deployment
     // concern, not ccteam's). The secret is generated-or-loaded here so
@@ -691,7 +691,7 @@ pub fn run_show(paths: &CcteamPaths, slug: &str, format: OutputFormat) -> Result
     })
 }
 
-/// V0.6.3 F141 — `(relative_url, secret)` for the project's webhook
+/// V0.6.3 F143 — `(relative_url, secret)` for the project's webhook
 /// ingress, or `None` if the secret could not be generated/read.
 fn resolve_webhook_info(paths: &CcteamPaths, slug: &str) -> Option<(String, String)> {
     let token_path = paths.project_webhook_token(slug);
@@ -2090,16 +2090,15 @@ pub struct DoctorOptions {
     ///
     /// V0.5.0 F93a: pair with `install_skill_only = Some("<name>")` to
     /// install just one named skill. Default (`install_skill_only = None`)
-    /// installs every shipped skill: `ccteam-control`, `ccteam-team-author`,
-    /// `ccteam-project-creator`, and the V0.5.0 `ccteam-team` primary-path
-    /// entry.
+    /// installs every shipped skill: `ccteam-control`, `ccteam-creator`,
+    /// `ccteam-team`, and the V0.6.2 F141 `ccteam-scan`.
     pub install_skill: bool,
     /// V0.5.0 F93a: when `install_skill == true` and this is `Some(name)`,
     /// install only the named skill (one of `ccteam-control` /
-    /// `ccteam-team-author` / `ccteam-project-creator` / `ccteam-team` /
-    /// `all`). `None` or `Some("all")` install every shipped skill. The
-    /// CLI flag is `--install-skill [NAME]` (no value = install all,
-    /// matches the V0.4.6 behavior).
+    /// `ccteam-creator` / `ccteam-team` / `ccteam-scan` / `all`). `None`
+    /// or `Some("all")` install every shipped skill. The CLI flag is
+    /// `--install-skill [NAME]` (no value = install all, matches the
+    /// V0.4.6 behavior).
     pub install_skill_only: Option<String>,
     /// V0.4.1: bootstrap the meta-agent project at `~/projects/meta/`.
     /// `true` triggers `install_skill` regardless of its standalone
@@ -2627,12 +2626,14 @@ fn render_install_skill_report(paths: &CcteamPaths, opts: &DoctorOptions) -> Res
             CCTEAM_CONTROL_SKILL_NAME => install_ccteam_control_skill(install_opts)?,
             CCTEAM_CREATOR_SKILL_NAME => install_ccteam_creator_skill(install_opts)?,
             CCTEAM_TEAM_SKILL_NAME => install_ccteam_team_skill(install_opts)?,
+            CCTEAM_SCAN_SKILL_NAME => install_ccteam_scan_skill(install_opts)?,
             other => bail!(
                 "ccteam doctor --install-skill {other}: unknown skill name; expected one of \
-                 `all` / {ctrl} / {creator} / {tt}",
+                 `all` / {ctrl} / {creator} / {tt} / {scan}",
                 ctrl = CCTEAM_CONTROL_SKILL_NAME,
                 creator = CCTEAM_CREATOR_SKILL_NAME,
                 tt = CCTEAM_TEAM_SKILL_NAME,
+                scan = CCTEAM_SCAN_SKILL_NAME,
             ),
         };
         out.push_str(&format!(
@@ -2667,6 +2668,12 @@ fn render_install_skill_report(paths: &CcteamPaths, opts: &DoctorOptions) -> Res
         "  ccteam-team             {label}  {}\n",
         team_skill.target.display(),
         label = skill_install_label(&team_skill.action),
+    ));
+    let scan = install_ccteam_scan_skill(install_opts)?;
+    out.push_str(&format!(
+        "  ccteam-scan             {label}  {}\n",
+        scan.target.display(),
+        label = skill_install_label(&scan.action),
     ));
     out.push('\n');
 
@@ -3694,7 +3701,7 @@ fn render_show_text(
         out.push_str("\n  tip: `claude attach <id>` to take over a session live\n");
     }
 
-    // V0.6.3 F141 — webhook ingress URL (relative; operator prepends
+    // V0.6.3 F143 — webhook ingress URL (relative; operator prepends
     // their own scheme+host). Treat the secret like the web token —
     // print it so the operator can wire CI / monitors against it.
     if let Some((url, _)) = webhook {
@@ -4471,7 +4478,7 @@ mod tests {
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["state"]["slug"], slug);
         assert_eq!(v["artifacts"]["spec"], ".ccteam/spec.md");
-        // V0.6.3 F141 — `webhook` block carries the relative ingress
+        // V0.6.3 F143 — `webhook` block carries the relative ingress
         // URL + the generated per-project secret.
         let url = v["webhook"]["url_path"].as_str().unwrap();
         assert!(url.starts_with(&format!("/webhook/{slug}/")), "got {url}");

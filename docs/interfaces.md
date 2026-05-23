@@ -67,8 +67,8 @@ First-source-wins,整团维度替换。读容错(yaml 错 → warn + 下一层),
 │   ├── signal/                   # MCP `signal` marker 桶
 │   ├── gate_override/            # MCP `trigger_gate` marker
 │   ├── workflow_overrides.json   # MCP `set_parallelism` 覆写
-│   ├── webhooks/                 # V0.6.3 F141: webhook ingress payload 桶(`trigger: watch:` 消费)
-│   ├── webhook-token             # V0.6.3 F141: per-project webhook secret(64 hex,mode 0600)
+│   ├── webhooks/                 # V0.6.3 F143: webhook ingress payload 桶(`trigger: watch:` 消费)
+│   ├── webhook-token             # V0.6.3 F143: per-project webhook secret(64 hex,mode 0600)
 │   ├── sessions/                 # flex-only adhoc session cwd
 │   │   └── <sid>/                # 例 claude-1;内含本 session inbox/outbox
 │   └── ready                     # SessionStart hook 写出的就绪标记
@@ -140,7 +140,7 @@ progress.jsonl / cost / silence classifier / web observability。
 `next_sid_seq` 是每 harness 的下一个编号(删除 session 不递减,sid 不复用)。
 workflow 项目保持空对象或省略。
 
-**`schedule_last_fire` 字段**(V0.6.3 F140):`trigger: schedule` agent 的 per-role
+**`schedule_last_fire` 字段**(V0.6.3 F142):`trigger: schedule` agent 的 per-role
 last-fire 时间戳。shape `{ "<role>": "<RFC3339 UTC>" }`。cron 调度器读它实现
 skip-missed 语义(daemon 停机期间错过的触发不补跑)。无 schedule agent 的项目保持
 空对象或省略。详 §17.3.1。
@@ -1047,7 +1047,7 @@ pub fn peek_pane(slug: &str, lines: Option<usize>) -> Result<PaneCapture, CoreEr
 | `POST` | `/api/{slug}/{sid}/pause` | 303 / 4xx | `text/plain`(error) | V0.3.1 F50:sid 校验后走 project-level pause,返回 `/session/{slug}/{sid}` |
 | `POST` | `/api/{slug}/resume` | 303 / 4xx | `text/plain`(error) | 空 body;详 §15.7 |
 | `POST` | `/api/{slug}/{sid}/resume` | 303 / 4xx | `text/plain`(error) | V0.3.1 F50:sid 校验后走 project-level resume,返回 `/session/{slug}/{sid}` |
-| `POST` | `/webhook/{project}/{token}` | 202 / 401 / 413 / 5xx | `application/json`(202)/ `text/plain`(401 / 413 / 5xx) | V0.6.3 F141:外部系统(CI / GitHub / 监控)的 HTTP→文件入口;详 §15.9。`auth_layer` **例外**(自带 per-project token)|
+| `POST` | `/webhook/{project}/{token}` | 202 / 401 / 413 / 5xx | `application/json`(202)/ `text/plain`(401 / 413 / 5xx) | V0.6.3 F143:外部系统(CI / GitHub / 监控)的 HTTP→文件入口;详 §15.9。`auth_layer` **例外**(自带 per-project token)|
 
 ### 15.2 dashboard 行(`/` 表格)
 
@@ -1346,7 +1346,7 @@ XSS tradeoff:token 出现在 HTML attribute 而非纯 HttpOnly cookie。
 被 XSS'd 时攻击者本来就能同源 fetch + 自动 cookie,所以 inline 不
 增加 threat surface。
 
-### 15.9 Webhook ingress(V0.6.3 F141)
+### 15.9 Webhook ingress(V0.6.3 F143)
 
 `POST /webhook/{project}/{token}` 让外部系统(CI 红 / GitHub PR 开 /
 CVE 监控)触发 ccteam agent。它是一个 **HTTP→文件薄入口**,**不是**新
@@ -1550,7 +1550,7 @@ agent_team:               # V0.5.0 F93b:可选,仅 mode: agent-team 时填。详
   snapshot_path: <path>
   suggested_teammates: [<SuggestedTeammate>]
   auto_spawn_teammates: <bool>
-squad:                    # V0.6.3 F143:可选,默认 None。跨 session 运行时路由。详 §17.1.5
+squad:                    # V0.6.3 F145:可选,默认 None。跨 session 运行时路由。详 §17.1.5
   leader: <role-name>
   members: [<role-name>, ...]
   hop_limit: <u32>
@@ -1629,7 +1629,7 @@ F84 budget guard 在 `try_spawn` 入口跑;cost 数据源走 F91 cost SoT(`agent
 | `auto_spawn_teammates` | HOT | 下次 plan 时才读 |
 | `suggested_teammates[].adhoc_color` / `.adhoc_tools` / `.adhoc_model` | HOT | cosmetic / UI 元数据 |
 
-### 17.1.5 V0.6.3 F143 `SquadSpec` 字段(跨 session 运行时路由)
+### 17.1.5 V0.6.3 F145 `SquadSpec` 字段(跨 session 运行时路由)
 
 ```yaml
 squad:
@@ -1667,10 +1667,11 @@ agents:
 |---|---|---|---|
 | `executor` | `claude` \| `codex` | `claude` | 选择哪个 harness 二进制(F61 ClaudeCodeAdapter / F62 CodexAdapter)|
 | `trigger` | scalar string | 必填 | 见 §17.3 |
+| `scope` | path | `None`(项目根) | V0.6.2:此 agent 的 harness session 的代码 cwd(相对项目根)。设了 → `SpawnCtx.cwd = project_dir.join(scope)`,大代码库 agent 起步即锁定到与其 role 相关的子树——每次 spawn 的爆炸半径收窄,红线 R3 "fresh 1M context" 指向小子树而非整个 repo root;Claude Code 仍向上走目录树加载沿途 `CLAUDE.md`,root context 不丢。`validate()` 拒绝绝对路径与含 `..` 的路径(path-traversal guard);目录不存在是运行期问题 → 普通 spawn 失败 → `fail_counts` 3-strike escalate |
 | `parallelism` | `u32` | `None`(等价 1) | 同时最多多少个 session 实例。`> 1` **仅** `watch:` 合法 |
 | `input` | path | `None` | artifact 输入目录(相对项目根),F64 watcher 派发时通过 `CCTEAM_INPUT` env 注入 spawned harness |
 | `output` | path | `None` | artifact 输出目录,通过 `CCTEAM_OUTPUT` 注入 |
-| `schedule` | 5-field cron string | `None` | V0.6.3 F140:仅 `trigger: schedule` 有效;标准 5 段 cron(`分 时 日 月 周`)。`trigger: schedule` 必填,其他 trigger 填了语义上忽略。详 §17.3 + §17.4 |
+| `schedule` | 5-field cron string | `None` | V0.6.3 F142:仅 `trigger: schedule` 有效;标准 5 段 cron(`分 时 日 月 周`)。`trigger: schedule` 必填,其他 trigger 填了语义上忽略。详 §17.3 + §17.4 |
 | `timeout` | duration string | `None` | 单 session 软超时(F64+ watchdog 消费)|
 | `on_timeout` | `escalate` \| `retry` \| `skip` | `None`(等价 `escalate`) | 超时动作 |
 | `plan_approval` | `Option<PlanApprovalSpec>` | `None`(opt-in)| V0.6.1 F98:此 agent 写 `.ccteam/plans/<role>-<ts>.md` plan → 走 IM approval 路径才能 resume。详 §17.2.2 |
@@ -1716,11 +1717,11 @@ agents:
 | 形式 | `Trigger` 变体 | 语义 |
 |---|---|---|
 | `manual` | `Trigger::Manual` | meta-agent 或用户显式 `ccteam trigger <role>` 才派发 |
-| `schedule` | `Trigger::Schedule` | V0.6.3 F140:定时;按 agent `schedule:` 的 5 段 cron 触发。daemon 主循环每 tick 评估到期项。详 §17.3.1 |
+| `schedule` | `Trigger::Schedule` | V0.6.3 F142:定时;按 agent `schedule:` 的 5 段 cron 触发。daemon 主循环每 tick 评估到期项。详 §17.3.1 |
 | `gate` | `Trigger::Gate` | 等 `trigger_gate` MCP 调用解锁(必须有 `input`)|
 | `watch:<path>` | `Trigger::Watch(PathBuf)` | F64 inotify watcher 监 `<path>` 新文件 → 派发 |
 
-### 17.3.1 V0.6.3 F140 `trigger: schedule` cron 调度
+### 17.3.1 V0.6.3 F142 `trigger: schedule` cron 调度
 
 ```yaml
 agents:
@@ -1742,8 +1743,8 @@ agents:
 3. `trigger: watch:<path>` 的 `<path>` 非空(`watch:` 单独 → `ValidationFailed`)。
 4. `trigger: gate` 必须有 `input`。
 5. `parallelism > 1` 只允许 `watch:` trigger;`schedule` / `gate` / `manual` 单实例。
-6. V0.6.3 F140:`trigger: schedule` 必须有合法 `schedule:`(标准 5 段 cron;缺失或解析失败 → `ValidationFailed`)。
-7. V0.6.3 F143:`squad:` 只在 `mode: artifact-driven` / `human-approval` 合法;`leader` + 每个 `members[]` 必须是已声明 agent role;`members` 非空;`hop_limit >= 1`。详 §17.1.5。
+6. V0.6.3 F142:`trigger: schedule` 必须有合法 `schedule:`(标准 5 段 cron;缺失或解析失败 → `ValidationFailed`)。
+7. V0.6.3 F145:`squad:` 只在 `mode: artifact-driven` / `human-approval` 合法;`leader` + 每个 `members[]` 必须是已声明 agent role;`members` 非空;`hop_limit >= 1`。详 §17.1.5。
 
 ### 17.5 `WorkflowError` 变体
 

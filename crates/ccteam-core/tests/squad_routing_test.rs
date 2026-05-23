@@ -1,4 +1,4 @@
-//! V0.6.3 F143 — squad cross-session runtime routing integration tests.
+//! V0.6.3 F145 — squad cross-session runtime routing integration tests.
 //!
 //! Exercises the orchestrator's `handle_artifact_event` squad-route
 //! branch without tmux: a `MockAdapter` records every spawn, and
@@ -124,6 +124,7 @@ fn squad_spec() -> WorkflowSpec {
                 executor: Executor::Claude,
                 model: None,
                 trigger: Trigger::Manual,
+                scope: None,
                 parallelism: None,
                 input: None,
                 output: None,

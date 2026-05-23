@@ -200,6 +200,7 @@ fn watch_spec(role: &str, watch_rel: &str, parallelism: Option<u32>) -> Workflow
             executor: Executor::Claude,
             model: None,
             trigger: Trigger::Watch(PathBuf::from(watch_rel)),
+            scope: None,
             parallelism,
             input: Some(PathBuf::from(watch_rel)),
             output: None,
@@ -231,6 +232,7 @@ fn manual_spec(role: &str) -> WorkflowSpec {
             executor: Executor::Claude,
             model: None,
             trigger: Trigger::Manual,
+            scope: None,
             parallelism: None,
             input: None,
             output: None,
@@ -262,6 +264,7 @@ fn gate_spec(role: &str, input_rel: &str) -> WorkflowSpec {
             executor: Executor::Claude,
             model: None,
             trigger: Trigger::Gate,
+            scope: None,
             parallelism: None,
             input: Some(PathBuf::from(input_rel)),
             output: None,
@@ -829,6 +832,7 @@ agents:
             executor: Executor::Claude,
             model: None,
             trigger: Trigger::Watch(PathBuf::from("dirA")),
+            scope: None,
             parallelism: Some(1),
             input: Some(PathBuf::from("dirA")),
             output: None,
@@ -844,6 +848,7 @@ agents:
             executor: Executor::Claude,
             model: None,
             trigger: Trigger::Watch(PathBuf::from("dirB")),
+            scope: None,
             parallelism: Some(1),
             input: Some(PathBuf::from("dirB")),
             output: None,
@@ -1407,6 +1412,7 @@ async fn t31_inbox_target_role_routes_explicitly() {
                 executor: Executor::Claude,
                 model: None,
                 trigger: Trigger::Manual,
+                scope: None,
                 parallelism: None,
                 input: None,
                 output: None,
@@ -1897,7 +1903,7 @@ async fn t32_f124_poll_completions_skips_drain_under_human_approval() {
 }
 
 // =====================================================================
-// V0.6.3 F140 — `trigger: schedule` cron scheduler
+// V0.6.3 F142 — `trigger: schedule` cron scheduler
 // =====================================================================
 
 /// Build a single-agent `trigger: schedule` workflow with the given
@@ -1910,6 +1916,7 @@ fn schedule_spec(role: &str, cron: &str) -> WorkflowSpec {
             executor: Executor::Claude,
             model: None,
             trigger: Trigger::Schedule,
+            scope: None,
             parallelism: None,
             input: None,
             output: None,
@@ -1936,7 +1943,7 @@ fn schedule_spec(role: &str, cron: &str) -> WorkflowSpec {
 #[tokio::test]
 #[serial]
 async fn t40_schedule_first_tick_seeds_cursor_no_spawn() {
-    // V0.6.3 F140 — a cold start must NOT fire on the first tick: the
+    // V0.6.3 F142 — a cold start must NOT fire on the first tick: the
     // scheduler anchors `last_fire = now` so the next occurrence is
     // computed forward from daemon start.
     use ccteam_core::state::ProjectState;
@@ -1968,7 +1975,7 @@ async fn t40_schedule_first_tick_seeds_cursor_no_spawn() {
 #[tokio::test]
 #[serial]
 async fn t41_schedule_fires_when_due() {
-    // V0.6.3 F140 — once the cron slot after `last_fire` is reached,
+    // V0.6.3 F142 — once the cron slot after `last_fire` is reached,
     // the next tick spawns the agent through the normal path.
     use ccteam_core::state::ProjectState;
 
@@ -2007,7 +2014,7 @@ async fn t41_schedule_fires_when_due() {
 #[tokio::test]
 #[serial]
 async fn t42_schedule_no_double_fire_on_restart() {
-    // V0.6.3 F140 acceptance gate — restart does not double-fire and
+    // V0.6.3 F142 acceptance gate — restart does not double-fire and
     // does not backfill. A tick that fires advances `last_fire` to
     // `now`; the immediately-following tick (same minute) must NOT
     // re-spawn, and the missed slots from the downtime are dropped.
@@ -2065,7 +2072,7 @@ async fn t42_schedule_no_double_fire_on_restart() {
 #[tokio::test]
 #[serial]
 async fn t43_schedule_no_state_json_is_graceful() {
-    // V0.6.3 F140 — a schedule workflow whose project has no
+    // V0.6.3 F142 — a schedule workflow whose project has no
     // state.json yet must not panic; the tick simply skips.
     let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_MANUAL_EXPLORER);
     let (orch, claude, _codex) = build_orchestrator(paths);

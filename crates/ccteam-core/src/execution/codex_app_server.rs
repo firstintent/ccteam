@@ -547,7 +547,7 @@ pub fn translate_notification(notif: &Notification, wanted: &str) -> Option<Thre
                 },
             })
         }
-        // V0.6.3 F142 — forward-compat: a `codex app-server` notification
+        // V0.6.3 F144 — forward-compat: a `codex app-server` notification
         // `method` we don't yet propagate is **skipped** (`None`) so the
         // event stream is never broken — the orchestrator's
         // `progress.jsonl` poller stays the state-transition SoT for
@@ -723,7 +723,7 @@ fn translate_item_event(
                 .unwrap_or("")
                 .to_string(),
         ),
-        // V0.6.3 F142 — forward-compat: a present-but-unrecognised item
+        // V0.6.3 F144 — forward-compat: a present-but-unrecognised item
         // `type` degrades to an empty agent message and warns once. A
         // missing `type` (`None`) is a shape gap, not a vocabulary
         // drift, so it stays silent.
@@ -873,7 +873,7 @@ mod tests {
         }
     }
 
-    // V0.6.3 F142 — forward-compat regression tests. Codex's app-server
+    // V0.6.3 F144 — forward-compat regression tests. Codex's app-server
     // protocol may grow a notification method or item type ccteam
     // doesn't translate; the seam must skip it (no panic, stream keeps
     // flowing) and warn once.

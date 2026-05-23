@@ -174,7 +174,7 @@ pub fn classify(value: &Value) -> JobLiveness {
             cost_usd,
         };
     }
-    // V0.6.3 F142 — forward-compat: a `state` string we don't recognise
+    // V0.6.3 F144 — forward-compat: a `state` string we don't recognise
     // (and that isn't the canonical `working`) is treated as
     // **non-terminal** — we keep probing on the next tick rather than
     // synthesising a premature `agent_done` that would strand a phantom
@@ -704,7 +704,7 @@ mod tests {
         }
     }
 
-    // V0.6.3 F142 — forward-compat regression tests. Anthropic may ship
+    // V0.6.3 F144 — forward-compat regression tests. Anthropic may ship
     // a `claude` CLI that writes a `state.json` with an unknown `state`
     // value and/or extra fields; ccteam must not panic and must NOT
     // mistake the unknown state for "done" (that would strand a phantom

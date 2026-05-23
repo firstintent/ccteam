@@ -360,7 +360,7 @@ ccteam 把"何时起 agent"的决策放在 **workflow.yaml trigger**,本节解�
 | trigger 类型 | 触发条件 | spawn 时 ccteam 注入 env | role.md 应该用的工具 |
 |---|---|---|---|
 | `watch:<path>` | inotify 检测到 `<path>` 下新文件写入完成(`IN_CLOSE_WRITE`,200ms debounce) | `CCTEAM_INPUT=<path>`(role.md 用 `Read` / `Glob` 扫输入)、`CCTEAM_OUTPUT=<output>` | 通常 `Read $CCTEAM_INPUT/<file>` + 处理 + `Write $CCTEAM_OUTPUT/<artifact>` |
-| `schedule` | V0.6.3 F140 真 cron:`AgentSpec::schedule: "<5 段 cron>"`(`croner` crate,workflow load 时 eager parse;daemon tick 评估 + `<project>/.ccteam/state.json::schedule_last_fire` 持久化 + skip-missed 不补跑)。也可被 meta-agent `spawn_agent` 显式主触发 | `CCTEAM_OUTPUT=<output>` (input 通常没意义) | 自主任务(crawler / monitor 类),用 `Bash` / `WebFetch` 拉数据,`Write` 出 artifact |
+| `schedule` | V0.6.3 F142 真 cron:`AgentSpec::schedule: "<5 段 cron>"`(`croner` crate,workflow load 时 eager parse;daemon tick 评估 + `<project>/.ccteam/state.json::schedule_last_fire` 持久化 + skip-missed 不补跑)。也可被 meta-agent `spawn_agent` 显式主触发 | `CCTEAM_OUTPUT=<output>` (input 通常没意义) | 自主任务(crawler / monitor 类),用 `Bash` / `WebFetch` 拉数据,`Write` 出 artifact |
 | `gate` | meta-agent / 人调 `mcp__ccteam__workflow_trigger_gate(gate_name, slug)` 后才起 | `CCTEAM_OUTPUT=<output>` + `CCTEAM_INPUT=<input>`(若声明) | 通常做"最终把关"(ship / publish 类),输出落地 + 通过 `Bash` 调外部命令(`gh pr create` / `npm publish` 等) |
 
 ### spawn 时的完整 env 注入(V0.4.0 实测)
@@ -399,7 +399,7 @@ artifact —— 这些工具直接和 Claude Code prompt cache 友好,且 Artifa
 | `workflow.yaml::agents.<role>.executor: codex` | spawn tmux + codex;**通道 1** 部分开(看 Codex 支持哪些工具),**通道 2 可用**(tmux send-keys) |
 | `workflow.yaml::agents.<role>.trigger: gate` | 由 **通道 3**(meta-agent + `mcp__ccteam__workflow_trigger_gate`)解锁后才起 |
 | role 产 artifact → 下游 `trigger: watch:*` | 完全 orchestrator deterministic(ArtifactWatcher),**不经任何 LLM 决策** |
-| **V0.6.3 F143** 顶层 `squad: { leader, members, hop_limit }`(default 3)+ leader 写 `<member>--*.md` 进 `.ccteam/squad/` | ArtifactWatcher 按文件名前缀 dispatch 到 `members:` 里声明的 role(membership 静态、dispatch 动态);超 `hop_limit` 发 `escalation` 事件 `kind: squad_hop_limit`,未知 member 前缀发 `squad_unknown_target` |
+| **V0.6.3 F145** 顶层 `squad: { leader, members, hop_limit }`(default 3)+ leader 写 `<member>--*.md` 进 `.ccteam/squad/` | ArtifactWatcher 按文件名前缀 dispatch 到 `members:` 里声明的 role(membership 静态、dispatch 动态);超 `hop_limit` 发 `escalation` 事件 `kind: squad_hop_limit`,未知 member 前缀发 `squad_unknown_target` |
 | escalation event 落 progress.jsonl | **通道 3** meta-agent 用 `observe_agents` / `get_progress` 读到自决策 |
 
 详 `docs/versions/v0-4-0/prd.md §6` 完整架构 + `docs/interfaces.md` workflow.yaml schema。

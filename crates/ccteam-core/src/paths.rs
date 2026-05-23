@@ -218,7 +218,7 @@ impl CcteamPaths {
         self.root.join("teams-progress.jsonl")
     }
 
-    /// V0.6.3 F141 — `<project>/.ccteam/webhooks/` directory holding
+    /// V0.6.3 F143 — `<project>/.ccteam/webhooks/` directory holding
     /// webhook-ingress payload files written by the `POST
     /// /webhook/:project/:token` route. An agent consumes them via the
     /// existing `trigger: watch:.ccteam/webhooks/` — webhook is a thin
@@ -227,7 +227,7 @@ impl CcteamPaths {
         self.project_ccteam_dir(slug).join("webhooks")
     }
 
-    /// V0.6.3 F141 — `<project>/.ccteam/webhook-token` file holding the
+    /// V0.6.3 F143 — `<project>/.ccteam/webhook-token` file holding the
     /// per-project webhook secret (64 hex chars, mode 0600). Generated
     /// lazily on first webhook request, mirroring `~/.ccteam/web-token`.
     /// The `:token` path segment of `POST /webhook/:project/:token` is

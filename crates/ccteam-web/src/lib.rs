@@ -110,7 +110,7 @@ pub fn router() -> Result<Router> {
 /// `ccteam_token` cookie set via the URL shim (see
 /// `auth::auth_layer`).
 ///
-/// V0.6.3 F141 — the webhook ingress router (`POST
+/// V0.6.3 F143 — the webhook ingress router (`POST
 /// /webhook/{project}/{token}`) is mounted **outside** the `auth_layer`
 /// gate: it carries its own per-project token in the URL path, so it
 /// must stay reachable even when the bearer gate is enabled on a

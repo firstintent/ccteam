@@ -43,6 +43,13 @@ pub const CCTEAM_CREATOR_SKILL_NAME: &str = "ccteam-creator";
 /// `<repo>/skills/ccteam-team/SKILL.md`.
 pub const CCTEAM_TEAM_SKILL_NAME: &str = "ccteam-team";
 
+/// V0.6.2 F141 — `ccteam-scan` skill name. Read-only large-codebase
+/// audit: probes monorepo structure, recommends a `scope:` value per
+/// subsystem for `workflow.yaml`, and reports navigability gaps
+/// (layered CLAUDE.md / `permissions.deny` noise exclusion / LSP).
+/// SKILL.md ships under `<repo>/skills/ccteam-scan/SKILL.md`.
+pub const CCTEAM_SCAN_SKILL_NAME: &str = "ccteam-scan";
+
 /// V0.2.2 F44 + V0.5.0 F100: legacy skill directory names that
 /// `ccteam doctor` migrates back when found.
 ///
@@ -81,6 +88,12 @@ pub const CCTEAM_CREATOR_SKILL_MD: &str = include_str!(concat!(
 pub const CCTEAM_TEAM_SKILL_MD: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../skills/ccteam-team/SKILL.md"
+));
+
+/// V0.6.2 F141 — embedded `SKILL.md` body for `ccteam-scan`.
+pub const CCTEAM_SCAN_SKILL_MD: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../skills/ccteam-scan/SKILL.md"
 ));
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -135,6 +148,14 @@ pub fn install_ccteam_creator_skill(opts: InstallSkillOptions) -> Result<Install
 pub fn install_ccteam_team_skill(opts: InstallSkillOptions) -> Result<InstallSkillReport> {
     let claude = user_claude_dir().context("resolve ~/.claude/")?;
     install_skill_body_into(&claude, CCTEAM_TEAM_SKILL_NAME, CCTEAM_TEAM_SKILL_MD, opts)
+}
+
+/// V0.6.2 F141: install the `ccteam-scan` skill into
+/// `~/.claude/skills/ccteam-scan/SKILL.md`. Same idempotent semantics
+/// as the other shipped skills.
+pub fn install_ccteam_scan_skill(opts: InstallSkillOptions) -> Result<InstallSkillReport> {
+    let claude = user_claude_dir().context("resolve ~/.claude/")?;
+    install_skill_body_into(&claude, CCTEAM_SCAN_SKILL_NAME, CCTEAM_SCAN_SKILL_MD, opts)
 }
 
 /// Test-injectable variant: write into `<claude_dir>/skills/...` so unit
@@ -348,6 +369,48 @@ mod tests {
             tmp.path(),
             CCTEAM_TEAM_SKILL_NAME,
             CCTEAM_TEAM_SKILL_MD,
+            InstallSkillOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(r2.action, SkillInstallAction::AlreadyPresent);
+    }
+
+    // ----------------- V0.6.2 F141 ccteam-scan skill -----------------
+
+    #[test]
+    fn ccteam_scan_skill_installs_under_canonical_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let report = install_skill_body_into(
+            tmp.path(),
+            CCTEAM_SCAN_SKILL_NAME,
+            CCTEAM_SCAN_SKILL_MD,
+            InstallSkillOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(report.action, SkillInstallAction::Wrote);
+        assert!(report.target.exists());
+        let body = std::fs::read_to_string(&report.target).unwrap();
+        assert!(body.starts_with("---\nname: ccteam-scan"));
+        // Read-only contract is the F141 red line — verify it's literally
+        // in the body so a future edit can't silently drop it.
+        assert!(body.contains("只读"));
+        assert!(body.contains("codebase-scan.md"));
+    }
+
+    #[test]
+    fn ccteam_scan_skill_install_is_idempotent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        install_skill_body_into(
+            tmp.path(),
+            CCTEAM_SCAN_SKILL_NAME,
+            CCTEAM_SCAN_SKILL_MD,
+            InstallSkillOptions::default(),
+        )
+        .unwrap();
+        let r2 = install_skill_body_into(
+            tmp.path(),
+            CCTEAM_SCAN_SKILL_NAME,
+            CCTEAM_SCAN_SKILL_MD,
             InstallSkillOptions::default(),
         )
         .unwrap();

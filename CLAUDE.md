@@ -5,16 +5,17 @@
 
 ---
 
-## 一、当前状态(2026-05-22)
+## 一、当前状态(2026-05-23)
 
 | 项 | 值 |
 |---|---|
 | 主分支 main HEAD | 以 `git rev-parse origin/main` 为准 |
 | Workspace version | **`0.6.3`** |
-| 测试 baseline | **`1462/1`**(`cargo test --workspace --locked --no-fail-fast`,1 fail 是 ccteam-web `workflow_summary_reflects_agent_spawn_and_done_events` running_count flake)|
+| 测试 baseline | **`1471/1`**(`cargo test --workspace --locked --no-fail-fast`,1 fail 是 ccteam-web `workflow_summary_reflects_agent_spawn_and_done_events` running_count flake)|
 | Clippy | **0 errors + 0 warnings**(`-D warnings` clean)|
 | 代码规模 | ~73 kLOC Rust(workspace,不含 references)|
-| 当前最新版 | **V0.6.3**(F140 `Trigger::Schedule` 接真 cron + F141 webhook ingress + F142 vendor 接缝 forward-compat + F143 `squad:` 跨 session 运行时路由)— 详 `docs/versions/v0-6-3/README.md`。上一版 **V0.6.1**(Epic D cleanup + Epic E user-claim + Epic F plan-approval / F98 + F119 + F120 + F121 + F122 + F123 + F124 + F125 + F126 + F127 + F128 + F129 + F130 + F131 + F132 + F134 + F135 + F136 + F137 + F139)— 详 `docs/versions/v0-6-1/README.md`(probe daemon+health / overnight-builder real workflow / `ccteam doctor --check-pricing-version` / CodexAppServerAdapter → progress.jsonl bridge / 5 demo GIF / `mode: human-approval` 第 4 mode / EN-only README + 红线 / `/ccteam-control change-persona + add-tool` / `@ccteam` IM NL admin / plan-approval ↔ IM outbox round-trip / F130 ccteam-imd folded into `ccteam start`(single-process daemon: orchestrator + web + IMD supervisor as 3 tokio tasks; standalone `ccteam-imd` binary removed; `--no-imd` flag mirrors `--no-web`) / F131 host-probe `remote_run` heredoc fix / F132 IMD inbound wire — daemon now spawns `Channel::listen` task + mpsc consumer + supervisor inbox-drain pass; before F132 the daemon NEVER called `TelegramChannel::listen`, so user TG messages sat unread in `getUpdates` and the bot tmux pane stayed silent / **F134 IMD outbound wire — daemon per-tick `drain_outboxes` reads each bot's `turns.jsonl` from a persisted byte-offset cursor (`<project>/.ccteam/chat/<role>/outbound.cursor`) and dispatches new `assistant` rows through the matching Channel; before F134 `outbound::forward_new_rows` had unit tests but was never called from `run_daemon_with_shutdown` — bot replies stranded in `turns.jsonl`, symmetric gap with F132** / **F135 DM auto-route — `auto_route_dm_mention` preprocessor prepends `@<role> ` when exactly one registered bot owns `(channel, reply_target)` and content has no existing `@<handle>`; router's "no @mention → Drop" contract preserved for 0-bot / 2+-bot (group) cases so multi-bot disambiguation still requires explicit @** / **F136 bot heartbeat writer — `BotSupervisor::ensure_started` spawns a 5s-tick task that writes `<bot_dir>/heartbeat`(RFC3339 UTC);before F136 nobody wrote the file so `supervisor::decide` saw stale-or-missing every tick → `SupervisorAction::Restart` → ~65s tmux teardown loop wiped any queued send-keys. Task aborted on `shutdown`/`restart`** / **F137 events→turns_mirror consumer — `BotSupervisor::ensure_started` spawns a second task that drains `adapter.events(&handle)` and, for every `ItemCompleted{AgentMessage}`, calls `turns_mirror::append_turn` against `<project>/.ccteam/chat/<role>/turns.jsonl`; before F137 `append_turn` had zero production callers, leaving the F134 outbound forwarder with an empty source file (symmetric gap with F132 inbound / F134 outbound — together F132+F134+F136+F137 close the chat round-trip)** / **F139 hooks → daemon HTTP — Claude Code hook commands now invoke `~/.ccteam/hooks/hook.sh` (single `include_str!`-embedded POSIX script, materialized by `ccteam init` + `ccteam doctor --install-hooks`, chmod 0755). The script POSTs the Claude Code hook stdin to the long-running `ccteam start` daemon's `POST /internal/hook/:kind[/:action]` axum route (~10 ms loopback round-trip) and falls back to `ccteam internal hook ...` when the daemon is unreachable. Before F139 every hook firing cold-spawned the ccteam Rust binary at ~200 ms × 4 hooks × ~1.5 turns/sec ⇒ user-visible 1+ s of chat sluggishness; F139 collapses that to ~20× faster. `ccteam doctor --migrate-hook-commands` rewrites V0.4.6/V0.6.0 `<bin> internal hook ...` settings.json hooks into the new `<hook.sh> ...` form.**)|
+| 当前最新版 | **V0.6.3**(F142 `Trigger::Schedule` 接真 cron + F143 webhook ingress + F144 vendor 接缝 forward-compat + F145 `squad:` 跨 session 运行时路由)— 详 `docs/versions/v0-6-3/README.md` |
+| 上一版 | **V0.6.2**(F140 per-role 代码 `scope` — 大型代码库:`AgentSpec.scope` 把每次 spawn 的 `cwd` 钉到与 role 相关的子树,收窄爆炸半径;源自 Anthropic《How Claude Code works in large codebases》)— 详 `docs/versions/v0-6-2/README.md` |
 | V0.6.x 延期候选 | 空(本版闭所有 retained risk)|
 | V0.7 主线候选 | Epic C 国内 IM(WeChat / 飞书 / DingTalk / QQ)启用 + chat memory 跨设备同步 + monorepo-aware `.mcp.json` + migrate-from-claude + 6 号编排模式深化(HumanApproval × bg/chat 矩阵全开) |
 | 历史版本 | V0.1 → V0.6.1 见各自 `docs/versions/v0-X-Y/README.md` |
@@ -34,11 +35,11 @@
 | 6 | `docs/ccteam-as-domain-agnostic-orchestrator.md` | 加新 team / 改红线时 |
 | 7 | `docs/claude-code-best-practices.md` | 改 agent prompt / hooks / context 管理时 |
 | 8 | `docs/claude-code-tool-surface.md` | 改 workflow.yaml + agent .md 时 |
-| 9 | `docs/versions/v0-6-3/README.md` | 看当前版本(V0.6.3 patch:F140 cron + F141 webhook + F142 vendor-seam + F143 squad routing)|
-| 10 | `docs/versions/v0-6-1/README.md` | 上一版(V0.6.1 Epic D/E/F + F98 + F119-F139)|
-| 11 | `docs/versions/v0-6-0/README.md` | 上一 minor(V0.6.0 Epic A/B/C + F106-F118 + 4-wave 范式)|
+| 9 | `docs/versions/v0-6-3/README.md` | 看当前版本(V0.6.3 patch:F142 cron + F143 webhook + F144 vendor-seam + F145 squad routing)|
+| 10 | `docs/versions/v0-6-2/README.md` | 上一版(V0.6.2 patch:F140 per-role `scope`)|
+| 11 | `docs/versions/v0-6-1/README.md` | 上上版(V0.6.1 Epic D/E/F + F98 + F119-F139)|
 
-**起手 30 秒**:`git log -1` 看 HEAD → `cargo test --workspace 2>&1 | awk '/^test result/{p+=$4;f+=$6}END{print p,f}'` 校 1462/1 → 读用户诉求 → 干。
+**起手 30 秒**:`git log -1` 看 HEAD → `cargo test --workspace 2>&1 | awk '/^test result/{p+=$4;f+=$6}END{print p,f}'` 校 1471/1 → 读用户诉求 → 干。
 
 **对照参考**(`references/` gitignore 不入库):`references/claude-code/`(Anthropic Claude Code 源码)+ `references/codex/codex-rs/`。HarnessAdapter / 协议适配时翻;**不**当 ccteam 依赖。
 
@@ -82,7 +83,7 @@
 | 机制 | 用途 |
 |---|---|
 | **CLAUDE.md** | 项目级 / 用户级持久指令 |
-| **Skills**(repo 根 `skills/`,V0.6.0 F113 总入口 + 5 sub-skill)| `/ccteam` 总入口 NL dispatcher / `ccteam-control` / `ccteam-creator` / `ccteam-team` / `ccteam-im-setup`(F117 一次性 IM token onboarding)/ `ccteam-advise`(F112 Codex parallel vote)|
+| **Skills**(repo 根 `skills/`,V0.6.0 F113 总入口 + 6 sub-skill)| `/ccteam` 总入口 NL dispatcher / `ccteam-control` / `ccteam-creator` / `ccteam-team` / `ccteam-im-setup`(F117 一次性 IM token onboarding)/ `ccteam-advise`(F112 Codex parallel vote)/ `ccteam-scan`(V0.6.2 F141 大型代码库导航性体检 — 只读 audit)|
 | **MCP** | `ccteam` 26 工具(V0.6 F111 24 + V0.6.1 F128 `admin_change_persona` + `admin_add_tool`),5 group 子前缀:`mcp__ccteam__{workflow_,chat_,advise_,admin_,screenshot}*`;`CCTEAM_DISABLE_TOOLS` group enum(非 glob);可选 `claude-mem`(LLM 自看 surface 决定是否调)|
 | **Subagents** | agent 内 `Task(subagent_type=...)` ad-hoc 节流;8 个 plugin agent 已 ln -sf |
 | **Hooks** | `ccteam internal hook progress-append / load-context / intercept-ask`(F89 隐藏)|

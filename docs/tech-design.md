@@ -53,15 +53,15 @@
 
 ### 2.1 三层架构（Channel / Interaction / Orchestration）
 
-V0.6.0 起 **Channel Layer 实化为 `ccteam-imd` supervisor**(F116;V0.6.1 F130 折入 `ccteam start` 单进程,作为 tokio task 与 orchestrator + web 共享 shutdown channel,独立 binary 已删)+ 统一 `openhuman/channels` Rust crate 14+ IM 平台(F109);**HarnessAdapter trait 是 5-method thread/turn 接口对齐 Codex `ThreadManager::{submit, next_event}`**(F107);新增**模式 3 chat 形态**(F108):per-bot tmux 长 session + Claude TUI 长跑 + dual-track hooks+transcript 镜像 ccteam-owned `turns.jsonl`。V0.6.3 F141 起 Channel Layer 还包含 **webhook ingress**(`POST /webhook/:project/:token`,挂在 daemon 已有 axum web server,token-only constant-time 比对 + 256 KiB body cap),payload 落 `<project>/.ccteam/webhooks/<ts>-<rand>.json`,由 agent 现成的 `trigger: watch:.ccteam/webhooks/` 消费 —— **`Trigger` enum 零改动**;webhook 不内嵌 LLM、不进 spawn argv,与 inbox 同级别"dumb router 写文件"。
+V0.6.0 起 **Channel Layer 实化为 `ccteam-imd` supervisor**(F116;V0.6.1 F130 折入 `ccteam start` 单进程,作为 tokio task 与 orchestrator + web 共享 shutdown channel,独立 binary 已删)+ 统一 `openhuman/channels` Rust crate 14+ IM 平台(F109);**HarnessAdapter trait 是 5-method thread/turn 接口对齐 Codex `ThreadManager::{submit, next_event}`**(F107);新增**模式 3 chat 形态**(F108):per-bot tmux 长 session + Claude TUI 长跑 + dual-track hooks+transcript 镜像 ccteam-owned `turns.jsonl`。V0.6.3 F143 起 Channel Layer 还包含 **webhook ingress**(`POST /webhook/:project/:token`,挂在 daemon 已有 axum web server,token-only constant-time 比对 + 256 KiB body cap),payload 落 `<project>/.ccteam/webhooks/<ts>-<rand>.json`,由 agent 现成的 `trigger: watch:.ccteam/webhooks/` 消费 —— **`Trigger` enum 零改动**;webhook 不内嵌 LLM、不进 spawn argv,与 inbox 同级别"dumb router 写文件"。
 
 ```
-Channel Layer (V0.6.0 F109+F116 实化;V0.6.1 F130 single-process; V0.6.3 F141 加 webhook ingress)  →  inbox/outbox 文件协议 + IM event bus
+Channel Layer (V0.6.0 F109+F116 实化;V0.6.1 F130 single-process; V0.6.3 F143 加 webhook ingress)  →  inbox/outbox 文件协议 + IM event bus
    ccteam-imd supervisor task (in-process tokio task inside `ccteam start`)
      ├── openhuman/channels Rust crate (telegram/slack/discord/lark/dingtalk/qq/...)
      ├── Reply Listener (borrowed OMC reply-listener.ts) + bot-to-bot @ routing + hop_limit
      ├── HarnessAdapter trait 调用(把 inbound IM 消息翻译成 TurnInput)
-     └── HTTP webhook route (V0.6.3 F141; axum POST /webhook/:project/:token → .ccteam/webhooks/)
+     └── HTTP webhook route (V0.6.3 F143; axum POST /webhook/:project/:token → .ccteam/webhooks/)
         ↓
 User Interaction Layer (M1, V0.6 F108 扩 chat)
    meta-agent session + project agent bg-jobs (~/.claude/jobs/<job_id>/)
@@ -106,7 +106,7 @@ pub struct ThreadHandle {
 
 `/compact /new /clear` 不再是独立 `LifecycleOp` enum,而是 `TurnInput::SystemDirective("compact")` 特殊 turn — adapter 内部翻译为 backend-specific 操作(Claude → `/compact` slash 透传;Codex → `compact_remote` API)。**统一模式 2 + 模式 3 = "all chat is a turn sequence"**。
 
-**Vendor-seam forward-compat**(V0.6.3 F142):ccteam 读 sub-harness 吐出的 `state.json` / `codex exec --json` / `codex app-server` JSON-RPC 通知 —— 这些是 vendor 自有 schema,按自家节奏新增字段 / 新 enum 值,ccteam 清不掉也管不了(与「不做历史迁移」红线管 ccteam 自有 state 不冲突)。`ccteam-core::vendor_compat::warn_unknown_vendor_token(seam, token, detail)` 是 process-wide warn-once helper(`(seam, token)` 作 dedup key,不在每个 poll tick 刷屏)。三处接缝的降级策略:**未知 Claude job state** → 当非终态、orchestrator 继续 probe(宁可多 probe,不可误判 done 留 phantom job);**未知 Codex `--json` event** → skip + warn(不中断 event stream);**未知 Codex app-server notification** → 同样 skip + warn。回归测试喂合成 future-JSON 锁死「不 panic + 降级符合预期」语义。
+**Vendor-seam forward-compat**(V0.6.3 F144):ccteam 读 sub-harness 吐出的 `state.json` / `codex exec --json` / `codex app-server` JSON-RPC 通知 —— 这些是 vendor 自有 schema,按自家节奏新增字段 / 新 enum 值,ccteam 清不掉也管不了(与「不做历史迁移」红线管 ccteam 自有 state 不冲突)。`ccteam-core::vendor_compat::warn_unknown_vendor_token(seam, token, detail)` 是 process-wide warn-once helper(`(seam, token)` 作 dedup key,不在每个 poll tick 刷屏)。三处接缝的降级策略:**未知 Claude job state** → 当非终态、orchestrator 继续 probe(宁可多 probe,不可误判 done 留 phantom job);**未知 Codex `--json` event** → skip + warn(不中断 event stream);**未知 Codex app-server notification** → 同样 skip + warn。回归测试喂合成 future-JSON 锁死「不 panic + 降级符合预期」语义。
 
 #### 2.1.1 三层各自的职责边界
 
@@ -202,7 +202,7 @@ created_at: 2026-05-04T10:23:00Z
 
 #### 3.2.1 meta-agent / 常驻 role
 
-meta-agent 是一个 workflow.yaml 配 `trigger: manual` 的 dispatcher agent + `<project>/.ccteam/inbox/` 作 Watch trigger 的接力跑者（用户写 inbox → ArtifactWatcher 触发 dispatcher agent 一次）。watchdog / reviewer 同理 — 在自家 workflow.yaml 用 `trigger: manual` + meta-agent 在自己 outbox 写 NL trigger，或用 `trigger: schedule`（V0.6.3 F140 起接真 5 段 cron + skip-missed 语义，详 §3.3.2）。
+meta-agent 是一个 workflow.yaml 配 `trigger: manual` 的 dispatcher agent + `<project>/.ccteam/inbox/` 作 Watch trigger 的接力跑者（用户写 inbox → ArtifactWatcher 触发 dispatcher agent 一次）。watchdog / reviewer 同理 — 在自家 workflow.yaml 用 `trigger: manual` + meta-agent 在自己 outbox 写 NL trigger，或用 `trigger: schedule`（V0.6.3 F142 起接真 5 段 cron + skip-missed 语义，详 §3.3.2）。
 
 `teams/meta-agent.yaml` 是首个常驻范例，作为 shipped seed 随 binary 发布；`Orchestrator::new` / `ccteam start` / `ccteam doctor --reset-shipped-teams` 都会把它写到 `~/.ccteam/teams/meta-agent/team.yaml`（只是种子，实际运行时编排器只看 workflow.yaml + state.json）。
 
@@ -317,7 +317,7 @@ chat:
 | Trigger | 语义 | 触发源 | 并发约束 |
 |---|---|---|---|
 | `manual` | 用户 / meta-agent 显式 `ccteam internal spawn <slug> <role>` 或 `mcp__ccteam__workflow_spawn_agent` | CLI / MCP / 用户 inbox 消息 | parallelism 强制 1 |
-| `schedule` | 定时 trigger；V0.6.3 F140 接真 cron(`croner` crate,标准 5 段 cron),`AgentSpec::schedule: "<expr>"` 必填(workflow load 时 eager parse,语法错 → 拒载);per-`(project, role)` `last_fire` 持久化在 `<project>/.ccteam/state.json::schedule_last_fire`;**skip-missed 语义** — daemon 停机期间错过的 slot 不补跑,只判「下一个 due 时刻 ≤ now」 | daemon 主循环 tick 评估 | parallelism 强制 1 |
+| `schedule` | 定时 trigger；V0.6.3 F142 接真 cron(`croner` crate,标准 5 段 cron),`AgentSpec::schedule: "<expr>"` 必填(workflow load 时 eager parse,语法错 → 拒载);per-`(project, role)` `last_fire` 持久化在 `<project>/.ccteam/state.json::schedule_last_fire`;**skip-missed 语义** — daemon 停机期间错过的 slot 不补跑,只判「下一个 due 时刻 ≤ now」 | daemon 主循环 tick 评估 | parallelism 强制 1 |
 | `gate` | 等 `mcp__ccteam__workflow_trigger_gate` MCP 工具调用释放；释放后消费 input 目录所有 artifact 后再回 gated | MCP 工具 | parallelism 强制 1 |
 | `watch:<path>` | inotify（Linux）/ fsevents（macOS）监听项目相对路径，新文件 → spawn 一个 session | ArtifactWatcher（F64，F78 修复项目相对路径） | `parallelism: u32` 上限内并发 |
 
@@ -329,7 +329,7 @@ agent 行为完全靠 `.claude/agents/<role>.md`（Claude Code 官方 agent 文�
 
 这种解耦让用户改 prompt 不需要重启 orchestrator（F82 workflow.yaml 热加载，prompt 改动 claude 下次 spawn 自动加载），改拓扑不需要改 prompt（workflow.yaml 调 trigger 路径，agent prompt 不变）。
 
-#### 3.3.4 跨 session 运行时路由 — `squad:` 块(V0.6.3 F143)
+#### 3.3.4 跨 session 运行时路由 — `squad:` 块(V0.6.3 F145)
 
 workflow.yaml 顶层新增可选 `squad: { leader, members, hop_limit }` 块,补「跨 spawn / 跨 session 运行时路由」这条窄缝(单 session 内的委派已被 Claude Code `Task` subagent 覆盖,ccteam 不重做)。模型:
 

@@ -801,7 +801,7 @@ impl Orchestrator {
         // passed `project_dir` (a directory), which made
         // `progress::append_event` fail with "open <project_dir>".
         //
-        // V0.6.3 F143 — when a `squad:` block is declared, hand the
+        // V0.6.3 F145 — when a `squad:` block is declared, hand the
         // absolute squad routing dir to the watcher so the leader's
         // `<member>--*.md` artifacts surface as `ArtifactEvent`s tagged
         // with the squad route sentinel.
@@ -1445,7 +1445,7 @@ impl Orchestrator {
                     tracing::info!(slug, role = role.as_str(), "waiting for explicit trigger");
                 }
                 Trigger::Schedule => {
-                    // V0.6.3 F140 — the per-tick `check_schedules` pass
+                    // V0.6.3 F142 — the per-tick `check_schedules` pass
                     // anchors the cursor on first observation and fires
                     // on cron-due. Nothing to register here.
                     tracing::info!(
@@ -1504,7 +1504,7 @@ impl Orchestrator {
                     self.poll_completions(slug, spec, project_dir, progress_path).await;
                     self.check_spawn_requests(slug, spec, project_dir, progress_path).await;
                     self.check_gates(slug, spec, project_dir, progress_path).await;
-                    // V0.6.3 F140 — cron-scheduled agents. Runs after
+                    // V0.6.3 F142 — cron-scheduled agents. Runs after
                     // gates so a tick that just released a gate still
                     // re-checks schedules in the same pass.
                     self.check_schedules(slug, spec, project_dir, progress_path).await;
@@ -1543,7 +1543,7 @@ impl Orchestrator {
     ) -> Result<()> {
         let role = evt.role.clone();
 
-        // V0.6.3 F143 — squad runtime routing. The watcher tags events
+        // V0.6.3 F145 — squad runtime routing. The watcher tags events
         // from `<project>/.ccteam/squad/` with the route sentinel; the
         // real target role is the `<member>--*.md` filename prefix the
         // leader chose at runtime.
@@ -1627,7 +1627,7 @@ impl Orchestrator {
             .await
     }
 
-    /// V0.6.3 F143 — dispatch a squad routing artifact.
+    /// V0.6.3 F145 — dispatch a squad routing artifact.
     ///
     /// The leader writes `<member>--*.md` (optionally `<member>--h<N>--*`
     /// for a re-route) into `<project>/.ccteam/squad/`. This method:
@@ -1926,7 +1926,14 @@ impl Orchestrator {
         let ctx = SpawnCtx {
             slug: slug.to_string(),
             sid: sid.clone(),
-            cwd: project_dir.to_path_buf(),
+            // V0.6.2 — `cwd` is the agent's `scope` subdirectory joined
+            // onto the project root (or the root itself when `scope` is
+            // unset). Scoping each spawn to the slice of the tree
+            // relevant to its role keeps the fresh-1M-context window
+            // (red line R3) pointed at a small subtree instead of the
+            // whole repo root; Claude Code still walks *up* and loads
+            // every CLAUDE.md along the way.
+            cwd: agent.cwd(project_dir),
             project_dir: project_dir.to_path_buf(),
             extra_args: vec![kick],
             // Wave 4 D14 — plumb the workflow-declared model id so the
@@ -2660,7 +2667,7 @@ impl Orchestrator {
         }
     }
 
-    /// V0.6.3 F140 — fire `trigger: schedule` agents whose cron
+    /// V0.6.3 F142 — fire `trigger: schedule` agents whose cron
     /// expression is due.
     ///
     /// ## skip-missed semantics
@@ -3261,7 +3268,7 @@ impl Orchestrator {
             .await;
     }
 
-    /// V0.6.3 F140 — drive one `check_schedules` pass (cron tick).
+    /// V0.6.3 F142 — drive one `check_schedules` pass (cron tick).
     pub async fn test_check_schedules(
         &self,
         slug: &str,

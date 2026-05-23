@@ -165,7 +165,7 @@ impl ArtifactWatcher {
     /// joining them to the project root before passing the spec in;
     /// `new` consumes the spec as-given and treats `path` literally.
     ///
-    /// V0.6.3 F143 — when `spec.squad` is `Some`, the caller passes the
+    /// V0.6.3 F145 — when `spec.squad` is `Some`, the caller passes the
     /// absolute squad routing dir (`<project>/.ccteam/squad/`) as
     /// `squad_root`. The watcher registers it as an extra root tagged
     /// with the [`SQUAD_ROUTE_SENTINEL`] role; the orchestrator's
@@ -188,7 +188,7 @@ impl ArtifactWatcher {
                 roots.push((path.clone(), role.clone()));
             }
         }
-        // V0.6.3 F143 — squad routing dir. Appended last so an explicit
+        // V0.6.3 F145 — squad routing dir. Appended last so an explicit
         // `watch:` agent root that happens to alias it still wins the
         // YAML-order match in `match_root`.
         if spec.squad.is_some() {

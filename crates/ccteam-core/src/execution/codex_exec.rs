@@ -562,7 +562,7 @@ pub fn translate_jsonl_event(v: &Value, turn_id: &TurnId) -> Vec<ThreadEvent> {
                 .unwrap_or("(no message)")
                 .to_string(),
         })],
-        // V0.6.3 F142 — forward-compat: a `codex exec --json` event
+        // V0.6.3 F144 — forward-compat: a `codex exec --json` event
         // `type` we don't translate is **skipped** (empty event vec) so
         // the stream keeps flowing for the events we *do* understand.
         // Warn once per unknown kind so a Codex CLI event-vocabulary
@@ -648,7 +648,7 @@ fn parse_jsonl_item(item: &Value) -> ThreadItem {
                 .unwrap_or("")
                 .to_string(),
         ),
-        // V0.6.3 F142 — forward-compat: an unrecognised item `type`
+        // V0.6.3 F144 — forward-compat: an unrecognised item `type`
         // degrades to an empty agent message (no panic, no stream
         // break). Warn once so a Codex item-vocabulary drift is visible.
         other => {
@@ -712,7 +712,7 @@ mod tests {
         assert_eq!(snap.model_display_name, "codex");
     }
 
-    // V0.6.3 F142 — forward-compat regression tests. OpenAI may ship a
+    // V0.6.3 F144 — forward-compat regression tests. OpenAI may ship a
     // `codex` CLI that emits a `--json` event with an unknown `type`
     // and/or extra fields; ccteam must skip it (no panic, no broken
     // stream) and warn once.
