@@ -1,10 +1,38 @@
-# Quickstart — 5 分钟在 TG 收到你第一个 AI 助理的回话
+# Quickstart
 
-> 本文档单一目标:从 0 到 **你手机 TG 收到 bot 第一条回话**,5 步,5 分钟。
+> **第一节先看决策树** ── 你想做的事 → 直接对应一个命令,不必先理解架构。
+>
+> 第二节起是 "我要做 IM bot" 这条路的 5 分钟走通流程(从 0 到 **你手机 TG 收到 bot 第一条回话**)。其他路径详见 [task-to-command.md](task-to-command.md) + [user-manual.md](user-manual.md)。
 >
 > 卡住任何一步?跳到 [troubleshooting.md](troubleshooting.md) 搜对应章节。
 
-## 你需要
+---
+
+## §1 我该用哪个命令?(决策树)
+
+```
+你想做的事                                  → 用这个
+──────────────────────────────────────────────────────────────────
+摸底新代码库 / 仓库 audit                    /ccteam-scan
+开发 / 修 bug / 重构(全程盯着干)            /ccteam-team "<task>"
+review PR / 第二意见 / 对答案                /ccteam-advise "<PR 或 path>"
+做个 IM 私聊助理(长期 24/7 在线)            /ccteam-creator "做个 X 助理"  ↓ §2 详跑通
+做个团队 IM 圆桌(多 bot 互动)               /ccteam-creator "群里几个 bot"
+夜里跑长任务(hands-off / 关电脑)            /ccteam-creator "<task>,睡前跑"
+看 / 暂停 / 恢复 / 看花费                    /ccteam-control list / pause / cost
+配 / 改 IM token(TG / Slack / Discord)      /ccteam-im-setup
+不确定?用自然语言问                          /ccteam "<NL 描述>"
+```
+
+每条详解 + 例子见 [task-to-command.md](task-to-command.md)。
+
+---
+
+## §2 走通 "IM 私聊助理" 这条路(5 分钟)
+
+下面是 ccteam **最有代表性的** 一条路 —— 起一个 Telegram 私聊 bot 当你的 AI 助理。
+
+**你需要**:
 
 - Claude Code(`claude` CLI),装好登好。没装看 [code.claude.com/docs/install](https://code.claude.com/docs/install)。
 - Telegram 账号 + 手机装 Telegram app。macOS / Linux 主机(Windows 走 WSL2)。
@@ -113,6 +141,7 @@ You:     go
 
 ## 接下来读什么
 
+- 想跑别的命令(不是 IM bot)?→ [task-to-command.md](task-to-command.md)(决策树详解)
 - 想跑别的 use case?→ [recipes.md](recipes.md)(代码审查 bot / 翻译 bot / 日报助手等 10 个现成模板)
 - 想了解全部 5 种用法?→ [user-manual.md](user-manual.md)
 - 想给 bot 换 persona / 加能力?→ [user-manual.md](user-manual.md) §2.4 Pocket Assistant

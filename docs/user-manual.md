@@ -1,8 +1,30 @@
 # ccteam User Manual
 
-> ccteam 让你**用一句中文/英文召唤一个 AI 团队**,跑在你电脑上、接进你的 IM。本手册带你跑通 5 种典型场景,5 分钟见效。
+> ccteam 让你**用一句中文/英文召唤一个 AI 团队**,跑在你电脑上、接进你的 IM。本手册带你跑通典型场景。
 >
 > **零 yaml,零 CLI 命令记忆,零术语**。你只需要会用 Claude Code session 输入 slash 命令 + 自然语言。
+
+---
+
+## §0 我该用哪个命令?(决策树速查)
+
+**先看决策树**,挑一条路再下读对应章节。完整决策树详解见 [task-to-command.md](task-to-command.md)。
+
+```
+你想做的事                                  → 用这个              → 本手册章节
+─────────────────────────────────────────────────────────────────────────────
+摸底新代码库 / 仓库 audit                    /ccteam-scan          §2.0
+开发 / 修 bug / 重构(全程盯着干)            /ccteam-team          §2.2 Team Sprint
+review PR / 第二意见 / 对答案                /ccteam-advise        §2.6 Advise
+IM 私聊助理(长跑)                          /ccteam-creator       §2.4 Pocket Assistant
+IM 圆桌(多 bot)                            /ccteam-creator       §2.5 IM Squad
+夜里跑长任务(hands-off)                    /ccteam-creator       §2.3 Overnight Builder
+看 / 暂停 / 改 persona / 加工具              /ccteam-control       §4 Admin 操作
+配 / 改 IM token                             /ccteam-im-setup      §2.4 + quickstart
+不确定?用自然语言问                          /ccteam "<NL>"        §3.1
+```
+
+> §1 介绍 ccteam 是什么 / 三种对话入口;§2 详跑每个场景;§3 是入口手册;§4 是 admin 操作参考;§5 cost。**只想用,跳到 §2 对应小节即可**。
 
 ---
 
