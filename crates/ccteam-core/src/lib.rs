@@ -13,6 +13,11 @@ pub mod actions;
 // change-persona` + `add-tool` MCP admin tools. Pure IO over a chat
 // bot's `.claude/agents/<bot>.md` definition file.
 pub mod admin_actions;
+// V0.6.5 F152 + F153 — `mcp__ccteam__advise_vote` /
+// `mcp__ccteam__advise_parallel` real implementations. Spawns Claude +
+// Codex one-shot advisors in parallel, optional verdict synthesis,
+// per-vendor budget ledger under `<ccteam_root>/cost-budget.json`.
+pub mod advise;
 // V0.6.0 Wave 2 F114 — scientist nickname pool used by ccteam-creator
 // when minting bot handles for new chat workflows.
 pub mod agent_naming;
@@ -101,6 +106,15 @@ pub mod workflow_watcher;
 pub use actions::{
     inject_decision, next_inbox_seq, pause, resume, send_to_session, send_to_session_with,
     DecisionInput, SendOptions, SendResult,
+};
+// V0.6.5 F152 + F153 — advise_vote / advise_parallel entry points
+// (used by the `mcp__ccteam__advise_*` MCP dispatch in ccteam-cli).
+pub use advise::{
+    advise_parallel, advise_vote, append_budget_sample as append_advise_budget_sample,
+    budget_ledger_path as advise_budget_ledger_path, load_budget_ledger as load_advise_budget,
+    sum_advise_today, AdviseBudgetLedger, AdviseError, Agreement, AnswerStatus, BudgetSample,
+    BudgetSnapshot, CodexStatus, ParallelResult, VendorAnswer, VoteResult,
+    DEFAULT_ADVISE_BUDGET_USD_24H, DEFAULT_CODEX_TIMEOUT_SECS,
 };
 pub use auto_loop::{AutoLoopDecision, AutoLoopFrontMatter, AutoLoopState};
 pub use claude_job::{

@@ -441,11 +441,12 @@ fn tool_definitions() -> Vec<Value> {
     ];
     // V0.4.0 F65 — append the 7 workflow-control tools.
     tools.extend(mcp_workflow_tools::workflow_tool_definitions());
-    // V0.6.0 Wave 1 (F108 / F112) — append chat (5) + advise (2)
-    // stubs. Wave 2 / Wave 3 swap the dispatch handlers from
-    // NotImplemented to real implementations; the schemas + names
-    // freeze here so skills / agent prompts compile against the
-    // final surface.
+    // V0.6.0 Wave 1 (F108 / F112) — append chat (6) + advise (2)
+    // tools. V0.6.5 F146 / F147 turned all 6 chat stubs into real
+    // implementations; V0.6.5 F152 / F153 turned both advise stubs
+    // into real implementations against the `ccteam_core::advise`
+    // entry points (Claude + Codex parallel one-shot advisors +
+    // per-vendor budget ledger).
     tools.extend(mcp_chat_tools::chat_tool_definitions());
     tools.extend(mcp_advise_tools::advise_tool_definitions());
     // V0.6.1 F128 — `admin_change_persona` + `admin_add_tool` real
@@ -532,7 +533,12 @@ async fn call_tool(paths: &CcteamPaths, params: &Value) -> Result<Vec<Value>> {
             if let Some(body) = mcp_chat_tools::dispatch(paths, other, &args)? {
                 return Ok(text_content(body));
             }
-            if let Some(body) = mcp_advise_tools::dispatch(other, &args)? {
+            // V0.6.5 F152 + F153 — advise group: real `advise_vote` +
+            // `advise_parallel` (Claude + Codex parallel one-shot
+            // advisors + verdict synthesis / N-of-N). Async dispatch
+            // because the underlying advisor calls spawn tokio
+            // subprocesses; ledger gates the spend pre-fan-out.
+            if let Some(body) = mcp_advise_tools::dispatch(paths, other, &args).await? {
                 return Ok(text_content(body));
             }
             // V0.6.1 F128 — admin mutators (after the daemon gate
