@@ -182,6 +182,7 @@ fn cursor_save_and_load_round_trip() {
         session_id: "ab".into(),
         byte_offset: 123,
         last_event_id: None,
+        prior_offsets: Default::default(),
     };
     c.save(&p).unwrap();
     let back = TranscriptCursor::load(&p).unwrap();

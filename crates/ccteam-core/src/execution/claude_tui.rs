@@ -477,11 +477,7 @@ async fn tail_loop(
     // session file. Catches any content written between Claude start
     // and our watcher arming.
     if let Some((sid, path)) = discover_active_session(&cwd) {
-        if cursor.session_id != sid {
-            cursor.session_id = sid;
-            cursor.byte_offset = 0;
-            cursor.last_event_id = None;
-            cursor.project_encoded = encode_project_cwd(&cwd);
+        if cursor.switch_session(&sid, encode_project_cwd(&cwd)) {
             pending.clear();
         }
         drain_path(&path, &mut cursor, &mut pending, &cursor_file, &tx).await;
@@ -507,14 +503,12 @@ async fn tail_loop(
                     let Some(sid) = affected.file_stem().and_then(|s| s.to_str()) else {
                         continue;
                     };
-                    if cursor.session_id != sid {
-                        // Rotation (or initial session bind) — `/clear`
-                        // / `/compact` creates a fresh sid.jsonl whose
-                        // CREATE event lands here.
-                        cursor.session_id = sid.to_string();
-                        cursor.byte_offset = 0;
-                        cursor.last_event_id = None;
-                        cursor.project_encoded = encode_project_cwd(&cwd);
+                    // Switch via `TranscriptCursor::switch_session` so a
+                    // sid we've seen before resumes at its prior offset
+                    // — never re-reads. Closes the main-session ↔
+                    // subagent-jsonl oscillation that caused 15× duplicate
+                    // Telegram sends on NAS.
+                    if cursor.switch_session(sid, encode_project_cwd(&cwd)) {
                         pending.clear();
                     }
                     drain_path(affected, &mut cursor, &mut pending, &cursor_file, &tx).await;
@@ -527,11 +521,7 @@ async fn tail_loop(
                 // bytes on disk we haven't observed. Just re-discover +
                 // read_new; usually a no-op.
                 if let Some((sid, path)) = discover_active_session(&cwd) {
-                    if cursor.session_id != sid {
-                        cursor.session_id = sid;
-                        cursor.byte_offset = 0;
-                        cursor.last_event_id = None;
-                        cursor.project_encoded = encode_project_cwd(&cwd);
+                    if cursor.switch_session(&sid, encode_project_cwd(&cwd)) {
                         pending.clear();
                     }
                     drain_path(&path, &mut cursor, &mut pending, &cursor_file, &tx).await;
@@ -604,12 +594,8 @@ async fn tail_loop_polling(
             }
         };
 
-        if cursor.session_id != sid {
-            cursor.session_id = sid.clone();
-            cursor.byte_offset = 0;
-            cursor.last_event_id = None;
+        if cursor.switch_session(&sid, transcript_tail::encode_project_cwd(&cwd)) {
             pending.clear();
-            cursor.project_encoded = transcript_tail::encode_project_cwd(&cwd);
         }
 
         match transcript_tail::read_new(&transcript_path, &cursor, std::mem::take(&mut pending))
