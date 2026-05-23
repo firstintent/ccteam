@@ -792,7 +792,130 @@ V0.6.0 Wave 4 ship 时仅跑了 5 preset E2E + 3 Codex scenario(`host-probe.md` 
 ### 风险
 
 - **真跑 50 次 claude API call 成本**:估算 sonnet 4.6 input ~50 tok x 50 = 2500 tok input;output ~50 tok x 50 = 2500 tok output;按 $3/Mtok in + $15/Mtok out → < $0.10。**可接受**,但 host-probe 模式默认 mock(静态路由表 match)+ `--real` flag 走真 LLM 验证。
-- **corpus 偏 ── 50 条可能不能代表 production**:V0.6.5 ship 后跟踪真实 user query,收集 / 扩 corpus 到 V0.6.6 / V0.7。
+- **corpus 偏 ── 50 条可能不能代表 production**:V0.6.5 ship 后跟踪真实 user query,**本版 50 条由 corpus reviewer audit pass 即可** ── 不能用"以后再扩"当绕过 90% gate 的借口。
+
+---
+
+# EPIC H — 运维健壮性(P1,2026-05-23 实战发现)
+
+**主线**:V0.6.4 OutboundCursor PR ship + nas-box005 真机首次部署过程中**实战发现**两个运维 blocker。这两条不是 V0.6.0 PRD 承诺的(是 ship 后才暴露的 production 痛),但**不修运维不通就无法签 F148 host-probe**(F148 验收要求 "fresh wipe → daemon → TG round-trip"),所以与 V0.6 收账主题强耦合,合并入 V0.6.5。
+
+## F163 — `ccteam start` 优雅响应 SIGINT/SIGTERM
+
+### 痛点
+
+2026-05-23 nas-box005 实战:`kill -INT <pid>` 等 10s 无响应,`kill -TERM <pid>` 等 10s 也无响应,**只能 SIGKILL**。这导致:
+- in-memory state 全丢(orchestrator 内部 watch::channel 没机会发 cancel,subtasks 不知道要 graceful drop)
+- pidfile `~/.ccteam/state/orchestrator.pid` 留 stale → 下次启动需 "stale pidfile reclaimed" warn 路径才能起来
+- web 端口 7331 释放靠 OS reaper(SIGKILL 也行,但若 fd 有 in-flight 写可能 leak)
+- 子进程 tmux session 不收任何信号 → 永久存活成孤儿(F164 治那个,但 F163 是 daemon 这一层的 graceful)
+
+### 现状缺口
+
+`crates/ccteam-cli/src/commands.rs::run_start` 主循环只 select 业务事件 + max-runtime watchdog,**没有 `tokio::signal::ctrl_c()` 或 `tokio::signal::unix::signal(SignalKind::terminate())` 监听**。`grep "signal\|SIGINT\|SIGTERM\|ctrl_c" crates/ccteam-cli/src/commands.rs` 0 命中(2026-05-23 实测)。
+
+`ccteam stop` 子命令是用户主动 CLI → 写 stop signal 文件 → daemon 看文件触发 shutdown 路径。但这条 file-trigger 路径**不响应 process signal**。
+
+### 需求
+
+`run_start` 主 loop 加 signal 监听:
+
+```rust
+let mut sigterm = tokio::signal::unix::signal(
+    tokio::signal::unix::SignalKind::terminate()
+).ok();
+let mut sigint = tokio::signal::ctrl_c();
+
+tokio::select! {
+    // 现有业务事件 arms
+    _ = sigint => { tracing::info!("SIGINT received, graceful shutdown"); break; }
+    _ = async { if let Some(s) = sigterm.as_mut() { s.recv().await; } } => {
+        tracing::info!("SIGTERM received, graceful shutdown");
+        break;
+    }
+}
+```
+
+Shutdown 路径(打破主 loop 后):
+1. **取消 watch::channel** → 所有 spawned tokio task(web / imd / orchestrator)看到 cancel 后自己 cleanup
+2. **等 task join**(设 5s timeout 防 hang;超时则 abort)
+3. **unlink pidfile + heartbeat 文件**:`~/.ccteam/state/orchestrator.pid` / `~/.ccteam/state/orchestrator.heartbeat` / `~/.ccteam/state/imd.heartbeat`
+4. **绝不直接 kill tmux 子进程** ── tmux session 是 bot 的 long-running,跟 daemon 生命周期解耦(red line:永不主动 kill 长 session);仅写一行 log 提示用户 "N tmux sessions left running (intentional)"
+5. **退出码** 0(graceful)/ 1(timeout reaping)
+
+### 文件(预估)
+
+- `crates/ccteam-cli/src/commands.rs::run_start` ── signal handler + shutdown sequence
+- `crates/ccteam-cli/tests/graceful_shutdown_test.rs`(新)── spawn `ccteam start --max-runtime 30s` 子进程 + 1s 后发 SIGTERM + 等 5s + 断言进程退出 + pidfile 不存在 + 端口 7331 释放
+- `docs/interfaces.md` ── §CLI lifecycle 注 "SIGTERM = graceful;SIGKILL = lossy(避免)"
+
+### 验收
+
+1. `cargo test -p ccteam-cli graceful_shutdown_test` pass(local + CI)
+2. 真机:nas-box005 `kill -TERM <pid>` → 5s 内 ps 看不到 + pidfile gone + `lsof -i :7331` empty
+3. SIGINT 同样行为
+4. baseline ≥ 1530 / 1 + 4 测试 → ≥ **1534 / 1**
+
+### 风险
+
+- **kill -9 强杀仍不响应**(SIGKILL 不能被捕获):预期行为,文档说清"SIGKILL 不 graceful,会留 stale pidfile,下次启动自动 reclaim"
+- **child task 不响应 cancel**(rust async task 不 cancellation-safe):cancel + 5s timeout 后 `tokio::task::JoinHandle::abort()` 兜底
+- **tmux 子进程在 SIGTERM 时收到 SIGHUP**(因为 daemon 是它们的 parent 经过 setsid 后变为孤儿,reparent 到 init,不会 SIGHUP):验证 nas 实测当前 ps 显示 tmux session ppid=1,所以 daemon 死不带它们。R(永不 kill 长 session)守。
+
+---
+
+## F164 — `claude-tui::start_thread` 自动重附接已存在 tmux session
+
+### 痛点
+
+2026-05-23 nas-box005 实战:daemon 重启后,看到老 tmux session `ccteam-chat-pocket-bot-assistant`(自 5/20 起,PPID=1)还在跑;调 `BotSupervisor::ensure_started → start_thread` → claude-tui adapter `tmux new-session -d` 因 session name 冲突报错 → `apply_action failed` 5s 一次 log 刷屏 → bot 永久失能;**必须人工 `tmux kill-session -t ccteam-chat-...`** 让 daemon 重新建。
+
+### 现状缺口
+
+`crates/ccteam-core/src/execution/claude_tui.rs::start_thread` 当前行为(2026-05-23 grep):
+
+```rust
+let session_name = chat_session_name(&ctx.slug, &spec.role);
+let session = TmuxSession::from_name(session_name.clone());
+if session.exists() {
+    return Err(HarnessError::SpawnFailed(format!(
+        "tmux session already exists: {session_name} (call resume_thread instead)"
+    )));
+}
+```
+
+它指 caller 走 `resume_thread`,但 `BotSupervisor::ensure_started` 路径从来不 call `resume_thread` ── 看到 supervisor 没起 thread 就调 `start_thread`,撞 SpawnFailed 一次次重试。
+
+### 需求
+
+`start_thread` 增加 "session 已存在 → 健康度判断 → reattach OR recreate":
+
+1. `if session.exists()`:
+   - **健康判断**:`tmux list-panes -t <session> -F "#{pane_pid}"` 拿 pane pid;`kill -0 <pid>` + `ps -p <pid> -o comm=` 看进程名包不包 `claude`
+   - **活的 → reattach**:不 spawn 新 process,只装/更新 hook 设置(`ensure_chat_hooks_installed`)+ ensure chat dir + 返回 ThreadHandle(identity 用既有 sid 或合成 "reattached-<session_name>")
+   - **死的(pid 不在 / 不是 claude)→ recreate**:`tmux kill-session -t <name>`(daemon 自己刚检测到的死 session,清理这一个 session **不违反** R6 "永不主动 kill 长 session" ── 那条 R 守的是"活的 bot 不被 daemon 主动 kill",死的 session 是孤儿不算)+ 走原来的 `tmux new-session` 创建路径
+2. log:`session reattached` vs `session recreated (dead pane)` 用 INFO 级别 + slug/role/老 pane pid 字段
+3. **不**改 `resume_thread` ── 它走 transcript-resume + 历史 sid 加载路径,不是 start_thread 该做的;F164 只让 `start_thread` 自闭环
+
+### 文件(预估)
+
+- `crates/ccteam-core/src/execution/claude_tui.rs::start_thread` ── 改逻辑;extract `is_pane_alive_with_claude(session) -> bool` helper
+- `crates/ccteam-core/src/tmux.rs` ── 加 `TmuxSession::list_pane_pids() -> Vec<u32>` + `TmuxSession::kill()` helpers(`tmux kill-session -t <name>`)
+- `crates/ccteam-core/tests/claude_tui_reattach_test.rs`(新)── tempdir + 起 fake tmux session + 跑 start_thread 断言 reattach;另一 case 模拟 dead pane(用 `tmux send-keys "exit" Enter` 让 pane 退出)断言 recreate
+- `docs/tech-design.md` § HarnessAdapter — start_thread 行为补 reattach 描述
+
+### 验收
+
+1. test: existing-alive-session → start_thread 成功 + session_id 不变(`tmux display-message -p "#{session_id}"` 前后一致)
+2. test: existing-dead-session → start_thread 成功 + session 被 recreate(pane pid 改变)
+3. 真机:nas-box005 daemon stop → daemon start → 老 `ccteam-chat-pocket-bot-tech-helper` session 自动 reattach + 5s 内 log `bot supervisor started thread` + bot 可正常收消息
+4. baseline ≥ 1534 / 1 + 6 测试 → ≥ **1540 / 1**
+
+### 风险
+
+- **pane "活" 判断假阳/阴**:claude 短暂 init / `/compact` 中,pane pid 是 claude 但暂时不响应输入。仅依 pid + comm name 判断,**不依赖 pane content scrape**(R 守)。"活的就 reattach" 是 over-eager 而非 over-conservative,代价是 reattach 到一个正在 /compact 的 session 时,下个 turn submit 可能要等 ── 可接受
+- **reattach 后 transcript-cursor 状态**:transcript-cursor.json 已有 V0.6.4 per-sid `prior_offsets` 机制(已 ship),reattach 一个 sid 不会 replay 历史(无 oscillation,因为 `discover_active_session` 仍按 mtime + subagent filter 选最新)。F164 不破坏 V0.6.4 修复
+- **race**:daemon 重启短窗口内,另一 daemon 实例同 slug/role 也 start_thread?── ccteam orchestrator pidfile 已防多实例,但若 user 强 SIGKILL old daemon + 立即 start new daemon 中间 pidfile lock 失败 ── 这是 F163 graceful shutdown 的 cleanup 路径覆盖范围
 
 ---
 
@@ -808,6 +931,10 @@ V0.6.0 Wave 4 ship 时仅跑了 5 preset E2E + 3 Codex scenario(`host-probe.md` 
 | F152 Codex CLI 协议漂移 | advise vote 解析崩 | V0.6.3 F144 forward-compat 解析已 ship,沿用 |
 | F155 doctor `--check-codex-auto-critic` 检测假阳/阴 | creator 误判 | stub binary tests + 真机 host-probe 双管 |
 | F162 50-query corpus 偏 | accuracy 数字不代表 production | corpus 设计 review;default mock + opt-in real LLM run |
+| F163 SIGKILL 仍不 graceful | stale pidfile,但**不能修** | 文档 + `ccteam start` 启动时的 "stale pidfile reclaimed" 路径已有(V0.6.1 ship);F163 只让 -INT/-TERM 不再走那个 reclaim 路径 |
+| F163 child task 不 cancel-safe | 5s timeout abort | `tokio::JoinHandle::abort()` 兜底;documentation 注 "shutdown 5s 内出" |
+| F164 reattach 到 /compact 中的 session | next turn submit 等更久 | 可接受;tmux 不被 scrape,行为正确 |
+| F164 daemon 跑着时 user 手工 tmux kill-session | 下个 tick `is_pane_alive_with_claude` 返 false → recreate | 这是正确路径;F164 自闭环 |
 
 ---
 
@@ -815,12 +942,15 @@ V0.6.0 Wave 4 ship 时仅跑了 5 preset E2E + 3 Codex scenario(`host-probe.md` 
 
 V0.6.5 → main merge 前必须:
 
-1. `cargo test --workspace --locked --no-fail-fast` ≥ **1530 / 1**
+1. `cargo test --workspace --locked --no-fail-fast` ≥ **1540 / 1**
 2. `cargo clippy --workspace --all-targets --locked -- -D warnings` 0 命中
 3. F148 host-probe(fresh nas-box005):`/ccteam-creator "做个 TG 助理"` → `go` → 不手工 touch 任何文件 → 从 TG 发 `hi` → 收到回复,**手动签字**记入 `docs/versions/v0-6-5/host-probe.md`
 4. F162 `intent-accuracy.md` 落,accuracy ≥ 0.90
-5. tier-1 docs 文案 grep(F149/F154/F161 mandate)0 命中
-6. `CLAUDE.md §一 baseline` 表已更新(F160)
-7. `ccteam doctor` 报告 "MCP tool surface: 26 active, 0 stubs"
-8. workspace version bump `0.6.4 → 0.6.5`;commit 前缀 `v0.6.5:`
-9. git tag `v0.6.5`
+5. F163 graceful shutdown 真机签字:nas-box005 `kill -TERM <pid>` → 5s 内 ps clear + pidfile gone + lsof :7331 clear,落 `host-probe.md`
+6. F164 reattach 真机签字:nas-box005 daemon restart → 老 tmux session 自动复用 + bot 立即可用 + 无 `apply_action failed` 日志,落 `host-probe.md`
+7. F157 host-probe:fresh repo `/ccteam-scan --quick` ≤ 90s 出报告,落 `host-probe.md`
+8. tier-1 docs 文案 grep(F149/F154/F161 mandate)0 命中
+9. `CLAUDE.md §一 baseline` 表已更新(F160)
+10. `ccteam doctor` 报告 "MCP tool surface: 26 active, 0 stubs"
+11. workspace version bump `0.6.4 → 0.6.5`;commit 前缀 `v0.6.5:`
+12. git tag `v0.6.5`
