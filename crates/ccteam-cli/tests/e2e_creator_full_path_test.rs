@@ -54,12 +54,10 @@ impl McpServer {
             .env("CCTEAM_HOME", home)
             .env("CCTEAM_PROJECTS_ROOT", projects)
             .env("CCTEAM_DISABLE_TOOL_SURFACE_BOOTSTRAP", "1")
-            // Quiet the tracing fmt layer — by default `init_tracing`
-            // writes INFO to stdout, which would interleave with the
-            // JSON-RPC frame on the same channel. `ccteam_imd::register_bot_checked_in`
-            // emits an info log on every successful registration, so
-            // without this filter the very first call returns garbage.
-            .env("RUST_LOG", "error")
+            // V0.6.5 F165: tracing for `ccteam mcp-serve` now writes
+            // to stderr (stdout is reserved for JSON-RPC frames), so
+            // the V0.6.5 F147 `RUST_LOG=error` workaround is gone —
+            // default tracing is fine here.
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
