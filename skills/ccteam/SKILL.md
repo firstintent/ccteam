@@ -1,6 +1,6 @@
 ---
 name: ccteam
-description: ccteam 总入口 NL dispatcher。用户在 Claude session 内输入 `/ccteam <自然语言>` 触发,本 skill 把 NL 意图分类到 7 类(start-team / create-workflow / configure-im / monitor / advise / status-debug / other)并路由到对应 sub-skill。Use when 用户说"起一个 team / 做个 TG 助理 bot / 跑 qa-loop / 看 ccteam 状态 / 投票决定 / second opinion / 暂停 X / 为啥撞 budget"等任何 ccteam 相关意图。V0.6.0 Wave 1 雏形 — 5 sub-skill 中 `/ccteam-im-setup` + `/ccteam-advise` + `/ccteam-creator` 复活版要 Wave 2/3 才落地;Wave 1 主要把 `/ccteam-team` + `/ccteam-control`(V0.5 已有)路由跑通。
+description: ccteam 总入口 NL dispatcher。用户在 Claude session 内输入 `/ccteam <自然语言>` 触发,本 skill 把 NL 意图分类到 7 类(start-team / create-workflow / configure-im / monitor / advise / status-debug / other)并路由到对应 sub-skill。Use when 用户说"起一个 team / 做个 TG 助理 bot / 跑 qa-loop / 看 ccteam 状态 / 投票决定 / second opinion / 暂停 X / 为啥撞 budget"等任何 ccteam 相关意图。7 intents 全部对应实工 skill,不再有 placeholder fallback。
 ---
 
 # /ccteam — NL dispatcher
@@ -16,16 +16,14 @@ V0.6.0 旗舰入口。用户**无需记多个 slash 名**,在 Claude session 内
 
 ## V0.6.0 skill 家族(本 skill 所处位置)
 
-| 用户意图 | Skill | Wave 1 状态 |
+| 用户意图 | Skill | 状态 |
 |---|---|---|
-| **(本 skill)总入口 NL dispatcher** | **`ccteam`** | **Wave 1 雏形(本文件)** |
-| 起临时 team 干活(in-session 多 teammate) | `ccteam-team` | V0.5 已有 |
-| 起新项目 / workflow / chat bot 配方 | `ccteam-creator` | V0.5 砍掉,Wave 2 F114 复活 |
-| 查项目状态 / pause / resume / 跨项目 ls | `ccteam-control` | V0.5 已有 |
-| TG / Lark / Slack 一次性 token 绑定 | `ccteam-im-setup` | Wave 2 F117 新建 |
-| Claude + Codex 并行 advisor + 投票 | `ccteam-advise` | Wave 3 F112 新建 |
-
-**Wave 1 实用范围**:意图分类落 5 路;`ccteam-team` / `ccteam-control` 路由跑通;`ccteam-creator` / `ccteam-im-setup` / `ccteam-advise` 三 sub-skill body 占位,用户被告知"该路径 Wave 2/3 才落地,目前请直接调 `<sibling>`"。
+| **(本 skill)总入口 NL dispatcher** | **`ccteam`** | **已 ship** |
+| 起临时 team 干活(in-session 多 teammate) | `ccteam-team` | 已 ship |
+| 起新项目 / workflow / chat bot 配方 | `ccteam-creator` | 已 ship |
+| 查项目状态 / pause / resume / 跨项目 ls | `ccteam-control` | 已 ship |
+| TG / Lark / Slack 一次性 token 绑定 | `ccteam-im-setup` | 已 ship |
+| Claude + Codex 并行 advisor + 投票 | `ccteam-advise` | 已 ship |
 
 ## When to invoke
 
@@ -61,20 +59,12 @@ V0.6.0 旗舰入口。用户**无需记多个 slash 名**,在 Claude session 内
 | 意图 | 路由 | 透传 |
 |---|---|---|
 | 1 start-team | `/ccteam-team <NL>` | 原 NL 原样 |
-| 2 create-workflow | `/ccteam-creator <NL>`(Wave 2 F114 复活 — Wave 1 fallback "请直接说 'wave2-not-ready' 由用户重述") | 原 NL 原样 |
-| 3 configure-im | `/ccteam-im-setup`(Wave 2 F117 新建 — Wave 1 fallback 同上) | 透传 token / IM 平台 hint |
+| 2 create-workflow | `/ccteam-creator <NL>` | 原 NL 原样 |
+| 3 configure-im | `/ccteam-im-setup` | 透传 token / IM 平台 hint |
 | 4 monitor | `/ccteam-control <NL>` | 原 NL,如有 slug 提取 |
-| 5 advise | `/ccteam-advise <NL>`(Wave 3 F112 新建 — Wave 1 fallback 同上) | 原 NL 原样 |
+| 5 advise | `/ccteam-advise <NL>` | 原 NL 原样 |
 | 6 status-debug | `/ccteam-control <NL>` | 提取 slug + 动作 |
 | 7 other | Step 3 fallback dialog | — |
-
-**Wave 1 缺失 sub-skill 处理**:当路由目标是 Wave 2/3 才落地的 `/ccteam-creator` / `/ccteam-im-setup` / `/ccteam-advise` 时,告诉用户:
-
-> 这个意图对应的 sub-skill (`<name>`) 是 V0.6.0 Wave 2/3 才落地的部分。Wave 1 你可以:
-> - 用 `ccteam new "<NL>"` CLI 起新项目(create-workflow 临时替代,见 `docs/versions/v0-1/user-quickstart.md`)
-> - 用 `ccteam doctor --install-mcp` 装 MCP 后让 daily-driver Claude 直接 `mcp__ccteam__chat_send_input(...)` 调用(stub 返 NotImplemented,但 schema 已锁)
-> - 用 `/ccteam-team` 临时起一个 advisor teammate(advise 临时替代)
-> 完整 NL 路径 V0.6.0 Wave 2/3 上线后请重试 `/ccteam <NL>`。
 
 ## Step 3: Fallback dialog(意图分类失败 / 用户 NL 含糊)
 
@@ -90,9 +80,9 @@ V0.6.0 旗舰入口。用户**无需记多个 slash 名**,在 Claude session 内
 
 收到字母:
 - `a` → 走 start-team 路径,问"具体要 team 干啥?(描述任务)"
-- `b` → 走 create-workflow 路径(Wave 1:Wave 2 缺失说明)
+- `b` → 走 create-workflow 路径
 - `c` → 走 monitor 路径
-- `d` → 走 advise 路径(Wave 1:Wave 3 缺失说明)
+- `d` → 走 advise 路径
 
 收到完整重述 → 重跑 Step 1。
 
@@ -109,13 +99,12 @@ V0.6.0 旗舰入口。用户**无需记多个 slash 名**,在 Claude session 内
 - `@docs/versions/v0-6-0/README.md` §三 — 用户面入口 + 5 sub-skill 一览
 - `@skills/ccteam-team/SKILL.md` — start-team 详细行为
 - `@skills/ccteam-control/SKILL.md` — monitor / status-debug 详细行为
-- `@skills/ccteam-creator/SKILL.md` — Wave 2 复活后填实(目前 V0.5 砍掉态)
+- `@skills/ccteam-creator/SKILL.md` — create-workflow 详细行为
 
-## Wave 1 状态(本文件)
+## 当前状态
 
-本 SKILL.md 是 **V0.6.0 Wave 1 雏形**:
 - ✅ frontmatter + 意图分类提示词 + 路由表 + fallback dialog 全落
-- ⏳ `/ccteam-creator` (Wave 2 F114) / `/ccteam-im-setup` (Wave 2 F117) / `/ccteam-advise` (Wave 3 F112) sub-skill body 由后续 Wave 填实
-- ⏳ host probe 5 sub-skill 验收(F113 验收 #5,基于 50 sample query intent classification ≥90% accuracy)Wave 4 落地
+- ✅ `/ccteam-creator` / `/ccteam-im-setup` / `/ccteam-advise` sub-skill body 已 ship
+- ✅ 7 intents 全部对应实工 skill,不再有 placeholder fallback
 
-Wave 1 用户主要还是直接调 `/ccteam-team` / `/ccteam-control`(V0.5 已有);本 dispatcher 在它们前面加一层 NL→slash 翻译,体验提升从"记 3 slash"→"说人话"。
+本 dispatcher 在所有 sub-skill 前面加一层 NL→slash 翻译,体验从"记多个 slash"→"说人话"。
