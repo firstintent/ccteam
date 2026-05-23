@@ -25,7 +25,7 @@
 │                                   • /help                                    │
 │                                   • /memory                                  │
 │                                   • /btw(meta-agent → signal) │             │
-│   ✅ role.md 直接编排             ❌ 模型摸不到             ✅ 17 个 MCP 工具│
+│   ✅ role.md 直接编排             ❌ 模型摸不到             ✅ 27 个 MCP 工具│
 │   ✅ cache 命中                   ✅ orchestrator send-keys ✅ 事件驱动      │
 │   ✅ 便宜、可观测                                                            │
 └──────────────────────────────────────────────────────────────────────────────┘
@@ -180,7 +180,7 @@ MCP server 注册的 tool 在模型看来就是普通工具,工具名形如
 | `claude-mem` | M3 | `mcp__plugin_claude-mem_mcp-search__search` 等 |
 | Playwright | 按需 | `mcp__plugin_playwright_playwright__browser_*` |
 | GitHub | M4+ | 优先 `gh` CLI(见最佳实践 §4.3) |
-| `ccteam-mcp`(自建) | M2 / V0.4.0 / V0.6 / V0.6.1 | **26 个工具**(V0.6 F111 24 + V0.6.1 F128 +2)5 group 子前缀:`mcp__ccteam__{workflow_(15), chat_(5), advise_(2), admin_(3), screenshot(1)}*`(见 `interfaces.md §12.2` 完整清单);高频 `workflow_show` / `workflow_spawn_agent` / `chat_send_input` / `advise_vote` / `admin_change_persona` |
+| `ccteam-mcp`(自建) | M2 / V0.4.0 / V0.6 / V0.6.1 / **V0.6.5** | **27 个工具,0 STUB**(V0.6 F111 24 + V0.6.1 F128 +2 + V0.6.5 F146/F147 chat 桥 5 升真 + F152/F153 advise vote/parallel 升真 + chat_lifecycle 拆 register/unregister 净 +1)5 group 子前缀:`mcp__ccteam__{workflow_(15), chat_(6), advise_(2), admin_(3), screenshot(1)}*`(见 `interfaces.md §12.2` 完整清单);高频 `workflow_show` / `workflow_spawn_agent` / `chat_register_bot` / `chat_send_input` / `chat_history` / `advise_vote` / `admin_change_persona` |
 
 #### 1.3.2 验证示例(假设已装 Playwright MCP)
 
@@ -255,7 +255,7 @@ MCP server 注册的 tool 在模型看来就是普通工具,工具名形如
 
 通道 1 让 spawn 的 role agent 在自己的 session 内做工具决策——但用户需要一个**跨 workflow / 跨 session 的对话面**:看进度、调并发、起新 role、解锁 gate、escalation 处置。这是 **meta-agent**(常驻 ccteam-managed claude session,装 `ccteam` MCP server)的职责。
 
-**26 个 mcp__ccteam__\* 工具完整清单见 interfaces.md §12.2**(V0.6 F111 24 + V0.6.1 F128 +2);高频:`workflow_spawn_agent` / `workflow_stop_agent` / `workflow_observe_agents` / `workflow_signal` / `workflow_set_parallelism` / `workflow_trigger_gate` / `workflow_get_artifact_summary` / V0.6 `chat_send_input` / `advise_vote` / V0.6.1 `admin_change_persona` / `admin_add_tool`。约束:meta-agent 所有操作落 progress.jsonl(`agent_spawn` / `gate_triggered` / V0.6.1 `plan_pending` / `plan_decision` / `persona_changed` / `tool_added` 等 event);不持有 workflow 状态(`workflow.yaml` 是 SoT)。
+**27 个 mcp__ccteam__\* 工具完整清单见 interfaces.md §12.2**(V0.6 F111 24 + V0.6.1 F128 +2 + V0.6.5 F146/F147 chat 桥 +1 [register/unregister net +1] + F152/F153 advise 升真);高频:`workflow_spawn_agent` / `workflow_stop_agent` / `workflow_observe_agents` / `workflow_signal` / `workflow_set_parallelism` / `workflow_trigger_gate` / `workflow_get_artifact_summary` / V0.6 `chat_send_input` / V0.6.5 `chat_register_bot` / `chat_history` / `advise_vote` / V0.6.1 `admin_change_persona` / `admin_add_tool`。约束:meta-agent 所有操作落 progress.jsonl(`agent_spawn` / `gate_triggered` / V0.6.1 `plan_pending` / `plan_decision` / `persona_changed` / `tool_added` 等 event);不持有 workflow 状态(`workflow.yaml` 是 SoT)。
 
 ### 3.1 与通道 1、2 的边界
 
@@ -263,7 +263,7 @@ MCP server 注册的 tool 在模型看来就是普通工具,工具名形如
 |---|---|---|
 | role 内调 code-reviewer / code-simplifier 等 subagent | 通道 1(spawn 的 role 自决) | spawned session `enabledPlugins` 启用对应 plugin(见 §6.2) |
 | Codex tmux session 的 `/exit` reset / `/reload-plugins` | 通道 2(仅 Codex executor) | Codex agent 而非 Claude bg agent |
-| 起 / 停 agent、调 parallelism、解锁 gate、escalation 处置 | 通道 3(meta-agent + MCP 工具) | meta-agent 装 ccteam-mcp 17 工具 |
+| 起 / 停 agent、调 parallelism、解锁 gate、escalation 处置 | 通道 3(meta-agent + MCP 工具) | meta-agent 装 ccteam-mcp 27 工具 |
 
 **重要架构后果**:Plugin agent 不是"装了 plugin 就能调"——spawned session 必须显式 enable plugin pipeline 才进通道 1。`bootstrap_project` 据 workflow.yaml + role.md 解析依赖,自动写 `enabledPlugins` 到 `<project>/.claude/settings.json`;session 启动时 plugin pipeline 加载 + namespace,role.md 用 `Task(subagent_type=...)` 即可调。
 
