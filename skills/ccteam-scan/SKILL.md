@@ -1,11 +1,112 @@
 ---
 name: ccteam-scan
-description: "大型代码库导航性体检 —— 只读 audit。探测 monorepo 结构、为每个子系统建议 workflow.yaml 的 `scope:` 值、报告 navigability gap(分层 CLAUDE.md / permissions.deny 噪声排除 / LSP 缺失)。Use when 用户说 '/ccteam-scan'、'检查我的大代码库'、'扫一下这个仓库'、'我的 monorepo 怎么接 ccteam'、'workflow.yaml 的 scope 该填什么'、'audit codebase navigability'。V0.6.2 F141。"
+description: "代码库扫描 —— 只读。两个 mode:(1) `--quick` 60-90s 摸底(1 sonnet agent + 3 个固定问题:语言/框架、TODO 热点、CLAUDE.md/README 状态);(2) default audit 大型代码库导航性体检(monorepo 结构、workflow.yaml `scope:` 建议、navigability gap)。Use when 用户说 '/ccteam-scan'、'扫一下代码 / 摸底新项目 / scan code / audit codebase'、'检查我的大代码库'、'扫一下这个仓库'、'我的 monorepo 怎么接 ccteam'、'workflow.yaml 的 scope 该填什么'、'audit codebase navigability'。V0.6.2 F141 + V0.6.5 F157(--quick)。"
 ---
 
-# /ccteam-scan — 大型代码库导航性体检
+# /ccteam-scan — 代码库扫描
 
-V0.6.2 F141。**只读** audit skill。一次性产出一份报告:这个仓库对 Claude Code agent 有多"可导航",以及把它接入 ccteam 时每个 role 的 `scope:` 该怎么填。
+两个 mode:
+
+| Mode | 触发 | 目标耗时 | 谁 spawn | 输出 |
+|---|---|---|---|---|
+| **quick** | `/ccteam-scan --quick` 或 `/ccteam "扫一下代码"` | 60-90s | 1 个 sonnet agent | `<repo>/.ccteam/codebase-scan.md`(~10-20 行,frontmatter `quick: true`)|
+| **audit**(default,V0.6.2 F141)| `/ccteam-scan`(无 flag)| 5-10 min | inline(本 skill body)| 同 path,**升级覆盖** quick 报告(frontmatter `quick: false`)|
+
+**新用户**:用 `--quick` 即可,30-90 秒看到 value。**大型 monorepo / 要接 ccteam**:跑 default audit 拿 scope 建议 + navigability 报告。
+
+下文 §"--quick mode" 描述 quick;§"--audit mode" 起以下是 V0.6.2 F141 原 audit 流程。
+
+---
+
+## --quick mode(V0.6.5 F157)
+
+**用途**:新用户 60-90s 内摸底任意 git 仓库。不替代 audit;只是第一印象。
+
+**实现**:本 skill body 不 inline 跑(quick 必须 spawn 一个 fresh sonnet agent,理由:Sonnet 4.5 工具调用快,语义抽取强,与主 session 隔离 context)。
+
+### 步骤
+
+1. **环境检查**(skill body 同步跑,< 1s):
+   - `pwd && git rev-parse --show-toplevel` —— 锁定仓库根
+   - 若不是 git 仓库 → 报错退出:"`--quick` 需要 git 仓库;在仓库根再跑"
+   - 若 `<repo>/.ccteam/codebase-scan.md` 已存在且 < 24h → 直接展示已有报告 + 提示"已有最近报告,如需重扫加 `--force`"
+2. **spawn 1 个 sonnet agent**(用户 ad-hoc Task tool,subagent_type 选 `general-purpose` 或项目内已 ln -sf 的 sonnet-default 子 agent;无项目子 agent 则 `general-purpose`):
+   - **model**: `claude-sonnet-4-5`(快,本 mode 不需要 opus 智能;若 opus quota 紧,fallback haiku-4-5)
+   - **briefing**: 见 §Quick agent briefing
+   - **target**:60-90s 出完整报告
+3. **agent 写报告** → `<repo>/.ccteam/codebase-scan.md` —— skill body 不再处理,agent 完即 done
+4. **skill body 给用户 ≤ 5 行摘要**:报告 path + 3 个 question 的 1-line 答案;问"要不要跑 full audit?(`/ccteam-scan`)"
+
+### Quick agent briefing(直接粘进 Task tool prompt)
+
+```
+你是 ccteam-scan --quick mode 的一次性 agent。60-90 秒内摸底当前 git 仓库,产一份短报告。
+
+仓库根:<pwd 锁定的路径>
+
+回答 3 个固定问题(每问限 5-8 行,允许 ≤ 3 个 bash 命令探测):
+
+## Q1 — 主语言 / 框架 / 入口
+- `ls -la` + `git ls-files | head -50` + 检查 `Cargo.toml` / `package.json` / `go.mod` / `pyproject.toml` / `pom.xml` 等 build 文件
+- 输出:主语言(top 1-2)、framework(若可见)、入口文件(`main.rs` / `index.ts` / `app.py` 等)、build 工具
+- ≤ 5 行
+
+## Q2 — TODO / FIXME / HACK 热点
+- `rg -i "TODO|FIXME|HACK" --no-heading -c | sort -t: -k2 -rn | head -10`(每文件 count)
+- 输出:top 10 热点文件 + 总数;若 < 5 个 hit → "干净,无明显 tech debt 标记"
+- ≤ 8 行
+
+## Q3 — CLAUDE.md / README 状态
+- 检查 root `CLAUDE.md` / `README.md` / `AGENTS.md` 存在性 + 大小(行数)
+- 若 root README 存在:用 `head -20` 抽出 project description 1-2 行
+- 若 root CLAUDE.md 存在:抽出 1-line summary(它是给 Claude Code 的 project memory)
+- 若两者皆无:建议初始化(`claude /init` 或 `ccteam init`)
+- ≤ 7 行
+
+落地报告到 `<repo>/.ccteam/codebase-scan.md`(若 `.ccteam/` 不存在先 `mkdir -p`),格式:
+
+---
+quick: true
+generated: <ISO 8601 timestamp>
+generator: ccteam-scan --quick
+---
+
+# Codebase quick scan — <repo basename>
+
+## Q1 — language / framework / entry
+<5 行>
+
+## Q2 — TODO hotspots
+<8 行>
+
+## Q3 — CLAUDE.md / README status
+<7 行>
+
+## Next steps
+- 大型 monorepo 要接 ccteam → 跑 full audit:`/ccteam-scan`(无 --quick)
+- 起 team 干活 → `/ccteam-team "<task>"`
+- 配 IM bot → `/ccteam-creator "做个 X 助理"`
+
+---
+
+**红线**:
+- 只读 —— 除报告文件外零写动作。不改 CLAUDE.md / README / 任何源码
+- 不 spawn 子 agent(本 mode 一层 sonnet 就到底)
+- 不调 MCP `mcp__ccteam__*`(quick 是 zero-config 体验,不依赖 ccteam project 状态)
+- 60-90s 内出报告;超时则截断(已答几问就答几问),不无限拉长
+```
+
+### 与 audit mode 的关系
+
+- quick 落 `quick: true` frontmatter;audit 落 `quick: false`,**覆盖**同 path
+- audit mode 不读 quick 报告 —— 两次扫描独立,不增量
+- 用户先 quick 后 audit 是常见路径:quick 给即时反馈,audit 给 production-grade 建议
+
+---
+
+## --audit mode(V0.6.2 F141,大型代码库导航性体检)
+
+**只读** audit skill。一次性产出一份报告:这个仓库对 Claude Code agent 有多"可导航",以及把它接入 ccteam 时每个 role 的 `scope:` 该怎么填。
 
 灵感来源:Anthropic《How Claude Code works in large codebases》—— "Claude 的能力 = 找到正确 context 的能力;太多则退化,太少则盲目"。本 skill 是 `docs/orchestration-patterns.md §1.5` explorer→artifact→editor 模板里 `explorer` role 的一次性交互版。
 
@@ -25,15 +126,22 @@ V0.6.2 F141。**只读** audit skill。一次性产出一份报告:这个仓库�
 
 触发短语(LLM 语义匹配,无需 regex):
 
-- `/ccteam-scan [路径]` — 显式 slash 入口(路径省略 = 当前 git 仓库根)
+**quick mode** —— 优先匹配:
+- `/ccteam-scan --quick` — 显式 quick
+- "扫一下代码 / 摸底 / 看看这个仓库 / scan code / quick scan"
+- 用户刚 `cd` 进新仓库 + 问"这是个啥项目 / 用了啥技术"
+- 通过 `/ccteam` dispatcher intent 5(code-scan)路由进来
+
+**audit mode** —— default:
+- `/ccteam-scan [路径]` — 显式 slash 入口(无 `--quick`,路径省略 = 当前 git 仓库根)
 - "检查 / 扫一下我的大代码库"、"这个 monorepo 怎么接 ccteam"
 - "workflow.yaml 的 `scope:` 该填什么"
 - "我的仓库对 agent 友好吗 / navigability audit"
 
 不要在以下场景触发:
 
-- 用户要的是代码 review / bug 排查 —— 那是普通编码任务,不是导航性体检
-- 仓库很小(`git ls-files | wc -l` < ~200)—— 直接告诉用户"小仓库不需要 scan,一份 root CLAUDE.md 足够",不跑完整流程
+- 用户要的是代码 review / bug 排查 —— 那是普通编码任务,不是导航性体检(转 `/ccteam-team` 或普通编码)
+- 仓库很小(`git ls-files | wc -l` < ~200)+ 用户要 audit —— 告诉用户"小仓库不需要 audit,跑 `--quick` 30 秒摸底足够";若要 audit 仍可继续
 
 ## 核心原则 —— 只读 advisory
 
@@ -120,7 +228,7 @@ crates/api           scope: crates/api          Cargo workspace member
 
 - 不改任何源码 / 配置 / workflow.yaml —— 只读 + 只写 `.ccteam/codebase-scan.md` 报告
 - 不代写 `CLAUDE.md` 内容、不装 LSP —— 那是 inner harness / 项目仓库职责
-- 不跑 agent、不 spawn session —— 纯一次性 audit
+- audit mode 不 spawn 长 session(纯一次性 audit);quick mode spawn 1 个 sonnet agent 单次回答 3 问后即结束(也非长 session)
 - 不做代码质量 / 安全 review —— 那是别的 skill / team 的事
 
 ## Red lines
@@ -133,4 +241,5 @@ crates/api           scope: crates/api          Cargo workspace member
 
 - `docs/orchestration-patterns.md §1.5` —— 大型代码库模板(scope + explorer→artifact→editor)
 - `docs/interfaces.md §17.2` —— `AgentSpec.scope` schema
-- `docs/versions/v0-6-2/README.md` —— F140 per-role scope + F141 本 skill
+- `docs/versions/v0-6-2/README.md` —— F140 per-role scope + F141 本 skill audit mode
+- `docs/versions/v0-6-5/prd.md §F157` —— `--quick` mode 需求 + 验收
