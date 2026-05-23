@@ -179,15 +179,45 @@ pub fn last_turn_at(
     slug: &str,
     role: &str,
 ) -> Option<chrono::DateTime<chrono::Utc>> {
-    let path = projects_root
+    let meta = fs::metadata(turns_jsonl_path(projects_root, slug, role)).ok()?;
+    let mtime = meta.modified().ok()?;
+    Some(chrono::DateTime::<chrono::Utc>::from(mtime))
+}
+
+/// V0.6.5 F147 — resolve `<projects_root>/<slug>/.ccteam/chat/<role>/inbox/`.
+/// The mailbox path the daemon's `drain_inboxes` / per-bot mpsc
+/// fast-path consume. MCP `chat_send_input` writes a router-style
+/// envelope here; daemon picks it up either via the fast-path (when
+/// the per-bot mpsc is wired) or via the safety-net drain tick.
+pub fn chat_inbox_dir(projects_root: &Path, slug: &str, role: &str) -> PathBuf {
+    projects_root
         .join(slug)
         .join(".ccteam")
         .join("chat")
         .join(role)
-        .join("turns.jsonl");
-    let meta = fs::metadata(&path).ok()?;
-    let mtime = meta.modified().ok()?;
-    Some(chrono::DateTime::<chrono::Utc>::from(mtime))
+        .join("inbox")
+}
+
+/// V0.6.5 F147 — resolve `<projects_root>/<slug>/.ccteam/chat/<role>/signals/reset.signal`.
+/// MCP `chat_reset` writes this file; the supervisor's next tick reads
+/// it via `signal_present(.., RESET_SIGNAL)` and applies the
+/// ResetSession action (archive + close + start + cursor wipe).
+pub fn chat_reset_signal_path(projects_root: &Path, slug: &str, role: &str) -> PathBuf {
+    projects_root
+        .join(slug)
+        .join(".ccteam")
+        .join("chat")
+        .join(role)
+        .join("signals")
+        .join("reset.signal")
+}
+
+/// V0.6.5 F147 — resolve `<projects_root>/<slug>/.ccteam/chat/<role>/turns.jsonl`.
+/// Source-of-truth file `chat_history` tails. Re-exports
+/// [`outbound::turns_jsonl_path`] under a top-level name so MCP /
+/// integration callers don't have to reach into the outbound module.
+pub fn turns_jsonl_path(projects_root: &Path, slug: &str, role: &str) -> PathBuf {
+    outbound::turns_jsonl_path(projects_root, slug, role)
 }
 
 /// V0.6.5 F146 — outcome of [`register_bot_checked_in`].

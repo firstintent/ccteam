@@ -133,9 +133,9 @@ fn every_tool_carries_group_subprefix_or_is_screenshot() {
         // followed by either `<group>_<rest>` OR the special-cased
         // single-member `screenshot` group whose member kept its
         // pre-V0.6 name.
-        let bare = n.strip_prefix("ccteam__").unwrap_or_else(|| {
-            panic!("tool name {n:?} missing required `ccteam__` server prefix")
-        });
+        let bare = n
+            .strip_prefix("ccteam__")
+            .unwrap_or_else(|| panic!("tool name {n:?} missing required `ccteam__` server prefix"));
         let ok = bare == "screenshot"
             || bare.starts_with("admin_")
             || bare.starts_with("workflow_")
@@ -180,34 +180,63 @@ fn legacy_v05_unprefixed_names_are_gone() {
 
 #[test]
 fn chat_and_advise_stubs_are_registered_and_return_not_implemented() {
-    // Spot-check both groups: schema is listed, but `tools/call`
-    // returns a graceful NotImplemented body (not a JSON-RPC error).
+    // V0.6.5 F147 — `chat_send_input` is now a real tool, but
+    // `advise_vote` remains a Wave-3 stub. Spot-check both group
+    // shapes: schema is listed, `tools/call` against the stub returns
+    // a graceful NotImplemented body (not a JSON-RPC error), AND
+    // `tools/call` against the real tool reaches its dispatcher
+    // (returns `ok: true` on a valid mailbox write).
     let names = list_tool_names();
     assert!(names.contains(&"ccteam__chat_send_input".to_string()));
     assert!(names.contains(&"ccteam__advise_vote".to_string()));
 
     let (_tmp, home, projects) = tmp_paths();
     let mut srv = McpServer::spawn(&home, &projects);
-    for stub in ["ccteam__chat_send_input", "ccteam__advise_vote"] {
-        srv.send(&json!({
-            "jsonrpc": "2.0", "id": 2,
-            "method": "tools/call",
-            "params": { "name": stub, "arguments": {} }
-        }));
-        let resp = srv.recv();
-        // Result envelope (not isError) — stubs return ok=false body.
-        assert_eq!(
-            resp["result"]["isError"], false,
-            "stub {stub} should land as result not isError"
-        );
-        let text = resp["result"]["content"][0]["text"]
-            .as_str()
-            .expect("content[0].text");
-        assert!(
-            text.contains("NotImplemented"),
-            "stub {stub} body should mention NotImplemented; got: {text}"
-        );
-    }
+    // advise_vote — still a stub.
+    srv.send(&json!({
+        "jsonrpc": "2.0", "id": 2,
+        "method": "tools/call",
+        "params": { "name": "ccteam__advise_vote", "arguments": {} }
+    }));
+    let resp = srv.recv();
+    assert_eq!(
+        resp["result"]["isError"], false,
+        "stub ccteam__advise_vote should land as result not isError"
+    );
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("content[0].text");
+    assert!(
+        text.contains("NotImplemented"),
+        "advise_vote body should mention NotImplemented; got: {text}"
+    );
+
+    // chat_send_input — F147 real tool. Exercise the happy path so
+    // we can be sure the dispatcher is wired (no NotImplemented).
+    srv.send(&json!({
+        "jsonrpc": "2.0", "id": 3,
+        "method": "tools/call",
+        "params": {
+            "name": "ccteam__chat_send_input",
+            "arguments": {
+                "workflow_slug": "demo",
+                "role": "helper",
+                "content": "hello",
+            }
+        }
+    }));
+    let resp = srv.recv();
+    assert_eq!(
+        resp["result"]["isError"], false,
+        "real chat_send_input should land as result not isError"
+    );
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("content[0].text");
+    assert!(
+        text.contains("\"ok\": true"),
+        "chat_send_input body should report ok:true; got: {text}"
+    );
     srv.shutdown();
 }
 

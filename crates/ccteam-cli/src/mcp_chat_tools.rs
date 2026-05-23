@@ -6,10 +6,26 @@
 //! deprecated alias — V0.6.5 dev-plan §F146; CLAUDE.md §五 #4 forbids
 //! backwards-compat shims pre-v1.0).
 //!
-//! The remaining 3 stubs (`chat_send_input`, `chat_session_reset`,
-//! `chat_show_turn_log`) still return `NotImplemented` until F147
-//! lands. The schema names + arg shapes here are the wire contract;
-//! `docs/interfaces.md` §MCP table mirrors them.
+//! V0.6.5 F147 lands the remaining 3 stubs as real implementations
+//! against the same file-system control plane:
+//!
+//! - `chat_send_input` — writes an [`ccteam_imd::inbound::InboxEnvelope`]
+//!   into the bot's mailbox dir (`<project>/.ccteam/chat/<role>/inbox/msg-<unix-ms>-<rand>.md`).
+//!   The daemon's per-bot mpsc fast-path (or the safety-net
+//!   `drain_inboxes` tick) picks it up and submits to the live tmux
+//!   session via `BotSupervisor::handle_inbound`. We do NOT push to
+//!   tmux directly — that would bypass the supervisor's draining /
+//!   shutdown gates AND violate CLAUDE.md §三 "No prompt injection"
+//!   (only the user-turn payload is forwarded; no system prompt).
+//! - `chat_history` — tails `<project>/.ccteam/chat/<role>/turns.jsonl`,
+//!   returns the last `n` rows. `include_user` flag toggles whether
+//!   user-side prompts are included (default: assistant only).
+//! - `chat_reset` — writes `<project>/.ccteam/chat/<role>/signals/reset.signal`.
+//!   The supervisor's next `decide()` tick returns `ResetSession`, which
+//!   archives `turns.jsonl` → `archive/turns-<unix-ms>.jsonl`, closes
+//!   the active tmux session, force-resets the in-memory OutboundCursor
+//!   (V0.6.4 Bug B防线) + clears the on-disk transcript cursor, then
+//!   spawns a fresh session.
 //!
 //! Architecture:
 //!
@@ -24,14 +40,19 @@
 //!   `BotRegistration` deserialize trips on `"Claude"` (Bug A from
 //!   the NAS deploy session).
 
-use anyhow::{anyhow, Result};
+use std::fs;
+use std::path::Path;
+
+use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 
+use ccteam_core::execution::turns_mirror::{read_all_turns, TurnRecord};
 use ccteam_core::harness::AgentVendor;
 use ccteam_core::paths::CcteamPaths;
+use ccteam_imd::inbound::{render_envelope, InboxEnvelope};
 use ccteam_imd::{
-    bot_running_status_in, last_turn_at, list_bots_in, register_bot_checked_in, unregister_bot_in,
-    RegisterOutcome,
+    bot_running_status_in, chat_inbox_dir, chat_reset_signal_path, last_turn_at, list_bots_in,
+    register_bot_checked_in, turns_jsonl_path, unregister_bot_in, RegisterOutcome,
 };
 
 /// Tool definitions for the chat group: 3 real + 3 stubs (total 6).
@@ -85,50 +106,44 @@ pub fn chat_tool_definitions() -> Vec<Value> {
                 "required": [],
             }),
         }),
-        // V0.6.0 Wave 1 STUBs still pending real implementations in F147.
         json!({
             "name": "ccteam__chat_send_input",
-            "description": "V0.6.0 Wave 2 (F108) STUB — send a user-NL turn to a chat-mode bot session. F147 lands the dispatch handler.",
+            "description": "V0.6.5 F147 — drop a user-NL turn into a chat-mode bot's mailbox. Writes `<project>/.ccteam/chat/<role>/inbox/msg-<unix-ms>-<rand>.md` (router-shaped InboxEnvelope). The daemon's per-bot mpsc fast-path picks it up within ~ms (or the 60s safety-net `drain_inboxes` if the fast-path isn't wired yet) and submits to the live tmux session via `BotSupervisor::handle_inbound`. Does NOT inject system prompts — only the `content` body is forwarded as a user turn (CLAUDE.md §三 red line).",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {
-                    "slug": { "type": "string", "description": "Chat-workflow project slug." },
-                    "bot": { "type": "string", "description": "Bot persona id (registered via chat_register_bot)." },
-                    "input": { "type": "string", "description": "User NL / markdown body." }
+                    "workflow_slug": { "type": "string", "description": "Workflow slug (matches the bot registered via chat_register_bot)." },
+                    "role": { "type": "string", "description": "Bot role within the workflow." },
+                    "content": { "type": "string", "description": "User NL / markdown body. Forwarded verbatim to the tmux session via submit_turn." },
+                    "reply_to": { "type": "string", "description": "Optional originating message id (echoes back through turns.jsonl for round-trip correlation)." }
                 },
-                "required": ["slug", "bot", "input"],
+                "required": ["workflow_slug", "role", "content"],
             }),
         }),
         json!({
-            "name": "ccteam__chat_session_reset",
-            "description": "V0.6.0 Wave 2 (F108) STUB — force-reset a single chat session. F147 lands the dispatch handler.",
+            "name": "ccteam__chat_history",
+            "description": "V0.6.5 F147 — tail `<project>/.ccteam/chat/<role>/turns.jsonl`. Returns the last `n` turns (default 20). By default only `assistant`-side rows are returned; pass `include_user: true` to interleave user-side prompts (useful for full transcript reconstruction).",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {
-                    "slug": { "type": "string", "description": "Chat-workflow project slug." },
-                    "bot": { "type": "string", "description": "Bot persona id." },
-                    "preserve_history": {
-                        "type": "boolean",
-                        "description": "If true, copy current turns.jsonl into archived/ before reset. Default true."
-                    }
+                    "workflow_slug": { "type": "string", "description": "Workflow slug." },
+                    "role": { "type": "string", "description": "Bot role." },
+                    "n": { "type": "integer", "description": "How many turns to return (default 20)." },
+                    "include_user": { "type": "boolean", "description": "Include user-side prompts in the result (default false — assistant rows only)." }
                 },
-                "required": ["slug", "bot"],
+                "required": ["workflow_slug", "role"],
             }),
         }),
         json!({
-            "name": "ccteam__chat_show_turn_log",
-            "description": "V0.6.0 Wave 2 (F108) STUB — return the last N turns from a bot's ccteam-owned <project>/.ccteam/chat/<bot>/turns.jsonl. F147 lands the dispatch handler.",
+            "name": "ccteam__chat_reset",
+            "description": "V0.6.5 F147 — request a session reset for a chat-mode bot. Writes `<project>/.ccteam/chat/<role>/signals/reset.signal`; the daemon's next supervisor tick (≤5s default) reads it, archives `turns.jsonl` → `archive/turns-<unix-ms>.jsonl`, force-resets the outbound + transcript cursors to 0 (V0.6.4 Bug B防线 — prevents the new session's first burst from being dedup-dropped), closes the active tmux session, and spawns a fresh one. Returns immediately after writing the signal — poll `chat_list_bots` for `last_turn_at` to observe the reset taking effect.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {
-                    "slug": { "type": "string", "description": "Chat-workflow project slug." },
-                    "bot": { "type": "string", "description": "Bot persona id." },
-                    "last_n": {
-                        "type": "integer",
-                        "description": "How many turns to return (default 20)."
-                    }
+                    "workflow_slug": { "type": "string", "description": "Workflow slug." },
+                    "role": { "type": "string", "description": "Bot role." }
                 },
-                "required": ["slug", "bot"],
+                "required": ["workflow_slug", "role"],
             }),
         }),
     ]
@@ -141,22 +156,11 @@ pub fn dispatch(paths: &CcteamPaths, name: &str, args: &Value) -> Result<Option<
         "ccteam__chat_register_bot" => Ok(Some(dispatch_register_bot(paths, args)?)),
         "ccteam__chat_unregister_bot" => Ok(Some(dispatch_unregister_bot(paths, args)?)),
         "ccteam__chat_list_bots" => Ok(Some(dispatch_list_bots(paths, args)?)),
-        "ccteam__chat_send_input" | "ccteam__chat_session_reset" | "ccteam__chat_show_turn_log" => {
-            Ok(Some(not_implemented_body(name)?))
-        }
+        "ccteam__chat_send_input" => Ok(Some(dispatch_send_input_in(&paths.projects_root, args)?)),
+        "ccteam__chat_history" => Ok(Some(dispatch_history_in(&paths.projects_root, args)?)),
+        "ccteam__chat_reset" => Ok(Some(dispatch_reset_in(&paths.projects_root, args)?)),
         _ => Ok(None),
     }
-}
-
-fn not_implemented_body(name: &str) -> Result<String> {
-    let body = json!({
-        "ok": false,
-        "error": "NotImplemented",
-        "tool": name,
-        "wave": "V0.6.5 F147",
-        "note": "Stub — F147 lands the dispatch handler.",
-    });
-    Ok(serde_json::to_string_pretty(&body)?)
 }
 
 /// V0.6.5 F146 — `ccteam__chat_register_bot` dispatcher.
@@ -258,6 +262,177 @@ pub(crate) fn dispatch_list_bots(paths: &CcteamPaths, args: &Value) -> Result<St
     }))?)
 }
 
+/// V0.6.5 F147 — `ccteam__chat_send_input` dispatcher (tempdir-aware
+/// variant for tests). Production callers go through [`dispatch`] which
+/// substitutes `paths.projects_root` for `projects_root`.
+pub fn dispatch_send_input_in(projects_root: &Path, args: &Value) -> Result<String> {
+    let workflow_slug = arg_str(args, "workflow_slug")?;
+    validate_slug(&workflow_slug, "workflow_slug")?;
+    let role = arg_str(args, "role")?;
+    validate_slug(&role, "role")?;
+    let content = arg_str(args, "content")?;
+    if content.is_empty() {
+        return Err(anyhow!("`content` must be non-empty"));
+    }
+    let reply_to = args
+        .get("reply_to")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    let inbox = chat_inbox_dir(projects_root, &workflow_slug, &role);
+    fs::create_dir_all(&inbox).with_context(|| format!("mkdir -p {}", inbox.display()))?;
+
+    // Compose a router-shaped envelope. We bypass the IM security
+    // pipeline (the caller is the meta-agent host process — already
+    // trusted local code), but we use the same `InboxEnvelope` shape so
+    // the daemon's parse + handle path is one well-tested code path.
+    //
+    // Filename: `msg-<unix-ms>-<rand>.md`. The 8-hex `<rand>` collision
+    // window inside one millisecond is 2^32 — well past any single-host
+    // concurrent MCP burst. (F147 PRD §risks.)
+    let unix_ms = chrono::Utc::now().timestamp_millis().max(0) as u128;
+    let rand_hex = generate_rand_hex();
+    let file_name = format!("msg-{unix_ms}-{rand_hex}.md");
+    let path = inbox.join(&file_name);
+    let cid = reply_to
+        .clone()
+        .unwrap_or_else(|| format!("mcp-{unix_ms}-{rand_hex}"));
+
+    let envelope = InboxEnvelope {
+        platform: "mcp".to_string(),
+        sender: "mcp-host".to_string(),
+        hop: 0,
+        received_at: chrono::Utc::now(),
+        // No IM reply target — the agent's reply flows back through
+        // `turns.jsonl` and the caller can read it via `chat_history`.
+        reply_target: String::new(),
+        payload: content,
+        message_id: cid.clone(),
+    };
+    let body = render_envelope(&envelope);
+    fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
+
+    Ok(serde_json::to_string_pretty(&json!({
+        "ok": true,
+        "mailbox_path": path.display().to_string(),
+        "cid": cid,
+        "workflow_slug": workflow_slug,
+        "role": role,
+    }))?)
+}
+
+/// V0.6.5 F147 — `ccteam__chat_history` dispatcher (tempdir-aware
+/// variant for tests).
+pub fn dispatch_history_in(projects_root: &Path, args: &Value) -> Result<String> {
+    let workflow_slug = arg_str(args, "workflow_slug")?;
+    validate_slug(&workflow_slug, "workflow_slug")?;
+    let role = arg_str(args, "role")?;
+    validate_slug(&role, "role")?;
+    let n = args
+        .get("n")
+        .and_then(|v| v.as_u64())
+        .map(|x| x as usize)
+        .unwrap_or(20);
+    let include_user = args
+        .get("include_user")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let project_dir = projects_root.join(&workflow_slug);
+    let turns_path = turns_jsonl_path(projects_root, &workflow_slug, &role);
+
+    // Missing file = bot registered but no turn yet. Return empty list
+    // rather than erroring so caller can treat "no history" uniformly.
+    if !turns_path.exists() {
+        return Ok(serde_json::to_string_pretty(&json!({
+            "ok": true,
+            "workflow_slug": workflow_slug,
+            "role": role,
+            "turns_jsonl": turns_path.display().to_string(),
+            "turns": Vec::<Value>::new(),
+        }))?);
+    }
+
+    let all = read_all_turns(&project_dir, &role)
+        .with_context(|| format!("read turns.jsonl for {workflow_slug}/{role}"))?;
+
+    // Project each TurnRecord to the wire view. Optional `include_user`
+    // flag interleaves a synthetic `role:"user"` row before the
+    // assistant row when the underlying TurnRecord carries non-empty
+    // user-side text. We keep chronological ordering (oldest first
+    // within the returned slice) for caller predictability.
+    let mut wire: Vec<Value> = Vec::new();
+    for t in &all {
+        if include_user && !t.user.is_empty() {
+            wire.push(turn_to_value(t, "user", &t.user));
+        }
+        if !t.assistant.is_empty() {
+            wire.push(turn_to_value(t, "assistant", &t.assistant));
+        }
+    }
+    let start = wire.len().saturating_sub(n);
+    let tail: Vec<Value> = wire.into_iter().skip(start).collect();
+
+    Ok(serde_json::to_string_pretty(&json!({
+        "ok": true,
+        "workflow_slug": workflow_slug,
+        "role": role,
+        "turns_jsonl": turns_path.display().to_string(),
+        "turns": tail,
+    }))?)
+}
+
+/// V0.6.5 F147 — `ccteam__chat_reset` dispatcher (tempdir-aware variant
+/// for tests).
+pub fn dispatch_reset_in(projects_root: &Path, args: &Value) -> Result<String> {
+    let workflow_slug = arg_str(args, "workflow_slug")?;
+    validate_slug(&workflow_slug, "workflow_slug")?;
+    let role = arg_str(args, "role")?;
+    validate_slug(&role, "role")?;
+
+    let sig = chat_reset_signal_path(projects_root, &workflow_slug, &role);
+    if let Some(parent) = sig.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("mkdir -p {}", parent.display()))?;
+    }
+    // Body = unix-ms so the supervisor can log when the reset was
+    // requested vs when it was applied. Idempotent overwrite — if a
+    // prior signal hasn't been consumed yet, we just refresh the ts.
+    let unix_ms = chrono::Utc::now().timestamp_millis();
+    fs::write(&sig, format!("{unix_ms}")).with_context(|| format!("write {}", sig.display()))?;
+
+    Ok(serde_json::to_string_pretty(&json!({
+        "ok": true,
+        "signal_path": sig.display().to_string(),
+        "workflow_slug": workflow_slug,
+        "role": role,
+        "requested_at_unix_ms": unix_ms,
+    }))?)
+}
+
+fn turn_to_value(t: &TurnRecord, side: &str, content: &str) -> Value {
+    json!({
+        "turn_id": t.turn_id,
+        "ts": t.ts.to_rfc3339(),
+        "vendor": t.vendor,
+        "role": side,
+        "bot_role": t.role,
+        "content": content,
+    })
+}
+
+/// V0.6.5 F147 — 8-hex random suffix for mailbox filenames. Uses the
+/// stdlib `RandomState` hasher seeded from system entropy to avoid
+/// pulling in an extra `rand` direct dep on ccteam-cli. Collision
+/// surface: 2^32 inside a single millisecond, vastly more than any
+/// realistic concurrent MCP burst.
+fn generate_rand_hex() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = RandomState::new().build_hasher();
+    h.write_u128(chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u128);
+    format!("{:08x}", (h.finish() & 0xFFFF_FFFF) as u32)
+}
+
 fn arg_str(args: &Value, key: &str) -> Result<String> {
     args.get(key)
         .and_then(|v| v.as_str())
@@ -333,12 +508,17 @@ mod tests {
         assert!(names.contains(&"ccteam__chat_register_bot"));
         assert!(names.contains(&"ccteam__chat_unregister_bot"));
         assert!(names.contains(&"ccteam__chat_list_bots"));
-        // F147-pending stubs.
+        // V0.6.5 F147 real tools (renamed from the V0.6.0 stub names —
+        // `chat_session_reset` → `chat_reset`; `chat_show_turn_log` →
+        // `chat_history`. CLAUDE.md §五 #4 forbids deprecated aliases
+        // pre-v1.0).
         assert!(names.contains(&"ccteam__chat_send_input"));
-        assert!(names.contains(&"ccteam__chat_session_reset"));
-        assert!(names.contains(&"ccteam__chat_show_turn_log"));
-        // Removed in V0.6.5 F146 — no deprecated alias.
+        assert!(names.contains(&"ccteam__chat_history"));
+        assert!(names.contains(&"ccteam__chat_reset"));
+        // Removed in V0.6.5 F146 / F147 — no deprecated alias.
         assert!(!names.contains(&"ccteam__chat_lifecycle"));
+        assert!(!names.contains(&"ccteam__chat_session_reset"));
+        assert!(!names.contains(&"ccteam__chat_show_turn_log"));
     }
 
     #[test]
@@ -365,14 +545,143 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_returns_not_implemented_for_pending_stubs() {
+    fn send_input_writes_envelope_with_router_yaml_frontmatter() {
         let tmp = TempDir::new().unwrap();
         let p = paths(&tmp);
-        let body = dispatch(&p, "ccteam__chat_send_input", &json!({}))
-            .unwrap()
-            .expect("matched our tool");
-        assert!(body.contains("NotImplemented"));
-        assert!(body.contains("F147"));
+        let body = dispatch(
+            &p,
+            "ccteam__chat_send_input",
+            &json!({
+                "workflow_slug": "demo",
+                "role": "helper",
+                "content": "hello world",
+            }),
+        )
+        .unwrap()
+        .expect("matched our tool");
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["ok"], true);
+        let path = parsed["mailbox_path"].as_str().unwrap();
+        let disk = std::fs::read_to_string(path).unwrap();
+        // Envelope round-trips through inbound::parse_envelope (same
+        // wire format the daemon's drain_inboxes / mpsc fast-path uses).
+        let env = ccteam_imd::inbound::parse_envelope(&disk).unwrap();
+        assert_eq!(env.payload, "hello world");
+        assert_eq!(env.platform, "mcp");
+        assert!(path.contains("demo/.ccteam/chat/helper/inbox/msg-"));
+        assert!(path.ends_with(".md"));
+    }
+
+    #[test]
+    fn reset_writes_signal_file_at_documented_path() {
+        let tmp = TempDir::new().unwrap();
+        let p = paths(&tmp);
+        let body = dispatch(
+            &p,
+            "ccteam__chat_reset",
+            &json!({ "workflow_slug": "demo", "role": "helper" }),
+        )
+        .unwrap()
+        .expect("matched our tool");
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["ok"], true);
+        let sig = parsed["signal_path"].as_str().unwrap();
+        assert!(std::path::Path::new(sig).exists());
+        assert!(
+            sig.ends_with("demo/.ccteam/chat/helper/signals/reset.signal"),
+            "unexpected signal path: {sig}"
+        );
+    }
+
+    #[test]
+    fn history_returns_empty_when_turns_jsonl_missing() {
+        let tmp = TempDir::new().unwrap();
+        let p = paths(&tmp);
+        let body = dispatch(
+            &p,
+            "ccteam__chat_history",
+            &json!({ "workflow_slug": "demo", "role": "helper" }),
+        )
+        .unwrap()
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["ok"], true);
+        assert_eq!(parsed["turns"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn history_tails_assistant_rows_only_by_default() {
+        let tmp = TempDir::new().unwrap();
+        let p = paths(&tmp);
+        // Seed turns.jsonl with mixed user+assistant rows.
+        let dir = p.projects_root.join("demo/.ccteam/chat/helper");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut body = String::new();
+        for i in 0..5 {
+            body.push_str(&format!(
+                "{{\"turn_id\":\"t{i}\",\"ts\":\"2026-05-24T00:00:00Z\",\"vendor\":\"claude\",\"role\":\"helper\",\"user\":\"u{i}\",\"assistant\":\"a{i}\"}}\n"
+            ));
+        }
+        std::fs::write(dir.join("turns.jsonl"), body).unwrap();
+
+        let body = dispatch(
+            &p,
+            "ccteam__chat_history",
+            &json!({ "workflow_slug": "demo", "role": "helper", "n": 3 }),
+        )
+        .unwrap()
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        let turns = parsed["turns"].as_array().unwrap();
+        // Only assistant rows (default include_user:false) → tail-3 = a2..a4.
+        assert_eq!(turns.len(), 3);
+        for t in turns {
+            assert_eq!(t["role"], "assistant");
+        }
+        assert_eq!(turns[0]["content"], "a2");
+        assert_eq!(turns[2]["content"], "a4");
+    }
+
+    #[test]
+    fn history_include_user_interleaves_both_sides() {
+        let tmp = TempDir::new().unwrap();
+        let p = paths(&tmp);
+        let dir = p.projects_root.join("demo/.ccteam/chat/helper");
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = "{\"turn_id\":\"t0\",\"ts\":\"2026-05-24T00:00:00Z\",\"vendor\":\"claude\",\"role\":\"helper\",\"user\":\"u0\",\"assistant\":\"a0\"}\n";
+        std::fs::write(dir.join("turns.jsonl"), body).unwrap();
+
+        let body = dispatch(
+            &p,
+            "ccteam__chat_history",
+            &json!({ "workflow_slug": "demo", "role": "helper", "include_user": true }),
+        )
+        .unwrap()
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        let turns = parsed["turns"].as_array().unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0]["role"], "user");
+        assert_eq!(turns[0]["content"], "u0");
+        assert_eq!(turns[1]["role"], "assistant");
+        assert_eq!(turns[1]["content"], "a0");
+    }
+
+    #[test]
+    fn send_input_rejects_path_injection_slug() {
+        let tmp = TempDir::new().unwrap();
+        let p = paths(&tmp);
+        let err = dispatch(
+            &p,
+            "ccteam__chat_send_input",
+            &json!({
+                "workflow_slug": "../escape",
+                "role": "helper",
+                "content": "x",
+            }),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("illegal"));
     }
 
     #[test]
