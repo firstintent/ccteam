@@ -735,6 +735,15 @@ ccteam web --token-file <path>                    # 自定义 token 文件路径
 
 CLI 写 `/tmp/ccteam-<user>.shutdown` trigger 文件 → daemon 主循环 select 检到 → 触发 `shutdown_token: tokio::sync::Notify` → cancel 所有 event_loop(F82 cancel-token,每个 loop 写 `workflow_done reason="shutdown"`)→ JoinSet `join_all()` 等所有 task 退出;30s timeout → `abort_all()` + log WARN。SIGTERM / SIGINT 等价 trigger(systemd / docker stop 兼容)。**不杀任何 tmux session**(CLAUDE.md §三红线);`ccteam start` 下次启动 `ensure_session` 自动 reattach。
 
+**F163 — 信号生命周期**(V0.6.5):
+
+| 信号 | 行为 |
+|---|---|
+| `SIGTERM` / `SIGINT` (Ctrl-C) | 触发 graceful shutdown:orchestrator 30s drain → web/imd 各 5s drain → pidfile unlink → exit 0 |
+| `SIGKILL` | 不可捕获;OS 强杀后留 stale pidfile(下次 `ccteam start` 自动 reclaim)+ web port 由 OS 释放 |
+
+tmux 子 session 在任何场景下均**不被 daemon kill** — daemon 退出后 tmux session reparent 到 init(ppid=1),继续存活;`ccteam start` 重启后自动 reattach。
+
 ---
 
 #### `ccteam remove <slug>` 行为契约
