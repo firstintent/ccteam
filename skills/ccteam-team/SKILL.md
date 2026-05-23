@@ -138,16 +138,27 @@ echo "codex-critic spawned (PID $!)"
 ```
 
 The team-lead session captures stdout/stderr to a temp file the
-synthesis loop polls. **No tmux** — `codex exec --json` is one-shot
-process, output is captured directly. Future Wave (F112 §D follow-up
-in V0.7) will route this through the daemon's `CodexExecAdapter` so
-cost accounting is unified.
+synthesis loop polls for a `turn.completed` JSONL frame. **No tmux**
+— `codex exec --json` is one-shot process, output is captured
+directly. This bash-spawn path is the **only supported route** in
+V0.6.5; the spawn mechanics are guarded by
+`crates/ccteam-cli/tests/team_3reviewer_codex_critic_test.rs` (F156)
+against a stub codex via `$CCTEAM_CODEX_BIN`.
+
+**Daemon-routed variant (deferred)**: routing this spawn through the
+daemon's `CodexExecAdapter` (so cost accounting is unified with the
+F84 budget rollup) is a follow-up to F112 §D. It is **explicitly
+deferred** past V0.6.5 — the daemon-side `mcp__ccteam__advise_*`
+dispatch is still a `NotImplemented` stub on `main` (F152/F153 land
+its real impl in V0.6.5 Wave 2 parallel, but cost-accounting + the
+team-3-reviewer routing on top sits behind that landing). Track in
+the V0.7 epic backlog.
 
 If `ccteam-imd` daemon is running and exposes
-`mcp__ccteam__advise_parallel`, the skill MAY prefer that path
-instead — daemon-side cost rollup + persistent log. Detection: a
-previous turn in this session must have registered the MCP tool;
-otherwise stay on the direct Bash spawn.
+`mcp__ccteam__advise_parallel` (V0.6.5 F153 onwards), the skill MAY
+prefer that path instead — daemon-side cost rollup + persistent log.
+Detection: a previous turn in this session must have registered the
+MCP tool; otherwise stay on the direct Bash spawn.
 
 ### 4. 等用户回复
 

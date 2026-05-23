@@ -558,6 +558,19 @@ enum Command {
         /// mutation. Pairs with --check-codex-version.
         #[arg(long, default_value_t = false)]
         check_codex_auth: bool,
+        /// V0.6.5 F155: deterministic gate for the `ccteam-creator`
+        /// Phase 3.5 Codex auto-critic detection. Probes whether
+        /// `codex` (honoring `$CCTEAM_CODEX_BIN`) is available AND emits
+        /// well-formed `--json` output, then prints a single JSON line
+        /// `{"available": true|false, ...}` to stdout. Exit code: 0 =
+        /// deterministic available, 2 = codex unavailable (binary
+        /// missing / version probe failed / not authenticated), 3 =
+        /// codex available but output malformed (skill must NOT inject
+        /// `executor: codex`). The skill consults this subprocess
+        /// instead of running `codex --version && codex login status`
+        /// inline so the gate is deterministic + testable.
+        #[arg(long, default_value_t = false)]
+        check_codex_auto_critic: bool,
         /// V0.6.1 F139: materialize the `~/.ccteam/hooks/hook.sh`
         /// daemon-aware Claude Code hook dispatcher (idempotent, chmod
         /// 0755). Run after a ccteam binary upgrade to refresh the
@@ -1005,6 +1018,7 @@ fn main() -> Result<()> {
             check_pricing_version,
             check_codex_version,
             check_codex_auth,
+            check_codex_auto_critic,
             install_hooks,
             migrate_hook_commands,
             apply,
@@ -1057,6 +1071,7 @@ fn main() -> Result<()> {
                 check_pricing_version,
                 check_codex_version,
                 check_codex_auth,
+                check_codex_auto_critic,
                 install_hooks,
                 migrate_hook_commands,
             })
@@ -1300,6 +1315,20 @@ fn run_stop() -> Result<()> {
 
 fn run_doctor(opts: commands::DoctorOptions) -> Result<()> {
     let paths = CcteamPaths::from_env()?;
+    // V0.6.5 F155 — `--check-codex-auto-critic` carries non-zero exit
+    // codes (2 = codex unavailable, 3 = output malformed) so callers
+    // (skill body, CI) can branch deterministically. The flag short-
+    // circuits before the generic dispatch because it's the only
+    // doctor mode that maps a structured outcome to a non-error exit
+    // code (everything else is `Ok(())` or anyhow::bail!).
+    if opts.check_codex_auto_critic {
+        let (body, exit_code) = commands::run_check_codex_auto_critic();
+        print!("{body}");
+        if exit_code != 0 {
+            std::process::exit(exit_code);
+        }
+        return Ok(());
+    }
     let body = commands::run_doctor(&paths, opts)?;
     print!("{body}");
     Ok(())

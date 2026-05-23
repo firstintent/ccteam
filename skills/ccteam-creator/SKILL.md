@@ -131,26 +131,41 @@ shows up as a one-line "Codex critic: auto-enabled" note in Phase 4.
 - `architect` / `architecture-reviewer`
 - any persona tagged `critic` or `second-opinion`
 
-**Detection probe** (run once per `ccteam-creator` dialogue):
+**Detection probe** (run once per `ccteam-creator` dialogue) —
+consult the deterministic gate subprocess **instead of** running
+`codex --version && codex login status` inline:
 
 ```bash
-codex --version 2>/dev/null && codex login status 2>/dev/null
+ccteam doctor --check-codex-auto-critic
+# stdout last line: {"available": true|false, "exit_code": 0|2|3, ...}
+# exit code: 0 = inject `executor: codex`; 2 = silent fallback;
+#            3 = silent fallback (probe malformed — don't inject)
 ```
 
-- Both succeed → set `auto_critic_vendor = "codex"` for the matched
-  role; the workflow.yaml render in Phase 5.3 injects
+The gate (V0.6.5 F155, `crates/ccteam-cli/src/commands.rs::
+run_check_codex_auto_critic`) wraps a `<bin> --version` probe AND a
+one-shot `<bin> exec --json --skip-git-repo-check` canary so the
+skill doesn't have to second-guess the result of two inline probes
+under different failure modes (broken install, auth missing, output
+schema drift). Honors `$CCTEAM_CODEX_BIN` for hermetic tests.
+
+- **exit 0** (`available: true`, `probe: "ok"`) → set
+  `auto_critic_vendor = "codex"` for the matched role; the
+  workflow.yaml render in Phase 5.3 injects
   `agents.<role>.executor: codex`. PROJECT PLAN line:
   "Codex critic: auto-enabled".
-- Either fails → silent fallback to `vendor: claude` for that role;
-  PROJECT PLAN line: "Codex critic: unavailable (codex CLI not
-  installed / not authenticated)". User can opt in later via
-  `ccteam doctor --check-codex-version` + `--check-codex-auth`.
+- **exit 2** (`available: false`) → silent fallback to
+  `vendor: claude` for that role; PROJECT PLAN line:
+  "Codex critic: unavailable (codex CLI not installed / not
+  authenticated)". User can opt in later by re-running the gate
+  after `codex login`.
+- **exit 3** (`available: true`, `probe: "malformed"`) → still
+  silent fallback (don't inject `executor: codex` until the operator's
+  codex install is fixed); PROJECT PLAN line:
+  "Codex critic: unavailable (codex exec output malformed — see
+  `ccteam doctor --check-codex-auto-critic`)".
 - Persona is not a critic-flavoured role → PROJECT PLAN line:
   "Codex critic: not applicable" (or omit entirely for brevity).
-
-**Test override**: when `$CCTEAM_CODEX_BIN` is set, treat that path
-as the codex binary. Unit / e2e tests inject a fake binary that
-returns success without burning real Codex inference cost.
 
 The persona `.md` body copied in Phase 5.4 is unchanged — vendor
 selection is purely a `workflow.yaml::agents.<role>.executor: codex`

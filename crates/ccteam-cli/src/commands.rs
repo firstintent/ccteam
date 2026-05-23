@@ -2175,6 +2175,15 @@ pub struct DoctorOptions {
     /// mode-3 codex bot path knows to error early. Pure-readout — no
     /// fs mutation.
     pub check_codex_auth: bool,
+    /// V0.6.5 F155: deterministic gate for the `ccteam-creator`
+    /// Phase 3.5 Codex auto-critic detection. Honors
+    /// `$CCTEAM_CODEX_BIN`; spawns a one-shot `<bin> --version` and
+    /// `<bin> exec --json --skip-git-repo-check` probe with a
+    /// minimal canary prompt, then emits a single JSON object on
+    /// stdout describing the outcome. Maps to non-zero exit code in
+    /// the CLI dispatcher (2 = unavailable, 3 = malformed) so the
+    /// skill body and CI can branch without parsing free text.
+    pub check_codex_auto_critic: bool,
     /// V0.6.1 F139: materialize the `~/.ccteam/hooks/hook.sh` daemon
     /// dispatcher (idempotent, chmod 0755). Use after a ccteam binary
     /// upgrade ships a new script body.
@@ -2206,6 +2215,7 @@ pub fn run_doctor(paths: &CcteamPaths, mut opts: DoctorOptions) -> Result<String
         || opts.check_pricing_version
         || opts.check_codex_version
         || opts.check_codex_auth
+        || opts.check_codex_auto_critic
         || opts.install_hooks
         || opts.migrate_hook_commands;
     // V0.6.1 F121 — `ccteam doctor` with no mode flag implicitly runs
@@ -2348,6 +2358,11 @@ const NO_MODE_HELP: &str = "\nccteam doctor: pass at least one mode flag for the
      probe `codex --version` and WARN when older than 0.131 (V0.6.0 Wave 3 F112).\n  \
      --check-codex-auth\n      \
      probe `codex login status` and report whether the operator is logged in (V0.6.0 Wave 3 F112).\n  \
+     --check-codex-auto-critic\n      \
+     deterministic gate for the `ccteam-creator` Phase 3.5 Codex auto-critic injection (V0.6.5 F155). \
+     Honors $CCTEAM_CODEX_BIN; emits a single JSON line on stdout. Exit 0 = available + well-formed, \
+     2 = unavailable (binary missing / version probe failed / not authenticated), 3 = available but \
+     `codex exec --json` output malformed. The skill consults this subprocess instead of inline probes.\n  \
      --install-hooks\n      \
      materialize ~/.ccteam/hooks/hook.sh (the daemon-aware Claude Code hook dispatcher; V0.6.1 F139). \
      Idempotent; chmod 0755. `ccteam init` already does this on first install.\n  \
@@ -3176,6 +3191,151 @@ fn render_check_codex_auth_report() -> String {
     }
     out.push('\n');
     out
+}
+
+/// V0.6.5 F155 — deterministic gate for the `ccteam-creator` Phase
+/// 3.5 Codex auto-critic injection. Returns `(report_body, exit_code)`
+/// where:
+///
+/// - exit 0 = codex binary available, version ≥ minimum, and the
+///   one-shot `<bin> exec --json --skip-git-repo-check` probe emitted
+///   at least one well-formed `turn.completed` JSONL line carrying a
+///   non-empty agent_message item;
+/// - exit 2 = codex binary missing / `--version` probe failed / non-
+///   zero exit code (treated as `available: false`);
+/// - exit 3 = codex available but the `codex exec --json` output is
+///   malformed (no parseable JSONL `turn.completed` event), so the
+///   skill MUST NOT inject `executor: codex` until the operator's
+///   codex install is fixed.
+///
+/// The function never panics on subprocess errors. Honors the
+/// `CCTEAM_CODEX_BIN` env override so hermetic tests can swap in a
+/// stub script (the same pattern used by the V0.6.0 Wave 3 codex_exec
+/// adapter tests).
+///
+/// stdout body is a single JSON line (`{"available": ...}\n`) so
+/// skill bodies can parse with one `jq` invocation. A short human-
+/// readable header precedes the JSON for `ccteam doctor` operators
+/// who run the flag manually.
+pub fn run_check_codex_auto_critic() -> (String, i32) {
+    let bin = std::env::var("CCTEAM_CODEX_BIN").unwrap_or_else(|_| "codex".to_string());
+    let header = format!(
+        "ccteam doctor --check-codex-auto-critic (V0.6.5 F155)\n  \
+         probing codex binary: {bin}\n"
+    );
+
+    // Step 1: `<bin> --version` — the cheap availability check.
+    let version_out = Command::new(&bin).arg("--version").output();
+    let version_line = match version_out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        Ok(o) => {
+            let body = json!({
+                "available": false,
+                "reason": format!(
+                    "`{bin} --version` exited {}: {}",
+                    o.status.code().unwrap_or(-1),
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ),
+                "exit_code": 2,
+            });
+            return (
+                format!("{header}{}\n", serde_json::to_string(&body).unwrap()),
+                2,
+            );
+        }
+        Err(err) => {
+            let body = json!({
+                "available": false,
+                "reason": format!("spawn `{bin} --version` failed: {err}"),
+                "exit_code": 2,
+            });
+            return (
+                format!("{header}{}\n", serde_json::to_string(&body).unwrap()),
+                2,
+            );
+        }
+    };
+
+    // Step 2: deterministic one-shot `codex exec --json` canary. We
+    // pipe a minimal canary prompt (heredoc-equivalent) and look for a
+    // `turn.completed` JSONL frame in stdout — that's the marker the
+    // skill needs to know "this codex install can deliver a critic
+    // verdict end-to-end without burning real inference cost in the
+    // gate itself". The stub binary in the test suite emits a fixed
+    // JSONL transcript so the test is deterministic; real codex will
+    // also emit `turn.completed` after `--json` mode finishes (cheap
+    // ~1¢ depending on user's plan).
+    //
+    // Argv mirrors `crates/ccteam-core/src/execution/codex_exec.rs::
+    // build_exec_argv` for parity with the real wave-3 adapter; the
+    // stub MUST accept the same flags.
+    let probe = Command::new(&bin)
+        .args(["exec", "--json", "--skip-git-repo-check"])
+        .arg("respond with the literal text OK")
+        .output();
+    match probe {
+        Ok(o) if o.status.success() => {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            let has_turn_completed = stdout
+                .lines()
+                .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                .any(|v| v.get("type").and_then(|t| t.as_str()) == Some("turn.completed"));
+            if has_turn_completed {
+                let body = json!({
+                    "available": true,
+                    "version": version_line,
+                    "probe": "ok",
+                    "exit_code": 0,
+                });
+                (
+                    format!("{header}{}\n", serde_json::to_string(&body).unwrap()),
+                    0,
+                )
+            } else {
+                let body = json!({
+                    "available": true,
+                    "version": version_line,
+                    "probe": "malformed",
+                    "reason": "`codex exec --json` exited 0 but no `turn.completed` JSONL \
+                               frame found on stdout; skill MUST NOT inject `executor: codex` \
+                               until codex install is fixed",
+                    "exit_code": 3,
+                });
+                (
+                    format!("{header}{}\n", serde_json::to_string(&body).unwrap()),
+                    3,
+                )
+            }
+        }
+        Ok(o) => {
+            let body = json!({
+                "available": false,
+                "version": version_line,
+                "reason": format!(
+                    "`codex exec --json` exited {}: {}",
+                    o.status.code().unwrap_or(-1),
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ),
+                "exit_code": 2,
+            });
+            (
+                format!("{header}{}\n", serde_json::to_string(&body).unwrap()),
+                2,
+            )
+        }
+        Err(err) => {
+            let body = json!({
+                "available": false,
+                "version": version_line,
+                "reason": format!("spawn `codex exec` failed: {err}"),
+                "exit_code": 2,
+            });
+            (
+                format!("{header}{}\n", serde_json::to_string(&body).unwrap()),
+                2,
+            )
+        }
+    }
 }
 
 /// Parse "codex 0.131.0" or "0.131.0 (...)". Returns `(major, minor,
