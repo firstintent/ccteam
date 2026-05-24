@@ -1,18 +1,18 @@
 ---
 name: ccteam-advise
-description: "Claude + Codex parallel advisor for architecture decisions, algorithm trade-offs, and security / performance second opinions. Use when the user says '/ccteam-advise <NL>', 'second opinion on X', 'should I pick A or B', 'ask both Claude and Codex about X', or otherwise asks for a cross-vendor consult. Backed by the daemon MCP tools `mcp__ccteam__advise_vote` / `mcp__ccteam__advise_parallel` (V0.6.5 F152 + F153)."
+description: "Claude + Codex parallel advisor for architecture decisions, algorithm trade-offs, and security / performance second opinions. Use when the user says '/ccteam-advise <NL>', 'second opinion on X', 'should I pick A or B', 'ask both Claude and Codex about X', or otherwise asks for a cross-vendor consult. Backed by the daemon MCP tools `mcp__ccteam__advise_vote` / `mcp__ccteam__advise_parallel`."
 ---
 
 # /ccteam-advise — Claude + Codex parallel voting
 
-V0.6.5 F152 + F153 — daemon-backed real implementations of
-`mcp__ccteam__advise_vote` (Claude + Codex one-shot + synthesised
-verdict via a third Claude call) and `mcp__ccteam__advise_parallel`
-(N-of-N raw answers, no synthesis). Single user-facing scenario: a
-hard question that benefits from two independent opinions, fanned to
-both vendors in parallel and reduced to a 3-5 sentence verdict.
+Daemon-backed dispatch for `mcp__ccteam__advise_vote` (Claude + Codex
+one-shot + synthesised verdict via a third Claude call) and
+`mcp__ccteam__advise_parallel` (N-of-N raw answers, no synthesis).
+Single user-facing scenario: a hard question that benefits from two
+independent opinions, fanned to both vendors in parallel and reduced
+to a 3-5 sentence verdict.
 
-## V0.6.5 skill family (you are here)
+## Skill family (you are here)
 
 | User intent | Skill |
 |---|---|
@@ -134,7 +134,7 @@ ADVISOR VERDICT (agreement: agree)
 Both Claude and Codex recommend Rust for a high-throughput message
 queue, citing zero-cost abstractions, predictable latency under
 load, and Tokio's mature async runtime. The lone Codex caveat is
-team familiarity — if your team has shipped 3+ Go services already
+team familiarity — if your team has already built 3+ Go services
 and zero Rust, the migration cost can dominate the latency win for
 the first 6 months. Recommended: Rust if you have at least one
 Rust-comfortable engineer; otherwise Go with a `sync.Pool`-heavy
@@ -245,7 +245,7 @@ codex without modifying `$PATH`.
   never lets either vendor write files or run shell commands on
   behalf of the user.
 - **N-way fan-out without synthesis** uses `mcp__ccteam__advise_parallel`
-  with `n: 3..=8` — supported and shipped (no longer a placeholder).
+  with `n: 3..=8`.
 
 ## Red lines
 
@@ -263,18 +263,8 @@ codex without modifying `$PATH`.
   `error:"budget_exceeded"`, surface it; do not retry with a
   silently raised `max_cost_usd`.
 
-## Where to look in the repo
+## Sibling skills
 
-- `@docs/versions/v0-6-5/prd.md` §F152 / §F153 / §F154 — real-impl
-  PRD (supersedes the V0.6.0 stub design)
-- `@crates/ccteam-cli/src/mcp_advise_tools.rs` — MCP tool schemas
-  + dispatchers for `ccteam__advise_vote` / `ccteam__advise_parallel`
-- `@crates/ccteam-core/src/advise.rs` — vendor adapter helpers
-  (`run_claude_advisor` / `run_codex_advisor` / budget ledger
-  persistence)
-- `@crates/ccteam-cli/tests/mcp_advise_vote_test.rs` — vote happy
-  path + Codex-unavailable + budget-exceeded e2e coverage
-- `@crates/ccteam-cli/tests/mcp_advise_parallel_test.rs` —
-  parallel round-robin + claude-only + unavailable slot + budget
-  e2e coverage
-- `@CLAUDE.md` §三 — architectural red lines
+- `@skills/ccteam-team/SKILL.md` — multi-turn debate via team
+- `@skills/ccteam-creator/SKILL.md` — start a new project / workflow
+- `@skills/ccteam-control/SKILL.md` — manage existing projects

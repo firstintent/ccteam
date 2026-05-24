@@ -78,6 +78,8 @@
 - ccteam **不 vendor** Claude / Codex 二进制(`references/{claude-code,codex/codex-rs}/` git-ignore 不入库,仅协议参考;实际 spawn 走 `$PATH` 内 `claude` / `codex` binary + `CCTEAM_{CLAUDE,CODEX}_BIN` env override)
 - `vendor: AgentVendor::{Claude, Codex}` enum 是 trait 一等公民,无 default — workflow.yaml 必须 explicit 或由 `ccteam-creator` skill auto-推断写入
 
+**skill 自洽红线**:`skills/*/SKILL.md` + `skills/*/` 其他 body 文件随 `ccteam init` 装到用户机器,**必须**自洽 ── 禁版本号(`V0.X.Y`)/ 禁 `docs/versions/v0-X-Y/` 引用 / 禁 Wave-N / 禁 F-tag / 禁 ship-status creep(shipped / "已 ship" / "ship gate" 等)/ 禁 PR # / 禁 commit ref。允许:sibling skill 引用、MCP tool 名、CLI 命令、稳定 user-facing docs (`docs/{quickstart,user-manual,task-to-command,troubleshooting,recipes}.md`)。Dev-side 历史去 `docs/versions/v0-X-Y/README.md` + `docs/dev-coupling-audit.md`。Ship gate:`grep -rnE "V\d+\.\d+\|docs/versions\|Wave [0-9]\|F[0-9]+[a-z]?\b\|F-Bug\|ship gate\|shipped" skills/*/SKILL.md` 必须 0 命中。
+
 ## 四、扩展机制速查
 
 详 `docs/tech-design.md` §6:

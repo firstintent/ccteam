@@ -1,6 +1,6 @@
 ---
 name: ccteam-scan
-description: "代码库扫描 —— 只读。两个 mode:(1) `--quick` 60-90s 摸底(1 sonnet agent + 3 个固定问题:语言/框架、TODO 热点、CLAUDE.md/README 状态);(2) default audit 大型代码库导航性体检(monorepo 结构、workflow.yaml `scope:` 建议、navigability gap)。Use when 用户说 '/ccteam-scan'、'扫一下代码 / 摸底新项目 / scan code / audit codebase'、'检查我的大代码库'、'扫一下这个仓库'、'我的 monorepo 怎么接 ccteam'、'workflow.yaml 的 scope 该填什么'、'audit codebase navigability'。V0.6.2 F141 + V0.6.5 F157(--quick)。"
+description: "代码库扫描 —— 只读。两个 mode:(1) `--quick` 60-90s 摸底(1 sonnet agent + 3 个固定问题:语言/框架、TODO 热点、CLAUDE.md/README 状态);(2) default audit 大型代码库导航性体检(monorepo 结构、workflow.yaml `scope:` 建议、navigability gap)。Use when 用户说 '/ccteam-scan'、'扫一下代码 / 摸底新项目 / scan code / audit codebase'、'检查我的大代码库'、'扫一下这个仓库'、'我的 monorepo 怎么接 ccteam'、'workflow.yaml 的 scope 该填什么'、'audit codebase navigability'。"
 ---
 
 # /ccteam-scan — 代码库扫描
@@ -10,15 +10,15 @@ description: "代码库扫描 —— 只读。两个 mode:(1) `--quick` 60-90s �
 | Mode | 触发 | 目标耗时 | 谁 spawn | 输出 |
 |---|---|---|---|---|
 | **quick** | `/ccteam-scan --quick` 或 `/ccteam "扫一下代码"` | 60-90s | 1 个 sonnet agent | `<repo>/.ccteam/codebase-scan.md`(~10-20 行,frontmatter `quick: true`)|
-| **audit**(default,V0.6.2 F141)| `/ccteam-scan`(无 flag)| 5-10 min | inline(本 skill body)| 同 path,**升级覆盖** quick 报告(frontmatter `quick: false`)|
+| **audit**(default)| `/ccteam-scan`(无 flag)| 5-10 min | inline(本 skill body)| 同 path,**升级覆盖** quick 报告(frontmatter `quick: false`)|
 
 **新用户**:用 `--quick` 即可,30-90 秒看到 value。**大型 monorepo / 要接 ccteam**:跑 default audit 拿 scope 建议 + navigability 报告。
 
-下文 §"--quick mode" 描述 quick;§"--audit mode" 起以下是 V0.6.2 F141 原 audit 流程。
+下文 §"--quick mode" 描述 quick;§"--audit mode" 起以下是大型代码库 audit 流程。
 
 ---
 
-## --quick mode(V0.6.5 F157)
+## --quick mode
 
 **用途**:新用户 60-90s 内摸底任意 git 仓库。不替代 audit;只是第一印象。
 
@@ -104,7 +104,7 @@ generator: ccteam-scan --quick
 
 ---
 
-## --audit mode(V0.6.2 F141,大型代码库导航性体检)
+## --audit mode(大型代码库导航性体检)
 
 **只读** audit skill。一次性产出一份报告:这个仓库对 Claude Code agent 有多"可导航",以及把它接入 ccteam 时每个 role 的 `scope:` 该怎么填。
 
@@ -187,7 +187,7 @@ du -sh -- */ 2>/dev/null | sort -rh | head -15      # 最大子树
 
 ## Step 3 — `scope:` 建议(本 skill 的核心产出)
 
-对每个 member / 主要子系统,给出一行可直接粘进 `workflow.yaml` 的 `scope:` 值。背景:V0.6.2 F140 —— `AgentSpec.scope` 把 agent spawn 的 cwd 钉到子树,收窄每次 fresh-context 的爆炸半径(详 `docs/interfaces.md §17.2`)。
+对每个 member / 主要子系统,给出一行可直接粘进 `workflow.yaml` 的 `scope:` 值。背景:`AgentSpec.scope` 把 agent spawn 的 cwd 钉到子树,收窄每次 fresh-context 的爆炸半径(详 `docs/interfaces.md §17.2`)。
 
 输出形如:
 
@@ -241,5 +241,3 @@ crates/api           scope: crates/api          Cargo workspace member
 
 - `docs/orchestration-patterns.md §1.5` —— 大型代码库模板(scope + explorer→artifact→editor)
 - `docs/interfaces.md §17.2` —— `AgentSpec.scope` schema
-- `docs/versions/v0-6-2/README.md` —— F140 per-role scope + F141 本 skill audit mode
-- `docs/versions/v0-6-5/prd.md §F157` —— `--quick` mode 需求 + 验收

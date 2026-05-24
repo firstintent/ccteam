@@ -1,6 +1,6 @@
 # ccteam-team — skill 入口速查
 
-V0.5.0 F93a primary path:在用户当前 Claude session 里起一个 Anthropic Agent Team。
+primary path:在用户当前 Claude session 里起一个 Anthropic Agent Team。
 **零 ccteam workflow.yaml 依赖** — 任意 git repo 都跑得起。
 
 > 完整协议见 `SKILL.md`。本 README 给 `ccteam-creator` skill / docs 等交叉引用用。
@@ -45,11 +45,6 @@ ccteam doctor --install-skill ccteam-team
 
 | skill | 用途 |
 |---|---|
-| **`ccteam-team`** (本 skill) | V0.5.0 primary — 起 agent team |
+| **`ccteam-team`** (本 skill) | 在当前 session 内起 agent team |
 | `ccteam-creator` | 创 ccteam project / workflow.yaml / agent.md |
 | `ccteam-control` | 管 ccteam daemon + MCP 工具调用 |
-
-## 参考
-
-- `docs/versions/v0-5-0/prd.md` §F93a — SoT
-- `docs/versions/v0-5-0/dev-plan.md` Wave 1 — 实施

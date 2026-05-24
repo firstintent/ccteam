@@ -5,14 +5,13 @@ description: "One-time IM token onboarding for ccteam chat bots. Walks the user 
 
 # /ccteam-im-setup — one-time IM token onboarding
 
-Shipped via F117 (V0.6.0). Standalone skill that any other skill (notably
-`ccteam-creator` Phase 5.1) can invoke to make sure
-`~/.ccteam/im/credentials.json` has the platform the rest of the
-flow needs. **Idempotent** — re-running for a platform that's
-already configured re-verifies the token and exits without prompting.
+Standalone skill that any other skill (notably `ccteam-creator`
+Phase 5.1) can invoke to make sure `~/.ccteam/im/credentials.json`
+has the platform the rest of the flow needs. **Idempotent** —
+re-running for a platform that's already configured re-verifies the
+token and exits without prompting.
 
-Backed by `ccteam_imd::onboarding::telegram_setup()` (and forthcoming
-`slack_setup` / `discord_setup`).
+Backed by `ccteam_imd::onboarding::telegram_setup()`.
 
 ## When to invoke
 
@@ -35,19 +34,16 @@ Backed by `ccteam_imd::onboarding::telegram_setup()` (and forthcoming
 
 ```
 > 要绑哪个 IM 平台?
-  1. Telegram   (V0.6 ✓)
-  2. Slack      (V0.7)
-  3. Discord    (V0.7)
-  4. (V0.7+) Lark / DingTalk / WeChat
+  1. Telegram
 ```
 
-If user picks 2/3/4 — politely defer to the future wave + return
-without writing anything: "V0.6 只支持 Telegram,Slack / Discord
-要等 V0.7。要先用 Telegram 吗?"
+目前只支持 Telegram。如果用户问起 Slack / Discord / Lark / DingTalk
+/ WeChat,礼貌告诉用户当前只支持 Telegram + 询问"要先用 Telegram 吗?"
+不要 promise 任何时间表。
 
 ---
 
-# Step 2 — Telegram onboarding (V0.6 happy path)
+# Step 2 — Telegram onboarding
 
 Walk the user through, **one step at a time** — don't dump the
 whole script:
@@ -100,13 +96,12 @@ While it's running, tell the user:
 Persist via either of these (same behaviour):
 
 ```rust
-// imd-teammate-branch canonical name:
 ccteam_imd::credentials::save(
     &ccteam_imd::credentials::default_path(),
     &Credentials { telegram: Some(result.creds), ..Default::default() },
 )?;
 
-// or the wave-2/creator-branch convenience wrapper:
+// or the convenience wrapper:
 ccteam_imd::credentials::write_credentials(
     &Credentials { telegram: Some(result.creds), ..Default::default() },
 )?;
@@ -155,9 +150,9 @@ chat_id ACL.)
 
 # Step 4 — Backup transport switch (optional)
 
-The default chat transport for V0.6 is `openhuman/channels`
-(uniform code path across all IM platforms). If the user wants the
-official Anthropic Telegram plugin path instead, they can run:
+The default chat transport is `openhuman/channels` (uniform code
+path across all IM platforms). If the user wants the official
+Anthropic Telegram plugin path instead, they can run:
 
 ```
 /ccteam-im-setup --transport official-telegram
@@ -179,17 +174,16 @@ Reasons to switch:
 - openhuman is misbehaving and they want a fallback
 
 Reasons not to switch:
-- official path doesn't cover Slack / Discord (only Telegram)
-- bot-to-bot @ addressing (IM Squad / F108) currently only works
-  via openhuman
+- official path only covers Telegram
+- bot-to-bot @ addressing (IM Squad) currently only works via
+  openhuman
 
 ---
 
 # What this skill does NOT do
 
-- OAuth flow — V0.6 is token-only (Telegram bot tokens / Slack bot
-  tokens for V0.7)
+- OAuth flow — token-only (Telegram bot tokens)
 - Webhook URL auto-setup — user runs ngrok / cloudflared themselves;
   document in `docs/troubleshooting.md`
-- Multi-account per platform — V0.6 supports one bot per platform
-- Token rotation / refresh — manual for V0.6
+- Multi-account per platform — one bot per platform
+- Token rotation / refresh — manual
