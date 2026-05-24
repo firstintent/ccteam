@@ -681,11 +681,25 @@ impl Orchestrator {
                 // default (ClaudeBgAdapter / CodexExecAdapter). The
                 // HITL gate is enforced at `poll_completions` time
                 // (pending-drain skipped + `plan_decision_required`
-                // emitted), not at adapter selection. TODO(F124 full
-                // scope, post-F98): introduce a dedicated
-                // `HumanApprovalAdapter` wrapper that delegates spawn
-                // to the inner adapter but tags spawn metadata for the
-                // IM round-trip + plan_decision injection.
+                // emitted), not at adapter selection.
+                //
+                // TODO(V0.7-human-approval-adapter): introduce a
+                //   dedicated `HumanApprovalAdapter` wrapper that
+                //   delegates `spawn` / `submit_turn` to the inner
+                //   adapter but tags spawn metadata for the IM
+                //   round-trip + plan_decision injection (full F124
+                //   scope, post-F98).
+                // Reason deferred: V0.6.1 F124 + F98 already deliver
+                //   the user-visible HITL contract via the
+                //   poll-time gate, so the adapter wrapper is pure
+                //   refactor (moves the gate from orchestrator into
+                //   the adapter trait surface) with no behavioural
+                //   delta. Pre-v1.0 it stays as the narrow-scope
+                //   implementation rather than churn the
+                //   `HarnessAdapter` trait for zero user impact.
+                // Tracking: docs/versions/v0-6-6/prd.md §F168
+                //   (decision row #6) + docs/versions/v0-6-1/prd.md
+                //   §F124 + docs/dev-coupling-audit.md V0.6.6 segment.
                 self.adapter_for(exec).cloned()
             }
             _ => self.adapter_for(exec).cloned(),

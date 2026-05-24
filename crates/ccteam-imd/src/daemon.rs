@@ -406,8 +406,18 @@ pub(crate) const SAFETY_NET_TICK: Duration = Duration::from_secs(60);
 /// 2. `creds.telegram` → build a [`TelegramChannel`] with the union of
 ///    the user-configured allowlist + every registered telegram bot's
 ///    `im_chat_id`,
-/// 3. (slack / discord — TODO in V0.7: providers exist but the host
-///    probe's first round only exercises telegram).
+/// 3. (slack / discord wiring).
+///
+// TODO(V0.7-im-providers): construct `SlackChannel` / `DiscordChannel`
+//   here when `creds.slack` / `creds.discord` are set. Provider modules
+//   already exist (`transport/providers/{slack,discord}.rs`) but only
+//   telegram is exercised by the V0.6.x host probe.
+// Reason deferred: bundled with V0.7 Epic C (国内 IM enablement +
+//   Slack Socket Mode / inbound HTTP) so the daemon wiring, HMAC
+//   verification, and onboarding skill ship as one wave instead of
+//   trickling per-provider half-changes through V0.6.x patch releases.
+// Tracking: docs/versions/v0-6-6/prd.md §F168 (decision row #2) +
+//   docs/dev-coupling-audit.md V0.6.6 V0.7-deferred segment.
 fn build_channels(args: &DaemonArgs, creds: &Credentials, bots: &[BotRegistration]) -> ChannelMap {
     if let Some(ch) = args.channels_override.clone() {
         return ch;
@@ -455,7 +465,19 @@ fn spawn_inbound_consumer(
             // bot owns this (channel, chat_id), prepend `@<role> ` so
             // the router resolves the message to that bot. List_bots()
             // is a small disk read; V0.6.1 IM traffic volume keeps it
-            // cheap (single-bot host probe), V0.7 will cache.
+            // cheap (single-bot host probe).
+            // TODO(V0.7-listbots-cache): hoist `list_bots()` behind an
+            //   in-memory cache (invalidated on `BotRegistry` write +
+            //   workflow.yaml reload) so per-inbound-message disk I/O
+            //   collapses to a hash lookup.
+            // Reason deferred: at V0.6.x single-bot host-probe traffic
+            //   volume the disk read is unmeasurable noise; the cache
+            //   only pays for itself at multi-bot per-platform scale,
+            //   which lands with V0.7 Epic C. Hoisting it now would
+            //   bake an invalidation contract that has to be revisited
+            //   when per-bot `chat_handle` lands in the same wave.
+            // Tracking: docs/versions/v0-6-6/prd.md §F168 (decision
+            //   row #3) + docs/dev-coupling-audit.md V0.6.6 segment.
             let bots_for_route = list_bots().unwrap_or_default();
             auto_route_dm_mention(&mut msg, &bots_for_route);
             let handles = build_handle_map();
@@ -555,10 +577,21 @@ fn spawn_inbound_consumer(
 ///
 /// V0.6.1 keeps it simple: each registered bot's `role` becomes a
 /// handle. Two bots sharing the same role across different slugs
-/// **collide** here (last-wins) — workflow.yaml's `chat_handle` field
-/// (V0.7) will land per-bot custom handles. For F132 the typical
-/// production registry has one bot ("web3op_bot") on one slug, so the
-/// collision is theoretical until V0.7.
+/// **collide** here (last-wins). For F132 the typical production
+/// registry has one bot ("web3op_bot") on one slug, so the collision
+/// is theoretical for the V0.6.x host probe.
+///
+// TODO(V0.7-chat-handle): extend `AgentSpec` with a `chat_handle:
+//   Option<String>` field (workflow.yaml schema additive) and build
+//   handles from `(slug, role, chat_handle.unwrap_or(role))` so two
+//   bots can share `role: chatops` across slugs without collision.
+// Reason deferred: the schema extension is paired with V0.7 Epic C
+//   multi-platform per-bot routing — landing it in isolation forces a
+//   second workflow.yaml migration when Epic C ships and would
+//   pre-commit to a handle-collision UX (warn vs. error vs. namespace
+//   per-slug) that the Epic C IM coverage will inform.
+// Tracking: docs/versions/v0-6-6/prd.md §F168 (decision row #4) +
+//   docs/dev-coupling-audit.md V0.6.6 segment.
 fn build_handle_map() -> HandleMap {
     let mut map = HandleMap::new();
     if let Ok(bots) = list_bots() {
