@@ -10,7 +10,7 @@
 #   * Strong checksum verification; mismatch aborts non-zero.
 #   * No sudo. Writes to $HOME/.local/bin by default.
 #   * Override target dir: CCTEAM_INSTALL_DIR=/usr/local/bin sh install.sh
-#   * Override tag (CI / pin): CCTEAM_VERSION=v0.6.6 sh install.sh
+#   * Override tag (CI / pin): CCTEAM_VERSION=<tag> sh install.sh
 #   * Windows is not supported — run ccteam under WSL2 and use the
 #     linux-x64 binary (tmux + inotify + POSIX signals are foundational).
 #
@@ -112,7 +112,7 @@ detect_sha256() {
     fi
 }
 
-# ---- resolve tag: env override → GH API "latest" ----
+# ---- resolve tag: env override → HTML redirect (primary) → GH API (fallback) ----
 resolve_tag() {
     if [ -n "${CCTEAM_VERSION:-}" ]; then
         TAG="$CCTEAM_VERSION"
@@ -120,10 +120,24 @@ resolve_tag() {
         return
     fi
     info "Resolving latest release..."
+    # Primary: HTML redirect (no GitHub API rate limit ~60 req/hr per IP).
+    # github.com/.../releases/latest 302-redirects to /releases/tag/<version>;
+    # grab the Location header (no -L = don't follow, we only want the redirect target).
+    TAG="$(curl -sI "https://github.com/$REPO/releases/latest" 2>/dev/null \
+        | grep -i '^location:' \
+        | sed -E 's|.*/tag/([^[:space:]]+).*|\1|' \
+        | tr -d '\r')"
+    if [ -n "$TAG" ]; then
+        info "Latest release: $TAG"
+        return
+    fi
+    # Fallback: GitHub API (rate-limited; only hit if HTML redirect parse failed).
+    info "Redirect parse failed; falling back to GitHub API..."
     _api="https://api.github.com/repos/$REPO/releases/latest"
     _tmp="$(mktemp)"
     if ! download "$_api" "$_tmp"; then
         err "failed to query GitHub API: $_api"
+        err "Override: CCTEAM_VERSION=<tag> sh install.sh"
         exit 1
     fi
     # POSIX grep + sed (no jq dependency).
@@ -131,10 +145,10 @@ resolve_tag() {
     rm -f "$_tmp"
     if [ -z "$TAG" ]; then
         err "could not parse tag_name from GitHub API response"
-        err "Override: CCTEAM_VERSION=v0.6.6 sh install.sh"
+        err "Override: CCTEAM_VERSION=<tag> sh install.sh"
         exit 1
     fi
-    info "Latest release: $TAG"
+    info "Latest release (via API fallback): $TAG"
 }
 
 # ---- main install ----
