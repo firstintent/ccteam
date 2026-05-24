@@ -154,9 +154,7 @@ pub fn list_handoffs(project_dir: &Path, workflow_slug: &str) -> Result<Vec<Path
         return Ok(Vec::new());
     }
     let mut entries: Vec<(u32, String, PathBuf)> = Vec::new();
-    for entry in std::fs::read_dir(&dir)
-        .with_context(|| format!("read_dir {}", dir.display()))?
-    {
+    for entry in std::fs::read_dir(&dir).with_context(|| format!("read_dir {}", dir.display()))? {
         let entry = entry?;
         let path = entry.path();
         if !path.is_file() {
@@ -194,11 +192,7 @@ pub fn list_handoffs(project_dir: &Path, workflow_slug: &str) -> Result<Vec<Path
 /// <!-- ccteam handoff: stage-2-fixer.md -->
 /// ...body...
 /// ```
-pub fn read_concat(
-    project_dir: &Path,
-    workflow_slug: &str,
-    last_n: usize,
-) -> Result<String> {
+pub fn read_concat(project_dir: &Path, workflow_slug: &str, last_n: usize) -> Result<String> {
     if last_n == 0 {
         return Ok(String::new());
     }
@@ -272,8 +266,7 @@ pub fn write_handoff(opts: &WriteHandoffOptions) -> Result<PathBuf> {
         std::process::id()
     );
     tmp.set_file_name(tmp_name);
-    std::fs::write(&tmp, &opts.content)
-        .with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::write(&tmp, &opts.content).with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, &final_path)
         .with_context(|| format!("rename {} → {}", tmp.display(), final_path.display()))?;
     Ok(final_path)

@@ -46,21 +46,16 @@ async fn daemon_runs_and_writes_heartbeat() {
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     use std::sync::{Mutex, OnceLock};
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 #[test]
 fn registration_round_trip() {
     let _g = env_lock();
     let _tmp = isolate_home();
-    let path = register_bot(
-        "dev-foo",
-        "lead",
-        AgentVendor::Claude,
-        "telegram",
-        "12345",
-    )
-    .unwrap();
+    let path = register_bot("dev-foo", "lead", AgentVendor::Claude, "telegram", "12345").unwrap();
     // Recompute path under the *same* HOME (no race because we hold env_lock).
     let expected = registration_path("dev-foo", "lead");
     assert_eq!(path, expected);

@@ -133,10 +133,8 @@ pub const SCIENTIST_NAMES: &[&str] = &[
 /// Comparison is case-insensitive but the returned name preserves the
 /// canonical PascalCase form from [`SCIENTIST_NAMES`].
 pub fn pick_unused_bot_name(existing: &[String]) -> String {
-    let taken: std::collections::HashSet<String> = existing
-        .iter()
-        .map(|s| s.to_ascii_lowercase())
-        .collect();
+    let taken: std::collections::HashSet<String> =
+        existing.iter().map(|s| s.to_ascii_lowercase()).collect();
     for &name in SCIENTIST_NAMES {
         if !taken.contains(&name.to_ascii_lowercase()) {
             return name.to_string();

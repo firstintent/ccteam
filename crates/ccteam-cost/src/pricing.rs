@@ -277,7 +277,10 @@ mod tests {
         };
         // o3 input = $2 / 1M.
         let cost = estimate_cost(&one_m_input, Vendor::Codex, "o3");
-        assert!((cost - 2.0).abs() < 0.01, "o3 input != $2 / 1M (got {cost})");
+        assert!(
+            (cost - 2.0).abs() < 0.01,
+            "o3 input != $2 / 1M (got {cost})"
+        );
     }
 
     #[test]

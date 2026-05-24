@@ -269,8 +269,8 @@ async fn handle_project(
     // line read `state.cost_used_usd`, which is now frozen.
     // V0.6.0 Wave 3 F112 — also surface `cost_24h_by_vendor` to drive
     // the SPA's per-vendor split and `/ccteam-advise` UI.
-    let cost = cost_summary(&slug, &app.paths.progress_jsonl(&slug), &app.paths)
-        .unwrap_or_default();
+    let cost =
+        cost_summary(&slug, &app.paths.progress_jsonl(&slug), &app.paths).unwrap_or_default();
     let cost_total = cost.cost_total_usd;
     let cost_24h_by_vendor = cost.cost_24h_by_vendor.clone();
     let summary = ProjectSummary {
@@ -360,10 +360,9 @@ async fn handle_session(
         .as_ref()
         .map(|snap| format!("{:.2}", snap.cost_usd_total))
         .unwrap_or_else(|| {
-            let total =
-                cost_summary(&slug, &app.paths.progress_jsonl(&slug), &app.paths)
-                    .map(|c| c.cost_total_usd)
-                    .unwrap_or(0.0);
+            let total = cost_summary(&slug, &app.paths.progress_jsonl(&slug), &app.paths)
+                .map(|c| c.cost_total_usd)
+                .unwrap_or(0.0);
             format!("{:.2}", total)
         });
 
@@ -494,7 +493,11 @@ fn build_workflow_session_detail(
     // project-wide badge. Fine-grained per-session badging is a flex
     // feature we deliberately don't replicate here.
     let label: &'static str = if live.is_some() { "live" } else { "done" };
-    let cls: &'static str = if live.is_some() { "badge-ok" } else { "badge-neutral" };
+    let cls: &'static str = if live.is_some() {
+        "badge-ok"
+    } else {
+        "badge-neutral"
+    };
 
     let kind = team_kind_label(state.team_kind).to_string();
     let detail = SessionDetail {

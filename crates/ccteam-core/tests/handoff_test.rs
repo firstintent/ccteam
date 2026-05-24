@@ -8,7 +8,13 @@ use ccteam_core::handoff::{
 };
 use tempfile::TempDir;
 
-fn opts(dir: &std::path::Path, slug: &str, stage: u32, role: &str, body: &str) -> WriteHandoffOptions {
+fn opts(
+    dir: &std::path::Path,
+    slug: &str,
+    stage: u32,
+    role: &str,
+    body: &str,
+) -> WriteHandoffOptions {
     WriteHandoffOptions {
         project_dir: dir.to_path_buf(),
         workflow_slug: slug.into(),
@@ -24,8 +30,7 @@ fn write_handoff_is_atomic_and_overwrites() {
     let body1 = "first version\n";
     let body2 = "second version\n";
 
-    let p1 =
-        write_handoff(&opts(td.path(), "demo", 1, "explorer", body1)).expect("first write");
+    let p1 = write_handoff(&opts(td.path(), "demo", 1, "explorer", body1)).expect("first write");
     assert!(p1.exists(), "file should exist after first write");
     assert_eq!(fs::read_to_string(&p1).unwrap(), body1);
 
@@ -42,8 +47,7 @@ fn write_handoff_is_atomic_and_overwrites() {
         "no .tmp.<pid> leftovers; saw {leftovers:?}"
     );
 
-    let p2 =
-        write_handoff(&opts(td.path(), "demo", 1, "explorer", body2)).expect("overwrite");
+    let p2 = write_handoff(&opts(td.path(), "demo", 1, "explorer", body2)).expect("overwrite");
     assert_eq!(p1, p2, "same (slug, stage, role) → same path");
     assert_eq!(
         fs::read_to_string(&p2).unwrap(),

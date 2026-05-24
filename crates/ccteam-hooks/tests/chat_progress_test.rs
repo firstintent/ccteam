@@ -8,9 +8,9 @@
 use std::path::Path;
 
 use ccteam_core::{CcteamPaths, ProjectState};
-use serial_test::serial;
 use ccteam_hooks::handle_chat_progress;
 use serde_json::{json, Value};
+use serial_test::serial;
 use tempfile::TempDir;
 
 /// Bootstrap a hermetic `CcteamPaths` rooted at `tmp` + register a

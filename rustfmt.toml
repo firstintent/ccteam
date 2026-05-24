@@ -2,9 +2,10 @@
 # whitespace. Stable rustfmt only (no `unstable_features = true`); CI and
 # `cargo fmt --check` must run on stable.
 #
-# **Apply to new / heavily-edited files only.** Pre-existing codebase carries
-# a known fmt drift (~4-5 kLOC); a workspace-wide `cargo fmt --all` sweep
-# explodes diffs and breaks reviewability. See CLAUDE.md §七 for the rule.
+# **Drift-zero policy**: workspace `cargo fmt --all` clean as of the chore
+# fmt-sweep PR. Commit-front `cargo fmt --all` is mandatory; CI gate
+# (`.github/workflows/check.yml::fmt`) enforces `cargo fmt --all -- --check`
+# on push / PR. See CLAUDE.md §七 for the rule.
 
 edition = "2021"
 max_width = 100

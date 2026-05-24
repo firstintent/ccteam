@@ -5,7 +5,11 @@ use ccteam_core::{pick_unused_bot_name, SCIENTIST_NAMES};
 
 #[test]
 fn pool_is_at_least_fifty_names() {
-    assert!(SCIENTIST_NAMES.len() >= 50, "pool too small: {}", SCIENTIST_NAMES.len());
+    assert!(
+        SCIENTIST_NAMES.len() >= 50,
+        "pool too small: {}",
+        SCIENTIST_NAMES.len()
+    );
 }
 
 #[test]

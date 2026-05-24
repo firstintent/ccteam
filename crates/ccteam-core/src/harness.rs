@@ -183,13 +183,29 @@ pub enum TurnInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ThreadEvent {
-    ThreadStarted { thread_id: String },
-    TurnStarted { turn_id: String },
-    TurnCompleted { turn_id: String, usage: UnifiedTokenUsage },
-    TurnFailed { turn_id: String, err: ThreadErrorEvent },
-    ItemStarted { item: ThreadItem },
-    ItemUpdated { item: ThreadItem },
-    ItemCompleted { item: ThreadItem },
+    ThreadStarted {
+        thread_id: String,
+    },
+    TurnStarted {
+        turn_id: String,
+    },
+    TurnCompleted {
+        turn_id: String,
+        usage: UnifiedTokenUsage,
+    },
+    TurnFailed {
+        turn_id: String,
+        err: ThreadErrorEvent,
+    },
+    ItemStarted {
+        item: ThreadItem,
+    },
+    ItemUpdated {
+        item: ThreadItem,
+    },
+    ItemCompleted {
+        item: ThreadItem,
+    },
     Error(ThreadErrorEvent),
 }
 
@@ -209,10 +225,21 @@ pub struct ThreadItem {
 pub enum ThreadItemDetails {
     AgentMessage(String),
     Reasoning(String),
-    CommandExecution { cmd: String, status: String },
-    FileChange { path: PathBuf, kind: String },
-    ToolCall { name: String, args: serde_json::Value },
-    WebSearch { query: String },
+    CommandExecution {
+        cmd: String,
+        status: String,
+    },
+    FileChange {
+        path: PathBuf,
+        kind: String,
+    },
+    ToolCall {
+        name: String,
+        args: serde_json::Value,
+    },
+    WebSearch {
+        query: String,
+    },
     Error(String),
 }
 
@@ -296,11 +323,8 @@ pub trait HarnessAdapter: Send + Sync {
 
     /// Submit one user-input turn to an existing thread. Bg adapters
     /// (single-turn) return a synthetic turn id from the spawn line.
-    async fn submit_turn(
-        &self,
-        h: &ThreadHandle,
-        input: TurnInput,
-    ) -> Result<TurnId, HarnessError>;
+    async fn submit_turn(&self, h: &ThreadHandle, input: TurnInput)
+        -> Result<TurnId, HarnessError>;
 
     /// Stream of thread events. Adapters that don't yet feed structured
     /// events return an empty stream (the orchestrator's legacy
@@ -313,10 +337,7 @@ pub trait HarnessAdapter: Send + Sync {
     /// session-id, Codex thread id). Bg adapters return
     /// [`HarnessError::NotImplemented`] because every spawn is a fresh
     /// 1M context (red line R3, Claude vendor).
-    async fn resume_thread(
-        &self,
-        persistent_id: &str,
-    ) -> Result<ThreadHandle, HarnessError>;
+    async fn resume_thread(&self, persistent_id: &str) -> Result<ThreadHandle, HarnessError>;
 
     /// Graceful close. Idempotent on missing PID / missing tmux
     /// session (matches V0.5.x `shutdown_session` semantics).
@@ -709,7 +730,11 @@ mod tests {
 
     #[test]
     fn execution_mode_serde_round_trip() {
-        for m in [ExecutionMode::InProc, ExecutionMode::Bg, ExecutionMode::Chat] {
+        for m in [
+            ExecutionMode::InProc,
+            ExecutionMode::Bg,
+            ExecutionMode::Chat,
+        ] {
             let json = serde_json::to_string(&m).unwrap();
             let back: ExecutionMode = serde_json::from_str(&json).unwrap();
             assert_eq!(m, back);

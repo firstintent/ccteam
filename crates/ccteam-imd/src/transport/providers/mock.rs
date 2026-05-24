@@ -50,10 +50,7 @@ impl Channel for MockChannel {
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
         self.outbox.lock().await.push(message.clone());
-        Ok(Some(format!(
-            "mock-{}",
-            self.outbox.lock().await.len()
-        )))
+        Ok(Some(format!("mock-{}", self.outbox.lock().await.len())))
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {

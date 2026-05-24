@@ -55,8 +55,7 @@ fn run_doctor_with_path(extra_path: &std::path::Path, args: &[&str]) -> (String,
 #[test]
 fn check_codex_version_reports_ok_for_supported_release() {
     let dir = fake_codex_dir("codex 0.131.0", "Not logged in");
-    let (stdout, _stderr, code) =
-        run_doctor_with_path(dir.path(), &["--check-codex-version"]);
+    let (stdout, _stderr, code) = run_doctor_with_path(dir.path(), &["--check-codex-version"]);
     assert_eq!(code, 0, "stdout: {stdout}");
     assert!(stdout.contains("[OK]"), "stdout: {stdout}");
     assert!(stdout.contains("0.131"), "stdout: {stdout}");
@@ -65,8 +64,7 @@ fn check_codex_version_reports_ok_for_supported_release() {
 #[test]
 fn check_codex_version_warns_on_old_release() {
     let dir = fake_codex_dir("codex 0.120.0", "Not logged in");
-    let (stdout, _stderr, code) =
-        run_doctor_with_path(dir.path(), &["--check-codex-version"]);
+    let (stdout, _stderr, code) = run_doctor_with_path(dir.path(), &["--check-codex-version"]);
     assert_eq!(code, 0);
     assert!(stdout.contains("[WARN]"), "stdout: {stdout}");
 }

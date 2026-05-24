@@ -633,12 +633,20 @@ mod tests {
 
         // Write the main session FIRST (so its mtime is older).
         let main_path = dir.join("main-sid.jsonl");
-        std::fs::write(&main_path, r#"{"type":"last-prompt","sessionId":"main-sid"}"#).unwrap();
+        std::fs::write(
+            &main_path,
+            r#"{"type":"last-prompt","sessionId":"main-sid"}"#,
+        )
+        .unwrap();
 
         // Then write a subagent jsonl — newer mtime.
         std::thread::sleep(std::time::Duration::from_millis(10));
         let sa_path = dir.join("subagent-sid.jsonl");
-        std::fs::write(&sa_path, r#"{"type":"agent-setting","sessionId":"subagent-sid"}"#).unwrap();
+        std::fs::write(
+            &sa_path,
+            r#"{"type":"agent-setting","sessionId":"subagent-sid"}"#,
+        )
+        .unwrap();
 
         let (picked_sid, picked_path) =
             discover_active_session(cwd).expect("should pick the main session, not the subagent");

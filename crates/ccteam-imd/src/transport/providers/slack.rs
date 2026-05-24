@@ -139,10 +139,7 @@ impl Channel for SlackChannel {
                     map.get(chan).cloned()
                 };
                 let url = format!("{SLACK_API}/conversations.history");
-                let mut q = vec![
-                    ("channel", chan.clone()),
-                    ("limit", "30".into()),
-                ];
+                let mut q = vec![("channel", chan.clone()), ("limit", "30".into())];
                 if let Some(o) = oldest.clone() {
                     q.push(("oldest", o));
                 }

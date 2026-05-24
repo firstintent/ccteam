@@ -148,15 +148,13 @@ fn translate_item_completed_extracts_file_change_details() {
     };
     let e = translate_notification(&n, "t-1").unwrap();
     match e {
-        ThreadEvent::ItemCompleted { item } => {
-            match item.details {
-                ccteam_core::harness::ThreadItemDetails::FileChange { path, kind } => {
-                    assert_eq!(path, PathBuf::from("/x.rs"));
-                    assert_eq!(kind, "update");
-                }
-                other => panic!("expected FileChange, got {other:?}"),
+        ThreadEvent::ItemCompleted { item } => match item.details {
+            ccteam_core::harness::ThreadItemDetails::FileChange { path, kind } => {
+                assert_eq!(path, PathBuf::from("/x.rs"));
+                assert_eq!(kind, "update");
             }
-        }
+            other => panic!("expected FileChange, got {other:?}"),
+        },
         _ => panic!("expected ItemCompleted"),
     }
 }
@@ -168,7 +166,9 @@ async fn adapter_returns_spawn_failed_when_socket_missing() {
     std::env::set_var(APP_SERVER_SOCKET_ENV, &bogus);
     let _ = std::fs::remove_file(&bogus);
     let adapter = CodexAppServerAdapter::new();
-    let spec = AgentSpecBrief { role: "demo".into() };
+    let spec = AgentSpecBrief {
+        role: "demo".into(),
+    };
     let ctx = SpawnCtx {
         slug: "test".into(),
         sid: "codex-1".into(),
@@ -200,7 +200,9 @@ async fn adapter_start_thread_against_scripted_peer() {
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     let adapter = CodexAppServerAdapter::new();
-    let spec = AgentSpecBrief { role: "demo".into() };
+    let spec = AgentSpecBrief {
+        role: "demo".into(),
+    };
     let ctx = SpawnCtx {
         slug: "test".into(),
         sid: "codex-1".into(),

@@ -60,12 +60,7 @@ async fn handle_with_action(
 /// Shared invocation path. `None` body is normalized to `Value::Null`
 /// so handlers that don't actually read stdin (today: `intercept-ask`)
 /// still work when the client sent zero bytes.
-fn dispatch(
-    app: &AppState,
-    kind: &str,
-    action: Option<&str>,
-    body: Option<Value>,
-) -> Response {
+fn dispatch(app: &AppState, kind: &str, action: Option<&str>, body: Option<Value>) -> Response {
     let t0 = std::time::Instant::now();
     let stdin = body.unwrap_or(Value::Null);
     // Try to pull session id / role from the Claude Code hook stdin

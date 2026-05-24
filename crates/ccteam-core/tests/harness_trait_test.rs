@@ -293,7 +293,10 @@ async fn codex_exec_submit_turn_returns_synthetic_turn_id_wave3() {
     // success/failure. We point CCTEAM_CODEX_BIN at `/bin/true` so the
     // process exits cleanly and the test doesn't depend on a real
     // codex install.
-    std::env::set_var(ccteam_core::execution::codex_app_server::CODEX_BIN_ENV, "/bin/true");
+    std::env::set_var(
+        ccteam_core::execution::codex_app_server::CODEX_BIN_ENV,
+        "/bin/true",
+    );
     let h = ThreadHandle {
         vendor: AgentVendor::Codex,
         mode: ExecutionMode::Bg,

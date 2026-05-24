@@ -214,16 +214,9 @@ async fn happy_path_im_to_bot_to_im() {
     let mut handles = HandleMap::new();
     handles.insert("lead", slug, role);
 
-    let res = process_inbound(
-        &im_msg("@lead what's up?"),
-        &sec,
-        &handles,
-        &mailbox,
-        0,
-        1,
-    )
-    .await
-    .unwrap();
+    let res = process_inbound(&im_msg("@lead what's up?"), &sec, &handles, &mailbox, 0, 1)
+        .await
+        .unwrap();
     assert!(matches!(res, InboundOutcome::DroppedToBot { .. }));
 
     // Wire supervisor + adapter; start the thread.
@@ -321,8 +314,16 @@ async fn restart_recovers_from_close_failure() {
     let sup = BotSupervisor::new(reg("dev-foo", "lead"), tmp.path(), adapter.clone());
     sup.ensure_started().await.unwrap();
     sup.restart().await.unwrap();
-    assert_eq!(adapter.starts.load(Ordering::SeqCst), 2, "restart starts again");
-    assert_eq!(adapter.closes.load(Ordering::SeqCst), 1, "close attempted once");
+    assert_eq!(
+        adapter.starts.load(Ordering::SeqCst),
+        2,
+        "restart starts again"
+    );
+    assert_eq!(
+        adapter.closes.load(Ordering::SeqCst),
+        1,
+        "close attempted once"
+    );
     assert!(sup.is_started().await);
 }
 
@@ -384,16 +385,9 @@ async fn multi_bot_parallel() {
     let mut seq = 0_u64;
     for content in ["@lead one", "@lead two", "@ops three"] {
         seq += 1;
-        let outcome = process_inbound(
-            &im_msg(content),
-            &sec,
-            &handles,
-            &mailbox,
-            0,
-            seq,
-        )
-        .await
-        .unwrap();
+        let outcome = process_inbound(&im_msg(content), &sec, &handles, &mailbox, 0, seq)
+            .await
+            .unwrap();
         assert!(matches!(outcome, InboundOutcome::DroppedToBot { .. }));
     }
 
@@ -409,10 +403,8 @@ async fn multi_bot_parallel() {
 
     // Each bot's turns.jsonl has its own assistant rows; outbound
     // forwards to bot-specific MockChannels.
-    let lead_turns = projects_root
-        .join("dev-foo/.ccteam/chat/lead/turns.jsonl");
-    let ops_turns = projects_root
-        .join("dev-bar/.ccteam/chat/ops/turns.jsonl");
+    let lead_turns = projects_root.join("dev-foo/.ccteam/chat/lead/turns.jsonl");
+    let ops_turns = projects_root.join("dev-bar/.ccteam/chat/ops/turns.jsonl");
     let (lead_rows, _) = read_new_rows(&lead_turns, &TailCursor::default()).unwrap();
     let (ops_rows, _) = read_new_rows(&ops_turns, &TailCursor::default()).unwrap();
     assert_eq!(lead_rows.len(), 2);

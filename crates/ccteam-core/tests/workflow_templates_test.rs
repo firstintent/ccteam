@@ -14,7 +14,10 @@ fn inproc_solo_renders() {
     .unwrap();
     assert!(out.contains("mode: agent-team"));
     assert!(out.contains("teammate_mode: in-process"));
-    assert!(!out.contains("{{"), "unsubstituted placeholder leaked:\n{out}");
+    assert!(
+        !out.contains("{{"),
+        "unsubstituted placeholder leaked:\n{out}"
+    );
 }
 
 #[test]
@@ -76,6 +79,10 @@ fn chat_squad_renders() {
 fn all_presets_have_unique_yaml_names() {
     let mut seen = std::collections::HashSet::new();
     for &p in WorkflowPreset::all() {
-        assert!(seen.insert(p.as_str()), "duplicate preset name: {}", p.as_str());
+        assert!(
+            seen.insert(p.as_str()),
+            "duplicate preset name: {}",
+            p.as_str()
+        );
     }
 }

@@ -91,10 +91,7 @@ impl CodexJsonRpcClient {
     /// writer background tasks are spawned immediately.
     pub async fn connect_uds(socket_path: &Path) -> Result<Self> {
         let stream = UnixStream::connect(socket_path).await.with_context(|| {
-            format!(
-                "connect codex app-server UDS at {}",
-                socket_path.display()
-            )
+            format!("connect codex app-server UDS at {}", socket_path.display())
         })?;
         let (read_half, write_half) = stream.into_split();
         Ok(Self::spawn(read_half, write_half))

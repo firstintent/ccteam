@@ -205,7 +205,9 @@ mod tests {
     #[test]
     fn slack_signature_stub_rejects_old_timestamp() {
         let old = "100"; // epoch=100s — far past window.
-        assert!(!verify_slack_signature_stub("secret", "v0=abc", old, "body"));
+        assert!(!verify_slack_signature_stub(
+            "secret", "v0=abc", old, "body"
+        ));
     }
 
     #[test]
