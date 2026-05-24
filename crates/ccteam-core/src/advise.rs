@@ -836,6 +836,20 @@ pub fn sum_advise_today(ledger: &AdviseBudgetLedger) -> f64 {
         .sum()
 }
 
+/// V0.6.6 F169 — per-vendor 24h spend, surfaced to the IM `@ccteam
+/// cost today` admin path so the user sees `claude: $X / codex: $Y`
+/// rather than the V0.6.1 bot-count placeholder. Same rolling window
+/// the bare [`sum_advise_today`] uses, just filtered by vendor.
+pub fn sum_advise_today_by_vendor(ledger: &AdviseBudgetLedger, vendor: AgentVendor) -> f64 {
+    let cutoff = Utc::now() - chrono::Duration::hours(24);
+    ledger
+        .samples
+        .iter()
+        .filter(|s| s.ts >= cutoff && s.vendor == vendor)
+        .map(|s| s.usd)
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

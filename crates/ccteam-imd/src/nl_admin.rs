@@ -184,25 +184,40 @@ struct Pending {
 }
 
 /// Admin-command executor. Holds the projects-root config (where bot
-/// signal files live) + the per-target pending-confirm map.
+/// signal files live), the ccteam-root config (where the advise-budget
+/// ledger lives — V0.6.6 F169), + the per-target pending-confirm map.
 ///
 /// One instance per daemon. `Arc<AdminExecutor>` is cheap to clone
 /// into per-message tasks.
 pub struct AdminExecutor {
     projects_root: PathBuf,
+    ccteam_root: PathBuf,
     pending: Mutex<HashMap<String, Pending>>,
     confirm_ttl: Duration,
 }
 
 impl AdminExecutor {
     /// Build an executor rooted at `projects_root`
-    /// (production: `~/projects`; tests: a tempdir).
+    /// (production: `~/projects`; tests: a tempdir). The ccteam-root
+    /// defaults to `~/.ccteam`; use [`Self::with_ccteam_root`] to
+    /// override in tests.
     pub fn new(projects_root: impl Into<PathBuf>) -> Self {
         Self {
             projects_root: projects_root.into(),
+            ccteam_root: crate::default_ccteam_root_public(),
             pending: Mutex::default(),
             confirm_ttl: CONFIRM_TTL,
         }
+    }
+
+    /// V0.6.6 F169 — override the ccteam-root used to read the
+    /// `cost-budget.json` advise ledger. Production daemon stays on
+    /// the home-derived default; tests inject a tempdir so each
+    /// scenario has its own ledger state.
+    #[doc(hidden)]
+    pub fn with_ccteam_root(mut self, ccteam_root: impl Into<PathBuf>) -> Self {
+        self.ccteam_root = ccteam_root.into();
+        self
     }
 
     /// Test helper: override the confirm TTL.
@@ -263,12 +278,27 @@ impl AdminExecutor {
     }
 
     async fn cost_today(&self, slug_filter: Option<&str>) -> AdminReply {
-        // V0.6.1: surface a registry-driven summary. Full per-vendor
-        // 24h cost aggregation across all projects lives behind
-        // `ccteam-control show-cost` (CLI) + the web dashboard — the
-        // IM path returns a deterministic snapshot derived from the
-        // registry so the user can verify the daemon parsed their
-        // request. V0.7 wires the full `ccteam_cost` rollup here.
+        // V0.6.6 F169 — read the real `<ccteam_root>/cost-budget.json`
+        // advise ledger (V0.6.5 F152 schema) so the IM `@ccteam cost
+        // today` path surfaces the same USD numbers the
+        // `/ccteam-control show-cost` CLI prints. The slug filter
+        // stays advisory — the ledger is keyed on vendor + ts only
+        // (per-slug attribution is a V0.7 ledger-schema bump) so we
+        // report it back in the header for transparency.
+        use ccteam_core::advise::{load_budget_ledger, sum_advise_today_by_vendor};
+        use ccteam_core::harness::AgentVendor;
+        use ccteam_core::DEFAULT_ADVISE_BUDGET_USD_24H;
+
+        let ledger = load_budget_ledger(&self.ccteam_root).unwrap_or_default();
+        // `+ 0.0` normalises negative-zero (Rust's `-0.0` formats as
+        // `-0.0000` otherwise, which is ugly in the IM reply).
+        let claude_24h = sum_advise_today_by_vendor(&ledger, AgentVendor::Claude) + 0.0;
+        let codex_24h = sum_advise_today_by_vendor(&ledger, AgentVendor::Codex) + 0.0;
+        let total = claude_24h + codex_24h;
+        let cap = DEFAULT_ADVISE_BUDGET_USD_24H;
+        let remaining = (cap - total).max(0.0);
+        let near_cap = cap > 0.0 && total / cap >= 0.80;
+
         let bots = list_bots().unwrap_or_default();
         let filtered: Vec<&BotRegistration> = match slug_filter {
             Some(s) => bots.iter().filter(|b| b.workflow_slug == s).collect(),
@@ -278,17 +308,22 @@ impl AdminExecutor {
             Some(s) => format!("ccteam cost today — slug `{s}`"),
             None => "ccteam cost today".to_string(),
         };
-        if filtered.is_empty() {
-            return AdminReply {
-                message: format!("{header}: no matching bots."),
-                side_effect: AdminSideEffect::None,
-            };
-        }
+        let warn_prefix = if near_cap {
+            "⚠️ approaching daily budget cap\n"
+        } else {
+            ""
+        };
+        let slug_note = slug_filter.unwrap_or("none");
+        let msg = format!(
+            "{warn_prefix}{header}\n  \
+             rolling 24h cost: Claude ${claude_24h:.4} + Codex ${codex_24h:.4} = total ${total:.4}\n  \
+             cap: ${cap:.2}/24h · remaining: ${remaining:.4}\n  \
+             active bots: {} (filter: {slug_note})\n  \
+             full breakdown: `/ccteam-control show-cost`",
+            filtered.len()
+        );
         AdminReply {
-            message: format!(
-                "{header}\n  bots: {}\n  detailed per-vendor breakdown: `/ccteam-control show-cost`.",
-                filtered.len()
-            ),
+            message: msg,
             side_effect: AdminSideEffect::None,
         }
     }
