@@ -162,6 +162,19 @@ main() {
     detect_sha256
     resolve_tag
 
+    # Short-circuit if already at TAG (CCTEAM_FORCE=1 to bypass).
+    # `ccteam --version` may print either `ccteam 0.6.8` or `0.6.8`; the
+    # release TAG may be `v0.6.8` — compare against both forms.
+    if [ -z "${CCTEAM_FORCE:-}" ] && command -v ccteam >/dev/null 2>&1; then
+        _current="$(ccteam --version 2>/dev/null | awk 'NR==1{print $NF}')"
+        _tag_no_v="${TAG#v}"
+        if [ -n "$_current" ] && { [ "$_current" = "$TAG" ] || [ "$_current" = "$_tag_no_v" ]; }; then
+            info "Already at $TAG; nothing to do."
+            info "(Set CCTEAM_FORCE=1 to reinstall anyway.)"
+            exit 0
+        fi
+    fi
+
     _asset="ccteam-${TAG}-${SUFFIX}.${EXT}"
     _base="https://github.com/${REPO}/releases/download/${TAG}"
     _url="${_base}/${_asset}"
@@ -212,6 +225,16 @@ main() {
     fi
 
     mkdir -p "$INSTALL_DIR"
+
+    # Warn if the daemon is currently running — the new binary won't be
+    # picked up until `ccteam stop && ccteam start` cycles the supervisor.
+    # `pgrep -f "ccteam start"` matches the argv (not just the comm name),
+    # so it won't false-positive on the installer's own shell children.
+    if command -v pgrep >/dev/null 2>&1 && pgrep -f "ccteam start" >/dev/null 2>&1; then
+        warn "ccteam daemon is running. Restart after install:"
+        printf '      ccteam stop && ccteam start\n\n'
+    fi
+
     mv "$_extracted" "$INSTALL_DIR/ccteam"
     chmod +x "$INSTALL_DIR/ccteam"
     info "${GREEN}Installed:${RESET} $INSTALL_DIR/ccteam ($TAG)"
