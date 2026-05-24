@@ -592,6 +592,19 @@ enum Command {
         /// dry-run.
         #[arg(long, default_value_t = false)]
         apply: bool,
+        /// V0.6.6 F171: assert the MCP tool surface is fully wired.
+        /// Counts active vs STUB tools (cross-checked against
+        /// `mcp_tool_groups::STUB_TOOLS`) and exits 1 when any STUB
+        /// is registered. Pair with `--json` for machine-readable
+        /// output (single JSON object on stdout). Use to gate CI on
+        /// the "0 STUB" invariant V0.6.5 ship-gate item #9 introduced.
+        #[arg(long, default_value_t = false)]
+        verify_mcp: bool,
+        /// V0.6.6 F171: emit machine-readable JSON instead of the
+        /// human-friendly text report (only used with `--verify-mcp`
+        /// today; ignored otherwise).
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     /// V0.3.1 F49 — adhoc multi-session primitives for `kind: flex`
     /// teams. `add --harness claude` creates a registered tmux session;
@@ -1022,6 +1035,8 @@ fn main() -> Result<()> {
             install_hooks,
             migrate_hook_commands,
             apply,
+            verify_mcp,
+            json,
         } => {
             // V0.4.1 `--install-all` is sugar for the three first-run
             // flags. Explicit flags still win where set; we OR them.
@@ -1074,6 +1089,8 @@ fn main() -> Result<()> {
                 check_codex_auto_critic,
                 install_hooks,
                 migrate_hook_commands,
+                verify_mcp,
+                verify_mcp_json: json,
             })
         }
         Command::Session { action } => run_session(action),
@@ -1326,6 +1343,23 @@ fn run_doctor(opts: commands::DoctorOptions) -> Result<()> {
         print!("{body}");
         if exit_code != 0 {
             std::process::exit(exit_code);
+        }
+        return Ok(());
+    }
+    // V0.6.6 F171 — `--verify-mcp` carries non-zero exit code (1) when
+    // any STUB tool is registered so CI can gate the "0 STUB"
+    // invariant. Same short-circuit pattern as --check-codex-auto-
+    // critic: deterministic outcome → structured non-error exit.
+    if opts.verify_mcp {
+        let report = commands::run_verify_mcp();
+        let body = if opts.verify_mcp_json {
+            report.render_json()
+        } else {
+            report.render_text()
+        };
+        print!("{body}");
+        if !report.ok() {
+            std::process::exit(1);
         }
         return Ok(());
     }

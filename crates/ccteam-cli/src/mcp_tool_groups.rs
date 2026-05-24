@@ -28,6 +28,18 @@
 
 use std::collections::HashSet;
 
+/// V0.6.6 F171 — explicit allow-list of MCP tool names whose dispatch
+/// path is still a STUB (returns "not implemented" / sentinel response).
+/// Empty after V0.6.5 (every shipped MCP tool has a real dispatch).
+///
+/// Any PR introducing a new STUB tool MUST add its full name (e.g.
+/// `ccteam__advise_something`) to this list — `ccteam doctor
+/// --verify-mcp` reads this const to compute `stub_count` and exits
+/// non-zero when it sees STUBs (in CI builds) so unwired tools cannot
+/// silently ship. When the dispatch is later wired, drop the name from
+/// this list in the same PR that removes the stub body.
+pub const STUB_TOOLS: &[&str] = &[];
+
 /// Group an MCP tool belongs to. Each tool is registered with exactly
 /// one group. Names match the lowercase form accepted by
 /// `CCTEAM_DISABLE_TOOLS`.

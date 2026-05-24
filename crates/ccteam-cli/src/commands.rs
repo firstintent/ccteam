@@ -2194,6 +2194,16 @@ pub struct DoctorOptions {
     /// `ccteam hook ...` / F39 `cct hook ...` forms). Idempotent; pair
     /// with `--dry-run` to preview.
     pub migrate_hook_commands: bool,
+    /// V0.6.6 F171: assert the MCP tool surface is fully wired. The
+    /// dispatcher short-circuits to `run_verify_mcp` which counts
+    /// active + STUB tools (`mcp_tool_groups::STUB_TOOLS`) and exits 1
+    /// when any STUB is found. Mirrors `--check-codex-auto-critic`'s
+    /// structured exit-code pattern.
+    pub verify_mcp: bool,
+    /// V0.6.6 F171: pair with `verify_mcp = true` to emit a single
+    /// pretty-printed JSON object on stdout instead of the human-
+    /// friendly text report. Ignored when `verify_mcp == false`.
+    pub verify_mcp_json: bool,
 }
 
 /// `ccteam doctor` dispatch. Returns a human-readable report so unit
@@ -3335,6 +3345,174 @@ pub fn run_check_codex_auto_critic() -> (String, i32) {
                 2,
             )
         }
+    }
+}
+
+/// V0.6.6 F171 — outcome of `ccteam doctor --verify-mcp`. Counts the
+/// MCP tool surface registered by `mcp_serve::tool_definitions()` and
+/// cross-checks against the `STUB_TOOLS` allow-list declared in
+/// `mcp_tool_groups`. `unexpected_stubs` is the set difference
+/// between live STUBs and the allow-list (today the allow-list is
+/// empty so any STUB is unexpected); `ok()` returns false when that
+/// set is non-empty.
+#[derive(Debug, Clone)]
+pub struct VerifyMcpReport {
+    /// Total number of MCP tools registered by `tool_definitions()`.
+    pub total_tools: usize,
+    /// Number of tools classified as STUB (name appears in
+    /// `mcp_tool_groups::STUB_TOOLS`).
+    pub stub_count: usize,
+    /// Number of tools with a real dispatch (= total - stub_count).
+    pub active_count: usize,
+    /// Sorted, full tool names (e.g. `ccteam__workflow_show`) for the
+    /// human-readable + JSON reports.
+    pub tool_list: Vec<String>,
+    /// Per-group counts (`workflow` → 15, `chat` → 8, ...). Sorted by
+    /// group name for deterministic output.
+    pub per_group: std::collections::BTreeMap<String, GroupStats>,
+    /// STUB tool names that are NOT in the `STUB_TOOLS` allow-list.
+    /// Empty in a clean build; non-empty → exit code 1.
+    pub unexpected_stubs: Vec<String>,
+}
+
+/// V0.6.6 F171 — per-group active/stub split used by `VerifyMcpReport`.
+#[derive(Debug, Clone)]
+pub struct GroupStats {
+    pub active: usize,
+    pub stub: usize,
+}
+
+impl VerifyMcpReport {
+    /// True when every registered tool has a real dispatch — i.e. the
+    /// allow-list and the live STUB set agree. CI uses this to decide
+    /// the exit code (`true` → 0, `false` → 1).
+    pub fn ok(&self) -> bool {
+        self.unexpected_stubs.is_empty()
+    }
+
+    /// Human-readable report (default). Mirrors the layout in
+    /// `docs/versions/v0-6-6/prd.md` §F171 Sub-3.
+    pub fn render_text(&self) -> String {
+        let mut out = String::new();
+        out.push_str("MCP tool surface verification (V0.6.6 F171)\n");
+        out.push_str("===\n");
+        out.push_str(&format!("total tools:    {}\n", self.total_tools));
+        out.push_str(&format!("active:         {}\n", self.active_count));
+        out.push_str(&format!("stubs:          {}\n", self.stub_count));
+        out.push_str("\nper-group breakdown:\n");
+        for (group, stats) in &self.per_group {
+            out.push_str(&format!(
+                "  {:<12} {} active / {} stub\n",
+                format!("{group}:"),
+                stats.active,
+                stats.stub
+            ));
+        }
+        if !self.unexpected_stubs.is_empty() {
+            out.push_str("\nunexpected STUBs (not in mcp_tool_groups::STUB_TOOLS):\n");
+            for name in &self.unexpected_stubs {
+                out.push_str(&format!("  - {name}\n"));
+            }
+        }
+        out.push('\n');
+        if self.ok() {
+            out.push_str(&format!(
+                "verdict: PASS — all {} tools live, no production STUBs.\n",
+                self.total_tools
+            ));
+        } else {
+            out.push_str(&format!(
+                "verdict: FAIL — {} unexpected STUB(s) registered.\n",
+                self.unexpected_stubs.len()
+            ));
+        }
+        out
+    }
+
+    /// Single pretty-printed JSON object (trailing newline) for
+    /// machine-readable callers (CI, `jq`-driven scripts). Hand-built
+    /// via `serde_json::json!` so the report type does not need a
+    /// `serde::Serialize` derive (ccteam-cli does not depend on the
+    /// `serde` crate directly).
+    pub fn render_json(&self) -> String {
+        let per_group: Map<String, Value> = self
+            .per_group
+            .iter()
+            .map(|(g, s)| (g.clone(), json!({ "active": s.active, "stub": s.stub })))
+            .collect();
+        let body = json!({
+            "ok": self.ok(),
+            "total_tools": self.total_tools,
+            "active_count": self.active_count,
+            "stub_count": self.stub_count,
+            "tool_list": self.tool_list,
+            "per_group": Value::Object(per_group),
+            "unexpected_stubs": self.unexpected_stubs,
+        });
+        let mut s = serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into());
+        s.push('\n');
+        s
+    }
+}
+
+/// V0.6.6 F171 — compute the report by introspecting
+/// `mcp_serve::tool_definitions()` (single source of truth for the
+/// registered MCP tool surface) and cross-checking against
+/// `mcp_tool_groups::STUB_TOOLS`.
+pub fn run_verify_mcp() -> VerifyMcpReport {
+    let tools = crate::mcp_serve::tool_definitions();
+    let mut names: Vec<String> = tools
+        .iter()
+        .filter_map(|t| t.get("name").and_then(|v| v.as_str()).map(String::from))
+        .collect();
+    names.sort();
+
+    let stub_set: std::collections::HashSet<&str> =
+        crate::mcp_tool_groups::STUB_TOOLS.iter().copied().collect();
+
+    let stub_count = names
+        .iter()
+        .filter(|n| stub_set.contains(n.as_str()))
+        .count();
+    let active_count = names.len().saturating_sub(stub_count);
+
+    // Per-group split. Tools whose `group_for_tool` returns `None` are
+    // bucketed under "other" so a typo in a new tool name still shows
+    // up in the report rather than silently disappearing.
+    let mut per_group: std::collections::BTreeMap<String, GroupStats> =
+        std::collections::BTreeMap::new();
+    for name in &names {
+        let group = match crate::mcp_tool_groups::group_for_tool(name) {
+            Some(g) => g.as_str().to_string(),
+            None => "other".to_string(),
+        };
+        let entry = per_group
+            .entry(group)
+            .or_insert(GroupStats { active: 0, stub: 0 });
+        if stub_set.contains(name.as_str()) {
+            entry.stub += 1;
+        } else {
+            entry.active += 1;
+        }
+    }
+
+    // Unexpected STUBs = live STUBs not in the allow-list. Today the
+    // allow-list is empty so this equals the full live STUB set; the
+    // indirection lets a future PR park a known-stub under the
+    // allow-list without forcing CI red.
+    let unexpected_stubs: Vec<String> = names
+        .iter()
+        .filter(|n| stub_set.contains(n.as_str()))
+        .cloned()
+        .collect();
+
+    VerifyMcpReport {
+        total_tools: names.len(),
+        stub_count,
+        active_count,
+        tool_list: names,
+        per_group,
+        unexpected_stubs,
     }
 }
 
@@ -6131,6 +6309,82 @@ mod tests {
         assert!(
             msg.contains("--restart-team"),
             "error must point at --restart-team; got: {msg}",
+        );
+    }
+
+    // V0.6.6 F171 — render-path coverage for the FAIL branch (binary
+    // E2E test in `tests/doctor_verify_mcp_test.rs` only exercises the
+    // PASS branch since shipping a STUB tool just to fail-test the
+    // binary would defeat the gate). These unit tests pin the
+    // human-readable + JSON shape for a synthetic STUB scenario so the
+    // FAIL message format stays stable across refactors.
+
+    #[test]
+    fn verify_mcp_run_on_live_surface_passes_with_zero_stubs() {
+        let report = run_verify_mcp();
+        assert!(report.ok(), "live MCP surface must be 0-STUB");
+        assert_eq!(report.stub_count, 0);
+        assert!(report.unexpected_stubs.is_empty());
+        // total_tools must match the mcp_serve spec — keeps F171 in
+        // sync with `tool_definitions_count_matches_spec` (live truth).
+        assert_eq!(report.total_tools, report.active_count);
+        assert_eq!(report.total_tools, 27, "V0.6.5 ships 27 tools");
+    }
+
+    #[test]
+    fn verify_mcp_report_render_text_fail_path_emits_verdict_fail() {
+        let mut per_group = std::collections::BTreeMap::new();
+        per_group.insert(
+            "workflow".to_string(),
+            GroupStats {
+                active: 14,
+                stub: 1,
+            },
+        );
+        let synth = VerifyMcpReport {
+            total_tools: 27,
+            stub_count: 1,
+            active_count: 26,
+            tool_list: vec!["ccteam__workflow_synth_stub".to_string()],
+            per_group,
+            unexpected_stubs: vec!["ccteam__workflow_synth_stub".to_string()],
+        };
+        assert!(!synth.ok());
+        let text = synth.render_text();
+        assert!(text.contains("verdict: FAIL"), "text: {text}");
+        assert!(
+            text.contains("unexpected STUBs"),
+            "text must list unexpected STUBs section: {text}",
+        );
+        assert!(
+            text.contains("ccteam__workflow_synth_stub"),
+            "stub tool name must appear in report: {text}",
+        );
+        assert!(text.contains("14 active / 1 stub"), "got: {text}");
+    }
+
+    #[test]
+    fn verify_mcp_report_render_json_fail_path_sets_ok_false() {
+        let mut per_group = std::collections::BTreeMap::new();
+        per_group.insert("advise".to_string(), GroupStats { active: 1, stub: 1 });
+        let synth = VerifyMcpReport {
+            total_tools: 28,
+            stub_count: 1,
+            active_count: 27,
+            tool_list: vec!["ccteam__advise_synth_stub".to_string()],
+            per_group,
+            unexpected_stubs: vec!["ccteam__advise_synth_stub".to_string()],
+        };
+        let j = synth.render_json();
+        let v: Value = serde_json::from_str(&j).expect("render_json emits valid JSON");
+        assert_eq!(v["ok"], Value::Bool(false));
+        assert_eq!(v["stub_count"], Value::Number(1.into()));
+        assert_eq!(v["total_tools"], Value::Number(28.into()));
+        let unexpected = v["unexpected_stubs"].as_array().unwrap();
+        assert_eq!(unexpected.len(), 1);
+        assert_eq!(
+            unexpected[0],
+            Value::String("ccteam__advise_synth_stub".into())
         );
     }
 }

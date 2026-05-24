@@ -338,7 +338,7 @@ fn tools_list_response() -> Value {
 /// `workflow_`, `chat_`, `advise_`) except `ccteam__screenshot`
 /// which keeps its single-member-group name for V0.5 muscle memory.
 /// Schemas mirror interfaces.md §12.2.
-fn tool_definitions() -> Vec<Value> {
+pub(crate) fn tool_definitions() -> Vec<Value> {
     let mut tools: Vec<Value> = vec![
         // Read-only inspection.
         json!({
