@@ -116,39 +116,9 @@ ccteam probe-project --json    # 看 ccteam 怎么"看"你的仓库
 
 ## Step 1 — 装 ccteam plugin(30 秒)
 
-ccteam 走 Claude Code 官方 plugin marketplace 协议安装 —— **plugin 是首选路径**,CLI binary 作为前置条件先装好(plugin 通过 MCP 调用本机 `ccteam` 命令)。
+ccteam 走 Claude Code(或 Codex)官方 plugin 协议安装 —— **plugin 是首选**且唯一**必需**的入口。plugin 自带 Node.js bridge(`index.js`),首次在 MCP server 启动时探测宿主、按平台从 GitHub Release 拉对应 binary 到 plugin sandbox 内,然后 `exec ccteam mcp-serve`。**不需要预先装 CLI binary**(bridge 会顺手把 binary symlink 到 `~/.local/bin/ccteam`,所以装完 plugin 终端也直接能跑 `ccteam start`)。
 
-### 1.1 装 CLI binary(前置,一次性)
-
-**首选 ── 一行装预编译 binary(不需要 Rust toolchain):**
-
-```bash
-curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh | sh
-ccteam --version    # 应输出当前版本号
-```
-
-默认装到 `~/.local/bin/ccteam`。装完如果该路径不在 `$PATH`,脚本会打印一行 export 指令(贴进 `~/.bashrc` / `~/.zshrc` 再 `source` 即可)。
-
-支持的平台:Linux x86_64、macOS arm64(Apple Silicon)、macOS x86_64(Intel)。Windows 用户走 WSL2 + linux-x64 binary —— native Windows 不支持(tmux + inotify + POSIX signals 是 ccteam 架构根基)。
-
-环境变量:
-- `CCTEAM_INSTALL_DIR=/usr/local/bin sh install.sh` —— 改装目录(系统级安装)
-- `CCTEAM_VERSION=v0.6.6 sh install.sh` —— 装指定 tag(不取 latest)
-
-macOS Gatekeeper 拦截(首次跑报"not verified developer"):
-```bash
-xattr -d com.apple.quarantine ~/.local/bin/ccteam
-```
-
-**回退 ── 从源码 build(需要 Rust 1.85+,5-15 min 编译):**
-
-```bash
-cargo install --git https://github.com/firstintent/ccteam ccteam-cli
-```
-
-新机器没装 Rust 时,先 `curl https://sh.rustup.rs -sSf | sh` 装 rustup,然后再跑上面这条。
-
-### 1.2 在 Claude session 里注册 marketplace + 装 plugin
+### 1.1 在 Claude session 里注册 marketplace + 装 plugin
 
 任意 terminal 起 Claude session:
 
@@ -171,7 +141,42 @@ $ claude
   • mcp__ccteam__* tools available (workflow_* / chat_* / advise_* / admin_* / screenshot_*)
 ```
 
-跑 `ccteam doctor` 验装(claude CLI / MCP / tmux / pidfile 路径都查一遍);加 `--verify-mcp` 自检 MCP 工具表面齐全(应输出 `26 active, 0 stubs`,非零 exit 即 CI gate fail);加 `--check-codex-auto-critic` 验证 Codex 二审是否能开;加 `--check-cost-orphan` 对账 24h 内 ledger 与 progress.jsonl(catch spawn 路径漏写 ledger)。
+首次调用任意 `mcp__ccteam__*` tool 时,`index.js` 会从 GitHub Release 拉对应平台的 tarball(linux-x64 / macos-arm64 / macos-x64),解压到 `${PLUGIN_ROOT}/bin/ccteam`,chmod +x,并 symlink 到 `~/.local/bin/ccteam`。第二次起秒启。
+
+跑 `ccteam doctor` 验装(claude CLI / MCP / tmux / pidfile 路径都查一遍);加 `--verify-mcp` 自检 MCP 工具表面齐全(应输出 `27 active, 0 stubs`,非零 exit 即 CI gate fail);加 `--check-codex-auto-critic` 验证 Codex 二审是否能开;加 `--check-cost-orphan` 对账 24h 内 ledger 与 progress.jsonl(catch spawn 路径漏写 ledger)。
+
+支持的平台:Linux x86_64、macOS arm64(Apple Silicon)、macOS x86_64(Intel)。Windows 用户走 WSL2 + linux-x64 binary —— native Windows 不支持(tmux + inotify + POSIX signals 是 ccteam 架构根基)。
+
+macOS Gatekeeper 拦截(首次跑报"not verified developer"):
+```bash
+xattr -d com.apple.quarantine ~/.local/bin/ccteam
+```
+
+### 1.2 Codex 用户
+
+```
+codex plugin marketplace add firstintent/ccteam
+```
+
+同一仓库同时是 Codex plugin。Bridge 通过 `CODEX_ACTIVE` env 嗅探宿主,自动选择走 Codex 路径。
+
+### 1.3 高级:不走 plugin,直接装 system-wide CLI(可选)
+
+只想在终端 / 服务器跑 `ccteam start` daemon、不打算用 Claude/Codex skill 路径时:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh | sh
+ccteam --version    # 应输出当前版本号
+```
+
+默认装到 `~/.local/bin/ccteam`。装完如果该路径不在 `$PATH`,脚本会打印一行 export 指令。环境变量:
+- `CCTEAM_INSTALL_DIR=/usr/local/bin sh install.sh` —— 改装目录(系统级安装)
+- `CCTEAM_VERSION=v0.6.6 sh install.sh` —— 装指定 tag(不取 latest)
+
+回退 ── 从源码 build(需要 Rust 1.85+,5-15 min 编译):
+```bash
+cargo install --git https://github.com/firstintent/ccteam ccteam-cli
+```
 
 → 卡了?见 [troubleshooting.md](troubleshooting.md) "plugin install 失败"。
 

@@ -1,0 +1,35 @@
+{
+  "name": "ccteam",
+  "version": "0.6.6",
+  "description": "Multi-vendor (Claude + Codex) AI dev-team orchestration: 7 skills + 27 MCP tools + IM bots + dual-LLM voting.",
+  "author": {
+    "name": "FirstIntent"
+  },
+  "repository": "https://github.com/firstintent/ccteam",
+  "homepage": "https://github.com/firstintent/ccteam",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "claude-code",
+    "plugin",
+    "multi-agent",
+    "orchestration",
+    "mcp",
+    "telegram"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "ccteam",
+    "shortDescription": "Autonomous multi-agent dev team",
+    "longDescription": "An unattended multi-agent orchestration engine that drives software from intent to closed-loop delivery — Claude + Codex dual-vendor, file-system as control plane, 24/7 IM bots, dual-LLM voting.",
+    "category": "Productivity",
+    "capabilities": ["Read", "Write"],
+    "brandColor": "#10A37F",
+    "defaultPrompt": [
+      "Use ccteam to scan this repo and tell me what it does",
+      "Use ccteam to run a long task overnight hands-off",
+      "Use ccteam to get a second opinion (Claude + Codex) on this design"
+    ]
+  }
+}
