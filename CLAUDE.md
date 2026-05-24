@@ -97,6 +97,11 @@
 4. **不写 backwards-compat shim**
 5. **优先编辑现有文件,不轻易新建**
 6. **测试不过不算完成** — `cargo test --workspace` 退步 = block;clippy 不能新增 warning
+7. **版本发布同步全局文档(ship gate,不是 post-ship polish)** — 每次 `vX.Y.Z` ship(minor / patch 都算)**必须**同步 3 类文档:
+   - **tier-1 内部 docs**:CLAUDE.md §一 baseline + `tech-design.md` / `interfaces.md` / `dev-coupling-audit.md` / `claude-code-tool-surface.md` + workspace `Cargo.toml` version bump ── Wave 4a doc-syncer 守
+   - **用户面 docs**:`README.md` + `docs/{quickstart,user-manual,recipes,troubleshooting}.md` + `docs/advanced/*.md` ── 必须把本版新能力(新 MCP tool / 新 skill mode / 新 vendor 支持 / 新 ops 行为)融入**用户视角**;不能留旧版本描述;**不**写"V0.X.Y 新增"措辞(README §三红线"不含版本进展")─ 直接以当前能力描述呈现
+   - **版本归档**:`docs/versions/v0-X-Y/README.md` + handoff doc 落地;F-finding 索引去 `docs/dev-coupling-audit.md`
+   - Ship gate 第 12 项(写入 V0.X.Y `README.md §5`):用户面 docs 必须 grep clean + 覆盖本版新能力 + 不夹历史版本号
 
 ### 多 session 并行编辑同一仓库
 
