@@ -13,24 +13,24 @@
 | 加 reviewer / critic | `/ccteam-creator` 重跑(中断式)|
 | 改 budget cap | `/ccteam-control set-budget` |
 | **加新 mode / vendor / trigger** | **vim yaml**(本文)|
-| **写 V0.7+ 新 preset PR** | **vim yaml + 加 template**(本文)|
+| **写新 preset PR** | **vim yaml + 加 template**(本文)|
 
-## 二、workflow.yaml 完整 schema(V0.6)
+## 二、workflow.yaml 完整 schema
 
-位置:`<project>/.ccteam/workflow.yaml`(F83 canonical;旧 `<project>/workflow.yaml` 仅 fallback)。
+位置:`<project>/.ccteam/workflow.yaml`(canonical;旧 `<project>/workflow.yaml` 仅 fallback)。
 
 ```yaml
 version: "0.6"                       # 必;迁移时 doctor 警告
 mode: chat                           # 必,{ in_proc | bg | chat }(serde tagged enum)
                                      # 决定 HarnessAdapter 路径 + mode-specific 字段集
-enabled: true                        # F82,default true
+enabled: true                        # default true
 
-budgets:                             # F107 + F112 vendor 拆分
+budgets:                             # vendor 拆分
   claude:
     max_cost_usd_per_24h: 5.00       # 撞顶 → budget_exceeded + auto-disable
     max_agent_spawns_per_hour: 100
     max_tokens_per_turn: 200000      # chat 必填,防 100k history 烧穿
-    max_cost_per_hour: 1.50          # spike 防,F84 24h cap 不够
+    max_cost_per_hour: 1.50          # spike 防
   codex:
     max_cost_usd_per_24h: 2.00
     max_tokens_per_turn: 100000
@@ -39,22 +39,22 @@ agents:
   - role: helpful-bot                # 必,匹配 .claude/agents/<role>.md
     vendor: claude                   # default claude;{ claude | codex }(严格小写枚举)
     model: opus-4-7                  # vendor-specific(claude:opus-4-7|sonnet-4-7|haiku;codex:o4|o4-mini)
-    trigger: manual                  # { manual | watch:<path> }(V0.6.0 仅这两类)
+    trigger: manual                  # { manual | watch:<path> | schedule:<cron> | webhook:<id> }
     parallelism: 1                   # 仅 watch 有意义;manual 强制 1
     timeout: 30m
     on_timeout: escalate             # { escalate | retry | skip }
-    max_spawn_depth: 5               # F112 recursion bomb guard;default 5
+    max_spawn_depth: 5               # recursion bomb guard;default 5
     # mode: chat 专用字段(其他 mode 写了 ignore + serde warn)
-    bot_name: "@helpful_assistant"   # IM handle(F109);default 从 F112 agent_naming 池取
-    hop_limit: 3                     # bot-to-bot @ 链路上限(R6);default 3
+    bot_name: "@helpful_assistant"   # IM handle;default 从 agent_naming 池取
+    hop_limit: 3                     # bot-to-bot @ 链路上限;default 3
     compact_every_turns: 50          # default 50,0 = 禁
     compact_every_tokens: 100000     # 双触发,default 100k
 
 artifact_dirs:                       # mode: bg 专用;mode: chat 完全忽略
   - .ccteam/fix-requests/
 
-im_channels:                         # mode: chat 专用;F109 openhuman/channels
-  - kind: telegram                   # { telegram | slack | discord | email | lark | ... (V0.7+ feature) }
+im_channels:                         # mode: chat 专用;走 openhuman/channels
+  - kind: telegram                   # { telegram | slack | discord | email | lark | ... (国内 IM 在 backlog) }
     credentials_ref: default         # ~/.ccteam/im/credentials.json 内 key
     chat_kind: dm                    # { dm | group }
     acl:                             # production must-have
@@ -66,7 +66,7 @@ im_channels:                         # mode: chat 专用;F109 openhuman/channels
 
 ## 三、5 preset 的 yaml diff(从 ccteam-creator 默认产物出发)
 
-`ccteam-creator` 模板在 `crates/ccteam-core/src/templates/workflow_templates/{pocket,squad,sprint,builder,solo}.yaml`(F114)。
+`ccteam-creator` 模板在 `crates/ccteam-core/src/templates/workflow_templates/{pocket,squad,sprint,builder,solo}.yaml`。
 
 ### Pocket → IM Squad(单 bot → 多 bot 群组)
 
@@ -74,7 +74,7 @@ im_channels:                         # mode: chat 专用;F109 openhuman/channels
  agents:
    - role: helpful-bot
 +  - role: critic-bot
-+    vendor: codex                    # F112 §D auto-critic
++    vendor: codex                    # auto-critic 路径自动设置(creator Phase 3.5)
 +    bot_name: "@critic_newton"       # 自动从 agent_naming 池
  im_channels:
    - kind: telegram
@@ -120,7 +120,7 @@ im_channels:                         # mode: chat 专用;F109 openhuman/channels
 
 `/ccteam doctor --check-codex` 验装 + auth;缺则报错,不静默 fallback。
 
-## 四、`.claude/agents/<role>.md` frontmatter(V0.6 加 `vendor`)
+## 四、`.claude/agents/<role>.md` frontmatter
 
 ```markdown
 ---
@@ -128,7 +128,7 @@ name: helpful-bot                    # 必,匹配 workflow.yaml::agents.role
 description: 中文技术助手,Claude Code best practices 范围内答问
 tools: [Read, Grep, Edit, Bash]      # Claude Code subagent 白名单;漏写 = 用不上
 model: opus-4-7
-vendor: claude                       # V0.6 新;与 workflow.yaml::vendor 必须一致(doctor warn)
+vendor: claude                       # 与 workflow.yaml::vendor 必须一致(doctor warn)
 tone: 礼貌、技术准、不啰嗦
 guardrails:
   - 拒绝 rm -rf / curl 管道 sudo 类高危命令
@@ -142,7 +142,7 @@ guardrails:
 
 ## 五、自定义 persona(从 prefab 改)
 
-prefab 在 `skills/ccteam-creator/personas/<name>/`(F114),目录结构:
+prefab 在 `skills/ccteam-creator/personas/<name>/`,目录结构:
 
 ```
 personas/tech-assistant-zh/
@@ -160,18 +160,18 @@ vim skills/ccteam-creator/personas/my-custom-bot/{agent.md.tmpl,meta.toml}
 # 不需要改 Rust — skill 启动扫 personas/* 自动 pick
 ```
 
-**用户自定义 persona 不入 V0.6.0**(F114 §不在范围)— 本节是 contributor 加内置 prefab 路径;V0.7+ 才支持 user-defined。
+**用户自定义 persona 在 backlog** — 本节是 contributor 加内置 prefab 路径;用户写 markdown persona 是未来 feature。
 
-## 六、Trigger 类型(V0.6.0 仅 2 类)
+## 六、Trigger 类型
 
 | Trigger | 语义 | 并发 |
 |---|---|---|
-| `manual` | `mcp__ct__workflow_spawn_agent` / chat user 触发 | 强制 1 |
+| `manual` | `mcp__ccteam__workflow_spawn_agent` / chat user 触发 | 强制 1 |
 | `watch:<path>` | inotify(Linux) / fsevents(macOS),**项目相对路径** | `parallelism` 上限内并发 |
+| `schedule:<cron>` | tokio_cron_scheduler;cron string(5 / 6 字段)| `parallelism` 上限内 |
+| `webhook:<id>` | HTTP POST ingress(daemon 内 axum 路由 `/webhook/<id>`)| `parallelism` 上限内 |
 
-旧 `schedule` / `gate` 在 V0.6 schema error(no shim,CLAUDE.md §五);`ccteam doctor --migrate-workflow` 自动 rewrite。
-
-## 七、Handoff 模板自定义(F115)
+## 七、Handoff 模板自定义
 
 每 stage / fix-loop iteration 完,hook prompt 当前 agent 落 `.ccteam/handoffs/<workflow-slug>/stage-<N>-<role>.md`(10-30 行);后续 spawn prompt 自动 `{{include_prev_handoffs}}` 注入。
 
@@ -214,9 +214,9 @@ ccteam start my-bots
 3. **`vendor` 严格小写枚举** — `vendor: openai` ✗ / `vendor: anthropic` ✗;只 `{ claude | codex }`。
 4. **`vendor` agent.md vs workflow.yaml 不一致** — doctor warn 不 error;运行时**按 workflow.yaml 走**,agent.md 字段静默 ignore。
 5. **`watch:<path>` 是项目相对路径**(F78 修过)— `watch:/abs/path` schema error。
-6. **`tools:` 列 `mcp__ct__*` 无效** — 该工具组给 meta-agent;普通 bot 无 permission。F111 反向 `CCTEAM_DISABLE_TOOLS` 才是禁用入口。
+6. **`tools:` 列 `mcp__ccteam__*` 无效** — 该工具组给 meta-agent;普通 bot 无 permission。反向 `CCTEAM_DISABLE_TOOLS` env(group enum)才是禁用入口。
 7. **`max_spawn_depth: 0` ≠ 无限,是禁 spawn** — 想"无限"删字段走 default 5,或 `u32::MAX`。
-8. **`compact_every_tokens` 不含 cached input** — cumulative input + output,**不算** cached(F108 实现细节)。
+8. **`compact_every_tokens` 不含 cached input** — cumulative input + output,**不算** cached(implementation detail)。
 9. **Trait 接口契约不能突破** — yaml schema 只是 `HarnessAdapter` trait 的 surface 投影;trait 不支持的字段(eg. mode 1 in_proc 写 `im_channels`)加了也是死字段。改 yaml 不能让 `submit_turn` 跳过 `start_thread`、不能让 `events()` 无 `ThreadStarted`。
 
 ## 十、看实际跑的是什么
@@ -227,4 +227,4 @@ cat ~/projects/<team>-<slug>/.ccteam/workflow.yaml
 tail -f ~/projects/<team>-<slug>/.ccteam/progress.jsonl | jq 'select(.event=="agent_spawn") | {role, vendor, mode}'
 ```
 
-任何 yaml 改动 daemon **不需重启**(F82 热加载);下次 spawn 即生效。**已在跑的 thread 不受影响**(R3 永不主动 kill);要应用到现有 chat bot,显式 `/ccteam-control restart-bot <role>`。
+任何 yaml 改动 daemon **不需重启**(热加载);下次 spawn 即生效。**已在跑的 thread 不受影响**(红线:永不主动 kill);要应用到现有 chat bot,显式 `/ccteam-control restart-bot <role>`。
