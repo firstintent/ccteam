@@ -592,7 +592,7 @@ fn detect_languages_and_tests(repo_root: &Path) -> (Vec<Language>, bool) {
         (Language::Go, count_go),
         (Language::Java, count_java),
     ];
-    ranked.sort_by(|a, b| b.1.cmp(&a.1));
+    ranked.sort_by_key(|b| std::cmp::Reverse(b.1));
     let langs: Vec<Language> = ranked
         .into_iter()
         .filter(|(_, n)| *n > 0)
