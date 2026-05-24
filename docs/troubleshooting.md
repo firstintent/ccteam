@@ -81,7 +81,22 @@
 ### A15. macOS Gatekeeper 拦 codex 二进制
 **原因**:从 GitHub Releases 下载的 codex 没签名。
 **修复**:System Settings → Privacy → "Allow anyway";或 `brew install --cask codex`(已签)。
-**相关**:E1。
+**相关**:E1、A16。
+
+### A16. macOS Gatekeeper 拦 ccteam 二进制(`install.sh` 装的 prebuilt)
+**原因**:GitHub Releases 的 macOS 二进制未走 Apple notarization;首次跑会被 quarantine 属性拦,报"cannot be opened because the developer cannot be verified"。
+**修复**:`xattr -d com.apple.quarantine ~/.local/bin/ccteam`(或装到的目录)。或退到从源码 build:`cargo install --git https://github.com/firstintent/ccteam ccteam-cli`(本地编译的 binary 没有 quarantine 属性)。
+**相关**:A15。
+
+### A17. `install.sh` 报 "checksum FAILED" / "not listed in SHA256SUMS"
+**原因**:1) 下载途中网络损坏(常见);2) GH Release 上传不全(罕见 — release CI 漏 SHA256SUMS 行);3) 中间人篡改(理论)。
+**修复**:1) 重跑 `curl ... | sh`;2) 走 GH Releases 页面手动下载对应 tarball,校 `shasum -a 256 ccteam-*.tar.gz` 对照 `SHA256SUMS` 文件;3) 仍失败 → 提 issue 附下载链接 + 校验对照。
+**相关**:无。
+
+### A18. `install.sh` 报 "unsupported platform: linux-aarch64"
+**原因**:V0.6.x 还未发布 linux-arm64 prebuilt(只发 x86_64 + macOS arm64/x64)。
+**修复**:走源码 build:`cargo install --git https://github.com/firstintent/ccteam ccteam-cli`(需要 Rust 1.85+);或等 V0.7 把 arm64 加进 release matrix。
+**相关**:A16。
 
 ---
 

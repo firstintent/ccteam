@@ -1,0 +1,199 @@
+# GitHub Actions: tag-triggered prebuilt-binary release (F166).
+#
+# Pushing a tag like `v0.6.6` builds the `ccteam` binary on four targets,
+# packages each with a per-asset SHA-256 sum, aggregates a single
+# SHA256SUMS file, and uploads everything to the corresponding GitHub
+# Release. `install.sh` (repo root) reads these assets — keep the asset
+# naming `ccteam-<tag>-<suffix>.<ext>` and the suffix vocabulary
+# (linux-x64 / macos-arm64 / macos-x64 / windows-x64) in lockstep with
+# that script.
+#
+# The repo-guard on every job stops a fork that accidentally inherits
+# this workflow from publishing under the upstream release page.
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build-${{ matrix.suffix }}
+    if: github.repository == 'firstintent/ccteam'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            suffix: linux-x64
+            ext: tar.gz
+          - os: macos-14
+            target: aarch64-apple-darwin
+            suffix: macos-arm64
+            ext: tar.gz
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            suffix: macos-x64
+            ext: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            suffix: windows-x64
+            ext: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build ccteam binary
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin ccteam
+
+      - name: Package (unix)
+        if: matrix.ext == 'tar.gz'
+        shell: bash
+        run: |
+          set -eu
+          TAG="${GITHUB_REF_NAME}"
+          PKG="ccteam-${TAG}-${{ matrix.suffix }}"
+          STAGE="$(mktemp -d)/${PKG}"
+          mkdir -p "${STAGE}"
+          cp "target/${{ matrix.target }}/release/ccteam" "${STAGE}/ccteam"
+          cp README.md LICENSE "${STAGE}/"
+          tar -czf "${PKG}.tar.gz" -C "$(dirname "${STAGE}")" "${PKG}"
+          # Per-asset checksum (also rolled up later into SHA256SUMS).
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256"
+          else
+            shasum -a 256 "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256"
+          fi
+
+      - name: Package (windows)
+        if: matrix.ext == 'zip'
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $pkg = "ccteam-$tag-${{ matrix.suffix }}"
+          $stage = Join-Path ([System.IO.Path]::GetTempPath()) $pkg
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/ccteam.exe" "$stage/ccteam.exe"
+          Copy-Item "README.md" "$stage/README.md"
+          Copy-Item "LICENSE" "$stage/LICENSE"
+          Compress-Archive -Path $stage -DestinationPath "$pkg.zip" -Force
+          $hash = (Get-FileHash "$pkg.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $pkg.zip" | Out-File -FilePath "$pkg.zip.sha256" -Encoding ascii
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ccteam-${{ matrix.suffix }}
+          path: |
+            ccteam-*-${{ matrix.suffix }}.tar.gz
+            ccteam-*-${{ matrix.suffix }}.tar.gz.sha256
+            ccteam-*-${{ matrix.suffix }}.zip
+            ccteam-*-${{ matrix.suffix }}.zip.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: publish-release
+    needs: build
+    if: github.repository == 'firstintent/ccteam'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Aggregate SHA256SUMS
+        shell: bash
+        run: |
+          set -eu
+          cd dist
+          # Each per-asset .sha256 already contains `<hash>  <basename>`.
+          # Concatenate them so `sha256sum -c SHA256SUMS` validates the
+          # whole release in one shot.
+          : > SHA256SUMS
+          for f in *.sha256; do
+            cat "$f" >> SHA256SUMS
+          done
+          ls -la
+
+      - name: Write release notes
+        shell: bash
+        run: |
+          set -eu
+          TAG="${GITHUB_REF_NAME}"
+          cat > release-notes.md <<EOF
+          # ccteam ${TAG}
+
+          Prebuilt binaries for Linux, macOS (Intel + Apple Silicon), and Windows.
+
+          ## Install (zero-Rust)
+
+          \`\`\`sh
+          curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh | sh
+          \`\`\`
+
+          Or download the archive for your platform below and extract \`ccteam\`
+          into a directory on your \`PATH\` (e.g. \`~/.local/bin\`).
+
+          ## Verify
+
+          \`\`\`sh
+          sha256sum -c SHA256SUMS   # linux
+          shasum -a 256 -c SHA256SUMS   # macOS
+          \`\`\`
+
+          ## macOS Gatekeeper
+
+          The macOS binaries are not notarized. After download:
+
+          \`\`\`sh
+          xattr -d com.apple.quarantine ccteam
+          \`\`\`
+
+          ## What's next
+
+          Read [docs/quickstart.md](https://github.com/firstintent/ccteam/blob/main/docs/quickstart.md)
+          for the 5-minute walkthrough.
+          EOF
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -eu
+          TAG="${GITHUB_REF_NAME}"
+          cd dist
+          # Only ship the user-facing archives + the aggregated SHA256SUMS;
+          # the per-asset .sha256 files are intermediate.
+          gh release create "${TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "ccteam ${TAG}" \
+            --notes-file ../release-notes.md \
+            ccteam-*.tar.gz ccteam-*.zip SHA256SUMS
