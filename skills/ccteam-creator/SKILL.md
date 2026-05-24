@@ -5,12 +5,11 @@ description: "NL dialogue to start a new ccteam project / workflow / IM bot. Pul
 
 # /ccteam-creator — NL bootstrap for ccteam projects
 
-Shipped via F114 (V0.6.0) — supersedes the V0.5 step-1/2/3/4 dispatch
-dialogue with an LLM-driven NL flow that infers everything the user
-shouldn't have to specify (execution mode, preset, persona),
-surfaces a PROJECT PLAN, and only executes after `go`.
+LLM-driven NL flow that infers everything the user shouldn't have to
+specify (execution mode, preset, persona), surfaces a PROJECT PLAN,
+and only executes after `go`.
 
-## V0.6.0 skill family (you are here)
+## Skill family (you are here)
 
 | User intent | Skill |
 |---|---|
@@ -75,8 +74,7 @@ clarifying question** before continuing. Do **not** assume.
 # Phase 2 — Mode inference
 
 Feed the three axes into `ccteam_core::infer_mode(intent) ->
-InferenceResult`. The function applies the V0.6.0 PRD F114 decision
-table:
+InferenceResult`. The function applies this decision table:
 
 | presence | timeline | CreatorMode | Preset |
 |---|---|---|---|
@@ -113,10 +111,10 @@ selection rules:
    `en/role.md`. (User may override: "用英文 persona".)
 
 If no persona is a clean fit, ask the user to pick from the top 3
-candidates. **Do not invent a new persona** — V0.7 will add a
-`/ccteam-creator-persona-new` flow; for V0.6 the library is fixed.
+candidates. **Do not invent a new persona** — the prefab library is
+fixed; user-defined personas are not in scope for this skill.
 
-## Phase 3.5 — Codex auto-critic detection (F112 §B, shipped V0.6.0)
+## Phase 3.5 — Codex auto-critic detection
 
 When the matched persona's role hints at adversarial / second-opinion
 work, ccteam-creator silently consults the Codex CLI and — if it's
@@ -142,7 +140,7 @@ ccteam doctor --check-codex-auto-critic
 #            3 = silent fallback (probe malformed — don't inject)
 ```
 
-The gate (V0.6.5 F155, `crates/ccteam-cli/src/commands.rs::
+The gate (`crates/ccteam-cli/src/commands.rs::
 run_check_codex_auto_critic`) wraps a `<bin> --version` probe AND a
 one-shot `<bin> exec --json --skip-git-repo-check` canary so the
 skill doesn't have to second-guess the result of two inline probes
@@ -269,10 +267,9 @@ The pool is the scientist-nickname list in
 
 For chat presets, invoke the **`mcp__ccteam__chat_register_bot`** MCP
 tool. The skill is LLM-driven and cannot call Rust functions directly
-— the registry is reached only through this MCP wire. V0.6.5 F146
-implemented the real handler that writes
-`~/.ccteam/imd/registry/<workflow_slug>/<role>.json`; the daemon's
-registry watcher picks it up and spawns the tmux session.
+— the registry is reached only through this MCP wire. The handler
+writes `~/.ccteam/imd/registry/<workflow_slug>/<role>.json`; the
+daemon's registry watcher picks it up and spawns the tmux session.
 
 `im_chat_id` comes from `~/.ccteam/im/credentials.json` written in
 Phase 5.1: take `telegram.allowed_chat_ids[0]` (cast to string —
@@ -293,9 +290,9 @@ Telegram chat ids are i64, but the MCP wire expects a string).
 ```
 
 **Vendor must be lowercase** (`"claude"` or `"codex"`). The daemon's
-`BotRegistration` deserialize trips on PascalCase `"Claude"` (Bug A
-from V0.6.5 NAS deploy session); the F146 dispatcher lowercases
-defensively, but stick to lowercase in the call to be explicit.
+`BotRegistration` deserialize trips on PascalCase `"Claude"`; the
+dispatcher lowercases defensively, but stick to lowercase in the
+call to be explicit.
 
 **Error handling:**
 
@@ -371,7 +368,7 @@ If `infer_mode` returns `Ambiguous`, show the top 2 candidates +
 one-line tradeoff comparison; let user pick.
 
 If persona match is < 50% confidence, list top 3 + "其他 / 自己写
-一个 V0.7+ 才支持,V0.6 请从内置库选" and bounce.
+一个目前不支持,请从内置库选" and bounce.
 
 Never silently re-execute Phase 5 steps that already ran — if
 `workflow.yaml` is already on disk, ask before overwriting.
@@ -380,12 +377,11 @@ Never silently re-execute Phase 5 steps that already ran — if
 
 # What this skill does NOT do
 
-- **User-defined personas** — V0.7+ will add a creator flow; for
-  V0.6 the prefab library is fixed at 7 personas.
-- **Persona marketplace pull** — V0.8+.
-- **OAuth-based IM onboarding** — `/ccteam-im-setup` is token-only
-  for V0.6.
-- **Voice / multi-modal input** — V0.7+ (text only).
+- **User-defined personas** — the prefab library is fixed at 7
+  personas; user-defined persona creator flow is not in scope.
+- **Persona marketplace pull** — out of scope.
+- **OAuth-based IM onboarding** — `/ccteam-im-setup` is token-only.
+- **Voice / multi-modal input** — text only.
 - **Cross-vendor agent vendoring** — Codex critic auto-enable is
-  declarative (a hint in PROJECT PLAN); actual Codex vendoring shipped
-  via F112 (V0.6.0).
+  declarative (a hint in PROJECT PLAN); actual Codex vendoring is
+  handled by the daemon vendor adapters.

@@ -1,15 +1,15 @@
 ---
 name: ccteam-team
-description: Start an Anthropic Agent Team in the current Claude session via the `/ccteam-team` entry. Use when the user says "起一个 team", "spawn a team to do X", "并行调研 X", "team N:role <task>", "make a 3-debugger swarm", or otherwise asks to spin up multiple teammates working under the current session as lead. V0.5.0 primary path — works in any git repo, no `ccteam init` / `workflow.yaml` required. Uses Anthropic native `TeamCreate` + `Task` tools; the current session becomes the team-lead in-process.
+description: Start an Anthropic Agent Team in the current Claude session via the `/ccteam-team` entry. Use when the user says "起一个 team", "spawn a team to do X", "并行调研 X", "team N:role <task>", "make a 3-debugger swarm", or otherwise asks to spin up multiple teammates working under the current session as lead. Primary path — works in any git repo, no `ccteam init` / `workflow.yaml` required. Uses Anthropic native `TeamCreate` + `Task` tools; the current session becomes the team-lead in-process.
 ---
 
 # ccteam-team — `/ccteam-team` in current session
 
-V0.5.0 primary path (95% 用户). 用户已在项目 session 里(`cd ~/projects/blog && claude`),
+Primary path (95% 用户). 用户已在项目 session 里(`cd ~/projects/blog && claude`),
 直接输入 `/ccteam-team "<task>"` 就把当前 turn 升级成 team-lead,native `TeamCreate` +
 `Task` spawn teammates。**不切 session、不出 terminal、零 ccteam workflow.yaml 依赖**。
 
-## V0.5.0 skill family (you are here)
+## Skill 家族(本 skill 所处位置)
 
 | 意图 | Skill |
 |---|---|
@@ -94,7 +94,7 @@ kind 决策:
 
 **这一步禁止调 `TeamCreate` / `Task`** — 等用户回复。
 
-### 3.5 Codex critic teammate(F112 §D — 当 N ≥ 3 时自动加入)
+### 3.5 Codex critic teammate(当 N ≥ 3 时自动加入)
 
 When the parsed team size `N ≥ 3`, ccteam-team probes for the Codex
 CLI **once** per `/ccteam-team` invocation:
@@ -140,24 +140,14 @@ echo "codex-critic spawned (PID $!)"
 The team-lead session captures stdout/stderr to a temp file the
 synthesis loop polls for a `turn.completed` JSONL frame. **No tmux**
 — `codex exec --json` is one-shot process, output is captured
-directly. This bash-spawn path is the **only supported route** in
-V0.6.5; the spawn mechanics are guarded by
-`crates/ccteam-cli/tests/team_3reviewer_codex_critic_test.rs` (F156)
-against a stub codex via `$CCTEAM_CODEX_BIN`.
-
-**Daemon-routed variant (deferred)**: routing this spawn through the
-daemon's `CodexExecAdapter` (so cost accounting is unified with the
-F84 budget rollup) is a follow-up to F112 §D. The daemon-side
-`mcp__ccteam__advise_*` dispatch shipped via F152/F153 in V0.6.5;
-unifying the team-3-reviewer routing through it (with cost-accounting
-on top) is **explicitly deferred** to V0.7+ and tracked in the
-backlog.
+directly. This bash-spawn path is the only supported route for the
+Codex critic teammate.
 
 If `ccteam-imd` daemon is running and exposes
-`mcp__ccteam__advise_parallel` (shipped F153, V0.6.5), the skill MAY
-prefer that path instead — daemon-side cost rollup + persistent log.
-Detection: a previous turn in this session must have registered the
-MCP tool; otherwise stay on the direct Bash spawn.
+`mcp__ccteam__advise_parallel`, the skill MAY prefer that path
+instead — daemon-side cost rollup + persistent log. Detection: a
+previous turn in this session must have registered the MCP tool;
+otherwise stay on the direct Bash spawn.
 
 ### 4. 等用户回复
 
@@ -265,7 +255,7 @@ discoveries 需要新 task**。
 ## ccteam daemon + web 怎么配合
 
 本 skill 跟 ccteam daemon **完全解耦** — 不需要 `ccteam init` / `ccteam start <slug>`。
-daemon 通过 F95 全局 watcher 自动发现 `~/.claude/teams/<new-slug>/` 出现 → web `/teams`
+daemon 通过全局 watcher 自动发现 `~/.claude/teams/<new-slug>/` 出现 → web `/teams`
 tab 5s 内出现该 team 卡片(若 daemon 在跑)。
 
 用户只需要一次性:
@@ -280,10 +270,10 @@ ccteam start                        # 启 daemon(可选,纯 web 可视化用)
 ## Skill 不做什么(刻意省略)
 
 - **不写 `workflow.yaml`** — primary path 零 ccteam project 概念
-- **不修改 `.claude/settings.json`** — F94 hook 注入是 F93b advanced 专属
+- **不修改 `.claude/settings.json`** — hook 注入是 advanced(`ccteam init --mode agent-team`)专属
 - **不开 bg lead session** — 当前 session **就是** lead(用户关 session = 团队停,跟
   Anthropic / OMC native 行为一致)
-- **不管 cost cap** — Anthropic 自有 usage limit;F84 budget cap 只 advanced path 用
+- **不管 cost cap** — Anthropic 自有 usage limit;daemon-side budget cap 只 advanced path 用
 - **不写 `~/.claude/teams/` 或 `~/.claude/tasks/` 文件** — Anthropic SoT,只读
 - **不抄 OMC 5-stage pipeline**(`team-plan → team-prd → exec → verify → fix`)—
   ccteam 鼓励 shape-agnostic,pipeline / debate / parallel review / vote 都行,lead 自决
@@ -300,16 +290,13 @@ ccteam start                        # 启 daemon(可选,纯 web 可视化用)
 ## What this skill cannot do
 
 - 不能跨 session 跑 — 当前 session 关 / `claude` exit 后 team 也停。要 24×7 long-running
-  team,走 advanced path:`ccteam init --mode agent-team <slug>` + `ccteam start <slug>`(F93b)
+  team,走 advanced path:`ccteam init --mode agent-team <slug>` + `ccteam start <slug>`
 - 不能强制 plan approval gate — Claude session 一般在 user-turn 间不会"主动等";本 skill
   靠 Claude 看到"STOP, do NOT call Task yet"指令自觉停手。如发现绕过,要 fix skill body
 - 不能监控 cost — 用 `ccteam web` (`http://localhost:7331/teams/<slug>`) 或 `claude
   /cost` 看
 
-## Where to look in the repo
+## Sibling skills
 
-- `@docs/versions/v0-5-0/prd.md` §F93a — 本 skill 设计 SoT
-- `@docs/versions/v0-5-0/dev-plan.md` §"Primary path 闭环" — 实施细节
-- `@CLAUDE.md` §三 — 架构红线
 - `@skills/ccteam-control/SKILL.md` — sibling skill(管 daemon)
 - `@skills/ccteam-creator/SKILL.md` — sibling skill(创 workflow / 项目)

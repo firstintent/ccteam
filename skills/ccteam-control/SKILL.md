@@ -9,9 +9,9 @@ ccteam is an autonomous project orchestrator built on Claude Code.
 This skill makes ccteam reachable from any Claude session via the
 `ccteam` CLI + `mcp__ccteam__*` MCP tool surface.
 
-## V0.5.0 skill family (you are here)
+## Skill family (you are here)
 
-This skill is one of three shipped V0.5.0 skills. Pick by intent:
+Pick by intent:
 
 | Intent | Skill | Quick example |
 |---|---|---|
@@ -30,13 +30,12 @@ Claude session sees `mcp__ccteam__*` tools — call those first. The
 `Bash` + `--format json` path stays as a fallback for sessions where the
 MCP server isn't registered yet.
 
-**V0.4.6 F89 CLI surface reorg.** The top-level `ccteam` CLI exposes
-only user-facing commands (`init` / `start` / `stop` / `new` / `ls` /
+**CLI surface layout.** The top-level `ccteam` CLI exposes only
+user-facing commands (`init` / `start` / `stop` / `new` / `ls` /
 `status` / `show` / `doctor` / `web` / `remove`). Hook handlers and
 meta-agent integration points (`spawn` / `send` / `peek` / `attach` /
 `progress` / `resume` / `mcp-serve` / `hook`) live under `ccteam
-internal <subcmd>`. V0.5.0 dropped the legacy top-level aliases —
-prefer the new path:
+internal <subcmd>` — prefer the new path:
 
 ```bash
 ccteam internal peek <slug>          # was: ccteam peek <slug>
@@ -59,15 +58,15 @@ ccteam internal spawn <slug> <role>  # was: ccteam spawn <slug> <role>
 | Resume project                   | `mcp__ccteam__workflow_resume`            | `ccteam internal resume <slug>` |
 | Send NL to a session inbox       | `mcp__ccteam__workflow_send_to_session`   | `ccteam internal send <slug> "<body>"` (or write `.ccteam/inbox/msg-<ts>-NNN.md` directly) |
 | Inject a structured decision     | `mcp__ccteam__workflow_inject_decision`   | (compose body manually + send_to_session) |
-| **Change bot persona** (V0.6.1 F128)  | `mcp__ccteam__admin_change_persona` | `ccteam admin change-persona <slug> <bot> -` (full markdown via stdin) |
-| **Add tool to a bot** (V0.6.1 F128)   | `mcp__ccteam__admin_add_tool`     | `ccteam admin add-tool <slug> <bot> <ToolName>` |
+| **Change bot persona**          | `mcp__ccteam__admin_change_persona` | `ccteam admin change-persona <slug> <bot> -` (full markdown via stdin) |
+| **Add tool to a bot**           | `mcp__ccteam__admin_add_tool`     | `ccteam admin add-tool <slug> <bot> <ToolName>` |
 | Health checks                    | (Bash only)                      | `ccteam doctor --tool-surface` |
 | Install meta-agent               | (Bash only)                      | `ccteam doctor --install-meta-agent` |
 
-## V0.6.1 F128 — `change-persona` and `add-tool` subcommands
+## `change-persona` and `add-tool` subcommands
 
-Two new operations land in V0.6.1 to back the `/ccteam-control` slash
-forms documented in `docs/user-manual.md §2.4`:
+These operations back the `/ccteam-control` slash forms documented
+in `docs/user-manual.md §2.4`:
 
 ```
 /ccteam-control change-persona helper-bot "改成英文 + 更幽默"

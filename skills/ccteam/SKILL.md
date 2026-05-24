@@ -1,11 +1,11 @@
 ---
 name: ccteam
-description: ccteam 总入口 NL dispatcher。用户在 Claude session 内输入 `/ccteam <自然语言>` 触发,本 skill 把 NL 意图分类到 8 类(start-team / create-workflow / configure-im / monitor / code-scan / advise / status-debug / other)并路由到对应 sub-skill。Use when 用户说"起一个 team / 做个 TG 助理 bot / 跑 qa-loop / 看 ccteam 状态 / 扫一下代码 / 摸底新项目 / 投票决定 / second opinion / 暂停 X / 为啥撞 budget"等任何 ccteam 相关意图。所有 ship intent 对应实工 skill,不再有 placeholder fallback。
+description: ccteam 总入口 NL dispatcher。用户在 Claude session 内输入 `/ccteam <自然语言>` 触发,本 skill 把 NL 意图分类到 8 类(start-team / create-workflow / configure-im / monitor / code-scan / advise / status-debug / other)并路由到对应 sub-skill。Use when 用户说"起一个 team / 做个 TG 助理 bot / 跑 qa-loop / 看 ccteam 状态 / 扫一下代码 / 摸底新项目 / 投票决定 / second opinion / 暂停 X / 为啥撞 budget"等任何 ccteam 相关意图。所有已实现 intent 都对应真 sub-skill,不返回 placeholder fallback。
 ---
 
 # /ccteam — NL dispatcher
 
-V0.6.0 旗舰入口。用户**无需记多个 slash 名**,在 Claude session 内一句话描述需求,本 skill 自动判别意图 + 透传 NL 到对应 sub-skill。设计目标(详 `docs/versions/v0-6-0/prd.md` F113):
+旗舰入口。用户**无需记多个 slash 名**,在 Claude session 内一句话描述需求,本 skill 自动判别意图 + 透传 NL 到对应 sub-skill:
 
 - 用户说"我想做个 TG 助理 bot" → 路由 `/ccteam-creator` → Pocket Assistant preset
 - 用户说"fix all TS errors" → 路由 `/ccteam-team 3 "fix all TS errors"`
@@ -16,15 +16,15 @@ V0.6.0 旗舰入口。用户**无需记多个 slash 名**,在 Claude session 内
 
 ## skill 家族(本 skill 所处位置)
 
-| 用户意图 | Skill | 状态 |
-|---|---|---|
-| **(本 skill)总入口 NL dispatcher** | **`ccteam`** | **已 ship** |
-| 起临时 team 干活(in-session 多 teammate) | `ccteam-team` | 已 ship |
-| 起新项目 / workflow / chat bot 配方 | `ccteam-creator` | 已 ship |
-| 查项目状态 / pause / resume / 跨项目 ls | `ccteam-control` | 已 ship |
-| TG / Lark / Slack 一次性 token 绑定 | `ccteam-im-setup` | 已 ship |
-| Claude + Codex 并行 advisor + 投票 | `ccteam-advise` | 已 ship |
-| 扫代码摸底 / 大码库 audit | `ccteam-scan`(V0.6.2 F141 + V0.6.5 F157)| 已 ship |
+| 用户意图 | Skill |
+|---|---|
+| **(本 skill)总入口 NL dispatcher** | **`ccteam`** |
+| 起临时 team 干活(in-session 多 teammate) | `ccteam-team` |
+| 起新项目 / workflow / chat bot 配方 | `ccteam-creator` |
+| 查项目状态 / pause / resume / 跨项目 ls | `ccteam-control` |
+| TG / Lark / Slack 一次性 token 绑定 | `ccteam-im-setup` |
+| Claude + Codex 并行 advisor + 投票 | `ccteam-advise` |
+| 扫代码摸底 / 大码库 audit | `ccteam-scan` |
 
 ## When to invoke
 
@@ -97,16 +97,16 @@ V0.6.0 旗舰入口。用户**无需记多个 slash 名**,在 Claude session 内
 
 - **不直接调 MCP tool 或 Bash 命令** — 只做 NL 分类 + slash 路由;真正执行由 sub-skill 负责
 - **不维护多轮对话状态** — 一次 turn 做一次分类 + 路由;后续多轮归 sub-skill
-- **不做 voice / 图片 / 多模态 input**(V0.7+)
-- **不接受 skill 自定义注册** — 6 sub-skill 固定(team / creator / control / im-setup / advise / scan),用户不能 `/ccteam-add-skill <name>`(由 V0.6.0 PRD F113 §"不在范围"锁定)
+- **不做 voice / 图片 / 多模态 input**(text only)
+- **不接受 skill 自定义注册** — 6 sub-skill 固定(team / creator / control / im-setup / advise / scan),用户不能 `/ccteam-add-skill <name>`
 
-## Red line — 未实现 intent **直接隐藏不渲染**(V0.6.5 F159)
+## Red line — 未实现 intent **直接隐藏不渲染**
 
-任何尚未 ship 的 intent **必须直接从 dispatcher 表面消失**,不得以下列任一形式向用户暴露:
+任何尚未实现的 intent **必须直接从 dispatcher 表面消失**,不得以下列任一形式向用户暴露:
 
 - 路由表 / Step 1 意图表里出现该 intent 行
 - Step 3 fallback dialog 4-options 列出该 intent
-- "V0.7 即将支持" / "敬请期待" 等任何 forward-looking 文案
+- "即将支持" / "敬请期待" 等任何 forward-looking 文案
 - 路由到未实现 sub-skill 后由 sub-skill 报 "尚未实现"(这种 dead-end 是用户视角最差的体验)
 
 **Ship gate**:每个新 intent 进 dispatcher 前必须先确认 ──
@@ -115,24 +115,15 @@ V0.6.0 旗舰入口。用户**无需记多个 slash 名**,在 Claude session 内
 3. 真路径在 host probe 验过
 
 满足 3 条才把 intent 加进 Step 1 表 + Step 2 路由表 + Step 3 fallback 字母选项。Dispatcher
-4-options 动态按 NL 推断 + ship 状态选出最相关的 4 个(V0.6.5 ship 后 7 intent 全可见)。
+4-options 动态按 NL 推断挑出最相关的 4 个。新 intent 在落地前 4-options 表 / 路由表里**不能预占行**;落地当天才加进来。
 
-V0.6.6+ 新 intent ship 前 4-options 表 / 路由表里**不能预占行**;ship 当天才加进来。
+## Sibling skills
 
-## Where to look in the repo
-
-- `@docs/versions/v0-6-0/prd.md` — F113 完整需求 + 验收(dispatcher 初版)
-- `@docs/versions/v0-6-5/prd.md` — F157 code-scan intent 接入
-- `@docs/versions/v0-6-0/README.md` §三 — 用户面入口 + sub-skill 一览
 - `@skills/ccteam-team/SKILL.md` — start-team 详细行为
 - `@skills/ccteam-control/SKILL.md` — monitor / status-debug 详细行为
 - `@skills/ccteam-creator/SKILL.md` — create-workflow 详细行为
 - `@skills/ccteam-scan/SKILL.md` — code-scan 详细行为(quick + audit 两 mode)
-
-## 当前状态
-
-- ✅ frontmatter + 意图分类提示词 + 路由表 + fallback dialog 全落
-- ✅ `/ccteam-creator` / `/ccteam-im-setup` / `/ccteam-advise` / `/ccteam-scan` sub-skill body 均已 ship
-- ✅ 8 intents(7 work + 1 fallback)全部对应实工 skill,不再有 placeholder
+- `@skills/ccteam-im-setup/SKILL.md` — IM token onboarding
+- `@skills/ccteam-advise/SKILL.md` — Claude + Codex parallel advisor
 
 本 dispatcher 在所有 sub-skill 前面加一层 NL→slash 翻译,体验从"记多个 slash"→"说人话"。

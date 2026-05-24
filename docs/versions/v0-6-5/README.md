@@ -119,6 +119,7 @@ V0.6.0 立项 PRD 里 F108 / F112 / F113 / F114 / F117 都明确承诺过 Wave 2
 8. **CLAUDE.md §一 baseline 表更新到 V0.6.5 数字** + §四 skill 状态注释清理
 9. **`cargo run --release -- doctor`** 输出含 "MCP tool surface: 26 active, 0 stubs"(原 9 个 stub 全实现)
 10. **F148 / F157 / F162 / F163 / F164 host-probe 全部签字**(`docs/versions/v0-6-5/host-probe.md` 收齐每条 finding 一行 OK/Fail + log path)
+12. **skills 自洽 grep clean**:`grep -rnE "V\d+\.\d+\|docs/versions\|Wave [0-9]\|F[0-9]+[a-z]?\b\|F-Bug\|ship gate\|shipped" skills/*/SKILL.md` 全 0 命中
 
 ---
 
