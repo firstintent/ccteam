@@ -31,7 +31,7 @@
 | W1-T4 `cost-today-ledger` | `v066-w1-cost-today-ledger` | **F169** | 0.5 d | `nl_admin::cost_today` 重写接 `load_budget_ledger` + `sum_24h(vendor)` helper + budget cap warning + 4 test;ledger schema 与 F152 align(本 finding 第一步 read `<root>/cost-budget.json` 实际 shape) |
 | W1-T5 `doc-scrub` | `v066-w1-doc-scrub` | **F170** | 0.5 d | 4 个 doc-comment site 各 1-line patch(dashboard.rs:10 / team.rs:1503 / pricing.rs:51 / project_mcp_json.rs:18);#3 若发现 `Vendor` 未 re-export → 加 `pub use` 后再改 doc(扩 ~5 LOC);grep verify 0 命中 |
 | W1-T6 `doctor-verify-mcp` | `v066-w1-doctor-verify-mcp` | **F171** | 0.5 d | `--verify-mcp` flag + `run_verify_mcp` + `VerifyMcpReport` struct + static `STUB_TOOLS: &[&str] = &[]` const + 6 test(`doctor_verify_mcp_test.rs`);输出格式对齐 V0.6.5 ship gate item #9 措辞「MCP tool surface: 26 active, 0 stubs」 |
-| W1-T7 `chat-snapshot` | `v066-w1-chat-snapshot` | **F172** | 2.5 d | `chat_snapshot` event const + `build_chat_snapshot_event` helper + `SnapshotPolicy` + `BotSupervisor::maybe_snapshot` 在 `chat_turn_completed` hook 调 + daemon restart recovery flow + idempotent re-attach `recovery_applied_in_restart_cycle` BoolMap;**红线守**:不新建第 9 类业务 event(扩 chat-mode 子家族)/ 不主动 kill / 不 capture-pane(grep verify);29-30 test |
+| W1-T7 `claude-resume-by-name` | `v066-w1-claude-resume-by-name` | **F172 V2** | 0.5-1 d | `claude_tui::start_thread` spawn argv 加 `--name ccteam-chat-<slug>-<role>` deterministic 命名(Fresh path)+ F164 dead-pane recreate 路径 spawn `claude --resume <name>` lossless lookup(Recreate path)+ `--resume` 失败 fallback 走 Fresh + emit `chat_session_reset` event with reason 字段;**第一步必须** `claude --help` verify `--name` / `--resume` flag 存在 + 行为对齐(若漂移 → block + escalate 主会话);**红线守**:不加 progress.jsonl event(原 V1 `chat_snapshot` ditch)/ 不动 alive reattach (a) 路径 / 不 capture-pane / 不 synthesis prompt;`grep -rn "CHAT_SNAPSHOT\|chat_snapshot" crates/ccteam-core/src/progress.rs` 0 命中验;~8 test;**不动** F118 `session_recovery::build_recovery_prompt`(brand-new spawn 路径保留) |
 | W1-T8 `codex-critic-ledger` | `v066-w1-codex-critic-ledger` | **F173** | 2 d | `default_adapter_factory` Codex arm 改用 `CodexExecAdapter` + `orchestrator::adapter_for_chat` 同步 + `CodexExecAdapter::submit_turn` 加 ledger hook + `ccteam doctor` cost-orphan invariant + `skills/ccteam-team/SKILL.md` F156 文案改「shipped V0.6.6 F173」+ `daemon.rs:84` TODO marker 清(F168 #1 决断同 PR);**关键**:`turn.completed` JSONL 实际字段名 verify;`BudgetExceeded` hard-fail(不自动 bypass) |
 
 **并行启动:** T1-T8 day1 同时起,各自独立 worktree,不读其他 worktree 实现。
@@ -46,13 +46,13 @@
 4. **T3 F168**(1 d)→ 等 T4/T8 merge 后再 merge(避免 #1/#5 决断与 T4/T8 重复改)
 5. **T2 F167**(1 d)→ 独立
 6. **T1 F166**(1.5 d)→ 独立但需 tag 测,**最后 merge**(避免误触 release CI on intermediate tags)
-7. **T7 F172**(2.5 d,体量最大)→ 与 T8 时间重叠,但代码路径完全分离,无冲突;最后 merge
+7. **T7 F172 V2**(0.5-1 d,spawn argv 级改动)→ 仅动 `claude_tui::start_thread`,与其他 finding 代码路径完全分离;可任意时点 merge
 
 **冲突处理:** 任两个 PR rebase 冲突 → 主会话 dispatch 一个 fix-rebase subagent 处理,**不**让 worktree agent 自己解决跨-finding 冲突(防 context 污染)。
 
 ### Wave 1 验收(集成 gate)
 
-- `cargo test --workspace --locked --no-fail-fast` ≥ **1660 / 1**(1583 起点 + 各 finding 估算见 README §0)
+- `cargo test --workspace --locked --no-fail-fast` ≥ **1644 / 1**(1583 起点 + 各 finding 估算见 README §0;F172 V2 +8 替代原 +30)
 - `cargo clippy --workspace --all-targets --locked -- -D warnings` 0 命中
 - 每 finding `prd.md §F1XX` 验收段全过(各 PR 描述链接)
 - F168 决断列表(9 项 + 三档分类)写入 `docs/versions/v0-6-6/wave-1-handoff.md`(Decided / Rejected / Risks / Files / Remaining 五段固定,per V0.6.0 4-wave 范式)
@@ -69,12 +69,12 @@
 | Task | Owner | 内容 | Est. |
 |---|---|---|---|
 | doc-sync | doc-syncer subagent | CLAUDE.md §一 baseline 表更新(test pass count + workspace version + 当前最新版 + 上一版 + V0.6.x 延期候选);`docs/dev-coupling-audit.md` 加 F166-F173 索引段;`docs/versions/v0-6-6/wave-1-handoff.md` 5 段;`docs/versions/v0-6-6/host-probe.md` host-probe 模板 | 0.5 d |
-| host-probe | host-probe subagent on nas-box005 | F166 install.sh(fresh wipe → `curl ... \| sh` → version verify);F167 sensible defaults(`/ccteam-creator` 跑 monorepo + single repo + docs-only 三场景,verify yaml scope 段非空);F169 真 ledger(advise call → IM `cost today` 出真数);F170 grep 0 命中验;F171 `doctor --verify-mcp` PASS;F172 daemon restart recovery(10+ turn → `kill -TERM` → restart → 11th turn 引用早 turn);F173 Codex critic ledger(advise_vote claude+codex → `<root>/cost-budget.json` 含两 row);手动签字 → `host-probe.md` | 1 d |
+| host-probe | host-probe subagent on nas-box005 | F166 install.sh(fresh wipe → `curl ... \| sh` → version verify);F167 sensible defaults(`/ccteam-creator` 跑 monorepo + single repo + docs-only 三场景,verify yaml scope 段非空);F169 真 ledger(advise call → IM `cost today` 出真数);F170 grep 0 命中验;F171 `doctor --verify-mcp` PASS;F172 V2 daemon restart recovery(10+ turn → `tmux kill-session -t <ccteam-chat-name>` 模拟 dead pane → daemon Recreate 路径 spawn `claude --resume <name>` → 11th turn "刚才那个 X" 引用早 turn,模型 cache 续接);F173 Codex critic ledger(advise_vote claude+codex → `<root>/cost-budget.json` 含两 row);手动签字 → `host-probe.md` | 1 d |
 | version bump + tag | main session | `workspace.package.version` `0.6.5` → `0.6.6`;commit `v0.6.6: <summary>`;git tag `v0.6.6`;push tag → 触发 F166 release CI;verify GH Release 自动创建 + 4 个 artifact + SHA256SUMS | 0.3 d |
 
 ### Wave 2 ship gate(README §5 sync,15 项)
 
-1. ✅ baseline `≥1660/1`
+1. ✅ baseline `≥1644/1`
 2. ✅ clippy `-D warnings` clean
 3. ✅ F166 GH Actions release CI(tag push → 4-matrix build → release artifact 全齐)
 4. ✅ F166 install.sh nas-box005 真验
@@ -83,7 +83,7 @@
 7. ✅ F169 真 ledger 验(IM + CLI 同数字)
 8. ✅ F170 doc-comment scrub clean(`grep -rn "V0.3.3 cleanup\|F49 wires\|once Wave 2 lands\|Wave 2 wires it into the"` 0 命中)
 9. ✅ F171 `doctor --verify-mcp` PASS + 自动化 test 覆盖
-10. ✅ F172 daemon restart recovery host-probe + `grep -rn "tmux capture-pane"` 0 命中(红线守)
+10. ✅ F172 V2 daemon restart recovery host-probe(dead-pane recreate → `--resume <name>` lossless 续接)+ `grep -rn "tmux capture-pane\|CHAT_SNAPSHOT\|chat_snapshot" crates/ccteam-core/src/execution/claude_tui.rs crates/ccteam-core/src/progress.rs` 0 命中(红线守 + V1 chat_snapshot 设计未污染)
 11. ✅ F173 Codex critic ledger 真验 + `doctor` 无 cost-orphan + `skills/ccteam-team/SKILL.md` F156 文案 cleanup
 12. ✅ CLAUDE.md §一 baseline 表 V0.6.6 数字
 13. ✅ dev-coupling-audit.md F166-F173 索引补
@@ -104,7 +104,7 @@
 | 某 finding test 通不过 + 估算无法在 +0.5 d 内修 | 主会话 escalate 给用户 → 当场决策三档(EOL 删 / V0.7 显式 defer-with-justification / 加 +0.5 d 继续);**禁止**自动决定推 V0.6.7 |
 | 实际 grep TODO 数(F168)≠ 9 | 实数为准,wave-1-handoff 列实际数 + 全部决断;**禁止**对 spec 数字 freelance(per task block 模式) |
 | F170 实际 site ≠ 4 | 实数为准,标题改 "F170 scrub N sites"(per task block 模式) |
-| F172 设计与红线冲突(如必须新加第 9 类业务 event) | 立即停 + 通报 "v066 SPEC QUESTION: F172 设计 violates <红线>, 主会话需重审"(per task block 模式) |
+| F172 V2 `claude --help` 验 `--name` / `--resume` flag 不存在 / 漂移 / 行为不对齐 | 立即停 + 通报 "v066 SPEC QUESTION: F172 V2 Anthropic CLI `--name`/`--resume` <flag-status>, 主会话需重审"(per task block 模式)── 不假装 flag 存在跑下去 |
 | F173 F156 R8 cross-ref(V0.6.5 wave-2-handoff)实际不存在 | 立即停 + 通报(per task block 模式)── doc-first session 已 verify line 36 存在 R8(`docs/versions/v0-6-5/wave-2-handoff.md`),代码 PR 阶段若 wave-2-handoff 内容被改动须重审 |
 | nas-box005 host-probe 失败(网络 / 物理) | 主会话 dispatch retry(最多 2 次)+ 失败留 log;若硬体不可达 → ship gate 走 docker-based fallback verify(F166 install.sh 在 ubuntu:24.04 container 内跑) |
 
@@ -115,7 +115,7 @@
 | Wave | Tasks | 估算 | 并行 / 串行 |
 |---|---|---|---|
 | 0 (doc-first) | 本 PR | 0.05 d | 单 session |
-| 1 (8 worktree) | F166-F173 | max(各 finding 估算) ≈ **2.5 d**(F172 体量最大) | 8 worktree 并行 |
+| 1 (8 worktree) | F166-F173 | max(各 finding 估算) ≈ **2 d**(F173 体量最大;F172 V2 转 spawn argv 路线后 0.5-1 d) | 8 worktree 并行 |
 | 2 (doc-sync + host-probe + tag) | 收尾 | 1.5 d | 部分与 Wave 1 末段并行 |
 | **总** | | **~3 d**(并行)/ **~10 d**(串行单线) | |
 
@@ -133,7 +133,7 @@
 - **F169**:不破坏 ledger schema(只 read);若需 helper API 加,与 F173 共享
 - **F170**:纯 doc chore,行为零变化;若 #3 需 `pub use` 加,扩 ~5 LOC 不超
 - **F171**:不引入新 MCP tool(F171 是 CLI flag,不动 MCP 总数 26);STUB_TOOLS const 是 invariant 守门员
-- **F172**:**红线最严**:不新建第 9 类业务 event(扩 chat-mode 子家族)/ 不主动 kill / 不 capture-pane / recovery prompt 是 user prompt 形式不是 system prompt
+- **F172 V2**:借 Anthropic 官方 `claude --resume <name>` 接口(R10 直接守);**不**加 progress.jsonl event(原 V1 `chat_snapshot` 设计 ditch)/ **不**动 F164 alive reattach (a) 路径 / **不**主动 kill alive session / **不** capture-pane / **不**构造 history-synthesis prompt(Anthropic 自己 reload);F118 `build_recovery_prompt` 保留作 brand-new spawn 路径用,**不删不重构**;`--resume` 失败 user-visible fallback(emit `chat_session_reset` event with reason 字段),禁止 silent context 损失冒充 resume
 - **F173**:不动 F124 HumanApprovalAdapter scope(已 V0.7 defer);F156 SKILL.md 文案改「shipped」不留 alias;BudgetExceeded hard-fail 不 bypass
 
 ---

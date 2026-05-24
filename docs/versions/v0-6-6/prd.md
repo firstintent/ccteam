@@ -545,145 +545,118 @@ verdict: PASS — all 26 tools live, no production STUBs.
 
 ---
 
-## F172 — tmux mode-3 上下文恢复(`chat_snapshot` event)
+## F172 — tmux mode-3 上下文恢复(借 Anthropic 官方 `claude --resume <name>` 路径)
 
 **痛点:** 用户痛点 9 + 14。
-V0.6.5 F163(SIGTERM graceful)+ F164(tmux reattach)解决了「daemon 物理重启不丢 tmux session」,但 **chat bot 已累积的对话上下文若发生 tmux session 死亡(进程崩 / 物理重启 / OOM kill)只能走 F118 `session_recovery::build_recovery_prompt` 回放 last-N turns**。F172 加 proactive snapshotting,让 recovery 不只靠 turns.jsonl 重放,还能续上「最后一次 snapshot 起的增量」── 把长跑 bot 的 context 损失从「last-N turns」收缩到「last snapshot 起的新增 turn 数」。
+V0.6.5 F163(SIGTERM graceful)+ F164(tmux reattach 含 dead-pane recreate)解决了 daemon 物理重启:**alive session** 走 F164 (a) reattach,**dead pane** 走 F164 (b) recreate(kill stale tmux + spawn 新 claude)。但 **dead-pane recreate 路径目前 spawn 的是 brand-new `claude` 进程,上一段对话的 full API-level context 全丢** ── F118 `session_recovery::build_recovery_prompt` 是 brand-new spawn 路径的最佳努力(回放 last-N turns 作 user prompt),只能给 bot 看到「最近几轮 user/assistant 字面 text」,**模型内部的 tool-use 中间结果、已折叠的 plan、cache 状态、推理链全失**。
+
+F172 V2 的设计转向:**直接借 Anthropic 官方 `claude --resume <session-name>` 接口** ── Anthropic 自己把每个 session 的 full API-level context 存在 `~/.claude/projects/<encoded-cwd>/<sid>.jsonl`,官方 CLI 提供 `--name <name>` 显式命名 + `--resume <name>` lossless 取回;ccteam 给每个 chat bot 起 deterministic name `ccteam-chat-<slug>-<role>`,recreate 路径用 `--resume <name>` spawn 即可 ── 无需 ccteam 手工 synthesis,context 由 Anthropic 自己 reload。
 
 **现状缺口:**
-- F118 已落 `chat_session_reset_with_recovery` event + `session_recovery::build_recovery_prompt` ── 仅在 session-id invalidated(compaction failure / corruption)时触发,**不是周期性** + recovery prompt 是 last-N turn 回放,不包含 bot 内部 working memory / 已下决断 / 引用的中间 artifact。
-- progress.jsonl 现有 chat-mode 子事件家族(F108 / F118):`chat_session_started` / `chat_turn_user_prompt` / `chat_turn_completed` / `chat_session_reset` / `chat_session_reset_with_recovery` / `chat_compact_done` / `chat_hop_escalate` ── 都是「事件发生时记一笔」,无周期性 snapshot 概念。
-- daemon 重启 → `claude_tui::start_thread` 若 session alive → F164 reattach;若 session dead → F118 recovery 回放 last-N turns。**Loss**:重启窗口内的 in-pane working memory(已用的工具结果 / 已展开的 plan / mid-conversation TODO list)全失。
+- `crates/ccteam-core/src/execution/claude_tui.rs::start_thread` 现 spawn argv 是 `[<claude>, --dangerously-skip-permissions]`(line 267 / 275)── 无 `--name`,无 deterministic identity,Anthropic 内部按 fresh session 处理;recreate 后无法用任何官方接口 reload 上一段。
+- F164 dead-pane recreate 路径 (b) 直接 spawn 新 claude,F118 `build_recovery_prompt` 路径(brand-new spawn 用)是已有的"最佳努力",但**远不如 `--resume` 完整**。
+- daemon 重启 / OOM kill / 物理重启的灾害恢复语义:F164 解决了 tmux session 物理回到桌面,F172 V2 解决「再次开口时模型脑子里还有上次的东西」。
 
 **设计:**
 
 ### 红线核对(详 README §3)
 
-- **不**新建第 9 类业务 event:`chat_snapshot` 加入 chat-mode 子事件家族(与 F108 / F118 同 category),progress.jsonl SoT 红线守。
-- **不**主动 kill long session:snapshot 是非破坏旁路 dump,不触 tmux pane,不发 send-keys,不影响 bot 当前活动。
-- **不**解析 tmux 终端输出:snapshot 源 = `turns.jsonl`(F108 mirror)+ 既有 progress.jsonl event,不调 `tmux capture-pane`。
-- **不**注入 system prompt:recovery 时注入的是 user prompt 形式(对齐 F118 `build_recovery_prompt` 既有路径),`.claude/agents/<role>.md` 仍是 agent 行为唯一 SoT。
+- **不**新建任何 progress.jsonl event(原 V1 设计的 `chat_snapshot` event ditch)── SoT 红线零扩,F172 V2 完全 spawn-argv 级改动。
+- **不**主动 kill long session:recreate 路径只在 F164 探测到 dead pane 时触发(那是 orphan tmux,不是活 bot ── F164 已论证不算红线违反),alive session 完全不动。
+- **不**解析 tmux 终端输出:零涉 pane content;`--resume <name>` 读 Anthropic 自己的 session jsonl,不调 `tmux capture-pane`。
+- **不**注入 system prompt:Anthropic 自己 reload context,ccteam 不构造 history-synthesis prompt 也不向 pane push 任何 text;`.claude/agents/<role>.md` 仍是 agent 行为唯一 SoT。
+- **跨项目记忆走官方接口(R10 直接守)**:`--resume <name>` 是 Anthropic CLI 一等公民,等同 `--name` / `-c` 同族;ccteam 借而不替,不引入第二个 context store。
 
-### Sub-1:`chat_snapshot` event schema
+### Sub-1:spawn argv 加 deterministic `--name`
 
-`crates/ccteam-core/src/progress.rs` 加:
-
-```rust
-/// `chat_snapshot` — V0.6.6 F172: periodic context snapshot dumped by
-/// the BotSupervisor (mode-3 chat). Used by daemon-restart recovery
-/// path to rebuild context beyond the last-N-turns fallback in F118.
-///
-/// Cadence: every N turns OR every M minutes, whichever first
-/// (defaults N=10, M=30). Payload references turns.jsonl byte offset
-/// instead of inlining transcript to keep progress.jsonl scannable.
-pub const CHAT_SNAPSHOT: &str = "chat_snapshot";
-
-pub fn build_chat_snapshot_event(
-    role: &str,
-    turn_id_range: (String, String),  // (first_turn_id, last_turn_id)
-    turns_jsonl_byte_offset: u64,     // resume point in turns.jsonl
-    context_size_tokens: u32,         // approx tokens in window
-    triggers: SnapshotTriggers,       // Periodic { every_n_turns } | TimeElapsed | Manual
-) -> Value {
-    serde_json::json!({
-        "event": CHAT_SNAPSHOT,
-        "role": role,
-        "turn_id_range": [turn_id_range.0, turn_id_range.1],
-        "turns_jsonl_byte_offset": turns_jsonl_byte_offset,
-        "context_size_tokens": context_size_tokens,
-        "triggers": triggers,
-        "ts": Utc::now().to_rfc3339(),
-    })
-}
-```
-
-**关键 schema 设计**:
-- **turns_jsonl_byte_offset**:snapshot 不内联 transcript(避免 progress.jsonl 膨胀),只记 resume point;recovery 时 `seek(offset)` 即可 stream-read 后续 turn。
-- **context_size_tokens**:approx 计数(由 UnifiedTokenUsage 累加),帮 recovery 判断「context 已超模型窗口?要先 compact?」。
-- **triggers**:why-this-snapshot 元数据(便于 dashboard 显示)。
-
-### Sub-2:dump cadence
-
-`crates/ccteam-imd/src/supervisor.rs` `BotSupervisor` 加:
+`crates/ccteam-core/src/execution/claude_tui.rs::start_thread` (c) absent + (b) dead-pane recreate 后的 new-session spawn argv 改:
 
 ```rust
-pub struct SnapshotPolicy {
-    pub every_n_turns: u32,        // default 10
-    pub max_elapsed: Duration,     // default 30 min
-    pub max_context_tokens: u32,   // emergency snapshot when > 80% window
-}
+// Before:
+let argv: Vec<&str> = vec![&bin, "--dangerously-skip-permissions"];
 
-impl BotSupervisor {
-    async fn maybe_snapshot(&mut self, role: &str) {
-        let since_last = self.turns_since_last_snapshot(role);
-        let elapsed = self.elapsed_since_last_snapshot(role);
-        let tokens = self.approx_context_tokens(role);
-        let trigger = match (since_last, elapsed, tokens) {
-            (n, _, _) if n >= self.policy.every_n_turns => Some(...),
-            (_, e, _) if e >= self.policy.max_elapsed => Some(...),
-            (_, _, t) if t >= self.policy.max_context_tokens => Some(...),
-            _ => None,
-        };
-        if let Some(triggers) = trigger {
-            self.emit_snapshot_event(role, triggers).await;
-        }
-    }
-}
+// After (Sub-1 + Sub-2):
+let session_id_name = format!("ccteam-chat-{}-{}", ctx.slug, spec.role);
+let argv: Vec<&str> = match recreate_kind {
+    NewSession::Fresh => vec![
+        &bin, "--dangerously-skip-permissions",
+        "--name", &session_id_name,
+    ],
+    NewSession::Recreate => vec![
+        &bin, "--dangerously-skip-permissions",
+        "--resume", &session_id_name,
+    ],
+};
 ```
 
-`maybe_snapshot` 在 `chat_turn_completed` handler 末尾调(已是 BotSupervisor 现有 hook 点)。
+`NewSession` enum 区分两条 new-session 路径:
+- **Fresh**(F164 (c) absent + Sub-1):首次为 (slug, role) 启 bot,加 `--name` 让 Anthropic 把 session jsonl 落到 deterministic 名字下,以备未来 `--resume`。
+- **Recreate**(F164 (b) dead-pane + Sub-2):tmux session 已存在但 pane 死掉,先 kill stale tmux(F164 既有),再 spawn `claude --resume <name>` 让 Anthropic 自己 reload 上次 session jsonl。
 
-### Sub-3:daemon restart recovery flow
+### Sub-2:`--resume` 失败 fallback(信任 Anthropic + degraded fresh)
 
-`crates/ccteam-imd/src/daemon.rs` 起 daemon 时 per-bot 走:
+`--resume <name>` 若失败(name 对应 session jsonl 不存在 / corrupt / 用户 `~/.claude/projects/` 被清理 / Anthropic schema 变更),官方 CLI 行为是非零 exit。ccteam 探测后 fallback:
 
-```
-1. tail progress.jsonl(F164 既有)→ 找 latest chat_snapshot event for this role
-2. if found:
-   a. claude_tui::start_thread(role)
-      - F164 path: if tmux session alive → reattach
-      - else: spawn new + run recovery prompt
-   b. read turns.jsonl from snapshot.turns_jsonl_byte_offset onwards
-   c. compose recovery prompt:
-      "[ccteam recovery] Resuming after daemon restart.
-       Last snapshot at turn_id <last_turn_id>, ~<N> turns ago.
-       Recent turns since snapshot: <inline last 5 turns from byte offset>.
-       Please continue from where we left off."
-   d. push as user prompt to tmux pane(对齐 F118 既有路径)
-3. if no snapshot:fallback F118 build_recovery_prompt(last-N turns mode)
-4. emit chat_session_reset_with_recovery event(F118 既有,扩 payload 加 from_snapshot: true 字段)
-```
+- **不**走 F118 synthesis"假装 resume" ── 与"silent 上下文损失"等价,user-visible 行为是"bot 突然忘了前面",但 user 误以为 `--resume` 成功。F172 V2 红线:**fallback 必须 user-visible**。
+- **走 brand-new session**(同 Sub-1 Fresh 路径):新 spawn `claude --dangerously-skip-permissions --name <name>`(覆盖旧 name);progress.jsonl emit 既有 `chat_session_reset` event(F108)即可 ── user 在 IM / web 看到 reset 提示,知道 context 丢了,自己决定怎么续。
 
-### Sub-4:idempotent re-attach
+实现要点:`claude_tui::start_thread` 的 recreate 路径 spawn `claude --resume <name>` 失败 → fall through Fresh 路径 spawn `claude --name <name>` + emit `chat_session_reset` event(reason = `"resume_failed_fallback_to_fresh"`)。
 
-`chat_handle` 必须 idempotent:重复调 `start_thread(role)` 时:
-- 若 tmux session alive + snapshot already applied this restart cycle → no-op
-- 否则:走完整 recovery flow
+### Sub-3:F164 alive reattach 路径不动
 
-引入 per-role `recovery_applied_in_restart_cycle: BoolMap`(daemon 内存),重启时清空。
+F164 (a) alive reattach 走 `is_pane_running_claude(&session)` 探测 + 复用 tmux 同 pane 同进程 ── **不**涉 claude session jsonl,**不**涉 `--resume`,F172 V2 完全不动。
 
-### Sub-5:边界(防滚雪球)
+F172 V2 只动 (b) recreate + (c) absent 两条 new-session 路径。regression test 必须验 F164 alive 路径行为零变化。
 
-**F172 不做**:
-- 主动恢复 in-tmux-pane 用户已输入未发送的 input(不可观测,放弃)
-- 跨机器迁移 chat context(V0.7+ chat memory sync)
-- recovery 时自动 compact(用户决定)── 仅在 `context_size_tokens` 超 90% 阈值时 warn
+### Sub-4:F118 路径保留(brand-new spawn 用)
+
+`crates/ccteam-core/src/execution/session_recovery.rs::build_recovery_prompt` **不删** ── 现仍是合法路径:用户首次为 bot 启动时(无 `~/.claude/projects/` 历史 + 无 turns.jsonl 之前 record)虽然走 Sub-1 Fresh,但若用户操作如「ccteam wipe / 项目搬迁后再起」无法 resume,turns.jsonl 仍可作 last-N turn 回放(F118 既有)。
+
+F172 V2 与 F118 关系:
+- F118 = brand-new spawn 时的"基于 turns.jsonl 的 best-effort context seed"(已有,保留)
+- F172 V2 = recreate 时的"基于 Anthropic 官方 session jsonl 的 lossless restore"(新主路)
+
+两者**不冲突**:不同触发场景。
+
+### Sub-5:cwd 隔离与多 bot 共存
+
+`--name` 的 namespace 是 per-CWD(Anthropic `~/.claude/projects/<encoded-cwd>/` 已按 cwd 分目录)。ccteam 每个 chat bot spawn 时 `ctx.cwd` 已是 `<project>/.ccteam/chat/<bot>/` 类 per-bot subtree(详 V0.6 F108 决策),天然不冲突。
+
+但如果两个 bot 同 cwd(罕见但可能 ── 例如 `scope: ""` 配合 multi-role workflow),`ccteam-chat-<slug>-<role>` deterministic name 仍按 role 区分;Anthropic 内部按 `<cwd>:<name>` lookup,不会串。验收时需 cwd-collision integration test 守这一点。
+
+### Sub-6:边界(防滚雪球)
+
+**F172 V2 不做**:
+- 不加 progress.jsonl event(原 `chat_snapshot` 设计 ditch);若用户需 "context % 观测 / dashboard 续点显示" → V0.7 单独 finding,本版不在 F172 scope。
+- 不主动恢复 in-tmux-pane 用户已输入未发送的 input(不可观测,放弃)。
+- 不跨机器迁移 chat context(V0.7+ chat memory sync epic)。
+- 不动 F118 `build_recovery_prompt` 实现 ── F172 V2 是平行路径,不重构既有。
 
 **文件:**
-- 改:`crates/ccteam-core/src/progress.rs`(`CHAT_SNAPSHOT` const + `build_chat_snapshot_event` + `SnapshotTriggers` enum)、`crates/ccteam-core/src/execution/session_recovery.rs`(`build_recovery_prompt` 加 snapshot-aware overload)、`crates/ccteam-imd/src/supervisor.rs`(`SnapshotPolicy` + `maybe_snapshot`)、`crates/ccteam-imd/src/daemon.rs`(restart recovery flow)、`crates/ccteam-core/src/execution/claude_tui.rs`(idempotent re-attach)
-- 新:`crates/ccteam-imd/tests/chat_snapshot_test.rs`(periodic trigger / time elapsed trigger / token cap trigger)、`crates/ccteam-imd/tests/daemon_restart_recovery_test.rs`(snapshot exists / no snapshot fallback / idempotent re-attach / from_snapshot field set)
+- 改:`crates/ccteam-core/src/execution/claude_tui.rs::start_thread`(spawn argv `--name` / `--resume` 分支)
+- 改(若必要):`crates/ccteam-core/src/execution/claude_tui.rs` 引入 `chat_session_name_canonical` helper 与既有 `chat_session_name` 协调(后者是 tmux session 名,前者是 Anthropic `--name`)── 若 tmux 名已合法可复用,**不**额外引 helper(本 finding 决断:复用,以最小 diff 为准)
+- 新:`crates/ccteam-core/tests/claude_tui_resume_test.rs`(spawn argv `--name` / `--resume` 分支 unit,`--resume` 失败 fallback unit,F164 alive reattach regression guard 引用 / cwd-collision integration)
+- **不动**:`crates/ccteam-core/src/progress.rs`(无新 const)、`crates/ccteam-imd/src/supervisor.rs`(无 SnapshotPolicy)、`crates/ccteam-imd/src/daemon.rs`(无 restart recovery flow)、`crates/ccteam-core/src/execution/session_recovery.rs`(F118 路径保留不重构)
 
 **验收:**
-- 测试 +~30 全通(snapshot 8 + recovery 12 + idempotent 4 + progress event helper 6)
-- nas-box005 host-probe:跑 mode-3 chat ≥10 turn → progress.jsonl 有 ≥1 `chat_snapshot` event(periodic trigger);`kill -TERM` daemon → `ccteam start` → 第 11 turn 输入 "continue from where we left off" → bot reply 引用早 turn 内容(测试人确认语义续接);progress.jsonl 含 `chat_session_reset_with_recovery` event with `from_snapshot: true`
+- 测试 +~8 全通,分项:
+  - `start_thread` Fresh path spawn argv 含 `--name ccteam-chat-<slug>-<role>` (unit, ~1 test)
+  - `start_thread` Recreate path spawn argv 含 `--resume ccteam-chat-<slug>-<role>` (unit, ~1 test)
+  - `--resume` 失败 → fallback to Fresh + emit `chat_session_reset` event with `reason="resume_failed_fallback_to_fresh"` (unit, ~2 test)
+  - F164 alive reattach 路径不受影响(regression guard, reuse F164 既有 test 形态, ~1 test)
+  - cwd-collision:同 cwd 两 bot 各自 `--name` 独立 resume 不串扰 (integration, ~1 test, 可 stub `CCTEAM_CLAUDE_BIN` 验 argv)
+  - daemon restart cycle 后 bot 仍能 "刚才那个 X 怎么样" 风格 message(integration, stub claude bin echoing argv to log, ~1 test)
+  - F118 `build_recovery_prompt` 仍存(brand-new spawn 路径未破)── regression guard (1 test 可复用既有 F118 test)
+- nas-box005 host-probe:跑 mode-3 chat bot ≥10 turn → `tmux kill-session -t <ccteam-chat-name>`(模拟 dead pane)→ daemon 探测 dead → `start_thread` 走 Recreate 路径 spawn `claude --resume <name>` → 第 11 turn 输入「刚才那个 X 怎么样」→ bot reply 直接引用早 turn 内容(测试人确认 semantic 续接,**不是** F118 last-N 字面回放,而是模型脑子里真有 cache);**手动签字** → `docs/versions/v0-6-6/host-probe.md`
 - baseline 不退
-- 红线核对:`grep -rn "tmux capture-pane" crates/ccteam-core/src/execution/session_recovery.rs crates/ccteam-imd/src/supervisor.rs crates/ccteam-imd/src/daemon.rs` 0 命中
+- 红线核对:`grep -rn "tmux capture-pane" crates/ccteam-core/src/execution/claude_tui.rs` 0 命中;`grep -rn "CHAT_SNAPSHOT\|chat_snapshot" crates/ccteam-core/src/progress.rs` 0 命中(原 V1 设计未污染 progress event 表)
 
 **风险:**
-- snapshot 频率过高 → progress.jsonl 膨胀 ── mitigate:默认 every-10-turns OR 30-min,benchmark 实测 < 100 line/day per active bot
-- recovery prompt 过长 → 浪费 context 窗口 ── mitigate:Sub-3 只 inline "since snapshot" 部分(typically 1-9 turns 间隔),完整历史在 turns.jsonl 由 LLM 按需 grep
-- byte_offset 失效(若 turns.jsonl 被外部 truncate)── mitigate:recovery flow 验 offset 在文件长度内,若否 fallback F118 build_recovery_prompt(last-N) + emit warning
-- 与 V0.6.5 F164 `start_thread` reattach 行为耦合 ── mitigate:F172 Sub-4 idempotent guard 独立 BoolMap,不影响 F164 alive-session 探测;严格区分 "session alive but no recovery applied yet"(走 recovery)vs "session alive + recovery already done"(no-op)
+- Anthropic `--name` / `--resume` CLI flag 漂移(未来 minor 改名 / 改语义)── mitigate:本 finding W1 第一步 verify `claude --help | grep -E 'name|resume'` 实测;若 flag 缺失 / 不同 → block subagent + escalate 主会话(per task block 模式);若 flag 存在 + 行为对齐 → 走;由 `CCTEAM_CLAUDE_BIN` env override 让测试不依赖真实 claude
+- `~/.claude/projects/<encoded-cwd>/<sid>.jsonl` 路径或编码方式变(我方对此存储无 schema 责任,但 `--resume` 是接口契约)── mitigate:ccteam 完全不读 / 不写 / 不假设这个文件路径,只走 `--resume <name>` CLI 接口;Anthropic 内部存储改了 CLI 行为不变即可
+- `--resume` 在 daemon 重启窗口期 spawn 可能比 fresh 多 ~3-5s(读 jsonl + 重建 cache 状态)── mitigate:user 已知"重启恢复"语义,慢一点合理;dashboard 可 V0.7 加 "resuming..." 提示但本版不做
+- cwd-collision 罕见场景未充分覆盖 ── mitigate:integration test 显式守;后续 V0.7 若大型 monorepo 共 cwd 模式普及再扩
+- F164 alive reattach regression 风险(spawn argv 修改如果污染 alive 路径)── mitigate:严格隔离 ── 改动仅在 (b) 与 (c) 两个 spawn 点,(a) reattach 完全不进 argv 构造代码;regression test 守
 
 ---
 
@@ -811,7 +784,7 @@ F168 (TODO sweep)                    ─┤  与 F169 + F170 + F173 有 site-ove
 F169 (cost_today ledger)             ─┤  → F168 #5 决断同 PR
 F170 (doc scrub)                     ─┤  → F168 #7 决断同 PR
 F171 (doctor --verify-mcp)           ─┤
-F172 (chat_snapshot)                 ─┤
+F172 (claude --resume by name)       ─┤
 F173 (Codex critic ledger)           ─┘  → F168 #1 决断同 PR + 与 F169 共享 ledger schema(F169 read,F173 write)
 
 site-overlap 处理:每 PR review 时主会话(dispatch agent)负责 cross-check;
