@@ -669,11 +669,14 @@ impl Orchestrator {
                 Some(Arc::new(ClaudeTuiAdapter::new()) as Arc<dyn HarnessAdapter + Send + Sync>)
             }
             (Executor::Codex, WorkflowMode::Chat) => {
-                // CodexAppServerAdapter ships with Wave 3 codex-exec-impl
-                // teammate; until that lands, fall back to the bg adapter
-                // so the dispatch table never returns None for a known
-                // (vendor, mode) pair.
-                self.adapter_for(Executor::Codex).cloned()
+                // F173 — Codex chat bots route through `CodexExecAdapter`
+                // (per-turn `codex exec --json` subprocess + advise
+                // ledger hook in `submit_turn`). Always-fresh-handle
+                // keeps the dispatch table from returning None for a
+                // known `(vendor, mode)` pair, and matches the daemon's
+                // `default_adapter_factory` so chat / bg / critic spawn
+                // paths all funnel cost into the same ledger.
+                Some(Arc::new(CodexExecAdapter::new()) as Arc<dyn HarnessAdapter + Send + Sync>)
             }
             (_, WorkflowMode::HumanApproval) => {
                 // V0.6.1 F124 narrow scope — `mode: human-approval`
@@ -2151,12 +2154,8 @@ impl Orchestrator {
             // up the project dir for this slug (and degrade gracefully
             // when it can't be resolved or no handoffs exist).
             let project_dir = self.paths.project_dir(slug);
-            let trace = handoff::read_concat(
-                &project_dir,
-                slug,
-                handoff::DEFAULT_INCLUDE_LAST_N,
-            )
-            .unwrap_or_default();
+            let trace = handoff::read_concat(&project_dir, slug, handoff::DEFAULT_INCLUDE_LAST_N)
+                .unwrap_or_default();
             let mut body = format!(
                 "role `{}` failed to spawn {} consecutive times — orchestrator escalating \
                  per fix-loop 3-strike rule.",

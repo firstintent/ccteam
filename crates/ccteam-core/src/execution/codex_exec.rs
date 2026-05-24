@@ -41,6 +41,10 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, Mutex};
 
+use crate::advise::{
+    append_budget_ledger_row, load_budget_ledger, sum_advise_today, APPROX_COST_PER_CALL_USD,
+    DEFAULT_ADVISE_BUDGET_USD_24H,
+};
 use crate::execution::codex_app_server::CODEX_BIN_ENV;
 use crate::harness::{
     pluck_f64, pluck_pct, pluck_str, AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter,
@@ -210,30 +214,31 @@ impl HarnessAdapter for CodexExecAdapter {
         let extra_args = ctx.extra_args.clone();
         let sid = ctx.sid.clone();
 
-        let result = tokio::task::spawn_blocking(move || -> Result<(String, Option<u32>), HarnessError> {
-            let session = TmuxSession::from_name(session_name.clone());
-            if session.exists() {
-                return Err(HarnessError::SpawnFailed(format!(
-                    "tmux session already exists: {session_name} \
+        let result =
+            tokio::task::spawn_blocking(move || -> Result<(String, Option<u32>), HarnessError> {
+                let session = TmuxSession::from_name(session_name.clone());
+                if session.exists() {
+                    return Err(HarnessError::SpawnFailed(format!(
+                        "tmux session already exists: {session_name} \
                      (sid collision; F49 next_sid_seq accounting drifted)"
-                )));
-            }
-            let mut argv: Vec<String> = vec!["codex".to_string()];
-            argv.extend(extra_args.iter().cloned());
-            let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-            session
-                .start(&cwd, &argv_refs)
-                .map_err(|err| HarnessError::SpawnFailed(format!("tmux new-session: {err:#}")))?;
-            let pid = session
-                .pane_pid()
-                .ok()
-                .flatten()
-                .and_then(|n| u32::try_from(n).ok());
-            CodexExecAdapter::write_initial_state(&sid, pid);
-            Ok((session_name, pid))
-        })
-        .await
-        .map_err(|err| HarnessError::SpawnFailed(format!("join blocking spawn: {err}")))??;
+                    )));
+                }
+                let mut argv: Vec<String> = vec!["codex".to_string()];
+                argv.extend(extra_args.iter().cloned());
+                let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+                session.start(&cwd, &argv_refs).map_err(|err| {
+                    HarnessError::SpawnFailed(format!("tmux new-session: {err:#}"))
+                })?;
+                let pid = session
+                    .pane_pid()
+                    .ok()
+                    .flatten()
+                    .and_then(|n| u32::try_from(n).ok());
+                CodexExecAdapter::write_initial_state(&sid, pid);
+                Ok((session_name, pid))
+            })
+            .await
+            .map_err(|err| HarnessError::SpawnFailed(format!("join blocking spawn: {err}")))??;
 
         let (session_name, pid) = result;
         let mut extras = serde_json::json!({ "tmux_session": session_name });
@@ -268,6 +273,40 @@ impl HarnessAdapter for CodexExecAdapter {
                     .unwrap_or(&h.identity)
                     .to_string()
             });
+
+        // F173 — Codex daemon-routed critic + unified cost rollup.
+        // Pre-turn budget check + post-turn ledger row keep every
+        // Codex call (chat bot, critic, advise_*) on the same
+        // `<ccteam_root>/cost-budget.json` SoT, so `@ccteam cost today`
+        // and `ccteam doctor --check-cost-orphan` can reconcile vendor
+        // calls against ledger rows without leaks.
+        //
+        // The hook only fires when **`CCTEAM_HOME` is explicitly set**
+        // (matching production `ccteam start` / `ccteam doctor` flows
+        // where `CcteamPaths::from_env()` is always invoked beforehand).
+        // This intentionally degrades to a no-op in raw `cargo test`
+        // contexts where `CCTEAM_HOME` is unset — those test runners
+        // would otherwise scribble into the developer's real
+        // `~/.ccteam/cost-budget.json`. Production paths always set the
+        // env (the `ccteam` CLI binary resolves `CcteamPaths::from_env`
+        // at startup; `ccteam-imd` daemon inherits the env from the
+        // parent shell).
+        let ccteam_root_for_budget: Option<std::path::PathBuf> = std::env::var("CCTEAM_HOME")
+            .ok()
+            .map(std::path::PathBuf::from);
+        if let Some(root) = &ccteam_root_for_budget {
+            let pre_spent = load_budget_ledger(root)
+                .map(|l| sum_advise_today(&l))
+                .unwrap_or(0.0);
+            if pre_spent >= DEFAULT_ADVISE_BUDGET_USD_24H {
+                return Err(HarnessError::SubmitFailed(format!(
+                    "budget_exceeded: codex 24h spend ({pre_spent:.4} USD) ≥ cap \
+                     ({:.4} USD); raise cap or wait for ledger GC",
+                    DEFAULT_ADVISE_BUDGET_USD_24H
+                )));
+            }
+        }
+
         let argv = build_exec_argv(resume_id.as_deref());
         let bin = Self::codex_bin();
         let tx = self.channel_for(&h.identity).await;
@@ -279,9 +318,7 @@ impl HarnessAdapter for CodexExecAdapter {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|err| {
-                HarnessError::SubmitFailed(format!("spawn {bin} {argv:?}: {err}"))
-            })?;
+            .map_err(|err| HarnessError::SubmitFailed(format!("spawn {bin} {argv:?}: {err}")))?;
 
         if let Some(mut stdin) = child.stdin.take() {
             let prompt_clone = prompt.clone();
@@ -301,12 +338,22 @@ impl HarnessAdapter for CodexExecAdapter {
         // Spawn a reader task that translates JSONL → ThreadEvent and
         // pushes into the per-thread broadcast. Detached — the events()
         // stream is the synchronisation point for callers that care.
+        //
+        // F173 — on TurnCompleted (or fallback success), append one
+        // ledger row to `<ccteam_root>/cost-budget.json`. We charge the
+        // flat [`APPROX_COST_PER_CALL_USD`] estimate (parity with
+        // advise_* paths) regardless of whether the JSONL stream
+        // exposed a usage block, so the cost-orphan invariant
+        // (every Codex turn ↔ one ledger row in 24h) holds even when
+        // `turn.completed.usage` is missing.
         let turn_id_for_task = turn_id.clone();
         let tx_for_task = tx.clone();
+        let ccteam_root_for_task = ccteam_root_for_budget.clone();
         tokio::spawn(async move {
             let buf = BufReader::new(stdout);
             let mut lines = buf.lines();
             let mut saw_completion = false;
+            let mut completion_ok = false;
             loop {
                 match lines.next_line().await {
                     Ok(Some(line)) => {
@@ -317,11 +364,10 @@ impl HarnessAdapter for CodexExecAdapter {
                         match serde_json::from_str::<Value>(trimmed) {
                             Ok(v) => {
                                 for evt in translate_jsonl_event(&v, &turn_id_for_task) {
-                                    if matches!(
-                                        evt,
-                                        ThreadEvent::TurnCompleted { .. }
-                                            | ThreadEvent::TurnFailed { .. }
-                                    ) {
+                                    if matches!(evt, ThreadEvent::TurnCompleted { .. }) {
+                                        saw_completion = true;
+                                        completion_ok = true;
+                                    } else if matches!(evt, ThreadEvent::TurnFailed { .. }) {
                                         saw_completion = true;
                                     }
                                     let _ = tx_for_task.send(evt);
@@ -347,6 +393,7 @@ impl HarnessAdapter for CodexExecAdapter {
             if !saw_completion {
                 match status {
                     Ok(s) if s.success() => {
+                        completion_ok = true;
                         let _ = tx_for_task.send(ThreadEvent::TurnCompleted {
                             turn_id: turn_id_for_task.0.clone(),
                             usage: UnifiedTokenUsage::default(),
@@ -372,6 +419,21 @@ impl HarnessAdapter for CodexExecAdapter {
                                 message: err.to_string(),
                             },
                         });
+                    }
+                }
+            }
+            // F173 — record ledger row on success only. Failed turns
+            // don't bill the operator; doctor's cost-orphan invariant
+            // counts only successful `agent_done` events for parity.
+            if completion_ok {
+                if let Some(root) = &ccteam_root_for_task {
+                    if let Err(err) =
+                        append_budget_ledger_row(root, AgentVendor::Codex, APPROX_COST_PER_CALL_USD)
+                    {
+                        tracing::warn!(
+                            error = %err,
+                            "codex exec: failed to append ledger row (cost rollup leak)"
+                        );
                     }
                 }
             }

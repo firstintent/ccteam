@@ -110,11 +110,13 @@ pub use actions::{
 // V0.6.5 F152 + F153 — advise_vote / advise_parallel entry points
 // (used by the `mcp__ccteam__advise_*` MCP dispatch in ccteam-cli).
 pub use advise::{
-    advise_parallel, advise_vote, append_budget_sample as append_advise_budget_sample,
+    advise_parallel, advise_vote, append_budget_ledger_row,
+    append_budget_sample as append_advise_budget_sample,
     budget_ledger_path as advise_budget_ledger_path, load_budget_ledger as load_advise_budget,
     sum_advise_today, sum_advise_today_by_vendor, AdviseBudgetLedger, AdviseError, Agreement,
     AnswerStatus, BudgetSample, BudgetSnapshot, CodexStatus, ParallelResult, VendorAnswer,
-    VoteResult, DEFAULT_ADVISE_BUDGET_USD_24H, DEFAULT_CODEX_TIMEOUT_SECS,
+    VoteResult, APPROX_COST_PER_CALL_USD as APPROX_ADVISE_COST_USD,
+    DEFAULT_ADVISE_BUDGET_USD_24H, DEFAULT_CODEX_TIMEOUT_SECS,
 };
 pub use auto_loop::{AutoLoopDecision, AutoLoopFrontMatter, AutoLoopState};
 pub use claude_job::{
@@ -207,8 +209,8 @@ pub use ccteam_cost::{
 };
 pub use mode_inferrer::{infer_mode, CreatorMode, InferenceResult, Intent, Presence, Timeline};
 pub use progress::{
-    current_agent_sessions, escalation_count, workflow_cost_total, AgentSessionStatus,
-    AgentSessionSummary,
+    current_agent_sessions, escalation_count, read_all_events, workflow_cost_total,
+    AgentSessionStatus, AgentSessionSummary,
 };
 pub use projects::{
     bootstrap_project, bootstrap_project_at_dir, pick_unused_slug, pick_unused_slug_verbatim,

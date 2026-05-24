@@ -1790,6 +1790,27 @@ fn human_approval_watch_spec(
     spec
 }
 
+/// V0.6.6 F173 — `pick_adapter` for `(Codex, Chat)` returns a real
+/// `CodexExecAdapter` (Codex vendor), not the prior Wave-3 placeholder
+/// that fell back to the bg adapter. Pins the unified-cost-rollup
+/// invariant: every Codex chat-mode spawn must route through the
+/// adapter whose `submit_turn` appends a `cost-budget.json` row.
+#[tokio::test]
+async fn t30b_f173_pick_adapter_codex_chat_returns_codex_vendor() {
+    use ccteam_core::harness::AgentVendor;
+    use ccteam_core::workflow::WorkflowMode;
+    let (_pr, _cr, _pdir, paths, _progress, _slug) = make_project(YAML_WATCH_FIXER);
+    let (orch, _claude_mock, _codex_mock) = build_orchestrator(paths);
+    let picked = orch
+        .pick_adapter(Executor::Codex, WorkflowMode::Chat)
+        .expect("(Codex, Chat) must resolve a real Codex adapter");
+    assert_eq!(
+        picked.vendor(),
+        AgentVendor::Codex,
+        "F173: (Codex, Chat) must return a Codex-vendor adapter"
+    );
+}
+
 /// F124 — `pick_adapter` for `mode: human-approval` falls back to
 /// the per-executor bg/exec default adapter (the HITL gate is
 /// orchestrator-side, not adapter-side).

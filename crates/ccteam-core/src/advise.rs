@@ -65,7 +65,7 @@ use crate::harness::{AgentVendor, CLAUDE_BIN_ENV};
 /// roundtrip → ~0.005 USD per advisor call. Conservative enough that
 /// the V0.6.5 default cap (`DEFAULT_ADVISE_BUDGET_USD_24H`) keeps
 /// hundreds of calls/day workable while preventing runaway loops.
-const APPROX_COST_PER_CALL_USD: f64 = 0.005;
+pub const APPROX_COST_PER_CALL_USD: f64 = 0.005;
 
 /// V0.6.5 F152 — fallback rolling 24h cap on advise calls when no
 /// per-vendor cap is supplied at MCP invocation time. 0.50 USD = 100
@@ -823,6 +823,21 @@ pub fn append_budget_sample(
         ))
     })?;
     Ok(())
+}
+
+/// V0.6.6 F173 — typed alias for [`append_budget_sample`] used by
+/// non-advise adapter ledger hooks (e.g. `CodexExecAdapter::submit_turn`'s
+/// per-turn rollup). The function body is identical; the alias exists
+/// so calling code documents intent ("vendor adapter recording a
+/// ledger row" vs. "advise call sampling cost"), and so future
+/// per-call-site policy (e.g. separate cap for vendor adapter vs.
+/// advise) can diverge without a sed-sweep.
+pub fn append_budget_ledger_row(
+    ccteam_root: &Path,
+    vendor: AgentVendor,
+    usd: f64,
+) -> Result<(), AdviseError> {
+    append_budget_sample(ccteam_root, vendor, usd)
 }
 
 /// Sum advise spend over the last 24h (regardless of vendor).
