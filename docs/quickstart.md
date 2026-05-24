@@ -129,7 +129,7 @@ ccteam --version    # 应输出当前版本号
 
 默认装到 `~/.local/bin/ccteam`。装完如果该路径不在 `$PATH`,脚本会打印一行 export 指令(贴进 `~/.bashrc` / `~/.zshrc` 再 `source` 即可)。
 
-支持的平台:Linux x86_64、macOS arm64(Apple Silicon)、macOS x86_64(Intel)。Windows 用户直接到 [Releases 页面](https://github.com/firstintent/ccteam/releases)下载 `windows-x64.zip` 解压(`install.sh` 是 POSIX 脚本,不跑 Windows)。
+支持的平台:Linux x86_64、macOS arm64(Apple Silicon)、macOS x86_64(Intel)。Windows 用户走 WSL2 + linux-x64 binary —— native Windows 不支持(tmux + inotify + POSIX signals 是 ccteam 架构根基)。
 
 环境变量:
 - `CCTEAM_INSTALL_DIR=/usr/local/bin sh install.sh` —— 改装目录(系统级安装)

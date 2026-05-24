@@ -11,7 +11,8 @@
 #   * No sudo. Writes to $HOME/.local/bin by default.
 #   * Override target dir: CCTEAM_INSTALL_DIR=/usr/local/bin sh install.sh
 #   * Override tag (CI / pin): CCTEAM_VERSION=v0.6.6 sh install.sh
-#   * Windows is not supported — use the GitHub Releases page (zip).
+#   * Windows is not supported — run ccteam under WSL2 and use the
+#     linux-x64 binary (tmux + inotify + POSIX signals are foundational).
 #
 # Usage:
 #   curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh | sh
