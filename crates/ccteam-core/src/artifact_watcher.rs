@@ -580,11 +580,25 @@ impl AgentTeamsWatcher {
                     return;
                 }
                 // Bounded wait: either we get an inotify event, or
-                // we time out and rerun discovery if due.
-                let timeout = config
+                // we time out and rerun discovery if due. V0.6.5 F163
+                // retro — the wait is **capped** at
+                // `WATCHER_SHUTDOWN_POLL` (500ms) so the cancel-flag
+                // check at the top of the loop fires within half a
+                // second of graceful shutdown. The earlier code used
+                // `.max(WATCHER_SHUTDOWN_POLL)` which made the floor
+                // `WATCHER_SHUTDOWN_POLL` but left the ceiling at the
+                // full `discovery_interval` (60s), so a daemon SIGTERM
+                // could sit blocked inside `recv_timeout` for up to a
+                // full minute — long enough that
+                // `BlockingPool::shutdown(None)` blocked the process
+                // past the operator's SIGKILL patience. Discovery still
+                // happens at `discovery_interval` cadence via the
+                // `last_discovery.elapsed() >= discovery_interval`
+                // check below; we just sample more often.
+                let remaining = config
                     .discovery_interval
-                    .saturating_sub(last_discovery.elapsed())
-                    .max(WATCHER_SHUTDOWN_POLL);
+                    .saturating_sub(last_discovery.elapsed());
+                let timeout = remaining.min(WATCHER_SHUTDOWN_POLL);
                 let recv = event_rx.recv_timeout(timeout);
                 match recv {
                     Ok(Ok(ev)) => {
