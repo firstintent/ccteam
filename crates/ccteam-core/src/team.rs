@@ -1499,8 +1499,8 @@ mod tests {
 
     #[test]
     fn f47_sessions_field_parses_codex_harness() {
-        // F47 ship: schema accepts `harness: codex` even though spawn
-        // is still NotImplemented. F49 wires the runtime path.
+        // Schema test: `harness: codex` parsing (F47 schema + F49
+        // runtime path, both shipped V0.4.x).
         let src = concat!(
             "name: my-flex\n",
             "sessions:\n",

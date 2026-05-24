@@ -6,8 +6,7 @@
 //!
 //! `templates/base.html` stays in-repo as an askama SSR fallback per
 //! the V0.3.2 PRD §F59 wording. Static htmx / xterm / `style.css`
-//! assets are still served by `routes/assets.rs` for one more release —
-//! see the TODO marker there for V0.3.3 cleanup.
+//! assets are still served by `routes/assets.rs`.
 
 use axum::{
     http::{header, StatusCode},
