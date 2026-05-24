@@ -21,11 +21,12 @@ agents:
   planner:
     trigger: manual
     max_parallel: 1
-
+{{scope_yaml}}
   executor:
     trigger: watch:.ccteam/inbox/executor
     max_parallel: 1
-
+{{scope_yaml}}
   critic:
     trigger: watch:.ccteam/inbox/critic
     max_parallel: 1
+{{scope_yaml}}

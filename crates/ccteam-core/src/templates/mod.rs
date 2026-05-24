@@ -33,10 +33,27 @@ pub use project_mcp_json::{
 // `<project>/.ccteam/workflow.yaml`.
 pub mod workflow_templates;
 pub use workflow_templates::{
+    apply_probe_defaults as apply_probe_defaults_to_workflow_ctx,
     default_ctx as default_workflow_ctx, render as render_workflow_template,
     Preset as WorkflowPreset, RenderError as WorkflowTemplateRenderError,
     TemplateCtx as WorkflowTemplateCtx,
 };
+
+// V0.6.6 F167 note: there is no separate `render_workflow_template_with_probe`
+// function. Callers build the ctx, then call
+// `apply_probe_defaults_to_workflow_ctx(&mut ctx, preset, &probe)` to
+// overlay sensible defaults, then call `render_workflow_template` as
+// usual. This keeps the render entry point single + strict, and lets
+// callers stack their own ctx overrides between the probe overlay and
+// the render call.
+
+// V0.6.6 F167 — project-type probe for `/ccteam-creator` sensible
+// defaults. Surfaces ProjectKind / languages / probable_scope from a
+// file-existence sweep so the skill's PROJECT PLAN can pre-populate
+// the rendered workflow.yaml's `scope:` field instead of shipping a
+// generic stub the user has to hand-edit before first run.
+pub mod project_probe;
+pub use project_probe::{probe as probe_project, Language, ProjectKind, ProjectProbe};
 
 /// Per-project `.claude/settings.json` template.
 ///
@@ -60,8 +77,7 @@ pub const PROJECT_SETTINGS_JSON: &str = include_str!("settings.json");
 /// new hook entries: `TeammateIdle`, `TaskCreated`, `TaskCompleted`.
 /// Used only by `ccteam init --mode agent-team` (per PRD F94 红线:
 /// advanced path only).
-pub const PROJECT_SETTINGS_AGENT_TEAM_JSON: &str =
-    include_str!("settings.agent-team.json");
+pub const PROJECT_SETTINGS_AGENT_TEAM_JSON: &str = include_str!("settings.agent-team.json");
 
 /// M2.4: helper templates that user-authored agent / workflow markdown
 /// can `@`-reference. Shipped inside the binary so a fresh install (or
@@ -155,12 +171,9 @@ fn render_settings_template(
     extra_env: &SettingsEnv,
     enabled: &EnabledPluginsSetting,
 ) -> Result<String> {
-    let hook = hook_sh.to_str().ok_or_else(|| {
-        anyhow!(
-            "ccteam hook.sh path not valid UTF-8: {}",
-            hook_sh.display()
-        )
-    })?;
+    let hook = hook_sh
+        .to_str()
+        .ok_or_else(|| anyhow!("ccteam hook.sh path not valid UTF-8: {}", hook_sh.display()))?;
     if hook.contains('"') || hook.contains('\\') {
         return Err(anyhow!(
             "ccteam hook.sh path contains characters that can't be embedded in settings.json: {hook}"
