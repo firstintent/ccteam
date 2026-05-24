@@ -635,6 +635,161 @@ MCP 工具本身 0 cost(纯文件操作 + daemon coordination);bot 跑起来后�
 
 ---
 
+## 配方 12 — 新项目零配置上手(ccteam-creator 自动探测)
+
+### 场景
+
+> "我刚 clone 了一个仓库(或者 `cargo new` / `pnpm init` 起的新项目),想直接 `/ccteam-creator` 起一个团队,**不必手改 yaml**就能跑。"
+
+### 适合谁
+
+刚装 ccteam 的新用户;或在不熟悉的项目里临时起 reviewer / squad;或单纯懒得手填 scope。
+
+### 起步
+
+```bash
+cd path/to/your/repo
+claude
+```
+
+session 里直接:
+
+```
+/ccteam-creator "做个后端 reviewer 团队"
+```
+
+ccteam-creator 先调 `ccteam probe-project` 探测:
+
+```
+Project probe:
+  kind: Monorepo (cargo workspace)
+  languages: Rust, TypeScript
+  probable scope: crates/api-core/src, crates/api-cli/src, services/web/src
+
+Generating workflow with scope pinned to those subtrees ...
+```
+
+随后 yaml 生成阶段把 probe 结果喂入 ── `scope:` 段已按项目结构填好,role.md 也按 Rust workspace 默认值(`cargo test --workspace` 风格)预填。
+
+### 用法
+
+probe 结果不满意?向导对话里直接说:
+
+```
+You: scope 改成只 crates/api-core/src,别管 cli 和 web
+Creator: ✓ scope updated → [crates/api-core/src]
+```
+
+或单独跑探测看 ccteam 怎么"看"你的仓库:
+
+```bash
+ccteam probe-project --json
+```
+
+输出 `kind` / `languages` / `probable_scope` 三段 JSON,适合 CI 编排在起 workflow 前先抓项目类型路由到不同 preset。
+
+### 生成什么
+
+- workflow.yaml `scope:` 段非空,按 monorepo 子树或 src/ + tests/ 分发
+- role.md 主语言(Rust → cargo / TS → npm / Python → pytest 风格)默认值
+- DocsOnly 仓库(只 *.md)→ scope = docs/,跳过 build/test 工具
+- ScriptsOnly 仓库(只 *.sh / *.py)→ scope = 顶层脚本目录
+
+### 探测启发式
+
+- `Cargo.toml workspace.members` + `package.json workspaces` + `go.work` → Monorepo
+- 单 `Cargo.toml` / `package.json` / `pyproject.toml` → SingleRepo
+- 只有 `.md` 无 source dir → DocsOnly
+- 只有 `.sh` / `.py` script → ScriptsOnly
+
+漏判时 user prompt override probe 结果,probe 只提供合理初值。
+
+### 预期 cost
+
+probe 本身 0 cost(纯文件扫描)。生成 yaml + 起 team 按对应 preset 计算。
+
+### 想改?
+
+[进阶定制 — preset 默认值 / scope 字段语义](advanced/customize-workflow.md#sensible-defaults)
+
+---
+
+## 配方 13 — 长跑 cost 监控(IM + doctor 对账)
+
+### 场景
+
+> "我有几个长跑 bot,想随时看花了多少钱;每周做一次对账,确认 ledger 没漏(防 spawn 路径绕开计费)。"
+
+### 适合谁
+
+任何长跑超过 1 周的 daemon / overnight builder / 多 bot 团队 owner。
+
+### 起步
+
+实时查 24h cost,IM 端:
+
+```
+@ccteam cost today
+```
+
+bot 回:
+
+```
+ccteam cost today
+  rolling 24h cost: Claude $1.8240 + Codex $0.4120 = total $2.2360
+  cap: $5.00/24h · remaining: $2.7640
+  active bots: 3 (filter: none)
+  full breakdown: `/ccteam-control show-cost`
+```
+
+撞 80% cap 自动加 `⚠️ approaching daily budget cap` 前缀。
+
+Claude session 内同样命令:
+
+```
+/ccteam-control show-cost                       # 全 workflow 24h 汇总
+/ccteam-control show-cost helper-bot --days 7   # 单 workflow 7 天
+```
+
+### 周末对账
+
+每周末终端跑一次:
+
+```bash
+ccteam doctor --check-cost-orphan
+```
+
+健康输出:
+
+```
+[ok] claude: 168 agent_done vs 168 ledger rows
+[ok] codex:  42 agent_done vs 42 ledger rows
+verdict: OK — ledger reconciled with progress.jsonl over 24h.
+```
+
+`WARN per vendor` 不对账 = 某 spawn 路径漏写 ledger ── 通常是新加自定义 adapter 没接 ledger hook,或外挂 codex bash 调用绕过(critic 路径已统一走 ledger,这种 leak 应消失)。
+
+### 配合 `ccteam doctor --verify-mcp` 做 CI gate
+
+CI 跑一次:
+
+```bash
+ccteam doctor --verify-mcp --json | jq .verdict
+# 期望:"PASS"
+```
+
+任何 STUB 注册 → exit 1,fail CI build。
+
+### 预期 cost
+
+监控命令本身 0 cost(纯读 ledger + progress.jsonl)。
+
+### 想改?
+
+[Multi-LLM 进阶](advanced/multi-llm-codex.md):per-vendor budget cap / unified cost rollup 内部架构。
+
+---
+
 ## 看完想自己捣鼓?
 
 每个配方都是 `ccteam-creator` 帮你生成的 `.ccteam/workflow.yaml` + `.claude/agents/*.md`。你 95% 时间不需要看这些文件 — 改东西在 Claude session 里一句话就行:

@@ -19,7 +19,7 @@ ccteam 的"低门槛 / Claude-Code-native UX"原则要求**用户从不直接选
 
 **所有其他场景**(qa-loop / autonomous-orchestrator / chat-bot / 通用 executor / planner / fixer)默认 Claude。Codex 不出场。
 
-**实现路径**:advise 场景由 `crates/ccteam-core/src/advise.rs` 实现 `advise_vote` / `advise_parallel` 两个公开 fn,各自并行 spawn 一个 advisor per vendor(Claude 走 claude-tui adapter / Codex 走 `CodexExecAdapter`),合成器读 `<ccteam_root>/cost-budget.json` 做 per-vendor cap enforcement。auto-critic 场景由 `ccteam-creator` Phase 3.5 调 `ccteam doctor --check-codex-auto-critic` 子进程(exit 0/2/3 三态)决定是否写入 vendor 字段。
+**实现路径**:advise 场景由 `crates/ccteam-core/src/advise.rs` 实现 `advise_vote` / `advise_parallel` 两个公开 fn,各自并行 spawn 一个 advisor per vendor(Claude 走 claude-tui adapter / Codex 走 `CodexExecAdapter`),合成器读 `<ccteam_root>/cost-budget.json` 做 per-vendor cap enforcement。auto-critic 场景由 `ccteam-creator` Phase 3.5 调 `ccteam doctor --check-codex-auto-critic` 子进程(exit 0/2/3 三态)决定是否写入 vendor 字段。**Critic 路径(场景 B/D)** 统一走 daemon-routed `CodexExecAdapter`,`submit_turn` post-turn 自动 append ledger row,与 advise 同账 ── 跨 vendor 调用都在同一账上,旧的 bash 直跑 `codex exec` 路径 deprecated;`ccteam doctor --check-cost-orphan` 守这条 invariant。
 
 ---
 
@@ -72,6 +72,8 @@ ccteam 内部跑 codex 用 `--profile ccteam-default` 引这套;**用户不必�
 ccteam doctor --check-codex                  # binary 存在 + auth ok
 ccteam doctor --check-codex-auto-critic      # 跑一次 codex exec --json canary,验 auto-critic 路径可用
 ccteam doctor --install-codex-profile        # 落 ~/.codex/config.toml [profiles.ccteam-default]
+ccteam doctor --check-cost-orphan            # 对账 24h ledger 与 progress.jsonl(catch 漏 ledger 的 spawn 路径)
+ccteam doctor --verify-mcp                   # 自检 MCP 工具表面 0 STUB(CI gate)
 ```
 
 `--check-codex-auto-critic` 退出码:
@@ -169,9 +171,11 @@ agents:
 | `crates/ccteam-cost/pricing/anthropic.toml` | Claude 各 tier 定价(`opus-4-7` / `sonnet-4-5` / `haiku-4-5`),含 `cache_creation_input_tokens` / `cache_read_input_tokens` 写入价 + 命中价 |
 | `crates/ccteam-cost/pricing/openai.toml` | Codex 各 tier 定价(`gpt-5.2-codex` / `o3` / `o3-mini`),含 `reasoning_output_tokens` 单独计费 |
 | `crates/ccteam-cost/src/budget.rs` | `UnifiedTokenUsage` enum + per-vendor budget cap |
-| `<ccteam_root>/cost-budget.json` | advise.rs 的 per-vendor ledger(48h 自动 GC,atomic-rename 写入)|
+| `<ccteam_root>/cost-budget.json` | per-vendor ledger(48h 自动 GC,atomic-rename 写入)── advise / Codex critic / `CodexExecAdapter::submit_turn` **统一**写入,跨 vendor 同账 |
 
 `UnifiedTokenUsage` 是 superset,容两边字段;`progress.jsonl::agent_done.usage` 序列化此结构。
+
+**Cost-orphan invariant**:`ccteam doctor --check-cost-orphan` 在终端跑(或 CI nightly job),对账 24h 内 `agent_done` event 数与 ledger row 数 ── 不对账即某 spawn 路径绕过 ledger(自加 custom adapter 漏接 hook / 外挂 bash 直跑 codex)。健康输出 `[ok] claude: N agent_done vs N ledger rows` per vendor,WARN 列差额。Codex critic 调用走 daemon-routed `CodexExecAdapter`,与 main spawn 同账,**不再** silent 漏算。
 
 #### Per-vendor budget cap
 

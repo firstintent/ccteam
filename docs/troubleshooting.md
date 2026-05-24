@@ -1,6 +1,6 @@
 # ccteam 故障排查手册
 
-> 主入口都在 Claude session 内:`/ccteam`(总入口)、`/ccteam-scan`(摸底)、`/ccteam-team`(临时 team)、`/ccteam-creator`(新建项目)、`/ccteam-control`(运行时)、`/ccteam-im-setup`(TG 配置)、`/ccteam-advise`(双 LLM 投票)。**诊断**走 **CLI**:在任意终端跑 `ccteam doctor`(详细诊断,80% 卡点它自动检出);Claude session 内可以 `Bash("ccteam doctor")` 一键调用。还卡再查本手册。
+> 主入口都在 Claude session 内:`/ccteam`(总入口)、`/ccteam-scan`(摸底)、`/ccteam-team`(临时 team)、`/ccteam-creator`(新建项目)、`/ccteam-control`(运行时)、`/ccteam-im-setup`(TG 配置)、`/ccteam-advise`(双 LLM 投票)。**诊断**走 **CLI**:在任意终端跑 `ccteam doctor`(详细诊断,80% 卡点它自动检出);Claude session 内可以 `Bash("ccteam doctor")` 一键调用。`--verify-mcp` 自检 MCP 表面 27 active / 0 stubs,`--check-cost-orphan` 对账 ledger 与 progress.jsonl,两条都适合放 CI gate。还卡再查本手册。
 >
 > 进阶 fix:`docs/claude-code-tool-surface.md` 看平台原语,`docs/orchestration-patterns.md` 看拓扑选择,`docs/tech-design.md` 看架构权威。
 
@@ -94,8 +94,8 @@
 **相关**:无。
 
 ### A18. `install.sh` 报 "unsupported platform: linux-aarch64"
-**原因**:V0.6.x 还未发布 linux-arm64 prebuilt(只发 x86_64 + macOS arm64/x64)。
-**修复**:走源码 build:`cargo install --git https://github.com/firstintent/ccteam ccteam-cli`(需要 Rust 1.85+);或等 V0.7 把 arm64 加进 release matrix。
+**原因**:当前未发布 linux-arm64 prebuilt(只发 x86_64 + macOS arm64/x64)。
+**修复**:走源码 build:`cargo install --git https://github.com/firstintent/ccteam ccteam-cli`(需要 Rust 1.85+);或等后续 release 把 arm64 加进 matrix。
 **相关**:A16。
 
 ---
@@ -179,7 +179,7 @@
 ## C. 成本 / 配额(10 条)
 
 ### C1. 24h budget 触底,bot 全停
-**原因**:F84 红线 — workflow 24h cost 撞 `max_cost_usd_per_24h`。
+**原因**:cost-cap 红线 — workflow 24h cost 撞 `max_cost_usd_per_24h`。
 **修复**:1) `/ccteam-control show-cost` 看哪个 role 烧得多;2) workflow.yaml 调高 budget 或换便宜模型;3) 等 24h reset 自动恢复。
 **相关**:C5 / C7。
 
@@ -299,11 +299,13 @@
 **相关**:F2 / F3。
 
 ### F2. 升级 ccteam 后 chat bot 失联 / context 像丢了
-**原因**:不应发生。`ccteam start` 启动时探测每个已注册 bot 的 `ccteam-chat-<slug>-<role>` tmux session,若 session + pane 内 claude 进程都活 → 自动 reattach(bot context 不丢)。
+**原因**:不应发生。`ccteam start` 启动时探测每个已注册 bot 的 `ccteam-chat-<slug>-<role>` tmux session,若 session + pane 内 claude 进程都活 → 自动 reattach(bot context 不丢);若 session 在但 pane 死 → kill stale + spawn `claude --resume <name>`,Anthropic 官方 CLI 直接 reload full API-level context(模型脑子里还有上次的东西)。
 **修复**:
 1. 终端 `tmux ls | grep ccteam-chat-` 看 session 是否存在
-2. 存在但 ccteam 没 reattach → 看 daemon 日志(`~/.ccteam/logs/ccteam-imd.log`)有无 reattach 行
-3. session 不存在(进程被 OOM-killed / 手动 `tmux kill-server`)→ ccteam 起新 session,context 确实丢;用 `mcp__ccteam__chat_history` 抓上轮 `turns.jsonl` 让 bot 自己重读上下文
+2. 存在但 ccteam 没 reattach → 看 daemon 日志(`~/.ccteam/logs/ccteam-imd.log`)有无 reattach / resume 行
+3. 日志显示 `chat_session_reset` event with `reason="resume_failed_fallback_to_fresh"` → `--resume` 失败(session jsonl 不存在 / 用户清过 `~/.claude/projects/` / Anthropic schema 升级)── bot 已退到 brand-new session,context 真丢;用 `mcp__ccteam__chat_history` 抓上轮 `turns.jsonl` 让 bot 自己重读上下文,或在 IM 端直接 paste 一句 summary
+4. session 不存在 + 无日志(进程被 OOM-killed + `~/.claude/projects/` 也清空)→ ccteam 起新 session,context 确实丢,同上 step 3
+**验证 lossless 恢复**:发条 `刚才那个 X 怎么样?` 风格 follow-up,bot reply 若能直接引用早 turn 内容 = 真 lossless;若 reply 显示"对不起请重述"= fallback 已走。
 **相关**:F1 / B11。
 
 ### F3. `ccteam mcp-serve` 跑起来 stdout 空 / 看不到 prompt
@@ -321,6 +323,22 @@
 2. 看 `<project>/.ccteam/chat/<bot>/turns.jsonl` 是否空(原内容应在 `archive/turns-<unix-ms>.jsonl`)
 3. tmux session 内 claude 进程仍持着旧 context — `mcp__ccteam__chat_unregister_bot` 再 `chat_register_bot` 一次,强制 spawn 新 claude 进程
 **相关**:B11 / §4.7 (user-manual.md)。
+
+### F5. `ccteam doctor --check-cost-orphan` 报 WARN
+**原因**:24h 内某 vendor 的 `agent_done` event 数 ≠ ledger row 数 ── 某 spawn 路径绕过了 `<ccteam_root>/cost-budget.json` ledger 写入。常见原因:(a) 用户自加 custom adapter 没接 ledger hook;(b) 外挂 bash 直跑 `codex exec` / `claude --print` 绕开 `CodexExecAdapter` / `ClaudeTuiAdapter`;(c) ccteam 自身新增 spawn 路径忘接(请提 issue)。
+**修复**:
+1. WARN 提示哪个 vendor 漏算 → 看自己的 workflow.yaml / skill 有没有手写 bash spawn(用 MCP `mcp__ccteam__advise_vote` 替代)
+2. ccteam built-in 路径漏 → 看 `<project>/.ccteam/progress.jsonl` 里漏的 `agent_done.vendor` 字段对应哪个 adapter,提 issue
+3. 长期对账失败 → CI 用 `ccteam doctor --check-cost-orphan` exit code 守 invariant(0 = OK / 1 = orphan,可放 nightly job)
+**相关**:C6 / §4.8(user-manual.md)。
+
+### F6. `ccteam doctor --verify-mcp` 报 STUB found
+**原因**:不应发生(0 STUB 是 ship gate invariant)。当某 MCP tool 注册了但 dispatch fn 返 `NotImplemented` 时触发。
+**修复**:
+1. 看输出 per-group breakdown,找具体哪个 group 有 stub
+2. `cargo clean && cargo build` 排除编译产物错位
+3. 仍报 → 跑 `ccteam doctor --verify-mcp --json | jq .unexpected_stubs` 取 stub 列表 → 提 issue 附完整 doctor 输出
+**相关**:A4 / §4.8。
 
 ---
 
