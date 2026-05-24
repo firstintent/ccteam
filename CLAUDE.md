@@ -21,7 +21,15 @@
 | V0.7 主线候选 | Epic C 国内 IM(WeChat / 飞书 / DingTalk / QQ)启用 + Slack inbound HTTP + Socket Mode(F168 anchor `TODO(V0.7-{im-providers,slack-inbound,slack-socket-mode})`)+ chat memory 跨设备同步 + monorepo-aware `.mcp.json` + migrate-from-claude + 6 号编排模式深化(HumanApproval × bg/chat 矩阵全开;`HumanApprovalAdapter` full wrapper F168 anchor `TODO(V0.7-human-approval-adapter)`)+ `/ccteam-creator` 完整 template library + LLM-assisted role auto-gen(F167 only 做 sensible defaults 探测)+ per-bot `chat_handle` schema(F168 anchor `TODO(V0.7-chat-handle)` + `TODO(V0.7-listbots-cache)`)|
 | 历史版本 | V0.1 → V0.6.5 见各自 `docs/versions/v0-X-Y/README.md`(V0.6.4 仅 commit,无 dir)|
 
-**ccteam 是 Claude Code 之上的元工具**(V0.4.0+,V0.6.0 起转 product-ready 元 AI 团队):每个项目用 `workflow.yaml` 声明 agent 拓扑(**无 prompt,只有 trigger + 并发上限 + `mode: chat`/`vendor: claude\|codex` for V0.6 mode 3 + V0.6.1 F124 `mode: human-approval` 第 4 mode + V0.6.1 F98 `plan_approval:` block**),`.claude/agents/<role>.md` 定义 agent 行为;Rust orchestrator 通过 `ArtifactWatcher`(inotify)监听文件系统控制平面 → spawn `claude --bg --agent <role>`(mode 2)/ 进 tmux 长 session `claude` TUI(mode 3,V0.6 F108;V0.6.6 F172 V2 `--name ccteam-chat-<slug>-<role>` deterministic + dead-pane recreate 走 `claude --resume <name>` lossless 续接)/ `codex exec --json` / `codex app-server` UDS(V0.6 F112 + V0.6.1 F122 progress.jsonl bridge;V0.6.6 F173 daemon-routed Codex critic 走 `CodexExecAdapter` + ledger);`progress.jsonl` 记录 7 类业务 event + `chat_session_reset`(F172 V2 fallback path 携 reason 字段)/ `turn_done` + V0.6.1 新增 `plan_pending` / `plan_decision` / `plan_timeout`(F98)+ `persona_changed` / `tool_added`(F128)为唯一状态 SoT(mode 3 对话原文走 ccteam-owned `<project>/.ccteam/chat/<bot>/turns.jsonl`);用户通过 meta-agent + `ccteam-control` skill + **27 个 `mcp__ccteam__{workflow_,chat_,advise_,admin_,screenshot}*` 子前缀分组工具**(V0.6 F111 24 + V0.6.1 F128 +2 admin + V0.6.5 F146/F147 chat 桥 + F152/F153 advise vote/parallel 真实现 — STUB 0,V0.6.6 F171 `STUB_TOOLS: &[&str] = &[]` static const 立法;0 deprecated alias)操作 + V0.6.1 F129 `@ccteam <NL>` IM mention 路径(pause/resume/list/cost/stop everything 5 keyword admin;V0.6.6 F169 `cost today` 现接真 `ccteam_cost` ledger 出 USD 分项);`ccteam-imd` supervisor(V0.6 F116;V0.6.1 F130 折入 `ccteam start` 作为单 tokio 任务,标准二进制已删,`--no-imd` 跳过)守 IM bridge,统一 `openhuman/channels` Rust crate 14+ IM 平台(V0.6 F109);web UI 提供 4 面板 + SSE。零摩擦安装(V0.6.6 F166)`curl ... | sh` 走 GH Releases prebuilt binary,`cargo install --git` 退到回退路径。详 `docs/tech-design.md` §2.1。
+**ccteam 是 Claude Code 之上的元工具**(V0.4.0+,V0.6.0 起转 product-ready 元 AI 团队)。架构 5 块:
+
+- **配置**:每项目 `workflow.yaml` 声明 agent 拓扑(**无 prompt**,只有 trigger + 并发上限 + `mode: chat`/`vendor: claude\|codex`(V0.6 mode 3)+ V0.6.1 F124 `mode: human-approval` 第 4 mode + V0.6.1 F98 `plan_approval:` block);`.claude/agents/<role>.md` 定义 agent 行为
+- **执行**:Rust orchestrator 通过 `ArtifactWatcher`(inotify)监听文件系统控制平面 → spawn `claude --bg --agent <role>`(mode 2)/ 进 tmux 长 session `claude` TUI(mode 3,V0.6 F108;V0.6.6 F172 V2 `--name ccteam-chat-<slug>-<role>` deterministic + dead-pane recreate 走 `claude --resume <name>` lossless 续接)/ `codex exec --json` / `codex app-server` UDS(V0.6 F112 + V0.6.1 F122 progress.jsonl bridge;V0.6.6 F173 daemon-routed Codex critic 走 `CodexExecAdapter` + unified ledger)
+- **状态 SoT**:`progress.jsonl` 7 类业务 event + `chat_session_reset`(F172 V2 携 reason 字段)/ `turn_done` / V0.6.1 `plan_pending` / `plan_decision` / `plan_timeout`(F98)/ `persona_changed` / `tool_added`(F128);mode 3 对话原文走 ccteam-owned `<project>/.ccteam/chat/<bot>/turns.jsonl`(不依赖 Anthropic 内部 `~/.claude/projects/`)
+- **接口**:**27 个 MCP 工具** `mcp__ccteam__{workflow_(15),chat_(6),advise_(2),admin_(3),screenshot(1)}`(V0.6.6 F171 `STUB_TOOLS: &[&str] = &[]` static const + `ccteam doctor --verify-mcp` 自检,0 STUB / 0 deprecated alias)+ V0.6.1 F129 `@ccteam <NL>` IM 5-keyword admin(pause/resume/list/cost/stop everything,V0.6.6 F169 `cost today` 接真 ledger 出 USD)+ `ccteam-imd` supervisor(V0.6.1 F130 折入 `ccteam start` 单 tokio 任务,`--no-imd` 跳过)守 `openhuman/channels` 14+ IM 平台 + web UI 4 面板 SSE
+- **安装**:V0.6.6 F166 `curl install.sh | sh`(GH Releases prebuilt binary,linux + macOS arm/x64,Windows 走 WSL2)→ Claude `/plugin marketplace add + /plugin install ccteam` OR Codex `codex plugin marketplace add firstintent/ccteam`(共享 `.mcp.json::command="ccteam"` 走 PATH binary);`cargo install --git https://github.com/firstintent/ccteam ccteam-cli` 是 fallback
+
+详 `docs/tech-design.md` §2.1。
 
 ## 二、必读文档(按推荐顺序)
 
@@ -92,7 +100,7 @@
 | **MCP** | `ccteam` **27 工具,0 STUB**(V0.6.6 F171 `STUB_TOOLS: &[&str] = &[]` static const + `ccteam doctor --verify-mcp` 自检 stub-counter parity exit code 1 on drift;`workflow_(15) + chat_(6) + advise_(2) + admin_(3) + screenshot(1) = 27`);5 group 子前缀:`mcp__ccteam__{workflow_,chat_,advise_,admin_,screenshot}*`;`CCTEAM_DISABLE_TOOLS` group enum(非 glob);wire 协议纪律(V0.6.5 F165):`mcp-serve` stdout 纯 JSON-RPC、tracing→stderr;可选 `claude-mem`(LLM 自看 surface 决定是否调)|
 | **Subagents** | agent 内 `Task(subagent_type=...)` ad-hoc 节流;8 个 plugin agent 已 ln -sf |
 | **Hooks** | `ccteam internal hook progress-append / load-context / intercept-ask`(F89 隐藏)|
-| **Plugins** | `~/.claude/plugins/marketplaces/claude-plugins-official/`;按需 ln -sf,**不 vendor** |
+| **Plugins** | 参考实现 `~/.claude/plugins/marketplaces/claude-plugins-official/`(按需 ln -sf,**不 vendor**);**ccteam 自身分发**:repo 同时是 Claude + Codex plugin marketplace ── `.claude-plugin/{plugin,marketplace}.json` + `.codex-plugin/plugin.json` + 根 `.mcp.json`(`command: "ccteam"` 走 PATH binary);user 装路径 = install.sh(binary)+ `/plugin install ccteam` OR `codex plugin marketplace add firstintent/ccteam` |
 
 ## 五、PR / 实现纪律
 
@@ -141,6 +149,9 @@ V0.6.0 走通的 4-wave 流程,V0.6.x patch + V0.7 minor 起点直接复用:
 - **env-mutating 测试**(`set_var/remove_var CLAUDE_CONFIG_HOME` 等)放 `crates/*/tests/*.rs` integration(各独立进程),**不**放 lib `#[cfg(test)] mod tests`
 - **改了 `ccteam-core` 公共 API**(如 `pick_unused_slug` 签名)→ grep 全 caller(tests / mcp_serve.rs / commands.rs)
 - **`claude --bg --agent` CLI 形态可能漂移** — `CCTEAM_CLAUDE_BIN` + `CCTEAM_CLAUDE_JOBS_DIR` env override 让测试不依赖真实 binary;生产改 `state_json_path` + `spawn_session` argv 即可,无需重构上层
+- **WSL2 / inotify-busy 宿主** `fs.inotify.max_user_instances=128` 易触顶,本机跑 cargo test 见大批 watcher/SSE/web e2e 502 → **环境层**,non-WSL / 大 limit 机 OR CI 复测;不计入 baseline
+- **`gh auth token` 没 `workflow` scope** ── 改 `.github/workflows/*` 文件的 PR HTTPS 推会被 GitHub 403 拒绝(`refusing to allow an OAuth App to create or update workflow`)。改用 SSH 推 `git push -u git@github.com:firstintent/ccteam.git <branch>:<branch>`
+- **`cargo fmt --all` 已是 required**(V0.6.6 post-ship drift-zero,`.github/workflows/check.yml` CI gate 守) ── 不再有"小改 drifted 文件不 fmt-sweep"特例,commit 前一律跑 + CI `cargo fmt --all -- --check` 不过 PR 不能 merge
 - **本文件 ≤200 行** — 越长 cache 越贵,Claude 越忽略
 
 历史版本升级 migration(V0.1 → V0.4.5)详各 `docs/versions/v0-X-Y/README.md`,不在此重复。
