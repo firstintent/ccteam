@@ -120,9 +120,29 @@ unit / e2e tests use a fake binary so the probe doesn't depend on a
 real `codex` install.
 
 The Codex critic teammate is **not** spawned via the Anthropic
-`Task` tool — that surface targets Claude-only subagents. Instead,
-the team-lead session runs the Codex teammate from skill body
-directly via Bash, in parallel with the Claude `Task` spawns:
+`Task` tool — that surface targets Claude-only subagents. The
+team-lead session has two routes:
+
+**Preferred — daemon-routed MCP path (`mcp__ccteam__advise_vote` /
+`mcp__ccteam__advise_parallel`)**:
+
+When the ccteam MCP server is registered and the daemon is running,
+route the critic call through `mcp__ccteam__advise_vote` (or
+`advise_parallel` for N raw answers without verdict synthesis). The
+daemon handles fan-out across vendors, funnels Codex calls through
+the shared `CodexExecAdapter` so every turn appends one row to the
+`cost-budget.json` ledger, and surfaces a per-vendor cost rollup in
+the return value. This keeps `@ccteam cost today` numbers honest
+across both main spawn and critic spawn, and lets
+`ccteam doctor --check-cost-orphan` reconcile vendor calls against
+ledger rows. Detection: a previous turn in this session must have
+registered the MCP tool surface; otherwise fall back below.
+
+**Fallback — direct bash spawn**:
+
+When the MCP path is unavailable (no daemon / no MCP registration),
+spawn the Codex teammate from skill body directly via Bash, in
+parallel with the Claude `Task` spawns:
 
 ```bash
 CODEX_BIN="${CCTEAM_CODEX_BIN:-codex}"
@@ -140,14 +160,8 @@ echo "codex-critic spawned (PID $!)"
 The team-lead session captures stdout/stderr to a temp file the
 synthesis loop polls for a `turn.completed` JSONL frame. **No tmux**
 — `codex exec --json` is one-shot process, output is captured
-directly. This bash-spawn path is the only supported route for the
-Codex critic teammate.
-
-If `ccteam-imd` daemon is running and exposes
-`mcp__ccteam__advise_parallel`, the skill MAY prefer that path
-instead — daemon-side cost rollup + persistent log. Detection: a
-previous turn in this session must have registered the MCP tool;
-otherwise stay on the direct Bash spawn.
+directly. The bash path does not record a cost ledger row, so the
+daemon-routed MCP path is preferred whenever available.
 
 ### 4. 等用户回复
 

@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
-use ccteam_core::execution::ClaudeTuiAdapter;
+use ccteam_core::execution::{ClaudeTuiAdapter, CodexExecAdapter};
 use ccteam_core::harness::{AgentVendor, HarnessAdapter};
 use tokio::sync::{mpsc, Mutex};
 
@@ -66,24 +66,22 @@ pub type ChannelMap = HashMap<String, Arc<dyn Channel + Send + Sync>>;
 pub type AdapterFactory =
     Arc<dyn Fn(AgentVendor) -> Arc<dyn HarnessAdapter + Send + Sync> + Send + Sync>;
 
-/// V0.6.0 Wave 3 — pick the canonical production adapter for `vendor`.
+/// Pick the canonical production adapter for `vendor`.
 ///
 /// - `Claude` → [`ClaudeTuiAdapter`] (the mode 3 chat adapter).
-/// - `Codex` → also [`ClaudeTuiAdapter`] today; the codex-exec-impl
-///   teammate's `CodexAppServerAdapter` will replace this arm in a
-///   follow-up commit. Falling back to the Claude adapter (rather
-///   than panicking) keeps any mis-registered Codex bot inert
-///   (`start_thread` will fail noisily on the wrong vendor) instead
-///   of taking down the daemon.
+/// - `Codex` → [`CodexExecAdapter`] — per-turn `codex exec --json`
+///   subprocess wrapped by the V0.6.5 advise-ledger hook so every
+///   Codex call (chat bot, daemon-routed critic, advise_vote / parallel)
+///   funnels through the same `<ccteam_root>/cost-budget.json` rollup.
+///   Previously fell back to `ClaudeTuiAdapter` (a silent no-op);
+///   that left Codex calls outside the cost ledger.
 pub fn default_adapter_factory() -> AdapterFactory {
     Arc::new(|vendor: AgentVendor| match vendor {
         AgentVendor::Claude => {
             Arc::new(ClaudeTuiAdapter::new()) as Arc<dyn HarnessAdapter + Send + Sync>
         }
         AgentVendor::Codex => {
-            // TODO(wave-3 codex-exec-impl): swap to CodexAppServerAdapter
-            // once it lands.
-            Arc::new(ClaudeTuiAdapter::new()) as Arc<dyn HarnessAdapter + Send + Sync>
+            Arc::new(CodexExecAdapter::new()) as Arc<dyn HarnessAdapter + Send + Sync>
         }
     })
 }
@@ -1435,5 +1433,27 @@ mod tests {
         assert_eq!(adapter.closes.load(Ordering::SeqCst), 1);
         let supervisors = registry.lock().await.all();
         assert!(!supervisors[0].is_started().await);
+    }
+
+    /// V0.6.6 F173 — `default_adapter_factory` must route the Codex arm
+    /// to a Codex-vendor adapter (CodexExecAdapter), not the Claude
+    /// fallback that lived here from V0.6.0 Wave 3. The previous fallback
+    /// silently broke the unified cost rollup (Codex chat-mode spawns
+    /// never appended a ledger row). This test pins the fix.
+    #[test]
+    fn default_adapter_factory_codex_arm_returns_codex_vendor() {
+        let factory = default_adapter_factory();
+        let claude = factory(AgentVendor::Claude);
+        assert_eq!(
+            claude.vendor(),
+            AgentVendor::Claude,
+            "claude arm must return a Claude adapter"
+        );
+        let codex = factory(AgentVendor::Codex);
+        assert_eq!(
+            codex.vendor(),
+            AgentVendor::Codex,
+            "F173: codex arm must return a Codex adapter, not the Claude fallback"
+        );
     }
 }

@@ -571,6 +571,16 @@ enum Command {
         /// inline so the gate is deterministic + testable.
         #[arg(long, default_value_t = false)]
         check_codex_auto_critic: bool,
+        /// V0.6.6 F173: reconcile `<ccteam_root>/cost-budget.json` ledger
+        /// rows against every registered project's `progress.jsonl`
+        /// over the last 24h. Reports "cost orphan: N <vendor> agent_done
+        /// events in progress.jsonl, M rows in ledger" for any mismatch
+        /// (vendor adapter call recorded a `progress.jsonl` event but no
+        /// ledger row). Silent OK when fully reconciled. No fs mutation —
+        /// pure-readout invariant check; future regressions (a new vendor
+        /// adapter that forgets the ledger hook) surface here.
+        #[arg(long, default_value_t = false)]
+        check_cost_orphan: bool,
         /// V0.6.1 F139: materialize the `~/.ccteam/hooks/hook.sh`
         /// daemon-aware Claude Code hook dispatcher (idempotent, chmod
         /// 0755). Run after a ccteam binary upgrade to refresh the
@@ -861,6 +871,20 @@ enum HookCommand {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // F173 — pin `CCTEAM_HOME` early so child spawn paths
+    // (CodexExecAdapter ledger hook, etc.) see the same root the CLI
+    // resolved. Production users almost never set `CCTEAM_HOME`
+    // explicitly; without this seed the cost-budget.json ledger hook
+    // in CodexExecAdapter would silently no-op (the adapter gates the
+    // hook on `CCTEAM_HOME` explicitly to avoid cargo-test pollution).
+    // Idempotent — if the operator already set it, we honour their
+    // override.
+    if std::env::var_os("CCTEAM_HOME").is_none() {
+        if let Ok(paths) = CcteamPaths::from_env() {
+            std::env::set_var("CCTEAM_HOME", &paths.root);
+        }
+    }
+
     // No subcommand → print help instead of silently exiting. Prior
     // behavior (V0.4.0 and earlier) was Ok(()) with nothing on stdout,
     // which left users wondering whether ccteam was installed at all.
@@ -1053,6 +1077,7 @@ fn main() -> Result<()> {
             check_codex_version,
             check_codex_auth,
             check_codex_auto_critic,
+            check_cost_orphan,
             install_hooks,
             migrate_hook_commands,
             apply,
@@ -1108,6 +1133,7 @@ fn main() -> Result<()> {
                 check_codex_version,
                 check_codex_auth,
                 check_codex_auto_critic,
+                check_cost_orphan,
                 install_hooks,
                 migrate_hook_commands,
                 verify_mcp,

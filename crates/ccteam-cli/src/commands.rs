@@ -2184,6 +2184,15 @@ pub struct DoctorOptions {
     /// the CLI dispatcher (2 = unavailable, 3 = malformed) so the
     /// skill body and CI can branch without parsing free text.
     pub check_codex_auto_critic: bool,
+    /// V0.6.6 F173: reconcile `<ccteam_root>/cost-budget.json` ledger
+    /// rows against every registered project's `progress.jsonl` over
+    /// the last 24h. Invariant: per vendor, the count of `agent_done`
+    /// events with `status="completed"` matches the count of ledger
+    /// `BudgetSample` rows. Reports any orphan (vendor adapter
+    /// recorded a progress.jsonl event but no ledger row) so a future
+    /// regression — e.g. a new adapter forgetting the cost hook —
+    /// surfaces deterministically. Pure-readout; no fs mutation.
+    pub check_cost_orphan: bool,
     /// V0.6.1 F139: materialize the `~/.ccteam/hooks/hook.sh` daemon
     /// dispatcher (idempotent, chmod 0755). Use after a ccteam binary
     /// upgrade ships a new script body.
@@ -2226,6 +2235,7 @@ pub fn run_doctor(paths: &CcteamPaths, mut opts: DoctorOptions) -> Result<String
         || opts.check_codex_version
         || opts.check_codex_auth
         || opts.check_codex_auto_critic
+        || opts.check_cost_orphan
         || opts.install_hooks
         || opts.migrate_hook_commands;
     // V0.6.1 F121 — `ccteam doctor` with no mode flag implicitly runs
@@ -2303,6 +2313,9 @@ pub fn run_doctor(paths: &CcteamPaths, mut opts: DoctorOptions) -> Result<String
     if opts.check_codex_auth {
         out.push_str(&render_check_codex_auth_report());
     }
+    if opts.check_cost_orphan {
+        out.push_str(&render_check_cost_orphan_report(paths));
+    }
     if opts.install_hooks {
         out.push_str(&render_install_hooks_report(paths)?);
     }
@@ -2373,6 +2386,10 @@ const NO_MODE_HELP: &str = "\nccteam doctor: pass at least one mode flag for the
      Honors $CCTEAM_CODEX_BIN; emits a single JSON line on stdout. Exit 0 = available + well-formed, \
      2 = unavailable (binary missing / version probe failed / not authenticated), 3 = available but \
      `codex exec --json` output malformed. The skill consults this subprocess instead of inline probes.\n  \
+     --check-cost-orphan\n      \
+     reconcile `<ccteam_root>/cost-budget.json` ledger rows against every registered project's \
+     progress.jsonl over the last 24h (V0.6.6 F173). WARN per vendor when `agent_done` count exceeds \
+     ledger row count — indicates a spawn path bypassed the ledger hook. Silent OK when reconciled.\n  \
      --install-hooks\n      \
      materialize ~/.ccteam/hooks/hook.sh (the daemon-aware Claude Code hook dispatcher; V0.6.1 F139). \
      Idempotent; chmod 0755. `ccteam init` already does this on first install.\n  \
@@ -3201,6 +3218,169 @@ fn render_check_codex_auth_report() -> String {
     }
     out.push('\n');
     out
+}
+
+/// V0.6.6 F173 — cost-orphan invariant check. Walks every registered
+/// project's `progress.jsonl` for the last 24h, counts `agent_done`
+/// events with `status="completed"` per vendor, then compares against
+/// the per-vendor row count in `<ccteam_root>/cost-budget.json` over
+/// the same window. Each vendor with `agent_done_count > ledger_rows`
+/// surfaces a `[WARN] cost orphan: …` line so a future regression
+/// (e.g. a new adapter that forgets the ledger hook) is visible at
+/// `ccteam doctor` time. Fully reconciled state emits one `[OK] cost
+/// ledger reconciled` line.
+fn render_check_cost_orphan_report(paths: &CcteamPaths) -> String {
+    let mut out = String::from("ccteam doctor --check-cost-orphan (V0.6.6 F173)\n\n");
+    let (counts, warnings) = compute_cost_orphan(paths);
+    let claude_done = counts
+        .agent_done
+        .get(&CostVendor::Claude)
+        .copied()
+        .unwrap_or(0);
+    let codex_done = counts
+        .agent_done
+        .get(&CostVendor::Codex)
+        .copied()
+        .unwrap_or(0);
+    let claude_rows = counts
+        .ledger_rows
+        .get(&CostVendor::Claude)
+        .copied()
+        .unwrap_or(0);
+    let codex_rows = counts
+        .ledger_rows
+        .get(&CostVendor::Codex)
+        .copied()
+        .unwrap_or(0);
+    out.push_str(&format!(
+        "  progress.jsonl agent_done (24h): claude={claude_done} codex={codex_done}\n"
+    ));
+    out.push_str(&format!(
+        "  cost-budget.json ledger rows (24h): claude={claude_rows} codex={codex_rows}\n"
+    ));
+    if warnings.is_empty() {
+        out.push_str(
+            "  [OK] cost ledger reconciled — every vendor adapter call has a ledger row.\n",
+        );
+    } else {
+        for w in &warnings {
+            out.push_str("  [WARN] ");
+            out.push_str(w);
+            out.push('\n');
+        }
+        out.push_str(
+            "  Likely cause: a vendor adapter spawn path bypassed the F173 ledger hook \
+             (`append_budget_ledger_row` in CodexExecAdapter::submit_turn). Inspect the \
+             new spawn site and add the hook before merging.\n",
+        );
+    }
+    out.push('\n');
+    out
+}
+
+/// V0.6.6 F173 — pure helper for [`render_check_cost_orphan_report`]
+/// so tests can drive the invariant without parsing report text.
+/// Returns per-vendor counts + a list of warning strings (empty when
+/// fully reconciled).
+pub fn compute_cost_orphan(paths: &CcteamPaths) -> (CostOrphanCounts, Vec<String>) {
+    let cutoff = chrono::Utc::now() - chrono::Duration::hours(24);
+    let mut counts = CostOrphanCounts::default();
+
+    // 1. agent_done per vendor across every registered project's progress.jsonl.
+    if let Ok(projects) = ccteam_core::collect_projects(paths) {
+        for proj in projects {
+            let slug = &proj.state.slug;
+            let progress_path = paths.progress_jsonl(slug);
+            let events = ccteam_core::read_all_events(&progress_path).unwrap_or_default();
+            for ev in events {
+                if ev.get("event").and_then(|s| s.as_str()) != Some("agent_done") {
+                    continue;
+                }
+                if ev.get("status").and_then(|s| s.as_str()) != Some("completed") {
+                    continue;
+                }
+                let ts = ev
+                    .get("ts")
+                    .and_then(|s| s.as_str())
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.with_timezone(&chrono::Utc));
+                if let Some(ts) = ts {
+                    if ts < cutoff {
+                        continue;
+                    }
+                }
+                let vendor = ev.get("vendor").and_then(|s| s.as_str()).unwrap_or("");
+                let key = match vendor {
+                    "claude" => CostVendor::Claude,
+                    "codex" => CostVendor::Codex,
+                    _ => continue, // unknown vendor — skip (forward-compat)
+                };
+                *counts.agent_done.entry(key).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // 2. ledger rows per vendor over the same window.
+    if let Ok(ledger) = ccteam_core::load_advise_budget(&paths.root) {
+        for sample in &ledger.samples {
+            if sample.ts < cutoff {
+                continue;
+            }
+            let key = match sample.vendor {
+                ccteam_core::harness::AgentVendor::Claude => CostVendor::Claude,
+                ccteam_core::harness::AgentVendor::Codex => CostVendor::Codex,
+            };
+            *counts.ledger_rows.entry(key).or_insert(0) += 1;
+        }
+    }
+
+    // 3. warnings — only flag `agent_done > ledger_rows` (orphans, the
+    //    F173 invariant). The reverse (advise_vote bumping ledger rows
+    //    without progress.jsonl events) is expected — advise calls are
+    //    not project-scoped, so they have no progress.jsonl footprint.
+    let mut warnings = Vec::new();
+    for vendor in [CostVendor::Claude, CostVendor::Codex] {
+        let done = counts.agent_done.get(&vendor).copied().unwrap_or(0);
+        let rows = counts.ledger_rows.get(&vendor).copied().unwrap_or(0);
+        if done > rows {
+            warnings.push(format!(
+                "cost orphan: {} {} calls in progress.jsonl, {} rows in ledger (Δ={})",
+                done,
+                vendor.label(),
+                rows,
+                done - rows,
+            ));
+        }
+    }
+    (counts, warnings)
+}
+
+/// V0.6.6 F173 — per-vendor cost rollup tally returned by
+/// [`compute_cost_orphan`]. Counts are 24h windowed (rolling, matches
+/// the advise ledger GC window).
+#[derive(Debug, Default)]
+pub struct CostOrphanCounts {
+    pub agent_done: std::collections::HashMap<CostVendor, u32>,
+    pub ledger_rows: std::collections::HashMap<CostVendor, u32>,
+}
+
+/// V0.6.6 F173 — vendor enum mirror used by the cost-orphan check.
+/// Mirrors `ccteam_core::harness::AgentVendor` but lives in the cli
+/// crate so the report rendering layer doesn't leak the core enum
+/// through its public surface. `Hash + Eq` for `HashMap` keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CostVendor {
+    Claude,
+    Codex,
+}
+
+impl CostVendor {
+    fn label(self) -> &'static str {
+        match self {
+            CostVendor::Claude => "claude",
+            CostVendor::Codex => "codex",
+        }
+    }
 }
 
 /// V0.6.5 F155 — deterministic gate for the `ccteam-creator` Phase

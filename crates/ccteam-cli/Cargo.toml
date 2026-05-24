@@ -42,3 +42,6 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# V0.6.6 F173 — `doctor_cost_orphan_test.rs` writes a project-registration
+# `config.yaml` via the same serde_yaml the production loader uses.
+serde_yaml.workspace = true
