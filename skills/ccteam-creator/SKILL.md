@@ -390,8 +390,10 @@ call to be explicit.
 The daemon's router resolves `@<chat_handle>` → `(slug, role)` from
 the registry directly; no `chat.bot_name` plumbing through
 workflow.yaml is required. Two bots in different slugs sharing the
-same effective handle collide deterministically — the second
-claimant (in `(slug, role)` sort order) receives a `@<slug>` suffix.
+same effective handle collide deterministically — the second claimant
+(in `(slug, role)` sort order) receives a `__<slug>` suffix (double
+underscore so the suffixed handle stays inside the IM mention
+charset and users can actually type `@curie__beta`).
 
 ## 5.7  Project-level `.mcp.json`
 

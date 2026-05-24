@@ -574,10 +574,14 @@ fn spawn_inbound_consumer(
 /// resolve `@<handle>` mentions to `(slug, role)`.
 ///
 /// Effective handle = `chat_handle.unwrap_or(role)`. Cross-slug
-/// collisions resolve to `<handle>@<slug>` for the second claimant
+/// collisions resolve to `<handle>__<slug>` for the second claimant
 /// (the first bot in `(slug, role)` sort order keeps the bare handle).
-/// Sort order is deterministic so collision suffixing doesn't depend
-/// on filesystem `read_dir` ordering.
+/// The double-underscore suffix keeps the combined token inside
+/// `router::parse_first_mention`'s `[a-zA-Z0-9_-]` handle charset so
+/// users can actually type `@curie__beta`; an `@` separator would
+/// truncate at the second sigil and route to UnknownHandle. Sort order
+/// is deterministic so collision suffixing doesn't depend on
+/// filesystem `read_dir` ordering.
 fn build_handle_map() -> HandleMap {
     let bots = list_bots().unwrap_or_default();
     build_handle_map_from_bots(&bots)
@@ -586,7 +590,7 @@ fn build_handle_map() -> HandleMap {
 /// Pure variant of [`build_handle_map`] — operates on a borrowed bot
 /// slice so unit tests can probe the collision resolution rule without
 /// touching the on-disk registry.
-pub(crate) fn build_handle_map_from_bots(bots: &[BotRegistration]) -> HandleMap {
+pub fn build_handle_map_from_bots(bots: &[BotRegistration]) -> HandleMap {
     let mut sorted: Vec<&BotRegistration> = bots.iter().collect();
     sorted.sort_by(|a, b| {
         a.workflow_slug
@@ -599,7 +603,7 @@ pub(crate) fn build_handle_map_from_bots(bots: &[BotRegistration]) -> HandleMap 
     for b in sorted {
         let base = b.effective_handle().to_string();
         let handle = if claimed.contains(&base) {
-            format!("{base}@{}", b.workflow_slug)
+            crate::router::collision_suffix(&base, &b.workflow_slug)
         } else {
             base.clone()
         };

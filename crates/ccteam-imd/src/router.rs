@@ -167,7 +167,9 @@ pub fn route(text: &str, handles: &HandleMap, hop: u8) -> Route {
 /// List the effective handles bound to a `(channel, chat_id)`, sorted
 /// alphabetically and deduped. Mirrors the cross-slug collision rule
 /// `build_handle_map` applies: a bot whose effective handle clashes
-/// with another claimant gets the `@<slug>` suffix.
+/// with another claimant gets the `__<slug>` suffix (using `_` so
+/// `parse_first_mention`'s handle-char rules accept the full token;
+/// `@` would terminate parsing at the second sigil).
 ///
 /// Used by both the unknown-handle reply path in
 /// [`crate::inbound::process_inbound_admin_aware`] and the
@@ -179,7 +181,7 @@ pub fn available_handles_for_chat(
     chat_id: &str,
 ) -> Vec<String> {
     // Match build_handle_map's sort + collision policy on the *full*
-    // registry so the bare-handle vs `@<slug>`-suffix decision matches
+    // registry so the bare-handle vs `__<slug>`-suffix decision matches
     // what the router actually sees. Filter to this chat after assigning
     // handles.
     let mut sorted: Vec<&BotRegistration> = bots.iter().collect();
@@ -194,7 +196,7 @@ pub fn available_handles_for_chat(
     for b in sorted {
         let base = b.effective_handle().to_string();
         let handle = if claimed.contains(&base) {
-            format!("{base}@{}", b.workflow_slug)
+            collision_suffix(&base, &b.workflow_slug)
         } else {
             base.clone()
         };
@@ -211,6 +213,15 @@ pub fn available_handles_for_chat(
     out.sort();
     out.dedup();
     out
+}
+
+/// Build the cross-slug collision suffix for a handle. Uses `__`
+/// (double underscore) as the separator so the result stays inside
+/// `parse_first_mention`'s `[a-zA-Z0-9_-]` handle charset — `@` would
+/// truncate parsing at the second sigil and route the suffixed handle
+/// to UnknownHandle. Slug `-` characters are preserved verbatim.
+pub fn collision_suffix(base: &str, slug: &str) -> String {
+    format!("{base}__{slug}")
 }
 
 /// Render the user-facing "available bots in this chat" line shared by

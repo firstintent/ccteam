@@ -730,8 +730,10 @@ pub struct AgentSpec {
     /// the daemon's router maps `@<chat_handle>` → `(slug, role)` instead
     /// of falling back to `@<role>`. Two bots in different slugs can
     /// share the same `chat_handle` value; the daemon resolves cross-slug
-    /// collisions by suffixing the second claimant with `@<slug>`
-    /// (deterministic by `(slug, role)` sort order). Omitted = the bot
+    /// collisions by suffixing the second claimant with `__<slug>`
+    /// (double underscore, deterministic by `(slug, role)` sort order;
+    /// the form stays inside the IM handle charset so users can type
+    /// `@curie__beta` and it routes end-to-end). Omitted = the bot
     /// answers to `@<role>` for backwards compatibility with
     /// pre-`chat_handle` workflows.
     ///

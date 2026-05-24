@@ -73,9 +73,11 @@ pub struct BotRegistration {
     /// `None` (legacy / pre-`chat_handle` registrations) falls back to
     /// `role` as the routing handle. The daemon's `build_handle_map`
     /// resolves cross-slug collisions by suffixing the second claimant
-    /// with `@<slug>`. `chat_register_bot` auto-mints a scientist
-    /// nickname from `ccteam_core::agent_naming::SCIENTIST_NAMES` when
-    /// the caller omits this field.
+    /// with `__<slug>` (double underscore — see
+    /// [`crate::router::collision_suffix`] for the rationale; `@` would
+    /// be eaten by the mention parser). `chat_register_bot` auto-mints
+    /// a scientist nickname from `ccteam_core::agent_naming::SCIENTIST_NAMES`
+    /// when the caller omits this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_handle: Option<String>,
     /// RFC3339 timestamp.

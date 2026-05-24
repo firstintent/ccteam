@@ -5,9 +5,12 @@
 //! Covers:
 //! - `chat_handle` absent → handle falls back to `role`
 //! - `chat_handle` set → it wins
-//! - cross-slug collision → second claimant gets `<handle>@<slug>`
+//! - cross-slug collision → second claimant gets `<handle>__<slug>`
+//!   (double underscore so `router::parse_first_mention` accepts the
+//!   suffixed token end-to-end)
 //! - sort order is deterministic regardless of input order
 //! - `available_handles_for_chat` filters by `(channel, chat_id)`
+//! - the suffixed handle actually routes end-to-end via `router::route`
 
 use ccteam_core::harness::AgentVendor;
 use ccteam_imd::router::{available_handles_for_chat, format_unknown_handle_reply};
@@ -60,14 +63,15 @@ fn available_handles_for_chat_no_match_returns_empty() {
 fn cross_slug_collision_assigns_suffix_to_second_claimant() {
     // Two bots, same effective handle (`curie`), different slugs in
     // the same chat. The slug-sorted first one (`alpha`) keeps the
-    // bare handle; `beta` gets the `@beta` suffix.
+    // bare handle; `beta` gets the `__beta` suffix (double underscore
+    // — see `router::collision_suffix` for the rationale).
     let bots = vec![
         mk("beta", "lead", Some("curie"), "telegram", "@g1"),
         mk("alpha", "lead", Some("curie"), "telegram", "@g1"),
     ];
     let mut out = available_handles_for_chat(&bots, "telegram", "@g1");
     out.sort();
-    assert_eq!(out, vec!["curie".to_string(), "curie@beta".to_string()]);
+    assert_eq!(out, vec!["curie".to_string(), "curie__beta".to_string()]);
 }
 
 #[test]
@@ -86,7 +90,7 @@ fn collision_resolution_is_deterministic_across_input_order() {
     // `alpha` < `beta` so alpha keeps the bare `curie` regardless of
     // which Vec order the caller passes.
     assert!(h1.contains(&"curie".to_string()));
-    assert!(h1.contains(&"curie@beta".to_string()));
+    assert!(h1.contains(&"curie__beta".to_string()));
 }
 
 #[test]
@@ -99,7 +103,7 @@ fn collision_uses_chat_handle_or_role_fallback_consistently() {
     ];
     let mut out = available_handles_for_chat(&bots, "telegram", "@g1");
     out.sort();
-    assert_eq!(out, vec!["lead".to_string(), "lead@beta".to_string()]);
+    assert_eq!(out, vec!["lead".to_string(), "lead__beta".to_string()]);
 }
 
 #[test]
@@ -116,4 +120,36 @@ fn format_unknown_handle_reply_when_no_bots_says_none() {
     let s = format_unknown_handle_reply("ghost", &[]);
     assert!(s.contains("@ghost"));
     assert!(s.contains("No bots registered in this chat"));
+}
+
+#[test]
+fn route_resolves_collision_suffix_handle_end_to_end() {
+    // Regression for the @-as-separator bug: `parse_first_mention`
+    // accepts `[a-zA-Z0-9_-]` for handle chars and *terminates* at any
+    // other byte. An `@` separator would split the typed handle so the
+    // suffixed claimant becomes unreachable. The `__<slug>` form keeps
+    // the whole token inside the parser's charset.
+    use ccteam_imd::daemon::build_handle_map_from_bots;
+    use ccteam_imd::router::{route, Route};
+
+    let bots = vec![
+        mk("alpha", "lead", Some("curie"), "telegram", "@g1"),
+        mk("beta", "lead", Some("curie"), "telegram", "@g1"),
+    ];
+    let map = build_handle_map_from_bots(&bots);
+    match route("@curie__beta payload", &map, 0) {
+        Route::Bot { slug, role, .. } => {
+            assert_eq!(slug, "beta");
+            assert_eq!(role, "lead");
+        }
+        other => panic!("expected Bot, got {other:?}"),
+    }
+    // Bare handle still routes the first claimant.
+    match route("@curie payload", &map, 0) {
+        Route::Bot { slug, role, .. } => {
+            assert_eq!(slug, "alpha");
+            assert_eq!(role, "lead");
+        }
+        other => panic!("expected Bot, got {other:?}"),
+    }
 }

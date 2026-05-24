@@ -179,7 +179,7 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
 
 | Anchor tag | Closed at | Replacement |
 |---|---|---|
-| `TODO(V0.7-chat-handle)` | V0.6.8 | `AgentSpec.chat_handle: Option<String>` + `BotRegistration.chat_handle` schema fields landed;`build_handle_map` 用 `chat_handle.unwrap_or(role)` + cross-slug `<handle>@<slug>` 后缀;`chat_register_bot` MCP 自动从 `agent_naming::SCIENTIST_NAMES` mint。F180-F184。
+| `TODO(V0.7-chat-handle)` | V0.6.8 | `AgentSpec.chat_handle: Option<String>` + `BotRegistration.chat_handle` schema fields landed;`build_handle_map` 用 `chat_handle.unwrap_or(role)` + cross-slug `<handle>__<slug>` 后缀(双下划线 — `@` 会被 `router::parse_first_mention` 在第二个 `@` 截断,使 suffixed handle 无法 route);`chat_register_bot` MCP 自动从 `agent_naming::SCIENTIST_NAMES` mint。F180-F184。
 
 ## V0.4.6 摘要更新
 
