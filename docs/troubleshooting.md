@@ -1,10 +1,8 @@
 # ccteam 故障排查手册
 
-> V0.6.1 起。主入口都在 Claude session 内:`/ccteam-control`(运行时)、`/ccteam-creator`(新建项目)、`/ccteam-team`(临时 team)、`/ccteam-im-setup`(TG 配置)、`/ccteam-advise`(双 LLM 投票)+ 总入口 `/ccteam <NL>`。**诊断**走 **CLI**:在任意终端跑 `ccteam doctor`(详细诊断,80% 卡点它自动检出);Claude session 内可以 `Bash("ccteam doctor")` 一键调用。还卡再查本手册。
+> 主入口都在 Claude session 内:`/ccteam`(总入口)、`/ccteam-scan`(摸底)、`/ccteam-team`(临时 team)、`/ccteam-creator`(新建项目)、`/ccteam-control`(运行时)、`/ccteam-im-setup`(TG 配置)、`/ccteam-advise`(双 LLM 投票)。**诊断**走 **CLI**:在任意终端跑 `ccteam doctor`(详细诊断,80% 卡点它自动检出);Claude session 内可以 `Bash("ccteam doctor")` 一键调用。还卡再查本手册。
 >
-> **V0.6.1 ship policy 提示**:本手册示例以 `ccteam doctor` 命令行为准;V0.6.0 早期文档曾写 `/ccteam-doctor` slash 形式,**该 slash 不存在**(F127 manual-prover sweep 校正)。
->
-> 进阶 fix path:`docs/versions/v0-6-1/prd.md` 找 F-finding,`docs/claude-code-tool-surface.md` 看平台原语,`docs/orchestration-patterns.md` 看拓扑选择。
+> 进阶 fix:`docs/claude-code-tool-surface.md` 看平台原语,`docs/orchestration-patterns.md` 看拓扑选择,`docs/tech-design.md` 看架构权威。
 
 ---
 
@@ -16,7 +14,7 @@
 **相关**:A2(版本过低)。
 
 ### A2. `ccteam doctor` 报 "claude version too old, need ≥ 2.1.139"
-**原因**:V0.6.0+ 依赖 agent-view / `--bg` 等新特性,旧版没有。
+**原因**:ccteam 依赖 agent-view / `--bg` 等较新特性,旧版没有。
 **修复**:`claude update` 升 stable → 重启 Claude session → 重跑 `ccteam doctor`。
 **相关**:A1。
 
@@ -42,8 +40,8 @@
 
 ### A7. `/ccteam-creator` 起新项目报 "Team already exists"
 **原因**:上次新建留下的 `~/.claude/teams/<name>/` 残留,或 `~/projects/<slug>/` 已存在。
-**修复**:1) 重选另一个 slug;2) 想用同名:手动 `rm -rf ~/.claude/teams/<name> ~/projects/<slug>` 后重起。
-**相关**:`docs/versions/v0-5-1/` troubleshoot 同类。
+**修复**:1) 重选另一个 slug;2) 想用同名:手动 `rm -rf ~/.claude/teams/<name> ~/projects/<slug>` 后重起,或 `ccteam remove <slug> --purge` 一并清 `imd/registry/`。
+**相关**:A11。
 
 ### A8. 跟 BotFather 要 TG bot token 拿不到
 **原因**:TG 没注册 / @BotFather 没回 / 超出 20 bot 上限。
@@ -61,8 +59,8 @@
 **相关**:A8。
 
 ### A11. 想跑 `ccteam new ...` shell 命令,提示 command not found
-**原因**:V0.6.0 推荐**不走 shell**,所有创建在 Claude session 里 `/ccteam-creator` 完成。
-**修复**:在 Claude session 内 `/ccteam-creator`,跟向导走完即可。**不需要装 ccteam 二进制**。
+**原因**:推荐**不走 shell**,所有创建在 Claude session 里 `/ccteam-creator` 完成。
+**修复**:在 Claude session 内 `/ccteam-creator`,跟向导走完即可。**不需要装 ccteam 二进制**(除非你要跑 `ccteam start` daemon)。
 **相关**:A3。
 
 ### A12. 项目 `.mcp.json` 跟其他 MCP server 冲突
@@ -120,19 +118,16 @@
 **相关**:C4 / C9。
 
 ### B7. 编辑过 / reply 引用的 TG 消息 bot 看不到
-**原因**:TG bridge V0.6.0 只处理 plain text 新消息。
+**原因**:TG bridge 只处理 plain text 新消息(编辑事件不入 inbox)。
 **修复**:编辑后重新 @bot 一次;reply quote 不传入,需在新消息复述要点。
 **相关**:B8。
 
 ### B8. bot 看不到图片 / 文件
-**原因**:V0.6.0 mode 3 只支持 text;富媒体延 V0.7.x。
+**原因**:chat 模式当前只支持 text;富媒体在 backlog。
 **修复**:1) 图片 OCR 后粘贴文字;2) 文件放服务器 + URL 让 bot fetch。
-**相关**:`docs/versions/v0-6-0/prd.md` F109 不在范围。
+**相关**:B7。
 
-### B9. bot 在 DM(私聊)里不回
-**原因**:V0.6.0 mode 3 只支持 group chat,DM 是 V0.6.1。
-**修复**:把 bot 加群后 @ 它;DM 场景等 V0.6.1。
-**相关**:`docs/versions/v0-6-0/prd.md` F109。
+### B9. (reserved)
 
 ### B10. bot 突然回乱码 / 内部错误
 **原因**:模型 API 抽风(rate limit / overload / 内容审核)。
@@ -152,7 +147,7 @@
 ### B13. bot 回复夹了 `<thinking>` / 内部标记
 **原因**:模型未屏蔽 thinking 段,或 system prompt 没拦。
 **修复**:1) 通常 ccteam 自动剥;漏的请报 issue;2) workflow.yaml 加 `strip_thinking: true`。
-**相关**:`docs/versions/v0-6-0/prd.md` F108。
+**相关**:B10。
 
 ### B14. 群里多人同时 @bot,谁先谁后
 **原因**:bot 单 session 串行处理 turn。
@@ -189,7 +184,7 @@
 **相关**:B6 / C8。
 
 ### C5. 想给单个 bot 设硬上限,不动整个 workflow
-**原因**:V0.6.0 cost cap 默认 workflow 级。
+**原因**:cost cap 默认 workflow 级。
 **修复**:1) workflow.yaml `agents.<role>.max_cost_usd_per_day: 5`(per-role);2) 平台层附加 `--max-budget-usd` 硬终止兜底。
 **相关**:C1。
 
@@ -205,7 +200,7 @@
 
 ### C8. Cache 不命中,prompt token 暴涨
 **原因**:system prompt 含动态字段(时间戳 / cwd)每次都变。
-**修复**:V0.6.0 默认带 `--exclude-dynamic-system-prompt-sections`;若仍不命中,workflow.yaml 别在 system prompt 里塞 "今天日期" 这类。
+**修复**:ccteam 默认带 `--exclude-dynamic-system-prompt-sections`;若仍不命中,workflow.yaml 别在 system prompt 里塞 "今天日期" 这类。
 **相关**:C4 / `docs/claude-code-best-practices.md` §6.2。
 
 ### C9. compact 完反而更贵了
@@ -216,7 +211,7 @@
 ### C10. 想完全 dry-run 不花钱
 **原因**:验证 workflow 而不调真实模型。
 **修复**:1) `/ccteam-control dry-run <slug>` — 只校验 yaml + 列将 spawn 的 role,不调 model;2) 单 bot:`CCTEAM_DRY_RUN=1` env。
-**相关**:`docs/versions/v0-6-0/dev-plan.md` validation 节。
+**相关**:C7。
 
 ---
 
@@ -249,7 +244,7 @@
 
 ---
 
-## E. Codex 集成(V0.6.0 引入,5 条)
+## E. Codex 集成(5 条)
 
 ### E1. workflow.yaml 标 `vendor: codex` 但 spawn 报 "codex not found"
 **原因**:Codex CLI 没装在 PATH。
@@ -264,17 +259,53 @@
 ### E3. codex 报 "sandbox denied"
 **原因**:codex 默认 `--sandbox read-only`,不允许写文件。
 **修复**:1) workflow.yaml `agents.<role>.codex_sandbox: workspace-write`;2) 危险场景才用 `danger-full-access`,且仅在容器里。
-**相关**:`docs/versions/v0-6-0/prd.md` Codex sandbox 表。
+**相关**:见 [advanced/multi-llm-codex.md](advanced/multi-llm-codex.md) Codex sandbox 表。
 
 ### E4. codex 比 claude 慢 3-5×
-**原因**:Codex 默认走 OpenAI Responses API,首 token 延迟比 Anthropic 高;且 V0.6.0 还没接 Codex 的 prompt cache。
-**修复**:1) 高频对话场景用 claude;2) batch 任务可接受;3) 等 V0.6.x 优化 codex cache。
+**原因**:Codex 默认走 OpenAI Responses API,首 token 延迟比 Anthropic 高;且 ccteam 还没接 Codex 的 prompt cache。
+**修复**:1) 高频对话场景用 claude;2) batch / advise 一次性场景可接受。
 **相关**:B3。
 
 ### E5. 同 workflow 混 Claude+Codex,cost 报告分裂
-**原因**:两 vendor 计费单位、token 价格不同,V0.6.0 不合算。
+**原因**:两 vendor 计费单位、token 价格不同,目前不合算。
 **修复**:`/ccteam-control show-cost --vendor claude` 和 `--vendor codex` 分别看;workflow 总额按各自 budget 独立 cap。
 **相关**:C6。
+
+---
+
+## F. Daemon / 运维(4 条)
+
+### F1. `ccteam start` 不退 / Ctrl+C 没反应
+**原因**:不应发生。daemon 实现 SIGINT / SIGTERM graceful drain(上限 5 秒);超过 5 秒未退 = bug。
+**修复**:
+1. **优先**:`kill -TERM $(cat ~/.ccteam/ccteam.pid)` 或 Ctrl+C 再等 5 秒
+2. 仍卡 → 收集 `ccteam doctor --full` + 跑 `ps -ef | grep ccteam` 看孤儿进程,贴 GitHub issue
+3. **最后兜底**(会留孤儿 pidfile / 可能伤进行中的 turn 状态):`kill -9 $(cat ~/.ccteam/ccteam.pid) && rm -f ~/.ccteam/ccteam.pid`
+**相关**:F2 / F3。
+
+### F2. 升级 ccteam 后 chat bot 失联 / context 像丢了
+**原因**:不应发生。`ccteam start` 启动时探测每个已注册 bot 的 `ccteam-chat-<slug>-<role>` tmux session,若 session + pane 内 claude 进程都活 → 自动 reattach(bot context 不丢)。
+**修复**:
+1. 终端 `tmux ls | grep ccteam-chat-` 看 session 是否存在
+2. 存在但 ccteam 没 reattach → 看 daemon 日志(`~/.ccteam/logs/ccteam-imd.log`)有无 reattach 行
+3. session 不存在(进程被 OOM-killed / 手动 `tmux kill-server`)→ ccteam 起新 session,context 确实丢;用 `mcp__ccteam__chat_history` 抓上轮 `turns.jsonl` 让 bot 自己重读上下文
+**相关**:F1 / B11。
+
+### F3. `ccteam mcp-serve` 跑起来 stdout 空 / 看不到 prompt
+**原因**:**正常行为**。`mcp-serve` 走 stdio JSON-RPC,**stdout 留给 protocol frame**,所有 tracing / log 走 stderr。
+**修复**:
+- 想看 log:**不要** `2>/dev/null` 屏蔽 stderr。`ccteam mcp-serve 2>&1 | tee debug.log` 才能同时看 RPC + log
+- 想纯 RPC view:`ccteam mcp-serve 2>/dev/null` — stdout 仍能解析(JSON-RPC 不被污染)
+- 想加 verbosity:`RUST_LOG=debug ccteam mcp-serve` 走 stderr
+**相关**:见 [advanced/customize-workflow.md](advanced/customize-workflow.md) MCP 内部章节。
+
+### F4. `chat_reset` 后 bot 还在回老 context
+**原因**:不应发生。`chat_reset` 归档 `turns.jsonl` + 清磁盘 cursor + daemon 内存 cursor 同步重置(三者原子)。
+**修复**:
+1. 看 `<ccteam_root>/imd/registry/<slug>/<role>.json` 里 `cursor` 字段是否 0
+2. 看 `<project>/.ccteam/chat/<bot>/turns.jsonl` 是否空(原内容应在 `archive/turns-<unix-ms>.jsonl`)
+3. tmux session 内 claude 进程仍持着旧 context — `mcp__ccteam__chat_unregister_bot` 再 `chat_register_bot` 一次,强制 spawn 新 claude 进程
+**相关**:B11 / §4.7 (user-manual.md)。
 
 ---
 
@@ -282,4 +313,4 @@
 
 1. 在终端跑 `ccteam doctor --full` 收集所有诊断信息(Claude session 内 `Bash("ccteam doctor --full")` 亦可)
 2. 仍卡:把诊断输出贴 GitHub issue,或 ccteam 用户群 @ 维护者
-3. 进阶 fix:`docs/versions/v0-6-1/prd.md` 找对应 F-finding;`docs/claude-code-tool-surface.md` 看平台原语;`docs/dev-coupling-audit.md` 看历史已修类似问题
+3. 进阶 fix:`docs/claude-code-tool-surface.md` 看平台原语;`docs/dev-coupling-audit.md` 看历史已修类似问题;`docs/tech-design.md` 看架构权威

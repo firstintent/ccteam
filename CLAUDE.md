@@ -11,7 +11,7 @@
 |---|---|
 | 主分支 main HEAD | 以 `git rev-parse origin/main` 为准 |
 | Workspace version | **`0.6.5`** |
-| 测试 baseline | **`1579/1`**(`cargo test --workspace --locked --no-fail-fast`,1 fail 是 ccteam-web `workflow_summary_reflects_agent_spawn_and_done_events` running_count flake;另零星观察到 `daemon_wires_mock_channel_to_supervisor_inbox` / `daemon_dm_no_at_mention_auto_routes_to_single_bot` 等单次性 flake,均不计入 baseline)|
+| 测试 baseline | **`1583/1`**(`cargo test --workspace --locked --no-fail-fast`,1 fail 是 ccteam-web `workflow_summary_reflects_agent_spawn_and_done_events` running_count flake;另零星观察到 `daemon_wires_mock_channel_to_supervisor_inbox` / `daemon_dm_no_at_mention_auto_routes_to_single_bot` 等单次性 flake,均不计入 baseline;F163 retro PR #116 加 4 unit tests 覆盖 BlockingPool / AgentTeamsWatcher graceful drain)|
 | Clippy | **0 errors + 0 warnings**(`-D warnings` clean)|
 | 代码规模 | ~89 kLOC Rust(workspace,~62 kLOC src + ~27 kLOC tests,不含 references)|
 | 当前最新版 | **V0.6.5**(F146-F165 共 20 finding:Epic E MCP chat 桥 + Epic F advise/Codex critic + Epic G UX cohesion + Epic H 运维健壮性 + 中途 F165 mcp-serve tracing→stderr — 关 V0.6 立项时承诺但 Wave 2/3 留 STUB 的账)— 详 `docs/versions/v0-6-5/README.md` |

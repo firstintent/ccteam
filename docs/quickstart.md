@@ -13,18 +13,57 @@
 ```
 你想做的事                                  → 用这个
 ──────────────────────────────────────────────────────────────────
-摸底新代码库 / 仓库 audit                    /ccteam-scan
+摸底新代码库(60s 零依赖,首选)              /ccteam-scan --quick     ↓ §1.5 详跑
+仓库 navigability 体检 / 大型 monorepo audit  /ccteam-scan
 开发 / 修 bug / 重构(全程盯着干)            /ccteam-team "<task>"
-review PR / 第二意见 / 对答案                /ccteam-advise "<PR 或 path>"
+跨 vendor 第二意见(Claude + Codex)          /ccteam-advise "<问题>"   ↓ §4 详跑
 做个 IM 私聊助理(长期 24/7 在线)            /ccteam-creator "做个 X 助理"  ↓ §2 详跑通
 做个团队 IM 圆桌(多 bot 互动)               /ccteam-creator "群里几个 bot"
 夜里跑长任务(hands-off / 关电脑)            /ccteam-creator "<task>,睡前跑"
+程序化起 bot / 看历史 / 重置 session         mcp__ccteam__chat_*      ↓ §5 详跑
 看 / 暂停 / 恢复 / 看花费                    /ccteam-control list / pause / cost
 配 / 改 IM token(TG / Slack / Discord)      /ccteam-im-setup
+验证安装 / 验 Codex auto-critic              ccteam doctor [--check-codex-auto-critic]
 不确定?用自然语言问                          /ccteam "<NL 描述>"
 ```
 
 每条详解 + 例子见 [task-to-command.md](task-to-command.md)。
+
+---
+
+## §1.5 60 秒上手:`/ccteam-scan --quick`(零依赖,首选)
+
+第一次摸 ccteam,如果你不打算立刻起 bot,**最低门槛的体验**就是 `--quick` 扫一个本地仓库:无需 IM token、无需 daemon、无需 Codex,只调一次 Sonnet,1 分钟内给你三段报告(主语言/框架/入口 · TODO 热点 · `CLAUDE.md` / `AGENTS.md` 状态)+ 一句建议你下一步该跑哪个 ccteam 命令。
+
+```bash
+cd path/to/any-repo
+claude
+```
+
+session 里:
+
+```
+/ccteam-scan --quick
+```
+
+输出大致这样:
+
+```
+ccteam-scan (quick) → <repo>/.ccteam/codebase-scan.md
+
+[1/3] Language / framework / entry
+  Rust workspace · tokio + axum · entry crates/ccteam-cli/src/main.rs
+
+[2/3] TODO / FIXME hotspots
+  crates/ccteam-imd/src/outbound.rs: 4 TODO
+  docs/troubleshooting.md: 2 FIXME
+
+[3/3] CLAUDE.md / README / AGENTS.md status
+  CLAUDE.md ✓ (180 lines, current) · README.md ✓ (English) · AGENTS.md → CLAUDE.md symlink ✓
+  建议下一步:用 /ccteam-team 处理 TODO,或 /ccteam-creator 起一个长跑 bot 监控这堆 hotspot
+```
+
+24h 内复跑会直接显示上次报告(`--force` 强制重扫)。**不**写 git / 不开 daemon / 不动 `~/.ccteam/`。
 
 ---
 
@@ -56,10 +95,12 @@ $ claude
 预期输出:
 
 ```
-✓ Installed ccteam@0.6.0
-  • 5 slash commands registered: /ccteam, /ccteam-team, /ccteam-creator, /ccteam-control, /ccteam-im-setup
-  • mcp__ccteam__* tools available
+✓ Installed ccteam
+  • slash commands registered: /ccteam, /ccteam-team, /ccteam-creator, /ccteam-control, /ccteam-im-setup, /ccteam-scan, /ccteam-advise
+  • mcp__ccteam__* tools available (workflow_* / chat_* / advise_* / admin_* / screenshot_*)
 ```
+
+跑 `ccteam doctor` 验装(claude CLI / MCP / tmux / pidfile 路径都查一遍);加 `--check-codex-auto-critic` 验证 Codex 二审是否能开。
 
 → 卡了?见 [troubleshooting.md](troubleshooting.md) "plugin install 失败"。
 
@@ -136,6 +177,45 @@ You:     go
 ## Step 5 — 跨设备试试(可选)
 
 笔记本继续开着,掏手机走开,继续在 TG 跟 bot 聊。bot 仍然回。bot 跑在**你电脑上**(能动文件 / 跑命令),手机只是入口 — 这是跟 ChatGPT app 拉开差异的关键。
+
+---
+
+## §4 跨 vendor 第二意见:`/ccteam-advise`(可选)
+
+碰到拿不准的设计 / PR / 代码片段,想要 Claude + Codex 两边各给一个答案再自己拍板:
+
+```
+/ccteam-advise vote "这段 SSO 设计的 token-refresh 路径有没有竞态?"
+```
+
+ccteam 并行调用 Claude + Codex 两个 advisor,合成 verdict(majority / unanimous / split),附每个 vendor 的原始答复 + 估算 cost。`parallel` 模式不合成,直接给两份 raw answer 让你自己读:
+
+```
+/ccteam-advise parallel "重构这段 auth 中间件有几种方式?"
+```
+
+**前置**:Codex 装好(`codex --version`)+ `codex login` 跑过。没装 ccteam 会 graceful 降级跑单 Claude advisor,verdict prose 说 "Codex unavailable: <reason>",**不报错**。两个 vendor 各自走 24h cost cap(`<ccteam_root>/cost-budget.json`,撞顶自动跳过该 vendor)。
+
+底层 MCP 工具:`mcp__ccteam__advise_vote` / `mcp__ccteam__advise_parallel`。
+
+---
+
+## §5 程序化起 bot:chat MCP 工具(可选)
+
+`/ccteam-creator` 是新手 onboarding 通路;**已经懂 ccteam** 之后,从 Claude session 内直接调 MCP 工具更快:
+
+```
+mcp__ccteam__chat_register_bot { "slug": "helper", "role": "main", "vendor": "claude", "im_chat_id": "123456789" }
+mcp__ccteam__chat_list_bots {}
+mcp__ccteam__chat_send_input { "slug": "helper", "role": "main", "text": "summarize today's PRs" }
+mcp__ccteam__chat_history { "slug": "helper", "role": "main", "limit": 10 }
+mcp__ccteam__chat_reset { "slug": "helper", "role": "main" }
+mcp__ccteam__chat_unregister_bot { "slug": "helper", "role": "main" }
+```
+
+6 个工具组成完整生命周期:register → list / send_input / history → reset → unregister。`chat_reset` 归档 `turns.jsonl` 到 `archive/turns-<ts>.jsonl` + 清 outbound cursor + 清 transcript cursor(daemon 内存与磁盘同步重置)。`vendor` 字段严格小写枚举:`claude` 或 `codex`。
+
+适合场景:CI 编排起多个 bot 做 batch / 给已跑 bot 推一个程序化指令 / 抓 bot 历史做 audit。**仍然守红线**:per-bot tmux session、`progress.jsonl` 是 state SoT、不写 prompt。
 
 ---
 

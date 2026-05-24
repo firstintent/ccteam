@@ -1,4 +1,4 @@
-# Recipes — 8 个 ready-to-go 配方
+# Recipes — ready-to-go 配方
 
 > 这是一份"照菜单点"的快速起手册。每个配方告诉你 **一句话怎么起、起出来是啥、每天大约花多少钱**。
 >
@@ -362,7 +362,7 @@ final 输出 → 你点 reaction 表示接受 / 让某个 bot 重做一段
 
 ### 适合谁
 
-任何"我要 V0.6.0 一上来就玩 Codex 集成"的早期采用者;严肃多模块改动场景。
+想从 day-1 用 Codex 集成的早期采用者;严肃多模块改动场景。
 
 ### 起步
 
@@ -437,7 +437,7 @@ ccteam-creator 推断:**混合** — Overnight Builder 跑长任务 + Pocket Ass
 ```
 PROJECT PLAN
 ============
-Type:           Pocket Assistant + Overnight Builder(混合配方,V0.6.0 验证项)
+Type:           Pocket Assistant + Overnight Builder(混合配方)
 Bot:            @project_lead(persona: 项目监工 中文版)
 白天角色:        TG 私聊回答进度问题、收新需求、整理 backlog
 夜里角色:        跑 test → fix bug → 生成晨报
@@ -477,6 +477,161 @@ Reply 'go' 启动。
 ### 想改?
 
 [进阶定制 — 调白天 / 夜里时段 / 改通知策略 / 加多人协作](advanced/customize-workflow.md#hybrid-project-lead)
+
+---
+
+## 配方 9 — 60s 摸底新开源项目(零 token,零依赖)
+
+### 场景
+
+> "我刚 clone 一个开源项目,想 60 秒知道它是干啥的 / TODO 集中在哪 / 文档齐不齐,再决定要不要深读。"
+
+### 适合谁
+
+任何刚 clone 仓库的人 / 评估一个候选依赖 / 给团队做 due-diligence 的 lead。**第一次接触 ccteam 也用这条** — 不开 daemon、不绑 IM、不需 Codex,纯单 Sonnet 调用看价值。
+
+### 起步
+
+```bash
+cd path/to/repo
+claude
+```
+
+session 里:
+
+```
+/ccteam-scan --quick
+```
+
+### 用法
+
+约 60 秒后,报告写到 `<repo>/.ccteam/codebase-scan.md`,session 内直接渲染:
+
+```
+[1/3] Language / framework / entry
+  Rust workspace · tokio + axum · entry crates/foo-cli/src/main.rs
+
+[2/3] TODO / FIXME hotspots
+  crates/foo-core/src/worker.rs: 7 TODO / 2 FIXME
+  docs/architecture.md: 3 TODO
+
+[3/3] CLAUDE.md / README / AGENTS.md status
+  CLAUDE.md ✗ (建议 claude /init)· README.md ✓ (English) · AGENTS.md 缺
+  建议下一步:跑 claude /init 写一份 CLAUDE.md;或 /ccteam-team 干掉 worker.rs 那 7 个 TODO
+```
+
+24h 内复跑直接显示上次报告(`--force` 强制重扫)。
+
+### 预期 cost
+
+每次 ≈ $0.01-0.03(单 Sonnet 调用,小中型仓库)。
+
+---
+
+## 配方 10 — Claude + Codex 双 vendor 二审一个设计决策
+
+### 场景
+
+> "我在拿不准的设计决策上想要 Claude 和 Codex 两边各给一份分析,看两边同不同意,再自己拍板。"
+
+### 适合谁
+
+任何"拿不准"场景:架构选型、PR 评审、棘手 bug 根因、性能优化路径选择。
+
+### 起步
+
+前置:`codex login` 跑过(可用 `ccteam doctor --check-codex-auto-critic` 一条命令验)。
+
+```
+/ccteam-advise vote "我们的 SSO token refresh 路径,放 redis 缓存还是走 DB 行锁?各自的故障模式有哪些?"
+```
+
+### 用法
+
+ccteam 并行调 Claude + Codex 两个 advisor,合成一份 verdict:
+
+```
+VERDICT: split
+Claude (Opus): 推荐 redis,理由 (1) 延迟低 (2) 失效自动... [完整答复 ~500 字]
+Codex (gpt-5.2-codex): 推荐 DB 行锁,理由 (1) 强一致 (2) 不依赖独立组件...
+
+差异点:
+  - 一致性 vs 延迟 trade-off 选不同
+  - Claude 假设 redis 高可用;Codex 假设 redis 是 SPOF
+
+Cost: Claude $0.02 + Codex $0.03 = $0.05
+```
+
+`parallel` 模式不合成,直接给两份 raw answer 让你自己读:
+
+```
+/ccteam-advise parallel "重构这段 auth 中间件有几种方式?"
+```
+
+### 生成什么
+
+无文件落盘(单次跑完即用)。两 vendor 各自走 24h cost cap(记账 `<ccteam_root>/cost-budget.json`,48h 自动 GC)。某 vendor 撞顶 → 静默跳过,verdict 标 `budget_exhausted`。
+
+### 预期 cost
+
+- 单次 vote ≈ **$0.01-0.05**(两 vendor 各跑一次)
+- 单次 parallel 同上
+
+### 想改?
+
+[Codex 集成进阶](advanced/multi-llm-codex.md):自定义 Codex sandbox / reasoning effort / 切默认 vendor。
+
+---
+
+## 配方 11 — 程序化起一个长跑 IM bot(MCP 路径)
+
+### 场景
+
+> "我已经懂 ccteam,想从 Claude session 内一句 MCP call 起 / 改 / 重置一个 chat bot,不走 /ccteam-creator 向导。"
+
+### 适合谁
+
+CI 编排 / 批量起多个 bot / power user 想跳过向导 / 自动化测试 / 给已跑 bot 推程序化指令。
+
+### 起步
+
+前置:`ccteam-im-setup` 跑过(token 落 `~/.ccteam/im/credentials.json`)。session 里直接调 MCP:
+
+```json
+{ "name": "mcp__ccteam__chat_register_bot",
+  "args": { "slug": "helper", "role": "main", "vendor": "claude", "im_chat_id": "123456789" } }
+```
+
+### 用法
+
+```json
+mcp__ccteam__chat_list_bots {}
+→ { "bots": [ { "slug": "helper", "role": "main", "running": true, "heartbeat_age_secs": 7 } ] }
+
+mcp__ccteam__chat_send_input { "slug": "helper", "role": "main", "text": "summarize today's PRs" }
+
+mcp__ccteam__chat_history { "slug": "helper", "role": "main", "limit": 5 }
+→ { "turns": [ {"turn_id":"...", "user":"...", "assistant":"..."} ] }
+
+mcp__ccteam__chat_reset { "slug": "helper", "role": "main" }
+→ { "ok": true, "archived": "archive/turns-1716527890123.jsonl" }
+
+mcp__ccteam__chat_unregister_bot { "slug": "helper", "role": "main" }
+```
+
+### 生成什么
+
+`<ccteam_root>/imd/registry/<slug>/<role>.json` + `<role>.heartbeat`(daemon 自维护)。`vendor` 字段严格小写枚举(`claude` / `codex`),3 层校验(schema enum / dispatch `to_lowercase()` / serde `rename_all`)。
+
+`chat_reset` 归档 `turns.jsonl` 到 `archive/turns-<unix-ms>.jsonl` + 清 outbound cursor + 清 transcript cursor(daemon 内存 + 磁盘同步重置 — 不留 race)。
+
+### 预期 cost
+
+MCP 工具本身 0 cost(纯文件操作 + daemon coordination);bot 跑起来后按 turn 计费。
+
+### 想改?
+
+[进阶定制](advanced/customize-workflow.md):workflow.yaml 字段 / multi-bot per slug / cross-vendor squad。
 
 ---
 

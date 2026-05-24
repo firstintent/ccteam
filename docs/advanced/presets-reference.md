@@ -164,7 +164,7 @@ turns_jsonl: <project>/.ccteam/chat/<bot>/turns.jsonl    # ccteam-owned conversa
 {"turn_id":"...","ts":"...","user":"...","assistant":"...","usage":{"input_tokens":...,"output_tokens":...,"cache_read_input_tokens":...},"tool_calls":[...],"vendor":"claude"}
 ```
 
-`session_id_persist` 文件丢失 / Anthropic 内部 jsonl 改格式 → fail-open + 从 `turns_jsonl` last-N turn 重建 conversation(详 F118)。
+`session_id_persist` 文件丢失 / Anthropic 内部 jsonl 改格式 → fail-open + 从 `turns_jsonl` last-N turn 重建 conversation。
 
 ---
 
@@ -209,8 +209,8 @@ budgets:
 
 `bot_to_bot.routing` 选项:
 - `at_mention` — 只有显式 @ 才转发(默认)
-- `keyword` — agent prompt 内置关键词触发(进阶,V0.7+)
-- `pubsub` — 任何 bot 发言所有其他 bot 都看到(危险,V0.7+ 仅小群组)
+- `keyword` — agent prompt 内置关键词触发(在 backlog)
+- `pubsub` — 任何 bot 发言所有其他 bot 都看到(在 backlog,且限小群组)
 
 `hop_escalate_to`:`user` / `lead` / `none`(撞 limit 自动停)
 
@@ -236,9 +236,9 @@ budgets:
 
 `im.transport` 字段:
 
-| 值 | 形态 | provider 支持(V0.6.0) |
+| 值 | 形态 | provider 支持 |
 |---|---|---|
-| `openhuman`(default)| `ccteam-imd` daemon + `openhuman/channels` crate | Telegram / Slack / Discord(V0.6.0);Lark / DingTalk / QQ feature gate(V0.7 启用) |
+| `openhuman`(default)| `ccteam-imd` daemon + `openhuman/channels` crate | Telegram(stable);Slack / Discord(provider Rust 就位,onboarding skill 在 backlog);Lark / DingTalk / QQ / WeChat(feature gate,onboarding 在 backlog)|
 | `official-telegram` | `claude --channels plugin:telegram@claude-plugins-official` | Telegram only |
 
 切换走 `/ccteam-im-setup --transport <name>`,不让用户编辑 yaml。两 path 互斥(同 bot token 不可同时绑两条)。
@@ -303,4 +303,4 @@ agents:
 - 5 preset 用户文档:[user-manual.md](../user-manual.md)
 - 自定义改造:[advanced/customize-workflow.md](customize-workflow.md)
 - Codex 集成深拆:[advanced/multi-llm-codex.md](multi-llm-codex.md)
-- 架构权威:`docs/tech-design.md` + `docs/interfaces.md` + `docs/architecture/orchestration-patterns.md`(V0.6.0 重组后路径)
+- 架构权威:`docs/tech-design.md` + `docs/interfaces.md` + `docs/orchestration-patterns.md`

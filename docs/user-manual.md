@@ -11,20 +11,24 @@
 **先看决策树**,挑一条路再下读对应章节。完整决策树详解见 [task-to-command.md](task-to-command.md)。
 
 ```
-你想做的事                                  → 用这个              → 本手册章节
-─────────────────────────────────────────────────────────────────────────────
-摸底新代码库 / 仓库 audit                    /ccteam-scan          §2.0
-开发 / 修 bug / 重构(全程盯着干)            /ccteam-team          §2.2 Team Sprint
-review PR / 第二意见 / 对答案                /ccteam-advise        §2.6 Advise
-IM 私聊助理(长跑)                          /ccteam-creator       §2.4 Pocket Assistant
-IM 圆桌(多 bot)                            /ccteam-creator       §2.5 IM Squad
-夜里跑长任务(hands-off)                    /ccteam-creator       §2.3 Overnight Builder
-看 / 暂停 / 改 persona / 加工具              /ccteam-control       §4 Admin 操作
-配 / 改 IM token                             /ccteam-im-setup      §2.4 + quickstart
-不确定?用自然语言问                          /ccteam "<NL>"        §3.1
+你想做的事                                  → 用这个                  → 本手册章节
+──────────────────────────────────────────────────────────────────────────────────
+摸底新代码库(60s 零依赖)                    /ccteam-scan --quick      §2.0
+仓库 navigability 体检                        /ccteam-scan              §2.0
+开发 / 修 bug / 重构(全程盯着干)            /ccteam-team              §2.2 Team Sprint
+跨 vendor 第二意见(Claude + Codex)          /ccteam-advise            §2.6 Advise
+IM 私聊助理(长跑)                          /ccteam-creator           §2.4 Pocket Assistant
+IM 圆桌(多 bot)                            /ccteam-creator           §2.5 IM Squad
+夜里跑长任务(hands-off)                    /ccteam-creator           §2.3 Overnight Builder
+程序化起 / 管 chat bot                        mcp__ccteam__chat_*       §4.7
+看 / 暂停 / 改 persona / 加工具              /ccteam-control           §4.1-§4.6
+诊断 / 验 Codex auto-critic                   ccteam doctor             §4.8
+配 / 改 IM token                             /ccteam-im-setup          §2.4 + quickstart
+daemon 优雅停止 / tmux reattach              kill -TERM <pid>          §6
+不确定?用自然语言问                          /ccteam "<NL>"            §3.1
 ```
 
-> §1 介绍 ccteam 是什么 / 三种对话入口;§2 详跑每个场景;§3 是入口手册;§4 是 admin 操作参考;§5 cost。**只想用,跳到 §2 对应小节即可**。
+> §1 介绍 ccteam 是什么 / 三种对话入口;§2 详跑每个场景;§3 是入口手册;§4 是 admin 操作 + MCP 工具参考;§5 cost;§6 daemon 运维。**只想用,跳到 §2 对应小节即可**。
 
 ---
 
@@ -52,9 +56,38 @@ ccteam = "在 Claude session 里召唤一个 AI 团队,长跑 + 跨设备 + 接�
 
 ---
 
-## §2 5 种用法(preset)
+## §2 用法(preset)
 
 每种用法 = "一个 ccteam 团队的预设配方"。你只挑场景,不挑实现细节。
+
+### §2.0 Code-Base Scan — 摸底新代码库
+
+**啥时用**:刚 clone 一个仓库,或者第一次接触 ccteam 想 60 秒看到价值。**零依赖** — 不开 daemon、不需 IM token、不需 Codex,只调一次 Sonnet(失败兜底 Haiku)。
+
+**怎么起**:
+
+```bash
+cd path/to/repo
+claude
+```
+
+session 里:
+
+```
+/ccteam-scan --quick                  # 60 秒快速体检(首选)
+/ccteam-scan                          # 完整 navigability audit(大型 monorepo 用,适合 contributor)
+```
+
+`--quick` 模式三问:
+1. **主语言 / framework / 入口** — 一句话告诉你这仓库是干啥的
+2. **TODO / FIXME 热点** — 哪几个文件 / 模块技术债集中
+3. **`CLAUDE.md` / `README.md` / `AGENTS.md` 状态** — 是否齐全,需不需要 `claude /init` 写初版
+
+报告写到 `<repo>/.ccteam/codebase-scan.md`(带 frontmatter `quick: true`)。24h 内复跑直接显示上次报告 + 建议加 `--force` 强制重扫。
+
+**Cost 估**:每次 ≈ $0.01-0.03(单 Sonnet 调用)。
+
+---
 
 ### §2.1 Solo Sidekick — 写代码时临时召唤一个帮手
 
@@ -220,21 +253,56 @@ writer_bot: 已起草文档,贴 PR 链接 → #1240
 
 ---
 
+### §2.6 Advise — 跨 vendor 第二意见(Claude + Codex)
+
+**啥时用**:你想拿一个**硬问题 / 设计决策 / PR 评审 / 棘手 bug** 去同时问 Claude 和 Codex,看两个 vendor 各给一份答案再自己拍板。**单视角不够**的场景。
+
+**两个 sub-mode**:
+
+| Sub-mode | 行为 | 何时用 |
+|---|---|---|
+| `vote` | 并行调多个 advisor,合成 verdict(majority / unanimous / split)+ 每 vendor 的 raw 答复 | 想看"两边到底同不同意" |
+| `parallel` | 并行调,**不合成**,直接 dump 每 vendor 的 raw 答复 | 想自己读两份对比 |
+
+**怎么起**:
+
+```
+/ccteam-advise vote "<question>"
+/ccteam-advise parallel "<question>"
+```
+
+或显式选 vendor 子集:
+
+```
+/ccteam-advise vote --vendors=claude,codex "<question>"
+```
+
+**前置**:Codex 装好 + `codex login` 跑过(可用 `ccteam doctor --check-codex-auto-critic` 一条命令验)。**没装也能跑** — graceful 降级单 Claude advisor,verdict prose 写 "Codex unavailable: <reason>",**不报错**。
+
+**Budget 守门**:每 vendor 单独 `max_cost_usd_per_24h` cap,记账落 `<ccteam_root>/cost-budget.json`(48h 自动 GC)。某 vendor 撞顶 → 静默跳过该 vendor 跑其余,verdict 标注 `budget_exhausted`。
+
+**底层 MCP 工具**:`mcp__ccteam__advise_vote` / `mcp__ccteam__advise_parallel`(可绕过 skill 直接调,适合 CI / batch)。
+
+**Cost 估**:单次 vote ≈ $0.01-0.05(两 vendor 各跑一次)。
+
+---
+
 ## §3 怎么跟 ccteam 对话(三种入口详解)
 
 ### §3.1 在 Claude session 内
 
 总入口 `/ccteam <NL>` 是万能的 — 发啥都行,它路由到对应 sub-skill。
 
-直接跳过 router 也行,5 个 sub-slash:
+直接跳过 router 也行,7 个 sub-slash:
 
 | Slash | 干啥 |
 |---|---|
+| `/ccteam-scan [--quick]` | 摸底新代码库(`--quick` 60s 零依赖,默认完整 navigability audit)|
 | `/ccteam-team <N> "<task>"` | 起临时 team(Team Sprint)|
 | `/ccteam-creator "<NL>"` | 起新 workflow / 改现有 workflow |
 | `/ccteam-control <subcmd>` | 管已有 workflow(暂停 / 恢复 / 查 cost / 改 persona)|
 | `/ccteam-im-setup` | 一次性绑 IM token(TG / Slack / Discord)|
-| `/ccteam-advise "<hard question>"` | Claude + Codex 并行二答案(仅装了 Codex 才出来)|
+| `/ccteam-advise vote\|parallel "<question>"` | Claude + Codex 并行二答案(没装 Codex 自动降级单 Claude)|
 
 ### §3.2 在 IM 端
 
@@ -262,9 +330,11 @@ Web **只看不操作**。所有控制走 Claude session slash 或 IM。
 
 ---
 
-## §4 Admin 操作参考(`mcp__ccteam__admin_*` + `mcp__ccteam__workflow_*`)
+## §4 Admin / Chat / Doctor MCP 操作参考
 
-> 所有 admin 操作的首选路径是 **MCP 工具**(`mcp__ccteam__*`)。如果 MCP 未注册(尚未跑 `ccteam doctor --install-mcp`),可用对应的 Bash fallback。
+> 所有操作的首选路径是 **MCP 工具**(`mcp__ccteam__*`)。如果 MCP 未注册(尚未跑 `ccteam doctor --install-mcp`),可用对应的 Bash fallback。MCP 工具按 5 个子前缀分组:`workflow_*` / `chat_*` / `advise_*` / `admin_*` / `screenshot_*`。
+>
+> §4.1-§4.6 是 admin 路径(workflow + persona / tool 管理);§4.7 是 chat 生命周期 MCP;§4.8 是 doctor 子命令。
 
 ### §4.1 暂停 / 恢复 workflow
 
@@ -412,6 +482,54 @@ skill 把 NL 翻译成 Claude Code 工具名(如 `WebFetch`、`Bash`)后调:
 
 ---
 
+### §4.7 Chat MCP 工具(程序化起 / 管 / 抓历史 / 重置 bot)
+
+`/ccteam-creator` 是 NL 向导,适合新手 onboarding;**已经懂 ccteam** 后从 Claude session 内直接调 MCP 更快。6 个工具构成完整生命周期:
+
+| 工具 | 用途 | 关键参数 |
+|---|---|---|
+| `mcp__ccteam__chat_register_bot` | 注册一个 chat bot 入 daemon registry | `{ slug, role, vendor, im_chat_id }`(`vendor` 严格小写枚举 `claude` / `codex`)|
+| `mcp__ccteam__chat_list_bots` | 列所有 registered bot + heartbeat 状态 | `{ slug? }`(省 = 全列)|
+| `mcp__ccteam__chat_send_input` | 给某 bot 推一段文本(走 inbox 文件,不直注 tmux pane)| `{ slug, role, text }` |
+| `mcp__ccteam__chat_history` | 抓 bot 对话历史(从 `turns.jsonl` 读)| `{ slug, role, limit? }` |
+| `mcp__ccteam__chat_reset` | 重置 session:归档 `turns.jsonl` + 清 outbound cursor + 清 transcript cursor | `{ slug, role }` |
+| `mcp__ccteam__chat_unregister_bot` | 注销 bot(daemon 自行停 tmux,清 heartbeat sidecar)| `{ slug, role }` |
+
+**Heartbeat 语义**:`chat_list_bots` 返回 `running: true` 当且仅当 `<root>/imd/registry/<slug>/<role>.heartbeat` mtime 在 30 秒内。daemon 重启时,bot tmux session 不丢,**自动 reattach**(详 §6)。
+
+**Reset 行为**:`chat_reset` 把当前 `turns.jsonl` 移到 `archive/turns-<unix-ms>.jsonl`,然后清磁盘 cursor 文件 + 让 daemon 重置内存里的 cursor — 两边同步,**不存在 "磁盘清干净但 daemon 还在读旧位置" 的 race**。
+
+**典型 JSON example**:
+
+```json
+{
+  "name": "chat_register_bot",
+  "args": { "slug": "helper", "role": "main", "vendor": "claude", "im_chat_id": "123456789" }
+}
+```
+
+返回:`{ "ok": true, "slug": "helper", "role": "main", "registered_path": "..." }`
+
+适合场景:CI 编排起多个 bot 做 batch / 给已跑 bot 推一个程序化指令 / 抓 bot 历史做 audit / 自动化测试。
+
+---
+
+### §4.8 Doctor 子命令
+
+`ccteam doctor` 是诊断入口,在任意终端跑(也可 `Bash("ccteam doctor")` 从 Claude session 内调):
+
+| 子命令 / flag | 用途 |
+|---|---|
+| `ccteam doctor` | 全套诊断(claude CLI 版本 / MCP 注册 / tmux / pidfile 路径 / web port)|
+| `ccteam doctor --install-mcp` | 重写 `~/.claude.json` / 项目 `.mcp.json` 里的 `ccteam` MCP server 注册 |
+| `ccteam doctor --check-codex` | 验 codex binary 存在 + auth ok |
+| `ccteam doctor --check-codex-auto-critic` | 验 codex 可用且能跑一次 `codex exec --json` canary(exit 0 = ok / 2 = binary 缺 / 3 = output 格式不对)|
+| `ccteam doctor --full` | 全套 + 详细输出(收集成给 issue)|
+
+`--check-codex-auto-critic` 是 `/ccteam-creator` Phase 3.5 内部调的同一条命令 — 决定 critic 角色是否自动设 `vendor: codex`。手动验等价。
+
+---
+
 ## §5 Cost 透明
 
 ccteam 默认每个 workflow 有 24h cost cap(creator 起项目时问你)。
@@ -437,16 +555,32 @@ qa-loop          $4.12    $5.00     ↘ -3%      ⚠ 82% of cap
 
 ---
 
-## §6 从 V0.5 升级到 V0.6 — 0 用户操作
+## §6 运维:daemon 优雅停止 + tmux reattach
 
-V0.6 升级**完全无感**:
+ccteam 把 orchestrator + IM bridge(`ccteam-imd`) + web 仪表板都装进 `ccteam start` 这一个 tokio runtime,前台跑或加 `&` 后台。
 
-- 你的 V0.5 项目配置继续跑 — 兼容,**0 文件修改**。
-- MCP 工具名字 `mcp__ccteam__*` **全保留** — V0.5 muscle memory 0 破坏。
-- V0.5 的 `/ccteam-team` / `/ccteam-control` / `/ccteam-creator` slash 行为兼容。
-- **新加**:`/ccteam` 总入口、`/ccteam-im-setup`(绑 IM)、`/ccteam-advise`(双 LLM 投票)。
+**优雅停止**:
 
-**唯一新选**:想试 Pocket Assistant / IM Squad?跑一次 `/ccteam-im-setup` 绑 TG token 就行。
+```bash
+kill -TERM $(cat ~/.ccteam/ccteam.pid)   # 或 Ctrl+C 在前台 terminal
+```
+
+行为契约:
+- daemon 收 SIGTERM / SIGINT → 5 秒内进 graceful drain(`TASK_DRAIN_TIMEOUT = 5s` 上限)
+- web port(默认 7331)立即释放
+- pidfile `~/.ccteam/ccteam.pid` 自动 unlink
+- **tmux 长 session 不被 kill**(CLAUDE.md §三 "永不主动 kill 长 session" 红线)— bot 进程留着,等下次 `ccteam start` reattach
+
+**不要用 `kill -9` / `SIGKILL`**。SIGKILL 跳过 graceful drain,会留孤儿 pidfile,可能伤进行中的 turn 状态。只有 graceful 卡死 5 秒以上才考虑 SIGKILL,且属于 bug — 请 issue。
+
+**tmux reattach across daemon restart**:
+
+升级 ccteam 或机器重启后,`ccteam start` 启动时探测每个已注册 bot 的 tmux session(`ccteam-chat-<slug>-<role>`):
+- session 存在 + pane 内 `claude` 进程活 → **reattach**(不 spawn 新 claude,bot context 不丢)
+- session 存在 + pane 死 → `tmux kill-session` 后重起新 session
+- session 不存在 → 起新 session
+
+也就是:**升级 ccteam 不会丢 bot 对话 context**。bot 仍在 IM 端 responsive,不需要人工 `tmux kill-session` 后再 `ccteam-creator` 重起。
 
 ---
 
@@ -459,4 +593,4 @@ V0.6 升级**完全无感**:
 | 改默认 persona / 加 MCP 工具 / 自定义 workflow | [advanced/customize-workflow.md](advanced/customize-workflow.md) |
 | 装 Codex 让两个 LLM 互审 | [advanced/multi-llm-codex.md](advanced/multi-llm-codex.md) |
 | 出错查不到 | [troubleshooting.md](troubleshooting.md) |
-| 看代码 / 改 ccteam | [architecture/](architecture/) |
+| 看代码 / 改 ccteam | [tech-design.md](tech-design.md) + [interfaces.md](interfaces.md) |
