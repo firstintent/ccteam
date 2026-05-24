@@ -18,7 +18,7 @@ A multi-bot IM round-table                       /ccteam-creator "a few bots in 
 Run a long task overnight (hands-off)            /ccteam-creator "<task>, run while I sleep"
 List / pause / resume / check spending           /ccteam-control list | pause | cost
 Wire up an IM token (Telegram / Slack / Discord) /ccteam-im-setup
-Verify your install / check Codex auto-critic    ccteam doctor [--check-codex-auto-critic]
+Verify your install / MCP surface / Codex critic ccteam doctor [--verify-mcp | --check-codex-auto-critic | --check-cost-orphan]
 Not sure? Just describe it in natural language   /ccteam "<what you want>"
 ```
 
@@ -34,10 +34,11 @@ curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh |
 #    Installs to ~/.local/bin/ccteam. The script prints a PATH-export
 #    hint if that directory isn't on your PATH yet — follow it, then
 #    restart your shell (or `source ~/.bashrc` / `source ~/.zshrc`).
+#    Pin a specific release tag: CCTEAM_VERSION=<tag> curl ... | sh
+#    Install system-wide:        CCTEAM_INSTALL_DIR=/usr/local/bin curl ... | sh
+#    Or download an archive from https://github.com/firstintent/ccteam/releases
 #    Build from source instead (requires Rust 1.85+):
 #      cargo install --git https://github.com/firstintent/ccteam ccteam-cli
-#    Pin a specific release tag: CCTEAM_VERSION=<tag> curl ... | sh
-#    Or download an archive from https://github.com/firstintent/ccteam/releases
 
 # 2. Inside any Claude session, register the marketplace + install the plugin:
 claude
@@ -82,7 +83,7 @@ The AI runs on **your computer** — it can read your files, run your commands, 
 kill -TERM $(cat ~/.ccteam/ccteam.pid)   # or just Ctrl+C in the foreground terminal
 ```
 
-It drains within 5 seconds, releases the web port, and unlinks its pidfile automatically. Long-running tmux chat sessions survive a daemon restart and are re-attached on the next `ccteam start` — upgrading ccteam does not lose your bot's context.
+It drains within 5 seconds, releases the web port, and unlinks its pidfile automatically. Long-running tmux chat sessions survive a daemon restart and are re-attached on the next `ccteam start` — upgrading ccteam does not lose your bot's context. If a chat pane was killed (OOM, manual `tmux kill-session`), the next `ccteam start` re-spawns it with `claude --resume <name>` so the model reloads its full API-level context (tool-use history, cache, reasoning) losslessly via the official Anthropic CLI path. If resume isn't possible (no on-disk session, schema drift), ccteam falls back to a fresh session and emits a visible `chat_session_reset` event — you'll see the bot acknowledge the reset rather than silently forget.
 
 ## Docs
 

@@ -23,7 +23,7 @@
 程序化起 bot / 看历史 / 重置 session         mcp__ccteam__chat_*      ↓ §5 详跑
 看 / 暂停 / 恢复 / 看花费                    /ccteam-control list / pause / cost
 配 / 改 IM token(TG / Slack / Discord)      /ccteam-im-setup
-验证安装 / 验 Codex auto-critic              ccteam doctor [--check-codex-auto-critic]
+验证安装 / MCP 表面 / Codex critic / cost     ccteam doctor [--verify-mcp | --check-codex-auto-critic | --check-cost-orphan]
 不确定?用自然语言问                          /ccteam "<NL 描述>"
 ```
 
@@ -64,6 +64,42 @@ ccteam-scan (quick) → <repo>/.ccteam/codebase-scan.md
 ```
 
 24h 内复跑会直接显示上次报告(`--force` 强制重扫)。**不**写 git / 不开 daemon / 不动 `~/.ccteam/`。
+
+---
+
+## §1.6 新项目零配置上手:`/ccteam-creator` 自动探测
+
+`/ccteam-creator` 第一次在你仓库内跑时,会先调 `ccteam probe-project` 探测项目类型(monorepo / single repo / docs-only / scripts-only)+ 主语言(Rust / TypeScript / Python / Go ...),然后把探测结果喂给后续 yaml 生成 ── 你拿到的初始 workflow.yaml `scope:` 段已按项目结构填好,role.md 也按主语言挑了合适默认值,**不必手改就能跑**。
+
+```bash
+cd path/to/your/repo
+claude
+```
+
+session 里:
+
+```
+/ccteam-creator "做个 monorepo 后端 reviewer"
+```
+
+ccteam-creator 先报探测结果:
+
+```
+Project probe:
+  kind: Monorepo (cargo workspace)
+  languages: Rust, TypeScript
+  probable scope: crates/api-core/src, crates/api-cli/src, services/web/src
+
+Generating workflow with scope pinned to those subtrees ...
+```
+
+如果探测错(比如混合 monorepo / 你想要别的 scope),后续向导对话里直接 `scope: 改成 X` 覆盖即可。也可单独跑探测:
+
+```bash
+ccteam probe-project --json    # 看 ccteam 怎么"看"你的仓库
+```
+
+输出 `kind` / `languages` / `probable_scope` 三段 JSON。
 
 ---
 
@@ -135,7 +171,7 @@ $ claude
   • mcp__ccteam__* tools available (workflow_* / chat_* / advise_* / admin_* / screenshot_*)
 ```
 
-跑 `ccteam doctor` 验装(claude CLI / MCP / tmux / pidfile 路径都查一遍);加 `--check-codex-auto-critic` 验证 Codex 二审是否能开。
+跑 `ccteam doctor` 验装(claude CLI / MCP / tmux / pidfile 路径都查一遍);加 `--verify-mcp` 自检 MCP 工具表面齐全(应输出 `26 active, 0 stubs`,非零 exit 即 CI gate fail);加 `--check-codex-auto-critic` 验证 Codex 二审是否能开;加 `--check-cost-orphan` 对账 24h 内 ledger 与 progress.jsonl(catch spawn 路径漏写 ledger)。
 
 → 卡了?见 [troubleshooting.md](troubleshooting.md) "plugin install 失败"。
 

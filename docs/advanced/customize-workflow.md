@@ -64,6 +64,42 @@ im_channels:                         # mode: chat 专用;走 openhuman/channels
 
 **不许写** `prompt:` / `system_prompt:` / `messages:` — 红线(`tech-design.md §3.3.3`);agent 行为住 `.claude/agents/<role>.md`。
 
+<a name="sensible-defaults"></a>
+### 二·1 Sensible defaults — `ccteam probe-project` 探测
+
+`/ccteam-creator` 第一次在仓库内跑时,先调 `ccteam probe-project` 探测项目类型 + 主语言,把结果喂给 yaml 生成 ── 用户拿到的初始 `scope:` 已按项目结构 pre-populate。手编 yaml 的高级用户也可单独跑:
+
+```bash
+ccteam probe-project --json
+# {"kind":"Monorepo","languages":["Rust","TypeScript"],
+#  "probable_scope":["crates/api-core/src","crates/api-cli/src","services/web/src"]}
+```
+
+#### 探测启发式(纯文件存在性,不 parse 任何代码)
+
+| 信号 | 推断 |
+|---|---|
+| `Cargo.toml` 内 `workspace.members` | Monorepo (Rust) |
+| `package.json` 内 `workspaces` 或 `pnpm-workspace.yaml` | Monorepo (TS) |
+| `go.work` | Monorepo (Go) |
+| 单 `Cargo.toml` / `package.json` / `pyproject.toml` | SingleRepo |
+| 只有 `*.md` + 无 source dir | DocsOnly |
+| 只有 `*.sh` / `*.py` script | ScriptsOnly |
+
+#### `probable_scope` 截断规则
+
+monorepo 探测出 10+ crate 时,按 LOC 排序取 top-3(fallback alphabetical),避免 scope 默认值过宽。用户对 prompt 内直说"scope 改成 X"即可 override。
+
+#### preset × probe 矩阵(sensible defaults)
+
+| preset | probe = Monorepo | probe = SingleRepo | probe = DocsOnly |
+|---|---|---|---|
+| `bg-overnight` | scope = top-3 workspace members | scope = src/, tests/ | scope = docs/ |
+| `inproc-team` | per-role scope 按 monorepo 子树分发 | per-role 同 scope | scope = docs/ |
+| `chat-pocket` | bot mention scope = repo root | 同 | 同 |
+
+不在范围:跨语言栈完整 template library(只针对当前 5 个 preset 的填充值);LLM-assisted 完整 role auto-gen。漏判时 user prompt override probe 结果。
+
 ## 三、5 preset 的 yaml diff(从 ccteam-creator 默认产物出发)
 
 `ccteam-creator` 模板在 `crates/ccteam-core/src/templates/workflow_templates/{pocket,squad,sprint,builder,solo}.yaml`。
@@ -213,7 +249,7 @@ ccteam start my-bots
 2. **`mode` 是 serde tagged enum** — 改 mode 必须**同时**改 mode-specific 字段。`mode: bg` 留 `bot_name`/`hop_limit` → 静默 ignore;`mode: chat` 漏 `im_channels` → schema error,daemon 不起。
 3. **`vendor` 严格小写枚举** — `vendor: openai` ✗ / `vendor: anthropic` ✗;只 `{ claude | codex }`。
 4. **`vendor` agent.md vs workflow.yaml 不一致** — doctor warn 不 error;运行时**按 workflow.yaml 走**,agent.md 字段静默 ignore。
-5. **`watch:<path>` 是项目相对路径**(F78 修过)— `watch:/abs/path` schema error。
+5. **`watch:<path>` 是项目相对路径** — `watch:/abs/path` schema error。
 6. **`tools:` 列 `mcp__ccteam__*` 无效** — 该工具组给 meta-agent;普通 bot 无 permission。反向 `CCTEAM_DISABLE_TOOLS` env(group enum)才是禁用入口。
 7. **`max_spawn_depth: 0` ≠ 无限,是禁 spawn** — 想"无限"删字段走 default 5,或 `u32::MAX`。
 8. **`compact_every_tokens` 不含 cached input** — cumulative input + output,**不算** cached(implementation detail)。

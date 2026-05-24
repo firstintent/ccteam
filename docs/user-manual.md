@@ -24,7 +24,7 @@ IM 圆桌(多 bot)                            /ccteam-creator           §2.5 IM
 看 / 暂停 / 改 persona / 加工具              /ccteam-control           §4.1-§4.6
 诊断 / 验 Codex auto-critic                   ccteam doctor             §4.8
 配 / 改 IM token                             /ccteam-im-setup          §2.4 + quickstart
-daemon 优雅停止 / tmux reattach              kill -TERM <pid>          §6
+daemon 优雅停止 / tmux reattach / 崩溃恢复    kill -TERM <pid>          §6
 不确定?用自然语言问                          /ccteam "<NL>"            §3.1
 ```
 
@@ -279,7 +279,7 @@ writer_bot: 已起草文档,贴 PR 链接 → #1240
 
 **前置**:Codex 装好 + `codex login` 跑过(可用 `ccteam doctor --check-codex-auto-critic` 一条命令验)。**没装也能跑** — graceful 降级单 Claude advisor,verdict prose 写 "Codex unavailable: <reason>",**不报错**。
 
-**Budget 守门**:每 vendor 单独 `max_cost_usd_per_24h` cap,记账落 `<ccteam_root>/cost-budget.json`(48h 自动 GC)。某 vendor 撞顶 → 静默跳过该 vendor 跑其余,verdict 标注 `budget_exhausted`。
+**Budget 守门**:每 vendor 单独 `max_cost_usd_per_24h` cap,记账落 `<ccteam_root>/cost-budget.json`(48h 自动 GC)。某 vendor 撞顶 → 静默跳过该 vendor 跑其余,verdict 标注 `budget_exhausted`。**Codex critic 路径** 同样走该 ledger ── 跨 vendor 调用都在同一账上,`@ccteam cost today` 与 `ccteam doctor --check-cost-orphan` 看到的数字是真实跨 vendor 累计(没有 spawn 路径绕开 ledger)。
 
 **底层 MCP 工具**:`mcp__ccteam__advise_vote` / `mcp__ccteam__advise_parallel`(可绕过 skill 直接调,适合 CI / batch)。
 
@@ -299,7 +299,7 @@ writer_bot: 已起草文档,贴 PR 链接 → #1240
 |---|---|
 | `/ccteam-scan [--quick]` | 摸底新代码库(`--quick` 60s 零依赖,默认完整 navigability audit)|
 | `/ccteam-team <N> "<task>"` | 起临时 team(Team Sprint)|
-| `/ccteam-creator "<NL>"` | 起新 workflow / 改现有 workflow |
+| `/ccteam-creator "<NL>"` | 起新 workflow / 改现有 workflow ── 第一次在仓库内跑时先自动调 `ccteam probe-project` 探测 monorepo / 主语言,生成 yaml 的 `scope:` 段直接按结果 pre-populate(不必手改即可跑)|
 | `/ccteam-control <subcmd>` | 管已有 workflow(暂停 / 恢复 / 查 cost / 改 persona)|
 | `/ccteam-im-setup` | 一次性绑 IM token(TG / Slack / Discord)|
 | `/ccteam-advise vote\|parallel "<question>"` | Claude + Codex 并行二答案(没装 Codex 自动降级单 Claude)|
@@ -314,8 +314,19 @@ writer_bot: 已起草文档,贴 PR 链接 → #1240
 @ccteam pause helper-bot           # 暂停某个 bot
 @ccteam resume helper-bot          # 恢复
 @ccteam list bots                  # 列所有跑着的 bot
-@ccteam cost today                 # 今日 cost
+@ccteam cost today                 # 今日 cost(真 USD,跨 vendor)
+@ccteam cost helper-bot            # 单 slug 24h cost
 @ccteam stop everything            # 紧急停所有
+```
+
+`cost today` 返当日 rolling 24h 真 USD(从 `<ccteam_root>/cost-budget.json` ledger 读),分 Claude / Codex 两行 + 总额 + cap + remaining,撞 80% cap 自动加 "⚠️ approaching daily budget cap" 前缀。例:
+
+```
+ccteam cost today
+  rolling 24h cost: Claude $0.1832 + Codex $0.0917 = total $0.2749
+  cap: $0.50/24h · remaining: $0.2251
+  active bots: 2 (filter: none)
+  full breakdown: `/ccteam-control show-cost`
 ```
 
 ### §3.3 Web 仪表板
@@ -409,11 +420,13 @@ Web **只看不操作**。所有控制走 Claude session slash 或 IM。
 **IM 端**:
 
 ```
-@ccteam cost today
+@ccteam cost today           # 全 workflow 24h 汇总
+@ccteam cost <slug>          # 单 workflow 24h
 ```
 
-底层都调 `mcp__ccteam__admin_ls`,从响应里读每个 project 的 `cost_24h_usd`。  
-`cost_24h_usd` = 最近 24h 内的 token 花费;`cost_used_usd` = 项目生命周期累计。
+`/ccteam-control show-cost` 底层调 `mcp__ccteam__admin_ls`,从响应里读每个 project 的 `cost_24h_usd`(= 最近 24h 内的 token 花费;`cost_used_usd` = 项目生命周期累计)。
+
+`@ccteam cost today` 走 IM 路径:从 `<ccteam_root>/cost-budget.json` ledger 聚合 ── 该 ledger 是 advise / Codex critic / 跨 vendor 调用的统一账,**不是** bot 数估算;输出格式见 §3.2。两条路径数字应一致(同源 ledger);若 `ccteam doctor --check-cost-orphan` 报 warn 表示某 spawn 路径绕过了 ledger,见 §4.8。
 
 ---
 
@@ -522,11 +535,44 @@ skill 把 NL 翻译成 Claude Code 工具名(如 `WebFetch`、`Bash`)后调:
 |---|---|
 | `ccteam doctor` | 全套诊断(claude CLI 版本 / MCP 注册 / tmux / pidfile 路径 / web port)|
 | `ccteam doctor --install-mcp` | 重写 `~/.claude.json` / 项目 `.mcp.json` 里的 `ccteam` MCP server 注册 |
+| `ccteam doctor --verify-mcp [--json]` | 自检 MCP 工具表面齐全,输出 `total / active / stubs` 与 per-group 分项,任何 STUB 注册 → exit 1(CI gate)|
 | `ccteam doctor --check-codex` | 验 codex binary 存在 + auth ok |
 | `ccteam doctor --check-codex-auto-critic` | 验 codex 可用且能跑一次 `codex exec --json` canary(exit 0 = ok / 2 = binary 缺 / 3 = output 格式不对)|
+| `ccteam doctor --check-cost-orphan` | 对账 24h 内 `<ccteam_root>/cost-budget.json` ledger 行数与每项目 progress.jsonl 的 `agent_done` event 数 ── 不对账 = 某 spawn 路径绕过 ledger,WARN per vendor,catch cost visibility leak |
 | `ccteam doctor --full` | 全套 + 详细输出(收集成给 issue)|
 
-`--check-codex-auto-critic` 是 `/ccteam-creator` Phase 3.5 内部调的同一条命令 — 决定 critic 角色是否自动设 `vendor: codex`。手动验等价。
+`--check-codex-auto-critic` 是 `/ccteam-creator` Phase 3.5 内部调的同一条命令 ── 决定 critic 角色是否自动设 `vendor: codex`。手动验等价。
+
+`--verify-mcp` 的预期输出:
+
+```
+MCP tool surface verification
+total tools:    27 (expected 27)
+active:         27
+stubs:          0
+
+per-group breakdown:
+  workflow_:    7 active / 0 stub
+  chat_:        9 active / 0 stub
+  advise_:      2 active / 0 stub
+  admin_:       8 active / 0 stub
+  screenshot:   1 active / 0 stub
+
+verdict: PASS — all 27 tools live, no production STUBs.
+```
+
+非 0 stub 或 unexpected stub 注册 → verdict 转 `FAIL` + exit code 1,适合放 CI。
+
+`--check-cost-orphan` 的预期输出(健康):
+
+```
+ccteam doctor --check-cost-orphan
+[ok] claude: 12 agent_done vs 12 ledger rows
+[ok] codex:  3 agent_done vs 3 ledger rows
+verdict: OK — ledger reconciled with progress.jsonl over 24h.
+```
+
+不对账时 WARN 列出 vendor + 差额,提示哪条 spawn 路径漏写 ledger(典型是新加的自定义 adapter 没接 ledger hook)。
 
 ---
 
@@ -573,14 +619,17 @@ kill -TERM $(cat ~/.ccteam/ccteam.pid)   # 或 Ctrl+C 在前台 terminal
 
 **不要用 `kill -9` / `SIGKILL`**。SIGKILL 跳过 graceful drain,会留孤儿 pidfile,可能伤进行中的 turn 状态。只有 graceful 卡死 5 秒以上才考虑 SIGKILL,且属于 bug — 请 issue。
 
-**tmux reattach across daemon restart**:
+**崩溃恢复(tmux reattach + lossless context resume)**:
 
 升级 ccteam 或机器重启后,`ccteam start` 启动时探测每个已注册 bot 的 tmux session(`ccteam-chat-<slug>-<role>`):
 - session 存在 + pane 内 `claude` 进程活 → **reattach**(不 spawn 新 claude,bot context 不丢)
-- session 存在 + pane 死 → `tmux kill-session` 后重起新 session
-- session 不存在 → 起新 session
+- session 存在 + pane 死(被 OOM-killed / 用户手动 `tmux kill-pane`)→ kill stale tmux + spawn `claude --resume <name>`,**Anthropic 官方 CLI 直接 reload 上次 session 的 full API-level context**(tool-use 中间结果、推理链、cache 状态全在)── 模型脑子里还有上次的东西,不只是 last-N turns 字面回放
+- session 不存在(首次启 bot)→ 起新 session,带 deterministic `--name`,以备未来 `--resume`
+- `--resume` 失败(session jsonl 不存在 / corrupt / 用户清过 `~/.claude/projects/`)→ 退到 brand-new session + 显式 emit `chat_session_reset` event,bot 在 IM 端会"告诉你它忘了"(visible degraded,不冒充 resume)
 
-也就是:**升级 ccteam 不会丢 bot 对话 context**。bot 仍在 IM 端 responsive,不需要人工 `tmux kill-session` 后再 `ccteam-creator` 重起。
+也就是:**升级 ccteam 不会丢 bot 对话 context;dead pane recreate 也尽力 lossless 还原**。bot 仍在 IM 端 responsive,不需要人工 `tmux kill-session` 后再 `ccteam-creator` 重起。
+
+实际验证:发 `刚才那个 X 怎么样?` 风格 follow-up,bot reply 若能直接引用早 turn 内容(不是 "对不起,能否再讲一下 X")= 真 lossless;若 reply 显示 `chat_session_reset` 提示 = fallback 走了,context 已重置。
 
 ---
 
