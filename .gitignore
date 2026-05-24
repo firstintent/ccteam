@@ -21,3 +21,4 @@ readme.local.txt
 # scripts/host-probe/run-probes.sh). Real demo GIFs land in
 # docs/v0-6-0/demos/ when V0.6.1 records them.
 .probe-results/
+.ccteam
