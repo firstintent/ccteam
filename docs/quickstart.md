@@ -84,12 +84,33 @@ ccteam 走 Claude Code 官方 plugin marketplace 协议安装 —— **plugin �
 
 ### 1.1 装 CLI binary(前置,一次性)
 
+**首选 ── 一行装预编译 binary(不需要 Rust toolchain):**
+
 ```bash
-cargo install ccteam-cli
+curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh | sh
 ccteam --version    # 应输出当前版本号
 ```
 
-将来会提供 prebuilt release(brew / GH releases),目前 cargo 是主路径。
+默认装到 `~/.local/bin/ccteam`。装完如果该路径不在 `$PATH`,脚本会打印一行 export 指令(贴进 `~/.bashrc` / `~/.zshrc` 再 `source` 即可)。
+
+支持的平台:Linux x86_64、macOS arm64(Apple Silicon)、macOS x86_64(Intel)。Windows 用户直接到 [Releases 页面](https://github.com/firstintent/ccteam/releases)下载 `windows-x64.zip` 解压(`install.sh` 是 POSIX 脚本,不跑 Windows)。
+
+环境变量:
+- `CCTEAM_INSTALL_DIR=/usr/local/bin sh install.sh` —— 改装目录(系统级安装)
+- `CCTEAM_VERSION=v0.6.6 sh install.sh` —— 装指定 tag(不取 latest)
+
+macOS Gatekeeper 拦截(首次跑报"not verified developer"):
+```bash
+xattr -d com.apple.quarantine ~/.local/bin/ccteam
+```
+
+**回退 ── 从源码 build(需要 Rust 1.85+,5-15 min 编译):**
+
+```bash
+cargo install --git https://github.com/firstintent/ccteam ccteam-cli
+```
+
+新机器没装 Rust 时,先 `curl https://sh.rustup.rs -sSf | sh` 装 rustup,然后再跑上面这条。
 
 ### 1.2 在 Claude session 里注册 marketplace + 装 plugin
 

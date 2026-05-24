@@ -29,8 +29,15 @@ Not sure? Just describe it in natural language   /ccteam "<what you want>"
 ```bash
 # 0. Install Claude Code first: https://code.claude.com/docs/install
 
-# 1. Install the ccteam CLI binary (prerequisite — the plugin shells out to it):
-cargo install ccteam-cli
+# 1. Install the ccteam CLI binary (one line, no Rust toolchain needed):
+curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh | sh
+#    Installs to ~/.local/bin/ccteam. The script prints a PATH-export
+#    hint if that directory isn't on your PATH yet — follow it, then
+#    restart your shell (or `source ~/.bashrc` / `source ~/.zshrc`).
+#    Build from source instead (requires Rust 1.85+):
+#      cargo install --git https://github.com/firstintent/ccteam ccteam-cli
+#    Pin a specific release tag: CCTEAM_VERSION=<tag> curl ... | sh
+#    Or download an archive from https://github.com/firstintent/ccteam/releases
 
 # 2. Inside any Claude session, register the marketplace + install the plugin:
 claude
@@ -50,6 +57,12 @@ claude
 # 4. (Optional) Bootstrap a per-project workflow scaffold from the CLI:
 ccteam init <project>
 ```
+
+Supported platforms for the prebuilt binary: Linux x86_64, macOS arm64
+(Apple Silicon), macOS x86_64 (Intel), Windows x86_64 (download the zip
+from the releases page — the install script is POSIX-only). On macOS,
+if Gatekeeper blocks the binary on first run:
+`xattr -d com.apple.quarantine ~/.local/bin/ccteam`.
 
 Step 2 registers ccteam as a Claude Code plugin marketplace, then installs the plugin — the seven `/ccteam*` slash commands and `mcp__ccteam__*` MCP tools light up immediately. The 5-minute walkthrough for "private IM assistant" (the flagship use case) lives in [docs/quickstart.md](docs/quickstart.md).
 
