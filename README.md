@@ -28,16 +28,30 @@ Not sure? Just describe it in natural language   /ccteam "<what you want>"
 
 ```bash
 # 0. Install Claude Code first: https://code.claude.com/docs/install
-claude
-/plugin install ccteam
 
-# 1. Try the universal entry — describe what you want in any language:
+# 1. Install the ccteam CLI binary (prerequisite — the plugin shells out to it):
+cargo install ccteam-cli
+
+# 2. Inside any Claude session, register the marketplace + install the plugin:
+claude
+```
+
+```
+/plugin marketplace add https://github.com/firstintent/ccteam
+/plugin install ccteam
+```
+
+```
+# 3. Try the universal entry — describe what you want in any language:
 /ccteam "scan this repo and tell me what it does"
 /ccteam "fix the TypeScript errors in src/"
 /ccteam "build a Telegram bot that summarizes my GitHub PRs at 7am"
+
+# 4. (Optional) Bootstrap a per-project workflow scaffold from the CLI:
+ccteam init <project>
 ```
 
-The 5-minute walkthrough for "private IM assistant" (the flagship use case) lives in [docs/quickstart.md](docs/quickstart.md).
+Step 2 registers ccteam as a Claude Code plugin marketplace, then installs the plugin — the seven `/ccteam*` slash commands and `mcp__ccteam__*` MCP tools light up immediately. The 5-minute walkthrough for "private IM assistant" (the flagship use case) lives in [docs/quickstart.md](docs/quickstart.md).
 
 ## Three ways to talk to ccteam
 
