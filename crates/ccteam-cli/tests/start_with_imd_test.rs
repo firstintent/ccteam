@@ -147,13 +147,7 @@ fn start_spawns_imd_supervisor_unless_no_imd_set() {
     let _ = std::fs::remove_file(&heartbeat);
     let no_imd_started = SystemTime::now();
     let mut child2 = Command::new(ccteam_bin())
-        .args([
-            "start",
-            "--no-web",
-            "--no-imd",
-            "--tick-seconds",
-            "1",
-        ])
+        .args(["start", "--no-web", "--no-imd", "--tick-seconds", "1"])
         .env("HOME", fake_home)
         .env("CCTEAM_HOME", &ccteam_home)
         .env("CCTEAM_PROJECTS_ROOT", fake_home.join("projects"))
@@ -167,10 +161,7 @@ fn start_spawns_imd_supervisor_unless_no_imd_set() {
     // seen the heartbeat if it were going to appear.
     std::thread::sleep(Duration::from_secs(6));
     let stale = match std::fs::metadata(&heartbeat) {
-        Ok(meta) => meta
-            .modified()
-            .map(|m| m < no_imd_started)
-            .unwrap_or(true),
+        Ok(meta) => meta.modified().map(|m| m < no_imd_started).unwrap_or(true),
         Err(_) => true,
     };
 

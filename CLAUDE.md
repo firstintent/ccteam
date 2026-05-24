@@ -147,11 +147,9 @@ V0.6.0 走通的 4-wave 流程,V0.6.x patch + V0.7 minor 起点直接复用:
 
 ## 七、Rust 代码格式化约定
 
-`rustfmt.toml` pin stable rustfmt(`max_width = 100` / `tab_spaces = 4` / `use_field_init_shorthand`):
+`rustfmt.toml` pin stable rustfmt(`max_width = 100` / `tab_spaces = 4` / `use_field_init_shorthand`)。**Workspace drift 已一次清零**(`cargo fmt --all` chore PR + CI gate 守),drift-zero policy:
 
-- **不用 `cargo fmt`**(含 `cargo fmt -- <files>` 形式)── cargo fmt **silently 忽略文件参数**,会全 workspace 跑,把存量 ~4-5 kLOC fmt drift 拉进你的 PR diff(2026-05-24 V0.6.5 W1-T3 实战踩坑)
-- **新文件 / 大改文件:`rustfmt --edition 2021 <files>` 直调**(commit 前;原地写回)
-- **dry-run probe:**`rustfmt --check --edition 2021 <files>`
-- **小改 drifted 文件:不 fmt-sweep**(让 drift 维持现状,别动)
-- **不上 workspace-wide CI fmt gate**(drift 清零后才指望)
-- **drift 清理走独立 chore PR**,按模块拆,一次一个 crate
+- **commit 前必跑** `cargo fmt --all`(或 `cargo fmt -p <crate>` 局部目标 crate);CI gate (`.github/workflows/check.yml::fmt`) `cargo fmt --all -- --check` 不过 PR 不能 merge
+- **`rustfmt --edition 2021 <files>` 直调仍 OK** ── 单文件场景照样能用,与 `cargo fmt` 等价
+- **0 maintenance overhead** ── 不再有"drift 维持现状"或"小改 drifted 文件不 fmt-sweep"的特例;**一律 fmt 干净**
+- 旧 drift 历史(V0.5 - V0.6.5)git log 可查(任何 commit 之前 fmt drift ~4-5 kLOC,已 chore PR `cargo fmt --all` 清零)

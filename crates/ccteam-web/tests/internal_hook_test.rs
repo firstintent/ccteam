@@ -18,9 +18,7 @@
 
 use std::net::SocketAddr;
 
-use ccteam_core::{
-    bootstrap_project, disable_tool_surface_bootstrap_for_tests, CcteamPaths,
-};
+use ccteam_core::{bootstrap_project, disable_tool_surface_bootstrap_for_tests, CcteamPaths};
 use ccteam_web::{router_with_state, AppState};
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -110,7 +108,10 @@ async fn post_unknown_kind_returns_500_with_error_body() {
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["ok"], false);
     assert!(
-        body["error"].as_str().unwrap().contains("unknown hook kind"),
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("unknown hook kind"),
         "expected unknown-kind error, got: {body}"
     );
 }

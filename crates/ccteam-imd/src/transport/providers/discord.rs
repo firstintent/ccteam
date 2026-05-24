@@ -86,10 +86,7 @@ impl Channel for DiscordChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
-        let url = format!(
-            "{DISCORD_API}/channels/{}/messages",
-            message.recipient
-        );
+        let url = format!("{DISCORD_API}/channels/{}/messages", message.recipient);
         let body = serde_json::json!({ "content": message.content });
         let resp = self
             .http

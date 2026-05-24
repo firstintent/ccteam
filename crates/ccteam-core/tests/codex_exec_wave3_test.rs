@@ -80,10 +80,7 @@ async fn submit_turn_rejects_system_directive() {
         .submit_turn(&h, TurnInput::SystemDirective("/compact".into()))
         .await
         .unwrap_err();
-    assert!(
-        matches!(err, HarnessError::SubmitFailed(_)),
-        "got {err:?}"
-    );
+    assert!(matches!(err, HarnessError::SubmitFailed(_)), "got {err:?}");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -106,12 +103,10 @@ async fn events_stream_translates_jsonl_to_thread_events() {
         .await
         .unwrap();
 
-    let collected: Vec<ThreadEvent> = tokio::time::timeout(
-        Duration::from_secs(3),
-        stream.take(4).collect::<Vec<_>>(),
-    )
-    .await
-    .expect("events stream timed out");
+    let collected: Vec<ThreadEvent> =
+        tokio::time::timeout(Duration::from_secs(3), stream.take(4).collect::<Vec<_>>())
+            .await
+            .expect("events stream timed out");
 
     assert!(matches!(collected[0], ThreadEvent::ThreadStarted { .. }));
     assert!(matches!(collected[1], ThreadEvent::TurnStarted { .. }));

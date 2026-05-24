@@ -102,10 +102,7 @@ pub fn render_spawn_brief(template: &str, ctx: &SpawnContext) -> Result<String> 
     }
 
     if out.contains("{{stage_num}}") {
-        let val = ctx
-            .stage_num
-            .map(|n| n.to_string())
-            .unwrap_or_default();
+        let val = ctx.stage_num.map(|n| n.to_string()).unwrap_or_default();
         out = out.replace("{{stage_num}}", &val);
     }
 

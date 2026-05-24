@@ -28,8 +28,8 @@ use futures::stream::{self, BoxStream};
 
 use crate::harness::{
     parse_backgrounded_short_id, parse_pid_from_state, sigterm_pid, state_json_path,
-    AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx, ThreadEvent,
-    ThreadHandle, TurnId, TurnInput, CLAUDE_BIN_ENV,
+    AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx,
+    ThreadEvent, ThreadHandle, TurnId, TurnInput, CLAUDE_BIN_ENV,
 };
 use crate::tmux::session_name_for_slug;
 
@@ -189,8 +189,7 @@ impl HarnessAdapter for ClaudeBgAdapter {
             }
         };
 
-        sigterm_pid(pid).map_err(|err| {
-            HarnessError::ShutdownFailed(format!("SIGTERM pid {pid}: {err}"))
-        })
+        sigterm_pid(pid)
+            .map_err(|err| HarnessError::ShutdownFailed(format!("SIGTERM pid {pid}: {err}")))
     }
 }

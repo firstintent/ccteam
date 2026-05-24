@@ -127,12 +127,21 @@ impl Channel for TelegramChannel {
                 content_len = message.content.len(),
                 "latency tg.egress (failed)"
             );
-            anyhow::bail!("telegram sendMessage {} → {}: {}", message.recipient, status, text);
+            anyhow::bail!(
+                "telegram sendMessage {} → {}: {}",
+                message.recipient,
+                status,
+                text
+            );
         }
         // Best-effort: pluck message_id without a full type.
         let id = serde_json::from_str::<serde_json::Value>(&text)
             .ok()
-            .and_then(|v| v.get("result").and_then(|r| r.get("message_id")).and_then(|n| n.as_i64()))
+            .and_then(|v| {
+                v.get("result")
+                    .and_then(|r| r.get("message_id"))
+                    .and_then(|n| n.as_i64())
+            })
             .map(|n| n.to_string());
         tracing::info!(
             event = "latency",

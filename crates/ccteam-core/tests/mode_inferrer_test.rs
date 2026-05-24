@@ -15,7 +15,11 @@ fn intent(task: &str, presence: &str, timeline: &str) -> Intent {
 
 #[test]
 fn inproc_solo_full_attended_one_shot() {
-    let r = infer_mode(&intent("coding", Presence::FULL_ATTENDED, Timeline::ONE_SHOT));
+    let r = infer_mode(&intent(
+        "coding",
+        Presence::FULL_ATTENDED,
+        Timeline::ONE_SHOT,
+    ));
     assert_eq!(r, InferenceResult::Confident(CreatorMode::InProc));
 }
 
@@ -37,7 +41,11 @@ fn bg_overnight_hands_off() {
 
 #[test]
 fn bg_partial_long_running() {
-    let r = infer_mode(&intent("qa-loop", Presence::PARTIAL, Timeline::LONG_RUNNING));
+    let r = infer_mode(&intent(
+        "qa-loop",
+        Presence::PARTIAL,
+        Timeline::LONG_RUNNING,
+    ));
     assert_eq!(r, InferenceResult::Confident(CreatorMode::Bg));
 }
 
@@ -63,7 +71,11 @@ fn chat_group_im_group() {
 
 #[test]
 fn ambiguous_full_attended_long_running() {
-    let r = infer_mode(&intent("coding", Presence::FULL_ATTENDED, Timeline::LONG_RUNNING));
+    let r = infer_mode(&intent(
+        "coding",
+        Presence::FULL_ATTENDED,
+        Timeline::LONG_RUNNING,
+    ));
     match r {
         InferenceResult::Ambiguous(candidates) => {
             assert!(candidates.len() >= 2);

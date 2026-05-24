@@ -127,13 +127,11 @@ pub fn load_or_default(root: &Path) -> Preferences {
 
 /// Atomically write preferences to `<root>/preferences.toml`.
 pub fn save(root: &Path, prefs: &Preferences) -> Result<()> {
-    std::fs::create_dir_all(root)
-        .with_context(|| format!("mkdir {}", root.display()))?;
+    std::fs::create_dir_all(root).with_context(|| format!("mkdir {}", root.display()))?;
     let raw = toml::to_string_pretty(prefs).context("serialize preferences")?;
     let path = preferences_path(root);
     let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, raw.as_bytes())
-        .with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::write(&tmp, raw.as_bytes()).with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, &path)
         .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
     Ok(())

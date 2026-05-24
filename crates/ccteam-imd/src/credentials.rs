@@ -110,8 +110,7 @@ pub fn load(path: Option<&Path>) -> Result<Credentials> {
 /// production use is read-only.
 pub fn save(path: &Path, creds: &Credentials) -> Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("mkdir -p {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| format!("mkdir -p {}", parent.display()))?;
     }
     let body = serde_json::to_string_pretty(creds).context("serialize credentials")?;
     fs::write(path, body).with_context(|| format!("write {}", path.display()))?;

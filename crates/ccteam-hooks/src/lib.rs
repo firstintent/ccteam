@@ -71,8 +71,8 @@ pub fn dispatch(
         }
         "intercept-ask" => Ok(Some(intercept_ask_decision())),
         "chat-progress" => {
-            let event = action
-                .ok_or_else(|| anyhow!("hook `chat-progress` requires an event argument"))?;
+            let event =
+                action.ok_or_else(|| anyhow!("hook `chat-progress` requires an event argument"))?;
             handle_chat_progress(paths, event, stdin)?;
             Ok(None)
         }

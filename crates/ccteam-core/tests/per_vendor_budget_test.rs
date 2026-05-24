@@ -54,10 +54,7 @@ fn cost_summary_skips_vendor_split_when_field_missing() {
     // Pre-V0.6 events lacked the vendor field. They contribute to the
     // aggregate but the per-vendor map stays empty (per-vendor caps
     // are V0.6-only opt-in).
-    let events = vec![
-        done_event(None, 5.0, "s1"),
-        done_event(None, 1.0, "s2"),
-    ];
+    let events = vec![done_event(None, 5.0, "s1"), done_event(None, 1.0, "s2")];
     let summary = compute_cost_summary(&events, Utc::now(), |_| {
         ccteam_core::claude_job::JobLiveness::Terminal {
             status: "completed",
@@ -82,8 +79,14 @@ fn cost_summary_aggregates_total_per_vendor() {
             cost_usd: 0.0,
         }
     });
-    assert_eq!(summary.cost_total_by_vendor.get("claude").copied(), Some(12.0));
-    assert_eq!(summary.cost_total_by_vendor.get("codex").copied(), Some(4.0));
+    assert_eq!(
+        summary.cost_total_by_vendor.get("claude").copied(),
+        Some(12.0)
+    );
+    assert_eq!(
+        summary.cost_total_by_vendor.get("codex").copied(),
+        Some(4.0)
+    );
     assert!((summary.cost_total_usd - 16.0).abs() < 1e-9);
 }
 

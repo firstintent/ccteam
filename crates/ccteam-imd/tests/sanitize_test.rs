@@ -2,16 +2,19 @@
 //! basics — this file exercises edge cases that should hold across
 //! the whole crate boundary).
 
-use ccteam_imd::sanitize::{sanitize_for_tmux, sanitize_reply_input, truncate_to_max, MAX_TURN_LEN};
+use ccteam_imd::sanitize::{
+    sanitize_for_tmux, sanitize_reply_input, truncate_to_max, MAX_TURN_LEN,
+};
 
 #[test]
 fn round_trip_with_all_dangerous_chars() {
     let raw = "before\x00 `whoami` $(rm) ${HOME} \u{202e}reverse\u{2069} after";
     let out = sanitize_reply_input(raw);
-    for needle in [
-        "\x00", "\u{202e}", "\u{2069}",
-    ] {
-        assert!(!out.contains(needle), "{needle:?} should have been stripped");
+    for needle in ["\x00", "\u{202e}", "\u{2069}"] {
+        assert!(
+            !out.contains(needle),
+            "{needle:?} should have been stripped"
+        );
     }
     for esc in ["\\`whoami\\`", "\\$(", "\\${"] {
         assert!(out.contains(esc), "missing escape {esc}");

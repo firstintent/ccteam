@@ -122,7 +122,10 @@ mod tests {
             },
         };
         assert_eq!(b.cap_for(Vendor::Claude).max_cost_usd_per_24h, Some(5.0));
-        assert_eq!(b.cap_for(Vendor::Codex).max_agent_spawns_per_hour, Some(100));
+        assert_eq!(
+            b.cap_for(Vendor::Codex).max_agent_spawns_per_hour,
+            Some(100)
+        );
     }
 
     #[test]

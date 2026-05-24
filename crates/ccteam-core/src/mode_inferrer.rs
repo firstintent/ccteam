@@ -184,10 +184,7 @@ pub fn infer_mode(intent: &Intent) -> InferenceResult {
         (Presence::FULL_ATTENDED, Timeline::LONG_RUNNING) => {
             // Long-running + user staying full-attended is unusual —
             // surface ambiguity rather than silently picking one.
-            let mut scores = vec![
-                (CreatorMode::Bg, 0.6),
-                (CreatorMode::InProc, 0.4),
-            ];
+            let mut scores = vec![(CreatorMode::Bg, 0.6), (CreatorMode::InProc, 0.4)];
             if task_type == "qa-loop" {
                 scores[0].1 += 0.1;
             }

@@ -37,10 +37,12 @@ pub const CCTEAM_MCP_SERVER_KEY: &str = "ccteam";
 pub fn render_project_mcp_json(ccteam_bin: &Path) -> Result<String> {
     let mut root = Map::new();
     let mut servers = Map::new();
-    servers.insert(CCTEAM_MCP_SERVER_KEY.into(), ccteam_server_entry(ccteam_bin));
+    servers.insert(
+        CCTEAM_MCP_SERVER_KEY.into(),
+        ccteam_server_entry(ccteam_bin),
+    );
     root.insert("mcpServers".into(), Value::Object(servers));
-    serde_json::to_string_pretty(&Value::Object(root))
-        .context("serialize fresh .mcp.json body")
+    serde_json::to_string_pretty(&Value::Object(root)).context("serialize fresh .mcp.json body")
 }
 
 /// Merge our `mcpServers.ccteam` entry into an existing `.mcp.json`
@@ -59,9 +61,7 @@ pub fn merge_project_mcp_json(existing: &str, ccteam_bin: &Path) -> Result<Strin
             .with_context(|| "parse existing .mcp.json (must be a JSON object)")?
         {
             Value::Object(m) => m,
-            other => anyhow::bail!(
-                "existing .mcp.json root is not a JSON object: {other}"
-            ),
+            other => anyhow::bail!("existing .mcp.json root is not a JSON object: {other}"),
         }
     };
     let servers_entry = root
@@ -76,8 +76,7 @@ pub fn merge_project_mcp_json(existing: &str, ccteam_bin: &Path) -> Result<Strin
         CCTEAM_MCP_SERVER_KEY.into(),
         ccteam_server_entry(ccteam_bin),
     );
-    serde_json::to_string_pretty(&Value::Object(root))
-        .context("serialize merged .mcp.json body")
+    serde_json::to_string_pretty(&Value::Object(root)).context("serialize merged .mcp.json body")
 }
 
 /// The single shared description of the ccteam server entry. Kept
@@ -105,7 +104,10 @@ mod tests {
     fn render_fresh_includes_ccteam_server_entry() {
         let body = render_project_mcp_json(&bin()).unwrap();
         let v: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(v["mcpServers"]["ccteam"]["command"], "/usr/local/bin/ccteam");
+        assert_eq!(
+            v["mcpServers"]["ccteam"]["command"],
+            "/usr/local/bin/ccteam"
+        );
         assert_eq!(v["mcpServers"]["ccteam"]["args"][0], "mcp-serve");
     }
 
@@ -126,7 +128,10 @@ mod tests {
         let v: Value = serde_json::from_str(&merged).unwrap();
         assert_eq!(v["playwrightConfig"]["headless"], true);
         assert_eq!(v["mcpServers"]["linear"]["command"], "linear-mcp");
-        assert_eq!(v["mcpServers"]["ccteam"]["command"], "/usr/local/bin/ccteam");
+        assert_eq!(
+            v["mcpServers"]["ccteam"]["command"],
+            "/usr/local/bin/ccteam"
+        );
     }
 
     #[test]
@@ -140,7 +145,10 @@ mod tests {
         let merged = merge_project_mcp_json(existing, &bin()).unwrap();
         let v: Value = serde_json::from_str(&merged).unwrap();
         // Updated.
-        assert_eq!(v["mcpServers"]["ccteam"]["command"], "/usr/local/bin/ccteam");
+        assert_eq!(
+            v["mcpServers"]["ccteam"]["command"],
+            "/usr/local/bin/ccteam"
+        );
         // Untouched.
         assert_eq!(v["mcpServers"]["playwright"]["command"], "npx");
     }

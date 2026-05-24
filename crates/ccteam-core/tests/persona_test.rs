@@ -43,8 +43,7 @@ struct PersonaEntry {
 
 fn read_manifest() -> Manifest {
     let path = personas_dir().join("manifest.toml");
-    let body = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+    let body = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
     toml::from_str(&body).unwrap_or_else(|e| panic!("parse {path:?}: {e}"))
 }
 
@@ -101,8 +100,9 @@ fn every_role_md_has_frontmatter() {
 #[test]
 fn manifest_default_modes_are_valid() {
     let m = read_manifest();
-    let valid: std::collections::HashSet<&'static str> =
-        ["in-proc", "bg", "chat-dm", "chat-group"].into_iter().collect();
+    let valid: std::collections::HashSet<&'static str> = ["in-proc", "bg", "chat-dm", "chat-group"]
+        .into_iter()
+        .collect();
     for p in &m.persona {
         assert!(
             valid.contains(p.default_mode.as_str()),
