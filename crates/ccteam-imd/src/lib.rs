@@ -83,6 +83,14 @@ fn default_ccteam_root() -> PathBuf {
         .join(".ccteam")
 }
 
+/// V0.6.6 F169 — pub wrapper around [`default_ccteam_root`] so the
+/// `nl_admin::AdminExecutor` (and other library callers) can resolve
+/// the production ccteam-root without re-implementing the home-derived
+/// path. Tests inject a tempdir via `AdminExecutor::with_ccteam_root`.
+pub fn default_ccteam_root_public() -> PathBuf {
+    default_ccteam_root()
+}
+
 /// `<ccteam_root>/imd/registry/` — base registry dir given an explicit
 /// root (V0.6.5 F146).
 pub fn registry_root_in(ccteam_root: &Path) -> PathBuf {
