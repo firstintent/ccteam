@@ -57,6 +57,10 @@ detect_target() {
             SUFFIX="linux-x64"
             EXT="tar.gz"
             ;;
+        linux-aarch64|linux-arm64)
+            SUFFIX="linux-arm64"
+            EXT="tar.gz"
+            ;;
         darwin-arm64|darwin-aarch64)
             SUFFIX="macos-arm64"
             EXT="tar.gz"
@@ -65,14 +69,9 @@ detect_target() {
             SUFFIX="macos-x64"
             EXT="tar.gz"
             ;;
-        linux-aarch64|linux-arm64)
-            err "linux-arm64 prebuilt is not yet published (planned post-V0.7)."
-            err "Workaround: cargo install --git https://github.com/$REPO ccteam-cli"
-            exit 1
-            ;;
         *)
             err "unsupported platform: $_os-$_arch"
-            err "Supported: linux-x86_64, darwin-arm64, darwin-x86_64."
+            err "Supported: linux-x86_64, linux-aarch64, darwin-arm64, darwin-x86_64."
             err "Workaround: cargo install --git https://github.com/$REPO ccteam-cli"
             exit 1
             ;;

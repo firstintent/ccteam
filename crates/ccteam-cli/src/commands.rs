@@ -1691,7 +1691,7 @@ fn latest_claude_bg_job_id(paths: &CcteamPaths, slug: &str) -> Option<String> {
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
         candidates.push((mtime, id));
     }
-    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.0));
     candidates.into_iter().next().map(|(_, id)| id)
 }
 

@@ -1,11 +1,22 @@
-# GitHub Actions: tag-triggered prebuilt-binary release (F166).
+# GitHub Actions: tag-triggered prebuilt-binary release (F166 + F174).
 #
-# Pushing a tag like `v0.6.6` builds the `ccteam` binary on three targets,
+# Pushing a tag like `v0.6.7` builds the `ccteam` binary on four targets,
 # packages each with a per-asset SHA-256 sum, aggregates a single
 # SHA256SUMS file, and uploads everything to the corresponding GitHub
 # Release. `install.sh` (repo root) reads these assets — keep the asset
 # naming `ccteam-<tag>-<suffix>.<ext>` and the suffix vocabulary
-# (linux-x64 / macos-arm64 / macos-x64) in lockstep with that script.
+# (linux-x64 / linux-arm64 / macos-arm64 / macos-x64) in lockstep with
+# that script.
+#
+# F174: linux binaries are statically linked against musl libc
+# (x86_64-unknown-linux-musl / aarch64-unknown-linux-musl) so they run
+# on any Linux distro regardless of host glibc version. Pre-F174
+# releases targeted `x86_64-unknown-linux-gnu` on `ubuntu-latest`
+# (glibc 2.39 from Ubuntu 24.04) which broke installs on Ubuntu 22.04,
+# Debian 12, and NAS-class systems pinned to older glibc. Suffix names
+# stay `linux-x64` / `linux-arm64` (musl is transparent to users); the
+# static-link sanity step at the end of the build job guards against
+# silent regressions if a dep upgrade re-introduces a glibc dependency.
 #
 # Windows is intentionally out of scope: ccteam's foundation is tmux +
 # inotify + POSIX signals (`libc::SIGKILL` / `SIGTERM` in
@@ -34,8 +45,12 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
             suffix: linux-x64
+            ext: tar.gz
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            suffix: linux-arm64
             ext: tar.gz
           - os: macos-14
             target: aarch64-apple-darwin
@@ -49,6 +64,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install musl toolchain (linux only)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -67,19 +86,20 @@ jobs:
       # Pre-install the SPA `node_modules/` before `cargo build` so the
       # `ccteam-web` build.rs (which feature-gates on `web-bundle`,
       # default-on) finds them and skips its own `npm install`. We split
-      # by runner OS because `package-lock.json` is generated on Linux
-      # and only resolves the linux-x64 rolldown native binding; macOS
-      # `npm ci` would honor that lockfile and skip the darwin
-      # `optionalDependencies`, leaving rolldown unable to load
-      # `.darwin-arm64.node` at build time. Clearing the lockfile on
-      # macOS forces a fresh platform-correct resolution.
-      - name: Pre-install web SPA deps (linux fast path with lockfile)
-        if: runner.os == 'Linux'
+      # by runner OS+arch because `package-lock.json` is generated on
+      # Linux x64 and only resolves the linux-x64 rolldown native
+      # binding; macOS and linux-arm64 `npm ci` would honor that
+      # lockfile and skip the platform-specific `optionalDependencies`,
+      # leaving rolldown unable to load its native node binding at build
+      # time. Clearing the lockfile on those runners forces a fresh
+      # platform-correct resolution.
+      - name: Pre-install web SPA deps (linux x64 fast path with lockfile)
+        if: runner.os == 'Linux' && runner.arch == 'X64'
         working-directory: crates/ccteam-web/web
         run: npm ci --no-audit --no-fund --include=optional
 
-      - name: Pre-install web SPA deps (macOS — drop lockfile for native binding refresh)
-        if: runner.os == 'macOS'
+      - name: Pre-install web SPA deps (macOS / linux-arm64 — drop lockfile for native binding refresh)
+        if: runner.os == 'macOS' || (runner.os == 'Linux' && runner.arch == 'ARM64')
         working-directory: crates/ccteam-web/web
         run: |
           rm -f package-lock.json
@@ -87,6 +107,23 @@ jobs:
 
       - name: Build ccteam binary
         run: cargo build --release --locked --target ${{ matrix.target }} --bin ccteam
+
+      # Static-link sanity (linux only). musl target should produce a
+      # binary with no dynamic dependencies; if a dep ever pulls in a
+      # glibc-linked native lib (rare but possible after dep bumps),
+      # `file` will report `dynamically linked` and we fail the build
+      # before shipping a broken binary to users.
+      - name: Verify static linkage (linux only)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -eu
+          BIN="target/${{ matrix.target }}/release/ccteam"
+          file "$BIN"
+          if ! file "$BIN" | grep -qE 'statically linked|static-pie linked'; then
+            echo "::error::ccteam binary is not statically linked — musl target regressed."
+            exit 1
+          fi
 
       - name: Package (unix)
         if: matrix.ext == 'tar.gz'
@@ -154,10 +191,11 @@ jobs:
           cat > release-notes.md <<EOF
           # ccteam ${TAG}
 
-          Prebuilt binaries for Linux x86_64 and macOS (Intel + Apple Silicon).
-          Windows users: run ccteam under WSL2 with the linux-x64 binary
-          (ccteam's foundation is tmux + inotify + POSIX signals, which
-          are unix-only).
+          Prebuilt binaries for Linux (x86_64 + aarch64, statically
+          linked against musl libc so they run on any glibc version) and
+          macOS (Intel + Apple Silicon). Windows users: run ccteam under
+          WSL2 with the linux-x64 binary (ccteam's foundation is tmux +
+          inotify + POSIX signals, which are unix-only).
 
           ## Install (zero-Rust)
 
