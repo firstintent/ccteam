@@ -49,6 +49,12 @@ claude
 /plugin install ccteam
 ```
 
+Inside any Codex session(same two-step works ── ccteam binary must be on `$PATH` from step 1):
+
+```
+codex plugin marketplace add firstintent/ccteam
+```
+
 ```
 # 3. Try the universal entry — describe what you want in any language:
 /ccteam "scan this repo and tell me what it does"
