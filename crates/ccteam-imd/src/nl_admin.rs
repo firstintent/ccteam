@@ -29,9 +29,14 @@ use crate::BotRegistration;
 pub enum AdminCmd {
     /// `@ccteam status` — print daemon + bot status.
     Status,
-    /// `@ccteam list` / `@ccteam list bots` / `@ccteam ls` — list
-    /// registered bots.
+    /// `@ccteam list` / `@ccteam ls` — list every registered bot
+    /// globally. The per-chat scoped form is [`AdminCmd::ListHere`].
     List,
+    /// `@ccteam list bots` / `@ccteam bots` / `@ccteam who` — list the
+    /// bots reachable from *this* chat (filtered by `(channel,
+    /// chat_id)`). Mirrors the available-bot list the router-level
+    /// unknown-handle reply renders so both surfaces stay consistent.
+    ListHere,
     /// `@ccteam pause <slug>` (all roles) or `@ccteam pause
     /// <slug>/<role>` — write `signals/drain.signal`.
     Pause {
@@ -89,7 +94,10 @@ pub fn parse(input: &str) -> AdminCmd {
     let lower = trimmed.to_ascii_lowercase();
 
     // Multi-word verbs first (longest match wins).
-    if lower == "list bots" || lower == "list" || lower == "ls" {
+    if lower == "list bots" || lower == "bots" || lower == "who" {
+        return AdminCmd::ListHere;
+    }
+    if lower == "list" || lower == "ls" {
         return AdminCmd::List;
     }
     if lower == "stop everything" || lower == "kill all" || lower == "stop all" {
@@ -246,12 +254,39 @@ impl AdminExecutor {
                 side_effect: AdminSideEffect::None,
             },
             AdminCmd::List => self.list().await,
+            AdminCmd::ListHere => self.list().await,
             AdminCmd::CostToday { slug } => self.cost_today(slug.as_deref()).await,
             AdminCmd::Pause { slug, role } => self.pause(&slug, role.as_deref()).await,
             AdminCmd::Resume { slug, role } => self.resume(&slug, role.as_deref()).await,
             AdminCmd::Stop { slug, role } => self.stop(&slug, role.as_deref()).await,
             AdminCmd::StopEverything => self.request_confirm(reply_target).await,
             AdminCmd::Confirm => self.consume_confirm(reply_target).await,
+        }
+    }
+
+    /// Chat-context-aware variant of [`Self::execute`]. Today only the
+    /// `list bots` / `bots` / `who` family of commands needs the
+    /// `(channel, chat_id, bots)` slice — that surface renders the
+    /// per-chat available-bot list shared with the unknown-handle
+    /// reply. Everything else delegates straight to `execute`.
+    pub async fn execute_for_chat(
+        &self,
+        cmd: AdminCmd,
+        reply_target: &str,
+        channel: &str,
+        bots: &[BotRegistration],
+    ) -> AdminReply {
+        if matches!(cmd, AdminCmd::ListHere) {
+            return self.list_here(channel, reply_target, bots);
+        }
+        self.execute(cmd, reply_target).await
+    }
+
+    fn list_here(&self, channel: &str, reply_target: &str, bots: &[BotRegistration]) -> AdminReply {
+        let available = crate::router::available_handles_for_chat(bots, channel, reply_target);
+        AdminReply {
+            message: crate::router::format_available_bots_line(&available),
+            side_effect: AdminSideEffect::None,
         }
     }
 
@@ -556,7 +591,8 @@ fn help_text() -> String {
         "  pause <slug>[/<role>]    drain a bot (no new turns)",
         "  resume <slug>[/<role>]   un-drain",
         "  stop <slug>[/<role>]     shutdown a bot",
-        "  list / list bots / ls    list registered bots",
+        "  list / ls                list every registered bot",
+        "  list bots / bots / who   list bots reachable from this chat",
         "  cost today / cost <slug> 24h cost summary",
         "  stop everything          shutdown every bot (CONFIRM required)",
         "  status                   daemon liveness",
@@ -609,10 +645,14 @@ mod tests {
 
     #[test]
     fn parses_list_aliases() {
+        // Global registry dump.
         assert_eq!(parse("list"), AdminCmd::List);
         assert_eq!(parse("ls"), AdminCmd::List);
-        assert_eq!(parse("list bots"), AdminCmd::List);
-        assert_eq!(parse("LIST BOTS"), AdminCmd::List);
+        // Per-chat scoped form (new 6th keyword family).
+        assert_eq!(parse("list bots"), AdminCmd::ListHere);
+        assert_eq!(parse("LIST BOTS"), AdminCmd::ListHere);
+        assert_eq!(parse("bots"), AdminCmd::ListHere);
+        assert_eq!(parse("who"), AdminCmd::ListHere);
     }
 
     #[test]

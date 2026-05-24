@@ -69,6 +69,15 @@ pub struct BotRegistration {
     /// channel id, Discord channel id). Stored as a string for
     /// platform-agnostic round-tripping.
     pub im_chat_id: String,
+    /// Optional IM handle this bot answers to in chat-mode messages.
+    /// `None` (legacy / pre-`chat_handle` registrations) falls back to
+    /// `role` as the routing handle. The daemon's `build_handle_map`
+    /// resolves cross-slug collisions by suffixing the second claimant
+    /// with `@<slug>`. `chat_register_bot` auto-mints a scientist
+    /// nickname from `ccteam_core::agent_naming::SCIENTIST_NAMES` when
+    /// the caller omits this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_handle: Option<String>,
     /// RFC3339 timestamp.
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
@@ -228,6 +237,16 @@ pub fn turns_jsonl_path(projects_root: &Path, slug: &str, role: &str) -> PathBuf
     outbound::turns_jsonl_path(projects_root, slug, role)
 }
 
+impl BotRegistration {
+    /// Effective IM handle this bot answers to. Falls back to `role`
+    /// when `chat_handle` is unset (legacy / pre-`chat_handle`
+    /// registrations) so older registries route the same way they did
+    /// before the schema field landed.
+    pub fn effective_handle(&self) -> &str {
+        self.chat_handle.as_deref().unwrap_or(&self.role)
+    }
+}
+
 /// V0.6.5 F146 — outcome of [`register_bot_checked_in`].
 #[derive(Debug)]
 pub enum RegisterOutcome {
@@ -244,6 +263,13 @@ pub enum RegisterOutcome {
 /// for `(workflow_slug, role)` already exists on disk. Use
 /// [`register_bot_in`] / [`register_bot`] for the idempotent overwrite
 /// path the daemon uses.
+///
+/// `chat_handle` is the optional IM mention this bot answers to. When
+/// `None`, the router falls back to `role` as the handle. MCP callers
+/// that pass `None` rely on `dispatch_register_bot` to auto-mint a
+/// scientist nickname (`ccteam_core::agent_naming::SCIENTIST_NAMES`)
+/// upstream of this call.
+#[allow(clippy::too_many_arguments)]
 pub fn register_bot_checked_in(
     ccteam_root: &Path,
     workflow_slug: &str,
@@ -252,6 +278,7 @@ pub fn register_bot_checked_in(
     im_platform: &str,
     im_chat_id: &str,
     persona_id: Option<&str>,
+    chat_handle: Option<&str>,
 ) -> Result<RegisterOutcome> {
     let path = registration_path_in(ccteam_root, workflow_slug, role);
     if path.exists() {
@@ -264,6 +291,7 @@ pub fn register_bot_checked_in(
         persona_id: persona_id.map(String::from),
         im_platform: im_platform.to_string(),
         im_chat_id: im_chat_id.to_string(),
+        chat_handle: chat_handle.map(String::from),
         created_at: chrono::Utc::now(),
     };
     if let Some(parent) = path.parent() {
@@ -278,7 +306,9 @@ pub fn register_bot_checked_in(
 
 /// Register one bot under an explicit ccteam root (V0.6.5 F146).
 /// Idempotent overwrite — see [`register_bot_checked_in`] for the
-/// non-clobbering MCP variant.
+/// non-clobbering MCP variant. `chat_handle = None` so the bot falls
+/// back to `role` as its IM handle until the MCP path is used to mint
+/// one.
 pub fn register_bot_in(
     ccteam_root: &Path,
     workflow_slug: &str,
@@ -294,6 +324,7 @@ pub fn register_bot_in(
         persona_id: None,
         im_platform: im_platform.to_string(),
         im_chat_id: im_chat_id.to_string(),
+        chat_handle: None,
         created_at: chrono::Utc::now(),
     };
     let path = registration_path_in(ccteam_root, workflow_slug, role);

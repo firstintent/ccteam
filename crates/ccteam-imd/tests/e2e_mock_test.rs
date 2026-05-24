@@ -150,6 +150,7 @@ fn reg(slug: &str, role: &str) -> BotRegistration {
         persona_id: None,
         im_platform: "mock".into(),
         im_chat_id: format!("chat-{slug}-{role}"),
+        chat_handle: None,
         created_at: chrono::Utc::now(),
     }
 }

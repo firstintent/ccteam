@@ -132,6 +132,7 @@ fn squad_spec() -> WorkflowSpec {
                 timeout: None,
                 on_timeout: None,
                 plan_approval: None,
+                chat_handle: None,
             },
         );
     }

@@ -53,6 +53,7 @@ fn build_spec(name: &str, watchers: &[(&str, PathBuf)]) -> WorkflowSpec {
                 timeout: None,
                 on_timeout: None,
                 plan_approval: None,
+                chat_handle: None,
             },
         );
     }

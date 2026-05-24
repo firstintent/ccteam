@@ -66,6 +66,7 @@ fn mk_bot(slug: &str, role: &str, platform: &str, chat_id: &str) -> BotRegistrat
         persona_id: None,
         im_platform: platform.into(),
         im_chat_id: chat_id.into(),
+        chat_handle: None,
         created_at: chrono::Utc::now(),
     }
 }
