@@ -169,6 +169,58 @@ The persona `.md` body copied in Phase 5.4 is unchanged — vendor
 selection is purely a `workflow.yaml::agents.<role>.executor: codex`
 injection. The user does not edit YAML at any point.
 
+## Phase 3.6 — Project probe (sensible scope defaults)
+
+Before rendering the PROJECT PLAN, probe the target project root so
+the rendered `workflow.yaml` ships with a `scope:` field already
+pointing at the right subtree. Without this, every freshly-created
+workflow has an empty `scope:` and the user has to hand-edit before
+the first spawn picks the right cwd — defeating the per-role scope
+blast-radius guarantee that keeps large-codebase agents focused.
+
+```bash
+ccteam probe-project --path <project_dir> --json
+```
+
+Returns:
+
+```json
+{
+  "kind": "monorepo" | "single-repo" | "docs-only" | "scripts-only" | "empty",
+  "languages": ["rust", "typescript", ...],
+  "has_tests": true | false,
+  "probable_scope": ["crates/foo/src", "crates/bar/src", ...]
+}
+```
+
+Use the result as input to Phase 5.3's template ctx:
+
+- For `bg-overnight`, set `scope_yaml` to `"    scope: <probable_scope[0]>\n"`
+  so each `agents.<role>` block embeds the scope (or call
+  `ccteam_core::apply_probe_defaults_to_workflow_ctx(&mut ctx, preset,
+  &probe)` if you're rendering in-process).
+- For `inproc-solo` / `inproc-team`, surface `probable_scope[0]` in the
+  PROJECT PLAN "Files I'll write" section as a comment hint — the
+  agent-team preset renders `agents: {}` so per-role scope is set by
+  the lead at Task-spawn time, not by the bootstrap.
+- For `chat-pocket` / `chat-squad`, chat bots run at project root by
+  design — no scope override needed.
+
+Detection is pure file-existence sweep (no source parsing, no LLM
+call) so the probe is fast (~10 ms even on the ccteam repo) and
+deterministic.
+
+**Edge cases:**
+
+- `kind == "empty"` → the user likely pointed at a fresh dir; PROJECT
+  PLAN shows `scope: (none — fresh repo)`.
+- `kind == "monorepo"` with > 3 first-party crates → probe caps at
+  top-3 by descending LOC, ties broken alphabetically. The skill
+  surfaces "(top 3 of N detected)" in PROJECT PLAN so the user knows
+  to widen if needed.
+- `kind == "docs-only"` + `bg-overnight` is unusual but valid — the
+  probe returns `scope: ["docs"]` and the user can override.
+
 ---
 
 # Phase 4 — Output PROJECT PLAN (plan-first)
@@ -241,6 +293,13 @@ ctx = WorkflowTemplateCtx::new()
     .with("bot_handle", "@" + bot_name)          # chat-only
     .with("im_platform", "telegram")              # chat-only
     .with("owner_chat_id", creds.owner_chat_id)   # chat-only
+
+# Overlay sensible scope defaults from the project probe (Phase 3.6)
+# so the rendered yaml's `scope:` is non-empty out of the box. Skill
+# callers without in-process access can `ccteam probe-project --json`
+# and set `scope_yaml` manually.
+apply_probe_defaults_to_workflow_ctx(&mut ctx, preset, &probe)
+
 yaml = render_workflow_template(preset, &ctx)
 write_to(project_dir + "/.ccteam/workflow.yaml", yaml)
 ```

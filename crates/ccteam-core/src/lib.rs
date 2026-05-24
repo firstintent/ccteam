@@ -255,10 +255,11 @@ pub use team_resolver::{
     TeamSource, TEAM_SOURCES,
 };
 pub use templates::{
-    current_ccteam_bin, default_workflow_ctx, merge_project_mcp_json, render_project_mcp_json,
-    render_project_settings, render_project_settings_agent_team, render_workflow_template,
-    write_global_helper_templates, write_project_settings, write_project_settings_agent_team,
-    EnabledPluginsSetting, SettingsEnv, WorkflowPreset, WorkflowTemplateCtx,
+    apply_probe_defaults_to_workflow_ctx, current_ccteam_bin, default_workflow_ctx,
+    merge_project_mcp_json, probe_project, render_project_mcp_json, render_project_settings,
+    render_project_settings_agent_team, render_workflow_template, write_global_helper_templates,
+    write_project_settings, write_project_settings_agent_team, EnabledPluginsSetting, Language,
+    ProjectKind, ProjectProbe, SettingsEnv, WorkflowPreset, WorkflowTemplateCtx,
     WorkflowTemplateRenderError, CCTEAM_MCP_SERVER_KEY, HELPER_TEMPLATES,
     PROJECT_SETTINGS_AGENT_TEAM_JSON, PROJECT_SETTINGS_JSON,
 };

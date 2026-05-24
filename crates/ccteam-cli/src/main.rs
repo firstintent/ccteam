@@ -653,6 +653,27 @@ enum Command {
         #[command(subcommand)]
         action: AdminAction,
     },
+    /// V0.6.6 F167 — probe a repo root and emit the detected
+    /// project kind (monorepo / single-repo / docs-only / scripts-only
+    /// / empty), the top-3 languages, a tests-present flag, and the
+    /// `probable_scope` paths the `/ccteam-creator` skill should
+    /// pre-populate into the rendered `workflow.yaml::agents.<role>.
+    /// scope` field. Pure read-only file-existence sweep — no source
+    /// parsing, no LLM calls.
+    ///
+    /// Skill use: invoked by `/ccteam-creator` Phase 3.6 before the
+    /// PROJECT PLAN render so the user sees sensible scope defaults
+    /// without having to hand-edit yaml after the install.
+    ProbeProject {
+        /// Repo root to probe. Defaults to cwd.
+        #[arg(long, value_name = "PATH")]
+        path: Option<PathBuf>,
+        /// Emit the probe as a JSON object (stable schema — see
+        /// `commands::run_probe_project` docs). Default is a
+        /// 4-line human-readable summary.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 /// V0.6.1 F128 — `ccteam admin` subcommand surface (chat-mode bot
@@ -1149,6 +1170,18 @@ fn main() -> Result<()> {
                     Ok(())
                 }
             }
+        }
+        Command::ProbeProject { path, json } => {
+            let root = match path {
+                Some(p) => p,
+                None => std::env::current_dir().context("get cwd for probe-project")?,
+            };
+            // JSON branch already produces no trailing newline (consumers
+            // pipe to `jq` — extra newline is noise). Text branch
+            // already includes a trailing `\n`. Both safe with `print!`.
+            let out = commands::run_probe_project(&root, json)?;
+            print!("{out}");
+            Ok(())
         }
     }
 }

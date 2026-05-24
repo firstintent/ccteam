@@ -4735,6 +4735,51 @@ fn purge_project_managed_paths(
     Ok(())
 }
 
+// V0.6.6 F167 — `ccteam probe-project` CLI subcommand. Thin wrapper
+// over `ccteam_core::probe_project()` that emits a JSON object the
+// `/ccteam-creator` skill can fold into Phase 4's PROJECT PLAN ctx
+// (so the rendered workflow.yaml's `scope:` is pre-populated with
+// sensible defaults instead of the empty stub the skill used to
+// emit). Pure CLI surface — the heuristic lives in the core crate;
+// this just serializes + writes to stdout.
+//
+// Output schema (stable for V0.6.6+):
+//
+// ```json
+// {
+//   "kind": "monorepo" | "single-repo" | "docs-only" | "scripts-only" | "empty",
+//   "languages": ["rust", "typescript", ...],
+//   "has_tests": true | false,
+//   "probable_scope": ["crates/ccteam-core/src", "crates/ccteam-cli/src", ...]
+// }
+// ```
+pub fn run_probe_project(repo_root: &std::path::Path, json: bool) -> Result<String> {
+    let probe = ccteam_core::probe_project(repo_root);
+    if json {
+        // V0.6.6 F167 — the wire shape lives in `ProjectProbe`'s
+        // `serde(rename_all = "kebab-case")` derive, so we just
+        // serialize directly.
+        Ok(serde_json::to_string_pretty(&probe).context("serialize probe-project JSON")?)
+    } else {
+        // Human-readable fallback for `ccteam probe-project` without
+        // `--json` — a 4-line summary the user can eyeball before
+        // they pipe it into the skill.
+        let langs: Vec<&str> = probe.languages.iter().map(|l| l.as_str()).collect();
+        let scope: Vec<String> = probe
+            .probable_scope
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        Ok(format!(
+            "kind: {}\nlanguages: [{}]\nhas_tests: {}\nprobable_scope: [{}]\n",
+            probe.kind.as_str(),
+            langs.join(", "),
+            probe.has_tests,
+            scope.join(", "),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Mutex, OnceLock};

@@ -163,6 +163,55 @@ pub fn render(preset: Preset, ctx: &TemplateCtx) -> Result<String, RenderError> 
     Ok(out)
 }
 
+/// V0.6.6 F167 — overlay `ProjectProbe`-derived sensible defaults onto a
+/// `TemplateCtx`. Today it sets `scope_yaml` (a small YAML fragment the
+/// preset templates embed under `agents.<role>` when present) based on
+/// `probe.probable_scope`. Existing `scope_yaml` overrides from the
+/// caller win — this is a *default seed*, never a clobber.
+///
+/// Templates that do not reference `scope_yaml` (chat-pocket /
+/// chat-squad — chat bots scope is naturally the project root) leave
+/// the key unused; render() is strict, so we only inject keys the
+/// templates actually consume.
+pub fn apply_probe_defaults(
+    ctx: &mut TemplateCtx,
+    preset: Preset,
+    probe: &super::project_probe::ProjectProbe,
+) {
+    // Build a YAML fragment for the `agents.<role>.scope:` slot. We
+    // emit a *single* scope for the role-bearing preset slots — for
+    // monorepos with multiple member crates, we pick the first
+    // probable_scope (top-LOC), matching the V0.6.2 F140 "one scope
+    // per role" semantics. The skill / user can hand-edit later if
+    // they want per-role splits.
+    let scope_yaml = probe
+        .probable_scope
+        .first()
+        .map(|p| format!("    scope: {}\n", p.display()))
+        .unwrap_or_default();
+
+    match preset {
+        Preset::BgOvernight => {
+            // Clobber only if the current value is the empty-default
+            // sentinel — preserves any explicit user-supplied scope.
+            let current = ctx.vars.get("scope_yaml").cloned().unwrap_or_default();
+            if current.trim().is_empty() {
+                ctx.vars.insert("scope_yaml".into(), scope_yaml.clone());
+            }
+        }
+        Preset::InprocTeam | Preset::InprocSolo => {
+            // agent-team mode renders agents: {} — scope lives on the
+            // per-role suggested_teammates instead. Future: extend.
+            // For now, leave a hint comment in the persona section
+            // via persona_label_hint (skill can format).
+            let _ = scope_yaml;
+        }
+        Preset::ChatPocket | Preset::ChatSquad => {
+            // chat bots run at project root by design — no scope.
+        }
+    }
+}
+
 /// Convenience: build a [`TemplateCtx`] populated with the minimal
 /// required keys for each preset, then let the caller layer extra
 /// overrides on top via [`TemplateCtx::with`]. Useful for the skill +
@@ -181,7 +230,12 @@ pub fn default_ctx(preset: Preset) -> TemplateCtx {
         Preset::InprocTeam => {
             ctx = ctx.with("worker_count", "3");
         }
-        Preset::BgOvernight => {}
+        Preset::BgOvernight => {
+            // V0.6.6 F167 — `scope_yaml` is an empty placeholder by
+            // default; `apply_probe_defaults` overlays a real
+            // `scope: <path>` line when a project probe is available.
+            ctx = ctx.with("scope_yaml", "");
+        }
         Preset::ChatPocket => {
             ctx = ctx
                 .with("primary_role", "tech-helper")
@@ -232,6 +286,55 @@ mod tests {
         assert!(out.contains("watch:.ccteam/inbox/executor"));
         assert!(out.contains("max_cost_usd_per_24h"));
         assert!(!out.contains("{{"));
+        // V0.6.6 F167: default scope_yaml is empty (no probe overlaid).
+        assert!(
+            !out.contains("scope:"),
+            "default render must not embed a scope until probe overlay applies"
+        );
+    }
+
+    #[test]
+    fn bg_overnight_applies_probe_scope_overlay() {
+        use super::super::project_probe::{Language, ProjectKind, ProjectProbe};
+        use std::path::PathBuf;
+
+        let mut ctx = default_ctx(Preset::BgOvernight);
+        let probe = ProjectProbe {
+            kind: ProjectKind::SingleRepo,
+            languages: vec![Language::Rust],
+            has_tests: true,
+            probable_scope: vec![PathBuf::from("src"), PathBuf::from("tests")],
+        };
+        apply_probe_defaults(&mut ctx, Preset::BgOvernight, &probe);
+        let out = render(Preset::BgOvernight, &ctx).unwrap();
+        assert!(
+            out.contains("    scope: src"),
+            "expected `scope: src` after probe overlay, got:\n{out}"
+        );
+        assert!(!out.contains("{{"));
+    }
+
+    #[test]
+    fn apply_probe_defaults_is_idempotent_and_does_not_clobber() {
+        use super::super::project_probe::{Language, ProjectKind, ProjectProbe};
+        use std::path::PathBuf;
+
+        let mut ctx =
+            default_ctx(Preset::BgOvernight).with("scope_yaml", "    scope: custom-dir\n");
+        let probe = ProjectProbe {
+            kind: ProjectKind::SingleRepo,
+            languages: vec![Language::Rust],
+            has_tests: false,
+            probable_scope: vec![PathBuf::from("src")],
+        };
+        apply_probe_defaults(&mut ctx, Preset::BgOvernight, &probe);
+        let out = render(Preset::BgOvernight, &ctx).unwrap();
+        // User-provided scope_yaml wins (entry().or_insert_with semantics).
+        assert!(
+            out.contains("scope: custom-dir"),
+            "explicit ctx override must win over probe defaults:\n{out}"
+        );
+        assert!(!out.contains("scope: src"));
     }
 
     #[test]
