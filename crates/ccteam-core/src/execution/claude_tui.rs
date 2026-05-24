@@ -72,6 +72,14 @@ pub fn chat_session_name(slug: &str, role: &str) -> String {
     format!("ccteam-chat-{slug}-{role}")
 }
 
+/// V0.6.6 F172 V2 — compose the deterministic Anthropic `--name` /
+/// `--resume` argument for a chat-mode bot. Same identifier as the tmux
+/// session name; kept as a separate function so the two namespaces can
+/// diverge in the future without grepping callers.
+pub fn chat_session_id_name(slug: &str, role: &str) -> String {
+    chat_session_name(slug, role)
+}
+
 /// V0.6.0 F108 / V0.6.1 F139 — write / merge the chat-progress hooks
 /// into `<project>/.claude/settings.json`. As of F139 the hook command
 /// invokes the per-host `~/.ccteam/hooks/hook.sh` wrapper (HTTP-to-
@@ -234,9 +242,15 @@ impl HarnessAdapter for ClaudeTuiAdapter {
         let session_name = chat_session_name(&ctx.slug, &spec.role);
         let session = TmuxSession::from_name(session_name.clone());
 
+        // V0.6.6 F172 V2 — deterministic Anthropic `--name` / `--resume`
+        // identifier so the dead-pane recreate path can ask Claude itself
+        // to reload the prior session jsonl (lossless context restore
+        // via Anthropic's own CLI surface; R10 守).
+        let session_id_name = chat_session_id_name(&ctx.slug, &spec.role);
         if session.exists() {
             if is_pane_running_claude(&session) {
-                // (a) Alive & healthy — reattach.
+                // (a) Alive & healthy — reattach. F164 path; F172 V2 must
+                // **not** touch this code path (no spawn → no argv change).
                 let pids = session.list_pane_pids();
                 let pane_pid = pids.first().copied();
                 tracing::info!(
@@ -248,7 +262,13 @@ impl HarnessAdapter for ClaudeTuiAdapter {
                     "claude-tui: reattached to existing tmux session (pane claude process alive)"
                 );
             } else {
-                // (b) Dead pane — recreate.
+                // (b) Dead pane — recreate via F172 V2 `--resume <name>`
+                // route. If --resume fails (jsonl absent / corrupt /
+                // user wiped ~/.claude/projects/) we detect a fast pane
+                // death and fall through to a fresh `--name` spawn,
+                // emitting `chat_session_reset` with a reason so the
+                // user-visible bot context loss is explicit (no silent
+                // synthesis — R3 / R10 守).
                 let pids = session.list_pane_pids();
                 let old_pane_pid = pids.first().copied();
                 tracing::info!(
@@ -257,22 +277,83 @@ impl HarnessAdapter for ClaudeTuiAdapter {
                     slug = %ctx.slug,
                     role = %spec.role,
                     old_pane_pid = ?old_pane_pid,
-                    "claude-tui: killing stale tmux session (dead pane), recreating"
+                    "claude-tui: killing stale tmux session (dead pane), recreating via --resume"
                 );
                 session
                     .kill()
                     .map_err(|e| HarnessError::SpawnFailed(format!("tmux kill stale: {e}")))?;
-                // Fall through to new-session below.
                 let bin = claude_bin();
-                let argv: Vec<&str> = vec![&bin, "--dangerously-skip-permissions"];
+                let argv: Vec<&str> = vec![
+                    &bin,
+                    "--dangerously-skip-permissions",
+                    "--resume",
+                    &session_id_name,
+                ];
                 session
                     .start(&ctx.cwd, &argv)
                     .map_err(|e| HarnessError::SpawnFailed(format!("tmux start: {e}")))?;
+
+                // Detect `--resume` failure: claude exits non-zero quickly
+                // if the named session jsonl can't be loaded. Give the
+                // pane a short window to either survive (success) or die
+                // (failure). 400ms is enough for the OS to schedule
+                // claude's startup + first jsonl read + exit on failure,
+                // while staying well under user-perceptible latency.
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                if !is_pane_running_claude(&session) {
+                    tracing::info!(
+                        event = "session_resume_failed_fallback",
+                        session = %session_name,
+                        slug = %ctx.slug,
+                        role = %spec.role,
+                        "claude-tui: `claude --resume <name>` failed; falling back to fresh `--name` spawn"
+                    );
+                    // Kill the dead pane's tmux session shell (still
+                    // exists with remain-on-exit / pane-dead state) and
+                    // re-spawn fresh.
+                    let _ = session.kill();
+                    let fresh_argv: Vec<&str> = vec![
+                        &bin,
+                        "--dangerously-skip-permissions",
+                        "--name",
+                        &session_id_name,
+                    ];
+                    session
+                        .start(&ctx.cwd, &fresh_argv)
+                        .map_err(|e| HarnessError::SpawnFailed(format!("tmux start fresh: {e}")))?;
+                    // Best-effort emit `chat_session_reset` with
+                    // explicit reason so IM / web surfaces show the
+                    // user "context was lost". Path resolution honours
+                    // CCTEAM_HOME so tests land in their tempdir layout.
+                    if let Ok(paths) = crate::CcteamPaths::from_env() {
+                        let progress_path = paths.progress_jsonl(&ctx.slug);
+                        let ev = crate::progress::build_chat_session_reset_event_with_reason(
+                            &spec.role,
+                            "resume_failed_fallback_to_fresh",
+                        );
+                        if let Err(err) = crate::progress::append_event(&progress_path, &ev) {
+                            tracing::warn!(
+                                error = %err,
+                                "claude-tui: failed to append chat_session_reset event"
+                            );
+                        }
+                    }
+                }
             }
         } else {
-            // (c) Absent — normal new session.
+            // (c) Absent — first spawn for this (slug, role). F172 V2:
+            // add `--name <session_id_name>` so Anthropic's session jsonl
+            // is filed under a deterministic name, enabling future
+            // recreate-path `--resume`. F118 brand-new spawn recovery
+            // path is unchanged (operates on turns.jsonl, not Anthropic
+            // session jsonl).
             let bin = claude_bin();
-            let argv: Vec<&str> = vec![&bin, "--dangerously-skip-permissions"];
+            let argv: Vec<&str> = vec![
+                &bin,
+                "--dangerously-skip-permissions",
+                "--name",
+                &session_id_name,
+            ];
             session
                 .start(&ctx.cwd, &argv)
                 .map_err(|e| HarnessError::SpawnFailed(format!("tmux start: {e}")))?;
