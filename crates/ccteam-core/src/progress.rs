@@ -266,6 +266,19 @@ pub fn build_chat_session_reset_event(role: &str) -> Value {
     })
 }
 
+/// V0.6.6 F172 V2 — build a `chat_session_reset` event with an explicit
+/// `reason` field so user-visible context loss (e.g. failed
+/// `claude --resume <name>` fallback to fresh) carries enough metadata
+/// for IM / web surfaces to distinguish from user-issued `/clear`.
+pub fn build_chat_session_reset_event_with_reason(role: &str, reason: &str) -> Value {
+    serde_json::json!({
+        "event": CHAT_SESSION_RESET,
+        "role": role,
+        "reason": reason,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
 /// Build a `chat_session_reset_with_recovery` event JSON (F118).
 pub fn build_chat_session_reset_with_recovery_event(role: &str, recovered_turns: usize) -> Value {
     serde_json::json!({
