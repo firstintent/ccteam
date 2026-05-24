@@ -325,7 +325,7 @@ fn no_silent_todo_in_production_src() {
 ## F169 — `nl_admin::cost_today` 接真 `ccteam_cost` ledger
 
 **痛点:** 用户痛点 9 + 14。
-V0.6.5 ship gate item #9 承诺 `ccteam doctor` 出 "MCP tool surface: 26 active, 0 stubs",但 IM admin `@ccteam cost today` 仍走 V0.6.1 占位 ── 返「bot count」而非真 USD。F169 接真 ledger,end-to-end 闭环。
+V0.6.5 ship gate item #9 承诺 `ccteam doctor` 出 "MCP tool surface: 27 active, 0 stubs",但 IM admin `@ccteam cost today` 仍走 V0.6.1 占位 ── 返「bot count」而非真 USD。F169 接真 ledger,end-to-end 闭环。
 
 **现状缺口:**
 - `crates/ccteam-imd/src/nl_admin.rs:265-296` `cost_today()` 返:
@@ -452,7 +452,7 @@ post-ship-stub-inventory.md Cat 7 列 4 个 stale doc-comment ── 引用早�
 ## F171 — `ccteam doctor --verify-mcp` flag,stub-counter parity check
 
 **痛点:** 用户痛点 14。
-V0.6.5 ship gate item #9 承诺 `ccteam doctor` 输出 "MCP tool surface: 26 active, 0 stubs",但实际 doctor 没有专门 stub-counter sub-mode ── inventory 显示 V0.6.5 ship 时是 manual 验。F171 加 `--verify-mcp` flag 把这条 invariant 自动化 + 加 0-STUB assertion,catch 未来回归。
+V0.6.5 ship gate item #9 承诺 `ccteam doctor` 输出 "MCP tool surface: 27 active, 0 stubs",但实际 doctor 没有专门 stub-counter sub-mode ── inventory 显示 V0.6.5 ship 时是 manual 验。F171 加 `--verify-mcp` flag 把这条 invariant 自动化 + 加 0-STUB assertion,catch 未来回归。
 
 **现状缺口:**
 - `ccteam doctor` 现支持多 sub-mode(`--validate-team` / `--check-codex-auto-critic` / `--check-pricing` ...)。
@@ -475,7 +475,7 @@ pub fn run_verify_mcp() -> Result<VerifyMcpReport> {
     //    - Active: dispatch path returns real result (not Err("not implemented"))
     //    - Stub: dispatch path is unwired
     // 3. Count + per-group breakdown
-    // 4. Cross-check against expected count(26 tools per V0.6.1 F128)
+    // 4. Cross-check against expected count(27 tools = workflow_(15) + chat_(6) + advise_(2) + admin_(3) + screenshot(1))
     Ok(VerifyMcpReport {
         total: 26,
         active: 26,
@@ -504,7 +504,7 @@ impl VerifyMcpReport {
 ```
 MCP tool surface verification
 ===
-total tools:    26 (expected 26)
+total tools:    27 (expected 27)
 active:         26
 stubs:          0
 
@@ -515,7 +515,7 @@ per-group breakdown:
   admin_:       7 active / 0 stub  (incl. change_persona, add_tool)
   screenshot:   1 active / 0 stub
 
-verdict: PASS — all 26 tools live, no production STUBs.
+verdict: PASS — all 27 tools live, no production STUBs.
 ```
 
 非 0 stub → `verdict: FAIL` + exit code 1。
@@ -533,7 +533,7 @@ verdict: PASS — all 26 tools live, no production STUBs.
 - 新:`crates/ccteam-cli/tests/doctor_verify_mcp_test.rs`(6 test:expected count / 0-stub assertion / per-group breakdown / FAIL exit code / render format / static-table parity)
 
 **验收:**
-- `cargo run --release -- doctor --verify-mcp` 输出含 `MCP tool surface: 26 active, 0 stubs`
+- `cargo run --release -- doctor --verify-mcp` 输出含 `MCP tool surface: 27 active, 0 stubs`
 - `mcp_tool_groups::STUB_TOOLS` const = `&[]`
 - 故意临时把一个 dispatch 改成 stub → `doctor --verify-mcp` 输出 FAIL + exit 1
 - 测试 +6 全通
@@ -541,7 +541,7 @@ verdict: PASS — all 26 tools live, no production STUBs.
 
 **风险:**
 - 「real dispatch 检查」过度复杂 ── mitigate:走 Sub-4 替代实现(static lookup table + grep 守),更轻量
-- 26 tool 总数本版可能因 F167 加 `ccteam probe-project` 而变 27 ── mitigate:`probe-project` 是 CLI sub-cmd,**不**是 MCP tool;MCP 总数仍 26(确认无新 MCP 工具),否则 expected count 同 PR 同步改
+- MCP 总数本版预期保持 27(F167 加 `ccteam probe-project` 是 CLI sub-cmd,**不**是 MCP tool;本 PR 不引新 MCP 工具)。F171 implementation 凭 `STUB_TOOLS` const + `--verify-mcp` 自检 lock 这个 invariant ── 任何未来 PR 新增/删 MCP 工具必须同步 expected count,否则 CI 挂
 
 ---
 
