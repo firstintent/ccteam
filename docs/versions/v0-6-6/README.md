@@ -3,7 +3,7 @@
 > **状态:doc-first / Wave 0**(本 PR 范围 = `README.md` + `prd.md` + `dev-plan.md`,代码 PR 走后续 8 个 worktree-per-finding 并行 dispatch)。
 > **主题:** **关 V0.6.5 ship 留的小账 + 把两条原 V0.7 候选拉回 V0.6.6**。V0.6.5 闭了 V0.6 自身的账(chat MCP 桥 / advise / UX cohesion / 运维 robustness),`post-ship-stub-inventory.md` 又给出一张 codebase 干净度地图。本版按那张地图扫尾,加 **F172 mode-3 上下文恢复**(daemon 重启不丢长跑 chat 会话上下文)+ **F173 daemon-routed Codex critic 统一 cost rollup**(V0.6.3 F156 留的 explicit defer 现在补完),同时把 **F166 prebuilt binary + install.sh** 这条「零摩擦安装」做掉 ── 用户不再被 `cargo install --git` 拦在门口。
 > **基线起点:** workspace `0.6.5` / test `1583 / 1`(V0.6.5 ship 数,1 fail 是已知 `workflow_summary_reflects_agent_spawn_and_done_events` flake)/ clippy `-D warnings` clean。
-> **基线目标:** workspace `0.6.6` / test ≥ `1660 / 1`(+~80,见 §0 估算)/ clippy `-D warnings` clean。
+> **基线目标:** workspace `0.6.6` / test ≥ `1644 / 1`(+~61,见 §0 估算;F172 V2 改 spawn argv 路线 +8 替代原 +30)/ clippy `-D warnings` clean。
 > **痛点对应(13 用户痛点):** 痛点 4(零摩擦上手)/ 痛点 9(团队不依赖人在场,24/7 daemon)/ 痛点 11(Skill / 入口可发现性)/ 痛点 14(长跑可靠性)。
 
 ---
@@ -18,10 +18,10 @@
 | **F169** | `nl_admin::cost_today` 接真 `ccteam_cost` ledger(替 V0.6.1 占位 registry-count 返值) | 9 / 14 | S | +4 |
 | **F170** | 陈旧 doc-comment scrub(post-ship-stub-inventory Cat 7,实测 4 site) | 14 | XS | 0 |
 | **F171** | `ccteam doctor --verify-mcp` flag 加 stub-counter parity 自检 | 14 | S | +6 |
-| **F172** | tmux mode-3 上下文恢复 ── progress.jsonl 加 `chat_snapshot` event 周期 dump,daemon 重启可重建 | 9 / 14 | L | +30 |
+| **F172** | tmux mode-3 上下文恢复 ── 借 Anthropic 官方 `claude --resume <name>` lossless 取回 full API-level context,无需手工 synthesis | 9 / 14 | S-M | +8 |
 | **F173** | Codex daemon-routed critic 统一 cost rollup(F156 follow-through;原 V0.7 候选) | 6 / 14 | M | +15 |
 
-**总计** 8 finding · 8 worktree 并行(完全独立)· 估算 +~80 新测试 → baseline 目标 `1660/1`。
+**总计** 8 finding · 8 worktree 并行(完全独立)· 估算 +~61 新测试 → baseline 目标 `1644/1`。
 
 ---
 
@@ -31,7 +31,7 @@ V0.6.5 ship 时 `post-ship-stub-inventory.md` §"Recommendations" 给了三档�
 
 - **3 项 V0.6.6 patch 全收**:F168(TODO sweep,实际范围比 inventory 列的更广,9 site)/ F169(`cost_today` 接真 ledger)/ F170(Cat 7 doc-comment scrub)/ F171(doctor stub-counter parity)。
 - **从「V0.7 minor 主候选」拉两项回 V0.6.6**:**F172 mode-3 上下文恢复** + **F173 Codex critic 统一 cost rollup**。理由:
-  - F172 是「24/7 长跑可靠性」的最后一块拼图 ── V0.6.5 F163 给了 graceful SIGTERM、F164 给了 tmux reattach,但 **daemon 崩 / 重启时 chat bot 已积累的上下文会丢**(F164 reattach 物理 session,F118 `session_recovery` 重建 last-N turns,但「last-N turns 的语义损失」对长跑 bot 来说仍然不可忽略)。F172 让 progress.jsonl 周期 snapshot 关键 context,重启时 chat_handle re-attach 后用 snapshot 续上,把损失从「last-N turns」缩到「最后一次 snapshot 起的增量」。
+  - F172 是「24/7 长跑可靠性」的最后一块拼图 ── V0.6.5 F163 给了 graceful SIGTERM、F164 给了 tmux reattach(alive)+ recreate(dead pane),但 **F164 dead-pane recreate 路径 spawn 的是 brand-new claude 进程,上一段对话的 full API-level context 全丢**(F118 `session_recovery` 回放 last-N turns 作 user prompt 是 best-effort 字面回放,模型内部 tool-use 中间结果 / 已折叠 plan / cache 状态 / 推理链全失)。F172 V2 转向**直接借 Anthropic 官方 `claude --resume <session-name>` 接口** ── 每个 chat bot spawn 时加 `--name ccteam-chat-<slug>-<role>` deterministic 命名,recreate 路径 spawn `claude --resume <name>` 让 Anthropic 自己 reload session jsonl(`~/.claude/projects/<encoded-cwd>/<sid>.jsonl`)── lossless,无需 ccteam 手工 synthesis;红线 R10(跨项目记忆走官方接口)直接守。
   - F173 是 V0.6.3 F156 留的「explicit defer past V0.6.5」 ── V0.6.5 advise/Codex critic 路径全 ship 了,F156 提到的 unified cost rollup 现在前提齐备(`CodexExecAdapter` 已用;`<root>/cost-budget.json` ledger 已在 F152 引入)。本版补完后,Codex critic 调用统计与 main spawn 在同一账上,用户面 `ccteam doctor` + `@ccteam cost today`(F169)出真数,end-to-end 闭环。
 - **加 F166 + F167**:F166 是用户级零摩擦入口(对齐痛点 4 ── 当前 README quickstart 要求 `cargo install --git`,新用户至少装 Rust toolchain 才能开始);F167 是用户首次 `/ccteam-creator` 时落地 yaml 的 sensible defaults,与 F166 一起把「first 5 min user experience」抬一个档。
 
@@ -57,21 +57,21 @@ V0.6.5 ship 时 `post-ship-stub-inventory.md` §"Recommendations" 给了三档�
 
 | 红线 | 本版触及? | 守的方式 |
 |---|---|---|
-| 文件系统是控制平面 | F172 写 `chat_snapshot` 到 progress.jsonl | progress.jsonl 是已存在的 SoT,**不**新建第二个文件;snapshot payload 内联(或指向 turns.jsonl 内 byte-offset),不引入新 IPC 通道 |
-| `progress.jsonl` 是唯一 state SoT | F172 **守 + 扩展** | `chat_snapshot` 是 chat-mode event 家族的新成员(继 F108/F118 的 `chat_session_started` / `chat_turn_user_prompt` / `chat_turn_completed` / `chat_session_reset` / `chat_session_reset_with_recovery` / `chat_compact_done` / `chat_hop_escalate` 之后)── **不是新的第 9 类业务 event,而是扩 chat-mode 子家族**(CLAUDE.md §一 的 7 类业务 event + chat 子事件已是同一 SoT);daemon 重启从 progress.jsonl tail 读最近 `chat_snapshot` → 走 F118 既有 `session_recovery::build_recovery_prompt` 路径 |
-| No prompt injection | F172 snapshot 仅作为 recovery context 注入新 tmux pane | recovery 时注入的是 user prompt 形式(对齐 F118 `chat_session_reset_with_recovery` 既有路径),不是 system prompt;`.claude/agents/<role>.md` 仍是 agent 行为唯一 SoT |
-| 每次 spawn = fresh 1M context(bg 模式) | 不触及 | F172 仅作用于 mode-3 chat;chat 复用 context 是 feature(CLAUDE.md §三 原文) |
-| 永不主动 kill 长 session | F172 / F173 守 | F172 snapshot 是**辅助 + 非破坏** ── 周期 dump 到 progress.jsonl,不触 tmux pane,不发 send-keys,不影响 bot 当前活动;只有 daemon 重启时(daemon process 已死) 才走 recovery 路径,不算 kill;F173 critic 通过 daemon route 仍是 fire-and-forget 子进程,与 main spawn 独立 |
-| 不解析 tmux 终端输出 | F172 snapshot 源 = transcript jsonl + turns.jsonl(已存在的 ccteam-owned 路径) | snapshot 内容由 `turns_mirror`(F108 引入)与 progress.jsonl event 拼合而成,**不**调 `tmux capture-pane` |
+| 文件系统是控制平面 | F172 V2 借 Anthropic 官方 session jsonl | `--resume <name>` 读 Anthropic 自己的 `~/.claude/projects/<encoded-cwd>/<sid>.jsonl`(已是控制平面的官方接口),**不**引入新 IPC 通道、**不**新建文件;progress.jsonl 不动 |
+| `progress.jsonl` 是唯一 state SoT | F172 V2 **守(零扩)** | 原 V1 设计的 `chat_snapshot` event **ditch** ── F172 V2 完全 spawn-argv 级改动,SoT 红线零扩;daemon 重启 recovery 走 `claude --resume <name>` 由 Anthropic 自己 reload,不再依赖 ccteam 写 / 读 snapshot 事件 |
+| No prompt injection | F172 V2 守 | Anthropic 自己 reload context,ccteam 不构造 history-synthesis prompt、不向 tmux pane push 任何 text;`.claude/agents/<role>.md` 仍是 agent 行为唯一 SoT |
+| 每次 spawn = fresh 1M context(bg 模式) | 不触及 | F172 V2 仅作用于 mode-3 chat;chat 复用 context 是 feature(CLAUDE.md §三 原文)|
+| 永不主动 kill 长 session | F172 V2 / F173 守 | F172 V2 仅在 F164 探测到 dead pane 时走 recreate(那是 orphan tmux,不是活 bot ── F164 已论证不算红线违反);alive session 完全不动;F173 critic 通过 daemon route 仍是 fire-and-forget 子进程,与 main spawn 独立 |
+| 不解析 tmux 终端输出 | F172 V2 不涉 tmux 任何 pane content | F172 V2 完全 spawn argv 级改动(`--name` / `--resume`),零调 `tmux capture-pane`、零读 pane 内文本 |
 | fix-loop 撞 3 次必 escalate | F168 决断须 explicit | F168 任何「continue iterating later」式拖单 → escalate-with-question,不写入 prd 默认 |
-| `ccteam-core` 零 team 名字面量 | 不触及 | 本版 ccteam-core 改动仅在 progress event const(F172)+ chat snapshot helper 函数,**无** team 名 |
-| 跨项目记忆走官方接口 | 不触及 | 本版不改 `~/.claude/CLAUDE.md` / `~/.codex/AGENTS.md` 处理 |
+| `ccteam-core` 零 team 名字面量 | 不触及 | 本版 ccteam-core 改动仅在 `claude_tui::start_thread` spawn argv 分支(F172 V2),**无** team 名;原 V1 设计的 progress event const + helper 函数也不再引入 |
+| 跨项目记忆走官方接口(R10) | F172 V2 **直接守** | `--resume <name>` 是 Anthropic CLI 一等公民(等同 `--name` / `-c` 同族),ccteam 借而不替;`~/.claude/CLAUDE.md` / `~/.codex/AGENTS.md` 路径完全不动 |
 | 新建项目走 `<projects_root>/<team>-<slug>/` | 不触及 | F167 改默认值,不动 slug minting |
 | root README.md MUST be English | F166 改 README quickstart 段 | install.sh 一行说明走英文段,中文说明进 `docs/quickstart.md` |
 | README.md 不含版本进展/状态信息 | F166 改 README | install.sh / GH Release 描述是「产品当前能力」展示,**不**含版本号 / shipping 日期 / 验收数字 |
 | HITL approval state SoT(V0.6.1 F124) | 不触及 | 本版无 plan_approval 改 |
 
-**F172 红线设计补充说明**:本版**明确**选「扩 chat-mode 子事件家族」而非「新建第 9 类业务 event」── 决策理由:`chat_snapshot` 与 F118 `chat_session_reset_with_recovery` 是同一抽象层级的孪生事件(一个写、一个读 recovery 路径),把它们划到不同 category 会让 progress.jsonl 消费者(`ccteam-imd::daemon` recovery / `ccteam-web` dashboard / `ccteam-control` admin)的分发逻辑撕成两套,违反 SoT 原则的 spirit。详 prd §F172。
+**F172 V2 红线设计补充说明**:本版从原 V1「ccteam 自建 `chat_snapshot` event + synthesis recovery prompt」改为「直接借 Anthropic 官方 `claude --resume <name>` CLI 接口」── 决策理由:Anthropic 自己已把 full API-level context(tool-use 中间结果 / cache 状态 / 推理链)存在 `~/.claude/projects/<encoded-cwd>/<sid>.jsonl`,官方 CLI 提供 lossless `--resume`;ccteam 借而不替,既守 R10(跨项目记忆走官方接口),又零扩 progress.jsonl SoT,还避免了 synthesis 路径的"silent 上下文损失"风险(如果 synthesis 不完整 user 会误以为 resume 成功)。F172 V2 fallback 路径(`--resume` 失败 → fresh session + 显式 `chat_session_reset` event)也是 user-visible degraded,**不**冒充 resume。详 prd §F172。
 
 ---
 
@@ -88,7 +88,7 @@ V0.6.5 ship 时 `post-ship-stub-inventory.md` §"Recommendations" 给了三档�
 
 ## 5. Ship gate(V0.6.6 → main)
 
-1. **baseline**:`cargo test --workspace --locked --no-fail-fast` ≥ **1660 / 1**(1583 起点 + ~80 新测试)
+1. **baseline**:`cargo test --workspace --locked --no-fail-fast` ≥ **1644 / 1**(1583 起点 + ~61 新测试;F172 V2 spawn argv 路线 +8 替代原 +30 chat_snapshot 设计)
 2. **clippy**:`cargo clippy --workspace --all-targets --locked -- -D warnings` 0 命中
 3. **F166 GH Actions release CI 跑通**:tag `v0.6.6` push → 4-arch matrix(linux-x64 / macOS-arm64 / macOS-x64 / windows-x64)build artifact 上 GH Release,checksum 文件齐
 4. **F166 install.sh 真验**:nas-box005(linux-x64)从 fresh wipe → `curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh | sh` → `ccteam --version` 输出 `0.6.6` + PATH 写入正确;**手动签字** → `docs/versions/v0-6-6/host-probe.md`
@@ -97,7 +97,7 @@ V0.6.5 ship 时 `post-ship-stub-inventory.md` §"Recommendations" 给了三档�
 7. **F169 真 ledger 验**:nas-box005 daemon 跑一次 advise call → `@ccteam cost today` IM 回返值含真 USD 数字 + per-vendor 分项;CLI `ccteam-control show-cost` 输出同样数字
 8. **F170 doc-comment scrub clean**:`grep -rn "V0.3.3 cleanup\|F49 wires\|once Wave 2 lands\|Wave 2 wires it into the" crates/*/src/` 0 命中
 9. **F171 doctor stub-counter**:`cargo run --release -- doctor --verify-mcp` 输出含 `MCP tool surface: 26 active, 0 stubs`(沿用 V0.6.5 ship gate item #9 措辞)+ 失败 exit code = 1;**有自动化 test 覆盖**(`crates/ccteam-cli/tests/doctor_verify_mcp_test.rs`)
-10. **F172 daemon-restart-recovery host-probe**:nas-box005 跑 mode-3 chat bot ≥10 turns → `kill -TERM <daemon pid>` → `ccteam start` 再起 → bot 自动 re-attach + 第 11 turn 输入能用得到前 10 turn 上下文(测试人确认 reply 引用早 turn 内容);progress.jsonl 含 ≥1 `chat_snapshot` event;**手动签字** → host-probe.md
+10. **F172 V2 daemon-restart-recovery host-probe**:nas-box005 跑 mode-3 chat bot ≥10 turns → `tmux kill-session -t <ccteam-chat-name>` 模拟 dead pane → daemon 探测 dead → `start_thread` 走 Recreate 路径 spawn `claude --resume ccteam-chat-<slug>-<role>` → 第 11 turn 输入「刚才那个 X 怎么样」→ bot reply 直接引用早 turn 内容(模型内部 cache 续接,**不是** F118 last-N 字面回放);`grep -rn "tmux capture-pane\|CHAT_SNAPSHOT\|chat_snapshot" crates/ccteam-core/src/execution/claude_tui.rs crates/ccteam-core/src/progress.rs` 0 命中(红线守);**手动签字** → host-probe.md
 11. **F173 Codex critic cost rollup 真验**:`mcp__ccteam__advise_vote` 调用 Claude+Codex 各一次 → `<root>/cost-budget.json` `advise_today_usd` 增加;`@ccteam cost today` 显示同样增量;`ccteam doctor` 不报 cost-orphan warning
 12. **CLAUDE.md §一 baseline 表更新到 V0.6.6 数字**(test pass count + version + 当前最新版 + 上一版 + V0.6.x 延期候选)
 13. **dev-coupling-audit.md 加 F166-F173 索引**
@@ -123,7 +123,7 @@ Wave 1  8 finding 全并行 worktree(每个独立 Opus subagent)
         F169 cost_today ledger wire-up               ── 0.5 d
         F170 doc-comment scrub                       ── 0.5 d
         F171 doctor stub-counter                     ── 0.5 d
-        F172 mode-3 context recovery                 ── 2.5 d
+        F172 V2 mode-3 context recovery via claude --resume by name ── 0.5-1 d
         F173 Codex critic cost rollup                ── 2 d
 
 Wave 2  doc-syncer + host-probe + ship gate(必要时,可与 Wave 1 末段并行)
