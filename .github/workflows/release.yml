@@ -1,12 +1,16 @@
 # GitHub Actions: tag-triggered prebuilt-binary release (F166).
 #
-# Pushing a tag like `v0.6.6` builds the `ccteam` binary on four targets,
+# Pushing a tag like `v0.6.6` builds the `ccteam` binary on three targets,
 # packages each with a per-asset SHA-256 sum, aggregates a single
 # SHA256SUMS file, and uploads everything to the corresponding GitHub
 # Release. `install.sh` (repo root) reads these assets — keep the asset
 # naming `ccteam-<tag>-<suffix>.<ext>` and the suffix vocabulary
-# (linux-x64 / macos-arm64 / macos-x64 / windows-x64) in lockstep with
-# that script.
+# (linux-x64 / macos-arm64 / macos-x64) in lockstep with that script.
+#
+# Windows is intentionally out of scope: ccteam's foundation is tmux +
+# inotify + POSIX signals (`libc::SIGKILL` / `SIGTERM` in
+# `crates/ccteam-core/src/harness.rs`), which are unix-only. Windows
+# users run ccteam under WSL2 with the linux-x64 binary.
 #
 # The repo-guard on every job stops a fork that accidentally inherits
 # this workflow from publishing under the upstream release page.
@@ -41,10 +45,6 @@ jobs:
             target: x86_64-apple-darwin
             suffix: macos-x64
             ext: tar.gz
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            suffix: windows-x64
-            ext: zip
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -63,6 +63,27 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # Pre-install the SPA `node_modules/` before `cargo build` so the
+      # `ccteam-web` build.rs (which feature-gates on `web-bundle`,
+      # default-on) finds them and skips its own `npm install`. We split
+      # by runner OS because `package-lock.json` is generated on Linux
+      # and only resolves the linux-x64 rolldown native binding; macOS
+      # `npm ci` would honor that lockfile and skip the darwin
+      # `optionalDependencies`, leaving rolldown unable to load
+      # `.darwin-arm64.node` at build time. Clearing the lockfile on
+      # macOS forces a fresh platform-correct resolution.
+      - name: Pre-install web SPA deps (linux fast path with lockfile)
+        if: runner.os == 'Linux'
+        working-directory: crates/ccteam-web/web
+        run: npm ci --no-audit --no-fund --include=optional
+
+      - name: Pre-install web SPA deps (macOS — drop lockfile for native binding refresh)
+        if: runner.os == 'macOS'
+        working-directory: crates/ccteam-web/web
+        run: |
+          rm -f package-lock.json
+          npm install --no-audit --no-fund --include=optional
 
       - name: Build ccteam binary
         run: cargo build --release --locked --target ${{ matrix.target }} --bin ccteam
@@ -86,21 +107,6 @@ jobs:
             shasum -a 256 "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256"
           fi
 
-      - name: Package (windows)
-        if: matrix.ext == 'zip'
-        shell: pwsh
-        run: |
-          $tag = $env:GITHUB_REF_NAME
-          $pkg = "ccteam-$tag-${{ matrix.suffix }}"
-          $stage = Join-Path ([System.IO.Path]::GetTempPath()) $pkg
-          New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/ccteam.exe" "$stage/ccteam.exe"
-          Copy-Item "README.md" "$stage/README.md"
-          Copy-Item "LICENSE" "$stage/LICENSE"
-          Compress-Archive -Path $stage -DestinationPath "$pkg.zip" -Force
-          $hash = (Get-FileHash "$pkg.zip" -Algorithm SHA256).Hash.ToLower()
-          "$hash  $pkg.zip" | Out-File -FilePath "$pkg.zip.sha256" -Encoding ascii
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -108,8 +114,6 @@ jobs:
           path: |
             ccteam-*-${{ matrix.suffix }}.tar.gz
             ccteam-*-${{ matrix.suffix }}.tar.gz.sha256
-            ccteam-*-${{ matrix.suffix }}.zip
-            ccteam-*-${{ matrix.suffix }}.zip.sha256
           if-no-files-found: error
           retention-days: 7
 
@@ -150,7 +154,10 @@ jobs:
           cat > release-notes.md <<EOF
           # ccteam ${TAG}
 
-          Prebuilt binaries for Linux, macOS (Intel + Apple Silicon), and Windows.
+          Prebuilt binaries for Linux x86_64 and macOS (Intel + Apple Silicon).
+          Windows users: run ccteam under WSL2 with the linux-x64 binary
+          (ccteam's foundation is tmux + inotify + POSIX signals, which
+          are unix-only).
 
           ## Install (zero-Rust)
 
@@ -196,4 +203,4 @@ jobs:
             --repo "${GITHUB_REPOSITORY}" \
             --title "ccteam ${TAG}" \
             --notes-file ../release-notes.md \
-            ccteam-*.tar.gz ccteam-*.zip SHA256SUMS
+            ccteam-*.tar.gz SHA256SUMS
