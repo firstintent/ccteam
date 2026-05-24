@@ -47,8 +47,8 @@ const ANTHROPIC_TOML: &str = include_str!("../pricing/anthropic.toml");
 const OPENAI_TOML: &str = include_str!("../pricing/openai.toml");
 
 /// Vendor discriminator. Defined here (not in `ccteam-core::harness`)
-/// so this crate has zero `ccteam-core` deps — `ccteam-core` will
-/// re-export `ccteam_cost::Vendor` once Wave 2 lands.
+/// so this crate has zero `ccteam-core` deps; `ccteam-core` re-exports
+/// `ccteam_cost::Vendor` from its `lib.rs` for downstream callers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Vendor {
     Claude,

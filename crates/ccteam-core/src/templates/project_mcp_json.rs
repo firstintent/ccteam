@@ -15,9 +15,8 @@
 //!   `mcpServers.*` entries the user already wired up (Playwright,
 //!   Linear, etc.).
 //!
-//! Wave 1 lands this helper alone; Wave 2 wires it into the
-//! `ccteam-creator` skill execute phase (per `docs/versions/v0-6-0/prd.md` F111
-//! file clean list).
+//! V0.6.5 F148 wires this helper into the `ccteam-creator` skill
+//! execute phase (see `skills/ccteam-creator/SKILL.md` §5.7).
 
 use std::path::Path;
 
