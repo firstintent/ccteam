@@ -866,7 +866,7 @@ V0.6 F111 起所有工具加 group 子前缀,**server name 不变**(`ccteam`),�
 | `admin_` | 3 | `mcp__ccteam__admin_{ls,change_persona,add_tool}` |
 | `screenshot`(单成员独立 group)| 1 | `mcp__ccteam__screenshot` |
 
-**总计 V0.6.5 收官 27 工具,0 STUB,0 deprecated alias**(V0.6 F111 24 + V0.6.1 F128 +2 admin + V0.6.5 F146 chat +1 [register/unregister 拆 1 → 2,net +1] + F152/F153 advise 升真 — 详 `interfaces.md §12`)。`CCTEAM_DISABLE_TOOLS` env 用 group enum(非 glob,防 typo):`CCTEAM_DISABLE_TOOLS=advise,chat` 关掉两组。F110 上版的 `ccteam` → `ct` namespace rename **取消**(V0.5 用户肌肉记忆 override 4 字符节省)。
+**总计 V0.6.5 收官 27 工具,0 STUB,0 deprecated alias**(V0.6 F111 24 + V0.6.1 F128 +2 admin + V0.6.5 F146 chat +1 [register/unregister 拆 1 → 2,net +1] + F152/F153 advise 升真 — 详 `interfaces.md §12`;V0.6.6 F171 在 `crates/ccteam-cli/src/mcp_tool_groups.rs` 落 `STUB_TOOLS: &[&str] = &[]` static const + `ccteam doctor --verify-mcp` 自检 stub-counter parity → 倒退 catch)。`CCTEAM_DISABLE_TOOLS` env 用 group enum(非 glob,防 typo):`CCTEAM_DISABLE_TOOLS=advise,chat` 关掉两组。F110 上版的 `ccteam` → `ct` namespace rename **取消**(V0.5 用户肌肉记忆 override 4 字符节省)。
 
 **Wire 协议纪律(V0.6.5 F165)**:`ccteam mcp-serve` stdout 是 line-delimited JSON-RPC frame channel,**所有 tracing / 日志走 stderr**(`init_tracing_stderr()`),否则 first `tools/list` 那次 `register_bot` 之类的 `info!` 会污染 frame parse → MCP client 解析挂。其他子命令(`ccteam start` / `ccteam web`)stdout 继续是 human readable。`RUST_LOG=error` 不再是 MCP test 的必经环境(F165 前 F147 等用过这个 workaround)。
 
@@ -1137,9 +1137,9 @@ user-manual.md §3.2 写 IM 群内 `@ccteam pause <bot>` / `cost today` / `list 
 
 **Tests**:`crates/ccteam-imd/tests/im_nl_admin_test.rs`(367 行)— mock TG inbound w/ 5 NL admin path + 危险 confirm flow。
 
-### 6.16 运维健壮性(V0.6.5 F163 + F164)
+### 6.16 运维健壮性(V0.6.5 F163 + F164;V0.6.6 F172 V2 daemon-restart context recovery)
 
-V0.6.4 nas-box005 真生产部署 surfaces 两个长跑 daemon 用 blocker — daemon 不响应任何 graceful shutdown 信号(只能 SIGKILL,丢 in-memory state、留孤儿 pidfile);`claude-tui::start_thread` 看到已存在的 ccteam tmux session 直接报错而非 reattach(daemon 重启周期里 bot 永久失能,必须人工 `tmux kill-session`)。F163 + F164 在 V0.6.5 把这两个洞合上。
+V0.6.4 nas-box005 真生产部署 surfaces 两个长跑 daemon 用 blocker — daemon 不响应任何 graceful shutdown 信号(只能 SIGKILL,丢 in-memory state、留孤儿 pidfile);`claude-tui::start_thread` 看到已存在的 ccteam tmux session 直接报错而非 reattach(daemon 重启周期里 bot 永久失能,必须人工 `tmux kill-session`)。F163 + F164 在 V0.6.5 把这两个洞合上。V0.6.6 F172 V2 再补 daemon-restart-after-dead-pane 的 context 丢失洞 —— 借 Anthropic 官方 `claude --resume <name>` lossless lookup,bot 跨重启续接 full API-level context(模型内部 tool-use 中间结果 / cache 状态 / 推理链全保;不再依赖 F118 last-N 字面回放,字面回放路径保留作 brand-new spawn 退路)。
 
 **F163 — `ccteam start` graceful drain**:
 
@@ -1159,6 +1159,40 @@ V0.6.4 nas-box005 真生产部署 surfaces 两个长跑 daemon 用 blocker — d
 健康检查走 `is_pane_running_claude(session) -> bool` helper,用 `ps -o comm=` 拿 pane pid 的 process name —— **不读 pane 内容**(CLAUDE.md §三 "不解析 tmux 终端输出" 守)。Hijack 风险:user 手工 `tmux new-session -s ccteam-chat-foo-bar` 然后跑 claude 会被 ccteam 当作已注册 bot adopt;接受这个 trade-off(documented in `claude_tui.rs` comment)—— ccteam-managed session 名按 `ccteam-chat-<slug>-<role>` 约定,hijack 需用户主动作意。
 
 不动 `resume_thread`(那条路径正常 stop+start 周期已经良性)。`TmuxSession::list_pane_pids()` 加 helper via `tmux list-panes -F "#{pane_pid}"`。Tests:`crates/ccteam-core/tests/claude_tui_reattach_test.rs` 6 cases(alive / dead / fresh / hijack-doc 等)。
+
+**F172 V2 — mode-3 上下文恢复 via `claude --resume <name>` lossless lookup**(V0.6.6):
+
+F164 给了 dead-pane recreate,但 recreate 路径 spawn 的是 brand-new `claude` 进程 —— 上一段对话的 full API-level context(tool-use 中间结果 / cache 状态 / 推理链 / 已折叠 plan)全丢。F118 `session_recovery::build_recovery_prompt` 拼 last-N turn 作 user prompt 字面回放是 best-effort,不能恢复模型内部状态(silent context 损失)。
+
+F172 V2 转向直接借 Anthropic 官方 CLI 接口(R10 跨项目记忆走官方接口直接守):
+- **Fresh path**:`claude_tui::start_thread` spawn argv 加 `--name ccteam-chat-<slug>-<role>` deterministic 命名(F108 spawn-keys 路径 + F164 recreate 路径都加),Anthropic 自己把 session jsonl 落在 `~/.claude/projects/<encoded-cwd>/<sid>.jsonl`
+- **Recreate path**(F164 (b) dead-pane 探测命中):argv 改为 `claude --resume ccteam-chat-<slug>-<role>` lossless lookup,Anthropic 自己 reload jsonl,模型 cache + 推理链续接
+- **`--resume` 失败 fallback**:走 Fresh path + emit `chat_session_reset { bot, reason }` event(user-visible degraded,**不**冒充 resume)。reason 字段供 IM 通知 / web UI 显示 "your bot lost context, here's why"
+
+**红线零扩**(V1 设计 ditch):原 V1 PRD 草过 `chat_snapshot` progress event + ccteam-side synthesis prompt,F172 V2 全部 ditch —— `progress.jsonl` SoT 零扩(只增 `chat_session_reset.reason` 字段)/ 不向 tmux pane 注入 system prompt / 不 `tmux capture-pane` / 不构造 history-synthesis prompt。Anthropic 自己 reload,ccteam 借而不替。
+
+不动 F118 `build_recovery_prompt`(brand-new spawn 路径保留 — 比如 `--resume` 因 jsonl 损坏失败时;V0.7 epic 可能整合)。Tests:`crates/ccteam-core/tests/session_recovery_test.rs` +8 cases(deterministic name / Fresh spawn args / Recreate spawn args / `--resume` failure → Fresh + reset event 等)。Host-probe:nas-box005 跑 10+ turn → `tmux kill-session` 模拟 dead → 第 11 turn "刚才那个 X" 引用早 turn(模型 cache 续接验证,**不是** F118 字面回放)。详 `docs/versions/v0-6-6/prd.md §F172`。
+
+### 6.17 Codex critic 统一 cost rollup(V0.6.6 F173)
+
+V0.6.3 F156 把 N≥3 critic 的 Codex 一票走 bash spawn(skill body 跑 `codex exec --json` 并行 Claude `Task`),但 cost 没汇总到 `<ccteam_root>/cost-budget.json` ledger(advise_* MCP 已经在用),用户面 `@ccteam cost today` / `ccteam doctor` 看到的是漏数。V0.6.6 F173 follow-through 闭环:
+
+- **`default_adapter_factory` Codex arm**:改用 `CodexExecAdapter`(替代 V0.6.3 bash spawn 路径);`orchestrator::adapter_for_chat` 同步 — mode 2 + mode 3 Codex critic 都走 trait 一等公民
+- **`CodexExecAdapter::submit_turn` ledger hook**:`turn/completed` JSONL event 携 `usage` 字段 → `append_budget_sample(vendor=codex, cost_usd, tokens)` 进 `<ccteam_root>/cost-budget.json`(与 F152 advise_vote 同 ledger)
+- **`ccteam doctor` cost-orphan invariant**:`--check-cost-orphan` flag 扫近 24h 的 Codex `agent_done` events(progress.jsonl)对比 ledger 行,缺失即 WARN(catch ledger 漏写)
+- **`BudgetExceeded` hard-fail**:critic 超 `budgets.codex.max_cost_usd_per_24h` 即拒(不 silent bypass)。`skills/ccteam-team/SKILL.md` §3.5 文案改"V0.6.6 F173 shipped daemon-routed Codex critic with unified cost rollup"
+
+Tests:`crates/ccteam-core/tests/codex_critic_ledger_test.rs` 3 cases(happy-path ledger row / budget cap hard-fail / cost-orphan detection)+ `crates/ccteam-cli/tests/doctor_check_cost_orphan_test.rs`。`@ccteam cost today` 与 `ccteam doctor` 端到端 cost 数字一致(F169 wire-up 完成同账)。详 `docs/versions/v0-6-6/prd.md §F173`。
+
+### 6.18 dev tooling — `ccteam doctor --verify-mcp`(V0.6.6 F171)
+
+V0.6.5 收官时 ship gate item #9 措辞"MCP tool surface: 26 active, 0 stubs"是手动 grep 验,易倒退。V0.6.6 F171 立法:
+
+- **`STUB_TOOLS: &[&str] = &[]` static const**(`crates/ccteam-cli/src/mcp_tool_groups.rs`)是 invariant 守门员;任何新 MCP tool 在 schema 实装前先加进 STUB_TOOLS,实装后从 const 删
+- **`ccteam doctor --verify-mcp` flag**(`crates/ccteam-cli/src/main.rs`)走 `run_verify_mcp` → `VerifyMcpReport { active, stubs, groups }`;text 模式输出"MCP tool surface: 27 active, 0 stubs",JSON 模式喂 CI;stub_count > 0 → exit code 1(机械验,F155 `--check-codex-auto-critic` 同模式)
+- Tests:`crates/ccteam-cli/tests/doctor_verify_mcp_test.rs` 6 cases。Ship gate item #9 V0.6.6+ 起改"`cargo run -- doctor --verify-mcp` exits 0"
+
+详 `docs/versions/v0-6-6/prd.md §F171`。
 
 ---
 
@@ -1184,6 +1218,8 @@ V0.6.4 nas-box005 真生产部署 surfaces 两个长跑 daemon 用 blocker — d
 | **M4.5-M4.6** | 多 audit 投票 + anti-leniency | 未 ship | (未规划到具体版本) |
 | **V0.4.7+** | F92 cost from jobs/linkScanPath / workflow.yaml 条件分支 / fan-out multi-session | 未 ship | V0.5 候选 |
 | **V0.6.3** | F140 真 cron(`Trigger::Schedule` 接 5 段 cron + skip-missed) / F141 webhook ingress / F142 vendor-seam forward-compat / F143 squad routing | 已 ship | [docs/versions/v0-6-3/](./versions/v0-6-3/) |
+| **V0.6.5** | F146-F165:Epic E chat MCP 桥(register/unregister/list/send/history/reset 6 真)+ Epic F advise/Codex critic(advise_vote / advise_parallel + doctor codex-auto-critic gate)+ Epic G UX cohesion(`/ccteam` dispatcher hide-unimpl + ccteam-scan --quick + task-to-command 决策树)+ Epic H 运维健壮性(F163 graceful shutdown + F164 tmux reattach) | 已 ship | [docs/versions/v0-6-5/](./versions/v0-6-5/) |
+| **V0.6.6** | F166-F173:GH Releases prebuilt binary + `install.sh` 零摩擦装 / `/ccteam-creator` per-project-type sensible defaults + `ccteam probe-project --json` / active TODO sweep 6 V0.7-defer-with-justification / `nl_admin::cost_today` 接真 `ccteam_cost` ledger / doc-comment scrub / `ccteam doctor --verify-mcp` + STUB_TOOLS static const / mode-3 上下文恢复 via `claude --resume <name>` lossless / Codex daemon-routed critic unified cost rollup(F156 follow-through) | 已 ship | [docs/versions/v0-6-6/](./versions/v0-6-6/) |
 
 **版本化文档维护**：每发布一个版本，该版本所有规划文档（PRD / dev-plan /
 design / retro / userguide）归档到 `docs/v<major>-<minor>-<patch>/`，通过该目录的

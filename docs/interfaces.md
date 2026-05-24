@@ -699,6 +699,12 @@ ccteam ls / show / status              # 查询(详见 §10.3)
 ccteam pause <slug>                    # 暂停项目(不杀 session;走 `state.user_pause_pending=true`)
 ccteam remove <slug> [--purge] [--dry-run] [--force]   # un-roster 项目(详见 §10.X remove)
 ccteam doctor [flags]                  # 维护(详见 §10.6)
+ccteam probe-project [--path PATH] [--json]
+                                       # V0.6.6 F167:per-project-type 启发式探测
+                                       # (Monorepo/SingleRepo/DocsOnly/ScriptsOnly)给
+                                       # `/ccteam-creator` Phase 3.6 喂 sensible defaults;
+                                       # `--json` 出稳定 schema(供 SKILL.md / jq 消费),
+                                       # 默认 4 行 human-readable summary
 ccteam session                         # flex session 管理(V0.5.0 F100: team factory 已删,见 §10.6 末)
 ccteam web                             # 单独跑 web(`ccteam start` 默认带)
 ```
@@ -726,6 +732,10 @@ ccteam doctor --migrate-workflow-to-ccteam-dir [--apply]
                                                   # 把根上 workflow.yaml 移到 `.ccteam/workflow.yaml`(默认 dry-run)
 ccteam doctor --gc-claude-jobs [--apply]          # GC `~/.claude/jobs/<id>/` 已 terminal 且 > 7 天的目录;默认 dry-run
 ccteam doctor --update-hooks [--dry-run]          # 扫所有项目 settings.json,改写顶层 `ccteam hook ...` 为 `ccteam internal hook ...`
+ccteam doctor --check-pricing-version             # V0.6.1 F121:per-vendor pricing toml stale 判定(OK / warn 180d / ERROR 365d)
+ccteam doctor --check-codex-auto-critic           # V0.6.5 F155:`<bin> --version` + `<bin> exec --json --skip-git-repo-check` canary;exit 0/2/3
+ccteam doctor --verify-mcp [--json]               # V0.6.6 F171:MCP tool surface stub-counter parity 自检;stub_count > 0 → exit code 1
+ccteam doctor --check-cost-orphan                 # V0.6.6 F173:扫近 24h Codex `agent_done` events vs `<ccteam_root>/cost-budget.json` ledger,缺失即 WARN
 ccteam web --bind 127.0.0.1:7331                  # web UI(详见 §15 + §16);`ccteam start` 默认带 web
 ccteam web --bind 0.0.0.0:7331 [--no-auth]        # LAN 模式;非 loopback 默认强 token 鉴权
 ccteam web --token-file <path>                    # 自定义 token 文件路径(默认 ~/.ccteam/web-token)
