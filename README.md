@@ -26,47 +26,48 @@ Not sure? Just describe it in natural language   /ccteam "<what you want>"
 
 ## Get started
 
-```bash
-# 0. Install Claude Code first: https://code.claude.com/docs/install
+### Install (Claude Code or Codex)
 
-# 1. Install the ccteam CLI binary (one line, no Rust toolchain needed):
-curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh | sh
-#    Installs to ~/.local/bin/ccteam. The script prints a PATH-export
-#    hint if that directory isn't on your PATH yet — follow it, then
-#    restart your shell (or `source ~/.bashrc` / `source ~/.zshrc`).
-#    Pin a specific release tag: CCTEAM_VERSION=<tag> curl ... | sh
-#    Install system-wide:        CCTEAM_INSTALL_DIR=/usr/local/bin curl ... | sh
-#    Or download an archive from https://github.com/firstintent/ccteam/releases
-#    Build from source instead (requires Rust 1.85+):
-#      cargo install --git https://github.com/firstintent/ccteam ccteam-cli
-
-# 2. Inside any Claude session, register the marketplace + install the plugin:
-claude
-```
+Inside any Claude Code session:
 
 ```
 /plugin marketplace add https://github.com/firstintent/ccteam
 /plugin install ccteam
 ```
 
+Inside any Codex session:
+
 ```
-# 3. Try the universal entry — describe what you want in any language:
+codex plugin marketplace add firstintent/ccteam
+```
+
+The plugin auto-downloads the Rust engine into its own sandbox on the first MCP invocation — no system-wide binary required, no Rust toolchain, no separate install step. A Node.js bridge (`index.js`) ships in the repo, detects the host (Claude vs Codex), pulls the matching prebuilt tarball from GitHub Releases, and execs `ccteam mcp-serve` under the covers. It also symlinks the binary to `~/.local/bin/ccteam` so the CLI is available from any terminal.
+
+### Use it
+
+```
+# Universal entry — describe what you want in any language:
 /ccteam "scan this repo and tell me what it does"
 /ccteam "fix the TypeScript errors in src/"
 /ccteam "build a Telegram bot that summarizes my GitHub PRs at 7am"
 
-# 4. (Optional) Bootstrap a per-project workflow scaffold from the CLI:
+# (Optional) Bootstrap a per-project workflow scaffold from the CLI:
 ccteam init <project>
 ```
 
-Supported platforms for the prebuilt binary: Linux x86_64, macOS arm64
-(Apple Silicon), macOS x86_64 (Intel). Windows users: install via WSL2
-and use the linux-x64 binary — native Windows isn't supported because
-tmux + inotify + POSIX signals are foundational to ccteam. On macOS,
-if Gatekeeper blocks the binary on first run:
-`xattr -d com.apple.quarantine ~/.local/bin/ccteam`.
+Supported platforms for the prebuilt binary: Linux x86_64, macOS arm64 (Apple Silicon), macOS x86_64 (Intel). Windows users: install via WSL2 and use the linux-x64 binary — native Windows isn't supported because tmux + inotify + POSIX signals are foundational to ccteam. On macOS, if Gatekeeper blocks the binary on first run: `xattr -d com.apple.quarantine ~/.local/bin/ccteam`.
 
-Step 2 registers ccteam as a Claude Code plugin marketplace, then installs the plugin — the seven `/ccteam*` slash commands and `mcp__ccteam__*` MCP tools light up immediately. The 5-minute walkthrough for "private IM assistant" (the flagship use case) lives in [docs/quickstart.md](docs/quickstart.md).
+The plugin install registers the seven `/ccteam*` slash commands and `mcp__ccteam__*` MCP tools — they light up immediately. The 5-minute walkthrough for "private IM assistant" (the flagship use case) lives in [docs/quickstart.md](docs/quickstart.md).
+
+### Advanced: system-wide CLI without the plugin
+
+If you want `ccteam` on `$PATH` for daemon use (`ccteam start`) without going through a Claude or Codex session — for example on a headless server — install the binary directly:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh | sh
+```
+
+Pin a tag: `CCTEAM_VERSION=<tag> curl ... | sh`. System-wide: `CCTEAM_INSTALL_DIR=/usr/local/bin curl ... | sh`. Or build from source: `cargo install --git https://github.com/firstintent/ccteam ccteam-cli` (Rust 1.85+).
 
 ## Three ways to talk to ccteam
 

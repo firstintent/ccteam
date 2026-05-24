@@ -21,7 +21,17 @@
 ### A3. `/plugin install ccteam@claude-plugins-official` 失败
 **原因**:网络 / GitHub rate-limit / 已装同名 plugin 冲突。
 **修复**:1) `/plugin list` 看是否同名 → `/plugin remove ccteam` 重装;2) 走代理 / 国内镜像;3) 仍失败:手动 `git clone` 到 `~/.claude/plugins/marketplaces/`。
-**相关**:A4 / A5。
+**相关**:A4 / A5 / A3b。
+
+### A3b. plugin 装好了,首次调 `mcp__ccteam__*` 时下载 binary 卡住 / 失败
+**原因**:plugin 的 Node.js bridge(`index.js`)首次 MCP 启动会从 GitHub Release 拉对应平台的 tarball(`ccteam-vX.Y.Z-<linux-x64|macos-arm64|macos-x64>.tar.gz`)到 `${PLUGIN_ROOT}/bin/ccteam`。慢/失败常因:1) GitHub Release 不在 CDN 近端(国内裸连慢);2) plugin sandbox 写权限缺;3) 平台 mismatch(`tar` 不在 PATH / 平台未发布)。
+**修复**:1) bridge 启动日志走 host stderr,Claude session `/mcp` 看 ccteam 启动报错 / Codex 看 server log;2) 走代理:在拉起 Claude/Codex 的 shell 里 `export HTTPS_PROXY=...`;3) 跳过 bridge 下载、走传统 system-wide 安装:`curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh | sh`,然后**临时把 `.mcp.json` 的 command 改回 `ccteam` + args `["mcp-serve"]`** 直至 bridge 路径修复;4) 国内裸连慢首次卡住 → 镜像 GH Release 到内网,把 `index.js` 里的下载 URL 改成镜像。版本严格对齐 `.claude-plugin/plugin.json::version`(SoT);Bridge 通过 `binary --version` 输出与之比对,不匹配会重下。
+**相关**:A3 / A4。
+
+### A3c. plugin 装好但终端 `ccteam --version` 报 command not found
+**原因**:bridge 首次 MCP 调用会把 `${PLUGIN_ROOT}/bin/ccteam` symlink 到 `~/.local/bin/ccteam`,但如果 `~/.local/bin/` 不在 `$PATH`,终端找不到。
+**修复**:1) Claude/Codex 里先调一次 `mcp__ccteam__chat_list_bots` 触发 bridge 下载 + symlink;2) `echo $PATH | grep -q "$HOME/.local/bin" || echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc`(zsh 改 `~/.zshrc`)再 `source` 一次。bridge symlink 失败时会在 stderr 打印 hint,通常因 `~/.local/bin/` 不可写。
+**相关**:A3b。
 
 ### A4. `/mcp` 列表里没 `mcp__ct__*` 工具
 **原因**:MCP 没注册到 `.mcp.json` 或 `~/.claude.json`,或 plugin 装完没 reload。

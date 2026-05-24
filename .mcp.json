@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "ccteam": {
-      "command": "ccteam",
-      "args": ["mcp-serve"]
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/index.js"]
     }
   }
 }
