@@ -24,11 +24,32 @@ fn ccteam_bin() -> &'static str {
 /// Spawn a minimal `ccteam start` daemon in an isolated tempdir.
 /// Returns (child, ccteam_home, pidfile_path).
 fn spawn_test_daemon(tmp_dir: &tempfile::TempDir) -> (std::process::Child, PathBuf, PathBuf) {
+    spawn_test_daemon_with(
+        tmp_dir,
+        /* with_agent_teams_root = */ false,
+        Stdio::null,
+    )
+}
+
+/// Spawn helper with explicit toggles. `with_agent_teams_root=true`
+/// pre-creates `<HOME>/.claude/teams/` so the F95 AgentTeamsWatcher
+/// installs its inotify watch + runs the full discovery loop — this is
+/// the production code path that V0.6.5 F163 retro fixes (`spawn_blocking`
+/// task held BlockingPool::shutdown for the full TEAMS_DISCOVERY_INTERVAL
+/// at process exit).
+fn spawn_test_daemon_with(
+    tmp_dir: &tempfile::TempDir,
+    with_agent_teams_root: bool,
+    stderr_factory: fn() -> Stdio,
+) -> (std::process::Child, PathBuf, PathBuf) {
     let fake_home = tmp_dir.path();
     let ccteam_home = fake_home.join(".ccteam");
     std::fs::create_dir_all(ccteam_home.join("phases")).unwrap();
     std::fs::create_dir_all(ccteam_home.join("state")).unwrap();
     std::fs::create_dir_all(fake_home.join("projects")).unwrap();
+    if with_agent_teams_root {
+        std::fs::create_dir_all(fake_home.join(".claude").join("teams")).unwrap();
+    }
     let pidfile = ccteam_home.join("state").join("orchestrator.pid");
 
     let child = Command::new(ccteam_bin())
@@ -38,7 +59,7 @@ fn spawn_test_daemon(tmp_dir: &tempfile::TempDir) -> (std::process::Child, PathB
         .env("CCTEAM_PROJECTS_ROOT", fake_home.join("projects"))
         .env("RUST_LOG", "warn")
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(stderr_factory())
         .spawn()
         .expect("spawn ccteam start");
 
@@ -303,4 +324,242 @@ fn shutdown_does_not_kill_tmux_sessions() {
 fn ccteam_core_pid_alive(pid: u32) -> bool {
     let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
     ret == 0
+}
+
+/// F163 retro case 5 — SIGTERM exits within 5s **even when the
+/// AgentTeamsWatcher path is fully wired** (`~/.claude/teams/`
+/// present, so the F95 watcher installs its inotify watch + spawns
+/// the blocking discovery loop).
+///
+/// Before the retro fix, this configuration triggered the
+/// `BlockingPool::shutdown(None)` hang: the AgentTeamsWatcher's
+/// `spawn_blocking` thread blocked inside `recv_timeout(60s)` and
+/// never noticed runtime tear-down, so `Runtime::drop` waited a full
+/// TEAMS_DISCOVERY_INTERVAL (>60s) and the process required SIGKILL.
+///
+/// Acceptance: process exits within 6s of SIGTERM (5s pool ceiling +
+/// 1s wall-clock slack for the orchestrator/web/imd drain dance + OS
+/// scheduling jitter). The unit-test deadline is intentionally tighter
+/// than the user-facing 10s contract so a regression that re-introduces
+/// even a partial hang surfaces here loudly.
+#[test]
+#[cfg(unix)]
+fn sigterm_exits_within_5s_with_agent_teams_watcher_active() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (mut child, _ccteam_home, pidfile) =
+        spawn_test_daemon_with(&tmp, /* with_agent_teams_root = */ true, Stdio::null);
+
+    let pidfile_deadline = Instant::now() + Duration::from_secs(10);
+    let daemon_pid = match wait_for_pidfile(&pidfile, pidfile_deadline) {
+        Ok(pid) => pid,
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("F163 retro: {msg}");
+        }
+    };
+
+    let signal_sent_at = Instant::now();
+    send_signal(daemon_pid, libc::SIGTERM).expect("send SIGTERM");
+
+    // 6s ceiling — tighter than the 10s user-facing contract to catch
+    // any regression that re-introduces a partial BlockingPool hang.
+    let exit_deadline = signal_sent_at + Duration::from_secs(6);
+    let exited = wait_for_exit(&mut child, exit_deadline);
+    let exit_elapsed = signal_sent_at.elapsed();
+
+    if exited.is_err() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+
+    assert!(
+        exited.is_ok(),
+        "F163 retro: daemon with active AgentTeamsWatcher should exit within 6s of SIGTERM; \
+         elapsed={:?} (was the cancel-handle wiring removed?)",
+        exit_elapsed,
+    );
+
+    assert!(
+        !pidfile.exists(),
+        "F163 retro: pidfile {} should be removed even when the BlockingPool path was exercised",
+        pidfile.display()
+    );
+}
+
+/// F163 retro case 6 — five consecutive `start → SIGTERM` cycles all
+/// exit within 6s, with the AgentTeamsWatcher wired. Catches any
+/// non-deterministic shutdown flake (e.g. a race where the cancel
+/// flag flip lands AFTER the discovery thread already entered
+/// recv_timeout for the next 60s window).
+///
+/// This is the unit-test analog of the F163 NAS re-probe acceptance
+/// loop (`for run in 1..5; do ccteam start & sleep 5; kill -TERM; ...`).
+#[test]
+#[cfg(unix)]
+fn sigterm_exits_fast_across_five_consecutive_runs() {
+    for run in 1..=5 {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (mut child, _ccteam_home, pidfile) =
+            spawn_test_daemon_with(&tmp, /* with_agent_teams_root = */ true, Stdio::null);
+
+        let pidfile_deadline = Instant::now() + Duration::from_secs(10);
+        let daemon_pid = match wait_for_pidfile(&pidfile, pidfile_deadline) {
+            Ok(pid) => pid,
+            Err(msg) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("F163 retro run #{run}: {msg}");
+            }
+        };
+
+        let signal_sent_at = Instant::now();
+        send_signal(daemon_pid, libc::SIGTERM).expect("send SIGTERM");
+
+        let exit_deadline = signal_sent_at + Duration::from_secs(6);
+        let exited = wait_for_exit(&mut child, exit_deadline);
+        let exit_elapsed = signal_sent_at.elapsed();
+
+        if exited.is_err() {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+
+        assert!(
+            exited.is_ok(),
+            "F163 retro run #{run}: daemon should exit within 6s of SIGTERM; elapsed={:?}",
+            exit_elapsed,
+        );
+        assert!(
+            !pidfile.exists(),
+            "F163 retro run #{run}: pidfile {} should be removed",
+            pidfile.display()
+        );
+    }
+}
+
+/// F163 retro case 7 — daemon logs the expected shutdown
+/// signal-handling lines BEFORE exit. Asserts the in-process telemetry
+/// chain (signal handler observed → graceful shutdown begin → graceful
+/// shutdown complete) actually executes, not just "process exited".
+/// A future regression that bypasses the orchestrator drain (e.g. by
+/// short-circuiting on a race or hard-aborting) would still satisfy
+/// "exited within 6s" but break this assertion.
+///
+/// Captures both stdout and stderr because the tracing subscriber's
+/// default writer (stdout) is asymmetric with the bin's banner
+/// `eprintln!` (stderr); merging both keeps the assertion robust to a
+/// future writer swap.
+#[test]
+#[cfg(unix)]
+fn sigterm_emits_full_graceful_shutdown_telemetry() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fake_home = tmp.path();
+    let ccteam_home = fake_home.join(".ccteam");
+    std::fs::create_dir_all(ccteam_home.join("phases")).unwrap();
+    std::fs::create_dir_all(ccteam_home.join("state")).unwrap();
+    std::fs::create_dir_all(fake_home.join("projects")).unwrap();
+    std::fs::create_dir_all(fake_home.join(".claude").join("teams")).unwrap();
+    let pidfile = ccteam_home.join("state").join("orchestrator.pid");
+
+    let mut child = Command::new(ccteam_bin())
+        .args(["start", "--no-web", "--no-imd", "--tick-seconds", "1"])
+        .env("HOME", fake_home)
+        .env("CCTEAM_HOME", &ccteam_home)
+        .env("CCTEAM_PROJECTS_ROOT", fake_home.join("projects"))
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ccteam start");
+
+    let pidfile_deadline = Instant::now() + Duration::from_secs(10);
+    let daemon_pid = match wait_for_pidfile(&pidfile, pidfile_deadline) {
+        Ok(pid) => pid,
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("F163 retro telemetry: {msg}");
+        }
+    };
+
+    send_signal(daemon_pid, libc::SIGTERM).expect("send SIGTERM");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(6);
+    let exited = wait_for_exit(&mut child, exit_deadline);
+    let output = child.wait_with_output().expect("wait_with_output");
+    let stdout_text = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr_text = String::from_utf8_lossy(&output.stderr).to_string();
+    let merged = format!("STDOUT:\n{stdout_text}\nSTDERR:\n{stderr_text}");
+
+    assert!(
+        exited.is_ok(),
+        "F163 retro telemetry: daemon must exit within 6s of SIGTERM; \
+         output-so-far:\n{merged}",
+    );
+
+    // The orchestrator graceful drain must execute. Without it we'd be
+    // tearing down state non-cooperatively — a CLAUDE.md §三 violation
+    // adjacent to "永不主动 kill 长 session".
+    assert!(
+        merged.contains("SIGTERM received"),
+        "F163 retro telemetry: expected 'SIGTERM received' line; got:\n{merged}",
+    );
+    assert!(
+        merged.contains("graceful shutdown complete"),
+        "F163 retro telemetry: expected 'graceful shutdown complete' line; got:\n{merged}",
+    );
+
+    assert!(
+        !pidfile.exists(),
+        "F163 retro telemetry: pidfile {} should be removed",
+        pidfile.display()
+    );
+}
+
+/// F163 retro case 8 — `AgentTeamsWatcher::cancel_handle()` flipping
+/// drives the blocking discovery loop to exit within the 500ms
+/// `WATCHER_SHUTDOWN_POLL` floor (well under the 60s
+/// `TEAMS_DISCOVERY_INTERVAL`). Direct unit test of the
+/// crate-internal contract the daemon path relies on — a regression
+/// that loses the cancel wiring inside `AgentTeamsWatcher::start` would
+/// pass the SIGTERM tests above only via the defense-in-depth
+/// `runtime.shutdown_timeout(5s)` fallback, but fail this one within
+/// 600ms (no pool teardown involved).
+#[tokio::test(flavor = "current_thread")]
+async fn agent_teams_watcher_cancel_handle_stops_blocking_loop_fast() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let teams_root = tmp.path().join("teams");
+    let tasks_root = tmp.path().join("tasks");
+    let progress_path = tmp.path().join("progress.jsonl");
+    std::fs::create_dir_all(&teams_root).unwrap();
+
+    let cfg = ccteam_core::AgentTeamsWatcherConfig {
+        teams_root,
+        tasks_root,
+        progress_path,
+        discovery_interval: Duration::from_secs(60),
+    };
+    let watcher = ccteam_core::AgentTeamsWatcher::new(cfg).expect("new watcher");
+    let cancel = watcher.cancel_handle();
+    let handle = watcher.start();
+
+    // Let the discovery loop reach its recv_timeout sleep.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let cancel_at = Instant::now();
+    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+
+    // Join via blocking with a tight deadline. The loop polls cancel
+    // each `WATCHER_SHUTDOWN_POLL` (500ms), so a generous 1500ms
+    // ceiling catches any regression that bumps the poll interval or
+    // moves the cancel check below recv_timeout.
+    let join_res = tokio::time::timeout(Duration::from_millis(1500), handle).await;
+    let elapsed = cancel_at.elapsed();
+    assert!(
+        join_res.is_ok(),
+        "F163 retro: AgentTeamsWatcher blocking loop did not exit within 1500ms of cancel; \
+         elapsed={:?}",
+        elapsed,
+    );
 }

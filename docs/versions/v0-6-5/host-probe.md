@@ -14,10 +14,10 @@
 | **F148** `/ccteam-creator` → TG round-trip | **PASS** | Fresh-state `/ccteam-creator "做个 TG 助理 bot"` → `go` → bot registered + tmux supervisor started + 3 real Telegram messages delivered (tg_msg_id 1896/1897/1898 to recipient 339498819) within ~25s of `go` confirmation. See "F148 details" below. |
 | **F157** `ccteam-scan --quick` <= 90s | **PASS** | Real run on `/home/rob/nasworkspace/ccteam` (89 kLOC Rust workspace): wall-clock **33s** (well under 90s). `.ccteam/codebase-scan.md` written (42 lines, frontmatter `quick: true`, all 3 Q's answered). |
 | **F162** `intent-accuracy.sh --real` | **PASS** | 50/50 = **1.0000** accuracy. Per-intent precision/recall all 1.000. Wall-clock 5:27. Report at `docs/versions/v0-6-5/intent-accuracy.md` (mode=`real`). Ship gate >= 0.90 cleared with margin. |
-| **F163** SIGTERM graceful (<= 5s) | **FAIL** | SIGTERM sent to two separate daemon instances (PID 1773722 and PID 1776891). Both stayed alive >60s after SIGTERM; pidfile not unlinked; required SIGKILL. **Port 7331 IS released** within ~1s of SIGTERM (web server tokio task does respond to shutdown), but the main process does not exit. Partial graceful shutdown — handler accepts SIGTERM but blocks somewhere before runtime drop. |
+| **F163** SIGTERM graceful (<= 5s) | **PASS** (after F163 retro fix) | Original W1-T6 PR #96 (`TASK_DRAIN_TIMEOUT` 5s wrap on web/imd handles) was insufficient. F163 retro PR re-probed nas-box005 5/5 runs: SIGTERM → process exit in **~1019ms** (range 1016-1019ms), pidfile unlinked every cycle, tmux session `ccteam-chat-tech-helper-tg-tech-helper` survives all 5 SIGTERM cycles (created 09:14:27 UTC, still alive after probe). See "F163 retro details" below. |
 | **F164** tmux reattach across restart | **PASS** | Bot tmux session_id `$1` (`ccteam-chat-tech-helper-tg-tech-helper`) survived daemon kill + restart. Daemon log explicitly emits `claude-tui: reattached to existing tmux session (pane claude process alive) event="session_reattached" pane_pid=Some(1775109)`. Post-restart MCP `chat_send_input` → bot pane → real Telegram delivery (tg_msg_id 1899 to recipient 339498819) confirmed. |
 
-**4 of 5 gates pass. F163 fails.**
+**Initial run: 4 of 5 gates pass. F163 retro PR re-probed nas-box005 — all 5 gates now PASS.**
 
 ---
 
@@ -89,7 +89,7 @@ Note: NAS `/usr/bin/python3` is permission-denied for user `rob` (Synology defau
 
 ---
 
-## F163 details — FAIL
+## F163 details — initial FAIL
 
 Two independent SIGTERM attempts, both stuck:
 
@@ -115,7 +115,65 @@ Both runs: pidfile NOT auto-unlinked, but port 7331 freed within ~1s.
 
 **Interpretation:** the daemon does have *some* signal handler (web server tokio task exits + binds port), but the main process hangs on a non-cancellable task — possibly an outstanding tokio runtime task (claude_jobs gc / artifact_watcher polling / supervisor thread join). This is consistent with F163's PRD description identifying this as a known V0.6.4 ship blocker.
 
-**Implication for V0.6.5 ship gate #5** (`docs/versions/v0-6-5/README.md` §5 #5): the ship gate is **not** met. Either (a) defer F163 explicitly with a `docs/versions/v0-6-6/` plan, or (b) treat current daemon shutdown semantics as "SIGTERM releases port + frees daemon-level resources but does not exit process; operators must `kill -9` after SIGTERM if they need the PID slot" and document accordingly. Recommend escalating to main session for ship/no-ship decision.
+---
+
+## F163 retro details — PASS (deep-fix follow-up)
+
+**Root cause** (identified 2026-05-24 09:14 UTC via deep-debug with
+`eu-stack` thread dumps + tracing-instrumented daemon log):
+
+1. `AgentTeamsWatcher::start` spawns a `tokio::task::spawn_blocking`
+   discovery loop. Its only exit conditions are (a) cancel flag set,
+   (b) inotify mpsc `Disconnected`. The mpsc sender is owned by the
+   same blocking task (held inside the `notify::Watcher` closure moved
+   into the spawn_blocking body), so (b) never fires while the task is
+   alive — self-pinning deadlock. Production daemon never flipped (a)
+   on shutdown.
+2. The loop's `recv_timeout` used
+   `discovery_interval.saturating_sub(elapsed).max(WATCHER_SHUTDOWN_POLL)`
+   which made `WATCHER_SHUTDOWN_POLL` a **floor** not a **ceiling**. The
+   thread sat in `recv_timeout` for up to a full
+   `TEAMS_DISCOVERY_INTERVAL` (60s) before sampling the cancel flag.
+3. `Runtime::drop` → `BlockingPool::shutdown(None)` blocks the process
+   indefinitely waiting for every `spawn_blocking` thread to return.
+   Combined with #1+#2 this held the main thread in `futex_wait` past
+   the operator's SIGKILL patience.
+
+**Fix** (PR `v065-f163-deep-fix`, commit 8906a79):
+- `AgentTeamsWatcher` loop now uses `remaining.min(WATCHER_SHUTDOWN_POLL)`
+  so cancel sampled every 500ms regardless of discovery interval.
+- `ccteam start` captures `watcher.cancel_handle()` before `.start()` and
+  flips it after graceful shutdown propagates.
+- Defense in depth: after `block_on` returns, explicit
+  `runtime.shutdown_timeout(Duration::from_secs(5))` bounds any
+  straggler spawn_blocking task at 5s.
+
+**Re-probe** (5 consecutive runs, 2026-05-24 09:37 UTC):
+```
+run 1: PID=1798958: gone in 1019ms PASS
+run 2: PID=1798994: gone in 1018ms PASS
+run 3: PID=1799027: gone in 1016ms PASS
+run 4: PID=1799102: gone in 1016ms PASS
+run 5: PID=1799138: gone in 1018ms PASS
+=== all 5 runs PASS ===
+```
+
+Each run: SIGTERM → exit in ~1.02s, pidfile unlinked every cycle. Daemon
+log emits full graceful shutdown chain (`SIGTERM received` → `graceful
+shutdown begin` → `graceful shutdown clean` → `graceful shutdown
+complete`). Existing tmux session `ccteam-chat-tech-helper-tg-tech-helper`
+(created at 09:14:27 UTC) **survives all 5 SIGTERM cycles**, confirming
+the F164 reattach contract is preserved (CLAUDE.md §三 red line: 永不主动
+kill 长 session — daemon stop ≠ bot session stop).
+
+**Unit-test coverage added** (`crates/ccteam-cli/tests/graceful_shutdown_test.rs`):
+- `sigterm_exits_within_5s_with_agent_teams_watcher_active`
+- `sigterm_exits_fast_across_five_consecutive_runs`
+- `sigterm_emits_full_graceful_shutdown_telemetry`
+- `agent_teams_watcher_cancel_handle_stops_blocking_loop_fast`
+
+Workspace baseline after fix: **1583 passed / 1 pre-existing flake**
+(`workflow_summary_reflects_agent_spawn_and_done_events`), clippy clean.
 
 ---
 
@@ -162,6 +220,6 @@ NAS left in clean state (no daemon, no tmux sessions, registry intact for future
 
 | | |
 |---|---|
-| **Overall** | **4/5 gates PASS** (F148 / F157 / F162 / F164) + **1 FAIL** (F163) |
-| **Recommend** | escalate F163 to main session for ship/no-ship decision; F164 minor inbox-on-startup-sweep wrinkle is V0.6.6 candidate |
-| **Run duration** | ~30 min (07:00 - 07:30 UTC, 2026-05-24); blocked once on python3 PATH issue (5 min troubleshoot) |
+| **Overall** | Initial probe: **4/5 gates PASS** (F148 / F157 / F162 / F164) + **1 FAIL** (F163). After F163 retro PR: **5/5 gates PASS** (re-probe 5/5 SIGTERM cycles all exit in ~1s with pidfile unlinked + tmux session preserved). |
+| **Recommend** | Ship V0.6.5 — all gates green. F164 minor inbox-on-startup-sweep wrinkle remains a V0.6.6 candidate. |
+| **Run duration** | Initial probe ~30 min (07:00 - 07:30 UTC, 2026-05-24); F163 deep-debug + retro fix + re-probe ~2.5h (09:00 - 11:30 UTC, 2026-05-24). |

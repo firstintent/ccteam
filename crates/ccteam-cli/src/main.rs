@@ -1446,12 +1446,12 @@ fn run_start(
     // We need the paths twice (for orchestrator construction + final
     // pidfile cleanup), so clone before the move into Orchestrator::new.
     let cleanup_paths = paths.clone();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime")?;
     let result = (|| -> Result<()> {
         let orchestrator = std::sync::Arc::new(Orchestrator::new(paths, config)?);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("build tokio runtime")?;
         runtime.block_on(async move {
             // V0.4.1 simplification: orchestrator + web share one
             // shutdown signal (Ctrl-C or SIGTERM). The watch::channel
@@ -1471,27 +1471,39 @@ fn run_start(
 
             // V0.5.0 F95 — global `~/.claude/teams/` watcher mirrors 5
             // `team_*` events into `~/.ccteam/teams-progress.jsonl` for
-            // the web `/teams` tab to consume. Fire-and-forget: the task
-            // owns its notify watcher, exits on runtime shutdown.
-            let _agent_teams_watcher_task = match ccteam_core::AgentTeamsWatcherConfig::from_env() {
-                Ok(cfg) => match ccteam_core::AgentTeamsWatcher::new(cfg) {
-                    Ok(watcher) => Some(watcher.start()),
+            // the web `/teams` tab to consume. The watcher runs inside
+            // `spawn_blocking` and never sees its outbound sender drop
+            // (the sender is owned by the same blocking task), so the
+            // only way to terminate it is to flip its `cancel` AtomicBool.
+            // F163 retro — without this wiring, the blocking thread sits
+            // in `recv_timeout(60s)` until the next discovery tick, and
+            // `Runtime::drop` → `BlockingPool::shutdown(None)` blocks
+            // the process for the full discovery interval (host probe
+            // observed >60s hang requiring SIGKILL).
+            let agent_teams_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> =
+                match ccteam_core::AgentTeamsWatcherConfig::from_env() {
+                    Ok(cfg) => match ccteam_core::AgentTeamsWatcher::new(cfg) {
+                        Ok(watcher) => {
+                            let cancel = watcher.cancel_handle();
+                            let _join = watcher.start();
+                            Some(cancel)
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                ?err,
+                                "F95 AgentTeamsWatcher::new failed; team-events disabled",
+                            );
+                            None
+                        }
+                    },
                     Err(err) => {
                         tracing::warn!(
                             ?err,
-                            "F95 AgentTeamsWatcher::new failed; team-events disabled",
+                            "F95 AgentTeamsWatcherConfig::from_env failed; team-events disabled",
                         );
                         None
                     }
-                },
-                Err(err) => {
-                    tracing::warn!(
-                        ?err,
-                        "F95 AgentTeamsWatcherConfig::from_env failed; team-events disabled",
-                    );
-                    None
-                }
-            };
+                };
 
             let web_handle = if web.disabled {
                 None
@@ -1583,6 +1595,16 @@ fn run_start(
             signal_task.abort();
             unroster_task.abort();
 
+            // F163 retro — flip the AgentTeamsWatcher cancel flag so its
+            // `spawn_blocking` thread exits within `WATCHER_SHUTDOWN_POLL`
+            // (500ms) instead of holding `BlockingPool::shutdown` for up
+            // to a full `TEAMS_DISCOVERY_INTERVAL` (60s) at process tear-
+            // down. Paired with the explicit `runtime.shutdown_timeout`
+            // outside this `block_on` for defense in depth.
+            if let Some(cancel) = agent_teams_cancel {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+
             // F163 — explicit log: tmux sessions are intentionally left
             // running. Daemon stop ≠ bot session stop (CLAUDE.md §三 red
             // line: 永不主动 kill 长 session).
@@ -1594,6 +1616,17 @@ fn run_start(
             orch_result
         })
     })();
+    // F163 retro — explicit bounded shutdown of the tokio blocking pool.
+    // `Runtime::drop` calls `BlockingPool::shutdown(None)` which waits
+    // **forever** for every `spawn_blocking` task to return. The
+    // AgentTeamsWatcher cancel above takes care of the long-poll
+    // watcher loop, but any straggler (workflow_watcher tx-is_closed
+    // race, per-project ArtifactWatcher mid-syscall, transient claude
+    // GC sweep) could still hold the pool. A 5s ceiling matches the
+    // per-task drain timeout used inside `block_on` and keeps total
+    // worst-case shutdown at ≤ 30s orch + 5s web + 5s imd + 5s pool =
+    // 45s well under the user-observed >60s hang.
+    runtime.shutdown_timeout(Duration::from_secs(5));
     ccteam_core::remove_pidfile(&cleanup_paths);
     result
 }
