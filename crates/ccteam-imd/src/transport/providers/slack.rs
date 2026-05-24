@@ -2,8 +2,19 @@
 //! `conversations.history` for inbound.
 //!
 //! No Socket Mode in V0.6 (avoids `tokio-tungstenite`); polling is
-//! enough for the host-probe scope. Switch to Socket Mode is a V0.7
-//! decision per `docs/versions/v0-6-0/wave-2-decisions.md` §5.
+//! enough for the host-probe scope.
+//!
+// TODO(V0.7-slack-socket-mode): switch to Slack Socket Mode (WSS via
+//   `tokio-tungstenite`) for inbound — replaces `conversations.history`
+//   polling with `apps.connections.open` + persistent WS frame loop.
+// Reason deferred: V0.6.x host probe only exercises one Slack channel
+//   with `POLL_INTERVAL_SECS = 4`, well under Slack rate limits;
+//   Socket Mode adds a new dep + reconnect / backoff state machine
+//   that benefits primarily from sub-second latency multi-channel
+//   workloads landing with V0.7 Epic C. Decision recorded in
+//   `docs/versions/v0-6-0/wave-2-decisions.md §5`.
+// Tracking: docs/versions/v0-6-6/prd.md §F168 (decision row #9) +
+//   docs/dev-coupling-audit.md V0.6.6 segment.
 
 use std::collections::HashMap;
 use std::sync::Arc;

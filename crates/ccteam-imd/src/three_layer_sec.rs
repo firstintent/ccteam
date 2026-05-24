@@ -108,8 +108,19 @@ pub fn verify_slack_signature_stub(
         return false;
     }
     // No HMAC backend wired yet; conservative deny by default.
-    // Slack inbound HTTP receiver is V0.7 scope per
-    // docs/versions/v0-6-0/wave-2-decisions.md §5.
+    // TODO(V0.7-slack-inbound): wire `hmac` + `sha2` + `subtle`
+    //   crates to verify the `v0=<hex>` signature against
+    //   `v0:<ts>:<body>` keyed by `creds.slack.signing_secret`,
+    //   returning `true` only on constant-time match.
+    // Reason deferred: Slack inbound HTTP receiver (the only caller
+    //   that would consume `true`) is V0.7 scope per
+    //   `docs/versions/v0-6-0/wave-2-decisions.md §5`; V0.6.x Slack
+    //   uses polling via `SlackChannel` which carries no signed
+    //   request, so wiring HMAC in isolation would add 3 deps for
+    //   zero production caller and risk drift before the inbound
+    //   receiver lands.
+    // Tracking: docs/versions/v0-6-6/prd.md §F168 (decision row #8) +
+    //   docs/dev-coupling-audit.md V0.6.6 segment.
     false
 }
 
