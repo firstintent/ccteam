@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "ccteam": {
+      "command": "ccteam",
+      "args": ["mcp-serve"]
+    }
+  }
+}

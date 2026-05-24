@@ -80,15 +80,29 @@ ccteam-scan (quick) → <repo>/.ccteam/codebase-scan.md
 
 ## Step 1 — 装 ccteam plugin(30 秒)
 
+ccteam 走 Claude Code 官方 plugin marketplace 协议安装 —— **plugin 是首选路径**,CLI binary 作为前置条件先装好(plugin 通过 MCP 调用本机 `ccteam` 命令)。
+
+### 1.1 装 CLI binary(前置,一次性)
+
+```bash
+cargo install ccteam-cli
+ccteam --version    # 应输出当前版本号
+```
+
+将来会提供 prebuilt release(brew / GH releases),目前 cargo 是主路径。
+
+### 1.2 在 Claude session 里注册 marketplace + 装 plugin
+
 任意 terminal 起 Claude session:
 
 ```bash
 $ claude
 ```
 
-在 session 里输入:
+在 session 里依次输入:
 
 ```
+/plugin marketplace add https://github.com/firstintent/ccteam
 /plugin install ccteam
 ```
 
