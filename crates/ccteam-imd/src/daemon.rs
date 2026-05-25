@@ -1529,6 +1529,13 @@ async fn drain_outboxes(
             continue;
         }
 
+        // F199 — mirror the fast-path dispatcher's prefix decision so
+        // assistant rows the safety-net handles also carry `from
+        // <handle>:\n` in multi-bot chats. Computed once per bot per
+        // tick; cheap.
+        let prefix_with_handle = outbound_format::should_prefix_with_handle(bots, bot);
+        let effective_handle = bot.effective_handle().to_string();
+
         let mut sent = 0usize;
         for indexed in &rows {
             let row = &indexed.row;
