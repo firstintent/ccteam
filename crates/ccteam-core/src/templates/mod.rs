@@ -35,6 +35,7 @@ pub mod workflow_templates;
 pub use workflow_templates::{
     apply_probe_defaults as apply_probe_defaults_to_workflow_ctx,
     default_ctx as default_workflow_ctx, render as render_workflow_template,
+    render_agents_block as render_workflow_agents_block, AgentTemplateEntry as WorkflowAgentEntry,
     Preset as WorkflowPreset, RenderError as WorkflowTemplateRenderError,
     TemplateCtx as WorkflowTemplateCtx,
 };

@@ -234,7 +234,9 @@ PROJECT PLAN
 Slug: <kebab-case-slug>
 Type: <Preset label> (<short description>)
 Persona: <persona label, zh or en variant>
-Bot: <@handle>                          # chat presets only
+Bot handles (auto-minted, you can override):       # chat presets only
+  - <role>  → @<proposed-handle>
+  - <role>  → @<proposed-handle>
 IM platform: <telegram|slack|discord>   # chat presets only
 Codex critic: <auto-enabled | not applicable | unavailable>
 Cost estimate / day: ~$<n>
@@ -245,8 +247,23 @@ Files I'll write:
   - ~/.ccteam/im/credentials.json    # only if IM onboarding needed
 
 Reply 'go' to execute, or describe what to change
-(persona / IM platform / bot name / language).
+(persona / IM platform / bot handles / language).
 ```
+
+The proposed handles are picked from `agent_naming::SCIENTIST_NAMES`
+(`@curie`, `@galileo`, ...) so each bot has a friendly default name.
+**The user can override any handle in their reply.** Examples of
+override phrasings to accept:
+
+- `use @dev instead of @curie`
+- `rename critic to @cx, lead to @arch`
+- `swap @galileo for @pm`
+- `give the lead bot the handle @dev`
+
+Parse such replies into a `{ role → chat_handle }` override map and
+carry it forward into Phase 5.5 / 5.6. If the user only says "go"
+(or the zh equivalents below), no overrides apply and the auto-mint
+runs in Phase 5.6.
 
 Cost estimate cheat sheet (rough Sonnet 4.5 baseline; actual usage
 varies):
@@ -314,17 +331,24 @@ copy src → dest
 
 ## 5.5  Bot handle minting (chat presets)
 
-You do **not** need to mint a handle yourself. When you call
-`mcp__ccteam__chat_register_bot` in Phase 5.6 without a `chat_handle`
-argument, the MCP handler auto-mints the first unused scientist
-nickname from `agent_naming::SCIENTIST_NAMES`
-(`@crates/ccteam-core/src/agent_naming.rs`) and reports the chosen
-handle in its reply.
+Two paths feed Phase 5.6's `chat_handle` argument:
 
-If you want to pin a specific handle (user override, persona-coupled
-naming, etc.) pass `chat_handle: "<name>"` explicitly — alphanumeric
-plus `_` / `-` only, no leading `@`. The dispatcher then skips the
-auto-mint and persists the supplied value.
+1. **User-supplied override (from Phase 4 reply).** If the user named a
+   specific handle for this role in their PROJECT PLAN reply (e.g.
+   "rename critic to @cx" → `{critic: cx}`), pass
+   `chat_handle: "<name>"` to `mcp__ccteam__chat_register_bot`. Strip
+   any leading `@` before passing. The dispatcher validates the
+   charset (alphanumeric plus `_` / `-` only) and persists the value
+   verbatim.
+2. **Auto-mint fallback.** If the user did not name a handle for this
+   role, omit the `chat_handle` argument entirely. The MCP handler
+   then picks the first unused scientist nickname from
+   `agent_naming::SCIENTIST_NAMES`
+   (`@crates/ccteam-core/src/agent_naming.rs` — `curie`, `galileo`,
+   `archimedes`, ...) and reports the chosen handle in its reply.
+
+The two paths are mutually exclusive per role: set `chat_handle` or
+omit it, never both with a placeholder.
 
 ## 5.6  Register the bot
 
@@ -346,6 +370,8 @@ layout (NAS shares, dir basename ≠ workflow slug) only resolve when
 this field is set. Omitting it falls back to the MCP server's current
 working directory.
 
+Without `chat_handle` (auto-mint path):
+
 ```json
 {
   "name": "mcp__ccteam__chat_register_bot",
@@ -361,8 +387,27 @@ working directory.
 }
 ```
 
-When `chat_handle` is omitted (as above) the dispatcher returns the
-auto-minted handle (and echoes the resolved `project_dir`) in the
+With a user-supplied `chat_handle` (override path — Phase 4 reply
+named a specific handle for this role):
+
+```json
+{
+  "name": "mcp__ccteam__chat_register_bot",
+  "arguments": {
+    "workflow_slug": "<slug from 5.2>",
+    "role": "<persona_id from Phase 3>",
+    "vendor": "claude",
+    "im_platform": "telegram",
+    "im_chat_id": "<allowed_chat_ids[0]>",
+    "persona_id": "<persona_id from Phase 3>",
+    "project_dir": "<absolute path of the dir containing .ccteam/workflow.yaml>",
+    "chat_handle": "<user-supplied handle, no leading @>"
+  }
+}
+```
+
+When `chat_handle` is omitted (auto-mint path), the dispatcher returns
+the auto-minted handle (and echoes the resolved `project_dir`) in the
 response:
 
 ```json

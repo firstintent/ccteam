@@ -54,7 +54,7 @@ fn chat_pocket_renders() {
     )
     .unwrap();
     assert!(out.contains("mode: chat"));
-    assert!(out.contains("bot_name: @demo_bot"));
+    assert!(out.contains("bot_name: \"@demo_bot\""));
     assert!(out.contains("compact_every_turns: 20"));
     assert!(out.contains("hop_limit: 1"));
     assert!(out.contains("recover_last_n_turns: 8"));
