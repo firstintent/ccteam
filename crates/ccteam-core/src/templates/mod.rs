@@ -56,6 +56,13 @@ pub use workflow_templates::{
 pub mod project_probe;
 pub use project_probe::{probe as probe_project, Language, ProjectKind, ProjectProbe};
 
+// Squad teammate roster block appended to chat-squad personas'
+// `.claude/agents/<role>.md` so each bot knows the other bots in its
+// workflow and can `@`-mention them directly (via the daemon-internal
+// mpsc cross-bot channel) instead of trying to spawn Task subagents.
+pub mod squad_roster;
+pub use squad_roster::{render_squad_roster_en, render_squad_roster_zh, TeammateInfo};
+
 /// Per-project `.claude/settings.json` template.
 ///
 /// V0.6.1 F139: hook commands route through a single shell wrapper
