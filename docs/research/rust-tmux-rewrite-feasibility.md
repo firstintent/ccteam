@@ -395,6 +395,115 @@ ccteam orchestrator / web / cli  ─UDS protocol─►  daemon
 
 ---
 
+---
+
+## 十一、竞品全景(2026-05 X / GitHub 社区视角)
+
+把 §十.2 的"业内已有 rmux + cmux"打开,补全 X 上 5 月活跃讨论的全部 8 个项目,按"如何对待 tmux"分两大阵营:
+
+### 11.1 阵营 A:**Replace tmux**(自己写 PTY + daemon,弃 tmux)
+
+| 项目 | 语言/平台 | 核心定位 | ccteam 复用价值 |
+|---|---|---|---|
+| **[Helvesec/rmux](https://github.com/helvesec/rmux)** v0.3.0 | Rust / Linux+macOS+**Windows ConPTY** | tmux-compatible CLI + Playwright-style typed SDK + daemon UDS。`ensure_session`/`wait_for_text`/`snapshot` 是一等公民 | **★★★★★** 直接当 ccteam V0.7 mux backend 依赖;X 社区评 "Claude Code agents just got their perfect terminal multiplexer" |
+| **[manaflow-ai/cmux](https://cmux.com)** | Swift/AppKit (macOS) | Ghostty 核 + 垂直 tab + 浏览器嵌入 + JSON-RPC `cmux.sock` + agent 完成时闪烁提醒 | **★★** 只 macOS,无法跨平台;协议设计可参考 |
+| **[bradwilson331/cmux-linux](https://github.com/bradwilson331/cmux-linux)** | Rust + GTK4 + Ghostty | cmux 的 Linux 端口 | **★★** 同上,且依赖 GTK4 太重 |
+| **[amirlehmam/wmux](https://github.com/amirlehmam/wmux)** / **[openwong2kim/wmux](https://github.com/openwong2kim/wmux)** | Rust (Windows native) | "no WSL required" — Windows AI agent multiplexer + MCP browser automation | **★★★** Windows-only;若 Helvesec/rmux Windows 路径不稳可作 fallback 参考 |
+| **[psmux/psmux](https://github.com/psmux/psmux)** | Rust (PowerShell + Windows Terminal + cmd.exe) | Windows-native tmux,PowerShell 优先 | **★** 偏 shell 集成,非 agent 目标 |
+| **[shell-pool/shpool](https://github.com/shell-pool/shpool)** | Rust | "think tmux, then aim lower" — 极简 detach/attach,无 mux | **★** 太薄,缺 multi-session;但代码量小可作 daemon 起步参考 |
+
+### 11.2 阵营 B:**Wrap tmux**(保留 tmux 作 runtime,加 orchestration + dashboard)
+
+| 项目 | 语言 | 核心定位 | ccteam 关系 |
+|---|---|---|---|
+| **[mixpeek/amux](https://github.com/mixpeek/amux)** | Python(单文件 `amux-server.py`)| **最像 ccteam 的竞品** — tmux 之上加 web dashboard + 移动 PWA + 自愈监控(检测 rate-limit / context overflow 自动按键 resume)+ kanban + email + CRM | **★★★★★ 直接竞品**;**关键差异**:amux 走"parse ANSI-stripped tmux output"路径,**违反 ccteam 红线**;但拿到了 ccteam 用 hooks/MCP 拿不到的 rate-limit 自愈能力 |
+| **[wavyrai/tmux-ide](https://github.com/wavyrai/tmux-ide)** (Thijs Verreck) | npm package(Node.js)| 声明式 `ide.yml` 定义 tmux pane layout + native Claude Agent Teams 支持 + 浏览器 dashboard(KPI/milestone/utilization/validation/timeline)+ Missions Mode 自治多代理 | **★★★ 横向 — 不同抽象层**;ccteam workflow.yaml 是 **role 拓扑**,tmux-ide ide.yml 是 **pane layout**,可叠加;若 ccteam 把 mux 层换成 rmux,可启发"声明式 layout" CLI 加进 ccteam-creator |
+| **[nmamano/isomux](https://github.com/nmamano/isomux)** | Bun/TypeScript | "Office metaphor" 可视化 — agent 是动画角色,sleep/typing/waving + 跨 Claude+Codex provider mix + 共享 task board + cron + 对话分支 | **★★ 消费端 UX 启发**;ccteam web SPA 当前是 dashboard 风,isomux 的 skeuomorphic 风可作 V0.8+ web UI 参考 |
+| **[l9c/tmux-agent-teams](https://github.com/l9c/tmux-agent-teams)** | Skill | "agent skill that enables agents to interact with Claude Code through tmux" — 走 Claude Code skill 接口 | **★** 与 ccteam skill 系统平行;ccteam-control 已覆盖 |
+| **[Ark0N/Codeman](https://github.com/Ark0N/Codeman)** | Web UI | tmux + Claude Code/Opencode session 管理 webui | **★** 风格类似 ccteam web,但 Code 量小 |
+
+### 11.3 阵营 C:**人类优先现代多路复用器**(非 agent 导向)
+
+| 项目 | 与 ccteam | 备注 |
+|---|---|---|
+| **[Zellij](https://zellij.dev/)** 20k+ ★ | **不复用** | DHH 从 tmux 切过去,Rust + WASM 插件 + Web 客户端 + 浮动/堆叠/布局 + 内置 UI 提示。但**是 binary,不是 library**,嵌入它 = 把 tmux 依赖换成 zellij 依赖,问题平移 |
+| **wezterm-mux** | **不复用** | wezterm 内嵌的 mux,需 wezterm 进程;但 portable-pty + termwiz 来自 wezterm,**零件级复用** |
+| **tmux 自身** | 现状 | Anthropic Claude Code Agent Teams 官方推荐;生态最成熟;**作为 ccteam V0.6 backend 兜底保留** |
+
+### 11.4 阵营 D:**官方未定**
+
+| 项目 | 状态 |
+|---|---|
+| [Claude Code issue #31901](https://github.com/anthropics/claude-code/issues/31901) | Anthropic 官方在评估 Zellij 作为 Agent Teams 备选 backend;**上游一旦官方支持 zellij,ccteam 可能要回应** |
+
+### 11.5 关键模式总结(社区共识 2026-05)
+
+1. **agent-native mux 的 3 个共识原语**:`ensure_session(idempotent create-or-reuse)` + `wait_for_text(replace sleep+grep loops)` + `snapshot(structured pane state)` — 三个项目(rmux/cmux/amux 各自实现各异但功能一致)独立收敛到同一组 API,**说明 §十.2 typed event stream 设计支柱是行业方向不是 ccteam 独有想法**
+2. **Windows 原生不再是奢望**:rmux/wmux/psmux 全部走 ConPTY,WSL2 在 AI agent 圈子明显被认为"不该是必需"
+3. **dashboard + 移动端是标配**:amux PWA / isomux 浏览器 / tmux-ide dashboard / ccteam web SPA — 所有项目都有,差异只在 UX 风
+4. **agent 间消息总线是分歧点**:ccteam 走 progress.jsonl + MCP;amux 走 watchdog 监听 pane;tmux-ide 走 shared task board;isomux 走 skill 命令(`/isomux-peer-review` `/isomux-all-hands`);**ccteam 的 progress.jsonl 唯一 SoT 是最严格的设计,值得保留**
+5. **declarative config 是标配**:ccteam workflow.yaml + tmux-ide ide.yml + isomux office config + amux yaml — 全部声明式,**没有项目在用纯 CLI/imperative**
+
+---
+
+## 十二、对 ccteam 的战略影响 — V0.7 决策更新
+
+§十.2 推荐的 "spike Helvesec/rmux 作 ccteam mux backend" **依然是首选路径**,但 §十一 的全景让我们必须明确 ccteam **战略定位**:
+
+### 12.1 ccteam 在 2026-05 ecosystem 里的位置
+
+```
+                    Pane-level orchestration                Role-level orchestration
+                    (单项目内多 pane 协调)                   (跨项目/多 agent 团队拓扑)
+                            │                                      │
+   Wrap tmux  ──────────────┼──────────────────────────────────────┼─────────
+   (脆弱但兼容)      amux ●      tmux-ide ●                ccteam V0.6 ●
+                       (PWA)        (yaml)                  (workflow.yaml + MCP)
+                                                                    │
+                                                            ↓ migrate via Option A
+                                                                    │
+   Replace tmux ──────────────┼──────────────────────────────────────┼─────────
+   (干净但需建)              cmux ●                            ccteam V0.7 ●
+                              wmux ●                          (workflow.yaml + MCP
+                                                              + rmux backend)
+                                       ↑
+                                       │
+                              Helvesec/rmux ● (纯 mux 引擎,无 role 概念)
+```
+
+**ccteam 独占的市场象限**:**Role-level orchestration**(workflow.yaml + 27 MCP 工具 + 跨项目记忆 + IM 集成)— rmux/cmux/wmux 都不做这一层,amux/tmux-ide 做但比 ccteam 弱。**Option A 走通后**(Replace tmux + 保留 role-level),ccteam 是唯一同时占两个象限的项目。
+
+### 12.2 amux 给 ccteam 的最大启发(也是最大威胁)
+
+amux **违反 ccteam 红线**(parse pane output),但拿到了 ccteam 拿不到的杀手能力:
+- **自动检测 rate-limit** → fleet 内所有 blocked session 按 `1` resume
+- **检测 context overflow** → 自动重启 session
+- **解析 scrollback 提取 reset 时间** → 倒数完精准 steer 消息
+
+ccteam 不能学 amux 做 pane scraping(红线在),但**这些能力用户真的需要**。Option A(daemon 持有 vt100 + 暴露 typed event)的最大正当性就在此:**让 daemon 内置 vt100 state machine 暴露 `rate_limit_detected` / `context_overflow_detected` / `bell_received` 类 typed event,ccteam orchestrator 订阅 typed event 而非 grep pane bytes** — **形式上没有"业务层解析 pane",事实上拿到 amux 同等能力**。这条路径让红线和能力同时成立,是 §十.2 第 2 支柱"structured event stream"的最强落地理由。
+
+### 12.3 修订后的 V0.7 决策矩阵
+
+| 选项 | 路径 | 工作量 | 收益 | 推荐度 |
+|---|---|---|---|---|
+| **V0.7-A1** | 依赖 Helvesec/rmux 作 binary,ccteam 走 MuxBackend trait + adapter | 1.5kLOC / 2-3w | Windows + typed event + 删 tmux dep | **★★★★★ 首选** |
+| **V0.7-A2** | 自己写 native mux daemon,不依赖外部 | 4kLOC / 6-8w | 全控制 + 可深度集成 ccteam 进程内 | ★★★ 备选(若 A1 spike 不通)|
+| **V0.7-B** | 学 amux 做 pane scraping,补 rate-limit 自愈,**不**换 mux | <1kLOC / 1w | 立刻拿到 rate-limit 自愈 | ❌ **拒** — 违反红线,且不解决 Windows |
+| **V0.7-C** | 转 zellij | 中 | 跟 Anthropic 上游一致 | ⚠️ **等上游表态**(issue #31901 未决前不动)|
+| **V0.7-D** | 维持 tmux,只补 Option C install.sh | 0.5d | 短期止血 | ✅ **作 V0.6.x patch 落地,与 V0.7-A1 不冲突** |
+
+### 12.4 spike 计划(V0.7 W0 必跑,1 天预算)
+
+V0.7 doc-first kickoff 之前先跑 3 个 spike 验证假设:
+
+1. **Helvesec/rmux 当依赖可行性**(0.5d):`cargo add rmux-sdk` → 跑 `ensure_session` + `wait_for_text` + `snapshot` 三个 RPC → 是否覆盖 ccteam §一.2 全部 11 子命令?attach 路径是否 expose?license 是否兼容 ccteam(看 GitHub LICENSE 文件)?
+2. **rmux + claude TUI 端到端兼容性**(0.5d):用 rmux 跑 `claude --resume <name>` 完整交互一遍(F172 V2 lossless 续接路径),vt100 渲染是否正常?ANSI 序列是否漏?有无 sixel/iterm-image escape 序列?
+3. **typed event 设计稿**(0.5d):列 ccteam 想要的 typed event 集合(`rate_limit_detected` / `bell` / `idle_5s` / `process_exited` / `output_pattern_matched` 等),对照 rmux 已 expose 的是否够;不够要 patch 上游 OR 自己写
+
+**Go/No-Go 标准**:3 个 spike 全过 → V0.7-A1;任意一个不过 → 退 V0.7-A2;Anthropic 在 issue #31901 表态用 zellij → 转 V0.7-C 重评。
+
+---
+
 ## Sources
 
 - [Helvesec/rmux GitHub](https://github.com/helvesec/rmux) — **已有 Rust 实现**,tmux 兼容 CLI + typed SDK + native Linux/macOS/Windows,v0.3.0 (2026-05-23);强推先 spike 复用
@@ -417,3 +526,25 @@ ccteam orchestrator / web / cli  ─UDS protocol─►  daemon
 - [termwiz tmux_cc module](https://docs.rs/termwiz/latest/termwiz/tmux_cc/index.html) — WezTerm 的 tmux control-mode client
 - [tmux Installing wiki](https://github.com/tmux/tmux/wiki/Installing) — libevent + ncurses + yacc 依赖
 - [libevent.org](https://libevent.org/) — tmux 底层 event loop 实现 + 已知 multithreading 限制
+- [rmux.io official docs](https://rmux.io/) — Helvesec rmux SDK 完整文档
+- [Show HN: Rmux Playwright-style SDK](https://news.ycombinator.com/item?id=48219918) — 社区设计动机讨论
+- [Rmux Review on andrew.ooo](https://andrew.ooo/posts/rmux-rust-terminal-multiplexer-agents-review/) — 第三方实测 review
+- [mixpeek/amux GitHub](https://github.com/mixpeek/amux) — **最像 ccteam 的竞品**,Python 单文件,parse pane output 拿到 rate-limit 自愈(违反 ccteam 红线但启发设计)
+- [amux.io blog: Best Multi-Agent Orchestrators 2026](https://amux.io/blog/best-multi-agent-orchestrators-2026/) — 行业全景对比 Claude Squad / Conductor / Codex
+- [Show HN: Amux tmux-based multiplexer](https://news.ycombinator.com/item?id=47104424) — amux 设计讨论
+- [wavyrai/tmux-ide GitHub](https://github.com/wavyrai/tmux-ide) — Thijs Verreck 的 declarative `ide.yml` + Claude Agent Teams native + 浏览器 dashboard(npm 包)
+- [tmux-ide official site](https://tmux.thijsverreck.com/) — Missions Mode 自治多代理介绍
+- [nmamano/isomux GitHub](https://github.com/nmamano/isomux) — "Office metaphor" 可视化 — agent 动画角色 + Claude+Codex provider mix(Bun/TS)
+- [isomux.com](https://isomux.com/) — isomux 官网
+- [openwong2kim/wmux GitHub](https://github.com/openwong2kim/wmux) — Windows native AI agent multiplexer(无 WSL)+ MCP browser automation
+- [amirlehmam/wmux GitHub](https://github.com/amirlehmam/wmux) — Windows cmux port
+- [bradwilson331/cmux-linux GitHub](https://github.com/bradwilson331/cmux-linux) — cmux Linux 端口(Rust + GTK4 + Ghostty)
+- [psmux/psmux GitHub](https://github.com/psmux/psmux) — Tmux on Windows PowerShell(Rust native)
+- [shell-pool/shpool GitHub](https://github.com/shell-pool/shpool) — "think tmux, then aim lower" — 极简 detach/attach
+- [l9c/tmux-agent-teams GitHub](https://github.com/l9c/tmux-agent-teams) — Claude Code skill 走 tmux 与 agent 交互
+- [Ark0N/Codeman GitHub](https://github.com/Ark0N/Codeman) — Web UI 管理 Claude Code/Opencode tmux session
+- [tmux-alternative GitHub Topic](https://github.com/topics/tmux-alternative) — 全谱 tmux 替代品索引
+- [Zellij official site](https://zellij.dev/) — Rust modern tmux 替代,20k+ stars
+- [Thijs Verreck tweet introducing tmux-ide](https://x.com/ThijsVerreck/status/2032034893383782744) — 原始发布推
+- [Setting up Claude Code Agent Teams on Windows w/ WSL2 + tmux](https://ardalis.com/setting-up-claude-code-agent-teams-with-wsl2-and-tmux-on-windows/) — Anthropic 官方推荐 tmux 的实际部署痛点
+- [Claude Code Agent Teams overview (cobusgreyling)](https://cobusgreyling.substack.com/p/claude-code-agent-teams) — Anthropic 官方多代理设计
