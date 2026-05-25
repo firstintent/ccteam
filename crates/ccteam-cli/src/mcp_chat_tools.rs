@@ -252,6 +252,10 @@ pub(crate) fn dispatch_register_bot(paths: &CcteamPaths, args: &Value) -> Result
     // omitted, default to the MCP server's `current_dir` canonicalized
     // through the filesystem (resolves symlinks too — daemon stores the
     // post-canonical form so a moved symlink doesn't silently rebind).
+    let project_dir_explicit = args
+        .get("project_dir")
+        .and_then(|v| v.as_str())
+        .is_some_and(|p| !p.is_empty());
     let project_dir = match args.get("project_dir").and_then(|v| v.as_str()) {
         Some(p) if !p.is_empty() => {
             let path = std::path::PathBuf::from(p);
@@ -271,6 +275,43 @@ pub(crate) fn dispatch_register_bot(paths: &CcteamPaths, args: &Value) -> Result
             project_dir.display()
         )
     })?;
+
+    // F197 — bootstrap `.ccteam/state.json` so the SessionStart hook's
+    // `session_context_from_cwd` walk-up finds the project root. The
+    // creator skill writes workflow.yaml / persona / registry but
+    // historically skipped `bootstrap_project_at_dir`, leaving state.json
+    // missing and every hook firing "not under any ccteam project".
+    //
+    // Gated on `project_dir_explicit` so unit tests (which omit
+    // `project_dir` and fall back to the current_dir, i.e. the ccteam
+    // source tree) don't pollute the repo with a stray `.ccteam/`. The
+    // creator-skill SessionStart-bug scenario always supplies
+    // `project_dir`, so the safety net still fires there.
+    //
+    // F198 — also lay down `<paths.root>/hooks/hook.sh` so the F139
+    // dispatcher Claude Code hooks shell out to actually exists.
+    // `install_hooks` is idempotent (`Unchanged` on a re-run), safe to
+    // call on every register.
+    if project_dir_explicit {
+        let state_path = ccteam_core::CcteamPaths::project_state_in(&project_dir);
+        if !state_path.exists() {
+            let slug_for_bootstrap = workflow_slug.clone();
+            ccteam_core::bootstrap_project_at_dir(
+                paths,
+                &project_dir,
+                &slug_for_bootstrap,
+                "",
+                "chat",
+            )
+            .with_context(|| {
+                format!(
+                    "bootstrap_project_at_dir for {} (creator-flow state.json seed)",
+                    project_dir.display()
+                )
+            })?;
+        }
+        ccteam_core::install_hooks(paths).context("install ~/.ccteam/hooks/hook.sh dispatcher")?;
+    }
 
     let outcome = register_bot_checked_in(
         &paths.root,

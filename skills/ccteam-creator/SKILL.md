@@ -287,6 +287,21 @@ For each step, surface a one-line progress note ("⏳ rendering
 workflow.yaml…", "✓ wrote .claude/agents/tech-helper.md") so the
 user knows what's happening.
 
+## 5.0  Bootstrap project state
+
+Before any other Phase 5 step runs, the chat-mode SessionStart hook
+needs `<project>/.ccteam/state.json` (so its walk-up resolves the
+project root) and `~/.ccteam/hooks/hook.sh` (the daemon-aware
+dispatcher every hook firing shells out to). The
+`mcp__ccteam__chat_register_bot` handler now performs both as a
+safety net whenever the caller passes an absolute `project_dir`, so
+the skill's documented Phase 5.6 call already covers this — no extra
+MCP invocation here. This phase exists to make the dependency
+explicit: if a future skill maintainer drops `project_dir` from the
+Phase 5.6 args, the SessionStart hook will silently fail. Keep
+`project_dir` set on the register call and the rest of Phase 5 just
+works.
+
 ## 5.1  IM onboarding (chat presets only)
 
 If `~/.ccteam/im/credentials.json` does not have the required
