@@ -533,6 +533,7 @@ pub fn build_exec_argv(resume_id: Option<&str>) -> Vec<String> {
         argv.push("exec".to_string());
     }
     argv.push("--json".to_string());
+    argv.push("--skip-git-repo-check".to_string());
     // Pipe prompt via stdin (`codex exec -`).
     argv.push("-".to_string());
     argv
