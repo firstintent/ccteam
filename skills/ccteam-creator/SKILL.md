@@ -381,13 +381,7 @@ render_project_mcp_json(current_ccteam_bin()) → project_dir/.mcp.json
 Merges into existing `.mcp.json` if present (does not clobber other
 servers).
 
-## 5.8  Ensure daemon is running
-
-Run `ccteam internal daemon ensure-running` so the workflow is
-picked up. If it was already running, the next reload tick (≤ 5s)
-will roster the new workflow.
-
-## 5.9  User reply
+## 5.8  User reply
 
 ```
 好了 ✓
