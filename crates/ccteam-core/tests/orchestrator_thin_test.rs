@@ -208,6 +208,7 @@ fn watch_spec(role: &str, watch_rel: &str, parallelism: Option<u32>) -> Workflow
             timeout: None,
             on_timeout: None,
             plan_approval: None,
+            chat_handle: None,
         },
     );
     WorkflowSpec {
@@ -240,6 +241,7 @@ fn manual_spec(role: &str) -> WorkflowSpec {
             timeout: None,
             on_timeout: None,
             plan_approval: None,
+            chat_handle: None,
         },
     );
     WorkflowSpec {
@@ -272,6 +274,7 @@ fn gate_spec(role: &str, input_rel: &str) -> WorkflowSpec {
             timeout: None,
             on_timeout: None,
             plan_approval: None,
+            chat_handle: None,
         },
     );
     WorkflowSpec {
@@ -840,6 +843,7 @@ agents:
             timeout: None,
             on_timeout: None,
             plan_approval: None,
+            chat_handle: None,
         },
     );
     agents.insert(
@@ -856,6 +860,7 @@ agents:
             timeout: None,
             on_timeout: None,
             plan_approval: None,
+            chat_handle: None,
         },
     );
     let spec = WorkflowSpec {
@@ -1420,6 +1425,7 @@ async fn t31_inbox_target_role_routes_explicitly() {
                 timeout: None,
                 on_timeout: None,
                 plan_approval: None,
+                chat_handle: None,
             },
         );
     }
@@ -1945,6 +1951,7 @@ fn schedule_spec(role: &str, cron: &str) -> WorkflowSpec {
             timeout: None,
             on_timeout: None,
             plan_approval: None,
+            chat_handle: None,
         },
     );
     WorkflowSpec {

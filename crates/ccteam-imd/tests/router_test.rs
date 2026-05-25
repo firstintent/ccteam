@@ -54,10 +54,13 @@ fn hop_budget_drops_at_max() {
 }
 
 #[test]
-fn unknown_handle_dropped_with_reason() {
+fn unknown_handle_surfaces_typed_variant() {
+    // F184 — router now emits a typed `UnknownHandle` variant so the
+    // inbound pipeline can render a per-chat "available bots" reply
+    // instead of silently dropping the message.
     let r = route("@phantom say hi", &make_map(), 0);
     match r {
-        Route::Drop { reason } => assert!(reason.contains("phantom")),
+        Route::UnknownHandle { handle } => assert_eq!(handle, "phantom"),
         other => panic!("{other:?}"),
     }
 }

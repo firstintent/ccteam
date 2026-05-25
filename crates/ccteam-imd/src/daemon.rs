@@ -471,11 +471,10 @@ fn spawn_inbound_consumer(
             // Reason deferred: at V0.6.x single-bot host-probe traffic
             //   volume the disk read is unmeasurable noise; the cache
             //   only pays for itself at multi-bot per-platform scale,
-            //   which lands with V0.7 Epic C. Hoisting it now would
-            //   bake an invalidation contract that has to be revisited
-            //   when per-bot `chat_handle` lands in the same wave.
-            // Tracking: docs/versions/v0-6-6/prd.md §F168 (decision
-            //   row #3) + docs/dev-coupling-audit.md V0.6.6 segment.
+            //   which lands with V0.7 Epic C. The original chat-handle
+            //   coupling note dropped when V0.6.8 landed the schema, so
+            //   this anchor now sits purely on the perf-budget axis.
+            // Tracking: docs/dev-coupling-audit.md V0.7-deferred index.
             let bots_for_route = list_bots().unwrap_or_default();
             auto_route_dm_mention(&mut msg, &bots_for_route);
             let handles = build_handle_map();
@@ -491,6 +490,7 @@ fn spawn_inbound_consumer(
                 &msg,
                 &sec,
                 &handles,
+                &bots_for_route,
                 mailbox.as_ref(),
                 executor.as_ref(),
                 channel.as_ref(),
@@ -570,32 +570,48 @@ fn spawn_inbound_consumer(
     })
 }
 
-/// V0.6.1 F132 — build a [`HandleMap`] from the current registry so
-/// the router can resolve `@<role>` mentions to `(slug, role)`.
+/// Build a [`HandleMap`] from the current registry so the router can
+/// resolve `@<handle>` mentions to `(slug, role)`.
 ///
-/// V0.6.1 keeps it simple: each registered bot's `role` becomes a
-/// handle. Two bots sharing the same role across different slugs
-/// **collide** here (last-wins). For F132 the typical production
-/// registry has one bot ("web3op_bot") on one slug, so the collision
-/// is theoretical for the V0.6.x host probe.
-///
-// TODO(V0.7-chat-handle): extend `AgentSpec` with a `chat_handle:
-//   Option<String>` field (workflow.yaml schema additive) and build
-//   handles from `(slug, role, chat_handle.unwrap_or(role))` so two
-//   bots can share `role: chatops` across slugs without collision.
-// Reason deferred: the schema extension is paired with V0.7 Epic C
-//   multi-platform per-bot routing — landing it in isolation forces a
-//   second workflow.yaml migration when Epic C ships and would
-//   pre-commit to a handle-collision UX (warn vs. error vs. namespace
-//   per-slug) that the Epic C IM coverage will inform.
-// Tracking: docs/versions/v0-6-6/prd.md §F168 (decision row #4) +
-//   docs/dev-coupling-audit.md V0.6.6 segment.
+/// Effective handle = `chat_handle.unwrap_or(role)`. Cross-slug
+/// collisions resolve to `<handle>__<slug>` for the second claimant
+/// (the first bot in `(slug, role)` sort order keeps the bare handle).
+/// The double-underscore suffix keeps the combined token inside
+/// `router::parse_first_mention`'s `[a-zA-Z0-9_-]` handle charset so
+/// users can actually type `@curie__beta`; an `@` separator would
+/// truncate at the second sigil and route to UnknownHandle. Sort order
+/// is deterministic so collision suffixing doesn't depend on
+/// filesystem `read_dir` ordering.
 fn build_handle_map() -> HandleMap {
+    let bots = list_bots().unwrap_or_default();
+    build_handle_map_from_bots(&bots)
+}
+
+/// Pure variant of [`build_handle_map`] — operates on a borrowed bot
+/// slice so unit tests can probe the collision resolution rule without
+/// touching the on-disk registry.
+pub fn build_handle_map_from_bots(bots: &[BotRegistration]) -> HandleMap {
+    let mut sorted: Vec<&BotRegistration> = bots.iter().collect();
+    sorted.sort_by(|a, b| {
+        a.workflow_slug
+            .cmp(&b.workflow_slug)
+            .then_with(|| a.role.cmp(&b.role))
+    });
+
     let mut map = HandleMap::new();
-    if let Ok(bots) = list_bots() {
-        for b in bots {
-            map.insert(&b.role, &b.workflow_slug, &b.role);
-        }
+    let mut claimed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for b in sorted {
+        let base = b.effective_handle().to_string();
+        let handle = if claimed.contains(&base) {
+            crate::router::collision_suffix(&base, &b.workflow_slug)
+        } else {
+            base.clone()
+        };
+        claimed.insert(handle.clone());
+        // Bare-name claim is also reserved so a later identical base
+        // can't sneak in via a numerically-smaller slug suffix.
+        claimed.insert(base);
+        map.insert(&handle, &b.workflow_slug, &b.role);
     }
     map
 }
@@ -1343,6 +1359,7 @@ mod tests {
             persona_id: None,
             im_platform: "telegram".into(),
             im_chat_id: "1".into(),
+            chat_handle: None,
             created_at: chrono::Utc::now(),
         };
 
@@ -1405,6 +1422,7 @@ mod tests {
             persona_id: None,
             im_platform: "telegram".into(),
             im_chat_id: "1".into(),
+            chat_handle: None,
             created_at: chrono::Utc::now(),
         };
         // Tick 1: Spawn.

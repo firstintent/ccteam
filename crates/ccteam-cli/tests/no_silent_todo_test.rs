@@ -6,9 +6,11 @@
 //! `V0.<N>` deferred-with-justification tag (either inline or in the
 //! immediately adjacent comment lines), so future grep sweeps trivially
 //! distinguish "deferred-with-reason" from "forgotten WIP". F168
-//! delivered six sites tagged `TODO(V0.7-<anchor>)` plus three
-//! sister-finding sites owned by F173 / F169 / F170 — see
-//! `docs/dev-coupling-audit.md` V0.6.6 segment for the index.
+//! originally delivered six `TODO(V0.7-<anchor>)` tags; V0.6.8 retired
+//! the `chat-handle` anchor (the AgentSpec / BotRegistration /
+//! build_handle_map schema landed) so the count is now five.
+//! Sister-finding sites owned by F173 / F169 / F170 cover the
+//! remaining markers — see `docs/dev-coupling-audit.md` for the index.
 //!
 //! Allowed escape hatch: a marker line that mentions any
 //! `V0.<N>` (N ≥ 7) token in its own line or in the ±3 line window
@@ -108,10 +110,13 @@ fn no_silent_todo_in_production_src() {
     );
 }
 
-/// Cross-check that F168 delivered exactly six `TODO(V0.7-<anchor>)`
-/// tags — guards against accidental tag removal or duplication.
+/// Cross-check that the surviving `TODO(V0.7-<anchor>)` tag set
+/// matches expectations — guards against accidental tag removal or
+/// duplication. F168 originally delivered six anchors; V0.6.8
+/// retired `chat-handle` (the schema landed), so the count is now
+/// five.
 #[test]
-fn f168_v07_deferred_tag_count_is_six() {
+fn f168_v07_deferred_tag_count_is_five() {
     let workspace_root = workspace_root();
     let mut hits: Vec<String> = Vec::new();
     for root in SCAN_ROOTS {
@@ -135,8 +140,9 @@ fn f168_v07_deferred_tag_count_is_six() {
     }
     assert_eq!(
         hits.len(),
-        6,
-        "F168 ships exactly 6 V0.7-deferred TODO anchors; found {}:\n{}",
+        5,
+        "V0.6.8 left exactly 5 V0.7-deferred TODO anchors (F168 minus \
+         chat-handle, which V0.6.8 closed); found {}:\n{}",
         hits.len(),
         hits.join("\n")
     );

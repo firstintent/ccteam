@@ -514,6 +514,7 @@ fn seed_imd_registry(fx: &Fixture, role: &str) -> (std::path::PathBuf, std::path
         "telegram",
         "42",
         Some(role),
+        None,
     )
     .expect("seed registry");
     let reg_path = match outcome {

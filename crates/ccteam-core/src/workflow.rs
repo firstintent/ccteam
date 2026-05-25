@@ -726,6 +726,30 @@ pub struct AgentSpec {
     /// ```
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_approval: Option<PlanApprovalSpec>,
+    /// Optional IM handle this agent answers to in chat mode. When set,
+    /// the daemon's router maps `@<chat_handle>` → `(slug, role)` instead
+    /// of falling back to `@<role>`. Two bots in different slugs can
+    /// share the same `chat_handle` value; the daemon resolves cross-slug
+    /// collisions by suffixing the second claimant with `__<slug>`
+    /// (double underscore, deterministic by `(slug, role)` sort order;
+    /// the form stays inside the IM handle charset so users can type
+    /// `@curie__beta` and it routes end-to-end). Omitted = the bot
+    /// answers to `@<role>` for backwards compatibility with
+    /// pre-`chat_handle` workflows.
+    ///
+    /// ```yaml
+    /// agents:
+    ///   helper:
+    ///     chat_handle: curie   # @curie in Telegram instead of @helper
+    /// ```
+    ///
+    /// Auto-mint: `ccteam-creator` skill calls `chat_register_bot`
+    /// without this field; the MCP handler picks an unused scientist
+    /// nickname from `agent_naming::SCIENTIST_NAMES` and persists it
+    /// into `BotRegistration.chat_handle`. Workflow.yaml callers may
+    /// pin a specific handle here to override that mint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_handle: Option<String>,
 }
 
 impl AgentSpec {
@@ -1279,6 +1303,7 @@ mod tests {
                         timeout: None,
                         on_timeout: None,
                         plan_approval: None,
+                        chat_handle: None,
                     },
                 );
                 m
@@ -1312,6 +1337,7 @@ mod tests {
                 timeout: None,
                 on_timeout: None,
                 plan_approval: None,
+                chat_handle: None,
             },
         );
         WorkflowSpec {
@@ -1343,6 +1369,7 @@ mod tests {
             timeout: None,
             on_timeout: None,
             plan_approval: None,
+            chat_handle: None,
         }
     }
 
@@ -1485,6 +1512,64 @@ agents:
         assert!(validate_role_name("").is_err());
     }
 
+    // ---- chat_handle field round-trip ---------------------------------
+
+    #[test]
+    fn agent_spec_chat_handle_deserializes_when_present() {
+        let yaml = "
+name: demo
+agents:
+  helper:
+    trigger: manual
+    chat_handle: curie
+";
+        let spec: WorkflowSpec = serde_yaml::from_str(yaml).expect("parse");
+        assert_eq!(spec.agents["helper"].chat_handle.as_deref(), Some("curie"));
+        spec.validate().expect("validate");
+    }
+
+    #[test]
+    fn agent_spec_chat_handle_defaults_to_none_when_absent() {
+        // Backwards-compat: pre-`chat_handle` workflow.yaml files must
+        // still parse cleanly.
+        let yaml = "
+name: demo
+agents:
+  helper:
+    trigger: manual
+";
+        let spec: WorkflowSpec = serde_yaml::from_str(yaml).expect("parse");
+        assert!(spec.agents["helper"].chat_handle.is_none());
+    }
+
+    #[test]
+    fn agent_spec_chat_handle_round_trips_through_serde() {
+        // Set field → serialize → deserialize → expect same value.
+        let mut agent = AgentSpec {
+            executor: Executor::Claude,
+            model: None,
+            trigger: Trigger::Manual,
+            scope: None,
+            parallelism: None,
+            input: None,
+            output: None,
+            schedule: None,
+            timeout: None,
+            on_timeout: None,
+            plan_approval: None,
+            chat_handle: Some("galileo".into()),
+        };
+        let yaml = serde_yaml::to_string(&agent).unwrap();
+        assert!(yaml.contains("chat_handle: galileo"));
+        let back: AgentSpec = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(back.chat_handle.as_deref(), Some("galileo"));
+
+        // None → field is skipped on serialize (skip_serializing_if).
+        agent.chat_handle = None;
+        let yaml = serde_yaml::to_string(&agent).unwrap();
+        assert!(!yaml.contains("chat_handle"));
+    }
+
     // ---- V0.6.3 F145 squad routing ------------------------------------
 
     /// Build an artifact-driven workflow with a `manual` agent per role
@@ -1506,6 +1591,7 @@ agents:
                     timeout: None,
                     on_timeout: None,
                     plan_approval: None,
+                    chat_handle: None,
                 },
             );
         }

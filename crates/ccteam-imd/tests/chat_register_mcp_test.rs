@@ -32,6 +32,7 @@ fn register_bot_checked_writes_registration_at_documented_path() {
         "telegram",
         "42",
         None,
+        None,
     )
     .unwrap();
     let path = match outcome {
@@ -64,6 +65,7 @@ fn register_bot_checked_does_not_clobber_existing() {
         "telegram",
         "42",
         None,
+        None,
     )
     .unwrap();
     let original_bytes = std::fs::read(registration_path_in(&r, "demo", "helper")).unwrap();
@@ -77,6 +79,7 @@ fn register_bot_checked_does_not_clobber_existing() {
         AgentVendor::Codex,
         "slack",
         "C999",
+        None,
         None,
     )
     .unwrap();
@@ -152,6 +155,55 @@ fn unregister_removes_heartbeat_sidecar() {
         !bot_heartbeat_path_in(&r, "demo", "helper").exists(),
         "unregister must clean up the sidecar heartbeat"
     );
+}
+
+#[test]
+fn register_bot_persists_caller_supplied_chat_handle() {
+    let tmp = TempDir::new().unwrap();
+    let r = root(&tmp);
+    let outcome = register_bot_checked_in(
+        &r,
+        "demo",
+        "helper",
+        AgentVendor::Claude,
+        "telegram",
+        "42",
+        None,
+        Some("curie"),
+    )
+    .unwrap();
+    assert!(matches!(outcome, RegisterOutcome::Registered(_)));
+    let path = registration_path_in(&r, "demo", "helper");
+    let on_disk: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    assert_eq!(on_disk["chat_handle"], "curie");
+    // Re-listing the registry round-trips chat_handle through serde.
+    let bots = list_bots_in(&r, None).unwrap();
+    assert_eq!(bots.len(), 1);
+    assert_eq!(bots[0].chat_handle.as_deref(), Some("curie"));
+    assert_eq!(bots[0].effective_handle(), "curie");
+}
+
+#[test]
+fn register_bot_chat_handle_none_persists_as_omitted_then_falls_back_to_role() {
+    let tmp = TempDir::new().unwrap();
+    let r = root(&tmp);
+    register_bot_checked_in(
+        &r,
+        "demo",
+        "helper",
+        AgentVendor::Claude,
+        "telegram",
+        "42",
+        None,
+        None,
+    )
+    .unwrap();
+    let bots = list_bots_in(&r, None).unwrap();
+    assert_eq!(bots.len(), 1);
+    assert!(bots[0].chat_handle.is_none());
+    // Effective handle falls back to role.
+    assert_eq!(bots[0].effective_handle(), "helper");
 }
 
 #[test]

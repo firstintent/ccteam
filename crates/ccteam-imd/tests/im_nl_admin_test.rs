@@ -116,10 +116,14 @@ impl Scenario {
             timestamp: 0,
             thread_ts: None,
         };
+        // Pull the live registry so ListHere / unknown-handle replies
+        // see the same bots the production daemon would see.
+        let bots = ccteam_imd::list_bots().unwrap_or_default();
         let (outcome, reply) = process_inbound_admin_aware(
             &msg,
             &self.sec,
             &self.handles,
+            &bots,
             &self.mailbox,
             &self.executor,
             &self.channel,
@@ -202,13 +206,144 @@ async fn resume_helper_bot_removes_drain_signal() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
-async fn list_bots_replies_with_registry_inventory() {
+async fn list_here_replies_with_handles_reachable_from_this_chat() {
+    // `list bots` (new 6th admin verb) returns the chat-scoped handle
+    // list — same format the unknown-handle reply uses. The bot
+    // registered in Scenario::build (`helper-bot/main` bound to
+    // `("telegram", "@group-1")`) falls back to its role `main` as the
+    // effective handle since no `chat_handle` was minted.
     let _g = env_lock();
     let sc = Scenario::build();
     let (_, side, msg) = sc.send("@ccteam list bots").await;
     assert_eq!(side, AdminSideEffect::None);
+    assert!(
+        msg.contains("@main"),
+        "expected per-chat handle line, got: {msg}"
+    );
+    assert!(msg.to_lowercase().contains("available bots in this chat"));
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn list_global_replies_with_full_registry_inventory() {
+    // Bare `list` / `ls` keeps the V0.6.x global-inventory shape so
+    // operators still have a way to dump every bot across slugs.
+    let _g = env_lock();
+    let sc = Scenario::build();
+    let (_, side, msg) = sc.send("@ccteam list").await;
+    assert_eq!(side, AdminSideEffect::None);
     assert!(msg.contains("helper-bot/main"));
     assert!(msg.contains("telegram"));
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn list_here_synonyms_bots_and_who_route_to_same_keyword() {
+    let _g = env_lock();
+    let sc = Scenario::build();
+    for verb in ["bots", "who"] {
+        let (_, side, msg) = sc.send(&format!("@ccteam {verb}")).await;
+        assert_eq!(side, AdminSideEffect::None, "verb={verb}");
+        assert!(
+            msg.to_lowercase().contains("available bots in this chat"),
+            "verb={verb}, got: {msg}"
+        );
+    }
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn unknown_handle_inbound_replies_with_available_bots_in_chat() {
+    // F184 — @<unknown> on inbound no longer silently drops. The
+    // router-level UnknownHandle outcome triggers a helpful reply on
+    // the originating channel.
+    let _g = env_lock();
+    let sc = Scenario::build();
+    let msg = ChannelMessage {
+        id: "u-unknown".into(),
+        sender: "alice".into(),
+        reply_target: "@group-1".into(),
+        content: "@ghost hello".into(),
+        channel: "telegram".into(),
+        timestamp: 0,
+        thread_ts: None,
+    };
+    let bots = ccteam_imd::list_bots().unwrap_or_default();
+    let (outcome, admin_reply) = process_inbound_admin_aware(
+        &msg,
+        &sc.sec,
+        &sc.handles,
+        &bots,
+        &sc.mailbox,
+        &sc.executor,
+        &sc.channel,
+        0,
+        99,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome, InboundOutcome::UnknownHandle { .. }));
+    // No AdminReply for unknown-handle; the channel did the talking.
+    assert!(admin_reply.is_none());
+    let out = sc.channel.outbox().await;
+    assert!(
+        !out.is_empty(),
+        "channel must receive an unknown-handle reply"
+    );
+    let last = out.last().unwrap();
+    assert_eq!(last.recipient, "@group-1");
+    assert!(
+        last.content.contains("@ghost"),
+        "reply echoes the typo: {}",
+        last.content
+    );
+    assert!(
+        last.content.contains("@main"),
+        "reply lists the reachable bot: {}",
+        last.content
+    );
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn list_here_with_zero_bots_in_chat_says_no_bots() {
+    // Empty registry — ListHere falls back to the canonical
+    // no-bots-in-chat message.
+    let _g = env_lock();
+    let home = TempDir::new().unwrap();
+    std::env::set_var("HOME", home.path());
+    let projects_root = home.path().join("projects");
+    std::fs::create_dir_all(&projects_root).unwrap();
+    let sec = Arc::new(Mutex::new(ThreeLayerSec::new(AclPolicy::default())));
+    let mailbox = DefaultMailboxResolver::with_projects_root(&projects_root);
+    let executor = AdminExecutor::new(&projects_root);
+    let channel = MockChannel::new();
+    let handles = HandleMap::new();
+
+    let msg = ChannelMessage {
+        id: "u-empty".into(),
+        sender: "alice".into(),
+        reply_target: "@group-1".into(),
+        content: "@ccteam list bots".into(),
+        channel: "telegram".into(),
+        timestamp: 0,
+        thread_ts: None,
+    };
+    let (_, reply) = process_inbound_admin_aware(
+        &msg,
+        &sec,
+        &handles,
+        &[],
+        &mailbox,
+        &executor,
+        &channel,
+        0,
+        1,
+    )
+    .await
+    .unwrap();
+    let r = reply.expect("admin reply");
+    assert!(r.message.contains("No bots registered in this chat"));
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -291,10 +426,19 @@ async fn expired_confirm_does_not_fire() {
         timestamp: 0,
         thread_ts: None,
     };
-    let (_, reply) =
-        process_inbound_admin_aware(&msg, &sec, &handles, &mailbox, &executor, &channel, 0, 1)
-            .await
-            .unwrap();
+    let (_, reply) = process_inbound_admin_aware(
+        &msg,
+        &sec,
+        &handles,
+        &[],
+        &mailbox,
+        &executor,
+        &channel,
+        0,
+        1,
+    )
+    .await
+    .unwrap();
     assert!(matches!(
         reply.unwrap().side_effect,
         AdminSideEffect::ConfirmRequested { .. }
@@ -313,7 +457,15 @@ async fn expired_confirm_does_not_fire() {
         thread_ts: None,
     };
     let (_, reply2) = process_inbound_admin_aware(
-        &confirm, &sec, &handles, &mailbox, &executor, &channel, 0, 2,
+        &confirm,
+        &sec,
+        &handles,
+        &[],
+        &mailbox,
+        &executor,
+        &channel,
+        0,
+        2,
     )
     .await
     .unwrap();
@@ -354,6 +506,7 @@ async fn admin_path_does_not_consume_hop_budget() {
         &msg,
         &sc.sec,
         &sc.handles,
+        &[],
         &sc.mailbox,
         &sc.executor,
         &sc.channel,

@@ -46,6 +46,7 @@ use std::path::Path;
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 
+use ccteam_core::agent_naming::pick_unused_bot_name;
 use ccteam_core::execution::turns_mirror::{read_all_turns, TurnRecord};
 use ccteam_core::harness::AgentVendor;
 use ccteam_core::paths::CcteamPaths;
@@ -61,7 +62,7 @@ pub fn chat_tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "ccteam__chat_register_bot",
-            "description": "V0.6.5 F146 — register a chat-mode bot. Writes `<ccteam_root>/imd/registry/<workflow_slug>/<role>.json` (non-clobbering — returns `ok:false, error:\"already_registered\"` if the file already exists; unregister first to re-bind). The daemon's registry watcher picks the new file up and spawns the tmux session.",
+            "description": "Register a chat-mode bot. Writes `<ccteam_root>/imd/registry/<workflow_slug>/<role>.json` (non-clobbering — returns `ok:false, error:\"already_registered\"` if the file already exists; unregister first to re-bind). The daemon's registry watcher picks the new file up and spawns the tmux session. When `chat_handle` is omitted, the dispatcher auto-mints an unused scientist nickname from `ccteam_core::agent_naming::SCIENTIST_NAMES` (e.g. `curie`, `galileo`) so IM users get a friendly `@curie` handle instead of `@helper`. Pass `chat_handle` to pin a specific handle.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {
@@ -78,7 +79,8 @@ pub fn chat_tool_definitions() -> Vec<Value> {
                         "description": "IM platform binding."
                     },
                     "im_chat_id": { "type": "string", "description": "Platform-specific chat id (string)." },
-                    "persona_id": { "type": "string", "description": "Optional stable persona id for display name / avatar." }
+                    "persona_id": { "type": "string", "description": "Optional stable persona id for display name / avatar." },
+                    "chat_handle": { "type": "string", "description": "Optional IM mention this bot answers to (without leading `@`). Omit to auto-mint an unused scientist nickname. Letters, digits, `_`, `-` only." }
                 },
                 "required": ["workflow_slug", "role", "vendor", "im_platform", "im_chat_id"],
             }),
@@ -163,7 +165,15 @@ pub fn dispatch(paths: &CcteamPaths, name: &str, args: &Value) -> Result<Option<
     }
 }
 
-/// V0.6.5 F146 — `ccteam__chat_register_bot` dispatcher.
+/// `ccteam__chat_register_bot` dispatcher.
+///
+/// When `chat_handle` is omitted the dispatcher walks the existing
+/// registry, collects every effective handle currently in use (taking
+/// per-bot `chat_handle` when set, otherwise `role`), and asks
+/// `pick_unused_bot_name` for the first unused scientist nickname.
+/// The minted handle is persisted into `BotRegistration.chat_handle`
+/// so the daemon's `build_handle_map` resolves `@<minted>` →
+/// `(slug, role)` immediately on the next registry-watcher tick.
 pub(crate) fn dispatch_register_bot(paths: &CcteamPaths, args: &Value) -> Result<String> {
     let workflow_slug = arg_str(args, "workflow_slug")?;
     validate_slug(&workflow_slug, "workflow_slug")?;
@@ -181,6 +191,16 @@ pub(crate) fn dispatch_register_bot(paths: &CcteamPaths, args: &Value) -> Result
         .and_then(|v| v.as_str())
         .map(String::from);
 
+    // Caller-supplied handle wins; absent → auto-mint from
+    // SCIENTIST_NAMES across every effective handle already in use.
+    let chat_handle = match args.get("chat_handle").and_then(|v| v.as_str()) {
+        Some(h) if !h.is_empty() => {
+            validate_chat_handle(h)?;
+            Some(h.to_string())
+        }
+        _ => Some(mint_unused_handle(&paths.root)?),
+    };
+
     let outcome = register_bot_checked_in(
         &paths.root,
         &workflow_slug,
@@ -189,6 +209,7 @@ pub(crate) fn dispatch_register_bot(paths: &CcteamPaths, args: &Value) -> Result
         &im_platform,
         &im_chat_id,
         persona_id.as_deref(),
+        chat_handle.as_deref(),
     )?;
     match outcome {
         RegisterOutcome::Registered(path) => Ok(serde_json::to_string_pretty(&json!({
@@ -196,6 +217,7 @@ pub(crate) fn dispatch_register_bot(paths: &CcteamPaths, args: &Value) -> Result
             "path": path.display().to_string(),
             "workflow_slug": workflow_slug,
             "role": role,
+            "chat_handle": chat_handle,
         }))?),
         RegisterOutcome::AlreadyRegistered(path) => Ok(serde_json::to_string_pretty(&json!({
             "ok": false,
@@ -206,6 +228,40 @@ pub(crate) fn dispatch_register_bot(paths: &CcteamPaths, args: &Value) -> Result
             "hint": "Unregister first with chat_unregister_bot, then re-register.",
         }))?),
     }
+}
+
+/// Pick the first unused scientist nickname across the entire registry.
+///
+/// "Effective handle" = `chat_handle.unwrap_or(role)` per bot — the same
+/// resolution `build_handle_map` uses — so the auto-mint never picks a
+/// name that would collide with an existing bot that fell back to its
+/// role as the handle. The match is case-insensitive in
+/// `pick_unused_bot_name` so registries that stored handles in mixed
+/// case still claim the right slot.
+fn mint_unused_handle(ccteam_root: &Path) -> Result<String> {
+    let existing = list_bots_in(ccteam_root, None).unwrap_or_default();
+    let in_use: Vec<String> = existing
+        .iter()
+        .map(|b| b.chat_handle.clone().unwrap_or_else(|| b.role.clone()))
+        .collect();
+    Ok(pick_unused_bot_name(&in_use))
+}
+
+/// Caller-supplied handles share the slug validator rules so registry
+/// filenames + router parse paths stay clean (alphanumeric / `_` / `-`).
+fn validate_chat_handle(s: &str) -> Result<()> {
+    if s.is_empty() {
+        return Err(anyhow!("`chat_handle` must be non-empty"));
+    }
+    if !s
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(anyhow!(
+            "`chat_handle` may contain only [a-zA-Z0-9_-]: `{s}`"
+        ));
+    }
+    Ok(())
 }
 
 /// V0.6.5 F146 — `ccteam__chat_unregister_bot` dispatcher.
@@ -250,6 +306,7 @@ pub(crate) fn dispatch_list_bots(paths: &CcteamPaths, args: &Value) -> Result<St
                 "im_platform": reg.im_platform,
                 "im_chat_id": reg.im_chat_id,
                 "persona_id": reg.persona_id,
+                "chat_handle": reg.chat_handle,
                 "created_at": reg.created_at.to_rfc3339(),
                 "running": running,
                 "last_turn_at": last,
@@ -920,5 +977,113 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("illegal"));
+    }
+
+    #[test]
+    fn register_bot_auto_mints_scientist_nickname_when_chat_handle_absent() {
+        let tmp = TempDir::new().unwrap();
+        let p = paths(&tmp);
+        let body = dispatch_register_bot(
+            &p,
+            &json!({
+                "workflow_slug": "demo",
+                "role": "helper",
+                "vendor": "claude",
+                "im_platform": "telegram",
+                "im_chat_id": "42",
+            }),
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["ok"], true);
+        let minted = parsed["chat_handle"]
+            .as_str()
+            .expect("dispatcher reports the minted handle in its reply");
+        assert!(!minted.is_empty());
+        // First-mint into an empty registry takes the head of
+        // SCIENTIST_NAMES (Euclid).
+        assert_eq!(minted, "Euclid");
+        // On-disk row carries the same value so the daemon's
+        // build_handle_map resolves @Euclid on the next tick.
+        let path = parsed["path"].as_str().unwrap();
+        let on_disk: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(on_disk["chat_handle"], "Euclid");
+    }
+
+    #[test]
+    fn register_bot_caller_supplied_chat_handle_overrides_auto_mint() {
+        let tmp = TempDir::new().unwrap();
+        let p = paths(&tmp);
+        let body = dispatch_register_bot(
+            &p,
+            &json!({
+                "workflow_slug": "demo",
+                "role": "helper",
+                "vendor": "claude",
+                "im_platform": "telegram",
+                "im_chat_id": "42",
+                "chat_handle": "curie",
+            }),
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["ok"], true);
+        assert_eq!(parsed["chat_handle"], "curie");
+        let path = parsed["path"].as_str().unwrap();
+        let on_disk: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(on_disk["chat_handle"], "curie");
+    }
+
+    #[test]
+    fn register_bot_auto_mint_skips_handles_already_in_use() {
+        let tmp = TempDir::new().unwrap();
+        let p = paths(&tmp);
+        // First registration: claim Euclid via explicit handle.
+        dispatch_register_bot(
+            &p,
+            &json!({
+                "workflow_slug": "a",
+                "role": "lead",
+                "vendor": "claude",
+                "im_platform": "telegram",
+                "im_chat_id": "1",
+                "chat_handle": "Euclid",
+            }),
+        )
+        .unwrap();
+        // Second registration with no chat_handle — mint should skip
+        // Euclid (case-insensitive) and pick Archimedes.
+        let body = dispatch_register_bot(
+            &p,
+            &json!({
+                "workflow_slug": "b",
+                "role": "lead",
+                "vendor": "claude",
+                "im_platform": "telegram",
+                "im_chat_id": "2",
+            }),
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["chat_handle"], "Archimedes");
+    }
+
+    #[test]
+    fn register_bot_rejects_invalid_chat_handle_chars() {
+        let tmp = TempDir::new().unwrap();
+        let p = paths(&tmp);
+        let err = dispatch_register_bot(
+            &p,
+            &json!({
+                "workflow_slug": "demo",
+                "role": "helper",
+                "vendor": "claude",
+                "im_platform": "telegram",
+                "im_chat_id": "42",
+                "chat_handle": "bad/handle",
+            }),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("chat_handle"));
     }
 }

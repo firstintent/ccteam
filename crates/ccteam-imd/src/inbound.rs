@@ -20,7 +20,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::nl_admin::{self, AdminExecutor, AdminReply};
-use crate::router::{self, HandleMap, Route};
+use crate::router::{
+    self, available_handles_for_chat, format_unknown_handle_reply, HandleMap, Route,
+};
 use crate::three_layer_sec::{SecOutcome, ThreeLayerSec};
 use crate::transport::{Channel, ChannelMessage, SendMessage};
 
@@ -72,7 +74,14 @@ pub enum InboundOutcome {
         /// `@ccteam <verb_and_args>` payload.
         verb_and_args: String,
     },
-    /// Dropped by router (unknown handle, no mention, hop budget).
+    /// `@handle` parsed but unknown to the registry. The admin-aware
+    /// wrapper replies to the originating chat with a helpful list of
+    /// available bots.
+    UnknownHandle {
+        /// The handle the user typed (without the leading `@`).
+        handle: String,
+    },
+    /// Dropped by router (no mention, hop budget exceeded).
     Dropped {
         /// reason.
         reason: String,
@@ -251,6 +260,7 @@ pub async fn process_inbound(
     let route = router::route(&payload, handles, hop);
     match route {
         Route::Drop { reason } => Ok(InboundOutcome::Dropped { reason }),
+        Route::UnknownHandle { handle } => Ok(InboundOutcome::UnknownHandle { handle }),
         Route::Admin { verb_and_args } => {
             tracing::info!(verb = %verb_and_args, "admin command parsed: {:?}", nl_admin::parse(&verb_and_args));
             Ok(InboundOutcome::Admin { verb_and_args })
@@ -297,32 +307,28 @@ pub async fn process_inbound(
     }
 }
 
-/// V0.6.1 F129 — admin-aware wrapper around [`process_inbound`].
+/// Admin-aware wrapper around [`process_inbound`].
 ///
-/// When the inbound router classifies a message as `@ccteam` admin
-/// traffic, this helper:
+/// Reply behaviour:
 ///
-/// 1. Parses the NL via [`nl_admin::parse`].
-/// 2. Runs the parsed command through `executor` (writes signal
-///    files / pulls registry / queues confirm prompts).
-/// 3. Sends the reply text back through `channel` to
-///    `msg.reply_target` so the user sees the outcome in the same
-///    chat.
+/// - `InboundOutcome::Admin` → parse the NL via [`nl_admin::parse`],
+///   execute it through `executor`, and `channel.send` the result so
+///   the user sees the outcome in the same chat.
+/// - `InboundOutcome::UnknownHandle` → format an
+///   `Unknown handle '@xxx'. Available bots in this chat: @alice @bob`
+///   reply from `bots` and send it. Replaces the V0.6.x silent-drop UX.
+/// - Bot routing, plain drops, and security rejections pass through
+///   with `admin_reply = None`.
 ///
-/// Returns the executor's [`AdminReply`] alongside the original
-/// [`InboundOutcome`] so callers (tests + the daemon) can assert
-/// side-effects without re-parsing the reply string.
-///
-/// Non-admin outcomes (bot routing, drops, sec rejections) pass
-/// through with `admin_reply = None`. Admin replies do **not** bump
-/// the hop counter — the F129 acceptance spec calls out that
-/// meta-agent admin paths must not consume the bot-to-bot hop
-/// budget, and this wrapper never re-routes through the bot mailbox.
+/// Admin and unknown-handle replies do **not** bump the hop counter —
+/// neither path re-enters the bot mailbox so the bot-to-bot hop budget
+/// stays untouched.
 #[allow(clippy::too_many_arguments)]
 pub async fn process_inbound_admin_aware(
     msg: &ChannelMessage,
     sec: &Arc<Mutex<ThreeLayerSec>>,
     handles: &HandleMap,
+    bots: &[crate::BotRegistration],
     mailbox: &dyn MailboxResolver,
     executor: &AdminExecutor,
     channel: &dyn Channel,
@@ -333,13 +339,25 @@ pub async fn process_inbound_admin_aware(
     let admin_reply = match &outcome {
         InboundOutcome::Admin { verb_and_args } => {
             let cmd = nl_admin::parse(verb_and_args);
-            let reply = executor.execute(cmd, &msg.reply_target).await;
+            let reply = executor
+                .execute_for_chat(cmd, &msg.reply_target, &msg.channel, bots)
+                .await;
             let out = SendMessage::new(reply.message.clone(), msg.reply_target.clone())
                 .in_thread(msg.thread_ts.clone());
             if let Err(err) = channel.send(&out).await {
                 tracing::warn!(error = %err, "admin reply send failed");
             }
             Some(reply)
+        }
+        InboundOutcome::UnknownHandle { handle } => {
+            let available = available_handles_for_chat(bots, &msg.channel, &msg.reply_target);
+            let text = format_unknown_handle_reply(handle, &available);
+            let out =
+                SendMessage::new(text, msg.reply_target.clone()).in_thread(msg.thread_ts.clone());
+            if let Err(err) = channel.send(&out).await {
+                tracing::warn!(error = %err, "unknown-handle reply send failed");
+            }
+            None
         }
         _ => None,
     };

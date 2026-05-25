@@ -165,16 +165,21 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
 | **F172** | V0.6.6 (V2 redesign) | ✓ shipped wave 1 | tmux mode-3 上下文恢复 via Anthropic 官方 `claude --resume <name>` lossless lookup —— `claude_tui::start_thread` spawn argv 加 `--name ccteam-chat-<slug>-<role>` deterministic 命名(Fresh path)+ F164 dead-pane recreate 路径 spawn `claude --resume <name>`(Recreate path,模型 cache + 推理链续接,不字面回放);`--resume` 失败 fallback 走 Fresh + emit `chat_session_reset { bot, reason }` event(user-visible degraded,不冒充 resume);**V1 设计 ditch**:原 PRD 草过 `chat_snapshot` progress event + ccteam-side synthesis prompt,V2 全部 ditch —— `progress.jsonl` SoT 零扩(只增 `reason` 字段)/ 不 capture-pane / 不构造 history-synthesis prompt;**红线守**:R10 跨项目记忆走官方接口直接守(Anthropic 自己 reload jsonl);F118 `build_recovery_prompt` 保留作 brand-new spawn 退路(`--resume` 因 jsonl 损坏失败时);+8 tests(`session_recovery_test.rs`)→ `docs/versions/v0-6-6/prd.md §F172` |
 | **F173** | V0.6.6 | ✓ shipped wave 1 | Codex daemon-routed critic 统一 cost rollup(V0.6.3 F156 follow-through)—— `default_adapter_factory` Codex arm 改用 `CodexExecAdapter`(替代 V0.6.3 bash spawn 路径)+ `orchestrator::adapter_for_chat` 同步 + `CodexExecAdapter::submit_turn` 加 ledger hook(`turn/completed` JSONL event 携 `usage` → `append_budget_sample(vendor=codex)` 进 `<ccteam_root>/cost-budget.json` 与 F152 同 ledger)+ `ccteam doctor --check-cost-orphan` invariant(扫近 24h Codex `agent_done` events vs ledger,缺失 WARN);`BudgetExceeded` hard-fail(不 silent bypass)+ `skills/ccteam-team/SKILL.md` §3.5 文案改"shipped V0.6.6 F173";`daemon.rs:84` F168 #1 TODO marker 同 PR 清;3 ledger tests + 2 doctor tests → `docs/versions/v0-6-6/prd.md §F173`(closes F156 retained risk)|
 
-### V0.6.6 V0.7-deferred TODO 索引(grep `TODO\(V0\.7-` 6 命中)
+### V0.6.6 V0.7-deferred TODO 索引(grep `TODO\(V0\.7-` 5 命中)
 
 | Anchor tag | Site | Reason deferred |
 |---|---|---|
 | `TODO(V0.7-im-providers)` | `crates/ccteam-imd/src/daemon.rs:411` | `SlackChannel` / `DiscordChannel` wiring bundled with V0.7 Epic C(国内 IM + Slack Socket Mode / inbound HTTP)so the daemon wiring, HMAC verification, and onboarding skill ship as one wave |
-| `TODO(V0.7-listbots-cache)` | `crates/ccteam-imd/src/daemon.rs:469` | V0.6.x single-bot host-probe disk-read is unmeasurable noise;cache invalidation contract better baked alongside V0.7 per-bot `chat_handle` schema |
-| `TODO(V0.7-chat-handle)` | `crates/ccteam-imd/src/daemon.rs:584` | `AgentSpec.chat_handle: Option<String>` schema extension paired with V0.7 Epic C multi-platform routing — isolated landing forces a second workflow.yaml migration |
+| `TODO(V0.7-listbots-cache)` | `crates/ccteam-imd/src/daemon.rs:469` | V0.6.x single-bot host-probe disk-read is unmeasurable noise;cache invalidation contract V0.7 Epic C scale 时再评估(原与 chat-handle 配对的理由已随 V0.6.8 schema 落地消解) |
 | `TODO(V0.7-human-approval-adapter)` | `crates/ccteam-core/src/orchestrator.rs:686` | V0.6.1 F124 + F98 narrow-scope poll-time HITL gate already delivers the user-visible contract;dedicated wrapper is pure refactor with zero behavioural delta — pre-v1.0 不为零增益 churn trait surface |
 | `TODO(V0.7-slack-inbound)` | `crates/ccteam-imd/src/three_layer_sec.rs:111` | Slack HMAC-SHA256 sig verify only consumed by V0.7 inbound HTTP receiver;V0.6.x Slack uses polling which carries no signed-request — wiring 3 deps(`hmac` / `sha2` / `subtle`)now risks drift before consumer lands |
 | `TODO(V0.7-slack-socket-mode)` | `crates/ccteam-imd/src/transport/providers/slack.rs:7` | V0.6.x host probe runs one Slack channel with `POLL_INTERVAL_SECS=4` well under rate limits;Socket Mode adds `tokio-tungstenite` + reconnect / backoff state machine that benefits primarily from V0.7 Epic C multi-channel scale |
+
+### V0.6.8 closed anchors(原 F168 候选,本版 retire)
+
+| Anchor tag | Closed at | Replacement |
+|---|---|---|
+| `TODO(V0.7-chat-handle)` | V0.6.8 | `AgentSpec.chat_handle: Option<String>` + `BotRegistration.chat_handle` schema fields landed;`build_handle_map` 用 `chat_handle.unwrap_or(role)` + cross-slug `<handle>__<slug>` 后缀(双下划线 — `@` 会被 `router::parse_first_mention` 在第二个 `@` 截断,使 suffixed handle 无法 route);`chat_register_bot` MCP 自动从 `agent_naming::SCIENTIST_NAMES` mint。F180-F184。
 
 ## V0.4.6 摘要更新
 

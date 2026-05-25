@@ -314,13 +314,17 @@ copy src → dest
 
 ## 5.5  Bot handle minting (chat presets)
 
-```
-existing = list_existing_bot_handles_across_projects()
-handle   = "@" + pick_unused_bot_name(existing).to_lowercase()
-```
+You do **not** need to mint a handle yourself. When you call
+`mcp__ccteam__chat_register_bot` in Phase 5.6 without a `chat_handle`
+argument, the MCP handler auto-mints the first unused scientist
+nickname from `agent_naming::SCIENTIST_NAMES`
+(`@crates/ccteam-core/src/agent_naming.rs`) and reports the chosen
+handle in its reply.
 
-The pool is the scientist-nickname list in
-`@crates/ccteam-core/src/agent_naming.rs`.
+If you want to pin a specific handle (user override, persona-coupled
+naming, etc.) pass `chat_handle: "<name>"` explicitly — alphanumeric
+plus `_` / `-` only, no leading `@`. The dispatcher then skips the
+auto-mint and persists the supplied value.
 
 ## 5.6  Register the bot
 
@@ -348,6 +352,22 @@ Telegram chat ids are i64, but the MCP wire expects a string).
 }
 ```
 
+When `chat_handle` is omitted (as above) the dispatcher returns the
+auto-minted handle in the response:
+
+```json
+{
+  "ok": true,
+  "path": "/home/.../helper.json",
+  "workflow_slug": "<slug>",
+  "role": "<role>",
+  "chat_handle": "Euclid"
+}
+```
+
+Read `chat_handle` from the reply so Phase 5.9's user message can
+quote `@Euclid` (or whichever name was assigned).
+
 **Vendor must be lowercase** (`"claude"` or `"codex"`). The daemon's
 `BotRegistration` deserialize trips on PascalCase `"Claude"`; the
 dispatcher lowercases defensively, but stick to lowercase in the
@@ -355,7 +375,8 @@ call to be explicit.
 
 **Error handling:**
 
-- Response `{"ok": true, "path": "..."}` → continue to Phase 5.7.
+- Response `{"ok": true, "path": "...", "chat_handle": "..."}` →
+  continue to Phase 5.7; surface the minted handle to the user later.
 - Response `{"ok": false, "error": "already_registered", "path": "..."}`
   → **idempotent OK**, this is a re-run of the same creator dialogue;
   log the line `Bot already registered at <path>; reusing` and
@@ -366,11 +387,13 @@ call to be explicit.
   to Phase 5.7 / 5.8 — leaving a half-installed bot with workflow.yaml
   but no registration is worse than failing the dialogue.
 
-The `bot_handle` is **not** an input to this call — it's resolved by
-the daemon-side router from the rendered `workflow.yaml`'s
-`chat.bot_name` field at the next registry-watcher tick. Embed the
-minted handle (from 5.5) into the `chat.bot_name` slot of the YAML
-before writing it out in 5.3.
+The daemon's router resolves `@<chat_handle>` → `(slug, role)` from
+the registry directly; no `chat.bot_name` plumbing through
+workflow.yaml is required. Two bots in different slugs sharing the
+same effective handle collide deterministically — the second claimant
+(in `(slug, role)` sort order) receives a `__<slug>` suffix (double
+underscore so the suffixed handle stays inside the IM mention
+charset and users can actually type `@curie__beta`).
 
 ## 5.7  Project-level `.mcp.json`
 

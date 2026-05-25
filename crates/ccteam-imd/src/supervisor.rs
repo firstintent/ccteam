@@ -942,6 +942,7 @@ mod bot_supervisor_tests {
             persona_id: None,
             im_platform: "mock".into(),
             im_chat_id: "1".into(),
+            chat_handle: None,
             created_at: chrono::Utc::now(),
         }
     }
@@ -1027,6 +1028,7 @@ mod tests {
             persona_id: None,
             im_platform: "mock".into(),
             im_chat_id: "1".into(),
+            chat_handle: None,
             created_at: Utc::now(),
         }
     }
