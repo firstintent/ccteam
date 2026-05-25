@@ -277,8 +277,134 @@ ccteam orchestrator / web / cli  ─UDS protocol─►  daemon
 
 ---
 
+---
+
+## 八、自研 mux 原理拆解(building blocks 视角)
+
+### 8.1 tmux 现状是怎么工作的
+
+任何 mux(tmux / zellij / screen / wezterm-mux / Helvesec rmux)都是同一个三层模型,差别只在实现语言 + 协议 + UX:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ Layer 3: Client Layer(human terminal OR agent RPC client)       │
+│   tmux: `tmux attach` 拉出一个 terminal-inside-terminal         │
+│   ccteam: 既有人 attach 也有 MCP RPC 调 send-keys/capture        │
+└──────────────────────▲──────────────────────────────────────────┘
+                       │ IPC(tmux 走 unix socket 自定义二进制协议)
+┌──────────────────────▼──────────────────────────────────────────┐
+│ Layer 2: Server / Multiplexer Daemon(detached, owns state)      │
+│   • event loop(tmux 用 libevent,rmux 类用 tokio/epoll)         │
+│   • HashMap<SessionName, Session>                               │
+│     ├── PTY master fd                                           │
+│     ├── child process handle (PID + waitpid future)             │
+│     ├── vt screen state(光标位置/属性/scrollback ring)         │
+│     ├── subscribers(broadcast 给 N 个 attached client)          │
+│     └── per-pane metadata(title / cwd / size / 自定义 fmt 变量) │
+└──────────────────────▲──────────────────────────────────────────┘
+                       │ PTY master/slave (openpty / ConPTY)
+┌──────────────────────▼──────────────────────────────────────────┐
+│ Layer 1: PTY + Child Process(`claude` / `codex` / shell)        │
+│   • slave 端是 child 的 stdin/stdout/stderr + ctty             │
+│   • master 端是 daemon 读/写口                                  │
+│   • SIGWINCH 通过 master 的 TIOCSWINSZ 同步                     │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**核心抽象**:**daemon 替 child 持有它的 controlling TTY**。child 以为自己跑在终端里(`isatty(0)==true`,环境变量 `TERM=xterm-256color`,有 `winsize`),实际另一端是 daemon 的 fd。所有 keystroke 经 daemon master fd 写入 PTY slave;所有 child 输出从 master 读出 → daemon 喂给 vt parser 维护 screen state → 同时广播给所有 subscriber。
+
+**detached 长 session 怎么实现**:daemon 是独立进程(double-fork 脱离 controlling terminal),client 退出不影响 daemon 持有的 PTY + child。这是 tmux 之于 nohup/screen 的核心价值。
+
+### 8.2 自研最小骨架(rmux for ccteam 的 5 个零件)
+
+按 8.1 模型映射到 Rust crate:
+
+| 零件 | 角色 | 选型 | LOC 估 |
+|---|---|---|---|
+| **PTY 抽象** | 跨平台 master/slave 分配 | `portable-pty` (wezterm 出品,已在 ccteam deps,Windows ConPTY 原生) | 0(直接用)|
+| **VT parser + screen** | 解释 ANSI/CSI/OSC,维护 cursor + cell grid + scrollback | `vt100` 或更全的 `alacritty_terminal` | 0(直接用)+ 200 行 wrapper |
+| **Event loop** | 多 PTY fd + 多 client socket fd async 复用 | `tokio` (已在 ccteam deps)| 0 |
+| **IPC 协议** | client ↔ daemon RPC,客户端 send-keys/capture/subscribe/attach | length-prefixed JSON-RPC over UDS;tarpc 也可 | 400 |
+| **Attach client** | 把本机 TTY 转发到 daemon 的 PTY(raw mode + 键盘 + 鼠标 + resize)| `crossterm` + `tokio::select!` | 800 |
+
+总计 ~3-4k LOC 落地一个**只为 ccteam 服务的最小 rmux**,比 §一.4 估算还小,因为我们**不需要 tmux 90 命令完整 CLI 兼容**(`Helvesec/rmux` 选择全兼容,我们不必)。
+
+---
+
+## 九、现有 tmux 的 14 个历史包袱(为什么 1992 年的 screen + 2007 年的 tmux 不适合 agent 时代)
+
+| # | 包袱 | 根因 | 对 ccteam 的具体影响 |
+|---|---|---|---|
+| 1 | **字符串协议,无结构化输出** | tmux CLI 设计于 shell 脚本时代,`-F '#{format}'` 是字符串模板 | ccteam `display-message -p '#{pane_pid}'` parse 出来还要 trim/atoi;`-CC` control mode 是行协议,转义规则 corner case 多 |
+| 2 | **PTY 字节流是唯一观测面** | tmux 不区分 child stdout / stderr / ANSI / 控制字符,全是 bytes;hooks 是 shell 命令不是 typed event | ccteam 红线"不解析 pane 输出"被迫只能靠 Claude Code hooks 的 fast event 通道,失去"Claude 输出了 X 关键词时通知我"这类能力(必须自己 grep)|
+| 3 | **single-server 单进程隔离弱** | 所有 session 跑在一个 `tmux server`,libevent 单 reactor | 一个 session 的 escape 序列触发 vt100 解析 bug 可能拖累整个 server(罕见但发生过)|
+| 4 | **无 per-session 资源限制** | 1992 年 screen 设计时没有 cgroup | 跑飞的 `claude --bg` 可以吃光机器内存;ccteam 只能在应用层 `budgets.max_cost_usd_per_24h`(费用,不是 CPU/mem)逼停 |
+| 5 | **scrollback 是 RAM ring,不持久** | tmux 默认 2000 行 in-memory;`-S -10000` 也只是改 ring 大小 | 长跑 agent 输出 100MB 编译日志,tmux server RSS 飙;ccteam 已经用 transcript jsonl 绕开这个,但渲染时还要靠 capture-pane |
+| 6 | **PID-based child tracking 易被 reuse 坑** | tmux 用 PID 跟踪 child;child 死 + fork 新进程占同 PID,tmux 无 waitpid 即时性 | ccteam F86 历史 bug 即此类(双校 tmux has-session + kill -0 已经在防);native daemon 持有 `Child` handle,从原理上免疫 |
+| 7 | **C + libevent + ncurses + yacc 编译链** | 2007 年 BSD 风格 | 用户系统老 → `libevent < 2.x`/老 ncurses → 编译失败;macOS 上 brew 装 tmux 偶尔要重链;ccteam install 出过多次 tmux missing 工单 |
+| 8 | **不支持 Windows 原生** | tmux 依赖 unix PTY,Windows 只能 WSL2 | ccteam CLAUDE.md 必须写"Windows 走 WSL2",一刀切掉相当比例的企业 Windows + macOS Boot Camp 用户 |
+| 9 | **`-CC` control mode 协议不友好** | 1992 GNU screen 遗留 + tmux 改造的妥协 | termwiz `tmux_cc` 模块文档已警告"-CC probably only makes sense if you're going to run it in a pty";agent 集成普遍弃用 |
+| 10 | **server 跨重启不存活** | tmux server 是用户级长进程,机器重启 session 全死 | NAS 长跑 agent 一旦机器升级重启全断;需要外部 tmux-resurrect 插件凑活 |
+| 11 | **`.tmux.conf` 与编程使用者冲突** | tmux 设计 client 是人 | 用户 `.tmux.conf` 改了 prefix / 装了 tmux-resurrect 钩 attach 事件 → ccteam attach 进去键绑奇怪;ccteam 没法假设干净环境 |
+| 12 | **格式串 mini-DSL 不可扩展** | `#{}` 格式串是 tmux 内嵌求值器 | 想加自定义元数据(如"这个 session 是哪个 ccteam role")只能塞 session 名字串,无 native key/value |
+| 13 | **多 client 协调粗暴** | 第二个 attach 默认共享 keystroke,经常误触 | dev workflow 里两个窗口看同一 session 共敲键导致混乱;mosh 已修但 tmux 没改 |
+| 14 | **socket 文件全局共享** | `/tmp/tmux-<uid>/default` 单 socket,多版本 tmux 互不识别 | `tmux 3.4 client` 连不上 `tmux 3.5 server`;ccteam 升级 tmux 后旧 session 不可见 |
+
+**额外的"用了 1/4 surface 却背 4/4 维护负担"陷阱**:tmux 90 个子命令、formats DSL、layouts、windows、panes、buffers、hooks、commands sequence、key tables、mouse mode — ccteam 一个都不用,但全在 binary 里,任何一个的 bug 都可能波及 ccteam 真用到的 11 命令路径。
+
+---
+
+## 十、rmux 为 agent 设计的 12 个优势支柱(对照 §九 包袱逐个解)
+
+> 业内已有 [`Helvesec/rmux`](https://github.com/helvesec/rmux)(Rust,tmux 兼容 CLI + typed SDK,Linux/macOS/Windows 原生)和 [`manaflow-ai/cmux`](https://github.com/manaflow-ai/cmux)(macOS 原生 + JSON-RPC socket)正在做这件事。下面是 ccteam 视角下 12 个 agent-first 设计支柱,部分支柱与 Helvesec rmux 重合(说明方向对),部分是 ccteam 独有(说明专属 ccteam 的 rmux 仍有价值)。
+
+| # | 支柱 | 解决 §九 哪条包袱 | ccteam 具体收益 |
+|---|---|---|---|
+| 1 | **typed JSON-RPC over UDS,无 shell escape** | #1, #9, #12 | `send_keys`/`capture`/`subscribe` 是 typed Rust 函数,zero string templating;ccteam mcp-serve 直接走 RPC,删 ~200 行 escape/parse 胶水 |
+| 2 | **structured event stream(typed event 而非 bytes)** | #2 | daemon vt100 parser 之上加 event detector:`process_exited(code)` / `bell_received` / `title_changed(s)` / `output_idle(threshold)` / `output_pattern_matched(regex_id)` 由 daemon push 给 subscriber;ccteam 可注册 "waiting for input:" 模式触发 plan_pending 事件,失去对 Claude Code fast event hooks 的死依赖 |
+| 3 | **per-session 资源隔离** | #3, #4 | linux 用 cgroup v2 包 child(`memory.max` / `cpu.max` / `pids.max`);macOS 用 `rlimit` + `posix_spawn`;Windows 用 Job Object。`budgets:` 配置直接落 OS 层硬隔离,而非应用层软计费 |
+| 4 | **append-only event log scrollback(磁盘 + 查询)** | #5, #10 | 输出按时间窗口分片落 `~/.ccteam/sessions/<name>/output.<n>.jsonl`,daemon RAM 只留 last N 行;查询走 mmap + binary search 按时间或行号;天然成为 transcript jsonl(F172 路径合并) |
+| 5 | **child handle owned by daemon,零 PID-reuse race** | #6 | tokio `Child::wait()` future 是 race-free 的死亡通知;不再需要 `tmux has-session + kill -0 + pid match` 三重双校 |
+| 6 | **零外部 native 依赖,静态链单 binary** | #7 | `cargo build --release` 出一个 ~2MB 静态 binary,无 libevent/ncurses;musl-static linux x64+arm64 + macOS notarized + Windows MSVC 一条 release.yml 搞定;install.sh 不再要 `apt install tmux` 步骤 |
+| 7 | **Windows ConPTY 原生** | #8 | portable-pty 已封 ConPTY;ccteam Windows 用户脱离 WSL2,CLAUDE.md 红线松绑(也利于企业用户 onboarding) |
+| 8 | **session 跨 host 重启可选 checkpoint** | #10 | daemon shutdown 时把 child env / cwd / 最后 N 条 event 落 snapshot;启动时按 `--restore` 标志选择性 respawn(注意:**TTY 状态本质不可恢复**,只能 respawn child 重跑;但对 `claude --resume <name>`(F172)路径完美 — claude 自带 session resume,rmux 只需重新拉起 claude 进程喂同 args)|
+| 9 | **session metadata 是 typed key/value,非格式串** | #12 | `metadata: { role: "critic", workflow: "review-flow", spawned_by_msg_id: ... }` 是 daemon HashMap,RPC 可读可写;ccteam 不再用 session 名 `ccteam-chat-<slug>-<role>` 编码所有信息(F172 设计可简化)|
+| 10 | **multi-client attach 仲裁可配置** | #13 | `attach --mode=observer`(只读)/`--mode=controller`(可写,独占);默认 observer 防止 dev 两窗口共敲;`ccteam attach` 走 controller |
+| 11 | **socket 路径项目隔离** | #14 | UDS 走 `~/.ccteam/run/rmux.sock`,不与系统 tmux 共用 socket;升级 rmux 版本可强制 daemon restart 不影响 host;多 ccteam project 各自 namespace |
+| 12 | **headless-by-default,attach 是次要 feature** | #2, #11 | tmux 设计假设主消费者是人;rmux 假设主消费者是 agent RPC,只在 `ccteam attach` 时才进入 TTY 模式 → 大量 tmux UX 代码(status bar / choose-tree / copy mode / mouse / `.tmux.conf` 求值器)整层删除;binary 体积 + 攻击面双降 |
+
+### 10.1 不在支柱里的"次要好处"
+
+- **可观测性**:daemon `/metrics` 出 prometheus(每 session CPU/mem/output rate / PTY buffer 高水位 / RPC latency p99),今天 ccteam web 4 面板可加 "mux session health" 第 5 面板
+- **测试可注入**:`MuxBackend` trait + `MockBackend`,单元测试不依赖真 PTY,跑 cargo test 不需要 tmux 安装
+- **`/exit /compact /new` 透传更干净**:无 prefix key 概念,这些指令是原样字节流,不会被 rmux 解释(tmux 的 `prefix + d` detach 在某些 ANSI 序列下偶尔误触)
+- **支持 batch 操作**:`rmux send --to-all-matching 'ccteam-chat-*' '/compact'`一次性给所有 chat bot compaction,tmux 要 shell `for` 循环
+- **支持 session fork**(可选):`rmux fork <name> <new_name>` 复制 env+cwd+history,跑双假设并行(agent A/B 测试场景)
+- **不强加键绑哲学**:tmux `Ctrl-b` / screen `Ctrl-a` 都是 prefix 心智负担;rmux attach 默认 `Ctrl-]` (telnet/ssh 风格,大家都会),不与任何 shell 应用冲突
+
+### 10.2 与 Helvesec/rmux 上游的选择对比
+
+| 决策点 | Helvesec/rmux | ccteam 视角推荐 |
+|---|---|---|
+| tmux CLI 兼容 | 全 90 命令兼容(易迁移) | **部分兼容**(只兜底 11 命令)— ccteam 不需要 tmux 迁移群体 |
+| binary 形态 | 独立 `rmux` daemon + CLI | **可选库化** — daemon 可折入 `ccteam` 进程(类 F130 IM supervisor 模式),省一个 binary |
+| 复用上游? | — | **强推**先用 Helvesec/rmux 做 W3 spike;若 SDK 够用、license 兼容,直接依赖,自己只写 ccteam-side adapter,**砍 60% 工作量** |
+| 协议 | typed SDK(Playwright-style) | RPC schema 上 ccteam 与之对齐(ensure_session / wait_for_text / snapshot 直接借)|
+
+**新增推荐**:V0.7 doc-first kickoff 第一步先 spike Helvesec/rmux 是否能直接当依赖。如果能,Option A 估算从 4kLOC → ~1.5kLOC(只写 MuxBackend trait + adapter + ccteam attach 客户端),时间从 6-8 周 → 2-3 周。
+
+---
+
 ## Sources
 
+- [Helvesec/rmux GitHub](https://github.com/helvesec/rmux) — **已有 Rust 实现**,tmux 兼容 CLI + typed SDK + native Linux/macOS/Windows,v0.3.0 (2026-05-23);强推先 spike 复用
+- [rmux.io](https://rmux.io/) — Helvesec rmux 官网 + SDK 文档
+- [Show HN: Rmux Playwright-style SDK](https://news.ycombinator.com/item?id=48219918) — 社区讨论 + 设计动机
+- [Rmux Review on andrew.ooo](https://andrew.ooo/posts/rmux-rust-terminal-multiplexer-agents-review/) — 第三方 review,实测可用度
+- [manaflow-ai/cmux](https://cmux.com/) — macOS 原生竞品(Swift/AppKit),JSON-RPC socket
+- [cmux for Linux (bradwilson331/cmux-linux)](https://github.com/bradwilson331/cmux-linux) — Linux 端口(Rust + GTK4 + Ghostty)
+- [wmux Windows port (amirlehmam/wmux)](https://github.com/amirlehmam/wmux) — Windows 端口
+- [How tmux Became the Runtime for AI Agent Teams](https://dev.to/battyterm/how-tmux-became-the-runtime-for-ai-agent-teams-gmi) — 行业趋势分析
 - [Zellij Modern Alternative to tmux 2026](https://petronellatech.com/blog/zellij-terminal-multiplexer-guide-2026) — Zellij 现状,WASM 插件,terminal-emulator-agnostic
 - [Claude Code Native Zellij support issue #31901](https://github.com/anthropics/claude-code/issues/31901) — 上游 Anthropic 在评估 zellij 作为 agent teams 备选
 - [portable-pty crate](https://lib.rs/crates/portable-pty) — WezTerm 跨平台 PTY 抽象
@@ -290,3 +416,4 @@ ccteam orchestrator / web / cli  ─UDS protocol─►  daemon
 - [tmux-interface-rs](https://github.com/AntonGepting/tmux-interface-rs) — Rust over tmux CLI wrapper(评估为不解决问题)
 - [termwiz tmux_cc module](https://docs.rs/termwiz/latest/termwiz/tmux_cc/index.html) — WezTerm 的 tmux control-mode client
 - [tmux Installing wiki](https://github.com/tmux/tmux/wiki/Installing) — libevent + ncurses + yacc 依赖
+- [libevent.org](https://libevent.org/) — tmux 底层 event loop 实现 + 已知 multithreading 限制
