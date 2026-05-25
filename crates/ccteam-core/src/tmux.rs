@@ -88,6 +88,27 @@ impl TmuxSession {
     /// long phase prompts visible without truncation; user `tmux
     /// attach` resizes to the client window automatically.
     pub fn start(&self, working_dir: &Path, argv: &[&str]) -> Result<()> {
+        self.start_with_env(working_dir, argv, &[])
+    }
+
+    /// Like [`start`](Self::start) but injects extra environment
+    /// variables into the new session via `tmux new-session -e KEY=VAL`.
+    /// Each `(key, value)` pair becomes a single `-e KEY=VAL` flag placed
+    /// before `-s <name>` (the position tmux requires). Values are passed
+    /// via `Command::arg` so embedded whitespace or shell metacharacters
+    /// survive without manual quoting.
+    ///
+    /// Chat-mode spawn uses this to forward `CCTEAM_CHAT_ROLE` /
+    /// `CCTEAM_CHAT_SLUG` to the Claude Code hook subprocess so it can
+    /// derive the bot's role correctly when emitting `chat_*` progress
+    /// events (otherwise role lands as `""` and per-bot turns.jsonl /
+    /// active-session-id marker can't be addressed).
+    pub fn start_with_env(
+        &self,
+        working_dir: &Path,
+        argv: &[&str],
+        env: &[(&str, &str)],
+    ) -> Result<()> {
         if self.exists() {
             bail!("tmux session already exists: {}", self.name);
         }
@@ -99,9 +120,11 @@ impl TmuxSession {
             .ok_or_else(|| anyhow!("working_dir is not valid UTF-8: {}", working_dir.display()))?;
 
         let mut cmd = Command::new("tmux");
+        cmd.arg("new-session").arg("-d");
+        for (key, value) in env {
+            cmd.arg("-e").arg(format!("{key}={value}"));
+        }
         cmd.args([
-            "new-session",
-            "-d",
             "-s",
             &self.name,
             "-c",

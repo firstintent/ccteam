@@ -46,7 +46,7 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use crate::execution::transcript_tail::{
-    self, anthropic_project_dir, cursor_path, discover_active_session, encode_project_cwd,
+    self, active_session_id_path, anthropic_project_dir, cursor_path, encode_project_cwd,
     PendingTools, TranscriptCursor,
 };
 use crate::execution::turns_mirror;
@@ -144,6 +144,15 @@ pub fn ensure_chat_hooks_installed(project_dir: &Path, hook_sh: &str) -> Result<
 
 fn claude_bin() -> String {
     std::env::var(CLAUDE_BIN_ENV).unwrap_or_else(|_| "claude".to_string())
+}
+
+/// Build the env var pairs forwarded into the tmux session at spawn so
+/// the Claude Code hook subprocess can derive role/slug. The hook reads
+/// `CCTEAM_CHAT_ROLE` via `std::env::var`; without these the hook's
+/// `derive_role_from_payload` falls back to `None` and every chat-mode
+/// progress event ships with `role=""`.
+fn chat_spawn_env<'a>(role: &'a str, slug: &'a str) -> Vec<(&'static str, &'a str)> {
+    vec![("CCTEAM_CHAT_ROLE", role), ("CCTEAM_CHAT_SLUG", slug)]
 }
 
 /// F164 — Probe whether a tmux session's pane process looks like a
@@ -289,8 +298,9 @@ impl HarnessAdapter for ClaudeTuiAdapter {
                     "--resume",
                     &session_id_name,
                 ];
+                let env = chat_spawn_env(&spec.role, &ctx.slug);
                 session
-                    .start(&ctx.cwd, &argv)
+                    .start_with_env(&ctx.cwd, &argv, &env)
                     .map_err(|e| HarnessError::SpawnFailed(format!("tmux start: {e}")))?;
 
                 // Detect `--resume` failure: claude exits non-zero quickly
@@ -318,8 +328,9 @@ impl HarnessAdapter for ClaudeTuiAdapter {
                         "--name",
                         &session_id_name,
                     ];
+                    let env = chat_spawn_env(&spec.role, &ctx.slug);
                     session
-                        .start(&ctx.cwd, &fresh_argv)
+                        .start_with_env(&ctx.cwd, &fresh_argv, &env)
                         .map_err(|e| HarnessError::SpawnFailed(format!("tmux start fresh: {e}")))?;
                     // Best-effort emit `chat_session_reset` with
                     // explicit reason so IM / web surfaces show the
@@ -354,8 +365,9 @@ impl HarnessAdapter for ClaudeTuiAdapter {
                 "--name",
                 &session_id_name,
             ];
+            let env = chat_spawn_env(&spec.role, &ctx.slug);
             session
-                .start(&ctx.cwd, &argv)
+                .start_with_env(&ctx.cwd, &argv, &env)
                 .map_err(|e| HarnessError::SpawnFailed(format!("tmux start: {e}")))?;
         }
 
@@ -637,10 +649,15 @@ async fn tail_loop(
         "claude-tui tail: inotify watcher armed (parent dir CREATE+MODIFY)"
     );
 
-    // One initial sweep — `read_new` against the most-recently-modified
-    // session file. Catches any content written between Claude start
-    // and our watcher arming.
-    if let Some((sid, path)) = discover_active_session(&cwd) {
+    // F177 — initial sweep targets the marker's sid. The marker is
+    // written by the chat-progress hook on SessionStart and carries
+    // Anthropic's real session_id. Each bot in a squad has its own
+    // marker under `<project>/.ccteam/chat/<role>/active-session-id`
+    // so three bots in one project dir never cross-fire (the V0.6.7
+    // fan-out bug — three tail loops all read whichever jsonl was
+    // most recently modified).
+    let marker_file = active_session_id_path(&project_dir, &role);
+    if let Some((sid, path)) = read_marker_target(&marker_file, &parent_dir) {
         if cursor.switch_session(&sid, encode_project_cwd(&cwd)) {
             pending.clear();
         }
@@ -660,6 +677,11 @@ async fn tail_loop(
                 if !matches!(evt.kind, EventKind::Create(_) | EventKind::Modify(_)) {
                     continue;
                 }
+                // Re-read the marker on every fs event — `/clear` /
+                // `/compact` rotates the sid and the hook overwrites
+                // the marker. Skip if missing (hook hasn't fired yet
+                // → wait for next event).
+                let Some(target_sid) = read_marker_sid(&marker_file) else { continue };
                 for affected in evt.paths.iter() {
                     if affected.extension().and_then(|s| s.to_str()) != Some("jsonl") {
                         continue;
@@ -667,6 +689,13 @@ async fn tail_loop(
                     let Some(sid) = affected.file_stem().and_then(|s| s.to_str()) else {
                         continue;
                     };
+                    // F177 — only drain the bot's target jsonl. Other
+                    // bots in the same project dir write their own
+                    // jsonls; we must NOT read them here or we fan-
+                    // out the same content to every bot's IM channel.
+                    if sid != target_sid {
+                        continue;
+                    }
                     // Switch via `TranscriptCursor::switch_session` so a
                     // sid we've seen before resumes at its prior offset
                     // — never re-reads. Closes the main-session ↔
@@ -682,9 +711,9 @@ async fn tail_loop(
                 // Safety-net poll. inotify rarely drops events on local
                 // ext4/btrfs, but a half-flushed line that didn't fire
                 // a MODIFY yet, or a fs that buffers writes, can leave
-                // bytes on disk we haven't observed. Just re-discover +
-                // read_new; usually a no-op.
-                if let Some((sid, path)) = discover_active_session(&cwd) {
+                // bytes on disk we haven't observed. Re-read marker +
+                // drain the targeted jsonl.
+                if let Some((sid, path)) = read_marker_target(&marker_file, &parent_dir) {
                     if cursor.switch_session(&sid, encode_project_cwd(&cwd)) {
                         pending.clear();
                     }
@@ -693,6 +722,34 @@ async fn tail_loop(
             }
         }
     }
+}
+
+/// Read just the sid from `<project>/.ccteam/chat/<role>/active-session-id`.
+/// Returns `None` when the marker is absent (hook hasn't fired yet) or
+/// unreadable. Trims whitespace because the hook writes the raw sid
+/// without a trailing newline but a future writer might.
+fn read_marker_sid(marker: &Path) -> Option<String> {
+    let body = std::fs::read_to_string(marker).ok()?;
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Resolve the marker to a `(sid, transcript_path)` pair the tail loop
+/// can drain. Returns `None` when the marker is missing OR when the
+/// targeted `<sid>.jsonl` doesn't exist yet under `<parent_dir>` — both
+/// are transient cold-start conditions; caller waits for the next fs
+/// event / safety-net tick.
+fn read_marker_target(marker: &Path, parent_dir: &Path) -> Option<(String, PathBuf)> {
+    let sid = read_marker_sid(marker)?;
+    let path = parent_dir.join(format!("{sid}.jsonl"));
+    if !path.exists() {
+        return None;
+    }
+    Some((sid, path))
 }
 
 /// Shared between the inotify-driven path and the safety-net branch:
@@ -741,6 +798,18 @@ async fn tail_loop_polling(
     tx: mpsc::Sender<ThreadEvent>,
 ) {
     let cursor_file = cursor_path(&project_dir, &role);
+    let marker_file = active_session_id_path(&project_dir, &role);
+    let parent_dir = match anthropic_project_dir(&cwd) {
+        Some(p) => p,
+        None => {
+            tracing::warn!(
+                cwd = %cwd.display(),
+                role,
+                "claude-tui tail (polling): HOME unset; cannot resolve anthropic projects dir"
+            );
+            return;
+        }
+    };
     let mut cursor = TranscriptCursor::load(&cursor_file).unwrap_or_default();
     let mut pending = PendingTools::new();
     let mut sleep_ms: u64 = 200;
@@ -749,7 +818,10 @@ async fn tail_loop_polling(
         if tx.is_closed() {
             return;
         }
-        let (sid, transcript_path) = match discover_active_session(&cwd) {
+        // F177 — marker-driven instead of `discover_active_session`.
+        // No fallback to most-recently-modified jsonl; if the hook
+        // hasn't published a marker yet, we wait.
+        let (sid, transcript_path) = match read_marker_target(&marker_file, &parent_dir) {
             Some(pair) => pair,
             None => {
                 tokio::time::sleep(Duration::from_millis(sleep_ms)).await;

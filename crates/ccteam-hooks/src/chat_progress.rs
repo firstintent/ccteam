@@ -25,6 +25,7 @@ use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use std::path::Path;
 
+use ccteam_core::execution::transcript_tail::active_session_id_path;
 use ccteam_core::progress::{
     append_event, build_chat_compact_done_event, build_chat_session_reset_event,
     build_chat_session_started_event, build_chat_turn_completed_event,
@@ -51,7 +52,33 @@ pub fn handle_chat_progress(paths: &CcteamPaths, event: &str, stdin: &Value) -> 
     let target = paths.progress_jsonl_for_context(&context);
 
     let mut ev: Value = match event {
-        "session-start" => build_chat_session_started_event(&role, &project_dir),
+        "session-start" => {
+            // F176 — persist the bot's currently-active Anthropic
+            // session_id so the chat-mode tail loop can target the
+            // correct jsonl deterministically. Without this marker
+            // three bots in one project dir all read whichever jsonl
+            // was most recently modified (the F177 fan-out bug).
+            //
+            // Only write when both role and session_id are present;
+            // otherwise we'd clobber a valid marker with empty data.
+            if !role.is_empty() {
+                if let Some(sid) = stdin.get("session_id").and_then(|v| v.as_str()) {
+                    if !sid.is_empty() {
+                        let marker = active_session_id_path(Path::new(cwd), &role);
+                        if let Err(err) = write_marker_atomic(&marker, sid) {
+                            tracing::warn!(
+                                role = %role,
+                                session_id = %sid,
+                                path = %marker.display(),
+                                error = %err,
+                                "chat-progress: failed to write active-session-id marker"
+                            );
+                        }
+                    }
+                }
+            }
+            build_chat_session_started_event(&role, &project_dir)
+        }
         "user-prompt" => {
             let prompt = stdin.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
             let turn_id = stdin
@@ -89,6 +116,24 @@ pub fn handle_chat_progress(paths: &CcteamPaths, event: &str, stdin: &Value) -> 
                 .unwrap_or("other");
             // `/clear` / `clear` `/exit` `exit` all map to session reset.
             if reason == "clear" {
+                // F176 — clear the active-session-id marker on the
+                // rotation event. Other `session-end` reasons (process
+                // exit, daemon kill, network drop) do NOT rotate the
+                // sid — leave the marker alone so the next SessionStart
+                // hook overwrites with the new sid atomically.
+                if !role.is_empty() {
+                    let marker = active_session_id_path(Path::new(cwd), &role);
+                    if marker.exists() {
+                        if let Err(err) = std::fs::remove_file(&marker) {
+                            tracing::warn!(
+                                role = %role,
+                                path = %marker.display(),
+                                error = %err,
+                                "chat-progress: failed to clear active-session-id marker"
+                            );
+                        }
+                    }
+                }
                 build_chat_session_reset_event(&role)
             } else {
                 json!({
@@ -119,6 +164,21 @@ pub fn handle_chat_progress(paths: &CcteamPaths, event: &str, stdin: &Value) -> 
     }
 
     append_event(&target, &ev)?;
+    Ok(())
+}
+
+/// Atomic write of `body` to `path` via `<path>.tmp` + rename. Same
+/// pattern as `TranscriptCursor::save`. Creates parent dirs as needed
+/// because the hook subprocess may race ahead of the orchestrator's
+/// `ensure_dir` call on a brand-new spawn.
+fn write_marker_atomic(path: &Path, body: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| anyhow!("create {}: {e}", parent.display()))?;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, body).map_err(|e| anyhow!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .map_err(|e| anyhow!("rename {} -> {}: {e}", tmp.display(), path.display()))?;
     Ok(())
 }
 

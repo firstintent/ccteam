@@ -177,6 +177,18 @@ pub fn cursor_path(project_dir: &Path, bot_role: &str) -> PathBuf {
     super::turns_mirror::chat_dir(project_dir, bot_role).join("transcript-cursor.json")
 }
 
+/// Path to the marker file holding the bot's currently-active Anthropic
+/// session_id (the `<sid>.jsonl` basename under
+/// `~/.claude/projects/<encoded-cwd>/`). The `chat-progress` hook
+/// rewrites this on every `SessionStart` and clears it on
+/// `SessionEnd { reason: "clear" }`. The chat-mode tail loop reads it
+/// to target the correct jsonl deterministically — three bots in one
+/// project dir each get their own marker, so the tail loops can't
+/// cross-fire.
+pub fn active_session_id_path(project_dir: &Path, bot_role: &str) -> PathBuf {
+    super::turns_mirror::chat_dir(project_dir, bot_role).join("active-session-id")
+}
+
 /// Pick the most recently-modified **main-session** `<sid>.jsonl`
 /// under `~/.claude/projects/<encoded>/`. Returns `None` when the dir
 /// is missing, empty, or contains only subagent jsonls.
