@@ -903,9 +903,22 @@ async fn spawn_outbound_dispatcher(
                 // a synthetic InboxItem directly into the target bot's
                 // mpsc. Logic factored into a pub helper for direct
                 // testability (the dispatcher is otherwise private).
-                let bots_now = list_bots().unwrap_or_default();
-                dispatch_cross_bot_mention(&item, &slug_log, &role_log, &bots_now, &bot_channels)
+                //
+                // Short-circuit when the reply has no `@` at all so the
+                // common (no-mention) case skips the `list_bots()` disk
+                // read. `parse_first_mention` returns None anyway in
+                // that case, but checking here avoids the I/O entirely.
+                if item.content.contains('@') {
+                    let bots_now = list_bots().unwrap_or_default();
+                    dispatch_cross_bot_mention(
+                        &item,
+                        &slug_log,
+                        &role_log,
+                        &bots_now,
+                        &bot_channels,
+                    )
                     .await;
+                }
             }
             Err(err) => {
                 // Don't advance cursor on failure — the safety-net
