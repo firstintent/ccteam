@@ -10,16 +10,16 @@
 | 项 | 值 |
 |---|---|
 | 主分支 main HEAD | 以 `git rev-parse origin/main` 为准 |
-| Workspace version | **`0.6.7`** |
-| 测试 baseline | **`1639/1`**(`cargo test --workspace --locked --no-fail-fast`,1 fail 是 ccteam-web `workflow_summary_reflects_agent_spawn_and_done_events` running_count flake;另 inotify-busy 宿主可见 watcher/SSE 类 transient(WSL2 fs.inotify.max_user_instances=128 易触顶),均不计入 baseline;V0.6.7 install-fix patch **无业务代码改动**,baseline 与 V0.6.6 持平)|
+| Workspace version | **`0.6.8`** |
+| 测试 baseline | **`1549/1`**(`cargo test --workspace --locked --no-fail-fast --exclude ccteam-web`,1 fail 是 inotify-busy 宿主上 `daemon_dm_no_at_mention_auto_routes_to_single_bot` env-race(WSL2 fs.inotify.max_user_instances=128 易触顶,单跑必过);ccteam-web ws_* 测试在本机 hang,CI 跑全 workspace baseline 含 ccteam-web 约 1700/1,1 known flake `workflow_summary_reflects_agent_spawn_and_done_events` running_count)|
 | Clippy | **0 errors + 0 warnings**(`-D warnings` clean)|
-| 代码规模 | ~93 kLOC Rust(workspace,~64 kLOC src + ~29 kLOC tests,不含 references)|
-| 当前最新版 | **V0.6.7**(F174 install-fix ship-blocker patch:`.github/workflows/release.yml` linux build target `x86_64-unknown-linux-gnu` on `ubuntu-latest` → musl static dual-arch(`x86_64-unknown-linux-musl` on `ubuntu-latest` + `aarch64-unknown-linux-musl` on `ubuntu-24.04-arm`)+ npm lockfile fast-path 条件收紧到 `runner.arch == 'X64'` + static-link sanity step;`install.sh` `linux-aarch64`/`linux-arm64` 从 error → `SUFFIX=linux-arm64`。修复 V0.6.6 prebuilt binary 在 glibc 2.35 / 老 NAS 系统 `GLIBC_2.39 not found` 装不上的 ship-blocker。0 行 ccteam 业务代码改动)— 详 `docs/versions/v0-6-7/README.md` |
-| 上一版 | **V0.6.6**(F166-F173 共 8 finding + F172 V2 redesign + Claude Code plugin marketplace chore:F166 GH Releases prebuilt binary + `install.sh` 一键装 / F167 `/ccteam-creator` per-project-type sensible defaults + `ccteam probe-project --json` / F168 active TODO sweep 6 V0.7-defer-with-justification + 3 sister-finding cover / F169 `nl_admin::cost_today` 接真 `ccteam_cost` ledger / F170 doc-comment scrub 4 sites / F171 `ccteam doctor --verify-mcp` + STUB_TOOLS static assertion / F172 V2 tmux mode-3 上下文恢复借 Anthropic 官方 `claude --resume <name>` lossless 续接(V1 chat_snapshot 设计 ditch)/ F173 Codex daemon-routed critic 统一 cost rollup(F156 follow-through))— 详 `docs/versions/v0-6-6/README.md` |
-| 上上版 | **V0.6.5**(F146-F165 共 20 finding:Epic E MCP chat 桥 + Epic F advise/Codex critic + Epic G UX cohesion + Epic H 运维健壮性 + 中途 F165 mcp-serve tracing→stderr)— 详 `docs/versions/v0-6-5/README.md` |
-| V0.6.4 注 | **V0.6.4** OutboundCursor race fix(NAS 上 Telegram duplicate flood 排错产出,无独立 docs dir,见 commit `504c208`)|
-| V0.6.x 延期候选 | 空(本版闭所有 retained risk;V0.6.7 是 V0.6.6 install-path ship-blocker 紧急 patch,业务代码不动)|
-| V0.7 主线候选 | Epic C 国内 IM(WeChat / 飞书 / DingTalk / QQ)启用 + Slack inbound HTTP + Socket Mode(F168 anchor `TODO(V0.7-{im-providers,slack-inbound,slack-socket-mode})`)+ chat memory 跨设备同步 + monorepo-aware `.mcp.json` + migrate-from-claude + 6 号编排模式深化(HumanApproval × bg/chat 矩阵全开;`HumanApprovalAdapter` full wrapper F168 anchor `TODO(V0.7-human-approval-adapter)`)+ `/ccteam-creator` 完整 template library + LLM-assisted role auto-gen(F167 only 做 sensible defaults 探测)+ per-bot `chat_handle` schema(F168 anchor `TODO(V0.7-chat-handle)` + `TODO(V0.7-listbots-cache)`)|
+| 代码规模 | ~96 kLOC Rust(workspace,~66 kLOC src + ~30 kLOC tests,不含 references)|
+| 当前最新版 | **V0.6.8**(F175-F203 共 29 finding,围绕 chat-mode squad 模式深度修复:F175-F177 fan-out 修复(tmux env + hook marker + tail loop)/ F178-F179 install + skill polish / F180-F184 chat_handle schema + auto-mint nicknames + unknown-handle UX / F185 BotRegistration.project_dir / F186-F187 hook HTTP header env injection + tail missed-marker WARN / F188-F189 chat-squad template schema sync + N-agent / F190 MailboxResolver config.yaml fallback / F191 handle override SKILL / F192 Codex doctor canary + retry cap + permanent-failure / F193 bot-to-bot @mention via daemon mpsc / F194-F195 DM multi-bot hint + per-turn timeout watchdog / F196 SessionStart marker self-heal / F197-F198 ccteam-creator bootstrap state.json + hook.sh wiring / F199-F200 outbound from-prefix + squad teammate awareness in persona / F201 plugin manifest version sync + CI gate / F202 ccteam admin register-bot/unregister-bot CLI / F203 init --force self-repo)— 详 `docs/versions/v0-6-8/README.md` |
+| 上一版 | **V0.6.7**(F174 install-fix ship-blocker patch:musl static dual-arch + linux-arm64 prebuilt + install.sh `linux-arm64` 支持;0 行 ccteam 业务代码改动)— 详 `docs/versions/v0-6-7/README.md` |
+| 上上版 | **V0.6.6**(F166-F173:零摩擦 install.sh + F167 creator sensible defaults + F168 active TODO sweep + F172 V2 mode-3 上下文恢复 via `claude --resume <name>` + F173 Codex daemon-routed critic 统一 cost rollup)— 详 `docs/versions/v0-6-6/README.md` |
+| V0.6.4 注 | **V0.6.4** OutboundCursor race fix(无独立 docs dir,见 commit `504c208`)|
+| V0.6.x 延期候选 | 空(V0.6.8 闭所有 retained risk)|
+| V0.7 主线候选 | Epic C 国内 IM(WeChat / 飞书 / DingTalk / QQ)启用 + Slack inbound HTTP + Socket Mode(F168 anchor `TODO(V0.7-{im-providers,slack-inbound,slack-socket-mode})`)+ chat memory 跨设备同步 + monorepo-aware `.mcp.json` + migrate-from-claude + 6 号编排模式深化(HumanApproval × bg/chat 矩阵全开;`HumanApprovalAdapter` full wrapper F168 anchor `TODO(V0.7-human-approval-adapter)`)+ `/ccteam-creator` 完整 template library + LLM-assisted role auto-gen + `listbots-cache`(F168 anchor `TODO(V0.7-listbots-cache)`)+ workflow.yaml `chat.turn_timeout_sec` plumb 进 tick_supervisors(F195 caveat)|
 | 历史版本 | V0.1 → V0.6.5 见各自 `docs/versions/v0-X-Y/README.md`(V0.6.4 仅 commit,无 dir)|
 
 **ccteam 是 Claude Code 之上的元工具**(V0.4.0+,V0.6.0 起转 product-ready 元 AI 团队)。架构 5 块:
@@ -45,13 +45,13 @@
 | 6 | `docs/ccteam-as-domain-agnostic-orchestrator.md` | 加新 team / 改红线时 |
 | 7 | `docs/claude-code-best-practices.md` | 改 agent prompt / hooks / context 管理时 |
 | 8 | `docs/claude-code-tool-surface.md` | 改 workflow.yaml + agent .md 时 |
-| 9 | `docs/versions/v0-6-6/README.md` | 看当前版本(V0.6.6 patch:F166-F173 — 零摩擦安装 + V0.6.5 后清扫 + mode-3 上下文恢复 via `claude --resume <name>` + Codex critic unified cost rollup)|
-| 10 | `docs/versions/v0-6-5/README.md` | 上版(V0.6.5:F146-F165 — Epic E chat MCP 桥 + Epic F advise/Codex critic + Epic G UX cohesion + Epic H 运维健壮性)|
-| 11 | `docs/versions/v0-6-3/README.md` | V0.6.3:F142 cron + F143 webhook + F144 vendor-seam + F145 squad routing |
-| 12 | `docs/versions/v0-6-2/README.md` | V0.6.2:F140 per-role `scope` |
+| 9 | `docs/versions/v0-6-8/README.md` | 看当前版本(V0.6.8:F175-F203 — chat-mode squad 深度修复:fan-out 修复 + chat_handle schema + bot-to-bot @mention via mpsc + creator bootstrap + squad teammate awareness + multi-bot UX + Codex retry cap + marker self-heal + plugin sync + register CLI)|
+| 10 | `docs/versions/v0-6-7/README.md` | 上版(V0.6.7:F174 install-fix musl static dual-arch)|
+| 11 | `docs/versions/v0-6-6/README.md` | 上上版(V0.6.6:F166-F173 — 零摩擦 install.sh + creator sensible defaults + mode-3 lossless resume + Codex critic unified cost)|
+| 12 | `docs/versions/v0-6-5/README.md` | V0.6.5:F146-F165 — Epic E chat MCP 桥 + Epic F advise/Codex critic + Epic G UX cohesion + Epic H 运维健壮性 |
 | 13 | `docs/versions/v0-6-1/README.md` | V0.6.1:Epic D/E/F + F98 + F119-F139 |
 
-**起手 30 秒**:`git log -1` 看 HEAD → `cargo test --workspace 2>&1 | awk '/^test result/{p+=$4;f+=$6}END{print p,f}'` 校 1639/1 → 读用户诉求 → 干。
+**起手 30 秒**:`git log -1` 看 HEAD → `cargo test --workspace --exclude ccteam-web 2>&1 | awk '/^test result/{p+=$4;f+=$6}END{print p,f}'` 校 1549/1 → 读用户诉求 → 干。
 
 **对照参考**(`references/` gitignore 不入库):`references/claude-code/`(Anthropic Claude Code 源码)+ `references/codex/codex-rs/`。HarnessAdapter / 协议适配时翻;**不**当 ccteam 依赖。
 

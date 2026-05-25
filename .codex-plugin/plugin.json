@@ -1,6 +1,6 @@
 {
   "name": "ccteam",
-  "version": "0.6.7",
+  "version": "0.6.8",
   "description": "Multi-vendor (Claude + Codex) AI dev-team orchestration: 7 skills + 27 MCP tools + IM bots + dual-LLM voting.",
   "author": {
     "name": "FirstIntent"
