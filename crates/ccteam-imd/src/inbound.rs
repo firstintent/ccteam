@@ -10,6 +10,7 @@
 //! per bot); this module's responsibility ends at writing the
 //! mailbox file the adapter watches.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -110,29 +111,68 @@ pub trait MailboxResolver: Send + Sync {
 }
 
 /// Default resolver: rooted at the bot's chat dir
-/// (`<project>/.ccteam/chat/<role>/inbox/`). When the registration
-/// carries an explicit `project_dir`, that absolute path is used
-/// directly; otherwise the resolver joins the configured
-/// `projects_root` with `workflow_slug` for the legacy layout.
+/// (`<project>/.ccteam/chat/<role>/inbox/`). Resolution honors the
+/// three-tier F190 priority chain (see
+/// [`crate::resolve_project_dir`]):
+///
+/// 1. `reg.project_dir` (F185 explicit field).
+/// 2. `config_projects[reg.workflow_slug]` (F190 —
+///    `~/.ccteam/config.yaml::projects[]` slug → path SoT). Daemon
+///    loads this once at startup and passes it in via
+///    [`Self::with_config_projects`]; legacy registrations without an
+///    explicit `project_dir` route correctly even when the project
+///    lives outside `~/projects/<slug>/` (NAS share, dir basename ≠
+///    workflow slug).
+/// 3. `<projects_root>/<workflow_slug>/` (historical layout).
+///
 /// `projects_root` is normally `~/projects` (production) but tests
-/// pass an override via [`Self::with_projects_root`].
+/// pass an override via [`Self::with_projects_root`]. Tests that want
+/// to assert the config-yaml tier construct with
+/// [`Self::with_config_projects`].
 pub struct DefaultMailboxResolver {
     projects_root: PathBuf,
+    /// V0.6.8 F190 — slug → absolute project path map sourced from
+    /// `~/.ccteam/config.yaml::projects[]`. Empty when the resolver was
+    /// constructed without config (legacy code path / unit tests that
+    /// don't exercise the F190 tier).
+    config_projects: HashMap<String, PathBuf>,
 }
 
 impl DefaultMailboxResolver {
-    /// Build pointing at `~/projects` (or `/` if HOME is unset).
+    /// Build pointing at `~/projects` (or `/` if HOME is unset). No
+    /// config-yaml tier — callers that want F190 behavior should use
+    /// [`Self::with_config_projects`].
     pub fn new() -> Self {
         let projects_root = dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("/"))
             .join("projects");
-        Self { projects_root }
+        Self {
+            projects_root,
+            config_projects: HashMap::new(),
+        }
     }
 
-    /// Build pointing at an explicit projects root (tests).
+    /// Build pointing at an explicit projects root (tests). No
+    /// config-yaml tier — see [`Self::with_config_projects`].
     pub fn with_projects_root(projects_root: impl Into<PathBuf>) -> Self {
         Self {
             projects_root: projects_root.into(),
+            config_projects: HashMap::new(),
+        }
+    }
+
+    /// V0.6.8 F190 — build with both `projects_root` and the
+    /// `~/.ccteam/config.yaml::projects[]` slug → path map. Daemon
+    /// startup wires this so legacy registrations with
+    /// `project_dir = None` resolve through the config-yaml tier
+    /// before falling through to the projects_root tier.
+    pub fn with_config_projects(
+        projects_root: impl Into<PathBuf>,
+        config_projects: HashMap<String, PathBuf>,
+    ) -> Self {
+        Self {
+            projects_root: projects_root.into(),
+            config_projects,
         }
     }
 }
@@ -145,7 +185,9 @@ impl Default for DefaultMailboxResolver {
 
 impl MailboxResolver for DefaultMailboxResolver {
     fn inbox_dir(&self, reg: &crate::BotRegistration) -> Result<PathBuf> {
-        Ok(crate::chat_inbox_dir(&self.projects_root, reg))
+        Ok(reg
+            .chat_dir_with_config(&self.projects_root, &self.config_projects)
+            .join("inbox"))
     }
 }
 

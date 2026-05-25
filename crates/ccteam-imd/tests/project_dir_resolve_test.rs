@@ -1,26 +1,34 @@
-//! F185 — `BotRegistration.project_dir` path-resolution coverage.
+//! F185 + V0.6.8 F190 — `BotRegistration.project_dir` /
+//! `~/.ccteam/config.yaml::projects[]` path-resolution coverage.
 //!
 //! Anchors the contract `supervisor::bot_dir` /
 //! `inbound::DefaultMailboxResolver::inbox_dir` /
 //! `outbound::{turns_jsonl_path, outbound_cursor_path}` honor on top of
-//! the new optional field:
+//! the F185 optional field + F190 three-tier priority chain:
 //!
 //! 1. When the registration carries an explicit `project_dir`, every
 //!    resolver lays out paths under that absolute path directly.
-//! 2. When `project_dir = None`, every resolver falls back to the
-//!    historical `<projects_root>/<workflow_slug>/.ccteam/chat/<role>/`
-//!    layout — pre-F185 registrations keep routing the same way.
-//! 3. `BotRegistration` serde round-trips the field — JSON with
+//! 2. F190 — when `reg.project_dir = None` AND the bot's slug is
+//!    present in the `config.yaml::projects[]` map, resolvers use the
+//!    config-recorded path. Lets legacy registrations (pre-F185) work
+//!    on hosts whose project lives outside `~/projects/<slug>/`.
+//! 3. When both `reg.project_dir = None` AND the slug is absent from
+//!    config, every resolver falls back to the historical
+//!    `<projects_root>/<workflow_slug>/.ccteam/chat/<role>/` layout.
+//! 4. `BotRegistration` serde round-trips the field — JSON with
 //!    `project_dir` populates it; JSON without it stays `None`
 //!    (the `skip_serializing_if = "Option::is_none"` keeps the wire
 //!    shape clean for legacy callers).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use ccteam_core::harness::AgentVendor;
 use ccteam_imd::inbound::{DefaultMailboxResolver, MailboxResolver};
-use ccteam_imd::supervisor::bot_dir;
-use ccteam_imd::{chat_inbox_dir, chat_reset_signal_path, turns_jsonl_path, BotRegistration};
+use ccteam_imd::supervisor::{bot_dir, bot_dir_with_config};
+use ccteam_imd::{
+    chat_inbox_dir, chat_reset_signal_path, resolve_project_dir, turns_jsonl_path, BotRegistration,
+};
 
 fn mk_reg(slug: &str, role: &str, project_dir: Option<PathBuf>) -> BotRegistration {
     BotRegistration {
@@ -192,4 +200,165 @@ fn project_root_helper_resolves_explicit_and_fallback() {
         reg_fallback.project_root(std::path::Path::new("/home/u/projects")),
         PathBuf::from("/home/u/projects/legacy-slug")
     );
+}
+
+// -------- V0.6.8 F190 — three-tier priority chain coverage ----------
+
+#[test]
+fn resolve_project_dir_prefers_explicit_over_config() {
+    // Tier 1 wins even when tier 2 has a different path: explicit
+    // `reg.project_dir` from F185 is the highest-priority source.
+    let reg = mk_reg(
+        "research-squad",
+        "code-critic",
+        Some(PathBuf::from("/from/explicit")),
+    );
+    let mut cfg: HashMap<String, PathBuf> = HashMap::new();
+    cfg.insert(
+        "research-squad".into(),
+        PathBuf::from("/from/config/should-not-win"),
+    );
+    let got = resolve_project_dir(&reg, std::path::Path::new("/home/u/projects"), &cfg);
+    assert_eq!(got, PathBuf::from("/from/explicit"));
+}
+
+#[test]
+fn resolve_project_dir_uses_config_when_reg_none_and_slug_present() {
+    // Tier 2 — legacy registration (project_dir = None) but slug is in
+    // config.yaml::projects[]. The config path wins over the
+    // projects_root fallback. This is the F190 NAS-share / out-of-tree
+    // project unlock.
+    let reg = mk_reg("nas-bot", "lead", None);
+    let mut cfg: HashMap<String, PathBuf> = HashMap::new();
+    cfg.insert("nas-bot".into(), PathBuf::from("/vol4/1000/ccteam"));
+    let got = resolve_project_dir(&reg, std::path::Path::new("/home/u/projects"), &cfg);
+    assert_eq!(got, PathBuf::from("/vol4/1000/ccteam"));
+}
+
+#[test]
+fn resolve_project_dir_falls_through_to_projects_root_when_slug_absent() {
+    // Tier 3 — neither reg.project_dir nor config map contains the
+    // slug. Resolver falls through to the historical layout.
+    let reg = mk_reg("orphan-slug", "lead", None);
+    let cfg: HashMap<String, PathBuf> = HashMap::new(); // empty
+    let got = resolve_project_dir(&reg, std::path::Path::new("/home/u/projects"), &cfg);
+    assert_eq!(got, PathBuf::from("/home/u/projects/orphan-slug"));
+}
+
+#[test]
+fn resolve_project_dir_falls_through_with_unrelated_config_entries() {
+    // Tier 3 sanity — slug missing from config, but config isn't
+    // empty (other projects present). Still falls through to the
+    // projects_root tier; we don't grab the first entry or anything
+    // silly like that.
+    let reg = mk_reg("orphan", "lead", None);
+    let mut cfg: HashMap<String, PathBuf> = HashMap::new();
+    cfg.insert("other-project".into(), PathBuf::from("/srv/other"));
+    let got = resolve_project_dir(&reg, std::path::Path::new("/home/u/projects"), &cfg);
+    assert_eq!(got, PathBuf::from("/home/u/projects/orphan"));
+}
+
+#[test]
+fn bot_dir_with_config_uses_config_when_reg_none() {
+    let reg = mk_reg("legacy-bot", "lead", None);
+    let mut cfg: HashMap<String, PathBuf> = HashMap::new();
+    cfg.insert("legacy-bot".into(), PathBuf::from("/srv/legacy"));
+    let dir = bot_dir_with_config(std::path::Path::new("/home/u/projects"), &reg, &cfg);
+    assert_eq!(dir, PathBuf::from("/srv/legacy/.ccteam/chat/lead"));
+}
+
+#[test]
+fn bot_dir_with_config_explicit_wins_over_config() {
+    let reg = mk_reg(
+        "any-slug",
+        "lead",
+        Some(PathBuf::from("/from/explicit/project")),
+    );
+    let mut cfg: HashMap<String, PathBuf> = HashMap::new();
+    cfg.insert("any-slug".into(), PathBuf::from("/from/config"));
+    let dir = bot_dir_with_config(std::path::Path::new("/home/u/projects"), &reg, &cfg);
+    assert_eq!(
+        dir,
+        PathBuf::from("/from/explicit/project/.ccteam/chat/lead")
+    );
+}
+
+#[test]
+fn default_mailbox_resolver_consults_config_when_reg_none() {
+    // F190 — resolver constructed via `with_config_projects` honors
+    // tier 2 of the priority chain when the registration lacks an
+    // explicit `project_dir`.
+    let reg = mk_reg("nas-bot", "lead", None);
+    let mut cfg: HashMap<String, PathBuf> = HashMap::new();
+    cfg.insert("nas-bot".into(), PathBuf::from("/vol4/1000/ccteam"));
+    let mailbox = DefaultMailboxResolver::with_config_projects("/home/u/projects", cfg);
+    let dir = mailbox.inbox_dir(&reg).unwrap();
+    assert_eq!(
+        dir,
+        PathBuf::from("/vol4/1000/ccteam/.ccteam/chat/lead/inbox")
+    );
+}
+
+#[test]
+fn default_mailbox_resolver_falls_through_when_slug_absent_from_config() {
+    // F190 — slug not in the config map. Resolver falls through to
+    // projects_root layout (pre-F190 behavior preserved).
+    let reg = mk_reg("orphan", "lead", None);
+    let cfg: HashMap<String, PathBuf> = HashMap::new(); // empty
+    let mailbox = DefaultMailboxResolver::with_config_projects("/home/u/projects", cfg);
+    let dir = mailbox.inbox_dir(&reg).unwrap();
+    assert_eq!(
+        dir,
+        PathBuf::from("/home/u/projects/orphan/.ccteam/chat/lead/inbox")
+    );
+}
+
+#[test]
+fn default_mailbox_resolver_explicit_project_dir_beats_config() {
+    // F190 — when both reg.project_dir AND config map have entries
+    // for the slug, reg.project_dir wins (F185 priority preserved).
+    let reg = mk_reg("dual", "lead", Some(PathBuf::from("/from/explicit")));
+    let mut cfg: HashMap<String, PathBuf> = HashMap::new();
+    cfg.insert("dual".into(), PathBuf::from("/from/config"));
+    let mailbox = DefaultMailboxResolver::with_config_projects("/home/u/projects", cfg);
+    let dir = mailbox.inbox_dir(&reg).unwrap();
+    assert_eq!(dir, PathBuf::from("/from/explicit/.ccteam/chat/lead/inbox"));
+}
+
+#[test]
+fn load_config_projects_map_missing_file_returns_empty() {
+    // Simulates a fresh install with no `~/.ccteam/config.yaml`. The
+    // helper must yield an empty map (not an error) so resolvers fall
+    // through cleanly to the projects_root tier.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let got = ccteam_imd::load_config_projects_map(tmp.path()).unwrap();
+    assert!(got.is_empty(), "expected empty map, got {:?}", got);
+}
+
+#[test]
+fn load_config_projects_map_populates_from_config_yaml() {
+    use ccteam_core::config::{save, CcteamConfig, ProjectEntry};
+    let tmp = tempfile::TempDir::new().unwrap();
+    let cfg = CcteamConfig {
+        projects: vec![
+            ProjectEntry {
+                slug: "alpha".into(),
+                path: PathBuf::from("/vol4/alpha"),
+                team: "dev".into(),
+                installed_at: chrono::Utc::now(),
+            },
+            ProjectEntry {
+                slug: "beta".into(),
+                path: PathBuf::from("/srv/beta"),
+                team: "research".into(),
+                installed_at: chrono::Utc::now(),
+            },
+        ],
+        ..Default::default()
+    };
+    save(tmp.path(), &cfg).unwrap();
+    let got = ccteam_imd::load_config_projects_map(tmp.path()).unwrap();
+    assert_eq!(got.len(), 2);
+    assert_eq!(got.get("alpha"), Some(&PathBuf::from("/vol4/alpha")));
+    assert_eq!(got.get("beta"), Some(&PathBuf::from("/srv/beta")));
 }

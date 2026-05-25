@@ -85,7 +85,32 @@ pub struct BotState {
     pub shutting_down: bool,
     /// True once `drain.signal` has been observed (no new turns).
     pub draining: bool,
+    /// V0.6.8 F192c — consecutive `HarnessAdapter::start_thread`
+    /// failures. Incremented in `ensure_started` on adapter error,
+    /// reset to 0 on a successful start. Cap is
+    /// [`MAX_START_THREAD_ATTEMPTS`]; on hitting the cap the supervisor
+    /// flips [`Self::permanent_failure`] and stops retrying.
+    pub fail_count: u32,
+    /// V0.6.8 F192c — once the supervisor has burned through
+    /// [`MAX_START_THREAD_ATTEMPTS`] consecutive `start_thread`
+    /// failures, this flag latches `true`. `decide_with_config`
+    /// short-circuits to `Quarantine` on every subsequent tick so the
+    /// daemon stops spamming identical WARN entries every 5 seconds.
+    /// Recovery: `ccteam restart-bot <slug>/<role>` (which removes the
+    /// registration and re-registers, building a fresh `BotState`) or
+    /// a daemon restart.
+    pub permanent_failure: bool,
 }
+
+/// V0.6.8 F192c — maximum consecutive `start_thread` attempts before
+/// the supervisor latches `permanent_failure`. After this many
+/// back-to-back failures the supervisor emits one
+/// `chat_bot_permanent_failure` progress event and stops retrying.
+/// The current tick interval (5s) means the give-up wall-clock is
+/// roughly `MAX_START_THREAD_ATTEMPTS * tick = 15s` — enough to catch
+/// a transient flake on the first or second tick while not letting a
+/// permanently-broken bot flood logs with identical WARNs.
+pub const MAX_START_THREAD_ATTEMPTS: u32 = 3;
 
 /// Decision the supervisor makes for one bot on a single tick.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,13 +151,32 @@ pub fn refresh_global_heartbeat() -> Result<()> {
 ///
 /// Pure decision function — no IO besides reading existing signal
 /// files + heartbeat file. The daemon's main loop applies the action.
+/// Wrapper around [`decide_with_config`] that passes an empty config
+/// map (the daemon's production path uses the config-aware form so
+/// F190's `~/.ccteam/config.yaml::projects[]` tier applies).
 pub fn decide(
     projects_root: &Path,
     reg: &BotRegistration,
     state: &BotState,
     now: SystemTime,
 ) -> SupervisorAction {
-    let bot_dir = bot_dir(projects_root, reg);
+    decide_with_config(projects_root, reg, state, now, &HashMap::new())
+}
+
+/// V0.6.8 F190 — config-yaml-aware variant of [`decide`]. The daemon's
+/// `tick_supervisors` reads `~/.ccteam/config.yaml::projects[]` once at
+/// startup and threads the slug → path map through this entry so a
+/// legacy bot (no `reg.project_dir`) whose project lives outside the
+/// projects_root tree still hits the right bot_dir for signal /
+/// heartbeat checks.
+pub fn decide_with_config(
+    projects_root: &Path,
+    reg: &BotRegistration,
+    state: &BotState,
+    now: SystemTime,
+    config_projects: &HashMap<String, PathBuf>,
+) -> SupervisorAction {
+    let bot_dir = bot_dir_with_config(projects_root, reg, config_projects);
 
     // Layer A — shutdown beats everything else (terminal).
     if signal_present(&bot_dir, SHUTDOWN_SIGNAL) || state.shutting_down {
@@ -148,9 +192,24 @@ pub fn decide(
     // restart loop, but loses to shutdown / drain (terminal states).
     // Independent of restart budget — a manual reset is an intentional
     // action, not a flap, and should always succeed even when the bot
-    // has burned through its hourly Restart budget.
+    // has burned through its hourly Restart budget. Reset also clears
+    // F192c `permanent_failure` (the supervisor's `reset_session`
+    // wipes `fail_count` + `permanent_failure` so a recovered config
+    // can retry).
     if signal_present(&bot_dir, RESET_SIGNAL) {
         return SupervisorAction::ResetSession;
+    }
+
+    // V0.6.8 F192c — `start_thread` retry budget exhausted. The
+    // supervisor's `ensure_started` flips this latch after
+    // `MAX_START_THREAD_ATTEMPTS` consecutive failures and emits one
+    // `chat_bot_permanent_failure` progress event. Subsequent ticks
+    // return `Quarantine` so the daemon stops spamming identical
+    // WARNs every 5 seconds. User-issued reset / drain / shutdown
+    // still cut through above; Quarantine maps to `NoOp` in
+    // `apply_action`, no further adapter calls are made.
+    if state.permanent_failure {
+        return SupervisorAction::Quarantine;
     }
 
     // Layer C — restart budget exhausted → quarantine.
@@ -189,8 +248,27 @@ pub fn decide(
 /// registration time). Falls back to the historical
 /// `<projects_root>/<workflow_slug>/.ccteam/chat/<role>/` layout for
 /// pre-F185 registrations that have `project_dir = None`.
+///
+/// F190 wrapper — see [`bot_dir_with_config`] for the config-yaml-aware
+/// resolver the daemon uses; this base form keeps the legacy / test
+/// signature stable (callers without a config map pass through here).
 pub fn bot_dir(projects_root: &Path, reg: &BotRegistration) -> PathBuf {
     reg.chat_dir(projects_root)
+}
+
+/// V0.6.8 F190 — config-yaml-aware variant of [`bot_dir`]. Resolves
+/// `<project>/.ccteam/chat/<role>/` honoring the full three-tier
+/// priority chain (`reg.project_dir` → `config_projects[slug]` →
+/// `<projects_root>/<slug>/`). Daemon `tick_supervisors` uses this
+/// via [`decide_with_config`] so legacy bots whose project lives
+/// outside the projects_root tree hit the right signal / heartbeat
+/// path.
+pub fn bot_dir_with_config(
+    projects_root: &Path,
+    reg: &BotRegistration,
+    config_projects: &HashMap<String, PathBuf>,
+) -> PathBuf {
+    reg.chat_dir_with_config(projects_root, config_projects)
 }
 
 fn signal_present(bot_dir: &Path, name: &str) -> bool {
@@ -227,6 +305,14 @@ pub struct BotSupervisor {
     pub reg: BotRegistration,
     /// Projects root (`<projects_root>/<slug>/.ccteam/chat/<role>/`).
     pub projects_root: PathBuf,
+    /// V0.6.8 F190 — `~/.ccteam/config.yaml::projects[]` slug → path
+    /// map. Daemon loads this once at startup and passes it through
+    /// [`Self::new_with_config`] so legacy bots (no `reg.project_dir`)
+    /// whose project lives outside the projects_root tree still
+    /// resolve correctly via the F190 tier of
+    /// [`crate::resolve_project_dir`]. Empty map for tests / callers
+    /// that skip the config tier.
+    pub config_projects: HashMap<String, PathBuf>,
     /// Wave 3 — the adapter the daemon picked for this vendor/mode
     /// pair. Owned via `Arc` so the supervisor can hand a clone to
     /// the outbound tail task.
@@ -275,15 +361,33 @@ impl std::fmt::Debug for BotSupervisor {
 
 impl BotSupervisor {
     /// Build a fresh supervisor for `reg`, using `adapter` for every
-    /// HarnessAdapter call. Initial state is empty (no handle).
+    /// HarnessAdapter call. Initial state is empty (no handle). The
+    /// F190 config-yaml tier is empty — callers that want the daemon's
+    /// `~/.ccteam/config.yaml::projects[]` lookup should use
+    /// [`Self::new_with_config`].
     pub fn new(
         reg: BotRegistration,
         projects_root: impl Into<PathBuf>,
         adapter: Arc<dyn HarnessAdapter + Send + Sync>,
     ) -> Self {
+        Self::new_with_config(reg, projects_root, adapter, HashMap::new())
+    }
+
+    /// V0.6.8 F190 — full constructor wiring the
+    /// `~/.ccteam/config.yaml::projects[]` slug → path map so
+    /// `project_dir()` / `bot_dir()` resolution honors the F190 tier
+    /// for legacy registrations whose project lives outside the
+    /// projects_root tree.
+    pub fn new_with_config(
+        reg: BotRegistration,
+        projects_root: impl Into<PathBuf>,
+        adapter: Arc<dyn HarnessAdapter + Send + Sync>,
+        config_projects: HashMap<String, PathBuf>,
+    ) -> Self {
         Self {
             reg,
             projects_root: projects_root.into(),
+            config_projects,
             adapter,
             state: Mutex::new(BotState::default()),
             heartbeat_task: Mutex::new(None),
@@ -302,17 +406,21 @@ impl BotSupervisor {
     }
 
     /// `<projects_root>/<slug>/.ccteam/chat/<role>/`. Helper so the
-    /// background tasks share one resolution path with `decide`.
+    /// background tasks share one resolution path with `decide`. F190 —
+    /// honors `config_projects` so the legacy registration tier picks
+    /// the right path out of `~/.ccteam/config.yaml::projects[]`.
     fn bot_dir(&self) -> PathBuf {
-        bot_dir(&self.projects_root, &self.reg)
+        bot_dir_with_config(&self.projects_root, &self.reg, &self.config_projects)
     }
 
     /// Root dir for the project hosting this bot's
     /// `.ccteam/workflow.yaml`. F185 — prefers `reg.project_dir` when
-    /// set; falls back to `<projects_root>/<workflow_slug>/` for
-    /// legacy registrations.
+    /// set; F190 — falls back to `config_projects[slug]` when
+    /// `reg.project_dir = None`; final fallback is the historical
+    /// `<projects_root>/<workflow_slug>/` layout.
     pub fn project_dir(&self) -> PathBuf {
-        self.reg.project_root(&self.projects_root)
+        self.reg
+            .project_root_with_config(&self.projects_root, &self.config_projects)
     }
 
     /// True iff `start_thread` has been called and `close_thread` has
@@ -334,13 +442,117 @@ impl BotSupervisor {
         self.state.lock().await.clone()
     }
 
+    /// V0.6.8 F192b/c — book-keep one `start_thread` failure. Logs a
+    /// WARN line carrying the full anyhow chain (which includes the
+    /// adapter's `SpawnFailed` body — for tmux-backed adapters that's
+    /// `tmux new-session` stderr already embedded), increments
+    /// `BotState::fail_count`, and on hitting
+    /// [`MAX_START_THREAD_ATTEMPTS`] consecutive failures latches
+    /// `BotState::permanent_failure` and emits one
+    /// `chat_bot_permanent_failure` progress event.
+    async fn record_start_failure(&self, err: &anyhow::Error) {
+        let mut st = self.state.lock().await;
+        st.fail_count = st.fail_count.saturating_add(1);
+        let attempts = st.fail_count;
+        let permanent = attempts >= MAX_START_THREAD_ATTEMPTS;
+        if permanent {
+            st.permanent_failure = true;
+        }
+        drop(st);
+
+        // The full anyhow chain (`{err:#}`) includes the underlying
+        // adapter SpawnFailed body, which for tmux-backed adapters
+        // already embeds `tmux new-session` stderr. Truncate to 1 KB
+        // so a perpetually-failing flap doesn't bloat the log file.
+        let chain = format!("{err:#}");
+        let chain_trunc: String = chain.chars().take(1024).collect();
+
+        if permanent {
+            tracing::warn!(
+                slug = %self.reg.workflow_slug,
+                role = %self.reg.role,
+                adapter = self.adapter.name(),
+                attempts,
+                error_chain = %chain_trunc,
+                "F192c: start_thread failed {} times in a row; latching permanent_failure (no more retries)",
+                attempts,
+            );
+            // Best-effort emit `chat_bot_permanent_failure` so IM /
+            // web surfaces show the user the bot is stuck. Path
+            // resolution honors `CCTEAM_HOME` so tests land in their
+            // tempdir layout. A missing CcteamPaths (no env) is the
+            // normal `cargo test` posture — we silently skip the
+            // append; the WARN above is the audit trail.
+            if let Ok(paths) = ccteam_core::CcteamPaths::from_env() {
+                let progress_path = paths.progress_jsonl(&self.reg.workflow_slug);
+                let ev = ccteam_core::progress::build_chat_bot_permanent_failure_event(
+                    &self.reg.role,
+                    &chain_trunc,
+                    attempts,
+                );
+                if let Err(append_err) = ccteam_core::progress::append_event(&progress_path, &ev) {
+                    tracing::warn!(
+                        slug = %self.reg.workflow_slug,
+                        role = %self.reg.role,
+                        error = %append_err,
+                        "F192c: failed to append chat_bot_permanent_failure event to progress.jsonl"
+                    );
+                }
+            }
+        } else {
+            tracing::warn!(
+                slug = %self.reg.workflow_slug,
+                role = %self.reg.role,
+                adapter = self.adapter.name(),
+                attempts,
+                max = MAX_START_THREAD_ATTEMPTS,
+                error_chain = %chain_trunc,
+                "F192b: start_thread failed (attempt {}/{}); will retry next tick",
+                attempts,
+                MAX_START_THREAD_ATTEMPTS,
+            );
+        }
+    }
+
     /// Idempotent: start the underlying tmux session via
     /// `adapter.start_thread` if not already running.
+    ///
+    /// V0.6.8 F192b/c — on `start_thread` failure this method:
+    /// 1. Logs a WARN line carrying the full anyhow error chain
+    ///    (`{err:#}` includes the adapter's `SpawnFailed` body, which
+    ///    for tmux-backed adapters already embeds `tmux new-session`
+    ///    stderr — see `crates/ccteam-core/src/tmux.rs::start_with_env`).
+    /// 2. Increments `BotState::fail_count`. On hitting
+    ///    [`MAX_START_THREAD_ATTEMPTS`] consecutive failures, latches
+    ///    `BotState::permanent_failure = true` and emits one
+    ///    `chat_bot_permanent_failure` progress event so the daemon's
+    ///    next `decide_with_config` short-circuits to `Quarantine` and
+    ///    stops spamming identical WARNs every 5 seconds.
+    /// 3. Returns the underlying error to the caller (daemon's
+    ///    `apply_action`) — `tick_supervisors_with_config` logs at
+    ///    WARN level but continues running other bots.
     pub async fn ensure_started(&self) -> Result<()> {
         {
             let st = self.state.lock().await;
             if st.handle.is_some() {
                 return Ok(());
+            }
+            // V0.6.8 F192c — once we've latched permanent failure,
+            // refuse to retry until reset / restart-bot clears it.
+            // The daemon's tick path returns `Quarantine` first so we
+            // shouldn't normally get here, but `apply_action(Spawn)`
+            // direct callers (e.g. tests) still hit this guard.
+            if st.permanent_failure {
+                return Err(anyhow!(
+                    "bot {}/{} is in permanent_failure state \
+                     (start_thread failed {} times in a row); \
+                     run `ccteam restart-bot {}/{}` or restart the daemon",
+                    self.reg.workflow_slug,
+                    self.reg.role,
+                    st.fail_count,
+                    self.reg.workflow_slug,
+                    self.reg.role,
+                ));
             }
         }
         let spec = AgentSpecBrief {
@@ -358,7 +570,7 @@ impl BotSupervisor {
             // path (try_spawn_with_prompt) plumbs through workflow.yaml.
             model_id: None,
         };
-        let handle = self
+        let start_result = self
             .adapter
             .start_thread(&spec, &ctx)
             .await
@@ -369,9 +581,22 @@ impl BotSupervisor {
                     self.reg.role,
                     self.adapter.name()
                 )
-            })?;
+            });
+        let handle = match start_result {
+            Ok(h) => h,
+            Err(err) => {
+                self.record_start_failure(&err).await;
+                return Err(err);
+            }
+        };
         let mut st = self.state.lock().await;
         st.handle = Some(handle.clone());
+        // V0.6.8 F192c — success path resets the consecutive-failure
+        // counter. (`permanent_failure` is only cleared on reset /
+        // restart-bot; once latched the supervisor refuses to retry
+        // even after a successful manual restart, which is the
+        // intended hard-stop semantic.)
+        st.fail_count = 0;
         drop(st);
         tracing::info!(
             slug = %self.reg.workflow_slug,
@@ -795,8 +1020,18 @@ impl BotSupervisor {
             }
         }
 
-        // 4. Close the old handle (best-effort).
-        let handle = self.state.lock().await.handle.take();
+        // 4. Close the old handle (best-effort). V0.6.8 F192c — also
+        //    clear `fail_count` + `permanent_failure` so reset is a
+        //    legitimate recovery path: an operator who fixed the
+        //    underlying breakage (config typo, missing binary, dead
+        //    tmux session) can re-arm the supervisor by writing
+        //    `signals/reset.signal` instead of restarting the daemon.
+        let handle = {
+            let mut st = self.state.lock().await;
+            st.fail_count = 0;
+            st.permanent_failure = false;
+            st.handle.take()
+        };
         if let Some(h) = handle {
             if let Err(err) = self.adapter.close_thread(&h).await {
                 tracing::warn!(
@@ -1014,6 +1249,114 @@ mod bot_supervisor_tests {
         assert_eq!(stub.starts.load(Ordering::SeqCst), 1);
         sup.apply_action(SupervisorAction::Shutdown).await.unwrap();
         assert_eq!(stub.closes.load(Ordering::SeqCst), 1);
+    }
+
+    // ---- V0.6.8 F192c — start_thread retry budget + permanent failure ----
+
+    #[tokio::test]
+    async fn ensure_started_increments_fail_count_on_spawn_error() {
+        let stub = Arc::new(StubAdapter {
+            fail_start: true,
+            ..StubAdapter::default()
+        });
+        let tmp = TempDir::new().unwrap();
+        let sup = BotSupervisor::new(reg(), tmp.path(), stub.clone());
+
+        // First failure: fail_count -> 1, not yet permanent.
+        let res = sup.ensure_started().await;
+        assert!(res.is_err());
+        let st = sup.state_snapshot().await;
+        assert_eq!(st.fail_count, 1);
+        assert!(!st.permanent_failure);
+
+        // Second failure: fail_count -> 2, still not permanent.
+        let res = sup.ensure_started().await;
+        assert!(res.is_err());
+        let st = sup.state_snapshot().await;
+        assert_eq!(st.fail_count, 2);
+        assert!(!st.permanent_failure);
+
+        // Third failure: fail_count -> 3, latches permanent_failure.
+        let res = sup.ensure_started().await;
+        assert!(res.is_err());
+        let st = sup.state_snapshot().await;
+        assert_eq!(st.fail_count, MAX_START_THREAD_ATTEMPTS);
+        assert!(
+            st.permanent_failure,
+            "expected permanent_failure latch after {MAX_START_THREAD_ATTEMPTS} consecutive fails"
+        );
+
+        // After latching, further `ensure_started` calls refuse without
+        // invoking the adapter. The stub's call counter should not have
+        // ticked past 3 — proving "no more retries" once latched.
+        let _ = sup.ensure_started().await;
+        assert_eq!(
+            stub.starts.load(Ordering::SeqCst),
+            MAX_START_THREAD_ATTEMPTS as usize,
+            "F192c: latched supervisor MUST NOT invoke adapter.start_thread again"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_started_resets_fail_count_on_success() {
+        let stub = Arc::new(StubAdapter::default()); // succeeds
+        let tmp = TempDir::new().unwrap();
+        let sup = BotSupervisor::new(reg(), tmp.path(), stub.clone());
+        // Pre-seed fail_count to simulate one earlier transient failure.
+        {
+            let mut st = sup.state.lock().await;
+            st.fail_count = 2;
+            assert!(!st.permanent_failure);
+        }
+        sup.ensure_started().await.unwrap();
+        let st = sup.state_snapshot().await;
+        assert_eq!(
+            st.fail_count, 0,
+            "successful start_thread must reset fail_count"
+        );
+        assert!(!st.permanent_failure);
+    }
+
+    #[tokio::test]
+    async fn decide_returns_quarantine_when_permanent_failure_latched() {
+        // Pure decide() check: state.permanent_failure short-circuits
+        // to Quarantine regardless of handle/heartbeat presence, so
+        // the daemon stops re-calling Spawn on a flap-locked bot.
+        let tmp = TempDir::new().unwrap();
+        let r = reg();
+        let st = BotState {
+            permanent_failure: true,
+            fail_count: MAX_START_THREAD_ATTEMPTS,
+            ..Default::default()
+        };
+        let action = decide(tmp.path(), &r, &st, SystemTime::now());
+        assert_eq!(action, SupervisorAction::Quarantine);
+    }
+
+    #[tokio::test]
+    async fn reset_session_clears_permanent_failure() {
+        // F192c — `signals/reset.signal` is the operator's recovery
+        // path. reset_session must wipe both fail_count and the
+        // permanent_failure latch so the next tick can attempt
+        // start_thread again (now that the operator presumably fixed
+        // whatever broke the spawn).
+        let stub = Arc::new(StubAdapter::default()); // will succeed on reset
+        let tmp = TempDir::new().unwrap();
+        let sup = BotSupervisor::new(reg(), tmp.path(), stub.clone());
+        {
+            let mut st = sup.state.lock().await;
+            st.fail_count = MAX_START_THREAD_ATTEMPTS;
+            st.permanent_failure = true;
+        }
+        sup.reset_session().await.unwrap();
+        let st = sup.state_snapshot().await;
+        assert_eq!(st.fail_count, 0);
+        assert!(!st.permanent_failure);
+        assert_eq!(
+            stub.starts.load(Ordering::SeqCst),
+            1,
+            "reset_session ends with one ensure_started call"
+        );
     }
 }
 
