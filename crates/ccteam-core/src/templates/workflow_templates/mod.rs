@@ -113,6 +113,47 @@ impl TemplateCtx {
     }
 }
 
+/// One agent entry the `chat-squad` preset materializes under the
+/// `agents:` map. Held by [`render_agents_block`] so callers can stamp
+/// out an N-agent block instead of being capped at the legacy 3-slot
+/// `role_a` / `role_b` / `role_c` placeholders.
+#[derive(Debug, Clone)]
+pub struct AgentTemplateEntry {
+    /// Role name (will become the `agents.<role>` key). Must match the
+    /// `[a-z0-9_-]` charset enforced by `WorkflowSpec::validate`.
+    pub role: String,
+}
+
+impl AgentTemplateEntry {
+    /// Convenience constructor for the common case (manual trigger,
+    /// max_parallel=1 — the only shape the chat-squad preset emits).
+    pub fn new(role: impl Into<String>) -> Self {
+        Self { role: role.into() }
+    }
+}
+
+/// Render a YAML fragment to fill the `{{agents_block}}` slot in
+/// `chat-squad.yaml`. Each entry produces three lines under a 2-space
+/// indent (matching the outer `agents:` key). The output always ends
+/// with a trailing newline so the template's following section starts
+/// on a fresh line.
+///
+/// Empty input is intentionally rendered as the empty string — the
+/// caller is responsible for asserting at least one agent before
+/// hitting `WorkflowSpec::validate`. See
+/// [`crate::workflow::WorkflowSpec::validate`] for the agents-non-empty
+/// rule (artifact-driven / human-approval modes) and the chat-mode
+/// allow-empty rule.
+pub fn render_agents_block(agents: &[AgentTemplateEntry]) -> String {
+    let mut out = String::with_capacity(agents.len() * 64);
+    for entry in agents {
+        out.push_str("  ");
+        out.push_str(&entry.role);
+        out.push_str(":\n    trigger: manual\n    max_parallel: 1\n");
+    }
+    out
+}
+
 /// Errors returned by [`render`].
 #[derive(Debug, Error)]
 pub enum RenderError {
@@ -244,14 +285,18 @@ pub fn default_ctx(preset: Preset) -> TemplateCtx {
                 .with("owner_chat_id", "123456789");
         }
         Preset::ChatSquad => {
+            // Use 2 agents so the schema gate exercises the N-agent
+            // render path (not just the legacy 3-slot shape).
+            let agents = [
+                AgentTemplateEntry::new("lead"),
+                AgentTemplateEntry::new("critic"),
+            ];
             ctx = ctx
                 .with("primary_bot_handle", "@lead_bot")
-                .with("bot_handles_summary", "@lead_bot, @critic_bot, @scribe_bot")
+                .with("bot_handles_summary", "@lead_bot, @critic_bot")
                 .with("im_platform", "telegram")
                 .with("group_chat_id", "-100123456789")
-                .with("role_a", "lead")
-                .with("role_b", "critic")
-                .with("role_c", "scribe");
+                .with("agents_block", render_agents_block(&agents));
         }
     }
     ctx
@@ -341,9 +386,14 @@ mod tests {
     fn chat_pocket_renders_with_defaults() {
         let out = render(Preset::ChatPocket, &default_ctx(Preset::ChatPocket)).unwrap();
         assert!(out.contains("mode: chat"));
-        assert!(out.contains("bot_name: @demo_bot"));
-        assert!(out.contains("im_platform: telegram"));
+        assert!(out.contains("bot_name: \"@demo_bot\""));
+        // `im_platform` lives only in the header comment now; the
+        // `chat:` block has no such field (ChatSpec doesn't define one).
+        assert!(out.contains("# IM platform: telegram"));
         assert!(out.contains("compact_every_turns: 20"));
+        // `chat_acl` is a struct (`allow_users` / `allow_groups`), not
+        // a list — verify the rendered shape matches ChatAcl.
+        assert!(out.contains("allow_users:"));
         assert!(!out.contains("{{"));
     }
 
@@ -353,7 +403,29 @@ mod tests {
         assert!(out.contains("mode: chat"));
         assert!(out.contains("hop_limit: 3"));
         assert!(out.contains("@lead_bot"));
+        // N-agent block: default ctx ships two agents (lead + critic).
+        assert!(out.contains("  lead:\n    trigger: manual"));
+        assert!(out.contains("  critic:\n    trigger: manual"));
+        // `chat_acl` reshaped into the struct form.
+        assert!(out.contains("allow_groups:"));
         assert!(!out.contains("{{"));
+    }
+
+    #[test]
+    fn render_agents_block_emits_two_space_indent_and_trailing_newline() {
+        let block = render_agents_block(&[
+            AgentTemplateEntry::new("alpha"),
+            AgentTemplateEntry::new("beta"),
+        ]);
+        assert_eq!(
+            block,
+            "  alpha:\n    trigger: manual\n    max_parallel: 1\n  beta:\n    trigger: manual\n    max_parallel: 1\n",
+        );
+    }
+
+    #[test]
+    fn render_agents_block_empty_input_returns_empty_string() {
+        assert_eq!(render_agents_block(&[]), "");
     }
 
     #[test]
