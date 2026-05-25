@@ -40,6 +40,7 @@ pub mod supervisor;
 pub mod three_layer_sec;
 pub mod transport;
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -268,11 +269,37 @@ impl BotRegistration {
     /// registration time). Falls back to the historical
     /// `<projects_root>/<workflow_slug>/` layout for legacy
     /// registrations that have `project_dir = None`.
+    ///
+    /// F190 — consult [`project_root_with_config`](Self::project_root_with_config)
+    /// when the caller has access to `~/.ccteam/config.yaml::projects[]`
+    /// (the slug → path SoT). This base form is kept for callers (MCP
+    /// path helpers, unit tests) that don't have the config map on hand.
     pub fn project_root(&self, projects_root: &Path) -> PathBuf {
         match self.project_dir.as_deref() {
             Some(p) => p.to_path_buf(),
             None => projects_root.join(&self.workflow_slug),
         }
+    }
+
+    /// V0.6.8 F190 — three-tier project-root resolver. Priority chain:
+    ///
+    /// 1. `reg.project_dir` (F185 — written by `chat_register_bot`).
+    /// 2. `config_projects[slug]` (F190 — `~/.ccteam/config.yaml::projects[]`
+    ///    slug → path SoT introduced in V0.4.2 F73).
+    /// 3. `<projects_root>/<workflow_slug>/` (historical layout).
+    ///
+    /// The daemon hands a populated `config_projects` to
+    /// [`DefaultMailboxResolver::with_config_projects`] and
+    /// [`BotSupervisor::new_with_config`] so legacy registrations (no
+    /// `project_dir`) whose project lives outside the home tree
+    /// (NAS shares, dir basename ≠ workflow slug) still route correctly
+    /// without re-registering every bot.
+    pub fn project_root_with_config(
+        &self,
+        projects_root: &Path,
+        config_projects: &HashMap<String, PathBuf>,
+    ) -> PathBuf {
+        resolve_project_dir(self, projects_root, config_projects)
     }
 
     /// Resolve `<project>/.ccteam/chat/<role>/` for this bot. The
@@ -284,6 +311,66 @@ impl BotRegistration {
             .join("chat")
             .join(&self.role)
     }
+
+    /// V0.6.8 F190 — config-yaml-aware companion to [`chat_dir`](Self::chat_dir).
+    /// Same `.ccteam/chat/<role>/` layout, but the project-root tier-2
+    /// lookup picks the path out of `config_projects` when
+    /// `reg.project_dir = None`.
+    pub fn chat_dir_with_config(
+        &self,
+        projects_root: &Path,
+        config_projects: &HashMap<String, PathBuf>,
+    ) -> PathBuf {
+        self.project_root_with_config(projects_root, config_projects)
+            .join(".ccteam")
+            .join("chat")
+            .join(&self.role)
+    }
+}
+
+/// V0.6.8 F190 — three-tier project-root resolver.
+///
+/// Returns the absolute path of the project this bot lives in. Priority
+/// chain (first hit wins):
+///
+/// 1. `reg.project_dir` — F185 explicit field written by
+///    `chat_register_bot` at registration time.
+/// 2. `config_projects[reg.workflow_slug]` — F190 lookup against
+///    `~/.ccteam/config.yaml::projects[]` (the slug → path SoT V0.4.2
+///    F73 introduced). The daemon loads `CcteamConfig` once at startup
+///    and builds this map; pass an empty map when the caller has no
+///    config available (MCP helpers, unit tests).
+/// 3. `projects_root.join(reg.workflow_slug)` — historical
+///    `<projects_root>/<slug>/` layout used by pre-F185 registrations.
+///
+/// The MailboxResolver + BotSupervisor + daemon `tick_supervisors` /
+/// `decide` paths funnel through this helper so the same priority chain
+/// applies everywhere; resolvers don't re-implement the logic.
+pub fn resolve_project_dir(
+    reg: &BotRegistration,
+    projects_root: &Path,
+    config_projects: &HashMap<String, PathBuf>,
+) -> PathBuf {
+    if let Some(p) = reg.project_dir.as_deref() {
+        return p.to_path_buf();
+    }
+    if let Some(p) = config_projects.get(&reg.workflow_slug) {
+        return p.clone();
+    }
+    projects_root.join(&reg.workflow_slug)
+}
+
+/// V0.6.8 F190 — load `~/.ccteam/config.yaml::projects[]` into a
+/// `slug -> absolute path` map suitable for [`resolve_project_dir`].
+///
+/// Errors load loud (corrupt yaml is fail-fast — same semantics as
+/// `ccteam_core::config::load`). A missing / empty file returns an
+/// empty map (no config-yaml tier applies, resolvers fall through to
+/// the projects_root tier).
+pub fn load_config_projects_map(ccteam_root: &Path) -> Result<HashMap<String, PathBuf>> {
+    let cfg = ccteam_core::config::load(ccteam_root)
+        .with_context(|| format!("load ccteam config from {}", ccteam_root.display()))?;
+    Ok(cfg.projects.into_iter().map(|p| (p.slug, p.path)).collect())
 }
 
 /// V0.6.5 F146 — outcome of [`register_bot_checked_in`].

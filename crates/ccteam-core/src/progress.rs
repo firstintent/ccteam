@@ -309,6 +309,34 @@ pub fn build_chat_hop_escalate_event(role: &str, hop_count: u32, last_bot: &str)
     })
 }
 
+/// `chat_bot_permanent_failure` — V0.6.8 F192c. Emitted after a bot's
+/// `HarnessAdapter::start_thread` has failed `MAX_START_THREAD_ATTEMPTS`
+/// times in a row. The supervisor latches `permanent_failure = true`,
+/// stops retrying, and the daemon's tick loop returns `Quarantine` on
+/// every subsequent decision pass for this bot. Recovery requires
+/// `ccteam restart-bot <slug>/<role>` or a daemon restart.
+///
+/// Payload: `{role, reason, attempts, ts}`.
+pub const CHAT_BOT_PERMANENT_FAILURE: &str = "chat_bot_permanent_failure";
+
+/// V0.6.8 F192c — build a `chat_bot_permanent_failure` event JSON.
+/// `reason` is a short human string summarizing the latest failure
+/// (typically the underlying tmux / spawn stderr, truncated to keep
+/// progress.jsonl scannable). `attempts` is the number of consecutive
+/// failed start_thread attempts (always 3 at the moment but kept as a
+/// field so future tuning of `MAX_START_THREAD_ATTEMPTS` lands on the
+/// wire without a schema bump).
+pub fn build_chat_bot_permanent_failure_event(role: &str, reason: &str, attempts: u32) -> Value {
+    let trimmed: String = reason.chars().take(512).collect();
+    serde_json::json!({
+        "event": CHAT_BOT_PERMANENT_FAILURE,
+        "role": role,
+        "reason": trimmed,
+        "attempts": attempts,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
 // ---------------- V0.6.1 F98 plan-approval event kinds ----------------
 
 /// `plan_pending` — agent wrote a plan markdown to

@@ -157,22 +157,40 @@ impl SupervisorRegistry {
     }
 
     /// Add a supervisor for `reg` if one isn't already registered.
-    /// Returns the live (existing-or-new) supervisor handle.
+    /// Returns the live (existing-or-new) supervisor handle. Wrapper
+    /// around [`Self::ensure_with_config`] that passes an empty F190
+    /// config-yaml tier (legacy / test callers without a config map).
     pub fn ensure(
         &mut self,
         reg: &BotRegistration,
         projects_root: &Path,
         factory: &AdapterFactory,
     ) -> Arc<BotSupervisor> {
+        self.ensure_with_config(reg, projects_root, factory, &HashMap::new())
+    }
+
+    /// V0.6.8 F190 — config-yaml-aware companion to [`Self::ensure`].
+    /// Wires the loaded `~/.ccteam/config.yaml::projects[]` slug → path
+    /// map into the new [`BotSupervisor`] so its
+    /// `project_dir()` / `bot_dir()` resolution honors the F190 tier
+    /// for legacy registrations.
+    pub fn ensure_with_config(
+        &mut self,
+        reg: &BotRegistration,
+        projects_root: &Path,
+        factory: &AdapterFactory,
+        config_projects: &std::collections::HashMap<String, PathBuf>,
+    ) -> Arc<BotSupervisor> {
         let k = Self::key(reg);
         self.inner
             .entry(k)
             .or_insert_with(|| {
                 let adapter = factory(reg.vendor);
-                Arc::new(BotSupervisor::new(
+                Arc::new(BotSupervisor::new_with_config(
                     reg.clone(),
                     projects_root.to_path_buf(),
                     adapter,
+                    config_projects.clone(),
                 ))
             })
             .clone()
@@ -220,6 +238,33 @@ where
         .unwrap_or_else(default_adapter_factory);
     let registry: Arc<Mutex<SupervisorRegistry>> =
         Arc::new(Mutex::new(SupervisorRegistry::default()));
+
+    // V0.6.8 F190 — load `~/.ccteam/config.yaml::projects[]` once at
+    // startup so legacy bots (no `reg.project_dir`) whose project
+    // lives outside the projects_root tree resolve correctly. Daemon
+    // restart is the standard "config changed" workflow, so a one-shot
+    // disk read here is enough (no live reload). A missing config.yaml
+    // / parse error yields an empty map; the third tier of
+    // `resolve_project_dir` (projects_root/slug) still applies.
+    let config_projects: std::collections::HashMap<String, PathBuf> = {
+        let ccteam_root = crate::default_ccteam_root_public();
+        match crate::load_config_projects_map(&ccteam_root) {
+            Ok(map) => {
+                tracing::info!(
+                    entries = map.len(),
+                    "F190: loaded ~/.ccteam/config.yaml::projects[] for legacy bot resolution"
+                );
+                map
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "F190: failed to load config.yaml; legacy bots fall through to projects_root/slug"
+                );
+                std::collections::HashMap::new()
+            }
+        }
+    };
 
     // V0.6.1 F132 — projects_root used for both supervisor bot_dir
     // resolution and the mailbox writer. Mirrors `tick_supervisors`'s
@@ -273,8 +318,13 @@ where
     // admin executor). `Arc` so the consumer task owns its own clones
     // without re-locking the daemon loop.
     let sec = Arc::new(Mutex::new(ThreeLayerSec::new(AclPolicy::default())));
-    let mailbox: Arc<dyn MailboxResolver> = Arc::new(DefaultMailboxResolver::with_projects_root(
+    // V0.6.8 F190 — mailbox resolver honors the three-tier project_dir
+    // priority chain (reg.project_dir > config.yaml::projects[slug] >
+    // projects_root/slug). Daemon's `config_projects` map is loaded
+    // above.
+    let mailbox: Arc<dyn MailboxResolver> = Arc::new(DefaultMailboxResolver::with_config_projects(
         projects_root.clone(),
+        config_projects.clone(),
     ));
     let executor = Arc::new(AdminExecutor::new(projects_root.clone()));
 
@@ -331,12 +381,13 @@ where
                         Vec::new()
                     }
                 };
-                tick_supervisors(
+                tick_supervisors_with_config(
                     &bots,
                     &registry,
                     Some(&projects_root),
                     &factory,
                     Some(&bot_channels),
+                    &config_projects,
                 )
                 .await;
                 ensure_bot_channels(
@@ -1174,12 +1225,38 @@ pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
 /// pipeline wired), the cursor reset is skipped and the supervisor's
 /// disk-side wipe still applies; the next `load_from_disk` will pick
 /// up the cleared cursor on the next daemon restart.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn tick_supervisors(
     bots: &[BotRegistration],
     registry: &Arc<Mutex<SupervisorRegistry>>,
     projects_root_override: Option<&Path>,
     factory: &AdapterFactory,
     bot_channels: Option<&BotChannelMap>,
+) {
+    tick_supervisors_with_config(
+        bots,
+        registry,
+        projects_root_override,
+        factory,
+        bot_channels,
+        &HashMap::new(),
+    )
+    .await
+}
+
+/// V0.6.8 F190 — config-yaml-aware companion to [`tick_supervisors`].
+/// Daemon main loop reads `~/.ccteam/config.yaml::projects[]` once at
+/// startup and passes the slug → path map through here so legacy bots
+/// (no `reg.project_dir`) whose project lives outside the
+/// projects_root tree resolve to the right bot_dir for signal /
+/// heartbeat decisions.
+pub(crate) async fn tick_supervisors_with_config(
+    bots: &[BotRegistration],
+    registry: &Arc<Mutex<SupervisorRegistry>>,
+    projects_root_override: Option<&Path>,
+    factory: &AdapterFactory,
+    bot_channels: Option<&BotChannelMap>,
+    config_projects: &HashMap<String, PathBuf>,
 ) {
     let owned;
     let projects_root: &Path = match projects_root_override {
@@ -1192,12 +1269,15 @@ pub(crate) async fn tick_supervisors(
         }
     };
 
-    // First pass: ensure a supervisor exists per bot.
+    // First pass: ensure a supervisor exists per bot. F190 — pass the
+    // config-yaml map so the new supervisor's `project_dir()` /
+    // `bot_dir()` honors the slug → path lookup for legacy
+    // registrations.
     let supervisors: Vec<(BotRegistration, Arc<BotSupervisor>)> = {
         let mut reg = registry.lock().await;
         bots.iter()
             .map(|b| {
-                let sup = reg.ensure(b, projects_root, factory);
+                let sup = reg.ensure_with_config(b, projects_root, factory, config_projects);
                 (b.clone(), sup)
             })
             .collect()
@@ -1205,10 +1285,17 @@ pub(crate) async fn tick_supervisors(
 
     // Second pass: decide + apply per bot (drop the registry lock for
     // each adapter call so a slow start_thread doesn't stall other
-    // bots' decisions).
+    // bots' decisions). F190 — use `decide_with_config` so signal /
+    // heartbeat path resolution mirrors the supervisor's spawn path.
     for (bot, sup) in supervisors {
         let state = sup.state_snapshot().await;
-        let action = supervisor::decide(projects_root, &bot, &state, SystemTime::now());
+        let action = supervisor::decide_with_config(
+            projects_root,
+            &bot,
+            &state,
+            SystemTime::now(),
+            config_projects,
+        );
         tracing::debug!(
             slug = %bot.workflow_slug,
             role = %bot.role,
