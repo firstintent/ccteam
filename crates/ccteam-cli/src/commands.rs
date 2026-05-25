@@ -148,12 +148,17 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
     let target_team = opts.team.clone().unwrap_or_else(|| "dev".to_string());
 
     // -- 3a. Refuse install in the ccteam repo itself ----------------
-    if is_ccteam_repo(&target) {
+    // V0.6.8 F203 — `--force` escape: legitimate self-hosting /
+    // dogfooding / nested-research-project cases need to install a
+    // ccteam project inside the ccteam source tree. The default still
+    // refuses to avoid circular-hook surprises for casual users.
+    if is_ccteam_repo(&target) && !opts.force {
         return Err(anyhow::anyhow!(
             "refusing to install ccteam in the ccteam repo itself: {}\n\n\
              this directory contains the ccteam source — installing here would create \
              a circular hook setup. Pick a different directory (or `cd` into your own project \
-             and re-run).",
+             and re-run), or pass `--force` if you really want a ccteam project inside the \
+             ccteam source repo (e.g. for self-hosting / dogfooding).",
             target.display(),
         ));
     }
@@ -4556,6 +4561,142 @@ pub fn run_admin_add_tool(
     }))?)
 }
 
+/// V0.6.8 F202 — register a chat-mode bot via the CLI (the fallback
+/// when no daemon / MCP server is running). Mirrors the MCP path
+/// `dispatch_register_bot` in `mcp_chat_tools.rs`: same vendor
+/// normalization, same `chat_handle` auto-mint when caller omits it,
+/// same `project_dir` canonicalize + absolute-path guard. Non-clobber:
+/// re-registering an existing `(slug, role)` returns
+/// `ok:false, error:"already_registered"` instead of overwriting.
+#[allow(clippy::too_many_arguments)]
+pub fn run_admin_register_bot(
+    paths: &CcteamPaths,
+    slug: &str,
+    role: &str,
+    vendor_raw: &str,
+    platform_raw: &str,
+    chat_id: &str,
+    chat_handle_in: Option<&str>,
+    project_dir_in: Option<&std::path::Path>,
+) -> Result<String> {
+    use ccteam_core::harness::AgentVendor;
+    use ccteam_imd::{register_bot_checked_in, RegisterOutcome};
+
+    // Slug / role share the same validator as the MCP path
+    // (alphanumeric + `-` + `_`).
+    crate::mcp_chat_tools::validate_slug(slug, "slug")?;
+    crate::mcp_chat_tools::validate_slug(role, "role")?;
+
+    // Vendor: lowercase first so `Claude` still lands in the right variant.
+    let vendor = match vendor_raw.to_lowercase().as_str() {
+        "claude" => AgentVendor::Claude,
+        "codex" => AgentVendor::Codex,
+        other => {
+            return Err(anyhow::anyhow!(
+                "invalid vendor `{other}`: expected one of `claude`, `codex`"
+            ))
+        }
+    };
+
+    // IM platform: same enum the MCP dispatcher uses.
+    match platform_raw {
+        "telegram" | "slack" | "discord" | "mock" => {}
+        other => {
+            return Err(anyhow::anyhow!(
+                "invalid platform `{other}`: expected one of `telegram`, `slack`, `discord`, `mock`"
+            ));
+        }
+    }
+
+    if chat_id.is_empty() {
+        return Err(anyhow::anyhow!("`chat-id` must be non-empty"));
+    }
+
+    // Chat handle: caller wins; absent → auto-mint scientist nickname.
+    let chat_handle = match chat_handle_in {
+        Some(h) if !h.is_empty() => {
+            crate::mcp_chat_tools::validate_chat_handle(h)?;
+            h.to_string()
+        }
+        _ => crate::mcp_chat_tools::mint_unused_handle(&paths.root)?,
+    };
+
+    // Project dir: caller-supplied MUST be absolute. When omitted, default
+    // to cwd canonicalized (resolves symlinks too — daemon stores the
+    // post-canonical form). Identical to the MCP path so bot record
+    // semantics never diverge.
+    let project_dir = match project_dir_in {
+        Some(p) if !p.as_os_str().is_empty() => {
+            if !p.is_absolute() {
+                return Err(anyhow::anyhow!(
+                    "`--project-dir` must be an absolute path (got `{}`)",
+                    p.display()
+                ));
+            }
+            p.to_path_buf()
+        }
+        _ => std::env::current_dir().context("std::env::current_dir for default project_dir")?,
+    };
+    let project_dir = std::fs::canonicalize(&project_dir).with_context(|| {
+        format!(
+            "canonicalize project_dir `{}` (does the path exist?)",
+            project_dir.display()
+        )
+    })?;
+
+    let outcome = register_bot_checked_in(
+        &paths.root,
+        slug,
+        role,
+        vendor,
+        platform_raw,
+        chat_id,
+        None,
+        Some(chat_handle.as_str()),
+        Some(project_dir.as_path()),
+    )?;
+    match outcome {
+        RegisterOutcome::Registered(path) => {
+            Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "path": path.display().to_string(),
+                "workflow_slug": slug,
+                "role": role,
+                "chat_handle": chat_handle,
+                "project_dir": project_dir.display().to_string(),
+            }))?)
+        }
+        RegisterOutcome::AlreadyRegistered(path) => {
+            Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "ok": false,
+                "error": "already_registered",
+                "path": path.display().to_string(),
+                "workflow_slug": slug,
+                "role": role,
+                "hint": "Unregister first with `ccteam admin unregister-bot`, then re-register.",
+            }))?)
+        }
+    }
+}
+
+/// V0.6.8 F202 — unregister a chat-mode bot via the CLI. Mirrors the
+/// MCP `ccteam__chat_unregister_bot` path: idempotent — returns
+/// `ok:true, removed:false` when no registration exists.
+pub fn run_admin_unregister_bot(paths: &CcteamPaths, slug: &str, role: &str) -> Result<String> {
+    use ccteam_imd::unregister_bot_in;
+
+    crate::mcp_chat_tools::validate_slug(slug, "slug")?;
+    crate::mcp_chat_tools::validate_slug(role, "role")?;
+    let (removed, path) = unregister_bot_in(&paths.root, slug, role)?;
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "ok": true,
+        "removed": removed,
+        "path": path.display().to_string(),
+        "workflow_slug": slug,
+        "role": role,
+    }))?)
+}
+
 /// V0.4.6 F81 — `ccteam remove <slug>` implementation.
 ///
 /// Steps (in order):
@@ -5811,6 +5952,52 @@ mod tests {
         assert!(
             msg.contains("ccteam repo itself"),
             "expected fail-loud message; got: {msg}",
+        );
+        assert!(
+            msg.contains("--force"),
+            "fail-loud message must point to the --force escape; got: {msg}",
+        );
+    }
+
+    /// V0.6.8 F203 — `--force` overrides the ccteam-repo refusal so
+    /// self-hosting / dogfooding installs inside the ccteam source tree
+    /// can proceed when the user explicitly opts in.
+    #[test]
+    fn run_init_force_overrides_ccteam_repo_refusal() {
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        // Plant the two markers `is_ccteam_repo` checks for.
+        let fake_repo = tmp.path().join("ccteam-mirror");
+        std::fs::create_dir_all(fake_repo.join("crates").join("ccteam-cli")).unwrap();
+        std::fs::write(fake_repo.join("Cargo.toml"), "[workspace]\n").unwrap();
+
+        let out = run_init(
+            &paths,
+            InitOptions {
+                install_in: Some(fake_repo.clone()),
+                slug: Some("self-host".into()),
+                force: true,
+                ..InitOptions::default()
+            },
+        )
+        .expect("--force must override ccteam-repo refusal");
+        assert!(
+            out.contains("ccteam init"),
+            "expected init summary header; got: {out}",
+        );
+
+        // Project install must have actually written the ccteam files.
+        let state_path = fake_repo.join(".ccteam").join("state.json");
+        assert!(
+            state_path.exists(),
+            "state.json must exist after --force init; checked {}",
+            state_path.display()
+        );
+        let workflow_path = fake_repo.join(".ccteam").join("workflow.yaml");
+        assert!(
+            workflow_path.exists(),
+            "workflow.yaml must exist after --force init; checked {}",
+            workflow_path.display()
         );
     }
 
