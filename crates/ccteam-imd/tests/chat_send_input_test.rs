@@ -129,7 +129,7 @@ async fn mailbox_envelope_round_trips_through_handle_inbound() {
     // `drain_inboxes` runs this exact sequence).
     let body = std::fs::read_to_string(&path).unwrap();
     let env = parse_envelope(&body).unwrap();
-    sup.handle_inbound(env.payload).await.unwrap();
+    sup.handle_inbound(env.payload, env.hop).await.unwrap();
 
     // Adapter must have seen exactly the payload — no envelope yaml,
     // no extra wrapping. (CLAUDE.md §三 "No prompt injection".)
@@ -234,7 +234,7 @@ async fn mailbox_envelope_routes_through_registration_project_dir() {
     let path = write_envelope(&resolved_inbox, "@tech-helper plan");
     let body = std::fs::read_to_string(&path).unwrap();
     let env = parse_envelope(&body).unwrap();
-    sup.handle_inbound(env.payload).await.unwrap();
+    sup.handle_inbound(env.payload, env.hop).await.unwrap();
 
     let submitted = adapter.submitted.lock().unwrap().clone();
     assert_eq!(submitted, vec!["@tech-helper plan".to_string()]);
@@ -258,7 +258,7 @@ async fn mailbox_envelope_payload_preserves_special_chars() {
 
     let body = std::fs::read_to_string(&path).unwrap();
     let env = parse_envelope(&body).unwrap();
-    sup.handle_inbound(env.payload).await.unwrap();
+    sup.handle_inbound(env.payload, env.hop).await.unwrap();
 
     let submitted = adapter.submitted.lock().unwrap().clone();
     assert_eq!(submitted, vec![payload.to_string()]);

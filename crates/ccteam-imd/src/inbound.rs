@@ -69,6 +69,11 @@ pub enum InboundOutcome {
         /// (e.g. `tg-{message_id}`). Used as the latency-log `cid` field
         /// in the downstream mpsc dispatcher.
         cid: String,
+        /// V0.6.8 F193 — hop counter for the bot-to-bot loop guard.
+        /// Echoes `process_inbound`'s `hop` argument so the downstream
+        /// fast-path `InboxItem` carries the same value the on-disk
+        /// `InboxEnvelope.hop` records.
+        hop: u8,
     },
     /// Routed to admin handler.
     Admin {
@@ -386,6 +391,7 @@ pub async fn process_inbound(
                 path,
                 payload: stripped,
                 cid: msg.id.clone(),
+                hop,
             })
         }
     }

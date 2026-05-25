@@ -54,10 +54,20 @@ pub struct InboxItem {
     /// Sanitized payload (router-stripped of the `@<handle>` mention).
     pub payload: String,
     /// On-disk envelope path — `unlink` after handle_inbound succeeds.
+    /// V0.6.8 F193 — synthesized cross-bot mentions carry an empty
+    /// `PathBuf`; the inbox dispatcher's `remove_file` silently fails
+    /// (no envelope file ever existed) which is the desired behaviour.
     pub path: PathBuf,
     /// Wall-clock millis when the daemon enqueued this item — the
     /// consumer logs `queue_age_ms` against `now - enqueue_unix_ms`.
     pub enqueue_unix_ms: u128,
+    /// V0.6.8 F193 — bot-to-bot loop-guard hop counter. User-IM-sourced
+    /// messages enter with `hop = 0`; the cross-bot fast-path in
+    /// `spawn_outbound_dispatcher` synthesizes items with
+    /// `hop = sender_hop + 1`. The fast-path mpsc lost this field before
+    /// F193; the on-disk `InboxEnvelope.hop` still carries it for
+    /// safety-net `drain_inboxes` recovery.
+    pub hop: u8,
 }
 
 /// One outbound assistant row ready for dispatch to the IM platform.
@@ -82,6 +92,12 @@ pub struct OutboundItem {
     pub cursor_after: u64,
     /// Wall-clock millis when the daemon enqueued this row.
     pub enqueue_unix_ms: u128,
+    /// V0.6.8 F193 — hop value of the inbound turn that produced this
+    /// reply. Threaded from `BotSupervisor::current_hop` so the
+    /// outbound dispatcher can compute `next_hop = hop + 1` when it
+    /// detects an embedded `@<otherbot>` mention and synthesizes a
+    /// cross-bot `InboxItem`.
+    pub hop: u8,
 }
 
 /// Per-bot send-side handles. The daemon owns these (one entry per
