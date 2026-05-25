@@ -764,6 +764,14 @@ async fn ensure_bot_channels(
         // consumer can fan out from the next ItemCompleted onward.
         sup.set_outbound_tx(outbound_tx.clone()).await;
 
+        // V0.6.8 F196 — register the supervisor as the chat-mode tail
+        // loop's marker reporter for `(slug, role)`. Same shape /
+        // lifetime as `set_outbound_tx`: wired after `ensure_started`
+        // succeeds (so the tail loop spawned by `events()` finds the
+        // reporter ready on its first observation), aborted in
+        // `shutdown` via `unregister_marker_reporter`.
+        sup.register_as_marker_reporter();
+
         // Register both senders + the shared cursor so the inbound
         // consumer + future ticks (and drain_outboxes) see them.
         bot_channels.lock().await.insert(

@@ -345,6 +345,48 @@ pub trait HarnessAdapter: Send + Sync {
 }
 
 // =====================================================================
+// MarkerReporter — V0.6.8 F196 cross-cutting tail_loop → supervisor
+// =====================================================================
+
+/// V0.6.8 F196 — fire-and-forget channel from a chat-mode adapter's
+/// transcript tail loop back to the per-bot supervisor.
+///
+/// The Claude TUI tail loop polls the F176 `active-session-id` marker
+/// to learn which `<sid>.jsonl` to drain. When the SessionStart hook
+/// fails (state.json missing, env propagation broke, hook subprocess
+/// errored, etc.), the marker never appears, the loop polls forever,
+/// and the bot is silently dead despite a healthy tmux pane. F187
+/// surfaces a one-shot WARN; F196 closes the loop by letting the
+/// supervisor count consecutive marker-missing reports and escalate
+/// to a session reset.
+///
+/// The trait is intentionally minimal — one observation per loop tick,
+/// no action enum exposed to the adapter side. The supervisor owns
+/// the state machine + threshold + heal escalation; the adapter only
+/// signals "this tick the marker was/wasn't there." Wiring is
+/// per-`(slug, role)`: each `BotSupervisor` registers itself under
+/// the bot's identity before `events()` is spawned, and the tail loop
+/// looks up the reporter on each observation.
+///
+/// Cycle safety: implementations should be cheap to clone (typically
+/// `Arc<Weak<Self>>` indirection on the registry side) and tolerate
+/// the bot supervisor being dropped — `report_marker_*` calls after
+/// shutdown must be no-ops.
+#[async_trait::async_trait]
+pub trait MarkerReporter: Send + Sync {
+    /// One tail-loop tick observed the F176 `active-session-id` marker
+    /// missing (file absent or transcript jsonl referenced by sid not
+    /// yet on disk). Supervisor increments its consecutive-miss
+    /// counter; on hitting threshold it escalates to a session reset.
+    async fn report_marker_missing(&self);
+
+    /// One tail-loop tick observed a present + resolvable marker.
+    /// Supervisor resets the consecutive-miss counter + self-heal
+    /// attempts so a recovered bot doesn't keep its history pinned.
+    async fn report_marker_found(&self);
+}
+
+// =====================================================================
 // HarnessError — F107 adds NotImplemented{reason:String} (dynamic)
 // =====================================================================
 

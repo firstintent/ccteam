@@ -21,6 +21,7 @@ pub mod codex_app_server;
 pub mod codex_exec;
 pub mod codex_jsonrpc;
 // V0.6.0 F108 / F118 — chat-mode helpers consumed by ClaudeTuiAdapter.
+pub mod marker_reporter;
 pub mod session_recovery;
 pub mod transcript_tail;
 pub mod turns_mirror;

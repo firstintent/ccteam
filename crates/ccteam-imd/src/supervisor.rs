@@ -30,14 +30,15 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
 use ccteam_core::execution::turns_mirror::{self, TurnRecord};
 use ccteam_core::harness::{
-    AgentSpecBrief, HarnessAdapter, SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails, TurnId,
-    TurnInput,
+    AgentSpecBrief, HarnessAdapter, MarkerReporter, SpawnCtx, ThreadEvent, ThreadHandle,
+    ThreadItemDetails, TurnId, TurnInput,
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -101,6 +102,34 @@ pub struct BotState {
     /// registration and re-registers, building a fresh `BotState`) or
     /// a daemon restart.
     pub permanent_failure: bool,
+    /// V0.6.8 F196 — consecutive "active-session-id marker missing"
+    /// reports from the chat-mode tail loop. The SessionStart hook
+    /// writes the F176 marker; when it fails (state.json missing, hook
+    /// env propagation broke, hook subprocess errored), the marker
+    /// never appears, the tail loop polls forever, and the bot is
+    /// silently dead despite a healthy tmux pane. Counter resets to 0
+    /// on every `report_marker_found` (the loop saw the marker again),
+    /// and on every successful `reset_session`-driven self-heal start
+    /// (the new session's tail loop re-arms from zero).
+    pub marker_missing_count: u32,
+    /// V0.6.8 F196 — number of consecutive self-heal session resets
+    /// attempted in response to sustained marker-missing reports. Caps
+    /// at [`MAX_MARKER_SELF_HEAL_ATTEMPTS`]; once the cap is reached
+    /// the supervisor latches [`Self::marker_stuck`] and emits
+    /// `chat_bot_marker_stuck`. Counter resets on `record_marker_found`
+    /// so a single bad spawn followed by a clean recovery does not
+    /// burn the budget down forever.
+    pub marker_self_heal_attempts: u32,
+    /// V0.6.8 F196 — once the supervisor has burned through
+    /// [`MAX_MARKER_SELF_HEAL_ATTEMPTS`] consecutive self-heal session
+    /// resets without the F176 marker ever appearing again, this flag
+    /// latches `true`. Further `record_marker_missing` reports
+    /// short-circuit to `MarkerHealAction::Quiet` so the supervisor
+    /// stops cycling the session. Recovery requires the operator to
+    /// restore the SessionStart hook prerequisite + write
+    /// `signals/reset.signal` (which clears the latch as part of the
+    /// `reset_session` flow) or restart the daemon.
+    pub marker_stuck: bool,
 }
 
 /// V0.6.8 F192c — maximum consecutive `start_thread` attempts before
@@ -112,6 +141,53 @@ pub struct BotState {
 /// a transient flake on the first or second tick while not letting a
 /// permanently-broken bot flood logs with identical WARNs.
 pub const MAX_START_THREAD_ATTEMPTS: u32 = 3;
+
+/// V0.6.8 F196 — number of consecutive tail-loop "marker missing"
+/// reports before the supervisor escalates to a self-heal session
+/// reset. The chat-mode tail loop reports roughly once every 2s in
+/// the inotify-driven path (safety-net cadence) and the polling
+/// fallback's exponential backoff settles at the same ceiling, so
+/// 30 reports ≈ 60s of silence — enough to cover a slow first-prompt
+/// SessionStart grace period while still catching a stuck loop well
+/// before the user reports "bot dead".
+pub const MARKER_MISSING_RESET_THRESHOLD: u32 = 30;
+
+/// V0.6.8 F196 — cap on consecutive self-heal session resets before
+/// the supervisor latches the marker-stuck state and stops trying.
+/// Same envelope as [`MAX_START_THREAD_ATTEMPTS`]: a single
+/// SessionStart hook flake gets one cheap recovery, two flakes get
+/// another, three consecutive failures mean the breakage is
+/// structural (state.json deleted by ops, hook script unreadable,
+/// etc.) and further auto-resets only churn the bot.
+pub const MAX_MARKER_SELF_HEAL_ATTEMPTS: u32 = 3;
+
+/// V0.6.8 F196 — outcome of one [`BotSupervisor::record_marker_missing`]
+/// call, returned to the caller (the chat-mode tail loop's
+/// [`MarkerReporter`] impl, internally — operators never see this
+/// enum directly).
+///
+/// Frame: this is **escalate-after-sustained-stuck-state**, not
+/// kill-mid-turn. R5 "永不主动 kill 长 session" honours the same
+/// channel F84 (budget overflow) and F192c (spawn-failure) use:
+/// the supervisor only escalates when the bot is functionally dead
+/// (no marker means the tail loop will never see new content) and
+/// the recovery path is a fresh `start_thread` against the same
+/// `(slug, role)` identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkerHealAction {
+    /// Counter incremented, threshold not yet reached. No action.
+    Quiet,
+    /// Threshold reached this tick. Caller should run the heal: emit
+    /// the `chat_marker_self_heal_attempt` progress event, call
+    /// `reset_session`, and bump `marker_self_heal_attempts`.
+    Heal,
+    /// Self-heal budget exhausted. Caller should emit the
+    /// `chat_bot_marker_stuck` event once and refuse further resets.
+    /// Subsequent `record_marker_missing` calls remain `Quiet` until
+    /// the operator clears the latch (write `signals/reset.signal`
+    /// or restart the daemon).
+    PermanentFailure,
+}
 
 /// Decision the supervisor makes for one bot on a single tick.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -361,6 +437,13 @@ pub struct BotSupervisor {
     /// session is mid-conversation) inherit the default value `0`,
     /// matching the "user-IM-sourced" hop semantic.
     current_hop: Arc<AtomicU8>,
+    /// V0.6.8 F196 — self-Weak captured during
+    /// `register_as_marker_reporter` so the [`MarkerReporter`] trait
+    /// impl (which only has `&self`) can recover an `Arc<Self>` to
+    /// drive the async heal task without holding the supervisor alive
+    /// past its rightful drop. Set once; subsequent registrations
+    /// (restart / reset) reuse the same Weak.
+    self_weak: std::sync::OnceLock<Weak<Self>>,
 }
 
 impl std::fmt::Debug for BotSupervisor {
@@ -409,6 +492,7 @@ impl BotSupervisor {
             events_task: Mutex::new(None),
             outbound_tx: Arc::new(Mutex::new(None)),
             current_hop: Arc::new(AtomicU8::new(0)),
+            self_weak: std::sync::OnceLock::new(),
         }
     }
 
@@ -419,6 +503,43 @@ impl BotSupervisor {
     /// (skipping the safety-net 60s `drain_outboxes` scan).
     pub async fn set_outbound_tx(&self, tx: mpsc::Sender<OutboundItem>) {
         *self.outbound_tx.lock().await = Some(tx);
+    }
+
+    /// V0.6.8 F196 — register this supervisor as the chat-mode tail
+    /// loop's marker reporter for `(slug, role)`. Called by the daemon
+    /// right after `ensure_started` succeeds (mirrors the
+    /// `set_outbound_tx` shape — both wire the supervisor as a
+    /// downstream of the adapter's event stream).
+    ///
+    /// The registry holds a [`std::sync::Weak`] so the supervisor's
+    /// drop semantics are unchanged: a stopped bot's reporter cleanly
+    /// disappears, and the tail loop's lookup returns `None` after
+    /// the Arc drops. Re-registration on restart / reset overwrites
+    /// the previous entry without leaking.
+    pub fn register_as_marker_reporter(self: &Arc<Self>) {
+        // Stash the self-Weak the first time we register so the
+        // MarkerReporter trait impl can recover Arc<Self> to drive
+        // the heal task (`&self` alone can't spawn an `Arc<Self>`
+        // tokio future). Subsequent registrations reuse the same
+        // Weak — re-registering after restart is fine since we
+        // always work off the same supervisor Arc.
+        let _ = self.self_weak.set(Arc::downgrade(self));
+        let weak: Weak<dyn MarkerReporter> = Arc::downgrade(self) as Weak<dyn MarkerReporter>;
+        ccteam_core::execution::marker_reporter::register(
+            &self.reg.workflow_slug,
+            &self.reg.role,
+            weak,
+        );
+    }
+
+    /// V0.6.8 F196 — companion to [`Self::register_as_marker_reporter`].
+    /// Called from `shutdown` so a long-lived daemon doesn't accumulate
+    /// dead entries. Idempotent on a missing key.
+    pub fn unregister_marker_reporter(&self) {
+        ccteam_core::execution::marker_reporter::unregister(
+            &self.reg.workflow_slug,
+            &self.reg.role,
+        );
     }
 
     /// `<projects_root>/<slug>/.ccteam/chat/<role>/`. Helper so the
@@ -527,6 +648,141 @@ impl BotSupervisor {
                 attempts,
                 MAX_START_THREAD_ATTEMPTS,
             );
+        }
+    }
+
+    /// V0.6.8 F196 — record one tail-loop tick where the F176
+    /// `active-session-id` marker was missing. Returns the
+    /// [`MarkerHealAction`] the caller should apply.
+    ///
+    /// State machine:
+    /// - Below [`MARKER_MISSING_RESET_THRESHOLD`]: increment counter,
+    ///   return `Quiet`.
+    /// - At threshold AND `marker_self_heal_attempts <
+    ///   MAX_MARKER_SELF_HEAL_ATTEMPTS`: bump
+    ///   `marker_self_heal_attempts`, reset `marker_missing_count` to
+    ///   zero (the next reset arms a fresh window), return `Heal`.
+    /// - At threshold AND `marker_self_heal_attempts ==
+    ///   MAX_MARKER_SELF_HEAL_ATTEMPTS - 1` after this bump: same as
+    ///   `Heal` for the current attempt, but the next miss-threshold
+    ///   crossing returns `PermanentFailure`.
+    /// - Once `marker_stuck` has latched: every call returns `Quiet`.
+    ///   The supervisor is done; reset / restart-bot clears the latch.
+    pub async fn record_marker_missing(&self) -> MarkerHealAction {
+        let mut st = self.state.lock().await;
+        if st.marker_stuck {
+            return MarkerHealAction::Quiet;
+        }
+        st.marker_missing_count = st.marker_missing_count.saturating_add(1);
+        if st.marker_missing_count < MARKER_MISSING_RESET_THRESHOLD {
+            return MarkerHealAction::Quiet;
+        }
+        // Threshold crossed — escalate. Reset the per-window counter
+        // so the *next* heal attempt also takes a fresh threshold's
+        // worth of silence (avoiding back-to-back resets if the new
+        // session happens to be slow on its first hook fire).
+        st.marker_missing_count = 0;
+        if st.marker_self_heal_attempts >= MAX_MARKER_SELF_HEAL_ATTEMPTS {
+            st.marker_stuck = true;
+            return MarkerHealAction::PermanentFailure;
+        }
+        st.marker_self_heal_attempts = st.marker_self_heal_attempts.saturating_add(1);
+        // Note: we do NOT latch `marker_stuck` here even when this bump
+        // hits the cap — the current Heal still gets to run. The latch
+        // trips on the NEXT threshold crossing (where
+        // `marker_self_heal_attempts >= MAX_MARKER_SELF_HEAL_ATTEMPTS`
+        // returns `PermanentFailure` above). That branch is what
+        // distinguishes "burning the last attempt" (Heal) from "having
+        // burned the last attempt" (PermanentFailure).
+        MarkerHealAction::Heal
+    }
+
+    /// V0.6.8 F196 — record one tail-loop tick where the F176 marker
+    /// was present and resolvable. Resets both consecutive-miss + heal
+    /// budget counters: a healthy bot starts every silence window
+    /// from scratch, so a single sustained outage doesn't shorten
+    /// the next legitimate flake's grace period. Does NOT clear
+    /// `marker_stuck` — once we've declared permanent failure, only
+    /// an operator-driven `reset_session` re-arms the supervisor.
+    pub async fn record_marker_found(&self) {
+        let mut st = self.state.lock().await;
+        st.marker_missing_count = 0;
+        st.marker_self_heal_attempts = 0;
+    }
+
+    /// V0.6.8 F196 — implementation of the heal sequence the daemon
+    /// runs when `record_marker_missing` returned `Heal`. Emits the
+    /// `chat_marker_self_heal_attempt` progress event for observability
+    /// (operators see it in progress.jsonl + the web dashboard) and
+    /// drives the existing F192c `reset_session` so the tmux pane is
+    /// recycled and the new session fires a fresh SessionStart hook.
+    /// Errors during reset are logged but not propagated — a failing
+    /// heal counts toward the budget via the next threshold crossing
+    /// (the marker will still be missing on the next tick).
+    ///
+    /// Returns the attempt number used in the emitted event (1-based).
+    pub async fn attempt_marker_self_heal(self: &Arc<Self>) -> u32 {
+        let attempt_n = self.state.lock().await.marker_self_heal_attempts;
+        tracing::warn!(
+            slug = %self.reg.workflow_slug,
+            role = %self.reg.role,
+            attempt_n,
+            max = MAX_MARKER_SELF_HEAL_ATTEMPTS,
+            "F196: SessionStart marker missing past threshold; escalating to session reset"
+        );
+        if let Ok(paths) = ccteam_core::CcteamPaths::from_env() {
+            let progress_path = paths.progress_jsonl(&self.reg.workflow_slug);
+            let ev = ccteam_core::progress::build_chat_marker_self_heal_attempt_event(
+                &self.reg.role,
+                attempt_n,
+            );
+            if let Err(err) = ccteam_core::progress::append_event(&progress_path, &ev) {
+                tracing::warn!(
+                    slug = %self.reg.workflow_slug,
+                    role = %self.reg.role,
+                    error = %err,
+                    "F196: failed to append chat_marker_self_heal_attempt event to progress.jsonl"
+                );
+            }
+        }
+        if let Err(err) = self.reset_session().await {
+            tracing::warn!(
+                slug = %self.reg.workflow_slug,
+                role = %self.reg.role,
+                error = %err,
+                "F196: reset_session during self-heal failed; next threshold crossing will retry or latch"
+            );
+        }
+        attempt_n
+    }
+
+    /// V0.6.8 F196 — companion to [`Self::attempt_marker_self_heal`]
+    /// for the `PermanentFailure` branch. Emits one
+    /// `chat_bot_marker_stuck` event and logs a WARN; subsequent
+    /// `record_marker_missing` calls return `Quiet` so the supervisor
+    /// stops cycling the bot.
+    pub async fn record_marker_stuck(&self) {
+        let attempts = self.state.lock().await.marker_self_heal_attempts;
+        tracing::warn!(
+            slug = %self.reg.workflow_slug,
+            role = %self.reg.role,
+            attempts,
+            max = MAX_MARKER_SELF_HEAL_ATTEMPTS,
+            "F196: SessionStart marker still missing after {} self-heal resets; latching marker_stuck (no more auto-recovery)",
+            attempts,
+        );
+        if let Ok(paths) = ccteam_core::CcteamPaths::from_env() {
+            let progress_path = paths.progress_jsonl(&self.reg.workflow_slug);
+            let ev =
+                ccteam_core::progress::build_chat_bot_marker_stuck_event(&self.reg.role, attempts);
+            if let Err(err) = ccteam_core::progress::append_event(&progress_path, &ev) {
+                tracing::warn!(
+                    slug = %self.reg.workflow_slug,
+                    role = %self.reg.role,
+                    error = %err,
+                    "F196: failed to append chat_bot_marker_stuck event to progress.jsonl"
+                );
+            }
         }
     }
 
@@ -913,6 +1169,10 @@ impl BotSupervisor {
         // V0.6.1 F136 / F137 — kill background tasks BEFORE close so
         // a final heartbeat write doesn't race the tmux teardown.
         self.abort_background_tasks().await;
+        // V0.6.8 F196 — drop the marker reporter registration so the
+        // tail loop (if still alive on a respawn) doesn't fire heal
+        // attempts against a closing supervisor.
+        self.unregister_marker_reporter();
         let handle = {
             let mut st = self.state.lock().await;
             st.shutting_down = true;
@@ -1064,6 +1324,17 @@ impl BotSupervisor {
         //    underlying breakage (config typo, missing binary, dead
         //    tmux session) can re-arm the supervisor by writing
         //    `signals/reset.signal` instead of restarting the daemon.
+        //
+        //    V0.6.8 F196 — the marker state machine fields
+        //    (`marker_missing_count` / `marker_self_heal_attempts` /
+        //    `marker_stuck`) are intentionally NOT cleared here. The
+        //    F196 self-heal path calls `reset_session` directly, and
+        //    clearing the budget mid-heal would prevent the supervisor
+        //    from ever latching `marker_stuck` (every reset would
+        //    reset the budget too, looping forever). The operator
+        //    reset path clears them explicitly via `apply_action`'s
+        //    `ResetSession` branch — that's the right place because
+        //    only operator intent should re-arm a marker_stuck bot.
         let handle = {
             let mut st = self.state.lock().await;
             st.fail_count = 0;
@@ -1134,10 +1405,78 @@ impl BotSupervisor {
                 // we get here. This method just covers the bot-side
                 // teardown + archive + transcript-cursor wipe.
                 self.reset_session().await?;
+                // V0.6.8 F196 — operator-driven reset (via
+                // `signals/reset.signal`) is the right place to clear
+                // the marker self-heal state. `reset_session` itself
+                // can't do this because the F196 heal path calls
+                // `reset_session` too — clearing there would prevent
+                // the budget from ever draining. By scoping the clear
+                // to this branch we ensure only an explicit operator
+                // intent (or `restart-bot` / daemon restart) re-arms
+                // a marker_stuck bot.
+                let mut st = self.state.lock().await;
+                st.marker_missing_count = 0;
+                st.marker_self_heal_attempts = 0;
+                st.marker_stuck = false;
             }
             SupervisorAction::Quarantine | SupervisorAction::NoOp => {}
         }
         Ok(action)
+    }
+}
+
+/// V0.6.8 F196 — bridge the chat-mode adapter's per-tick marker
+/// observations into the supervisor's heal state machine.
+///
+/// The trait impl is intentionally thin: it forwards to
+/// [`BotSupervisor::record_marker_missing`] / `record_marker_found`,
+/// and on a `Heal` / `PermanentFailure` outcome it recovers an
+/// `Arc<Self>` from the stashed Weak (set by
+/// `register_as_marker_reporter`) and spawns the async heal task so
+/// the tail loop's `report_marker_missing` call returns immediately —
+/// the loop must not block while the supervisor archives turns.jsonl,
+/// kills tmux, and respawns the session.
+///
+/// R5 framing: the heal path calls `reset_session`, which is the same
+/// code path operators trigger via `signals/reset.signal` and that
+/// F192c uses to recover from spawn flakes. Frame is "escalate from
+/// a stuck state" — the marker never appearing means the bot is
+/// functionally dead and the tmux session, while alive, is silently
+/// useless. Recycling it is recovery, not interruption.
+#[async_trait]
+impl MarkerReporter for BotSupervisor {
+    async fn report_marker_missing(&self) {
+        let action = self.record_marker_missing().await;
+        match action {
+            MarkerHealAction::Quiet => {}
+            MarkerHealAction::Heal => {
+                // Recover Arc<Self> via the stashed Weak so we can
+                // tokio::spawn the heal task. If the upgrade fails the
+                // supervisor is mid-drop — skip; the next loop tick
+                // will see lookup() return None anyway.
+                let Some(weak) = self.self_weak.get() else {
+                    tracing::warn!(
+                        slug = %self.reg.workflow_slug,
+                        role = %self.reg.role,
+                        "F196: marker reporter fired before register_as_marker_reporter; skipping heal"
+                    );
+                    return;
+                };
+                let Some(arc) = weak.upgrade() else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    arc.attempt_marker_self_heal().await;
+                });
+            }
+            MarkerHealAction::PermanentFailure => {
+                self.record_marker_stuck().await;
+            }
+        }
+    }
+
+    async fn report_marker_found(&self) {
+        self.record_marker_found().await;
     }
 }
 
