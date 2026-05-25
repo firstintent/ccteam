@@ -377,15 +377,15 @@ fn t_creator_skill_phase_5_6_documents_mcp_tool_not_rust_function() {
         "Phase 5.6 must document the `already_registered` idempotent-OK branch; got: {phase_5_6_body}",
     );
 
-    // Phase 5.9 reply template must mention the registry path so the
+    // Phase 5.8 reply template must mention the registry path so the
     // user sees the bot actually landed somewhere.
-    let phase_5_9 = body
-        .split("## 5.9")
+    let phase_5_8 = body
+        .split("## 5.8")
         .nth(1)
-        .expect("SKILL.md must have a `## 5.9` Phase 5.9 section");
-    let phase_5_9_body = phase_5_9.split("\n## ").next().unwrap_or(phase_5_9);
+        .expect("SKILL.md must have a `## 5.8` Phase 5.8 section");
+    let phase_5_8_body = phase_5_8.split("\n## ").next().unwrap_or(phase_5_8);
     assert!(
-        phase_5_9_body.contains("imd/registry/"),
-        "Phase 5.9 reply must mention `imd/registry/<slug>/<role>.json` so the user sees the bot was registered; got: {phase_5_9_body}",
+        phase_5_8_body.contains("imd/registry/"),
+        "Phase 5.8 reply must mention `imd/registry/<slug>/<role>.json` so the user sees the bot was registered; got: {phase_5_8_body}",
     );
 }

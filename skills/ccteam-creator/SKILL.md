@@ -338,6 +338,14 @@ daemon's registry watcher picks it up and spawns the tmux session.
 Phase 5.1: take `telegram.allowed_chat_ids[0]` (cast to string —
 Telegram chat ids are i64, but the MCP wire expects a string).
 
+Always pass `project_dir` (absolute path of the directory holding
+`.ccteam/workflow.yaml`, i.e. the `project_dir` you used in Phase 5.3 /
+5.4 above) so the daemon can find the project no matter where the
+user keeps it. Projects outside the default `~/projects/<slug>/`
+layout (NAS shares, dir basename ≠ workflow slug) only resolve when
+this field is set. Omitting it falls back to the MCP server's current
+working directory.
+
 ```json
 {
   "name": "mcp__ccteam__chat_register_bot",
@@ -347,13 +355,15 @@ Telegram chat ids are i64, but the MCP wire expects a string).
     "vendor": "claude",
     "im_platform": "telegram",
     "im_chat_id": "<allowed_chat_ids[0]>",
-    "persona_id": "<persona_id from Phase 3>"
+    "persona_id": "<persona_id from Phase 3>",
+    "project_dir": "<absolute path of the dir containing .ccteam/workflow.yaml>"
   }
 }
 ```
 
 When `chat_handle` is omitted (as above) the dispatcher returns the
-auto-minted handle in the response:
+auto-minted handle (and echoes the resolved `project_dir`) in the
+response:
 
 ```json
 {
@@ -361,7 +371,8 @@ auto-minted handle in the response:
   "path": "/home/.../helper.json",
   "workflow_slug": "<slug>",
   "role": "<role>",
-  "chat_handle": "Euclid"
+  "chat_handle": "Euclid",
+  "project_dir": "/abs/path/to/project"
 }
 ```
 

@@ -184,13 +184,13 @@ pub fn decide(
     }
 }
 
-/// Per-bot dir: `<projects_root>/<slug>/.ccteam/chat/<role>/`.
+/// Per-bot dir: `<project>/.ccteam/chat/<role>/`. F185 — prefers
+/// `reg.project_dir` (absolute path written by `chat_register_bot` at
+/// registration time). Falls back to the historical
+/// `<projects_root>/<workflow_slug>/.ccteam/chat/<role>/` layout for
+/// pre-F185 registrations that have `project_dir = None`.
 pub fn bot_dir(projects_root: &Path, reg: &BotRegistration) -> PathBuf {
-    projects_root
-        .join(&reg.workflow_slug)
-        .join(".ccteam")
-        .join("chat")
-        .join(&reg.role)
+    reg.chat_dir(projects_root)
 }
 
 fn signal_present(bot_dir: &Path, name: &str) -> bool {
@@ -307,9 +307,12 @@ impl BotSupervisor {
         bot_dir(&self.projects_root, &self.reg)
     }
 
-    /// `<projects_root>/<slug>/`.
+    /// Root dir for the project hosting this bot's
+    /// `.ccteam/workflow.yaml`. F185 — prefers `reg.project_dir` when
+    /// set; falls back to `<projects_root>/<workflow_slug>/` for
+    /// legacy registrations.
     pub fn project_dir(&self) -> PathBuf {
-        self.projects_root.join(&self.reg.workflow_slug)
+        self.reg.project_root(&self.projects_root)
     }
 
     /// True iff `start_thread` has been called and `close_thread` has
@@ -943,6 +946,7 @@ mod bot_supervisor_tests {
             im_platform: "mock".into(),
             im_chat_id: "1".into(),
             chat_handle: None,
+            project_dir: None,
             created_at: chrono::Utc::now(),
         }
     }
@@ -1029,6 +1033,7 @@ mod tests {
             im_platform: "mock".into(),
             im_chat_id: "1".into(),
             chat_handle: None,
+            project_dir: None,
             created_at: Utc::now(),
         }
     }

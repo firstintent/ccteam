@@ -86,6 +86,7 @@ fn reg() -> BotRegistration {
         im_platform: "mcp".into(),
         im_chat_id: "0".into(),
         chat_handle: None,
+        project_dir: None,
         created_at: chrono::Utc::now(),
     }
 }
@@ -121,7 +122,7 @@ async fn mailbox_envelope_round_trips_through_handle_inbound() {
 
     // Drop the envelope into the documented mailbox path (same path
     // `chat_send_input` writes to via `chat_inbox_dir`).
-    let inbox = chat_inbox_dir(&projects_root, "demo", "helper");
+    let inbox = chat_inbox_dir(&projects_root, &reg());
     let path = write_envelope(&inbox, "please plan");
 
     // Daemon-side parse + dispatch (the production safety-net
@@ -173,6 +174,73 @@ fn envelope_filename_collision_window_is_realistic() {
 }
 
 #[tokio::test]
+async fn mailbox_envelope_routes_through_registration_project_dir() {
+    // F185 — when the BotRegistration carries an explicit absolute
+    // `project_dir` that differs from `<projects_root>/<workflow_slug>/`
+    // (e.g. NAS-shared project: `/vol4/.../ccteam` with slug
+    // `research-squad`), the mailbox writer + supervisor must resolve
+    // *both* sides under the explicit path. Asserting both the resolver
+    // path and the file actually showing up there is the regression
+    // anchor for "MCP write went to `~/projects/research-squad/...`
+    // while the daemon supervisor watched `/vol4/.../ccteam/...`" —
+    // a partial F185 would silently route them past each other.
+    let tmp = TempDir::new().unwrap();
+    let projects_root = tmp.path().join("projects");
+    std::fs::create_dir_all(&projects_root).unwrap();
+    // The real project lives outside `projects_root/<slug>/`.
+    let project_dir = tmp.path().join("vol4/ccteam");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    // Registration explicitly binds to the absolute project_dir; slug
+    // intentionally does NOT match the dir basename.
+    let reg = ccteam_imd::BotRegistration {
+        workflow_slug: "research-squad".into(),
+        role: "tech-helper".into(),
+        vendor: AgentVendor::Claude,
+        persona_id: None,
+        im_platform: "mcp".into(),
+        im_chat_id: "0".into(),
+        chat_handle: None,
+        project_dir: Some(project_dir.clone()),
+        created_at: chrono::Utc::now(),
+    };
+
+    let adapter = Arc::new(CapturingAdapter::default());
+    let sup = ccteam_imd::supervisor::BotSupervisor::new(
+        reg.clone(),
+        projects_root.clone(),
+        adapter.clone(),
+    );
+    sup.ensure_started().await.unwrap();
+
+    // Supervisor's `project_dir()` and `chat_inbox_dir(...)` must both
+    // land under the registration's absolute path — NOT `projects_root/slug`.
+    let expected_inbox = project_dir.join(".ccteam/chat/tech-helper/inbox");
+    let resolved_inbox = ccteam_imd::chat_inbox_dir(&projects_root, &reg);
+    assert_eq!(
+        resolved_inbox, expected_inbox,
+        "chat_inbox_dir must resolve under reg.project_dir"
+    );
+
+    // The legacy slug-based path under projects_root MUST NOT be the
+    // mailbox path — guard against a silent fallback regression.
+    let legacy_inbox = projects_root.join("research-squad/.ccteam/chat/tech-helper/inbox");
+    assert_ne!(resolved_inbox, legacy_inbox);
+
+    // End-to-end: write the envelope into the resolved inbox (the path
+    // the daemon's `drain_inboxes` would read), parse + submit, and
+    // confirm the bot saw the payload — proving the round trip works
+    // when projects sit outside the default home/projects tree.
+    let path = write_envelope(&resolved_inbox, "@tech-helper plan");
+    let body = std::fs::read_to_string(&path).unwrap();
+    let env = parse_envelope(&body).unwrap();
+    sup.handle_inbound(env.payload).await.unwrap();
+
+    let submitted = adapter.submitted.lock().unwrap().clone();
+    assert_eq!(submitted, vec!["@tech-helper plan".to_string()]);
+}
+
+#[tokio::test]
 async fn mailbox_envelope_payload_preserves_special_chars() {
     // Slash commands, backticks, newlines, multiline markdown — must
     // round-trip verbatim. This is the regression anchor for "user
@@ -184,7 +252,7 @@ async fn mailbox_envelope_payload_preserves_special_chars() {
     let sup = BotSupervisor::new(reg(), projects_root.clone(), adapter.clone());
     sup.ensure_started().await.unwrap();
 
-    let inbox = chat_inbox_dir(&projects_root, "demo", "helper");
+    let inbox = chat_inbox_dir(&projects_root, &reg());
     let payload = "Line 1\n```rust\nfn main() {}\n```\n@mention `/clear` end";
     let path = write_envelope(&inbox, payload);
 

@@ -131,33 +131,29 @@ pub struct TailCursor {
 }
 
 /// Resolve `<project>/.ccteam/chat/<role>/turns.jsonl` for the given
-/// `(projects_root, slug, role)` triple.
-pub fn turns_jsonl_path(projects_root: &std::path::Path, slug: &str, role: &str) -> PathBuf {
-    projects_root
-        .join(slug)
-        .join(".ccteam")
-        .join("chat")
-        .join(role)
-        .join("turns.jsonl")
+/// bot. Honors `reg.project_dir` (F185) — when set, uses the absolute
+/// path; otherwise falls back to
+/// `<projects_root>/<workflow_slug>/.ccteam/chat/<role>/turns.jsonl`.
+pub fn turns_jsonl_path(projects_root: &std::path::Path, reg: &crate::BotRegistration) -> PathBuf {
+    reg.chat_dir(projects_root).join("turns.jsonl")
 }
 
 /// V0.6.1 F134 — persistent byte-offset state for one bot's
 /// `turns.jsonl` tailer. Stored at
-/// `<projects_root>/<slug>/.ccteam/chat/<role>/outbound.cursor` as a
-/// JSON blob `{"position": N}` (serde-derived on [`TailCursor`]).
+/// `<project>/.ccteam/chat/<role>/outbound.cursor` as a JSON blob
+/// `{"position": N}` (serde-derived on [`TailCursor`]).
 ///
 /// Daemon restart re-loads this file so messages forwarded across a
 /// previous run aren't re-sent to the user. Missing / malformed file
 /// → fall back to the zero cursor (re-forward everything; safer than
 /// dropping content silently, and `turns.jsonl` grows monotonically
 /// so a stale cursor would only ever under-skip, never over-skip).
-pub fn outbound_cursor_path(projects_root: &std::path::Path, slug: &str, role: &str) -> PathBuf {
-    projects_root
-        .join(slug)
-        .join(".ccteam")
-        .join("chat")
-        .join(role)
-        .join("outbound.cursor")
+/// F185 — honors `reg.project_dir`.
+pub fn outbound_cursor_path(
+    projects_root: &std::path::Path,
+    reg: &crate::BotRegistration,
+) -> PathBuf {
+    reg.chat_dir(projects_root).join("outbound.cursor")
 }
 
 /// Load a [`TailCursor`] from disk. Missing file or parse failure

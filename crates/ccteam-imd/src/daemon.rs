@@ -688,8 +688,7 @@ async fn ensure_bot_channels(
         // same monotonic primitive.
         let chat_id = bot.im_chat_id.clone();
         let platform = bot.im_platform.clone();
-        let cursor_path =
-            outbound::outbound_cursor_path(projects_root, &bot.workflow_slug, &bot.role);
+        let cursor_path = outbound::outbound_cursor_path(projects_root, bot);
         let outbound_cursor = outbound::OutboundCursor::load_from_disk(cursor_path);
         let slug_log = bot.workflow_slug.clone();
         let role_log = bot.role.clone();
@@ -880,12 +879,10 @@ async fn drain_inboxes(
             .collect()
     };
     for (bot, sup) in supervisors {
-        let inbox = projects_root
-            .join(&bot.workflow_slug)
-            .join(".ccteam")
-            .join("chat")
-            .join(&bot.role)
-            .join("inbox");
+        // F185 — honor `reg.project_dir` so projects living outside
+        // `~/projects/<slug>/` (NAS shares, dir basename ≠ slug)
+        // resolve correctly.
+        let inbox = crate::chat_inbox_dir(projects_root, &bot);
         if !inbox.exists() {
             continue;
         }
@@ -1012,7 +1009,7 @@ async fn drain_outboxes(
             );
             continue;
         };
-        let path = outbound::turns_jsonl_path(projects_root, &bot.workflow_slug, &bot.role);
+        let path = outbound::turns_jsonl_path(projects_root, bot);
 
         // Prefer the shared OutboundCursor owned by the fast-path
         // dispatcher (so we update the same in-memory state and the
@@ -1027,11 +1024,7 @@ async fn drain_outboxes(
             match guard.get(&key) {
                 Some(ch) => ch.outbound_cursor.clone(),
                 None => {
-                    let cursor_path = outbound::outbound_cursor_path(
-                        projects_root,
-                        &bot.workflow_slug,
-                        &bot.role,
-                    );
+                    let cursor_path = outbound::outbound_cursor_path(projects_root, bot);
                     outbound::OutboundCursor::load_from_disk(cursor_path)
                 }
             }
@@ -1360,6 +1353,7 @@ mod tests {
             im_platform: "telegram".into(),
             im_chat_id: "1".into(),
             chat_handle: None,
+            project_dir: None,
             created_at: chrono::Utc::now(),
         };
 
@@ -1423,6 +1417,7 @@ mod tests {
             im_platform: "telegram".into(),
             im_chat_id: "1".into(),
             chat_handle: None,
+            project_dir: None,
             created_at: chrono::Utc::now(),
         };
         // Tick 1: Spawn.

@@ -32,8 +32,28 @@ use ccteam_imd::outbound;
 use ccteam_imd::register_bot;
 use ccteam_imd::transport::providers::mock::MockChannel;
 use ccteam_imd::transport::Channel;
+use ccteam_imd::BotRegistration;
 use futures::stream::BoxStream;
 use tempfile::TempDir;
+
+/// Build a transient `BotRegistration` for path-helper calls. F185
+/// path resolvers take `&BotRegistration` so they can honor a per-bot
+/// `project_dir`; these tests stay on the slug-fallback layout
+/// (`project_dir = None`), matching the legacy `<projects_root>/<slug>/`
+/// shape register_bot() persists.
+fn bot_reg(slug: &str, role: &str) -> BotRegistration {
+    BotRegistration {
+        workflow_slug: slug.into(),
+        role: role.into(),
+        vendor: AgentVendor::Claude,
+        persona_id: None,
+        im_platform: "telegram".into(),
+        im_chat_id: "0".into(),
+        chat_handle: None,
+        project_dir: None,
+        created_at: chrono::Utc::now(),
+    }
+}
 
 // ----- env isolation helpers (mirrors tests/inbound_wiring_test.rs) ---
 
@@ -181,7 +201,7 @@ async fn daemon_forwards_turns_jsonl_to_channel() {
     assert_eq!(outbox[1].recipient, "chat-42");
 
     // Cursor file was persisted so a daemon restart wouldn't re-forward.
-    let cursor_path = outbound::outbound_cursor_path(&projects_root, "dev-foo", "lead");
+    let cursor_path = outbound::outbound_cursor_path(&projects_root, &bot_reg("dev-foo", "lead"));
     assert!(
         cursor_path.exists(),
         "cursor file should exist at {}",
@@ -299,7 +319,7 @@ async fn drain_handles_truncation_without_repeat_forwarding() {
     // Seed an outbound.cursor that points well past the new EOF —
     // simulates a turns.jsonl that was much longer before and got
     // rotated / truncated while the daemon was offline.
-    let cursor_path = outbound::outbound_cursor_path(&projects_root, "dev-trunc", "lead");
+    let cursor_path = outbound::outbound_cursor_path(&projects_root, &bot_reg("dev-trunc", "lead"));
     std::fs::write(&cursor_path, r#"{"position": 10000}"#).unwrap();
     assert!(
         new_eof < 10000,
@@ -400,7 +420,7 @@ async fn drain_no_op_when_cursor_already_at_eof() {
 
     // Cursor pre-positioned at EOF — simulates the steady-state where
     // the fast-path dispatcher already shipped every row.
-    let cursor_path = outbound::outbound_cursor_path(&projects_root, "dev-eof", "lead");
+    let cursor_path = outbound::outbound_cursor_path(&projects_root, &bot_reg("dev-eof", "lead"));
     std::fs::write(&cursor_path, format!(r#"{{"position": {eof}}}"#)).unwrap();
 
     let mock = Arc::new(MockChannel::new());

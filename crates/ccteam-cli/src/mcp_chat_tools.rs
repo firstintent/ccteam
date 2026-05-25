@@ -80,7 +80,8 @@ pub fn chat_tool_definitions() -> Vec<Value> {
                     },
                     "im_chat_id": { "type": "string", "description": "Platform-specific chat id (string)." },
                     "persona_id": { "type": "string", "description": "Optional stable persona id for display name / avatar." },
-                    "chat_handle": { "type": "string", "description": "Optional IM mention this bot answers to (without leading `@`). Omit to auto-mint an unused scientist nickname. Letters, digits, `_`, `-` only." }
+                    "chat_handle": { "type": "string", "description": "Optional IM mention this bot answers to (without leading `@`). Omit to auto-mint an unused scientist nickname. Letters, digits, `_`, `-` only." },
+                    "project_dir": { "type": "string", "description": "Absolute path to the project directory hosting .ccteam/workflow.yaml. When omitted, defaults to the MCP server's current working directory (canonicalized). The daemon resolves the bot's working dir as `<project_dir>/.ccteam/chat/<role>/`. Use this when the project lives outside `~/projects/<slug>/` (NAS share, dir basename differs from workflow slug)." }
                 },
                 "required": ["workflow_slug", "role", "vendor", "im_platform", "im_chat_id"],
             }),
@@ -158,10 +159,56 @@ pub fn dispatch(paths: &CcteamPaths, name: &str, args: &Value) -> Result<Option<
         "ccteam__chat_register_bot" => Ok(Some(dispatch_register_bot(paths, args)?)),
         "ccteam__chat_unregister_bot" => Ok(Some(dispatch_unregister_bot(paths, args)?)),
         "ccteam__chat_list_bots" => Ok(Some(dispatch_list_bots(paths, args)?)),
-        "ccteam__chat_send_input" => Ok(Some(dispatch_send_input_in(&paths.projects_root, args)?)),
-        "ccteam__chat_history" => Ok(Some(dispatch_history_in(&paths.projects_root, args)?)),
-        "ccteam__chat_reset" => Ok(Some(dispatch_reset_in(&paths.projects_root, args)?)),
+        "ccteam__chat_send_input" => Ok(Some(dispatch_send_input_in(
+            &paths.root,
+            &paths.projects_root,
+            args,
+        )?)),
+        "ccteam__chat_history" => Ok(Some(dispatch_history_in(
+            &paths.root,
+            &paths.projects_root,
+            args,
+        )?)),
+        "ccteam__chat_reset" => Ok(Some(dispatch_reset_in(
+            &paths.root,
+            &paths.projects_root,
+            args,
+        )?)),
         _ => Ok(None),
+    }
+}
+
+/// F185 — look up a registration by `(slug, role)` so the chat MCP
+/// dispatchers can honor the bot's persisted `project_dir`. Returns a
+/// synthetic registration with `project_dir = None` (legacy fallback
+/// layout) when the bot isn't registered — pre-registration MCP calls
+/// continue to resolve against `<projects_root>/<slug>/`, matching
+/// the historical contract.
+fn lookup_or_synthesize_reg(
+    ccteam_root: &Path,
+    workflow_slug: &str,
+    role: &str,
+) -> ccteam_imd::BotRegistration {
+    let regs = list_bots_in(ccteam_root, Some(workflow_slug)).unwrap_or_default();
+    if let Some(r) = regs
+        .into_iter()
+        .find(|b| b.workflow_slug == workflow_slug && b.role == role)
+    {
+        return r;
+    }
+    ccteam_imd::BotRegistration {
+        workflow_slug: workflow_slug.to_string(),
+        role: role.to_string(),
+        // Vendor / im_platform / im_chat_id are unused on the
+        // path-resolution code paths; we still need *some* values to
+        // build the struct.
+        vendor: ccteam_core::harness::AgentVendor::Claude,
+        persona_id: None,
+        im_platform: "mcp".to_string(),
+        im_chat_id: "0".to_string(),
+        chat_handle: None,
+        project_dir: None,
+        created_at: chrono::Utc::now(),
     }
 }
 
@@ -201,6 +248,30 @@ pub(crate) fn dispatch_register_bot(paths: &CcteamPaths, args: &Value) -> Result
         _ => Some(mint_unused_handle(&paths.root)?),
     };
 
+    // F185 — caller-supplied `project_dir` MUST be absolute. When
+    // omitted, default to the MCP server's `current_dir` canonicalized
+    // through the filesystem (resolves symlinks too — daemon stores the
+    // post-canonical form so a moved symlink doesn't silently rebind).
+    let project_dir = match args.get("project_dir").and_then(|v| v.as_str()) {
+        Some(p) if !p.is_empty() => {
+            let path = std::path::PathBuf::from(p);
+            if !path.is_absolute() {
+                return Err(anyhow!(
+                    "`project_dir` must be an absolute path (got `{}`)",
+                    p
+                ));
+            }
+            path
+        }
+        _ => std::env::current_dir().context("std::env::current_dir for default project_dir")?,
+    };
+    let project_dir = std::fs::canonicalize(&project_dir).with_context(|| {
+        format!(
+            "canonicalize project_dir `{}` (does the path exist?)",
+            project_dir.display()
+        )
+    })?;
+
     let outcome = register_bot_checked_in(
         &paths.root,
         &workflow_slug,
@@ -210,6 +281,7 @@ pub(crate) fn dispatch_register_bot(paths: &CcteamPaths, args: &Value) -> Result
         &im_chat_id,
         persona_id.as_deref(),
         chat_handle.as_deref(),
+        Some(project_dir.as_path()),
     )?;
     match outcome {
         RegisterOutcome::Registered(path) => Ok(serde_json::to_string_pretty(&json!({
@@ -218,6 +290,7 @@ pub(crate) fn dispatch_register_bot(paths: &CcteamPaths, args: &Value) -> Result
             "workflow_slug": workflow_slug,
             "role": role,
             "chat_handle": chat_handle,
+            "project_dir": project_dir.display().to_string(),
         }))?),
         RegisterOutcome::AlreadyRegistered(path) => Ok(serde_json::to_string_pretty(&json!({
             "ok": false,
@@ -294,8 +367,7 @@ pub(crate) fn dispatch_list_bots(paths: &CcteamPaths, args: &Value) -> Result<St
         .into_iter()
         .map(|reg| {
             let running = bot_running_status_in(&paths.root, &reg.workflow_slug, &reg.role);
-            let last = last_turn_at(&paths.projects_root, &reg.workflow_slug, &reg.role)
-                .map(|dt| dt.to_rfc3339());
+            let last = last_turn_at(&paths.projects_root, &reg).map(|dt| dt.to_rfc3339());
             // vendor is serialized via AgentVendor's `rename_all = "lowercase"`
             // — see ccteam_core::harness::AgentVendor — so the wire shape is
             // guaranteed `"claude"` / `"codex"` (Bug A防线).
@@ -307,6 +379,7 @@ pub(crate) fn dispatch_list_bots(paths: &CcteamPaths, args: &Value) -> Result<St
                 "im_chat_id": reg.im_chat_id,
                 "persona_id": reg.persona_id,
                 "chat_handle": reg.chat_handle,
+                "project_dir": reg.project_dir,
                 "created_at": reg.created_at.to_rfc3339(),
                 "running": running,
                 "last_turn_at": last,
@@ -321,8 +394,18 @@ pub(crate) fn dispatch_list_bots(paths: &CcteamPaths, args: &Value) -> Result<St
 
 /// V0.6.5 F147 — `ccteam__chat_send_input` dispatcher (tempdir-aware
 /// variant for tests). Production callers go through [`dispatch`] which
-/// substitutes `paths.projects_root` for `projects_root`.
-pub fn dispatch_send_input_in(projects_root: &Path, args: &Value) -> Result<String> {
+/// substitutes `paths.{root,projects_root}` for the two roots.
+///
+/// F185 — looks up the bot's registration so the envelope is written
+/// to `<reg.project_dir>/.ccteam/chat/<role>/inbox/` when the
+/// registration carries an explicit `project_dir`. Pre-registration
+/// callers (no matching reg yet) fall back to the legacy
+/// `<projects_root>/<slug>/` layout via [`lookup_or_synthesize_reg`].
+pub fn dispatch_send_input_in(
+    ccteam_root: &Path,
+    projects_root: &Path,
+    args: &Value,
+) -> Result<String> {
     let workflow_slug = arg_str(args, "workflow_slug")?;
     validate_slug(&workflow_slug, "workflow_slug")?;
     let role = arg_str(args, "role")?;
@@ -336,7 +419,8 @@ pub fn dispatch_send_input_in(projects_root: &Path, args: &Value) -> Result<Stri
         .and_then(|v| v.as_str())
         .map(String::from);
 
-    let inbox = chat_inbox_dir(projects_root, &workflow_slug, &role);
+    let reg = lookup_or_synthesize_reg(ccteam_root, &workflow_slug, &role);
+    let inbox = chat_inbox_dir(projects_root, &reg);
     fs::create_dir_all(&inbox).with_context(|| format!("mkdir -p {}", inbox.display()))?;
 
     // Compose a router-shaped envelope. We bypass the IM security
@@ -380,7 +464,14 @@ pub fn dispatch_send_input_in(projects_root: &Path, args: &Value) -> Result<Stri
 
 /// V0.6.5 F147 — `ccteam__chat_history` dispatcher (tempdir-aware
 /// variant for tests).
-pub fn dispatch_history_in(projects_root: &Path, args: &Value) -> Result<String> {
+///
+/// F185 — reads under the bot's registered `project_dir` (when set)
+/// rather than the legacy `<projects_root>/<slug>/` join.
+pub fn dispatch_history_in(
+    ccteam_root: &Path,
+    projects_root: &Path,
+    args: &Value,
+) -> Result<String> {
     let workflow_slug = arg_str(args, "workflow_slug")?;
     validate_slug(&workflow_slug, "workflow_slug")?;
     let role = arg_str(args, "role")?;
@@ -395,8 +486,9 @@ pub fn dispatch_history_in(projects_root: &Path, args: &Value) -> Result<String>
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let project_dir = projects_root.join(&workflow_slug);
-    let turns_path = turns_jsonl_path(projects_root, &workflow_slug, &role);
+    let reg = lookup_or_synthesize_reg(ccteam_root, &workflow_slug, &role);
+    let project_dir = reg.project_root(projects_root);
+    let turns_path = turns_jsonl_path(projects_root, &reg);
 
     // Missing file = bot registered but no turn yet. Return empty list
     // rather than erroring so caller can treat "no history" uniformly.
@@ -441,13 +533,17 @@ pub fn dispatch_history_in(projects_root: &Path, args: &Value) -> Result<String>
 
 /// V0.6.5 F147 — `ccteam__chat_reset` dispatcher (tempdir-aware variant
 /// for tests).
-pub fn dispatch_reset_in(projects_root: &Path, args: &Value) -> Result<String> {
+///
+/// F185 — writes the signal under the bot's registered `project_dir`
+/// when set; falls back to `<projects_root>/<slug>/` otherwise.
+pub fn dispatch_reset_in(ccteam_root: &Path, projects_root: &Path, args: &Value) -> Result<String> {
     let workflow_slug = arg_str(args, "workflow_slug")?;
     validate_slug(&workflow_slug, "workflow_slug")?;
     let role = arg_str(args, "role")?;
     validate_slug(&role, "role")?;
 
-    let sig = chat_reset_signal_path(projects_root, &workflow_slug, &role);
+    let reg = lookup_or_synthesize_reg(ccteam_root, &workflow_slug, &role);
+    let sig = chat_reset_signal_path(projects_root, &reg);
     if let Some(parent) = sig.parent() {
         fs::create_dir_all(parent).with_context(|| format!("mkdir -p {}", parent.display()))?;
     }

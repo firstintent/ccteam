@@ -25,6 +25,7 @@ fn mk(slug: &str, role: &str, handle: Option<&str>, platform: &str, chat: &str) 
         im_platform: platform.into(),
         im_chat_id: chat.into(),
         chat_handle: handle.map(String::from),
+        project_dir: None,
         created_at: chrono::Utc::now(),
     }
 }
