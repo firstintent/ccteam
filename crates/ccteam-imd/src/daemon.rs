@@ -40,7 +40,7 @@ use crate::inbound::{
 use crate::latency::now_unix_ms;
 use crate::nl_admin::AdminExecutor;
 use crate::outbound;
-use crate::router::HandleMap;
+use crate::router::{self, HandleMap};
 use crate::supervisor::{self, BotSupervisor};
 use crate::three_layer_sec::ThreeLayerSec;
 use crate::transport::providers::telegram::TelegramChannel;
@@ -572,6 +572,7 @@ fn spawn_inbound_consumer(
                         path,
                         payload,
                         cid: item_cid,
+                        hop,
                     } = outcome
                     {
                         let guard = bot_channels.lock().await;
@@ -583,6 +584,7 @@ fn spawn_inbound_consumer(
                                 payload,
                                 path,
                                 enqueue_unix_ms: now_unix_ms(),
+                                hop,
                             };
                             if let Err(err) = ch.inbox_tx.try_send(item) {
                                 tracing::warn!(
@@ -751,6 +753,11 @@ async fn ensure_bot_channels(
             outbound_cursor.clone(),
             slug_log,
             role_log,
+            // V0.6.8 F193 — hand the dispatcher a clone of the
+            // BotChannelMap so it can synthesize cross-bot `InboxItem`s
+            // when the reply contains `@<otherbot>`. Cheap: the map is
+            // `Arc<Mutex<HashMap<..>>>`, cloning is just an Arc bump.
+            bot_channels.clone(),
         ));
 
         // Tell the supervisor about the outbound side so its events
@@ -790,7 +797,7 @@ async fn spawn_inbox_dispatcher(
     while let Some(item) = rx.recv().await {
         let queue_age_ms = now_unix_ms().saturating_sub(item.enqueue_unix_ms) as u64;
         let submit_t0 = std::time::Instant::now();
-        match sup.handle_inbound(item.payload).await {
+        match sup.handle_inbound(item.payload, item.hop).await {
             Ok(turn_id) => {
                 tracing::info!(
                     event = "latency",
@@ -840,6 +847,7 @@ async fn spawn_inbox_dispatcher(
 /// this gives both writers a single source of truth and closes both
 /// the cursor-rewind loop and the per-row double-send window that
 /// the NAS-environment bug exposed.
+#[allow(clippy::too_many_arguments)]
 async fn spawn_outbound_dispatcher(
     mut rx: mpsc::Receiver<OutboundItem>,
     channel: Arc<dyn Channel + Send + Sync>,
@@ -848,6 +856,7 @@ async fn spawn_outbound_dispatcher(
     cursor: Arc<outbound::OutboundCursor>,
     slug_log: String,
     role_log: String,
+    bot_channels: BotChannelMap,
 ) {
     while let Some(item) = rx.recv().await {
         // Already covered by drain_outboxes — skip the redundant TG
@@ -888,6 +897,28 @@ async fn spawn_outbound_dispatcher(
                     "latency imd.outbound.dispatch (mpsc)"
                 );
                 cursor.try_advance(item.cursor_after).await;
+
+                // V0.6.8 F193 — cross-bot @mention fast-path. After the
+                // reply hits IM, scan it for `@<otherhandle>` and push
+                // a synthetic InboxItem directly into the target bot's
+                // mpsc. Logic factored into a pub helper for direct
+                // testability (the dispatcher is otherwise private).
+                //
+                // Short-circuit when the reply has no `@` at all so the
+                // common (no-mention) case skips the `list_bots()` disk
+                // read. `parse_first_mention` returns None anyway in
+                // that case, but checking here avoids the I/O entirely.
+                if item.content.contains('@') {
+                    let bots_now = list_bots().unwrap_or_default();
+                    dispatch_cross_bot_mention(
+                        &item,
+                        &slug_log,
+                        &role_log,
+                        &bots_now,
+                        &bot_channels,
+                    )
+                    .await;
+                }
             }
             Err(err) => {
                 // Don't advance cursor on failure — the safety-net
@@ -907,6 +938,172 @@ async fn spawn_outbound_dispatcher(
         }
     }
     tracing::debug!(slug = %slug_log, role = %role_log, "imd: outbound dispatcher exited");
+}
+
+/// Outcome of one cross-bot @mention scan. Exposed mainly so tests can
+/// assert on the routing decision without inspecting tracing output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CrossBotDispatch {
+    /// Reply had no `@<handle>` mention.
+    NoMention,
+    /// Handle parsed but no registered bot answers to it.
+    UnknownHandle {
+        /// The literal handle parsed (without `@`).
+        handle: String,
+    },
+    /// Handle resolved to the sender itself — dropped to avoid loops.
+    SelfMention,
+    /// Resolved + within budget + target mpsc wired — pushed.
+    Dispatched {
+        /// Target slug the synthetic InboxItem was sent to.
+        to_slug: String,
+        /// Target role the synthetic InboxItem was sent to.
+        to_role: String,
+        /// `sender_hop + 1`.
+        hop: u8,
+    },
+    /// Resolved + budget exhausted (`hop + 1 >= MAX_HOPS`).
+    HopExceeded {
+        /// Target slug that would have received the InboxItem.
+        to_slug: String,
+        /// Target role that would have received the InboxItem.
+        to_role: String,
+        /// The hop value that exceeded the budget (`sender_hop + 1`).
+        hop: u8,
+    },
+    /// Resolved but the target bot's mpsc isn't wired in
+    /// `bot_channels` yet (race: target registered after sender's
+    /// dispatcher spawned, supervisor tick hasn't run `ensure_bot_channels`
+    /// for it yet). Dropped — no envelope file exists so safety-net
+    /// drain doesn't cover this.
+    TargetNotWired {
+        /// Target slug the lookup resolved to.
+        to_slug: String,
+        /// Target role the lookup resolved to.
+        to_role: String,
+    },
+    /// Resolved + budget OK but the target inbox is full (try_send
+    /// returned Err). Dropped — same reason as TargetNotWired.
+    InboxFull {
+        /// Target slug whose inbox was full.
+        to_slug: String,
+        /// Target role whose inbox was full.
+        to_role: String,
+    },
+}
+
+/// V0.6.8 F193 — scan an OutboundItem's content for a `@<otherbot>`
+/// mention; if it resolves to a registered bot AND we have hop budget,
+/// synthesize a fresh `InboxItem` (hop = sender_hop + 1) and `try_send`
+/// it directly into that bot's `inbox_tx`. Returns the dispatch outcome
+/// for tests / structured logging.
+///
+/// Called from `spawn_outbound_dispatcher` immediately after a
+/// successful `channel.send` (assistant rows only — non-assistant rows
+/// short-circuit before the scan). Cursor-skip + non-assistant paths
+/// don't fire cross-mention by design: the safety-net drain doesn't
+/// emit synthetic mpsc items, so duplicating the scan there would
+/// double-route on overlap.
+///
+/// Self-mention guard uses the resolved `(slug, role)` tuple, NOT the
+/// handle string — a bot's `chat_handle` may override its role, and two
+/// slugs can legitimately share a role name (e.g. two squads with a
+/// `reporter`).
+pub async fn dispatch_cross_bot_mention(
+    item: &OutboundItem,
+    sender_slug: &str,
+    sender_role: &str,
+    bots: &[BotRegistration],
+    bot_channels: &BotChannelMap,
+) -> CrossBotDispatch {
+    let Some((handle, rest)) = router::parse_first_mention(&item.content) else {
+        return CrossBotDispatch::NoMention;
+    };
+    let handles = build_handle_map_from_bots(bots);
+    let Some((target_slug, target_role)) = handles.lookup(&handle) else {
+        return CrossBotDispatch::UnknownHandle { handle };
+    };
+    if target_slug.as_str() == sender_slug && target_role.as_str() == sender_role {
+        return CrossBotDispatch::SelfMention;
+    }
+    let next_hop = item.hop.saturating_add(1);
+    if !router::within_hop_budget(next_hop) {
+        tracing::info!(
+            event = "cross_bot_mention_hop_exceeded",
+            from_slug = %sender_slug,
+            from_role = %sender_role,
+            to_slug = %target_slug,
+            to_role = %target_role,
+            hop = next_hop,
+            max = router::MAX_HOPS,
+            "F193 mention dropped (hop budget exceeded)"
+        );
+        return CrossBotDispatch::HopExceeded {
+            to_slug: target_slug,
+            to_role: target_role,
+            hop: next_hop,
+        };
+    }
+    let guard = bot_channels.lock().await;
+    let Some(ch) = guard.get(&bot_key(&target_slug, &target_role)) else {
+        tracing::debug!(
+            from_slug = %sender_slug,
+            from_role = %sender_role,
+            to_slug = %target_slug,
+            to_role = %target_role,
+            "F193 target mpsc not yet wired; cross-mention dropped"
+        );
+        return CrossBotDispatch::TargetNotWired {
+            to_slug: target_slug,
+            to_role: target_role,
+        };
+    };
+    // Synthetic InboxItem: `path = PathBuf::new()` — there is no
+    // envelope file on disk. The inbox dispatcher's `remove_file` will
+    // silently fail (correct: nothing to unlink).
+    let item_synth = InboxItem {
+        cid: format!("cross-{}", item.turn_id),
+        slug: target_slug.clone(),
+        role: target_role.clone(),
+        payload: rest,
+        path: PathBuf::new(),
+        enqueue_unix_ms: now_unix_ms(),
+        hop: next_hop,
+    };
+    match ch.inbox_tx.try_send(item_synth) {
+        Ok(_) => {
+            tracing::info!(
+                event = "cross_bot_mention",
+                from_slug = %sender_slug,
+                from_role = %sender_role,
+                to_slug = %target_slug,
+                to_role = %target_role,
+                hop = next_hop,
+                turn_id = %item.turn_id,
+                "F193 cross-bot @mention routed via mpsc"
+            );
+            CrossBotDispatch::Dispatched {
+                to_slug: target_slug,
+                to_role: target_role,
+                hop: next_hop,
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                event = "cross_bot_mention_drop",
+                from_slug = %sender_slug,
+                from_role = %sender_role,
+                to_slug = %target_slug,
+                to_role = %target_role,
+                error = %err,
+                "F193 target inbox saturated; dropped"
+            );
+            CrossBotDispatch::InboxFull {
+                to_slug: target_slug,
+                to_role: target_role,
+            }
+        }
+    }
 }
 
 /// V0.6.1 F132 — once per tick, for each registered bot:
@@ -982,7 +1179,11 @@ async fn drain_inboxes(
                     let received_ms = env.received_at.timestamp_millis().max(0) as u128;
                     let queue_age_ms = now_unix_ms().saturating_sub(received_ms) as u64;
                     let drain_t0 = std::time::Instant::now();
-                    match sup.handle_inbound(env.payload).await {
+                    // V0.6.8 F193 — thread the on-disk envelope's hop
+                    // through the safety-net drain too so a daemon
+                    // restart between cross-mention synth and consume
+                    // still respects the bot-to-bot loop budget.
+                    match sup.handle_inbound(env.payload, env.hop).await {
                         Ok(id) => {
                             tracing::info!(
                                 event = "latency",

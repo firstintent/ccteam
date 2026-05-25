@@ -192,7 +192,7 @@ async fn drain_inbox_into_supervisor(
     for entry in entries {
         let body = std::fs::read_to_string(entry.path()).unwrap();
         let env = ccteam_imd::inbound::parse_envelope(&body).unwrap();
-        sup.handle_inbound(env.payload).await.unwrap();
+        sup.handle_inbound(env.payload, env.hop).await.unwrap();
         std::fs::remove_file(entry.path()).unwrap();
         count += 1;
     }
@@ -355,7 +355,7 @@ async fn close_thread_cleanup_idempotent() {
     assert_eq!(adapter.closes.load(Ordering::SeqCst), 1);
     assert!(!sup.is_started().await);
     // handle_inbound should refuse after shutdown (no handle).
-    assert!(sup.handle_inbound("ignored".into()).await.is_err());
+    assert!(sup.handle_inbound("ignored".into(), 0).await.is_err());
 }
 
 // ---------------------------------------------------------------------

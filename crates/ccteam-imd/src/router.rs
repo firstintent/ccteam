@@ -99,7 +99,12 @@ impl Default for HandleMap {
 
 /// Extract the **first** `@handle` in the text. Returns the handle
 /// (without `@`) plus the rest of the text with that mention stripped.
-fn parse_first_mention(text: &str) -> Option<(String, String)> {
+///
+/// V0.6.8 F193 — `pub` so the daemon's outbound dispatcher can scan a
+/// bot's reply for an embedded `@<otherbot>` and route it back through
+/// the in-daemon mpsc inbox (bot-to-bot @-addressing, no IM
+/// round-trip).
+pub fn parse_first_mention(text: &str) -> Option<(String, String)> {
     let mut handle = String::new();
     let mut start = None;
     for (i, ch) in text.char_indices() {

@@ -29,6 +29,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -346,6 +347,20 @@ pub struct BotSupervisor {
     /// `Some`, the events consumer additionally sends each assistant
     /// row through the channel for ~immediate dispatch.
     outbound_tx: Arc<Mutex<Option<mpsc::Sender<OutboundItem>>>>,
+    /// V0.6.8 F193 — hop counter of the most recent inbound turn the
+    /// supervisor accepted. Stored atomically so the spawned events
+    /// consumer (which builds the [`OutboundItem`] for each reply) can
+    /// stamp every outbound row with the inbound's hop. The daemon's
+    /// outbound dispatcher then computes `next_hop = item.hop + 1`
+    /// when it detects an embedded `@<otherbot>` mention and
+    /// synthesizes a cross-bot `InboxItem`.
+    ///
+    /// Set in `handle_inbound` before `submit_turn`; read per-event in
+    /// `spawn_events_consumer`. Replies from a turn we never observed
+    /// (host-probe direct `submit_turn`, daemon restart while a tmux
+    /// session is mid-conversation) inherit the default value `0`,
+    /// matching the "user-IM-sourced" hop semantic.
+    current_hop: Arc<AtomicU8>,
 }
 
 impl std::fmt::Debug for BotSupervisor {
@@ -393,6 +408,7 @@ impl BotSupervisor {
             heartbeat_task: Mutex::new(None),
             events_task: Mutex::new(None),
             outbound_tx: Arc::new(Mutex::new(None)),
+            current_hop: Arc::new(AtomicU8::new(0)),
         }
     }
 
@@ -716,6 +732,12 @@ impl BotSupervisor {
         // disable the fast path. Locking per event is fine — this is a
         // tokio Mutex held only for a `clone()`, single-task contention.
         let outbound_tx_arc = self.outbound_tx.clone();
+        // V0.6.8 F193 — clone the current_hop Arc so each event reads
+        // the hop value last stashed by `handle_inbound`. The atomic
+        // load is wait-free; the per-event read picks up the most
+        // recent value (across submit_turn await points + scheduler
+        // hand-off).
+        let current_hop_arc = self.current_hop.clone();
         let task = tokio::spawn(async move {
             let mut stream = adapter.events(&handle);
             while let Some(evt) = stream.next().await {
@@ -772,12 +794,14 @@ impl BotSupervisor {
                         // (e.g. supervisor restart mid-turn).
                         let tx_now = outbound_tx_arc.lock().await.clone();
                         if let Some(tx) = tx_now {
+                            let hop = current_hop_arc.load(Ordering::SeqCst);
                             let item = OutboundItem {
                                 turn_id: turn_id_log.clone(),
                                 role: "assistant".into(),
                                 content: record.assistant.clone(),
                                 cursor_after,
                                 enqueue_unix_ms: now_unix_ms(),
+                                hop,
                             };
                             // `try_send` because the dispatcher is
                             // bounded; if it's backlogged the safety-net
@@ -838,7 +862,20 @@ impl BotSupervisor {
     ///
     /// Returns an error when the thread isn't started yet — callers
     /// typically `ensure_started().await?` first.
-    pub async fn handle_inbound(&self, payload: String) -> Result<TurnId> {
+    ///
+    /// V0.6.8 F193 — `hop` is the bot-to-bot loop-guard counter of the
+    /// inbound turn. The supervisor stores it on `current_hop` so the
+    /// outbound events consumer can stamp every reply's
+    /// `OutboundItem.hop` with it; the outbound dispatcher reads that
+    /// value to compute `next_hop = hop + 1` when it detects an
+    /// embedded `@<otherbot>` mention and synthesizes a cross-bot
+    /// `InboxItem`. User-IM-sourced turns enter with `hop = 0`.
+    pub async fn handle_inbound(&self, payload: String, hop: u8) -> Result<TurnId> {
+        // V0.6.8 F193 — stash the inbound hop BEFORE submit_turn so the
+        // events consumer (which fires asynchronously when the adapter
+        // emits ItemCompleted) reads the right value when it builds
+        // the OutboundItem.
+        self.current_hop.store(hop, Ordering::SeqCst);
         let handle = {
             let st = self.state.lock().await;
             st.handle.clone().ok_or_else(|| {
@@ -863,6 +900,7 @@ impl BotSupervisor {
             slug = %self.reg.workflow_slug,
             role = %self.reg.role,
             turn = %id.0,
+            hop,
             "submitted user turn"
         );
         Ok(id)
@@ -1203,7 +1241,7 @@ mod bot_supervisor_tests {
         let tmp = TempDir::new().unwrap();
         let sup = BotSupervisor::new(reg(), tmp.path(), stub.clone());
         sup.ensure_started().await.unwrap();
-        let id = sup.handle_inbound("hello".into()).await.unwrap();
+        let id = sup.handle_inbound("hello".into(), 0).await.unwrap();
         assert_eq!(id.0, "stub-turn");
         assert_eq!(stub.submits.load(Ordering::SeqCst), 1);
     }
@@ -1213,7 +1251,7 @@ mod bot_supervisor_tests {
         let stub = Arc::new(StubAdapter::default());
         let tmp = TempDir::new().unwrap();
         let sup = BotSupervisor::new(reg(), tmp.path(), stub.clone());
-        assert!(sup.handle_inbound("x".into()).await.is_err());
+        assert!(sup.handle_inbound("x".into(), 0).await.is_err());
         assert_eq!(stub.submits.load(Ordering::SeqCst), 0);
     }
 
