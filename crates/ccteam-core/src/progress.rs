@@ -337,6 +337,60 @@ pub fn build_chat_bot_permanent_failure_event(role: &str, reason: &str, attempts
     })
 }
 
+/// `chat_marker_self_heal_attempt` — V0.6.8 F196. Emitted each time the
+/// supervisor escalates from a sustained "marker missing" state to a
+/// session reset. The SessionStart hook writes the F176
+/// `active-session-id` marker; when it fails (state.json missing,
+/// hook env propagation broke, hook subprocess errored), the tail loop
+/// polls forever and the bot is silently dead despite a healthy tmux
+/// pane. After [`MARKER_MISSING_RESET_THRESHOLD`] consecutive
+/// marker-missing reports the supervisor calls `reset_session` to
+/// auto-recover (same code path operators trigger via
+/// `signals/reset.signal`). This event records the escalation for
+/// operator-facing observability.
+///
+/// Payload: `{role, attempt_n, ts}`. `attempt_n` is the 1-based index
+/// of the heal attempt (1..=`MAX_MARKER_SELF_HEAL_ATTEMPTS`).
+pub const CHAT_MARKER_SELF_HEAL_ATTEMPT: &str = "chat_marker_self_heal_attempt";
+
+/// V0.6.8 F196 — build a `chat_marker_self_heal_attempt` event JSON.
+/// See [`CHAT_MARKER_SELF_HEAL_ATTEMPT`] for semantics.
+pub fn build_chat_marker_self_heal_attempt_event(role: &str, attempt_n: u32) -> Value {
+    serde_json::json!({
+        "event": CHAT_MARKER_SELF_HEAL_ATTEMPT,
+        "role": role,
+        "attempt_n": attempt_n,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
+/// `chat_bot_marker_stuck` — V0.6.8 F196. Emitted after the supervisor
+/// has burned through `MAX_MARKER_SELF_HEAL_ATTEMPTS` consecutive
+/// session resets without the F176 `active-session-id` marker ever
+/// appearing again. At this point the supervisor latches the
+/// "marker stuck" state and stops attempting further self-heal resets
+/// (same envelope as F192c's `chat_bot_permanent_failure`). Recovery:
+/// operator restores the SessionStart hook prerequisite (typically
+/// re-creates the bot's `state.json`) and runs
+/// `ccteam restart-bot <slug>/<role>` or writes `signals/reset.signal`.
+///
+/// Payload: `{role, attempts, ts}`. `attempts` is the number of
+/// consecutive failed self-heal resets, always
+/// `MAX_MARKER_SELF_HEAL_ATTEMPTS` at the moment but kept as a field so
+/// future tuning lands on the wire without a schema bump.
+pub const CHAT_BOT_MARKER_STUCK: &str = "chat_bot_marker_stuck";
+
+/// V0.6.8 F196 — build a `chat_bot_marker_stuck` event JSON.
+/// See [`CHAT_BOT_MARKER_STUCK`] for semantics.
+pub fn build_chat_bot_marker_stuck_event(role: &str, attempts: u32) -> Value {
+    serde_json::json!({
+        "event": CHAT_BOT_MARKER_STUCK,
+        "role": role,
+        "attempts": attempts,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
 // ---------------- V0.6.1 F98 plan-approval event kinds ----------------
 
 /// `plan_pending` — agent wrote a plan markdown to
@@ -912,6 +966,34 @@ mod tests {
         let ev = build_chat_session_reset_with_recovery_event("frank", 12);
         assert_eq!(ev["event"], CHAT_SESSION_RESET_WITH_RECOVERY);
         assert_eq!(ev["recovered_turns"], 12);
+    }
+
+    #[test]
+    fn build_chat_marker_self_heal_attempt_event_shape() {
+        // V0.6.8 F196 — attempt_n 1-based, carries role + ts, no
+        // surprise fields. Web SSE / api_v1 consumers handle this
+        // untyped (per F192c verification — same envelope).
+        let ev = build_chat_marker_self_heal_attempt_event("grace", 2);
+        assert_eq!(ev["event"], CHAT_MARKER_SELF_HEAL_ATTEMPT);
+        assert_eq!(ev["role"], "grace");
+        assert_eq!(ev["attempt_n"], 2);
+        assert!(ev["ts"].is_string());
+    }
+
+    #[test]
+    fn build_chat_bot_marker_stuck_event_shape() {
+        // V0.6.8 F196 — same envelope as F192c
+        // chat_bot_permanent_failure: role + attempts + ts. No
+        // freeform reason field because the failure mode is
+        // structural (SessionStart hook prerequisite missing) and
+        // the operator-facing surface for diagnostics is the F187
+        // tail_marker_missing WARN line + the supervisor's heal
+        // attempt history.
+        let ev = build_chat_bot_marker_stuck_event("hank", 3);
+        assert_eq!(ev["event"], CHAT_BOT_MARKER_STUCK);
+        assert_eq!(ev["role"], "hank");
+        assert_eq!(ev["attempts"], 3);
+        assert!(ev["ts"].is_string());
     }
 
     #[test]

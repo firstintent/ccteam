@@ -482,6 +482,15 @@ impl HarnessAdapter for ClaudeTuiAdapter {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        // V0.6.8 F196 — tail_loop needs `slug` so it can consult the
+        // per-bot MarkerReporter registry. Pre-F196 the loop only knew
+        // `role`; the slug is in `raw_extras` (start_thread writes it).
+        let slug = h
+            .raw_extras
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let project_dir = h
             .raw_extras
             .get("project_dir")
@@ -497,7 +506,7 @@ impl HarnessAdapter for ClaudeTuiAdapter {
 
         if let (Some(pdir), Some(cwd)) = (project_dir, cwd) {
             if !role.is_empty() {
-                tokio::spawn(tail_loop(pdir, cwd, role, tx));
+                tokio::spawn(tail_loop(pdir, cwd, slug, role, tx));
             }
         }
 
@@ -580,6 +589,7 @@ impl HarnessAdapter for ClaudeTuiAdapter {
 async fn tail_loop(
     project_dir: PathBuf,
     cwd: PathBuf,
+    slug: String,
     role: String,
     tx: mpsc::Sender<ThreadEvent>,
 ) {
@@ -629,7 +639,7 @@ async fn tail_loop(
             );
             // Best-effort fallback to the legacy polling path —
             // shouldn't realistically happen on supported platforms.
-            tail_loop_polling(project_dir, cwd, role, tx).await;
+            tail_loop_polling(project_dir, cwd, slug, role, tx).await;
             return;
         }
     };
@@ -640,7 +650,7 @@ async fn tail_loop(
             "claude-tui tail: watch() failed; falling back to plain polling"
         );
         drop(watcher);
-        tail_loop_polling(project_dir, cwd, role, tx).await;
+        tail_loop_polling(project_dir, cwd, slug, role, tx).await;
         return;
     }
     tracing::info!(
@@ -661,7 +671,15 @@ async fn tail_loop(
     // once the marker appears (resets on first marker-found read).
     let mut silence = MarkerSilenceWatch::from_env();
     let initial = read_marker_target(&marker_file, &parent_dir);
-    silence.observe(initial.is_some(), &marker_file, &role, &project_dir);
+    observe_marker(
+        &mut silence,
+        initial.is_some(),
+        &marker_file,
+        &slug,
+        &role,
+        &project_dir,
+    )
+    .await;
     if let Some((sid, path)) = initial {
         if cursor.switch_session(&sid, encode_project_cwd(&cwd)) {
             pending.clear();
@@ -689,11 +707,27 @@ async fn tail_loop(
                 // toward the silence WARN clock.
                 let target_sid = match read_marker_sid(&marker_file) {
                     Some(sid) => {
-                        silence.observe(true, &marker_file, &role, &project_dir);
+                        observe_marker(
+                            &mut silence,
+                            true,
+                            &marker_file,
+                            &slug,
+                            &role,
+                            &project_dir,
+                        )
+                        .await;
                         sid
                     }
                     None => {
-                        silence.observe(false, &marker_file, &role, &project_dir);
+                        observe_marker(
+                            &mut silence,
+                            false,
+                            &marker_file,
+                            &slug,
+                            &role,
+                            &project_dir,
+                        )
+                        .await;
                         continue;
                     }
                 };
@@ -731,7 +765,15 @@ async fn tail_loop(
                 // that gates the silence WARN — at 2s/tick we hit the
                 // 60s threshold after ~30 consecutive misses.
                 let pair = read_marker_target(&marker_file, &parent_dir);
-                silence.observe(pair.is_some(), &marker_file, &role, &project_dir);
+                observe_marker(
+                    &mut silence,
+                    pair.is_some(),
+                    &marker_file,
+                    &slug,
+                    &role,
+                    &project_dir,
+                )
+                .await;
                 if let Some((sid, path)) = pair {
                     if cursor.switch_session(&sid, encode_project_cwd(&cwd)) {
                         pending.clear();
@@ -739,6 +781,45 @@ async fn tail_loop(
                     drain_path(&path, &mut cursor, &mut pending, &cursor_file, &tx).await;
                 }
             }
+        }
+    }
+}
+
+/// V0.6.8 F196 — single observation point that fans out to both the
+/// F187 in-process WARN gate ([`MarkerSilenceWatch`]) and the
+/// supervisor-side state machine (via the
+/// [`crate::execution::marker_reporter`] registry).
+///
+/// Called once per tail-loop tick (initial sweep, every inotify
+/// CREATE/MODIFY event, and every 2-second safety-net tick in
+/// `tail_loop`; every iteration of the poll-only fallback). The
+/// supervisor counts the misses and escalates to a session reset when
+/// the consecutive run crosses its threshold — `tail_loop` stays a
+/// fire-and-forget reporter and doesn't see the heal decision.
+///
+/// Lookup failures (no supervisor registered, supervisor dropped) are
+/// silently swallowed — the corresponding bot's state machine no
+/// longer matters.
+async fn observe_marker(
+    silence: &mut MarkerSilenceWatch,
+    marker_present: bool,
+    marker_file: &Path,
+    slug: &str,
+    role: &str,
+    project_dir: &Path,
+) {
+    silence.observe(marker_present, marker_file, role, project_dir);
+    // Empty slug means raw_extras was malformed at `events()` entry —
+    // the registry uses `(slug, role)` as the key so an empty slug
+    // would never resolve. Skip the lookup to avoid noise.
+    if slug.is_empty() {
+        return;
+    }
+    if let Some(reporter) = crate::execution::marker_reporter::lookup(slug, role) {
+        if marker_present {
+            reporter.report_marker_found().await;
+        } else {
+            reporter.report_marker_missing().await;
         }
     }
 }
@@ -752,6 +833,13 @@ async fn tail_loop(
 /// role/slug context so the failure mode is grep-able in logs;
 /// suppress further WARNs until the marker appears at least once so
 /// long-running loops don't spam.
+///
+/// V0.6.8 F196 — the WARN gate naturally resets across heals because
+/// the supervisor's `reset_session` aborts the events task and
+/// `ensure_started` respawns a fresh `events()` stream → fresh
+/// `tail_loop` → fresh `MarkerSilenceWatch`. No per-heal-cycle reset
+/// logic is plumbed here; the F196 escalation owns the reset, and
+/// the WARN simply re-arms on the new task.
 struct MarkerSilenceWatch {
     first_missing: Option<Instant>,
     warned: bool,
@@ -888,6 +976,7 @@ async fn drain_path(
 async fn tail_loop_polling(
     project_dir: PathBuf,
     cwd: PathBuf,
+    slug: String,
     role: String,
     tx: mpsc::Sender<ThreadEvent>,
 ) {
@@ -922,11 +1011,19 @@ async fn tail_loop_polling(
         // hasn't published a marker yet, we wait.
         let (sid, transcript_path) = match read_marker_target(&marker_file, &parent_dir) {
             Some(pair) => {
-                silence.observe(true, &marker_file, &role, &project_dir);
+                observe_marker(&mut silence, true, &marker_file, &slug, &role, &project_dir).await;
                 pair
             }
             None => {
-                silence.observe(false, &marker_file, &role, &project_dir);
+                observe_marker(
+                    &mut silence,
+                    false,
+                    &marker_file,
+                    &slug,
+                    &role,
+                    &project_dir,
+                )
+                .await;
                 tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
                 sleep_ms = (sleep_ms * 2).min(2000);
                 continue;
