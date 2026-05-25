@@ -24,7 +24,9 @@ use ccteam_core::harness::{
     ThreadEvent, ThreadHandle, TurnId, TurnInput,
 };
 use ccteam_imd::daemon::{run_daemon_with_shutdown, AdapterFactory, ChannelMap, DaemonArgs};
-use ccteam_imd::inbound::{auto_route_dm_mention, has_at_mention};
+use ccteam_imd::inbound::{
+    auto_route_dm_mention, format_ambiguous_dm_reply, has_at_mention, DmRoutingHint,
+};
 use ccteam_imd::register_bot;
 use ccteam_imd::transport::providers::mock::MockChannel;
 use ccteam_imd::transport::{Channel, ChannelMessage};
@@ -95,38 +97,100 @@ fn has_at_mention_ignores_bare_at() {
 fn auto_route_dm_prepends_for_single_match() {
     let bots = vec![mk_bot("dev-foo", "lead", "telegram", "chat-1")];
     let mut msg = mk_msg("hi", "chat-1", "telegram");
-    auto_route_dm_mention(&mut msg, &bots);
+    let hint = auto_route_dm_mention(&mut msg, &bots);
     assert_eq!(msg.content, "@lead hi");
+    assert_eq!(
+        hint,
+        DmRoutingHint::Routed {
+            to_role: "lead".into()
+        }
+    );
 }
 
 #[test]
 fn auto_route_dm_skips_when_zero_bots() {
     let bots: Vec<BotRegistration> = vec![];
     let mut msg = mk_msg("hi", "chat-1", "telegram");
-    auto_route_dm_mention(&mut msg, &bots);
+    let hint = auto_route_dm_mention(&mut msg, &bots);
     assert_eq!(msg.content, "hi", "no bots → no mutation");
+    assert_eq!(hint, DmRoutingHint::NoMatch);
 }
 
 #[test]
-fn auto_route_dm_skips_when_multiple_bots_share_chat_id() {
+fn auto_route_dm_ambiguous_when_multiple_bots_share_chat_id() {
+    // V0.6.8 F194 — the V0.6.x silent-drop path now returns
+    // DmRoutingHint::Ambiguous so the daemon can reply with an
+    // available-bots hint instead of dropping the message.
     let bots = vec![
         mk_bot("dev-foo", "lead", "telegram", "chat-1"),
         mk_bot("dev-bar", "reviewer", "telegram", "chat-1"),
     ];
     let mut msg = mk_msg("hi", "chat-1", "telegram");
-    auto_route_dm_mention(&mut msg, &bots);
-    assert_eq!(msg.content, "hi", "group-style → require explicit @");
+    let hint = auto_route_dm_mention(&mut msg, &bots);
+    assert_eq!(
+        msg.content, "hi",
+        "ambiguous → message untouched (caller short-circuits with a reply)"
+    );
+    match hint {
+        DmRoutingHint::Ambiguous { available } => {
+            assert_eq!(
+                available,
+                vec!["lead".to_string(), "reviewer".to_string()],
+                "available handles sorted alphabetically"
+            );
+        }
+        other => panic!("expected Ambiguous, got {other:?}"),
+    }
+}
+
+#[test]
+fn auto_route_dm_ambiguous_three_bots_lists_all_handles() {
+    // F194 — same trigger as above but with three bots to confirm the
+    // hint covers all reachable handles (not just two).
+    let bots = vec![
+        mk_bot("dev-a", "alice", "telegram", "chat-1"),
+        mk_bot("dev-b", "bob", "telegram", "chat-1"),
+        mk_bot("dev-c", "carol", "telegram", "chat-1"),
+    ];
+    let mut msg = mk_msg("hello team", "chat-1", "telegram");
+    let hint = auto_route_dm_mention(&mut msg, &bots);
+    match hint {
+        DmRoutingHint::Ambiguous { available } => {
+            assert_eq!(available.len(), 3);
+            assert!(available.contains(&"alice".into()));
+            assert!(available.contains(&"bob".into()));
+            assert!(available.contains(&"carol".into()));
+        }
+        other => panic!("expected Ambiguous, got {other:?}"),
+    }
+}
+
+#[test]
+fn format_ambiguous_dm_reply_renders_handles() {
+    let text = format_ambiguous_dm_reply(&["alice".into(), "bob".into()]);
+    assert_eq!(text, "Multiple bots in this chat. Specify one: @alice @bob");
+}
+
+#[test]
+fn format_ambiguous_dm_reply_handles_empty_race() {
+    // Race: bots unregistered between probe and reply → graceful
+    // fallback so the user still gets *something*.
+    let text = format_ambiguous_dm_reply(&[]);
+    assert_eq!(text, "No bots available in this chat.");
 }
 
 #[test]
 fn auto_route_dm_skips_when_message_already_has_mention() {
     let bots = vec![mk_bot("dev-foo", "lead", "telegram", "chat-1")];
     let mut msg = mk_msg("@lead already", "chat-1", "telegram");
-    auto_route_dm_mention(&mut msg, &bots);
+    let hint = auto_route_dm_mention(&mut msg, &bots);
     assert_eq!(
         msg.content, "@lead already",
         "existing @ → idempotent (no double-prepend)"
     );
+    // We treat "user typed their own @" identically to NoMatch — the
+    // router resolves the explicit mention itself.
+    assert_eq!(hint, DmRoutingHint::NoMatch);
 }
 
 #[test]
@@ -134,14 +198,16 @@ fn auto_route_dm_filters_by_platform_and_chat_id() {
     // Right chat_id, wrong platform → no match.
     let bots = vec![mk_bot("dev-foo", "lead", "slack", "chat-1")];
     let mut msg = mk_msg("hi", "chat-1", "telegram");
-    auto_route_dm_mention(&mut msg, &bots);
+    let hint = auto_route_dm_mention(&mut msg, &bots);
     assert_eq!(msg.content, "hi");
+    assert_eq!(hint, DmRoutingHint::NoMatch);
 
     // Right platform, wrong chat_id → no match.
     let bots = vec![mk_bot("dev-foo", "lead", "telegram", "chat-OTHER")];
     let mut msg = mk_msg("hi", "chat-1", "telegram");
-    auto_route_dm_mention(&mut msg, &bots);
+    let hint = auto_route_dm_mention(&mut msg, &bots);
     assert_eq!(msg.content, "hi");
+    assert_eq!(hint, DmRoutingHint::NoMatch);
 }
 
 // ----- end-to-end: daemon + MockChannel + registered bot ------------
@@ -271,14 +337,19 @@ async fn daemon_dm_no_at_mention_auto_routes_to_single_bot() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn daemon_dm_multiple_bots_same_chat_id_drops() {
+async fn daemon_dm_multiple_bots_same_chat_id_replies_with_ambiguity_hint() {
+    // V0.6.8 F194 — what used to be a silent drop is now an active
+    // hint: the daemon answers with the available-bots list so the
+    // user knows their message was received and how to address it.
+    // R1 (no progress.jsonl write for this synthetic reply) + R12 (no
+    // turn submitted) still hold: only the IM channel.send fires.
     let _g = env_lock();
     let home = isolate_home();
     let projects_root = home.path().join("projects");
     std::fs::create_dir_all(&projects_root).unwrap();
 
-    // Two bots bound to the same telegram chat_id → group-style: must
-    // require explicit @ to disambiguate.
+    // Two bots bound to the same telegram chat_id → group-style: V0.6.8
+    // F194 surfaces a hint reply instead of dropping silently.
     register_bot(
         "dev-foo",
         "lead",
@@ -337,7 +408,25 @@ async fn daemon_dm_multiple_bots_same_chat_id_drops() {
     assert_eq!(
         adapter.submits.load(Ordering::SeqCst),
         0,
-        "group with 2 bots + no @ must drop (got submits={})",
+        "group with 2 bots + no @ must NOT submit a turn (got submits={})",
         adapter.submits.load(Ordering::SeqCst)
     );
+
+    let outbox = mock.outbox().await;
+    let hints: Vec<&ccteam_imd::transport::SendMessage> = outbox
+        .iter()
+        .filter(|m| m.content.starts_with("Multiple bots in this chat."))
+        .collect();
+    assert_eq!(
+        hints.len(),
+        1,
+        "F194: expected exactly 1 ambiguity-hint reply, got {} (outbox: {outbox:?})",
+        hints.len()
+    );
+    let text = &hints[0].content;
+    assert!(
+        text.contains("@lead") && text.contains("@reviewer"),
+        "F194: hint must list both bots' handles, got {text:?}"
+    );
+    assert_eq!(hints[0].recipient, "chat-group");
 }

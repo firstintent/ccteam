@@ -485,6 +485,17 @@ pub struct ChatSpec {
     /// group the IM channel hands us (Wave 2 default; F113 hardens).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_acl: Option<ChatAcl>,
+    /// V0.6.8 F195: per-turn watchdog timeout in seconds. The IMD
+    /// daemon arms a deadline on `submit_turn`; at `1×` the deadline
+    /// it emits `chat_turn_running_long` + a "still working" IM reply,
+    /// at `2×` it emits `chat_turn_timeout` + a "stuck" IM reply.
+    /// **Never kills the turn** (R5 守) — the watchdog only surfaces
+    /// silent stalls. Defaults to [`DEFAULT_TURN_TIMEOUT_SECS`] (90s)
+    /// when omitted. `0` is rejected by validation (use a positive
+    /// integer; there's no "disabled" mode for V0.6.8 — silent stalls
+    /// are exactly what F195 closes).
+    #[serde(default = "default_turn_timeout_sec")]
+    pub turn_timeout_sec: u32,
 }
 
 /// V0.6.0 F108 hop-limit default — 3 hops matches the V0.4.x fix-loop
@@ -498,6 +509,21 @@ pub fn default_hop_limit() -> u32 {
 /// initial-context budget.
 pub fn default_recover_last_n_turns() -> usize {
     20
+}
+
+/// V0.6.8 F195 — per-turn watchdog default (seconds).
+///
+/// 90s leaves enough headroom for normal multi-tool turns to finish
+/// without triggering the "still working" notice, while keeping the
+/// silent-stall feedback loop tight enough that a stuck Stop hook /
+/// tail loop / claude hang doesn't go unsurfaced for minutes.
+pub const DEFAULT_TURN_TIMEOUT_SECS: u32 = 90;
+
+/// V0.6.8 F195 — serde-default constructor for [`ChatSpec::turn_timeout_sec`].
+/// Kept as a function (not a `const` directly) because `#[serde(default = "...")]`
+/// only accepts a function pointer.
+pub fn default_turn_timeout_sec() -> u32 {
+    DEFAULT_TURN_TIMEOUT_SECS
 }
 
 /// V0.6.0 F108 — optional ACL gate for `mode: chat` bots. Empty vecs
@@ -1025,6 +1051,14 @@ impl WorkflowSpec {
                         return Err(WorkflowError::ValidationFailed(
                             "chat.hop_limit must be >= 1 (0 disables bot-to-bot consultation \
                              entirely; use omit-field if that's what you want)"
+                                .to_string(),
+                        ));
+                    }
+                    if chat.turn_timeout_sec == 0 {
+                        return Err(WorkflowError::ValidationFailed(
+                            "chat.turn_timeout_sec must be >= 1 (V0.6.8 F195 watchdog has no \
+                             'disabled' mode — silent stalls are exactly what it closes; omit \
+                             the field for the 90s default)"
                                 .to_string(),
                         ));
                     }
@@ -1778,5 +1812,67 @@ agents:
         let (target, hop) = parse_squad_route("backend--hx--task.md").unwrap();
         assert_eq!(target, "backend");
         assert_eq!(hop, 0);
+    }
+
+    // V0.6.8 F195 — per-turn watchdog schema field round-trip + validation.
+
+    #[test]
+    fn chat_spec_turn_timeout_defaults_to_90_when_absent() {
+        let yaml = "
+name: dev-foo
+mode: chat
+chat:
+  bot_name: alice
+agents:
+  alice:
+    trigger: manual
+";
+        let spec: WorkflowSpec = serde_yaml::from_str(yaml).expect("parse");
+        let chat = spec.chat.as_ref().expect("chat block");
+        assert_eq!(
+            chat.turn_timeout_sec, DEFAULT_TURN_TIMEOUT_SECS,
+            "absent field must default to {DEFAULT_TURN_TIMEOUT_SECS}s"
+        );
+        spec.validate().expect("default 90 is valid");
+    }
+
+    #[test]
+    fn chat_spec_turn_timeout_round_trips_explicit_value() {
+        let yaml = "
+name: dev-foo
+mode: chat
+chat:
+  bot_name: alice
+  turn_timeout_sec: 45
+agents:
+  alice:
+    trigger: manual
+";
+        let spec: WorkflowSpec = serde_yaml::from_str(yaml).expect("parse");
+        assert_eq!(spec.chat.unwrap().turn_timeout_sec, 45);
+    }
+
+    #[test]
+    fn chat_spec_turn_timeout_zero_is_rejected() {
+        let yaml = "
+name: dev-foo
+mode: chat
+chat:
+  bot_name: alice
+  turn_timeout_sec: 0
+agents:
+  alice:
+    trigger: manual
+";
+        let spec: WorkflowSpec = serde_yaml::from_str(yaml).expect("parse");
+        match spec.validate() {
+            Err(WorkflowError::ValidationFailed(msg)) => {
+                assert!(
+                    msg.contains("turn_timeout_sec"),
+                    "error must mention the field, got {msg}"
+                );
+            }
+            other => panic!("expected ValidationFailed, got {other:?}"),
+        }
     }
 }
