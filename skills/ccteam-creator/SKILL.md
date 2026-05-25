@@ -329,6 +329,77 @@ dest = project_dir + "/.claude/agents/<persona-id>.md"
 copy src → dest
 ```
 
+### 5.4.1  Append squad teammate roster (chat-squad only)
+
+For the `chat-squad` preset with N >= 2 bots, append a "Squad
+teammates" block to each bot's freshly-written
+`.claude/agents/<persona-id>.md`. The block lists the other bots in
+the workflow by handle, role, and persona label so each bot reads
+its roster on every session start (Claude Code auto-loads
+`.claude/agents/<role>.md`).
+
+Without this block each bot thinks it is alone — when a user (or
+sibling) says `@dev can you help here`, the bot tries to spawn a
+Task subagent named `dev` instead of recognising `@dev` as a real
+sibling bot reachable via the daemon-internal mpsc cross-bot
+channel. With the block, the bot knows to `@`-mention the sibling
+directly.
+
+Source the teammate list from the Phase 4 PROJECT PLAN: every role
++ proposed handle (after any user overrides from the reply) is
+already locked in. For each bot, **exclude the bot itself** from the
+list (the renderer trusts the caller for self-exclusion).
+
+The skill is LLM-driven, so the `Write` call uses the literal
+template below. The byte-for-byte equivalent Rust helper lives at
+`@crates/ccteam-core/src/templates/squad_roster.rs` for testability;
+if the two ever drift, fix the skill body to match the Rust render.
+
+For Chinese personas (persona body in `zh/`), append:
+
+```markdown
+
+---
+
+## 你的队友 (Squad teammates)
+
+你是 `<workflow_slug>` chat-squad 工作流中的一员。其他兄弟 bot 在同一个 IM 群里,你可以 `@<handle>` 直接发起 bot-to-bot 协作(hop_limit=3,防循环):
+
+- **@<handle_1>** — <role_1> (<persona_label_1>)
+- **@<handle_2>** — <role_2> (<persona_label_2>)
+
+@ 他们能让消息直接进对方 inbox(不走 IM 端 round-trip)。**他们不是你 spawn 出来的 Task subagent,而是独立长跑的兄弟进程** — 别试图调 Task 工具去"扮演" @<handle>,直接 @ 它就好。
+
+只在需要队友视角时 @,3 行 bug 不需要拉团队会议。
+```
+
+For English personas (persona body in `en/`), append the equivalent
+English block:
+
+```markdown
+
+---
+
+## Squad teammates
+
+You are one of several bots in the `<workflow_slug>` chat-squad workflow. Your siblings sit in the same IM room; `@<handle>` reaches them directly for bot-to-bot collaboration (hop_limit=3, cycle-safe):
+
+- **@<handle_1>** — <role_1> (<persona_label_1>)
+- **@<handle_2>** — <role_2> (<persona_label_2>)
+
+`@`-mentioning a sibling routes the message into their inbox directly (no IM-side round-trip). **Siblings are NOT Task subagents you spawn** — they are independent long-running processes. Do not call the Task tool to "play" `@<handle>`; just `@` them.
+
+Only `@` a teammate when you actually need their perspective. A 3-line bug fix does not need a team meeting.
+```
+
+When `persona_label` is blank for a teammate, drop the parenthesised
+suffix (so the line reads `- **@galileo** — explorer` not
+`- **@galileo** — explorer ()`).
+
+**Skip this step entirely** for `chat-pocket`, `inproc-*`, and
+`bg-*` presets — the block only makes sense when N >= 2 bots share
+an IM room.
+
 ## 5.5  Bot handle minting (chat presets)
 
 Two paths feed Phase 5.6's `chat_handle` argument:

@@ -33,6 +33,7 @@ pub mod inbound;
 pub mod latency;
 pub mod nl_admin;
 pub mod outbound;
+pub mod outbound_format;
 pub mod rate_limit;
 pub mod router;
 pub mod sanitize;

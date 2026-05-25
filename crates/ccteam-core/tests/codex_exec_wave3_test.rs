@@ -137,9 +137,12 @@ async fn resume_thread_synthesises_handle_with_resumed_extras() {
 #[tokio::test(flavor = "current_thread")]
 async fn build_exec_argv_resume_branch() {
     let exec = build_exec_argv(None);
-    assert_eq!(exec, vec!["exec", "--json", "-"]);
+    assert_eq!(exec, vec!["exec", "--json", "--skip-git-repo-check", "-"]);
     let resume = build_exec_argv(Some("UUID"));
-    assert_eq!(resume, vec!["resume", "UUID", "--json", "-"]);
+    assert_eq!(
+        resume,
+        vec!["resume", "UUID", "--json", "--skip-git-repo-check", "-"]
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

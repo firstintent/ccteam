@@ -40,6 +40,7 @@ use crate::inbound::{
 use crate::latency::now_unix_ms;
 use crate::nl_admin::AdminExecutor;
 use crate::outbound;
+use crate::outbound_format;
 use crate::router::{self, HandleMap};
 use crate::supervisor::{self, BotSupervisor};
 use crate::three_layer_sec::ThreeLayerSec;
@@ -783,6 +784,17 @@ async fn ensure_bot_channels(
         let outbound_cursor = outbound::OutboundCursor::load_from_disk(cursor_path);
         let slug_log = bot.workflow_slug.clone();
         let role_log = bot.role.clone();
+        // F199 — snapshot the "is this bot one of several in the same
+        // chat" decision at spawn time. The decision keys off the
+        // registry slice the caller already iterates over and stays
+        // valid for the lifetime of this dispatcher task. Squads come
+        // up in one creator flow, so registry churn under a single
+        // dispatcher is rare; the snapshot trades a tiny staleness
+        // window for an I/O-free hot path. New squad members joining
+        // later get the prefix the next time `ensure_bot_channels`
+        // spawns the previously-unwired dispatcher.
+        let prefix_with_handle = outbound_format::should_prefix_with_handle(bots, bot);
+        let effective_handle = bot.effective_handle().to_string();
         tokio::spawn(spawn_outbound_dispatcher(
             outbound_rx,
             channel,
@@ -796,6 +808,8 @@ async fn ensure_bot_channels(
             // when the reply contains `@<otherbot>`. Cheap: the map is
             // `Arc<Mutex<HashMap<..>>>`, cloning is just an Arc bump.
             bot_channels.clone(),
+            prefix_with_handle,
+            effective_handle,
         ));
 
         // Tell the supervisor about the outbound side so its events
@@ -903,6 +917,14 @@ async fn spawn_outbound_dispatcher(
     slug_log: String,
     role_log: String,
     bot_channels: BotChannelMap,
+    // V0.6.8 F199 — when `true`, wrap the assistant content with
+    // `from <effective_handle>:\n` before handing it to `channel.send`.
+    // Set when the bot shares its IM chat_id with at least one
+    // sibling (typical chat-squad posture); cleared for single-bot DM.
+    // Snapshotted by `ensure_bot_channels` at dispatcher spawn time
+    // so the hot path stays I/O-free.
+    prefix_with_handle: bool,
+    effective_handle: String,
 ) {
     while let Some(item) = rx.recv().await {
         // Already covered by drain_outboxes — skip the redundant TG
@@ -926,7 +948,18 @@ async fn spawn_outbound_dispatcher(
         }
         let tail_age_ms = now_unix_ms().saturating_sub(item.enqueue_unix_ms) as u64;
         let send_t0 = std::time::Instant::now();
-        let msg = crate::transport::SendMessage::new(item.content.clone(), &chat_id);
+        // F199 — prepend `from <handle>:\n` so users in a multi-bot
+        // group room can tell which ccteam role spoke. The decision
+        // was snapshotted at spawn time; the cross-bot @mention scan
+        // below still works on `item.content` (the original, un-
+        // prefixed body) so handle-detection doesn't trip over the
+        // prefix.
+        let outbound_content = if prefix_with_handle {
+            outbound_format::prefix_with_handle(&effective_handle, &item.content)
+        } else {
+            item.content.clone()
+        };
+        let msg = crate::transport::SendMessage::new(outbound_content, &chat_id);
         match channel.send(&msg).await {
             Ok(tg_msg_id) => {
                 tracing::info!(
@@ -1495,6 +1528,13 @@ async fn drain_outboxes(
         if rows.is_empty() {
             continue;
         }
+
+        // F199 — mirror the fast-path dispatcher's prefix decision so
+        // assistant rows the safety-net handles also carry `from
+        // <handle>:\n` in multi-bot chats. Computed once per bot per
+        // tick; cheap.
+        let prefix_with_handle = outbound_format::should_prefix_with_handle(bots, bot);
+        let effective_handle = bot.effective_handle().to_string();
 
         let mut sent = 0usize;
         for indexed in &rows {
