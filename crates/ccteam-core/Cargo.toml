@@ -68,6 +68,10 @@ tempfile = "3"
 # dev-dependency for cargo dedup.
 serial_test = "3"
 
+# V0.6.8 F187 — tracing capture for `tail_marker_missing` WARN
+# assertions. Uses the workspace pin (already in [workspace.dependencies]).
+tracing-subscriber.workspace = true
+
 # V0.6.0 Wave 2 F114 / Wave 3 F112 — `toml` is now a runtime dep
 # (preferences.rs); persona_test.rs continues to use it via the
 # runtime entry, no separate dev-dep needed.
