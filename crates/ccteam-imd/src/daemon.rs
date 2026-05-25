@@ -1569,7 +1569,12 @@ async fn drain_outboxes(
                 continue;
             }
 
-            let mut msg = crate::transport::SendMessage::new(row.content.clone(), &bot.im_chat_id);
+            let content = if prefix_with_handle {
+                outbound_format::prefix_with_handle(&effective_handle, &row.content)
+            } else {
+                row.content.clone()
+            };
+            let mut msg = crate::transport::SendMessage::new(content, &bot.im_chat_id);
             msg.thread_ts = row.thread_ts.clone();
             match channel.send(&msg).await {
                 Ok(_tg_msg_id) => {

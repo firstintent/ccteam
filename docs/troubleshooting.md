@@ -94,18 +94,28 @@
 **相关**:无。
 
 ### A18. `install.sh` 报 "unsupported platform: linux-aarch64"
-**原因**:当前未发布 linux-arm64 prebuilt(只发 x86_64 + macOS arm64/x64)。
-**修复**:走源码 build:`cargo install --git https://github.com/firstintent/ccteam ccteam-cli`(需要 Rust 1.85+);或等后续 release 把 arm64 加进 matrix。
+**原因**:linux-arm64 prebuilt 已发,你的 install.sh 是老版没识别 aarch64。
+**修复**:重跑最新 install.sh(`curl -sSL ...install.sh | sh`),它会下 `linux-arm64` musl static binary。
 **相关**:A16。
+
+### A19. `ccteam init` 在 ccteam 源码目录被拒
+**原因**:防自指 — 默认不允许在 ccteam repo 自身里装 ccteam 项目(会形成循环 hook setup)。
+**修复**:开发 / self-host / dogfood 场景明确要在源码目录跑,加 `--force`:`ccteam init --force`。
+**相关**:无。
+
+### A20. creator skill 写完但 bot 不工作 / SessionStart hook 报 "not under any ccteam project"
+**原因**:老版 creator 没自动调 init 流程,缺 `<project>/.ccteam/state.json`。
+**修复**:升到 V0.6.8+ — `chat_register_bot` MCP 自动调 bootstrap_project_at_dir + install_hooks。手动修:`cd <project> && ccteam init --force`(在已经有 workflow.yaml 的项目里 refresh state.json 安全)。
+**相关**:A19 / B11。
 
 ---
 
 ## B. 聊天运行时(15 条)
 
 ### B1. TG 群 @bot 后 bot 完全不回
-**原因**:3 种:bot 进程崩 / token 失效 / 网络不通。
-**修复**:1) `/ccteam-control show-bots` 看每个 bot 状态;2) status "stopped" → `/ccteam-control restart-bot <name>`;3) "running 但不回" → 看 B10。
-**相关**:A6 / B10。
+**原因**:5 种 — bot 进程崩 / token 失效 / 网络不通 / SessionStart hook 链断(hook.sh 缺失 或 env propagation 中断)/ tail loop 等不到 `active-session-id` marker。
+**修复**:1) `/ccteam-control show-bots` 看每个 bot 状态;2) status "stopped" → `/ccteam-control restart-bot <name>`;3) "running 但不回" → daemon 日志看 `tail_marker_missing` WARN(60s+ marker 没写)= hook 链断;4) 等 60s 触发 F196 marker self-heal 自动重 spawn session;5) 看 turn watchdog `chat_turn_running_long` event(90s)/ `chat_turn_timeout`(180s)— bot 还在算或真卡死;6) 手动 force:`ccteam doctor --install-hooks` + `ccteam stop && ccteam start`。
+**相关**:A6 / A20 / B10 / B11。
 
 ### B2. bot 回了但内容像"失忆了"
 **原因**:bot 对话历史被清(compact / new session)或平台升级后旧会话失效。

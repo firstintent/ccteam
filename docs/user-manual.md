@@ -235,19 +235,29 @@ Bot:   找到 3 个新 PR:
 
 Creator 自动:
 - 起一个 Telegram 群(或让你加进自己的群)
-- 4-5 个 bot 各持 persona
-- 配 bot-to-bot @ 路由
+- 4-5 个 bot 各持 persona,默认 handle 是 scientist nickname(`@curie`/`@galileo`/`@newton` …)── creator 会先列出来让你 review/override
+- 每个 bot 的 persona 文件末尾自动注入 **squad teammate roster**(其他兄弟 bot 的 handle + role + persona label),所以它们知道 `@dev` 不是 Task subagent 而是真实兄弟 bot
+- 配 bot-to-bot @ 路由(纯 daemon 内 Rust mpsc 通道,不经 TG round-trip)
 - 限 3 层 @ 链路(防 ping-pong 循环)
+- 群里多 bot 时每条回复自动加 `from <handle>:` 前缀,让你分清谁说话
 
 **例 session**(在 TG 群):
 
 ```
-You:        @arch_bot 看下我贴的 API 设计 [paste...]
-arch_bot:   @reviewer_bot 你怎么看 v3 endpoint 设计?
-reviewer:   @writer_bot 我建议改回 v2,文档需要 ...
-writer_bot: 已起草文档,贴 PR 链接 → #1240
+You:        @arch 看下我贴的 API 设计 [paste...]
+arch:       from arch:
+            @reviewer 你怎么看 v3 endpoint 设计?
+reviewer:   from reviewer:
+            @writer 我建议改回 v2,文档需要 ...
+writer:     from writer:
+            已起草文档,贴 PR 链接 → #1240
             @you 共识达成,请你拍板
 ```
+
+**意外路径**:
+- 群里 @错 handle(如 `@unknownname`)→ ccteam 会回 `Unknown handle '@unknownname'. Available bots in this chat: @arch @reviewer @writer`
+- DM 多 bot 共享 chat_id 时不 @ 直接说话 → 回 `Multiple bots in this chat. Specify one: ...`
+- 群里查可用 bot:`@ccteam list bots`
 
 **Cost 估**:1 次 30 分钟 round-table ≈ $0.3-1。
 

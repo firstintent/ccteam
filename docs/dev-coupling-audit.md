@@ -181,6 +181,30 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
 |---|---|---|
 | `TODO(V0.7-chat-handle)` | V0.6.8 | `AgentSpec.chat_handle: Option<String>` + `BotRegistration.chat_handle` schema fields landed;`build_handle_map` 用 `chat_handle.unwrap_or(role)` + cross-slug `<handle>__<slug>` 后缀(双下划线 — `@` 会被 `router::parse_first_mention` 在第二个 `@` 截断,使 suffixed handle 无法 route);`chat_register_bot` MCP 自动从 `agent_naming::SCIENTIST_NAMES` mint。F180-F184。
 
+## V0.6.8 索引(F175-F203)
+
+V0.6.8 ship 29 finding,围绕 chat-mode squad 实战发现的全套问题集中修复 — fan-out cross-fire / hook env propagation / bot-to-bot mpsc 通道 / creator bootstrap 漏 state.json + hook.sh / 多 bot UX / Codex retry cap / marker self-heal / plugin sync 等。**完整 detail 在 `docs/versions/v0-6-8/README.md`**;本表只挂一行索引:
+
+| Finding | Cluster | One-line summary | Detail |
+|---|---|---|---|
+| **F175-F177** | Fan-out | tmux env + hook marker + tail loop deterministic jsonl(squad cross-fire 根因)| §2.1 |
+| **F178-F179** | Polish | install.sh re-run UX + SKILL 删失效 `ccteam internal daemon ensure-running` 引用 | §2.2 |
+| **F180-F184** | chat_handle | schema additive + auto-mint scientist + cross-slug collision `__<slug>` + unknown @ reply UX + `@ccteam list bots` admin keyword | §2.3 |
+| **F185** | project_dir | `BotRegistration.project_dir: Option<PathBuf>` + resolver priority chain | §2.4 |
+| **F186-F187** | hook HTTP | `X-Ccteam-Role` / `X-Ccteam-Slug` HTTP header injection(F175 的设计盲点修复)+ tail loop sustained-marker-missing WARN | §2.5 |
+| **F188-F189-F191** | template | chat-squad.yaml schema sync + N-agent + handle override SKILL | §2.6 |
+| **F190-F192** | resolver + Codex | config.yaml fallback + Codex doctor canary + retry cap + permanent-failure event | §2.7 |
+| **F193** | bot-to-bot | daemon mpsc cross-mention dispatcher(纯 Rust 通道不经 IM)| §2.8 |
+| **F194-F195** | chat UX | DM multi-bot ambiguity hint + per-turn timeout watchdog `chat_turn_running_long` / `chat_turn_timeout` | §2.9 |
+| **F196** | self-heal | `MarkerReporter` trait + 30-tick threshold → reset_session 自愈(同 F84 / F192c 通道,R5 守)| §2.10 |
+| **F197-F198** | creator bootstrap | `chat_register_bot` MCP 自动调 `bootstrap_project_at_dir` + `install_hooks` | §2.11 |
+| **F199-F200** | multi-bot UX | outbound `from <handle>:\n` prefix(only when N≥2 共享 chat_id)+ squad teammate roster 注入 persona body | §2.12 |
+| **F201-F203** | polish 2 | plugin manifest version sync + ship-gate test / `ccteam admin register-bot/unregister-bot` CLI / `ccteam init --force` 解锁 self-host | §2.13 |
+
+### V0.7-deferred TODO 索引(grep `TODO\(V0\.7-` 4 命中,F168 6 项缩到 4)
+
+V0.6.8 closes `chat-handle`(F180-F184)+ `listbots-cache`(F168 原 deferred 理由消解);剩 4 个 V0.7-deferred 锚点:`im-providers` / `human-approval-adapter` / `slack-inbound` / `slack-socket-mode`。
+
 ## V0.4.6 摘要更新
 
 | 优先级 | 数量 | 编号 |

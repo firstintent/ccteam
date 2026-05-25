@@ -65,10 +65,12 @@ codex plugin marketplace add firstintent/ccteam
 ccteam init <project>
 ```
 
-Supported platforms for the prebuilt binary: Linux x86_64, macOS arm64
-(Apple Silicon), macOS x86_64 (Intel). Windows users: install via WSL2
-and use the linux-x64 binary — native Windows isn't supported because
-tmux + inotify + POSIX signals are foundational to ccteam. On macOS,
+Supported platforms for the prebuilt binary: Linux x86_64, Linux aarch64
+(arm64), macOS arm64 (Apple Silicon), macOS x86_64 (Intel). Linux
+binaries are musl-static so they run on any glibc version (NAS / older
+distros included). Windows users: install via WSL2 and use the
+linux-x64 binary — native Windows isn't supported because tmux +
+inotify + POSIX signals are foundational to ccteam. On macOS,
 if Gatekeeper blocks the binary on first run:
 `xattr -d com.apple.quarantine ~/.local/bin/ccteam`.
 
