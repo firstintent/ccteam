@@ -155,6 +155,178 @@ fn session_end_with_clear_reason_emits_chat_session_reset() {
 
 #[test]
 #[serial]
+fn session_start_writes_active_session_id_marker() {
+    // F176 — the hook persists Anthropic's real session_id (carried
+    // in stdin) to `<project>/.ccteam/chat/<role>/active-session-id`
+    // so the chat-mode tail loop can target the correct jsonl
+    // deterministically. This is the only reliable source for the sid
+    // because `--name` is just an internal label, not the filename.
+    let tmp = TempDir::new().unwrap();
+    let slug = "tcp-marker-write";
+    let (paths, project_dir) = setup_project(&tmp, slug);
+    std::env::set_var("CCTEAM_CHAT_ROLE", "alice");
+
+    let sid = "11111111-2222-3333-4444-555555555555";
+    let stdin = json!({
+        "hook_event_name": "SessionStart",
+        "session_id": sid,
+        "cwd": project_dir.to_string_lossy(),
+        "source": "startup",
+    });
+    handle_chat_progress(&paths, "session-start", &stdin).unwrap();
+
+    let marker = project_dir.join(".ccteam/chat/alice/active-session-id");
+    assert!(
+        marker.exists(),
+        "active-session-id marker must be written on session-start; expected at {}",
+        marker.display()
+    );
+    let body = std::fs::read_to_string(&marker).unwrap();
+    assert_eq!(body, sid, "marker body must be the raw sid (no JSON wrap)");
+
+    std::env::remove_var("CCTEAM_CHAT_ROLE");
+}
+
+#[test]
+#[serial]
+fn session_start_overwrites_marker_after_rotation() {
+    // /clear emits SessionEnd(reason=clear) then SessionStart with a
+    // fresh sid. The marker must point at the NEW sid; the old one
+    // shouldn't survive the rotation.
+    let tmp = TempDir::new().unwrap();
+    let slug = "tcp-marker-rotate";
+    let (paths, project_dir) = setup_project(&tmp, slug);
+    std::env::set_var("CCTEAM_CHAT_ROLE", "bob");
+
+    let sid_old = "aaaa-old";
+    handle_chat_progress(
+        &paths,
+        "session-start",
+        &json!({
+            "hook_event_name": "SessionStart",
+            "session_id": sid_old,
+            "cwd": project_dir.to_string_lossy(),
+            "source": "startup",
+        }),
+    )
+    .unwrap();
+
+    let sid_new = "bbbb-new";
+    handle_chat_progress(
+        &paths,
+        "session-start",
+        &json!({
+            "hook_event_name": "SessionStart",
+            "session_id": sid_new,
+            "cwd": project_dir.to_string_lossy(),
+            "source": "clear",
+        }),
+    )
+    .unwrap();
+
+    let marker = project_dir.join(".ccteam/chat/bob/active-session-id");
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), sid_new);
+
+    std::env::remove_var("CCTEAM_CHAT_ROLE");
+}
+
+#[test]
+#[serial]
+fn session_end_clear_removes_active_session_id_marker() {
+    // SessionEnd { reason: "clear" } means the user invoked /clear —
+    // the sid is about to rotate. Drop the marker so the tail loop
+    // waits for the next SessionStart instead of pointing at a now-
+    // stale jsonl.
+    let tmp = TempDir::new().unwrap();
+    let slug = "tcp-marker-clear";
+    let (paths, project_dir) = setup_project(&tmp, slug);
+    std::env::set_var("CCTEAM_CHAT_ROLE", "carol");
+
+    // Plant the marker first.
+    let sid = "doomed-sid";
+    handle_chat_progress(
+        &paths,
+        "session-start",
+        &json!({
+            "hook_event_name": "SessionStart",
+            "session_id": sid,
+            "cwd": project_dir.to_string_lossy(),
+            "source": "startup",
+        }),
+    )
+    .unwrap();
+    let marker = project_dir.join(".ccteam/chat/carol/active-session-id");
+    assert!(marker.exists());
+
+    // Now signal /clear.
+    handle_chat_progress(
+        &paths,
+        "session-end",
+        &json!({
+            "hook_event_name": "SessionEnd",
+            "session_id": sid,
+            "cwd": project_dir.to_string_lossy(),
+            "reason": "clear",
+        }),
+    )
+    .unwrap();
+    assert!(
+        !marker.exists(),
+        "session-end (clear) must remove the marker; still present at {}",
+        marker.display()
+    );
+
+    std::env::remove_var("CCTEAM_CHAT_ROLE");
+}
+
+#[test]
+#[serial]
+fn session_end_non_clear_leaves_marker_intact() {
+    // Process exit / daemon kill / network drop send SessionEnd with
+    // a non-`clear` reason. The sid hasn't rotated; the marker must
+    // survive so a daemon restart can pick up where it left off.
+    let tmp = TempDir::new().unwrap();
+    let slug = "tcp-marker-exit";
+    let (paths, project_dir) = setup_project(&tmp, slug);
+    std::env::set_var("CCTEAM_CHAT_ROLE", "dora");
+
+    let sid = "surviving-sid";
+    handle_chat_progress(
+        &paths,
+        "session-start",
+        &json!({
+            "hook_event_name": "SessionStart",
+            "session_id": sid,
+            "cwd": project_dir.to_string_lossy(),
+            "source": "startup",
+        }),
+    )
+    .unwrap();
+    let marker = project_dir.join(".ccteam/chat/dora/active-session-id");
+    assert!(marker.exists());
+
+    handle_chat_progress(
+        &paths,
+        "session-end",
+        &json!({
+            "hook_event_name": "SessionEnd",
+            "session_id": sid,
+            "cwd": project_dir.to_string_lossy(),
+            "reason": "exit",
+        }),
+    )
+    .unwrap();
+    assert!(
+        marker.exists(),
+        "session-end with reason != 'clear' must NOT remove the marker"
+    );
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), sid);
+
+    std::env::remove_var("CCTEAM_CHAT_ROLE");
+}
+
+#[test]
+#[serial]
 fn unknown_event_arg_falls_back_to_chat_prefix() {
     let tmp = TempDir::new().unwrap();
     let slug = "tcp-future";
