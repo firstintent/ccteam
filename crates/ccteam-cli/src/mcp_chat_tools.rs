@@ -352,7 +352,11 @@ pub(crate) fn dispatch_register_bot(paths: &CcteamPaths, args: &Value) -> Result
 /// role as the handle. The match is case-insensitive in
 /// `pick_unused_bot_name` so registries that stored handles in mixed
 /// case still claim the right slot.
-fn mint_unused_handle(ccteam_root: &Path) -> Result<String> {
+///
+/// V0.6.8 F202 — `pub(crate)` so the `ccteam admin register-bot` CLI
+/// dispatcher in `commands.rs` can re-use the same auto-mint logic
+/// without copy-paste.
+pub(crate) fn mint_unused_handle(ccteam_root: &Path) -> Result<String> {
     let existing = list_bots_in(ccteam_root, None).unwrap_or_default();
     let in_use: Vec<String> = existing
         .iter()
@@ -363,7 +367,10 @@ fn mint_unused_handle(ccteam_root: &Path) -> Result<String> {
 
 /// Caller-supplied handles share the slug validator rules so registry
 /// filenames + router parse paths stay clean (alphanumeric / `_` / `-`).
-fn validate_chat_handle(s: &str) -> Result<()> {
+///
+/// V0.6.8 F202 — `pub(crate)` so the `ccteam admin register-bot` CLI
+/// dispatcher can re-use the same validator.
+pub(crate) fn validate_chat_handle(s: &str) -> Result<()> {
     if s.is_empty() {
         return Err(anyhow!("`chat_handle` must be non-empty"));
     }
@@ -652,7 +659,12 @@ fn parse_vendor(args: &Value) -> Result<AgentVendor> {
     }
 }
 
-fn validate_slug(s: &str, field: &str) -> Result<()> {
+/// V0.6.8 F202 — `pub(crate)` so the `ccteam admin register-bot` CLI
+/// dispatcher can re-use the same slug/role validator the MCP path
+/// uses (alphanumerics + `-` + `_`). Distinct from
+/// `ccteam_core::validate_slug_format`, which is stricter (lowercase
+/// + digits + dashes only) and gates init-time project slugs.
+pub(crate) fn validate_slug(s: &str, field: &str) -> Result<()> {
     if s.is_empty() {
         return Err(anyhow!("`{field}` must be non-empty"));
     }

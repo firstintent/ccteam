@@ -717,6 +717,48 @@ enum AdminAction {
         /// Tool descriptor (verbatim — taken as-is into the CSV).
         tool_descriptor: String,
     },
+    /// V0.6.8 F202 — register a chat-mode bot directly via the CLI.
+    /// Mirrors the `mcp__ccteam__chat_register_bot` MCP tool. Useful as
+    /// a scripted / no-daemon fallback when the MCP server isn't
+    /// registered yet (first-time setup, automation, MCP-less envs).
+    RegisterBot {
+        /// Project slug (workflow.yaml's `name` field).
+        #[arg(long)]
+        slug: String,
+        /// Role within the workflow (matches the `agents.<role>` key).
+        #[arg(long)]
+        role: String,
+        /// Harness vendor — `claude` or `codex`.
+        #[arg(long, default_value = "claude")]
+        vendor: String,
+        /// IM platform — `telegram`, `slack`, `discord`, or `mock`.
+        #[arg(long, default_value = "telegram")]
+        platform: String,
+        /// Platform chat id (Telegram chat_id, Slack channel id, etc.).
+        #[arg(long)]
+        chat_id: String,
+        /// Optional IM mention this bot answers to (without leading
+        /// `@`). When omitted, auto-mints an unused scientist nickname
+        /// from `ccteam_core::agent_naming::SCIENTIST_NAMES`. Letters,
+        /// digits, `_`, `-` only.
+        #[arg(long)]
+        chat_handle: Option<String>,
+        /// Optional absolute path to the project hosting
+        /// `.ccteam/workflow.yaml`. Defaults to cwd (canonicalized).
+        #[arg(long)]
+        project_dir: Option<PathBuf>,
+    },
+    /// V0.6.8 F202 — unregister a chat-mode bot. Mirrors the
+    /// `mcp__ccteam__chat_unregister_bot` MCP tool. Idempotent —
+    /// returns `ok:true, removed:false` when no registration exists.
+    UnregisterBot {
+        /// Project slug.
+        #[arg(long)]
+        slug: String,
+        /// Role within the workflow.
+        #[arg(long)]
+        role: String,
+    },
 }
 
 /// V0.6.0 Wave 3 F112 §C — `ccteam prefs` subcommand surface.
@@ -1192,6 +1234,33 @@ fn main() -> Result<()> {
                     tool_descriptor,
                 } => {
                     let out = commands::run_admin_add_tool(&paths, &slug, &bot, &tool_descriptor)?;
+                    println!("{out}");
+                    Ok(())
+                }
+                AdminAction::RegisterBot {
+                    slug,
+                    role,
+                    vendor,
+                    platform,
+                    chat_id,
+                    chat_handle,
+                    project_dir,
+                } => {
+                    let out = commands::run_admin_register_bot(
+                        &paths,
+                        &slug,
+                        &role,
+                        &vendor,
+                        &platform,
+                        &chat_id,
+                        chat_handle.as_deref(),
+                        project_dir.as_deref(),
+                    )?;
+                    println!("{out}");
+                    Ok(())
+                }
+                AdminAction::UnregisterBot { slug, role } => {
+                    let out = commands::run_admin_unregister_bot(&paths, &slug, &role)?;
                     println!("{out}");
                     Ok(())
                 }
