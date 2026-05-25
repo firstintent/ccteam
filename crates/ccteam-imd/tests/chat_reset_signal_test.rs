@@ -87,12 +87,13 @@ fn reg() -> BotRegistration {
         im_platform: "mcp".into(),
         im_chat_id: "0".into(),
         chat_handle: None,
+        project_dir: None,
         created_at: chrono::Utc::now(),
     }
 }
 
-fn write_reset_signal(projects_root: &std::path::Path, slug: &str, role: &str) {
-    let sig = ccteam_imd::chat_reset_signal_path(projects_root, slug, role);
+fn write_reset_signal(projects_root: &std::path::Path, r: &BotRegistration) {
+    let sig = ccteam_imd::chat_reset_signal_path(projects_root, r);
     std::fs::create_dir_all(sig.parent().unwrap()).unwrap();
     std::fs::write(&sig, format!("{}", chrono::Utc::now().timestamp_millis())).unwrap();
 }
@@ -101,7 +102,7 @@ fn write_reset_signal(projects_root: &std::path::Path, slug: &str, role: &str) {
 fn decide_returns_reset_session_when_signal_present() {
     let tmp = TempDir::new().unwrap();
     let r = reg();
-    write_reset_signal(tmp.path(), &r.workflow_slug, &r.role);
+    write_reset_signal(tmp.path(), &r);
     // Provide a fresh heartbeat so the noop / restart path doesn't fire.
     let dir = bot_dir(tmp.path(), &r);
     std::fs::create_dir_all(&dir).unwrap();
@@ -130,7 +131,7 @@ fn decide_reset_session_beats_restart_budget_exhaustion() {
     // in `decide()` for exactly this reason.
     let tmp = TempDir::new().unwrap();
     let r = reg();
-    write_reset_signal(tmp.path(), &r.workflow_slug, &r.role);
+    write_reset_signal(tmp.path(), &r);
     let st = BotState {
         handle: Some(ThreadHandle {
             vendor: AgentVendor::Claude,
@@ -158,7 +159,7 @@ fn decide_shutdown_still_beats_reset_signal() {
     // to kill.
     let tmp = TempDir::new().unwrap();
     let r = reg();
-    write_reset_signal(tmp.path(), &r.workflow_slug, &r.role);
+    write_reset_signal(tmp.path(), &r);
     // ALSO drop shutdown.signal.
     let sig_dir = bot_dir(tmp.path(), &r).join("signals");
     std::fs::create_dir_all(&sig_dir).unwrap();
@@ -202,7 +203,7 @@ async fn reset_session_archives_turns_jsonl_and_clears_transcript_cursor() {
     std::fs::write(bd.join("outbound.cursor"), r#"{"position":5000}"#).unwrap();
 
     // Drop the reset.signal file the MCP tool would have written.
-    write_reset_signal(&projects_root, &r.workflow_slug, &r.role);
+    write_reset_signal(&projects_root, &r);
 
     let archived = sup.reset_session().await.unwrap();
     let archived_path = archived.expect("archive path returned");
@@ -226,7 +227,7 @@ async fn reset_session_archives_turns_jsonl_and_clears_transcript_cursor() {
         "outbound cursor must be cleared on reset"
     );
     // Signal is unlinked so the next tick doesn't loop.
-    let sig = ccteam_imd::chat_reset_signal_path(&projects_root, &r.workflow_slug, &r.role);
+    let sig = ccteam_imd::chat_reset_signal_path(&projects_root, &r);
     assert!(!sig.exists(), "reset.signal must be consumed");
     // Adapter saw close + fresh start.
     assert_eq!(adapter.closes.load(Ordering::SeqCst), 1);
@@ -279,7 +280,7 @@ fn reset_signal_const_matches_documented_filename() {
     // contract.
     assert_eq!(RESET_SIGNAL, "reset.signal");
     let tmp = TempDir::new().unwrap();
-    let sig = ccteam_imd::chat_reset_signal_path(tmp.path(), "demo", "helper");
+    let sig = ccteam_imd::chat_reset_signal_path(tmp.path(), &reg());
     assert!(
         sig.ends_with("signals/reset.signal"),
         "MCP signal path filename must match supervisor RESET_SIGNAL: {}",

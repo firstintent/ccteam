@@ -33,6 +33,7 @@ fn register_bot_checked_writes_registration_at_documented_path() {
         "42",
         None,
         None,
+        None,
     )
     .unwrap();
     let path = match outcome {
@@ -66,6 +67,7 @@ fn register_bot_checked_does_not_clobber_existing() {
         "42",
         None,
         None,
+        None,
     )
     .unwrap();
     let original_bytes = std::fs::read(registration_path_in(&r, "demo", "helper")).unwrap();
@@ -79,6 +81,7 @@ fn register_bot_checked_does_not_clobber_existing() {
         AgentVendor::Codex,
         "slack",
         "C999",
+        None,
         None,
         None,
     )
@@ -170,6 +173,7 @@ fn register_bot_persists_caller_supplied_chat_handle() {
         "42",
         None,
         Some("curie"),
+        None,
     )
     .unwrap();
     assert!(matches!(outcome, RegisterOutcome::Registered(_)));
@@ -197,6 +201,7 @@ fn register_bot_chat_handle_none_persists_as_omitted_then_falls_back_to_role() {
         "42",
         None,
         None,
+        None,
     )
     .unwrap();
     let bots = list_bots_in(&r, None).unwrap();
@@ -207,13 +212,91 @@ fn register_bot_chat_handle_none_persists_as_omitted_then_falls_back_to_role() {
 }
 
 #[test]
+fn register_bot_persists_caller_supplied_project_dir() {
+    // F185 — when MCP `chat_register_bot` passes a `project_dir`, the
+    // registry JSON on disk must round-trip the absolute path through
+    // serde so the daemon's path resolvers can honor it.
+    let tmp = TempDir::new().unwrap();
+    let r = root(&tmp);
+    let proj = tmp.path().join("vol4/1000/nasworkspace/ccteam");
+    std::fs::create_dir_all(&proj).unwrap();
+    let outcome = register_bot_checked_in(
+        &r,
+        "research-squad",
+        "helper",
+        AgentVendor::Claude,
+        "telegram",
+        "42",
+        None,
+        None,
+        Some(&proj),
+    )
+    .unwrap();
+    assert!(matches!(outcome, RegisterOutcome::Registered(_)));
+    let path = registration_path_in(&r, "research-squad", "helper");
+    let on_disk: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    assert_eq!(
+        on_disk["project_dir"].as_str().unwrap(),
+        proj.to_string_lossy()
+    );
+
+    // Re-listing the registry round-trips project_dir through serde.
+    let bots = list_bots_in(&r, None).unwrap();
+    assert_eq!(bots.len(), 1);
+    assert_eq!(bots[0].project_dir.as_deref(), Some(proj.as_path()));
+}
+
+#[test]
+fn register_bot_project_dir_none_persists_as_omitted_field() {
+    // Legacy / non-F185 callers don't supply `project_dir`. The serde
+    // `skip_serializing_if = "Option::is_none"` must keep the field
+    // out of the on-disk JSON entirely so older readers / round-trip
+    // assertions don't trip on a `null` they didn't expect.
+    let tmp = TempDir::new().unwrap();
+    let r = root(&tmp);
+    register_bot_checked_in(
+        &r,
+        "demo",
+        "helper",
+        AgentVendor::Claude,
+        "telegram",
+        "42",
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let path = registration_path_in(&r, "demo", "helper");
+    let body = std::fs::read_to_string(path).unwrap();
+    assert!(
+        !body.contains("project_dir"),
+        "JSON must omit project_dir when None: {}",
+        body
+    );
+    let bots = list_bots_in(&r, None).unwrap();
+    assert!(bots[0].project_dir.is_none());
+}
+
+#[test]
 fn last_turn_at_returns_none_when_file_missing_and_mtime_when_present() {
     let tmp = TempDir::new().unwrap();
     let projects = tmp.path().join("projects");
     std::fs::create_dir_all(&projects).unwrap();
-    assert!(last_turn_at(&projects, "demo", "helper").is_none());
+    let reg = ccteam_imd::BotRegistration {
+        workflow_slug: "demo".into(),
+        role: "helper".into(),
+        vendor: AgentVendor::Claude,
+        persona_id: None,
+        im_platform: "telegram".into(),
+        im_chat_id: "42".into(),
+        chat_handle: None,
+        project_dir: None,
+        created_at: chrono::Utc::now(),
+    };
+    assert!(last_turn_at(&projects, &reg).is_none());
     let turns_dir = projects.join("demo/.ccteam/chat/helper");
     std::fs::create_dir_all(&turns_dir).unwrap();
     std::fs::write(turns_dir.join("turns.jsonl"), b"{}\n").unwrap();
-    assert!(last_turn_at(&projects, "demo", "helper").is_some());
+    assert!(last_turn_at(&projects, &reg).is_some());
 }

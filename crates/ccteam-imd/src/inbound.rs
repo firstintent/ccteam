@@ -96,13 +96,24 @@ pub enum InboundOutcome {
 /// Per-bot mailbox path resolver. The daemon owns this; it's a
 /// closure-style trait so tests can substitute a tempdir-based
 /// implementation.
+///
+/// F185 — takes the full [`crate::BotRegistration`] so resolvers can
+/// honor `reg.project_dir` (absolute path written at registration
+/// time). Resolvers fall back to the historical
+/// `<projects_root>/<workflow_slug>/.ccteam/chat/<role>/inbox/` layout
+/// when `reg.project_dir = None` (legacy registrations).
 pub trait MailboxResolver: Send + Sync {
-    /// Return `<project>/.ccteam/chat/<bot>/inbox/` for the given
-    /// (slug, role).
-    fn inbox_dir(&self, slug: &str, role: &str) -> Result<PathBuf>;
+    /// Return `<project>/.ccteam/chat/<role>/inbox/` for the given
+    /// bot. The resolver decides how to interpret
+    /// `reg.project_dir` vs the fallback `projects_root` layout.
+    fn inbox_dir(&self, reg: &crate::BotRegistration) -> Result<PathBuf>;
 }
 
-/// Default resolver: rooted at `<projects_root>/<slug>/.ccteam/chat/<role>/inbox/`.
+/// Default resolver: rooted at the bot's chat dir
+/// (`<project>/.ccteam/chat/<role>/inbox/`). When the registration
+/// carries an explicit `project_dir`, that absolute path is used
+/// directly; otherwise the resolver joins the configured
+/// `projects_root` with `workflow_slug` for the legacy layout.
 /// `projects_root` is normally `~/projects` (production) but tests
 /// pass an override via [`Self::with_projects_root`].
 pub struct DefaultMailboxResolver {
@@ -133,14 +144,8 @@ impl Default for DefaultMailboxResolver {
 }
 
 impl MailboxResolver for DefaultMailboxResolver {
-    fn inbox_dir(&self, slug: &str, role: &str) -> Result<PathBuf> {
-        Ok(self
-            .projects_root
-            .join(slug)
-            .join(".ccteam")
-            .join("chat")
-            .join(role)
-            .join("inbox"))
+    fn inbox_dir(&self, reg: &crate::BotRegistration) -> Result<PathBuf> {
+        Ok(crate::chat_inbox_dir(&self.projects_root, reg))
     }
 }
 
@@ -220,10 +225,20 @@ pub fn has_at_mention(text: &str) -> bool {
 }
 
 /// Process one inbound IM event end-to-end.
+///
+/// `bots` is the registry slice the router resolves against; F185 uses
+/// it to look up the [`crate::BotRegistration`] matching the routed
+/// `(slug, role)` so the mailbox resolver can honor the bot's
+/// `project_dir`. When no matching registration is found (race
+/// window: registration removed between route resolution and mailbox
+/// resolution), we synthesize a transient `BotRegistration` with
+/// `project_dir = None` so the fallback layout still works — better
+/// than erroring out the inbound pipeline.
 pub async fn process_inbound(
     msg: &ChannelMessage,
     sec: &Arc<Mutex<ThreeLayerSec>>,
     handles: &HandleMap,
+    bots: &[crate::BotRegistration],
     mailbox: &dyn MailboxResolver,
     hop: u8,
     seq: u64,
@@ -271,7 +286,34 @@ pub async fn process_inbound(
             payload: stripped,
         } => {
             let t0 = std::time::Instant::now();
-            let dir = mailbox.inbox_dir(&slug, &role)?;
+            // F185 — find the live BotRegistration so the mailbox
+            // resolver can honor its `project_dir`. Synthesize a
+            // fallback reg (project_dir = None) when the routed
+            // (slug, role) isn't present in `bots` so a race between
+            // unregister and route doesn't error out the pipeline —
+            // the fallback layout keeps the inbound path live.
+            let owned_reg;
+            let reg_ref: &crate::BotRegistration = match bots
+                .iter()
+                .find(|b| b.workflow_slug == slug && b.role == role)
+            {
+                Some(b) => b,
+                None => {
+                    owned_reg = crate::BotRegistration {
+                        workflow_slug: slug.clone(),
+                        role: role.clone(),
+                        vendor: ccteam_core::harness::AgentVendor::Claude,
+                        persona_id: None,
+                        im_platform: msg.channel.clone(),
+                        im_chat_id: msg.reply_target.clone(),
+                        chat_handle: None,
+                        project_dir: None,
+                        created_at: chrono::Utc::now(),
+                    };
+                    &owned_reg
+                }
+            };
+            let dir = mailbox.inbox_dir(reg_ref)?;
             fs::create_dir_all(&dir).with_context(|| format!("mkdir -p {}", dir.display()))?;
             let ts = Utc::now().format("%Y%m%dT%H%M%S").to_string();
             let path = dir.join(format!("msg-{ts}-{seq:03}.md"));
@@ -335,7 +377,7 @@ pub async fn process_inbound_admin_aware(
     hop: u8,
     seq: u64,
 ) -> Result<(InboundOutcome, Option<AdminReply>)> {
-    let outcome = process_inbound(msg, sec, handles, mailbox, hop, seq).await?;
+    let outcome = process_inbound(msg, sec, handles, bots, mailbox, hop, seq).await?;
     let admin_reply = match &outcome {
         InboundOutcome::Admin { verb_and_args } => {
             let cmd = nl_admin::parse(verb_and_args);
@@ -418,6 +460,7 @@ mod tests {
             &sample_msg("telegram", "hello world"),
             &sec,
             &HandleMap::new(),
+            &[],
             &mailbox,
             0,
             1,
@@ -438,6 +481,7 @@ mod tests {
             &sample_msg("telegram", "@lead please plan"),
             &sec,
             &handles,
+            &[],
             &mailbox,
             0,
             7,
@@ -469,6 +513,7 @@ mod tests {
             &sample_msg("telegram", "@ccteam status"),
             &sec,
             &HandleMap::new(),
+            &[],
             &mailbox,
             0,
             0,
@@ -492,10 +537,10 @@ mod tests {
         let mut handles = HandleMap::new();
         handles.insert("lead", "dev-foo", "lead");
         let m = sample_msg("telegram", "@lead one");
-        let _ = process_inbound(&m, &sec, &handles, &mailbox, 0, 1)
+        let _ = process_inbound(&m, &sec, &handles, &[], &mailbox, 0, 1)
             .await
             .unwrap();
-        let res = process_inbound(&m, &sec, &handles, &mailbox, 0, 2)
+        let res = process_inbound(&m, &sec, &handles, &[], &mailbox, 0, 2)
             .await
             .unwrap();
         match res {

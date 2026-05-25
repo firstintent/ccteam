@@ -83,6 +83,7 @@ fn reg() -> BotRegistration {
         im_platform: "mock".into(),
         im_chat_id: "1".into(),
         chat_handle: None,
+        project_dir: None,
         created_at: chrono::Utc::now(),
     }
 }

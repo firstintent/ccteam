@@ -80,6 +80,20 @@ pub struct BotRegistration {
     /// when the caller omits this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_handle: Option<String>,
+    /// Absolute path to the project directory hosting
+    /// `.ccteam/workflow.yaml`. When present, daemon resolves bot
+    /// working dirs as `<project_dir>/.ccteam/chat/<role>/` directly.
+    /// When `None` (legacy registrations pre-`project_dir`), daemon
+    /// falls back to the historical
+    /// `<projects_root>/<workflow_slug>/.ccteam/chat/<role>/` layout.
+    /// The field is additive — `chat_register_bot` MCP accepts it as
+    /// an optional input and the dispatcher defaults to
+    /// `std::env::current_dir()` (canonicalized) so projects living
+    /// outside `~/projects/<slug>/` (NAS shares, dir basename ≠
+    /// workflow slug) resolve correctly. Pre-v1.0 — no migration: the
+    /// `Option<PathBuf>` branch handles old registrations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_dir: Option<PathBuf>,
     /// RFC3339 timestamp.
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
@@ -192,51 +206,51 @@ pub fn bot_running_status(slug: &str, role: &str) -> bool {
 
 /// V0.6.5 F146 — read `last_turn_at` (mtime of the ccteam-owned
 /// `turns.jsonl`) from the project tree. Returns `None` if the file
-/// doesn't exist yet (bot registered but no turn taken).
+/// doesn't exist yet (bot registered but no turn taken). Honors
+/// `reg.project_dir` (F185) — when set, reads under the absolute
+/// project path; otherwise falls back to
+/// `<projects_root>/<workflow_slug>/.ccteam/chat/<role>/turns.jsonl`.
 pub fn last_turn_at(
     projects_root: &Path,
-    slug: &str,
-    role: &str,
+    reg: &BotRegistration,
 ) -> Option<chrono::DateTime<chrono::Utc>> {
-    let meta = fs::metadata(turns_jsonl_path(projects_root, slug, role)).ok()?;
+    let meta = fs::metadata(turns_jsonl_path(projects_root, reg)).ok()?;
     let mtime = meta.modified().ok()?;
     Some(chrono::DateTime::<chrono::Utc>::from(mtime))
 }
 
-/// V0.6.5 F147 — resolve `<projects_root>/<slug>/.ccteam/chat/<role>/inbox/`.
-/// The mailbox path the daemon's `drain_inboxes` / per-bot mpsc
-/// fast-path consume. MCP `chat_send_input` writes a router-style
+/// V0.6.5 F147 — resolve `<project>/.ccteam/chat/<role>/inbox/` for
+/// this bot. The mailbox path the daemon's `drain_inboxes` / per-bot
+/// mpsc fast-path consume. MCP `chat_send_input` writes a router-style
 /// envelope here; daemon picks it up either via the fast-path (when
 /// the per-bot mpsc is wired) or via the safety-net drain tick.
-pub fn chat_inbox_dir(projects_root: &Path, slug: &str, role: &str) -> PathBuf {
-    projects_root
-        .join(slug)
-        .join(".ccteam")
-        .join("chat")
-        .join(role)
-        .join("inbox")
+///
+/// F185 — prefers `reg.project_dir` (absolute path) over the historic
+/// `<projects_root>/<workflow_slug>/` fallback so projects living
+/// outside `~/projects/<slug>/` (NAS shares, dir basename ≠ slug)
+/// resolve correctly.
+pub fn chat_inbox_dir(projects_root: &Path, reg: &BotRegistration) -> PathBuf {
+    reg.chat_dir(projects_root).join("inbox")
 }
 
-/// V0.6.5 F147 — resolve `<projects_root>/<slug>/.ccteam/chat/<role>/signals/reset.signal`.
-/// MCP `chat_reset` writes this file; the supervisor's next tick reads
-/// it via `signal_present(.., RESET_SIGNAL)` and applies the
-/// ResetSession action (archive + close + start + cursor wipe).
-pub fn chat_reset_signal_path(projects_root: &Path, slug: &str, role: &str) -> PathBuf {
-    projects_root
-        .join(slug)
-        .join(".ccteam")
-        .join("chat")
-        .join(role)
+/// V0.6.5 F147 — resolve `<project>/.ccteam/chat/<role>/signals/reset.signal`
+/// for this bot. MCP `chat_reset` writes this file; the supervisor's
+/// next tick reads it via `signal_present(.., RESET_SIGNAL)` and
+/// applies the ResetSession action (archive + close + start + cursor
+/// wipe). Honors `reg.project_dir` (F185).
+pub fn chat_reset_signal_path(projects_root: &Path, reg: &BotRegistration) -> PathBuf {
+    reg.chat_dir(projects_root)
         .join("signals")
         .join("reset.signal")
 }
 
-/// V0.6.5 F147 — resolve `<projects_root>/<slug>/.ccteam/chat/<role>/turns.jsonl`.
-/// Source-of-truth file `chat_history` tails. Re-exports
+/// V0.6.5 F147 — resolve `<project>/.ccteam/chat/<role>/turns.jsonl`
+/// for this bot. Source-of-truth file `chat_history` tails. Re-exports
 /// [`outbound::turns_jsonl_path`] under a top-level name so MCP /
 /// integration callers don't have to reach into the outbound module.
-pub fn turns_jsonl_path(projects_root: &Path, slug: &str, role: &str) -> PathBuf {
-    outbound::turns_jsonl_path(projects_root, slug, role)
+/// Honors `reg.project_dir` (F185).
+pub fn turns_jsonl_path(projects_root: &Path, reg: &BotRegistration) -> PathBuf {
+    outbound::turns_jsonl_path(projects_root, reg)
 }
 
 impl BotRegistration {
@@ -246,6 +260,29 @@ impl BotRegistration {
     /// before the schema field landed.
     pub fn effective_handle(&self) -> &str {
         self.chat_handle.as_deref().unwrap_or(&self.role)
+    }
+
+    /// Resolve the project root for this bot — the directory holding
+    /// `.ccteam/workflow.yaml`. Prefers the registration's explicit
+    /// `project_dir` (absolute path written by `chat_register_bot` at
+    /// registration time). Falls back to the historical
+    /// `<projects_root>/<workflow_slug>/` layout for legacy
+    /// registrations that have `project_dir = None`.
+    pub fn project_root(&self, projects_root: &Path) -> PathBuf {
+        match self.project_dir.as_deref() {
+            Some(p) => p.to_path_buf(),
+            None => projects_root.join(&self.workflow_slug),
+        }
+    }
+
+    /// Resolve `<project>/.ccteam/chat/<role>/` for this bot. The
+    /// per-bot working dir used by the supervisor, mailbox writer,
+    /// transcript tail, outbound cursor, and all `chat_*` MCP paths.
+    pub fn chat_dir(&self, projects_root: &Path) -> PathBuf {
+        self.project_root(projects_root)
+            .join(".ccteam")
+            .join("chat")
+            .join(&self.role)
     }
 }
 
@@ -281,6 +318,7 @@ pub fn register_bot_checked_in(
     im_chat_id: &str,
     persona_id: Option<&str>,
     chat_handle: Option<&str>,
+    project_dir: Option<&Path>,
 ) -> Result<RegisterOutcome> {
     let path = registration_path_in(ccteam_root, workflow_slug, role);
     if path.exists() {
@@ -294,6 +332,7 @@ pub fn register_bot_checked_in(
         im_platform: im_platform.to_string(),
         im_chat_id: im_chat_id.to_string(),
         chat_handle: chat_handle.map(String::from),
+        project_dir: project_dir.map(PathBuf::from),
         created_at: chrono::Utc::now(),
     };
     if let Some(parent) = path.parent() {
@@ -327,6 +366,7 @@ pub fn register_bot_in(
         im_platform: im_platform.to_string(),
         im_chat_id: im_chat_id.to_string(),
         chat_handle: None,
+        project_dir: None,
         created_at: chrono::Utc::now(),
     };
     let path = registration_path_in(ccteam_root, workflow_slug, role);

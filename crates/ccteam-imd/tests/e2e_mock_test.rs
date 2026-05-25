@@ -151,6 +151,7 @@ fn reg(slug: &str, role: &str) -> BotRegistration {
         im_platform: "mock".into(),
         im_chat_id: format!("chat-{slug}-{role}"),
         chat_handle: None,
+        project_dir: None,
         created_at: chrono::Utc::now(),
     }
 }
@@ -215,9 +216,17 @@ async fn happy_path_im_to_bot_to_im() {
     let mut handles = HandleMap::new();
     handles.insert("lead", slug, role);
 
-    let res = process_inbound(&im_msg("@lead what's up?"), &sec, &handles, &mailbox, 0, 1)
-        .await
-        .unwrap();
+    let res = process_inbound(
+        &im_msg("@lead what's up?"),
+        &sec,
+        &handles,
+        &[],
+        &mailbox,
+        0,
+        1,
+    )
+    .await
+    .unwrap();
     assert!(matches!(res, InboundOutcome::DroppedToBot { .. }));
 
     // Wire supervisor + adapter; start the thread.
@@ -386,7 +395,7 @@ async fn multi_bot_parallel() {
     let mut seq = 0_u64;
     for content in ["@lead one", "@lead two", "@ops three"] {
         seq += 1;
-        let outcome = process_inbound(&im_msg(content), &sec, &handles, &mailbox, 0, seq)
+        let outcome = process_inbound(&im_msg(content), &sec, &handles, &[], &mailbox, 0, seq)
             .await
             .unwrap();
         assert!(matches!(outcome, InboundOutcome::DroppedToBot { .. }));
@@ -463,7 +472,7 @@ async fn channel_listen_to_inbound_pipeline() {
     let mut count = 0_u64;
     while let Ok(msg) = rx.try_recv() {
         count += 1;
-        let outcome = process_inbound(&msg, &sec, &handles, &mailbox, 0, count)
+        let outcome = process_inbound(&msg, &sec, &handles, &[], &mailbox, 0, count)
             .await
             .unwrap();
         assert!(matches!(outcome, InboundOutcome::DroppedToBot { .. }));
