@@ -36,7 +36,7 @@
 //!   ccteam never filters or rewrites these.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -657,7 +657,12 @@ async fn tail_loop(
     // fan-out bug — three tail loops all read whichever jsonl was
     // most recently modified).
     let marker_file = active_session_id_path(&project_dir, &role);
-    if let Some((sid, path)) = read_marker_target(&marker_file, &parent_dir) {
+    // F187 — surface a stuck loop with one WARN at ~60s; suppressed
+    // once the marker appears (resets on first marker-found read).
+    let mut silence = MarkerSilenceWatch::from_env();
+    let initial = read_marker_target(&marker_file, &parent_dir);
+    silence.observe(initial.is_some(), &marker_file, &role, &project_dir);
+    if let Some((sid, path)) = initial {
         if cursor.switch_session(&sid, encode_project_cwd(&cwd)) {
             pending.clear();
         }
@@ -680,8 +685,18 @@ async fn tail_loop(
                 // Re-read the marker on every fs event — `/clear` /
                 // `/compact` rotates the sid and the hook overwrites
                 // the marker. Skip if missing (hook hasn't fired yet
-                // → wait for next event).
-                let Some(target_sid) = read_marker_sid(&marker_file) else { continue };
+                // → wait for next event). F187: account missing markers
+                // toward the silence WARN clock.
+                let target_sid = match read_marker_sid(&marker_file) {
+                    Some(sid) => {
+                        silence.observe(true, &marker_file, &role, &project_dir);
+                        sid
+                    }
+                    None => {
+                        silence.observe(false, &marker_file, &role, &project_dir);
+                        continue;
+                    }
+                };
                 for affected in evt.paths.iter() {
                     if affected.extension().and_then(|s| s.to_str()) != Some("jsonl") {
                         continue;
@@ -712,14 +727,93 @@ async fn tail_loop(
                 // ext4/btrfs, but a half-flushed line that didn't fire
                 // a MODIFY yet, or a fs that buffers writes, can leave
                 // bytes on disk we haven't observed. Re-read marker +
-                // drain the targeted jsonl.
-                if let Some((sid, path)) = read_marker_target(&marker_file, &parent_dir) {
+                // drain the targeted jsonl. F187: this is the cadence
+                // that gates the silence WARN — at 2s/tick we hit the
+                // 60s threshold after ~30 consecutive misses.
+                let pair = read_marker_target(&marker_file, &parent_dir);
+                silence.observe(pair.is_some(), &marker_file, &role, &project_dir);
+                if let Some((sid, path)) = pair {
                     if cursor.switch_session(&sid, encode_project_cwd(&cwd)) {
                         pending.clear();
                     }
                     drain_path(&path, &mut cursor, &mut pending, &cursor_file, &tx).await;
                 }
             }
+        }
+    }
+}
+
+/// F187 — surface tail loops silently waiting forever for the F176
+/// active-session-id marker. The hook writes the marker on the
+/// SessionStart hook firing; when that fails (most likely cause:
+/// F186-style env-propagation failure leaving `role=""` so the hook
+/// targets the wrong marker path), the loop quietly sleeps and the
+/// user sees a bot that never replies. Fire one WARN at ~60s with
+/// role/slug context so the failure mode is grep-able in logs;
+/// suppress further WARNs until the marker appears at least once so
+/// long-running loops don't spam.
+struct MarkerSilenceWatch {
+    first_missing: Option<Instant>,
+    warned: bool,
+    warn_after: Duration,
+}
+
+impl Default for MarkerSilenceWatch {
+    fn default() -> Self {
+        Self {
+            first_missing: None,
+            warned: false,
+            warn_after: Self::DEFAULT_WARN_AFTER,
+        }
+    }
+}
+
+impl MarkerSilenceWatch {
+    /// Threshold after which we WARN. ~60s covers the cold-start grace
+    /// period (the hook can take a beat to fire on first prompt) but
+    /// surfaces a stuck loop well before the user reports "bot dead".
+    /// `CCTEAM_TAIL_MARKER_WARN_MS` overrides this for tests so they
+    /// don't have to sleep a full minute to exercise the WARN path.
+    const DEFAULT_WARN_AFTER: Duration = Duration::from_secs(60);
+
+    fn from_env() -> Self {
+        let warn_after = std::env::var("CCTEAM_TAIL_MARKER_WARN_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(Self::DEFAULT_WARN_AFTER);
+        Self {
+            first_missing: None,
+            warned: false,
+            warn_after,
+        }
+    }
+
+    /// Call on every loop iteration with the current marker-present
+    /// status. `marker_file` is only used for the WARN message.
+    fn observe(
+        &mut self,
+        marker_present: bool,
+        marker_file: &Path,
+        role: &str,
+        project_dir: &Path,
+    ) {
+        if marker_present {
+            self.first_missing = None;
+            self.warned = false;
+            return;
+        }
+        let started = *self.first_missing.get_or_insert_with(Instant::now);
+        if !self.warned && started.elapsed() >= self.warn_after {
+            tracing::warn!(
+                event = "tail_marker_missing",
+                role = %role,
+                project_dir = %project_dir.display(),
+                marker = %marker_file.display(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "chat-mode tail waiting for SessionStart hook — likely env-propagation failure if this persists"
+            );
+            self.warned = true;
         }
     }
 }
@@ -813,6 +907,11 @@ async fn tail_loop_polling(
     let mut cursor = TranscriptCursor::load(&cursor_file).unwrap_or_default();
     let mut pending = PendingTools::new();
     let mut sleep_ms: u64 = 200;
+    // F187 — same WARN gate as `tail_loop`. The exponential backoff
+    // (200ms → 2s) means count-based thresholds drift; the Instant
+    // form fires on wall-clock elapsed instead, matching the
+    // event-driven loop's 60s threshold.
+    let mut silence = MarkerSilenceWatch::from_env();
 
     loop {
         if tx.is_closed() {
@@ -822,8 +921,12 @@ async fn tail_loop_polling(
         // No fallback to most-recently-modified jsonl; if the hook
         // hasn't published a marker yet, we wait.
         let (sid, transcript_path) = match read_marker_target(&marker_file, &parent_dir) {
-            Some(pair) => pair,
+            Some(pair) => {
+                silence.observe(true, &marker_file, &role, &project_dir);
+                pair
+            }
             None => {
+                silence.observe(false, &marker_file, &role, &project_dir);
                 tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
                 sleep_ms = (sleep_ms * 2).min(2000);
                 continue;
@@ -883,5 +986,36 @@ mod tests {
         let a = ClaudeTuiAdapter::new();
         assert_eq!(a.name(), "claude-tui");
         assert_eq!(a.vendor(), AgentVendor::Claude);
+    }
+
+    // F187 — state machine smoke. The `observe` method is the
+    // load-bearing logic; an integration test
+    // (`claude_tui_silence_warn_test.rs`) covers the actual WARN
+    // emission against a live tail loop, this unit asserts the
+    // first-missing tracking + reset on marker-found resets the
+    // warned flag.
+    #[test]
+    fn marker_silence_watch_arms_and_resets() {
+        let marker = std::path::PathBuf::from("/tmp/nope");
+        let project = std::path::PathBuf::from("/tmp/proj");
+        let mut s = MarkerSilenceWatch {
+            first_missing: None,
+            warned: false,
+            warn_after: Duration::from_millis(0),
+        };
+        // First missing: arms the clock + (since threshold is 0)
+        // immediately fires + flips warned to true.
+        s.observe(false, &marker, "alice", &project);
+        assert!(
+            s.warned,
+            "WARN should latch on first missing with 0 threshold"
+        );
+        // Second missing: warned latched → no re-fire (no observable
+        // way to count from outside, but `first_missing` stays set).
+        assert!(s.first_missing.is_some());
+        // Marker found resets: next missing should re-arm the clock.
+        s.observe(true, &marker, "alice", &project);
+        assert!(!s.warned);
+        assert!(s.first_missing.is_none());
     }
 }

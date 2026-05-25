@@ -116,6 +116,102 @@ async fn post_unknown_kind_returns_500_with_error_body() {
     );
 }
 
+/// F186 — daemon process does not inherit the firing claude pane's
+/// env (it runs in its own process tree), so `CCTEAM_CHAT_ROLE`
+/// reaches it only via the `X-Ccteam-Role` HTTP header set by
+/// `hook.sh`. Without this path the chat-mode SessionStart hook lands
+/// `role=""` in progress.jsonl and the F176 active-session-id marker
+/// is never written → F177 tail loop has no target jsonl → squad mode
+/// silently breaks in production.
+#[tokio::test]
+async fn chat_progress_session_start_uses_role_header() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    disable_tool_surface_bootstrap_for_tests();
+    bootstrap_project(&paths, "demo", "demo", "chat").unwrap();
+    let progress = paths.progress_jsonl("demo");
+    let cwd = paths.project_dir("demo");
+    let marker = cwd.join(".ccteam/chat/alice/active-session-id");
+
+    let state = AppState::new(paths);
+    let addr = spawn(state).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "http://{addr}/internal/hook/chat-progress/session-start"
+        ))
+        .header("x-ccteam-role", "alice")
+        .header("x-ccteam-slug", "demo")
+        .json(&json!({
+            "hook_event_name": "SessionStart",
+            "session_id": "sid-f186",
+            "transcript_path": "/tmp/whatever.jsonl",
+            "cwd": cwd.display().to_string(),
+            "source": "startup",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Progress line should carry `role=alice` even though the daemon
+    // process itself has no `CCTEAM_CHAT_ROLE` in env.
+    let line = std::fs::read_to_string(&progress).expect("progress jsonl written");
+    assert!(
+        line.contains("\"event\":\"chat_session_started\""),
+        "expected chat_session_started, got: {line}",
+    );
+    assert!(
+        line.contains("\"role\":\"alice\""),
+        "expected role=alice from X-Ccteam-Role header injection, got: {line}",
+    );
+
+    // F176 active-session-id marker should land under the per-bot dir
+    // — this is the load-bearing side effect F186 protects.
+    let marker_body = std::fs::read_to_string(&marker).expect("active-session-id marker written");
+    assert_eq!(marker_body.trim(), "sid-f186");
+}
+
+/// F186 — payload-shipped `role` wins over header so we don't clobber
+/// upstream-provided identity. Defensive: if Anthropic ever ships
+/// `role` in the hook stdin, we honor it.
+#[tokio::test]
+async fn chat_progress_payload_role_overrides_header() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    disable_tool_surface_bootstrap_for_tests();
+    bootstrap_project(&paths, "demo", "demo", "chat").unwrap();
+    let progress = paths.progress_jsonl("demo");
+    let cwd = paths.project_dir("demo");
+
+    let state = AppState::new(paths);
+    let addr = spawn(state).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "http://{addr}/internal/hook/chat-progress/session-start"
+        ))
+        .header("x-ccteam-role", "header-role")
+        .json(&json!({
+            "hook_event_name": "SessionStart",
+            "session_id": "sid-payload",
+            "transcript_path": "/tmp/whatever.jsonl",
+            "cwd": cwd.display().to_string(),
+            "source": "startup",
+            "role": "payload-role",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let line = std::fs::read_to_string(&progress).expect("progress jsonl written");
+    assert!(
+        line.contains("\"role\":\"payload-role\""),
+        "payload role must win over header, got: {line}",
+    );
+}
+
 #[tokio::test]
 async fn auth_on_rejects_without_bearer_then_accepts_with_it() {
     let tmp = TempDir::new().unwrap();
