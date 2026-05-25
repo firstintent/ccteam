@@ -391,6 +391,67 @@ pub fn build_chat_bot_marker_stuck_event(role: &str, attempts: u32) -> Value {
     })
 }
 
+/// `chat_turn_running_long` — V0.6.8 F195. Per-turn watchdog crossed
+/// the first threshold (`1× turn_timeout_sec`, default 90s). The
+/// supervisor is **still** waiting on `chat_turn_completed`; this event
+/// signals the wait crossed the warning bar so IM / web surfaces can
+/// reassure the user the bot is alive. Hard rule: **does not kill the
+/// turn** — the underlying claude session keeps running.
+///
+/// Payload: `{role, slug, turn_id, elapsed_sec, ts}`.
+pub const CHAT_TURN_RUNNING_LONG: &str = "chat_turn_running_long";
+
+/// V0.6.8 F195 — build a `chat_turn_running_long` event JSON.
+pub fn build_chat_turn_running_long_event(
+    role: &str,
+    slug: &str,
+    turn_id: &str,
+    elapsed_sec: u64,
+) -> Value {
+    serde_json::json!({
+        "event": CHAT_TURN_RUNNING_LONG,
+        "role": role,
+        "slug": slug,
+        "turn_id": turn_id,
+        "elapsed_sec": elapsed_sec,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
+/// `chat_turn_timeout` — V0.6.8 F195. Per-turn watchdog crossed the
+/// second threshold (`2× turn_timeout_sec`, default 180s) without ever
+/// seeing `chat_turn_completed`. Carries a `stuck: true` flag so
+/// downstream consumers (web UI, ops dashboards) can distinguish from
+/// a slow-but-progressing turn. Hard rule: **does not kill the turn**
+/// — the watchdog only surfaces the silent stall; recovery is via
+/// user-driven `/clear` / signal-reset, not engine intervention (R5
+/// 守 from CLAUDE.md §三).
+///
+/// Payload: `{role, slug, turn_id, elapsed_sec, stuck, ts}`.
+pub const CHAT_TURN_TIMEOUT: &str = "chat_turn_timeout";
+
+/// V0.6.8 F195 — build a `chat_turn_timeout` event JSON. The `stuck`
+/// field is hard-coded `true`; it exists in the payload so a future
+/// `chat_turn_timeout_recovered` event (if we ever add one when the
+/// turn does eventually finish post-timeout) can be distinguished on
+/// the wire by flipping the flag.
+pub fn build_chat_turn_timeout_event(
+    role: &str,
+    slug: &str,
+    turn_id: &str,
+    elapsed_sec: u64,
+) -> Value {
+    serde_json::json!({
+        "event": CHAT_TURN_TIMEOUT,
+        "role": role,
+        "slug": slug,
+        "turn_id": turn_id,
+        "elapsed_sec": elapsed_sec,
+        "stuck": true,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
 // ---------------- V0.6.1 F98 plan-approval event kinds ----------------
 
 /// `plan_pending` — agent wrote a plan markdown to
@@ -469,7 +530,8 @@ pub fn build_plan_timeout_event(plan_id: &str, agent: &str, on_timeout: &str) ->
     })
 }
 
-/// True if `kind` is one of the F108/F118 chat-mode event names.
+/// True if `kind` is one of the chat-mode event names (F108 / F118 /
+/// F192c / F195 / F196).
 pub fn is_chat_event(kind: &str) -> bool {
     matches!(
         kind,
@@ -480,6 +542,11 @@ pub fn is_chat_event(kind: &str) -> bool {
             | CHAT_SESSION_RESET_WITH_RECOVERY
             | CHAT_COMPACT_DONE
             | CHAT_HOP_ESCALATE
+            | CHAT_BOT_PERMANENT_FAILURE
+            | CHAT_MARKER_SELF_HEAL_ATTEMPT
+            | CHAT_BOT_MARKER_STUCK
+            | CHAT_TURN_RUNNING_LONG
+            | CHAT_TURN_TIMEOUT
     )
 }
 
@@ -889,7 +956,7 @@ mod tests {
     }
 
     #[test]
-    fn is_chat_event_recognises_all_seven() {
+    fn is_chat_event_recognises_all_chat_kinds() {
         for kind in [
             CHAT_SESSION_STARTED,
             CHAT_TURN_USER_PROMPT,
@@ -898,11 +965,36 @@ mod tests {
             CHAT_SESSION_RESET_WITH_RECOVERY,
             CHAT_COMPACT_DONE,
             CHAT_HOP_ESCALATE,
+            CHAT_BOT_PERMANENT_FAILURE,
+            CHAT_TURN_RUNNING_LONG,
+            CHAT_TURN_TIMEOUT,
         ] {
             assert!(is_chat_event(kind), "{kind} should be a chat event");
         }
         assert!(!is_chat_event("Stop"));
         assert!(!is_chat_event("agent_done"));
+    }
+
+    #[test]
+    fn build_chat_turn_running_long_event_shape() {
+        let ev = build_chat_turn_running_long_event("alice", "dev-foo", "turn-42", 95);
+        assert_eq!(ev["event"], CHAT_TURN_RUNNING_LONG);
+        assert_eq!(ev["role"], "alice");
+        assert_eq!(ev["slug"], "dev-foo");
+        assert_eq!(ev["turn_id"], "turn-42");
+        assert_eq!(ev["elapsed_sec"], 95);
+        assert!(ev["ts"].is_string());
+    }
+
+    #[test]
+    fn build_chat_turn_timeout_event_carries_stuck_flag() {
+        let ev = build_chat_turn_timeout_event("alice", "dev-foo", "turn-42", 200);
+        assert_eq!(ev["event"], CHAT_TURN_TIMEOUT);
+        assert_eq!(ev["role"], "alice");
+        assert_eq!(ev["slug"], "dev-foo");
+        assert_eq!(ev["turn_id"], "turn-42");
+        assert_eq!(ev["elapsed_sec"], 200);
+        assert_eq!(ev["stuck"], true);
     }
 
     #[test]

@@ -189,6 +189,54 @@ pub enum MarkerHealAction {
     PermanentFailure,
 }
 
+/// V0.6.8 F195 — per-turn watchdog state held inside
+/// [`BotSupervisor::active_turn`].
+///
+/// Set when [`BotSupervisor::handle_inbound`] successfully calls
+/// `adapter.submit_turn`; cleared on `ItemCompleted/AgentMessage`
+/// (assistant turn done from the harness's perspective), `shutdown`,
+/// `reset_session`. Two latches — `long_emitted`, `timeout_emitted` —
+/// stop the daemon's tick from re-firing the same notification on
+/// every 5s pass.
+#[derive(Debug, Clone)]
+pub struct TurnDeadline {
+    /// Adapter-assigned turn id, copied from the `submit_turn` return.
+    pub turn_id: TurnId,
+    /// When [`BotSupervisor::handle_inbound`] called `submit_turn`.
+    /// `Instant` (monotonic) so wall-clock drift can't reset the timer.
+    pub started_at: Instant,
+    /// True once the `chat_turn_running_long` notification fired.
+    pub long_emitted: bool,
+    /// True once the `chat_turn_timeout` notification fired.
+    pub timeout_emitted: bool,
+}
+
+/// V0.6.8 F195 — one notification the watchdog wants to surface for an
+/// outstanding turn. Returned from
+/// [`BotSupervisor::check_turn_watchdog`] so the daemon owns the IO
+/// (progress.jsonl append + `channel.send`) — the supervisor stays a
+/// pure decision-maker, mirroring `decide_with_config`'s split.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnWatchdogNotice {
+    /// First threshold (`1× turn_timeout_sec`). User-facing IM line:
+    /// "Still working on your message (turn started <HH:MM:SS>).
+    /// Continuing."
+    RunningLong {
+        /// Adapter turn id.
+        turn_id: String,
+        /// Seconds since `submit_turn`.
+        elapsed_sec: u64,
+    },
+    /// Second threshold (`2× turn_timeout_sec`). User-facing IM line
+    /// includes recovery instructions ("/clear and retry").
+    Timeout {
+        /// Adapter turn id.
+        turn_id: String,
+        /// Seconds since `submit_turn`.
+        elapsed_sec: u64,
+    },
+}
+
 /// Decision the supervisor makes for one bot on a single tick.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SupervisorAction {
@@ -429,13 +477,8 @@ pub struct BotSupervisor {
     /// stamp every outbound row with the inbound's hop. The daemon's
     /// outbound dispatcher then computes `next_hop = item.hop + 1`
     /// when it detects an embedded `@<otherbot>` mention and
-    /// synthesizes a cross-bot `InboxItem`.
-    ///
-    /// Set in `handle_inbound` before `submit_turn`; read per-event in
-    /// `spawn_events_consumer`. Replies from a turn we never observed
-    /// (host-probe direct `submit_turn`, daemon restart while a tmux
-    /// session is mid-conversation) inherit the default value `0`,
-    /// matching the "user-IM-sourced" hop semantic.
+    /// synthesizes a cross-bot `InboxItem`. User-IM-sourced turns enter
+    /// with `hop = 0`.
     current_hop: Arc<AtomicU8>,
     /// V0.6.8 F196 — self-Weak captured during
     /// `register_as_marker_reporter` so the [`MarkerReporter`] trait
@@ -444,6 +487,26 @@ pub struct BotSupervisor {
     /// past its rightful drop. Set once; subsequent registrations
     /// (restart / reset) reuse the same Weak.
     self_weak: std::sync::OnceLock<Weak<Self>>,
+    /// V0.6.8 F195 — outstanding-turn watchdog state. Set by
+    /// `handle_inbound` after a successful `submit_turn`, cleared by
+    /// the `events()` consumer on `ItemCompleted/AgentMessage` (the
+    /// HarnessAdapter's local view of "turn completed"), and also
+    /// cleared in `shutdown` / `reset_session`. The daemon's tick loop
+    /// calls [`check_turn_watchdog`] each pass to drain
+    /// [`TurnWatchdogNotice`]s that crossed a threshold.
+    ///
+    /// `Arc<Mutex<_>>` so the spawned events-consumer task can hold its
+    /// own clone and clear the deadline without re-locking the
+    /// supervisor's main `state`.
+    active_turn: Arc<Mutex<Option<TurnDeadline>>>,
+    /// V0.6.8 F195 — per-turn watchdog threshold (seconds). First
+    /// crossing emits `chat_turn_running_long`; second crossing (at
+    /// `2× turn_timeout_sec`) emits `chat_turn_timeout`. Defaults to
+    /// [`ccteam_core::workflow::DEFAULT_TURN_TIMEOUT_SECS`] when
+    /// callers use [`Self::new`] / [`Self::new_with_config`]; a future
+    /// patch will plumb `workflow.yaml::chat.turn_timeout_sec` through
+    /// here once the daemon learns to load workflow specs at startup.
+    pub turn_timeout_sec: u32,
 }
 
 impl std::fmt::Debug for BotSupervisor {
@@ -493,7 +556,28 @@ impl BotSupervisor {
             outbound_tx: Arc::new(Mutex::new(None)),
             current_hop: Arc::new(AtomicU8::new(0)),
             self_weak: std::sync::OnceLock::new(),
+            active_turn: Arc::new(Mutex::new(None)),
+            turn_timeout_sec: ccteam_core::workflow::DEFAULT_TURN_TIMEOUT_SECS,
         }
+    }
+
+    /// V0.6.8 F195 — full constructor including the watchdog timeout
+    /// override. Production callers stick with
+    /// [`Self::new`] / [`Self::new_with_config`] (default 90s); tests
+    /// pass a tight value (e.g. 1s) so threshold assertions fit under
+    /// `max_runtime`. A future patch will thread
+    /// `workflow.yaml::chat.turn_timeout_sec` through here once the
+    /// daemon learns to load workflow specs at startup.
+    pub fn new_with_turn_timeout(
+        reg: BotRegistration,
+        projects_root: impl Into<PathBuf>,
+        adapter: Arc<dyn HarnessAdapter + Send + Sync>,
+        config_projects: HashMap<String, PathBuf>,
+        turn_timeout_sec: u32,
+    ) -> Self {
+        let mut sup = Self::new_with_config(reg, projects_root, adapter, config_projects);
+        sup.turn_timeout_sec = turn_timeout_sec;
+        sup
     }
 
     /// V0.6.1 fast-path — daemon main loop calls this once per bot
@@ -994,6 +1078,12 @@ impl BotSupervisor {
         // recent value (across submit_turn await points + scheduler
         // hand-off).
         let current_hop_arc = self.current_hop.clone();
+        // V0.6.8 F195 — clone the `active_turn` Arc into the spawned
+        // task so it can clear the watchdog deadline the moment the
+        // adapter emits the matching `ItemCompleted/AgentMessage`. The
+        // task can't reach `self` (lifetime), so we hand the Arc in
+        // explicitly. Mirrors the `outbound_tx` pattern above.
+        let active_turn_arc = self.active_turn.clone();
         let task = tokio::spawn(async move {
             let mut stream = adapter.events(&handle);
             while let Some(evt) = stream.next().await {
@@ -1007,6 +1097,18 @@ impl BotSupervisor {
                 };
                 if text.is_empty() {
                     continue;
+                }
+                // V0.6.8 F195 — assistant text means the harness saw
+                // the turn finish. Clear the watchdog so a subsequent
+                // post-timeout reply doesn't keep firing the daemon's
+                // tick notifications. We clear unconditionally (rather
+                // than match on turn_id) because in steady-state the
+                // bot serializes one turn at a time; the rare edge
+                // case where a stale post-clear turn lands is benign
+                // (next `handle_inbound` re-arms the deadline anyway).
+                {
+                    let mut guard = active_turn_arc.lock().await;
+                    *guard = None;
                 }
                 let assistant_len = text.len();
                 let turn_id_log = item.id.clone();
@@ -1126,6 +1228,16 @@ impl BotSupervisor {
     /// value to compute `next_hop = hop + 1` when it detects an
     /// embedded `@<otherbot>` mention and synthesizes a cross-bot
     /// `InboxItem`. User-IM-sourced turns enter with `hop = 0`.
+    ///
+    /// V0.6.8 F195 — on a successful submit, arms the per-turn watchdog
+    /// by storing a fresh [`TurnDeadline`] in `active_turn`. The
+    /// daemon's tick loop polls [`check_turn_watchdog`] each pass; when
+    /// the elapsed time crosses `1× turn_timeout_sec` (default 90s) the
+    /// daemon emits `chat_turn_running_long` + a "still working" IM
+    /// reply; at `2×` it emits `chat_turn_timeout` + a "stuck" IM
+    /// reply. The deadline is cleared when the events consumer sees
+    /// the matching `ItemCompleted/AgentMessage` (turn done) or when
+    /// the supervisor is shut down / reset.
     pub async fn handle_inbound(&self, payload: String, hop: u8) -> Result<TurnId> {
         // V0.6.8 F193 — stash the inbound hop BEFORE submit_turn so the
         // events consumer (which fires asynchronously when the adapter
@@ -1152,6 +1264,21 @@ impl BotSupervisor {
                     self.reg.workflow_slug, self.reg.role
                 )
             })?;
+        // V0.6.8 F195 — arm the watchdog *after* submit_turn succeeds.
+        // On submit failure we leave any previous deadline alone — a
+        // pre-existing in-flight turn from an earlier `handle_inbound`
+        // is still a legitimate stall to surface. (Practically the bot
+        // serializes turns through tmux, so back-to-back submits land
+        // sequentially; the rare overlap window is benign.)
+        {
+            let mut guard = self.active_turn.lock().await;
+            *guard = Some(TurnDeadline {
+                turn_id: id.clone(),
+                started_at: Instant::now(),
+                long_emitted: false,
+                timeout_emitted: false,
+            });
+        }
         tracing::debug!(
             slug = %self.reg.workflow_slug,
             role = %self.reg.role,
@@ -1160,6 +1287,69 @@ impl BotSupervisor {
             "submitted user turn"
         );
         Ok(id)
+    }
+
+    /// V0.6.8 F195 — snapshot the outstanding turn (test / observability).
+    pub async fn active_turn_snapshot(&self) -> Option<TurnDeadline> {
+        self.active_turn.lock().await.clone()
+    }
+
+    /// V0.6.8 F195 — poll the watchdog for one bot.
+    ///
+    /// Returns the notification (if any) the daemon should surface this
+    /// tick AND latches `long_emitted` / `timeout_emitted` so the next
+    /// tick doesn't re-fire the same notice. Pure decision-side: no
+    /// progress.jsonl writes, no `channel.send` — those happen on the
+    /// daemon side (which already owns the [`ChannelMap`] +
+    /// [`CcteamPaths`] surface needed for the IO).
+    ///
+    /// Hard rule (CLAUDE.md §三 R5): this method never touches the
+    /// underlying claude / tmux session. The watchdog only **observes**
+    /// the silent stall and surfaces it; recovery is user-driven.
+    ///
+    /// Returns at most one notice per call (the earliest unlatched
+    /// threshold the deadline has crossed). The daemon calls this once
+    /// per 5s tick per bot; in steady-state a stalled turn emits
+    /// `RunningLong` on the tick after the 90s mark, then `Timeout` on
+    /// the tick after the 180s mark, then nothing.
+    pub async fn check_turn_watchdog(&self) -> Option<TurnWatchdogNotice> {
+        let mut guard = self.active_turn.lock().await;
+        let deadline = guard.as_mut()?;
+        let elapsed = deadline.started_at.elapsed();
+        let timeout_sec = self.turn_timeout_sec.max(1) as u64;
+        let elapsed_sec = elapsed.as_secs();
+        // Second threshold (2x) wins over first when both are crossed
+        // and `RunningLong` was already emitted — we always advance
+        // forward through the thresholds, never re-emit.
+        if !deadline.timeout_emitted && elapsed_sec >= timeout_sec.saturating_mul(2) {
+            deadline.timeout_emitted = true;
+            // Set `long_emitted` too so a daemon that skipped the
+            // intermediate tick (e.g. busy tokio scheduler) doesn't
+            // back-fire `RunningLong` next pass.
+            deadline.long_emitted = true;
+            return Some(TurnWatchdogNotice::Timeout {
+                turn_id: deadline.turn_id.0.clone(),
+                elapsed_sec,
+            });
+        }
+        if !deadline.long_emitted && elapsed_sec >= timeout_sec {
+            deadline.long_emitted = true;
+            return Some(TurnWatchdogNotice::RunningLong {
+                turn_id: deadline.turn_id.0.clone(),
+                elapsed_sec,
+            });
+        }
+        None
+    }
+
+    /// V0.6.8 F195 — clear the outstanding-turn watchdog. Called by the
+    /// events consumer when `ItemCompleted/AgentMessage` fires (turn
+    /// done from the harness's view) and by `shutdown` /
+    /// `reset_session` so a stale deadline doesn't survive a session
+    /// teardown. Idempotent — clearing an already-cleared slot is a
+    /// no-op.
+    pub async fn clear_active_turn(&self) {
+        *self.active_turn.lock().await = None;
     }
 
     /// Gracefully close the underlying thread (`adapter.close_thread`)
@@ -1173,6 +1363,10 @@ impl BotSupervisor {
         // tail loop (if still alive on a respawn) doesn't fire heal
         // attempts against a closing supervisor.
         self.unregister_marker_reporter();
+        // V0.6.8 F195 — drop any outstanding watchdog deadline so a
+        // post-shutdown daemon tick doesn't keep emitting timeout
+        // notices for a bot whose session is gone.
+        self.clear_active_turn().await;
         let handle = {
             let mut st = self.state.lock().await;
             st.shutting_down = true;
@@ -1201,6 +1395,9 @@ impl BotSupervisor {
         // tasks before tearing it down; `ensure_started` will respawn
         // them against the fresh handle.
         self.abort_background_tasks().await;
+        // V0.6.8 F195 — drop the watchdog deadline: the old session is
+        // being torn down, any in-flight turn it owned is gone.
+        self.clear_active_turn().await;
         // Close first.
         let handle = self.state.lock().await.handle.take();
         if let Some(h) = handle {
@@ -1258,6 +1455,10 @@ impl BotSupervisor {
     /// any turn was taken).
     pub async fn reset_session(&self) -> Result<Option<PathBuf>> {
         self.abort_background_tasks().await;
+        // V0.6.8 F195 — wipe the watchdog deadline. A reset means the
+        // user explicitly asked for a fresh session; any pre-reset
+        // turn's stall is no longer actionable.
+        self.clear_active_turn().await;
 
         // 2. Archive the existing turns.jsonl.
         let bot_dir = self.bot_dir();

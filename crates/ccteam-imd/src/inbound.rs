@@ -196,26 +196,77 @@ impl MailboxResolver for DefaultMailboxResolver {
     }
 }
 
-/// V0.6.1 F135 — DM auto-route preprocessor.
+/// V0.6.8 F194 — outcome of the DM auto-route preprocessor.
 ///
-/// Mutates `msg.content` in-place by prepending `@<role> ` when:
-/// 1. The content has no existing `@<handle>` mention, AND
-/// 2. Exactly one registered bot's `(im_platform, im_chat_id)` matches
-///    `(msg.channel, msg.reply_target)`.
+/// The caller (the daemon's inbound consumer) inspects this to decide
+/// whether to:
+/// - continue normal routing ([`DmRoutingHint::Routed`] /
+///   [`DmRoutingHint::NoMatch`] — `msg.content` already mutated by
+///   [`auto_route_dm_mention`] in the single-bot case, untouched
+///   otherwise);
+/// - short-circuit with a user-facing "disambiguate which bot" reply
+///   ([`DmRoutingHint::Ambiguous`]) without forwarding the message to
+///   the router. Reusing F184's `format_unknown_handle_reply` would be
+///   misleading ("Unknown handle '@xxx'") because the user didn't type
+///   one — we render a parallel "Multiple bots in this chat" line via
+///   [`format_ambiguous_dm_reply`] instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DmRoutingHint {
+    /// Single registered bot owns `(channel, chat_id)`; `msg.content`
+    /// has been mutated in-place to prepend `@<role> ` so the router
+    /// resolves the message to that bot.
+    Routed {
+        /// The bot role we prepended.
+        to_role: String,
+    },
+    /// Two or more bots share `(channel, chat_id)` (group-style chat,
+    /// chat-squad fan-out). Caller should send the
+    /// `format_ambiguous_dm_reply(available)` text back to the chat and
+    /// **not** continue normal routing — the user has to retype with an
+    /// explicit `@<handle>`.
+    Ambiguous {
+        /// The handles the user can pick from. Same ordering / collision
+        /// rules as [`crate::router::available_handles_for_chat`] so the
+        /// hint always matches `@ccteam list bots` for the same chat.
+        available: Vec<String>,
+    },
+    /// Zero registered bots own this chat. Same as legacy F135 silent
+    /// path — let the router drop the message naturally (no IM reply,
+    /// no admin processing).
+    NoMatch,
+}
+
+/// V0.6.1 F135 + V0.6.8 F194 — DM auto-route preprocessor.
 ///
-/// The router contract drops "no @mention" messages; without this
-/// preprocessor a user DMing a single bot would have to type
-/// `@<role> hi` to be heard, which defeats the "natural DM" UX
-/// promise. The 2+ bot case (group with multiple bots sharing a
-/// chat_id) still falls through to the router's drop path so explicit
-/// @ mentions remain the disambiguator there.
+/// Behavior:
+/// 1. Existing `@<handle>` in the content → return [`DmRoutingHint::Routed`]
+///    with `to_role` empty-ish (caller should treat as no-op; the router
+///    will resolve the explicit mention itself). For clarity we return
+///    `NoMatch` in that branch — the caller's contract is "did we mutate
+///    `msg`?", and we didn't.
+/// 2. No `@`, exactly one bot owns `(channel, chat_id)` → mutate
+///    `msg.content` to prepend `@<role> ` and return
+///    [`DmRoutingHint::Routed`].
+/// 3. No `@`, **two or more** bots own `(channel, chat_id)` (the V0.6.8
+///    F194 anchor) → leave `msg.content` untouched and return
+///    [`DmRoutingHint::Ambiguous { available }`]. The caller renders the
+///    hint reply via [`format_ambiguous_dm_reply`] and short-circuits
+///    out of the inbound pipeline.
+/// 4. No `@`, zero bots own the chat → return [`DmRoutingHint::NoMatch`]
+///    (legacy F135 silent drop path).
 ///
-/// Helper [`has_at_mention`] does the @ detection; kept public so
-/// unit tests can probe the boundary cases (e.g. bare "@" with no
+/// Helper [`has_at_mention`] does the `@` detection; kept public so
+/// unit tests can probe the boundary cases (e.g. bare `@` with no
 /// handle char).
-pub fn auto_route_dm_mention(msg: &mut ChannelMessage, bots: &[crate::BotRegistration]) {
+pub fn auto_route_dm_mention(
+    msg: &mut ChannelMessage,
+    bots: &[crate::BotRegistration],
+) -> DmRoutingHint {
     if has_at_mention(&msg.content) {
-        return;
+        // Caller treats this the same as NoMatch (no mutation, normal
+        // router pass). We don't fabricate a `to_role` here — the user
+        // already specified one.
+        return DmRoutingHint::NoMatch;
     }
     let matches: Vec<&crate::BotRegistration> = bots
         .iter()
@@ -234,6 +285,7 @@ pub fn auto_route_dm_mention(msg: &mut ChannelMessage, bots: &[crate::BotRegistr
                 role
             );
             msg.content = new_content;
+            DmRoutingHint::Routed { to_role: role }
         }
         0 => {
             tracing::debug!(
@@ -241,16 +293,50 @@ pub fn auto_route_dm_mention(msg: &mut ChannelMessage, bots: &[crate::BotRegistr
                 chat_id = %msg.reply_target,
                 "imd: F135 DM auto-route skipped (no bot bound to this chat)"
             );
+            DmRoutingHint::NoMatch
         }
         n => {
-            tracing::debug!(
+            // V0.6.8 F194 — instead of the legacy silent drop, compute
+            // the available-handle list now so the caller can send the
+            // disambiguation hint reply. We reuse
+            // `available_handles_for_chat` so the suggested handles
+            // mirror what `@ccteam list bots` shows for this chat
+            // (including F184 cross-slug collision suffixes).
+            let available = available_handles_for_chat(bots, &msg.channel, &msg.reply_target);
+            tracing::info!(
                 count = n,
+                available = available.len(),
                 platform = %msg.channel,
                 chat_id = %msg.reply_target,
-                "imd: F135 DM auto-route skipped (multiple bots share chat_id; group-style @ required)"
+                "imd: F194 DM auto-route ambiguous (multiple bots share chat_id); replying with hint"
             );
+            DmRoutingHint::Ambiguous { available }
         }
     }
+}
+
+/// V0.6.8 F194 — render the user-facing "multiple bots in this chat"
+/// reply.
+///
+/// Parallel to F184's [`crate::router::format_unknown_handle_reply`]
+/// but for a different trigger: the user sent a message with no `@`
+/// mention into a chat where 2+ bots are registered. We can't pick one
+/// arbitrarily (that would route conversations to the wrong agent
+/// silently) so we list every bot reachable from this chat and ask
+/// the user to retype with `@<handle>`.
+///
+/// Falls back to a "No bots available" line when `available` is empty
+/// — guards the race window where a bot unregistered between the
+/// inbound listener's read of [`crate::list_bots`] and this render call.
+pub fn format_ambiguous_dm_reply(available: &[String]) -> String {
+    if available.is_empty() {
+        return "No bots available in this chat.".to_string();
+    }
+    let mentions: Vec<String> = available.iter().map(|h| format!("@{h}")).collect();
+    format!(
+        "Multiple bots in this chat. Specify one: {}",
+        mentions.join(" ")
+    )
 }
 
 /// V0.6.1 F135 — true iff `text` contains an `@` followed by at least

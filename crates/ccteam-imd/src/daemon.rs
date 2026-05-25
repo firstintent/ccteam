@@ -34,8 +34,8 @@ use crate::acl::AclPolicy;
 use crate::bot_mpsc::{bot_key, BotChannelMap, BotChannels, InboxItem, OutboundItem, CHANNEL_BUF};
 use crate::credentials::{self, Credentials};
 use crate::inbound::{
-    auto_route_dm_mention, parse_envelope, process_inbound_admin_aware, DefaultMailboxResolver,
-    InboundOutcome, MailboxResolver,
+    auto_route_dm_mention, format_ambiguous_dm_reply, parse_envelope, process_inbound_admin_aware,
+    DefaultMailboxResolver, DmRoutingHint, InboundOutcome, MailboxResolver,
 };
 use crate::latency::now_unix_ms;
 use crate::nl_admin::AdminExecutor;
@@ -398,6 +398,14 @@ where
                     &projects_root,
                 )
                 .await;
+                // V0.6.8 F195 — per-turn watchdog poll. Runs after
+                // `tick_supervisors_with_config` so any freshly-spawned
+                // supervisor is observable, and after
+                // `ensure_bot_channels` so the IM channel is wired when
+                // a notice needs to reply. Hard rule (R5): the
+                // watchdog only emits events + IM replies; it never
+                // kills the turn or restarts the bot.
+                check_turn_watchdogs(&bots, &registry, &channels).await;
 
                 if let Some(max) = args.max_runtime {
                     if started.elapsed() >= max {
@@ -527,7 +535,7 @@ fn spawn_inbound_consumer(
             //   this anchor now sits purely on the perf-budget axis.
             // Tracking: docs/dev-coupling-audit.md V0.7-deferred index.
             let bots_for_route = list_bots().unwrap_or_default();
-            auto_route_dm_mention(&mut msg, &bots_for_route);
+            let dm_hint = auto_route_dm_mention(&mut msg, &bots_for_route);
             let handles = build_handle_map();
             let Some(channel) = channels.get(&msg.channel).cloned() else {
                 tracing::debug!(
@@ -537,6 +545,36 @@ fn spawn_inbound_consumer(
                 );
                 continue;
             };
+            // V0.6.8 F194 — multi-bot DM ambiguity short-circuit. Reply
+            // to the originating chat with the list of available handles
+            // and skip normal routing (no @ prepended, no mailbox write).
+            // This closes the V0.6.x silent-drop gap when 2+ chat-squad
+            // bots share one (channel, chat_id) and the user sent an
+            // unaddressed message.
+            if let DmRoutingHint::Ambiguous { available } = dm_hint {
+                let text = format_ambiguous_dm_reply(&available);
+                let out = crate::transport::SendMessage::new(text, msg.reply_target.clone())
+                    .in_thread(msg.thread_ts.clone());
+                if let Err(err) = channel.send(&out).await {
+                    tracing::warn!(
+                        cid = %cid,
+                        channel = %msg.channel,
+                        chat_id = %msg.reply_target,
+                        available = available.len(),
+                        error = %err,
+                        "imd: F194 ambiguity-hint reply send failed"
+                    );
+                } else {
+                    tracing::info!(
+                        cid = %cid,
+                        channel = %msg.channel,
+                        chat_id = %msg.reply_target,
+                        available = available.len(),
+                        "imd: F194 ambiguity-hint reply sent"
+                    );
+                }
+                continue;
+            }
             match process_inbound_admin_aware(
                 &msg,
                 &sec,
@@ -1110,6 +1148,128 @@ pub async fn dispatch_cross_bot_mention(
                 to_slug: target_slug,
                 to_role: target_role,
             }
+        }
+    }
+}
+
+/// V0.6.8 F195 — once per tick, for each live supervisor:
+///
+/// 1. Call [`BotSupervisor::check_turn_watchdog`] to advance the
+///    deadline state machine and pull out at most one notification.
+/// 2. Append the matching progress.jsonl event
+///    (`chat_turn_running_long` / `chat_turn_timeout`).
+/// 3. Send the user-facing IM reply via the bot's
+///    `(im_platform, im_chat_id)` channel.
+///
+/// Best-effort end-to-end: a missing `CcteamPaths` (no `CCTEAM_HOME`
+/// env), a missing channel (bot bound to a vendor we don't yet support
+/// in [`build_channels`]), or a `channel.send` failure are all
+/// warn-logged + skipped so one flaky bot doesn't stall the rest of the
+/// tick.
+///
+/// Hard rule (CLAUDE.md §三 R5): does **not** kill the turn. Recovery
+/// is user-driven (`/clear` + retry); the watchdog only surfaces the
+/// silent stall so the user knows the bot isn't ignoring them.
+async fn check_turn_watchdogs(
+    bots: &[BotRegistration],
+    registry: &Arc<Mutex<SupervisorRegistry>>,
+    channels: &ChannelMap,
+) {
+    let supervisors: Vec<(BotRegistration, Arc<BotSupervisor>)> = {
+        let reg = registry.lock().await;
+        bots.iter()
+            .filter_map(|b| reg.lookup(b).map(|s| (b.clone(), s)))
+            .collect()
+    };
+    for (bot, sup) in supervisors {
+        let notice = match sup.check_turn_watchdog().await {
+            Some(n) => n,
+            None => continue,
+        };
+        let (event_json, im_text, kind, turn_id, elapsed) = match &notice {
+            supervisor::TurnWatchdogNotice::RunningLong {
+                turn_id,
+                elapsed_sec,
+            } => {
+                let ev = ccteam_core::progress::build_chat_turn_running_long_event(
+                    &bot.role,
+                    &bot.workflow_slug,
+                    turn_id,
+                    *elapsed_sec,
+                );
+                let text = format!(
+                    "Still working on your message (turn running {}s). Continuing.",
+                    elapsed_sec
+                );
+                (ev, text, "running_long", turn_id.clone(), *elapsed_sec)
+            }
+            supervisor::TurnWatchdogNotice::Timeout {
+                turn_id,
+                elapsed_sec,
+            } => {
+                let ev = ccteam_core::progress::build_chat_turn_timeout_event(
+                    &bot.role,
+                    &bot.workflow_slug,
+                    turn_id,
+                    *elapsed_sec,
+                );
+                let text = format!(
+                    "Turn appears stuck after {}s. Check the daemon log; \
+                     you can /clear and retry.",
+                    elapsed_sec
+                );
+                (ev, text, "timeout", turn_id.clone(), *elapsed_sec)
+            }
+        };
+
+        // Progress.jsonl append (best-effort — missing CCTEAM_HOME in
+        // tests is the normal posture, the tracing log below is the
+        // audit trail).
+        if let Ok(paths) = ccteam_core::CcteamPaths::from_env() {
+            let progress_path = paths.progress_jsonl(&bot.workflow_slug);
+            if let Err(err) = ccteam_core::progress::append_event(&progress_path, &event_json) {
+                tracing::warn!(
+                    slug = %bot.workflow_slug,
+                    role = %bot.role,
+                    turn_id = %turn_id,
+                    kind,
+                    error = %err,
+                    "F195: progress append failed"
+                );
+            }
+        }
+
+        // IM reply (best-effort — a missing channel is a no-op).
+        if let Some(channel) = channels.get(&bot.im_platform) {
+            let msg = crate::transport::SendMessage::new(im_text, bot.im_chat_id.clone());
+            if let Err(err) = channel.send(&msg).await {
+                tracing::warn!(
+                    slug = %bot.workflow_slug,
+                    role = %bot.role,
+                    turn_id = %turn_id,
+                    kind,
+                    elapsed_sec = elapsed,
+                    error = %err,
+                    "F195: watchdog IM reply send failed"
+                );
+            } else {
+                tracing::info!(
+                    slug = %bot.workflow_slug,
+                    role = %bot.role,
+                    turn_id = %turn_id,
+                    kind,
+                    elapsed_sec = elapsed,
+                    "F195: watchdog notice surfaced"
+                );
+            }
+        } else {
+            tracing::debug!(
+                slug = %bot.workflow_slug,
+                role = %bot.role,
+                platform = %bot.im_platform,
+                kind,
+                "F195: no channel for bot's platform; watchdog notice not sent (progress.jsonl still appended)"
+            );
         }
     }
 }
