@@ -127,6 +127,47 @@ This forces SDK to spawn **ccteam itself** as the daemon, and reach the ccteam-o
 - **Multi-ccteam-process safety**: socket path includes uid (`{HOME}/.ccteam/...`); per-user daemon; concurrent ccteam invocations connect to same daemon (UDS allows multi-client)
 - **Codex `app-server` UDS coexistence**: Codex's own UDS path (`~/.codex/...`) is unrelated; daemon's CodexUdsBridge is a JSON-RPC *client* against that socket, not a server
 
+## Resolved: W0 subagent B's "no `with_launcher` builder" finding
+
+W0 subagent B's smoke test docstring + `0e78b0a` commit flagged that `rmux-sdk` 0.3.1 has no `connect_or_start_with_launcher` builder method, treating it as a potential W2 blocker.
+
+**This is not a blocker** — the design doc §五 5.1 sketch with a launcher closure was an over-engineered guess. The actual rmux 0.3.1 protocol is **simpler**: an env var override.
+
+| Sketch (design doc §五 5.1) | Reality (rmux 0.3.1) |
+|---|---|
+| `Rmux::builder().launcher(closure).connect_or_start()` | `Rmux::builder().connect_or_start()` |
+| Closure spawns `Command::new(current_exe)...` | SDK spawns `Command::new(daemon_binary())...` |
+| Caller provides closure | Caller provides env: `std::env::set_var("RMUX_SDK_DAEMON_BINARY", current_exe())` |
+
+The `RMUX_SDK_DAEMON_BINARY` env var is a **public constant** at `references/rmux/crates/rmux-sdk/src/bootstrap/discovery.rs:25`:
+
+```rust
+pub const SDK_DAEMON_BINARY_ENV: &str = "RMUX_SDK_DAEMON_BINARY";
+```
+
+And the SDK's `daemon_binary()` resolver at `connect.rs:177` checks it first:
+
+```rust
+fn daemon_binary() -> std::ffi::OsString {
+    std::env::var_os(discovery::SDK_DAEMON_BINARY_ENV)
+        .unwrap_or_else(|| "rmux".into())
+}
+```
+
+So ccteam's W2 implementation is:
+
+```rust
+// Once at startup, before any RmuxBackend::spawn call.
+std::env::set_var("RMUX_SDK_DAEMON_BINARY", std::env::current_exe()?);
+
+// And in fn main() argv routing, BEFORE clap parses:
+if matches!(args.get(1), Some(s) if s == "--__internal-daemon") {
+    return ccteam_mux::daemon::run_internal_daemon(args[2].clone());
+}
+```
+
+**No upstream PR needed. No `rmux` binary on PATH needed. No second shipped artifact.** The single-binary integration path is fully supported by rmux 0.3.1 as published.
+
 ## Open items for W2 implementation
 
 1. Confirm `rmux_server::ServerDaemon::new` API stability between 0.3.x patches (semver minor → potentially breaking; pin patch version in Cargo.toml or accept rmux 0.3.x and add CI smoke on bumps)
