@@ -23,3 +23,7 @@ readme.local.txt
 .probe-results/
 .ccteam
 .codegraph
+
+# Claude Telegram (added by claude-telegram-workspace/install.sh)
+.claude/channels/
+.claude/settings.local.json
