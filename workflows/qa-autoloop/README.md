@@ -54,10 +54,10 @@
 ```bash
 cd /path/to/your-project
 mkdir -p .ccteam .claude/agents
-cp <ccteam-repo>/examples/workflows/qa-autoloop/workflow.yaml       .ccteam/workflow.yaml
-cp <ccteam-repo>/examples/workflows/qa-autoloop/config.example.json .ccteam/config.json
-cp -r <ccteam-repo>/examples/workflows/qa-autoloop/agents/*.md      .claude/agents/
-cp -r <ccteam-repo>/examples/workflows/qa-autoloop/rules            .ccteam/rules
+cp <ccteam-repo>/workflows/qa-autoloop/workflow.yaml       .ccteam/workflow.yaml
+cp <ccteam-repo>/workflows/qa-autoloop/config.example.json .ccteam/config.json
+cp -r <ccteam-repo>/workflows/qa-autoloop/agents/*.md      .claude/agents/
+cp -r <ccteam-repo>/workflows/qa-autoloop/rules            .ccteam/rules
 ```
 
 ### 2. 填 `.ccteam/config.json`
