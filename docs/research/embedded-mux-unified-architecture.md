@@ -887,6 +887,253 @@ V0.8 trait 设计的微调(§12.5)是低成本前瞻动作,**强烈推荐 V0.8 W
 
 ---
 
+## 十三、Claude Code 与 Codex 消息入站/出站的 rmux 统一架构详解
+
+> 本节是 §二.2 第 1 红利"统一 vendor adapter 形态"的**深度展开** —— 用户提问"引入 rmux 重点就是解决 Claude Code 和 Codex 入站/出站统一,现在入站靠 tmux send-keys、出站靠 hook,引入 rmux 之后有更好的方法吗"的正面回答。
+>
+> 一句话:**rmux daemon 是 typed event bus 与 typed command bus 的双向中枢;Claude / Codex 在 orchestrator 视角下变成同一个 RPC**。
+
+### 13.1 现状(V0.6.8)— Claude 和 Codex 的 4 条不对称数据通道
+
+```
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                ccteam orchestrator (V0.6.8 现状)                              │
+│                                                                                │
+│   ┌──────────────────────────────────────────────────────────────────────┐   │
+│   │ progress.jsonl  ◄── 业务事件 SoT(7 类 + chat_session_reset / turn_done)│
+│   │ turns.jsonl     ◄── 对话原文(mode 3 ccteam-owned)                       │
+│   └──────────────────────────────────────────────────────────────────────┘   │
+│       ▲ inbound    ▲ outbound      ▲ inbound       ▲ outbound                │
+│       │            │ (state)        │               │                         │
+└───────┼────────────┼────────────────┼───────────────┼─────────────────────────┘
+        │ (1)        │ (2)            │ (3)           │ (4)
+        │            │                │               │
+        │ tmux       │ Claude Code    │ direct UDS    │ codex UDS
+        │ send-keys  │ hook subprocess│ JSON-RPC      │ JSON-RPC event stream
+        │ -l 字符串   │ fork-per-event │ orchestrator  │ + F122 bridge writes
+        │ (escape    │ writes         │ → codex UDS   │ progress.jsonl 直接
+        │  risk)     │ progress.jsonl │               │
+        │            │ 直接           │               │
+        ▼            ▲                ▼               ▲
+   ┌──────────────────────────────┐  ┌──────────────────────────────┐
+   │ tmux session(ccteam-chat-...) │  │ codex app-server 独立进程    │
+   │ ├── claude TUI(PTY child)    │  │ ├── 自己 bind 自己的 UDS      │
+   │ │   ├── stdin from tmux       │  │ │   socket                   │
+   │ │   └── hook 钩子 → fork       │  │ ├── JSON-RPC 协议            │
+   │ │       `ccteam internal      │  │ └── ccteam-side 独立          │
+   │ │       hook progress-append`│  │     supervisor 守(F112)      │
+   │ └── transcript jsonl(Anthropic │  └──────────────────────────────┘
+   │     内部 ~/.claude/projects/  │
+   │     ,ccteam tail 镜像 →        │
+   │     turns.jsonl)               │
+   └──────────────────────────────┘
+```
+
+**4 条通道、4 种协议**:
+
+| # | 方向 | vendor | 通道 | 协议形态 | 痛点 |
+|---|---|---|---|---|---|
+| (1) | 入站 | Claude | `tmux send-keys -l --` | shell 命令行字符串 | escape risk;每次新进程;无 typed schema |
+| (2) | 出站 | Claude | Claude Code hook(`pre_tool_use` 等)| 子进程 + 写文件 | fork-per-event;只能写到文件 SoT,无 push 给 orchestrator;失败静默 |
+| (3) | 入站 | Codex | orchestrator → codex UDS JSON-RPC | typed JSON-RPC | orchestrator 直连,**与 Claude 入站协议完全不同**;每加新 vendor 又一套 |
+| (4) | 出站 | Codex | codex UDS event stream + F122 progress bridge | typed JSON-RPC + 文件桥 | bridge 是 ccteam-core 内自定义代码;**与 Claude 出站机制完全不同** |
+
+**根因诊断**:Claude Code 是**人机交互 TUI**(stdin/stdout + 外挂 hook),Codex app-server 是**机机 RPC server**(UDS + JSON-RPC)。两种 vendor 哲学迥异,ccteam V0.6.8 各写一套适配 — adapter 总 LOC ~2200,**两 vendor 之间几乎零代码复用**。
+
+### 13.2 rmux 引入后:daemon 是双向 typed bus 中枢
+
+```
+┌────────────────────────────────────────────────────────────────────────────────┐
+│              ccteam orchestrator (V0.8+ with rmux)                              │
+│                                                                                  │
+│   progress.jsonl, turns.jsonl 仍是文件 SoT(下游 写者 = orchestrator,单写者)  │
+│                                                                                  │
+│   ┌───────────────────────────────────────────────────────────────────────┐    │
+│   │ 单一 API:                                                              │    │
+│   │   mux.send_to_session(sid, TypedCommand)  ────────── 入站(任何 vendor)│
+│   │   mux.subscribe(sid) → Stream<TypedEvent> ────────── 出站(任何 vendor)│
+│   └───────────────────────────────────────────────────────────────────────┘    │
+│       │ typed RPC over UDS                              ▲ typed event stream    │
+└───────┼─────────────────────────────────────────────────┼───────────────────────┘
+        │                                                 │
+        ▼                                                 │
+┌────────────────────────────────────────────────────────────────────────────────┐
+│               rmux daemon(sibling process via `ccteam mux daemon`)              │
+│                                                                                  │
+│   ┌──────────────────────────────────────────────────────────────────────┐     │
+│   │  Unified event bus + command router                                   │     │
+│   │  • InboundCommand → per-session backend translator                    │     │
+│   │  • OutboundEvent ← per-session backend collector                      │     │
+│   │  • All sessions, all vendors → one stream, one schema                 │     │
+│   └────────────┬──────────────────────────────┬──────────────────────────┘     │
+│                │                              │                                 │
+│   ┌────────────▼────────────────┐  ┌──────────▼─────────────────────────┐     │
+│   │ Session A:Claude            │  │ Session B:Codex                    │     │
+│   │ Backend = ClaudeTuiBackend  │  │ Backend = CodexAppServerBackend     │     │
+│   │ ┌─────────────────────────┐ │  │ ┌─────────────────────────────────┐ │     │
+│   │ │ PTY master              │ │  │ │ PTY master                      │ │     │
+│   │ │ (stdin/stdout bytes)    │ │  │ │ (process supervision only)      │ │     │
+│   │ └─────────────────────────┘ │  │ └─────────────────────────────────┘ │     │
+│   │ ┌─────────────────────────┐ │  │ ┌─────────────────────────────────┐ │     │
+│   │ │ HookSidecar(UDS)        │ │  │ │ CodexUdsBridge(daemon-owned UDS │ │     │
+│   │ │ 接 Claude hook 子进程    │ │  │ │ + JSON-RPC client to codex)     │ │     │
+│   │ │ 的 typed event 投递      │ │  │ │                                  │ │     │
+│   │ └─────────────────────────┘ │  │ └─────────────────────────────────┘ │     │
+│   │ TypedCommand::KeyboardInput │  │ TypedCommand::JsonRpcCall          │     │
+│   │   → PTY stdin               │  │   → forwards to codex UDS          │     │
+│   │ TypedEvent ←                │  │ TypedEvent ←                       │     │
+│   │   ← HookSidecar 收 hook     │  │   ← CodexUdsBridge 收 JSON-RPC     │     │
+│   │   ← PatternMatched(regex)   │  │   ← PatternMatched(regex)          │     │
+│   │   ← ProcessExited           │  │   ← ProcessExited                  │     │
+│   └─────┬─────────────▲─────────┘  └─────┬──────────────▲────────────────┘     │
+│         │             │                  │              │                       │
+└─────────┼─────────────┼──────────────────┼──────────────┼───────────────────────┘
+          │             │                  │              │
+          ▼             │                  ▼              │
+   ┌──────────────────────────┐    ┌─────────────────────────────────────┐
+   │ claude TUI in PTY child   │    │ codex app-server child process      │
+   │                           │    │  binds own UDS for JSON-RPC         │
+   │ hooks 钩子 → 子进程       │    │  daemon's CodexUdsBridge connects   │
+   │ `ccteam mux hook-emit \   │    │  as JSON-RPC client                 │
+   │   --session <sid> \       │    │                                     │
+   │   --kind tool_use \       │    │                                     │
+   │   --json '{...}'`         │    │                                     │
+   │   ↓ short subprocess      │    │                                     │
+   │   ↓ UDS to daemon         │    │                                     │
+   │   HookSidecar 收 typed    │    │                                     │
+   └───────────────────────────┘    └─────────────────────────────────────┘
+```
+
+**关键架构转变**:vendor-specific 协议(Claude hook fork-per-event / Codex JSON-RPC over UDS)被**收敛到 daemon 的 backend 适配层**。orchestrator 永远只对接一个 typed API。
+
+### 13.3 入站详细路径对比
+
+**Claude 入站**:
+
+| 阶段 | V0.6.8 现状 | V0.8 with rmux |
+|---|---|---|
+| orchestrator API | `TmuxSession::send_keys_literal(text)` | `mux.send(sid, TypedCommand::KeyboardInput(text))` |
+| 协议形态 | shell argv `tmux send-keys -t <name> -l -- "<text>"` | typed Rust struct over UDS |
+| escape 处理 | `send-keys -l` literal flag(仍是 shell 边界) | daemon 直写 PTY master,**零 escape** |
+| 失败响应 | shell exit code,解析 stderr 字符串 | typed `Result<(), MuxError>`,enum 枚举 |
+| 测试 mock | spawn 假 tmux binary(`CCTEAM_TMUX_BIN`)| `MockBackend` 注入 trait,无进程 |
+
+**Codex 入站**:
+
+| 阶段 | V0.6.8 现状 | V0.8 with rmux |
+|---|---|---|
+| orchestrator API | `CodexJsonRpcClient::call(method, params)` 直连 codex UDS | `mux.send(sid, TypedCommand::JsonRpcCall { method, params })` |
+| 协议形态 | orchestrator 自己 bind Codex UDS,自己处理 JSON-RPC | daemon 持 UDS handle,orchestrator 不直接接触 codex 协议 |
+| 多 codex session 并发 | 每个 codex session 独立 UDS,orchestrator 持多 socket | daemon 持所有 socket,orchestrator 走 SessionId 路由 |
+| 失败响应 | UDS 断 / JSON-RPC error 各自类型 | 统一 typed `MuxError`,与 Claude 同 enum |
+
+**统一收益**:orchestrator 业务代码不再写"if vendor == Claude then send-keys else if vendor == Codex then JSON-RPC" 这类分支;**`mux.send(sid, cmd)` 一行打通,daemon 内 backend 自动翻译协议**。
+
+### 13.4 出站详细路径对比(关键设计点)
+
+```
+V0.6.8 现状(Claude hook 出站)              V0.8 with rmux(Claude hook 出站)
+───────────────────────────                ───────────────────────────────────
+Claude TUI 触发 pre_tool_use hook           Claude TUI 触发 pre_tool_use hook
+  ↓                                          ↓
+hook command:                              hook command:
+  `ccteam internal hook                      `ccteam mux hook-emit \
+   progress-append`                            --session <sid> \
+  ↓                                            --kind tool_use \
+fork subprocess                                --json '{...}'`
+  ↓                                          ↓
+reads STDIN(Claude payload)                fork subprocess
+  ↓                                          ↓
+opens progress.jsonl                       opens UDS to daemon
+  ↓                                          ↓
+appends event(无 schema check)             daemon HookSidecar 收
+  ↓                                          ↓
+exit                                       daemon validate + publish to bus
+                                             ↓
+                                           orchestrator subscribe → writes
+                                             progress.jsonl(单写者)
+                                             ↓
+                                           web UI / 其他 subscriber 同步收到
+                                             event(无需 tail 文件)
+```
+
+**为什么 V0.8 路径"加一跳"反而更好**:
+
+| 维度 | V0.6.8 hook → 直写 progress.jsonl | V0.8 hook → daemon → orchestrator → progress.jsonl |
+|---|---|---|
+| schema 验证 | 无 — bad event 静默写入,后续 reader 才崩 | daemon publish 前 typed validate,bad event 立即返错 |
+| 实时性 | orchestrator tail progress.jsonl,**轮询延迟** ~50ms | daemon push,**< 1ms** |
+| 多 subscriber | 只有 orchestrator 一家;web UI 也得 tail 文件 | event bus 多 subscriber(orchestrator + web + cli peek + future)|
+| 跨 vendor 一致 | Claude 走 hook,Codex 走 F122 bridge,**两套** | **同一 typed event 经同一 bus**,vendor 信息在 event metadata |
+| 写者收敛 | hook subprocess 是直接 writer,orchestrator 也写 | **orchestrator 唯一 writer**,事件源单一 |
+| crash-resilience | orchestrator 死 → 新 hook event 仍写文件,重启后 reread | orchestrator 死 → event 暂存 daemon bus(可选 ring buffer)→ 重连重放 |
+| Codex 同构 | Codex 走完全不同路径 | **Codex backend 同样 publish 到 bus,机制一样** |
+
+**Codex 出站(V0.8)**:
+
+```
+codex app-server emit JSON-RPC event over its UDS
+  ↓
+daemon's CodexUdsBridge 收 JSON-RPC frame
+  ↓
+翻译为 TypedEvent(与 Claude hook event 同 enum)
+  ↓
+daemon publish to event bus(同一条 bus,与 Claude 共用)
+  ↓
+orchestrator subscribe → writes progress.jsonl
+```
+
+**Claude 和 Codex 在 orchestrator 视角下出站完全无差别** — 因为 orchestrator 只看 typed event,event 的 vendor 是 metadata 字段,不是 protocol 差异。
+
+### 13.5 红线对齐:不解析 pane 输出 仍守住
+
+CLAUDE.md §三"不解析 tmux 终端输出"红线在 V0.8 仍**完全成立** — 而且更稳:
+
+- Claude 出站 typed event 通过 **Claude Code hook subprocess** 投递(Anthropic 官方 typed 通道),**不**通过 PTY 字节流
+- daemon 的 vt100 屏幕状态**只用于** screenshot / peek / wait_for_text(同前)
+- `PatternMatched{regex_id}` 用预注册 regex 作 typed event(本篇 §11.2 S2),业务代码零 grep — **形式上没有"业务层解析 pane",事实上拿到 amux 类自愈能力**
+
+**Codex 出站没有 pane 解析问题** — 它本来就是 JSON-RPC,daemon 只是协议中转。
+
+### 13.6 LOC + 工程账面收益
+
+V0.6.8 现状 vendor adapter 估算(`crates/ccteam-core/src/execution/`):
+
+| 文件 | 现 LOC | 用途 | V0.8 改造后估 |
+|---|---|---|---|
+| `claude_tui.rs` | ~450 | mode 3a Claude TUI + tmux send-keys + transcript tail + hook 投递路径 | ~200(send/subscribe 走 trait)|
+| `claude_bg.rs` | ~350 | mode 2 Claude bg + jobs.jsonl tail | ~180 |
+| `codex_exec.rs` | ~280 | mode 2 Codex exec + send-keys fallback | ~140 |
+| `codex_app_server.rs` | ~420 | mode 3b Codex UDS supervisor + JSON-RPC client + F122 bridge | ~150(supervisor + bridge 下沉 daemon)|
+| `codex_jsonrpc.rs` | ~200 | Codex JSON-RPC client(orchestrator 直接持有)| ~80(typed schema 定义,具体调用走 daemon)|
+| `transcript_tail.rs` | ~180 | tail Anthropic 内部 jsonl 镜像 turns.jsonl | 不变 |
+| `turns_mirror.rs` | ~120 | 同上 sibling | 不变 |
+| `session_recovery.rs` | ~200 | crash-restart 拼接 jobs.jsonl 反推状态 | ~60(走 mux.exists / mux.subscribe)|
+
+**LOC 总减幅 ~40%**(从 ~2200 砍到 ~1300);更重要的是**两 vendor 之间共享 backend 抽象**,加第三 vendor(opencode / aider / future)只需新写一个 backend translator(~300 LOC),不再每个 mode × vendor 各写一次。
+
+### 13.7 与本篇前文的对应位置
+
+| 议题 | 本篇位置 |
+|---|---|
+| 整体 vision + 7 红利 | §二.2(第 1 条"统一 vendor adapter"即本节深度展开)|
+| `MuxBackend` trait 设计 | §四(本节用的 `mux.send_to_session` / `mux.subscribe` 即 trait 方法)|
+| mode 3a Claude 落地 | §三.3 |
+| mode 3b Codex 落地 + Option A 推荐(进 mux PTY)| §三.4 |
+| typed event 设计支柱 | §11.2 S2(PatternMatched + 预注册 regex 红线方案)|
+| Wave 排期 | §六 W2-W3(W2 RmuxBackend 起 Claude mode 3a,W3 mode 2 + Codex)|
+| IM channel 扩展(V0.9)| §十二 — daemon event bus 同时承载 agent 出站 + IM 入站,**架构形态完全相同** |
+
+### 13.8 落地次序建议(W2-W4 三 wave)
+
+1. **W2 Claude TUI in rmux(mode 3a only)** — `ClaudeTuiBackend` 落地:`TypedCommand::KeyboardInput` → PTY;Claude hook subprocess 改投递到 daemon HookSidecar UDS;orchestrator subscribe 替代 tail progress.jsonl(progress.jsonl 仍写,但是 orchestrator 写)。Codex 仍走 V0.6.8 路径(unaffected)
+2. **W3 mode 2 bg(Claude + Codex)** — `ClaudeBgAdapter` + `CodexExecAdapter` 改 spawn via `MuxBackend::spawn`;jobs.jsonl tail 改 mux subscribe
+3. **W4 Codex app-server in rmux(mode 3b)** — `CodexAppServerBackend` 落地:codex 进 mux PTY supervision,daemon's `CodexUdsBridge` 接 codex 自有 UDS,做 JSON-RPC → TypedEvent 翻译;F122 bridge 代码删除(职责下沉 daemon)
+
+**关键里程碑**:W4 结束时,**`crates/ccteam-core/src/execution/` 里 vendor 名字字面量出现频次 → 0**(只在 daemon backend impl 文件出现);ccteam 业务代码彻底 vendor-agnostic。**这是 §十一.5 战略象限中 ccteam 升级 rmux 上游"agent-era abstraction" 的起点**。
+
+---
+
 ## Sources
 
 (本篇)
