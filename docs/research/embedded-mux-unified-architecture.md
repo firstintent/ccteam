@@ -1134,6 +1134,213 @@ V0.6.8 现状 vendor adapter 估算(`crates/ccteam-core/src/execution/`):
 
 ---
 
+## 十四、入站 vs 出站的能力边界:为何 outbound 不可能 100% 走 mux
+
+> 本节回应用户尖锐追问:**"主要看出站入站机制,能不能全部用 tmux 或 rmux 的能力 — 之前入站 send-keys 是 tmux 能力,出站 hook 用的是 Claude Code 的能力"**。
+>
+> **结论先行**:**inbound 100% 可以走 mux 能力(tmux 或 rmux 都行);outbound 在 Claude 上不可能 100% 走 mux 能力 — 这是 bytes 流向决定的根本不对称,不是实现差距**。rmux 在 outbound 上的角色是**统一 BUS**(把所有 source 路由到同一 typed event 流),不是**统一 SOURCE**。Codex 看起来"出站统一"是因为它本身就把出站事件用 typed JSON-RPC 表达,与 mux 协议层重合。
+
+### 14.1 入站机制:本来就是 mux 能力域,没有别的选择
+
+向一个 PTY 内的进程"送入消息"只有一条物理路径:**写 PTY master fd**。
+- `tmux send-keys -l -- "<text>"` = 把字节写进 tmux server 持有的 PTY master fd
+- `rmux-sdk::pane.send_text("text")` = 把字节写进 rmux daemon 持有的 PTY master fd
+- 二者底层是**同一系统调用** `write(pty_master_fd, bytes, len)`,只是上层包装不同
+
+**Claude TUI 和 Codex app-server 在入站上唯一区别**:
+- Claude TUI:消费 PTY stdin 字节(键盘事件)— 与 tmux/rmux 自然对接
+- Codex app-server:消费自己 bind 的 UDS socket 上的 JSON-RPC frame — 与 PTY stdin **正交**;但仍可让 daemon 持 UDS handle,作为 backend 内的一个 channel
+
+无论哪种 vendor,**入站协议都收敛到 daemon 的一个 typed API**(`mux.send(sid, TypedCommand)`),daemon 的 backend 自动翻译到具体 wire 协议(PTY write / UDS write)。**inbound 完全是 mux 能力域**(§13.3 已展开)。
+
+### 14.2 出站的根本不对称:byte 流方向是子进程主导,不是 mux 主导
+
+入站时**ccteam 是 producer,Claude/Codex 是 consumer** — producer 决定协议,所以入站统一在 mux 一侧成立。
+
+出站时**Claude/Codex 是 producer,ccteam 是 consumer** — **producer 决定有哪些 channel 可用**。mux daemon 在出站方向是**被动 consumer**(只能看到 producer 暴露的字节流):
+- PTY stdout/stderr 字节流(被动)
+- 子进程退出码 + 信号(被动)
+- 子进程 fork 出来的辅助进程(Claude hook subprocess)— **被动**;mux daemon 看到 fork() syscall 但看不到 hook 进程的 stdin payload
+
+**关键**:mux daemon **不持有** Claude 内部状态(当前 tool 调用、persona、plan 决策树)— 这些信息**只有 Claude 进程自己知道**,Claude **主动选择**通过 hook subprocess 把它们暴露出来。这是 Anthropic 的架构决策,mux 无法绕过。
+
+### 14.3 出站事件的 4 个层次 — 各层"谁能观测到"
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ Layer 4 — Semantic Event(tool 名字 + 参数 + 结果 / persona / plan 决策树)    │
+│ ────────────────────────────────────────────────────────────────────────────│
+│  Claude:  ✓ ONLY via Claude Code hooks(typed JSON payload,Anthropic 官方)   │
+│  Codex:   ✓ via JSON-RPC events over UDS(typed,Codex 官方)                  │
+│  rmux:    ✗ INVISIBLE — TUI bytes 是 lossy 投影,无法可靠还原 tool params     │
+│           (业务面读 pane bytes = 违反 CLAUDE.md §三红线)                      │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ Layer 3 — Conversation Content(assistant message 文本)                       │
+│ ────────────────────────────────────────────────────────────────────────────│
+│  Claude:  ✓ via Anthropic 内部 transcript jsonl tail(~/.claude/projects/)   │
+│           ✗ rmux PTY capture 渲染后是 ANSI + status bar + 高亮混合,不可还原  │
+│  Codex:   ✓ via JSON-RPC events                                              │
+│  rmux:    ✗ INVISIBLE(同 Layer 4 理由)                                       │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ Layer 2 — Pattern Event(rate-limit / context-overflow / "waiting for...")    │
+│ ────────────────────────────────────────────────────────────────────────────│
+│  Claude:  部分 via hook + 部分 via 输出文本(rate-limit error message)        │
+│  Codex:   部分 via JSON-RPC + 部分 via 输出文本(冗余覆盖)                    │
+│  rmux:    ✓ via PatternMatched(预注册 regex_id,daemon server-side 匹配)     │
+│           红线安全:业务面零 grep(§11.2 S2)                                    │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ Layer 1 — Process Event(started / exited / SIGCHLD / SIGWINCH / idle 30s)    │
+│ ────────────────────────────────────────────────────────────────────────────│
+│  Claude:  ✗ Claude 不暴露 process 级事件                                      │
+│  Codex:   ✗ 同上                                                              │
+│  rmux:    ✓ 全覆盖(daemon owns child handle,wait/waitpid 是 race-free)       │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+**rmux 真正独占的 outbound source 只在 Layer 1 + Layer 2**(process 级事件 + pattern 事件)。**Layer 3-4 是 vendor 自己的事**,mux daemon 只能做 BUS,不能做 SOURCE。
+
+### 14.4 Claude 出站的 4 个 source 详解
+
+ccteam 当前从 Claude 出站事件的 4 个来源:
+
+| Source | 提供的信息 | 谁的能力 | rmux 能否替代? |
+|---|---|---|---|
+| **(a) Claude Code hooks**(`pre_tool_use` 等)| 工具名 + 参数 + 结果 / persona 切换 / plan_pending | Claude Code 官方 | ✗ **不能** — TUI 渲染丢失了结构化参数;rmux 只能看 ANSI 字节 |
+| **(b) Anthropic 内部 transcript jsonl** | assistant message 全文 + tool block | Claude Code 官方(F172 V2 仍依赖)| ✗ **不能** — 同 Layer 3 理由;Anthropic 可能改格式,但比 (a) 替代 easier(只是文本)|
+| **(c) rmux PTY 字节流 + 预注册 pattern**(V0.8 新增)| rate-limit / idle / context-overflow 等 surface 级事件 | rmux 能力 | ✓ 部分代替 hook 中的 surface signal |
+| **(d) rmux process handle**(V0.8 新增)| exit code / SIGCHLD / OOM | rmux 能力 | ✓ 完全独占(Claude 不暴露)|
+
+**Claude 出站不可能"全 mux 能力"**:**只有 (c) 和 (d) 在 rmux 能力域**;(a) 必须依赖 Claude Code hooks,(b) 必须依赖 Anthropic 内部文件。V0.8 后 ccteam 的 Claude 出站架构是:
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│ rmux daemon event bus(orchestrator 只对接这一个 stream)              │
+└──┬─────────────────┬───────────────────────┬───────────────┬──────────┘
+   │ (a) hook event  │ (b) transcript event  │ (c) pattern   │ (d) process
+   │                 │                       │               │
+┌──┴───────┐     ┌───┴──────────┐      ┌─────┴────┐     ┌────┴──────┐
+│Claude    │     │transcript    │      │rmux      │     │rmux       │
+│Code hook │     │jsonl tail    │      │PatternM  │     │ProcExited │
+│subprocess│     │(ccteam-side  │      │atched    │     │/ Idle     │
+│→ daemon  │     │ task)→ daemon│      │(daemon-  │     │(daemon-   │
+│HookSidecar│    │HookSidecar   │      │ side)    │     │ side)     │
+└──────────┘     └──────────────┘      └──────────┘     └───────────┘
+  vendor-          vendor-              mux 能力          mux 能力
+  specific         specific             (vendor-          (vendor-
+  source           source               agnostic)         agnostic)
+```
+
+**4 个 source、1 条 bus**。orchestrator 看到的是统一 typed event stream,**但 source 仍然是 vendor-specific**。
+
+### 14.5 Codex 出站为什么"看起来"统一
+
+Codex 的 JSON-RPC over UDS 是**结构化典型** — 它把 Layer 4 (semantic event) 直接用 JSON-RPC 表达,不依赖 PTY 字节流也不依赖 hook subprocess。这让 Codex 出站**天然只有 1 个 source**(UDS):
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│ rmux daemon event bus                                                  │
+└──┬───────────────────────────────┬─────────────┬─────────────────────┘
+   │ Codex UDS event(承载 Layer 4) │ pattern(c) │ process(d)
+   │                               │             │
+┌──┴─────────────────────┐    ┌────┴──────┐  ┌───┴──────┐
+│daemon's CodexUdsBridge │    │rmux       │  │rmux      │
+│接 codex 自有 UDS,      │    │PatternM   │  │ProcExited│
+│翻译 JSON-RPC → typed   │    │atched     │  │          │
+│event                   │    │           │  │          │
+└────────────────────────┘    └───────────┘  └──────────┘
+```
+
+Codex 也是 **3 个 source**(UDS + pattern + process),只是 UDS 是 typed-vendor-source(可视为"vendor 选择了 typed channel",**功能上等价于 Anthropic 用 hooks**)。
+
+**Codex 不"更统一",只是 vendor 选了 in-band typed**;Claude 选了 out-of-band typed(hook subprocess)。两种都是 typed,只是路径不同。
+
+### 14.6 创意替代:如果**真的**全 mux 出站(放弃 hook),会损失什么
+
+假设 V0.8 激进设计:**完全不用 Claude Code hook,纯靠 rmux PatternMatched + transcript jsonl tail + process handle**,损失清单:
+
+| 当前 ccteam 用 Claude hook 拿到的信息 | 用 rmux 替代是否可行 | 损失 |
+|---|---|---|
+| `pre_tool_use` 工具名 + 参数 | 部分可 — TUI 渲染时工具名通常显示,但参数被截断 | **工具参数丢失** — F128 tool_added / advise_vote 等用例失效 |
+| `post_tool_use` 工具结果 | 不可 — 结果可能很长被 TUI 滚动出屏 | **工具结果丢失** |
+| `chat_session_reset` 时机 | 可 — `/new` / `/compact` / `/clear` 命令注入后能 pattern 检测 | 时机有 ~100ms 延迟 |
+| `persona_changed` | 不可 — TUI 不显式渲染 persona 切换 | **persona 切换不可见** |
+| `plan_pending` HITL state(V0.6.1 F124)| 不可 — 需 plan 详情 + agent path | **HITL 功能整个失效** |
+| `turn_done` 准确时机 | 部分可 — idle pattern 替代,但精度低 | turn 边界模糊 |
+
+**结论**:激进替代会**让 ccteam 退化到 V0.5 之前的能力水平**(无结构化 tool 观测 / 无 HITL / 无 persona);**不可接受**。
+
+### 14.7 创意替代:把 Claude hook 投递的数据"路由到 mux"算不算"全 mux 能力"
+
+这是用户问题的另一可能理解:**hook 仍是 Claude 的能力,但 hook 的 PAYLOAD 改路由到 mux daemon,而非直接写文件 — 这样从架构形态上 outbound 是"mux daemon 内部消化",算不算统一?**
+
+这正是 §13 已经在做的设计 — **算"统一",但要诚实地说**:
+- **统一的是路由**(daemon 是唯一 outbound sink)
+- **没统一的是 source**(Claude 的能力 vs Codex 的能力 vs rmux 的能力 各自贡献)
+
+用一句话表达:**mux daemon 是 outbound 的 *unified bus*,不是 outbound 的 *unified producer***。
+
+类比:邮局是邮件的统一中枢,不代表所有邮件都是邮局**写的**;邮件是写信人写的,邮局只是收集和分发。outbound 信息源是 vendor(claude/codex),mux daemon 是中央邮局。
+
+### 14.8 asymmetry 的根因 — byte 流方向决定可观测性主权
+
+| 方向 | producer | consumer | "能力归属" |
+|---|---|---|---|
+| **入站** | ccteam | claude / codex | **producer 主导协议** → ccteam 可全部走 mux 写 PTY 实现统一 |
+| **出站** | claude / codex | ccteam | **producer 主导协议** → vendor 各自决定 channel 形态(hook / JSON-RPC / 文件)— ccteam 只能按 vendor 提供的 channel 收 |
+
+**这个不对称是物理的,不是工程上的"缺哪一脚就能补"**。
+- 入站统一 = ccteam 决定怎么发 → 完全可控,走 mux 100%
+- 出站统一 = 取决于 vendor 选择 → 部分可控,**mux 是 bus**,**source 是 vendor 的事**
+
+如果 Anthropic 未来给 Claude Code 加一个 official `--event-output-fd N`(把 typed event 流到给定 fd),那 rmux 可以"接管"那个 fd → 出站接近 100% 走 mux。**但今天这个 API 不存在**;ccteam 只能用既有的 hook 机制。
+
+### 14.9 与本篇前文的对应位置
+
+| 议题 | 本篇位置 |
+|---|---|
+| §13.2 daemon 是双向 typed bus 的图 | 本节 14.3 layer 矩阵 + 14.4 4-source 图是其**诚实展开** |
+| §13.5 红线对齐 | 本节 14.3 Layer 4 invisible 部分的根据(为何 hook 不可省)|
+| 落地次序 §13.8 | 本节 W2 设计要点:**Claude hook 仍要,只是 hook 命令改成 `ccteam mux hook-emit`(写 daemon UDS),不再直写 progress.jsonl** |
+| 未来 Anthropic 改 API | 本节 14.8 末尾;若上游加 typed event fd,ccteam 可演进 |
+
+### 14.10 一图收尾:rmux 在 outbound 上的实际角色
+
+```
+   ┌─────────────────────────────────────────────────────────────┐
+   │   ccteam orchestrator                                        │
+   │   ▲ 订阅 1 条 typed event stream                              │
+   └───┼─────────────────────────────────────────────────────────┘
+       │
+   ┌───┴────────────────────────────────────────────────────────┐
+   │   rmux daemon = OUTBOUND BUS(统一 1 条 stream 出)           │
+   │                                                              │
+   │   收集 4 类 source,翻译为同一个 TypedEvent enum:            │
+   │   ┌──────────┬─────────────┬───────────┬──────────┐         │
+   │   │(a)Claude │(b)Anthropic │(c)rmux    │(d)rmux   │         │
+   │   │Code hook │transcript   │Pattern    │Process   │         │
+   │   │subprocess│jsonl tail   │Matched    │Exited /  │         │
+   │   │→ daemon  │→ daemon     │(daemon-   │Idle      │         │
+   │   │UDS       │tail(or kept │ side)     │(daemon-  │         │
+   │   │          │ in ccteam)  │           │ side)    │         │
+   │   └──────────┴─────────────┴───────────┴──────────┘         │
+   │      ▲             ▲           ▲             ▲              │
+   └──────┼─────────────┼───────────┼─────────────┼──────────────┘
+          │             │           │             │
+        Claude       Anthropic    rmux 能力      rmux 能力
+        能力          能力                                       
+        (vendor)     (vendor)    (mux)         (mux)             
+        ───── source 仍 vendor-specific ───── │  ─── mux 独占 ───
+```
+
+**rmux 的真实角色**:
+- ✓ outbound BUS — 4 类 source 收敛到 1 条 stream
+- ✓ outbound SOURCE for Layer 1 (process) + Layer 2 (pattern)
+- ✗ outbound SOURCE for Layer 3-4 (conversation / semantic) — **物理上看不到**
+
+**Claude Code hooks 仍要保留**,只是 hook command 从 `ccteam internal hook progress-append`(直写文件)改为 `ccteam mux hook-emit`(投递到 daemon)。**形态上"hook 不消失,但它 feed 到 mux bus,而非平行通道" — 这是用户能问到的统一极限**。
+
+---
+
 ## Sources
 
 (本篇)
