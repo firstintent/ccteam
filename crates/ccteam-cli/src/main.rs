@@ -911,6 +911,33 @@ enum HookCommand {
 }
 
 fn main() -> Result<()> {
+    // V0.8 W2a — rmux SDK daemon spawn protocol. BEFORE clap parses
+    // argv, intercept the `--__internal-daemon <socket>` form emitted
+    // by `rmux_sdk::Rmux::connect_or_start` so the same ccteam binary
+    // can host the rmux daemon. See
+    // `docs/versions/v0-8-rmux/w2-daemon-spawn-protocol.md` and
+    // `references/rmux/crates/rmux-sdk/src/handles/rmux/connect.rs`
+    // (lines 150-180) for the upstream invariant this implementation
+    // tracks.
+    //
+    // TODO(V0.8-W2c): `RmuxBackend::new()` sets `RMUX_SDK_DAEMON_BINARY`
+    // lazily in its constructor — enough for the orchestrator's own
+    // use, but child processes ccteam spawns (claude / codex subagents)
+    // inherit env at fork time. When W2c migrates `claude_tui.rs` /
+    // `codex_exec.rs` to the trait, set `RMUX_SDK_DAEMON_BINARY =
+    // current_exe()` here at `main()` entry so inherited-env propagation
+    // covers any subagent that later uses rmux-sdk. No subagent uses it
+    // today, so W2a leaves this as a TODO rather than a behavior change.
+    {
+        let raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+        if raw_args.len() >= 3 && raw_args[1] == ccteam_mux::daemon::INTERNAL_DAEMON_FLAG {
+            let socket = raw_args[2].clone();
+            ccteam_mux::daemon::run_internal_daemon(socket)
+                .context("ccteam internal rmux daemon")?;
+            return Ok(());
+        }
+    }
+
     let cli = Cli::parse();
 
     // F173 — pin `CCTEAM_HOME` early so child spawn paths

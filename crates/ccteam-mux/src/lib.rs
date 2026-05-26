@@ -31,11 +31,14 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use futures::Stream;
 
+pub mod daemon;
 pub mod inproc_backend;
+pub mod rmux_backend;
 pub mod tmux_backend;
 pub mod tmux_ops;
 
 pub use inproc_backend::InProcBackend;
+pub use rmux_backend::{default_ccteam_mux_socket_path, RmuxBackend};
 pub use tmux_backend::TmuxBackend;
 
 /// Vendor-agnostic identity for a mux-backed session.
@@ -332,9 +335,7 @@ pub fn interactive_attach_argv(backend: BackendKind, session_name: &str) -> Vec<
 /// when those land in W2b).
 pub fn from_env() -> Result<Arc<dyn MuxBackend>> {
     match std::env::var("CCTEAM_MUX_BACKEND").as_deref() {
-        Ok("rmux") => Err(anyhow!(
-            "CCTEAM_MUX_BACKEND=rmux requires W2 (RmuxBackend not yet implemented)"
-        )),
+        Ok("rmux") => Ok(Arc::new(RmuxBackend::new())),
         Ok("inproc-test") => Ok(Arc::new(InProcBackend::new())),
         Ok("tmux") | Ok("") | Err(_) => Ok(Arc::new(TmuxBackend::new())),
         Ok(other) => Err(anyhow!(
