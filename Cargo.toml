@@ -8,6 +8,11 @@ members = [
     # V0.6.0 Wave 2 F109/F116 — IM-bot daemon + supervisor.
     # V0.6.1 F130: library-only (binary folded into `ccteam start`).
     "crates/ccteam-imd",
+    # V0.8 W0 spike — future home of the `MuxBackend` trait + `RmuxBackend`
+    # impl. Currently a placeholder pinning `rmux-sdk` 0.3 so the
+    # workspace catches any rmux semver drift via `rmux_types_compile_link`
+    # and a `#[ignore]` end-to-end smoke test. Real trait surface lands W1.
+    "crates/ccteam-mux",
     "crates/ccteam-web",
 ]
 
@@ -22,7 +27,20 @@ ccteam-core = { path = "crates/ccteam-core" }
 ccteam-cost = { path = "crates/ccteam-cost" }
 ccteam-hooks = { path = "crates/ccteam-hooks" }
 ccteam-imd = { path = "crates/ccteam-imd" }
+ccteam-mux = { path = "crates/ccteam-mux" }
 ccteam-web = { path = "crates/ccteam-web" }
+
+# V0.8 W0 spike — rmux as the future unified-mux execution surface for
+# mode 2 / 3a / 3b child supervision (design doc:
+# `docs/research/embedded-mux-unified-architecture.md` §四). Pinned at
+# the 0.3 minor; published on crates.io v0.3.1. Internal crates
+# (rmux-pty / rmux-ipc / rmux-os / rmux-types) flow in transitively —
+# do NOT add them as direct deps. `ratatui-rmux` is intentionally NOT
+# pulled (ccteam owns its own TUI rendering, if any).
+rmux-sdk = "0.3"
+rmux-client = "0.3"
+rmux-server = "0.3"
+rmux-proto = "0.3"
 
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive", "env"] }
