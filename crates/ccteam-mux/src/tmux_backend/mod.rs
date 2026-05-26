@@ -8,27 +8,53 @@
 //! convention) all stay inside `tmux_ops` and are inherited by this
 //! impl for free.
 //!
-//! **subscribe() / register_pattern()**: W1 returns an error pointing
-//! to W2. The refcounted `tmux pipe-pane` registry (currently in
-//! `ccteam-web::pty::PtyRegistry`) gets ported into this impl in W2
-//! alongside the regex-pattern matching layer.
+//! **subscribe() / register_pattern()**: W2b ports the refcounted
+//! `tmux pipe-pane` FIFO relay (formerly in `ccteam-web::pty`) into this
+//! impl (see [`fifo_relay`]) and layers the [`crate::patterns`] regex
+//! matcher on top ([`subscribe`]). `subscribe` returns a typed
+//! [`crate::MuxEventStream`]; `register_pattern` compiles + stores a
+//! regex per session.
 
+mod fifo_relay;
+mod subscribe;
+
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
+use tokio::sync::Mutex;
 
+use crate::patterns::{PatternMatcher, PatternVendor};
 use crate::tmux_ops::{
     capture_pane_tail_from_session, capture_pane_with_ansi_from_session, list_sessions,
     query_pane_dims_from_session, resize_window, TmuxSession,
 };
 use crate::{MuxBackend, MuxEventStream, MuxSessionId, MuxSessionSpec};
 
-#[derive(Debug, Default, Clone)]
+use fifo_relay::FifoRelayRegistry;
+
+/// Per-session compiled pattern registry. Lives at the top level
+/// (NOT inside the refcounted relay, which dies at refcount=0) so a
+/// `register_pattern` call can precede any `subscribe`. `subscribe`
+/// snapshots the current matcher (`Arc::clone`) into the stream — a
+/// pattern added afterward applies only to subsequent subscribes,
+/// matching `register_pattern`'s "effective at subscribe time"
+/// contract.
+type PatternRegistry = Arc<Mutex<HashMap<MuxSessionId, Arc<PatternMatcher>>>>;
+
+#[derive(Clone, Default)]
 pub struct TmuxBackend {
-    // Empty for W1; W2 grows the refcount registry (FIFO + broadcast
-    // tx) used by `subscribe`.
-    _private: (),
+    /// Refcounted FIFO + broadcast relays, one per live session.
+    relays: FifoRelayRegistry,
+    /// Compiled regex patterns per session, consulted by `subscribe`.
+    patterns: PatternRegistry,
+}
+
+impl std::fmt::Debug for TmuxBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TmuxBackend").finish_non_exhaustive()
+    }
 }
 
 impl TmuxBackend {
@@ -38,6 +64,26 @@ impl TmuxBackend {
 
     pub fn shared() -> Arc<dyn MuxBackend> {
         Arc::new(Self::new())
+    }
+
+    /// Convenience: register all of a vendor's base patterns
+    /// ([`crate::patterns::base_patterns`]) for `id` in one call. The
+    /// base table is compile-test-verified, so this never fails on a
+    /// shipped binary.
+    pub async fn register_base_patterns(
+        &self,
+        id: &MuxSessionId,
+        vendor: PatternVendor,
+    ) -> Result<()> {
+        let mut reg = self.patterns.lock().await;
+        let entry = reg.entry(id.clone()).or_default();
+        let matcher = Arc::make_mut(entry);
+        for pat in crate::patterns::base_patterns(vendor) {
+            matcher
+                .register(pat.id.to_string(), pat.regex)
+                .map_err(|e| anyhow!("base pattern `{}` failed to compile: {e}", pat.id))?;
+        }
+        Ok(())
     }
 }
 
@@ -155,35 +201,39 @@ impl MuxBackend for TmuxBackend {
             .map_err(|e| anyhow!("MuxBackend(tmux)::resize join error: {e}"))?
     }
 
-    async fn subscribe(&self, _id: &MuxSessionId) -> Result<MuxEventStream> {
-        // W1 scope cap: the refcounted `tmux pipe-pane` registry
-        // (FIFO + broadcast::Sender) currently lives in
-        // `ccteam-web::pty::PtyRegistry` and stays there for V0.8 W1.
-        // W2 ports the registry into this impl and exposes only the
-        // `MuxEventStream`. Callers of `MuxBackend::subscribe` MUST
-        // not exist yet — `ccteam-web` continues to use `PtyRegistry`
-        // directly until W2.
-        //
-        // Return an explicit error rather than a silent empty stream
-        // so an accidental caller fails loudly.
-        Err(anyhow!(
-            "MuxBackend(tmux)::subscribe is not implemented in W1 — \
-             use `ccteam-web::pty::PtyRegistry` until W2 ports the \
-             refcounted pipe-pane relay into this impl"
-        ))
+    async fn subscribe(&self, id: &MuxSessionId) -> Result<MuxEventStream> {
+        // Snapshot the current matcher for this session (empty if no
+        // patterns registered). `subscribe` is the moment patterns
+        // become effective for the returned stream.
+        let matcher = {
+            let reg = self.patterns.lock().await;
+            reg.get(id)
+                .cloned()
+                .unwrap_or_else(|| Arc::new(PatternMatcher::new()))
+        };
+        // Attach to the refcounted FIFO relay (bringing up `pipe-pane`
+        // + the FIFO on first subscriber). The guard's Drop releases
+        // the refcount when the returned stream is dropped.
+        let (rx, guard) = self.relays.attach(id).await?;
+        Ok(subscribe::build_stream(rx, matcher, guard))
     }
 
     async fn register_pattern(
         &self,
-        _id: &MuxSessionId,
-        _regex_id: String,
-        _regex: String,
+        id: &MuxSessionId,
+        regex_id: String,
+        regex: String,
     ) -> Result<()> {
-        // W1 stub. Real impl lands W2b alongside `subscribe`. We
-        // intentionally return Ok(()) (not an error) so adapter-level
-        // code can call this proactively now without erroring; once
-        // subscribe is live in W2 the stub becomes a no-op-with-side-
-        // effects-only-at-subscribe-time impl, which is fine.
+        // Compile + store under this session's matcher. Idempotent:
+        // re-registering the same `regex_id` replaces the pattern.
+        // Takes effect for subsequent `subscribe` calls (existing
+        // streams hold their own snapshot).
+        let mut reg = self.patterns.lock().await;
+        let entry = reg.entry(id.clone()).or_default();
+        let matcher = Arc::make_mut(entry);
+        matcher
+            .register(regex_id.clone(), &regex)
+            .map_err(|e| anyhow!("register_pattern `{regex_id}`: invalid regex `{regex}`: {e}"))?;
         Ok(())
     }
 
