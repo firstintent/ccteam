@@ -13,6 +13,11 @@ description = "ccteam orchestrator core: state machine, protocol types, tmux wra
 # backward-compat with V0.5.x callers.
 ccteam-cost.workspace = true
 
+# V0.8 W1 — tmux CLI primitives moved into `ccteam-mux::tmux_ops` so
+# the `MuxBackend` trait + impls can live there without inducing a
+# cargo cycle. `ccteam-core::tmux` is a thin re-export module on top.
+ccteam-mux.workspace = true
+
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true

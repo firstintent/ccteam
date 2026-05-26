@@ -4,20 +4,26 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "ccteam mux abstraction — MuxBackend trait + rmux/tmux/inproc impls (V0.8 spike: placeholder while W1 lands the trait)."
+description = "ccteam mux abstraction — MuxBackend trait + tmux/inproc impls. V0.8 W1 wraps the existing tmux CLI; V0.8 W2+ adds RmuxBackend."
 
 [dependencies]
 # V0.8 W0 — rmux is the future unified-mux execution surface. Trait
-# definitions land in W1; for the spike we only pin the SDK + transport
-# so semver drift is caught by `rmux_types_compile_link`.
+# definitions land in W1; the SDK + transport are pinned so semver
+# drift is caught by `rmux_types_compile_link`.
 rmux-sdk = { workspace = true }
 rmux-client = { workspace = true }
 rmux-server = { workspace = true }
 rmux-proto = { workspace = true }
+
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 # Bring tokio test runtime helpers into the smoke test. The workspace
 # tokio feature set already includes `macros` / `rt-multi-thread` via
 # `["full"]`, so dev-deps only need to re-expose the workspace alias.
 tokio = { workspace = true }
+tempfile = "3"

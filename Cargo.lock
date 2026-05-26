@@ -384,6 +384,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "ccteam-cost",
+ "ccteam-mux",
  "chrono",
  "croner",
  "dirs",
@@ -461,11 +462,16 @@ dependencies = [
 name = "ccteam-mux"
 version = "0.6.8"
 dependencies = [
+ "anyhow",
+ "async-trait",
+ "futures",
  "rmux-client",
  "rmux-proto",
  "rmux-sdk",
  "rmux-server",
+ "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
