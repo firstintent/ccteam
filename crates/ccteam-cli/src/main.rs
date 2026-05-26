@@ -938,6 +938,19 @@ fn main() -> Result<()> {
         }
     }
 
+    // V0.8 W2c — set `RMUX_SDK_DAEMON_BINARY` to this binary at main()
+    // entry (not lazily in RmuxBackend::new) so the value is in the
+    // process env BEFORE any child process is forked. Child agents
+    // (claude / codex sessions) that later use rmux-sdk inherit it and
+    // resolve the same ccteam binary as their daemon host, rather than
+    // falling back to a `rmux` binary on PATH that may not exist.
+    // Idempotent — honors an explicit operator override.
+    if std::env::var_os(ccteam_mux::daemon::SDK_DAEMON_BINARY_ENV).is_none() {
+        if let Ok(exe) = std::env::current_exe() {
+            std::env::set_var(ccteam_mux::daemon::SDK_DAEMON_BINARY_ENV, exe.as_os_str());
+        }
+    }
+
     let cli = Cli::parse();
 
     // F173 — pin `CCTEAM_HOME` early so child spawn paths

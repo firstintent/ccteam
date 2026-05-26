@@ -23,6 +23,13 @@ use rmux_server::{DaemonConfig, ServerDaemon};
 /// public protocol with rmux-sdk's `INTERNAL_DAEMON_FLAG` const).
 pub const INTERNAL_DAEMON_FLAG: &str = "--__internal-daemon";
 
+/// Re-export of rmux-sdk's daemon-binary-override env var name
+/// (`"RMUX_SDK_DAEMON_BINARY"`). Re-exported so ccteam-cli's `main()`
+/// can set it at process entry — before any child fork — without
+/// taking a direct rmux-sdk dependency. See
+/// `docs/versions/v0-8-rmux/w2-daemon-spawn-protocol.md`.
+pub use rmux_sdk::bootstrap::discovery::SDK_DAEMON_BINARY_ENV;
+
 /// Hidden-daemon worker-thread count. Mirrors rmux's upstream
 /// `hidden_daemon_worker_threads` heuristic (fixed at 4 here for
 /// simplicity — workspace doesn't depend on `num_cpus`).
