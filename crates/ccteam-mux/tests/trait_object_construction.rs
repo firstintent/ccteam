@@ -5,9 +5,19 @@
 //! `Self: Sized` bounds or `&mut self` slips at compile time. It's
 //! cheap and a useful guardrail when the trait surface evolves.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use ccteam_mux::{from_env, InProcBackend, MuxBackend, TmuxBackend};
+
+/// Tests that mutate `CCTEAM_MUX_BACKEND` must serialize against each
+/// other — cargo test parallelism otherwise races the env var (one
+/// test's `set_var("rmux")` is observable by another test's
+/// `from_env()` call in a different thread). One in-crate mutex
+/// suffices; no need for the `serial_test` crate here.
+fn env_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 #[test]
 fn tmux_backend_is_dyn_compat() {
@@ -24,12 +34,14 @@ fn from_env_default_yields_tmux() {
     // No env override → expect the tmux default (regardless of
     // whether tmux is actually installed; `from_env` just constructs
     // the backend, it doesn't probe).
+    let _guard = env_lock().lock().unwrap();
     std::env::remove_var("CCTEAM_MUX_BACKEND");
     let _backend = from_env().expect("from_env default should succeed");
 }
 
 #[test]
 fn from_env_inproc_test_yields_inproc() {
+    let _guard = env_lock().lock().unwrap();
     std::env::set_var("CCTEAM_MUX_BACKEND", "inproc-test");
     let backend = from_env().expect("inproc-test should succeed");
     // Sanity: list_sessions on a fresh InProcBackend is empty.
@@ -45,6 +57,7 @@ fn from_env_inproc_test_yields_inproc() {
 
 #[test]
 fn from_env_rmux_errors_until_w2() {
+    let _guard = env_lock().lock().unwrap();
     std::env::set_var("CCTEAM_MUX_BACKEND", "rmux");
     let err = match from_env() {
         Ok(_) => panic!("rmux should not yet construct"),
