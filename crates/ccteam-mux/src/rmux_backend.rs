@@ -9,17 +9,19 @@
 //! `std::env::current_exe()` so the SDK spawns ccteam itself rather
 //! than a separate `rmux` artifact.
 //!
-//! W2a scope:
+//! W2b scope (this revision):
 //!
 //! - `spawn` / `exists` / `send_text` / `send_enter` / `capture` /
 //!   `pane_dims` / `pane_pid` / `list_pane_pids` / `resize` / `kill` /
-//!   `list_sessions` — all wired through SDK primitives.
-//! - `subscribe` — minimum viable: returns an empty stream as a stub
-//!   (no daemon subscription opened). W2b lands the real
-//!   `pane.output_stream()`-backed translator + regex pattern matching.
-//! - `register_pattern` — stub stores patterns in an internal map; the
-//!   actual matching layer that emits `MuxEvent::PatternMatched` lands
-//!   in W2b alongside subscribe.
+//!   `list_sessions` — all wired through SDK primitives (W2a).
+//! - `subscribe` — drives the SDK `pane.line_stream()`: each
+//!   `PaneLineItem::Line` becomes a `MuxEvent::OutputChunk` plus a
+//!   `MuxEvent::PatternMatched` per registered-regex hit; a
+//!   `PaneLineItem::Lag` becomes `MuxEvent::OutputDropped`. No FIFO
+//!   machinery — the daemon owns the broadcast.
+//! - `register_pattern` — compiles + stores into a shared
+//!   [`crate::patterns::PatternMatcher`] per session; `subscribe`
+//!   snapshots it (same type the TmuxBackend uses).
 //!
 //! Known gap (W2b followup): [`MuxBackend::capture`]'s `with_ansi=true`
 //! cannot be honored from the SDK's `PaneSnapshot` cell grid — ANSI
@@ -28,21 +30,23 @@
 //! the gap; ccteam-web consumers that need raw bytes continue routing
 //! through `ccteam-web::pty::PtyRegistry` until W2b ports the registry.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use futures::stream;
+use rmux_sdk::PaneLineStream;
 use tokio::sync::{Mutex, OnceCell};
 
 use rmux_sdk::{
     bootstrap::discovery::SDK_DAEMON_BINARY_ENV, EnsureSession, EnsureSessionPolicy, PaneInfo,
-    PaneProcessState, ProcessSpec, Rmux, RmuxEndpoint, SessionName, TerminalSizeSpec,
+    PaneLineItem, PaneProcessState, ProcessSpec, Rmux, RmuxEndpoint, SessionName, TerminalSizeSpec,
 };
 
-use crate::{MuxBackend, MuxEventStream, MuxSessionId, MuxSessionSpec};
+use crate::patterns::{PatternMatcher, PatternVendor};
+use crate::{MuxBackend, MuxEvent, MuxEventStream, MuxSessionId, MuxSessionSpec};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 5;
 
@@ -85,10 +89,19 @@ fn ensure_socket_parent(socket: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Per-session regex registry, keyed by `MuxSessionId`. Each entry is
-/// a Vec of `(regex_id, regex_pattern)` pairs preserving insertion
-/// order. W2b consults this map from the subscribe-side translator.
-type PatternRegistry = Arc<Mutex<HashMap<MuxSessionId, Vec<(String, String)>>>>;
+/// Per-session compiled pattern registry, keyed by `MuxSessionId`.
+/// Shares the [`PatternMatcher`] type with `TmuxBackend`; `subscribe`
+/// snapshots the matcher (`Arc::clone`) into the line-stream translator.
+type PatternRegistry = Arc<Mutex<HashMap<MuxSessionId, Arc<PatternMatcher>>>>;
+
+/// State threaded through `subscribe`'s `unfold` over the SDK line
+/// stream. `pending` holds the `PatternMatched` events derived from the
+/// most recent line, yielded after its `OutputChunk`.
+struct RmuxStreamState {
+    line_stream: PaneLineStream,
+    matcher: Arc<PatternMatcher>,
+    pending: VecDeque<MuxEvent>,
+}
 
 /// `RmuxBackend` — ccteam's MuxBackend impl over rmux-sdk 0.3.
 ///
@@ -175,6 +188,25 @@ impl RmuxBackend {
     async fn session_name(&self, id: &MuxSessionId) -> Result<SessionName> {
         SessionName::new(id.0.clone())
             .map_err(|e| anyhow!("RmuxBackend: invalid session name `{}`: {e}", id.0))
+    }
+
+    /// Convenience: register all of a vendor's base patterns
+    /// ([`crate::patterns::base_patterns`]) for `id` in one call.
+    /// Mirrors [`crate::TmuxBackend::register_base_patterns`].
+    pub async fn register_base_patterns(
+        &self,
+        id: &MuxSessionId,
+        vendor: PatternVendor,
+    ) -> Result<()> {
+        let mut registry = self.pattern_registry.lock().await;
+        let entry = registry.entry(id.clone()).or_default();
+        let matcher = Arc::make_mut(entry);
+        for pat in crate::patterns::base_patterns(vendor) {
+            matcher
+                .register(pat.id.to_string(), pat.regex)
+                .map_err(|e| anyhow!("base pattern `{}` failed to compile: {e}", pat.id))?;
+        }
+        Ok(())
     }
 
     /// Look up the first pane's `PaneInfo` for this session, when the
@@ -336,12 +368,72 @@ impl MuxBackend for RmuxBackend {
         Ok(())
     }
 
-    async fn subscribe(&self, _id: &MuxSessionId) -> Result<MuxEventStream> {
-        // W2a minimum viable: return an empty stream so adapter code
-        // can compile against `MuxBackend::subscribe` without
-        // hard-erroring; W2b lands the `pane.output_stream()`-backed
-        // translator + regex pattern matching layer.
-        Ok(Box::pin(stream::empty()))
+    async fn subscribe(&self, id: &MuxSessionId) -> Result<MuxEventStream> {
+        // Snapshot the matcher (empty if no patterns registered).
+        let matcher = {
+            let reg = self.pattern_registry.lock().await;
+            reg.get(id)
+                .cloned()
+                .unwrap_or_else(|| Arc::new(PatternMatcher::new()))
+        };
+        let rmux = self.rmux().await?;
+        let name = self.session_name(id).await?;
+        let session = rmux
+            .session(name)
+            .await
+            .map_err(|e| anyhow!("RmuxBackend::subscribe session `{}`: {e}", id.0))?;
+        let line_stream = session
+            .pane(0, 0)
+            .line_stream()
+            .await
+            .map_err(|e| anyhow!("RmuxBackend::subscribe line_stream `{}`: {e}", id.0))?;
+
+        // unfold over (line_stream, matcher, pending). One `Line` may
+        // yield 1 OutputChunk + N PatternMatched; `pending` holds the
+        // extras between `next` calls. No FIFO/refcount — the daemon
+        // owns the broadcast and the stream's own drop guard unsubs.
+        let state = RmuxStreamState {
+            line_stream,
+            matcher,
+            pending: VecDeque::new(),
+        };
+        let s = stream::unfold(state, |mut st| async move {
+            loop {
+                if let Some(ev) = st.pending.pop_front() {
+                    return Some((ev, st));
+                }
+                match st.line_stream.next().await {
+                    Ok(Some(PaneLineItem::Line { text })) => {
+                        for (regex_id, captured) in st.matcher.match_line(&text) {
+                            st.pending
+                                .push_back(MuxEvent::PatternMatched { regex_id, captured });
+                        }
+                        // Emit the raw line (with the trailing \n the
+                        // line stream stripped re-appended for byte
+                        // parity with the FIFO path) first.
+                        let mut bytes = text.into_bytes();
+                        bytes.push(b'\n');
+                        return Some((MuxEvent::OutputChunk(bytes), st));
+                    }
+                    Ok(Some(PaneLineItem::Lag(notice))) => {
+                        return Some((
+                            MuxEvent::OutputDropped {
+                                behind: notice.missed_events,
+                            },
+                            st,
+                        ));
+                    }
+                    Ok(Some(_)) => {
+                        // PaneLineItem is #[non_exhaustive]; a future
+                        // variant we don't model is skipped (loop).
+                        continue;
+                    }
+                    Ok(None) => return None,
+                    Err(_) => return None,
+                }
+            }
+        });
+        Ok(Box::pin(s))
     }
 
     async fn register_pattern(
@@ -350,16 +442,15 @@ impl MuxBackend for RmuxBackend {
         regex_id: String,
         regex: String,
     ) -> Result<()> {
-        // W2a stub: store in registry; W2b consults this map from the
-        // subscribe-side translator and emits PatternMatched events.
-        // Idempotent — same regex_id replaces the pattern.
+        // Compile + store into this session's shared matcher. Idempotent
+        // — same regex_id replaces the pattern. Effective for subsequent
+        // `subscribe` calls (existing streams hold their own snapshot).
         let mut registry = self.pattern_registry.lock().await;
-        let patterns = registry.entry(id.clone()).or_default();
-        if let Some(existing) = patterns.iter_mut().find(|(rid, _)| rid == &regex_id) {
-            existing.1 = regex;
-        } else {
-            patterns.push((regex_id, regex));
-        }
+        let entry = registry.entry(id.clone()).or_default();
+        let matcher = Arc::make_mut(entry);
+        matcher
+            .register(regex_id.clone(), &regex)
+            .map_err(|e| anyhow!("register_pattern `{regex_id}`: invalid regex `{regex}`: {e}"))?;
         Ok(())
     }
 
