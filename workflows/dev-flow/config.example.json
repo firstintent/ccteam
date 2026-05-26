@@ -1,0 +1,49 @@
+{
+  "_schema": "ccteam dev-flow config v1 — fill every TODO before launching",
+
+  "name": "TODO-project-slug",
+  "description": "TODO short one-liner about what this project is",
+
+  "_local_path_note": "absolute path to the project's git working tree; agents cd here on every turn",
+  "local_path": "TODO-/absolute/path/to/repo",
+
+  "github": {
+    "_note": "dev opens PRs against fix_base_branch; reviewer merges into the same. production_branch is NEVER touched by automation.",
+    "owner": "TODO-org-or-user",
+    "repo": "TODO-repo-name",
+    "fix_base_branch": "main",
+    "production_branch": "main",
+    "fix_branch_prefix": "feat/dev-flow-",
+    "_review_strategy_note": "squash | merge | rebase — passed to `gh pr merge --<strategy>`",
+    "merge_strategy": "squash"
+  },
+
+  "test": {
+    "_note": "shell commands the dev bot runs before opening PR. Each entry runs in the worktree cwd; non-zero exit = blocks the PR.",
+    "pre_pr_commands": [
+      "TODO-fmt-check (e.g. cargo fmt --all -- --check)",
+      "TODO-lint (e.g. cargo clippy --all-targets -- -D warnings)",
+      "TODO-test (e.g. cargo test --workspace)"
+    ]
+  },
+
+  "worktree": {
+    "_note": "where dev creates ephemeral worktrees per PR. .ccteam-worktrees/ is gitignored by convention.",
+    "base_dir": ".ccteam-worktrees",
+    "cleanup_after_merge": true
+  },
+
+  "ops": {
+    "_note": "ops bot health scan tunables. Set thresholds project-by-project.",
+    "stuck_pr_hours": 24,
+    "fix_attempts_warn": 3,
+    "cost_spike_pct": 50,
+    "report_dir": ".ccteam/ops-reports"
+  },
+
+  "_im_note": "IM platform comes from ccteam-imd configuration (see /telegram:configure or /ccteam-im-setup). config.json doesn't carry the bot token — that lives in keychain / .env. This block is just a hint for bots that need to identify the active platform in their messages.",
+  "im": {
+    "platform": "TODO-telegram-or-slack-or-discord",
+    "group_handle_hint": "TODO-human-readable-group-name (for logs only)"
+  }
+}

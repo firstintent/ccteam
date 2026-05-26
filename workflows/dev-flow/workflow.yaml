@@ -1,0 +1,147 @@
+# ccteam workflow.yaml — dev-flow (holon-inspired 4-bot dev loop).
+#
+# 4 个长跑 chat bot 在同一 IM 群里通过 @-mention 协作,把"用户提需求
+# → 写代码 → 评审 → 合并 → 健康巡检"这条 holon-style 闭环跑通。
+#
+# 借鉴 holon 而不是照搬 qa-autoloop 的关键差异:
+#
+# 1. **bot-to-bot 走 IM @ 路由,不走文件 marker**
+#    qa-autoloop 用 `.ccteam/triggers/<role>/` marker drop 跨 agent,
+#    丝滑度差(spawn 延迟 + 状态不可见 + 用户在 IM 看不见协作过程)。
+#    dev-flow 用 V0.6.8 F193 daemon-internal mpsc 让 bot 互相 @,IM
+#    群里看得见全过程。
+#
+# 2. **每个 bot 是长跑 tmux session,不是 fresh-spawn**
+#    qa-autoloop fixer/releaser 每次 spawn 都 fresh 1M context;
+#    dev-flow 4 bot 各占一个 tmux long session(V0.6.6 F172 V2
+#    `claude --resume <name>` lossless),跨日跨 turn 累积上下文 —
+#    这是 holon WorkItem "多 turn 推进" 的 ccteam 现状最贴近的实现。
+#
+# 3. **用户是闭环里的一环,不是 trigger 触发器**
+#    qa-autoloop planner 是 manual,要用户 `ccteam spawn` 才动;
+#    dev-flow pm bot 在 IM 群里待命,用户 @pm 说需求就开聊,无 CLI
+#    门槛。
+#
+# === 已知不丝滑的地方(跑起来会暴露,反向驱动 V0.7 substrate)===
+#
+# A. **ops 没有 schedule trigger**
+#    chat 模式下 trigger=manual,无 cron。当前 workaround:用户在
+#    IM 群里 `@ops scan` 或让 pm 定时 @ops。理想:V0.7 给 chat mode
+#    bot 加 schedule trigger(借 F142 的 cron 实现,放宽到 chat mode)。
+#
+# B. **GitHub PR/CI 事件不接**
+#    dev 提了 PR 后,无法被 PR comment / CI 完成自动唤醒。当前
+#    workaround:reviewer 主动 `gh pr view` 轮询,或用户 @reviewer
+#    "PR #N 有新评论了请看"。理想:V0.7 ExternalTriggerCapability +
+#    WaitingIntent,GitHub webhook → 自动 @ 对应 bot。
+#
+# C. **backlog 视图只能 grep**
+#    用户在 IM 看不见 backlog 有多少、谁卡了。当前 workaround:
+#    `@pm status` 让 pm 回报。理想:V0.7 web UI / IM 端 backlog
+#    面板(对接 holon WorkItem readiness)。
+#
+# D. **fix-loop 撞顶 trace 丢失**
+#    reviewer 让 dev 改 3 次还不通过的话,dev 撞顶后只剩"放弃"。
+#    当前 workaround:@ops 兜底报警。理想:V0.7 escalation envelope
+#    带 turn-by-turn 失败上下文。
+#
+# === 红线对照(ccteam CLAUDE.md §三 全部守住)===
+#
+# - 文件系统是控制平面:backlog / prs / ops-reports 全部走 .ccteam/
+# - progress.jsonl 是 SoT:bot turn_done 事件正常写,无新事件
+# - No prompt injection:bot 行为住 .claude/agents/<role>.md
+# - 不主动 kill 长 session:bot tmux session 24/7 跑
+# - 不解析 tmux 终端:bot 之间通信走 daemon mpsc / IM 文本
+# - fix-loop 撞 3 次 escalate:dev 内部计 fix_attempts,reviewer 校核
+#
+# === 适用场景 ===
+#
+# ✅ 中小型项目,有 GitHub repo + 一个或多个用户在 IM 群里掌舵
+# ✅ 用户希望"提需求 → 自动出 PR → 自动 review → 自动 merge"全闭环
+# ✅ 接受 ccteam 24×7 跑 4 bot tmux session 的 budget
+#
+# ❌ 不适用 ccteam 仓库自己 dogfood(CLAUDE.md §六:不要给 ccteam
+#    自己加 ccteam-style hook,循环引用排错地狱)— 用 sibling repo
+# ❌ 项目还在很早期(先用 chat-pocket 单 bot 探索,稳了再上 4 bot)
+# ❌ 高度合规 / 必须人工 approve 每个 merge(可叠 `plan_approval`
+#    block 到 reviewer,但默认 dev-flow 让 reviewer 自动合)
+
+name: dev-flow
+description: |
+  Holon-inspired 4-bot dev loop on chat substrate. pm/dev/reviewer/ops
+  in one IM room, bot-to-bot @-mention routing via V0.6.8 F193 daemon
+  mpsc. pm intakes user requirements → @dev to implement →
+  @reviewer to merge → @ops health-checks the loop. Each bot is a
+  long-running tmux session (mode 3, F172 V2 lossless resume).
+
+mode: chat
+
+chat:
+  # pm 是默认入口 bot — 用户在 IM 群里 @pm 提需求时,daemon 把消息
+  # 路由到 pm tmux session。其它 3 个 bot 也在群里待命,被 @ 才动。
+  bot_name: "pm"
+
+  # F195 watchdog:每 turn 90s 仍未 turn_done 则报 stall 并 close.
+  # dev / reviewer 单 turn 跑大 cargo test / gh CLI 可能需要更长 —
+  # 用户可按项目实际放宽到 300s 或更长。
+  turn_timeout_sec: 180
+
+  # compaction 节奏:每 30 turn 一次 /compact。dev 在写代码 turn 经
+  # 常跑掉很多 tool call,30 turn 大约对应 1-2 天的协作。
+  compact_every_turns: 30
+
+  # bot-to-bot @ 跳数上限:防 pm→dev→reviewer→pm→… 循环。3 跳够
+  # 覆盖 "pm 派活 → dev 提 PR → reviewer 合并 → 回报 pm" 闭环。
+  hop_limit: 3
+
+  # 重启 daemon 后续读最近 N 个 turn 的对话原文(F172 V2 lossless
+  # resume 之外的双保险)。
+  recover_last_n_turns: 12
+
+  # ACL:限定哪个 IM group/user 能 @ 这些 bot。装机时替换为真实
+  # group_chat_id(Telegram 群是负数 / Slack 是 C 开头 / Discord 是
+  # 数字)。**不填这个就是全开放**,任何 IM 用户 @bot 都生效 — 生产
+  # 环境强烈建议填。
+  chat_acl:
+    allow_groups:
+      - "TODO-replace-with-im-group-chat-id"
+
+# 每日预算上限:跨 vendor 加和。dev-flow 4 bot 都长跑,coding turn
+# 容易跑大 token,装机时按项目实际调整。
+budget:
+  max_cost_usd_per_24h: 30.00
+
+agents:
+  # ─── pm:用户接待 + 需求 intake + 派活到 dev ──────────────────────
+  pm:
+    executor: claude
+    trigger: manual          # chat 模式下 trigger=manual,通过 @-mention 唤醒
+    max_parallel: 1
+    chat_handle: pm
+
+  # ─── dev:实现 backlog item,开 PR,接 reviewer 反馈循环 ─────────
+  dev:
+    executor: claude
+    trigger: manual
+    max_parallel: 1
+    chat_handle: dev
+
+  # ─── reviewer:评审 dev 的 PR,合并或要求改 ─────────────────────
+  reviewer:
+    executor: claude
+    trigger: manual
+    max_parallel: 1
+    chat_handle: reviewer
+
+  # ─── ops:健康巡检,扫 progress.jsonl 找 anomaly,报告 pm ──────────
+  # ⚠️ chat 模式当前无 schedule trigger(F142 cron 只在 artifact-driven
+  # mode 工作)— ops 必须靠 @ops 触发。@ops 来源可以是:
+  #   1. 用户在 IM 直接 `@ops scan now`
+  #   2. pm 在自己的 turn 内决定 @ops(例如收到用户 "/health" 命令)
+  #   3. host 层 crontab 跑 `ccteam admin send-message <group> "@ops scan"`
+  # 理想 V0.7 解:为 chat-mode bot 加 schedule trigger。
+  ops:
+    executor: claude
+    trigger: manual
+    max_parallel: 1
+    chat_handle: ops
