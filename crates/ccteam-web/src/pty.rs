@@ -79,11 +79,25 @@ impl PtyRegistry {
         // handler's own `RecvError::Lagged` path still fires).
         let forwarder = tokio::spawn(async move {
             while let Some(event) = stream.next().await {
-                if let MuxEvent::OutputChunk(bytes) = event {
-                    // Err only when there are zero receivers; harmless —
-                    // keep draining so the backend stream stays alive
-                    // and the relay isn't torn down prematurely.
-                    let _ = tx.send(bytes);
+                match event {
+                    MuxEvent::OutputChunk(bytes) => {
+                        // Err only when there are zero receivers;
+                        // harmless — keep draining so the backend stream
+                        // stays alive and the relay isn't torn down
+                        // prematurely.
+                        let _ = tx.send(bytes);
+                    }
+                    // Backend-side OutputDropped (the forwarder itself
+                    // fell behind the backend broadcast under scheduler
+                    // starvation) is intentionally NOT forwarded: the WS
+                    // client would see a seamless byte stream with an
+                    // invisible hole. This is an accepted single-user
+                    // dev-tool trade-off — the dominant lag case (a slow
+                    // WS *subscriber*) is still surfaced downstream by
+                    // this compat broadcast's own RecvError::Lagged,
+                    // which the pty_ws handler maps to a `lag` frame.
+                    MuxEvent::OutputDropped { .. } => {}
+                    _ => {}
                 }
             }
         });

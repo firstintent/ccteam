@@ -149,7 +149,12 @@ impl RelaySession {
         // existing pipe; running stop first turns this into
         // "stop-then-start". The ccteam-layer refcount enforces the
         // single-relay-per-pane invariant; we don't rely on tmux's `-o`.
-        let target = format!("{tmux_session}:0.0");
+        //
+        // Target the bare session name (NOT `:0.0`) so tmux resolves the
+        // active pane — a hard-coded `:0` breaks on hosts with
+        // `base-index 1` / `pane-base-index 1` (no window/pane 0). This
+        // matches the `tmux_ops` convention (resize-window / pane_pid).
+        let target = tmux_session.clone();
         let _ = Command::new("tmux")
             .args(["pipe-pane", "-t", &target])
             .status()
@@ -175,10 +180,10 @@ impl RelaySession {
     }
 
     async fn tear_down(&self) {
-        let target = format!("{}:0.0", self.tmux_session);
+        // Bare session name — base-index-safe (see bring_up).
         // No command after `-t <target>` = stop the existing pipe.
         let _ = Command::new("tmux")
-            .args(["pipe-pane", "-t", &target])
+            .args(["pipe-pane", "-t", &self.tmux_session])
             .status()
             .await;
         let _ = tokio::fs::remove_file(&self.fifo_path).await;

@@ -408,9 +408,13 @@ impl MuxBackend for RmuxBackend {
                             st.pending
                                 .push_back(MuxEvent::PatternMatched { regex_id, captured });
                         }
-                        // Emit the raw line (with the trailing \n the
-                        // line stream stripped re-appended for byte
-                        // parity with the FIFO path) first.
+                        // Emit the rendered line as a chunk, re-appending
+                        // a `\n` the line stream stripped. This is an
+                        // *approximate* reconstruction (the stream also
+                        // strips any `\r`), so it is NOT byte-faithful to
+                        // the original pane bytes — adequate for SSE
+                        // display + pattern matching (which fires off the
+                        // rendered line above), not for byte-exact replay.
                         let mut bytes = text.into_bytes();
                         bytes.push(b'\n');
                         return Some((MuxEvent::OutputChunk(bytes), st));

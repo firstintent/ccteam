@@ -148,15 +148,24 @@ async fn subscribe_streams_output_and_fires_pattern() {
     }
     let backend = Arc::new(TmuxBackend::new());
     let session_name = random_session_name("subscribe");
-    // Run an interactive shell so the pane stays alive and echoes.
+    // Run a loop that re-emits the marker every 300ms so the pane stays
+    // alive (no controlling tty under daemon-launch can make a bare
+    // interactive shell exit immediately) and the marker fires
+    // repeatedly within the collection window.
     let spec = MuxSessionSpec::new(
         &session_name,
-        vec!["sh".into(), "-i".into()],
+        vec![
+            "sh".into(),
+            "-c".into(),
+            "while true; do printf 'CCTEAM-MARKER-OK\\n'; sleep 0.3; done".into(),
+        ],
         PathBuf::from("/tmp"),
     );
     let id = backend.spawn(spec).await.expect("spawn");
+    // Give the pane a moment to come up before subscribing.
+    tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // Register a pattern that matches a line we will echo.
+    // Register a pattern that matches the line the pane emits.
     backend
         .register_base_patterns(&id, PatternVendor::Claude)
         .await
@@ -168,17 +177,10 @@ async fn subscribe_streams_output_and_fires_pattern() {
 
     let mut stream = backend.subscribe(&id).await.expect("subscribe");
 
-    // Drive output through the pane.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    backend
-        .send_line(&id, "printf 'CCTEAM-MARKER-OK\\n'")
-        .await
-        .unwrap();
-
-    // Collect events for up to 3s; assert we see a chunk + the marker.
+    // Collect events for up to 5s; assert we see a chunk + the marker.
     let mut saw_chunk = false;
     let mut saw_marker = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(300), stream.next()).await {
             Ok(Some(MuxEvent::OutputChunk(_))) => saw_chunk = true,
