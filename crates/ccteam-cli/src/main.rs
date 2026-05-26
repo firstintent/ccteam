@@ -762,6 +762,20 @@ enum AdminAction {
         #[arg(long)]
         role: String,
     },
+    /// List registered chat-mode bots (reads the F146 registry at
+    /// `~/.ccteam/imd/registry/<slug>/<role>.json`). Confirms what
+    /// `register-bot` wrote — role → @handle → platform/chat_id, plus
+    /// live `running` status from the per-bot heartbeat sidecar.
+    /// Note: distinct from the MCP `admin_ls` tool, which lists
+    /// *projects*, not bot registrations.
+    ListBots {
+        /// Optional slug filter. Omit to list bots across all slugs.
+        #[arg(long)]
+        slug: Option<String>,
+        /// Emit a JSON array instead of the human-readable table.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 /// V0.6.0 Wave 3 F112 §C — `ccteam prefs` subcommand surface.
@@ -1264,6 +1278,11 @@ fn main() -> Result<()> {
                 }
                 AdminAction::UnregisterBot { slug, role } => {
                     let out = commands::run_admin_unregister_bot(&paths, &slug, &role)?;
+                    println!("{out}");
+                    Ok(())
+                }
+                AdminAction::ListBots { slug, json } => {
+                    let out = commands::run_admin_list_bots(&paths, slug.as_deref(), json)?;
                     println!("{out}");
                     Ok(())
                 }

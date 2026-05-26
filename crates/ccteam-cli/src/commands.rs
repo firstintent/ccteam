@@ -4697,6 +4697,98 @@ pub fn run_admin_unregister_bot(paths: &CcteamPaths, slug: &str, role: &str) -> 
     }))?)
 }
 
+/// `ccteam admin list-bots [--slug <slug>] [--json]`. Reads the F146
+/// registry (`~/.ccteam/imd/registry/<slug>/<role>.json`) and reports
+/// each registered chat-mode bot with its effective `@handle`,
+/// platform/chat_id, and live `running` status (from the per-bot
+/// heartbeat sidecar). Pairs with `register-bot` / `unregister-bot` so
+/// users can confirm what they wired up. Distinct from the MCP
+/// `admin_ls` tool, which enumerates *projects*, not bot registrations.
+pub fn run_admin_list_bots(
+    paths: &CcteamPaths,
+    filter_slug: Option<&str>,
+    json: bool,
+) -> Result<String> {
+    use ccteam_imd::{bot_running_status_in, list_bots_in};
+
+    if let Some(slug) = filter_slug {
+        crate::mcp_chat_tools::validate_slug(slug, "slug")?;
+    }
+
+    let mut bots = list_bots_in(&paths.root, filter_slug)?;
+    // Deterministic order: slug, then role.
+    bots.sort_by(|a, b| {
+        a.workflow_slug
+            .cmp(&b.workflow_slug)
+            .then_with(|| a.role.cmp(&b.role))
+    });
+
+    if json {
+        let arr: Vec<serde_json::Value> = bots
+            .iter()
+            .map(|b| {
+                let running = bot_running_status_in(&paths.root, &b.workflow_slug, &b.role);
+                serde_json::json!({
+                    "slug": b.workflow_slug,
+                    "role": b.role,
+                    "handle": b.chat_handle.clone().unwrap_or_else(|| b.role.clone()),
+                    "vendor": b.vendor,
+                    "platform": b.im_platform,
+                    "chat_id": b.im_chat_id,
+                    "running": running,
+                    "created_at": b.created_at.to_rfc3339(),
+                })
+            })
+            .collect();
+        return Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "ok": true,
+            "count": arr.len(),
+            "bots": arr,
+        }))?);
+    }
+
+    if bots.is_empty() {
+        return Ok(match filter_slug {
+            Some(s) => format!("no bots registered for slug `{s}`"),
+            None => "no bots registered".to_string(),
+        });
+    }
+
+    // Human-readable table.
+    let mut out = String::new();
+    out.push_str(&format!("{} registered bot(s):\n\n", bots.len()));
+    out.push_str("  SLUG                 ROLE         @HANDLE        PLATFORM   RUNNING\n");
+    out.push_str("  ──────────────────── ──────────── ────────────── ────────── ───────\n");
+    for b in &bots {
+        let handle = b.chat_handle.clone().unwrap_or_else(|| b.role.clone());
+        let running = if bot_running_status_in(&paths.root, &b.workflow_slug, &b.role) {
+            "yes"
+        } else {
+            "no"
+        };
+        out.push_str(&format!(
+            "  {:<20} {:<12} @{:<13} {:<10} {}\n",
+            truncate_col(&b.workflow_slug, 20),
+            truncate_col(&b.role, 12),
+            truncate_col(&handle, 13),
+            truncate_col(&b.im_platform, 10),
+            running,
+        ));
+    }
+    Ok(out)
+}
+
+/// Right-pad/truncate helper for the `list-bots` table — keeps columns
+/// aligned when a slug/handle is longer than its column width.
+fn truncate_col(s: &str, width: usize) -> String {
+    if s.chars().count() > width {
+        let kept: String = s.chars().take(width.saturating_sub(1)).collect();
+        format!("{kept}…")
+    } else {
+        s.to_string()
+    }
+}
+
 /// V0.4.6 F81 — `ccteam remove <slug>` implementation.
 ///
 /// Steps (in order):

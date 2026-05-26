@@ -125,28 +125,31 @@ chat_acl:
 
 不填 ACL = 全开放,生产强烈建议填。
 
-### 5. 注册 4 个 bot
+### 5. 配 1 个 bot token + 注册 4 个角色映射
 
-ccteam V0.6.8 chat-squad bot 走 `chat_register_bot` MCP 注册(每个
-bot 一个独立 Telegram/Slack bot token,在同一群里出现 4 个机器人):
+⚠️ **只要 1 个 Telegram/Slack bot,不是 4 个。** 4 个角色共用群里那
+1 个 bot:入站靠 daemon 解析 `@handle` 文本路由,出站靠 F199
+`from <handle>:` 前缀区分发言者。完整说明 + step-by-step 见
+[USAGE.md §1.2 + §2.5-2.6](./USAGE.md)。
 
 ```bash
-# 方式 A: 通过 /ccteam-im-setup skill
-# 它会向导式带你注册 4 个 bot token
+# (a) token 配一次,存 ~/.ccteam/im/credentials.json(走 /telegram:configure
+#     skill,或手写 {"telegram":{"bot_token":"...","allowed_chat_ids":[...]}})
 
-# 方式 B: 手动每个 bot 跑一次
-ccteam admin register-bot \
-  --slug <project-slug> \
-  --role pm \
-  --chat-handle pm \
-  --platform telegram \
-  --token <pm-bot-token>
+# (b) 注册 4 个角色的路由映射(不碰 token,4 次同一 chat-id):
+SLUG=<project-slug>; CHAT_ID=-1001234567890
+for ROLE in pm dev reviewer ops; do
+  ccteam admin register-bot --slug "$SLUG" --role "$ROLE" \
+    --vendor claude --platform telegram --chat-id="$CHAT_ID" \
+    --chat-handle "$ROLE" --project-dir "$(pwd)"
+done
 
-# 重复 dev / reviewer / ops
+# 确认:
+ccteam admin list-bots --slug "$SLUG"
 ```
 
-(V0.6.8 F202 `ccteam admin register-bot` 是 CLI 端点;`/ccteam-creator`
-skill 可一键注册,实操更顺)
+(V0.6.8 `ccteam admin register-bot` / `list-bots` 是 CLI 端点;
+`register-bot` 不收 token —— token 在 (a) 单独配。)
 
 ### 6. 启动
 
@@ -156,7 +159,8 @@ ccteam start
 ```
 
 ccteam 起 4 个 tmux session(`ccteam-chat-<slug>-{pm,dev,reviewer,ops}`),
-每个绑定一个 IM bot,在 IM 群里待命。
+4 个角色共用群里那 1 个 IM bot(入站 @handle 路由 + 出站 from-prefix),
+在群里待命。
 
 ### 7. 试一下
 
@@ -327,12 +331,12 @@ ccteam 起 4 个 tmux session(`ccteam-chat-<slug>-{pm,dev,reviewer,ops}`),
 | 症状 | 看哪里 |
 |---|---|
 | bot 没回话 | `tmux ls \| grep ccteam-chat`(session 在不?)→ `ccteam doctor` |
-| @-mention 没路由到对的 bot | `ccteam admin ls` 看 chat_handle 注册;F193 路由日志在 `~/.ccteam/logs/imd.log` |
+| @-mention 没路由到对的 bot | `ccteam admin list-bots --slug <slug>` 看 chat_handle 注册;daemon 路由日志在 `ccteam start` 的前台终端 stderr |
 | dev 跑 `gh pr create` 报权限 | `gh auth status` 看 scope;`workflow` scope 缺会卡 `.github/workflows/*.yml` 改动 |
 | backlog 文件写了但 dev 没动 | dev 不被文件 marker 唤醒,**只能靠 @dev**;pm 派活时记得 @dev |
 | ops scan 报"progress.jsonl 缺失" | ccteam orchestrator 没跑,先 `ccteam start` |
 | watchdog timeout(turn 超时) | `chat.turn_timeout_sec` 加大,默认 180s 对大 cargo test 不够 |
-| Telegram 群里 4 个 bot 互不识别 | `ccteam admin ls`;F184 unknown-handle UX 修过,但群 chat_id 填错也会这样 |
+| 群里 @handle 路由不到角色 | `ccteam admin list-bots --slug <slug>`;F184 unknown-handle UX 修过,但群 chat_id 填错也会这样 |
 
 ---
 

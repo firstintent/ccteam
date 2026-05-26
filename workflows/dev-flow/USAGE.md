@@ -58,21 +58,29 @@ pm:             @你 ✓ PR #42 已 merged(dark mode 切换上线了)
 | `git` 2.30+ | worktree 操作 | `git --version` |
 | Claude Code | bot 跑的 harness | `claude --version` |
 
-### 1.2 IM 平台 + 4 个 bot token
+### 1.2 IM 平台 + **1 个** bot token
 
-你要跟 4 个独立 bot 对话 — 每个 bot 一个独立 token,在同一 IM 群
-里出现 4 个机器人头像。
+> **只要 1 个 bot,不是 4 个。** chat-squad 架构是:1 个 Telegram
+> bot 进群,4 个角色(pm/dev/reviewer/ops)靠 daemon 解析消息里的
+> `@handle` 文本路由(入站)+ `from <handle>:` 前缀区分发言者
+> (出站,F199)。群里只有 1 个机器人头像。
+>
+> ccteam credentials 模型(`~/.ccteam/im/credentials.json`)每个平台
+> **只有一个 `bot_token` 槽位** —— 配不了 4 个 token,也不需要。
 
 **Telegram(最推荐,token 申请 60 秒)**:
 
-1. IM 里搜 `@BotFather` → `/newbot` → 起名 → 拿 token
-2. 重复 4 次拿 4 个 token,分别给 pm / dev / reviewer / ops
-3. 把 4 个 bot 都拉进你的目标 IM 群,设成 admin(能读所有消息)
+1. IM 里搜 `@BotFather` → `/newbot` → 起名 → 拿 **1 个** token
+2. 把这 1 个 bot 拉进你的目标 IM 群,设成 admin(群里能读所有消息;
+   私聊不需要)
+3. 关掉 bot 的 privacy mode(`@BotFather` → `/setprivacy` → Disable),
+   否则 bot 收不到没直接 @它 的群消息
 4. 拿群的 `chat_id`(负数,可在 [@RawDataBot](https://t.me/RawDataBot) 拉到)
 
-**Slack**:每个 bot 走独立 Slack App,bot token + bot user OAuth scope `chat:write` `channels:history` `app_mentions:read`。
+**Slack**:1 个 Slack App,bot token(`xoxb-...`)+ OAuth scope
+`chat:write` `channels:history` `app_mentions:read`。
 
-**Discord**:每个 bot 一个独立 Application + Bot,启 `MESSAGE CONTENT INTENT`。
+**Discord**:1 个 Application + Bot,启 `MESSAGE CONTENT INTENT`。
 
 ### 1.3 目标项目 + sibling 隔离
 
@@ -189,83 +197,88 @@ chat:
 progress.jsonl);`.ccteam-worktrees/` 是 dev 临时工作树。**两者
 都不应入 git**。
 
-### 2.5 注册 4 个 bot
+### 2.5 配 IM bot token(一次,跟 register 无关)
 
-每个 bot 一次 `ccteam admin register-bot`。
+token **不在** `register-bot` 命令里 —— 它单独配一次,存
+`~/.ccteam/im/credentials.json`(每平台一个 token 槽位)。
+
+```bash
+# 方式 A:skill 向导(推荐)
+#   在任意 Claude session 里:/telegram:configure → 粘 token
+#   它写 credentials.json + chmod 600 + 校验
+
+# 方式 B:手写
+mkdir -p ~/.ccteam/im
+cat > ~/.ccteam/im/credentials.json <<'EOF'
+{
+  "telegram": {
+    "bot_token": "123456789:ABCdef_your_token_from_botfather",
+    "allowed_chat_ids": ["-1001234567890"]
+  }
+}
+EOF
+chmod 600 ~/.ccteam/im/credentials.json
+```
+
+`allowed_chat_ids` 留空 = 接受 bot 所在任意 chat(生产不推荐)。
+填了就只读这些群 —— 跟 workflow.yaml 的 `chat_acl` 双重保险。
+
+### 2.6 注册 4 个角色的路由映射
+
+这一步**不碰 token**,只往 registry 写 `@handle → (slug, role)` 映射,
+让 daemon 知道群里 `@pm` 该路由给哪个 tmux session。4 次注册用
+**同一个群 chat-id**(它们共享上面那 1 个 bot)。
 
 > **⚠️ Telegram chat_id 是负数**(super-group / channel 形如
-> `-1001234567890`)。ccteam CLI 在 V0.6.8 patch 之前未在
-> `--chat-id` 上声明 `allow_hyphen_values`,负数会被 clap 误认
-> 为 flag → `error: unexpected argument '-1' found`。
-> V0.6.8 patch 起已修;**老版本** workaround:用 `--chat-id=-1001234567890`
-> 等号紧贴形式(不要 `--chat-id "-1001..."` 空格分隔)。
+> `-1001234567890`)。V0.6.8 patch 起 `--chat-id` 已声明
+> `allow_hyphen_values`;**老版本** workaround:用 `--chat-id=-1001234567890`
+> 等号紧贴形式(下方示例已用等号,新老 binary 都吃)。
 
 ```bash
 cd /path/to/your-target-project
 SLUG=$(jq -r '.name' .ccteam/config.json)
 CHAT_ID="-1001234567890"   # 同 workflow.yaml 里的群 chat_id
 
-# pm
-ccteam admin register-bot \
-  --slug "$SLUG" \
-  --role pm \
-  --vendor claude \
-  --platform telegram \
-  --chat-id "$CHAT_ID" \
-  --chat-handle pm \
-  --project-dir "$(pwd)"
-
-# dev
-ccteam admin register-bot \
-  --slug "$SLUG" \
-  --role dev \
-  --vendor claude \
-  --platform telegram \
-  --chat-id "$CHAT_ID" \
-  --chat-handle dev \
-  --project-dir "$(pwd)"
-
-# reviewer
-ccteam admin register-bot \
-  --slug "$SLUG" \
-  --role reviewer \
-  --vendor claude \
-  --platform telegram \
-  --chat-id "$CHAT_ID" \
-  --chat-handle reviewer \
-  --project-dir "$(pwd)"
-
-# ops
-ccteam admin register-bot \
-  --slug "$SLUG" \
-  --role ops \
-  --vendor claude \
-  --platform telegram \
-  --chat-id "$CHAT_ID" \
-  --chat-handle ops \
-  --project-dir "$(pwd)"
+for ROLE in pm dev reviewer ops; do
+  ccteam admin register-bot \
+    --slug "$SLUG" \
+    --role "$ROLE" \
+    --vendor claude \
+    --platform telegram \
+    --chat-id="$CHAT_ID" \
+    --chat-handle "$ROLE" \
+    --project-dir "$(pwd)"
+done
 ```
 
-每个 register-bot 命令之后,ccteam 会让你**把对应 bot 的 token
-粘进 keychain**(走 `ccteam-im-setup` skill 已经接好的安全存储,
-不进 config.json / .env)。
-
-确认 4 个 bot 都注册成功:
+确认 4 个角色都注册成功(三选一):
 
 ```bash
-ccteam admin ls
-# 应该看到 4 行:pm / dev / reviewer / ops,全部 chat_handle 显示
+# 真命令(V0.6.8 patch 起):对齐表格 + @handle + running 状态
+ccteam admin list-bots --slug "$SLUG"
+
+# 零依赖替代(任何 binary):
+ls -1 ~/.ccteam/imd/registry/"$SLUG"/    # 应见 pm.json dev.json reviewer.json ops.json
+
+# 看 handle 映射:
+for f in ~/.ccteam/imd/registry/"$SLUG"/*.json; do
+  jq -r '"\(.role) → @\(.chat_handle)"' "$f"
+done
 ```
 
-### 2.6 启动 ccteam
+### 2.7 启动 ccteam
 
 ```bash
 cd /path/to/your-target-project
 ccteam start
 ```
 
+> `ccteam start` **前台运行**(daemon 就是这个前台进程,日志走本终端
+> stderr)。想后台跑 + 留日志:`ccteam start > ~/ccteam-$SLUG.log 2>&1 &`
+> 或丢进 tmux/screen。
+
 ccteam 起 4 个 tmux session(`ccteam-chat-<slug>-{pm,dev,reviewer,ops}`),
-每个绑定一个 IM bot,在 IM 群里待命。
+4 个角色共用群里那 1 个 IM bot,在群里待命。
 
 **确认在跑**:
 
@@ -654,13 +667,13 @@ ps aux | grep ccteam | grep -v grep
 # Step 2: 4 个 tmux session 都在吗?
 tmux ls | grep "ccteam-chat-$SLUG"
 
-# 缺少哪个 → 试单独重启:
-ccteam start $SLUG --restart-bot <role>   # 如该子命令存在
-# 或:
+# 缺少哪个 → 重启整个 workflow(没有单 bot restart 子命令):
 ccteam stop $SLUG && ccteam start $SLUG
 
-# Step 3: 看 IM bridge log
-tail -100 ~/.ccteam/logs/imd.log | grep -E "$SLUG|ERROR"
+# Step 3: 看 daemon 日志
+# ccteam start 前台跑 → 日志在运行它的那个终端的 stderr。
+# 若你按 §2.7 重定向了:
+#   tail -100 ~/ccteam-$SLUG.log | grep -E "$SLUG|ERROR"
 
 # Step 4: ccteam doctor
 ccteam doctor
@@ -669,7 +682,7 @@ ccteam doctor
 ### 6.2 @-mention 没路由到对的 bot
 
 ```bash
-ccteam admin ls
+ccteam admin list-bots --slug "$SLUG"
 # 应该看到 4 行,chat_handle 全显示
 
 # 用 V0.6.8 F184 unknown-handle UX:
@@ -709,9 +722,15 @@ chat:
 
 ### 6.5 cost 飙升
 
+cost 没有 `ccteam admin cost` CLI。两个查法:
+
+```
+# IM 群里(权威,出 claude: $X / codex: $Y):
+@ccteam cost today
+```
 ```bash
-ccteam admin cost today
-# 看每 bot 当日 USD
+# 直接读 ledger 文件(粗略 24h 总额):
+jq '.' ~/.ccteam/cost-budget.json
 ```
 
 如果某 bot(常见是 dev / reviewer)异常高:
@@ -847,10 +866,17 @@ ccteam 会通过 IM 发 plan 给你 approve/reject。详 F98 / F124。
 加新 agents 段 → register-bot。建议保持 ≤ 8 bot,否则 IM 群里
 @-routing 复杂度上升 + 资源占用线性增长。
 
-### Q5:4 个 bot token 一定要 4 个独立 Telegram bot 吗?
-是的。每个 bot 对应一个独立 IM 身份(头像 / handle / token),这
-样用户在群里看得清谁是谁。**不支持** 1 个 token 多个 handle
-(IM 平台限制,不是 ccteam 限制)。
+### Q5:要 4 个独立 Telegram bot token 吗?
+**不要 —— 只要 1 个。** ccteam credentials 模型每平台只有一个
+`bot_token` 槽位(`~/.ccteam/im/credentials.json`)。4 个角色共用
+群里那 1 个 bot:
+- **入站**:daemon 解析消息文本里的 `@pm`/`@dev`(纯文本 mention,
+  不是 Telegram @username)→ 路由到对应 tmux session
+- **出站**:F199 给回复加 `from pm:` / `from dev:` 前缀,让你在群里
+  分得清谁在说话
+
+所以群里只有 **1 个机器人头像**,角色靠消息前缀区分。`register-bot`
+注册的是路由映射(`@handle → role`),不是 token。
 
 ### Q6:bot 之间能跨 slug @ 吗?
 F183 chat_handle collision 之后可以(`@dev__<other-slug>` 显式跨

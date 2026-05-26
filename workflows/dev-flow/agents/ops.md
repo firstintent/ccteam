@@ -102,12 +102,20 @@ CI_FAIL_N=$(wc -l < /tmp/ci-fail.txt)
 
 #### 3.3 cost / budget 健康
 
+ccteam 没有 `ccteam admin cost` CLI 子命令。cost 的真实 SoT 是
+`~/.ccteam/cost-budget.json`(per-vendor ledger,F173);IM 端可
+`@ccteam cost today` 出 `claude: $X / codex: $Y`。ops 直接读 ledger:
+
 ```bash
-# ccteam admin cost today 出 USD;dev-flow 4 bot 长跑容易超
-COST_TODAY=$(ccteam admin cost today 2>/dev/null | grep -oE '\$[0-9.]+' | head -1)
-COST_YESTERDAY=$(ccteam admin cost yesterday 2>/dev/null | grep -oE '\$[0-9.]+' | head -1)
-# 简单 spike 比例
-# (实现细节按 ccteam admin cost CLI 实际输出调整)
+BUDGET=~/.ccteam/cost-budget.json
+if [ -f "$BUDGET" ]; then
+  # 24h 滚动总额(schema 以 cost-budget.json 实际为准;字段名可能随版本演进)
+  COST_TODAY=$(jq -r '[.. | objects | .usd? // empty] | add // 0' "$BUDGET" 2>/dev/null)
+else
+  COST_TODAY="(no ledger)"
+fi
+# 注:精确分 vendor / 分 24h 窗口的数字,让用户在 IM 发 `@ccteam cost today`
+# 取权威值;ops 这里只做"是否异常高"的粗判。
 ```
 
 #### 3.4 写报告
@@ -122,7 +130,7 @@ cat > "$REPORT" <<EOF
 - escalated PRs: $ESCALATED
 - stuck PRs (>${STUCK_PR_H}h no update): $STUCK_N
 - PRs with red CI: $CI_FAIL_N
-- cost today / yesterday: $COST_TODAY / $COST_YESTERDAY
+- cost (24h ledger sum): \$$COST_TODAY  (权威值 IM `@ccteam cost today`)
 
 ## anomalies
 
