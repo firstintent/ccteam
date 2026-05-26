@@ -100,30 +100,108 @@ async fn kill_is_idempotent_on_missing_session() {
 }
 
 #[tokio::test]
-async fn subscribe_returns_w2_error() {
-    // No tmux required; the W1 stub is a synchronous Err return.
-    let backend: Arc<dyn MuxBackend> = Arc::new(TmuxBackend::new());
-    let id = MuxSessionId::new("does-not-need-to-exist");
-    // `MuxEventStream` is `Pin<Box<dyn Stream>>` which doesn't impl
-    // Debug, so the result can't use `unwrap_err()`; match it.
-    let err = match backend.subscribe(&id).await {
-        Ok(_) => panic!("subscribe should error in W1"),
-        Err(e) => e,
-    };
-    let msg = err.to_string();
-    assert!(
-        msg.contains("W2") || msg.contains("PtyRegistry"),
-        "subscribe error should point to W2 / PtyRegistry: got `{msg}`"
-    );
-}
-
-#[tokio::test]
-async fn register_pattern_w1_stub_is_ok() {
-    // W1 stub returns Ok(()) so adapter code can call it pre-W2.
-    let backend: Arc<dyn MuxBackend> = Arc::new(TmuxBackend::new());
+async fn register_pattern_compiles_and_stores() {
+    // W2b: register_pattern now compiles the regex and stores it in the
+    // per-session matcher consulted by subscribe. A valid regex is Ok;
+    // an invalid one errors loudly. No tmux required (no subscribe).
+    let backend = TmuxBackend::new();
     let id = MuxSessionId::new("any-name");
     backend
         .register_pattern(&id, "claude.idle".into(), r"\[idle\]".into())
         .await
+        .expect("valid regex must register");
+    let err = backend
+        .register_pattern(&id, "bad".into(), r"(unclosed".into())
+        .await;
+    assert!(err.is_err(), "invalid regex must surface a compile error");
+}
+
+#[tokio::test]
+async fn register_base_patterns_loads_claude_tier() {
+    use ccteam_mux::patterns::PatternVendor;
+    // No tmux required — register_base_patterns only touches the
+    // in-memory matcher registry.
+    let backend = TmuxBackend::new();
+    let id = MuxSessionId::new("base-patterns-session");
+    backend
+        .register_base_patterns(&id, PatternVendor::Claude)
+        .await
+        .expect("base patterns must register");
+}
+
+/// Full subscribe integration: spawn a tmux session, register the
+/// Claude base patterns, subscribe, send a line that trips a pattern,
+/// and assert both OutputChunk and PatternMatched arrive on the stream.
+///
+/// Gated `#[ignore]` because it needs a real tmux AND a writable
+/// `~/.ccteam/pty` FIFO dir (the relay invokes `tmux pipe-pane "cat >>
+/// <fifo>"`). Run with `cargo test -p ccteam-mux -- --ignored`.
+#[tokio::test]
+#[ignore = "requires tmux on PATH + writable FIFO dir"]
+async fn subscribe_streams_output_and_fires_pattern() {
+    use ccteam_mux::patterns::PatternVendor;
+    use ccteam_mux::MuxEvent;
+    use futures::StreamExt;
+
+    if skip_if_no_tmux() {
+        return;
+    }
+    let backend = Arc::new(TmuxBackend::new());
+    let session_name = random_session_name("subscribe");
+    // Run an interactive shell so the pane stays alive and echoes.
+    let spec = MuxSessionSpec::new(
+        &session_name,
+        vec!["sh".into(), "-i".into()],
+        PathBuf::from("/tmp"),
+    );
+    let id = backend.spawn(spec).await.expect("spawn");
+
+    // Register a pattern that matches a line we will echo.
+    backend
+        .register_base_patterns(&id, PatternVendor::Claude)
+        .await
         .unwrap();
+    backend
+        .register_pattern(&id, "test.marker".into(), r"CCTEAM-MARKER-(\w+)".into())
+        .await
+        .unwrap();
+
+    let mut stream = backend.subscribe(&id).await.expect("subscribe");
+
+    // Drive output through the pane.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    backend
+        .send_line(&id, "printf 'CCTEAM-MARKER-OK\\n'")
+        .await
+        .unwrap();
+
+    // Collect events for up to 3s; assert we see a chunk + the marker.
+    let mut saw_chunk = false;
+    let mut saw_marker = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(300), stream.next()).await {
+            Ok(Some(MuxEvent::OutputChunk(_))) => saw_chunk = true,
+            Ok(Some(MuxEvent::PatternMatched { regex_id, captured })) => {
+                if regex_id == "test.marker" {
+                    saw_marker = true;
+                    assert_eq!(captured, "OK");
+                }
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => {} // timeout tick — keep polling until deadline
+        }
+        if saw_chunk && saw_marker {
+            break;
+        }
+    }
+
+    // Drop the stream → relay refcount hits 0 → pipe-pane stop + FIFO
+    // unlink (best-effort, in a spawned task).
+    drop(stream);
+    backend.kill(&id).await.unwrap();
+
+    assert!(saw_chunk, "expected at least one OutputChunk");
+    assert!(saw_marker, "expected the registered marker pattern to fire");
 }
