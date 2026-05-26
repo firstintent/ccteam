@@ -735,7 +735,10 @@ enum AdminAction {
         #[arg(long, default_value = "telegram")]
         platform: String,
         /// Platform chat id (Telegram chat_id, Slack channel id, etc.).
-        #[arg(long)]
+        /// `allow_hyphen_values` is required because Telegram super-group /
+        /// channel chat ids are negative integers (e.g. `-1001234567890`);
+        /// without this clap parses `-1...` as an unknown flag.
+        #[arg(long, allow_hyphen_values = true)]
         chat_id: String,
         /// Optional IM mention this bot answers to (without leading
         /// `@`). When omitted, auto-mints an unused scientist nickname

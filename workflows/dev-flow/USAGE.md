@@ -191,7 +191,14 @@ progress.jsonl);`.ccteam-worktrees/` 是 dev 临时工作树。**两者
 
 ### 2.5 注册 4 个 bot
 
-每个 bot 一次 `ccteam admin register-bot`:
+每个 bot 一次 `ccteam admin register-bot`。
+
+> **⚠️ Telegram chat_id 是负数**(super-group / channel 形如
+> `-1001234567890`)。ccteam CLI 在 V0.6.8 patch 之前未在
+> `--chat-id` 上声明 `allow_hyphen_values`,负数会被 clap 误认
+> 为 flag → `error: unexpected argument '-1' found`。
+> V0.6.8 patch 起已修;**老版本** workaround:用 `--chat-id=-1001234567890`
+> 等号紧贴形式(不要 `--chat-id "-1001..."` 空格分隔)。
 
 ```bash
 cd /path/to/your-target-project
