@@ -466,6 +466,8 @@ dependencies = [
  "anyhow",
  "async-trait",
  "futures",
+ "nix 0.29.0",
+ "regex",
  "rmux-client",
  "rmux-proto",
  "rmux-sdk",

@@ -33,6 +33,7 @@ use futures::Stream;
 
 pub mod daemon;
 pub mod inproc_backend;
+pub mod patterns;
 pub mod rmux_backend;
 pub mod tmux_backend;
 pub mod tmux_ops;
@@ -154,8 +155,8 @@ pub enum MuxEvent {
         duration: Duration,
     },
     /// A registered pattern matched. `regex_id` is from the static
-    /// registry (`crates/ccteam-core/src/mux/patterns/{claude,codex}.rs`,
-    /// landing W2b).
+    /// registry ([`crate::patterns`] — `claude.rs` lands W2b; codex
+    /// follows the Codex event catalog).
     PatternMatched {
         regex_id: String,
         captured: String,

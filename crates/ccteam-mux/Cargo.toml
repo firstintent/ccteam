@@ -18,8 +18,14 @@ rmux-proto = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
+regex = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+
+# W2b — the refcounted `tmux pipe-pane` FIFO relay ported out of
+# `ccteam-web::pty` needs `mkfifo` + a 0600 `Mode`. `fs` is the only
+# feature required.
+nix = { version = "0.29", default-features = false, features = ["fs"] }
 
 [dev-dependencies]
 # Bring tokio test runtime helpers into the smoke test. The workspace
