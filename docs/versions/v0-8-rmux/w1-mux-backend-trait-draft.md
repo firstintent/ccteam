@@ -175,13 +175,41 @@ pub trait MuxBackend: Send + Sync {
 | `kill(id)` | `TmuxSession::kill()` |
 | `list_sessions()` | `tmux list-sessions -F '#{session_name}'` (new helper) |
 
-## Open W1 questions for audit subagent to answer
+## Audit-resolved questions(W0 subagent A delivered `w0-tmux-surface-audit.md` 460 lines)
 
-1. Are there `tmux` calls in the workspace outside `tmux.rs` / `pty.rs` / `commands.rs` / `codex_exec.rs`? If yes, those callers also need migration.
-2. Does `claude_tui.rs::ClaudeTuiAdapter` use `TmuxSession` directly or via a wrapper? (1118 LOC — many touch points expected)
-3. Does any test rely on directly spawning `tmux` and not going through `TmuxSession` abstraction? Those need separate handling.
-4. Is `CCTEAM_TMUX_BIN` env override referenced anywhere besides `Command::new("tmux")` callsites? If yes, the trait needs an analog (`CCTEAM_MUX_BACKEND=rmux` is our equivalent).
-5. The current `start_with_env` API takes `env: &[(&str, &str)]` for `tmux -e KEY=VAL` flags. Does rmux SDK's `ProcessSpec` support per-session env? (verify: yes, via `ProcessSpec::env_vars`)
+1. Q: tmux callers outside `tmux.rs`/`pty.rs`/`commands.rs`/`codex_exec.rs`? — **A: also `screenshot.rs`, `web/src/routes/pty_ws.rs`, `web/src/routes/pane_snapshot.rs`, `projects.rs`. All inventoried in §3 of audit.**
+2. Q: `claude_tui.rs` use TmuxSession directly? — **A: yes, 5 `from_name` sites + ~15 method calls; F164 reattach + F172 V2 `--resume` paths both depend on `list_pane_pids` for liveness check.**
+3. Q: Tests bypass TmuxSession? — **A: yes, ~16 test `Command::new("tmux")` sites including a `base-index 1` regression guard that pins the bare-name target convention. Audit §5 categorizes mock-suitable vs real-tmux-required.**
+4. Q: `CCTEAM_TMUX_BIN` env override exists? — **A: NO, it does not exist. CLAUDE.md §六 was incorrect. `tmux` is hardcoded in all 17 production sites. The V0.8 W1 migration to trait + `CCTEAM_MUX_BACKEND` will be the FIRST env-driven dispatch — there is no current behavior to preserve.**
+5. Q: rmux ProcessSpec env? — **A: yes, `ProcessSpec.environment: Option<Vec<String>>` accepts `NAME=VAL` strings. Verified at `references/rmux/crates/rmux-sdk/src/spec.rs:61`.**
+
+## Audit-driven trait deltas (vs the draft above)
+
+Adopted into the trait (W1 implementation will use these):
+
+1. **+ `resize(h, cols, rows)`** — production caller exists (`pty_ws::resize_window` for browser xterm.js geometry), research draft missed it
+2. **+ `list_pane_pids(h) -> Vec<u32>`** — F164 reattach + `claude_tui_resume_test.rs` consume directly; even if rmux abstracts "pane", "child process PIDs in this session" is a load-bearing signal for vendor-aware liveness checks
+3. **`pane_pid(h)` retained as distinct method** — research draft proposed handle.pid field at spawn; insufficient because `is_alive` re-queries the *current* live PID which may drift on internal respawn
+4. **`pane_dims(h) -> Option<(u16,u16)>`** — `Option` (research had unwrapped) — screenshot fallback to 80×24 needs `None` branch
+5. **Drop `capture_pane_tail` String form** — zero production callers; consolidate to `capture(h, lines, ansi=false) → Vec<u8>` only
+6. **Interactive `attach` is NOT on the trait** — terminal handover doesn't fit async. Provide a free fn `mux::interactive_attach_argv(backend, name) -> Vec<String>` returning argv for the CLI to spawn via blocking `Command::status()` on its own tty
+7. **`is_alive(h, expected_pid)` is a default-method composite** on the trait, calling `exists` + `pane_pid` + external `pid_is_alive`
+8. **`pid_is_alive(pid)` (`kill -0`) stays outside the trait** — OS-level not mux-level; free fn in `mux::util`
+9. **Three target-string formats** observed in workspace — bare name (canonical, base-index-safe), `<session>:0.0` (web pipe-pane + pty_ws), `<session>:0` (broken — test guarded against). RmuxBackend impl uses opaque SessionId so this asymmetry disappears
+10. **F56 web SSE pipe-pane refcount + FIFO** behavior — `PtySession::bring_up` does mkfifo + cleanup-then-start `pipe-pane`. **Refcount + FIFO bookkeeping moves INSIDE the trait impl**'s `subscribe()` method; trait API exposes only `MuxEventStream`, drop = unsubscribe (decrement refcount), teardown when refcount hits 0
+
+## Direct-caller migration list (audit §3.3 + §4)
+
+These 4 sites bypass `TmuxSession` today and need their own refactor in W1:
+
+| Site | file:line | tmux call | After W1 |
+|---|---|---|---|
+| `commands::run_attach` | cli/src/commands.rs:1556 | `tmux attach -t <name>` | call `mux::interactive_attach_argv(&backend, name)` → spawn |
+| `commands::run_peek` | cli/src/commands.rs:1710 | `tmux capture-pane -p -t <name>` | `backend.capture(h, 1000, false).await` |
+| `pty.rs::PtySession::{bring_up,tear_down}` | web/src/pty.rs:153,163,185 | `tmux pipe-pane …` 3 sites | `backend.subscribe(h).await` |
+| `pty_ws::send_keys + resize_window` | web/src/routes/pty_ws.rs:221,241 | `tmux send-keys`, `tmux resize-window` | `backend.send_text(h, …)` + `backend.resize(h, cols, rows)` |
+| `codex_exec::send_codex_quit_keys` | core/src/execution/codex_exec.rs:732,741 | 2 raw `tmux send-keys` | refactor to use `backend.send_text("q") + backend.send_enter()` |
+| `commands::run_doctor` | cli/src/commands.rs:205 | inline `tmux -V` | use `backend.probe() -> Result<()>` (new associated/static fn) |
 
 ## Acceptance for W1
 
