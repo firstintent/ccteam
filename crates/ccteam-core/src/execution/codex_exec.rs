@@ -52,7 +52,11 @@ use crate::harness::{
     ThreadItem, ThreadItemDetails, TurnId, TurnInput, UnifiedTokenUsage, CODEX_STATUS_MARKER,
 };
 use crate::paths::CcteamPaths;
-use crate::tmux::{session_name_for_slug, TmuxSession};
+// `session_name_for_slug` is a pure string helper (NOT a tmux call) —
+// sourced directly from the mux crate's `tmux_ops` so this module has
+// zero `crate::tmux` coupling (V0.8 W2c).
+use ccteam_mux::tmux_ops::session_name_for_slug;
+use ccteam_mux::{default_backend, MuxBackend, MuxSessionId, MuxSessionKind, MuxSessionSpec};
 
 /// Per-thread event broadcast buffer. Codex bursts items per turn so
 /// 256 lines of headroom is comfortable for a single subscriber.
@@ -209,38 +213,39 @@ impl HarnessAdapter for CodexExecAdapter {
             .trim_start_matches('-')
             .to_string();
 
+        // V0.8 W2c — route the container lifecycle through the MuxBackend
+        // trait (default = TmuxBackend; behavior unchanged vs V0.6.x).
+        // The inner ops are now async, so the V0.6.x `spawn_blocking`
+        // wrapper is removed — the composite is short and the trait calls
+        // already bridge to off-runtime work where it matters.
         let session_name = tmux_session.clone();
-        let cwd = ctx.cwd.clone();
-        let extra_args = ctx.extra_args.clone();
-        let sid = ctx.sid.clone();
-
-        let result =
-            tokio::task::spawn_blocking(move || -> Result<(String, Option<u32>), HarnessError> {
-                let session = TmuxSession::from_name(session_name.clone());
-                if session.exists() {
-                    return Err(HarnessError::SpawnFailed(format!(
-                        "tmux session already exists: {session_name} \
-                     (sid collision; F49 next_sid_seq accounting drifted)"
-                    )));
-                }
-                let mut argv: Vec<String> = vec!["codex".to_string()];
-                argv.extend(extra_args.iter().cloned());
-                let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-                session.start(&cwd, &argv_refs).map_err(|err| {
-                    HarnessError::SpawnFailed(format!("tmux new-session: {err:#}"))
-                })?;
-                let pid = session
-                    .pane_pid()
-                    .ok()
-                    .flatten()
-                    .and_then(|n| u32::try_from(n).ok());
-                CodexExecAdapter::write_initial_state(&sid, pid);
-                Ok((session_name, pid))
-            })
+        let backend = default_backend();
+        let id = MuxSessionId::new(session_name.clone());
+        if backend
+            .exists(&id)
             .await
-            .map_err(|err| HarnessError::SpawnFailed(format!("join blocking spawn: {err}")))??;
-
-        let (session_name, pid) = result;
+            .map_err(|err| HarnessError::SpawnFailed(format!("mux exists: {err}")))?
+        {
+            return Err(HarnessError::SpawnFailed(format!(
+                "tmux session already exists: {session_name} \
+                 (sid collision; F49 next_sid_seq accounting drifted)"
+            )));
+        }
+        let mut argv: Vec<String> = vec!["codex".to_string()];
+        argv.extend(ctx.extra_args.iter().cloned());
+        let spec = MuxSessionSpec::new(session_name.clone(), argv, ctx.cwd.clone())
+            .with_kind(MuxSessionKind::LongLived);
+        backend
+            .spawn(spec)
+            .await
+            .map_err(|err| HarnessError::SpawnFailed(format!("tmux new-session: {err:#}")))?;
+        let pid = backend
+            .pane_pid(&id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|n| u32::try_from(n).ok());
+        CodexExecAdapter::write_initial_state(&ctx.sid, pid);
         let mut extras = serde_json::json!({ "tmux_session": session_name });
         if let Some(pid_val) = pid {
             extras["pid"] = serde_json::json!(pid_val);
@@ -494,30 +499,40 @@ impl HarnessAdapter for CodexExecAdapter {
     }
 
     async fn close_thread(&self, h: &ThreadHandle) -> Result<(), HarnessError> {
+        // V0.8 W2c — route through the MuxBackend trait (default =
+        // TmuxBackend; behavior unchanged vs V0.6.x). The inner ops are
+        // now async trait calls, so the V0.6.x `spawn_blocking` wrapper
+        // is removed. Sequence preserved: exists → quit-keys → 500ms
+        // grace → exists → kill.
         let session_name = h.identity.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), HarnessError> {
-            let session = TmuxSession::from_name(session_name.clone());
-            if !session.exists() {
-                return Ok(());
-            }
-            if let Err(err) = send_codex_quit_keys(&session_name) {
-                tracing::warn!(
-                    error = %err,
-                    session = %session_name,
-                    "CodexExecAdapter::close_thread: send-keys q failed; falling through to \
-                     tmux kill-session",
-                );
-            }
-            std::thread::sleep(Duration::from_millis(500));
-            if session.exists() {
-                session.kill().map_err(|err| {
-                    HarnessError::ShutdownFailed(format!("tmux kill-session: {err:#}"))
-                })?;
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|err| HarnessError::ShutdownFailed(format!("join blocking close: {err}")))?
+        let backend = default_backend();
+        let id = MuxSessionId::new(session_name.clone());
+        if !backend
+            .exists(&id)
+            .await
+            .map_err(|err| HarnessError::ShutdownFailed(format!("mux exists: {err:#}")))?
+        {
+            return Ok(());
+        }
+        if let Err(err) = send_codex_quit_keys(&*backend, &id).await {
+            tracing::warn!(
+                error = %err,
+                session = %session_name,
+                "CodexExecAdapter::close_thread: send-keys q failed; falling through to \
+                 tmux kill-session",
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if backend
+            .exists(&id)
+            .await
+            .map_err(|err| HarnessError::ShutdownFailed(format!("mux exists: {err:#}")))?
+        {
+            backend.kill(&id).await.map_err(|err| {
+                HarnessError::ShutdownFailed(format!("tmux kill-session: {err:#}"))
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -726,21 +741,21 @@ fn parse_jsonl_item(item: &Value) -> ThreadItem {
     ThreadItem { id, details }
 }
 
-/// Send `q` + Enter to the named tmux session — codex's standard
-/// quit keybinding.
+/// Send `q` + Enter to the session — codex's standard quit keybinding.
 ///
-/// V0.8 W1 — routes through the same `tmux_ops::TmuxSession` primitives
-/// that back `ccteam_mux::TmuxBackend::send_text/send_enter`. The
-/// behavior is identical to the legacy raw `Command::new("tmux")` form
-/// but inherits the `-l --` literal-mode separator (audit §4-J) for
-/// free, removing a class of payload-starts-with-dash bug.
-fn send_codex_quit_keys(tmux_session: &str) -> std::io::Result<()> {
-    let session = TmuxSession::from_name(tmux_session);
-    session
-        .send_keys_literal("q")
+/// V0.8 W2c — routes through the `MuxBackend` trait (`send_text` +
+/// `send_enter`, default = TmuxBackend). The behavior is identical to
+/// the legacy raw tmux-CLI form but inherits the `-l --` literal-mode
+/// separator (audit §4-J) for free, removing a class of
+/// payload-starts-with-dash bug.
+async fn send_codex_quit_keys(backend: &dyn MuxBackend, id: &MuxSessionId) -> std::io::Result<()> {
+    backend
+        .send_text(id, "q")
+        .await
         .map_err(|e| std::io::Error::other(format!("tmux send-keys -l q: {e:#}")))?;
-    session
-        .send_keys_enter()
+    backend
+        .send_enter(id)
+        .await
         .map_err(|e| std::io::Error::other(format!("tmux send-keys Enter: {e:#}")))?;
     Ok(())
 }
