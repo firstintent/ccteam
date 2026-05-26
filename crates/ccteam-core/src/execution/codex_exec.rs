@@ -29,7 +29,7 @@
 //!   deterministic JSONL. Used by `tests/codex_exec_test.rs`.
 
 use std::collections::HashMap;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -728,25 +728,20 @@ fn parse_jsonl_item(item: &Value) -> ThreadItem {
 
 /// Send `q` + Enter to the named tmux session — codex's standard
 /// quit keybinding.
+///
+/// V0.8 W1 — routes through the same `tmux_ops::TmuxSession` primitives
+/// that back `ccteam_mux::TmuxBackend::send_text/send_enter`. The
+/// behavior is identical to the legacy raw `Command::new("tmux")` form
+/// but inherits the `-l --` literal-mode separator (audit §4-J) for
+/// free, removing a class of payload-starts-with-dash bug.
 fn send_codex_quit_keys(tmux_session: &str) -> std::io::Result<()> {
-    let send_lit = Command::new("tmux")
-        .args(["send-keys", "-t", tmux_session, "-l", "--", "q"])
-        .output()?;
-    if !send_lit.status.success() {
-        return Err(std::io::Error::other(format!(
-            "tmux send-keys -l q: {}",
-            String::from_utf8_lossy(&send_lit.stderr)
-        )));
-    }
-    let send_enter = Command::new("tmux")
-        .args(["send-keys", "-t", tmux_session, "Enter"])
-        .output()?;
-    if !send_enter.status.success() {
-        return Err(std::io::Error::other(format!(
-            "tmux send-keys Enter: {}",
-            String::from_utf8_lossy(&send_enter.stderr)
-        )));
-    }
+    let session = TmuxSession::from_name(tmux_session);
+    session
+        .send_keys_literal("q")
+        .map_err(|e| std::io::Error::other(format!("tmux send-keys -l q: {e:#}")))?;
+    session
+        .send_keys_enter()
+        .map_err(|e| std::io::Error::other(format!("tmux send-keys Enter: {e:#}")))?;
     Ok(())
 }
 
