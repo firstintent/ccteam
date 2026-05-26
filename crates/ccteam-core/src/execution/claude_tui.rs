@@ -45,6 +45,7 @@ use notify::{EventKind, RecursiveMode, Watcher};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
+use crate::execution::process_inspect::pane_runs_process;
 use crate::execution::transcript_tail::{
     self, active_session_id_path, anthropic_project_dir, cursor_path, encode_project_cwd,
     PendingTools, TranscriptCursor,
@@ -54,7 +55,7 @@ use crate::harness::{
     AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx,
     ThreadEvent, ThreadHandle, TurnId, TurnInput, CLAUDE_BIN_ENV,
 };
-use crate::tmux::TmuxSession;
+use ccteam_mux::{default_backend, MuxSessionId, MuxSessionKind, MuxSessionSpec};
 
 /// V0.6.0 F108 [`HarnessAdapter`] for Claude Code TUI (long-running tmux
 /// session, multi-turn with context reuse).
@@ -146,50 +147,79 @@ fn claude_bin() -> String {
     std::env::var(CLAUDE_BIN_ENV).unwrap_or_else(|_| "claude".to_string())
 }
 
-/// Build the env var pairs forwarded into the tmux session at spawn so
+/// Build the env var pairs forwarded into the mux session at spawn so
 /// the Claude Code hook subprocess can derive role/slug. The hook reads
 /// `CCTEAM_CHAT_ROLE` via `std::env::var`; without these the hook's
 /// `derive_role_from_payload` falls back to `None` and every chat-mode
 /// progress event ships with `role=""`.
-fn chat_spawn_env<'a>(role: &'a str, slug: &'a str) -> Vec<(&'static str, &'a str)> {
-    vec![("CCTEAM_CHAT_ROLE", role), ("CCTEAM_CHAT_SLUG", slug)]
+///
+/// V0.8 W2c — returns owned `(String, String)` pairs to feed
+/// [`MuxSessionSpec::env`] directly (the trait spec owns its env, no
+/// borrow plumbing).
+fn chat_spawn_env_owned(role: &str, slug: &str) -> Vec<(String, String)> {
+    vec![
+        ("CCTEAM_CHAT_ROLE".to_string(), role.to_string()),
+        ("CCTEAM_CHAT_SLUG".to_string(), slug.to_string()),
+    ]
 }
 
-/// F164 — Probe whether a tmux session's pane process looks like a
+/// F164 — Probe whether a chat session's pane process looks like a
 /// running `claude` process.
 ///
-/// Algorithm (no pane content read — red line compliant):
-/// 1. `tmux list-panes -F "#{pane_pid}"` → get pane PID(s).
-/// 2. For each PID: `ps -p <pid> -o comm=` to read the command name.
-/// 3. Accept if the `comm` field **contains** the string "claude"
-///    (covers `claude`, `claude-code`, etc.).
-///
-/// Returns `false` when the session has no panes, all pids are gone,
-/// or none match. Does **not** read pane text content.
-fn is_pane_running_claude(session: &TmuxSession) -> bool {
-    let pids = session.list_pane_pids();
-    if pids.is_empty() {
-        return false;
-    }
-    for pid in pids {
-        if pid == 0 {
-            continue;
-        }
-        let Ok(output) = std::process::Command::new("ps")
-            .args(["-p", &pid.to_string(), "-o", "comm="])
-            .output()
-        else {
-            continue;
-        };
-        if !output.status.success() {
-            continue;
-        }
-        let comm = String::from_utf8_lossy(&output.stdout);
-        if comm.trim().contains("claude") {
-            return true;
-        }
-    }
-    false
+/// V0.8 W2c — thin async wrapper over the shared
+/// [`pane_runs_process`] helper with needle `"claude"`. Goes through the
+/// `MuxBackend` trait for pane PID enumeration; the `ps -o comm=` read
+/// stays OS-level. Red-line compliant (reads process command name, never
+/// pane text content). Probe errors (backend query failure) degrade to
+/// `false` — a session we can't probe is treated as not-alive, which
+/// routes start_thread to the safe recreate path.
+async fn pane_runs_claude(backend: &dyn ccteam_mux::MuxBackend, id: &MuxSessionId) -> bool {
+    pane_runs_process(backend, id, "claude")
+        .await
+        .unwrap_or(false)
+}
+
+/// V0.8 W2c — `MuxSessionSpec` for the dead-pane recreate path: relaunch
+/// `claude --resume <session_id_name>` so Claude reloads the prior
+/// session jsonl (lossless context restore via Anthropic's own CLI).
+fn spec_for_resume(role: &str, slug: &str, cwd: &Path, session_id_name: &str) -> MuxSessionSpec {
+    MuxSessionSpec::new(
+        chat_session_name(slug, role),
+        vec![
+            claude_bin(),
+            "--dangerously-skip-permissions".to_string(),
+            "--resume".to_string(),
+            session_id_name.to_string(),
+        ],
+        cwd.to_path_buf(),
+    )
+    .with_env(chat_spawn_env_owned(role, slug))
+    .with_kind(MuxSessionKind::LongLived)
+}
+
+/// V0.8 W2c — `MuxSessionSpec` for the `--resume` failure fallback: fresh
+/// `claude --name <session_id_name>` (no context carry-over; pairs with
+/// the `chat_session_reset` event the caller emits).
+fn spec_for_fresh(role: &str, slug: &str, cwd: &Path, session_id_name: &str) -> MuxSessionSpec {
+    spec_for_new(role, slug, cwd, session_id_name)
+}
+
+/// V0.8 W2c — `MuxSessionSpec` for the brand-new (session-absent) path:
+/// `claude --name <session_id_name>` so Anthropic files the session jsonl
+/// under a deterministic name, enabling future recreate-path `--resume`.
+fn spec_for_new(role: &str, slug: &str, cwd: &Path, session_id_name: &str) -> MuxSessionSpec {
+    MuxSessionSpec::new(
+        chat_session_name(slug, role),
+        vec![
+            claude_bin(),
+            "--dangerously-skip-permissions".to_string(),
+            "--name".to_string(),
+            session_id_name.to_string(),
+        ],
+        cwd.to_path_buf(),
+    )
+    .with_env(chat_spawn_env_owned(role, slug))
+    .with_kind(MuxSessionKind::LongLived)
 }
 
 fn ccteam_bin_for_hooks() -> String {
@@ -249,18 +279,26 @@ impl HarnessAdapter for ClaudeTuiAdapter {
         //       长 session" red line), then fall through to new-session.
         //    c) Session absent → normal new-session path.
         let session_name = chat_session_name(&ctx.slug, &spec.role);
-        let session = TmuxSession::from_name(session_name.clone());
+        // V0.8 W2c — route all session lifecycle through the MuxBackend
+        // trait (default = TmuxBackend, behavior unchanged vs V0.6.x).
+        // Hold the backend once; pass `&*backend` to the liveness probe.
+        let backend = default_backend();
+        let id = MuxSessionId::new(session_name.clone());
 
         // V0.6.6 F172 V2 — deterministic Anthropic `--name` / `--resume`
         // identifier so the dead-pane recreate path can ask Claude itself
         // to reload the prior session jsonl (lossless context restore
         // via Anthropic's own CLI surface; R10 守).
         let session_id_name = chat_session_id_name(&ctx.slug, &spec.role);
-        if session.exists() {
-            if is_pane_running_claude(&session) {
+        if backend
+            .exists(&id)
+            .await
+            .map_err(|e| HarnessError::SpawnFailed(format!("mux exists: {e}")))?
+        {
+            if pane_runs_claude(&*backend, &id).await {
                 // (a) Alive & healthy — reattach. F164 path; F172 V2 must
                 // **not** touch this code path (no spawn → no argv change).
-                let pids = session.list_pane_pids();
+                let pids = backend.list_pane_pids(&id).await.unwrap_or_default();
                 let pane_pid = pids.first().copied();
                 tracing::info!(
                     event = "session_reattached",
@@ -278,7 +316,7 @@ impl HarnessAdapter for ClaudeTuiAdapter {
                 // emitting `chat_session_reset` with a reason so the
                 // user-visible bot context loss is explicit (no silent
                 // synthesis — R3 / R10 守).
-                let pids = session.list_pane_pids();
+                let pids = backend.list_pane_pids(&id).await.unwrap_or_default();
                 let old_pane_pid = pids.first().copied();
                 tracing::info!(
                     event = "session_recreated",
@@ -288,20 +326,19 @@ impl HarnessAdapter for ClaudeTuiAdapter {
                     old_pane_pid = ?old_pane_pid,
                     "claude-tui: killing stale tmux session (dead pane), recreating via --resume"
                 );
-                session
-                    .kill()
-                    .map_err(|e| HarnessError::SpawnFailed(format!("tmux kill stale: {e}")))?;
-                let bin = claude_bin();
-                let argv: Vec<&str> = vec![
-                    &bin,
-                    "--dangerously-skip-permissions",
-                    "--resume",
-                    &session_id_name,
-                ];
-                let env = chat_spawn_env(&spec.role, &ctx.slug);
-                session
-                    .start_with_env(&ctx.cwd, &argv, &env)
-                    .map_err(|e| HarnessError::SpawnFailed(format!("tmux start: {e}")))?;
+                backend
+                    .kill(&id)
+                    .await
+                    .map_err(|e| HarnessError::SpawnFailed(format!("mux kill stale: {e}")))?;
+                backend
+                    .spawn(spec_for_resume(
+                        &spec.role,
+                        &ctx.slug,
+                        &ctx.cwd,
+                        &session_id_name,
+                    ))
+                    .await
+                    .map_err(|e| HarnessError::SpawnFailed(format!("mux spawn resume: {e}")))?;
 
                 // Detect `--resume` failure: claude exits non-zero quickly
                 // if the named session jsonl can't be loaded. Give the
@@ -310,7 +347,7 @@ impl HarnessAdapter for ClaudeTuiAdapter {
                 // claude's startup + first jsonl read + exit on failure,
                 // while staying well under user-perceptible latency.
                 tokio::time::sleep(Duration::from_millis(400)).await;
-                if !is_pane_running_claude(&session) {
+                if !pane_runs_claude(&*backend, &id).await {
                     tracing::info!(
                         event = "session_resume_failed_fallback",
                         session = %session_name,
@@ -321,17 +358,16 @@ impl HarnessAdapter for ClaudeTuiAdapter {
                     // Kill the dead pane's tmux session shell (still
                     // exists with remain-on-exit / pane-dead state) and
                     // re-spawn fresh.
-                    let _ = session.kill();
-                    let fresh_argv: Vec<&str> = vec![
-                        &bin,
-                        "--dangerously-skip-permissions",
-                        "--name",
-                        &session_id_name,
-                    ];
-                    let env = chat_spawn_env(&spec.role, &ctx.slug);
-                    session
-                        .start_with_env(&ctx.cwd, &fresh_argv, &env)
-                        .map_err(|e| HarnessError::SpawnFailed(format!("tmux start fresh: {e}")))?;
+                    let _ = backend.kill(&id).await;
+                    backend
+                        .spawn(spec_for_fresh(
+                            &spec.role,
+                            &ctx.slug,
+                            &ctx.cwd,
+                            &session_id_name,
+                        ))
+                        .await
+                        .map_err(|e| HarnessError::SpawnFailed(format!("mux spawn fresh: {e}")))?;
                     // Best-effort emit `chat_session_reset` with
                     // explicit reason so IM / web surfaces show the
                     // user "context was lost". Path resolution honours
@@ -358,17 +394,15 @@ impl HarnessAdapter for ClaudeTuiAdapter {
             // recreate-path `--resume`. F118 brand-new spawn recovery
             // path is unchanged (operates on turns.jsonl, not Anthropic
             // session jsonl).
-            let bin = claude_bin();
-            let argv: Vec<&str> = vec![
-                &bin,
-                "--dangerously-skip-permissions",
-                "--name",
-                &session_id_name,
-            ];
-            let env = chat_spawn_env(&spec.role, &ctx.slug);
-            session
-                .start_with_env(&ctx.cwd, &argv, &env)
-                .map_err(|e| HarnessError::SpawnFailed(format!("tmux start: {e}")))?;
+            backend
+                .spawn(spec_for_new(
+                    &spec.role,
+                    &ctx.slug,
+                    &ctx.cwd,
+                    &session_id_name,
+                ))
+                .await
+                .map_err(|e| HarnessError::SpawnFailed(format!("mux spawn new: {e}")))?;
         }
 
         // 4. Heartbeat file — lightweight liveness marker the imd watch
@@ -403,8 +437,13 @@ impl HarnessAdapter for ClaudeTuiAdapter {
         h: &ThreadHandle,
         input: TurnInput,
     ) -> Result<TurnId, HarnessError> {
-        let session = TmuxSession::from_name(h.identity.clone());
-        if !session.exists() {
+        let backend = default_backend();
+        let id = MuxSessionId::new(h.identity.clone());
+        if !backend
+            .exists(&id)
+            .await
+            .map_err(|e| HarnessError::SubmitFailed(format!("mux exists: {e}")))?
+        {
             return Err(HarnessError::SubmitFailed(format!(
                 "tmux session missing: {} (resume_thread first)",
                 h.identity
@@ -433,12 +472,14 @@ impl HarnessAdapter for ClaudeTuiAdapter {
             }
         };
         let sendkeys_t0 = std::time::Instant::now();
-        session
-            .send_keys_literal(&text)
+        backend
+            .send_text(&id, &text)
+            .await
             .map_err(|e| HarnessError::SubmitFailed(format!("send_keys -l: {e}")))?;
         let literal_ms = sendkeys_t0.elapsed().as_millis() as u64;
-        session
-            .send_keys_enter()
+        backend
+            .send_enter(&id)
+            .await
             .map_err(|e| HarnessError::SubmitFailed(format!("send_keys Enter: {e}")))?;
         let total_ms = sendkeys_t0.elapsed().as_millis() as u64;
         // Synthesize a turn id from the wall clock + a short random
@@ -520,8 +561,13 @@ impl HarnessAdapter for ClaudeTuiAdapter {
         // (`ccteam-chat-<slug>-<role>`). If it's live, hand back a
         // handle pointing at it; otherwise we cannot rebuild without
         // the SpawnCtx (caller falls back to start_thread + recovery).
-        let session = TmuxSession::from_name(persistent_id.to_string());
-        if !session.exists() {
+        let backend = default_backend();
+        let id = MuxSessionId::new(persistent_id.to_string());
+        if !backend
+            .exists(&id)
+            .await
+            .map_err(|e| HarnessError::SpawnFailed(format!("mux exists: {e}")))?
+        {
             return Err(HarnessError::NotImplemented {
                 reason: format!(
                     "resume_thread requires a live tmux session ({persistent_id} not found); \
@@ -543,17 +589,23 @@ impl HarnessAdapter for ClaudeTuiAdapter {
     }
 
     async fn close_thread(&self, h: &ThreadHandle) -> Result<(), HarnessError> {
-        let session = TmuxSession::from_name(h.identity.clone());
-        if !session.exists() {
+        let backend = default_backend();
+        let id = MuxSessionId::new(h.identity.clone());
+        if !backend
+            .exists(&id)
+            .await
+            .map_err(|e| HarnessError::ShutdownFailed(format!("mux exists: {e}")))?
+        {
             return Ok(());
         }
         // Send `/exit` so Claude shuts down cleanly + writes any pending
         // transcript line; then SIGTERM via tmux kill-session.
-        let _ = session.send_keys_literal("/exit");
-        let _ = session.send_keys_enter();
+        let _ = backend.send_text(&id, "/exit").await;
+        let _ = backend.send_enter(&id).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
-        session
-            .kill()
+        backend
+            .kill(&id)
+            .await
             .map_err(|e| HarnessError::ShutdownFailed(format!("tmux kill-session: {e}")))?;
         Ok(())
     }
