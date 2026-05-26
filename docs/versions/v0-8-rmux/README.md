@@ -30,4 +30,22 @@
 
 ## Open log
 
-(Append entries here as waves progress.)
+### W0 — completed deliverables
+
+- `w0-tmux-surface-audit.md` (460 lines, subagent A) — 11 tmux subcommands, 4 direct callers bypass `TmuxSession`, `CCTEAM_TMUX_BIN` does NOT exist (CLAUDE.md §六 outdated), 10 trait deltas vs research §四 draft
+- `w3b-codex-event-catalog.md` (484 lines, subagent C) — 50 Codex notifications + 10 blocking HITL requests inventoried
+- Design notes: `w1-mux-backend-trait-draft.md`, `w2-daemon-spawn-protocol.md`, `w4-enriched-event-merger.md`, `w6-hook-reroute-design.md`
+
+### W4 must-fix defects (discovered by W0 audit)
+
+Filed as part of V0.8 W4 Codex rework (not separate V0.6.x patches — W4 redoes the backend):
+
+1. **Missing `initialize` handshake** — `crates/ccteam-core/src/execution/codex_app_server.rs` doc-comment claims handshake exists but the call is absent. `experimental_api` ends up `false`, silently filtering ~30% of Codex notifications including `turn/plan/updated` (the headline plan-tree event for HITL F124).
+
+2. **Dead `"item/updated"` match arm** at `codex_app_server.rs:525-527` — mode-3 protocol has no such method; arm never fires.
+
+3. **Dead `"turn/failed"` match arm** at `codex_app_server.rs:504` — wire name is actually `"error"`. ccteam may be silently dropping all Codex turn failures into the `warn_unknown_vendor_token` skip path.
+
+### W3b unhandled critical path
+
+ccteam currently handles ZERO of the 10 server→client requests Codex sends that BLOCK turn progress (sandbox-violation HITL, etc.). W3b lands the request handler dispatch + response routing.
