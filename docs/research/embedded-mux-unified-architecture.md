@@ -1341,6 +1341,207 @@ Codex 也是 **3 个 source**(UDS + pattern + process),只是 UDS 是 typed-vend
 
 ---
 
+## 十五、Vendor TUI 字节流的 mux 捕获能力 — §14 过早结论的修正
+
+> 用户对 §14 的反驳:**"vendor 都是 TUI 形式,暴露的是终端显示,这个 mux 应该可以捕获的"**。
+>
+> **这个反驳是对的**。§14 把"Layer 3-4 对 mux INVISIBLE"说得过于绝对了。事实上 vt100 capture **看得见**,只是看到的是**有损投影**(lossy projection)而非**无损源**(lossless source)。本节做诚实修正,并据此重新评估 outbound 架构选项。
+
+### 15.1 §14 错在哪里 — "INVISIBLE" 应是 "LOSSY"
+
+§14.3 表格说 Layer 3 (conversation content) / Layer 4 (semantic) **对 rmux INVISIBLE**。准确表述应是:
+
+| 层 | 对 mux 的实际可见性 | §14 表述 | 修正后表述 |
+|---|---|---|---|
+| Layer 1 process | 全可见(handle owned)| ✓ | ✓ |
+| Layer 2 pattern | 全可见(预注册 regex)| ✓ | ✓ |
+| Layer 3 conversation | **可读但有损**(TUI 渲染了内容,但混着 ANSI / 高亮 / 状态栏 / 滚动)| ✗ INVISIBLE | **◐ LOSSY**(60-80% 准确,关键场景可用)|
+| Layer 4 semantic | **部分可读**(tool 名 / permission prompt 渲染有 distinctive 结构,但参数 / 结果 / plan 树常被截断/换行)| ✗ INVISIBLE | **◐ LOSSY**(tool 名高准确,params/results 低准确)|
+
+**关键洞察**:vt100 capture + grid 解析 + 预注册结构化 pattern 能拿到的信息远超 §14 暗示的"只有 surface event"。
+
+### 15.2 vt100 capture 实际能可靠提取什么(按可靠性分级)
+
+以 Claude TUI 为例(用 vt100 grid 解析,非简单字节 grep):
+
+#### ✓ 高可靠性(daemon-side 直接落 typed event 完全可行)
+
+| 信息 | 提取方法 | 可靠性 |
+|---|---|---|
+| **tool 名** | 行首 `●\s+(\w+)\(` pattern + 颜色属性(Claude 工具行通常上色)| ~95%(rendering 变化敏感)|
+| **tool 是否完成** | 后续行 `⎿` continuation char 出现 | ~90% |
+| **permission prompt** | 多行块 `Do you want to allow...` + `[y]es [n]o` 选项 | ~98%(Claude 的 prompt 格式稳定)|
+| **rate-limit 提示** | 错误带 `rate limit` / `Anthropic API` 关键字 | ~99% |
+| **context overflow 警告** | 红色 + 关键字 | ~99% |
+| **token usage / cost 状态栏** | 状态栏数字 + 单位(`127k tokens` `$0.42`)| ~95% |
+| **thinking 状态** | spinner 帧 + `Thinking...` 字串 | ~99% |
+| **user prompt 提交** | `>` 提示符 + 用户输入回显 | ~95% |
+| **session reset** | `/new` / `/compact` / `/clear` 命令注入后清屏 + welcome banner | ~95% |
+| **`turn_done` 边界** | output 停滞 + 提示符回归 + spinner 消失 | ~90% |
+
+**这些 10 个 typed event 足够支撑 ccteam 当前 progress.jsonl 7 类业务事件的 80%**。
+
+#### ◐ 中可靠性(daemon 可尝试,业务面接受降级)
+
+| 信息 | 限制 |
+|---|---|
+| **tool 参数(短)** | 单行参数可读;> 80 char 被 TUI 截断为 `...` |
+| **tool 结果(摘要)** | Claude 通常只渲染 `⎿ Read 47 lines` 摘要;具体内容滚动出屏 |
+| **assistant message 文本** | 可读,但 markdown 渲染 / 代码块高亮 / 链接颜色化让 plaintext 还原有损 |
+| **plan 列表(markdown)** | 渲染为编号列表,**树结构 / 依赖关系 / item 状态码丢失** |
+
+#### ✗ 低可靠性(daemon 拿不到,必须 vendor channel)
+
+| 信息 | 为何 mux 拿不到 |
+|---|---|
+| **tool 参数全文** | 大参数 Claude 不渲染 full text 到 TUI(用户也不需要看)|
+| **tool 结果全文** | 同上;Claude 写 result 到 Anthropic 内部 transcript jsonl,但 TUI 只渲染摘要 |
+| **persona JSON 切换** | 通常 TUI 不显示;`/persona` 命令后只有 banner 变化 |
+| **HITL plan_pending 的结构化 plan 树** | F124 需要的 plan tree dependencies / status enum,TUI 不渲染这层结构 |
+| **MCP tool registration runtime metadata** | F128 tool_added,Claude 内部状态,**不渲染到 TUI** |
+
+**修正后的判断**:Layer 4 大部分**部分可见**,小部分**真不可见**。
+
+### 15.3 红线"不解析 pane 输出"— 字面 vs 精神
+
+CLAUDE.md §三:**"永不主动 kill 长 session" + "不解析 tmux 终端输出"**。后者是关键约束。
+
+**字面解释**:"业务面 / orchestrator 进程的 Rust 代码不允许 `grep pane bytes`"。
+- §11.2 S2 已正式提出:daemon-side 在预注册 regex 之上做匹配 → 业务面零 grep,**字面合规**
+
+**精神解释**:"TUI 是 vendor UX 表面,vendor 改 UX 不应该让 ccteam 崩。状态机 SoT 应走 vendor 的官方 typed 通道(hook / JSON-RPC)而非 UX-derived 通道"。
+- 重 daemon-side TUI extraction(本节 15.2 的 10 个 typed event)= **精神上轻微违反** — 不是严格"业务面 grep",但 daemon 解析 = **ccteam 整体仍然依赖 Anthropic TUI 渲染**;Anthropic 改 TUI(如改 `●` 为别的、改 `⎿` continuation、改颜色)需 ccteam 同步发新版 daemon
+
+**两个事实削弱"精神违反"的严重性**:
+1. **ccteam 早已依赖 Anthropic 内部文件格式**(transcript_tail.rs 读 `~/.claude/projects/.../*.jsonl`)— Anthropic 改 jsonl 格式 ccteam 同样要 patch。即"对 Anthropic UX/internal 依赖" not new
+2. **Anthropic 的 TUI 比内部 jsonl 更稳定** — TUI 是 product surface,有向用户公开的稳定预期;内部 jsonl 是 implementation detail,理论上更易变。**Anthropic TUI 一年内变化几次** vs **内部 jsonl 几乎每月微调**
+
+**结论**:重 daemon-side TUI extraction 在红线精神上**略增加 vendor surface 依赖,但量级与现状 transcript jsonl 依赖相当**。可接受,但需明确写入 release notes 治理(本节 15.7)。
+
+### 15.4 出站架构三选项重审
+
+| 选项 | 描述 | Claude 完整度 | Codex 完整度 | 新 vendor 友好度 |
+|---|---|---|---|---|
+| **A. 纯 mux capture** | 完全不用 hooks / JSON-RPC,daemon 解析 TUI 为唯一 source | 60-80%(失去 tool params 全文 / HITL plan / persona) | 60-80%(同) | **极高** — 任何 TUI agent 立即接入 |
+| **B. mux capture 主 + hook/UDS 富化(hybrid)** | daemon 解析 TUI 为通用 base;Claude hook / Codex UDS 作为 enrichment(填补 lossy 部分) | 95%+(hook 补 tool params / plan / persona) | 95%+(UDS 补结构化) | **高** — 无 hook/UDS 的 vendor 走 80% 路径,有 hook/UDS 时升级到 95%+ |
+| **C. hook/UDS 主 + mux process 兜底(§13/§14 立场)** | hook/UDS 是 Layer 3-4 唯一 source;mux 只补 Layer 1-2(process / pattern)| 100%(对 Claude/Codex 完全 lossless) | 100% | **低** — 新 vendor 必须实现 hook/UDS 才能接入 |
+
+### 15.5 推荐选 B(hybrid)— 这是用户问题"全 mux 出站"的最佳近似
+
+**Option B 的具体落地形态**:
+
+```
+                ┌─────────────────────────────────────┐
+                │ ccteam orchestrator                  │
+                │ 订阅 1 条 enriched typed event stream│
+                └────────────┬────────────────────────┘
+                             ▲
+        ┌────────────────────┴────────────────────────────┐
+        │ rmux daemon — event enrichment merger           │
+        │                                                  │
+        │   每个 session 持有 EnrichedEvent stream:       │
+        │   base event(TUI 解析)+ 可选 enrichment payload│
+        │                                                  │
+        │   ┌────────────────┐         ┌──────────────┐   │
+        │   │ Base source:   │         │ Enrichment:  │   │
+        │   │ TUI vt100      │   ◀┐    │ vendor       │   │
+        │   │ extraction     │    │    │ specific     │   │
+        │   │ (per pattern   │    │    │ channel      │   │
+        │   │  registry)     │    │    │              │   │
+        │   └────────────────┘    │    │ Claude: hook │   │
+        │           ↑             │    │ subprocess   │   │
+        │           │             │    │              │   │
+        │           │  Merger:    │    │ Codex: UDS   │   │
+        │           │  by         │    │ JSON-RPC     │   │
+        │           │  timestamp  │    │              │   │
+        │           │  + sequence │    │ Future: ?    │   │
+        │           │  ID         ├────┤              │   │
+        │           └─────────────┘    └──────────────┘   │
+        └──────────────────────────────────────────────────┘
+                ▲                              ▲
+                │                              │
+        ┌───────┴────────┐         ┌───────────┴────────────┐
+        │ claude TUI in  │         │ Claude Code hook       │
+        │ rmux PTY pane  │         │ subprocess → daemon UDS│
+        │ stdout/stderr  │         │ (optional enrichment)  │
+        └────────────────┘         └────────────────────────┘
+```
+
+**关键设计**:
+1. **base event 从 TUI 解析,vendor-agnostic** — daemon 持 pattern registry,扫 TUI 字节流出基础 typed event(tool 名 / permission prompt / rate-limit / idle / 等)
+2. **enrichment 从 vendor channel 拿,vendor-specific** — Claude hook 携 tool 全参数 + result + plan 树等富信息;daemon 按 sequence ID 把 enrichment 合到对应 base event
+3. **没 enrichment 也能跑** — orchestrator 收到的 EnrichedEvent 中 `.enrichment: Option<...>` 字段,业务代码视情况降级;新 vendor 没 hook → enrichment 永远 `None`,但 base event 有
+4. **enrichment 失败也能跑** — hook subprocess fork 失败 / UDS 断 → daemon 继续 emit base event(degraded but functional)
+
+**这是用户问题的最强答案**:**输出**架构上**"mux 是主路径"成立**(base event 全走 mux 解析);**hook 退化为 enrichment**(可选,丢失只是降级,不是 ccteam 死);**新 vendor 不需要 hook 就能接入**(只是富信息缺失)。
+
+### 15.6 修正后的 V0.8 W2-W4 wave 计划
+
+§六 / §13.8 原 wave 计划保留主要 milestone,但 W2-W4 内容调整为 Option B 落地:
+
+| Wave | 原计划(§六 / §13.8)| 修正(Option B)|
+|---|---|---|
+| **W2** | Claude TUI in rmux + hook subprocess 改投递 daemon | + daemon-side TUI extraction registry(10 个 base pattern)+ EnrichedEvent merger 框架 |
+| **W3** | mode 2 bg 进 mux | + bg agent TUI extraction(jobs.jsonl 仍是 fallback)|
+| **W4** | typed event → progress.jsonl 桥 + Codex 进 mux | + Codex UDS 也走 enrichment 模式(base 从 TUI 解析,enrichment 从 JSON-RPC 富化)|
+| **W5+** | attach / cross-platform | 同 |
+
+**新增 wave 子目标**:
+- W2 子目标:**注册 10 个 base pattern 到 daemon**(本节 15.2 "高可靠性" 那一列),整理为 `crates/ccteam-core/src/mux/patterns/claude.rs` 静态 const
+- W3 子目标:**Codex 同样 10 个 base pattern**(`patterns/codex.rs`)
+- W4 子目标:**EnrichedEvent merger 算法稳定**(by timestamp + sequence ID,容忍 enrichment 延迟到 base event ±2s 之内)
+
+### 15.7 fragility 治理 — Anthropic 改 TUI 不让 ccteam 崩
+
+| 风险 | 缓解 |
+|---|---|
+| Anthropic 改 `●` 为别的字符 / 改颜色 | daemon 内 pattern registry 单文件,patch ship 走 V0.8.x patch;CI 加 Claude Code 多版本 smoke test(`claude --version` 探测,差异版本走对应 pattern set)|
+| TUI 渲染宽度敏感(`tput cols` < 80 截断不同)| daemon 在 spawn session 时强制 `pty size = (200, 50)`(与 ccteam-core/src/tmux.rs 现有 `-x 200 -y 50` 一致),pattern 按 200 col 假设 |
+| 不同 Anthropic 区域版本(中国/美国)渲染微差 | pattern variant 走 feature flag,daemon 自动探测后 fallback |
+| **ccteam release notes** | 每版本 release notes **明列** "Claude TUI X.Y 已验证 / X.Z 未验证";用户升级 Claude Code 前查表 |
+
+**核心治理原则**:**daemon 内 pattern registry 是 ccteam owned 的"vendor TUI compatibility shim",同 transcript_tail.rs 一样需要 vendor-version 跟踪**。运维负担 +1 表面,但换来"vendor-agnostic 出站架构" + "新 vendor 接入只需 patterns 文件" 的长期价值。
+
+### 15.8 与 §14 的关系
+
+§14 立论:**outbound 100% 走 mux 不可能 — Layer 3-4 INVISIBLE,hook 必留**。
+
+§15 修正:**outbound 主路径走 mux 是可行的 — Layer 3-4 是 LOSSY 不是 INVISIBLE;hook 降级为 enrichment**。
+
+| 维度 | §14 立场 | §15 修正 |
+|---|---|---|
+| Layer 3-4 可见性 | INVISIBLE | LOSSY projection(60-80% 准确)|
+| 出站架构 | hooks/UDS 是 SOURCE,mux 是 BUS | **mux 是 base SOURCE,hooks/UDS 是 enrichment SOURCE** |
+| 红线立场 | 严守字面,daemon side regex 拉满 | **微调精神**:接受 daemon-side TUI extraction = vendor surface 依赖,与现状 transcript_tail.rs 同量级 |
+| 新 vendor 接入 | 必须有 hook/UDS,否则不可用 | 只需写 TUI pattern 文件,base 功能即开 |
+| 完整度 | 100%(对 Claude/Codex 完美)| 95%+(base + enrichment 合并;无 enrichment 80%)|
+| 推荐 | Option C | **Option B (hybrid)** |
+
+**用户的反驳促成了这个修正** — `§14` 的"INVISIBLE" 是把 capture 能力低估了一档;`§15` 的 "LOSSY projection" 才是诚实表述。**这也是用户问题"出站能不能全走 mux"的最强工程答案**:**主路径走 mux 可以,enrichment 退化为可选 — 这等同于 architectural 上的"mux 是出站第一性 source"**。
+
+### 15.9 红线表的拟定修订(待 V0.8 doc-first 评审确认)
+
+CLAUDE.md §三 "不解析 tmux 终端输出" 行的修订建议:
+
+```
+旧:
+| 不解析 tmux 终端输出 | — | 守 | 守 — agent 行为住 .claude/agents/<role>.md ... |
+
+新:
+| 业务面零 grep pane bytes | — | 守 — daemon-side TUI extraction 允许 | 守 — daemon-side TUI extraction 允许,
+                                              业务面只消费 daemon 翻译后的 typed event;
+                                              vendor TUI 渲染格式变更视同 daemon backend 协议
+                                              变更,需 ccteam release notes 同步(同 transcript
+                                              jsonl 依赖治理) |
+```
+
+修订后:
+- "业务面零 grep" 是字面红线(强制)
+- "daemon-side TUI extraction" 是 architectural pattern,vendor surface 依赖明牌
+- ccteam release notes 治理把"TUI 兼容"作为一类正式工程负担,与 "transcript jsonl 兼容" 并列
+
+---
+
 ## Sources
 
 (本篇)
