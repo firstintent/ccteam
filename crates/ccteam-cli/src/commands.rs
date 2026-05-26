@@ -202,6 +202,12 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
     // -- 6. Health check + optional wizard --------------------------
     let bin = current_ccteam_bin().ok();
     let claude = Command::new("claude").arg("--version").output();
+    // V0.8 W1 — `tmux -V` probe routes through the canonical
+    // `ccteam_core::tmux_available()` helper (re-exported from
+    // `ccteam_mux::tmux_ops`) but the wizard wants a version string,
+    // not a bool. Keep the inline `Command` here; the V0.9 retirement
+    // of tmux.rs will swap this once tmux_available exposes the
+    // version string too.
     let tmux = Command::new("tmux").arg("-V").output();
 
     let mut out = String::new();
@@ -1553,8 +1559,17 @@ pub fn run_attach(paths: &CcteamPaths, slug: &str) -> Result<()> {
     let tmux_session = TmuxSession::from_name(session_name_for_project(paths, slug));
     if tmux_session.exists() {
         eprintln!("→ tmux attach -t {}", tmux_session.name());
-        let status = Command::new("tmux")
-            .args(["attach", "-t", tmux_session.name()])
+        // V0.8 W1 — argv from `ccteam_mux::interactive_attach_argv`
+        // (free fn, not a trait method — terminal handover doesn't fit
+        // async; audit delta 6). Caller still spawns blocking
+        // Command::status() on the CLI's own controlling tty.
+        let argv =
+            ccteam_mux::interactive_attach_argv(ccteam_mux::BackendKind::Tmux, tmux_session.name());
+        let (bin, args) = argv
+            .split_first()
+            .ok_or_else(|| anyhow::anyhow!("interactive_attach_argv returned empty argv"))?;
+        let status = Command::new(bin)
+            .args(args)
             .status()
             .context("spawn tmux attach")?;
         if !status.success() {
@@ -1702,20 +1717,21 @@ fn latest_claude_bg_job_id(paths: &CcteamPaths, slug: &str) -> Option<String> {
 
 /// `ccteam peek <slug>`. Returns the contents of the session's first
 /// pane via `tmux capture-pane -p`.
+///
+/// V0.8 W1 — routes through `ccteam_core::capture_pane_tail_from_session`
+/// (re-exported over `ccteam_mux::tmux_ops::capture_pane_tail_from_session`,
+/// the same primitive `TmuxBackend::capture` calls under the hood).
+/// Keeps run_peek sync per the W1 "sync sites stay sync" decision.
 pub fn run_peek(paths: &CcteamPaths, slug: &str) -> Result<String> {
     let session = TmuxSession::from_name(session_name_for_project(paths, slug));
     if !session.exists() {
         bail!("tmux session not running: {}", session.name());
     }
-    let output = Command::new("tmux")
-        .args(["capture-pane", "-p", "-t", session.name()])
-        .output()
-        .context("spawn tmux capture-pane")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("tmux capture-pane failed: {stderr}");
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    // 1000-line tail matches the legacy raw `capture-pane -p` default
+    // window (no `-S` flag → tmux's default scroll-region tail).
+    let text = ccteam_core::capture_pane_tail_from_session(session.name(), 1000, false)
+        .unwrap_or_default();
+    Ok(text)
 }
 
 /// `ccteam progress <slug>`. With `tail = false`, returns the entire
@@ -1946,8 +1962,15 @@ pub fn run_session_attach(slug: &str, sid: &str) -> Result<()> {
     if !session.exists() {
         bail!("tmux session not running: {}", session.name());
     }
-    let status = Command::new("tmux")
-        .args(["attach", "-t", session.name()])
+    // V0.8 W1 — argv from `ccteam_mux::interactive_attach_argv` (audit
+    // delta 6). Caller spawns blocking `Command::status()` on the CLI's
+    // own controlling tty.
+    let argv = ccteam_mux::interactive_attach_argv(ccteam_mux::BackendKind::Tmux, session.name());
+    let (bin, args) = argv
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("interactive_attach_argv returned empty argv"))?;
+    let status = Command::new(bin)
+        .args(args)
         .status()
         .context("spawn tmux attach")?;
     if !status.success() {

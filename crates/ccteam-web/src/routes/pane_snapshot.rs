@@ -15,6 +15,7 @@ use axum::{
     Router,
 };
 use ccteam_core::{ProjectState, TeamKind};
+use ccteam_mux::{MuxBackend, MuxSessionId, TmuxBackend};
 
 use crate::state::AppState;
 
@@ -47,28 +48,29 @@ async fn handle_session_pane_snapshot(
 }
 
 async fn serve_pane_snapshot(slug: String, sid: Option<String>, session_name: String) -> Response {
-    let capture_session_name = session_name.clone();
-    let capture = tokio::task::spawn_blocking(move || {
-        capture_snapshot_bytes(&capture_session_name, SNAPSHOT_LINES)
-    })
-    .await;
+    // V0.8 W1 — route through the MuxBackend trait. `TmuxBackend`
+    // bridges to the same blocking `tmux capture-pane / display-message`
+    // calls under `spawn_blocking` internally, so the latency profile
+    // is unchanged.
+    let backend = TmuxBackend::new();
+    let id = MuxSessionId::new(session_name.clone());
 
+    let capture = backend.capture(&id, SNAPSHOT_LINES, true).await;
     let Some((bytes, rows, cols)) = (match capture {
-        Ok(Ok(Some(snapshot))) => Some(snapshot),
-        Ok(Ok(None)) => None,
-        Ok(Err(err)) => {
+        Ok(bytes) if !bytes.is_empty() => {
+            let (rows, cols) = match backend.pane_dims(&id).await {
+                Ok(Some((r, c))) if r > 0 && c > 0 => (r, c),
+                _ => FALLBACK_DIMS,
+            };
+            let max_rows = SNAPSHOT_LINES.min(u16::MAX as usize) as u16;
+            Some((bytes, rows.min(max_rows).max(1), cols))
+        }
+        Ok(_) => None,
+        Err(err) => {
             tracing::warn!(slug = %slug, sid = ?sid, ?err, "pane snapshot capture returned Err");
             return (
                 StatusCode::GATEWAY_TIMEOUT,
                 format!("pane snapshot capture failed: {err}"),
-            )
-                .into_response();
-        }
-        Err(err) => {
-            tracing::warn!(slug = %slug, sid = ?sid, ?err, "pane snapshot worker failed");
-            return (
-                StatusCode::GATEWAY_TIMEOUT,
-                format!("pane snapshot worker failed: {err}"),
             )
                 .into_response();
         }
@@ -128,22 +130,6 @@ fn session_name_for_project_session(
         )
     })?;
     Ok(record.tmux_session.clone())
-}
-
-fn capture_snapshot_bytes(
-    session_name: &str,
-    lines: usize,
-) -> anyhow::Result<Option<(Vec<u8>, u16, u16)>> {
-    let bytes = match ccteam_core::capture_pane_with_ansi_from_session(session_name, lines)? {
-        Some(b) => b,
-        None => return Ok(None),
-    };
-    let (rows, cols) = match ccteam_core::query_pane_dims_from_session(session_name) {
-        Ok(Some((r, c))) if r > 0 && c > 0 => (r, c),
-        Ok(Some(_)) | Ok(None) | Err(_) => FALLBACK_DIMS,
-    };
-    let max_rows = lines.min(u16::MAX as usize) as u16;
-    Ok(Some((bytes, rows.min(max_rows).max(1), cols)))
 }
 
 fn digit_header(n: u16) -> HeaderValue {

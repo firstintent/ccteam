@@ -19,6 +19,10 @@ ccteam-web.workspace = true
 # here because the operator-facing process model collapses to a single
 # `ccteam start` daemon (orchestrator + web + IMD supervisor).
 ccteam-imd.workspace = true
+# V0.8 W1 — `interactive_attach_argv` for `ccteam attach` / `session
+# attach`. The trait stays out of the sync CLI fns themselves; only
+# the argv-builder is consumed here.
+ccteam-mux.workspace = true
 clap.workspace = true
 chrono.workspace = true
 dirs.workspace = true
