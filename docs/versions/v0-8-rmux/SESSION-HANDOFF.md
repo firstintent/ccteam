@@ -1,8 +1,18 @@
 # Session Handoff — rmux integration (v0-8-rmux-integration)
 
-> Paste-ready prompts for migrating to a new session. Branch is at 69
-> commits, all pushed to `origin/v0-8-rmux-integration`, baseline green,
-> worktree `/tmp/ccteam-rmux` (target/ warm after last rebuild).
+> Paste-ready prompts for migrating to a new session. Branch is at 71
+> commits, all pushed to `origin/v0-8-rmux-integration`, baseline green
+> (~1676 pass / 0 fail excl. 2 known inotify flakes), worktree
+> `/tmp/ccteam-rmux` (target/ warm).
+
+> **UPDATE (flip-default DONE, commit `8b3310c`)**: `ccteam start` now
+> defaults `CCTEAM_MUX_BACKEND` to rmux (operator opts out with =tmux);
+> library `from_env()` default stays tmux so the test suite is
+> unaffected. **rmux is now the product default.** Item ① closed.
+> Remaining: ② macOS/Windows CI green (hardware-bound, CI wired) ·
+> ③ EnrichedEvent merger consumer (built-not-wired infrastructure;
+> decide: wire a minimal consumer OR mark ahead-of-consumer). The
+> goal-prompts below predate this — ① is no longer pending.
 
 ---
 
