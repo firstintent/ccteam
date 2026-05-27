@@ -27,14 +27,25 @@ jobs:
           components: clippy
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-  # v0.8 rmux G2 — real-daemon smoke. ccteam hosts the rmux daemon itself
-  # (re-execs via `--__internal-daemon`), so no system `rmux` is needed —
-  # only the built binary, pointed at by `RMUX_SDK_DAEMON_BINARY`. Linux
-  # runners are PTY-capable; the test spawns `sh -c "echo ... && sleep"`,
-  # so no claude/codex binary is required either. macOS/Windows deferred.
+  # v0.8 rmux G2/G8 — real-daemon smoke. ccteam hosts the rmux daemon
+  # itself (re-execs via `--__internal-daemon`), so no system `rmux` is
+  # needed — only the built binary, pointed at by `RMUX_SDK_DAEMON_BINARY`.
+  # Both Linux and macOS runners are PTY-capable; the test spawns
+  # `sh -c "echo ... && sleep"`, so no claude/codex binary is required.
+  #
+  # macOS (G8): rmux upstream marks macOS `skipped` in its feature
+  # inventory and ccteam treats macOS as tier-1, so this matrix entry is
+  # the ONLY automated macOS validation of the rmux integration. It is
+  # the last open flip-default gate blocker — until this is green on a
+  # real macOS runner, CCTEAM_MUX_BACKEND must NOT default to rmux on
+  # Darwin. Windows (ConPTY) is deferred to a later wave.
   rmux-smoke:
-    name: rmux real-daemon smoke (linux)
-    runs-on: ubuntu-latest
+    name: rmux real-daemon smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

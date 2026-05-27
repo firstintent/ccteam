@@ -16,7 +16,10 @@
 # Usage:
 #   scripts/rmux-smoke.sh
 #
-# Linux-only for now (macOS/Windows PTY paths deferred per the audit).
+# Portable to Linux and macOS (both PTY-capable; uses only bash + cargo,
+# no GNU-isms). CI runs it on an [ubuntu-latest, macos-latest] matrix —
+# the macOS leg is the sole automated Darwin validation (audit G8 /
+# flip-default gate). Windows ConPTY is deferred to a later wave.
 
 set -euo pipefail
 
