@@ -67,6 +67,7 @@ fn make_ctx(slug: &str, _role: &str, tmp: &tempfile::TempDir) -> SpawnCtx {
 #[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn start_thread_reattaches_alive_session() {
+    std::env::set_var("CCTEAM_MUX_BACKEND", "tmux");
     if !ccteam_core::tmux::tmux_available() {
         eprintln!("skip: tmux not available");
         return;
@@ -154,6 +155,7 @@ async fn start_thread_reattaches_alive_session() {
 #[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn start_thread_recreates_dead_session() {
+    std::env::set_var("CCTEAM_MUX_BACKEND", "tmux");
     if !ccteam_core::tmux::tmux_available() {
         eprintln!("skip: tmux not available");
         return;
@@ -256,6 +258,7 @@ async fn start_thread_recreates_dead_session() {
 #[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn start_thread_creates_new_session_when_absent() {
+    std::env::set_var("CCTEAM_MUX_BACKEND", "tmux");
     if !ccteam_core::tmux::tmux_available() {
         eprintln!("skip: tmux not available");
         return;
@@ -346,6 +349,7 @@ fn list_pane_pids_on_live_session_returns_pid() {
 #[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn start_thread_is_idempotent_on_alive_session() {
+    std::env::set_var("CCTEAM_MUX_BACKEND", "tmux");
     if !ccteam_core::tmux::tmux_available() {
         eprintln!("skip: tmux not available");
         return;

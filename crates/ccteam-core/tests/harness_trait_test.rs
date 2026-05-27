@@ -228,6 +228,7 @@ fn tmux_on_path_bg() -> bool {
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial]
 async fn claude_bg_via_mux_spawns_ephemeral_session_and_close_reaps_it() {
+    let _mux_guard = EnvGuard::set("CCTEAM_MUX_BACKEND", "tmux");
     if !tmux_on_path_bg() {
         eprintln!("skipping: tmux not on PATH");
         return;
@@ -355,7 +356,9 @@ async fn claude_bg_via_mux_spawns_ephemeral_session_and_close_reaps_it() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
 async fn claude_bg_via_mux_close_thread_idempotent_on_missing_session() {
+    let _mux_guard = EnvGuard::set("CCTEAM_MUX_BACKEND", "tmux");
     // A via_mux handle whose session never existed (or already reaped):
     // MuxBackend::kill is idempotent, so close_thread is Ok. Does not
     // require tmux on PATH — kill of a non-existent session is a no-op
@@ -512,7 +515,9 @@ async fn codex_exec_resume_thread_rejects_empty_persistent_id() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
 async fn codex_exec_close_thread_idempotent_on_missing_session() {
+    let _mux_guard = EnvGuard::set("CCTEAM_MUX_BACKEND", "tmux");
     let h = ThreadHandle {
         vendor: AgentVendor::Codex,
         mode: ExecutionMode::Bg,
@@ -555,7 +560,9 @@ async fn claude_tui_rejects_empty_role() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
 async fn claude_tui_resume_missing_session_reports_not_implemented() {
+    let _mux_guard = EnvGuard::set("CCTEAM_MUX_BACKEND", "tmux");
     // Wave 2: resume_thread w/o a live tmux session falls back to a
     // structured NotImplemented so the caller knows to invoke
     // start_thread + session_recovery::build_recovery_prompt.
