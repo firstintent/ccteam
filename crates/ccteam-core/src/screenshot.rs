@@ -49,11 +49,11 @@ use imageproc::drawing::{draw_filled_rect_mut, draw_text_mut};
 use imageproc::rect::Rect;
 use vt100::Parser;
 
+use ccteam_mux::MuxSessionId;
+
 use crate::paths::CcteamPaths;
 use crate::state::ProjectState;
-use crate::tmux::{
-    capture_pane_with_ansi_from_session, query_pane_dims_from_session, session_name_for_project,
-};
+use crate::tmux::session_name_for_project;
 
 pub mod ansi_palette;
 
@@ -93,10 +93,34 @@ pub type ScreenshotResult = Result<Option<PathBuf>>;
 /// tmux session, render to a PNG under
 /// `<project>/.ccteam/screenshots/<utc>.png`, return the path.
 ///
-/// Returns `Ok(None)` for any non-panic failure (tmux missing, pane
-/// query failed, font parse failed, IO failed). Each path logs a
-/// `tracing::warn!` with reason. Panics from `vt100` / `imageproc`
-/// are caught and converted to `Ok(None)`.
+/// Returns `Ok(None)` for any non-panic failure (session missing, pane
+/// query failed, font parse failed, IO failed, unknown mux backend).
+/// Each path logs a `tracing::warn!` with reason. Panics from `vt100` /
+/// `imageproc` are caught and converted to `Ok(None)`.
+///
+/// **V0.8 G5** — capture + pane-dims route through the
+/// [`ccteam_mux::MuxBackend`] trait (`ccteam_mux::from_env()`) so the
+/// configured backend (`CCTEAM_MUX_BACKEND=tmux|rmux`) is honored
+/// instead of hard-calling tmux. Under the default tmux backend the
+/// behavior is byte-for-byte identical (TmuxBackend wraps the same
+/// `tmux capture-pane -e` / `display-message` calls).
+///
+/// **rmux ANSI gap** — under `CCTEAM_MUX_BACKEND=rmux`,
+/// `MuxBackend::capture(.., with_ansi=true)` currently returns rendered
+/// PLAIN TEXT (rmux's `PaneSnapshot` is a parsed cell grid; no public
+/// byte-level capture-pane shim exists yet). The PNG still renders the
+/// text, just without color/attribute fidelity. Cell-grid→ANSI
+/// re-serialization belongs in `ccteam-mux::rmux_backend` — see
+/// `TODO(V0.9-rmux-ansi-capture)` there. We accept degraded screenshots
+/// under rmux for V0.8: degraded-but-working beats silently-broken.
+///
+/// **Runtime note** — this sync fn drives the async trait on a fresh
+/// current-thread tokio runtime. Safe from plain-sync callers (CLI /
+/// MCP) and from `tokio::task::spawn_blocking` worker threads (no
+/// reactor runs there). Do NOT call this directly from inside an
+/// `async fn` on a tokio worker thread without wrapping in
+/// `spawn_blocking` — `Runtime::block_on` panics when nested in a
+/// running runtime.
 pub fn render_screenshot(
     paths: &CcteamPaths,
     slug: &str,
@@ -108,19 +132,47 @@ pub fn render_screenshot(
         None => session_name_for_project(paths, slug),
     };
 
-    // 1. tmux capture (ANSI escapes preserved).
-    let ansi_bytes = match capture_pane_with_ansi_from_session(&session_name, lines) {
-        Ok(Some(b)) => b,
-        Ok(None) => {
+    // Select the configured mux backend. A garbage CCTEAM_MUX_BACKEND
+    // value errors — per the graceful-degrade red line (module doc),
+    // rendering NEVER aborts the enclosing path, so map Err → Ok(None).
+    // NB: rmux's `from_env()` lazily connects a daemon per call (the
+    // documented no-cache policy); under rmux each screenshot pays that
+    // connect cost. Acceptable for the screenshot surface — flagged for
+    // any future hot-path follow-up.
+    let backend = match ccteam_mux::from_env() {
+        Ok(b) => b,
+        Err(err) => {
+            tracing::warn!("screenshot: mux backend selection failed: {err:#}");
+            return Ok(None);
+        }
+    };
+    let id = MuxSessionId::new(session_name.clone());
+
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(err) => {
+            tracing::warn!("screenshot: build tokio runtime failed: {err:#}");
+            return Ok(None);
+        }
+    };
+
+    // 1. capture pane output (ANSI escapes preserved on tmux; plain
+    //    text under rmux — see rmux ANSI gap above).
+    let ansi_bytes = match runtime.block_on(backend.capture(&id, lines, true)) {
+        Ok(b) if !b.is_empty() => b,
+        Ok(_) => {
             tracing::warn!(
-                "screenshot: tmux capture-pane returned no output for slug `{slug}` \
-                 session `{session_name}` (session missing or tmux failed)"
+                "screenshot: capture returned no output for slug `{slug}` \
+                 session `{session_name}` (session missing or backend failed)"
             );
             return Ok(None);
         }
         Err(err) => {
             tracing::warn!(
-                "screenshot: tmux capture-pane failed for slug `{slug}` \
+                "screenshot: capture failed for slug `{slug}` \
                  session `{session_name}`: {err:#}"
             );
             return Ok(None);
@@ -128,7 +180,7 @@ pub fn render_screenshot(
     };
 
     // 2. pane dims (rows × cols) — fall back to 80×24 when query fails.
-    let (rows, cols) = match query_pane_dims_from_session(&session_name) {
+    let (rows, cols) = match runtime.block_on(backend.pane_dims(&id)) {
         Ok(Some((r, c))) => (r as usize, c as usize),
         _ => (FALLBACK_DIMS.0 as usize, FALLBACK_DIMS.1 as usize),
     };
