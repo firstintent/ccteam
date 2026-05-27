@@ -2,9 +2,8 @@
 //!
 //! Bridges a live Claude chat-TUI session's [`ccteam_mux::TypedEventTap`]
 //! into the project's `progress.jsonl` as `typed_event` observability
-//! rows. This is the **first production consumer** of the
-//! ahead-of-consumer EnrichedEvent merger (see
-//! `ccteam-mux::enriched_event` module doc / `TODO(V0.9-typed-event-consumer)`).
+//! rows. This is the **first production consumer** of the EnrichedEvent
+//! merger (see the `ccteam-mux::enriched_event` module doc — V0.8 Slice 1).
 //!
 //! Scope of this slice is deliberately narrow:
 //! - Gated entirely behind the `CCTEAM_TYPED_EVENTS` env flag. With the

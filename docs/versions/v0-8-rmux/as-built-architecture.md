@@ -44,7 +44,8 @@ ccteam-core ─┘                  └─▶ tmux CLI                 (TmuxBack
 | `inproc_backend.rs` (217 ln) | `InProcBackend` — mode-1 stub; most ops return `Ok(())` / no-op, drives a `tokio::task`. Used by tests + the eventual mode-1 unification (W1 `23f0676`). |
 | `daemon.rs` (122 ln) | `run_internal_daemon` — the single-binary re-exec daemon runtime (W2a `050edff`). |
 | `patterns/` (`mod.rs` + `claude.rs` + `codex.rs`) | Layer-2 TUI-render regex registry: `PatternMatcher` engine + the static base-pattern tables (W2b `2158f18` Claude, W3b `aacc616` Codex). |
-| `enriched_event.rs` (553 ln) | The `EventMerger` — priority-with-grace-window merge of P1 (typed) + P2 (regex) + P3 (process) signals (W3b `2a331d1`). **AHEAD-OF-CONSUMER** (built+tested, no production producer/consumer; deliberate, `TODO(V0.9-typed-event-consumer)` — see §5). |
+| `enriched_event.rs` (553 ln) | The `EventMerger` — priority-with-grace-window merge of P1 (typed) + P2 (regex) + P3 (process) signals (W3b `2a331d1`). **WIRED (V0.8 Slice 1)** — driven by `typed_event_tap.rs`; `BaseOnly` path live, pairing path is Slice 2 (see §5). |
+| `typed_event_tap.rs` | `TypedEventTap` — daemon-side driver: registers a session's base patterns, subscribes, lifts `PatternMatched`/`OutputIdle`/`ProcessExited` → `BaseEvent`, mints pairing seq (pending-partner token), feeds the merger, forwards `EnrichedEvent`s. The merger's first production producer. |
 
 `ccteam-core` consumes the trait via `ccteam_mux::default_backend()` from the
 mode-2/3 adapters; `ccteam-cli` consumes `backend_kind_from_env()` for
@@ -204,33 +205,42 @@ patterns** (`patterns/codex.rs`): `rate_limit`, `thinking`, `turn_done`,
 `approval_prompt` — deliberately thin (Codex's semantic catalog is JSON-RPC,
 not regex; these are lossy L2 fallbacks).
 
-**`PatternMatched` has zero consumers today.** The registry + matching is fully
-built and tested, but nothing in `ccteam-core` / `ccteam-web` reads
-`MuxEvent::PatternMatched` — only `OutputChunk` / `OutputDropped` are consumed
-(by the web SSE forwarder). It is **BUILT-NOT-WIRED** dead weight until a
-consumer (the merger wiring, or W6) lands.
+**`PatternMatched` is consumed in V0.8 Slice 1** (flag-gated). `typed_event_tap.rs`
+registers the base patterns and reads `MuxEvent::PatternMatched` (plus
+`OutputIdle` / `ProcessExited`), lifting them into the `EventMerger`; the web
+SSE forwarder continues to consume `OutputChunk` / `OutputDropped` for raw
+streaming. Activated by `CCTEAM_TYPED_EVENTS=1` at the Claude chat-TUI spawn;
+the default path reads no `PatternMatched`.
 
 **`EnrichedEvent` merger** (`enriched_event.rs`): a pure-logic
 priority-with-grace-window merger that emits at most one logical event per
 occurrence, sourcing the richest of P1 (Claude hook / Codex JSON-RPC, lossless)
 / P2 (regex, lossy) / P3 (process). Pairs by `(session_id, kind,
-sequence_id)`. **Explicitly marked AHEAD-OF-CONSUMER infrastructure** (a
-deliberate decision, not an oversight) — the source module doc says so and
-carries a searchable `TODO(V0.9-typed-event-consumer)` tag.
+sequence_id)`. **WIRED in V0.8 Slice 1** — it now has a real production
+producer and consumer.
 
-Status: built + acceptance-tested (W3b `f3bd694`), but with **neither a
-production producer nor consumer**:
-- *No producer* — base events would come from `MuxEvent::PatternMatched`,
-  which needs `register_pattern` called in production; it has no production
-  caller. (The raw `MuxBackend::subscribe` line stream IS consumed, by the
-  web PTY SSE — but the typed pattern-match layer above it is unwired.)
-- *No consumer* — nothing reads the merged stream.
+- **Producer**: `typed_event_tap.rs::TypedEventTap` registers a session's
+  base patterns, subscribes, and lifts `MuxEvent::PatternMatched` /
+  `OutputIdle` / `ProcessExited` → `BaseEvent` into the merger. It mints the
+  pairing `sequence_id` with a pending-partner token scheme (no independent
+  per-side counters → no cascade mis-pairing).
+- **Consumer**: `ccteam_core::execution::typed_events` reads the merged stream
+  and writes `typed_event` rows to `progress.jsonl`, integrated at the Claude
+  chat-TUI spawn (`claude_tui.rs`), flag-gated on `CCTEAM_TYPED_EVENTS`.
+  Verified end-to-end by `typed_event_pipeline_test.rs` (a live rmux session's
+  "rate limit" pane line → a `typed_event{rate_limit}` row) + wired into
+  `rmux-smoke.sh`.
 
-The consuming feature is **V0.9 daemon-side typed-event-driven orchestration**
-(rate-limit auto-resume, idle/turn-done detection from a merged typed stream
-rather than `progress.jsonl` polling). A stub consumer is deliberately NOT
-added — it would look load-bearing while doing nothing. This is the cleanest
-designed/built boundary on the branch.
+**Slice 1 scope**: only the no-enrichment kinds (`EnrichmentSource::None` —
+RateLimitHit / ContextOverflow / Idle / ProcessExited) flow today; they emit
+`MergeOutcome::BaseOnly` immediately. The grace-window *pairing* path
+(`Paired` / `BaseLossy`) is exercised by the unit + acceptance tests but not
+yet by production. **Slice 2 (follow-up, in-0.8)**: feed P1 enrichment —
+translate the daemon's Claude-hook (via `HookSink`) / Codex JSON-RPC events
+into `EnrichmentEvent`s so the merger's reliability fallback (`BaseLossy`: a
+lossy pattern fired but the lossless hook never arrived within the grace
+window) becomes live. That needs a session→`TapHandle` registry to route the
+global hook sink to the per-session tap.
 
 ---
 

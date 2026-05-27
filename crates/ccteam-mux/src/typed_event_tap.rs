@@ -2,8 +2,8 @@
 //! the [`crate::enriched_event::EventMerger`] from a live session's
 //! [`MuxBackend::subscribe`] stream.
 //!
-//! This is the wiring the merger module's `TODO(V0.9-typed-event-consumer)`
-//! anticipates: it registers the vendor's base patterns
+//! This is the V0.8 Slice 1 wiring that makes the merger live: it
+//! registers the vendor's base patterns
 //! ([`crate::patterns::base_patterns`]) against a session, subscribes to
 //! its typed [`MuxEvent`] stream, and lifts each
 //! [`MuxEvent::PatternMatched`] into a [`BaseEvent`] (with a minted

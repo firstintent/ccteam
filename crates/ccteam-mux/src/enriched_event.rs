@@ -16,7 +16,7 @@
 //! a priority queue with a grace window (spec:
 //! `docs/versions/v0-8-rmux/w4-enriched-event-merger.md`).
 //!
-//! ## Status: AHEAD-OF-CONSUMER infrastructure (deliberate)
+//! ## Status: WIRED (Slice 1) — base/`BaseOnly` pipeline live
 //!
 //! This module is a **self-contained, pure-logic library**: it consumes
 //! [`BaseEvent`] / [`EnrichmentEvent`] values and produces
@@ -24,29 +24,26 @@
 //! testable with `tokio::time::pause()` (see the inline tests + the
 //! acceptance suite in `tests/enriched_event_merger.rs`).
 //!
-//! It is **built + tested but has no production producer or consumer**,
-//! by design — not an oversight:
-//! - *No producer*: its base-event input would come from
-//!   `MuxEvent::PatternMatched`, which requires `register_pattern` to be
-//!   called in production. `register_pattern` currently has no production
-//!   caller (the raw `MuxBackend::subscribe` line stream IS consumed — by
-//!   the web PTY SSE — but the typed pattern-match layer above it is not
-//!   wired to register anything).
-//! - *No consumer*: nothing reads the merged `EnrichedEvent` stream.
+//! It now has a real production producer AND consumer (V0.8 Slice 1):
+//! - *Producer*: [`crate::typed_event_tap::TypedEventTap`] registers a
+//!   session's base patterns, subscribes, and lifts
+//!   `MuxEvent::PatternMatched` / `OutputIdle` / `ProcessExited` into
+//!   [`BaseEvent`]s fed to this merger.
+//! - *Consumer*: `ccteam_core::execution::typed_events` reads the merged
+//!   stream and writes `typed_event` rows to `progress.jsonl` (flag-gated
+//!   on `CCTEAM_TYPED_EVENTS`, integrated at the Claude chat-TUI spawn).
 //!
-//! The merger exists ahead of the feature that will consume it:
-//! **daemon-side typed-event-driven orchestration** (e.g. rate-limit
-//! auto-resume, idle/turn-done detection driven from a merged typed
-//! stream rather than from `progress.jsonl` polling). That feature is
-//! V0.9 scope — it must mint `sequence_id`s and translate the daemon's
-//! hook / `CodexUdsBridge` enrichments into [`EnrichmentEvent`]s, which
-//! touches `tmux_backend` / `rmux_backend` / `daemon`. The merger is
-//! delivered ready for that wiring; do NOT add a stub consumer (it would
-//! look load-bearing while doing nothing).
-//!
-//! `TODO(V0.9-typed-event-consumer)`: wire register_pattern → PatternMatched
-//! → BaseEvent and the daemon enrichment sources → EnrichmentEvent into
-//! this merger, and add the orchestration consumer that reads the output.
+//! **Slice 1 scope**: only the no-enrichment kinds
+//! ([`EnrichmentSource::None`] — RateLimitHit / ContextOverflow / Idle /
+//! ProcessExited) flow today; they emit [`MergeOutcome::BaseOnly`]
+//! immediately, so the grace-window *pairing* path (`Paired` /
+//! `BaseLossy`) is exercised by the unit/acceptance tests but not yet by
+//! production. **Slice 2 (follow-up)**: feed P1 enrichment — translate the
+//! daemon's Claude-hook (via `HookSink`) / Codex JSON-RPC events into
+//! [`EnrichmentEvent`]s so the merger's reliability fallback (`BaseLossy`:
+//! a lossy pattern fired but the lossless hook never arrived) becomes
+//! live. That needs a session→[`crate::typed_event_tap::TapHandle`]
+//! registry to route the global hook sink to the per-session tap.
 //!
 //! ## Sequence-id contract
 //!
@@ -286,8 +283,9 @@ struct Inner {
 
 /// The priority-with-grace-window merger.
 ///
-/// **Ahead-of-consumer infrastructure** — built + tested, no production
-/// producer/consumer yet (see the module doc; `TODO(V0.9-typed-event-consumer)`).
+/// Driven in production by [`crate::typed_event_tap::TypedEventTap`]
+/// (V0.8 Slice 1 — see the module doc). The `BaseOnly` path is live; the
+/// grace-window pairing path goes live when Slice 2 wires P1 enrichment.
 ///
 /// Construct with [`EventMerger::new`], which hands back the output
 /// [`mpsc::UnboundedReceiver`]. **All** emissions — immediate pairs,
