@@ -130,9 +130,10 @@ where
 /// **V0.8 G5** — capture + pane-dims route through the
 /// [`ccteam_mux::MuxBackend`] trait (`ccteam_mux::from_env()`) so the
 /// configured backend (`CCTEAM_MUX_BACKEND=tmux|rmux`) is honored
-/// instead of hard-calling tmux. Under the default tmux backend the
-/// behavior is byte-for-byte identical (TmuxBackend wraps the same
-/// `tmux capture-pane -e` / `display-message` calls).
+/// instead of hard-calling tmux. Under the tmux backend (the opt-out,
+/// `CCTEAM_MUX_BACKEND=tmux`) the behavior is byte-for-byte identical
+/// (TmuxBackend wraps the same `tmux capture-pane -e` / `display-message`
+/// calls).
 ///
 /// **rmux ANSI gap** — under `CCTEAM_MUX_BACKEND=rmux`,
 /// `MuxBackend::capture(.., with_ansi=true)` currently returns rendered

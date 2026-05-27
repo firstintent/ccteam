@@ -1705,25 +1705,22 @@ fn run_start(
 ) -> Result<()> {
     init_tracing();
 
-    // V0.8 rmux W7 — flip the PRODUCT default to rmux at the orchestrator
-    // entry point (not in the library `from_env()`, which stays tmux so
-    // the test suite — which legitimately exercises tmux fixtures — keeps
-    // passing without a per-test migration). A live `ccteam start` now
-    // uses the embedded rmux daemon by default; an operator opts out with
-    // `CCTEAM_MUX_BACKEND=tmux`. Idempotent — an explicit operator value
-    // (tmux OR rmux) always wins.
+    // V0.8 rmux — the mux backend default is rmux, resolved in the
+    // library (`ccteam_mux::from_env` / `default_backend`): rmux is the
+    // bundled always-available backend so ccteam works with no external
+    // tmux. An operator opts out with `CCTEAM_MUX_BACKEND=tmux`. Log the
+    // effective choice for ops visibility at orchestrator startup (no
+    // set_var here — the library is the single source of truth).
     //
     // Validated end-to-end on Linux (rmux-smoke CI job: spawn→send→
     // capture→kill + reconnect-after-daemon-death). macOS/Windows run on
     // the CI matrix; real-claude mode-3 burn-in is the merge-to-main gate
     // (this is a no-merge evaluation branch). See
     // docs/versions/v0-8-rmux/w-flip-default-migration-plan.md.
-    if std::env::var_os("CCTEAM_MUX_BACKEND").is_none() {
-        std::env::set_var("CCTEAM_MUX_BACKEND", "rmux");
-        tracing::info!(
-            "ccteam start: mux backend defaulting to rmux (set CCTEAM_MUX_BACKEND=tmux to opt out)"
-        );
-    }
+    tracing::info!(
+        backend = ?ccteam_mux::backend_kind_from_env(),
+        "ccteam start: mux backend (set CCTEAM_MUX_BACKEND=tmux to use tmux)"
+    );
 
     let paths = CcteamPaths::from_env()?;
 

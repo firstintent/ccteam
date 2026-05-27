@@ -342,33 +342,36 @@ pub fn interactive_attach_argv(backend: BackendKind, session_name: &str) -> Vec<
 }
 
 /// Resolve the configured [`BackendKind`] from `CCTEAM_MUX_BACKEND`
-/// (defaults to `tmux`) WITHOUT constructing a backend.
+/// (defaults to `rmux`) WITHOUT constructing a backend.
 ///
 /// Sync, cheap, and side-effect free — meant for sync CLI sites that
 /// branch interactive terminal handover (`ccteam attach`) on the
 /// backend without paying the cost of instantiating a backend (and,
 /// for rmux, without lazily connecting a daemon). Mirrors the match
-/// in [`from_env`]; an unknown value maps to `Tmux` (the safe default)
-/// here rather than erroring, because the callers that need a hard
-/// error already go through [`from_env`].
+/// in [`from_env`]; only an explicit `tmux` opts out — everything else
+/// (unset, empty, or an unknown/typo'd value) resolves to `Rmux`, the
+/// bundled always-available backend. Callers that need a hard error on
+/// a typo go through [`from_env`].
 pub fn backend_kind_from_env() -> BackendKind {
     match std::env::var("CCTEAM_MUX_BACKEND").as_deref() {
-        Ok("rmux") => BackendKind::Rmux,
+        Ok("tmux") => BackendKind::Tmux,
         Ok("inproc-test") => BackendKind::InProc,
-        _ => BackendKind::Tmux,
+        _ => BackendKind::Rmux,
     }
 }
 
 /// Pick a backend from the `CCTEAM_MUX_BACKEND` env var (defaults to
-/// `tmux`). Returns `Arc<dyn MuxBackend>` so the value can be cloned
-/// freely through call chains; do NOT cache as a process-wide
-/// singleton (per-test instantiation keeps mock impls test-isolated
-/// when those land in W2b).
+/// `rmux`, the bundled always-available backend). Explicit `tmux` opts
+/// out; unset/empty falls through to rmux. Returns `Arc<dyn MuxBackend>`
+/// so the value can be cloned freely through call chains; do NOT cache
+/// as a process-wide singleton (per-test instantiation keeps mock impls
+/// test-isolated). Unlike the infallible [`default_backend`], this errors
+/// on an unknown/typo'd value so fallible callers surface the mistake.
 pub fn from_env() -> Result<Arc<dyn MuxBackend>> {
     match std::env::var("CCTEAM_MUX_BACKEND").as_deref() {
-        Ok("rmux") => Ok(Arc::new(RmuxBackend::new())),
+        Ok("tmux") => Ok(Arc::new(TmuxBackend::new())),
         Ok("inproc-test") => Ok(Arc::new(InProcBackend::new())),
-        Ok("tmux") | Ok("") | Err(_) => Ok(Arc::new(TmuxBackend::new())),
+        Ok("rmux") | Ok("") | Err(_) => Ok(Arc::new(RmuxBackend::new())),
         Ok(other) => Err(anyhow!(
             "CCTEAM_MUX_BACKEND=`{other}` is unknown (expected tmux / rmux / inproc-test)"
         )),
@@ -377,18 +380,15 @@ pub fn from_env() -> Result<Arc<dyn MuxBackend>> {
 
 /// Production call sites' backend selector. Honors `CCTEAM_MUX_BACKEND`
 /// exactly like [`from_env`], but is infallible: an unknown/garbage env
-/// value falls back to `TmuxBackend` rather than erroring, so a config
-/// typo degrades to the safe default instead of crashing a live agent.
+/// value degrades to `RmuxBackend` rather than erroring, so a config
+/// typo lands on the bundled always-available backend instead of
+/// crashing a live agent (or on a possibly-absent tmux).
 ///
-/// V0.8 W5 fix: previously this hardcoded `TmuxBackend`, which meant the
-/// W2c-migrated `claude_tui` / `codex_exec` adapters stayed on tmux even
-/// under `CCTEAM_MUX_BACKEND=rmux` — the feature flag had no effect on
-/// production mode-3 spawns. Now `default_backend()` routes by env so
-/// the flag actually reaches every adapter that calls it.
-///
-/// Default (env unset) is still `tmux` — rmux only activates on explicit
-/// `CCTEAM_MUX_BACKEND=rmux`. **Do not cache** — instantiate at the call
-/// site (or thread it through from `main` / daemon startup).
+/// V0.8 default: env-unset (and empty, and typo) resolves to `rmux` —
+/// rmux is the bundled mux so ccteam works with no external tmux. An
+/// operator opts out of rmux only with an explicit `CCTEAM_MUX_BACKEND=tmux`.
+/// **Do not cache** — instantiate at the call site (or thread it through
+/// from `main` / daemon startup).
 pub fn default_backend() -> Arc<dyn MuxBackend> {
-    from_env().unwrap_or_else(|_| Arc::new(TmuxBackend::new()))
+    from_env().unwrap_or_else(|_| Arc::new(RmuxBackend::new()))
 }

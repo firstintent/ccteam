@@ -32,16 +32,16 @@ fn with_backend_env<F: FnOnce()>(value: Option<&str>, body: F) {
 }
 
 #[test]
-fn unset_yields_tmux() {
+fn unset_yields_rmux() {
     with_backend_env(None, || {
-        assert_eq!(backend_kind_from_env(), BackendKind::Tmux);
+        assert_eq!(backend_kind_from_env(), BackendKind::Rmux);
     });
 }
 
 #[test]
-fn empty_yields_tmux() {
+fn empty_yields_rmux() {
     with_backend_env(Some(""), || {
-        assert_eq!(backend_kind_from_env(), BackendKind::Tmux);
+        assert_eq!(backend_kind_from_env(), BackendKind::Rmux);
     });
 }
 
@@ -67,13 +67,14 @@ fn inproc_test_yields_inproc() {
 }
 
 #[test]
-fn unknown_falls_back_to_tmux() {
+fn unknown_falls_back_to_rmux() {
     // `from_env` errors on an unknown value; `backend_kind_from_env`
     // (used only by sync CLI branches that already error elsewhere via
-    // `from_env`) takes the safe default so an attach branch never
-    // misroutes a typo'd value into the rmux path.
+    // `from_env`) degrades to rmux — the bundled always-available
+    // backend — so a typo'd value never misroutes onto a possibly-absent
+    // tmux. Only an explicit `tmux` opts out.
     with_backend_env(Some("bogus"), || {
-        assert_eq!(backend_kind_from_env(), BackendKind::Tmux);
+        assert_eq!(backend_kind_from_env(), BackendKind::Rmux);
     });
 }
 
@@ -96,23 +97,23 @@ fn default_backend_honors_rmux_env() {
 }
 
 #[test]
-fn default_backend_defaults_to_tmux() {
+fn default_backend_defaults_to_rmux() {
     with_backend_env(None, || {
         assert_eq!(
             ccteam_mux::default_backend().backend_kind(),
-            BackendKind::Tmux,
-            "default_backend() default (env unset) stays tmux"
+            BackendKind::Rmux,
+            "default_backend() default (env unset) is rmux — the bundled backend"
         );
     });
 }
 
 #[test]
-fn default_backend_unknown_value_falls_back_to_tmux() {
+fn default_backend_unknown_value_falls_back_to_rmux() {
     with_backend_env(Some("bogus"), || {
         assert_eq!(
             ccteam_mux::default_backend().backend_kind(),
-            BackendKind::Tmux,
-            "default_backend() degrades a typo'd value to the safe default"
+            BackendKind::Rmux,
+            "default_backend() degrades a typo'd value to rmux (the bundled always-available backend)"
         );
     });
 }

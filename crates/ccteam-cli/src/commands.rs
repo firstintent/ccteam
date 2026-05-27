@@ -1807,7 +1807,7 @@ pub fn run_peek(paths: &CcteamPaths, slug: &str) -> Result<String> {
     // non-interactive (a plain-text grid snapshot) so it fits the async
     // `MuxBackend::capture` trait method cleanly; drive it on a
     // current-thread tokio runtime (same pattern as `run_session_rm`).
-    // The default tmux path is unchanged.
+    // The tmux path (opt-out) is unchanged.
     if ccteam_mux::backend_kind_from_env() == ccteam_mux::BackendKind::Rmux {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()

@@ -38,16 +38,16 @@ fn rmux_backend_is_dyn_compat() {
 }
 
 #[test]
-fn from_env_default_yields_tmux() {
-    // No env override → expect the tmux default (regardless of
-    // whether tmux is actually installed; `from_env` just constructs
-    // the backend, it doesn't probe).
+fn from_env_default_yields_rmux() {
+    // No env override → expect the rmux default (the bundled backend;
+    // `from_env` just constructs it, it doesn't connect a daemon here).
     let _guard = match env_lock().lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
     std::env::remove_var("CCTEAM_MUX_BACKEND");
-    let _backend = from_env().expect("from_env default should succeed");
+    let backend = from_env().expect("from_env default should succeed");
+    assert_eq!(backend.backend_kind(), ccteam_mux::BackendKind::Rmux);
 }
 
 #[test]

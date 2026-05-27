@@ -46,8 +46,8 @@ pub const BROADCAST_CAPACITY: usize = 256;
 /// ccteam. Previously this hardcoded `TmuxBackend`, which silently
 /// produced no stream under `CCTEAM_MUX_BACKEND=rmux` (it drove
 /// `tmux pipe-pane` against a session that only exists in the rmux
-/// daemon). Default (env unset) is still tmux; a garbage env value
-/// degrades to tmux rather than erroring.
+/// daemon). Default (env unset) is rmux — the bundled backend; an
+/// operator opts out with `CCTEAM_MUX_BACKEND=tmux`.
 #[derive(Clone)]
 pub struct PtyRegistry {
     backend: Arc<dyn MuxBackend>,

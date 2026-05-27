@@ -50,8 +50,8 @@ async fn handle_session_pane_snapshot(
 async fn serve_pane_snapshot(slug: String, sid: Option<String>, session_name: String) -> Response {
     // V0.8 W1 / G5 — route through the MuxBackend trait, honoring the
     // configured backend via `ccteam_mux::from_env()`
-    // (`CCTEAM_MUX_BACKEND=tmux|rmux`). Under the default tmux backend
-    // `TmuxBackend` bridges to the same blocking
+    // (`CCTEAM_MUX_BACKEND=tmux|rmux`). Under the tmux backend (the
+    // opt-out) `TmuxBackend` bridges to the same blocking
     // `tmux capture-pane / display-message` calls under
     // `spawn_blocking`, so the latency profile is unchanged.
     //
