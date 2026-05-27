@@ -126,8 +126,11 @@ under RmuxBackend**, not the V0.8-default tmux backend.
    flag (`CCTEAM_CLAUDE_BG_VIA_MUX=1`). When enabled, `start_thread`:
    - builds `claude -p <prompt-from-extra_args> --agent <role>
      --dangerously-skip-permissions` (foreground, NOT `--bg`),
-   - `backend.spawn(MuxSessionSpec { kind: Ephemeral, name: "ccteam-bg-<sid>",
-     ... })` so the daemon owns the child,
+   - `backend.spawn(MuxSessionSpec { kind: Ephemeral, name:
+     "ccteam-bg-<slug>-<sid>", ... })` so the daemon owns the child. The
+     `ccteam-bg-` marker prefix is distinct from the `ccteam-<slug>`
+     long-session chat sessions so `list_sessions` / peek tooling can
+     tell mode-2-via-mux spawns apart,
    - returns a `ThreadHandle` whose `raw_extras` records `{"mux_session":
      "<name>", "via_mux": true}` while **preserving** the `tmux_session` field
      and `identity` shape so downstream code is unperturbed,
@@ -155,3 +158,35 @@ under RmuxBackend**, not the V0.8-default tmux backend.
 
 A future wave (W4/W7) can promote the mux path to default once RmuxBackend is
 the default backend and the cost/lifecycle delta is measured.
+
+---
+
+## Known limitation — orchestrator F80 poller interaction (NOT YET WIRED)
+
+The opt-in `CCTEAM_CLAUDE_BG_VIA_MUX=1` path is, today, an **adapter-level
+stepping stone that is not yet end-to-end-usable inside a live orchestrator
+run.** The reason:
+
+A via_mux `ThreadHandle` has `identity = "ccteam-bg-<slug>-<sid>"` (the mux
+session name), **not** a hex `job_id`. The orchestrator's F80
+stale-spawn-cleanup poller (`claude_job::probe_job`) resolves liveness by
+reading `harness::state_json_path(identity)` →
+`~/.claude/jobs/<identity>/state.json`. For a via_mux spawn that file **never
+exists** (there is no `--bg` worker writing a job state). `probe_job` therefore
+returns `JobLiveness::Terminal { status: "killed" }` on the very next poll tick,
+and the orchestrator writes a synthetic `agent_done` — **prematurely retiring
+the spawn while the mux session is still running the agent.**
+
+Consequence: enabling the flag in a real `ccteam start` run would make mode-2
+agents appear to finish instantly. The **default (flag OFF) path is unaffected**
+— the legacy `--bg` + job_id + F80 probe contract is untouched — so this does
+not break the existing flow (per the W3 "behavior preservation is paramount"
+constraint).
+
+**Fix is deferred to a follow-up wave** that touches `crates/ccteam-core/src/
+orchestrator.rs` (explicitly OUT of this agent's W3 scope). That wave must teach
+the orchestrator to recognize `raw_extras.via_mux == true` handles and route
+their completion through the mux session signal (stream-end under TmuxBackend;
+typed `MuxEvent::ProcessExited` under RmuxBackend W2) **instead of** the F80
+`state.json` probe. Until then, the flag is for adapter-level testing /
+RmuxBackend bring-up only, and ships default-OFF.
