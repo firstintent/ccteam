@@ -21,7 +21,7 @@
   - **Slice 1**(`CCTEAM_TYPED_EVENTS=1`):no-enrichment kinds(rate_limit / context_overflow / idle / process_exited)→ `typed_event` 行。
   - **Slice 2**(再加 `CCTEAM_HOOK_VIA_DAEMON=1`):session→TapHandle registry(`Arc::ptr_eq`-guarded)把 W6 HookSink 的 Claude `Stop` hook 路由进对应 session 的 tap 作 `TurnDone` enrichment;`turn_done` pane 模式命中但 grace 窗口内无 hook → `BaseLossy` → `merger_lossy_partial` 行(可靠性兜底);`Paired` 抑制。
   - **Slice 3**(同 Slice 2 flag):`SeqState` 升级为 **time-windowed FIFO**(`PendingSlot { seq, arrived_at: tokio::time::Instant }` + `drop_stale` on opposite queue),消除 multi-in-flight cascade mis-pair;`enrich_kind_for_chat_action` 加映射 `("chat-progress","user-prompt") → UserPromptSubmitted` / `("chat-progress","tool-use") → ToolCallCompleted`。**`pre-tool-use` 不接线**(installer table at `claude_tui.rs:126-135` 不发 PreToolUse;改装表 = 新 finding,见 §未覆盖)。详 `w-slice-3-multi-in-flight-pairing.md`。
-  - 默认路径(两 flag 关)完全不变 → baseline 不受影响。CI:`rmux-smoke.sh` 跑全部 `#[ignore]` 端到端测试(roundtrip + adapter + typed-event pipeline,含 Slice 3 四个 multi-in-flight 场景)。
+  - 默认路径(两 flag 关)完全不变 → baseline 不受影响。CI:`rmux-smoke.sh` 跑全部 `#[ignore]` 端到端测试(roundtrip + adapter + typed-event pipeline,含 Slice 3 四个 multi-in-flight 场景)── 本 WSL2 宿主跑全 11 项 ignored 测试 100% 绿(typed-event pipeline 7/7 含 Slice 3 四项 ~26s)。
 
 ## Remaining
 
