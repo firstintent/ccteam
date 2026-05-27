@@ -58,4 +58,13 @@ CCTEAM_TEST_BIN="$BIN" RMUX_SDK_DAEMON_BINARY="$BIN" \
   cargo test -p ccteam-core --test claude_bg_rmux_adapter_test --locked \
   -- --ignored --nocapture
 
+# Typed-event pipeline coverage: with CCTEAM_TYPED_EVENTS=1 a live rmux
+# session's rate-limit pane line is mirrored into progress.jsonl as a
+# `typed_event` row. The end-to-end test is `#[ignore]` (needs a real
+# daemon + PTY), so run it explicitly with `-- --ignored`.
+echo "==> running typed-event pipeline coverage (--ignored)"
+CCTEAM_TEST_BIN="$BIN" RMUX_SDK_DAEMON_BINARY="$BIN" \
+  cargo test -p ccteam-core --test typed_event_pipeline_test --locked \
+  -- --ignored --nocapture
+
 echo "==> rmux smoke: PASS"
