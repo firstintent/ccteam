@@ -89,6 +89,35 @@ const FALLBACK_DIMS: (u16, u16) = (24, 80);
 /// surfaces wrap `Option<PathBuf>` into `{ok, path?, reason?}`.
 pub type ScreenshotResult = Result<Option<PathBuf>>;
 
+/// Drive an async future to completion from ANY calling context —
+/// plain-sync, inside a current-thread tokio runtime (the async MCP
+/// tool dispatch reaches `render_screenshot` synchronously while a
+/// runtime drives the thread), or inside a multi-thread runtime.
+///
+/// The future runs on a dedicated scoped OS thread that has no ambient
+/// reactor, so `Runtime::block_on` can never collide with a running
+/// runtime ("Cannot start a runtime from within a runtime"). `thread::
+/// scope` lets the future borrow from the caller's stack — the borrows
+/// outlive the joined thread.
+fn block_on_isolated<F, T>(fut: F) -> Result<T>
+where
+    F: std::future::Future<Output = T> + Send,
+    T: Send,
+{
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("build screenshot driver runtime")?;
+                Ok(rt.block_on(fut))
+            })
+            .join()
+            .map_err(|_| anyhow::anyhow!("screenshot driver thread panicked"))?
+    })
+}
+
 /// V0.2.2 F38 entry point. Capture the active pane of the project's
 /// tmux session, render to a PNG under
 /// `<project>/.ccteam/screenshots/<utc>.png`, return the path.
@@ -114,13 +143,13 @@ pub type ScreenshotResult = Result<Option<PathBuf>>;
 /// `TODO(V0.9-rmux-ansi-capture)` there. We accept degraded screenshots
 /// under rmux for V0.8: degraded-but-working beats silently-broken.
 ///
-/// **Runtime note** — this sync fn drives the async trait on a fresh
-/// current-thread tokio runtime. Safe from plain-sync callers (CLI /
-/// MCP) and from `tokio::task::spawn_blocking` worker threads (no
-/// reactor runs there). Do NOT call this directly from inside an
-/// `async fn` on a tokio worker thread without wrapping in
-/// `spawn_blocking` — `Runtime::block_on` panics when nested in a
-/// running runtime.
+/// **Runtime note** — this sync fn drives the async trait via
+/// [`block_on_isolated`], which runs the backend calls on a dedicated
+/// scoped thread with its own runtime. It is therefore safe from ANY
+/// caller: plain-sync (CLI), inside a current-thread runtime (the async
+/// MCP tool dispatch), inside a multi-thread runtime, or a
+/// `spawn_blocking` worker. No `spawn_blocking` wrapper is required at
+/// call sites.
 pub fn render_screenshot(
     paths: &CcteamPaths,
     slug: &str,
@@ -148,20 +177,28 @@ pub fn render_screenshot(
     };
     let id = MuxSessionId::new(session_name.clone());
 
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
+    // Drive capture + pane-dims on a dedicated thread with its own
+    // current-thread runtime (see [`block_on_isolated`]). Safe from ANY
+    // caller — plain-sync CLI, the async MCP tool dispatch, or web's
+    // spawn_blocking — because the spawned thread has no ambient reactor
+    // for `block_on` to collide with. (A prior revision built the
+    // runtime inline and panicked "Cannot start a runtime from within a
+    // runtime" the moment the async MCP screenshot handler reached here.)
+    let (capture_res, dims_res) = match block_on_isolated(async {
+        let cap = backend.capture(&id, lines, true).await;
+        let dims = backend.pane_dims(&id).await;
+        (cap, dims)
+    }) {
+        Ok(pair) => pair,
         Err(err) => {
-            tracing::warn!("screenshot: build tokio runtime failed: {err:#}");
+            tracing::warn!("screenshot: backend driver thread failed: {err:#}");
             return Ok(None);
         }
     };
 
     // 1. capture pane output (ANSI escapes preserved on tmux; plain
     //    text under rmux — see rmux ANSI gap above).
-    let ansi_bytes = match runtime.block_on(backend.capture(&id, lines, true)) {
+    let ansi_bytes = match capture_res {
         Ok(b) if !b.is_empty() => b,
         Ok(_) => {
             tracing::warn!(
@@ -180,7 +217,7 @@ pub fn render_screenshot(
     };
 
     // 2. pane dims (rows × cols) — fall back to 80×24 when query fails.
-    let (rows, cols) = match runtime.block_on(backend.pane_dims(&id)) {
+    let (rows, cols) = match dims_res {
         Ok(Some((r, c))) => (r as usize, c as usize),
         _ => (FALLBACK_DIMS.0 as usize, FALLBACK_DIMS.1 as usize),
     };
