@@ -5287,13 +5287,20 @@ mod tests {
 
     #[test]
     fn run_peek_uses_state_tmux_session_for_meta_project() {
+        // Serialize the env mutation (default backend is now rmux; this
+        // test asserts the tmux peek path, so pin tmux while it runs).
+        let _lock = env_lock().lock().unwrap_or_else(|p| p.into_inner());
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
         let mut state = ProjectState::initial_for_team("meta-cto".into(), "meta-agent".into());
         state.tmux_session = "ccteam-meta-cto".into();
         state.save(&paths.project_state("meta-cto")).unwrap();
 
-        let err = run_peek(&paths, "meta-cto").unwrap_err();
+        std::env::set_var("CCTEAM_MUX_BACKEND", "tmux");
+        let result = run_peek(&paths, "meta-cto");
+        std::env::remove_var("CCTEAM_MUX_BACKEND");
+
+        let err = result.unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("ccteam-meta-cto"),
