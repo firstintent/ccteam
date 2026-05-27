@@ -30,7 +30,7 @@ use crate::tmux_ops::{
     capture_pane_tail_from_session, capture_pane_with_ansi_from_session, list_sessions,
     query_pane_dims_from_session, resize_window, TmuxSession,
 };
-use crate::{MuxBackend, MuxEventStream, MuxSessionId, MuxSessionSpec};
+use crate::{BackendKind, MuxBackend, MuxEventStream, MuxSessionId, MuxSessionSpec};
 
 use fifo_relay::FifoRelayRegistry;
 
@@ -249,6 +249,10 @@ impl MuxBackend for TmuxBackend {
             .await
             .map_err(|e| anyhow!("MuxBackend(tmux)::list_sessions join error: {e}"))?;
         Ok(names.into_iter().map(MuxSessionId).collect())
+    }
+
+    fn backend_kind(&self) -> BackendKind {
+        BackendKind::Tmux
     }
 }
 

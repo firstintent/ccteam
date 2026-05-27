@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
-use crate::{MuxBackend, MuxEventStream, MuxSessionId, MuxSessionSpec};
+use crate::{BackendKind, MuxBackend, MuxEventStream, MuxSessionId, MuxSessionSpec};
 
 struct InProcSession {
     handle: JoinHandle<()>,
@@ -149,6 +149,10 @@ impl MuxBackend for InProcBackend {
             .filter(|(_, s)| !s.handle.is_finished())
             .map(|(k, _)| MuxSessionId::new(k.clone()))
             .collect())
+    }
+
+    fn backend_kind(&self) -> BackendKind {
+        BackendKind::InProc
     }
 }
 

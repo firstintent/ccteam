@@ -76,3 +76,43 @@ fn unknown_falls_back_to_tmux() {
         assert_eq!(backend_kind_from_env(), BackendKind::Tmux);
     });
 }
+
+// V0.8 W5-fix regression guard: `default_backend()` must HONOR
+// CCTEAM_MUX_BACKEND, not hardcode tmux. Before the fix the W2c-migrated
+// claude_tui / codex_exec adapters (which call default_backend()) stayed
+// on tmux even under CCTEAM_MUX_BACKEND=rmux, so the feature flag had no
+// effect on production mode-3 spawns. These assert the routing reaches
+// the backend the trait object actually is, via backend_kind().
+
+#[test]
+fn default_backend_honors_rmux_env() {
+    with_backend_env(Some("rmux"), || {
+        assert_eq!(
+            ccteam_mux::default_backend().backend_kind(),
+            BackendKind::Rmux,
+            "default_backend() must route to rmux under CCTEAM_MUX_BACKEND=rmux"
+        );
+    });
+}
+
+#[test]
+fn default_backend_defaults_to_tmux() {
+    with_backend_env(None, || {
+        assert_eq!(
+            ccteam_mux::default_backend().backend_kind(),
+            BackendKind::Tmux,
+            "default_backend() default (env unset) stays tmux"
+        );
+    });
+}
+
+#[test]
+fn default_backend_unknown_value_falls_back_to_tmux() {
+    with_backend_env(Some("bogus"), || {
+        assert_eq!(
+            ccteam_mux::default_backend().backend_kind(),
+            BackendKind::Tmux,
+            "default_backend() degrades a typo'd value to the safe default"
+        );
+    });
+}

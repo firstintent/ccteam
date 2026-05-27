@@ -297,6 +297,11 @@ pub trait MuxBackend: Send + Sync {
 
     /// List all live sessions managed by this backend.
     async fn list_sessions(&self) -> Result<Vec<MuxSessionId>>;
+
+    /// Which concrete backend this is. Lets callers introspect what
+    /// [`default_backend`] / [`from_env`] actually returned (the trait
+    /// object otherwise erases the impl type).
+    fn backend_kind(&self) -> BackendKind;
 }
 
 /// Build argv for an interactive terminal handover (`tmux attach -t
@@ -363,10 +368,20 @@ pub fn from_env() -> Result<Arc<dyn MuxBackend>> {
     }
 }
 
-/// Convenience for production call sites that want the default
-/// backend without env override. Equivalent to constructing a fresh
-/// `TmuxBackend`. **Do not cache** — instantiate at the call site (or
-/// thread it through from `main` / daemon startup).
+/// Production call sites' backend selector. Honors `CCTEAM_MUX_BACKEND`
+/// exactly like [`from_env`], but is infallible: an unknown/garbage env
+/// value falls back to `TmuxBackend` rather than erroring, so a config
+/// typo degrades to the safe default instead of crashing a live agent.
+///
+/// V0.8 W5 fix: previously this hardcoded `TmuxBackend`, which meant the
+/// W2c-migrated `claude_tui` / `codex_exec` adapters stayed on tmux even
+/// under `CCTEAM_MUX_BACKEND=rmux` — the feature flag had no effect on
+/// production mode-3 spawns. Now `default_backend()` routes by env so
+/// the flag actually reaches every adapter that calls it.
+///
+/// Default (env unset) is still `tmux` — rmux only activates on explicit
+/// `CCTEAM_MUX_BACKEND=rmux`. **Do not cache** — instantiate at the call
+/// site (or thread it through from `main` / daemon startup).
 pub fn default_backend() -> Arc<dyn MuxBackend> {
-    Arc::new(TmuxBackend::new())
+    from_env().unwrap_or_else(|_| Arc::new(TmuxBackend::new()))
 }

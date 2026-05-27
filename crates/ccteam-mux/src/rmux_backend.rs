@@ -46,7 +46,7 @@ use rmux_sdk::{
 };
 
 use crate::patterns::{PatternMatcher, PatternVendor};
-use crate::{MuxBackend, MuxEvent, MuxEventStream, MuxSessionId, MuxSessionSpec};
+use crate::{BackendKind, MuxBackend, MuxEvent, MuxEventStream, MuxSessionId, MuxSessionSpec};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 5;
 
@@ -495,5 +495,9 @@ impl MuxBackend for RmuxBackend {
             .into_iter()
             .map(|n| MuxSessionId::new(n.as_str().to_string()))
             .collect())
+    }
+
+    fn backend_kind(&self) -> BackendKind {
+        BackendKind::Rmux
     }
 }
