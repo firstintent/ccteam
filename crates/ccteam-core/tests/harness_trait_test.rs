@@ -88,7 +88,13 @@ impl Drop for EnvGuard {
     }
 }
 
+// `#[serial]` because this asserts the DEFAULT (`claude --bg`) path,
+// which requires `CCTEAM_CLAUDE_BG_VIA_MUX` UNSET. The via_mux tests
+// below set that env var process-globally; without serialization a
+// concurrent via_mux test flips this test onto the foreground-in-mux
+// path and the `tmux_session`/`identity` asserts fail intermittently.
 #[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
 async fn claude_bg_start_thread_parses_backgrounded_marker() {
     // Build a fake `claude` script that prints the `backgrounded ·
     // <id>` marker on stdout — same fixture shape V0.4.0 F61 used.
