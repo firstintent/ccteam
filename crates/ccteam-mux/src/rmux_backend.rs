@@ -31,6 +31,7 @@
 //! through `ccteam-web::pty::PtyRegistry` until W2b ports the registry.
 
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -38,11 +39,12 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use futures::stream;
 use rmux_sdk::PaneLineStream;
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::Mutex;
 
 use rmux_sdk::{
     bootstrap::discovery::SDK_DAEMON_BINARY_ENV, EnsureSession, EnsureSessionPolicy, PaneInfo,
-    PaneLineItem, PaneProcessState, ProcessSpec, Rmux, RmuxEndpoint, SessionName, TerminalSizeSpec,
+    PaneLineItem, PaneProcessState, ProcessSpec, Rmux, RmuxEndpoint, RmuxError, SessionName,
+    TerminalSizeSpec,
 };
 
 use crate::patterns::{PatternMatcher, PatternVendor};
@@ -89,6 +91,35 @@ fn ensure_socket_parent(socket: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Classify an SDK error as a dead / closed-transport failure that a
+/// fresh `connect_or_start` could recover from.
+///
+/// Keys on [`RmuxError::Transport`] with the same `io::ErrorKind` set
+/// the SDK itself treats as a clean transport close
+/// (`is_clean_shutdown_close` in the SDK's `rmux` handle) —
+/// `UnexpectedEof | ConnectionReset | BrokenPipe | NotConnected` — plus
+/// `ConnectionRefused`, which is the stale-socket case after a daemon
+/// crash or reboot (the socket file lingers but nothing is listening).
+///
+/// Deliberately narrow: `io::ErrorKind::Other`, protocol errors, and
+/// per-session errors (`PaneNotFound`, etc.) are NOT treated as
+/// transport-dead — reconnecting would not change their outcome.
+fn is_dead_transport(err: &RmuxError) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        err,
+        RmuxError::Transport { source, .. }
+            if matches!(
+                source.kind(),
+                ErrorKind::UnexpectedEof
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::NotConnected
+                    | ErrorKind::ConnectionRefused
+            )
+    )
+}
+
 /// Per-session compiled pattern registry, keyed by `MuxSessionId`.
 /// Shares the [`PatternMatcher`] type with `TmuxBackend`; `subscribe`
 /// snapshots the matcher (`Arc::clone`) into the line-stream translator.
@@ -105,12 +136,24 @@ struct RmuxStreamState {
 
 /// `RmuxBackend` — ccteam's MuxBackend impl over rmux-sdk 0.3.
 ///
-/// The SDK `Rmux` handle is lazily initialized on first use through a
-/// [`OnceCell`] so the daemon spawn cost (~50-200ms) is paid only when
-/// the backend is actually used. Once connected, all subsequent calls
-/// reuse the same transport.
+/// The SDK `Rmux` handle is lazily connected on first use and cached in
+/// a [`Mutex`]-guarded `Option<Arc<Rmux>>` so the daemon spawn cost
+/// (~50-200ms) is paid only when the backend is actually used.
+///
+/// Unlike a `OnceCell`, the cache is **invalidatable**: if the daemon
+/// dies (machine reboot, daemon crash, OOM) the cached handle's
+/// transport is dead and every subsequent operation would fail
+/// permanently. Each operation therefore runs through [`Self::call`],
+/// which inspects the SDK error: on a dead-transport / closed-connection
+/// error it drops the stale handle, reconnects via `connect_or_start`
+/// (which re-spawns the daemon only if no socket answers), and retries
+/// the operation once. The Arc is cloned out under the lock and the lock
+/// is released before the operation runs, so backend calls do not
+/// serialize on each other; reconnect is serialized by an
+/// [`Arc::ptr_eq`] check so concurrent reconnects spawn at most one fresh
+/// handle (the loser observes the winner's new Arc and reuses it).
 pub struct RmuxBackend {
-    rmux: OnceCell<Rmux>,
+    rmux: Mutex<Option<Arc<Rmux>>>,
     socket_path: PathBuf,
     pattern_registry: PatternRegistry,
 }
@@ -157,32 +200,91 @@ impl RmuxBackend {
             }
         }
         Self {
-            rmux: OnceCell::new(),
+            rmux: Mutex::new(None),
             socket_path,
             pattern_registry: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// Lazily connect (or start) the daemon and cache the SDK handle.
-    async fn rmux(&self) -> Result<&Rmux> {
-        self.rmux
-            .get_or_try_init(|| async {
-                ensure_socket_parent(&self.socket_path)?;
-                let endpoint = RmuxEndpoint::UnixSocket(self.socket_path.clone());
-                let rmux = Rmux::builder()
-                    .endpoint(endpoint)
-                    .default_timeout(std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS))
-                    .connect_or_start()
-                    .await
-                    .map_err(|e| {
-                        anyhow!(
-                            "RmuxBackend connect_or_start at {}: {e}",
-                            self.socket_path.display()
-                        )
-                    })?;
-                Ok::<Rmux, anyhow::Error>(rmux)
-            })
+    /// Build a fresh SDK handle by connecting to — or starting — the
+    /// daemon. `connect_or_start` first tries the existing socket
+    /// (cheap) and only spawns a new daemon if none answers, so calling
+    /// this to recover from a dead handle is safe: a live daemon is
+    /// reused, a dead one is replaced.
+    async fn connect_fresh(&self) -> Result<Arc<Rmux>> {
+        ensure_socket_parent(&self.socket_path)?;
+        let endpoint = RmuxEndpoint::UnixSocket(self.socket_path.clone());
+        let rmux = Rmux::builder()
+            .endpoint(endpoint)
+            .default_timeout(std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+            .connect_or_start()
             .await
+            .map_err(|e| {
+                anyhow!(
+                    "RmuxBackend connect_or_start at {}: {e}",
+                    self.socket_path.display()
+                )
+            })?;
+        Ok(Arc::new(rmux))
+    }
+
+    /// Return the cached handle, connecting (or starting the daemon) on
+    /// first use. The Arc is cloned out under the lock; the lock is
+    /// released before the caller uses the handle.
+    async fn rmux(&self) -> Result<Arc<Rmux>> {
+        let mut guard = self.rmux.lock().await;
+        if let Some(rmux) = guard.as_ref() {
+            return Ok(Arc::clone(rmux));
+        }
+        let rmux = self.connect_fresh().await?;
+        *guard = Some(Arc::clone(&rmux));
+        Ok(rmux)
+    }
+
+    /// Invalidate `stale` and return a freshly connected handle. The
+    /// [`Arc::ptr_eq`] guard makes concurrent reconnects converge: only
+    /// the first caller (whose `stale` still matches the cached Arc)
+    /// reconnects; later callers observe the replacement and reuse it,
+    /// so a daemon hiccup never triggers a reconnect storm of multiple
+    /// `connect_or_start` daemon spawns.
+    async fn reconnect(&self, stale: &Arc<Rmux>) -> Result<Arc<Rmux>> {
+        let mut guard = self.rmux.lock().await;
+        match guard.as_ref() {
+            Some(current) if !Arc::ptr_eq(current, stale) => {
+                // Someone else already reconnected — reuse their handle.
+                Ok(Arc::clone(current))
+            }
+            _ => {
+                let fresh = self.connect_fresh().await?;
+                *guard = Some(Arc::clone(&fresh));
+                Ok(fresh)
+            }
+        }
+    }
+
+    /// Run one SDK operation with reconnect-on-dead-transport.
+    ///
+    /// `op` is invoked with the cached handle; if it returns a
+    /// dead-transport error ([`is_dead_transport`]) the cache is
+    /// invalidated, the daemon reconnected, and `op` retried **once**.
+    /// Any other error — and the retry's error, dead-transport or not —
+    /// propagates. `label` prefixes the surfaced anyhow error.
+    async fn call<T, F, Fut>(&self, label: &str, op: F) -> Result<T>
+    where
+        F: Fn(Arc<Rmux>) -> Fut,
+        Fut: Future<Output = rmux_sdk::Result<T>>,
+    {
+        let rmux = self.rmux().await?;
+        match op(Arc::clone(&rmux)).await {
+            Ok(value) => Ok(value),
+            Err(err) if is_dead_transport(&err) => {
+                let fresh = self.reconnect(&rmux).await?;
+                op(fresh)
+                    .await
+                    .map_err(|e| anyhow!("RmuxBackend::{label} (after reconnect): {e}"))
+            }
+            Err(err) => Err(anyhow!("RmuxBackend::{label}: {err}")),
+        }
     }
 
     async fn session_name(&self, id: &MuxSessionId) -> Result<SessionName> {
@@ -213,25 +315,23 @@ impl RmuxBackend {
     /// session exists and has at least one pane. Used by `pane_pid`,
     /// `pane_dims`, and `list_pane_pids`.
     async fn first_pane_info(&self, id: &MuxSessionId) -> Result<Option<PaneInfo>> {
-        let rmux = self.rmux().await?;
         let name = self.session_name(id).await?;
-        let session = rmux
-            .session(name)
-            .await
-            .map_err(|e| anyhow!("RmuxBackend: session lookup `{}`: {e}", id.0))?;
-        let pane = session.pane(0, 0);
-        let snapshot = pane
-            .info()
-            .await
-            .map_err(|e| anyhow!("RmuxBackend: pane info `{}`: {e}", id.0))?;
-        Ok(snapshot.panes.into_iter().next())
+        let label = format!("first_pane_info `{}`", id.0);
+        self.call(&label, |rmux| {
+            let name = name.clone();
+            async move {
+                let session = rmux.session(name).await?;
+                let snapshot = session.pane(0, 0).info().await?;
+                Ok(snapshot.panes.into_iter().next())
+            }
+        })
+        .await
     }
 }
 
 #[async_trait]
 impl MuxBackend for RmuxBackend {
     async fn spawn(&self, spec: MuxSessionSpec) -> Result<MuxSessionId> {
-        let rmux = self.rmux().await?;
         let session_name = SessionName::new(spec.name.clone()).map_err(|e| {
             anyhow!(
                 "RmuxBackend::spawn invalid session name `{}`: {e}",
@@ -239,60 +339,70 @@ impl MuxBackend for RmuxBackend {
             )
         })?;
         let env_strings: Vec<String> = spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
-        let mut process = ProcessSpec::argv(spec.argv.iter().cloned());
-        process.environment = Some(env_strings);
-        let mut ensure = EnsureSession::named(session_name.clone())
-            .policy(EnsureSessionPolicy::CreateOnly)
-            .detached(true)
-            .size(TerminalSizeSpec::new(spec.size.0, spec.size.1))
-            .process(process);
         // working_directory is a String template on the SDK; lossy
         // unicode conversion is fine — paths originate from the
         // operator's environment which is UTF-8 in practice.
-        ensure = ensure.working_directory(spec.working_dir.to_string_lossy().into_owned());
-
-        rmux.ensure_session(ensure)
-            .await
-            .map_err(|e| anyhow!("RmuxBackend::spawn `{}`: {e}", spec.name))?;
+        let working_dir = spec.working_dir.to_string_lossy().into_owned();
+        let label = format!("spawn `{}`", spec.name);
+        self.call(&label, |rmux| {
+            let session_name = session_name.clone();
+            let env_strings = env_strings.clone();
+            let argv = spec.argv.clone();
+            let working_dir = working_dir.clone();
+            let size = spec.size;
+            async move {
+                let mut process = ProcessSpec::argv(argv);
+                process.environment = Some(env_strings);
+                let ensure = EnsureSession::named(session_name)
+                    .policy(EnsureSessionPolicy::CreateOnly)
+                    .detached(true)
+                    .size(TerminalSizeSpec::new(size.0, size.1))
+                    .process(process)
+                    .working_directory(working_dir);
+                rmux.ensure_session(ensure).await?;
+                Ok(())
+            }
+        })
+        .await?;
         Ok(MuxSessionId::new(spec.name))
     }
 
     async fn exists(&self, id: &MuxSessionId) -> Result<bool> {
-        let rmux = self.rmux().await?;
         let name = self.session_name(id).await?;
-        rmux.has_session(name)
-            .await
-            .map_err(|e| anyhow!("RmuxBackend::exists `{}`: {e}", id.0))
+        let label = format!("exists `{}`", id.0);
+        self.call(&label, |rmux| {
+            let name = name.clone();
+            async move { rmux.has_session(name).await }
+        })
+        .await
     }
 
     async fn send_text(&self, id: &MuxSessionId, text: &str) -> Result<()> {
-        let rmux = self.rmux().await?;
         let name = self.session_name(id).await?;
-        let session = rmux
-            .session(name)
-            .await
-            .map_err(|e| anyhow!("RmuxBackend::send_text session `{}`: {e}", id.0))?;
-        session
-            .pane(0, 0)
-            .send_text(text)
-            .await
-            .map_err(|e| anyhow!("RmuxBackend::send_text `{}`: {e}", id.0))?;
-        Ok(())
+        let label = format!("send_text `{}`", id.0);
+        self.call(&label, |rmux| {
+            let name = name.clone();
+            async move {
+                let session = rmux.session(name).await?;
+                session.pane(0, 0).send_text(text).await?;
+                Ok(())
+            }
+        })
+        .await
     }
 
     async fn send_enter(&self, id: &MuxSessionId) -> Result<()> {
-        let rmux = self.rmux().await?;
         let name = self.session_name(id).await?;
-        let session = rmux
-            .session(name)
-            .await
-            .map_err(|e| anyhow!("RmuxBackend::send_enter session `{}`: {e}", id.0))?;
-        session
-            .pane(0, 0)
-            .send_key("Enter")
-            .await
-            .map_err(|e| anyhow!("RmuxBackend::send_enter `{}`: {e}", id.0))?;
-        Ok(())
+        let label = format!("send_enter `{}`", id.0);
+        self.call(&label, |rmux| {
+            let name = name.clone();
+            async move {
+                let session = rmux.session(name).await?;
+                session.pane(0, 0).send_key("Enter").await?;
+                Ok(())
+            }
+        })
+        .await
     }
 
     async fn capture(&self, id: &MuxSessionId, lines: usize, _with_ansi: bool) -> Result<Vec<u8>> {
@@ -301,23 +411,22 @@ impl MuxBackend for RmuxBackend {
         // plain-text bytes for both `with_ansi=true` and `false`. Web
         // SSE consumers that need raw bytes continue routing through
         // `ccteam-web::pty::PtyRegistry` until W2b ports the registry.
-        let rmux = self.rmux().await?;
         let name = self.session_name(id).await?;
-        let session = rmux
-            .session(name)
-            .await
-            .map_err(|e| anyhow!("RmuxBackend::capture session `{}`: {e}", id.0))?;
-        let snapshot = session
-            .pane(0, 0)
-            .snapshot()
-            .await
-            .map_err(|e| anyhow!("RmuxBackend::capture `{}`: {e}", id.0))?;
-        let visible_lines = snapshot.visible_lines();
-        // Honor `lines` by taking the last N.
-        let take = lines.min(visible_lines.len());
-        let start = visible_lines.len().saturating_sub(take);
-        let slice = &visible_lines[start..];
-        Ok(slice.join("\n").into_bytes())
+        let label = format!("capture `{}`", id.0);
+        self.call(&label, |rmux| {
+            let name = name.clone();
+            async move {
+                let session = rmux.session(name).await?;
+                let snapshot = session.pane(0, 0).snapshot().await?;
+                let visible_lines = snapshot.visible_lines();
+                // Honor `lines` by taking the last N.
+                let take = lines.min(visible_lines.len());
+                let start = visible_lines.len().saturating_sub(take);
+                let slice = &visible_lines[start..];
+                Ok(slice.join("\n").into_bytes())
+            }
+        })
+        .await
     }
 
     async fn pane_dims(&self, id: &MuxSessionId) -> Result<Option<(u16, u16)>> {
@@ -354,18 +463,20 @@ impl MuxBackend for RmuxBackend {
     }
 
     async fn resize(&self, id: &MuxSessionId, cols: u16, rows: u16) -> Result<()> {
-        let rmux = self.rmux().await?;
         let name = self.session_name(id).await?;
-        let session = rmux
-            .session(name)
-            .await
-            .map_err(|e| anyhow!("RmuxBackend::resize session `{}`: {e}", id.0))?;
-        session
-            .pane(0, 0)
-            .resize(TerminalSizeSpec::new(cols, rows))
-            .await
-            .map_err(|e| anyhow!("RmuxBackend::resize `{}`: {e}", id.0))?;
-        Ok(())
+        let label = format!("resize `{}`", id.0);
+        self.call(&label, |rmux| {
+            let name = name.clone();
+            async move {
+                let session = rmux.session(name).await?;
+                session
+                    .pane(0, 0)
+                    .resize(TerminalSizeSpec::new(cols, rows))
+                    .await?;
+                Ok(())
+            }
+        })
+        .await
     }
 
     async fn subscribe(&self, id: &MuxSessionId) -> Result<MuxEventStream> {
@@ -376,17 +487,20 @@ impl MuxBackend for RmuxBackend {
                 .cloned()
                 .unwrap_or_else(|| Arc::new(PatternMatcher::new()))
         };
-        let rmux = self.rmux().await?;
         let name = self.session_name(id).await?;
-        let session = rmux
-            .session(name)
-            .await
-            .map_err(|e| anyhow!("RmuxBackend::subscribe session `{}`: {e}", id.0))?;
-        let line_stream = session
-            .pane(0, 0)
-            .line_stream()
-            .await
-            .map_err(|e| anyhow!("RmuxBackend::subscribe line_stream `{}`: {e}", id.0))?;
+        let label = format!("subscribe `{}`", id.0);
+        // The returned `PaneLineStream` owns a cloned transport, so it
+        // outlives the `Rmux` handle and the lock — safe to construct
+        // inside `call` and return past the closure.
+        let line_stream = self
+            .call(&label, |rmux| {
+                let name = name.clone();
+                async move {
+                    let session = rmux.session(name).await?;
+                    session.pane(0, 0).line_stream().await
+                }
+            })
+            .await?;
 
         // unfold over (line_stream, matcher, pending). One `Line` may
         // yield 1 OutputChunk + N PatternMatched; `pending` holds the
@@ -459,38 +573,35 @@ impl MuxBackend for RmuxBackend {
     }
 
     async fn kill(&self, id: &MuxSessionId) -> Result<()> {
-        let rmux = self.rmux().await?;
         let name = self.session_name(id).await?;
-        // Look up first to make `kill` idempotent on absent sessions
-        // (`session()` uses `ReuseOnly` policy which errors when the
-        // session is missing; `has_session` is cheaper than catching
-        // that error).
-        if !rmux
-            .has_session(name.clone())
-            .await
-            .map_err(|e| anyhow!("RmuxBackend::kill has_session `{}`: {e}", id.0))?
-        {
-            return Ok(());
-        }
-        let session = rmux
-            .session(name)
-            .await
-            .map_err(|e| anyhow!("RmuxBackend::kill session `{}`: {e}", id.0))?;
-        let _killed = session
-            .kill()
-            .await
-            .map_err(|e| anyhow!("RmuxBackend::kill `{}`: {e}", id.0))?;
-        // Both `true` (existed and was killed) and `false` (already
-        // gone) map to our `Ok(())` per the trait contract.
-        Ok(())
+        let label = format!("kill `{}`", id.0);
+        self.call(&label, |rmux| {
+            let name = name.clone();
+            async move {
+                // Look up first to make `kill` idempotent on absent
+                // sessions (`session()` uses `ReuseOnly` policy which
+                // errors when the session is missing; `has_session` is
+                // cheaper than catching that error).
+                if !rmux.has_session(name.clone()).await? {
+                    return Ok(());
+                }
+                let session = rmux.session(name).await?;
+                // Both `true` (existed and was killed) and `false`
+                // (already gone) map to `Ok(())` per the trait contract.
+                let _killed = session.kill().await?;
+                Ok(())
+            }
+        })
+        .await
     }
 
     async fn list_sessions(&self) -> Result<Vec<MuxSessionId>> {
-        let rmux = self.rmux().await?;
-        let names = rmux
-            .list_sessions()
-            .await
-            .map_err(|e| anyhow!("RmuxBackend::list_sessions: {e}"))?;
+        let names = self
+            .call(
+                "list_sessions",
+                |rmux| async move { rmux.list_sessions().await },
+            )
+            .await?;
         Ok(names
             .into_iter()
             .map(|n| MuxSessionId::new(n.as_str().to_string()))
@@ -499,5 +610,86 @@ impl MuxBackend for RmuxBackend {
 
     fn backend_kind(&self) -> BackendKind {
         BackendKind::Rmux
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+
+    /// `is_dead_transport` must fire for the closed/dead-connection
+    /// `io::ErrorKind`s that a fresh `connect_or_start` can recover from
+    /// — and must NOT fire for protocol / per-session errors (reconnect
+    /// would not change their outcome) or for unrelated I/O kinds.
+    #[test]
+    fn classifies_dead_transport_errors() {
+        let dead_kinds = [
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::NotConnected,
+            io::ErrorKind::ConnectionRefused,
+        ];
+        for kind in dead_kinds {
+            let err = RmuxError::transport("op", io::Error::new(kind, "boom"));
+            assert!(
+                is_dead_transport(&err),
+                "{kind:?} must be classified dead-transport"
+            );
+        }
+
+        // A transport error with an unrelated kind is NOT dead-transport
+        // (too broad to reconnect on).
+        let other = RmuxError::transport("op", io::Error::other("weird"));
+        assert!(!is_dead_transport(&other));
+
+        // Non-transport errors are never dead-transport.
+        let unsupported = RmuxError::unsupported("feature", "hint");
+        assert!(!is_dead_transport(&unsupported));
+        let invalid = RmuxError::invalid_regex("[", "unterminated");
+        assert!(!is_dead_transport(&invalid));
+    }
+
+    /// `reconnect` with a stale handle that no longer matches the cached
+    /// Arc must reuse the cached handle (the concurrent-reconnect loser
+    /// path) WITHOUT contacting a daemon. We seed the slot with an inert
+    /// `Rmux` (construction does not contact a daemon) and hand
+    /// `reconnect` a *different* Arc as the "stale" one, so `ptr_eq` is
+    /// false and the cached handle is returned as-is.
+    #[tokio::test]
+    async fn reconnect_reuses_cache_when_another_caller_already_replaced_it() {
+        let backend = RmuxBackend::with_socket_path(PathBuf::from("/nonexistent/never.sock"));
+        // Seed the cache with an inert handle (the "winner's" fresh Arc).
+        let winner = Arc::new(Rmux::new());
+        *backend.rmux.lock().await = Some(Arc::clone(&winner));
+
+        // A different Arc plays the role of a handle some other op was
+        // holding when it hit a dead transport.
+        let stale = Arc::new(Rmux::new());
+        assert!(!Arc::ptr_eq(&winner, &stale));
+
+        let recovered = backend
+            .reconnect(&stale)
+            .await
+            .expect("reconnect must reuse the cached handle without a daemon");
+        assert!(
+            Arc::ptr_eq(&recovered, &winner),
+            "reconnect must return the already-cached handle, not connect afresh"
+        );
+    }
+
+    /// `rmux()` caches on first call: a second call returns the same Arc.
+    /// Seeded via the inert-handle slot so no daemon is needed.
+    #[tokio::test]
+    async fn rmux_returns_cached_handle_on_second_call() {
+        let backend = RmuxBackend::with_socket_path(PathBuf::from("/nonexistent/never.sock"));
+        let seeded = Arc::new(Rmux::new());
+        *backend.rmux.lock().await = Some(Arc::clone(&seeded));
+
+        let first = backend.rmux().await.expect("cached handle");
+        let second = backend.rmux().await.expect("cached handle");
+        assert!(Arc::ptr_eq(&first, &seeded));
+        assert!(Arc::ptr_eq(&first, &second));
     }
 }
