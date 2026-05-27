@@ -696,11 +696,19 @@ fn parse_jsonl_item(item: &Value) -> ThreadItem {
                 .and_then(|v| v.as_str())
                 .map(std::path::PathBuf::from)
                 .unwrap_or_default();
+            // PatchChangeKind on the Codex wire is a tagged-enum OBJECT
+            // (`{"type":"add"}`), so the old `.as_str()` read always
+            // yielded None and every patch silently defaulted to
+            // "update" (same bug class fixed in codex_app_server.rs by
+            // the #18/#20 sweep). Dual-read: object → its "type" tag,
+            // flat string → itself (mode-2 `codex exec --json` wire shape
+            // is not separately pinned, so accept both to avoid a
+            // regression either way).
             let kind = item
                 .get("changes")
                 .and_then(|c| c.get(0))
                 .and_then(|c| c.get("kind"))
-                .and_then(|v| v.as_str())
+                .and_then(|k| k.get("type").and_then(|t| t.as_str()).or_else(|| k.as_str()))
                 .unwrap_or("update")
                 .to_string();
             ThreadItemDetails::FileChange { path, kind }
