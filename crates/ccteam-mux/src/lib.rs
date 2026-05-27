@@ -39,6 +39,7 @@ pub mod patterns;
 pub mod rmux_backend;
 pub mod tmux_backend;
 pub mod tmux_ops;
+pub mod typed_event_tap;
 
 pub use enriched_event::{
     enrichment_source, BaseEvent, BasePayload, EnrichedEvent, EnrichmentEvent, EnrichmentPayload,
@@ -48,6 +49,7 @@ pub use hook_sink::{default_ccteam_hook_socket_path, HookEvent, HookSink, HookSi
 pub use inproc_backend::InProcBackend;
 pub use rmux_backend::{default_ccteam_mux_socket_path, RmuxBackend};
 pub use tmux_backend::TmuxBackend;
+pub use typed_event_tap::{event_kind_for_regex_id, RawEnrichment, TapHandle, TypedEventTap};
 
 /// Vendor-agnostic identity for a mux-backed session.
 ///
