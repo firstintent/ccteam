@@ -673,6 +673,29 @@ pub fn build_codex_rate_limit_event(snapshot: Value) -> Value {
     })
 }
 
+/// Build a `typed_event` observability row from the rmux typed-event
+/// pipeline. These surface daemon-side pattern detections (rate-limit /
+/// context-overflow / idle / process-exit) merged through the
+/// EnrichedEvent merger. They exist for **visibility only** — NOTHING
+/// currently acts on them. `event_kind` is a stable snake_case kind
+/// string, `captured` the lossy P2/P3 detail, `session` the mux session
+/// identity.
+pub fn build_typed_event_event(
+    vendor: &str,
+    event_kind: &str,
+    captured: &str,
+    session: &str,
+) -> Value {
+    serde_json::json!({
+        "kind": "typed_event",
+        "vendor": vendor,
+        "event_kind": event_kind,
+        "captured": captured,
+        "session": session,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
 /// True if `kind` is one of the chat-mode event names (F108 / F118 /
 /// F192c / F195 / F196).
 pub fn is_chat_event(kind: &str) -> bool {

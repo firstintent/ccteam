@@ -426,6 +426,20 @@ impl HarnessAdapter for ClaudeTuiAdapter {
                 .map_err(|e| HarnessError::SpawnFailed(format!("mux spawn new: {e}")))?;
         }
 
+        // V0.8 rmux Slice 1 — all three branches above (reattach /
+        // recreate / fresh) converge here with a confirmed-live session.
+        // Start a typed-event tap that mirrors no-enrichment pattern
+        // detections into progress.jsonl. No-op unless CCTEAM_TYPED_EVENTS
+        // is set, so the flag-OFF path is behavior-neutral (one env check).
+        if let Ok(paths) = crate::CcteamPaths::from_env() {
+            crate::execution::typed_events::maybe_start_typed_event_tap(
+                backend.clone(),
+                id.clone(),
+                ccteam_mux::Vendor::Claude,
+                paths.progress_jsonl(&ctx.slug),
+            );
+        }
+
         // 4. Heartbeat file — lightweight liveness marker the imd watch
         //    + meta-agent dashboard can poll.
         let heartbeat = ctx

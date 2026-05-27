@@ -27,6 +27,8 @@ pub mod process_inspect;
 pub mod session_recovery;
 pub mod transcript_tail;
 pub mod turns_mirror;
+// V0.8 rmux — Slice 1 typed-event consumer (gated by CCTEAM_TYPED_EVENTS).
+pub mod typed_events;
 
 pub use claude_bg::ClaudeBgAdapter;
 pub use claude_tui::ClaudeTuiAdapter;
