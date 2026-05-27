@@ -204,15 +204,27 @@ impl TypedEventTap {
             use futures::StreamExt;
 
             let mut seq = SeqState::default();
-            // Once the subscribe stream ends we stop polling it; likewise
-            // once every TapHandle is dropped the enrichment channel is
-            // closed and we stop polling it. The task exits cleanly when
-            // BOTH inputs are exhausted (or the consumer drops out_rx).
-            // Guarding each branch on its `*_done` flag is what prevents a
-            // closed channel's immediate `recv()->None` from busy-spinning
-            // the select loop.
+            // Lifetime model: the tap lives as long as the session's
+            // subscribe stream. When that stream ends (session gone) we do
+            // NOT break immediately — a base parked in the merger awaiting
+            // enrichment still has its grace window running, and on session
+            // death no enrichment can ever arrive, so that base SHOULD fire
+            // as `BaseLossy`. We therefore linger for one `grace` window
+            // after stream-end, draining the merger's grace-expiry emissions
+            // (the reliability fallback Slice 2 exists to surface), then exit.
+            //
+            // The `*_done` guards are still required: once a channel closes,
+            // its `recv()` returns `None` immediately/forever, which would
+            // busy-spin the select loop unless the branch is disabled. The
+            // `enrich_done` guard matters when a consumer feeds no enrichment
+            // and drops its handle (Slice 1) while the stream is still live.
             let mut stream_done = false;
             let mut enrich_done = false;
+            // Far-future placeholder; reset to `now + grace` when the stream
+            // ends, and only then enabled as a select branch.
+            let linger = tokio::time::sleep(Duration::from_secs(86_400));
+            tokio::pin!(linger);
+            let mut lingering = false;
 
             loop {
                 tokio::select! {
@@ -267,9 +279,15 @@ impl TypedEventTap {
                             // started / reconnect).
                             Some(_) => {}
                             None => {
+                                // Session gone. Start the linger window so
+                                // pending grace-expiry BaseLossy events still
+                                // drain through branch (c) before we exit.
                                 stream_done = true;
-                                if enrich_done {
-                                    break;
+                                if !lingering {
+                                    linger
+                                        .as_mut()
+                                        .reset(tokio::time::Instant::now() + grace);
+                                    lingering = true;
                                 }
                             }
                         }
@@ -292,15 +310,12 @@ impl TypedEventTap {
                                     .await;
                             }
                             None => {
-                                // All TapHandles dropped. Stop polling this
-                                // branch (the `if !enrich_done` guard above)
-                                // so the closed channel can't busy-spin the
-                                // select loop; exit once the stream is also
-                                // done.
+                                // Every TapHandle dropped. Disable this branch
+                                // (the `if !enrich_done` guard) so the closed
+                                // channel can't busy-spin the select loop. We
+                                // do NOT exit here — exit is driven by the
+                                // stream ending + the linger window.
                                 enrich_done = true;
-                                if stream_done {
-                                    break;
-                                }
                             }
                         }
                     }
@@ -320,6 +335,12 @@ impl TypedEventTap {
                                 break;
                             }
                         }
+                    }
+
+                    // (d) Linger window after stream-end elapsed — pending
+                    // grace-expiry events have drained; exit.
+                    _ = &mut linger, if lingering => {
+                        break;
                     }
                 }
             }
