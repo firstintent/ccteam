@@ -1,121 +1,53 @@
 # Session Handoff — rmux integration (v0-8-rmux-integration)
 
-> Paste-ready prompts for migrating to a new session. Branch HEAD
-> `f58fd96`, all pushed to `origin/v0-8-rmux-integration`, baseline
-> 1675 pass / 1 fail excl. ccteam-web (the 1 = known daemon_dm WSL2
-> inotify/timing env-flake, non-regression), worktree `/tmp/ccteam-rmux`
-> (target/ warm).
+> Single current-state doc for migrating to a new session. **No-merge
+> evaluation branch**: continuous development, no release, no PR.
 
-> **UPDATE 2 — flip-default LIBRARY flip DONE (Steps 1-5 complete)**:
-> `from_env()` / `default_backend()` / `backend_kind_from_env()` now
-> default to **rmux** (commit `e9e2bdf`); only an explicit
-> `CCTEAM_MUX_BACKEND=tmux` opts out (unset/empty/typo → rmux, the
-> bundled always-available backend). The redundant `run_start` set_var
-> (`8b3310c`) was removed so the **library is the single source of
-> truth** — this also fixed a real correctness gap where `mcp-serve` and
-> standalone `ccteam web` (separate processes from `ccteam start`) looked
-> at tmux while the squad ran on rmux. The 21 tmux-fixture adapter tests
-> + the run_peek unit test are pinned to tmux (`e0068a9`, `44acdee`);
-> default-assertion tests updated; positive adapter-layer rmux coverage
-> added + wired into rmux-smoke CI (`f58fd96`, Step 3). Full workspace
-> suite under rmux default = **1676 tests, 1675 pass / 1 fail** where the
-> 1 is the documented `daemon_dm_no_at_mention_auto_routes_to_single_bot`
-> WSL2 inotify/timing env-flake (it PASSED in the clean first post-flip
-> gate run — non-regression; green on CI / unloaded hosts). clippy 0; fmt
-> clean. **rmux is now the genuine default everywhere.** Items ① + Step 3
-> closed.
->
-> **UPDATE 3 — EnrichedEvent item RESOLVED** (commit `a35e722`): per the
-> goal-prompt's option (b), the merger is now explicitly marked
-> **ahead-of-consumer** infrastructure (module doc + EventMerger struct doc
-> + as-built §5, tagged `TODO(V0.9-typed-event-consumer)`). It has neither
-> a production producer (register_pattern unused) nor consumer; its
-> consuming feature is V0.9 daemon-side typed-event orchestration. No stub
-> consumer added (would be misleading dead code).
->
-> **Both in-environment goal items are now DONE** — (1) flip-default
-> library migration + (2) EnrichedEvent decision. The ONLY remaining item
-> is ② macOS/Windows CI green, which is **hardware-bound** (CI matrix wired,
-> runs on push; no Darwin/Windows runner in this sandbox) and is the
-> merge-to-main gate, not an in-environment task.
+## Current state (authoritative)
 
----
+| 项 | 值 |
+|---|---|
+| 分支 | `v0-8-rmux-integration`(off origin/main `446e33a`),全部 pushed origin |
+| HEAD | 见 `git log -1`(本 doc 写于 `562ea6b` 之后)|
+| worktree | `/tmp/ccteam-rmux`(target 暖)|
+| 默认 backend | **rmux**(库级单一 SoT — `from_env`/`default_backend`/`backend_kind_from_env`;仅显式 `CCTEAM_MUX_BACKEND=tmux` opt-out;unset/empty/typo → rmux)|
+| 基线 | **1685 / 0**(`cargo test --workspace --locked --no-fail-fast --exclude ccteam-web`,clean run)· clippy 0 · fmt clean。本 WSL2 宿主在并发负载下偶现 1 flake = `daemon_dm_no_at_mention_auto_routes_to_single_bot`(inotify/timing env-race,`fs.inotify.max_user_instances=128` 易触顶,非回归,空载/CI 必过)|
 
-## ① GOAL prompt — recommended (achievable in-environment)
+## What's DONE in 0.8
 
-Re-issue this with `/goal` in the new session. The agent CAN complete it
-(unlike the original, which implies macOS/Windows hardware the sandbox
-lacks and would block the stop-hook forever):
+- **W0–W7 rmux 集成**:MuxBackend trait + Tmux/Rmux/InProc 三 backend;单 binary daemon(`ccteam --__internal-daemon` re-exec + `RMUX_SDK_DAEMON_BINARY`);全 mode 走 trait;exit-empty=off + dead-handle reconnect;6 Codex wire 修复。
+- **flip-default(库级)**:rmux 是 env-unset 默认,tmux 是 opt-out。21 个 tmux-fixture adapter 测试 + run_peek 单测 pin 到 tmux;positive rmux-adapter 覆盖(`claude_bg_rmux_adapter_test`)。**rmux 与 tmux 并存**:tmux backend + 全部 fixture 完整保留。
+- **EnrichedEvent 类型化事件管线(Slice 1 + 2,flag-gated)** — register_pattern → PatternMatched → `TypedEventTap` → `EventMerger` → consumer(`typed_events.rs`)→ progress.jsonl:
+  - **Slice 1**(`CCTEAM_TYPED_EVENTS=1`):no-enrichment kinds(rate_limit / context_overflow / idle / process_exited)→ `typed_event` 行。
+  - **Slice 2**(再加 `CCTEAM_HOOK_VIA_DAEMON=1`):session→TapHandle registry(`Arc::ptr_eq`-guarded)把 W6 HookSink 的 Claude `Stop` hook 路由进对应 session 的 tap 作 `TurnDone` enrichment;`turn_done` pane 模式命中但 grace 窗口内无 hook → `BaseLossy` → `merger_lossy_partial` 行(可靠性兜底);`Paired` 抑制。**仅 TurnDone**(single-in-flight,配对安全)。
+  - 默认路径(两 flag 关)完全不变 → baseline 1685/0 不受影响。CI:`rmux-smoke.sh` 跑全部 `#[ignore]` 端到端测试(roundtrip + adapter + typed-event pipeline)。
 
-```
-继续在 v0-8-rmux-integration 分支(worktree /tmp/ccteam-rmux,不发版不PR,≤3 opus subagent)推进 rmux 集成收尾。完成可在本环境验证的剩余项:(1) flip-default —— 按 docs/versions/v0-8-rmux/w-flip-default-migration-plan.md Steps 1-5,把 adapter 级测试 pin 到 CCTEAM_MUX_BACKEND=tmux,翻转 default_backend() 默认到 rmux,全 workspace 测试绿(--exclude ccteam-web;daemon_dm_* / daemon_wires_mock_* 是 inotify flake 可忽略);(2) EnrichedEvent merger 接入 subscribe 或显式标注为 ahead-of-consumer 基础设施。每步 commit + clippy 0 + fmt clean + push origin。macOS/Windows CI 绿与 merge-to-main burn-in 属硬件/时间外因,不纳入完成判定。直到上述两项达成。
-```
+## Remaining
 
-## ①′ GOAL prompt — original (verbatim)
+- **macOS / Windows CI 绿 → 归 0.8.1**(硬件外因)。CI matrix 已接线(`rmux-smoke` on `[ubuntu-latest, macos-latest]`),push 即跑;本 Linux sandbox 无 Darwin/Windows runner。这是 merge-to-main 门槛(+ real-claude burn-in),非本环境任务。
+- **Slice 3(可选增强)**:把 typed-event 配对扩到 multi-in-flight kinds(tool calls / prompts / plan)。需要 per-(session,kind) 计数器配对(不能用当前 single-in-flight 的 pending-partner token,会 cascade mis-pair)。当前 Slice 1+2 已满足「register_pattern → PatternMatched → merger → 真实 consumer」诉求 + 配对兜底;Slice 3 是 robustness 扩展,非「跑通」前提。
 
-⚠️ As literally written this can't be satisfied in a Linux sandbox
-(macOS/Windows production validation needs hardware) — the stop-hook
-will block indefinitely. Use only if you accept that.
+## 关键设计 / 红线
+
+- rmux 是 crates.io `"0.3"` 依赖(可跟随升级,**非** path/git/vendor)。
+- 红线:业务代码零 grep pane bytes(typed-event 走 daemon-side `subscribe` + vetted regex,不 scrape);`progress.jsonl` 是业务 event SoT;mode-3 对话原文走 `<project>/.ccteam/chat/<bot>/turns.jsonl`。
+- 文档全在 `docs/versions/v0-8-rmux/` —— `as-built-architecture.md`(§5 typed-event 管线 + §8 flip-default gate)+ `w-flip-default-migration-plan.md` + `w-production-readiness.md`。
+
+## 纪律(任何后续开发)
+
+- 共享 worktree:subagent 只改自己 explicit-path 文件、**绝不** `git stash/checkout/add -A`;主代理做所有 commit。
+- 每批后 `cargo clippy --workspace --all-targets --locked -- -D warnings`(0)+ `cargo fmt --all -- --check`(clean)+ push `git@github.com:firstintent/ccteam.git v0-8-rmux-integration:v0-8-rmux-integration`。
+- 跑 `#[ignore]` rmux 测试会留 idle 守护进程(exit-empty off by design,unique socket,无害);大批后按 PID kill `/tmp/ccteam-rmux/target/debug/ccteam --__internal-daemon`(用 PID,别用 `pkill -f <pattern>` —— pattern 会 self-match 你的 shell 命令行),避免 inotify 触顶让 `daemon_dm_*` flake。
+
+## 历史 GOAL prompt(原文,供参考)
 
 ```
 新开一个rmux分支，分支不用发版，不用pr，在分支上连续开发即可，最终目标是整个rmux集成完成到100%，使用opus subagent。最大subagent不超过3个。直到所有功能完全就绪。达到用户生产级别。
 ```
+后续补充:`要在0.8版本完全跑通rmux，并且rmux和tmux并存。不要放到0.9，本机无法实现的放到0.8.1中搞定`。
 
----
-
-## ② RESUME prompt — work context (paste after, or let the agent read this file)
-
-```
-继续 rmux 集成(分支 v0-8-rmux-integration,worktree /tmp/ccteam-rmux,不发版/不PR,持续开发,≤3 opus subagent)。
-
-起手:cd /tmp/ccteam-rmux && cargo build --workspace --locked(target 已暖,增量编译)。
-git log --oneline -5 看 HEAD(69 commits 全推送 origin)。
-验证 gate:cargo clippy --workspace --all-targets --locked -- -D warnings(须 0)、
-cargo fmt --all -- --check(须 clean)、
-cargo test --workspace --locked --no-fail-fast --exclude ccteam-web
-(注:daemon_dm_no_at_mention_auto_routes_to_single_bot + daemon_wires_mock_channel_to_supervisor_inbox
-是本机 inotify 耗尽 flake,非回归,CI/单跑必过;基线 ~1672 pass)。
-
-【已完成 W0-W6 全部】MuxBackend trait + Tmux/Rmux/InProc 三 backend;单 binary daemon(ccteam --__internal-daemon
-re-exec + RMUX_SDK_DAEMON_BINARY=current_exe);全 mode(3a claude_tui / 2 claude_bg+codex_exec / 3b codex_app_server)
-走 trait;subscribe + pattern registry(claude 10/codex 4) + EnrichedEvent merger(merger built-not-wired);
-attach/peek/screenshot/web-SSE 全 from_env;exit-empty=off + dead-handle reconnect;6 个 Codex wire 缺陷修复;
-W6 hook-reroute flag-gated(CCTEAM_HOOK_VIA_DAEMON 默认关)。端到端活体验证过(roundtrip + reconnect-after-death,
-CI rmux-smoke job linux+macos matrix)。
-
-【关键设计】rmux 是 crates.io "0.3" 依赖(可跟随升级);默认 backend 仍 tmux,rmux 走 CCTEAM_MUX_BACKEND=rmux opt-in;
-default_backend()/from_env() honor 该 env(969b0e2)。红线:业务零 grep pane bytes;progress.jsonl 是 SoT。
-文档全在 docs/versions/v0-8-rmux/ —— 先读 as-built-architecture.md + w-production-readiness.md
-+ w-flip-default-migration-plan.md。
-
-【剩余项】
-① flip-default 全局切 rmux:实测 naive flip 让 7/8 adapter 测试 timeout(路由到未运行的 daemon)。
-   按 w-flip-default-migration-plan.md Steps 1-5:inventory → pin adapter 测试到 CCTEAM_MUX_BACKEND=tmux →
-   加 rmux-default 覆盖 → 翻 default_backend() 默认 → 全绿。commit-per-step、baseline-safe。
-   受影响测试文件:claude_tui_resume_test / claude_tui_reattach_test / claude_tui_env_test / harness_trait_test
-   + orchestrator 相关 + 任何经 default_backend() spawn 的。本分支(不发版)可做;merge-to-main 仍需 burn-in。
-② macOS/Windows CI 绿:需 Darwin/Windows runner(CI 已接线,push 跑),本地无法验证 —— 外因,不纳入完成判定。
-③ EnrichedEvent merger 接 subscribe + orchestrator 消费 PatternMatched:目前 built-not-wired,
-   无真实 consumer(daemon-side rate-limit 自愈是其用例,未设计)。要么接最小 consumer,要么显式标注 ahead-of-consumer。
-
-【纪律】subagent 只改自己 explicit-path 文件、绝不 git stash/checkout/add -A(共享 worktree);
-每批后 clippy 0 + fmt clean + push origin v0-8-rmux-integration:v0-8-rmux-integration。
-flip-default 的 test 迁移不要在上下文将满时启动(不能留半成品破基线)。
-```
-
----
-
-## Current state snapshot
-
-| 项 | 值 |
-|---|---|
-| 分支 | `v0-8-rmux-integration`(off origin/main `446e33a`)|
-| commits | 全部 pushed origin(HEAD `f58fd96`)|
-| 基线 | 1676 tests,1675 pass / 1 fail(workspace --exclude ccteam-web;1 fail = `daemon_dm_no_at_mention_auto_routes_to_single_bot` WSL2 inotify/timing env-flake,首次 gate 通过、非回归)· clippy 0 · fmt clean |
-| worktree | `/tmp/ccteam-rmux`(target 暖)|
-| 默认 backend | **rmux**(库级单一 SoT;`CCTEAM_MUX_BACKEND=tmux` 显式 opt-out;unset/empty/typo → rmux)|
-| 剩余 | macOS/Windows CI(硬件)· EnrichedEvent consumer(基础设施,built-not-wired)|
+⚠️ 字面「100%」在 Linux sandbox 不可完全满足(macOS/Windows 生产验证需硬件 → 归 0.8.1)。**所有可在本环境验证的项已完成**:flip-default + rmux/tmux 并存 + EnrichedEvent 管线(Slice 1+2)。
 
 ## 注意:`/goal` 是 session-scoped
-迁到新 session **不会自动带 hook**。要继续 goal-driven 开发,在新 session 重新 `/goal`(用 ① 推荐版)。
-不重发 = 普通会话,可正常收口。
+
+迁到新 session **不会自动带 hook / goal**。要继续 goal-driven 开发,在新 session 重发 `/goal` 并贴本 doc;不重发 = 普通会话可正常收口。
