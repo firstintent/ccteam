@@ -30,9 +30,15 @@ cd "$ROOT"
 echo "==> rmux smoke: building ccteam binary (debug, --locked)"
 cargo build -p ccteam-cli --locked
 
+# Resolve the binary, accounting for the Windows `.exe` suffix so the
+# script is portable across the CI matrix (Linux/macOS = `ccteam`,
+# Windows = `ccteam.exe`).
 BIN="$ROOT/target/debug/ccteam"
+if [[ ! -x "$BIN" && -x "$BIN.exe" ]]; then
+  BIN="$BIN.exe"
+fi
 if [[ ! -x "$BIN" ]]; then
-  echo "FATAL: expected ccteam binary at $BIN after build, not found" >&2
+  echo "FATAL: expected ccteam binary at $BIN (or .exe) after build, not found" >&2
   exit 1
 fi
 echo "==> ccteam binary: $BIN"
