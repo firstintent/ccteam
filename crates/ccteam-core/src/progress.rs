@@ -696,6 +696,29 @@ pub fn build_typed_event_event(
     })
 }
 
+/// Build a `merger_lossy_partial` row from the rmux typed-event pipeline
+/// (V0.8 Slice 2). Emitted when a lossy P2 pattern fired (e.g. a `turn_done`
+/// pane match) but the lossless P1 enrichment (the Claude `Stop` hook) never
+/// arrived within the merger's grace window — i.e. a turn whose authoritative
+/// hook was lost (crashed hook subprocess, etc.). For **visibility only** —
+/// nothing acts on these. Same field layout as [`build_typed_event_event`]
+/// (parse either with one struct, branch on `kind`).
+pub fn build_merger_lossy_partial_event(
+    vendor: &str,
+    event_kind: &str,
+    captured: &str,
+    session: &str,
+) -> Value {
+    serde_json::json!({
+        "kind": "merger_lossy_partial",
+        "vendor": vendor,
+        "event_kind": event_kind,
+        "captured": captured,
+        "session": session,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
 /// True if `kind` is one of the chat-mode event names (F108 / F118 /
 /// F192c / F195 / F196).
 pub fn is_chat_event(kind: &str) -> bool {

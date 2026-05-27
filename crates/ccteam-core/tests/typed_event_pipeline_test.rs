@@ -35,9 +35,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ccteam_core::execution::typed_events::maybe_start_typed_event_tap;
+use ccteam_core::execution::typed_events::{enrich_session, maybe_start_typed_event_tap};
 use ccteam_core::progress;
-use ccteam_mux::{InProcBackend, MuxBackend, MuxSessionId, MuxSessionSpec, RmuxBackend, Vendor};
+use ccteam_mux::{
+    EventKind, InProcBackend, MuxBackend, MuxSessionId, MuxSessionSpec, RmuxBackend, Vendor,
+};
 
 /// Drop guard that restores a `$ENV` var to its pre-test value. Mirrors
 /// the guard used by the sibling rmux adapter test, plus a `remove`
@@ -156,6 +158,7 @@ async fn typed_event_row_written_for_rate_limit_pattern_when_flag_on() {
         backend.clone(),
         id.clone(),
         Vendor::Claude,
+        format!("{session_name}-role"),
         progress_path.clone(),
     );
 
@@ -213,6 +216,7 @@ async fn no_typed_event_row_when_flag_off() {
         backend,
         MuxSessionId::new("x"),
         Vendor::Claude,
+        "slug-role".to_string(),
         progress_path.clone(),
     );
 
@@ -251,5 +255,195 @@ fn build_typed_event_event_has_expected_shape() {
     assert!(
         row.get("ts").and_then(|v| v.as_str()).is_some(),
         "row must carry a `ts` timestamp field; got: {row:#?}"
+    );
+}
+
+/// Spawn a self-emitting Claude session whose pane prints a `turn_done`
+/// trigger line (`╰─`) after a 2s lead, returning the live backend, its
+/// session id, and the temp dir holding the socket + progress file.
+///
+/// The 2s lead is the safety margin that lets `maybe_start_typed_event_tap`'s
+/// detached task register patterns + subscribe before the line renders (the
+/// Claude `turn_done` base pattern is `^╰─|^>\s*$`). The trailing `sleep 30`
+/// keeps the pane alive across the poll/grace window.
+async fn spawn_turn_done_session(
+    socket_path: PathBuf,
+    base: &str,
+) -> (Arc<dyn MuxBackend>, MuxSessionId, String) {
+    let backend: Arc<dyn MuxBackend> = Arc::new(RmuxBackend::with_socket_path(socket_path.clone()));
+    eprintln!("socket: {}", socket_path.display());
+
+    let session_name = random_session_name(base);
+    let spec = MuxSessionSpec::new(
+        &session_name,
+        vec![
+            "sh".into(),
+            "-c".into(),
+            "sleep 2; echo '╰─ turn done'; sleep 30".into(),
+        ],
+        PathBuf::from("/tmp"),
+    );
+    let id = backend.spawn(spec).await.expect("spawn must succeed");
+
+    // Let the daemon register the session before the caller attaches the tap.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        backend.exists(&id).await.unwrap(),
+        "session must exist after spawn"
+    );
+
+    (backend, id, session_name)
+}
+
+/// Slice 2 — reliability fallback. With BOTH `CCTEAM_TYPED_EVENTS` and
+/// `CCTEAM_HOOK_VIA_DAEMON` ON, a `turn_done` pane pattern fires, parks for the
+/// merger's grace window awaiting a `Stop`-hook enrichment, and — because NO
+/// enrichment is routed to the tap — falls back to `MergeOutcome::BaseLossy`,
+/// which the consumer mirrors as a `merger_lossy_partial` /
+/// `event_kind=="turn_done"` row.
+///
+/// `CCTEAM_HOOK_VIA_DAEMON` is gating: the tap snapshots
+/// `hook_via_daemon_enabled()` ONCE at start (typed_events.rs), so it must be
+/// set BEFORE `maybe_start_typed_event_tap` is called — `#[serial]` + the
+/// EnvGuard set order below guarantee that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+#[ignore]
+async fn merger_lossy_partial_written_for_unenriched_turn_done() {
+    let Some(bin) = locate_ccteam_binary() else {
+        eprintln!(
+            "SKIP: ccteam binary not found in target/{{debug,release}}/ccteam; build with \
+             `cargo build --bin ccteam` (or set CCTEAM_TEST_BIN=...) and rerun."
+        );
+        return;
+    };
+    eprintln!("ccteam binary: {}", bin.display());
+
+    // Pin the rmux SDK's daemon re-exec target + flag the consumer ON. Both
+    // env vars are set BEFORE the tap is started so the tap's one-shot
+    // `lossy_meaningful` snapshot sees `CCTEAM_HOOK_VIA_DAEMON` ON.
+    let _daemon_bin = EnvGuard::set("RMUX_SDK_DAEMON_BINARY", bin.to_str().unwrap());
+    let _flag = EnvGuard::set("CCTEAM_TYPED_EVENTS", "1");
+    let _hook_daemon = EnvGuard::set("CCTEAM_HOOK_VIA_DAEMON", "1");
+
+    let tmpdir = tempfile::tempdir().expect("create tempdir");
+    let socket_path = tmpdir.path().join("mux.sock");
+    let progress_path = tmpdir.path().join("progress.jsonl");
+
+    let (backend, id, session_name) = spawn_turn_done_session(socket_path, "lossy-turndone").await;
+    let session_key = format!("{session_name}-role");
+
+    // Attach the tap. No `enrich_session` call — the parked turn_done base
+    // gets no partner, so after the grace window it resolves BaseLossy.
+    maybe_start_typed_event_tap(
+        backend.clone(),
+        id.clone(),
+        Vendor::Claude,
+        session_key.clone(),
+        progress_path.clone(),
+    );
+
+    // Poll up to ~6s (line at t≈2s + 500ms grace + emit + fs flush).
+    let mut found = false;
+    let mut seen = Vec::new();
+    for _ in 0..60 {
+        seen = progress::read_all_events(&progress_path).unwrap_or_default();
+        found = seen.iter().any(|e| {
+            e.get("kind").and_then(|v| v.as_str()) == Some("merger_lossy_partial")
+                && e.get("event_kind").and_then(|v| v.as_str()) == Some("turn_done")
+        });
+        if found {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let _ = backend.kill(&id).await;
+
+    assert!(
+        found,
+        "expected a merger_lossy_partial row with event_kind==\"turn_done\" in {} within ~6s \
+         (no enrichment arrived → BaseLossy fallback); events seen: {:#?}",
+        progress_path.display(),
+        seen
+    );
+}
+
+/// Slice 2 — pairing suppresses the lossy fallback. Same flags + self-emitting
+/// session as the lossy test, but here a `TurnDone` enrichment is routed to the
+/// tap so the parked `turn_done` base PAIRS (`MergeOutcome::Paired`) instead of
+/// going lossy. A `Paired` outcome owns no fallback row, so NO
+/// `merger_lossy_partial` row must appear.
+///
+/// ## Timing note (inherent)
+/// The base fires when `╰─` renders at t≈2s and parks for the merger's 500ms
+/// grace window; the enrichment must land inside `[t_base, t_base + 500ms]`.
+/// We use an enrichment-first strategy: the tap attaches at t≈0, then we sleep
+/// ~1.7s and call `enrich_session` — the enrichment parks first, the base
+/// arrives ~300ms later, and they pair. To be robust against scheduling jitter
+/// we spray a few more `enrich_session` calls spanning t≈1.7s–2.4s; surplus
+/// enrichments leave only dangling PENDING-enrichments (which never emit a
+/// `merger_lossy_partial` row — only unenriched BASES do), so spraying is safe.
+/// We deliberately do NOT drive a second `╰─` line via `send_text`: a second
+/// base would park unenriched and go BaseLossy, defeating the assertion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+#[ignore]
+async fn turn_done_paired_suppresses_lossy_partial() {
+    let Some(bin) = locate_ccteam_binary() else {
+        eprintln!(
+            "SKIP: ccteam binary not found in target/{{debug,release}}/ccteam; build with \
+             `cargo build --bin ccteam` (or set CCTEAM_TEST_BIN=...) and rerun."
+        );
+        return;
+    };
+    eprintln!("ccteam binary: {}", bin.display());
+
+    let _daemon_bin = EnvGuard::set("RMUX_SDK_DAEMON_BINARY", bin.to_str().unwrap());
+    let _flag = EnvGuard::set("CCTEAM_TYPED_EVENTS", "1");
+    let _hook_daemon = EnvGuard::set("CCTEAM_HOOK_VIA_DAEMON", "1");
+
+    let tmpdir = tempfile::tempdir().expect("create tempdir");
+    let socket_path = tmpdir.path().join("mux.sock");
+    let progress_path = tmpdir.path().join("progress.jsonl");
+
+    let (backend, id, session_name) = spawn_turn_done_session(socket_path, "paired-turndone").await;
+    let session_key = format!("{session_name}-role");
+
+    maybe_start_typed_event_tap(
+        backend.clone(),
+        id.clone(),
+        Vendor::Claude,
+        session_key.clone(),
+        progress_path.clone(),
+    );
+
+    // The registry slot for `session_key` is populated only AFTER
+    // `TypedEventTap::spawn().await` returns inside the detached task. Wait for
+    // that, then spray enrichments straddling the t≈2s base so at least one
+    // lands within the 500ms grace. The first calls park ahead of the base
+    // (enrichment-first pairing); the base then pairs with the earliest.
+    tokio::time::sleep(Duration::from_millis(1700)).await;
+    for _ in 0..6 {
+        enrich_session(&session_key, EventKind::TurnDone, "{}".to_string());
+        tokio::time::sleep(Duration::from_millis(120)).await;
+    }
+
+    // Wait comfortably past the grace window (line at t≈2s + 500ms grace, plus
+    // margin) before the negative assertion.
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+
+    let events = progress::read_all_events(&progress_path).unwrap_or_default();
+    let has_lossy = events.iter().any(|e| {
+        e.get("kind").and_then(|v| v.as_str()) == Some("merger_lossy_partial")
+            && e.get("event_kind").and_then(|v| v.as_str()) == Some("turn_done")
+    });
+
+    let _ = backend.kill(&id).await;
+
+    assert!(
+        !has_lossy,
+        "turn_done base paired with its enrichment → Paired → no merger_lossy_partial row \
+         expected; events seen: {events:#?}"
     );
 }

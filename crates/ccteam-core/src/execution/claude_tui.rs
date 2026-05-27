@@ -436,6 +436,10 @@ impl HarnessAdapter for ClaudeTuiAdapter {
                 backend.clone(),
                 id.clone(),
                 ccteam_mux::Vendor::Claude,
+                // Registry key == HookEvent::session_id (`{slug}-{role}`,
+                // from CCTEAM_CHAT_SLUG/ROLE) so the orchestrator's hook sink
+                // can route Stop-hook enrichment to this session's tap.
+                format!("{}-{}", ctx.slug, spec.role),
                 paths.progress_jsonl(&ctx.slug),
             );
         }

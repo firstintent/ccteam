@@ -1912,6 +1912,13 @@ fn run_start(
                                     _ = rx.changed() => break,
                                     maybe = sink.recv() => {
                                         let Some(event) = maybe else { break };
+                                        // V0.8 Slice 2 — tee P1 enrichment to the
+                                        // session's typed-event tap (no-op unless
+                                        // CCTEAM_TYPED_EVENTS is set + a tap is
+                                        // registered for this session). Cheap sync
+                                        // channel send; done before the event moves
+                                        // into the blocking dispatch below.
+                                        ccteam_core::execution::typed_events::enrich_session_from_hook(&event);
                                         let dispatch_paths = dispatch_paths.clone();
                                         let res = tokio::task::spawn_blocking(move || {
                                             let stdin: serde_json::Value =
