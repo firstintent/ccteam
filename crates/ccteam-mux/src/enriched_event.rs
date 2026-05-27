@@ -335,12 +335,13 @@ impl EventMerger {
 
             // Did an enrichment already arrive (EnrichmentOnly path)?
             // Pair now and self-suppress the would-be lossy fallback.
-            if let Some(pos) = buffers
-                .pending_enrichment
-                .iter()
-                .position(|p| p.enrich.kind == base.kind && p.enrich.sequence_id == base.sequence_id)
-            {
-                let parked = buffers.pending_enrichment.remove(pos).expect("pos in range");
+            if let Some(pos) = buffers.pending_enrichment.iter().position(|p| {
+                p.enrich.kind == base.kind && p.enrich.sequence_id == base.sequence_id
+            }) {
+                let parked = buffers
+                    .pending_enrichment
+                    .remove(pos)
+                    .expect("pos in range");
                 // The enrichment was already emitted as EnrichmentOnly;
                 // the base self-suppresses (no second event). Spec
                 // §algorithm: "base self-suppresses if its sequence_id
@@ -383,28 +384,27 @@ impl EventMerger {
         tokio::spawn(async move {
             tokio::time::sleep(grace).await;
             let mut guard = inner.lock().await;
-            let send = if let Some(buffers) = guard.sessions.get_mut(&key) {
-                if let Some(pos) = buffers
-                    .recent_base
-                    .iter()
-                    .position(|p| p.base.kind == kind && p.base.sequence_id == seq && !p.consumed)
-                {
-                    let parked = buffers.recent_base.remove(pos).expect("pos in range");
-                    Some(EnrichedEvent {
-                        session_id: parked.base.session_id.clone(),
-                        kind: parked.base.kind,
-                        timestamp: parked.base.timestamp,
-                        sequence_id: parked.base.sequence_id,
-                        base: Some(parked.base.payload.clone()),
-                        enrichment: None,
-                        outcome: MergeOutcome::BaseLossy,
-                    })
+            let send =
+                if let Some(buffers) = guard.sessions.get_mut(&key) {
+                    if let Some(pos) = buffers.recent_base.iter().position(|p| {
+                        p.base.kind == kind && p.base.sequence_id == seq && !p.consumed
+                    }) {
+                        let parked = buffers.recent_base.remove(pos).expect("pos in range");
+                        Some(EnrichedEvent {
+                            session_id: parked.base.session_id.clone(),
+                            kind: parked.base.kind,
+                            timestamp: parked.base.timestamp,
+                            sequence_id: parked.base.sequence_id,
+                            base: Some(parked.base.payload.clone()),
+                            enrichment: None,
+                            outcome: MergeOutcome::BaseLossy,
+                        })
+                    } else {
+                        None
+                    }
                 } else {
                     None
-                }
-            } else {
-                None
-            };
+                };
             if let Some(ev) = send {
                 let _ = guard.out.send(ev);
             }
@@ -421,16 +421,11 @@ impl EventMerger {
     pub async fn process_enrichment(&self, enrich: EnrichmentEvent) {
         let mut guard = self.inner.lock().await;
         let out = guard.out.clone();
-        let buffers = guard
-            .sessions
-            .entry(enrich.session_id.clone())
-            .or_default();
+        let buffers = guard.sessions.entry(enrich.session_id.clone()).or_default();
 
-        if let Some(pos) = buffers
-            .recent_base
-            .iter()
-            .position(|p| p.base.kind == enrich.kind && p.base.sequence_id == enrich.sequence_id && !p.consumed)
-        {
+        if let Some(pos) = buffers.recent_base.iter().position(|p| {
+            p.base.kind == enrich.kind && p.base.sequence_id == enrich.sequence_id && !p.consumed
+        }) {
             // Pair: mark consumed (the grace task will skip it) and
             // remove the parked base now that it is resolved.
             let mut parked = buffers.recent_base.remove(pos).expect("pos in range");
