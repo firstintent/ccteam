@@ -484,6 +484,20 @@ pub struct SessionHandle {
     pub job_id: Option<String>,
     pub pid: Option<u32>,
     pub started_at: DateTime<Utc>,
+    /// V0.8 W3 follow-up — `true` when this spawn is a mode-2
+    /// foreground-in-mux bg session (`CCTEAM_CLAUDE_BG_VIA_MUX=1`).
+    /// Such a spawn has no `~/.claude/jobs/<id>/state.json`; the
+    /// orchestrator detects its completion via the mux session
+    /// lifecycle ([`crate::orchestrator`] checks
+    /// `MuxBackend::exists(mux_session)`) instead of the F80
+    /// state.json poll. serde-default `false` keeps existing
+    /// state.json `SessionRecord` files loading unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub via_mux: bool,
+    /// V0.8 W3 follow-up — the mux session name to probe for liveness
+    /// when `via_mux` is set. `None` for legacy `--bg` + codex spawns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mux_session: Option<String>,
 }
 
 impl SessionHandle {
@@ -513,6 +527,19 @@ impl SessionHandle {
             AgentVendor::Claude if h.mode == ExecutionMode::Bg => Some(h.identity.clone()),
             _ => None,
         };
+        // V0.8 W3 follow-up — carry the foreground-in-mux markers so
+        // the orchestrator routes completion through the mux session
+        // lifecycle instead of the (nonexistent) F80 state.json.
+        let via_mux = h
+            .raw_extras
+            .get("via_mux")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let mux_session = h
+            .raw_extras
+            .get("mux_session")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         Self {
             tmux_session,
             harness: harness.to_string(),
@@ -520,6 +547,8 @@ impl SessionHandle {
             job_id,
             pid,
             started_at: h.started_at,
+            via_mux,
+            mux_session,
         }
     }
 }

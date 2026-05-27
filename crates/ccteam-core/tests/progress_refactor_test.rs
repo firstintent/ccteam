@@ -743,3 +743,45 @@ fn t18_open_agent_spawns_returns_unclosed_triples() {
     assert_eq!(open[0].1.as_deref(), Some("job-b"));
     assert_eq!(open[0].2, "explorer");
 }
+
+/// V0.8 W3 follow-up — `open_agent_spawns_detailed` surfaces the
+/// `via_mux` / `mux_session` markers persisted on the `agent_spawn`
+/// event so the orchestrator's F80 stale-spawn pass can pick the mux
+/// liveness probe over the (nonexistent) state.json probe. Legacy
+/// `--bg` rows (no markers) default `via_mux = false` / `mux_session =
+/// None` — preserving the unchanged default path.
+#[test]
+fn open_agent_spawns_detailed_surfaces_via_mux_markers() {
+    use ccteam_core::progress::open_agent_spawns_detailed;
+
+    // Legacy `--bg` spawn (no via_mux markers).
+    let legacy = spawn_with_job("worker", "worker-1", Some("job-x"), "2026-05-10T00:00:00Z");
+    // Mode-2 foreground-in-mux spawn (via_mux markers present).
+    let mut mux = serde_json::Map::new();
+    mux.insert("event".into(), json!("agent_spawn"));
+    mux.insert("role".into(), json!("worker"));
+    mux.insert("session_id".into(), json!("worker-2"));
+    mux.insert("via_mux".into(), json!(true));
+    mux.insert("mux_session".into(), json!("ccteam-bg-proj-worker-2"));
+    mux.insert("ts".into(), json!("2026-05-10T00:00:01Z"));
+    let mux = Value::Object(mux);
+
+    let open = open_agent_spawns_detailed(&[legacy, mux]);
+    assert_eq!(open.len(), 2);
+
+    let legacy_row = open.iter().find(|s| s.session_id == "worker-1").unwrap();
+    assert!(
+        !legacy_row.via_mux,
+        "legacy --bg row must default via_mux=false"
+    );
+    assert_eq!(legacy_row.mux_session, None);
+    assert_eq!(legacy_row.job_id.as_deref(), Some("job-x"));
+
+    let mux_row = open.iter().find(|s| s.session_id == "worker-2").unwrap();
+    assert!(mux_row.via_mux, "via_mux row must carry the marker");
+    assert_eq!(
+        mux_row.mux_session.as_deref(),
+        Some("ccteam-bg-proj-worker-2")
+    );
+    assert_eq!(mux_row.job_id, None);
+}

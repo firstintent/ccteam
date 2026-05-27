@@ -960,6 +960,79 @@ pub fn open_agent_spawns(events: &[Value]) -> Vec<(String, Option<String>, Strin
         .collect()
 }
 
+/// V0.8 W3 follow-up — one open (un-`agent_done`-ed) `agent_spawn` row
+/// with the extra mode-2-via-mux markers the orchestrator needs to pick
+/// the right liveness probe. A sibling of [`open_agent_spawns`] (kept
+/// stable for `queries.rs`) so callers that don't care about mux keep
+/// the simpler triple.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenAgentSpawn {
+    pub session_id: String,
+    pub job_id: Option<String>,
+    pub role: String,
+    /// `true` when the `agent_spawn` row was written by a
+    /// `CCTEAM_CLAUDE_BG_VIA_MUX=1` foreground-in-mux spawn — its
+    /// liveness lives in the mux session lifecycle, NOT in
+    /// `~/.claude/jobs/<id>/state.json`.
+    pub via_mux: bool,
+    /// Mux session name to probe via `MuxBackend::exists` when
+    /// `via_mux` is set. `None` for legacy `--bg` + codex rows.
+    pub mux_session: Option<String>,
+}
+
+/// V0.8 W3 follow-up — like [`open_agent_spawns`] but also surfaces the
+/// `via_mux` / `mux_session` markers persisted on the `agent_spawn`
+/// event so the orchestrator's stale-spawn pass can route mode-2
+/// foreground-in-mux spawns through the mux session lifecycle instead
+/// of the F80 `state.json` probe (which never exists for them).
+pub fn open_agent_spawns_detailed(events: &[Value]) -> Vec<OpenAgentSpawn> {
+    let mut spawns: BTreeMap<String, OpenAgentSpawn> = BTreeMap::new();
+    let mut closed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for event in events {
+        let kind = event.get("event").and_then(|s| s.as_str()).unwrap_or("");
+        let sid = match event.get("session_id").and_then(|s| s.as_str()) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => continue,
+        };
+        match kind {
+            "agent_spawn" => {
+                let job_id = event
+                    .get("job_id")
+                    .and_then(|s| s.as_str())
+                    .map(String::from);
+                let role = event
+                    .get("role")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let via_mux = event
+                    .get("via_mux")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let mux_session = event
+                    .get("mux_session")
+                    .and_then(|s| s.as_str())
+                    .map(String::from);
+                spawns.entry(sid.clone()).or_insert(OpenAgentSpawn {
+                    session_id: sid,
+                    job_id,
+                    role,
+                    via_mux,
+                    mux_session,
+                });
+            }
+            "agent_done" => {
+                closed.insert(sid);
+            }
+            _ => {}
+        }
+    }
+    spawns
+        .into_values()
+        .filter(|s| !closed.contains(&s.session_id))
+        .collect()
+}
+
 fn parse_ts(raw: Option<&str>) -> DateTime<Utc> {
     raw.and_then(|s| DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&Utc))

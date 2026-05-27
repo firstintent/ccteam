@@ -1027,6 +1027,8 @@ async fn t20_meta_agent_not_killed() {
             pid: Some(1234),
             started_at: chrono::Utc::now(),
             job_id: None,
+            via_mux: false,
+            mux_session: None,
         },
     )
     .await;
@@ -1593,6 +1595,8 @@ async fn t34_poll_completions_skips_phantom_pass_when_in_memory_owned() {
             job_id: Some("owned-job".into()),
             pid: None,
             started_at: chrono::Utc::now(),
+            via_mux: false,
+            mux_session: None,
         },
     )
     .await;
