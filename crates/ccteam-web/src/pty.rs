@@ -37,19 +37,37 @@ use tokio::task::JoinHandle;
 /// historical F56 value so lag behavior downstream is unchanged.
 pub const BROADCAST_CAPACITY: usize = 256;
 
-/// Adapter registry. Kept as a unit struct so [`crate::state::AppState`]
-/// construction (`PtyRegistry::new()`) and its `Clone`/field shape stay
-/// stable; all refcount/FIFO state now lives in the `TmuxBackend`.
-#[derive(Clone, Default)]
+/// Adapter registry. Kept so [`crate::state::AppState`] construction
+/// (`PtyRegistry::new()`) and its `Clone` shape stay stable; all
+/// refcount/FIFO state lives backend-side.
+///
+/// V0.8: the backend is selected via `ccteam_mux::from_env()` so web
+/// SSE live streaming honors `CCTEAM_MUX_BACKEND` like the rest of
+/// ccteam. Previously this hardcoded `TmuxBackend`, which silently
+/// produced no stream under `CCTEAM_MUX_BACKEND=rmux` (it drove
+/// `tmux pipe-pane` against a session that only exists in the rmux
+/// daemon). Default (env unset) is still tmux; a garbage env value
+/// degrades to tmux rather than erroring.
+#[derive(Clone)]
 pub struct PtyRegistry {
-    backend: Arc<TmuxBackend>,
+    backend: Arc<dyn MuxBackend>,
 }
 
 impl PtyRegistry {
     pub fn new() -> Self {
-        Self::default()
+        let backend = ccteam_mux::from_env()
+            .unwrap_or_else(|_| Arc::new(TmuxBackend::new()) as Arc<dyn MuxBackend>);
+        Self { backend }
     }
+}
 
+impl Default for PtyRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PtyRegistry {
     /// Subscribe to `key`'s pane output. Delegates to
     /// `TmuxBackend::subscribe(tmux_session)` and spawns a forwarder
     /// task that pushes `OutputChunk` bytes onto a fresh per-subscriber
