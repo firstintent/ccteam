@@ -32,12 +32,17 @@ use anyhow::{anyhow, Result};
 use futures::Stream;
 
 pub mod daemon;
+pub mod enriched_event;
 pub mod inproc_backend;
 pub mod patterns;
 pub mod rmux_backend;
 pub mod tmux_backend;
 pub mod tmux_ops;
 
+pub use enriched_event::{
+    enrichment_source, BaseEvent, BasePayload, EnrichedEvent, EnrichmentEvent, EnrichmentPayload,
+    EnrichmentSource, EventKind, EventMerger, MergeOutcome, Vendor, DEFAULT_GRACE,
+};
 pub use inproc_backend::InProcBackend;
 pub use rmux_backend::{default_ccteam_mux_socket_path, RmuxBackend};
 pub use tmux_backend::TmuxBackend;
