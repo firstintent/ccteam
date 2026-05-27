@@ -679,6 +679,18 @@ pub fn translate_notification(notif: &Notification, wanted: &str) -> Option<Thre
                 },
             })
         }
+        // V0.8 rmux W4-fu — these four W4-unlocked notifications carry no
+        // `ThreadEvent` variant; they are mirrored to `progress.jsonl` by
+        // `build_codex_notification_progress_line` in the `events()` loop.
+        // Return `None` *silently* here (NOT via the unknown-method warn
+        // below) — they are explicitly handled, not protocol drift, and
+        // `thread/tokenUsage/updated` in particular fires several times per
+        // turn, so routing them through `warn_unknown_vendor_token` would
+        // spam the logs and defeat its "surface real drift" purpose.
+        "turn/plan/updated"
+        | "thread/tokenUsage/updated"
+        | "thread/status/changed"
+        | "account/rateLimits/updated" => None,
         // V0.6.3 F144 — forward-compat: a `codex app-server` notification
         // `method` we don't yet propagate is **skipped** (`None`) so the
         // event stream is never broken — the orchestrator's
@@ -1305,6 +1317,29 @@ mod tests {
         assert_eq!(line["explanation"], "drafting");
         assert_eq!(line["plan"][0]["step"], "read repo");
         assert_eq!(line["plan"][1]["status"], "inProgress");
+    }
+
+    #[test]
+    fn w4fu_methods_return_none_silently_not_via_unknown_warn() {
+        // These four are handled by build_codex_notification_progress_line,
+        // so translate_notification must skip them via the explicit no-op
+        // arms (silent None), NOT the forward-compat unknown-method warn
+        // path — tokenUsage especially fires many times per turn.
+        for method in [
+            "turn/plan/updated",
+            "thread/tokenUsage/updated",
+            "thread/status/changed",
+            "account/rateLimits/updated",
+        ] {
+            let n = Notification {
+                method: method.into(),
+                params: json!({ "thread_id": "t-1" }),
+            };
+            assert!(
+                translate_notification(&n, "t-1").is_none(),
+                "{method} must be skipped by translate_notification"
+            );
+        }
     }
 
     #[test]
