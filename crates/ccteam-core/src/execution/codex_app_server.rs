@@ -568,10 +568,21 @@ pub fn translate_notification(notif: &Notification, wanted: &str) -> Option<Thre
     // that omit it). The real Codex v2 wire is camelCase (`threadId`),
     // so read it dual-key — otherwise the filter never fires against a
     // live binary and foreign-thread events would be falsely accepted.
-    // Note: `thread/started` + `turn/*` nest the id inside `thread`/`turn`
-    // objects, so a top-level lookup is absent for those — they still
-    // pass this gate (None) and are thread-matched by their own arm.
-    if let Some(tid) = pluck_str(&notif.params, "thread_id", "threadId") {
+    //
+    // `turn/*` + `item/*` carry a top-level `threadId` (verified
+    // `references/codex/codex-rs/app-server-protocol/src/protocol/v2/turn.rs:312-315`
+    // + `.../v2/item.rs:1059-1066`), so the flat lookup gates them.
+    // `thread/started` is the exception: its only id is nested at
+    // `params.thread.id` (`ThreadStartedNotification { thread: Thread }`,
+    // `.../v2/thread.rs:1122-1124` + `.../v2/thread_data.rs:105-106`).
+    // Without consulting the nested id a foreign `thread/started` slipped
+    // the gate, and its arm's `unwrap_or_else(|| wanted)` laundered the
+    // foreign id into the wanted slot. Resolve the nested id as a fallback
+    // so the foreign-thread filter fires uniformly.
+    let resolved_tid = pluck_str(&notif.params, "thread_id", "threadId")
+        .map(str::to_string)
+        .or_else(|| notif.params.get("thread").and_then(pluck_id));
+    if let Some(tid) = resolved_tid {
         if tid != wanted {
             return None;
         }
@@ -579,7 +590,10 @@ pub fn translate_notification(notif: &Notification, wanted: &str) -> Option<Thre
     match notif.method.as_str() {
         // Real wire: `ThreadStartedNotification { thread: Thread }`, so the
         // id is `params.thread.id` (camelCase Thread). Fall back to a flat
-        // `thread_id`/`threadId` (test fixtures) and finally `wanted`.
+        // `thread_id`/`threadId` (test fixtures) and finally `wanted`. The
+        // foreign-thread gate above already consulted the nested
+        // `thread.id`, so a non-matching id was filtered out before reaching
+        // this arm — it never launders a foreign id into the wanted slot.
         "thread/started" => Some(ThreadEvent::ThreadStarted {
             thread_id: notif
                 .params
@@ -828,28 +842,63 @@ fn translate_item_event(
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string(),
-                status: item_val
-                    .get("status")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("in_progress")
-                    .to_string(),
+                // Real wire: `CommandExecutionStatus` is a
+                // `#[serde(rename_all = "camelCase")]` enum, so the live
+                // binary sends `"inProgress"` / `"completed"` / `"failed"`
+                // / `"declined"` (verified
+                // `references/codex/codex-rs/app-server-protocol/src/protocol/v2/item.rs:870-878`).
+                // Fold through `camel_to_snake` so progress.jsonl reads in
+                // ccteam's snake_case house style (`in_progress`); the
+                // single-word variants pass through unchanged, and the
+                // already-snake `in_progress` default is idempotent.
+                status: camel_to_snake(
+                    item_val
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("in_progress"),
+                ),
             }
         }
         Some("file_change") | Some("fileChange") => {
-            let path = item_val
-                .get("changes")
-                .and_then(|c| c.get(0))
+            // Real wire: `FileChange { changes: Vec<FileUpdateChange> }`
+            // where `FileUpdateChange { path, kind: PatchChangeKind, diff }`
+            // and `PatchChangeKind` is an INTERNALLY-TAGGED enum
+            // `#[serde(tag = "type", rename_all = "camelCase")]` →
+            // `{"type":"add"}` / `{"type":"delete"}` /
+            // `{"type":"update","movePath":<opt>}` (verified
+            // `references/codex/codex-rs/app-server-protocol/src/protocol/v2/item.rs:918-935`).
+            // The prior `changes[0].kind` string read always yielded `None`
+            // against the live binary (kind is an object, not a string) →
+            // every patch silently defaulted to `"update"`.
+            let change = item_val.get("changes").and_then(|c| c.get(0));
+            let path = change
                 .and_then(|c| c.get("path"))
                 .and_then(|v| v.as_str())
                 .map(PathBuf::from)
                 .unwrap_or_default();
-            let kind = item_val
-                .get("changes")
-                .and_then(|c| c.get(0))
-                .and_then(|c| c.get("kind"))
+            let kind_obj = change.and_then(|c| c.get("kind"));
+            // The tag field is `type`; fold through `camel_to_snake` for
+            // house style. An `update` carrying a `movePath` is a rename
+            // (there is no distinct `rename` variant on the wire), so
+            // surface the richer `"rename"` kind in that case.
+            let kind = match kind_obj
+                .and_then(|k| k.get("type"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("update")
-                .to_string();
+            {
+                Some("update") | Some("Update") => {
+                    let has_move = kind_obj
+                        .and_then(|k| k.get("movePath").or_else(|| k.get("move_path")))
+                        .map(|v| !v.is_null())
+                        .unwrap_or(false);
+                    if has_move {
+                        "rename".to_string()
+                    } else {
+                        "update".to_string()
+                    }
+                }
+                Some(other) => camel_to_snake(other),
+                None => "update".to_string(),
+            };
             ThreadItemDetails::FileChange { path, kind }
         }
         Some("mcp_tool_call") | Some("mcpToolCall") => ThreadItemDetails::ToolCall {

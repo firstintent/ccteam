@@ -135,6 +135,9 @@ fn translate_notification_unknown_method_returns_none() {
 
 #[test]
 fn translate_item_completed_extracts_file_change_details() {
+    // Real wire: `PatchChangeKind` is a tagged-enum object
+    // (`{"type":"update"}`), NOT a flat string. (No-compat policy: the
+    // fixture uses the real shape; the legacy flat-string read was the bug.)
     let n = Notification {
         method: "item/completed".into(),
         params: json!({
@@ -142,7 +145,7 @@ fn translate_item_completed_extracts_file_change_details() {
             "item": {
                 "id": "i-1",
                 "type": "file_change",
-                "changes": [{ "path": "/x.rs", "kind": "update" }]
+                "changes": [{ "path": "/x.rs", "kind": { "type": "update" }, "diff": "" }]
             }
         }),
     };
@@ -156,6 +159,156 @@ fn translate_item_completed_extracts_file_change_details() {
             other => panic!("expected FileChange, got {other:?}"),
         },
         _ => panic!("expected ItemCompleted"),
+    }
+}
+
+// V0.8 rmux #20 — the three real-wire item-event bugs surfaced after the
+// #18 camelCase sweep. Each test feeds the REAL `codex app-server` v2 wire
+// shape (camelCase enum status / tagged-enum patch kind / nested
+// thread.id) verified against references/codex (commit 76845d716b).
+
+#[test]
+fn translate_command_execution_status_camelcase_folds_to_snake() {
+    // Bug 1: `CommandExecutionStatus` is a camelCase enum, so the live
+    // binary sends `"inProgress"`; it must land in progress.jsonl as the
+    // snake_case `in_progress`, not leak the raw camelCase token.
+    let n = Notification {
+        method: "item/started".into(),
+        params: json!({
+            "thread_id": "t-1",
+            "item": {
+                "id": "c-1",
+                "type": "command_execution",
+                "command": "cargo test",
+                "status": "inProgress"
+            }
+        }),
+    };
+    let e = translate_notification(&n, "t-1").unwrap();
+    match e {
+        ThreadEvent::ItemStarted { item } => match item.details {
+            ccteam_core::harness::ThreadItemDetails::CommandExecution { cmd, status } => {
+                assert_eq!(cmd, "cargo test");
+                assert_eq!(status, "in_progress", "camelCase status must fold to snake");
+            }
+            other => panic!("expected CommandExecution, got {other:?}"),
+        },
+        _ => panic!("expected ItemStarted"),
+    }
+}
+
+#[test]
+fn translate_file_change_tagged_kind_add() {
+    // Bug 2: `PatchChangeKind` is internally tagged `{"type":"add"}`. The
+    // prior `changes[0].kind` string read yielded None → defaulted every
+    // patch to "update". With the object read, an add must surface as "add".
+    let n = Notification {
+        method: "item/completed".into(),
+        params: json!({
+            "thread_id": "t-1",
+            "item": {
+                "id": "f-1",
+                "type": "file_change",
+                "changes": [{ "path": "/new.rs", "kind": { "type": "add" }, "diff": "" }]
+            }
+        }),
+    };
+    let e = translate_notification(&n, "t-1").unwrap();
+    match e {
+        ThreadEvent::ItemCompleted { item } => match item.details {
+            ccteam_core::harness::ThreadItemDetails::FileChange { path, kind } => {
+                assert_eq!(path, PathBuf::from("/new.rs"));
+                assert_eq!(
+                    kind, "add",
+                    "tagged-enum kind must be read from the object .type"
+                );
+            }
+            other => panic!("expected FileChange, got {other:?}"),
+        },
+        _ => panic!("expected ItemCompleted"),
+    }
+}
+
+#[test]
+fn translate_file_change_tagged_kind_update_with_move_is_rename() {
+    // Bug 2 (rename): the wire has no `rename` variant — a rename is an
+    // `update` carrying a `movePath`. Surface the richer "rename" kind.
+    let n = Notification {
+        method: "item/completed".into(),
+        params: json!({
+            "thread_id": "t-1",
+            "item": {
+                "id": "f-2",
+                "type": "file_change",
+                "changes": [{
+                    "path": "/old.rs",
+                    "kind": { "type": "update", "movePath": "/renamed.rs" },
+                    "diff": ""
+                }]
+            }
+        }),
+    };
+    let e = translate_notification(&n, "t-1").unwrap();
+    match e {
+        ThreadEvent::ItemCompleted { item } => match item.details {
+            ccteam_core::harness::ThreadItemDetails::FileChange { kind, .. } => {
+                assert_eq!(kind, "rename", "update + movePath must surface as rename");
+            }
+            other => panic!("expected FileChange, got {other:?}"),
+        },
+        _ => panic!("expected ItemCompleted"),
+    }
+}
+
+#[test]
+fn translate_file_change_tagged_kind_delete() {
+    let n = Notification {
+        method: "item/completed".into(),
+        params: json!({
+            "thread_id": "t-1",
+            "item": {
+                "id": "f-3",
+                "type": "file_change",
+                "changes": [{ "path": "/gone.rs", "kind": { "type": "delete" }, "diff": "" }]
+            }
+        }),
+    };
+    let e = translate_notification(&n, "t-1").unwrap();
+    match e {
+        ThreadEvent::ItemCompleted { item } => match item.details {
+            ccteam_core::harness::ThreadItemDetails::FileChange { kind, .. } => {
+                assert_eq!(kind, "delete");
+            }
+            other => panic!("expected FileChange, got {other:?}"),
+        },
+        _ => panic!("expected ItemCompleted"),
+    }
+}
+
+#[test]
+fn translate_thread_started_real_wire_nested_id_filters_foreign() {
+    // Bug 3: `thread/started`'s only id is nested at `params.thread.id`
+    // (`ThreadStartedNotification { thread: Thread }`). A foreign thread's
+    // started notification must be filtered out — previously it slipped the
+    // top-level-only gate and laundered the foreign id into the wanted slot.
+    let foreign = Notification {
+        method: "thread/started".into(),
+        params: json!({ "thread": { "id": "other", "sessionId": "s-1" } }),
+    };
+    assert!(
+        translate_notification(&foreign, "ours").is_none(),
+        "foreign thread/started (nested thread.id) must be filtered out"
+    );
+
+    // And the matching thread/started (nested id == wanted) still surfaces
+    // with the real id, not a laundered fallback.
+    let ours = Notification {
+        method: "thread/started".into(),
+        params: json!({ "thread": { "id": "ours", "sessionId": "s-1" } }),
+    };
+    match translate_notification(&ours, "ours").expect("matching thread/started must surface") {
+        ThreadEvent::ThreadStarted { thread_id } => assert_eq!(thread_id, "ours"),
+        other => panic!("expected ThreadStarted, got {other:?}"),
     }
 }
 
