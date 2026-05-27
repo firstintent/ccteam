@@ -114,6 +114,7 @@ impl CodexJsonRpcClient {
             reader,
             Arc::clone(&pending),
             notif_tx.clone(),
+            out_tx.clone(),
         ));
 
         Self {
@@ -207,6 +208,7 @@ async fn run_reader_loop<R: AsyncRead + Unpin + Send>(
     reader: R,
     pending: Arc<Mutex<Pending>>,
     notifications: broadcast::Sender<Notification>,
+    out: mpsc::Sender<Vec<u8>>,
 ) {
     let buf = BufReader::new(reader);
     let mut lines = buf.lines();
@@ -218,7 +220,7 @@ async fn run_reader_loop<R: AsyncRead + Unpin + Send>(
                     continue;
                 }
                 match serde_json::from_str::<Value>(trimmed) {
-                    Ok(v) => dispatch(v, &pending, &notifications).await,
+                    Ok(v) => dispatch(v, &pending, &notifications, &out).await,
                     Err(err) => {
                         tracing::warn!(error = %err, line = %trimmed, "jsonrpc: parse failure");
                     }
@@ -240,10 +242,15 @@ async fn dispatch(
     v: Value,
     pending: &Arc<Mutex<Pending>>,
     notifications: &broadcast::Sender<Notification>,
+    out: &mpsc::Sender<Vec<u8>>,
 ) {
-    // Response: has `id` AND (`result` or `error`).
-    if let Some(id) = v.get("id").and_then(|x| x.as_i64()) {
-        if v.get("result").is_some() || v.get("error").is_some() {
+    let id = v.get("id").and_then(|x| x.as_i64());
+    let method = v.get("method").and_then(|m| m.as_str());
+
+    // Response (server → client reply to one of our requests): has `id`
+    // AND (`result` or `error`), and NO `method`.
+    if let Some(id) = id {
+        if method.is_none() && (v.get("result").is_some() || v.get("error").is_some()) {
             let tx = { pending.lock().await.remove(&id) };
             if let Some(tx) = tx {
                 let outcome = if let Some(err) = v.get("error") {
@@ -265,9 +272,58 @@ async fn dispatch(
             }
             return;
         }
+
+        // Server-initiated REQUEST: has BOTH `id` AND `method` (no
+        // result/error). The Codex app-server BLOCKS the turn until the
+        // client replies (W3b catalog §2.2 + §8.3 — sandbox-violation
+        // elicitation, file-change approval, MCP elicitation, ...). The
+        // previous dispatch matched only `method` and (mis)routed these
+        // into the notification broadcast, dropping the `id` — so any
+        // Codex turn that asked for approval HUNG until the server timed
+        // out.
+        //
+        // W4 SAFE DEFAULT: reply with a JSON-RPC *error* response keyed by
+        // the request `id`. An error reply is the protocol-canonical way to
+        // unblock ANY server request — including the complex-payload ones
+        // (PermissionsRequestApprovalResponse, ToolRequestUserInputResponse,
+        // DynamicToolCallResponse) — without ccteam having to construct a
+        // typed decision payload it might get wrong. Codex treats a failed
+        // approval callback as "denied / cancel the affected action" rather
+        // than auto-approving, which is the conservative, safe direction.
+        //
+        // W4-FOLLOWUP: route these into the V0.6.1 F98 `plan_decision` HITL
+        // flow and reply with the typed `{decision:"decline"}` /
+        // `{action:"decline"}` payloads so the user can actually approve via
+        // IM round-trip. See docs/versions/v0-8-rmux/w4-codex-in-mux-plan.md.
+        if let Some(method) = method {
+            tracing::info!(
+                id,
+                method,
+                "jsonrpc: server-initiated request; replying with default-decline \
+                 error to unblock the turn (HITL routing is W4-followup)"
+            );
+            let reply = json!({
+                "id": id,
+                "error": {
+                    "code": -32601,
+                    "message": format!(
+                        "ccteam: server-initiated request '{method}' not yet handled \
+                         (default-decline to unblock turn)"
+                    ),
+                },
+            });
+            if let Ok(mut line) = serde_json::to_vec(&reply) {
+                line.push(b'\n');
+                if let Err(err) = out.send(line).await {
+                    tracing::warn!(error = %err, "jsonrpc: failed to send default server-request reply");
+                }
+            }
+            return;
+        }
     }
-    // Notification: has `method` but no result/error.
-    if let Some(method) = v.get("method").and_then(|m| m.as_str()) {
+
+    // Notification: has `method` but no `id` (and no result/error).
+    if let Some(method) = method {
         let params = v.get("params").cloned().unwrap_or(Value::Null);
         let _ = notifications.send(Notification {
             method: method.to_string(),
