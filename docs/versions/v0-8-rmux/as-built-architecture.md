@@ -44,7 +44,7 @@ ccteam-core ─┘                  └─▶ tmux CLI                 (TmuxBack
 | `inproc_backend.rs` (217 ln) | `InProcBackend` — mode-1 stub; most ops return `Ok(())` / no-op, drives a `tokio::task`. Used by tests + the eventual mode-1 unification (W1 `23f0676`). |
 | `daemon.rs` (122 ln) | `run_internal_daemon` — the single-binary re-exec daemon runtime (W2a `050edff`). |
 | `patterns/` (`mod.rs` + `claude.rs` + `codex.rs`) | Layer-2 TUI-render regex registry: `PatternMatcher` engine + the static base-pattern tables (W2b `2158f18` Claude, W3b `aacc616` Codex). |
-| `enriched_event.rs` (553 ln) | The `EventMerger` — priority-with-grace-window merge of P1 (typed) + P2 (regex) + P3 (process) signals (W3b `2a331d1`). **BUILT-NOT-WIRED** (see §5). |
+| `enriched_event.rs` (553 ln) | The `EventMerger` — priority-with-grace-window merge of P1 (typed) + P2 (regex) + P3 (process) signals (W3b `2a331d1`). **AHEAD-OF-CONSUMER** (built+tested, no production producer/consumer; deliberate, `TODO(V0.9-typed-event-consumer)` — see §5). |
 
 `ccteam-core` consumes the trait via `ccteam_mux::default_backend()` from the
 mode-2/3 adapters; `ccteam-cli` consumes `backend_kind_from_env()` for
@@ -214,18 +214,23 @@ consumer (the merger wiring, or W6) lands.
 priority-with-grace-window merger that emits at most one logical event per
 occurrence, sourcing the richest of P1 (Claude hook / Codex JSON-RPC, lossless)
 / P2 (regex, lossy) / P3 (process). Pairs by `(session_id, kind,
-sequence_id)`. **Explicitly BUILT-NOT-WIRED** — the source says so itself
-(enriched_event.rs:26-31):
+sequence_id)`. **Explicitly marked AHEAD-OF-CONSUMER infrastructure** (a
+deliberate decision, not an oversight) — the source module doc says so and
+carries a searchable `TODO(V0.9-typed-event-consumer)` tag.
 
-> "It is **NOT yet wired into the live `MuxBackend::subscribe` path** — that
-> integration (translating `MuxEvent::PatternMatched` into `BaseEvent` and the
-> daemon's hook / `CodexUdsBridge` into `EnrichmentEvent`, minting
-> `sequence_id`s) is a later wave … The merger is delivered ready for that
-> wiring."
+Status: built + acceptance-tested (W3b `f3bd694`), but with **neither a
+production producer nor consumer**:
+- *No producer* — base events would come from `MuxEvent::PatternMatched`,
+  which needs `register_pattern` called in production; it has no production
+  caller. (The raw `MuxBackend::subscribe` line stream IS consumed, by the
+  web PTY SSE — but the typed pattern-match layer above it is unwired.)
+- *No consumer* — nothing reads the merged stream.
 
-This is the cleanest designed/built boundary on the branch: the merge
-*algorithm* is done + acceptance-tested (W3b `f3bd694`); the *daemon-side
-plumbing that feeds it* is not built.
+The consuming feature is **V0.9 daemon-side typed-event-driven orchestration**
+(rate-limit auto-resume, idle/turn-done detection from a merged typed stream
+rather than `progress.jsonl` polling). A stub consumer is deliberately NOT
+added — it would look load-bearing while doing nothing. This is the cleanest
+designed/built boundary on the branch.
 
 ---
 

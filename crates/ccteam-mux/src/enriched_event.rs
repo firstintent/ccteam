@@ -16,19 +16,37 @@
 //! a priority queue with a grace window (spec:
 //! `docs/versions/v0-8-rmux/w4-enriched-event-merger.md`).
 //!
-//! ## Scope / integration boundary (W3b)
+//! ## Status: AHEAD-OF-CONSUMER infrastructure (deliberate)
 //!
 //! This module is a **self-contained, pure-logic library**: it consumes
 //! [`BaseEvent`] / [`EnrichmentEvent`] values and produces
 //! [`EnrichedEvent`] values. It performs **no I/O** and is fully unit-
-//! testable with `tokio::time::pause()`.
+//! testable with `tokio::time::pause()` (see the inline tests + the
+//! acceptance suite in `tests/enriched_event_merger.rs`).
 //!
-//! It is **NOT yet wired into the live `MuxBackend::subscribe` path** —
-//! that integration (translating `MuxEvent::PatternMatched` into
-//! [`BaseEvent`] and the daemon's hook / `CodexUdsBridge` into
-//! [`EnrichmentEvent`], minting `sequence_id`s) is a later wave and
-//! touches `tmux_backend` / `rmux_backend` / `daemon`, which are out of
-//! W3b scope. The merger is delivered ready for that wiring.
+//! It is **built + tested but has no production producer or consumer**,
+//! by design — not an oversight:
+//! - *No producer*: its base-event input would come from
+//!   `MuxEvent::PatternMatched`, which requires `register_pattern` to be
+//!   called in production. `register_pattern` currently has no production
+//!   caller (the raw `MuxBackend::subscribe` line stream IS consumed — by
+//!   the web PTY SSE — but the typed pattern-match layer above it is not
+//!   wired to register anything).
+//! - *No consumer*: nothing reads the merged `EnrichedEvent` stream.
+//!
+//! The merger exists ahead of the feature that will consume it:
+//! **daemon-side typed-event-driven orchestration** (e.g. rate-limit
+//! auto-resume, idle/turn-done detection driven from a merged typed
+//! stream rather than from `progress.jsonl` polling). That feature is
+//! V0.9 scope — it must mint `sequence_id`s and translate the daemon's
+//! hook / `CodexUdsBridge` enrichments into [`EnrichmentEvent`]s, which
+//! touches `tmux_backend` / `rmux_backend` / `daemon`. The merger is
+//! delivered ready for that wiring; do NOT add a stub consumer (it would
+//! look load-bearing while doing nothing).
+//!
+//! `TODO(V0.9-typed-event-consumer)`: wire register_pattern → PatternMatched
+//! → BaseEvent and the daemon enrichment sources → EnrichmentEvent into
+//! this merger, and add the orchestration consumer that reads the output.
 //!
 //! ## Sequence-id contract
 //!
@@ -267,6 +285,9 @@ struct Inner {
 }
 
 /// The priority-with-grace-window merger.
+///
+/// **Ahead-of-consumer infrastructure** — built + tested, no production
+/// producer/consumer yet (see the module doc; `TODO(V0.9-typed-event-consumer)`).
 ///
 /// Construct with [`EventMerger::new`], which hands back the output
 /// [`mpsc::UnboundedReceiver`]. **All** emissions — immediate pairs,
