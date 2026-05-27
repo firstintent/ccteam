@@ -1542,6 +1542,73 @@ fn run_restart_team(
 ///
 /// Always prints the underlying command before exec'ing so the operator
 /// learns the lower-level tool.
+/// V0.8 W5 — interactive attach to a session hosted by the
+/// ccteam-owned rmux daemon (`~/.ccteam/run/mux.sock`).
+///
+/// Path A (use `rmux-client` directly): `connect` → `begin_attach`
+/// → `into_parts` → `attach_terminal_with_initial_bytes`. The last call
+/// drives the local TTY in raw mode (termios) on the CLI's own
+/// controlling terminal — exactly the in-process analogue of
+/// `tmux attach -t <name>`, so it stays a blocking sync call here
+/// (terminal handover doesn't fit the async trait — W0 audit §4-D).
+///
+/// Detach behavior (chord / banner) is determined by the rmux daemon
+/// itself: it emits `AttachMessage::DetachKill` / `DetachExec`, which
+/// the client driver handles. ccteam does NOT pick a detach key
+/// (e.g. `Ctrl-]`) — that is rmux-owned.
+#[cfg(unix)]
+fn rmux_interactive_attach(session_name: &str) -> Result<()> {
+    use rmux_client::{connect_or_absent, AttachTransition, ConnectResult};
+    use rmux_proto::SessionName;
+
+    let socket = ccteam_mux::default_ccteam_mux_socket_path();
+    eprintln!("→ rmux attach {session_name} (socket {})", socket.display());
+
+    let connection = match connect_or_absent(&socket).context("connect to ccteam rmux daemon")? {
+        ConnectResult::Connected(conn) => conn,
+        ConnectResult::Absent => bail!(
+            "ccteam rmux daemon is not running (socket `{}` absent).\n  \
+             Start the project first:  ccteam start {session_name}\n  \
+             (the daemon is hosted by `ccteam start`; attach has nothing to connect to until then.)",
+            socket.display(),
+        ),
+    };
+
+    let name = SessionName::new(session_name.to_string())
+        .map_err(|e| anyhow::anyhow!("invalid rmux session name `{session_name}`: {e}"))?;
+
+    let transition = connection
+        .begin_attach(name)
+        .with_context(|| format!("begin attach to rmux session `{session_name}`"))?;
+
+    let upgrade = match transition {
+        AttachTransition::Upgraded(upgrade) => upgrade,
+        AttachTransition::Rejected(other) => bail!(
+            "rmux daemon rejected attach to session `{session_name}`: {other:?}\n  \
+             (the session may not exist — check `ccteam session ls` or start it with `ccteam start`.)",
+        ),
+    };
+
+    // into_parts yields the raw upgraded UnixStream plus any bytes the
+    // daemon already streamed past the response frame; the driver
+    // replays those `initial_bytes` before entering the poll loop so no
+    // pane output is lost on the attach boundary.
+    let (stream, initial_bytes) = upgrade.into_parts();
+    rmux_client::attach_terminal_with_initial_bytes(stream, initial_bytes)
+        .map_err(|e| anyhow::anyhow!("rmux attach session `{session_name}`: {e}"))?;
+    Ok(())
+}
+
+/// Non-Unix fallback: the rmux backend is Unix-first (UDS transport),
+/// so interactive attach is not yet wired on Windows. Fail loud.
+#[cfg(not(unix))]
+fn rmux_interactive_attach(session_name: &str) -> Result<()> {
+    bail!(
+        "rmux interactive attach is not supported on this platform yet \
+         (session `{session_name}`); use the tmux backend (unset CCTEAM_MUX_BACKEND).",
+    )
+}
+
 pub fn run_attach(paths: &CcteamPaths, slug: &str) -> Result<()> {
     // V0.5.0 F93b: agent-team mode dispatches to the lead session.
     if let Some(lead_id) = read_agent_team_lead_session_id(paths, slug)? {
@@ -1556,7 +1623,18 @@ pub fn run_attach(paths: &CcteamPaths, slug: &str) -> Result<()> {
         return Ok(());
     }
 
-    let tmux_session = TmuxSession::from_name(session_name_for_project(paths, slug));
+    // V0.8 W5 — backend-aware interactive attach. Branch on the
+    // configured mux backend BEFORE the tmux exists-check: under the
+    // rmux backend the tmux session never exists, so falling through to
+    // the tmux / claude-bg paths would always miss. The rmux path
+    // attaches to the ccteam-hosted rmux daemon via rmux-client
+    // directly (Path A). The tmux path is unchanged (default).
+    let session_name = session_name_for_project(paths, slug);
+    if ccteam_mux::backend_kind_from_env() == ccteam_mux::BackendKind::Rmux {
+        return rmux_interactive_attach(&session_name);
+    }
+
+    let tmux_session = TmuxSession::from_name(session_name);
     if tmux_session.exists() {
         eprintln!("→ tmux attach -t {}", tmux_session.name());
         // V0.8 W1 — argv from `ccteam_mux::interactive_attach_argv`
@@ -1985,6 +2063,14 @@ pub fn run_session_attach(slug: &str, sid: &str) -> Result<()> {
             available_sids(&state)
         )
     })?;
+    // V0.8 W5 — backend-aware: the persisted `tmux_session` name is the
+    // mux session name for both backends (rmux reuses the same label).
+    // Under rmux, attach through the daemon; the existence check is the
+    // daemon's job (begin_attach rejects an absent session).
+    if ccteam_mux::backend_kind_from_env() == ccteam_mux::BackendKind::Rmux {
+        return rmux_interactive_attach(&record.tmux_session);
+    }
+
     let session = TmuxSession::from_name(record.tmux_session.clone());
     if !session.exists() {
         bail!("tmux session not running: {}", session.name());
