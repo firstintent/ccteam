@@ -90,18 +90,21 @@ pattern translator does, emitting higher-level variants outward.
 lets a caller recover the concrete impl after the trait object erases it.
 
 **Routing** (the load-bearing functions):
-- `from_env()` (lib.rs:365-374) — fallible; reads `CCTEAM_MUX_BACKEND`
-  (`tmux` default / `rmux` / `inproc-test`); unknown value → hard error.
-- `default_backend()` (lib.rs:390-392) — infallible production selector;
-  unknown env → falls back to `TmuxBackend`. **W5 fix `969b0e2`**: this used
-  to hardcode `TmuxBackend`, so `CCTEAM_MUX_BACKEND=rmux` was a no-op on
-  production spawns. Now it routes via `from_env`, so the flag actually
-  reaches every W2c-migrated adapter.
-- `backend_kind_from_env()` (lib.rs:352-358) — sync, side-effect-free; for CLI
-  sites (`ccteam attach`/`peek`) that branch on backend without instantiating.
+- `from_env()` — fallible; reads `CCTEAM_MUX_BACKEND`. Explicit `tmux` →
+  Tmux, `inproc-test` → InProc; `rmux` / unset / empty → Rmux; an
+  unknown/typo'd value → hard error (fallible callers surface the mistake).
+- `default_backend()` — infallible production selector; same routing as
+  `from_env`, but a typo degrades to **Rmux** (the bundled always-available
+  backend) rather than erroring. **W5 fix `969b0e2`** made it route via env
+  (it used to hardcode tmux, so `CCTEAM_MUX_BACKEND=rmux` was a no-op on
+  production spawns); **W7 `e9e2bdf`** flipped its env-unset default to rmux.
+- `backend_kind_from_env()` — sync, side-effect-free; for CLI sites
+  (`ccteam attach`/`peek`) that branch on backend without instantiating.
+  Same routing: only explicit `tmux` opts out; everything else → Rmux.
 
-**Default is still `tmux`.** rmux activates only on explicit
-`CCTEAM_MUX_BACKEND=rmux`. Flip-default (env-unset → rmux) is W7, gated (§8).
+**Default is `rmux`** (W7 `e9e2bdf` — the library is the single source of
+truth). rmux is the bundled mux so ccteam works with no external tmux; an
+operator opts out only with an explicit `CCTEAM_MUX_BACKEND=tmux`.
 
 ---
 
@@ -319,10 +322,22 @@ the **unified outbound bus** (the migration's headline) is **not** delivered.
 
 ## 8. Flip-default gate
 
-The W7 flip (env-unset default `tmux → rmux`) is gated on the
-`w-production-readiness.md §6` checklist. That audit was written at HEAD
-`969b0e2`; several gates have since been closed by post-audit commits. Current
-state at this commit:
+> **EXECUTED on this branch (W7, commit `e9e2bdf`).** The library default
+> is now rmux (`from_env` / `default_backend` / `backend_kind_from_env`);
+> only an explicit `CCTEAM_MUX_BACKEND=tmux` opts out. The flip migration
+> followed `w-flip-default-migration-plan.md` Steps 1-5 (pin 21 tmux-fixture
+> adapter tests + the run_peek unit test to tmux → flip default → update
+> default-assertion tests → full suite green) plus Step 3 positive
+> adapter-layer rmux coverage. This is a **no-merge evaluation branch**:
+> the flip demonstrates "rmux as the genuine default everywhere," while
+> **merge-to-main stays gated** on the open hardware/decision items below
+> (G8 macOS, G3/G4/G6 carve-outs) + real-claude burn-in. The gate table is
+> the audit snapshot; "Remaining" now means remaining-before-MERGE, not
+> remaining-before-flip.
+
+The W7 flip was gated on the `w-production-readiness.md §6` checklist. That
+audit was written at HEAD `969b0e2`; several gates have since been closed by
+post-audit commits. Current state:
 
 | Gate | Statement | Audit (`969b0e2`) | **Now** | Closed by |
 |---|---|---|---|---|
@@ -337,19 +352,19 @@ state at this commit:
 | **G9** Windows scope | Windows OUT of flip scope; WSL2 red-line documented | doc-only | **doc-only** | carve-out |
 | **G10** no semver drift | `rmux_types_compile_link` canary green | MET | **MET** | canary in suite |
 
-**Remaining before flip:**
+**Remaining before MERGE-to-main (the flip itself is done on this branch):**
 - **G8** (macOS real-binary smoke) — the one open *hard* blocker; needs real
-  Darwin hardware. Honor the research R3 "do not flip until upstream macOS
-  green" gate.
+  Darwin hardware. Honor the research R3 "do not flip *on main* until upstream
+  macOS green" gate. The CI matrix is wired (linux+macOS) and runs on push.
 - **G3** — land the orchestrator `via_mux` wiring (in-flight) *or* write the
   explicit "mode-2 `--bg` stays tmux-file-based under rmux" carve-out.
 - **G4 / G6** — write the carve-out docs (Codex app-server stays its own
   supervisor; rmux ships with two `progress.jsonl` writers + retained V0.6.4
   race) *or* deliver W6.
 
-**Default remains `tmux`.** Only after G8 hard-closes and G3/G4/G6 are
-decided does W7 flip `from_env` / `default_backend`, sync tier-1 + user docs,
-and bump the version.
+**Default is `rmux` on this branch** (W7 `e9e2bdf`). Merging to main + a
+version bump stay gated on G8 hard-closing, G3/G4/G6 being decided, and
+real-claude mode-3 burn-in.
 
 ---
 

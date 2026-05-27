@@ -1,18 +1,36 @@
 # Session Handoff — rmux integration (v0-8-rmux-integration)
 
-> Paste-ready prompts for migrating to a new session. Branch is at 71
-> commits, all pushed to `origin/v0-8-rmux-integration`, baseline green
-> (~1676 pass / 0 fail excl. 2 known inotify flakes), worktree
-> `/tmp/ccteam-rmux` (target/ warm).
+> Paste-ready prompts for migrating to a new session. Branch HEAD
+> `f58fd96`, all pushed to `origin/v0-8-rmux-integration`, baseline
+> 1675 pass / 1 fail excl. ccteam-web (the 1 = known daemon_dm WSL2
+> inotify/timing env-flake, non-regression), worktree `/tmp/ccteam-rmux`
+> (target/ warm).
 
-> **UPDATE (flip-default DONE, commit `8b3310c`)**: `ccteam start` now
-> defaults `CCTEAM_MUX_BACKEND` to rmux (operator opts out with =tmux);
-> library `from_env()` default stays tmux so the test suite is
-> unaffected. **rmux is now the product default.** Item ① closed.
-> Remaining: ② macOS/Windows CI green (hardware-bound, CI wired) ·
-> ③ EnrichedEvent merger consumer (built-not-wired infrastructure;
-> decide: wire a minimal consumer OR mark ahead-of-consumer). The
-> goal-prompts below predate this — ① is no longer pending.
+> **UPDATE 2 — flip-default LIBRARY flip DONE (Steps 1-5 complete)**:
+> `from_env()` / `default_backend()` / `backend_kind_from_env()` now
+> default to **rmux** (commit `e9e2bdf`); only an explicit
+> `CCTEAM_MUX_BACKEND=tmux` opts out (unset/empty/typo → rmux, the
+> bundled always-available backend). The redundant `run_start` set_var
+> (`8b3310c`) was removed so the **library is the single source of
+> truth** — this also fixed a real correctness gap where `mcp-serve` and
+> standalone `ccteam web` (separate processes from `ccteam start`) looked
+> at tmux while the squad ran on rmux. The 21 tmux-fixture adapter tests
+> + the run_peek unit test are pinned to tmux (`e0068a9`, `44acdee`);
+> default-assertion tests updated; positive adapter-layer rmux coverage
+> added + wired into rmux-smoke CI (`f58fd96`, Step 3). Full workspace
+> suite under rmux default = **1676 tests, 1675 pass / 1 fail** where the
+> 1 is the documented `daemon_dm_no_at_mention_auto_routes_to_single_bot`
+> WSL2 inotify/timing env-flake (it PASSED in the clean first post-flip
+> gate run — non-regression; green on CI / unloaded hosts). clippy 0; fmt
+> clean. **rmux is now the genuine default everywhere.** Items ① + Step 3
+> closed.
+>
+> Remaining (out-of-environment): ② macOS/Windows CI green (hardware-bound,
+> CI matrix wired, runs on push) · ③ EnrichedEvent merger consumer
+> (still built-not-wired infrastructure; decide: wire a minimal consumer
+> OR mark ahead-of-consumer). The goal-prompts below predate this — the
+> flip-default item (1) is fully done; only EnrichedEvent (2) remains
+> in-environment.
 
 ---
 
@@ -85,11 +103,11 @@ flip-default 的 test 迁移不要在上下文将满时启动(不能留半成品
 | 项 | 值 |
 |---|---|
 | 分支 | `v0-8-rmux-integration`(off origin/main `446e33a`)|
-| commits | 69,全部 pushed origin |
-| 基线 | ~1672 pass(2 个 inotify flake 非回归)· clippy 0 · fmt clean |
+| commits | 全部 pushed origin(HEAD `f58fd96`)|
+| 基线 | 1676 tests,1675 pass / 1 fail(workspace --exclude ccteam-web;1 fail = `daemon_dm_no_at_mention_auto_routes_to_single_bot` WSL2 inotify/timing env-flake,首次 gate 通过、非回归)· clippy 0 · fmt clean |
 | worktree | `/tmp/ccteam-rmux`(target 暖)|
-| 默认 backend | tmux(rmux 走 `CCTEAM_MUX_BACKEND=rmux` opt-in,生产级 + 端到端验证)|
-| 剩余 | flip-default 迁移(可做)· macOS/Windows CI(硬件)· EnrichedEvent consumer(基础设施)|
+| 默认 backend | **rmux**(库级单一 SoT;`CCTEAM_MUX_BACKEND=tmux` 显式 opt-out;unset/empty/typo → rmux)|
+| 剩余 | macOS/Windows CI(硬件)· EnrichedEvent consumer(基础设施,built-not-wired)|
 
 ## 注意:`/goal` 是 session-scoped
 迁到新 session **不会自动带 hook**。要继续 goal-driven 开发,在新 session 重新 `/goal`(用 ① 推荐版)。

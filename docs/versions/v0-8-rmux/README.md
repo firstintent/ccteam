@@ -29,7 +29,7 @@
 | audit | production-readiness audit + flip-default gate | **DONE** `ae168f3` |
 | fixes | G1 exit-empty + G1 reconnect + G5 screenshot/snapshot via trait + G2 CI real-daemon smoke + default_backend env routing | **DONE** `d6bb4c1` `768a367` `e49d787` `2a292f7` `af3a5a3` `6d01a15` `969b0e2` |
 | W6 | Claude Code hook → daemon UDS reroute (single-writer bus) | **DESIGNED-ONLY** (`w6-hook-reroute-design.md`, no code) |
-| W7 | flip default to rmux + doc sync + production polish | **PENDING** (gated — see §flip-default) |
+| W7 | flip default to rmux + doc sync + production polish | **DONE (on branch)** `e9e2bdf` + Step 3 `f58fd96` — library default = rmux, single SoT; merge-to-main still gated (G8 macOS + burn-in) |
 
 ## Acceptance gates per wave
 
@@ -92,9 +92,11 @@ flip-default gate state (full table in `as-built-architecture.md §8`):
   needs an upstream rmux RPC and it touches the hook path all mode-3 depends
   on. Recommended close = accept-race carve-out, not build. See
   `as-built-architecture.md §6/§8`.
-- **W7 flip-default** — flip env-unset default `tmux → rmux`. Gated on G8 +
-  G3/G4/G6 decisions.
-- **macOS validation (G8)** — the one open hard flip blocker.
+- **W7 flip-default** — **DONE on this branch** (`e9e2bdf`): env-unset default
+  flipped `tmux → rmux` in the library (single SoT) + 21 tmux-fixture tests +
+  run_peek pinned + Step 3 adapter coverage (`f58fd96`). Merge-to-main remains
+  gated on G8 + G3/G4/G6 + burn-in.
+- **macOS validation (G8)** — the one open hard *merge* blocker.
 - **In-flight (parallel agents at this commit)**: Codex app-server camelCase
   wire-name sweep; mode-2 `via_mux` orchestrator wiring (teach the F80 poller to
   honor `raw_extras.via_mux` instead of `state.json`, closing G3/G-C).
