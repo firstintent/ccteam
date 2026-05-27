@@ -48,4 +48,14 @@ RMUX_SDK_DAEMON_BINARY="$BIN" \
   cargo test -p ccteam-mux --test rmux_backend_session_roundtrip --locked \
   -- --ignored --nocapture
 
+# Adapter-layer coverage: drives the production spawn path
+# (ClaudeBgAdapter -> default_backend() -> rmux daemon -> live session)
+# so the composition is exercised, not just the bare trait. Uses a fake
+# `claude` (sleep) under an isolated per-test HOME, so no real claude is
+# needed. CCTEAM_TEST_BIN points the binary locator at the built ccteam.
+echo "==> running rmux adapter-layer spawn coverage (--ignored)"
+CCTEAM_TEST_BIN="$BIN" RMUX_SDK_DAEMON_BINARY="$BIN" \
+  cargo test -p ccteam-core --test claude_bg_rmux_adapter_test --locked \
+  -- --ignored --nocapture
+
 echo "==> rmux smoke: PASS"
