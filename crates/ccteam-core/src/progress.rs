@@ -557,6 +557,43 @@ pub fn build_plan_timeout_event(plan_id: &str, agent: &str, on_timeout: &str) ->
 /// wire enum). Observability only — NOT a HITL approval pause.
 pub const CODEX_PLAN_UPDATED: &str = "codex_plan_updated";
 
+/// `codex_token_usage` — Codex emitted a `thread/tokenUsage/updated`
+/// notification (mid-turn token accounting). Payload:
+/// `{thread_id, turn_id, total:{...}, last:{...}, model_context_window?, vendor:"codex", ts}`.
+/// This is **not** a cost-ledger write — the authoritative cost row is
+/// still the `agent_done` written at `turn/completed`. This event exists
+/// so a budget tripwire can fire mid-turn before a runaway turn completes.
+pub const CODEX_TOKEN_USAGE: &str = "codex_token_usage";
+
+/// `codex_thread_status` — Codex emitted a `thread/status/changed`
+/// notification. Payload:
+/// `{thread_id, status, active_flags:[...], vendor:"codex", ts}`.
+/// `status` is `not_loaded` / `idle` / `system_error` / `active` (the
+/// internally-tagged `type` discriminator, snake_cased here);
+/// `active_flags` carries `waiting_on_approval` / `waiting_on_user_input`
+/// when `status == active`. The `waiting_on_approval` flag is the
+/// authoritative "this Codex thread is blocked on a human" signal that a
+/// future `mode: human-approval` Codex adapter will combine with the
+/// server-initiated `item/*/requestApproval` handlers.
+pub const CODEX_THREAD_STATUS: &str = "codex_thread_status";
+
+/// `codex_rate_limit` — Codex emitted an `account/rateLimits/updated`
+/// notification (typed rate-limit visibility, replacing TUI scrape).
+/// Payload: `{primary?:{used_percent, window_duration_mins?, resets_at?},
+/// secondary?:{...}, rate_limit_reached_type?, plan_type?, vendor:"codex", ts}`.
+/// Feeds the F84 budget-cap escalation surface with typed numbers instead
+/// of a string-matched TUI error.
+pub const CODEX_RATE_LIMIT: &str = "codex_rate_limit";
+
+/// True if `kind` is one of the V0.8 Codex app-server notification event
+/// names.
+pub fn is_codex_notification_event(kind: &str) -> bool {
+    matches!(
+        kind,
+        CODEX_PLAN_UPDATED | CODEX_TOKEN_USAGE | CODEX_THREAD_STATUS | CODEX_RATE_LIMIT
+    )
+}
+
 /// Build a `codex_plan_updated` event JSON. `plan` is the verbatim
 /// `Vec<TurnPlanStep>` array from the wire (`[{step, status}, ...]`).
 pub fn build_codex_plan_updated_event(
@@ -579,6 +616,61 @@ pub fn build_codex_plan_updated_event(
             .insert("explanation".to_string(), Value::String(e.to_string()));
     }
     v
+}
+
+/// Build a `codex_token_usage` event JSON. `total` / `last` are the
+/// verbatim `TokenUsageBreakdown` objects from the wire.
+pub fn build_codex_token_usage_event(
+    thread_id: &str,
+    turn_id: &str,
+    total: Value,
+    last: Value,
+    model_context_window: Option<i64>,
+) -> Value {
+    let mut v = serde_json::json!({
+        "event": CODEX_TOKEN_USAGE,
+        "vendor": "codex",
+        "thread_id": thread_id,
+        "turn_id": turn_id,
+        "total": total,
+        "last": last,
+        "ts": Utc::now().to_rfc3339(),
+    });
+    if let Some(w) = model_context_window {
+        v.as_object_mut()
+            .unwrap()
+            .insert("model_context_window".to_string(), Value::Number(w.into()));
+    }
+    v
+}
+
+/// Build a `codex_thread_status` event JSON. `status` is the snake_cased
+/// thread-status discriminator; `active_flags` is the (possibly empty)
+/// list of snake_cased active flags.
+pub fn build_codex_thread_status_event(
+    thread_id: &str,
+    status: &str,
+    active_flags: Vec<String>,
+) -> Value {
+    serde_json::json!({
+        "event": CODEX_THREAD_STATUS,
+        "vendor": "codex",
+        "thread_id": thread_id,
+        "status": status,
+        "active_flags": active_flags,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
+/// Build a `codex_rate_limit` event JSON. `snapshot` is the verbatim
+/// `RateLimitSnapshot` object from the wire (camelCase keys preserved).
+pub fn build_codex_rate_limit_event(snapshot: Value) -> Value {
+    serde_json::json!({
+        "event": CODEX_RATE_LIMIT,
+        "vendor": "codex",
+        "snapshot": snapshot,
+        "ts": Utc::now().to_rfc3339(),
+    })
 }
 
 /// True if `kind` is one of the chat-mode event names (F108 / F118 /

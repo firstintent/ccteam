@@ -892,12 +892,13 @@ fn pluck_val(params: &Value, snake: &str, camel: &str) -> Option<Value> {
     params.get(camel).or_else(|| params.get(snake)).cloned()
 }
 
-/// V0.8 rmux W4-fu — translate Codex app-server notifications that have
-/// no [`ThreadEvent`] variant into additive `progress.jsonl` rows. These
-/// were silently dropped by [`translate_notification`]'s forward-compat
-/// `other` arm until the W4 `initialize` handshake (`experimentalApi:
-/// true`) put them on the wire. This commit wires `turn/plan/updated`;
-/// the follow-up commit adds tokenUsage / status / rateLimits.
+/// V0.8 rmux W4-fu — translate the four Codex app-server notifications
+/// that have no [`ThreadEvent`] variant (`turn/plan/updated`,
+/// `thread/tokenUsage/updated`, `thread/status/changed`,
+/// `account/rateLimits/updated`) into additive `progress.jsonl` rows.
+/// These were silently dropped by [`translate_notification`]'s
+/// forward-compat `other` arm until the W4 `initialize` handshake
+/// (`experimentalApi: true`) put them on the wire.
 ///
 /// Returns `None` for any other method (so [`translate_notification`]'s
 /// own dispatch still owns the `ThreadEvent`-bearing notifications) and
@@ -936,8 +937,90 @@ pub fn build_codex_notification_progress_line(notif: &Notification, wanted: &str
                 plan,
             ))
         }
+        "thread/tokenUsage/updated" => {
+            if !matches_thread(&notif.params) {
+                return None;
+            }
+            let usage = pluck_val(&notif.params, "token_usage", "tokenUsage")
+                .unwrap_or(Value::Object(Default::default()));
+            let total = usage
+                .get("total")
+                .cloned()
+                .unwrap_or(Value::Object(Default::default()));
+            let last = usage
+                .get("last")
+                .cloned()
+                .unwrap_or(Value::Object(Default::default()));
+            let window = usage
+                .get("modelContextWindow")
+                .or_else(|| usage.get("model_context_window"))
+                .and_then(|v| v.as_i64());
+            Some(crate::progress::build_codex_token_usage_event(
+                pluck_str(&notif.params, "thread_id", "threadId").unwrap_or(wanted),
+                pluck_str(&notif.params, "turn_id", "turnId").unwrap_or(""),
+                total,
+                last,
+                window,
+            ))
+        }
+        "thread/status/changed" => {
+            if !matches_thread(&notif.params) {
+                return None;
+            }
+            let status_obj = pluck_val(&notif.params, "status", "status")
+                .unwrap_or(Value::Object(Default::default()));
+            // ThreadStatus is internally tagged: {"type":"idle"} /
+            // {"type":"active","activeFlags":["waitingOnApproval"]}.
+            let status = status_obj
+                .get("type")
+                .and_then(|v| v.as_str())
+                .map(camel_to_snake)
+                .unwrap_or_default();
+            let active_flags = status_obj
+                .get("activeFlags")
+                .or_else(|| status_obj.get("active_flags"))
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|f| f.as_str())
+                        .map(camel_to_snake)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            Some(crate::progress::build_codex_thread_status_event(
+                pluck_str(&notif.params, "thread_id", "threadId").unwrap_or(wanted),
+                &status,
+                active_flags,
+            ))
+        }
+        "account/rateLimits/updated" => {
+            // No thread_id on this notification — it is account-scoped.
+            let snapshot = pluck_val(&notif.params, "rate_limits", "rateLimits")
+                .unwrap_or(Value::Object(Default::default()));
+            Some(crate::progress::build_codex_rate_limit_event(snapshot))
+        }
         _ => None,
     }
+}
+
+/// V0.8 rmux W4-fu — fold a camelCase identifier to snake_case so the
+/// emitted `progress.jsonl` `status` / `active_flags` values read in
+/// ccteam's snake_case house style regardless of the Codex wire casing
+/// (`waitingOnApproval` → `waiting_on_approval`, `systemError` →
+/// `system_error`). ASCII-only; Codex status/flag tokens are all ASCII.
+fn camel_to_snake(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    for (i, ch) in s.chars().enumerate() {
+        if ch.is_ascii_uppercase() {
+            if i != 0 {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 fn pluck_thread_id(v: &Value) -> Option<String> {
@@ -1250,6 +1333,109 @@ mod tests {
             params: json!({ "threadId": "other", "turnId": "u", "plan": [] }),
         };
         assert!(build_codex_notification_progress_line(&n, "ours").is_none());
+    }
+
+    #[test]
+    fn thread_token_usage_maps_to_codex_token_usage() {
+        let n = Notification {
+            method: "thread/tokenUsage/updated".into(),
+            params: json!({
+                "thread_id": "t-1",
+                "turn_id": "u-1",
+                "token_usage": {
+                    "total": { "total_tokens": 300, "input_tokens": 200, "output_tokens": 100,
+                               "cached_input_tokens": 0, "reasoning_output_tokens": 0 },
+                    "last":  { "total_tokens": 30,  "input_tokens": 20,  "output_tokens": 10,
+                               "cached_input_tokens": 0, "reasoning_output_tokens": 0 },
+                    "model_context_window": 200000,
+                },
+            }),
+        };
+        assert!(translate_notification(&n, "t-1").is_none());
+        let line = build_codex_notification_progress_line(&n, "t-1").expect("usage row");
+        assert_eq!(line["event"], crate::progress::CODEX_TOKEN_USAGE);
+        assert_eq!(line["vendor"], "codex");
+        assert_eq!(line["turn_id"], "u-1");
+        assert_eq!(line["total"]["total_tokens"], 300);
+        assert_eq!(line["last"]["output_tokens"], 10);
+        assert_eq!(line["model_context_window"], 200000);
+    }
+
+    #[test]
+    fn thread_token_usage_camelcase_wire() {
+        let n = Notification {
+            method: "thread/tokenUsage/updated".into(),
+            params: json!({
+                "threadId": "t-1",
+                "turnId": "u-1",
+                "tokenUsage": {
+                    "total": { "total_tokens": 5 },
+                    "last":  { "total_tokens": 1 },
+                    "modelContextWindow": 128000,
+                },
+            }),
+        };
+        let line = build_codex_notification_progress_line(&n, "t-1").expect("usage row");
+        assert_eq!(line["event"], crate::progress::CODEX_TOKEN_USAGE);
+        assert_eq!(line["total"]["total_tokens"], 5);
+        assert_eq!(line["model_context_window"], 128000);
+    }
+
+    #[test]
+    fn thread_status_active_waiting_on_approval() {
+        // Internally-tagged ThreadStatus: {"type":"active","activeFlags":[...]}.
+        let n = Notification {
+            method: "thread/status/changed".into(),
+            params: json!({
+                "threadId": "t-1",
+                "status": { "type": "active", "activeFlags": ["waitingOnApproval"] },
+            }),
+        };
+        assert!(translate_notification(&n, "t-1").is_none());
+        let line = build_codex_notification_progress_line(&n, "t-1").expect("status row");
+        assert_eq!(line["event"], crate::progress::CODEX_THREAD_STATUS);
+        assert_eq!(line["vendor"], "codex");
+        assert_eq!(line["status"], "active");
+        assert_eq!(line["active_flags"][0], "waiting_on_approval");
+    }
+
+    #[test]
+    fn thread_status_idle_has_no_flags() {
+        let n = Notification {
+            method: "thread/status/changed".into(),
+            params: json!({ "threadId": "t-1", "status": { "type": "idle" } }),
+        };
+        let line = build_codex_notification_progress_line(&n, "t-1").expect("status row");
+        assert_eq!(line["status"], "idle");
+        assert_eq!(line["active_flags"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn account_rate_limits_maps_to_codex_rate_limit() {
+        // No thread_id — account-scoped; never filtered by thread.
+        let n = Notification {
+            method: "account/rateLimits/updated".into(),
+            params: json!({
+                "rateLimits": {
+                    "primary": { "usedPercent": 80, "windowDurationMins": 60, "resetsAt": 123 },
+                    "rateLimitReachedType": null,
+                },
+            }),
+        };
+        assert!(translate_notification(&n, "any-thread").is_none());
+        let line =
+            build_codex_notification_progress_line(&n, "any-thread").expect("rate-limit row");
+        assert_eq!(line["event"], crate::progress::CODEX_RATE_LIMIT);
+        assert_eq!(line["vendor"], "codex");
+        assert_eq!(line["snapshot"]["primary"]["usedPercent"], 80);
+    }
+
+    #[test]
+    fn camel_to_snake_folds_codex_tokens() {
+        assert_eq!(camel_to_snake("waitingOnApproval"), "waiting_on_approval");
+        assert_eq!(camel_to_snake("systemError"), "system_error");
+        assert_eq!(camel_to_snake("idle"), "idle");
+        assert_eq!(camel_to_snake("NotLoaded"), "not_loaded");
     }
 
     #[test]
