@@ -530,6 +530,57 @@ pub fn build_plan_timeout_event(plan_id: &str, agent: &str, on_timeout: &str) ->
     })
 }
 
+// ---------------- V0.8 rmux W4-fu Codex app-server notifications ----------------
+//
+// These four events surface Codex-only mode-3 notifications that the
+// W4 `initialize` handshake (`experimentalApi: true`) unlocked. They are
+// **additive observability rows**, deliberately distinct from the F98
+// plan-approval events above:
+//
+// - `codex_plan_updated` is Codex's `update_plan` todo/checklist tool
+//   output (the upstream source itself notes "`update_plan` is a
+//   todo/checklist tool; it is not related to plan-mode updates" —
+//   `references/codex/codex-rs/app-server/src/bespoke_event_handling.rs`).
+//   It is a fire-and-forget streaming progress signal (the analog of
+//   Claude's `TodoWrite` hook output), NOT a HITL pause point — Codex
+//   never awaits a client response after emitting it. The real Codex
+//   HITL approval path is `thread/status/changed → Active{WaitingOnApproval}`
+//   plus server-initiated `item/*/requestApproval` requests, which is a
+//   separate (future) `plan_pending` wiring. Mapping `turn/plan/updated`
+//   onto `plan_pending` would spuriously fire the F98 IM round-trip on
+//   every checklist tick, so we keep it a pure observability event.
+
+/// `codex_plan_updated` — Codex emitted a `turn/plan/updated`
+/// notification (its `update_plan` todo/checklist tool). Payload:
+/// `{thread_id, turn_id, explanation?, plan: [{step, status}], vendor:"codex", ts}`.
+/// `status` is one of `pending` / `inProgress` / `completed` (camelCase
+/// wire enum). Observability only — NOT a HITL approval pause.
+pub const CODEX_PLAN_UPDATED: &str = "codex_plan_updated";
+
+/// Build a `codex_plan_updated` event JSON. `plan` is the verbatim
+/// `Vec<TurnPlanStep>` array from the wire (`[{step, status}, ...]`).
+pub fn build_codex_plan_updated_event(
+    thread_id: &str,
+    turn_id: &str,
+    explanation: Option<&str>,
+    plan: Value,
+) -> Value {
+    let mut v = serde_json::json!({
+        "event": CODEX_PLAN_UPDATED,
+        "vendor": "codex",
+        "thread_id": thread_id,
+        "turn_id": turn_id,
+        "plan": plan,
+        "ts": Utc::now().to_rfc3339(),
+    });
+    if let Some(e) = explanation {
+        v.as_object_mut()
+            .unwrap()
+            .insert("explanation".to_string(), Value::String(e.to_string()));
+    }
+    v
+}
+
 /// True if `kind` is one of the chat-mode event names (F108 / F118 /
 /// F192c / F195 / F196).
 pub fn is_chat_event(kind: &str) -> bool {

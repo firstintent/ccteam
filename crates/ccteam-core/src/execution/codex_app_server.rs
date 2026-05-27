@@ -433,6 +433,33 @@ impl HarnessAdapter for CodexAppServerAdapter {
                                             }
                                             return Some((evt, (rx, bridge)));
                                         }
+                                        // V0.8 rmux W4-fu — some Codex
+                                        // notifications (plan/tokenUsage/
+                                        // status/rateLimits) carry no
+                                        // `ThreadEvent` variant but must
+                                        // still land in progress.jsonl as
+                                        // additive observability rows. They
+                                        // are NOT terminal and NOT yielded
+                                        // into the event stream; the bridge
+                                        // mirrors them and the loop keeps
+                                        // pumping the next notification.
+                                        if let Some(ctx) = bridge.bridge_for(&wanted).await {
+                                            if let Some(line) =
+                                                build_codex_notification_progress_line(
+                                                    &notif, &wanted,
+                                                )
+                                            {
+                                                if let Err(err) =
+                                                    append_event(&ctx.progress_path, &line)
+                                                {
+                                                    tracing::warn!(
+                                                        thread_id = %wanted,
+                                                        error = %err,
+                                                        "codex bridge: append codex-notif progress.jsonl failed"
+                                                    );
+                                                }
+                                            }
+                                        }
                                     }
                                     Err(
                                         tokio::sync::broadcast::error::RecvError::Lagged(n),
@@ -845,6 +872,74 @@ fn translate_item_event(
     Some(ctor(ThreadItem { id, details }))
 }
 
+/// V0.8 rmux W4-fu — read a string field tolerating both the real
+/// Codex v2 wire casing (camelCase, e.g. `threadId`) and the snake_case
+/// the existing arms / test fixtures use. The real `codex app-server`
+/// notifications serialize with `#[serde(rename_all = "camelCase")]`
+/// (verified at `app-server-protocol/src/protocol/common.rs:2833`
+/// `serialize_thread_status_changed_notification`), so a camelCase-first
+/// lookup is required for the live wire while snake_case keeps the
+/// in-module test fixtures consistent. Scoped to the four W4-fu arms.
+fn pluck_str<'a>(params: &'a Value, snake: &str, camel: &str) -> Option<&'a str> {
+    params
+        .get(camel)
+        .or_else(|| params.get(snake))
+        .and_then(|v| v.as_str())
+}
+
+/// V0.8 rmux W4-fu — read a JSON sub-value tolerating both wire casings.
+fn pluck_val(params: &Value, snake: &str, camel: &str) -> Option<Value> {
+    params.get(camel).or_else(|| params.get(snake)).cloned()
+}
+
+/// V0.8 rmux W4-fu — translate Codex app-server notifications that have
+/// no [`ThreadEvent`] variant into additive `progress.jsonl` rows. These
+/// were silently dropped by [`translate_notification`]'s forward-compat
+/// `other` arm until the W4 `initialize` handshake (`experimentalApi:
+/// true`) put them on the wire. This commit wires `turn/plan/updated`;
+/// the follow-up commit adds tokenUsage / status / rateLimits.
+///
+/// Returns `None` for any other method (so [`translate_notification`]'s
+/// own dispatch still owns the `ThreadEvent`-bearing notifications) and
+/// for notifications whose thread_id doesn't match `wanted`
+/// (`account/rateLimits/updated` is thread-agnostic, so it is never
+/// filtered out).
+///
+/// IMPORTANT (semantics): `turn/plan/updated` is Codex's `update_plan`
+/// todo/checklist tool — the upstream source comments
+/// "`update_plan` is a todo/checklist tool; it is not related to
+/// plan-mode updates"
+/// (`references/codex/codex-rs/app-server/src/bespoke_event_handling.rs`,
+/// `handle_turn_plan_update`). It is fire-and-forget; Codex never awaits
+/// a client response. We therefore map it to the observability-only
+/// `codex_plan_updated` event, NOT the F98 `plan_pending` HITL event.
+pub fn build_codex_notification_progress_line(notif: &Notification, wanted: &str) -> Option<Value> {
+    // thread_id filter for the thread-scoped notifications (rate-limit
+    // carries no thread_id, so skip the gate when absent).
+    let matches_thread = |params: &Value| -> bool {
+        match pluck_str(params, "thread_id", "threadId") {
+            Some(tid) => tid == wanted,
+            None => true,
+        }
+    };
+
+    match notif.method.as_str() {
+        "turn/plan/updated" => {
+            if !matches_thread(&notif.params) {
+                return None;
+            }
+            let plan = pluck_val(&notif.params, "plan", "plan").unwrap_or(Value::Array(vec![]));
+            Some(crate::progress::build_codex_plan_updated_event(
+                pluck_str(&notif.params, "thread_id", "threadId").unwrap_or(wanted),
+                pluck_str(&notif.params, "turn_id", "turnId").unwrap_or(""),
+                pluck_str(&notif.params, "explanation", "explanation"),
+                plan,
+            ))
+        }
+        _ => None,
+    }
+}
+
 fn pluck_thread_id(v: &Value) -> Option<String> {
     v.get("thread")
         .and_then(|t| t.get("thread_id"))
@@ -1092,6 +1187,69 @@ mod tests {
             }
             _ => panic!("expected TurnCompleted"),
         }
+    }
+
+    // V0.8 rmux W4-fu — the four notifications the W4 `initialize`
+    // handshake unlocked. They have no ThreadEvent variant, so
+    // translate_notification still skips them (None); the additive
+    // progress.jsonl rows come from build_codex_notification_progress_line.
+
+    #[test]
+    fn turn_plan_updated_maps_to_codex_plan_updated_not_plan_pending() {
+        // CRITICAL: Codex's `turn/plan/updated` is its `update_plan`
+        // todo/checklist tool (upstream comment: "not related to plan-mode
+        // updates"); it is fire-and-forget and must NOT trigger the F98
+        // `plan_pending` HITL round-trip.
+        let n = Notification {
+            method: "turn/plan/updated".into(),
+            params: json!({
+                "thread_id": "t-1",
+                "turn_id": "u-1",
+                "explanation": "drafting",
+                "plan": [
+                    { "step": "read repo", "status": "completed" },
+                    { "step": "write code", "status": "inProgress" },
+                ],
+            }),
+        };
+        // No ThreadEvent variant.
+        assert!(translate_notification(&n, "t-1").is_none());
+        let line = build_codex_notification_progress_line(&n, "t-1").expect("plan row");
+        assert_eq!(line["event"], crate::progress::CODEX_PLAN_UPDATED);
+        assert_ne!(line["event"], crate::progress::PLAN_PENDING);
+        assert_eq!(line["vendor"], "codex");
+        assert_eq!(line["turn_id"], "u-1");
+        assert_eq!(line["explanation"], "drafting");
+        assert_eq!(line["plan"][0]["step"], "read repo");
+        assert_eq!(line["plan"][1]["status"], "inProgress");
+    }
+
+    #[test]
+    fn turn_plan_updated_camelcase_wire_is_handled() {
+        // The real Codex v2 wire serializes params in camelCase
+        // (`threadId`/`turnId`), per common.rs:2833. The dual-key helper
+        // must accept it.
+        let n = Notification {
+            method: "turn/plan/updated".into(),
+            params: json!({
+                "threadId": "t-9",
+                "turnId": "u-9",
+                "plan": [ { "step": "x", "status": "pending" } ],
+            }),
+        };
+        let line = build_codex_notification_progress_line(&n, "t-9").expect("camel plan row");
+        assert_eq!(line["event"], crate::progress::CODEX_PLAN_UPDATED);
+        assert_eq!(line["thread_id"], "t-9");
+        assert_eq!(line["turn_id"], "u-9");
+    }
+
+    #[test]
+    fn turn_plan_updated_foreign_thread_filtered() {
+        let n = Notification {
+            method: "turn/plan/updated".into(),
+            params: json!({ "threadId": "other", "turnId": "u", "plan": [] }),
+        };
+        assert!(build_codex_notification_progress_line(&n, "ours").is_none());
     }
 
     #[test]
