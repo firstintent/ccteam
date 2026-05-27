@@ -86,8 +86,12 @@ flip-default gate state (full table in `as-built-architecture.md §8`):
 ### What REMAINS
 
 - **W6 hook-reroute** — daemon-bus single-writer `progress.jsonl`
-  (`w6-hook-reroute-design.md`). DESIGNED-ONLY; closes the V0.6.4
-  `OutboundCursor` two-writer race. The migration's headline payoff, unbuilt.
+  (`w6-hook-reroute-design.md`). **DEFERRED, value reassessed downward**: the
+  `OutboundCursor` race it targets was already fixed in V0.6.4 (`504c208`), so
+  W6's remaining value is architectural cleanup, not a fix; the clean version
+  needs an upstream rmux RPC and it touches the hook path all mode-3 depends
+  on. Recommended close = accept-race carve-out, not build. See
+  `as-built-architecture.md §6/§8`.
 - **W7 flip-default** — flip env-unset default `tmux → rmux`. Gated on G8 +
   G3/G4/G6 decisions.
 - **macOS validation (G8)** — the one open hard flip blocker.

@@ -234,15 +234,25 @@ realized**. As built:
 - **Claude outbound** is still **file-based and backend-independent**. The
   Claude Code hook subprocess writes `progress.jsonl` directly; the
   orchestrator tails the file. This path does not go through the daemon at all,
-  so it behaves identically under tmux and rmux. Consequence: there remain
-  **two writers to `progress.jsonl`** (hook subprocess + orchestrator) and the
-  V0.6.4 `OutboundCursor` race **persists even under rmux**.
+  so it behaves identically under tmux and rmux. Consequence: the two-writer
+  *architecture* (hook subprocess + orchestrator) remains. **The acute
+  `OutboundCursor` race was already fixed independently in V0.6.4
+  (commit `504c208`)** — so this is a cleanliness/defense-in-depth concern,
+  NOT an open correctness bug.
 
 - **W6 hook-reroute** (daemon-bus single-writer: `ccteam mux hook-emit` →
   `MuxEvent::HookEvent` → daemon coalesces → single writer) is
-  **DESIGNED-ONLY** (`w6-hook-reroute-design.md`). No `hook_sidecar.rs`, no
-  `hook-emit` subcommand, no `HookEvent` variant. This is the *architectural
-  payoff* the daemon was for, and it is unrealized (audit G-F / G6).
+  **DEFERRED — value reassessed downward post-V0.6.4** (`w6-hook-reroute-
+  design.md`). It was framed in the research docs as the headline payoff of
+  the unified-bus vision, but: (1) the race it would prevent is already
+  patched (V0.6.4), so W6's remaining value is architectural elegance, not a
+  fix; (2) the clean version needs an upstream rmux daemon RPC (we don't fork
+  rmux), and the fallback (a ccteam-owned `hook.sock`) sidesteps the very
+  daemon-bus it was meant to demonstrate; (3) it touches the hook mechanism
+  ALL mode-3 Claude depends on — wrong risk/value for a no-merge branch.
+  Whoever picks this up should re-justify it before building, not treat it as
+  obligatory. No `hook_sidecar.rs`, no `hook-emit` subcommand, no `HookEvent`
+  variant exist (audit G6 — accept-race carve-out is the recommended close).
 
 - **Codex outbound** flows over the app-server **UDS JSON-RPC** bridge in
   `codex_app_server.rs`, which translates typed notifications into
