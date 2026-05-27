@@ -565,38 +565,47 @@ pub fn turn_input_to_items(input: TurnInput) -> Result<Value, HarnessError> {
 pub fn translate_notification(notif: &Notification, wanted: &str) -> Option<ThreadEvent> {
     // thread_id filter (some notifications carry the id, some don't —
     // we only filter when present so we don't drop turn-scoped events
-    // that omit it).
-    if let Some(tid) = notif.params.get("thread_id").and_then(|v| v.as_str()) {
+    // that omit it). The real Codex v2 wire is camelCase (`threadId`),
+    // so read it dual-key — otherwise the filter never fires against a
+    // live binary and foreign-thread events would be falsely accepted.
+    // Note: `thread/started` + `turn/*` nest the id inside `thread`/`turn`
+    // objects, so a top-level lookup is absent for those — they still
+    // pass this gate (None) and are thread-matched by their own arm.
+    if let Some(tid) = pluck_str(&notif.params, "thread_id", "threadId") {
         if tid != wanted {
             return None;
         }
     }
     match notif.method.as_str() {
+        // Real wire: `ThreadStartedNotification { thread: Thread }`, so the
+        // id is `params.thread.id` (camelCase Thread). Fall back to a flat
+        // `thread_id`/`threadId` (test fixtures) and finally `wanted`.
         "thread/started" => Some(ThreadEvent::ThreadStarted {
             thread_id: notif
                 .params
-                .get("thread_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or(wanted)
-                .to_string(),
+                .get("thread")
+                .and_then(pluck_id)
+                .or_else(|| pluck_str(&notif.params, "thread_id", "threadId").map(str::to_string))
+                .unwrap_or_else(|| wanted.to_string()),
         }),
+        // Real wire: `TurnStartedNotification { threadId, turn: Turn }`,
+        // where the turn id is `turn.id` (NOT `turn.turn_id`, and there is
+        // no top-level `turnId`). `pluck_turn_id_from_params` resolves the
+        // real shape first, then the snake/camel flat fallbacks the test
+        // fixtures use.
         "turn/started" => Some(ThreadEvent::TurnStarted {
-            turn_id: notif
-                .params
-                .get("turn_id")
-                .or_else(|| notif.params.get("turn").and_then(|t| t.get("turn_id")))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
+            turn_id: pluck_turn_id_from_params(&notif.params),
         }),
         "turn/completed" => Some(ThreadEvent::TurnCompleted {
-            turn_id: notif
-                .params
-                .get("turn_id")
-                .or_else(|| notif.params.get("turn").and_then(|t| t.get("turn_id")))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
+            turn_id: pluck_turn_id_from_params(&notif.params),
+            // NOTE: the real `turn/completed` wire has NO `usage` field
+            // anywhere (the `Turn` struct carries id/items/status/error/
+            // timing only). Token accounting flows through the separate
+            // `thread/tokenUsage/updated` notification (W4-fu bridge). This
+            // lookup therefore returns `None` against a live binary →
+            // default usage; it stays only to satisfy synthetic test
+            // fixtures that inline `usage`. Do NOT "fix" it to read the
+            // turn object — there is nothing there to read.
             usage: pluck_usage(&notif.params).unwrap_or_default(),
         }),
         // W3b catalog §8.4 defect fix: the mode-3 app-server protocol has
@@ -617,19 +626,16 @@ pub fn translate_notification(notif: &Notification, wanted: &str) -> Option<Thre
         // `turn/completed` would never write its `agent_done`. We therefore
         // skip retryable errors and only emit TurnFailed on terminal ones.
         "error" => {
-            let will_retry = notif
-                .params
-                .get("will_retry")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+            // Real wire `ErrorNotification { error, willRetry, threadId,
+            // turnId }` — read `willRetry`/`turnId` dual-key so a live
+            // codex binary's terminal failure surfaces as TurnFailed
+            // (snake_case kept for the in-module test fixtures).
+            let will_retry = pluck_bool(&notif.params, "will_retry", "willRetry").unwrap_or(false);
             if will_retry {
                 return None;
             }
             Some(ThreadEvent::TurnFailed {
-                turn_id: notif
-                    .params
-                    .get("turn_id")
-                    .and_then(|v| v.as_str())
+                turn_id: pluck_str(&notif.params, "turn_id", "turnId")
                     .unwrap_or("")
                     .to_string(),
                 err: ThreadErrorEvent {
@@ -666,10 +672,8 @@ pub fn translate_notification(notif: &Notification, wanted: &str) -> Option<Thre
                 .get("delta")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let id = notif
-                .params
-                .get("item_id")
-                .and_then(|v| v.as_str())
+            // Real wire `AgentMessageDeltaNotification` carries `itemId`.
+            let id = pluck_str(&notif.params, "item_id", "itemId")
                 .unwrap_or("")
                 .to_string();
             Some(ThreadEvent::ItemUpdated {
@@ -793,10 +797,13 @@ fn translate_item_event(
         .get("item")
         .cloned()
         .unwrap_or_else(|| params.clone());
+    // Real wire: the id lives at `item.id` (single-word, no casing
+    // issue). The flat `item_id`/`itemId` fallback only matters for
+    // hand-rolled fixtures that omit the `item` wrapper.
     let id = item_val
         .get("id")
-        .or_else(|| params.get("item_id"))
         .and_then(|v| v.as_str())
+        .or_else(|| pluck_str(params, "item_id", "itemId"))
         .unwrap_or("")
         .to_string();
     let details = match item_val.get("type").and_then(|v| v.as_str()) {
@@ -902,6 +909,41 @@ fn pluck_str<'a>(params: &'a Value, snake: &str, camel: &str) -> Option<&'a str>
 /// V0.8 rmux W4-fu — read a JSON sub-value tolerating both wire casings.
 fn pluck_val(params: &Value, snake: &str, camel: &str) -> Option<Value> {
     params.get(camel).or_else(|| params.get(snake)).cloned()
+}
+
+/// V0.8 rmux — bool sibling of [`pluck_str`] for the `error`
+/// notification's `willRetry` (real wire) / `will_retry` (test fixture).
+fn pluck_bool(params: &Value, snake: &str, camel: &str) -> Option<bool> {
+    params
+        .get(camel)
+        .or_else(|| params.get(snake))
+        .and_then(|v| v.as_bool())
+}
+
+/// V0.8 rmux — pull a `*Notification`'s nested object id. The real Codex
+/// v2 `Thread`/`Turn` structs name their id field plain `id` (camelCase
+/// rename leaves single-word `id` untouched); older ccteam test fixtures
+/// used the redundant `thread_id`/`turn_id` inside the object, so accept
+/// any of the three. Used for the `thread`/`turn` sub-objects that
+/// `thread/started` + `turn/*` notifications carry.
+fn pluck_id(obj: &Value) -> Option<String> {
+    obj.get("id")
+        .or_else(|| obj.get("thread_id"))
+        .or_else(|| obj.get("turn_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// V0.8 rmux — resolve a turn id from a `turn/*` notification's params.
+/// Real wire: `{ threadId, turn: { id, .. } }` (id at `turn.id`). Falls
+/// back to a flat `turn_id`/`turnId` for the in-module fixtures. Empty
+/// string when nothing matches (preserving the prior unwrap_or("")).
+fn pluck_turn_id_from_params(params: &Value) -> String {
+    params
+        .get("turn")
+        .and_then(pluck_id)
+        .or_else(|| pluck_str(params, "turn_id", "turnId").map(str::to_string))
+        .unwrap_or_default()
 }
 
 /// V0.8 rmux W4-fu — translate the four Codex app-server notifications
@@ -1035,20 +1077,23 @@ fn camel_to_snake(s: &str) -> String {
     out
 }
 
+/// Pull the thread id from a `thread/start` / `thread/resume` response.
+/// Real wire: `ThreadStartResponse { thread: Thread }` where the id is
+/// `thread.id` (camelCase Thread). [`pluck_id`] tolerates the older
+/// `thread.thread_id` fixture shape; the flat `thread_id`/`threadId`
+/// fallbacks cover responses that inline the id.
 fn pluck_thread_id(v: &Value) -> Option<String> {
     v.get("thread")
-        .and_then(|t| t.get("thread_id"))
-        .or_else(|| v.get("thread_id"))
-        .and_then(|s| s.as_str())
-        .map(|s| s.to_string())
+        .and_then(pluck_id)
+        .or_else(|| pluck_str(v, "thread_id", "threadId").map(str::to_string))
 }
 
+/// Pull the turn id from a `turn/start` response. Real wire:
+/// `TurnStartResponse { turn: Turn }` with the id at `turn.id`.
 fn pluck_turn_id(v: &Value) -> Option<String> {
     v.get("turn")
-        .and_then(|t| t.get("turn_id"))
-        .or_else(|| v.get("turn_id"))
-        .and_then(|s| s.as_str())
-        .map(|s| s.to_string())
+        .and_then(pluck_id)
+        .or_else(|| pluck_str(v, "turn_id", "turnId").map(str::to_string))
 }
 
 fn pluck_usage(v: &Value) -> Option<UnifiedTokenUsage> {
@@ -1471,6 +1516,206 @@ mod tests {
         assert_eq!(camel_to_snake("systemError"), "system_error");
         assert_eq!(camel_to_snake("idle"), "idle");
         assert_eq!(camel_to_snake("NotLoaded"), "not_loaded");
+    }
+
+    // V0.8 rmux task #18 — Codex wire camelCase sweep. The real
+    // `codex app-server` v2 wire serializes every multi-word field in
+    // camelCase (`#[serde(rename_all = "camelCase")]`, verified in
+    // `references/codex/codex-rs/app-server-protocol/src/protocol/`).
+    // The arms below previously read snake_case only and silently failed
+    // against a live binary. These tests feed the REAL wire shape; the
+    // pre-existing snake_case tests above still pass (dual-key).
+
+    #[test]
+    fn translate_thread_started_real_wire_nested_camel() {
+        // Real wire: ThreadStartedNotification { thread: Thread { id, .. } }.
+        let n = Notification {
+            method: "thread/started".into(),
+            params: json!({ "thread": { "id": "t-1", "sessionId": "s-1" } }),
+        };
+        let e = translate_notification(&n, "t-1").unwrap();
+        match e {
+            ThreadEvent::ThreadStarted { thread_id } => assert_eq!(thread_id, "t-1"),
+            other => panic!("expected ThreadStarted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_turn_started_real_wire_turn_dot_id() {
+        // Real wire: TurnStartedNotification { threadId, turn: { id, .. } }.
+        // The turn id is `turn.id` — NOT `turn.turn_id`, NOT top-level.
+        let n = Notification {
+            method: "turn/started".into(),
+            params: json!({ "threadId": "t-1", "turn": { "id": "u-7", "status": "inProgress" } }),
+        };
+        let e = translate_notification(&n, "t-1").unwrap();
+        match e {
+            ThreadEvent::TurnStarted { turn_id } => assert_eq!(turn_id, "u-7"),
+            other => panic!("expected TurnStarted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_turn_completed_real_wire_turn_dot_id_no_usage() {
+        // Real wire `turn/completed` has the id at `turn.id` and NO usage
+        // field anywhere (token data flows via thread/tokenUsage/updated).
+        // Must extract the id and default the usage without panicking.
+        let n = Notification {
+            method: "turn/completed".into(),
+            params: json!({ "threadId": "t-1", "turn": { "id": "u-9", "status": "completed" } }),
+        };
+        let e = translate_notification(&n, "t-1").unwrap();
+        match e {
+            ThreadEvent::TurnCompleted { turn_id, usage } => {
+                assert_eq!(turn_id, "u-9");
+                // No usage on the real wire → defaulted to zero.
+                assert_eq!(usage.input_tokens, 0);
+                assert_eq!(usage.output_tokens, 0);
+            }
+            other => panic!("expected TurnCompleted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_turn_completed_real_wire_foreign_thread_filtered() {
+        // camelCase threadId on a foreign thread must be filtered out —
+        // proves the thread filter reads the camelCase key (regression:
+        // a snake-only filter would falsely accept this).
+        let n = Notification {
+            method: "turn/completed".into(),
+            params: json!({ "threadId": "other", "turn": { "id": "u-9" } }),
+        };
+        assert!(
+            translate_notification(&n, "ours").is_none(),
+            "foreign camelCase threadId must be filtered"
+        );
+    }
+
+    #[test]
+    fn translate_error_notification_camelcase_terminal_surfaces_turn_failed() {
+        // THE critical case (task #18): the real wire ErrorNotification is
+        // { error, willRetry, threadId, turnId } in camelCase. A terminal
+        // failure (willRetry=false) MUST surface as TurnFailed so the
+        // bridge writes agent_done{status:"errored"}. A snake-only
+        // `will_retry` read would default to false too, but a snake-only
+        // `turn_id` would lose the id — assert both.
+        let n = Notification {
+            method: "error".into(),
+            params: json!({
+                "threadId": "t-1",
+                "turnId": "u-1",
+                "willRetry": false,
+                "error": { "message": "context window exceeded" },
+            }),
+        };
+        let e = translate_notification(&n, "t-1").expect("terminal camelCase error must surface");
+        match e {
+            ThreadEvent::TurnFailed { turn_id, err } => {
+                assert_eq!(turn_id, "u-1");
+                assert_eq!(err.message, "context window exceeded");
+                assert_eq!(err.kind, "turn_failed");
+            }
+            other => panic!("expected TurnFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_error_notification_camelcase_retryable_is_skipped() {
+        // Real wire camelCase willRetry=true must still be read as true so
+        // the retryable error is skipped (bridge survives until completion).
+        let n = Notification {
+            method: "error".into(),
+            params: json!({
+                "threadId": "t-1",
+                "turnId": "u-1",
+                "willRetry": true,
+                "error": { "message": "transient 503" },
+            }),
+        };
+        assert!(
+            translate_notification(&n, "t-1").is_none(),
+            "camelCase retryable error must be skipped"
+        );
+    }
+
+    #[test]
+    fn translate_agent_message_delta_camelcase_item_id() {
+        // Real wire AgentMessageDeltaNotification { threadId, turnId,
+        // itemId, delta }. The item id must come from `itemId`.
+        let n = Notification {
+            method: "item/agentMessage/delta".into(),
+            params: json!({
+                "threadId": "t-1",
+                "turnId": "u-1",
+                "itemId": "i-42",
+                "delta": "hel",
+            }),
+        };
+        let e = translate_notification(&n, "t-1").unwrap();
+        match e {
+            ThreadEvent::ItemUpdated { item } => {
+                assert_eq!(item.id, "i-42");
+                match item.details {
+                    ThreadItemDetails::AgentMessage(s) => assert_eq!(s, "hel"),
+                    other => panic!("expected agent message, got {other:?}"),
+                }
+            }
+            other => panic!("expected ItemUpdated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_item_completed_camelcase_type_tag() {
+        // Real wire ThreadItem is #[serde(tag="type", rename_all="camelCase")]
+        // → type tag `agentMessage`; id at `item.id`. Carried inside
+        // ItemCompletedNotification { item, threadId, turnId }.
+        let n = Notification {
+            method: "item/completed".into(),
+            params: json!({
+                "threadId": "t-1",
+                "turnId": "u-1",
+                "item": { "id": "i-1", "type": "agentMessage", "text": "hello" }
+            }),
+        };
+        let e = translate_notification(&n, "t-1").unwrap();
+        match e {
+            ThreadEvent::ItemCompleted { item } => {
+                assert_eq!(item.id, "i-1");
+                match item.details {
+                    ThreadItemDetails::AgentMessage(s) => assert_eq!(s, "hello"),
+                    other => panic!("expected agent message, got {other:?}"),
+                }
+            }
+            other => panic!("expected ItemCompleted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pluck_thread_id_resolves_real_wire_thread_dot_id() {
+        // thread/start response: ThreadStartResponse { thread: Thread{ id } }.
+        let resp = json!({ "thread": { "id": "thr_abc", "sessionId": "s" } });
+        assert_eq!(pluck_thread_id(&resp), Some("thr_abc".to_string()));
+        // Older fixture shape (thread.thread_id) still works.
+        let legacy = json!({ "thread": { "thread_id": "thr_legacy" } });
+        assert_eq!(pluck_thread_id(&legacy), Some("thr_legacy".to_string()));
+        // Flat fallbacks.
+        assert_eq!(
+            pluck_thread_id(&json!({ "threadId": "thr_flat" })),
+            Some("thr_flat".to_string())
+        );
+    }
+
+    #[test]
+    fn pluck_turn_id_resolves_real_wire_turn_dot_id() {
+        // turn/start response: TurnStartResponse { turn: Turn{ id } }.
+        let resp = json!({ "turn": { "id": "turn_abc", "status": "inProgress" } });
+        assert_eq!(pluck_turn_id(&resp), Some("turn_abc".to_string()));
+        let legacy = json!({ "turn": { "turn_id": "turn_legacy" } });
+        assert_eq!(pluck_turn_id(&legacy), Some("turn_legacy".to_string()));
+        assert_eq!(
+            pluck_turn_id(&json!({ "turnId": "turn_flat" })),
+            Some("turn_flat".to_string())
+        );
     }
 
     #[test]
