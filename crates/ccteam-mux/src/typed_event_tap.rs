@@ -204,10 +204,15 @@ impl TypedEventTap {
             use futures::StreamExt;
 
             let mut seq = SeqState::default();
-            // Once the subscribe stream ends we stop polling it; the task
-            // then lives only as long as enrichments may still arrive AND
-            // the consumer is listening.
+            // Once the subscribe stream ends we stop polling it; likewise
+            // once every TapHandle is dropped the enrichment channel is
+            // closed and we stop polling it. The task exits cleanly when
+            // BOTH inputs are exhausted (or the consumer drops out_rx).
+            // Guarding each branch on its `*_done` flag is what prevents a
+            // closed channel's immediate `recv()->None` from busy-spinning
+            // the select loop.
             let mut stream_done = false;
+            let mut enrich_done = false;
 
             loop {
                 tokio::select! {
@@ -263,12 +268,15 @@ impl TypedEventTap {
                             Some(_) => {}
                             None => {
                                 stream_done = true;
+                                if enrich_done {
+                                    break;
+                                }
                             }
                         }
                     }
 
                     // (b) The integrator's P1 enrichment channel.
-                    maybe_enrich = enrich_rx.recv() => {
+                    maybe_enrich = enrich_rx.recv(), if !enrich_done => {
                         match maybe_enrich {
                             Some(RawEnrichment { kind, payload }) => {
                                 let sequence_id = seq.mint_enrich(kind);
@@ -284,11 +292,12 @@ impl TypedEventTap {
                                     .await;
                             }
                             None => {
-                                // All TapHandles dropped. Nothing more to
-                                // do on this branch; `recv()` will keep
-                                // returning None, so guard against a busy
-                                // spin by exiting once the stream is also
+                                // All TapHandles dropped. Stop polling this
+                                // branch (the `if !enrich_done` guard above)
+                                // so the closed channel can't busy-spin the
+                                // select loop; exit once the stream is also
                                 // done.
+                                enrich_done = true;
                                 if stream_done {
                                     break;
                                 }
