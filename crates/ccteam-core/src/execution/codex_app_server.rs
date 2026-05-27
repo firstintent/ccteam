@@ -7,14 +7,19 @@
 //! ## Lifecycle
 //!
 //! - `start_thread`: ensure a `codex app-server` daemon is running →
-//!   connect to its UDS → `initialize` (if needed) → `thread/start`
+//!   connect to its UDS → `initialize` handshake (negotiating
+//!   `experimentalApi: true`) + `initialized` notification → `thread/start`
 //!   with model + cwd hint → return [`ThreadHandle`] whose `identity`
-//!   carries the codex `thread_id`.
+//!   carries the codex `thread_id`. The handshake runs once per cached
+//!   client inside `client()` (W3b catalog §7.2 — without it the server
+//!   keeps `experimental_api = false` and silently filters ~30% of the
+//!   notification surface, including `turn/plan/updated`).
 //! - `submit_turn`: `turn/start` with `[{type:"text", text:...}]`.
 //! - `events`: subscribe to broadcast notifications, translate
 //!   `item/*` + `turn/*` notifications → [`ThreadEvent`]. **V0.6.1 F122**:
-//!   also mirror the key boundary events (`turn/completed` / `turn/failed`
-//!   / `error`) into the project's `progress.jsonl` as `agent_done`
+//!   also mirror the key boundary events (`turn/completed` + the `error`
+//!   notification — the real wire name for turn failures, NOT `turn/failed`)
+//!   into the project's `progress.jsonl` as `agent_done`
 //!   entries tagged `vendor: codex` so the `cost_24h_by_vendor["codex"]`
 //!   roll-up + budget cap surfaces stay live without the orchestrator
 //!   needing to wire a separate poller (the V0.6.0 Wave 3 D9 retained
@@ -155,8 +160,74 @@ impl CodexAppServerAdapter {
                 ))
             })?;
         let shared = Arc::new(client);
+        // W3b catalog §7.2 defect fix: complete the `initialize` handshake
+        // BEFORE returning the cached client (i.e. before the first
+        // `thread/start` or `events()` subscribe). The previous code dialed
+        // the UDS and went straight to `thread/start`, so the server kept
+        // `experimental_api = false` and silently filtered ~30% of the
+        // server→client notification surface — including `turn/plan/updated`
+        // (the structured plan tree V0.6.1 F124 HITL needs),
+        // `thread/tokenUsage/updated`, `thread/goal/*`, and `item/plan/delta`.
+        // We do this once per cached client (client() memoises), so all
+        // subsequent calls reuse the negotiated capabilities.
+        Self::handshake(&shared).await?;
         *guard = Some(Arc::clone(&shared));
         Ok(shared)
+    }
+
+    /// W3b catalog §4.1 — send the Codex `initialize` request (negotiating
+    /// `experimentalApi: true`) followed by the one-way `initialized`
+    /// notification. Mirrors the handshake the official Codex clients run:
+    /// `InitializeParams { clientInfo, capabilities }` per
+    /// `references/codex/codex-rs/app-server-protocol/src/protocol/v1.rs:26-56`
+    /// (camelCase wire), then `ClientNotification::Initialized` →
+    /// `{"method":"initialized"}` per `common.rs:1519-1521`.
+    ///
+    /// We opt OUT of the realtime/voice + Windows-only + admin-UI noise
+    /// notifications (server-side filter is cheaper than ccteam-side) but
+    /// keep every business-critical surface (turn/*, item/*, account/*).
+    async fn handshake(client: &CodexJsonRpcClient) -> Result<(), HarnessError> {
+        let params = json!({
+            "clientInfo": {
+                "name": "ccteam",
+                "version": crate::VERSION,
+            },
+            "capabilities": {
+                "experimentalApi": true,
+                "requestAttestation": false,
+                "optOutNotificationMethods": [
+                    "thread/realtime/started",
+                    "thread/realtime/itemAdded",
+                    "thread/realtime/transcript/delta",
+                    "thread/realtime/transcript/done",
+                    "thread/realtime/outputAudio/delta",
+                    "thread/realtime/sdp",
+                    "thread/realtime/error",
+                    "thread/realtime/closed",
+                    "windows/worldWritableWarning",
+                    "windowsSandbox/setupCompleted",
+                    "app/list/updated",
+                    "skills/changed",
+                    "fuzzyFileSearch/sessionUpdated",
+                    "fuzzyFileSearch/sessionCompleted",
+                    "remoteControl/status/changed"
+                ]
+            }
+        });
+        client
+            .call("initialize", params)
+            .await
+            .map_err(|e| HarnessError::SpawnFailed(format!("codex initialize handshake: {e:#}")))?;
+        // `initialized` is a one-way client notification (no id, no
+        // response) signalling readiness to receive server-initiated
+        // requests + notifications.
+        client
+            .notify("initialized", Value::Null)
+            .await
+            .map_err(|e| {
+                HarnessError::SpawnFailed(format!("codex initialized notification: {e:#}"))
+            })?;
+        Ok(())
     }
 
     /// One-shot helper: drop the cached client (e.g. after detecting a
@@ -501,30 +572,64 @@ pub fn translate_notification(notif: &Notification, wanted: &str) -> Option<Thre
                 .to_string(),
             usage: pluck_usage(&notif.params).unwrap_or_default(),
         }),
-        "turn/failed" => Some(ThreadEvent::TurnFailed {
-            turn_id: notif
+        // W3b catalog §8.4 defect fix: the mode-3 app-server protocol has
+        // **no** `turn/failed` notification. The real wire name for a turn
+        // failure is `"error"` carrying an `ErrorNotification` payload
+        // (`references/codex/codex-rs/app-server-protocol/src/protocol/v2/notification.rs:41`):
+        //   { error: TurnError { message, .. }, will_retry: bool,
+        //     thread_id, turn_id }
+        // The former `"turn/failed"` arm was dead code (the catalog notes
+        // turn failures were silently routed into warn_unknown_vendor_token),
+        // so terminal Codex failures never surfaced as `agent_done
+        // {status:"errored"}`.
+        //
+        // `will_retry == true` means the app-server will transparently
+        // retry the turn (a transient upstream blip) and does NOT interrupt
+        // the turn — surfacing it as TurnFailed would prematurely tear down
+        // the progress bridge (is_terminal_progress drops it), so a later
+        // `turn/completed` would never write its `agent_done`. We therefore
+        // skip retryable errors and only emit TurnFailed on terminal ones.
+        "error" => {
+            let will_retry = notif
                 .params
-                .get("turn_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            err: ThreadErrorEvent {
-                kind: "turn_failed".into(),
-                message: notif
+                .get("will_retry")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if will_retry {
+                return None;
+            }
+            Some(ThreadEvent::TurnFailed {
+                turn_id: notif
                     .params
-                    .get("error")
-                    .and_then(|e| e.get("message"))
+                    .get("turn_id")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("(no message)")
+                    .unwrap_or("")
                     .to_string(),
-            },
-        }),
+                err: ThreadErrorEvent {
+                    kind: "turn_failed".into(),
+                    message: notif
+                        .params
+                        .get("error")
+                        .and_then(|e| e.get("message"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(no message)")
+                        .to_string(),
+                },
+            })
+        }
         "item/started" => {
             translate_item_event(&notif.params, |item| ThreadEvent::ItemStarted { item })
         }
-        "item/updated" => {
-            translate_item_event(&notif.params, |item| ThreadEvent::ItemUpdated { item })
-        }
+        // NOTE (W3b catalog §8.2): there is **no** `item/updated`
+        // notification in the mode-3 app-server protocol — the
+        // server_notification_definitions! registry at
+        // `references/codex/codex-rs/app-server-protocol/src/protocol/common.rs:1425-1517`
+        // splits item state changes into typed `*Delta` notifications
+        // (`item/agentMessage/delta`, `item/reasoning/textDelta`, ...) +
+        // `item/completed`. The dot-named `item.updated` exists only in
+        // the mode-2 `codex exec --json` stream (see codex_exec.rs). The
+        // former arm here was a copy-paste artefact that never fired;
+        // removed so the dispatch reflects the real wire surface.
         "item/completed" => {
             translate_item_event(&notif.params, |item| ThreadEvent::ItemCompleted { item })
         }
@@ -871,6 +976,78 @@ mod tests {
             }
             _ => panic!("expected ItemCompleted"),
         }
+    }
+
+    // W3b catalog §8.4 defect fix — turn failures arrive as the `"error"`
+    // notification (NOT a `"turn/failed"` method, which does not exist in
+    // the mode-3 protocol). A terminal `error` (will_retry=false) must
+    // surface as TurnFailed so the bridge writes `agent_done
+    // {status:"errored"}`; a transient `error` (will_retry=true) must be
+    // skipped so the progress bridge isn't torn down mid-retry.
+
+    #[test]
+    fn translate_error_notification_terminal_surfaces_turn_failed() {
+        let n = Notification {
+            method: "error".into(),
+            params: json!({
+                "thread_id": "t-1",
+                "turn_id": "u-1",
+                "will_retry": false,
+                "error": { "message": "context window exceeded" },
+            }),
+        };
+        let e = translate_notification(&n, "t-1").expect("terminal error must surface");
+        match e {
+            ThreadEvent::TurnFailed { turn_id, err } => {
+                assert_eq!(turn_id, "u-1");
+                assert_eq!(err.message, "context window exceeded");
+                assert_eq!(err.kind, "turn_failed");
+            }
+            other => panic!("expected TurnFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_error_notification_retryable_is_skipped() {
+        let n = Notification {
+            method: "error".into(),
+            params: json!({
+                "thread_id": "t-1",
+                "turn_id": "u-1",
+                "will_retry": true,
+                "error": { "message": "transient upstream 503" },
+            }),
+        };
+        assert!(
+            translate_notification(&n, "t-1").is_none(),
+            "retryable error must be skipped so the bridge survives until turn/completed"
+        );
+    }
+
+    #[test]
+    fn translate_legacy_turn_failed_method_is_now_unknown() {
+        // The dead `turn/failed` arm was removed; the (non-existent) wire
+        // name now falls through to the forward-compat skip path.
+        let n = Notification {
+            method: "turn/failed".into(),
+            params: json!({ "thread_id": "t-1", "turn_id": "u-1" }),
+        };
+        assert!(translate_notification(&n, "t-1").is_none());
+    }
+
+    #[test]
+    fn translate_item_updated_method_is_now_unknown() {
+        // The dead `item/updated` arm (mode-2-only wire shape) was removed;
+        // it must now fall through to the forward-compat skip path, not
+        // produce a ThreadEvent.
+        let n = Notification {
+            method: "item/updated".into(),
+            params: json!({
+                "thread_id": "t-1",
+                "item": { "id": "i-1", "type": "agent_message", "text": "x" }
+            }),
+        };
+        assert!(translate_notification(&n, "t-1").is_none());
     }
 
     // V0.6.3 F144 — forward-compat regression tests. Codex's app-server

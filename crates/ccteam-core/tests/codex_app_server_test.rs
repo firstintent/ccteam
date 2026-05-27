@@ -184,15 +184,136 @@ async fn adapter_returns_spawn_failed_when_socket_missing() {
 
 #[tokio::test(flavor = "current_thread")]
 #[serial]
+async fn adapter_sends_initialize_handshake_before_thread_start() {
+    // W3b catalog §7.2 defect fix: the adapter MUST send the `initialize`
+    // request (with `capabilities.experimentalApi == true`) and the
+    // one-way `initialized` notification BEFORE the first `thread/start`.
+    // Without it the server keeps experimental_api=false and silently
+    // filters turn/plan/updated etc. This test records the exact order of
+    // methods the peer receives and asserts the handshake precedes
+    // thread/start.
+    let sock = unique_socket_path("handshake-order");
+    std::env::set_var(APP_SERVER_SOCKET_ENV, &sock);
+
+    let listener = UnixListener::bind(&sock).unwrap();
+    let (seen_tx, mut seen_rx) = tokio::sync::mpsc::channel::<Value>(16);
+    let peer = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (r, mut w) = stream.into_split();
+        let mut reader = BufReader::new(r);
+        loop {
+            let mut buf = String::new();
+            match reader.read_line(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let req: Value = match serde_json::from_str(buf.trim()) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    // Record every inbound frame (requests + notifications).
+                    let _ = seen_tx.send(req.clone()).await;
+                    // Only requests (with id) get a reply.
+                    if let Some(id) = req.get("id").cloned() {
+                        let result = match req["method"].as_str() {
+                            Some("initialize") => json!({
+                                "user_agent": "codex-test/0.0.0",
+                                "codex_home": "/tmp/.codex",
+                                "platform_family": "unix",
+                                "platform_os": "linux"
+                            }),
+                            Some("thread/start") => {
+                                json!({ "thread": { "thread_id": "tid-77" } })
+                            }
+                            _ => json!({ "ok": true }),
+                        };
+                        let resp = json!({ "id": id, "result": result });
+                        let mut bytes = serde_json::to_vec(&resp).unwrap();
+                        bytes.push(b'\n');
+                        let _ = w.write_all(&bytes).await;
+                        let _ = w.flush().await;
+                    }
+                }
+            }
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let adapter = CodexAppServerAdapter::new();
+    let spec = AgentSpecBrief {
+        role: "demo".into(),
+    };
+    let ctx = SpawnCtx {
+        slug: "test".into(),
+        sid: "codex-1".into(),
+        cwd: std::env::temp_dir(),
+        project_dir: std::env::temp_dir(),
+        extra_args: vec![],
+        model_id: None,
+    };
+    let h = adapter.start_thread(&spec, &ctx).await.unwrap();
+    assert_eq!(h.identity, "tid-77");
+
+    // Collect the first three frames the peer saw and assert ordering.
+    let mut methods: Vec<String> = Vec::new();
+    let mut initialize_frame: Option<Value> = None;
+    for _ in 0..3 {
+        let frame = tokio::time::timeout(Duration::from_secs(1), seen_rx.recv())
+            .await
+            .expect("expected a frame from the adapter")
+            .unwrap();
+        let m = frame["method"].as_str().unwrap_or("").to_string();
+        if m == "initialize" {
+            initialize_frame = Some(frame.clone());
+        }
+        methods.push(m);
+    }
+
+    assert_eq!(
+        methods,
+        vec![
+            "initialize".to_string(),
+            "initialized".to_string(),
+            "thread/start".to_string()
+        ],
+        "handshake must precede thread/start; got {methods:?}"
+    );
+    let init = initialize_frame.expect("initialize frame must be present");
+    assert_eq!(
+        init["params"]["capabilities"]["experimentalApi"], true,
+        "initialize must negotiate experimentalApi=true to unlock turn/plan/updated"
+    );
+    assert_eq!(init["params"]["clientInfo"]["name"], "ccteam");
+
+    drop(peer);
+    let _ = std::fs::remove_file(&sock);
+    std::env::remove_var(APP_SERVER_SOCKET_ENV);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
 async fn adapter_start_thread_against_scripted_peer() {
     let sock = unique_socket_path("start-thread");
     std::env::set_var(APP_SERVER_SOCKET_ENV, &sock);
 
     let (peer, _notif) = spawn_scripted_peer(sock.clone(), |req| {
-        if req["method"] == "thread/start" {
-            json!({ "result": { "thread": { "thread_id": "tid-42" } } })
-        } else {
-            json!({ "error": { "code": -32601, "message": "unexpected" } })
+        match req["method"].as_str() {
+            // W3b: the adapter now completes the `initialize` handshake on
+            // connect before `thread/start`, so the scripted peer must
+            // answer it. `initialized` is a one-way notification (no id) —
+            // the peer simply receives it and produces no reply (the empty
+            // result here is dropped because there's no id to attach).
+            Some("initialize") => json!({
+                "result": {
+                    "user_agent": "codex-test/0.0.0",
+                    "codex_home": "/tmp/.codex",
+                    "platform_family": "unix",
+                    "platform_os": "linux"
+                }
+            }),
+            Some("thread/start") => {
+                json!({ "result": { "thread": { "thread_id": "tid-42" } } })
+            }
+            _ => json!({ "error": { "code": -32601, "message": "unexpected" } }),
         }
     })
     .await;
