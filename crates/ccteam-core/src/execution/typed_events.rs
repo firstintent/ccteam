@@ -2,7 +2,7 @@
 //! [`ccteam_mux::EventMerger`].
 //!
 //! Bridges a live Claude chat-TUI session's [`ccteam_mux::TypedEventTap`]
-//! into the project's `progress.jsonl`. Two slices:
+//! into the project's `progress.jsonl`. Three slices:
 //!
 //! - **Slice 1 — `BaseOnly` pipeline** (flag: `CCTEAM_TYPED_EVENTS`): the
 //!   no-enrichment kinds (rate-limit / context-overflow / idle /
@@ -16,14 +16,17 @@
 //!   no `Stop` hook arrived within the merger's grace window, the merger
 //!   emits `BaseLossy` and we write a `merger_lossy_partial` row — surfacing
 //!   a turn whose lossless hook was lost (e.g. a crashed hook subprocess).
-//!
-//! Scope of Slice 2 is deliberately limited to **`TurnDone` only**: a turn
-//! is single-in-flight per session, so the tap's pending-partner sequence
-//! pairing cannot mis-pair. Multi-in-flight kinds (tool calls, prompts) need
-//! the per-kind-counter redesign and are left for a later slice. Nothing
-//! acts on the emitted rows yet — they are for visibility. The `Stop` hook's
-//! PRESENCE (not its payload content) is what pairs; the payload is carried
-//! opaquely.
+//! - **Slice 3 — multi-in-flight kinds.** Adds `user-prompt` →
+//!   [`EventKind::UserPromptSubmitted`] and `tool-use` (Claude's
+//!   `PostToolUse`) → [`EventKind::ToolCallCompleted`] to the
+//!   chat-progress hook → enrichment routing in [`enrich_kind_for_chat_action`].
+//!   Multi-in-flight pairing is robust against cascade-mispair via the
+//!   `TypedEventTap::SeqState`'s time-windowed FIFO drop-stale-on-mint
+//!   (see `docs/versions/v0-8-rmux/w-slice-3-multi-in-flight-pairing.md`).
+//!   `ToolCallStarted` (`PreToolUse`) is **not** wired today — the
+//!   chat-progress installer at `crates/ccteam-core/src/execution/claude_tui.rs:126-135`
+//!   does not register a `PreToolUse` entry, so no `pre-tool-use` action
+//!   reaches the orchestrator.
 //!
 //! Both progress rows (`typed_event`, `merger_lossy_partial`) share the same
 //! JSON field layout (`vendor` / `event_kind` / `captured` / `session` /
@@ -67,12 +70,29 @@ fn registry() -> &'static Mutex<HashMap<String, Arc<TapHandle>>> {
 }
 
 /// Map a Claude chat-progress hook `(kind, action)` to the merger event kind
-/// it enriches. Slice 2: only `Stop` → `TurnDone` (single-in-flight, safe to
-/// pair). All other actions return `None` (deferred — multi-in-flight pairing
-/// needs the per-kind-counter redesign).
+/// it enriches.
+///
+/// The chat-progress installer at
+/// `crates/ccteam-core/src/execution/claude_tui.rs:126-135` uses kebab-case
+/// action strings (`stop`, `user-prompt`, `tool-use`, `session-start`,
+/// `subagent-stop`, `session-end`, `pre-compact`, `post-compact`). We map the
+/// subset that has a merger [`EventKind`] today:
+///
+/// | action | EventKind | Slice |
+/// |---|---|---|
+/// | `stop` | [`EventKind::TurnDone`] | 2 (single-in-flight) |
+/// | `user-prompt` | [`EventKind::UserPromptSubmitted`] | 3 (multi-in-flight; see [`ccteam_mux::TypedEventTap`] time-windowed FIFO) |
+/// | `tool-use` | [`EventKind::ToolCallCompleted`] | 3 (multi-in-flight; pairs `PostToolUse` hook with the `^\s*⎿` pane glyph) |
+///
+/// Returns `None` for unmapped actions (no merger kind, e.g. `subagent-stop`,
+/// `session-end`, `pre-compact`, `post-compact`; or `session-start` whose
+/// canonical signal is the pane `welcome to claude code` regex →
+/// `SessionReset` already at the base level).
 pub fn enrich_kind_for_chat_action(kind: &str, action: Option<&str>) -> Option<EventKind> {
     match (kind, action) {
         ("chat-progress", Some("stop")) => Some(EventKind::TurnDone),
+        ("chat-progress", Some("user-prompt")) => Some(EventKind::UserPromptSubmitted),
+        ("chat-progress", Some("tool-use")) => Some(EventKind::ToolCallCompleted),
         _ => None,
     }
 }
@@ -246,4 +266,78 @@ pub fn maybe_start_typed_event_tap(
             reg.remove(&session_key);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slice_2_stop_maps_to_turn_done() {
+        assert_eq!(
+            enrich_kind_for_chat_action("chat-progress", Some("stop")),
+            Some(EventKind::TurnDone)
+        );
+    }
+
+    #[test]
+    fn slice_3_user_prompt_maps_to_user_prompt_submitted() {
+        assert_eq!(
+            enrich_kind_for_chat_action("chat-progress", Some("user-prompt")),
+            Some(EventKind::UserPromptSubmitted)
+        );
+    }
+
+    #[test]
+    fn slice_3_tool_use_maps_to_tool_call_completed() {
+        assert_eq!(
+            enrich_kind_for_chat_action("chat-progress", Some("tool-use")),
+            Some(EventKind::ToolCallCompleted)
+        );
+    }
+
+    #[test]
+    fn unmapped_chat_progress_actions_return_none() {
+        // Sentinel: these are installed by the chat hook table but have no
+        // merger kind today. Listing them explicitly so a future mapping
+        // change is an opt-in edit, not a silent drop.
+        for action in [
+            "session-start",
+            "subagent-stop",
+            "session-end",
+            "pre-compact",
+            "post-compact",
+        ] {
+            assert_eq!(
+                enrich_kind_for_chat_action("chat-progress", Some(action)),
+                None,
+                "{action} should not map to a merger EventKind today",
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_kind_returns_none() {
+        assert_eq!(
+            enrich_kind_for_chat_action("progress-append", Some("stop")),
+            None,
+            "progress-append is a different dispatch kind; must not collide",
+        );
+        assert_eq!(enrich_kind_for_chat_action("chat-progress", None), None);
+        assert_eq!(enrich_kind_for_chat_action("", Some("stop")), None);
+    }
+
+    #[test]
+    fn pre_tool_use_action_is_unmapped_until_installer_adds_it() {
+        // PreToolUse is NOT registered in the chat-progress installer
+        // (see claude_tui.rs:126-135). This is a guard: if a future change
+        // adds `("PreToolUse", "pre-tool-use")` to the table without also
+        // mapping it here, the hook will route an action this mapper drops
+        // — silent. The fix in that case is to extend the match arm to
+        // `Some("pre-tool-use") => Some(EventKind::ToolCallStarted)`.
+        assert_eq!(
+            enrich_kind_for_chat_action("chat-progress", Some("pre-tool-use")),
+            None
+        );
+    }
 }

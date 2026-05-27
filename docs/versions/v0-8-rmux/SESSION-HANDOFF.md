@@ -17,15 +17,17 @@
 
 - **W0–W7 rmux 集成**:MuxBackend trait + Tmux/Rmux/InProc 三 backend;单 binary daemon(`ccteam --__internal-daemon` re-exec + `RMUX_SDK_DAEMON_BINARY`);全 mode 走 trait;exit-empty=off + dead-handle reconnect;6 Codex wire 修复。
 - **flip-default(库级)**:rmux 是 env-unset 默认,tmux 是 opt-out。21 个 tmux-fixture adapter 测试 + run_peek 单测 pin 到 tmux;positive rmux-adapter 覆盖(`claude_bg_rmux_adapter_test`)。**rmux 与 tmux 并存**:tmux backend + 全部 fixture 完整保留。
-- **EnrichedEvent 类型化事件管线(Slice 1 + 2,flag-gated)** — register_pattern → PatternMatched → `TypedEventTap` → `EventMerger` → consumer(`typed_events.rs`)→ progress.jsonl:
+- **EnrichedEvent 类型化事件管线(Slice 1 + 2 + 3,flag-gated)** — register_pattern → PatternMatched → `TypedEventTap` → `EventMerger` → consumer(`typed_events.rs`)→ progress.jsonl:
   - **Slice 1**(`CCTEAM_TYPED_EVENTS=1`):no-enrichment kinds(rate_limit / context_overflow / idle / process_exited)→ `typed_event` 行。
-  - **Slice 2**(再加 `CCTEAM_HOOK_VIA_DAEMON=1`):session→TapHandle registry(`Arc::ptr_eq`-guarded)把 W6 HookSink 的 Claude `Stop` hook 路由进对应 session 的 tap 作 `TurnDone` enrichment;`turn_done` pane 模式命中但 grace 窗口内无 hook → `BaseLossy` → `merger_lossy_partial` 行(可靠性兜底);`Paired` 抑制。**仅 TurnDone**(single-in-flight,配对安全)。
-  - 默认路径(两 flag 关)完全不变 → baseline 1685/0 不受影响。CI:`rmux-smoke.sh` 跑全部 `#[ignore]` 端到端测试(roundtrip + adapter + typed-event pipeline)。
+  - **Slice 2**(再加 `CCTEAM_HOOK_VIA_DAEMON=1`):session→TapHandle registry(`Arc::ptr_eq`-guarded)把 W6 HookSink 的 Claude `Stop` hook 路由进对应 session 的 tap 作 `TurnDone` enrichment;`turn_done` pane 模式命中但 grace 窗口内无 hook → `BaseLossy` → `merger_lossy_partial` 行(可靠性兜底);`Paired` 抑制。
+  - **Slice 3**(同 Slice 2 flag):`SeqState` 升级为 **time-windowed FIFO**(`PendingSlot { seq, arrived_at: tokio::time::Instant }` + `drop_stale` on opposite queue),消除 multi-in-flight cascade mis-pair;`enrich_kind_for_chat_action` 加映射 `("chat-progress","user-prompt") → UserPromptSubmitted` / `("chat-progress","tool-use") → ToolCallCompleted`。**`pre-tool-use` 不接线**(installer table at `claude_tui.rs:126-135` 不发 PreToolUse;改装表 = 新 finding,见 §未覆盖)。详 `w-slice-3-multi-in-flight-pairing.md`。
+  - 默认路径(两 flag 关)完全不变 → baseline 不受影响。CI:`rmux-smoke.sh` 跑全部 `#[ignore]` 端到端测试(roundtrip + adapter + typed-event pipeline,含 Slice 3 四个 multi-in-flight 场景)。
 
 ## Remaining
 
 - **macOS / Windows CI 绿 → 归 0.8.1**(硬件外因)。CI matrix 已接线(`rmux-smoke` on `[ubuntu-latest, macos-latest]`),push 即跑;本 Linux sandbox 无 Darwin/Windows runner。这是 merge-to-main 门槛(+ real-claude burn-in),非本环境任务。
-- **Slice 3(可选增强)**:把 typed-event 配对扩到 multi-in-flight kinds(tool calls / prompts / plan)。需要 per-(session,kind) 计数器配对(不能用当前 single-in-flight 的 pending-partner token,会 cascade mis-pair)。当前 Slice 1+2 已满足「register_pattern → PatternMatched → merger → 真实 consumer」诉求 + 配对兜底;Slice 3 是 robustness 扩展,非「跑通」前提。
+- **identity-based pairing for `ToolCallCompleted`(within-grace mis-pair fix)**:当前 FIFO + drop-stale 在 *grace 窗口内* 仍可能 mis-pair(罕见,详 design doc §"Known within-grace races");解决方案 = 在 base 和 enrich 两侧携带 tool_name + 按 identity 配对。Slice 3 OOS,延 V0.9 或 0.8.1。
+- **`pre-tool-use` 接线**(`ToolCallStarted` mapping):纯增量 finding(table at `claude_tui.rs:126` 加一行 + `chat_progress.rs:54` 加一个 match arm + 现网项目重跑 installer)。无紧迫需求,延后。
 
 ## 关键设计 / 红线
 

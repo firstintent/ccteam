@@ -447,3 +447,425 @@ async fn turn_done_paired_suppresses_lossy_partial() {
          expected; events seen: {events:#?}"
     );
 }
+
+// ===========================================================================
+// Slice 3 — multi-in-flight pairing integration tests
+// ===========================================================================
+//
+// These mirror the Slice 2 acceptance tests above but exercise the
+// multi-in-flight kinds (`ToolCallCompleted` via the Claude `⎿` glyph +
+// chat-progress `tool-use` enrichment; `UserPromptSubmitted` via the
+// `^> (.+)` regex + `user-prompt` enrichment). They also prove
+// `SeqState`'s new drop-stale FIFO (`crates/ccteam-mux/src/typed_event_tap.rs`)
+// prevents cascade mis-pair when an enrichment is dropped, and that
+// per-tap `SeqState` keeps concurrent sessions from cross-pairing.
+//
+// All four require a live rmux daemon (via `RMUX_SDK_DAEMON_BINARY`) so
+// they are `#[ignore]` like the Slice 2 pair above; the leader runs
+// them via `scripts/rmux-smoke.sh`.
+
+/// Spawn a self-emitting Claude session whose pane prints TWO
+/// `tool_call_completed` trigger lines (`⎿`) spaced ~150ms apart after a
+/// 2s lead. Returns the live backend, its session id, and the random
+/// session name (which the caller composes into `session_key` for
+/// `enrich_session`).
+///
+/// Same 2s lead pattern as [`spawn_turn_done_session`] — the
+/// `maybe_start_typed_event_tap` detached task needs that margin to
+/// register patterns + subscribe before the lines render. The two `⎿`
+/// glyphs are emitted directly from the pane shell (not via `send_text`)
+/// so the in-flight ordering is reliable; the trailing `sleep 30` keeps
+/// the pane alive across the poll window.
+async fn spawn_two_tool_use_session(
+    socket_path: PathBuf,
+    base: &str,
+) -> (Arc<dyn MuxBackend>, MuxSessionId, String) {
+    let backend: Arc<dyn MuxBackend> = Arc::new(RmuxBackend::with_socket_path(socket_path.clone()));
+    eprintln!("socket: {}", socket_path.display());
+
+    let session_name = random_session_name(base);
+    let spec = MuxSessionSpec::new(
+        &session_name,
+        vec![
+            "sh".into(),
+            "-c".into(),
+            "sleep 2; echo '  ⎿ Read 42 lines'; sleep 0.15; echo '  ⎿ Edit 7 lines'; sleep 30"
+                .into(),
+        ],
+        PathBuf::from("/tmp"),
+    );
+    let id = backend.spawn(spec).await.expect("spawn must succeed");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        backend.exists(&id).await.unwrap(),
+        "session must exist after spawn"
+    );
+
+    (backend, id, session_name)
+}
+
+/// Spawn a self-emitting Claude session whose pane prints TWO
+/// `user_prompt_submit` trigger lines (`> hello` / `> world`) spaced
+/// ~150ms apart after a 2s lead. Returns the live backend, its session
+/// id, and the random session name.
+async fn spawn_two_user_prompt_session(
+    socket_path: PathBuf,
+    base: &str,
+) -> (Arc<dyn MuxBackend>, MuxSessionId, String) {
+    let backend: Arc<dyn MuxBackend> = Arc::new(RmuxBackend::with_socket_path(socket_path.clone()));
+    eprintln!("socket: {}", socket_path.display());
+
+    let session_name = random_session_name(base);
+    let spec = MuxSessionSpec::new(
+        &session_name,
+        vec![
+            "sh".into(),
+            "-c".into(),
+            "sleep 2; echo '> hello'; sleep 0.15; echo '> world'; sleep 30".into(),
+        ],
+        PathBuf::from("/tmp"),
+    );
+    let id = backend.spawn(spec).await.expect("spawn must succeed");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        backend.exists(&id).await.unwrap(),
+        "session must exist after spawn"
+    );
+
+    (backend, id, session_name)
+}
+
+/// Slice 3 — happy path for multi-in-flight `ToolCallCompleted`. Two
+/// `⎿` pane matches arrive ~150ms apart; we spray `ToolCallCompleted`
+/// enrichments straddling the t≈2s base window so each base finds a
+/// partner inside the 500ms grace. Both PAIR → zero `merger_lossy_partial`
+/// rows with `event_kind=="tool_call_completed"`.
+///
+/// ## Timing sketch
+/// `t=0`  tap attaches; `t=1.7s` start spraying enrichments (each ~120ms
+/// apart); `t≈2.0s` first `⎿` fires; `t≈2.15s` second `⎿` fires. The
+/// spray window covers `[1.7s, 2.4s]` — base #1 pops the earliest pending
+/// enrich; base #2 pops the next; surplus enrichments dangle as
+/// `pending_enrichment` slots and never emit a `merger_lossy_partial`
+/// row (only unenriched BASES do).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+#[ignore]
+async fn tool_use_pair_with_two_in_flight() {
+    let Some(bin) = locate_ccteam_binary() else {
+        eprintln!(
+            "SKIP: ccteam binary not found in target/{{debug,release}}/ccteam; build with \
+             `cargo build --bin ccteam` (or set CCTEAM_TEST_BIN=...) and rerun."
+        );
+        return;
+    };
+    eprintln!("ccteam binary: {}", bin.display());
+
+    let _daemon_bin = EnvGuard::set("RMUX_SDK_DAEMON_BINARY", bin.to_str().unwrap());
+    let _flag = EnvGuard::set("CCTEAM_TYPED_EVENTS", "1");
+    let _hook_daemon = EnvGuard::set("CCTEAM_HOOK_VIA_DAEMON", "1");
+
+    let tmpdir = tempfile::tempdir().expect("create tempdir");
+    let socket_path = tmpdir.path().join("mux.sock");
+    let progress_path = tmpdir.path().join("progress.jsonl");
+
+    let (backend, id, session_name) =
+        spawn_two_tool_use_session(socket_path, "paired-tooluse").await;
+    let session_key = format!("{session_name}-role");
+
+    maybe_start_typed_event_tap(
+        backend.clone(),
+        id.clone(),
+        Vendor::Claude,
+        session_key.clone(),
+        progress_path.clone(),
+    );
+
+    // Enrichment-first spray spanning t≈1.7s–2.4s so at least two land
+    // within the grace window straddling the two `⎿` lines at t≈2.0s
+    // and t≈2.15s. Surplus enrichments dangle in pending_enrichment
+    // (no lossy row).
+    tokio::time::sleep(Duration::from_millis(1700)).await;
+    for _ in 0..6 {
+        enrich_session(&session_key, EventKind::ToolCallCompleted, "{}".to_string());
+        tokio::time::sleep(Duration::from_millis(120)).await;
+    }
+
+    // Wait past the grace window (line at t≈2s + 500ms grace + margin)
+    // before the negative assertion.
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+
+    let events = progress::read_all_events(&progress_path).unwrap_or_default();
+    let lossy_rows: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            e.get("kind").and_then(|v| v.as_str()) == Some("merger_lossy_partial")
+                && e.get("event_kind").and_then(|v| v.as_str()) == Some("tool_call_completed")
+        })
+        .collect();
+
+    let _ = backend.kill(&id).await;
+
+    assert!(
+        lossy_rows.is_empty(),
+        "both tool_call_completed bases paired with their enrichments → no \
+         merger_lossy_partial row expected; lossy rows seen: {lossy_rows:#?}"
+    );
+}
+
+/// Slice 3 — drop-stale isolation under enrichment loss. Two `⎿` lines
+/// arrive ~150ms apart but only ONE `ToolCallCompleted` enrichment is
+/// routed. Per design `w-slice-3-multi-in-flight-pairing.md` §"Why this
+/// is sufficient", the second base must orphan to `BaseLossy` and emit
+/// exactly one `merger_lossy_partial` row — proving the new `drop_stale`
+/// in `SeqState` prevents cascade FIFO mis-pair.
+///
+/// ## Timing sketch
+/// `t=0`  tap attaches; `t=1.9s` enrich #1 sprayed (parks in
+/// `pending_enrichment`); `t≈2.0s` first `⎿` → mint_base pops the
+/// parked enrich → Paired; `t≈2.15s` second `⎿` → no enrich → parks;
+/// `t≈2.65s` grace elapses → merger emits BaseLossy for the orphan.
+/// Net: exactly one `merger_lossy_partial` row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+#[ignore]
+async fn tool_use_one_hook_lost_does_not_cascade() {
+    let Some(bin) = locate_ccteam_binary() else {
+        eprintln!(
+            "SKIP: ccteam binary not found in target/{{debug,release}}/ccteam; build with \
+             `cargo build --bin ccteam` (or set CCTEAM_TEST_BIN=...) and rerun."
+        );
+        return;
+    };
+    eprintln!("ccteam binary: {}", bin.display());
+
+    let _daemon_bin = EnvGuard::set("RMUX_SDK_DAEMON_BINARY", bin.to_str().unwrap());
+    let _flag = EnvGuard::set("CCTEAM_TYPED_EVENTS", "1");
+    let _hook_daemon = EnvGuard::set("CCTEAM_HOOK_VIA_DAEMON", "1");
+
+    let tmpdir = tempfile::tempdir().expect("create tempdir");
+    let socket_path = tmpdir.path().join("mux.sock");
+    let progress_path = tmpdir.path().join("progress.jsonl");
+
+    let (backend, id, session_name) =
+        spawn_two_tool_use_session(socket_path, "lossy-tooluse-cascade").await;
+    let session_key = format!("{session_name}-role");
+
+    maybe_start_typed_event_tap(
+        backend.clone(),
+        id.clone(),
+        Vendor::Claude,
+        session_key.clone(),
+        progress_path.clone(),
+    );
+
+    // Spray exactly ONE enrichment shortly before the first `⎿`. With
+    // the enrichment-first pairing strategy it parks first; base #1
+    // (`t≈2.0s`) pops it → Paired. Base #2 (`t≈2.15s`) finds no pending
+    // enrich → parks → ages out after 500ms grace → BaseLossy → one
+    // `merger_lossy_partial` row.
+    tokio::time::sleep(Duration::from_millis(1900)).await;
+    enrich_session(&session_key, EventKind::ToolCallCompleted, "{}".to_string());
+
+    // Wait past grace + margin (line #2 at t≈2.15s + 500ms grace +
+    // emit + fs flush + scheduling jitter).
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+
+    let events = progress::read_all_events(&progress_path).unwrap_or_default();
+    let lossy_rows: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            e.get("kind").and_then(|v| v.as_str()) == Some("merger_lossy_partial")
+                && e.get("event_kind").and_then(|v| v.as_str()) == Some("tool_call_completed")
+        })
+        .collect();
+
+    let _ = backend.kill(&id).await;
+
+    assert_eq!(
+        lossy_rows.len(),
+        1,
+        "exactly one tool_call_completed base must orphan to BaseLossy when one of two \
+         enrichments is dropped (drop-stale prevents cascade); rows: {lossy_rows:#?} \
+         (full events: {events:#?})"
+    );
+}
+
+/// Slice 3 — symmetric happy path for multi-in-flight
+/// `UserPromptSubmitted`. Two `> ...` pane matches arrive ~150ms apart;
+/// `UserPromptSubmitted` enrichments are sprayed straddling the t≈2s
+/// base window. Both PAIR → zero `merger_lossy_partial` rows with
+/// `event_kind=="user_prompt_submitted"`.
+///
+/// ## Timing sketch
+/// Identical to [`tool_use_pair_with_two_in_flight`] — the pane lines
+/// just trip the `^> (.+)` regex instead of `^\s*⎿`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+#[ignore]
+async fn user_prompt_pair_with_two_in_flight() {
+    let Some(bin) = locate_ccteam_binary() else {
+        eprintln!(
+            "SKIP: ccteam binary not found in target/{{debug,release}}/ccteam; build with \
+             `cargo build --bin ccteam` (or set CCTEAM_TEST_BIN=...) and rerun."
+        );
+        return;
+    };
+    eprintln!("ccteam binary: {}", bin.display());
+
+    let _daemon_bin = EnvGuard::set("RMUX_SDK_DAEMON_BINARY", bin.to_str().unwrap());
+    let _flag = EnvGuard::set("CCTEAM_TYPED_EVENTS", "1");
+    let _hook_daemon = EnvGuard::set("CCTEAM_HOOK_VIA_DAEMON", "1");
+
+    let tmpdir = tempfile::tempdir().expect("create tempdir");
+    let socket_path = tmpdir.path().join("mux.sock");
+    let progress_path = tmpdir.path().join("progress.jsonl");
+
+    let (backend, id, session_name) =
+        spawn_two_user_prompt_session(socket_path, "paired-userprompt").await;
+    let session_key = format!("{session_name}-role");
+
+    maybe_start_typed_event_tap(
+        backend.clone(),
+        id.clone(),
+        Vendor::Claude,
+        session_key.clone(),
+        progress_path.clone(),
+    );
+
+    tokio::time::sleep(Duration::from_millis(1700)).await;
+    for _ in 0..6 {
+        enrich_session(
+            &session_key,
+            EventKind::UserPromptSubmitted,
+            "{}".to_string(),
+        );
+        tokio::time::sleep(Duration::from_millis(120)).await;
+    }
+
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+
+    let events = progress::read_all_events(&progress_path).unwrap_or_default();
+    let lossy_rows: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            e.get("kind").and_then(|v| v.as_str()) == Some("merger_lossy_partial")
+                && e.get("event_kind").and_then(|v| v.as_str()) == Some("user_prompt_submitted")
+        })
+        .collect();
+
+    let _ = backend.kill(&id).await;
+
+    assert!(
+        lossy_rows.is_empty(),
+        "both user_prompt_submitted bases paired with their enrichments → no \
+         merger_lossy_partial row expected; lossy rows seen: {lossy_rows:#?}"
+    );
+}
+
+/// Slice 3 — `SeqState` is per-tap; concurrent sessions must not cross
+/// pair. Two independent sessions A + B run concurrently, each with its
+/// own socket + tap + progress file. A receives a `TurnDone` enrichment
+/// straddling its `╰─` pane line; B's `╰─` line fires unenriched.
+///
+/// Assertions:
+///   - Session A's progress file has **no** `merger_lossy_partial` row
+///     with `event_kind=="turn_done"` (paired).
+///   - Session B's progress file has **at least one** such row (BaseLossy).
+///
+/// Proves the registry routes by `session_key` (no leak across taps)
+/// and that B's parked base does not pop A's parked enrich.
+///
+/// ## Timing sketch
+/// Both sessions emit `╰─` at t≈2s. A's enrich is sprayed t∈[1.7s,
+/// 2.4s] under its session_key only; B's session_key never receives
+/// any enrichment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+#[ignore]
+async fn multiple_sessions_do_not_cross_pair() {
+    let Some(bin) = locate_ccteam_binary() else {
+        eprintln!(
+            "SKIP: ccteam binary not found in target/{{debug,release}}/ccteam; build with \
+             `cargo build --bin ccteam` (or set CCTEAM_TEST_BIN=...) and rerun."
+        );
+        return;
+    };
+    eprintln!("ccteam binary: {}", bin.display());
+
+    let _daemon_bin = EnvGuard::set("RMUX_SDK_DAEMON_BINARY", bin.to_str().unwrap());
+    let _flag = EnvGuard::set("CCTEAM_TYPED_EVENTS", "1");
+    let _hook_daemon = EnvGuard::set("CCTEAM_HOOK_VIA_DAEMON", "1");
+
+    // Session A — paired (gets enrichments).
+    let tmpdir_a = tempfile::tempdir().expect("create tempdir A");
+    let socket_path_a = tmpdir_a.path().join("mux.sock");
+    let progress_path_a = tmpdir_a.path().join("progress.jsonl");
+
+    // Session B — lossy (no enrichments).
+    let tmpdir_b = tempfile::tempdir().expect("create tempdir B");
+    let socket_path_b = tmpdir_b.path().join("mux.sock");
+    let progress_path_b = tmpdir_b.path().join("progress.jsonl");
+
+    let (backend_a, id_a, session_name_a) =
+        spawn_turn_done_session(socket_path_a, "multi-sess-a").await;
+    let session_key_a = format!("{session_name_a}-role");
+
+    let (backend_b, id_b, session_name_b) =
+        spawn_turn_done_session(socket_path_b, "multi-sess-b").await;
+    let session_key_b = format!("{session_name_b}-role");
+
+    maybe_start_typed_event_tap(
+        backend_a.clone(),
+        id_a.clone(),
+        Vendor::Claude,
+        session_key_a.clone(),
+        progress_path_a.clone(),
+    );
+    maybe_start_typed_event_tap(
+        backend_b.clone(),
+        id_b.clone(),
+        Vendor::Claude,
+        session_key_b.clone(),
+        progress_path_b.clone(),
+    );
+
+    // Spray TurnDone enrichments only to A. B's tap never sees an
+    // enrichment, so B's `╰─` base must age out to BaseLossy.
+    tokio::time::sleep(Duration::from_millis(1700)).await;
+    for _ in 0..6 {
+        enrich_session(&session_key_a, EventKind::TurnDone, "{}".to_string());
+        tokio::time::sleep(Duration::from_millis(120)).await;
+    }
+
+    // Wait past grace + margin for B's BaseLossy to land in its progress.
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+
+    let events_a = progress::read_all_events(&progress_path_a).unwrap_or_default();
+    let events_b = progress::read_all_events(&progress_path_b).unwrap_or_default();
+
+    let has_lossy_a = events_a.iter().any(|e| {
+        e.get("kind").and_then(|v| v.as_str()) == Some("merger_lossy_partial")
+            && e.get("event_kind").and_then(|v| v.as_str()) == Some("turn_done")
+    });
+    let has_lossy_b = events_b.iter().any(|e| {
+        e.get("kind").and_then(|v| v.as_str()) == Some("merger_lossy_partial")
+            && e.get("event_kind").and_then(|v| v.as_str()) == Some("turn_done")
+    });
+
+    let _ = backend_a.kill(&id_a).await;
+    let _ = backend_b.kill(&id_b).await;
+
+    assert!(
+        !has_lossy_a,
+        "session A's turn_done base must pair with its enrichment (no cross-tap leak); \
+         events_a: {events_a:#?}"
+    );
+    assert!(
+        has_lossy_b,
+        "session B's turn_done base must orphan to BaseLossy (no enrichment routed → \
+         per-tap SeqState must not consume A's enrich); events_b: {events_b:#?}"
+    );
+}

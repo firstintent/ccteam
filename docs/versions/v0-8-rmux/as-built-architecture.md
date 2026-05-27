@@ -222,9 +222,13 @@ production producer + consumer AND its grace-window pairing path is live.
 - **Producer**: `typed_event_tap.rs::TypedEventTap` registers a session's
   base patterns, subscribes, and lifts `MuxEvent::PatternMatched` /
   `OutputIdle` / `ProcessExited` → `BaseEvent` into the merger. It mints the
-  pairing `sequence_id` with a pending-partner token scheme (no independent
-  per-side counters → no cascade mis-pairing), and lingers one grace window
-  after stream-end so a parked base's fallback still drains on session death.
+  pairing `sequence_id` with a per-`EventKind` FIFO of `PendingSlot { seq,
+  arrived_at }` (`SeqState`), so the in-flight slot ordering is preserved
+  across multiple unpaired bases of the same kind. To handle one-side loss
+  without cascading mis-pair, every `mint_*` call calls `drop_stale` on the
+  opposite queue first — any slot older than the merger's grace is purged
+  before FIFO pop. The tap lingers one grace window after stream-end so a
+  parked base's fallback still drains on session death.
 - **Consumer**: `ccteam_core::execution::typed_events` reads the merged stream
   and writes `progress.jsonl` rows, integrated at the Claude chat-TUI spawn
   (`claude_tui.rs`), flag-gated on `CCTEAM_TYPED_EVENTS`.
@@ -241,11 +245,23 @@ the W6 `HookSink` consumer route a Claude `Stop` hook to the matching tap as a
 pattern fired but no `Stop` hook arrived within the grace window, the consumer
 writes a `merger_lossy_partial` row (gated on `hook_via_daemon_enabled()` so an
 unenriched turn_done never spams spurious partials); `Paired` is suppressed
-(the hook path owns the canonical row). Scope: **TurnDone only**
-(single-in-flight → safe pairing); multi-in-flight kinds (tool calls, prompts)
-need a per-kind-counter redesign — **Slice 3**. Requires both
+(the hook path owns the canonical row). Requires both
 `CCTEAM_TYPED_EVENTS=1` + `CCTEAM_HOOK_VIA_DAEMON=1`; default path untouched.
 Verified by two ignored tests (lossy-on-unenriched, paired-suppresses).
+
+**Slice 3** (multi-in-flight kinds): `enrich_kind_for_chat_action` adds
+`("chat-progress", "user-prompt") → UserPromptSubmitted` and
+`("chat-progress", "tool-use") → ToolCallCompleted`. The producer-side
+robustness fix is the `SeqState` time-windowed FIFO described above
+(drop-stale-on-mint). Within-grace mis-pair is documented and characterised
+(`w-slice-3-multi-in-flight-pairing.md` §"Known within-grace races") — fully
+eliminating it needs identity-based pairing (out of scope; deferred).
+`ToolCallStarted` is **not** wired: the chat-progress installer in
+`claude_tui.rs:126-135` does not emit a `pre-tool-use` action today; adding
+it is an additive future change. Verified by four ignored integration tests
+(tool-use happy path, tool-use one-hook-lost no-cascade, user-prompt happy
+path, multi-session no-cross-pair) + new `SeqState` unit tests under
+`tokio::time::pause()`.
 
 ---
 
