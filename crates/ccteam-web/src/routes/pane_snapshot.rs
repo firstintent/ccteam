@@ -15,7 +15,7 @@ use axum::{
     Router,
 };
 use ccteam_core::{ProjectState, TeamKind};
-use ccteam_mux::{MuxBackend, MuxSessionId, TmuxBackend};
+use ccteam_mux::MuxSessionId;
 
 use crate::state::AppState;
 
@@ -48,11 +48,28 @@ async fn handle_session_pane_snapshot(
 }
 
 async fn serve_pane_snapshot(slug: String, sid: Option<String>, session_name: String) -> Response {
-    // V0.8 W1 — route through the MuxBackend trait. `TmuxBackend`
-    // bridges to the same blocking `tmux capture-pane / display-message`
-    // calls under `spawn_blocking` internally, so the latency profile
-    // is unchanged.
-    let backend = TmuxBackend::new();
+    // V0.8 W1 / G5 — route through the MuxBackend trait, honoring the
+    // configured backend via `ccteam_mux::from_env()`
+    // (`CCTEAM_MUX_BACKEND=tmux|rmux`). Under the default tmux backend
+    // `TmuxBackend` bridges to the same blocking
+    // `tmux capture-pane / display-message` calls under
+    // `spawn_blocking`, so the latency profile is unchanged.
+    //
+    // rmux ANSI gap: under rmux, `capture(.., with_ansi=true)` returns
+    // rendered plain text (no byte-level capture-pane shim yet) — the
+    // xterm.js widget renders the text without color fidelity. See
+    // `TODO(V0.9-rmux-ansi-capture)` in `ccteam-mux::rmux_backend`.
+    let backend = match ccteam_mux::from_env() {
+        Ok(b) => b,
+        Err(err) => {
+            tracing::warn!(slug = %slug, sid = ?sid, ?err, "pane snapshot mux backend selection failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("pane snapshot backend unavailable: {err}\n"),
+            )
+                .into_response();
+        }
+    };
     let id = MuxSessionId::new(session_name.clone());
 
     let capture = backend.capture(&id, SNAPSHOT_LINES, true).await;
