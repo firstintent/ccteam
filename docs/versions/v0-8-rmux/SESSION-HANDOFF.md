@@ -25,12 +25,19 @@
 > clean. **rmux is now the genuine default everywhere.** Items ① + Step 3
 > closed.
 >
-> Remaining (out-of-environment): ② macOS/Windows CI green (hardware-bound,
-> CI matrix wired, runs on push) · ③ EnrichedEvent merger consumer
-> (still built-not-wired infrastructure; decide: wire a minimal consumer
-> OR mark ahead-of-consumer). The goal-prompts below predate this — the
-> flip-default item (1) is fully done; only EnrichedEvent (2) remains
-> in-environment.
+> **UPDATE 3 — EnrichedEvent item RESOLVED** (commit `a35e722`): per the
+> goal-prompt's option (b), the merger is now explicitly marked
+> **ahead-of-consumer** infrastructure (module doc + EventMerger struct doc
+> + as-built §5, tagged `TODO(V0.9-typed-event-consumer)`). It has neither
+> a production producer (register_pattern unused) nor consumer; its
+> consuming feature is V0.9 daemon-side typed-event orchestration. No stub
+> consumer added (would be misleading dead code).
+>
+> **Both in-environment goal items are now DONE** — (1) flip-default
+> library migration + (2) EnrichedEvent decision. The ONLY remaining item
+> is ② macOS/Windows CI green, which is **hardware-bound** (CI matrix wired,
+> runs on push; no Darwin/Windows runner in this sandbox) and is the
+> merge-to-main gate, not an in-environment task.
 
 ---
 
