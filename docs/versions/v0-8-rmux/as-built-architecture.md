@@ -44,7 +44,7 @@ ccteam-core ─┘                  └─▶ tmux CLI                 (TmuxBack
 | `inproc_backend.rs` (217 ln) | `InProcBackend` — mode-1 stub; most ops return `Ok(())` / no-op, drives a `tokio::task`. Used by tests + the eventual mode-1 unification (W1 `23f0676`). |
 | `daemon.rs` (122 ln) | `run_internal_daemon` — the single-binary re-exec daemon runtime (W2a `050edff`). |
 | `patterns/` (`mod.rs` + `claude.rs` + `codex.rs`) | Layer-2 TUI-render regex registry: `PatternMatcher` engine + the static base-pattern tables (W2b `2158f18` Claude, W3b `aacc616` Codex). |
-| `enriched_event.rs` (553 ln) | The `EventMerger` — priority-with-grace-window merge of P1 (typed) + P2 (regex) + P3 (process) signals (W3b `2a331d1`). **WIRED (V0.8 Slice 1)** — driven by `typed_event_tap.rs`; `BaseOnly` path live, pairing path is Slice 2 (see §5). |
+| `enriched_event.rs` (553 ln) | The `EventMerger` — priority-with-grace-window merge of P1 (typed) + P2 (regex) + P3 (process) signals (W3b `2a331d1`). **WIRED (V0.8 Slices 1+2)** — driven by `typed_event_tap.rs`; both `BaseOnly` and pairing (`Paired`/`BaseLossy`) paths live (see §5). |
 | `typed_event_tap.rs` | `TypedEventTap` — daemon-side driver: registers a session's base patterns, subscribes, lifts `PatternMatched`/`OutputIdle`/`ProcessExited` → `BaseEvent`, mints pairing seq (pending-partner token), feeds the merger, forwards `EnrichedEvent`s. The merger's first production producer. |
 
 `ccteam-core` consumes the trait via `ccteam_mux::default_backend()` from the
@@ -216,31 +216,36 @@ the default path reads no `PatternMatched`.
 priority-with-grace-window merger that emits at most one logical event per
 occurrence, sourcing the richest of P1 (Claude hook / Codex JSON-RPC, lossless)
 / P2 (regex, lossy) / P3 (process). Pairs by `(session_id, kind,
-sequence_id)`. **WIRED in V0.8 Slice 1** — it now has a real production
-producer and consumer.
+sequence_id)`. **WIRED in V0.8 (Slices 1 + 2)** — it now has a real
+production producer + consumer AND its grace-window pairing path is live.
 
 - **Producer**: `typed_event_tap.rs::TypedEventTap` registers a session's
   base patterns, subscribes, and lifts `MuxEvent::PatternMatched` /
   `OutputIdle` / `ProcessExited` → `BaseEvent` into the merger. It mints the
   pairing `sequence_id` with a pending-partner token scheme (no independent
-  per-side counters → no cascade mis-pairing).
+  per-side counters → no cascade mis-pairing), and lingers one grace window
+  after stream-end so a parked base's fallback still drains on session death.
 - **Consumer**: `ccteam_core::execution::typed_events` reads the merged stream
-  and writes `typed_event` rows to `progress.jsonl`, integrated at the Claude
-  chat-TUI spawn (`claude_tui.rs`), flag-gated on `CCTEAM_TYPED_EVENTS`.
-  Verified end-to-end by `typed_event_pipeline_test.rs` (a live rmux session's
-  "rate limit" pane line → a `typed_event{rate_limit}` row) + wired into
-  `rmux-smoke.sh`.
+  and writes `progress.jsonl` rows, integrated at the Claude chat-TUI spawn
+  (`claude_tui.rs`), flag-gated on `CCTEAM_TYPED_EVENTS`.
 
-**Slice 1 scope**: only the no-enrichment kinds (`EnrichmentSource::None` —
-RateLimitHit / ContextOverflow / Idle / ProcessExited) flow today; they emit
-`MergeOutcome::BaseOnly` immediately. The grace-window *pairing* path
-(`Paired` / `BaseLossy`) is exercised by the unit + acceptance tests but not
-yet by production. **Slice 2 (follow-up, in-0.8)**: feed P1 enrichment —
-translate the daemon's Claude-hook (via `HookSink`) / Codex JSON-RPC events
-into `EnrichmentEvent`s so the merger's reliability fallback (`BaseLossy`: a
-lossy pattern fired but the lossless hook never arrived within the grace
-window) becomes live. That needs a session→`TapHandle` registry to route the
-global hook sink to the per-session tap.
+**Slice 1** (`BaseOnly`): the no-enrichment kinds (`EnrichmentSource::None` —
+RateLimitHit / ContextOverflow / Idle / ProcessExited) emit `typed_event`
+observability rows. Verified by `typed_event_pipeline_test.rs` (a live rmux
+session's "rate limit" pane line → a `typed_event{rate_limit}` row).
+
+**Slice 2** (pairing + `BaseLossy`): a session→`TapHandle` registry (keyed by
+`HookEvent::session_id` = `{slug}-{role}`, `Arc::ptr_eq`-guarded removal) lets
+the W6 `HookSink` consumer route a Claude `Stop` hook to the matching tap as a
+`TurnDone` enrichment (`enrich_session_from_hook`). When a `turn_done` pane
+pattern fired but no `Stop` hook arrived within the grace window, the consumer
+writes a `merger_lossy_partial` row (gated on `hook_via_daemon_enabled()` so an
+unenriched turn_done never spams spurious partials); `Paired` is suppressed
+(the hook path owns the canonical row). Scope: **TurnDone only**
+(single-in-flight → safe pairing); multi-in-flight kinds (tool calls, prompts)
+need a per-kind-counter redesign — **Slice 3**. Requires both
+`CCTEAM_TYPED_EVENTS=1` + `CCTEAM_HOOK_VIA_DAEMON=1`; default path untouched.
+Verified by two ignored tests (lossy-on-unenriched, paired-suppresses).
 
 ---
 
