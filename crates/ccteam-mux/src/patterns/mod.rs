@@ -21,8 +21,10 @@
 use regex::Regex;
 
 pub mod claude;
+pub mod codex;
 
 pub use claude::CLAUDE_BASE_PATTERNS;
+pub use codex::CODEX_BASE_PATTERNS;
 
 /// One entry in a vendor's base pattern table.
 ///
@@ -41,21 +43,23 @@ pub struct PatternEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PatternVendor {
     Claude,
-    // Codex base patterns land alongside the Codex event catalog
-    // (`w3b-codex-event-catalog.md`); the variant is reserved now so
-    // callers can pass it through without an API break later.
+    // Codex base patterns are the §6.4 mode-3b L2 safety-net tier
+    // (`w3b-codex-event-catalog.md`): a thin set of TUI regexes that
+    // serve as lossy fallbacks for signals whose canonical source is
+    // the Codex JSON-RPC channel. See `codex::CODEX_BASE_PATTERNS`.
     Codex,
 }
 
 /// Return the static base pattern table for a vendor.
 ///
-/// Codex returns an empty slice for now (its catalog is driven by
-/// JSON-RPC, not TUI-render regexes — see `w3b`); the convenience is
-/// shaped so a future Codex tier slots in without a signature change.
+/// Codex's table is deliberately thin (its semantic catalog is driven
+/// by JSON-RPC, not TUI-render regexes — see `w3b`); the entries it
+/// does carry are L2 fallbacks for when the typed channel is
+/// unavailable.
 pub fn base_patterns(vendor: PatternVendor) -> &'static [PatternEntry] {
     match vendor {
         PatternVendor::Claude => CLAUDE_BASE_PATTERNS,
-        PatternVendor::Codex => &[],
+        PatternVendor::Codex => CODEX_BASE_PATTERNS,
     }
 }
 
@@ -176,8 +180,9 @@ mod tests {
     }
 
     #[test]
-    fn codex_base_is_empty_for_now() {
+    fn base_codex_matcher_loads_all_entries() {
         let m = PatternMatcher::base(PatternVendor::Codex);
-        assert!(m.is_empty());
+        assert_eq!(m.len(), CODEX_BASE_PATTERNS.len());
+        assert!(!m.is_empty());
     }
 }
