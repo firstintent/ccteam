@@ -368,6 +368,8 @@ dependencies = [
  "clap",
  "dirs",
  "libc",
+ "rmux-client",
+ "rmux-proto",
  "serde_json",
  "serde_yaml",
  "tempfile",

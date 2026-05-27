@@ -1723,7 +1723,34 @@ fn latest_claude_bg_job_id(paths: &CcteamPaths, slug: &str) -> Option<String> {
 /// the same primitive `TmuxBackend::capture` calls under the hood).
 /// Keeps run_peek sync per the W1 "sync sites stay sync" decision.
 pub fn run_peek(paths: &CcteamPaths, slug: &str) -> Result<String> {
-    let session = TmuxSession::from_name(session_name_for_project(paths, slug));
+    let session_name = session_name_for_project(paths, slug);
+
+    // V0.8 W5 — backend-aware peek. Under the rmux backend, capture is
+    // non-interactive (a plain-text grid snapshot) so it fits the async
+    // `MuxBackend::capture` trait method cleanly; drive it on a
+    // current-thread tokio runtime (same pattern as `run_session_rm`).
+    // The default tmux path is unchanged.
+    if ccteam_mux::backend_kind_from_env() == ccteam_mux::BackendKind::Rmux {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("build tokio runtime for rmux peek")?;
+        let id = ccteam_mux::MuxSessionId::new(session_name);
+        let backend = ccteam_mux::from_env()?;
+        let bytes = runtime
+            .block_on(async {
+                if !backend.exists(&id).await? {
+                    bail!("rmux session not running: {}", id);
+                }
+                // 1000-line tail mirrors the tmux default scroll-region
+                // window; `with_ansi=false` returns stripped plain text.
+                backend.capture(&id, 1000, false).await
+            })
+            .context("rmux capture")?;
+        return Ok(String::from_utf8_lossy(&bytes).into_owned());
+    }
+
+    let session = TmuxSession::from_name(session_name);
     if !session.exists() {
         bail!("tmux session not running: {}", session.name());
     }

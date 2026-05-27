@@ -329,6 +329,24 @@ pub fn interactive_attach_argv(backend: BackendKind, session_name: &str) -> Vec<
     }
 }
 
+/// Resolve the configured [`BackendKind`] from `CCTEAM_MUX_BACKEND`
+/// (defaults to `tmux`) WITHOUT constructing a backend.
+///
+/// Sync, cheap, and side-effect free — meant for sync CLI sites that
+/// branch interactive terminal handover (`ccteam attach`) on the
+/// backend without paying the cost of instantiating a backend (and,
+/// for rmux, without lazily connecting a daemon). Mirrors the match
+/// in [`from_env`]; an unknown value maps to `Tmux` (the safe default)
+/// here rather than erroring, because the callers that need a hard
+/// error already go through [`from_env`].
+pub fn backend_kind_from_env() -> BackendKind {
+    match std::env::var("CCTEAM_MUX_BACKEND").as_deref() {
+        Ok("rmux") => BackendKind::Rmux,
+        Ok("inproc-test") => BackendKind::InProc,
+        _ => BackendKind::Tmux,
+    }
+}
+
 /// Pick a backend from the `CCTEAM_MUX_BACKEND` env var (defaults to
 /// `tmux`). Returns `Arc<dyn MuxBackend>` so the value can be cloned
 /// freely through call chains; do NOT cache as a process-wide

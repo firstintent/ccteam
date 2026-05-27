@@ -22,7 +22,19 @@ ccteam-imd.workspace = true
 # V0.8 W1 — `interactive_attach_argv` for `ccteam attach` / `session
 # attach`. The trait stays out of the sync CLI fns themselves; only
 # the argv-builder is consumed here.
+# V0.8 W5 — `backend_kind_from_env` to branch interactive attach +
+# `from_env().capture(...)` for the rmux peek path.
 ccteam-mux.workspace = true
+# V0.8 W5 — interactive `ccteam attach` against the ccteam-hosted rmux
+# daemon goes through rmux-client's public attach driver directly
+# (Path A): `connect` → `Connection::begin_attach` → `into_parts` →
+# `attach_terminal_with_initial_bytes`, which drives the local TTY in
+# raw mode on the CLI's own controlling terminal. `rmux-proto` carries
+# `SessionName` for `begin_attach`. Unix-only — Windows attach lands in
+# a follow-up wave (the rmux backend is Unix-first).
+[target.'cfg(unix)'.dependencies]
+rmux-client.workspace = true
+rmux-proto.workspace = true
 clap.workspace = true
 chrono.workspace = true
 dirs.workspace = true
