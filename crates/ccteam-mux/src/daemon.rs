@@ -13,9 +13,38 @@
 
 use std::ffi::OsString;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rmux_server::{DaemonConfig, ServerDaemon};
+
+/// ccteam-owned rmux daemon config. The ONLY directive that matters:
+/// `set -g exit-empty off`.
+///
+/// **Production-killer this defends against (W-verify G-D)**: rmux's
+/// `exit-empty` server option defaults to `on`
+/// (`rmux-server/.../options/table.rs`), so a stock daemon
+/// self-terminates the moment its last session is killed. ccteam hosts
+/// the daemon as a sibling process for 24/7 mode-3 chat — if it died
+/// whenever the final bot stopped, `RmuxBackend`'s cached handle would
+/// then point at a dead daemon. Disabling exit-empty keeps the daemon
+/// resident across "all bots stopped" windows.
+const CCTEAM_RMUX_CONF: &str = "# ccteam-managed rmux daemon config — do not edit.\n\
+                                # Keeps the daemon resident when its last session is killed\n\
+                                # (mode-3 chat is 24/7; see daemon.rs CCTEAM_RMUX_CONF).\n\
+                                set -g exit-empty off\n";
+
+/// Write [`CCTEAM_RMUX_CONF`] next to the daemon socket and return its
+/// path, for passing to `DaemonConfig::with_config_files`. Best-effort:
+/// returns `None` if the parent dir is unavailable or the write fails,
+/// in which case the daemon falls back to stock defaults (exit-empty on)
+/// — degraded but not broken.
+fn write_ccteam_rmux_conf(socket_path: &Path) -> Option<PathBuf> {
+    let dir = socket_path.parent()?;
+    std::fs::create_dir_all(dir).ok()?;
+    let conf = dir.join("ccteam-rmux.conf");
+    std::fs::write(&conf, CCTEAM_RMUX_CONF).ok()?;
+    Some(conf)
+}
 
 /// Fixed `--__internal-daemon` flag emitted by `rmux_sdk` when it
 /// spawns the hidden daemon. Re-exported here so the main.rs argv
@@ -45,7 +74,15 @@ const HIDDEN_DAEMON_WORKER_THREADS: usize = 4;
 /// daemon child.
 pub fn run_internal_daemon(socket: OsString) -> io::Result<()> {
     let socket_path = PathBuf::from(socket);
-    let config = DaemonConfig::new(socket_path);
+
+    // Disable rmux's exit-empty self-termination (W-verify G-D). Without
+    // this the daemon dies when its last session is killed, stranding the
+    // 24/7 mode-3 chat use case. Best-effort: a write failure degrades to
+    // stock defaults rather than aborting daemon startup.
+    let config = match write_ccteam_rmux_conf(&socket_path) {
+        Some(conf) => DaemonConfig::new(socket_path).with_config_files(vec![conf], true, None),
+        None => DaemonConfig::new(socket_path),
+    };
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -56,4 +93,30 @@ pub fn run_internal_daemon(socket: OsString) -> io::Result<()> {
         let server = ServerDaemon::new(config).bind().await?;
         server.wait().await
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conf_writer_disables_exit_empty() {
+        let dir = std::env::temp_dir().join(format!("ccteam-mux-conf-test-{}", std::process::id()));
+        let socket = dir.join("mux.sock");
+        let conf = write_ccteam_rmux_conf(&socket).expect("write conf");
+        let body = std::fs::read_to_string(&conf).expect("read conf");
+        assert!(
+            body.contains("set -g exit-empty off"),
+            "ccteam rmux conf must disable exit-empty, got:\n{body}"
+        );
+        assert_eq!(conf.file_name().unwrap(), "ccteam-rmux.conf");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn conf_writer_returns_none_for_rootless_path() {
+        // "/" has no parent component → None, so run_internal_daemon
+        // degrades to stock defaults rather than aborting startup.
+        assert!(write_ccteam_rmux_conf(Path::new("/")).is_none());
+    }
 }
