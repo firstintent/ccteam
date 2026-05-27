@@ -90,6 +90,14 @@ pub fn chat_session_id_name(slug: &str, role: &str) -> String {
 /// `hook_sh` is the absolute path to the dispatcher
 /// (`~/.ccteam/hooks/hook.sh` in production; tests pin a fake path).
 ///
+/// V0.8 rmux W6 — when [`crate::hooks_dispatcher::hook_via_daemon_enabled`]
+/// is true (operator set `CCTEAM_HOOK_VIA_DAEMON=1`), the generated hook
+/// command becomes `ccteam mux hook-emit --kind chat-progress --action
+/// <arg>` instead — routing the firing to the orchestrator's hook.sock
+/// (single-writer path) rather than the legacy direct progress.jsonl
+/// write. When the flag is unset (the default) the command string is
+/// byte-for-byte the pre-W6 `{hook_sh} chat-progress {arg}` form.
+///
 /// Idempotent: existing hooks for other events are preserved; existing
 /// chat-progress entries are replaced.
 pub fn ensure_chat_hooks_installed(project_dir: &Path, hook_sh: &str) -> Result<(), HarnessError> {
@@ -125,12 +133,25 @@ pub fn ensure_chat_hooks_installed(project_dir: &Path, hook_sh: &str) -> Result<
         ("PreCompact", "pre-compact"),
         ("PostCompact", "post-compact"),
     ];
+    let via_daemon = crate::hooks_dispatcher::hook_via_daemon_enabled();
     for (event, arg) in chat_events {
+        // DEFAULT (flag unset): byte-for-byte the pre-W6 command string.
+        // mode-3 Claude depends on this exact form — do NOT change it.
+        let command = if via_daemon {
+            // W6 daemon-bus reroute: hook subprocess emits onto the
+            // ccteam-owned hook.sock; the orchestrator is the single
+            // progress.jsonl writer. session_id is derived from
+            // CCTEAM_CHAT_SLUG / CCTEAM_CHAT_ROLE env (the same env the
+            // legacy hook.sh path forwards), so the command stays short.
+            format!("ccteam mux hook-emit --kind chat-progress --action {arg}")
+        } else {
+            format!("{hook_sh} chat-progress {arg}")
+        };
         let entry = json!([{
             "matcher": "*",
             "hooks": [{
                 "type": "command",
-                "command": format!("{hook_sh} chat-progress {arg}"),
+                "command": command,
             }],
         }]);
         hooks_obj.insert((*event).to_string(), entry);

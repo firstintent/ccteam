@@ -1760,6 +1760,11 @@ fn run_start(
     // We need the paths twice (for orchestrator construction + final
     // pidfile cleanup), so clone before the move into Orchestrator::new.
     let cleanup_paths = paths.clone();
+    // V0.8 rmux W6 — a third clone for the (flag-gated) hook-sink
+    // dispatch task. Cloned out here so the `move` closure below doesn't
+    // consume `cleanup_paths` (still needed for the final pidfile
+    // removal). Cheap clone (two PathBufs).
+    let hook_sink_paths = paths.clone();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1858,6 +1863,83 @@ fn run_start(
                 }))
             };
 
+            // V0.8 rmux W6 — flag-gated hook-sink listener (Option C).
+            // ONLY when `CCTEAM_HOOK_VIA_DAEMON=1`: bind the ccteam-owned
+            // `~/.ccteam/run/hook.sock`, consume each forwarded HookEvent,
+            // and translate it to the same progress.jsonl line the legacy
+            // `ccteam internal hook <kind> <action>` path would have
+            // written — making the orchestrator process the SINGLE writer
+            // and closing the two-writer race. When the flag is unset
+            // (the default) we do NOT bind the sink: nothing changes, the
+            // hook subprocess keeps writing progress.jsonl directly via
+            // the `hook.sh chat-progress <arg>` path.
+            //
+            // The consumer awaits each dispatch (on the blocking pool, so
+            // the file IO doesn't stall the runtime) before the next
+            // recv, preserving append order — the single-writer invariant
+            // the whole reroute exists to provide.
+            let hook_sink_handle = if ccteam_core::hooks_dispatcher::hook_via_daemon_enabled() {
+                let socket = ccteam_mux::default_ccteam_hook_socket_path();
+                match ccteam_mux::HookSink::bind(&socket) {
+                    Ok(mut sink) => {
+                        tracing::info!(
+                            socket = %socket.display(),
+                            "W6 hook-sink bound (CCTEAM_HOOK_VIA_DAEMON=1): orchestrator is single progress.jsonl writer"
+                        );
+                        let dispatch_paths = hook_sink_paths.clone();
+                        let mut rx = shutdown_rx.clone();
+                        Some(tokio::spawn(async move {
+                            loop {
+                                tokio::select! {
+                                    _ = rx.changed() => break,
+                                    maybe = sink.recv() => {
+                                        let Some(event) = maybe else { break };
+                                        let dispatch_paths = dispatch_paths.clone();
+                                        let res = tokio::task::spawn_blocking(move || {
+                                            let stdin: serde_json::Value =
+                                                serde_json::from_str(&event.payload_json)
+                                                    .unwrap_or(serde_json::Value::Null);
+                                            ccteam_hooks::dispatch(
+                                                &dispatch_paths,
+                                                &event.kind,
+                                                event.action.as_deref(),
+                                                &stdin,
+                                            )
+                                        })
+                                        .await;
+                                        match res {
+                                            Ok(Ok(_)) => {}
+                                            Ok(Err(err)) => tracing::warn!(
+                                                error = %err,
+                                                "W6 hook-sink: dispatch failed; event dropped"
+                                            ),
+                                            Err(je) => tracing::warn!(
+                                                ?je,
+                                                "W6 hook-sink: dispatch task panicked"
+                                            ),
+                                        }
+                                    }
+                                }
+                            }
+                            // Keep the sink (and thus the bound socket)
+                            // alive for the whole task body; drop here on
+                            // shutdown removes the socket file.
+                            drop(sink);
+                        }))
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            socket = %socket.display(),
+                            error = %err,
+                            "W6 hook-sink bind failed; chat-mode hooks will fail to route (set CCTEAM_HOOK_VIA_DAEMON only when intended)"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
             let orch_shutdown = {
                 let mut rx = shutdown_rx.clone();
                 async move {
@@ -1902,6 +1984,23 @@ fn run_start(
                         tracing::warn!(
                             timeout_secs = TASK_DRAIN_TIMEOUT.as_secs(),
                             "ccteam-imd drain timed out; aborting"
+                        );
+                    }
+                }
+            }
+            // V0.8 rmux W6 — drain the hook-sink task on the same
+            // shutdown boundary. It responds to the watch channel
+            // immediately (select! break), so the 5s cap is just a
+            // safety net.
+            if let Some(h) = hook_sink_handle {
+                match tokio::time::timeout(TASK_DRAIN_TIMEOUT, h).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(je)) if je.is_cancelled() => {}
+                    Ok(Err(je)) => tracing::warn!(?je, "W6 hook-sink task panicked"),
+                    Err(_) => {
+                        tracing::warn!(
+                            timeout_secs = TASK_DRAIN_TIMEOUT.as_secs(),
+                            "W6 hook-sink drain timed out; aborting"
                         );
                     }
                 }
