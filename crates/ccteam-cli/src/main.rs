@@ -344,6 +344,14 @@ enum Command {
     /// agent both see the 9-tool surface (interfaces §12).
     #[command(hide = true)]
     McpServe,
+    /// V0.8 rmux — mux backend utilities. Today the only subcommand is
+    /// `hook-emit`, the W6 daemon-bus hook reroute client (active only
+    /// when `CCTEAM_HOOK_VIA_DAEMON=1`; see `ccteam mux hook-emit
+    /// --help`).
+    Mux {
+        #[command(subcommand)]
+        cmd: MuxCommand,
+    },
     /// Internal commands — hook handlers + meta-agent / MCP integration
     /// points. Not user-facing day to day; meta-agent and the
     /// `ccteam-control` skill drive these. Run `ccteam internal --help`
@@ -786,6 +794,36 @@ enum PrefsAction {
     },
 }
 
+/// V0.8 rmux W6 — `ccteam mux` subcommand group.
+#[derive(Subcommand)]
+enum MuxCommand {
+    /// W6 daemon-bus hook reroute client. A Claude Code hook subprocess
+    /// invokes this (only when the host opted in with
+    /// `CCTEAM_HOOK_VIA_DAEMON=1`) to forward its firing to the
+    /// orchestrator over `~/.ccteam/run/hook.sock` instead of writing
+    /// `progress.jsonl` directly. Reads the hook payload from `--json`
+    /// or stdin; derives the session id from `CCTEAM_CHAT_SLUG` /
+    /// `CCTEAM_CHAT_ROLE`. Exits 0 on send; exits non-zero but QUIET
+    /// when the sink isn't listening so a stray fire never error-spams
+    /// Claude Code's UI.
+    HookEmit {
+        /// Dispatch kind, e.g. `chat-progress`.
+        #[arg(long, value_name = "KIND")]
+        kind: String,
+        /// Dispatch action (the event arg), e.g. `session-start`.
+        #[arg(long, value_name = "ACTION")]
+        action: Option<String>,
+        /// Explicit session id; defaults to `<slug>-<role>` derived from
+        /// `CCTEAM_CHAT_SLUG` / `CCTEAM_CHAT_ROLE` env.
+        #[arg(long, value_name = "SID")]
+        session: Option<String>,
+        /// Hook payload JSON inline. When absent, the payload is read
+        /// from stdin (`-` is also treated as "read stdin").
+        #[arg(long, value_name = "JSON")]
+        json: Option<String>,
+    },
+}
+
 /// V0.4.6 F89: subcommands hidden under `ccteam internal`. Each mirrors
 /// a former top-level command 1:1 — the old top-level names stay as
 /// hidden aliases that emit a one-line stderr deprecation WARN and route
@@ -1101,6 +1139,7 @@ fn main() -> Result<()> {
             warn_deprecated_top_level("mcp-serve", "internal mcp-serve");
             run_mcp_serve()
         }
+        Command::Mux { cmd } => run_mux(cmd),
         Command::Internal { cmd } => run_internal(cmd),
         Command::Stop { slug, stop_timeout } => match slug {
             // V0.5.0 F97 — per-slug agent-team cleanup.
@@ -1388,6 +1427,79 @@ fn run_mcp_serve() -> Result<()> {
         .build()
         .context("build tokio runtime for mcp-serve")?;
     runtime.block_on(mcp_serve::run_mcp_serve(paths))
+}
+
+/// V0.8 rmux W6 — `ccteam mux <subcommand>` dispatch.
+fn run_mux(cmd: MuxCommand) -> Result<()> {
+    match cmd {
+        MuxCommand::HookEmit {
+            kind,
+            action,
+            session,
+            json,
+        } => run_mux_hook_emit(kind, action, session, json),
+    }
+}
+
+/// V0.8 rmux W6 — connect to `~/.ccteam/run/hook.sock` and forward one
+/// hook firing to the orchestrator (single-writer path).
+///
+/// QUIET-on-failure contract: when the sink isn't listening (no
+/// orchestrator running with the flag set, stale socket), we exit
+/// non-zero WITHOUT printing to stderr. A Claude Code hook subprocess
+/// that error-spammed stderr would pollute the chat UI; a silent
+/// non-zero exit is the documented behaviour (Claude Code tolerates a
+/// failed fire-and-forget hook).
+fn run_mux_hook_emit(
+    kind: String,
+    action: Option<String>,
+    session: Option<String>,
+    json: Option<String>,
+) -> Result<()> {
+    // Derive the session id from env when not given explicitly. The hook
+    // subprocess inherits CCTEAM_CHAT_SLUG / CCTEAM_CHAT_ROLE from the
+    // chat tmux session (claude_tui::chat_spawn_env_owned). Either may
+    // be empty if env propagation failed; that's fine — the orchestrator
+    // re-derives routing from the payload the same way the legacy hook
+    // handler did, so session_id is informational.
+    let session_id = session.unwrap_or_else(|| {
+        let slug = std::env::var("CCTEAM_CHAT_SLUG").unwrap_or_default();
+        let role = std::env::var("CCTEAM_CHAT_ROLE").unwrap_or_default();
+        format!("{slug}-{role}")
+    });
+
+    // Payload: `--json` inline (unless it's `-`), else read stdin.
+    let payload_json = match json {
+        Some(s) if s != "-" => s,
+        _ => {
+            use std::io::Read;
+            let mut buf = String::new();
+            // A hook may fire with no stdin (e.g. SessionStart in some
+            // configs); tolerate an empty read.
+            let _ = std::io::stdin().lock().read_to_string(&mut buf);
+            buf
+        }
+    };
+
+    let event = ccteam_mux::HookEvent {
+        session_id,
+        kind,
+        action,
+        payload_json,
+    };
+    let socket = ccteam_mux::default_ccteam_hook_socket_path();
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime for mux hook-emit")?;
+    match runtime.block_on(ccteam_mux::HookSinkClient::emit(&socket, &event)) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            // Quiet non-zero exit — no stderr. See contract above.
+            std::process::exit(1);
+        }
+    }
 }
 
 // V0.6.1 F130 — `ccteam daemon {start,stop,status}` removed. The IMD
