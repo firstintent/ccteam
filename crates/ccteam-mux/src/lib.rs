@@ -33,6 +33,7 @@ use futures::Stream;
 
 pub mod daemon;
 pub mod enriched_event;
+pub mod hook_sink;
 pub mod inproc_backend;
 pub mod patterns;
 pub mod rmux_backend;
@@ -43,6 +44,7 @@ pub use enriched_event::{
     enrichment_source, BaseEvent, BasePayload, EnrichedEvent, EnrichmentEvent, EnrichmentPayload,
     EnrichmentSource, EventKind, EventMerger, MergeOutcome, Vendor, DEFAULT_GRACE,
 };
+pub use hook_sink::{default_ccteam_hook_socket_path, HookEvent, HookSink, HookSinkClient};
 pub use inproc_backend::InProcBackend;
 pub use rmux_backend::{default_ccteam_mux_socket_path, RmuxBackend};
 pub use tmux_backend::TmuxBackend;

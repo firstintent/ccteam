@@ -474,6 +474,8 @@ dependencies = [
  "rmux-proto",
  "rmux-sdk",
  "rmux-server",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",

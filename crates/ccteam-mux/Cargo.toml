@@ -19,6 +19,10 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 regex = { workspace = true }
+# V0.8 W6 — hook_sink frames a typed `HookEvent` as length-prefixed
+# JSON over the ccteam-owned hook.sock (Option C).
+serde = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
