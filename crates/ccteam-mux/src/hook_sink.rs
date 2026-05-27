@@ -107,9 +107,8 @@ impl HookSink {
         let socket_path = socket_path.as_ref().to_path_buf();
         if let Some(parent) = socket_path.parent() {
             if !parent.exists() {
-                std::fs::create_dir_all(parent).with_context(|| {
-                    format!("create hook.sock parent {}", parent.display())
-                })?;
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("create hook.sock parent {}", parent.display()))?;
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;

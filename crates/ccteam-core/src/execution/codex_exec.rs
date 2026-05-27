@@ -708,7 +708,11 @@ fn parse_jsonl_item(item: &Value) -> ThreadItem {
                 .get("changes")
                 .and_then(|c| c.get(0))
                 .and_then(|c| c.get("kind"))
-                .and_then(|k| k.get("type").and_then(|t| t.as_str()).or_else(|| k.as_str()))
+                .and_then(|k| {
+                    k.get("type")
+                        .and_then(|t| t.as_str())
+                        .or_else(|| k.as_str())
+                })
                 .unwrap_or("update")
                 .to_string();
             ThreadItemDetails::FileChange { path, kind }
