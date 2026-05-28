@@ -425,7 +425,7 @@ async fn turn_done_paired_suppresses_lossy_partial() {
     // (enrichment-first pairing); the base then pairs with the earliest.
     tokio::time::sleep(Duration::from_millis(1700)).await;
     for _ in 0..6 {
-        enrich_session(&session_key, EventKind::TurnDone, "{}".to_string());
+        enrich_session(&session_key, EventKind::TurnDone, None, "{}".to_string());
         tokio::time::sleep(Duration::from_millis(120)).await;
     }
 
@@ -589,7 +589,12 @@ async fn tool_use_pair_with_two_in_flight() {
     // (no lossy row).
     tokio::time::sleep(Duration::from_millis(1700)).await;
     for _ in 0..6 {
-        enrich_session(&session_key, EventKind::ToolCallCompleted, "{}".to_string());
+        enrich_session(
+            &session_key,
+            EventKind::ToolCallCompleted,
+            None,
+            "{}".to_string(),
+        );
         tokio::time::sleep(Duration::from_millis(120)).await;
     }
 
@@ -667,7 +672,12 @@ async fn tool_use_one_hook_lost_does_not_cascade() {
     // enrich → parks → ages out after 500ms grace → BaseLossy → one
     // `merger_lossy_partial` row.
     tokio::time::sleep(Duration::from_millis(1900)).await;
-    enrich_session(&session_key, EventKind::ToolCallCompleted, "{}".to_string());
+    enrich_session(
+        &session_key,
+        EventKind::ToolCallCompleted,
+        None,
+        "{}".to_string(),
+    );
 
     // Wait past grace + margin (line #2 at t≈2.15s + 500ms grace +
     // emit + fs flush + scheduling jitter).
@@ -740,6 +750,7 @@ async fn user_prompt_pair_with_two_in_flight() {
         enrich_session(
             &session_key,
             EventKind::UserPromptSubmitted,
+            None,
             "{}".to_string(),
         );
         tokio::time::sleep(Duration::from_millis(120)).await;
@@ -836,7 +847,7 @@ async fn multiple_sessions_do_not_cross_pair() {
     // enrichment, so B's `╰─` base must age out to BaseLossy.
     tokio::time::sleep(Duration::from_millis(1700)).await;
     for _ in 0..6 {
-        enrich_session(&session_key_a, EventKind::TurnDone, "{}".to_string());
+        enrich_session(&session_key_a, EventKind::TurnDone, None, "{}".to_string());
         tokio::time::sleep(Duration::from_millis(120)).await;
     }
 

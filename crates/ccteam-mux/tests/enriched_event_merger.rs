@@ -33,6 +33,11 @@ fn base(session: &str, seq: u64) -> BaseEvent {
         payload: BasePayload {
             captured: format!("Read#{seq}"),
         },
+        // Slice 4: legacy merger acceptance tests stay in the `None`
+        // identity cohort (preserves pre-Slice-4 behaviour byte-identical).
+        // Slice-4 cohort partitioning is exercised by the SeqState unit
+        // tests + the chat integration suite.
+        identity: None,
     }
 }
 
@@ -46,6 +51,7 @@ fn enrichment(session: &str, seq: u64) -> EnrichmentEvent {
         payload: EnrichmentPayload {
             data: format!("{{\"tool\":\"Read\",\"seq\":{seq}}}"),
         },
+        identity: None,
     }
 }
 

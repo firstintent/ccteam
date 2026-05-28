@@ -129,6 +129,7 @@ pub fn ensure_chat_hooks_installed(project_dir: &Path, hook_sh: &str) -> Result<
         ("Stop", "stop"),
         ("SubagentStop", "subagent-stop"),
         ("PostToolUse", "tool-use"),
+        ("PreToolUse", "pre-tool-use"),
         ("SessionEnd", "session-end"),
         ("PreCompact", "pre-compact"),
         ("PostCompact", "post-compact"),

@@ -29,6 +29,10 @@ pub mod transcript_tail;
 pub mod turns_mirror;
 // V0.8 rmux — Slice 1 typed-event consumer (gated by CCTEAM_TYPED_EVENTS).
 pub mod typed_events;
+// V0.8 rmux Slice 4 — Codex mode-3 typed-event producer (gated by same flag).
+// Bypasses EventMerger; writes progress.jsonl rows directly from the
+// `app-server` JSON-RPC notification stream. See module docs.
+pub mod codex_typed_events;
 
 pub use claude_bg::ClaudeBgAdapter;
 pub use claude_tui::ClaudeTuiAdapter;

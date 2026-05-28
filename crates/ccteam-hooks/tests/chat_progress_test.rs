@@ -327,6 +327,45 @@ fn session_end_non_clear_leaves_marker_intact() {
 
 #[test]
 #[serial]
+fn slice_4_pre_tool_use_arm_writes_chat_tool_call_started_event() {
+    // V0.8 Slice 4 — Claude `PreToolUse` hook lands in mode-3 chat. The
+    // hook subprocess reads `tool_name` from stdin and writes a
+    // `chat_tool_call_started` event row. The event string is
+    // intentionally distinct from mode-2's `progress-append`
+    // `event:"PreToolUse"` row (which `silence_classifier.rs` counts as a
+    // closes_pending signal); reusing the name would poison mode-2
+    // silence detection.
+    let tmp = TempDir::new().unwrap();
+    let slug = "tcp-pre-tool";
+    let (paths, project_dir) = setup_project(&tmp, slug);
+    std::env::set_var("CCTEAM_CHAT_ROLE", "evan");
+
+    let stdin = json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "sess-pretool",
+        "cwd": project_dir.to_string_lossy(),
+        "tool_name": "Edit",
+        "tool_input": {"file_path": "/x/y.rs"},
+    });
+    handle_chat_progress(&paths, "pre-tool-use", &stdin).unwrap();
+
+    let progress = paths.progress_jsonl_for_context(
+        &ccteam_core::session_context_from_cwd(&project_dir, &paths).unwrap(),
+    );
+    let rows = read_jsonl(&progress);
+    let row = rows.last().unwrap();
+    assert_eq!(row["event"], "chat_tool_call_started");
+    assert_eq!(row["role"], "evan");
+    assert_eq!(row["tool"], "Edit");
+    // Must NOT be mode-2's PreToolUse string — silence_classifier.rs:188
+    // counts that as a Task-balance signal.
+    assert_ne!(row["event"], "PreToolUse");
+
+    std::env::remove_var("CCTEAM_CHAT_ROLE");
+}
+
+#[test]
+#[serial]
 fn unknown_event_arg_falls_back_to_chat_prefix() {
     let tmp = TempDir::new().unwrap();
     let slug = "tcp-future";

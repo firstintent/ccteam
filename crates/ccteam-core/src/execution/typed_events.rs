@@ -23,10 +23,14 @@
 //!   Multi-in-flight pairing is robust against cascade-mispair via the
 //!   `TypedEventTap::SeqState`'s time-windowed FIFO drop-stale-on-mint
 //!   (see `docs/versions/v0-8-rmux/w-slice-3-multi-in-flight-pairing.md`).
-//!   `ToolCallStarted` (`PreToolUse`) is **not** wired today — the
-//!   chat-progress installer at `crates/ccteam-core/src/execution/claude_tui.rs:126-135`
-//!   does not register a `PreToolUse` entry, so no `pre-tool-use` action
-//!   reaches the orchestrator.
+//! - **Slice 4 — `ToolCallStarted` wiring.** Adds `pre-tool-use` (Claude's
+//!   `PreToolUse`) → [`EventKind::ToolCallStarted`]. The chat-progress
+//!   installer at `crates/ccteam-core/src/execution/claude_tui.rs:126-135`
+//!   now registers a `PreToolUse` entry; the hook writes a
+//!   `chat_tool_call_started` row and routes a `ToolCallStarted`
+//!   enrichment into the tap. Pre-rerun-of-`ccteam doctor --install-hooks`
+//!   projects keep working with no `pre-tool-use` firing — the new
+//!   mapping is unreachable until the user reinstalls hooks.
 //!
 //! Both progress rows (`typed_event`, `merger_lossy_partial`) share the same
 //! JSON field layout (`vendor` / `event_kind` / `captured` / `session` /
@@ -83,6 +87,7 @@ fn registry() -> &'static Mutex<HashMap<String, Arc<TapHandle>>> {
 /// | `stop` | [`EventKind::TurnDone`] | 2 (single-in-flight) |
 /// | `user-prompt` | [`EventKind::UserPromptSubmitted`] | 3 (multi-in-flight; see [`ccteam_mux::TypedEventTap`] time-windowed FIFO) |
 /// | `tool-use` | [`EventKind::ToolCallCompleted`] | 3 (multi-in-flight; pairs `PostToolUse` hook with the `^\s*⎿` pane glyph) |
+/// | `pre-tool-use` | [`EventKind::ToolCallStarted`] | 4 (multi-in-flight; pairs `PreToolUse` hook with the `^●\s+(\w+)\(` pane regex) |
 ///
 /// Returns `None` for unmapped actions (no merger kind, e.g. `subagent-stop`,
 /// `session-end`, `pre-compact`, `post-compact`; or `session-start` whose
@@ -93,13 +98,47 @@ pub fn enrich_kind_for_chat_action(kind: &str, action: Option<&str>) -> Option<E
         ("chat-progress", Some("stop")) => Some(EventKind::TurnDone),
         ("chat-progress", Some("user-prompt")) => Some(EventKind::UserPromptSubmitted),
         ("chat-progress", Some("tool-use")) => Some(EventKind::ToolCallCompleted),
+        ("chat-progress", Some("pre-tool-use")) => Some(EventKind::ToolCallStarted),
+        _ => None,
+    }
+}
+
+/// Extract the **identity cohort** for a hook payload (Slice 4).
+///
+/// For `ToolCallStarted` / `ToolCallCompleted` the identity is the Claude
+/// hook payload's `tool_name` field; the tap routes it into the merger's
+/// pairing predicate so two parallel tool calls of different tools never
+/// cross-pair (see `docs/versions/v0-8-rmux/w-slice-4-identity-and-codex.md`).
+/// For every other kind (and any malformed / missing-field payload)
+/// returns `None`, falling back to the pre-Slice-4 per-kind FIFO behaviour
+/// exactly. Forgiving by design — a future hook payload shape drift
+/// surfaces as `None`, not a panic or a poisoned cohort.
+pub fn identity_for(kind: EventKind, payload_json: &str) -> Option<String> {
+    match kind {
+        EventKind::ToolCallStarted | EventKind::ToolCallCompleted => {
+            let value: serde_json::Value = serde_json::from_str(payload_json).ok()?;
+            value
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        }
         _ => None,
     }
 }
 
 /// Route a P1 enrichment to the tap registered for `session_key`. No-op if no
 /// tap is registered (the session has no live tap, or typed events are off).
-pub fn enrich_session(session_key: &str, kind: EventKind, payload: String) {
+///
+/// `identity` is the Slice-4 cohort key — call [`identity_for`] to derive
+/// it from the hook payload when routing tool-call enrichments. Pass `None`
+/// for kinds without identity (TurnDone / UserPromptSubmitted / etc).
+pub fn enrich_session(
+    session_key: &str,
+    kind: EventKind,
+    identity: Option<String>,
+    payload: String,
+) {
     let handle = {
         let reg = match registry().lock() {
             Ok(g) => g,
@@ -108,7 +147,11 @@ pub fn enrich_session(session_key: &str, kind: EventKind, payload: String) {
         reg.get(session_key).cloned()
     };
     if let Some(handle) = handle {
-        handle.enrich(RawEnrichment { kind, payload });
+        handle.enrich(RawEnrichment {
+            kind,
+            identity,
+            payload,
+        });
     }
 }
 
@@ -121,7 +164,13 @@ pub fn enrich_session_from_hook(event: &ccteam_mux::HookEvent) {
         return;
     }
     if let Some(kind) = enrich_kind_for_chat_action(&event.kind, event.action.as_deref()) {
-        enrich_session(&event.session_id, kind, event.payload_json.clone());
+        let identity = identity_for(kind, &event.payload_json);
+        enrich_session(
+            &event.session_id,
+            kind,
+            identity,
+            event.payload_json.clone(),
+        );
     }
 }
 
@@ -136,7 +185,6 @@ fn event_kind_str(kind: EventKind) -> &'static str {
         EventKind::ToolCallCompleted => "tool_call_completed",
         EventKind::UserPromptSubmitted => "user_prompt_submitted",
         EventKind::AssistantMessageComplete => "assistant_message_complete",
-        EventKind::TurnStarted => "turn_started",
         EventKind::TurnDone => "turn_done",
         EventKind::PlanPending => "plan_pending",
         EventKind::SessionReset => "session_reset",
@@ -328,15 +376,71 @@ mod tests {
     }
 
     #[test]
-    fn pre_tool_use_action_is_unmapped_until_installer_adds_it() {
-        // PreToolUse is NOT registered in the chat-progress installer
-        // (see claude_tui.rs:126-135). This is a guard: if a future change
-        // adds `("PreToolUse", "pre-tool-use")` to the table without also
-        // mapping it here, the hook will route an action this mapper drops
-        // — silent. The fix in that case is to extend the match arm to
-        // `Some("pre-tool-use") => Some(EventKind::ToolCallStarted)`.
+    fn slice_4_pre_tool_use_maps_to_tool_call_started() {
+        // V0.8 Slice 4: PreToolUse is now registered in the chat-progress
+        // installer (claude_tui.rs:126-135) and the hook subprocess emits
+        // a `chat_tool_call_started` row + routes a `ToolCallStarted`
+        // enrichment through this mapper. Previous Slice-3 guard was
+        // "unmapped until installer adds it" — installer added it, so
+        // this assertion is now positive.
         assert_eq!(
             enrich_kind_for_chat_action("chat-progress", Some("pre-tool-use")),
+            Some(EventKind::ToolCallStarted)
+        );
+    }
+
+    /// Slice 4 — identity is extracted only for tool-call kinds; every
+    /// other kind returns `None` regardless of payload contents.
+    #[test]
+    fn identity_for_tool_call_kinds_extracts_tool_name() {
+        let payload = r#"{"tool_name":"Edit","tool_input":{"file_path":"/foo"}}"#;
+        assert_eq!(
+            identity_for(EventKind::ToolCallStarted, payload),
+            Some("Edit".to_string())
+        );
+        assert_eq!(
+            identity_for(EventKind::ToolCallCompleted, payload),
+            Some("Edit".to_string())
+        );
+    }
+
+    #[test]
+    fn identity_for_non_tool_kinds_returns_none() {
+        let payload = r#"{"tool_name":"Edit"}"#;
+        // A payload that happens to carry tool_name does NOT poison
+        // other kinds — identity is only meaningful for tool-call kinds.
+        assert_eq!(identity_for(EventKind::TurnDone, payload), None);
+        assert_eq!(identity_for(EventKind::UserPromptSubmitted, payload), None);
+        assert_eq!(identity_for(EventKind::SessionReset, payload), None);
+        assert_eq!(identity_for(EventKind::RateLimitHit, payload), None);
+    }
+
+    /// Slice 4 §"Risks" R5 — forgiving by design. A malformed payload, a
+    /// missing field, an empty string, or a non-string tool_name all
+    /// degrade to `None` so the cohort gracefully falls back to FIFO
+    /// instead of a panic or a poisoned `Some("")` bucket.
+    #[test]
+    fn identity_for_malformed_payload_returns_none() {
+        // Not valid JSON.
+        assert_eq!(
+            identity_for(EventKind::ToolCallStarted, "not json at all"),
+            None
+        );
+        // Empty object — no tool_name field.
+        assert_eq!(identity_for(EventKind::ToolCallStarted, "{}"), None);
+        // tool_name is null.
+        assert_eq!(
+            identity_for(EventKind::ToolCallStarted, r#"{"tool_name":null}"#),
+            None
+        );
+        // tool_name is a non-string.
+        assert_eq!(
+            identity_for(EventKind::ToolCallStarted, r#"{"tool_name":42}"#),
+            None
+        );
+        // tool_name is an empty string — refuse to mint a `Some("")` cohort.
+        assert_eq!(
+            identity_for(EventKind::ToolCallStarted, r#"{"tool_name":""}"#),
             None
         );
     }

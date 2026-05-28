@@ -64,9 +64,17 @@ pub fn event_kind_for_regex_id(regex_id: &str) -> Option<EventKind> {
 /// The tap mints the matching seq (so it pairs with the corresponding
 /// base) and lifts this into an [`EnrichmentEvent`]. `payload` is the
 /// opaque serialized P1 detail the merger forwards verbatim.
+///
+/// **Slice 4 — `identity`.** For tool-call kinds, the integrator extracts
+/// the tool name from the hook payload (see
+/// `ccteam_core::execution::typed_events::identity_for`) and passes it
+/// here. The tap routes identity into the merger's pairing predicate so
+/// two parallel tool calls of different tools never cross-pair. `None`
+/// preserves the pre-Slice-4 per-kind FIFO behaviour exactly.
 #[derive(Debug, Clone)]
 pub struct RawEnrichment {
     pub kind: EventKind,
+    pub identity: Option<String>,
     pub payload: String,
 }
 
@@ -105,9 +113,10 @@ struct PendingSlot {
 ///
 /// A base and its enrichment for the same occurrence must carry the
 /// **same** `sequence_id` so the merger pairs them. We use a single
-/// monotonic counter plus two per-`EventKind` FIFO queues of "minted but
-/// not yet matched by the other side" tokens, each tagged with its
-/// arrival [`Instant`].
+/// monotonic counter plus two per-`(EventKind, Option<String>)` FIFO
+/// queues of "minted but not yet matched by the other side" tokens, each
+/// tagged with its arrival [`Instant`]. The `Option<String>` part of
+/// the key is the **identity cohort** (Slice 4) — see [`RawEnrichment`].
 ///
 /// **Slice 3 multi-in-flight fix.** Plain FIFO cascade-mispairs if one
 /// side ever drops an occurrence: the next opposite-side mint pops the
@@ -118,13 +127,24 @@ struct PendingSlot {
 /// already aged out (or would have) the corresponding parked side, so
 /// consuming that stale seq could only mis-pair. After the drop pass,
 /// FIFO is correctly aligned for the in-window slots.
+///
+/// **Slice 4 identity cohorts.** Each `(kind, identity)` is its own
+/// FIFO. `Some("Edit")` and `Some("Read")` never cross-mint, so two
+/// parallel tool calls of different tools can't be mis-paired. The
+/// `None` cohort is the pre-Slice-4 path — TurnDone, UserPromptSubmit,
+/// no-enrich kinds, anything that doesn't carry identity. The global
+/// monotonic `next_seq` ensures `sequence_id`s remain unique across
+/// cohorts so the merger's predicate `(kind, identity, seq)` can rely
+/// on seq alone for collision-freeness within a cohort.
+type CohortKey = (EventKind, Option<String>);
+
 struct SeqState {
     next_seq: u64,
     grace: Duration,
     /// seqs minted by a base, awaiting their enrichment partner.
-    pending_base: HashMap<EventKind, VecDeque<PendingSlot>>,
+    pending_base: HashMap<CohortKey, VecDeque<PendingSlot>>,
     /// seqs minted by an enrichment, awaiting their base partner.
-    pending_enrich: HashMap<EventKind, VecDeque<PendingSlot>>,
+    pending_enrich: HashMap<CohortKey, VecDeque<PendingSlot>>,
 }
 
 impl SeqState {
@@ -156,15 +176,17 @@ impl SeqState {
         }
     }
 
-    /// Mint the `sequence_id` for an arriving base of `kind`.
+    /// Mint the `sequence_id` for an arriving base of `(kind, identity)`.
     ///
-    /// Drops every stale entry from `pending_enrich[kind]` first (Slice 3
-    /// time-windowed FIFO); then if a fresh enrichment for this kind is
-    /// waiting, reuses its seq so the two pair. Otherwise mints a fresh
-    /// seq and records it as awaiting the enrichment side.
-    fn mint_base(&mut self, kind: EventKind) -> u64 {
+    /// Drops every stale entry from `pending_enrich[(kind, identity)]`
+    /// first (Slice 3 time-windowed FIFO); then if a fresh enrichment
+    /// for this cohort is waiting, reuses its seq so the two pair.
+    /// Otherwise mints a fresh seq and records it as awaiting the
+    /// enrichment side **within this cohort only** (Slice 4).
+    fn mint_base(&mut self, kind: EventKind, identity: Option<String>) -> u64 {
         let now = Instant::now();
-        if let Some(q) = self.pending_enrich.get_mut(&kind) {
+        let key = (kind, identity);
+        if let Some(q) = self.pending_enrich.get_mut(&key) {
             Self::drop_stale(q, now, self.grace);
             if let Some(slot) = q.pop_front() {
                 return slot.seq;
@@ -172,7 +194,7 @@ impl SeqState {
         }
         let s = self.fresh();
         self.pending_base
-            .entry(kind)
+            .entry(key)
             .or_default()
             .push_back(PendingSlot {
                 seq: s,
@@ -181,14 +203,12 @@ impl SeqState {
         s
     }
 
-    /// Mint the `sequence_id` for an arriving enrichment of `kind`.
-    ///
-    /// Symmetric to [`Self::mint_base`]: drop stale `pending_base[kind]`,
-    /// reuse a base's fresh pending seq if one is waiting, else mint a
-    /// fresh seq and record it as awaiting the base side.
-    fn mint_enrich(&mut self, kind: EventKind) -> u64 {
+    /// Mint the `sequence_id` for an arriving enrichment of
+    /// `(kind, identity)`. Symmetric to [`Self::mint_base`].
+    fn mint_enrich(&mut self, kind: EventKind, identity: Option<String>) -> u64 {
         let now = Instant::now();
-        if let Some(q) = self.pending_base.get_mut(&kind) {
+        let key = (kind, identity);
+        if let Some(q) = self.pending_base.get_mut(&key) {
             Self::drop_stale(q, now, self.grace);
             if let Some(slot) = q.pop_front() {
                 return slot.seq;
@@ -196,7 +216,7 @@ impl SeqState {
         }
         let s = self.fresh();
         self.pending_enrich
-            .entry(kind)
+            .entry(key)
             .or_default()
             .push_back(PendingSlot {
                 seq: s,
@@ -285,7 +305,23 @@ impl TypedEventTap {
                         match maybe_ev {
                             Some(MuxEvent::PatternMatched { regex_id, captured }) => {
                                 if let Some(kind) = event_kind_for_regex_id(&regex_id) {
-                                    let sequence_id = seq.mint_base(kind);
+                                    // Slice 4: extract identity from pane capture.
+                                    // `tool_call_started` regex `^●\s+(\w+)\(`
+                                    // captures the tool name → use as identity cohort.
+                                    // `tool_call_completed`'s `^\s*⎿` captures
+                                    // nothing useful; identity is None on the base
+                                    // side and cohort partitioning happens via the
+                                    // enrichment-side `tool_name` (see
+                                    // `ccteam_core::execution::typed_events::identity_for`).
+                                    // Every other kind has no pane-side identity.
+                                    let identity = if kind == EventKind::ToolCallStarted
+                                        && !captured.is_empty()
+                                    {
+                                        Some(captured.clone())
+                                    } else {
+                                        None
+                                    };
+                                    let sequence_id = seq.mint_base(kind, identity.clone());
                                     merger
                                         .process_base(BaseEvent {
                                             session_id: session_id.clone(),
@@ -294,6 +330,7 @@ impl TypedEventTap {
                                             sequence_id,
                                             timestamp: SystemTime::now(),
                                             payload: BasePayload { captured },
+                                            identity,
                                         })
                                         .await;
                                 }
@@ -301,7 +338,7 @@ impl TypedEventTap {
                             }
                             Some(MuxEvent::OutputIdle { .. }) => {
                                 // None-kind → BaseOnly immediately; seq irrelevant.
-                                let sequence_id = seq.mint_base(EventKind::Idle);
+                                let sequence_id = seq.mint_base(EventKind::Idle, None);
                                 merger
                                     .process_base(BaseEvent {
                                         session_id: session_id.clone(),
@@ -310,11 +347,13 @@ impl TypedEventTap {
                                         sequence_id,
                                         timestamp: SystemTime::now(),
                                         payload: BasePayload::default(),
+                                        identity: None,
                                     })
                                     .await;
                             }
                             Some(MuxEvent::ProcessExited { .. }) => {
-                                let sequence_id = seq.mint_base(EventKind::ProcessExited);
+                                let sequence_id =
+                                    seq.mint_base(EventKind::ProcessExited, None);
                                 merger
                                     .process_base(BaseEvent {
                                         session_id: session_id.clone(),
@@ -323,6 +362,7 @@ impl TypedEventTap {
                                         sequence_id,
                                         timestamp: SystemTime::now(),
                                         payload: BasePayload::default(),
+                                        identity: None,
                                     })
                                     .await;
                             }
@@ -348,8 +388,8 @@ impl TypedEventTap {
                     // (b) The integrator's P1 enrichment channel.
                     maybe_enrich = enrich_rx.recv(), if !enrich_done => {
                         match maybe_enrich {
-                            Some(RawEnrichment { kind, payload }) => {
-                                let sequence_id = seq.mint_enrich(kind);
+                            Some(RawEnrichment { kind, identity, payload }) => {
+                                let sequence_id = seq.mint_enrich(kind, identity.clone());
                                 merger
                                     .process_enrichment(EnrichmentEvent {
                                         session_id: session_id.clone(),
@@ -358,6 +398,7 @@ impl TypedEventTap {
                                         sequence_id,
                                         timestamp: SystemTime::now(),
                                         payload: EnrichmentPayload { data: payload },
+                                        identity,
                                     })
                                     .await;
                             }
@@ -462,28 +503,28 @@ mod tests {
     #[test]
     fn seq_base_first_then_enrich_reuse_same_seq() {
         let mut s = fresh_seq_state();
-        let b = s.mint_base(EventKind::TurnDone);
-        let e = s.mint_enrich(EventKind::TurnDone);
+        let b = s.mint_base(EventKind::TurnDone, None);
+        let e = s.mint_enrich(EventKind::TurnDone, None);
         assert_eq!(b, e, "enrichment must reuse the base's pending seq");
     }
 
     #[test]
     fn seq_enrich_first_then_base_reuse_same_seq() {
         let mut s = fresh_seq_state();
-        let e = s.mint_enrich(EventKind::ToolCallStarted);
-        let b = s.mint_base(EventKind::ToolCallStarted);
+        let e = s.mint_enrich(EventKind::ToolCallStarted, None);
+        let b = s.mint_base(EventKind::ToolCallStarted, None);
         assert_eq!(e, b, "base must reuse the enrichment's pending seq");
     }
 
     #[test]
     fn seq_two_bases_before_any_enrich_get_distinct_seqs() {
         let mut s = fresh_seq_state();
-        let b0 = s.mint_base(EventKind::ToolCallStarted);
-        let b1 = s.mint_base(EventKind::ToolCallStarted);
+        let b0 = s.mint_base(EventKind::ToolCallStarted, None);
+        let b1 = s.mint_base(EventKind::ToolCallStarted, None);
         assert_ne!(b0, b1, "two unpaired bases must get distinct seqs");
         // And their enrichments pair FIFO: first enrich pairs b0, second b1.
-        let e0 = s.mint_enrich(EventKind::ToolCallStarted);
-        let e1 = s.mint_enrich(EventKind::ToolCallStarted);
+        let e0 = s.mint_enrich(EventKind::ToolCallStarted, None);
+        let e1 = s.mint_enrich(EventKind::ToolCallStarted, None);
         assert_eq!(e0, b0);
         assert_eq!(e1, b1);
     }
@@ -491,10 +532,45 @@ mod tests {
     #[test]
     fn seq_distinct_kinds_do_not_cross_pair() {
         let mut s = fresh_seq_state();
-        let tool = s.mint_base(EventKind::ToolCallStarted);
+        let tool = s.mint_base(EventKind::ToolCallStarted, None);
         // An enrichment of a DIFFERENT kind must NOT reuse tool's seq.
-        let turn = s.mint_enrich(EventKind::TurnDone);
+        let turn = s.mint_enrich(EventKind::TurnDone, None);
         assert_ne!(tool, turn);
+    }
+
+    /// Slice 4 — different identity cohorts under the same `EventKind`
+    /// never cross-pair. This is the core guarantee item (1) ships:
+    /// parallel Edit + Read tool calls can't be mis-attributed.
+    #[test]
+    fn seq_cross_cohort_no_mint_collision() {
+        let mut s = fresh_seq_state();
+        let b_edit = s.mint_base(EventKind::ToolCallStarted, Some("Edit".to_string()));
+        let e_read = s.mint_enrich(EventKind::ToolCallStarted, Some("Read".to_string()));
+        // Distinct cohorts → distinct seqs; the Read enrich does NOT
+        // consume the Edit base's pending slot.
+        assert_ne!(
+            b_edit, e_read,
+            "Edit base and Read enrich are in disjoint cohorts; \
+             must not share a seq"
+        );
+        // The Edit's own enrich still pairs correctly.
+        let e_edit = s.mint_enrich(EventKind::ToolCallStarted, Some("Edit".to_string()));
+        assert_eq!(e_edit, b_edit);
+    }
+
+    /// Slice 4 — the `None` identity cohort is independent of any
+    /// `Some(...)` cohort (pre-Slice-4 codepaths preserved exactly).
+    #[test]
+    fn seq_none_cohort_is_disjoint_from_some_cohorts() {
+        let mut s = fresh_seq_state();
+        let b_none = s.mint_base(EventKind::ToolCallCompleted, None);
+        let b_edit = s.mint_base(EventKind::ToolCallCompleted, Some("Edit".to_string()));
+        assert_ne!(b_none, b_edit);
+        // Enrichments to each cohort pair within their own cohort only.
+        let e_edit = s.mint_enrich(EventKind::ToolCallCompleted, Some("Edit".to_string()));
+        let e_none = s.mint_enrich(EventKind::ToolCallCompleted, None);
+        assert_eq!(e_edit, b_edit);
+        assert_eq!(e_none, b_none);
     }
 
     /// Slice 3 — a base parked beyond `grace` is dropped from
@@ -506,13 +582,13 @@ mod tests {
         let grace = Duration::from_millis(500);
         let mut s = SeqState::new(grace);
         // base[0] arrives. Its enrich never does.
-        let b0 = s.mint_base(EventKind::ToolCallCompleted);
+        let b0 = s.mint_base(EventKind::ToolCallCompleted, None);
         // Advance past grace.
         tokio::time::advance(grace + Duration::from_millis(50)).await;
         // base[1] arrives.
-        let b1 = s.mint_base(EventKind::ToolCallCompleted);
+        let b1 = s.mint_base(EventKind::ToolCallCompleted, None);
         // The next enrich must pair with b1, NOT cascade-mispair onto b0.
-        let e = s.mint_enrich(EventKind::ToolCallCompleted);
+        let e = s.mint_enrich(EventKind::ToolCallCompleted, None);
         assert_eq!(
             e, b1,
             "stale b0 must be dropped; enrich must pair with the fresh b1"
@@ -527,10 +603,10 @@ mod tests {
     async fn seq_stale_pending_enrich_dropped_before_pairing() {
         let grace = Duration::from_millis(500);
         let mut s = SeqState::new(grace);
-        let e0 = s.mint_enrich(EventKind::UserPromptSubmitted);
+        let e0 = s.mint_enrich(EventKind::UserPromptSubmitted, None);
         tokio::time::advance(grace + Duration::from_millis(50)).await;
-        let e1 = s.mint_enrich(EventKind::UserPromptSubmitted);
-        let b = s.mint_base(EventKind::UserPromptSubmitted);
+        let e1 = s.mint_enrich(EventKind::UserPromptSubmitted, None);
+        let b = s.mint_base(EventKind::UserPromptSubmitted, None);
         assert_eq!(
             b, e1,
             "stale e0 must be dropped; base must pair with the fresh e1"
@@ -547,7 +623,7 @@ mod tests {
         let grace = Duration::from_millis(500);
         let mut s = SeqState::new(grace);
         for _ in 0..32 {
-            s.mint_base(EventKind::Idle);
+            s.mint_base(EventKind::Idle, None);
         }
         // Without drop-stale, pending_base[Idle] would be 32; nothing
         // pops it ever. After grace elapses, the next mint_enrich would
@@ -572,7 +648,7 @@ mod tests {
         // update this expectation.
         let len = s
             .pending_base
-            .get(&EventKind::Idle)
+            .get(&(EventKind::Idle, None))
             .map(|q| q.len())
             .unwrap_or(0);
         assert_eq!(len, 32, "same-queue self-prune is not part of Slice 3");
@@ -585,10 +661,10 @@ mod tests {
         // drop_stale mechanic IS attached to pending_base[Idle] and
         // a hypothetical enrich would clean it up.
         tokio::time::advance(grace + Duration::from_millis(50)).await;
-        let _e = s.mint_enrich(EventKind::Idle);
+        let _e = s.mint_enrich(EventKind::Idle, None);
         let len_after = s
             .pending_base
-            .get(&EventKind::Idle)
+            .get(&(EventKind::Idle, None))
             .map(|q| q.len())
             .unwrap_or(0);
         assert_eq!(
@@ -604,9 +680,9 @@ mod tests {
     async fn seq_in_window_pending_is_not_dropped() {
         let grace = Duration::from_millis(500);
         let mut s = SeqState::new(grace);
-        let b = s.mint_base(EventKind::ToolCallCompleted);
+        let b = s.mint_base(EventKind::ToolCallCompleted, None);
         tokio::time::advance(grace / 2).await;
-        let e = s.mint_enrich(EventKind::ToolCallCompleted);
+        let e = s.mint_enrich(EventKind::ToolCallCompleted, None);
         assert_eq!(b, e, "in-window pending must still pair via FIFO");
     }
 

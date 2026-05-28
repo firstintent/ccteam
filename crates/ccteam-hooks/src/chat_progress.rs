@@ -13,6 +13,7 @@
 //! | `stop`           | Stop                | `chat_turn_completed`           |
 //! | `subagent-stop`  | SubagentStop        | `chat_subagent_completed`       |
 //! | `tool-use`       | PostToolUse         | `chat_tool_use`                 |
+//! | `pre-tool-use`   | PreToolUse          | `chat_tool_call_started`        |
 //! | `session-end`    | SessionEnd          | `chat_session_reset` (clear)    |
 //! | `pre-compact`    | PreCompact          | `chat_pre_compact`              |
 //! | `post-compact`   | PostCompact         | `chat_compact_done`             |
@@ -28,8 +29,8 @@ use std::path::Path;
 use ccteam_core::execution::transcript_tail::active_session_id_path;
 use ccteam_core::progress::{
     append_event, build_chat_compact_done_event, build_chat_session_reset_event,
-    build_chat_session_started_event, build_chat_turn_completed_event,
-    build_chat_turn_user_prompt_event,
+    build_chat_session_started_event, build_chat_tool_call_started_event,
+    build_chat_turn_completed_event, build_chat_turn_user_prompt_event,
 };
 use ccteam_core::{session_context_from_cwd, CcteamPaths};
 
@@ -109,6 +110,20 @@ pub fn handle_chat_progress(paths: &CcteamPaths, event: &str, stdin: &Value) -> 
             "tool": stdin.get("tool_name").and_then(|v| v.as_str()).unwrap_or(""),
             "ts": chrono::Utc::now().to_rfc3339(),
         }),
+        "pre-tool-use" => {
+            // V0.8 Slice 4 — Claude Code `PreToolUse` hook for mode-3
+            // chat. Mirrors `tool-use` (PostToolUse): reads the same
+            // `tool_name` + `tool_input` fields. Writes
+            // `chat_tool_call_started` (NOT `PreToolUse` — that string
+            // is owned by the mode-2 silence classifier;
+            // CHAT_TOOL_CALL_STARTED docstring in progress.rs has the
+            // full rationale).
+            let tool = stdin
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            build_chat_tool_call_started_event(&role, tool)
+        }
         "session-end" => {
             let reason = stdin
                 .get("reason")

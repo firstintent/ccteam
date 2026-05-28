@@ -305,7 +305,7 @@ impl HarnessAdapter for CodexAppServerAdapter {
             self.register_bridge(
                 thread_id.clone(),
                 ProgressBridgeCtx {
-                    progress_path,
+                    progress_path: progress_path.clone(),
                     role: spec.role.clone(),
                     sid: ctx.sid.clone(),
                     slug: ctx.slug.clone(),
@@ -313,6 +313,16 @@ impl HarnessAdapter for CodexAppServerAdapter {
                 },
             )
             .await;
+            // V0.8 rmux Slice 4 — Codex mode-3 typed-event producer.
+            // Gated on `CCTEAM_TYPED_EVENTS`; subscribes to JSON-RPC
+            // notifications and writes `typed_event` rows directly to
+            // the same `progress.jsonl`. Bypasses `EventMerger`
+            // (no pane base side) — see module docs at
+            // `execution/codex_typed_events.rs`.
+            let _ = crate::execution::codex_typed_events::maybe_start_codex_typed_event_tap(
+                Arc::clone(&client),
+                progress_path,
+            );
         }
         Ok(ThreadHandle {
             vendor: AgentVendor::Codex,

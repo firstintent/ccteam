@@ -214,6 +214,29 @@ pub const CHAT_COMPACT_DONE: &str = "chat_compact_done";
 /// surface the hop-loop. Payload: `{role, hop_count, last_bot, ts}`.
 pub const CHAT_HOP_ESCALATE: &str = "chat_hop_escalate";
 
+/// `chat_tool_call_started` — V0.8 Slice 4. Claude Code `PreToolUse` hook
+/// fired inside a mode-3 chat session. Payload: `{role, tool, ts}`. The
+/// `event` string is intentionally distinct from the mode-2
+/// `progress-append` row whose `event:"PreToolUse"` is counted by
+/// `silence_classifier.rs::event_kind` as a `closes_pending` Task-balance
+/// signal — reusing the name here would poison mode-2 silence detection
+/// with mode-3 rows. This row also drives the merger's `ToolCallStarted`
+/// enrichment via `enrich_kind_for_chat_action("chat-progress",
+/// Some("pre-tool-use"))`.
+pub const CHAT_TOOL_CALL_STARTED: &str = "chat_tool_call_started";
+
+/// V0.8 Slice 4 — build a `chat_tool_call_started` event JSON. `tool` is
+/// the `tool_name` field from the Claude Code `PreToolUse` hook stdin
+/// payload (matches `PostToolUse` for downstream pairing).
+pub fn build_chat_tool_call_started_event(role: &str, tool: &str) -> Value {
+    serde_json::json!({
+        "event": CHAT_TOOL_CALL_STARTED,
+        "role": role,
+        "tool": tool,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
 /// Build a `chat_session_started` event JSON. `role` is the bot handle
 /// (`workflow.yaml mode: chat` `bot_name`); `project_dir` is the
 /// ccteam-managed project root.

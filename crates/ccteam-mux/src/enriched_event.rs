@@ -86,7 +86,6 @@ pub enum EventKind {
     ToolCallCompleted,
     UserPromptSubmitted,
     AssistantMessageComplete,
-    TurnStarted,
     TurnDone,
     PlanPending,
     SessionReset,
@@ -99,6 +98,11 @@ pub enum EventKind {
     Idle,
     /// Process exited (P3) — process-level, no enrichment.
     ProcessExited,
+    // NOTE: `TurnStarted` was removed in Slice 4 — the dispatch table mapped
+    // both `TurnStarted` and `UserPromptSubmitted` to `turn/started` /
+    // `user_prompt_submit` on the same notification, which would have
+    // emitted duplicate rows from one occurrence. `UserPromptSubmitted` is
+    // the canonical kind; `TurnStarted` had no producer or consumer.
 }
 
 /// The vendor whose channels feed a given occurrence. Determines which
@@ -146,9 +150,6 @@ pub fn enrichment_source(kind: EventKind, vendor: Vendor) -> EnrichmentSource {
         (AssistantMessageComplete, Claude) => ClaudeHook("stop"),
         (AssistantMessageComplete, Codex) => CodexJsonRpc("item/agentMessage/delta"),
 
-        (TurnStarted, Claude) => ClaudeHook("user_prompt_submit"),
-        (TurnStarted, Codex) => CodexJsonRpc("turn/started"),
-
         (TurnDone, Claude) => ClaudeHook("stop"),
         (TurnDone, Codex) => CodexJsonRpc("turn/completed"),
 
@@ -179,6 +180,17 @@ pub struct BaseEvent {
     pub sequence_id: u64,
     pub timestamp: SystemTime,
     pub payload: BasePayload,
+    /// Slice 4 — optional **identity** for cohort-based pairing.
+    ///
+    /// For `ToolCallStarted` Claude this is the tool name captured from
+    /// the pane regex `^●\s+(\w+)\(`; for `ToolCallCompleted` the pane
+    /// regex `^\s*⎿` captures nothing, so identity is `None` on the base
+    /// side and cohort partitioning happens via the enrichment-side
+    /// `tool_name`. For every other kind it is `None`. Identity carries
+    /// into the merger's pairing predicate so two parallel tool calls of
+    /// different tools never cross-pair (see
+    /// `docs/versions/v0-8-rmux/w-slice-4-identity-and-codex.md`).
+    pub identity: Option<String>,
 }
 
 /// The lossless (P1) enrichment — a Claude hook event or Codex JSON-RPC
@@ -191,6 +203,11 @@ pub struct EnrichmentEvent {
     pub sequence_id: u64,
     pub timestamp: SystemTime,
     pub payload: EnrichmentPayload,
+    /// Slice 4 — see [`BaseEvent::identity`]. For tool-call hooks this
+    /// is `Some(tool_name)` extracted from the hook payload by the
+    /// consumer-side `identity_for(...)` helper. `None` preserves the
+    /// pre-Slice-4 per-kind FIFO behaviour exactly.
+    pub identity: Option<String>,
 }
 
 /// Lossy base detail. The captured regex group / process detail; the
@@ -356,9 +373,17 @@ impl EventMerger {
             let buffers = guard.sessions.entry(base.session_id.clone()).or_default();
 
             // Did an enrichment already arrive (EnrichmentOnly path)?
-            // Pair now and self-suppress the would-be lossy fallback.
+            // Pair now and self-suppress the would-be lossy fallback. The
+            // predicate matches on `(kind, identity, sequence_id)` —
+            // identity is the Slice-4 cohort key so parallel tool calls
+            // of different tools never cross-pair across the
+            // pending_enrichment / recent_base ring buffers (defence in
+            // depth; `SeqState` already partitions by identity at the
+            // mint layer in `typed_event_tap.rs`).
             if let Some(pos) = buffers.pending_enrichment.iter().position(|p| {
-                p.enrich.kind == base.kind && p.enrich.sequence_id == base.sequence_id
+                p.enrich.kind == base.kind
+                    && p.enrich.identity == base.identity
+                    && p.enrich.sequence_id == base.sequence_id
             }) {
                 let parked = buffers
                     .pending_enrichment
@@ -398,35 +423,39 @@ impl EventMerger {
 
         // Deferred grace-expiry: sleep, then emit BaseLossy unless the
         // slot was consumed by a pairing enrichment meanwhile. Honors
-        // the mock clock under `tokio::time::pause()`.
+        // the mock clock under `tokio::time::pause()`. Matches on
+        // `(kind, identity, sequence_id)` per the Slice-4 cohort key.
         let inner = self.inner.clone();
         let key = base.session_id.clone();
         let kind = base.kind;
         let seq = base.sequence_id;
+        let identity = base.identity.clone();
         tokio::spawn(async move {
             tokio::time::sleep(grace).await;
             let mut guard = inner.lock().await;
-            let send =
-                if let Some(buffers) = guard.sessions.get_mut(&key) {
-                    if let Some(pos) = buffers.recent_base.iter().position(|p| {
-                        p.base.kind == kind && p.base.sequence_id == seq && !p.consumed
-                    }) {
-                        let parked = buffers.recent_base.remove(pos).expect("pos in range");
-                        Some(EnrichedEvent {
-                            session_id: parked.base.session_id.clone(),
-                            kind: parked.base.kind,
-                            timestamp: parked.base.timestamp,
-                            sequence_id: parked.base.sequence_id,
-                            base: Some(parked.base.payload.clone()),
-                            enrichment: None,
-                            outcome: MergeOutcome::BaseLossy,
-                        })
-                    } else {
-                        None
-                    }
+            let send = if let Some(buffers) = guard.sessions.get_mut(&key) {
+                if let Some(pos) = buffers.recent_base.iter().position(|p| {
+                    p.base.kind == kind
+                        && p.base.identity == identity
+                        && p.base.sequence_id == seq
+                        && !p.consumed
+                }) {
+                    let parked = buffers.recent_base.remove(pos).expect("pos in range");
+                    Some(EnrichedEvent {
+                        session_id: parked.base.session_id.clone(),
+                        kind: parked.base.kind,
+                        timestamp: parked.base.timestamp,
+                        sequence_id: parked.base.sequence_id,
+                        base: Some(parked.base.payload.clone()),
+                        enrichment: None,
+                        outcome: MergeOutcome::BaseLossy,
+                    })
                 } else {
                     None
-                };
+                }
+            } else {
+                None
+            };
             if let Some(ev) = send {
                 let _ = guard.out.send(ev);
             }
@@ -435,9 +464,9 @@ impl EventMerger {
 
     /// Ingest a lossless P1 enrichment.
     ///
-    /// - matching parked base for this `(kind, sequence_id)` → pair now,
-    ///   emit `Paired`, mark the base consumed so its grace task
-    ///   self-suppresses.
+    /// - matching parked base for this `(kind, identity, sequence_id)` →
+    ///   pair now, emit `Paired`, mark the base consumed so its grace
+    ///   task self-suppresses.
     /// - else emit `EnrichmentOnly` immediately and park the enrichment
     ///   so a late base self-suppresses.
     pub async fn process_enrichment(&self, enrich: EnrichmentEvent) {
@@ -446,7 +475,10 @@ impl EventMerger {
         let buffers = guard.sessions.entry(enrich.session_id.clone()).or_default();
 
         if let Some(pos) = buffers.recent_base.iter().position(|p| {
-            p.base.kind == enrich.kind && p.base.sequence_id == enrich.sequence_id && !p.consumed
+            p.base.kind == enrich.kind
+                && p.base.identity == enrich.identity
+                && p.base.sequence_id == enrich.sequence_id
+                && !p.consumed
         }) {
             // Pair: mark consumed (the grace task will skip it) and
             // remove the parked base now that it is resolved.
@@ -523,15 +555,14 @@ mod tests {
     #[test]
     fn dispatch_table_covers_all_base_kinds_for_both_vendors() {
         use EventKind::*;
-        // The 9 enriched kinds (10th "TurnStarted" overlaps prompt) must
-        // have a P1 source for both vendors; the 4 process/surface kinds
-        // map to None.
+        // 8 enriched kinds must have a P1 source for both vendors; the 4
+        // process/surface kinds map to None. (Slice 4 removed `TurnStarted`
+        // — it shared its source with `UserPromptSubmitted`.)
         let enriched = [
             ToolCallStarted,
             ToolCallCompleted,
             UserPromptSubmitted,
             AssistantMessageComplete,
-            TurnStarted,
             TurnDone,
             PlanPending,
             SessionReset,
@@ -564,6 +595,7 @@ mod tests {
             vendor: Vendor::Claude,
             sequence_id: 0,
             timestamp: SystemTime::now(),
+            identity: None,
             payload: BasePayload {
                 captured: "rate limit".into(),
             },

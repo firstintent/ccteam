@@ -11,23 +11,25 @@
 | HEAD | 见 `git log -1`(本 doc 写于 `562ea6b` 之后)|
 | worktree | `/tmp/ccteam-rmux`(target 暖)|
 | 默认 backend | **rmux**(库级单一 SoT — `from_env`/`default_backend`/`backend_kind_from_env`;仅显式 `CCTEAM_MUX_BACKEND=tmux` opt-out;unset/empty/typo → rmux)|
-| 基线 | **1685 / 0**(`cargo test --workspace --locked --no-fail-fast --exclude ccteam-web`,clean run)· clippy 0 · fmt clean。本 WSL2 宿主在并发负载下偶现 1 flake = `daemon_dm_no_at_mention_auto_routes_to_single_bot`(inotify/timing env-race,`fs.inotify.max_user_instances=128` 易触顶,非回归,空载/CI 必过)|
+| 基线 | **1716 / 0**(`cargo test --workspace --locked --no-fail-fast --exclude ccteam-web`,clean run)· clippy 0 · fmt clean。本 WSL2 宿主在并发负载下偶现 1 flake = `daemon_wires_mock_channel_to_supervisor_inbox` / `daemon_dm_*`(inotify/timing env-race,`fs.inotify.max_user_instances=128` 易触顶,非回归,空载/CI 必过)|
 
 ## What's DONE in 0.8
 
 - **W0–W7 rmux 集成**:MuxBackend trait + Tmux/Rmux/InProc 三 backend;单 binary daemon(`ccteam --__internal-daemon` re-exec + `RMUX_SDK_DAEMON_BINARY`);全 mode 走 trait;exit-empty=off + dead-handle reconnect;6 Codex wire 修复。
 - **flip-default(库级)**:rmux 是 env-unset 默认,tmux 是 opt-out。21 个 tmux-fixture adapter 测试 + run_peek 单测 pin 到 tmux;positive rmux-adapter 覆盖(`claude_bg_rmux_adapter_test`)。**rmux 与 tmux 并存**:tmux backend + 全部 fixture 完整保留。
-- **EnrichedEvent 类型化事件管线(Slice 1 + 2 + 3,flag-gated)** — register_pattern → PatternMatched → `TypedEventTap` → `EventMerger` → consumer(`typed_events.rs`)→ progress.jsonl:
+- **EnrichedEvent 类型化事件管线(Slice 1 + 2 + 3 + 4,flag-gated)** — register_pattern → PatternMatched → `TypedEventTap` → `EventMerger` → consumer(`typed_events.rs`)→ progress.jsonl:
   - **Slice 1**(`CCTEAM_TYPED_EVENTS=1`):no-enrichment kinds(rate_limit / context_overflow / idle / process_exited)→ `typed_event` 行。
   - **Slice 2**(再加 `CCTEAM_HOOK_VIA_DAEMON=1`):session→TapHandle registry(`Arc::ptr_eq`-guarded)把 W6 HookSink 的 Claude `Stop` hook 路由进对应 session 的 tap 作 `TurnDone` enrichment;`turn_done` pane 模式命中但 grace 窗口内无 hook → `BaseLossy` → `merger_lossy_partial` 行(可靠性兜底);`Paired` 抑制。
-  - **Slice 3**(同 Slice 2 flag):`SeqState` 升级为 **time-windowed FIFO**(`PendingSlot { seq, arrived_at: tokio::time::Instant }` + `drop_stale` on opposite queue),消除 multi-in-flight cascade mis-pair;`enrich_kind_for_chat_action` 加映射 `("chat-progress","user-prompt") → UserPromptSubmitted` / `("chat-progress","tool-use") → ToolCallCompleted`。**`pre-tool-use` 不接线**(installer table at `claude_tui.rs:126-135` 不发 PreToolUse;改装表 = 新 finding,见 §未覆盖)。详 `w-slice-3-multi-in-flight-pairing.md`。
-  - 默认路径(两 flag 关)完全不变 → baseline 不受影响。CI:`rmux-smoke.sh` 跑全部 `#[ignore]` 端到端测试(roundtrip + adapter + typed-event pipeline,含 Slice 3 四个 multi-in-flight 场景)── 本 WSL2 宿主跑全 11 项 ignored 测试 100% 绿(typed-event pipeline 7/7 含 Slice 3 四项 ~26s)。
+  - **Slice 3**(同 Slice 2 flag):`SeqState` 升级为 **time-windowed FIFO**(`PendingSlot { seq, arrived_at: tokio::time::Instant }` + `drop_stale` on opposite queue),消除 multi-in-flight cascade mis-pair;`enrich_kind_for_chat_action` 加 `tool-use` / `user-prompt` 映射。
+  - **Slice 4**(同 Slice 2 flag):**identity-based cohort pairing** —`SeqState` 的 pending FIFO 由 `EventKind` 升级为 `(EventKind, Option<String>)` 复合 key,`BaseEvent` / `EnrichmentEvent` / `RawEnrichment` 加 `identity: Option<String>` 字段;`identity_for(kind, payload_json)` 从 hook payload 抽 `tool_name`。两个并发不同工具(`Edit` + `Read`)永不 cross-pair。同时 ship `pre-tool-use` 接线(`ToolCallStarted` mapping + `chat_tool_call_started` row)+ **Codex vendor parity**(新模块 `codex_typed_events.rs`:订阅 `CodexJsonRpcClient::subscribe()` 直接写 `progress.jsonl`,**绕过 merger** 以免无 base 永挂 `pending_enrichment` 累积;mode-3 only,mode-2 codex-exec 留到后续 slice)。另删除未使用的 `EventKind::TurnStarted`(与 `UserPromptSubmitted` 同源)。详 `w-slice-4-identity-and-codex.md`。
+  - 默认路径(两 flag 关)完全不变 → baseline 不受影响。CI:`rmux-smoke.sh` 跑全部 `#[ignore]` 端到端测试(roundtrip + adapter + typed-event pipeline + Codex producer 模拟)。
 
 ## Remaining
 
 - **macOS / Windows CI 绿 → 归 0.8.1**(硬件外因)。CI matrix 已接线(`rmux-smoke` on `[ubuntu-latest, macos-latest]`),push 即跑;本 Linux sandbox 无 Darwin/Windows runner。这是 merge-to-main 门槛(+ real-claude burn-in),非本环境任务。
-- **identity-based pairing for `ToolCallCompleted`(within-grace mis-pair fix)**:当前 FIFO + drop-stale 在 *grace 窗口内* 仍可能 mis-pair(罕见,详 design doc §"Known within-grace races");解决方案 = 在 base 和 enrich 两侧携带 tool_name + 按 identity 配对。Slice 3 OOS,延 V0.9 或 0.8.1。
-- **`pre-tool-use` 接线**(`ToolCallStarted` mapping):纯增量 finding(table at `claude_tui.rs:126` 加一行 + `chat_progress.rs:54` 加一个 match arm + 现网项目重跑 installer)。无紧迫需求,延后。
+- **within-grace identity mis-pair(同工具并发)**:Slice 4 消除了 cross-tool mis-pair;**same-tool** 并发(两个并行 Edit)在 grace 窗口内仍退化为 FIFO,可能 mis-pair。需要 `tool_use_id`-based pairing(等 Claude hook stdin schema 实地探测确认 `tool_use_id` 存在;repo 内无 first-hand 证据)。延 V0.8.1 探测后。
+- **Codex 模式 2(`codex exec --json`)接管线 + Codex 基线 pattern wired**:V0.8 Slice 4 只接 mode-3 app-server enrichment 路径;mode-2 JSONL stdout + 基线 pane patterns 接 tap 是后续 slice。
+- **`turn/plan/updated` → `PlanPending`** 语义在 Codex / Claude 不一致(Codex 是 `update_plan` todo-tool,Claude 是 plan-mode HITL);延后专项调和。
 
 ## 关键设计 / 红线
 
@@ -48,7 +50,7 @@
 ```
 后续补充:`要在0.8版本完全跑通rmux，并且rmux和tmux并存。不要放到0.9，本机无法实现的放到0.8.1中搞定`。
 
-⚠️ 字面「100%」在 Linux sandbox 不可完全满足(macOS/Windows 生产验证需硬件 → 归 0.8.1)。**所有可在本环境验证的项已完成**:flip-default + rmux/tmux 并存 + EnrichedEvent 管线(Slice 1+2)。
+⚠️ 字面「100%」在 Linux sandbox 不可完全满足(macOS/Windows 生产验证需硬件 → 归 0.8.1)。**所有可在本环境验证的项已完成**:flip-default + rmux/tmux 并存 + EnrichedEvent 管线(Slice 1+2+3+4 含 identity pairing + Codex vendor parity)。
 
 ## 注意:`/goal` 是 session-scoped
 
