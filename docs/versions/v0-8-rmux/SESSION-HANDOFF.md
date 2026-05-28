@@ -22,7 +22,7 @@
   - **Slice 2**(再加 `CCTEAM_HOOK_VIA_DAEMON=1`):session→TapHandle registry(`Arc::ptr_eq`-guarded)把 W6 HookSink 的 Claude `Stop` hook 路由进对应 session 的 tap 作 `TurnDone` enrichment;`turn_done` pane 模式命中但 grace 窗口内无 hook → `BaseLossy` → `merger_lossy_partial` 行(可靠性兜底);`Paired` 抑制。
   - **Slice 3**(同 Slice 2 flag):`SeqState` 升级为 **time-windowed FIFO**(`PendingSlot { seq, arrived_at: tokio::time::Instant }` + `drop_stale` on opposite queue),消除 multi-in-flight cascade mis-pair;`enrich_kind_for_chat_action` 加 `tool-use` / `user-prompt` 映射。
   - **Slice 4**(同 Slice 2 flag):**identity-based cohort pairing** —`SeqState` 的 pending FIFO 由 `EventKind` 升级为 `(EventKind, Option<String>)` 复合 key,`BaseEvent` / `EnrichmentEvent` / `RawEnrichment` 加 `identity: Option<String>` 字段;`identity_for(kind, payload_json)` 从 hook payload 抽 `tool_name`。两个并发不同工具(`Edit` + `Read`)永不 cross-pair。同时 ship `pre-tool-use` 接线(`ToolCallStarted` mapping + `chat_tool_call_started` row)+ **Codex vendor parity**(新模块 `codex_typed_events.rs`:订阅 `CodexJsonRpcClient::subscribe()` 直接写 `progress.jsonl`,**绕过 merger** 以免无 base 永挂 `pending_enrichment` 累积;mode-3 only,mode-2 codex-exec 留到后续 slice)。另删除未使用的 `EventKind::TurnStarted`(与 `UserPromptSubmitted` 同源)。详 `w-slice-4-identity-and-codex.md`。
-  - 默认路径(两 flag 关)完全不变 → baseline 不受影响。CI:`rmux-smoke.sh` 跑全部 `#[ignore]` 端到端测试(roundtrip + adapter + typed-event pipeline + Codex producer 模拟)。
+  - 默认路径(两 flag 关)完全不变 → baseline 不受影响。CI:`rmux-smoke.sh` 跑 11 项 `#[ignore]` 端到端测试(roundtrip + adapter + typed-event pipeline 含 Slice 3 四项)── 本 WSL2 宿主 100% 绿。Codex producer 走 `tokio::io::duplex` 内存 peer 模拟,作为非-ignored 单元/集成测试在 workspace 跑(6 项,~0.5s)。
 
 ## Remaining
 
