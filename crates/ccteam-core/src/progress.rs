@@ -214,6 +214,29 @@ pub const CHAT_COMPACT_DONE: &str = "chat_compact_done";
 /// surface the hop-loop. Payload: `{role, hop_count, last_bot, ts}`.
 pub const CHAT_HOP_ESCALATE: &str = "chat_hop_escalate";
 
+/// `chat_tool_call_started` — V0.8 Slice 4. Claude Code `PreToolUse` hook
+/// fired inside a mode-3 chat session. Payload: `{role, tool, ts}`. The
+/// `event` string is intentionally distinct from the mode-2
+/// `progress-append` row whose `event:"PreToolUse"` is counted by
+/// `silence_classifier.rs::event_kind` as a `closes_pending` Task-balance
+/// signal — reusing the name here would poison mode-2 silence detection
+/// with mode-3 rows. This row also drives the merger's `ToolCallStarted`
+/// enrichment via `enrich_kind_for_chat_action("chat-progress",
+/// Some("pre-tool-use"))`.
+pub const CHAT_TOOL_CALL_STARTED: &str = "chat_tool_call_started";
+
+/// V0.8 Slice 4 — build a `chat_tool_call_started` event JSON. `tool` is
+/// the `tool_name` field from the Claude Code `PreToolUse` hook stdin
+/// payload (matches `PostToolUse` for downstream pairing).
+pub fn build_chat_tool_call_started_event(role: &str, tool: &str) -> Value {
+    serde_json::json!({
+        "event": CHAT_TOOL_CALL_STARTED,
+        "role": role,
+        "tool": tool,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
 /// Build a `chat_session_started` event JSON. `role` is the bot handle
 /// (`workflow.yaml mode: chat` `bot_name`); `project_dir` is the
 /// ccteam-managed project root.
@@ -530,6 +553,195 @@ pub fn build_plan_timeout_event(plan_id: &str, agent: &str, on_timeout: &str) ->
     })
 }
 
+// ---------------- V0.8 rmux W4-fu Codex app-server notifications ----------------
+//
+// These four events surface Codex-only mode-3 notifications that the
+// W4 `initialize` handshake (`experimentalApi: true`) unlocked. They are
+// **additive observability rows**, deliberately distinct from the F98
+// plan-approval events above:
+//
+// - `codex_plan_updated` is Codex's `update_plan` todo/checklist tool
+//   output (the upstream source itself notes "`update_plan` is a
+//   todo/checklist tool; it is not related to plan-mode updates" —
+//   `references/codex/codex-rs/app-server/src/bespoke_event_handling.rs`).
+//   It is a fire-and-forget streaming progress signal (the analog of
+//   Claude's `TodoWrite` hook output), NOT a HITL pause point — Codex
+//   never awaits a client response after emitting it. The real Codex
+//   HITL approval path is `thread/status/changed → Active{WaitingOnApproval}`
+//   plus server-initiated `item/*/requestApproval` requests, which is a
+//   separate (future) `plan_pending` wiring. Mapping `turn/plan/updated`
+//   onto `plan_pending` would spuriously fire the F98 IM round-trip on
+//   every checklist tick, so we keep it a pure observability event.
+
+/// `codex_plan_updated` — Codex emitted a `turn/plan/updated`
+/// notification (its `update_plan` todo/checklist tool). Payload:
+/// `{thread_id, turn_id, explanation?, plan: [{step, status}], vendor:"codex", ts}`.
+/// `status` is one of `pending` / `inProgress` / `completed` (camelCase
+/// wire enum). Observability only — NOT a HITL approval pause.
+pub const CODEX_PLAN_UPDATED: &str = "codex_plan_updated";
+
+/// `codex_token_usage` — Codex emitted a `thread/tokenUsage/updated`
+/// notification (mid-turn token accounting). Payload:
+/// `{thread_id, turn_id, total:{...}, last:{...}, model_context_window?, vendor:"codex", ts}`.
+/// This is **not** a cost-ledger write — the authoritative cost row is
+/// still the `agent_done` written at `turn/completed`. This event exists
+/// so a budget tripwire can fire mid-turn before a runaway turn completes.
+pub const CODEX_TOKEN_USAGE: &str = "codex_token_usage";
+
+/// `codex_thread_status` — Codex emitted a `thread/status/changed`
+/// notification. Payload:
+/// `{thread_id, status, active_flags:[...], vendor:"codex", ts}`.
+/// `status` is `not_loaded` / `idle` / `system_error` / `active` (the
+/// internally-tagged `type` discriminator, snake_cased here);
+/// `active_flags` carries `waiting_on_approval` / `waiting_on_user_input`
+/// when `status == active`. The `waiting_on_approval` flag is the
+/// authoritative "this Codex thread is blocked on a human" signal that a
+/// future `mode: human-approval` Codex adapter will combine with the
+/// server-initiated `item/*/requestApproval` handlers.
+pub const CODEX_THREAD_STATUS: &str = "codex_thread_status";
+
+/// `codex_rate_limit` — Codex emitted an `account/rateLimits/updated`
+/// notification (typed rate-limit visibility, replacing TUI scrape).
+/// Payload: `{primary?:{used_percent, window_duration_mins?, resets_at?},
+/// secondary?:{...}, rate_limit_reached_type?, plan_type?, vendor:"codex", ts}`.
+/// Feeds the F84 budget-cap escalation surface with typed numbers instead
+/// of a string-matched TUI error.
+pub const CODEX_RATE_LIMIT: &str = "codex_rate_limit";
+
+/// True if `kind` is one of the V0.8 Codex app-server notification event
+/// names.
+pub fn is_codex_notification_event(kind: &str) -> bool {
+    matches!(
+        kind,
+        CODEX_PLAN_UPDATED | CODEX_TOKEN_USAGE | CODEX_THREAD_STATUS | CODEX_RATE_LIMIT
+    )
+}
+
+/// Build a `codex_plan_updated` event JSON. `plan` is the verbatim
+/// `Vec<TurnPlanStep>` array from the wire (`[{step, status}, ...]`).
+pub fn build_codex_plan_updated_event(
+    thread_id: &str,
+    turn_id: &str,
+    explanation: Option<&str>,
+    plan: Value,
+) -> Value {
+    let mut v = serde_json::json!({
+        "event": CODEX_PLAN_UPDATED,
+        "vendor": "codex",
+        "thread_id": thread_id,
+        "turn_id": turn_id,
+        "plan": plan,
+        "ts": Utc::now().to_rfc3339(),
+    });
+    if let Some(e) = explanation {
+        v.as_object_mut()
+            .unwrap()
+            .insert("explanation".to_string(), Value::String(e.to_string()));
+    }
+    v
+}
+
+/// Build a `codex_token_usage` event JSON. `total` / `last` are the
+/// verbatim `TokenUsageBreakdown` objects from the wire.
+pub fn build_codex_token_usage_event(
+    thread_id: &str,
+    turn_id: &str,
+    total: Value,
+    last: Value,
+    model_context_window: Option<i64>,
+) -> Value {
+    let mut v = serde_json::json!({
+        "event": CODEX_TOKEN_USAGE,
+        "vendor": "codex",
+        "thread_id": thread_id,
+        "turn_id": turn_id,
+        "total": total,
+        "last": last,
+        "ts": Utc::now().to_rfc3339(),
+    });
+    if let Some(w) = model_context_window {
+        v.as_object_mut()
+            .unwrap()
+            .insert("model_context_window".to_string(), Value::Number(w.into()));
+    }
+    v
+}
+
+/// Build a `codex_thread_status` event JSON. `status` is the snake_cased
+/// thread-status discriminator; `active_flags` is the (possibly empty)
+/// list of snake_cased active flags.
+pub fn build_codex_thread_status_event(
+    thread_id: &str,
+    status: &str,
+    active_flags: Vec<String>,
+) -> Value {
+    serde_json::json!({
+        "event": CODEX_THREAD_STATUS,
+        "vendor": "codex",
+        "thread_id": thread_id,
+        "status": status,
+        "active_flags": active_flags,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
+/// Build a `codex_rate_limit` event JSON. `snapshot` is the verbatim
+/// `RateLimitSnapshot` object from the wire (camelCase keys preserved).
+pub fn build_codex_rate_limit_event(snapshot: Value) -> Value {
+    serde_json::json!({
+        "event": CODEX_RATE_LIMIT,
+        "vendor": "codex",
+        "snapshot": snapshot,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
+/// Build a `typed_event` observability row from the rmux typed-event
+/// pipeline. These surface daemon-side pattern detections (rate-limit /
+/// context-overflow / idle / process-exit) merged through the
+/// EnrichedEvent merger. They exist for **visibility only** — NOTHING
+/// currently acts on them. `event_kind` is a stable snake_case kind
+/// string, `captured` the lossy P2/P3 detail, `session` the mux session
+/// identity.
+pub fn build_typed_event_event(
+    vendor: &str,
+    event_kind: &str,
+    captured: &str,
+    session: &str,
+) -> Value {
+    serde_json::json!({
+        "kind": "typed_event",
+        "vendor": vendor,
+        "event_kind": event_kind,
+        "captured": captured,
+        "session": session,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
+/// Build a `merger_lossy_partial` row from the rmux typed-event pipeline
+/// (V0.8 Slice 2). Emitted when a lossy P2 pattern fired (e.g. a `turn_done`
+/// pane match) but the lossless P1 enrichment (the Claude `Stop` hook) never
+/// arrived within the merger's grace window — i.e. a turn whose authoritative
+/// hook was lost (crashed hook subprocess, etc.). For **visibility only** —
+/// nothing acts on these. Same field layout as [`build_typed_event_event`]
+/// (parse either with one struct, branch on `kind`).
+pub fn build_merger_lossy_partial_event(
+    vendor: &str,
+    event_kind: &str,
+    captured: &str,
+    session: &str,
+) -> Value {
+    serde_json::json!({
+        "kind": "merger_lossy_partial",
+        "vendor": vendor,
+        "event_kind": event_kind,
+        "captured": captured,
+        "session": session,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
 /// True if `kind` is one of the chat-mode event names (F108 / F118 /
 /// F192c / F195 / F196).
 pub fn is_chat_event(kind: &str) -> bool {
@@ -814,6 +1026,79 @@ pub fn open_agent_spawns(events: &[Value]) -> Vec<(String, Option<String>, Strin
         .into_iter()
         .filter(|(sid, _)| !closed.contains(sid))
         .map(|(sid, (job_id, role))| (sid, job_id, role))
+        .collect()
+}
+
+/// V0.8 W3 follow-up — one open (un-`agent_done`-ed) `agent_spawn` row
+/// with the extra mode-2-via-mux markers the orchestrator needs to pick
+/// the right liveness probe. A sibling of [`open_agent_spawns`] (kept
+/// stable for `queries.rs`) so callers that don't care about mux keep
+/// the simpler triple.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenAgentSpawn {
+    pub session_id: String,
+    pub job_id: Option<String>,
+    pub role: String,
+    /// `true` when the `agent_spawn` row was written by a
+    /// `CCTEAM_CLAUDE_BG_VIA_MUX=1` foreground-in-mux spawn — its
+    /// liveness lives in the mux session lifecycle, NOT in
+    /// `~/.claude/jobs/<id>/state.json`.
+    pub via_mux: bool,
+    /// Mux session name to probe via `MuxBackend::exists` when
+    /// `via_mux` is set. `None` for legacy `--bg` + codex rows.
+    pub mux_session: Option<String>,
+}
+
+/// V0.8 W3 follow-up — like [`open_agent_spawns`] but also surfaces the
+/// `via_mux` / `mux_session` markers persisted on the `agent_spawn`
+/// event so the orchestrator's stale-spawn pass can route mode-2
+/// foreground-in-mux spawns through the mux session lifecycle instead
+/// of the F80 `state.json` probe (which never exists for them).
+pub fn open_agent_spawns_detailed(events: &[Value]) -> Vec<OpenAgentSpawn> {
+    let mut spawns: BTreeMap<String, OpenAgentSpawn> = BTreeMap::new();
+    let mut closed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for event in events {
+        let kind = event.get("event").and_then(|s| s.as_str()).unwrap_or("");
+        let sid = match event.get("session_id").and_then(|s| s.as_str()) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => continue,
+        };
+        match kind {
+            "agent_spawn" => {
+                let job_id = event
+                    .get("job_id")
+                    .and_then(|s| s.as_str())
+                    .map(String::from);
+                let role = event
+                    .get("role")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let via_mux = event
+                    .get("via_mux")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let mux_session = event
+                    .get("mux_session")
+                    .and_then(|s| s.as_str())
+                    .map(String::from);
+                spawns.entry(sid.clone()).or_insert(OpenAgentSpawn {
+                    session_id: sid,
+                    job_id,
+                    role,
+                    via_mux,
+                    mux_session,
+                });
+            }
+            "agent_done" => {
+                closed.insert(sid);
+            }
+            _ => {}
+        }
+    }
+    spawns
+        .into_values()
+        .filter(|s| !closed.contains(&s.session_id))
         .collect()
 }
 

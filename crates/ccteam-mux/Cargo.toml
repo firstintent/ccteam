@@ -1,0 +1,41 @@
+[package]
+name = "ccteam-mux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ccteam mux abstraction — MuxBackend trait + tmux/inproc impls. V0.8 W1 wraps the existing tmux CLI; V0.8 W2+ adds RmuxBackend."
+
+[dependencies]
+# V0.8 W0 — rmux is the future unified-mux execution surface. Trait
+# definitions land in W1; the SDK + transport are pinned so semver
+# drift is caught by `rmux_types_compile_link`.
+rmux-sdk = { workspace = true }
+rmux-client = { workspace = true }
+rmux-server = { workspace = true }
+rmux-proto = { workspace = true }
+
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+regex = { workspace = true }
+# V0.8 W6 — hook_sink frames a typed `HookEvent` as length-prefixed
+# JSON over the ccteam-owned hook.sock (Option C).
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+# W2b — the refcounted `tmux pipe-pane` FIFO relay ported out of
+# `ccteam-web::pty` needs `mkfifo` + a 0600 `Mode`. `fs` is the only
+# feature required.
+nix = { version = "0.29", default-features = false, features = ["fs"] }
+
+[dev-dependencies]
+# Bring tokio test runtime helpers into the smoke test. The workspace
+# tokio feature set already includes `macros` / `rt-multi-thread` via
+# `["full"]` — but NOT `test-util`, which the W4 merger tests need for
+# `tokio::time::{pause, advance}` (deterministic GRACE_MS testing with
+# no real sleeps). Enable it here as an additive dev-only feature.
+tokio = { workspace = true, features = ["test-util"] }
+tempfile = "3"

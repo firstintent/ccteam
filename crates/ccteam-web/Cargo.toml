@@ -26,6 +26,10 @@ ccteam-core.workspace = true
 # V0.6.1 F139 — share the hook dispatch with the CLI so `POST
 # /internal/hook/...` runs the same code as `ccteam internal hook ...`.
 ccteam-hooks.workspace = true
+# V0.8 W1 — MuxBackend trait for pty_ws + pane_snapshot routes.
+# pty.rs::PtyRegistry still calls `tmux pipe-pane` directly; that port
+# into `TmuxBackend::subscribe` lands in W2.
+ccteam-mux.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 # V0.5.0 F96 — resolve `~/.claude/` root (Anthropic Agent Teams SoT).

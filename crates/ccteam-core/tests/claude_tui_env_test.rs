@@ -63,6 +63,7 @@ fn show_env(session: &str, key: &str) -> Option<String> {
 #[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn fresh_spawn_injects_chat_role_and_slug_env() {
+    std::env::set_var("CCTEAM_MUX_BACKEND", "tmux");
     if !ccteam_core::tmux::tmux_available() {
         eprintln!("skip: tmux not available");
         return;

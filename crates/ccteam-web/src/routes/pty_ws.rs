@@ -54,9 +54,9 @@ use axum::{
     Router,
 };
 use ccteam_core::{ProjectState, TeamKind};
+use ccteam_mux::{MuxBackend, MuxSessionId, TmuxBackend};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use tokio::process::Command;
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::pty::Subscription;
@@ -219,42 +219,28 @@ async fn relay(socket: WebSocket, mut sub: Subscription, tmux_session: Arc<str>)
 }
 
 async fn send_keys(tmux_session: &str, bytes: &[u8]) -> anyhow::Result<()> {
-    // tmux send-keys takes the literal byte string after `-l`. We pass
-    // it as a single argument; on systems where bytes are not valid
-    // UTF-8 this still works because std::process::Command preserves
-    // OsStr-level bytes via `OsStr::from_bytes` on Unix. xterm.js sends
-    // UTF-8 in practice, so the straightforward conversion is fine.
+    // xterm.js sends UTF-8 in practice; non-UTF-8 input is rejected
+    // because the underlying tmux argv path does not survive
+    // OsStr-level byte injection cleanly across all setups.
     let s = std::str::from_utf8(bytes).map_err(|_| {
         anyhow::anyhow!("send-keys: non-UTF-8 input rejected (would corrupt tmux argv)")
     })?;
-    let target = format!("{tmux_session}:0.0");
-    let status = Command::new("tmux")
-        .args(["send-keys", "-t", &target, "-l", "--", s])
-        .status()
-        .await?;
-    if !status.success() {
-        anyhow::bail!("tmux send-keys exited {status}");
-    }
+    // V0.8 W1 — route through the MuxBackend trait. Note `TmuxBackend`
+    // currently targets bare session-name (`-t <name>`) rather than the
+    // legacy `<name>:0.0` form. The change is benign for CCTEAM-managed
+    // single-window-single-pane sessions and removes an audit §4-B
+    // base-index landmine.
+    let backend = TmuxBackend::new();
+    let id = MuxSessionId::new(tmux_session.to_string());
+    backend.send_text(&id, s).await?;
     Ok(())
 }
 
 async fn resize_window(tmux_session: &str, cols: u16, rows: u16) -> anyhow::Result<()> {
-    let status = Command::new("tmux")
-        .args([
-            "resize-window",
-            "-t",
-            tmux_session,
-            "-x",
-            &cols.to_string(),
-            "-y",
-            &rows.to_string(),
-        ])
-        .status()
-        .await?;
-    if !status.success() {
-        anyhow::bail!("tmux resize-window exited {status}");
-    }
-    Ok(())
+    // V0.8 W1 — route through the MuxBackend trait.
+    let backend = TmuxBackend::new();
+    let id = MuxSessionId::new(tmux_session.to_string());
+    backend.resize(&id, cols, rows).await
 }
 
 #[cfg(test)]

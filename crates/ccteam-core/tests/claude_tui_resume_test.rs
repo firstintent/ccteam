@@ -212,6 +212,7 @@ fn chat_session_id_name_uses_canonical_format() {
 #[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn fresh_spawn_argv_contains_name_flag() {
+    std::env::set_var("CCTEAM_MUX_BACKEND", "tmux");
     if !ccteam_core::tmux::tmux_available() {
         eprintln!("skip: tmux not available");
         return;
@@ -268,6 +269,7 @@ async fn fresh_spawn_argv_contains_name_flag() {
 #[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn recreate_dead_pane_spawn_argv_contains_resume_flag() {
+    std::env::set_var("CCTEAM_MUX_BACKEND", "tmux");
     if !ccteam_core::tmux::tmux_available() {
         eprintln!("skip: tmux not available");
         return;
@@ -327,6 +329,7 @@ async fn recreate_dead_pane_spawn_argv_contains_resume_flag() {
 #[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn resume_failure_falls_back_to_fresh_name() {
+    std::env::set_var("CCTEAM_MUX_BACKEND", "tmux");
     if !ccteam_core::tmux::tmux_available() {
         eprintln!("skip: tmux not available");
         return;
@@ -414,6 +417,7 @@ async fn resume_failure_falls_back_to_fresh_name() {
 #[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn alive_reattach_does_not_spawn_new_claude() {
+    std::env::set_var("CCTEAM_MUX_BACKEND", "tmux");
     if !ccteam_core::tmux::tmux_available() {
         eprintln!("skip: tmux not available");
         return;
@@ -481,6 +485,7 @@ async fn alive_reattach_does_not_spawn_new_claude() {
 #[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn cwd_collision_two_roles_distinct_names() {
+    std::env::set_var("CCTEAM_MUX_BACKEND", "tmux");
     if !ccteam_core::tmux::tmux_available() {
         eprintln!("skip: tmux not available");
         return;
@@ -553,6 +558,7 @@ async fn cwd_collision_two_roles_distinct_names() {
 #[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn fresh_spawn_creates_turns_mirror_dir_for_f118() {
+    std::env::set_var("CCTEAM_MUX_BACKEND", "tmux");
     if !ccteam_core::tmux::tmux_available() {
         eprintln!("skip: tmux not available");
         return;
@@ -601,6 +607,7 @@ async fn fresh_spawn_creates_turns_mirror_dir_for_f118() {
 #[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn daemon_restart_uses_resume_route() {
+    std::env::set_var("CCTEAM_MUX_BACKEND", "tmux");
     if !ccteam_core::tmux::tmux_available() {
         eprintln!("skip: tmux not available");
         return;

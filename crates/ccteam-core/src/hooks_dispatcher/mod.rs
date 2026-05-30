@@ -28,6 +28,37 @@ use crate::CcteamPaths;
 /// fallback behaviour.
 pub const HOOK_DISPATCHER_SH: &str = include_str!("hook.sh");
 
+/// V0.8 rmux W6 — env flag that opts a host into the daemon-bus hook
+/// reroute (Option C: hook subprocess → `~/.ccteam/run/hook.sock` →
+/// orchestrator single-writer). When `CCTEAM_HOOK_VIA_DAEMON=1`,
+/// [`ensure_chat_hooks_installed`](crate::execution::claude_tui::ensure_chat_hooks_installed)
+/// generates hook commands that call `ccteam mux hook-emit ...` and the
+/// orchestrator (`ccteam start`) binds a [`ccteam_mux::HookSink`] to
+/// consume them.
+pub const HOOK_VIA_DAEMON_ENV: &str = "CCTEAM_HOOK_VIA_DAEMON";
+
+/// V0.8 rmux W6 — single source of truth for the daemon-bus hook
+/// reroute opt-in. Returns `true` ONLY when `CCTEAM_HOOK_VIA_DAEMON=1`.
+///
+/// Read at two points that MUST agree: the install-time branch in
+/// `ensure_chat_hooks_installed` (which hook command string to write
+/// into `.claude/settings.json`) and the sink-bind decision in
+/// `ccteam start` (whether to bind the `hook.sock` listener). Sharing
+/// this helper guarantees they never drift.
+///
+/// NOTE: this reads the env of the *current* process. The flag must be
+/// set in the operator's shell when `ccteam start` runs (and when
+/// `ccteam init` / `ccteam doctor` install the hooks); it is NOT
+/// auto-propagated into spawned tmux sessions. `MuxSessionSpec::env`
+/// seeds the chat session's env, not the orchestrator's own — so the
+/// orchestrator only binds the sink if the operator launched `ccteam
+/// start` with the flag set.
+pub fn hook_via_daemon_enabled() -> bool {
+    std::env::var(HOOK_VIA_DAEMON_ENV)
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
 /// Outcome of one [`install_hooks`] call. The caller renders these to
 /// the operator (e.g. via `ccteam doctor --install-hooks`).
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -88,7 +88,13 @@ impl Drop for EnvGuard {
     }
 }
 
+// `#[serial]` because this asserts the DEFAULT (`claude --bg`) path,
+// which requires `CCTEAM_CLAUDE_BG_VIA_MUX` UNSET. The via_mux tests
+// below set that env var process-globally; without serialization a
+// concurrent via_mux test flips this test onto the foreground-in-mux
+// path and the `tmux_session`/`identity` asserts fail intermittently.
 #[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
 async fn claude_bg_start_thread_parses_backgrounded_marker() {
     // Build a fake `claude` script that prints the `backgrounded ·
     // <id>` marker on stdout — same fixture shape V0.4.0 F61 used.
@@ -200,6 +206,182 @@ async fn claude_bg_submit_turn_synthesises_turn_id() {
         .await
         .expect("synthetic ok");
     assert_eq!(tid.0, "bg-abc12345");
+}
+
+// ─── V0.8 W3 — opt-in foreground-in-mux bg path ──────────────────────
+//
+// `claude --bg` self-detaches, so mux can't supervise the worker (see
+// `docs/versions/v0-8-rmux/w3-mode2-bg-findings.md`). The W3 deliverable
+// is an opt-in `claude -p --agent` foreground run inside an Ephemeral
+// mux session, gated by `CCTEAM_CLAUDE_BG_VIA_MUX=1`. These tests verify
+// the path is reachable + mints a mux-backed handle, and that
+// `close_thread` routes teardown through the backend.
+
+fn tmux_on_path_bg() -> bool {
+    std::process::Command::new("tmux")
+        .arg("-V")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn claude_bg_via_mux_spawns_ephemeral_session_and_close_reaps_it() {
+    let _mux_guard = EnvGuard::set("CCTEAM_MUX_BACKEND", "tmux");
+    if !tmux_on_path_bg() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    // Fake `claude` that records its argv (so we can assert the Path B
+    // invocation contract: `-p --agent <role> --dangerously-skip-...`)
+    // then sleeps so the mux session sticks around for the exists()
+    // assert before close_thread reaps it. (Real `claude -p` runs the
+    // turn to completion; a sleeper stands in for "process alive in the
+    // pane".)
+    let fake_claude = tmp.path().join("fake-claude");
+    let argv_capture = tmp.path().join("argv-capture");
+    std::fs::write(
+        &fake_claude,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nsleep 30\n",
+            argv_capture.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake_claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let _bin = EnvGuard::set(CLAUDE_BIN_ENV, fake_claude.to_str().unwrap());
+    let _flag = EnvGuard::set("CCTEAM_CLAUDE_BG_VIA_MUX", "1");
+
+    let brief = AgentSpecBrief {
+        role: "tester".into(),
+    };
+    let ctx = SpawnCtx {
+        slug: "muxbg".into(),
+        sid: "claude-9".into(),
+        cwd: tmp.path().to_path_buf(),
+        project_dir: tmp.path().to_path_buf(),
+        extra_args: vec!["do the thing".into()],
+        model_id: None,
+    };
+
+    let adapter = ClaudeBgAdapter::new();
+    let handle = adapter
+        .start_thread(&brief, &ctx)
+        .await
+        .expect("via-mux start_thread spawns an ephemeral mux session");
+
+    assert_eq!(handle.vendor, AgentVendor::Claude);
+    assert_eq!(handle.mode, ExecutionMode::Bg);
+    // Mux path uses the session name as identity (NOT the --bg job id).
+    assert_eq!(handle.identity, "ccteam-bg-muxbg-claude-9");
+    assert_eq!(
+        handle.raw_extras.get("via_mux").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        handle
+            .raw_extras
+            .get("mux_session")
+            .and_then(|v| v.as_str()),
+        Some("ccteam-bg-muxbg-claude-9")
+    );
+    // Legacy field preserved for SessionRecord parity.
+    assert_eq!(
+        handle
+            .raw_extras
+            .get("tmux_session")
+            .and_then(|v| v.as_str()),
+        Some("ccteam-bg-muxbg-claude-9")
+    );
+
+    // The session is live: the daemon (tmux) owns the child process.
+    let backend = ccteam_mux::default_backend();
+    let id = ccteam_mux::MuxSessionId::new("ccteam-bg-muxbg-claude-9".to_string());
+    assert!(
+        backend.exists(&id).await.unwrap(),
+        "mux session should exist after via-mux spawn"
+    );
+
+    // Verify the Path B invocation contract: the pane child is
+    // `claude -p --agent tester --dangerously-skip-permissions <prompt>`,
+    // NOT `--bg`. The fake claude writes its argv async inside the pane;
+    // poll briefly for the capture file.
+    let mut argv_text = String::new();
+    for _ in 0..50 {
+        if let Ok(s) = std::fs::read_to_string(&argv_capture) {
+            if !s.is_empty() {
+                argv_text = s;
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        argv_text.lines().any(|l| l == "-p"),
+        "via-mux argv must use foreground -p (not --bg); got: {argv_text:?}"
+    );
+    assert!(
+        !argv_text.lines().any(|l| l == "--bg"),
+        "via-mux argv must NOT contain --bg; got: {argv_text:?}"
+    );
+    assert!(
+        argv_text.lines().any(|l| l == "--agent"),
+        "via-mux argv must pass --agent; got: {argv_text:?}"
+    );
+    assert!(
+        argv_text.lines().any(|l| l == "tester"),
+        "via-mux argv must carry the role; got: {argv_text:?}"
+    );
+    assert!(
+        argv_text.lines().any(|l| l == "do the thing"),
+        "via-mux argv must carry the extra_args prompt; got: {argv_text:?}"
+    );
+
+    // close_thread routes through MuxBackend::kill (via_mux=true handle).
+    adapter
+        .close_thread(&handle)
+        .await
+        .expect("close_thread reaps the mux session");
+    assert!(
+        !backend.exists(&id).await.unwrap(),
+        "mux session should be gone after close_thread"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn claude_bg_via_mux_close_thread_idempotent_on_missing_session() {
+    let _mux_guard = EnvGuard::set("CCTEAM_MUX_BACKEND", "tmux");
+    // A via_mux handle whose session never existed (or already reaped):
+    // MuxBackend::kill is idempotent, so close_thread is Ok. Does not
+    // require tmux on PATH — kill of a non-existent session is a no-op
+    // even when the backend can shell out (tmux kill-session on a
+    // missing target is treated as success by tmux_ops).
+    if !tmux_on_path_bg() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let h = ThreadHandle {
+        vendor: AgentVendor::Claude,
+        mode: ExecutionMode::Bg,
+        identity: "ccteam-ghost-mux-0".into(),
+        started_at: chrono::Utc::now(),
+        raw_extras: serde_json::json!({
+            "via_mux": true,
+            "mux_session": "ccteam-ghost-mux-0",
+        }),
+    };
+    ClaudeBgAdapter::new()
+        .close_thread(&h)
+        .await
+        .expect("via_mux close_thread idempotent on missing mux session");
 }
 
 #[test]
@@ -333,7 +515,9 @@ async fn codex_exec_resume_thread_rejects_empty_persistent_id() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
 async fn codex_exec_close_thread_idempotent_on_missing_session() {
+    let _mux_guard = EnvGuard::set("CCTEAM_MUX_BACKEND", "tmux");
     let h = ThreadHandle {
         vendor: AgentVendor::Codex,
         mode: ExecutionMode::Bg,
@@ -376,7 +560,9 @@ async fn claude_tui_rejects_empty_role() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
 async fn claude_tui_resume_missing_session_reports_not_implemented() {
+    let _mux_guard = EnvGuard::set("CCTEAM_MUX_BACKEND", "tmux");
     // Wave 2: resume_thread w/o a live tmux session falls back to a
     // structured NotImplemented so the caller knows to invoke
     // start_thread + session_recovery::build_recovery_prompt.

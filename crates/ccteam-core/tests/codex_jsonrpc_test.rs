@@ -162,6 +162,99 @@ async fn interleaved_response_and_notification_demuxed() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn server_initiated_request_gets_auto_reply_to_unblock_turn() {
+    // W3b catalog §2.2 / §8.3 defect fix: a server→client REQUEST frame
+    // (`{id, method, params}`, no result/error) BLOCKS the Codex turn until
+    // the client replies. The dispatch must NOT mistake it for a
+    // notification (which would drop the id and hang the turn). It must send
+    // back a JSON-RPC response keyed by the same `id` so the turn proceeds.
+    let (client, mut peer) = duplex_pair();
+    let peer_task = tokio::spawn(async move {
+        let (pr, mut pw) = tokio::io::split(&mut peer);
+        let mut pr = BufReader::new(pr);
+        // Server initiates a sandbox-violation approval request.
+        let req = json!({
+            "id": 9001,
+            "method": "item/commandExecution/requestApproval",
+            "params": {
+                "thread_id": "t-1",
+                "turn_id": "u-1",
+                "item_id": "i-1",
+                "started_at_ms": 0,
+                "command": "rm -rf /"
+            }
+        });
+        let mut line = serde_json::to_vec(&req).unwrap();
+        line.push(b'\n');
+        pw.write_all(&line).await.unwrap();
+        pw.flush().await.unwrap();
+
+        // Read ccteam's reply.
+        let mut buf = String::new();
+        let read = tokio::time::timeout(Duration::from_secs(1), pr.read_line(&mut buf))
+            .await
+            .expect("ccteam must reply to the server request")
+            .unwrap();
+        assert!(read > 0, "expected a reply frame, got EOF");
+        let reply: Value = serde_json::from_str(buf.trim()).unwrap();
+        // Reply must be keyed by the SAME id and carry an error (default
+        // decline) — that unblocks the turn without auto-approving.
+        assert_eq!(reply["id"], 9001, "reply must echo the request id");
+        assert!(
+            reply.get("error").is_some(),
+            "default-decline reply must be a JSON-RPC error, got {reply}"
+        );
+        assert!(reply.get("result").is_none());
+    });
+
+    peer_task.await.unwrap();
+    drop(client);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn server_request_does_not_leak_into_notification_stream() {
+    // The auto-reply path must consume the server request entirely — it
+    // must NOT also broadcast it as a notification (which would double-route
+    // and confuse downstream translate_notification).
+    let (client, mut peer) = duplex_pair();
+    let mut rx = client.subscribe();
+    let peer_task = tokio::spawn(async move {
+        let (pr, mut pw) = tokio::io::split(&mut peer);
+        let mut pr = BufReader::new(pr);
+        // First a server request (has id), then a genuine notification.
+        let req = json!({
+            "id": 42,
+            "method": "item/fileChange/requestApproval",
+            "params": { "thread_id": "t-1", "turn_id": "u-1", "item_id": "i-1", "started_at_ms": 0 }
+        });
+        let mut line = serde_json::to_vec(&req).unwrap();
+        line.push(b'\n');
+        pw.write_all(&line).await.unwrap();
+        let notif = json!({ "method": "turn/started", "params": { "turn_id": "u-9" } });
+        let mut line = serde_json::to_vec(&notif).unwrap();
+        line.push(b'\n');
+        pw.write_all(&line).await.unwrap();
+        pw.flush().await.unwrap();
+        // Drain ccteam's reply to the request so the buffer doesn't stall.
+        let mut buf = String::new();
+        let _ = tokio::time::timeout(Duration::from_secs(1), pr.read_line(&mut buf)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    });
+
+    // The ONLY notification the subscriber sees is the genuine turn/started
+    // — never the server request method.
+    let n = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        n.method, "turn/started",
+        "server request must not be broadcast as a notification"
+    );
+    peer_task.await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn malformed_lines_are_tolerated() {
     // A garbage line in the middle of the stream must not poison the
     // reader; the next valid line should still match the pending id.

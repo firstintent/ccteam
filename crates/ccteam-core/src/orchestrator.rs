@@ -561,6 +561,51 @@ enum SessionStatus {
     },
 }
 
+/// V0.8 W3 follow-up — completion probe for a mode-2 foreground-in-mux
+/// bg spawn (`CCTEAM_CLAUDE_BG_VIA_MUX=1`). Such a spawn is a
+/// `claude -p ... --agent <role>` foreground run owned by the mux
+/// daemon: it runs the agentic loop to completion and exits, ending the
+/// mux session. There is no `~/.claude/jobs/<id>/state.json` to poll, so
+/// liveness == "does the mux session still exist".
+///
+/// - `exists == true`  → [`SessionStatus::Running`] (poll again next
+///   tick; one extra "still running" tick while the daemon reaps is
+///   harmless and matches the existing F80 cadence — no grace sleep).
+/// - `exists == false` → [`SessionStatus::Done`] with `status =
+///   "completed"`. The `claude -p` exit code (and thus completed-vs-
+///   errored) is only available as a typed `ProcessExited` under
+///   RmuxBackend (W2/W7); under the V0.8-default TmuxBackend the only
+///   signal is session-end, so we report "completed" — same shape the
+///   state.json path emits for a clean finish. Cost rollup for via_mux
+///   spawns is deferred to the RmuxBackend bring-up wave (no per-job
+///   state.json to read `cost_usd` from yet), so `cost_usd = None`.
+/// - probe error → [`SessionStatus::Running`] (fail-safe: never retire a
+///   spawn on a transient backend error; mirrors `session_status`'s
+///   "unreadable state.json → still running" default).
+async fn via_mux_session_status(
+    backend: &std::sync::Arc<dyn ccteam_mux::MuxBackend>,
+    session: &str,
+) -> SessionStatus {
+    match backend
+        .exists(&ccteam_mux::MuxSessionId::new(session.to_string()))
+        .await
+    {
+        Ok(true) => SessionStatus::Running,
+        Ok(false) => SessionStatus::Done {
+            cost_usd: None,
+            status: "completed".to_string(),
+        },
+        Err(err) => {
+            tracing::warn!(
+                session,
+                ?err,
+                "via_mux liveness probe errored; treating spawn as still running this tick"
+            );
+            SessionStatus::Running
+        }
+    }
+}
+
 impl Orchestrator {
     /// Build orchestrator; pre-register claude + codex adapters so the
     /// dispatch path never allocates one mid-flight.
@@ -2007,6 +2052,16 @@ impl Orchestrator {
                         "session_id": handle.sid,
                         "tmux_session": handle.tmux_session,
                         "job_id": handle.job_id,
+                        // V0.8 W3 follow-up — persist the mode-2
+                        // foreground-in-mux markers so the F80
+                        // stale-spawn pass can reconstruct a via_mux
+                        // handle from progress.jsonl and route its
+                        // liveness through the mux session lifecycle
+                        // (there is no `~/.claude/jobs/<id>/state.json`
+                        // for these spawns). Default `--bg` + codex
+                        // rows skip both (serde via the json! literal).
+                        "via_mux": handle.via_mux,
+                        "mux_session": handle.mux_session,
                         "executor": match effective_executor {
                             Executor::Claude => "claude",
                             Executor::Codex => "codex",
@@ -2190,12 +2245,62 @@ impl Orchestrator {
                 .flat_map(|v| v.iter().map(|h| h.sid.clone()))
                 .collect()
         };
+        // V0.8 W3 follow-up — mode-2 foreground-in-mux bg spawns
+        // (`via_mux`) resolve liveness via an async `MuxBackend::exists`
+        // probe, not the sync state.json read. To preserve the prior
+        // locking discipline (the in-lock sweep below must NOT `.await`
+        // — every other `self.running` caller would stall on a
+        // backend fork/RPC otherwise), we PRE-COMPUTE via_mux liveness
+        // OUTSIDE the lock: snapshot the (sid, mux_session) pairs under a
+        // brief guard, probe each unlocked, then consult the resulting
+        // map during the synchronous sweep.
+        let via_mux_probes: Vec<(String, String)> = {
+            let running = self.running.lock().await;
+            running
+                .values()
+                .flat_map(|v| v.iter())
+                .filter(|h| h.via_mux)
+                .map(|h| {
+                    let session = h
+                        .mux_session
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(h.sid.as_str())
+                        .to_string();
+                    (h.sid.clone(), session)
+                })
+                .collect()
+        };
+        let mut via_mux_status: HashMap<String, SessionStatus> = HashMap::new();
+        if !via_mux_probes.is_empty() {
+            let backend = ccteam_mux::default_backend();
+            for (sid, session) in via_mux_probes {
+                via_mux_status.insert(sid, via_mux_session_status(&backend, &session).await);
+            }
+        }
         {
             let mut running = self.running.lock().await;
             for (role, handles) in running.iter_mut() {
                 let mut keep = Vec::with_capacity(handles.len());
                 for handle in handles.drain(..) {
-                    match self.session_status(&handle) {
+                    // via_mux handles consult the pre-computed map (probed
+                    // outside this lock); all others take the sync
+                    // state.json path. A via_mux handle spawned AFTER the
+                    // snapshot above (not in the map) defaults to Running
+                    // and is resolved on the next tick — never retired
+                    // prematurely.
+                    let status = if handle.via_mux {
+                        match via_mux_status.get(&handle.sid) {
+                            Some(SessionStatus::Done { cost_usd, status }) => SessionStatus::Done {
+                                cost_usd: *cost_usd,
+                                status: status.clone(),
+                            },
+                            _ => SessionStatus::Running,
+                        }
+                    } else {
+                        self.session_status(&handle)
+                    };
+                    match status {
                         SessionStatus::Done { cost_usd, status } => {
                             finished.push((role.clone(), handle, cost_usd, status));
                         }
@@ -2218,22 +2323,50 @@ impl Orchestrator {
         // never repopulated on daemon restart); this is purely about
         // the progress-jsonl event log.
         let events = progress::read_all_events(progress_path).unwrap_or_default();
-        for (sid, job_id, role) in progress::open_agent_spawns(&events) {
+        for open in progress::open_agent_spawns_detailed(&events) {
+            let progress::OpenAgentSpawn {
+                session_id: sid,
+                job_id,
+                role,
+                via_mux,
+                mux_session,
+            } = open;
             if in_memory_sids.contains(&sid) {
                 continue; // genuinely tracked by this orchestrator instance
                           // (snapshot taken before in-memory cleanup, so
                           // sessions transitioning to Done in this tick
                           // are still excluded)
             }
-            let verdict = crate::claude_job::probe_job(job_id.as_deref());
-            let crate::claude_job::JobLiveness::Terminal { status, cost_usd } = verdict else {
-                continue;
+            // V0.8 W3 follow-up — mode-2 foreground-in-mux spawns
+            // (`via_mux`) have NO `~/.claude/jobs/<id>/state.json`;
+            // probing it would (correctly, for a missing file) return
+            // `Terminal{killed}` and PREMATURELY retire a still-running
+            // mux session. Route their liveness through the mux session
+            // lifecycle instead, mirroring the in-memory `session_status`
+            // branch. The default `--bg` path falls through to the F80
+            // state.json probe unchanged.
+            let (status, cost_usd) = if via_mux {
+                let session = mux_session
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(sid.as_str());
+                match via_mux_session_status(&ccteam_mux::default_backend(), session).await {
+                    SessionStatus::Running => continue,
+                    SessionStatus::Done { cost_usd, status } => (status, cost_usd.unwrap_or(0.0)),
+                }
+            } else {
+                let verdict = crate::claude_job::probe_job(job_id.as_deref());
+                let crate::claude_job::JobLiveness::Terminal { status, cost_usd } = verdict else {
+                    continue;
+                };
+                (status.to_string(), cost_usd)
             };
             tracing::info!(
                 slug,
                 role = role.as_str(),
                 session_id = sid.as_str(),
                 ?job_id,
+                via_mux,
                 status,
                 cost_usd,
                 "F80 stale-spawn cleanup: emitting synthetic agent_done",
@@ -2247,9 +2380,11 @@ impl Orchestrator {
                     job_id,
                     pid: None,
                     started_at: Utc::now(),
+                    via_mux,
+                    mux_session,
                 },
                 Some(cost_usd),
-                status.to_string(),
+                status,
             ));
         }
 
@@ -2884,6 +3019,13 @@ impl Orchestrator {
         }
     }
 
+    /// Synchronous state.json liveness probe for the default
+    /// self-detaching `claude --bg` (+ codex) path. Mode-2
+    /// foreground-in-mux spawns (`via_mux`) do NOT route through here —
+    /// they have no `~/.claude/jobs/<id>/state.json`; their liveness is
+    /// pre-computed via [`via_mux_session_status`] (an async
+    /// `MuxBackend::exists` probe) OUTSIDE the `self.running` lock in
+    /// [`Self::poll_completions`], keeping this in-lock sweep sync.
     fn session_status(&self, handle: &SessionHandle) -> SessionStatus {
         let path = self.session_state_path(handle);
         let Ok(body) = std::fs::read_to_string(&path) else {
@@ -3346,5 +3488,81 @@ impl Orchestrator {
     /// Test seam: read the `spawned` set membership.
     pub async fn test_spawned_contains(&self, slug: &str) -> bool {
         self.spawned.lock().await.contains(slug)
+    }
+}
+
+#[cfg(test)]
+mod via_mux_tests {
+    //! V0.8 W3 follow-up — the orchestrator routes mode-2
+    //! foreground-in-mux bg spawns' completion through the mux session
+    //! lifecycle instead of the F80 `state.json` probe. These tests
+    //! exercise the [`via_mux_session_status`] helper directly against a
+    //! `InProcBackend` instance we control (spawn → exists==true →
+    //! Running; kill → exists==false → Done), with no real mux daemon
+    //! and no env mutation (the helper takes the backend by reference).
+
+    use std::sync::Arc;
+
+    use ccteam_mux::{InProcBackend, MuxBackend, MuxSessionId, MuxSessionSpec};
+
+    use super::{via_mux_session_status, SessionStatus};
+
+    fn spec(name: &str) -> MuxSessionSpec {
+        MuxSessionSpec::new(
+            name.to_string(),
+            vec!["true".to_string()],
+            std::env::temp_dir(),
+        )
+    }
+
+    /// A live mux session (process still running the agent) reports
+    /// `Running` — the orchestrator must NOT retire it.
+    #[tokio::test]
+    async fn live_mux_session_reports_running() {
+        let backend: Arc<dyn MuxBackend> = Arc::new(InProcBackend::new());
+        let name = "ccteam-bg-demo-sid1";
+        backend.spawn(spec(name)).await.unwrap();
+
+        match via_mux_session_status(&backend, name).await {
+            SessionStatus::Running => {}
+            SessionStatus::Done { .. } => panic!("live via_mux session must report Running"),
+        }
+    }
+
+    /// Once the `claude -p` foreground run exits the mux session is
+    /// gone (`exists == false`); the orchestrator emits a synthetic
+    /// `agent_done` with `status = "completed"` — the same shape the
+    /// state.json path emits for a clean finish.
+    #[tokio::test]
+    async fn gone_mux_session_reports_completed() {
+        let backend: Arc<dyn MuxBackend> = Arc::new(InProcBackend::new());
+        let name = "ccteam-bg-demo-sid2";
+        backend.spawn(spec(name)).await.unwrap();
+        backend
+            .kill(&MuxSessionId::new(name.to_string()))
+            .await
+            .unwrap();
+
+        match via_mux_session_status(&backend, name).await {
+            SessionStatus::Done { status, cost_usd } => {
+                assert_eq!(status, "completed");
+                // Cost rollup for via_mux spawns is deferred to the
+                // RmuxBackend bring-up wave (no per-job state.json yet).
+                assert_eq!(cost_usd, None);
+            }
+            SessionStatus::Running => panic!("exited via_mux session must report Done"),
+        }
+    }
+
+    /// A session that was never spawned (e.g. F80 reconstructs a handle
+    /// from progress.jsonl after the run already finished) reports
+    /// `Done` — `exists == false` is the done signal.
+    #[tokio::test]
+    async fn unknown_mux_session_reports_completed() {
+        let backend: Arc<dyn MuxBackend> = Arc::new(InProcBackend::new());
+        match via_mux_session_status(&backend, "ccteam-bg-never-spawned").await {
+            SessionStatus::Done { status, .. } => assert_eq!(status, "completed"),
+            SessionStatus::Running => panic!("nonexistent via_mux session must report Done"),
+        }
     }
 }

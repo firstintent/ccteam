@@ -344,6 +344,14 @@ enum Command {
     /// agent both see the 9-tool surface (interfaces §12).
     #[command(hide = true)]
     McpServe,
+    /// V0.8 rmux — mux backend utilities. Today the only subcommand is
+    /// `hook-emit`, the W6 daemon-bus hook reroute client (active only
+    /// when `CCTEAM_HOOK_VIA_DAEMON=1`; see `ccteam mux hook-emit
+    /// --help`).
+    Mux {
+        #[command(subcommand)]
+        cmd: MuxCommand,
+    },
     /// Internal commands — hook handlers + meta-agent / MCP integration
     /// points. Not user-facing day to day; meta-agent and the
     /// `ccteam-control` skill drive these. Run `ccteam internal --help`
@@ -803,6 +811,36 @@ enum PrefsAction {
     },
 }
 
+/// V0.8 rmux W6 — `ccteam mux` subcommand group.
+#[derive(Subcommand)]
+enum MuxCommand {
+    /// W6 daemon-bus hook reroute client. A Claude Code hook subprocess
+    /// invokes this (only when the host opted in with
+    /// `CCTEAM_HOOK_VIA_DAEMON=1`) to forward its firing to the
+    /// orchestrator over `~/.ccteam/run/hook.sock` instead of writing
+    /// `progress.jsonl` directly. Reads the hook payload from `--json`
+    /// or stdin; derives the session id from `CCTEAM_CHAT_SLUG` /
+    /// `CCTEAM_CHAT_ROLE`. Exits 0 on send; exits non-zero but QUIET
+    /// when the sink isn't listening so a stray fire never error-spams
+    /// Claude Code's UI.
+    HookEmit {
+        /// Dispatch kind, e.g. `chat-progress`.
+        #[arg(long, value_name = "KIND")]
+        kind: String,
+        /// Dispatch action (the event arg), e.g. `session-start`.
+        #[arg(long, value_name = "ACTION")]
+        action: Option<String>,
+        /// Explicit session id; defaults to `<slug>-<role>` derived from
+        /// `CCTEAM_CHAT_SLUG` / `CCTEAM_CHAT_ROLE` env.
+        #[arg(long, value_name = "SID")]
+        session: Option<String>,
+        /// Hook payload JSON inline. When absent, the payload is read
+        /// from stdin (`-` is also treated as "read stdin").
+        #[arg(long, value_name = "JSON")]
+        json: Option<String>,
+    },
+}
+
 /// V0.4.6 F89: subcommands hidden under `ccteam internal`. Each mirrors
 /// a former top-level command 1:1 — the old top-level names stay as
 /// hidden aliases that emit a one-line stderr deprecation WARN and route
@@ -928,6 +966,46 @@ enum HookCommand {
 }
 
 fn main() -> Result<()> {
+    // V0.8 W2a — rmux SDK daemon spawn protocol. BEFORE clap parses
+    // argv, intercept the `--__internal-daemon <socket>` form emitted
+    // by `rmux_sdk::Rmux::connect_or_start` so the same ccteam binary
+    // can host the rmux daemon. See
+    // `docs/versions/v0-8-rmux/w2-daemon-spawn-protocol.md` and
+    // `references/rmux/crates/rmux-sdk/src/handles/rmux/connect.rs`
+    // (lines 150-180) for the upstream invariant this implementation
+    // tracks.
+    //
+    // TODO(V0.8-W2c): `RmuxBackend::new()` sets `RMUX_SDK_DAEMON_BINARY`
+    // lazily in its constructor — enough for the orchestrator's own
+    // use, but child processes ccteam spawns (claude / codex subagents)
+    // inherit env at fork time. When W2c migrates `claude_tui.rs` /
+    // `codex_exec.rs` to the trait, set `RMUX_SDK_DAEMON_BINARY =
+    // current_exe()` here at `main()` entry so inherited-env propagation
+    // covers any subagent that later uses rmux-sdk. No subagent uses it
+    // today, so W2a leaves this as a TODO rather than a behavior change.
+    {
+        let raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+        if raw_args.len() >= 3 && raw_args[1] == ccteam_mux::daemon::INTERNAL_DAEMON_FLAG {
+            let socket = raw_args[2].clone();
+            ccteam_mux::daemon::run_internal_daemon(socket)
+                .context("ccteam internal rmux daemon")?;
+            return Ok(());
+        }
+    }
+
+    // V0.8 W2c — set `RMUX_SDK_DAEMON_BINARY` to this binary at main()
+    // entry (not lazily in RmuxBackend::new) so the value is in the
+    // process env BEFORE any child process is forked. Child agents
+    // (claude / codex sessions) that later use rmux-sdk inherit it and
+    // resolve the same ccteam binary as their daemon host, rather than
+    // falling back to a `rmux` binary on PATH that may not exist.
+    // Idempotent — honors an explicit operator override.
+    if std::env::var_os(ccteam_mux::daemon::SDK_DAEMON_BINARY_ENV).is_none() {
+        if let Ok(exe) = std::env::current_exe() {
+            std::env::set_var(ccteam_mux::daemon::SDK_DAEMON_BINARY_ENV, exe.as_os_str());
+        }
+    }
+
     let cli = Cli::parse();
 
     // F173 — pin `CCTEAM_HOME` early so child spawn paths
@@ -1078,6 +1156,7 @@ fn main() -> Result<()> {
             warn_deprecated_top_level("mcp-serve", "internal mcp-serve");
             run_mcp_serve()
         }
+        Command::Mux { cmd } => run_mux(cmd),
         Command::Internal { cmd } => run_internal(cmd),
         Command::Stop { slug, stop_timeout } => match slug {
             // V0.5.0 F97 — per-slug agent-team cleanup.
@@ -1372,6 +1451,79 @@ fn run_mcp_serve() -> Result<()> {
     runtime.block_on(mcp_serve::run_mcp_serve(paths))
 }
 
+/// V0.8 rmux W6 — `ccteam mux <subcommand>` dispatch.
+fn run_mux(cmd: MuxCommand) -> Result<()> {
+    match cmd {
+        MuxCommand::HookEmit {
+            kind,
+            action,
+            session,
+            json,
+        } => run_mux_hook_emit(kind, action, session, json),
+    }
+}
+
+/// V0.8 rmux W6 — connect to `~/.ccteam/run/hook.sock` and forward one
+/// hook firing to the orchestrator (single-writer path).
+///
+/// QUIET-on-failure contract: when the sink isn't listening (no
+/// orchestrator running with the flag set, stale socket), we exit
+/// non-zero WITHOUT printing to stderr. A Claude Code hook subprocess
+/// that error-spammed stderr would pollute the chat UI; a silent
+/// non-zero exit is the documented behaviour (Claude Code tolerates a
+/// failed fire-and-forget hook).
+fn run_mux_hook_emit(
+    kind: String,
+    action: Option<String>,
+    session: Option<String>,
+    json: Option<String>,
+) -> Result<()> {
+    // Derive the session id from env when not given explicitly. The hook
+    // subprocess inherits CCTEAM_CHAT_SLUG / CCTEAM_CHAT_ROLE from the
+    // chat tmux session (claude_tui::chat_spawn_env_owned). Either may
+    // be empty if env propagation failed; that's fine — the orchestrator
+    // re-derives routing from the payload the same way the legacy hook
+    // handler did, so session_id is informational.
+    let session_id = session.unwrap_or_else(|| {
+        let slug = std::env::var("CCTEAM_CHAT_SLUG").unwrap_or_default();
+        let role = std::env::var("CCTEAM_CHAT_ROLE").unwrap_or_default();
+        format!("{slug}-{role}")
+    });
+
+    // Payload: `--json` inline (unless it's `-`), else read stdin.
+    let payload_json = match json {
+        Some(s) if s != "-" => s,
+        _ => {
+            use std::io::Read;
+            let mut buf = String::new();
+            // A hook may fire with no stdin (e.g. SessionStart in some
+            // configs); tolerate an empty read.
+            let _ = std::io::stdin().lock().read_to_string(&mut buf);
+            buf
+        }
+    };
+
+    let event = ccteam_mux::HookEvent {
+        session_id,
+        kind,
+        action,
+        payload_json,
+    };
+    let socket = ccteam_mux::default_ccteam_hook_socket_path();
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime for mux hook-emit")?;
+    match runtime.block_on(ccteam_mux::HookSinkClient::emit(&socket, &event)) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            // Quiet non-zero exit — no stderr. See contract above.
+            std::process::exit(1);
+        }
+    }
+}
+
 // V0.6.1 F130 — `ccteam daemon {start,stop,status}` removed. The IMD
 // supervisor now lives inside `ccteam start` as one tokio task, so
 // lifecycle = `ccteam start` / `ccteam stop` (same as orchestrator +
@@ -1574,6 +1726,24 @@ fn run_start(
     imd: StartImdOpts,
 ) -> Result<()> {
     init_tracing();
+
+    // V0.8 rmux — the mux backend default is rmux, resolved in the
+    // library (`ccteam_mux::from_env` / `default_backend`): rmux is the
+    // bundled always-available backend so ccteam works with no external
+    // tmux. An operator opts out with `CCTEAM_MUX_BACKEND=tmux`. Log the
+    // effective choice for ops visibility at orchestrator startup (no
+    // set_var here — the library is the single source of truth).
+    //
+    // Validated end-to-end on Linux (rmux-smoke CI job: spawn→send→
+    // capture→kill + reconnect-after-daemon-death). macOS/Windows run on
+    // the CI matrix; real-claude mode-3 burn-in is the merge-to-main gate
+    // (this is a no-merge evaluation branch). See
+    // docs/versions/v0-8-rmux/w-flip-default-migration-plan.md.
+    tracing::info!(
+        backend = ?ccteam_mux::backend_kind_from_env(),
+        "ccteam start: mux backend (set CCTEAM_MUX_BACKEND=tmux to use tmux)"
+    );
+
     let paths = CcteamPaths::from_env()?;
 
     // V0.4.0 F60: the shipped team seed writer was deleted with the
@@ -1630,6 +1800,11 @@ fn run_start(
     // We need the paths twice (for orchestrator construction + final
     // pidfile cleanup), so clone before the move into Orchestrator::new.
     let cleanup_paths = paths.clone();
+    // V0.8 rmux W6 — a third clone for the (flag-gated) hook-sink
+    // dispatch task. Cloned out here so the `move` closure below doesn't
+    // consume `cleanup_paths` (still needed for the final pidfile
+    // removal). Cheap clone (two PathBufs).
+    let hook_sink_paths = paths.clone();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1728,6 +1903,90 @@ fn run_start(
                 }))
             };
 
+            // V0.8 rmux W6 — flag-gated hook-sink listener (Option C).
+            // ONLY when `CCTEAM_HOOK_VIA_DAEMON=1`: bind the ccteam-owned
+            // `~/.ccteam/run/hook.sock`, consume each forwarded HookEvent,
+            // and translate it to the same progress.jsonl line the legacy
+            // `ccteam internal hook <kind> <action>` path would have
+            // written — making the orchestrator process the SINGLE writer
+            // and closing the two-writer race. When the flag is unset
+            // (the default) we do NOT bind the sink: nothing changes, the
+            // hook subprocess keeps writing progress.jsonl directly via
+            // the `hook.sh chat-progress <arg>` path.
+            //
+            // The consumer awaits each dispatch (on the blocking pool, so
+            // the file IO doesn't stall the runtime) before the next
+            // recv, preserving append order — the single-writer invariant
+            // the whole reroute exists to provide.
+            let hook_sink_handle = if ccteam_core::hooks_dispatcher::hook_via_daemon_enabled() {
+                let socket = ccteam_mux::default_ccteam_hook_socket_path();
+                match ccteam_mux::HookSink::bind(&socket) {
+                    Ok(mut sink) => {
+                        tracing::info!(
+                            socket = %socket.display(),
+                            "W6 hook-sink bound (CCTEAM_HOOK_VIA_DAEMON=1): orchestrator is single progress.jsonl writer"
+                        );
+                        let dispatch_paths = hook_sink_paths.clone();
+                        let mut rx = shutdown_rx.clone();
+                        Some(tokio::spawn(async move {
+                            loop {
+                                tokio::select! {
+                                    _ = rx.changed() => break,
+                                    maybe = sink.recv() => {
+                                        let Some(event) = maybe else { break };
+                                        // V0.8 Slice 2 — tee P1 enrichment to the
+                                        // session's typed-event tap (no-op unless
+                                        // CCTEAM_TYPED_EVENTS is set + a tap is
+                                        // registered for this session). Cheap sync
+                                        // channel send; done before the event moves
+                                        // into the blocking dispatch below.
+                                        ccteam_core::execution::typed_events::enrich_session_from_hook(&event);
+                                        let dispatch_paths = dispatch_paths.clone();
+                                        let res = tokio::task::spawn_blocking(move || {
+                                            let stdin: serde_json::Value =
+                                                serde_json::from_str(&event.payload_json)
+                                                    .unwrap_or(serde_json::Value::Null);
+                                            ccteam_hooks::dispatch(
+                                                &dispatch_paths,
+                                                &event.kind,
+                                                event.action.as_deref(),
+                                                &stdin,
+                                            )
+                                        })
+                                        .await;
+                                        match res {
+                                            Ok(Ok(_)) => {}
+                                            Ok(Err(err)) => tracing::warn!(
+                                                error = %err,
+                                                "W6 hook-sink: dispatch failed; event dropped"
+                                            ),
+                                            Err(je) => tracing::warn!(
+                                                ?je,
+                                                "W6 hook-sink: dispatch task panicked"
+                                            ),
+                                        }
+                                    }
+                                }
+                            }
+                            // Keep the sink (and thus the bound socket)
+                            // alive for the whole task body; drop here on
+                            // shutdown removes the socket file.
+                            drop(sink);
+                        }))
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            socket = %socket.display(),
+                            error = %err,
+                            "W6 hook-sink bind failed; chat-mode hooks will fail to route (set CCTEAM_HOOK_VIA_DAEMON only when intended)"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
             let orch_shutdown = {
                 let mut rx = shutdown_rx.clone();
                 async move {
@@ -1772,6 +2031,23 @@ fn run_start(
                         tracing::warn!(
                             timeout_secs = TASK_DRAIN_TIMEOUT.as_secs(),
                             "ccteam-imd drain timed out; aborting"
+                        );
+                    }
+                }
+            }
+            // V0.8 rmux W6 — drain the hook-sink task on the same
+            // shutdown boundary. It responds to the watch channel
+            // immediately (select! break), so the 5s cap is just a
+            // safety net.
+            if let Some(h) = hook_sink_handle {
+                match tokio::time::timeout(TASK_DRAIN_TIMEOUT, h).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(je)) if je.is_cancelled() => {}
+                    Ok(Err(je)) => tracing::warn!(?je, "W6 hook-sink task panicked"),
+                    Err(_) => {
+                        tracing::warn!(
+                            timeout_secs = TASK_DRAIN_TIMEOUT.as_secs(),
+                            "W6 hook-sink drain timed out; aborting"
                         );
                     }
                 }

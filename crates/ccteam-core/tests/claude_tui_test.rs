@@ -33,6 +33,7 @@ fn kill_session_quiet(name: &str) {
 #[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn start_thread_spawns_tmux_and_returns_handle() {
+    std::env::set_var("CCTEAM_MUX_BACKEND", "tmux");
     let tmp = tempfile::TempDir::new().unwrap();
     let bin = fake_claude_script(&tmp);
     // Use unique slug so parallel runs don't collide
@@ -80,6 +81,7 @@ async fn start_thread_spawns_tmux_and_returns_handle() {
 #[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn submit_turn_sends_literal_text_to_tmux_pane() {
+    std::env::set_var("CCTEAM_MUX_BACKEND", "tmux");
     let tmp = tempfile::TempDir::new().unwrap();
     let bin = fake_claude_script(&tmp);
     let slug = format!("tui-submit-{}", std::process::id());
@@ -125,6 +127,7 @@ async fn submit_turn_sends_literal_text_to_tmux_pane() {
 async fn submit_turn_artifact_uses_read_protocol() {
     // Artifact path must trigger the "Look at the file I just placed at
     // <p>" sentinel — Wave 2 design sidesteps stdin escape entirely.
+    std::env::set_var("CCTEAM_MUX_BACKEND", "tmux");
     let tmp = tempfile::TempDir::new().unwrap();
     let bin = fake_claude_script(&tmp);
     let slug = format!("tui-artifact-{}", std::process::id());
@@ -163,6 +166,7 @@ async fn submit_turn_artifact_uses_read_protocol() {
 #[serial]
 async fn close_thread_is_idempotent_on_missing_session() {
     // Closing a handle whose tmux session is already gone must not error.
+    std::env::set_var("CCTEAM_MUX_BACKEND", "tmux");
     let h = ThreadHandle {
         vendor: AgentVendor::Claude,
         mode: ExecutionMode::Chat,
@@ -178,6 +182,7 @@ async fn close_thread_is_idempotent_on_missing_session() {
 #[serial]
 async fn resume_thread_on_live_session_returns_handle() {
     // Pre-create a tmux session by hand, then resume it.
+    std::env::set_var("CCTEAM_MUX_BACKEND", "tmux");
     let tmp = tempfile::TempDir::new().unwrap();
     let session_name = format!("ccteam-chat-resume-{}", std::process::id());
     kill_session_quiet(&session_name);
