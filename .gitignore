@@ -27,3 +27,7 @@ readme.local.txt
 # Claude Telegram (added by claude-telegram-workspace/install.sh)
 .claude/channels/
 .claude/settings.local.json
+
+# Local scratch notes (architecture diagrams, ad-hoc analysis)
+notes/
+graphify-out/
