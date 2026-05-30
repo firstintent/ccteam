@@ -46,12 +46,28 @@ PLUGIN_AGENTS  := \
 # is the cross-project RAG store).
 RUNTIME_DIRS   := state progress inbox queue control log
 
+# Connection config for notes sync lives in .env (gitignored — keeps the real
+# host/IP out of version control). Copy .env.example → .env and fill in. The
+# include comes before the defaults below, so .env values win; the defaults
+# are inert placeholders that make the targets fail loudly if .env is missing.
+-include $(CURDIR)/.env
+
+# notes/ is gitignored scratch (architecture diagrams, prototypes, ad-hoc
+# analysis). These targets mirror it to/from the remote box, full overwrite
+# (destination is removed first, so it's a true mirror, not a merge).
+NOTES_DIR      := $(CURDIR)/notes
+NOTES_HOST     ?= __UNSET__
+NOTES_KEY      ?= $(HOME)/.ssh/id_ed25519
+NOTES_REMOTE   ?= __UNSET__
+NOTES_SSH_OPTS := -i $(NOTES_KEY) -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15
+
 .DEFAULT_GOAL := help
 .PHONY: help build release clean check fmt clippy test \
         install uninstall reinstall \
         setup start attach \
         doctor tool-surface \
-        tmux-clean agents-clean state-clean wipe nuke
+        tmux-clean agents-clean state-clean wipe nuke \
+        notes-push notes-pull notes-env-check
 
 # --- Help --------------------------------------------------------------------
 
@@ -76,6 +92,10 @@ help:
 	@printf '\033[1mHealth check\033[0m\n'
 	@printf '  make doctor        ccteam doctor --tool-surface\n'
 	@printf '  make tool-surface  alias for doctor\n\n'
+	@printf '\033[1mnotes/ sync (scratch ⇄ remote box)\033[0m\n'
+	@printf '  make notes-push    local notes/ → remote box (full overwrite)\n'
+	@printf '  make notes-pull    remote box → local notes/ (full overwrite)\n'
+	@printf '                     (host/path from .env — see .env.example)\n\n'
 	@printf '\033[1mState reset (destructive — read help text)\033[0m\n'
 	@printf '  make tmux-clean    kill all ccteam-* tmux sessions\n'
 	@printf '  make agents-clean  remove the 8 plugin agent symlinks we installed\n'
@@ -89,6 +109,8 @@ help:
 	@printf '  BIN_DIR        install location (default $(BIN_DIR))\n'
 	@printf '  CCTEAM_HOME    ccteam state root (default $(CCTEAM_HOME))\n'
 	@printf '  PROJECTS_ROOT  projects root      (default $(PROJECTS_ROOT))\n'
+	@printf '  NOTES_HOST     notes sync remote  (set in .env — see .env.example)\n'
+	@printf '  NOTES_REMOTE   remote notes path  (set in .env)\n'
 
 # --- Build & test ------------------------------------------------------------
 
@@ -244,3 +266,29 @@ nuke:
 	    rm -rf "$(PROJECTS_ROOT)" && printf 'rmrf: %s\n' '$(PROJECTS_ROOT)'; \
 	fi
 	@printf '\nnuke complete. binary still installed; run `make doctor` to verify.\n'
+
+# --- notes/ sync (scratch ⇄ remote dev box) ----------------------------------
+#
+# Full-overwrite mirror, not a merge: the destination notes/ is removed before
+# copy, so deletions propagate. notes/ is gitignored, so this never touches
+# tracked state. Override NOTES_HOST / NOTES_REMOTE / NOTES_KEY as needed.
+
+notes-env-check:
+	@if [ "$(NOTES_HOST)" = "__UNSET__" ] || [ "$(NOTES_REMOTE)" = "__UNSET__" ]; then \
+	    printf '\033[31merror:\033[0m NOTES_HOST / NOTES_REMOTE not set.\n' >&2; \
+	    printf 'create your .env first:  cp .env.example .env   then edit it.\n' >&2; \
+	    exit 1; \
+	fi
+
+notes-push: notes-env-check
+	@printf 'push: %s → %s:%s (overwrite)\n' '$(NOTES_DIR)' '$(NOTES_HOST)' '$(NOTES_REMOTE)'
+	@if [ ! -d "$(NOTES_DIR)" ]; then printf '\033[31merror:\033[0m no local %s\n' '$(NOTES_DIR)' >&2; exit 1; fi
+	ssh $(NOTES_SSH_OPTS) $(NOTES_HOST) 'rm -rf $(NOTES_REMOTE) && mkdir -p $(dir $(NOTES_REMOTE))'
+	scp $(NOTES_SSH_OPTS) -r $(NOTES_DIR) $(NOTES_HOST):$(dir $(NOTES_REMOTE))
+	@printf '\033[32mdone.\033[0m remote notes/ now mirrors local.\n'
+
+notes-pull: notes-env-check
+	@printf 'pull: %s:%s → %s (overwrite)\n' '$(NOTES_HOST)' '$(NOTES_REMOTE)' '$(NOTES_DIR)'
+	rm -rf $(NOTES_DIR)
+	scp $(NOTES_SSH_OPTS) -r $(NOTES_HOST):$(NOTES_REMOTE) $(NOTES_DIR)
+	@printf '\033[32mdone.\033[0m local notes/ now mirrors remote.\n'

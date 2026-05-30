@@ -31,3 +31,7 @@ readme.local.txt
 # Local scratch notes (architecture diagrams, ad-hoc analysis)
 notes/
 graphify-out/
+
+# Local-only connection config (real host/IP). Keep .env.example tracked.
+.env
+!.env.example
