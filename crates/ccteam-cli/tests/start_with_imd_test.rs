@@ -88,6 +88,7 @@ fn start_spawns_imd_supervisor_unless_no_imd_set() {
     std::fs::create_dir_all(ccteam_home.join("phases")).unwrap();
     std::fs::create_dir_all(fake_home.join("projects")).unwrap();
     let heartbeat = ccteam_home.join("state").join("imd.heartbeat");
+    let mcp_socket = ccteam_home.join("run").join("mcp.sock");
     assert!(
         !heartbeat.exists(),
         "tempdir-isolated heartbeat must start absent",
@@ -105,24 +106,31 @@ fn start_spawns_imd_supervisor_unless_no_imd_set() {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn ccteam start");
+    let child_pid = child.id();
 
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut observed = false;
+    let mut observed_mcp = false;
     while Instant::now() < deadline {
         if let Ok(meta) = std::fs::metadata(&heartbeat) {
             if let Ok(mtime) = meta.modified() {
                 if mtime >= started_at {
                     observed = true;
-                    break;
                 }
             }
+        }
+        if mcp_socket.exists() {
+            observed_mcp = true;
+        }
+        if observed && observed_mcp {
+            break;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
 
     // Tear down — write the F86 shutdown trigger.
     let trigger = trigger_path();
-    let _ = std::fs::write(&trigger, format!("{}\n", std::process::id()));
+    let _ = std::fs::write(&trigger, format!("{child_pid}\n"));
     let drain_deadline = Instant::now() + Duration::from_secs(35);
     while Instant::now() < drain_deadline {
         match child.try_wait() {
@@ -142,6 +150,11 @@ fn start_spawns_imd_supervisor_unless_no_imd_set() {
         "F130: IMD heartbeat at {} should have been refreshed by the in-process supervisor within 15s",
         heartbeat.display()
     );
+    assert!(
+        observed_mcp,
+        "v8.1: MCP socket at {} should be served by `ccteam start`",
+        mcp_socket.display()
+    );
 
     // --- Case 2: --no-imd — heartbeat must NOT appear --------------
     let _ = std::fs::remove_file(&heartbeat);
@@ -156,6 +169,7 @@ fn start_spawns_imd_supervisor_unless_no_imd_set() {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn ccteam start --no-imd");
+    let child2_pid = child2.id();
 
     // Wait at least 6s (>3 supervisor ticks) to make sure we'd have
     // seen the heartbeat if it were going to appear.
@@ -165,7 +179,7 @@ fn start_spawns_imd_supervisor_unless_no_imd_set() {
         Err(_) => true,
     };
 
-    let _ = std::fs::write(&trigger, format!("{}\n", std::process::id()));
+    let _ = std::fs::write(&trigger, format!("{child2_pid}\n"));
     let drain_deadline = Instant::now() + Duration::from_secs(35);
     while Instant::now() < drain_deadline {
         match child2.try_wait() {

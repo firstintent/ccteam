@@ -229,6 +229,11 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
         project_report.workflow_action,
     ));
     out.push_str(&format!(
+        "  ccteam layout    {} ({})\n",
+        target.join(".ccteam").display(),
+        project_report.ccteam_layout_action,
+    ));
+    out.push_str(&format!(
         "  agents dir       {} ({})\n",
         target.join(".claude").join("agents").display(),
         project_report.agents_action,
@@ -297,7 +302,7 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
 
     out.push_str("\nnext:\n");
     out.push_str("  - edit .ccteam/workflow.yaml + .claude/agents/<role>.md to your taste\n");
-    out.push_str("  - ccteam start                # boots orchestrator + web\n");
+    out.push_str("  - ccteam start                # boots gateway + web\n");
     Ok(out)
 }
 
@@ -363,6 +368,7 @@ struct ProjectInstallReport {
     state_action: &'static str,
     workflow_action: &'static str,
     agents_action: &'static str,
+    ccteam_layout_action: &'static str,
 }
 
 impl ProjectInstallReport {
@@ -390,6 +396,7 @@ fn install_project_at(
     let state_action: &'static str;
     let workflow_action: &'static str;
     let agents_action: &'static str;
+    let ccteam_layout_action: &'static str;
     let final_team: String;
 
     if fresh {
@@ -401,6 +408,7 @@ fn install_project_at(
             team,
         )?;
         scaffold_workflow_yaml(target, false, opts.mode)?;
+        scaffold_v81_project_layout(target, false, opts.mode)?;
         let agent_count = scaffold_default_agents(target, false, opts.mode)?;
         if matches!(opts.mode, InitMode::AgentTeam) {
             scaffold_agent_team_inbox(target)?;
@@ -416,6 +424,7 @@ fn install_project_at(
         }
         state_action = "created";
         workflow_action = "scaffolded";
+        ccteam_layout_action = "scaffolded";
         agents_action = if agent_count > 0 {
             "scaffolded"
         } else {
@@ -438,6 +447,14 @@ fn install_project_at(
             scaffold_workflow_yaml(target, true, opts.mode)?;
             "overwritten (--force)"
         } else {
+            "preserved"
+        };
+
+        ccteam_layout_action = if opts.force {
+            scaffold_v81_project_layout(target, true, opts.mode)?;
+            "overwritten (--force)"
+        } else {
+            scaffold_v81_project_layout(target, false, opts.mode)?;
             "preserved"
         };
 
@@ -469,6 +486,7 @@ fn install_project_at(
         state_action,
         workflow_action,
         agents_action,
+        ccteam_layout_action,
     })
 }
 
@@ -494,6 +512,44 @@ fn scaffold_workflow_yaml(target: &std::path::Path, force: bool, mode: InitMode)
         InitMode::AgentTeam => DEFAULT_AGENT_TEAM_WORKFLOW_YAML,
     };
     std::fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+/// Write the v8.1 project-owned asset layout. Claude Code still reads
+/// `.claude/agents`; `.ccteam/agents` is the neutral ccteam copy used by
+/// IM/session onboarding and future non-Claude adapters.
+fn scaffold_v81_project_layout(
+    target: &std::path::Path,
+    force: bool,
+    mode: InitMode,
+) -> Result<()> {
+    let ccteam_dir = target.join(".ccteam");
+    let agents_dir = ccteam_dir.join("agents");
+    let skills_dir = ccteam_dir.join("skills");
+    std::fs::create_dir_all(&agents_dir)
+        .with_context(|| format!("create {}", agents_dir.display()))?;
+    std::fs::create_dir_all(&skills_dir)
+        .with_context(|| format!("create {}", skills_dir.display()))?;
+
+    for (name, body) in DEFAULT_AGENT_SCAFFOLDS {
+        let path = agents_dir.join(name);
+        if path.exists() && !force {
+            continue;
+        }
+        std::fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
+    }
+    if matches!(mode, InitMode::AgentTeam) {
+        let path = agents_dir.join("__lead.md");
+        if !path.exists() || force {
+            std::fs::write(&path, AGENT_TEAM_LEAD_MD)
+                .with_context(|| format!("write {}", path.display()))?;
+        }
+    }
+
+    let sentinel = skills_dir.join(".gitkeep");
+    if !sentinel.exists() || force {
+        std::fs::write(&sentinel, b"").with_context(|| format!("write {}", sentinel.display()))?;
+    }
     Ok(())
 }
 
@@ -5647,6 +5703,16 @@ mod tests {
             .join(".claude")
             .join("agents")
             .join("explorer.md")
+            .is_file());
+        assert!(target
+            .join(".ccteam")
+            .join("agents")
+            .join("explorer.md")
+            .is_file());
+        assert!(target
+            .join(".ccteam")
+            .join("skills")
+            .join(".gitkeep")
             .is_file());
 
         let cfg = ccteam_core::load_ccteam_config(&paths.root).unwrap();

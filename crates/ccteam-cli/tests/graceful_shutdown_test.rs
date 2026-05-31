@@ -216,7 +216,7 @@ fn trigger_file_shutdown_exits_cleanly_and_cleans_pidfile() {
     let (mut child, _ccteam_home, pidfile) = spawn_test_daemon(&tmp);
 
     let pidfile_deadline = Instant::now() + Duration::from_secs(10);
-    let _daemon_pid = match wait_for_pidfile(&pidfile, pidfile_deadline) {
+    let daemon_pid = match wait_for_pidfile(&pidfile, pidfile_deadline) {
         Ok(pid) => pid,
         Err(msg) => {
             let _ = child.kill();
@@ -228,7 +228,7 @@ fn trigger_file_shutdown_exits_cleanly_and_cleans_pidfile() {
     // Write the F86 trigger file to simulate `ccteam stop`.
     let user = std::env::var("USER").unwrap_or_else(|_| "ccteam".into());
     let trigger = PathBuf::from("/tmp").join(format!("ccteam-{user}.shutdown"));
-    std::fs::write(&trigger, format!("{}\n", std::process::id())).expect("write shutdown trigger");
+    std::fs::write(&trigger, format!("{daemon_pid}\n")).expect("write shutdown trigger");
 
     let exit_deadline = Instant::now() + Duration::from_secs(10);
     let exited = wait_for_exit(&mut child, exit_deadline);

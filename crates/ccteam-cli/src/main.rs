@@ -24,9 +24,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 use ccteam_core::CcteamPaths;
-use ccteam_flow::{CancelReason, Orchestrator, OrchestratorConfig};
 use commands::{InitMode, InitOptions, OutputFormat};
 
 #[derive(Parser)]
@@ -113,11 +113,11 @@ enum Command {
         #[command(subcommand)]
         cmd: HookCommand,
     },
-    /// Run the orchestrator daemon (and, by default, the web UI on
-    /// `127.0.0.1:7331` in the same process). Foreground is the only
-    /// supported mode — `ccteam start` is enough; the `--foreground`
-    /// flag is accepted for back-compat but no longer required.
-    /// Pass `--no-web` to run orchestrator only.
+    /// Run the v8.1 gateway daemon (IM gateway plus, by default, the
+    /// web UI in the same process). Foreground is the only supported
+    /// mode — `ccteam start` is enough; the `--foreground` flag is
+    /// accepted for back-compat but no longer required.
+    /// Pass `--no-web` to run the gateway without web.
     ///
     /// V0.5.0 F93b: when a positional `<slug>` is supplied AND that
     /// project's workflow.yaml has `mode: agent-team`, `ccteam start`
@@ -132,12 +132,12 @@ enum Command {
     /// prompt in scripted callers.
     Start {
         /// V0.5.0 F93b: project slug to spawn an agent-team lead for.
-        /// Omit to run the daemon (V0.4.6 behavior).
+        /// Omit to run the v8.1 gateway daemon.
         slug: Option<String>,
         /// Back-compat no-op: foreground is the only mode.
         #[arg(long, default_value_t = false, hide = true)]
         foreground: bool,
-        /// Override the polling tick interval (debug / tests only).
+        /// Back-compat no-op for no-slug gateway start.
         #[arg(long, value_name = "SECONDS", default_value_t = 30)]
         tick_seconds: u64,
         /// Skip the M0.5.3 phase tools_required check at startup.
@@ -156,15 +156,13 @@ enum Command {
         #[arg(long, value_name = "ARGV")]
         claude_argv: Option<String>,
         /// Skip starting the embedded web UI. Use this when you want
-        /// orchestrator only (e.g. headless server, custom web bind
+        /// only the IM gateway (e.g. headless server, custom web bind
         /// via a separate `ccteam web` invocation).
         #[arg(long, default_value_t = false)]
         no_web: bool,
-        /// V0.6.1 F130 — skip starting the embedded `ccteam-im`
-        /// IM-bot supervisor (Telegram / Slack / Discord bridge). The
-        /// supervisor lives in the same process as the orchestrator
-        /// (no separate `ccteam-im` binary anymore); pass this to
-        /// run orchestrator-only without IM transport.
+        /// Skip starting the embedded `ccteam-im` gateway (Telegram /
+        /// Slack / Discord bridge). The gateway lives in this process
+        /// (no separate `ccteam-im` binary); pass this to run web-only.
         #[arg(long, default_value_t = false)]
         no_imd: bool,
         /// Embedded web UI bind address. Default `0.0.0.0:7331` so
@@ -361,12 +359,12 @@ enum Command {
         #[command(subcommand)]
         cmd: InternalCommand,
     },
-    /// Stop the running orchestrator daemon, OR (V0.5.0 F97) tear
+    /// Stop the running gateway daemon, OR (V0.5.0 F97) tear
     /// down one agent-team project's lead session per its workflow.yaml
     /// `cleanup_on_stop:` strategy.
     ///
-    /// Without `<slug>`: legacy V0.4.6 behavior — write the per-user
-    /// graceful shutdown trigger; daemon drains every project
+    /// Without `<slug>`: write the per-user graceful shutdown trigger;
+    /// daemon drains web / IM gateway / MCP socket / hook sink
     /// gracefully; tmux sessions are NOT killed.
     ///
     /// With `<slug>` (V0.5.0 F97): dispatch on the project's
@@ -1594,22 +1592,22 @@ fn run_stop() -> Result<()> {
     let pid = match ccteam_core::read_pidfile(&pidfile) {
         Ok(pid) if ccteam_core::daemon::pid_alive(pid) => pid,
         _ => {
-            println!("ccteam stop: no running orchestrator (pidfile absent or stale).");
+            println!("ccteam stop: no running gateway daemon (pidfile absent or stale).");
             return Ok(());
         }
     };
 
     let trigger = shutdown_trigger_path();
-    std::fs::write(&trigger, format!("{}\n", std::process::id()))
+    std::fs::write(&trigger, format!("{pid}\n"))
         .with_context(|| format!("write shutdown trigger {}", trigger.display()))?;
     println!(
         "ccteam stop: graceful shutdown trigger written to {}",
         trigger.display()
     );
-    println!("ccteam stop: orchestrator pid {pid} will drain projects (≤ 30s)…");
+    println!("ccteam stop: gateway daemon pid {pid} will drain (≤ 5s per task)…");
 
-    // Block until the orchestrator actually exits — docker-stop style.
-    // The orchestrator removes its pidfile on graceful shutdown, so
+    // Block until the gateway daemon actually exits — docker-stop style.
+    // The daemon removes its pidfile on graceful shutdown, so
     // either an absent pidfile OR `kill -0 <pid>` returning false is
     // proof of exit. V0.4.6 bumps the wait to 35s so the daemon's
     // own 30s graceful timeout + abort-fallback path can complete
@@ -1619,7 +1617,7 @@ fn run_stop() -> Result<()> {
     let deadline = std::time::Instant::now() + Duration::from_secs(35);
     while std::time::Instant::now() < deadline {
         if !pidfile.exists() || !ccteam_core::daemon::pid_alive(pid) {
-            println!("ccteam stop: orchestrator exited.");
+            println!("ccteam stop: gateway daemon exited.");
             // Best-effort: tidy the trigger file so the next start
             // doesn't instantly shut itself down on a stale flag.
             let _ = std::fs::remove_file(&trigger);
@@ -1723,9 +1721,9 @@ struct StartImdOpts {
 }
 
 fn run_start(
-    tick_seconds: u64,
-    skip_tool_check: bool,
-    claude_argv_flag: Option<String>,
+    _tick_seconds: u64,
+    _skip_tool_check: bool,
+    _claude_argv_flag: Option<String>,
     web: StartWebOpts,
     imd: StartImdOpts,
 ) -> Result<()> {
@@ -1772,25 +1770,26 @@ fn run_start(
         );
     }
 
-    // F29 — precedence: CLI flag > CCTEAM_CLAUDE_ARGV env > production
-    // default. `OrchestratorConfig::default()` already reads the env;
-    // the flag layers on top.
-    let mut config = OrchestratorConfig {
-        tick_interval: Duration::from_secs(tick_seconds.max(1)),
-        skip_tool_check,
-        ..OrchestratorConfig::default()
-    };
-    if let Some(raw) = claude_argv_flag {
-        let parts: Vec<String> = raw.split_whitespace().map(String::from).collect();
-        if !parts.is_empty() {
-            config.claude_argv = parts;
-        }
+    // Drain only clearly-stale triggers. The trigger path is per-user,
+    // so integration tests can have several daemons alive at once; a
+    // daemon starting after another test wrote a fresh trigger must not
+    // erase that fresh shutdown request before the target sees it.
+    let trigger = shutdown_trigger_path();
+    let stale_trigger = std::fs::metadata(&trigger)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|mtime| std::time::SystemTime::now().duration_since(mtime).ok())
+        .is_some_and(|age| age > Duration::from_secs(2));
+    if stale_trigger {
+        let _ = std::fs::remove_file(&trigger);
     }
-    // Write the pidfile *before* constructing the orchestrator so a
-    // second `ccteam start` against the same root errors out cleanly
-    // before either side has touched tmux.
+
+    // v8.1: no-slug `ccteam start` is the resident gateway daemon, not
+    // the flow/orchestrator loop. The legacy tick/claude-argv flags are
+    // accepted by clap for compatibility but are intentionally ignored
+    // here; agent process settings live in the harness adapters.
     let pidfile = ccteam_core::write_pidfile(&paths)?;
-    tracing::info!(pidfile = %pidfile.display(), "orchestrator pidfile written");
+    tracing::info!(pidfile = %pidfile.display(), "ccteam gateway pidfile written");
 
     // Print a single banner up front so the operator can paste the web
     // URL into a browser without grepping mid-log noise. Skip when
@@ -1801,111 +1800,67 @@ fn run_start(
         print_web_banner(&paths, &web);
     }
 
-    // We need the paths twice (for orchestrator construction + final
-    // pidfile cleanup), so clone before the move into Orchestrator::new.
+    // We need the paths for final pidfile cleanup after the async
+    // runtime has drained the gateway tasks.
     let cleanup_paths = paths.clone();
-    // V0.8 rmux W6 — a third clone for the (flag-gated) hook-sink
-    // dispatch task. Cloned out here so the `move` closure below doesn't
-    // consume `cleanup_paths` (still needed for the final pidfile
-    // removal). Cheap clone (two PathBufs).
     let hook_sink_paths = paths.clone();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("build tokio runtime")?;
-    let result = (|| -> Result<()> {
-        let orchestrator = std::sync::Arc::new(Orchestrator::new(paths, config)?);
-        runtime.block_on(async move {
-            // V0.4.1 simplification: orchestrator + web share one
-            // shutdown signal (Ctrl-C or SIGTERM). The watch::channel
-            // lets multiple awaiters subscribe to the same termination
-            // event without consuming a single oneshot.
-            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let result = runtime.block_on(async move {
+        // v8.1 gateway + web + hook sink share one shutdown signal
+        // (Ctrl-C, SIGTERM, or `ccteam stop` trigger file). No flow
+        // orchestrator is constructed in this path.
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-            let signal_task = tokio::spawn(async move {
-                wait_for_shutdown_signal().await;
-                let _ = shutdown_tx.send(true);
-            });
+        let signal_task = tokio::spawn(async move {
+            wait_for_shutdown_signal().await;
+            let _ = shutdown_tx.send(true);
+        });
 
-            let unroster_task = {
-                let orch = std::sync::Arc::clone(&orchestrator);
-                tokio::spawn(poll_unroster_triggers(orch))
+        let web_handle = if web.disabled {
+            None
+        } else {
+            let opts = match parse_web_opts(&web) {
+                Ok(o) => o,
+                Err(err) => {
+                    signal_task.abort();
+                    return Err(err);
+                }
             };
+            let mut rx = shutdown_rx.clone();
+            Some(tokio::spawn(async move {
+                ccteam_web::serve_with_shutdown(opts, async move {
+                    let _ = rx.changed().await;
+                })
+                .await
+            }))
+        };
 
-            // V0.5.0 F95 — global `~/.claude/teams/` watcher mirrors 5
-            // `team_*` events into `~/.ccteam/teams-progress.jsonl` for
-            // the web `/teams` tab to consume. The watcher runs inside
-            // `spawn_blocking` and never sees its outbound sender drop
-            // (the sender is owned by the same blocking task), so the
-            // only way to terminate it is to flip its `cancel` AtomicBool.
-            // F163 retro — without this wiring, the blocking thread sits
-            // in `recv_timeout(60s)` until the next discovery tick, and
-            // `Runtime::drop` → `BlockingPool::shutdown(None)` blocks
-            // the process for the full discovery interval (host probe
-            // observed >60s hang requiring SIGKILL).
-            let agent_teams_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> =
-                match ccteam_flow::AgentTeamsWatcherConfig::from_env() {
-                    Ok(cfg) => match ccteam_flow::AgentTeamsWatcher::new(cfg) {
-                        Ok(watcher) => {
-                            let cancel = watcher.cancel_handle();
-                            let _join = watcher.start();
-                            Some(cancel)
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                ?err,
-                                "F95 AgentTeamsWatcher::new failed; team-events disabled",
-                            );
-                            None
-                        }
-                    },
-                    Err(err) => {
-                        tracing::warn!(
-                            ?err,
-                            "F95 AgentTeamsWatcherConfig::from_env failed; team-events disabled",
-                        );
-                        None
-                    }
-                };
-
-            let web_handle = if web.disabled {
-                None
-            } else {
-                let opts = match parse_web_opts(&web) {
-                    Ok(o) => o,
-                    Err(err) => {
-                        signal_task.abort();
-                        unroster_task.abort();
-                        return Err(err);
-                    }
-                };
-                let mut rx = shutdown_rx.clone();
-                Some(tokio::spawn(async move {
-                    ccteam_web::serve_with_shutdown(opts, async move {
+        let imd_handle = if imd.disabled {
+            tracing::info!("ccteam start: --no-imd set; IM gateway task skipped");
+            None
+        } else {
+            let mut rx = shutdown_rx.clone();
+            Some(tokio::spawn(async move {
+                ccteam_im::run_daemon_with_shutdown(
+                    ccteam_im::DaemonArgs::default(),
+                    async move {
                         let _ = rx.changed().await;
-                    })
-                    .await
-                }))
-            };
+                    },
+                )
+                .await
+            }))
+        };
 
-            // V0.6.1 F130 — IM supervisor as a third tokio task sharing
-            // the same shutdown channel. Mirrors the web_handle pattern
-            // above; binary `ccteam-im` no longer exists.
-            let imd_handle = if imd.disabled {
-                tracing::info!("ccteam start: --no-imd set; IM supervisor task skipped");
-                None
-            } else {
-                let mut rx = shutdown_rx.clone();
-                Some(tokio::spawn(async move {
-                    ccteam_im::run_daemon_with_shutdown(
-                        ccteam_im::DaemonArgs::default(),
-                        async move {
-                            let _ = rx.changed().await;
-                        },
-                    )
-                    .await
-                }))
-            };
+        let mut rx = shutdown_rx.clone();
+        let mcp_handle = tokio::spawn(async move {
+            serve_mcp_socket(paths, async move {
+                let _ = rx.changed().await;
+            })
+            .await
+        });
 
             // V0.8 rmux W6 — flag-gated hook-sink listener (Option C).
             // ONLY when `CCTEAM_HOOK_VIA_DAEMON=1`: bind the ccteam-owned
@@ -1922,177 +1877,225 @@ fn run_start(
             // the file IO doesn't stall the runtime) before the next
             // recv, preserving append order — the single-writer invariant
             // the whole reroute exists to provide.
-            let hook_sink_handle = if ccteam_core::hooks_dispatcher::hook_via_daemon_enabled() {
-                let socket = ccteam_harness::default_ccteam_hook_socket_path();
-                match ccteam_harness::HookSink::bind(&socket) {
-                    Ok(mut sink) => {
-                        tracing::info!(
-                            socket = %socket.display(),
-                            "W6 hook-sink bound (CCTEAM_HOOK_VIA_DAEMON=1): orchestrator is single progress.jsonl writer"
-                        );
-                        let dispatch_paths = hook_sink_paths.clone();
-                        let mut rx = shutdown_rx.clone();
-                        Some(tokio::spawn(async move {
-                            loop {
-                                tokio::select! {
-                                    _ = rx.changed() => break,
-                                    maybe = sink.recv() => {
-                                        let Some(event) = maybe else { break };
-                                        // V0.8 Slice 2 — tee P1 enrichment to the
-                                        // session's typed-event tap (no-op unless
-                                        // CCTEAM_TYPED_EVENTS is set + a tap is
-                                        // registered for this session). Cheap sync
-                                        // channel send; done before the event moves
-                                        // into the blocking dispatch below.
-                                        ccteam_harness::execution::typed_events::enrich_session_from_hook(&event);
-                                        let dispatch_paths = dispatch_paths.clone();
-                                        let res = tokio::task::spawn_blocking(move || {
-                                            let stdin: serde_json::Value =
-                                                serde_json::from_str(&event.payload_json)
-                                                    .unwrap_or(serde_json::Value::Null);
-                                            ccteam_hooks::dispatch(
-                                                &dispatch_paths,
-                                                &event.kind,
-                                                event.action.as_deref(),
-                                                &stdin,
-                                            )
-                                        })
-                                        .await;
-                                        match res {
-                                            Ok(Ok(_)) => {}
-                                            Ok(Err(err)) => tracing::warn!(
-                                                error = %err,
-                                                "W6 hook-sink: dispatch failed; event dropped"
-                                            ),
-                                            Err(je) => tracing::warn!(
-                                                ?je,
-                                                "W6 hook-sink: dispatch task panicked"
-                                            ),
-                                        }
+        let hook_sink_handle = if ccteam_core::hooks_dispatcher::hook_via_daemon_enabled() {
+            let socket = ccteam_harness::default_ccteam_hook_socket_path();
+            match ccteam_harness::HookSink::bind(&socket) {
+                Ok(mut sink) => {
+                    tracing::info!(
+                        socket = %socket.display(),
+                        "W6 hook-sink bound (CCTEAM_HOOK_VIA_DAEMON=1): daemon is single progress.jsonl writer"
+                    );
+                    let dispatch_paths = hook_sink_paths.clone();
+                    let mut rx = shutdown_rx.clone();
+                    Some(tokio::spawn(async move {
+                        loop {
+                            tokio::select! {
+                                _ = rx.changed() => break,
+                                maybe = sink.recv() => {
+                                    let Some(event) = maybe else { break };
+                                    ccteam_harness::execution::typed_events::enrich_session_from_hook(&event);
+                                    let dispatch_paths = dispatch_paths.clone();
+                                    let res = tokio::task::spawn_blocking(move || {
+                                        let stdin: serde_json::Value =
+                                            serde_json::from_str(&event.payload_json)
+                                                .unwrap_or(serde_json::Value::Null);
+                                        ccteam_hooks::dispatch(
+                                            &dispatch_paths,
+                                            &event.kind,
+                                            event.action.as_deref(),
+                                            &stdin,
+                                        )
+                                    })
+                                    .await;
+                                    match res {
+                                        Ok(Ok(_)) => {}
+                                        Ok(Err(err)) => tracing::warn!(
+                                            error = %err,
+                                            "W6 hook-sink: dispatch failed; event dropped"
+                                        ),
+                                        Err(je) => tracing::warn!(
+                                            ?je,
+                                            "W6 hook-sink: dispatch task panicked"
+                                        ),
                                     }
                                 }
                             }
-                            // Keep the sink (and thus the bound socket)
-                            // alive for the whole task body; drop here on
-                            // shutdown removes the socket file.
-                            drop(sink);
-                        }))
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            socket = %socket.display(),
-                            error = %err,
-                            "W6 hook-sink bind failed; chat-mode hooks will fail to route (set CCTEAM_HOOK_VIA_DAEMON only when intended)"
-                        );
-                        None
-                    }
+                        }
+                        drop(sink);
+                    }))
                 }
-            } else {
-                None
-            };
-
-            let orch_shutdown = {
-                let mut rx = shutdown_rx.clone();
-                async move {
-                    let _ = rx.changed().await;
-                }
-            };
-            let orch_result = orchestrator.run(orch_shutdown).await;
-
-            // F163 — drain web + IMD tasks with a 5s hard timeout each.
-            // The orchestrator already did its own 30s graceful drain for
-            // project loops; web/imd should respond quickly to the
-            // shutdown channel. If they don't, abort to unblock the
-            // pidfile cleanup and port release.
-            const TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-
-            // Drain the web task once shutdown propagates.
-            if let Some(h) = web_handle {
-                match tokio::time::timeout(TASK_DRAIN_TIMEOUT, h).await {
-                    Ok(Ok(Ok(()))) => {}
-                    Ok(Ok(Err(err))) => tracing::warn!(?err, "ccteam web exited with error"),
-                    Ok(Err(je)) if je.is_cancelled() => {}
-                    Ok(Err(je)) => tracing::warn!(?je, "ccteam web task panicked"),
-                    Err(_) => {
-                        tracing::warn!(
-                            timeout_secs = TASK_DRAIN_TIMEOUT.as_secs(),
-                            "ccteam web drain timed out; aborting (port will be released by OS)"
-                        );
-                    }
+                Err(err) => {
+                    tracing::warn!(
+                        socket = %socket.display(),
+                        error = %err,
+                        "W6 hook-sink bind failed; chat-mode hooks will fail to route (set CCTEAM_HOOK_VIA_DAEMON only when intended)"
+                    );
+                    None
                 }
             }
-            // V0.6.1 F130 — drain the IMD task on the same shutdown
-            // boundary so a slow supervisor tick can finish before the
-            // runtime exits. F163: capped at 5s to avoid hanging on
-            // a slow Telegram long-poll wakeup.
-            if let Some(h) = imd_handle {
-                match tokio::time::timeout(TASK_DRAIN_TIMEOUT, h).await {
-                    Ok(Ok(Ok(()))) => {}
-                    Ok(Ok(Err(err))) => tracing::warn!(?err, "ccteam-im exited with error"),
-                    Ok(Err(je)) if je.is_cancelled() => {}
-                    Ok(Err(je)) => tracing::warn!(?je, "ccteam-im task panicked"),
-                    Err(_) => {
-                        tracing::warn!(
-                            timeout_secs = TASK_DRAIN_TIMEOUT.as_secs(),
-                            "ccteam-im drain timed out; aborting"
-                        );
-                    }
+        } else {
+            None
+        };
+
+        let mut gateway_shutdown = shutdown_rx.clone();
+        let _ = gateway_shutdown.changed().await;
+
+        const TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+        if let Some(h) = web_handle {
+            match tokio::time::timeout(TASK_DRAIN_TIMEOUT, h).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(err))) => tracing::warn!(?err, "ccteam web exited with error"),
+                Ok(Err(je)) if je.is_cancelled() => {}
+                Ok(Err(je)) => tracing::warn!(?je, "ccteam web task panicked"),
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_secs = TASK_DRAIN_TIMEOUT.as_secs(),
+                        "ccteam web drain timed out; aborting (port will be released by OS)"
+                    );
                 }
             }
-            // V0.8 rmux W6 — drain the hook-sink task on the same
-            // shutdown boundary. It responds to the watch channel
-            // immediately (select! break), so the 5s cap is just a
-            // safety net.
-            if let Some(h) = hook_sink_handle {
-                match tokio::time::timeout(TASK_DRAIN_TIMEOUT, h).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(je)) if je.is_cancelled() => {}
-                    Ok(Err(je)) => tracing::warn!(?je, "W6 hook-sink task panicked"),
-                    Err(_) => {
-                        tracing::warn!(
-                            timeout_secs = TASK_DRAIN_TIMEOUT.as_secs(),
-                            "W6 hook-sink drain timed out; aborting"
-                        );
-                    }
+        }
+        if let Some(h) = imd_handle {
+            match tokio::time::timeout(TASK_DRAIN_TIMEOUT, h).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(err))) => tracing::warn!(?err, "ccteam-im exited with error"),
+                Ok(Err(je)) if je.is_cancelled() => {}
+                Ok(Err(je)) => tracing::warn!(?je, "ccteam-im task panicked"),
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_secs = TASK_DRAIN_TIMEOUT.as_secs(),
+                        "ccteam-im drain timed out; aborting"
+                    );
                 }
             }
-            signal_task.abort();
-            unroster_task.abort();
-
-            // F163 retro — flip the AgentTeamsWatcher cancel flag so its
-            // `spawn_blocking` thread exits within `WATCHER_SHUTDOWN_POLL`
-            // (500ms) instead of holding `BlockingPool::shutdown` for up
-            // to a full `TEAMS_DISCOVERY_INTERVAL` (60s) at process tear-
-            // down. Paired with the explicit `runtime.shutdown_timeout`
-            // outside this `block_on` for defense in depth.
-            if let Some(cancel) = agent_teams_cancel {
-                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        match tokio::time::timeout(TASK_DRAIN_TIMEOUT, mcp_handle).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(err))) => tracing::warn!(?err, "ccteam MCP socket exited with error"),
+            Ok(Err(je)) if je.is_cancelled() => {}
+            Ok(Err(je)) => tracing::warn!(?je, "ccteam MCP socket task panicked"),
+            Err(_) => {
+                tracing::warn!(
+                    timeout_secs = TASK_DRAIN_TIMEOUT.as_secs(),
+                    "ccteam MCP socket drain timed out; aborting"
+                );
             }
+        }
+        if let Some(h) = hook_sink_handle {
+            match tokio::time::timeout(TASK_DRAIN_TIMEOUT, h).await {
+                Ok(Ok(())) => {}
+                Ok(Err(je)) if je.is_cancelled() => {}
+                Ok(Err(je)) => tracing::warn!(?je, "W6 hook-sink task panicked"),
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_secs = TASK_DRAIN_TIMEOUT.as_secs(),
+                        "W6 hook-sink drain timed out; aborting"
+                    );
+                }
+            }
+        }
+        signal_task.abort();
 
-            // F163 — explicit log: tmux sessions are intentionally left
-            // running. Daemon stop ≠ bot session stop (CLAUDE.md §三 red
-            // line: 永不主动 kill 长 session).
-            tracing::info!(
-                "graceful shutdown complete; tmux sessions (if any) left running intentionally — \
-                 `ccteam start` will reattach to them"
-            );
+        tracing::info!(
+            "graceful shutdown complete; agent sessions (if any) left running intentionally — \
+             `ccteam start` will reattach to them"
+        );
 
-            orch_result
-        })
-    })();
-    // F163 retro — explicit bounded shutdown of the tokio blocking pool.
-    // `Runtime::drop` calls `BlockingPool::shutdown(None)` which waits
-    // **forever** for every `spawn_blocking` task to return. The
-    // AgentTeamsWatcher cancel above takes care of the long-poll
-    // watcher loop, but any straggler (workflow_watcher tx-is_closed
-    // race, per-project ArtifactWatcher mid-syscall, transient claude
-    // GC sweep) could still hold the pool. A 5s ceiling matches the
-    // per-task drain timeout used inside `block_on` and keeps total
-    // worst-case shutdown at ≤ 30s orch + 5s web + 5s imd + 5s pool =
-    // 45s well under the user-observed >60s hang.
+        Ok(())
+    });
+    // Keep runtime teardown bounded even if a blocking hook dispatch is
+    // mid-flight during shutdown.
     runtime.shutdown_timeout(Duration::from_secs(5));
     ccteam_core::remove_pidfile(&cleanup_paths);
     result
+}
+
+#[cfg(unix)]
+fn mcp_socket_path(paths: &CcteamPaths) -> PathBuf {
+    paths.root.join("run").join("mcp.sock")
+}
+
+#[cfg(unix)]
+async fn serve_mcp_socket<F>(paths: CcteamPaths, shutdown: F) -> Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let socket = mcp_socket_path(&paths);
+    if let Some(parent) = socket.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create MCP socket dir {}", parent.display()))?;
+    }
+    let _ = std::fs::remove_file(&socket);
+    let listener = tokio::net::UnixListener::bind(&socket)
+        .with_context(|| format!("bind MCP socket {}", socket.display()))?;
+    tracing::info!(socket = %socket.display(), "ccteam MCP socket listening");
+
+    let mut shutdown = Box::pin(shutdown);
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => {
+                let _ = std::fs::remove_file(&socket);
+                return Ok(());
+            }
+            accepted = listener.accept() => {
+                let (stream, _addr) = accepted
+                    .with_context(|| format!("accept MCP socket {}", socket.display()))?;
+                let paths = paths.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = handle_mcp_socket_connection(paths, stream).await {
+                        tracing::warn!(error = %err, "MCP socket connection failed");
+                    }
+                });
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn serve_mcp_socket<F>(_paths: CcteamPaths, shutdown: F) -> Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    shutdown.await;
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn handle_mcp_socket_connection(
+    paths: CcteamPaths,
+    stream: tokio::net::UnixStream,
+) -> Result<()> {
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = tokio::io::BufReader::new(reader).lines();
+    while let Some(line) = lines.next_line().await.context("read MCP socket line")? {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let req: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(value) => value,
+            Err(err) => {
+                let response = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": null,
+                    "error": { "code": -32700, "message": format!("parse error: {err}") },
+                });
+                let mut out = serde_json::to_string(&response)?;
+                out.push('\n');
+                writer.write_all(out.as_bytes()).await?;
+                writer.flush().await?;
+                continue;
+            }
+        };
+        if let Some(response) = mcp_serve::handle_request(&paths, &req).await {
+            let mut out = serde_json::to_string(&response)?;
+            out.push('\n');
+            writer.write_all(out.as_bytes()).await?;
+            writer.flush().await?;
+        }
+    }
+    Ok(())
 }
 
 async fn wait_for_shutdown_signal() {
@@ -2102,15 +2105,19 @@ async fn wait_for_shutdown_signal() {
     // graceful cancel via Notify channel). SIGTERM is retained for
     // systemd / docker-stop callers; either trigger is sufficient.
     let trigger = shutdown_trigger_path();
-    // Drain any stale trigger left by a previous run before we begin
-    // polling so we don't insta-shutdown on startup.
-    let _ = std::fs::remove_file(&trigger);
+    let self_pid = std::process::id();
     let trigger_poll = async {
         let mut ticker = tokio::time::interval(Duration::from_millis(250));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
             if trigger.exists() {
+                let targeted_pid = std::fs::read_to_string(&trigger)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok());
+                if targeted_pid.is_some_and(|pid| pid != self_pid) {
+                    continue;
+                }
                 tracing::info!(
                     path = %trigger.display(),
                     "shutdown trigger file observed (ccteam stop)"
@@ -2146,49 +2153,6 @@ async fn wait_for_shutdown_signal() {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => tracing::info!("ctrl+c received"),
             _ = trigger_poll => tracing::info!("shutdown via trigger file"),
-        }
-    }
-}
-
-/// Poll `/tmp/ccteam-<user>.unroster.<slug>` files every 250ms and,
-/// for each found, call `unroster_project(CancelReason::Removed)` then
-/// remove the trigger. Written by `ccteam remove` (commands::run_remove
-/// step 4); mirrors the F86 shutdown trigger pattern.
-async fn poll_unroster_triggers(orch: std::sync::Arc<Orchestrator>) {
-    let prefix = {
-        let user = std::env::var("USER").unwrap_or_else(|_| "ccteam".into());
-        format!("ccteam-{user}.unroster.")
-    };
-    let tmp = std::path::PathBuf::from("/tmp");
-    // Drain any stale trigger files left by a previous crashed daemon so
-    // a re-created project doesn't get instantly cancelled on startup —
-    // mirrors the stale-shutdown-trigger drain in `wait_for_shutdown_signal`.
-    if let Ok(entries) = std::fs::read_dir(&tmp) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            if name.to_string_lossy().starts_with(&prefix) {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
-    }
-    let mut ticker = tokio::time::interval(Duration::from_millis(250));
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        ticker.tick().await;
-        let entries = match std::fs::read_dir(&tmp) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if let Some(slug) = name_str.strip_prefix(&prefix) {
-                let slug = slug.to_string();
-                let path = entry.path();
-                tracing::info!(slug, "unroster trigger observed; cancelling project loop");
-                orch.unroster_project(&slug, CancelReason::Removed).await;
-                let _ = std::fs::remove_file(&path);
-            }
         }
     }
 }

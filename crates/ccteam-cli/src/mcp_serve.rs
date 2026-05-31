@@ -267,7 +267,7 @@ async fn signal_recv(_: &mut SigStream) {
 
 /// Dispatch a single JSON-RPC message. Returns `Some(response)` for
 /// requests (which carry an `id`) and `None` for notifications.
-async fn handle_request(paths: &CcteamPaths, req: &Value) -> Option<Value> {
+pub(crate) async fn handle_request(paths: &CcteamPaths, req: &Value) -> Option<Value> {
     let id = req.get("id").cloned();
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or(json!({}));
