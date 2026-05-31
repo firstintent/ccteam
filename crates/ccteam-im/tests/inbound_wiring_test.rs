@@ -76,6 +76,25 @@ struct GatewayAdapter {
     events: Arc<tokio::sync::Mutex<VecDeque<ThreadEvent>>>,
 }
 
+#[derive(Debug)]
+struct FailingGatewayAdapter {
+    fail_start: bool,
+    fail_submit: bool,
+    starts: AtomicUsize,
+    submits: AtomicUsize,
+}
+
+impl FailingGatewayAdapter {
+    fn new(fail_start: bool, fail_submit: bool) -> Self {
+        Self {
+            fail_start,
+            fail_submit,
+            starts: AtomicUsize::new(0),
+            submits: AtomicUsize::new(0),
+        }
+    }
+}
+
 #[async_trait]
 impl HarnessAdapter for GatewayAdapter {
     fn name(&self) -> &'static str {
@@ -134,6 +153,65 @@ impl HarnessAdapter for GatewayAdapter {
                 Some((evt, ()))
             }
         }))
+    }
+
+    async fn resume_thread(&self, _id: &str) -> Result<ThreadHandle, HarnessError> {
+        Err(HarnessError::NotImplemented {
+            reason: "stub".into(),
+        })
+    }
+
+    async fn close_thread(&self, _h: &ThreadHandle) -> Result<(), HarnessError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl HarnessAdapter for FailingGatewayAdapter {
+    fn name(&self) -> &'static str {
+        "failing-gateway-stub"
+    }
+
+    fn vendor(&self) -> AgentVendor {
+        AgentVendor::Claude
+    }
+
+    async fn start_thread(
+        &self,
+        spec: &AgentSpecBrief,
+        ctx: &SpawnCtx,
+    ) -> Result<ThreadHandle, HarnessError> {
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        if self.fail_start {
+            return Err(HarnessError::SpawnFailed(
+                "simulated start failure".to_string(),
+            ));
+        }
+        Ok(ThreadHandle {
+            vendor: AgentVendor::Claude,
+            mode: ExecutionMode::Chat,
+            identity: format!("gateway-{}-{}-{}", ctx.slug, spec.role, ctx.sid),
+            started_at: chrono::Utc::now(),
+            raw_extras: serde_json::json!({}),
+        })
+    }
+
+    async fn submit_turn(
+        &self,
+        _h: &ThreadHandle,
+        _input: TurnInput,
+    ) -> Result<TurnId, HarnessError> {
+        self.submits.fetch_add(1, Ordering::SeqCst);
+        if self.fail_submit {
+            return Err(HarnessError::SubmitFailed(
+                "simulated submit failure".to_string(),
+            ));
+        }
+        Ok(TurnId::new("failing-stub-turn"))
+    }
+
+    fn events(&self, _h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
+        Box::pin(futures::stream::empty())
     }
 
     async fn resume_thread(&self, _id: &str) -> Result<ThreadHandle, HarnessError> {
@@ -437,6 +515,100 @@ async fn daemon_replays_queued_durable_outbound_to_mock_channel() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_surfaces_start_failure_to_im_and_ledger() {
+    let _g = env_lock();
+    let home = isolate_home();
+    let projects_root = home.path().join("projects");
+    std::fs::create_dir_all(&projects_root).unwrap();
+
+    let mock = Arc::new(MockChannel::new());
+    mock.push(ChannelMessage {
+        id: "fail-start-1".into(),
+        sender: "alice".into(),
+        reply_target: "chat-1".into(),
+        content: "/new claude helper".into(),
+        channel: "telegram".into(),
+        timestamp: 0,
+        thread_ts: None,
+    })
+    .await;
+    let adapter = Arc::new(FailingGatewayAdapter::new(true, false));
+    run_mock_gateway_daemon(projects_root, Arc::clone(&mock), Arc::clone(&adapter)).await;
+
+    let contents: Vec<String> = mock
+        .outbox()
+        .await
+        .into_iter()
+        .map(|message| message.content)
+        .collect();
+    assert_eq!(
+        contents,
+        vec!["gateway error: spawn failed: simulated start failure"]
+    );
+    assert_eq!(adapter.starts.load(Ordering::SeqCst), 1);
+    let rows = read_durable_outbound_rows();
+    assert!(rows.iter().any(|row| {
+        row["state"] == "sent"
+            && row["message"]["content"] == "gateway error: spawn failed: simulated start failure"
+    }));
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_surfaces_submit_failure_to_im_and_ledger() {
+    let _g = env_lock();
+    let home = isolate_home();
+    let projects_root = home.path().join("projects");
+    std::fs::create_dir_all(&projects_root).unwrap();
+
+    let mock = Arc::new(MockChannel::new());
+    mock.push(ChannelMessage {
+        id: "fail-submit-1".into(),
+        sender: "alice".into(),
+        reply_target: "chat-1".into(),
+        content: "/new claude helper".into(),
+        channel: "telegram".into(),
+        timestamp: 0,
+        thread_ts: None,
+    })
+    .await;
+    mock.push(ChannelMessage {
+        id: "fail-submit-2".into(),
+        sender: "alice".into(),
+        reply_target: "chat-1".into(),
+        content: "hello after start".into(),
+        channel: "telegram".into(),
+        timestamp: 1,
+        thread_ts: None,
+    })
+    .await;
+    let adapter = Arc::new(FailingGatewayAdapter::new(false, true));
+    run_mock_gateway_daemon(projects_root, Arc::clone(&mock), Arc::clone(&adapter)).await;
+
+    let contents: Vec<String> = mock
+        .outbox()
+        .await
+        .into_iter()
+        .map(|message| message.content)
+        .collect();
+    assert_eq!(
+        contents,
+        vec![
+            "created session s1".to_string(),
+            "gateway error: submit failed: simulated submit failure".to_string()
+        ]
+    );
+    assert_eq!(adapter.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(adapter.submits.load(Ordering::SeqCst), 1);
+    let rows = read_durable_outbound_rows();
+    assert!(rows.iter().any(|row| {
+        row["state"] == "sent"
+            && row["message"]["content"] == "gateway error: submit failed: simulated submit failure"
+    }));
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_routes_ws_channel_to_gateway_over_real_socket() {
     let _g = env_lock();
     let home = isolate_home();
@@ -651,6 +823,37 @@ fn spawn_ws_gateway_daemon(
         .unwrap();
     });
     (stop_tx, handle)
+}
+
+async fn run_mock_gateway_daemon<T>(
+    projects_root: std::path::PathBuf,
+    mock: Arc<MockChannel>,
+    adapter: Arc<T>,
+) where
+    T: HarnessAdapter + Send + Sync + 'static,
+{
+    let mut channels: ChannelMap = std::collections::HashMap::new();
+    channels.insert(
+        "telegram".to_string(),
+        mock as Arc<dyn Channel + Send + Sync>,
+    );
+    let adapter_factory: AdapterFactory = {
+        let cloned = Arc::clone(&adapter);
+        Arc::new(move |_| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
+    };
+    let args = DaemonArgs {
+        credentials: None,
+        registry: Some(projects_root),
+        tick: Duration::from_millis(50),
+        max_runtime: Some(Duration::from_millis(600)),
+        adapter_factory: Some(adapter_factory),
+        channels_override: Some(channels),
+    };
+    run_daemon_with_shutdown(args, async {
+        futures::future::pending::<()>().await;
+    })
+    .await
+    .unwrap();
 }
 
 async fn send_ws_text<S>(socket: &mut WebSocketStream<S>, id: &str, content: &str)
