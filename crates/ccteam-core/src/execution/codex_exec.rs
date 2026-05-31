@@ -296,7 +296,7 @@ impl HarnessAdapter for CodexExecAdapter {
         // would otherwise scribble into the developer's real
         // `~/.ccteam/cost-budget.json`. Production paths always set the
         // env (the `ccteam` CLI binary resolves `CcteamPaths::from_env`
-        // at startup; `ccteam-imd` daemon inherits the env from the
+        // at startup; `ccteam-im` daemon inherits the env from the
         // parent shell).
         let ccteam_root_for_budget: Option<std::path::PathBuf> = std::env::var("CCTEAM_HOME")
             .ok()

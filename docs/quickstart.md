@@ -55,7 +55,7 @@ ccteam-scan (quick) → <repo>/.ccteam/codebase-scan.md
   Rust workspace · tokio + axum · entry crates/ccteam-cli/src/main.rs
 
 [2/3] TODO / FIXME hotspots
-  crates/ccteam-imd/src/outbound.rs: 4 TODO
+  crates/ccteam-im/src/outbound.rs: 4 TODO
   docs/troubleshooting.md: 2 FIXME
 
 [3/3] CLAUDE.md / README / AGENTS.md status
@@ -190,7 +190,7 @@ $ claude
 ```
 ✓ Telegram bot 已绑定:@my_helper_bot
 ✓ chat_id 抓到:123456789
-✓ Daemon ccteam-imd 已起
+✓ Daemon ccteam-im 已起
 现在可以跟 @my_helper_bot 私聊:https://t.me/my_helper_bot
 ```
 

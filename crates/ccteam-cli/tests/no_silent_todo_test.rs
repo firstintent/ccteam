@@ -27,7 +27,7 @@ const SCAN_ROOTS: &[&str] = &[
     "crates/ccteam-core/src",
     "crates/ccteam-cli/src",
     "crates/ccteam-cost/src",
-    "crates/ccteam-imd/src",
+    "crates/ccteam-im/src",
     "crates/ccteam-web/src",
 ];
 
@@ -53,7 +53,7 @@ const SISTER_FINDING_ALLOWLIST: &[(&str, &str)] = &[
     // F173 (`v066-w1-codex-critic-ledger`) clears this in the same
     // PR that swaps the Codex arm to `CodexExecAdapter`.
     (
-        "crates/ccteam-imd/src/daemon.rs",
+        "crates/ccteam-im/src/daemon.rs",
         "TODO(wave-3 codex-exec-impl)",
     ),
 ];

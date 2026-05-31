@@ -150,7 +150,7 @@ pub enum WorkflowMode {
     AgentTeam,
     /// V0.6.0 F108. Long-running Claude Code TUI session (tmux +
     /// send-keys -l) acting as a chat bot. User talks to it via IM
-    /// (`ccteam-imd`); each turn is one tmux send-keys + Stop hook.
+    /// (`ccteam-im`); each turn is one tmux send-keys + Stop hook.
     Chat,
     /// V0.6.1 F124 narrow scope. Artifact-driven roster with a
     /// human-in-the-loop gate after every `agent_done`. Orchestrator
@@ -739,7 +739,7 @@ pub struct AgentSpec {
     /// the user replies APPROVE / REJECT / EDIT through the configured
     /// IM outbox (or `timeout_min` elapses, in which case `on_timeout`
     /// fires). Pure schema field here — the engine lives in
-    /// [`crate::plan_approval`] and the IM wiring in `ccteam-imd`.
+    /// [`crate::plan_approval`] and the IM wiring in `ccteam-im`.
     ///
     /// ```yaml
     /// agents:
@@ -819,7 +819,7 @@ pub struct PlanApprovalSpec {
     #[serde(default = "default_plan_approval_enabled")]
     pub enabled: bool,
     /// Outbox channel id (e.g. `telegram`, `slack`). The IM-side
-    /// resolver in `ccteam-imd` maps this to a concrete `Channel`
+    /// resolver in `ccteam-im` maps this to a concrete `Channel`
     /// implementation + recipient. Required.
     pub outbox: String,
     /// Approval window in minutes. `0` disables the timeout (the

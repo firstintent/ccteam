@@ -18,7 +18,7 @@
 //!
 //! No tokio / no notify / no IM client calls live here; the
 //! orchestrator (or a test harness) drives the engine on each tick
-//! and the IM glue in `ccteam-imd` translates the actions.
+//! and the IM glue in `ccteam-im` translates the actions.
 //!
 //! ## Red lines (CLAUDE.md §三 + prd.md §F98)
 //!

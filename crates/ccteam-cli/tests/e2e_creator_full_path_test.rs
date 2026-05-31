@@ -2,7 +2,7 @@
 //!
 //! Background — F148 fixes the deepest root cause of the nas-box005
 //! deploy fiasco: `skills/ccteam-creator/SKILL.md` Phase 5.6 used to
-//! tell the LLM to "call `ccteam_imd::register_bot(...)`" — a Rust
+//! tell the LLM to "call `ccteam_im::register_bot(...)`" — a Rust
 //! function the LLM has no way to invoke. The result: workflow.yaml
 //! landed, .claude/agents/<role>.md landed, .mcp.json landed — but
 //! `~/.ccteam/imd/registry/<slug>/<role>.json` was never written,
@@ -22,7 +22,7 @@
 //!
 //! 2. **Skill text guard** — `skills/ccteam-creator/SKILL.md` Phase
 //!    5.6 mentions `mcp__ccteam__chat_register_bot` (the F148 contract)
-//!    and **not** the legacy `ccteam_imd::register_bot` Rust call.
+//!    and **not** the legacy `ccteam_im::register_bot` Rust call.
 //!    This prevents a future SKILL.md edit from reverting to the
 //!    pre-F148 stub text.
 //!
@@ -274,8 +274,8 @@ fn t_creator_phase_5_6_mcp_call_lands_registration_with_lowercase_vendor() {
         "registration JSON must land on disk at {}",
         registration_path.display(),
     );
-    // Layout assertion — ccteam-imd::registration_path_in canonical form.
-    let expected = ccteam_imd::registration_path_in(&fx.ccteam_home, slug, role);
+    // Layout assertion — ccteam-im::registration_path_in canonical form.
+    let expected = ccteam_im::registration_path_in(&fx.ccteam_home, slug, role);
     assert_eq!(
         registration_path.canonicalize().unwrap(),
         expected.canonicalize().unwrap(),
@@ -297,7 +297,7 @@ fn t_creator_phase_5_6_mcp_call_lands_registration_with_lowercase_vendor() {
 
     // Round-trip via list_bots_in — this is the *daemon's* consumption
     // path; if this returns 1 row, the registry watcher will too.
-    let bots = ccteam_imd::list_bots_in(&fx.ccteam_home, Some(slug)).unwrap();
+    let bots = ccteam_im::list_bots_in(&fx.ccteam_home, Some(slug)).unwrap();
     assert_eq!(
         bots.len(),
         1,
@@ -324,7 +324,7 @@ fn t_creator_phase_5_6_mcp_call_lands_registration_with_lowercase_vendor() {
 
 /// F148 SKILL.md text guard — `Phase 5.6` must mention the MCP tool by
 /// name and must NOT still claim the LLM should call the Rust function
-/// `ccteam_imd::register_bot` (the pre-F148 stub instruction).
+/// `ccteam_im::register_bot` (the pre-F148 stub instruction).
 ///
 /// This is a regression test against doc drift — the skill body is
 /// LLM-consumed, so the only way to keep the wire contract honest is
@@ -361,8 +361,8 @@ fn t_creator_skill_phase_5_6_documents_mcp_tool_not_rust_function() {
     // F148 contract — must NOT still tell the LLM to call the Rust fn
     // (the pre-F148 stub instruction the LLM physically cannot follow).
     assert!(
-        !phase_5_6_body.contains("ccteam_imd::register_bot("),
-        "Phase 5.6 must not still tell the LLM to call the Rust function `ccteam_imd::register_bot(...)`; that was the pre-F148 bug. Got:\n{phase_5_6_body}",
+        !phase_5_6_body.contains("ccteam_im::register_bot("),
+        "Phase 5.6 must not still tell the LLM to call the Rust function `ccteam_im::register_bot(...)`; that was the pre-F148 bug. Got:\n{phase_5_6_body}",
     );
     // F148 contract — lowercase vendor must be called out explicitly
     // (Bug A防线 — daemon BotRegistration deserialize trips on PascalCase).

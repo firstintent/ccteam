@@ -14,11 +14,11 @@ path = "src/main.rs"
 ccteam-core.workspace = true
 ccteam-hooks.workspace = true
 ccteam-web.workspace = true
-# V0.6.1 F130 — IMD supervisor loop folded into `ccteam start` as one
+# V0.6.1 F130 — IM supervisor loop folded into `ccteam start` as one
 # tokio task. The IM-transport transitive deps (`reqwest`) are accepted
 # here because the operator-facing process model collapses to a single
-# `ccteam start` daemon (orchestrator + web + IMD supervisor).
-ccteam-imd.workspace = true
+# `ccteam start` daemon (orchestrator + web + IM supervisor).
+ccteam-im.workspace = true
 # V0.8 W1 — `interactive_attach_argv` for `ccteam attach` / `session
 # attach`. The trait stays out of the sync CLI fns themselves; only
 # the argv-builder is consumed here.

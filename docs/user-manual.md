@@ -613,7 +613,7 @@ qa-loop          $4.12    $5.00     ↘ -3%      ⚠ 82% of cap
 
 ## §6 运维:daemon 优雅停止 + tmux reattach
 
-ccteam 把 orchestrator + IM bridge(`ccteam-imd`) + web 仪表板都装进 `ccteam start` 这一个 tokio runtime,前台跑或加 `&` 后台。
+ccteam 把 orchestrator + IM bridge(`ccteam-im`) + web 仪表板都装进 `ccteam start` 这一个 tokio runtime,前台跑或加 `&` 后台。
 
 **优雅停止**:
 

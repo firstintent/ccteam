@@ -11,7 +11,7 @@ has the platform the rest of the flow needs. **Idempotent** —
 re-running for a platform that's already configured re-verifies the
 token and exits without prompting.
 
-Backed by `ccteam_imd::onboarding::telegram_setup()`.
+Backed by `ccteam_im::onboarding::telegram_setup()`.
 
 ## When to invoke
 
@@ -63,7 +63,7 @@ Wait for the user to paste a token.
 
 ### 2b. Verify token (calls `telegram_setup`)
 
-Call `ccteam_imd::onboarding::telegram_setup(token, poll_seconds=120)`.
+Call `ccteam_im::onboarding::telegram_setup(token, poll_seconds=120)`.
 
 The function:
 1. Hits `https://api.telegram.org/bot<token>/getMe` to verify the
@@ -96,13 +96,13 @@ While it's running, tell the user:
 Persist via either of these (same behaviour):
 
 ```rust
-ccteam_imd::credentials::save(
-    &ccteam_imd::credentials::default_path(),
+ccteam_im::credentials::save(
+    &ccteam_im::credentials::default_path(),
     &Credentials { telegram: Some(result.creds), ..Default::default() },
 )?;
 
 // or the convenience wrapper:
-ccteam_imd::credentials::write_credentials(
+ccteam_im::credentials::write_credentials(
     &Credentials { telegram: Some(result.creds), ..Default::default() },
 )?;
 ```

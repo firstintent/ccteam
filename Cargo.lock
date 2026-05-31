@@ -362,7 +362,7 @@ dependencies = [
  "ccteam-core",
  "ccteam-harness",
  "ccteam-hooks",
- "ccteam-imd",
+ "ccteam-im",
  "ccteam-web",
  "chrono",
  "clap",
@@ -456,7 +456,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ccteam-imd"
+name = "ccteam-im"
 version = "0.6.8"
 dependencies = [
  "anyhow",

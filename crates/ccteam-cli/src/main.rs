@@ -159,10 +159,10 @@ enum Command {
         /// via a separate `ccteam web` invocation).
         #[arg(long, default_value_t = false)]
         no_web: bool,
-        /// V0.6.1 F130 — skip starting the embedded `ccteam-imd`
+        /// V0.6.1 F130 — skip starting the embedded `ccteam-im`
         /// IM-bot supervisor (Telegram / Slack / Discord bridge). The
         /// supervisor lives in the same process as the orchestrator
-        /// (no separate `ccteam-imd` binary anymore); pass this to
+        /// (no separate `ccteam-im` binary anymore); pass this to
         /// run orchestrator-only without IM transport.
         #[arg(long, default_value_t = false)]
         no_imd: bool,
@@ -1713,7 +1713,7 @@ struct StartWebOpts {
     no_clipboard: bool,
 }
 
-/// V0.6.1 F130 — IMD supervisor task knobs. Today the only operator
+/// V0.6.1 F130 — IM supervisor task knobs. Today the only operator
 /// switch is `disabled` (mirror of `--no-imd`); future knobs (custom
 /// credentials path, custom registry root) attach here without changing
 /// `run_start`'s signature.
@@ -1887,17 +1887,17 @@ fn run_start(
                 }))
             };
 
-            // V0.6.1 F130 — IMD supervisor as a third tokio task sharing
+            // V0.6.1 F130 — IM supervisor as a third tokio task sharing
             // the same shutdown channel. Mirrors the web_handle pattern
-            // above; binary `ccteam-imd` no longer exists.
+            // above; binary `ccteam-im` no longer exists.
             let imd_handle = if imd.disabled {
-                tracing::info!("ccteam start: --no-imd set; IMD supervisor task skipped");
+                tracing::info!("ccteam start: --no-imd set; IM supervisor task skipped");
                 None
             } else {
                 let mut rx = shutdown_rx.clone();
                 Some(tokio::spawn(async move {
-                    ccteam_imd::run_daemon_with_shutdown(
-                        ccteam_imd::DaemonArgs::default(),
+                    ccteam_im::run_daemon_with_shutdown(
+                        ccteam_im::DaemonArgs::default(),
                         async move {
                             let _ = rx.changed().await;
                         },
@@ -2027,13 +2027,13 @@ fn run_start(
             if let Some(h) = imd_handle {
                 match tokio::time::timeout(TASK_DRAIN_TIMEOUT, h).await {
                     Ok(Ok(Ok(()))) => {}
-                    Ok(Ok(Err(err))) => tracing::warn!(?err, "ccteam-imd exited with error"),
+                    Ok(Ok(Err(err))) => tracing::warn!(?err, "ccteam-im exited with error"),
                     Ok(Err(je)) if je.is_cancelled() => {}
-                    Ok(Err(je)) => tracing::warn!(?je, "ccteam-imd task panicked"),
+                    Ok(Err(je)) => tracing::warn!(?je, "ccteam-im task panicked"),
                     Err(_) => {
                         tracing::warn!(
                             timeout_secs = TASK_DRAIN_TIMEOUT.as_secs(),
-                            "ccteam-imd drain timed out; aborting"
+                            "ccteam-im drain timed out; aborting"
                         );
                     }
                 }

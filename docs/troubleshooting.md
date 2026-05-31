@@ -312,7 +312,7 @@
 **原因**:不应发生。`ccteam start` 启动时探测每个已注册 bot 的 `ccteam-chat-<slug>-<role>` tmux session,若 session + pane 内 claude 进程都活 → 自动 reattach(bot context 不丢);若 session 在但 pane 死 → kill stale + spawn `claude --resume <name>`,Anthropic 官方 CLI 直接 reload full API-level context(模型脑子里还有上次的东西)。
 **修复**:
 1. 终端 `tmux ls | grep ccteam-chat-` 看 session 是否存在
-2. 存在但 ccteam 没 reattach → 看 daemon 日志(`~/.ccteam/logs/ccteam-imd.log`)有无 reattach / resume 行
+2. 存在但 ccteam 没 reattach → 看 daemon 日志(`~/.ccteam/logs/ccteam-im.log`)有无 reattach / resume 行
 3. 日志显示 `chat_session_reset` event with `reason="resume_failed_fallback_to_fresh"` → `--resume` 失败(session jsonl 不存在 / 用户清过 `~/.claude/projects/` / Anthropic schema 升级)── bot 已退到 brand-new session,context 真丢;用 `mcp__ccteam__chat_history` 抓上轮 `turns.jsonl` 让 bot 自己重读上下文,或在 IM 端直接 paste 一句 summary
 4. session 不存在 + 无日志(进程被 OOM-killed + `~/.claude/projects/` 也清空)→ ccteam 起新 session,context 确实丢,同上 step 3
 **验证 lossless 恢复**:发条 `刚才那个 X 怎么样?` 风格 follow-up,bot reply 若能直接引用早 turn 内容 = 真 lossless;若 reply 显示"对不起请重述"= fallback 已走。

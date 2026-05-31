@@ -781,7 +781,7 @@ pub fn run_start_agent_team(
         (ccteam_core::WorkflowMode::Chat, _) => bail!(
             "project `{slug}` is in chat mode (V0.6.0 F108); `ccteam start <slug>` is not\n  \
              the chat-mode entry point. Bots are launched via the IM channel + \n  \
-             `ccteam-imd` daemon, not the agent-team start flow.",
+             `ccteam-im` daemon, not the agent-team start flow.",
         ),
         (ccteam_core::WorkflowMode::HumanApproval, _) => bail!(
             "project `{slug}` is in human-approval mode (V0.6.1 F124); `ccteam start <slug>`\n  \
@@ -4719,7 +4719,7 @@ pub fn run_admin_register_bot(
     project_dir_in: Option<&std::path::Path>,
 ) -> Result<String> {
     use ccteam_core::harness::AgentVendor;
-    use ccteam_imd::{register_bot_checked_in, RegisterOutcome};
+    use ccteam_im::{register_bot_checked_in, RegisterOutcome};
 
     // Slug / role share the same validator as the MCP path
     // (alphanumeric + `-` + `_`).
@@ -4822,7 +4822,7 @@ pub fn run_admin_register_bot(
 /// MCP `ccteam__chat_unregister_bot` path: idempotent — returns
 /// `ok:true, removed:false` when no registration exists.
 pub fn run_admin_unregister_bot(paths: &CcteamPaths, slug: &str, role: &str) -> Result<String> {
-    use ccteam_imd::unregister_bot_in;
+    use ccteam_im::unregister_bot_in;
 
     crate::mcp_chat_tools::validate_slug(slug, "slug")?;
     crate::mcp_chat_tools::validate_slug(role, "role")?;
@@ -4848,7 +4848,7 @@ pub fn run_admin_list_bots(
     filter_slug: Option<&str>,
     json: bool,
 ) -> Result<String> {
-    use ccteam_imd::{bot_running_status_in, list_bots_in};
+    use ccteam_im::{bot_running_status_in, list_bots_in};
 
     if let Some(slug) = filter_slug {
         crate::mcp_chat_tools::validate_slug(slug, "slug")?;
@@ -5114,7 +5114,7 @@ pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Resul
 /// V0.6.5 F151 — purge `~/.ccteam/imd/registry/<slug>/`.
 ///
 /// **Strategy:** for each registered role under the slug, call
-/// [`ccteam_imd::unregister_bot_in`] first — this is the in-process
+/// [`ccteam_im::unregister_bot_in`] first — this is the in-process
 /// equivalent of the `chat_unregister_bot` MCP tool. It deletes the
 /// `<role>.json` registry file *and* the `<role>.heartbeat` sidecar,
 /// which is exactly what the daemon's registry watcher observes to
@@ -5132,7 +5132,7 @@ fn purge_imd_registry_for_slug(
     dry_run: bool,
     report: &mut RemoveReport,
 ) -> Result<()> {
-    let slug_dir = ccteam_imd::registry_root_in(ccteam_root).join(slug);
+    let slug_dir = ccteam_im::registry_root_in(ccteam_root).join(slug);
     if !slug_dir.exists() {
         // Nothing to clean — non-chat slug or already pristine. Stay
         // silent (don't add a "nothing to do" step row that clutters
@@ -5143,7 +5143,7 @@ fn purge_imd_registry_for_slug(
     // Enumerate roles via list_bots_in (so we route through the F146
     // MCP-equivalent surface). Falls back to empty list on parse errors;
     // the final rm -rf still catches whatever remains.
-    let bots = ccteam_imd::list_bots_in(ccteam_root, Some(slug)).unwrap_or_default();
+    let bots = ccteam_im::list_bots_in(ccteam_root, Some(slug)).unwrap_or_default();
     let role_count = bots.len();
 
     if dry_run {
@@ -5169,7 +5169,7 @@ fn purge_imd_registry_for_slug(
     // Step 6a — per-role unregister (MCP-equivalent in-process call).
     // Idempotent miss is fine; just records the path that *was* there.
     for reg in bots {
-        match ccteam_imd::unregister_bot_in(ccteam_root, &reg.workflow_slug, &reg.role) {
+        match ccteam_im::unregister_bot_in(ccteam_root, &reg.workflow_slug, &reg.role) {
             Ok((removed, path)) => {
                 if removed {
                     report.steps.push(format!(

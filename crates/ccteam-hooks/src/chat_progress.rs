@@ -201,7 +201,7 @@ fn write_marker_atomic(path: &Path, body: &str) -> Result<()> {
 /// project-dir basename as a fallback because chat-mode tmux session
 /// names are `ccteam-chat-<slug>-<role>` and the hook doesn't carry
 /// that name natively; the orchestrator-side stamping (the eventual
-/// `ccteam_imd` PR) will inject `role` directly into the env we read.
+/// `ccteam_im` PR) will inject `role` directly into the env we read.
 fn derive_role_from_payload(stdin: &Value) -> Option<String> {
     if let Some(r) = stdin.get("role").and_then(|v| v.as_str()) {
         if !r.is_empty() {
@@ -209,7 +209,7 @@ fn derive_role_from_payload(stdin: &Value) -> Option<String> {
         }
     }
     // CCTEAM_CHAT_ROLE env override — chat-mode hook scaffold sets this
-    // when ccteam-imd spawns the tmux session.
+    // when ccteam-im spawns the tmux session.
     if let Ok(r) = std::env::var("CCTEAM_CHAT_ROLE") {
         if !r.is_empty() {
             return Some(r);

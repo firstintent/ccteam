@@ -238,7 +238,7 @@ budgets:
 
 | 值 | 形态 | provider 支持 |
 |---|---|---|
-| `openhuman`(default)| `ccteam-imd` daemon + `openhuman/channels` crate | Telegram(stable);Slack / Discord(provider Rust 就位,onboarding skill 在 backlog);Lark / DingTalk / QQ / WeChat(feature gate,onboarding 在 backlog)|
+| `openhuman`(default)| `ccteam-im` daemon + `openhuman/channels` crate | Telegram(stable);Slack / Discord(provider Rust 就位,onboarding skill 在 backlog);Lark / DingTalk / QQ / WeChat(feature gate,onboarding 在 backlog)|
 | `official-telegram` | `claude --channels plugin:telegram@claude-plugins-official` | Telegram only |
 
 切换走 `/ccteam-im-setup --transport <name>`,不让用户编辑 yaml。两 path 互斥(同 bot token 不可同时绑两条)。

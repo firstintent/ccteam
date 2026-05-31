@@ -506,7 +506,7 @@ fn t06_force_overrides_refusal() {
 /// produces.
 fn seed_imd_registry(fx: &Fixture, role: &str) -> (std::path::PathBuf, std::path::PathBuf) {
     use ccteam_core::harness::AgentVendor;
-    let outcome = ccteam_imd::register_bot_checked_in(
+    let outcome = ccteam_im::register_bot_checked_in(
         &fx.ccteam_home,
         &fx.slug,
         role,
@@ -519,11 +519,11 @@ fn seed_imd_registry(fx: &Fixture, role: &str) -> (std::path::PathBuf, std::path
     )
     .expect("seed registry");
     let reg_path = match outcome {
-        ccteam_imd::RegisterOutcome::Registered(p) => p,
-        ccteam_imd::RegisterOutcome::AlreadyRegistered(p) => p,
+        ccteam_im::RegisterOutcome::Registered(p) => p,
+        ccteam_im::RegisterOutcome::AlreadyRegistered(p) => p,
     };
     // Drop a heartbeat sidecar so we can assert it gets cleaned too.
-    let hb = ccteam_imd::bot_heartbeat_path_in(&fx.ccteam_home, &fx.slug, role);
+    let hb = ccteam_im::bot_heartbeat_path_in(&fx.ccteam_home, &fx.slug, role);
     std::fs::write(&hb, chrono::Utc::now().to_rfc3339()).unwrap();
     assert!(reg_path.exists(), "fixture: registration JSON seeded");
     assert!(hb.exists(), "fixture: heartbeat seeded");
@@ -538,7 +538,7 @@ fn t09_purge_cleans_imd_registry_dir() {
     // loop + final rm -rf both work.
     let (reg_a, hb_a) = seed_imd_registry(&fx, "helper");
     let (reg_b, hb_b) = seed_imd_registry(&fx, "critic");
-    let slug_dir = ccteam_imd::registry_root_in(&fx.ccteam_home).join(&fx.slug);
+    let slug_dir = ccteam_im::registry_root_in(&fx.ccteam_home).join(&fx.slug);
     assert!(slug_dir.is_dir(), "fixture: imd/registry/<slug>/ seeded");
 
     let out = fx
@@ -588,7 +588,7 @@ fn t10_remove_without_purge_keeps_imd_registry() {
     let fx = Fixture::new("dex-bot");
     fx.seed_closed_progress();
     let (reg_path, hb_path) = seed_imd_registry(&fx, "helper");
-    let slug_dir = ccteam_imd::registry_root_in(&fx.ccteam_home).join(&fx.slug);
+    let slug_dir = ccteam_im::registry_root_in(&fx.ccteam_home).join(&fx.slug);
 
     let out = fx
         .cmd()

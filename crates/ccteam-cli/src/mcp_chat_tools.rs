@@ -9,7 +9,7 @@
 //! V0.6.5 F147 lands the remaining 3 stubs as real implementations
 //! against the same file-system control plane:
 //!
-//! - `chat_send_input` — writes an [`ccteam_imd::inbound::InboxEnvelope`]
+//! - `chat_send_input` — writes an [`ccteam_im::inbound::InboxEnvelope`]
 //!   into the bot's mailbox dir (`<project>/.ccteam/chat/<role>/inbox/msg-<unix-ms>-<rand>.md`).
 //!   The daemon's per-bot mpsc fast-path (or the safety-net
 //!   `drain_inboxes` tick) picks it up and submits to the live tmux
@@ -29,7 +29,7 @@
 //!
 //! Architecture:
 //!
-//! - The 3 lifecycle / list tools wrap `ccteam_imd::{register_bot_checked_in,
+//! - The 3 lifecycle / list tools wrap `ccteam_im::{register_bot_checked_in,
 //!   unregister_bot_in, list_bots_in}` (file-system control plane:
 //!   registry JSON under `<ccteam_root>/imd/registry/<slug>/<role>.json`).
 //! - `running` status comes from a sidecar heartbeat file the daemon's
@@ -50,8 +50,8 @@ use ccteam_core::agent_naming::pick_unused_bot_name;
 use ccteam_core::execution::turns_mirror::{read_all_turns, TurnRecord};
 use ccteam_core::harness::AgentVendor;
 use ccteam_core::paths::CcteamPaths;
-use ccteam_imd::inbound::{render_envelope, InboxEnvelope};
-use ccteam_imd::{
+use ccteam_im::inbound::{render_envelope, InboxEnvelope};
+use ccteam_im::{
     bot_running_status_in, chat_inbox_dir, chat_reset_signal_path, last_turn_at, list_bots_in,
     register_bot_checked_in, turns_jsonl_path, unregister_bot_in, RegisterOutcome,
 };
@@ -188,7 +188,7 @@ fn lookup_or_synthesize_reg(
     ccteam_root: &Path,
     workflow_slug: &str,
     role: &str,
-) -> ccteam_imd::BotRegistration {
+) -> ccteam_im::BotRegistration {
     let regs = list_bots_in(ccteam_root, Some(workflow_slug)).unwrap_or_default();
     if let Some(r) = regs
         .into_iter()
@@ -196,7 +196,7 @@ fn lookup_or_synthesize_reg(
     {
         return r;
     }
-    ccteam_imd::BotRegistration {
+    ccteam_im::BotRegistration {
         workflow_slug: workflow_slug.to_string(),
         role: role.to_string(),
         // Vendor / im_platform / im_chat_id are unused on the
@@ -771,7 +771,7 @@ mod tests {
         let disk = std::fs::read_to_string(path).unwrap();
         // Envelope round-trips through inbound::parse_envelope (same
         // wire format the daemon's drain_inboxes / mpsc fast-path uses).
-        let env = ccteam_imd::inbound::parse_envelope(&disk).unwrap();
+        let env = ccteam_im::inbound::parse_envelope(&disk).unwrap();
         assert_eq!(env.payload, "hello world");
         assert_eq!(env.platform, "mcp");
         assert!(path.contains("demo/.ccteam/chat/helper/inbox/msg-"));
@@ -1067,7 +1067,7 @@ mod tests {
         )
         .unwrap();
         // Touch heartbeat — running should flip to true.
-        let hb = ccteam_imd::bot_heartbeat_path_in(&p.root, "demo", "helper");
+        let hb = ccteam_im::bot_heartbeat_path_in(&p.root, "demo", "helper");
         std::fs::create_dir_all(hb.parent().unwrap()).unwrap();
         std::fs::write(&hb, chrono::Utc::now().to_rfc3339()).unwrap();
         let body = dispatch_list_bots(&p, &json!({})).unwrap();

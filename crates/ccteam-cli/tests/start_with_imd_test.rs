@@ -1,4 +1,4 @@
-//! V0.6.1 F130 — `ccteam start` folds the IMD supervisor in-process.
+//! V0.6.1 F130 — `ccteam start` folds the IM supervisor in-process.
 //!
 //! Two surface-level guarantees we check here without spinning up
 //! the full daemon (that would require a registered project, tmux,
@@ -7,9 +7,9 @@
 //! 1. `ccteam start --help` advertises `--no-imd` (mirror of the
 //!    pre-existing `--no-web`) so the operator switch survives any
 //!    accidental rename of the clap arg.
-//! 2. The standalone `ccteam-imd` binary no longer exists in the
+//! 2. The standalone `ccteam-im` binary no longer exists in the
 //!    cargo workspace — F130 removed the `[[bin]]` from
-//!    `ccteam-imd/Cargo.toml` and deleted `src/main.rs`. Cargo's
+//!    `ccteam-im/Cargo.toml` and deleted `src/main.rs`. Cargo's
 //!    `CARGO_BIN_EXE_<name>` env var is only emitted for binaries
 //!    declared in the workspace; absence is the cleanest proof.
 //! 3. An end-to-end smoke that boots `ccteam start --no-web` in the
@@ -45,26 +45,26 @@ fn start_help_advertises_no_imd_flag() {
 }
 
 #[test]
-fn standalone_ccteam_imd_binary_no_longer_exists() {
-    // F130: `[[bin]]` was removed from crates/ccteam-imd/Cargo.toml.
-    // Cargo only injects CARGO_BIN_EXE_ccteam-imd at compile time
+fn standalone_ccteam_im_binary_no_longer_exists() {
+    // F130: `[[bin]]` was removed from crates/ccteam-im/Cargo.toml.
+    // Cargo only injects CARGO_BIN_EXE_ccteam-im at compile time
     // when the workspace declares such a binary; we should NOT find
     // an executable at any historical release path either.
     let candidates = [
-        PathBuf::from("target/debug/ccteam-imd"),
-        PathBuf::from("target/release/ccteam-imd"),
+        PathBuf::from("target/debug/ccteam-im"),
+        PathBuf::from("target/release/ccteam-im"),
     ];
     // CARGO_TARGET_DIR redirection (e.g. shared-target workspaces) is
     // optional; if set, also check there.
     let mut search: Vec<PathBuf> = candidates.to_vec();
     if let Ok(td) = std::env::var("CARGO_TARGET_DIR") {
-        search.push(PathBuf::from(&td).join("debug/ccteam-imd"));
-        search.push(PathBuf::from(&td).join("release/ccteam-imd"));
+        search.push(PathBuf::from(&td).join("debug/ccteam-im"));
+        search.push(PathBuf::from(&td).join("release/ccteam-im"));
     }
     for p in &search {
         assert!(
             !p.is_file(),
-            "F130: standalone ccteam-imd binary should be gone, but found {}",
+            "F130: standalone ccteam-im binary should be gone, but found {}",
             p.display()
         );
     }

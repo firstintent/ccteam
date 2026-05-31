@@ -702,7 +702,7 @@ impl Orchestrator {
     ///
     /// Per the Wave 3 e2e-wiring contract: the orchestrator currently
     /// short-circuits `WorkflowMode::Chat` (lifecycle owned by
-    /// `ccteam-imd`); this helper is the seam future spawn paths reach
+    /// `ccteam-im`); this helper is the seam future spawn paths reach
     /// through once orchestrator-owned chat scenarios land.
     pub fn pick_adapter(
         &self,
@@ -841,7 +841,7 @@ impl Orchestrator {
             }),
         )?;
 
-        // V0.6.0 Wave 3 — `mode: chat` is owned by `ccteam-imd` end to
+        // V0.6.0 Wave 3 — `mode: chat` is owned by `ccteam-im` end to
         // end. The daemon spawns the tmux session via
         // `ClaudeTuiAdapter::start_thread`, drives turns from IM input,
         // and tails `turns.jsonl` for outbound. Orchestrator's role is
@@ -853,7 +853,7 @@ impl Orchestrator {
         if matches!(spec.mode, WorkflowMode::Chat) {
             tracing::info!(
                 slug,
-                "mode: chat workflow — ccteam-imd owns lifecycle; orchestrator exiting"
+                "mode: chat workflow — ccteam-im owns lifecycle; orchestrator exiting"
             );
             return Ok(());
         }
