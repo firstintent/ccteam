@@ -71,6 +71,7 @@ struct StubAdapter {
 struct GatewayAdapter {
     starts: AtomicUsize,
     submits: AtomicUsize,
+    submitted_threads: tokio::sync::Mutex<Vec<String>>,
     submitted_payloads: tokio::sync::Mutex<Vec<String>>,
     events: Arc<tokio::sync::Mutex<VecDeque<ThreadEvent>>>,
 }
@@ -102,7 +103,7 @@ impl HarnessAdapter for GatewayAdapter {
 
     async fn submit_turn(
         &self,
-        _h: &ThreadHandle,
+        h: &ThreadHandle,
         input: TurnInput,
     ) -> Result<TurnId, HarnessError> {
         self.submits.fetch_add(1, Ordering::SeqCst);
@@ -110,6 +111,7 @@ impl HarnessAdapter for GatewayAdapter {
             TurnInput::UserText(s) => s,
             other => format!("{other:?}"),
         };
+        self.submitted_threads.lock().await.push(h.identity.clone());
         self.submitted_payloads.lock().await.push(text.clone());
         self.events
             .lock()
@@ -452,6 +454,122 @@ async fn daemon_routes_ws_channel_to_gateway_over_real_socket() {
     assert_eq!(adapter.submits.load(Ordering::SeqCst), 1);
 
     daemon.await.unwrap();
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_restart_preserves_ws_gateway_session() {
+    let _g = env_lock();
+    let home = isolate_home();
+    let projects_root = home.path().join("projects");
+    std::fs::create_dir_all(&projects_root).unwrap();
+
+    let adapter = Arc::new(GatewayAdapter::default());
+    let first_ws = Arc::new(WsChannel::bind_localhost().await.unwrap());
+    let ws_addr = first_ws.local_addr();
+    let ws_url = format!("ws://{ws_addr}");
+    let (first_stop_tx, first_daemon) =
+        spawn_ws_gateway_daemon(projects_root.clone(), first_ws, Arc::clone(&adapter));
+
+    let mut first_socket = connect_ws_with_retry(&ws_url).await;
+    send_ws_text(&mut first_socket, "ws-r1-new", "/new claude helper").await;
+    assert_eq!(
+        recv_ws_send(&mut first_socket).await.content,
+        "created session s1"
+    );
+    send_ws_text(&mut first_socket, "ws-r1-msg", "before restart").await;
+    assert_eq!(
+        recv_ws_send(&mut first_socket).await.content,
+        "gateway echo: before restart"
+    );
+    drop(first_socket);
+    let _ = first_stop_tx.send(());
+    first_daemon.await.unwrap();
+    assert_eq!(adapter.starts.load(Ordering::SeqCst), 1);
+
+    let second_ws = Arc::new(WsChannel::bind_on_listen(ws_addr));
+    let (second_stop_tx, second_daemon) =
+        spawn_ws_gateway_daemon(projects_root, second_ws, Arc::clone(&adapter));
+    let mut second_socket = connect_ws_with_retry(&ws_url).await;
+    send_ws_text(&mut second_socket, "ws-r2-msg", "after restart").await;
+    assert_eq!(
+        recv_ws_send(&mut second_socket).await.content,
+        "gateway echo: after restart"
+    );
+    drop(second_socket);
+    let _ = second_stop_tx.send(());
+    second_daemon.await.unwrap();
+
+    assert_eq!(
+        adapter.starts.load(Ordering::SeqCst),
+        1,
+        "restart must reuse persisted s1 instead of spawning s2"
+    );
+    assert_eq!(adapter.submits.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        adapter.submitted_threads.lock().await.as_slice(),
+        &[
+            "gateway-default-helper-s1".to_string(),
+            "gateway-default-helper-s1".to_string()
+        ]
+    );
+    assert_eq!(
+        adapter.submitted_payloads.lock().await.as_slice(),
+        &["before restart".to_string(), "after restart".to_string()]
+    );
+}
+
+fn spawn_ws_gateway_daemon(
+    projects_root: std::path::PathBuf,
+    ws: Arc<WsChannel>,
+    adapter: Arc<GatewayAdapter>,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let mut channels: ChannelMap = std::collections::HashMap::new();
+    channels.insert("ws".to_string(), ws as Arc<dyn Channel + Send + Sync>);
+
+    let adapter_factory: AdapterFactory = {
+        let cloned = adapter.clone();
+        Arc::new(move |_| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
+    };
+
+    let args = DaemonArgs {
+        credentials: None,
+        registry: Some(projects_root),
+        tick: Duration::from_millis(50),
+        max_runtime: Some(Duration::from_secs(5)),
+        adapter_factory: Some(adapter_factory),
+        channels_override: Some(channels),
+    };
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        run_daemon_with_shutdown(args, async {
+            let _ = stop_rx.await;
+        })
+        .await
+        .unwrap();
+    });
+    (stop_tx, handle)
+}
+
+async fn send_ws_text<S>(socket: &mut WebSocketStream<S>, id: &str, content: &str)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    socket
+        .send(Message::Text(
+            serde_json::json!({
+                "id": id,
+                "sender": "alice",
+                "reply_target": "chat-1",
+                "content": content
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
 }
 
 async fn connect_ws_with_retry(
