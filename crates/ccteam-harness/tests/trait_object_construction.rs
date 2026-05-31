@@ -1,5 +1,5 @@
-//! V0.8 W1 — verify each `ProcessBackend` impl is constructible as
-//! `Arc<dyn TerminalProcessBackend>` (dyn-compat / object safety check).
+//! V0.8 W1 — verify process and pane backend impls are constructible
+//! as trait objects (dyn-compat / object safety check).
 //!
 //! The trait is `async fn` heavy; this test catches accidental
 //! `Self: Sized` bounds or `&mut self` slips at compile time. It's
@@ -7,7 +7,10 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
-use ccteam_harness::{from_env, InProcBackend, RmuxBackend, TerminalProcessBackend, TmuxBackend};
+use ccteam_harness::{
+    from_env, process_from_env, terminal_from_env, InProcBackend, PaneBackend, ProcessBackend,
+    RmuxBackend, TerminalProcessBackend, TmuxBackend,
+};
 
 /// Tests that mutate `CCTEAM_MUX_BACKEND` must serialize against each
 /// other — cargo test parallelism otherwise races the env var (one
@@ -21,12 +24,12 @@ fn env_lock() -> &'static Mutex<()> {
 
 #[test]
 fn tmux_backend_is_dyn_compat() {
-    let _: Arc<dyn TerminalProcessBackend> = Arc::new(TmuxBackend::new());
+    let _: Arc<dyn PaneBackend> = Arc::new(TmuxBackend::new());
 }
 
 #[test]
 fn inproc_backend_is_dyn_compat() {
-    let _: Arc<dyn TerminalProcessBackend> = Arc::new(InProcBackend::new());
+    let _: Arc<dyn ProcessBackend> = Arc::new(InProcBackend::new());
 }
 
 #[test]
@@ -51,13 +54,13 @@ fn from_env_default_yields_rmux() {
 }
 
 #[test]
-fn from_env_inproc_test_yields_inproc() {
+fn process_from_env_inproc_test_yields_inproc() {
     let _guard = match env_lock().lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
     std::env::set_var("CCTEAM_MUX_BACKEND", "inproc-test");
-    let backend = from_env().expect("inproc-test should succeed");
+    let backend = process_from_env().expect("inproc-test should succeed for process backend");
     // Sanity: list_sessions on a fresh InProcBackend is empty.
     let live = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -66,6 +69,21 @@ fn from_env_inproc_test_yields_inproc() {
         .block_on(backend.list_sessions())
         .unwrap();
     assert!(live.is_empty());
+    std::env::remove_var("CCTEAM_MUX_BACKEND");
+}
+
+#[test]
+fn terminal_from_env_inproc_test_errors() {
+    let _guard = match env_lock().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    std::env::set_var("CCTEAM_MUX_BACKEND", "inproc-test");
+    let err = match terminal_from_env() {
+        Ok(_) => panic!("inproc-test should not satisfy pane backend selection"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("terminal pane operations"));
     std::env::remove_var("CCTEAM_MUX_BACKEND");
 }
 

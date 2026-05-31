@@ -38,8 +38,7 @@ use std::time::Duration;
 use ccteam_core::execution::typed_events::{enrich_session, maybe_start_typed_event_tap};
 use ccteam_core::progress;
 use ccteam_harness::{
-    EventKind, InProcBackend, MuxSessionId, MuxSessionSpec, RmuxBackend, TerminalProcessBackend,
-    Vendor,
+    EventKind, MuxSessionId, MuxSessionSpec, RmuxBackend, TerminalProcessBackend, Vendor,
 };
 
 /// Drop guard that restores a `$ENV` var to its pre-test value. Mirrors
@@ -202,9 +201,9 @@ async fn typed_event_row_written_for_rate_limit_pattern_when_flag_on() {
 
 /// Flag-OFF path is behavior-neutral: with `CCTEAM_TYPED_EVENTS` unset,
 /// `maybe_start_typed_event_tap` returns immediately and writes nothing.
-/// Uses an `InProcBackend` (its `subscribe` is a no-op) so even if the
-/// flag check regressed, no real work could produce a row — the
-/// assertion isolates the flag gate.
+/// Uses an `RmuxBackend` value that is only constructed; with the flag
+/// gate intact, `maybe_start_typed_event_tap` returns before it can
+/// connect to a daemon or subscribe.
 #[tokio::test]
 #[serial_test::serial]
 async fn no_typed_event_row_when_flag_off() {
@@ -213,7 +212,9 @@ async fn no_typed_event_row_when_flag_off() {
     let tmpdir = tempfile::tempdir().expect("create tempdir");
     let progress_path = tmpdir.path().join("progress.jsonl");
 
-    let backend: Arc<dyn TerminalProcessBackend> = Arc::new(InProcBackend::new());
+    let backend: Arc<dyn TerminalProcessBackend> = Arc::new(RmuxBackend::with_socket_path(
+        tmpdir.path().join("mux.sock"),
+    ));
     maybe_start_typed_event_tap(
         backend,
         MuxSessionId::new("x"),

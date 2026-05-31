@@ -23,7 +23,7 @@
 //!   [`crate::patterns::PatternMatcher`] per session; `subscribe`
 //!   snapshots it (same type the TmuxBackend uses).
 //!
-//! Known gap (W2b followup): [`ProcessBackend::capture`]'s `with_ansi=true`
+//! Known gap (W2b followup): [`crate::PaneBackend::capture`]'s `with_ansi=true`
 //! cannot be honored from the SDK's `PaneSnapshot` cell grid — ANSI
 //! escape bytes are gone after the daemon parses the grid. W2a's impl
 //! returns rendered plain-text bytes for both branches and documents

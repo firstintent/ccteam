@@ -294,12 +294,12 @@ pub trait ProcessBackend: Send + Sync {
     fn backend_kind(&self) -> BackendKind;
 }
 
-/// Terminal/pane operations exposed only by process backends that host
+/// Pane operations exposed only by process backends that host
 /// interactive terminal sessions. This keeps [`ProcessBackend`] focused
 /// on portable lifecycle + IO while preserving the current tmux/rmux
 /// terminal feature surface for web snapshots, pty resize, and tests.
 #[async_trait::async_trait]
-pub trait TerminalProcessBackend: ProcessBackend {
+pub trait PaneBackend: ProcessBackend {
     /// Capture the last N lines of pane output.
     /// `with_ansi=true` preserves escape sequences when the backend can
     /// provide them. Returns bytes; callers choose the display encoding.
@@ -319,6 +319,10 @@ pub trait TerminalProcessBackend: ProcessBackend {
     /// Resize the pane geometry.
     async fn resize(&self, id: &MuxSessionId, cols: u16, rows: u16) -> Result<()>;
 }
+
+/// Back-compat name retained for call sites that still use the older
+/// terminal-oriented terminology. New code should prefer [`PaneBackend`].
+pub use self::PaneBackend as TerminalProcessBackend;
 
 /// Build argv for an interactive terminal handover (`tmux attach -t
 /// <name>` for the tmux backend). The CLI invokes this via blocking
@@ -356,11 +360,11 @@ pub fn interactive_attach_argv(backend: BackendKind, session_name: &str) -> Vec<
 /// Sync, cheap, and side-effect free — meant for sync CLI sites that
 /// branch interactive terminal handover (`ccteam attach`) on the
 /// backend without paying the cost of instantiating a backend (and,
-/// for rmux, without lazily connecting a daemon). Mirrors the match
-/// in [`from_env`]; only an explicit `tmux` opts out — everything else
-/// (unset, empty, or an unknown/typo'd value) resolves to `Rmux`, the
-/// bundled always-available backend. Callers that need a hard error on
-/// a typo go through [`from_env`].
+/// for rmux, without lazily connecting a daemon). Only explicit `tmux`
+/// and `inproc-test` opt out — everything else (unset, empty, or an
+/// unknown/typo'd value) resolves to `Rmux`, the bundled
+/// always-available backend. Callers that need a hard error on a typo
+/// go through [`process_from_env`] or [`terminal_from_env`].
 pub fn backend_kind_from_env() -> BackendKind {
     match std::env::var("CCTEAM_MUX_BACKEND").as_deref() {
         Ok("tmux") => BackendKind::Tmux,
@@ -369,14 +373,16 @@ pub fn backend_kind_from_env() -> BackendKind {
     }
 }
 
-/// Pick a backend from the `CCTEAM_MUX_BACKEND` env var (defaults to
-/// `rmux`, the bundled always-available backend). Explicit `tmux` opts
-/// out; unset/empty falls through to rmux. Returns `Arc<dyn TerminalProcessBackend>`
+/// Pick any process backend from the `CCTEAM_MUX_BACKEND` env var
+/// (defaults to `rmux`, the bundled always-available backend). Explicit
+/// `tmux` and `inproc-test` opt out; unset/empty falls through to rmux.
+/// Returns `Arc<dyn ProcessBackend>`
 /// so the value can be cloned freely through call chains; do NOT cache
 /// as a process-wide singleton (per-test instantiation keeps mock impls
-/// test-isolated). Unlike the infallible [`default_backend`], this errors
-/// on an unknown/typo'd value so fallible callers surface the mistake.
-pub fn from_env() -> Result<Arc<dyn TerminalProcessBackend>> {
+/// test-isolated). Unlike the infallible [`default_process_backend`],
+/// this errors on an unknown/typo'd value so fallible callers surface
+/// the mistake.
+pub fn process_from_env() -> Result<Arc<dyn ProcessBackend>> {
     match std::env::var("CCTEAM_MUX_BACKEND").as_deref() {
         Ok("tmux") => Ok(Arc::new(TmuxBackend::new())),
         Ok("inproc-test") => Ok(Arc::new(InProcBackend::new())),
@@ -387,11 +393,47 @@ pub fn from_env() -> Result<Arc<dyn TerminalProcessBackend>> {
     }
 }
 
-/// Production call sites' backend selector. Honors `CCTEAM_MUX_BACKEND`
-/// exactly like [`from_env`], but is infallible: an unknown/garbage env
-/// value degrades to `RmuxBackend` rather than erroring, so a config
-/// typo lands on the bundled always-available backend instead of
-/// crashing a live agent (or on a possibly-absent tmux).
+/// Pick a pane-capable backend from the `CCTEAM_MUX_BACKEND` env var.
+/// In-proc tasks do not own a terminal pane, so `inproc-test` is
+/// rejected here; callers that only need lifecycle + stdin/stdout
+/// operations should use [`process_from_env`].
+pub fn terminal_from_env() -> Result<Arc<dyn TerminalProcessBackend>> {
+    match std::env::var("CCTEAM_MUX_BACKEND").as_deref() {
+        Ok("tmux") => Ok(Arc::new(TmuxBackend::new())),
+        Ok("inproc-test") => Err(anyhow!(
+            "CCTEAM_MUX_BACKEND=`inproc-test` does not support terminal pane operations"
+        )),
+        Ok("rmux") | Ok("") | Err(_) => Ok(Arc::new(RmuxBackend::new())),
+        Ok(other) => Err(anyhow!(
+            "CCTEAM_MUX_BACKEND=`{other}` is unknown (expected tmux / rmux for pane operations)"
+        )),
+    }
+}
+
+/// Back-compat pane backend selector. New code that only needs generic
+/// lifecycle/IO should use [`process_from_env`]; new code that needs
+/// capture/dimensions/resize should use [`terminal_from_env`] or
+/// [`default_backend`] explicitly.
+pub fn from_env() -> Result<Arc<dyn TerminalProcessBackend>> {
+    terminal_from_env()
+}
+
+/// Production call sites' generic backend selector. Honors
+/// `CCTEAM_MUX_BACKEND` exactly like [`process_from_env`], but is
+/// infallible: an unknown/garbage env value degrades to `RmuxBackend`
+/// rather than erroring, so a config typo lands on the bundled
+/// always-available backend instead of crashing a live agent.
+pub fn default_process_backend() -> Arc<dyn ProcessBackend> {
+    process_from_env().unwrap_or_else(|_| Arc::new(RmuxBackend::new()))
+}
+
+/// Production call sites' pane backend selector. Honors
+/// `CCTEAM_MUX_BACKEND` exactly like [`terminal_from_env`], but is
+/// infallible: an unknown/garbage env value degrades to `RmuxBackend`
+/// rather than erroring, so a config typo lands on the bundled
+/// always-available backend instead of crashing a live agent (or on a
+/// possibly-absent tmux). `inproc-test` also degrades to rmux because
+/// it has no pane to capture or resize.
 ///
 /// V0.8 default: env-unset (and empty, and typo) resolves to `rmux` —
 /// rmux is the bundled mux so ccteam works with no external tmux. An
@@ -399,5 +441,5 @@ pub fn from_env() -> Result<Arc<dyn TerminalProcessBackend>> {
 /// **Do not cache** — instantiate at the call site (or thread it through
 /// from `main` / daemon startup).
 pub fn default_backend() -> Arc<dyn TerminalProcessBackend> {
-    from_env().unwrap_or_else(|_| Arc::new(RmuxBackend::new()))
+    terminal_from_env().unwrap_or_else(|_| Arc::new(RmuxBackend::new()))
 }

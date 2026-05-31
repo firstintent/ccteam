@@ -2,10 +2,10 @@
 //!
 //! Wraps a `tokio::task::JoinHandle` per spawned "session". Most
 //! trait methods that don't apply to in-proc tasks (send_text /
-//! send_enter / capture / pane_dims / resize / subscribe /
-//! register_pattern) return errors; the lifecycle subset (spawn /
-//! exists / kill / list_sessions / pane_pid / list_pane_pids) does
-//! useful work.
+//! send_enter / subscribe / register_pattern) return errors or empty
+//! streams; the lifecycle subset (spawn / exists / kill /
+//! list_sessions) does useful work. Pane methods live on
+//! `PaneBackend`, which in-proc tasks intentionally do not implement.
 //!
 //! This is **not** production-load-bearing in W1. It exists so the
 //! trait can be constructed against an impl that doesn't require
@@ -20,10 +20,7 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
-use crate::{
-    BackendKind, MuxEventStream, MuxSessionId, MuxSessionSpec, ProcessBackend,
-    TerminalProcessBackend,
-};
+use crate::{BackendKind, MuxEventStream, MuxSessionId, MuxSessionSpec, ProcessBackend};
 
 struct InProcSession {
     handle: JoinHandle<()>,
@@ -123,40 +120,6 @@ impl ProcessBackend for InProcBackend {
 
     fn backend_kind(&self) -> BackendKind {
         BackendKind::InProc
-    }
-}
-
-#[async_trait]
-impl TerminalProcessBackend for InProcBackend {
-    async fn capture(
-        &self,
-        _id: &MuxSessionId,
-        _lines: usize,
-        _with_ansi: bool,
-    ) -> Result<Vec<u8>> {
-        Err(anyhow!(
-            "InProcBackend::capture: not applicable to in-proc tasks"
-        ))
-    }
-
-    async fn pane_dims(&self, _id: &MuxSessionId) -> Result<Option<(u16, u16)>> {
-        Ok(None)
-    }
-
-    async fn pane_pid(&self, _id: &MuxSessionId) -> Result<Option<i32>> {
-        // In-proc tasks share the host process PID; reporting it
-        // would mislead `is_alive(expected_pid)` callers.
-        Ok(None)
-    }
-
-    async fn list_pane_pids(&self, _id: &MuxSessionId) -> Result<Vec<u32>> {
-        Ok(Vec::new())
-    }
-
-    async fn resize(&self, _id: &MuxSessionId, _cols: u16, _rows: u16) -> Result<()> {
-        Err(anyhow!(
-            "InProcBackend::resize: not applicable to in-proc tasks"
-        ))
     }
 }
 

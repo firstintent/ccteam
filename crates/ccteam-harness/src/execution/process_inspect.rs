@@ -28,7 +28,7 @@
 /// skipped. A failed `ps` invocation for one pid is treated as a
 /// non-match and the loop continues to the next pid.
 pub async fn pane_runs_process(
-    backend: &dyn crate::TerminalProcessBackend,
+    backend: &dyn crate::PaneBackend,
     id: &crate::MuxSessionId,
     needle: &str,
 ) -> anyhow::Result<bool> {
@@ -51,15 +51,92 @@ pub async fn pane_runs_process(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{InProcBackend, MuxSessionId};
+    use crate::{
+        BackendKind, MuxEventStream, MuxSessionId, MuxSessionSpec, PaneBackend, ProcessBackend,
+    };
 
-    /// `InProcBackend::list_pane_pids` returns an empty Vec (mode-1 has
-    /// no panes), so the probe short-circuits to `false` without ever
+    struct TestPaneBackend {
+        pids: Vec<u32>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessBackend for TestPaneBackend {
+        async fn spawn(&self, spec: MuxSessionSpec) -> anyhow::Result<MuxSessionId> {
+            Ok(MuxSessionId::new(spec.name))
+        }
+
+        async fn exists(&self, _id: &MuxSessionId) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn send_text(&self, _id: &MuxSessionId, _text: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn send_enter(&self, _id: &MuxSessionId) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn subscribe(&self, _id: &MuxSessionId) -> anyhow::Result<MuxEventStream> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+
+        async fn register_pattern(
+            &self,
+            _id: &MuxSessionId,
+            _regex_id: String,
+            _regex: String,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn kill(&self, _id: &MuxSessionId) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn list_sessions(&self) -> anyhow::Result<Vec<MuxSessionId>> {
+            Ok(Vec::new())
+        }
+
+        fn backend_kind(&self) -> BackendKind {
+            BackendKind::Tmux
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PaneBackend for TestPaneBackend {
+        async fn capture(
+            &self,
+            _id: &MuxSessionId,
+            _lines: usize,
+            _with_ansi: bool,
+        ) -> anyhow::Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+
+        async fn pane_dims(&self, _id: &MuxSessionId) -> anyhow::Result<Option<(u16, u16)>> {
+            Ok(None)
+        }
+
+        async fn pane_pid(&self, _id: &MuxSessionId) -> anyhow::Result<Option<i32>> {
+            Ok(None)
+        }
+
+        async fn list_pane_pids(&self, _id: &MuxSessionId) -> anyhow::Result<Vec<u32>> {
+            Ok(self.pids.clone())
+        }
+
+        async fn resize(&self, _id: &MuxSessionId, _cols: u16, _rows: u16) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Empty pane PID lists short-circuit to `false` without ever
     /// shelling out to `ps`. Confirms the empty-pids fast path + that
-    /// the helper is wired to the trait correctly.
+    /// the helper is wired to the pane trait correctly.
     #[tokio::test]
     async fn empty_pids_returns_false() {
-        let backend = InProcBackend::new();
+        let backend = TestPaneBackend { pids: Vec::new() };
         let id = MuxSessionId::new("nonexistent-session");
         let runs = pane_runs_process(&backend, &id, "claude")
             .await
@@ -67,20 +144,11 @@ mod tests {
         assert!(!runs, "no panes ⇒ no matching process");
     }
 
-    /// PID 0 is skipped; with the only entry being 0 (or empty), the
-    /// probe never calls `ps` and returns false. We exercise the real
-    /// `ps` path against the current test process via its own PID: the
-    /// `ps` command name for a cargo-test binary contains neither
-    /// "claude" nor "codex", so a needle that can't match returns false
-    /// while a needle that the test-runner comm happens to contain would
-    /// match — we assert on a needle guaranteed absent.
+    /// PID 0 is skipped; with the only entry being 0, the probe never
+    /// calls `ps` and returns false.
     #[tokio::test]
-    async fn ps_path_no_match_for_absent_needle() {
-        // We can't easily mock list_pane_pids to inject our own pid via
-        // the public trait surface, so this test stays behind the
-        // empty-pids contract above; the live-pid `ps` path is covered
-        // by `claude_tui_resume_test.rs` (alive_reattach_does_not_spawn).
-        let backend = InProcBackend::new();
+    async fn pid_zero_returns_false() {
+        let backend = TestPaneBackend { pids: vec![0] };
         let id = MuxSessionId::new("x");
         assert!(!pane_runs_process(&backend, &id, "definitely-not-a-comm")
             .await

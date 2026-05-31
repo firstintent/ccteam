@@ -128,7 +128,7 @@ where
 /// `imageproc` are caught and converted to `Ok(None)`.
 ///
 /// **V0.8 G5** — capture + pane-dims route through the
-/// [`ccteam_harness::ProcessBackend`] trait (`ccteam_harness::from_env()`) so the
+/// [`ccteam_harness::PaneBackend`] trait (`ccteam_harness::terminal_from_env()`) so the
 /// configured backend (`CCTEAM_MUX_BACKEND=tmux|rmux`) is honored
 /// instead of hard-calling tmux. Under the tmux backend (the opt-out,
 /// `CCTEAM_MUX_BACKEND=tmux`) the behavior is byte-for-byte identical
@@ -136,7 +136,7 @@ where
 /// calls).
 ///
 /// **rmux ANSI gap** — under `CCTEAM_MUX_BACKEND=rmux`,
-/// `ProcessBackend::capture(.., with_ansi=true)` currently returns rendered
+/// `PaneBackend::capture(.., with_ansi=true)` currently returns rendered
 /// PLAIN TEXT (rmux's `PaneSnapshot` is a parsed cell grid; no public
 /// byte-level capture-pane shim exists yet). The PNG still renders the
 /// text, just without color/attribute fidelity. Cell-grid→ANSI
@@ -165,11 +165,11 @@ pub fn render_screenshot(
     // Select the configured mux backend. A garbage CCTEAM_MUX_BACKEND
     // value errors — per the graceful-degrade red line (module doc),
     // rendering NEVER aborts the enclosing path, so map Err → Ok(None).
-    // NB: rmux's `from_env()` lazily connects a daemon per call (the
-    // documented no-cache policy); under rmux each screenshot pays that
-    // connect cost. Acceptable for the screenshot surface — flagged for
-    // any future hot-path follow-up.
-    let backend = match ccteam_harness::from_env() {
+    // NB: rmux's `terminal_from_env()` lazily connects a daemon per call
+    // (the documented no-cache policy); under rmux each screenshot pays
+    // that connect cost. Acceptable for the screenshot surface —
+    // flagged for any future hot-path follow-up.
+    let backend = match ccteam_harness::terminal_from_env() {
         Ok(b) => b,
         Err(err) => {
             tracing::warn!("screenshot: mux backend selection failed: {err:#}");

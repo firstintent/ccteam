@@ -583,10 +583,10 @@ enum SessionStatus {
 /// - probe error → [`SessionStatus::Running`] (fail-safe: never retire a
 ///   spawn on a transient backend error; mirrors `session_status`'s
 ///   "unreadable state.json → still running" default).
-async fn via_mux_session_status(
-    backend: &std::sync::Arc<dyn ccteam_harness::TerminalProcessBackend>,
-    session: &str,
-) -> SessionStatus {
+async fn via_mux_session_status<B>(backend: &B, session: &str) -> SessionStatus
+where
+    B: ccteam_harness::ProcessBackend + ?Sized,
+{
     match backend
         .exists(&ccteam_harness::MuxSessionId::new(session.to_string()))
         .await
@@ -2276,7 +2276,10 @@ impl Orchestrator {
         if !via_mux_probes.is_empty() {
             let backend = ccteam_harness::default_backend();
             for (sid, session) in via_mux_probes {
-                via_mux_status.insert(sid, via_mux_session_status(&backend, &session).await);
+                via_mux_status.insert(
+                    sid,
+                    via_mux_session_status(backend.as_ref(), &session).await,
+                );
             }
         }
         {
@@ -2351,7 +2354,8 @@ impl Orchestrator {
                     .as_deref()
                     .filter(|s| !s.is_empty())
                     .unwrap_or(sid.as_str());
-                match via_mux_session_status(&ccteam_harness::default_backend(), session).await {
+                let backend = ccteam_harness::default_backend();
+                match via_mux_session_status(backend.as_ref(), session).await {
                     SessionStatus::Running => continue,
                     SessionStatus::Done { cost_usd, status } => (status, cost_usd.unwrap_or(0.0)),
                 }
@@ -3504,7 +3508,7 @@ mod via_mux_tests {
 
     use std::sync::Arc;
 
-    use ccteam_harness::{InProcBackend, MuxSessionId, MuxSessionSpec, TerminalProcessBackend};
+    use ccteam_harness::{InProcBackend, MuxSessionId, MuxSessionSpec, ProcessBackend};
 
     use super::{via_mux_session_status, SessionStatus};
 
@@ -3520,11 +3524,11 @@ mod via_mux_tests {
     /// `Running` — the orchestrator must NOT retire it.
     #[tokio::test]
     async fn live_mux_session_reports_running() {
-        let backend: Arc<dyn TerminalProcessBackend> = Arc::new(InProcBackend::new());
+        let backend: Arc<dyn ProcessBackend> = Arc::new(InProcBackend::new());
         let name = "ccteam-bg-demo-sid1";
         backend.spawn(spec(name)).await.unwrap();
 
-        match via_mux_session_status(&backend, name).await {
+        match via_mux_session_status(backend.as_ref(), name).await {
             SessionStatus::Running => {}
             SessionStatus::Done { .. } => panic!("live via_mux session must report Running"),
         }
@@ -3536,7 +3540,7 @@ mod via_mux_tests {
     /// state.json path emits for a clean finish.
     #[tokio::test]
     async fn gone_mux_session_reports_completed() {
-        let backend: Arc<dyn TerminalProcessBackend> = Arc::new(InProcBackend::new());
+        let backend: Arc<dyn ProcessBackend> = Arc::new(InProcBackend::new());
         let name = "ccteam-bg-demo-sid2";
         backend.spawn(spec(name)).await.unwrap();
         backend
@@ -3544,7 +3548,7 @@ mod via_mux_tests {
             .await
             .unwrap();
 
-        match via_mux_session_status(&backend, name).await {
+        match via_mux_session_status(backend.as_ref(), name).await {
             SessionStatus::Done { status, cost_usd } => {
                 assert_eq!(status, "completed");
                 // Cost rollup for via_mux spawns is deferred to the
@@ -3560,8 +3564,8 @@ mod via_mux_tests {
     /// `Done` — `exists == false` is the done signal.
     #[tokio::test]
     async fn unknown_mux_session_reports_completed() {
-        let backend: Arc<dyn TerminalProcessBackend> = Arc::new(InProcBackend::new());
-        match via_mux_session_status(&backend, "ccteam-bg-never-spawned").await {
+        let backend: Arc<dyn ProcessBackend> = Arc::new(InProcBackend::new());
+        match via_mux_session_status(backend.as_ref(), "ccteam-bg-never-spawned").await {
             SessionStatus::Done { status, .. } => assert_eq!(status, "completed"),
             SessionStatus::Running => panic!("nonexistent via_mux session must report Done"),
         }

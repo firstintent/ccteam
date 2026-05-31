@@ -41,7 +41,7 @@ pub const BROADCAST_CAPACITY: usize = 256;
 /// (`PtyRegistry::new()`) and its `Clone` shape stay stable; all
 /// refcount/FIFO state lives backend-side.
 ///
-/// V0.8: the backend is selected via `ccteam_harness::from_env()` so web
+/// V0.8: the backend is selected via `ccteam_harness::terminal_from_env()` so web
 /// SSE live streaming honors `CCTEAM_MUX_BACKEND` like the rest of
 /// ccteam. Previously this hardcoded `TmuxBackend`, which silently
 /// produced no stream under `CCTEAM_MUX_BACKEND=rmux` (it drove
@@ -55,7 +55,7 @@ pub struct PtyRegistry {
 
 impl PtyRegistry {
     pub fn new() -> Self {
-        let backend = ccteam_harness::from_env()
+        let backend = ccteam_harness::terminal_from_env()
             .unwrap_or_else(|_| Arc::new(TmuxBackend::new()) as Arc<dyn TerminalProcessBackend>);
         Self { backend }
     }
