@@ -5,6 +5,7 @@
 //! a Slack-only deployment.
 
 pub mod mock;
+pub mod ws;
 
 #[cfg(feature = "telegram")]
 pub mod telegram;

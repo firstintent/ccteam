@@ -32,9 +32,14 @@ use ccteam_harness::{
 use ccteam_im::daemon::{run_daemon_with_shutdown, AdapterFactory, ChannelMap, DaemonArgs};
 use ccteam_im::register_bot;
 use ccteam_im::transport::providers::mock::MockChannel;
-use ccteam_im::transport::{Channel, ChannelMessage};
+use ccteam_im::transport::providers::ws::WsChannel;
+use ccteam_im::transport::{Channel, ChannelMessage, SendMessage};
 use futures::stream::BoxStream;
+use futures::{SinkExt, StreamExt};
 use tempfile::TempDir;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{connect_async, WebSocketStream};
 
 // ----- env isolation helpers (mirrors tests/daemon_test.rs) ---------
 
@@ -371,4 +376,113 @@ async fn daemon_routes_gateway_inbound_to_submit_turn_and_outbound() {
             "gateway echo: hello gateway".to_string()
         ]
     );
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_routes_ws_channel_to_gateway_over_real_socket() {
+    let _g = env_lock();
+    let home = isolate_home();
+    let projects_root = home.path().join("projects");
+    std::fs::create_dir_all(&projects_root).unwrap();
+
+    let ws = Arc::new(WsChannel::bind_localhost().await.unwrap());
+    let ws_url = format!("ws://{}", ws.local_addr());
+    let mut channels: ChannelMap = std::collections::HashMap::new();
+    channels.insert(
+        "ws".to_string(),
+        ws.clone() as Arc<dyn Channel + Send + Sync>,
+    );
+
+    let adapter = Arc::new(GatewayAdapter::default());
+    let adapter_factory: AdapterFactory = {
+        let cloned = adapter.clone();
+        Arc::new(move |_| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
+    };
+
+    let args = DaemonArgs {
+        credentials: None,
+        registry: Some(projects_root),
+        tick: Duration::from_millis(50),
+        max_runtime: Some(Duration::from_millis(1200)),
+        adapter_factory: Some(adapter_factory),
+        channels_override: Some(channels),
+    };
+
+    let daemon = tokio::spawn(async move {
+        run_daemon_with_shutdown(args, async {
+            futures::future::pending::<()>().await;
+        })
+        .await
+        .unwrap();
+    });
+
+    let mut socket = connect_ws_with_retry(&ws_url).await;
+    socket
+        .send(Message::Text(
+            serde_json::json!({
+                "id": "ws-1",
+                "sender": "alice",
+                "reply_target": "chat-1",
+                "content": "/new claude helper"
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    let created = recv_ws_send(&mut socket).await;
+    assert_eq!(created.content, "created session s1");
+    assert_eq!(created.recipient, "chat-1");
+
+    socket
+        .send(Message::Text(
+            serde_json::json!({
+                "id": "ws-2",
+                "sender": "alice",
+                "reply_target": "chat-1",
+                "content": "hello over ws"
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    let reply = recv_ws_send(&mut socket).await;
+    assert_eq!(reply.content, "gateway echo: hello over ws");
+    assert_eq!(adapter.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(adapter.submits.load(Ordering::SeqCst), 1);
+
+    daemon.await.unwrap();
+}
+
+async fn connect_ws_with_retry(
+    url: &str,
+) -> WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    let mut last_err = None;
+    for _ in 0..40 {
+        match connect_async(url).await {
+            Ok((socket, _)) => return socket,
+            Err(err) => {
+                last_err = Some(err);
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    }
+    panic!("failed to connect to {url}: {last_err:?}");
+}
+
+async fn recv_ws_send<S>(socket: &mut WebSocketStream<S>) -> SendMessage
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(frame) = socket.next().await {
+            let frame = frame.unwrap();
+            if let Message::Text(text) = frame {
+                return serde_json::from_str(&text).unwrap();
+            }
+        }
+        panic!("websocket closed before outbound SendMessage");
+    })
+    .await
+    .expect("timed out waiting for websocket SendMessage")
 }

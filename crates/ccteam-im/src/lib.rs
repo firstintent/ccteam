@@ -67,7 +67,7 @@ pub struct BotRegistration {
     /// `<slug>/<role>`).
     pub persona_id: Option<String>,
     /// Which IM platform this bot binds to: `"telegram"`, `"slack"`,
-    /// `"discord"`, or `"mock"` (tests).
+    /// `"discord"`, `"ws"` (local browser/e2e), or `"mock"` (tests).
     pub im_platform: String,
     /// Platform-specific chat identifier (Telegram chat_id, Slack
     /// channel id, Discord channel id). Stored as a string for

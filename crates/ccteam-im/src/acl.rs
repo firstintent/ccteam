@@ -8,6 +8,7 @@
 //!   telegram_user_ids: ["12345", "67890"]
 //!   slack_user_ids: ["U0123ABC"]
 //!   discord_user_ids: ["..."]
+//!   ws_user_ids: ["alice"]
 //! ```
 //!
 //! [`AclPolicy::allow`] returns `true` when (a) the platform block is
@@ -29,6 +30,9 @@ pub struct AclPolicy {
     /// Discord user IDs. Empty = open.
     #[serde(default)]
     pub discord_user_ids: Vec<String>,
+    /// Local WebSocket user IDs. Empty = open.
+    #[serde(default)]
+    pub ws_user_ids: Vec<String>,
 }
 
 impl AclPolicy {
@@ -38,6 +42,7 @@ impl AclPolicy {
             "telegram" => &self.telegram_user_ids,
             "slack" => &self.slack_user_ids,
             "discord" => &self.discord_user_ids,
+            "ws" => &self.ws_user_ids,
             // Unknown platform: deny by default (fail-closed).
             _ => return false,
         };
@@ -58,6 +63,7 @@ mod tests {
         let p = AclPolicy::default();
         assert!(p.allow("telegram", "any"));
         assert!(p.allow("slack", "any"));
+        assert!(p.allow("ws", "any"));
     }
 
     #[test]

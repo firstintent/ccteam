@@ -39,6 +39,8 @@ regex.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 # UNIX-only signalling for graceful supervisor SIGTERM (libc::kill).
 libc = "0.2"
+# Lightweight WebSocket Channel used for local/browser IM e2e validation.
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake"] }
 
 # V0.6.0 Wave 2 Option-C decision (docs/versions/v0-6-0/wave-2-decisions.md §3):
 # The Channel trait + slim TG/Slack/Discord providers live in-crate
