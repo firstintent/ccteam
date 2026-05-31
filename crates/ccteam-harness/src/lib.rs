@@ -42,6 +42,7 @@ pub mod rmux_backend;
 pub mod tmux_backend;
 pub mod tmux_ops;
 pub mod typed_event_tap;
+pub mod vendor_compat;
 
 pub use adapter::{
     parse_backgrounded_short_id, parse_cc_state_json, parse_pid_from_state, pluck, pluck_f64,
@@ -62,6 +63,7 @@ pub use inproc_backend::InProcBackend;
 pub use rmux_backend::{default_ccteam_harness_socket_path, RmuxBackend};
 pub use tmux_backend::TmuxBackend;
 pub use typed_event_tap::{event_kind_for_regex_id, RawEnrichment, TapHandle, TypedEventTap};
+pub use vendor_compat::warn_unknown_vendor_token;
 
 /// Vendor-agnostic identity for a mux-backed session.
 ///

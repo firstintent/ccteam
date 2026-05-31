@@ -1,4 +1,4 @@
-//! V0.6.3 F144 — vendor-seam forward-compatibility helpers.
+//! Vendor-seam forward-compatibility helpers.
 //!
 //! ## Why this module exists
 //!
@@ -15,7 +15,7 @@
 //! ## The contract
 //!
 //! - Unknown / extra JSON fields on vendor output are ignored. Every
-//!   vendor-output struct in `ccteam-core` already deserialises through
+//!   vendor-output struct already deserialises through
 //!   `serde_json::Value` plucking (or `#[serde(default)]` structs with
 //!   no `deny_unknown_fields`), so an added field is a no-op by
 //!   construction. No code change is needed for that half.

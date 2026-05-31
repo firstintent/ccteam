@@ -91,8 +91,6 @@ pub mod teams_task_parser;
 pub mod templates;
 pub mod tmux;
 pub mod tool_surface;
-// V0.6.3 F144 — vendor-seam forward-compatibility warn-once helper.
-pub mod vendor_compat;
 // V0.5.0 F92 — cumulative-cost scanner over Claude Code transcript JSONLs.
 pub mod transcript_scanner;
 pub mod watchdog;

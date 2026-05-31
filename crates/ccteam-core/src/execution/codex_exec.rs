@@ -648,7 +648,7 @@ pub fn translate_jsonl_event(v: &Value, turn_id: &TurnId) -> Vec<ThreadEvent> {
         // Warn once per unknown kind so a Codex CLI event-vocabulary
         // drift is visible without flooding the log per JSONL line.
         other => {
-            crate::vendor_compat::warn_unknown_vendor_token(
+            ccteam_harness::warn_unknown_vendor_token(
                 "codex_exec_event",
                 other,
                 "skipping this event; rest of the stream is unaffected",
@@ -744,7 +744,7 @@ fn parse_jsonl_item(item: &Value) -> ThreadItem {
         // degrades to an empty agent message (no panic, no stream
         // break). Warn once so a Codex item-vocabulary drift is visible.
         other => {
-            crate::vendor_compat::warn_unknown_vendor_token(
+            ccteam_harness::warn_unknown_vendor_token(
                 "codex_exec_item",
                 other,
                 "degraded to empty agent message",
