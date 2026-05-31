@@ -56,6 +56,7 @@ pub use enriched_event::{
     enrichment_source, BaseEvent, BasePayload, EnrichedEvent, EnrichmentEvent, EnrichmentPayload,
     EnrichmentSource, EventKind, EventMerger, MergeOutcome, Vendor, DEFAULT_GRACE,
 };
+pub use execution::ClaudeBgAdapter;
 pub use hook_sink::{default_ccteam_hook_socket_path, HookEvent, HookSink, HookSinkClient};
 pub use inproc_backend::InProcBackend;
 pub use rmux_backend::{default_ccteam_harness_socket_path, RmuxBackend};

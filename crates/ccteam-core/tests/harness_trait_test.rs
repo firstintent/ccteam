@@ -20,10 +20,11 @@
 //! 7. `SessionHandle::from_thread_handle` translation parity for both
 //!    vendors (orchestrator boundary correctness).
 
-use ccteam_core::execution::{ClaudeBgAdapter, ClaudeTuiAdapter, CodexExecAdapter};
+use ccteam_core::execution::{ClaudeTuiAdapter, CodexExecAdapter};
 use ccteam_harness::{
-    parse_backgrounded_short_id, AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter,
-    HarnessError, SessionHandle, SpawnCtx, ThreadHandle, CLAUDE_BIN_ENV, CLAUDE_JOBS_DIR_ENV,
+    parse_backgrounded_short_id, AgentSpecBrief, AgentVendor, ClaudeBgAdapter, ExecutionMode,
+    HarnessAdapter, HarnessError, SessionHandle, SpawnCtx, ThreadHandle, CLAUDE_BIN_ENV,
+    CLAUDE_JOBS_DIR_ENV,
 };
 
 // =====================================================================

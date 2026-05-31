@@ -1,9 +1,7 @@
 //! V0.6.0 F107 — adapter implementations behind the new
 //! [`ccteam_harness::HarnessAdapter`] trait.
 //!
-//! - [`claude_bg`] — V0.5.x `ClaudeCodeAdapter` renamed +
-//!   migrated to the 5-method trait shape. Zero behaviour change vs.
-//!   V0.5.1.
+//! - `ClaudeBgAdapter` lives in `ccteam-harness`.
 //! - [`claude_tui`] — Wave 2 F108 fills in tmux long-session +
 //!   send-keys -l direct user-content passthrough + dual-track
 //!   transcript polling.
@@ -14,7 +12,6 @@
 //!   to `codex app-server` over UDS via
 //!   [`ccteam_harness::execution::codex_jsonrpc`].
 
-pub mod claude_bg;
 pub mod claude_tui;
 pub mod codex_app_server;
 pub mod codex_exec;
@@ -25,7 +22,6 @@ pub mod typed_events;
 // `app-server` JSON-RPC notification stream. See module docs.
 pub mod codex_typed_events;
 
-pub use claude_bg::ClaudeBgAdapter;
 pub use claude_tui::ClaudeTuiAdapter;
 pub use codex_app_server::CodexAppServerAdapter;
 pub use codex_exec::CodexExecAdapter;

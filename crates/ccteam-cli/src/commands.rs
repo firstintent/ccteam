@@ -1931,10 +1931,10 @@ pub fn run_resume(paths: &CcteamPaths, slug: &str) -> Result<()> {
 /// `claude --bg --agent <role>` (no tmux); the codex branch (F62)
 /// still uses tmux + `codex` CLI.
 pub fn run_session_add(slug: &str, harness: ccteam_core::HarnessKind, role: String) -> Result<()> {
-    use ccteam_core::{
-        harness_sid_prefix, ClaudeBgAdapter, CodexExecAdapter, HarnessKind, SessionRecord, TeamKind,
+    use ccteam_core::{harness_sid_prefix, CodexExecAdapter, HarnessKind, SessionRecord, TeamKind};
+    use ccteam_harness::{
+        AgentSpecBrief, ClaudeBgAdapter, HarnessAdapter, SessionHandle, SpawnCtx,
     };
-    use ccteam_harness::{AgentSpecBrief, HarnessAdapter, SessionHandle, SpawnCtx};
 
     let paths = CcteamPaths::from_env()?;
     let state_path = paths.project_state(slug);
@@ -2099,8 +2099,10 @@ pub fn run_session_attach(slug: &str, sid: &str) -> Result<()> {
 /// Gracefully shut down one registered flex session and scrub it from
 /// `state.json::sessions[]`.
 pub fn run_session_rm(slug: &str, sid: &str) -> Result<()> {
-    use ccteam_core::{ClaudeBgAdapter, CodexExecAdapter};
-    use ccteam_harness::{AgentVendor, ExecutionMode, HarnessAdapter, ThreadHandle};
+    use ccteam_core::CodexExecAdapter;
+    use ccteam_harness::{
+        AgentVendor, ClaudeBgAdapter, ExecutionMode, HarnessAdapter, ThreadHandle,
+    };
 
     let paths = CcteamPaths::from_env()?;
     let state_path = paths.project_state(slug);

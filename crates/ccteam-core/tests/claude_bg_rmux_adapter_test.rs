@@ -22,9 +22,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use ccteam_core::execution::ClaudeBgAdapter;
 use ccteam_harness::{
-    AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, SpawnCtx, CLAUDE_BIN_ENV,
+    AgentSpecBrief, AgentVendor, ClaudeBgAdapter, ExecutionMode, HarnessAdapter, SpawnCtx,
+    CLAUDE_BIN_ENV,
 };
 
 /// Drop guard that restores a `$ENV` var to its pre-test value.

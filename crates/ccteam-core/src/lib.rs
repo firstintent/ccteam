@@ -148,7 +148,7 @@ pub use daemon::{
 // `ccteam_cost::{..., UnifiedTokenUsage as Usage}`.
 // V0.6.0 F107 — adapter impls. Public so consumers (orchestrator,
 // `ccteam-cli` commands) can wire them by concrete type when needed.
-pub use execution::{ClaudeBgAdapter, ClaudeTuiAdapter, CodexExecAdapter};
+pub use execution::{ClaudeTuiAdapter, CodexExecAdapter};
 // V0.6.0 F115 — handoff doc mechanism.
 pub use handoff::{
     handoff_path, handoffs_dir, list_handoffs, read_concat as read_handoffs_concat, write_handoff,

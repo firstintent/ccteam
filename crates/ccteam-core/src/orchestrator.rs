@@ -32,7 +32,7 @@ use tokio::task::JoinSet;
 
 use crate::artifact_watcher::{ArtifactEvent, ArtifactWatcher};
 use crate::daemon;
-use crate::execution::{ClaudeBgAdapter, ClaudeTuiAdapter, CodexExecAdapter};
+use crate::execution::{ClaudeTuiAdapter, CodexExecAdapter};
 use crate::handoff;
 use crate::inbox::{InboxMessage, SessionMailbox};
 use crate::paths::CcteamPaths;
@@ -42,6 +42,7 @@ use crate::queries;
 use crate::spawn_brief::{render_spawn_brief, SpawnContext as SpawnBriefContext};
 use crate::workflow::{AgentSpec, Executor, Trigger, WorkflowError, WorkflowMode, WorkflowSpec};
 use crate::workflow_watcher::{WorkflowFileEvent, WorkflowFileWatcher};
+use ccteam_harness::ClaudeBgAdapter;
 use ccteam_harness::{
     AgentSpecBrief, AgentVendor, HarnessAdapter, SessionHandle, SpawnCtx, ThreadEvent,
     UnifiedTokenUsage,
