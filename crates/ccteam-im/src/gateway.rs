@@ -15,8 +15,11 @@ use ccteam_harness::{
     ThreadItemDetails, TurnInput,
 };
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+use crate::BotRegistration;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct ChatKey {
     channel: String,
     chat_id: String,
@@ -45,16 +48,54 @@ struct GatewaySession {
     adapter: Arc<dyn HarnessAdapter + Send + Sync>,
 }
 
+#[derive(Debug, Clone)]
+struct GatewayRouteTemplate {
+    channel: String,
+    chat_id: String,
+    project: String,
+    role: String,
+    vendor: AgentVendor,
+    handle: String,
+}
+
 /// In-memory v8.1 route table for one daemon process.
 pub struct Gateway {
     adapter_factory:
         Arc<dyn Fn(AgentVendor) -> Arc<dyn HarnessAdapter + Send + Sync> + Send + Sync>,
     default_project: String,
+    state_path: Option<PathBuf>,
     projects: BTreeMap<String, PathBuf>,
     current_project: BTreeMap<ChatKey, String>,
     current_session: BTreeMap<ChatKey, String>,
     sessions: BTreeMap<String, GatewaySession>,
+    templates: Vec<GatewayRouteTemplate>,
     next_session: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SavedGatewayState {
+    default_project: String,
+    current_project: Vec<SavedGatewayRoute>,
+    current_session: Vec<SavedGatewayRoute>,
+    sessions: Vec<SavedGatewaySession>,
+    next_session: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SavedGatewayRoute {
+    chat: ChatKey,
+    value: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SavedGatewaySession {
+    id: String,
+    owner: ChatKey,
+    project: String,
+    role: String,
+    vendor: AgentVendor,
+    handle: String,
+    thread: ThreadHandle,
 }
 
 impl Gateway {
@@ -88,12 +129,23 @@ impl Gateway {
         Self {
             adapter_factory,
             default_project,
+            state_path: None,
             projects,
             current_project: BTreeMap::new(),
             current_session: BTreeMap::new(),
             sessions: BTreeMap::new(),
+            templates: Vec::new(),
             next_session: 0,
         }
+    }
+
+    /// Load and persist route/session state at `path`.
+    ///
+    /// The daemon uses this for v8.1 spawn-on-demand continuity across
+    /// restarts. Unit tests keep the default in-memory mode.
+    pub fn enable_persistence(&mut self, path: impl Into<PathBuf>) -> Result<()> {
+        self.state_path = Some(path.into());
+        self.load_state()
     }
 
     /// Register or update a project root addressable by `/cd <slug>`.
@@ -101,11 +153,38 @@ impl Gateway {
         self.projects.insert(slug.into(), dir.into());
     }
 
+    /// Register a persisted bot as a spawn-on-demand gateway session template.
+    pub fn register_bot_template(
+        &mut self,
+        bot: &BotRegistration,
+        project_dir: impl Into<PathBuf>,
+    ) {
+        self.register_project(bot.workflow_slug.clone(), project_dir);
+        let template = GatewayRouteTemplate {
+            channel: bot.im_platform.clone(),
+            chat_id: bot.im_chat_id.clone(),
+            project: bot.workflow_slug.clone(),
+            role: bot.role.clone(),
+            vendor: bot.vendor,
+            handle: bot.effective_handle().to_string(),
+        };
+        if let Some(existing) = self.templates.iter_mut().find(|entry| {
+            entry.channel == template.channel
+                && entry.chat_id == template.chat_id
+                && entry.project == template.project
+                && entry.role == template.role
+        }) {
+            *existing = template;
+        } else {
+            self.templates.push(template);
+        }
+    }
+
     /// True when `text` is one of the gateway-owned slash commands.
     pub fn is_gateway_command(text: &str) -> bool {
         matches!(
             text.split_whitespace().next(),
-            Some("/new" | "/use" | "/cd" | "/sessions" | "/projects")
+            Some("/pair" | "/new" | "/use" | "/cd" | "/sessions" | "/projects")
         )
     }
 
@@ -135,6 +214,21 @@ impl Gateway {
                 }
                 return self.submit_to_current(&chat, payload).await;
             }
+            if let Some(template) = self.template_by_handle(&chat, &handle) {
+                let session_id = self.start_template_session(chat.clone(), template).await?;
+                self.current_session.insert(chat.clone(), session_id);
+                if payload.is_empty() {
+                    return Ok(vec![format!("using @{handle}")]);
+                }
+                return self.submit_to_current(&chat, payload).await;
+            }
+        }
+        let templates = self.templates_for_chat(&chat);
+        if templates.len() > 1 {
+            let mut handles: Vec<String> = templates.iter().map(|t| t.handle.clone()).collect();
+            handles.sort();
+            handles.dedup();
+            return Ok(vec![crate::inbound::format_ambiguous_dm_reply(&handles)]);
         }
         self.ensure_current_session(&chat).await?;
         self.submit_to_current(&chat, text.to_string()).await
@@ -148,12 +242,21 @@ impl Gateway {
         let mut parts = trimmed.split_whitespace();
         let cmd = parts.next().unwrap_or_default();
         match cmd {
+            "/pair" => {
+                let code = parts
+                    .next()
+                    .ok_or_else(|| anyhow!("/pair requires a code"))?;
+                self.ensure_current_session(chat).await?;
+                self.persist_state()?;
+                Ok(Some(format!("paired {code}")))
+            }
             "/new" => {
                 let vendor = parse_vendor(parts.next().unwrap_or("claude"))?;
                 let role = parts.next().unwrap_or("assistant").to_string();
                 let project = self.current_project_for(chat);
+                let handle = role.clone();
                 let session_id = self
-                    .start_session(chat.clone(), project, vendor, role)
+                    .start_session(chat.clone(), project, vendor, role, handle)
                     .await?;
                 Ok(Some(format!("created session {session_id}")))
             }
@@ -168,6 +271,7 @@ impl Gateway {
                     .ok_or_else(|| anyhow!("unknown session for this chat: {id}"))?;
                 self.current_session
                     .insert(chat.clone(), session.id.clone());
+                self.persist_state()?;
                 Ok(Some(format!("using session {}", session.id)))
             }
             "/cd" => {
@@ -179,6 +283,7 @@ impl Gateway {
                 }
                 self.current_project
                     .insert(chat.clone(), project.to_string());
+                self.persist_state()?;
                 Ok(Some(format!("project set to {project}")))
             }
             "/sessions" => Ok(Some(self.render_sessions(chat))),
@@ -191,15 +296,45 @@ impl Gateway {
         if self.current_session.contains_key(chat) {
             return Ok(());
         }
+        let templates = self.templates_for_chat(chat);
+        if templates.len() == 1 {
+            self.start_template_session(chat.clone(), templates[0].clone())
+                .await?;
+            return Ok(());
+        }
+        if templates.len() > 1 {
+            let mut handles: Vec<String> = templates.iter().map(|t| t.handle.clone()).collect();
+            handles.sort();
+            handles.dedup();
+            return Err(anyhow!(crate::inbound::format_ambiguous_dm_reply(&handles)));
+        }
         let project = self.current_project_for(chat);
         self.start_session(
             chat.clone(),
             project,
             AgentVendor::Claude,
             "assistant".to_string(),
+            "assistant".to_string(),
         )
         .await?;
         Ok(())
+    }
+
+    async fn start_template_session(
+        &mut self,
+        owner: ChatKey,
+        template: GatewayRouteTemplate,
+    ) -> Result<String> {
+        self.current_project
+            .insert(owner.clone(), template.project.clone());
+        self.start_session(
+            owner,
+            template.project,
+            template.vendor,
+            template.role,
+            template.handle,
+        )
+        .await
     }
 
     async fn start_session(
@@ -208,6 +343,7 @@ impl Gateway {
         project: String,
         vendor: AgentVendor,
         role: String,
+        handle: String,
     ) -> Result<String> {
         self.next_session += 1;
         let id = format!("s{}", self.next_session);
@@ -230,7 +366,6 @@ impl Gateway {
                 },
             )
             .await?;
-        let handle = role.clone();
         self.sessions.insert(
             id.clone(),
             GatewaySession {
@@ -245,7 +380,95 @@ impl Gateway {
             },
         );
         self.current_session.insert(owner, id.clone());
+        self.persist_state()?;
         Ok(id)
+    }
+
+    fn load_state(&mut self) -> Result<()> {
+        let Some(path) = self.state_path.as_ref() else {
+            return Ok(());
+        };
+        if !path.exists() {
+            return Ok(());
+        }
+        let raw = std::fs::read_to_string(path)?;
+        let saved: SavedGatewayState = serde_json::from_str(&raw)?;
+        self.default_project = saved.default_project;
+        self.current_project = saved
+            .current_project
+            .into_iter()
+            .map(|route| (route.chat, route.value))
+            .collect();
+        self.current_session = saved
+            .current_session
+            .into_iter()
+            .map(|route| (route.chat, route.value))
+            .collect();
+        self.next_session = saved.next_session;
+        self.sessions.clear();
+        for saved_session in saved.sessions {
+            let adapter = (self.adapter_factory)(saved_session.vendor);
+            self.sessions.insert(
+                saved_session.id.clone(),
+                GatewaySession {
+                    id: saved_session.id,
+                    owner: saved_session.owner,
+                    project: saved_session.project,
+                    role: saved_session.role,
+                    vendor: saved_session.vendor,
+                    handle: saved_session.handle,
+                    thread: saved_session.thread,
+                    adapter,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn persist_state(&self) -> Result<()> {
+        let Some(path) = self.state_path.as_ref() else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let saved = SavedGatewayState {
+            default_project: self.default_project.clone(),
+            current_project: self
+                .current_project
+                .iter()
+                .map(|(chat, value)| SavedGatewayRoute {
+                    chat: chat.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+            current_session: self
+                .current_session
+                .iter()
+                .map(|(chat, value)| SavedGatewayRoute {
+                    chat: chat.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+            sessions: self
+                .sessions
+                .values()
+                .map(|session| SavedGatewaySession {
+                    id: session.id.clone(),
+                    owner: session.owner.clone(),
+                    project: session.project.clone(),
+                    role: session.role.clone(),
+                    vendor: session.vendor,
+                    handle: session.handle.clone(),
+                    thread: session.thread.clone(),
+                })
+                .collect(),
+            next_session: self.next_session,
+        };
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec_pretty(&saved)?)?;
+        std::fs::rename(tmp, path)?;
+        Ok(())
     }
 
     async fn submit_to_current(&self, chat: &ChatKey, payload: String) -> Result<Vec<String>> {
@@ -289,6 +512,21 @@ impl Gateway {
             .values()
             .find(|s| s.owner == *chat && s.handle == handle)
             .map(|s| s.id.clone())
+    }
+
+    fn template_by_handle(&self, chat: &ChatKey, handle: &str) -> Option<GatewayRouteTemplate> {
+        self.templates
+            .iter()
+            .find(|t| t.channel == chat.channel && t.chat_id == chat.chat_id && t.handle == handle)
+            .cloned()
+    }
+
+    fn templates_for_chat(&self, chat: &ChatKey) -> Vec<GatewayRouteTemplate> {
+        self.templates
+            .iter()
+            .filter(|t| t.channel == chat.channel && t.chat_id == chat.chat_id)
+            .cloned()
+            .collect()
     }
 
     fn render_sessions(&self, chat: &ChatKey) -> String {
@@ -453,6 +691,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gateway_pair_starts_default_session() {
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+
+        let paired = gateway
+            .handle_text("mock", "chat-1", "alice", "/pair 4821-77")
+            .await
+            .unwrap();
+        assert_eq!(paired, vec!["paired 4821-77"]);
+
+        let reply = gateway
+            .handle_text("mock", "chat-1", "alice", "after pair")
+            .await
+            .unwrap();
+        assert_eq!(reply, vec!["alpha-assistant-s1 echo: after pair"]);
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn gateway_commands_switch_project_and_session() {
         let fake = Arc::new(FakeAdapter::default());
         let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
@@ -525,5 +782,109 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(other, vec!["alpha-reviewer-s3 echo: same text"]);
+    }
+
+    #[tokio::test]
+    async fn gateway_persistence_restores_routes_and_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_path = tmp.path().join("gateway-state.json");
+        let fake = Arc::new(FakeAdapter::default());
+
+        {
+            let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+            gateway.register_project("beta", "/tmp/beta");
+            gateway.enable_persistence(&state_path).unwrap();
+            gateway
+                .handle_text("mock", "chat-1", "alice", "/cd beta")
+                .await
+                .unwrap();
+            gateway
+                .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+                .await
+                .unwrap();
+        }
+
+        let mut restored = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        restored.register_project("beta", "/tmp/beta");
+        restored.enable_persistence(&state_path).unwrap();
+
+        let sessions = restored
+            .handle_text("mock", "chat-1", "alice", "/sessions")
+            .await
+            .unwrap();
+        assert_eq!(sessions, vec!["s1:beta:Claude:reviewer"]);
+
+        let reply = restored
+            .handle_text("mock", "chat-1", "alice", "after restart")
+            .await
+            .unwrap();
+        assert_eq!(reply, vec!["beta-reviewer-s1 echo: after restart"]);
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn gateway_registered_bot_template_spawns_on_demand() {
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "default", "/tmp/default");
+        gateway.register_bot_template(
+            &BotRegistration {
+                workflow_slug: "alpha".to_string(),
+                role: "lead".to_string(),
+                vendor: AgentVendor::Claude,
+                persona_id: None,
+                im_platform: "mock".to_string(),
+                im_chat_id: "chat-1".to_string(),
+                chat_handle: None,
+                project_dir: None,
+                created_at: chrono::Utc::now(),
+            },
+            "/tmp/alpha",
+        );
+
+        let reply = gateway
+            .handle_text("mock", "chat-1", "alice", "hello")
+            .await
+            .unwrap();
+
+        assert_eq!(reply, vec!["alpha-lead-s1 echo: hello"]);
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn gateway_registered_bot_templates_keep_ambiguous_dm_out_of_sessions() {
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "default", "/tmp/default");
+        for role in ["lead", "reviewer"] {
+            gateway.register_bot_template(
+                &BotRegistration {
+                    workflow_slug: format!("alpha-{role}"),
+                    role: role.to_string(),
+                    vendor: AgentVendor::Claude,
+                    persona_id: None,
+                    im_platform: "mock".to_string(),
+                    im_chat_id: "chat-1".to_string(),
+                    chat_handle: None,
+                    project_dir: None,
+                    created_at: chrono::Utc::now(),
+                },
+                format!("/tmp/alpha-{role}"),
+            );
+        }
+
+        let ambiguous = gateway
+            .handle_text("mock", "chat-1", "alice", "hello")
+            .await
+            .unwrap();
+        assert_eq!(
+            ambiguous,
+            vec!["Multiple bots in this chat. Specify one: @lead @reviewer"]
+        );
+
+        let reply = gateway
+            .handle_text("mock", "chat-1", "alice", "@reviewer hello")
+            .await
+            .unwrap();
+        assert_eq!(reply, vec!["alpha-reviewer-reviewer-s1 echo: hello"]);
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
     }
 }

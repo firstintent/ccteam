@@ -122,7 +122,7 @@ impl HarnessAdapter for QuietAdapter {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn daemon_forwards_turns_jsonl_to_channel() {
+async fn daemon_does_not_tail_legacy_turns_jsonl() {
     let _g = env_lock();
     let home = isolate_home();
     let projects_root = home.path().join("projects");
@@ -137,8 +137,10 @@ async fn daemon_forwards_turns_jsonl_to_channel() {
     )
     .unwrap();
 
-    // Pre-seed the bot's turns.jsonl with two assistant rows + one user
-    // row. drain_outboxes should forward only the two assistant rows.
+    // Pre-seed the bot's turns.jsonl with assistant rows. In v8.1 the
+    // daemon is a gateway and no longer runs the legacy safety-net
+    // outbox tailer, so these rows must not be forwarded by startup
+    // side effects.
     let chat_dir = projects_root.join("dev-foo/.ccteam/chat/lead");
     std::fs::create_dir_all(&chat_dir).unwrap();
     let turns_path = chat_dir.join("turns.jsonl");
@@ -183,38 +185,25 @@ async fn daemon_forwards_turns_jsonl_to_channel() {
     .await
     .unwrap();
 
-    // Outbox holds the two assistant rows, both addressed to chat-42.
     let outbox = mock.outbox().await;
     assert_eq!(
         outbox.len(),
-        2,
-        "expected 2 assistant rows forwarded (got {}): {:?}",
+        0,
+        "gateway daemon must not tail legacy turns.jsonl (got {}): {:?}",
         outbox.len(),
         outbox
             .iter()
             .map(|m| m.content.as_str())
             .collect::<Vec<_>>()
     );
-    assert_eq!(outbox[0].content, "hello from the bot");
-    assert_eq!(outbox[0].recipient, "chat-42");
-    assert_eq!(outbox[1].content, "second reply");
-    assert_eq!(outbox[1].recipient, "chat-42");
 
-    // Cursor file was persisted so a daemon restart wouldn't re-forward.
     let cursor_path = outbound::outbound_cursor_path(&projects_root, &bot_reg("dev-foo", "lead"));
     assert!(
-        cursor_path.exists(),
-        "cursor file should exist at {}",
+        !cursor_path.exists(),
+        "gateway daemon must not create legacy outbound cursor at {}",
         cursor_path.display()
     );
-    let body = std::fs::read_to_string(&cursor_path).unwrap();
-    let cursor: outbound::TailCursor = serde_json::from_str(&body).unwrap();
-    let turns_len = std::fs::metadata(&turns_path).unwrap().len();
-    assert_eq!(
-        cursor.position, turns_len,
-        "cursor should advance to EOF of turns.jsonl ({} bytes)",
-        turns_len
-    );
+    assert!(turns_path.exists(), "test fixture should remain in place");
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -293,7 +282,7 @@ async fn daemon_no_op_when_turns_jsonl_missing() {
 /// new EOF and subsequent ticks find nothing new.
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn drain_handles_truncation_without_repeat_forwarding() {
+async fn daemon_does_not_replay_truncated_legacy_turns_jsonl() {
     let _g = env_lock();
     let home = isolate_home();
     let projects_root = home.path().join("projects");
@@ -314,17 +303,12 @@ async fn drain_handles_truncation_without_repeat_forwarding() {
     let turns_path = chat_dir.join("turns.jsonl");
     let row = r#"{"role":"assistant","content":"post-rotation reply"}"#;
     std::fs::write(&turns_path, format!("{row}\n")).unwrap();
-    let new_eof = std::fs::metadata(&turns_path).unwrap().len();
-
     // Seed an outbound.cursor that points well past the new EOF —
     // simulates a turns.jsonl that was much longer before and got
     // rotated / truncated while the daemon was offline.
     let cursor_path = outbound::outbound_cursor_path(&projects_root, &bot_reg("dev-trunc", "lead"));
     std::fs::write(&cursor_path, r#"{"position": 10000}"#).unwrap();
-    assert!(
-        new_eof < 10000,
-        "test pre-condition: new EOF < stale cursor"
-    );
+    assert!(std::fs::metadata(&turns_path).unwrap().len() < 10000);
 
     let mock = Arc::new(MockChannel::new());
     let mut channels: ChannelMap = std::collections::HashMap::new();
@@ -351,15 +335,11 @@ async fn drain_handles_truncation_without_repeat_forwarding() {
     .await
     .unwrap();
 
-    // The post-truncation row is forwarded EXACTLY ONCE, not on every
-    // tick. (Pre-fix this would be 1 forward per safety-net pass — and
-    // since the safety_net_ticker tokio::interval fires immediately on
-    // first poll, even a short test run would see >= 1 duplicate.)
     let outbox = mock.outbox().await;
     assert_eq!(
         outbox.len(),
-        1,
-        "expected exactly 1 forward post-truncation (got {}): {:?}",
+        0,
+        "gateway daemon must not replay legacy turns.jsonl after truncation (got {}): {:?}",
         outbox.len(),
         outbox
             .iter()
@@ -367,14 +347,11 @@ async fn drain_handles_truncation_without_repeat_forwarding() {
             .collect::<Vec<_>>()
     );
 
-    // Cursor should sit at the new EOF — not stuck at the stale 10000
-    // and not stuck at 0 (which would re-forward next tick).
     let body = std::fs::read_to_string(&cursor_path).unwrap();
     let cursor: outbound::TailCursor = serde_json::from_str(&body).unwrap();
     assert_eq!(
-        cursor.position, new_eof,
-        "cursor should land at the new EOF ({} bytes)",
-        new_eof
+        cursor.position, 10000,
+        "gateway daemon must leave legacy outbound cursor untouched"
     );
 }
 
