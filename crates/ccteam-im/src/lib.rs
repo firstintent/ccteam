@@ -30,6 +30,7 @@ pub mod acl;
 pub mod bot_mpsc;
 pub mod credentials;
 pub mod daemon;
+pub mod gateway;
 pub mod inbound;
 pub mod latency;
 pub mod nl_admin;
