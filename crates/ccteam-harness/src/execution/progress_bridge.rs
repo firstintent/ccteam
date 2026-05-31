@@ -14,6 +14,18 @@ use serde_json::{json, Value};
 use crate::ccteam_root_from_env;
 
 pub const CHAT_SESSION_RESET: &str = "chat_session_reset";
+pub const CHAT_SESSION_STARTED: &str = "chat_session_started";
+pub const CHAT_TURN_USER_PROMPT: &str = "chat_turn_user_prompt";
+pub const CHAT_TURN_COMPLETED: &str = "chat_turn_completed";
+pub const CHAT_SESSION_RESET_WITH_RECOVERY: &str = "chat_session_reset_with_recovery";
+pub const CHAT_COMPACT_DONE: &str = "chat_compact_done";
+pub const CHAT_HOP_ESCALATE: &str = "chat_hop_escalate";
+pub const CHAT_TOOL_CALL_STARTED: &str = "chat_tool_call_started";
+pub const CHAT_BOT_PERMANENT_FAILURE: &str = "chat_bot_permanent_failure";
+pub const CHAT_MARKER_SELF_HEAL_ATTEMPT: &str = "chat_marker_self_heal_attempt";
+pub const CHAT_BOT_MARKER_STUCK: &str = "chat_bot_marker_stuck";
+pub const CHAT_TURN_RUNNING_LONG: &str = "chat_turn_running_long";
+pub const CHAT_TURN_TIMEOUT: &str = "chat_turn_timeout";
 pub const CODEX_PLAN_UPDATED: &str = "codex_plan_updated";
 pub const CODEX_TOKEN_USAGE: &str = "codex_token_usage";
 pub const CODEX_THREAD_STATUS: &str = "codex_thread_status";
@@ -42,11 +54,151 @@ pub fn append_event(path: &Path, event: &Value) -> Result<()> {
     Ok(())
 }
 
+pub fn build_chat_tool_call_started_event(role: &str, tool: &str) -> Value {
+    json!({
+        "event": CHAT_TOOL_CALL_STARTED,
+        "role": role,
+        "tool": tool,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
+pub fn build_chat_session_started_event(role: &str, project_dir: &str) -> Value {
+    json!({
+        "event": CHAT_SESSION_STARTED,
+        "role": role,
+        "project_dir": project_dir,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
+pub fn build_chat_turn_user_prompt_event(role: &str, turn_id: &str, prompt_excerpt: &str) -> Value {
+    let trimmed: String = prompt_excerpt.chars().take(256).collect();
+    json!({
+        "event": CHAT_TURN_USER_PROMPT,
+        "role": role,
+        "turn_id": turn_id,
+        "prompt_excerpt": trimmed,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
+pub fn build_chat_turn_completed_event(
+    role: &str,
+    turn_id: &str,
+    usage: &ccteam_cost::UnifiedTokenUsage,
+) -> Value {
+    json!({
+        "event": CHAT_TURN_COMPLETED,
+        "role": role,
+        "turn_id": turn_id,
+        "usage": serde_json::to_value(usage).unwrap_or(Value::Null),
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
+pub fn build_chat_session_reset_event(role: &str) -> Value {
+    json!({
+        "event": CHAT_SESSION_RESET,
+        "role": role,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
 pub fn build_chat_session_reset_event_with_reason(role: &str, reason: &str) -> Value {
     json!({
         "event": CHAT_SESSION_RESET,
         "role": role,
         "reason": reason,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
+pub fn build_chat_session_reset_with_recovery_event(role: &str, recovered_turns: usize) -> Value {
+    json!({
+        "event": CHAT_SESSION_RESET_WITH_RECOVERY,
+        "role": role,
+        "recovered_turns": recovered_turns,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
+pub fn build_chat_compact_done_event(role: &str) -> Value {
+    json!({
+        "event": CHAT_COMPACT_DONE,
+        "role": role,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
+pub fn build_chat_hop_escalate_event(role: &str, hop_count: u32, last_bot: &str) -> Value {
+    json!({
+        "event": CHAT_HOP_ESCALATE,
+        "role": role,
+        "hop_count": hop_count,
+        "last_bot": last_bot,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
+pub fn build_chat_bot_permanent_failure_event(role: &str, reason: &str, attempts: u32) -> Value {
+    let trimmed: String = reason.chars().take(512).collect();
+    json!({
+        "event": CHAT_BOT_PERMANENT_FAILURE,
+        "role": role,
+        "reason": trimmed,
+        "attempts": attempts,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
+pub fn build_chat_marker_self_heal_attempt_event(role: &str, attempt_n: u32) -> Value {
+    json!({
+        "event": CHAT_MARKER_SELF_HEAL_ATTEMPT,
+        "role": role,
+        "attempt_n": attempt_n,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
+pub fn build_chat_bot_marker_stuck_event(role: &str, attempts: u32) -> Value {
+    json!({
+        "event": CHAT_BOT_MARKER_STUCK,
+        "role": role,
+        "attempts": attempts,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
+pub fn build_chat_turn_running_long_event(
+    role: &str,
+    slug: &str,
+    turn_id: &str,
+    elapsed_sec: u64,
+) -> Value {
+    json!({
+        "event": CHAT_TURN_RUNNING_LONG,
+        "role": role,
+        "slug": slug,
+        "turn_id": turn_id,
+        "elapsed_sec": elapsed_sec,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
+pub fn build_chat_turn_timeout_event(
+    role: &str,
+    slug: &str,
+    turn_id: &str,
+    elapsed_sec: u64,
+) -> Value {
+    json!({
+        "event": CHAT_TURN_TIMEOUT,
+        "role": role,
+        "slug": slug,
+        "turn_id": turn_id,
+        "elapsed_sec": elapsed_sec,
+        "stuck": true,
         "ts": Utc::now().to_rfc3339(),
     })
 }
