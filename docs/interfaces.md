@@ -914,6 +914,8 @@ V0.6 F111 起所有 MCP 工具加 group 子前缀,server name 保持 `ccteam`;**
 
 **Codex app-server transport**:`CodexAppServerAdapter` speaks the v2 JSON-RPC surface (`thread/start`, `turn/start`, `thread/resume`, `thread/archive`, `thread/unsubscribe`) with current camelCase params: `threadId`, `threadSource`, `sessionStartSource`, `serviceName`, `developerInstructions`. Default transport is the standalone daemon UDS at `CCTEAM_CODEX_APP_SERVER_SOCKET` or `$CODEX_HOME/app-server-control/app-server-control.sock`; `CCTEAM_CODEX_APP_SERVER_TRANSPORT=stdio` (with optional `CCTEAM_CODEX_BIN`) spawns `codex app-server --listen stdio://` and uses the same JSON-RPC client. The stdio path is the real-binary fallback for npm-managed Codex installs where the foreground `unix://` listener is not the raw daemon control protocol.
 
+**Gateway real-path knobs**:`CCTEAM_HOME` overrides the daemon ccteam root for gateway state/outbound ledger/config lookup, letting real WS smoke tests isolate ccteam-owned state while preserving `$HOME` for Claude/Codex auth. `CCTEAM_IM_GATEWAY_REPLY_WAIT_MS` controls how long the synchronous gateway path waits for the first harness `ThreadEvent` before replying with `submitted <session> turn <id>`; default is 5ms for low-latency command ACKs, real reply probes can raise it.
+
 **V0.6.1 F128 admin extension**(`admin_` group +2 → 3 tools;`mcp_admin_tools.rs`):
 
 | Tool 名 | Group | 行为 | 入参 | 返回 |

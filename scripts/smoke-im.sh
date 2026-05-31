@@ -17,6 +17,8 @@ usage: scripts/smoke-im.sh [--real]
 
 Set CCTEAM_REAL_CODEX_RPC=1 with --real to also probe Codex app-server
 thread/start. The default preflight only proves binaries + transport availability.
+Set CCTEAM_REAL_IM_WS=1 with --real to also run the real WebSocket
+dual-harness smoke (Codex app-server + Claude tmux).
 EOF
 }
 
@@ -166,6 +168,11 @@ if [[ "$MODE" == "real" ]]; then
     run_test real_codex_app_server ccteam-harness real_codex_app_server_start_thread_smoke
   else
     echo "smoke-im --real: skipping Codex RPC probe (set CCTEAM_REAL_CODEX_RPC=1)"
+  fi
+  if [[ "${CCTEAM_REAL_IM_WS:-0}" == "1" ]]; then
+    run_test real_ws_dual_harness ccteam-im real_ws_dual_harness_smoke
+  else
+    echo "smoke-im --real: skipping real WS dual-harness probe (set CCTEAM_REAL_IM_WS=1)"
   fi
 fi
 

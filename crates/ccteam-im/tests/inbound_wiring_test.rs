@@ -29,7 +29,9 @@ use ccteam_harness::{
     AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx,
     ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails, TurnId, TurnInput,
 };
-use ccteam_im::daemon::{run_daemon_with_shutdown, AdapterFactory, ChannelMap, DaemonArgs};
+use ccteam_im::daemon::{
+    default_adapter_factory, run_daemon_with_shutdown, AdapterFactory, ChannelMap, DaemonArgs,
+};
 use ccteam_im::register_bot;
 use ccteam_im::transport::providers::mock::MockChannel;
 use ccteam_im::transport::providers::ws::WsChannel;
@@ -790,6 +792,117 @@ async fn daemon_replays_ws_outbound_when_client_reconnects() {
         .any(|row| row["id"] == "ws-replay-1" && row["state"] == "sent"));
 }
 
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_ws_dual_harness_smoke() {
+    if std::env::var("CCTEAM_REAL_IM_WS").ok().as_deref() != Some("1") {
+        eprintln!("skip: set CCTEAM_REAL_IM_WS=1 for real WS dual-harness smoke");
+        return;
+    }
+    let _g = env_lock();
+    assert!(command_exists("tmux"), "tmux is required for real Claude");
+    assert!(command_exists("claude"), "claude binary is required");
+    assert!(command_exists("codex"), "codex binary is required");
+
+    let ccteam_home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let slug = format!("real-ws-{}", std::process::id());
+    let old_ccteam_home = std::env::var_os("CCTEAM_HOME");
+    let old_transport = std::env::var_os("CCTEAM_CODEX_APP_SERVER_TRANSPORT");
+    let old_socket = std::env::var_os("CCTEAM_CODEX_APP_SERVER_SOCKET");
+    let old_mux_backend = std::env::var_os("CCTEAM_MUX_BACKEND");
+    std::env::set_var("CCTEAM_HOME", ccteam_home.path());
+    std::env::set_var("CCTEAM_CODEX_APP_SERVER_TRANSPORT", "stdio");
+    std::env::remove_var("CCTEAM_CODEX_APP_SERVER_SOCKET");
+    std::env::set_var("CCTEAM_MUX_BACKEND", "tmux");
+    std::fs::write(
+        ccteam_home.path().join("config.yaml"),
+        format!(
+            "projects:\n  - slug: {slug}\n    path: {}\n    team: real-ws\n    installed_at: 2026-01-01T00:00:00Z\n",
+            project.path().display()
+        ),
+    )
+    .unwrap();
+
+    let ws = Arc::new(WsChannel::bind_localhost().await.unwrap());
+    let ws_url = format!("ws://{}", ws.local_addr());
+    let mut channels: ChannelMap = std::collections::HashMap::new();
+    channels.insert("ws".to_string(), ws as Arc<dyn Channel + Send + Sync>);
+    let args = DaemonArgs {
+        credentials: None,
+        registry: Some(project.path().to_path_buf()),
+        tick: Duration::from_millis(50),
+        max_runtime: Some(Duration::from_secs(30)),
+        adapter_factory: Some(default_adapter_factory()),
+        channels_override: Some(channels),
+    };
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let daemon = tokio::spawn(async move {
+        run_daemon_with_shutdown(args, async {
+            let _ = stop_rx.await;
+        })
+        .await
+        .unwrap();
+    });
+
+    let mut socket = connect_ws_with_retry(&ws_url).await;
+    send_ws_text(&mut socket, "real-ws-codex-new", "/new codex api").await;
+    assert_eq!(
+        recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10))
+            .await
+            .content,
+        "created session s1"
+    );
+    send_ws_text(&mut socket, "real-ws-claude-new", "/new claude reviewer").await;
+    assert_eq!(
+        recv_ws_send_with_timeout(&mut socket, Duration::from_secs(20))
+            .await
+            .content,
+        "created session s2"
+    );
+    send_ws_text(&mut socket, "real-ws-sessions", "/sessions").await;
+    let sessions = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(5))
+        .await
+        .content;
+    assert!(
+        sessions.contains(&format!("s1:{slug}:Codex:api"))
+            && sessions.contains(&format!("s2:{slug}:Claude:reviewer")),
+        "real WS sessions must use the configured project slug; got {sessions:?}"
+    );
+    let claude_tmux_session = format!("ccteam-chat-{slug}-reviewer");
+    assert!(
+        tmux_session_exists(&claude_tmux_session),
+        "Claude tmux session should remain live after /new: {claude_tmux_session}"
+    );
+    send_ws_text(&mut socket, "real-ws-codex-compact", "@api /compact").await;
+    let codex = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10)).await;
+    assert!(
+        codex.content.starts_with("submitted s1 turn "),
+        "Codex /compact should reach app-server RPC, got {:?}",
+        codex.content
+    );
+    send_ws_text(&mut socket, "real-ws-claude-clear", "@reviewer /clear").await;
+    let claude = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10)).await;
+    assert!(
+        claude.content.starts_with("submitted s2 turn "),
+        "Claude /clear should reach tmux send-keys, got {:?}",
+        claude.content
+    );
+
+    let _ = std::process::Command::new("tmux")
+        .arg("kill-session")
+        .arg("-t")
+        .arg(&claude_tmux_session)
+        .status();
+    drop(socket);
+    let _ = stop_tx.send(());
+    daemon.await.unwrap();
+    restore_env("CCTEAM_HOME", old_ccteam_home);
+    restore_env("CCTEAM_CODEX_APP_SERVER_TRANSPORT", old_transport);
+    restore_env("CCTEAM_CODEX_APP_SERVER_SOCKET", old_socket);
+    restore_env("CCTEAM_MUX_BACKEND", old_mux_backend);
+}
+
 fn spawn_ws_gateway_daemon(
     projects_root: std::path::PathBuf,
     ws: Arc<WsChannel>,
@@ -894,7 +1007,17 @@ async fn recv_ws_send<S>(socket: &mut WebSocketStream<S>) -> SendMessage
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    tokio::time::timeout(Duration::from_secs(3), async {
+    recv_ws_send_with_timeout(socket, Duration::from_secs(3)).await
+}
+
+async fn recv_ws_send_with_timeout<S>(
+    socket: &mut WebSocketStream<S>,
+    timeout: Duration,
+) -> SendMessage
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    tokio::time::timeout(timeout, async {
         while let Some(frame) = socket.next().await {
             let frame = frame.unwrap();
             if let Message::Text(text) = frame {
@@ -905,6 +1028,33 @@ where
     })
     .await
     .expect("timed out waiting for websocket SendMessage")
+}
+
+fn command_exists(cmd: &str) -> bool {
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {cmd} >/dev/null 2>&1"))
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn tmux_session_exists(session: &str) -> bool {
+    std::process::Command::new("tmux")
+        .arg("has-session")
+        .arg("-t")
+        .arg(session)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn restore_env(name: &str, value: Option<std::ffi::OsString>) {
+    if let Some(value) = value {
+        std::env::set_var(name, value);
+    } else {
+        std::env::remove_var(name);
+    }
 }
 
 fn read_durable_outbound_rows() -> Vec<serde_json::Value> {

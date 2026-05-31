@@ -107,6 +107,9 @@ pub struct BotRegistration {
 /// variants below so they can isolate against a tempdir; daemon /
 /// supervisor code stays on the home-derived path.
 fn default_ccteam_root() -> PathBuf {
+    if let Some(root) = std::env::var_os("CCTEAM_HOME") {
+        return PathBuf::from(root);
+    }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("/"))
         .join(".ccteam")

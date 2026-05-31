@@ -489,9 +489,8 @@ impl Gateway {
             .await?;
         let mut events = session.adapter.events(&session.thread);
         let mut replies = Vec::new();
-        while let Ok(Some(evt)) =
-            tokio::time::timeout(std::time::Duration::from_millis(5), events.next()).await
-        {
+        let wait = gateway_reply_wait_duration();
+        while let Ok(Some(evt)) = tokio::time::timeout(wait, events.next()).await {
             if let Some(text) = event_text(&evt) {
                 replies.push(text);
                 break;
@@ -551,6 +550,15 @@ impl Gateway {
     }
 }
 
+fn gateway_reply_wait_duration() -> std::time::Duration {
+    const DEFAULT_MS: u64 = 5;
+    let ms = std::env::var("CCTEAM_IM_GATEWAY_REPLY_WAIT_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MS);
+    std::time::Duration::from_millis(ms)
+}
+
 fn turn_input_for_session(vendor: AgentVendor, payload: String) -> TurnInput {
     let trimmed = payload.trim();
     if let Some(command) = trimmed.strip_prefix('/') {
@@ -595,12 +603,21 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Mutex;
 
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex as StdMutex, OnceLock};
+        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     #[derive(Debug)]
     struct FakeAdapter {
         vendor: AgentVendor,
         starts: AtomicUsize,
         submissions: Arc<Mutex<Vec<(String, String)>>>,
         events: Arc<Mutex<VecDeque<(String, ThreadEvent)>>>,
+        event_delay: std::time::Duration,
     }
 
     impl Default for FakeAdapter {
@@ -616,6 +633,14 @@ mod tests {
                 starts: AtomicUsize::new(0),
                 submissions: Arc::new(Mutex::new(Vec::new())),
                 events: Arc::new(Mutex::new(VecDeque::new())),
+                event_delay: std::time::Duration::ZERO,
+            }
+        }
+
+        fn new_with_event_delay(vendor: AgentVendor, event_delay: std::time::Duration) -> Self {
+            Self {
+                event_delay,
+                ..Self::new(vendor)
             }
         }
     }
@@ -677,10 +702,15 @@ mod tests {
         fn events(&self, h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
             let events = Arc::clone(&self.events);
             let wanted = h.identity.clone();
+            let delay = self.event_delay;
             Box::pin(futures::stream::unfold((), move |_| {
                 let events = Arc::clone(&events);
                 let wanted = wanted.clone();
+                let delay = delay;
                 async move {
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
                     let mut guard = events.lock().await;
                     let idx = guard.iter().position(|(thread, _)| thread == &wanted)?;
                     let (_, evt) = guard.remove(idx)?;
@@ -721,6 +751,30 @@ mod tests {
             fake.submissions.lock().await.as_slice(),
             &[("alpha-reviewer-s1".to_string(), "hi".to_string())]
         );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn gateway_reply_wait_can_capture_realistic_delayed_event() {
+        let _guard = env_lock();
+        std::env::set_var("CCTEAM_IM_GATEWAY_REPLY_WAIT_MS", "100");
+        let fake = Arc::new(FakeAdapter::new_with_event_delay(
+            AgentVendor::Claude,
+            std::time::Duration::from_millis(25),
+        ));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        let replies = gateway
+            .handle_text("mock", "chat-1", "alice", "hi after delay")
+            .await
+            .unwrap();
+        std::env::remove_var("CCTEAM_IM_GATEWAY_REPLY_WAIT_MS");
+
+        assert_eq!(replies, vec!["alpha-reviewer-s1 echo: hi after delay"]);
     }
 
     #[tokio::test]
