@@ -50,8 +50,7 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
-use crate::execution::codex_app_server::CODEX_BIN_ENV;
-use ccteam_harness::{AgentVendor, CLAUDE_BIN_ENV};
+use ccteam_harness::{AgentVendor, CLAUDE_BIN_ENV, CODEX_BIN_ENV};
 
 /// Per-vendor word-rate proxy used when synthesising an upper-bound
 /// cost for the advise budget ledger. Each Claude / Codex one-shot

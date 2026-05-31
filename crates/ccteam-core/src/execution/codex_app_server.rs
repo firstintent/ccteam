@@ -64,12 +64,6 @@ use ccteam_harness::{
 /// `$CODEX_HOME/app-server-control/app-server-control.sock`.
 pub const APP_SERVER_SOCKET_ENV: &str = "CCTEAM_CODEX_APP_SERVER_SOCKET";
 
-/// Env override for the codex binary used when spawning the daemon
-/// (parity with `claude_bg`'s [`ccteam_harness::CLAUDE_BIN_ENV`]). Tests
-/// point this at a fake script that creates the socket without booting
-/// real codex.
-pub const CODEX_BIN_ENV: &str = "CCTEAM_CODEX_BIN";
-
 /// V0.6.1 F122 — per-thread context the adapter consults when bridging
 /// boundary events into `progress.jsonl`. Populated by `start_thread`
 /// from the [`SpawnCtx`]; consumed by the `events()` stream the first

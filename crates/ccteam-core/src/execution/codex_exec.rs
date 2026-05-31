@@ -45,12 +45,12 @@ use crate::advise::{
     append_budget_ledger_row, load_budget_ledger, sum_advise_today, APPROX_COST_PER_CALL_USD,
     DEFAULT_ADVISE_BUDGET_USD_24H,
 };
-use crate::execution::codex_app_server::CODEX_BIN_ENV;
 use crate::paths::CcteamPaths;
 use ccteam_harness::{
     pluck_f64, pluck_pct, pluck_str, AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter,
     HarnessError, HarnessSnapshot, SpawnCtx, ThreadErrorEvent, ThreadEvent, ThreadHandle,
-    ThreadItem, ThreadItemDetails, TurnId, TurnInput, UnifiedTokenUsage, CODEX_STATUS_MARKER,
+    ThreadItem, ThreadItemDetails, TurnId, TurnInput, UnifiedTokenUsage, CODEX_BIN_ENV,
+    CODEX_STATUS_MARKER,
 };
 // `session_name_for_slug` is a pure string helper (NOT a tmux call) —
 // sourced directly from the mux crate's `tmux_ops` so this module has

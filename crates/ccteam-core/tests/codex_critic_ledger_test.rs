@@ -16,10 +16,10 @@ use ccteam_core::advise::{
     append_budget_ledger_row, load_budget_ledger, sum_advise_today, AdviseBudgetLedger,
     BudgetSample, APPROX_COST_PER_CALL_USD, DEFAULT_ADVISE_BUDGET_USD_24H,
 };
-use ccteam_core::execution::codex_app_server::CODEX_BIN_ENV;
 use ccteam_core::execution::CodexExecAdapter;
 use ccteam_harness::{
     AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, ThreadEvent, ThreadHandle, TurnInput,
+    CODEX_BIN_ENV,
 };
 use futures::StreamExt;
 use serde_json::json;

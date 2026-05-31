@@ -24,7 +24,7 @@ use ccteam_core::execution::{ClaudeTuiAdapter, CodexExecAdapter};
 use ccteam_harness::{
     parse_backgrounded_short_id, AgentSpecBrief, AgentVendor, ClaudeBgAdapter, ExecutionMode,
     HarnessAdapter, HarnessError, SessionHandle, SpawnCtx, ThreadHandle, CLAUDE_BIN_ENV,
-    CLAUDE_JOBS_DIR_ENV,
+    CLAUDE_JOBS_DIR_ENV, CODEX_BIN_ENV,
 };
 
 // =====================================================================
@@ -476,10 +476,7 @@ async fn codex_exec_submit_turn_returns_synthetic_turn_id_wave3() {
     // success/failure. We point CCTEAM_CODEX_BIN at `/bin/true` so the
     // process exits cleanly and the test doesn't depend on a real
     // codex install.
-    std::env::set_var(
-        ccteam_core::execution::codex_app_server::CODEX_BIN_ENV,
-        "/bin/true",
-    );
+    std::env::set_var(CODEX_BIN_ENV, "/bin/true");
     let h = ThreadHandle {
         vendor: AgentVendor::Codex,
         mode: ExecutionMode::Bg,
@@ -492,7 +489,7 @@ async fn codex_exec_submit_turn_returns_synthetic_turn_id_wave3() {
         .await
         .expect("Wave 3 submit_turn returns synthetic TurnId");
     assert!(tid.0.starts_with("codex-exec-"));
-    std::env::remove_var(ccteam_core::execution::codex_app_server::CODEX_BIN_ENV);
+    std::env::remove_var(CODEX_BIN_ENV);
 }
 
 #[tokio::test(flavor = "current_thread")]

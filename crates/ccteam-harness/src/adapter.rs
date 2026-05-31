@@ -61,6 +61,11 @@ pub const CLAUDE_JOBS_DIR_ENV: &str = "CCTEAM_CLAUDE_JOBS_DIR";
 /// stdout so `start_thread` is hermetic.
 pub const CLAUDE_BIN_ENV: &str = "CCTEAM_CLAUDE_BIN";
 
+/// Environment override for the `codex` binary path. Tests set this to
+/// fake scripts for `codex exec --json` and `codex app-server` without
+/// requiring the real CLI on PATH.
+pub const CODEX_BIN_ENV: &str = "CCTEAM_CODEX_BIN";
+
 /// Marker line the codex agent prints in its tmux pane to publish
 /// state to the observer (PRD §6.5 + dev-plan §3.2).
 pub const CODEX_STATUS_MARKER: &str = "CODEX_STATUS:";

@@ -51,7 +51,7 @@ pub use adapter::{
     HarnessAdapter, HarnessError, HarnessSnapshot, MarkerReporter, SessionHandle, SpawnCtx,
     SpawnOpts, SubagentState, ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadItem,
     ThreadItemDetails, TurnId, TurnInput, UnifiedTokenUsage, CLAUDE_BIN_ENV, CLAUDE_JOBS_DIR_ENV,
-    CODEX_STATUS_MARKER, CODEX_STATUS_TAIL_LINES, DEFAULT_CLAUDE_SID,
+    CODEX_BIN_ENV, CODEX_STATUS_MARKER, CODEX_STATUS_TAIL_LINES, DEFAULT_CLAUDE_SID,
 };
 pub use enriched_event::{
     enrichment_source, BaseEvent, BasePayload, EnrichedEvent, EnrichmentEvent, EnrichmentPayload,

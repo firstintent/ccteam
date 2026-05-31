@@ -3,12 +3,11 @@
 //! script via `CCTEAM_CODEX_BIN` env override so they don't require
 //! the real codex binary on PATH.
 
-use ccteam_core::execution::codex_app_server::CODEX_BIN_ENV;
 use ccteam_core::execution::codex_exec::{build_exec_argv, render_prompt, translate_jsonl_event};
 use ccteam_core::execution::CodexExecAdapter;
 use ccteam_harness::{
     AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, ThreadEvent, ThreadHandle, TurnId,
-    TurnInput,
+    TurnInput, CODEX_BIN_ENV,
 };
 use futures::StreamExt;
 use serde_json::json;

@@ -14,8 +14,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-const CODEX_BIN_ENV: &str = "CCTEAM_CODEX_BIN";
-const CLAUDE_BIN_ENV: &str = "CCTEAM_CLAUDE_BIN";
+use ccteam_harness::{CLAUDE_BIN_ENV, CODEX_BIN_ENV};
 
 /// Build a fake binary script that echoes the supplied stdout on
 /// invocation and exits 0. Returns the (guard, path) so the caller
