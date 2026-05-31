@@ -262,6 +262,7 @@ where
     // their producers register credentials (matches the host-probe
     // shape that landed in F121).
     let channels: ChannelMap = build_channels(&args, &creds, &initial);
+    replay_durable_outbox(&channels).await;
     let gateway = Arc::new(Mutex::new(build_gateway(
         factory.clone(),
         &projects_root,
@@ -563,6 +564,16 @@ async fn send_gateway_outbound(
         platform_message_id: None,
         error: None,
     });
+    finish_durable_outbound_send(id, inbound_id, channel_name, channel, message).await;
+}
+
+async fn finish_durable_outbound_send(
+    id: String,
+    inbound_id: &str,
+    channel_name: &str,
+    channel: &(dyn Channel + Send + Sync),
+    message: SendMessage,
+) {
     match channel.send(&message).await {
         Ok(platform_message_id) => {
             append_durable_outbound(DurableOutboundRow {
@@ -594,6 +605,58 @@ async fn send_gateway_outbound(
                 "ccteam-im: gateway outbound send failed"
             );
         }
+    }
+}
+
+async fn replay_durable_outbox(channels: &ChannelMap) {
+    let path = durable_outbox_path();
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let mut latest: HashMap<String, DurableOutboundRow> = HashMap::new();
+    for (line_idx, line) in raw.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<DurableOutboundRow>(line) {
+            Ok(row) => {
+                latest.insert(row.id.clone(), row);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    line = line_idx + 1,
+                    error = %err,
+                    "ccteam-im: ignoring malformed durable outbound row"
+                );
+            }
+        }
+    }
+    for row in latest
+        .into_values()
+        .filter(|row| row.state != DurableOutboundState::Sent)
+    {
+        let Some(channel) = channels.get(&row.channel) else {
+            append_durable_outbound(DurableOutboundRow {
+                ts_ms: now_unix_ms_u64(),
+                id: row.id,
+                inbound_id: row.inbound_id,
+                channel: row.channel,
+                state: DurableOutboundState::Failed,
+                message: row.message,
+                platform_message_id: None,
+                error: Some("replay failed: channel is not configured".to_string()),
+            });
+            continue;
+        };
+        finish_durable_outbound_send(
+            row.id,
+            &row.inbound_id,
+            &row.channel,
+            channel.as_ref(),
+            row.message,
+        )
+        .await;
     }
 }
 

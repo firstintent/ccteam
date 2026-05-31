@@ -390,6 +390,53 @@ async fn daemon_routes_gateway_inbound_to_submit_turn_and_outbound() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_replays_queued_durable_outbound_to_mock_channel() {
+    let _g = env_lock();
+    let home = isolate_home();
+    let projects_root = home.path().join("projects");
+    std::fs::create_dir_all(&projects_root).unwrap();
+    write_durable_outbound_row("replay-1", "telegram", "queued", "queued before restart");
+
+    let mock = Arc::new(MockChannel::new());
+    let mut channels: ChannelMap = std::collections::HashMap::new();
+    channels.insert(
+        "telegram".to_string(),
+        mock.clone() as Arc<dyn Channel + Send + Sync>,
+    );
+
+    let adapter = Arc::new(GatewayAdapter::default());
+    let adapter_factory: AdapterFactory = {
+        let cloned = adapter.clone();
+        Arc::new(move |_| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
+    };
+    let args = DaemonArgs {
+        credentials: None,
+        registry: Some(projects_root),
+        tick: Duration::from_millis(50),
+        max_runtime: Some(Duration::from_millis(100)),
+        adapter_factory: Some(adapter_factory),
+        channels_override: Some(channels),
+    };
+
+    run_daemon_with_shutdown(args, async {
+        futures::future::pending::<()>().await;
+    })
+    .await
+    .unwrap();
+
+    let outbox = mock.outbox().await;
+    assert_eq!(outbox.len(), 1);
+    assert_eq!(outbox[0].content, "queued before restart");
+    let rows = read_durable_outbound_rows();
+    assert_eq!(rows.last().unwrap()["state"], "sent");
+    assert_eq!(
+        rows.last().unwrap()["message"]["content"],
+        "queued before restart"
+    );
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_routes_ws_channel_to_gateway_over_real_socket() {
     let _g = env_lock();
     let home = isolate_home();
@@ -542,6 +589,35 @@ async fn daemon_restart_preserves_ws_gateway_session() {
     );
 }
 
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_replays_ws_outbound_when_client_reconnects() {
+    let _g = env_lock();
+    let home = isolate_home();
+    let projects_root = home.path().join("projects");
+    std::fs::create_dir_all(&projects_root).unwrap();
+    write_durable_outbound_row("ws-replay-1", "ws", "failed", "stored while ws was offline");
+
+    let ws = Arc::new(WsChannel::bind_localhost().await.unwrap());
+    let ws_url = format!("ws://{}", ws.local_addr());
+    let (stop_tx, daemon) =
+        spawn_ws_gateway_daemon(projects_root, ws, Arc::new(GatewayAdapter::default()));
+
+    let mut socket = connect_ws_with_retry(&ws_url).await;
+    send_ws_text(&mut socket, "ws-replay-presence", "/projects").await;
+    let first = recv_ws_send(&mut socket).await;
+    assert_eq!(first.content, "stored while ws was offline");
+
+    drop(socket);
+    let _ = stop_tx.send(());
+    daemon.await.unwrap();
+
+    let rows = read_durable_outbound_rows();
+    assert!(rows
+        .iter()
+        .any(|row| row["id"] == "ws-replay-1" && row["state"] == "sent"));
+}
+
 fn spawn_ws_gateway_daemon(
     projects_root: std::path::PathBuf,
     ws: Arc<WsChannel>,
@@ -638,4 +714,29 @@ fn read_durable_outbound_rows() -> Vec<serde_json::Value> {
     raw.lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect()
+}
+
+fn write_durable_outbound_row(id: &str, channel: &str, state: &str, content: &str) {
+    let path = dirs::home_dir()
+        .unwrap()
+        .join(".ccteam")
+        .join("imd")
+        .join("outbound.jsonl");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let row = serde_json::json!({
+        "ts_ms": 1,
+        "id": id,
+        "inbound_id": format!("{id}-in"),
+        "channel": channel,
+        "state": state,
+        "message": {
+            "content": content,
+            "recipient": "chat-1",
+            "subject": null,
+            "thread_ts": null
+        },
+        "platform_message_id": null,
+        "error": null
+    });
+    std::fs::write(path, format!("{row}\n")).unwrap();
 }

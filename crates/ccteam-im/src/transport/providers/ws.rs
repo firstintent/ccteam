@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, Mutex, Notify};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::transport::{Channel, ChannelMessage, SendMessage};
@@ -32,6 +32,7 @@ pub struct WsChannel {
     addr: SocketAddr,
     listener: Arc<Mutex<Option<TcpListener>>>,
     outbound: broadcast::Sender<SendMessage>,
+    backlog: Arc<Mutex<Vec<SendMessage>>>,
     next_id: AtomicU64,
 }
 
@@ -61,6 +62,7 @@ impl WsChannel {
             addr,
             listener: Arc::new(Mutex::new(None)),
             outbound,
+            backlog: Arc::default(),
             next_id: AtomicU64::new(1),
         }
     }
@@ -77,6 +79,7 @@ impl WsChannel {
             addr,
             listener: Arc::new(Mutex::new(Some(listener))),
             outbound,
+            backlog: Arc::default(),
             next_id: AtomicU64::new(1),
         }
     }
@@ -95,6 +98,7 @@ impl Channel for WsChannel {
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
         let id = self.next_message_id("ws-out");
+        self.backlog.lock().await.push(message.clone());
         let _ = self.outbound.send(message.clone());
         Ok(Some(id))
     }
@@ -112,8 +116,11 @@ impl Channel for WsChannel {
             let (stream, peer) = listener.accept().await?;
             let inbound_tx = tx.clone();
             let outbound_rx = self.outbound.subscribe();
+            let backlog = Arc::clone(&self.backlog);
             tokio::spawn(async move {
-                if let Err(err) = handle_connection(stream, peer, inbound_tx, outbound_rx).await {
+                if let Err(err) =
+                    handle_connection(stream, peer, inbound_tx, outbound_rx, backlog).await
+                {
                     tracing::debug!(peer = %peer, error = %err, "ws channel connection closed");
                 }
             });
@@ -130,24 +137,42 @@ async fn handle_connection(
     peer: SocketAddr,
     tx: tokio::sync::mpsc::Sender<ChannelMessage>,
     mut outbound_rx: broadcast::Receiver<SendMessage>,
+    backlog: Arc<Mutex<Vec<SendMessage>>>,
 ) -> anyhow::Result<()> {
     let ws = tokio_tungstenite::accept_async(stream).await?;
     let (mut sink, mut source) = ws.split();
     let reply_target: Arc<Mutex<Option<String>>> = Arc::default();
+    let target_changed = Arc::new(Notify::new());
 
     let writer_target = Arc::clone(&reply_target);
+    let writer_notify = Arc::clone(&target_changed);
+    let writer_backlog = Arc::clone(&backlog);
     let writer = tokio::spawn(async move {
-        while let Ok(message) = outbound_rx.recv().await {
-            let target = writer_target.lock().await.clone();
-            if target
-                .as_deref()
-                .is_some_and(|wanted| wanted != message.recipient)
-            {
-                continue;
+        loop {
+            if let Some(target) = writer_target.lock().await.clone() {
+                for message in take_backlog_for_target(&writer_backlog, &target).await {
+                    let payload = serde_json::to_string(&message)?;
+                    if sink.send(Message::Text(payload)).await.is_err() {
+                        return anyhow::Ok(());
+                    }
+                }
             }
-            let payload = serde_json::to_string(&message)?;
-            if sink.send(Message::Text(payload)).await.is_err() {
-                break;
+            tokio::select! {
+                outcome = outbound_rx.recv() => {
+                    let Ok(message) = outcome else {
+                        break;
+                    };
+                    let target = writer_target.lock().await.clone();
+                    if target.as_deref().is_some_and(|wanted| wanted == message.recipient)
+                        && remove_backlog_message(&writer_backlog, &message).await
+                    {
+                        let payload = serde_json::to_string(&message)?;
+                        if sink.send(Message::Text(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                _ = writer_notify.notified() => {}
             }
         }
         anyhow::Ok(())
@@ -162,6 +187,7 @@ async fn handle_connection(
             continue;
         };
         *reply_target.lock().await = Some(message.reply_target.clone());
+        target_changed.notify_one();
         if tx.send(message).await.is_err() {
             break;
         }
@@ -170,6 +196,35 @@ async fn handle_connection(
     writer.abort();
     let _ = writer.await;
     Ok(())
+}
+
+async fn take_backlog_for_target(
+    backlog: &Arc<Mutex<Vec<SendMessage>>>,
+    target: &str,
+) -> Vec<SendMessage> {
+    let mut guard = backlog.lock().await;
+    let mut matched = Vec::new();
+    let mut idx = 0;
+    while idx < guard.len() {
+        if guard[idx].recipient == target {
+            matched.push(guard.remove(idx));
+        } else {
+            idx += 1;
+        }
+    }
+    matched
+}
+
+async fn remove_backlog_message(
+    backlog: &Arc<Mutex<Vec<SendMessage>>>,
+    message: &SendMessage,
+) -> bool {
+    let mut guard = backlog.lock().await;
+    let Some(idx) = guard.iter().position(|entry| entry == message) else {
+        return false;
+    };
+    guard.remove(idx);
+    true
 }
 
 fn parse_frame(frame: Message, peer: SocketAddr) -> anyhow::Result<Option<ChannelMessage>> {
