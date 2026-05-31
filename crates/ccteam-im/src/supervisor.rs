@@ -502,7 +502,7 @@ pub struct BotSupervisor {
     /// V0.6.8 F195 — per-turn watchdog threshold (seconds). First
     /// crossing emits `chat_turn_running_long`; second crossing (at
     /// `2× turn_timeout_sec`) emits `chat_turn_timeout`. Defaults to
-    /// [`ccteam_core::workflow::DEFAULT_TURN_TIMEOUT_SECS`] when
+    /// [`ccteam_core::DEFAULT_TURN_TIMEOUT_SECS`] when
     /// callers use [`Self::new`] / [`Self::new_with_config`]; a future
     /// patch will plumb `workflow.yaml::chat.turn_timeout_sec` through
     /// here once the daemon learns to load workflow specs at startup.
@@ -557,7 +557,7 @@ impl BotSupervisor {
             current_hop: Arc::new(AtomicU8::new(0)),
             self_weak: std::sync::OnceLock::new(),
             active_turn: Arc::new(Mutex::new(None)),
-            turn_timeout_sec: ccteam_core::workflow::DEFAULT_TURN_TIMEOUT_SECS,
+            turn_timeout_sec: ccteam_core::DEFAULT_TURN_TIMEOUT_SECS,
         }
     }
 

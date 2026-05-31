@@ -37,6 +37,7 @@ pub mod config;
 // V0.6.3 F142 — `trigger: schedule` cron evaluation (5-field, skip-missed).
 pub mod cron;
 pub mod daemon;
+pub mod defaults;
 // V0.6.0 F107 — adapter implementations behind the HarnessAdapter trait
 // now live in ccteam-harness; concrete execution adapters move next.
 pub mod execution;
@@ -141,6 +142,7 @@ pub use daemon::{
     write_heartbeat, write_pidfile, DaemonHealth, HEARTBEAT_GRACE, HEARTBEAT_INTERVAL,
     HEARTBEAT_NAME, PIDFILE_NAME,
 };
+pub use defaults::DEFAULT_TURN_TIMEOUT_SECS;
 // HarnessAdapter and its cross-vendor types live in ccteam-harness.
 // `UnifiedTokenUsage` is still re-exported below via
 // `ccteam_cost::{..., UnifiedTokenUsage as Usage}`.

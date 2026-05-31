@@ -511,13 +511,7 @@ pub fn default_recover_last_n_turns() -> usize {
     20
 }
 
-/// V0.6.8 F195 — per-turn watchdog default (seconds).
-///
-/// 90s leaves enough headroom for normal multi-tool turns to finish
-/// without triggering the "still working" notice, while keeping the
-/// silent-stall feedback loop tight enough that a stuck Stop hook /
-/// tail loop / claude hang doesn't go unsurfaced for minutes.
-pub const DEFAULT_TURN_TIMEOUT_SECS: u32 = 90;
+pub use crate::defaults::DEFAULT_TURN_TIMEOUT_SECS;
 
 /// V0.6.8 F195 — serde-default constructor for [`ChatSpec::turn_timeout_sec`].
 /// Kept as a function (not a `const` directly) because `#[serde(default = "...")]`
