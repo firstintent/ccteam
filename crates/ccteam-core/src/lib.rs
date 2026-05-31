@@ -143,8 +143,8 @@ pub use daemon::{
     HEARTBEAT_NAME, PIDFILE_NAME,
 };
 pub use defaults::{
-    claude_jobs_dir_from_env, state_json_path as claude_state_json_path, CLAUDE_JOBS_DIR_ENV,
-    DEFAULT_CLAUDE_SID, DEFAULT_TURN_TIMEOUT_SECS,
+    claude_jobs_dir_from_env, state_json_path as claude_state_json_path, CLAUDE_BIN_ENV,
+    CLAUDE_JOBS_DIR_ENV, CODEX_BIN_ENV, DEFAULT_CLAUDE_SID, DEFAULT_TURN_TIMEOUT_SECS,
 };
 // HarnessAdapter and its cross-vendor types live in ccteam-harness.
 // `UnifiedTokenUsage` is still re-exported below via

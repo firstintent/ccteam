@@ -14,6 +14,14 @@ pub const DEFAULT_CLAUDE_SID: &str = "claude-1";
 /// unset. Tests override this to a tempdir.
 pub const CLAUDE_JOBS_DIR_ENV: &str = "CCTEAM_CLAUDE_JOBS_DIR";
 
+/// Environment override for the `claude` binary path. Tests set this to
+/// fake scripts so execution paths stay hermetic.
+pub const CLAUDE_BIN_ENV: &str = "CCTEAM_CLAUDE_BIN";
+
+/// Environment override for the `codex` binary path. Tests set this to
+/// fake scripts for `codex exec --json` and app-server probes.
+pub const CODEX_BIN_ENV: &str = "CCTEAM_CODEX_BIN";
+
 /// V0.6.8 F195 — per-turn watchdog default (seconds).
 ///
 /// 90s leaves enough headroom for normal multi-tool turns to finish

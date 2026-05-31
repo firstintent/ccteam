@@ -52,7 +52,9 @@ use tokio::process::Command;
 pub use ccteam_cost::{
     AdviseBudgetLedger, BudgetSample, APPROX_COST_PER_CALL_USD, DEFAULT_ADVISE_BUDGET_USD_24H,
 };
-use ccteam_harness::{AgentVendor, CLAUDE_BIN_ENV, CODEX_BIN_ENV};
+use ccteam_harness::AgentVendor;
+
+use crate::{CLAUDE_BIN_ENV, CODEX_BIN_ENV};
 
 /// V0.6.5 F152 — default per-vendor wall clock for advisor subprocesses.
 /// 60s lines up with the `ccteam-advise` skill's documented Step 1

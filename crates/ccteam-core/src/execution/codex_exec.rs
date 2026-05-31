@@ -49,7 +49,7 @@ use ccteam_harness::{
     ccteam_root_from_env, pluck_f64, pluck_pct, pluck_str, AgentSpecBrief, AgentVendor,
     ExecutionMode, HarnessAdapter, HarnessError, HarnessSnapshot, SpawnCtx, ThreadErrorEvent,
     ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails, TurnId, TurnInput, UnifiedTokenUsage,
-    CODEX_BIN_ENV, CODEX_STATUS_MARKER,
+    CODEX_STATUS_MARKER,
 };
 // `session_name_for_slug` is a pure string helper (NOT a tmux call) —
 // sourced directly from the mux crate's `tmux_ops` so this module has
@@ -58,6 +58,8 @@ use ccteam_harness::tmux_ops::session_name_for_slug;
 use ccteam_harness::{
     default_backend, MuxSessionId, MuxSessionKind, MuxSessionSpec, TerminalProcessBackend,
 };
+
+use crate::CODEX_BIN_ENV;
 
 /// Per-thread event broadcast buffer. Codex bursts items per turn so
 /// 256 lines of headroom is comfortable for a single subscriber.

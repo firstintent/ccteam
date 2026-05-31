@@ -54,8 +54,10 @@ use ccteam_harness::execution::turns_mirror;
 use ccteam_harness::{default_backend, MuxSessionId, MuxSessionKind, MuxSessionSpec};
 use ccteam_harness::{
     AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx,
-    ThreadEvent, ThreadHandle, TurnId, TurnInput, CLAUDE_BIN_ENV,
+    ThreadEvent, ThreadHandle, TurnId, TurnInput,
 };
+
+use crate::CLAUDE_BIN_ENV;
 
 /// V0.6.0 F108 [`HarnessAdapter`] for Claude Code TUI (long-running tmux
 /// session, multi-turn with context reuse).
