@@ -31,8 +31,7 @@ use crate::tmux_ops::{
     query_pane_dims_from_session, resize_window, TmuxSession,
 };
 use crate::{
-    BackendKind, MuxEventStream, MuxSessionId, MuxSessionSpec, ProcessBackend,
-    TerminalProcessBackend,
+    BackendKind, MuxEventStream, MuxSessionId, MuxSessionSpec, PaneBackend, ProcessBackend,
 };
 
 use fifo_relay::FifoRelayRegistry;
@@ -65,7 +64,7 @@ impl TmuxBackend {
         Self::default()
     }
 
-    pub fn shared() -> Arc<dyn TerminalProcessBackend> {
+    pub fn shared() -> Arc<dyn PaneBackend> {
         Arc::new(Self::new())
     }
 
@@ -146,7 +145,7 @@ impl ProcessBackend for TmuxBackend {
                 if !crate::tmux_ops::pid_is_alive(pid) {
                     return Ok(false);
                 }
-                match TerminalProcessBackend::pane_pid(self, id).await? {
+                match PaneBackend::pane_pid(self, id).await? {
                     Some(actual) => Ok(actual == pid),
                     None => Ok(false),
                 }
@@ -229,7 +228,7 @@ impl ProcessBackend for TmuxBackend {
 }
 
 #[async_trait]
-impl TerminalProcessBackend for TmuxBackend {
+impl PaneBackend for TmuxBackend {
     async fn capture(&self, id: &MuxSessionId, lines: usize, with_ansi: bool) -> Result<Vec<u8>> {
         let name = id.0.clone();
         tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {

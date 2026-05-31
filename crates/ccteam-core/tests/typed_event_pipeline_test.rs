@@ -37,9 +37,7 @@ use std::time::Duration;
 
 use ccteam_core::progress;
 use ccteam_harness::execution::typed_events::{enrich_session, maybe_start_typed_event_tap};
-use ccteam_harness::{
-    EventKind, MuxSessionId, MuxSessionSpec, RmuxBackend, TerminalProcessBackend, Vendor,
-};
+use ccteam_harness::{EventKind, MuxSessionId, MuxSessionSpec, PaneBackend, RmuxBackend, Vendor};
 
 /// Drop guard that restores a `$ENV` var to its pre-test value. Mirrors
 /// the guard used by the sibling rmux adapter test, plus a `remove`
@@ -122,7 +120,7 @@ async fn typed_event_row_written_for_rate_limit_pattern_when_flag_on() {
 
     let tmpdir = tempfile::tempdir().expect("create tempdir");
     let socket_path = tmpdir.path().join("mux.sock");
-    let backend: Arc<dyn TerminalProcessBackend> =
+    let backend: Arc<dyn PaneBackend> =
         Arc::new(RmuxBackend::with_socket_path(socket_path.clone()));
     eprintln!("socket: {}", socket_path.display());
 
@@ -212,7 +210,7 @@ async fn no_typed_event_row_when_flag_off() {
     let tmpdir = tempfile::tempdir().expect("create tempdir");
     let progress_path = tmpdir.path().join("progress.jsonl");
 
-    let backend: Arc<dyn TerminalProcessBackend> = Arc::new(RmuxBackend::with_socket_path(
+    let backend: Arc<dyn PaneBackend> = Arc::new(RmuxBackend::with_socket_path(
         tmpdir.path().join("mux.sock"),
     ));
     maybe_start_typed_event_tap(
@@ -272,8 +270,8 @@ fn build_typed_event_event_has_expected_shape() {
 async fn spawn_turn_done_session(
     socket_path: PathBuf,
     base: &str,
-) -> (Arc<dyn TerminalProcessBackend>, MuxSessionId, String) {
-    let backend: Arc<dyn TerminalProcessBackend> =
+) -> (Arc<dyn PaneBackend>, MuxSessionId, String) {
+    let backend: Arc<dyn PaneBackend> =
         Arc::new(RmuxBackend::with_socket_path(socket_path.clone()));
     eprintln!("socket: {}", socket_path.display());
 
@@ -483,8 +481,8 @@ async fn turn_done_paired_suppresses_lossy_partial() {
 async fn spawn_two_tool_use_session(
     socket_path: PathBuf,
     base: &str,
-) -> (Arc<dyn TerminalProcessBackend>, MuxSessionId, String) {
-    let backend: Arc<dyn TerminalProcessBackend> =
+) -> (Arc<dyn PaneBackend>, MuxSessionId, String) {
+    let backend: Arc<dyn PaneBackend> =
         Arc::new(RmuxBackend::with_socket_path(socket_path.clone()));
     eprintln!("socket: {}", socket_path.display());
 
@@ -517,8 +515,8 @@ async fn spawn_two_tool_use_session(
 async fn spawn_two_user_prompt_session(
     socket_path: PathBuf,
     base: &str,
-) -> (Arc<dyn TerminalProcessBackend>, MuxSessionId, String) {
-    let backend: Arc<dyn TerminalProcessBackend> =
+) -> (Arc<dyn PaneBackend>, MuxSessionId, String) {
+    let backend: Arc<dyn PaneBackend> =
         Arc::new(RmuxBackend::with_socket_path(socket_path.clone()));
     eprintln!("socket: {}", socket_path.display());
 

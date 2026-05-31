@@ -54,7 +54,7 @@ use axum::{
     Router,
 };
 use ccteam_core::{ProjectState, TeamKind};
-use ccteam_harness::{MuxSessionId, ProcessBackend, TerminalProcessBackend, TmuxBackend};
+use ccteam_harness::{MuxSessionId, PaneBackend, ProcessBackend, TmuxBackend};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::sync::broadcast::error::RecvError;

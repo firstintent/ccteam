@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ccteam_harness::{MuxSessionSpec, RmuxBackend, TerminalProcessBackend};
+use ccteam_harness::{MuxSessionSpec, PaneBackend, RmuxBackend};
 
 fn random_session_name(base: &str) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -83,7 +83,7 @@ async fn backend_recovers_after_daemon_death() {
 
     let tmpdir = tempfile::tempdir().expect("create tempdir for socket");
     let socket_path = tmpdir.path().join("mux.sock");
-    let backend: Arc<dyn TerminalProcessBackend> =
+    let backend: Arc<dyn PaneBackend> =
         Arc::new(RmuxBackend::with_socket_path(socket_path.clone()));
 
     // First op spawns the daemon + caches the handle.

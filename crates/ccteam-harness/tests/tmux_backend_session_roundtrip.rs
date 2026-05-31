@@ -7,9 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ccteam_harness::tmux_ops::tmux_available;
-use ccteam_harness::{
-    MuxSessionId, MuxSessionSpec, ProcessBackend, TerminalProcessBackend, TmuxBackend,
-};
+use ccteam_harness::{MuxSessionId, MuxSessionSpec, PaneBackend, ProcessBackend, TmuxBackend};
 
 fn skip_if_no_tmux() -> bool {
     if !tmux_available() {
@@ -37,7 +35,7 @@ async fn spawn_send_capture_kill_through_trait() {
     if skip_if_no_tmux() {
         return;
     }
-    let backend: Arc<dyn TerminalProcessBackend> = Arc::new(TmuxBackend::new());
+    let backend: Arc<dyn PaneBackend> = Arc::new(TmuxBackend::new());
     let session_name = random_session_name("roundtrip");
     let spec = MuxSessionSpec::new(
         &session_name,
@@ -95,7 +93,7 @@ async fn kill_is_idempotent_on_missing_session() {
     if skip_if_no_tmux() {
         return;
     }
-    let backend: Arc<dyn TerminalProcessBackend> = Arc::new(TmuxBackend::new());
+    let backend: Arc<dyn PaneBackend> = Arc::new(TmuxBackend::new());
     let id = MuxSessionId::new(random_session_name("absent"));
     // Must not error on a session that never existed.
     backend.kill(&id).await.unwrap();

@@ -55,9 +55,7 @@ use ccteam_cost::{
 // sourced directly from the mux crate's `tmux_ops` so this module has
 // zero `crate::tmux` coupling (V0.8 W2c).
 use crate::tmux_ops::session_name_for_slug;
-use crate::{
-    default_backend, MuxSessionId, MuxSessionKind, MuxSessionSpec, TerminalProcessBackend,
-};
+use crate::{default_backend, MuxSessionId, MuxSessionKind, MuxSessionSpec, PaneBackend};
 
 /// Per-thread event broadcast buffer. Codex bursts items per turn so
 /// 256 lines of headroom is comfortable for a single subscriber.
@@ -760,10 +758,7 @@ fn parse_jsonl_item(item: &Value) -> ThreadItem {
 /// the legacy raw tmux-CLI form but inherits the `-l --` literal-mode
 /// separator (audit §4-J) for free, removing a class of
 /// payload-starts-with-dash bug.
-async fn send_codex_quit_keys(
-    backend: &dyn TerminalProcessBackend,
-    id: &MuxSessionId,
-) -> std::io::Result<()> {
+async fn send_codex_quit_keys(backend: &dyn PaneBackend, id: &MuxSessionId) -> std::io::Result<()> {
     backend
         .send_text(id, "q")
         .await

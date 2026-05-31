@@ -34,7 +34,7 @@ use crate::enriched_event::{
     EventMerger, Vendor,
 };
 use crate::patterns::{self, PatternVendor};
-use crate::{MuxEvent, MuxSessionId, TerminalProcessBackend};
+use crate::{MuxEvent, MuxSessionId, PaneBackend};
 
 /// FIXED mapping from a base-pattern `regex_id` (see
 /// [`crate::patterns`]) to the merger [`EventKind`] it produces.
@@ -252,7 +252,7 @@ impl TypedEventTap {
     pub async fn spawn(
         session_id: MuxSessionId,
         vendor: Vendor,
-        backend: Arc<dyn TerminalProcessBackend>,
+        backend: Arc<dyn PaneBackend>,
         grace: Duration,
     ) -> anyhow::Result<SpawnResult> {
         // Register every base pattern for this vendor so the backend will
@@ -739,7 +739,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl TerminalProcessBackend for MockBackend {
+    impl PaneBackend for MockBackend {
         async fn capture(
             &self,
             _id: &MuxSessionId,

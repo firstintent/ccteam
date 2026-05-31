@@ -45,8 +45,8 @@ use crate::execution::progress_bridge::{
     append_event, build_merger_lossy_partial_event, build_typed_event_event,
 };
 use crate::{
-    EventKind, MergeOutcome, MuxSessionId, RawEnrichment, TapHandle, TerminalProcessBackend,
-    TypedEventTap, Vendor, DEFAULT_GRACE,
+    EventKind, MergeOutcome, MuxSessionId, PaneBackend, RawEnrichment, TapHandle, TypedEventTap,
+    Vendor, DEFAULT_GRACE,
 };
 
 /// True when `CCTEAM_TYPED_EVENTS` is set to a truthy value (`1` / `true`).
@@ -213,7 +213,7 @@ fn vendor_str(vendor: Vendor) -> &'static str {
 /// tap lingers one grace window first to drain pending fallbacks). Append
 /// errors are logged at debug and skipped — never panics.
 pub fn maybe_start_typed_event_tap(
-    backend: Arc<dyn TerminalProcessBackend>,
+    backend: Arc<dyn PaneBackend>,
     id: MuxSessionId,
     vendor: Vendor,
     session_key: String,

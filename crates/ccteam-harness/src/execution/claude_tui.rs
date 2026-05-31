@@ -200,7 +200,7 @@ fn chat_spawn_env_owned(role: &str, slug: &str) -> Vec<(String, String)> {
 /// pane text content). Probe errors (backend query failure) degrade to
 /// `false` — a session we can't probe is treated as not-alive, which
 /// routes start_thread to the safe recreate path.
-async fn pane_runs_claude(backend: &dyn crate::TerminalProcessBackend, id: &MuxSessionId) -> bool {
+async fn pane_runs_claude(backend: &dyn crate::PaneBackend, id: &MuxSessionId) -> bool {
     pane_runs_process(backend, id, "claude")
         .await
         .unwrap_or(false)

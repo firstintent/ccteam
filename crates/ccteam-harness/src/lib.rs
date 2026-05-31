@@ -320,10 +320,6 @@ pub trait PaneBackend: ProcessBackend {
     async fn resize(&self, id: &MuxSessionId, cols: u16, rows: u16) -> Result<()>;
 }
 
-/// Back-compat name retained for call sites that still use the older
-/// terminal-oriented terminology. New code should prefer [`PaneBackend`].
-pub use self::PaneBackend as TerminalProcessBackend;
-
 /// Build argv for an interactive terminal handover (`tmux attach -t
 /// <name>` for the tmux backend). The CLI invokes this via blocking
 /// `Command::status()` on its own controlling tty — async doesn't fit
@@ -397,7 +393,7 @@ pub fn process_from_env() -> Result<Arc<dyn ProcessBackend>> {
 /// In-proc tasks do not own a terminal pane, so `inproc-test` is
 /// rejected here; callers that only need lifecycle + stdin/stdout
 /// operations should use [`process_from_env`].
-pub fn terminal_from_env() -> Result<Arc<dyn TerminalProcessBackend>> {
+pub fn terminal_from_env() -> Result<Arc<dyn PaneBackend>> {
     match std::env::var("CCTEAM_MUX_BACKEND").as_deref() {
         Ok("tmux") => Ok(Arc::new(TmuxBackend::new())),
         Ok("inproc-test") => Err(anyhow!(
@@ -414,7 +410,7 @@ pub fn terminal_from_env() -> Result<Arc<dyn TerminalProcessBackend>> {
 /// lifecycle/IO should use [`process_from_env`]; new code that needs
 /// capture/dimensions/resize should use [`terminal_from_env`] or
 /// [`default_backend`] explicitly.
-pub fn from_env() -> Result<Arc<dyn TerminalProcessBackend>> {
+pub fn from_env() -> Result<Arc<dyn PaneBackend>> {
     terminal_from_env()
 }
 
@@ -440,6 +436,6 @@ pub fn default_process_backend() -> Arc<dyn ProcessBackend> {
 /// operator opts out of rmux only with an explicit `CCTEAM_MUX_BACKEND=tmux`.
 /// **Do not cache** — instantiate at the call site (or thread it through
 /// from `main` / daemon startup).
-pub fn default_backend() -> Arc<dyn TerminalProcessBackend> {
+pub fn default_backend() -> Arc<dyn PaneBackend> {
     terminal_from_env().unwrap_or_else(|_| Arc::new(RmuxBackend::new()))
 }

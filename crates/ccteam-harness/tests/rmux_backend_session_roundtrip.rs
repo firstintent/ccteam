@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ccteam_harness::{MuxSessionId, MuxSessionSpec, RmuxBackend, TerminalProcessBackend};
+use ccteam_harness::{MuxSessionId, MuxSessionSpec, PaneBackend, RmuxBackend};
 
 fn random_session_name(base: &str) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -75,7 +75,7 @@ async fn spawn_send_capture_kill_through_trait() {
     // don't fight over `~/.ccteam/run/mux.sock`.
     let tmpdir = tempfile::tempdir().expect("create tempdir for socket");
     let socket_path = tmpdir.path().join("mux.sock");
-    let backend: Arc<dyn TerminalProcessBackend> =
+    let backend: Arc<dyn PaneBackend> =
         Arc::new(RmuxBackend::with_socket_path(socket_path.clone()));
     eprintln!("socket: {}", socket_path.display());
 
@@ -174,8 +174,7 @@ async fn kill_is_idempotent_on_missing_session() {
 
     let tmpdir = tempfile::tempdir().expect("create tempdir for socket");
     let socket_path = tmpdir.path().join("mux.sock");
-    let backend: Arc<dyn TerminalProcessBackend> =
-        Arc::new(RmuxBackend::with_socket_path(socket_path));
+    let backend: Arc<dyn PaneBackend> = Arc::new(RmuxBackend::with_socket_path(socket_path));
     let id = MuxSessionId::new(random_session_name("absent"));
     backend.kill(&id).await.unwrap();
 }
@@ -191,8 +190,7 @@ async fn register_pattern_w2a_stub_is_ok() {
 
     let tmpdir = tempfile::tempdir().expect("create tempdir for socket");
     let socket_path = tmpdir.path().join("mux.sock");
-    let backend: Arc<dyn TerminalProcessBackend> =
-        Arc::new(RmuxBackend::with_socket_path(socket_path));
+    let backend: Arc<dyn PaneBackend> = Arc::new(RmuxBackend::with_socket_path(socket_path));
     let id = MuxSessionId::new("any-name");
     backend
         .register_pattern(&id, "claude.idle".into(), r"\[idle\]".into())

@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use ccteam_harness::{
     from_env, process_from_env, terminal_from_env, InProcBackend, PaneBackend, ProcessBackend,
-    RmuxBackend, TerminalProcessBackend, TmuxBackend,
+    RmuxBackend, TmuxBackend,
 };
 
 /// Tests that mutate `CCTEAM_MUX_BACKEND` must serialize against each
@@ -37,7 +37,7 @@ fn rmux_backend_is_dyn_compat() {
     // V0.8 W2a — RmuxBackend constructs without contacting the daemon
     // (the SDK `Rmux` handle is lazily initialized on first
     // `connect_or_start`).
-    let _: Arc<dyn TerminalProcessBackend> = Arc::new(RmuxBackend::new());
+    let _: Arc<dyn PaneBackend> = Arc::new(RmuxBackend::new());
 }
 
 #[test]

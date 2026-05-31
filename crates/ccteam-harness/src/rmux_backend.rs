@@ -49,8 +49,8 @@ use rmux_sdk::{
 
 use crate::patterns::{PatternMatcher, PatternVendor};
 use crate::{
-    BackendKind, MuxEvent, MuxEventStream, MuxSessionId, MuxSessionSpec, ProcessBackend,
-    TerminalProcessBackend,
+    BackendKind, MuxEvent, MuxEventStream, MuxSessionId, MuxSessionSpec, PaneBackend,
+    ProcessBackend,
 };
 
 const DEFAULT_TIMEOUT_SECS: u64 = 5;
@@ -390,7 +390,7 @@ impl ProcessBackend for RmuxBackend {
                 if !crate::tmux_ops::pid_is_alive(pid) {
                     return Ok(false);
                 }
-                match TerminalProcessBackend::pane_pid(self, id).await? {
+                match PaneBackend::pane_pid(self, id).await? {
                     Some(actual) => Ok(actual == pid),
                     None => Ok(false),
                 }
@@ -561,7 +561,7 @@ impl ProcessBackend for RmuxBackend {
 }
 
 #[async_trait]
-impl TerminalProcessBackend for RmuxBackend {
+impl PaneBackend for RmuxBackend {
     async fn capture(&self, id: &MuxSessionId, lines: usize, _with_ansi: bool) -> Result<Vec<u8>> {
         // W2b followup: PaneSnapshot is the parsed grid — ANSI escape
         // bytes are not recoverable from cells. W2a returns the rendered

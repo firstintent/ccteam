@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use ccteam_core::CcteamPaths;
-use ccteam_harness::{MuxEvent, MuxSessionId, TerminalProcessBackend, TmuxBackend};
+use ccteam_harness::{MuxEvent, MuxSessionId, PaneBackend, TmuxBackend};
 use futures::StreamExt;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
@@ -50,13 +50,13 @@ pub const BROADCAST_CAPACITY: usize = 256;
 /// operator opts out with `CCTEAM_MUX_BACKEND=tmux`.
 #[derive(Clone)]
 pub struct PtyRegistry {
-    backend: Arc<dyn TerminalProcessBackend>,
+    backend: Arc<dyn PaneBackend>,
 }
 
 impl PtyRegistry {
     pub fn new() -> Self {
         let backend = ccteam_harness::terminal_from_env()
-            .unwrap_or_else(|_| Arc::new(TmuxBackend::new()) as Arc<dyn TerminalProcessBackend>);
+            .unwrap_or_else(|_| Arc::new(TmuxBackend::new()) as Arc<dyn PaneBackend>);
         Self { backend }
     }
 }
