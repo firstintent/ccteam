@@ -181,7 +181,7 @@ pub fn classify(value: &Value) -> JobLiveness {
     // job. Warn once so a Claude Code state-vocabulary drift surfaces in
     // the logs without flooding every poll.
     if state_str != "working" {
-        ccteam_harness::warn_unknown_vendor_token(
+        crate::warn_unknown_vendor_token(
             "claude_job_state",
             state_str,
             "treating as non-terminal (job stays Running); will keep probing",

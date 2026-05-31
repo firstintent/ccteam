@@ -95,6 +95,7 @@ pub mod tool_surface;
 // V0.5.0 F92 — cumulative-cost scanner over Claude Code transcript JSONLs.
 pub mod transcript_scanner;
 pub mod vendor;
+pub mod vendor_compat;
 pub mod watchdog;
 // V0.4.0 F63 — workflow.yaml schema + parser. Pure data + validation;
 // no IO side effects beyond reading the YAML file. See module docs.
@@ -279,6 +280,7 @@ pub use tool_surface::{
 };
 pub use transcript_scanner::{resolve_jsonl_path, session_cost_from_jsonl};
 pub use vendor::AgentVendor;
+pub use vendor_compat::warn_unknown_vendor_token;
 pub use watchdog::{
     config_path as watchdog_config_path, load_config as load_watchdog_config,
     push_alert_to_meta_outbox as push_watchdog_alert_to_meta_outbox, scan as watchdog_scan,

@@ -720,7 +720,7 @@ pub fn translate_notification(notif: &Notification, wanted: &str) -> Option<Thre
         // anything we don't translate. Warn once per unknown method so a
         // Codex app-server protocol drift surfaces in the logs.
         other => {
-            ccteam_harness::warn_unknown_vendor_token(
+            crate::warn_unknown_vendor_token(
                 "codex_app_server_notification",
                 other,
                 "skipping this notification; event stream continues",
@@ -932,7 +932,7 @@ fn translate_item_event(
         // missing `type` (`None`) is a shape gap, not a vocabulary
         // drift, so it stays silent.
         Some(other) => {
-            ccteam_harness::warn_unknown_vendor_token(
+            crate::warn_unknown_vendor_token(
                 "codex_app_server_item",
                 other,
                 "degraded to empty agent message",
