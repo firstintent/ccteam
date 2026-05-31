@@ -7,7 +7,7 @@
 use ccteam_core::execution::codex_app_server::{
     translate_notification, turn_input_to_items, CodexAppServerAdapter, APP_SERVER_SOCKET_ENV,
 };
-use ccteam_core::execution::codex_jsonrpc::Notification;
+use ccteam_harness::execution::codex_jsonrpc::Notification;
 use ccteam_harness::{
     AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx,
     ThreadEvent, TurnInput,

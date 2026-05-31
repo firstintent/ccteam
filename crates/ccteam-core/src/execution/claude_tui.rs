@@ -45,12 +45,12 @@ use notify::{EventKind, RecursiveMode, Watcher};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-use crate::execution::process_inspect::pane_runs_process;
-use crate::execution::transcript_tail::{
+use ccteam_harness::execution::process_inspect::pane_runs_process;
+use ccteam_harness::execution::transcript_tail::{
     self, active_session_id_path, anthropic_project_dir, cursor_path, encode_project_cwd,
     PendingTools, TranscriptCursor,
 };
-use crate::execution::turns_mirror;
+use ccteam_harness::execution::turns_mirror;
 use ccteam_harness::{default_backend, MuxSessionId, MuxSessionKind, MuxSessionSpec};
 use ccteam_harness::{
     AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx,
@@ -883,7 +883,7 @@ async fn tail_loop(
 /// V0.6.8 F196 — single observation point that fans out to both the
 /// F187 in-process WARN gate ([`MarkerSilenceWatch`]) and the
 /// supervisor-side state machine (via the
-/// [`crate::execution::marker_reporter`] registry).
+/// [`ccteam_harness::execution::marker_reporter`] registry).
 ///
 /// Called once per tail-loop tick (initial sweep, every inotify
 /// CREATE/MODIFY event, and every 2-second safety-net tick in
@@ -910,7 +910,7 @@ async fn observe_marker(
     if slug.is_empty() {
         return;
     }
-    if let Some(reporter) = crate::execution::marker_reporter::lookup(slug, role) {
+    if let Some(reporter) = ccteam_harness::execution::marker_reporter::lookup(slug, role) {
         if marker_present {
             reporter.report_marker_found().await;
         } else {
@@ -1159,7 +1159,7 @@ async fn tail_loop_polling(
 
 // Re-export to keep `anthropic_project_dir` reachable for the
 // session_recovery / imd consumers without bloating the module surface.
-pub use crate::execution::transcript_tail::anthropic_project_dir as resolve_anthropic_project_dir;
+pub use ccteam_harness::execution::transcript_tail::anthropic_project_dir as resolve_anthropic_project_dir;
 
 #[cfg(test)]
 mod tests {

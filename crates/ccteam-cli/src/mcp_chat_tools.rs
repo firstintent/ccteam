@@ -47,8 +47,8 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 
 use ccteam_core::agent_naming::pick_unused_bot_name;
-use ccteam_core::execution::turns_mirror::{read_all_turns, TurnRecord};
 use ccteam_core::paths::CcteamPaths;
+use ccteam_harness::execution::turns_mirror::{read_all_turns, TurnRecord};
 use ccteam_harness::AgentVendor;
 use ccteam_im::inbound::{render_envelope, InboxEnvelope};
 use ccteam_im::{

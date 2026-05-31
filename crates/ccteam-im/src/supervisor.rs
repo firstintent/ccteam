@@ -35,7 +35,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use ccteam_core::execution::turns_mirror::{self, TurnRecord};
+use ccteam_harness::execution::turns_mirror::{self, TurnRecord};
 use ccteam_harness::{
     AgentSpecBrief, HarnessAdapter, MarkerReporter, SpawnCtx, ThreadEvent, ThreadHandle,
     ThreadItemDetails, TurnId, TurnInput,
@@ -423,8 +423,8 @@ pub struct SupervisorSnapshot {
 ///   4. `restart()` — close + start (used when heartbeat goes stale).
 ///
 /// All adapter calls go through the [`HarnessAdapter`] trait — no
-/// `ccteam_core::execution::*` import lives in this crate (red line
-/// enforced by `tests/dep_graph_test.rs`). Tests inject a stub adapter.
+/// concrete execution adapter import lives in this supervisor. Tests
+/// inject a stub adapter.
 pub struct BotSupervisor {
     /// Registration this supervisor binds to.
     pub reg: BotRegistration,
@@ -609,7 +609,7 @@ impl BotSupervisor {
         // always work off the same supervisor Arc.
         let _ = self.self_weak.set(Arc::downgrade(self));
         let weak: Weak<dyn MarkerReporter> = Arc::downgrade(self) as Weak<dyn MarkerReporter>;
-        ccteam_core::execution::marker_reporter::register(
+        ccteam_harness::execution::marker_reporter::register(
             &self.reg.workflow_slug,
             &self.reg.role,
             weak,
@@ -620,7 +620,7 @@ impl BotSupervisor {
     /// Called from `shutdown` so a long-lived daemon doesn't accumulate
     /// dead entries. Idempotent on a missing key.
     pub fn unregister_marker_reporter(&self) {
-        ccteam_core::execution::marker_reporter::unregister(
+        ccteam_harness::execution::marker_reporter::unregister(
             &self.reg.workflow_slug,
             &self.reg.role,
         );

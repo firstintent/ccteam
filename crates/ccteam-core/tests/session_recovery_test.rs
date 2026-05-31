@@ -1,7 +1,7 @@
 //! V0.6.0 F118 — recovery prompt builder tests.
 
-use ccteam_core::execution::session_recovery::{build_recovery_prompt, format_recovery_prompt};
-use ccteam_core::execution::turns_mirror::{append_turn, TurnRecord};
+use ccteam_harness::execution::session_recovery::{build_recovery_prompt, format_recovery_prompt};
+use ccteam_harness::execution::turns_mirror::{append_turn, TurnRecord};
 use chrono::Utc;
 use serde_json::Value;
 use tempfile::TempDir;

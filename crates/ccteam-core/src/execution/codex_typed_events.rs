@@ -37,7 +37,7 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
-use crate::execution::codex_jsonrpc::{CodexJsonRpcClient, Notification};
+use ccteam_harness::execution::codex_jsonrpc::{CodexJsonRpcClient, Notification};
 
 /// True when `CCTEAM_TYPED_EVENTS` is set to a truthy value (`1` /
 /// `true`). Mirrors [`crate::execution::typed_events::flag_enabled`] so

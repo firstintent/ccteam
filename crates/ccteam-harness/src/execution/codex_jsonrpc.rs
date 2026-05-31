@@ -1,4 +1,4 @@
-//! V0.6.0 Wave 3 F112 — thin JSON-RPC client over a Unix Domain Socket
+//! Thin JSON-RPC client over a Unix Domain Socket
 //! for talking to `codex app-server --listen unix://<sock>`.
 //!
 //! Codex's wire format is "JSON-RPC lite" — line-delimited JSON, no

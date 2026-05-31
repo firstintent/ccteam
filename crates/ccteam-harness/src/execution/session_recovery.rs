@@ -8,7 +8,7 @@
 //!   from the orchestrator-owned mirror,
 //! - the user deleting `~/.claude/projects/<encoded>/<sid>.jsonl`.
 //!
-//! In all cases the ccteam-owned
+//! In all cases the ccteam-owned harness mirror
 //! `<project>/.ccteam/chat/<bot>/turns.jsonl` (see
 //! [`super::turns_mirror`]) has the canonical conversation. This module
 //! takes the last `N` turns from that file, formats them as a

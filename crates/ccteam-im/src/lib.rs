@@ -15,9 +15,10 @@
 //!
 //! - **`ccteam-core` stays openhuman-free.** The dependency graph
 //!   integration test `tests/dep_graph_test.rs` enforces this.
-//! - We talk to long-running chat sessions through
-//!   [`ccteam_harness::HarnessAdapter`] only — never reach into
-//!   `ccteam_core::execution::*` directly.
+//! - Runtime routing talks to long-running chat sessions through
+//!   [`ccteam_harness::HarnessAdapter`]. The default adapter factory
+//!   still imports concrete core adapters until the next P1 slice moves
+//!   those implementations into `ccteam-harness`.
 //! - The daemon **never kills tmux sessions** outside the F116
 //!   supervisor crash-restart codepath. User-initiated stop goes
 //!   through `<project>/.ccteam/chat/<bot>/signals/shutdown.signal`.

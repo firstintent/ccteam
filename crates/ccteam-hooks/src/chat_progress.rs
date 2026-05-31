@@ -26,13 +26,13 @@ use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use std::path::Path;
 
-use ccteam_core::execution::transcript_tail::active_session_id_path;
 use ccteam_core::progress::{
     append_event, build_chat_compact_done_event, build_chat_session_reset_event,
     build_chat_session_started_event, build_chat_tool_call_started_event,
     build_chat_turn_completed_event, build_chat_turn_user_prompt_event,
 };
 use ccteam_core::{session_context_from_cwd, CcteamPaths};
+use ccteam_harness::execution::transcript_tail::active_session_id_path;
 
 /// V0.6.0 F108 entry — dispatch one `chat-progress <event>` invocation.
 ///

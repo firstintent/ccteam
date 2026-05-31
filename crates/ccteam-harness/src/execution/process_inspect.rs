@@ -28,8 +28,8 @@
 /// skipped. A failed `ps` invocation for one pid is treated as a
 /// non-match and the loop continues to the next pid.
 pub async fn pane_runs_process(
-    backend: &dyn ccteam_harness::TerminalProcessBackend,
-    id: &ccteam_harness::MuxSessionId,
+    backend: &dyn crate::TerminalProcessBackend,
+    id: &crate::MuxSessionId,
     needle: &str,
 ) -> anyhow::Result<bool> {
     let pids = backend.list_pane_pids(id).await?;
@@ -51,7 +51,7 @@ pub async fn pane_runs_process(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ccteam_harness::{InProcBackend, MuxSessionId};
+    use crate::{InProcBackend, MuxSessionId};
 
     /// `InProcBackend::list_pane_pids` returns an empty Vec (mode-1 has
     /// no panes), so the probe short-circuits to `false` without ever

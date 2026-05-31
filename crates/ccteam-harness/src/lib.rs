@@ -34,6 +34,7 @@ use futures::Stream;
 pub mod adapter;
 pub mod daemon;
 pub mod enriched_event;
+pub mod execution;
 pub mod hook_sink;
 pub mod inproc_backend;
 pub mod patterns;

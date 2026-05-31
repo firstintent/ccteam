@@ -4,7 +4,7 @@
 //! framing + dispatch logic is exercised without dialing a real
 //! `codex app-server` daemon.
 
-use ccteam_core::execution::codex_jsonrpc::{CodexJsonRpcClient, Notification};
+use ccteam_harness::execution::codex_jsonrpc::{CodexJsonRpcClient, Notification};
 use serde_json::{json, Value};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};

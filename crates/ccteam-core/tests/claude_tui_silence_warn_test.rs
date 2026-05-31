@@ -9,7 +9,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ccteam_core::execution::transcript_tail::active_session_id_path;
+use ccteam_harness::execution::transcript_tail::active_session_id_path;
 use serial_test::serial;
 use tempfile::TempDir;
 use tracing::field::{Field, Visit};

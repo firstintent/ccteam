@@ -1,10 +1,10 @@
 //! V0.6.8 F196 — process-global registry mapping a `(slug, role)` pair
-//! to the [`MarkerReporter`](ccteam_harness::MarkerReporter) the chat-
+//! to the [`MarkerReporter`](crate::MarkerReporter) the chat-
 //! mode adapter's transcript tail loop should poke on every observed
 //! tick.
 //!
 //! Why a registry instead of plumbing the reporter through
-//! [`ccteam_harness::HarnessAdapter::events`]: the adapter trait is
+//! [`HarnessAdapter::events`](crate::HarnessAdapter::events): the adapter trait is
 //! shared with Codex (UDS app-server) and the bg adapters. Adding a
 //! parameter would ripple to every impl + every test fixture (and to
 //! the public stream signature consumers spell out). The registry
@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use ccteam_harness::MarkerReporter;
+use crate::MarkerReporter;
 
 /// `(slug, role)` lookup key. Owned so the map can outlive any one
 /// supervisor's borrowed strings.

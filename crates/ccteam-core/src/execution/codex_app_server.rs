@@ -50,9 +50,9 @@ use futures::stream::{self, BoxStream, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
-use crate::execution::codex_jsonrpc::{CodexJsonRpcClient, Notification};
 use crate::paths::CcteamPaths;
 use crate::progress::append_event;
+use ccteam_harness::execution::codex_jsonrpc::{CodexJsonRpcClient, Notification};
 use ccteam_harness::{
     AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx,
     ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails, TurnId, TurnInput,

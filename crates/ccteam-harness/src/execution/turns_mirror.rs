@@ -3,7 +3,7 @@
 //! The Anthropic transcript at
 //! `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl` is the wire SoT
 //! for one *session*; it disappears when the user runs `/clear` or when
-//! Claude rotates session-ids on compaction. The orchestrator owns a
+//! Claude rotates session-ids on compaction. ccteam owns a
 //! parallel mirror — `<project>/.ccteam/chat/<bot>/turns.jsonl` — that:
 //!
 //! - never gets rotated by Claude,

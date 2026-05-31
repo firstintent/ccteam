@@ -1,6 +1,6 @@
 //! V0.6.0 F108 — `<bot>/turns.jsonl` mirror tests.
 
-use ccteam_core::execution::turns_mirror::{
+use ccteam_harness::execution::turns_mirror::{
     append_turn, last_n_turns, read_all_turns, turns_jsonl_path, ToolCallSummary, TurnRecord,
 };
 use chrono::Utc;

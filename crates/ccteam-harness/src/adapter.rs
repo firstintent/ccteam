@@ -19,19 +19,10 @@
 //!   [`state_json_path`], [`sigterm_pid`], [`sigkill_pid`],
 //!   [`parse_backgrounded_short_id`], plus codex marker constants.
 //!
-//! Adapter implementations live in [`crate::execution`]:
-//!
-//! - [`crate::execution::claude_bg::ClaudeBgAdapter`] (replaces V0.5.x
-//!   `ClaudeCodeAdapter`; zero behaviour change — `start_thread` =
-//!   spawn `claude --bg --agent <role>`, `close_thread` = SIGTERM pid
-//!   from `state.json`).
-//! - [`crate::execution::codex_exec::CodexExecAdapter`] (replaces V0.5.x
-//!   `CodexAdapter`; `start_thread` = `tmux new-session -d -- codex`,
-//!   `close_thread` = `send-keys q` + `tmux kill-session` fallback;
-//!   Wave 3 F112 fills in `codex exec --json` + thread/start UDS).
-//! - [`crate::execution::claude_tui::ClaudeTuiAdapter`] (Wave 1 STUB;
-//!   Wave 2 F108 fills tmux long-session + send-keys -l + dual-track
-//!   transcript polling).
+//! Concrete adapter implementations still live in `ccteam-core` for
+//! this slice; they move here after their progress/workflow coupling is
+//! removed. Pure execution support modules already live under
+//! [`crate::execution`].
 //!
 //! ## Red lines (unchanged from V0.5.x)
 //!
@@ -122,12 +113,12 @@ pub enum ExecutionMode {
 ///
 /// `identity` semantics by adapter:
 ///
-/// - [`crate::execution::claude_bg::ClaudeBgAdapter`] → `daemonShort`
-///   `job_id` from `claude --bg`'s `backgrounded · <id>` stdout line.
-/// - [`crate::execution::claude_tui::ClaudeTuiAdapter`] → tmux session
-///   name `ccteam-chat-<slug>-<role>`.
-/// - [`crate::execution::codex_exec::CodexExecAdapter`] → tmux session
-///   name `ccteam-<slug>-<sid>`.
+/// - Claude bg adapters use the `daemonShort` job id from `claude
+///   --bg`'s `backgrounded · <id>` stdout line.
+/// - Claude TUI adapters use tmux session names like
+///   `ccteam-chat-<slug>-<role>`.
+/// - Codex exec adapters use tmux session names like
+///   `ccteam-<slug>-<sid>`.
 ///
 /// `raw_extras` is a free-form JSON bag for vendor-specific data the
 /// orchestrator's translation layer may need (e.g. `{"tmux_session":
@@ -348,10 +339,7 @@ pub struct AgentSpecBrief {
 /// **Binding contract** (Wave 1 lock; Wave 2/3 may not change this
 /// signature): 5 async lifecycle methods + 2 sync identifier methods.
 ///
-/// Implementations live in [`crate::execution`]:
-/// - [`crate::execution::claude_bg::ClaudeBgAdapter`]
-/// - [`crate::execution::claude_tui::ClaudeTuiAdapter`] (stub Wave 1)
-/// - [`crate::execution::codex_exec::CodexExecAdapter`]
+/// Concrete implementations move into this crate in the next P1 slice.
 #[async_trait::async_trait]
 pub trait HarnessAdapter: Send + Sync {
     /// Stable identifier, e.g. `"claude-bg"`, `"claude-tui"`,

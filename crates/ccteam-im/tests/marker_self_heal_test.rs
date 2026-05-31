@@ -367,7 +367,7 @@ async fn trait_impl_heal_path_runs_through_registry() {
     sup.register_as_marker_reporter();
 
     // Look up the way the chat-mode tail loop does in production.
-    let reporter = ccteam_core::execution::marker_reporter::lookup("dev-foo", "lead")
+    let reporter = ccteam_harness::execution::marker_reporter::lookup("dev-foo", "lead")
         .expect("registered supervisor should be found in the reporter registry");
 
     // Fire below-threshold reports through the trait — should be

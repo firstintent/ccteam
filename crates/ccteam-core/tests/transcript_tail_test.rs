@@ -3,7 +3,7 @@
 use std::io::Write as _;
 use std::path::Path;
 
-use ccteam_core::execution::transcript_tail::{
+use ccteam_harness::execution::transcript_tail::{
     cursor_path, encode_project_cwd, parse_transcript_line, read_new, PendingTools,
     TranscriptCursor,
 };
