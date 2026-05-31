@@ -4,7 +4,7 @@
 //! adapter's `client()` connects to the test socket rather than
 //! `$CODEX_HOME/app-server-control/app-server-control.sock`.
 
-use ccteam_core::execution::codex_app_server::{
+use ccteam_harness::execution::codex_app_server::{
     translate_notification, turn_input_to_items, CodexAppServerAdapter, APP_SERVER_SOCKET_ENV,
 };
 use ccteam_harness::execution::codex_jsonrpc::Notification;

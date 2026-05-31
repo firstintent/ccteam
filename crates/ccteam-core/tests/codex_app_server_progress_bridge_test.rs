@@ -12,7 +12,7 @@
 //!
 //! 1. **Unit-level bridge** — pre-register a ctx via
 //!    [`CodexAppServerAdapter::register_bridge_for_test`] then call
-//!    [`ccteam_core::execution::codex_app_server::build_progress_line`]
+//!    [`ccteam_harness::execution::codex_app_server::build_progress_line`]
 //!    directly. Verifies the row shape + cost roll-up without a real
 //!    UDS round-trip (deterministic; runs on every box).
 //! 2. **End-to-end UDS** — mock a JSON-RPC peer, drive
@@ -24,11 +24,11 @@
 //! peer harness so any future `app-server` protocol drift surfaces in
 //! both suites.
 
-use ccteam_core::execution::codex_app_server::{
-    build_progress_line, CodexAppServerAdapter, ProgressBridgeCtx, APP_SERVER_SOCKET_ENV,
-};
 use ccteam_core::queries::cost_summary_from_events;
 use ccteam_core::CcteamPaths;
+use ccteam_harness::execution::codex_app_server::{
+    build_progress_line, CodexAppServerAdapter, ProgressBridgeCtx, APP_SERVER_SOCKET_ENV,
+};
 use ccteam_harness::{
     AgentSpecBrief, HarnessAdapter, SpawnCtx, ThreadErrorEvent, ThreadEvent, UnifiedTokenUsage,
 };

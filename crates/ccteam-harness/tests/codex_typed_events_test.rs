@@ -11,8 +11,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ccteam_core::execution::codex_typed_events::{maybe_start_codex_typed_event_tap, run_loop};
 use ccteam_harness::execution::codex_jsonrpc::{CodexJsonRpcClient, Notification};
+use ccteam_harness::execution::codex_typed_events::{maybe_start_codex_typed_event_tap, run_loop};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;

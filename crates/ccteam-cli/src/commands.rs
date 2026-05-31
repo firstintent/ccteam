@@ -3603,7 +3603,7 @@ pub fn run_check_codex_auto_critic() -> (String, i32) {
     // also emit `turn.completed` after `--json` mode finishes (cheap
     // ~1¢ depending on user's plan).
     //
-    // Argv mirrors `crates/ccteam-core/src/execution/codex_exec.rs::
+    // Argv mirrors `crates/ccteam-harness/src/execution/codex_exec.rs::
     // build_exec_argv` for parity with the real wave-3 adapter; the
     // stub MUST accept the same flags.
     let probe = Command::new(&bin)

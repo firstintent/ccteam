@@ -2,7 +2,7 @@
 //!
 //! Parallels [`crate::execution::typed_events`] (Claude side) but with
 //! one critical architectural divergence: **we do NOT drive
-//! [`ccteam_harness::EventMerger`]**.
+//! [`crate::EventMerger`]**.
 //!
 //! Why bypass the merger? The merger exists to *pair* a lossy P2 base
 //! event (pane regex match) with a lossless P1 enrichment (Claude hook
@@ -11,7 +11,7 @@
 //! Going through the merger would push every notification into
 //! `pending_enrichment` waiting for a base that will never arrive;
 //! `BUFFER_CAPACITY=64` would silently FIFO-evict the front
-//! ([`ccteam_harness::EventMerger`] internals — see
+//! ([`crate::EventMerger`] internals — see
 //! `enriched_event.rs:481-487`), so a busy turn would drop events with
 //! no visible signal. Direct writes from the JSON-RPC subscriber
 //! eliminate the leak.
@@ -32,12 +32,13 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use ccteam_harness::EventKind;
+use crate::EventKind;
 use serde_json::Value;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
-use ccteam_harness::execution::codex_jsonrpc::{CodexJsonRpcClient, Notification};
+use crate::execution::codex_jsonrpc::{CodexJsonRpcClient, Notification};
+use crate::execution::progress_bridge::{append_event, build_typed_event_event};
 
 /// True when `CCTEAM_TYPED_EVENTS` is set to a truthy value (`1` /
 /// `true`). Mirrors [`crate::execution::typed_events::flag_enabled`] so
@@ -133,13 +134,8 @@ pub async fn run_loop(mut rx: broadcast::Receiver<Notification>, progress_path: 
                 // `"{slug}-{role}"` session_key here. Downstream tools
                 // pair rows by `progress.jsonl` file path (one file per
                 // slug) + `vendor`.
-                let row = crate::progress::build_typed_event_event(
-                    "codex",
-                    event_kind_str(kind),
-                    &captured,
-                    "",
-                );
-                if let Err(err) = crate::progress::append_event(&progress_path, &row) {
+                let row = build_typed_event_event("codex", event_kind_str(kind), &captured, "");
+                if let Err(err) = append_event(&progress_path, &row) {
                     tracing::debug!(
                         error = %err,
                         method = %notif.method,

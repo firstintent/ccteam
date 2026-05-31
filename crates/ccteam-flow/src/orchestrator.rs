@@ -32,11 +32,11 @@ use tokio::task::JoinSet;
 
 use crate::artifact_watcher::{ArtifactEvent, ArtifactWatcher};
 use crate::workflow_watcher::{WorkflowFileEvent, WorkflowFileWatcher};
-use ccteam_core::execution::{ClaudeTuiAdapter, CodexExecAdapter};
 use ccteam_core::inbox::{InboxMessage, SessionMailbox};
 use ccteam_core::paths::CcteamPaths;
 use ccteam_core::spawn_brief::{render_spawn_brief, SpawnContext as SpawnBriefContext};
 use ccteam_core::{daemon, handoff, preferences, progress, queries};
+use ccteam_harness::execution::{ClaudeTuiAdapter, CodexExecAdapter};
 use ccteam_harness::ClaudeBgAdapter;
 use ccteam_harness::{
     AgentSpecBrief, AgentVendor, HarnessAdapter, SessionHandle, SpawnCtx, ThreadEvent,

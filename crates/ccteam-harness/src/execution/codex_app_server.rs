@@ -50,10 +50,16 @@ use futures::stream::{self, BoxStream, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
-use crate::paths::CcteamPaths;
-use crate::progress::append_event;
-use ccteam_harness::execution::codex_jsonrpc::{CodexJsonRpcClient, Notification};
-use ccteam_harness::{
+use crate::execution::codex_jsonrpc::{CodexJsonRpcClient, Notification};
+use crate::execution::progress_bridge::{
+    append_event, build_codex_plan_updated_event, build_codex_rate_limit_event,
+    build_codex_thread_status_event, build_codex_token_usage_event, progress_jsonl_from_env,
+};
+#[cfg(test)]
+use crate::execution::progress_bridge::{
+    CODEX_PLAN_UPDATED, CODEX_RATE_LIMIT, CODEX_THREAD_STATUS, CODEX_TOKEN_USAGE,
+};
+use crate::{
     AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx,
     ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails, TurnId, TurnInput,
     UnifiedTokenUsage,
@@ -70,7 +76,7 @@ pub const APP_SERVER_SOCKET_ENV: &str = "CCTEAM_CODEX_APP_SERVER_SOCKET";
 /// time a notification matches the thread.
 ///
 /// `progress_path` lands at `~/.ccteam/progress/<slug>.jsonl`
-/// (resolved via [`CcteamPaths::from_env`]) so the bridge stays
+/// (resolved from `CCTEAM_HOME`) so the bridge stays
 /// consistent with the orchestrator's own writes. Tests inject a
 /// custom ctx via [`CodexAppServerAdapter::register_bridge_for_test`].
 #[derive(Debug, Clone)]
@@ -184,7 +190,7 @@ impl CodexAppServerAdapter {
         let params = json!({
             "clientInfo": {
                 "name": "ccteam",
-                "version": crate::VERSION,
+                "version": env!("CARGO_PKG_VERSION"),
             },
             "capabilities": {
                 "experimentalApi": true,
@@ -292,10 +298,9 @@ impl HarnessAdapter for CodexAppServerAdapter {
         })?;
         // V0.6.1 F122 — register a progress bridge so the events()
         // stream can mirror turn boundaries into progress.jsonl.
-        // CcteamPaths resolution honours CCTEAM_HOME so test runs land
+        // progress path resolution honours CCTEAM_HOME so test runs land
         // in their tempdir layout; production lands in ~/.ccteam/progress/.
-        if let Ok(paths) = CcteamPaths::from_env() {
-            let progress_path = paths.progress_jsonl(&ctx.slug);
+        if let Some(progress_path) = progress_jsonl_from_env(&ctx.slug) {
             self.register_bridge(
                 thread_id.clone(),
                 ProgressBridgeCtx {
@@ -1037,7 +1042,7 @@ pub fn build_codex_notification_progress_line(notif: &Notification, wanted: &str
                 return None;
             }
             let plan = pluck_val(&notif.params, "plan", "plan").unwrap_or(Value::Array(vec![]));
-            Some(crate::progress::build_codex_plan_updated_event(
+            Some(build_codex_plan_updated_event(
                 pluck_str(&notif.params, "thread_id", "threadId").unwrap_or(wanted),
                 pluck_str(&notif.params, "turn_id", "turnId").unwrap_or(""),
                 pluck_str(&notif.params, "explanation", "explanation"),
@@ -1062,7 +1067,7 @@ pub fn build_codex_notification_progress_line(notif: &Notification, wanted: &str
                 .get("modelContextWindow")
                 .or_else(|| usage.get("model_context_window"))
                 .and_then(|v| v.as_i64());
-            Some(crate::progress::build_codex_token_usage_event(
+            Some(build_codex_token_usage_event(
                 pluck_str(&notif.params, "thread_id", "threadId").unwrap_or(wanted),
                 pluck_str(&notif.params, "turn_id", "turnId").unwrap_or(""),
                 total,
@@ -1094,7 +1099,7 @@ pub fn build_codex_notification_progress_line(notif: &Notification, wanted: &str
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            Some(crate::progress::build_codex_thread_status_event(
+            Some(build_codex_thread_status_event(
                 pluck_str(&notif.params, "thread_id", "threadId").unwrap_or(wanted),
                 &status,
                 active_flags,
@@ -1104,7 +1109,7 @@ pub fn build_codex_notification_progress_line(notif: &Notification, wanted: &str
             // No thread_id on this notification — it is account-scoped.
             let snapshot = pluck_val(&notif.params, "rate_limits", "rateLimits")
                 .unwrap_or(Value::Object(Default::default()));
-            Some(crate::progress::build_codex_rate_limit_event(snapshot))
+            Some(build_codex_rate_limit_event(snapshot))
         }
         _ => None,
     }
@@ -1408,8 +1413,8 @@ mod tests {
         // No ThreadEvent variant.
         assert!(translate_notification(&n, "t-1").is_none());
         let line = build_codex_notification_progress_line(&n, "t-1").expect("plan row");
-        assert_eq!(line["event"], crate::progress::CODEX_PLAN_UPDATED);
-        assert_ne!(line["event"], crate::progress::PLAN_PENDING);
+        assert_eq!(line["event"], CODEX_PLAN_UPDATED);
+        assert_ne!(line["event"], "plan_pending");
         assert_eq!(line["vendor"], "codex");
         assert_eq!(line["turn_id"], "u-1");
         assert_eq!(line["explanation"], "drafting");
@@ -1454,7 +1459,7 @@ mod tests {
             }),
         };
         let line = build_codex_notification_progress_line(&n, "t-9").expect("camel plan row");
-        assert_eq!(line["event"], crate::progress::CODEX_PLAN_UPDATED);
+        assert_eq!(line["event"], CODEX_PLAN_UPDATED);
         assert_eq!(line["thread_id"], "t-9");
         assert_eq!(line["turn_id"], "u-9");
     }
@@ -1486,7 +1491,7 @@ mod tests {
         };
         assert!(translate_notification(&n, "t-1").is_none());
         let line = build_codex_notification_progress_line(&n, "t-1").expect("usage row");
-        assert_eq!(line["event"], crate::progress::CODEX_TOKEN_USAGE);
+        assert_eq!(line["event"], CODEX_TOKEN_USAGE);
         assert_eq!(line["vendor"], "codex");
         assert_eq!(line["turn_id"], "u-1");
         assert_eq!(line["total"]["total_tokens"], 300);
@@ -1509,7 +1514,7 @@ mod tests {
             }),
         };
         let line = build_codex_notification_progress_line(&n, "t-1").expect("usage row");
-        assert_eq!(line["event"], crate::progress::CODEX_TOKEN_USAGE);
+        assert_eq!(line["event"], CODEX_TOKEN_USAGE);
         assert_eq!(line["total"]["total_tokens"], 5);
         assert_eq!(line["model_context_window"], 128000);
     }
@@ -1526,7 +1531,7 @@ mod tests {
         };
         assert!(translate_notification(&n, "t-1").is_none());
         let line = build_codex_notification_progress_line(&n, "t-1").expect("status row");
-        assert_eq!(line["event"], crate::progress::CODEX_THREAD_STATUS);
+        assert_eq!(line["event"], CODEX_THREAD_STATUS);
         assert_eq!(line["vendor"], "codex");
         assert_eq!(line["status"], "active");
         assert_eq!(line["active_flags"][0], "waiting_on_approval");
@@ -1558,7 +1563,7 @@ mod tests {
         assert!(translate_notification(&n, "any-thread").is_none());
         let line =
             build_codex_notification_progress_line(&n, "any-thread").expect("rate-limit row");
-        assert_eq!(line["event"], crate::progress::CODEX_RATE_LIMIT);
+        assert_eq!(line["event"], CODEX_RATE_LIMIT);
         assert_eq!(line["vendor"], "codex");
         assert_eq!(line["snapshot"]["primary"]["usedPercent"], 80);
     }

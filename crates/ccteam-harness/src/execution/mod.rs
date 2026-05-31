@@ -2,8 +2,10 @@
 //!
 pub mod claude_bg;
 pub mod claude_tui;
+pub mod codex_app_server;
 pub mod codex_exec;
 pub mod codex_jsonrpc;
+pub mod codex_typed_events;
 pub mod marker_reporter;
 pub mod process_inspect;
 pub mod progress_bridge;
@@ -14,4 +16,5 @@ pub mod typed_events;
 
 pub use claude_bg::ClaudeBgAdapter;
 pub use claude_tui::ClaudeTuiAdapter;
+pub use codex_app_server::CodexAppServerAdapter;
 pub use codex_exec::CodexExecAdapter;
