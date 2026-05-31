@@ -101,7 +101,7 @@ impl PatternMatcher {
 
     /// Compile `regex` and store it under `regex_id`. Idempotent —
     /// re-registering the same `regex_id` replaces the prior pattern
-    /// (mirrors the [`crate::MuxBackend::register_pattern`] contract).
+    /// (mirrors the [`crate::ProcessBackend::register_pattern`] contract).
     pub fn register(&mut self, regex_id: String, regex: &str) -> Result<(), regex::Error> {
         let compiled = Regex::new(regex)?;
         if let Some(slot) = self.patterns.iter_mut().find(|(id, _)| id == &regex_id) {

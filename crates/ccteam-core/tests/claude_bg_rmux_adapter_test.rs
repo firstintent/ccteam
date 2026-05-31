@@ -83,7 +83,7 @@ async fn via_mux_bg_spawn_routes_through_rmux_daemon() {
 
     // Isolate the rmux socket + ccteam paths under a per-test HOME so the
     // adapter's `default_backend()` (which resolves `RmuxBackend::new()`
-    // → `default_ccteam_mux_socket_path()` from HOME) lands on a private
+    // → `default_ccteam_harness_socket_path()` from HOME) lands on a private
     // socket instead of the shared `~/.ccteam/run/mux.sock`.
     let _home = EnvGuard::set("HOME", tmp.path().to_str().unwrap());
     // Re-exec target for the daemon. RmuxBackend::new defaults this to
@@ -132,13 +132,13 @@ async fn via_mux_bg_spawn_routes_through_rmux_daemon() {
 
     // The production backend selector resolves to rmux on the same socket;
     // the session the adapter spawned must be live in the rmux daemon.
-    let backend = ccteam_mux::default_backend();
+    let backend = ccteam_harness::default_backend();
     assert_eq!(
         backend.backend_kind(),
-        ccteam_mux::BackendKind::Rmux,
+        ccteam_harness::BackendKind::Rmux,
         "default_backend() must be rmux under CCTEAM_MUX_BACKEND=rmux"
     );
-    let id = ccteam_mux::MuxSessionId::new(handle.identity.clone());
+    let id = ccteam_harness::MuxSessionId::new(handle.identity.clone());
 
     let mut alive = false;
     for _ in 0..30 {
@@ -169,7 +169,7 @@ async fn via_mux_bg_spawn_routes_through_rmux_daemon() {
         "rmux pane child PID must be up before teardown"
     );
 
-    // close_thread routes teardown through MuxBackend::kill on the rmux
+    // close_thread routes teardown through ProcessBackend::kill on the rmux
     // daemon. RmuxBackend pins `exit-empty off`, so the daemon stays up
     // and exists() returns a clean Ok(false); tolerate a transport-closed
     // Err too in case the daemon races a shutdown.

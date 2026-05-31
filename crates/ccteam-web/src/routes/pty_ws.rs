@@ -54,7 +54,7 @@ use axum::{
     Router,
 };
 use ccteam_core::{ProjectState, TeamKind};
-use ccteam_mux::{MuxBackend, MuxSessionId, TmuxBackend};
+use ccteam_harness::{MuxSessionId, ProcessBackend, TerminalProcessBackend, TmuxBackend};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::sync::broadcast::error::RecvError;
@@ -225,7 +225,7 @@ async fn send_keys(tmux_session: &str, bytes: &[u8]) -> anyhow::Result<()> {
     let s = std::str::from_utf8(bytes).map_err(|_| {
         anyhow::anyhow!("send-keys: non-UTF-8 input rejected (would corrupt tmux argv)")
     })?;
-    // V0.8 W1 — route through the MuxBackend trait. Note `TmuxBackend`
+    // V0.8 W1 — route through the ProcessBackend trait. Note `TmuxBackend`
     // currently targets bare session-name (`-t <name>`) rather than the
     // legacy `<name>:0.0` form. The change is benign for CCTEAM-managed
     // single-window-single-pane sessions and removes an audit §4-B
@@ -237,7 +237,7 @@ async fn send_keys(tmux_session: &str, bytes: &[u8]) -> anyhow::Result<()> {
 }
 
 async fn resize_window(tmux_session: &str, cols: u16, rows: u16) -> anyhow::Result<()> {
-    // V0.8 W1 — route through the MuxBackend trait.
+    // V0.8 W1 — route through the ProcessBackend trait.
     let backend = TmuxBackend::new();
     let id = MuxSessionId::new(tmux_session.to_string());
     backend.resize(&id, cols, rows).await

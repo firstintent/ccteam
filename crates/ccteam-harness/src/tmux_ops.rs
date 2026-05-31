@@ -1,8 +1,8 @@
 //! Thin wrapper around the `tmux` CLI for project-level long sessions.
 //!
-//! V0.8 W1 — moved from `ccteam-core/src/tmux.rs` so the `MuxBackend`
+//! V0.8 W1 — moved from `ccteam-core/src/tmux.rs` so the `ProcessBackend`
 //! trait and its impls can live in the same crate without inducing a
-//! `ccteam-core ↔ ccteam-mux` cargo cycle. `ccteam-core::tmux`
+//! `ccteam-core ↔ ccteam-harness` cargo cycle. `ccteam-core::tmux`
 //! re-exports every public item from this module so existing callers
 //! (and the test suite) keep compiling unchanged. The free-function
 //! surface (`session_name_*`, `capture_pane_*`, `query_pane_dims_*`,
@@ -38,8 +38,8 @@ pub fn session_name_for_slug(slug: &str) -> String {
 // NOTE: `session_name_for_project` lives in `ccteam-core::tmux` (not
 // here) because it consults `CcteamPaths` + `ProjectState` to honor
 // meta-agent's `ccteam-meta-<handle>` override stored in
-// `state.json.tmux_session`. Moving it down to `ccteam-mux` would
-// induce a cargo cycle (`ccteam-mux` → `ccteam-core` → `ccteam-mux`).
+// `state.json.tmux_session`. Moving it down to `ccteam-harness` would
+// induce a cargo cycle (`ccteam-harness` → `ccteam-core` → `ccteam-harness`).
 // Every operation on this side of the boundary takes a bare
 // `session_name: &str` instead.
 

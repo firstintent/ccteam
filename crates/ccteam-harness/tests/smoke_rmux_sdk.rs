@@ -12,7 +12,7 @@
 //!   opens a detached session that runs `echo hello`, waits for the
 //!   pane snapshot to contain `hello`, then shuts the daemon down.
 //!   Requires the `rmux` binary on `PATH`. Run via
-//!   `cargo test -p ccteam-mux smoke_rmux_sdk -- --ignored --nocapture`.
+//!   `cargo test -p ccteam-harness smoke_rmux_sdk -- --ignored --nocapture`.
 //!
 //! The smoke test does **not** ride on `connect_or_start_with_launcher`
 //! — that API does not exist in `rmux-sdk` 0.3.1. The published SDK

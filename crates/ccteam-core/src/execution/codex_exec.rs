@@ -55,8 +55,10 @@ use crate::paths::CcteamPaths;
 // `session_name_for_slug` is a pure string helper (NOT a tmux call) —
 // sourced directly from the mux crate's `tmux_ops` so this module has
 // zero `crate::tmux` coupling (V0.8 W2c).
-use ccteam_mux::tmux_ops::session_name_for_slug;
-use ccteam_mux::{default_backend, MuxBackend, MuxSessionId, MuxSessionKind, MuxSessionSpec};
+use ccteam_harness::tmux_ops::session_name_for_slug;
+use ccteam_harness::{
+    default_backend, MuxSessionId, MuxSessionKind, MuxSessionSpec, TerminalProcessBackend,
+};
 
 /// Per-thread event broadcast buffer. Codex bursts items per turn so
 /// 256 lines of headroom is comfortable for a single subscriber.
@@ -213,7 +215,7 @@ impl HarnessAdapter for CodexExecAdapter {
             .trim_start_matches('-')
             .to_string();
 
-        // V0.8 W2c — route the container lifecycle through the MuxBackend
+        // V0.8 W2c — route the container lifecycle through the ProcessBackend
         // trait (default = TmuxBackend; behavior unchanged vs V0.6.x).
         // The inner ops are now async, so the V0.6.x `spawn_blocking`
         // wrapper is removed — the composite is short and the trait calls
@@ -499,7 +501,7 @@ impl HarnessAdapter for CodexExecAdapter {
     }
 
     async fn close_thread(&self, h: &ThreadHandle) -> Result<(), HarnessError> {
-        // V0.8 W2c — route through the MuxBackend trait (default =
+        // V0.8 W2c — route through the ProcessBackend trait (default =
         // TmuxBackend; behavior unchanged vs V0.6.x). The inner ops are
         // now async trait calls, so the V0.6.x `spawn_blocking` wrapper
         // is removed. Sequence preserved: exists → quit-keys → 500ms
@@ -755,12 +757,15 @@ fn parse_jsonl_item(item: &Value) -> ThreadItem {
 
 /// Send `q` + Enter to the session — codex's standard quit keybinding.
 ///
-/// V0.8 W2c — routes through the `MuxBackend` trait (`send_text` +
+/// V0.8 W2c — routes through the `ProcessBackend` trait (`send_text` +
 /// `send_enter`, default = TmuxBackend). The behavior is identical to
 /// the legacy raw tmux-CLI form but inherits the `-l --` literal-mode
 /// separator (audit §4-J) for free, removing a class of
 /// payload-starts-with-dash bug.
-async fn send_codex_quit_keys(backend: &dyn MuxBackend, id: &MuxSessionId) -> std::io::Result<()> {
+async fn send_codex_quit_keys(
+    backend: &dyn TerminalProcessBackend,
+    id: &MuxSessionId,
+) -> std::io::Result<()> {
     backend
         .send_text(id, "q")
         .await

@@ -6,8 +6,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ccteam_mux::tmux_ops::tmux_available;
-use ccteam_mux::{MuxBackend, MuxSessionId, MuxSessionSpec, TmuxBackend};
+use ccteam_harness::tmux_ops::tmux_available;
+use ccteam_harness::{
+    MuxSessionId, MuxSessionSpec, ProcessBackend, TerminalProcessBackend, TmuxBackend,
+};
 
 fn skip_if_no_tmux() -> bool {
     if !tmux_available() {
@@ -27,7 +29,7 @@ fn random_session_name(base: &str) -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("ccteam-mux-w1-{base}-{nanos}")
+    format!("ccteam-harness-w1-{base}-{nanos}")
 }
 
 #[tokio::test]
@@ -35,7 +37,7 @@ async fn spawn_send_capture_kill_through_trait() {
     if skip_if_no_tmux() {
         return;
     }
-    let backend: Arc<dyn MuxBackend> = Arc::new(TmuxBackend::new());
+    let backend: Arc<dyn TerminalProcessBackend> = Arc::new(TmuxBackend::new());
     let session_name = random_session_name("roundtrip");
     let spec = MuxSessionSpec::new(
         &session_name,
@@ -93,7 +95,7 @@ async fn kill_is_idempotent_on_missing_session() {
     if skip_if_no_tmux() {
         return;
     }
-    let backend: Arc<dyn MuxBackend> = Arc::new(TmuxBackend::new());
+    let backend: Arc<dyn TerminalProcessBackend> = Arc::new(TmuxBackend::new());
     let id = MuxSessionId::new(random_session_name("absent"));
     // Must not error on a session that never existed.
     backend.kill(&id).await.unwrap();
@@ -118,7 +120,7 @@ async fn register_pattern_compiles_and_stores() {
 
 #[tokio::test]
 async fn register_base_patterns_loads_claude_tier() {
-    use ccteam_mux::patterns::PatternVendor;
+    use ccteam_harness::patterns::PatternVendor;
     // No tmux required — register_base_patterns only touches the
     // in-memory matcher registry.
     let backend = TmuxBackend::new();
@@ -135,12 +137,12 @@ async fn register_base_patterns_loads_claude_tier() {
 ///
 /// Gated `#[ignore]` because it needs a real tmux AND a writable
 /// `~/.ccteam/pty` FIFO dir (the relay invokes `tmux pipe-pane "cat >>
-/// <fifo>"`). Run with `cargo test -p ccteam-mux -- --ignored`.
+/// <fifo>"`). Run with `cargo test -p ccteam-harness -- --ignored`.
 #[tokio::test]
 #[ignore = "requires tmux on PATH + writable FIFO dir"]
 async fn subscribe_streams_output_and_fires_pattern() {
-    use ccteam_mux::patterns::PatternVendor;
-    use ccteam_mux::MuxEvent;
+    use ccteam_harness::patterns::PatternVendor;
+    use ccteam_harness::MuxEvent;
     use futures::StreamExt;
 
     if skip_if_no_tmux() {

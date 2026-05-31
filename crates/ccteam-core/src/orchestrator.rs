@@ -583,11 +583,11 @@ enum SessionStatus {
 ///   spawn on a transient backend error; mirrors `session_status`'s
 ///   "unreadable state.json → still running" default).
 async fn via_mux_session_status(
-    backend: &std::sync::Arc<dyn ccteam_mux::MuxBackend>,
+    backend: &std::sync::Arc<dyn ccteam_harness::TerminalProcessBackend>,
     session: &str,
 ) -> SessionStatus {
     match backend
-        .exists(&ccteam_mux::MuxSessionId::new(session.to_string()))
+        .exists(&ccteam_harness::MuxSessionId::new(session.to_string()))
         .await
     {
         Ok(true) => SessionStatus::Running,
@@ -2246,7 +2246,7 @@ impl Orchestrator {
                 .collect()
         };
         // V0.8 W3 follow-up — mode-2 foreground-in-mux bg spawns
-        // (`via_mux`) resolve liveness via an async `MuxBackend::exists`
+        // (`via_mux`) resolve liveness via an async `ProcessBackend::exists`
         // probe, not the sync state.json read. To preserve the prior
         // locking discipline (the in-lock sweep below must NOT `.await`
         // — every other `self.running` caller would stall on a
@@ -2273,7 +2273,7 @@ impl Orchestrator {
         };
         let mut via_mux_status: HashMap<String, SessionStatus> = HashMap::new();
         if !via_mux_probes.is_empty() {
-            let backend = ccteam_mux::default_backend();
+            let backend = ccteam_harness::default_backend();
             for (sid, session) in via_mux_probes {
                 via_mux_status.insert(sid, via_mux_session_status(&backend, &session).await);
             }
@@ -2350,7 +2350,7 @@ impl Orchestrator {
                     .as_deref()
                     .filter(|s| !s.is_empty())
                     .unwrap_or(sid.as_str());
-                match via_mux_session_status(&ccteam_mux::default_backend(), session).await {
+                match via_mux_session_status(&ccteam_harness::default_backend(), session).await {
                     SessionStatus::Running => continue,
                     SessionStatus::Done { cost_usd, status } => (status, cost_usd.unwrap_or(0.0)),
                 }
@@ -3024,7 +3024,7 @@ impl Orchestrator {
     /// foreground-in-mux spawns (`via_mux`) do NOT route through here —
     /// they have no `~/.claude/jobs/<id>/state.json`; their liveness is
     /// pre-computed via [`via_mux_session_status`] (an async
-    /// `MuxBackend::exists` probe) OUTSIDE the `self.running` lock in
+    /// `ProcessBackend::exists` probe) OUTSIDE the `self.running` lock in
     /// [`Self::poll_completions`], keeping this in-lock sweep sync.
     fn session_status(&self, handle: &SessionHandle) -> SessionStatus {
         let path = self.session_state_path(handle);
@@ -3503,7 +3503,7 @@ mod via_mux_tests {
 
     use std::sync::Arc;
 
-    use ccteam_mux::{InProcBackend, MuxBackend, MuxSessionId, MuxSessionSpec};
+    use ccteam_harness::{InProcBackend, MuxSessionId, MuxSessionSpec, TerminalProcessBackend};
 
     use super::{via_mux_session_status, SessionStatus};
 
@@ -3519,7 +3519,7 @@ mod via_mux_tests {
     /// `Running` — the orchestrator must NOT retire it.
     #[tokio::test]
     async fn live_mux_session_reports_running() {
-        let backend: Arc<dyn MuxBackend> = Arc::new(InProcBackend::new());
+        let backend: Arc<dyn TerminalProcessBackend> = Arc::new(InProcBackend::new());
         let name = "ccteam-bg-demo-sid1";
         backend.spawn(spec(name)).await.unwrap();
 
@@ -3535,7 +3535,7 @@ mod via_mux_tests {
     /// state.json path emits for a clean finish.
     #[tokio::test]
     async fn gone_mux_session_reports_completed() {
-        let backend: Arc<dyn MuxBackend> = Arc::new(InProcBackend::new());
+        let backend: Arc<dyn TerminalProcessBackend> = Arc::new(InProcBackend::new());
         let name = "ccteam-bg-demo-sid2";
         backend.spawn(spec(name)).await.unwrap();
         backend
@@ -3559,7 +3559,7 @@ mod via_mux_tests {
     /// `Done` — `exists == false` is the done signal.
     #[tokio::test]
     async fn unknown_mux_session_reports_completed() {
-        let backend: Arc<dyn MuxBackend> = Arc::new(InProcBackend::new());
+        let backend: Arc<dyn TerminalProcessBackend> = Arc::new(InProcBackend::new());
         match via_mux_session_status(&backend, "ccteam-bg-never-spawned").await {
             SessionStatus::Done { status, .. } => assert_eq!(status, "completed"),
             SessionStatus::Running => panic!("nonexistent via_mux session must report Done"),

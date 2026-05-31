@@ -55,7 +55,7 @@ use crate::harness::{
     AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx,
     ThreadEvent, ThreadHandle, TurnId, TurnInput, CLAUDE_BIN_ENV,
 };
-use ccteam_mux::{default_backend, MuxSessionId, MuxSessionKind, MuxSessionSpec};
+use ccteam_harness::{default_backend, MuxSessionId, MuxSessionKind, MuxSessionSpec};
 
 /// V0.6.0 F108 [`HarnessAdapter`] for Claude Code TUI (long-running tmux
 /// session, multi-turn with context reuse).
@@ -190,12 +190,15 @@ fn chat_spawn_env_owned(role: &str, slug: &str) -> Vec<(String, String)> {
 ///
 /// V0.8 W2c — thin async wrapper over the shared
 /// [`pane_runs_process`] helper with needle `"claude"`. Goes through the
-/// `MuxBackend` trait for pane PID enumeration; the `ps -o comm=` read
+/// `ProcessBackend` trait for pane PID enumeration; the `ps -o comm=` read
 /// stays OS-level. Red-line compliant (reads process command name, never
 /// pane text content). Probe errors (backend query failure) degrade to
 /// `false` — a session we can't probe is treated as not-alive, which
 /// routes start_thread to the safe recreate path.
-async fn pane_runs_claude(backend: &dyn ccteam_mux::MuxBackend, id: &MuxSessionId) -> bool {
+async fn pane_runs_claude(
+    backend: &dyn ccteam_harness::TerminalProcessBackend,
+    id: &MuxSessionId,
+) -> bool {
     pane_runs_process(backend, id, "claude")
         .await
         .unwrap_or(false)
@@ -301,7 +304,7 @@ impl HarnessAdapter for ClaudeTuiAdapter {
         //       长 session" red line), then fall through to new-session.
         //    c) Session absent → normal new-session path.
         let session_name = chat_session_name(&ctx.slug, &spec.role);
-        // V0.8 W2c — route all session lifecycle through the MuxBackend
+        // V0.8 W2c — route all session lifecycle through the ProcessBackend
         // trait (default = TmuxBackend, behavior unchanged vs V0.6.x).
         // Hold the backend once; pass `&*backend` to the liveness probe.
         let backend = default_backend();
@@ -436,7 +439,7 @@ impl HarnessAdapter for ClaudeTuiAdapter {
             crate::execution::typed_events::maybe_start_typed_event_tap(
                 backend.clone(),
                 id.clone(),
-                ccteam_mux::Vendor::Claude,
+                ccteam_harness::Vendor::Claude,
                 // Registry key == HookEvent::session_id (`{slug}-{role}`,
                 // from CCTEAM_CHAT_SLUG/ROLE) so the orchestrator's hook sink
                 // can route Stop-hook enrichment to this session's tap.

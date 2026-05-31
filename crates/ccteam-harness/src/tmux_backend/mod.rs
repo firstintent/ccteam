@@ -30,7 +30,10 @@ use crate::tmux_ops::{
     capture_pane_tail_from_session, capture_pane_with_ansi_from_session, list_sessions,
     query_pane_dims_from_session, resize_window, TmuxSession,
 };
-use crate::{BackendKind, MuxBackend, MuxEventStream, MuxSessionId, MuxSessionSpec};
+use crate::{
+    BackendKind, MuxEventStream, MuxSessionId, MuxSessionSpec, ProcessBackend,
+    TerminalProcessBackend,
+};
 
 use fifo_relay::FifoRelayRegistry;
 
@@ -62,7 +65,7 @@ impl TmuxBackend {
         Self::default()
     }
 
-    pub fn shared() -> Arc<dyn MuxBackend> {
+    pub fn shared() -> Arc<dyn TerminalProcessBackend> {
         Arc::new(Self::new())
     }
 
@@ -88,7 +91,7 @@ impl TmuxBackend {
 }
 
 #[async_trait]
-impl MuxBackend for TmuxBackend {
+impl ProcessBackend for TmuxBackend {
     async fn spawn(&self, spec: MuxSessionSpec) -> Result<MuxSessionId> {
         // Bridge to the existing blocking `start_with_env`, which
         // includes the post-spawn `resize-window` workaround
@@ -109,7 +112,7 @@ impl MuxBackend for TmuxBackend {
                 env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
             session
                 .start_with_env(&working_dir, &argv_refs, &env_refs)
-                .with_context(|| format!("MuxBackend(tmux)::spawn {session_name}"))?;
+                .with_context(|| format!("ProcessBackend(tmux)::spawn {session_name}"))?;
             // If caller asked for a non-default size, re-resize. The
             // `start_with_env` internal workaround forces 200×50;
             // honor `spec.size` after the fact (best-effort — newer
@@ -120,7 +123,7 @@ impl MuxBackend for TmuxBackend {
             Ok(())
         })
         .await
-        .map_err(|join_err| anyhow!("MuxBackend(tmux)::spawn join error: {join_err}"))??;
+        .map_err(|join_err| anyhow!("ProcessBackend(tmux)::spawn join error: {join_err}"))??;
 
         Ok(MuxSessionId::new(spec.name))
     }
@@ -129,8 +132,26 @@ impl MuxBackend for TmuxBackend {
         let name = id.0.clone();
         let res = tokio::task::spawn_blocking(move || TmuxSession::from_name(name).exists())
             .await
-            .map_err(|e| anyhow!("MuxBackend(tmux)::exists join error: {e}"))?;
+            .map_err(|e| anyhow!("ProcessBackend(tmux)::exists join error: {e}"))?;
         Ok(res)
+    }
+
+    async fn is_alive(&self, id: &MuxSessionId, expected_pid: Option<i32>) -> Result<bool> {
+        if !self.exists(id).await? {
+            return Ok(false);
+        }
+        match expected_pid {
+            None => Ok(true),
+            Some(pid) => {
+                if !crate::tmux_ops::pid_is_alive(pid) {
+                    return Ok(false);
+                }
+                match TerminalProcessBackend::pane_pid(self, id).await? {
+                    Some(actual) => Ok(actual == pid),
+                    None => Ok(false),
+                }
+            }
+        }
     }
 
     async fn send_text(&self, id: &MuxSessionId, text: &str) -> Result<()> {
@@ -140,7 +161,7 @@ impl MuxBackend for TmuxBackend {
             TmuxSession::from_name(name).send_keys_literal(&text)
         })
         .await
-        .map_err(|e| anyhow!("MuxBackend(tmux)::send_text join error: {e}"))?
+        .map_err(|e| anyhow!("ProcessBackend(tmux)::send_text join error: {e}"))?
     }
 
     async fn send_enter(&self, id: &MuxSessionId) -> Result<()> {
@@ -149,56 +170,7 @@ impl MuxBackend for TmuxBackend {
             TmuxSession::from_name(name).send_keys_enter()
         })
         .await
-        .map_err(|e| anyhow!("MuxBackend(tmux)::send_enter join error: {e}"))?
-    }
-
-    async fn capture(&self, id: &MuxSessionId, lines: usize, with_ansi: bool) -> Result<Vec<u8>> {
-        let name = id.0.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
-            if with_ansi {
-                match capture_pane_with_ansi_from_session(&name, lines)? {
-                    Some(bytes) => Ok(bytes),
-                    None => Ok(Vec::new()),
-                }
-            } else {
-                match capture_pane_tail_from_session(&name, lines, false) {
-                    Some(s) => Ok(s.into_bytes()),
-                    None => Ok(Vec::new()),
-                }
-            }
-        })
-        .await
-        .map_err(|e| anyhow!("MuxBackend(tmux)::capture join error: {e}"))?
-    }
-
-    async fn pane_dims(&self, id: &MuxSessionId) -> Result<Option<(u16, u16)>> {
-        let name = id.0.clone();
-        tokio::task::spawn_blocking(move || query_pane_dims_from_session(&name))
-            .await
-            .map_err(|e| anyhow!("MuxBackend(tmux)::pane_dims join error: {e}"))?
-    }
-
-    async fn pane_pid(&self, id: &MuxSessionId) -> Result<Option<i32>> {
-        let name = id.0.clone();
-        tokio::task::spawn_blocking(move || TmuxSession::from_name(name).pane_pid())
-            .await
-            .map_err(|e| anyhow!("MuxBackend(tmux)::pane_pid join error: {e}"))?
-    }
-
-    async fn list_pane_pids(&self, id: &MuxSessionId) -> Result<Vec<u32>> {
-        let name = id.0.clone();
-        let pids =
-            tokio::task::spawn_blocking(move || TmuxSession::from_name(name).list_pane_pids())
-                .await
-                .map_err(|e| anyhow!("MuxBackend(tmux)::list_pane_pids join error: {e}"))?;
-        Ok(pids)
-    }
-
-    async fn resize(&self, id: &MuxSessionId, cols: u16, rows: u16) -> Result<()> {
-        let name = id.0.clone();
-        tokio::task::spawn_blocking(move || resize_window(&name, cols, rows))
-            .await
-            .map_err(|e| anyhow!("MuxBackend(tmux)::resize join error: {e}"))?
+        .map_err(|e| anyhow!("ProcessBackend(tmux)::send_enter join error: {e}"))?
     }
 
     async fn subscribe(&self, id: &MuxSessionId) -> Result<MuxEventStream> {
@@ -241,18 +213,70 @@ impl MuxBackend for TmuxBackend {
         let name = id.0.clone();
         tokio::task::spawn_blocking(move || TmuxSession::from_name(name).kill())
             .await
-            .map_err(|e| anyhow!("MuxBackend(tmux)::kill join error: {e}"))?
+            .map_err(|e| anyhow!("ProcessBackend(tmux)::kill join error: {e}"))?
     }
 
     async fn list_sessions(&self) -> Result<Vec<MuxSessionId>> {
         let names = tokio::task::spawn_blocking(list_sessions)
             .await
-            .map_err(|e| anyhow!("MuxBackend(tmux)::list_sessions join error: {e}"))?;
+            .map_err(|e| anyhow!("ProcessBackend(tmux)::list_sessions join error: {e}"))?;
         Ok(names.into_iter().map(MuxSessionId).collect())
     }
 
     fn backend_kind(&self) -> BackendKind {
         BackendKind::Tmux
+    }
+}
+
+#[async_trait]
+impl TerminalProcessBackend for TmuxBackend {
+    async fn capture(&self, id: &MuxSessionId, lines: usize, with_ansi: bool) -> Result<Vec<u8>> {
+        let name = id.0.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+            if with_ansi {
+                match capture_pane_with_ansi_from_session(&name, lines)? {
+                    Some(bytes) => Ok(bytes),
+                    None => Ok(Vec::new()),
+                }
+            } else {
+                match capture_pane_tail_from_session(&name, lines, false) {
+                    Some(s) => Ok(s.into_bytes()),
+                    None => Ok(Vec::new()),
+                }
+            }
+        })
+        .await
+        .map_err(|e| anyhow!("ProcessBackend(tmux)::capture join error: {e}"))?
+    }
+
+    async fn pane_dims(&self, id: &MuxSessionId) -> Result<Option<(u16, u16)>> {
+        let name = id.0.clone();
+        tokio::task::spawn_blocking(move || query_pane_dims_from_session(&name))
+            .await
+            .map_err(|e| anyhow!("ProcessBackend(tmux)::pane_dims join error: {e}"))?
+    }
+
+    async fn pane_pid(&self, id: &MuxSessionId) -> Result<Option<i32>> {
+        let name = id.0.clone();
+        tokio::task::spawn_blocking(move || TmuxSession::from_name(name).pane_pid())
+            .await
+            .map_err(|e| anyhow!("ProcessBackend(tmux)::pane_pid join error: {e}"))?
+    }
+
+    async fn list_pane_pids(&self, id: &MuxSessionId) -> Result<Vec<u32>> {
+        let name = id.0.clone();
+        let pids =
+            tokio::task::spawn_blocking(move || TmuxSession::from_name(name).list_pane_pids())
+                .await
+                .map_err(|e| anyhow!("ProcessBackend(tmux)::list_pane_pids join error: {e}"))?;
+        Ok(pids)
+    }
+
+    async fn resize(&self, id: &MuxSessionId, cols: u16, rows: u16) -> Result<()> {
+        let name = id.0.clone();
+        tokio::task::spawn_blocking(move || resize_window(&name, cols, rows))
+            .await
+            .map_err(|e| anyhow!("ProcessBackend(tmux)::resize join error: {e}"))?
     }
 }
 

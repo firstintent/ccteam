@@ -360,9 +360,9 @@ version = "0.6.8"
 dependencies = [
  "anyhow",
  "ccteam-core",
+ "ccteam-harness",
  "ccteam-hooks",
  "ccteam-imd",
- "ccteam-mux",
  "ccteam-web",
  "chrono",
  "clap",
@@ -387,7 +387,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "ccteam-cost",
- "ccteam-mux",
+ "ccteam-harness",
  "chrono",
  "croner",
  "dirs",
@@ -418,6 +418,26 @@ dependencies = [
  "serde",
  "serde_json",
  "toml",
+ "tracing",
+]
+
+[[package]]
+name = "ccteam-harness"
+version = "0.6.8"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "futures",
+ "nix 0.29.0",
+ "regex",
+ "rmux-client",
+ "rmux-proto",
+ "rmux-sdk",
+ "rmux-server",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
  "tracing",
 ]
 
@@ -462,26 +482,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ccteam-mux"
-version = "0.6.8"
-dependencies = [
- "anyhow",
- "async-trait",
- "futures",
- "nix 0.29.0",
- "regex",
- "rmux-client",
- "rmux-proto",
- "rmux-sdk",
- "rmux-server",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "ccteam-web"
 version = "0.6.8"
 dependencies = [
@@ -490,8 +490,8 @@ dependencies = [
  "axum",
  "axum-extra",
  "ccteam-core",
+ "ccteam-harness",
  "ccteam-hooks",
- "ccteam-mux",
  "chrono",
  "dirs",
  "futures",

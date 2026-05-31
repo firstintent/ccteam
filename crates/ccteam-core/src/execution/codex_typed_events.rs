@@ -2,16 +2,16 @@
 //!
 //! Parallels [`crate::execution::typed_events`] (Claude side) but with
 //! one critical architectural divergence: **we do NOT drive
-//! [`ccteam_mux::EventMerger`]**.
+//! [`ccteam_harness::EventMerger`]**.
 //!
 //! Why bypass the merger? The merger exists to *pair* a lossy P2 base
 //! event (pane regex match) with a lossless P1 enrichment (Claude hook
 //! payload). Codex mode-3 has only the lossless P1 side — `app-server`
-//! JSON-RPC notifications. There is no MuxBackend pane to regex on.
+//! JSON-RPC notifications. There is no ProcessBackend pane to regex on.
 //! Going through the merger would push every notification into
 //! `pending_enrichment` waiting for a base that will never arrive;
 //! `BUFFER_CAPACITY=64` would silently FIFO-evict the front
-//! ([`ccteam_mux::EventMerger`] internals — see
+//! ([`ccteam_harness::EventMerger`] internals — see
 //! `enriched_event.rs:481-487`), so a busy turn would drop events with
 //! no visible signal. Direct writes from the JSON-RPC subscriber
 //! eliminate the leak.
@@ -32,7 +32,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use ccteam_mux::EventKind;
+use ccteam_harness::EventKind;
 use serde_json::Value;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;

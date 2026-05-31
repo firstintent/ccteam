@@ -1044,7 +1044,7 @@ pub struct OpenAgentSpawn {
     /// liveness lives in the mux session lifecycle, NOT in
     /// `~/.claude/jobs/<id>/state.json`.
     pub via_mux: bool,
-    /// Mux session name to probe via `MuxBackend::exists` when
+    /// Mux session name to probe via `ProcessBackend::exists` when
     /// `via_mux` is set. `None` for legacy `--bg` + codex rows.
     pub mux_session: Option<String>,
 }

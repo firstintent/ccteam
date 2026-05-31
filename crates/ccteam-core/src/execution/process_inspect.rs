@@ -14,7 +14,7 @@
 //! This reads only the process **command name** (`comm`), never pane
 //! **text content**. `ps` is an OS-level inspection — NOT a mux-level
 //! concern — so it stays a direct subprocess rather than a trait method
-//! (the `MuxBackend` surface deliberately exposes pane PIDs but not
+//! (the `ProcessBackend` surface deliberately exposes pane PIDs but not
 //! "what binary is the PID running"). The banned `tmux capture-pane`
 //! pane-scrape is never invoked here.
 
@@ -28,8 +28,8 @@
 /// skipped. A failed `ps` invocation for one pid is treated as a
 /// non-match and the loop continues to the next pid.
 pub async fn pane_runs_process(
-    backend: &dyn ccteam_mux::MuxBackend,
-    id: &ccteam_mux::MuxSessionId,
+    backend: &dyn ccteam_harness::TerminalProcessBackend,
+    id: &ccteam_harness::MuxSessionId,
     needle: &str,
 ) -> anyhow::Result<bool> {
     let pids = backend.list_pane_pids(id).await?;
@@ -51,7 +51,7 @@ pub async fn pane_runs_process(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ccteam_mux::{InProcBackend, MuxSessionId};
+    use ccteam_harness::{InProcBackend, MuxSessionId};
 
     /// `InProcBackend::list_pane_pids` returns an empty Vec (mode-1 has
     /// no panes), so the probe short-circuits to `false` without ever

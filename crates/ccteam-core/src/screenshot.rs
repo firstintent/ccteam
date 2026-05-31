@@ -49,7 +49,7 @@ use imageproc::drawing::{draw_filled_rect_mut, draw_text_mut};
 use imageproc::rect::Rect;
 use vt100::Parser;
 
-use ccteam_mux::MuxSessionId;
+use ccteam_harness::MuxSessionId;
 
 use crate::paths::CcteamPaths;
 use crate::state::ProjectState;
@@ -128,7 +128,7 @@ where
 /// `imageproc` are caught and converted to `Ok(None)`.
 ///
 /// **V0.8 G5** — capture + pane-dims route through the
-/// [`ccteam_mux::MuxBackend`] trait (`ccteam_mux::from_env()`) so the
+/// [`ccteam_harness::ProcessBackend`] trait (`ccteam_harness::from_env()`) so the
 /// configured backend (`CCTEAM_MUX_BACKEND=tmux|rmux`) is honored
 /// instead of hard-calling tmux. Under the tmux backend (the opt-out,
 /// `CCTEAM_MUX_BACKEND=tmux`) the behavior is byte-for-byte identical
@@ -136,11 +136,11 @@ where
 /// calls).
 ///
 /// **rmux ANSI gap** — under `CCTEAM_MUX_BACKEND=rmux`,
-/// `MuxBackend::capture(.., with_ansi=true)` currently returns rendered
+/// `ProcessBackend::capture(.., with_ansi=true)` currently returns rendered
 /// PLAIN TEXT (rmux's `PaneSnapshot` is a parsed cell grid; no public
 /// byte-level capture-pane shim exists yet). The PNG still renders the
 /// text, just without color/attribute fidelity. Cell-grid→ANSI
-/// re-serialization belongs in `ccteam-mux::rmux_backend` — see
+/// re-serialization belongs in `ccteam-harness::rmux_backend` — see
 /// `TODO(V0.9-rmux-ansi-capture)` there. We accept degraded screenshots
 /// under rmux for V0.8: degraded-but-working beats silently-broken.
 ///
@@ -169,7 +169,7 @@ pub fn render_screenshot(
     // documented no-cache policy); under rmux each screenshot pays that
     // connect cost. Acceptable for the screenshot surface — flagged for
     // any future hot-path follow-up.
-    let backend = match ccteam_mux::from_env() {
+    let backend = match ccteam_harness::from_env() {
         Ok(b) => b,
         Err(err) => {
             tracing::warn!("screenshot: mux backend selection failed: {err:#}");

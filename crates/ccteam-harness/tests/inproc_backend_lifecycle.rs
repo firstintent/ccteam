@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use ccteam_mux::{InProcBackend, MuxBackend, MuxSessionSpec};
+use ccteam_harness::{InProcBackend, MuxSessionSpec, TerminalProcessBackend};
 
 fn make_spec(name: &str) -> MuxSessionSpec {
     MuxSessionSpec::new(name, vec!["true".into()], PathBuf::from("/tmp"))
@@ -13,7 +13,7 @@ fn make_spec(name: &str) -> MuxSessionSpec {
 
 #[tokio::test]
 async fn spawn_exists_kill_through_trait_object() {
-    let backend: Arc<dyn MuxBackend> = Arc::new(InProcBackend::new());
+    let backend: Arc<dyn TerminalProcessBackend> = Arc::new(InProcBackend::new());
 
     let id = backend.spawn(make_spec("lifecycle-1")).await.unwrap();
     assert!(backend.exists(&id).await.unwrap());
@@ -27,7 +27,7 @@ async fn spawn_exists_kill_through_trait_object() {
 
 #[tokio::test]
 async fn send_text_errors_with_not_applicable() {
-    let backend: Arc<dyn MuxBackend> = Arc::new(InProcBackend::new());
+    let backend: Arc<dyn TerminalProcessBackend> = Arc::new(InProcBackend::new());
     let id = backend.spawn(make_spec("send-target")).await.unwrap();
     let err = backend.send_text(&id, "hi").await.unwrap_err();
     assert!(err.to_string().contains("not applicable"));
@@ -36,7 +36,7 @@ async fn send_text_errors_with_not_applicable() {
 #[tokio::test]
 async fn subscribe_returns_empty_stream() {
     use futures::StreamExt;
-    let backend: Arc<dyn MuxBackend> = Arc::new(InProcBackend::new());
+    let backend: Arc<dyn TerminalProcessBackend> = Arc::new(InProcBackend::new());
     let id = backend.spawn(make_spec("sub-target")).await.unwrap();
     let mut stream = backend.subscribe(&id).await.unwrap();
     assert!(stream.next().await.is_none());
@@ -44,7 +44,7 @@ async fn subscribe_returns_empty_stream() {
 
 #[tokio::test]
 async fn kill_is_idempotent() {
-    let backend: Arc<dyn MuxBackend> = Arc::new(InProcBackend::new());
+    let backend: Arc<dyn TerminalProcessBackend> = Arc::new(InProcBackend::new());
     let id = backend.spawn(make_spec("k-1")).await.unwrap();
     backend.kill(&id).await.unwrap();
     // Second kill on a gone session — must not error.

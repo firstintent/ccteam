@@ -1,7 +1,7 @@
 //! V0.8 rmux typed-event consumer — the first production consumer of the
-//! [`ccteam_mux::EventMerger`].
+//! [`ccteam_harness::EventMerger`].
 //!
-//! Bridges a live Claude chat-TUI session's [`ccteam_mux::TypedEventTap`]
+//! Bridges a live Claude chat-TUI session's [`ccteam_harness::TypedEventTap`]
 //! into the project's `progress.jsonl`. Three slices:
 //!
 //! - **Slice 1 — `BaseOnly` pipeline** (flag: `CCTEAM_TYPED_EVENTS`): the
@@ -9,7 +9,7 @@
 //!   process-exit) are mirrored as `typed_event` observability rows.
 //! - **Slice 2 — pairing + `BaseLossy` reliability fallback** (additionally
 //!   requires `CCTEAM_HOOK_VIA_DAEMON`, so the orchestrator's hook sink can
-//!   feed P1 enrichment): each tap's [`ccteam_mux::TapHandle`] is held in a
+//!   feed P1 enrichment): each tap's [`ccteam_harness::TapHandle`] is held in a
 //!   session-keyed registry; the hook sink routes a Claude `Stop` hook to
 //!   the matching tap as a `TurnDone` enrichment via
 //!   [`enrich_session_from_hook`]. When a `turn_done` pane pattern fired but
@@ -41,9 +41,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use ccteam_mux::{
-    EventKind, MergeOutcome, MuxBackend, MuxSessionId, RawEnrichment, TapHandle, TypedEventTap,
-    Vendor, DEFAULT_GRACE,
+use ccteam_harness::{
+    EventKind, MergeOutcome, MuxSessionId, RawEnrichment, TapHandle, TerminalProcessBackend,
+    TypedEventTap, Vendor, DEFAULT_GRACE,
 };
 
 /// True when `CCTEAM_TYPED_EVENTS` is set to a truthy value (`1` / `true`).
@@ -85,7 +85,7 @@ fn registry() -> &'static Mutex<HashMap<String, Arc<TapHandle>>> {
 /// | action | EventKind | Slice |
 /// |---|---|---|
 /// | `stop` | [`EventKind::TurnDone`] | 2 (single-in-flight) |
-/// | `user-prompt` | [`EventKind::UserPromptSubmitted`] | 3 (multi-in-flight; see [`ccteam_mux::TypedEventTap`] time-windowed FIFO) |
+/// | `user-prompt` | [`EventKind::UserPromptSubmitted`] | 3 (multi-in-flight; see [`ccteam_harness::TypedEventTap`] time-windowed FIFO) |
 /// | `tool-use` | [`EventKind::ToolCallCompleted`] | 3 (multi-in-flight; pairs `PostToolUse` hook with the `^\s*⎿` pane glyph) |
 /// | `pre-tool-use` | [`EventKind::ToolCallStarted`] | 4 (multi-in-flight; pairs `PreToolUse` hook with the `^●\s+(\w+)\(` pane regex) |
 ///
@@ -156,10 +156,10 @@ pub fn enrich_session(
 }
 
 /// Entry point for the orchestrator's hook sink: translate a Claude
-/// chat-progress [`ccteam_mux::HookEvent`] into a merger enrichment and route
+/// chat-progress [`ccteam_harness::HookEvent`] into a merger enrichment and route
 /// it to the session's tap. No-op unless typed events are enabled and the
 /// action maps to a paired kind.
-pub fn enrich_session_from_hook(event: &ccteam_mux::HookEvent) {
+pub fn enrich_session_from_hook(event: &ccteam_harness::HookEvent) {
     if !flag_enabled() {
         return;
     }
@@ -210,7 +210,7 @@ fn vendor_str(vendor: Vendor) -> &'static str {
 /// tap lingers one grace window first to drain pending fallbacks). Append
 /// errors are logged at debug and skipped — never panics.
 pub fn maybe_start_typed_event_tap(
-    backend: Arc<dyn MuxBackend>,
+    backend: Arc<dyn TerminalProcessBackend>,
     id: MuxSessionId,
     vendor: Vendor,
     session_key: String,

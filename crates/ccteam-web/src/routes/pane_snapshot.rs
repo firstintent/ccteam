@@ -15,7 +15,7 @@ use axum::{
     Router,
 };
 use ccteam_core::{ProjectState, TeamKind};
-use ccteam_mux::MuxSessionId;
+use ccteam_harness::MuxSessionId;
 
 use crate::state::AppState;
 
@@ -48,8 +48,8 @@ async fn handle_session_pane_snapshot(
 }
 
 async fn serve_pane_snapshot(slug: String, sid: Option<String>, session_name: String) -> Response {
-    // V0.8 W1 / G5 — route through the MuxBackend trait, honoring the
-    // configured backend via `ccteam_mux::from_env()`
+    // V0.8 W1 / G5 — route through the ProcessBackend trait, honoring the
+    // configured backend via `ccteam_harness::from_env()`
     // (`CCTEAM_MUX_BACKEND=tmux|rmux`). Under the tmux backend (the
     // opt-out) `TmuxBackend` bridges to the same blocking
     // `tmux capture-pane / display-message` calls under
@@ -58,8 +58,8 @@ async fn serve_pane_snapshot(slug: String, sid: Option<String>, session_name: St
     // rmux ANSI gap: under rmux, `capture(.., with_ansi=true)` returns
     // rendered plain text (no byte-level capture-pane shim yet) — the
     // xterm.js widget renders the text without color fidelity. See
-    // `TODO(V0.9-rmux-ansi-capture)` in `ccteam-mux::rmux_backend`.
-    let backend = match ccteam_mux::from_env() {
+    // `TODO(V0.9-rmux-ansi-capture)` in `ccteam-harness::rmux_backend`.
+    let backend = match ccteam_harness::from_env() {
         Ok(b) => b,
         Err(err) => {
             tracing::warn!(slug = %slug, sid = ?sid, ?err, "pane snapshot mux backend selection failed");

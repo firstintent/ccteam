@@ -1,6 +1,6 @@
 //! Refcounted `tmux pipe-pane` FIFO relay — ported from
 //! `ccteam-web::pty` (V0.3.2 F56) into the `TmuxBackend` so that
-//! `MuxBackend::subscribe` is the single owner of the pipe-pane control
+//! `ProcessBackend::subscribe` is the single owner of the pipe-pane control
 //! plane. ccteam-web becomes a thin adapter on top (W2c Site 3).
 //!
 //! Invariants preserved verbatim from the F56 design:
@@ -19,7 +19,7 @@
 //!
 //! ## Decoupling from `ccteam-core`
 //!
-//! `ccteam-core` depends on `ccteam-mux` (tmux_ops moved here in W1), so
+//! `ccteam-core` depends on `ccteam-harness` (tmux_ops moved here in W1), so
 //! mux MUST NOT depend on core — that would cycle. The FIFO directory
 //! (`~/.ccteam/pty`, honoring `CCTEAM_HOME`) is therefore resolved by a
 //! small local helper that mirrors `CcteamPaths::pty_dir` rather than

@@ -5,7 +5,7 @@
 //!
 //! ```sh
 //! cargo build --bin ccteam
-//! cargo test -p ccteam-mux --test rmux_backend_session_roundtrip -- \
+//! cargo test -p ccteam-harness --test rmux_backend_session_roundtrip -- \
 //!     --ignored --nocapture
 //! ```
 //!
@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ccteam_mux::{MuxBackend, MuxSessionId, MuxSessionSpec, RmuxBackend};
+use ccteam_harness::{MuxSessionId, MuxSessionSpec, RmuxBackend, TerminalProcessBackend};
 
 fn random_session_name(base: &str) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -24,20 +24,20 @@ fn random_session_name(base: &str) -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("ccteam-mux-w2a-{base}-{nanos}")
+    format!("ccteam-harness-w2a-{base}-{nanos}")
 }
 
 /// Locate the ccteam binary built in the workspace's target dir. The
 /// rmux SDK spawns this binary with `--__internal-daemon <socket>` to
 /// host the daemon. We honor `CARGO_BIN_EXE_ccteam` if cargo sets it
-/// for this test (only happens when `ccteam-mux` declares ccteam-cli
+/// for this test (only happens when `ccteam-harness` declares ccteam-cli
 /// as a `[[bin]]` reference, which it doesn't); otherwise fall back to
 /// `target/debug/ccteam` relative to the workspace root.
 fn locate_ccteam_binary() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("CCTEAM_TEST_BIN") {
         return Some(PathBuf::from(path));
     }
-    // CARGO_MANIFEST_DIR for ccteam-mux = .../crates/ccteam-mux; the
+    // CARGO_MANIFEST_DIR for ccteam-harness = .../crates/ccteam-harness; the
     // workspace root is two levels up.
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest_dir.parent()?.parent()?;
@@ -75,7 +75,8 @@ async fn spawn_send_capture_kill_through_trait() {
     // don't fight over `~/.ccteam/run/mux.sock`.
     let tmpdir = tempfile::tempdir().expect("create tempdir for socket");
     let socket_path = tmpdir.path().join("mux.sock");
-    let backend: Arc<dyn MuxBackend> = Arc::new(RmuxBackend::with_socket_path(socket_path.clone()));
+    let backend: Arc<dyn TerminalProcessBackend> =
+        Arc::new(RmuxBackend::with_socket_path(socket_path.clone()));
     eprintln!("socket: {}", socket_path.display());
 
     let session_name = random_session_name("roundtrip");
@@ -173,7 +174,8 @@ async fn kill_is_idempotent_on_missing_session() {
 
     let tmpdir = tempfile::tempdir().expect("create tempdir for socket");
     let socket_path = tmpdir.path().join("mux.sock");
-    let backend: Arc<dyn MuxBackend> = Arc::new(RmuxBackend::with_socket_path(socket_path));
+    let backend: Arc<dyn TerminalProcessBackend> =
+        Arc::new(RmuxBackend::with_socket_path(socket_path));
     let id = MuxSessionId::new(random_session_name("absent"));
     backend.kill(&id).await.unwrap();
 }
@@ -189,7 +191,8 @@ async fn register_pattern_w2a_stub_is_ok() {
 
     let tmpdir = tempfile::tempdir().expect("create tempdir for socket");
     let socket_path = tmpdir.path().join("mux.sock");
-    let backend: Arc<dyn MuxBackend> = Arc::new(RmuxBackend::with_socket_path(socket_path));
+    let backend: Arc<dyn TerminalProcessBackend> =
+        Arc::new(RmuxBackend::with_socket_path(socket_path));
     let id = MuxSessionId::new("any-name");
     backend
         .register_pattern(&id, "claude.idle".into(), r"\[idle\]".into())

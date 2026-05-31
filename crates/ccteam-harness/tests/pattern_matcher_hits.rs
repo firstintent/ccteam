@@ -6,7 +6,7 @@
 //! `patterns/claude.rs` by exercising the matcher through the crate's
 //! public API exactly as a backend `subscribe` translator would.
 
-use ccteam_mux::patterns::{PatternMatcher, PatternVendor};
+use ccteam_harness::patterns::{PatternMatcher, PatternVendor};
 
 fn matcher() -> PatternMatcher {
     PatternMatcher::base(PatternVendor::Claude)

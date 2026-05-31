@@ -101,7 +101,8 @@ mod tests {
 
     #[test]
     fn conf_writer_disables_exit_empty() {
-        let dir = std::env::temp_dir().join(format!("ccteam-mux-conf-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("ccteam-harness-conf-test-{}", std::process::id()));
         let socket = dir.join("mux.sock");
         let conf = write_ccteam_rmux_conf(&socket).expect("write conf");
         let body = std::fs::read_to_string(&conf).expect("read conf");

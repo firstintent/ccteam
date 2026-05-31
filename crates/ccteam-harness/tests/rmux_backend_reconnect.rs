@@ -7,7 +7,7 @@
 //!
 //! ```sh
 //! cargo build --bin ccteam
-//! cargo test -p ccteam-mux --test rmux_backend_reconnect -- \
+//! cargo test -p ccteam-harness --test rmux_backend_reconnect -- \
 //!     --ignored --nocapture
 //! ```
 //!
@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ccteam_mux::{MuxBackend, MuxSessionSpec, RmuxBackend};
+use ccteam_harness::{MuxSessionSpec, RmuxBackend, TerminalProcessBackend};
 
 fn random_session_name(base: &str) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -27,7 +27,7 @@ fn random_session_name(base: &str) -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("ccteam-mux-reconnect-{base}-{nanos}")
+    format!("ccteam-harness-reconnect-{base}-{nanos}")
 }
 
 fn locate_ccteam_binary() -> Option<PathBuf> {
@@ -83,7 +83,8 @@ async fn backend_recovers_after_daemon_death() {
 
     let tmpdir = tempfile::tempdir().expect("create tempdir for socket");
     let socket_path = tmpdir.path().join("mux.sock");
-    let backend: Arc<dyn MuxBackend> = Arc::new(RmuxBackend::with_socket_path(socket_path.clone()));
+    let backend: Arc<dyn TerminalProcessBackend> =
+        Arc::new(RmuxBackend::with_socket_path(socket_path.clone()));
 
     // First op spawns the daemon + caches the handle.
     let session_name = random_session_name("survivor");

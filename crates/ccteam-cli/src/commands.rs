@@ -204,7 +204,7 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
     let claude = Command::new("claude").arg("--version").output();
     // V0.8 W1 — `tmux -V` probe routes through the canonical
     // `ccteam_core::tmux_available()` helper (re-exported from
-    // `ccteam_mux::tmux_ops`) but the wizard wants a version string,
+    // `ccteam_harness::tmux_ops`) but the wizard wants a version string,
     // not a bool. Keep the inline `Command` here; the V0.9 retirement
     // of tmux.rs will swap this once tmux_available exposes the
     // version string too.
@@ -1561,7 +1561,7 @@ fn rmux_interactive_attach(session_name: &str) -> Result<()> {
     use rmux_client::{connect_or_absent, AttachTransition, ConnectResult};
     use rmux_proto::SessionName;
 
-    let socket = ccteam_mux::default_ccteam_mux_socket_path();
+    let socket = ccteam_harness::default_ccteam_harness_socket_path();
     eprintln!("→ rmux attach {session_name} (socket {})", socket.display());
 
     let connection = match connect_or_absent(&socket).context("connect to ccteam rmux daemon")? {
@@ -1630,19 +1630,21 @@ pub fn run_attach(paths: &CcteamPaths, slug: &str) -> Result<()> {
     // attaches to the ccteam-hosted rmux daemon via rmux-client
     // directly (Path A). The tmux path is unchanged (default).
     let session_name = session_name_for_project(paths, slug);
-    if ccteam_mux::backend_kind_from_env() == ccteam_mux::BackendKind::Rmux {
+    if ccteam_harness::backend_kind_from_env() == ccteam_harness::BackendKind::Rmux {
         return rmux_interactive_attach(&session_name);
     }
 
     let tmux_session = TmuxSession::from_name(session_name);
     if tmux_session.exists() {
         eprintln!("→ tmux attach -t {}", tmux_session.name());
-        // V0.8 W1 — argv from `ccteam_mux::interactive_attach_argv`
+        // V0.8 W1 — argv from `ccteam_harness::interactive_attach_argv`
         // (free fn, not a trait method — terminal handover doesn't fit
         // async; audit delta 6). Caller still spawns blocking
         // Command::status() on the CLI's own controlling tty.
-        let argv =
-            ccteam_mux::interactive_attach_argv(ccteam_mux::BackendKind::Tmux, tmux_session.name());
+        let argv = ccteam_harness::interactive_attach_argv(
+            ccteam_harness::BackendKind::Tmux,
+            tmux_session.name(),
+        );
         let (bin, args) = argv
             .split_first()
             .ok_or_else(|| anyhow::anyhow!("interactive_attach_argv returned empty argv"))?;
@@ -1797,7 +1799,7 @@ fn latest_claude_bg_job_id(paths: &CcteamPaths, slug: &str) -> Option<String> {
 /// pane via `tmux capture-pane -p`.
 ///
 /// V0.8 W1 — routes through `ccteam_core::capture_pane_tail_from_session`
-/// (re-exported over `ccteam_mux::tmux_ops::capture_pane_tail_from_session`,
+/// (re-exported over `ccteam_harness::tmux_ops::capture_pane_tail_from_session`,
 /// the same primitive `TmuxBackend::capture` calls under the hood).
 /// Keeps run_peek sync per the W1 "sync sites stay sync" decision.
 pub fn run_peek(paths: &CcteamPaths, slug: &str) -> Result<String> {
@@ -1805,16 +1807,16 @@ pub fn run_peek(paths: &CcteamPaths, slug: &str) -> Result<String> {
 
     // V0.8 W5 — backend-aware peek. Under the rmux backend, capture is
     // non-interactive (a plain-text grid snapshot) so it fits the async
-    // `MuxBackend::capture` trait method cleanly; drive it on a
+    // `ProcessBackend::capture` trait method cleanly; drive it on a
     // current-thread tokio runtime (same pattern as `run_session_rm`).
     // The tmux path (opt-out) is unchanged.
-    if ccteam_mux::backend_kind_from_env() == ccteam_mux::BackendKind::Rmux {
+    if ccteam_harness::backend_kind_from_env() == ccteam_harness::BackendKind::Rmux {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .context("build tokio runtime for rmux peek")?;
-        let id = ccteam_mux::MuxSessionId::new(session_name);
-        let backend = ccteam_mux::from_env()?;
+        let id = ccteam_harness::MuxSessionId::new(session_name);
+        let backend = ccteam_harness::from_env()?;
         let bytes = runtime
             .block_on(async {
                 if !backend.exists(&id).await? {
@@ -2067,7 +2069,7 @@ pub fn run_session_attach(slug: &str, sid: &str) -> Result<()> {
     // mux session name for both backends (rmux reuses the same label).
     // Under rmux, attach through the daemon; the existence check is the
     // daemon's job (begin_attach rejects an absent session).
-    if ccteam_mux::backend_kind_from_env() == ccteam_mux::BackendKind::Rmux {
+    if ccteam_harness::backend_kind_from_env() == ccteam_harness::BackendKind::Rmux {
         return rmux_interactive_attach(&record.tmux_session);
     }
 
@@ -2075,10 +2077,11 @@ pub fn run_session_attach(slug: &str, sid: &str) -> Result<()> {
     if !session.exists() {
         bail!("tmux session not running: {}", session.name());
     }
-    // V0.8 W1 — argv from `ccteam_mux::interactive_attach_argv` (audit
+    // V0.8 W1 — argv from `ccteam_harness::interactive_attach_argv` (audit
     // delta 6). Caller spawns blocking `Command::status()` on the CLI's
     // own controlling tty.
-    let argv = ccteam_mux::interactive_attach_argv(ccteam_mux::BackendKind::Tmux, session.name());
+    let argv =
+        ccteam_harness::interactive_attach_argv(ccteam_harness::BackendKind::Tmux, session.name());
     let (bin, args) = argv
         .split_first()
         .ok_or_else(|| anyhow::anyhow!("interactive_attach_argv returned empty argv"))?;

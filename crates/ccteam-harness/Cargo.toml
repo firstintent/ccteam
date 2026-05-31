@@ -1,10 +1,10 @@
 [package]
-name = "ccteam-mux"
+name = "ccteam-harness"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "ccteam mux abstraction — MuxBackend trait + tmux/inproc impls. V0.8 W1 wraps the existing tmux CLI; V0.8 W2+ adds RmuxBackend."
+description = "ccteam mux abstraction — ProcessBackend trait + tmux/inproc impls. V0.8 W1 wraps the existing tmux CLI; V0.8 W2+ adds RmuxBackend."
 
 [dependencies]
 # V0.8 W0 — rmux is the future unified-mux execution surface. Trait

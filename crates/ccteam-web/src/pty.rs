@@ -1,20 +1,20 @@
 //! V0.3.2 F56 / V0.8 W2b — thin adapter over
-//! [`ccteam_mux::MuxBackend::subscribe`].
+//! [`ccteam_harness::ProcessBackend::subscribe`].
 //!
 //! The refcounted `tmux pipe-pane` FIFO + broadcast machinery that used
-//! to live here was ported into `ccteam-mux::tmux_backend` (W2c Site 3)
-//! so that `MuxBackend::subscribe` is the single owner of the pipe-pane
+//! to live here was ported into `ccteam-harness::tmux_backend` (W2c Site 3)
+//! so that `ProcessBackend::subscribe` is the single owner of the pipe-pane
 //! control plane. This module keeps its **public surface stable**
 //! ([`PtyRegistry`] + [`Subscription`] with `rx:
 //! broadcast::Receiver<Vec<u8>>` + [`Subscription::tmux_session`]) so
 //! the `pty_ws` route handler is untouched; internally each
 //! [`PtyRegistry::subscribe`] now drives a `MuxEventStream` and fans its
-//! [`ccteam_mux::MuxEvent::OutputChunk`] bytes back into a
+//! [`ccteam_harness::MuxEvent::OutputChunk`] bytes back into a
 //! per-subscriber broadcast channel for compatibility with the existing
 //! SSE/WS consumer loop.
 //!
 //! The refcount + FIFO teardown now lives entirely inside
-//! `ccteam-mux`: the [`ccteam_mux::MuxEventStream`] returned by
+//! `ccteam-harness`: the [`ccteam_harness::MuxEventStream`] returned by
 //! `subscribe` carries an RAII guard; dropping the stream (which the
 //! forwarder task owns) decrements the backend-side refcount and tears
 //! down the pipe-pane on zero. [`Subscription`]'s Drop aborts the
@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use ccteam_core::CcteamPaths;
-use ccteam_mux::{MuxBackend, MuxEvent, MuxSessionId, TmuxBackend};
+use ccteam_harness::{MuxEvent, MuxSessionId, TerminalProcessBackend, TmuxBackend};
 use futures::StreamExt;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
@@ -41,7 +41,7 @@ pub const BROADCAST_CAPACITY: usize = 256;
 /// (`PtyRegistry::new()`) and its `Clone` shape stay stable; all
 /// refcount/FIFO state lives backend-side.
 ///
-/// V0.8: the backend is selected via `ccteam_mux::from_env()` so web
+/// V0.8: the backend is selected via `ccteam_harness::from_env()` so web
 /// SSE live streaming honors `CCTEAM_MUX_BACKEND` like the rest of
 /// ccteam. Previously this hardcoded `TmuxBackend`, which silently
 /// produced no stream under `CCTEAM_MUX_BACKEND=rmux` (it drove
@@ -50,13 +50,13 @@ pub const BROADCAST_CAPACITY: usize = 256;
 /// operator opts out with `CCTEAM_MUX_BACKEND=tmux`.
 #[derive(Clone)]
 pub struct PtyRegistry {
-    backend: Arc<dyn MuxBackend>,
+    backend: Arc<dyn TerminalProcessBackend>,
 }
 
 impl PtyRegistry {
     pub fn new() -> Self {
-        let backend = ccteam_mux::from_env()
-            .unwrap_or_else(|_| Arc::new(TmuxBackend::new()) as Arc<dyn MuxBackend>);
+        let backend = ccteam_harness::from_env()
+            .unwrap_or_else(|_| Arc::new(TmuxBackend::new()) as Arc<dyn TerminalProcessBackend>);
         Self { backend }
     }
 }

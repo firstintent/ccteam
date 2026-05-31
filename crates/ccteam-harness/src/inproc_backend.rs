@@ -20,7 +20,10 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
-use crate::{BackendKind, MuxBackend, MuxEventStream, MuxSessionId, MuxSessionSpec};
+use crate::{
+    BackendKind, MuxEventStream, MuxSessionId, MuxSessionSpec, ProcessBackend,
+    TerminalProcessBackend,
+};
 
 struct InProcSession {
     handle: JoinHandle<()>,
@@ -44,7 +47,7 @@ impl std::fmt::Debug for InProcBackend {
 }
 
 #[async_trait]
-impl MuxBackend for InProcBackend {
+impl ProcessBackend for InProcBackend {
     async fn spawn(&self, spec: MuxSessionSpec) -> Result<MuxSessionId> {
         let mut guard = self.inner.lock().await;
         if guard.contains_key(&spec.name) {
@@ -85,39 +88,6 @@ impl MuxBackend for InProcBackend {
         ))
     }
 
-    async fn capture(
-        &self,
-        _id: &MuxSessionId,
-        _lines: usize,
-        _with_ansi: bool,
-    ) -> Result<Vec<u8>> {
-        Err(anyhow!(
-            "InProcBackend::capture: not applicable to in-proc tasks"
-        ))
-    }
-
-    async fn pane_dims(&self, _id: &MuxSessionId) -> Result<Option<(u16, u16)>> {
-        Ok(None)
-    }
-
-    async fn pane_pid(&self, _id: &MuxSessionId) -> Result<Option<i32>> {
-        // In-proc tasks share the host process PID; reporting it
-        // would mislead `is_alive(expected_pid)` callers (the
-        // host pid is always alive). Return None so callers fall
-        // through to "exists" semantics.
-        Ok(None)
-    }
-
-    async fn list_pane_pids(&self, _id: &MuxSessionId) -> Result<Vec<u32>> {
-        Ok(Vec::new())
-    }
-
-    async fn resize(&self, _id: &MuxSessionId, _cols: u16, _rows: u16) -> Result<()> {
-        Err(anyhow!(
-            "InProcBackend::resize: not applicable to in-proc tasks"
-        ))
-    }
-
     async fn subscribe(&self, _id: &MuxSessionId) -> Result<MuxEventStream> {
         // No pane → no chunks. Returning an empty stream is the
         // ergonomic choice (subscribers that don't actually need
@@ -153,6 +123,40 @@ impl MuxBackend for InProcBackend {
 
     fn backend_kind(&self) -> BackendKind {
         BackendKind::InProc
+    }
+}
+
+#[async_trait]
+impl TerminalProcessBackend for InProcBackend {
+    async fn capture(
+        &self,
+        _id: &MuxSessionId,
+        _lines: usize,
+        _with_ansi: bool,
+    ) -> Result<Vec<u8>> {
+        Err(anyhow!(
+            "InProcBackend::capture: not applicable to in-proc tasks"
+        ))
+    }
+
+    async fn pane_dims(&self, _id: &MuxSessionId) -> Result<Option<(u16, u16)>> {
+        Ok(None)
+    }
+
+    async fn pane_pid(&self, _id: &MuxSessionId) -> Result<Option<i32>> {
+        // In-proc tasks share the host process PID; reporting it
+        // would mislead `is_alive(expected_pid)` callers.
+        Ok(None)
+    }
+
+    async fn list_pane_pids(&self, _id: &MuxSessionId) -> Result<Vec<u32>> {
+        Ok(Vec::new())
+    }
+
+    async fn resize(&self, _id: &MuxSessionId, _cols: u16, _rows: u16) -> Result<()> {
+        Err(anyhow!(
+            "InProcBackend::resize: not applicable to in-proc tasks"
+        ))
     }
 }
 

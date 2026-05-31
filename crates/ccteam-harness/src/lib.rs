@@ -1,7 +1,7 @@
-//! ccteam-mux — unified mux abstraction for mode 1 / 2 / 3a / 3b child
+//! ccteam-harness — unified mux abstraction for mode 1 / 2 / 3a / 3b child
 //! supervision.
 //!
-//! V0.8 W1 lands the `MuxBackend` async trait + two impls:
+//! V0.8 W1 lands the `ProcessBackend` async trait + two impls:
 //!
 //! - [`TmuxBackend`] — thin async facade over the existing `tmux` CLI
 //!   primitives (which now live in [`tmux_ops`] inside this crate, with
@@ -47,7 +47,7 @@ pub use enriched_event::{
 };
 pub use hook_sink::{default_ccteam_hook_socket_path, HookEvent, HookSink, HookSinkClient};
 pub use inproc_backend::InProcBackend;
-pub use rmux_backend::{default_ccteam_mux_socket_path, RmuxBackend};
+pub use rmux_backend::{default_ccteam_harness_socket_path, RmuxBackend};
 pub use tmux_backend::TmuxBackend;
 pub use typed_event_tap::{event_kind_for_regex_id, RawEnrichment, TapHandle, TypedEventTap};
 
@@ -88,7 +88,7 @@ pub enum MuxSessionKind {
     Daemon,
 }
 
-/// Specification for `MuxBackend::spawn`. Maps 1:1 onto
+/// Specification for `ProcessBackend::spawn`. Maps 1:1 onto
 /// `tmux new-session -d -e KEY=VAL... -s <name> -c <wd> -x C -y R <argv>`
 /// for the TmuxBackend impl; rmux uses the same fields against
 /// `rmux_sdk::EnsureSession` (W2).
@@ -207,7 +207,7 @@ pub enum BackendKind {
 /// when it matters, or runs synchronously inline when the call is
 /// cheap.
 #[async_trait::async_trait]
-pub trait MuxBackend: Send + Sync {
+pub trait ProcessBackend: Send + Sync {
     /// Idempotent create-or-error spawn. Returns the session id.
     async fn spawn(&self, spec: MuxSessionSpec) -> Result<MuxSessionId>;
 
@@ -218,24 +218,16 @@ pub trait MuxBackend: Send + Sync {
     /// against tmux stale-session-with-dead-pane state; for rmux this
     /// is daemon-tracked).
     ///
-    /// Default impl composes `exists` + `pane_pid` + the OS-level
-    /// `pid_is_alive` (the latter stays outside the trait — see audit
-    /// delta 8).
+    /// Default impl composes `exists` + the OS-level `pid_is_alive`
+    /// when a caller has a spawn-time pid. Backends with terminal pane
+    /// semantics can override this with stronger live-child checks.
     async fn is_alive(&self, id: &MuxSessionId, expected_pid: Option<i32>) -> Result<bool> {
         if !self.exists(id).await? {
             return Ok(false);
         }
         match expected_pid {
             None => Ok(true),
-            Some(pid) => {
-                if !tmux_ops::pid_is_alive(pid) {
-                    return Ok(false);
-                }
-                match self.pane_pid(id).await? {
-                    Some(actual) => Ok(actual == pid),
-                    None => Ok(false),
-                }
-            }
+            Some(pid) => Ok(tmux_ops::pid_is_alive(pid)),
         }
     }
 
@@ -250,32 +242,6 @@ pub trait MuxBackend: Send + Sync {
         self.send_text(id, text).await?;
         self.send_enter(id).await
     }
-
-    /// Capture the last N lines of pane output.
-    /// `with_ansi=true` preserves escape sequences (for vt100
-    /// rendering). `with_ansi=false` returns stripped plain text.
-    /// Returns bytes — String form was dropped (audit delta 5).
-    async fn capture(&self, id: &MuxSessionId, lines: usize, with_ansi: bool) -> Result<Vec<u8>>;
-
-    /// Query pane dimensions `(rows, cols)`. `None` when the session
-    /// is missing or the query fails — screenshot fallback to 80×24
-    /// needs the None branch (audit delta 4).
-    async fn pane_dims(&self, id: &MuxSessionId) -> Result<Option<(u16, u16)>>;
-
-    /// Query the active pane's leader PID. Distinct from any
-    /// spawn-time PID handle — internal respawn drifts the live value
-    /// (audit delta 3).
-    async fn pane_pid(&self, id: &MuxSessionId) -> Result<Option<i32>>;
-
-    /// List the PIDs of every pane in this session. F164 reattach
-    /// path + claude_tui resume tests consume this directly even
-    /// though rmux may abstract "pane" — "child PIDs in this session"
-    /// remains a load-bearing signal (audit delta 2).
-    async fn list_pane_pids(&self, id: &MuxSessionId) -> Result<Vec<u32>>;
-
-    /// Resize the pane geometry. Required for `pty_ws::resize_window`
-    /// browser xterm.js parity (audit delta 1).
-    async fn resize(&self, id: &MuxSessionId, cols: u16, rows: u16) -> Result<()>;
 
     /// Subscribe to the typed event stream. Stream ends when session
     /// ends. The refcount + FIFO bookkeeping (F56) is internalized
@@ -311,6 +277,32 @@ pub trait MuxBackend: Send + Sync {
     /// [`default_backend`] / [`from_env`] actually returned (the trait
     /// object otherwise erases the impl type).
     fn backend_kind(&self) -> BackendKind;
+}
+
+/// Terminal/pane operations exposed only by process backends that host
+/// interactive terminal sessions. This keeps [`ProcessBackend`] focused
+/// on portable lifecycle + IO while preserving the current tmux/rmux
+/// terminal feature surface for web snapshots, pty resize, and tests.
+#[async_trait::async_trait]
+pub trait TerminalProcessBackend: ProcessBackend {
+    /// Capture the last N lines of pane output.
+    /// `with_ansi=true` preserves escape sequences when the backend can
+    /// provide them. Returns bytes; callers choose the display encoding.
+    async fn capture(&self, id: &MuxSessionId, lines: usize, with_ansi: bool) -> Result<Vec<u8>>;
+
+    /// Query pane dimensions `(rows, cols)`. `None` when the session is
+    /// missing or the query fails.
+    async fn pane_dims(&self, id: &MuxSessionId) -> Result<Option<(u16, u16)>>;
+
+    /// Query the active pane's leader PID. Distinct from any spawn-time
+    /// process handle because terminal backends can respawn internally.
+    async fn pane_pid(&self, id: &MuxSessionId) -> Result<Option<i32>>;
+
+    /// List the PIDs of every pane/process in this session.
+    async fn list_pane_pids(&self, id: &MuxSessionId) -> Result<Vec<u32>>;
+
+    /// Resize the pane geometry.
+    async fn resize(&self, id: &MuxSessionId, cols: u16, rows: u16) -> Result<()>;
 }
 
 /// Build argv for an interactive terminal handover (`tmux attach -t
@@ -364,12 +356,12 @@ pub fn backend_kind_from_env() -> BackendKind {
 
 /// Pick a backend from the `CCTEAM_MUX_BACKEND` env var (defaults to
 /// `rmux`, the bundled always-available backend). Explicit `tmux` opts
-/// out; unset/empty falls through to rmux. Returns `Arc<dyn MuxBackend>`
+/// out; unset/empty falls through to rmux. Returns `Arc<dyn TerminalProcessBackend>`
 /// so the value can be cloned freely through call chains; do NOT cache
 /// as a process-wide singleton (per-test instantiation keeps mock impls
 /// test-isolated). Unlike the infallible [`default_backend`], this errors
 /// on an unknown/typo'd value so fallible callers surface the mistake.
-pub fn from_env() -> Result<Arc<dyn MuxBackend>> {
+pub fn from_env() -> Result<Arc<dyn TerminalProcessBackend>> {
     match std::env::var("CCTEAM_MUX_BACKEND").as_deref() {
         Ok("tmux") => Ok(Arc::new(TmuxBackend::new())),
         Ok("inproc-test") => Ok(Arc::new(InProcBackend::new())),
@@ -391,6 +383,6 @@ pub fn from_env() -> Result<Arc<dyn MuxBackend>> {
 /// operator opts out of rmux only with an explicit `CCTEAM_MUX_BACKEND=tmux`.
 /// **Do not cache** — instantiate at the call site (or thread it through
 /// from `main` / daemon startup).
-pub fn default_backend() -> Arc<dyn MuxBackend> {
+pub fn default_backend() -> Arc<dyn TerminalProcessBackend> {
     from_env().unwrap_or_else(|_| Arc::new(RmuxBackend::new()))
 }

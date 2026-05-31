@@ -1,5 +1,5 @@
-//! V0.8 W1 — verify each `MuxBackend` impl is constructible as
-//! `Arc<dyn MuxBackend>` (dyn-compat / object safety check).
+//! V0.8 W1 — verify each `ProcessBackend` impl is constructible as
+//! `Arc<dyn TerminalProcessBackend>` (dyn-compat / object safety check).
 //!
 //! The trait is `async fn` heavy; this test catches accidental
 //! `Self: Sized` bounds or `&mut self` slips at compile time. It's
@@ -7,7 +7,7 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
-use ccteam_mux::{from_env, InProcBackend, MuxBackend, RmuxBackend, TmuxBackend};
+use ccteam_harness::{from_env, InProcBackend, RmuxBackend, TerminalProcessBackend, TmuxBackend};
 
 /// Tests that mutate `CCTEAM_MUX_BACKEND` must serialize against each
 /// other — cargo test parallelism otherwise races the env var (one
@@ -21,12 +21,12 @@ fn env_lock() -> &'static Mutex<()> {
 
 #[test]
 fn tmux_backend_is_dyn_compat() {
-    let _: Arc<dyn MuxBackend> = Arc::new(TmuxBackend::new());
+    let _: Arc<dyn TerminalProcessBackend> = Arc::new(TmuxBackend::new());
 }
 
 #[test]
 fn inproc_backend_is_dyn_compat() {
-    let _: Arc<dyn MuxBackend> = Arc::new(InProcBackend::new());
+    let _: Arc<dyn TerminalProcessBackend> = Arc::new(InProcBackend::new());
 }
 
 #[test]
@@ -34,7 +34,7 @@ fn rmux_backend_is_dyn_compat() {
     // V0.8 W2a — RmuxBackend constructs without contacting the daemon
     // (the SDK `Rmux` handle is lazily initialized on first
     // `connect_or_start`).
-    let _: Arc<dyn MuxBackend> = Arc::new(RmuxBackend::new());
+    let _: Arc<dyn TerminalProcessBackend> = Arc::new(RmuxBackend::new());
 }
 
 #[test]
@@ -47,7 +47,7 @@ fn from_env_default_yields_rmux() {
     };
     std::env::remove_var("CCTEAM_MUX_BACKEND");
     let backend = from_env().expect("from_env default should succeed");
-    assert_eq!(backend.backend_kind(), ccteam_mux::BackendKind::Rmux);
+    assert_eq!(backend.backend_kind(), ccteam_harness::BackendKind::Rmux);
 }
 
 #[test]

@@ -1,4 +1,4 @@
-//! `RmuxBackend` — V0.8 W2a implementation of [`MuxBackend`] backed by
+//! `RmuxBackend` — V0.8 W2a implementation of [`ProcessBackend`] backed by
 //! the `rmux-sdk` 0.3 daemon.
 //!
 //! Daemon spawn protocol: ccteam re-hosts the rmux daemon inside its
@@ -23,7 +23,7 @@
 //!   [`crate::patterns::PatternMatcher`] per session; `subscribe`
 //!   snapshots it (same type the TmuxBackend uses).
 //!
-//! Known gap (W2b followup): [`MuxBackend::capture`]'s `with_ansi=true`
+//! Known gap (W2b followup): [`ProcessBackend::capture`]'s `with_ansi=true`
 //! cannot be honored from the SDK's `PaneSnapshot` cell grid — ANSI
 //! escape bytes are gone after the daemon parses the grid. W2a's impl
 //! returns rendered plain-text bytes for both branches and documents
@@ -48,7 +48,10 @@ use rmux_sdk::{
 };
 
 use crate::patterns::{PatternMatcher, PatternVendor};
-use crate::{BackendKind, MuxBackend, MuxEvent, MuxEventStream, MuxSessionId, MuxSessionSpec};
+use crate::{
+    BackendKind, MuxEvent, MuxEventStream, MuxSessionId, MuxSessionSpec, ProcessBackend,
+    TerminalProcessBackend,
+};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 5;
 
@@ -57,7 +60,7 @@ const DEFAULT_TIMEOUT_SECS: u64 = 5;
 /// to the SDK-default named pipe.
 ///
 /// The parent directory is created on first use (mode 0700 on Unix).
-pub fn default_ccteam_mux_socket_path() -> PathBuf {
+pub fn default_ccteam_harness_socket_path() -> PathBuf {
     let home = dirs_home_or_tmp();
     home.join(".ccteam").join("run").join("mux.sock")
 }
@@ -134,7 +137,7 @@ struct RmuxStreamState {
     pending: VecDeque<MuxEvent>,
 }
 
-/// `RmuxBackend` — ccteam's MuxBackend impl over rmux-sdk 0.3.
+/// `RmuxBackend` — ccteam's ProcessBackend impl over rmux-sdk 0.3.
 ///
 /// The SDK `Rmux` handle is lazily connected on first use and cached in
 /// a [`Mutex`]-guarded `Option<Arc<Rmux>>` so the daemon spawn cost
@@ -180,7 +183,7 @@ impl RmuxBackend {
     /// by the operator, the existing value wins (production-friendly
     /// for `CCTEAM_RMUX_BIN` style overrides should they materialize).
     pub fn new() -> Self {
-        Self::with_socket_path(default_ccteam_mux_socket_path())
+        Self::with_socket_path(default_ccteam_harness_socket_path())
     }
 
     /// Variant that pins the UDS endpoint explicitly. Used by the
@@ -330,7 +333,7 @@ impl RmuxBackend {
 }
 
 #[async_trait]
-impl MuxBackend for RmuxBackend {
+impl ProcessBackend for RmuxBackend {
     async fn spawn(&self, spec: MuxSessionSpec) -> Result<MuxSessionId> {
         let session_name = SessionName::new(spec.name.clone()).map_err(|e| {
             anyhow!(
@@ -377,6 +380,24 @@ impl MuxBackend for RmuxBackend {
         .await
     }
 
+    async fn is_alive(&self, id: &MuxSessionId, expected_pid: Option<i32>) -> Result<bool> {
+        if !self.exists(id).await? {
+            return Ok(false);
+        }
+        match expected_pid {
+            None => Ok(true),
+            Some(pid) => {
+                if !crate::tmux_ops::pid_is_alive(pid) {
+                    return Ok(false);
+                }
+                match TerminalProcessBackend::pane_pid(self, id).await? {
+                    Some(actual) => Ok(actual == pid),
+                    None => Ok(false),
+                }
+            }
+        }
+    }
+
     async fn send_text(&self, id: &MuxSessionId, text: &str) -> Result<()> {
         let name = self.session_name(id).await?;
         let label = format!("send_text `{}`", id.0);
@@ -399,80 +420,6 @@ impl MuxBackend for RmuxBackend {
             async move {
                 let session = rmux.session(name).await?;
                 session.pane(0, 0).send_key("Enter").await?;
-                Ok(())
-            }
-        })
-        .await
-    }
-
-    async fn capture(&self, id: &MuxSessionId, lines: usize, _with_ansi: bool) -> Result<Vec<u8>> {
-        // W2b followup: PaneSnapshot is the parsed grid — ANSI escape
-        // bytes are not recoverable from cells. W2a returns the rendered
-        // plain-text bytes for both `with_ansi=true` and `false`. Web
-        // SSE consumers that need raw bytes continue routing through
-        // `ccteam-web::pty::PtyRegistry` until W2b ports the registry.
-        let name = self.session_name(id).await?;
-        let label = format!("capture `{}`", id.0);
-        self.call(&label, |rmux| {
-            let name = name.clone();
-            async move {
-                let session = rmux.session(name).await?;
-                let snapshot = session.pane(0, 0).snapshot().await?;
-                let visible_lines = snapshot.visible_lines();
-                // Honor `lines` by taking the last N.
-                let take = lines.min(visible_lines.len());
-                let start = visible_lines.len().saturating_sub(take);
-                let slice = &visible_lines[start..];
-                Ok(slice.join("\n").into_bytes())
-            }
-        })
-        .await
-    }
-
-    async fn pane_dims(&self, id: &MuxSessionId) -> Result<Option<(u16, u16)>> {
-        let Some(info) = self.first_pane_info(id).await? else {
-            return Ok(None);
-        };
-        // Trait contract: `(rows, cols)` (per W1 trait doc / TmuxBackend
-        // impl — see `query_pane_dims_from_session`).
-        Ok(Some((info.size.rows, info.size.cols)))
-    }
-
-    async fn pane_pid(&self, id: &MuxSessionId) -> Result<Option<i32>> {
-        let Some(info) = self.first_pane_info(id).await? else {
-            return Ok(None);
-        };
-        match info.process {
-            PaneProcessState::Running { pid: Some(pid) } => Ok(Some(pid as i32)),
-            _ => Ok(None),
-        }
-    }
-
-    async fn list_pane_pids(&self, id: &MuxSessionId) -> Result<Vec<u32>> {
-        // ccteam sessions are single-pane today; rmux's "pane" model
-        // differs from tmux's so a session-wide pane listing diverges
-        // semantically. W2a: return the first pane's pid as a
-        // one-element vec. W2b refines if multi-pane callers appear.
-        let Some(info) = self.first_pane_info(id).await? else {
-            return Ok(Vec::new());
-        };
-        match info.process {
-            PaneProcessState::Running { pid: Some(pid) } => Ok(vec![pid]),
-            _ => Ok(Vec::new()),
-        }
-    }
-
-    async fn resize(&self, id: &MuxSessionId, cols: u16, rows: u16) -> Result<()> {
-        let name = self.session_name(id).await?;
-        let label = format!("resize `{}`", id.0);
-        self.call(&label, |rmux| {
-            let name = name.clone();
-            async move {
-                let session = rmux.session(name).await?;
-                session
-                    .pane(0, 0)
-                    .resize(TerminalSizeSpec::new(cols, rows))
-                    .await?;
                 Ok(())
             }
         })
@@ -610,6 +557,74 @@ impl MuxBackend for RmuxBackend {
 
     fn backend_kind(&self) -> BackendKind {
         BackendKind::Rmux
+    }
+}
+
+#[async_trait]
+impl TerminalProcessBackend for RmuxBackend {
+    async fn capture(&self, id: &MuxSessionId, lines: usize, _with_ansi: bool) -> Result<Vec<u8>> {
+        // W2b followup: PaneSnapshot is the parsed grid — ANSI escape
+        // bytes are not recoverable from cells. W2a returns the rendered
+        // plain-text bytes for both `with_ansi=true` and `false`.
+        let name = self.session_name(id).await?;
+        let label = format!("capture `{}`", id.0);
+        self.call(&label, |rmux| {
+            let name = name.clone();
+            async move {
+                let session = rmux.session(name).await?;
+                let snapshot = session.pane(0, 0).snapshot().await?;
+                let visible_lines = snapshot.visible_lines();
+                let take = lines.min(visible_lines.len());
+                let start = visible_lines.len().saturating_sub(take);
+                let slice = &visible_lines[start..];
+                Ok(slice.join("\n").into_bytes())
+            }
+        })
+        .await
+    }
+
+    async fn pane_dims(&self, id: &MuxSessionId) -> Result<Option<(u16, u16)>> {
+        let Some(info) = self.first_pane_info(id).await? else {
+            return Ok(None);
+        };
+        Ok(Some((info.size.rows, info.size.cols)))
+    }
+
+    async fn pane_pid(&self, id: &MuxSessionId) -> Result<Option<i32>> {
+        let Some(info) = self.first_pane_info(id).await? else {
+            return Ok(None);
+        };
+        match info.process {
+            PaneProcessState::Running { pid: Some(pid) } => Ok(Some(pid as i32)),
+            _ => Ok(None),
+        }
+    }
+
+    async fn list_pane_pids(&self, id: &MuxSessionId) -> Result<Vec<u32>> {
+        let Some(info) = self.first_pane_info(id).await? else {
+            return Ok(Vec::new());
+        };
+        match info.process {
+            PaneProcessState::Running { pid: Some(pid) } => Ok(vec![pid]),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    async fn resize(&self, id: &MuxSessionId, cols: u16, rows: u16) -> Result<()> {
+        let name = self.session_name(id).await?;
+        let label = format!("resize `{}`", id.0);
+        self.call(&label, |rmux| {
+            let name = name.clone();
+            async move {
+                let session = rmux.session(name).await?;
+                session
+                    .pane(0, 0)
+                    .resize(TerminalSizeSpec::new(cols, rows))
+                    .await?;
+                Ok(())
+            }
+        })
+        .await
     }
 }
 

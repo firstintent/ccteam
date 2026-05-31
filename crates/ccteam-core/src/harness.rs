@@ -489,7 +489,7 @@ pub struct SessionHandle {
     /// Such a spawn has no `~/.claude/jobs/<id>/state.json`; the
     /// orchestrator detects its completion via the mux session
     /// lifecycle ([`crate::orchestrator`] checks
-    /// `MuxBackend::exists(mux_session)`) instead of the F80
+    /// `ProcessBackend::exists(mux_session)`) instead of the F80
     /// state.json poll. serde-default `false` keeps existing
     /// state.json `SessionRecord` files loading unchanged.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

@@ -17,11 +17,11 @@
 
 use std::time::{Duration, SystemTime};
 
-use ccteam_mux::enriched_event::{
+use ccteam_harness::enriched_event::{
     BaseEvent, BasePayload, EnrichmentEvent, EnrichmentPayload, EventKind, EventMerger,
     MergeOutcome, Vendor, DEFAULT_GRACE,
 };
-use ccteam_mux::MuxSessionId;
+use ccteam_harness::MuxSessionId;
 
 fn base(session: &str, seq: u64) -> BaseEvent {
     BaseEvent {
@@ -58,9 +58,9 @@ fn enrichment(session: &str, seq: u64) -> EnrichmentEvent {
 /// Collect exactly `n` events off the receiver, auto-advancing the
 /// paused clock as needed. Fails if the stream closes early.
 async fn collect_n(
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<ccteam_mux::EnrichedEvent>,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<ccteam_harness::EnrichedEvent>,
     n: usize,
-) -> Vec<ccteam_mux::EnrichedEvent> {
+) -> Vec<ccteam_harness::EnrichedEvent> {
     let mut out = Vec::with_capacity(n);
     while out.len() < n {
         match rx.recv().await {

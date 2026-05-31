@@ -1,6 +1,6 @@
 //! Daemon-side **typed-event tap** — the production producer that drives
 //! the [`crate::enriched_event::EventMerger`] from a live session's
-//! [`MuxBackend::subscribe`] stream.
+//! [`ProcessBackend::subscribe`] stream.
 //!
 //! This is the V0.8 wiring that makes the merger live (Slice 1 base path +
 //! Slice 2 enrichment pairing): it registers the vendor's base patterns
@@ -34,7 +34,7 @@ use crate::enriched_event::{
     EventMerger, Vendor,
 };
 use crate::patterns::{self, PatternVendor};
-use crate::{MuxBackend, MuxEvent, MuxSessionId};
+use crate::{MuxEvent, MuxSessionId, TerminalProcessBackend};
 
 /// FIXED mapping from a base-pattern `regex_id` (see
 /// [`crate::patterns`]) to the merger [`EventKind`] it produces.
@@ -252,7 +252,7 @@ impl TypedEventTap {
     pub async fn spawn(
         session_id: MuxSessionId,
         vendor: Vendor,
-        backend: Arc<dyn MuxBackend>,
+        backend: Arc<dyn TerminalProcessBackend>,
         grace: Duration,
     ) -> anyhow::Result<SpawnResult> {
         // Register every base pattern for this vendor so the backend will
@@ -447,7 +447,7 @@ impl TypedEventTap {
 mod tests {
     use super::*;
     use crate::enriched_event::MergeOutcome;
-    use crate::{BackendKind, MuxEventStream, MuxSessionSpec};
+    use crate::{BackendKind, MuxEventStream, MuxSessionSpec, ProcessBackend};
     use anyhow::Result;
 
     #[test]
@@ -695,7 +695,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl MuxBackend for MockBackend {
+    impl ProcessBackend for MockBackend {
         async fn spawn(&self, _spec: MuxSessionSpec) -> Result<MuxSessionId> {
             unimplemented!()
         }
@@ -706,26 +706,6 @@ mod tests {
             unimplemented!()
         }
         async fn send_enter(&self, _id: &MuxSessionId) -> Result<()> {
-            unimplemented!()
-        }
-        async fn capture(
-            &self,
-            _id: &MuxSessionId,
-            _lines: usize,
-            _with_ansi: bool,
-        ) -> Result<Vec<u8>> {
-            unimplemented!()
-        }
-        async fn pane_dims(&self, _id: &MuxSessionId) -> Result<Option<(u16, u16)>> {
-            unimplemented!()
-        }
-        async fn pane_pid(&self, _id: &MuxSessionId) -> Result<Option<i32>> {
-            unimplemented!()
-        }
-        async fn list_pane_pids(&self, _id: &MuxSessionId) -> Result<Vec<u32>> {
-            unimplemented!()
-        }
-        async fn resize(&self, _id: &MuxSessionId, _cols: u16, _rows: u16) -> Result<()> {
             unimplemented!()
         }
         async fn subscribe(&self, _id: &MuxSessionId) -> Result<MuxEventStream> {
@@ -755,6 +735,34 @@ mod tests {
         }
         fn backend_kind(&self) -> BackendKind {
             BackendKind::InProc
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TerminalProcessBackend for MockBackend {
+        async fn capture(
+            &self,
+            _id: &MuxSessionId,
+            _lines: usize,
+            _with_ansi: bool,
+        ) -> Result<Vec<u8>> {
+            unimplemented!()
+        }
+
+        async fn pane_dims(&self, _id: &MuxSessionId) -> Result<Option<(u16, u16)>> {
+            unimplemented!()
+        }
+
+        async fn pane_pid(&self, _id: &MuxSessionId) -> Result<Option<i32>> {
+            unimplemented!()
+        }
+
+        async fn list_pane_pids(&self, _id: &MuxSessionId) -> Result<Vec<u32>> {
+            unimplemented!()
+        }
+
+        async fn resize(&self, _id: &MuxSessionId, _cols: u16, _rows: u16) -> Result<()> {
+            unimplemented!()
         }
     }
 

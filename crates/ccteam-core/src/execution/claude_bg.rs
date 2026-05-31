@@ -44,7 +44,7 @@
 use std::process::Command;
 
 use async_trait::async_trait;
-use ccteam_mux::{default_backend, MuxSessionId, MuxSessionKind, MuxSessionSpec};
+use ccteam_harness::{default_backend, MuxSessionId, MuxSessionKind, MuxSessionSpec};
 use chrono::Utc;
 use futures::stream::{self, BoxStream};
 
@@ -104,7 +104,7 @@ impl ClaudeBgAdapter {
     /// The returned [`ThreadHandle`] preserves the legacy
     /// `raw_extras.tmux_session` field for downstream parity and adds
     /// `mux_session` + `via_mux: true` so callers can route teardown
-    /// through `MuxBackend::kill` (see [`Self::close_thread`]).
+    /// through `ProcessBackend::kill` (see [`Self::close_thread`]).
     async fn start_thread_via_mux(
         &self,
         spec: &AgentSpecBrief,
@@ -287,7 +287,7 @@ impl HarnessAdapter for ClaudeBgAdapter {
 
     async fn close_thread(&self, h: &ThreadHandle) -> Result<(), HarnessError> {
         // V0.8 W3 — handles minted by the foreground-in-mux path carry
-        // `via_mux: true`; route teardown through `MuxBackend::kill`
+        // `via_mux: true`; route teardown through `ProcessBackend::kill`
         // (idempotent) so the daemon-owned child is reaped. The legacy
         // file-based SIGTERM path below is only for self-detached
         // `--bg` workers.

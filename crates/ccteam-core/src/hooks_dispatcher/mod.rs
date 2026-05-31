@@ -33,7 +33,7 @@ pub const HOOK_DISPATCHER_SH: &str = include_str!("hook.sh");
 /// orchestrator single-writer). When `CCTEAM_HOOK_VIA_DAEMON=1`,
 /// [`ensure_chat_hooks_installed`](crate::execution::claude_tui::ensure_chat_hooks_installed)
 /// generates hook commands that call `ccteam mux hook-emit ...` and the
-/// orchestrator (`ccteam start`) binds a [`ccteam_mux::HookSink`] to
+/// orchestrator (`ccteam start`) binds a [`ccteam_harness::HookSink`] to
 /// consume them.
 pub const HOOK_VIA_DAEMON_ENV: &str = "CCTEAM_HOOK_VIA_DAEMON";
 

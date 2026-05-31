@@ -1,10 +1,10 @@
-//! V0.8 W1 — back-compat re-export over `ccteam-mux::tmux_ops`.
+//! V0.8 W1 — back-compat re-export over `ccteam-harness::tmux_ops`.
 //!
 //! The primitive `tmux` CLI wrapper (`TmuxSession`, free fns
 //! `capture_pane_*`, `query_pane_dims_*`, `pid_is_alive`,
-//! `tmux_available`, …) moved into `ccteam-mux/src/tmux_ops.rs` so the
-//! `MuxBackend` trait + `TmuxBackend` impl can live in the same crate
-//! without inducing a `ccteam-mux ↔ ccteam-core` cargo cycle.
+//! `tmux_available`, …) moved into `ccteam-harness/src/tmux_ops.rs` so the
+//! `ProcessBackend` trait + `TmuxBackend` impl can live in the same crate
+//! without inducing a `ccteam-harness ↔ ccteam-core` cargo cycle.
 //!
 //! Everything is re-exported from here so existing callers (production
 //! sites + integration tests) keep compiling unchanged. The only item
@@ -12,10 +12,10 @@
 //! which depends on `CcteamPaths` + `ProjectState` (both owned by
 //! `ccteam-core`) and would re-introduce the cycle if moved.
 //!
-//! V0.9 retires this module entirely once the `MuxBackend` trait has
+//! V0.9 retires this module entirely once the `ProcessBackend` trait has
 //! burned in.
 
-pub use ccteam_mux::tmux_ops::{
+pub use ccteam_harness::tmux_ops::{
     capture_pane_tail, capture_pane_tail_from_session, capture_pane_with_ansi,
     capture_pane_with_ansi_from_session, list_sessions, pid_is_alive, query_pane_dims,
     query_pane_dims_from_session, resize_window, session_name_for_slug, tmux_available,
@@ -33,7 +33,7 @@ use crate::state::ProjectState;
 /// If the state is missing or malformed we fall back to the
 /// conventional name so diagnostic surfaces still degrade cleanly.
 ///
-/// Stays in `ccteam-core` (rather than `ccteam-mux`) because the
+/// Stays in `ccteam-core` (rather than `ccteam-harness`) because the
 /// `CcteamPaths` + `ProjectState` dependency would re-introduce the
 /// cargo cycle that the W1 move was designed to break.
 pub fn session_name_for_project(paths: &CcteamPaths, slug: &str) -> String {

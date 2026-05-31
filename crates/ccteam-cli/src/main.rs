@@ -985,9 +985,9 @@ fn main() -> Result<()> {
     // today, so W2a leaves this as a TODO rather than a behavior change.
     {
         let raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
-        if raw_args.len() >= 3 && raw_args[1] == ccteam_mux::daemon::INTERNAL_DAEMON_FLAG {
+        if raw_args.len() >= 3 && raw_args[1] == ccteam_harness::daemon::INTERNAL_DAEMON_FLAG {
             let socket = raw_args[2].clone();
-            ccteam_mux::daemon::run_internal_daemon(socket)
+            ccteam_harness::daemon::run_internal_daemon(socket)
                 .context("ccteam internal rmux daemon")?;
             return Ok(());
         }
@@ -1000,9 +1000,12 @@ fn main() -> Result<()> {
     // resolve the same ccteam binary as their daemon host, rather than
     // falling back to a `rmux` binary on PATH that may not exist.
     // Idempotent — honors an explicit operator override.
-    if std::env::var_os(ccteam_mux::daemon::SDK_DAEMON_BINARY_ENV).is_none() {
+    if std::env::var_os(ccteam_harness::daemon::SDK_DAEMON_BINARY_ENV).is_none() {
         if let Ok(exe) = std::env::current_exe() {
-            std::env::set_var(ccteam_mux::daemon::SDK_DAEMON_BINARY_ENV, exe.as_os_str());
+            std::env::set_var(
+                ccteam_harness::daemon::SDK_DAEMON_BINARY_ENV,
+                exe.as_os_str(),
+            );
         }
     }
 
@@ -1503,19 +1506,19 @@ fn run_mux_hook_emit(
         }
     };
 
-    let event = ccteam_mux::HookEvent {
+    let event = ccteam_harness::HookEvent {
         session_id,
         kind,
         action,
         payload_json,
     };
-    let socket = ccteam_mux::default_ccteam_hook_socket_path();
+    let socket = ccteam_harness::default_ccteam_hook_socket_path();
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("build tokio runtime for mux hook-emit")?;
-    match runtime.block_on(ccteam_mux::HookSinkClient::emit(&socket, &event)) {
+    match runtime.block_on(ccteam_harness::HookSinkClient::emit(&socket, &event)) {
         Ok(()) => Ok(()),
         Err(_) => {
             // Quiet non-zero exit — no stderr. See contract above.
@@ -1728,7 +1731,7 @@ fn run_start(
     init_tracing();
 
     // V0.8 rmux — the mux backend default is rmux, resolved in the
-    // library (`ccteam_mux::from_env` / `default_backend`): rmux is the
+    // library (`ccteam_harness::from_env` / `default_backend`): rmux is the
     // bundled always-available backend so ccteam works with no external
     // tmux. An operator opts out with `CCTEAM_MUX_BACKEND=tmux`. Log the
     // effective choice for ops visibility at orchestrator startup (no
@@ -1740,7 +1743,7 @@ fn run_start(
     // (this is a no-merge evaluation branch). See
     // docs/versions/v0-8-rmux/w-flip-default-migration-plan.md.
     tracing::info!(
-        backend = ?ccteam_mux::backend_kind_from_env(),
+        backend = ?ccteam_harness::backend_kind_from_env(),
         "ccteam start: mux backend (set CCTEAM_MUX_BACKEND=tmux to use tmux)"
     );
 
@@ -1919,8 +1922,8 @@ fn run_start(
             // recv, preserving append order — the single-writer invariant
             // the whole reroute exists to provide.
             let hook_sink_handle = if ccteam_core::hooks_dispatcher::hook_via_daemon_enabled() {
-                let socket = ccteam_mux::default_ccteam_hook_socket_path();
-                match ccteam_mux::HookSink::bind(&socket) {
+                let socket = ccteam_harness::default_ccteam_hook_socket_path();
+                match ccteam_harness::HookSink::bind(&socket) {
                     Ok(mut sink) => {
                         tracing::info!(
                             socket = %socket.display(),

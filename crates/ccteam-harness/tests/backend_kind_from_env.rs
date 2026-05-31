@@ -11,7 +11,7 @@
 
 use std::sync::{Mutex, OnceLock};
 
-use ccteam_mux::{backend_kind_from_env, BackendKind};
+use ccteam_harness::{backend_kind_from_env, BackendKind};
 
 fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -89,7 +89,7 @@ fn unknown_falls_back_to_rmux() {
 fn default_backend_honors_rmux_env() {
     with_backend_env(Some("rmux"), || {
         assert_eq!(
-            ccteam_mux::default_backend().backend_kind(),
+            ccteam_harness::default_backend().backend_kind(),
             BackendKind::Rmux,
             "default_backend() must route to rmux under CCTEAM_MUX_BACKEND=rmux"
         );
@@ -100,7 +100,7 @@ fn default_backend_honors_rmux_env() {
 fn default_backend_defaults_to_rmux() {
     with_backend_env(None, || {
         assert_eq!(
-            ccteam_mux::default_backend().backend_kind(),
+            ccteam_harness::default_backend().backend_kind(),
             BackendKind::Rmux,
             "default_backend() default (env unset) is rmux — the bundled backend"
         );
@@ -111,7 +111,7 @@ fn default_backend_defaults_to_rmux() {
 fn default_backend_unknown_value_falls_back_to_rmux() {
     with_backend_env(Some("bogus"), || {
         assert_eq!(
-            ccteam_mux::default_backend().backend_kind(),
+            ccteam_harness::default_backend().backend_kind(),
             BackendKind::Rmux,
             "default_backend() degrades a typo'd value to rmux (the bundled always-available backend)"
         );

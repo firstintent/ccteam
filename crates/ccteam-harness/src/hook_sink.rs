@@ -42,7 +42,7 @@ use tokio::sync::mpsc;
 /// Default UDS path for the ccteam-owned hook sink. Resolves to
 /// `$HOME/.ccteam/run/hook.sock` on Unix, alongside the rmux daemon's
 /// `mux.sock`. Kept deliberately separate from
-/// [`crate::default_ccteam_mux_socket_path`] so the two sockets never
+/// [`crate::default_ccteam_harness_socket_path`] so the two sockets never
 /// alias.
 pub fn default_ccteam_hook_socket_path() -> PathBuf {
     let home = if let Some(home) = std::env::var_os("HOME") {

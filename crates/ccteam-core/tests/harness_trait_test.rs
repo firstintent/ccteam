@@ -302,8 +302,8 @@ async fn claude_bg_via_mux_spawns_ephemeral_session_and_close_reaps_it() {
     );
 
     // The session is live: the daemon (tmux) owns the child process.
-    let backend = ccteam_mux::default_backend();
-    let id = ccteam_mux::MuxSessionId::new("ccteam-bg-muxbg-claude-9".to_string());
+    let backend = ccteam_harness::default_backend();
+    let id = ccteam_harness::MuxSessionId::new("ccteam-bg-muxbg-claude-9".to_string());
     assert!(
         backend.exists(&id).await.unwrap(),
         "mux session should exist after via-mux spawn"
@@ -344,7 +344,7 @@ async fn claude_bg_via_mux_spawns_ephemeral_session_and_close_reaps_it() {
         "via-mux argv must carry the extra_args prompt; got: {argv_text:?}"
     );
 
-    // close_thread routes through MuxBackend::kill (via_mux=true handle).
+    // close_thread routes through ProcessBackend::kill (via_mux=true handle).
     adapter
         .close_thread(&handle)
         .await
@@ -360,7 +360,7 @@ async fn claude_bg_via_mux_spawns_ephemeral_session_and_close_reaps_it() {
 async fn claude_bg_via_mux_close_thread_idempotent_on_missing_session() {
     let _mux_guard = EnvGuard::set("CCTEAM_MUX_BACKEND", "tmux");
     // A via_mux handle whose session never existed (or already reaped):
-    // MuxBackend::kill is idempotent, so close_thread is Ok. Does not
+    // ProcessBackend::kill is idempotent, so close_thread is Ok. Does not
     // require tmux on PATH — kill of a non-existent session is a no-op
     // even when the backend can shell out (tmux kill-session on a
     // missing target is treated as success by tmux_ops).
