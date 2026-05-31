@@ -27,11 +27,11 @@
 use ccteam_core::execution::codex_app_server::{
     build_progress_line, CodexAppServerAdapter, ProgressBridgeCtx, APP_SERVER_SOCKET_ENV,
 };
-use ccteam_core::harness::{
-    AgentSpecBrief, HarnessAdapter, SpawnCtx, ThreadErrorEvent, ThreadEvent, UnifiedTokenUsage,
-};
 use ccteam_core::queries::cost_summary_from_events;
 use ccteam_core::CcteamPaths;
+use ccteam_harness::{
+    AgentSpecBrief, HarnessAdapter, SpawnCtx, ThreadErrorEvent, ThreadEvent, UnifiedTokenUsage,
+};
 use futures::StreamExt;
 use serde_json::{json, Value};
 use serial_test::serial;

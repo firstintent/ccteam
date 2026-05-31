@@ -505,7 +505,7 @@ fn t06_force_overrides_refusal() {
 /// sidecar — mirrors the on-disk shape F146's `register_bot_checked_in`
 /// produces.
 fn seed_imd_registry(fx: &Fixture, role: &str) -> (std::path::PathBuf, std::path::PathBuf) {
-    use ccteam_core::harness::AgentVendor;
+    use ccteam_harness::AgentVendor;
     let outcome = ccteam_im::register_bot_checked_in(
         &fx.ccteam_home,
         &fx.slug,

@@ -18,7 +18,7 @@ use ccteam_core::advise::{
 };
 use ccteam_core::execution::codex_app_server::CODEX_BIN_ENV;
 use ccteam_core::execution::CodexExecAdapter;
-use ccteam_core::harness::{
+use ccteam_harness::{
     AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, ThreadEvent, ThreadHandle, TurnInput,
 };
 use futures::StreamExt;

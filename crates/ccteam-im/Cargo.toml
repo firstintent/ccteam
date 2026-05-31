@@ -12,8 +12,11 @@ description = "V0.6.0 Wave 2 F109/F116 — IM-bot daemon (Telegram / Slack / Dis
 # `ccteam_im::run_daemon_with_shutdown`.
 
 [dependencies]
-# Trait + types only — no `crate::execution::*` direct dep (HarnessAdapter red line).
+# Primitives plus the current concrete adapter factories; execution moves
+# out of core in the next P1 slice.
 ccteam-core.workspace = true
+# HarnessAdapter trait + cross-vendor thread/event types.
+ccteam-harness.workspace = true
 # Cost tracking from progress events the daemon may surface.
 ccteam-cost.workspace = true
 

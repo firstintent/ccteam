@@ -20,9 +20,8 @@ use std::io::Write;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use ccteam_core::{
-    CcteamPaths, HarnessKind, HarnessSnapshot, ProjectState, SessionRecord, SpawnCtx, TeamKind,
-};
+use ccteam_core::{CcteamPaths, HarnessKind, ProjectState, SessionRecord, TeamKind};
+use ccteam_harness::{HarnessSnapshot, SpawnCtx};
 use ccteam_web::{router_with_state, AppState};
 use reqwest::redirect::Policy;
 use tempfile::TempDir;

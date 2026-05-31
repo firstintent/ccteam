@@ -2,7 +2,7 @@
 
 use std::time::{Duration, SystemTime};
 
-use ccteam_core::harness::AgentVendor;
+use ccteam_harness::AgentVendor;
 use ccteam_im::{
     daemon::{run_daemon, DaemonArgs},
     imd_heartbeat_path, list_bots, register_bot, registration_path, unregister_bot,

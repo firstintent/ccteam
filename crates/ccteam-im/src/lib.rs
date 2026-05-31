@@ -16,7 +16,7 @@
 //! - **`ccteam-core` stays openhuman-free.** The dependency graph
 //!   integration test `tests/dep_graph_test.rs` enforces this.
 //! - We talk to long-running chat sessions through
-//!   [`ccteam_core::harness::HarnessAdapter`] only — never reach into
+//!   [`ccteam_harness::HarnessAdapter`] only — never reach into
 //!   `ccteam_core::execution::*` directly.
 //! - The daemon **never kills tmux sessions** outside the F116
 //!   supervisor crash-restart codepath. User-initiated stop goes
@@ -47,7 +47,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
-use ccteam_core::harness::AgentVendor;
+use ccteam_harness::AgentVendor;
 use serde::{Deserialize, Serialize};
 
 /// One registered bot — the on-disk payload at

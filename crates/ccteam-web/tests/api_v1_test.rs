@@ -29,8 +29,9 @@ use std::net::SocketAddr;
 
 use ccteam_core::{
     bootstrap_project, disable_tool_surface_bootstrap_for_tests, CcteamPaths, HarnessKind,
-    HarnessSnapshot, ProjectState, SessionRecord, TeamKind,
+    ProjectState, SessionRecord, TeamKind,
 };
+use ccteam_harness::HarnessSnapshot;
 use ccteam_web::{router_with_state, AppState, AuthState};
 use reqwest::redirect::Policy;
 use serde_json::Value;

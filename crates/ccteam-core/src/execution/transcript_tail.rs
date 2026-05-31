@@ -41,7 +41,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader};
 
-use crate::harness::{ThreadEvent, ThreadItem, ThreadItemDetails};
+use ccteam_harness::{ThreadEvent, ThreadItem, ThreadItemDetails};
 
 /// Persistent cursor written to
 /// `<project>/.ccteam/chat/<bot>/transcript-cursor.json`. Stored as

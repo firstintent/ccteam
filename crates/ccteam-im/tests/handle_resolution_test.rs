@@ -12,7 +12,7 @@
 //! - `available_handles_for_chat` filters by `(channel, chat_id)`
 //! - the suffixed handle actually routes end-to-end via `router::route`
 
-use ccteam_core::harness::AgentVendor;
+use ccteam_harness::AgentVendor;
 use ccteam_im::router::{available_handles_for_chat, format_unknown_handle_reply};
 use ccteam_im::BotRegistration;
 

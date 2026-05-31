@@ -427,7 +427,11 @@ version = "0.6.8"
 dependencies = [
  "anyhow",
  "async-trait",
+ "ccteam-cost",
+ "chrono",
+ "dirs",
  "futures",
+ "libc",
  "nix 0.29.0",
  "regex",
  "rmux-client",
@@ -437,6 +441,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
 ]
@@ -447,6 +452,7 @@ version = "0.6.8"
 dependencies = [
  "anyhow",
  "ccteam-core",
+ "ccteam-harness",
  "chrono",
  "serde",
  "serde_json",
@@ -463,6 +469,7 @@ dependencies = [
  "async-trait",
  "ccteam-core",
  "ccteam-cost",
+ "ccteam-harness",
  "chrono",
  "clap",
  "dirs",

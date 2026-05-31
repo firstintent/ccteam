@@ -321,8 +321,8 @@ impl AdminExecutor {
         // (per-slug attribution is a V0.7 ledger-schema bump) so we
         // report it back in the header for transparency.
         use ccteam_core::advise::{load_budget_ledger, sum_advise_today_by_vendor};
-        use ccteam_core::harness::AgentVendor;
         use ccteam_core::DEFAULT_ADVISE_BUDGET_USD_24H;
+        use ccteam_harness::AgentVendor;
 
         let ledger = load_budget_ledger(&self.ccteam_root).unwrap_or_default();
         // `+ 0.0` normalises negative-zero (Rust's `-0.0` formats as

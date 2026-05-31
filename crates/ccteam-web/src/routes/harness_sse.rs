@@ -119,7 +119,7 @@ fn reconnect_hint(reason: &str) -> Event {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ccteam_core::HarnessSnapshot;
+    use ccteam_harness::HarnessSnapshot;
 
     fn fixture_snapshot() -> HarnessSnapshot {
         HarnessSnapshot {

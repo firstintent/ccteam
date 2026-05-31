@@ -26,13 +26,13 @@ use serial_test::serial;
 use tempfile::TempDir;
 
 use ccteam_core::artifact_watcher::{ArtifactEvent, WatchKind};
-use ccteam_core::harness::{
-    AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, SessionHandle,
-    SpawnCtx, ThreadEvent, ThreadHandle, TurnId, TurnInput,
-};
 use ccteam_core::orchestrator::{Orchestrator, OrchestratorConfig};
 use ccteam_core::workflow::{AgentSpec, Executor, Trigger, WorkflowSpec};
 use ccteam_core::{cost_summary, CcteamPaths};
+use ccteam_harness::{
+    AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, SessionHandle,
+    SpawnCtx, ThreadEvent, ThreadHandle, TurnId, TurnInput,
+};
 use futures::stream::{self, BoxStream};
 
 // =====================================================================
@@ -1527,8 +1527,8 @@ async fn t33_poll_completions_clears_phantom_spawn_from_progress() {
     // Empty jobs dir → state_json_path("dead-job") returns ENOENT
     // → probe_job classifies as Terminal { status: "killed", cost_usd: 0.0 }.
     let jobs_dir = tempfile::tempdir().unwrap();
-    let prev = std::env::var_os(ccteam_core::CLAUDE_JOBS_DIR_ENV);
-    std::env::set_var(ccteam_core::CLAUDE_JOBS_DIR_ENV, jobs_dir.path());
+    let prev = std::env::var_os(ccteam_harness::CLAUDE_JOBS_DIR_ENV);
+    std::env::set_var(ccteam_harness::CLAUDE_JOBS_DIR_ENV, jobs_dir.path());
 
     let (orch, _claude, _codex) = build_orchestrator(paths);
     let spec = watch_spec("fixer", "issues", Some(2));
@@ -1537,8 +1537,8 @@ async fn t33_poll_completions_clears_phantom_spawn_from_progress() {
         .await;
 
     match prev {
-        Some(v) => std::env::set_var(ccteam_core::CLAUDE_JOBS_DIR_ENV, v),
-        None => std::env::remove_var(ccteam_core::CLAUDE_JOBS_DIR_ENV),
+        Some(v) => std::env::set_var(ccteam_harness::CLAUDE_JOBS_DIR_ENV, v),
+        None => std::env::remove_var(ccteam_harness::CLAUDE_JOBS_DIR_ENV),
     }
 
     let events = read_events(&progress);
@@ -1558,7 +1558,7 @@ async fn t34_poll_completions_skips_phantom_pass_when_in_memory_owned() {
     // sid (i.e. we own the session and just haven't observed its
     // state.json transition yet), the phantom-cleanup pass must NOT
     // fire — that would race the genuine `agent_done` write.
-    use ccteam_core::harness::SessionHandle;
+    use ccteam_harness::SessionHandle;
 
     let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_WATCH_FIXER);
     let progress = paths.progress_jsonl(&slug);
@@ -1579,8 +1579,8 @@ async fn t34_poll_completions_skips_phantom_pass_when_in_memory_owned() {
 
     // No state.json file — probe would say "killed" if we ran it.
     let jobs_dir = tempfile::tempdir().unwrap();
-    let prev = std::env::var_os(ccteam_core::CLAUDE_JOBS_DIR_ENV);
-    std::env::set_var(ccteam_core::CLAUDE_JOBS_DIR_ENV, jobs_dir.path());
+    let prev = std::env::var_os(ccteam_harness::CLAUDE_JOBS_DIR_ENV);
+    std::env::set_var(ccteam_harness::CLAUDE_JOBS_DIR_ENV, jobs_dir.path());
 
     let (orch, _claude, _codex) = build_orchestrator(paths);
     let spec = watch_spec("fixer", "issues", Some(2));
@@ -1605,8 +1605,8 @@ async fn t34_poll_completions_skips_phantom_pass_when_in_memory_owned() {
         .await;
 
     match prev {
-        Some(v) => std::env::set_var(ccteam_core::CLAUDE_JOBS_DIR_ENV, v),
-        None => std::env::remove_var(ccteam_core::CLAUDE_JOBS_DIR_ENV),
+        Some(v) => std::env::set_var(ccteam_harness::CLAUDE_JOBS_DIR_ENV, v),
+        None => std::env::remove_var(ccteam_harness::CLAUDE_JOBS_DIR_ENV),
     }
 
     let events = read_events(&progress);
@@ -1630,7 +1630,7 @@ async fn t35_agent_spawn_event_carries_job_id_field() {
     // `job_id` field so the read-side cleanup can locate state.json.
     // The default MockAdapter returns `job_id: None`; use a custom
     // adapter that returns a fixed string and verify it round-trips.
-    use ccteam_core::harness::{
+    use ccteam_harness::{
         AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx,
         ThreadEvent, ThreadHandle, TurnId, TurnInput,
     };
@@ -1751,8 +1751,8 @@ async fn t36_phantom_cleanup_records_cost_in_progress_for_cost_summary() {
         r#"{"state":"failed","cost_usd":1.25,"firstTerminalAt":"2026-05-15T12:00:00Z"}"#,
     )
     .unwrap();
-    let prev = std::env::var_os(ccteam_core::CLAUDE_JOBS_DIR_ENV);
-    std::env::set_var(ccteam_core::CLAUDE_JOBS_DIR_ENV, jobs_dir.path());
+    let prev = std::env::var_os(ccteam_harness::CLAUDE_JOBS_DIR_ENV);
+    std::env::set_var(ccteam_harness::CLAUDE_JOBS_DIR_ENV, jobs_dir.path());
 
     let (orch, _claude, _codex) = build_orchestrator(paths.clone());
     let spec = watch_spec("fixer", "issues", Some(2));
@@ -1761,8 +1761,8 @@ async fn t36_phantom_cleanup_records_cost_in_progress_for_cost_summary() {
         .await;
 
     match prev {
-        Some(v) => std::env::set_var(ccteam_core::CLAUDE_JOBS_DIR_ENV, v),
-        None => std::env::remove_var(ccteam_core::CLAUDE_JOBS_DIR_ENV),
+        Some(v) => std::env::set_var(ccteam_harness::CLAUDE_JOBS_DIR_ENV, v),
+        None => std::env::remove_var(ccteam_harness::CLAUDE_JOBS_DIR_ENV),
     }
 
     let events = read_events(&progress);
@@ -1807,8 +1807,8 @@ fn human_approval_watch_spec(
 /// adapter whose `submit_turn` appends a `cost-budget.json` row.
 #[tokio::test]
 async fn t30b_f173_pick_adapter_codex_chat_returns_codex_vendor() {
-    use ccteam_core::harness::AgentVendor;
     use ccteam_core::workflow::WorkflowMode;
+    use ccteam_harness::AgentVendor;
     let (_pr, _cr, _pdir, paths, _progress, _slug) = make_project(YAML_WATCH_FIXER);
     let (orch, _claude_mock, _codex_mock) = build_orchestrator(paths);
     let picked = orch

@@ -48,12 +48,12 @@ use ccteam_harness::{default_backend, MuxSessionId, MuxSessionKind, MuxSessionSp
 use chrono::Utc;
 use futures::stream::{self, BoxStream};
 
-use crate::harness::{
+use crate::tmux::session_name_for_slug;
+use ccteam_harness::{
     parse_backgrounded_short_id, parse_pid_from_state, sigterm_pid, state_json_path,
     AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx,
     ThreadEvent, ThreadHandle, TurnId, TurnInput, CLAUDE_BIN_ENV,
 };
-use crate::tmux::session_name_for_slug;
 
 /// Env flag that opts mode-2 bg spawns into the W3 foreground-in-mux
 /// path. Unset / any value other than `"1"` keeps the legacy

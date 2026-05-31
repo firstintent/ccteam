@@ -8,7 +8,7 @@
 //! dispatcher's own unit tests live alongside it in
 //! `ccteam-cli/src/mcp_chat_tools.rs`.
 
-use ccteam_core::harness::AgentVendor;
+use ccteam_harness::AgentVendor;
 use ccteam_im::{
     bot_heartbeat_path_in, bot_running_status_in, last_turn_at, list_bots_in,
     register_bot_checked_in, register_bot_in, registration_path_in, touch_bot_heartbeat_in,

@@ -48,8 +48,8 @@ use serde_json::{json, Value};
 
 use ccteam_core::agent_naming::pick_unused_bot_name;
 use ccteam_core::execution::turns_mirror::{read_all_turns, TurnRecord};
-use ccteam_core::harness::AgentVendor;
 use ccteam_core::paths::CcteamPaths;
+use ccteam_harness::AgentVendor;
 use ccteam_im::inbound::{render_envelope, InboxEnvelope};
 use ccteam_im::{
     bot_running_status_in, chat_inbox_dir, chat_reset_signal_path, last_turn_at, list_bots_in,
@@ -202,7 +202,7 @@ fn lookup_or_synthesize_reg(
         // Vendor / im_platform / im_chat_id are unused on the
         // path-resolution code paths; we still need *some* values to
         // build the struct.
-        vendor: ccteam_core::harness::AgentVendor::Claude,
+        vendor: ccteam_harness::AgentVendor::Claude,
         persona_id: None,
         im_platform: "mcp".to_string(),
         im_chat_id: "0".to_string(),
@@ -417,7 +417,7 @@ pub(crate) fn dispatch_list_bots(paths: &CcteamPaths, args: &Value) -> Result<St
             let running = bot_running_status_in(&paths.root, &reg.workflow_slug, &reg.role);
             let last = last_turn_at(&paths.projects_root, &reg).map(|dt| dt.to_rfc3339());
             // vendor is serialized via AgentVendor's `rename_all = "lowercase"`
-            // — see ccteam_core::harness::AgentVendor — so the wire shape is
+            // — see ccteam_harness::AgentVendor — so the wire shape is
             // guaranteed `"claude"` / `"codex"` (Bug A防线).
             json!({
                 "workflow_slug": reg.workflow_slug,

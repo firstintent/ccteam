@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use ccteam_core::harness::AgentVendor;
+use ccteam_harness::AgentVendor;
 use ccteam_im::inbound::{DefaultMailboxResolver, MailboxResolver};
 use ccteam_im::supervisor::{bot_dir, bot_dir_with_config};
 use ccteam_im::{

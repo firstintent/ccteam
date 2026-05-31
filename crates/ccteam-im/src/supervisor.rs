@@ -36,7 +36,7 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use ccteam_core::execution::turns_mirror::{self, TurnRecord};
-use ccteam_core::harness::{
+use ccteam_harness::{
     AgentSpecBrief, HarnessAdapter, MarkerReporter, SpawnCtx, ThreadEvent, ThreadHandle,
     ThreadItemDetails, TurnId, TurnInput,
 };
@@ -1060,8 +1060,8 @@ impl BotSupervisor {
         let slug = self.reg.workflow_slug.clone();
         let role = self.reg.role.clone();
         let vendor = match self.reg.vendor {
-            ccteam_core::harness::AgentVendor::Claude => "claude",
-            ccteam_core::harness::AgentVendor::Codex => "codex",
+            ccteam_harness::AgentVendor::Claude => "claude",
+            ccteam_harness::AgentVendor::Codex => "codex",
         }
         .to_string();
         // V0.6.1 fast-path — clone the **Arc** so the task can lock-read
@@ -1685,9 +1685,7 @@ impl MarkerReporter for BotSupervisor {
 mod bot_supervisor_tests {
     use super::*;
     use async_trait::async_trait;
-    use ccteam_core::harness::{
-        AgentVendor, ExecutionMode, HarnessError, ThreadEvent, ThreadHandle,
-    };
+    use ccteam_harness::{AgentVendor, ExecutionMode, HarnessError, ThreadEvent, ThreadHandle};
     use futures::stream::BoxStream;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
@@ -1941,7 +1939,7 @@ mod bot_supervisor_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ccteam_core::harness::{AgentVendor, ExecutionMode, ThreadHandle};
+    use ccteam_harness::{AgentVendor, ExecutionMode, ThreadHandle};
     use chrono::Utc;
     use tempfile::TempDir;
 

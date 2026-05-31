@@ -7,7 +7,7 @@ use ccteam_core::execution::transcript_tail::{
     cursor_path, encode_project_cwd, parse_transcript_line, read_new, PendingTools,
     TranscriptCursor,
 };
-use ccteam_core::harness::{ThreadEvent, ThreadItemDetails};
+use ccteam_harness::{ThreadEvent, ThreadItemDetails};
 use serde_json::json;
 use tempfile::TempDir;
 

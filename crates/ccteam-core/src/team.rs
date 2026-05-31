@@ -356,9 +356,9 @@ impl Default for CostPolicy {
 }
 
 /// V0.3.1 F47 — which LLM harness backs a session. Mapped 1:1 to
-/// `crate::harness::HarnessAdapter` impls; `Claude` →
-/// [`crate::harness::ClaudeCodeAdapter`], `Codex` →
-/// [`crate::harness::CodexAdapter`] (stub, V0.3.2 fills it). The serde
+/// `ccteam_harness::HarnessAdapter` impls; `Claude` →
+/// [`ccteam_harness::ClaudeCodeAdapter`], `Codex` →
+/// [`ccteam_harness::CodexAdapter`] (stub, V0.3.2 fills it). The serde
 /// rename is `lowercase` so `team.yaml` stays user-readable
 /// (`harness: claude` / `harness: codex`) without mentioning the
 /// internal `claude-code` adapter name.
@@ -366,14 +366,14 @@ impl Default for CostPolicy {
 #[serde(rename_all = "lowercase")]
 pub enum HarnessKind {
     /// Anthropic's Claude Code TUI — V0.3.1 default + only fully
-    /// supported harness. Backed by [`crate::harness::ClaudeCodeAdapter`].
+    /// supported harness. Backed by [`ccteam_harness::ClaudeCodeAdapter`].
     /// `#[default]` because Claude Code is the only real harness in
     /// V0.3.1; F48 PR adds the `kind: flex` team layer that consumes
     /// this default; F49 fills the master state.json::sessions wiring.
     #[default]
     Claude,
     /// OpenAI's `codex` CLI. V0.3.1 ships the trait stub
-    /// ([`crate::harness::CodexAdapter`]); real spawn / ingest /
+    /// ([`ccteam_harness::CodexAdapter`]); real spawn / ingest /
     /// shutdown lands in V0.3.2 (PRD §F47, see also
     /// `docs/research/ccteam-codex-integration.md`).
     Codex,

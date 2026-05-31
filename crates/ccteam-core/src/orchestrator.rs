@@ -34,10 +34,6 @@ use crate::artifact_watcher::{ArtifactEvent, ArtifactWatcher};
 use crate::daemon;
 use crate::execution::{ClaudeBgAdapter, ClaudeTuiAdapter, CodexExecAdapter};
 use crate::handoff;
-use crate::harness::{
-    AgentSpecBrief, AgentVendor, HarnessAdapter, SessionHandle, SpawnCtx, ThreadEvent,
-    UnifiedTokenUsage,
-};
 use crate::inbox::{InboxMessage, SessionMailbox};
 use crate::paths::CcteamPaths;
 use crate::preferences;
@@ -46,6 +42,10 @@ use crate::queries;
 use crate::spawn_brief::{render_spawn_brief, SpawnContext as SpawnBriefContext};
 use crate::workflow::{AgentSpec, Executor, Trigger, WorkflowError, WorkflowMode, WorkflowSpec};
 use crate::workflow_watcher::{WorkflowFileEvent, WorkflowFileWatcher};
+use ccteam_harness::{
+    AgentSpecBrief, AgentVendor, HarnessAdapter, SessionHandle, SpawnCtx, ThreadEvent,
+    UnifiedTokenUsage,
+};
 
 /// Hard cap on concurrent project sessions (excluding the meta-agent).
 pub const MAX_CONCURRENT_PROJECTS: usize = 3;
@@ -3093,7 +3093,7 @@ impl Orchestrator {
         // the F80 stale-spawn fallback (which does honor the env) ever
         // detected completions. F120 host-probe surfaced this split.
         let id = handle.job_id.as_deref().unwrap_or("__no_job_id__");
-        if let Ok(custom) = std::env::var(crate::harness::CLAUDE_JOBS_DIR_ENV) {
+        if let Ok(custom) = std::env::var(ccteam_harness::CLAUDE_JOBS_DIR_ENV) {
             return PathBuf::from(custom).join(id).join("state.json");
         }
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));

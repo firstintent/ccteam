@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use ccteam_core::execution::claude_tui::{
     chat_session_name, ensure_chat_hooks_installed, ClaudeTuiAdapter,
 };
-use ccteam_core::harness::{
+use ccteam_harness::{
     AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, SpawnCtx, ThreadHandle, TurnInput,
     CLAUDE_BIN_ENV,
 };

@@ -14,10 +14,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use ccteam_core::execution::claude_tui::{chat_session_name, ClaudeTuiAdapter};
-use ccteam_core::harness::{
+use ccteam_core::tmux::TmuxSession;
+use ccteam_harness::{
     AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, SpawnCtx, CLAUDE_BIN_ENV,
 };
-use ccteam_core::tmux::TmuxSession;
 use serial_test::serial;
 
 // ---------------------------------------------------------------------------

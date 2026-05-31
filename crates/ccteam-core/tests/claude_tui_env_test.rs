@@ -17,7 +17,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use ccteam_core::execution::claude_tui::{chat_session_name, ClaudeTuiAdapter};
-use ccteam_core::harness::{AgentSpecBrief, HarnessAdapter, SpawnCtx, CLAUDE_BIN_ENV};
+use ccteam_harness::{AgentSpecBrief, HarnessAdapter, SpawnCtx, CLAUDE_BIN_ENV};
 use serial_test::serial;
 
 fn kill_session_quiet(name: &str) {

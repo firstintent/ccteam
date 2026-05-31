@@ -37,9 +37,8 @@ pub mod config;
 // V0.6.3 F142 — `trigger: schedule` cron evaluation (5-field, skip-missed).
 pub mod cron;
 pub mod daemon;
-pub mod harness;
-// V0.6.0 F107 — adapter implementations behind the new HarnessAdapter
-// trait (claude_bg / claude_tui stub / codex_exec).
+// V0.6.0 F107 — adapter implementations behind the HarnessAdapter trait
+// now live in ccteam-harness; concrete execution adapters move next.
 pub mod execution;
 // V0.6.0 F115 — agent handoff doc mechanism (`.ccteam/handoffs/`).
 pub mod handoff;
@@ -144,15 +143,9 @@ pub use daemon::{
     write_heartbeat, write_pidfile, DaemonHealth, HEARTBEAT_GRACE, HEARTBEAT_INTERVAL,
     HEARTBEAT_NAME, PIDFILE_NAME,
 };
-pub use harness::{
-    parse_cc_state_json, parse_pid_from_state, sigkill_pid, state_json_path, AgentSpecBrief,
-    AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, HarnessSnapshot, SessionHandle,
-    SpawnCtx, SpawnOpts, SubagentState, ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadItem,
-    ThreadItemDetails, TurnId, TurnInput, CLAUDE_BIN_ENV, CLAUDE_JOBS_DIR_ENV, CODEX_STATUS_MARKER,
-    CODEX_STATUS_TAIL_LINES, DEFAULT_CLAUDE_SID,
-};
-// `UnifiedTokenUsage` re-exported below via `ccteam_cost::{..., UnifiedTokenUsage as Usage}`
-// — the canonical home is the ccteam-cost crate (V0.6.0 F107).
+// HarnessAdapter and its cross-vendor types live in ccteam-harness.
+// `UnifiedTokenUsage` is still re-exported below via
+// `ccteam_cost::{..., UnifiedTokenUsage as Usage}`.
 // V0.6.0 F107 — adapter impls. Public so consumers (orchestrator,
 // `ccteam-cli` commands) can wire them by concrete type when needed.
 pub use execution::{ClaudeBgAdapter, ClaudeTuiAdapter, CodexExecAdapter};

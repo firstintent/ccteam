@@ -27,7 +27,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
 use ccteam_core::execution::{ClaudeTuiAdapter, CodexExecAdapter};
-use ccteam_core::harness::{AgentVendor, HarnessAdapter};
+use ccteam_harness::{AgentVendor, HarnessAdapter};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::acl::AclPolicy;
@@ -1761,7 +1761,7 @@ pub fn _link_check(_c: &Credentials) {}
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use ccteam_core::harness::{
+    use ccteam_harness::{
         AgentSpecBrief, ExecutionMode, HarnessError, SpawnCtx, ThreadEvent, ThreadHandle, TurnId,
         TurnInput,
     };

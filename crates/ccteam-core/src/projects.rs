@@ -606,7 +606,7 @@ pub fn refuses_active_session(
     // shouldn't block removal of this project).
     let project_dir = paths.project_dir(slug);
     let canon_project = std::fs::canonicalize(&project_dir).unwrap_or(project_dir.clone());
-    let jobs_dir = std::env::var_os(crate::harness::CLAUDE_JOBS_DIR_ENV)
+    let jobs_dir = std::env::var_os(ccteam_harness::CLAUDE_JOBS_DIR_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             dirs::home_dir()

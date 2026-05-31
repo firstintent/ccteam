@@ -31,6 +31,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use futures::Stream;
 
+pub mod adapter;
 pub mod daemon;
 pub mod enriched_event;
 pub mod hook_sink;
@@ -41,6 +42,15 @@ pub mod tmux_backend;
 pub mod tmux_ops;
 pub mod typed_event_tap;
 
+pub use adapter::{
+    parse_backgrounded_short_id, parse_cc_state_json, parse_pid_from_state, pluck, pluck_f64,
+    pluck_pct, pluck_str, sigkill_pid, sigterm_pid, state_json_path, AgentSpecBrief, AgentVendor,
+    ApprovalIR, ApprovalKind, ApprovalRisk, ApprovalScope, CanonicalEvent, ExecutionMode,
+    HarnessAdapter, HarnessError, HarnessSnapshot, MarkerReporter, SessionHandle, SpawnCtx,
+    SpawnOpts, SubagentState, ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadItem,
+    ThreadItemDetails, TurnId, TurnInput, UnifiedTokenUsage, CLAUDE_BIN_ENV, CLAUDE_JOBS_DIR_ENV,
+    CODEX_STATUS_MARKER, CODEX_STATUS_TAIL_LINES, DEFAULT_CLAUDE_SID,
+};
 pub use enriched_event::{
     enrichment_source, BaseEvent, BasePayload, EnrichedEvent, EnrichmentEvent, EnrichmentPayload,
     EnrichmentSource, EventKind, EventMerger, MergeOutcome, Vendor, DEFAULT_GRACE,

@@ -42,7 +42,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use ccteam_core::HarnessSnapshot;
+use ccteam_harness::HarnessSnapshot;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde_json::Value;
 use tokio::sync::broadcast;
@@ -559,7 +559,7 @@ fn publish_harness_snapshot(
 
 /// Split a harness file stem into `(slug, sid)`.
 ///
-/// Match rules (mirrors the writer in `ccteam_core::harness`):
+/// Match rules (mirrors the writer in `ccteam_harness`):
 /// - `_meta-<handle>` → `("_meta-<handle>", "default")` (meta-agent project,
 ///   single session, no real sid)
 /// - `<slug>-<claude|codex>-N` → `(<slug>, <claude|codex>-N)`

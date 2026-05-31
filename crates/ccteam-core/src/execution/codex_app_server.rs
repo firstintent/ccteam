@@ -51,13 +51,13 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 use crate::execution::codex_jsonrpc::{CodexJsonRpcClient, Notification};
-use crate::harness::{
+use crate::paths::CcteamPaths;
+use crate::progress::append_event;
+use ccteam_harness::{
     AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx,
     ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails, TurnId, TurnInput,
     UnifiedTokenUsage,
 };
-use crate::paths::CcteamPaths;
-use crate::progress::append_event;
 
 /// Env override for the UDS path the adapter dials. Tests set this to
 /// a tempdir socket; production resolves
@@ -65,7 +65,7 @@ use crate::progress::append_event;
 pub const APP_SERVER_SOCKET_ENV: &str = "CCTEAM_CODEX_APP_SERVER_SOCKET";
 
 /// Env override for the codex binary used when spawning the daemon
-/// (parity with `claude_bg`'s [`crate::harness::CLAUDE_BIN_ENV`]). Tests
+/// (parity with `claude_bg`'s [`ccteam_harness::CLAUDE_BIN_ENV`]). Tests
 /// point this at a fake script that creates the socket without booting
 /// real codex.
 pub const CODEX_BIN_ENV: &str = "CCTEAM_CODEX_BIN";

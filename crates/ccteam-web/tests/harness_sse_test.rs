@@ -14,7 +14,8 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use ccteam_core::{CcteamPaths, HarnessSnapshot};
+use ccteam_core::CcteamPaths;
+use ccteam_harness::HarnessSnapshot;
 use ccteam_web::{router_with_state, AppState, HarnessSnapshotEvent};
 use tempfile::TempDir;
 use tokio::io::AsyncBufReadExt;

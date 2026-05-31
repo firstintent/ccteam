@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use ccteam_core::execution::claude_tui::ClaudeTuiAdapter;
 use ccteam_core::execution::transcript_tail::{active_session_id_path, encode_project_cwd};
-use ccteam_core::harness::{
+use ccteam_harness::{
     AgentVendor, ExecutionMode, HarnessAdapter, ThreadEvent, ThreadHandle, ThreadItemDetails,
 };
 use futures::StreamExt;

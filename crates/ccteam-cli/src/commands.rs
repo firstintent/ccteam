@@ -1015,7 +1015,8 @@ fn spawn_agent_team_lead(
     teammate_mode: &str,
 ) -> Result<String> {
     let project_dir = paths.project_dir(slug);
-    let bin = std::env::var(ccteam_core::CLAUDE_BIN_ENV).unwrap_or_else(|_| "claude".to_string());
+    let bin =
+        std::env::var(ccteam_harness::CLAUDE_BIN_ENV).unwrap_or_else(|_| "claude".to_string());
     let mut cmd = Command::new(&bin);
     cmd.arg("--bg")
         .arg("--agent")
@@ -1065,7 +1066,7 @@ fn spawn_agent_team_lead(
 }
 
 /// V0.5.0 F93b — duplicated locally from
-/// `ccteam_core::harness::parse_backgrounded_short_id` because that
+/// `ccteam_harness::parse_backgrounded_short_id` because that
 /// fn is `pub(crate)`. The format is "backgrounded · <id>" on the
 /// first non-empty line.
 fn parse_backgrounded_short_id(stdout: &str) -> Option<String> {
@@ -1230,10 +1231,10 @@ fn force_kill_lead(
     report: &mut String,
 ) -> Result<()> {
     if let Some(id) = lead_id {
-        let state_path = ccteam_core::state_json_path(id);
+        let state_path = ccteam_harness::state_json_path(id);
         match std::fs::read_to_string(&state_path) {
-            Ok(raw) => match ccteam_core::parse_pid_from_state(&raw) {
-                Some(pid) => match ccteam_core::sigkill_pid(pid) {
+            Ok(raw) => match ccteam_harness::parse_pid_from_state(&raw) {
+                Some(pid) => match ccteam_harness::sigkill_pid(pid) {
                     Ok(()) => {
                         report.push_str(&format!("  ✓ SIGKILL pid {pid} (lead bg job {id})\n",))
                     }
@@ -1931,9 +1932,9 @@ pub fn run_resume(paths: &CcteamPaths, slug: &str) -> Result<()> {
 /// still uses tmux + `codex` CLI.
 pub fn run_session_add(slug: &str, harness: ccteam_core::HarnessKind, role: String) -> Result<()> {
     use ccteam_core::{
-        harness_sid_prefix, AgentSpecBrief, ClaudeBgAdapter, CodexExecAdapter, HarnessAdapter,
-        HarnessKind, SessionHandle, SessionRecord, SpawnCtx, TeamKind,
+        harness_sid_prefix, ClaudeBgAdapter, CodexExecAdapter, HarnessKind, SessionRecord, TeamKind,
     };
+    use ccteam_harness::{AgentSpecBrief, HarnessAdapter, SessionHandle, SpawnCtx};
 
     let paths = CcteamPaths::from_env()?;
     let state_path = paths.project_state(slug);
@@ -2098,9 +2099,8 @@ pub fn run_session_attach(slug: &str, sid: &str) -> Result<()> {
 /// Gracefully shut down one registered flex session and scrub it from
 /// `state.json::sessions[]`.
 pub fn run_session_rm(slug: &str, sid: &str) -> Result<()> {
-    use ccteam_core::{
-        AgentVendor, ClaudeBgAdapter, CodexExecAdapter, ExecutionMode, HarnessAdapter, ThreadHandle,
-    };
+    use ccteam_core::{ClaudeBgAdapter, CodexExecAdapter};
+    use ccteam_harness::{AgentVendor, ExecutionMode, HarnessAdapter, ThreadHandle};
 
     let paths = CcteamPaths::from_env()?;
     let state_path = paths.project_state(slug);
@@ -3471,8 +3471,8 @@ pub fn compute_cost_orphan(paths: &CcteamPaths) -> (CostOrphanCounts, Vec<String
                 continue;
             }
             let key = match sample.vendor {
-                ccteam_core::harness::AgentVendor::Claude => CostVendor::Claude,
-                ccteam_core::harness::AgentVendor::Codex => CostVendor::Codex,
+                ccteam_harness::AgentVendor::Claude => CostVendor::Claude,
+                ccteam_harness::AgentVendor::Codex => CostVendor::Codex,
             };
             *counts.ledger_rows.entry(key).or_insert(0) += 1;
         }
@@ -3509,7 +3509,7 @@ pub struct CostOrphanCounts {
 }
 
 /// V0.6.6 F173 — vendor enum mirror used by the cost-orphan check.
-/// Mirrors `ccteam_core::harness::AgentVendor` but lives in the cli
+/// Mirrors `ccteam_harness::AgentVendor` but lives in the cli
 /// crate so the report rendering layer doesn't leak the core enum
 /// through its public surface. `Hash + Eq` for `HashMap` keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -4718,7 +4718,7 @@ pub fn run_admin_register_bot(
     chat_handle_in: Option<&str>,
     project_dir_in: Option<&std::path::Path>,
 ) -> Result<String> {
-    use ccteam_core::harness::AgentVendor;
+    use ccteam_harness::AgentVendor;
     use ccteam_im::{register_bot_checked_in, RegisterOutcome};
 
     // Slug / role share the same validator as the MCP path

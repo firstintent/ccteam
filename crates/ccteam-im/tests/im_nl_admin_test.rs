@@ -17,7 +17,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ccteam_core::harness::AgentVendor;
+use ccteam_harness::AgentVendor;
 use ccteam_im::acl::AclPolicy;
 use ccteam_im::inbound::{process_inbound_admin_aware, DefaultMailboxResolver, InboundOutcome};
 use ccteam_im::nl_admin::{AdminExecutor, AdminSideEffect};

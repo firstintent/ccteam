@@ -102,7 +102,7 @@ pub fn probe_job(job_id: Option<&str>) -> JobLiveness {
             cost_usd: 0.0,
         };
     };
-    let path = crate::harness::state_json_path(id);
+    let path = ccteam_harness::state_json_path(id);
     probe_state_json(&path)
 }
 
@@ -309,7 +309,7 @@ pub fn reset_link_scan_warn_for_tests() {
 /// re-export of `harness::state_json_path` so call sites that want to
 /// log the path don't need to import `harness` directly.
 pub fn job_state_path(job_id: &str) -> PathBuf {
-    crate::harness::state_json_path(job_id)
+    ccteam_harness::state_json_path(job_id)
 }
 
 // V0.4.6 F85 — `~/.claude/jobs/` GC.
@@ -589,7 +589,7 @@ fn dir_mtime_utc(path: &Path) -> Option<chrono::DateTime<chrono::Utc>> {
 /// [`gc_terminated_jobs`] is exposed so test code (and any future GC
 /// caller wanting a custom path) can target a tempdir directly.
 pub fn gc_user_claude_jobs(retention_days: u32, dry_run: bool) -> Result<GcReport> {
-    let base = std::env::var_os(crate::harness::CLAUDE_JOBS_DIR_ENV)
+    let base = std::env::var_os(ccteam_harness::CLAUDE_JOBS_DIR_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             dirs::home_dir()

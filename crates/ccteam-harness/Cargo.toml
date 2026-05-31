@@ -15,16 +15,23 @@ rmux-client = { workspace = true }
 rmux-server = { workspace = true }
 rmux-proto = { workspace = true }
 
+ccteam-cost.workspace = true
+
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+chrono = { workspace = true }
+dirs = { workspace = true }
 futures = { workspace = true }
 regex = { workspace = true }
 # V0.8 W6 — hook_sink frames a typed `HookEvent` as length-prefixed
 # JSON over the ccteam-owned hook.sock (Option C).
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+
+libc = "0.2"
 
 # W2b — the refcounted `tmux pipe-pane` FIFO relay ported out of
 # `ccteam-web::pty` needs `mkfifo` + a 0600 `Mode`. `fs` is the only

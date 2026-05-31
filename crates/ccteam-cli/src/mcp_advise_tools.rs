@@ -25,8 +25,8 @@ use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
 use ccteam_core::advise;
-use ccteam_core::harness::AgentVendor;
 use ccteam_core::paths::CcteamPaths;
+use ccteam_harness::AgentVendor;
 
 /// Tool definitions for the 2 advise tools. Merged into the top-level
 /// `tool_definitions()` in `mcp_serve.rs`.
@@ -288,7 +288,7 @@ mod tests {
         for _ in 0..30 {
             ccteam_core::advise::append_budget_sample(
                 &root,
-                ccteam_core::harness::AgentVendor::Claude,
+                ccteam_harness::AgentVendor::Claude,
                 0.10,
             )
             .unwrap();
@@ -359,7 +359,7 @@ mod tests {
         for _ in 0..30 {
             ccteam_core::advise::append_budget_sample(
                 &root,
-                ccteam_core::harness::AgentVendor::Claude,
+                ccteam_harness::AgentVendor::Claude,
                 0.10,
             )
             .unwrap();

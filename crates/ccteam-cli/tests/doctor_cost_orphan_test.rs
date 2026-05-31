@@ -15,8 +15,8 @@
 use ccteam_core::advise::{
     append_budget_ledger_row, budget_ledger_path, AdviseBudgetLedger, BudgetSample,
 };
-use ccteam_core::harness::AgentVendor;
 use ccteam_core::state::ProjectState;
+use ccteam_harness::AgentVendor;
 use chrono::Utc;
 use serde_json::json;
 use std::path::{Path, PathBuf};

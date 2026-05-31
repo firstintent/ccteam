@@ -1,4 +1,4 @@
-//! V0.6.0 F107 — `HarnessAdapter` trait migration (Option C).
+//! Harness adapter API shared by Claude/Codex execution adapters.
 //!
 //! ## What this file owns
 //!
@@ -209,6 +209,56 @@ pub enum ThreadEvent {
     Error(ThreadErrorEvent),
 }
 
+/// v8.1 neutral event name. This is intentionally an alias for the
+/// established adapter event schema while downstream code is still
+/// named around `ThreadEvent`.
+pub type CanonicalEvent = ThreadEvent;
+
+/// Vendor-neutral approval request placeholder.
+///
+/// v8.1 runs agent processes with skip-permissions and does not produce
+/// or resolve approvals. The type lives here so future Claude hook and
+/// Codex app-server approval surfaces can share one IM-facing shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalIR {
+    pub req_id: String,
+    pub vendor: AgentVendor,
+    pub kind: ApprovalKind,
+    pub risk: ApprovalRisk,
+    pub scope: ApprovalScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub raw: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalKind {
+    Command,
+    FileChange,
+    Permission,
+    Question,
+    ToolUse,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalRisk {
+    Low,
+    Medium,
+    High,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalScope {
+    Once,
+    Session,
+    Always,
+}
+
 /// Per-turn item the adapter emits (one or more per turn). Mirrors
 /// Codex `ThreadItem`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -277,7 +327,7 @@ pub struct SpawnCtx {
 /// V0.6.0 F107 — canonical [`UnifiedTokenUsage`] lives in `ccteam-cost`
 /// (`crates/ccteam-cost/src/pricing.rs`) so cost / pricing logic and
 /// vendor accounting stay in one crate. Re-exported here so trait users
-/// can `use ccteam_core::harness::UnifiedTokenUsage` without depending
+/// can `use ccteam_harness::UnifiedTokenUsage` without depending
 /// on `ccteam-cost` directly.
 pub use ccteam_cost::UnifiedTokenUsage;
 
@@ -672,10 +722,7 @@ pub fn sigkill_pid(pid: i32) -> std::io::Result<()> {
 // Plucker helpers — tolerant of missing / mistyped fields
 // =====================================================================
 
-pub(crate) fn pluck<'a>(
-    value: &'a serde_json::Value,
-    path: &[&str],
-) -> Option<&'a serde_json::Value> {
+pub fn pluck<'a>(value: &'a serde_json::Value, path: &[&str]) -> Option<&'a serde_json::Value> {
     let mut cursor = value;
     for key in path {
         cursor = cursor.get(*key)?;
@@ -683,17 +730,17 @@ pub(crate) fn pluck<'a>(
     Some(cursor)
 }
 
-pub(crate) fn pluck_str(value: &serde_json::Value, path: &[&str]) -> Option<String> {
+pub fn pluck_str(value: &serde_json::Value, path: &[&str]) -> Option<String> {
     pluck(value, path)
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
 }
 
-pub(crate) fn pluck_f64(value: &serde_json::Value, path: &[&str]) -> Option<f64> {
+pub fn pluck_f64(value: &serde_json::Value, path: &[&str]) -> Option<f64> {
     pluck(value, path).and_then(|v| v.as_f64())
 }
 
-pub(crate) fn pluck_pct(value: &serde_json::Value, path: &[&str]) -> Option<u8> {
+pub fn pluck_pct(value: &serde_json::Value, path: &[&str]) -> Option<u8> {
     pluck(value, path).and_then(|v| {
         v.as_u64()
             .map(|n| n.min(100) as u8)

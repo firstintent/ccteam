@@ -40,8 +40,8 @@ use std::path::{Path, PathBuf};
 use ccteam_core::execution::claude_tui::{
     chat_session_id_name, chat_session_name, ClaudeTuiAdapter,
 };
-use ccteam_core::harness::{AgentSpecBrief, HarnessAdapter, SpawnCtx, CLAUDE_BIN_ENV};
 use ccteam_core::tmux::TmuxSession;
+use ccteam_harness::{AgentSpecBrief, HarnessAdapter, SpawnCtx, CLAUDE_BIN_ENV};
 use serial_test::serial;
 
 // ---------------------------------------------------------------------------

@@ -1,5 +1,5 @@
 //! V0.6.0 F107 — adapter implementations behind the new
-//! [`crate::harness::HarnessAdapter`] trait.
+//! [`ccteam_harness::HarnessAdapter`] trait.
 //!
 //! - [`claude_bg`] — V0.5.x `ClaudeCodeAdapter` renamed +
 //!   migrated to the 5-method trait shape. Zero behaviour change vs.

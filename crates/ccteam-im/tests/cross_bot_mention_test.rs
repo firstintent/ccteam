@@ -25,7 +25,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use ccteam_core::harness::AgentVendor;
+use ccteam_harness::AgentVendor;
 use ccteam_im::bot_mpsc::{bot_key, BotChannelMap, BotChannels, InboxItem, OutboundItem};
 use ccteam_im::daemon::{dispatch_cross_bot_mention, CrossBotDispatch};
 use ccteam_im::outbound::OutboundCursor;

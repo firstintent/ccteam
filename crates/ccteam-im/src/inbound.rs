@@ -6,7 +6,7 @@
 //! router, and the per-bot mailbox writer.
 //!
 //! The actual `HarnessAdapter::submit_turn` call is performed by the
-//! daemon's supervisor (it owns the active [`ccteam_core::harness::ThreadHandle`]
+//! daemon's supervisor (it owns the active [`ccteam_harness::ThreadHandle`]
 //! per bot); this module's responsibility ends at writing the
 //! mailbox file the adapter watches.
 
@@ -435,7 +435,7 @@ pub async fn process_inbound(
                     owned_reg = crate::BotRegistration {
                         workflow_slug: slug.clone(),
                         role: role.clone(),
-                        vendor: ccteam_core::harness::AgentVendor::Claude,
+                        vendor: ccteam_harness::AgentVendor::Claude,
                         persona_id: None,
                         im_platform: msg.channel.clone(),
                         im_chat_id: msg.reply_target.clone(),

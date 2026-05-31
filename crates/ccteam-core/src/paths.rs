@@ -144,7 +144,7 @@ impl CcteamPaths {
             let sid = context
                 .sid
                 .as_deref()
-                .unwrap_or(crate::harness::DEFAULT_CLAUDE_SID);
+                .unwrap_or(ccteam_harness::DEFAULT_CLAUDE_SID);
             self.progress_jsonl_for_session(&context.slug, sid)
         } else {
             self.progress_jsonl(&context.slug)

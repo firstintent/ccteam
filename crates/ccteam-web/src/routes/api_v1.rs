@@ -29,8 +29,9 @@ use axum::{
 };
 use ccteam_core::{
     cost_history_buckets, cost_summary, ActiveSessionInfo, ArtifactQueueEntry, CostHistoryBucket,
-    HarnessKind, HarnessSnapshot, ProjectState, TeamKind, WorkflowSummary,
+    HarnessKind, ProjectState, TeamKind, WorkflowSummary,
 };
+use ccteam_harness::HarnessSnapshot;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 

@@ -8,7 +8,7 @@ use ccteam_core::execution::codex_app_server::{
     translate_notification, turn_input_to_items, CodexAppServerAdapter, APP_SERVER_SOCKET_ENV,
 };
 use ccteam_core::execution::codex_jsonrpc::Notification;
-use ccteam_core::harness::{
+use ccteam_harness::{
     AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx,
     ThreadEvent, TurnInput,
 };
@@ -152,7 +152,7 @@ fn translate_item_completed_extracts_file_change_details() {
     let e = translate_notification(&n, "t-1").unwrap();
     match e {
         ThreadEvent::ItemCompleted { item } => match item.details {
-            ccteam_core::harness::ThreadItemDetails::FileChange { path, kind } => {
+            ccteam_harness::ThreadItemDetails::FileChange { path, kind } => {
                 assert_eq!(path, PathBuf::from("/x.rs"));
                 assert_eq!(kind, "update");
             }
@@ -187,7 +187,7 @@ fn translate_command_execution_status_camelcase_folds_to_snake() {
     let e = translate_notification(&n, "t-1").unwrap();
     match e {
         ThreadEvent::ItemStarted { item } => match item.details {
-            ccteam_core::harness::ThreadItemDetails::CommandExecution { cmd, status } => {
+            ccteam_harness::ThreadItemDetails::CommandExecution { cmd, status } => {
                 assert_eq!(cmd, "cargo test");
                 assert_eq!(status, "in_progress", "camelCase status must fold to snake");
             }
@@ -216,7 +216,7 @@ fn translate_file_change_tagged_kind_add() {
     let e = translate_notification(&n, "t-1").unwrap();
     match e {
         ThreadEvent::ItemCompleted { item } => match item.details {
-            ccteam_core::harness::ThreadItemDetails::FileChange { path, kind } => {
+            ccteam_harness::ThreadItemDetails::FileChange { path, kind } => {
                 assert_eq!(path, PathBuf::from("/new.rs"));
                 assert_eq!(
                     kind, "add",
@@ -251,7 +251,7 @@ fn translate_file_change_tagged_kind_update_with_move_is_rename() {
     let e = translate_notification(&n, "t-1").unwrap();
     match e {
         ThreadEvent::ItemCompleted { item } => match item.details {
-            ccteam_core::harness::ThreadItemDetails::FileChange { kind, .. } => {
+            ccteam_harness::ThreadItemDetails::FileChange { kind, .. } => {
                 assert_eq!(kind, "rename", "update + movePath must surface as rename");
             }
             other => panic!("expected FileChange, got {other:?}"),
@@ -276,7 +276,7 @@ fn translate_file_change_tagged_kind_delete() {
     let e = translate_notification(&n, "t-1").unwrap();
     match e {
         ThreadEvent::ItemCompleted { item } => match item.details {
-            ccteam_core::harness::ThreadItemDetails::FileChange { kind, .. } => {
+            ccteam_harness::ThreadItemDetails::FileChange { kind, .. } => {
                 assert_eq!(kind, "delete");
             }
             other => panic!("expected FileChange, got {other:?}"),

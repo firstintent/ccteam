@@ -1137,7 +1137,7 @@ struct SessionProbe {
 }
 
 fn probe_active_session_state(job_id: &str) -> SessionProbe {
-    let path = crate::harness::state_json_path(job_id);
+    let path = ccteam_harness::state_json_path(job_id);
     let Ok(raw) = std::fs::read_to_string(&path) else {
         return SessionProbe::default();
     };
@@ -1315,7 +1315,7 @@ fn last_usage_in_jsonl(path: &std::path::Path) -> Option<UsageTokens> {
 /// `FailureInspector` then surfaces a "no log available" hint.
 pub fn job_log_tail(job_id: &str, tail_lines: u32) -> Result<(String, u64)> {
     let n = tail_lines.clamp(1, 5000) as usize;
-    let state_path = crate::harness::state_json_path(job_id);
+    let state_path = ccteam_harness::state_json_path(job_id);
     // output.log lives in the same job dir as state.json. state_json_path
     // returns `<base>/<job_id>/state.json`; replace the filename.
     let Some(job_dir) = state_path.parent() else {

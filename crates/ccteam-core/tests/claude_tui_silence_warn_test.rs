@@ -80,7 +80,7 @@ impl Subscriber for WarnCapture {
 #[serial]
 async fn tail_loop_warns_once_when_marker_missing_for_threshold() {
     use ccteam_core::execution::claude_tui::ClaudeTuiAdapter;
-    use ccteam_core::harness::{AgentVendor, ExecutionMode, HarnessAdapter, ThreadHandle};
+    use ccteam_harness::{AgentVendor, ExecutionMode, HarnessAdapter, ThreadHandle};
     use chrono::Utc;
     use serde_json::json;
 

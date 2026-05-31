@@ -23,15 +23,15 @@ use serde_json::Value;
 use tempfile::TempDir;
 
 use ccteam_core::artifact_watcher::{ArtifactEvent, WatchKind};
-use ccteam_core::harness::{
-    AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx,
-    ThreadEvent, ThreadHandle, TurnId, TurnInput,
-};
 use ccteam_core::orchestrator::{Orchestrator, OrchestratorConfig};
 use ccteam_core::workflow::{
     AgentSpec, Executor, SquadSpec, Trigger, WorkflowSpec, SQUAD_ROUTE_SENTINEL,
 };
 use ccteam_core::CcteamPaths;
+use ccteam_harness::{
+    AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx,
+    ThreadEvent, ThreadHandle, TurnId, TurnInput,
+};
 use futures::stream::{self, BoxStream};
 
 // =====================================================================

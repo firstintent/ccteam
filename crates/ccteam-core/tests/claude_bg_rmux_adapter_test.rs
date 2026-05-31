@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use ccteam_core::execution::ClaudeBgAdapter;
-use ccteam_core::harness::{
+use ccteam_harness::{
     AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, SpawnCtx, CLAUDE_BIN_ENV,
 };
 

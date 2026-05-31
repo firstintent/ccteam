@@ -305,14 +305,14 @@ agents:
     std::fs::write(issues_dir.join("b.md"), "b").unwrap();
     std::fs::write(fixes_dir.join("z.md"), "z").unwrap();
 
-    let prev = std::env::var_os(ccteam_core::CLAUDE_JOBS_DIR_ENV);
-    std::env::set_var(ccteam_core::CLAUDE_JOBS_DIR_ENV, &jobs_dir);
+    let prev = std::env::var_os(ccteam_harness::CLAUDE_JOBS_DIR_ENV);
+    std::env::set_var(ccteam_harness::CLAUDE_JOBS_DIR_ENV, &jobs_dir);
 
     let summary = workflow_summary(slug, &paths).unwrap();
 
     match prev {
-        Some(v) => std::env::set_var(ccteam_core::CLAUDE_JOBS_DIR_ENV, v),
-        None => std::env::remove_var(ccteam_core::CLAUDE_JOBS_DIR_ENV),
+        Some(v) => std::env::set_var(ccteam_harness::CLAUDE_JOBS_DIR_ENV, v),
+        None => std::env::remove_var(ccteam_harness::CLAUDE_JOBS_DIR_ENV),
     }
 
     assert_eq!(summary.workflow_name, "watcher");
@@ -609,8 +609,8 @@ fn t15_workflow_summary_phantom_drop_via_real_state_json() {
     );
     // `dead-1` job has no state.json at all (= SIGKILL casualty).
 
-    let prev = std::env::var_os(ccteam_core::CLAUDE_JOBS_DIR_ENV);
-    std::env::set_var(ccteam_core::CLAUDE_JOBS_DIR_ENV, &jobs_dir);
+    let prev = std::env::var_os(ccteam_harness::CLAUDE_JOBS_DIR_ENV);
+    std::env::set_var(ccteam_harness::CLAUDE_JOBS_DIR_ENV, &jobs_dir);
 
     let slug = "phantom-proj";
     let yaml = "\
@@ -639,8 +639,8 @@ agents:
     let summary = workflow_summary(slug, &paths).unwrap();
 
     match prev {
-        Some(v) => std::env::set_var(ccteam_core::CLAUDE_JOBS_DIR_ENV, v),
-        None => std::env::remove_var(ccteam_core::CLAUDE_JOBS_DIR_ENV),
+        Some(v) => std::env::set_var(ccteam_harness::CLAUDE_JOBS_DIR_ENV, v),
+        None => std::env::remove_var(ccteam_harness::CLAUDE_JOBS_DIR_ENV),
     }
 
     let explorer = summary

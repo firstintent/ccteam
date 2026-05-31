@@ -21,7 +21,7 @@
 //!    vendors (orchestrator boundary correctness).
 
 use ccteam_core::execution::{ClaudeBgAdapter, ClaudeTuiAdapter, CodexExecAdapter};
-use ccteam_core::harness::{
+use ccteam_harness::{
     parse_backgrounded_short_id, AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter,
     HarnessError, SessionHandle, SpawnCtx, ThreadHandle, CLAUDE_BIN_ENV, CLAUDE_JOBS_DIR_ENV,
 };
@@ -202,7 +202,7 @@ async fn claude_bg_submit_turn_synthesises_turn_id() {
         raw_extras: serde_json::json!({}),
     };
     let tid = ClaudeBgAdapter::new()
-        .submit_turn(&h, ccteam_core::harness::TurnInput::UserText("hi".into()))
+        .submit_turn(&h, ccteam_harness::TurnInput::UserText("hi".into()))
         .await
         .expect("synthetic ok");
     assert_eq!(tid.0, "bg-abc12345");
@@ -487,7 +487,7 @@ async fn codex_exec_submit_turn_returns_synthetic_turn_id_wave3() {
         raw_extras: serde_json::json!({}),
     };
     let tid = CodexExecAdapter::new()
-        .submit_turn(&h, ccteam_core::harness::TurnInput::UserText("hi".into()))
+        .submit_turn(&h, ccteam_harness::TurnInput::UserText("hi".into()))
         .await
         .expect("Wave 3 submit_turn returns synthetic TurnId");
     assert!(tid.0.starts_with("codex-exec-"));
