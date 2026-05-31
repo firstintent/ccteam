@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# v0.8 rmux G2 — real-daemon smoke for the rmux MuxBackend.
+# v0.8 rmux G2 — real-daemon smoke for the rmux ProcessBackend.
 #
 # Exercises spawn → exists → send → capture → kill through a LIVE rmux
 # daemon. ccteam hosts the daemon itself: the rmux SDK re-execs the
@@ -45,7 +45,7 @@ echo "==> ccteam binary: $BIN"
 
 echo "==> running rmux real-daemon roundtrip (--ignored)"
 RMUX_SDK_DAEMON_BINARY="$BIN" \
-  cargo test -p ccteam-mux --test rmux_backend_session_roundtrip --locked \
+  cargo test -p ccteam-harness --test rmux_backend_session_roundtrip --locked \
   -- --ignored --nocapture
 
 # Adapter-layer coverage: drives the production spawn path
