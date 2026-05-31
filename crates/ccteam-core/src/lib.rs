@@ -142,7 +142,10 @@ pub use daemon::{
     write_heartbeat, write_pidfile, DaemonHealth, HEARTBEAT_GRACE, HEARTBEAT_INTERVAL,
     HEARTBEAT_NAME, PIDFILE_NAME,
 };
-pub use defaults::DEFAULT_TURN_TIMEOUT_SECS;
+pub use defaults::{
+    claude_jobs_dir_from_env, state_json_path as claude_state_json_path, CLAUDE_JOBS_DIR_ENV,
+    DEFAULT_CLAUDE_SID, DEFAULT_TURN_TIMEOUT_SECS,
+};
 // HarnessAdapter and its cross-vendor types live in ccteam-harness.
 // `UnifiedTokenUsage` is still re-exported below via
 // `ccteam_cost::{..., UnifiedTokenUsage as Usage}`.

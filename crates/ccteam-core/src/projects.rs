@@ -606,14 +606,7 @@ pub fn refuses_active_session(
     // shouldn't block removal of this project).
     let project_dir = paths.project_dir(slug);
     let canon_project = std::fs::canonicalize(&project_dir).unwrap_or(project_dir.clone());
-    let jobs_dir = std::env::var_os(ccteam_harness::CLAUDE_JOBS_DIR_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_default()
-                .join(".claude")
-                .join("jobs")
-        });
+    let jobs_dir = crate::claude_jobs_dir_from_env();
     if let Ok(read) = std::fs::read_dir(&jobs_dir) {
         for entry in read.flatten() {
             let state_path = entry.path().join("state.json");

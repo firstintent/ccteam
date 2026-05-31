@@ -2,7 +2,7 @@
 //!
 //! Every claude background session writes its lifecycle into
 //! `~/.claude/jobs/<job_id>/state.json` (or `$CCTEAM_CLAUDE_JOBS_DIR`
-//! when set — same env override `harness::state_json_path` reads).
+//! when set — same env override [`crate::claude_state_json_path`] reads).
 //! This module is the SHARED helper both `queries::workflow_summary`
 //! (read-side: phantom-running detection) and
 //! `orchestrator::poll_completions` (write-side: stale-spawn cleanup)
@@ -81,7 +81,7 @@ pub enum JobLiveness {
 }
 
 /// Probe a `claude --bg` background job's liveness via
-/// `harness::state_json_path(job_id)`.
+/// [`crate::claude_state_json_path(job_id)`].
 ///
 /// Returns [`JobLiveness::Terminal`] with `status: "killed"` when:
 /// - `job_id` is `None` (legacy agent_spawn row without F80 plumbing),
@@ -102,7 +102,7 @@ pub fn probe_job(job_id: Option<&str>) -> JobLiveness {
             cost_usd: 0.0,
         };
     };
-    let path = ccteam_harness::state_json_path(id);
+    let path = crate::claude_state_json_path(id);
     probe_state_json(&path)
 }
 
@@ -306,10 +306,10 @@ pub fn reset_link_scan_warn_for_tests() {
 }
 
 /// Resolve the absolute state.json path for a `(job_id)`. Thin
-/// re-export of `harness::state_json_path` so call sites that want to
+/// re-export of [`crate::claude_state_json_path`] so call sites that want to
 /// log the path don't need to import `harness` directly.
 pub fn job_state_path(job_id: &str) -> PathBuf {
-    ccteam_harness::state_json_path(job_id)
+    crate::claude_state_json_path(job_id)
 }
 
 // V0.4.6 F85 — `~/.claude/jobs/` GC.
@@ -589,14 +589,7 @@ fn dir_mtime_utc(path: &Path) -> Option<chrono::DateTime<chrono::Utc>> {
 /// [`gc_terminated_jobs`] is exposed so test code (and any future GC
 /// caller wanting a custom path) can target a tempdir directly.
 pub fn gc_user_claude_jobs(retention_days: u32, dry_run: bool) -> Result<GcReport> {
-    let base = std::env::var_os(ccteam_harness::CLAUDE_JOBS_DIR_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_default()
-                .join(".claude")
-                .join("jobs")
-        });
+    let base = crate::claude_jobs_dir_from_env();
     gc_terminated_jobs(&base, retention_days, dry_run)
 }
 
