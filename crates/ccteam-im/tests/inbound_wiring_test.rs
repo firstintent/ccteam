@@ -832,6 +832,7 @@ async fn real_ws_dual_harness_smoke() {
     let old_mux_backend = std::env::var_os("CCTEAM_MUX_BACKEND");
     let old_path = std::env::var_os("PATH");
     let nl_mode = std::env::var("CCTEAM_REAL_IM_WS_NL").ok();
+    let restart_mode = std::env::var("CCTEAM_REAL_IM_WS_RESTART").ok().as_deref() == Some("1");
     std::env::set_var("CCTEAM_HOME", ccteam_home.path());
     std::env::set_var("CCTEAM_CODEX_APP_SERVER_TRANSPORT", "stdio");
     std::env::remove_var("CCTEAM_CODEX_APP_SERVER_SOCKET");
@@ -872,29 +873,15 @@ async fn real_ws_dual_harness_smoke() {
     }
 
     let ws = Arc::new(WsChannel::bind_localhost().await.unwrap());
-    let ws_url = format!("ws://{}", ws.local_addr());
-    let mut channels: ChannelMap = std::collections::HashMap::new();
-    channels.insert("ws".to_string(), ws as Arc<dyn Channel + Send + Sync>);
-    let args = DaemonArgs {
-        credentials: None,
-        registry: Some(project.path().to_path_buf()),
-        tick: Duration::from_millis(50),
-        max_runtime: Some(if nl_mode.is_some() {
-            Duration::from_secs(300)
-        } else {
-            Duration::from_secs(30)
-        }),
-        adapter_factory: Some(default_adapter_factory()),
-        channels_override: Some(channels),
+    let ws_addr = ws.local_addr();
+    let ws_url = format!("ws://{ws_addr}");
+    let max_runtime = if nl_mode.is_some() || restart_mode {
+        Duration::from_secs(300)
+    } else {
+        Duration::from_secs(30)
     };
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let daemon = tokio::spawn(async move {
-        run_daemon_with_shutdown(args, async {
-            let _ = stop_rx.await;
-        })
-        .await
-        .unwrap();
-    });
+    let (mut stop_tx, mut daemon) =
+        spawn_real_ws_gateway_daemon(project.path().to_path_buf(), ws, max_runtime);
 
     let mut socket = connect_ws_with_retry(&ws_url).await;
     send_ws_text(&mut socket, "real-ws-codex-new", "/new codex api").await;
@@ -973,6 +960,70 @@ async fn real_ws_dual_harness_smoke() {
         }
     }
 
+    if restart_mode {
+        drop(socket);
+        let _ = stop_tx.send(());
+        daemon.await.unwrap();
+        assert!(
+            tmux_session_exists(&claude_tmux_session),
+            "Claude tmux session must survive daemon restart: {claude_tmux_session}"
+        );
+
+        let ws = Arc::new(WsChannel::bind_on_listen(ws_addr));
+        let restarted = spawn_real_ws_gateway_daemon(project.path().to_path_buf(), ws, max_runtime);
+        stop_tx = restarted.0;
+        daemon = restarted.1;
+        socket = connect_ws_with_retry(&ws_url).await;
+
+        send_ws_text(&mut socket, "real-ws-restart-sessions", "/sessions").await;
+        let sessions = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10))
+            .await
+            .content;
+        assert!(
+            sessions.contains(&format!("s1:{slug}:Codex:api"))
+                && sessions.contains(&format!("s2:{slug}:Claude:reviewer")),
+            "restart must restore original sessions; got {sessions:?}"
+        );
+
+        send_ws_text(
+            &mut socket,
+            "real-ws-codex-after-restart",
+            "@api Reply with exactly CCTEAM-CODEX-WS-RESTART-OK and no extra text.",
+        )
+        .await;
+        let codex_ack = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10)).await;
+        assert!(
+            codex_ack.content.starts_with("submitted s1 turn "),
+            "Codex after restart should reuse s1, got {:?}",
+            codex_ack.content
+        );
+        recv_ws_until_contains(
+            &mut socket,
+            "CCTEAM-CODEX-WS-RESTART-OK",
+            Duration::from_secs(120),
+        )
+        .await;
+
+        send_ws_text(
+            &mut socket,
+            "real-ws-claude-after-restart",
+            "@reviewer Reply with exactly CCTEAM-CLAUDE-WS-RESTART-OK and no extra text.",
+        )
+        .await;
+        let claude_ack = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10)).await;
+        assert!(
+            claude_ack.content.starts_with("submitted s2 turn "),
+            "Claude after restart should reuse s2, got {:?}",
+            claude_ack.content
+        );
+        recv_ws_until_contains(
+            &mut socket,
+            "CCTEAM-CLAUDE-WS-RESTART-OK",
+            Duration::from_secs(180),
+        )
+        .await;
+    }
+
     send_ws_text(&mut socket, "real-ws-claude-clear", "@reviewer /clear").await;
     let claude = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10)).await;
     assert!(
@@ -1018,6 +1069,36 @@ fn spawn_ws_gateway_daemon(
         tick: Duration::from_millis(50),
         max_runtime: Some(Duration::from_secs(5)),
         adapter_factory: Some(adapter_factory),
+        channels_override: Some(channels),
+    };
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        run_daemon_with_shutdown(args, async {
+            let _ = stop_rx.await;
+        })
+        .await
+        .unwrap();
+    });
+    (stop_tx, handle)
+}
+
+fn spawn_real_ws_gateway_daemon(
+    project_root: std::path::PathBuf,
+    ws: Arc<WsChannel>,
+    max_runtime: Duration,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let mut channels: ChannelMap = std::collections::HashMap::new();
+    channels.insert("ws".to_string(), ws as Arc<dyn Channel + Send + Sync>);
+
+    let args = DaemonArgs {
+        credentials: None,
+        registry: Some(project_root),
+        tick: Duration::from_millis(50),
+        max_runtime: Some(max_runtime),
+        adapter_factory: Some(default_adapter_factory()),
         channels_override: Some(channels),
     };
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();

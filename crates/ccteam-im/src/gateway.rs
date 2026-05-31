@@ -184,6 +184,90 @@ impl Gateway {
         self.load_state()
     }
 
+    /// Reconnect persisted sessions after daemon restart.
+    ///
+    /// Claude TUI sessions first use the live tmux `resume_thread`
+    /// path, then merge persisted transcript-tail context back in.
+    /// If the pane is gone, real Claude handles fall through to
+    /// `start_thread` so the adapter can reattach/recreate. Codex
+    /// app-server sessions use the native `thread/resume` RPC.
+    pub async fn resume_restored_sessions(&mut self) {
+        let ids = self.sessions.keys().cloned().collect::<Vec<_>>();
+        for id in ids {
+            let Some(snapshot) = self.sessions.get(&id).cloned() else {
+                continue;
+            };
+            let Some(cwd) = self.projects.get(&snapshot.project).cloned() else {
+                tracing::warn!(
+                    session = %id,
+                    project = %snapshot.project,
+                    "ccteam-im: restored gateway session skipped; project root missing"
+                );
+                continue;
+            };
+            let adapter = (self.adapter_factory)(snapshot.vendor);
+            let resumed = match snapshot.vendor {
+                AgentVendor::Claude => {
+                    match adapter.resume_thread(&snapshot.thread.identity).await {
+                        Ok(mut thread) => {
+                            thread.raw_extras = merge_thread_extras(
+                                snapshot.thread.raw_extras.clone(),
+                                thread.raw_extras,
+                            );
+                            Ok(thread)
+                        }
+                        Err(err) if is_real_claude_tui_handle(&snapshot.thread) => {
+                            tracing::warn!(
+                                session = %id,
+                                error = %err,
+                                "ccteam-im: Claude restored-session resume failed; trying start_thread reattach/recreate"
+                            );
+                            adapter
+                                .start_thread(
+                                    &AgentSpecBrief {
+                                        role: snapshot.role.clone(),
+                                    },
+                                    &SpawnCtx {
+                                        slug: snapshot.project.clone(),
+                                        sid: snapshot.id.clone(),
+                                        cwd: cwd.clone(),
+                                        project_dir: cwd,
+                                        extra_args: vec![],
+                                        model_id: None,
+                                    },
+                                )
+                                .await
+                        }
+                        Err(err) => Err(err),
+                    }
+                }
+                AgentVendor::Codex => adapter.resume_thread(&snapshot.thread.identity).await,
+            };
+            match resumed {
+                Ok(thread) => {
+                    if let Some(session) = self.sessions.get_mut(&id) {
+                        session.thread = thread;
+                        session.adapter = adapter;
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        session = %id,
+                        vendor = ?snapshot.vendor,
+                        error = %err,
+                        "ccteam-im: restored gateway session resume failed; keeping persisted handle"
+                    );
+                }
+            }
+        }
+        if let Err(err) = self.persist_state() {
+            tracing::warn!(
+                error = %err,
+                "ccteam-im: failed to persist resumed gateway sessions"
+            );
+        }
+    }
+
     /// Register or update a project root addressable by `/cd <slug>`.
     pub fn register_project(&mut self, slug: impl Into<String>, dir: impl Into<PathBuf>) {
         self.projects.insert(slug.into(), dir.into());
@@ -671,6 +755,37 @@ fn gateway_submit_timeout_duration() -> std::time::Duration {
         .and_then(|raw| raw.parse::<u64>().ok())
         .unwrap_or(DEFAULT_MS);
     std::time::Duration::from_millis(ms)
+}
+
+fn is_real_claude_tui_handle(thread: &ThreadHandle) -> bool {
+    thread
+        .raw_extras
+        .get("tmux_session")
+        .and_then(|v| v.as_str())
+        .is_some()
+        && thread
+            .raw_extras
+            .get("cwd")
+            .and_then(|v| v.as_str())
+            .is_some()
+        && thread
+            .raw_extras
+            .get("project_dir")
+            .and_then(|v| v.as_str())
+            .is_some()
+}
+
+fn merge_thread_extras(
+    persisted: serde_json::Value,
+    resumed: serde_json::Value,
+) -> serde_json::Value {
+    let mut merged = persisted.as_object().cloned().unwrap_or_default();
+    if let Some(resumed) = resumed.as_object() {
+        for (key, value) in resumed {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+    serde_json::Value::Object(merged)
 }
 
 fn turn_input_for_session(vendor: AgentVendor, payload: String) -> TurnInput {

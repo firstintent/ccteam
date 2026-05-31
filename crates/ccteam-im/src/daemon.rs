@@ -265,6 +265,7 @@ where
     replay_durable_outbox(&channels).await;
     let mut gateway_inner =
         build_gateway(factory.clone(), &projects_root, &config_projects, &initial);
+    gateway_inner.resume_restored_sessions().await;
     let (gateway_event_tx, gateway_event_rx) =
         tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
     gateway_inner.set_event_sink(gateway_event_tx);
