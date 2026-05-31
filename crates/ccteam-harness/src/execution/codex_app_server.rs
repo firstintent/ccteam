@@ -343,6 +343,9 @@ impl HarnessAdapter for CodexAppServerAdapter {
         input: TurnInput,
     ) -> Result<TurnId, HarnessError> {
         let client = self.client().await?;
+        if let TurnInput::SystemDirective(directive) = input {
+            return submit_system_directive(&client, h, &directive).await;
+        }
         let items = turn_input_to_items(input)?;
         let params = json!({
             "thread_id": h.identity,
@@ -531,6 +534,61 @@ impl HarnessAdapter for CodexAppServerAdapter {
             .await;
         Ok(())
     }
+}
+
+async fn submit_system_directive(
+    client: &CodexJsonRpcClient,
+    h: &ThreadHandle,
+    directive: &str,
+) -> Result<TurnId, HarnessError> {
+    let normalized = directive
+        .trim()
+        .trim_start_matches('/')
+        .split_whitespace()
+        .next()
+        .unwrap_or("");
+    match normalized {
+        "compact" => {
+            client
+                .call("thread/compact/start", json!({ "threadId": h.identity }))
+                .await
+                .map_err(|e| HarnessError::SubmitFailed(format!("thread/compact/start: {e:#}")))?;
+            Ok(synthetic_command_turn_id("compact", &h.identity))
+        }
+        "review" => {
+            let result = client
+                .call(
+                    "review/start",
+                    json!({
+                        "threadId": h.identity,
+                        "target": { "type": "uncommittedChanges" },
+                    }),
+                )
+                .await
+                .map_err(|e| HarnessError::SubmitFailed(format!("review/start: {e:#}")))?;
+            let turn_id = pluck_turn_id(&result).ok_or_else(|| {
+                HarnessError::SubmitFailed(format!(
+                    "review/start response missing turn.id: {result}"
+                ))
+            })?;
+            Ok(TurnId(turn_id))
+        }
+        "" => Err(HarnessError::SubmitFailed(
+            "codex app-server: empty SystemDirective".to_string(),
+        )),
+        other => Err(HarnessError::SubmitFailed(format!(
+            "codex app-server: SystemDirective \"{other}\" not supported \
+             (supported: /compact, /review)"
+        ))),
+    }
+}
+
+fn synthetic_command_turn_id(command: &str, thread_id: &str) -> TurnId {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    TurnId::new(format!("codex-app-server-{command}-{thread_id}-{nanos:x}"))
 }
 
 /// Translate a [`TurnInput`] into the codex `UserInput[]` payload

@@ -15,6 +15,7 @@ use ccteam_harness::{
 use serde_json::{json, Value};
 use serial_test::serial;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
@@ -491,6 +492,104 @@ async fn adapter_start_thread_against_scripted_peer() {
     assert_eq!(h.identity, "tid-42");
 
     drop(peer); // shutdown peer; adapter no-ops on subsequent calls
+    let _ = std::fs::remove_file(&sock);
+    std::env::remove_var(APP_SERVER_SOCKET_ENV);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn adapter_maps_system_directives_to_command_rpcs() {
+    let sock = unique_socket_path("system-directive-rpc");
+    std::env::set_var(APP_SERVER_SOCKET_ENV, &sock);
+
+    let seen = Arc::new(StdMutex::new(Vec::<Value>::new()));
+    let seen_for_peer = Arc::clone(&seen);
+    let (peer, _notif) = spawn_scripted_peer(sock.clone(), move |req| {
+        seen_for_peer.lock().unwrap().push(req.clone());
+        match req["method"].as_str() {
+            Some("initialize") => json!({
+                "result": {
+                    "user_agent": "codex-test/0.0.0",
+                    "codex_home": "/tmp/.codex",
+                    "platform_family": "unix",
+                    "platform_os": "linux"
+                }
+            }),
+            Some("thread/start") => json!({
+                "result": { "thread": { "id": "tid-command" } }
+            }),
+            Some("thread/compact/start") => json!({ "result": {} }),
+            Some("review/start") => json!({
+                "result": {
+                    "turn": { "id": "turn-review-1" },
+                    "reviewThreadId": "tid-command"
+                }
+            }),
+            other => json!({
+                "error": {
+                    "code": -32601,
+                    "message": format!("unexpected method {other:?}")
+                }
+            }),
+        }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let adapter = CodexAppServerAdapter::new();
+    let spec = AgentSpecBrief {
+        role: "demo".into(),
+    };
+    let ctx = SpawnCtx {
+        slug: "test".into(),
+        sid: "codex-1".into(),
+        cwd: std::env::temp_dir(),
+        project_dir: std::env::temp_dir(),
+        extra_args: vec![],
+        model_id: None,
+    };
+    let h = adapter.start_thread(&spec, &ctx).await.unwrap();
+
+    let compact_turn = adapter
+        .submit_turn(&h, TurnInput::SystemDirective("/compact".into()))
+        .await
+        .unwrap();
+    assert!(compact_turn.0.starts_with("codex-app-server-compact-"));
+
+    let review_turn = adapter
+        .submit_turn(&h, TurnInput::SystemDirective("review".into()))
+        .await
+        .unwrap();
+    assert_eq!(review_turn.0, "turn-review-1");
+
+    let frames = seen.lock().unwrap().clone();
+    let methods: Vec<&str> = frames.iter().filter_map(|v| v["method"].as_str()).collect();
+    assert_eq!(
+        methods,
+        vec![
+            "initialize",
+            "initialized",
+            "thread/start",
+            "thread/compact/start",
+            "review/start"
+        ]
+    );
+    let compact = frames
+        .iter()
+        .find(|v| v["method"] == "thread/compact/start")
+        .unwrap();
+    assert_eq!(compact["params"]["threadId"], "tid-command");
+    let review = frames
+        .iter()
+        .find(|v| v["method"] == "review/start")
+        .unwrap();
+    assert_eq!(review["params"]["threadId"], "tid-command");
+    assert_eq!(
+        review["params"]["target"],
+        json!({ "type": "uncommittedChanges" })
+    );
+
+    drop(peer);
     let _ = std::fs::remove_file(&sock);
     std::env::remove_var(APP_SERVER_SOCKET_ENV);
 }
