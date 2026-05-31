@@ -74,6 +74,13 @@ pub const APP_SERVER_SOCKET_ENV: &str = "CCTEAM_CODEX_APP_SERVER_SOCKET";
 /// Supported values today: `uds` (default) and `stdio`.
 pub const APP_SERVER_TRANSPORT_ENV: &str = "CCTEAM_CODEX_APP_SERVER_TRANSPORT";
 
+/// Fault-injection hook for real IM smoke tests: when set to `1`, the
+/// next `submit_turn` terminates the cached stdio Codex app-server
+/// child before issuing the JSON-RPC request, exercising the normal
+/// submit-error path against a real binary.
+pub const APP_SERVER_FAULT_KILL_BEFORE_TURN_ENV: &str =
+    "CCTEAM_CODEX_APP_SERVER_FAULT_KILL_BEFORE_TURN";
+
 /// V0.6.1 F122 — per-thread context the adapter consults when bridging
 /// boundary events into `progress.jsonl`. Populated by `start_thread`
 /// from the [`SpawnCtx`]; consumed by the `events()` stream the first
@@ -369,6 +376,15 @@ impl HarnessAdapter for CodexAppServerAdapter {
         input: TurnInput,
     ) -> Result<TurnId, HarnessError> {
         let client = self.client().await?;
+        if std::env::var(APP_SERVER_FAULT_KILL_BEFORE_TURN_ENV)
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            client.terminate_stdio_child().await.map_err(|e| {
+                HarnessError::SubmitFailed(format!("codex app-server fault injection: {e:#}"))
+            })?;
+        }
         if let TurnInput::SystemDirective(directive) = input {
             return submit_system_directive(&client, h, &directive).await;
         }

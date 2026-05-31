@@ -890,6 +890,7 @@ async fn real_ws_dual_harness_smoke() {
     let old_ccteam_home = std::env::var_os("CCTEAM_HOME");
     let old_transport = std::env::var_os("CCTEAM_CODEX_APP_SERVER_TRANSPORT");
     let old_socket = std::env::var_os("CCTEAM_CODEX_APP_SERVER_SOCKET");
+    let old_codex_fault = std::env::var_os("CCTEAM_CODEX_APP_SERVER_FAULT_KILL_BEFORE_TURN");
     let old_mux_backend = std::env::var_os("CCTEAM_MUX_BACKEND");
     let old_path = std::env::var_os("PATH");
     let nl_mode = std::env::var("CCTEAM_REAL_IM_WS_NL").ok();
@@ -1112,12 +1113,31 @@ async fn real_ws_dual_harness_smoke() {
             "Claude tmux death should be user-visible, got {:?}",
             fault.content
         );
+        std::env::set_var("CCTEAM_CODEX_APP_SERVER_FAULT_KILL_BEFORE_TURN", "1");
+        send_ws_text(
+            &mut socket,
+            "real-ws-codex-after-kill",
+            "@api this should surface a codex app-server disconnect",
+        )
+        .await;
+        let fault = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(20)).await;
+        assert!(
+            fault.content.starts_with("gateway error: submit failed:")
+                && (fault.content.contains("turn/start")
+                    || fault.content.contains("codex app-server fault injection")),
+            "Codex app-server death should be user-visible, got {:?}",
+            fault.content
+        );
         drop(socket);
         let _ = stop_tx.send(());
         daemon.await.unwrap();
         restore_env("CCTEAM_HOME", old_ccteam_home);
         restore_env("CCTEAM_CODEX_APP_SERVER_TRANSPORT", old_transport);
         restore_env("CCTEAM_CODEX_APP_SERVER_SOCKET", old_socket);
+        restore_env(
+            "CCTEAM_CODEX_APP_SERVER_FAULT_KILL_BEFORE_TURN",
+            old_codex_fault,
+        );
         restore_env("CCTEAM_MUX_BACKEND", old_mux_backend);
         restore_env("PATH", old_path);
         return;
@@ -1142,6 +1162,10 @@ async fn real_ws_dual_harness_smoke() {
     restore_env("CCTEAM_HOME", old_ccteam_home);
     restore_env("CCTEAM_CODEX_APP_SERVER_TRANSPORT", old_transport);
     restore_env("CCTEAM_CODEX_APP_SERVER_SOCKET", old_socket);
+    restore_env(
+        "CCTEAM_CODEX_APP_SERVER_FAULT_KILL_BEFORE_TURN",
+        old_codex_fault,
+    );
     restore_env("CCTEAM_MUX_BACKEND", old_mux_backend);
     restore_env("PATH", old_path);
 }

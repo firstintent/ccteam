@@ -27,7 +27,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
@@ -85,7 +85,7 @@ pub struct CodexJsonRpcClient {
     notifications: broadcast::Sender<Notification>,
     _writer_task: JoinHandle<()>,
     _reader_task: JoinHandle<()>,
-    _child: Option<Child>,
+    child: StdMutex<Option<Child>>,
 }
 
 impl CodexJsonRpcClient {
@@ -161,8 +161,32 @@ impl CodexJsonRpcClient {
             notifications: notif_tx,
             _writer_task: writer_task,
             _reader_task: reader_task,
-            _child: child,
+            child: StdMutex::new(child),
         }
+    }
+
+    /// Terminate the stdio app-server child owned by this client.
+    /// UDS connections have no child here and return an error.
+    pub async fn terminate_stdio_child(&self) -> Result<()> {
+        let child = {
+            let mut guard = self
+                .child
+                .lock()
+                .map_err(|_| anyhow!("codex app-server child mutex poisoned"))?;
+            let Some(child) = guard.take() else {
+                return Err(anyhow!("codex app-server stdio child unavailable"));
+            };
+            child
+        };
+        let mut child = child;
+        child
+            .kill()
+            .await
+            .context("kill codex app-server stdio child")?;
+        self._reader_task.abort();
+        self._writer_task.abort();
+        tokio::task::yield_now().await;
+        Ok(())
     }
 
     /// Issue a JSON-RPC request and await the matching response. `params`
