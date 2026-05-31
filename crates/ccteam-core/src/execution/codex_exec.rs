@@ -41,16 +41,15 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, Mutex};
 
-use crate::paths::CcteamPaths;
 use ccteam_cost::{
     append_budget_ledger_row, load_budget_ledger, sum_advise_today, Vendor as CostVendor,
     APPROX_COST_PER_CALL_USD, DEFAULT_ADVISE_BUDGET_USD_24H,
 };
 use ccteam_harness::{
-    pluck_f64, pluck_pct, pluck_str, AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter,
-    HarnessError, HarnessSnapshot, SpawnCtx, ThreadErrorEvent, ThreadEvent, ThreadHandle,
-    ThreadItem, ThreadItemDetails, TurnId, TurnInput, UnifiedTokenUsage, CODEX_BIN_ENV,
-    CODEX_STATUS_MARKER,
+    ccteam_root_from_env, pluck_f64, pluck_pct, pluck_str, AgentSpecBrief, AgentVendor,
+    ExecutionMode, HarnessAdapter, HarnessError, HarnessSnapshot, SpawnCtx, ThreadErrorEvent,
+    ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails, TurnId, TurnInput, UnifiedTokenUsage,
+    CODEX_BIN_ENV, CODEX_STATUS_MARKER,
 };
 // `session_name_for_slug` is a pure string helper (NOT a tmux call) —
 // sourced directly from the mux crate's `tmux_ops` so this module has
@@ -116,8 +115,7 @@ impl CodexExecAdapter {
 
     /// Resolve `~/.ccteam/codex/<sid>/state.json` for a session.
     pub fn state_json_path(sid: &str) -> Option<std::path::PathBuf> {
-        let paths = CcteamPaths::from_env().ok()?;
-        Some(paths.root.join("codex").join(sid).join("state.json"))
+        ccteam_root_from_env().map(|root| root.join("codex").join(sid).join("state.json"))
     }
 
     fn write_initial_state(sid: &str, pid: Option<u32>) {

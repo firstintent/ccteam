@@ -66,6 +66,11 @@ pub const CLAUDE_BIN_ENV: &str = "CCTEAM_CLAUDE_BIN";
 /// requiring the real CLI on PATH.
 pub const CODEX_BIN_ENV: &str = "CCTEAM_CODEX_BIN";
 
+/// Environment override for the global ccteam root. Harness-owned
+/// adapters use this for per-session state sidecars without depending
+/// on `ccteam-core::paths::CcteamPaths`.
+pub const CCTEAM_HOME_ENV: &str = "CCTEAM_HOME";
+
 /// Marker line the codex agent prints in its tmux pane to publish
 /// state to the observer (PRD §6.5 + dev-plan §3.2).
 pub const CODEX_STATUS_MARKER: &str = "CODEX_STATUS:";
@@ -77,6 +82,16 @@ pub const CODEX_STATUS_TAIL_LINES: usize = 5;
 // =====================================================================
 // V0.6.0 F107 — New trait surface
 // =====================================================================
+
+/// Resolve the global ccteam root the same way `CcteamPaths::from_env`
+/// resolves its `root` field: `CCTEAM_HOME` wins, otherwise
+/// `$HOME/.ccteam`.
+pub fn ccteam_root_from_env() -> Option<PathBuf> {
+    std::env::var(CCTEAM_HOME_ENV)
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".ccteam")))
+}
 
 /// Vendor enum, a first-class trait field (F107 step 1).
 ///
