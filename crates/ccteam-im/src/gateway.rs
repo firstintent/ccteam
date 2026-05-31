@@ -101,6 +101,20 @@ impl Gateway {
         self.projects.insert(slug.into(), dir.into());
     }
 
+    /// True when `text` is one of the gateway-owned slash commands.
+    pub fn is_gateway_command(text: &str) -> bool {
+        matches!(
+            text.split_whitespace().next(),
+            Some("/new" | "/use" | "/cd" | "/sessions" | "/projects")
+        )
+    }
+
+    /// True when this chat/user already has a current gateway session.
+    pub fn has_current_session(&self, channel: &str, chat_id: &str, user_id: &str) -> bool {
+        self.current_session
+            .contains_key(&ChatKey::new(channel, chat_id, user_id))
+    }
+
     /// Route one inbound text message and return outbound replies.
     pub async fn handle_text(
         &mut self,

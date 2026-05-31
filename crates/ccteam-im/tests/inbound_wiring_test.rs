@@ -19,6 +19,7 @@
 //! 2. The stub adapter's `submit_turn` counter advances (proves the
 //!    supervisor inbox drain reached the harness layer).
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,7 +27,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use ccteam_harness::{
     AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx,
-    ThreadEvent, ThreadHandle, TurnId, TurnInput,
+    ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails, TurnId, TurnInput,
 };
 use ccteam_im::daemon::{run_daemon_with_shutdown, AdapterFactory, ChannelMap, DaemonArgs};
 use ccteam_im::register_bot;
@@ -59,6 +60,84 @@ struct StubAdapter {
     submits: AtomicUsize,
     closes: AtomicUsize,
     submitted_payloads: tokio::sync::Mutex<Vec<String>>,
+}
+
+#[derive(Debug, Default)]
+struct GatewayAdapter {
+    starts: AtomicUsize,
+    submits: AtomicUsize,
+    submitted_payloads: tokio::sync::Mutex<Vec<String>>,
+    events: Arc<tokio::sync::Mutex<VecDeque<ThreadEvent>>>,
+}
+
+#[async_trait]
+impl HarnessAdapter for GatewayAdapter {
+    fn name(&self) -> &'static str {
+        "gateway-stub"
+    }
+
+    fn vendor(&self) -> AgentVendor {
+        AgentVendor::Claude
+    }
+
+    async fn start_thread(
+        &self,
+        spec: &AgentSpecBrief,
+        ctx: &SpawnCtx,
+    ) -> Result<ThreadHandle, HarnessError> {
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        Ok(ThreadHandle {
+            vendor: AgentVendor::Claude,
+            mode: ExecutionMode::Chat,
+            identity: format!("gateway-{}-{}-{}", ctx.slug, spec.role, ctx.sid),
+            started_at: chrono::Utc::now(),
+            raw_extras: serde_json::json!({}),
+        })
+    }
+
+    async fn submit_turn(
+        &self,
+        _h: &ThreadHandle,
+        input: TurnInput,
+    ) -> Result<TurnId, HarnessError> {
+        self.submits.fetch_add(1, Ordering::SeqCst);
+        let text = match input {
+            TurnInput::UserText(s) => s,
+            other => format!("{other:?}"),
+        };
+        self.submitted_payloads.lock().await.push(text.clone());
+        self.events
+            .lock()
+            .await
+            .push_back(ThreadEvent::ItemCompleted {
+                item: ThreadItem {
+                    id: "gateway-msg-1".to_string(),
+                    details: ThreadItemDetails::AgentMessage(format!("gateway echo: {text}")),
+                },
+            });
+        Ok(TurnId::new("gateway-turn"))
+    }
+
+    fn events(&self, _h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
+        let events = Arc::clone(&self.events);
+        Box::pin(futures::stream::unfold((), move |_| {
+            let events = Arc::clone(&events);
+            async move {
+                let evt = events.lock().await.pop_front()?;
+                Some((evt, ()))
+            }
+        }))
+    }
+
+    async fn resume_thread(&self, _id: &str) -> Result<ThreadHandle, HarnessError> {
+        Err(HarnessError::NotImplemented {
+            reason: "stub".into(),
+        })
+    }
+
+    async fn close_thread(&self, _h: &ThreadHandle) -> Result<(), HarnessError> {
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -217,4 +296,79 @@ async fn daemon_wires_mock_channel_to_supervisor_inbox() {
             remaining.len()
         );
     }
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_routes_gateway_inbound_to_submit_turn_and_outbound() {
+    let _g = env_lock();
+    let home = isolate_home();
+    let projects_root = home.path().join("projects");
+    std::fs::create_dir_all(&projects_root).unwrap();
+
+    let mock = Arc::new(MockChannel::new());
+    mock.push(ChannelMessage {
+        id: "gw-1".into(),
+        sender: "alice".into(),
+        reply_target: "chat-1".into(),
+        content: "/new claude helper".into(),
+        channel: "telegram".into(),
+        timestamp: 0,
+        thread_ts: None,
+    })
+    .await;
+    mock.push(ChannelMessage {
+        id: "gw-2".into(),
+        sender: "alice".into(),
+        reply_target: "chat-1".into(),
+        content: "hello gateway".into(),
+        channel: "telegram".into(),
+        timestamp: 1,
+        thread_ts: None,
+    })
+    .await;
+
+    let mut channels: ChannelMap = std::collections::HashMap::new();
+    channels.insert(
+        "telegram".to_string(),
+        mock.clone() as Arc<dyn Channel + Send + Sync>,
+    );
+
+    let adapter = Arc::new(GatewayAdapter::default());
+    let adapter_factory: AdapterFactory = {
+        let cloned = adapter.clone();
+        Arc::new(move |_| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
+    };
+
+    let args = DaemonArgs {
+        credentials: None,
+        registry: Some(projects_root),
+        tick: Duration::from_millis(50),
+        max_runtime: Some(Duration::from_millis(600)),
+        adapter_factory: Some(adapter_factory),
+        channels_override: Some(channels),
+    };
+
+    run_daemon_with_shutdown(args, async {
+        futures::future::pending::<()>().await;
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(adapter.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(adapter.submits.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        adapter.submitted_payloads.lock().await.as_slice(),
+        &["hello gateway".to_string()]
+    );
+
+    let outbox = mock.outbox().await;
+    let contents: Vec<String> = outbox.into_iter().map(|m| m.content).collect();
+    assert_eq!(
+        contents,
+        vec![
+            "created session s1".to_string(),
+            "gateway echo: hello gateway".to_string()
+        ]
+    );
 }

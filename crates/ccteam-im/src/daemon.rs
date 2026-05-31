@@ -33,6 +33,7 @@ use tokio::sync::{mpsc, Mutex};
 use crate::acl::AclPolicy;
 use crate::bot_mpsc::{bot_key, BotChannelMap, BotChannels, InboxItem, OutboundItem, CHANNEL_BUF};
 use crate::credentials::{self, Credentials};
+use crate::gateway::Gateway;
 use crate::inbound::{
     auto_route_dm_mention, format_ambiguous_dm_reply, parse_envelope, process_inbound_admin_aware,
     DefaultMailboxResolver, DmRoutingHint, InboundOutcome, MailboxResolver,
@@ -43,9 +44,9 @@ use crate::outbound;
 use crate::outbound_format;
 use crate::router::{self, HandleMap};
 use crate::supervisor::{self, BotSupervisor};
-use crate::three_layer_sec::ThreeLayerSec;
+use crate::three_layer_sec::{SecOutcome, ThreeLayerSec};
 use crate::transport::providers::telegram::TelegramChannel;
-use crate::transport::{Channel, ChannelMessage};
+use crate::transport::{Channel, ChannelMessage, SendMessage};
 use crate::{list_bots, BotRegistration};
 
 /// V0.6.1 F132 — keyed map of live IM Channels, keyed by
@@ -282,6 +283,12 @@ where
     // their producers register credentials (matches the host-probe
     // shape that landed in F121).
     let channels: ChannelMap = build_channels(&args, &creds, &initial);
+    let gateway = Arc::new(Mutex::new(build_gateway(
+        factory.clone(),
+        &projects_root,
+        &config_projects,
+        &initial,
+    )));
 
     // V0.6.1 F132 — spawn one `Channel::listen` task per active
     // channel. Each listener pushes ChannelMessages into a shared mpsc
@@ -344,6 +351,7 @@ where
         mailbox.clone(),
         executor.clone(),
         bot_channels.clone(),
+        gateway.clone(),
     );
 
     // V0.6.1 F134 — outbound forwarder runs per supervisor tick (inside
@@ -494,6 +502,41 @@ fn build_channels(args: &DaemonArgs, creds: &Credentials, bots: &[BotRegistratio
     out
 }
 
+fn build_gateway(
+    factory: AdapterFactory,
+    projects_root: &Path,
+    config_projects: &HashMap<String, PathBuf>,
+    bots: &[BotRegistration],
+) -> Gateway {
+    let (default_slug, default_dir) = bots
+        .first()
+        .map(|bot| {
+            (
+                bot.workflow_slug.clone(),
+                bot.project_root_with_config(projects_root, config_projects),
+            )
+        })
+        .or_else(|| {
+            config_projects
+                .iter()
+                .next()
+                .map(|(slug, path)| (slug.clone(), path.clone()))
+        })
+        .unwrap_or_else(|| ("default".to_string(), projects_root.join("default")));
+
+    let mut gateway = Gateway::new_with_factory(factory, default_slug, default_dir);
+    for (slug, path) in config_projects {
+        gateway.register_project(slug.clone(), path.clone());
+    }
+    for bot in bots {
+        gateway.register_project(
+            bot.workflow_slug.clone(),
+            bot.project_root_with_config(projects_root, config_projects),
+        );
+    }
+    gateway
+}
+
 /// V0.6.1 F132 — drain the mpsc receiving from every listener, routing
 /// each `ChannelMessage` through the security + admin + mailbox path.
 /// Side-effects ultimately land as one mailbox `.md` file per inbound
@@ -505,6 +548,7 @@ fn spawn_inbound_consumer(
     mailbox: Arc<dyn MailboxResolver>,
     executor: Arc<AdminExecutor>,
     bot_channels: BotChannelMap,
+    gateway: Arc<Mutex<Gateway>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut seq: u64 = 0;
@@ -546,6 +590,74 @@ fn spawn_inbound_consumer(
                 );
                 continue;
             };
+            let gateway_should_handle = {
+                let gateway = gateway.lock().await;
+                Gateway::is_gateway_command(&msg.content)
+                    || gateway.has_current_session(&msg.channel, &msg.reply_target, &msg.sender)
+            };
+            if gateway_should_handle {
+                let clean_payload =
+                    match sec
+                        .lock()
+                        .await
+                        .evaluate(&msg.channel, &msg.sender, &msg.content)
+                    {
+                        SecOutcome::Accept { payload } => payload,
+                        other => {
+                            tracing::warn!(
+                                cid = %cid,
+                                outcome = ?other,
+                                "imd: gateway inbound rejected by security layer"
+                            );
+                            continue;
+                        }
+                    };
+                let replies = gateway
+                    .lock()
+                    .await
+                    .handle_text(&msg.channel, &msg.reply_target, &msg.sender, &clean_payload)
+                    .await;
+                match replies {
+                    Ok(replies) => {
+                        for reply in replies {
+                            let out = SendMessage::new(reply, msg.reply_target.clone())
+                                .in_thread(msg.thread_ts.clone());
+                            if let Err(err) = channel.send(&out).await {
+                                tracing::warn!(
+                                    cid = %cid,
+                                    channel = %msg.channel,
+                                    error = %err,
+                                    "imd: gateway outbound send failed"
+                                );
+                            }
+                        }
+                        tracing::info!(
+                            event = "latency",
+                            stage = "imd.gateway.done",
+                            cid = %cid,
+                            elapsed_ms = route_t0.elapsed().as_millis() as u64,
+                            "latency imd.gateway.done"
+                        );
+                    }
+                    Err(err) => {
+                        let out = SendMessage::new(
+                            format!("gateway error: {err}"),
+                            msg.reply_target.clone(),
+                        )
+                        .in_thread(msg.thread_ts.clone());
+                        let _ = channel.send(&out).await;
+                        tracing::warn!(
+                            event = "latency",
+                            stage = "imd.gateway.err",
+                            cid = %cid,
+                            elapsed_ms = route_t0.elapsed().as_millis() as u64,
+                            error = %err,
+                            "latency imd.gateway.err"
+                        );
+                    }
+                }
+                continue;
+            }
             // V0.6.8 F194 — multi-bot DM ambiguity short-circuit. Reply
             // to the originating chat with the list of available handles
             // and skip normal routing (no @ prepended, no mailbox write).
