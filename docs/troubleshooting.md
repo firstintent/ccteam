@@ -105,7 +105,7 @@
 
 ### A20. creator skill 写完但 bot 不工作 / SessionStart hook 报 "not under any ccteam project"
 **原因**:老版 creator 没自动调 init 流程,缺 `<project>/.ccteam/state.json`。
-**修复**:升到 V0.6.8+ — `chat_register_bot` MCP 自动调 bootstrap_project_at_dir + install_hooks。手动修:`cd <project> && ccteam init --force`(在已经有 workflow.yaml 的项目里 refresh state.json 安全)。
+**修复**:升到 V0.8.1+ — `ccteam init` 会补齐 `.ccteam/{agents,skills,state.json}`,`chat_register_bot` MCP 也会自动调 bootstrap_project_at_dir + install_hooks。手动修:`cd <project> && ccteam init --force`(在已经有 workflow.yaml 的项目里 refresh state.json 安全)。
 **相关**:A19 / B11。
 
 ---

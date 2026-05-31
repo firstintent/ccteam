@@ -611,9 +611,9 @@ qa-loop          $4.12    $5.00     ↘ -3%      ⚠ 82% of cap
 
 ---
 
-## §6 运维:daemon 优雅停止 + tmux reattach
+## §6 运维:gateway daemon 优雅停止 + tmux reattach
 
-ccteam 把 orchestrator + IM bridge(`ccteam-im`) + web 仪表板都装进 `ccteam start` 这一个 tokio runtime,前台跑或加 `&` 后台。
+ccteam 把 IM gateway(`ccteam-im`) + 本机 MCP socket(`~/.ccteam/run/mcp.sock`) + web 仪表板装进 `ccteam start` 这一个 tokio runtime,前台跑或加 `&` 后台。这个 daemon 不跑 `ccteam-flow` 编排 tick;它只做 IM/session 路由。
 
 **优雅停止**:
 
@@ -624,6 +624,7 @@ kill -TERM $(cat ~/.ccteam/ccteam.pid)   # 或 Ctrl+C 在前台 terminal
 行为契约:
 - daemon 收 SIGTERM / SIGINT → 5 秒内进 graceful drain(`TASK_DRAIN_TIMEOUT = 5s` 上限)
 - web port(默认 7331)立即释放
+- MCP socket `~/.ccteam/run/mcp.sock` 自动 unlink
 - pidfile `~/.ccteam/ccteam.pid` 自动 unlink
 - **tmux 长 session 不被 kill**(CLAUDE.md §三 "永不主动 kill 长 session" 红线)— bot 进程留着,等下次 `ccteam start` reattach
 

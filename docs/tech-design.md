@@ -6,6 +6,27 @@
 
 ---
 
+## 0a. V0.8.1 当前架构覆盖层
+
+V0.8.1 的产品运行态是 **IM gateway + session gateway**,不是旧
+orchestrator tick loop:
+
+- crate 命名已收敛:`ccteam-harness` 是执行层,`ccteam-im` 是 IM gateway,
+  `ccteam-flow` 是推后的编排层;`ccteam-im` 不依赖 `ccteam-flow`。
+- 执行层保持两轴:`HarnessAdapter`(Claude tmux / Codex app-server 等 vendor
+  protocol) × `ProcessBackend`(tmux / inproc / remote 等承载位置);pane 操作
+  只在 `PaneBackend` 子 trait。
+- no-slug `ccteam start` 在一个进程内启动 web server、IM gateway、daemon MCP
+  Unix socket(`~/.ccteam/run/mcp.sock`)和可选 hook sink。它不构造
+  `ccteam-flow::Orchestrator`,也不跑 supervisor tick。
+- `ccteam init` 写项目自有 `.ccteam/{agents,skills,state.json}`;`.claude/agents`
+  仍是 Claude Code 当前读取路径。
+- Claude TUI adapter 走 `--dangerously-skip-permissions` + `tmux send-keys -l`;
+  Codex app-server RPC 使用原生 `thread/compact/start` / `review/start`。
+
+后文保留大量 V0.6.x orchestrator 历史实现细节;实现新 v8.1 行为时以本节和
+`docs/versions/v0-8-1/README.md` 为准。
+
 ## 0. 红线表(V0.6.0 F106 双轴 scope)
 
 > 详 `docs/versions/v0-6-0/README.md §五`;CLAUDE.md §三 是简版镜像。任何 PR 违反红线 = block。
@@ -53,11 +74,16 @@
 
 ### 2.1 三层架构（Channel / Interaction / Orchestration）
 
-V0.6.0 起 **Channel Layer 实化为 `ccteam-imd` supervisor**(F116;V0.6.1 F130 折入 `ccteam start` 单进程,作为 tokio task 与 orchestrator + web 共享 shutdown channel,独立 binary 已删)+ 统一 `openhuman/channels` Rust crate 14+ IM 平台(F109);**HarnessAdapter trait 是 5-method thread/turn 接口对齐 Codex `ThreadManager::{submit, next_event}`**(F107);新增**模式 3 chat 形态**(F108):per-bot tmux 长 session + Claude TUI 长跑 + dual-track hooks+transcript 镜像 ccteam-owned `turns.jsonl`。V0.6.3 F143 起 Channel Layer 还包含 **webhook ingress**(`POST /webhook/:project/:token`,挂在 daemon 已有 axum web server,token-only constant-time 比对 + 256 KiB body cap),payload 落 `<project>/.ccteam/webhooks/<ts>-<rand>.json`,由 agent 现成的 `trigger: watch:.ccteam/webhooks/` 消费 —— **`Trigger` enum 零改动**;webhook 不内嵌 LLM、不进 spawn argv,与 inbox 同级别"dumb router 写文件"。
+V0.8.1 起 **Channel Layer 实化为 `ccteam-im` gateway**:no-slug
+`ccteam start` 把 IM gateway、MCP socket、web server 和可选 hook sink 放进同一
+tokio runtime,共享 shutdown channel,但不跑 orchestration tick。`HarnessAdapter`
+trait 仍是 5-method thread/turn 接口;Claude 用 tmux TUI, Codex 用 app-server
+JSON-RPC。V0.6.x 的 ArtifactWatcher / `ccteam-flow` 编排实现保留在独立 crate,
+不属于 IM gateway daemon 热路径。
 
 ```
-Channel Layer (V0.6.0 F109+F116 实化;V0.6.1 F130 single-process; V0.6.3 F143 加 webhook ingress)  →  inbox/outbox 文件协议 + IM event bus
-   ccteam-imd supervisor task (in-process tokio task inside `ccteam start`)
+Channel Layer (V0.8.1 gateway;V0.6.3 F143 webhook ingress remains available)  →  inbox/outbox 文件协议 + IM event bus
+   ccteam-im gateway task (in-process tokio task inside `ccteam start`)
      ├── openhuman/channels Rust crate (telegram/slack/discord/lark/dingtalk/qq/...)
      ├── Reply Listener (borrowed OMC reply-listener.ts) + bot-to-bot @ routing + hop_limit
      ├── HarnessAdapter trait 调用(把 inbound IM 消息翻译成 TurnInput)
@@ -503,7 +529,7 @@ CLI 切成 **9 user-facing** + `internal` 折叠组（meta-agent / MCP / hook in
 **用户日常（9 个）**：
 ```bash
 ccteam init                  # 一次性 setup ~/.ccteam/ + 当前目录变 ccteam 项目（F72 三合一）
-ccteam start [--no-web]      # 起 orchestrator daemon + 嵌入 web UI
+ccteam start [--no-web]      # 起 v8.1 gateway daemon(IM gateway + MCP socket + web)
 ccteam stop                  # F86 graceful shutdown：写 /tmp/ccteam-<user>.shutdown trigger
 ccteam new <slug>            # init thin wrapper：在 ~/projects/<team>-<slug>/ 起新项目（F75）
 ccteam ls                    # 列所有 rostered 项目 + daemon health
@@ -517,6 +543,7 @@ ccteam web                   # 单独跑 web SPA（start 已含，这里给 head
 ```bash
 ccteam internal hook <progress-append|load-context|intercept-ask>
 ccteam internal mcp-serve                       # MCP stdio server，~/.claude.json wire
+~/.ccteam/run/mcp.sock                          # start daemon 内嵌 MCP Unix socket
 ccteam internal spawn <slug> <role> [prompt]    # 手动 spawn，写 .ccteam/spawn_requests/<role>-<ts>.json
 ccteam internal send <slug> <body>              # 写项目 inbox，allow_hyphen_values（F87）
 ccteam internal attach <slug>                   # tmux attach（meta + codex 还用）
@@ -847,7 +874,7 @@ apply the suggested fix, run `npm test`, and write result to `$CCTEAM_OUTPUT/`.
 
 | MCP | 用途 | 出处 |
 |---|---|---|
-| **Telegram bot** | V0.6 起统一走 `ccteam-imd` daemon + `openhuman/channels` Rust crate(F109/F116);`claude-plugins-official/telegram` 作 backup transport | 用户偏好 backup 时 `/ccteam-im-setup --transport official-telegram` 切换 |
+| **Telegram bot** | V0.8.1 起统一走 `ccteam-im` gateway + `openhuman/channels` Rust crate;`claude-plugins-official/telegram` 作 backup transport | 用户偏好 backup 时 `/ccteam-im-setup --transport official-telegram` 切换 |
 | **claude-mem** | 跨项目记忆**可选增强**（read-only MCP search / timeline / get_observations + 自带 hook 自动捕获）；ccteam 不写集成代码，LLM 自看 tool surface 决定用不用 | 已 ship 为可选项（M4）——默认路径走官方 `~/.claude/rules/` + auto-memory，装了 claude-mem 自动叠加 |
 | **Playwright** | E2E 测试（前端项目） | 已有 |
 | **GitHub** | PR 创建、issue 管理 | 可选（优先 `gh` CLI） |
@@ -870,7 +897,7 @@ V0.6 F111 起所有工具加 group 子前缀,**server name 不变**(`ccteam`),�
 
 **Wire 协议纪律(V0.6.5 F165)**:`ccteam mcp-serve` stdout 是 line-delimited JSON-RPC frame channel,**所有 tracing / 日志走 stderr**(`init_tracing_stderr()`),否则 first `tools/list` 那次 `register_bot` 之类的 `info!` 会污染 frame parse → MCP client 解析挂。其他子命令(`ccteam start` / `ccteam web`)stdout 继续是 human readable。`RUST_LOG=error` 不再是 MCP test 的必经环境(F165 前 F147 等用过这个 workaround)。
 
-**实现形态**：`ccteam-mcp` 与 `ccteam-core` 同 workspace（lib + 多 binary），通过 `ccteam internal mcp-serve` 子命令暴露——读写同一份 state.json / progress.jsonl，为 `ccteam tui`（未 ship） / `ccteam web` 三种前端共用 `ccteam-core` lib API（详见 §3.8 前端层小节），MCP 只是把这套 API 套上 MCP wire protocol 给外部 LLM 消费。
+**实现形态**：`ccteam-mcp` 与 `ccteam-core` 同 workspace（lib + 多 binary），通过 `ccteam internal mcp-serve` 子命令暴露 stdio MCP；V0.8.1 的 `ccteam start` 还在 `~/.ccteam/run/mcp.sock` 暴露同一 line-delimited JSON-RPC handler 供 daemon-local 客户端使用。两条 transport 共用同一 handler,读写同一份 state.json / progress.jsonl。
 
 ---
 

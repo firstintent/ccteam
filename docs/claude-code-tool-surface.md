@@ -3,6 +3,10 @@
 > 本文档面向 **`workflow.yaml` / `.claude/agents/<role>.md` 作者**和 **meta-agent / orchestrator 设计者**,
 > 解决一个核心问题:在 ccteam 编排的 Claude Code session 里,**谁能触发什么命令、怎么触发**。
 >
+> V0.8.1 note:no-slug `ccteam start` 是 IM/session gateway daemon,不跑
+> `ccteam-flow` tick。MCP 仍可通过 stdio `ccteam mcp-serve` 使用;daemon 另在
+> Unix 平台提供 `~/.ccteam/run/mcp.sock` line-delimited JSON-RPC transport。
+>
 > 不读这份文档的后果:role.md 里写"请用 `/review` 检查代码",运行时模型把 `/review` 当死字符输出 → orchestrator 拿不到 review report → 整条 workflow 静默失败。
 >
 > Claude Code 工具触发面与 ccteam workflow.yaml 的映射详见文末《workflow.yaml trigger ↔ Claude Code 工具触发面》。

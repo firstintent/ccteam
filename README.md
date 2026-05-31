@@ -86,13 +86,13 @@ The AI runs on **your computer** — it can read your files, run your commands, 
 
 ## Run as a daemon
 
-`ccteam start` runs the orchestrator in the foreground (or as a detached process). To stop it cleanly:
+`ccteam start` runs the gateway daemon in the foreground (or as a detached process): IM gateway, local MCP socket, and the web dashboard share one process. To stop it cleanly:
 
 ```bash
 kill -TERM $(cat ~/.ccteam/ccteam.pid)   # or just Ctrl+C in the foreground terminal
 ```
 
-It drains within 5 seconds, releases the web port, and unlinks its pidfile automatically. Long-running tmux chat sessions survive a daemon restart and are re-attached on the next `ccteam start` — upgrading ccteam does not lose your bot's context. If a chat pane was killed (OOM, manual `tmux kill-session`), the next `ccteam start` re-spawns it with `claude --resume <name>` so the model reloads its full API-level context (tool-use history, cache, reasoning) losslessly via the official Anthropic CLI path. If resume isn't possible (no on-disk session, schema drift), ccteam falls back to a fresh session and emits a visible `chat_session_reset` event — you'll see the bot acknowledge the reset rather than silently forget.
+It drains within 5 seconds, releases the web port and MCP socket, and unlinks its pidfile automatically. Long-running tmux chat sessions survive a daemon restart and are re-attached on the next `ccteam start` — upgrading ccteam does not lose your bot's context. If a chat pane was killed (OOM, manual `tmux kill-session`), the next `ccteam start` re-spawns it with `claude --resume <name>` so the model reloads its full API-level context (tool-use history, cache, reasoning) losslessly via the official Anthropic CLI path. If resume isn't possible (no on-disk session, schema drift), ccteam falls back to a fresh session and emits a visible `chat_session_reset` event — you'll see the bot acknowledge the reset rather than silently forget.
 
 ## Docs
 

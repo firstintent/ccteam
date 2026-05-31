@@ -169,11 +169,11 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
 
 | Anchor tag | Site | Reason deferred |
 |---|---|---|
-| `TODO(V0.7-im-providers)` | `crates/ccteam-imd/src/daemon.rs:411` | `SlackChannel` / `DiscordChannel` wiring bundled with V0.7 Epic C(国内 IM + Slack Socket Mode / inbound HTTP)so the daemon wiring, HMAC verification, and onboarding skill ship as one wave |
-| `TODO(V0.7-listbots-cache)` | `crates/ccteam-imd/src/daemon.rs:469` | V0.6.x single-bot host-probe disk-read is unmeasurable noise;cache invalidation contract V0.7 Epic C scale 时再评估(原与 chat-handle 配对的理由已随 V0.6.8 schema 落地消解) |
-| `TODO(V0.7-human-approval-adapter)` | `crates/ccteam-core/src/orchestrator.rs:686` | V0.6.1 F124 + F98 narrow-scope poll-time HITL gate already delivers the user-visible contract;dedicated wrapper is pure refactor with zero behavioural delta — pre-v1.0 不为零增益 churn trait surface |
-| `TODO(V0.7-slack-inbound)` | `crates/ccteam-imd/src/three_layer_sec.rs:111` | Slack HMAC-SHA256 sig verify only consumed by V0.7 inbound HTTP receiver;V0.6.x Slack uses polling which carries no signed-request — wiring 3 deps(`hmac` / `sha2` / `subtle`)now risks drift before consumer lands |
-| `TODO(V0.7-slack-socket-mode)` | `crates/ccteam-imd/src/transport/providers/slack.rs:7` | V0.6.x host probe runs one Slack channel with `POLL_INTERVAL_SECS=4` well under rate limits;Socket Mode adds `tokio-tungstenite` + reconnect / backoff state machine that benefits primarily from V0.7 Epic C multi-channel scale |
+| `TODO(V0.7-im-providers)` | `crates/ccteam-im/src/daemon.rs:365` | `SlackChannel` / `DiscordChannel` wiring bundled with V0.7 Epic C(国内 IM + Slack Socket Mode / inbound HTTP)so the daemon wiring, HMAC verification, and onboarding skill ship as one wave |
+| `TODO(V0.7-listbots-cache)` | closed V0.6.8 | V0.6.x single-bot host-probe disk-read is unmeasurable noise;cache invalidation contract V0.7 Epic C scale 时再评估(原与 chat-handle 配对的理由已随 V0.6.8 schema 落地消解) |
+| `TODO(V0.7-human-approval-adapter)` | `crates/ccteam-flow/src/orchestrator.rs:731` | V0.6.1 F124 + F98 narrow-scope poll-time HITL gate already delivers the user-visible contract;dedicated wrapper is pure refactor with zero behavioural delta — pre-v1.0 不为零增益 churn trait surface |
+| `TODO(V0.7-slack-inbound)` | `crates/ccteam-im/src/three_layer_sec.rs:111` | Slack HMAC-SHA256 sig verify only consumed by V0.7 inbound HTTP receiver;V0.6.x Slack uses polling which carries no signed-request — wiring 3 deps(`hmac` / `sha2` / `subtle`)now risks drift before consumer lands |
+| `TODO(V0.7-slack-socket-mode)` | `crates/ccteam-im/src/transport/providers/slack.rs:7` | V0.6.x host probe runs one Slack channel with `POLL_INTERVAL_SECS=4` well under rate limits;Socket Mode adds `tokio-tungstenite` + reconnect / backoff state machine that benefits primarily from V0.7 Epic C multi-channel scale |
 
 ### V0.6.8 closed anchors(原 F168 候选,本版 retire)
 
@@ -204,6 +204,19 @@ V0.6.8 ship 29 finding,围绕 chat-mode squad 实战发现的全套问题集中�
 ### V0.7-deferred TODO 索引(grep `TODO\(V0\.7-` 4 命中,F168 6 项缩到 4)
 
 V0.6.8 closes `chat-handle`(F180-F184)+ `listbots-cache`(F168 原 deferred 理由消解);剩 4 个 V0.7-deferred 锚点:`im-providers` / `human-approval-adapter` / `slack-inbound` / `slack-socket-mode`。
+
+## V0.8.1 索引(v8.1 architecture cutover)
+
+V0.8.1 是架构竖切,不是新增 domain-specific team finding。完整 detail 在
+`docs/versions/v0-8-1/README.md`;本表只钉耦合红线:
+
+| Area | Status | Coupling note |
+|---|---|---|
+| `ccteam-mux` / `MuxBackend` rename | closed | 执行层命名收敛到 `ccteam-harness` / `ProcessBackend`;tmux pane 操作限定在 `PaneBackend` 子 trait,避免把 tmux 假设推回通用 backend。 |
+| `ccteam-imd` rename | closed | IM crate 为 `ccteam-im`;历史 `imd` 路径只可出现在版本归档/旧注释,新代码不要新增。 |
+| core / flow split | closed | 编排实现属于 `ccteam-flow`;`ccteam-core` 保持 primitives;拓扑必须是 `core -> harness -> cost`,不要反向依赖。 |
+| daemon tick retirement | closed | no-slug `ccteam start` 是 gateway daemon(IM gateway + MCP socket + web + hook sink),不构造 `ccteam-flow::Orchestrator`,不把 supervisor tick 重新塞回 `ccteam-im`。 |
+| progress bridge authority | closed | `harness/progress_bridge` 是写入 schema 单一权威;`core` re-export 仅兼容。 |
 
 ## V0.4.6 摘要更新
 

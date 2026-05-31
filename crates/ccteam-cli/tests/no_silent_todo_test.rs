@@ -27,6 +27,7 @@ const SCAN_ROOTS: &[&str] = &[
     "crates/ccteam-core/src",
     "crates/ccteam-cli/src",
     "crates/ccteam-cost/src",
+    "crates/ccteam-flow/src",
     "crates/ccteam-im/src",
     "crates/ccteam-web/src",
 ];

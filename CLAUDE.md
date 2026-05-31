@@ -1,41 +1,44 @@
 # CLAUDE.md — ccteam 实现导引
 
 > 本文档面向**下一次接手 ccteam 实现的 Claude session**。每次起手必读。
-> 历史里程碑 + 升级 migration 见 `docs/versions/v0-X-Y/README.md`,本文描述**当前状态 + 红线 + 纪律**;**§〇 标注在建的 v8.1 新架构方向(与下文冲突处以 §〇 为准)**。
+> 历史里程碑 + 升级 migration 见 `docs/versions/v0-X-Y/README.md`,本文描述**当前状态 + 红线 + 纪律**。
 
 ---
 
-## 〇、v8.1 新架构方向(在建 —— 与下文冲突处以此为准)
+## 〇、v0.8.1 / v8.1 当前架构红线
 
-本仓正按 **v8.1「云 CC/Codex + IM」新架构**改造:设计 `notes/im.html`,开发计划 `notes/plan.html`(新 session `/goal` 执行,P0–P6 每步带验收 gate)。**下文 §一~ 描述当前 V0.6.8 实现;凡与 v8.1 冲突按 v8.1,v8.1 未触及处仍按下文:**
+本仓已落地 **v8.1「云 CC/Codex + IM」架构切换**(版本号 `0.8.1`):设计源 `notes/im.html`,阶段交接 `notes/v8.1-progress.md`。**下文若仍有 V0.6.x / orchestrator-era 术语残留,以本节为准:**
 
-- **改名/重构**:`ccteam-mux`→`ccteam-harness`、`MuxBackend`→`ProcessBackend`(tmux 专属方法 pane/resize 只在 `TmuxBackend`)、`ccteam-imd`→`ccteam-im`;orchestrator 从 `ccteam-core` 抽到新 crate `ccteam-flow`(core 瘦成 primitives leaf)。
-- **执行层两轴**:`HarnessAdapter`(vendor 怎么驱动:Claude=tmux+send-keys+transcript+hook;Codex=app-server JSON-RPC)× `ProcessBackend`(进程跑哪:tmux/inproc/remote);两 vendor 归一成中立 `CanonicalEvent` + `ApprovalIR`(**不**抄 alleycat 的 codex-emulation)。
-- **daemon = IM⇄session 路由网关**(一个进程含 im-gateway + MCP server + web server,**不 tick、无 orchestrator 循环**);编排 `ccteam-flow` **推后**,过渡期借 cc/codex 内部编排。
+- **改名/重构已收敛**:`ccteam-mux`→`ccteam-harness`、`MuxBackend`→`ProcessBackend`、`ccteam-imd`→`ccteam-im`;orchestrator 从 `ccteam-core` 抽到 `ccteam-flow`(core 瘦成 primitives leaf)。拓扑保持 `core -> harness -> cost`,不要翻成 `harness -> core`。
+- **执行层两轴**:`HarnessAdapter`(vendor 怎么驱动:Claude=tmux+send-keys+transcript+hook;Codex=app-server JSON-RPC)× `ProcessBackend`(进程跑哪:tmux/inproc/remote);tmux pane 操作只属于 `PaneBackend` 子 trait。两 vendor 归一成中立 `CanonicalEvent` + `ApprovalIR`(**不**抄 alleycat 的 codex-emulation)。
+- **daemon = IM⇄session 路由网关**(一个进程含 IM gateway + MCP Unix socket + web server,**不 tick、无 orchestrator 循环**);编排 `ccteam-flow` 推后,过渡期借 cc/codex 内部编排。
+- **`ccteam init` 当前布局**:项目内写 `.ccteam/{agents,skills,state.json}` + `.claude/agents`;`.ccteam/skills/.gitkeep` 预留项目自有 skill 扩展。
+- **`ccteam start` 当前职责**:无 slug 时只启动 resident gateway daemon(web + IM gateway + MCP socket + 可选 hook sink),不构造 `ccteam-flow::Orchestrator`,legacy `--tick-seconds` / `--claude-argv` 仅兼容解析。
 - **会话 = resume-by-id**(spawn-on-demand + 按 id resume + 空闲释放,**非**常驻吊着):IM session 属 chat 类,红线「每次 spawn = fresh 1M context」对它**不适用**(chat 复用 context 本就是 feature);autonomous bg 路径仍 fresh-spawn。
 - **v8.1 不做手机批准** → agent 走 `--dangerously-skip-permissions`(无批准门);`ApprovalIR` 留类型占位,HITL 批准推后。
 - **核心概念 `chat ⇄ project ⇄ session`**:一个 chat = 你的终端,跨多 project、随时 `/new` 多 session、随时切(`@bot` / `/use` / `/cd`);命令 Claude 走 send-keys、Codex 走 app-server RPC(/compact=`thread/compact/start`、/review=`review/start`)。
 - **vendor 选型**:Claude→tmux(全 TUI + 耐久 + 已有);Codex→app-server(原生、文档化)。per-adapter best-fit,不强行统一。
+- **progress 写入权威**:`harness/progress_bridge` 是 schema 单一权威,`core` 只 re-export。
 
-> 验证优先用确定性 fake(`CCTEAM_{CLAUDE,CODEX}_BIN`);每 phase 不退 baseline。术语与图以 `notes/im.html` 为准。
+> 验证优先用确定性 fake(`CCTEAM_{CLAUDE,CODEX}_BIN`);每 phase 不退 baseline。恢复时先读 `notes/v8.1-progress.md`,不要整篇重读 `notes/plan.html` / `notes/im.html`。
 
 ---
 
-## 一、当前状态(2026-05-25)
+## 一、当前状态(2026-06-01)
 
 | 项 | 值 |
 |---|---|
 | 主分支 main HEAD | 以 `git rev-parse origin/main` 为准 |
-| Workspace version | **`0.6.8`** |
-| 测试 baseline | **`1549/1`**(`cargo test --workspace --locked --no-fail-fast --exclude ccteam-web`,1 fail 是 inotify-busy 宿主上 `daemon_dm_no_at_mention_auto_routes_to_single_bot` env-race(WSL2 fs.inotify.max_user_instances=128 易触顶,单跑必过);ccteam-web ws_* 测试在本机 hang,CI 跑全 workspace baseline 含 ccteam-web 约 1700/1,1 known flake `workflow_summary_reflects_agent_spawn_and_done_events` running_count)|
+| Workspace version | **`0.8.1`** |
+| 测试 baseline | **`1732/0`**(`cargo test --workspace --locked --no-fail-fast --exclude ccteam-web`,2026-06-01 本机通过;`ccteam-web` ws_* 测试仍留 CI/专机跑)|
 | Clippy | **0 errors + 0 warnings**(`-D warnings` clean)|
 | 代码规模 | ~96 kLOC Rust(workspace,~66 kLOC src + ~30 kLOC tests,不含 references)|
-| 当前最新版 | **V0.6.8**(F175-F203 共 29 finding,围绕 chat-mode squad 模式深度修复:F175-F177 fan-out 修复(tmux env + hook marker + tail loop)/ F178-F179 install + skill polish / F180-F184 chat_handle schema + auto-mint nicknames + unknown-handle UX / F185 BotRegistration.project_dir / F186-F187 hook HTTP header env injection + tail missed-marker WARN / F188-F189 chat-squad template schema sync + N-agent / F190 MailboxResolver config.yaml fallback / F191 handle override SKILL / F192 Codex doctor canary + retry cap + permanent-failure / F193 bot-to-bot @mention via daemon mpsc / F194-F195 DM multi-bot hint + per-turn timeout watchdog / F196 SessionStart marker self-heal / F197-F198 ccteam-creator bootstrap state.json + hook.sh wiring / F199-F200 outbound from-prefix + squad teammate awareness in persona / F201 plugin manifest version sync + CI gate / F202 ccteam admin register-bot/unregister-bot CLI / F203 init --force self-repo)— 详 `docs/versions/v0-6-8/README.md` |
-| 上一版 | **V0.6.7**(F174 install-fix ship-blocker patch:musl static dual-arch + linux-arm64 prebuilt + install.sh `linux-arm64` 支持;0 行 ccteam 业务代码改动)— 详 `docs/versions/v0-6-7/README.md` |
-| 上上版 | **V0.6.6**(F166-F173:零摩擦 install.sh + F167 creator sensible defaults + F168 active TODO sweep + F172 V2 mode-3 上下文恢复 via `claude --resume <name>` + F173 Codex daemon-routed critic 统一 cost rollup)— 详 `docs/versions/v0-6-6/README.md` |
+| 当前最新版 | **V0.8.1**(v8.1 云 CC/Codex + IM 架构竖切:rename 到 harness/im,core→flow 抽离,Claude tmux adapter skip-perms, Codex app-server RPC,IM gateway 接管 session 生命周期,`ccteam start` 成为不 tick 的 gateway daemon,init 写 `.ccteam/{agents,skills,state.json}`)— 详 `docs/versions/v0-8-1/README.md` |
+| 上一版 | **V0.6.8**(F175-F203 共 29 finding,chat-mode squad 深度修复)— 详 `docs/versions/v0-6-8/README.md` |
+| 上上版 | **V0.6.7**(F174 install-fix ship-blocker patch:musl static dual-arch + linux-arm64 prebuilt + install.sh `linux-arm64` 支持)— 详 `docs/versions/v0-6-7/README.md` |
 | V0.6.4 注 | **V0.6.4** OutboundCursor race fix(无独立 docs dir,见 commit `504c208`)|
 | V0.6.x 延期候选 | 空(V0.6.8 闭所有 retained risk)|
-| V0.7 主线候选 | Epic C 国内 IM(WeChat / 飞书 / DingTalk / QQ)启用 + Slack inbound HTTP + Socket Mode(F168 anchor `TODO(V0.7-{im-providers,slack-inbound,slack-socket-mode})`)+ chat memory 跨设备同步 + monorepo-aware `.mcp.json` + migrate-from-claude + 6 号编排模式深化(HumanApproval × bg/chat 矩阵全开;`HumanApprovalAdapter` full wrapper F168 anchor `TODO(V0.7-human-approval-adapter)`)+ `/ccteam-creator` 完整 template library + LLM-assisted role auto-gen + `listbots-cache`(F168 anchor `TODO(V0.7-listbots-cache)`)+ workflow.yaml `chat.turn_timeout_sec` plumb 进 tick_supervisors(F195 caveat)|
+| V0.7 主线候选 | Epic C 国内 IM(WeChat / 飞书 / DingTalk / QQ)启用 + Slack inbound HTTP + Socket Mode(F168 anchor `TODO(V0.7-{im-providers,slack-inbound,slack-socket-mode})`)+ chat memory 跨设备同步 + monorepo-aware `.mcp.json` + migrate-from-claude + 6 号编排模式深化(HumanApproval × bg/chat 矩阵全开;`HumanApprovalAdapter` full wrapper F168 anchor `TODO(V0.7-human-approval-adapter)`)+ `/ccteam-creator` 完整 template library + LLM-assisted role auto-gen |
 | 历史版本 | V0.1 → V0.6.5 见各自 `docs/versions/v0-X-Y/README.md`(V0.6.4 仅 commit,无 dir)|
 
 **ccteam 是 Claude Code 之上的元工具**(V0.4.0+,V0.6.0 起转 product-ready 元 AI 团队)。架构 5 块:
@@ -61,11 +64,11 @@
 | 6 | `docs/ccteam-as-domain-agnostic-orchestrator.md` | 加新 team / 改红线时 |
 | 7 | `docs/claude-code-best-practices.md` | 改 agent prompt / hooks / context 管理时 |
 | 8 | `docs/claude-code-tool-surface.md` | 改 workflow.yaml + agent .md 时 |
-| 9 | `docs/versions/v0-6-8/README.md` | 看当前版本(V0.6.8:F175-F203 — chat-mode squad 深度修复:fan-out 修复 + chat_handle schema + bot-to-bot @mention via mpsc + creator bootstrap + squad teammate awareness + multi-bot UX + Codex retry cap + marker self-heal + plugin sync + register CLI)|
-| 10 | `docs/versions/v0-6-7/README.md` | 上版(V0.6.7:F174 install-fix musl static dual-arch)|
-| 11 | `docs/versions/v0-6-6/README.md` | 上上版(V0.6.6:F166-F173 — 零摩擦 install.sh + creator sensible defaults + mode-3 lossless resume + Codex critic unified cost)|
-| 12 | `docs/versions/v0-6-5/README.md` | V0.6.5:F146-F165 — Epic E chat MCP 桥 + Epic F advise/Codex critic + Epic G UX cohesion + Epic H 运维健壮性 |
-| 13 | `docs/versions/v0-6-1/README.md` | V0.6.1:Epic D/E/F + F98 + F119-F139 |
+| 9 | `docs/versions/v0-8-1/README.md` | 看当前版本(V0.8.1:v8.1 gateway daemon + harness/im rename + start/init cutover)|
+| 10 | `docs/versions/v0-6-8/README.md` | 上版(V0.6.8:F175-F203 — chat-mode squad 深度修复)|
+| 11 | `docs/versions/v0-6-7/README.md` | 上上版(V0.6.7:F174 install-fix musl static dual-arch)|
+| 12 | `docs/versions/v0-6-6/README.md` | V0.6.6:F166-F173 — 零摩擦 install.sh + creator sensible defaults + mode-3 lossless resume + Codex critic unified cost |
+| 13 | `docs/versions/v0-6-5/README.md` | V0.6.5:F146-F165 — Epic E chat MCP 桥 + Epic F advise/Codex critic + Epic G UX cohesion + Epic H 运维健壮性 |
 
 **起手 30 秒**:`git log -1` 看 HEAD → `cargo test --workspace --exclude ccteam-web 2>&1 | awk '/^test result/{p+=$4;f+=$6}END{print p,f}'` 校 1549/1 → 读用户诉求 → 干。
 

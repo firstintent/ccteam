@@ -61,6 +61,8 @@ First-source-wins,整团维度替换。读容错(yaml 错 → warn + 下一层),
 ├── .ccteam/                      # ccteam 元数据
 │   ├── workflow.yaml             # canonical 位置(F83;详见 §17)
 │   ├── state.json                # 项目级状态机(详见 §2.1)
+│   ├── agents/                   # v8.1 项目自有 agent assets(source-of-project layout)
+│   ├── skills/                   # v8.1 项目自有 skills;init 写 .gitkeep
 │   ├── escalation.md             # 触发用户介入时写这里
 │   ├── spawn_requests/           # MCP `spawn_agent` marker 桶(详见 §12.2)
 │   ├── stop_signal/              # MCP `stop_agent` marker 桶
@@ -612,8 +614,8 @@ fork_timeout_hours: 24            # L3 默认通过超时(careful 模式忽略)
 ### 10.1 启动 / 停止
 
 ```bash
-ccteam start                           # 启动 orchestrator + web UI(默认 127.0.0.1:7331)
-ccteam start --no-web                  # 只跑 orchestrator
+ccteam start                           # 启动 v8.1 gateway daemon(IM gateway + MCP socket + web,默认 127.0.0.1:7331)
+ccteam start --no-web                  # 只跑 gateway daemon,不启 web
 ccteam start --no-clipboard            # 不尝试把 web bearer token 复制到 clipboard
 ccteam start <slug>                    # V0.5.0 F93b:agent-team mode 项目 spawn lead([Y/n/attach])
 ccteam start <slug> --no-confirm       # F93b 脚本化跳过提示
@@ -624,6 +626,7 @@ ccteam stop                            # 优雅停机(保留 tmux session)
 ccteam stop <slug>                     # V0.5.0 F97:依 workflow.yaml::cleanup_on_stop 处理(force-kill / ask-lead / leave-running)
 ccteam stop <slug> --stop-timeout 120  # V0.5.0 F97:ask-lead 模式自定义等待秒数(默认 60)
 ccteam internal mcp-serve              # 作为 ccteam-mcp 跑 stdio MCP 协议(详见 §12)
+~/.ccteam/run/mcp.sock                 # `ccteam start` 内嵌 MCP Unix socket(line-delimited JSON-RPC)
 ```
 
 `ccteam stop` 行为详见 §10.6 末 + §17.1.4(`cleanup_on_stop` 策略)。
@@ -743,13 +746,13 @@ ccteam web --token-file <path>                    # 自定义 token 文件路径
 
 #### `ccteam stop` 行为契约
 
-CLI 写 `/tmp/ccteam-<user>.shutdown` trigger 文件 → daemon 主循环 select 检到 → 触发 `shutdown_token: tokio::sync::Notify` → cancel 所有 event_loop(F82 cancel-token,每个 loop 写 `workflow_done reason="shutdown"`)→ JoinSet `join_all()` 等所有 task 退出;30s timeout → `abort_all()` + log WARN。SIGTERM / SIGINT 等价 trigger(systemd / docker stop 兼容)。**不杀任何 tmux session**(CLAUDE.md §三红线);`ccteam start` 下次启动 `ensure_session` 自动 reattach。
+CLI 读取 `~/.ccteam/ccteam.pid`,把目标 daemon PID 写入 `/tmp/ccteam-<user>.shutdown` trigger 文件 → 目标 daemon 轮询到匹配 PID 后广播共享 shutdown watch signal → web / IM gateway / MCP socket / hook sink 各自 5s bounded drain → pidfile unlink。SIGTERM / SIGINT 等价 trigger(systemd / docker stop 兼容)。**不杀任何 tmux session**(CLAUDE.md §三红线);`ccteam start` 下次启动时由 gateway/session lifecycle 重新接管。
 
 **F163 — 信号生命周期**(V0.6.5):
 
 | 信号 | 行为 |
 |---|---|
-| `SIGTERM` / `SIGINT` (Ctrl-C) | 触发 graceful shutdown:orchestrator 30s drain → web/imd 各 5s drain → pidfile unlink → exit 0 |
+| `SIGTERM` / `SIGINT` (Ctrl-C) | 触发 graceful shutdown:web / ccteam-im / MCP socket / hook sink 各 5s drain → pidfile unlink → exit 0 |
 | `SIGKILL` | 不可捕获;OS 强杀后留 stale pidfile(下次 `ccteam start` 自动 reclaim)+ web port 由 OS 释放 |
 
 tmux 子 session 在任何场景下均**不被 daemon kill** — daemon 退出后 tmux session reparent 到 init(ppid=1),继续存活;`ccteam start` 重启后自动 reattach。
@@ -859,7 +862,7 @@ orchestrator 识别 `state.team == "meta-agent"` 走 `process_meta_project` 分�
 }
 ```
 
-由 `ccteam doctor --install-mcp` 写入(M2 release)。`ccteam mcp-serve` 是 binary 子命令,stdio 协议。
+由 `ccteam doctor --install-mcp` 写入(M2 release)。`ccteam mcp-serve` 是 binary 子命令,stdio 协议。V0.8.1 起,no-slug `ccteam start` 还会在 Unix 平台绑定 `~/.ccteam/run/mcp.sock`,使用同一 handler 处理 line-delimited JSON-RPC frame;非 Unix 平台继续使用 stdio transport。
 
 **V0.6.5 F165 — wire 通道纪律**:
 

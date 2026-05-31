@@ -133,7 +133,7 @@ ccteam --version    # 应输出当前版本号
 
 环境变量:
 - `CCTEAM_INSTALL_DIR=/usr/local/bin sh install.sh` —— 改装目录(系统级安装)
-- `CCTEAM_VERSION=v0.6.6 sh install.sh` —— 装指定 tag(不取 latest)
+- `CCTEAM_VERSION=v0.8.1 sh install.sh` —— 装指定 tag(不取 latest)
 
 macOS Gatekeeper 拦截(首次跑报"not verified developer"):
 ```bash
@@ -171,7 +171,7 @@ $ claude
   • mcp__ccteam__* tools available (workflow_* / chat_* / advise_* / admin_* / screenshot_*)
 ```
 
-跑 `ccteam doctor` 验装(claude CLI / MCP / tmux / pidfile 路径都查一遍);加 `--verify-mcp` 自检 MCP 工具表面齐全(应输出 `26 active, 0 stubs`,非零 exit 即 CI gate fail);加 `--check-codex-auto-critic` 验证 Codex 二审是否能开;加 `--check-cost-orphan` 对账 24h 内 ledger 与 progress.jsonl(catch spawn 路径漏写 ledger)。
+跑 `ccteam doctor` 验装(claude CLI / MCP / tmux / pidfile 路径都查一遍);加 `--verify-mcp` 自检 MCP 工具表面齐全(应输出 `27 active, 0 stubs`,非零 exit 即 CI gate fail);加 `--check-codex-auto-critic` 验证 Codex 二审是否能开;加 `--check-cost-orphan` 对账 24h 内 ledger 与 progress.jsonl(catch spawn 路径漏写 ledger)。`ccteam start` 还会启动本机 MCP socket:`~/.ccteam/run/mcp.sock`。
 
 → 卡了?见 [troubleshooting.md](troubleshooting.md) "plugin install 失败"。
 
