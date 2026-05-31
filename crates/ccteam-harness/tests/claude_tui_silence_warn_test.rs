@@ -9,7 +9,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ccteam_harness::execution::transcript_tail::active_session_id_path;
+use ccteam_harness::execution::transcript_tail::{active_session_id_path, encode_project_cwd};
 use serial_test::serial;
 use tempfile::TempDir;
 use tracing::field::{Field, Visit};
@@ -94,7 +94,7 @@ async fn tail_loop_warns_once_when_marker_missing_for_threshold() {
     std::fs::create_dir_all(&project_dir).unwrap();
     // Pre-create the Anthropic projects dir so `parent_dir.exists()` is
     // true and we land in the watch-arming code path quickly.
-    let encoded = cwd.to_string_lossy().replace('/', "-");
+    let encoded = encode_project_cwd(&cwd);
     let anthropic_dir = fake_home.join(".claude").join("projects").join(&encoded);
     std::fs::create_dir_all(&anthropic_dir).unwrap();
 
@@ -110,12 +110,6 @@ async fn tail_loop_warns_once_when_marker_missing_for_threshold() {
     let capture = WarnCapture::default();
     let captured_for_assert = capture.clone();
     let dispatch = tracing::Dispatch::new(capture);
-    // The tail loop runs on a tokio-spawned task — the dispatcher
-    // scope on the caller side wouldn't follow into the spawned task.
-    // `set_global_default` is once-per-process; we ignore the error so
-    // re-running this test (or running it alongside another that
-    // already set one) doesn't panic.
-    let _ = tracing::dispatcher::set_global_default(dispatch);
 
     let handle = ThreadHandle {
         vendor: AgentVendor::Claude,
@@ -130,7 +124,7 @@ async fn tail_loop_warns_once_when_marker_missing_for_threshold() {
     };
 
     let adapter = ClaudeTuiAdapter::new();
-    let _stream = adapter.events(&handle);
+    let _stream = tracing::dispatcher::with_default(&dispatch, || adapter.events(&handle));
 
     // The 2s safety-net tick gates the WARN — sleep long enough for at
     // least one tick past the 100ms threshold to land. 3s is safe.

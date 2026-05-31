@@ -5,9 +5,9 @@
 
 ---
 
-## 〇、v0.8.1 / v8.1 当前架构红线
+## 〇、v0.8.2 / v8.2 当前架构红线
 
-本仓已落地 **v8.1「云 CC/Codex + IM」架构切换**(版本号 `0.8.1`):设计源 `notes/im.html`,阶段交接 `notes/v8.1-progress.md`。**下文若仍有 V0.6.x / orchestrator-era 术语残留,以本节为准:**
+本仓已落地 **v8.2「云 CC/Codex + IM」真实路径收敛**(版本号 `0.8.2`):设计源 `notes/im.html`,阶段交接 `notes/v8.2-progress.md`。**下文若仍有 V0.6.x / orchestrator-era 术语残留,以本节为准:**
 
 - **改名/重构已收敛**:`ccteam-mux`→`ccteam-harness`、`MuxBackend`→`ProcessBackend`、`ccteam-imd`→`ccteam-im`;orchestrator 从 `ccteam-core` 抽到 `ccteam-flow`(core 瘦成 primitives leaf)。拓扑保持 `core -> harness -> cost`,不要翻成 `harness -> core`。
 - **执行层两轴**:`HarnessAdapter`(vendor 怎么驱动:Claude=tmux+send-keys+transcript+hook;Codex=app-server JSON-RPC)× `ProcessBackend`(进程跑哪:tmux/inproc/remote);tmux pane 操作只属于 `PaneBackend` 子 trait。两 vendor 归一成中立 `CanonicalEvent` + `ApprovalIR`(**不**抄 alleycat 的 codex-emulation)。
@@ -20,7 +20,7 @@
 - **vendor 选型**:Claude→tmux(全 TUI + 耐久 + 已有);Codex→app-server(原生、文档化)。per-adapter best-fit,不强行统一。
 - **progress 写入权威**:`harness/progress_bridge` 是 schema 单一权威,`core` 只 re-export。
 
-> 验证优先用确定性 fake(`CCTEAM_{CLAUDE,CODEX}_BIN`);每 phase 不退 baseline。恢复时先读 `notes/v8.1-progress.md`,不要整篇重读 `notes/plan.html` / `notes/im.html`。
+> 验证优先用确定性 fake(`CCTEAM_{CLAUDE,CODEX}_BIN`)和真实 WS smoke;每 phase 不退 baseline。恢复时先读 `notes/v8.2-progress.md`,不要整篇重读 `notes/plan.html` / `notes/im.html`。
 
 ---
 
@@ -29,12 +29,12 @@
 | 项 | 值 |
 |---|---|
 | 主分支 main HEAD | 以 `git rev-parse origin/main` 为准 |
-| Workspace version | **`0.8.1`** |
-| 测试 baseline | **`1732/0`**(`cargo test --workspace --locked --no-fail-fast --exclude ccteam-web`,2026-06-01 本机通过;`ccteam-web` ws_* 测试仍留 CI/专机跑)|
+| Workspace version | **`0.8.2`** |
+| 测试 baseline | **`1743/0`**(`cargo test --workspace --locked --no-fail-fast --exclude ccteam-web`,2026-06-01 本机通过;`ccteam-web` ws_* 测试仍留 CI/专机跑)|
 | Clippy | **0 errors + 0 warnings**(`-D warnings` clean)|
 | 代码规模 | ~96 kLOC Rust(workspace,~66 kLOC src + ~30 kLOC tests,不含 references)|
-| 当前最新版 | **V0.8.1**(v8.1 云 CC/Codex + IM 架构竖切:rename 到 harness/im,core→flow 抽离,Claude tmux adapter skip-perms, Codex app-server RPC,IM gateway 接管 session 生命周期,`ccteam start` 成为不 tick 的 gateway daemon,init 写 `.ccteam/{agents,skills,state.json}`)— 详 `docs/versions/v0-8-1/README.md` |
-| 上一版 | **V0.6.8**(F175-F203 共 29 finding,chat-mode squad 深度修复)— 详 `docs/versions/v0-6-8/README.md` |
+| 当前最新版 | **V0.8.2**(v8.2 真实 WS 端到端:多项目×多 session 路由、Claude tmux + Codex app-server 并发、daemon restart resume、真实二进制 fault visibility、退役遗留 supervisor tick coordinator)— 详 `docs/versions/v0-8-2/README.md` |
+| 上一版 | **V0.8.1**(v8.1 云 CC/Codex + IM 架构竖切:rename 到 harness/im,core→flow 抽离,Claude tmux adapter skip-perms, Codex app-server RPC,IM gateway 接管 session 生命周期,`ccteam start` 成为不 tick 的 gateway daemon,init 写 `.ccteam/{agents,skills,state.json}`)— 详 `docs/versions/v0-8-1/README.md` |
 | 上上版 | **V0.6.7**(F174 install-fix ship-blocker patch:musl static dual-arch + linux-arm64 prebuilt + install.sh `linux-arm64` 支持)— 详 `docs/versions/v0-6-7/README.md` |
 | V0.6.4 注 | **V0.6.4** OutboundCursor race fix(无独立 docs dir,见 commit `504c208`)|
 | V0.6.x 延期候选 | 空(V0.6.8 闭所有 retained risk)|
@@ -64,9 +64,9 @@
 | 6 | `docs/ccteam-as-domain-agnostic-orchestrator.md` | 加新 team / 改红线时 |
 | 7 | `docs/claude-code-best-practices.md` | 改 agent prompt / hooks / context 管理时 |
 | 8 | `docs/claude-code-tool-surface.md` | 改 workflow.yaml + agent .md 时 |
-| 9 | `docs/versions/v0-8-1/README.md` | 看当前版本(V0.8.1:v8.1 gateway daemon + harness/im rename + start/init cutover)|
-| 10 | `docs/versions/v0-6-8/README.md` | 上版(V0.6.8:F175-F203 — chat-mode squad 深度修复)|
-| 11 | `docs/versions/v0-6-7/README.md` | 上上版(V0.6.7:F174 install-fix musl static dual-arch)|
+| 9 | `docs/versions/v0-8-2/README.md` | 看当前版本(V0.8.2:真实 WS e2e + restart/fault + tick retirement)|
+| 10 | `docs/versions/v0-8-1/README.md` | 上版(V0.8.1:v8.1 gateway daemon + harness/im rename + start/init cutover)|
+| 11 | `docs/versions/v0-6-8/README.md` | 上上版(V0.6.8:F175-F203 — chat-mode squad 深度修复)|
 | 12 | `docs/versions/v0-6-6/README.md` | V0.6.6:F166-F173 — 零摩擦 install.sh + creator sensible defaults + mode-3 lossless resume + Codex critic unified cost |
 | 13 | `docs/versions/v0-6-5/README.md` | V0.6.5:F146-F165 — Epic E chat MCP 桥 + Epic F advise/Codex critic + Epic G UX cohesion + Epic H 运维健壮性 |
 

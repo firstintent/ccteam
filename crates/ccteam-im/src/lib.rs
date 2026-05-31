@@ -148,9 +148,8 @@ pub fn registration_path(slug: &str, role: &str) -> PathBuf {
     registration_path_in(&default_ccteam_root(), slug, role)
 }
 
-/// V0.6.5 F146 — per-bot heartbeat sidecar under the registry, so the
-/// MCP tool process (which has no access to the daemon's in-memory
-/// `SupervisorRegistry`) can read `running` status off disk. Sibling
+/// V0.6.5 F146 — per-bot heartbeat sidecar under the registry, so a
+/// separate MCP tool process can read `running` status off disk. Sibling
 /// of the registration JSON: `<ccteam_root>/imd/registry/<slug>/<role>.heartbeat`.
 pub fn bot_heartbeat_path_in(ccteam_root: &Path, slug: &str, role: &str) -> PathBuf {
     registry_root_in(ccteam_root)
@@ -227,10 +226,8 @@ pub fn last_turn_at(
 }
 
 /// V0.6.5 F147 — resolve `<project>/.ccteam/chat/<role>/inbox/` for
-/// this bot. The mailbox path the daemon's `drain_inboxes` / per-bot
-/// mpsc fast-path consume. MCP `chat_send_input` writes a router-style
-/// envelope here; daemon picks it up either via the fast-path (when
-/// the per-bot mpsc is wired) or via the safety-net drain tick.
+/// this bot. Legacy mailbox path consumed by supervisor-oriented chat
+/// helpers; v8.2 daemon IM ingress routes through the gateway directly.
 ///
 /// F185 — prefers `reg.project_dir` (absolute path) over the historic
 /// `<projects_root>/<workflow_slug>/` fallback so projects living
@@ -241,10 +238,9 @@ pub fn chat_inbox_dir(projects_root: &Path, reg: &BotRegistration) -> PathBuf {
 }
 
 /// V0.6.5 F147 — resolve `<project>/.ccteam/chat/<role>/signals/reset.signal`
-/// for this bot. MCP `chat_reset` writes this file; the supervisor's
-/// next tick reads it via `signal_present(.., RESET_SIGNAL)` and
-/// applies the ResetSession action (archive + close + start + cursor
-/// wipe). Honors `reg.project_dir` (F185).
+/// for this bot. Legacy supervisor reset signal path; v8.2 daemon IM
+/// ingress routes through the gateway directly. Honors
+/// `reg.project_dir` (F185).
 pub fn chat_reset_signal_path(projects_root: &Path, reg: &BotRegistration) -> PathBuf {
     reg.chat_dir(projects_root)
         .join("signals")
@@ -349,9 +345,9 @@ impl BotRegistration {
 /// 3. `projects_root.join(reg.workflow_slug)` — historical
 ///    `<projects_root>/<slug>/` layout used by pre-F185 registrations.
 ///
-/// The MailboxResolver + BotSupervisor + daemon `tick_supervisors` /
-/// `decide` paths funnel through this helper so the same priority chain
-/// applies everywhere; resolvers don't re-implement the logic.
+/// MailboxResolver, BotSupervisor, and gateway template registration
+/// funnel through this helper so the same priority chain applies
+/// everywhere; resolvers don't re-implement the logic.
 pub fn resolve_project_dir(
     reg: &BotRegistration,
     projects_root: &Path,
@@ -566,7 +562,7 @@ pub fn list_bots() -> Result<Vec<BotRegistration>> {
     list_bots_in(&default_ccteam_root(), None)
 }
 
-/// Heartbeat file the daemon refreshes every supervisor tick.
+/// Heartbeat file the daemon refreshes at startup.
 pub fn imd_heartbeat_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("/"))

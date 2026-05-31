@@ -139,7 +139,7 @@ pub fn chat_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "ccteam__chat_reset",
-            "description": "V0.6.5 F147 — request a session reset for a chat-mode bot. Writes `<project>/.ccteam/chat/<role>/signals/reset.signal`; the daemon's next supervisor tick (≤5s default) reads it, archives `turns.jsonl` → `archive/turns-<unix-ms>.jsonl`, force-resets the outbound + transcript cursors to 0 (V0.6.4 Bug B防线 — prevents the new session's first burst from being dedup-dropped), closes the active tmux session, and spawns a fresh one. Returns immediately after writing the signal — poll `chat_list_bots` for `last_turn_at` to observe the reset taking effect.",
+            "description": "V0.6.5 F147 legacy supervisor reset request for a chat-mode bot. Writes `<project>/.ccteam/chat/<role>/signals/reset.signal`; v8.2 daemon IM ingress routes through the gateway and no longer runs the supervisor tick loop, so this file is consumed only by legacy supervisor-driven chat paths. Returns immediately after writing the signal.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {

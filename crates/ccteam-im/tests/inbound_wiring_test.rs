@@ -333,11 +333,6 @@ async fn daemon_wires_mock_channel_to_supervisor_inbox() {
     let args = DaemonArgs {
         credentials: None,
         registry: Some(projects_root.clone()),
-        // Short tick so the supervisor spawns + inbox drains within
-        // the test budget. Two ticks are enough: first tick spawns
-        // the supervisor (no handle yet → `Spawn`), second tick (or
-        // first if the mailbox file is already there) drains the inbox.
-        tick: Duration::from_millis(50),
         max_runtime: Some(Duration::from_millis(1200)),
         adapter_factory: Some(adapter_factory),
         channels_override: Some(channels),
@@ -434,7 +429,6 @@ async fn daemon_routes_gateway_inbound_to_submit_turn_and_outbound() {
     let args = DaemonArgs {
         credentials: None,
         registry: Some(projects_root),
-        tick: Duration::from_millis(50),
         max_runtime: Some(Duration::from_millis(600)),
         adapter_factory: Some(adapter_factory),
         channels_override: Some(channels),
@@ -499,7 +493,6 @@ async fn daemon_replays_queued_durable_outbound_to_mock_channel() {
     let args = DaemonArgs {
         credentials: None,
         registry: Some(projects_root),
-        tick: Duration::from_millis(50),
         max_runtime: Some(Duration::from_millis(100)),
         adapter_factory: Some(adapter_factory),
         channels_override: Some(channels),
@@ -702,7 +695,6 @@ async fn daemon_routes_ws_channel_to_gateway_over_real_socket() {
     let args = DaemonArgs {
         credentials: None,
         registry: Some(projects_root),
-        tick: Duration::from_millis(50),
         max_runtime: Some(Duration::from_millis(1200)),
         adapter_factory: Some(adapter_factory),
         channels_override: Some(channels),
@@ -1189,7 +1181,6 @@ fn spawn_ws_gateway_daemon(
     let args = DaemonArgs {
         credentials: None,
         registry: Some(projects_root),
-        tick: Duration::from_millis(50),
         max_runtime: Some(Duration::from_secs(5)),
         adapter_factory: Some(adapter_factory),
         channels_override: Some(channels),
@@ -1219,7 +1210,6 @@ fn spawn_real_ws_gateway_daemon(
     let args = DaemonArgs {
         credentials: None,
         registry: Some(project_root),
-        tick: Duration::from_millis(50),
         max_runtime: Some(max_runtime),
         adapter_factory: Some(default_adapter_factory()),
         channels_override: Some(channels),
@@ -1254,7 +1244,6 @@ async fn run_mock_gateway_daemon<T>(
     let args = DaemonArgs {
         credentials: None,
         registry: Some(projects_root),
-        tick: Duration::from_millis(50),
         max_runtime: Some(Duration::from_millis(600)),
         adapter_factory: Some(adapter_factory),
         channels_override: Some(channels),

@@ -133,7 +133,7 @@ ccteam --version    # 应输出当前版本号
 
 环境变量:
 - `CCTEAM_INSTALL_DIR=/usr/local/bin sh install.sh` —— 改装目录(系统级安装)
-- `CCTEAM_VERSION=v0.8.1 sh install.sh` —— 装指定 tag(不取 latest)
+- `CCTEAM_VERSION=v0.8.2 sh install.sh` —— 装指定 tag(不取 latest)
 
 macOS Gatekeeper 拦截(首次跑报"not verified developer"):
 ```bash

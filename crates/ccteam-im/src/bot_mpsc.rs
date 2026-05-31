@@ -123,7 +123,7 @@ pub struct BotChannels {
 /// loop's `ensure_bot_channels` registration pass.
 pub type BotChannelMap = Arc<Mutex<HashMap<String, BotChannels>>>;
 
-/// Key the map uses — same convention as `SupervisorRegistry::key`.
+/// Key the map uses for per-bot channel lookup.
 pub fn bot_key(slug: &str, role: &str) -> String {
     format!("{slug}/{role}")
 }

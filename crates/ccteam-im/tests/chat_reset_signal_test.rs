@@ -8,10 +8,9 @@
 //!   `archive/turns-<unix-ms>.jsonl`, clears the on-disk transcript
 //!   cursor, deletes the signal file, and starts a fresh handle on
 //!   the adapter.
-//! - The V0.6.4 Bug B防线: post-reset, both the in-memory
-//!   `OutboundCursor` (when the daemon's `tick_supervisors` coordinator
-//!   wires one) AND the on-disk transcript cursor are zeroed so the
-//!   new session's first transcript bytes are NOT dedup-skipped.
+//! - The V0.6.4 Bug B防线: post-reset, the on-disk transcript cursor is
+//!   zeroed so the new session's first transcript bytes are NOT
+//!   dedup-skipped.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;

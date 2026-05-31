@@ -310,7 +310,6 @@ async fn daemon_dm_no_at_mention_auto_routes_to_single_bot() {
     let args = DaemonArgs {
         credentials: None,
         registry: Some(projects_root.clone()),
-        tick: Duration::from_millis(50),
         max_runtime: Some(Duration::from_millis(1200)),
         adapter_factory: Some(adapter_factory),
         channels_override: Some(channels),
@@ -393,7 +392,6 @@ async fn daemon_dm_multiple_bots_same_chat_id_replies_with_ambiguity_hint() {
     let args = DaemonArgs {
         credentials: None,
         registry: Some(projects_root.clone()),
-        tick: Duration::from_millis(50),
         max_runtime: Some(Duration::from_millis(800)),
         adapter_factory: Some(adapter_factory),
         channels_override: Some(channels),

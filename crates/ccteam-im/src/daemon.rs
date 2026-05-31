@@ -13,7 +13,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use anyhow::Result;
 use ccteam_harness::execution::{ClaudeTuiAdapter, CodexAppServerAdapter};
@@ -27,7 +27,7 @@ use crate::credentials::{self, Credentials};
 use crate::gateway::{Gateway, GatewayEvent};
 use crate::latency::now_unix_ms;
 use crate::router::{self, HandleMap};
-use crate::supervisor::{self, BotSupervisor};
+use crate::supervisor;
 use crate::three_layer_sec::{SecOutcome, ThreeLayerSec};
 use crate::transport::providers::telegram::TelegramChannel;
 use crate::transport::{Channel, ChannelMessage, SendMessage};
@@ -70,15 +70,12 @@ pub fn default_adapter_factory() -> AdapterFactory {
 }
 
 /// CLI arguments forwarded from `main.rs`.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct DaemonArgs {
     /// Override credentials path (`None` → default).
     pub credentials: Option<PathBuf>,
     /// Override registry root.
     pub registry: Option<PathBuf>,
-    /// Legacy supervisor tick interval. v8.1 daemon no longer uses
-    /// this; the field remains until P6 CLI/test surface cleanup.
-    pub tick: Duration,
     /// Optional max-runtime watchdog (`None` → unbounded; tests
     /// pass `Some(_)` to keep the harness from hanging).
     pub max_runtime: Option<Duration>,
@@ -100,7 +97,6 @@ impl std::fmt::Debug for DaemonArgs {
         f.debug_struct("DaemonArgs")
             .field("credentials", &self.credentials)
             .field("registry", &self.registry)
-            .field("tick", &self.tick)
             .field("max_runtime", &self.max_runtime)
             .field("adapter_factory", &self.adapter_factory.is_some())
             .field(
@@ -108,88 +104,6 @@ impl std::fmt::Debug for DaemonArgs {
                 &self.channels_override.as_ref().map(|m| m.len()),
             )
             .finish()
-    }
-}
-
-impl Default for DaemonArgs {
-    fn default() -> Self {
-        Self {
-            credentials: None,
-            registry: None,
-            tick: Duration::from_secs(5),
-            max_runtime: None,
-            adapter_factory: None,
-            channels_override: None,
-        }
-    }
-}
-
-/// V0.6.0 Wave 3 — keyed map of live [`BotSupervisor`]s.
-///
-/// Keyed by `"<slug>/<role>"` (same convention as `bot_dir`). New
-/// registrations grow the map; the daemon never removes entries
-/// during the loop (`unregister_bot` deletes the JSON on disk; the
-/// supervisor stays Shutdown via the signal file).
-#[derive(Default)]
-pub struct SupervisorRegistry {
-    inner: HashMap<String, Arc<BotSupervisor>>,
-}
-
-impl SupervisorRegistry {
-    fn key(reg: &BotRegistration) -> String {
-        format!("{}/{}", reg.workflow_slug, reg.role)
-    }
-
-    /// Add a supervisor for `reg` if one isn't already registered.
-    /// Returns the live (existing-or-new) supervisor handle. Wrapper
-    /// around [`Self::ensure_with_config`] that passes an empty F190
-    /// config-yaml tier (legacy / test callers without a config map).
-    pub fn ensure(
-        &mut self,
-        reg: &BotRegistration,
-        projects_root: &Path,
-        factory: &AdapterFactory,
-    ) -> Arc<BotSupervisor> {
-        self.ensure_with_config(reg, projects_root, factory, &HashMap::new())
-    }
-
-    /// V0.6.8 F190 — config-yaml-aware companion to [`Self::ensure`].
-    /// Wires the loaded `~/.ccteam/config.yaml::projects[]` slug → path
-    /// map into the new [`BotSupervisor`] so its
-    /// `project_dir()` / `bot_dir()` resolution honors the F190 tier
-    /// for legacy registrations.
-    pub fn ensure_with_config(
-        &mut self,
-        reg: &BotRegistration,
-        projects_root: &Path,
-        factory: &AdapterFactory,
-        config_projects: &std::collections::HashMap<String, PathBuf>,
-    ) -> Arc<BotSupervisor> {
-        let k = Self::key(reg);
-        self.inner
-            .entry(k)
-            .or_insert_with(|| {
-                let adapter = factory(reg.vendor);
-                Arc::new(BotSupervisor::new_with_config(
-                    reg.clone(),
-                    projects_root.to_path_buf(),
-                    adapter,
-                    config_projects.clone(),
-                ))
-            })
-            .clone()
-    }
-
-    /// Snapshot of every live supervisor for test introspection.
-    pub fn all(&self) -> Vec<Arc<BotSupervisor>> {
-        self.inner.values().cloned().collect()
-    }
-
-    /// V0.6.1 F132 — lookup the live supervisor for `reg` (used by the
-    /// inbox drain pass which iterates the registry and dispatches each
-    /// mailbox envelope to the matching `BotSupervisor::handle_inbound`).
-    pub fn lookup(&self, reg: &BotRegistration) -> Option<Arc<BotSupervisor>> {
-        self.inner.get(&Self::key(reg)).cloned()
     }
 }
 
@@ -247,9 +161,8 @@ where
         }
     };
 
-    // V0.6.1 F132 — projects_root used for both supervisor bot_dir
-    // resolution and the mailbox writer. Mirrors `tick_supervisors`'s
-    // fallback so test and production paths share one root.
+    // V0.6.1 F132 — projects_root used for gateway project fallback
+    // and legacy mailbox path resolution.
     let projects_root: PathBuf = args.registry.clone().unwrap_or_else(|| {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("/"))
@@ -780,9 +693,8 @@ pub enum CrossBotDispatch {
     },
     /// Resolved but the target bot's mpsc isn't wired in
     /// `bot_channels` yet (race: target registered after sender's
-    /// dispatcher spawned, supervisor tick hasn't run `ensure_bot_channels`
-    /// for it yet). Dropped — no envelope file exists so safety-net
-    /// drain doesn't cover this.
+    /// dispatcher spawned). Dropped — no envelope file exists so
+    /// safety-net drain doesn't cover this.
     TargetNotWired {
         /// Target slug the lookup resolved to.
         to_slug: String,
@@ -927,134 +839,6 @@ pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
     .await
 }
 
-/// V0.6.0 Wave 3 — per-tick driver. Registers any new bots with the
-/// supervisor registry, then for each known bot calls
-/// `decide(...)` against its live state and applies the resulting
-/// action through the supervisor (`apply_action`).
-///
-/// V0.6.5 F147 — when `bot_channels` is provided **and** the
-/// supervisor's decision is `ResetSession`, we force-reset the
-/// in-memory `OutboundCursor` (Bug B防线) before calling
-/// `apply_action`. The supervisor handles the on-disk side
-/// (archive + transcript cursor wipe + close + start) but cannot reach
-/// the cursor `Arc` itself — `bot_channels` owns those handles. When
-/// `bot_channels` is `None` (legacy callers / tests without an outbound
-/// pipeline wired), the cursor reset is skipped and the supervisor's
-/// disk-side wipe still applies; the next `load_from_disk` will pick
-/// up the cleared cursor on the next daemon restart.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) async fn tick_supervisors(
-    bots: &[BotRegistration],
-    registry: &Arc<Mutex<SupervisorRegistry>>,
-    projects_root_override: Option<&Path>,
-    factory: &AdapterFactory,
-    bot_channels: Option<&BotChannelMap>,
-) {
-    tick_supervisors_with_config(
-        bots,
-        registry,
-        projects_root_override,
-        factory,
-        bot_channels,
-        &HashMap::new(),
-    )
-    .await
-}
-
-/// V0.6.8 F190 — config-yaml-aware companion to [`tick_supervisors`].
-/// Daemon main loop reads `~/.ccteam/config.yaml::projects[]` once at
-/// startup and passes the slug → path map through here so legacy bots
-/// (no `reg.project_dir`) whose project lives outside the
-/// projects_root tree resolve to the right bot_dir for signal /
-/// heartbeat decisions.
-pub(crate) async fn tick_supervisors_with_config(
-    bots: &[BotRegistration],
-    registry: &Arc<Mutex<SupervisorRegistry>>,
-    projects_root_override: Option<&Path>,
-    factory: &AdapterFactory,
-    bot_channels: Option<&BotChannelMap>,
-    config_projects: &HashMap<String, PathBuf>,
-) {
-    let owned;
-    let projects_root: &Path = match projects_root_override {
-        Some(p) => p,
-        None => {
-            owned = dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("/"))
-                .join("projects");
-            &owned
-        }
-    };
-
-    // First pass: ensure a supervisor exists per bot. F190 — pass the
-    // config-yaml map so the new supervisor's `project_dir()` /
-    // `bot_dir()` honors the slug → path lookup for legacy
-    // registrations.
-    let supervisors: Vec<(BotRegistration, Arc<BotSupervisor>)> = {
-        let mut reg = registry.lock().await;
-        bots.iter()
-            .map(|b| {
-                let sup = reg.ensure_with_config(b, projects_root, factory, config_projects);
-                (b.clone(), sup)
-            })
-            .collect()
-    };
-
-    // Second pass: decide + apply per bot (drop the registry lock for
-    // each adapter call so a slow start_thread doesn't stall other
-    // bots' decisions). F190 — use `decide_with_config` so signal /
-    // heartbeat path resolution mirrors the supervisor's spawn path.
-    for (bot, sup) in supervisors {
-        let state = sup.state_snapshot().await;
-        let action = supervisor::decide_with_config(
-            projects_root,
-            &bot,
-            &state,
-            SystemTime::now(),
-            config_projects,
-        );
-        tracing::debug!(
-            slug = %bot.workflow_slug,
-            role = %bot.role,
-            ?action,
-            "supervisor decision"
-        );
-
-        // V0.6.5 F147 — Bug B防线: reset the in-memory OutboundCursor
-        // BEFORE the supervisor archives + restarts so any concurrent
-        // events-task push that lands during the gap is dedup-checked
-        // against position 0 (the post-reset baseline), not the
-        // pre-reset position that would silently drop new content.
-        if action == supervisor::SupervisorAction::ResetSession {
-            if let Some(ch_map) = bot_channels {
-                let key = bot_key(&bot.workflow_slug, &bot.role);
-                let cursor_opt = {
-                    let guard = ch_map.lock().await;
-                    guard.get(&key).map(|c| c.outbound_cursor.clone())
-                };
-                if let Some(cur) = cursor_opt {
-                    cur.force_set(0).await;
-                    tracing::info!(
-                        slug = %bot.workflow_slug,
-                        role = %bot.role,
-                        "F147 reset: in-memory OutboundCursor force-reset to 0 (Bug B防线)"
-                    );
-                }
-            }
-        }
-
-        if let Err(err) = sup.apply_action(action.clone()).await {
-            tracing::warn!(
-                slug = %bot.workflow_slug,
-                role = %bot.role,
-                ?action,
-                error = %err,
-                "apply_action failed"
-            );
-        }
-    }
-}
-
 /// Compatibility shim — `lib.rs` re-exports this so the existing
 /// `pub use daemon::run_daemon;` keeps working without forcing
 /// callers to depend on this module path directly.
@@ -1063,13 +847,6 @@ pub fn _link_check(_c: &Credentials) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
-    use ccteam_harness::{
-        AgentSpecBrief, ExecutionMode, HarnessError, SpawnCtx, ThreadEvent, ThreadHandle, TurnId,
-        TurnInput,
-    };
-    use futures::stream::BoxStream;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
     #[tokio::test(flavor = "current_thread", start_paused = false)]
@@ -1080,7 +857,6 @@ mod tests {
         let args = DaemonArgs {
             credentials: None,
             registry: None,
-            tick: Duration::from_millis(50),
             max_runtime: Some(Duration::from_millis(120)),
             adapter_factory: None,
             channels_override: None,
@@ -1090,166 +866,6 @@ mod tests {
         let hb = crate::imd_heartbeat_path();
         assert!(hb.exists(), "heartbeat at {} should exist", hb.display());
         std::env::remove_var("HOME");
-    }
-
-    #[derive(Debug, Default)]
-    struct RecordingAdapter {
-        starts: AtomicUsize,
-        closes: AtomicUsize,
-    }
-    #[async_trait]
-    impl HarnessAdapter for RecordingAdapter {
-        fn name(&self) -> &'static str {
-            "recording"
-        }
-        fn vendor(&self) -> AgentVendor {
-            AgentVendor::Claude
-        }
-        async fn start_thread(
-            &self,
-            spec: &AgentSpecBrief,
-            ctx: &SpawnCtx,
-        ) -> Result<ThreadHandle, HarnessError> {
-            self.starts.fetch_add(1, Ordering::SeqCst);
-            Ok(ThreadHandle {
-                vendor: AgentVendor::Claude,
-                mode: ExecutionMode::Chat,
-                identity: format!("rec-{}-{}", ctx.slug, spec.role),
-                started_at: chrono::Utc::now(),
-                raw_extras: serde_json::json!({}),
-            })
-        }
-        async fn submit_turn(
-            &self,
-            _h: &ThreadHandle,
-            _input: TurnInput,
-        ) -> Result<TurnId, HarnessError> {
-            Ok(TurnId::new("t"))
-        }
-        fn events(&self, _h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
-            Box::pin(futures::stream::empty())
-        }
-        async fn resume_thread(&self, _id: &str) -> Result<ThreadHandle, HarnessError> {
-            Err(HarnessError::NotImplemented {
-                reason: "stub".into(),
-            })
-        }
-        async fn close_thread(&self, _h: &ThreadHandle) -> Result<(), HarnessError> {
-            self.closes.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn tick_supervisors_registers_and_spawns_bot() {
-        let projects = TempDir::new().unwrap();
-        let adapter = Arc::new(RecordingAdapter::default());
-        let adapter_factory: AdapterFactory = {
-            let cloned = adapter.clone();
-            Arc::new(move |_| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
-        };
-        let registry = Arc::new(Mutex::new(SupervisorRegistry::default()));
-        let bot = BotRegistration {
-            workflow_slug: "dev-foo".into(),
-            role: "lead".into(),
-            vendor: AgentVendor::Claude,
-            persona_id: None,
-            im_platform: "telegram".into(),
-            im_chat_id: "1".into(),
-            chat_handle: None,
-            project_dir: None,
-            created_at: chrono::Utc::now(),
-        };
-
-        // Tick 1: decide() returns Spawn (no handle yet) → start_thread.
-        tick_supervisors(
-            std::slice::from_ref(&bot),
-            &registry,
-            Some(projects.path()),
-            &adapter_factory,
-            None,
-        )
-        .await;
-        assert_eq!(adapter.starts.load(Ordering::SeqCst), 1);
-
-        // Tick 2: heartbeat missing → decide() returns Restart → close + start.
-        tick_supervisors(
-            std::slice::from_ref(&bot),
-            &registry,
-            Some(projects.path()),
-            &adapter_factory,
-            None,
-        )
-        .await;
-        assert_eq!(adapter.starts.load(Ordering::SeqCst), 2);
-        assert_eq!(adapter.closes.load(Ordering::SeqCst), 1);
-
-        // Drop in a fresh heartbeat: next tick is a NoOp.
-        let bot_dir = projects.path().join("dev-foo/.ccteam/chat/lead");
-        std::fs::create_dir_all(&bot_dir).unwrap();
-        std::fs::write(bot_dir.join("heartbeat"), "x").unwrap();
-        tick_supervisors(
-            std::slice::from_ref(&bot),
-            &registry,
-            Some(projects.path()),
-            &adapter_factory,
-            None,
-        )
-        .await;
-        assert_eq!(adapter.starts.load(Ordering::SeqCst), 2, "no new start");
-
-        // Verify the supervisor is registered + holds a live handle.
-        let supervisors = registry.lock().await.all();
-        assert_eq!(supervisors.len(), 1);
-        assert!(supervisors[0].is_started().await);
-    }
-
-    #[tokio::test]
-    async fn tick_supervisors_honors_shutdown_signal() {
-        let projects = TempDir::new().unwrap();
-        let adapter = Arc::new(RecordingAdapter::default());
-        let adapter_factory: AdapterFactory = {
-            let cloned = adapter.clone();
-            Arc::new(move |_| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
-        };
-        let registry = Arc::new(Mutex::new(SupervisorRegistry::default()));
-        let bot = BotRegistration {
-            workflow_slug: "dev-foo".into(),
-            role: "lead".into(),
-            vendor: AgentVendor::Claude,
-            persona_id: None,
-            im_platform: "telegram".into(),
-            im_chat_id: "1".into(),
-            chat_handle: None,
-            project_dir: None,
-            created_at: chrono::Utc::now(),
-        };
-        // Tick 1: Spawn.
-        tick_supervisors(
-            std::slice::from_ref(&bot),
-            &registry,
-            Some(projects.path()),
-            &adapter_factory,
-            None,
-        )
-        .await;
-        assert_eq!(adapter.starts.load(Ordering::SeqCst), 1);
-
-        // Drop shutdown.signal; next tick → Shutdown action.
-        let sig_dir = projects.path().join("dev-foo/.ccteam/chat/lead/signals");
-        std::fs::create_dir_all(&sig_dir).unwrap();
-        std::fs::write(sig_dir.join("shutdown.signal"), "").unwrap();
-        tick_supervisors(
-            std::slice::from_ref(&bot),
-            &registry,
-            Some(projects.path()),
-            &adapter_factory,
-            None,
-        )
-        .await;
-        assert_eq!(adapter.closes.load(Ordering::SeqCst), 1);
-        let supervisors = registry.lock().await.all();
-        assert!(!supervisors[0].is_started().await);
     }
 
     /// `default_adapter_factory` must route the Codex arm to the mode-3

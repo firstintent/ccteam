@@ -597,7 +597,8 @@ impl HarnessAdapter for ClaudeTuiAdapter {
 
         if let (Some(pdir), Some(cwd)) = (project_dir, cwd) {
             if !role.is_empty() {
-                tokio::spawn(tail_loop(pdir, cwd, slug, role, tx));
+                let dispatch = tracing::dispatcher::get_default(Clone::clone);
+                tokio::spawn(tail_loop(pdir, cwd, slug, role, tx, dispatch));
             }
         }
 
@@ -694,6 +695,7 @@ async fn tail_loop(
     slug: String,
     role: String,
     tx: mpsc::Sender<ThreadEvent>,
+    dispatch: tracing::Dispatch,
 ) {
     let cursor_file = cursor_path(&project_dir, &role);
     let mut cursor = TranscriptCursor::load(&cursor_file).unwrap_or_default();
@@ -741,7 +743,7 @@ async fn tail_loop(
             );
             // Best-effort fallback to the legacy polling path —
             // shouldn't realistically happen on supported platforms.
-            tail_loop_polling(project_dir, cwd, slug, role, tx).await;
+            tail_loop_polling(project_dir, cwd, slug, role, tx, dispatch).await;
             return;
         }
     };
@@ -752,7 +754,7 @@ async fn tail_loop(
             "claude-tui tail: watch() failed; falling back to plain polling"
         );
         drop(watcher);
-        tail_loop_polling(project_dir, cwd, slug, role, tx).await;
+        tail_loop_polling(project_dir, cwd, slug, role, tx, dispatch).await;
         return;
     }
     tracing::info!(
@@ -780,6 +782,7 @@ async fn tail_loop(
         &slug,
         &role,
         &project_dir,
+        &dispatch,
     )
     .await;
     if let Some((sid, path)) = initial {
@@ -816,6 +819,7 @@ async fn tail_loop(
                             &slug,
                             &role,
                             &project_dir,
+                            &dispatch,
                         )
                         .await;
                         sid
@@ -828,6 +832,7 @@ async fn tail_loop(
                             &slug,
                             &role,
                             &project_dir,
+                            &dispatch,
                         )
                         .await;
                         continue;
@@ -874,6 +879,7 @@ async fn tail_loop(
                     &slug,
                     &role,
                     &project_dir,
+                    &dispatch,
                 )
                 .await;
                 if let Some((sid, path)) = pair {
@@ -909,8 +915,11 @@ async fn observe_marker(
     slug: &str,
     role: &str,
     project_dir: &Path,
+    dispatch: &tracing::Dispatch,
 ) {
-    silence.observe(marker_present, marker_file, role, project_dir);
+    tracing::dispatcher::with_default(dispatch, || {
+        silence.observe(marker_present, marker_file, role, project_dir)
+    });
     // Empty slug means raw_extras was malformed at `events()` entry —
     // the registry uses `(slug, role)` as the key so an empty slug
     // would never resolve. Skip the lookup to avoid noise.
@@ -1081,6 +1090,7 @@ async fn tail_loop_polling(
     slug: String,
     role: String,
     tx: mpsc::Sender<ThreadEvent>,
+    dispatch: tracing::Dispatch,
 ) {
     let cursor_file = cursor_path(&project_dir, &role);
     let marker_file = active_session_id_path(&project_dir, &role);
@@ -1113,7 +1123,16 @@ async fn tail_loop_polling(
         // hasn't published a marker yet, we wait.
         let (sid, transcript_path) = match read_marker_target(&marker_file, &parent_dir) {
             Some(pair) => {
-                observe_marker(&mut silence, true, &marker_file, &slug, &role, &project_dir).await;
+                observe_marker(
+                    &mut silence,
+                    true,
+                    &marker_file,
+                    &slug,
+                    &role,
+                    &project_dir,
+                    &dispatch,
+                )
+                .await;
                 pair
             }
             None => {
@@ -1124,6 +1143,7 @@ async fn tail_loop_polling(
                     &slug,
                     &role,
                     &project_dir,
+                    &dispatch,
                 )
                 .await;
                 tokio::time::sleep(Duration::from_millis(sleep_ms)).await;

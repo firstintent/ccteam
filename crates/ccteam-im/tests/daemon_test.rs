@@ -30,7 +30,6 @@ async fn daemon_runs_and_writes_heartbeat() {
     let args = DaemonArgs {
         credentials: None,
         registry: None,
-        tick: Duration::from_millis(40),
         max_runtime: Some(Duration::from_millis(150)),
         adapter_factory: None,
         channels_override: None,
@@ -92,8 +91,6 @@ fn register_overwrites_existing() {
 // ---------- V0.6.1 F119 — `wait_for_health` ----------
 
 /// Background-write a fresh heartbeat once, after the configured delay.
-/// Mirrors how the real daemon's supervisor tick refreshes
-/// `imd_heartbeat_path()`.
 fn schedule_heartbeat_write(after: Duration) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         std::thread::sleep(after);

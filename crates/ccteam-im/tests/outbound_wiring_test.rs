@@ -173,7 +173,6 @@ async fn daemon_does_not_tail_legacy_turns_jsonl() {
     let args = DaemonArgs {
         credentials: None,
         registry: Some(projects_root.clone()),
-        tick: Duration::from_millis(50),
         max_runtime: Some(Duration::from_millis(600)),
         adapter_factory: Some(adapter_factory),
         channels_override: Some(channels),
@@ -240,7 +239,6 @@ async fn daemon_no_op_when_turns_jsonl_missing() {
     let args = DaemonArgs {
         credentials: None,
         registry: Some(projects_root.clone()),
-        tick: Duration::from_millis(50),
         max_runtime: Some(Duration::from_millis(300)),
         adapter_factory: Some(adapter_factory),
         channels_override: Some(channels),
@@ -324,7 +322,6 @@ async fn daemon_does_not_replay_truncated_legacy_turns_jsonl() {
     let args = DaemonArgs {
         credentials: None,
         registry: Some(projects_root.clone()),
-        tick: Duration::from_millis(50),
         max_runtime: Some(Duration::from_millis(600)),
         adapter_factory: Some(adapter_factory),
         channels_override: Some(channels),
@@ -414,7 +411,6 @@ async fn drain_no_op_when_cursor_already_at_eof() {
     let args = DaemonArgs {
         credentials: None,
         registry: Some(projects_root.clone()),
-        tick: Duration::from_millis(50),
         max_runtime: Some(Duration::from_millis(400)),
         adapter_factory: Some(adapter_factory),
         channels_override: Some(channels),

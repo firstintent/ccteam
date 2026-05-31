@@ -288,11 +288,10 @@ pub fn decide(
     decide_with_config(projects_root, reg, state, now, &HashMap::new())
 }
 
-/// V0.6.8 F190 — config-yaml-aware variant of [`decide`]. The daemon's
-/// `tick_supervisors` reads `~/.ccteam/config.yaml::projects[]` once at
-/// startup and threads the slug → path map through this entry so a
-/// legacy bot (no `reg.project_dir`) whose project lives outside the
-/// projects_root tree still hits the right bot_dir for signal /
+/// V0.6.8 F190 — config-yaml-aware variant of [`decide`]. Legacy
+/// supervisor-driven callers thread the slug → path map through this
+/// entry so a bot (no `reg.project_dir`) whose project lives outside
+/// the projects_root tree still hits the right bot_dir for signal /
 /// heartbeat checks.
 pub fn decide_with_config(
     projects_root: &Path,
@@ -384,10 +383,9 @@ pub fn bot_dir(projects_root: &Path, reg: &BotRegistration) -> PathBuf {
 /// V0.6.8 F190 — config-yaml-aware variant of [`bot_dir`]. Resolves
 /// `<project>/.ccteam/chat/<role>/` honoring the full three-tier
 /// priority chain (`reg.project_dir` → `config_projects[slug]` →
-/// `<projects_root>/<slug>/`). Daemon `tick_supervisors` uses this
-/// via [`decide_with_config`] so legacy bots whose project lives
-/// outside the projects_root tree hit the right signal / heartbeat
-/// path.
+/// `<projects_root>/<slug>/`). Legacy supervisor-driven callers use
+/// this via [`decide_with_config`] so bots whose project lives outside
+/// the projects_root tree hit the right signal / heartbeat path.
 pub fn bot_dir_with_config(
     projects_root: &Path,
     reg: &BotRegistration,
@@ -884,9 +882,9 @@ impl BotSupervisor {
     ///    `chat_bot_permanent_failure` progress event so the daemon's
     ///    next `decide_with_config` short-circuits to `Quarantine` and
     ///    stops spamming identical WARNs every 5 seconds.
-    /// 3. Returns the underlying error to the caller (daemon's
-    ///    `apply_action`) — `tick_supervisors_with_config` logs at
-    ///    WARN level but continues running other bots.
+    /// 3. Returns the underlying error to the caller so legacy
+    ///    supervisor-driven loops can log it and continue running other
+    ///    bots.
     pub async fn ensure_started(&self) -> Result<()> {
         {
             let st = self.state.lock().await;

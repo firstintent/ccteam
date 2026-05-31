@@ -6,9 +6,9 @@
 
 ---
 
-## 0a. V0.8.1 当前架构覆盖层
+## 0a. V0.8.2 当前架构覆盖层
 
-V0.8.1 的产品运行态是 **IM gateway + session gateway**,不是旧
+V0.8.2 的产品运行态是 **IM gateway + session gateway**,不是旧
 orchestrator tick loop:
 
 - crate 命名已收敛:`ccteam-harness` 是执行层,`ccteam-im` 是 IM gateway,
@@ -23,9 +23,11 @@ orchestrator tick loop:
   仍是 Claude Code 当前读取路径。
 - Claude TUI adapter 走 `--dangerously-skip-permissions` + `tmux send-keys -l`;
   Codex app-server RPC 使用原生 `thread/compact/start` / `review/start`。
+- 真实 WS smoke 覆盖多项目×多 session、Claude+Codex 并发、daemon restart
+  resume,以及 Claude tmux / Codex app-server 故障的用户可见错误。
 
-后文保留大量 V0.6.x orchestrator 历史实现细节;实现新 v8.1 行为时以本节和
-`docs/versions/v0-8-1/README.md` 为准。
+后文保留大量 V0.6.x orchestrator 历史实现细节;实现新 v8.2 行为时以本节和
+`docs/versions/v0-8-2/README.md` 为准。
 
 ## 0. 红线表(V0.6.0 F106 双轴 scope)
 

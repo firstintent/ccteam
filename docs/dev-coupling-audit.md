@@ -137,7 +137,7 @@ ccteam-core/src/lib.rs:21`)把 dev 假设暴露到 lib 接口表面——**已�
 | **F145** | V0.6.3 | ✓ shipped | 跨 session 运行时路由 —— workflow.yaml 顶层 `squad: { leader, members, hop_limit }` 块(成员静态声明 → 「声明式拓扑」红线守);leader 写 `<member>--*.md`(可选 `<member>--h<N>--*` re-route)到 `<project>/.ccteam/squad/`,orchestrator ArtifactWatcher 加 `squad_root` extra-root + `SQUAD_ROUTE_SENTINEL` tag,`handle_squad_route` 按文件名前缀 spawn 对应 member(无 file-body parsing → R3 守);hop_limit 默认 3 → 超限 `escalation`(`kind: squad_hop_limit`)+ 未知 member 前缀 `kind: squad_unknown_target` → `docs/versions/v0-6-3/README.md` |
 | **F-Bug A/B** | V0.6.4 | ✓ shipped | OutboundCursor race fix — NAS 上 Telegram duplicate flood 排错产出(in-memory cursor 与 disk archive 不同步导致老 turns 被重发);patch 仅一次性 fix,无独立 docs dir,见 commit `504c208` |
 | **F146** | V0.6.5 | ✓ shipped wave 1 | `mcp__ccteam__chat_{register_bot,unregister_bot,list_bots}` 真实现(原 `chat_lifecycle` STUB 拆原子操作,无 deprecated alias)+ heartbeat sidecar 30s freshness 推断 running + `register_bot_in`/`list_bots_in`/`unregister_bot_in` 拿 explicit `ccteam_root` 给 tempdir-isolated tests + vendor lowercase 3 层 enforce(schema enum / dispatch / serde)→ `docs/versions/v0-6-5/wave-1-handoff.md` |
-| **F147** | V0.6.5 | ✓ shipped wave 1 | `mcp__ccteam__chat_{send_input,history,reset}` 真实现(`chat_session_reset`→`chat_reset` / `chat_show_turn_log`→`chat_history` rename 无 alias)+ `SupervisorAction::ResetSession` + `tick_supervisors(bot_channels)` 协调 in-memory `OutboundCursor` reset 配合 disk archive(V0.6.4 Bug B防线)+ `inbound::render_envelope` 升 pub 给 MCP 复用 → `docs/versions/v0-6-5/wave-1-handoff.md` |
+| **F147** | V0.6.5 | ✓ shipped wave 1; v8.2 gateway retired daemon tick coordinator | `mcp__ccteam__chat_{send_input,history,reset}` 真实现(`chat_session_reset`→`chat_reset` / `chat_show_turn_log`→`chat_history` rename 无 alias)+ `SupervisorAction::ResetSession` legacy path + disk archive(V0.6.4 Bug B防线)+ `inbound::render_envelope` 升 pub 给 MCP 复用。v8.2 生产 daemon 直接走 Gateway session lifecycle,不再运行 supervisor tick coordinator。→ `docs/versions/v0-6-5/wave-1-handoff.md` |
 | **F148** | V0.6.5 | ✓ shipped wave 1 | `/ccteam-creator` Phase 5.6/5.9 SKILL.md text 改 "调 Rust fn" → "调 `mcp__ccteam__chat_register_bot` MCP 工具" + JSON-args 示例;`e2e_creator_full_path_test.rs` 2 cases(wire-contract + SKILL.md text guard)用 stub TG + stub claude-tui。真机 round-trip 留 Wave 4 nas-box005 host-probe 签字 → `docs/versions/v0-6-5/wave-1-handoff.md` |
 | **F149** | V0.6.5 | ✓ shipped wave 1 | `/ccteam` 总入口 SKILL.md scrub 6+ 处 "Wave 1 fallback" / "Wave 2 not ready" / "Wave 3 未落地" stale phrase(frontmatter / skill 表 / 路由表 / dialog letter / Wave-status block 全对齐"已 ship");dispatcher 路由逻辑本身不动(doc-only)→ `docs/versions/v0-6-5/wave-1-handoff.md` |
 | **F150** | V0.6.5 | ✓ shipped wave 1 | `skills/ccteam-control/SKILL.md` 审计(已 MCP-first,无 `ccteam ctl` 残留)+ `crates/ccteam-cli/tests/mcp_admin_smoke_test.rs` 6 admin smoke(pause/resume/list/cost/stop_everything/change_persona)+ `docs/user-manual.md` §4 Admin 操作参考补完 → `docs/versions/v0-6-5/wave-1-handoff.md` |
@@ -204,6 +204,17 @@ V0.6.8 ship 29 finding,围绕 chat-mode squad 实战发现的全套问题集中�
 ### V0.7-deferred TODO 索引(grep `TODO\(V0\.7-` 4 命中,F168 6 项缩到 4)
 
 V0.6.8 closes `chat-handle`(F180-F184)+ `listbots-cache`(F168 原 deferred 理由消解);剩 4 个 V0.7-deferred 锚点:`im-providers` / `human-approval-adapter` / `slack-inbound` / `slack-socket-mode`。
+
+## V0.8.2 索引(v8.2 real-path closure)
+
+V0.8.2 收敛真实 WS 端到端与 Q6 清理。完整 detail 在
+`docs/versions/v0-8-2/README.md`;本表只钉新增耦合红线:
+
+| Area | Status | Coupling note |
+|---|---|---|
+| real WS e2e | closed | `scripts/smoke-im.sh --real` 可用真实 Claude tmux + Codex app-server,覆盖 `/compact`、双 harness 并发、daemon restart resume、Claude tmux death 和 Codex app-server disconnect 的 IM 可见错误。 |
+| supervisor tick coordinator | removed | `ccteam-im` 生产 daemon 不保留 `tick_supervisors` / `SupervisorRegistry` / `DaemonArgs.tick`;旧 supervisor reset signal 只属于 legacy supervisor-driven path,不要重新接进 gateway hot path。 |
+| gate baseline | closed | workspace version `0.8.2`;`cargo test --workspace --locked --no-fail-fast --exclude ccteam-web` 本机 `1743 passed, 15 ignored`;workspace clippy `-D warnings`,fmt,workspace build,normal smoke,real WS fault smoke 绿。 |
 
 ## V0.8.1 索引(v8.1 architecture cutover)
 
