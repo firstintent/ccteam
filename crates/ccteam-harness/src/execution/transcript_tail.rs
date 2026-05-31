@@ -159,7 +159,9 @@ impl TranscriptCursor {
 /// `~/.claude/projects/-home-rob-workplace-agents-ccteam/`).
 pub fn encode_project_cwd(cwd: &Path) -> String {
     let s = cwd.to_string_lossy();
-    s.replace('/', "-")
+    s.chars()
+        .map(|ch| if matches!(ch, '/' | '.') { '-' } else { ch })
+        .collect()
 }
 
 /// Resolve `~/.claude/projects/<encoded-cwd>/`.
@@ -534,6 +536,8 @@ mod tests {
     fn encode_project_cwd_uses_dashes() {
         let p = Path::new("/home/rob/workplace/agents/ccteam");
         assert_eq!(encode_project_cwd(p), "-home-rob-workplace-agents-ccteam");
+        let p = Path::new("/tmp/.tmpBxJUlA");
+        assert_eq!(encode_project_cwd(p), "-tmp--tmpBxJUlA");
     }
 
     #[test]

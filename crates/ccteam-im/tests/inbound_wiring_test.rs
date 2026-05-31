@@ -151,8 +151,12 @@ impl HarnessAdapter for GatewayAdapter {
         Box::pin(futures::stream::unfold((), move |_| {
             let events = Arc::clone(&events);
             async move {
-                let evt = events.lock().await.pop_front()?;
-                Some((evt, ()))
+                loop {
+                    if let Some(evt) = events.lock().await.pop_front() {
+                        return Some((evt, ()));
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
             }
         }))
     }
@@ -455,17 +459,20 @@ async fn daemon_routes_gateway_inbound_to_submit_turn_and_outbound() {
         contents,
         vec![
             "created session s1".to_string(),
+            "submitted s1 turn gateway-turn".to_string(),
             "gateway echo: hello gateway".to_string()
         ]
     );
 
     let rows = read_durable_outbound_rows();
-    assert_eq!(rows.len(), 4, "queued+sent rows per outbound message");
+    assert_eq!(rows.len(), 6, "queued+sent rows per outbound message");
     assert_eq!(rows[0]["state"], "queued");
     assert_eq!(rows[1]["state"], "sent");
     assert_eq!(rows[2]["state"], "queued");
     assert_eq!(rows[3]["state"], "sent");
-    assert_eq!(rows[3]["message"]["content"], "gateway echo: hello gateway");
+    assert_eq!(rows[4]["state"], "queued");
+    assert_eq!(rows[5]["state"], "sent");
+    assert_eq!(rows[5]["message"]["content"], "gateway echo: hello gateway");
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -677,6 +684,8 @@ async fn daemon_routes_ws_channel_to_gateway_over_real_socket() {
         ))
         .await
         .unwrap();
+    let ack = recv_ws_send(&mut socket).await;
+    assert_eq!(ack.content, "submitted s1 turn gateway-turn");
     let reply = recv_ws_send(&mut socket).await;
     assert_eq!(reply.content, "gateway echo: hello over ws");
     assert_eq!(adapter.starts.load(Ordering::SeqCst), 1);
@@ -709,6 +718,10 @@ async fn daemon_restart_preserves_ws_gateway_session() {
     send_ws_text(&mut first_socket, "ws-r1-msg", "before restart").await;
     assert_eq!(
         recv_ws_send(&mut first_socket).await.content,
+        "submitted s1 turn gateway-turn"
+    );
+    assert_eq!(
+        recv_ws_send(&mut first_socket).await.content,
         "gateway echo: before restart"
     );
     drop(first_socket);
@@ -721,6 +734,10 @@ async fn daemon_restart_preserves_ws_gateway_session() {
         spawn_ws_gateway_daemon(projects_root, second_ws, Arc::clone(&adapter));
     let mut second_socket = connect_ws_with_retry(&ws_url).await;
     send_ws_text(&mut second_socket, "ws-r2-msg", "after restart").await;
+    assert_eq!(
+        recv_ws_send(&mut second_socket).await.content,
+        "submitted s1 turn gateway-turn"
+    );
     assert_eq!(
         recv_ws_send(&mut second_socket).await.content,
         "gateway echo: after restart"
@@ -757,7 +774,9 @@ async fn daemon_restart_preserves_ws_gateway_session() {
         sent_contents,
         vec![
             "created session s1".to_string(),
+            "submitted s1 turn gateway-turn".to_string(),
             "gateway echo: before restart".to_string(),
+            "submitted s1 turn gateway-turn".to_string(),
             "gateway echo: after restart".to_string()
         ]
     );
@@ -811,10 +830,20 @@ async fn real_ws_dual_harness_smoke() {
     let old_transport = std::env::var_os("CCTEAM_CODEX_APP_SERVER_TRANSPORT");
     let old_socket = std::env::var_os("CCTEAM_CODEX_APP_SERVER_SOCKET");
     let old_mux_backend = std::env::var_os("CCTEAM_MUX_BACKEND");
+    let old_path = std::env::var_os("PATH");
+    let nl_mode = std::env::var("CCTEAM_REAL_IM_WS_NL").ok();
     std::env::set_var("CCTEAM_HOME", ccteam_home.path());
     std::env::set_var("CCTEAM_CODEX_APP_SERVER_TRANSPORT", "stdio");
     std::env::remove_var("CCTEAM_CODEX_APP_SERVER_SOCKET");
     std::env::set_var("CCTEAM_MUX_BACKEND", "tmux");
+    if let Some(bin) = workspace_ccteam_bin() {
+        let debug_dir = bin.parent().unwrap().to_path_buf();
+        let mut paths = vec![debug_dir];
+        if let Some(old) = old_path.as_ref() {
+            paths.extend(std::env::split_paths(old));
+        }
+        std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
+    }
     std::fs::write(
         ccteam_home.path().join("config.yaml"),
         format!(
@@ -823,6 +852,24 @@ async fn real_ws_dual_harness_smoke() {
         ),
     )
     .unwrap();
+    let paths = ccteam_core::CcteamPaths::from_env().unwrap();
+    ccteam_core::bootstrap_project_at_dir(&paths, project.path(), &slug, "", "real-ws").unwrap();
+    ccteam_core::install_hooks(&paths).unwrap();
+    if let Some(bin) = workspace_ccteam_bin() {
+        let hook = paths.hooks_script();
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\nexec '{}' internal hook \"$@\"\n", bin.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&hook).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&hook, perms).unwrap();
+        }
+    }
 
     let ws = Arc::new(WsChannel::bind_localhost().await.unwrap());
     let ws_url = format!("ws://{}", ws.local_addr());
@@ -832,7 +879,11 @@ async fn real_ws_dual_harness_smoke() {
         credentials: None,
         registry: Some(project.path().to_path_buf()),
         tick: Duration::from_millis(50),
-        max_runtime: Some(Duration::from_secs(30)),
+        max_runtime: Some(if nl_mode.is_some() {
+            Duration::from_secs(300)
+        } else {
+            Duration::from_secs(30)
+        }),
         adapter_factory: Some(default_adapter_factory()),
         channels_override: Some(channels),
     };
@@ -881,6 +932,47 @@ async fn real_ws_dual_harness_smoke() {
         "Codex /compact should reach app-server RPC, got {:?}",
         codex.content
     );
+
+    if nl_mode
+        .as_deref()
+        .is_some_and(|mode| mode == "1" || mode == "codex" || mode == "claude")
+    {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        if nl_mode.as_deref() != Some("claude") {
+            send_ws_text(
+                &mut socket,
+                "real-ws-codex-nl",
+                "@api Reply with exactly CCTEAM-CODEX-WS-OK and no extra text.",
+            )
+            .await;
+            let codex_ack = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10)).await;
+            assert!(
+                codex_ack.content.starts_with("submitted s1 turn "),
+                "Codex NL prompt should be submitted, got {:?}",
+                codex_ack.content
+            );
+            recv_ws_until_contains(&mut socket, "CCTEAM-CODEX-WS-OK", Duration::from_secs(120))
+                .await;
+        }
+
+        if nl_mode.as_deref() != Some("codex") {
+            send_ws_text(
+                &mut socket,
+                "real-ws-claude-nl",
+                "@reviewer Reply with exactly CCTEAM-CLAUDE-WS-OK and no extra text.",
+            )
+            .await;
+            let claude_ack = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10)).await;
+            assert!(
+                claude_ack.content.starts_with("submitted s2 turn "),
+                "Claude NL prompt should be submitted, got {:?}",
+                claude_ack.content
+            );
+            recv_ws_until_contains(&mut socket, "CCTEAM-CLAUDE-WS-OK", Duration::from_secs(180))
+                .await;
+        }
+    }
+
     send_ws_text(&mut socket, "real-ws-claude-clear", "@reviewer /clear").await;
     let claude = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10)).await;
     assert!(
@@ -901,6 +993,7 @@ async fn real_ws_dual_harness_smoke() {
     restore_env("CCTEAM_CODEX_APP_SERVER_TRANSPORT", old_transport);
     restore_env("CCTEAM_CODEX_APP_SERVER_SOCKET", old_socket);
     restore_env("CCTEAM_MUX_BACKEND", old_mux_backend);
+    restore_env("PATH", old_path);
 }
 
 fn spawn_ws_gateway_daemon(
@@ -1030,6 +1123,41 @@ where
     .expect("timed out waiting for websocket SendMessage")
 }
 
+async fn recv_ws_until_contains<S>(socket: &mut WebSocketStream<S>, needle: &str, timeout: Duration)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut seen = String::new();
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let now = tokio::time::Instant::now();
+        assert!(
+            now < deadline,
+            "timed out waiting for {needle}; seen:\n{seen}"
+        );
+        let remaining = deadline.saturating_duration_since(now);
+        let msg = tokio::time::timeout(remaining, async {
+            loop {
+                let frame = socket
+                    .next()
+                    .await
+                    .unwrap_or_else(|| panic!("websocket closed while waiting for {needle}"))
+                    .unwrap();
+                if let Message::Text(text) = frame {
+                    return serde_json::from_str::<SendMessage>(&text).unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {needle}; seen:\n{seen}"));
+        seen.push_str(&msg.content);
+        seen.push('\n');
+        if seen.contains(needle) {
+            return;
+        }
+    }
+}
+
 fn command_exists(cmd: &str) -> bool {
     std::process::Command::new("sh")
         .arg("-c")
@@ -1037,6 +1165,13 @@ fn command_exists(cmd: &str) -> bool {
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
+}
+
+fn workspace_ccteam_bin() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let debug_dir = exe.parent()?.parent()?;
+    let bin = debug_dir.join("ccteam");
+    bin.exists().then(|| bin.canonicalize().ok()).flatten()
 }
 
 fn tmux_session_exists(session: &str) -> bool {

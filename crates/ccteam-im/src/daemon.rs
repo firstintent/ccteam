@@ -24,7 +24,7 @@ use tokio::sync::Mutex;
 use crate::acl::AclPolicy;
 use crate::bot_mpsc::{bot_key, BotChannelMap, InboxItem, OutboundItem};
 use crate::credentials::{self, Credentials};
-use crate::gateway::Gateway;
+use crate::gateway::{Gateway, GatewayEvent};
 use crate::latency::now_unix_ms;
 use crate::router::{self, HandleMap};
 use crate::supervisor::{self, BotSupervisor};
@@ -263,12 +263,12 @@ where
     // shape that landed in F121).
     let channels: ChannelMap = build_channels(&args, &creds, &initial);
     replay_durable_outbox(&channels).await;
-    let gateway = Arc::new(Mutex::new(build_gateway(
-        factory.clone(),
-        &projects_root,
-        &config_projects,
-        &initial,
-    )));
+    let mut gateway_inner =
+        build_gateway(factory.clone(), &projects_root, &config_projects, &initial);
+    let (gateway_event_tx, gateway_event_rx) =
+        tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+    gateway_inner.set_event_sink(gateway_event_tx);
+    let gateway = Arc::new(Mutex::new(gateway_inner));
 
     // V0.6.1 F132 — spawn one `Channel::listen` task per active
     // channel. Each listener pushes ChannelMessages into a shared mpsc
@@ -309,6 +309,7 @@ where
 
     let inbound_consumer =
         spawn_inbound_consumer(inbound_rx, channels.clone(), sec.clone(), gateway.clone());
+    let gateway_event_consumer = spawn_gateway_event_consumer(gateway_event_rx, channels.clone());
 
     tracing::info!(
         channels = channels.len(),
@@ -344,6 +345,7 @@ where
         h.abort();
     }
     inbound_consumer.abort();
+    gateway_event_consumer.abort();
     result
 }
 
@@ -517,6 +519,27 @@ fn spawn_inbound_consumer(
             }
         }
         tracing::debug!("imd: inbound consumer exited (all senders closed)");
+    })
+}
+
+fn spawn_gateway_event_consumer(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>,
+    channels: ChannelMap,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(evt) = rx.recv().await {
+            let Some(channel) = channels.get(&evt.channel).cloned() else {
+                tracing::warn!(
+                    channel = %evt.channel,
+                    event_id = %evt.id,
+                    "ccteam-im: gateway event dropped because channel is not configured"
+                );
+                continue;
+            };
+            let out = SendMessage::new(evt.content, evt.chat_id).in_thread(evt.thread_ts);
+            send_gateway_outbound(&evt.id, 0, &evt.channel, channel.as_ref(), out).await;
+        }
+        tracing::debug!("imd: gateway event consumer exited");
     })
 }
 

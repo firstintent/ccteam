@@ -70,6 +70,26 @@ pub struct Gateway {
     sessions: BTreeMap<String, GatewaySession>,
     templates: Vec<GatewayRouteTemplate>,
     next_session: u64,
+    event_sink: Option<tokio::sync::mpsc::UnboundedSender<GatewayEvent>>,
+    event_pumps: BTreeMap<String, tokio::task::JoinHandle<()>>,
+}
+
+/// User-visible text emitted asynchronously from a harness event stream.
+///
+/// The daemon owns delivery: it maps `channel` to a live [`Channel`],
+/// appends the durable outbound ledger row, and sends to `chat_id`.
+#[derive(Debug, Clone)]
+pub struct GatewayEvent {
+    /// Stable outbound id prefix used by the durable ledger.
+    pub id: String,
+    /// IM channel name (`telegram`, `ws`, ...).
+    pub channel: String,
+    /// Platform chat/recipient id.
+    pub chat_id: String,
+    /// Optional platform thread id.
+    pub thread_ts: Option<String>,
+    /// User-visible message content.
+    pub content: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -136,6 +156,22 @@ impl Gateway {
             sessions: BTreeMap::new(),
             templates: Vec::new(),
             next_session: 0,
+            event_sink: None,
+            event_pumps: BTreeMap::new(),
+        }
+    }
+
+    /// Enable async delivery of [`HarnessAdapter::events`] back to IM.
+    ///
+    /// When enabled, `handle_text` returns a quick submit ACK and the
+    /// daemon sends later assistant/error events via this sink. Calling
+    /// this after `enable_persistence` also re-subscribes restored
+    /// sessions, which is the daemon-restart path.
+    pub fn set_event_sink(&mut self, tx: tokio::sync::mpsc::UnboundedSender<GatewayEvent>) {
+        self.event_sink = Some(tx);
+        let ids = self.sessions.keys().cloned().collect::<Vec<_>>();
+        for id in ids {
+            self.spawn_event_pump(&id);
         }
     }
 
@@ -381,7 +417,45 @@ impl Gateway {
         );
         self.current_session.insert(owner, id.clone());
         self.persist_state()?;
+        self.spawn_event_pump(&id);
         Ok(id)
+    }
+
+    fn spawn_event_pump(&mut self, session_id: &str) {
+        if self.event_pumps.contains_key(session_id) {
+            return;
+        }
+        let Some(tx) = self.event_sink.clone() else {
+            return;
+        };
+        let Some(session) = self.sessions.get(session_id).cloned() else {
+            return;
+        };
+        let session_id = session.id.clone();
+        let pump_key = session_id.clone();
+        let handle = tokio::spawn(async move {
+            let mut events = session.adapter.events(&session.thread);
+            let mut seq: u64 = 0;
+            while let Some(evt) = events.next().await {
+                let Some(text) = async_event_text(&evt) else {
+                    continue;
+                };
+                seq = seq.saturating_add(1);
+                if tx
+                    .send(GatewayEvent {
+                        id: format!("gateway-event-{session_id}-{seq}"),
+                        channel: session.owner.channel.clone(),
+                        chat_id: session.owner.chat_id.clone(),
+                        thread_ts: None,
+                        content: text,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        self.event_pumps.insert(pump_key, handle);
     }
 
     fn load_state(&mut self) -> Result<()> {
@@ -480,20 +554,27 @@ impl Gateway {
             .sessions
             .get(session_id)
             .ok_or_else(|| anyhow!("current session missing: {session_id}"))?;
-        let turn_id = session
-            .adapter
-            .submit_turn(
-                &session.thread,
-                turn_input_for_session(session.vendor, payload),
-            )
-            .await?;
-        let mut events = session.adapter.events(&session.thread);
+        let submit_wait = gateway_submit_timeout_duration();
+        let turn_id = tokio::time::timeout(submit_wait, async {
+            session
+                .adapter
+                .submit_turn(
+                    &session.thread,
+                    turn_input_for_session(session.vendor, payload),
+                )
+                .await
+        })
+        .await
+        .map_err(|_| anyhow!("submit timed out after {submit_wait:?} for {session_id}"))??;
         let mut replies = Vec::new();
-        let wait = gateway_reply_wait_duration();
-        while let Ok(Some(evt)) = tokio::time::timeout(wait, events.next()).await {
-            if let Some(text) = event_text(&evt) {
-                replies.push(text);
-                break;
+        if self.event_sink.is_none() {
+            let mut events = session.adapter.events(&session.thread);
+            let wait = gateway_reply_wait_duration();
+            while let Ok(Some(evt)) = tokio::time::timeout(wait, events.next()).await {
+                if let Some(text) = event_text(&evt) {
+                    replies.push(text);
+                    break;
+                }
             }
         }
         if replies.is_empty() {
@@ -550,9 +631,42 @@ impl Gateway {
     }
 }
 
+impl Drop for Gateway {
+    fn drop(&mut self) {
+        for (_, handle) in std::mem::take(&mut self.event_pumps) {
+            handle.abort();
+        }
+    }
+}
+
+fn async_event_text(evt: &ThreadEvent) -> Option<String> {
+    match evt {
+        ThreadEvent::ItemCompleted { item } | ThreadEvent::ItemUpdated { item } => {
+            match &item.details {
+                ThreadItemDetails::AgentMessage(text) if !text.is_empty() => Some(text.clone()),
+                _ => None,
+            }
+        }
+        ThreadEvent::TurnFailed { err, .. } | ThreadEvent::Error(err) => Some(err.message.clone()),
+        ThreadEvent::ThreadStarted { .. }
+        | ThreadEvent::TurnStarted { .. }
+        | ThreadEvent::TurnCompleted { .. }
+        | ThreadEvent::ItemStarted { .. } => None,
+    }
+}
+
 fn gateway_reply_wait_duration() -> std::time::Duration {
     const DEFAULT_MS: u64 = 5;
     let ms = std::env::var("CCTEAM_IM_GATEWAY_REPLY_WAIT_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MS);
+    std::time::Duration::from_millis(ms)
+}
+
+fn gateway_submit_timeout_duration() -> std::time::Duration {
+    const DEFAULT_MS: u64 = 5_000;
+    let ms = std::env::var("CCTEAM_IM_GATEWAY_SUBMIT_TIMEOUT_MS")
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
         .unwrap_or(DEFAULT_MS);
