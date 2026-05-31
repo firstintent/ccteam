@@ -1,7 +1,23 @@
 # CLAUDE.md — ccteam 实现导引
 
 > 本文档面向**下一次接手 ccteam 实现的 Claude session**。每次起手必读。
-> 历史里程碑 + 升级 migration 见 `docs/versions/v0-X-Y/README.md`,本文只描述**当前状态 + 红线 + 纪律**。
+> 历史里程碑 + 升级 migration 见 `docs/versions/v0-X-Y/README.md`,本文描述**当前状态 + 红线 + 纪律**;**§〇 标注在建的 v8.1 新架构方向(与下文冲突处以 §〇 为准)**。
+
+---
+
+## 〇、v8.1 新架构方向(在建 —— 与下文冲突处以此为准)
+
+本仓正按 **v8.1「云 CC/Codex + IM」新架构**改造:设计 `notes/im.html`,开发计划 `notes/plan.html`(新 session `/goal` 执行,P0–P6 每步带验收 gate)。**下文 §一~ 描述当前 V0.6.8 实现;凡与 v8.1 冲突按 v8.1,v8.1 未触及处仍按下文:**
+
+- **改名/重构**:`ccteam-mux`→`ccteam-harness`、`MuxBackend`→`ProcessBackend`(tmux 专属方法 pane/resize 只在 `TmuxBackend`)、`ccteam-imd`→`ccteam-im`;orchestrator 从 `ccteam-core` 抽到新 crate `ccteam-flow`(core 瘦成 primitives leaf)。
+- **执行层两轴**:`HarnessAdapter`(vendor 怎么驱动:Claude=tmux+send-keys+transcript+hook;Codex=app-server JSON-RPC)× `ProcessBackend`(进程跑哪:tmux/inproc/remote);两 vendor 归一成中立 `CanonicalEvent` + `ApprovalIR`(**不**抄 alleycat 的 codex-emulation)。
+- **daemon = IM⇄session 路由网关**(一个进程含 im-gateway + MCP server + web server,**不 tick、无 orchestrator 循环**);编排 `ccteam-flow` **推后**,过渡期借 cc/codex 内部编排。
+- **会话 = resume-by-id**(spawn-on-demand + 按 id resume + 空闲释放,**非**常驻吊着):IM session 属 chat 类,红线「每次 spawn = fresh 1M context」对它**不适用**(chat 复用 context 本就是 feature);autonomous bg 路径仍 fresh-spawn。
+- **v8.1 不做手机批准** → agent 走 `--dangerously-skip-permissions`(无批准门);`ApprovalIR` 留类型占位,HITL 批准推后。
+- **核心概念 `chat ⇄ project ⇄ session`**:一个 chat = 你的终端,跨多 project、随时 `/new` 多 session、随时切(`@bot` / `/use` / `/cd`);命令 Claude 走 send-keys、Codex 走 app-server RPC(/compact=`thread/compact/start`、/review=`review/start`)。
+- **vendor 选型**:Claude→tmux(全 TUI + 耐久 + 已有);Codex→app-server(原生、文档化)。per-adapter best-fit,不强行统一。
+
+> 验证优先用确定性 fake(`CCTEAM_{CLAUDE,CODEX}_BIN`);每 phase 不退 baseline。术语与图以 `notes/im.html` 为准。
 
 ---
 
