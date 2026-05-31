@@ -5,31 +5,18 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOG_DIR="${TMPDIR:-/tmp}/ccteam-smoke-im"
 mkdir -p "$LOG_DIR"
 MODE="fake"
-REAL_APP_SERVER_PID=""
-REAL_APP_SERVER_DIR=""
-
-cleanup_real() {
-  if [[ -n "$REAL_APP_SERVER_PID" ]]; then
-    kill "$REAL_APP_SERVER_PID" >/dev/null 2>&1 || true
-    wait "$REAL_APP_SERVER_PID" >/dev/null 2>&1 || true
-  fi
-  if [[ -n "$REAL_APP_SERVER_DIR" ]]; then
-    rm -rf "$REAL_APP_SERVER_DIR"
-  fi
-}
-trap cleanup_real EXIT
 
 usage() {
   cat <<'EOF'
 usage: scripts/smoke-im.sh [--real]
 
-  --real  Fail loud unless real claude/codex binaries and the Codex
-          app-server socket are present. This mode is the v8.2 guard
+  --real  Fail loud unless real claude/codex binaries and a Codex
+          app-server transport are present. This mode is the v8.2 guard
           against accidentally treating fake gateway tests as a real
           IM smoke.
 
 Set CCTEAM_REAL_CODEX_RPC=1 with --real to also probe Codex app-server
-thread/start. The default preflight only proves binaries + UDS availability.
+thread/start. The default preflight only proves binaries + transport availability.
 EOF
 }
 
@@ -106,18 +93,6 @@ run_version_probe() {
   tail -5 "$log"
 }
 
-wait_for_socket() {
-  local socket="$1"
-  local i
-  for i in $(seq 1 80); do
-    if [[ -S "$socket" ]]; then
-      return 0
-    fi
-    sleep 0.1
-  done
-  return 1
-}
-
 ensure_codex_app_server_socket() {
   local codex_bin="$1"
   local configured="${CCTEAM_CODEX_APP_SERVER_SOCKET:-}"
@@ -125,6 +100,7 @@ ensure_codex_app_server_socket() {
 
   if [[ -S "$socket" ]]; then
     export CCTEAM_CODEX_APP_SERVER_SOCKET="$socket"
+    export CCTEAM_CODEX_APP_SERVER_TRANSPORT="uds"
     return 0
   fi
 
@@ -132,29 +108,24 @@ ensure_codex_app_server_socket() {
   timeout 30 "$codex_bin" app-server daemon start >"$daemon_log" 2>&1 || true
   if [[ -S "$socket" ]]; then
     export CCTEAM_CODEX_APP_SERVER_SOCKET="$socket"
+    export CCTEAM_CODEX_APP_SERVER_TRANSPORT="uds"
     return 0
   fi
 
   if [[ -z "$configured" ]]; then
-    REAL_APP_SERVER_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ccteam-codex-app-server.XXXXXX")"
-    socket="$REAL_APP_SERVER_DIR/app-server.sock"
-  else
-    mkdir -p "$(dirname "$socket")"
-  fi
-
-  local foreground_log="$LOG_DIR/real-codex-app-server-foreground.log"
-  "$codex_bin" app-server --listen "unix://$socket" >"$foreground_log" 2>&1 &
-  REAL_APP_SERVER_PID="$!"
-  if wait_for_socket "$socket"; then
-    export CCTEAM_CODEX_APP_SERVER_SOCKET="$socket"
+    # npm-managed Codex exposes a raw JSONL app-server on stdio. Its
+    # foreground unix:// listener is not the standalone daemon control
+    # socket protocol the harness UDS client speaks, so use stdio as the
+    # real-binary fallback when the managed daemon is unavailable.
+    unset CCTEAM_CODEX_APP_SERVER_SOCKET
+    export CCTEAM_CODEX_APP_SERVER_TRANSPORT="stdio"
+    export CCTEAM_CODEX_BIN="$codex_bin"
     return 0
   fi
 
   echo "smoke-im --real: Codex app-server socket not found: $socket" >&2
   echo "smoke-im --real: daemon start log: $daemon_log" >&2
-  echo "smoke-im --real: foreground start log: $foreground_log" >&2
   tail -20 "$daemon_log" >&2 || true
-  tail -20 "$foreground_log" >&2 || true
   return 1
 }
 
@@ -180,7 +151,11 @@ run_real_preflight() {
 
   run_version_probe claude "$claude_bin"
   run_version_probe codex "$codex_bin"
-  echo "smoke-im --real: Codex app-server socket $CCTEAM_CODEX_APP_SERVER_SOCKET"
+  if [[ "${CCTEAM_CODEX_APP_SERVER_TRANSPORT:-uds}" == "stdio" ]]; then
+    echo "smoke-im --real: Codex app-server transport stdio"
+  else
+    echo "smoke-im --real: Codex app-server socket $CCTEAM_CODEX_APP_SERVER_SOCKET"
+  fi
   export CCTEAM_REAL_CODEX_APP_SERVER=1
   echo "smoke-im --real: real binary preflight PASS"
 }

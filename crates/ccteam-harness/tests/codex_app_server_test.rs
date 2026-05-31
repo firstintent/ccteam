@@ -6,6 +6,7 @@
 
 use ccteam_harness::execution::codex_app_server::{
     translate_notification, turn_input_to_items, CodexAppServerAdapter, APP_SERVER_SOCKET_ENV,
+    APP_SERVER_TRANSPORT_ENV,
 };
 use ccteam_harness::execution::codex_jsonrpc::Notification;
 use ccteam_harness::{
@@ -44,12 +45,15 @@ async fn real_codex_app_server_start_thread_smoke() {
         eprintln!("skip: set CCTEAM_REAL_CODEX_APP_SERVER=1 for real app-server smoke");
         return;
     }
-    let socket = std::env::var(APP_SERVER_SOCKET_ENV)
-        .expect("CCTEAM_CODEX_APP_SERVER_SOCKET must point to a real app-server UDS");
-    assert!(
-        std::path::Path::new(&socket).exists(),
-        "real app-server socket must exist: {socket}"
-    );
+    let transport = std::env::var(APP_SERVER_TRANSPORT_ENV).unwrap_or_else(|_| "uds".to_string());
+    if transport != "stdio" {
+        let socket = std::env::var(APP_SERVER_SOCKET_ENV)
+            .expect("CCTEAM_CODEX_APP_SERVER_SOCKET must point to a real app-server UDS");
+        assert!(
+            std::path::Path::new(&socket).exists(),
+            "real app-server socket must exist: {socket}"
+        );
+    }
 
     let tmp = TempDir::new().unwrap();
     let adapter = CodexAppServerAdapter::new();
@@ -459,6 +463,7 @@ async fn adapter_sends_initialize_handshake_before_thread_start() {
     // Collect the first three frames the peer saw and assert ordering.
     let mut methods: Vec<String> = Vec::new();
     let mut initialize_frame: Option<Value> = None;
+    let mut thread_start_frame: Option<Value> = None;
     for _ in 0..3 {
         let frame = tokio::time::timeout(Duration::from_secs(1), seen_rx.recv())
             .await
@@ -467,6 +472,8 @@ async fn adapter_sends_initialize_handshake_before_thread_start() {
         let m = frame["method"].as_str().unwrap_or("").to_string();
         if m == "initialize" {
             initialize_frame = Some(frame.clone());
+        } else if m == "thread/start" {
+            thread_start_frame = Some(frame.clone());
         }
         methods.push(m);
     }
@@ -486,6 +493,18 @@ async fn adapter_sends_initialize_handshake_before_thread_start() {
         "initialize must negotiate experimentalApi=true to unlock turn/plan/updated"
     );
     assert_eq!(init["params"]["clientInfo"]["name"], "ccteam");
+    let thread_start = thread_start_frame.expect("thread/start frame must be present");
+    assert_eq!(thread_start["params"]["threadSource"], "user");
+    assert_eq!(thread_start["params"]["sessionStartSource"], "startup");
+    assert_eq!(thread_start["params"]["serviceName"], "ccteam/test");
+    assert_eq!(
+        thread_start["params"]["developerInstructions"],
+        "ccteam role: demo (slug=test, sid=codex-1)"
+    );
+    assert!(
+        thread_start["params"].get("session_source").is_none(),
+        "thread/start must use current Codex v2 camelCase fields"
+    );
 
     drop(peer);
     let _ = std::fs::remove_file(&sock);
@@ -567,6 +586,9 @@ async fn adapter_maps_system_directives_to_command_rpcs() {
             Some("thread/start") => json!({
                 "result": { "thread": { "id": "tid-command" } }
             }),
+            Some("turn/start") => json!({
+                "result": { "turn": { "id": "turn-user-1" } }
+            }),
             Some("thread/compact/start") => json!({ "result": {} }),
             Some("review/start") => json!({
                 "result": {
@@ -598,6 +620,11 @@ async fn adapter_maps_system_directives_to_command_rpcs() {
         model_id: None,
     };
     let h = adapter.start_thread(&spec, &ctx).await.unwrap();
+    let user_turn = adapter
+        .submit_turn(&h, TurnInput::UserText("hello".into()))
+        .await
+        .unwrap();
+    assert_eq!(user_turn.0, "turn-user-1");
 
     let compact_turn = adapter
         .submit_turn(&h, TurnInput::SystemDirective("/compact".into()))
@@ -619,9 +646,17 @@ async fn adapter_maps_system_directives_to_command_rpcs() {
             "initialize",
             "initialized",
             "thread/start",
+            "turn/start",
             "thread/compact/start",
             "review/start"
         ]
+    );
+    let turn = frames.iter().find(|v| v["method"] == "turn/start").unwrap();
+    assert_eq!(turn["params"]["threadId"], "tid-command");
+    assert_eq!(turn["params"]["input"][0]["type"], "text");
+    assert!(
+        turn["params"].get("thread_id").is_none(),
+        "turn/start must use current Codex v2 threadId field"
     );
     let compact = frames
         .iter()

@@ -912,6 +912,8 @@ V0.6 F111 起所有 MCP 工具加 group 子前缀,server name 保持 `ccteam`;**
 
 **Daemon durable outbound ledger**:`<ccteam_root>/imd/outbound.jsonl` stores gateway replies before and after each `Channel::send`. Each line is `{ts_ms, id, inbound_id, channel, state: "queued"|"sent"|"failed", message: SendMessage, platform_message_id?, error?}`. On daemon startup, the gateway replays rows whose latest state is `queued` or `failed`; `ws` transport keeps accepted outbound in memory until a client reconnects and declares the matching `reply_target`. Harness start/submit failures are sent back to IM as `gateway error: ...` and recorded through the same ledger. This is the daemon-side audit/recovery SoT for IM outbound delivery; transport-specific chat logs remain separate.
 
+**Codex app-server transport**:`CodexAppServerAdapter` speaks the v2 JSON-RPC surface (`thread/start`, `turn/start`, `thread/resume`, `thread/archive`, `thread/unsubscribe`) with current camelCase params: `threadId`, `threadSource`, `sessionStartSource`, `serviceName`, `developerInstructions`. Default transport is the standalone daemon UDS at `CCTEAM_CODEX_APP_SERVER_SOCKET` or `$CODEX_HOME/app-server-control/app-server-control.sock`; `CCTEAM_CODEX_APP_SERVER_TRANSPORT=stdio` (with optional `CCTEAM_CODEX_BIN`) spawns `codex app-server --listen stdio://` and uses the same JSON-RPC client. The stdio path is the real-binary fallback for npm-managed Codex installs where the foreground `unix://` listener is not the raw daemon control protocol.
+
 **V0.6.1 F128 admin extension**(`admin_` group +2 → 3 tools;`mcp_admin_tools.rs`):
 
 | Tool 名 | Group | 行为 | 入参 | 返回 |

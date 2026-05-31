@@ -70,6 +70,10 @@ use crate::{
 /// `$CODEX_HOME/app-server-control/app-server-control.sock`.
 pub const APP_SERVER_SOCKET_ENV: &str = "CCTEAM_CODEX_APP_SERVER_SOCKET";
 
+/// Env override for the transport used to reach Codex app-server.
+/// Supported values today: `uds` (default) and `stdio`.
+pub const APP_SERVER_TRANSPORT_ENV: &str = "CCTEAM_CODEX_APP_SERVER_TRANSPORT";
+
 /// V0.6.1 F122 — per-thread context the adapter consults when bridging
 /// boundary events into `progress.jsonl`. Populated by `start_thread`
 /// from the [`SpawnCtx`]; consumed by the `events()` stream the first
@@ -144,6 +148,25 @@ impl CodexAppServerAdapter {
         if let Some(c) = guard.as_ref() {
             return Ok(Arc::clone(c));
         }
+        if std::env::var_os(APP_SERVER_SOCKET_ENV).is_none()
+            && std::env::var(APP_SERVER_TRANSPORT_ENV)
+                .map(|v| v.eq_ignore_ascii_case("stdio"))
+                .unwrap_or(false)
+        {
+            let program = std::env::var("CCTEAM_CODEX_BIN").unwrap_or_else(|_| "codex".to_string());
+            let client = CodexJsonRpcClient::connect_stdio_command(&program)
+                .await
+                .map_err(|err| {
+                    HarnessError::SpawnFailed(format!(
+                        "spawn codex app-server stdio ({program}): {err:#}"
+                    ))
+                })?;
+            let shared = Arc::new(client);
+            Self::handshake(&shared).await?;
+            *guard = Some(Arc::clone(&shared));
+            return Ok(shared);
+        }
+
         let path = Self::resolve_socket_path().ok_or_else(|| {
             HarnessError::SpawnFailed(
                 "codex app-server socket path unresolved (set CODEX_HOME or \
@@ -280,9 +303,10 @@ impl HarnessAdapter for CodexAppServerAdapter {
         let cwd_str = ctx.cwd.to_string_lossy().to_string();
         let params = json!({
             "cwd": cwd_str,
-            "session_source": "ccteam",
-            "service_name": format!("ccteam/{}", ctx.slug),
-            "developer_instructions": format!(
+            "threadSource": "user",
+            "sessionStartSource": "startup",
+            "serviceName": format!("ccteam/{}", ctx.slug),
+            "developerInstructions": format!(
                 "ccteam role: {} (slug={}, sid={})",
                 spec.role, ctx.slug, ctx.sid
             ),
@@ -330,6 +354,8 @@ impl HarnessAdapter for CodexAppServerAdapter {
             started_at: Utc::now(),
             raw_extras: json!({
                 "thread_id": thread_id,
+                "transport": std::env::var(APP_SERVER_TRANSPORT_ENV)
+                    .unwrap_or_else(|_| "uds".to_string()),
                 "socket": Self::resolve_socket_path()
                     .map(|p| p.display().to_string())
                     .unwrap_or_default(),
@@ -348,7 +374,7 @@ impl HarnessAdapter for CodexAppServerAdapter {
         }
         let items = turn_input_to_items(input)?;
         let params = json!({
-            "thread_id": h.identity,
+            "threadId": h.identity,
             "input": items,
         });
         let result = client
@@ -501,7 +527,7 @@ impl HarnessAdapter for CodexAppServerAdapter {
     async fn resume_thread(&self, persistent_id: &str) -> Result<ThreadHandle, HarnessError> {
         let client = self.client().await?;
         let result = client
-            .call("thread/resume", json!({ "thread_id": persistent_id }))
+            .call("thread/resume", json!({ "threadId": persistent_id }))
             .await
             .map_err(|e| HarnessError::SpawnFailed(format!("thread/resume: {e:#}")))?;
         let thread_id = pluck_thread_id(&result).unwrap_or_else(|| persistent_id.to_string());
@@ -524,13 +550,13 @@ impl HarnessAdapter for CodexAppServerAdapter {
             return Ok(());
         };
         let archive = client
-            .call("thread/archive", json!({ "thread_id": h.identity }))
+            .call("thread/archive", json!({ "threadId": h.identity }))
             .await;
         if let Err(err) = archive {
             tracing::warn!(thread_id = %h.identity, error = %err, "thread/archive failed (best-effort)");
         }
         let _ = client
-            .call("thread/unsubscribe", json!({ "thread_id": h.identity }))
+            .call("thread/unsubscribe", json!({ "threadId": h.identity }))
             .await;
         Ok(())
     }

@@ -33,6 +33,7 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+use tokio::process::{Child, Command};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 
@@ -84,6 +85,7 @@ pub struct CodexJsonRpcClient {
     notifications: broadcast::Sender<Notification>,
     _writer_task: JoinHandle<()>,
     _reader_task: JoinHandle<()>,
+    _child: Option<Child>,
 }
 
 impl CodexJsonRpcClient {
@@ -97,10 +99,45 @@ impl CodexJsonRpcClient {
         Ok(Self::spawn(read_half, write_half))
     }
 
+    /// Spawn `codex app-server --listen stdio://` and speak JSON-RPC
+    /// over its stdio pipes. This is used as a real-binary fallback for
+    /// npm-managed Codex installs whose foreground `unix://` listener is
+    /// not the same raw JSONL control protocol exposed by the standalone
+    /// daemon socket.
+    pub async fn connect_stdio_command(program: &str) -> Result<Self> {
+        let mut child = Command::new(program)
+            .arg("app-server")
+            .arg("--listen")
+            .arg("stdio://")
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .with_context(|| format!("spawn {program} app-server --listen stdio://"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("codex app-server stdio stdout unavailable")?;
+        let stdin = child
+            .stdin
+            .take()
+            .context("codex app-server stdio stdin unavailable")?;
+        Ok(Self::spawn_with_child(stdout, stdin, Some(child)))
+    }
+
     /// Build a client around an arbitrary split read/write pair.
     /// Tests use this with a `tokio::io::duplex` pair for scripted
     /// peers.
     pub fn spawn<R, W>(reader: R, writer: W) -> Self
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        Self::spawn_with_child(reader, writer, None)
+    }
+
+    fn spawn_with_child<R, W>(reader: R, writer: W, child: Option<Child>) -> Self
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
@@ -124,6 +161,7 @@ impl CodexJsonRpcClient {
             notifications: notif_tx,
             _writer_task: writer_task,
             _reader_task: reader_task,
+            _child: child,
         }
     }
 
@@ -228,13 +266,29 @@ async fn run_reader_loop<R: AsyncRead + Unpin + Send>(
             }
             Ok(None) => {
                 tracing::debug!("jsonrpc: peer closed");
+                fail_pending(&pending, "jsonrpc peer closed").await;
                 break;
             }
             Err(err) => {
                 tracing::warn!(error = %err, "jsonrpc: read error");
+                fail_pending(&pending, &format!("jsonrpc read error: {err}")).await;
                 break;
             }
         }
+    }
+}
+
+async fn fail_pending(pending: &Arc<Mutex<Pending>>, message: &str) {
+    let drained = {
+        let mut guard = pending.lock().await;
+        guard.drain().map(|(_, tx)| tx).collect::<Vec<_>>()
+    };
+    for tx in drained {
+        let _ = tx.send(Err(JsonRpcError {
+            code: None,
+            message: message.to_string(),
+            data: None,
+        }));
     }
 }
 
@@ -441,6 +495,31 @@ mod tests {
 
         let err = client.call("bogus", Value::Null).await.unwrap_err();
         assert!(err.to_string().contains("method not found"));
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn peer_close_fails_pending_call() {
+        let (client_rw, peer_rw) = tokio::io::duplex(4096);
+        let (client_r, client_w) = tokio::io::split(client_rw);
+        let client = CodexJsonRpcClient::spawn(client_r, client_w);
+        let peer = tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let (pr, _pw) = tokio::io::split(peer_rw);
+            let mut pr = BufReader::new(pr);
+            let mut buf = String::new();
+            pr.read_line(&mut buf).await.unwrap();
+            drop(pr);
+        });
+
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.call("thread/start", json!({ "cwd": "/tmp" })),
+        )
+        .await
+        .expect("pending call must fail promptly when the peer closes")
+        .unwrap_err();
+        assert!(err.to_string().contains("jsonrpc peer closed"));
         peer.await.unwrap();
     }
 }
