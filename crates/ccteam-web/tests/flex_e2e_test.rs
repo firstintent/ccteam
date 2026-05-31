@@ -322,11 +322,11 @@ fn v0_6_0_codex_exec_adapter_pane_ingest_is_permissive() {
     // V0.6.0 F107 — `ingest_snapshot` was dropped from the trait
     // surface (Option C: 5-method trait alignment with Codex
     // ThreadManager). Codex pane-capture parsing now lives as a free
-    // fn in `ccteam_core::execution::codex_exec::ingest_codex_pane`.
+    // fn in `ccteam_harness::execution::codex_exec::ingest_codex_pane`.
     // This regression guard preserves the V0.4.0 F62 contract: empty
     // pane bodies return a permissive fallback snapshot (model =
     // "codex", context_pct = 0), never `NotImplemented`.
-    let snap = ccteam_core::execution::codex_exec::ingest_codex_pane("")
+    let snap = ccteam_harness::execution::codex_exec::ingest_codex_pane("")
         .expect("ingest fallback must succeed post-F107");
     assert_eq!(snap.harness, "codex");
     assert_eq!(snap.model_display_name, "codex");

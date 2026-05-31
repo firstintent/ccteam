@@ -16,9 +16,9 @@ use ccteam_core::advise::{
     append_budget_ledger_row, load_budget_ledger, sum_advise_today, AdviseBudgetLedger,
     BudgetSample, APPROX_COST_PER_CALL_USD, DEFAULT_ADVISE_BUDGET_USD_24H,
 };
-use ccteam_core::execution::CodexExecAdapter;
 use ccteam_core::AgentVendor;
 use ccteam_core::Vendor;
+use ccteam_harness::execution::CodexExecAdapter;
 use ccteam_harness::{
     AgentVendor as HarnessAgentVendor, ExecutionMode, HarnessAdapter, HarnessError, ThreadEvent,
     ThreadHandle, TurnInput, CODEX_BIN_ENV,

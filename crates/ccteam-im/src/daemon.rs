@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
-use ccteam_core::execution::{ClaudeTuiAdapter, CodexExecAdapter};
+use ccteam_harness::execution::{ClaudeTuiAdapter, CodexExecAdapter};
 use ccteam_harness::{AgentVendor, HarnessAdapter};
 use tokio::sync::{mpsc, Mutex};
 

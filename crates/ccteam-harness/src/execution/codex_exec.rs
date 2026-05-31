@@ -41,25 +41,23 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, Mutex};
 
+use crate::{
+    ccteam_root_from_env, pluck_f64, pluck_pct, pluck_str, AgentSpecBrief, AgentVendor,
+    ExecutionMode, HarnessAdapter, HarnessError, HarnessSnapshot, SpawnCtx, ThreadErrorEvent,
+    ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails, TurnId, TurnInput, UnifiedTokenUsage,
+    CODEX_BIN_ENV, CODEX_STATUS_MARKER,
+};
 use ccteam_cost::{
     append_budget_ledger_row, load_budget_ledger, sum_advise_today, Vendor as CostVendor,
     APPROX_COST_PER_CALL_USD, DEFAULT_ADVISE_BUDGET_USD_24H,
 };
-use ccteam_harness::{
-    ccteam_root_from_env, pluck_f64, pluck_pct, pluck_str, AgentSpecBrief, AgentVendor,
-    ExecutionMode, HarnessAdapter, HarnessError, HarnessSnapshot, SpawnCtx, ThreadErrorEvent,
-    ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails, TurnId, TurnInput, UnifiedTokenUsage,
-    CODEX_STATUS_MARKER,
-};
 // `session_name_for_slug` is a pure string helper (NOT a tmux call) —
 // sourced directly from the mux crate's `tmux_ops` so this module has
 // zero `crate::tmux` coupling (V0.8 W2c).
-use ccteam_harness::tmux_ops::session_name_for_slug;
-use ccteam_harness::{
+use crate::tmux_ops::session_name_for_slug;
+use crate::{
     default_backend, MuxSessionId, MuxSessionKind, MuxSessionSpec, TerminalProcessBackend,
 };
-
-use crate::CODEX_BIN_ENV;
 
 /// Per-thread event broadcast buffer. Codex bursts items per turn so
 /// 256 lines of headroom is comfortable for a single subscriber.
