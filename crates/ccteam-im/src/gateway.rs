@@ -482,7 +482,10 @@ impl Gateway {
             .ok_or_else(|| anyhow!("current session missing: {session_id}"))?;
         let turn_id = session
             .adapter
-            .submit_turn(&session.thread, TurnInput::UserText(payload))
+            .submit_turn(
+                &session.thread,
+                turn_input_for_session(session.vendor, payload),
+            )
             .await?;
         let mut events = session.adapter.events(&session.thread);
         let mut replies = Vec::new();
@@ -548,6 +551,17 @@ impl Gateway {
     }
 }
 
+fn turn_input_for_session(vendor: AgentVendor, payload: String) -> TurnInput {
+    let trimmed = payload.trim();
+    if let Some(command) = trimmed.strip_prefix('/') {
+        let name = command.split_whitespace().next().unwrap_or_default();
+        if vendor == AgentVendor::Claude || matches!(name, "compact" | "review") {
+            return TurnInput::SystemDirective(command.to_string());
+        }
+    }
+    TurnInput::UserText(payload)
+}
+
 fn parse_vendor(raw: &str) -> Result<AgentVendor> {
     match raw {
         "claude" => Ok(AgentVendor::Claude),
@@ -581,11 +595,29 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Mutex;
 
-    #[derive(Debug, Default)]
+    #[derive(Debug)]
     struct FakeAdapter {
+        vendor: AgentVendor,
         starts: AtomicUsize,
         submissions: Arc<Mutex<Vec<(String, String)>>>,
         events: Arc<Mutex<VecDeque<(String, ThreadEvent)>>>,
+    }
+
+    impl Default for FakeAdapter {
+        fn default() -> Self {
+            Self::new(AgentVendor::Claude)
+        }
+    }
+
+    impl FakeAdapter {
+        fn new(vendor: AgentVendor) -> Self {
+            Self {
+                vendor,
+                starts: AtomicUsize::new(0),
+                submissions: Arc::new(Mutex::new(Vec::new())),
+                events: Arc::new(Mutex::new(VecDeque::new())),
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -595,7 +627,7 @@ mod tests {
         }
 
         fn vendor(&self) -> AgentVendor {
-            AgentVendor::Claude
+            self.vendor
         }
 
         async fn start_thread(
@@ -605,7 +637,7 @@ mod tests {
         ) -> Result<ThreadHandle, HarnessError> {
             self.starts.fetch_add(1, Ordering::SeqCst);
             Ok(ThreadHandle {
-                vendor: AgentVendor::Claude,
+                vendor: self.vendor,
                 mode: ExecutionMode::Chat,
                 identity: format!("{}-{}-{}", ctx.slug, spec.role, ctx.sid),
                 started_at: chrono::Utc::now(),
@@ -620,6 +652,7 @@ mod tests {
         ) -> Result<TurnId, HarnessError> {
             let text = match input {
                 TurnInput::UserText(text) => text,
+                TurnInput::SystemDirective(directive) => format!("system:{directive}"),
                 _ => String::new(),
             };
             self.submissions
@@ -751,6 +784,136 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(replies, vec!["beta-api-s1 echo: ping"]);
+    }
+
+    #[tokio::test]
+    async fn gateway_routes_two_projects_and_sessions_matrix() {
+        let claude = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let codex = Arc::new(FakeAdapter::new(AgentVendor::Codex));
+        let factory = {
+            let claude = Arc::clone(&claude);
+            let codex = Arc::clone(&codex);
+            Arc::new(move |vendor| -> Arc<dyn HarnessAdapter + Send + Sync> {
+                match vendor {
+                    AgentVendor::Claude => claude.clone(),
+                    AgentVendor::Codex => codex.clone(),
+                }
+            })
+        };
+        let mut gateway = Gateway::new_with_factory(factory, "alpha", "/tmp/alpha");
+        gateway.register_project("beta", "/tmp/beta");
+
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new codex docs")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/cd beta")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new codex api")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude qa")
+            .await
+            .unwrap();
+
+        let sessions = gateway
+            .handle_text("mock", "chat-1", "alice", "/sessions")
+            .await
+            .unwrap();
+        assert_eq!(
+            sessions,
+            vec![
+                "s1:alpha:Claude:reviewer\ns2:alpha:Codex:docs\ns3:beta:Codex:api\ns4:beta:Claude:qa"
+            ]
+        );
+        let projects = gateway
+            .handle_text("mock", "chat-1", "alice", "/projects")
+            .await
+            .unwrap();
+        assert_eq!(projects, vec!["alpha\nbeta"]);
+
+        let alpha_reply = gateway
+            .handle_text("mock", "chat-1", "alice", "@reviewer alpha ping")
+            .await
+            .unwrap();
+        assert_eq!(alpha_reply, vec!["alpha-reviewer-s1 echo: alpha ping"]);
+        let beta_reply = gateway
+            .handle_text("mock", "chat-1", "alice", "@api beta ping")
+            .await
+            .unwrap();
+        assert_eq!(beta_reply, vec!["beta-api-s3 echo: beta ping"]);
+
+        gateway
+            .handle_text("mock", "chat-2", "bob", "/new claude reviewer")
+            .await
+            .unwrap();
+        let isolated = gateway
+            .handle_text("mock", "chat-2", "bob", "same text")
+            .await
+            .unwrap();
+        assert_eq!(isolated, vec!["alpha-reviewer-s5 echo: same text"]);
+    }
+
+    #[tokio::test]
+    async fn gateway_dual_vendor_sessions_route_slash_commands_by_vendor() {
+        let claude = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let codex = Arc::new(FakeAdapter::new(AgentVendor::Codex));
+        let factory = {
+            let claude = Arc::clone(&claude);
+            let codex = Arc::clone(&codex);
+            Arc::new(move |vendor| -> Arc<dyn HarnessAdapter + Send + Sync> {
+                match vendor {
+                    AgentVendor::Claude => claude.clone(),
+                    AgentVendor::Codex => codex.clone(),
+                }
+            })
+        };
+        let mut gateway = Gateway::new_with_factory(factory, "alpha", "/tmp/alpha");
+
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new codex api")
+            .await
+            .unwrap();
+
+        let compact = gateway
+            .handle_text("mock", "chat-1", "alice", "/compact")
+            .await
+            .unwrap();
+        assert_eq!(compact, vec!["alpha-api-s2 echo: system:compact"]);
+        let review = gateway
+            .handle_text("mock", "chat-1", "alice", "/review")
+            .await
+            .unwrap();
+        assert_eq!(review, vec!["alpha-api-s2 echo: system:review"]);
+        let claude_clear = gateway
+            .handle_text("mock", "chat-1", "alice", "@reviewer /clear")
+            .await
+            .unwrap();
+        assert_eq!(claude_clear, vec!["alpha-reviewer-s1 echo: system:clear"]);
+
+        assert_eq!(
+            codex.submissions.lock().await.as_slice(),
+            &[
+                ("alpha-api-s2".to_string(), "system:compact".to_string()),
+                ("alpha-api-s2".to_string(), "system:review".to_string())
+            ]
+        );
+        assert_eq!(
+            claude.submissions.lock().await.as_slice(),
+            &[("alpha-reviewer-s1".to_string(), "system:clear".to_string())]
+        );
     }
 
     #[tokio::test]

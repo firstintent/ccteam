@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
-use ccteam_harness::execution::{ClaudeTuiAdapter, CodexExecAdapter};
+use ccteam_harness::execution::{ClaudeTuiAdapter, CodexAppServerAdapter};
 use ccteam_harness::{AgentVendor, HarnessAdapter};
 use tokio::sync::Mutex;
 
@@ -53,19 +53,16 @@ pub type AdapterFactory =
 /// Pick the canonical production adapter for `vendor`.
 ///
 /// - `Claude` → [`ClaudeTuiAdapter`] (the mode 3 chat adapter).
-/// - `Codex` → [`CodexExecAdapter`] — per-turn `codex exec --json`
-///   subprocess wrapped by the V0.6.5 advise-ledger hook so every
-///   Codex call (chat bot, daemon-routed critic, advise_vote / parallel)
-///   funnels through the same `<ccteam_root>/cost-budget.json` rollup.
-///   Previously fell back to `ClaudeTuiAdapter` (a silent no-op);
-///   that left Codex calls outside the cost ledger.
+/// - `Codex` → [`CodexAppServerAdapter`] — mode-3 chat sessions use the
+///   app-server JSON-RPC control plane so `/compact` and `/review` map to
+///   Codex-native RPCs instead of `codex exec` subprocess turns.
 pub fn default_adapter_factory() -> AdapterFactory {
     Arc::new(|vendor: AgentVendor| match vendor {
         AgentVendor::Claude => {
             Arc::new(ClaudeTuiAdapter::new()) as Arc<dyn HarnessAdapter + Send + Sync>
         }
         AgentVendor::Codex => {
-            Arc::new(CodexExecAdapter::new()) as Arc<dyn HarnessAdapter + Send + Sync>
+            Arc::new(CodexAppServerAdapter::new()) as Arc<dyn HarnessAdapter + Send + Sync>
         }
     })
 }
@@ -1061,13 +1058,10 @@ mod tests {
         assert!(!supervisors[0].is_started().await);
     }
 
-    /// V0.6.6 F173 — `default_adapter_factory` must route the Codex arm
-    /// to a Codex-vendor adapter (CodexExecAdapter), not the Claude
-    /// fallback that lived here from V0.6.0 Wave 3. The previous fallback
-    /// silently broke the unified cost rollup (Codex chat-mode spawns
-    /// never appended a ledger row). This test pins the fix.
+    /// `default_adapter_factory` must route the Codex arm to the mode-3
+    /// app-server adapter, not the legacy exec path or Claude fallback.
     #[test]
-    fn default_adapter_factory_codex_arm_returns_codex_vendor() {
+    fn default_adapter_factory_codex_arm_returns_app_server_adapter() {
         let factory = default_adapter_factory();
         let claude = factory(AgentVendor::Claude);
         assert_eq!(
@@ -1081,5 +1075,6 @@ mod tests {
             AgentVendor::Codex,
             "F173: codex arm must return a Codex adapter, not the Claude fallback"
         );
+        assert_eq!(codex.name(), "codex-app-server");
     }
 }
