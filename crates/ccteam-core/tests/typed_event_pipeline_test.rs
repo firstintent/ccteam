@@ -1,6 +1,6 @@
 //! V0.8 rmux Slice 1 — typed-event pipeline integration coverage.
 //!
-//! Exercises [`ccteam_core::execution::typed_events::maybe_start_typed_event_tap`],
+//! Exercises [`ccteam_harness::execution::typed_events::maybe_start_typed_event_tap`],
 //! the flag-gated bridge that mirrors a live mux session's no-enrichment
 //! pattern detections into a project's `progress.jsonl` as `typed_event`
 //! rows.
@@ -35,8 +35,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ccteam_core::execution::typed_events::{enrich_session, maybe_start_typed_event_tap};
 use ccteam_core::progress;
+use ccteam_harness::execution::typed_events::{enrich_session, maybe_start_typed_event_tap};
 use ccteam_harness::{
     EventKind, MuxSessionId, MuxSessionSpec, RmuxBackend, TerminalProcessBackend, Vendor,
 };

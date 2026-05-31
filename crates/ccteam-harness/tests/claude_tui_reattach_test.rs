@@ -13,8 +13,8 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
-use ccteam_core::execution::claude_tui::{chat_session_name, ClaudeTuiAdapter};
-use ccteam_core::tmux::TmuxSession;
+use ccteam_harness::execution::claude_tui::{chat_session_name, ClaudeTuiAdapter};
+use ccteam_harness::tmux_ops::TmuxSession;
 use ccteam_harness::{
     AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, SpawnCtx, CLAUDE_BIN_ENV,
 };
@@ -68,7 +68,7 @@ fn make_ctx(slug: &str, _role: &str, tmp: &tempfile::TempDir) -> SpawnCtx {
 #[serial]
 async fn start_thread_reattaches_alive_session() {
     std::env::set_var("CCTEAM_MUX_BACKEND", "tmux");
-    if !ccteam_core::tmux::tmux_available() {
+    if !ccteam_harness::tmux_ops::tmux_available() {
         eprintln!("skip: tmux not available");
         return;
     }
@@ -156,7 +156,7 @@ async fn start_thread_reattaches_alive_session() {
 #[serial]
 async fn start_thread_recreates_dead_session() {
     std::env::set_var("CCTEAM_MUX_BACKEND", "tmux");
-    if !ccteam_core::tmux::tmux_available() {
+    if !ccteam_harness::tmux_ops::tmux_available() {
         eprintln!("skip: tmux not available");
         return;
     }
@@ -259,7 +259,7 @@ async fn start_thread_recreates_dead_session() {
 #[serial]
 async fn start_thread_creates_new_session_when_absent() {
     std::env::set_var("CCTEAM_MUX_BACKEND", "tmux");
-    if !ccteam_core::tmux::tmux_available() {
+    if !ccteam_harness::tmux_ops::tmux_available() {
         eprintln!("skip: tmux not available");
         return;
     }
@@ -310,7 +310,7 @@ fn list_pane_pids_on_absent_session_is_empty() {
 #[test]
 #[serial]
 fn list_pane_pids_on_live_session_returns_pid() {
-    if !ccteam_core::tmux::tmux_available() {
+    if !ccteam_harness::tmux_ops::tmux_available() {
         eprintln!("skip: tmux not available");
         return;
     }
@@ -350,7 +350,7 @@ fn list_pane_pids_on_live_session_returns_pid() {
 #[serial]
 async fn start_thread_is_idempotent_on_alive_session() {
     std::env::set_var("CCTEAM_MUX_BACKEND", "tmux");
-    if !ccteam_core::tmux::tmux_available() {
+    if !ccteam_harness::tmux_ops::tmux_available() {
         eprintln!("skip: tmux not available");
         return;
     }

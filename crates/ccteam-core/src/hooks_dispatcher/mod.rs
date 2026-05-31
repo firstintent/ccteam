@@ -31,7 +31,7 @@ pub const HOOK_DISPATCHER_SH: &str = include_str!("hook.sh");
 /// V0.8 rmux W6 — env flag that opts a host into the daemon-bus hook
 /// reroute (Option C: hook subprocess → `~/.ccteam/run/hook.sock` →
 /// orchestrator single-writer). When `CCTEAM_HOOK_VIA_DAEMON=1`,
-/// [`ensure_chat_hooks_installed`](crate::execution::claude_tui::ensure_chat_hooks_installed)
+/// [`ensure_chat_hooks_installed`](ccteam_harness::execution::claude_tui::ensure_chat_hooks_installed)
 /// generates hook commands that call `ccteam mux hook-emit ...` and the
 /// orchestrator (`ccteam start`) binds a [`ccteam_harness::HookSink`] to
 /// consume them.

@@ -37,16 +37,33 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use ccteam_core::execution::claude_tui::{
+use ccteam_harness::execution::claude_tui::{
     chat_session_id_name, chat_session_name, ClaudeTuiAdapter,
 };
-use ccteam_core::tmux::TmuxSession;
+use ccteam_harness::tmux_ops::TmuxSession;
 use ccteam_harness::{AgentSpecBrief, HarnessAdapter, SpawnCtx, CLAUDE_BIN_ENV};
 use serial_test::serial;
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+struct TestCcteamPaths {
+    root: PathBuf,
+}
+
+impl TestCcteamPaths {
+    fn progress_jsonl(&self, slug: &str) -> PathBuf {
+        self.root.join("progress").join(format!("{slug}.jsonl"))
+    }
+}
+
+fn test_ccteam_paths_from_env() -> Option<TestCcteamPaths> {
+    std::env::var_os("CCTEAM_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".ccteam")))
+        .map(|root| TestCcteamPaths { root })
+}
 
 fn kill_session_quiet(name: &str) {
     let _ = std::process::Command::new("tmux")
@@ -213,7 +230,7 @@ fn chat_session_id_name_uses_canonical_format() {
 #[serial]
 async fn fresh_spawn_argv_contains_name_flag() {
     std::env::set_var("CCTEAM_MUX_BACKEND", "tmux");
-    if !ccteam_core::tmux::tmux_available() {
+    if !ccteam_harness::tmux_ops::tmux_available() {
         eprintln!("skip: tmux not available");
         return;
     }
@@ -270,7 +287,7 @@ async fn fresh_spawn_argv_contains_name_flag() {
 #[serial]
 async fn recreate_dead_pane_spawn_argv_contains_resume_flag() {
     std::env::set_var("CCTEAM_MUX_BACKEND", "tmux");
-    if !ccteam_core::tmux::tmux_available() {
+    if !ccteam_harness::tmux_ops::tmux_available() {
         eprintln!("skip: tmux not available");
         return;
     }
@@ -330,7 +347,7 @@ async fn recreate_dead_pane_spawn_argv_contains_resume_flag() {
 #[serial]
 async fn resume_failure_falls_back_to_fresh_name() {
     std::env::set_var("CCTEAM_MUX_BACKEND", "tmux");
-    if !ccteam_core::tmux::tmux_available() {
+    if !ccteam_harness::tmux_ops::tmux_available() {
         eprintln!("skip: tmux not available");
         return;
     }
@@ -385,7 +402,7 @@ async fn resume_failure_falls_back_to_fresh_name() {
     );
 
     // Verify `chat_session_reset` event was appended with the right reason.
-    let paths = ccteam_core::CcteamPaths::from_env().expect("CcteamPaths::from_env");
+    let paths = test_ccteam_paths_from_env().expect("CcteamPaths::from_env");
     let progress_path = paths.progress_jsonl(&slug);
     assert!(
         progress_path.exists(),
@@ -418,7 +435,7 @@ async fn resume_failure_falls_back_to_fresh_name() {
 #[serial]
 async fn alive_reattach_does_not_spawn_new_claude() {
     std::env::set_var("CCTEAM_MUX_BACKEND", "tmux");
-    if !ccteam_core::tmux::tmux_available() {
+    if !ccteam_harness::tmux_ops::tmux_available() {
         eprintln!("skip: tmux not available");
         return;
     }
@@ -486,7 +503,7 @@ async fn alive_reattach_does_not_spawn_new_claude() {
 #[serial]
 async fn cwd_collision_two_roles_distinct_names() {
     std::env::set_var("CCTEAM_MUX_BACKEND", "tmux");
-    if !ccteam_core::tmux::tmux_available() {
+    if !ccteam_harness::tmux_ops::tmux_available() {
         eprintln!("skip: tmux not available");
         return;
     }
@@ -559,7 +576,7 @@ async fn cwd_collision_two_roles_distinct_names() {
 #[serial]
 async fn fresh_spawn_creates_turns_mirror_dir_for_f118() {
     std::env::set_var("CCTEAM_MUX_BACKEND", "tmux");
-    if !ccteam_core::tmux::tmux_available() {
+    if !ccteam_harness::tmux_ops::tmux_available() {
         eprintln!("skip: tmux not available");
         return;
     }
@@ -608,7 +625,7 @@ async fn fresh_spawn_creates_turns_mirror_dir_for_f118() {
 #[serial]
 async fn daemon_restart_uses_resume_route() {
     std::env::set_var("CCTEAM_MUX_BACKEND", "tmux");
-    if !ccteam_core::tmux::tmux_available() {
+    if !ccteam_harness::tmux_ops::tmux_available() {
         eprintln!("skip: tmux not available");
         return;
     }

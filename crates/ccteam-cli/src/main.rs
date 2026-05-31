@@ -1944,7 +1944,7 @@ fn run_start(
                                         // registered for this session). Cheap sync
                                         // channel send; done before the event moves
                                         // into the blocking dispatch below.
-                                        ccteam_core::execution::typed_events::enrich_session_from_hook(&event);
+                                        ccteam_harness::execution::typed_events::enrich_session_from_hook(&event);
                                         let dispatch_paths = dispatch_paths.clone();
                                         let res = tokio::task::spawn_blocking(move || {
                                             let stdin: serde_json::Value =

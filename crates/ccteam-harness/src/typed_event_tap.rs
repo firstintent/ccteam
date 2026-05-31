@@ -67,7 +67,7 @@ pub fn event_kind_for_regex_id(regex_id: &str) -> Option<EventKind> {
 ///
 /// **Slice 4 — `identity`.** For tool-call kinds, the integrator extracts
 /// the tool name from the hook payload (see
-/// `ccteam_core::execution::typed_events::identity_for`) and passes it
+/// `crate::execution::typed_events::identity_for`) and passes it
 /// here. The tap routes identity into the merger's pairing predicate so
 /// two parallel tool calls of different tools never cross-pair. `None`
 /// preserves the pre-Slice-4 per-kind FIFO behaviour exactly.
@@ -312,7 +312,7 @@ impl TypedEventTap {
                                     // nothing useful; identity is None on the base
                                     // side and cohort partitioning happens via the
                                     // enrichment-side `tool_name` (see
-                                    // `ccteam_core::execution::typed_events::identity_for`).
+                                    // `crate::execution::typed_events::identity_for`).
                                     // Every other kind has no pane-side identity.
                                     let identity = if kind == EventKind::ToolCallStarted
                                         && !captured.is_empty()
@@ -639,7 +639,7 @@ mod tests {
         // bound: it grows linearly with the no-enrich event count
         // between flushes. That is acceptable because (a) the merger
         // already emits these immediately as BaseOnly (no parking on
-        // the merger side), and (b) ccteam_core::execution::typed_events
+        // the merger side), and (b) crate::execution::typed_events
         // does not consult pending_base. The size is observability-only.
         //
         // The assertion below pins this: queue length equals number of

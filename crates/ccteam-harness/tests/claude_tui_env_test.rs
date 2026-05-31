@@ -16,7 +16,7 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
-use ccteam_core::execution::claude_tui::{chat_session_name, ClaudeTuiAdapter};
+use ccteam_harness::execution::claude_tui::{chat_session_name, ClaudeTuiAdapter};
 use ccteam_harness::{AgentSpecBrief, HarnessAdapter, SpawnCtx, CLAUDE_BIN_ENV};
 use serial_test::serial;
 
@@ -64,7 +64,7 @@ fn show_env(session: &str, key: &str) -> Option<String> {
 #[serial]
 async fn fresh_spawn_injects_chat_role_and_slug_env() {
     std::env::set_var("CCTEAM_MUX_BACKEND", "tmux");
-    if !ccteam_core::tmux::tmux_available() {
+    if !ccteam_harness::tmux_ops::tmux_available() {
         eprintln!("skip: tmux not available");
         return;
     }

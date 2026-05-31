@@ -23,7 +23,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use ccteam_core::execution::claude_tui::ClaudeTuiAdapter;
+use ccteam_harness::execution::claude_tui::ClaudeTuiAdapter;
 use ccteam_harness::execution::transcript_tail::{active_session_id_path, encode_project_cwd};
 use ccteam_harness::{
     AgentVendor, ExecutionMode, HarnessAdapter, ThreadEvent, ThreadHandle, ThreadItemDetails,

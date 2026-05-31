@@ -25,7 +25,7 @@
 //!   (see `docs/versions/v0-8-rmux/w-slice-3-multi-in-flight-pairing.md`).
 //! - **Slice 4 — `ToolCallStarted` wiring.** Adds `pre-tool-use` (Claude's
 //!   `PreToolUse`) → [`EventKind::ToolCallStarted`]. The chat-progress
-//!   installer at `crates/ccteam-core/src/execution/claude_tui.rs:126-135`
+//!   installer at `crates/ccteam-harness/src/execution/claude_tui.rs:126-135`
 //!   now registers a `PreToolUse` entry; the hook writes a
 //!   `chat_tool_call_started` row and routes a `ToolCallStarted`
 //!   enrichment into the tap. Pre-rerun-of-`ccteam doctor --install-hooks`
@@ -41,7 +41,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use ccteam_harness::{
+use crate::execution::progress_bridge::{
+    append_event, build_merger_lossy_partial_event, build_typed_event_event,
+};
+use crate::{
     EventKind, MergeOutcome, MuxSessionId, RawEnrichment, TapHandle, TerminalProcessBackend,
     TypedEventTap, Vendor, DEFAULT_GRACE,
 };
@@ -77,7 +80,7 @@ fn registry() -> &'static Mutex<HashMap<String, Arc<TapHandle>>> {
 /// it enriches.
 ///
 /// The chat-progress installer at
-/// `crates/ccteam-core/src/execution/claude_tui.rs:126-135` uses kebab-case
+/// `crates/ccteam-harness/src/execution/claude_tui.rs:126-135` uses kebab-case
 /// action strings (`stop`, `user-prompt`, `tool-use`, `session-start`,
 /// `subagent-stop`, `session-end`, `pre-compact`, `post-compact`). We map the
 /// subset that has a merger [`EventKind`] today:
@@ -156,10 +159,10 @@ pub fn enrich_session(
 }
 
 /// Entry point for the orchestrator's hook sink: translate a Claude
-/// chat-progress [`ccteam_harness::HookEvent`] into a merger enrichment and route
+/// chat-progress [`crate::HookEvent`] into a merger enrichment and route
 /// it to the session's tap. No-op unless typed events are enabled and the
 /// action maps to a paired kind.
-pub fn enrich_session_from_hook(event: &ccteam_harness::HookEvent) {
+pub fn enrich_session_from_hook(event: &crate::HookEvent) {
     if !flag_enabled() {
         return;
     }
@@ -250,7 +253,9 @@ pub fn maybe_start_typed_event_tap(
         // only when hook enrichment is actually being routed to taps (else a
         // turn_done pattern with no enrichment ALWAYS goes BaseLossy, which
         // would spam spurious partials). Snapshot once at start.
-        let lossy_meaningful = crate::hooks_dispatcher::hook_via_daemon_enabled();
+        let lossy_meaningful = std::env::var("CCTEAM_HOOK_VIA_DAEMON")
+            .map(|v| v == "1")
+            .unwrap_or(false);
 
         while let Some(ev) = rx.recv().await {
             let kind_for_row = match ev.outcome {
@@ -277,20 +282,20 @@ pub fn maybe_start_typed_event_tap(
                 .map(|b| b.captured.clone())
                 .unwrap_or_default();
             let row = match row_kind {
-                "merger_lossy_partial" => crate::progress::build_merger_lossy_partial_event(
+                "merger_lossy_partial" => build_merger_lossy_partial_event(
                     vendor_str(vendor),
                     event_kind_str(kind),
                     &captured,
                     &session,
                 ),
-                _ => crate::progress::build_typed_event_event(
+                _ => build_typed_event_event(
                     vendor_str(vendor),
                     event_kind_str(kind),
                     &captured,
                     &session,
                 ),
             };
-            if let Err(err) = crate::progress::append_event(&progress_path, &row) {
+            if let Err(err) = append_event(&progress_path, &row) {
                 tracing::debug!(
                     error = %err,
                     session = %session,

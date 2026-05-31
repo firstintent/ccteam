@@ -45,19 +45,22 @@ use notify::{EventKind, RecursiveMode, Watcher};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-use ccteam_harness::execution::process_inspect::pane_runs_process;
-use ccteam_harness::execution::transcript_tail::{
+use crate::execution::marker_reporter;
+use crate::execution::process_inspect::pane_runs_process;
+use crate::execution::progress_bridge::{
+    append_event, build_chat_session_reset_event_with_reason, hooks_script_from_env,
+    progress_jsonl_from_env,
+};
+use crate::execution::transcript_tail::{
     self, active_session_id_path, anthropic_project_dir, cursor_path, encode_project_cwd,
     PendingTools, TranscriptCursor,
 };
-use ccteam_harness::execution::turns_mirror;
-use ccteam_harness::{default_backend, MuxSessionId, MuxSessionKind, MuxSessionSpec};
-use ccteam_harness::{
+use crate::execution::turns_mirror;
+use crate::{default_backend, MuxSessionId, MuxSessionKind, MuxSessionSpec};
+use crate::{
     AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx,
-    ThreadEvent, ThreadHandle, TurnId, TurnInput,
+    ThreadEvent, ThreadHandle, TurnId, TurnInput, CLAUDE_BIN_ENV,
 };
-
-use crate::CLAUDE_BIN_ENV;
 
 /// V0.6.0 F108 [`HarnessAdapter`] for Claude Code TUI (long-running tmux
 /// session, multi-turn with context reuse).
@@ -92,7 +95,7 @@ pub fn chat_session_id_name(slug: &str, role: &str) -> String {
 /// `hook_sh` is the absolute path to the dispatcher
 /// (`~/.ccteam/hooks/hook.sh` in production; tests pin a fake path).
 ///
-/// V0.8 rmux W6 — when [`crate::hooks_dispatcher::hook_via_daemon_enabled`]
+/// V0.8 rmux W6 — when [`hook_via_daemon_enabled`]
 /// is true (operator set `CCTEAM_HOOK_VIA_DAEMON=1`), the generated hook
 /// command becomes `ccteam mux hook-emit --kind chat-progress --action
 /// <arg>` instead — routing the firing to the orchestrator's hook.sock
@@ -136,7 +139,7 @@ pub fn ensure_chat_hooks_installed(project_dir: &Path, hook_sh: &str) -> Result<
         ("PreCompact", "pre-compact"),
         ("PostCompact", "post-compact"),
     ];
-    let via_daemon = crate::hooks_dispatcher::hook_via_daemon_enabled();
+    let via_daemon = hook_via_daemon_enabled();
     for (event, arg) in chat_events {
         // DEFAULT (flag unset): byte-for-byte the pre-W6 command string.
         // mode-3 Claude depends on this exact form — do NOT change it.
@@ -197,10 +200,7 @@ fn chat_spawn_env_owned(role: &str, slug: &str) -> Vec<(String, String)> {
 /// pane text content). Probe errors (backend query failure) degrade to
 /// `false` — a session we can't probe is treated as not-alive, which
 /// routes start_thread to the safe recreate path.
-async fn pane_runs_claude(
-    backend: &dyn ccteam_harness::TerminalProcessBackend,
-    id: &MuxSessionId,
-) -> bool {
+async fn pane_runs_claude(backend: &dyn crate::TerminalProcessBackend, id: &MuxSessionId) -> bool {
     pane_runs_process(backend, id, "claude")
         .await
         .unwrap_or(false)
@@ -258,9 +258,15 @@ fn ccteam_bin_for_hooks() -> String {
     if let Ok(path) = std::env::var("CCTEAM_HOOK_SH") {
         return path;
     }
-    crate::CcteamPaths::from_env()
-        .map(|paths| paths.hooks_script().display().to_string())
-        .unwrap_or_else(|_| "ccteam".to_string())
+    hooks_script_from_env()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "ccteam".to_string())
+}
+
+fn hook_via_daemon_enabled() -> bool {
+    std::env::var("CCTEAM_HOOK_VIA_DAEMON")
+        .map(|v| v == "1")
+        .unwrap_or(false)
 }
 
 #[async_trait]
@@ -399,13 +405,12 @@ impl HarnessAdapter for ClaudeTuiAdapter {
                     // explicit reason so IM / web surfaces show the
                     // user "context was lost". Path resolution honours
                     // CCTEAM_HOME so tests land in their tempdir layout.
-                    if let Ok(paths) = crate::CcteamPaths::from_env() {
-                        let progress_path = paths.progress_jsonl(&ctx.slug);
-                        let ev = crate::progress::build_chat_session_reset_event_with_reason(
+                    if let Some(progress_path) = progress_jsonl_from_env(&ctx.slug) {
+                        let ev = build_chat_session_reset_event_with_reason(
                             &spec.role,
                             "resume_failed_fallback_to_fresh",
                         );
-                        if let Err(err) = crate::progress::append_event(&progress_path, &ev) {
+                        if let Err(err) = append_event(&progress_path, &ev) {
                             tracing::warn!(
                                 error = %err,
                                 "claude-tui: failed to append chat_session_reset event"
@@ -437,16 +442,16 @@ impl HarnessAdapter for ClaudeTuiAdapter {
         // Start a typed-event tap that mirrors no-enrichment pattern
         // detections into progress.jsonl. No-op unless CCTEAM_TYPED_EVENTS
         // is set, so the flag-OFF path is behavior-neutral (one env check).
-        if let Ok(paths) = crate::CcteamPaths::from_env() {
+        if let Some(progress_path) = progress_jsonl_from_env(&ctx.slug) {
             crate::execution::typed_events::maybe_start_typed_event_tap(
                 backend.clone(),
                 id.clone(),
-                ccteam_harness::Vendor::Claude,
+                crate::Vendor::Claude,
                 // Registry key == HookEvent::session_id (`{slug}-{role}`,
                 // from CCTEAM_CHAT_SLUG/ROLE) so the orchestrator's hook sink
                 // can route Stop-hook enrichment to this session's tap.
                 format!("{}-{}", ctx.slug, spec.role),
-                paths.progress_jsonl(&ctx.slug),
+                progress_path,
             );
         }
 
@@ -912,7 +917,7 @@ async fn observe_marker(
     if slug.is_empty() {
         return;
     }
-    if let Some(reporter) = ccteam_harness::execution::marker_reporter::lookup(slug, role) {
+    if let Some(reporter) = marker_reporter::lookup(slug, role) {
         if marker_present {
             reporter.report_marker_found().await;
         } else {
@@ -1161,7 +1166,7 @@ async fn tail_loop_polling(
 
 // Re-export to keep `anthropic_project_dir` reachable for the
 // session_recovery / imd consumers without bloating the module surface.
-pub use ccteam_harness::execution::transcript_tail::anthropic_project_dir as resolve_anthropic_project_dir;
+pub use crate::execution::transcript_tail::anthropic_project_dir as resolve_anthropic_project_dir;
 
 #[cfg(test)]
 mod tests {

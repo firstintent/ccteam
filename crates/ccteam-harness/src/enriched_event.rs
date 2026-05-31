@@ -29,7 +29,7 @@
 //!   session's base patterns, subscribes, and lifts
 //!   `MuxEvent::PatternMatched` / `OutputIdle` / `ProcessExited` into
 //!   [`BaseEvent`]s fed to this merger.
-//! - *Consumer*: `ccteam_core::execution::typed_events` reads the merged
+//! - *Consumer*: `crate::execution::typed_events` reads the merged
 //!   stream and writes `progress.jsonl` rows (flag-gated on
 //!   `CCTEAM_TYPED_EVENTS`, integrated at the Claude chat-TUI spawn).
 //!

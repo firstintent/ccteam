@@ -22,6 +22,7 @@ async-trait = { workspace = true }
 chrono = { workspace = true }
 dirs = { workspace = true }
 futures = { workspace = true }
+notify = { workspace = true }
 regex = { workspace = true }
 # V0.8 W6 — hook_sink frames a typed `HookEvent` as length-prefixed
 # JSON over the ccteam-owned hook.sock (Option C).
@@ -46,3 +47,4 @@ nix = { version = "0.29", default-features = false, features = ["fs"] }
 # no real sleeps). Enable it here as an additive dev-only feature.
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
+serial_test = "3"

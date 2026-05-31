@@ -8,7 +8,7 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
-use ccteam_core::execution::claude_tui::{
+use ccteam_harness::execution::claude_tui::{
     chat_session_name, ensure_chat_hooks_installed, ClaudeTuiAdapter,
 };
 use ccteam_harness::{
