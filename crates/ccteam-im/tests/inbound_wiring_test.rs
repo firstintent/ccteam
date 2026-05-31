@@ -894,6 +894,7 @@ async fn real_ws_dual_harness_smoke() {
     let old_path = std::env::var_os("PATH");
     let nl_mode = std::env::var("CCTEAM_REAL_IM_WS_NL").ok();
     let restart_mode = std::env::var("CCTEAM_REAL_IM_WS_RESTART").ok().as_deref() == Some("1");
+    let fault_mode = std::env::var("CCTEAM_REAL_IM_WS_FAULTS").ok().as_deref() == Some("1");
     std::env::set_var("CCTEAM_HOME", ccteam_home.path());
     std::env::set_var("CCTEAM_CODEX_APP_SERVER_TRANSPORT", "stdio");
     std::env::remove_var("CCTEAM_CODEX_APP_SERVER_SOCKET");
@@ -936,7 +937,7 @@ async fn real_ws_dual_harness_smoke() {
     let ws = Arc::new(WsChannel::bind_localhost().await.unwrap());
     let ws_addr = ws.local_addr();
     let ws_url = format!("ws://{ws_addr}");
-    let max_runtime = if nl_mode.is_some() || restart_mode {
+    let max_runtime = if nl_mode.is_some() || restart_mode || fault_mode {
         Duration::from_secs(300)
     } else {
         Duration::from_secs(30)
@@ -1083,6 +1084,43 @@ async fn real_ws_dual_harness_smoke() {
             Duration::from_secs(180),
         )
         .await;
+    }
+
+    if fault_mode {
+        let status = std::process::Command::new("tmux")
+            .arg("kill-session")
+            .arg("-t")
+            .arg(&claude_tmux_session)
+            .status()
+            .expect("tmux kill-session should run");
+        assert!(status.success(), "tmux kill-session should succeed");
+        assert!(
+            !tmux_session_exists(&claude_tmux_session),
+            "Claude tmux session should be gone after injected fault"
+        );
+        send_ws_text(
+            &mut socket,
+            "real-ws-claude-after-kill",
+            "@reviewer this should surface a missing tmux error",
+        )
+        .await;
+        let fault = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10)).await;
+        assert!(
+            fault
+                .content
+                .starts_with("gateway error: submit failed: tmux session missing:"),
+            "Claude tmux death should be user-visible, got {:?}",
+            fault.content
+        );
+        drop(socket);
+        let _ = stop_tx.send(());
+        daemon.await.unwrap();
+        restore_env("CCTEAM_HOME", old_ccteam_home);
+        restore_env("CCTEAM_CODEX_APP_SERVER_TRANSPORT", old_transport);
+        restore_env("CCTEAM_CODEX_APP_SERVER_SOCKET", old_socket);
+        restore_env("CCTEAM_MUX_BACKEND", old_mux_backend);
+        restore_env("PATH", old_path);
+        return;
     }
 
     send_ws_text(&mut socket, "real-ws-claude-clear", "@reviewer /clear").await;

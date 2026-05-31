@@ -23,6 +23,8 @@ Set CCTEAM_REAL_IM_WS_NL=codex|claude|1 with CCTEAM_REAL_IM_WS=1
 to require true natural-language replies from Codex, Claude, or both.
 Set CCTEAM_REAL_IM_WS_RESTART=1 with CCTEAM_REAL_IM_WS=1 to kill and
 restart the daemon mid-smoke, then require both sessions to continue.
+Set CCTEAM_REAL_IM_WS_FAULTS=1 with CCTEAM_REAL_IM_WS=1 to inject a
+real Claude tmux-session death and require a user-visible gateway error.
 EOF
 }
 
