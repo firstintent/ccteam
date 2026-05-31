@@ -44,33 +44,15 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
+pub use ccteam_cost::{
+    AdviseBudgetLedger, BudgetSample, APPROX_COST_PER_CALL_USD, DEFAULT_ADVISE_BUDGET_USD_24H,
+};
 use ccteam_harness::{AgentVendor, CLAUDE_BIN_ENV, CODEX_BIN_ENV};
-
-/// Per-vendor word-rate proxy used when synthesising an upper-bound
-/// cost for the advise budget ledger. Each Claude / Codex one-shot
-/// advisor call is small (~250 words capped by the skill prompt); we
-/// stick to a single rough multiplier rather than parsing usage out of
-/// the vendor JSONL (Claude's `-p` text mode has no usage block, and
-/// Codex's `--json` does but we charge a flat estimate either way so
-/// the budget ledger keeps the same shape across vendors).
-///
-/// Default ~3.5 USD / 1M tokens, scaled to a typical ~1500-token
-/// roundtrip → ~0.005 USD per advisor call. Conservative enough that
-/// the V0.6.5 default cap (`DEFAULT_ADVISE_BUDGET_USD_24H`) keeps
-/// hundreds of calls/day workable while preventing runaway loops.
-pub const APPROX_COST_PER_CALL_USD: f64 = 0.005;
-
-/// V0.6.5 F152 — fallback rolling 24h cap on advise calls when no
-/// per-vendor cap is supplied at MCP invocation time. 0.50 USD = 100
-/// advisor calls at the [`APPROX_COST_PER_CALL_USD`] estimate. Caller
-/// can override via the `max_cost_usd` MCP arg.
-pub const DEFAULT_ADVISE_BUDGET_USD_24H: f64 = 0.50;
 
 /// V0.6.5 F152 — default per-vendor wall clock for advisor subprocesses.
 /// 60s lines up with the `ccteam-advise` skill's documented Step 1
@@ -147,25 +129,6 @@ pub struct ParallelResult {
     pub budget: BudgetSnapshot,
 }
 
-/// Persistent advise-budget ledger written to
-/// `<ccteam_root>/cost-budget.json`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AdviseBudgetLedger {
-    /// Rolling-window samples. Each entry = one advise call
-    /// (vendor + cost USD + UTC ts). The 24h sum is recomputed on
-    /// every check.
-    #[serde(default)]
-    pub samples: Vec<BudgetSample>,
-}
-
-/// One ledger row.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BudgetSample {
-    pub vendor: AgentVendor,
-    pub usd: f64,
-    pub ts: DateTime<Utc>,
-}
-
 /// Read-only snapshot returned to the MCP caller so the skill can
 /// surface budget headroom without re-reading the file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,6 +150,24 @@ pub enum AdviseError {
     ClaudeFailed(String),
     #[error("verdict synthesis failed: {0}")]
     VerdictFailed(String),
+}
+
+impl From<ccteam_cost::BudgetLedgerError> for AdviseError {
+    fn from(err: ccteam_cost::BudgetLedgerError) -> Self {
+        match err {
+            ccteam_cost::BudgetLedgerError::Io(msg) => AdviseError::Io(msg),
+            ccteam_cost::BudgetLedgerError::Serialize(msg) => {
+                AdviseError::Io(format!("serialize ledger: {msg}"))
+            }
+        }
+    }
+}
+
+fn cost_vendor(vendor: AgentVendor) -> ccteam_cost::Vendor {
+    match vendor {
+        AgentVendor::Claude => ccteam_cost::Vendor::Claude,
+        AgentVendor::Codex => ccteam_cost::Vendor::Codex,
+    }
 }
 
 /// V0.6.5 F152 — entry point for the `ccteam__advise_vote` MCP tool.
@@ -768,21 +749,14 @@ fn classify_agreement(
 
 /// Resolve the ledger file path under a ccteam-root directory.
 pub fn budget_ledger_path(ccteam_root: &Path) -> PathBuf {
-    ccteam_root.join("cost-budget.json")
+    ccteam_cost::budget_ledger_path(ccteam_root)
 }
 
 /// Read the ledger, returning an empty one on missing / malformed file
 /// (we never want budget reads to fail loud — recovery is automatic
 /// on the next call).
 pub fn load_budget_ledger(ccteam_root: &Path) -> Result<AdviseBudgetLedger, AdviseError> {
-    let path = budget_ledger_path(ccteam_root);
-    if !path.exists() {
-        return Ok(AdviseBudgetLedger::default());
-    }
-    let body = std::fs::read_to_string(&path)
-        .map_err(|e| AdviseError::Io(format!("read {}: {e}", path.display())))?;
-    let ledger: AdviseBudgetLedger = serde_json::from_str(&body).unwrap_or_default();
-    Ok(ledger)
+    ccteam_cost::load_budget_ledger(ccteam_root).map_err(AdviseError::from)
 }
 
 /// Append one sample, atomic-rename the ledger. We GC samples older
@@ -793,35 +767,8 @@ pub fn append_budget_sample(
     vendor: AgentVendor,
     usd: f64,
 ) -> Result<(), AdviseError> {
-    std::fs::create_dir_all(ccteam_root)
-        .map_err(|e| AdviseError::Io(format!("mkdir {}: {e}", ccteam_root.display())))?;
-    let mut ledger = load_budget_ledger(ccteam_root)?;
-    ledger.samples.push(BudgetSample {
-        vendor,
-        usd,
-        ts: Utc::now(),
-    });
-    // GC: drop > 48h old samples.
-    let cutoff = Utc::now() - chrono::Duration::hours(48);
-    ledger.samples.retain(|s| s.ts >= cutoff);
-    let body = serde_json::to_string_pretty(&ledger)
-        .map_err(|e| AdviseError::Io(format!("serialize ledger: {e}")))?;
-    let path = budget_ledger_path(ccteam_root);
-    // Atomic write: tmp + rename so a crash mid-write can never leave
-    // a half-flushed file (the read path silently falls back to an
-    // empty ledger on parse failure, but we prefer not to depend on
-    // that for the steady-state).
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, body.as_bytes())
-        .map_err(|e| AdviseError::Io(format!("write {}: {e}", tmp.display())))?;
-    std::fs::rename(&tmp, &path).map_err(|e| {
-        AdviseError::Io(format!(
-            "rename {} → {}: {e}",
-            tmp.display(),
-            path.display()
-        ))
-    })?;
-    Ok(())
+    ccteam_cost::append_budget_sample(ccteam_root, cost_vendor(vendor), usd)
+        .map_err(AdviseError::from)
 }
 
 /// V0.6.6 F173 — typed alias for [`append_budget_sample`] used by
@@ -836,18 +783,13 @@ pub fn append_budget_ledger_row(
     vendor: AgentVendor,
     usd: f64,
 ) -> Result<(), AdviseError> {
-    append_budget_sample(ccteam_root, vendor, usd)
+    ccteam_cost::append_budget_ledger_row(ccteam_root, cost_vendor(vendor), usd)
+        .map_err(AdviseError::from)
 }
 
 /// Sum advise spend over the last 24h (regardless of vendor).
 pub fn sum_advise_today(ledger: &AdviseBudgetLedger) -> f64 {
-    let cutoff = Utc::now() - chrono::Duration::hours(24);
-    ledger
-        .samples
-        .iter()
-        .filter(|s| s.ts >= cutoff)
-        .map(|s| s.usd)
-        .sum()
+    ccteam_cost::sum_advise_today(ledger)
 }
 
 /// V0.6.6 F169 — per-vendor 24h spend, surfaced to the IM `@ccteam
@@ -855,13 +797,7 @@ pub fn sum_advise_today(ledger: &AdviseBudgetLedger) -> f64 {
 /// rather than the V0.6.1 bot-count placeholder. Same rolling window
 /// the bare [`sum_advise_today`] uses, just filtered by vendor.
 pub fn sum_advise_today_by_vendor(ledger: &AdviseBudgetLedger, vendor: AgentVendor) -> f64 {
-    let cutoff = Utc::now() - chrono::Duration::hours(24);
-    ledger
-        .samples
-        .iter()
-        .filter(|s| s.ts >= cutoff && s.vendor == vendor)
-        .map(|s| s.usd)
-        .sum()
+    ccteam_cost::sum_advise_today_by_vendor(ledger, cost_vendor(vendor))
 }
 
 #[cfg(test)]
@@ -950,10 +886,10 @@ mod tests {
         // Seed a stale sample (49h old) by writing the ledger directly,
         // then a fresh sample via the API. The append path should GC
         // the stale row.
-        let stale_ts = Utc::now() - chrono::Duration::hours(49);
+        let stale_ts = chrono::Utc::now() - chrono::Duration::hours(49);
         let ledger = AdviseBudgetLedger {
             samples: vec![BudgetSample {
-                vendor: AgentVendor::Claude,
+                vendor: ccteam_cost::Vendor::Claude,
                 usd: 99.0,
                 ts: stale_ts,
             }],

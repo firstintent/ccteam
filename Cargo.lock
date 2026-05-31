@@ -415,8 +415,11 @@ dependencies = [
 name = "ccteam-cost"
 version = "0.6.8"
 dependencies = [
+ "chrono",
  "serde",
  "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
  "toml",
  "tracing",
 ]

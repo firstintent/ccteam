@@ -3473,8 +3473,8 @@ pub fn compute_cost_orphan(paths: &CcteamPaths) -> (CostOrphanCounts, Vec<String
                 continue;
             }
             let key = match sample.vendor {
-                ccteam_harness::AgentVendor::Claude => CostVendor::Claude,
-                ccteam_harness::AgentVendor::Codex => CostVendor::Codex,
+                ccteam_core::Vendor::Claude => CostVendor::Claude,
+                ccteam_core::Vendor::Codex => CostVendor::Codex,
             };
             *counts.ledger_rows.entry(key).or_insert(0) += 1;
         }

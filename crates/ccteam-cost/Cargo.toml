@@ -7,9 +7,12 @@ license.workspace = true
 description = "ccteam dual-vendor pricing + cost classification + budget caps. Anthropic Claude + OpenAI Codex (o-series + gpt-4o) rate tables, unified token usage shape, and per-vendor budget enforcement primitives."
 
 [dependencies]
+chrono.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 tracing.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
+tempfile = "3"

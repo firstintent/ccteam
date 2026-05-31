@@ -11,9 +11,24 @@
 //! emit `budget_exceeded`) stays in `ccteam-core::queries` because
 //! it depends on `progress.jsonl` parsing types.
 
+use std::path::{Path, PathBuf};
+
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use crate::pricing::Vendor;
+
+/// Per-advisor-call cost estimate used by advise budget ledger rows.
+/// Kept intentionally approximate: both Claude text mode and Codex
+/// JSONL advisors are capped to small prompts, so a flat estimate keeps
+/// budget enforcement deterministic without vendor-specific usage
+/// parsing.
+pub const APPROX_COST_PER_CALL_USD: f64 = 0.005;
+
+/// Fallback rolling 24h cap for advise calls when no explicit cap is
+/// supplied.
+pub const DEFAULT_ADVISE_BUDGET_USD_24H: f64 = 0.50;
 
 /// Per-vendor budget pair. Either side can be omitted in YAML and
 /// defaults to `BudgetCap::default()` (no caps).
@@ -68,6 +83,148 @@ impl Budgets {
             (Some(c), None) => Some(c),
             (None, Some(d)) => Some(d),
             (None, None) => None,
+        }
+    }
+}
+
+/// Persistent advise-budget ledger written to
+/// `<ccteam_root>/cost-budget.json`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AdviseBudgetLedger {
+    /// Rolling-window samples. Each entry = one advise call
+    /// (vendor + cost USD + UTC ts). The 24h sum is recomputed on
+    /// every check.
+    #[serde(default)]
+    pub samples: Vec<BudgetSample>,
+}
+
+/// One ledger row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BudgetSample {
+    #[serde(with = "vendor_wire")]
+    pub vendor: Vendor,
+    pub usd: f64,
+    pub ts: DateTime<Utc>,
+}
+
+/// Errors surfaced by cost-budget ledger persistence.
+#[derive(Debug, Error)]
+pub enum BudgetLedgerError {
+    #[error("io error: {0}")]
+    Io(String),
+    #[error("serialize ledger: {0}")]
+    Serialize(String),
+}
+
+/// Resolve the ledger file path under a ccteam-root directory.
+pub fn budget_ledger_path(ccteam_root: &Path) -> PathBuf {
+    ccteam_root.join("cost-budget.json")
+}
+
+/// Read the ledger, returning an empty one on missing / malformed file
+/// (we never want budget reads to fail loud; recovery is automatic on
+/// the next write).
+pub fn load_budget_ledger(ccteam_root: &Path) -> Result<AdviseBudgetLedger, BudgetLedgerError> {
+    let path = budget_ledger_path(ccteam_root);
+    if !path.exists() {
+        return Ok(AdviseBudgetLedger::default());
+    }
+    let body = std::fs::read_to_string(&path)
+        .map_err(|e| BudgetLedgerError::Io(format!("read {}: {e}", path.display())))?;
+    let ledger: AdviseBudgetLedger = serde_json::from_str(&body).unwrap_or_default();
+    Ok(ledger)
+}
+
+/// Append one sample, atomic-rename the ledger. We GC samples older
+/// than 48h on every write so the file stays bounded even under
+/// many-calls-per-day workloads.
+pub fn append_budget_sample(
+    ccteam_root: &Path,
+    vendor: Vendor,
+    usd: f64,
+) -> Result<(), BudgetLedgerError> {
+    std::fs::create_dir_all(ccteam_root)
+        .map_err(|e| BudgetLedgerError::Io(format!("mkdir {}: {e}", ccteam_root.display())))?;
+    let mut ledger = load_budget_ledger(ccteam_root)?;
+    ledger.samples.push(BudgetSample {
+        vendor,
+        usd,
+        ts: Utc::now(),
+    });
+    let cutoff = Utc::now() - chrono::Duration::hours(48);
+    ledger.samples.retain(|s| s.ts >= cutoff);
+    let body = serde_json::to_string_pretty(&ledger)
+        .map_err(|e| BudgetLedgerError::Serialize(e.to_string()))?;
+    let path = budget_ledger_path(ccteam_root);
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, body.as_bytes())
+        .map_err(|e| BudgetLedgerError::Io(format!("write {}: {e}", tmp.display())))?;
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        BudgetLedgerError::Io(format!(
+            "rename {} -> {}: {e}",
+            tmp.display(),
+            path.display()
+        ))
+    })?;
+    Ok(())
+}
+
+/// Alias for adapter call sites that record a vendor turn rather than
+/// an advise tool fan-out slot.
+pub fn append_budget_ledger_row(
+    ccteam_root: &Path,
+    vendor: Vendor,
+    usd: f64,
+) -> Result<(), BudgetLedgerError> {
+    append_budget_sample(ccteam_root, vendor, usd)
+}
+
+/// Sum advise spend over the last 24h (regardless of vendor).
+pub fn sum_advise_today(ledger: &AdviseBudgetLedger) -> f64 {
+    let cutoff = Utc::now() - chrono::Duration::hours(24);
+    ledger
+        .samples
+        .iter()
+        .filter(|s| s.ts >= cutoff)
+        .map(|s| s.usd)
+        .sum()
+}
+
+/// Sum advise spend for one vendor over the last 24h.
+pub fn sum_advise_today_by_vendor(ledger: &AdviseBudgetLedger, vendor: Vendor) -> f64 {
+    let cutoff = Utc::now() - chrono::Duration::hours(24);
+    ledger
+        .samples
+        .iter()
+        .filter(|s| s.ts >= cutoff && s.vendor == vendor)
+        .map(|s| s.usd)
+        .sum()
+}
+
+mod vendor_wire {
+    use serde::{de::Error as _, Deserialize, Deserializer, Serializer};
+
+    use crate::pricing::Vendor;
+
+    pub fn serialize<S>(vendor: &Vendor, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(match vendor {
+            Vendor::Claude => "claude",
+            Vendor::Codex => "codex",
+        })
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vendor, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        match raw.to_ascii_lowercase().as_str() {
+            "claude" => Ok(Vendor::Claude),
+            "codex" => Ok(Vendor::Codex),
+            other => Err(D::Error::custom(format!("unknown vendor {other:?}"))),
         }
     }
 }
@@ -136,5 +293,54 @@ mod tests {
             ..Default::default()
         }
         .is_empty());
+    }
+
+    #[test]
+    fn advise_budget_ledger_roundtrips_lowercase_vendor_wire() {
+        let ledger = AdviseBudgetLedger {
+            samples: vec![BudgetSample {
+                vendor: Vendor::Codex,
+                usd: 0.005,
+                ts: Utc::now(),
+            }],
+        };
+        let body = serde_json::to_string(&ledger).unwrap();
+        assert!(body.contains("\"vendor\":\"codex\""));
+        let back: AdviseBudgetLedger = serde_json::from_str(&body).unwrap();
+        assert_eq!(back.samples[0].vendor, Vendor::Codex);
+    }
+
+    #[test]
+    fn advise_budget_ledger_reads_legacy_pascal_vendor_wire() {
+        let body = r#"{"samples":[{"vendor":"Claude","usd":0.01,"ts":"2026-05-31T00:00:00Z"}]}"#;
+        let ledger: AdviseBudgetLedger = serde_json::from_str(body).unwrap();
+        assert_eq!(ledger.samples[0].vendor, Vendor::Claude);
+    }
+
+    #[test]
+    fn advise_budget_ledger_gc_drops_stale_samples_on_next_write() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let stale_ts = Utc::now() - chrono::Duration::hours(49);
+        let ledger = AdviseBudgetLedger {
+            samples: vec![BudgetSample {
+                vendor: Vendor::Claude,
+                usd: 99.0,
+                ts: stale_ts,
+            }],
+        };
+        std::fs::write(
+            budget_ledger_path(root),
+            serde_json::to_string_pretty(&ledger).unwrap(),
+        )
+        .unwrap();
+
+        append_budget_sample(root, Vendor::Claude, 0.005).unwrap();
+        let ledger = load_budget_ledger(root).unwrap();
+        assert_eq!(ledger.samples.len(), 1, "stale sample must be GC'd");
+        assert!(
+            (sum_advise_today(&ledger) - 0.005).abs() < 1e-9,
+            "24h sum reflects only the fresh sample"
+        );
     }
 }

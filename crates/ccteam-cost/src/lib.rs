@@ -25,7 +25,11 @@ pub mod budget;
 pub mod level;
 pub mod pricing;
 
-pub use budget::{BudgetCap, Budgets};
+pub use budget::{
+    append_budget_ledger_row, append_budget_sample, budget_ledger_path, load_budget_ledger,
+    sum_advise_today, sum_advise_today_by_vendor, AdviseBudgetLedger, BudgetCap, BudgetLedgerError,
+    BudgetSample, Budgets, APPROX_COST_PER_CALL_USD, DEFAULT_ADVISE_BUDGET_USD_24H,
+};
 pub use level::{classify, CostLevel, COST_MID_WARN_USD};
 pub use pricing::{
     estimate_cost, pricing_schema_version, pricing_schema_version_for, ModelPrices,

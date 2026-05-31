@@ -41,11 +41,11 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, Mutex};
 
-use crate::advise::{
-    append_budget_ledger_row, load_budget_ledger, sum_advise_today, APPROX_COST_PER_CALL_USD,
-    DEFAULT_ADVISE_BUDGET_USD_24H,
-};
 use crate::paths::CcteamPaths;
+use ccteam_cost::{
+    append_budget_ledger_row, load_budget_ledger, sum_advise_today, Vendor as CostVendor,
+    APPROX_COST_PER_CALL_USD, DEFAULT_ADVISE_BUDGET_USD_24H,
+};
 use ccteam_harness::{
     pluck_f64, pluck_pct, pluck_str, AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter,
     HarnessError, HarnessSnapshot, SpawnCtx, ThreadErrorEvent, ThreadEvent, ThreadHandle,
@@ -435,7 +435,7 @@ impl HarnessAdapter for CodexExecAdapter {
             if completion_ok {
                 if let Some(root) = &ccteam_root_for_task {
                     if let Err(err) =
-                        append_budget_ledger_row(root, AgentVendor::Codex, APPROX_COST_PER_CALL_USD)
+                        append_budget_ledger_row(root, CostVendor::Codex, APPROX_COST_PER_CALL_USD)
                     {
                         tracing::warn!(
                             error = %err,

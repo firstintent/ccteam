@@ -17,6 +17,7 @@ use ccteam_core::advise::{
     BudgetSample, APPROX_COST_PER_CALL_USD, DEFAULT_ADVISE_BUDGET_USD_24H,
 };
 use ccteam_core::execution::CodexExecAdapter;
+use ccteam_core::Vendor;
 use ccteam_harness::{
     AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, ThreadEvent, ThreadHandle, TurnInput,
     CODEX_BIN_ENV,
@@ -109,7 +110,7 @@ async fn successful_turn_appends_one_codex_ledger_row() {
     let codex_rows: Vec<_> = ledger
         .samples
         .iter()
-        .filter(|s| matches!(s.vendor, AgentVendor::Codex))
+        .filter(|s| matches!(s.vendor, Vendor::Codex))
         .collect();
     assert_eq!(
         codex_rows.len(),
@@ -172,7 +173,7 @@ async fn failed_turn_does_not_append_ledger_row() {
     let codex_rows: Vec<_> = ledger
         .samples
         .iter()
-        .filter(|s| matches!(s.vendor, AgentVendor::Codex))
+        .filter(|s| matches!(s.vendor, Vendor::Codex))
         .collect();
     assert!(
         codex_rows.is_empty(),
@@ -197,7 +198,7 @@ async fn submit_turn_rejects_when_budget_already_exceeded() {
     // covered separately by advise.rs unit tests).
     let ledger = AdviseBudgetLedger {
         samples: vec![BudgetSample {
-            vendor: AgentVendor::Codex,
+            vendor: Vendor::Codex,
             // 1.0 USD ≫ DEFAULT_ADVISE_BUDGET_USD_24H (0.50)
             usd: 1.0,
             ts: chrono::Utc::now(),
@@ -252,7 +253,7 @@ fn append_budget_ledger_row_round_trips_through_disk() {
     let codex_rows: Vec<_> = ledger
         .samples
         .iter()
-        .filter(|s| matches!(s.vendor, AgentVendor::Codex))
+        .filter(|s| matches!(s.vendor, Vendor::Codex))
         .collect();
     assert_eq!(codex_rows.len(), 2);
     let total = sum_advise_today(&ledger);

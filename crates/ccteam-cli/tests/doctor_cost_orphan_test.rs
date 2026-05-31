@@ -16,6 +16,7 @@ use ccteam_core::advise::{
     append_budget_ledger_row, budget_ledger_path, AdviseBudgetLedger, BudgetSample,
 };
 use ccteam_core::state::ProjectState;
+use ccteam_core::Vendor;
 use ccteam_harness::AgentVendor;
 use chrono::Utc;
 use serde_json::json;
@@ -240,12 +241,12 @@ fn fully_seeded_ledger_via_hand_write_round_trips() {
     let ledger = AdviseBudgetLedger {
         samples: vec![
             BudgetSample {
-                vendor: AgentVendor::Codex,
+                vendor: Vendor::Codex,
                 usd: 0.005,
                 ts: Utc::now(),
             },
             BudgetSample {
-                vendor: AgentVendor::Claude,
+                vendor: Vendor::Claude,
                 usd: 0.005,
                 ts: Utc::now(),
             },
