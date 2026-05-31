@@ -378,6 +378,14 @@ async fn daemon_routes_gateway_inbound_to_submit_turn_and_outbound() {
             "gateway echo: hello gateway".to_string()
         ]
     );
+
+    let rows = read_durable_outbound_rows();
+    assert_eq!(rows.len(), 4, "queued+sent rows per outbound message");
+    assert_eq!(rows[0]["state"], "queued");
+    assert_eq!(rows[1]["state"], "sent");
+    assert_eq!(rows[2]["state"], "queued");
+    assert_eq!(rows[3]["state"], "sent");
+    assert_eq!(rows[3]["message"]["content"], "gateway echo: hello gateway");
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -517,6 +525,21 @@ async fn daemon_restart_preserves_ws_gateway_session() {
         adapter.submitted_payloads.lock().await.as_slice(),
         &["before restart".to_string(), "after restart".to_string()]
     );
+
+    let rows = read_durable_outbound_rows();
+    let sent_contents: Vec<String> = rows
+        .iter()
+        .filter(|row| row["state"] == "sent")
+        .filter_map(|row| row["message"]["content"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(
+        sent_contents,
+        vec![
+            "created session s1".to_string(),
+            "gateway echo: before restart".to_string(),
+            "gateway echo: after restart".to_string()
+        ]
+    );
 }
 
 fn spawn_ws_gateway_daemon(
@@ -603,4 +626,16 @@ where
     })
     .await
     .expect("timed out waiting for websocket SendMessage")
+}
+
+fn read_durable_outbound_rows() -> Vec<serde_json::Value> {
+    let path = dirs::home_dir()
+        .unwrap()
+        .join(".ccteam")
+        .join("imd")
+        .join("outbound.jsonl");
+    let raw = std::fs::read_to_string(path).unwrap();
+    raw.lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
 }

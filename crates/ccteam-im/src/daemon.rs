@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -17,6 +18,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::Result;
 use ccteam_harness::execution::{ClaudeTuiAdapter, CodexAppServerAdapter};
 use ccteam_harness::{AgentVendor, HarnessAdapter};
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::acl::AclPolicy;
@@ -484,17 +486,10 @@ fn spawn_inbound_consumer(
                 .await;
             match replies {
                 Ok(replies) => {
-                    for reply in replies {
+                    for (seq, reply) in replies.into_iter().enumerate() {
                         let out = SendMessage::new(reply, msg.reply_target.clone())
                             .in_thread(msg.thread_ts.clone());
-                        if let Err(err) = channel.send(&out).await {
-                            tracing::warn!(
-                                cid = %cid,
-                                channel = %msg.channel,
-                                error = %err,
-                                "ccteam-im: gateway outbound send failed"
-                            );
-                        }
+                        send_gateway_outbound(&cid, seq, &msg.channel, channel.as_ref(), out).await;
                     }
                     tracing::info!(
                         event = "latency",
@@ -508,7 +503,7 @@ fn spawn_inbound_consumer(
                     let out =
                         SendMessage::new(format!("gateway error: {err}"), msg.reply_target.clone())
                             .in_thread(msg.thread_ts.clone());
-                    let _ = channel.send(&out).await;
+                    send_gateway_outbound(&cid, 0, &msg.channel, channel.as_ref(), out).await;
                     tracing::warn!(
                         event = "latency",
                         stage = "imd.gateway.err",
@@ -522,6 +517,113 @@ fn spawn_inbound_consumer(
         }
         tracing::debug!("imd: inbound consumer exited (all senders closed)");
     })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DurableOutboundRow {
+    ts_ms: u64,
+    id: String,
+    inbound_id: String,
+    channel: String,
+    state: DurableOutboundState,
+    message: SendMessage,
+    platform_message_id: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum DurableOutboundState {
+    Queued,
+    Sent,
+    Failed,
+}
+
+fn durable_outbox_path() -> PathBuf {
+    crate::default_ccteam_root_public()
+        .join("imd")
+        .join("outbound.jsonl")
+}
+
+async fn send_gateway_outbound(
+    inbound_id: &str,
+    seq: usize,
+    channel_name: &str,
+    channel: &(dyn Channel + Send + Sync),
+    message: SendMessage,
+) {
+    let id = format!("{inbound_id}-{seq}");
+    append_durable_outbound(DurableOutboundRow {
+        ts_ms: now_unix_ms_u64(),
+        id: id.clone(),
+        inbound_id: inbound_id.to_string(),
+        channel: channel_name.to_string(),
+        state: DurableOutboundState::Queued,
+        message: message.clone(),
+        platform_message_id: None,
+        error: None,
+    });
+    match channel.send(&message).await {
+        Ok(platform_message_id) => {
+            append_durable_outbound(DurableOutboundRow {
+                ts_ms: now_unix_ms_u64(),
+                id,
+                inbound_id: inbound_id.to_string(),
+                channel: channel_name.to_string(),
+                state: DurableOutboundState::Sent,
+                message,
+                platform_message_id,
+                error: None,
+            });
+        }
+        Err(err) => {
+            append_durable_outbound(DurableOutboundRow {
+                ts_ms: now_unix_ms_u64(),
+                id,
+                inbound_id: inbound_id.to_string(),
+                channel: channel_name.to_string(),
+                state: DurableOutboundState::Failed,
+                message,
+                platform_message_id: None,
+                error: Some(err.to_string()),
+            });
+            tracing::warn!(
+                inbound_id,
+                channel = %channel_name,
+                error = %err,
+                "ccteam-im: gateway outbound send failed"
+            );
+        }
+    }
+}
+
+fn append_durable_outbound(row: DurableOutboundRow) {
+    if let Err(err) = append_durable_outbound_inner(&row) {
+        tracing::warn!(
+            id = %row.id,
+            state = ?row.state,
+            error = %err,
+            "ccteam-im: durable outbound append failed"
+        );
+    }
+}
+
+fn append_durable_outbound_inner(row: &DurableOutboundRow) -> Result<()> {
+    let path = durable_outbox_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    serde_json::to_writer(&mut file, row)?;
+    file.write_all(b"\n")?;
+    Ok(())
+}
+
+fn now_unix_ms_u64() -> u64 {
+    now_unix_ms().min(u128::from(u64::MAX)) as u64
 }
 
 /// Pure variant of [`build_handle_map`] — operates on a borrowed bot
