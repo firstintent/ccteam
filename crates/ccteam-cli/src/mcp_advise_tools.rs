@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 
 use ccteam_core::advise;
 use ccteam_core::paths::CcteamPaths;
-use ccteam_harness::AgentVendor;
+use ccteam_core::AgentVendor;
 
 /// Tool definitions for the 2 advise tools. Merged into the top-level
 /// `tool_definitions()` in `mcp_serve.rs`.
@@ -286,12 +286,7 @@ mod tests {
         // BEFORE attempting any vendor spawn (so this test is
         // hermetic — no `claude` binary on PATH needed).
         for _ in 0..30 {
-            ccteam_core::advise::append_budget_sample(
-                &root,
-                ccteam_harness::AgentVendor::Claude,
-                0.10,
-            )
-            .unwrap();
+            ccteam_core::advise::append_budget_sample(&root, AgentVendor::Claude, 0.10).unwrap();
         }
         let body = dispatch_vote(
             &root,
@@ -357,12 +352,7 @@ mod tests {
         let root = tmp.path().join("ccteam-root");
         std::fs::create_dir_all(&root).unwrap();
         for _ in 0..30 {
-            ccteam_core::advise::append_budget_sample(
-                &root,
-                ccteam_harness::AgentVendor::Claude,
-                0.10,
-            )
-            .unwrap();
+            ccteam_core::advise::append_budget_sample(&root, AgentVendor::Claude, 0.10).unwrap();
         }
         let body = dispatch_parallel(
             &root,

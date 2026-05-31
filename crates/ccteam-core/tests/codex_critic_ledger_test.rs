@@ -17,10 +17,11 @@ use ccteam_core::advise::{
     BudgetSample, APPROX_COST_PER_CALL_USD, DEFAULT_ADVISE_BUDGET_USD_24H,
 };
 use ccteam_core::execution::CodexExecAdapter;
+use ccteam_core::AgentVendor;
 use ccteam_core::Vendor;
 use ccteam_harness::{
-    AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, ThreadEvent, ThreadHandle, TurnInput,
-    CODEX_BIN_ENV,
+    AgentVendor as HarnessAgentVendor, ExecutionMode, HarnessAdapter, HarnessError, ThreadEvent,
+    ThreadHandle, TurnInput, CODEX_BIN_ENV,
 };
 use futures::StreamExt;
 use serde_json::json;
@@ -54,7 +55,7 @@ fn fake_codex_emitting(lines: &[&str]) -> (tempfile::TempDir, PathBuf) {
 
 fn handle(identity: &str) -> ThreadHandle {
     ThreadHandle {
-        vendor: AgentVendor::Codex,
+        vendor: HarnessAgentVendor::Codex,
         mode: ExecutionMode::Bg,
         identity: identity.into(),
         started_at: chrono::Utc::now(),

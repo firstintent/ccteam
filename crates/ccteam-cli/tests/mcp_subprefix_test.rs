@@ -202,7 +202,7 @@ fn chat_and_advise_real_tools_dispatch_through_server() {
     // pre-spawn (no real `claude` / `codex` binary needed).
     std::fs::create_dir_all(&home).unwrap();
     for _ in 0..15 {
-        ccteam_core::advise::append_budget_sample(&home, ccteam_harness::AgentVendor::Claude, 0.10)
+        ccteam_core::advise::append_budget_sample(&home, ccteam_core::AgentVendor::Claude, 0.10)
             .unwrap();
     }
     let mut srv = McpServer::spawn(&home, &projects);

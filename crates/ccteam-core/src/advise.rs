@@ -52,9 +52,8 @@ use tokio::process::Command;
 pub use ccteam_cost::{
     AdviseBudgetLedger, BudgetSample, APPROX_COST_PER_CALL_USD, DEFAULT_ADVISE_BUDGET_USD_24H,
 };
-use ccteam_harness::AgentVendor;
 
-use crate::{CLAUDE_BIN_ENV, CODEX_BIN_ENV};
+use crate::{AgentVendor, CLAUDE_BIN_ENV, CODEX_BIN_ENV};
 
 /// V0.6.5 F152 — default per-vendor wall clock for advisor subprocesses.
 /// 60s lines up with the `ccteam-advise` skill's documented Step 1
@@ -162,13 +161,6 @@ impl From<ccteam_cost::BudgetLedgerError> for AdviseError {
                 AdviseError::Io(format!("serialize ledger: {msg}"))
             }
         }
-    }
-}
-
-fn cost_vendor(vendor: AgentVendor) -> ccteam_cost::Vendor {
-    match vendor {
-        AgentVendor::Claude => ccteam_cost::Vendor::Claude,
-        AgentVendor::Codex => ccteam_cost::Vendor::Codex,
     }
 }
 
@@ -769,7 +761,7 @@ pub fn append_budget_sample(
     vendor: AgentVendor,
     usd: f64,
 ) -> Result<(), AdviseError> {
-    ccteam_cost::append_budget_sample(ccteam_root, cost_vendor(vendor), usd)
+    ccteam_cost::append_budget_sample(ccteam_root, vendor.cost_vendor(), usd)
         .map_err(AdviseError::from)
 }
 
@@ -785,7 +777,7 @@ pub fn append_budget_ledger_row(
     vendor: AgentVendor,
     usd: f64,
 ) -> Result<(), AdviseError> {
-    ccteam_cost::append_budget_ledger_row(ccteam_root, cost_vendor(vendor), usd)
+    ccteam_cost::append_budget_ledger_row(ccteam_root, vendor.cost_vendor(), usd)
         .map_err(AdviseError::from)
 }
 
@@ -799,7 +791,7 @@ pub fn sum_advise_today(ledger: &AdviseBudgetLedger) -> f64 {
 /// rather than the V0.6.1 bot-count placeholder. Same rolling window
 /// the bare [`sum_advise_today`] uses, just filtered by vendor.
 pub fn sum_advise_today_by_vendor(ledger: &AdviseBudgetLedger, vendor: AgentVendor) -> f64 {
-    ccteam_cost::sum_advise_today_by_vendor(ledger, cost_vendor(vendor))
+    ccteam_cost::sum_advise_today_by_vendor(ledger, vendor.cost_vendor())
 }
 
 #[cfg(test)]

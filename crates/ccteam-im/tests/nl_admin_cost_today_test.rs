@@ -13,7 +13,7 @@
 //! with the other integration tests in this crate.
 
 use ccteam_core::advise::{append_budget_sample, DEFAULT_ADVISE_BUDGET_USD_24H};
-use ccteam_harness::AgentVendor;
+use ccteam_core::AgentVendor;
 use ccteam_im::nl_admin::{AdminCmd, AdminExecutor, AdminSideEffect};
 use tempfile::TempDir;
 
