@@ -7,9 +7,8 @@
 //! - Cross-vendor types: [`AgentVendor`], [`ExecutionMode`], [`ThreadHandle`],
 //!   [`TurnInput`], [`TurnId`], [`ThreadEvent`], [`ThreadItem`],
 //!   [`ThreadItemDetails`], [`ThreadErrorEvent`], [`SpawnCtx`].
-//! - [`UnifiedTokenUsage`] *stub* (cost-crater will move the canonical
-//!   definition into the `ccteam-cost` crate; until that lands, callers
-//!   inside this crate import this local stub).
+//! - [`UnifiedTokenUsage`] re-exported from `ccteam-cost`, the canonical
+//!   pricing/cost definition.
 //! - Legacy persistence + helper types still consumed by orchestrator /
 //!   web / state.json registry: [`HarnessSnapshot`], [`SubagentState`],
 //!   [`SpawnOpts`], [`SessionHandle`] (now an internal data type — no

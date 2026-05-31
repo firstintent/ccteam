@@ -269,7 +269,7 @@ pub fn build_chat_turn_user_prompt_event(role: &str, turn_id: &str, prompt_excer
 pub fn build_chat_turn_completed_event(
     role: &str,
     turn_id: &str,
-    usage: &ccteam_harness::UnifiedTokenUsage,
+    usage: &ccteam_cost::UnifiedTokenUsage,
 ) -> Value {
     serde_json::json!({
         "event": CHAT_TURN_COMPLETED,
@@ -1302,7 +1302,7 @@ mod tests {
 
     #[test]
     fn build_chat_turn_completed_event_carries_usage() {
-        let usage = ccteam_harness::UnifiedTokenUsage::default();
+        let usage = ccteam_cost::UnifiedTokenUsage::default();
         let ev = build_chat_turn_completed_event("carol", "turn-7", &usage);
         assert_eq!(ev["event"], CHAT_TURN_COMPLETED);
         assert_eq!(ev["turn_id"], "turn-7");
