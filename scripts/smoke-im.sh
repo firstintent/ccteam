@@ -5,6 +5,19 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOG_DIR="${TMPDIR:-/tmp}/ccteam-smoke-im"
 mkdir -p "$LOG_DIR"
 MODE="fake"
+REAL_APP_SERVER_PID=""
+REAL_APP_SERVER_DIR=""
+
+cleanup_real() {
+  if [[ -n "$REAL_APP_SERVER_PID" ]]; then
+    kill "$REAL_APP_SERVER_PID" >/dev/null 2>&1 || true
+    wait "$REAL_APP_SERVER_PID" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$REAL_APP_SERVER_DIR" ]]; then
+    rm -rf "$REAL_APP_SERVER_DIR"
+  fi
+}
+trap cleanup_real EXIT
 
 usage() {
   cat <<'EOF'
@@ -14,6 +27,9 @@ usage: scripts/smoke-im.sh [--real]
           app-server socket are present. This mode is the v8.2 guard
           against accidentally treating fake gateway tests as a real
           IM smoke.
+
+Set CCTEAM_REAL_CODEX_RPC=1 with --real to also probe Codex app-server
+thread/start. The default preflight only proves binaries + UDS availability.
 EOF
 }
 
@@ -49,10 +65,16 @@ run_test() {
   shift 2
   local log="$LOG_DIR/${name}.log"
   echo "==> $name"
+  local code=0
   (
     cd "$ROOT"
     run_cargo test -p "$package" "$@" >"$log" 2>&1
-  )
+  ) || code=$?
+  if [[ "$code" -ne 0 ]]; then
+    grep -E '^(test result|cargo test:)' "$log" | tail -10 || true
+    tail -80 "$log"
+    exit "$code"
+  fi
   grep -E '^(test result|cargo test:)' "$log" | tail -10
 }
 
@@ -84,6 +106,58 @@ run_version_probe() {
   tail -5 "$log"
 }
 
+wait_for_socket() {
+  local socket="$1"
+  local i
+  for i in $(seq 1 80); do
+    if [[ -S "$socket" ]]; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+ensure_codex_app_server_socket() {
+  local codex_bin="$1"
+  local configured="${CCTEAM_CODEX_APP_SERVER_SOCKET:-}"
+  local socket="${configured:-${CODEX_HOME:-$HOME/.codex}/app-server-control/app-server-control.sock}"
+
+  if [[ -S "$socket" ]]; then
+    export CCTEAM_CODEX_APP_SERVER_SOCKET="$socket"
+    return 0
+  fi
+
+  local daemon_log="$LOG_DIR/real-codex-app-server-daemon-start.log"
+  timeout 30 "$codex_bin" app-server daemon start >"$daemon_log" 2>&1 || true
+  if [[ -S "$socket" ]]; then
+    export CCTEAM_CODEX_APP_SERVER_SOCKET="$socket"
+    return 0
+  fi
+
+  if [[ -z "$configured" ]]; then
+    REAL_APP_SERVER_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ccteam-codex-app-server.XXXXXX")"
+    socket="$REAL_APP_SERVER_DIR/app-server.sock"
+  else
+    mkdir -p "$(dirname "$socket")"
+  fi
+
+  local foreground_log="$LOG_DIR/real-codex-app-server-foreground.log"
+  "$codex_bin" app-server --listen "unix://$socket" >"$foreground_log" 2>&1 &
+  REAL_APP_SERVER_PID="$!"
+  if wait_for_socket "$socket"; then
+    export CCTEAM_CODEX_APP_SERVER_SOCKET="$socket"
+    return 0
+  fi
+
+  echo "smoke-im --real: Codex app-server socket not found: $socket" >&2
+  echo "smoke-im --real: daemon start log: $daemon_log" >&2
+  echo "smoke-im --real: foreground start log: $foreground_log" >&2
+  tail -20 "$daemon_log" >&2 || true
+  tail -20 "$foreground_log" >&2 || true
+  return 1
+}
+
 run_real_preflight() {
   local missing=0
   local claude_bin codex_bin codex_socket
@@ -97,10 +171,7 @@ run_real_preflight() {
     echo "smoke-im --real: tmux is required for ClaudeTuiAdapter" >&2
     missing=1
   fi
-  codex_socket="${CCTEAM_CODEX_APP_SERVER_SOCKET:-${CODEX_HOME:-$HOME/.codex}/app-server-control/app-server-control.sock}"
-  if [[ ! -S "$codex_socket" ]]; then
-    echo "smoke-im --real: Codex app-server socket not found: $codex_socket" >&2
-    echo "smoke-im --real: start it with: codex app-server daemon start" >&2
+  if [[ "$missing" -eq 0 ]] && ! ensure_codex_app_server_socket "$codex_bin"; then
     missing=1
   fi
   if [[ "$missing" -ne 0 ]]; then
@@ -109,11 +180,18 @@ run_real_preflight() {
 
   run_version_probe claude "$claude_bin"
   run_version_probe codex "$codex_bin"
+  echo "smoke-im --real: Codex app-server socket $CCTEAM_CODEX_APP_SERVER_SOCKET"
+  export CCTEAM_REAL_CODEX_APP_SERVER=1
   echo "smoke-im --real: real binary preflight PASS"
 }
 
 if [[ "$MODE" == "real" ]]; then
   run_real_preflight
+  if [[ "${CCTEAM_REAL_CODEX_RPC:-0}" == "1" ]]; then
+    run_test real_codex_app_server ccteam-harness real_codex_app_server_start_thread_smoke
+  else
+    echo "smoke-im --real: skipping Codex RPC probe (set CCTEAM_REAL_CODEX_RPC=1)"
+  fi
 fi
 
 run_test init_scaffold ccteam-cli run_init_fresh_install_scaffolds_and_registers

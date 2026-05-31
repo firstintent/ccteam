@@ -17,6 +17,7 @@ use serial_test::serial;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
+use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
@@ -30,6 +31,54 @@ fn unique_socket_path(tag: &str) -> PathBuf {
     ));
     let _ = std::fs::remove_file(&p);
     p
+}
+
+#[tokio::test]
+#[serial]
+async fn real_codex_app_server_start_thread_smoke() {
+    if std::env::var("CCTEAM_REAL_CODEX_APP_SERVER")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        eprintln!("skip: set CCTEAM_REAL_CODEX_APP_SERVER=1 for real app-server smoke");
+        return;
+    }
+    let socket = std::env::var(APP_SERVER_SOCKET_ENV)
+        .expect("CCTEAM_CODEX_APP_SERVER_SOCKET must point to a real app-server UDS");
+    assert!(
+        std::path::Path::new(&socket).exists(),
+        "real app-server socket must exist: {socket}"
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let adapter = CodexAppServerAdapter::new();
+    let handle = tokio::time::timeout(
+        Duration::from_secs(15),
+        adapter.start_thread(
+            &AgentSpecBrief {
+                role: "real-smoke".to_string(),
+            },
+            &SpawnCtx {
+                slug: "real-codex-smoke".to_string(),
+                sid: "s-real".to_string(),
+                cwd: tmp.path().to_path_buf(),
+                project_dir: tmp.path().to_path_buf(),
+                extra_args: vec![],
+                model_id: None,
+            },
+        ),
+    )
+    .await
+    .expect("real codex app-server thread/start timed out")
+    .expect("real codex app-server thread/start should succeed");
+    assert_eq!(handle.vendor, AgentVendor::Codex);
+    assert_eq!(handle.mode, ExecutionMode::Chat);
+    assert!(!handle.identity.trim().is_empty());
+    tokio::time::timeout(Duration::from_secs(10), adapter.close_thread(&handle))
+        .await
+        .expect("real codex app-server thread/archive timed out")
+        .expect("real codex app-server thread/archive should succeed");
 }
 
 /// Spawn a scripted peer that accepts ONE connection and serves the
