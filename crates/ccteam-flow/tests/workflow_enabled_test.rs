@@ -25,10 +25,10 @@ use std::sync::Arc;
 use serde_json::Value;
 use tempfile::TempDir;
 
-use ccteam_core::orchestrator::{CancelReason, Orchestrator, OrchestratorConfig};
-use ccteam_core::workflow::WorkflowSpec;
-use ccteam_core::workflow_watcher::WorkflowFileWatcher;
 use ccteam_core::CcteamPaths;
+use ccteam_flow::orchestrator::{CancelReason, Orchestrator, OrchestratorConfig};
+use ccteam_flow::workflow::WorkflowSpec;
+use ccteam_flow::workflow_watcher::WorkflowFileWatcher;
 
 // =====================================================================
 // Fixture helpers

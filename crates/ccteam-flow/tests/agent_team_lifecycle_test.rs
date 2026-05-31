@@ -21,7 +21,7 @@
 //! via integration tests at the CLI level (see
 //! `crates/ccteam-cli/src/commands.rs::tests::cleanup_on_stop_*`).
 
-use ccteam_core::workflow::{
+use ccteam_flow::workflow::{
     AgentTeamSpec, CleanupOnStop, SuggestedTeammate, SuggestedTeammateKind, WorkflowMode,
     WorkflowSpec,
 };

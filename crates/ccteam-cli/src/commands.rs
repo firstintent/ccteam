@@ -766,24 +766,24 @@ pub fn run_start_agent_team(
             project_dir.display(),
         );
     }
-    let spec = ccteam_core::WorkflowSpec::load_for_project(&project_dir)
+    let spec = ccteam_flow::WorkflowSpec::load_for_project(&project_dir)
         .with_context(|| format!("load workflow.yaml for {slug}"))?;
     let team_spec = match (&spec.mode, &spec.agent_team) {
-        (ccteam_core::WorkflowMode::AgentTeam, Some(t)) => t,
-        (ccteam_core::WorkflowMode::AgentTeam, None) => {
+        (ccteam_flow::WorkflowMode::AgentTeam, Some(t)) => t,
+        (ccteam_flow::WorkflowMode::AgentTeam, None) => {
             bail!("workflow.yaml mode: agent-team but agent_team block missing — schema bug?",)
         }
-        (ccteam_core::WorkflowMode::ArtifactDriven, _) => bail!(
+        (ccteam_flow::WorkflowMode::ArtifactDriven, _) => bail!(
             "project `{slug}` is in artifact-driven mode; `ccteam start <slug>` is only\n  \
              implemented for agent-team mode. For artifact-driven projects run\n  \
              `ccteam start` (no slug) to start the daemon.",
         ),
-        (ccteam_core::WorkflowMode::Chat, _) => bail!(
+        (ccteam_flow::WorkflowMode::Chat, _) => bail!(
             "project `{slug}` is in chat mode (V0.6.0 F108); `ccteam start <slug>` is not\n  \
              the chat-mode entry point. Bots are launched via the IM channel + \n  \
              `ccteam-im` daemon, not the agent-team start flow.",
         ),
-        (ccteam_core::WorkflowMode::HumanApproval, _) => bail!(
+        (ccteam_flow::WorkflowMode::HumanApproval, _) => bail!(
             "project `{slug}` is in human-approval mode (V0.6.1 F124); `ccteam start <slug>`\n  \
              is only implemented for agent-team mode. For human-approval projects run\n  \
              `ccteam start` (no slug) to start the daemon — the HITL gate fires on each\n  \
@@ -855,8 +855,8 @@ pub fn run_start_agent_team(
             .suggested_teammates
             .iter()
             .fold((0u32, 0u32), |(d, a), t| match t.kind {
-                ccteam_core::SuggestedTeammateKind::Definition => (d + 1, a),
-                ccteam_core::SuggestedTeammateKind::AdHoc => (d, a + 1),
+                ccteam_flow::SuggestedTeammateKind::Definition => (d + 1, a),
+                ccteam_flow::SuggestedTeammateKind::AdHoc => (d, a + 1),
             });
     preview.push_str(&format!(
         "  ✓ Suggested teammates: {def_count} definition + {adhoc_count} ad-hoc\n",
@@ -1011,7 +1011,7 @@ fn resolve_start_choice(opts: &StartAgentTeamOptions) -> Result<StartChoice> {
 fn spawn_agent_team_lead(
     paths: &CcteamPaths,
     slug: &str,
-    team_spec: &ccteam_core::AgentTeamSpec,
+    team_spec: &ccteam_flow::AgentTeamSpec,
     teammate_mode: &str,
 ) -> Result<String> {
     let project_dir = paths.project_dir(slug);
@@ -1133,23 +1133,23 @@ pub fn run_stop_slug(paths: &CcteamPaths, slug: &str, opts: StopSlugOptions) -> 
             project_dir.display(),
         );
     }
-    let spec = ccteam_core::WorkflowSpec::load_for_project(&project_dir)
+    let spec = ccteam_flow::WorkflowSpec::load_for_project(&project_dir)
         .with_context(|| format!("load workflow.yaml for {slug}"))?;
     let team_spec = match (&spec.mode, &spec.agent_team) {
-        (ccteam_core::WorkflowMode::AgentTeam, Some(t)) => t,
-        (ccteam_core::WorkflowMode::AgentTeam, None) => {
+        (ccteam_flow::WorkflowMode::AgentTeam, Some(t)) => t,
+        (ccteam_flow::WorkflowMode::AgentTeam, None) => {
             bail!("workflow.yaml mode: agent-team but agent_team block missing — schema bug?",)
         }
-        (ccteam_core::WorkflowMode::ArtifactDriven, _) => bail!(
+        (ccteam_flow::WorkflowMode::ArtifactDriven, _) => bail!(
             "project `{slug}` is in artifact-driven mode; `ccteam stop <slug>` is only\n  \
              implemented for agent-team mode. For daemon shutdown run `ccteam stop` (no slug).",
         ),
-        (ccteam_core::WorkflowMode::Chat, _) => bail!(
+        (ccteam_flow::WorkflowMode::Chat, _) => bail!(
             "project `{slug}` is in chat mode (V0.6.0 F108); `ccteam stop <slug>` is not\n  \
              the chat-mode shutdown path. Use the IM channel `/stop` directive or\n  \
              kill the bot's tmux session directly.",
         ),
-        (ccteam_core::WorkflowMode::HumanApproval, _) => bail!(
+        (ccteam_flow::WorkflowMode::HumanApproval, _) => bail!(
             "project `{slug}` is in human-approval mode (V0.6.1 F124); `ccteam stop <slug>`\n  \
              is only implemented for agent-team mode. For daemon shutdown run\n  \
              `ccteam stop` (no slug).",
@@ -1188,10 +1188,10 @@ pub fn run_stop_slug(paths: &CcteamPaths, slug: &str, opts: StopSlugOptions) -> 
         cleanup.as_str(),
     ));
     match cleanup {
-        ccteam_core::CleanupOnStop::ForceKill => {
+        ccteam_flow::CleanupOnStop::ForceKill => {
             force_kill_lead(paths, slug, &snapshot_path, lead_id.as_deref(), &mut report)?;
         }
-        ccteam_core::CleanupOnStop::AskLead => {
+        ccteam_flow::CleanupOnStop::AskLead => {
             ask_lead_cleanup(
                 paths,
                 slug,
@@ -1202,18 +1202,18 @@ pub fn run_stop_slug(paths: &CcteamPaths, slug: &str, opts: StopSlugOptions) -> 
                 &mut report,
             )?;
         }
-        ccteam_core::CleanupOnStop::LeaveRunning => {
+        ccteam_flow::CleanupOnStop::LeaveRunning => {
             leave_running(paths, slug, &snapshot_path, lead_id.as_deref(), &mut report)?;
         }
     }
     Ok(report)
 }
 
-fn parse_cleanup_str(raw: &str) -> Result<ccteam_core::CleanupOnStop> {
+fn parse_cleanup_str(raw: &str) -> Result<ccteam_flow::CleanupOnStop> {
     match raw {
-        "force-kill" => Ok(ccteam_core::CleanupOnStop::ForceKill),
-        "ask-lead" => Ok(ccteam_core::CleanupOnStop::AskLead),
-        "leave-running" => Ok(ccteam_core::CleanupOnStop::LeaveRunning),
+        "force-kill" => Ok(ccteam_flow::CleanupOnStop::ForceKill),
+        "ask-lead" => Ok(ccteam_flow::CleanupOnStop::AskLead),
+        "leave-running" => Ok(ccteam_flow::CleanupOnStop::LeaveRunning),
         other => bail!("unknown cleanup_on_stop `{other}`"),
     }
 }
@@ -1460,7 +1460,7 @@ fn run_restart_team(
     paths: &CcteamPaths,
     slug: &str,
     project_dir: &std::path::Path,
-    _team_spec: &ccteam_core::AgentTeamSpec,
+    _team_spec: &ccteam_flow::AgentTeamSpec,
 ) -> Result<RestartTeamOutcome> {
     let snapshot_path = project_dir.join(".ccteam").join("team-snapshot.json");
     if !snapshot_path.exists() {
@@ -1698,11 +1698,11 @@ fn read_agent_team_lead_session_id(paths: &CcteamPaths, slug: &str) -> Result<Op
     if !project_dir.exists() {
         return Ok(None);
     }
-    let spec = match ccteam_core::WorkflowSpec::load_for_project(&project_dir) {
+    let spec = match ccteam_flow::WorkflowSpec::load_for_project(&project_dir) {
         Ok(spec) => spec,
         Err(_) => return Ok(None),
     };
-    if !matches!(spec.mode, ccteam_core::WorkflowMode::AgentTeam) {
+    if !matches!(spec.mode, ccteam_flow::WorkflowMode::AgentTeam) {
         return Ok(None);
     }
     let snapshot_path = project_dir.join(".ccteam").join("team-snapshot.json");

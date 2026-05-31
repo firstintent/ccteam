@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-use ccteam_core::workflow::{Executor, Trigger, WorkflowError, WorkflowSpec};
+use ccteam_flow::workflow::{Executor, Trigger, WorkflowError, WorkflowSpec};
 
 fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -450,7 +450,7 @@ agents: {}
 // ---------------------------------------------------------------------
 #[test]
 fn t18_human_approval_mode_round_trip() {
-    use ccteam_core::workflow::WorkflowMode;
+    use ccteam_flow::workflow::WorkflowMode;
     let yaml = r#"
 name: critical-migration
 mode: human-approval

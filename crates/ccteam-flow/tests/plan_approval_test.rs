@@ -28,7 +28,7 @@ use ccteam_core::plan_approval::{
     PlanEngineAction, PlanId, PlanRecordState,
 };
 use ccteam_core::progress;
-use ccteam_core::workflow::{PlanApprovalOnTimeout, WorkflowSpec};
+use ccteam_flow::workflow::{PlanApprovalOnTimeout, WorkflowSpec};
 
 #[derive(Default, Clone)]
 struct MockOutbox {

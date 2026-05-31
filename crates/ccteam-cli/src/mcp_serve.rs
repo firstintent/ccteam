@@ -40,6 +40,7 @@ use ccteam_core::{
     bootstrap_project, check_daemon_health, cost_summary, pick_unused_slug, render_screenshot,
     CcteamPaths, DaemonHealth, SendOptions,
 };
+use ccteam_flow::MAX_CONCURRENT_PROJECTS;
 
 use crate::commands::{collect_projects, collect_recent_events, run_peek, run_show, OutputFormat};
 // V0.4.0 F65 — 7 new workflow tools. Schemas + handlers live in a
@@ -607,7 +608,7 @@ fn tool_ls(paths: &CcteamPaths) -> Result<String> {
         "projects": arr,
         "orchestrator": {
             "active_count": active_count,
-            "max_concurrent": ccteam_core::MAX_CONCURRENT_PROJECTS,
+            "max_concurrent": MAX_CONCURRENT_PROJECTS,
             "daemon_health": daemon_health_json(&health),
         },
     });

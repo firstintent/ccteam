@@ -66,8 +66,8 @@ use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde_json::json;
 use tokio::sync::mpsc;
 
-use crate::progress;
 use crate::workflow::{Trigger, WorkflowSpec, SQUAD_ROUTE_SENTINEL};
+use ccteam_core::progress;
 
 /// Debounce window per `(watch_root, role)`. Two rapid filesystem
 /// events on the same watch root inside this window collapse to one
@@ -415,14 +415,14 @@ struct TeamState {
     /// Latest parsed `config.json`. `None` when the file is missing or
     /// schema-broken — the watcher degrades to mtime-only until parse
     /// recovers (PRD F95 §需求 .4).
-    config: Option<crate::teams_config_parser::TeamConfigSnapshot>,
+    config: Option<ccteam_core::teams_config_parser::TeamConfigSnapshot>,
     /// Inbox snapshots keyed by teammate name. Cold-discovery seeds
     /// these with the current file contents so historical messages
     /// don't flood `progress.jsonl` on daemon restart.
-    inboxes: BTreeMap<String, crate::teams_inbox_parser::InboxSnapshot>,
+    inboxes: BTreeMap<String, ccteam_core::teams_inbox_parser::InboxSnapshot>,
     /// Per-task file snapshots keyed by task id (the file stem). Used
     /// by `teams_task_parser::diff_task` to compute status transitions.
-    tasks: BTreeMap<String, crate::teams_task_parser::TaskFile>,
+    tasks: BTreeMap<String, ccteam_core::teams_task_parser::TaskFile>,
     /// Has `WARN`-once already fired for `config.json` schema breakage?
     /// Reset on successful re-parse.
     config_warned: bool,
@@ -456,9 +456,9 @@ impl AgentTeamsWatcherConfig {
     /// `CCTEAM_AGENT_TASKS_ROOT` / `CCTEAM_HOME` for test isolation.
     pub fn from_env() -> Result<Self> {
         Ok(Self {
-            teams_root: crate::paths::agent_teams_root()?,
-            tasks_root: crate::paths::agent_tasks_root()?,
-            progress_path: crate::paths::teams_progress_path()?,
+            teams_root: ccteam_core::paths::agent_teams_root()?,
+            tasks_root: ccteam_core::paths::agent_tasks_root()?,
+            progress_path: ccteam_core::paths::teams_progress_path()?,
             discovery_interval: TEAMS_DISCOVERY_INTERVAL,
         })
     }
@@ -716,7 +716,7 @@ fn run_discovery(config: &AgentTeamsWatcherConfig, teams: &SharedTeams) -> Resul
                     let Some(fname) = p.file_name().and_then(|s| s.to_str()) else {
                         continue;
                     };
-                    if crate::teams_task_parser::is_sibling_file(fname) {
+                    if ccteam_core::teams_task_parser::is_sibling_file(fname) {
                         continue;
                     }
                     if p.extension().and_then(|s| s.to_str()) == Some("json") {
@@ -753,7 +753,7 @@ fn run_discovery(config: &AgentTeamsWatcherConfig, teams: &SharedTeams) -> Resul
                 "team_name": name,
                 "teammate_name": m.name,
             });
-            let _ = crate::progress::append_event(&config.progress_path, &event);
+            let _ = ccteam_core::progress::append_event(&config.progress_path, &event);
         }
     }
 
@@ -788,7 +788,7 @@ fn sync_team_config(
             return Ok(());
         }
     };
-    let snap = match crate::teams_config_parser::parse_config(&bytes) {
+    let snap = match ccteam_core::teams_config_parser::parse_config(&bytes) {
         Ok(s) => s,
         Err(err) => {
             let mut guard = teams.lock().expect("teams mutex poisoned");
@@ -810,12 +810,12 @@ fn sync_team_config(
         let st = guard.entry(name.to_string()).or_default();
         st.config_warned = false;
         let prev = st.config.clone().unwrap_or_default();
-        let events = crate::teams_config_parser::diff_snapshots(&prev, &snap);
+        let events = ccteam_core::teams_config_parser::diff_snapshots(&prev, &snap);
         st.config = Some(snap);
         events
     };
     for event in events {
-        crate::progress::append_event(&config.progress_path, &event)?;
+        ccteam_core::progress::append_event(&config.progress_path, &event)?;
     }
     Ok(())
 }
@@ -836,7 +836,7 @@ fn seed_inbox_snapshot(teams: &SharedTeams, team_name: &str, inbox_path: &Path) 
         Ok(b) => b,
         Err(_) => return Ok(()),
     };
-    let snap = match crate::teams_inbox_parser::parse_inbox(&bytes) {
+    let snap = match ccteam_core::teams_inbox_parser::parse_inbox(&bytes) {
         Ok(s) => s,
         Err(err) => {
             tracing::warn!(
@@ -868,7 +868,7 @@ fn seed_task_snapshot(teams: &SharedTeams, team_name: &str, task_path: &Path) ->
         Ok(b) => b,
         Err(_) => return Ok(()),
     };
-    let task = match crate::teams_task_parser::parse_task(&bytes) {
+    let task = match ccteam_core::teams_task_parser::parse_task(&bytes) {
         Ok(t) => t,
         Err(err) => {
             tracing::warn!(
@@ -895,7 +895,7 @@ fn seed_task_snapshot(teams: &SharedTeams, team_name: &str, task_path: &Path) ->
 fn dispatch_path(config: &AgentTeamsWatcherConfig, teams: &SharedTeams, path: &Path) -> Result<()> {
     // Skip sibling files unconditionally.
     if let Some(fname) = path.file_name().and_then(|s| s.to_str()) {
-        if crate::teams_task_parser::is_sibling_file(fname) {
+        if ccteam_core::teams_task_parser::is_sibling_file(fname) {
             return Ok(());
         }
     }
@@ -936,7 +936,7 @@ fn dispatch_path(config: &AgentTeamsWatcherConfig, teams: &SharedTeams, path: &P
         let rest: Vec<_> = comps.collect();
         if let [std::path::Component::Normal(file)] = rest.as_slice() {
             let fname = file.to_string_lossy().to_string();
-            if crate::teams_task_parser::is_sibling_file(&fname) {
+            if ccteam_core::teams_task_parser::is_sibling_file(&fname) {
                 return Ok(());
             }
             if let Some(task_id) = fname.strip_suffix(".json") {
@@ -958,7 +958,7 @@ fn dispatch_inbox(
         Ok(b) => b,
         Err(_) => return Ok(()), // delete races handled defensively
     };
-    let next = match crate::teams_inbox_parser::parse_inbox(&bytes) {
+    let next = match ccteam_core::teams_inbox_parser::parse_inbox(&bytes) {
         Ok(s) => s,
         Err(err) => {
             tracing::warn!(
@@ -973,12 +973,12 @@ fn dispatch_inbox(
         let mut guard = teams.lock().expect("teams mutex poisoned");
         let st = guard.entry(team_name.to_string()).or_default();
         let prev = st.inboxes.get(teammate).cloned().unwrap_or_default();
-        let events = crate::teams_inbox_parser::diff_inbox(&prev, &next, team_name, teammate);
+        let events = ccteam_core::teams_inbox_parser::diff_inbox(&prev, &next, team_name, teammate);
         st.inboxes.insert(teammate.to_string(), next);
         events
     };
     for event in events {
-        crate::progress::append_event(&config.progress_path, &event)?;
+        ccteam_core::progress::append_event(&config.progress_path, &event)?;
     }
     Ok(())
 }
@@ -1003,7 +1003,7 @@ fn dispatch_task(
             return Ok(());
         }
     };
-    let next = match crate::teams_task_parser::parse_task(&bytes) {
+    let next = match ccteam_core::teams_task_parser::parse_task(&bytes) {
         Ok(t) => t,
         Err(err) => {
             tracing::warn!(
@@ -1018,12 +1018,12 @@ fn dispatch_task(
         let mut guard = teams.lock().expect("teams mutex poisoned");
         let st = guard.entry(team_name.to_string()).or_default();
         let prev = st.tasks.get(task_id).cloned();
-        let events = crate::teams_task_parser::diff_task(prev.as_ref(), &next, team_name);
+        let events = ccteam_core::teams_task_parser::diff_task(prev.as_ref(), &next, team_name);
         st.tasks.insert(task_id.to_string(), next);
         events
     };
     for event in events {
-        crate::progress::append_event(&config.progress_path, &event)?;
+        ccteam_core::progress::append_event(&config.progress_path, &event)?;
     }
     Ok(())
 }

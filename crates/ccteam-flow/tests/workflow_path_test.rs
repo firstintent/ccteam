@@ -16,8 +16,9 @@ use std::path::Path;
 
 use ccteam_core::{
     migrate_workflow_to_ccteam_dir, upsert_project_in_config, CcteamPaths, ProjectEntry,
-    WorkflowMigrationAction, WorkflowSpec,
+    WorkflowMigrationAction,
 };
+use ccteam_flow::WorkflowSpec;
 use chrono::Utc;
 use tempfile::TempDir;
 

@@ -21,7 +21,7 @@
 //! 2. **No persistent watch loops** in this module. `observe_agents`
 //!    is a one-shot read; the meta-agent polls via repeated calls.
 //! 3. `crates/ccteam-core` is not touched by this PR. Schemas reference
-//!    [`ccteam_core::WorkflowSpec`] read-only.
+//!    [`ccteam_flow::WorkflowSpec`] read-only.
 //!
 //! ## F66 integration hooks
 //!
@@ -36,7 +36,8 @@ use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use serde_json::{json, Map, Value};
 
-use ccteam_core::{actions, CcteamPaths, SendOptions, WorkflowSpec};
+use ccteam_core::{actions, CcteamPaths, SendOptions};
+use ccteam_flow::WorkflowSpec;
 
 /// Helper: locate `<project_dir>/.ccteam/` and verify the project
 /// exists. Mirrors `actions::send_to_session_with` shape so error

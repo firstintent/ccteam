@@ -1,12 +1,12 @@
-//! ccteam-core: orchestrator state machine, protocol types, tmux wrapper,
-//! and hook-shared schemas. Consumed by `ccteam-cli` (binary entry) and
-//! `ccteam-hooks` (hook handlers invoked via `ccteam hook ...`).
+//! ccteam-core: shared schemas, state/query helpers, project primitives,
+//! and hook-shared logic. Runtime workflow orchestration lives in
+//! `ccteam-flow`.
 //!
 //! V0.4.0 F60: the phase machinery modules (`phases`, `golden_rules`,
 //! `dag`, `subskill`) and the team-template loaders have been deleted.
-//! The thin `Orchestrator` stub stays so `ccteam start` and tests keep
-//! compiling; F66 rebuilds dispatch against the new `workflow.yaml`
-//! shape (F63) and artifact-trigger watcher (F64).
+//! F66 rebuilt dispatch against the new `workflow.yaml` shape (F63)
+//! and artifact-trigger watcher (F64); those runtime pieces now live in
+//! `ccteam-flow`.
 
 pub mod actions;
 // V0.6.1 F128 — file-mutation helpers for `/ccteam-control
@@ -21,10 +21,6 @@ pub mod advise;
 // V0.6.0 Wave 2 F114 — scientist nickname pool used by ccteam-creator
 // when minting bot handles for new chat workflows.
 pub mod agent_naming;
-// V0.4.0 F64 — artifact-trigger filesystem watcher (inotify / fsevents).
-// Emits ArtifactEvent for every workflow.yaml `Trigger::Watch(<path>)`
-// agent. See module docs + docs/versions/v0-4-0/prd.md §6.2.
-pub mod artifact_watcher;
 pub mod auto_loop;
 // V0.4.5 F80 — Liveness probe for `claude --bg` background jobs.
 // Cross-references the recorded `job_id` against
@@ -55,7 +51,6 @@ pub mod migration;
 // V0.6.0 Wave 2 F114 — rule-based NL intent → ExecutionMode inferrer
 // used by the `ccteam-creator` skill's Phase 2.
 pub mod mode_inferrer;
-pub mod orchestrator;
 pub mod paths;
 pub mod pending_inject;
 // V0.6.1 F98 — plan-approval ↔ outbox engine. Pure state machine over
@@ -97,11 +92,6 @@ pub mod transcript_scanner;
 pub mod vendor;
 pub mod vendor_compat;
 pub mod watchdog;
-// V0.4.0 F63 — workflow.yaml schema + parser. Pure data + validation;
-// no IO side effects beyond reading the YAML file. See module docs.
-pub mod workflow;
-// V0.4.6 F82 — workflow.yaml file watcher (hot-reload trigger).
-pub mod workflow_watcher;
 
 pub use actions::{
     inject_decision, next_inbox_seq, pause, resume, send_to_session, send_to_session_with,
@@ -181,10 +171,6 @@ pub use migration::{
     render_workflow_migration_report, MigrationReport as V042MigrationReport,
     WorkflowMigrationAction, WorkflowMigrationReport,
 };
-pub use orchestrator::MAX_CONCURRENT_PROJECTS;
-pub use orchestrator::{
-    CancelReason, Orchestrator, OrchestratorConfig, TeamEvent, DEFAULT_CLAUDE_MODEL,
-};
 pub use paths::{
     session_context_from_cwd, slug_from_project_dir, CcteamPaths, ProjectSessionContext,
 };
@@ -206,6 +192,8 @@ pub use ccteam_cost::{
     UnifiedTokenUsage as Usage, Vendor,
 };
 pub use mode_inferrer::{infer_mode, CreatorMode, InferenceResult, Intent, Presence, Timeline};
+pub use paths::{agent_tasks_root, agent_teams_root, teams_progress_path};
+pub use plan_approval::{PlanApprovalOnTimeout, PlanApprovalSpec};
 pub use progress::{
     current_agent_sessions, escalation_count, read_all_events, workflow_cost_total,
     AgentSessionStatus, AgentSessionSummary,
@@ -287,23 +275,6 @@ pub use watchdog::{
     AlertKind as WatchdogAlertKind, NotifyMode as WatchdogNotifyMode, WatchdogAlert,
     WatchdogConfig, DEFAULT_NOTIFY_ON_CYCLE_COUNT, WATCHDOG_CONFIG_FILENAME,
 };
-// V0.4.0 F63 — workflow.yaml schema. V0.4.6 F84 adds `BudgetSpec`.
-// V0.5.0 F93b adds `WorkflowMode` / `AgentTeamSpec` / `SuggestedTeammate`.
-// V0.5.0 F97 adds `CleanupOnStop`.
-pub use workflow::{
-    AgentSpec, AgentTeamSpec, BudgetSpec, CleanupOnStop, Executor, OnTimeout, SuggestedTeammate,
-    SuggestedTeammateKind, Trigger, WorkflowError, WorkflowMode, WorkflowSpec,
-};
-// V0.4.6 F82 — workflow.yaml file watcher.
-pub use workflow_watcher::{
-    WorkflowFileEvent, WorkflowFileEventKind, WorkflowFileWatcher,
-    DEBOUNCE_WINDOW as WORKFLOW_WATCHER_DEBOUNCE_WINDOW,
-};
-// V0.4.0 F64 — artifact watcher event types + watcher entry point.
-pub use artifact_watcher::{ArtifactEvent, ArtifactWatcher, WatchKind, DEBOUNCE_WINDOW};
-// V0.5.0 F95 — global Anthropic Agent Teams watcher entry points.
-pub use artifact_watcher::{AgentTeamsWatcher, AgentTeamsWatcherConfig, TEAMS_DISCOVERY_INTERVAL};
-pub use paths::{agent_tasks_root, agent_teams_root, teams_progress_path};
 
 /// Crate version, identical to the workspace package version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

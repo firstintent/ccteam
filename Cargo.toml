@@ -8,6 +8,7 @@ members = [
     # V0.6.0 Wave 2 F109/F116 — IM-bot daemon + supervisor.
     # V0.6.1 F130: library-only (binary folded into `ccteam start`).
     "crates/ccteam-im",
+    "crates/ccteam-flow",
     # V0.8 W0 spike — future home of the `ProcessBackend` trait + `RmuxBackend`
     # impl. Currently a placeholder pinning `rmux-sdk` 0.3 so the
     # workspace catches any rmux semver drift via `rmux_types_compile_link`
@@ -27,6 +28,7 @@ ccteam-core = { path = "crates/ccteam-core" }
 ccteam-cost = { path = "crates/ccteam-cost" }
 ccteam-hooks = { path = "crates/ccteam-hooks" }
 ccteam-im = { path = "crates/ccteam-im" }
+ccteam-flow = { path = "crates/ccteam-flow" }
 ccteam-harness = { path = "crates/ccteam-harness" }
 ccteam-web = { path = "crates/ccteam-web" }
 

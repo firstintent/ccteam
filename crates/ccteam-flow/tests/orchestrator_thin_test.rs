@@ -25,10 +25,10 @@ use serde_json::Value;
 use serial_test::serial;
 use tempfile::TempDir;
 
-use ccteam_core::artifact_watcher::{ArtifactEvent, WatchKind};
-use ccteam_core::orchestrator::{Orchestrator, OrchestratorConfig};
-use ccteam_core::workflow::{AgentSpec, Executor, Trigger, WorkflowSpec};
 use ccteam_core::{cost_summary, CcteamPaths};
+use ccteam_flow::artifact_watcher::{ArtifactEvent, WatchKind};
+use ccteam_flow::orchestrator::{Orchestrator, OrchestratorConfig};
+use ccteam_flow::workflow::{AgentSpec, Executor, Trigger, WorkflowSpec};
 use ccteam_harness::{
     AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, SessionHandle,
     SpawnCtx, ThreadEvent, ThreadHandle, TurnId, TurnInput,
@@ -214,7 +214,7 @@ fn watch_spec(role: &str, watch_rel: &str, parallelism: Option<u32>) -> Workflow
     WorkflowSpec {
         name: "test-workflow".into(),
         description: None,
-        mode: ccteam_core::WorkflowMode::default(),
+        mode: ccteam_flow::WorkflowMode::default(),
         enabled: true,
         budget: None,
         budgets_v060: None,
@@ -247,7 +247,7 @@ fn manual_spec(role: &str) -> WorkflowSpec {
     WorkflowSpec {
         name: "test-manual-workflow".into(),
         description: None,
-        mode: ccteam_core::WorkflowMode::default(),
+        mode: ccteam_flow::WorkflowMode::default(),
         enabled: true,
         budget: None,
         budgets_v060: None,
@@ -280,7 +280,7 @@ fn gate_spec(role: &str, input_rel: &str) -> WorkflowSpec {
     WorkflowSpec {
         name: "test-gate-workflow".into(),
         description: None,
-        mode: ccteam_core::WorkflowMode::default(),
+        mode: ccteam_flow::WorkflowMode::default(),
         enabled: true,
         budget: None,
         budgets_v060: None,
@@ -866,7 +866,7 @@ agents:
     let spec = WorkflowSpec {
         name: "multi".into(),
         description: None,
-        mode: ccteam_core::WorkflowMode::default(),
+        mode: ccteam_flow::WorkflowMode::default(),
         enabled: true,
         budget: None,
         budgets_v060: None,
@@ -1434,7 +1434,7 @@ async fn t31_inbox_target_role_routes_explicitly() {
     let spec = WorkflowSpec {
         name: "dual".into(),
         description: None,
-        mode: ccteam_core::WorkflowMode::default(),
+        mode: ccteam_flow::WorkflowMode::default(),
         enabled: true,
         budget: None,
         budgets_v060: None,
@@ -1796,7 +1796,7 @@ fn human_approval_watch_spec(
     parallelism: Option<u32>,
 ) -> WorkflowSpec {
     let mut spec = watch_spec(role, watch_rel, parallelism);
-    spec.mode = ccteam_core::WorkflowMode::HumanApproval;
+    spec.mode = ccteam_flow::WorkflowMode::HumanApproval;
     spec
 }
 
@@ -1807,7 +1807,7 @@ fn human_approval_watch_spec(
 /// adapter whose `submit_turn` appends a `cost-budget.json` row.
 #[tokio::test]
 async fn t30b_f173_pick_adapter_codex_chat_returns_codex_vendor() {
-    use ccteam_core::workflow::WorkflowMode;
+    use ccteam_flow::workflow::WorkflowMode;
     use ccteam_harness::AgentVendor;
     let (_pr, _cr, _pdir, paths, _progress, _slug) = make_project(YAML_WATCH_FIXER);
     let (orch, _claude_mock, _codex_mock) = build_orchestrator(paths);
@@ -1826,7 +1826,7 @@ async fn t30b_f173_pick_adapter_codex_chat_returns_codex_vendor() {
 /// orchestrator-side, not adapter-side).
 #[tokio::test]
 async fn t30_f124_pick_adapter_human_approval_falls_back_to_bg() {
-    use ccteam_core::workflow::WorkflowMode;
+    use ccteam_flow::workflow::WorkflowMode;
     let (_pr, _cr, _pdir, paths, _progress, _slug) = make_project(YAML_WATCH_FIXER);
     let (orch, claude_mock, codex_mock) = build_orchestrator(paths);
     // Claude path → claude-mock (== the registered bg adapter).
@@ -1890,7 +1890,7 @@ async fn t31_f124_artifact_event_parks_under_human_approval() {
 #[tokio::test]
 #[serial]
 async fn t32_f124_poll_completions_skips_drain_under_human_approval() {
-    use ccteam_core::artifact_watcher::WatchKind;
+    use ccteam_flow::artifact_watcher::WatchKind;
 
     let (_pr, _cr, pdir, paths, _progress, slug) = make_project(YAML_WATCH_FIXER);
     std::fs::create_dir_all(pdir.join("issues")).unwrap();
@@ -1961,7 +1961,7 @@ fn schedule_spec(role: &str, cron: &str) -> WorkflowSpec {
     WorkflowSpec {
         name: "test-schedule-workflow".into(),
         description: None,
-        mode: ccteam_core::WorkflowMode::default(),
+        mode: ccteam_flow::WorkflowMode::default(),
         enabled: true,
         budget: None,
         budgets_v060: None,

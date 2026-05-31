@@ -29,9 +29,9 @@ use serde_json::Value;
 use tempfile::TempDir;
 use tokio::sync::oneshot;
 
-use ccteam_core::orchestrator::{CancelReason, Orchestrator, OrchestratorConfig};
-use ccteam_core::workflow::{AgentSpec, Executor, Trigger, WorkflowSpec};
 use ccteam_core::CcteamPaths;
+use ccteam_flow::orchestrator::{CancelReason, Orchestrator, OrchestratorConfig};
+use ccteam_flow::workflow::{AgentSpec, Executor, Trigger, WorkflowSpec};
 
 fn make_paths() -> (TempDir, TempDir, CcteamPaths) {
     let projects_root = tempfile::tempdir().unwrap();
@@ -65,7 +65,7 @@ fn manual_spec(role: &str) -> WorkflowSpec {
     WorkflowSpec {
         name: "shutdown-test".into(),
         description: None,
-        mode: ccteam_core::WorkflowMode::default(),
+        mode: ccteam_flow::WorkflowMode::default(),
         enabled: true,
         budget: None,
         budgets_v060: None,

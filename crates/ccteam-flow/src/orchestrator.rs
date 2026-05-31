@@ -31,21 +31,20 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinSet;
 
 use crate::artifact_watcher::{ArtifactEvent, ArtifactWatcher};
-use crate::daemon;
-use crate::execution::{ClaudeTuiAdapter, CodexExecAdapter};
-use crate::handoff;
-use crate::inbox::{InboxMessage, SessionMailbox};
-use crate::paths::CcteamPaths;
-use crate::preferences;
-use crate::progress;
-use crate::queries;
-use crate::spawn_brief::{render_spawn_brief, SpawnContext as SpawnBriefContext};
-use crate::workflow::{AgentSpec, Executor, Trigger, WorkflowError, WorkflowMode, WorkflowSpec};
 use crate::workflow_watcher::{WorkflowFileEvent, WorkflowFileWatcher};
+use ccteam_core::execution::{ClaudeTuiAdapter, CodexExecAdapter};
+use ccteam_core::inbox::{InboxMessage, SessionMailbox};
+use ccteam_core::paths::CcteamPaths;
+use ccteam_core::spawn_brief::{render_spawn_brief, SpawnContext as SpawnBriefContext};
+use ccteam_core::{daemon, handoff, preferences, progress, queries};
 use ccteam_harness::ClaudeBgAdapter;
 use ccteam_harness::{
     AgentSpecBrief, AgentVendor, HarnessAdapter, SessionHandle, SpawnCtx, ThreadEvent,
     UnifiedTokenUsage,
+};
+
+use crate::workflow::{
+    AgentSpec, AgentTeamSpec, Executor, Trigger, WorkflowError, WorkflowMode, WorkflowSpec,
 };
 
 /// Hard cap on concurrent project sessions (excluding the meta-agent).
@@ -59,7 +58,7 @@ pub const MAX_CONCURRENT_PROJECTS: usize = 3;
 /// V0.6.0 Wave 3 F112 — derive vendor string from a
 /// [`SessionHandle::harness`] tag. Used to annotate `agent_done`
 /// events with the per-vendor key consumed by
-/// [`crate::queries::CostSummary::cost_24h_by_vendor`] + per-vendor
+/// [`ccteam_core::queries::CostSummary::cost_24h_by_vendor`] + per-vendor
 /// budget caps. Anything starting with `"codex"` is classified codex;
 /// everything else is claude.
 pub fn vendor_from_harness(harness: &str) -> &'static str {
@@ -245,11 +244,8 @@ enum AgentTeamReloadOutcome {
 /// `lead_session_id` + `teammate_mode`. We only need enough fields to
 /// drive `AgentTeamSpec::classify_reload`; missing optional fields
 /// default to sensible values.
-fn snapshot_to_team_spec(snapshot: &serde_json::Value) -> Option<crate::AgentTeamSpec> {
-    use crate::{
-        workflow::{CleanupOnStop, SuggestedTeammate, SuggestedTeammateKind},
-        AgentTeamSpec,
-    };
+fn snapshot_to_team_spec(snapshot: &serde_json::Value) -> Option<AgentTeamSpec> {
+    use crate::workflow::{AgentTeamSpec, CleanupOnStop, SuggestedTeammate, SuggestedTeammateKind};
     let team_name = snapshot.get("team_name")?.as_str()?.to_string();
     let teammate_mode = snapshot
         .get("teammate_mode")
@@ -928,7 +924,7 @@ impl Orchestrator {
     /// Daemon entry point: roster every project under
     /// `paths.projects_root` that has a `workflow.yaml`, drive each
     /// through [`run_project`] on its own tokio task, and keep the
-    /// heartbeat file fresh so [`crate::daemon::check_health`] reports
+    /// heartbeat file fresh so [`ccteam_core::daemon::check_health`] reports
     /// healthy. Returns when `shutdown` resolves.
     ///
     /// ### Hot-reload of new projects
@@ -969,21 +965,21 @@ impl Orchestrator {
         // permissions glitch never blocks daemon boot.
         let gc_paths_root = self.paths.root.clone();
         tokio::task::spawn_blocking(move || {
-            let retention = match crate::config::load(&gc_paths_root) {
+            let retention = match ccteam_core::config::load(&gc_paths_root) {
                 Ok(cfg) => cfg.claude_jobs_retention_days,
                 Err(err) => {
                     tracing::warn!(
                         ?err,
                         "claude_jobs gc: failed to load config; using default retention"
                     );
-                    crate::config::default_claude_jobs_retention_days()
+                    ccteam_core::config::default_claude_jobs_retention_days()
                 }
             };
             if retention == 0 {
                 tracing::info!("claude_jobs gc: disabled (retention == 0)");
                 return;
             }
-            match crate::claude_job::gc_user_claude_jobs(retention, false) {
+            match ccteam_core::claude_job::gc_user_claude_jobs(retention, false) {
                 Ok(report) => {
                     tracing::info!(
                         retention_days = retention,
@@ -2360,8 +2356,9 @@ impl Orchestrator {
                     SessionStatus::Done { cost_usd, status } => (status, cost_usd.unwrap_or(0.0)),
                 }
             } else {
-                let verdict = crate::claude_job::probe_job(job_id.as_deref());
-                let crate::claude_job::JobLiveness::Terminal { status, cost_usd } = verdict else {
+                let verdict = ccteam_core::claude_job::probe_job(job_id.as_deref());
+                let ccteam_core::claude_job::JobLiveness::Terminal { status, cost_usd } = verdict
+                else {
                     continue;
                 };
                 (status.to_string(), cost_usd)
@@ -2834,7 +2831,7 @@ impl Orchestrator {
     ///   then computed forward from daemon start, so a cold start
     ///   never fires on boot.
     /// - **subsequent ticks** — fire iff
-    ///   [`crate::cron::Schedule::is_due`] returns `true` (the next
+    ///   [`ccteam_core::cron::Schedule::is_due`] returns `true` (the next
     ///   cron slot after `last_fire` is `<= now`). On fire, advance
     ///   `last_fire` to `now` — NOT to the missed slot — so a daemon
     ///   that was down across many slots fires exactly once on
@@ -2865,8 +2862,8 @@ impl Orchestrator {
             return;
         }
 
-        let state_path = crate::paths::CcteamPaths::project_state_in(project_dir);
-        let mut state = match crate::state::ProjectState::load(&state_path) {
+        let state_path = ccteam_core::paths::CcteamPaths::project_state_in(project_dir);
+        let mut state = match ccteam_core::state::ProjectState::load(&state_path) {
             Ok(s) => s,
             Err(err) => {
                 tracing::warn!(
@@ -2896,7 +2893,7 @@ impl Orchestrator {
             let Some(expr) = agent.schedule.as_deref() else {
                 continue;
             };
-            let sched = match crate::cron::Schedule::parse(expr) {
+            let sched = match ccteam_core::cron::Schedule::parse(expr) {
                 Ok(s) => s,
                 Err(err) => {
                     tracing::warn!(
@@ -3098,7 +3095,7 @@ impl Orchestrator {
         // the F80 stale-spawn fallback (which does honor the env) ever
         // detected completions. F120 host-probe surfaced this split.
         let id = handle.job_id.as_deref().unwrap_or("__no_job_id__");
-        if let Ok(custom) = std::env::var(crate::CLAUDE_JOBS_DIR_ENV) {
+        if let Ok(custom) = std::env::var(ccteam_core::CLAUDE_JOBS_DIR_ENV) {
             return PathBuf::from(custom).join(id).join("state.json");
         }
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));

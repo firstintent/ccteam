@@ -360,6 +360,7 @@ version = "0.6.8"
 dependencies = [
  "anyhow",
  "ccteam-core",
+ "ccteam-flow",
  "ccteam-harness",
  "ccteam-hooks",
  "ccteam-im",
@@ -394,7 +395,6 @@ dependencies = [
  "futures",
  "image",
  "imageproc",
- "indexmap",
  "libc",
  "notify",
  "regex",
@@ -421,6 +421,31 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "toml",
+ "tracing",
+]
+
+[[package]]
+name = "ccteam-flow"
+version = "0.6.8"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "ccteam-core",
+ "ccteam-cost",
+ "ccteam-harness",
+ "chrono",
+ "croner",
+ "dirs",
+ "futures",
+ "indexmap",
+ "notify",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "serial_test",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
  "tracing",
 ]
 

@@ -140,10 +140,9 @@ impl AgentTemplateEntry {
 ///
 /// Empty input is intentionally rendered as the empty string — the
 /// caller is responsible for asserting at least one agent before
-/// hitting `WorkflowSpec::validate`. See
-/// [`crate::workflow::WorkflowSpec::validate`] for the agents-non-empty
-/// rule (artifact-driven / human-approval modes) and the chat-mode
-/// allow-empty rule.
+/// hitting `WorkflowSpec::validate`. The workflow schema enforces the
+/// agents-non-empty rule for artifact-driven / human-approval modes and
+/// the chat-mode allow-empty rule.
 pub fn render_agents_block(agents: &[AgentTemplateEntry]) -> String {
     let mut out = String::with_capacity(agents.len() * 64);
     for entry in agents {

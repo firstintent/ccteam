@@ -28,9 +28,9 @@ use indexmap::IndexMap;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-use ccteam_core::orchestrator::{Orchestrator, OrchestratorConfig};
-use ccteam_core::workflow::{AgentSpec, BudgetSpec, Executor, Trigger, WorkflowSpec};
 use ccteam_core::CcteamPaths;
+use ccteam_flow::orchestrator::{Orchestrator, OrchestratorConfig};
+use ccteam_flow::workflow::{AgentSpec, BudgetSpec, Executor, Trigger, WorkflowSpec};
 
 // =====================================================================
 // Fixture helpers
@@ -81,7 +81,7 @@ fn manual_spec_with_budget(role: &str, budget: Option<BudgetSpec>) -> WorkflowSp
     WorkflowSpec {
         name: "test-budget".into(),
         description: None,
-        mode: ccteam_core::WorkflowMode::default(),
+        mode: ccteam_flow::WorkflowMode::default(),
         enabled: true,
         budget,
         budgets_v060: None,

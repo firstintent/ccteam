@@ -25,7 +25,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use ccteam_core::{CcteamPaths, Orchestrator, OrchestratorConfig};
+use ccteam_core::CcteamPaths;
+use ccteam_flow::{CancelReason, Orchestrator, OrchestratorConfig};
 use commands::{InitMode, InitOptions, OutputFormat};
 
 #[derive(Parser)]
@@ -1843,8 +1844,8 @@ fn run_start(
             // the process for the full discovery interval (host probe
             // observed >60s hang requiring SIGKILL).
             let agent_teams_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> =
-                match ccteam_core::AgentTeamsWatcherConfig::from_env() {
-                    Ok(cfg) => match ccteam_core::AgentTeamsWatcher::new(cfg) {
+                match ccteam_flow::AgentTeamsWatcherConfig::from_env() {
+                    Ok(cfg) => match ccteam_flow::AgentTeamsWatcher::new(cfg) {
                         Ok(watcher) => {
                             let cancel = watcher.cancel_handle();
                             let _join = watcher.start();
@@ -2185,8 +2186,7 @@ async fn poll_unroster_triggers(orch: std::sync::Arc<Orchestrator>) {
                 let slug = slug.to_string();
                 let path = entry.path();
                 tracing::info!(slug, "unroster trigger observed; cancelling project loop");
-                orch.unroster_project(&slug, ccteam_core::CancelReason::Removed)
-                    .await;
+                orch.unroster_project(&slug, CancelReason::Removed).await;
                 let _ = std::fs::remove_file(&path);
             }
         }
@@ -2544,7 +2544,7 @@ fn run_spawn(paths: &CcteamPaths, slug: &str, role: &str, prompt: Option<&str>) 
     // Validate the role exists in workflow.yaml so we fail loud here
     // instead of letting the orchestrator silently delete the marker
     // ("spawn_request for unknown role; deleting").
-    let spec = ccteam_core::workflow::WorkflowSpec::load_for_project(&project_dir)
+    let spec = ccteam_flow::workflow::WorkflowSpec::load_for_project(&project_dir)
         .with_context(|| format!("load workflow.yaml from {}", project_dir.display()))?;
     if !spec.agents.contains_key(role) {
         anyhow::bail!(

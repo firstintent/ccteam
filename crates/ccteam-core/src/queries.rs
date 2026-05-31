@@ -29,12 +29,13 @@
 //! §5.5 progress.jsonl SoT.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Timelike, Utc};
 use serde::Serialize;
 use serde_json::Value;
+use serde_yaml::Value as YamlValue;
 
 use crate::paths::CcteamPaths;
 use crate::progress::{
@@ -43,7 +44,95 @@ use crate::progress::{
 };
 use crate::state::ProjectState;
 use crate::team::TeamKind;
-use crate::workflow::{Trigger, WorkflowError, WorkflowSpec};
+
+#[derive(Debug, Clone)]
+struct WorkflowReadSpec {
+    name: String,
+    agents: Vec<WorkflowReadAgent>,
+}
+
+#[derive(Debug, Clone)]
+struct WorkflowReadAgent {
+    role: String,
+    trigger: WorkflowReadTrigger,
+    input: Option<PathBuf>,
+    output: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+enum WorkflowReadTrigger {
+    Gate,
+    Watch(PathBuf),
+    Other,
+}
+
+#[derive(Debug)]
+enum WorkflowReadError {
+    NotFound,
+    Io(std::io::Error),
+    Yaml(serde_yaml::Error),
+}
+
+impl std::fmt::Display for WorkflowReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => write!(f, "workflow.yaml not found"),
+            Self::Io(err) => write!(f, "{err}"),
+            Self::Yaml(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+fn load_workflow_read_spec(project_dir: &Path) -> Result<WorkflowReadSpec, WorkflowReadError> {
+    let nested = project_dir.join(".ccteam").join("workflow.yaml");
+    let direct = project_dir.join("workflow.yaml");
+    let path = if nested.exists() {
+        nested
+    } else if direct.exists() {
+        direct
+    } else {
+        return Err(WorkflowReadError::NotFound);
+    };
+    let body = std::fs::read_to_string(&path).map_err(WorkflowReadError::Io)?;
+    let yaml: YamlValue = serde_yaml::from_str(&body).map_err(WorkflowReadError::Yaml)?;
+    let name = yaml
+        .get("name")
+        .and_then(YamlValue::as_str)
+        .unwrap_or("")
+        .to_string();
+    let mut agents = Vec::new();
+    if let Some(map) = yaml.get("agents").and_then(YamlValue::as_mapping) {
+        for (role, spec) in map {
+            let Some(role) = role.as_str() else {
+                continue;
+            };
+            let trigger_raw = spec
+                .get("trigger")
+                .and_then(YamlValue::as_str)
+                .unwrap_or("manual");
+            let trigger = match trigger_raw.trim() {
+                "gate" => WorkflowReadTrigger::Gate,
+                raw if raw.starts_with("watch:") => {
+                    WorkflowReadTrigger::Watch(PathBuf::from(raw.trim_start_matches("watch:")))
+                }
+                _ => WorkflowReadTrigger::Other,
+            };
+            agents.push(WorkflowReadAgent {
+                role: role.to_string(),
+                trigger,
+                input: spec
+                    .get("input")
+                    .and_then(YamlValue::as_str)
+                    .map(PathBuf::from),
+                output: spec
+                    .get("output")
+                    .and_then(YamlValue::as_str)
+                    .map(PathBuf::from),
+            });
+        }
+    }
+    Ok(WorkflowReadSpec { name, agents })
+}
 
 /// Project metadata with derived fields used by `ccteam ls`, the MCP
 /// `ls` tool, and the V0.3 web dashboard. Pulled out so each renderer
@@ -504,9 +593,9 @@ pub fn workflow_summary(slug: &str, paths: &CcteamPaths) -> Result<WorkflowSumma
     let project_dir = paths.project_dir(slug);
 
     // Try to load workflow.yaml; absence is non-fatal (legacy project).
-    let spec = match WorkflowSpec::load_for_project(&project_dir) {
+    let spec = match load_workflow_read_spec(&project_dir) {
         Ok(s) => Some(s),
-        Err(WorkflowError::NotFound(_)) => None,
+        Err(WorkflowReadError::NotFound) => None,
         Err(err) => {
             tracing::warn!(
                 slug,
@@ -558,9 +647,9 @@ pub fn workflow_summary(slug: &str, paths: &CcteamPaths) -> Result<WorkflowSumma
     if let Some(spec) = &spec {
         // gate_states default to "waiting" for every Gate role; flip
         // to "fired" when a `gate_triggered` event names the role.
-        for (role, agent) in &spec.agents {
-            if matches!(agent.trigger, Trigger::Gate) {
-                gate_states.insert(role.clone(), "waiting".to_string());
+        for agent in &spec.agents {
+            if matches!(agent.trigger, WorkflowReadTrigger::Gate) {
+                gate_states.insert(agent.role.clone(), "waiting".to_string());
             }
         }
         for event in &events {
@@ -572,7 +661,7 @@ pub fn workflow_summary(slug: &str, paths: &CcteamPaths) -> Result<WorkflowSumma
         }
 
         // Stat each agent's input + output dirs.
-        for agent in spec.agents.values() {
+        for agent in &spec.agents {
             for rel in [agent.input.as_ref(), agent.output.as_ref()]
                 .into_iter()
                 .flatten()
@@ -588,11 +677,11 @@ pub fn workflow_summary(slug: &str, paths: &CcteamPaths) -> Result<WorkflowSumma
     // Aggregate per-role stats from the session list.
     let agents = if let Some(spec) = &spec {
         let mut by_role: HashMap<&str, AgentStatus> = HashMap::new();
-        for role in spec.agents.keys() {
+        for agent in &spec.agents {
             by_role.insert(
-                role.as_str(),
+                agent.role.as_str(),
                 AgentStatus {
-                    role: role.clone(),
+                    role: agent.role.clone(),
                     running_count: 0,
                     queued_count: 0,
                     total_cost_usd: 0.0,
@@ -756,9 +845,9 @@ pub struct ArtifactQueueEntry {
 /// Output ordering: ASCII-sorted by `path`, then `role` as tiebreaker.
 pub fn artifact_queue(slug: &str, paths: &CcteamPaths) -> Result<Vec<ArtifactQueueEntry>> {
     let project_dir = paths.project_dir(slug);
-    let spec = match WorkflowSpec::load_for_project(&project_dir) {
+    let spec = match load_workflow_read_spec(&project_dir) {
         Ok(s) => s,
-        Err(WorkflowError::NotFound(_)) => return Ok(Vec::new()),
+        Err(WorkflowReadError::NotFound) => return Ok(Vec::new()),
         Err(err) => {
             tracing::warn!(
                 slug,
@@ -770,14 +859,14 @@ pub fn artifact_queue(slug: &str, paths: &CcteamPaths) -> Result<Vec<ArtifactQue
     };
 
     let mut entries: Vec<ArtifactQueueEntry> = Vec::new();
-    for (role, agent) in &spec.agents {
-        if let Trigger::Watch(rel) = &agent.trigger {
+    for agent in &spec.agents {
+        if let WorkflowReadTrigger::Watch(rel) = &agent.trigger {
             let path_display = rel.display().to_string();
             let dir = project_dir.join(rel);
             let stat = stat_artifact_queue(&dir);
             entries.push(ArtifactQueueEntry {
                 path: path_display,
-                role: role.clone(),
+                role: agent.role.clone(),
                 file_count: stat.file_count,
                 oldest_age_seconds: stat.oldest_age_seconds,
                 newest_filename: stat.newest_filename,

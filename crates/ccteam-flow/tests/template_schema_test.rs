@@ -15,8 +15,9 @@
 
 use ccteam_core::{
     default_workflow_ctx, render_workflow_agents_block, render_workflow_template,
-    WorkflowAgentEntry, WorkflowPreset, WorkflowSpec,
+    WorkflowAgentEntry, WorkflowPreset,
 };
+use ccteam_flow::WorkflowSpec;
 
 #[test]
 fn every_preset_renders_and_deserializes_into_workflow_spec() {

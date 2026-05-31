@@ -534,13 +534,13 @@ async fn agent_teams_watcher_cancel_handle_stops_blocking_loop_fast() {
     let progress_path = tmp.path().join("progress.jsonl");
     std::fs::create_dir_all(&teams_root).unwrap();
 
-    let cfg = ccteam_core::AgentTeamsWatcherConfig {
+    let cfg = ccteam_flow::AgentTeamsWatcherConfig {
         teams_root,
         tasks_root,
         progress_path,
         discovery_interval: Duration::from_secs(60),
     };
-    let watcher = ccteam_core::AgentTeamsWatcher::new(cfg).expect("new watcher");
+    let watcher = ccteam_flow::AgentTeamsWatcher::new(cfg).expect("new watcher");
     let cancel = watcher.cancel_handle();
     let handle = watcher.start();
 

@@ -25,11 +25,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use ccteam_core::{
-    artifact_watcher::ArtifactWatcher,
-    workflow::{AgentSpec, Executor, Trigger, WorkflowSpec},
-    WatchKind,
-};
+use ccteam_flow::WorkflowSpec;
+use ccteam_flow::{AgentSpec, ArtifactEvent, ArtifactWatcher, Executor, Trigger, WatchKind};
 use indexmap::IndexMap;
 use tempfile::tempdir;
 
@@ -60,7 +57,7 @@ fn build_spec(name: &str, watchers: &[(&str, PathBuf)]) -> WorkflowSpec {
     WorkflowSpec {
         name: name.to_string(),
         description: None,
-        mode: ccteam_core::WorkflowMode::default(),
+        mode: ccteam_flow::WorkflowMode::default(),
         enabled: true,
         budget: None,
         budgets_v060: None,
@@ -78,7 +75,7 @@ fn build_spec(name: &str, watchers: &[(&str, PathBuf)]) -> WorkflowSpec {
 async fn spawn_for(
     spec: &WorkflowSpec,
 ) -> (
-    tokio::sync::mpsc::Receiver<ccteam_core::ArtifactEvent>,
+    tokio::sync::mpsc::Receiver<ArtifactEvent>,
     tokio::task::JoinHandle<()>,
 ) {
     let (watcher, rx) = ArtifactWatcher::new(spec, None, None).expect("build watcher");
@@ -93,16 +90,16 @@ async fn spawn_for(
 /// Poll the receiver until either an event arrives or `total` elapses.
 /// Returns the first event or `None` on timeout.
 async fn next_event(
-    rx: &mut tokio::sync::mpsc::Receiver<ccteam_core::ArtifactEvent>,
+    rx: &mut tokio::sync::mpsc::Receiver<ArtifactEvent>,
     total: Duration,
-) -> Option<ccteam_core::ArtifactEvent> {
+) -> Option<ArtifactEvent> {
     tokio::time::timeout(total, rx.recv()).await.ok().flatten()
 }
 
 /// Drain everything in the receiver until `quiet` ms pass with no new
 /// events. Returns the count drained. Used by debounce tests.
 async fn drain_until_quiet(
-    rx: &mut tokio::sync::mpsc::Receiver<ccteam_core::ArtifactEvent>,
+    rx: &mut tokio::sync::mpsc::Receiver<ArtifactEvent>,
     quiet: Duration,
     cap: Duration,
 ) -> usize {

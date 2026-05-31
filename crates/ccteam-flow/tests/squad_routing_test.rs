@@ -22,12 +22,12 @@ use indexmap::IndexMap;
 use serde_json::Value;
 use tempfile::TempDir;
 
-use ccteam_core::artifact_watcher::{ArtifactEvent, WatchKind};
-use ccteam_core::orchestrator::{Orchestrator, OrchestratorConfig};
-use ccteam_core::workflow::{
+use ccteam_core::CcteamPaths;
+use ccteam_flow::artifact_watcher::{ArtifactEvent, WatchKind};
+use ccteam_flow::orchestrator::{Orchestrator, OrchestratorConfig};
+use ccteam_flow::workflow::{
     AgentSpec, Executor, SquadSpec, Trigger, WorkflowSpec, SQUAD_ROUTE_SENTINEL,
 };
-use ccteam_core::CcteamPaths;
 use ccteam_harness::{
     AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx,
     ThreadEvent, ThreadHandle, TurnId, TurnInput,
@@ -139,7 +139,7 @@ fn squad_spec() -> WorkflowSpec {
     WorkflowSpec {
         name: "squad-routed".into(),
         description: None,
-        mode: ccteam_core::WorkflowMode::default(),
+        mode: ccteam_flow::WorkflowMode::default(),
         enabled: true,
         budget: None,
         budgets_v060: None,

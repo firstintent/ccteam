@@ -7,7 +7,7 @@
 //! integration (各独立进程)") so they don't race against unit-test
 //! readers of the same env var inside the lib binary.
 
-use ccteam_core::OrchestratorConfig;
+use ccteam_flow::OrchestratorConfig;
 
 /// Each test mutates the same env var — serialize them within this
 /// binary using a static mutex so the precedence checks don't race.

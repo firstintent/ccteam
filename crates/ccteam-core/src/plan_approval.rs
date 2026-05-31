@@ -38,14 +38,51 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::progress;
-use crate::workflow::{PlanApprovalOnTimeout, PlanApprovalSpec};
-
 /// Plan markdowns live under `<project>/.ccteam/plans/`.
 pub const PLANS_SUBDIR: &str = ".ccteam/plans";
 
 /// Decision files the engine emits (one per plan; the agent reads on
 /// resume).
 pub const DECISIONS_SUBDIR: &str = ".ccteam/plan-decisions";
+
+/// Workflow-level plan approval configuration consumed by the
+/// plan-approval engine.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PlanApprovalSpec {
+    /// Master toggle. Defaults to `true` when the block is present.
+    #[serde(default = "default_plan_approval_enabled")]
+    pub enabled: bool,
+    /// Outbox channel id (e.g. `telegram`, `slack`).
+    pub outbox: String,
+    /// Approval window in minutes. `0` disables the timeout.
+    #[serde(default = "default_plan_approval_timeout_min")]
+    pub timeout_min: u32,
+    /// What happens when `timeout_min` elapses without a user reply.
+    #[serde(default)]
+    pub on_timeout: PlanApprovalOnTimeout,
+}
+
+/// `on_timeout` policy for plan approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum PlanApprovalOnTimeout {
+    /// Emit `plan_timeout` + push an escalation message. The agent
+    /// stays paused.
+    #[default]
+    Escalate,
+    /// Treat timeout as APPROVE.
+    AutoApprove,
+    /// Treat timeout as REJECT.
+    Reject,
+}
+
+fn default_plan_approval_enabled() -> bool {
+    true
+}
+
+fn default_plan_approval_timeout_min() -> u32 {
+    60
+}
 
 /// One plan-approval gate identifier. Derived from the plan file
 /// basename (without the `.md` extension) so two plans the same agent

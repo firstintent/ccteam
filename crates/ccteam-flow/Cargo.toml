@@ -1,0 +1,35 @@
+[package]
+name = "ccteam-flow"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ccteam workflow orchestration engine and filesystem watchers."
+
+[dependencies]
+ccteam-core.workspace = true
+ccteam-cost.workspace = true
+ccteam-harness.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+chrono.workspace = true
+croner.workspace = true
+dirs.workspace = true
+notify.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+futures.workspace = true
+indexmap = { version = "2", features = ["serde"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+serial_test = "3"
+async-trait.workspace = true
+
+[features]
+default = ["test-util"]
+test-util = []

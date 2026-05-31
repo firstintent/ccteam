@@ -13,7 +13,7 @@
 //! `team_teammate_idle` variant (F94 hook-only — never emitted by the
 //! watcher).
 
-use ccteam_core::TeamEvent;
+use ccteam_flow::TeamEvent;
 use serde_json::json;
 
 #[test]

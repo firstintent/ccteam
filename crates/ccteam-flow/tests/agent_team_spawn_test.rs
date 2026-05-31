@@ -20,7 +20,7 @@
 
 use std::path::Path;
 
-use ccteam_core::workflow::{
+use ccteam_flow::workflow::{
     AgentTeamSpec, CleanupOnStop, SuggestedTeammate, SuggestedTeammateKind, WorkflowMode,
     WorkflowSpec,
 };
@@ -230,8 +230,8 @@ fn agent_team_workflow_yaml_template_parses() {
     // The bundled template (ccteam-core/src/templates/
     // workflow.agent-team.yaml) must round-trip through the schema.
     // This is the file `ccteam init --mode agent-team` writes.
-    let template_path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/templates/workflow.agent-team.yaml");
+    let template_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../ccteam-core/src/templates/workflow.agent-team.yaml");
     let spec =
         WorkflowSpec::load(&template_path).expect("shipped workflow.agent-team.yaml must parse");
     assert_eq!(spec.mode, WorkflowMode::AgentTeam);

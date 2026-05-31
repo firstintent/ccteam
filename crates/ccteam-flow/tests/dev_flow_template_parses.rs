@@ -30,7 +30,7 @@ fn dev_flow_workflow_yaml_parses_and_validates() {
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
 
     // Parse via serde_yaml — same path as orchestrator load_workflow.
-    let spec: ccteam_core::WorkflowSpec =
+    let spec: ccteam_flow::WorkflowSpec =
         serde_yaml::from_str(&body).unwrap_or_else(|e| panic!("serde_yaml parse failed: {e}"));
 
     // Run the full validator.
@@ -39,7 +39,7 @@ fn dev_flow_workflow_yaml_parses_and_validates() {
 
     // Sanity: chat mode + 4 known roles + each role has chat_handle.
     assert!(
-        matches!(spec.mode, ccteam_core::WorkflowMode::Chat),
+        matches!(spec.mode, ccteam_flow::WorkflowMode::Chat),
         "dev-flow must be mode: chat"
     );
 

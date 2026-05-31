@@ -1,5 +1,5 @@
 //! V0.5.0 F95 — integration tests for
-//! [`ccteam_core::AgentTeamsWatcher`].
+//! [`ccteam_flow::AgentTeamsWatcher`].
 //!
 //! Covers PRD F95 §验收 1-6 via fixture-driven scenarios:
 //!
@@ -32,7 +32,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use ccteam_core::{AgentTeamsWatcher, AgentTeamsWatcherConfig};
+use ccteam_flow::{AgentTeamsWatcher, AgentTeamsWatcherConfig};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -76,7 +76,8 @@ impl TestEnv {
         let dir = self.teams_root.join(team);
         fs::create_dir_all(&dir).unwrap();
         let dst = dir.join("config.json");
-        let bytes = include_bytes!("fixtures/agent_teams/config-roblog.json");
+        let bytes =
+            include_bytes!("../../ccteam-core/tests/fixtures/agent_teams/config-roblog.json");
         fs::write(&dst, bytes).unwrap();
         dst
     }
@@ -87,7 +88,8 @@ impl TestEnv {
         let dir = self.teams_root.join(team).join("inboxes");
         fs::create_dir_all(&dir).unwrap();
         let dst = dir.join(format!("{teammate}.json"));
-        let bytes = include_bytes!("fixtures/agent_teams/inbox-team-lead.json");
+        let bytes =
+            include_bytes!("../../ccteam-core/tests/fixtures/agent_teams/inbox-team-lead.json");
         fs::write(&dst, bytes).unwrap();
         dst
     }
@@ -384,7 +386,7 @@ fn typed_team_event_round_trips_watcher_emitted_payloads() {
     // deserialize into the typed TeamEvent. Verify every variant
     // emitted by the cold-discovery + dispatch passes deserializes
     // cleanly with no field drift.
-    use ccteam_core::TeamEvent;
+    use ccteam_flow::TeamEvent;
 
     let env = TestEnv::new();
     env.install_roblog("roblog");
@@ -403,7 +405,7 @@ fn typed_team_event_round_trips_watcher_emitted_payloads() {
     env.write(&cp, &parsed.to_string());
     watcher.test_tick(&[cp.clone()]).unwrap();
     // re-add pm (synthesized) → member_joined
-    let bytes = include_bytes!("fixtures/agent_teams/config-roblog.json");
+    let bytes = include_bytes!("../../ccteam-core/tests/fixtures/agent_teams/config-roblog.json");
     fs::write(&cp, bytes).unwrap();
     watcher.test_tick(&[cp.clone()]).unwrap();
     // message
@@ -500,7 +502,7 @@ fn broken_config_warns_and_keeps_team_in_discovery() {
 
     // The team is still observable: dispatch a fresh tick after we
     // repair the file → joined events flow.
-    let bytes = include_bytes!("fixtures/agent_teams/config-roblog.json");
+    let bytes = include_bytes!("../../ccteam-core/tests/fixtures/agent_teams/config-roblog.json");
     fs::write(&config_path, bytes).unwrap();
     watcher.test_tick(&[config_path.clone()]).unwrap();
     let events = env.events();

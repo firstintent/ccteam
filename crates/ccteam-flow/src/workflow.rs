@@ -35,6 +35,9 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::path::{Path, PathBuf};
 
+pub use ccteam_core::plan_approval::{PlanApprovalOnTimeout, PlanApprovalSpec};
+use ccteam_core::Schedule;
+
 /// Full `workflow.yaml` document.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct WorkflowSpec {
@@ -511,7 +514,7 @@ pub fn default_recover_last_n_turns() -> usize {
     20
 }
 
-pub use crate::defaults::DEFAULT_TURN_TIMEOUT_SECS;
+pub use ccteam_core::DEFAULT_TURN_TIMEOUT_SECS;
 
 /// V0.6.8 F195 — serde-default constructor for [`ChatSpec::turn_timeout_sec`].
 /// Kept as a function (not a `const` directly) because `#[serde(default = "...")]`
@@ -787,71 +790,6 @@ impl AgentSpec {
 
 /// V0.6.1 F98 — per-agent plan-approval policy.
 ///
-/// Mirrors the prd.md §F98 schema:
-///
-/// ```yaml
-/// plan_approval:
-///   enabled: true
-///   outbox: telegram     # registered IM transport
-///   timeout_min: 60      # 0 disables the timeout entirely
-///   on_timeout: escalate # | auto-approve | reject
-/// ```
-///
-/// Red lines (CLAUDE.md §三 + prd.md §F98):
-/// - `progress.jsonl` is the SoT — every state transition emits one of
-///   `plan_pending` / `plan_decision` / `plan_timeout` (see
-///   [`crate::progress::PLAN_PENDING`] etc.).
-/// - No prompt injection — the engine only writes the decision file at
-///   `<project>/.ccteam/plan-decisions/<plan_id>.md`; the agent picks
-///   it up via the standard inbox-style read.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-pub struct PlanApprovalSpec {
-    /// Master toggle. Defaults to `true` when the block is present —
-    /// the only reason to write `plan_approval:` is to opt in. Setting
-    /// it explicitly to `false` lets a workflow temporarily disable
-    /// the gate without removing the rest of the config.
-    #[serde(default = "default_plan_approval_enabled")]
-    pub enabled: bool,
-    /// Outbox channel id (e.g. `telegram`, `slack`). The IM-side
-    /// resolver in `ccteam-im` maps this to a concrete `Channel`
-    /// implementation + recipient. Required.
-    pub outbox: String,
-    /// Approval window in minutes. `0` disables the timeout (the
-    /// engine never emits `plan_timeout`). Defaults to 60 via
-    /// [`default_plan_approval_timeout_min`].
-    #[serde(default = "default_plan_approval_timeout_min")]
-    pub timeout_min: u32,
-    /// What happens when `timeout_min` elapses without a user reply.
-    /// Defaults to [`PlanApprovalOnTimeout::Escalate`].
-    #[serde(default)]
-    pub on_timeout: PlanApprovalOnTimeout,
-}
-
-/// V0.6.1 F98 — `on_timeout` policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum PlanApprovalOnTimeout {
-    /// Emit `plan_timeout` + push an escalation message to the
-    /// meta-agent inbox. The agent stays paused.
-    #[default]
-    Escalate,
-    /// Treat as APPROVE — inject an approve decision and resume.
-    AutoApprove,
-    /// Treat as REJECT — inject a reject decision (reason: timeout).
-    Reject,
-}
-
-/// Default `plan_approval.enabled` (= `true`). Presence of the block
-/// implies opt-in.
-fn default_plan_approval_enabled() -> bool {
-    true
-}
-
-/// Default `plan_approval.timeout_min` (= 60).
-fn default_plan_approval_timeout_min() -> u32 {
-    60
-}
-
 /// Harness binary executor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -1136,7 +1074,7 @@ impl WorkflowSpec {
                     // than silently never firing.
                     match &spec.schedule {
                         Some(expr) => {
-                            crate::cron::Schedule::parse(expr).map_err(|e| {
+                            Schedule::parse(expr).map_err(|e| {
                                 WorkflowError::ValidationFailed(format!(
                                     "agent `{role}`: trigger `schedule` has invalid \
                                      `schedule:` expression: {e}"
