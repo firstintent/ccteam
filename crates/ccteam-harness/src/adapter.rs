@@ -105,6 +105,15 @@ pub enum AgentVendor {
     Codex,
 }
 
+impl AgentVendor {
+    pub fn cost_vendor(self) -> ccteam_cost::Vendor {
+        match self {
+            AgentVendor::Claude => ccteam_cost::Vendor::Claude,
+            AgentVendor::Codex => ccteam_cost::Vendor::Codex,
+        }
+    }
+}
+
 /// Execution mode classifier. Carried on [`ThreadHandle::mode`] so the
 /// orchestrator (and downstream UI) can decide policy without
 /// re-deriving from `vendor + adapter name`:
