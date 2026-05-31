@@ -696,6 +696,11 @@ fn append_durable_outbound(row: DurableOutboundRow) {
 }
 
 fn append_durable_outbound_inner(row: &DurableOutboundRow) -> Result<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    let _guard = LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
     let path = durable_outbox_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;

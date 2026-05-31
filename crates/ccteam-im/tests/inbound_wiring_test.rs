@@ -618,6 +618,67 @@ async fn daemon_surfaces_submit_failure_to_im_and_ledger() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_surfaces_turn_timeout_to_im_and_ledger() {
+    let _g = env_lock();
+    let old_timeout = std::env::var_os("CCTEAM_IM_GATEWAY_TURN_TIMEOUT_MS");
+    std::env::set_var("CCTEAM_IM_GATEWAY_TURN_TIMEOUT_MS", "50");
+    let home = isolate_home();
+    let projects_root = home.path().join("projects");
+    std::fs::create_dir_all(&projects_root).unwrap();
+
+    let mock = Arc::new(MockChannel::new());
+    mock.push(ChannelMessage {
+        id: "turn-timeout-1".into(),
+        sender: "alice".into(),
+        reply_target: "chat-1".into(),
+        content: "/new claude helper".into(),
+        channel: "telegram".into(),
+        timestamp: 0,
+        thread_ts: None,
+    })
+    .await;
+    mock.push(ChannelMessage {
+        id: "turn-timeout-2".into(),
+        sender: "alice".into(),
+        reply_target: "chat-1".into(),
+        content: "hello but never answer".into(),
+        channel: "telegram".into(),
+        timestamp: 1,
+        thread_ts: None,
+    })
+    .await;
+    let adapter = Arc::new(FailingGatewayAdapter::new(false, false));
+    run_mock_gateway_daemon(projects_root, Arc::clone(&mock), Arc::clone(&adapter)).await;
+    restore_env("CCTEAM_IM_GATEWAY_TURN_TIMEOUT_MS", old_timeout);
+
+    let contents: Vec<String> = mock
+        .outbox()
+        .await
+        .into_iter()
+        .map(|message| message.content)
+        .collect();
+    assert_eq!(contents.len(), 3, "created + ack + timeout");
+    assert_eq!(contents[0], "created session s1");
+    assert_eq!(contents[1], "submitted s1 turn failing-stub-turn");
+    assert!(
+        contents[2]
+            .starts_with("gateway error: turn timed out after 50ms for s1 turn failing-stub-turn"),
+        "unexpected timeout content: {:?}",
+        contents[2]
+    );
+    assert_eq!(adapter.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(adapter.submits.load(Ordering::SeqCst), 1);
+    let rows = read_durable_outbound_rows();
+    assert!(rows.iter().any(|row| {
+        row["state"] == "sent"
+            && row["message"]["content"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("gateway error: turn timed out after 50ms"))
+    }));
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_routes_ws_channel_to_gateway_over_real_socket() {
     let _g = env_lock();
     let home = isolate_home();

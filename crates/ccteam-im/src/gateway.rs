@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -46,6 +47,7 @@ struct GatewaySession {
     handle: String,
     thread: ThreadHandle,
     adapter: Arc<dyn HarnessAdapter + Send + Sync>,
+    visible_events: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone)]
@@ -248,6 +250,7 @@ impl Gateway {
                     if let Some(session) = self.sessions.get_mut(&id) {
                         session.thread = thread;
                         session.adapter = adapter;
+                        session.visible_events = Arc::new(AtomicU64::new(0));
                     }
                 }
                 Err(err) => {
@@ -497,6 +500,7 @@ impl Gateway {
                 handle,
                 thread,
                 adapter,
+                visible_events: Arc::new(AtomicU64::new(0)),
             },
         );
         self.current_session.insert(owner, id.clone());
@@ -525,6 +529,7 @@ impl Gateway {
                     continue;
                 };
                 seq = seq.saturating_add(1);
+                session.visible_events.fetch_add(1, Ordering::SeqCst);
                 if tx
                     .send(GatewayEvent {
                         id: format!("gateway-event-{session_id}-{seq}"),
@@ -577,6 +582,7 @@ impl Gateway {
                     handle: saved_session.handle,
                     thread: saved_session.thread,
                     adapter,
+                    visible_events: Arc::new(AtomicU64::new(0)),
                 },
             );
         }
@@ -638,6 +644,7 @@ impl Gateway {
             .sessions
             .get(session_id)
             .ok_or_else(|| anyhow!("current session missing: {session_id}"))?;
+        let start_visible_events = session.visible_events.load(Ordering::SeqCst);
         let submit_wait = gateway_submit_timeout_duration();
         let turn_id = tokio::time::timeout(submit_wait, async {
             session
@@ -651,7 +658,9 @@ impl Gateway {
         .await
         .map_err(|_| anyhow!("submit timed out after {submit_wait:?} for {session_id}"))??;
         let mut replies = Vec::new();
-        if self.event_sink.is_none() {
+        if let Some(tx) = self.event_sink.clone() {
+            spawn_turn_timeout_watchdog(tx, session, start_visible_events, &turn_id.0);
+        } else {
             let mut events = session.adapter.events(&session.thread);
             let wait = gateway_reply_wait_duration();
             while let Ok(Some(evt)) = tokio::time::timeout(wait, events.next()).await {
@@ -723,6 +732,38 @@ impl Drop for Gateway {
     }
 }
 
+fn spawn_turn_timeout_watchdog(
+    tx: tokio::sync::mpsc::UnboundedSender<GatewayEvent>,
+    session: &GatewaySession,
+    start_visible_events: u64,
+    turn_id: &str,
+) {
+    let timeout = gateway_turn_timeout_duration();
+    if timeout.is_zero() {
+        return;
+    }
+    let visible_events = Arc::clone(&session.visible_events);
+    let session_id = session.id.clone();
+    let channel = session.owner.channel.clone();
+    let chat_id = session.owner.chat_id.clone();
+    let turn_id = turn_id.to_string();
+    tokio::spawn(async move {
+        tokio::time::sleep(timeout).await;
+        if visible_events.load(Ordering::SeqCst) != start_visible_events {
+            return;
+        }
+        let _ = tx.send(GatewayEvent {
+            id: format!("gateway-timeout-{session_id}-{turn_id}"),
+            channel,
+            chat_id,
+            thread_ts: None,
+            content: format!(
+                "gateway error: turn timed out after {timeout:?} for {session_id} turn {turn_id}"
+            ),
+        });
+    });
+}
+
 fn async_event_text(evt: &ThreadEvent) -> Option<String> {
     match evt {
         ThreadEvent::ItemCompleted { item } | ThreadEvent::ItemUpdated { item } => {
@@ -751,6 +792,15 @@ fn gateway_reply_wait_duration() -> std::time::Duration {
 fn gateway_submit_timeout_duration() -> std::time::Duration {
     const DEFAULT_MS: u64 = 5_000;
     let ms = std::env::var("CCTEAM_IM_GATEWAY_SUBMIT_TIMEOUT_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MS);
+    std::time::Duration::from_millis(ms)
+}
+
+fn gateway_turn_timeout_duration() -> std::time::Duration {
+    const DEFAULT_MS: u64 = 120_000;
+    let ms = std::env::var("CCTEAM_IM_GATEWAY_TURN_TIMEOUT_MS")
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
         .unwrap_or(DEFAULT_MS);
