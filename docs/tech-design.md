@@ -8,25 +8,12 @@
 
 ## 0. 架构红线
 
-源 `docs/tech-design.md` + CLAUDE.md §三。任何 PR 不得违反。红线按「模式 × vendor」双轴 scope 表述;**当前运行态只有模式 3(chat / gateway)落地**,模式 1(in-proc)/ 模式 2(bg)属于推后的 `ccteam-flow` 编排层(详 §7),红线仍按三模式列出以保证编排层落地时不退基线。
+**权威红线清单 = [CLAUDE.md §三](../CLAUDE.md)**(always-loaded 的开发宪法:红线表 + vendor / HITL / README / skill 红线;任何 PR 不得违反)。本文档**不重复**该清单 —— 只在下面各组件章节就地给红线的**架构论证**(为什么这么定),并用下表的 R-code 简写引用 §三 的条目。
 
-| 红线 | 模式 1 in-proc | 模式 2 bg(Claude / Codex)| 模式 3 chat(Claude / Codex)|
-|---|---|---|---|
-| R1 文件系统是控制平面 | — | 守(artifact 双 vendor) | 守 — Claude: tmux 长 session + transcript jsonl byte-offset 增量读;Codex: app-server UDS;两 vendor 共写 ccteam-owned `<project>/.ccteam/chat/<bot>/turns.jsonl` |
-| R2 `progress.jsonl` 唯一 state SoT | — | 守(双 vendor) | 业务事件 SoT 守(7 类 + `chat_session_reset` / `turn_done`);对话原文走 `turns.jsonl` |
-| R3 No prompt injection | 守 | 守 | 守 — agent 行为住 `.claude/agents/<role>.md`,不向 tmux pane 注入 system prompt;`/compact /new /clear` 完全透传 |
-| R4 每次 spawn = fresh 1M context | — | Claude: `claude --bg`(无 `--resume`);Codex: trait 决定可复用,用户不见 | 不适用 — chat 复用 context 是 feature |
-| R5 永不主动 kill 长 session | 守 | per-vendor `budgets.{claude,codex}.max_cost_usd_per_24h` 触顶 → auto-disable workflow | 守 — `/compact /new` 是合法 turn,非 kill;tmux 长跑 24/7 |
-| R6 不解析 tmux 终端输出 | — | 守 | 守 — 读 transcript jsonl + Claude Code 官方 hooks fast event 通道;不 scrape pane(`tmux capture-pane` 仅 dev-time 调试 + screenshot tool 只读) |
-| R7 fix-loop 撞 3 次必 escalate | 守 | 守(`fix_counts` map) | 守 + AgentPath depth limit(借 Codex `agent_max_depth` 实现 hop_limit 替代平铺 fix_counts)|
-| R8 `ccteam-core` 零 team 名字面量 | 守 | 守 | 守 |
-| R9 跨项目记忆走官方接口 | 守 | Claude: `~/.claude/{CLAUDE.md,rules}`;Codex: `~/.codex/AGENTS.md`(`ccteam init` 落 symlink)| 同 |
-| R10 新建项目走 `<projects_root>/<team>-<slug>/` | — | 守(`pick_unused_slug` 强制 team 前缀)| per-bot tmux session = `<project>/<bot>`;IM bot 落 `.ccteam/chat/<bot>/` |
-| R11 HITL approval state SoT | — | progress.jsonl::plan_decision | 同 |
+**R-code 速查**(简写 ↔ CLAUDE.md §三):
 
-**vendor 红线**:ccteam **不 vendor** Claude / Codex 二进制(`references/{claude-code,codex/codex-rs}/` git-ignore 不入库,仅协议参考;实际 spawn 走 `$PATH` 内 `claude` / `codex` binary + `CCTEAM_{CLAUDE,CODEX}_BIN` env override);`vendor: AgentVendor::{Claude, Codex}` enum 是 trait 一等公民,无 default。
-
-**HITL 红线**:当前 IM 路径里的 agent 走 `--dangerously-skip-permissions`,**无批准门**;`ApprovalIR` 是中立的类型占位,留给未来手机批准能力,当前不产生也不消费 approval。
+- 当前架构红线:`R1` 文件系统是控制/状态面 · `R2` `progress.jsonl` 是 state SoT(+ `turns.jsonl` 对话原文)· `R3` No prompt injection · `R5` 永不主动 kill 长 session · `R6` 不解析终端输出(不 scrape pane)· `R8` `ccteam-core` 零 team 名字面量 · `R9` 跨项目记忆走官方接口 · `R10` 新建项目走 `<team>-<slug>/`
+- 仅 **autonomous bg / 推后的 `ccteam-flow` 层**适用(详 §7):`R4` bg 每次 spawn = fresh 1M context(chat 复用 context 是 feature,不适用)· `R7` fix-loop 撞 3 次 escalate(chat 用 AgentPath depth)· `R11` HITL approval(推后,`ApprovalIR` 仅类型占位;当前 agent 走 `--dangerously-skip-permissions`)
 
 ---
 
@@ -404,7 +391,7 @@ mode-3 = tmux 长 session + claude TUI 长跑(per bot)+ dual-track 观测 + ccte
 
 **Authentication**:loopback 免 token;非 loopback 自动生成 `~/.ccteam/web-token`(mode 0600)+ LAN-RCE 倒计时;URL shim `?token=ccteam:<hex>` → HttpOnly cookie + 303 干净 URL。
 
-**架构红线**:progress.jsonl 仍是 SoT;web 不解析 tmux 终端(SSE watcher 仅读 progress.jsonl);web 不 kill 长 session;web 不写跨项目记忆;web 写控制走跟 IM channel 完全相同的 gateway dispatch 路径;`cargo tree -p ccteam-web | grep ccteam-cli` 必须 0 命中(独立 dep graph 红线由 `tests/dep_graph_test.rs` 锁)。
+**架构红线**:web 守 R2(SSE watcher 仅读 progress.jsonl)/ R5(不 kill 长 session)/ R6(不解析 tmux 终端)/ R9(不写跨项目记忆)。web-specific:写控制走跟 IM channel 完全相同的 gateway dispatch 路径(**web ⊥ im**,桥只在 cli 层);`cargo tree -p ccteam-web | grep ccteam-cli` 必须 0 命中(独立 dep graph 红线由 `tests/dep_graph_test.rs` 锁)。
 
 #### 前端层 invariant(红线)
 

@@ -63,7 +63,7 @@
 
 ## 三、不可触碰的架构红线
 
-源 `docs/tech-design.md`。两条用户进入层(IM + web)+ autonomous bg 都守;orchestrator tick 已退役,旧的「模式 1/2/3」分栏作废,统一如下。任何 PR 不得违反:
+**本节是架构红线的唯一权威清单**(`docs/tech-design.md` §0 只放 R-code 速查 + 就地论证,引用本节)。两条用户进入层(IM + web)+ autonomous bg 都守;orchestrator tick 已退役,旧的「模式 1/2/3」分栏作废,统一如下。任何 PR 不得违反:
 
 | 红线 | 怎么守 |
 |---|---|
