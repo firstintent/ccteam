@@ -1666,6 +1666,190 @@ fn rmux_interactive_attach(session_name: &str) -> Result<()> {
     )
 }
 
+/// Run a future to completion on a throwaway current-thread runtime. The
+/// session-listing / chat-attach handlers are synchronous CLI entry points but
+/// need the async `ProcessBackend` enumeration; this keeps that bridge in one
+/// place.
+fn block_on_async<F: std::future::Future>(fut: F) -> Result<F::Output> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime")?;
+    Ok(rt.block_on(fut))
+}
+
+/// Interactively hand the controlling tty over to an existing mux session by
+/// its exact name, honoring `CCTEAM_MUX_BACKEND`. Read-only handover — it never
+/// captures pane text (R6); it only checks existence and execs the attach.
+fn attach_interactive_by_name(session_name: &str) -> Result<()> {
+    if ccteam_harness::backend_kind_from_env() == ccteam_harness::BackendKind::Rmux {
+        return rmux_interactive_attach(session_name);
+    }
+    let tmux_session = TmuxSession::from_name(session_name.to_string());
+    if !tmux_session.exists() {
+        bail!("mux session not running: {}", tmux_session.name());
+    }
+    eprintln!("→ tmux attach -t {}", tmux_session.name());
+    let argv = ccteam_harness::interactive_attach_argv(
+        ccteam_harness::BackendKind::Tmux,
+        tmux_session.name(),
+    );
+    let (bin, args) = argv
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("interactive_attach_argv returned empty argv"))?;
+    let status = Command::new(bin)
+        .args(args)
+        .status()
+        .context("spawn tmux attach")?;
+    if !status.success() {
+        bail!("tmux attach exited with {status}");
+    }
+    Ok(())
+}
+
+/// Resolve a gateway chat-mode bot session (`ccteam-chat-<slug>-<role>`) for
+/// `slug_or_name` (+ optional `role`) and interactively attach to it. These
+/// sessions are invisible to [`run_attach`], which only resolves the
+/// project-level `ccteam-<slug>` session.
+///
+/// Returns `Ok(true)` when a chat session was matched and the attach was
+/// dispatched; `Ok(false)` *only* when `role` is omitted AND no live chat
+/// session matches `slug_or_name`, so the caller may fall back to the
+/// project-oriented attach. Read-only enumeration (R6) — never captures panes.
+pub fn try_attach_chat_session(slug_or_name: &str, role: Option<&str>) -> Result<bool> {
+    // A full canonical name passed through verbatim.
+    if slug_or_name.starts_with(ccteam_harness::CHAT_SESSION_PREFIX) {
+        attach_interactive_by_name(slug_or_name)?;
+        return Ok(true);
+    }
+    // Explicit role → deterministic name. The user clearly wants the chat
+    // session, so a miss is a hard error (no project fallback).
+    if let Some(role) = role {
+        let name = ccteam_harness::chat_session_name(slug_or_name, role);
+        attach_interactive_by_name(&name)?;
+        return Ok(true);
+    }
+    // Role omitted → enumerate live chat sessions and filter by slug.
+    let backend = ccteam_harness::default_process_backend();
+    let live = block_on_async(ccteam_harness::list_chat_sessions(backend.as_ref()))??;
+    let mut matches: Vec<(String, String)> = live
+        .iter()
+        .filter_map(|name| {
+            let (slug, role) = ccteam_harness::parse_chat_session_name(name)?;
+            (slug == slug_or_name).then(|| (role, name.clone()))
+        })
+        .collect();
+    matches.sort();
+    match matches.as_slice() {
+        [] => Ok(false),
+        [(_role, name)] => {
+            attach_interactive_by_name(name)?;
+            Ok(true)
+        }
+        many => {
+            let mut msg = format!(
+                "`{slug_or_name}` has {} live chat sessions; specify a role:",
+                many.len()
+            );
+            for (role, name) in many {
+                msg.push_str(&format!(
+                    "\n  ccteam internal attach {slug_or_name} {role}   # {name}"
+                ));
+            }
+            bail!("{msg}")
+        }
+    }
+}
+
+/// `ccteam sessions` — read-only snapshot of gateway chat-mode bot sessions
+/// (`ccteam-chat-<slug>-<role>`). Enumerates live sessions from the mux backend
+/// (R6: names only, never capture-pane) and reconciles them against the
+/// daemon's persisted registry, flagging orphans (live but untracked) and
+/// registered sessions that are no longer running. Never spawns or kills.
+pub fn run_sessions() -> Result<()> {
+    let backend = ccteam_harness::default_process_backend();
+    let live = block_on_async(ccteam_harness::list_chat_sessions(backend.as_ref()))??;
+    let live_set: std::collections::BTreeSet<&str> = live.iter().map(String::as_str).collect();
+
+    let state_path = ccteam_im::default_gateway_state_path();
+    // A missing / unreadable registry is non-fatal: treat every live session as
+    // an orphan rather than refusing to list anything.
+    let tracked = ccteam_im::gateway::tracked_chat_session_names(&state_path).unwrap_or_default();
+
+    // Reuse the gateway's reconcile classification (orphan = live ∧ untracked).
+    let inventory = ccteam_im::gateway::reconcile_chat_sessions(&tracked, &live);
+    let orphan_names: std::collections::BTreeSet<&str> =
+        inventory.orphans.iter().map(|o| o.name.as_str()).collect();
+
+    // Row set = union of live + tracked, deterministically ordered by name.
+    let mut names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    names.extend(live.iter().map(String::as_str));
+    names.extend(tracked.iter().map(String::as_str));
+
+    if names.is_empty() {
+        println!("no chat sessions (none live, none registered).");
+        println!(
+            "  Gateway chat sessions appear here once a bot is spawned \
+             (e.g. via Telegram `/new`)."
+        );
+        return Ok(());
+    }
+
+    struct Row {
+        slug: String,
+        role: String,
+        name: String,
+        alive: bool,
+        note: &'static str,
+    }
+    let rows: Vec<Row> = names
+        .iter()
+        .map(|name| {
+            let (slug, role) = ccteam_harness::parse_chat_session_name(name)
+                .unwrap_or_else(|| ("?".to_string(), "?".to_string()));
+            let alive = live_set.contains(name);
+            let note = if orphan_names.contains(name) {
+                "orphan (untracked)"
+            } else if !alive {
+                "registered, not running"
+            } else {
+                ""
+            };
+            Row {
+                slug,
+                role,
+                name: (*name).to_string(),
+                alive,
+                note,
+            }
+        })
+        .collect();
+
+    let w_slug = rows.iter().map(|r| r.slug.len()).max().unwrap_or(0).max(4);
+    let w_role = rows.iter().map(|r| r.role.len()).max().unwrap_or(0).max(4);
+    let w_name = rows.iter().map(|r| r.name.len()).max().unwrap_or(0).max(7);
+
+    let header = format!(
+        "{:<w_slug$}  {:<w_role$}  {:<w_name$}  {:<5}  NOTE",
+        "SLUG", "ROLE", "SESSION", "ALIVE"
+    );
+    println!("{}", header.trim_end());
+    for r in &rows {
+        let line = format!(
+            "{:<w_slug$}  {:<w_role$}  {:<w_name$}  {:<5}  {}",
+            r.slug,
+            r.role,
+            r.name,
+            if r.alive { "yes" } else { "no" },
+            r.note,
+        );
+        println!("{}", line.trim_end());
+    }
+    println!();
+    println!("attach: `ccteam internal attach <slug> [role]`  (Telegram: `/sessions`)");
+    Ok(())
+}
+
 pub fn run_attach(paths: &CcteamPaths, slug: &str) -> Result<()> {
     // V0.5.0 F93b: agent-team mode dispatches to the lead session.
     if let Some(lead_id) = read_agent_team_lead_session_id(paths, slug)? {
@@ -2244,7 +2428,9 @@ fn refresh_state_team_kind(paths: &CcteamPaths, state: &mut ProjectState) -> Res
 
 fn bail_session_requires_flex(state: &ProjectState) -> Result<()> {
     bail!(
-        "session subcommands only work on flex teams; project `{}` is team `{}` (kind={:?})",
+        "session subcommands only work on flex teams; project `{}` is team `{}` (kind={:?})\n  \
+         gateway chat sessions: list with `ccteam sessions` (or Telegram `/sessions`), \
+         attach with `ccteam internal attach <slug> [role]`",
         state.slug,
         state.team,
         state.team_kind,

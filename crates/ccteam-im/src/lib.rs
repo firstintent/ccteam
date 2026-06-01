@@ -123,6 +123,15 @@ pub fn default_ccteam_root_public() -> PathBuf {
     default_ccteam_root()
 }
 
+/// Canonical on-disk path of the gateway route-table snapshot
+/// (`<ccteam_root>/imd/gateway-state.json`). The daemon persists its tracked
+/// sessions here; the read-only `ccteam sessions` CLI view loads them back via
+/// [`gateway::tracked_chat_session_names`]. Both sides resolve the path through
+/// this one helper so they never drift.
+pub fn default_gateway_state_path() -> PathBuf {
+    default_ccteam_root().join("imd").join("gateway-state.json")
+}
+
 /// `<ccteam_root>/imd/registry/` — base registry dir given an explicit
 /// root (V0.6.5 F146).
 pub fn registry_root_in(ccteam_root: &Path) -> PathBuf {

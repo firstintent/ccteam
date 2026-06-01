@@ -6,11 +6,11 @@
 //! the daemon can wire the same state machine into real transports.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use ccteam_harness::{
     chat_session_name, parse_chat_session_name, AgentSpecBrief, AgentVendor, HarnessAdapter,
     ProcessBackend, SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails, TurnInput,
@@ -809,22 +809,8 @@ impl Gateway {
             .values()
             .map(|s| chat_session_name(&s.project, &s.role))
             .collect();
-        let mut inventory = SessionInventory::default();
-        for name in live_chat_names {
-            if tracked_names.contains(name) {
-                inventory.tracked.push(name.clone());
-            } else if let Some((slug, role)) = parse_chat_session_name(name) {
-                inventory.orphans.push(OrphanSession {
-                    name: name.clone(),
-                    slug,
-                    role,
-                });
-            }
-        }
-        inventory.tracked.sort();
-        inventory.tracked.dedup();
-        inventory.orphans.sort_by(|a, b| a.name.cmp(&b.name));
-        inventory
+        // Bare-path call binds to the free function below, not this method.
+        reconcile_chat_sessions(&tracked_names, live_chat_names)
     }
 
     /// Enumerate live chat sessions from `backend` and reconcile them against
@@ -864,6 +850,61 @@ impl Gateway {
             lines.join("\n")
         }
     }
+}
+
+/// Reconcile live `ccteam-chat-*` process names against a set of *tracked*
+/// canonical session names. A live name present in `tracked_names` is
+/// `tracked`; any other (parseable) live name is an `orphan` — a process that
+/// outlived the daemon that spawned it. Matching is by the *computed* canonical
+/// name, so dash-containing slugs stay unambiguous; the live name is only
+/// parsed to describe an orphan for display.
+///
+/// This is the daemon-independent core behind [`Gateway::reconcile_chat_sessions`].
+/// The read-only `ccteam sessions` CLI view calls it directly, passing tracked
+/// names loaded from the persisted registry via [`tracked_chat_session_names`].
+pub fn reconcile_chat_sessions(
+    tracked_names: &std::collections::BTreeSet<String>,
+    live_chat_names: &[String],
+) -> SessionInventory {
+    let mut inventory = SessionInventory::default();
+    for name in live_chat_names {
+        if tracked_names.contains(name) {
+            inventory.tracked.push(name.clone());
+        } else if let Some((slug, role)) = parse_chat_session_name(name) {
+            inventory.orphans.push(OrphanSession {
+                name: name.clone(),
+                slug,
+                role,
+            });
+        }
+    }
+    inventory.tracked.sort();
+    inventory.tracked.dedup();
+    inventory.orphans.sort_by(|a, b| a.name.cmp(&b.name));
+    inventory
+}
+
+/// Load the set of canonical chat-session names (`ccteam-chat-<slug>-<role>`)
+/// the gateway has tracked, from its persisted route table at `state_path`
+/// (see [`default_gateway_state_path`](crate::default_gateway_state_path)).
+///
+/// Returns an empty set when the file is absent — no daemon has persisted a
+/// registry yet, so every live chat session is by definition an orphan. This
+/// is the daemon-independent registry source the `ccteam sessions` CLI view
+/// reconciles against; it is strictly read-only and never mutates the file.
+pub fn tracked_chat_session_names(state_path: &Path) -> Result<std::collections::BTreeSet<String>> {
+    if !state_path.exists() {
+        return Ok(std::collections::BTreeSet::new());
+    }
+    let raw = std::fs::read_to_string(state_path)
+        .with_context(|| format!("read gateway state {}", state_path.display()))?;
+    let saved: SavedGatewayState = serde_json::from_str(&raw)
+        .with_context(|| format!("parse gateway state {}", state_path.display()))?;
+    Ok(saved
+        .sessions
+        .into_iter()
+        .map(|s| chat_session_name(&s.project, &s.role))
+        .collect())
 }
 
 impl Drop for Gateway {
@@ -1469,6 +1510,57 @@ mod tests {
             .unwrap();
         assert_eq!(reply, vec!["beta-reviewer-s1 echo: after restart"]);
         assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn reconcile_chat_sessions_free_fn_splits_tracked_and_orphans() {
+        let tracked: std::collections::BTreeSet<String> =
+            [ccteam_harness::chat_session_name("dev-foo", "alice")]
+                .into_iter()
+                .collect();
+        let live = vec![
+            ccteam_harness::chat_session_name("dev-foo", "alice"), // tracked
+            ccteam_harness::chat_session_name("ghost-proj", "zombie"), // orphan
+            "ccteam-chat-".to_string(),                            // unparseable → dropped
+        ];
+        let inv = reconcile_chat_sessions(&tracked, &live);
+        assert_eq!(inv.tracked, vec!["ccteam-chat-dev-foo-alice".to_string()]);
+        assert_eq!(inv.orphans.len(), 1);
+        assert_eq!(inv.orphans[0].slug, "ghost-proj");
+        assert_eq!(inv.orphans[0].role, "zombie");
+        assert_eq!(inv.orphans[0].name, "ccteam-chat-ghost-proj-zombie");
+    }
+
+    #[test]
+    fn tracked_chat_session_names_empty_when_state_file_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist.json");
+        assert!(tracked_chat_session_names(&missing).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tracked_chat_session_names_reads_persisted_canonical_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_path = tmp.path().join("gateway-state.json");
+        let fake = Arc::new(FakeAdapter::default());
+
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        gateway.register_project("beta", "/tmp/beta");
+        gateway.enable_persistence(&state_path).unwrap();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/cd beta")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+
+        let names = tracked_chat_session_names(&state_path).unwrap();
+        assert!(
+            names.contains("ccteam-chat-beta-reviewer"),
+            "expected canonical chat-session name, got {names:?}"
+        );
     }
 
     #[tokio::test]

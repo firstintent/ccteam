@@ -260,6 +260,14 @@ enum Command {
     /// to tmux session attach (V0.3.x compat) or the latest
     /// `claude --bg` job id (V0.4.0 default).
     Attach { slug: String },
+    /// List live gateway chat-mode bot sessions (`ccteam-chat-<slug>-<role>`).
+    ///
+    /// Read-only control-plane enumeration: lists session names from the mux
+    /// backend (never capture-pane) and reconciles them against the daemon's
+    /// persisted registry, flagging orphans (live but untracked) and registered
+    /// sessions that are not running. Attach one with
+    /// `ccteam internal attach <slug> [role]`.
+    Sessions,
     /// **DEPRECATED** in V0.4.6 (F89) — moved to `ccteam internal peek`.
     ///
     /// Capture the project's pane content without attaching.
@@ -862,8 +870,18 @@ enum InternalCommand {
     /// --install-mcp` so daily-driver claude sessions and the meta
     /// agent both see the 17-tool surface (interfaces §12).
     McpServe,
-    /// Attach to a project's tmux session (`tmux attach`).
-    Attach { slug: String },
+    /// Attach to a session. Resolves a gateway chat-mode bot session
+    /// (`ccteam-chat-<slug>-<role>`) first: `<slug> <role>` (or a full session
+    /// name) is deterministic; with `<slug>` alone, attaches when the slug has
+    /// exactly one live chat session, else lists them to disambiguate. Falls
+    /// back to the project session (`ccteam-<slug>`) when no live chat session
+    /// matches.
+    Attach {
+        slug: String,
+        /// Chat-mode role (the trailing segment of `ccteam-chat-<slug>-<role>`).
+        /// Omit to auto-resolve a single live chat session for `<slug>`.
+        role: Option<String>,
+    },
     /// Capture the project's pane content without attaching.
     Peek { slug: String },
     /// Print the project's progress.jsonl, optionally tailing.
@@ -1131,6 +1149,7 @@ fn main() -> Result<()> {
             None => show_slug_picker(),
         },
         Command::Attach { slug } => run_attach(&slug),
+        Command::Sessions => commands::run_sessions(),
         Command::Peek { slug } => {
             warn_deprecated_top_level("peek", "internal peek");
             run_peek(&slug)
@@ -1410,7 +1429,7 @@ fn run_internal(cmd: InternalCommand) -> Result<()> {
     match cmd {
         InternalCommand::Hook { cmd } => run_hook(cmd),
         InternalCommand::McpServe => run_mcp_serve(),
-        InternalCommand::Attach { slug } => run_attach(&slug),
+        InternalCommand::Attach { slug, role } => run_internal_attach(&slug, role.as_deref()),
         InternalCommand::Peek { slug } => run_peek(&slug),
         InternalCommand::Progress { slug, tail } => run_progress(&slug, tail),
         InternalCommand::Resume { slug } => run_resume(&slug),
@@ -1534,6 +1553,18 @@ fn run_mux_hook_emit(
 // web). Status check is `ccteam doctor` (heartbeat file probe).
 
 fn run_attach(slug: &str) -> Result<()> {
+    let paths = CcteamPaths::from_env()?;
+    commands::run_attach(&paths, slug)
+}
+
+/// `ccteam internal attach <slug> [role]` — reach gateway chat-mode bot
+/// sessions first (the project-oriented [`commands::run_attach`] cannot see
+/// `ccteam-chat-*`), then fall back to the project session when no live chat
+/// session matches `slug`.
+fn run_internal_attach(slug: &str, role: Option<&str>) -> Result<()> {
+    if commands::try_attach_chat_session(slug, role)? {
+        return Ok(());
+    }
     let paths = CcteamPaths::from_env()?;
     commands::run_attach(&paths, slug)
 }
