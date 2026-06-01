@@ -26,6 +26,9 @@ restart the daemon mid-smoke, then require both sessions to continue.
 Set CCTEAM_REAL_IM_WS_FAULTS=1 with CCTEAM_REAL_IM_WS=1 to inject a
 real Claude tmux-session death plus a Codex app-server disconnect, and
 require user-visible gateway errors.
+Set CCTEAM_REAL_IM_TELEGRAM=1 with --real plus CCTEAM_TELEGRAM_BOT_TOKEN
+and CCTEAM_TELEGRAM_CHAT_ID to run an opt-in real Telegram send/listen
+round trip. The test sends a unique code and waits for that exact reply.
 EOF
 }
 
@@ -180,6 +183,15 @@ if [[ "$MODE" == "real" ]]; then
     run_test real_ws_dual_harness ccteam-im real_ws_dual_harness_smoke
   else
     echo "smoke-im --real: skipping real WS dual-harness probe (set CCTEAM_REAL_IM_WS=1)"
+  fi
+  if [[ "${CCTEAM_REAL_IM_TELEGRAM:-0}" == "1" ]]; then
+    if [[ -z "${CCTEAM_TELEGRAM_BOT_TOKEN:-${CCTEAM_TELEGRAM_TOKEN:-}}" || -z "${CCTEAM_TELEGRAM_CHAT_ID:-}" ]]; then
+      echo "smoke-im --real: CCTEAM_REAL_IM_TELEGRAM=1 requires CCTEAM_TELEGRAM_BOT_TOKEN and CCTEAM_TELEGRAM_CHAT_ID" >&2
+      exit 2
+    fi
+    run_test real_telegram_channel ccteam-im real_telegram_channel_roundtrip_smoke
+  else
+    echo "smoke-im --real: skipping real Telegram probe (set CCTEAM_REAL_IM_TELEGRAM=1)"
   fi
 fi
 
