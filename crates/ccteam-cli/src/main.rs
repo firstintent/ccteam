@@ -2291,13 +2291,27 @@ fn run_status(tail: usize) -> Result<()> {
         println!("  projects: (none — `ccteam new \"<idea>\"` to create one)");
     } else {
         println!("  projects ({}):", projects.len());
+        // Classify each project's silence into a short verdict so the
+        // operator reads "STUCK" instead of decoding raw seconds. Reuses
+        // the same `commands::stall_level` tiers the `--json` path emits,
+        // keeping the human + machine views consistent.
+        let mut needs_attention: Vec<(&str, String)> = Vec::new();
         for p in &projects {
             let age = humanize_secs(p.age_seconds);
             let silent = humanize_secs(p.stall_silent_seconds);
+            let verdict = commands::stall_verdict(p.stall_silent_seconds);
+            if verdict != "OK" {
+                needs_attention.push((p.state.slug.as_str(), silent.clone()));
+            }
             println!(
-                "    {:<32}  age {:>8}  last-event {:>8}",
-                p.state.slug, age, silent
+                "    {:<32}  age {:>8}  last-event {:>8}  {}",
+                p.state.slug, age, silent, verdict
             );
+        }
+        // One actionable hint line per warn-or-higher project so the
+        // operator knows the exact peek → attach takeover sequence.
+        for (slug, silent) in &needs_attention {
+            println!("    {}", commands::stall_takeover_hint(slug, silent));
         }
     }
     println!();

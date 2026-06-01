@@ -4484,7 +4484,7 @@ fn phase_state_str(s: &PhaseState) -> &'static str {
     }
 }
 
-fn stall_level(silent_s: u64) -> &'static str {
+pub(crate) fn stall_level(silent_s: u64) -> &'static str {
     if silent_s >= 30 * 60 {
         "escalate"
     } else if silent_s >= 15 * 60 {
@@ -4494,6 +4494,28 @@ fn stall_level(silent_s: u64) -> &'static str {
     } else {
         "ok"
     }
+}
+
+/// Collapse the `stall_level` tiers into the short verdict word the
+/// `ccteam status` project rows print, so the operator reads "STUCK"
+/// instead of decoding raw silence seconds. `escalate`/`suspicious`
+/// both surface as `STUCK` (silent long enough to warrant a takeover),
+/// `warn` stays `warn`, everything else is `OK`.
+pub(crate) fn stall_verdict(silent_s: u64) -> &'static str {
+    match stall_level(silent_s) {
+        "escalate" | "suspicious" => "STUCK",
+        "warn" => "warn",
+        _ => "OK",
+    }
+}
+
+/// One actionable hint line for a warn-or-higher project: the exact
+/// peek → attach takeover sequence the operator runs next.
+pub(crate) fn stall_takeover_hint(slug: &str, silent: &str) -> String {
+    format!(
+        "{slug} silent {silent} — `ccteam internal peek {slug}` then \
+         `ccteam internal attach {slug}` to take over"
+    )
 }
 
 fn truncate(s: &str, n: usize) -> &str {
@@ -5470,6 +5492,29 @@ mod tests {
         assert!(
             msg.contains("ccteam-meta-cto"),
             "peek should target state.tmux_session, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn stall_verdict_classifies_silence_tiers() {
+        // 0s → OK, 5m → warn, 15m+/30m+ both collapse to STUCK so the
+        // status row prints a verdict instead of raw seconds.
+        assert_eq!(stall_verdict(0), "OK");
+        assert_eq!(stall_verdict(5 * 60), "warn");
+        assert_eq!(stall_verdict(15 * 60), "STUCK");
+        // Past the escalate threshold (30m) the project is STUCK and the
+        // takeover hint names the exact peek → attach sequence.
+        assert_eq!(stall_verdict(30 * 60), "STUCK");
+        let hint = stall_takeover_hint("dev-checkout", "31m");
+        assert!(hint.contains("dev-checkout"), "hint names the slug: {hint}");
+        assert!(hint.contains("silent 31m"), "hint shows silence: {hint}");
+        assert!(
+            hint.contains("ccteam internal peek dev-checkout"),
+            "hint points at peek: {hint}",
+        );
+        assert!(
+            hint.contains("ccteam internal attach dev-checkout"),
+            "hint points at attach: {hint}",
         );
     }
 
