@@ -179,6 +179,7 @@ where
     let mut gateway_inner =
         build_gateway(factory.clone(), &projects_root, &config_projects, &initial);
     gateway_inner.resume_restored_sessions().await;
+    log_orphan_chat_sessions(&gateway_inner).await;
     let (gateway_event_tx, gateway_event_rx) =
         tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
     gateway_inner.set_event_sink(gateway_event_tx);
@@ -349,6 +350,52 @@ fn build_gateway(
         );
     }
     gateway
+}
+
+/// Surface `ccteam-chat-*` processes that outlived a prior daemon but are not
+/// in the restored route table (orphans). Read-only control-plane enumeration:
+/// it only LOGS — reclaim stays explicit and opt-in (the "never auto-kill a
+/// long session" redline).
+///
+/// Scoped to the tmux backend: tmux sessions outlive the daemon, whereas the
+/// bundled rmux backend is daemon-tracked (its sessions die with the daemon, so
+/// there is nothing to orphan). Enumerating only on an explicit
+/// `CCTEAM_MUX_BACKEND=tmux` also keeps daemon startup side-effect-free on the
+/// default backend. Timeout-guarded so a stale tmux server never blocks boot.
+///
+/// A richer operator surface — orphans in `@ccteam list` / a
+/// `ccteam sessions --all` command, plus an explicit reclaim verb — can reuse
+/// [`Gateway::render_all_sessions`], which already renders tracked + orphan
+/// rows; this startup hook is the read-only visibility half.
+async fn log_orphan_chat_sessions(gateway: &Gateway) {
+    if std::env::var("CCTEAM_MUX_BACKEND").ok().as_deref() != Some("tmux") {
+        return;
+    }
+    let backend = ccteam_harness::TmuxBackend::new();
+    let inventory = match tokio::time::timeout(
+        Duration::from_secs(2),
+        gateway.inventory_via_backend(&backend),
+    )
+    .await
+    {
+        Ok(Ok(inventory)) => inventory,
+        Ok(Err(err)) => {
+            tracing::debug!(error = %err, "ccteam-im: orphan reconcile: backend enumeration unavailable");
+            return;
+        }
+        Err(_) => {
+            tracing::debug!("ccteam-im: orphan reconcile: backend enumeration timed out");
+            return;
+        }
+    };
+    for orphan in &inventory.orphans {
+        tracing::warn!(
+            session = %orphan.name,
+            slug = %orphan.slug,
+            role = %orphan.role,
+            "ccteam-im: orphaned chat session (untracked; survived a prior daemon) — reclaim explicitly, never auto-killed"
+        );
+    }
 }
 
 /// Drain the mpsc receiving from every listener and route each accepted

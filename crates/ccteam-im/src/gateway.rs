@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use ccteam_harness::{
-    AgentSpecBrief, AgentVendor, HarnessAdapter, SpawnCtx, ThreadEvent, ThreadHandle,
-    ThreadItemDetails, TurnInput,
+    chat_session_name, parse_chat_session_name, AgentSpecBrief, AgentVendor, HarnessAdapter,
+    ProcessBackend, SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails, TurnInput,
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -92,6 +92,30 @@ pub struct GatewayEvent {
     pub thread_ts: Option<String>,
     /// User-visible message content.
     pub content: String,
+}
+
+/// A live `ccteam-chat-*` process with no matching tracked gateway session —
+/// a survivor of a prior daemon. The process name carries only slug+role (not
+/// the owning chat), so orphans are a global concern and are never attributed
+/// to a single chat's `/sessions`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrphanSession {
+    /// Full process/tmux session name (`ccteam-chat-<slug>-<role>`).
+    pub name: String,
+    /// Project slug parsed from the name.
+    pub slug: String,
+    /// Role parsed from the name.
+    pub role: String,
+}
+
+/// Reconciliation of live chat-mode processes against this gateway's tracked
+/// sessions. See [`Gateway::reconcile_chat_sessions`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionInventory {
+    /// Live `ccteam-chat-*` names that map to a tracked gateway session.
+    pub tracked: Vec<String>,
+    /// Live `ccteam-chat-*` names with no tracked session (orphans).
+    pub orphans: Vec<OrphanSession>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -769,6 +793,76 @@ impl Gateway {
 
     fn render_projects(&self) -> String {
         self.projects.keys().cloned().collect::<Vec<_>>().join("\n")
+    }
+
+    /// Reconcile live `ccteam-chat-*` process names against tracked sessions.
+    ///
+    /// A live name equal to some tracked session's canonical name
+    /// ([`chat_session_name`]) is `tracked`; the rest are `orphans` — processes
+    /// that outlived a prior daemon and were never recorded by this one.
+    /// Matching is by *computed* canonical name (not by parsing the live name),
+    /// so dash-containing slugs are unambiguous; parsing is only used to
+    /// describe orphans for display.
+    pub fn reconcile_chat_sessions(&self, live_chat_names: &[String]) -> SessionInventory {
+        let tracked_names: std::collections::BTreeSet<String> = self
+            .sessions
+            .values()
+            .map(|s| chat_session_name(&s.project, &s.role))
+            .collect();
+        let mut inventory = SessionInventory::default();
+        for name in live_chat_names {
+            if tracked_names.contains(name) {
+                inventory.tracked.push(name.clone());
+            } else if let Some((slug, role)) = parse_chat_session_name(name) {
+                inventory.orphans.push(OrphanSession {
+                    name: name.clone(),
+                    slug,
+                    role,
+                });
+            }
+        }
+        inventory.tracked.sort();
+        inventory.tracked.dedup();
+        inventory.orphans.sort_by(|a, b| a.name.cmp(&b.name));
+        inventory
+    }
+
+    /// Enumerate live chat sessions from `backend` and reconcile them against
+    /// tracked sessions. Production entry for daemon startup / a global session
+    /// view. Read-only — never kills (the "never auto-kill a long session"
+    /// redline; reclaim stays an explicit, opt-in action).
+    pub async fn inventory_via_backend(
+        &self,
+        backend: &dyn ProcessBackend,
+    ) -> Result<SessionInventory> {
+        let live = ccteam_harness::list_chat_sessions(backend).await?;
+        Ok(self.reconcile_chat_sessions(&live))
+    }
+
+    /// Render a global session inventory for an operator: every tracked session
+    /// (`id:project:vendor:role`) plus any orphaned `ccteam-chat-*` processes,
+    /// each flagged for explicit reclaim. Global (not per-chat): orphan names
+    /// don't carry an owning chat, so this is intentionally not part of the
+    /// per-chat `/sessions` view.
+    pub fn render_all_sessions(&self, live_chat_names: &[String]) -> String {
+        let inventory = self.reconcile_chat_sessions(live_chat_names);
+        let mut lines: Vec<String> = self
+            .sessions
+            .values()
+            .map(|s| format!("{}:{}:{:?}:{}", s.id, s.project, s.vendor, s.role))
+            .collect();
+        lines.sort();
+        for orphan in &inventory.orphans {
+            lines.push(format!(
+                "orphan {} (slug={} role={}) — untracked, reclaim explicitly",
+                orphan.name, orphan.slug, orphan.role
+            ));
+        }
+        if lines.is_empty() {
+            "no sessions".to_string()
+        } else {
+            lines.join("\n")
+        }
     }
 }
 
@@ -1552,5 +1646,61 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reply, vec!["beta-assistant-s1 echo: hello"]);
+    }
+
+    #[tokio::test]
+    async fn gateway_reconciles_orphan_chat_sessions() {
+        use ccteam_harness::{InProcBackend, MuxSessionSpec};
+        use std::path::PathBuf;
+
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+
+        // One tracked session: s1 = alpha/lead → ccteam-chat-alpha-lead.
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude lead")
+            .await
+            .unwrap();
+
+        // Two live ccteam-chat-* processes injected via a fake ProcessBackend:
+        // one matches the tracked session, the other is an orphan that outlived
+        // a prior daemon (dashed slug to exercise the parser).
+        let backend = InProcBackend::new();
+        let spec =
+            |name: &str| MuxSessionSpec::new(name, vec!["true".into()], PathBuf::from("/tmp"));
+        backend
+            .spawn(spec(&chat_session_name("alpha", "lead")))
+            .await
+            .unwrap();
+        backend
+            .spawn(spec("ccteam-chat-ghost-proj-zombie"))
+            .await
+            .unwrap();
+
+        let inventory = gateway.inventory_via_backend(&backend).await.unwrap();
+        assert_eq!(
+            inventory.tracked,
+            vec!["ccteam-chat-alpha-lead".to_string()]
+        );
+        assert_eq!(
+            inventory.orphans,
+            vec![OrphanSession {
+                name: "ccteam-chat-ghost-proj-zombie".to_string(),
+                slug: "ghost-proj".to_string(),
+                role: "zombie".to_string(),
+            }]
+        );
+
+        // The global display entry lists the tracked session and flags the orphan.
+        let live = ccteam_harness::list_chat_sessions(&backend).await.unwrap();
+        let rendered = gateway.render_all_sessions(&live);
+        assert!(
+            rendered.contains("s1:alpha:Claude:lead"),
+            "rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains("orphan ccteam-chat-ghost-proj-zombie (slug=ghost-proj role=zombie)"),
+            "rendered: {rendered}"
+        );
     }
 }

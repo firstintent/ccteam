@@ -73,9 +73,23 @@ impl ClaudeTuiAdapter {
     }
 }
 
+/// Tmux/process session-name prefix for chat-mode bots.
+pub const CHAT_SESSION_PREFIX: &str = "ccteam-chat-";
+
 /// Compose the canonical tmux session name for a chat-mode bot.
 pub fn chat_session_name(slug: &str, role: &str) -> String {
-    format!("ccteam-chat-{slug}-{role}")
+    format!("{CHAT_SESSION_PREFIX}{slug}-{role}")
+}
+
+/// Inverse of [`chat_session_name`]: parse a chat-mode session name back into
+/// `(slug, role)`. The role is the final dash-delimited segment; the slug is
+/// everything between the prefix and it (slugs may themselves contain dashes,
+/// e.g. `team-proj`). Returns `None` when `name` is not a chat-mode session
+/// name or is missing a slug/role.
+pub fn parse_chat_session_name(name: &str) -> Option<(String, String)> {
+    let rest = name.strip_prefix(CHAT_SESSION_PREFIX)?;
+    let (slug, role) = rest.rsplit_once('-')?;
+    (!slug.is_empty() && !role.is_empty()).then(|| (slug.to_string(), role.to_string()))
 }
 
 /// V0.6.6 F172 V2 — compose the deterministic Anthropic `--name` /
@@ -1198,6 +1212,23 @@ mod tests {
             chat_session_name("dev-foo", "alice"),
             "ccteam-chat-dev-foo-alice"
         );
+    }
+
+    #[test]
+    fn parse_chat_session_name_round_trips_with_dashed_slug() {
+        // Role is the last segment; the slug keeps its internal dashes.
+        assert_eq!(
+            parse_chat_session_name("ccteam-chat-dev-foo-alice"),
+            Some(("dev-foo".to_string(), "alice".to_string()))
+        );
+        let (slug, role) = ("team-proj", "reviewer");
+        assert_eq!(
+            parse_chat_session_name(&chat_session_name(slug, role)),
+            Some((slug.to_string(), role.to_string()))
+        );
+        // Non-chat names and malformed inputs are rejected.
+        assert_eq!(parse_chat_session_name("some-other-tmux"), None);
+        assert_eq!(parse_chat_session_name("ccteam-chat-noseprole"), None);
     }
 
     #[test]

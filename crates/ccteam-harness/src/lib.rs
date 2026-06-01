@@ -58,6 +58,7 @@ pub use enriched_event::{
     enrichment_source, BaseEvent, BasePayload, EnrichedEvent, EnrichmentEvent, EnrichmentPayload,
     EnrichmentSource, EventKind, EventMerger, MergeOutcome, Vendor, DEFAULT_GRACE,
 };
+pub use execution::claude_tui::{chat_session_name, parse_chat_session_name, CHAT_SESSION_PREFIX};
 pub use execution::ClaudeBgAdapter;
 pub use hook_sink::{default_ccteam_hook_socket_path, HookEvent, HookSink, HookSinkClient};
 pub use inproc_backend::InProcBackend;
@@ -438,4 +439,54 @@ pub fn default_process_backend() -> Arc<dyn ProcessBackend> {
 /// from `main` / daemon startup).
 pub fn default_backend() -> Arc<dyn PaneBackend> {
     terminal_from_env().unwrap_or_else(|_| Arc::new(RmuxBackend::new()))
+}
+
+/// Read-only control-plane enumeration of live chat-mode bot sessions
+/// (`ccteam-chat-<slug>-<role>`) hosted by `backend`. Lists session *names*
+/// via [`ProcessBackend::list_sessions`] — no pane scraping. The gateway uses
+/// this to reconcile its tracked sessions against processes that outlived a
+/// previous daemon (orphans).
+pub async fn list_chat_sessions(backend: &dyn ProcessBackend) -> Result<Vec<String>> {
+    Ok(backend
+        .list_sessions()
+        .await?
+        .into_iter()
+        .map(|id| id.0)
+        .filter(|name| name.starts_with(CHAT_SESSION_PREFIX))
+        .collect())
+}
+
+#[cfg(test)]
+mod chat_session_enum_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn spec(name: &str) -> MuxSessionSpec {
+        MuxSessionSpec::new(name, vec!["true".into()], PathBuf::from("/tmp"))
+    }
+
+    #[tokio::test]
+    async fn list_chat_sessions_filters_to_chat_mode_names() {
+        let backend = InProcBackend::new();
+        backend
+            .spawn(spec(&chat_session_name("dev-foo", "alice")))
+            .await
+            .unwrap();
+        backend
+            .spawn(spec(&chat_session_name("ghost-proj", "zombie")))
+            .await
+            .unwrap();
+        // A non-chat tmux session must be filtered out.
+        backend.spawn(spec("some-other-tmux")).await.unwrap();
+
+        let mut chat = list_chat_sessions(&backend).await.unwrap();
+        chat.sort();
+        assert_eq!(
+            chat,
+            vec![
+                "ccteam-chat-dev-foo-alice".to_string(),
+                "ccteam-chat-ghost-proj-zombie".to_string(),
+            ]
+        );
+    }
 }
