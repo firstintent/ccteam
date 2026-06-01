@@ -134,7 +134,7 @@ Creator 自动起群 / 配多 bot persona / 配 @ 路由 / 限 3 层 @ 链防 pi
 
 向导自动开浏览器到 BotFather → 拿 token → 抓 chat_id → 起 daemon。详 [quickstart.md](quickstart.md) §Step 2。
 
-> Slack / Discord onboarding 在 V0.7 ship(V0.6.x 仅 Telegram 端到端走通)。
+> 当前 Telegram 端到端走通;Slack / Discord onboarding 是后续计划。
 
 ---
 
