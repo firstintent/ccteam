@@ -17,7 +17,7 @@ ccteam gateway 把 IM 消息路由到真实 Claude/Codex session。核心对象�
 | 命令 | 说明 |
 |---|---|
 | `/pair <code>` | 将当前 chat 建立为可用入口,并确保默认 session 存在。 |
-| `/cd <project>` | 当前 chat 切到项目。 |
+| `/cd <project>` | 当前 chat 切到项目;活动 session 跟着切到该项目下的会话(没有则下条消息在那新建)。 |
 | `/new claude <handle>` | 在当前项目创建 Claude tmux session。 |
 | `/new codex <handle>` | 在当前项目创建 Codex app-server session。 |
 | `/use <session-id>` | 当前 chat 切到已有 session。 |

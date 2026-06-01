@@ -202,7 +202,7 @@ Telegram 侧(网关命令,均为确定性):
 | `/new claude reviewer` | 当前项目建 Claude session,handle `@reviewer` |
 | `/new codex api` | 当前项目建 Codex session,handle `@api` |
 | `/use s1` | 切到 session `s1` |
-| `/cd demo-api` | 当前 chat 切到 `demo-api` 项目 |
+| `/cd demo-api` | 当前 chat 切到 `demo-api`;活动 session 跟着切(无则下条消息新建)|
 | `/sessions` · `/projects` | 列当前 chat 的 session / daemon 已知项目 |
 | `@api /compact` · `@api /review` | Codex 原生 RPC(compact / review) |
 | `@reviewer /clear` | Claude TUI slash 透传 |
