@@ -1,0 +1,517 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ccteam · Codex/CC + IM — 最新综合原型</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2330; --border:#30363d;
+    --fg:#e6edf3; --dim:#8b949e; --faint:#6e7681;
+    --green:#3fb950; --blue:#58a6ff; --amber:#d29922; --red:#f85149;
+    --purple:#bc8cff; --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);font-size:14px;line-height:1.5}
+  .wrap{max-width:1180px;margin:0 auto;padding:0 18px 60px}
+  header{position:sticky;top:0;z-index:5;background:rgba(13,17,23,.92);backdrop-filter:blur(6px);border-bottom:1px solid var(--border)}
+  .hbar{max-width:1180px;margin:0 auto;padding:10px 18px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+  .logo{font-weight:700;font-size:15px} .logo .sub{color:var(--dim);font-weight:500}
+  .pill{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;font-size:12px;border:1px solid var(--border);background:var(--panel)}
+  .pill.b{border-color:#274b6b;color:var(--blue)} .pill.p{border-color:#4b3a6b;color:var(--purple)} .pill.g{border-color:#2a5b34;color:var(--green)}
+  .dot{width:8px;height:8px;border-radius:50%;display:inline-block;background:var(--green)}
+  .spacer{flex:1}
+  .cost{font-family:var(--mono);font-size:12px;color:var(--dim)} .cost b{color:var(--fg)}
+  .tabs{display:flex;gap:6px;margin:18px 0 14px;flex-wrap:wrap}
+  .tab{cursor:pointer;padding:7px 14px;border-radius:8px;border:1px solid transparent;color:var(--dim);font-weight:600}
+  .tab:hover{color:var(--fg)} .tab.on{color:var(--fg);background:var(--panel);border-color:var(--border)}
+  .view{display:none} .view.on{display:block}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:12px}
+  .card h3{margin:0;padding:12px 14px;font-size:12px;letter-spacing:.6px;text-transform:uppercase;color:var(--dim);border-bottom:1px solid var(--border);font-weight:700}
+  .pad{padding:14px}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px} .grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
+  h2.sec{font-size:13px;color:var(--dim);text-transform:uppercase;letter-spacing:.6px;margin:22px 0 10px}
+  .lead{color:var(--dim);margin:2px 0 14px}
+  code.inl{font-family:var(--mono);background:var(--panel2);border:1px solid var(--border);border-radius:5px;padding:1px 6px;font-size:12px}
+  pre{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:16px;overflow-x:auto;font-family:var(--mono);font-size:12.5px;line-height:1.65;color:var(--fg)}
+  pre .c{color:var(--faint)} pre .k{color:var(--blue)} pre .g{color:var(--green)} pre .p{color:var(--purple)} pre .a{color:var(--amber)} pre .r{color:var(--red)} pre .d{color:var(--faint)}
+  .note{background:var(--panel2);border:1px solid var(--border);border-left:3px solid var(--blue);border-radius:8px;padding:11px 13px;color:var(--dim);font-size:13px;margin-top:12px}
+  .note b{color:var(--fg)}
+  .note.warn{border-left-color:var(--amber)} .note.good{border-left-color:var(--green)} .note.bad{border-left-color:var(--red)}
+  .kv{display:flex;gap:8px;margin:7px 0;font-size:13px} .kv .k{color:var(--dim);flex:none;width:92px}
+  table{width:100%;border-collapse:collapse;font-size:12.5px;margin-top:6px}
+  th,td{border:1px solid var(--border);padding:7px 9px;text-align:left;vertical-align:top}
+  th{color:var(--dim);font-weight:600;background:var(--panel2)} td code{font-family:var(--mono);font-size:11.5px;color:var(--blue)}
+  .vb{font-size:10px;font-family:var(--mono);padding:1px 6px;border-radius:5px;border:1px solid var(--border);margin-left:6px}
+  .vb.cl{color:var(--blue);border-color:#274b6b} .vb.cx{color:var(--purple);border-color:#4b3a6b}
+  /* phone */
+  .expgrid{display:grid;grid-template-columns:392px 1fr;gap:16px}
+  .phone{width:392px;border:1px solid var(--border);border-radius:30px;background:#080b10;padding:12px 10px 14px}
+  .notch{width:120px;height:6px;background:#222831;border-radius:99px;margin:2px auto 10px}
+  .pwin{background:var(--bg);border:1px solid var(--border);border-radius:18px;overflow:hidden;height:580px;display:flex;flex-direction:column}
+  .ptop{display:flex;align-items:center;gap:8px;padding:9px 12px;border-bottom:1px solid var(--border);background:var(--panel)}
+  .ptop .av{width:24px;height:24px;border-radius:50%;background:linear-gradient(135deg,#1f6feb,#bc8cff);flex:none}
+  .ptop .t{font-weight:700;font-size:13px} .ptop .s{font-size:11px;color:var(--green);font-family:var(--mono)}
+  .ptabs{display:flex;gap:6px;padding:7px 10px;border-bottom:1px solid var(--border);background:var(--panel2)}
+  .ptab{font-size:11px;font-family:var(--mono);padding:3px 9px;border-radius:7px;border:1px solid var(--border);color:var(--dim);cursor:pointer}
+  .ptab.on{color:var(--fg);background:var(--bg)} .ptab.cl.on{border-color:#274b6b;color:var(--blue)} .ptab.cx.on{border-color:#4b3a6b;color:var(--purple)}
+  .scr{flex:1;overflow-y:auto;padding:12px 11px;display:flex;flex-direction:column;gap:9px;font-size:13px}
+  .b{max-width:84%;padding:8px 11px;border-radius:13px;line-height:1.45}
+  .b.user{align-self:flex-end;background:#1f3b5e;border:1px solid #274b6b;border-bottom-right-radius:4px}
+  .b.cc{align-self:flex-start;background:var(--panel);border:1px solid var(--border);border-bottom-left-radius:4px}
+  .b.cc .nm{font-size:10px;font-weight:700;margin-bottom:3px;font-family:var(--mono)}
+  .b.cc .nm.cl{color:var(--blue)} .b.cc .nm.cx{color:var(--purple)}
+  .tool{align-self:flex-start;font-family:var(--mono);font-size:11.5px;color:var(--dim);background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:5px 9px;max-width:90%}
+  .tool .ic{color:var(--green)}
+  .sys{align-self:center;font-size:11px;color:var(--faint);font-family:var(--mono);text-align:center}
+  .img{align-self:flex-end;width:120px;height:74px;border-radius:10px;background:repeating-linear-gradient(45deg,#1c2330,#1c2330 8px,#222b39 8px,#222b39 16px);border:1px solid var(--border);display:grid;place-items:center;color:var(--faint);font-size:11px}
+  .appr{align-self:stretch;border:1px solid #6b5524;background:rgba(210,153,34,.08);border-radius:12px;padding:10px 11px}
+  .appr .h{font-size:11px;color:var(--amber);font-weight:700;font-family:var(--mono);margin-bottom:5px;display:flex;justify-content:space-between}
+  .appr .src{color:var(--faint);font-weight:400}
+  .appr .cmd{font-family:var(--mono);font-size:12px;background:#0b0e13;border:1px solid var(--border);border-radius:7px;padding:6px 8px;color:var(--fg);margin-bottom:8px;white-space:pre-wrap}
+  .appr .btns{display:flex;gap:8px} .appr button{flex:1;border-radius:8px;padding:7px;font-weight:700;font-size:12px;cursor:pointer;border:1px solid}
+  .appr .ok{background:rgba(63,185,80,.15);border-color:#2a5b34;color:var(--green)} .appr .no{background:rgba(248,81,73,.12);border-color:#5b2a2a;color:var(--red)}
+  .pbar{display:flex;gap:7px;align-items:center;padding:8px 10px;border-top:1px solid var(--border);background:var(--panel)}
+  .pbar input{flex:1;background:var(--panel2);border:1px solid var(--border);color:var(--fg);border-radius:18px;padding:7px 12px;font-size:12.5px;outline:none}
+  .pbar .snd{background:#1f6feb;border:1px solid #388bfd;color:#fff;border-radius:50%;width:32px;height:32px;cursor:pointer;flex:none}
+  .pbar .clip{color:var(--faint);cursor:pointer;font-size:16px}
+  .capli{display:flex;gap:9px;padding:7px 0;border-bottom:1px solid var(--border);font-size:13px;align-items:baseline}
+  .capli:last-child{border-bottom:none}
+  .capli .mk{flex:none;width:60px;font-size:10px;font-family:var(--mono);text-align:center;border-radius:5px;border:1px solid var(--border);padding:1px 0}
+  .capli .mk.v{color:var(--green);border-color:#2a5b34} .capli .mk.x{color:var(--purple);border-color:#4b3a6b}
+  /* layers + roadmap */
+  .lyr{border:1px solid var(--border);border-radius:12px;padding:12px 14px;margin-bottom:10px;background:var(--panel)}
+  .lyr .h{display:flex;align-items:center;gap:10px;margin-bottom:5px}
+  .lyr .h .t{font-weight:700;font-size:14px;font-family:var(--mono)} .lyr .h .role{color:var(--dim);font-size:12px}
+  .lyr .h .tag{margin-left:auto;font-size:10px;font-family:var(--mono);padding:2px 8px;border-radius:6px;border:1px solid var(--border)}
+  .tag.in{color:var(--green);border-color:#2a5b34} .tag.out{color:var(--purple);border-color:#4b3a6b} .tag.leaf{color:var(--dim)}
+  .lyr.im{border-left:3px solid var(--blue)} .lyr.mux{border-left:3px solid var(--green)} .lyr.flow{border-left:3px solid var(--purple);opacity:.78} .lyr.leaf{border-left:3px solid var(--faint)}
+  .lyr .d{color:var(--dim);font-size:12.5px} .lyr code{font-family:var(--mono);font-size:11.5px;color:var(--blue)}
+  .road{display:flex;flex-direction:column;gap:10px}
+  .stp{display:flex;gap:12px;border:1px solid var(--border);border-radius:10px;padding:12px 14px;background:var(--panel)}
+  .stp .num{width:30px;height:30px;border-radius:8px;display:grid;place-items:center;font-weight:700;flex:none;background:var(--panel2);border:1px solid var(--border)}
+  .stp.now{border-left:3px solid var(--green)} .stp.now .num{color:var(--green);border-color:#2a5b34}
+  .stp.later{border-left:3px solid var(--purple)} .stp.later .num{color:var(--purple);border-color:#4b3a6b}
+  .stp .nm{font-weight:700;margin-bottom:3px} .stp .ds{color:var(--dim);font-size:13px}
+</style>
+</head>
+<body>
+<header>
+  <div class="hbar">
+    <div class="logo">ccteam <span class="sub">▸ Codex/CC + IM</span></div>
+    <span class="pill"><span class="dot"></span>最新综合原型</span>
+    <span class="pill b">Claude=tmux</span><span class="pill p">Codex=app-server</span><span class="pill" style="border-color:#5b2a2a;color:var(--red)">v8.1: skip-permissions</span>
+    <div class="spacer"></div>
+    <span class="cost">花费 <b>$2.10</b> / $20 · 24h</span>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="tabs">
+    <div class="tab on" data-v="exp">体验(IM 端)</div>
+    <div class="tab" data-v="onboard">上手 · 项目/会话/Bot</div>
+    <div class="tab" data-v="arch">整体架构</div>
+    <div class="tab" data-v="future">未来计划</div>
+    <div class="tab" data-v="exec">执行层(双 vendor)</div>
+    <div class="tab" data-v="appr">手机批准(统一)</div>
+    <div class="tab" data-v="gw">网关 + 会话</div>
+    <div class="tab" data-v="road">路线</div>
+  </div>
+
+  <!-- ============ 体验 ============ -->
+  <div class="view on" id="v-exp">
+    <h2 class="sec">手机 = Claude Code 和 Codex 的完整控制台(同一套体验)</h2>
+    <div class="expgrid">
+      <div class="phone">
+        <div class="notch"></div>
+        <div class="pwin">
+          <div class="ptop"><div class="av"></div><div><div class="t">ccteam · 路由网关</div><div class="s">2 个常驻 session 活</div></div></div>
+          <div class="ptabs">
+            <div class="ptab cl on" id="t-cl">claude · payments</div>
+            <div class="ptab cx" id="t-cx">codex · api-svc</div>
+            <div class="ptab" id="t-new" style="color:var(--faint)">＋ /new</div>
+          </div>
+          <div class="scr" id="scr"></div>
+          <div class="pbar">
+            <span class="clip" id="clip" title="发图/文件">📎</span>
+            <input id="pin" placeholder="发消息 / 插话 / 命令(/compact /review)…">
+            <button class="snd" id="snd">↑</button>
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <div class="card"><h3>在 IM 端能做的全部(Claude + Codex 对称)</h3><div class="pad" style="padding-top:4px">
+          <div class="capli"><span class="mk v">核心</span><div><b>一个 chat = 你的终端</b> —— 跨多 project、随时 <code class="inl">/new</code> 多 session、随时切(<code class="inl">@bot</code> / <code class="inl">/use</code> / <code class="inl">/cd</code>);每 session 独立 context。详见「网关」tab</div></div>
+        <div class="capli"><span class="mk v">双 vendor</span><div><b>多轮对话</b> —— 文本 → submit_turn 进对应常驻 session;<code class="inl">@bot</code> / 标签切 Claude ⇄ Codex</div></div>
+          <div class="capli"><span class="mk v">双 vendor</span><div><b>看输出流 + tool 调用</b> —— Claude 走 transcript+hook;Codex 走 app-server 事件;归一成同一套 CanonicalEvent</div></div>
+          <div class="capli"><span class="mk x">未来</span><div><b>手机批准 tool(未来)</b> —— v8.1 不做,先 <code class="inl">--dangerously-skip-permissions</code>;未来 Claude 阻塞 hook / Codex 原生 RequestApproval → 中立 ApprovalIR</div></div>
+          <div class="capli"><span class="mk v">双 vendor</span><div><b>命令</b> —— Claude:/compact /clear /preview(TUI send-keys);Codex:/compact=<code class="inl">thread/compact/start</code>、/review=<code class="inl">review/start</code>(typed RPC,可 detached)</div></div>
+          <div class="capli"><span class="mk v">双 vendor</span><div><b>插话 / 中断 / 发图 / admin</b> —— 不打断当前 turn;<code class="inl">@ccteam cost/status/stop</code></div></div>
+          <div class="capli"><span class="mk v">双 vendor</span><div><b>跨重启续接</b> —— resume-by-session-id(ccteam 重启后重连,不是常驻吊着)</div></div>
+          <div class="capli"><span class="mk x">将来</span><div><b>跨机器</b> —— ccteam-bridge(Iroh QUIC + SSH),agent 在远端机器跑、手机照常控</div></div>
+        </div></div>
+        <div class="note good"><b>对称的核心:</b> 两个 vendor 用各自<b>原生最顺</b>的通道驱动(Claude=tmux/transcript/hook,Codex=app-server JSON-RPC),但在 IM 端是<b>同一套体验</b> —— 因为执行层把它们都归一成中立 CanonicalEvent + ApprovalIR(见「执行层」「手机批准」tab)。</div>
+      </div>
+    </div>
+    <div class="note warn"><b>v8.1 走 <code class="inl">--dangerously-skip-permissions</code>(无批准门)</b> —— 下面演示里的黄色批准卡是<b>未来计划</b>预览;v8.1 里 tool 直接跑、不弹卡。<br><b>试一下:</b> 点 ↑ 跑演示;切上面 claude/codex 标签看两 vendor。</div>
+  </div>
+
+  <!-- ============ 上手 ============ -->
+  <div class="view" id="v-onboard">
+    <h2 class="sec">三步上手:创建项目 → 起 session → 绑定 Bot</h2>
+    <p class="lead">「体验」是稳态,这里是怎么走到那。三步各自落进 daemon(=路由网关)的三张表:<b>项目</b> / <b>session 注册表</b> / <b>路由表 + ACL</b>。</p>
+<pre>  <span class="g">① 创建项目</span>             <span class="b">② 起 session</span>            <span class="p">③ 绑定 Bot</span>
+  ──────────             ──────────             ──────────
+  ccteam init            选 vendor + role        配 token(一次性)
+  (建新/纳管现有)         Claude→<span class="b">tmux</span>             → 手机发 <span class="a">/pair &lt;code&gt;</span>
+    agents/ skills/      Codex→<span class="p">app-server</span>       → ACL allowlist 收
+    state.json          → 注册表 +1 Handle       → 路由:chat ⇄ 项目/session
+       │                      │                        │
+       ▼                      ▼                        ▼
+  ┌──────────┐        ┌───────────────┐       ┌──────────────────┐
+  │ 项目表    │───────▶│ session 注册表  │◀──────│ 路由表 + ACL        │
+  └──────────┘        └───────────────┘       └──────────────────┘
+                    ↑ 全在 daemon(ccteam-im 路由网关)内 ↑</pre>
+
+    <div class="grid3">
+      <div class="card"><h3>① 创建项目</h3><div class="pad">
+        <div class="kv"><span class="k">做什么</span><span>定义一个 agent 工作区(目录)</span></div>
+        <div class="kv"><span class="k">怎么做</span><span><code>ccteam init</code> —— 建新 / 纳管现有 repo(幂等,可重跑)</span></div>
+        <div class="kv"><span class="k">落地</span><span><code>&lt;project&gt;/.ccteam/</code>:agents/ · skills/ · state.json</span></div>
+        <div class="kv"><span class="k">入口</span><span>CLI / ccteam-creator skill</span></div>
+      </div></div>
+      <div class="card"><h3>② 起 session</h3><div class="pad">
+        <div class="kv"><span class="k">做什么</span><span>在项目里声明一个常驻 agent session</span></div>
+        <div class="kv"><span class="k">选</span><span><span class="vb cl">Claude→tmux</span> / <span class="vb cx">Codex→app-server</span> + role</span></div>
+        <div class="kv"><span class="k">怎么起</span><span>daemon 经 HarnessAdapter×ProcessBackend spawn,进 <b>session 注册表</b>(一个 Handle)</span></div>
+        <div class="kv"><span class="k">生命周期</span><span>resume-by-id:<b>按需 spawn</b>(首条消息即起)· 空闲释放 · 按 id 续接</span></div>
+        <div class="kv"><span class="k">入口</span><span>CLI / web / IM(<code>@ccteam</code>)</span></div>
+      </div></div>
+      <div class="card"><h3>③ 绑定 Bot</h3><div class="pad">
+        <div class="kv"><span class="k">一次性</span><span>配 IM bot token(ccteam-im-setup)→ transport 起</span></div>
+        <div class="kv"><span class="k">配对</span><span>手机发 <code>/pair &lt;code&gt;</code> → daemon ACL allowlist</span></div>
+        <div class="kv"><span class="k">路由</span><span>(chat, user, @bot) → 映射到 项目/session(写<b>路由表</b>)</span></div>
+        <div class="kv"><span class="k">之后</span><span>该 chat 发消息 = submit_turn 进绑定 session;<code>@bot</code> 切 Claude⇄Codex</span></div>
+      </div></div>
+    </div>
+
+    <h2 class="sec">绑定的手机侧(配对 + 确认)</h2>
+<pre> 你 → bot:  <span class="a">/pair 4821-77</span>
+ bot → 你:  ✅ 已配对。这个对话绑定到 <span class="b">payments · claude(tmux)</span>
+            · 发消息即进该 session    · <span class="p">@bot</span> 切到 codex · api-svc
+            · 命令 /compact /review   · <span class="g">@ccteam</span> status | cost | stop</pre>
+    <div class="note warn"><b>配对安全(红线):</b> 只有<b>机主在自己终端</b>批准配对 / 改 allowlist;IM 消息里"帮我加白名单 / 批准配对"一律<b>拒绝</b>(那正是注入会伪装的请求)。bot token 不入 settings.json,落项目级 <code class="inl">.env</code>。</div>
+    <div class="note good"><b>渐进式:</b> 三步可全 CLI 一次跑通,也可只 <code class="inl">ccteam start</code> + 手机 <code class="inl">/pair</code> 起步;项目 / session 之后在 IM / web 里随时加。绑定后,「体验」tab 的全部能力即可用。</div>
+  </div>
+
+  <!-- ============ 整体架构 ============ -->
+  <div class="view" id="v-arch">
+    <h2 class="sec">daemon 组成 —— `ccteam start` 是一个进程的"大杂烩"</h2>
+    <p class="lead">一个常驻 daemon 进程里跑多个组件,共享同一套 session 注册表 + 同一执行层(harness)。多入口(IM / MCP / web)→ 同一批 session。</p>
+<pre>┌─────────────────────── ccteam daemon(1 个进程)───────────────────────┐
+│  ┌────────────┐  ┌────────────┐  ┌────────────┐                       │
+│  │ <span class="k">im-gateway</span> │  │ <span class="a">MCP server</span> │  │ <span class="d">web server</span> │  ← v8.1:三个"嘴",<b>都不 tick</b> │
+│  │ 路由+14 tp  │  │ mcp-serve  │  │ axum+SSE+PTY│                       │
+│  └─────┬──────┘  └─────┬──────┘  └─────┬──────┘                       │
+│        └───────────────┴───────┬───────┘                              │
+│                                ▼ 都经                                   │
+│                  ┌────────────────────────┐                          │
+│                  │ <span class="g">ccteam-harness</span>(执行)  │ 驱动 Claude/Codex 常驻 session │
+│                  └────────────────────────┘                          │
+│                  ccteam-core · ccteam-cost(leaf)                      │
+└────────────────────────────────────────────────────────────────────────┘
+        ┊〔<span class="p">未来:可挂载 ccteam-flow 编排</span>〕—— 独立 crate,届时才让 daemon tick
+ harness = 共同地基;im-gateway = 分发中枢;MCP/web 是另两个"嘴"(非另一套引擎)。
+ <b>v8.1 daemon = 网关、不 tick;flow 是单独推后的 crate,不在这个盒子里。</b></pre>
+
+    <h2 class="sec">数据流:IM 渠道 → 路由网关 → per-adapter 执行 → 中立事件</h2>
+<pre>  手机 (Telegram / WeChat / …)
+        │ 消息 / 图片 / @bot / 命令 / 批准回复
+        ▼
+  ┌─────────────────────────────────────────────┐
+  │ <span class="k">ccteam-im</span> · daemon 的核心 = <span class="k">IM⇄session 路由网关</span>     │
+  │ 路由表(谁⇄哪个 session)+ session 注册表 + ACL │  ← <b>不 tick、无编排循环</b>
+  └───────────────┬───────────────┬───────────────┘
+       submit_turn │               │ submit_turn
+                   ▼               ▼
+        ┌────────────────┐  ┌────────────────┐
+        │ Claude session │  │ Codex session  │   ← <span class="g">ccteam-harness</span> 执行层
+        │ <span class="b">tmux</span>: send-keys  │  │ <span class="p">app-server</span>      │     (HarnessAdapter × ProcessBackend)
+        │ + transcript    │  │ JSON-RPC        │
+        │ + PreToolUse hk │  │ (UDS/WS)        │
+        └───────┬────────┘  └───────┬─────────┘
+                │ 归一               │ 归一
+                ▼                    ▼
+        ┌─────────────────────────────────────┐
+        │ <span class="a">CanonicalEvent</span> + 中立 <span class="a">ApprovalIR</span>       │  ← 谁都不假装成谁
+        └─────────────────────────────────────┘
+                │ 出站回手机(文本/tool/批准卡)
+                ▼  状态落 progress.jsonl + turns.jsonl(展示)</pre>
+
+    <h2 class="sec">crate 分层(v8.1 实线 · 推后/将来虚化)</h2>
+<pre>                          <span class="a">ccteam-cli</span> (bin)  CLI + MCP + `ccteam start`
+        ┌──────────────┬──────────────┬──────────────┐
+        ▼              ▼              ▼              ▼
+   <span class="k">ccteam-im</span>      <span class="p">ccteam-flow</span>    <span class="d">ccteam-web</span>     <span class="g">ccteam-hooks</span>
+   IM 网关〔v8.1〕    编排〔推后〕     UI〔可选〕      hook+阻塞批准〔v8.1〕
+        └──────┬───────┴──────┬───────┘              │
+               ▼              ▼                      │ hook→core
+          <span class="g">ccteam-harness</span> ◄────────────────────────────┘
+          执行层(一个 crate;Claude/Codex adapter 共存)〔v8.1〕
+               │
+        ┌──────┴──────┐
+        ▼             ▼
+   <span class="a">ccteam-core</span>     <span class="a">ccteam-cost</span>   〔leaf〕
+   primitives        budget
+   将来 <span class="p">ccteam-bridge</span> = 远程 ProcessBackend(Iroh+SSH)→ 插 harness</pre>
+    <div class="note good"><b>v8.1 运行时 = { cli + im + harness + hooks + core + cost }</b> —— 明确<b>不含 flow</b>(IM 产品不 tick),web 可选。"云 CC/Codex + IM" 不带编排就能先发。编排(ccteam-flow)推后,过渡期借 cc/codex 内部。</div>
+
+    <h2 class="sec">ccteam-harness 内部(一个 crate,不按 agent 细拆)</h2>
+<pre>┌──────────────────────────── ccteam-harness ────────────────────────────────┐
+│  trait <span class="b">HarnessAdapter</span>(drive 轴:怎么驱动)  trait <span class="g">ProcessBackend</span>(host 轴:跑哪) │
+│   ├ ClaudeTuiAdapter ──┐ argv + dialect       ├ TmuxBackend(pane;resize 等 tmux 专属只在此)│
+│   ├ CodexAppServerAdapter│ wire ↔ Canonical    ├ InProcBackend(子进程 + 管道)              │
+│   └ (Gemini / Pi / … 模块)│ + Caps             └ RemoteBackend(= ccteam-bridge,未来)       │
+│                          ▼ 都产出 / 消费                                                     │
+│        <span class="a">CanonicalEvent</span> + 中立 <span class="a">ApprovalIR</span> + framer(newline / LSP Content-Length)              │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
+ 组合:一个 session = HarnessAdapter(选 vendor)× ProcessBackend(选 host)。两轴正交,N+M 不是 N×M。</pre>
+    <div class="note"><b>命名(回应你):mux → harness。</b> 执行层 crate 脊梁是 <code class="inl">HarnessAdapter</code>,Codex 走 app-server 不沾 tmux,所以不叫 mux;"mux"/tmux 收窄成 <code class="inl">ProcessBackend</code> 的一个 impl <code class="inl">TmuxBackend</code>,名副其实。pane / resize 等 tmux 专属方法只在 TmuxBackend,不污染 trait。</div>
+  </div>
+
+  <!-- ============ 未来计划 ============ -->
+  <div class="view" id="v-future">
+    <h2 class="sec">未来计划 · 理想态(<span style="color:var(--purple)">非 v8.1</span> —— 整张图标注为未来计划)</h2>
+    <p class="lead">所有轴拉满后的样子。v8.1 只点亮其中一条竖切(Claude/tmux + IM);画出终态是为了让每一步知道往哪收敛 + 确认现在就把抽象接口留对。</p>
+<pre> ┌─ 入口:全是 gateway 的 channel ─────────────────────────────────┐
+ │  IM(TG / WeChat / Slack / 飞书 / 钉钉…) · Web · CLI · 第三方 MCP client │
+ └────────────────────────────┬────────────────────────────────────┘
+                              ▼ 同一路由网关(chat ⇄ project ⇄ session)
+           ┌────────────────────────────────────────┐
+           │ ccteam daemon                            │
+           │  im-gateway · MCP server · web server     │
+           │  + <span class="p">ccteam-flow(编排 · 点亮)</span> ← 护城河       │
+           └───────────────────┬──────────────────────┘
+                               ▼ submit_turn / resolve
+           ┌────────────────────────────────────────┐
+           │ ccteam-harness                           │
+           │  HarnessAdapter: <span class="b">Claude · Codex</span> · Gemini · Pi · ACP… │
+           │  ProcessBackend: Tmux · InProc · <span class="p">Remote</span>       │
+           └───────────────────┬──────────────────────┘
+             ┌─────────────────┴─────────────────┐
+             ▼ 本地                                ▼ 远程(<span class="p">ccteam-bridge</span>)
+       本机 agent session                远端机器 agent session(Iroh QUIC + SSH)</pre>
+    <div class="grid2">
+      <div class="card"><h3>相对 v8.1,未来多出来的</h3><div class="pad">
+        <div class="kv"><span class="k">多 vendor</span><span style="color:var(--dim)">Gemini / Pi / ACP… 各加一个 HarnessAdapter(per-agent crate,agent#2+)</span></div>
+        <div class="kv"><span class="k">多 provider</span><span style="color:var(--dim)">同一 vendor 切后端模型:命名配置文件选 provider —— Claude <code>.claude/settings-&lt;p&gt;.json</code>(<code>--settings</code> 注 ANTHROPIC_BASE_URL/TOKEN/model,接 DeepSeek/Kimi/GLM 等 Anthropic-兼容网关);Codex <code>~/.codex/config.toml [model_providers.&lt;p&gt;]</code> + <code>--profile</code>。workflow.yaml 加正交 <code>provider:</code> 轴(per-role/bot)+ 运行时 <code>/provider &lt;p&gt;</code> 切换(re-spawn)</span></div>
+        <div class="kv"><span class="k">跨机器</span><span style="color:var(--dim)"><span class="vb" style="color:var(--purple);border-color:#4b3a6b">ccteam-bridge</span> = 远程 ProcessBackend(Iroh+SSH),agent 跑远端机</span></div>
+        <div class="kv"><span class="k">编排</span><span style="color:var(--dim)"><span class="vb" style="color:var(--purple);border-color:#4b3a6b">ccteam-flow</span> 点亮:自主多 agent(reactive 引擎)—— 区别于 Lucarne/litter 的护城河</span></div>
+        <div class="kv"><span class="k">多入口</span><span style="color:var(--dim)">web / CLI / 第三方 MCP client 也走同一 gateway → 同一批 session</span></div>
+        <div class="kv"><span class="k">国内 IM</span><span style="color:var(--dim)">WeChat 引用路由 + 飞书/钉钉/QQ transport</span></div>
+      </div></div>
+      <div class="card"><h3>哪些 v8.1、哪些推后</h3><div class="pad">
+        <div class="kv"><span class="k" style="color:var(--green)">v8.1</span><span style="color:var(--dim)">Claude/tmux + IM + 手机批准 + 路由网关 + resume-by-id</span></div>
+        <div class="kv"><span class="k" style="color:var(--purple)">未来①</span><span style="color:var(--dim)">Codex/app-server 对称接入(很快,见路线)</span></div>
+        <div class="kv"><span class="k" style="color:var(--purple)">未来②</span><span style="color:var(--dim)">ccteam-bridge 跨机器</span></div>
+        <div class="kv"><span class="k" style="color:var(--purple)">未来③</span><span style="color:var(--dim)">ccteam-flow 编排</span></div>
+        <div class="kv"><span class="k" style="color:var(--purple)">未来④</span><span style="color:var(--dim)">多 vendor 广度 + per-agent crate 拆分</span></div>
+        <div class="kv"><span class="k" style="color:var(--purple)">未来⑤</span><span style="color:var(--dim)">多 provider 切换(命名配置文件 · 正交 <code>provider:</code> 轴)—— 见左卡</span></div>
+        <div class="kv"><span class="k" style="color:var(--purple)">未来⑥</span><span style="color:var(--dim)">web chat:浏览器 ⇄ WebSocket ⇄ 网关,复用 P5 e2e 的 <code>WsChannel</code>(同一 Channel impl)—— 详见「网关」tab</span></div>
+      </div></div>
+    </div>
+    <div class="note warn"><b>这张图是「未来计划」,不是现在。</b> 现在只做 v8.1 那条竖切;画出来是为了让每一步(「路线」tab)知道往哪收敛,以及确认 4 个抽象边界(HarnessAdapter / ProcessBackend / gateway / ApprovalIR)<b>现在就留对接口</b>,免得将来返工。</div>
+  </div>
+
+  <!-- ============ 执行层 ============ -->
+  <div class="view" id="v-exec">
+    <h2 class="sec">执行层:HarnessAdapter × ProcessBackend,per-adapter best-fit</h2>
+    <p class="lead">两条正交轴(HarnessAdapter=怎么驱动 × ProcessBackend=跑在哪)。每个 vendor 用它<b>原生最顺</b>的;归一成一套中立事件。被 Lucarne(5 agent)/ alleycat(~10 agent)验证。</p>
+    <div class="grid2">
+      <div class="card"><h3>Claude · tmux backend</h3><div class="pad">
+        <div class="kv"><span class="k">起</span><span><code>claude --agent &lt;role&gt; --name &lt;sess&gt;</code>(交互,tmux pane)</span></div>
+        <div class="kv"><span class="k">输入</span><span><code>send-keys -l</code> + Enter —— <b>全 TUI 透传</b>(/compact /clear /preview)</span></div>
+        <div class="kv"><span class="k">输出</span><span><b>transcript-tail + PreToolUse hook</b>,<b>不 capture-pane、不抓屏</b></span></div>
+        <div class="kv"><span class="k">批准</span><span>阻塞 PreToolUse hook(文档化·600s·NET-NEW)</span></div>
+        <div class="kv"><span class="k">耐久</span><span>session 扛 daemon 重启,可 re-attach;人也能坐下来看</span></div>
+        <div class="kv"><span class="k">现状</span><span>ccteam mode-3 已是这套</span></div>
+      </div></div>
+      <div class="card"><h3>Codex · app-server backend</h3><div class="pad">
+        <div class="kv"><span class="k">起</span><span><code>codex app-server</code>(JSON-RPC,UDS/WS)</span></div>
+        <div class="kv"><span class="k">输入/命令</span><span>typed RPC:<code>turn/start</code>·<code>turn/steer</code>·<code>thread/compact/start</code>·<code>review/start</code>·<code>fork</code>·<code>rollback</code></span></div>
+        <div class="kv"><span class="k">输出</span><span>ServerNotification 事件流(结构化)</span></div>
+        <div class="kv"><span class="k">批准</span><span><b>原生</b> <code>*RequestApproval</code> → <code>resolve/reject_server_request</code></span></div>
+        <div class="kv"><span class="k">耐久</span><span>监听 socket,daemon 崩了重连(litter 验证)</span></div>
+        <div class="kv"><span class="k">现状</span><span>ccteam CodexAppServerAdapter 已有底子</span></div>
+      </div></div>
+    </div>
+    <h2 class="sec">中立 CanonicalEvent + ApprovalIR(关键:不让谁假装成谁)</h2>
+<pre><span class="k">enum</span> CanonicalEvent { ThreadStarted · TurnStarted · AssistantDelta · ToolCall · <span class="a">ApprovalRequest</span> · Usage · TurnCompleted · Error }
+
+<span class="k">struct</span> <span class="a">ApprovalIR</span> { req_id, kind: Command|FileChange|Permission|Question|ToolUse, risk, scope:[Once|Session|Always] }
+   Claude  阻塞 hook{tool,input}                    ⇄ ApprovalIR
+   Codex   {Command/FileChange/Permissions}Approval ⇄ ApprovalIR
+   <span class="c">★ 反面教材(alleycat):让每个 agent 假装成 Codex 协议 → Claude 的 Read/Task/MCP 被塞成假 commandExecution(有损)。我们用中立 IR,不抄。</span></pre>
+    <div class="note"><b>"一个 crate,不按 agent 细拆":</b> 执行层 = 一个 <code class="inl">ccteam-harness</code>;Claude/Codex adapter 是其内部模块。per-agent 物理拆(到 ~10 agent)等 agent#2 才做(alleycat 证明可扩展)。现在只钉对 4 个抽象边界(HarnessAdapter / ProcessBackend / CanonicalEvent / ApprovalIR)。</div>
+  </div>
+
+  <!-- ============ 手机批准 ============ -->
+  <div class="view" id="v-appr">
+    <h2 class="sec">手机批准:两 vendor 各走原生通道 → 同一张卡(中立 ApprovalIR)</h2>
+    <div class="note bad"><b>v8.1 不做手机批准 —— 先走 <code class="inl">--dangerously-skip-permissions</code>(无批准门,YOLO,跟 alleycat 默认一致)。</b> 本 tab 是<b>未来计划</b>的设计;留着是因为接口现在就要留对(中立 ApprovalIR 是 4 个抽象边界之一,届时填实现不返工)。</div>
+    <div class="grid2">
+      <div class="card"><h3>Claude:阻塞 PreToolUse hook</h3><div class="pad">
+<pre>tool 待批 → <span class="g">PreToolUse</span> hook <span class="r">阻塞</span>
+  → 写 .ccteam/approvals/&lt;id&gt; (pending)
+  → ccteam-im 推手机卡片
+  → 用户点 → 写 decision
+  → hook 返回 {permissionDecision: allow|deny}</pre>
+        <div class="kv"><span class="k">已核实</span><span style="color:var(--dim)">文档化·返回 allow/deny/ask·<b>600s 超时</b>·tmux+headless 都触发</span></div>
+        <div class="kv"><span class="k">NET-NEW</span><span style="color:var(--dim)">现有 hook 只 emit 事件,要扩成阻塞+转发+等决定</span></div>
+        <div class="kv"><span class="k">不走</span><span style="color:var(--dim)">stream-json control_request(未文档化+有回归)</span></div>
+      </div></div>
+      <div class="card"><h3>Codex:原生 app-server 批准</h3><div class="pad">
+<pre>server→client <span class="p">*RequestApproval</span>
+  (CommandExecution/FileChange/Permissions)
+  → ccteam-im 推手机卡片(同一张)
+  → 用户点
+  → <span class="g">resolve/reject_server_request</span>
+     {decision: Accept|AcceptForSession|Decline}</pre>
+        <div class="kv"><span class="k">已验证</span><span style="color:var(--dim)">litter:同一条 JSON-RPC 连接收发,原生 scope(Turn/Session)</span></div>
+        <div class="kv"><span class="k">前提</span><span style="color:var(--dim)">daemon 把 Codex 起在 approval-requiring 策略下</span></div>
+      </div></div>
+    </div>
+    <div class="note good"><b>两条入口、一个出口:</b> 不同 vendor 的批准请求都归一成中立 <code class="inl">ApprovalIR</code> → 手机上是<b>同一张卡片</b> [批准]/[拒绝]/[本 session 一直允许];用户的决定再编码回各自原生 reply。red line:<b>全程不 scrape 终端</b>(Claude 走 hook、Codex 走协议)。</div>
+  </div>
+
+  <!-- ============ 网关 + 会话 ============ -->
+  <div class="view" id="v-gw">
+    <h2 class="sec">核心概念:chat ⇄ project ⇄ session(一个 chat = 你的"终端")</h2>
+    <p class="lead">一个 chat bot 对话 = 你的终端。像 tmux 一样:里面可跨多个项目、随时起多 session、随时切。这是整套路由的三层关系。</p>
+<pre>  <span class="k">chat</span>(一个 IM 对话)
+   │  · 有一个「<b>当前焦点</b>」session —— 消息默认进它
+   │  · 可达(ACL)若干 project
+   ▼
+  <span class="g">project</span>(一个 dir,ccteam init 得到)
+   │  · 含 0..N 个 session
+   ▼
+  <span class="b">session</span> = project × vendor × role → 常驻 Handle(Claude tmux / Codex app-server)
+            每个 session <b>自己的 context</b>(/compact /clear 各管各)</pre>
+    <div class="grid2">
+      <div class="card"><h3>路由规则 + 切换(像 tmux 切 window)</h3><div class="pad">
+        <div class="kv"><span class="k">默认路由</span><span>chat 内每条消息 → chat.<b>当前 session</b> → submit_turn</span></div>
+        <div class="kv"><span class="k">切 session</span><span><code>@codex</code> / <code>/use api-svc</code> → 改当前 session</span></div>
+        <div class="kv"><span class="k">切 project</span><span><code>/cd payments</code> / <code>/project &lt;name&gt;</code> → 焦点落它的默认/上次 session</span></div>
+        <div class="kv"><span class="k">新 session</span><span><code>/new claude reviewer</code> → spawn + 设为当前(随时可加)</span></div>
+        <div class="kv"><span class="k">列 / 看</span><span><code>/sessions</code> · <code>/projects</code></span></div>
+      </div></div>
+      <div class="card"><h3>为什么"像 CC 的 TUI"</h3><div class="pad" style="color:var(--dim)">
+        一个 chat 就是一个"终端":多 session = 多 window,随时 <code class="inl">/new</code> / 切换 / 跑 slash;每个 session 独立 context + 续接。<br><br>
+        底层对 Claude 本来就是 tmux,所以是<b>直通不是模拟</b>:<b>project ≈ 工作目录</b>、<b>session ≈ 一个 tmux window 里的常驻 claude</b>、<b>chat ≈ attached 客户端</b>、<b>当前 session ≈ current window</b>。
+      </div></div>
+    </div>
+
+    <h2 class="sec">网关怎么接线(daemon 内,不 tick)</h2>
+<pre>  ┌──────────────┐  inbound   ┌────────────────────────────┐
+  │ transport     │──────────▶│ <span class="k">router</span>(chat,user,@bot)→session │
+  │ (TG/WeChat/…) │           │ acl / rate_limit / sanitize │
+  │              │◀──────────│ <b>session 注册表</b>:N 个常驻 Handle │
+  └──────────────┘  outbound  └──────────────┬──────────────┘
+        ▲ 文本/tool/批准卡                     │ submit_turn / resolve
+        └────────────────────────────────────┤
+                                             ▼
+                       Claude(tmux) · Codex(app-server) … 多路复用</pre>
+    <div class="grid3">
+      <div class="card"><h3>路由表 + 注册表</h3><div class="pad" style="color:var(--dim)"><code class="inl">(chat,user,@bot) ⇄ session</code>;N 渠道 × M session 双向多路复用(一人多 session、一群共享一 session)。</div></div>
+      <div class="card"><h3>会话 = resume-by-id</h3><div class="pad" style="color:var(--dim)"><b>不是常驻吊着</b>:spawn-on-demand + 按 session-id resume + 活着就复用 + 空闲释放。状态在磁盘(transcript/turns + codex session),重启后重连 —— 比"常驻不放"安全(躲 shadow-SoT),且仍连续。</div></div>
+      <div class="card"><h3>不 tick</h3><div class="pad" style="color:var(--dim)">网关循环,<b>非</b> orchestrator 事件循环。progress/turns 只当展示日志。编排(flow)是另一层、推后。</div></div>
+    </div>
+    <div class="note"><b>transport = 一个 <code class="inl">Channel</code> trait</b>(<code>send</code> 出站 + <code>listen(tx)</code> 入站)。真渠道 Telegram/Slack/微信 各一个 impl。<b>MockChannel</b>(push 入站 / 看 outbox)= in-proc 双向 sim,<b>P5 e2e 直接用它</b>驱动整条 入站→路由→submit_turn→出站(配 <code class="inl">CCTEAM_*_BIN</code> 假 agent,确定性)。<b>WsChannel</b>(WebSocket impl)一鱼两吃:<b>跨进程 e2e + 将来 web chat 同一根线</b> —— UI/WS 路由在 ccteam-web(复用 <code class="inl">pty_ws</code>),在 <b>cli 层用 mpsc 桥接、保持 web⊥im</b>(不引入 web→im / im→web crate 依赖)。线缆 = <code class="inl">ChannelMessage</code>/<code class="inl">SendMessage</code> 的 JSON 镜像。<b>纪律:e2e 永远走 Channel impl、不写分叉测试路径</b> —— 才能跑的是和生产同一条路。</div>
+    <div class="note warn"><b>耐久缺口(要补):</b> 今天 IM uplink / bot-routing 是 in-proc tokio+mpsc,<b>ccteam 重启即断</b>。要把 supervisor/outbound 沉进 daemon,让 IM 连接也扛重启 —— 否则"云端 24/7"打折。</div>
+  </div>
+
+  <!-- ============ 路线 ============ -->
+  <div class="view" id="v-road">
+    <h2 class="sec">路线 —— 先发确定的,推后易变的</h2>
+    <div class="road">
+      <div class="stp now"><div class="num">1</div><div><div class="nm">crate 分离(一次做全)</div>
+        <div class="ds">harness+execution→<code class="inl">ccteam-harness</code>;orchestrator→<code class="inl">ccteam-flow</code>(推后);core 瘦成 primitives leaf;imd→<code class="inl">ccteam-im</code>。钉对 4 个抽象边界。</div></div></div>
+      <div class="stp now"><div class="num">2</div><div><div class="nm">Claude via tmux + 完整 IM 体验</div>
+        <div class="ds">send-keys + transcript + hook;对话/tool 流/插话/slash/附件/多 session 路由/resume-by-id。骑成熟 tmux。</div></div></div>
+      <div class="stp now"><div class="num">3</div><div><div class="nm">skip-permissions(v8.1 无批准门)</div>
+        <div class="ds">agent 跑 <code class="inl">--dangerously-skip-permissions</code>,tool 直接执行、无批准回路(跟 alleycat 默认一致)。手机批准是未来计划(见步骤 8)。</div></div></div>
+      <div class="stp now"><div class="num">4</div><div><div class="nm">Codex via app-server(对称接入)</div>
+        <div class="ds">CodexAppServerAdapter 进 IM factory:turn/steer · thread/compact/start · review/start。两 vendor 对称(v8.1 同样 skip-permissions)。</div></div></div>
+      <div class="stp now"><div class="num">5</div><div><div class="nm">IM uplink 扛重启</div>
+        <div class="ds">supervisor/outbound/mpsc 沉进 daemon,连接活过 ccteam 重启。</div></div></div>
+      <div class="stp later"><div class="num">6</div><div><div class="nm">推后 · ccteam-bridge(跨机器)</div>
+        <div class="ds">远程 ProcessBackend(Iroh QUIC + relay + SSH,偷 alleycat/litter),端点放 daemon,agent 在远端机器跑。</div></div></div>
+      <div class="stp later"><div class="num">7</div><div><div class="nm">推后 · ccteam-flow(编排)</div>
+        <div class="ds">真要自主多 agent 编排时点亮(review 的收窄版 A:artifact-driven 家族)。此前借 cc/codex 内部编排。这是 ccteam 区别于 Lucarne/litter 的护城河。</div></div></div>
+      <div class="stp later"><div class="num">8</div><div><div class="nm">推后 · 手机批准(替代 skip-permissions)</div>
+        <div class="ds">Claude 阻塞 PreToolUse hook(600s)+ Codex 原生 *RequestApproval → 归一成中立 ApprovalIR、同一张批准卡。接口(ApprovalIR)v8.1 已留,届时只填实现。</div></div></div>
+    </div>
+    <div class="note"><b>待验/诚实钉子:</b> ① 阻塞批准 hook 的 timeout 超时行为(默认 600s,超时后未文档化);② Claude 经 stream-json/tmux 收图/附件(只在 Pi 上验过);③ Codex-via-IM 常驻化(今天 per-turn)。<b>设计在写代码前就被 Lucarne/litter/alleycat 三方印证 + claude-code-guide 核实校正过。</b></div>
+  </div>
+</div>
+
+<script>
+(function(){
+  document.querySelectorAll('.tab').forEach(function(t){
+    t.onclick=function(){
+      document.querySelectorAll('.tab').forEach(x=>x.classList.remove('on'));
+      document.querySelectorAll('.view').forEach(x=>x.classList.remove('on'));
+      t.classList.add('on'); document.getElementById('v-'+t.dataset.v).classList.add('on');
+    };
+  });
+  var scr=document.getElementById('scr');
+  function add(html,cls){ var d=document.createElement('div'); d.className=cls; d.innerHTML=html; scr.appendChild(d); scr.scrollTop=scr.scrollHeight; return d; }
+  function user(t){ add(t,'b user'); }
+  function cl(t){ add('<div class="nm cl">claude · tmux</div>'+t,'b cc'); }
+  function cx(t){ add('<div class="nm cx">codex · app-server</div>'+t,'b cc'); }
+  function tool(t){ add('<span class="ic">⚙</span> '+t,'tool'); }
+  function sys(t){ add(t,'sys'); }
+  function appr(src,cmd,onok,ono){
+    var c=add('<div class="h">⚠️ 要批准 tool<span class="src">'+src+'</span></div><div class="cmd">'+cmd+'</div><div class="btns"><button class="ok">✓ 批准</button><button class="no">✗ 拒绝</button></div>','appr');
+    c.querySelector('.ok').onclick=function(){ c.remove(); onok(); };
+    c.querySelector('.no').onclick=function(){ c.remove(); ono(); };
+  }
+  // seed (Claude session)
+  user('修一下登录页的 race condition');
+  cl('看了 src/auth/session.ts,并发刷新 token 的竞态。开 fix/login-race 改。');
+  tool('Read · src/auth/session.ts'); tool('Edit · session.ts (+8 −3)');
+
+  var steps=[
+    function(){ cl('要重装依赖跑测试,这步要你批:');
+      appr(' · via Claude 阻塞 PreToolUse hook',
+        'Bash: rm -rf node_modules && npm ci',
+        function(){ sys('decision=allow → hook 返回,Claude 继续'); tool('Bash · npm ci ✓'); tool('Bash · npm test ✓ 142 passed'); },
+        function(){ sys('decision=deny → hook 跳过该 tool'); cl('好,跳过重装,用现有依赖跑。'); }); },
+    function(){ user('/compact'); sys('→ TUI send-keys 透传进 tmux session'); cl('已压缩上下文。'); },
+    function(){ sys('—— 切到 codex · api-svc 标签(@bot 路由到另一个常驻 session)——'); document.getElementById('t-cl').classList.remove('on'); document.getElementById('t-cx').classList.add('on'); },
+    function(){ user('给 /v2/orders 加幂等键,然后 review'); cx('在 thread 上开干:加 Idempotency-Key 中间件。'); tool('app-server: turn/start · ItemStarted(file_change)'); },
+    function(){ cx('要写 migration,需批准文件改动:');
+      appr(' · via Codex 原生 FileChangeRequestApproval',
+        'FileChange: migrations/0007_idem.sql (+ grant_root)',
+        function(){ sys('resolve_server_request{Accept} → 同一条 JSON-RPC 回'); tool('app-server: ItemCompleted · TurnDiffUpdated'); },
+        function(){ sys('reject_server_request{Decline}'); cx('好,不写 migration,改用内存幂等表。'); }); },
+    function(){ user('/review'); sys('→ Codex review/start(detached 到新 thread)'); cx('review_thread_id=rv_88 · 发现 1 处竞态,已附 patch 建议。'); },
+    function(){ sys('两个 session 都常驻等下一条 · 批准全程不 scrape 终端'); }
+  ];
+  var si=0;
+  function next(){ if(si<steps.length){ steps[si++](); } else { sys('—— 演示结束 ——'); } }
+  document.getElementById('snd').onclick=function(){
+    var i=document.getElementById('pin'); var v=i.value.trim();
+    if(v){ user(v); i.value=''; sys('→ submit_turn 进当前 session'); } else { next(); }
+  };
+  document.getElementById('pin').addEventListener('keydown',function(e){ if(e.key==='Enter'){ document.getElementById('snd').click(); }});
+  document.getElementById('clip').onclick=function(){ add('截图.png','img'); sys('→ 附件随下一条 turn'); };
+  document.getElementById('t-cl').onclick=function(){ this.classList.add('on'); document.getElementById('t-cx').classList.remove('on'); };
+  document.getElementById('t-cx').onclick=function(){ this.classList.add('on'); document.getElementById('t-cl').classList.remove('on'); };
+  document.getElementById('t-new').onclick=function(){ sys('→ /new <vendor> <role> · 起一个新 session 并切过去(一个 chat 内随时可加)'); };
+})();
+</script>
+</body>
+</html>

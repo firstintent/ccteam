@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ccteam · Codex/CC + IM — 一口气开发计划(/goal)</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2330; --border:#30363d;
+    --fg:#e6edf3; --dim:#8b949e; --faint:#6e7681;
+    --green:#3fb950; --blue:#58a6ff; --amber:#d29922; --red:#f85149; --purple:#bc8cff;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);font-size:14px;line-height:1.55}
+  .wrap{max-width:1080px;margin:0 auto;padding:0 18px 80px}
+  header{position:sticky;top:0;z-index:5;background:rgba(13,17,23,.92);backdrop-filter:blur(6px);border-bottom:1px solid var(--border)}
+  .hbar{max-width:1080px;margin:0 auto;padding:10px 18px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+  .logo{font-weight:700;font-size:15px} .logo .sub{color:var(--dim);font-weight:500}
+  .pill{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;font-size:12px;border:1px solid var(--border);background:var(--panel)}
+  .pill.r{border-color:#5b2a2a;color:var(--red)} .pill.g{border-color:#2a5b34;color:var(--green)}
+  .spacer{flex:1}
+  h2.sec{font-size:13px;color:var(--dim);text-transform:uppercase;letter-spacing:.6px;margin:26px 0 10px;border-bottom:1px solid var(--border);padding-bottom:6px}
+  code.inl{font-family:var(--mono);background:var(--panel2);border:1px solid var(--border);border-radius:5px;padding:1px 6px;font-size:12px}
+  pre{background:#0b0e13;border:1px solid var(--border);border-radius:10px;padding:12px 14px;overflow-x:auto;font-family:var(--mono);font-size:12.5px;line-height:1.6;color:var(--fg);margin:8px 0}
+  pre .c{color:var(--faint)} pre .g{color:var(--green)} pre .a{color:var(--amber)} pre .b{color:var(--blue)} pre .r{color:var(--red)}
+  .note{background:var(--panel2);border:1px solid var(--border);border-left:3px solid var(--blue);border-radius:8px;padding:11px 13px;color:var(--dim);font-size:13px;margin:12px 0}
+  .note b{color:var(--fg)} .note.warn{border-left-color:var(--amber)} .note.good{border-left-color:var(--green)} .note.bad{border-left-color:var(--red)}
+  ul{margin:6px 0 6px 0;padding-left:20px} li{margin:3px 0}
+  .phase{border:1px solid var(--border);border-radius:12px;margin:14px 0;background:var(--panel);overflow:hidden}
+  .phase>.h{display:flex;align-items:center;gap:10px;padding:11px 14px;border-bottom:1px solid var(--border);background:var(--panel2)}
+  .phase>.h .n{width:34px;height:28px;border-radius:7px;display:grid;place-items:center;font-weight:700;font-family:var(--mono);flex:none;border:1px solid var(--border)}
+  .phase.now>.h .n{color:var(--green);border-color:#2a5b34} .phase.later>.h .n{color:var(--purple);border-color:#4b3a6b}
+  .phase>.h .t{font-weight:700;font-size:15px} .phase>.h .tag{margin-left:auto;font-size:11px;font-family:var(--mono);color:var(--dim)}
+  .phase>.body{padding:12px 14px}
+  .lbl{font-size:11px;font-family:var(--mono);text-transform:uppercase;letter-spacing:.5px;color:var(--faint);margin:10px 0 4px}
+  .lbl.v{color:var(--green)}
+  .kv{display:flex;gap:8px;margin:4px 0;font-size:13px} .kv .k{color:var(--dim);flex:none;width:64px}
+  .acc{background:rgba(63,185,80,.07);border:1px solid #2a5b34;border-radius:8px;padding:8px 11px;margin-top:6px}
+  .acc .done{color:var(--green);font-weight:700;font-size:12px}
+  a{color:var(--blue)}
+</style>
+</head>
+<body>
+<header>
+  <div class="hbar">
+    <div class="logo">ccteam <span class="sub">▸ Codex/CC + IM · 开发计划</span></div>
+    <span class="pill g">/goal 一口气执行</span>
+    <span class="pill r">v8.1: --dangerously-skip-permissions</span>
+    <div class="spacer"></div>
+    <span class="pill">架构见 <code class="inl">im.html</code></span>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <h2 class="sec">这是什么 / 怎么用</h2>
+  <p>把 <a href="im.html">im.html</a> 里那套 v8.1 架构在 <b>ccteam 真仓库</b>里实现 —— 「云 Claude Code / Codex + IM」:一个常驻 daemon 当 IM⇄session 路由网关,驱动 Claude(tmux)和 Codex(app-server)常驻 session,手机收发、切项目/会话。<b>v8.1 不做手机批准,agent 跑 <code class="inl">--dangerously-skip-permissions</code>(无批准门)。</b></p>
+  <div class="note good"><b>用法:</b> 新 session 里 <code class="inl">/goal</code> 本文件。<b>严格按 P0 → P6 顺序</b>,<b>每个 phase 必须先跑通它的「✅ 验收」命令(全绿)才进下一个</b>。所有验收全绿 = 完成。被打断可从"第一个没过验收的 phase"续做。</div>
+
+  <h2 class="sec">贯穿红线(每个 phase 都守)</h2>
+  <ul>
+    <li><b>不退步 baseline</b>:每 phase 末 <code class="inl">cargo test --workspace --locked --no-fail-fast --exclude ccteam-web</code> 的 pass 数 ≥ 起手数(起手先记下基线)。</li>
+    <li><b>clippy 0 warning</b> + <code class="inl">cargo fmt --all --check</code> 干净(收尾 P6 强制,过程中尽量保持)。</li>
+    <li><b>skip-permissions</b>:所有 spawn 的 agent 带 <code class="inl">--dangerously-skip-permissions</code>(Codex 用其等价 yolo/bypass);<b>不</b>写任何批准回路。</li>
+    <li><b>4 个抽象边界现在就留对</b>(细节见 im.html「执行层」「整体架构」):<code class="inl">HarnessAdapter</code>(drive)/ <code class="inl">ProcessBackend</code>(host)/ <code class="inl">CanonicalEvent</code> / <code class="inl">ApprovalIR</code>(v8.1 只留类型占位,不实现批准)。</li>
+    <li><b>验证优先用确定性 fake</b>:<code class="inl">CCTEAM_CLAUDE_BIN</code> / <code class="inl">CCTEAM_CODEX_BIN</code> 指向打桩二进制(吐固定 stream-json / JSON-RPC),使测试 CI 可跑、不依赖真 claude/codex;真二进制只在 P5 的可选 smoke 跑。</li>
+    <li><b>命名已定</b>:执行层 crate = <code class="inl">ccteam-harness</code>(非 mux);supervision trait = <code class="inl">ProcessBackend</code>(tmux 专属方法只在 <code class="inl">TmuxBackend</code>)。</li>
+  </ul>
+  <div class="note"><b>起手第一件事(记基线):</b><pre><span class="c"># 记录当前 baseline pass 数,后续每 phase 不得低于它</span>
+cargo test --workspace --locked --no-fail-fast --exclude ccteam-web 2>&1 | <span class="b">awk</span> '/^test result/{p+=$4}END{print "BASELINE_PASS="p}'</pre></div>
+
+  <!-- ===== P0 ===== -->
+  <div class="phase now">
+    <div class="h"><div class="n">P0</div><div class="t">改名 mux → harness(低风险热身)</div><div class="tag">v8.1</div></div>
+    <div class="body">
+      <div class="lbl">改动</div>
+      <ul>
+        <li>crate <code class="inl">ccteam-mux</code> → <code class="inl">ccteam-harness</code>(Cargo.toml name + workspace 成员 + 所有 <code class="inl">.workspace = true</code> 引用 + <code class="inl">use ccteam_mux</code>)。</li>
+        <li>trait <code class="inl">MuxBackend</code> → <code class="inl">ProcessBackend</code>;<code class="inl">TmuxBackend</code>/<code class="inl">InProcBackend</code>/<code class="inl">RmuxBackend</code> 名保留(tmux 名副其实)。</li>
+        <li>把 tmux 专属方法(<code class="inl">pane_pid</code>/<code class="inl">resize</code> 等)从 trait 下沉到 <code class="inl">TmuxBackend</code> impl,trait 只留通用(spawn/exists/is_alive/io/subscribe)。</li>
+      </ul>
+      <div class="lbl v">✅ 验收</div>
+<pre><span class="g">cargo build --workspace</span>                                   <span class="c"># 通过</span>
+<span class="r">!</span> grep -rn 'ccteam-mux\|ccteam_mux\|MuxBackend' crates/      <span class="c"># 0 命中</span>
+cargo test --workspace --locked --no-fail-fast --exclude ccteam-web   <span class="c"># pass ≥ BASELINE_PASS</span></pre>
+      <div class="acc"><span class="done">DONE WHEN</span> build 过 · grep 0 命中 · 不退步 baseline。</div>
+    </div>
+  </div>
+
+  <!-- ===== P1 ===== -->
+  <div class="phase now">
+    <div class="h"><div class="n">P1</div><div class="t">从 fat core 抽出执行层 + 钉抽象边界</div><div class="tag">v8.1</div></div>
+    <div class="body">
+      <div class="lbl">改动</div>
+      <ul>
+        <li>把 <code class="inl">harness.rs</code> + <code class="inl">execution/</code>(ClaudeTui/CodexExec/CodexAppServer adapter、transcript_tail、turns_mirror…)从 <code class="inl">ccteam-core</code> 移进 <code class="inl">ccteam-harness</code>。</li>
+        <li>定义/确认 4 个抽象边界类型:<code class="inl">HarnessAdapter</code>、<code class="inl">ProcessBackend</code>、<code class="inl">CanonicalEvent</code>(中立事件枚举)、<code class="inl">ApprovalIR</code>(只定义类型,v8.1 不产出/不消费)。</li>
+        <li><code class="inl">ccteam-imd</code> → 改名 <code class="inl">ccteam-im</code>,依赖改成 <code class="inl">harness + cost + core(primitives)</code>,<b>不</b>依赖 orchestrator。</li>
+        <li><b>orchestrator/artifact_watcher/workflow 必须移出 core → 新 crate <code class="inl">ccteam-flow</code></b>(否则 im 依赖 core 会把引擎一起编译进来);<code class="inl">ccteam-core</code> 瘦成 primitives-only。<code class="inl">ccteam-im</code> 依赖 <code class="inl">harness + core(primitives) + cost</code>,<b>不</b>依赖 <code class="inl">ccteam-flow</code>。</li>
+      </ul>
+      <div class="lbl v">✅ 验收</div>
+<pre><span class="g">cargo build --workspace</span>
+cargo tree -p ccteam-im 2>/dev/null | grep -i 'ccteam-flow'   <span class="c"># 期望:空(orchestrator 是 core 里的模块,不是 crate;</span>
+                                                             <span class="c"># 所以 gate 是:引擎已移到 ccteam-flow 且 im 不依赖它)</span>
+grep -n 'pub mod orchestrator' crates/ccteam-core/src/lib.rs <span class="c"># 期望:空(引擎已移出 core)</span>
+cargo build -p ccteam-harness                                <span class="c"># 执行层独立编译</span>
+cargo test --workspace --locked --no-fail-fast --exclude ccteam-web   <span class="c"># pass ≥ BASELINE_PASS</span></pre>
+      <div class="acc"><span class="done">DONE WHEN</span> ccteam-im 依赖树<b>不含编排</b> · harness 独立编译 · 不退步 baseline。这是「IM 不带编排先发」成立的硬证据。</div>
+    </div>
+  </div>
+
+  <!-- ===== P2 ===== -->
+  <div class="phase now">
+    <div class="h"><div class="n">P2</div><div class="t">Claude adapter(tmux · skip-perms · 出 CanonicalEvent)</div><div class="tag">v8.1</div></div>
+    <div class="body">
+      <div class="lbl">改动</div>
+      <ul>
+        <li><code class="inl">ClaudeTuiAdapter</code> 实现 <code class="inl">HarnessAdapter</code> on <code class="inl">TmuxBackend</code>:起 <code class="inl">claude --agent &lt;role&gt; --name &lt;sess&gt; --dangerously-skip-permissions</code>;输入 <code class="inl">send-keys -l</code> + Enter(含 /compact /clear 透传);输出 transcript-tail + chat-progress hook → <code class="inl">CanonicalEvent</code>。</li>
+        <li><code class="inl">resume_thread</code>(按 session-id 续接);空闲释放。<b>不</b>做批准。</li>
+      </ul>
+      <div class="lbl v">✅ 验收(确定性 fake,可 CI)</div>
+<pre><span class="c"># 复用现有 fake 基建:CCTEAM_CLAUDE_BIN 已被 ccteam-core 测试广泛用;</span>
+<span class="c"># 现有 claude_tui_test.rs / claude_tui_resume_test.rs / harness_trait_test.rs 是基底,随 harness 一起搬过来并扩</span>
+CCTEAM_CLAUDE_BIN=&lt;stub stream-json emitter&gt; \
+  <span class="g">cargo test -p ccteam-harness claude_tui</span>
+<span class="c"># 断言:start_thread → submit_turn("hi") → AssistantDelta/ToolCall/TurnCompleted 序列;resume_thread(sid) 续上</span></pre>
+      <div class="acc"><span class="done">DONE WHEN</span> <code class="inl">cargo test -p ccteam-harness claude_tui</code> 绿:fake 驱动下 submit_turn 产出正确 CanonicalEvent 序列 + resume 成功。</div>
+    </div>
+  </div>
+
+  <!-- ===== P3 ===== -->
+  <div class="phase now">
+    <div class="h"><div class="n">P3</div><div class="t">Codex adapter(app-server · 出 CanonicalEvent + 命令 RPC)</div><div class="tag">v8.1</div></div>
+    <div class="body">
+      <div class="lbl">改动</div>
+      <ul>
+        <li><code class="inl">CodexAppServerAdapter</code> 实现 <code class="inl">HarnessAdapter</code>:spawn <code class="inl">codex app-server</code>(UDS/WS)+ JSON-RPC <code class="inl">thread/start</code> / <code class="inl">turn/start</code> / <code class="inl">turn/steer</code> → <code class="inl">CanonicalEvent</code>;skip-perms(approval-policy 关或 yolo)。</li>
+        <li><code class="inl">invoke_command</code> 映射:/compact → <code class="inl">thread/compact/start</code>、/review → <code class="inl">review/start</code>;<code class="inl">resume_thread</code> → <code class="inl">thread/resume</code>。</li>
+      </ul>
+      <div class="lbl v">✅ 验收(fake app-server)</div>
+<pre><span class="c"># 复用现有 CCTEAM_CODEX_BIN fake(codex_exec_wave3_test.rs 等已用);加一个 app-server stub(监听 UDS/WS、回固定 ServerNotification)</span>
+CCTEAM_CODEX_BIN=&lt;stub app-server&gt; \
+  <span class="g">cargo test -p ccteam-harness codex_app_server</span>
+<span class="c"># 断言:thread/start + turn/start → CanonicalEvent;invoke_command(/compact)=thread/compact/start 完成</span></pre>
+      <div class="acc"><span class="done">DONE WHEN</span> <code class="inl">cargo test -p ccteam-harness codex_app_server</code> 绿:turn 出事件 + /compact·/review RPC 成功。两 vendor 都产出<b>同一套</b> CanonicalEvent。</div>
+    </div>
+  </div>
+
+  <!-- ===== P4 ===== -->
+  <div class="phase now">
+    <div class="h"><div class="n">P4</div><div class="t">IM 网关:chat⇄project⇄session 路由 + Telegram</div><div class="tag">v8.1</div></div>
+    <div class="body">
+      <div class="lbl">改动</div>
+      <ul>
+        <li><code class="inl">ccteam-im</code>:<b>路由表</b>(chat,user,@bot ⇄ session)+ <b>session 注册表</b>(N 个 Handle,spawn-on-demand)+ ACL。inbound → 当前 session.submit_turn → outbound。</li>
+        <li>命令:<code class="inl">/use</code> 切 session、<code class="inl">/cd</code> 切 project、<code class="inl">/new &lt;vendor&gt; &lt;role&gt;</code> 起新 session、<code class="inl">/sessions</code> <code class="inl">/projects</code> 列;<code class="inl">@bot</code> 切 vendor。</li>
+        <li>Telegram transport 接 inbound/outbound(复用现有 transport;长连接先 in-proc,P5/未来再扛重启)。</li>
+      </ul>
+      <div class="lbl v">✅ 验收(fake transport + fake harness)</div>
+<pre><span class="g">cargo test -p ccteam-im gateway</span>
+<span class="c"># 断言:</span>
+<span class="c"># 1) 入站 "hi" → 当前 session 收到 submit_turn → 出站回显该 session 的 CanonicalEvent 文本</span>
+<span class="c"># 2) /new claude reviewer → 注册表 +1 且当前 session 切到它</span>
+<span class="c"># 3) /use &lt;other&gt; 改当前 session;后续消息进新的;/cd 切 project</span>
+<span class="c"># 4) 两个不同 chat 路由互不串(隔离)</span></pre>
+      <div class="acc"><span class="done">DONE WHEN</span> <code class="inl">cargo test -p ccteam-im gateway</code> 绿:路由 + 切换(use/cd/new) + 多 chat 隔离都通过。</div>
+    </div>
+  </div>
+
+  <!-- ===== P5 ===== -->
+  <div class="phase now">
+    <div class="h"><div class="n">P5</div><div class="t">上手(init + pair)+ 端到端 smoke</div><div class="tag">v8.1</div></div>
+    <div class="body">
+      <div class="lbl">改动</div>
+      <ul>
+        <li><code class="inl">ccteam init</code> 落 <code class="inl">&lt;project&gt;/.ccteam/</code>(agents/ skills/ state.json);<code class="inl">ccteam start</code> 起 daemon(im-gateway + MCP server + web server,同进程;<b>不</b> tick)。</li>
+        <li>bot token 配置 + <code class="inl">/pair &lt;code&gt;</code> → ACL allowlist;路由把该 chat 绑到 project/session。</li>
+        <li>写 <code class="inl">scripts/smoke-im.sh</code>(用 fake 二进制,端到端)。</li>
+        <li><b>e2e 模拟 IM 走 <code class="inl">Channel</code> seam、不分叉</b>:smoke 用已有的 <code class="inl">MockChannel</code>(push 入站 / 看 outbox)驱动整条 入站→路由→submit_turn→出站 —— 和生产同一条路。跨进程 / 将来 web chat 用 <code class="inl">WsChannel</code>(同一 Channel impl;浏览器 ⇄ WS ⇄ 网关,UI/WS 路由在 ccteam-web 复用 <code class="inl">pty_ws</code>,cli 层 mpsc 桥接、<b>保持 web⊥im</b>)。</li>
+      </ul>
+      <div class="lbl v">✅ 验收(端到端 smoke,exit 0)</div>
+<pre><span class="g">bash scripts/smoke-im.sh</span>   <span class="c"># 全程 fake claude/codex,断言每步</span>
+<span class="c"># 步骤:init → start(后台)→ 模拟 /pair → 发 "hi" → 断言收到回复</span>
+<span class="c">#       → /new codex api → 发 "ping" → 断言 codex 回复</span>
+<span class="c">#       → 杀 daemon → 重启 → 同 chat 发消息 → 断言 resume 续上(非新 session)</span>
+<span class="c"># 可选真二进制 smoke(本地,有 claude/codex 时):scripts/smoke-im.sh --real</span></pre>
+      <div class="acc"><span class="done">DONE WHEN</span> <code class="inl">scripts/smoke-im.sh</code> exit 0:init→pair→收发(两 vendor)→重启 resume 全过。</div>
+    </div>
+  </div>
+
+  <!-- ===== P6 ===== -->
+  <div class="phase now">
+    <div class="h"><div class="n">P6</div><div class="t">收尾:质量门 + 文档</div><div class="tag">v8.1</div></div>
+    <div class="body">
+      <div class="lbl">改动</div>
+      <ul>
+        <li>清 clippy;<code class="inl">cargo fmt --all</code>;补/更新 doc(CLAUDE.md baseline、interfaces 若动了 schema)。</li>
+        <li>确认 skip-permissions 在所有 spawn 路径生效;<code class="inl">ApprovalIR</code> 类型留着但无实现(未来填)。</li>
+      </ul>
+      <div class="lbl v">✅ 验收(全绿门)</div>
+<pre><span class="g">cargo clippy --workspace --all-targets -- -D warnings</span>     <span class="c"># 0 warning</span>
+<span class="g">cargo fmt --all -- --check</span>                                <span class="c"># 干净</span>
+cargo test --workspace --locked --no-fail-fast --exclude ccteam-web   <span class="c"># pass ≥ BASELINE_PASS</span>
+<span class="g">bash scripts/smoke-im.sh</span>                                   <span class="c"># exit 0</span></pre>
+      <div class="acc"><span class="done">DONE WHEN</span> clippy 0 · fmt clean · baseline 不退 · smoke 绿。</div>
+    </div>
+  </div>
+
+  <h2 class="sec">总验收(全部完成的判据)</h2>
+  <div class="note good"><b>全绿即完成:</b>
+  <ul>
+    <li>P0–P6 每个 phase 的「✅ 验收」全过。</li>
+    <li><code class="inl">grep -rn 'ccteam-mux\|MuxBackend'</code> = 0;<code class="inl">cargo tree -p ccteam-im</code> 不含 orchestrator。</li>
+    <li><code class="inl">cargo test --workspace --exclude ccteam-web</code> ≥ BASELINE_PASS;clippy 0;fmt clean。</li>
+    <li><code class="inl">scripts/smoke-im.sh</code> exit 0:手机(fake IM)端能完整用 Claude(tmux)和 Codex(app-server)—— 收发、切 session/project、/compact·/review、重启 resume,全程 skip-permissions、无批准门。</li>
+  </ul></div>
+
+  <h2 class="sec">明确不在 v8.1(未来,接口已留)</h2>
+  <ul>
+    <li><b>手机批准</b> —— 留 <code class="inl">ApprovalIR</code> 类型,不实现;v8.1 全程 skip-permissions。</li>
+    <li><b>ccteam-flow 编排</b> —— 推后;v8.1 daemon 是网关、不 tick。</li>
+    <li><b>ccteam-bridge 跨机器</b> —— 留 <code class="inl">ProcessBackend</code> 的 Remote 位,不实现。</li>
+    <li><b>IM uplink 扛重启 / 多 vendor 广度(Gemini/Pi) / per-agent crate 拆分</b> —— 见 im.html「未来计划」。</li>
+    <li><b>多 provider 切换</b>(命名配置文件 <code class="inl">.claude/settings-&lt;p&gt;.json</code> via <code>--settings</code> / Codex <code>~/.codex</code> profile + 正交 <code class="inl">provider:</code> 轴)· <b>web chat</b>(浏览器 ⇄ WebSocket ⇄ 网关,复用 P5 e2e 的 <code class="inl">WsChannel</code>)—— 见 im.html「未来计划」⑤⑥。</li>
+  </ul>
+
+  <div class="note warn"><b>给执行者(/goal session)的提醒:</b> 这是真 ccteam 仓库的<b>重构 + 增量</b>,不是 greenfield —— 尽量复用现有 transport / tmux / app-server 代码,别另起炉灶。每 phase 先跑验收再推进;baseline 退步要先修。架构与术语以 <a href="im.html">im.html</a> 为准(harness × ProcessBackend 两轴、CanonicalEvent + ApprovalIR 中立模型、daemon=网关不 tick、chat⇄project⇄session 路由)。<br><b>P0/P1 前提已对当前 <code class="inl">crates/</code> 树核实(2026-05-31):</b> <code class="inl">ccteam-mux</code> crate + <code class="inl">trait MuxBackend</code> 存在(lib.rs:210);<code class="inl">ccteam-imd</code> 存在;<code class="inl">harness.rs</code>+<code class="inl">execution/</code> 在 <code class="inl">ccteam-core</code>;<code class="inl">ccteam-imd</code> 今天<b>已不 import orchestrator</b>(P1 可行);<code class="inl">CCTEAM_CLAUDE_BIN</code>/<code class="inl">CCTEAM_CODEX_BIN</code> fake 基建 + <code class="inl">claude_tui_*</code> 测试已存在(P2/P3 扩它们,别另造)。<br><b>版本号 "v8.1" 是本计划的标签</b>;仓库当前 baseline 是 v0.6.8/V0.8 线 —— 若你其实指 v0.8.1 或别的,告知即可一键替换,不影响计划内容。</div>
+</div>
+</body>
+</html>

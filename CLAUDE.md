@@ -7,7 +7,7 @@
 
 ## 〇、v0.8.2 / v8.2 当前架构红线
 
-本仓已落地 **v8.2「云 CC/Codex + IM」真实路径收敛**(版本号 `0.8.2`):设计源 `notes/im.html`,阶段交接 `notes/v8.2-progress.md`。**下文若仍有 V0.6.x / orchestrator-era 术语残留,以本节为准:**
+本仓已落地 **v8.2「云 CC/Codex + IM」真实路径收敛**(版本号 `0.8.2`):架构 SoT 是 `docs/tech-design.md` / `docs/interfaces.md` 与本文;UX/概念原型见 `docs/im.html` + `docs/plan.html`(其 crate 拓扑图有出入,以本节 + tech-design §3.1 的 `core→harness→cost` 为准)。**下文若仍有 V0.6.x / orchestrator-era 术语残留,以本节为准:**
 
 - **改名/重构已收敛**:`ccteam-mux`→`ccteam-harness`、`MuxBackend`→`ProcessBackend`、`ccteam-imd`→`ccteam-im`;orchestrator 从 `ccteam-core` 抽到 `ccteam-flow`(core 瘦成 primitives leaf)。拓扑保持 `core -> harness -> cost`,不要翻成 `harness -> core`。
 - **执行层两轴**:`HarnessAdapter`(vendor 怎么驱动:Claude=tmux+send-keys+transcript+hook;Codex=app-server JSON-RPC)× `ProcessBackend`(进程跑哪:tmux/inproc/remote);tmux pane 操作只属于 `PaneBackend` 子 trait。两 vendor 归一成中立 `CanonicalEvent` + `ApprovalIR`(**不**抄 alleycat 的 codex-emulation)。
@@ -20,7 +20,7 @@
 - **vendor 选型**:Claude→tmux(全 TUI + 耐久 + 已有);Codex→app-server(原生、文档化)。per-adapter best-fit,不强行统一。
 - **progress 写入权威**:`harness/progress_bridge` 是 schema 单一权威,`core` 只 re-export。
 
-> 验证优先用确定性 fake(`CCTEAM_{CLAUDE,CODEX}_BIN`)和真实 WS smoke;每 phase 不退 baseline。恢复时先读 `notes/v8.2-progress.md`,不要整篇重读 `notes/plan.html` / `notes/im.html`。
+> 验证优先用确定性 fake(`CCTEAM_{CLAUDE,CODEX}_BIN`)和真实 WS smoke;不退 baseline。起手/恢复先读本文 §一 + `docs/tech-design.md`(架构 SoT);`docs/im.html` / `docs/plan.html` 是 UX/概念原型,按需查,不必整篇重读。
 
 ---
 
