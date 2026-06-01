@@ -19,7 +19,7 @@
 //! 2. The stub adapter's `submit_turn` counter advances (proves the
 //!    supervisor inbox drain reached the harness layer).
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -449,24 +449,56 @@ async fn daemon_routes_gateway_inbound_to_submit_turn_and_outbound() {
 
     let outbox = mock.outbox().await;
     let contents: Vec<String> = outbox.into_iter().map(|m| m.content).collect();
+    let mut content_counts: BTreeMap<String, usize> = BTreeMap::new();
+    for content in contents {
+        *content_counts.entry(content).or_default() += 1;
+    }
+    assert_eq!(content_counts.len(), 3);
+    assert_eq!(content_counts.get("created session s1"), Some(&1));
     assert_eq!(
-        contents,
-        vec![
-            "created session s1".to_string(),
-            "submitted s1 turn gateway-turn".to_string(),
-            "gateway echo: hello gateway".to_string()
-        ]
+        content_counts.get("submitted s1 turn gateway-turn"),
+        Some(&1)
     );
+    assert_eq!(content_counts.get("gateway echo: hello gateway"), Some(&1));
 
     let rows = read_durable_outbound_rows();
     assert_eq!(rows.len(), 6, "queued+sent rows per outbound message");
-    assert_eq!(rows[0]["state"], "queued");
-    assert_eq!(rows[1]["state"], "sent");
-    assert_eq!(rows[2]["state"], "queued");
-    assert_eq!(rows[3]["state"], "sent");
-    assert_eq!(rows[4]["state"], "queued");
-    assert_eq!(rows[5]["state"], "sent");
-    assert_eq!(rows[5]["message"]["content"], "gateway echo: hello gateway");
+    let mut state_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut rows_by_id: BTreeMap<String, Vec<(usize, String, String)>> = BTreeMap::new();
+    for (idx, row) in rows.iter().enumerate() {
+        let state = row["state"].as_str().unwrap().to_string();
+        let id = row["id"].as_str().unwrap().to_string();
+        let content = row["message"]["content"].as_str().unwrap().to_string();
+        *state_counts.entry(state.clone()).or_default() += 1;
+        rows_by_id
+            .entry(id)
+            .or_default()
+            .push((idx, state, content));
+    }
+    assert_eq!(state_counts.get("queued"), Some(&3));
+    assert_eq!(state_counts.get("sent"), Some(&3));
+    assert_eq!(rows_by_id.len(), 3, "one outbound id per message");
+    for (id, entries) in &rows_by_id {
+        assert_eq!(entries.len(), 2, "outbound id {id} must have queued+sent");
+        let queued = entries
+            .iter()
+            .find(|(_, state, _)| state == "queued")
+            .unwrap_or_else(|| panic!("outbound id {id} missing queued row"));
+        let sent = entries
+            .iter()
+            .find(|(_, state, _)| state == "sent")
+            .unwrap_or_else(|| panic!("outbound id {id} missing sent row"));
+        assert!(
+            queued.0 < sent.0,
+            "outbound id {id} must queue before sent marker"
+        );
+        assert_eq!(queued.2, sent.2, "outbound id {id} content drifted");
+    }
+    assert!(rows_by_id.values().any(|entries| {
+        entries
+            .iter()
+            .any(|(_, state, content)| state == "sent" && content == "gateway echo: hello gateway")
+    }));
 }
 
 #[allow(clippy::await_holding_lock)]
