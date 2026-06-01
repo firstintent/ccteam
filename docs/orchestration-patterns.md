@@ -2,11 +2,15 @@
 audience: contributors
 ---
 
-# 编排模式 —— 拆分哲学 + 5 模式目录(ccteam 设计依据)
+# 编排模式 —— 拆分哲学 + 5 模式目录(ccteam-flow 设计依据)
+
+> ⚠️ **本文是 `ccteam-flow` 编排层(推后,未接入当前运行态)的模式设计。**
+> 当前产品是 **IM⇄session 路由网关 daemon**(`ccteam start`):它**不跑编排 tick、无 orchestrator 循环**,由用户在 IM 里手动驱动多个 session(见 [tech-design.md](tech-design.md) §2 / [user-manual.md](user-manual.md))。
+> 自动多 agent 编排住在独立 crate `ccteam-flow`,**已构建但未接进运行中的 gateway daemon**(见 [tech-design.md](tech-design.md) §7)。本文记录该编排层的模式设计与红线,供其落地时不退基线 —— **不要**把下文当成当前 daemon 的运行方式。
 
 > **角色**:tier-1 全局文档,**面向 contributor**(ccteam 维护者 / 新 workflow 设计者)。日常**用户**用 ccteam 不需要读本文 —— 用户面入口是 [task-to-command.md](task-to-command.md)(决策树)+ [quickstart.md](quickstart.md) + [user-manual.md](user-manual.md)。
 >
-> ccteam 后续所有 workflow 设计、agent 拓扑、自动化迭代**都基于本文的 5 模式 + 拆分哲学**;新加 workflow 模板 / 重做 fix-loop / 拓展非编程领域 team 都先回到本文校准。
+> 编排层点亮后,所有 workflow 设计、agent 拓扑、自动化迭代**都基于本文的 5 模式 + 拆分哲学**;新加 workflow 模板 / 重做 fix-loop / 拓展非编程领域 team 都先回到本文校准。
 >
 > **回答两个核心问题**:
 > 1. **什么时候该拆 agent?**(§一 设计哲学 — "按上下文拆,不按角色拆")
@@ -14,16 +18,16 @@ audience: contributors
 >
 > **资料来源**:
 > - Anthropic Engineering Blog *"Building Effective Agents"*(canonical 5-pattern taxonomy)
-> - 大模型大鱼 2026-05《如何设计 Multi-Agent》+《超有用的 5 种编排模式》短文
+> - 大模型大鱼《如何设计 Multi-Agent》+《超有用的 5 种编排模式》短文
 > - 配套研究:`research/omc-orchestration-modes.md`(OMC 8 mode 深拆)+ `research/omc-vs-ccteam-orchestration.md`(prompt-as-orchestrator vs code-as-orchestrator 路线对比)
 >
 > **跟其他全局文档的关系**:
-> - `requirements.md` 给"用户痛点 + V1.0.0 终极目标"
+> - `requirements.md` 给"用户痛点 + 终极目标"
 > - **本文给"模式选型字典"** — 解决"该痛点应该用哪种编排模式"
-> - `tech-design.md` 给"ccteam 当前架构 = workflow.yaml + ArtifactWatcher + thin orchestrator"作为承载层
+> - `tech-design.md` §7 给编排层承载形态 = `ccteam-flow::Orchestrator` + `ArtifactWatcher` + `WorkflowSpec`(workflow.yaml)—— **推后**,不接进当前运行态
 > - `interfaces.md` 给"workflow.yaml schema / Trigger / parallelism" 等具体协议
 >
-> ccteam 加新 finding / 新 team / 新 workflow 时:**先回本文识别走哪条模式**,再到 tech-design / interfaces 找具体怎么写。
+> 编排层落地、加新 team / 新 workflow 时:**先回本文识别走哪条模式**,再到 tech-design §7 / interfaces 找具体怎么写。
 
 ---
 
@@ -65,19 +69,19 @@ audience: contributors
 - Claude Code 默认 1M context,**单 agent 装得下的边界比想象大**
 - phase 边界 reset / context compact 会丢决策依据 — OMC 的 `.omc/handoffs/<stage>.md` 是为这个痛点贴的创可贴;**一开始按"重叠原则"少拆,handoff 本身就少**
 - Subagent / Task() 调用本身有启动成本(prompt 重新 brief),拆得越细,这部分越烧
-- ccteam 架构红线:文件系统是控制平面、`progress.jsonl` SoT —— 拆 agent 就要新增 trigger / artifact / event,**拆是有成本的,不要 default 拆**
+- 编排层架构红线:文件系统是控制平面、`progress.jsonl` SoT —— 拆 agent 就要新增 trigger / artifact / event,**拆是有成本的,不要 default 拆**
 
-### 1.5 大型代码库:`scope` 切口 + explorer→artifact→editor(V0.6.2)
+### 1.5 大型代码库:`scope` 切口 + explorer→artifact→editor
 
-**分层认知**:ccteam 是 outer harness,底层 Claude Code / Codex 是 inner harness。Anthropic《How Claude Code works in large codebases》整篇讲的是 **inner harness**(CLAUDE.md / hooks / skills / plugins / LSP / within-session subagent)—— 那是项目仓库 + Claude Code 自己的职责,**ccteam 不重复造**。ccteam 唯一不可替代的价值,是 inner harness 结构上看不见的东西:**拓扑**。
+**分层认知**:ccteam 是 outer harness,底层 Claude Code / Codex 是 inner harness。Anthropic《How Claude Code works in large codebases》整篇讲的是 **inner harness**(CLAUDE.md / hooks / skills / plugins / LSP / within-session subagent)—— 那是项目仓库 + Claude Code 自己的职责,**编排层不重复造**。编排层不可替代的价值,是 inner harness 结构上看不见的东西:**拓扑**。
 
-**那篇文章对 ccteam 的唯一真空白**:文章压在一句 —— "Claude 的能力 = 找到正确 context 的能力;太多则退化,太少则盲目"。inner harness 管的是单 agent 窗口内的 context;ccteam 管的是**跨 agent 的 context —— 靠切口**。ccteam 红线 R3"每次 spawn = fresh 1M context"给的是干净窗口,但 **fresh ≠ scoped**:一个干净的 1M 窗口对着百万行的仓库根,光"找路"就烧穿预算。R3 给干净窗口,scoping 给一个小的东西去看 —— ccteam 有前者,V0.6.2 前缺后者。
+**那篇文章对 ccteam 的唯一真空白**:文章压在一句 —— "Claude 的能力 = 找到正确 context 的能力;太多则退化,太少则盲目"。inner harness 管的是单 agent 窗口内的 context;编排层管的是**跨 agent 的 context —— 靠切口**。红线 R4"每次 spawn = fresh 1M context"给的是干净窗口,但 **fresh ≠ scoped**:一个干净的 1M 窗口对着百万行的仓库根,光"找路"就烧穿预算。R4 给干净窗口,scoping 给一个小的东西去看 —— 编排层需要把两者都给齐。
 
 落地是**一条代码 + 一个模板**:
 
-1. **`scope` 切口(代码)** —— `AgentSpec.scope`(`docs/interfaces.md` §17.2)把每次 spawn 的 cwd 钉到与该 role 相关的子树。这是**纯拓扑决策**:inner harness 只看见自己一个 session,结构上做不到;只有 spawn 多 agent 的这层能给每个 agent 定切口。Claude Code 仍自动向上 walk 目录树、加载沿途 `CLAUDE.md`,root context 不丢。
+1. **`scope` 切口(代码)** —— `AgentSpec.scope`(`docs/interfaces.md` §17.2)把每次 spawn 的 cwd 钉到与该 role 相关的子树。这是**纯拓扑决策**:inner harness 只看见自己一个 session,结构上做不到;只有 spawn 多 agent 的编排层能给每个 agent 定切口。Claude Code 仍自动向上 walk 目录树、加载沿途 `CLAUDE.md`,root context 不丢。
 
-2. **explorer→artifact→editor(模板)** —— 文章把 subagent 列为对抗 context 约束的核武器:"read-only subagent 画子系统地图、findings 落文件,主 agent 拿全图再编辑"。**这正是 ccteam 的 artifact-driven 拓扑**:explorer role(read-only、宽 scope)→ 写 codebase-map artifact → editor role(窄 scope)trigger 在该 artifact 上消费。ccteam 天生就是这条 subagent 建议的多-agent 泛化版。大代码库的 workflow 默认就该是这个切分,而**不是一个胖 agent 端到端**。
+2. **explorer→artifact→editor(模板)** —— 文章把 subagent 列为对抗 context 约束的核武器:"read-only subagent 画子系统地图、findings 落文件,主 agent 拿全图再编辑"。**这正是编排层的 artifact-driven 拓扑**:explorer role(read-only、宽 scope)→ 写 codebase-map artifact → editor role(窄 scope)trigger 在该 artifact 上消费。编排层天生就是这条 subagent 建议的多-agent 泛化版。大代码库的 workflow 默认就该是这个切分,而**不是一个胖 agent 端到端**。
 
 ```yaml
 # 大代码库模板:explorer 画图 → editor 按图改(各锁 scope)
@@ -93,13 +97,13 @@ agents:
     input: .ccteam/maps
 ```
 
-**克制(不吸收的)**:文章关于 CLAUDE.md 内容生成 / LSP / `permissions.deny` / 结构化搜索 MCP 的建议,ccteam 一律不吸收 —— 那些是 inner harness / 项目仓库的职责;ccteam 代笔 `CLAUDE.md` 内容还会撞"no prompt injection"红线。ccteam 顶多在 `ccteam doctor` 里**提示**缺失,不**拥有**。
+**克制(不吸收的)**:文章关于 CLAUDE.md 内容生成 / LSP / `permissions.deny` / 结构化搜索 MCP 的建议,编排层一律不吸收 —— 那些是 inner harness / 项目仓库的职责;代笔 `CLAUDE.md` 内容还会撞"no prompt injection"红线。编排层顶多在 `ccteam doctor` 里**提示**缺失,不**拥有**。
 
 ---
 
 ## 二、五种编排模式 —— 在 Claude Code 上的具体形态
 
-下表 5 种模式来自 Anthropic "Building Effective Agents" canonical taxonomy(也是上文短文 §2 列的 5 种)。本节把每种模式映射到 **Claude Code 原语 + OMC 落地 + ccteam 落地**。
+下表 5 种模式来自 Anthropic "Building Effective Agents" canonical taxonomy(也是上文短文 §2 列的 5 种)。本节把每种模式映射到 **Claude Code 原语 + OMC 落地 + 编排层(ccteam-flow)落地**。
 
 ### 2.1 Prompt Chaining(链式调用)
 
@@ -109,7 +113,7 @@ agents:
   - 主 agent 在 conversation turn 里依次 spawn `Task(subagent_type=...)` —— 串行,等结果再 spawn 下一个
   - 文件 / artifact 接力:agent B 的 trigger 是 agent A 写的 artifact
 - **OMC 落地**:`team-plan → team-prd → team-exec → team-verify → team-fix` 是 staged chaining;每 stage 间写 `.omc/handoffs/<stage>.md`(10-20 行,decisions/rejected/risks/files/remaining)避免 context compact 丢决策
-- **ccteam 落地**:`workflow.yaml` 中 `triggers: [artifact_received:<path>]` 编织成有向边;orchestrator 按 artifact 顺序 spawn 后继 agent
+- **编排层落地**:`workflow.yaml` 中 `trigger: watch:<path>` 把 agent 编织成有向边;`ccteam-flow::Orchestrator` 按 artifact 顺序 spawn 后继 agent
 - **何时用**:有严格 quality gate(plan 不过不能 exec)、产出可序列化为文件(plan.md / spec.md)、不需要并发
 
 ### 2.2 Routing(意图路由)
@@ -124,7 +128,7 @@ agents:
   - `role-router.ts`(role + cost mode + provider availability → 具体 provider/model tier)
   - **resolved routing snapshot** 模式:`TeamCreate` 时一次性解析并冻结,运行时不重读 yaml — 保证 stickiness
   - Cost 降级:opus → sonnet → haiku;`team-verify` 强约束 ≥ sonnet
-- **ccteam 落地**:`workflow.yaml` 的 `agents.<name>.role` 是**静态路由**(写死);动态路由目前只能靠 meta-agent 在对话里临时调度
+- **编排层落地**:`workflow.yaml` 的 `agents.<name>.role` 是**静态路由**(写死);动态路由由 meta-agent 在对话里临时调度承载
 - **何时用**:任务复杂度悬殊大、有不同特长 agent、想分级别省钱
 
 ### 2.3 Parallelization(并行化)
@@ -135,7 +139,7 @@ agents:
 
 - **Claude Code 原语**:主 agent 同一 turn 内多个 `Task()` call 并发 spawn,prompt 相同(或微扰),结果合成
 - **OMC 落地**:`ccg`(Claude-Codex-Gemini tri-model advisor)是这个的极致 — 把同一问题拆成 codex 侧重 + gemini 侧重两个 advisor prompt,并行调,Claude 合成"双方同意 / 冲突 / 选谁 + 为啥"
-- **ccteam 落地**:**目前缺**。`workflow.yaml` 表达不了"同 prompt fork N 次然后合成"语义
+- **编排层落地**:**待补语法** —— `workflow.yaml` 当前 schema 表达不了"同 prompt fork N 次然后合成",这是编排层的设计目标(见 §五 fan-out)
 - **何时用**:质量优先、单 LLM 一次生成不靠谱、需要"多视角"保险
 
 #### 2.3.2 分段(独立子任务同时推)
@@ -144,7 +148,7 @@ agents:
 - **OMC 落地**:
   - `ultrawork`(并行执行引擎,非独立 mode,被 ralph / autopilot 嵌套调用)— "fire N 个 Task() 不等"
   - `git-worktree.ts` 给每个 worker 独立 worktree(`omc-team/<team>/<worker>` 分支),避免共享文件树冲突
-- **ccteam 落地**:`workflow.yaml` `parallelism: N` 字段;Rust orchestrator 按 artifact event 触发独立 agent
+- **编排层落地**:`workflow.yaml` `parallelism: N` 字段;`ccteam-flow::Orchestrator` 按 artifact event 触发独立 agent
 - **何时用**:子任务真独立、墙钟时间是瓶颈、文件系统冲突可隔离(worktree)
 
 > **共同陷阱**:LLM 经常把可并行的任务串行跑(spawn 一个等结果再 spawn 下一个)。这是反模式 — 必须显式在同一 turn 多 Task() 调用。OMC 的 ultrawork SKILL.md 反复强调这点。
@@ -152,14 +156,14 @@ agents:
 ### 2.4 Orchestrator-Worker(编排者-执行者)
 
 - **定义**:一个主 Agent 负责拆任务、派活、收结果。**最主流的架构**,Sub-agents 和 Agent Teams 在生产环境的默认形态。
-- **Claude Code 原语**:`TeamCreate` + `TaskCreate` × N + `Task(subagent_type, team_name, name)` × N + `SendMessage` + `TaskList` 轮询(Claude Code v4 引入的 native team tools)
+- **Claude Code 原语**:`TeamCreate` + `TaskCreate` × N + `Task(subagent_type, team_name, name)` × N + `SendMessage` + `TaskList` 轮询(Claude Code native team tools)
 - **两条实现路线**(深度对比见 `omc-vs-ccteam-orchestration.md`):
   - **prompt-as-orchestrator(LLM-driven)**:主 agent 自己读 SKILL.md 当剧本,LLM 推理控制流。OMC 路线。强:灵活、低实施成本、单 chat 内可看可改。弱:每次决策烧 lead session token、非决定论、context compact 后丢状态
-  - **code-as-orchestrator(deterministic)**:外置进程(Rust binary 等)读 workflow.yaml + watch artifact,**LLM 不在控制平面**。ccteam 路线。强:决定论、可测、长跑无状态、低 token。弱:用户得先写 workflow.yaml、灵活度低
+  - **code-as-orchestrator(deterministic)**:外置进程(Rust binary 等)读 workflow.yaml + watch artifact,**LLM 不在控制平面**。编排层路线。强:决定论、可测、长跑无状态、低 token。弱:用户得先写 workflow.yaml、灵活度低
 - **OMC 落地**:`skills/team/SKILL.md` 1040 行 + `src/team/` 20 kLOC substrate;control flow 100% 在 SKILL.md(LLM 在 conversation turn 里推理)
-- **ccteam 落地**:`crates/ccteam-core` Rust orchestrator + `workflow.yaml` 声明 + `progress.jsonl` SoT;control flow 100% 在 Rust 代码
-- **何时用**:任务大、子任务多、要长跑(选 ccteam 路线)/ 要快速迭代多 provider hybrid(选 OMC 路线)
-- **V0.6.3 F145 squad 路由(artifact-driven 模式的细化,非新 mode)**:workflow.yaml 顶层 `squad: { leader, members, hop_limit }` 块让 orchestrator-worker 的 worker 选择从**静态接线**(只能写死的 `output:` 目录)扩到**运行时 dispatch**(leader 写 `<member>--*.md` 进 `.ccteam/squad/`,ArtifactWatcher 按文件名前缀 spawn 对应 member)。同一条 artifact-as-control-plane 红线 + 同样的 code-as-orchestrator 形态;`members:` 静态声明保证拓扑可审计、不开 prompt-injection 面;`hop_limit`(默认 3)按 R7 红线发 `escalation` 事件兜底 routing 回路。**不是第 6 种 mode** —— 是 Orchestrator-Worker 在 ccteam 上的「动态 dispatch」分支。
+- **编排层落地**:`crates/ccteam-flow` Rust orchestrator + `workflow.yaml` 声明 + `progress.jsonl` SoT;control flow 100% 在 Rust 代码
+- **何时用**:任务大、子任务多、要长跑(选 code-as-orchestrator 路线)/ 要快速迭代多 provider hybrid(选 OMC 路线)
+- **squad 路由(artifact-driven 模式的细化,非新 mode)**:workflow.yaml 顶层 `squad: { leader, members, hop_limit }` 块让 orchestrator-worker 的 worker 选择从**静态接线**(只能写死的 `output:` 目录)扩到**运行时 dispatch**(leader 写 `<member>--*.md` 进 `.ccteam/squad/`,ArtifactWatcher 按文件名前缀 spawn 对应 member)。同一条 artifact-as-control-plane 红线 + 同样的 code-as-orchestrator 形态;`members:` 静态声明保证拓扑可审计、不开 prompt-injection 面;`hop_limit`(默认 3)按 R7 红线发 `escalation` 事件兜底 routing 回路。**不是第 6 种 mode** —— 是 Orchestrator-Worker 在编排层上的「动态 dispatch」分支。
 
 ### 2.5 Evaluator-Optimizer(生成-评估循环)
 
@@ -171,7 +175,7 @@ agents:
   - `team-verify → team-fix → team-verify` loop(`max_fix_loops: 3`)
   - `autopilot` Phase 4:三个独立 reviewer 并行(architect / security-reviewer / code-reviewer),**全 approve 才算过**
   - `ralph` reviewer verification(默认 architect,可 `--critic=critic` 或 `--critic=codex`)+ 强制 `ai-slop-cleaner` deslop pass + post-deslop regression test
-- **ccteam 落地**:`workflow.yaml` `budget.fix_loop_attempts` + `escalation` event;Rust orchestrator 物理执行 cap(LLM 不能绕过)
+- **编排层落地**:`workflow.yaml` `budget.fix_loop_attempts` + `escalation` event;`ccteam-flow::Orchestrator` 物理执行 cap(LLM 不能绕过)
 - **关键架构红线**(CLAUDE.md §三):**fix-loop 撞 3 次顶必 escalate,绝不静默重置**。Evaluator-Optimizer 没有 hard cap 就是死循环烧钱机
 - **次要风险:"polite-stop anti-pattern"**:OMC ralph SKILL.md 反复警告 lead 在 reviewer APPROVED 后不要"礼貌停手";Claude 有"任务完成就停"的强 prior。**hook + system reminder 是技术抗体**,prompt 自律不够
 - **何时用**:质量优先、人工 review 太贵、有可机器评估的标准(test pass / lint clean / build green)
@@ -180,13 +184,13 @@ agents:
 
 ## 三、Claude Code 原语速查表
 
-| 模式 | Claude Code native 原语 | OMC 落地 | ccteam 落地 |
+| 模式 | Claude Code native 原语 | OMC 落地 | 编排层(ccteam-flow)落地 |
 |---|---|---|---|
 | Chaining | `Task` subagent 串行 + artifact 接力 | `team-plan → team-prd → ...` + handoffs.md | `workflow.yaml` artifact 边 |
 | Routing | LLM 推理 `subagent_type` / Skill 内置路由表 | `role-router` + `stage-router` + resolved snapshot | meta-agent 选 role(静态) |
-| Parallel (vote) | 多 `Task` 同 turn fork 同 prompt | `ccg`(codex + gemini + Claude 合成) | **缺**(可加 `fan_out: { count, merge: vote }` 语法) |
+| Parallel (vote) | 多 `Task` 同 turn fork 同 prompt | `ccg`(codex + gemini + Claude 合成) | **待补语法**(`fan_out: { count, merge: vote }`) |
 | Parallel (segment) | 多 `Task` 同 turn 不同 prompt + worktree 隔离 | `ultrawork` + `git-worktree.ts` | `workflow.yaml` `parallelism: N` |
-| Orchestrator-Worker | `TeamCreate` + `TaskCreate` × N + `Task(team_name, name)` × N | `skills/team/SKILL.md` 1040 行(prompt-as-orchestrator) | Rust orchestrator + `workflow.yaml`(code-as-orchestrator) |
+| Orchestrator-Worker | `TeamCreate` + `TaskCreate` × N + `Task(team_name, name)` × N | `skills/team/SKILL.md` 1040 行(prompt-as-orchestrator) | `ccteam-flow` orchestrator + `workflow.yaml`(code-as-orchestrator) |
 | Evaluator-Optimizer | `Task(reviewer)` + 循环 + hook 抗 polite-stop | `team-verify/fix` loop + `ralph` PRD reviewer + `autopilot` Phase 4 三 reviewer 并行 | `budget.fix_loop_attempts` + `escalation` event(Rust hard cap) |
 
 ---
@@ -235,33 +239,33 @@ autopilot (lifecycle, 整体 = Orchestrator-Worker)
 
 OMC `skills/cancel/SKILL.md` **387 行**管所有 mode 状态清理 — 每加一个 mode,cancel 涨一段。这是**复杂度税**:模式越多、composition 越自由,cancel/resume 路径越爆炸。
 
-ccteam 的对策(架构红线):**所有 state 进 `progress.jsonl` 一种文件**,cancel 只动一种东西。代价:模式表达力受限,**用一致性换可维护性**。
+编排层的对策(架构红线):**所有 state 进 `progress.jsonl` 一种文件**,cancel 只动一种东西。代价:模式表达力受限,**用一致性换可维护性**。
 
 ---
 
-## 五、ccteam 对 5 模式的承载现状 + 后续迭代方向
+## 五、编排层如何表达 5 模式 + 设计目标
 
-V0.4.6 ccteam 通过 `workflow.yaml` + Trigger 4 类 + parallelism 字段承载 5 模式如下;**缺口即下个版本设计输入**:
+编排层通过 `workflow.yaml` + Trigger 4 类 + parallelism 字段表达 5 模式如下;**未补齐的语法即编排层的设计目标**:
 
-| 模式 | V0.4.6 承载 | 缺口 → 下版本设计输入 |
+| 模式 | 编排层如何表达 | 设计目标(待补语法) |
 |---|---|---|
 | **Chaining** | `Trigger::Watch(<dir>)` 接力 + artifact 文件 = 串行管道 | ✅ 充分,无需改 |
-| **Routing** | 静态:`workflow.yaml` 写死 role;动态 dispatch:V0.6.3 F145 `squad: { leader, members, hop_limit }` —— leader 运行时挑 member,membership 仍静态;动态 spawn:meta-agent + MCP `spawn_agent` 临时调度 | **仍缺 LLM-driven router sugar**:`agent.router: <expr>` 让 orchestrator 解析后 LLM 推理选 agent(F143 是声明集合内的 leader dispatch,不替代任意 expr 路由) |
+| **Routing** | 静态:`workflow.yaml` 写死 role;运行时 dispatch:`squad: { leader, members, hop_limit }` —— leader 运行时挑 member,membership 仍静态;动态 spawn:meta-agent + MCP `spawn_agent` 临时调度 | **仍缺 LLM-driven router sugar**:`agent.router: <expr>` 让 orchestrator 解析后 LLM 推理选 agent(squad 是声明集合内的 leader dispatch,不替代任意 expr 路由) |
 | **Parallelization (segment)** | `agent.parallelism: u32` + `Trigger::Watch(<dir>)` fan-out = 多文件并行 | ✅ 充分(每个新 artifact 触发独立 session) |
-| **Parallelization (vote)** | **完全缺失** | 加 `agent.fan_out: { count: 3, merge: vote\|best\|concat }` 语法 — 同 prompt fork N 个,merge 策略由 orchestrator 实现 |
-| **Orchestrator-Worker** | meta-agent + 17 MCP `mcp__ccteam__*` 工具 = orchestrator 层;workflow.yaml 各 agent = worker 层 | ✅ 充分,这是 ccteam 主流形态 |
+| **Parallelization (vote)** | **当前 schema 未表达** | 加 `agent.fan_out: { count: 3, merge: vote\|best\|concat }` 语法 — 同 prompt fork N 个,merge 策略由 orchestrator 实现 |
+| **Orchestrator-Worker** | meta-agent + `mcp__ccteam__*` 工具 = orchestrator 层;workflow.yaml 各 agent = worker 层 | ✅ 充分,这是编排层主流形态 |
 | **Evaluator-Optimizer** | `fix_counts` 3-strike → escalation 是隐含的 evaluator-optimizer | **缺显式 sugar**:加 `agent.evaluates: <target>` + `max_iterations: N` + `on_max_exceeded: escalate\|accept` 让 reviewer 多轮可声明 |
 
-**两条横向迭代方向**:
+**两条横向设计方向**:
 
 1. **"按上下文拆"反推 `ccteam-creator` skill dialogue** — 用户写 workflow.yaml 容易按 role 直觉拆(planner / builder / tester / reviewer)。`ccteam-creator` skill 应在 dialogue 中强制走 §1.3 checklist:"两个 agent 间有多少信息重叠?"重叠 >50% 就合并 — 默认行为应是 monolithic agent + subagent 内 ad-hoc 拆,不是 workflow.yaml 切 N 个 role。
 
-2. **Composability**(ccteam 最弱) — 当前必须重写整个 workflow.yaml 才能复合两个模式。设计 `workflow.yaml::extends: <path>` + override 语法,让常见 composition(ralph-shell / vote-merger / evaluator-loop)模板化。OMC 的 `/team ralph` 一行命令复合两个模式是参考形态。
+2. **Composability**(编排层最弱) — 当前必须重写整个 workflow.yaml 才能复合两个模式。设计 `workflow.yaml::extends: <path>` + override 语法,让常见 composition(ralph-shell / vote-merger / evaluator-loop)模板化。OMC 的 `/team ralph` 一行命令复合两个模式是参考形态。
 
 **架构红线**(本文 §1.4 + §4.4 引申):
-- 5 模式可叠加但 state 必须收敛 — ccteam 所有 state 进 `progress.jsonl`,**绝不**为新模式开新 state 文件(OMC `cancel/SKILL.md` 387 行膨胀是反面教材)
-- Evaluator-Optimizer 必须 hard cap — `fix_counts` 3-strike escalation 是 V0.4.0 红线,任何新增 evaluator 模式遵守同样 cap
-- "按上下文拆"是 phase 删除(V0.4.0 F60)的根本论证 — workflow.yaml event-driven 才是更原生表达,不要走回头路
+- 5 模式可叠加但 state 必须收敛 — 编排层所有 state 进 `progress.jsonl`,**绝不**为新模式开新 state 文件(OMC `cancel/SKILL.md` 387 行膨胀是反面教材)
+- Evaluator-Optimizer 必须 hard cap — `fix_counts` 3-strike escalation 是架构红线,任何新增 evaluator 模式遵守同样 cap
+- "按上下文拆"是不引入 phase 概念的根本论证 — workflow.yaml event-driven 才是更原生表达,不要走回头路
 
 ---
 
@@ -272,7 +276,7 @@ V0.4.6 ccteam 通过 `workflow.yaml` + Trigger 4 类 + parallelism 字段承载 
 3. **Orchestrator-Worker 是主流;两条实现路线不是技术选择,是控制权位置选择** — prompt-as-orchestrator(灵活、token 贵、不决定论)vs code-as-orchestrator(决定论、长跑、低 token)。详对比见 `omc-vs-ccteam-orchestration.md`
 4. **Composability 比 mode 数量重要** — OMC 真正杀手锏是嵌套 + 接力 + 修饰符三种拼装,不是 8 个 mode 本身。设计新 mode 前先想:能不能用现有模式组合表达?
 5. **Evaluator-Optimizer 必须 hard cap** — Claude Code 架构红线:fix-loop 撞 3 次必 escalate,绝不静默重置。`polite-stop anti-pattern` 是真实风险,hook 抗体比 prompt 自律靠谱
-6. **State proliferation 是 composability 的隐藏成本** — OMC 387 行 cancel SKILL.md 是反面教材;ccteam 的"所有 state 进 progress.jsonl"红线是用一致性换可维护性
+6. **State proliferation 是 composability 的隐藏成本** — OMC 387 行 cancel SKILL.md 是反面教材;编排层的"所有 state 进 progress.jsonl"红线是用一致性换可维护性
 
 ---
 
@@ -285,12 +289,12 @@ V0.4.6 ccteam 通过 `workflow.yaml` + Trigger 4 类 + parallelism 字段承载 
 | Canonical 5-pattern 术语 | Anthropic Engineering Blog "Building Effective Agents"(2024-12) |
 | OMC 8 mode 全谱 + composability 三层 | [`research/omc-orchestration-modes.md`](research/omc-orchestration-modes.md) §一 §三 |
 | OMC vs ccteam 编排架构两条路线 | [`research/omc-vs-ccteam-orchestration.md`](research/omc-vs-ccteam-orchestration.md) §四 |
-| OMC team 7-phase pipeline + 5-stage routing 表 | `oh-my-claudecode@4.13.7` `skills/team/SKILL.md` |
+| OMC team 7-phase pipeline + 5-stage routing 表 | `oh-my-claudecode` `skills/team/SKILL.md` |
 | OMC `.omc/handoffs/<stage>.md` handoff 机制 | 同上 §"Stage Handoff Convention" |
 | `team ralph` composition(横切修饰符) | 同上 §"Team + Ralph Composition" |
 | OMC `ccg` vote / advisor 模式 | `skills/ccg/SKILL.md`(详 `omc-orchestration-modes.md` §2.3) |
 | OMC `ultrawork` parallel + worktree 隔离 | `skills/ultrawork/SKILL.md` + `src/team/git-worktree.ts` |
 | OMC `ralph` boulder-never-stops + polite-stop 抗体 | `skills/ralph/SKILL.md`(详 `omc-orchestration-modes.md` §2.6) |
-| ccteam workflow.yaml + Rust orchestrator | `CLAUDE.md §一` + `docs/versions/v0-4-0/README.md` |
+| ccteam-flow workflow.yaml + orchestrator | `CLAUDE.md §〇/§一` + `tech-design.md` §7 |
 | ccteam fix-loop hard cap 红线 | `CLAUDE.md §三` |
-| ccteam phase 删除决策 | `docs/versions/v0-4-0/prd.md` |
+| ccteam event-driven(非 phase)拓扑论证 | `CLAUDE.md §〇/§三` |
