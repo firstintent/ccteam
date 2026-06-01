@@ -274,10 +274,14 @@ enum Command {
         #[arg(long)]
         tail: bool,
     },
-    /// **DEPRECATED** in V0.4.6 (F89) — moved to `ccteam internal resume`.
-    ///
+    /// Pause auto-dispatch for one project. Sets `user_pause_pending`
+    /// so the workflow loop stops handing the project fresh work; never
+    /// kills the long-running session (CLAUDE.md §三 red line). Mirrors
+    /// the `mcp__ccteam__workflow_pause` tool — the documented
+    /// `ccteam-control` skill control surface.
+    Pause { slug: String },
     /// Resume a paused / escalated project (re-arm phase_state=idle).
-    #[command(hide = true)]
+    /// Mirrors the `mcp__ccteam__workflow_resume` tool.
     Resume { slug: String },
     /// **DEPRECATED** in V0.4.6 (F89) — moved to `ccteam internal send`.
     ///
@@ -1135,10 +1139,8 @@ fn main() -> Result<()> {
             warn_deprecated_top_level("progress", "internal progress");
             run_progress(&slug, tail)
         }
-        Command::Resume { slug } => {
-            warn_deprecated_top_level("resume", "internal resume");
-            run_resume(&slug)
-        }
+        Command::Pause { slug } => run_pause(&slug),
+        Command::Resume { slug } => run_resume(&slug),
         Command::Send {
             slug,
             role,
@@ -1541,9 +1543,21 @@ fn run_progress(slug: &str, tail: bool) -> Result<()> {
     commands::run_progress(&paths, slug, tail)
 }
 
+/// `ccteam pause <slug>` — pause auto-dispatch for one project. Same
+/// `actions::pause` body the `workflow_pause` MCP tool and the web
+/// action route call; never kills the session (CLAUDE.md §三 red line).
+fn run_pause(slug: &str) -> Result<()> {
+    let paths = CcteamPaths::from_env()?;
+    ccteam_core::actions::pause(&paths, slug)?;
+    println!("ccteam: paused `{slug}` (no kill — re-arm with `ccteam resume {slug}`)");
+    Ok(())
+}
+
 fn run_resume(slug: &str) -> Result<()> {
     let paths = CcteamPaths::from_env()?;
-    commands::run_resume(&paths, slug)
+    commands::run_resume(&paths, slug)?;
+    println!("ccteam: resumed `{slug}`");
+    Ok(())
 }
 
 /// V0.3.1 F49 — dispatch `ccteam session <action>` to the flex

@@ -32,9 +32,13 @@ fn t01_help_user_facing_only() {
     assert!(out.status.success(), "ccteam --help should exit 0");
     let stdout = String::from_utf8_lossy(&out.stdout);
 
-    // User-facing commands must show up.
+    // User-facing commands must show up. `pause` / `resume` are the
+    // documented `ccteam-control` control surface (mirroring the
+    // `mcp__ccteam__workflow_{pause,resume}` tools); the `internal
+    // resume` alias stays as a hidden compat path.
     for required in [
         "init", "start", "stop", "new", "ls", "status", "show", "doctor", "web", "internal",
+        "pause", "resume",
     ] {
         assert!(
             stdout.contains(required),
@@ -50,15 +54,7 @@ fn t01_help_user_facing_only() {
     // agent-team mode needs `ccteam attach <slug>` as a primary entry
     // point (see PRD F93b §验收 5). The `internal attach` alias stays
     // as a hidden compat path.
-    let deprecated = [
-        "hook",
-        "spawn",
-        "send",
-        "peek",
-        "progress",
-        "resume",
-        "mcp-serve",
-    ];
+    let deprecated = ["hook", "spawn", "send", "peek", "progress", "mcp-serve"];
     for d in deprecated {
         // Use word-boundary check: look for `  <name>  ` (with the
         // surrounding whitespace clap uses in its commands column) so
