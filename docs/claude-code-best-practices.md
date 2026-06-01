@@ -18,7 +18,7 @@ context 包括：每条消息、每次文件读取、每次命令输出。一次
 - 用 status line 持续追踪 context 使用率
 - 参考 `/en/context-window`、`/en/statusline`、`/en/costs#reduce-token-usage`
 
-> **ccteam 映射**：详见 tech-design.md §6.9(每个 agent session 独立 context,跨 agent 隔离即天然 reset 单位)。
+> **ccteam 映射**:详见 tech-design.md。每个 session / role 有独立 context(per-role `.claude/agents/<role>.md`),session 隔离即天然 reset 单位;多 session 并行不会堆积成单一 CLAUDE.md 的 context 膨胀。
 
 ---
 
@@ -36,7 +36,7 @@ context 包括：每条消息、每次文件读取、每次命令输出。一次
 
 UI 验证可用 [Claude in Chrome](/en/chrome) 扩展（自动开 tab 测 UI 迭代）。
 
-> **ccteam 映射**:requirements.md 痛点 3 + tech-design.md §3.6「测试即验收」直接来自此原则;role.md 产物需写可执行验证条目,下游 `verifier` role 通过 watch trigger 闭环。
+> **ccteam 映射**:requirements.md 痛点 3 + tech-design.md「测试即验收」直接来自此原则;role.md 产物需写可执行验证条目,下游 `verifier` role 通过 watch trigger 闭环。
 
 ---
 
@@ -59,7 +59,7 @@ UI 验证可用 [Claude in Chrome](/en/chrome) 扩展（自动开 tab 测 UI 迭
 - 一句话能描述 diff → 跳过 plan
 - 跨多文件、不熟悉的代码、方案不确定 → **必须** plan
 
-> **ccteam 映射**:explore/plan/implement 分离由 `workflow.yaml` 多 role 拓扑 + artifact 文件传递实现(如 `explorer` → `planner` → `implementer`,每个独立 `claude --bg` session 天然 context 隔离)。详 tech-design.md §3.3。
+> **ccteam 映射**:explore/plan/implement 分离由 `workflow.yaml` 多 role 拓扑 + artifact 文件传递实现(如 `explorer` → `planner` → `implementer`,每个独立 session 天然 context 隔离)。详 tech-design.md。
 
 ---
 
@@ -82,7 +82,7 @@ UI 验证可用 [Claude in Chrome](/en/chrome) 扩展（自动开 tab 测 UI 迭
 - **管道喂数据**：`cat error.log | claude`
 - **让 Claude 自己拉**：告诉它用 Bash / MCP / Read 自取
 
-> **ccteam 映射**:role.md 用 `@<file>` 引用大段背景(role.md 越短 cache 越好);agent 通过 `claude --bg --agent <role>` 启动,prompt = role.md,orchestrator 只通过 env(`CCTEAM_INPUT`/`CCTEAM_OUTPUT`)告诉 artifact 路径。
+> **ccteam 映射**:role.md 用 `@<file>` 引用大段背景(role.md 越短 cache 越好);agent 行为住 `.claude/agents/<role>.md`,artifact 路径只通过 env(`CCTEAM_INPUT`/`CCTEAM_OUTPUT`)传入,不向 session 注入 system prompt。
 
 ---
 
@@ -127,7 +127,7 @@ CLAUDE.md 在每次会话开头加载。包括：Bash 命令、code style、work
 - 父目录：monorepo 自动加载
 - 子目录：按需加载
 
-> **ccteam 映射**：本仓库的 CLAUDE.md 自身要遵守「精简」原则——能进 tech-design.md 就别进 CLAUDE.md。每项目自动生成的 `~/projects/<slug>/CLAUDE.md`（tech-design §6.5）也要按这套规则模板化。
+> **ccteam 映射**:本仓库的 CLAUDE.md 自身要遵守「精简」原则——能进 tech-design.md 就别进 CLAUDE.md。新建项目自动生成的 `<projects_root>/<team>-<slug>/CLAUDE.md` 也按这套规则模板化;跨项目记忆走官方接口(Claude `~/.claude/CLAUDE.md`、Codex `~/.codex/AGENTS.md`),同样保持精简。
 
 ### 4.2 配置 permissions
 
@@ -139,7 +139,7 @@ CLAUDE.md 在每次会话开头加载。包括：Bash 命令、code style、work
 
 参考：`/en/permission-modes`、`/en/permissions`、`/en/sandboxing`。
 
-> **ccteam 映射**：tech-design §6.1「`--dangerously-skip-permissions` + 项目级容器」=「sandboxing + 全放行」组合——给最终用户产出的项目用；本仓库自己开发用 `bypassPermissions`，语义不同（参见 CLAUDE.md §六）。
+> **ccteam 映射**:tech-design.md「`--dangerously-skip-permissions` + 项目级容器」=「sandboxing + 全放行」组合——给最终用户产出的项目用;本仓库自己开发用 `bypassPermissions`,语义不同(参见 CLAUDE.md)。
 
 ### 4.3 用 CLI 工具
 
@@ -151,7 +151,7 @@ CLAUDE.md 在每次会话开头加载。包括：Bash 命令、code style、work
 
 `claude mcp add` 接外部工具(Notion、Figma、数据库)。让 Claude 能从 issue tracker 读需求、查 DB、看监控、读设计、自动化 workflow。
 
-> **ccteam 映射**:tech-design §6.4 列了推荐 MCP(telegram / claude-mem / playwright / github + 自建 ccteam-mcp 17 工具)。
+> **ccteam 映射**:tech-design.md 列了推荐 MCP(telegram / claude-mem / playwright / github + 自建 `ccteam` MCP server)。
 
 ### 4.5 设置 hooks
 
@@ -162,19 +162,19 @@ CLAUDE.md 在每次会话开头加载。包括：Bash 命令、code style、work
 
 让 Claude 帮写 hook：「写一个 hook，每次文件编辑后跑 eslint」/「写一个 hook 阻止写 migrations 目录」。`.claude/settings.json` 直接编辑，`/hooks` 浏览。
 
-> **ccteam 映射**:详见 interfaces.md §6 — progress.jsonl 写入、escalation 解析、危险命令拦截全是 hook,ccteam 可观测性的命脉。
+> **ccteam 映射**:详见 interfaces.md — progress.jsonl 写入、escalation 解析、危险命令拦截全是 hook,ccteam 可观测性的命脉。
 
 ### 4.6 创建 skills
 
 `.claude/skills/<name>/SKILL.md`。Claude 自动在相关时应用,或 `/skill-name` 显式调用。frontmatter 支持 `disable-model-invocation: true`(有副作用时仅手动触发)。
 
-> **ccteam 映射**:自带 skill 在 repo 根 `skills/`(V0.5.0 F100 由 5 个精简到 3 个:`ccteam-control` / `ccteam-creator` / `ccteam-team`),分别对应 CLI/MCP 控制、创建新项目 + workflow + agent 对话向导、`/ccteam-team` 在当前 session 起 Anthropic Agent Team。meta-agent 优先 delegate 到这三个 skill。
+> **ccteam 映射**:自带 skill 在 repo 根 `skills/`,以 `/ccteam` 为 NL 总入口,分派到 `ccteam-control`(CLI/MCP 控制)/ `ccteam-creator`(创建新项目 + workflow + agent 对话向导)/ `ccteam-team` / `ccteam-im-setup` / `ccteam-advise` / `ccteam-scan` 等 sub-skill。meta-agent 优先 delegate 到这些 skill。
 
 ### 4.7 创建 subagent
 
 `.claude/agents/<name>.md`：自有 context、自有 tool 集、不污染主对话。frontmatter:`name` / `description` / `tools` / `model`。显式调用:"Use a subagent to review this code for security issues."
 
-> **ccteam 映射**:feature-dev / pr-review-toolkit 的 agent 通过 `enabledPlugins` 复用(详 tool-surface.md §6.2)。
+> **ccteam 映射**:feature-dev / pr-review-toolkit 的 agent 通过 `enabledPlugins` 复用(详 claude-code-tool-surface.md)。
 
 ### 4.8 装 plugins
 
@@ -182,7 +182,7 @@ CLAUDE.md 在每次会话开头加载。包括：Bash 命令、code style、work
 
 类型语言项目装 [code intelligence plugin](https://code.claude.com/docs/en/discover-plugins#code-intelligence)：精准符号导航 + 编辑后自动错误检测。
 
-> **ccteam 映射**:`claude-plugins-official` 仍是 ccteam 推荐的 agent / hook / skill 复用源;spawned project session 通过 `enabledPlugins` 启用 plugin。详 CLAUDE.md §3.7 + tool-surface.md §6.2。
+> **ccteam 映射**:`claude-plugins-official` 是 ccteam 推荐的 agent / hook / skill 复用源;spawned project session 通过 `enabledPlugins` 启用 plugin。详 CLAUDE.md + claude-code-tool-surface.md。
 
 ### 何时用哪个扩展机制（决策参考）
 
@@ -234,13 +234,13 @@ CLAUDE.md 在每次会话开头加载。包括：Bash 命令、code style、work
 - CLAUDE.md 里加压缩偏好：`"When compacting, always preserve the full list of modified files and any test commands"`
 - 临时问题用 `/btw`：答案在 dismissible overlay，**不进 context history**
 
-> **ccteam 映射**:`/btw` 由 meta-agent 用 `mcp__ccteam__workflow_signal` 调,等价于"给某 agent 投递侧带消息";context reset 单位 = 每个 agent session,supervisor 在 `agent_done` 时决定回收。
+> **ccteam 映射**:`/btw` 由 meta-agent 用 `mcp__ccteam__workflow_signal` 调,等价于"给某 session 投递侧带消息";context reset 单位 = 每个 session,session spawn-on-demand、按 id resume、空闲后释放。
 
 ### 6.3 用 subagent 做调查
 
 > Subagent 在隔离 context 里探索,回主对话只带 summary——最强 context 节流手段。例:`Use subagents to investigate how our authentication system handles token refresh`;实现后 `use a subagent to review this code for edge cases`。
 
-> **ccteam 映射**:CLAUDE.md §3.4 复用清单全靠这条——research / review 类工作必走 subagent。
+> **ccteam 映射**:CLAUDE.md 的复用清单全靠这条——research / review 类工作必走 subagent。
 
 ### 6.4 Checkpoints 与 rewind
 
@@ -254,7 +254,7 @@ CLAUDE.md 在每次会话开头加载。包括：Bash 命令、code style、work
 - `claude --resume` 选会话
 - `/rename oauth-migration` 命名会话——像 git branch 一样管理
 
-> **ccteam 映射**：tech-design §6.1「极端情况——session 必须重启」走 `--resume` 全量恢复对话历史；普通的 60% reset 反而**不**用 `--resume`（目的是清空 context）。这两条要分清楚。
+> **ccteam 映射**:chat / IM session 走 resume-by-id——daemon 重启后按持久化 session id 续接(Claude 接回 tmux TUI、Codex 重连 app-server),复用 context 是 feature;autonomous bg 路径反而每次 fresh-spawn(目的是清空 context)。这两条要分清楚。
 
 ---
 
@@ -270,7 +270,7 @@ claude -p "Analyze this log file" --output-format stream-json
 
 CI / pre-commit hook / 脚本里的标准用法。
 
-> **ccteam 映射**：tech-design §6.1 明确**不用** `claude -p`——失去 attach、cache 反复冷启动。这是 ccteam 与一般 CC 用法的关键差异。但内部某些纯一次性查询（如 ccteam status MCP 的子查询）可以用。
+> **ccteam 映射**:tech-design.md 明确**不用** `claude -p` 驱动长 session——失去 attach、cache 反复冷启动。这是 ccteam 与一般 CC 用法的关键差异。但内部某些纯一次性查询(如 ccteam status MCP 的子查询)可以用。
 
 ### 7.2 多会话并行
 
@@ -289,13 +289,13 @@ CI / pre-commit hook / 脚本里的标准用法。
 
 测试反向：Session A 写测试 → Session B 写代码让测试过。
 
-> **ccteam 映射**:Writer/Reviewer 模式 = workflow.yaml 写两个 role(`writer` 产 `drafts/` + `reviewer` `trigger: watch:drafts/` 产 `reviews/`),thin orchestrator 按 artifact-trigger 自动驱动。Agent Teams 概念已并入 workflow.yaml 拓扑。
+> **ccteam 映射**:Writer/Reviewer 模式 = workflow.yaml 写两个 role(`writer` 产 `drafts/` + `reviewer` `trigger: watch:drafts/` 产 `reviews/`),靠 artifact-trigger(文件系统控制平面)串接,无需人工逐步驱动。Agent Teams 概念已并入 workflow.yaml 拓扑。
 
 ### 7.3 跨文件 fan-out
 
 大批量迁移 / 分析:`for file in $(cat files.txt); do claude -p "Migrate $file ..." --allowedTools "Edit,Bash(git commit *)"; done`。**`--allowedTools` 限制无人值守能力面。** 先在 2-3 个文件上调 prompt 再放量。也可 `claude -p "<prompt>" --output-format json | your_command` 接管道。
 
-> **ccteam 映射**:M5「自动任务分解」(一句话需求 → 拆成 N 子项目)的底层执行模式。
+> **ccteam 映射**:「自动任务分解」(一句话需求 → 拆成 N 子项目)是推后的 ccteam-flow 编排层的底层执行模式。
 
 ### 7.4 Auto mode 自主跑
 
@@ -332,7 +332,7 @@ claude --permission-mode auto -p "fix all lint errors"
 
 **注意 Claude 表现好 / 差的差异**：好时记住 prompt 结构、context、模式；差时问为什么——context 太杂？prompt 太糊？任务太大？
 
-> **ccteam 映射**：requirements §五「成功判定」与本节同源——产品成败不看代码行数 / agent 数量，看用户参与时间、并行项目数、跨项目沉淀效果。
+> **ccteam 映射**:requirements.md「成功判定」与本节同源——产品成败不看代码行数 / agent 数量,看用户参与时间、并行项目数、跨项目沉淀效果。
 
 ---
 
@@ -358,7 +358,7 @@ claude --permission-mode auto -p "fix all lint errors"
 | progress.jsonl + business-event hook | §4.5 hooks deterministic |
 | 复用 plugin 的 agent / hook / skill via `enabledPlugins` | §4.7 + §4.8 |
 | meta-agent 调 `signal` 投递侧带消息 | §6.2 `/btw` 不进 history |
-| `claude --bg --agent` + supervisor | §7.2 parallel sessions worktrees |
+| bg session fresh-spawn + chat session resume-by-id | §7.2 parallel sessions worktrees |
 | meta-agent CLARIFY 反向面试 | §5.2 让 Claude 反向面试 |
 | 3-strike escalate + meta-agent | §8 correcting over and over |
 

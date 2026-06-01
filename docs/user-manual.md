@@ -189,9 +189,9 @@ daemon 退出时不会杀 tmux session。重启后 gateway 会按持久化 sessi
 | MCP 工具表面 | `ccteam doctor --verify-mcp` |
 | 最近 daemon 日志 | `tail -120 /tmp/ccteam.log` |
 | outbound ledger | `tail -80 ~/.ccteam/imd/outbound.jsonl` |
-| gateway session state | `~/.ccteam/im/gateway-state.json` |
+| gateway session state | `~/.ccteam/imd/gateway-state.json` |
 | 项目状态 | `<project>/.ccteam/state.json` |
-| 业务进度 | `<project>/.ccteam/progress.jsonl` |
+| 业务进度 | `~/.ccteam/progress/<slug>.jsonl` |
 
 ### cost cap
 
