@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, Mutex, Notify};
+use tokio::sync::{broadcast, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::transport::{Channel, ChannelMessage, SendMessage};
@@ -132,6 +132,15 @@ impl Channel for WsChannel {
     }
 }
 
+/// One resolved event from the per-connection `select!` loop.
+///
+/// Reads and writes are funnelled through a single owner so the inbound and
+/// outbound halves can never touch the socket concurrently.
+enum Step {
+    Inbound(Option<Result<Message, tokio_tungstenite::tungstenite::Error>>),
+    Outbound(Result<SendMessage, broadcast::error::RecvError>),
+}
+
 async fn handle_connection(
     stream: TcpStream,
     peer: SocketAddr,
@@ -139,62 +148,67 @@ async fn handle_connection(
     mut outbound_rx: broadcast::Receiver<SendMessage>,
     backlog: Arc<Mutex<Vec<SendMessage>>>,
 ) -> anyhow::Result<()> {
-    let ws = tokio_tungstenite::accept_async(stream).await?;
-    let (mut sink, mut source) = ws.split();
-    let reply_target: Arc<Mutex<Option<String>>> = Arc::default();
-    let target_changed = Arc::new(Notify::new());
+    // A single task owns the whole (un-split) WebSocket stream and serializes
+    // every read and write through one `select!` loop, so a frame is always
+    // written to completion before the socket is touched again. Splitting the
+    // stream into an independently-polled writer task (with `writer.abort()` on
+    // shutdown) can cut a Text frame mid-flush, or let the read half's control
+    // writes (Pong/Close) interleave between a partially-flushed frame's bytes —
+    // either way the client receives a truncated frame it fails to parse.
+    let mut ws = tokio_tungstenite::accept_async(stream).await?;
+    let mut reply_target: Option<String> = None;
 
-    let writer_target = Arc::clone(&reply_target);
-    let writer_notify = Arc::clone(&target_changed);
-    let writer_backlog = Arc::clone(&backlog);
-    let writer = tokio::spawn(async move {
-        loop {
-            if let Some(target) = writer_target.lock().await.clone() {
-                for message in take_backlog_for_target(&writer_backlog, &target).await {
-                    let payload = serde_json::to_string(&message)?;
-                    if sink.send(Message::Text(payload)).await.is_err() {
-                        return anyhow::Ok(());
-                    }
+    loop {
+        // Flush any backlog already destined for the current target. Each send
+        // runs to completion before the next, so frames never interleave.
+        if let Some(target) = reply_target.clone() {
+            for message in take_backlog_for_target(&backlog, &target).await {
+                let payload = serde_json::to_string(&message)?;
+                if ws.send(Message::Text(payload)).await.is_err() {
+                    return Ok(());
                 }
             }
-            tokio::select! {
-                outcome = outbound_rx.recv() => {
-                    let Ok(message) = outcome else {
-                        break;
-                    };
-                    let target = writer_target.lock().await.clone();
-                    if target.as_deref().is_some_and(|wanted| wanted == message.recipient)
-                        && remove_backlog_message(&writer_backlog, &message).await
-                    {
-                        let payload = serde_json::to_string(&message)?;
-                        if sink.send(Message::Text(payload)).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-                _ = writer_notify.notified() => {}
-            }
         }
-        anyhow::Ok(())
-    });
 
-    while let Some(frame) = source.next().await {
-        let frame = frame?;
-        if frame.is_close() {
-            break;
-        }
-        let Some(message) = parse_frame(frame, peer)? else {
-            continue;
+        // `ws.next()` borrows `ws` only for the duration of the select; once it
+        // resolves the borrow is released, so the outbound arm below is free to
+        // write to the same stream sequentially.
+        let step = tokio::select! {
+            frame = ws.next() => Step::Inbound(frame),
+            outcome = outbound_rx.recv() => Step::Outbound(outcome),
         };
-        *reply_target.lock().await = Some(message.reply_target.clone());
-        target_changed.notify_one();
-        if tx.send(message).await.is_err() {
-            break;
+
+        match step {
+            Step::Inbound(None) => break,
+            Step::Inbound(Some(frame)) => {
+                let frame = frame?;
+                if frame.is_close() {
+                    break;
+                }
+                let Some(message) = parse_frame(frame, peer)? else {
+                    continue;
+                };
+                reply_target = Some(message.reply_target.clone());
+                if tx.send(message).await.is_err() {
+                    break;
+                }
+            }
+            // Broadcast channel closed or lagged: drop the connection (matches
+            // the previous writer-task behaviour).
+            Step::Outbound(Err(_)) => break,
+            Step::Outbound(Ok(message)) => {
+                if reply_target.as_deref() == Some(message.recipient.as_str())
+                    && remove_backlog_message(&backlog, &message).await
+                {
+                    let payload = serde_json::to_string(&message)?;
+                    if ws.send(Message::Text(payload)).await.is_err() {
+                        break;
+                    }
+                }
+            }
         }
     }
 
-    writer.abort();
-    let _ = writer.await;
     Ok(())
 }
 
