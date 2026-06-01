@@ -134,6 +134,8 @@ Reply 'go' 启动。
 
 任何"白天 review、晚上跑"的人。需要质量 gate 的长任务都吃这套。
 
+> 注:这条配方的 `ccteam-creator` 能生成 overnight builder 的 workflow,但**无人值守的自动接力执行(test → fix → release 循环自己往下跑)依赖推后的 `ccteam-flow` 编排层**。当前 gateway daemon 只做 IM⇄session 路由、不 tick。
+
 ### 起步
 
 ```
@@ -222,6 +224,8 @@ Reply 'go' 启动。
 
 - 新 issue 进 GitHub → bot 自动读 issue body → 贴 1-3 个 label + 回一句中性的"thanks for reporting"
 - 拿不准的(比如 "这是 bug 还是 feature?")→ bot TG 私信你 + 选项 a/b/c,你回一个数字它就给 issue 操作下去
+
+> 注:webhook 入站端点(`POST /webhook/{project}/{token}`)当前可用,会把 payload 落 `<project>/.ccteam/webhooks/`;但"新 issue 自动触发 bot 处理"依赖推后的 ccteam-flow 编排层(agent `trigger: watch:.ccteam/webhooks/`),当前 gateway daemon 不 watch artifact。过渡期可在 IM 里把 issue 内容手动发给 `@triage_helper` 处理。
 
 ### 生成什么
 
@@ -362,7 +366,9 @@ final 输出 → 你点 reaction 表示接受 / 让某个 bot 重做一段
 
 ### 适合谁
 
-想从 day-1 用 Codex 集成的早期采用者;严肃多模块改动场景。
+想从一开始就用 Codex 集成的早期采用者;严肃多模块改动场景。
+
+> 注:`/ccteam-team` 能生成 Orchestrator-Worker 的 team 配置,但**多 agent 自动分工 + 自动 join 结果的无人值守编排依赖推后的 `ccteam-flow` 编排层**。当前过渡期借 Claude session 内部的 `Task(subagent_type=...)` 直接派工(lead 在你当前 session 里拆任务、起 teammate、收 `SendMessage` 汇报),由你在 session 里逐步驱动。
 
 ### 起步
 
@@ -433,6 +439,8 @@ solo 创业者 / 业余维护项目 / 需要 "24/7 替身" 场景。
 ```
 
 ccteam-creator 推断:**混合** — Overnight Builder 跑长任务 + Pocket Assistant 收发 IM。
+
+> 注:白天的 TG 私聊汇报这一半是当前 IM gateway 路径,可直接用(`@project_lead` 路由到一个长跑 chat session)。夜里的**无人值守自动 test → fix → release 接力**依赖推后的 `ccteam-flow` 编排层;当前 daemon 不 tick。
 
 ```
 PROJECT PLAN

@@ -167,10 +167,10 @@ ccteam 服务于「**想做软件、但不想（也不应）成为项目经理**
 **用户真正的诉求：**
 > "团队的运转**不依赖我在场**。我下班关电脑，早上起来看结果。"
 
-**ccteam 当前进展**(V0.6.3 起两条外部触发源补齐):
-- **F140 真 cron**(`Trigger::Schedule` 接 5 段 cron + `croner` crate + skip-missed 语义)— 让 schedule trigger 从 V0.4.6 stub 落地为可定时巡检 / 夜间任务的真实触发。
-- **F141 webhook ingress**(`POST /webhook/:project/:token` 挂 daemon web server,落 `.ccteam/webhooks/` 由 watch trigger 消费)— 让 CI 红 / CVE / PR-open 等外部系统事件能直接推 ccteam,不再依赖人手动触发。
-- 痛点 9 的"用户在场当 team-lead"主诉求由 V0.6.0 起的 mode 2/3 + meta-agent + IM bot 已大头解决;F140/F141 补齐"团队还需要被外部世界触发"这一维。
+**ccteam 当前进展**:
+- "用户在场当 team-lead"这一主诉求,由当前的 chat session(IM bot 通过手机随时下指令)+ bg session 已大头解决 —— 用户不需要守着主对话窗口,团队的执行不依赖人在场。
+- **webhook ingress 的 HTTP 入口已落地**:daemon web server 挂 `POST /webhook/:project/:token` 端点,外部世界(CI 红 / CVE / PR-open 等)可直接把事件推进来,落成 `.ccteam/webhooks/` 记录 —— 这个入口当前可用。
+- **schedule trigger(真 cron)**、以及"webhook 记录 / 定时事件自动 fan-out 成 agent 任务"属**推后的编排层(ccteam-flow)** —— 让定时巡检 / 夜间任务、以及推进来的事件自动 spawn 成多 agent 工作流,要等编排层落地才完整。
 
 ---
 
@@ -300,22 +300,22 @@ ccteam 主动开了 4 个 tmux session 并行——后端 1 个、前端 1 个�
 
 具体例子：implement phase 启动 Agent Teams，`backend-dev` / `frontend-dev` / `reviewer` 三 agent 并行；**backend-dev 内部**同时用 `Task` 工具启 subagent 研究"我们 codebase 怎么用 SQLAlchemy"。两者**同时发生**，职责互不重叠——Agent Teams 做**横向多角色**，subagent 做**纵向 context 节流**。三档机制可以**逐层嵌套**，不是 either-or。
 
-**ccteam 设计的回应**(V0.4.0+ workflow.yaml 架构):
+**ccteam 设计的回应**(workflow.yaml 架构,并行拓扑由**推后的编排层(ccteam-flow)**执行):
 - **workflow.yaml 声明并行拓扑** — 每个 agent 的 `parallelism: u32` 字段决定该 role 同时可跑几个 session;`trigger: watch:<dir>/` 决定 fan-out 触发条件(每个新 artifact 一个 session)。系统**事件驱动**,无需在 plan 阶段预先决定"主框架"档次。
 - **subagent 不在 workflow 协议中声明** — 任何 agent 内部都可 ad-hoc 启 subagent(`Task` 工具),不需要 workflow.yaml 许可,叠加在主框架之上。
 - **三档自然落到 workflow 语义**:
   - **solo** = `parallelism: 1` + 串行 watch dir
   - **agent_team** = 同一 watch dir 多 role 监听(fan-out 一次 → N agent 并行处理) + 后续 gate trigger 收敛
   - **multi_session** = 同一 role `parallelism > 1`(同时跑 N session 处理 backlog)
-- **资源约束**:`workflow.yaml::budget`(V0.4.6 F84)`max_cost_usd_per_24h` / `max_agent_spawns_per_hour` 自动 trip + auto-disable;daemon 全局 `MAX_CONCURRENT_PROJECTS: 3` 硬上限。
+- **资源约束**:`workflow.yaml::budget` 的 `max_cost_usd_per_24h` / `max_agent_spawns_per_hour` 自动 trip + auto-disable;daemon 全局 `MAX_CONCURRENT_PROJECTS` 硬上限。(budget trip → auto-disable 这套自动巡检属**推后的编排层**。)
 
 **边界 — 这条不解决什么**:
-- 不解决**自动任务分解**(workflow.yaml 拓扑要 ccteam-creator skill / 人手工写) — 本痛点假设 workflow.yaml 已声明好 fan-out 拓扑。**V0.6.3 F145 进展**:顶层 `squad: { leader, members, hop_limit }` 块补齐**跨 session 运行时路由** —— leader 在运行时挑哪个 member 接活(写 `<member>--*.md` artifact),由 orchestrator 按文件名前缀 dispatch。membership 仍**静态声明在 workflow.yaml**(可审计、不开 prompt-injection 面),F143 关掉的是**运行时 dispatch**,**不是**自动 decomposition —— 这条边界仍成立。
+- 不解决**自动任务分解**(workflow.yaml 拓扑要 ccteam-creator skill / 人手工写) — 本痛点假设 workflow.yaml 已声明好 fan-out 拓扑。顶层 `squad: { leader, members, hop_limit }` 块提供**跨 session 运行时路由** —— leader 在运行时挑哪个 member 接活(写 `<member>--*.md` artifact),按文件名前缀 dispatch(此运行时 dispatch 属**推后的编排层**)。membership 仍**静态声明在 workflow.yaml**(可审计、不开 prompt-injection 面),解决的是**运行时 dispatch**,**不是**自动 decomposition —— 这条边界仍成立。
 - 不解决**子模块接口同步**(role 之间通过 artifact 文件协作,无 RPC/IPC 内层契约管理)。
 
 ---
 
-### 痛点 14:Claude Code(以及任何单体 AI 助手)做不了真大型软件系统(V1.0.0 目标)
+### 痛点 14:Claude Code(以及任何单体 AI 助手)做不了真大型软件系统(目标)
 
 **用户场景**:
 > "我能用 Claude Code 写个 todo CLI、做个 Telegram bot、修个小 bug。但我手上是一个 100k+ LOC 的电商后台 / 实时交易系统 / 多服务架构 — Claude Code 单 session 跑半小时 context 就漂,改完 OAuth 模块忘了 mobile 端要同步改 schema,改完一个 bug 引入回归不被发现。我不需要再'对话式 AI 助手',我需要一个 **24×7 跑着的开发团队**,能自己做 N 周长跑、能多 agent 在多模块并行不踩对方脚、能自己跑回归、能撞到不会的 stack 自己换路。"
@@ -331,14 +331,18 @@ ccteam 主动开了 4 个 tmux session 并行——后端 1 个、前端 1 个�
 - 长跑 daemon + meta-agent 总管 → 撞死路自己换 stack 试 / 撞不会的 RFC 自己研究
 - artifact 文件 + progress.jsonl 是跨 session 的"团队共识"载体,context 漂掉无所谓 — 下个 spawn 读 artifact 就有共识
 
-**长跑维护方向的 V0.6.3 进展**:F140 真 cron(定时巡检 / 夜间依赖升级) + F141 webhook ingress(CI 红 / CVE / PR-open 等外部事件触发) + F142 vendor-seam forward-compat(`vendor_compat::warn_unknown_vendor_token` warn-once;未知 Claude job state → 非终态续 probe,未知 Codex event → skip + warn,不让上游 CLI 节奏外的新字段 / 新 enum 值把 daemon 干 panic)—— 三条都服务"长跑可靠性",但**距 V1.0.0 ≥7 天连续自助跑**仍有距离(关键缺口在 budget shaping / 跨模块语义同步,见上)。
+**长跑维护方向的当前进展**:
+- **vendor-seam forward-compat**(`vendor_compat::warn_unknown_vendor_token` warn-once;未知 Claude job state → 非终态续 probe,未知 Codex event → skip + warn)让上游 CLI 节奏外的新字段 / 新 enum 值不把 daemon 干 panic —— 这服务"长跑可靠性",当前可用。
+- **webhook ingress** 的 HTTP 入口当前可用(daemon web server 挂 `POST /webhook/:project/:token`,外部 CI 红 / CVE / PR-open 事件可直接推进来)。
+- **真 cron(定时巡检 / 夜间依赖升级)**与"外部事件 → 自动 spawn 修复 agent"属**推后的编排层(ccteam-flow)**。
+- **距"≥7 天连续自助跑"目标仍有距离** —— 关键缺口在 budget shaping / 跨模块语义同步(见上)+ 整个自主编排循环要等编排层落地。
 
-**V1.0.0 目标**:
+**目标**:
 - 能让 ccteam **连续自助跑 ≥7 天**做一个真实项目(20-100k LOC,有 DB + API + frontend + e2e test),期间用户 ≤5 次拍板
 - 期间产物能 ship(测试通过 + lint 通过 + deploy 通过 + 无回归);token 预算用户可配 + 撞 cap 优雅 throttle 不爆
 - **维护**也能跑:对已 ship 的项目持续跑 bug 修复 / 依赖升级 / 性能优化 / 安全补丁(meta-agent 自己识别 issue → 调度 agent 修 → 提 PR)
 
-### 痛点 15:自动化只服务"开发软件",拓不到其他领域(V1.0.0 目标)
+### 痛点 15:自动化只服务"开发软件",拓不到其他领域(目标)
 
 **用户场景**:
 > "AI 自动化只解决了'写代码'。我做研究 / 内容运营 / 投资分析 / 实验室自动化 — 这些也是'目标 + 多步骤 + agent 之间协作'的工作流,凭什么没有同样的自助团队?Claude / Cursor / Codex 都只配了'编程域'的工具(Read/Edit/Bash),没人给我配'研究域'的工具(scrape / paper search / dataset / 回测引擎),也没人教 LLM 怎么编排研究流程。"
@@ -347,9 +351,9 @@ ccteam 主动开了 4 个 tmux session 并行——后端 1 个、前端 1 个�
 
 **ccteam 的回应 — 数据驱动的领域抽象**:ccteam-core 从设计上**零编程域字面量**(strategic doc §1 红线):workflow.yaml + team.yaml + `.claude/agents/<role>.md` + MCP 工具接入 = 任何领域可创建自己的多 agent 团队。Token maxxing 让"对话式 wizard 创建领域 team"也变成 N 分钟级体验。
 
-**V1.0.0 目标**:
+**目标**:
 - 出 **3 个非编程领域的官方 team**(候选:研究 / 内容运营 / 投资分析,各自 starter workflow.yaml + agents + MCP 工具集)
-- **用户能在 30 分钟内**用 `ccteam-creator` skill(V0.5.0 F100 起合并自 `ccteam-project-creator` + `ccteam-team-author`)+ 对话式 wizard 创建自己领域的 workflow / agent 拓扑 → 不需要懂 YAML / Rust,自然语言对话定义
+- **用户能在 30 分钟内**用 `ccteam-creator` skill + 对话式 wizard 创建自己领域的 workflow / agent 拓扑 → 不需要懂 YAML / Rust,自然语言对话定义
 - 跑通第一个**非编程**项目(典型:用户描述"我想跑一个每天爬 5 个财经网站 + 写一篇市场摘要 + 发到 Telegram 的工作流",30 分钟内 ccteam 跑起来)
 
 ---
