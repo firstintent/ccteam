@@ -16,6 +16,7 @@ use crate::state::AppState;
 pub mod actions;
 pub mod api_v1;
 pub mod assets;
+pub mod chat_ws;
 pub mod dashboard;
 pub mod harness_sse;
 pub mod health;
@@ -52,6 +53,7 @@ pub fn stateful_router() -> Router<AppState> {
         .merge(actions::router())
         .merge(internal_hook::router())
         .merge(api_v1::router())
+        .merge(chat_ws::router())
         .merge(pty_ws::router())
         // V0.5.0 F96 — Agent Teams surface.
         .merge(teams_api::router())

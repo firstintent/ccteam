@@ -176,6 +176,7 @@ async fn daemon_does_not_tail_legacy_turns_jsonl() {
         max_runtime: Some(Duration::from_millis(600)),
         adapter_factory: Some(adapter_factory),
         channels_override: Some(channels),
+        extra_channels: None,
     };
 
     run_daemon_with_shutdown(args, async {
@@ -242,6 +243,7 @@ async fn daemon_no_op_when_turns_jsonl_missing() {
         max_runtime: Some(Duration::from_millis(300)),
         adapter_factory: Some(adapter_factory),
         channels_override: Some(channels),
+        extra_channels: None,
     };
 
     run_daemon_with_shutdown(args, async {
@@ -325,6 +327,7 @@ async fn daemon_does_not_replay_truncated_legacy_turns_jsonl() {
         max_runtime: Some(Duration::from_millis(600)),
         adapter_factory: Some(adapter_factory),
         channels_override: Some(channels),
+        extra_channels: None,
     };
     run_daemon_with_shutdown(args, async {
         futures::future::pending::<()>().await;
@@ -414,6 +417,7 @@ async fn drain_no_op_when_cursor_already_at_eof() {
         max_runtime: Some(Duration::from_millis(400)),
         adapter_factory: Some(adapter_factory),
         channels_override: Some(channels),
+        extra_channels: None,
     };
     run_daemon_with_shutdown(args, async {
         futures::future::pending::<()>().await;

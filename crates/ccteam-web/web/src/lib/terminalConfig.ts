@@ -29,6 +29,13 @@ export function ptyUrlFor(slug: string, sid?: string): string {
   return `${proto}//${host}${path}`;
 }
 
+export function chatUrlFor(chatId: string, userId: string): string {
+  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const host = window.location.host;
+  const params = new URLSearchParams({ chat_id: chatId, user_id: userId });
+  return `${proto}//${host}/ws/chat?${params.toString()}`;
+}
+
 /**
  * Subprotocol the F56 backend echoes back on accept. Browsers fail the
  * upgrade if the server doesn't acknowledge a requested subprotocol,
@@ -36,3 +43,5 @@ export function ptyUrlFor(slug: string, sid?: string): string {
  * server side.
  */
 export const PTY_SUBPROTOCOL = "ccteam-pty.v1";
+
+export const CHAT_SUBPROTOCOL = "ccteam-chat.v1";

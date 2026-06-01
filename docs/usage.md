@@ -5,11 +5,11 @@
 
 核心模型:**一个 chat 就是一台终端**。三个对象——
 
-- **chat**:Telegram 私聊或群聊。每个 chat 有自己的当前 project、当前 session、session 列表,互相隔离。
+- **chat**:Telegram 私聊/群聊或 web 控制台会话。每个 chat 有自己的当前 project、当前 session、session 列表,互相隔离。
 - **project**:本地一个已 `ccteam init` 的目录,用 slug 标识。
 - **session**:一个可继续上下文的 agent 会话,属于某个 chat + 某个 project。
 
-两类命令别混:**shell 里的 `ccteam <子命令>`**(运维 + 安装) vs **IM 里的网关命令 `/pair /new /use /cd /sessions /projects`、路由前缀 `@<handle>`、管理 `@ccteam`**(日常对话)。
+两类命令别混:**shell 里的 `ccteam <子命令>`**(运维 + 安装) vs **IM / web chat 里的网关命令 `/pair /new /use /cd /sessions /projects`、路由前缀 `@<handle>`、管理 `@ccteam`**(日常对话)。
 
 ---
 
@@ -121,10 +121,10 @@ chmod 600 ~/.ccteam/im/credentials.json
 ## 4. 启动 gateway daemon
 
 ```bash
-ccteam start > /tmp/ccteam.log 2>&1 &     # 一个进程:IM gateway + MCP socket + web UI
+ccteam start > /tmp/ccteam.log 2>&1 &     # 一个进程:IM gateway + web chat + MCP socket + web UI
 ```
 
-`ccteam start`(无 slug)启动常驻网关,同进程提供:IM gateway(Telegram 长轮询 + 出站)、MCP socket(`~/.ccteam/run/mcp.sock`)、Web UI(默认 `0.0.0.0:7331`)、hook sink。
+`ccteam start`(无 slug)启动常驻网关,同进程提供:IM gateway(Telegram 长轮询 + 出站)、web chat WS(`/ws/chat`)、MCP socket(`~/.ccteam/run/mcp.sock`)、Web UI(默认 `0.0.0.0:7331`)、hook sink。
 
 ```bash
 ccteam start --web-bind 127.0.0.1:7331    # 只绑环回(此时 web 不需 token)
@@ -202,6 +202,18 @@ cat ~/.ccteam/web-token
 ```bash
 ccteam web --bind 127.0.0.1:7331          # 单独起 web(不带网关)
 ```
+
+打开 `http://<host>:7331/app/chat` 进入 web chat 控制台。它和 IM 共用同一个 Gateway:
+
+```text
+/new claude reviewer
+/new codex api
+@reviewer 看一下当前项目
+@api /review
+@api /compact
+```
+
+Chat 面板走 `ccteam-chat.v1` WebSocket;Terminal 面板走既有 `ccteam-pty.v1`。`ccteam start --no-imd` 只启动 web server,此时 Chat 面板能打开但不会接入 Gateway;要使用 web chat,保持 IM gateway task 启用(默认)。
 
 ---
 

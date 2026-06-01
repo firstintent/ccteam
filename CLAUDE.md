@@ -5,18 +5,18 @@
 
 ---
 
-## 〇、v0.8.2 / v8.2 当前架构红线
+## 〇、v0.8.3 / v8.3 当前架构红线
 
-本仓已落地 **v8.2「云 CC/Codex + IM」真实路径收敛**(版本号 `0.8.2`):架构 SoT 是 `docs/tech-design.md` 与本文(**协议细节一律以代码为准**,见 tech-design 末尾「协议 → 代码位置」指针表);UX/概念原型见 `docs/im.html`(crate 拓扑以本节 + tech-design §3.1 的 `core→harness→cost` 为准)。**下文若仍有 V0.6.x / orchestrator-era 术语残留,以本节为准:**
+本仓已落地 **v8.3「云 CC/Codex + IM + Web」真实路径收敛**(版本号 `0.8.3`):架构 SoT 是 `docs/tech-design.md` 与本文(**协议细节一律以代码为准**,见 tech-design 末尾「协议 → 代码位置」指针表);UX/概念原型见 `docs/im.html`(crate 拓扑以本节 + tech-design §3.1 的 `core→harness→cost` 为准)。**下文若仍有 V0.6.x / orchestrator-era 术语残留,以本节为准:**
 
 - **改名/重构已收敛**:`ccteam-mux`→`ccteam-harness`、`MuxBackend`→`ProcessBackend`、`ccteam-imd`→`ccteam-im`;orchestrator 从 `ccteam-core` 抽到 `ccteam-flow`(core 瘦成 primitives leaf)。拓扑保持 `core -> harness -> cost`,不要翻成 `harness -> core`。
 - **执行层两轴**:`HarnessAdapter`(vendor 怎么驱动:Claude=tmux+send-keys+transcript+hook;Codex=app-server JSON-RPC)× `ProcessBackend`(进程跑哪:tmux/inproc/remote);tmux pane 操作只属于 `PaneBackend` 子 trait。两 vendor 归一成中立 `CanonicalEvent` + `ApprovalIR`(**不**抄 alleycat 的 codex-emulation)。
-- **daemon = IM⇄session 路由网关**(一个进程含 IM gateway + MCP Unix socket + web server,**不 tick、无 orchestrator 循环**);编排 `ccteam-flow` 推后,过渡期借 cc/codex 内部编排。
+- **daemon = IM/web⇄session 路由网关**(一个进程含 IM gateway + web chat WS + MCP Unix socket + web server,**不 tick、无 orchestrator 循环**);编排 `ccteam-flow` 推后,过渡期借 cc/codex 内部编排。
 - **`ccteam init` 当前布局**:项目内写 `.ccteam/{agents,skills,state.json}` + `.claude/agents`;`.ccteam/skills/.gitkeep` 预留项目自有 skill 扩展。
-- **`ccteam start` 当前职责**:无 slug 时只启动 resident gateway daemon(web + IM gateway + MCP socket + 可选 hook sink),不构造 `ccteam-flow::Orchestrator`,legacy `--tick-seconds` / `--claude-argv` 仅兼容解析。
+- **`ccteam start` 当前职责**:无 slug 时只启动 resident gateway daemon(web + web chat WS + IM gateway + MCP socket + 可选 hook sink),不构造 `ccteam-flow::Orchestrator`,legacy `--tick-seconds` / `--claude-argv` 仅兼容解析。
 - **会话 = resume-by-id**(spawn-on-demand + 按 id resume + 空闲释放,**非**常驻吊着):IM session 属 chat 类,红线「每次 spawn = fresh 1M context」对它**不适用**(chat 复用 context 本就是 feature);autonomous bg 路径仍 fresh-spawn。
 - **v8.1 不做手机批准** → agent 走 `--dangerously-skip-permissions`(无批准门);`ApprovalIR` 留类型占位,HITL 批准推后。
-- **核心概念 `chat ⇄ project ⇄ session`**:一个 chat = 你的终端,跨多 project、随时 `/new` 多 session、随时切(`@bot` / `/use` / `/cd`);命令 Claude 走 send-keys、Codex 走 app-server RPC(/compact=`thread/compact/start`、/review=`review/start`)。
+- **核心概念 `chat ⇄ project ⇄ session`**:一个 chat = 你的终端(IM chat 或 web chat),跨多 project、随时 `/new` 多 session、随时切(`@bot` / `/use` / `/cd`);命令 Claude 走 send-keys、Codex 走 app-server RPC(/compact=`thread/compact/start`、/review=`review/start`)。
 - **vendor 选型**:Claude→tmux(全 TUI + 耐久 + 已有);Codex→app-server(原生、文档化)。per-adapter best-fit,不强行统一。
 - **progress 写入权威**:`harness/progress_bridge` 是 schema 单一权威,`core` 只 re-export。
 
@@ -28,19 +28,19 @@
 
 | 项 | 值 |
 |---|---|
-| Workspace version | `0.8.2` |
-| 测试 baseline | `1743/0`(`cargo test --workspace --locked --no-fail-fast --exclude ccteam-web`;`ccteam-web` ws_* 测试留 CI/专机)|
+| Workspace version | `0.8.3` |
+| 测试 baseline | `1759/0`(`cargo test --workspace --locked --no-fail-fast --exclude ccteam-web`;`ccteam-web` ws_* 测试留 CI/专机)|
 | Clippy | 0 errors + 0 warnings(`cargo clippy --workspace --all-targets -- -D warnings`)|
-| 当前在做 | **v0.8.3 web 端进入层**(WS,与 IM 平行)— PRD/原型见 `docs/versions/v0-8-3/` |
+| 当前在做 | **v0.8.3 ship gate / 验收**(web 端进入层已接入 Gateway;PRD/原型见 `docs/versions/v0-8-3/`) |
 
 > 主分支 HEAD 以 `git rev-parse origin/main` 为准;历史版本里程碑见 `docs/versions/v0-X-Y/README.md`(冻结归档)。
 
 **ccteam 是 Claude Code(+ Codex)之上的元工具** —— 云端常驻的元 AI 团队,从 IM 和 web 驱动。架构 5 块:
 
 - **配置**:每项目 `workflow.yaml` 声明 agent 拓扑(**无 prompt**,只有 trigger + 并发上限 + `vendor: claude|codex`);`.claude/agents/<role>.md`(Codex `AGENTS.md`)定义 agent 行为
-- **执行**:resident daemon = IM⇄session 路由网关(**不 tick、无 orchestrator 循环**)→ 按需 spawn / resume session:Claude 走 tmux 长 session(send-keys + transcript + hook),Codex 走 `codex app-server` JSON-RPC;两 vendor 归一成中立 `CanonicalEvent`
+- **执行**:resident daemon = IM/web⇄session 路由网关(**不 tick、无 orchestrator 循环**)→ 按需 spawn / resume session:Claude 走 tmux 长 session(send-keys + transcript + hook),Codex 走 `codex app-server` JSON-RPC;两 vendor 归一成中立 `CanonicalEvent`
 - **状态 SoT**:`progress.jsonl` 业务事件(`harness/progress_bridge` 单一权威);chat 对话原文走 ccteam-owned `<project>/.ccteam/chat/<bot>/turns.jsonl`(不依赖 Anthropic 内部 `~/.claude/projects/`)
-- **接口**:27 个 MCP 工具 `mcp__ccteam__{workflow_,chat_,advise_,admin_,screenshot}*`(代码 `STUB_TOOLS` + `ccteam doctor --verify-mcp` 自检)+ `@ccteam <NL>` IM admin(pause/resume/list/cost/stop)+ web UI SSE 面板
+- **接口**:27 个 MCP 工具 `mcp__ccteam__{workflow_,chat_,advise_,admin_,screenshot}*`(代码 `STUB_TOOLS` + `ccteam doctor --verify-mcp` 自检)+ `@ccteam <NL>` IM admin(pause/resume/list/cost/stop)+ web UI SSE 面板 + `/app/chat` web chat 控制台
 - **安装**:`curl install.sh | sh`(prebuilt binary,linux + macOS,Windows 走 WSL2)→ Claude `/plugin install ccteam` OR Codex `codex plugin marketplace add firstintent/ccteam`;`cargo install --git https://github.com/firstintent/ccteam ccteam-cli` 是 fallback
 
 详 `docs/tech-design.md`。
@@ -75,7 +75,7 @@
 | **`ccteam-core` 零 team 名字面量** | core = primitives leaf,team 名不入 core |
 | **跨项目记忆走官方接口** | Claude `~/.claude/CLAUDE.md` + `~/.claude/rules/*.md`;Codex `~/.codex/AGENTS.md`(`ccteam init` 落 AGENTS.md → CLAUDE.md symlink)|
 | **新建项目走 `<projects_root>/<team>-<slug>/`** | `pick_unused_slug` 强制 team 前缀;IM/web bot 落 `.ccteam/chat/<bot>/` |
-| **文件系统是状态面**(非 chat 命令面)| state.json / progress.jsonl / turns.jsonl on disk;chat 命令走 IM/WS → gateway `handle_text`,**不**再 file-watch(orchestrator tick 已退役;仅 autonomous bg 用 artifact 控制面)|
+| **文件系统是状态面**(非 chat 命令面)| state.json / progress.jsonl / turns.jsonl on disk;chat 命令走 IM/WS(`ccteam-chat.v1`) → gateway `handle_text`,**不**再 file-watch(orchestrator tick 已退役;仅 autonomous bg 用 artifact 控制面)|
 | **root README.md 必须英文 + 不含版本进展/状态** | README 始终反映当前能力,不夹版本时间轴 / baseline / shipped 日期 |
 
 > **已退役的旧红线**(新架构打破,勿再引用):「每次 spawn = fresh 1M context」(chat 复用 context 是 feature,仅 bg 适用)、「fix-loop 撞 3 次 escalate / AgentPath depth」(属推后的 `ccteam-flow` 引擎)、「HITL approval state SoT / `mode: human-approval` 第 4 mode」(批准全推后,`ApprovalIR` 仅类型占位,agent 走 `--dangerously-skip-permissions`)。

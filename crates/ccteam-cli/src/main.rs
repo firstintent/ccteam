@@ -18,6 +18,7 @@ mod mcp_tool_groups;
 // `ccteam__admin_add_tool` real implementations (mutate
 // `.claude/agents/<bot>.md` + emit progress events).
 mod mcp_admin_tools;
+mod web_chat_bridge;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -1858,6 +1859,11 @@ fn run_start(
         // (Ctrl-C, SIGTERM, or `ccteam stop` trigger file). No flow
         // orchestrator is constructed in this path.
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let web_chat_bridge = if !web.disabled && !imd.disabled {
+            Some(web_chat_bridge::build())
+        } else {
+            None
+        };
 
         let signal_task = tokio::spawn(async move {
             wait_for_shutdown_signal().await;
@@ -1875,10 +1881,30 @@ fn run_start(
                 }
             };
             let mut rx = shutdown_rx.clone();
+            let web_bridge = web_chat_bridge
+                .as_ref()
+                .map(|bridge| {
+                    (
+                        bridge.inbound_tx.clone(),
+                        bridge.outbound_tx.clone(),
+                        bridge.backlog.clone(),
+                    )
+                });
             Some(tokio::spawn(async move {
-                ccteam_web::serve_with_shutdown(opts, async move {
-                    let _ = rx.changed().await;
-                })
+                ccteam_web::serve_with_state_factory_and_shutdown(
+                    opts,
+                    move |paths, auth| {
+                        let state = ccteam_web::AppState::with_auth(paths, auth);
+                        if let Some((inbound, outbound, backlog)) = web_bridge {
+                            state.with_chat_bridge(inbound, outbound, backlog)
+                        } else {
+                            state
+                        }
+                    },
+                    async move {
+                        let _ = rx.changed().await;
+                    },
+                )
                 .await
             }))
         };
@@ -1888,13 +1914,16 @@ fn run_start(
             None
         } else {
             let mut rx = shutdown_rx.clone();
+            let mut args = ccteam_im::DaemonArgs::default();
+            if let Some(bridge) = web_chat_bridge.as_ref() {
+                let mut channels = ccteam_im::daemon::ChannelMap::new();
+                channels.insert("web".to_string(), bridge.channel.clone());
+                args.extra_channels = Some(channels);
+            }
             Some(tokio::spawn(async move {
-                ccteam_im::run_daemon_with_shutdown(
-                    ccteam_im::DaemonArgs::default(),
-                    async move {
-                        let _ = rx.changed().await;
-                    },
-                )
+                ccteam_im::run_daemon_with_shutdown(args, async move {
+                    let _ = rx.changed().await;
+                })
                 .await
             }))
         };

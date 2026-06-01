@@ -90,6 +90,10 @@ pub struct DaemonArgs {
     /// `None`; the daemon then builds a [`TelegramChannel`] from
     /// `credentials.json` when `creds.telegram.is_some()`.
     pub channels_override: Option<ChannelMap>,
+    /// Additional channels supplied by the embedding process. `ccteam start`
+    /// uses this to add the browser web-chat transport while preserving
+    /// credential-driven IM channels.
+    pub extra_channels: Option<ChannelMap>,
 }
 
 impl std::fmt::Debug for DaemonArgs {
@@ -102,6 +106,10 @@ impl std::fmt::Debug for DaemonArgs {
             .field(
                 "channels_override",
                 &self.channels_override.as_ref().map(|m| m.len()),
+            )
+            .field(
+                "extra_channels",
+                &self.extra_channels.as_ref().map(|m| m.len()),
             )
             .finish()
     }
@@ -303,6 +311,9 @@ fn build_channels(args: &DaemonArgs, creds: &Credentials, bots: &[BotRegistratio
         allowed.dedup();
         let ch = Arc::new(TelegramChannel::new(tg.bot_token.clone(), allowed));
         out.insert("telegram".to_string(), ch as Arc<dyn Channel + Send + Sync>);
+    }
+    if let Some(extra) = args.extra_channels.clone() {
+        out.extend(extra);
     }
     out
 }
@@ -971,6 +982,7 @@ mod tests {
             max_runtime: Some(Duration::from_millis(120)),
             adapter_factory: None,
             channels_override: None,
+            extra_channels: None,
         };
         run_daemon(args).await.unwrap();
         // Heartbeat was written at least once.
@@ -1035,6 +1047,7 @@ mod tests {
             max_runtime: None,
             adapter_factory: Some(factory),
             channels_override: None,
+            extra_channels: None,
         };
 
         let task = tokio::spawn(run_daemon_with_shutdown(args, std::future::pending::<()>()));

@@ -2,7 +2,7 @@
 
 > 本文档基于 [requirements.md](./requirements.md)（已确认的用户痛点）给出 ccteam 当前的技术架构、组件分解、数据协议、扩展点映射。
 >
-> **产品定位**：「云 CC/Codex + IM」—— 把一个常驻 gateway daemon 架在你机器上的真实 Claude Code / Codex 之上,让你在 IM(Telegram 等)里像用一台终端一样,跨多个项目、多个 session 操作真实 agent。
+> **产品定位**：「云 CC/Codex + IM + Web」—— 把一个常驻 gateway daemon 架在你机器上的真实 Claude Code / Codex 之上,让你在 IM(Telegram 等)或 web 控制台里像用一台终端一样,跨多个项目、多个 session 操作真实 agent。
 
 ---
 
@@ -40,11 +40,11 @@
 
 ### 2.1 核心模型:chat ⇄ project ⇄ session
 
-ccteam gateway 把 IM 消息路由到真实 Claude/Codex session。核心对象只有三个:
+ccteam gateway 把 IM / web chat 消息路由到真实 Claude/Codex session。核心对象只有三个:
 
 | 对象 | 含义 |
 |---|---|
-| **chat** | 一个 IM 私聊或群聊。每个 chat 有自己的当前项目、当前 session 和 session 列表。 |
+| **chat** | 一个 IM 私聊、群聊或 web chat。每个 chat 有自己的当前项目、当前 session 和 session 列表。 |
 | **project** | 本地一个已 `ccteam init` 的项目目录,用 slug 标识。 |
 | **session** | 一个可继续上下文的 agent 会话,属于某个 chat × 某个 project × 某个 vendor × 某个 role。它是一个常驻的 `ThreadHandle`,有自己独立的 context(`/compact` `/clear` 各自独立)。 |
 
@@ -62,13 +62,14 @@ ccteam gateway 把 IM 消息路由到真实 Claude/Codex session。核心对象�
 
 这些 chat-local 命令由 gateway 路由表(`Gateway::is_gateway_command`)拦截处理;`/compact` / `/review` / `/clear` 这类**不是** gateway 命令,会作为一个普通 turn 透传给当前 session 的 adapter,由 adapter 翻译成 vendor-native 操作。
 
-### 2.2 daemon = IM⇄session 路由网关
+### 2.2 daemon = IM/web⇄session 路由网关
 
 无 slug 的 `ccteam start` 是一个常驻 gateway daemon,**不是** tick loop / orchestrator 循环。它在同一个 tokio runtime 内、共享一条 shutdown 信号(Ctrl-C / SIGTERM / `ccteam stop` trigger 文件),启动以下任务:
 
 | 组件 | 位置 / 说明 |
 |---|---|
 | IM gateway | `ccteam-im::run_daemon_with_shutdown`;Telegram(等)long-poll 入站 + 出站发送;chat⇄project⇄session 路由表 |
+| Web chat WS | `GET /ws/chat`(`ccteam-chat.v1`);CLI 层 mpsc bridge 把 browser frame 翻成 `ChannelMessage{channel:"web"}` 后接入同一个 Gateway |
 | MCP socket | `~/.ccteam/run/mcp.sock` —— daemon-local line-delimited JSON-RPC handler,供 Claude/Codex plugin 调 ccteam 工具 |
 | Web server | axum + SSE,默认 `http://127.0.0.1:7331` |
 | Hook sink(可选) | `CCTEAM_HOOK_VIA_DAEMON=1` 时 bind `~/.ccteam/run/hook.sock`,让 daemon 成为 `progress.jsonl` 单一 writer,关掉 hook 子进程直写的两-writer race |
@@ -218,12 +219,12 @@ ccteam-cli (bin)
 
 ## 4. 关键流程
 
-### 4.1 一条 IM 消息的端到端路径
+### 4.1 一条 IM / web chat 消息的端到端路径
 
 ```
-用户在 IM 发 "@reviewer 看一下这个项目的 README,给我三条风险"
+用户在 IM 或 `/app/chat` 发 "@reviewer 看一下这个项目的 README,给我三条风险"
    │
-   ▼  IM gateway 收入站(经 allowed_chat_ids allowlist 校验)
+   ▼  IM gateway 收入站(经 allowed_chat_ids allowlist 校验)或 web `/ws/chat` 收入站(经 web token auth + ACL local websocket allowlist)
    │
    ▼  Gateway::handle_text:解析 @reviewer mention → 定位/创建 chat 当前 project 的 reviewer session
    │     (首条消息触发 HarnessAdapter::start_thread;已存在则复用 ThreadHandle)
@@ -231,13 +232,13 @@ ccteam-cli (bin)
    ▼  HarnessAdapter::submit_turn(handle, TurnInput::UserText("看一下..."))
    │     Claude: tmux send-keys -l "<text>" Enter
    │
-   ▼  gateway 立刻回 IM:"submitted <session> turn <id>"
+   ▼  gateway 立刻回入口:"submitted <session> turn <id>"
    │
    ▼  HarnessAdapter::events 流(Claude: hooks fast event + transcript tail;Codex: JSON-RPC)
    │     → CanonicalEvent::ItemCompleted{AgentMessage} / TurnCompleted{usage}
    │     → 镜像写 turns.jsonl(R2)+ progress.jsonl 业务事件 + cost ledger(per-vendor)
    │
-   ▼  outbound ledger 把 assistant 文本发回 IM(at-least-once;失败重放)
+   ▼  outbound ledger 把 assistant 文本发回 IM / web(at-least-once;失败重放)
 ```
 
 ### 4.2 失败与恢复
@@ -391,7 +392,9 @@ mode-3 = tmux 长 session + claude TUI 长跑(per bot)+ dual-track 观测 + ccte
 
 **Authentication**:loopback 免 token;非 loopback 自动生成 `~/.ccteam/web-token`(mode 0600)+ LAN-RCE 倒计时;URL shim `?token=ccteam:<hex>` → HttpOnly cookie + 303 干净 URL。
 
-**架构红线**:web 守 R2(SSE watcher 仅读 progress.jsonl)/ R5(不 kill 长 session)/ R6(不解析 tmux 终端)/ R9(不写跨项目记忆)。web-specific:写控制走跟 IM channel 完全相同的 gateway dispatch 路径(**web ⊥ im**,桥只在 cli 层);`cargo tree -p ccteam-web | grep ccteam-cli` 必须 0 命中(独立 dep graph 红线由 `tests/dep_graph_test.rs` 锁)。
+**Chat 控制台**:`/app/chat` 通过 `GET /ws/chat` + 子协议 `ccteam-chat.v1` 进入 Gateway。`ccteam-web` 只持有 web-local JSON 帧和 mpsc 端点;`ccteam-cli::web_chat_bridge` 在 `run_start` 装配处把它翻译成 `ccteam-im::transport::ChannelMessage` / `SendMessage`,所以 web 与 IM crate 互不依赖,但两者共用同一个 `Gateway::handle_text`、同一批 session、同一个 outbound ledger。
+
+**架构红线**:web 守 R2(progress.jsonl 仍是 SoT;SSE watcher 仅读 progress.jsonl)/ R5(不 kill 长 session)/ R6(不解析 tmux 终端;裸终端字节只走 `ccteam-pty.v1`)/ R9(不写跨项目记忆)。web-specific:写控制走跟 IM channel 完全相同的 gateway dispatch 路径(**web ⊥ im**,桥只在 cli 层);`cargo tree -p ccteam-web | grep ccteam-cli` 必须 0 命中(独立 dep graph 红线由 `tests/dep_graph_test.rs` 锁)。
 
 #### 前端层 invariant(红线)
 
@@ -558,6 +561,8 @@ ccteam web [--bind 127.0.0.1:7331]                # 单独启动 Web UI
 | MCP 工具清单 / schema | `crates/ccteam-cli/src/mcp_tool_groups.rs`(`STUB_TOOLS`)+ mcp serve | `ccteam doctor --verify-mcp`(drift → exit 1) |
 | Hooks / settings.json | `crates/ccteam-hooks` + `ccteam internal hook` 子命令;`ccteam init` 落 settings | — |
 | Web 路由 / SSE / WS | `crates/ccteam-web/src/routes/*`(axum `.route()`) | — |
+| Web chat WS (`ccteam-chat.v1`) | `crates/ccteam-web/src/chat_protocol.rs` + `routes/chat_ws.rs`;CLI bridge = `crates/ccteam-cli/src/web_chat_bridge.rs` | `cargo test -p ccteam-web chat_frame`;`cargo test -p ccteam-cli web_chat_ws_routes_through_gateway_and_survives_restart` |
+| PTY WS (`ccteam-pty.v1`) | `crates/ccteam-web/src/routes/pty_ws.rs` + SPA `useTerminal` | `cargo test -p ccteam-web --test pty_ws_test` |
 | JSON API v1 | `crates/ccteam-web/src/routes/api_v1.rs` | — |
 | IM transport / 凭证 | `crates/ccteam-im/src/transport/`(`Channel` trait + providers)+ `im/credentials.json` 解析 | — |
 | workflow.yaml schema | `ccteam-flow` / `ccteam-core` 解析代码(推后的编排层) | — |

@@ -23,6 +23,7 @@ import SessionDetail from "./pages/SessionDetail";
 import SessionsListPage from "./pages/SessionsListPage";
 import TeamsListPage from "./pages/TeamsListPage";
 import TeamDetailPage from "./pages/TeamDetailPage";
+import ChatConsole from "./pages/ChatConsole";
 import { TokenEntryPage } from "./components/TokenEntryPage";
 import { useAuthState } from "./hooks/useAuthState";
 import { fetchDashboard, type DashboardRow } from "./lib/dashboardApi";
@@ -93,11 +94,14 @@ function PrimaryTabs() {
   const path = location.pathname;
   const active = path.startsWith("/teams")
     ? "teams"
+    : path.startsWith("/chat")
+      ? "chat"
     : path.startsWith("/s/") || path.startsWith("/sessions")
       ? "sessions"
       : "projects";
   const tabs: Array<{ key: string; label: string; to: string }> = [
     { key: "projects", label: "Projects", to: "/" },
+    { key: "chat", label: "Chat", to: "/chat" },
     { key: "teams", label: "Teams", to: "/teams" },
     { key: "sessions", label: "Sessions", to: "/sessions" },
   ];
@@ -142,6 +146,7 @@ export default function App() {
                   <Route path="/" element={<Dashboard />} />
                   <Route path="/p/:slug" element={<ProjectDetail />} />
                   <Route path="/p/:slug/s/:sid" element={<SessionDetail />} />
+                  <Route path="/chat" element={<ChatConsole />} />
                   <Route path="/teams" element={<TeamsListPage />} />
                   <Route path="/teams/:name" element={<TeamDetailPage />} />
                   <Route path="/sessions" element={<SessionsListPage />} />

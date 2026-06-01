@@ -336,6 +336,7 @@ async fn daemon_wires_mock_channel_to_supervisor_inbox() {
         max_runtime: Some(Duration::from_millis(1200)),
         adapter_factory: Some(adapter_factory),
         channels_override: Some(channels),
+        extra_channels: None,
     };
 
     run_daemon_with_shutdown(args, async {
@@ -432,6 +433,7 @@ async fn daemon_routes_gateway_inbound_to_submit_turn_and_outbound() {
         max_runtime: Some(Duration::from_millis(600)),
         adapter_factory: Some(adapter_factory),
         channels_override: Some(channels),
+        extra_channels: None,
     };
 
     run_daemon_with_shutdown(args, async {
@@ -528,6 +530,7 @@ async fn daemon_replays_queued_durable_outbound_to_mock_channel() {
         max_runtime: Some(Duration::from_millis(100)),
         adapter_factory: Some(adapter_factory),
         channels_override: Some(channels),
+        extra_channels: None,
     };
 
     run_daemon_with_shutdown(args, async {
@@ -730,6 +733,7 @@ async fn daemon_routes_ws_channel_to_gateway_over_real_socket() {
         max_runtime: Some(Duration::from_millis(1200)),
         adapter_factory: Some(adapter_factory),
         channels_override: Some(channels),
+        extra_channels: None,
     };
 
     let daemon = tokio::spawn(async move {
@@ -1224,6 +1228,7 @@ fn spawn_ws_gateway_daemon(
         max_runtime: Some(Duration::from_secs(5)),
         adapter_factory: Some(adapter_factory),
         channels_override: Some(channels),
+        extra_channels: None,
     };
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
@@ -1253,6 +1258,7 @@ fn spawn_real_ws_gateway_daemon(
         max_runtime: Some(max_runtime),
         adapter_factory: Some(default_adapter_factory()),
         channels_override: Some(channels),
+        extra_channels: None,
     };
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
@@ -1287,6 +1293,7 @@ async fn run_mock_gateway_daemon<T>(
         max_runtime: Some(Duration::from_millis(600)),
         adapter_factory: Some(adapter_factory),
         channels_override: Some(channels),
+        extra_channels: None,
     };
     run_daemon_with_shutdown(args, async {
         futures::future::pending::<()>().await;

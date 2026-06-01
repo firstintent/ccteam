@@ -35,6 +35,7 @@ use ccteam_core::CcteamPaths;
 use tokio::net::TcpListener;
 
 pub mod auth;
+pub mod chat_protocol;
 pub mod decisions;
 pub mod pty;
 pub mod queries;
@@ -155,6 +156,21 @@ pub async fn serve_with_shutdown<F>(opts: ServeOpts, shutdown: F) -> Result<()>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
+    serve_with_state_factory_and_shutdown(opts, AppState::with_auth, shutdown).await
+}
+
+/// Embedded entry with caller-supplied state construction. `ccteam start`
+/// uses this to install the web-chat bridge while preserving the same bind
+/// and auth behavior as [`serve_with_shutdown`].
+pub async fn serve_with_state_factory_and_shutdown<F, B>(
+    opts: ServeOpts,
+    build_state: B,
+    shutdown: F,
+) -> Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+    B: FnOnce(CcteamPaths, AuthState) -> AppState,
+{
     let paths = CcteamPaths::from_env().context("resolve CcteamPaths from env for ccteam web")?;
 
     let listener = TcpListener::bind(opts.bind)
@@ -225,7 +241,7 @@ where
     println!("ccteam web listening on http://{local}");
     tracing::info!(addr = %local, auth_enabled = auth_state.enabled, "ccteam web bound");
 
-    let state = AppState::with_auth(paths, auth_state);
+    let state = build_state(paths, auth_state);
     let app = router_with_state(state);
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)

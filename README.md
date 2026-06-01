@@ -12,17 +12,17 @@ You talk to ccteam from three places, all backed by one daemon:
 
 - **From IM** — DM a bot to work on a project, or `@ccteam <natural language>` in a group for control (`pause`, `cost`, `list`, `stop everything`, …).
 - **Inside a Claude or Codex session** — `/ccteam <natural language>` is the universal entry; per-task slash commands let you skip the router when you know the path. The `mcp__ccteam__*` MCP tools are the programmatic surface.
-- **From a web console** — a local dashboard to watch live sessions, transcripts, and 24h spend.
+- **From a web console** — a local dashboard plus `/app/chat`, a browser chat surface that uses the same Gateway sessions as IM.
 
 ## Key concepts
 
 **chat ⇄ project ⇄ session.** This is the whole mental model:
 
-- A **chat** is one IM conversation — your terminal. It can span multiple projects and hold multiple live sessions at once. Another chat is fully isolated.
+- A **chat** is one IM conversation or browser chat — your terminal. It can span multiple projects and hold multiple live sessions at once. Another chat is fully isolated.
 - A **project** is a local directory you ran `ccteam init` on.
 - A **session** is `project × vendor × role` — a resident agent handle with its own context (`/compact` and `/clear` are per-session). You spin up sessions with `/new`, switch between them with `@bot` / `/use`, and switch projects with `/cd`.
 
-**One gateway daemon, no tick loop.** `ccteam start` runs a single resident process that is purely an IM⇄session routing gateway — there is no orchestrator polling loop. In one runtime it co-hosts the IM gateway, a local MCP Unix socket (so the Claude/Codex plugins can call ccteam tools), and the web server. All three share one clean-shutdown signal.
+**One gateway daemon, no tick loop.** `ccteam start` runs a single resident process that is purely an IM/web⇄session routing gateway — there is no orchestrator polling loop. In one runtime it co-hosts the IM gateway, browser chat WebSocket, a local MCP Unix socket (so the Claude/Codex plugins can call ccteam tools), and the web server. All tasks share one clean-shutdown signal.
 
 **Two vendors, best-fit drive.** Each agent runtime is driven through its most natural channel, then normalized to a single neutral `CanonicalEvent` stream:
 
@@ -50,7 +50,7 @@ curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh |
 # 2. Turn any directory into a ccteam project:
 ccteam init
 
-# 3. Start the gateway daemon (IM gateway + MCP socket + web console):
+# 3. Start the gateway daemon (IM gateway + web chat + MCP socket + web console):
 ccteam start
 #    Stop it cleanly with Ctrl+C, or:  ccteam stop
 ```

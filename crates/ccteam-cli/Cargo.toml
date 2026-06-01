@@ -44,6 +44,8 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
+async-trait.workspace = true
+futures.workspace = true
 
 # V0.6.0 Wave 3 F112 §C — `ccteam prefs show` pretty-prints the
 # Preferences struct via `toml::to_string_pretty`. Aligned with the
@@ -59,6 +61,8 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+axum.workspace = true
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 # V0.6.6 F173 — `doctor_cost_orphan_test.rs` writes a project-registration
 # `config.yaml` via the same serde_yaml the production loader uses.
 serde_yaml.workspace = true

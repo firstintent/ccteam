@@ -30,7 +30,7 @@ pub struct AclPolicy {
     /// Discord user IDs. Empty = open.
     #[serde(default)]
     pub discord_user_ids: Vec<String>,
-    /// Local WebSocket user IDs. Empty = open.
+    /// Local WebSocket / browser web-chat user IDs. Empty = open.
     #[serde(default)]
     pub ws_user_ids: Vec<String>,
 }
@@ -42,7 +42,7 @@ impl AclPolicy {
             "telegram" => &self.telegram_user_ids,
             "slack" => &self.slack_user_ids,
             "discord" => &self.discord_user_ids,
-            "ws" => &self.ws_user_ids,
+            "ws" | "web" => &self.ws_user_ids,
             // Unknown platform: deny by default (fail-closed).
             _ => return false,
         };
@@ -64,6 +64,7 @@ mod tests {
         assert!(p.allow("telegram", "any"));
         assert!(p.allow("slack", "any"));
         assert!(p.allow("ws", "any"));
+        assert!(p.allow("web", "any"));
     }
 
     #[test]

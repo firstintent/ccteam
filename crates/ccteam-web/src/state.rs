@@ -14,8 +14,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use ccteam_core::CcteamPaths;
+use tokio::sync::{broadcast, mpsc, Mutex};
 
 use crate::auth::AuthState;
+use crate::chat_protocol::{WebChannelMessage, WebSendMessage};
 use crate::pty::PtyRegistry;
 use crate::watcher::{spawn_watcher, EventBus};
 
@@ -53,6 +55,14 @@ pub struct AppState {
     /// this worktree the line below becomes
     /// `paths.teams_progress_jsonl()` with no behaviour change.
     pub teams_progress_path: Arc<PathBuf>,
+    /// Browser chat inbound bridge. `ccteam-web` owns only the neutral
+    /// JSON shape; `ccteam-cli` translates this into the IM gateway.
+    pub chat_inbound: Option<mpsc::Sender<WebChannelMessage>>,
+    /// Browser chat outbound fan-out, fed by the CLI bridge.
+    pub chat_outbound: broadcast::Sender<WebSendMessage>,
+    /// Browser chat outbound backlog for messages emitted while a
+    /// matching web socket is disconnected.
+    pub chat_backlog: Arc<Mutex<Vec<WebSendMessage>>>,
 }
 
 impl AppState {
@@ -99,6 +109,7 @@ impl AppState {
         // F95 canonicalised the path; switch over now that it's
         // available (was `paths.root.join("teams-progress.jsonl")` pre-F95).
         let teams_progress_path = paths.teams_progress_jsonl();
+        let (chat_outbound, _) = broadcast::channel(256);
         Self {
             paths: Arc::new(paths),
             bus,
@@ -106,6 +117,9 @@ impl AppState {
             pty: PtyRegistry::new(),
             claude_home: Arc::new(claude_home),
             teams_progress_path: Arc::new(teams_progress_path),
+            chat_inbound: None,
+            chat_outbound,
+            chat_backlog: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -117,6 +131,7 @@ impl AppState {
         let claude_home =
             crate::teams::claude_home().unwrap_or_else(|_| PathBuf::from("/tmp/.claude"));
         let teams_progress_path = paths.teams_progress_jsonl();
+        let (chat_outbound, _) = broadcast::channel(256);
         Self {
             paths: Arc::new(paths),
             bus,
@@ -124,6 +139,9 @@ impl AppState {
             pty: PtyRegistry::new(),
             claude_home: Arc::new(claude_home),
             teams_progress_path: Arc::new(teams_progress_path),
+            chat_inbound: None,
+            chat_outbound,
+            chat_backlog: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -140,6 +158,18 @@ impl AppState {
     /// point this at a tempdir file the test seeds + appends to.
     pub fn with_teams_progress_path(mut self, path: PathBuf) -> Self {
         self.teams_progress_path = Arc::new(path);
+        self
+    }
+
+    pub fn with_chat_bridge(
+        mut self,
+        inbound: mpsc::Sender<WebChannelMessage>,
+        outbound: broadcast::Sender<WebSendMessage>,
+        backlog: Arc<Mutex<Vec<WebSendMessage>>>,
+    ) -> Self {
+        self.chat_inbound = Some(inbound);
+        self.chat_outbound = outbound;
+        self.chat_backlog = backlog;
         self
     }
 }
