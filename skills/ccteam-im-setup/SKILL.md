@@ -184,6 +184,6 @@ Reasons not to switch:
 
 - OAuth flow — token-only (Telegram bot tokens)
 - Webhook URL auto-setup — user runs ngrok / cloudflared themselves;
-  document in `docs/troubleshooting.md`
+  document in `docs/usage.md`
 - Multi-account per platform — one bot per platform
 - Token rotation / refresh — manual

@@ -270,14 +270,14 @@ gateway 的原则:失败必须在 IM 里可见,不能静默挂住。
 
 ## 5. 数据与文件协议
 
-完整字段、JSON schema、文件命名规则、事件类型清单 → **[interfaces.md](./interfaces.md)**。本节只保留架构约束:
+完整字段、JSON schema、文件命名规则、事件类型清单**以代码为准**(见 §12「协议 → 代码位置」指针表)。本节只保留架构约束:
 
-| 子节 | 架构约束 | interfaces.md 章节 |
+| 子节 | 架构约束 | 代码位置(SoT) |
 |---|---|---|
-| 全局目录布局 | `~/.ccteam/` 是单一根;`run/mcp.sock`、`imd/outbound.jsonl`、`im/credentials.json`、`web-token`、`ccteam.pid` 都在其下 | [§1.1](./interfaces.md#11-全局目录ccteam) |
-| 项目级 state.json | 原子写(`.tmp` + rename);per-project 元数据;损坏走 backup | [§2](./interfaces.md#2-state-协议) |
-| progress.jsonl | **唯一业务状态事实来源** —— 写 schema 单一权威 = `ccteam-harness::progress_bridge`,core re-export;tmux 终端输出不参与状态判定 | [§4](./interfaces.md#4-progressjsonl-事件流) |
-| turns.jsonl | chat 对话原文 SoT,ccteam-owned `<project>/.ccteam/chat/<bot>/`;**不**依赖 Anthropic 内部目录长期可读 | [§4](./interfaces.md#4-progressjsonl-事件流) |
+| 全局目录布局 | `~/.ccteam/` 是单一根;`run/mcp.sock`、`imd/outbound.jsonl`、`im/credentials.json`、`web-token`、`ccteam.pid` 都在其下 | `ccteam-core::paths`(`CcteamPaths`) |
+| 项目级 state.json | 原子写(`.tmp` + rename);per-project 元数据;损坏走 backup | `ccteam-core`(`ProjectState`) |
+| progress.jsonl | **唯一业务状态事实来源** —— 写 schema 单一权威 = `ccteam-harness::progress_bridge`,core re-export;tmux 终端输出不参与状态判定 | `ccteam-harness::progress_bridge` / `enriched_event::EventKind` |
+| turns.jsonl | chat 对话原文 SoT,ccteam-owned `<project>/.ccteam/chat/<bot>/`;**不**依赖 Anthropic 内部目录长期可读 | `ccteam-im`(turns mirror) |
 | outbound ledger | `~/.ccteam/imd/outbound.jsonl`;at-least-once IM 投递,daemon 启动后重放未发送 / 失败行 | — |
 
 **关键论证**:「progress.jsonl 唯一事实来源」是架构红线。曾考虑过解析 tmux `capture-pane` 输出做状态判断 —— 拒,因为终端文本格式不稳定、ANSI 转义难、对 prompt cache 表现敏感。所有状态转移走 hook + transcript jsonl + app-server event,deterministic 且可重放。
@@ -334,7 +334,7 @@ You are a reviewer agent. ...
 
 ### 6.4 Hooks 配置
 
-完整 `settings.json` 模板、Hook 事件用途表 → **[interfaces.md §6](./interfaces.md#6-hooks-配置-schema)**。本节只保留架构论证:
+完整 `settings.json` 模板、Hook 事件用途**以代码为准**(`ccteam init` 落 settings;hook impl = `ccteam internal hook` 子命令,见 §12 指针表)。本节只保留架构论证:
 
 **为什么 hooks 是可观测性命脉**:Claude Code hooks 是 deterministic 的 —— 同一事件触发同一脚本,这是把「AI 的随机推理」转成「系统可处理的事件流」的桥。ccteam 把工具调用 / turn 边界事件通过 hooks 落到 progress.jsonl + turns.jsonl,**完全不解析 tmux 终端文本**。
 
@@ -366,7 +366,7 @@ You are a reviewer agent. ...
 | `admin_` | 3 | ls / change_persona / add_tool |
 | `screenshot` | 1 | 只读终端截图 |
 
-`CCTEAM_DISABLE_TOOLS` 用 group enum(非 glob,防 typo):`CCTEAM_DISABLE_TOOLS=advise,chat` 关掉两组。`STUB_TOOLS: &[&str] = &[]` static const(`crates/ccteam-cli/src/mcp_tool_groups.rs`)是 invariant 守门员;`ccteam doctor --verify-mcp` 自检 stub-counter parity,stub_count > 0 → exit code 1。完整 tool schema → [interfaces.md §12](./interfaces.md#12-ccteam-mcp-mcp-server-m2)。
+`CCTEAM_DISABLE_TOOLS` 用 group enum(非 glob,防 typo):`CCTEAM_DISABLE_TOOLS=advise,chat` 关掉两组。`STUB_TOOLS: &[&str] = &[]` static const(`crates/ccteam-cli/src/mcp_tool_groups.rs`)是 invariant 守门员;`ccteam doctor --verify-mcp` 自检 stub-counter parity,stub_count > 0 → exit code 1。完整 tool schema 见代码 `mcp_tool_groups.rs` + `ccteam doctor --verify-mcp`(§12 指针表)。
 
 **Wire 协议纪律**:`ccteam internal mcp-serve` stdout 是 line-delimited JSON-RPC frame channel,**所有 tracing / 日志走 stderr**,否则污染 frame parse → MCP client 解析挂。两条 transport(stdio + daemon 的 `~/.ccteam/run/mcp.sock`)共用同一 handler,读写同一份 state.json / progress.jsonl。
 
@@ -436,7 +436,7 @@ ccteam 核心是 **headless 状态引擎** —— 所有 UI 都是可插拔前�
 - **声明式拓扑**:每项目 `<project>/.ccteam/workflow.yaml` 声明 agent 角色 + trigger + 并发上限,**不含任何 prompt**(R3);agent 行为住 `.claude/agents/<role>.md`。
 - **trigger 四类**:`manual`(显式 spawn)/ `schedule`(`croner` 5 段 cron + skip-missed,`last_fire` 持久化)/ `gate`(等 MCP 工具释放)/ `watch:<path>`(inotify/fsevents,新文件 → spawn,`parallelism: u32` 上限内并发)。
 - **bg-job 形态**:Claude agent 走 `claude --bg --agent <role>`(每次 fresh 1M context,R4);Codex 走 `codex exec --json` / `codex app-server`。完成走 hook 写 `agent_done` + cost。
-- **5 类编排模式**:见 `docs/orchestration-patterns.md`。
+- **5 类编排模式**(推后的 `ccteam-flow` 编排层):见 `docs/research/orchestration-patterns.md`。
 - **重启恢复**:phantom cleanup 扫每个项目 progress.jsonl,`agent_spawn` 无匹配 `agent_done` 且对应 job state.json 已不在 → 补 synthetic `agent_done status="cleanup"`。
 
 ### 7.2 `workflow.yaml` schema 速览
@@ -445,7 +445,7 @@ ccteam 核心是 **headless 状态引擎** —— 所有 UI 都是可插拔前�
 name: dex-ui-autoloop
 enabled: true                            # false 时跳过 roster
 mode: artifact-driven                    # artifact-driven(默认)| chat | human-approval | agent-team
-budgets:                                 # per-vendor cap(具体 key 以 interfaces.md §17 为准)
+budgets:                                 # per-vendor cap(具体 key 见 workflow.yaml 解析代码)
   claude: { max_cost_usd_per_24h: 5.00, max_agent_spawns_per_hour: 100 }
   codex:  { max_cost_usd_per_24h: 5.00 }
 agents:
@@ -463,7 +463,7 @@ agents:
     input: .ccteam/done/
 ```
 
-**红线**:`workflow.yaml` 不许出现 `prompt:` / `system_prompt:` / `messages:` 字段。完整 schema → [interfaces.md §17](./interfaces.md#17-workflowyaml-schema)。
+**红线**:`workflow.yaml` 不许出现 `prompt:` / `system_prompt:` / `messages:` 字段。完整 schema 见 workflow.yaml 解析代码(`ccteam-flow`,推后的编排层)。
 
 ### 7.3 Self-healing Fix Loop + escalation
 
@@ -514,7 +514,7 @@ workflow.yaml 顶层可选 `squad: { leader, members, hop_limit }` 补「跨 spa
 
 ### 10.1 命令签名 / 文件路径
 
-完整 CLI 命令签名 → **[interfaces.md §10](./interfaces.md#10-cli-命令签名)**;关键文件路径速查 → **[interfaces.md §11](./interfaces.md#11-关键文件路径速查)**。
+完整 CLI 命令签名 = `ccteam-cli` clap 定义(`ccteam --help`);关键文件路径 = `ccteam-core::paths`。见 §12 指针表。
 
 用户日常 CLI:
 
@@ -549,8 +549,31 @@ ccteam web [--bind 127.0.0.1:7331]                # 单独启动 Web UI
 
 ## 11. 本文档的位置
 
-- `requirements.md` 回答 **为什么做** 与 **谁会用**。
-- 本文档 `tech-design.md` 回答 **怎么做** —— 架构论证、设计权衡、扩展点选择,描述当前架构。
-- [`interfaces.md`](./interfaces.md) 回答 **接口确切长什么样** —— YAML schema、JSON shape、文件路径、事件类型、命令签名。
+- `requirements.md` 回答 **为什么做** 与 **谁会用**(核心痛点)。
+- 本文档 `tech-design.md` 回答 **怎么做** —— 架构论证、设计权衡、扩展点选择,描述当前架构;**协议确切长什么样以代码为准**,见下面 §12。
+- `usage.md` 回答 **怎么用**(用户命令手册,纯命令)。
 
-所有实现 PR 必须能映射回:① `requirements.md` 的某条痛点 ② 本文档某个组件 / 流程 ③(改协议时)`interfaces.md` 必须同步。无法映射的,先放进 backlog 而非合入主线。
+所有实现 PR 必须能映射回:① `requirements.md` 的某条痛点 ② 本文档某个组件 / 流程 ③ 改协议同步代码 + §12 指针表。无法映射的,先放进 backlog 而非合入主线。
+
+---
+
+## 12. 协议 → 代码位置(代码是唯一 SoT)
+
+旧 `interfaces.md` 已退役。协议细节(CLI / JSON / event / 路由 / schema)全部以代码为准 —— 文档不再维护第二份会漂移的副本。下表是「想看 X → 去代码哪」的指针;有自检的优先跑自检。
+
+| 协议 | 代码位置(SoT) | 自检 / 速查 |
+|---|---|---|
+| 文件系统布局 / 路径 | `crates/ccteam-core/src/paths.rs`(`CcteamPaths`) | — |
+| 项目 / session state.json | `crates/ccteam-core/src/`(`ProjectState` / `SessionRecord` serde) | — |
+| progress.jsonl 事件 schema | `crates/ccteam-harness/src/execution/progress_bridge.rs` + `enriched_event.rs`(`EventKind`) | schema 单一权威 |
+| chat turns.jsonl | `crates/ccteam-im`(turns mirror)+ `ccteam-core` chat 路径 | — |
+| CLI 命令 / flag | `crates/ccteam-cli/src/main.rs` + `commands.rs`(clap derive) | `ccteam --help` |
+| MCP 工具清单 / schema | `crates/ccteam-cli/src/mcp_tool_groups.rs`(`STUB_TOOLS`)+ mcp serve | `ccteam doctor --verify-mcp`(drift → exit 1) |
+| Hooks / settings.json | `crates/ccteam-hooks` + `ccteam internal hook` 子命令;`ccteam init` 落 settings | — |
+| Web 路由 / SSE / WS | `crates/ccteam-web/src/routes/*`(axum `.route()`) | — |
+| JSON API v1 | `crates/ccteam-web/src/routes/api_v1.rs` | — |
+| IM transport / 凭证 | `crates/ccteam-im/src/transport/`(`Channel` trait + providers)+ `im/credentials.json` 解析 | — |
+| workflow.yaml schema | `ccteam-flow` / `ccteam-core` 解析代码(推后的编排层) | — |
+| HarnessAdapter / ProcessBackend | `crates/ccteam-harness/src/adapter.rs` + `lib.rs` | — |
+
+改协议 = 改代码 +(若新增一类协议)补本表一行。**不**再维护独立的 interfaces.md。

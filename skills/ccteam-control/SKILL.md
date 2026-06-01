@@ -66,7 +66,7 @@ ccteam internal spawn <slug> <role>  # was: ccteam spawn <slug> <role>
 ## `change-persona` and `add-tool` subcommands
 
 These operations back the `/ccteam-control` slash forms documented
-in `docs/user-manual.md §2.4`:
+in `docs/usage.md`:
 
 ```
 /ccteam-control change-persona helper-bot "改成英文 + 更幽默"
@@ -164,8 +164,8 @@ When this skill is loaded inside the ccteam meta-agent session:
    the dispatcher-not-worker rule — this skill is the tool list the
    dispatcher uses.
 2. After every status reply, write an outbox file at
-   `~/projects/meta/.ccteam/outbox/reply-<ts>-<seq>.md` per
-   `docs/interfaces.md` §3.4.3.
+   `~/projects/meta/.ccteam/outbox/reply-<ts>-<seq>.md`
+   (NL message body;一个 reply 一个文件)。
 3. When the user has resolved a project's clarify / escalation, use
    `mcp__ccteam__workflow_inject_decision` (or its Bash equivalent) to push
    the resolution back into the project session — it constructs a

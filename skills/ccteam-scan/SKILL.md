@@ -108,7 +108,7 @@ generator: ccteam-scan --quick
 
 **只读** audit skill。一次性产出一份报告:这个仓库对 Claude Code agent 有多"可导航",以及把它接入 ccteam 时每个 role 的 `scope:` 该怎么填。
 
-灵感来源:Anthropic《How Claude Code works in large codebases》—— "Claude 的能力 = 找到正确 context 的能力;太多则退化,太少则盲目"。本 skill 是 `docs/orchestration-patterns.md §1.5` explorer→artifact→editor 模板里 `explorer` role 的一次性交互版。
+灵感来源:Anthropic《How Claude Code works in large codebases》—— "Claude 的能力 = 找到正确 context 的能力;太多则退化,太少则盲目"。本 skill 是 explorer→artifact→editor 模板里 `explorer` role 的一次性交互版。
 
 ## skill 家族(本 skill 所处位置)
 
@@ -187,7 +187,7 @@ du -sh -- */ 2>/dev/null | sort -rh | head -15      # 最大子树
 
 ## Step 3 — `scope:` 建议(本 skill 的核心产出)
 
-对每个 member / 主要子系统,给出一行可直接粘进 `workflow.yaml` 的 `scope:` 值。背景:`AgentSpec.scope` 把 agent spawn 的 cwd 钉到子树,收窄每次 fresh-context 的爆炸半径(详 `docs/interfaces.md §17.2`)。
+对每个 member / 主要子系统,给出一行可直接粘进 `workflow.yaml` 的 `scope:` 值。背景:`scope:` 把 agent spawn 的 cwd 钉到子树,收窄每次 fresh-context 的爆炸半径。
 
 输出形如:
 
@@ -239,5 +239,5 @@ crates/api           scope: crates/api          Cargo workspace member
 
 ## Where to look in the repo
 
-- `docs/orchestration-patterns.md §1.5` —— 大型代码库模板(scope + explorer→artifact→editor)
-- `docs/interfaces.md §17.2` —— `AgentSpec.scope` schema
+- `workflow.yaml::scope` —— 把 agent spawn 的 cwd 钉到子树,收窄每次 fresh-context 爆炸半径
+- explorer→artifact→editor —— 大型代码库的拆分模板(本 skill = explorer 的一次性交互版)

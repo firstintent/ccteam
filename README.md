@@ -1,110 +1,99 @@
 # ccteam
 
-> **A multi-agent orchestrator on top of Claude Code** — describe what you want, ccteam picks the command. No YAML. No CLI flags to memorize.
+> **Your AI dev team, cloud-resident on your own machine — driven from IM and a web console.** Built on top of Claude Code and Codex. No YAML to write, no flags to memorize.
 
-## What do you want to do?
+ccteam is a meta-tool that runs on top of [Claude Code](https://code.claude.com/) (and OpenAI Codex). It puts a single resident gateway daemon on your own computer, sitting in front of the real `claude` / `codex` agents, so you can drive them from instant messaging (Telegram, Slack, …) and a local web console — as if your phone were a terminal into your machine.
 
-Pick the row that matches your goal. The right column is the command — copy-paste into any Claude session.
+The AI runs on **your computer**: it reads your files, runs your commands, touches your code. IM is just the entry point — close the laptop lid and the work keeps running. Sessions are durable and survive restarts.
 
-```
-You want to do                                  → Run this
-──────────────────────────────────────────────────────────────────────
-Get a feel for a new codebase (60 s, zero deps)  /ccteam-scan --quick
-Audit a codebase navigability / large monorepo   /ccteam-scan
-Build / fix / refactor (watching it work)        /ccteam-team "<task>"
-Cross-vendor second opinion on a hard call       /ccteam-advise "<question>"
-A private IM assistant (24/7, always on)         /ccteam-creator "build me a <X> assistant"
-A multi-bot IM round-table                       /ccteam-creator "a few bots in a group"
-Run a long task overnight (hands-off)            /ccteam-creator "<task>, run while I sleep"
-List / pause / resume / check spending           /ccteam-control list | pause | cost
-Wire up an IM token (Telegram / Slack / Discord) /ccteam-im-setup
-Verify your install / MCP surface / Codex critic ccteam doctor [--verify-mcp | --check-codex-auto-critic | --check-cost-orphan]
-Not sure? Just describe it in natural language   /ccteam "<what you want>"
-```
+## What it is
 
-> Each command is a Claude Code slash command. Type it in a `claude` session — `/ccteam <NL>` is the universal entry; the others let you skip the router when you already know the path.
+You talk to ccteam from three places, all backed by one daemon:
 
-## Get started
+- **From IM** — DM a bot to work on a project, or `@ccteam <natural language>` in a group for control (`pause`, `cost`, `list`, `stop everything`, …).
+- **Inside a Claude or Codex session** — `/ccteam <natural language>` is the universal entry; per-task slash commands let you skip the router when you know the path. The `mcp__ccteam__*` MCP tools are the programmatic surface.
+- **From a web console** — a local dashboard to watch live sessions, transcripts, and 24h spend.
+
+## Key concepts
+
+**chat ⇄ project ⇄ session.** This is the whole mental model:
+
+- A **chat** is one IM conversation — your terminal. It can span multiple projects and hold multiple live sessions at once. Another chat is fully isolated.
+- A **project** is a local directory you ran `ccteam init` on.
+- A **session** is `project × vendor × role` — a resident agent handle with its own context (`/compact` and `/clear` are per-session). You spin up sessions with `/new`, switch between them with `@bot` / `/use`, and switch projects with `/cd`.
+
+**One gateway daemon, no tick loop.** `ccteam start` runs a single resident process that is purely an IM⇄session routing gateway — there is no orchestrator polling loop. In one runtime it co-hosts the IM gateway, a local MCP Unix socket (so the Claude/Codex plugins can call ccteam tools), and the web server. All three share one clean-shutdown signal.
+
+**Two vendors, best-fit drive.** Each agent runtime is driven through its most natural channel, then normalized to a single neutral `CanonicalEvent` stream:
+
+- **Claude** runs in a long-lived **tmux TUI** session — durable, full TUI, driven with `send-keys` plus transcript tailing and the official Claude Code hooks. ccteam never scrapes terminal output.
+- **Codex** runs via the **app-server JSON-RPC** control plane — native and documented; `/compact`, `/review`, etc. map to Codex-native RPCs.
+
+Both vendors can run concurrently inside the same chat.
+
+**Resume-by-id, durable sessions.** Sessions are spawned on demand (first message creates one), resumed by id, and released when idle — state lives on disk, never as a shadow source of truth. They survive a daemon restart: the next `ccteam start` re-attaches your bots and replays any unsent IM replies, so upgrading or restarting ccteam doesn't lose context. If a Claude pane was killed, it is recreated with `claude --resume` for a lossless reload of the model's full context; if resume isn't possible, ccteam falls back to a fresh session and emits a visible reset event rather than silently forgetting.
+
+## Quickstart
 
 ```bash
 # 0. Install Claude Code first: https://code.claude.com/docs/install
 
-# 1. Install the ccteam CLI binary (one line, no Rust toolchain needed):
+# 1. Install the ccteam binary (one line, no Rust toolchain needed):
 curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh | sh
-#    Installs to ~/.local/bin/ccteam. The script prints a PATH-export
-#    hint if that directory isn't on your PATH yet — follow it, then
-#    restart your shell (or `source ~/.bashrc` / `source ~/.zshrc`).
-#    Pin a specific release tag: CCTEAM_VERSION=<tag> curl ... | sh
-#    Install system-wide:        CCTEAM_INSTALL_DIR=/usr/local/bin curl ... | sh
-#    Or download an archive from https://github.com/firstintent/ccteam/releases
-#    Build from source instead (requires Rust 1.85+):
-#      cargo install --git https://github.com/firstintent/ccteam ccteam-cli
-
-# 2. Inside any Claude session, register the marketplace + install the plugin:
-claude
+#    Installs to ~/.local/bin/ccteam. If that directory isn't on your PATH,
+#    the script prints an export hint — follow it, then restart your shell.
+#    Install system-wide:  CCTEAM_INSTALL_DIR=/usr/local/bin curl ... | sh
+#    Build from source:    cargo install --git https://github.com/firstintent/ccteam ccteam-cli
 ```
 
+```bash
+# 2. Turn any directory into a ccteam project:
+ccteam init
+
+# 3. Start the gateway daemon (IM gateway + MCP socket + web console):
+ccteam start
+#    Stop it cleanly with Ctrl+C, or:  ccteam stop
 ```
+
+```text
+# 4. Register the plugin so the slash commands and MCP tools light up.
+#    In a Claude session:
 /plugin marketplace add https://github.com/firstintent/ccteam
 /plugin install ccteam
-```
 
-Inside any Codex session(same two-step works ── ccteam binary must be on `$PATH` from step 1):
-
-```
+#    Or in a Codex session (the ccteam binary must be on $PATH from step 1):
 codex plugin marketplace add firstintent/ccteam
 ```
 
-```
-# 3. Try the universal entry — describe what you want in any language:
+```bash
+# 5. Drive it in natural language — from a Claude/Codex session or from IM:
 /ccteam "scan this repo and tell me what it does"
 /ccteam "fix the TypeScript errors in src/"
 /ccteam "build a Telegram bot that summarizes my GitHub PRs at 7am"
-
-# 4. (Optional) Bootstrap a per-project workflow scaffold from the CLI:
-ccteam init <project>
 ```
 
-Supported platforms for the prebuilt binary: Linux x86_64, Linux aarch64
-(arm64), macOS arm64 (Apple Silicon), macOS x86_64 (Intel). Linux
-binaries are musl-static so they run on any glibc version (NAS / older
-distros included). Windows users: install via WSL2 and use the
-linux-x64 binary — native Windows isn't supported because tmux +
-inotify + POSIX signals are foundational to ccteam. On macOS,
-if Gatekeeper blocks the binary on first run:
-`xattr -d com.apple.quarantine ~/.local/bin/ccteam`.
+**Supported platforms.** Linux x86_64 / aarch64 and macOS arm64 / x86_64 (prebuilt binaries). Linux binaries are musl-static, so they run on any glibc version (NAS and older distros included). Windows is supported via WSL2 using the linux-x64 binary — tmux, inotify, and POSIX signals are foundational to ccteam, so native Windows isn't supported. On macOS, if Gatekeeper blocks the binary on first run: `xattr -d com.apple.quarantine ~/.local/bin/ccteam`.
 
-Step 2 registers ccteam as a Claude Code plugin marketplace, then installs the plugin — the seven `/ccteam*` slash commands and `mcp__ccteam__*` MCP tools light up immediately. The 5-minute walkthrough for "private IM assistant" (the flagship use case) lives in [docs/quickstart.md](docs/quickstart.md).
+## Features
 
-## Three ways to talk to ccteam
-
-- **Inside a Claude session** — `/ccteam <NL>` is the universal entry; the per-task slash commands above are shortcuts. MCP tools (`mcp__ccteam__chat_*`, `mcp__ccteam__advise_*`, `mcp__ccteam__admin_*`) are the programmatic path for anything a sub-skill does.
-- **From IM** — DM your bot directly, or `@ccteam <NL admin>` inside a group for control (`pause`, `cost`, `list`, `stop everything`, …).
-- **Web dashboard** (read-only) — `http://localhost:7331` to watch workflows, transcripts, and 24h spend.
-
-The AI runs on **your computer** — it can read your files, run your commands, touch your code. Your phone / IM is just the entry point; close the laptop lid and the workflow keeps running.
-
-## Run as a daemon
-
-`ccteam start` runs the gateway daemon in the foreground (or as a detached process): IM gateway, local MCP socket, and the web dashboard share one process. To stop it cleanly:
-
-```bash
-kill -TERM $(cat ~/.ccteam/ccteam.pid)   # or just Ctrl+C in the foreground terminal
-```
-
-It drains within 5 seconds, releases the web port and MCP socket, and unlinks its pidfile automatically. Long-running tmux chat sessions survive a daemon restart and are re-attached on the next `ccteam start` — upgrading ccteam does not lose your bot's context. If a chat pane was killed (OOM, manual `tmux kill-session`), the next `ccteam start` re-spawns it with `claude --resume <name>` so the model reloads its full API-level context (tool-use history, cache, reasoning) losslessly via the official Anthropic CLI path. If resume isn't possible (no on-disk session, schema drift), ccteam falls back to a fresh session and emits a visible `chat_session_reset` event — you'll see the bot acknowledge the reset rather than silently forget.
+- **A meta AI team you drive from your phone** — assign work, get results, and intervene from IM, anywhere.
+- **Multi-project, multi-session** — one chat fans out across many repos and many concurrent agent sessions, each with its own context.
+- **Two agent vendors** — Claude (tmux TUI) and Codex (app-server) side by side; ask for a cross-vendor second opinion on hard calls.
+- **Durable by design** — sessions survive daemon restarts and machine reboots; nothing silently forgets.
+- **File-system source of truth** — all state is reconstructable from disk; ccteam reads hooks, transcripts, and RPC events, never scraped terminal text.
+- **Cost-aware** — per-vendor 24h budgets with a hard ceiling; long-running sessions are never killed unless a budget cap is hit.
+- **Cross-project memory** — lessons accumulate through the official Claude Code / Codex memory channels, so new projects don't start from zero.
+- **Web console** — a local dashboard to watch sessions, transcripts, and spend in real time.
+- **MCP surface** — the `ccteam` MCP server exposes workflow, chat, advise, admin, and screenshot tool groups for programmatic control.
 
 ## Docs
 
 | What you want | Read this |
 |---|---|
-| Decision tree — task to command (with examples) | [docs/task-to-command.md](docs/task-to-command.md) |
-| 5-minute walkthrough for the flagship IM-bot use case | [docs/quickstart.md](docs/quickstart.md) |
-| Full user manual (every scenario, every flag) | [docs/user-manual.md](docs/user-manual.md) |
-| Copy-paste a ready-made use case | [docs/recipes.md](docs/recipes.md) |
-| Something broke | [docs/troubleshooting.md](docs/troubleshooting.md) |
-| Advanced customization / Codex integration | [docs/advanced/](docs/advanced/) |
+| Command guide — every CLI command, slash command, and IM control | [docs/usage.md](docs/usage.md) |
+| Architecture — components, data protocols, design rationale | [docs/tech-design.md](docs/tech-design.md) |
+| Requirements — the problems ccteam solves, and for whom | [docs/requirements.md](docs/requirements.md) |
 
 ## License & acknowledgements
 
-See [LICENSE](LICENSE). Built on [Claude Code](https://code.claude.com/) (the runtime) and [openhuman/channels](https://github.com/openhuman/channels) (14+ IM platforms in Rust); orchestration taxonomy from Anthropic's *Building Effective Agents*; IM-bot pattern (tmux + send-keys + transcript polling) inspired by `ccgram` and `oh-my-claudecode`.
+MIT — see [LICENSE](LICENSE). Built on [Claude Code](https://code.claude.com/) (the agent runtime) and OpenAI Codex, with [openhuman/channels](https://github.com/openhuman/channels) providing IM connectivity across many platforms. The IM-bot pattern (tmux + send-keys + transcript polling) is inspired by `ccgram` and `oh-my-claudecode`.
