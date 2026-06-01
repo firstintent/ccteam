@@ -18,8 +18,8 @@
 //!    then `ccteam stop`s gracefully. With `--no-imd` set the
 //!    heartbeat must NOT appear.
 
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
 fn ccteam_bin() -> &'static str {
@@ -71,9 +71,21 @@ fn standalone_ccteam_im_binary_no_longer_exists() {
 }
 
 /// V0.6.1 F130 smoke — `ccteam start --no-web` should bring up the IMD
-/// supervisor as a tokio task inside the orchestrator process and
-/// refresh `~/.ccteam/state/imd.heartbeat` within ~5s. With `--no-imd`,
-/// no fresh heartbeat is observed.
+/// supervisor as a tokio task inside the gateway process and publish
+/// `~/.ccteam/state/imd.heartbeat`. With `--no-imd`, no fresh heartbeat
+/// is observed.
+///
+/// The heartbeat is written **once at daemon boot** (the v8.1 gateway
+/// daemon has no supervisor tick), so observing it is really measuring
+/// "process spawned + booted past the heartbeat write" — a one-shot
+/// startup latency that is ~60ms on an idle host. Under heavy parallel
+/// test load the cold-start of the (large) debug binary plus tokio
+/// runtime init can stretch that out, so [`READY_TIMEOUT`] is
+/// deliberately generous and load-insensitive: we only assert the
+/// supervisor *eventually* publishes a heartbeat, never that it is fast.
+/// A daemon that dies during boot is caught via `try_wait` so the test
+/// fails fast with the child's captured stderr instead of burning the
+/// whole timeout polling for a heartbeat that will never appear.
 ///
 /// We point HOME at a tempdir so the heartbeat lands in isolation and
 /// the test doesn't race with the operator's real daemon (if any).
@@ -95,6 +107,10 @@ fn start_spawns_imd_supervisor_unless_no_imd_set() {
     );
 
     // --- Case 1: default (no --no-imd) — heartbeat MUST appear -----
+    // Capture the daemon's stderr to a file (not /dev/null) so a boot
+    // failure is diagnosable from the assertion message instead of
+    // surfacing as a silent timeout.
+    let stderr_log = ccteam_home.join("daemon-case1.stderr.log");
     let started_at = SystemTime::now();
     let mut child = Command::new(ccteam_bin())
         .args(["start", "--no-web", "--tick-seconds", "1"])
@@ -103,30 +119,25 @@ fn start_spawns_imd_supervisor_unless_no_imd_set() {
         .env("CCTEAM_PROJECTS_ROOT", fake_home.join("projects"))
         .env("RUST_LOG", "warn")
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(
+            std::fs::File::create(&stderr_log).expect("create daemon stderr log"),
+        ))
         .spawn()
         .expect("spawn ccteam start");
     let child_pid = child.id();
 
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let mut observed = false;
-    let mut observed_mcp = false;
-    while Instant::now() < deadline {
-        if let Ok(meta) = std::fs::metadata(&heartbeat) {
-            if let Ok(mtime) = meta.modified() {
-                if mtime >= started_at {
-                    observed = true;
-                }
-            }
-        }
-        if mcp_socket.exists() {
-            observed_mcp = true;
-        }
-        if observed && observed_mcp {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    let (observed, observed_mcp) = await_supervisor_ready(
+        &mut child,
+        &heartbeat,
+        &mcp_socket,
+        started_at,
+        READY_TIMEOUT,
+    );
+    // Record whether the daemon exited on its own (crash / early bail)
+    // before we issue the teardown trigger — folded into the assertion
+    // message so a real boot failure is obvious rather than looking
+    // like a slow heartbeat.
+    let early_exit = child.try_wait().ok().flatten();
 
     // Tear down — write the F86 shutdown trigger.
     let trigger = trigger_path();
@@ -145,15 +156,23 @@ fn start_spawns_imd_supervisor_unless_no_imd_set() {
     }
     let _ = std::fs::remove_file(&trigger);
 
+    let daemon_stderr = std::fs::read_to_string(&stderr_log).unwrap_or_default();
     assert!(
         observed,
-        "F130: IMD heartbeat at {} should have been refreshed by the in-process supervisor within 15s",
-        heartbeat.display()
+        "F130: IMD heartbeat at {} was not published by the in-process supervisor within {}s \
+         (observed_mcp={observed_mcp}, daemon early_exit={early_exit:?}).\n\
+         The heartbeat is written once at daemon boot, so this means the daemon never reached \
+         that point.\n--- daemon stderr ---\n{}",
+        heartbeat.display(),
+        READY_TIMEOUT.as_secs(),
+        daemon_stderr.trim(),
     );
     assert!(
         observed_mcp,
-        "v8.1: MCP socket at {} should be served by `ccteam start`",
-        mcp_socket.display()
+        "v8.1: MCP socket at {} should be served by `ccteam start` \
+         (daemon early_exit={early_exit:?}).\n--- daemon stderr ---\n{}",
+        mcp_socket.display(),
+        daemon_stderr.trim(),
     );
 
     // --- Case 2: --no-imd — heartbeat must NOT appear --------------
@@ -199,6 +218,56 @@ fn start_spawns_imd_supervisor_unless_no_imd_set() {
         "F130: with --no-imd, supervisor task must be skipped — observed fresh heartbeat at {}",
         heartbeat.display()
     );
+}
+
+/// Generous, load-insensitive budget for the daemon to publish its
+/// first (and only) boot heartbeat + bind the MCP socket. The happy
+/// path resolves in tens of milliseconds; this ceiling exists purely so
+/// a genuinely-stuck daemon eventually fails the test rather than
+/// hanging forever. It must NOT be tightened to "catch slow boots" — a
+/// slow-but-successful boot under parallel load is a pass, not a bug.
+const READY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Poll until the IMD heartbeat is fresh (`mtime >= since`) **and** the
+/// MCP socket is bound, or `timeout` elapses, or `child` exits early.
+///
+/// Returns `(observed_heartbeat, observed_mcp)`. The early-exit check is
+/// the key robustness property: a daemon that crashes during boot is
+/// detected within one poll interval, so the caller fails fast with the
+/// child's captured stderr instead of polling a never-coming heartbeat
+/// for the full timeout and then reporting a misleading "within Ns".
+fn await_supervisor_ready(
+    child: &mut Child,
+    heartbeat: &Path,
+    mcp_socket: &Path,
+    since: SystemTime,
+    timeout: Duration,
+) -> (bool, bool) {
+    let deadline = Instant::now() + timeout;
+    let mut observed = false;
+    let mut observed_mcp = false;
+    while Instant::now() < deadline {
+        if !observed {
+            if let Ok(meta) = std::fs::metadata(heartbeat) {
+                if let Ok(mtime) = meta.modified() {
+                    observed = mtime >= since;
+                }
+            }
+        }
+        if !observed_mcp {
+            observed_mcp = mcp_socket.exists();
+        }
+        if observed && observed_mcp {
+            break;
+        }
+        // Bail the instant the daemon dies — no point waiting out the
+        // timeout for signals a dead process can no longer emit.
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    (observed, observed_mcp)
 }
 
 /// Mirror of `crates/ccteam-cli/src/main.rs::shutdown_trigger_path` so
