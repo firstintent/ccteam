@@ -1,300 +1,219 @@
 # Quickstart
 
-> **第一节先看决策树** ── 你想做的事 → 直接对应一个命令,不必先理解架构。
->
-> 第二节起是 "我要做 IM bot" 这条路的 5 分钟走通流程(从 0 到 **你手机 TG 收到 bot 第一条回话**)。其他路径详见 [task-to-command.md](task-to-command.md) + [user-manual.md](user-manual.md)。
->
-> 卡住任何一步?跳到 [troubleshooting.md](troubleshooting.md) 搜对应章节。
+目标:5-10 分钟从空机器跑到 Telegram 里第一条往返。你只需要一个本地仓库、Claude Code、Codex CLI 和一个 Telegram bot token。
 
----
+## 1. 安装 CLI 和插件
 
-## §1 我该用哪个命令?(决策树)
-
-```
-你想做的事                                  → 用这个
-──────────────────────────────────────────────────────────────────
-摸底新代码库(60s 零依赖,首选)              /ccteam-scan --quick     ↓ §1.5 详跑
-仓库 navigability 体检 / 大型 monorepo audit  /ccteam-scan
-开发 / 修 bug / 重构(全程盯着干)            /ccteam-team "<task>"
-跨 vendor 第二意见(Claude + Codex)          /ccteam-advise "<问题>"   ↓ §4 详跑
-做个 IM 私聊助理(长期 24/7 在线)            /ccteam-creator "做个 X 助理"  ↓ §2 详跑通
-做个团队 IM 圆桌(多 bot 互动)               /ccteam-creator "群里几个 bot"
-夜里跑长任务(hands-off / 关电脑)            /ccteam-creator "<task>,睡前跑"
-程序化起 bot / 看历史 / 重置 session         mcp__ccteam__chat_*      ↓ §5 详跑
-看 / 暂停 / 恢复 / 看花费                    /ccteam-control list / pause / cost
-配 / 改 IM token(TG / Slack / Discord)      /ccteam-im-setup
-验证安装 / MCP 表面 / Codex critic / cost     ccteam doctor [--verify-mcp | --check-codex-auto-critic | --check-cost-orphan]
-不确定?用自然语言问                          /ccteam "<NL 描述>"
-```
-
-每条详解 + 例子见 [task-to-command.md](task-to-command.md)。
-
----
-
-## §1.5 60 秒上手:`/ccteam-scan --quick`(零依赖,首选)
-
-第一次摸 ccteam,如果你不打算立刻起 bot,**最低门槛的体验**就是 `--quick` 扫一个本地仓库:无需 IM token、无需 daemon、无需 Codex,只调一次 Sonnet,1 分钟内给你三段报告(主语言/框架/入口 · TODO 热点 · `CLAUDE.md` / `AGENTS.md` 状态)+ 一句建议你下一步该跑哪个 ccteam 命令。
-
-```bash
-cd path/to/any-repo
-claude
-```
-
-session 里:
-
-```
-/ccteam-scan --quick
-```
-
-输出大致这样:
-
-```
-ccteam-scan (quick) → <repo>/.ccteam/codebase-scan.md
-
-[1/3] Language / framework / entry
-  Rust workspace · tokio + axum · entry crates/ccteam-cli/src/main.rs
-
-[2/3] TODO / FIXME hotspots
-  crates/ccteam-im/src/outbound.rs: 4 TODO
-  docs/troubleshooting.md: 2 FIXME
-
-[3/3] CLAUDE.md / README / AGENTS.md status
-  CLAUDE.md ✓ (180 lines, current) · README.md ✓ (English) · AGENTS.md → CLAUDE.md symlink ✓
-  建议下一步:用 /ccteam-team 处理 TODO,或 /ccteam-creator 起一个长跑 bot 监控这堆 hotspot
-```
-
-24h 内复跑会直接显示上次报告(`--force` 强制重扫)。**不**写 git / 不开 daemon / 不动 `~/.ccteam/`。
-
----
-
-## §1.6 新项目零配置上手:`/ccteam-creator` 自动探测
-
-`/ccteam-creator` 第一次在你仓库内跑时,会先调 `ccteam probe-project` 探测项目类型(monorepo / single repo / docs-only / scripts-only)+ 主语言(Rust / TypeScript / Python / Go ...),然后把探测结果喂给后续 yaml 生成 ── 你拿到的初始 workflow.yaml `scope:` 段已按项目结构填好,role.md 也按主语言挑了合适默认值,**不必手改就能跑**。
-
-```bash
-cd path/to/your/repo
-claude
-```
-
-session 里:
-
-```
-/ccteam-creator "做个 monorepo 后端 reviewer"
-```
-
-ccteam-creator 先报探测结果:
-
-```
-Project probe:
-  kind: Monorepo (cargo workspace)
-  languages: Rust, TypeScript
-  probable scope: crates/api-core/src, crates/api-cli/src, services/web/src
-
-Generating workflow with scope pinned to those subtrees ...
-```
-
-如果探测错(比如混合 monorepo / 你想要别的 scope),后续向导对话里直接 `scope: 改成 X` 覆盖即可。也可单独跑探测:
-
-```bash
-ccteam probe-project --json    # 看 ccteam 怎么"看"你的仓库
-```
-
-输出 `kind` / `languages` / `probable_scope` 三段 JSON。
-
----
-
-## §2 走通 "IM 私聊助理" 这条路(5 分钟)
-
-下面是 ccteam **最有代表性的** 一条路 —— 起一个 Telegram 私聊 bot 当你的 AI 助理。
-
-**你需要**:
-
-- Claude Code(`claude` CLI),装好登好。没装看 [code.claude.com/docs/install](https://code.claude.com/docs/install)。
-- Telegram 账号 + 手机装 Telegram app。macOS / Linux 主机(Windows 走 WSL2)。
-
----
-
-## Step 1 — 装 ccteam plugin(30 秒)
-
-ccteam 走 Claude Code 官方 plugin marketplace 协议安装 —— **plugin 是首选路径**,CLI binary 作为前置条件先装好(plugin 通过 MCP 调用本机 `ccteam` 命令)。
-
-### 1.1 装 CLI binary(前置,一次性)
-
-**首选 ── 一行装预编译 binary(不需要 Rust toolchain):**
+先装 `ccteam` CLI:
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh | sh
-ccteam --version    # 应输出当前版本号
+ccteam --version
 ```
 
-默认装到 `~/.local/bin/ccteam`。装完如果该路径不在 `$PATH`,脚本会打印一行 export 指令(贴进 `~/.bashrc` / `~/.zshrc` 再 `source` 即可)。
+如果脚本提示 `~/.local/bin` 不在 `PATH`,把它打印的 `export PATH=...` 加到 shell 配置后重新打开终端。
 
-支持的平台:Linux x86_64、macOS arm64(Apple Silicon)、macOS x86_64(Intel)。Windows 用户走 WSL2 + linux-x64 binary —— native Windows 不支持(tmux + inotify + POSIX signals 是 ccteam 架构根基)。
-
-环境变量:
-- `CCTEAM_INSTALL_DIR=/usr/local/bin sh install.sh` —— 改装目录(系统级安装)
-- `CCTEAM_VERSION=v0.8.2 sh install.sh` —— 装指定 tag(不取 latest)
-
-macOS Gatekeeper 拦截(首次跑报"not verified developer"):
-```bash
-xattr -d com.apple.quarantine ~/.local/bin/ccteam
-```
-
-**回退 ── 从源码 build(需要 Rust 1.85+,5-15 min 编译):**
+在 Claude Code 里安装 Claude 插件:
 
 ```bash
-cargo install --git https://github.com/firstintent/ccteam ccteam-cli
+claude
 ```
 
-新机器没装 Rust 时,先 `curl https://sh.rustup.rs -sSf | sh` 装 rustup,然后再跑上面这条。
+Claude 会话内执行:
 
-### 1.2 在 Claude session 里注册 marketplace + 装 plugin
-
-任意 terminal 起 Claude session:
-
-```bash
-$ claude
-```
-
-在 session 里依次输入:
-
-```
+```text
 /plugin marketplace add https://github.com/firstintent/ccteam
 /plugin install ccteam
 ```
 
-预期输出:
+Codex 用户也装 Codex 插件:
 
-```
-✓ Installed ccteam
-  • slash commands registered: /ccteam, /ccteam-team, /ccteam-creator, /ccteam-control, /ccteam-im-setup, /ccteam-scan, /ccteam-advise
-  • mcp__ccteam__* tools available (workflow_* / chat_* / advise_* / admin_* / screenshot_*)
+```bash
+codex plugin marketplace add firstintent/ccteam
 ```
 
-跑 `ccteam doctor` 验装(claude CLI / MCP / tmux / pidfile 路径都查一遍);加 `--verify-mcp` 自检 MCP 工具表面齐全(应输出 `27 active, 0 stubs`,非零 exit 即 CI gate fail);加 `--check-codex-auto-critic` 验证 Codex 二审是否能开;加 `--check-cost-orphan` 对账 24h 内 ledger 与 progress.jsonl(catch spawn 路径漏写 ledger)。`ccteam start` 还会启动本机 MCP socket:`~/.ccteam/run/mcp.sock`。
+最后跑一次体检:
 
-→ 卡了?见 [troubleshooting.md](troubleshooting.md) "plugin install 失败"。
-
----
-
-## Step 2 — 绑定你的 TG bot(2 分钟)
-
-```
-/ccteam-im-setup
+```bash
+ccteam doctor
+ccteam doctor --verify-mcp
 ```
 
-向导引导你:浏览器自动开 [@BotFather](https://t.me/BotFather) → 发 `/newbot` → 起名(如 `my_helper_bot`)→ 复制 token 粘回 Claude → 向导在 TG 监听 30 秒,你随便发条 `hi`,它自动抓 `chat_id`。
+`--verify-mcp` 应显示 `27 active, 0 stubs`。
 
-预期结束:
+## 2. 登录 Claude 和 Codex
 
-```
-✓ Telegram bot 已绑定:@my_helper_bot
-✓ chat_id 抓到:123456789
-✓ Daemon ccteam-im 已起
-现在可以跟 @my_helper_bot 私聊:https://t.me/my_helper_bot
-```
+`ccteam` 不打包 Claude 或 Codex 二进制,它调用你机器上的真实 CLI。
 
-→ 卡了?见 [troubleshooting.md](troubleshooting.md) "TG token 拿不到 / chat_id 抓不到"。
-
----
-
-## Step 3 — 让 ccteam 做一个 Pocket Assistant(1 分钟)
-
-```
-/ccteam-creator "做个 TG 私聊助理 bot,帮我每天读邮件 + 看 GitHub PR + 早 7 点发摘要"
+```bash
+claude --version
+codex --version
 ```
 
-ccteam-creator 自动判定是 **Pocket Assistant** preset,问 2-3 个问题:
+如果任一命令要求登录,按对应 CLI 的提示完成登录。之后再跑:
 
-```
-Creator: persona 模板?推荐 "Personal Workflow Assistant"(中文)
-         其他选项:Technical Helper / Writing Coach / Translator / Study Buddy
-You:     用 Personal Workflow Assistant
-
-Creator: 24h cost cap?建议 $2 起步(用得多再调)
-You:     $2
-
-Creator: 计划:Preset = Pocket Assistant · Persona = Personal Workflow Assistant(中文)
-         · IM = TG @my_helper_bot(私聊)· cap = $2/24h。回 "go" 起。
-You:     go
+```bash
+claude --version
+codex --version
+ccteam doctor
 ```
 
-预期:
+## 3. 初始化两个项目
 
-```
-✓ Workflow created: helper-bot
-✓ Bot @my_helper_bot is now live
-✓ Web dashboard: http://localhost:7331/p/helper-bot
-```
+一个 chat 可以同时切多个项目。下面用两个本地目录演示:
 
----
+```bash
+mkdir -p ~/projects/demo-app ~/projects/demo-api
 
-## Step 4 — 去 TG 私聊它(30 秒)
+cd ~/projects/demo-app
+ccteam init --slug demo-app
 
-打开 Telegram,搜 `@my_helper_bot`(你 Step 2 起的名字),点 Start。
-
-发条消息:
-
-```
-你好,你能帮我做啥?
+cd ~/projects/demo-api
+ccteam init --slug demo-api
 ```
 
-预期:几秒内收到 bot 自我介绍 + 列能力清单。
+`ccteam init` 会在项目里写入 `.ccteam/{agents,skills,state.json}` 和 `.claude/agents`。重跑是安全的;如果你明确要覆盖 ccteam 生成物,加 `--force`。
 
-🎉 **完成。你的第一个 AI 助理已经在 TG 里跑起来了。**
+## 4. 配 Telegram bot
 
----
+在 Telegram 里找 `@BotFather`,创建 bot 并复制 token。然后先给你的 bot 发一条消息,或把 bot 加进目标群后发一条消息,用下面命令拿 chat id:
 
-## Step 5 — 跨设备试试(可选)
-
-笔记本继续开着,掏手机走开,继续在 TG 跟 bot 聊。bot 仍然回。bot 跑在**你电脑上**(能动文件 / 跑命令),手机只是入口 — 这是跟 ChatGPT app 拉开差异的关键。
-
----
-
-## §4 跨 vendor 第二意见:`/ccteam-advise`(可选)
-
-碰到拿不准的设计 / PR / 代码片段,想要 Claude + Codex 两边各给一个答案再自己拍板:
-
-```
-/ccteam-advise vote "这段 SSO 设计的 token-refresh 路径有没有竞态?"
+```bash
+BOT_TOKEN='123456:replace_me'
+curl -s "https://api.telegram.org/bot${BOT_TOKEN}/getUpdates"
 ```
 
-ccteam 并行调用 Claude + Codex 两个 advisor,合成 verdict(majority / unanimous / split),附每个 vendor 的原始答复 + 估算 cost。`parallel` 模式不合成,直接给两份 raw answer 让你自己读:
+在输出里找到目标 `chat.id`,写入本机凭证文件:
 
-```
-/ccteam-advise parallel "重构这段 auth 中间件有几种方式?"
-```
-
-**前置**:Codex 装好(`codex --version`)+ `codex login` 跑过。没装 ccteam 会 graceful 降级跑单 Claude advisor,verdict prose 说 "Codex unavailable: <reason>",**不报错**。两个 vendor 各自走 24h cost cap(`<ccteam_root>/cost-budget.json`,撞顶自动跳过该 vendor)。
-
-底层 MCP 工具:`mcp__ccteam__advise_vote` / `mcp__ccteam__advise_parallel`。
-
----
-
-## §5 程序化起 bot:chat MCP 工具(可选)
-
-`/ccteam-creator` 是新手 onboarding 通路;**已经懂 ccteam** 之后,从 Claude session 内直接调 MCP 工具更快:
-
-```
-mcp__ccteam__chat_register_bot { "slug": "helper", "role": "main", "vendor": "claude", "im_chat_id": "123456789" }
-mcp__ccteam__chat_list_bots {}
-mcp__ccteam__chat_send_input { "slug": "helper", "role": "main", "text": "summarize today's PRs" }
-mcp__ccteam__chat_history { "slug": "helper", "role": "main", "limit": 10 }
-mcp__ccteam__chat_reset { "slug": "helper", "role": "main" }
-mcp__ccteam__chat_unregister_bot { "slug": "helper", "role": "main" }
+```bash
+mkdir -p ~/.ccteam/im
+chmod 700 ~/.ccteam ~/.ccteam/im
+cat > ~/.ccteam/im/credentials.json <<'JSON'
+{
+  "telegram": {
+    "bot_token": "123456:replace_me",
+    "allowed_chat_ids": ["123456789"]
+  }
+}
+JSON
+chmod 600 ~/.ccteam/im/credentials.json
 ```
 
-6 个工具组成完整生命周期:register → list / send_input / history → reset → unregister。`chat_reset` 归档 `turns.jsonl` 到 `archive/turns-<ts>.jsonl` + 清 outbound cursor + 清 transcript cursor(daemon 内存与磁盘同步重置)。`vendor` 字段严格小写枚举:`claude` 或 `codex`。
+`allowed_chat_ids` 是安全边界:只允许这些 chat 触达 daemon。生产环境不要留空。
 
-适合场景:CI 编排起多个 bot 做 batch / 给已跑 bot 推一个程序化指令 / 抓 bot 历史做 audit。**仍然守红线**:per-bot tmux session、`progress.jsonl` 是 state SoT、不写 prompt。
+## 5. 启动 gateway daemon
 
----
+```bash
+ccteam start > /tmp/ccteam.log 2>&1 &
+```
 
-## 接下来读什么
+这个进程同时提供:
 
-- 想跑别的命令(不是 IM bot)?→ [task-to-command.md](task-to-command.md)(决策树详解)
-- 想跑别的 use case?→ [recipes.md](recipes.md)(代码审查 bot / 翻译 bot / 日报助手等 10 个现成模板)
-- 想了解全部 5 种用法?→ [user-manual.md](user-manual.md)
-- 想给 bot 换 persona / 加能力?→ [user-manual.md](user-manual.md) §2.4 Pocket Assistant
-- 装 Codex 让两个 LLM 互审?→ [advanced/multi-llm-codex.md](advanced/multi-llm-codex.md)
-- 出错?→ [troubleshooting.md](troubleshooting.md)
+- IM gateway:Telegram 入站/出站长连接
+- MCP socket:`~/.ccteam/run/mcp.sock`
+- Web UI:`http://127.0.0.1:7331`
+
+看状态:
+
+```bash
+ccteam status
+tail -40 /tmp/ccteam.log
+```
+
+停机:
+
+```bash
+ccteam stop
+```
+
+`ccteam stop` 只停 daemon,不会杀 Claude tmux session。下次 `ccteam start` 会按 session id 接回。
+
+## 6. 在 Telegram 里跑第一条消息
+
+给 bot 发送:
+
+```text
+/pair phone
+```
+
+预期回复:
+
+```text
+paired phone
+```
+
+然后创建两个 session:
+
+```text
+/cd demo-app
+/new claude reviewer
+
+/cd demo-api
+/new codex api
+```
+
+看列表:
+
+```text
+/sessions
+/projects
+```
+
+你现在有同一个 chat 里的两个 harness:
+
+- `@reviewer`:Claude Code tmux TUI session
+- `@api`:Codex app-server session
+
+发消息:
+
+```text
+@reviewer 看一下这个项目的 README,给我三条风险
+@api /review
+@api /compact
+@reviewer /clear
+```
+
+`@handle` 决定路由;不带 `@handle` 时消息发给当前 session。`/cd` 只切当前 chat 的当前项目,不会影响其他 Telegram chat。
+
+## 7. 日常操作
+
+常用 Telegram 命令:
+
+| 命令 | 作用 |
+|---|---|
+| `/new claude reviewer` | 在当前项目创建 Claude session,handle 是 `@reviewer` |
+| `/new codex api` | 在当前项目创建 Codex session,handle 是 `@api` |
+| `/use s1` | 切到 session `s1` |
+| `/cd demo-api` | 当前 chat 切到 `demo-api` 项目 |
+| `/sessions` | 列当前 chat 的 session |
+| `/projects` | 列 daemon 已知项目 |
+| `@api /compact` | Codex 原生 compact RPC |
+| `@api /review` | Codex 原生 review RPC |
+| `@reviewer /clear` | Claude TUI slash 透传 |
+
+一个 chat 就是一台终端:你可以在里面同时操作多个项目和多个 session。不同 chat 互相隔离。
+
+## 8. 手动凭证门:真实 Telegram roundtrip
+
+真实 Telegram 验收需要你的 token 和 chat id,因此默认不跑。需要验收时执行:
+
+```bash
+CCTEAM_REAL_IM_TELEGRAM=1 \
+CCTEAM_TELEGRAM_BOT_TOKEN='123456:replace_me' \
+CCTEAM_TELEGRAM_CHAT_ID='123456789' \
+bash scripts/smoke-im.sh --real
+```
+
+脚本会向该 chat 发送唯一验证码,等待你把同一验证码回给 bot,然后发送 PASS ACK。这个门是手动/凭证门验收,不阻塞普通 ship gate。
+
+## 9. 卡住时
+
+先跑:
+
+```bash
+ccteam doctor
+ccteam status
+tail -80 /tmp/ccteam.log
+```
+
+再看 [troubleshooting.md](troubleshooting.md)。常见问题是 Telegram chat id 不在 `allowed_chat_ids`、Claude/Codex CLI 未登录、daemon 没重启读取新 credentials。

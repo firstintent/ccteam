@@ -1316,6 +1316,7 @@ where
     .expect("timed out waiting for websocket SendMessage")
 }
 
+#[allow(clippy::result_large_err)]
 async fn recv_ws_until_contains<S>(socket: &mut WebSocketStream<S>, needle: &str, timeout: Duration)
 where
     S: AsyncRead + AsyncWrite + Unpin,

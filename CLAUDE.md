@@ -31,7 +31,7 @@
 | 主分支 main HEAD | 以 `git rev-parse origin/main` 为准 |
 | Workspace version | **`0.8.2`** |
 | 测试 baseline | **`1743/0`**(`cargo test --workspace --locked --no-fail-fast --exclude ccteam-web`,2026-06-01 本机通过;`ccteam-web` ws_* 测试仍留 CI/专机跑)|
-| Clippy | **0 errors + 0 warnings**(`-D warnings` clean)|
+| Clippy | **0 errors + 0 warnings**(`cargo clippy --workspace --all-targets -- -D warnings` clean)|
 | 代码规模 | ~96 kLOC Rust(workspace,~66 kLOC src + ~30 kLOC tests,不含 references)|
 | 当前最新版 | **V0.8.2**(v8.2 真实 WS 端到端:多项目×多 session 路由、Claude tmux + Codex app-server 并发、daemon restart resume、真实二进制 fault visibility、退役遗留 supervisor tick coordinator)— 详 `docs/versions/v0-8-2/README.md` |
 | 上一版 | **V0.8.1**(v8.1 云 CC/Codex + IM 架构竖切:rename 到 harness/im,core→flow 抽离,Claude tmux adapter skip-perms, Codex app-server RPC,IM gateway 接管 session 生命周期,`ccteam start` 成为不 tick 的 gateway daemon,init 写 `.ccteam/{agents,skills,state.json}`)— 详 `docs/versions/v0-8-1/README.md` |

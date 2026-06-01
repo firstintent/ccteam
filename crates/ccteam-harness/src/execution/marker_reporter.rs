@@ -109,49 +109,47 @@ mod tests {
 
     #[tokio::test]
     async fn register_then_lookup_returns_live_reporter() {
-        _clear_for_tests();
         let r = Arc::new(CountingReporter {
             missing: AtomicUsize::new(0),
             found: AtomicUsize::new(0),
         });
         let weak: Weak<dyn MarkerReporter> = Arc::downgrade(&r) as Weak<dyn MarkerReporter>;
-        register("dev-foo", "alice", weak);
-        let looked = lookup("dev-foo", "alice").expect("registered key resolves");
+        register("marker-register-test", "alice", weak);
+        let looked = lookup("marker-register-test", "alice").expect("registered key resolves");
         looked.report_marker_missing().await;
         assert_eq!(r.missing.load(Ordering::SeqCst), 1);
+        unregister("marker-register-test", "alice");
     }
 
     #[tokio::test]
     async fn lookup_unknown_key_returns_none() {
-        _clear_for_tests();
-        assert!(lookup("dev-foo", "bob").is_none());
+        assert!(lookup("marker-unknown-test", "bob").is_none());
     }
 
     #[tokio::test]
     async fn dropped_supervisor_becomes_invisible() {
-        _clear_for_tests();
         let r = Arc::new(CountingReporter {
             missing: AtomicUsize::new(0),
             found: AtomicUsize::new(0),
         });
         let weak: Weak<dyn MarkerReporter> = Arc::downgrade(&r) as Weak<dyn MarkerReporter>;
-        register("dev-foo", "alice", weak);
+        register("marker-dropped-test", "alice", weak);
         drop(r);
         // Weak upgrade fails after the Arc is dropped — lookup must
         // return None, NOT a stale clone that panics on call.
-        assert!(lookup("dev-foo", "alice").is_none());
+        assert!(lookup("marker-dropped-test", "alice").is_none());
+        unregister("marker-dropped-test", "alice");
     }
 
     #[tokio::test]
     async fn unregister_drops_entry() {
-        _clear_for_tests();
         let r = Arc::new(CountingReporter {
             missing: AtomicUsize::new(0),
             found: AtomicUsize::new(0),
         });
         let weak: Weak<dyn MarkerReporter> = Arc::downgrade(&r) as Weak<dyn MarkerReporter>;
-        register("dev-foo", "alice", weak);
-        unregister("dev-foo", "alice");
-        assert!(lookup("dev-foo", "alice").is_none());
+        register("marker-unregister-test", "alice", weak);
+        unregister("marker-unregister-test", "alice");
+        assert!(lookup("marker-unregister-test", "alice").is_none());
     }
 }
