@@ -406,8 +406,20 @@ impl Gateway {
                 }
                 self.current_project
                     .insert(chat.clone(), project.to_string());
+                // The active session must follow the project switch, otherwise
+                // messages keep landing in the previous project's session while
+                // the receipt claims we moved. Adopt an existing session owned by
+                // this chat in the target project (deterministic: smallest id);
+                // otherwise clear the active session so the next message spawns
+                // one on demand in the target project via `ensure_current_session`.
+                let adopted = self.adopt_session_in_project(chat, project);
                 self.persist_state()?;
-                Ok(Some(format!("project set to {project}")))
+                Ok(Some(match adopted {
+                    Some(sid) => format!("project set to {project} (switched to {sid})"),
+                    None => {
+                        format!("project set to {project} (next message starts a session there)")
+                    }
+                }))
             }
             "/sessions" => Ok(Some(self.render_sessions(chat))),
             "/projects" => Ok(Some(self.render_projects())),
@@ -421,9 +433,23 @@ impl Gateway {
         }
         let templates = self.templates_for_chat(chat);
         if templates.len() == 1 {
-            self.start_template_session(chat.clone(), templates[0].clone())
-                .await?;
-            return Ok(());
+            // A single registered bot template spawns on demand — UNLESS the
+            // user explicitly `/cd`'d to a different project. An explicit `/cd`
+            // target wins over the template so the project switch is honoured:
+            // fall through to a generic assistant in the requested project
+            // rather than silently dragging the message back into the bot's
+            // project. (Tradeoff: the bot's role/vendor are not reused once you
+            // `/cd` off its project.)
+            let template = &templates[0];
+            let cd_elsewhere = self
+                .current_project
+                .get(chat)
+                .is_some_and(|p| *p != template.project);
+            if !cd_elsewhere {
+                self.start_template_session(chat.clone(), template.clone())
+                    .await?;
+                return Ok(());
+            }
         }
         if templates.len() > 1 {
             let mut handles: Vec<String> = templates.iter().map(|t| t.handle.clone()).collect();
@@ -683,6 +709,28 @@ impl Gateway {
             .unwrap_or_else(|| self.default_project.clone())
     }
 
+    /// Point the chat's active session at an existing session owned by this
+    /// chat in `project` (deterministic: smallest session index), returning its
+    /// id. When none exists, clear the active session so the next message spawns
+    /// one on demand in `project`. Backs `/cd` so the project switch is real.
+    fn adopt_session_in_project(&mut self, chat: &ChatKey, project: &str) -> Option<String> {
+        let adopted = self
+            .sessions
+            .values()
+            .filter(|s| s.owner == *chat && s.project == project)
+            .min_by_key(|s| session_index(&s.id))
+            .map(|s| s.id.clone());
+        match &adopted {
+            Some(id) => {
+                self.current_session.insert(chat.clone(), id.clone());
+            }
+            None => {
+                self.current_session.remove(chat);
+            }
+        }
+        adopted
+    }
+
     fn session_by_handle(&self, chat: &ChatKey, handle: &str) -> Option<String> {
         self.sessions
             .values()
@@ -855,6 +903,14 @@ fn parse_vendor(raw: &str) -> Result<AgentVendor> {
         "codex" => Ok(AgentVendor::Codex),
         other => Err(anyhow!("unknown vendor: {other}")),
     }
+}
+
+/// Numeric ordering key for a `s{n}` session id; unparseable ids sort last so
+/// session adoption stays deterministic.
+fn session_index(id: &str) -> u64 {
+    id.strip_prefix('s')
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(u64::MAX)
 }
 
 fn event_text(evt: &ThreadEvent) -> Option<String> {
@@ -1091,7 +1147,10 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/cd beta")
             .await
             .unwrap();
-        assert_eq!(cd, vec!["project set to beta"]);
+        assert_eq!(
+            cd,
+            vec!["project set to beta (next message starts a session there)"]
+        );
 
         gateway
             .handle_text("mock", "chat-1", "alice", "/new codex api")
@@ -1382,5 +1441,116 @@ mod tests {
             .unwrap();
         assert_eq!(reply, vec!["alpha-reviewer-reviewer-s1 echo: hello"]);
         assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn gateway_cd_switches_active_session_to_target_project() {
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        gateway.register_project("beta", "/tmp/beta");
+
+        // Active session s1 lives in project alpha.
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        let before = gateway
+            .handle_text("mock", "chat-1", "alice", "/sessions")
+            .await
+            .unwrap();
+        assert_eq!(before, vec!["s1:alpha:Claude:reviewer"]);
+
+        // /cd to beta, where no session exists yet, clears the active session.
+        let cd = gateway
+            .handle_text("mock", "chat-1", "alice", "/cd beta")
+            .await
+            .unwrap();
+        assert_eq!(
+            cd,
+            vec!["project set to beta (next message starts a session there)"]
+        );
+
+        // The next plain message must route into a beta session, not back s1.
+        let reply = gateway
+            .handle_text("mock", "chat-1", "alice", "where am i")
+            .await
+            .unwrap();
+        assert_eq!(reply, vec!["beta-assistant-s2 echo: where am i"]);
+
+        let after = gateway
+            .handle_text("mock", "chat-1", "alice", "/sessions")
+            .await
+            .unwrap();
+        assert_eq!(
+            after,
+            vec!["s1:alpha:Claude:reviewer\ns2:beta:Claude:assistant"]
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_cd_adopts_existing_session_in_target_project() {
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        gateway.register_project("beta", "/tmp/beta");
+
+        // s1 in alpha; then /cd beta + /new makes s2 in beta.
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/cd beta")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new codex api")
+            .await
+            .unwrap();
+
+        // /cd back to alpha must deterministically re-adopt the existing s1.
+        let cd_back = gateway
+            .handle_text("mock", "chat-1", "alice", "/cd alpha")
+            .await
+            .unwrap();
+        assert_eq!(cd_back, vec!["project set to alpha (switched to s1)"]);
+
+        let reply = gateway
+            .handle_text("mock", "chat-1", "alice", "ping")
+            .await
+            .unwrap();
+        assert_eq!(reply, vec!["alpha-reviewer-s1 echo: ping"]);
+    }
+
+    #[tokio::test]
+    async fn gateway_cd_overrides_single_template_project() {
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "default", "/tmp/default");
+        gateway.register_project("beta", "/tmp/beta");
+        gateway.register_bot_template(
+            &BotRegistration {
+                workflow_slug: "alpha".to_string(),
+                role: "lead".to_string(),
+                vendor: AgentVendor::Claude,
+                persona_id: None,
+                im_platform: "mock".to_string(),
+                im_chat_id: "chat-1".to_string(),
+                chat_handle: None,
+                project_dir: None,
+                created_at: chrono::Utc::now(),
+            },
+            "/tmp/alpha",
+        );
+
+        // /cd to a different project than the bot's: the explicit target wins,
+        // so the next message spawns a generic assistant in beta, not the bot.
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/cd beta")
+            .await
+            .unwrap();
+        let reply = gateway
+            .handle_text("mock", "chat-1", "alice", "hello")
+            .await
+            .unwrap();
+        assert_eq!(reply, vec!["beta-assistant-s1 echo: hello"]);
     }
 }
