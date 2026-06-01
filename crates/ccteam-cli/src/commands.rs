@@ -2557,7 +2557,7 @@ const NO_MODE_HELP: &str = "\nccteam doctor: pass at least one mode flag for the
      --install-meta-agent\n      \
      bootstrap the canonical meta-agent project at ~/projects/meta/. Implies --install-skill. (V0.4.1: handle dropped — one ccteam install = one meta-agent.)\n  \
      --install-mcp\n      \
-     register `mcpServers.ccteam` in ~/.claude.json so daily-driver claude + meta-agent see the 9-tool MCP server (M2.5).\n  \
+     register `mcpServers.ccteam` in ~/.claude.json so daily-driver claude + meta-agent see the ccteam MCP server. The exact tool count is printed by the command itself (and `ccteam doctor --verify-mcp`).\n  \
      --install-memory-bridge [--dry-run]\n      \
      write ~/.claude/rules/ccteam-lessons-<team>.md placeholders for every team with non-empty retro_schema (M4.2; V0.2 M0.16.2 — disk-driven team discovery).\n  \
      --reset-shipped-teams [--force]\n      \
@@ -2819,18 +2819,29 @@ fn render_install_memory_bridge_report(
 
 fn render_install_mcp_report() -> Result<String> {
     let path = crate::mcp_serve::install_mcp()?;
+    Ok(render_install_mcp_body(&path))
+}
+
+/// Pure renderer for the `--install-mcp` report body, split out from the
+/// `~/.claude.json` write so it stays unit-testable without touching the
+/// real config. The `tools surface` line interpolates the live tool count
+/// from the same `tool_definitions()` source `run_verify_mcp` introspects
+/// — never hard-code it, or the number drifts (it was stuck at "9" while
+/// the surface grew to 27).
+fn render_install_mcp_body(path: &std::path::Path) -> String {
     let mut out = String::from("ccteam doctor --install-mcp\n\n");
     out.push_str(&format!(
         "  registered ccteam MCP server in {}\n",
         path.display()
     ));
-    out.push_str("  tools surface : 9 (interfaces §12.2)\n");
+    let total_tools = run_verify_mcp().total_tools;
+    out.push_str(&format!("  tools surface : {total_tools}\n"));
     out.push_str("  consumers     : daily-driver claude + meta-agent\n");
     out.push('\n');
     out.push_str(
         "open a new claude session to pick up the change; existing sessions need /reload-mcp.\n",
     );
-    Ok(out)
+    out
 }
 
 fn skill_install_label(action: &SkillInstallAction) -> String {
@@ -7048,6 +7059,28 @@ mod tests {
         // sync with `tool_definitions_count_matches_spec` (live truth).
         assert_eq!(report.total_tools, report.active_count);
         assert_eq!(report.total_tools, 27, "V0.6.5 ships 27 tools");
+    }
+
+    #[test]
+    fn install_mcp_report_renders_live_tool_count() {
+        // The `--install-mcp` report must print the live tool count from
+        // `tool_definitions()`, never a hard-coded number that drifts
+        // (it was stuck at "9" while the surface grew to 27). Mirrors
+        // `tool_definitions_count_matches_spec` so the rendered string
+        // can never silently diverge from the registered surface. Uses
+        // the pure body renderer with a synthetic path so it never
+        // touches the real ~/.claude.json.
+        let total = run_verify_mcp().total_tools;
+        let report = render_install_mcp_body(std::path::Path::new("/tmp/fake-claude.json"));
+        assert!(
+            report.contains(&format!("tools surface : {total}")),
+            "report must interpolate live tool count {total}: {report}",
+        );
+        // The stale "(interfaces §12.2)" tag must be gone.
+        assert!(
+            !report.contains("interfaces §12.2"),
+            "stale section tag must be dropped: {report}",
+        );
     }
 
     #[test]
