@@ -175,6 +175,9 @@ where
     // their producers register credentials (matches the host-probe
     // shape that landed in F121).
     let channels: ChannelMap = build_channels(&args, &creds, &initial);
+    if let Err(err) = supervisor::refresh_global_heartbeat() {
+        tracing::warn!(error = %err, "heartbeat refresh failed");
+    }
     replay_durable_outbox(&channels).await;
     let mut gateway_inner =
         build_gateway(factory.clone(), &projects_root, &config_projects, &initial);
@@ -231,9 +234,6 @@ where
         bots = initial.len(),
         "ccteam-im: gateway router started (no supervisor tick)"
     );
-    if let Err(err) = supervisor::refresh_global_heartbeat() {
-        tracing::warn!(error = %err, "heartbeat refresh failed");
-    }
 
     let mut shutdown: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(shutdown);
     let mut max_runtime: Pin<Box<dyn Future<Output = ()> + Send>> = match args.max_runtime {
@@ -890,13 +890,81 @@ pub fn _link_check(_c: &Credentials) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ccteam_harness::{
+        AgentSpecBrief, HarnessError, SpawnCtx, ThreadEvent, ThreadHandle, TurnId, TurnInput,
+    };
+    use futures::stream::{self, BoxStream};
     use tempfile::TempDir;
 
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex as StdMutex, OnceLock};
+        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn restore_env(key: &str, value: Option<std::ffi::OsString>) {
+        if let Some(value) = value {
+            std::env::set_var(key, value);
+        } else {
+            std::env::remove_var(key);
+        }
+    }
+
+    struct BlockingResumeAdapter {
+        vendor: AgentVendor,
+    }
+
+    #[async_trait::async_trait]
+    impl HarnessAdapter for BlockingResumeAdapter {
+        fn name(&self) -> &'static str {
+            "blocking-resume"
+        }
+
+        fn vendor(&self) -> AgentVendor {
+            self.vendor
+        }
+
+        async fn start_thread(
+            &self,
+            _spec: &AgentSpecBrief,
+            _ctx: &SpawnCtx,
+        ) -> Result<ThreadHandle, HarnessError> {
+            unreachable!("restored-session resume test must not start a fresh thread")
+        }
+
+        async fn submit_turn(
+            &self,
+            _h: &ThreadHandle,
+            _input: TurnInput,
+        ) -> Result<TurnId, HarnessError> {
+            unreachable!("restored-session resume test must not submit turns")
+        }
+
+        fn events(&self, _h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
+            Box::pin(stream::empty())
+        }
+
+        async fn resume_thread(&self, _persistent_id: &str) -> Result<ThreadHandle, HarnessError> {
+            std::future::pending().await
+        }
+
+        async fn close_thread(&self, _h: &ThreadHandle) -> Result<(), HarnessError> {
+            Ok(())
+        }
+    }
+
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread", start_paused = false)]
     async fn daemon_boots_and_exits_on_max_runtime() {
+        let _guard = env_lock();
         // Point HOME at a tempdir so no real credentials are read.
         let tmp = TempDir::new().unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_ccteam_home = std::env::var_os("CCTEAM_HOME");
         std::env::set_var("HOME", tmp.path());
+        std::env::set_var("CCTEAM_HOME", tmp.path().join(".ccteam"));
         let args = DaemonArgs {
             credentials: None,
             registry: None,
@@ -908,7 +976,90 @@ mod tests {
         // Heartbeat was written at least once.
         let hb = crate::imd_heartbeat_path();
         assert!(hb.exists(), "heartbeat at {} should exist", hb.display());
-        std::env::remove_var("HOME");
+        restore_env("CCTEAM_HOME", old_ccteam_home);
+        restore_env("HOME", old_home);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn daemon_heartbeat_is_not_gated_by_restored_session_resume() {
+        let _guard = env_lock();
+        let tmp = TempDir::new().unwrap();
+        let ccteam_home = tmp.path().join(".ccteam");
+        let old_home = std::env::var_os("HOME");
+        let old_ccteam_home = std::env::var_os("CCTEAM_HOME");
+        let old_mux_backend = std::env::var_os("CCTEAM_MUX_BACKEND");
+        std::env::set_var("HOME", tmp.path());
+        std::env::set_var("CCTEAM_HOME", &ccteam_home);
+        std::env::remove_var("CCTEAM_MUX_BACKEND");
+
+        let state_path = crate::default_gateway_state_path();
+        std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &state_path,
+            serde_json::to_vec(&serde_json::json!({
+                "default_project": "default",
+                "current_project": [],
+                "current_session": [],
+                "sessions": [{
+                    "id": "s1",
+                    "owner": {
+                        "channel": "mock",
+                        "chat_id": "chat-1",
+                        "user_id": "alice"
+                    },
+                    "project": "default",
+                    "role": "helper",
+                    "vendor": "claude",
+                    "handle": "helper",
+                    "thread": {
+                        "vendor": "claude",
+                        "mode": "chat",
+                        "identity": "persisted-thread",
+                        "started_at": chrono::Utc::now(),
+                        "raw_extras": {}
+                    }
+                }],
+                "next_session": 2
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let factory: AdapterFactory = Arc::new(|vendor| {
+            Arc::new(BlockingResumeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+        });
+        let args = DaemonArgs {
+            credentials: None,
+            registry: None,
+            max_runtime: None,
+            adapter_factory: Some(factory),
+            channels_override: None,
+        };
+
+        let task = tokio::spawn(run_daemon_with_shutdown(args, std::future::pending::<()>()));
+        let hb = crate::imd_heartbeat_path();
+        let observed = tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                if hb.exists() {
+                    break true;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or(false);
+        task.abort();
+
+        assert!(
+            observed,
+            "heartbeat at {} must be published before restored-session resume awaits",
+            hb.display()
+        );
+
+        restore_env("CCTEAM_MUX_BACKEND", old_mux_backend);
+        restore_env("CCTEAM_HOME", old_ccteam_home);
+        restore_env("HOME", old_home);
     }
 
     /// `default_adapter_factory` must route the Codex arm to the mode-3
