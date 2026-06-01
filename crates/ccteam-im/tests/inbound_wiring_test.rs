@@ -882,9 +882,17 @@ async fn daemon_replays_ws_outbound_when_client_reconnects() {
         spawn_ws_gateway_daemon(projects_root, ws, Arc::new(GatewayAdapter::default()));
 
     let mut socket = connect_ws_with_retry(&ws_url).await;
+    // Reconnect triggers replay of the failed durable row, while the /projects
+    // command produces its own response frame. The two outbound paths race on the
+    // wire, so assert the replay content is present among the received frames
+    // (membership) instead of expecting it to arrive first.
     send_ws_text(&mut socket, "ws-replay-presence", "/projects").await;
-    let first = recv_ws_send(&mut socket).await;
-    assert_eq!(first.content, "stored while ws was offline");
+    recv_ws_until_contains(
+        &mut socket,
+        "stored while ws was offline",
+        Duration::from_secs(3),
+    )
+    .await;
 
     drop(socket);
     let _ = stop_tx.send(());
