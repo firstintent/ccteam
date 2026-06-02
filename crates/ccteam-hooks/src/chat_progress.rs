@@ -34,6 +34,38 @@ use ccteam_core::progress::{
 use ccteam_core::{session_context_from_cwd, CcteamPaths};
 use ccteam_harness::execution::transcript_tail::active_session_id_path;
 
+/// Refresh the F176 `active-session-id` marker from a hook payload's
+/// `session_id`. The chat-mode tail loop reads this marker to pick the
+/// correct `<sid>.jsonl`. Originally only `SessionStart` wrote it, so a
+/// missed SessionStart (or a mid-session transcript rotation, e.g.
+/// `/compact` / auto-compact) left the marker stale and the bot went
+/// silent despite a healthy pane (the reply landed in a jsonl the tail
+/// wasn't following). Refreshing it on every turn start (`user-prompt`,
+/// which carries the same `session_id`) keeps it current and self-heals
+/// a missed/stale marker. No-op when role or session_id is absent so it
+/// never clobbers a good marker with empty data.
+fn refresh_active_session_marker(cwd: &str, role: &str, stdin: &Value) {
+    if role.is_empty() {
+        return;
+    }
+    let Some(sid) = stdin.get("session_id").and_then(|v| v.as_str()) else {
+        return;
+    };
+    if sid.is_empty() {
+        return;
+    }
+    let marker = active_session_id_path(Path::new(cwd), role);
+    if let Err(err) = write_marker_atomic(&marker, sid) {
+        tracing::warn!(
+            role = %role,
+            session_id = %sid,
+            path = %marker.display(),
+            error = %err,
+            "chat-progress: failed to refresh active-session-id marker"
+        );
+    }
+}
+
 /// V0.6.0 F108 entry — dispatch one `chat-progress <event>` invocation.
 ///
 /// `stdin` is the parsed Claude Code hook payload (carries `cwd`,
@@ -59,28 +91,16 @@ pub fn handle_chat_progress(paths: &CcteamPaths, event: &str, stdin: &Value) -> 
             // correct jsonl deterministically. Without this marker
             // three bots in one project dir all read whichever jsonl
             // was most recently modified (the F177 fan-out bug).
-            //
-            // Only write when both role and session_id are present;
-            // otherwise we'd clobber a valid marker with empty data.
-            if !role.is_empty() {
-                if let Some(sid) = stdin.get("session_id").and_then(|v| v.as_str()) {
-                    if !sid.is_empty() {
-                        let marker = active_session_id_path(Path::new(cwd), &role);
-                        if let Err(err) = write_marker_atomic(&marker, sid) {
-                            tracing::warn!(
-                                role = %role,
-                                session_id = %sid,
-                                path = %marker.display(),
-                                error = %err,
-                                "chat-progress: failed to write active-session-id marker"
-                            );
-                        }
-                    }
-                }
-            }
+            refresh_active_session_marker(cwd, &role, stdin);
             build_chat_session_started_event(&role, &project_dir)
         }
         "user-prompt" => {
+            // Refresh the marker on every turn start too — SessionStart can
+            // be missed (env propagation, resume) or the transcript can
+            // rotate mid-session (/compact, auto-compact), which otherwise
+            // strands the tail on a stale jsonl and the reply is never read.
+            // `user-prompt` carries the same `session_id`, so this self-heals.
+            refresh_active_session_marker(cwd, &role, stdin);
             let prompt = stdin.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
             let turn_id = stdin
                 .get("session_id")

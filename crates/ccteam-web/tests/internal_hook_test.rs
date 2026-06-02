@@ -172,6 +172,45 @@ async fn chat_progress_session_start_uses_role_header() {
     assert_eq!(marker_body.trim(), "sid-f186");
 }
 
+#[tokio::test]
+async fn chat_progress_user_prompt_refreshes_marker() {
+    // Regression: a missed SessionStart (or a mid-session transcript
+    // rotation like /compact) used to strand the tail loop on a stale
+    // jsonl, so the agent's reply was never read (silent bot despite a
+    // healthy pane). user-prompt now also refreshes the active-session-id
+    // marker, which self-heals it.
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    disable_tool_surface_bootstrap_for_tests();
+    bootstrap_project(&paths, "demo", "demo", "chat").unwrap();
+    let cwd = paths.project_dir("demo");
+    let marker = cwd.join(".ccteam/chat/alice/active-session-id");
+
+    let state = AppState::new(paths);
+    let addr = spawn(state).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "http://{addr}/internal/hook/chat-progress/user-prompt"
+        ))
+        .header("x-ccteam-role", "alice")
+        .header("x-ccteam-slug", "demo")
+        .json(&json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "sid-up-heal",
+            "cwd": cwd.display().to_string(),
+            "prompt": "which project is this",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let marker_body =
+        std::fs::read_to_string(&marker).expect("active-session-id marker written on user-prompt");
+    assert_eq!(marker_body.trim(), "sid-up-heal");
+}
+
 /// F186 — payload-shipped `role` wins over header so we don't clobber
 /// upstream-provided identity. Defensive: if Anthropic ever ships
 /// `role` in the hook stdin, we honor it.
