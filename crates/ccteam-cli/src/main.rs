@@ -65,9 +65,11 @@ enum Command {
         /// auto-derived slug (default: dir basename).
         #[arg(long, value_name = "PATH")]
         r#in: Option<PathBuf>,
-        /// V0.4.2 F72: explicit slug. When `--in` is absent and `--slug`
-        /// is given, ccteam installs at `<projects_root>/<slug>/`. When
-        /// `--in` is given, the slug overrides the dir-basename default.
+        /// Explicit project name (registered slug). Overrides the
+        /// install-dir basename default. Does NOT change where the
+        /// project installs — that stays the cwd (or `--in <path>`). To
+        /// create a fresh project under `<projects_root>/<team>-<slug>/`,
+        /// use `ccteam new <slug>`.
         #[arg(long, value_name = "NAME")]
         slug: Option<String>,
         /// V0.4.2 F72: team name for new installs (default `dev`).
@@ -215,11 +217,11 @@ enum Command {
         restart_team: bool,
     },
     /// V0.4.2 F75: thin wrapper over `ccteam init --in
-    /// <projects_root>/<slug>` for users who prefer the "create a
-    /// new project somewhere central" mental model. Identical
-    /// semantics to running `ccteam init --slug <slug>` from any cwd
-    /// — see `ccteam init --help` for the full overwrite-strategy
-    /// surface.
+    /// <projects_root>/<team>-<slug>` for users who prefer the "create a
+    /// new project somewhere central" mental model — it prepends the
+    /// team prefix and installs there. (`ccteam init --slug <name>` no
+    /// longer relocates: it installs in the cwd and only sets the name.)
+    /// See `ccteam init --help` for the full overwrite-strategy surface.
     ///
     /// The V0.4.0 free-text request + LLM-auto-slug path was dropped
     /// in V0.4.2: `slug` is required and explicit.

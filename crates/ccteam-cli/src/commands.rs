@@ -53,11 +53,12 @@ pub enum InitMode {
 #[derive(Debug, Clone, Default)]
 pub struct InitOptions {
     /// V0.4.2 F72: install in this directory. `None` defaults to the
-    /// cwd (or, when `slug` is also Some, to
-    /// `<projects_root>/<slug>/`).
+    /// current working directory. (`slug` no longer affects the
+    /// location — it only names the registered project.)
     pub install_in: Option<std::path::PathBuf>,
-    /// V0.4.2 F72: slug override. When absent we derive from the
-    /// install target's dir basename.
+    /// V0.4.2 F72: slug override — sets the *registered project name*
+    /// only, never the install location. When absent we derive it from
+    /// the install target's dir basename.
     pub slug: Option<String>,
     /// V0.4.2 F72: team for new installs (default `dev`). On refresh
     /// the existing `state.json::team` is preserved unless `force`.
@@ -132,7 +133,8 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
     install_hooks(paths).context("install ~/.ccteam/hooks/hook.sh dispatcher")?;
 
     // -- 2. Resolve project install target ---------------------------
-    let target = resolve_install_target(paths, &opts)?;
+    let target = resolve_install_target(&opts)?;
+    let slug_was_explicit = opts.slug.is_some();
     let derived_slug = opts.slug.clone().unwrap_or_else(|| {
         target
             .file_name()
@@ -141,10 +143,21 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
             .to_string()
     });
     // V0.4.3 F76: validate slug grammar before anything writes to disk.
-    // Catches whitespace / unicode / leading-dash cases that used to
-    // create `~/projects/<bad-name>/` directories silently.
-    let target_slug = ccteam_core::validate_slug_format(&derived_slug)
-        .with_context(|| format!("ccteam init: invalid slug {derived_slug:?}"))?;
+    // Catches whitespace / unicode / leading-dash / uppercase cases.
+    // When the slug was derived from the install-dir basename (no
+    // `--slug`), point the user at `--slug` instead of failing opaquely
+    // — a dir like `AgentServe` (caps) can't be a slug verbatim.
+    let target_slug = ccteam_core::validate_slug_format(&derived_slug).with_context(|| {
+        if slug_was_explicit {
+            format!("ccteam init: invalid slug {derived_slug:?}")
+        } else {
+            format!(
+                "ccteam init: install-dir name {derived_slug:?} is not a valid slug \
+                 (lowercase ASCII / digits / dashes only). Pass an explicit name, e.g. \
+                 `ccteam init --slug <lowercase-name>`."
+            )
+        }
+    })?;
     let target_team = opts.team.clone().unwrap_or_else(|| "dev".to_string());
 
     // -- 3a. Refuse install in the ccteam repo itself ----------------
@@ -306,11 +319,17 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
     Ok(out)
 }
 
-/// V0.4.2 F72: resolve where to install. Priority:
+/// Resolve where to install. Priority:
 ///   1. `--in <path>`  (absolute or relative; created if absent)
-///   2. `--slug <name>` (→ `<projects_root>/<slug>/`)
-///   3. current working directory
-fn resolve_install_target(paths: &CcteamPaths, opts: &InitOptions) -> Result<std::path::PathBuf> {
+///   2. current working directory
+///
+/// `--slug` only sets the *registered project name*; it never changes
+/// the install location (it used to relocate to `<projects_root>/<slug>/`
+/// — a drift from the documented "override the derived slug" intent that
+/// silently sent users standing in an existing repo to an empty skeleton
+/// elsewhere). To create a fresh project under
+/// `<projects_root>/<team>-<slug>/`, use `ccteam new <slug>`.
+fn resolve_install_target(opts: &InitOptions) -> Result<std::path::PathBuf> {
     if let Some(p) = &opts.install_in {
         let abs = if p.is_absolute() {
             p.clone()
@@ -322,12 +341,6 @@ fn resolve_install_target(paths: &CcteamPaths, opts: &InitOptions) -> Result<std
         std::fs::create_dir_all(&abs)
             .with_context(|| format!("create --in target {}", abs.display()))?;
         return Ok(abs);
-    }
-    if let Some(slug) = &opts.slug {
-        let target = paths.projects_root.join(slug);
-        std::fs::create_dir_all(&target)
-            .with_context(|| format!("create slug target {}", target.display()))?;
-        return Ok(target);
     }
     std::env::current_dir().context("read cwd as install target")
 }
