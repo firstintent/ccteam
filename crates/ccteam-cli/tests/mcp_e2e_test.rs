@@ -240,28 +240,24 @@ fn mcp_serve_tools_call_ls_returns_empty_projects_for_fresh_root() {
 
 // =============== V0.4.0 F65 integration tests ===============
 
-/// Prepare a project directory with a workflow.yaml and a fresh
-/// heartbeat. Returns the `home` / `projects` paths so the caller can
-/// hand them to `McpServer::spawn`.
+/// Prepare a project directory with a workflow.yaml and a reachable
+/// fake daemon socket. The returned listener must stay alive for
+/// mutating tool calls that pass the daemon-health gate.
 fn bootstrap_workflow_project(
     home: &std::path::Path,
     projects: &std::path::Path,
     slug: &str,
     workflow_yaml: &str,
-) {
+) -> std::os::unix::net::UnixListener {
     std::fs::create_dir_all(home).unwrap();
     std::fs::create_dir_all(projects).unwrap();
     let project_dir = projects.join(slug);
     let ccteam = project_dir.join(".ccteam");
     std::fs::create_dir_all(&ccteam).unwrap();
     std::fs::write(ccteam.join("workflow.yaml"), workflow_yaml).unwrap();
-    // The mutating F65 tools require a live daemon heartbeat. Write
-    // one directly so we don't have to spin up `ccteam start`.
-    let state_dir = home.join("state");
-    std::fs::create_dir_all(&state_dir).unwrap();
-    let now = chrono::Utc::now().to_rfc3339();
-    let body = format!("pid: {}\nat: {}\n", std::process::id(), now);
-    std::fs::write(state_dir.join("orchestrator.heartbeat"), body).unwrap();
+    let socket = home.join("run").join("mcp.sock");
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    std::os::unix::net::UnixListener::bind(socket).unwrap()
 }
 
 const FIXTURE_WF: &str = r#"
@@ -302,7 +298,7 @@ fn t_spawn_agent_returns_session_id() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().join("home");
     let projects = tmp.path().join("projects");
-    bootstrap_workflow_project(&home, &projects, "demo", FIXTURE_WF);
+    let _daemon = bootstrap_workflow_project(&home, &projects, "demo", FIXTURE_WF);
 
     let mut srv = McpServer::spawn(&home, &projects);
     let body = call_tool(
@@ -328,7 +324,7 @@ fn t_observe_agents_empty() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().join("home");
     let projects = tmp.path().join("projects");
-    bootstrap_workflow_project(&home, &projects, "demo", FIXTURE_WF);
+    let _daemon = bootstrap_workflow_project(&home, &projects, "demo", FIXTURE_WF);
 
     let mut srv = McpServer::spawn(&home, &projects);
     let body = call_tool(
@@ -349,7 +345,7 @@ fn t_set_parallelism_writes_override_file() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().join("home");
     let projects = tmp.path().join("projects");
-    bootstrap_workflow_project(&home, &projects, "demo", FIXTURE_WF);
+    let _daemon = bootstrap_workflow_project(&home, &projects, "demo", FIXTURE_WF);
 
     let mut srv = McpServer::spawn(&home, &projects);
     let body = call_tool(
@@ -375,7 +371,7 @@ fn t_get_artifact_summary_empty_dirs() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().join("home");
     let projects = tmp.path().join("projects");
-    bootstrap_workflow_project(&home, &projects, "demo", FIXTURE_WF);
+    let _daemon = bootstrap_workflow_project(&home, &projects, "demo", FIXTURE_WF);
 
     let mut srv = McpServer::spawn(&home, &projects);
     let body = call_tool(
@@ -400,7 +396,7 @@ fn t_trigger_gate_writes_marker() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().join("home");
     let projects = tmp.path().join("projects");
-    bootstrap_workflow_project(&home, &projects, "demo", FIXTURE_WF);
+    let _daemon = bootstrap_workflow_project(&home, &projects, "demo", FIXTURE_WF);
 
     let mut srv = McpServer::spawn(&home, &projects);
     let body = call_tool(
@@ -422,7 +418,7 @@ fn t_signal_btw_writes_inbox() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().join("home");
     let projects = tmp.path().join("projects");
-    bootstrap_workflow_project(&home, &projects, "demo", FIXTURE_WF);
+    let _daemon = bootstrap_workflow_project(&home, &projects, "demo", FIXTURE_WF);
     // signal=btw routes through actions::send_to_session, which
     // requires the .ccteam/inbox/ dir; bootstrap_workflow_project
     // already laid down the .ccteam/ root, so send_to_session_with

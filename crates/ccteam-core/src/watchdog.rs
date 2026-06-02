@@ -3,8 +3,8 @@
 //!
 //! V0.2 M0.21. The watchdog is a smart-layer translator: it reads
 //! existing telemetry (per-project `progress.jsonl` / `state.json`,
-//! `<project>/.ccteam/needs_attention.outbox.json`, the orchestrator
-//! daemon heartbeat) and emits zero or more `WatchdogAlert`s describing
+//! `<project>/.ccteam/needs_attention.outbox.json`, gateway daemon MCP
+//! socket reachability) and emits zero or more `WatchdogAlert`s describing
 //! what a meta-agent should ask the user about. It does not call
 //! orchestrator APIs, never kills sessions, never re-injects prompts —
 //! that's the orchestrator's job (tech-design red line: "smart layer
@@ -19,7 +19,7 @@
 //! 3. phase cost / duration thresholds — any `state.json` with
 //!    `cost_used_usd > notify_on_phase_cost_usd` or current phase
 //!    older than `notify_on_phase_duration_min`
-//! 4. orchestrator daemon heartbeat stale (M0.23.1)
+//! 4. gateway daemon MCP socket unreachable
 //!
 //! User config lives at `~/.ccteam/watchdog.yaml`; missing file ⇒ defaults.
 //! `notify_mode: quiet` suppresses everything except `daemon_down` and
@@ -164,7 +164,7 @@ pub enum AlertKind {
     CostOverrun,
     /// Current phase duration exceeded `notify_on_phase_duration_min`.
     PhaseDurationOverrun,
-    /// Orchestrator daemon heartbeat is stale or missing.
+    /// Gateway daemon MCP socket is unreachable.
     DaemonDown,
 }
 
@@ -215,19 +215,19 @@ pub fn scan(paths: &CcteamPaths, config: &WatchdogConfig) -> Result<Vec<Watchdog
     scan_at(paths, config, SystemTime::now(), Utc::now())
 }
 
-/// Testable inner — explicit `now` so heartbeat / phase-duration
-/// classification is deterministic.
+/// Testable inner — explicit `now` so phase-duration classification is
+/// deterministic.
 pub fn scan_at(
     paths: &CcteamPaths,
     config: &WatchdogConfig,
-    now_system: SystemTime,
+    _now_system: SystemTime,
     now_utc: DateTime<Utc>,
 ) -> Result<Vec<WatchdogAlert>> {
     let mut alerts = Vec::new();
 
-    // Signal 4: daemon heartbeat. Cross-project, fires once per scan.
-    let heartbeat = daemon::heartbeat_path(paths);
-    let health = daemon::check_health_at(&heartbeat, now_system);
+    // Signal 4: daemon MCP socket reachability. Cross-project, fires
+    // once per scan.
+    let health = daemon::check_health(paths);
     if !health.is_healthy() {
         alerts.push(WatchdogAlert {
             kind: AlertKind::DaemonDown,
@@ -268,23 +268,22 @@ pub fn scan_at(
 #[derive(Debug, Clone, Serialize)]
 struct HealthDetails {
     status: &'static str,
-    age_secs: Option<u64>,
+    socket: Option<String>,
+    reason: Option<String>,
 }
 
 impl From<&DaemonHealth> for HealthDetails {
     fn from(h: &DaemonHealth) -> Self {
         match h {
-            DaemonHealth::Healthy { age_secs } => Self {
+            DaemonHealth::Healthy { socket } => Self {
                 status: "healthy",
-                age_secs: Some(*age_secs),
+                socket: Some(socket.display().to_string()),
+                reason: None,
             },
-            DaemonHealth::NoHeartbeat => Self {
-                status: "no_heartbeat",
-                age_secs: None,
-            },
-            DaemonHealth::Stale { age_secs } => Self {
-                status: "stale",
-                age_secs: Some(*age_secs),
+            DaemonHealth::Unreachable { socket, reason } => Self {
+                status: "unreachable",
+                socket: Some(socket.display().to_string()),
+                reason: Some(reason.clone()),
             },
         }
     }
@@ -579,6 +578,13 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn fake_daemon(p: &CcteamPaths) -> std::os::unix::net::UnixListener {
+        let socket = crate::daemon::daemon_socket_path(p);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        std::os::unix::net::UnixListener::bind(socket).unwrap()
+    }
+
     fn write_state(p: &CcteamPaths, slug: &str, mutate: impl FnOnce(&mut ProjectState)) {
         let dir = p.project_ccteam_dir(slug);
         std::fs::create_dir_all(&dir).unwrap();
@@ -655,7 +661,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_emits_daemon_down_when_heartbeat_missing() {
+    fn scan_emits_daemon_down_when_socket_unreachable() {
         let tmp = TempDir::new().unwrap();
         let p = paths(&tmp);
         std::fs::create_dir_all(&p.projects_root).unwrap();
@@ -667,16 +673,16 @@ mod tests {
     }
 
     #[test]
-    fn scan_skips_daemon_down_when_heartbeat_fresh() {
+    fn scan_skips_daemon_down_when_socket_reachable() {
         let tmp = TempDir::new().unwrap();
         let p = paths(&tmp);
         std::fs::create_dir_all(&p.projects_root).unwrap();
-        crate::daemon::write_heartbeat(&p).unwrap();
+        let _daemon = fake_daemon(&p);
         let cfg = WatchdogConfig::default();
         let alerts = scan(&p, &cfg).unwrap();
         assert!(
             alerts.iter().all(|a| a.kind != AlertKind::DaemonDown),
-            "fresh heartbeat must not trip daemon-down: {alerts:?}",
+            "reachable daemon socket must not trip daemon-down: {alerts:?}",
         );
     }
 
@@ -684,7 +690,7 @@ mod tests {
     fn scan_surfaces_needs_attention_outbox() {
         let tmp = TempDir::new().unwrap();
         let p = paths(&tmp);
-        crate::daemon::write_heartbeat(&p).unwrap();
+        let _daemon = fake_daemon(&p);
         let slug = "dev-x";
         write_state(&p, slug, |_| {});
         let needs = p
@@ -710,7 +716,7 @@ mod tests {
     fn scan_filters_auto_loop_below_cycle_threshold() {
         let tmp = TempDir::new().unwrap();
         let p = paths(&tmp);
-        crate::daemon::write_heartbeat(&p).unwrap();
+        let _daemon = fake_daemon(&p);
         let slug = "dev-y";
         write_state(&p, slug, |_| {});
         // iteration=1 < default threshold 2 ⇒ no alert.
@@ -727,7 +733,7 @@ mod tests {
     fn scan_emits_auto_loop_at_threshold() {
         let tmp = TempDir::new().unwrap();
         let p = paths(&tmp);
-        crate::daemon::write_heartbeat(&p).unwrap();
+        let _daemon = fake_daemon(&p);
         let slug = "dev-y";
         write_state(&p, slug, |_| {});
         let alp = auto_loop::path_in(&p.project_dir(slug));
@@ -749,7 +755,7 @@ mod tests {
     fn quiet_mode_suppresses_auto_loop_but_not_cost_overrun() {
         let tmp = TempDir::new().unwrap();
         let p = paths(&tmp);
-        crate::daemon::write_heartbeat(&p).unwrap();
+        let _daemon = fake_daemon(&p);
         let slug = "dev-z";
         write_state(&p, slug, |s| {
             s.current_phase = "implement".into();
@@ -776,7 +782,7 @@ mod tests {
     fn cost_overrun_threshold_gates() {
         let tmp = TempDir::new().unwrap();
         let p = paths(&tmp);
-        crate::daemon::write_heartbeat(&p).unwrap();
+        let _daemon = fake_daemon(&p);
         let slug = "dev-cheap";
         write_state(&p, slug, |_| {});
         // V0.4.6 F91 — write the cost event ($5.00) so cost_summary
@@ -806,7 +812,7 @@ mod tests {
     fn phase_duration_overrun_uses_last_event_age() {
         let tmp = TempDir::new().unwrap();
         let p = paths(&tmp);
-        crate::daemon::write_heartbeat(&p).unwrap();
+        let _daemon = fake_daemon(&p);
         let slug = "dev-slow";
         let then = Utc::now() - chrono::Duration::minutes(45);
         write_state(&p, slug, |s| {
@@ -837,7 +843,7 @@ mod tests {
             slug: None,
             message: "daemon down".into(),
             emitted_at: Utc::now(),
-            details: serde_json::json!({"status": "no_heartbeat"}),
+            details: serde_json::json!({"status": "unreachable"}),
         };
         let path = push_alert_to_meta_outbox(&p, &alert).unwrap();
         assert!(path.exists());
@@ -890,20 +896,12 @@ mod tests {
     }
 
     #[test]
-    fn scan_at_uses_provided_now_for_heartbeat_classification() {
-        // Independent confirmation that scan_at honors the deterministic
-        // `now` clock — important because tests above relied on the
-        // implicit assumption.
+    fn scan_at_daemon_down_depends_on_socket_reachability_not_now() {
         let tmp = TempDir::new().unwrap();
         let p = paths(&tmp);
-        crate::daemon::write_heartbeat(&p).unwrap();
-        let mtime = std::fs::metadata(crate::daemon::heartbeat_path(&p))
-            .unwrap()
-            .modified()
-            .unwrap();
-        // Far past the grace ⇒ stale.
-        let stale_now = mtime + Duration::from_secs(600);
-        let alerts = scan_at(&p, &WatchdogConfig::default(), stale_now, Utc::now()).unwrap();
-        assert!(alerts.iter().any(|a| a.kind == AlertKind::DaemonDown));
+        let _daemon = fake_daemon(&p);
+        let far_future = std::time::SystemTime::now() + Duration::from_secs(600);
+        let alerts = scan_at(&p, &WatchdogConfig::default(), far_future, Utc::now()).unwrap();
+        assert!(alerts.iter().all(|a| a.kind != AlertKind::DaemonDown));
     }
 }

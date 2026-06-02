@@ -129,10 +129,11 @@ pub use cron::{Schedule, ScheduleError};
 // `classify(cost, soft_warn, hard_kill)` (primitives, not `&ProjectState`).
 pub use ccteam_cost::{classify as classify_cost, CostLevel, COST_MID_WARN_USD};
 pub use daemon::{
-    check_health as check_daemon_health, check_health_at as check_daemon_health_at, heartbeat_path,
-    pidfile_path, read_pidfile, remove_heartbeat, remove_pidfile, send_sigterm_to_pidfile,
-    write_heartbeat, write_pidfile, DaemonHealth, HEARTBEAT_GRACE, HEARTBEAT_INTERVAL,
-    HEARTBEAT_NAME, PIDFILE_NAME,
+    check_health as check_daemon_health, check_health_at as check_daemon_health_at,
+    daemon_reachable, daemon_socket_path, heartbeat_path, pidfile_path, read_pidfile,
+    remove_heartbeat, remove_pidfile, send_sigterm_to_pidfile, write_heartbeat, write_pidfile,
+    DaemonHealth, DAEMON_CONNECT_TIMEOUT, HEARTBEAT_GRACE, HEARTBEAT_INTERVAL, HEARTBEAT_NAME,
+    MCP_SOCKET_NAME, PIDFILE_NAME,
 };
 pub use defaults::{
     claude_jobs_dir_from_env, state_json_path as claude_state_json_path, CLAUDE_BIN_ENV,

@@ -2,18 +2,16 @@
 //!
 //! V0.6.0 Wave 2 F116. The supervisor:
 //!
-//! 1. Refreshes the daemon-global heartbeat file each tick
-//!    (`~/.ccteam/state/imd.heartbeat`).
-//! 2. For every registered bot, checks the per-bot heartbeat
+//! 1. For every registered bot, checks the per-bot heartbeat
 //!    (`<project>/.ccteam/chat/<bot>/heartbeat`) — V0.6.1 F136
 //!    writes this file via a 5s-tick task spawned inside
 //!    [`BotSupervisor::ensure_started`] (lifetime tied to the
 //!    adapter handle; aborted on `shutdown` / `restart`). Before
 //!    F136 the production daemon never wrote it, so `decide()` ran
 //!    a ~65s restart loop on every healthy bot.
-//! 3. If a per-bot heartbeat is missing or older than [`STALE_THRESHOLD`],
+//! 2. If a per-bot heartbeat is missing or older than [`STALE_THRESHOLD`],
 //!    initiates a graceful close → restart cycle.
-//! 4. Honors `signals/shutdown.signal` (final stop) and
+//! 3. Honors `signals/shutdown.signal` (final stop) and
 //!    `signals/drain.signal` (stop accepting new turns; let inflight
 //!    finish). The signal files are user-writable via `@ccteam pause`
 //!    / `@ccteam stop` admin commands.
@@ -48,7 +46,7 @@ use tokio::task::JoinHandle;
 
 use crate::bot_mpsc::OutboundItem;
 use crate::latency::now_unix_ms;
-use crate::{imd_heartbeat_path, BotRegistration};
+use crate::BotRegistration;
 
 /// V0.6.1 F136 — interval between per-bot heartbeat writes. Picked so
 /// 6 cycles fit comfortably inside [`STALE_THRESHOLD`] (60s) — one
@@ -259,17 +257,6 @@ pub enum SupervisorAction {
     /// restart budget (this is an intentional user action, not a flap),
     /// and ALWAYS archives so the new session starts on a clean mirror.
     ResetSession,
-}
-
-/// Refresh the daemon-global heartbeat file. Creates parent dir.
-pub fn refresh_global_heartbeat() -> Result<()> {
-    let path = imd_heartbeat_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let now = chrono::Utc::now().to_rfc3339();
-    fs::write(&path, now)?;
-    Ok(())
 }
 
 /// Decide what to do with one bot on a single tick.
@@ -2061,15 +2048,5 @@ mod tests {
             decide(tmp.path(), &reg, &st, SystemTime::now()),
             SupervisorAction::Quarantine
         );
-    }
-
-    #[test]
-    fn refresh_global_heartbeat_writes_file() {
-        let tmp = TempDir::new().unwrap();
-        std::env::set_var("HOME", tmp.path());
-        refresh_global_heartbeat().unwrap();
-        let p = imd_heartbeat_path();
-        assert!(p.exists());
-        std::env::remove_var("HOME");
     }
 }

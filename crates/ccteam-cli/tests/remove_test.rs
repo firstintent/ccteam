@@ -365,11 +365,13 @@ fn t05_refuses_with_running_claude_bg() {
     );
 }
 
-/// Seed a fresh heartbeat file so `heartbeat_alive` returns true for the
-/// sandbox. Uses `ccteam_core::daemon::write_heartbeat` to keep the format
-/// in sync with the real daemon.
-fn seed_heartbeat(fx: &Fixture) {
-    ccteam_core::daemon::write_heartbeat(&fx.paths()).unwrap();
+/// Bind a fake MCP socket listener so daemon reachability is true for
+/// the sandbox. The returned listener must stay alive while the spawned
+/// CLI process runs.
+fn seed_daemon(fx: &Fixture) -> std::os::unix::net::UnixListener {
+    let socket = ccteam_core::daemon::daemon_socket_path(&fx.paths());
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    std::os::unix::net::UnixListener::bind(socket).unwrap()
 }
 
 /// Compute the unroster trigger path the CLI writes (mirrors
@@ -380,14 +382,14 @@ fn unroster_trigger(slug: &str) -> std::path::PathBuf {
     std::path::PathBuf::from("/tmp").join(format!("ccteam-{user}.unroster.{slug}"))
 }
 
-/// t07: when the daemon heartbeat is fresh, `ccteam remove` writes the
+/// t07: when the daemon socket is reachable, `ccteam remove` writes the
 /// per-slug unroster trigger file and polls for it to disappear. A
 /// background "acker" thread simulates the daemon consuming the trigger.
 #[test]
 fn t07_remove_writes_unroster_trigger_when_daemon_alive() {
-    let fx = Fixture::new("dex-ui");
+    let fx = Fixture::new("dex-ui-t07");
     fx.seed_closed_progress();
-    seed_heartbeat(&fx);
+    let _daemon = seed_daemon(&fx);
 
     let trigger = unroster_trigger(&fx.slug);
     // Clean up any leftover from a prior run.
@@ -428,18 +430,15 @@ fn t07_remove_writes_unroster_trigger_when_daemon_alive() {
     assert!(!trigger.exists(), "trigger file must be gone after remove");
 }
 
-/// t08: when the daemon heartbeat is fresh but nothing acks the trigger
+/// t08: when the daemon socket is reachable but nothing acks the trigger
 /// (simulates a slow/stalled daemon), `ccteam remove` times out after 5s,
 /// self-cleans the trigger file, and reports the timeout.
 ///
-/// Marked `#[ignore]` because the 5s CLI timeout makes this too slow for
-/// the default test run. Run explicitly with `cargo test -- --ignored t08`.
 #[test]
-#[ignore]
 fn t08_remove_timeout_when_daemon_unresponsive() {
-    let fx = Fixture::new("dex-ui");
+    let fx = Fixture::new("dex-ui-t08");
     fx.seed_closed_progress();
-    seed_heartbeat(&fx);
+    let _daemon = seed_daemon(&fx);
 
     let trigger = unroster_trigger(&fx.slug);
     let _ = std::fs::remove_file(&trigger);

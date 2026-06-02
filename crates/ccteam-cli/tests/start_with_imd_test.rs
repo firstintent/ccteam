@@ -13,14 +13,13 @@
 //!    `CARGO_BIN_EXE_<name>` env var is only emitted for binaries
 //!    declared in the workspace; absence is the cleanest proof.
 //! 3. An end-to-end smoke that boots `ccteam start --no-web` in the
-//!    background against an empty CCTEAM_HOME, observes the IMD
-//!    heartbeat file appear (proving the supervisor task spawned),
-//!    then `ccteam stop`s gracefully. With `--no-imd` set the
-//!    heartbeat must NOT appear.
+//!    background against an empty CCTEAM_HOME, observes the daemon MCP
+//!    socket accept connections, then `ccteam stop`s gracefully. With
+//!    `--no-imd` set the MCP socket must still accept connections.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 fn ccteam_bin() -> &'static str {
     env!("CARGO_BIN_EXE_ccteam")
@@ -70,32 +69,20 @@ fn standalone_ccteam_im_binary_no_longer_exists() {
     }
 }
 
-/// V0.6.1 F130 smoke — `ccteam start --no-web` should bring up the IMD
-/// supervisor as a tokio task inside the gateway process and publish
-/// `~/.ccteam/state/imd.heartbeat`. With `--no-imd`, no fresh heartbeat
-/// is observed.
-///
-/// The heartbeat is written **once at daemon boot** (the v8.1 gateway
-/// daemon has no supervisor tick), so observing it is really measuring
-/// "process spawned + booted past the heartbeat write" — a one-shot
-/// startup latency that is ~60ms on an idle host. Under heavy parallel
-/// test load the cold-start of the (large) debug binary plus tokio
-/// runtime init can stretch that out, so [`READY_TIMEOUT`] is
-/// deliberately generous and load-insensitive: we only assert the
-/// supervisor *eventually* publishes a heartbeat, never that it is fast.
-/// A daemon that dies during boot is caught via `try_wait` so the test
-/// fails fast with the child's captured stderr instead of burning the
-/// whole timeout polling for a heartbeat that will never appear.
-///
-/// We point HOME at a tempdir so the heartbeat lands in isolation and
-/// the test doesn't race with the operator's real daemon (if any).
+/// V0.6.1 F130 smoke, updated for gateway liveness: `ccteam start
+/// --no-web` must bind the MCP socket and accept connections. The MCP
+/// socket is the daemon liveness signal; stale socket files are not
+/// enough. A daemon that dies during boot is caught via `try_wait` so
+/// the test fails fast with the child's captured stderr instead of
+/// burning the whole timeout polling for a signal a dead process can no
+/// longer emit.
 #[test]
 fn start_spawns_imd_supervisor_unless_no_imd_set() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let fake_home = tmp.path();
+    let trigger_user = format!("ccteam-start-{}", std::process::id());
     // Need at least an empty projects dir so `ccteam start` doesn't
-    // bail early on missing config; CCTEAM_HOME drives ccteam state,
-    // HOME drives where the IMD heartbeat lands (via dirs::home_dir).
+    // bail early on missing config.
     let ccteam_home = fake_home.join(".ccteam");
     std::fs::create_dir_all(ccteam_home.join("phases")).unwrap();
     std::fs::create_dir_all(fake_home.join("projects")).unwrap();
@@ -106,15 +93,15 @@ fn start_spawns_imd_supervisor_unless_no_imd_set() {
         "tempdir-isolated heartbeat must start absent",
     );
 
-    // --- Case 1: default (no --no-imd) — heartbeat MUST appear -----
+    // --- Case 1: default (no --no-imd) — MCP socket MUST accept -----
     // Capture the daemon's stderr to a file (not /dev/null) so a boot
     // failure is diagnosable from the assertion message instead of
     // surfacing as a silent timeout.
     let stderr_log = ccteam_home.join("daemon-case1.stderr.log");
-    let started_at = SystemTime::now();
     let mut child = Command::new(ccteam_bin())
         .args(["start", "--no-web", "--tick-seconds", "1"])
         .env("HOME", fake_home)
+        .env("USER", &trigger_user)
         .env("CCTEAM_HOME", &ccteam_home)
         .env("CCTEAM_PROJECTS_ROOT", fake_home.join("projects"))
         .env("RUST_LOG", "warn")
@@ -126,21 +113,15 @@ fn start_spawns_imd_supervisor_unless_no_imd_set() {
         .expect("spawn ccteam start");
     let child_pid = child.id();
 
-    let (observed, observed_mcp) = await_supervisor_ready(
-        &mut child,
-        &heartbeat,
-        &mcp_socket,
-        started_at,
-        READY_TIMEOUT,
-    );
+    let observed_mcp = await_mcp_socket_reachable(&mut child, &mcp_socket, READY_TIMEOUT);
     // Record whether the daemon exited on its own (crash / early bail)
     // before we issue the teardown trigger — folded into the assertion
     // message so a real boot failure is obvious rather than looking
-    // like a slow heartbeat.
+    // like a slow socket bind.
     let early_exit = child.try_wait().ok().flatten();
 
     // Tear down — write the F86 shutdown trigger.
-    let trigger = trigger_path();
+    let trigger = trigger_path(&trigger_user);
     let _ = std::fs::write(&trigger, format!("{child_pid}\n"));
     let drain_deadline = Instant::now() + Duration::from_secs(35);
     while Instant::now() < drain_deadline {
@@ -158,29 +139,24 @@ fn start_spawns_imd_supervisor_unless_no_imd_set() {
 
     let daemon_stderr = std::fs::read_to_string(&stderr_log).unwrap_or_default();
     assert!(
-        observed,
-        "F130: IMD heartbeat at {} was not published by the in-process supervisor within {}s \
-         (observed_mcp={observed_mcp}, daemon early_exit={early_exit:?}).\n\
-         The heartbeat is written once at daemon boot, so this means the daemon never reached \
-         that point.\n--- daemon stderr ---\n{}",
-        heartbeat.display(),
-        READY_TIMEOUT.as_secs(),
-        daemon_stderr.trim(),
-    );
-    assert!(
         observed_mcp,
-        "v8.1: MCP socket at {} should be served by `ccteam start` \
+        "MCP socket at {} should accept connections from `ccteam start` \
          (daemon early_exit={early_exit:?}).\n--- daemon stderr ---\n{}",
         mcp_socket.display(),
         daemon_stderr.trim(),
     );
+    assert!(
+        !heartbeat.exists(),
+        "global IMD heartbeat must not be written; liveness is MCP socket reachability"
+    );
 
-    // --- Case 2: --no-imd — heartbeat must NOT appear --------------
+    // --- Case 2: --no-imd — MCP socket still accepts --------------
     let _ = std::fs::remove_file(&heartbeat);
-    let no_imd_started = SystemTime::now();
+    let _ = std::fs::remove_file(&mcp_socket);
     let mut child2 = Command::new(ccteam_bin())
         .args(["start", "--no-web", "--no-imd", "--tick-seconds", "1"])
         .env("HOME", fake_home)
+        .env("USER", &trigger_user)
         .env("CCTEAM_HOME", &ccteam_home)
         .env("CCTEAM_PROJECTS_ROOT", fake_home.join("projects"))
         .env("RUST_LOG", "warn")
@@ -190,13 +166,7 @@ fn start_spawns_imd_supervisor_unless_no_imd_set() {
         .expect("spawn ccteam start --no-imd");
     let child2_pid = child2.id();
 
-    // Wait at least 6s (>3 supervisor ticks) to make sure we'd have
-    // seen the heartbeat if it were going to appear.
-    std::thread::sleep(Duration::from_secs(6));
-    let stale = match std::fs::metadata(&heartbeat) {
-        Ok(meta) => meta.modified().map(|m| m < no_imd_started).unwrap_or(true),
-        Err(_) => true,
-    };
+    let observed_no_imd_mcp = await_mcp_socket_reachable(&mut child2, &mcp_socket, READY_TIMEOUT);
 
     let _ = std::fs::write(&trigger, format!("{child2_pid}\n"));
     let drain_deadline = Instant::now() + Duration::from_secs(35);
@@ -214,51 +184,34 @@ fn start_spawns_imd_supervisor_unless_no_imd_set() {
     let _ = std::fs::remove_file(&trigger);
 
     assert!(
-        stale,
-        "F130: with --no-imd, supervisor task must be skipped — observed fresh heartbeat at {}",
-        heartbeat.display()
+        observed_no_imd_mcp,
+        "--no-imd must still serve the MCP socket"
+    );
+    assert!(
+        !heartbeat.exists(),
+        "--no-imd must not create the retired global IMD heartbeat"
     );
 }
 
-/// Generous, load-insensitive budget for the daemon to publish its
-/// first (and only) boot heartbeat + bind the MCP socket. The happy
-/// path resolves in tens of milliseconds; this ceiling exists purely so
-/// a genuinely-stuck daemon eventually fails the test rather than
-/// hanging forever. It must NOT be tightened to "catch slow boots" — a
-/// slow-but-successful boot under parallel load is a pass, not a bug.
+/// Generous, load-insensitive budget for the daemon to publish its MCP
+/// socket. The happy path resolves in tens of milliseconds; this
+/// ceiling exists purely so a genuinely-stuck daemon eventually fails
+/// the test rather than hanging forever. It must NOT be tightened to
+/// "catch slow boots" — a slow-but-successful boot under parallel load
+/// is a pass, not a bug.
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Poll until the IMD heartbeat is fresh (`mtime >= since`) **and** the
-/// MCP socket is bound, or `timeout` elapses, or `child` exits early.
+/// Poll until the MCP socket accepts a real connection, or `timeout`
+/// elapses, or `child` exits early.
 ///
-/// Returns `(observed_heartbeat, observed_mcp)`. The early-exit check is
-/// the key robustness property: a daemon that crashes during boot is
-/// detected within one poll interval, so the caller fails fast with the
-/// child's captured stderr instead of polling a never-coming heartbeat
-/// for the full timeout and then reporting a misleading "within Ns".
-fn await_supervisor_ready(
-    child: &mut Child,
-    heartbeat: &Path,
-    mcp_socket: &Path,
-    since: SystemTime,
-    timeout: Duration,
-) -> (bool, bool) {
+/// The early-exit check is the key robustness property: a daemon that
+/// crashes during boot is detected within one poll interval, so the
+/// caller fails fast with the child's captured stderr.
+fn await_mcp_socket_reachable(child: &mut Child, mcp_socket: &Path, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
-    let mut observed = false;
-    let mut observed_mcp = false;
     while Instant::now() < deadline {
-        if !observed {
-            if let Ok(meta) = std::fs::metadata(heartbeat) {
-                if let Ok(mtime) = meta.modified() {
-                    observed = mtime >= since;
-                }
-            }
-        }
-        if !observed_mcp {
-            observed_mcp = mcp_socket.exists();
-        }
-        if observed && observed_mcp {
-            break;
+        if mcp_socket_reachable(mcp_socket) {
+            return true;
         }
         // Bail the instant the daemon dies — no point waiting out the
         // timeout for signals a dead process can no longer emit.
@@ -267,12 +220,21 @@ fn await_supervisor_ready(
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    (observed, observed_mcp)
+    false
+}
+
+#[cfg(unix)]
+fn mcp_socket_reachable(path: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(path).is_ok()
+}
+
+#[cfg(not(unix))]
+fn mcp_socket_reachable(_path: &Path) -> bool {
+    false
 }
 
 /// Mirror of `crates/ccteam-cli/src/main.rs::shutdown_trigger_path` so
 /// the test doesn't need to depend on internal CLI items.
-fn trigger_path() -> PathBuf {
-    let user = std::env::var("USER").unwrap_or_else(|_| "ccteam".into());
+fn trigger_path(user: &str) -> PathBuf {
     PathBuf::from("/tmp").join(format!("ccteam-{user}.shutdown"))
 }

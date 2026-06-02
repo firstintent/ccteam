@@ -5,9 +5,8 @@
 
 use ccteam_core::{
     auto_loop::{self, AutoLoopState},
-    push_watchdog_alert_to_meta_outbox, watchdog_scan, write_heartbeat, CcteamPaths,
-    OutboxEventKind, OutboxMessage, OutboxPriority, ProjectState, WatchdogAlertKind,
-    WatchdogConfig, WatchdogNotifyMode,
+    push_watchdog_alert_to_meta_outbox, watchdog_scan, CcteamPaths, OutboxEventKind, OutboxMessage,
+    OutboxPriority, ProjectState, WatchdogAlertKind, WatchdogConfig, WatchdogNotifyMode,
 };
 use tempfile::TempDir;
 
@@ -26,13 +25,20 @@ fn write_state(p: &CcteamPaths, slug: &str, mutate: impl FnOnce(&mut ProjectStat
     s.save(&p.project_state(slug)).unwrap();
 }
 
+#[cfg(unix)]
+fn fake_daemon(p: &CcteamPaths) -> std::os::unix::net::UnixListener {
+    let socket = ccteam_core::daemon_socket_path(p);
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    std::os::unix::net::UnixListener::bind(socket).unwrap()
+}
+
 #[test]
 fn auto_loop_iteration_2_surfaces_alert_then_pushes_to_meta_outbox() {
     // Mirrors dev-plan §7 acceptance: "phase auto_loop cycle 第 2 次时,
     // meta-agent surface 一条用户可读通知".
     let tmp = TempDir::new().unwrap();
     let p = paths(&tmp);
-    write_heartbeat(&p).unwrap();
+    let _daemon = fake_daemon(&p);
 
     let slug = "dev-bookmark";
     write_state(&p, slug, |s| {
@@ -64,13 +70,13 @@ fn auto_loop_iteration_2_surfaces_alert_then_pushes_to_meta_outbox() {
 }
 
 #[test]
-fn quiet_mode_drops_cycle_alert_but_pushes_daemon_down_when_heartbeat_missing() {
+fn quiet_mode_drops_cycle_alert_but_pushes_daemon_down_when_socket_unreachable() {
     // Mirrors dev-plan §7 acceptance: "用户改 watchdog.yaml notify_mode:
     // quiet → 通知不再 surface" — *except* the breaks-through-quiet
     // signals (cost / daemon down).
     let tmp = TempDir::new().unwrap();
     let p = paths(&tmp);
-    // Deliberately do NOT write heartbeat ⇒ daemon_down should fire.
+    // Deliberately do NOT bind the MCP socket ⇒ daemon_down should fire.
     std::fs::create_dir_all(&p.projects_root).unwrap();
 
     let slug = "dev-bookmark";
@@ -110,7 +116,7 @@ fn watchdog_does_not_mutate_state_or_progress_jsonl() {
     // (file count unchanged).
     let tmp = TempDir::new().unwrap();
     let p = paths(&tmp);
-    write_heartbeat(&p).unwrap();
+    let _daemon = fake_daemon(&p);
     std::fs::create_dir_all(p.root.join("progress")).unwrap();
 
     let slug = "dev-watch";

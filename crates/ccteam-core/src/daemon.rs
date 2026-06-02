@@ -1,12 +1,10 @@
-//! Orchestrator daemon lifecycle helpers (M1.5).
+//! Gateway daemon lifecycle helpers.
 //!
 //! - **pidfile** at `~/.ccteam/state/orchestrator.pid` so `ccteam stop`
 //!   can find a running daemon.
-//! - **heartbeat** at `~/.ccteam/state/orchestrator.heartbeat` (M0.23.1):
-//!   the orchestrator touches it every `HEARTBEAT_INTERVAL`; supervisors
-//!   (MCP entrypoints, meta-agent skill startup) read its mtime and
-//!   declare the daemon dead when it lags `HEARTBEAT_GRACE` past now.
-//!   Pure stat — no IPC.
+//! - **liveness** is the daemon MCP Unix socket at
+//!   `~/.ccteam/run/mcp.sock`: callers must successfully connect to the
+//!   socket. A leftover socket file from a crashed daemon is not alive.
 //! - **graceful stop** via SIGTERM (Unix). The orchestrator's tokio
 //!   `select!` already listens on Ctrl-C; we route SIGTERM through the
 //!   same path on Unix.
@@ -16,7 +14,7 @@
 //!   M1.5 explicitly does **not** kill any tmux sessions on stop.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 
@@ -26,26 +24,43 @@ use crate::paths::CcteamPaths;
 /// its PID.
 pub const PIDFILE_NAME: &str = "orchestrator.pid";
 
-/// Filename under `<root>/state/` for the daemon heartbeat (M0.23.1).
+/// Legacy flow/orchestrator heartbeat file. Gateway daemon liveness does
+/// not use this file; it is retained for the deferred `ccteam-flow`
+/// runtime until that layer is migrated separately.
 pub const HEARTBEAT_NAME: &str = "orchestrator.heartbeat";
 
-/// How often the orchestrator touches the heartbeat file. Supervisors
-/// must allow ≥ 2× this before declaring the daemon dead.
+/// Filename under `<root>/run/` for the gateway daemon's MCP socket.
+pub const MCP_SOCKET_NAME: &str = "mcp.sock";
+
+/// How often the deferred flow/orchestrator runtime touches its legacy
+/// heartbeat file.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Maximum mtime age before a heartbeat is considered stale. Set to
-/// 2× `HEARTBEAT_INTERVAL` so a single missed tick (GC pause, blocked
-/// disk write) doesn't flap. A genuinely-down daemon trips this in ≤ 60s.
+/// Maximum mtime age for the deferred flow/orchestrator legacy
+/// heartbeat. Gateway daemon health does not use this value.
 pub const HEARTBEAT_GRACE: Duration = Duration::from_secs(60);
+
+/// Maximum time a liveness probe may spend trying to connect to the
+/// daemon MCP socket. Unix-domain socket connects are normally
+/// immediate; the bound keeps status/doctor/MCP probes honest if the
+/// platform stalls unexpectedly.
+pub const DAEMON_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Resolve the pidfile path for a given ccteam root.
 pub fn pidfile_path(paths: &CcteamPaths) -> PathBuf {
     paths.root.join("state").join(PIDFILE_NAME)
 }
 
-/// Resolve the heartbeat-file path for a given ccteam root.
+/// Resolve the deferred flow/orchestrator heartbeat-file path for a
+/// given ccteam root.
 pub fn heartbeat_path(paths: &CcteamPaths) -> PathBuf {
     paths.root.join("state").join(HEARTBEAT_NAME)
+}
+
+/// Resolve the MCP socket that proves the gateway daemon is accepting
+/// control-plane connections.
+pub fn daemon_socket_path(paths: &CcteamPaths) -> PathBuf {
+    paths.root.join("run").join(MCP_SOCKET_NAME)
 }
 
 /// Write the current process's PID to the pidfile. Called by
@@ -160,9 +175,9 @@ pub fn send_sigterm_to_pidfile(_paths: &CcteamPaths) -> Result<Option<u32>> {
     Err(anyhow!("ccteam stop is only implemented on Unix"))
 }
 
-/// Touch the heartbeat file (create-or-bump-mtime). Called by the
-/// orchestrator main loop on a fixed cadence (`HEARTBEAT_INTERVAL`).
-/// Idempotent.
+/// Touch the deferred flow/orchestrator heartbeat file
+/// (create-or-bump-mtime). Gateway daemon liveness is MCP socket
+/// reachability, not this file.
 pub fn write_heartbeat(paths: &CcteamPaths) -> Result<()> {
     let path = heartbeat_path(paths);
     if let Some(parent) = path.parent() {
@@ -189,18 +204,16 @@ pub fn remove_heartbeat(paths: &CcteamPaths) {
     }
 }
 
-/// Outcome of a daemon health check. `Healthy` means the heartbeat is
-/// fresh; everything else is fail-loud signal for callers (MCP tools,
-/// meta-agent skill startup) to surface "daemon down" rather than
-/// silently continue.
+/// Outcome of a daemon health check. `Healthy` means a client can
+/// connect to the daemon MCP socket; `Unreachable` is a fail-loud signal
+/// for callers (MCP tools, meta-agent skill startup, status/doctor) to
+/// surface "daemon down" rather than silently continue.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonHealth {
-    /// Heartbeat file present and within `HEARTBEAT_GRACE`.
-    Healthy { age_secs: u64 },
-    /// Heartbeat file missing (daemon never ran, or removed).
-    NoHeartbeat,
-    /// Heartbeat present but mtime older than `HEARTBEAT_GRACE`.
-    Stale { age_secs: u64 },
+    /// MCP socket accepted a connection.
+    Healthy { socket: PathBuf },
+    /// MCP socket could not be reached.
+    Unreachable { socket: PathBuf, reason: String },
 }
 
 impl DaemonHealth {
@@ -213,50 +226,72 @@ impl DaemonHealth {
     /// Human-readable explanation for surfacing to users.
     pub fn describe(&self) -> String {
         match self {
-            DaemonHealth::Healthy { age_secs } => {
-                format!("orchestrator daemon healthy ({age_secs}s since last heartbeat)")
+            DaemonHealth::Healthy { socket } => {
+                format!(
+                    "daemon healthy: MCP socket reachable at {}",
+                    socket.display()
+                )
             }
-            DaemonHealth::NoHeartbeat => {
-                "orchestrator daemon down: no heartbeat file (start it with `ccteam start` \
-                 in another terminal)"
-                    .into()
-            }
-            DaemonHealth::Stale { age_secs } => format!(
-                "orchestrator daemon down: heartbeat is {age_secs}s old (grace = {}s); \
-                 restart with `ccteam start`",
-                HEARTBEAT_GRACE.as_secs()
+            DaemonHealth::Unreachable { socket, reason } => format!(
+                "daemon down: cannot connect to MCP socket at {} ({reason}); \
+                 start it with `ccteam start`",
+                socket.display()
             ),
         }
     }
 }
 
-/// Stat the heartbeat file and classify daemon liveness. Pure read; no
-/// IPC, no daemon contact. Designed for hot paths (every MCP call).
+/// Connect to the daemon MCP socket and classify daemon liveness.
 pub fn check_health(paths: &CcteamPaths) -> DaemonHealth {
-    check_health_at(&heartbeat_path(paths), SystemTime::now())
+    check_health_at(&daemon_socket_path(paths), DAEMON_CONNECT_TIMEOUT)
 }
 
-/// V0.2.1 F27 — boolean variant of [`check_health`] for callers that
-/// only care "up or down" (text/json `ls` annotation). Returns `true`
-/// iff the heartbeat is fresh; missing or stale heartbeat → `false`.
-pub fn heartbeat_alive(paths: &CcteamPaths) -> bool {
+/// Boolean variant of [`check_health`] for callers that only care "up
+/// or down" (text/json `ls` annotation).
+pub fn daemon_reachable(paths: &CcteamPaths) -> bool {
     check_health(paths).is_healthy()
 }
 
-/// Testable inner: classify based on the file at `path` relative to `now`.
-pub fn check_health_at(path: &Path, now: SystemTime) -> DaemonHealth {
-    let metadata = match std::fs::metadata(path) {
-        Ok(m) => m,
-        Err(_) => return DaemonHealth::NoHeartbeat,
-    };
-    let mtime = metadata.modified().ok().unwrap_or(SystemTime::UNIX_EPOCH);
-    let age = now.duration_since(mtime).unwrap_or(Duration::ZERO);
-    let age_secs = age.as_secs();
-    if age <= HEARTBEAT_GRACE {
-        DaemonHealth::Healthy { age_secs }
-    } else {
-        DaemonHealth::Stale { age_secs }
+/// Testable inner: classify based on whether `path` accepts a Unix
+/// socket connection before `timeout`.
+pub fn check_health_at(path: &Path, timeout: Duration) -> DaemonHealth {
+    match connect_mcp_socket(path, timeout) {
+        Ok(()) => DaemonHealth::Healthy {
+            socket: path.to_path_buf(),
+        },
+        Err(reason) => DaemonHealth::Unreachable {
+            socket: path.to_path_buf(),
+            reason,
+        },
     }
+}
+
+#[cfg(unix)]
+fn connect_mcp_socket(path: &Path, timeout: Duration) -> std::result::Result<(), String> {
+    use std::os::unix::net::UnixStream;
+    use std::sync::mpsc;
+
+    let path = path.to_path_buf();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = UnixStream::connect(&path)
+            .map(|_| ())
+            .map_err(|err| err.to_string());
+        let _ = tx.send(result);
+    });
+
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err(format!("connect timed out after {}ms", timeout.as_millis()))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err("connect worker exited".to_string()),
+    }
+}
+
+#[cfg(not(unix))]
+fn connect_mcp_socket(_path: &Path, _timeout: Duration) -> std::result::Result<(), String> {
+    Err("MCP Unix socket liveness is only supported on Unix".to_string())
 }
 
 #[cfg(test)]
@@ -334,41 +369,6 @@ mod tests {
     }
 
     #[test]
-    fn check_health_reports_no_heartbeat_when_file_missing() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let p = paths(&tmp);
-        assert_eq!(check_health(&p), DaemonHealth::NoHeartbeat);
-        assert!(!check_health(&p).is_healthy());
-    }
-
-    #[test]
-    fn check_health_reports_healthy_for_fresh_heartbeat() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let p = paths(&tmp);
-        write_heartbeat(&p).unwrap();
-        let health = check_health(&p);
-        assert!(health.is_healthy(), "got {health:?}");
-    }
-
-    #[test]
-    fn check_health_reports_stale_when_mtime_past_grace() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let p = paths(&tmp);
-        write_heartbeat(&p).unwrap();
-        let path = heartbeat_path(&p);
-        // Compare against a time `HEARTBEAT_GRACE * 2` past the file's
-        // mtime to simulate a long-dead daemon.
-        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
-        let now = mtime + HEARTBEAT_GRACE * 2;
-        let health = check_health_at(&path, now);
-        assert!(
-            matches!(health, DaemonHealth::Stale { .. }),
-            "got {health:?}"
-        );
-        assert!(!health.is_healthy());
-    }
-
-    #[test]
     fn remove_heartbeat_is_idempotent() {
         let tmp = tempfile::TempDir::new().unwrap();
         let p = paths(&tmp);
@@ -379,11 +379,57 @@ mod tests {
     }
 
     #[test]
+    fn check_health_reports_unreachable_when_socket_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let p = paths(&tmp);
+        let health = check_health(&p);
+        assert!(
+            matches!(health, DaemonHealth::Unreachable { .. }),
+            "got {health:?}"
+        );
+        assert!(!health.is_healthy());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_health_reports_healthy_when_mcp_socket_accepts_connections() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let p = paths(&tmp);
+        let socket = daemon_socket_path(&p);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+        let health = check_health(&p);
+        assert!(health.is_healthy(), "got {health:?}");
+        assert!(daemon_reachable(&p));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_health_rejects_stale_socket_file_without_listener() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let p = paths(&tmp);
+        let socket = daemon_socket_path(&p);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        {
+            let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        }
+
+        let health = check_health(&p);
+        assert!(
+            matches!(health, DaemonHealth::Unreachable { .. }),
+            "got {health:?}"
+        );
+        assert!(!daemon_reachable(&p));
+    }
+
+    #[test]
     fn daemon_health_describe_is_actionable_when_down() {
-        let no = DaemonHealth::NoHeartbeat;
-        assert!(no.describe().contains("ccteam start"));
-        let stale = DaemonHealth::Stale { age_secs: 120 };
-        assert!(stale.describe().contains("ccteam start"));
-        assert!(stale.describe().contains("120"));
+        let down = DaemonHealth::Unreachable {
+            socket: PathBuf::from("/tmp/missing.sock"),
+            reason: "not found".to_string(),
+        };
+        assert!(down.describe().contains("ccteam start"));
+        assert!(down.describe().contains("missing.sock"));
     }
 }

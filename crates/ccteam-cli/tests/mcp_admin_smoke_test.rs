@@ -130,7 +130,6 @@ fn minimal_state_json(slug: &str) -> String {
 /// Creates:
 /// - `projects/<slug>/.ccteam/workflow.yaml`
 /// - `projects/<slug>/.ccteam/state.json`       (for pause/resume)
-/// - `home/state/orchestrator.heartbeat`         (daemon-alive gate)
 /// - `projects/<slug>/.claude/agents/<bot>.md`  (for change-persona test)
 fn bootstrap(home: &std::path::Path, projects: &std::path::Path, slug: &str, bot: Option<&str>) {
     std::fs::create_dir_all(home).unwrap();
@@ -139,16 +138,6 @@ fn bootstrap(home: &std::path::Path, projects: &std::path::Path, slug: &str, bot
     std::fs::create_dir_all(&ccteam_dir).unwrap();
     std::fs::write(ccteam_dir.join("workflow.yaml"), FIXTURE_WF).unwrap();
     std::fs::write(ccteam_dir.join("state.json"), minimal_state_json(slug)).unwrap();
-
-    // Daemon heartbeat so mutating tools don't fail the health gate.
-    let state_dir = home.join("state");
-    std::fs::create_dir_all(&state_dir).unwrap();
-    let now = chrono::Utc::now().to_rfc3339();
-    std::fs::write(
-        state_dir.join("orchestrator.heartbeat"),
-        format!("pid: {}\nat: {}\n", std::process::id(), now),
-    )
-    .unwrap();
 
     // Persona file for the change-persona smoke test.
     if let Some(b) = bot {
@@ -160,6 +149,12 @@ fn bootstrap(home: &std::path::Path, projects: &std::path::Path, slug: &str, bot
         )
         .unwrap();
     }
+}
+
+fn fake_daemon(home: &std::path::Path) -> std::os::unix::net::UnixListener {
+    let socket = home.join("run").join("mcp.sock");
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    std::os::unix::net::UnixListener::bind(socket).unwrap()
 }
 
 /// Call a tool and assert `isError=false`; return the parsed body JSON.
@@ -190,6 +185,7 @@ fn admin_workflow_pause() {
     let home = tmp.path().join("home");
     let projects = tmp.path().join("projects");
     bootstrap(&home, &projects, "dev-alpha", None);
+    let _daemon = fake_daemon(&home);
 
     let mut srv = McpServer::spawn(&home, &projects);
     let body = call_tool(
@@ -218,6 +214,7 @@ fn admin_workflow_resume() {
     let home = tmp.path().join("home");
     let projects = tmp.path().join("projects");
     bootstrap(&home, &projects, "dev-beta", None);
+    let _daemon = fake_daemon(&home);
 
     let mut srv = McpServer::spawn(&home, &projects);
 
@@ -328,9 +325,10 @@ fn admin_stop_everything() {
     let home = tmp.path().join("home");
     let projects = tmp.path().join("projects");
     bootstrap(&home, &projects, "dev-zeta", None);
+    let _daemon = fake_daemon(&home);
 
-    // stop_agent is a file-system marker write — it does NOT require a
-    // live daemon (the orchestrator reads the marker on its next tick).
+    // stop_agent is gated on a reachable daemon so the control-plane
+    // write cannot be silently accepted while ccteam is down.
     let mut srv = McpServer::spawn(&home, &projects);
     let body = call_tool(
         &mut srv,
@@ -384,6 +382,7 @@ fn admin_change_persona() {
     let home = tmp.path().join("home");
     let projects = tmp.path().join("projects");
     bootstrap(&home, &projects, "dev-eta", Some("worker"));
+    let _daemon = fake_daemon(&home);
 
     let new_persona =
         "---\nname: worker\ntools: Read, WebFetch\n---\nRevised persona: 专注于 web 研究。\n";

@@ -46,7 +46,7 @@ pub mod transport;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use ccteam_harness::AgentVendor;
@@ -571,56 +571,6 @@ pub fn list_bots() -> Result<Vec<BotRegistration>> {
     list_bots_in(&default_ccteam_root(), None)
 }
 
-/// Heartbeat file the daemon refreshes at startup.
-pub fn imd_heartbeat_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/"))
-        .join(".ccteam")
-        .join("state")
-        .join("imd.heartbeat")
-}
-
-/// Result of [`wait_for_health`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HealthResult {
-    /// A heartbeat written at or after `started_at` was observed before
-    /// the timeout elapsed.
-    Ready,
-    /// The timeout elapsed without observing a fresh heartbeat.
-    Timeout,
-}
-
-/// V0.6.1 F119 — block until the daemon publishes a heartbeat written
-/// at or after `started_at`, or `timeout` elapses.
-///
-/// "Fresh" is defined as the heartbeat file's mtime being `>=
-/// started_at`. Comparing against a caller-recorded `started_at` (not
-/// just "exists") prevents a stale heartbeat from a previous daemon
-/// invocation from spoofing readiness. Callers using `ccteam-im
-/// health` semantics capture `SystemTime::now()` *before* spawning
-/// the daemon, then pass it here.
-///
-/// `poll` is the sleep between filesystem checks (200ms is a sane
-/// default; tests pass `Duration::from_millis(5)` for hermetic
-/// fast-loop checks).
-pub fn wait_for_health(started_at: SystemTime, timeout: Duration, poll: Duration) -> HealthResult {
-    let deadline = Instant::now() + timeout;
-    let hb = imd_heartbeat_path();
-    loop {
-        if let Ok(meta) = fs::metadata(&hb) {
-            if let Ok(mtime) = meta.modified() {
-                if mtime >= started_at {
-                    return HealthResult::Ready;
-                }
-            }
-        }
-        if Instant::now() >= deadline {
-            return HealthResult::Timeout;
-        }
-        std::thread::sleep(poll);
-    }
-}
-
 /// Re-export the daemon entry points. `run_daemon_with_shutdown` is the
 /// V0.6.1 F130 form `ccteam start` consumes (caller-supplied shutdown
 /// future); `run_daemon` is the SIGINT-only convenience wrapper kept
@@ -635,12 +585,5 @@ mod tests {
     fn registration_path_layout() {
         let p = registration_path("dev-foo", "lead");
         assert!(p.ends_with(".ccteam/imd/registry/dev-foo/lead.json"));
-    }
-
-    #[test]
-    fn health_result_round_trip_ready_eq_timeout_distinct() {
-        // Sanity: HealthResult variants aren't accidentally collapsed.
-        assert_eq!(HealthResult::Ready, HealthResult::Ready);
-        assert_ne!(HealthResult::Ready, HealthResult::Timeout);
     }
 }

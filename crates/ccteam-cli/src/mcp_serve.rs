@@ -505,9 +505,9 @@ async fn call_tool(paths: &CcteamPaths, params: &Value) -> Result<Vec<Value>> {
         "ccteam__screenshot" => Ok(text_content(tool_screenshot(paths, &args)?)),
         // V0.4.0 F65 — route the 7 workflow tools through the
         // dedicated dispatcher. Mutating tools (spawn / stop / signal /
-        // set_parallelism / trigger_gate) gate on a live daemon
-        // heartbeat so a dead orchestrator surfaces immediately rather
-        // than silently swallowing marker writes that no one consumes.
+        // set_parallelism / trigger_gate) gate on a reachable gateway
+        // daemon so a dead control plane surfaces immediately rather
+        // than silently swallowing writes that no one consumes.
         // Read-only tools (observe_agents / get_artifact_summary) stay
         // daemon-independent so the meta-agent can inspect a stopped
         // project.
@@ -552,10 +552,7 @@ async fn call_tool(paths: &CcteamPaths, params: &Value) -> Result<Vec<Value>> {
     }
 }
 
-/// M0.23.1 + M0.23.3 fail-loud gate for action tools that need a live
-/// orchestrator (state-mutating tools where a dead daemon means the
-/// effect would silently never reach the project session). Pure stat
-/// against the heartbeat file — no IPC.
+/// Fail-loud gate for action tools that need a reachable gateway daemon.
 fn require_healthy_daemon(paths: &CcteamPaths) -> Result<()> {
     let health = check_daemon_health(paths);
     if !health.is_healthy() {
@@ -616,22 +613,18 @@ fn tool_ls(paths: &CcteamPaths) -> Result<String> {
 }
 
 /// Stable JSON shape for daemon health: `status` is one of
-/// `healthy|no_heartbeat|stale`; `message` is the human-readable
-/// describe(); `age_secs` carries heartbeat age when available.
+/// `healthy|unreachable`; `message` is the human-readable describe().
 fn daemon_health_json(health: &DaemonHealth) -> Value {
     match health {
-        DaemonHealth::Healthy { age_secs } => json!({
+        DaemonHealth::Healthy { socket } => json!({
             "status": "healthy",
-            "age_secs": age_secs,
+            "socket": socket.display().to_string(),
             "message": health.describe(),
         }),
-        DaemonHealth::NoHeartbeat => json!({
-            "status": "no_heartbeat",
-            "message": health.describe(),
-        }),
-        DaemonHealth::Stale { age_secs } => json!({
-            "status": "stale",
-            "age_secs": age_secs,
+        DaemonHealth::Unreachable { socket, reason } => json!({
+            "status": "unreachable",
+            "socket": socket.display().to_string(),
+            "reason": reason,
             "message": health.describe(),
         }),
     }
@@ -1015,6 +1008,13 @@ mod tests {
         ccteam_core::disable_tool_surface_bootstrap_for_tests();
     }
 
+    #[cfg(unix)]
+    fn fake_daemon(paths: &CcteamPaths) -> std::os::unix::net::UnixListener {
+        let socket = ccteam_core::daemon_socket_path(paths);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        std::os::unix::net::UnixListener::bind(socket).unwrap()
+    }
+
     #[tokio::test]
     async fn handle_initialize_returns_tools_capability() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1163,8 +1163,7 @@ mod tests {
             projects_root: tmp.path().join("projects"),
         };
         bootstrap_project(&paths, "demo", "demo request", "dev").unwrap();
-        // M0.23.1: action tools require a live daemon heartbeat.
-        ccteam_core::write_heartbeat(&paths).unwrap();
+        let _daemon = fake_daemon(&paths);
         let req = json!({
             "jsonrpc": "2.0",
             "id": 7,
@@ -1194,7 +1193,7 @@ mod tests {
             projects_root: tmp.path().join("projects"),
         };
         bootstrap_project(&paths, "demo", "demo request", "dev").unwrap();
-        ccteam_core::write_heartbeat(&paths).unwrap();
+        let _daemon = fake_daemon(&paths);
         let req = json!({
             "jsonrpc": "2.0",
             "id": 8,
@@ -1228,7 +1227,7 @@ mod tests {
             projects_root: tmp.path().join("projects"),
         };
         bootstrap_project(&paths, "demo", "demo request", "dev").unwrap();
-        // No heartbeat written → daemon considered down.
+        // No MCP socket listener → daemon considered down.
         let req = json!({
             "jsonrpc": "2.0",
             "id": 70,
@@ -1294,7 +1293,7 @@ mod tests {
         let content = resp["result"]["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(content).unwrap();
         assert_eq!(
-            parsed["orchestrator"]["daemon_health"]["status"], "no_heartbeat",
+            parsed["orchestrator"]["daemon_health"]["status"], "unreachable",
             "ls must annotate daemon health when daemon is down"
         );
     }
@@ -1355,9 +1354,9 @@ mod tests {
             root: tmp.path().join("home"),
             projects_root: tmp.path().join("projects"),
         };
-        // Heartbeat present so the daemon-health gate doesn't preempt
+        // Reachable daemon socket so the health gate doesn't preempt
         // the unknown-kind validation we're testing here.
-        ccteam_core::write_heartbeat(&paths).unwrap();
+        let _daemon = fake_daemon(&paths);
         let req = json!({
             "jsonrpc": "2.0",
             "id": 9,

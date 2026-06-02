@@ -649,8 +649,8 @@ pub fn dispatch(paths: &CcteamPaths, name: &str, args: &Value) -> Result<Option<
     Ok(Some(body))
 }
 
-/// Names of tools that require a live daemon heartbeat (state-mutating
-/// tools where a dead daemon means F66 will never pick up the marker).
+/// Names of tools that require a reachable gateway daemon (state-mutating
+/// tools where a dead daemon means no control-plane consumer is alive).
 /// Read-only tools (`observe_agents`, `get_artifact_summary`) stay
 /// daemon-independent so the meta-agent can inspect a stopped project.
 pub fn requires_daemon(name: &str) -> bool {

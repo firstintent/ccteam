@@ -2086,16 +2086,11 @@ fn run_start(
 }
 
 #[cfg(unix)]
-fn mcp_socket_path(paths: &CcteamPaths) -> PathBuf {
-    paths.root.join("run").join("mcp.sock")
-}
-
-#[cfg(unix)]
 async fn serve_mcp_socket<F>(paths: CcteamPaths, shutdown: F) -> Result<()>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    let socket = mcp_socket_path(&paths);
+    let socket = ccteam_core::daemon_socket_path(&paths);
     if let Some(parent) = socket.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create MCP socket dir {}", parent.display()))?;

@@ -714,7 +714,7 @@ fn resolve_team_kind(paths: &CcteamPaths, team: &str) -> Result<ccteam_core::Tea
 /// JSON shape (a single string, not printed — caller decides).
 pub fn run_ls(paths: &CcteamPaths, format: OutputFormat) -> Result<String> {
     let projects = collect_projects(paths)?;
-    let daemon_up = ccteam_core::daemon::heartbeat_alive(paths);
+    let daemon_up = ccteam_core::daemon::daemon_reachable(paths);
     Ok(match format {
         OutputFormat::Text => render_ls_text(paths, &projects, daemon_up),
         OutputFormat::Json => render_ls_json(paths, &projects, daemon_up)?,
@@ -2711,6 +2711,7 @@ pub fn run_doctor(paths: &CcteamPaths, mut opts: DoctorOptions) -> Result<String
     if opts.migrate_hook_commands {
         out.push_str(&render_migrate_hook_commands_report(paths, opts.dry_run)?);
     }
+    out.push_str(&render_daemon_health_line(paths));
     // V0.3.1 F47 — informational codex CLI detection. Appends one line
     // to every successful doctor run (any_mode == true) so operators
     // see whether the codex binary is on PATH ahead of V0.3.2's real
@@ -2724,6 +2725,11 @@ pub fn run_doctor(paths: &CcteamPaths, mut opts: DoctorOptions) -> Result<String
         out.push_str(NO_MODE_HELP);
     }
     Ok(out)
+}
+
+fn render_daemon_health_line(paths: &CcteamPaths) -> String {
+    let health = ccteam_core::check_daemon_health(paths);
+    format!("[ccteam] daemon: {}\n", health.describe())
 }
 
 /// V0.6.1 F121 — help text appended after the implicit pricing check
@@ -4496,9 +4502,9 @@ fn render_ls_json(
         .collect();
     let v = json!({
         "projects": arr,
-        // F27 — `running` is now a real bool driven by
-        // `daemon::heartbeat_alive` so meta-agent / MCP consumers can
-        // gate writes on daemon liveness without an extra round trip.
+        // `running` is a real bool driven by MCP socket reachability so
+        // meta-agent / MCP consumers can gate writes on daemon liveness
+        // without trusting a stale side file.
         "orchestrator": {
             "running": daemon_up,
             "active_count": active_count,
@@ -5295,7 +5301,7 @@ pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Resul
     // is alive it polls for these every 250ms (same pattern as the F86
     // shutdown trigger) and calls unroster_project(CancelReason::Removed).
     let trigger_path = unroster_trigger_path(slug);
-    let daemon_up = ccteam_core::daemon::heartbeat_alive(paths);
+    let daemon_up = ccteam_core::daemon::daemon_reachable(paths);
     if opts.dry_run {
         report.steps.push(if daemon_up {
             "would write unroster trigger + await daemon acknowledgment (≤5s)".to_string()
@@ -5648,6 +5654,13 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn fake_daemon(paths: &CcteamPaths) -> std::os::unix::net::UnixListener {
+        let socket = ccteam_core::daemon::daemon_socket_path(paths);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        std::os::unix::net::UnixListener::bind(socket).unwrap()
+    }
+
     /// V0.4.2 F75: tests that previously used `run_new_t4` (the
     /// Tier-4 deterministic slug wrapper) now bootstrap directly via
     /// the core helper. Same effect for setup purposes — the
@@ -5763,7 +5776,7 @@ mod tests {
     }
 
     #[test]
-    fn f27_run_ls_text_reports_daemon_down_when_no_heartbeat() {
+    fn f27_run_ls_text_reports_daemon_down_when_socket_unreachable() {
         // F27 — `ls` text output annotates daemon health on its first
         // line so users can disambiguate "no projects" from "daemon
         // never came up".
@@ -5780,7 +5793,7 @@ mod tests {
     #[test]
     fn f27_run_ls_json_orchestrator_running_is_bool() {
         // F27 — `orchestrator.running` was hardcoded `null` pre-V0.2.1;
-        // now it's a real bool gated on heartbeat freshness so MCP /
+        // now it's a real bool gated on socket reachability so MCP /
         // meta-agent consumers can treat it as a status field.
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
@@ -5791,19 +5804,19 @@ mod tests {
             running.is_boolean(),
             "expected orchestrator.running:bool; got: {running:?}",
         );
-        // No heartbeat written → must be false.
+        // No MCP socket listener → must be false.
         assert_eq!(running.as_bool(), Some(false));
     }
 
     #[test]
-    fn f27_run_ls_text_reports_daemon_up_on_fresh_heartbeat() {
+    fn f27_run_ls_text_reports_daemon_up_on_reachable_socket() {
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
-        ccteam_core::daemon::write_heartbeat(&paths).unwrap();
+        let _daemon = fake_daemon(&paths);
         let body = run_ls(&paths, OutputFormat::Text).unwrap();
         assert!(
             body.starts_with("daemon: up"),
-            "expected `daemon: up` head line on fresh heartbeat; got:\n{body}",
+            "expected `daemon: up` head line on reachable socket; got:\n{body}",
         );
     }
 
