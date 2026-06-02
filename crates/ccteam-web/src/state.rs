@@ -10,6 +10,7 @@
 //! about live events use [`AppState::new_no_bus`] which still hands
 //! out a working bus (the watcher just has nothing to watch).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -61,9 +62,26 @@ pub struct AppState {
     /// Browser chat outbound fan-out, fed by the CLI bridge.
     pub chat_outbound: broadcast::Sender<WebSendMessage>,
     /// Browser chat outbound backlog for messages emitted while a
-    /// matching web socket is disconnected.
+    /// matching web socket is disconnected. Bounded by
+    /// [`CHAT_BACKLOG_CAP`] (oldest dropped first) — combined with the
+    /// connection registry below, entries only accrue while a recipient
+    /// has zero live sockets.
     pub chat_backlog: Arc<Mutex<Vec<WebSendMessage>>>,
+    /// Per-recipient (`chat_id`) live web-chat socket count. Shared with
+    /// the CLI `web_chat_bridge` so the send path can decide whether an
+    /// outbound message rides the live broadcast (≥1 socket) or must be
+    /// parked in `chat_backlog` (0 sockets). The WS edge bumps this on
+    /// connect and decrements on disconnect.
+    pub chat_conns: ChatConns,
 }
+
+/// Shared map of `chat_id` → live web-chat socket count.
+pub type ChatConns = Arc<Mutex<HashMap<String, usize>>>;
+
+/// Hard cap on parked outbound messages. With the connection registry
+/// gating inserts, the backlog only fills while a recipient is offline;
+/// the cap is a safety valve against an unbounded offline window.
+pub const CHAT_BACKLOG_CAP: usize = 1024;
 
 impl AppState {
     /// Resolve paths + spawn the progress watcher. If the watcher
@@ -120,6 +138,7 @@ impl AppState {
             chat_inbound: None,
             chat_outbound,
             chat_backlog: Arc::new(Mutex::new(Vec::new())),
+            chat_conns: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -142,6 +161,7 @@ impl AppState {
             chat_inbound: None,
             chat_outbound,
             chat_backlog: Arc::new(Mutex::new(Vec::new())),
+            chat_conns: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -166,10 +186,12 @@ impl AppState {
         inbound: mpsc::Sender<WebChannelMessage>,
         outbound: broadcast::Sender<WebSendMessage>,
         backlog: Arc<Mutex<Vec<WebSendMessage>>>,
+        conns: ChatConns,
     ) -> Self {
         self.chat_inbound = Some(inbound);
         self.chat_outbound = outbound;
         self.chat_backlog = backlog;
+        self.chat_conns = conns;
         self
     }
 }

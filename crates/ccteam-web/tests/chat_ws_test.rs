@@ -1,5 +1,6 @@
 //! Web chat WebSocket route tests.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -114,6 +115,7 @@ async fn chat_ws_forwards_text_to_inbound_and_renders_outbound_reply() {
         in_tx,
         out_tx.clone(),
         backlog.clone(),
+        Arc::new(Mutex::new(HashMap::new())),
     );
     let addr = spawn(state).await;
 
@@ -162,6 +164,7 @@ async fn chat_ws_switch_emits_cd_then_use_and_refreshes_sessions() {
         in_tx,
         out_tx.clone(),
         Arc::new(Mutex::new(Vec::new())),
+        Arc::new(Mutex::new(HashMap::new())),
     );
     let addr = spawn(state).await;
 
@@ -206,6 +209,7 @@ async fn chat_ws_outbound_replies_are_scoped_by_chat_id() {
         in_tx,
         out_tx.clone(),
         backlog.clone(),
+        Arc::new(Mutex::new(HashMap::new())),
     );
     let addr = spawn(state).await;
 

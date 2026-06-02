@@ -10,11 +10,15 @@ use tokio::sync::{broadcast, mpsc, Mutex};
 
 use ccteam_im::transport::{Channel, ChannelMessage, SendMessage};
 use ccteam_web::chat_protocol::{WebChannelMessage, WebSendMessage};
+use ccteam_web::{ChatConns, CHAT_BACKLOG_CAP};
 
 pub(crate) struct WebChatBridge {
     pub inbound_tx: mpsc::Sender<WebChannelMessage>,
     pub outbound_tx: broadcast::Sender<WebSendMessage>,
     pub backlog: Arc<Mutex<Vec<WebSendMessage>>>,
+    /// Shared with `AppState` so the send path and the WS edge agree on
+    /// which recipients currently have a live socket.
+    pub conns: ChatConns,
     pub channel: Arc<dyn Channel + Send + Sync>,
 }
 
@@ -22,15 +26,18 @@ pub(crate) fn build() -> WebChatBridge {
     let (inbound_tx, inbound_rx) = mpsc::channel(64);
     let (outbound_tx, _) = broadcast::channel(256);
     let backlog = Arc::new(Mutex::new(Vec::new()));
+    let conns: ChatConns = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let channel = Arc::new(WebChatChannel {
         inbound_rx: Mutex::new(Some(inbound_rx)),
         outbound_tx: outbound_tx.clone(),
         backlog: Arc::clone(&backlog),
+        conns: Arc::clone(&conns),
     });
     WebChatBridge {
         inbound_tx,
         outbound_tx,
         backlog,
+        conns,
         channel,
     }
 }
@@ -39,6 +46,7 @@ struct WebChatChannel {
     inbound_rx: Mutex<Option<mpsc::Receiver<WebChannelMessage>>>,
     outbound_tx: broadcast::Sender<WebSendMessage>,
     backlog: Arc<Mutex<Vec<WebSendMessage>>>,
+    conns: ChatConns,
 }
 
 #[async_trait]
@@ -54,7 +62,26 @@ impl Channel for WebChatChannel {
             subject: message.subject.clone(),
             thread_ts: message.thread_ts.clone(),
         };
-        self.backlog.lock().await.push(message.clone());
+        // P1-1/P1-3: only park the message when the recipient has no live
+        // socket. A connected socket receives it via the broadcast below,
+        // so backlogging it would re-deliver a stale copy on the next
+        // connect. With the registry gating inserts, the backlog only
+        // grows while offline; the cap bounds even that.
+        let live = self
+            .conns
+            .lock()
+            .await
+            .get(&message.recipient)
+            .copied()
+            .unwrap_or(0);
+        if live == 0 {
+            let mut backlog = self.backlog.lock().await;
+            backlog.push(message.clone());
+            let overflow = backlog.len().saturating_sub(CHAT_BACKLOG_CAP);
+            if overflow > 0 {
+                backlog.drain(0..overflow);
+            }
+        }
         let _ = self.outbound_tx.send(message);
         Ok(None)
     }
@@ -326,6 +353,7 @@ mod tests {
                 bridge.inbound_tx.clone(),
                 bridge.outbound_tx.clone(),
                 bridge.backlog.clone(),
+                bridge.conns.clone(),
             ),
         );
         let (web_stop, web_stop_rx) = tokio::sync::oneshot::channel::<()>();

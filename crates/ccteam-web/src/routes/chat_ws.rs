@@ -18,12 +18,13 @@ use ccteam_core::TeamKind;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::mpsc;
 
 use crate::chat_protocol::{
     now_unix_seconds, timestamp_id, ClientChatFrame, ServerChatFrame, SessionItem,
     WebChannelMessage, WebSendMessage, SUBPROTOCOL,
 };
-use crate::state::AppState;
+use crate::state::{AppState, ChatConns};
 
 #[derive(Debug, Deserialize)]
 struct ChatQuery {
@@ -59,6 +60,20 @@ async fn relay(
     user_id: String,
 ) -> anyhow::Result<()> {
     let (mut tx, mut rx) = socket.split();
+
+    // Order matters for the backlog/live handoff (P1-1):
+    //   1. subscribe so we catch every live broadcast from here on,
+    //   2. register this socket so the send path stops parking this
+    //      recipient's messages in the backlog (a live socket exists),
+    //   3. send the session list, then drain anything parked while the
+    //      recipient had no socket. A message sent in the µs window
+    //      between (1) and (2) may arrive both live and via the drain;
+    //      that rare duplicate is preferred over the loss the old
+    //      "backlog entry == delivery token" scheme caused with >1 tab.
+    let mut outbound = app.chat_outbound.subscribe();
+    let _conn = ConnGuard::enter(app.chat_conns.clone(), chat_id.clone()).await;
+    let inbound = app.chat_inbound.clone();
+
     let sessions = ServerChatFrame::Sessions {
         items: session_items(&app),
     };
@@ -69,47 +84,34 @@ async fn relay(
         }
     }
 
-    let inbound = app.chat_inbound.clone();
-    let mut outbound = app.chat_outbound.subscribe();
-
     loop {
         tokio::select! {
             frame = rx.next() => match frame {
                 Some(Ok(Message::Text(text))) => {
-                    let parsed = serde_json::from_str::<ClientChatFrame>(&text)?;
-                    let is_switch = matches!(parsed, ClientChatFrame::Switch { .. });
-                    let messages = frame_to_messages(parsed, &chat_id, &user_id);
-                    if let Some(inbound) = &inbound {
-                        for message in messages {
-                            if inbound.send(message).await.is_err() {
-                                break;
-                            }
+                    match serde_json::from_str::<ClientChatFrame>(&text) {
+                        Ok(parsed) => {
+                            forward_client_frame(parsed, &chat_id, &user_id, &inbound, &app, &mut tx)
+                                .await?;
                         }
-                    }
-                    if is_switch {
-                        let sessions = ServerChatFrame::Sessions {
-                            items: session_items(&app),
-                        };
-                        send_frame(&mut tx, &sessions).await?;
+                        // P1-2: a single malformed frame must not tear
+                        // down the whole chat socket. Log + keep going.
+                        Err(err) => {
+                            tracing::debug!(chat_id = %chat_id, error = %err, "chat_ws: ignoring malformed text frame");
+                        }
                     }
                 }
                 Some(Ok(Message::Binary(data))) => {
-                    let text = String::from_utf8(data.to_vec())?;
-                    let parsed = serde_json::from_str::<ClientChatFrame>(&text)?;
-                    let is_switch = matches!(parsed, ClientChatFrame::Switch { .. });
-                    let messages = frame_to_messages(parsed, &chat_id, &user_id);
-                    if let Some(inbound) = &inbound {
-                        for message in messages {
-                            if inbound.send(message).await.is_err() {
-                                break;
-                            }
+                    match String::from_utf8(data.to_vec())
+                        .ok()
+                        .and_then(|text| serde_json::from_str::<ClientChatFrame>(&text).ok())
+                    {
+                        Some(parsed) => {
+                            forward_client_frame(parsed, &chat_id, &user_id, &inbound, &app, &mut tx)
+                                .await?;
                         }
-                    }
-                    if is_switch {
-                        let sessions = ServerChatFrame::Sessions {
-                            items: session_items(&app),
-                        };
-                        send_frame(&mut tx, &sessions).await?;
+                        None => {
+                            tracing::debug!(chat_id = %chat_id, "chat_ws: ignoring malformed/non-utf8 binary frame");
+                        }
                     }
                 }
                 Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
@@ -120,10 +122,11 @@ async fn relay(
                 }
             },
             message = outbound.recv() => match message {
+                // P1-1: deliver to every socket whose recipient matches —
+                // multiple tabs on the same chat each get a copy. Delivery
+                // is no longer gated on removing a backlog entry.
                 Ok(message) => {
-                    if message.recipient == chat_id
-                        && remove_backlog_message(&app, &message).await
-                    {
+                    if message.recipient == chat_id {
                         for frame in send_message_to_frames(message) {
                             send_frame(&mut tx, &frame).await?;
                         }
@@ -138,6 +141,72 @@ async fn relay(
     }
 
     Ok(())
+}
+
+/// Translate a parsed client frame into bridge inbound messages and, for
+/// focus switches, re-emit the (now-current) session list. Shared by the
+/// text and binary receive arms so P1-2's resilience lives in one place.
+async fn forward_client_frame<S>(
+    parsed: ClientChatFrame,
+    chat_id: &str,
+    user_id: &str,
+    inbound: &Option<mpsc::Sender<WebChannelMessage>>,
+    app: &AppState,
+    tx: &mut S,
+) -> anyhow::Result<()>
+where
+    S: SinkExt<Message> + Unpin,
+    <S as futures_util::Sink<Message>>::Error: std::error::Error + Send + Sync + 'static,
+{
+    let is_switch = matches!(parsed, ClientChatFrame::Switch { .. });
+    let messages = frame_to_messages(parsed, chat_id, user_id);
+    if let Some(inbound) = inbound {
+        for message in messages {
+            if inbound.send(message).await.is_err() {
+                break;
+            }
+        }
+    }
+    if is_switch {
+        let sessions = ServerChatFrame::Sessions {
+            items: session_items(app),
+        };
+        send_frame(tx, &sessions).await?;
+    }
+    Ok(())
+}
+
+/// RAII counter for live web-chat sockets per `chat_id`. The send path
+/// (`web_chat_bridge`) reads this to decide live-broadcast vs backlog.
+struct ConnGuard {
+    conns: ChatConns,
+    chat_id: String,
+}
+
+impl ConnGuard {
+    async fn enter(conns: ChatConns, chat_id: String) -> Self {
+        *conns.lock().await.entry(chat_id.clone()).or_insert(0) += 1;
+        Self { conns, chat_id }
+    }
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        // tokio's Mutex can't be locked synchronously here; hand the
+        // decrement to the runtime. Keyed by chat_id, so a fast
+        // reconnect (new increment before this runs) still nets correct.
+        let conns = self.conns.clone();
+        let chat_id = std::mem::take(&mut self.chat_id);
+        tokio::spawn(async move {
+            let mut guard = conns.lock().await;
+            if let Some(count) = guard.get_mut(&chat_id) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    guard.remove(&chat_id);
+                }
+            }
+        });
+    }
 }
 
 async fn send_frame<S>(tx: &mut S, frame: &ServerChatFrame) -> anyhow::Result<()>
@@ -221,15 +290,6 @@ async fn take_backlog_for_target(app: &AppState, target: &str) -> Vec<WebSendMes
     matched
 }
 
-async fn remove_backlog_message(app: &AppState, message: &WebSendMessage) -> bool {
-    let mut guard = app.chat_backlog.lock().await;
-    let Some(idx) = guard.iter().position(|entry| entry == message) else {
-        return false;
-    };
-    guard.remove(idx);
-    true
-}
-
 fn send_message_to_frames(message: WebSendMessage) -> Vec<ServerChatFrame> {
     let mut frames = vec![ServerChatFrame::Reply {
         content: message.content.clone(),
@@ -247,7 +307,7 @@ fn parse_sessions_reply(content: &str) -> Option<Vec<SessionItem>> {
     let mut items = Vec::new();
     for line in content.lines() {
         let mut parts = line.splitn(4, ':');
-        let (Some(session), Some(project), Some(vendor), Some(_role)) =
+        let (Some(session), Some(project), Some(vendor), Some(role)) =
             (parts.next(), parts.next(), parts.next(), parts.next())
         else {
             return None;
@@ -259,6 +319,7 @@ fn parse_sessions_reply(content: &str) -> Option<Vec<SessionItem>> {
             project: project.to_string(),
             session: Some(session.to_string()),
             vendor: Some(vendor.to_ascii_lowercase()),
+            role: Some(role.to_string()),
             current: false,
         });
     }
@@ -274,10 +335,12 @@ fn session_items(app: &AppState) -> Vec<SessionItem> {
         let state = project.state;
         if state.team_kind == TeamKind::Flex {
             for (sid, record) in state.sessions {
+                let role = role_from_chat_tmux(&record.tmux_session, &state.slug);
                 items.push(SessionItem {
                     project: state.slug.clone(),
                     session: Some(sid),
                     vendor: Some(format!("{:?}", record.harness).to_lowercase()),
+                    role,
                     current: false,
                 });
             }
@@ -286,9 +349,23 @@ fn session_items(app: &AppState) -> Vec<SessionItem> {
                 project: state.slug,
                 session: None,
                 vendor: None,
+                role: None,
                 current: false,
             });
         }
     }
     items
+}
+
+/// Recover the agent role from a chat session's tmux name. Chat panes are
+/// named `ccteam-chat-<slug>-<role>` by the gateway; since the slug is
+/// known we strip the `ccteam-chat-<slug>-` prefix rather than guessing
+/// split points in a slug that may itself contain hyphens. Returns `None`
+/// for non-chat tmux names (the role isn't recoverable from disk).
+fn role_from_chat_tmux(tmux_session: &str, slug: &str) -> Option<String> {
+    let prefix = format!("ccteam-chat-{slug}-");
+    tmux_session
+        .strip_prefix(&prefix)
+        .filter(|role| !role.is_empty())
+        .map(|role| role.to_string())
 }

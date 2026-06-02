@@ -48,7 +48,7 @@ pub mod views;
 pub mod watcher;
 
 pub use auth::AuthState;
-pub use state::AppState;
+pub use state::{AppState, ChatConns, CHAT_BACKLOG_CAP};
 pub use watcher::{EventBus, HarnessSnapshotEvent, ProgressUpdate};
 
 /// Knobs accepted by [`serve`]. Mirrors the `ccteam web` CLI flags

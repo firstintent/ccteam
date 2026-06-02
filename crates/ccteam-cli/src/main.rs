@@ -1888,6 +1888,7 @@ fn run_start(
                         bridge.inbound_tx.clone(),
                         bridge.outbound_tx.clone(),
                         bridge.backlog.clone(),
+                        bridge.conns.clone(),
                     )
                 });
             Some(tokio::spawn(async move {
@@ -1895,8 +1896,8 @@ fn run_start(
                     opts,
                     move |paths, auth| {
                         let state = ccteam_web::AppState::with_auth(paths, auth);
-                        if let Some((inbound, outbound, backlog)) = web_bridge {
-                            state.with_chat_bridge(inbound, outbound, backlog)
+                        if let Some((inbound, outbound, backlog, conns)) = web_bridge {
+                            state.with_chat_bridge(inbound, outbound, backlog, conns)
                         } else {
                             state
                         }

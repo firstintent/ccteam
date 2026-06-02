@@ -44,6 +44,11 @@ pub struct SessionItem {
     pub project: String,
     pub session: Option<String>,
     pub vendor: Option<String>,
+    /// Agent role (`reviewer`, `api`, …). Derived from the chat-session
+    /// tmux name (`ccteam-chat-<slug>-<role>`) for the disk path, or the
+    /// `/sessions` reply for the gateway path. `None` for workflow
+    /// projects and sessions whose role can't be resolved.
+    pub role: Option<String>,
     pub current: bool,
 }
 
@@ -151,6 +156,7 @@ mod tests {
                 project: "dev-demo".into(),
                 session: Some("s1".into()),
                 vendor: Some("codex".into()),
+                role: Some("reviewer".into()),
                 current: true,
             }],
         });

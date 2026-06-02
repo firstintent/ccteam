@@ -132,32 +132,50 @@ function PrimaryTabs() {
 export default function App() {
   return (
     <TokenEntryGate>
+      <AppShell />
+    </TokenEntryGate>
+  );
+}
+
+/** v0.8.3 — the web chat is a standalone app: on `/chat` we render
+ *  `ChatConsole` full-screen WITHOUT the dashboard chrome (TopBar /
+ *  PrimaryTabs / Projects sidebar). Every other route keeps the
+ *  dashboard shell. `ChatConsole` carries its own app bar with a
+ *  `Dashboard ↗` link back. */
+function AppShell() {
+  const location = useLocation();
+  if (location.pathname === "/chat" || location.pathname.startsWith("/chat/")) {
+    return (
       <div className="h-dvh flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset">
-        <TopBar />
-        <PrimaryTabs />
-        <div className="flex flex-1 min-h-0">
-          <PersistentSidebar />
-          <div className="flex-1 flex flex-col min-h-0 min-w-0">
-            <ContentSplit
-              collapsed
-              onToggleCollapse={() => {}}
-              left={
-                <Routes>
-                  <Route path="/" element={<Dashboard />} />
-                  <Route path="/p/:slug" element={<ProjectDetail />} />
-                  <Route path="/p/:slug/s/:sid" element={<SessionDetail />} />
-                  <Route path="/chat" element={<ChatConsole />} />
-                  <Route path="/teams" element={<TeamsListPage />} />
-                  <Route path="/teams/:name" element={<TeamDetailPage />} />
-                  <Route path="/sessions" element={<SessionsListPage />} />
-                  <Route path="*" element={<PlaceholderPage label="route" />} />
-                </Routes>
-              }
-              right={<div />}
-            />
-          </div>
+        <ChatConsole />
+      </div>
+    );
+  }
+  return (
+    <div className="h-dvh flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset">
+      <TopBar />
+      <PrimaryTabs />
+      <div className="flex flex-1 min-h-0">
+        <PersistentSidebar />
+        <div className="flex-1 flex flex-col min-h-0 min-w-0">
+          <ContentSplit
+            collapsed
+            onToggleCollapse={() => {}}
+            left={
+              <Routes>
+                <Route path="/" element={<Dashboard />} />
+                <Route path="/p/:slug" element={<ProjectDetail />} />
+                <Route path="/p/:slug/s/:sid" element={<SessionDetail />} />
+                <Route path="/teams" element={<TeamsListPage />} />
+                <Route path="/teams/:name" element={<TeamDetailPage />} />
+                <Route path="/sessions" element={<SessionsListPage />} />
+                <Route path="*" element={<PlaceholderPage label="route" />} />
+              </Routes>
+            }
+            right={<div />}
+          />
         </div>
       </div>
-    </TokenEntryGate>
+    </div>
   );
 }
