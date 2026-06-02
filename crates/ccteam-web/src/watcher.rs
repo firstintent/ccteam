@@ -355,9 +355,14 @@ fn drain_new_lines(
         // Validate it parses as a JSON object before broadcasting so
         // SSE clients always receive well-formed `data:` payloads.
         if serde_json::from_str::<Value>(line).is_err() {
+            // Char-boundary-safe preview: byte-slicing a UTF-8 line at a
+            // fixed offset panics when the cut lands inside a multibyte char
+            // (e.g. a Chinese prompt excerpt), which crashed this watcher
+            // thread. Take whole chars instead.
+            let preview: String = line.chars().take(120).collect();
             tracing::warn!(
                 file = %path.display(),
-                line_preview = &line[..line.len().min(120)],
+                line_preview = %preview,
                 "skipping unparseable progress line",
             );
             continue;
