@@ -53,7 +53,7 @@
   .lyr .d{color:var(--dim);font-size:12.5px} .lyr code{font-family:var(--mono);font-size:11.5px;color:var(--blue)}
   /* browser mockup */
   .bgrid{display:grid;grid-template-columns:1fr;gap:16px}
-  .browser{border:1px solid var(--border);border-radius:12px;overflow:hidden;background:#080b10;box-shadow:0 8px 40px rgba(0,0,0,.4)}
+  .browser{position:relative;border:1px solid var(--border);border-radius:12px;overflow:hidden;background:#080b10;box-shadow:0 8px 40px rgba(0,0,0,.4)}
   .bchrome{display:flex;align-items:center;gap:10px;padding:9px 13px;background:var(--panel);border-bottom:1px solid var(--border)}
   .lights{display:flex;gap:6px} .lights i{width:11px;height:11px;border-radius:50%;display:inline-block}
   .lights .r{background:#ff5f57} .lights .y{background:#febc2e} .lights .g{background:#28c840}
@@ -97,6 +97,55 @@
   .xterm{flex:1;overflow-y:auto;padding:13px 14px;font-family:var(--mono);font-size:12px;line-height:1.55;color:#c9d1d9;background:#05070a;white-space:pre-wrap}
   .xterm .pr{color:var(--green)} .xterm .pa{color:var(--blue)} .xterm .cm{color:var(--faint)} .xterm .blk{display:inline-block;width:7px;height:13px;background:#c9d1d9;vertical-align:-2px;animation:bl 1s steps(2) infinite}
   .hide{display:none!important}
+  /* sidebar: ALL sessions (grouped by project) */
+  .sbtop{display:flex;align-items:center;gap:8px;padding:10px 11px 9px;border-bottom:1px solid var(--border)}
+  .sbh2{font-size:10px;letter-spacing:.6px;text-transform:uppercase;color:var(--faint);font-weight:700}
+  .newbtn{margin-left:auto;background:#1f6feb;border:1px solid #388bfd;color:#fff;font-size:11px;border-radius:7px;padding:3px 9px;cursor:pointer;font-weight:600}
+  .newbtn:hover{background:#388bfd}
+  .sgrp{font-size:10px;font-family:var(--mono);color:var(--faint);padding:10px 13px 3px;letter-spacing:.3px}
+  .sgrp .muted{color:#4b525c}
+  .sess{display:flex;align-items:center;gap:7px;padding:7px 12px;cursor:pointer;border-left:2px solid transparent;font-size:12px}
+  .sess:hover{background:var(--panel2)}
+  .sess.on{background:var(--panel2);border-left-color:var(--blue)}
+  .sess .sd{width:7px;height:7px;border-radius:50%;background:var(--faint);flex:none}
+  .sess .sd.live{background:var(--green)}
+  .sess .sv{font-family:var(--mono);font-size:10px;font-weight:700;padding:1px 6px;border-radius:5px;border:1px solid var(--border);flex:none}
+  .sess .sv.cl{color:var(--blue);border-color:#274b6b} .sess .sv.cx{color:var(--purple);border-color:#4b3a6b}
+  .sess .sr{color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap} .sess.on .sr{color:var(--fg)}
+  .sess .sid{margin-left:auto;font-family:var(--mono);font-size:10px;color:var(--faint);flex:none}
+  /* main crumb (current focus) */
+  .crumb{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--dim);font-family:var(--mono);min-width:0;overflow:hidden}
+  .crumb b{color:var(--fg)} .crumb .sep{color:var(--faint)} .crumb .cl{color:var(--blue)} .crumb .cx{color:var(--purple)}
+  .crumb .live{color:var(--green);font-size:10px}
+  .crumb .sid2{font-size:10px;color:var(--faint);border:1px solid var(--border);border-radius:5px;padding:0 5px}
+  /* new-session modal */
+  .modal{position:absolute;inset:0;background:rgba(3,5,8,.66);display:flex;align-items:center;justify-content:center;z-index:9}
+  .mcard{width:344px;background:var(--panel);border:1px solid var(--border);border-radius:14px;box-shadow:0 18px 60px rgba(0,0,0,.55);overflow:hidden}
+  .mh{display:flex;align-items:center;padding:12px 14px;font-weight:700;font-size:13px;border-bottom:1px solid var(--border)}
+  .mh .mx{margin-left:auto;color:var(--faint);cursor:pointer}
+  .mb{padding:14px}
+  .ml{display:block;font-size:10px;letter-spacing:.5px;text-transform:uppercase;color:var(--faint);font-weight:700;margin:12px 0 5px} .ml.first{margin-top:0}
+  .msel,.mip{width:100%;background:var(--panel2);border:1px solid var(--border);color:var(--fg);border-radius:8px;padding:8px 10px;font-size:13px;outline:none;font-family:var(--sans)}
+  .msel:focus,.mip:focus{border-color:#388bfd}
+  .seg{display:flex;border:1px solid var(--border);border-radius:8px;overflow:hidden}
+  .seg button{flex:1;background:var(--panel2);border:none;color:var(--dim);font-size:12px;padding:8px 6px;cursor:pointer;font-family:var(--mono)}
+  .seg button.on{background:#1f3b5e;color:var(--fg);box-shadow:inset 0 0 0 1px #274b6b}
+  .mhint{margin-top:12px;font-size:11.5px;color:var(--dim);background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:8px 10px;font-family:var(--mono)}
+  .mf{display:flex;gap:8px;justify-content:flex-end;padding:12px 14px;border-top:1px solid var(--border)}
+  .mbtn{background:#1f6feb;border:1px solid #388bfd;color:#fff;border-radius:8px;padding:7px 14px;font-size:12.5px;cursor:pointer;font-weight:600}
+  .mbtn:hover{background:#388bfd}
+  .mbtn.ghost{background:transparent;border-color:var(--border);color:var(--dim)} .mbtn.ghost:hover{color:var(--fg)}
+  /* standalone app bar */
+  .appbar{display:flex;align-items:center;gap:9px;padding:8px 13px;background:var(--bg);border-bottom:1px solid var(--border)}
+  .ablogo{font-weight:700;font-size:13px} .ablogo b{color:var(--blue)}
+  .abtag{font-family:var(--mono);font-size:10px;color:var(--faint);border:1px solid var(--border);border-radius:5px;padding:1px 6px}
+  .abdot{width:7px;height:7px;border-radius:50%;background:var(--green);margin-left:4px} .abcon{color:var(--green);font-size:11px;font-family:var(--mono)}
+  .abcost{font-family:var(--mono);font-size:11px;color:var(--dim)} .abcost b{color:var(--fg)}
+  .ablink{color:var(--blue);font-size:11px;text-decoration:none;border:1px solid #274b6b;border-radius:6px;padding:2px 8px;cursor:pointer} .ablink:hover{background:var(--panel2)}
+  .atlabel{font-size:10px;color:var(--faint);font-family:var(--mono);text-transform:uppercase;letter-spacing:.5px;flex:none}
+  .vtoggle button.disabled{opacity:.4;cursor:not-allowed}
+  .b.cc .nm .pj{color:var(--faint);font-weight:500}
+  .switchmk{align-self:center;font-size:10.5px;color:var(--blue);font-family:var(--mono);background:var(--panel2);border:1px solid #274b6b;border-radius:7px;padding:3px 10px;margin:2px 0}
   /* phone for parity */
   .phone{width:300px;border:1px solid var(--border);border-radius:26px;background:#080b10;padding:10px 8px 12px;flex:none}
   .notch{width:96px;height:5px;background:#222831;border-radius:99px;margin:2px auto 9px}
@@ -135,7 +184,7 @@
 
   <!-- ============ Web 端控制台原型 ============ -->
   <div class="view on" id="v-web">
-    <h2 class="sec">浏览器 = Claude / Codex 的完整控制台(与 IM 同一套体验,走 WebSocket)</h2>
+    <h2 class="sec">独立 web chat 应用 —— 自己的外壳(不嵌 dashboard);一条连续会话流、历史保留;与 IM 同一套体验,走 WebSocket</h2>
     <div class="bgrid">
       <div class="browser">
         <div class="bchrome">
@@ -143,25 +192,35 @@
           <div class="urlbar"><span class="lk">🔒</span> localhost:8787/app/<b>chat</b> &nbsp;<span style="color:var(--faint)">· ws ccteam-chat.v1 · 已连接</span></div>
           <span class="cost">$2.10 / $20</span>
         </div>
+        <div class="appbar">
+          <span class="ablogo">ccteam <b>chat</b></span>
+          <span class="abtag">独立应用 · ccteam-chat.v1</span>
+          <span class="abdot"></span><span class="abcon">已连接</span>
+          <span style="flex:1"></span>
+          <span class="abcost">今日 <b>$2.10</b> / $20</span>
+          <a class="ablink" id="godash">Dashboard ↗</a>
+        </div>
         <div class="bbody">
-          <!-- sidebar: projects -->
+          <!-- sidebar: ALL sessions, grouped by project -->
           <div class="sidebar">
-            <div class="sbh">项目(本 chat 可达)</div>
-            <div class="proj on" data-p="payments"><span class="pd"></span>payments<span class="cnt">2 sess</span></div>
-            <div class="proj" data-p="api-svc"><span class="pd"></span>api-svc<span class="cnt">1 sess</span></div>
-            <div class="proj" data-p="web-app"><span class="pd"></span>web-app<span class="cnt">0 sess</span></div>
-            <div class="proj" data-p="infra"><span class="pd"></span>infra<span class="cnt">idle</span></div>
-            <div class="sbadd" id="addproj">＋ ccteam init · 新项目</div>
+            <div class="sbtop"><span class="sbh2">所有 session</span><button class="newbtn" id="newsess">＋ 新建</button></div>
+            <div class="sgrp">payments</div>
+            <div class="sess cl on" id="wt-cl" data-p="payments" data-v="claude" data-r="reviewer" data-s="s1"><span class="sd live"></span><span class="sv cl">claude</span><span class="sr">reviewer</span><span class="sid">s1</span></div>
+            <div class="sess cx" id="wt-cx" data-p="payments" data-v="codex" data-r="payments-core" data-s="s2"><span class="sd live"></span><span class="sv cx">codex</span><span class="sr">payments-core</span><span class="sid">s2</span></div>
+            <div class="sgrp">api-svc</div>
+            <div class="sess cl" data-p="api-svc" data-v="claude" data-r="api" data-s="s3"><span class="sd live"></span><span class="sv cl">claude</span><span class="sr">api</span><span class="sid">s3</span></div>
+            <div class="sgrp">web-app</div>
+            <div class="sess cx" data-p="web-app" data-v="codex" data-r="ui" data-s="s4"><span class="sd"></span><span class="sv cx">codex</span><span class="sr">ui · 空闲</span><span class="sid">s4</span></div>
+            <div class="sgrp">infra <span class="muted">· 无 session</span></div>
           </div>
           <!-- main: session tabs + transcript + composer -->
           <div class="bmain">
             <div class="stabs">
-              <div class="stab cl on" id="wt-cl"><span class="live">●</span> claude · reviewer</div>
-              <div class="stab cx" id="wt-cx"><span class="live">●</span> codex · payments-core</div>
-              <div class="stab" id="wt-new" style="color:var(--faint)">＋ /new</div>
+              <span class="atlabel">对话焦点 →</span>
+              <div class="crumb" id="wcrumb"><span class="live">●</span> <b>payments</b> <span class="sep">/</span> <span class="cl">claude · reviewer</span> <span class="sid2">s1</span></div>
               <div class="vtoggle">
                 <button id="mode-chat" class="on">💬 Chat</button>
-                <button id="mode-term">▦ 终端</button>
+                <button id="mode-term" title="仅 Claude/tmux session 有终端">▦ 终端</button>
               </div>
             </div>
             <div class="scr" id="wscr"></div>
@@ -173,23 +232,46 @@
             </div>
           </div>
         </div>
+        <!-- new-session modal: project / code agent / role -->
+        <div class="modal hide" id="newmodal">
+          <div class="mcard">
+            <div class="mh">新建 session<span class="mx" id="mclose">✕</span></div>
+            <div class="mb">
+              <label class="ml first">项目</label>
+              <select class="msel" id="m-proj">
+                <option>payments</option><option>api-svc</option><option>web-app</option><option>infra</option>
+                <option value="__new">＋ 新项目(ccteam init)…</option>
+              </select>
+              <label class="ml">Code agent</label>
+              <div class="seg" id="m-vendor">
+                <button class="on" data-v="claude">Claude Code · tmux</button>
+                <button data-v="codex">Codex · app-server</button>
+              </div>
+              <label class="ml">Role</label>
+              <input class="mip" id="m-role" list="rolelist" placeholder="reviewer / api / payments-core …">
+              <datalist id="rolelist"><option>reviewer</option><option>api</option><option>payments-core</option><option>ui</option><option>qa</option><option>docs</option></datalist>
+              <div class="mhint" id="mhint">→ <code class="inl">/cd payments</code> + <code class="inl">/new claude reviewer</code></div>
+            </div>
+            <div class="mf"><button class="mbtn ghost" id="mcancel">取消</button><button class="mbtn" id="mcreate">创建并切过去</button></div>
+          </div>
+        </div>
       </div>
 
       <div class="grid2">
         <div class="card"><h3>这个页面演示了什么</h3><div class="pad" style="padding-top:6px">
-          <div class="feat"><span class="mk n">新</span><div><b>结构化 chat over WS</b> —— 浏览器经 <code class="inl">ccteam-chat.v1</code> 子协议收发 turn 事件(assistant 流 / tool 调用 / reply),<b>不是</b>裸 PTY 字节;消息进同一个 Gateway。</div></div>
-          <div class="feat"><span class="mk r">复用</span><div><b>chat ⇄ project ⇄ session</b> —— 左栏项目 = 这个 chat 可达的多 project;上方标签 = 当前 project 的多 session;一个浏览器 = 一个"终端"。</div></div>
-          <div class="feat"><span class="mk r">复用</span><div><b>同一套命令</b> —— <code class="inl">/new</code> <code class="inl">/use</code> <code class="inl">/cd</code> <code class="inl">@bot</code> <code class="inl">/compact</code> <code class="inl">/review</code> 全部走 <code class="inl">handle_text</code>,与 IM 字面一致。</div></div>
-          <div class="feat"><span class="mk r">复用</span><div><b>▦ 终端视图</b> —— 切到原始 xterm.js,走<b>已有的</b> <code class="inl">/ws/&lt;slug&gt;/pty</code>(<code class="inl">ccteam-pty.v1</code>)看完整 TUI;两条 WS 并存、各司其职。</div></div>
-          <div class="feat"><span class="mk r">复用</span><div><b>双 vendor 对称</b> —— Claude(tmux)与 Codex(app-server)在 web 端是同一套气泡;归一成 CanonicalEvent。</div></div>
+          <div class="feat"><span class="mk n">新</span><div><b>独立 chat 应用</b> —— 自己的外壳,<b>不</b>挂在 dashboard 导航里;dashboard(监控/进度/成本)是右上角链接过去的独立入口。</div></div>
+          <div class="feat"><span class="mk n">新</span><div><b>一条连续会话流</b> —— 一个 chat = 一条时间线,跨 s1/s2/s3 不清屏、没有"切项目"感;切焦点只插一行标记,会话继续。</div></div>
+          <div class="feat"><span class="mk n">新</span><div><b>历史保留</b> —— 连上 / 重连即从 <code class="inl">turns.jsonl</code> 恢复整段历史(往上可滚到更早),不是空白重开。</div></div>
+          <div class="feat"><span class="mk r">复用</span><div><b>左栏 = 所有 session</b>(按 project 分组,vendor·role·sid)——「＋ 新建」走 <code class="inl">/cd</code>+<code class="inl">/new</code>;<code class="inl">@bot</code> <code class="inl">/use</code> <code class="inl">/cd</code> <code class="inl">/compact</code> <code class="inl">/review</code> 全走 <code class="inl">handle_text</code>,与 IM 一致。</div></div>
+          <div class="feat"><span class="mk r">复用</span><div><b>终端按 vendor</b> —— 仅 Claude/tmux session 有「终端」(<code class="inl">ccteam-pty.v1</code>);Codex(app-server)无 PTY,终端页签禁用。</div></div>
         </div></div>
         <div class="card"><h3>试一下</h3><div class="pad" style="color:var(--dim);padding-top:6px">
           <div class="kv"><span class="k">↑ 发送</span><span>空输入点 ↑ 跑脚本演示;输入文本则按你的内容走。</span></div>
-          <div class="kv"><span class="k">切 session</span><span>点上方 <span style="color:var(--blue)">claude·reviewer</span> / <span style="color:var(--purple)">codex·payments-core</span> 标签。</span></div>
-          <div class="kv"><span class="k">切 project</span><span>点左栏 payments / api-svc …(= <code class="inl">/cd</code>)。</span></div>
-          <div class="kv"><span class="k">视图</span><span>右上 💬 Chat ⇄ ▦ 终端 切换两条 WS。</span></div>
-          <div class="kv"><span class="k">/new</span><span>点标签栏 ＋ /new 起新 session。</span></div>
-          <div class="note good" style="margin-top:8px"><b>核心主张:</b> web 端不是只读看板 —— 它是<b>能发起、能切换、能驱动 session</b> 的第一等用户进入层,和 IM 完全平行。</div>
+          <div class="kv"><span class="k">切焦点</span><span>点左栏任一 session → 只插一行「切到 X」,<b>会话流不清屏</b>(这条就是:不要切项目的感觉)。</span></div>
+          <div class="kv"><span class="k">新建</span><span>左栏右上「＋ 新建」→ 选 项目 / code agent / role → 创建并切过去。</span></div>
+          <div class="kv"><span class="k">终端</span><span>右上 ▦ 终端(仅 Claude session;codex 禁用)。💬 切回连续 chat。</span></div>
+          <div class="kv"><span class="k">历史</span><span>顶部「历史从 turns.jsonl 恢复」—— 重连后整段还在。</span></div>
+          <div class="note good" style="margin-top:8px"><b>核心主张:</b> 一个浏览器 chat = 一条连续会话(像 IM),不是项目切换器;web 与 IM 平行,同一批常驻 session。</div>
         </div></div>
       </div>
     </div>
@@ -299,8 +381,8 @@
   <!-- ============ 接入缝 + 红线 ============ -->
   <div class="view" id="v-seam">
     <h2 class="sec">接入缝:browser → ccteam-web → (cli mpsc 桥) → Gateway,web ⊥ im 不破</h2>
-    <div class="lyr web"><div class="h"><span class="t">① 浏览器 + ccteam-web</span><span class="role">chat WS 路由 + SPA chat 视图</span><span class="tag new">net-new</span></div>
-      <div class="d">新增 <code>routes::chat_ws</code>(子协议 <code>ccteam-chat.v1</code>)。沿用 <code>pty_ws</code> 的 axum upgrade / auth_layer / 背压套路。SPA 加 chat 面板(项目栏 + 会话标签 + transcript + composer)。<b>不</b>依赖 ccteam-im。</div></div>
+    <div class="lyr web"><div class="h"><span class="t">① 浏览器 + ccteam-web</span><span class="role">chat WS 路由 + 独立 chat SPA</span><span class="tag new">net-new</span></div>
+      <div class="d">新增 <code>routes::chat_ws</code>(子协议 <code>ccteam-chat.v1</code>)。沿用 <code>pty_ws</code> 的 axum upgrade / auth_layer / 背压套路。<b>独立 chat SPA 外壳</b>(不嵌 dashboard 导航;全 session 左栏 + 连续会话流 + composer)。<b>不</b>依赖 ccteam-im。</div></div>
     <div class="lyr bridge"><div class="h"><span class="t">② cli 层 mpsc 桥</span><span class="role">run_start daemon 装配处接线</span><span class="tag new">net-new(小)</span></div>
       <div class="d">cli 本就同时 spawn web + im。在此把 web chat WS 的入站/出站,经 <code>WsChannel</code>(或等价 mpsc 适配)接到 Gateway 的 inbound mpsc + 出站。线缆 = <code>ChannelMessage</code>/<code>SendMessage</code> JSON。<b>这是唯一让两者相遇的地方,且只在 cli。</b></div></div>
     <div class="lyr gw"><div class="h"><span class="t">③ Gateway 路由核(ccteam-im)</span><span class="role">handle_text · chat⇄project⇄session · spawn/resume</span><span class="tag reuse">复用 · 不动</span></div>
@@ -352,38 +434,41 @@
     };
   });
 
-  // ---- web console mockup ----
+  // ---- standalone web chat mockup · continuous per-chat timeline ----
   var scr=document.getElementById('wscr');
+  var active={p:'payments',v:'claude',r:'reviewer',s:'s1'};
   function add(html,cls){ var d=document.createElement('div'); d.className=cls; d.innerHTML=html; scr.appendChild(d); scr.scrollTop=scr.scrollHeight; return d; }
   function user(t){ add(t,'b user'); }
-  function cl(t){ add('<div class="nm cl">claude · reviewer · tmux</div>'+t,'b cc'); }
-  function cx(t){ add('<div class="nm cx">codex · payments-core · app-server</div>'+t,'b cc'); }
+  function bot(v,r,t){ var vc=v==='codex'?'cx':'cl'; add('<div class="nm '+vc+'">'+v+' · '+r+' <span class="pj">· '+active.p+'</span></div>'+t,'b cc'); }
+  function cl(t){ bot('claude','reviewer',t); }
+  function cx(t){ bot('codex','payments-core',t); }
   function tool(t){ add('<span class="ic">⚙</span> '+t,'tool'); }
   function sys(t){ add(t,'sys'); }
+  function switchmk(t){ add(t,'switchmk'); }
+  function setCrumb(){ var vc=active.v==='codex'?'cx':'cl';
+    document.getElementById('wcrumb').innerHTML='<span class="live">●</span> <b>'+active.p+'</b> <span class="sep">/</span> <span class="'+vc+'">'+active.v+' · '+active.r+'</span> <span class="sid2">'+active.s+'</span>';
+    updTerm(); }
 
-  function seedCl(){ scr.innerHTML='';
-    sys('— ws ccteam-chat.v1 已连接 · channel=web · chat=web-9f3 —');
-    sys('当前焦点:project=payments · session=s1(claude·reviewer)');
-    user('审一下 fix/login-race,重点看并发刷新 token');
-    cl('看了 src/auth/session.ts,确认是并发刷新的竞态。给出 3 处建议 + 1 个必改。');
-    tool('Read · src/auth/session.ts'); tool('Grep · refreshToken (4 hits)');
-    cl('必改:第 88 行的 check-then-act,要换成单飞(single-flight)锁。'); }
-  function seedCx(){ scr.innerHTML='';
-    sys('— /use s2 · 切到 codex·payments-core(app-server)—');
-    sys('当前焦点:project=payments · session=s2(codex·payments-core)');
-    cx('在 thread 上待命。'); }
-  seedCl();
+  // ONE continuous conversation — restored from turns.jsonl on connect, never cleared on switch
+  sys('— 已连接 · chat=web-9f3 · 历史从 turns.jsonl 恢复(往上可滚到更早)—');
+  user('审一下 fix/login-race,重点看并发刷新 token');
+  cl('看了 src/auth/session.ts,确认是并发刷新的竞态。3 处建议 + 1 必改:第 88 行 check-then-act → 单飞锁。');
+  tool('Read · src/auth/session.ts'); tool('Grep · refreshToken (4 hits)');
+  switchmk('→ @codex · 焦点切到 codex · payments-core (s2) · 同一条会话流,不清屏');
+  user('@codex 给 /v2/orders 加幂等键');
+  cx('已加 Idempotency-Key 中间件 + 单测。');
 
   var steps=[
-    function(){ user('@codex 给 /v2/orders 加幂等键,然后 /review'); sys('→ text 帧 → ChannelMessage{channel:web} → handle_text → @codex 切 s2');
-      document.getElementById('wt-cl').classList.remove('on'); document.getElementById('wt-cx').classList.add('on'); seedCx();
-      var d=cx('在 s2 上开干:加 Idempotency-Key 中间件<span class="cursor"></span>');
-      setTimeout(function(){ d.innerHTML='<div class="nm cx">codex · payments-core · app-server</div>在 s2 上开干:加 Idempotency-Key 中间件。'; tool('app-server · turn/start → ItemStarted(file_change)'); },700); },
-    function(){ tool('app-server · ItemCompleted · TurnDiffUpdated (+34 −2)'); cx('已加中间件 + 单测;接着跑 /review。'); },
-    function(){ user('/review'); sys('→ SystemDirective("/review") → Codex review/start(detached thread)'); cx('review_thread_id=rv_88 · 发现 1 处边界:重复键应回 409 而非 200。已附 patch。'); },
-    function(){ sys('— 点左栏 api-svc = /cd api-svc(切 project,焦点落它的会话)—'); },
-    function(){ user('@ccteam cost today'); sys('→ admin 关键词 → 真 ledger'); add('<div class="nm cl">ccteam · admin</div>今日:claude $1.42 · codex $0.68 · 合计 $2.10 / $20',  'b cc'); },
-    function(){ sys('— 两个 session 都常驻等下一条 · 同一批 session 在手机端也看得到(见「平行对照」)—'); }
+    function(){ active={p:'payments',v:'codex',r:'payments-core',s:'s2'};
+      document.querySelectorAll('.sess').forEach(x=>x.classList.remove('on')); document.getElementById('wt-cx').classList.add('on'); setCrumb();
+      user('/review'); sys('→ SystemDirective("/review") → Codex review/start(detached thread)');
+      cx('review_thread_id=rv_88 · 发现 1 处边界:重复键应回 409 而非 200。已附 patch。'); },
+    function(){ switchmk('→ 点左栏 api-svc / api (s3) · 焦点切过去,会话流不清屏');
+      active={p:'api-svc',v:'claude',r:'api',s:'s3'};
+      document.querySelectorAll('.sess').forEach(x=>x.classList.remove('on')); document.querySelector('[data-s="s3"]').classList.add('on'); setCrumb();
+      user('这个项目的 /healthz 加个依赖检查'); cl('好,加 db + redis ping,失败回 503。'); },
+    function(){ user('@ccteam cost today'); sys('→ admin 关键词 → 真 ledger'); add('<div class="nm cl">ccteam · admin</div>今日:claude $1.42 · codex $0.68 · 合计 $2.10 / $20','b cc'); },
+    function(){ sys('— 一条连续会话,跨 s1 / s2 / s3 都在这一个 chat 里 · 重连后整段历史照样在 —'); }
   ];
   var si=0;
   function next(){ if(si<steps.length){ steps[si++](); } else { sys('— 演示结束 · 切上方 tab 看协议 / 接入缝 —'); } }
@@ -395,30 +480,41 @@
   document.getElementById('wpin').addEventListener('keydown',function(e){ if(e.key==='Enter'){ document.getElementById('wsnd').click(); }});
   document.getElementById('wclip').onclick=function(){ add('shot.png','img'); sys('→ attach 帧 · 随下一条 turn'); };
 
-  // session tabs
-  document.getElementById('wt-cl').onclick=function(){ this.classList.add('on'); document.getElementById('wt-cx').classList.remove('on'); seedCl(); si=0; };
-  document.getElementById('wt-cx').onclick=function(){ this.classList.add('on'); document.getElementById('wt-cl').classList.remove('on'); seedCx(); };
-  document.getElementById('wt-new').onclick=function(){ sys('→ /new <vendor> <role> · 起新 session 并切过去(一个 chat 内随时可加)'); };
+  // sidebar: click any session = move focus (NO clear; timeline continues)
+  document.querySelectorAll('.sess').forEach(function(el){ el.onclick=function(){
+    document.querySelectorAll('.sess').forEach(x=>x.classList.remove('on')); el.classList.add('on');
+    active={p:el.dataset.p,v:el.dataset.v,r:el.dataset.r,s:el.dataset.s}; setCrumb();
+    switchmk('→ 焦点切到 '+active.v+' · '+active.r+' ('+active.s+') · /cd '+active.p+' · 会话流不清屏'); }; });
 
-  // project sidebar
-  document.querySelectorAll('.proj').forEach(function(p){ p.onclick=function(){
-    document.querySelectorAll('.proj').forEach(x=>x.classList.remove('on')); p.classList.add('on');
-    sys('→ switch 帧(/cd '+p.dataset.p+')· 焦点落该 project 的默认/上次 session'); }; });
-  document.getElementById('addproj').onclick=function(){ sys('→ ccteam init · 新建项目(走 <projects_root>/<team>-<slug>/)'); };
+  // new-session modal (project / code agent / role)
+  var modal=document.getElementById('newmodal');
+  function mupd(){ var v=document.querySelector('#m-vendor button.on').dataset.v;
+    var p=document.getElementById('m-proj').value; var r=document.getElementById('m-role').value.trim()||'<role>';
+    var h=document.getElementById('mhint');
+    if(p==='__new'){ h.innerHTML='→ <code class="inl">ccteam init</code> 新项目,再 <code class="inl">/new '+v+' '+r+'</code>'; }
+    else { h.innerHTML='→ <code class="inl">/cd '+p+'</code> + <code class="inl">/new '+v+' '+r+'</code>'; } }
+  document.getElementById('newsess').onclick=function(){ modal.classList.remove('hide'); mupd(); };
+  document.getElementById('mclose').onclick=function(){ modal.classList.add('hide'); };
+  document.getElementById('mcancel').onclick=function(){ modal.classList.add('hide'); };
+  document.querySelectorAll('#m-vendor button').forEach(function(b){ b.onclick=function(){ document.querySelectorAll('#m-vendor button').forEach(x=>x.classList.remove('on')); b.classList.add('on'); mupd(); }; });
+  document.getElementById('m-proj').onchange=mupd; document.getElementById('m-role').oninput=mupd;
+  document.getElementById('mcreate').onclick=function(){ var v=document.querySelector('#m-vendor button.on').dataset.v;
+    var p=document.getElementById('m-proj').value; if(p==='__new')p='(新项目)'; var r=document.getElementById('m-role').value.trim()||'assistant';
+    modal.classList.add('hide'); switchmk('→ 新建 /cd '+p+' + /new '+v+' '+r+' → spawn,返回新 sid,焦点切过去'); };
+  document.getElementById('godash').onclick=function(){ sys('→ 跳 dashboard(独立监控:项目/进度/成本/SSE)· 不在 chat 外壳内'); };
 
-  // chat / terminal view toggle
+  // chat / terminal toggle — terminal ONLY for Claude/tmux sessions (codex app-server has no PTY)
   var mc=document.getElementById('mode-chat'), mt=document.getElementById('mode-term');
   var termEl=document.getElementById('wterm');
+  function updTerm(){ if(active.v==='codex'){ mt.classList.add('disabled'); mt.title='codex 走 app-server,无 PTY 终端'; } else { mt.classList.remove('disabled'); mt.title='Claude/tmux session 的原始终端'; } }
   function fillTerm(){ termEl.innerHTML=
-    '<span class="cm"># 原始终端视图 · ws /ws/payments/s1/pty · ccteam-pty.v1(已有的 PTY 字节中继)</span>\n'+
-    '<span class="pa">ubuntu@dev</span>:<span class="pr">~/payments</span>$ claude --resume ccteam-chat-payments-reviewer\n'+
-    '  ⎿  resumed session · 1M context\n'+
-    '<span class="pr">●</span> 审 fix/login-race …\n'+
-    '   <span class="cm">Read(src/auth/session.ts)</span>\n'+
-    '   <span class="cm">Grep(refreshToken)  4 matches</span>\n'+
-    '<span class="pr">●</span> 必改:第 88 行 check-then-act → single-flight 锁<span class="blk"></span>'; }
+    '<span class="cm"># 终端仅 Claude/tmux session · ws /ws/'+active.p+'/'+active.s+'/pty · ccteam-pty.v1</span>\n'+
+    '<span class="pa">ubuntu@dev</span>:<span class="pr">~/'+active.p+'</span>$ claude --resume ccteam-chat-'+active.p+'-'+active.r+'\n'+
+    '  ⎿  resumed · 1M context\n'+
+    '<span class="pr">●</span> 待命<span class="blk"></span>'; }
   mc.onclick=function(){ mc.classList.add('on'); mt.classList.remove('on'); scr.classList.remove('hide'); termEl.classList.add('hide'); };
-  mt.onclick=function(){ mt.classList.add('on'); mc.classList.remove('on'); scr.classList.add('hide'); termEl.classList.remove('hide'); fillTerm(); };
+  mt.onclick=function(){ if(active.v==='codex'){ sys('— codex session 无 PTY,终端不可用(看 chat 里的 tool 行即可)—'); return; } mt.classList.add('on'); mc.classList.remove('on'); scr.classList.add('hide'); termEl.classList.remove('hide'); fillTerm(); };
+  setCrumb();
 
   // ---- parity phone (static) ----
   var p=document.getElementById('pscr');
