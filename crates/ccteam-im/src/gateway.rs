@@ -597,6 +597,24 @@ impl Gateway {
         role: String,
         handle: String,
     ) -> Result<String> {
+        // A chat session's tmux pane is named `ccteam-chat-<project>-<role>`,
+        // so one (project, role) == one pane + transcript. Reuse an existing
+        // record instead of spawning a duplicate that would share the pane and
+        // run a second event pump over the same transcript (which doubles every
+        // reply and clutters the session list). Point it at the new driver.
+        if let Some(existing) = self
+            .sessions
+            .values()
+            .find(|s| s.project == project && s.role == role)
+        {
+            let id = existing.id.clone();
+            if let Ok(mut target) = existing.reply_to.lock() {
+                *target = owner.clone();
+            }
+            self.current_session.insert(owner, id.clone());
+            self.persist_state()?;
+            return Ok(id);
+        }
         self.next_session += 1;
         let id = format!("s{}", self.next_session);
         let cwd = self
@@ -703,7 +721,15 @@ impl Gateway {
             .collect();
         self.next_session = saved.next_session;
         self.sessions.clear();
+        // Collapse legacy duplicate records that share a tmux pane (same
+        // project+role) — keep the first, drop the rest. Without this, each
+        // duplicate would resume its own pump over the same transcript and
+        // re-deliver every reply.
+        let mut seen_panes = std::collections::HashSet::new();
         for saved_session in saved.sessions {
+            if !seen_panes.insert((saved_session.project.clone(), saved_session.role.clone())) {
+                continue;
+            }
             let adapter = (self.adapter_factory)(saved_session.vendor);
             self.sessions.insert(
                 saved_session.id.clone(),
@@ -721,6 +747,10 @@ impl Gateway {
                 },
             );
         }
+        // Drop current-session routes that pointed at a dropped duplicate; the
+        // next message re-resolves to the kept record via start_session's dedup.
+        let live: std::collections::HashSet<String> = self.sessions.keys().cloned().collect();
+        self.current_session.retain(|_, sid| live.contains(sid));
         Ok(())
     }
 
@@ -1494,15 +1524,17 @@ mod tests {
             .unwrap();
         assert_eq!(beta_reply, vec!["beta-api-s3 echo: beta ping"]);
 
+        // chat-2 uses a distinct role → its own pane/session (a same
+        // (project, role) would dedup onto the shared pane).
         gateway
-            .handle_text("mock", "chat-2", "bob", "/new claude reviewer")
+            .handle_text("mock", "chat-2", "bob", "/new claude security")
             .await
             .unwrap();
         let isolated = gateway
             .handle_text("mock", "chat-2", "bob", "same text")
             .await
             .unwrap();
-        assert_eq!(isolated, vec!["alpha-reviewer-s5 echo: same text"]);
+        assert_eq!(isolated, vec!["alpha-security-s5 echo: same text"]);
     }
 
     #[tokio::test]
@@ -1572,8 +1604,12 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/new codex api")
             .await
             .unwrap();
+        // chat-2 uses a DISTINCT role → a distinct tmux pane / session. (Same
+        // (project, role) would be the same pane, so it dedups to one session;
+        // isolation between chats comes from distinct roles, not duplicate
+        // records over a shared pane.)
         gateway
-            .handle_text("mock", "chat-2", "bob", "/new claude reviewer")
+            .handle_text("mock", "chat-2", "bob", "/new claude qa")
             .await
             .unwrap();
 
@@ -1587,7 +1623,7 @@ mod tests {
             .handle_text("mock", "chat-2", "bob", "same text")
             .await
             .unwrap();
-        assert_eq!(other, vec!["alpha-reviewer-s3 echo: same text"]);
+        assert_eq!(other, vec!["alpha-qa-s3 echo: same text"]);
     }
 
     #[tokio::test]
@@ -1989,5 +2025,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(other, vec!["no sessions"]);
+    }
+
+    #[tokio::test]
+    async fn gateway_dedupes_sessions_by_project_and_role() {
+        // One (project, role) == one tmux pane, so a repeat /new reuses the
+        // record instead of spawning a duplicate pump over the same transcript.
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+
+        let first = gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude assistant")
+            .await
+            .unwrap();
+        assert_eq!(first, vec!["created session s1"]);
+        // Same project + role → reuse s1, not a new sid.
+        let again = gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude assistant")
+            .await
+            .unwrap();
+        assert_eq!(again, vec!["created session s1"]);
+        // A different role → a genuinely distinct pane/session.
+        let other_role = gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        assert_eq!(other_role, vec!["created session s2"]);
+
+        // Exactly two sessions tracked (one per project+role pane).
+        let listing = gateway
+            .handle_text("mock", "chat-1", "alice", "/sessions")
+            .await
+            .unwrap();
+        assert_eq!(
+            listing[0].lines().count(),
+            2,
+            "expected 2 deduped sessions: {}",
+            listing[0]
+        );
     }
 }
