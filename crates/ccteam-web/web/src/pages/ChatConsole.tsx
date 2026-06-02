@@ -131,6 +131,13 @@ export default function ChatConsole() {
   // Refs so the long-lived socket handler reads current values.
   const focusRef = useRef<Focus | null>(focus);
   const pendingCreateRef = useRef<Focus | null>(null);
+  // A new-project create in flight: we wait for /newproject to succeed before
+  // sending /cd + /new, so a failed scaffold doesn't cascade into a confusing
+  // "unknown project" from /cd.
+  const pendingNewProjectRef = useRef<{ slug: string; vendor: string; role: string } | null>(null);
+  // Lets handleFrame (defined before sendText) send follow-up commands without
+  // a definition-order / dependency cycle.
+  const sendTextRef = useRef<((content: string, echo: boolean) => boolean) | null>(null);
   useEffect(() => {
     focusRef.current = focus;
   }, [focus]);
@@ -205,6 +212,28 @@ export default function ChatConsole() {
           break;
         }
         case "reply": {
+          // New-project sequencing: once the project is scaffolded, cd in +
+          // spawn the session. On failure, drop the pending create (the error
+          // bubble already shows) so /cd never runs against a missing project.
+          const np = pendingNewProjectRef.current;
+          if (np) {
+            const created = new RegExp(`created project ${np.slug}\\b`).test(frame.content);
+            const failed = /^gateway error/.test(frame.content);
+            if (created) {
+              pendingNewProjectRef.current = null;
+              pendingCreateRef.current = {
+                project: np.slug,
+                session: null,
+                vendor: np.vendor,
+                role: np.role,
+              };
+              sendTextRef.current?.(`/cd ${np.slug}`, true);
+              sendTextRef.current?.(`/new ${np.vendor} ${np.role}`, true);
+              sendTextRef.current?.("/sessions", false);
+            } else if (failed) {
+              pendingNewProjectRef.current = null;
+            }
+          }
           const sid = /created session (s\d+)/.exec(frame.content)?.[1];
           const pending = pendingCreateRef.current;
           if (sid && pending) {
@@ -308,6 +337,9 @@ export default function ChatConsole() {
     },
     [pushRow, sendFrame],
   );
+  useEffect(() => {
+    sendTextRef.current = sendText;
+  }, [sendText]);
 
   const submit = useCallback(() => {
     const content = draft.trim();
@@ -356,23 +388,23 @@ export default function ChatConsole() {
 
   const createSession = useCallback(
     (req: CreateRequest) => {
-      pendingCreateRef.current = {
-        project: req.kind === "new" ? req.slug : req.project,
-        session: null,
-        vendor: req.vendor,
-        role: req.role,
-      };
       if (req.kind === "new") {
-        // Scaffold + register the project (gateway /newproject), then cd
-        // into it and spawn the session there.
+        // Scaffold + register the project first. Only cd + spawn once
+        // /newproject confirms (handled in the reply case), so a bad path /
+        // name doesn't cascade into "unknown project" from a premature /cd.
+        pendingNewProjectRef.current = { slug: req.slug, vendor: req.vendor, role: req.role };
         sendText(`/newproject ${req.slug} ${req.path}`, true);
-        sendText(`/cd ${req.slug}`, true);
       } else {
+        pendingCreateRef.current = {
+          project: req.project,
+          session: null,
+          vendor: req.vendor,
+          role: req.role,
+        };
         sendText(`/cd ${req.project}`, true);
+        sendText(`/new ${req.vendor} ${req.role}`, true);
+        sendText("/sessions", false);
       }
-      sendText(`/new ${req.vendor} ${req.role}`, true);
-      // Refresh the rail so the freshly-created session shows up.
-      sendText("/sessions", false);
       setModalOpen(false);
     },
     [sendText],
@@ -667,7 +699,11 @@ function NewSessionModal({
   const effectiveRole = role.trim() || "assistant";
   const slug = newName.trim();
   const path = newPath.trim();
-  const ready = isNew ? slug.length > 0 && path.length > 0 : project.length > 0;
+  // The gateway requires an absolute (or ~) path; validate here so a bad path
+  // can't be submitted (which the backend would reject after the fact).
+  const pathOk = path.startsWith("/") || path.startsWith("~");
+  const slugOk = /^[a-z0-9-]+$/.test(slug);
+  const ready = isNew ? slugOk && pathOk : project.length > 0;
 
   const submit = () => {
     if (!ready) return;
@@ -716,6 +752,11 @@ function NewSessionModal({
                   placeholder="payments-core(小写、数字、连字符)"
                   className="w-full h-9 rounded-md bg-surface-800 border border-surface-700 px-3 text-sm outline-none focus:border-amber-500"
                 />
+                {slug.length > 0 && !slugOk ? (
+                  <div className="mt-1 text-[10px] text-red-400 leading-4">
+                    只能用小写字母、数字、连字符。
+                  </div>
+                ) : null}
               </div>
               <div>
                 <label className="block text-xs text-text-dim mb-1">项目路径</label>
@@ -725,8 +766,14 @@ function NewSessionModal({
                   placeholder="/home/you/code/myrepo 或 ~/code/myrepo"
                   className="w-full h-9 rounded-md bg-surface-800 border border-surface-700 px-3 text-sm font-mono outline-none focus:border-amber-500"
                 />
-                <div className="mt-1 text-[10px] text-text-dim leading-4">
-                  已有仓库就地接管(不动你的代码);空目录会被创建。需绝对路径或 ~ 开头。
+                <div
+                  className={`mt-1 text-[10px] leading-4 ${
+                    path.length > 0 && !pathOk ? "text-red-400" : "text-text-dim"
+                  }`}
+                >
+                  {path.length > 0 && !pathOk
+                    ? "路径必须以 / 或 ~ 开头(绝对路径)。"
+                    : "已有仓库就地接管(不动你的代码);空目录会被创建。需绝对路径或 ~ 开头。"}
                 </div>
               </div>
             </div>
