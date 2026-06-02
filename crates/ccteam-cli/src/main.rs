@@ -30,10 +30,21 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use ccteam_core::CcteamPaths;
 use commands::{InitMode, InitOptions, OutputFormat};
 
+/// Version string shown by `ccteam --version`: the crate version plus the
+/// git commit it was built from (e.g. `0.8.3 (66737ca)`), so a running
+/// binary's exact build is identifiable. `CCTEAM_GIT_COMMIT` is set by
+/// `build.rs` (falls back to "unknown" when git isn't available at build).
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("CCTEAM_GIT_COMMIT"),
+    ")"
+);
+
 #[derive(Parser)]
 #[command(
     name = "ccteam",
-    version,
+    version = VERSION,
     about = "Autonomous AI development orchestrator built on Claude Code"
 )]
 struct Cli {
@@ -885,8 +896,14 @@ enum InternalCommand {
         /// Omit to auto-resolve a single live chat session for `<slug>`.
         role: Option<String>,
     },
-    /// Capture the project's pane content without attaching.
-    Peek { slug: String },
+    /// Capture the project's pane content without attaching. Resolves a
+    /// live chat session (`ccteam-chat-<slug>-<role>`) first, falling back
+    /// to the project pane (`ccteam-<slug>`) — same resolution as `attach`.
+    Peek {
+        slug: String,
+        /// Chat-mode role; omit to auto-resolve a single live chat session.
+        role: Option<String>,
+    },
     /// Print the project's progress.jsonl, optionally tailing.
     Progress {
         slug: String,
@@ -1433,7 +1450,7 @@ fn run_internal(cmd: InternalCommand) -> Result<()> {
         InternalCommand::Hook { cmd } => run_hook(cmd),
         InternalCommand::McpServe => run_mcp_serve(),
         InternalCommand::Attach { slug, role } => run_internal_attach(&slug, role.as_deref()),
-        InternalCommand::Peek { slug } => run_peek(&slug),
+        InternalCommand::Peek { slug, role } => run_internal_peek(&slug, role.as_deref()),
         InternalCommand::Progress { slug, tail } => run_progress(&slug, tail),
         InternalCommand::Resume { slug } => run_resume(&slug),
         InternalCommand::Send {
@@ -2691,6 +2708,13 @@ fn run_show(slug: &str, format: OutputFormat) -> Result<()> {
 fn run_peek(slug: &str) -> Result<()> {
     let paths = CcteamPaths::from_env()?;
     let body = commands::run_peek(&paths, slug)?;
+    print!("{body}");
+    Ok(())
+}
+
+fn run_internal_peek(slug: &str, role: Option<&str>) -> Result<()> {
+    let paths = CcteamPaths::from_env()?;
+    let body = commands::run_peek_with_role(&paths, slug, role)?;
     print!("{body}");
     Ok(())
 }

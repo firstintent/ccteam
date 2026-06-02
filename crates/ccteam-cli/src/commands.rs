@@ -1729,20 +1729,22 @@ fn attach_interactive_by_name(session_name: &str) -> Result<()> {
 /// dispatched; `Ok(false)` *only* when `role` is omitted AND no live chat
 /// session matches `slug_or_name`, so the caller may fall back to the
 /// project-oriented attach. Read-only enumeration (R6) — never captures panes.
-pub fn try_attach_chat_session(slug_or_name: &str, role: Option<&str>) -> Result<bool> {
-    // A full canonical name passed through verbatim.
+/// Resolve a chat-session reference to its canonical tmux name
+/// (`ccteam-chat-<slug>-<role>`):
+/// - a full `ccteam-chat-…` name passes through verbatim;
+/// - an explicit role yields the deterministic name;
+/// - otherwise live chat sessions are enumerated and filtered by slug.
+///
+/// Returns `Ok(None)` when nothing matches (the caller falls back to the
+/// project pane `ccteam-<slug>`); `Err` when `<slug>` is ambiguous across
+/// roles. Shared by `attach` and `peek` so both resolve identically.
+pub fn resolve_chat_session_name(slug_or_name: &str, role: Option<&str>) -> Result<Option<String>> {
     if slug_or_name.starts_with(ccteam_harness::CHAT_SESSION_PREFIX) {
-        attach_interactive_by_name(slug_or_name)?;
-        return Ok(true);
+        return Ok(Some(slug_or_name.to_string()));
     }
-    // Explicit role → deterministic name. The user clearly wants the chat
-    // session, so a miss is a hard error (no project fallback).
     if let Some(role) = role {
-        let name = ccteam_harness::chat_session_name(slug_or_name, role);
-        attach_interactive_by_name(&name)?;
-        return Ok(true);
+        return Ok(Some(ccteam_harness::chat_session_name(slug_or_name, role)));
     }
-    // Role omitted → enumerate live chat sessions and filter by slug.
     let backend = ccteam_harness::default_process_backend();
     let live = block_on_async(ccteam_harness::list_chat_sessions(backend.as_ref()))??;
     let mut matches: Vec<(String, String)> = live
@@ -1754,23 +1756,28 @@ pub fn try_attach_chat_session(slug_or_name: &str, role: Option<&str>) -> Result
         .collect();
     matches.sort();
     match matches.as_slice() {
-        [] => Ok(false),
-        [(_role, name)] => {
-            attach_interactive_by_name(name)?;
-            Ok(true)
-        }
+        [] => Ok(None),
+        [(_role, name)] => Ok(Some(name.clone())),
         many => {
             let mut msg = format!(
                 "`{slug_or_name}` has {} live chat sessions; specify a role:",
                 many.len()
             );
             for (role, name) in many {
-                msg.push_str(&format!(
-                    "\n  ccteam internal attach {slug_or_name} {role}   # {name}"
-                ));
+                msg.push_str(&format!("\n  {slug_or_name} {role}   # {name}"));
             }
             bail!("{msg}")
         }
+    }
+}
+
+pub fn try_attach_chat_session(slug_or_name: &str, role: Option<&str>) -> Result<bool> {
+    match resolve_chat_session_name(slug_or_name, role)? {
+        Some(name) => {
+            attach_interactive_by_name(&name)?;
+            Ok(true)
+        }
+        None => Ok(false),
     }
 }
 
@@ -2057,8 +2064,29 @@ fn latest_claude_bg_job_id(paths: &CcteamPaths, slug: &str) -> Option<String> {
 /// the same primitive `TmuxBackend::capture` calls under the hood).
 /// Keeps run_peek sync per the W1 "sync sites stay sync" decision.
 pub fn run_peek(paths: &CcteamPaths, slug: &str) -> Result<String> {
-    let session_name = session_name_for_project(paths, slug);
+    run_peek_with_role(paths, slug, None)
+}
 
+/// `ccteam internal peek <slug> [role]`. Resolves a live chat session
+/// (`ccteam-chat-<slug>-<role>`) first — mirroring `attach` — and falls
+/// back to the project pane (`ccteam-<slug>`) when none matches. This is
+/// why a bare `peek <slug>` against a chat session used to fail with
+/// "rmux session not running: ccteam-<slug>" while `attach` worked.
+pub fn run_peek_with_role(
+    paths: &CcteamPaths,
+    slug_or_name: &str,
+    role: Option<&str>,
+) -> Result<String> {
+    let session_name = match resolve_chat_session_name(slug_or_name, role)? {
+        Some(name) => name,
+        None => session_name_for_project(paths, slug_or_name),
+    };
+    peek_session_by_name(&session_name)
+}
+
+/// Capture a 1000-line plain-text tail of a session pane by its exact
+/// tmux/rmux name (chat or project — the caller already resolved it).
+fn peek_session_by_name(session_name: &str) -> Result<String> {
     // V0.8 W5 — backend-aware peek. Under the rmux backend, capture is
     // non-interactive (a plain-text grid snapshot) so it fits the async
     // `ProcessBackend::capture` trait method cleanly; drive it on a
@@ -2069,7 +2097,7 @@ pub fn run_peek(paths: &CcteamPaths, slug: &str) -> Result<String> {
             .enable_all()
             .build()
             .context("build tokio runtime for rmux peek")?;
-        let id = ccteam_harness::MuxSessionId::new(session_name);
+        let id = ccteam_harness::MuxSessionId::new(session_name.to_string());
         let backend = ccteam_harness::from_env()?;
         let bytes = runtime
             .block_on(async {
@@ -2084,7 +2112,7 @@ pub fn run_peek(paths: &CcteamPaths, slug: &str) -> Result<String> {
         return Ok(String::from_utf8_lossy(&bytes).into_owned());
     }
 
-    let session = TmuxSession::from_name(session_name);
+    let session = TmuxSession::from_name(session_name.to_string());
     if !session.exists() {
         bail!("tmux session not running: {}", session.name());
     }
