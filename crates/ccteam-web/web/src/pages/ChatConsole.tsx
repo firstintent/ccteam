@@ -168,8 +168,31 @@ export default function ChatConsole() {
   const handleFrame = useCallback(
     (frame: ServerFrame) => {
       switch (frame.type) {
-        case "sessions":
-          setSessions(frame.items);
+        case "sessions": {
+          // Merge frames: the disk frame carries all projects (as markers),
+          // the gateway `/sessions` frame carries all chat sessions (cross-
+          // entry). Chat sessions (with an id) win and are deduped; a project
+          // marker is kept only when that project has no session.
+          setSessions((prev) => {
+            const merged: SessionItem[] = [];
+            const seenSession = new Set<string>();
+            for (const item of [...frame.items, ...prev]) {
+              if (!item.session) continue;
+              const key = `${item.project}:${item.session}`;
+              if (seenSession.has(key)) continue;
+              seenSession.add(key);
+              merged.push(item);
+            }
+            const withSession = new Set(merged.map((s) => s.project));
+            const seenMarker = new Set<string>();
+            for (const item of [...frame.items, ...prev]) {
+              if (item.session) continue;
+              if (withSession.has(item.project) || seenMarker.has(item.project)) continue;
+              seenMarker.add(item.project);
+              merged.push(item);
+            }
+            return merged;
+          });
           // Adopt a default focus once we know the sessions, but never
           // clobber a focus the user already chose.
           setFocus((current) => {
@@ -180,6 +203,7 @@ export default function ChatConsole() {
             return next;
           });
           break;
+        }
         case "reply": {
           const sid = /created session (s\d+)/.exec(frame.content)?.[1];
           const pending = pendingCreateRef.current;
@@ -230,6 +254,13 @@ export default function ChatConsole() {
         attempt = 0;
         setReconnectAttempt(0);
         setConnected(true);
+        // Pull the gateway's global session list (cross-entry); the disk
+        // frame the server sends on connect doesn't include chat sessions.
+        try {
+          ws.send(JSON.stringify({ type: "text", content: "/sessions", id: nextId("sys") }));
+        } catch {
+          // socket raced closed — the reconnect path will retry.
+        }
       };
       ws.onmessage = (event) => {
         if (typeof event.data !== "string") return;
@@ -340,6 +371,8 @@ export default function ChatConsole() {
         sendText(`/cd ${req.project}`, true);
       }
       sendText(`/new ${req.vendor} ${req.role}`, true);
+      // Refresh the rail so the freshly-created session shows up.
+      sendText("/sessions", false);
       setModalOpen(false);
     },
     [sendText],

@@ -43,6 +43,7 @@ impl ChatKey {
 #[derive(Clone)]
 struct GatewaySession {
     id: String,
+    /// Chat that created the session.
     owner: ChatKey,
     project: String,
     role: String,
@@ -51,6 +52,11 @@ struct GatewaySession {
     thread: ThreadHandle,
     adapter: Arc<dyn HarnessAdapter + Send + Sync>,
     visible_events: Arc<AtomicU64>,
+    /// Where this session's replies go (option ①: whoever last drove it).
+    /// Starts at `owner`; updated on `/use` and on every submit so a turn
+    /// sent from web replies to web, one from Telegram replies to Telegram.
+    /// Shared with the detached event pump / watchdog so they route live.
+    reply_to: Arc<std::sync::Mutex<ChatKey>>,
 }
 
 #[derive(Debug, Clone)]
@@ -427,15 +433,20 @@ impl Gateway {
                 let id = parts
                     .next()
                     .ok_or_else(|| anyhow!("/use requires a session id"))?;
+                // The web console drives any session (cross-entry sharing);
+                // IM channels stay scoped to sessions they own.
                 let session = self
                     .sessions
                     .get(id)
-                    .filter(|s| s.owner == *chat)
+                    .filter(|s| s.owner == *chat || chat.channel == "web")
                     .ok_or_else(|| anyhow!("unknown session for this chat: {id}"))?;
-                self.current_session
-                    .insert(chat.clone(), session.id.clone());
+                let sid = session.id.clone();
+                if let Ok(mut target) = session.reply_to.lock() {
+                    *target = chat.clone();
+                }
+                self.current_session.insert(chat.clone(), sid.clone());
                 self.persist_state()?;
-                Ok(Some(format!("using session {}", session.id)))
+                Ok(Some(format!("using session {sid}")))
             }
             "/cd" => {
                 let project = parts
@@ -619,6 +630,7 @@ impl Gateway {
                 thread,
                 adapter,
                 visible_events: Arc::new(AtomicU64::new(0)),
+                reply_to: Arc::new(std::sync::Mutex::new(owner.clone())),
             },
         );
         self.current_session.insert(owner, id.clone());
@@ -648,11 +660,15 @@ impl Gateway {
                 };
                 seq = seq.saturating_add(1);
                 session.visible_events.fetch_add(1, Ordering::SeqCst);
+                let (channel, chat_id) = match session.reply_to.lock() {
+                    Ok(target) => (target.channel.clone(), target.chat_id.clone()),
+                    Err(_) => (session.owner.channel.clone(), session.owner.chat_id.clone()),
+                };
                 if tx
                     .send(GatewayEvent {
                         id: format!("gateway-event-{session_id}-{seq}"),
-                        channel: session.owner.channel.clone(),
-                        chat_id: session.owner.chat_id.clone(),
+                        channel,
+                        chat_id,
                         thread_ts: None,
                         content: text,
                     })
@@ -693,7 +709,7 @@ impl Gateway {
                 saved_session.id.clone(),
                 GatewaySession {
                     id: saved_session.id,
-                    owner: saved_session.owner,
+                    owner: saved_session.owner.clone(),
                     project: saved_session.project,
                     role: saved_session.role,
                     vendor: saved_session.vendor,
@@ -701,6 +717,7 @@ impl Gateway {
                     thread: saved_session.thread,
                     adapter,
                     visible_events: Arc::new(AtomicU64::new(0)),
+                    reply_to: Arc::new(std::sync::Mutex::new(saved_session.owner)),
                 },
             );
         }
@@ -762,6 +779,11 @@ impl Gateway {
             .sessions
             .get(session_id)
             .ok_or_else(|| anyhow!("current session missing: {session_id}"))?;
+        // Option ① — replies for this turn (sync + async pump + watchdog)
+        // go back to whoever sent it, not the original creator.
+        if let Ok(mut target) = session.reply_to.lock() {
+            *target = chat.clone();
+        }
         let start_visible_events = session.visible_events.load(Ordering::SeqCst);
         let submit_wait = gateway_submit_timeout_duration();
         let turn_id = tokio::time::timeout(submit_wait, async {
@@ -846,10 +868,13 @@ impl Gateway {
     }
 
     fn render_sessions(&self, chat: &ChatKey) -> String {
+        // The web console is a global operator view and lists every chat
+        // session (cross-entry sharing); IM channels stay scoped to their own.
+        let global = chat.channel == "web";
         let rows: Vec<String> = self
             .sessions
             .values()
-            .filter(|s| s.owner == *chat)
+            .filter(|s| global || s.owner == *chat)
             .map(|s| format!("{}:{}:{:?}:{}", s.id, s.project, s.vendor, s.role))
             .collect();
         if rows.is_empty() {
@@ -995,14 +1020,18 @@ fn spawn_turn_timeout_watchdog(
     }
     let visible_events = Arc::clone(&session.visible_events);
     let session_id = session.id.clone();
-    let channel = session.owner.channel.clone();
-    let chat_id = session.owner.chat_id.clone();
+    let reply_to = Arc::clone(&session.reply_to);
+    let owner = session.owner.clone();
     let turn_id = turn_id.to_string();
     tokio::spawn(async move {
         tokio::time::sleep(timeout).await;
         if visible_events.load(Ordering::SeqCst) != start_visible_events {
             return;
         }
+        let (channel, chat_id) = match reply_to.lock() {
+            Ok(target) => (target.channel.clone(), target.chat_id.clone()),
+            Err(_) => (owner.channel.clone(), owner.chat_id.clone()),
+        };
         let _ = tx.send(GatewayEvent {
             id: format!("gateway-timeout-{session_id}-{turn_id}"),
             channel,
@@ -1911,5 +1940,54 @@ mod tests {
         let home = expand_project_path("~/code/app").unwrap();
         assert!(home.is_absolute());
         assert!(home.ends_with("code/app"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gateway_web_is_global_view_and_drives_im_created_session() {
+        // Sync reply path (no event_sink) — the async pump's reply routing is
+        // covered by the web_chat_bridge harness (its adapter keeps the event
+        // stream alive; this FakeAdapter ends it on an empty queue).
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+
+        // A Telegram chat creates a session.
+        gateway
+            .handle_text("telegram", "tg-1", "rob", "/new claude assistant")
+            .await
+            .unwrap();
+
+        // The web console is a global view: it sees the session it didn't create.
+        let listing = gateway
+            .handle_text("web", "web-chat", "web-user", "/sessions")
+            .await
+            .unwrap();
+        assert!(
+            listing
+                .iter()
+                .any(|r| r.contains("s1:alpha:Claude:assistant")),
+            "web /sessions should list the Telegram session: {listing:?}"
+        );
+
+        // Web can /use it (cross-entry) and drive it; the reply comes back.
+        let used = gateway
+            .handle_text("web", "web-chat", "web-user", "/use s1")
+            .await
+            .unwrap();
+        assert_eq!(used, vec!["using session s1"]);
+        let reply = gateway
+            .handle_text("web", "web-chat", "web-user", "hello from web")
+            .await
+            .unwrap();
+        assert!(
+            reply.iter().any(|r| r.contains("echo: hello from web")),
+            "web drive reply: {reply:?}"
+        );
+
+        // IM stays scoped: a different Telegram chat does NOT see tg-1's session.
+        let other = gateway
+            .handle_text("telegram", "tg-2", "bob", "/sessions")
+            .await
+            .unwrap();
+        assert_eq!(other, vec!["no sessions"]);
     }
 }
