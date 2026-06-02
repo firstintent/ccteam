@@ -306,6 +306,23 @@ export default function ChatConsole() {
     [pushRow, sendFrame],
   );
 
+  // Focus a project itself (no specific session) — clicking a project
+  // header /cd's into it; the next message spawns a session there. This
+  // is the entry point for projects that have no chat session yet.
+  const switchToProject = useCallback(
+    (project: string) => {
+      const next: Focus = { project, session: null, vendor: null, role: null };
+      setFocus(next);
+      focusRef.current = next;
+      sendFrame({ type: "switch", project });
+      pushRow({
+        kind: "marker",
+        content: `→ 焦点切到项目 ${project} · /cd ${project} · 发消息会在此自动起 session`,
+      });
+    },
+    [pushRow, sendFrame],
+  );
+
   const createSession = useCallback(
     (req: CreateRequest) => {
       pendingCreateRef.current = {
@@ -374,14 +391,24 @@ export default function ChatConsole() {
               const items = sessions.filter(
                 (item) => item.project === project && item.session,
               );
+              const projectActive = focus?.project === project && !focus?.session;
               return (
                 <div key={project}>
-                  <div className="px-1.5 py-1 text-[11px] font-mono text-text-dim flex items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={() => switchToProject(project)}
+                    title={`聚焦项目 ${project}(/cd;发消息自动起 session)`}
+                    className={`w-full text-left px-1.5 py-1 rounded text-[11px] font-mono flex items-center gap-1 ${
+                      projectActive
+                        ? "bg-surface-800 text-text-primary"
+                        : "text-text-dim hover:bg-surface-800/60 hover:text-text-secondary"
+                    }`}
+                  >
                     {project}
                     {items.length === 0 ? (
-                      <span className="text-text-dim/60">· 无 session</span>
+                      <span className="text-text-dim/60">· 无 session,点此聚焦</span>
                     ) : null}
-                  </div>
+                  </button>
                   <div className="space-y-0.5">
                     {items.map((item) => {
                       const active =
