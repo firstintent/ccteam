@@ -19,7 +19,7 @@
 // Red lines: the chat view reads structured turn frames (never scrapes a
 // pane); the terminal view is the existing `ccteam-pty.v1` byte relay.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { MessageSquare, Plus, Send, Terminal } from "lucide-react";
 import { TerminalView } from "../components/TerminalView";
@@ -384,6 +384,20 @@ export default function ChatConsole() {
   // or no session) without an extra render-triggering effect.
   const showTerminal = view === "terminal" && canTerminal;
 
+  // Auto-scroll the transcript to the newest message — but only when the user
+  // is already near the bottom, so reading scrollback isn't interrupted.
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const atBottomRef = useRef(true);
+  const onTranscriptScroll = useCallback(() => {
+    const el = scrollRef.current;
+    if (el) atBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+  }, []);
+  useLayoutEffect(() => {
+    if (!showTerminal && atBottomRef.current && scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [rows, showTerminal]);
+
   return (
     <div className="h-full min-h-0 flex flex-col bg-surface-900 text-text-primary">
       {/* N1 — standalone app bar */}
@@ -537,7 +551,11 @@ export default function ChatConsole() {
             <TerminalView slug={focus.project} sid={focus.session} className="flex-1 min-h-0" />
           ) : (
             <>
-              <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-3">
+              <div
+                ref={scrollRef}
+                onScroll={onTranscriptScroll}
+                className="flex-1 min-h-0 overflow-y-auto p-4 space-y-3"
+              >
                 {rows.map((row) => {
                   if (row.kind === "marker") {
                     return (
