@@ -165,13 +165,38 @@ pub fn encode_project_cwd(cwd: &Path) -> String {
 }
 
 /// Resolve `~/.claude/projects/<encoded-cwd>/`.
+///
+/// Claude encodes the cwd into the dir name by string-substitution (no
+/// symlink resolution). When a project lives under a symlinked path
+/// (e.g. `~/nasworkspace` → `/vol4/.../nasworkspace`), Claude writes its
+/// transcript under the **canonical** path's encoding (its hook payload's
+/// `cwd` is the resolved path), while the gateway may tail using the
+/// registered/launch (symlinked) path. The two encodings differ, so the
+/// tail looked in the wrong dir and never saw the reply. Resolve to
+/// whichever encoded dir actually exists (raw first to preserve the
+/// non-symlink fast path; then the canonicalized form).
 pub fn anthropic_project_dir(cwd: &Path) -> Option<PathBuf> {
     let home = dirs::home_dir()?;
-    Some(
-        home.join(".claude")
-            .join("projects")
-            .join(encode_project_cwd(cwd)),
-    )
+    let base = home.join(".claude").join("projects");
+    Some(resolve_project_dir_in(&base, cwd))
+}
+
+fn resolve_project_dir_in(base: &Path, cwd: &Path) -> PathBuf {
+    let raw = base.join(encode_project_cwd(cwd));
+    if raw.exists() {
+        return raw;
+    }
+    if let Ok(canon) = std::fs::canonicalize(cwd) {
+        if canon != cwd {
+            let canon_dir = base.join(encode_project_cwd(&canon));
+            if canon_dir.exists() {
+                return canon_dir;
+            }
+        }
+    }
+    // Neither exists yet (fresh session, no transcript written) — fall back
+    // to the raw encoding; it'll be created/matched once Claude writes.
+    raw
 }
 
 /// Resolve the cursor file path.
@@ -538,6 +563,35 @@ mod tests {
         assert_eq!(encode_project_cwd(p), "-home-rob-workplace-agents-ccteam");
         let p = Path::new("/tmp/.tmpBxJUlA");
         assert_eq!(encode_project_cwd(p), "-tmp--tmpBxJUlA");
+    }
+
+    #[test]
+    fn resolve_project_dir_follows_symlinked_cwd_to_canonical_encoding() {
+        // Repro: a project under a symlinked path (e.g. ~/nasworkspace ->
+        // /vol4/.../nasworkspace). Claude writes its transcript dir under
+        // the CANONICAL encoding; the gateway tails using the symlink path.
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("projects");
+        std::fs::create_dir_all(&base).unwrap();
+
+        let real = tmp.path().join("real-proj");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = tmp.path().join("link-proj");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // Claude wrote the transcript dir under the canonical (real) encoding.
+        let canon = std::fs::canonicalize(&real).unwrap();
+        let canon_dir = base.join(encode_project_cwd(&canon));
+        std::fs::create_dir_all(&canon_dir).unwrap();
+
+        // Tail asked with the symlink path → resolves to the canonical dir.
+        assert_eq!(resolve_project_dir_in(&base, &link), canon_dir);
+
+        // A non-symlink project whose raw encoding exists stays on raw.
+        let plain = tmp.path().join("plain-proj");
+        std::fs::create_dir_all(&plain).unwrap();
+        let raw_dir = base.join(encode_project_cwd(&plain));
+        std::fs::create_dir_all(&raw_dir).unwrap();
+        assert_eq!(resolve_project_dir_in(&base, &plain), raw_dir);
     }
 
     #[test]
