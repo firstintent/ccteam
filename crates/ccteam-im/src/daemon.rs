@@ -346,6 +346,12 @@ fn build_gateway(
             bot.project_root_with_config(projects_root, config_projects),
         );
     }
+    // Enable `/newproject <slug> <path>`: config.yaml lives under the
+    // ccteam root; new projects are scaffolded at the caller's path.
+    gateway.enable_project_creation(ccteam_core::CcteamPaths {
+        root: crate::default_ccteam_root_public(),
+        projects_root: projects_root.to_path_buf(),
+    });
     if let Err(err) = gateway.enable_persistence(crate::default_gateway_state_path()) {
         tracing::warn!(
             error = %err,

@@ -56,6 +56,10 @@ type Focus = {
   role: string | null;
 };
 
+type CreateRequest =
+  | { kind: "existing"; project: string; vendor: string; role: string }
+  | { kind: "new"; slug: string; path: string; vendor: string; role: string };
+
 // All tabs share one chat id so they observe the same conversation; the
 // backend broadcasts each outbound reply to every matching socket.
 const WEB_CHAT_ID = "web-chat";
@@ -303,10 +307,22 @@ export default function ChatConsole() {
   );
 
   const createSession = useCallback(
-    (project: string, vendor: string, role: string) => {
-      pendingCreateRef.current = { project, session: null, vendor, role };
-      sendText(`/cd ${project}`, true);
-      sendText(`/new ${vendor} ${role}`, true);
+    (req: CreateRequest) => {
+      pendingCreateRef.current = {
+        project: req.kind === "new" ? req.slug : req.project,
+        session: null,
+        vendor: req.vendor,
+        role: req.role,
+      };
+      if (req.kind === "new") {
+        // Scaffold + register the project (gateway /newproject), then cd
+        // into it and spawn the session there.
+        sendText(`/newproject ${req.slug} ${req.path}`, true);
+        sendText(`/cd ${req.slug}`, true);
+      } else {
+        sendText(`/cd ${req.project}`, true);
+      }
+      sendText(`/new ${req.vendor} ${req.role}`, true);
       setModalOpen(false);
     },
     [sendText],
@@ -532,7 +548,11 @@ export default function ChatConsole() {
         <NewSessionModal
           projects={projects}
           roleOptions={roleOptions}
-          defaultProject={focus?.project ?? projects[0] ?? ""}
+          defaultProject={
+            focus?.project && projects.includes(focus.project)
+              ? focus.project
+              : (projects[0] ?? "__new")
+          }
           onCancel={() => setModalOpen(false)}
           onCreate={createSession}
         />
@@ -541,9 +561,11 @@ export default function ChatConsole() {
   );
 }
 
-// N3 — new session: project + code agent + role, with a live command
-// preview. Project/role are editable comboboxes (datalist) so you can
-// pick an existing one or type a new project / role.
+// N3 + new-project: a real <select> for the project (existing ones +
+// "＋ 新建项目…"), code agent, and role. Choosing "＋ 新建项目…" reveals a
+// name + path so a brand-new project can be scaffolded at any directory.
+const NEW_PROJECT = "__new";
+
 function NewSessionModal({
   projects,
   roleOptions,
@@ -555,21 +577,31 @@ function NewSessionModal({
   roleOptions: string[];
   defaultProject: string;
   onCancel: () => void;
-  onCreate: (project: string, vendor: string, role: string) => void;
+  onCreate: (req: CreateRequest) => void;
 }) {
   const [project, setProject] = useState(defaultProject);
+  const [newName, setNewName] = useState("");
+  const [newPath, setNewPath] = useState("");
   const [vendor, setVendor] = useState<"claude" | "codex">("claude");
   const [role, setRole] = useState("");
 
-  const trimmedProject = project.trim();
+  const isNew = project === NEW_PROJECT;
   const effectiveRole = role.trim() || "assistant";
-  const ready = trimmedProject.length > 0;
+  const slug = newName.trim();
+  const path = newPath.trim();
+  const ready = isNew ? slug.length > 0 && path.length > 0 : project.length > 0;
+
+  const submit = () => {
+    if (!ready) return;
+    if (isNew) {
+      onCreate({ kind: "new", slug, path, vendor, role: effectiveRole });
+    } else {
+      onCreate({ kind: "existing", project, vendor, role: effectiveRole });
+    }
+  };
 
   return (
-    <div
-      className="fixed inset-0 z-50 bg-black/50 grid place-items-center p-4"
-      onClick={onCancel}
-    >
+    <div className="fixed inset-0 z-50 bg-black/50 grid place-items-center p-4" onClick={onCancel}>
       <div
         className="w-full max-w-md rounded-lg bg-surface-900 border border-surface-700 shadow-xl"
         onClick={(event) => event.stopPropagation()}
@@ -582,18 +614,45 @@ function NewSessionModal({
         </div>
         <div className="p-4 space-y-3">
           <label className="block text-xs text-text-dim">项目</label>
-          <input
-            list="ccteam-chat-projects"
+          <select
             value={project}
             onChange={(event) => setProject(event.target.value)}
-            placeholder="选择已有项目,或输入新项目 slug"
             className="w-full h-9 rounded-md bg-surface-800 border border-surface-700 px-3 text-sm outline-none focus:border-amber-500"
-          />
-          <datalist id="ccteam-chat-projects">
+          >
+            {projects.length === 0 ? <option value="">（暂无已有项目）</option> : null}
             {projects.map((item) => (
-              <option key={item} value={item} />
+              <option key={item} value={item}>
+                {item}
+              </option>
             ))}
-          </datalist>
+            <option value={NEW_PROJECT}>＋ 新建项目…</option>
+          </select>
+
+          {isNew ? (
+            <div className="space-y-3 rounded-md border border-surface-700/60 bg-surface-800/40 p-3">
+              <div>
+                <label className="block text-xs text-text-dim mb-1">新项目名 (slug)</label>
+                <input
+                  value={newName}
+                  onChange={(event) => setNewName(event.target.value)}
+                  placeholder="payments-core(小写、数字、连字符)"
+                  className="w-full h-9 rounded-md bg-surface-800 border border-surface-700 px-3 text-sm outline-none focus:border-amber-500"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-text-dim mb-1">项目路径</label>
+                <input
+                  value={newPath}
+                  onChange={(event) => setNewPath(event.target.value)}
+                  placeholder="/home/you/code/myrepo 或 ~/code/myrepo"
+                  className="w-full h-9 rounded-md bg-surface-800 border border-surface-700 px-3 text-sm font-mono outline-none focus:border-amber-500"
+                />
+                <div className="mt-1 text-[10px] text-text-dim leading-4">
+                  已有仓库就地接管(不动你的代码);空目录会被创建。需绝对路径或 ~ 开头。
+                </div>
+              </div>
+            </div>
+          ) : null}
 
           <label className="block text-xs text-text-dim">Code agent</label>
           <div className="flex gap-1 rounded-md bg-surface-800 p-0.5">
@@ -625,12 +684,24 @@ function NewSessionModal({
             ))}
           </datalist>
 
-          <div className="text-[11px] font-mono text-text-dim">
-            → <span className="text-text-secondary">/cd {trimmedProject || "<project>"}</span>
-            {" + "}
-            <span className="text-text-secondary">
-              /new {vendor} {effectiveRole}
-            </span>
+          <div className="text-[11px] font-mono text-text-dim leading-5">
+            {isNew ? (
+              <>
+                → <span className="text-text-secondary">/newproject {slug || "<slug>"} {path || "<path>"}</span>
+                <br />→{" "}
+                <span className="text-text-secondary">
+                  /cd {slug || "<slug>"} + /new {vendor} {effectiveRole}
+                </span>
+              </>
+            ) : (
+              <>
+                → <span className="text-text-secondary">/cd {project || "<project>"}</span>
+                {" + "}
+                <span className="text-text-secondary">
+                  /new {vendor} {effectiveRole}
+                </span>
+              </>
+            )}
           </div>
         </div>
         <div className="px-4 py-3 flex justify-end gap-2 border-t border-surface-700/50">
@@ -644,7 +715,7 @@ function NewSessionModal({
           <button
             type="button"
             disabled={!ready}
-            onClick={() => onCreate(trimmedProject, vendor, effectiveRole)}
+            onClick={submit}
             className="h-9 px-3 rounded-md text-sm bg-amber-500 text-surface-950 hover:bg-amber-400 disabled:opacity-40"
           >
             创建并切过去

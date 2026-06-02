@@ -11,6 +11,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
+use ccteam_core::config::{upsert_project, ProjectEntry};
+use ccteam_core::projects::{bootstrap_project_at_dir, validate_slug_format};
+use ccteam_core::CcteamPaths;
 use ccteam_harness::{
     chat_session_name, parse_chat_session_name, AgentSpecBrief, AgentVendor, HarnessAdapter,
     ProcessBackend, SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails, TurnInput,
@@ -74,6 +77,10 @@ pub struct Gateway {
     next_session: u64,
     event_sink: Option<tokio::sync::mpsc::UnboundedSender<GatewayEvent>>,
     event_pumps: BTreeMap<String, tokio::task::JoinHandle<()>>,
+    /// Path context for `/newproject` (scaffold + config-registry write).
+    /// `None` in unit tests that don't exercise project creation; the
+    /// daemon sets it via [`Gateway::enable_project_creation`].
+    project_paths: Option<CcteamPaths>,
 }
 
 /// User-visible text emitted asynchronously from a harness event stream.
@@ -184,6 +191,7 @@ impl Gateway {
             next_session: 0,
             event_sink: None,
             event_pumps: BTreeMap::new(),
+            project_paths: None,
         }
     }
 
@@ -199,6 +207,14 @@ impl Gateway {
         for id in ids {
             self.spawn_event_pump(&id);
         }
+    }
+
+    /// Enable `/newproject <slug> <path>` by giving the gateway the path
+    /// context it needs to scaffold + register a project. The daemon
+    /// wires this; unit tests that don't create projects leave it unset
+    /// (the command then reports it's unavailable).
+    pub fn enable_project_creation(&mut self, paths: CcteamPaths) {
+        self.project_paths = Some(paths);
     }
 
     /// Load and persist route/session state at `path`.
@@ -331,7 +347,7 @@ impl Gateway {
     pub fn is_gateway_command(text: &str) -> bool {
         matches!(
             text.split_whitespace().next(),
-            Some("/pair" | "/new" | "/use" | "/cd" | "/sessions" | "/projects")
+            Some("/pair" | "/new" | "/use" | "/cd" | "/sessions" | "/projects" | "/newproject")
         )
     }
 
@@ -445,10 +461,62 @@ impl Gateway {
                     }
                 }))
             }
+            "/newproject" => {
+                // `/newproject <slug> <path>` — the path is the remainder
+                // of the line so it may contain spaces. Splitting on the
+                // first two whitespace runs keeps the path intact.
+                let mut it = trimmed.splitn(3, char::is_whitespace);
+                let _cmd = it.next();
+                let slug = it
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| anyhow!("用法: /newproject <slug> <项目路径>"))?;
+                let path = it
+                    .next()
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .ok_or_else(|| anyhow!("用法: /newproject <slug> <项目路径>"))?;
+                self.create_project(slug, path).map(Some)
+            }
             "/sessions" => Ok(Some(self.render_sessions(chat))),
             "/projects" => Ok(Some(self.render_projects())),
             _ => Ok(None),
         }
+    }
+
+    /// Scaffold a ccteam project at `raw_path`, register it in
+    /// `config.yaml`, and make it addressable by `/cd <slug>` in this
+    /// running daemon. `raw_path` may be `~`-relative; it must resolve to
+    /// an absolute directory (existing repos are adopted in place, empty
+    /// dirs are created — `bootstrap_project_at_dir` leaves user files
+    /// alone). Requires [`Gateway::enable_project_creation`].
+    fn create_project(&mut self, slug: &str, raw_path: &str) -> Result<String> {
+        let paths = self
+            .project_paths
+            .clone()
+            .ok_or_else(|| anyhow!("project creation is not configured on this daemon"))?;
+        let slug = validate_slug_format(slug)?;
+        if self.projects.contains_key(&slug) {
+            return Err(anyhow!("project already exists: {slug}"));
+        }
+        let abs = expand_project_path(raw_path)?;
+        bootstrap_project_at_dir(&paths, &abs, &slug, "(created from web/IM chat)", "dev")
+            .with_context(|| format!("scaffold project {slug} at {}", abs.display()))?;
+        upsert_project(
+            &paths.root,
+            ProjectEntry {
+                slug: slug.clone(),
+                path: abs.clone(),
+                team: "dev".to_string(),
+                installed_at: chrono::Utc::now(),
+            },
+        )
+        .with_context(|| format!("register project {slug} in config.yaml"))?;
+        self.register_project(slug.clone(), abs.clone());
+        if let Err(err) = self.persist_state() {
+            tracing::warn!(error = %err, "ccteam-im: persist after /newproject failed");
+        }
+        Ok(format!("created project {slug} at {}", abs.display()))
     }
 
     async fn ensure_current_session(&mut self, chat: &ChatKey) -> Result<()> {
@@ -1038,6 +1106,25 @@ fn parse_vendor(raw: &str) -> Result<AgentVendor> {
         "codex" => Ok(AgentVendor::Codex),
         other => Err(anyhow!("unknown vendor: {other}")),
     }
+}
+
+/// Resolve a chat-supplied project path: expand a leading `~`, then
+/// require the result to be absolute (the daemon's cwd is not a
+/// meaningful base for a path typed into a chat / web form).
+fn expand_project_path(raw: &str) -> Result<PathBuf> {
+    let expanded = if let Some(rest) = raw.strip_prefix("~/") {
+        dirs::home_dir()
+            .ok_or_else(|| anyhow!("cannot resolve home directory for ~"))?
+            .join(rest)
+    } else if raw == "~" {
+        dirs::home_dir().ok_or_else(|| anyhow!("cannot resolve home directory for ~"))?
+    } else {
+        PathBuf::from(raw)
+    };
+    if !expanded.is_absolute() {
+        return Err(anyhow!("项目路径必须是绝对路径(或 ~ 开头): {raw}"));
+    }
+    Ok(expanded)
 }
 
 /// Numeric ordering key for a `s{n}` session id; unparseable ids sort last so
@@ -1794,5 +1881,35 @@ mod tests {
             rendered.contains("orphan ccteam-chat-ghost-proj-zombie (slug=ghost-proj role=zombie)"),
             "rendered: {rendered}"
         );
+    }
+
+    #[tokio::test]
+    async fn gateway_newproject_validates_args_and_requires_path_context() {
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        // Missing path → usage error (parsed before any path-context check).
+        let usage = gateway
+            .handle_text("mock", "chat-1", "alice", "/newproject demo")
+            .await;
+        assert!(format!("{:#}", usage.unwrap_err()).contains("用法"));
+        // Valid args, but project creation is not configured on this gateway.
+        let err = gateway
+            .handle_text("mock", "chat-1", "alice", "/newproject demo /tmp/demo")
+            .await
+            .expect_err("expected not-configured error");
+        assert!(format!("{err:#}").contains("not configured"));
+        assert!(Gateway::is_gateway_command("/newproject demo /x"));
+    }
+
+    #[test]
+    fn expand_project_path_requires_absolute_and_expands_tilde() {
+        assert_eq!(
+            expand_project_path("/srv/code/app").unwrap(),
+            std::path::PathBuf::from("/srv/code/app")
+        );
+        assert!(expand_project_path("relative/dir").is_err());
+        let home = expand_project_path("~/code/app").unwrap();
+        assert!(home.is_absolute());
+        assert!(home.ends_with("code/app"));
     }
 }

@@ -651,4 +651,41 @@ mod tests {
         assert!(vendors.contains(&AgentVendor::Claude));
         assert!(vendors.contains(&AgentVendor::Codex));
     }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn web_chat_newproject_scaffolds_registers_and_cd_works() {
+        let _guard = env_lock();
+        let home = TempDir::new().unwrap();
+        let ccteam_home = home.path().join(".ccteam");
+        let _restore = EnvRestore::install(home.path(), &ccteam_home);
+        let paths = fake_paths(home.path());
+        std::fs::create_dir_all(&paths.projects_root).unwrap();
+
+        let adapter_state = Arc::new(RecordingState::default());
+        let stack = spawn_stack(paths.clone(), Arc::clone(&adapter_state)).await;
+        let mut socket = connect_chat(stack.addr).await;
+
+        // `/newproject <slug> <path>` scaffolds at the path and registers it.
+        let proj_dir = home.path().join("code").join("demo");
+        send_text(
+            &mut socket,
+            "newproject",
+            &format!("/newproject demo {}", proj_dir.display()),
+        )
+        .await;
+        recv_reply_contains(&mut socket, "created project demo").await;
+
+        assert!(proj_dir.join(".ccteam").join("state.json").exists());
+        let config = std::fs::read_to_string(ccteam_home.join("config.yaml")).unwrap();
+        assert!(config.contains("demo"), "config.yaml: {config}");
+        assert!(config.contains(&proj_dir.display().to_string()));
+
+        // Immediately addressable by /cd in the running daemon.
+        send_text(&mut socket, "cd-demo", "/cd demo").await;
+        recv_reply_contains(&mut socket, "project set to demo").await;
+
+        drop(socket);
+        stop_stack(stack).await;
+    }
 }
