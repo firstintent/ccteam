@@ -85,6 +85,141 @@ async fn real_codex_app_server_start_thread_smoke() {
         .expect("real codex app-server thread/archive should succeed");
 }
 
+/// Real end-to-end round-trip proving the chat reply ccteam surfaces is
+/// genuinely the Codex MODEL's output — not an echo, a stub, or a Claude
+/// process. We drive the production `CodexAppServerAdapter` over the
+/// stdio transport (it spawns a real `codex app-server --listen
+/// stdio://` child itself), `submit_turn` a prompt whose correct answer
+/// requires real inference (17 * 23 = 391, which an echo could never
+/// produce), and assert the `ThreadItemDetails::AgentMessage` the
+/// adapter parses out of the live JSON-RPC stream contains `391`.
+///
+/// Gated behind `CCTEAM_REAL_CODEX_REPLY=1` (real model call → needs
+/// `codex login` + network + a few tokens of spend), so it no-ops in the
+/// normal `cargo test` baseline exactly like the smoke test above.
+#[tokio::test]
+#[serial]
+async fn real_codex_reply_roundtrip_proves_model_output() {
+    use ccteam_harness::ThreadItemDetails;
+    use futures::StreamExt;
+
+    if std::env::var("CCTEAM_REAL_CODEX_REPLY").ok().as_deref() != Some("1") {
+        eprintln!("skip: set CCTEAM_REAL_CODEX_REPLY=1 for the real codex reply round-trip");
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    // stdio transport ⇒ the adapter spawns codex itself; no external
+    // daemon/socket. CCTEAM_HOME keeps any progress-bridge writes in tmp.
+    std::env::remove_var(APP_SERVER_SOCKET_ENV);
+    std::env::set_var(APP_SERVER_TRANSPORT_ENV, "stdio");
+    std::env::set_var("CCTEAM_HOME", tmp.path());
+
+    let adapter = CodexAppServerAdapter::new();
+    let handle = tokio::time::timeout(
+        Duration::from_secs(30),
+        adapter.start_thread(
+            &AgentSpecBrief {
+                role: "real-reply".to_string(),
+            },
+            &SpawnCtx {
+                slug: "real-codex-reply".to_string(),
+                sid: "s-real-reply".to_string(),
+                cwd: tmp.path().to_path_buf(),
+                project_dir: tmp.path().to_path_buf(),
+                extra_args: vec![],
+                model_id: None,
+            },
+        ),
+    )
+    .await
+    .expect("real codex thread/start timed out")
+    .expect("real codex thread/start should succeed");
+    assert_eq!(handle.vendor, AgentVendor::Codex);
+    assert_eq!(handle.mode, ExecutionMode::Chat);
+    eprintln!(
+        "[real-codex] thread_id={} extras={}",
+        handle.identity, handle.raw_extras
+    );
+
+    // Subscribe BEFORE submitting so we don't miss the agent-message
+    // notifications the server emits while the turn runs.
+    let mut stream = adapter.events(&handle);
+    let collector = tokio::spawn(async move {
+        let mut text = String::new();
+        let mut usage_line = String::new();
+        // Count which event variants carry the agent message so the test
+        // documents codex's dual emission (streaming `ItemUpdated` deltas
+        // + a final `ItemCompleted`) — the input the gateway pump must
+        // dedupe to avoid a doubled chat reply.
+        let mut agent_msg_via_updated = 0u32;
+        let mut agent_msg_via_completed = 0u32;
+        while let Some(ev) = stream.next().await {
+            match ev {
+                ThreadEvent::ItemUpdated { item } => {
+                    if let ThreadItemDetails::AgentMessage(t) = item.details {
+                        eprintln!("[real-codex] ItemUpdated  AgentMessage={t:?}");
+                        agent_msg_via_updated += 1;
+                        text.push_str(&t);
+                    }
+                }
+                ThreadEvent::ItemCompleted { item } => {
+                    if let ThreadItemDetails::AgentMessage(t) = item.details {
+                        eprintln!("[real-codex] ItemCompleted AgentMessage={t:?}");
+                        agent_msg_via_completed += 1;
+                        text.push_str(&t);
+                    }
+                }
+                ThreadEvent::ItemStarted { .. } => {}
+                ThreadEvent::TurnCompleted { turn_id, usage } => {
+                    usage_line = format!(
+                        "turn={turn_id} usage={usage:?} agentMessage via ItemUpdated={agent_msg_via_updated} via ItemCompleted={agent_msg_via_completed}"
+                    );
+                    break;
+                }
+                ThreadEvent::TurnFailed { turn_id, err } => {
+                    return Err(format!("turn {turn_id} failed: {err:?}"));
+                }
+                ThreadEvent::Error(e) => return Err(format!("stream error: {e:?}")),
+                _ => {}
+            }
+        }
+        Ok((text, usage_line))
+    });
+    // Let the collector run its first poll (broadcast subscribe) before
+    // the turn — model latency makes 500ms a comfortable margin.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let turn = adapter
+        .submit_turn(
+            &handle,
+            TurnInput::UserText(
+                "Compute 17 * 23 and reply with ONLY the integer result, no words.".to_string(),
+            ),
+        )
+        .await
+        .expect("real codex submit_turn should succeed");
+    eprintln!("[real-codex] submitted turn_id={}", turn.0);
+
+    let (reply, usage_line) = tokio::time::timeout(Duration::from_secs(120), collector)
+        .await
+        .expect("real codex reply timed out")
+        .expect("collector task panicked")
+        .expect("real codex turn should not fail");
+    eprintln!("[real-codex] REPLY = {reply:?}");
+    eprintln!("[real-codex] {usage_line}");
+
+    assert!(
+        reply.contains("391"),
+        "codex MODEL reply must contain the computed product 391 \
+         (an echo/stub/Claude-mislabel could not produce it); got: {reply:?}"
+    );
+
+    let _ = tokio::time::timeout(Duration::from_secs(10), adapter.close_thread(&handle)).await;
+    std::env::remove_var(APP_SERVER_TRANSPORT_ENV);
+    std::env::remove_var("CCTEAM_HOME");
+}
+
 /// Spawn a scripted peer that accepts ONE connection and serves the
 /// supplied request → response map. Notifications can be pushed
 /// out-of-band via the returned channel.

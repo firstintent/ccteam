@@ -1076,14 +1076,21 @@ fn spawn_turn_timeout_watchdog(
 
 fn async_event_text(evt: &ThreadEvent) -> Option<String> {
     match evt {
-        ThreadEvent::ItemCompleted { item } | ThreadEvent::ItemUpdated { item } => {
-            match &item.details {
-                ThreadItemDetails::AgentMessage(text) if !text.is_empty() => Some(text.clone()),
-                _ => None,
-            }
-        }
+        // Codex streams the agent message as `ItemUpdated` deltas *and* a
+        // final `ItemCompleted` carrying the full text (verified against a
+        // live `codex app-server`: a delta "391" followed by a completed
+        // "391"). Forward ONLY the final, else every codex chat turn is
+        // doubled — a fragment per delta plus a duplicate final message.
+        // Claude emits its reply solely as `ItemCompleted{AgentMessage}`
+        // (its `ItemUpdated` carries `Reasoning`), so dropping the delta
+        // arm is a no-op for Claude.
+        ThreadEvent::ItemCompleted { item } => match &item.details {
+            ThreadItemDetails::AgentMessage(text) if !text.is_empty() => Some(text.clone()),
+            _ => None,
+        },
         ThreadEvent::TurnFailed { err, .. } | ThreadEvent::Error(err) => Some(err.message.clone()),
-        ThreadEvent::ThreadStarted { .. }
+        ThreadEvent::ItemUpdated { .. }
+        | ThreadEvent::ThreadStarted { .. }
         | ThreadEvent::TurnStarted { .. }
         | ThreadEvent::TurnCompleted { .. }
         | ThreadEvent::ItemStarted { .. } => None,
@@ -1196,15 +1203,18 @@ fn session_index(id: &str) -> u64 {
 
 fn event_text(evt: &ThreadEvent) -> Option<String> {
     match evt {
-        ThreadEvent::ItemCompleted { item } | ThreadEvent::ItemUpdated { item } => {
-            match &item.details {
-                ThreadItemDetails::AgentMessage(text) if !text.is_empty() => Some(text.clone()),
-                _ => None,
-            }
-        }
+        // Same codex delta-vs-final dedup as `async_event_text`: only the
+        // final `ItemCompleted` agent message is a reply. The sync reply
+        // path breaks on the first hit, so forwarding a delta here would
+        // return a partial fragment instead of the full text.
+        ThreadEvent::ItemCompleted { item } => match &item.details {
+            ThreadItemDetails::AgentMessage(text) if !text.is_empty() => Some(text.clone()),
+            _ => None,
+        },
         ThreadEvent::TurnCompleted { turn_id, .. } => Some(format!("turn completed {turn_id}")),
         ThreadEvent::TurnFailed { err, .. } | ThreadEvent::Error(err) => Some(err.message.clone()),
-        ThreadEvent::ThreadStarted { .. }
+        ThreadEvent::ItemUpdated { .. }
+        | ThreadEvent::ThreadStarted { .. }
         | ThreadEvent::TurnStarted { .. }
         | ThreadEvent::ItemStarted { .. } => None,
     }
@@ -1225,6 +1235,53 @@ mod tests {
         LOCK.get_or_init(|| StdMutex::new(()))
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn agent_msg(kind: fn(ThreadItem) -> ThreadEvent, text: &str) -> ThreadEvent {
+        kind(ThreadItem {
+            id: "i1".into(),
+            details: ThreadItemDetails::AgentMessage(text.into()),
+        })
+    }
+
+    /// Regression: a real `codex app-server` turn emits the agent message
+    /// as a streaming `ItemUpdated` delta AND a final `ItemCompleted`
+    /// carrying the full text (verified live: delta "391" + completed
+    /// "391"). The chat pump (`async_event_text`) must forward ONLY the
+    /// final — else every codex reply is doubled. Claude's reply arrives
+    /// solely as `ItemCompleted{AgentMessage}` (its `ItemUpdated` is
+    /// `Reasoning`), so the streaming-delta drop is a no-op for Claude.
+    #[test]
+    fn async_event_text_forwards_final_not_codex_streaming_delta() {
+        // The streaming delta must NOT become a chat message.
+        assert_eq!(
+            async_event_text(&agent_msg(|item| ThreadEvent::ItemUpdated { item }, "391")),
+            None,
+            "codex streaming ItemUpdated delta must be suppressed"
+        );
+        // The final completed message is the one reply.
+        assert_eq!(
+            async_event_text(&agent_msg(
+                |item| ThreadEvent::ItemCompleted { item },
+                "391"
+            )),
+            Some("391".to_string()),
+        );
+        // The empty placeholder `item/completed` codex emits first is not a
+        // reply.
+        assert_eq!(
+            async_event_text(&agent_msg(|item| ThreadEvent::ItemCompleted { item }, "")),
+            None,
+        );
+        // Claude's reasoning rides ItemUpdated too — also dropped (no chat
+        // noise), confirming the fix doesn't leak thinking into chat.
+        let reasoning = ThreadEvent::ItemUpdated {
+            item: ThreadItem {
+                id: "r".into(),
+                details: ThreadItemDetails::Reasoning("thinking".into()),
+            },
+        };
+        assert_eq!(async_event_text(&reasoning), None);
     }
 
     #[derive(Debug)]
