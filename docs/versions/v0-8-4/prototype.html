@@ -119,12 +119,12 @@
             <div class="prog">
               <div class="ln">⏳ 正在处理…<span class="live"></span></div>
               <div class="ln">🧠 定位到 src/auth.rs 的超时分支</div>
-              <div class="ln">🔧 Bash · <span class="mono">cargo test auth</span></div>
-              <div class="ln">✏️ 编辑 src/auth.rs（+6 −2）</div>
-              <div class="ln done">✅ 完成 · 3 工具 · 1 文件 · 42s</div>
+              <div class="ln">📖 read ×5 · 🔧 bash ×3 · ✏️ edit ×2 · 🔎 web ×1</div>
+              <div class="ln" style="color:var(--muted)">↳ 🔧 <span class="mono">cargo test auth</span> · ✏️ src/auth.rs (+6 −2)</div>
+              <div class="ln done">✅ 完成 · 11 步 · 2 文件 · 42s</div>
             </div>
           </div>
-          <div class="ann">同一条消息**原地刷新**(节流~1.5s),不刷屏、不再干瞪眼;顺带吃掉旧的 "submitted s1 turn…" 机器味 ack。</div>
+          <div class="ann">同一条消息**原地刷新**(节流~1.5s):工具事件**分组计数**(借 claude-code `GroupedToolUse`,不逐条铺开),最近 1–2 条展开 + 入参 ≤200 字符截断;吃掉旧的 "submitted s1 turn…" 机器味 ack。</div>
         </div>
 
         <!-- B2: chunked answer with code fence continuity -->
@@ -163,7 +163,7 @@
           </div>
           <div class="meta">11:05</div>
         </div>
-        <div class="ann" style="align-self:flex-end">图片+caption 入站 → daemon 落盘 → turn 注入本地路径,agent 用 Read 看图。</div>
+        <div class="ann" style="align-self:flex-end">图片+caption 入站 → daemon 落盘 → 注入 &lt;channel … image_path=…&gt;;agent 按 ccteam **自己注入的 Read 约定**主动读图(非 native,需 ccteam 的 MCP instructions)。</div>
 
         <!-- bot reads it -->
         <div class="row bot">
@@ -204,7 +204,7 @@
         <p>治"多步骤 turn 的黑盒";治不了"单个长步骤内的静默"(粒度=步骤完成)。</p>
         <div class="ba">
           <div class="col"><div class="h bad">今天</div>整条 turn 一片静默,末尾才冒答案</div>
-          <div class="col"><div class="h gd">v0.8.4</div>一条 live-edit status 滚动显示工具/文件/思考</div>
+          <div class="col"><div class="h gd">v0.8.4</div>一条 live-edit status:工具/文件**分组计数**滚动显示(借 claude-code)</div>
         </div>
       </div>
 
