@@ -1,6 +1,6 @@
 # v0.8.5 dev-plan —— 执行编排(wave-based)
 
-> 配套 `prd.md`(实现规约)+ `docs/research/im-slash-coverage-decision.md`(设计论证)+ **`arch-refactor.md`(动工前必读:三个核心概念 Directive/Interaction/ThreadStatus + 两处 F10 支撑修缮;含对 prd 的 3 处修订点与各 wave 增量)**。本文只讲**怎么把它落地**:wave 切分、依赖、gate、收尾。架构与验收以 `prd.md` 为准。
+> 配套 `prd.md`(实现规约)+ `docs/research/im-slash-coverage-decision.md`(设计论证)+ **`arch-refactor.md`(动工前必读:补全两个全局核心概念 Harness/Session;含对 prd 的 3 处修订点与各 wave 增量)**。本文只讲**怎么把它落地**:wave 切分、依赖、gate、收尾。架构与验收以 `prd.md` 为准。
 > 这版大(动 `ccteam-harness` / `ccteam-im` / `ccteam-hooks` 多 crate + 新 trait + hook + 两 vendor adapter),按 minor 版 4-wave 范式走。
 
 ## Wave 依赖图
