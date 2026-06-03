@@ -39,8 +39,14 @@ regex.workspace = true
 reqwest = { workspace = true, features = ["json", "multipart"] }
 # UNIX-only signalling for graceful supervisor SIGTERM (libc::kill).
 libc = "0.2"
-# Lightweight WebSocket Channel used for local/browser IM e2e validation.
-tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake"] }
+# Lightweight WebSocket Channel used for local/browser IM e2e validation,
+# plus the Lark/Feishu WSS long-connection. `rustls-tls-webpki-roots`
+# adds the rustls TLS provider so `connect_async("wss://…")` works against
+# real Feishu (matches the workspace `reqwest` rustls posture). Tests use
+# plain-TCP localhost peers, so the feature is a runtime-only requirement.
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+# Lark/Feishu WS frame codec (pbbp2.proto) — used behind the `lark` feature.
+prost.workspace = true
 
 # V0.6.0 Wave 2 Option-C decision (docs/versions/v0-6-0/wave-2-decisions.md §3):
 # The Channel trait + slim TG/Slack/Discord providers live in-crate
@@ -53,10 +59,11 @@ tokio-tungstenite = { version = "0.24", default-features = false, features = ["c
 # URL needed for V0.6 host-probe scope).
 
 [features]
-# Each provider is a cargo feature; default = international "big three".
-# China-platform names (lark/dingtalk/qq/wechat) are placeholder feature
-# names — provider modules land in V0.7.
-default = ["telegram", "slack", "discord"]
+# Each provider is a cargo feature. `lark` (Feishu/Lark WS long-connection)
+# ships in `default` so the gate (`cargo test`/`clippy` without `--features`)
+# compiles + exercises the lark module and its tests. The remaining
+# China-platform names (dingtalk/qq/wechat) stay placeholder feature names.
+default = ["telegram", "slack", "discord", "lark"]
 telegram = []
 slack = []
 discord = []

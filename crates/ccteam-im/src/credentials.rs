@@ -6,7 +6,8 @@
 //! {
 //!   "telegram": { "bot_token": "...", "allowed_chat_ids": ["12345"] },
 //!   "slack":    { "bot_token": "xoxb-...", "signing_secret": "..." },
-//!   "discord":  { "bot_token": "...", "authorized_user_ids": ["..."] }
+//!   "discord":  { "bot_token": "...", "authorized_user_ids": ["..."] },
+//!   "lark":     { "app_id": "cli_...", "app_secret": "...", "allowed_user_ids": ["ou_..."] }
 //! }
 //! ```
 //!
@@ -32,6 +33,11 @@ pub struct Credentials {
     /// Discord bot credentials (REST messages API).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discord: Option<DiscordCreds>,
+    /// Lark/Feishu bot credentials (WebSocket long-connection +
+    /// `im/v1/messages`). No public URL / webhook port — the daemon
+    /// opens an outbound WSS long-connection (Path A).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lark: Option<LarkCreds>,
 }
 
 /// Telegram bot credentials.
@@ -69,6 +75,37 @@ pub struct DiscordCreds {
     /// the bound channel.
     #[serde(default)]
     pub authorized_user_ids: Vec<String>,
+}
+
+/// Lark/Feishu bot credentials.
+///
+/// The daemon uses the WebSocket long-connection receive path
+/// (`POST /callback/ws/endpoint` -> WSS frame loop): no public HTTPS
+/// endpoint, no `port`, no `verification_token` (those belong to the
+/// dropped webhook path). Outbound replies go via tenant-token
+/// `im/v1/messages`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LarkCreds {
+    /// App ID (`cli_...`) from the Lark/Feishu developer console.
+    pub app_id: String,
+    /// App secret (used to fetch the WS endpoint + tenant access token).
+    pub app_secret: String,
+    /// `open_id`s allowed to drive the bot. Empty = closed (deny all),
+    /// `"*"` = open — matches the channel-level `is_user_allowed`
+    /// semantics. NOTE: this is the opposite default of telegram's
+    /// empty=open; the daemon `AclPolicy` layer is independent and uses
+    /// empty=open (see `acl.rs`).
+    #[serde(default)]
+    pub allowed_user_ids: Vec<String>,
+    /// `true` -> Feishu (CN, open.feishu.cn); `false` -> Lark intl
+    /// (open.larksuite.com). Defaults true (CN-first, matches the
+    /// `china` feature intent).
+    #[serde(default = "default_use_feishu")]
+    pub use_feishu: bool,
+}
+
+fn default_use_feishu() -> bool {
+    true
 }
 
 /// Default credentials file path.
@@ -154,6 +191,7 @@ mod tests {
         assert!(creds.telegram.is_none());
         assert!(creds.slack.is_none());
         assert!(creds.discord.is_none());
+        assert!(creds.lark.is_none());
     }
 
     #[test]
@@ -170,6 +208,36 @@ mod tests {
         save(&path, &original).unwrap();
         let back = load(Some(&path)).unwrap();
         assert_eq!(back, original);
+    }
+
+    #[test]
+    fn round_trip_lark_only() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("c.json");
+        let original = Credentials {
+            lark: Some(LarkCreds {
+                app_id: "cli_app123".into(),
+                app_secret: "secret456".into(),
+                allowed_user_ids: vec!["ou_alice".into(), "ou_bob".into()],
+                use_feishu: false,
+            }),
+            ..Default::default()
+        };
+        save(&path, &original).unwrap();
+        let back = load(Some(&path)).unwrap();
+        assert_eq!(back, original);
+    }
+
+    #[test]
+    fn lark_defaults_use_feishu() {
+        let json = r#"{"lark":{"app_id":"a","app_secret":"s"}}"#;
+        let creds: Credentials = serde_json::from_str(json).unwrap();
+        let lark = creds.lark.expect("lark block parsed");
+        assert!(lark.use_feishu, "use_feishu defaults to true (CN-first)");
+        assert!(
+            lark.allowed_user_ids.is_empty(),
+            "allowed_user_ids defaults empty (channel layer = closed)"
+        );
     }
 
     #[test]

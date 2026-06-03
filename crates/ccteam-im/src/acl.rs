@@ -9,6 +9,7 @@
 //!   slack_user_ids: ["U0123ABC"]
 //!   discord_user_ids: ["..."]
 //!   ws_user_ids: ["alice"]
+//!   lark_user_ids: ["ou_..."]
 //! ```
 //!
 //! [`AclPolicy::allow`] returns `true` when (a) the platform block is
@@ -33,6 +34,9 @@ pub struct AclPolicy {
     /// Local WebSocket / browser web-chat user IDs. Empty = open.
     #[serde(default)]
     pub ws_user_ids: Vec<String>,
+    /// Lark/Feishu `open_id`s. Empty = open.
+    #[serde(default)]
+    pub lark_user_ids: Vec<String>,
 }
 
 impl AclPolicy {
@@ -43,6 +47,7 @@ impl AclPolicy {
             "slack" => &self.slack_user_ids,
             "discord" => &self.discord_user_ids,
             "ws" | "web" => &self.ws_user_ids,
+            "lark" => &self.lark_user_ids,
             // Unknown platform: deny by default (fail-closed).
             _ => return false,
         };
@@ -65,6 +70,17 @@ mod tests {
         assert!(p.allow("slack", "any"));
         assert!(p.allow("ws", "any"));
         assert!(p.allow("web", "any"));
+        assert!(p.allow("lark", "any"));
+    }
+
+    #[test]
+    fn lark_allowlist_enforced() {
+        let p = AclPolicy {
+            lark_user_ids: vec!["ou_x".into()],
+            ..Default::default()
+        };
+        assert!(p.allow("lark", "ou_x"));
+        assert!(!p.allow("lark", "ou_y"));
     }
 
     #[test]
@@ -88,10 +104,14 @@ mod tests {
         let p = AclPolicy {
             telegram_user_ids: vec!["alice-tg".into()],
             slack_user_ids: vec!["alice-slack".into()],
+            lark_user_ids: vec!["ou_alice".into()],
             ..Default::default()
         };
         // alice's TG id must not unlock the Slack channel.
         assert!(!p.allow("slack", "alice-tg"));
         assert!(p.allow("slack", "alice-slack"));
+        // …nor the Lark channel (open_id-space is isolated too).
+        assert!(!p.allow("lark", "alice-tg"));
+        assert!(p.allow("lark", "ou_alice"));
     }
 }

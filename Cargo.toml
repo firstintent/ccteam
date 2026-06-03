@@ -73,6 +73,13 @@ async-trait = "0.1"
 # events() trait method.
 futures = { version = "0.3", default-features = false, features = ["std"] }
 
+# Lark/Feishu WebSocket long-connection frame codec (pbbp2.proto).
+# The `derive` feature is on by default and powers `#[derive(prost::Message)]`
+# on the hand-written `PbFrame` / `PbHeader` structs — no `prost-build`,
+# no codegen, no vendored `.proto`. Only consumed by ccteam-im behind the
+# `lark` feature.
+prost = "0.14"
+
 # V0.3 M5.0 — web UI (axum + askama). Pinned per `docs/versions/v0-3/prd.md`
 # §3.2.2; minor bumps in M5.x must update the table there.
 axum = "0.8"

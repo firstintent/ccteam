@@ -1,6 +1,6 @@
 //! Credentials reader integration tests.
 
-use ccteam_im::credentials::{load, save, Credentials, SlackCreds, TelegramCreds};
+use ccteam_im::credentials::{load, save, Credentials, LarkCreds, SlackCreds, TelegramCreds};
 use tempfile::TempDir;
 
 #[test]
@@ -11,6 +11,7 @@ fn missing_file_returns_default() {
     assert!(c.telegram.is_none());
     assert!(c.slack.is_none());
     assert!(c.discord.is_none());
+    assert!(c.lark.is_none());
 }
 
 #[test]
@@ -28,6 +29,12 @@ fn round_trip_all_platforms() {
             poll_channels: vec!["C123".into()],
         }),
         discord: None,
+        lark: Some(LarkCreds {
+            app_id: "cli_x".into(),
+            app_secret: "sek".into(),
+            allowed_user_ids: vec!["ou_a".into()],
+            use_feishu: true,
+        }),
     };
     save(&path, &original).unwrap();
     let back = load(Some(&path)).unwrap();
