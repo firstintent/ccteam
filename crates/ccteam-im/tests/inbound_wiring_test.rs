@@ -35,7 +35,9 @@ use ccteam_im::daemon::{
 use ccteam_im::register_bot;
 use ccteam_im::transport::providers::mock::MockChannel;
 use ccteam_im::transport::providers::ws::WsChannel;
-use ccteam_im::transport::{Channel, ChannelMessage, SendMessage};
+use ccteam_im::transport::{
+    AttachmentKind, Channel, ChannelAttachment, ChannelMessage, SendMessage,
+};
 use futures::stream::BoxStream;
 use futures::{SinkExt, StreamExt};
 use tempfile::TempDir;
@@ -311,6 +313,7 @@ async fn daemon_wires_mock_channel_to_supervisor_inbox() {
         channel: "telegram".into(),
         timestamp: 0,
         thread_ts: None,
+        attachments: Vec::new(),
     })
     .await;
 
@@ -402,6 +405,7 @@ async fn daemon_routes_gateway_inbound_to_submit_turn_and_outbound() {
         channel: "telegram".into(),
         timestamp: 0,
         thread_ts: None,
+        attachments: Vec::new(),
     })
     .await;
     mock.push(ChannelMessage {
@@ -412,6 +416,7 @@ async fn daemon_routes_gateway_inbound_to_submit_turn_and_outbound() {
         channel: "telegram".into(),
         timestamp: 1,
         thread_ts: None,
+        attachments: Vec::new(),
     })
     .await;
 
@@ -531,6 +536,7 @@ async fn daemon_splits_long_outbound_into_ordered_parts() {
         channel: "telegram".into(),
         timestamp: 0,
         thread_ts: None,
+        attachments: Vec::new(),
     })
     .await;
     mock.push(ChannelMessage {
@@ -541,6 +547,7 @@ async fn daemon_splits_long_outbound_into_ordered_parts() {
         channel: "telegram".into(),
         timestamp: 1,
         thread_ts: None,
+        attachments: Vec::new(),
     })
     .await;
 
@@ -680,6 +687,7 @@ async fn daemon_split_failure_surfaces_notice() {
         channel: "telegram".into(),
         timestamp: 0,
         thread_ts: None,
+        attachments: Vec::new(),
     })
     .await;
     mock.push(ChannelMessage {
@@ -690,6 +698,7 @@ async fn daemon_split_failure_surfaces_notice() {
         channel: "telegram".into(),
         timestamp: 1,
         thread_ts: None,
+        attachments: Vec::new(),
     })
     .await;
 
@@ -800,6 +809,7 @@ async fn daemon_surfaces_start_failure_to_im_and_ledger() {
         channel: "telegram".into(),
         timestamp: 0,
         thread_ts: None,
+        attachments: Vec::new(),
     })
     .await;
     let adapter = Arc::new(FailingGatewayAdapter::new(true, false));
@@ -840,6 +850,7 @@ async fn daemon_surfaces_submit_failure_to_im_and_ledger() {
         channel: "telegram".into(),
         timestamp: 0,
         thread_ts: None,
+        attachments: Vec::new(),
     })
     .await;
     mock.push(ChannelMessage {
@@ -850,6 +861,7 @@ async fn daemon_surfaces_submit_failure_to_im_and_ledger() {
         channel: "telegram".into(),
         timestamp: 1,
         thread_ts: None,
+        attachments: Vec::new(),
     })
     .await;
     let adapter = Arc::new(FailingGatewayAdapter::new(false, true));
@@ -896,6 +908,7 @@ async fn daemon_surfaces_turn_timeout_to_im_and_ledger() {
         channel: "telegram".into(),
         timestamp: 0,
         thread_ts: None,
+        attachments: Vec::new(),
     })
     .await;
     mock.push(ChannelMessage {
@@ -906,6 +919,7 @@ async fn daemon_surfaces_turn_timeout_to_im_and_ledger() {
         channel: "telegram".into(),
         timestamp: 1,
         thread_ts: None,
+        attachments: Vec::new(),
     })
     .await;
     let adapter = Arc::new(FailingGatewayAdapter::new(false, false));
@@ -1664,6 +1678,86 @@ fn restore_env(name: &str, value: Option<std::ffi::OsString>) {
     } else {
         std::env::remove_var(name);
     }
+}
+
+/// V0.8.4 P2a — an inbound message carrying an image attachment reaches
+/// the agent as a turn wrapped in `<channel … image_path="…">` so the
+/// Read convention (taught by the MCP server instructions) can fire.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_routes_inbound_image_attachment_into_turn_text() {
+    let _g = env_lock();
+    // Progress off keeps this focused on the inbound turn text.
+    std::env::set_var("CCTEAM_IM_PROGRESS", "off");
+    let home = isolate_home();
+    let projects_root = home.path().join("projects");
+    std::fs::create_dir_all(&projects_root).unwrap();
+
+    let mock = Arc::new(MockChannel::new());
+    mock.push(ChannelMessage {
+        id: "gw-1".into(),
+        sender: "alice".into(),
+        reply_target: "chat-1".into(),
+        content: "/new claude helper".into(),
+        channel: "telegram".into(),
+        timestamp: 0,
+        thread_ts: None,
+        attachments: Vec::new(),
+    })
+    .await;
+    mock.push(ChannelMessage {
+        id: "tg-77".into(),
+        sender: "alice".into(),
+        reply_target: "chat-1".into(),
+        content: "这是报错".into(),
+        channel: "telegram".into(),
+        timestamp: 1,
+        thread_ts: None,
+        attachments: vec![ChannelAttachment {
+            kind: AttachmentKind::Image,
+            file_name: "tg-77-shot.png".into(),
+            local_path: "/tmp/ccteam-inbound/tg-77-shot.png".into(),
+            mime: Some("image/png".into()),
+            size: Some(1234),
+        }],
+    })
+    .await;
+
+    let mut channels: ChannelMap = std::collections::HashMap::new();
+    channels.insert(
+        "telegram".to_string(),
+        mock.clone() as Arc<dyn Channel + Send + Sync>,
+    );
+    let adapter = Arc::new(GatewayAdapter::default());
+    let adapter_factory: AdapterFactory = {
+        let cloned = adapter.clone();
+        Arc::new(move |_| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
+    };
+    let args = DaemonArgs {
+        credentials: None,
+        registry: Some(projects_root),
+        max_runtime: Some(Duration::from_millis(700)),
+        adapter_factory: Some(adapter_factory),
+        channels_override: Some(channels),
+        extra_channels: None,
+    };
+    run_daemon_with_shutdown(args, async {
+        futures::future::pending::<()>().await;
+    })
+    .await
+    .unwrap();
+
+    let payloads = adapter.submitted_payloads.lock().await.clone();
+    let turn = payloads
+        .iter()
+        .find(|p| p.contains("这是报错"))
+        .unwrap_or_else(|| panic!("image turn not submitted: {payloads:?}"));
+    assert!(turn.contains("<channel "), "no channel wrapper: {turn}");
+    assert!(
+        turn.contains("image_path=\"/tmp/ccteam-inbound/tg-77-shot.png\""),
+        "image path not named in turn: {turn}"
+    );
+    std::env::remove_var("CCTEAM_IM_PROGRESS");
 }
 
 fn read_durable_outbound_rows() -> Vec<serde_json::Value> {

@@ -582,6 +582,7 @@ mod tests {
             channel: platform.into(),
             timestamp: 0,
             thread_ts: None,
+            attachments: Vec::new(),
         }
     }
 

@@ -195,6 +195,7 @@ async fn run_scripted(script: Vec<ThreadEvent>) -> Arc<MockChannel> {
             channel: "telegram".into(),
             timestamp: 0,
             thread_ts: None,
+            attachments: Vec::new(),
         })
         .await;
     }

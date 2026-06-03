@@ -165,6 +165,7 @@ fn im_msg(payload: &str) -> ChannelMessage {
         channel: "telegram".into(),
         timestamp: 0,
         thread_ts: None,
+        attachments: Vec::new(),
     }
 }
 
@@ -462,6 +463,7 @@ async fn channel_listen_to_inbound_pipeline() {
             channel: "telegram".into(),
             timestamp: 0,
             thread_ts: None,
+            attachments: Vec::new(),
         })
         .await;
     }

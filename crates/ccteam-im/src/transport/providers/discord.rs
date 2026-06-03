@@ -177,6 +177,7 @@ impl Channel for DiscordChannel {
                             .map(|d| d.timestamp().max(0) as u64)
                             .unwrap_or(0),
                         thread_ts: None,
+                        attachments: Vec::new(),
                     };
                     {
                         let mut map = self.last_id.lock().await;

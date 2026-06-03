@@ -115,6 +115,7 @@ fn to_im_message(message: WebChannelMessage) -> ChannelMessage {
         channel: message.channel,
         timestamp: message.timestamp,
         thread_ts: message.thread_ts,
+        attachments: Vec::new(),
     }
 }
 

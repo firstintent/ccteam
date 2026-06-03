@@ -92,6 +92,20 @@ fn current_ppid() -> i32 {
 const SERVER_NAME: &str = "ccteam";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// V0.8.4 P2a — server `instructions` surfaced to the agent on
+/// `initialize`. This is the **load-bearing** Read convention: a bare
+/// `claude` session does NOT auto-`Read` an attachment path — it must be
+/// told to. (The official telegram plugin teaches this exact convention
+/// via its own MCP server instructions; ccteam owns its channel, so it
+/// teaches its own.) Without this, inbound images are silently unseen.
+const CCTEAM_MCP_INSTRUCTIONS: &str = "ccteam routes IM (Telegram / web) chats to you and back. \
+An inbound chat message may arrive wrapped in a `<channel source=\"…\" chat_id=\"…\" user=\"…\" message_id=\"…\">` tag.\n\n\
+ATTACHMENTS (important): if a `<channel …>` tag carries an `image_path=\"/abs/path\"` attribute, immediately `Read` that file — \
+it is an image the user attached (often an error screenshot) and is essential context. If it carries a `file_path=\"/abs/path\"` \
+attribute, `Read` that file too. Further attachments may appear in the body as `[attachment image_path=\"…\"]` / \
+`[attachment file_path=\"…\"]` lines — `Read` each of those as well. Do this BEFORE you answer; the user expects you to have \
+looked at the file they sent.";
+
 /// Run `ccteam mcp-serve`. Reads JSON-RPC requests one per line from
 /// stdin; writes responses one per line to stdout.
 ///
@@ -313,6 +327,8 @@ fn initialize_response() -> Value {
             "name": SERVER_NAME,
             "version": SERVER_VERSION,
         },
+        // P2a — teach the agent the inbound-attachment Read convention.
+        "instructions": CCTEAM_MCP_INSTRUCTIONS,
     })
 }
 
@@ -1034,6 +1050,16 @@ mod tests {
         assert_eq!(resp["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
         assert!(resp["result"]["capabilities"]["tools"].is_object());
         assert_eq!(resp["result"]["serverInfo"]["name"], SERVER_NAME);
+        // P2a — the inbound-attachment Read convention must be taught via
+        // the server `instructions`, or a bare claude won't Read images.
+        let instructions = resp["result"]["instructions"].as_str().unwrap();
+        assert!(
+            instructions.contains("image_path"),
+            "instructions: {instructions}"
+        );
+        assert!(instructions.contains("file_path"));
+        assert!(instructions.contains("Read"));
+        assert!(instructions.contains("<channel"));
     }
 
     #[tokio::test]

@@ -21,6 +21,7 @@ use ccteam_harness::{
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
+use crate::transport::{AttachmentKind, ChannelAttachment};
 use crate::BotRegistration;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -386,7 +387,10 @@ impl Gateway {
             .contains_key(&ChatKey::new(channel, chat_id, user_id))
     }
 
-    /// Route one inbound text message and return outbound replies.
+    /// Route one inbound text message and return outbound replies. Thin
+    /// wrapper over [`handle_message`](Self::handle_message) with no
+    /// attachments — preserves the historic call shape for tests and
+    /// non-Telegram callers.
     pub async fn handle_text(
         &mut self,
         channel: &str,
@@ -394,25 +398,49 @@ impl Gateway {
         user_id: &str,
         text: &str,
     ) -> Result<Vec<String>> {
+        self.handle_message(channel, chat_id, user_id, "", text, &[])
+            .await
+    }
+
+    /// Route one inbound message (text + optional attachments) and return
+    /// outbound replies. V0.8.4 P2a: when `attachments` is non-empty, the
+    /// submitted turn text is wrapped in a `<channel …>` tag naming each
+    /// file's on-disk path, so the agent `Read`s it — the load-bearing
+    /// Read convention is taught by the daemon's MCP server instructions
+    /// (`ccteam mcp-serve` `initialize`).
+    pub async fn handle_message(
+        &mut self,
+        channel: &str,
+        chat_id: &str,
+        user_id: &str,
+        message_id: &str,
+        text: &str,
+        attachments: &[ChannelAttachment],
+    ) -> Result<Vec<String>> {
         let chat = ChatKey::new(channel, chat_id, user_id);
+        // Commands parse on the raw text; attachments don't apply to them.
         if let Some(reply) = self.handle_command(&chat, text).await? {
             return Ok(vec![reply]);
         }
         if let Some((handle, payload)) = crate::router::parse_first_mention(text) {
             if let Some(session_id) = self.session_by_handle(&chat, &handle) {
                 self.current_session.insert(chat.clone(), session_id);
-                if payload.is_empty() {
+                if payload.is_empty() && attachments.is_empty() {
                     return Ok(vec![format!("using @{handle}")]);
                 }
-                return self.submit_to_current(&chat, payload).await;
+                let turn =
+                    wrap_inbound(channel, chat_id, user_id, message_id, &payload, attachments);
+                return self.submit_to_current(&chat, turn).await;
             }
             if let Some(template) = self.template_by_handle(&chat, &handle) {
                 let session_id = self.start_template_session(chat.clone(), template).await?;
                 self.current_session.insert(chat.clone(), session_id);
-                if payload.is_empty() {
+                if payload.is_empty() && attachments.is_empty() {
                     return Ok(vec![format!("using @{handle}")]);
                 }
-                return self.submit_to_current(&chat, payload).await;
+                let turn =
+                    wrap_inbound(channel, chat_id, user_id, message_id, &payload, attachments);
+                return self.submit_to_current(&chat, turn).await;
             }
         }
         let templates = self.templates_for_chat(&chat);
@@ -423,7 +451,8 @@ impl Gateway {
             return Ok(vec![crate::inbound::format_ambiguous_dm_reply(&handles)]);
         }
         self.ensure_current_session(&chat).await?;
-        self.submit_to_current(&chat, text.to_string()).await
+        let turn = wrap_inbound(channel, chat_id, user_id, message_id, text, attachments);
+        self.submit_to_current(&chat, turn).await
     }
 
     async fn handle_command(&mut self, chat: &ChatKey, text: &str) -> Result<Option<String>> {
@@ -1173,6 +1202,46 @@ fn spawn_turn_timeout_watchdog(
     });
 }
 
+/// Build the turn text for an inbound message (V0.8.4 P2a). With no
+/// attachments it is the payload unchanged (today's behavior). With
+/// attachments, wrap it in a `<channel …>` provenance tag whose
+/// `image_path` / `file_path` attribute names each staged file, so the
+/// agent `Read`s it. The Read convention itself is taught by the daemon's
+/// MCP server instructions (a bare `claude` won't auto-Read otherwise).
+fn wrap_inbound(
+    channel: &str,
+    chat_id: &str,
+    user_id: &str,
+    message_id: &str,
+    payload: &str,
+    attachments: &[ChannelAttachment],
+) -> String {
+    if attachments.is_empty() {
+        return payload.to_string();
+    }
+    let mut attrs = format!(
+        "source=\"{channel}\" chat_id=\"{chat_id}\" user=\"{user_id}\" message_id=\"{message_id}\""
+    );
+    let mut extra_lines = Vec::new();
+    for (i, att) in attachments.iter().enumerate() {
+        let key = match att.kind {
+            AttachmentKind::Image => "image_path",
+            AttachmentKind::File => "file_path",
+        };
+        if i == 0 {
+            attrs.push_str(&format!(" {key}=\"{}\"", att.local_path));
+        } else {
+            extra_lines.push(format!("[attachment {key}=\"{}\"]", att.local_path));
+        }
+    }
+    let body = if extra_lines.is_empty() {
+        payload.to_string()
+    } else {
+        format!("{payload}\n{}", extra_lines.join("\n"))
+    };
+    format!("<channel {attrs}>\n{body}\n</channel>")
+}
+
 /// Resolve a session pump's live reply target `(channel, chat_id)`,
 /// honoring a `/cd`-updated `reply_to` and falling back to the owner.
 fn pump_target(session: &GatewaySession) -> (String, String) {
@@ -1463,6 +1532,64 @@ mod tests {
             },
         };
         assert_eq!(async_event_text(&reasoning), None);
+    }
+
+    // ----- P2a wrap_inbound (turn-text + attachment paths) ----------
+
+    fn img(path: &str) -> ChannelAttachment {
+        ChannelAttachment {
+            kind: AttachmentKind::Image,
+            file_name: "shot.png".into(),
+            local_path: path.into(),
+            mime: Some("image/png".into()),
+            size: Some(10),
+        }
+    }
+
+    #[test]
+    fn wrap_inbound_no_attachments_is_unchanged() {
+        // The text-only path must be byte-identical to today's behavior
+        // so every existing handle_text test stays valid.
+        assert_eq!(
+            wrap_inbound("telegram", "c1", "alice", "tg-9", "hello", &[]),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn wrap_inbound_names_image_path_in_channel_tag() {
+        let turn = wrap_inbound(
+            "telegram",
+            "c1",
+            "alice",
+            "tg-9",
+            "这是报错",
+            &[img("/abs/inbound/tg-9-shot.png")],
+        );
+        assert!(turn.contains("<channel "), "missing channel tag: {turn}");
+        assert!(turn.contains("source=\"telegram\""));
+        assert!(turn.contains("chat_id=\"c1\""));
+        assert!(turn.contains("image_path=\"/abs/inbound/tg-9-shot.png\""));
+        assert!(turn.contains("这是报错"));
+        assert!(turn.trim_end().ends_with("</channel>"));
+    }
+
+    #[test]
+    fn wrap_inbound_file_uses_file_path_and_lists_extras() {
+        let atts = vec![
+            img("/abs/a.png"),
+            ChannelAttachment {
+                kind: AttachmentKind::File,
+                file_name: "log.txt".into(),
+                local_path: "/abs/b.log".into(),
+                mime: None,
+                size: None,
+            },
+        ];
+        let turn = wrap_inbound("telegram", "c1", "alice", "tg-9", "see these", &atts);
+        // First attachment becomes a tag attribute, extras become body lines.
+        assert!(turn.contains("image_path=\"/abs/a.png\""));
+        assert!(turn.contains("[attachment file_path=\"/abs/b.log\"]"));
     }
 
     #[derive(Debug)]

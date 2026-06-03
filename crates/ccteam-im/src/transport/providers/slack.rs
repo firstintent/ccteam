@@ -191,6 +191,7 @@ impl Channel for SlackChannel {
                             .and_then(|s| s.parse::<u64>().ok())
                             .unwrap_or(0),
                         thread_ts: m.thread_ts.clone(),
+                        attachments: Vec::new(),
                     };
                     {
                         let mut map = self.last_ts.lock().await;
