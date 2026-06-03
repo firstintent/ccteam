@@ -77,6 +77,8 @@ codex plugin marketplace add firstintent/ccteam
 ## Features
 
 - **A meta AI team you drive from your phone** — assign work, get results, and intervene from IM, anywhere.
+- **Live, legible IM turns** — a turn shows folded step-by-step progress (`📖 read ×5 · 🔧 bash ×3`) in one editable status message while it works, then the answer arrives as its own message. Long replies are split into ordered chunks (code fences kept intact) instead of being truncated.
+- **Pictures both ways** — send a screenshot or file to the bot and the agent reads it; the agent can send images/files back to your chat with a `chat_send_file` tool.
 - **Multi-project, multi-session** — one chat fans out across many repos and many concurrent agent sessions, each with its own context.
 - **Two agent vendors** — Claude (tmux TUI) and Codex (app-server) side by side; ask for a cross-vendor second opinion on hard calls.
 - **Durable by design** — sessions survive daemon restarts and machine reboots; nothing silently forgets.

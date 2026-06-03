@@ -1,6 +1,6 @@
 {
   "name": "ccteam",
-  "version": "0.8.3",
+  "version": "0.8.4",
   "description": "Multi-vendor AI team orchestration on Claude Code: 7 skills + 27 MCP tools + IM bots + multi-agent voting.",
   "author": {
     "name": "FirstIntent"

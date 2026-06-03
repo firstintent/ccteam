@@ -1,6 +1,6 @@
 //! Capture the git commit the binary is built from and expose it as the
 //! `CCTEAM_GIT_COMMIT` compile-time env var, so `ccteam --version` can
-//! report `0.8.3 (<commit>)`. This makes a running daemon's exact build
+//! report `0.8.4 (<commit>)`. This makes a running daemon's exact build
 //! identifiable (the operator was chasing "is the running binary the one
 //! I just rebuilt?"). Falls back to "unknown" when git is unavailable
 //! (e.g. building from a source tarball with no `.git`).

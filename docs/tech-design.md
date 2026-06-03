@@ -565,6 +565,9 @@ ccteam web [--bind 127.0.0.1:7331]                # 单独启动 Web UI
 | PTY WS (`ccteam-pty.v1`) | `crates/ccteam-web/src/routes/pty_ws.rs` + SPA `useTerminal` | `cargo test -p ccteam-web --test pty_ws_test` |
 | JSON API v1 | `crates/ccteam-web/src/routes/api_v1.rs` | — |
 | IM transport / 凭证 | `crates/ccteam-im/src/transport/`(`Channel` trait + providers)+ `im/credentials.json` 解析 | — |
+| IM 出站分片 (B2) | `Channel::max_message_len`(常量只活 `transport/providers/telegram.rs`)+ `sanitize::split_for_channel`(UTF-16 预算 / fence 平衡)+ `daemon::send_gateway_outbound`(分片循环 + 每片 durable row) | `cargo test -p ccteam-im split` |
+| IM 进度 status (B1) | `progress::ProgressFold`(分组折叠 + `truncate_for_preview`)+ `Channel::edit_message` + `gateway::spawn_event_pump`(答案/进度分流 + 节流)+ `GatewayEventKind::Progress` + daemon `deliver_progress`(send-first/edit-after) | `cargo test -p ccteam-im --test im_progress_test`;env `CCTEAM_IM_PROGRESS`(off)/`CCTEAM_IM_PROGRESS_THROTTLE_MS` |
+| IM 附件 I/O (B3) | 入站:`transport::{ChannelAttachment,AttachmentKind}` + telegram `getFile`/下载 staging + `gateway::handle_message` 拼 `<channel … image_path=…>`;出站:`transport::{OutboundFile,OutboundFileKind}` + telegram `sendPhoto/sendDocument` + `chat_send_file`(零寻址,`resolve_home_chat` 解析)走 `mcp.sock`(`main.rs::handle_mcp_socket_connection` 注入 `GatewayEvent` sink)。**Read 约定**(load-bearing)= ccteam MCP `initialize` instructions(`mcp_serve.rs::CCTEAM_MCP_INSTRUCTIONS`) | `cargo test -p ccteam-im`;`ccteam doctor --verify-mcp` |
 | workflow.yaml schema | `ccteam-flow` / `ccteam-core` 解析代码(推后的编排层) | — |
 | HarnessAdapter / ProcessBackend | `crates/ccteam-harness/src/adapter.rs` + `lib.rs` | — |
 
