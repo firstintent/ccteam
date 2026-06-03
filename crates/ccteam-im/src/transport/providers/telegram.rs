@@ -265,6 +265,29 @@ impl Channel for TelegramChannel {
     fn max_message_len(&self) -> Option<usize> {
         Some(MAX_MESSAGE_UTF16)
     }
+
+    async fn edit_message(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        content: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let url = self.api_url("editMessageText");
+        let body = serde_json::json!({
+            "chat_id": recipient,
+            "message_id": message_id.parse::<i64>().ok(),
+            "text": content,
+        });
+        let resp = self.http.post(&url).json(&body).send().await?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("telegram editMessageText {recipient}#{message_id} → {status}: {text}");
+        }
+        // editMessageText returns the (same) edited Message; the id is
+        // stable, so echo it back for the daemon's status bookkeeping.
+        Ok(Some(message_id.to_string()))
+    }
 }
 
 #[cfg(test)]

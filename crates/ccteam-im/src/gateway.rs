@@ -89,10 +89,31 @@ pub struct Gateway {
     project_paths: Option<CcteamPaths>,
 }
 
+/// How the daemon should deliver a [`GatewayEvent`] (V0.8.4 P1).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum GatewayEventKind {
+    /// A delivered reply — a **new** message (P0-split, durable-ledgered,
+    /// pings the user). Today's behavior.
+    #[default]
+    Answer,
+    /// A live progress update — the daemon keeps **one editable status
+    /// message per `status_key`** (sends the first, edits the rest),
+    /// folding rapid steps into a single message. `done` finalizes and
+    /// forgets the status. Progress bypasses the durable ledger (it is a
+    /// delivery-layer UX, not state SoT).
+    Progress {
+        /// Correlates edits within one turn's status epoch.
+        status_key: String,
+        /// Final update — finalize + forget after delivering.
+        done: bool,
+    },
+}
+
 /// User-visible text emitted asynchronously from a harness event stream.
 ///
 /// The daemon owns delivery: it maps `channel` to a live [`Channel`],
-/// appends the durable outbound ledger row, and sends to `chat_id`.
+/// appends the durable outbound ledger row (answers only), and sends to
+/// `chat_id`.
 #[derive(Debug, Clone)]
 pub struct GatewayEvent {
     /// Stable outbound id prefix used by the durable ledger.
@@ -105,6 +126,8 @@ pub struct GatewayEvent {
     pub thread_ts: Option<String>,
     /// User-visible message content.
     pub content: String,
+    /// Answer (new message) vs. live progress (edited status message).
+    pub kind: GatewayEventKind,
 }
 
 /// A live `ccteam-chat-*` process with no matching tracked gateway session —
@@ -670,30 +693,105 @@ impl Gateway {
         let session_id = session.id.clone();
         let pump_key = session_id.clone();
         let handle = tokio::spawn(async move {
+            use std::time::Instant;
+            // V0.8.4 P1: split the event stream into ANSWER (new message)
+            // and PROGRESS (one live, edited status message per turn).
+            let progress_on = progress_enabled();
+            let throttle = progress_throttle();
             let mut events = session.adapter.events(&session.thread);
-            let mut seq: u64 = 0;
-            while let Some(evt) = events.next().await {
-                let Some(text) = async_event_text(&evt) else {
-                    continue;
+            let mut seq: u64 = 0; // answer sequence → message ids
+            let mut epoch: u64 = 0; // status epoch → one per turn
+            let mut fold = crate::progress::ProgressFold::new();
+            let mut dirty = false;
+            let mut last_emit: Option<Instant> = None;
+            let mut last_sent: Option<String> = None;
+
+            loop {
+                // Flush timer, armed only while a throttled update waits.
+                let flush = async {
+                    if let Some(t) = last_emit {
+                        let deadline = t + throttle;
+                        let now = Instant::now();
+                        if now < deadline {
+                            tokio::time::sleep(deadline - now).await;
+                        }
+                    }
                 };
-                seq = seq.saturating_add(1);
-                session.visible_events.fetch_add(1, Ordering::SeqCst);
-                let (channel, chat_id) = match session.reply_to.lock() {
-                    Ok(target) => (target.channel.clone(), target.chat_id.clone()),
-                    Err(_) => (session.owner.channel.clone(), session.owner.chat_id.clone()),
-                };
-                if tx
-                    .send(GatewayEvent {
-                        id: format!("gateway-event-{session_id}-{seq}"),
-                        channel,
-                        chat_id,
-                        thread_ts: None,
-                        content: text,
-                    })
-                    .is_err()
-                {
-                    break;
+
+                tokio::select! {
+                    biased;
+                    maybe = events.next() => {
+                        let Some(evt) = maybe else { break; };
+                        if let Some(text) = async_event_text(&evt) {
+                            // ----- ANSWER (or error) -----
+                            // Finalize this turn's status epoch first.
+                            if progress_on && fold.has_activity() && !fold.done() {
+                                fold.mark_done();
+                                if !flush_progress(
+                                    &tx, &session, &session_id, epoch, &fold,
+                                    &mut last_sent, &mut last_emit, &mut dirty,
+                                ) {
+                                    break;
+                                }
+                                epoch = epoch.saturating_add(1);
+                            }
+                            fold = crate::progress::ProgressFold::new();
+                            dirty = false;
+                            last_emit = None;
+                            last_sent = None;
+
+                            seq = seq.saturating_add(1);
+                            session.visible_events.fetch_add(1, Ordering::SeqCst);
+                            let (channel, chat_id) = pump_target(&session);
+                            if tx
+                                .send(GatewayEvent {
+                                    id: format!("gateway-event-{session_id}-{seq}"),
+                                    channel,
+                                    chat_id,
+                                    thread_ts: None,
+                                    content: text,
+                                    kind: GatewayEventKind::Answer,
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        } else if progress_on && fold.apply(&evt) {
+                            // ----- PROGRESS -----
+                            dirty = true;
+                            let ready = last_emit.map(|t| t.elapsed() >= throttle).unwrap_or(true);
+                            if ready
+                                && !flush_progress(
+                                    &tx, &session, &session_id, epoch, &fold,
+                                    &mut last_sent, &mut last_emit, &mut dirty,
+                                )
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    _ = flush, if progress_on && dirty => {
+                        if !flush_progress(
+                            &tx, &session, &session_id, epoch, &fold,
+                            &mut last_sent, &mut last_emit, &mut dirty,
+                        ) {
+                            break;
+                        }
+                    }
                 }
+            }
+            // Stream ended — flush any pending progress as a last update.
+            if progress_on && dirty {
+                let _ = flush_progress(
+                    &tx,
+                    &session,
+                    &session_id,
+                    epoch,
+                    &fold,
+                    &mut last_sent,
+                    &mut last_emit,
+                    &mut dirty,
+                );
             }
         });
         self.event_pumps.insert(pump_key, handle);
@@ -1070,8 +1168,91 @@ fn spawn_turn_timeout_watchdog(
             content: format!(
                 "gateway error: turn timed out after {timeout:?} for {session_id} turn {turn_id}"
             ),
+            kind: GatewayEventKind::Answer,
         });
     });
+}
+
+/// Resolve a session pump's live reply target `(channel, chat_id)`,
+/// honoring a `/cd`-updated `reply_to` and falling back to the owner.
+fn pump_target(session: &GatewaySession) -> (String, String) {
+    match session.reply_to.lock() {
+        Ok(target) => (target.channel.clone(), target.chat_id.clone()),
+        Err(_) => (session.owner.channel.clone(), session.owner.chat_id.clone()),
+    }
+}
+
+/// Send one `Progress` gateway event with the given rendered `content`.
+/// Returns `false` only if the sink is closed (pump should stop). Sync
+/// (unbounded send), so it never holds a lock across an await.
+fn emit_progress(
+    tx: &tokio::sync::mpsc::UnboundedSender<GatewayEvent>,
+    session: &GatewaySession,
+    session_id: &str,
+    epoch: u64,
+    content: &str,
+    done: bool,
+) -> bool {
+    let (channel, chat_id) = pump_target(session);
+    let status_key = format!("{session_id}-{epoch}");
+    tx.send(GatewayEvent {
+        id: format!("gateway-progress-{status_key}"),
+        channel,
+        chat_id,
+        thread_ts: None,
+        content: content.to_string(),
+        kind: GatewayEventKind::Progress { status_key, done },
+    })
+    .is_ok()
+}
+
+/// Render the fold and flush it as a progress update, **skipping** a
+/// redundant edit whose text is unchanged (avoids Telegram's "message is
+/// not modified" 400). Updates the pump's throttle bookkeeping
+/// (`last_sent` / `last_emit` / `dirty`). Returns `false` if the sink
+/// closed.
+#[allow(clippy::too_many_arguments)]
+fn flush_progress(
+    tx: &tokio::sync::mpsc::UnboundedSender<GatewayEvent>,
+    session: &GatewaySession,
+    session_id: &str,
+    epoch: u64,
+    fold: &crate::progress::ProgressFold,
+    last_sent: &mut Option<String>,
+    last_emit: &mut Option<std::time::Instant>,
+    dirty: &mut bool,
+) -> bool {
+    *last_emit = Some(std::time::Instant::now());
+    *dirty = false;
+    let content = fold.render();
+    if !fold.done() && last_sent.as_deref() == Some(content.as_str()) {
+        return true; // no visible change → don't spend an edit
+    }
+    let ok = emit_progress(tx, session, session_id, epoch, &content, fold.done());
+    if ok {
+        *last_sent = Some(content);
+    }
+    ok
+}
+
+/// Whether IM progress status messages are enabled (default on). Set
+/// `CCTEAM_IM_PROGRESS=off` to fall back to answers-only.
+fn progress_enabled() -> bool {
+    !matches!(
+        std::env::var("CCTEAM_IM_PROGRESS").ok().as_deref(),
+        Some("off") | Some("0") | Some("false")
+    )
+}
+
+/// Minimum interval between status-message edits (default 1500ms — TG
+/// soft-limits edits to ~1/s). `CCTEAM_IM_PROGRESS_THROTTLE_MS=0` makes
+/// every step emit, for deterministic tests that don't rely on sleeps.
+fn progress_throttle() -> std::time::Duration {
+    let ms = std::env::var("CCTEAM_IM_PROGRESS_THROTTLE_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(1500);
+    std::time::Duration::from_millis(ms)
 }
 
 fn async_event_text(evt: &ThreadEvent) -> Option<String> {

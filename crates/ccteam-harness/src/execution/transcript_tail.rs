@@ -810,6 +810,79 @@ mod tests {
         assert!(!pending.contains_key("toolu-42"));
     }
 
+    /// V0.8.4 P1 pre-gate — pin that `ToolCall` / `Reasoning` /
+    /// `AgentMessage` events actually flow out of the streaming
+    /// `read_new` reader (not just the line parser), so the IM progress
+    /// state machine has a real signal to fold. `CommandExecution` /
+    /// `FileChange` are *Codex*-only (see `codex_exec.rs` /
+    /// `codex_app_server.rs`); Claude surfaces every tool as
+    /// `ToolCall{name}` (`Bash`/`Read`/`Edit`/…), which the IM layer
+    /// buckets by name.
+    #[tokio::test]
+    async fn read_new_surfaces_tool_and_reasoning_events() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("transcript.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // A realistic Claude turn: think → run a tool → tool result →
+        // final answer text.
+        for row in [
+            json!({"type":"assistant","uuid":"u1","message":{"content":[
+                {"type":"thinking","thinking":"let me check the file"}]}}),
+            json!({"type":"assistant","uuid":"u2","message":{"content":[
+                {"type":"tool_use","id":"tool-1","name":"Bash","input":{"command":"cargo test"}}]}}),
+            json!({"type":"user","uuid":"u3","message":{"content":[
+                {"type":"tool_result","tool_use_id":"tool-1","content":"ok"}]}}),
+            json!({"type":"assistant","uuid":"u4","message":{"content":[
+                {"type":"text","text":"all green"}]}}),
+        ] {
+            writeln!(f, "{row}").unwrap();
+        }
+        f.flush().unwrap();
+
+        let cursor = TranscriptCursor::default();
+        let delta = read_new(&path, &cursor, PendingTools::new())
+            .await
+            .unwrap()
+            .expect("transcript exists");
+
+        // Reasoning (thinking) flows as ItemUpdated{Reasoning}.
+        assert!(
+            delta.events.iter().any(|e| matches!(
+                e,
+                ThreadEvent::ItemUpdated { item }
+                    if matches!(&item.details, ThreadItemDetails::Reasoning(_))
+            )),
+            "expected a Reasoning event"
+        );
+        // Tool invocation flows as ItemStarted{ToolCall{Bash}}.
+        assert!(
+            delta.events.iter().any(|e| matches!(
+                e,
+                ThreadEvent::ItemStarted { item }
+                    if matches!(&item.details, ThreadItemDetails::ToolCall { name, .. } if name == "Bash")
+            )),
+            "expected an ItemStarted ToolCall(Bash)"
+        );
+        // Tool result flows as ItemCompleted{ToolCall{Bash}}.
+        assert!(
+            delta.events.iter().any(|e| matches!(
+                e,
+                ThreadEvent::ItemCompleted { item }
+                    if matches!(&item.details, ThreadItemDetails::ToolCall { name, .. } if name == "Bash")
+            )),
+            "expected an ItemCompleted ToolCall(Bash)"
+        );
+        // The answer flows as ItemCompleted{AgentMessage}.
+        assert!(
+            delta.events.iter().any(|e| matches!(
+                e,
+                ThreadEvent::ItemCompleted { item }
+                    if matches!(&item.details, ThreadItemDetails::AgentMessage(t) if t == "all green")
+            )),
+            "expected the final AgentMessage answer"
+        );
+    }
+
     #[test]
     fn parse_thinking_block_emits_reasoning() {
         let row = json!({

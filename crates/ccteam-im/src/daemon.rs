@@ -24,7 +24,7 @@ use tokio::sync::Mutex;
 use crate::acl::AclPolicy;
 use crate::bot_mpsc::{bot_key, BotChannelMap, InboxItem, OutboundItem};
 use crate::credentials::{self, Credentials};
-use crate::gateway::{Gateway, GatewayEvent};
+use crate::gateway::{Gateway, GatewayEvent, GatewayEventKind};
 use crate::latency::now_unix_ms;
 use crate::router::{self, HandleMap};
 use crate::three_layer_sec::{SecOutcome, ThreeLayerSec};
@@ -492,11 +492,24 @@ fn spawn_inbound_consumer(
     })
 }
 
+/// A live, editable progress status message (V0.8.4 P1): the platform
+/// message id plus where it lives, so later progress updates for the same
+/// turn edit it in place instead of spamming new messages.
+#[derive(Clone)]
+struct StatusHandle {
+    message_id: String,
+    recipient: String,
+}
+
 fn spawn_gateway_event_consumer(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>,
     channels: ChannelMap,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // One editable status message per `status_key` (a turn's progress
+        // epoch). Bounded: entries are inserted on the first progress of a
+        // turn and removed when the turn finalizes (`done`).
+        let mut status_messages: HashMap<String, StatusHandle> = HashMap::new();
         while let Some(evt) = rx.recv().await {
             let Some(channel) = channels.get(&evt.channel).cloned() else {
                 tracing::warn!(
@@ -506,11 +519,84 @@ fn spawn_gateway_event_consumer(
                 );
                 continue;
             };
-            let out = SendMessage::new(evt.content, evt.chat_id).in_thread(evt.thread_ts);
-            send_gateway_outbound(&evt.id, 0, &evt.channel, channel.as_ref(), out).await;
+            match evt.kind {
+                GatewayEventKind::Answer => {
+                    let out = SendMessage::new(evt.content, evt.chat_id).in_thread(evt.thread_ts);
+                    send_gateway_outbound(&evt.id, 0, &evt.channel, channel.as_ref(), out).await;
+                }
+                GatewayEventKind::Progress { status_key, done } => {
+                    deliver_progress(
+                        channel.as_ref(),
+                        &mut status_messages,
+                        status_key,
+                        done,
+                        &evt.channel,
+                        evt.chat_id,
+                        evt.thread_ts,
+                        evt.content,
+                    )
+                    .await;
+                }
+            }
         }
         tracing::debug!("imd: gateway event consumer exited");
     })
+}
+
+/// Deliver one progress update: send a fresh status message the first
+/// time a `status_key` is seen, then edit that same message for every
+/// later update, finalizing + forgetting it on `done`. Progress bypasses
+/// the durable ledger — it is delivery-layer UX, not state SoT.
+#[allow(clippy::too_many_arguments)]
+async fn deliver_progress(
+    channel: &(dyn Channel + Send + Sync),
+    status_messages: &mut HashMap<String, StatusHandle>,
+    status_key: String,
+    done: bool,
+    channel_name: &str,
+    chat_id: String,
+    thread_ts: Option<String>,
+    content: String,
+) {
+    if let Some(handle) = status_messages.get(&status_key).cloned() {
+        if let Err(err) = channel
+            .edit_message(&handle.recipient, &handle.message_id, &content)
+            .await
+        {
+            tracing::warn!(
+                channel = %channel_name,
+                status_key = %status_key,
+                error = %err,
+                "ccteam-im: progress edit failed"
+            );
+        }
+        if done {
+            status_messages.remove(&status_key);
+        }
+        return;
+    }
+    // First progress for this turn — send a new status message (the seed).
+    let seed = SendMessage::new(content, chat_id.clone()).in_thread(thread_ts.clone());
+    match channel.send(&seed).await {
+        Ok(Some(message_id)) if !done => {
+            status_messages.insert(
+                status_key,
+                StatusHandle {
+                    message_id,
+                    recipient: chat_id,
+                },
+            );
+        }
+        Ok(_) => {} // no editable id, or already done → one-shot
+        Err(err) => {
+            tracing::warn!(
+                channel = %channel_name,
+                status_key = %status_key,
+                error = %err,
+                "ccteam-im: progress seed send failed"
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
