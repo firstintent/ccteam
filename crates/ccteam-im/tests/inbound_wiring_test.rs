@@ -503,6 +503,239 @@ async fn daemon_routes_gateway_inbound_to_submit_turn_and_outbound() {
     }));
 }
 
+/// V0.8.4 P0 — a gateway reply that overflows the channel's
+/// `max_message_len` is split into ordered durable sub-messages. Built on
+/// `daemon_routes_gateway_inbound_to_submit_turn_and_outbound`, but with a
+/// `MockChannel` that declares a 40-unit ceiling so the async echo splits
+/// (the short "created session"/"submitted" acks stay single).
+///
+/// Ledger assertions are **multiset + pairing** (every id carries its own
+/// Queued+Sent, paired by id, ordered only *within* an id) — never
+/// positional across logical messages, since the sync ack and the async
+/// echo race (PRD §4.2 / the v8.2 flake).
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_splits_long_outbound_into_ordered_parts() {
+    let _g = env_lock();
+    let home = isolate_home();
+    let projects_root = home.path().join("projects");
+    std::fs::create_dir_all(&projects_root).unwrap();
+
+    let long_input = "please echo this fairly long sentence back to me intact";
+    let mock = Arc::new(MockChannel::new().with_max_message_len(40));
+    mock.push(ChannelMessage {
+        id: "gw-1".into(),
+        sender: "alice".into(),
+        reply_target: "chat-1".into(),
+        content: "/new claude helper".into(),
+        channel: "telegram".into(),
+        timestamp: 0,
+        thread_ts: None,
+    })
+    .await;
+    mock.push(ChannelMessage {
+        id: "gw-2".into(),
+        sender: "alice".into(),
+        reply_target: "chat-1".into(),
+        content: long_input.into(),
+        channel: "telegram".into(),
+        timestamp: 1,
+        thread_ts: None,
+    })
+    .await;
+
+    let mut channels: ChannelMap = std::collections::HashMap::new();
+    channels.insert(
+        "telegram".to_string(),
+        mock.clone() as Arc<dyn Channel + Send + Sync>,
+    );
+
+    let adapter = Arc::new(GatewayAdapter::default());
+    let adapter_factory: AdapterFactory = {
+        let cloned = adapter.clone();
+        Arc::new(move |_| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
+    };
+    let args = DaemonArgs {
+        credentials: None,
+        registry: Some(projects_root),
+        max_runtime: Some(Duration::from_millis(900)),
+        adapter_factory: Some(adapter_factory),
+        channels_override: Some(channels),
+        extra_channels: None,
+    };
+    run_daemon_with_shutdown(args, async {
+        futures::future::pending::<()>().await;
+    })
+    .await
+    .unwrap();
+
+    let echo = format!("gateway echo: {long_input}");
+
+    // ---- ledger: multiset + pairing (no cross-message ordering) ----
+    let rows = read_durable_outbound_rows();
+    let mut rows_by_id: BTreeMap<String, Vec<(usize, String, String)>> = BTreeMap::new();
+    let mut state_counts: BTreeMap<String, usize> = BTreeMap::new();
+    for (idx, row) in rows.iter().enumerate() {
+        let id = row["id"].as_str().unwrap().to_string();
+        let state = row["state"].as_str().unwrap().to_string();
+        let content = row["message"]["content"].as_str().unwrap().to_string();
+        *state_counts.entry(state.clone()).or_default() += 1;
+        rows_by_id
+            .entry(id)
+            .or_default()
+            .push((idx, state, content));
+    }
+    // Happy path: every Queued has a paired Sent, no Failed.
+    assert_eq!(state_counts.get("failed"), None, "no failures expected");
+    assert_eq!(
+        state_counts.get("queued"),
+        state_counts.get("sent"),
+        "every queued part must reach sent"
+    );
+    for (id, entries) in &rows_by_id {
+        let queued = entries
+            .iter()
+            .find(|(_, s, _)| s == "queued")
+            .unwrap_or_else(|| panic!("id {id} missing queued row"));
+        let sent = entries
+            .iter()
+            .find(|(_, s, _)| s == "sent")
+            .unwrap_or_else(|| panic!("id {id} missing sent row"));
+        assert!(queued.0 < sent.0, "id {id}: queued must precede sent");
+        assert_eq!(queued.2, sent.2, "id {id}: content drifted queued→sent");
+    }
+
+    // ---- the echo specifically split into ≥2 ordered parts ---------
+    // The async echo flows through the event pump ⇒ inbound_id starts
+    // "gateway-event-"; its split parts are `…-0-<part>`.
+    let mut echo_parts: Vec<(usize, String)> = rows
+        .iter()
+        .filter_map(|row| {
+            if row["state"].as_str()? != "sent" {
+                return None;
+            }
+            if !row["inbound_id"].as_str()?.starts_with("gateway-event-") {
+                return None;
+            }
+            let part_idx: usize = row["id"].as_str()?.rsplit('-').next()?.parse().ok()?;
+            Some((part_idx, row["message"]["content"].as_str()?.to_string()))
+        })
+        .collect();
+    echo_parts.sort_by_key(|(idx, _)| *idx);
+    assert!(
+        echo_parts.len() >= 2,
+        "echo must split into ordered parts (got {})",
+        echo_parts.len()
+    );
+    for (_, content) in &echo_parts {
+        assert!(
+            content.chars().map(char::len_utf16).sum::<usize>() <= 40,
+            "split part exceeds 40-unit budget: {content:?}"
+        );
+    }
+    let reconstructed: String = echo_parts.iter().map(|(_, c)| c.as_str()).collect();
+    assert_eq!(
+        reconstructed, echo,
+        "ordered parts must concatenate to echo"
+    );
+
+    // ---- the mock outbox carries the same ordered parts ------------
+    let outbox = mock.outbox().await;
+    let echo_outbox: Vec<String> = outbox
+        .into_iter()
+        .map(|m| m.content)
+        .filter(|c| !c.is_empty() && c != &echo && echo.contains(c.as_str()))
+        .collect();
+    assert_eq!(
+        echo_outbox.concat(),
+        echo,
+        "outbox echo parts must reconstruct"
+    );
+}
+
+/// V0.8.4 P0 — when a split part fails to send, the daemon surfaces one
+/// `⚠️` notice back to the chat (no silent partial delivery) and records
+/// a `Failed` ledger row. The failing channel keys on content
+/// (`"intact"`, which lands in the echo's final part) so the test is
+/// immune to the sync-ack / async-echo send ordering.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_split_failure_surfaces_notice() {
+    let _g = env_lock();
+    let home = isolate_home();
+    let projects_root = home.path().join("projects");
+    std::fs::create_dir_all(&projects_root).unwrap();
+
+    let long_input = "please echo this fairly long sentence back to me intact";
+    let mock = Arc::new(
+        MockChannel::new()
+            .with_max_message_len(40)
+            .failing_on_content(&["intact"]),
+    );
+    mock.push(ChannelMessage {
+        id: "gw-1".into(),
+        sender: "alice".into(),
+        reply_target: "chat-1".into(),
+        content: "/new claude helper".into(),
+        channel: "telegram".into(),
+        timestamp: 0,
+        thread_ts: None,
+    })
+    .await;
+    mock.push(ChannelMessage {
+        id: "gw-2".into(),
+        sender: "alice".into(),
+        reply_target: "chat-1".into(),
+        content: long_input.into(),
+        channel: "telegram".into(),
+        timestamp: 1,
+        thread_ts: None,
+    })
+    .await;
+
+    let mut channels: ChannelMap = std::collections::HashMap::new();
+    channels.insert(
+        "telegram".to_string(),
+        mock.clone() as Arc<dyn Channel + Send + Sync>,
+    );
+    let adapter = Arc::new(GatewayAdapter::default());
+    let adapter_factory: AdapterFactory = {
+        let cloned = adapter.clone();
+        Arc::new(move |_| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
+    };
+    let args = DaemonArgs {
+        credentials: None,
+        registry: Some(projects_root),
+        max_runtime: Some(Duration::from_millis(900)),
+        adapter_factory: Some(adapter_factory),
+        channels_override: Some(channels),
+        extra_channels: None,
+    };
+    run_daemon_with_shutdown(args, async {
+        futures::future::pending::<()>().await;
+    })
+    .await
+    .unwrap();
+
+    // The final echo part (carrying "intact") failed → a ⚠️ notice was
+    // delivered to the same chat.
+    let outbox = mock.outbox().await;
+    assert!(
+        outbox.iter().any(|m| m.content.starts_with("⚠️")),
+        "expected a split-failure notice, got {:?}",
+        outbox
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+    );
+    // And the ledger recorded the failed part.
+    let rows = read_durable_outbound_rows();
+    assert!(
+        rows.iter().any(|r| r["state"] == "failed"),
+        "expected a failed ledger row for the undelivered part"
+    );
+}
+
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_replays_queued_durable_outbound_to_mock_channel() {

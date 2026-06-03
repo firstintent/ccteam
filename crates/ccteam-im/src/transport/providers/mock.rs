@@ -18,6 +18,15 @@ pub struct MockChannel {
     inbox: Arc<Mutex<Vec<ChannelMessage>>>,
     outbox: Arc<Mutex<Vec<SendMessage>>>,
     name: String,
+    /// Optional per-message UTF-16 ceiling (default `None` = unlimited),
+    /// so a test can exercise the daemon's split path without a real
+    /// Telegram channel.
+    max_len: Option<usize>,
+    /// Substrings that, when present in an outbound message's content,
+    /// make [`Channel::send`] return `Err` — for exercising the P0
+    /// split-failure notice deterministically (content-keyed, so it is
+    /// immune to the sync-ack/async-echo send ordering).
+    fail_if_contains: Arc<Vec<String>>,
 }
 
 impl MockChannel {
@@ -27,7 +36,26 @@ impl MockChannel {
             inbox: Arc::default(),
             outbox: Arc::default(),
             name: "mock".to_string(),
+            max_len: None,
+            fail_if_contains: Arc::default(),
         }
+    }
+
+    /// Declare a per-message length ceiling (UTF-16 units), making this
+    /// channel exercise [`Channel::max_message_len`] + the daemon split
+    /// path. Builder-style so existing `MockChannel::new()` callers keep
+    /// the unlimited default.
+    pub fn with_max_message_len(mut self, max_len: usize) -> Self {
+        self.max_len = Some(max_len);
+        self
+    }
+
+    /// Make [`Channel::send`] fail for any message whose content contains
+    /// one of `needles`. Builder-style; used to drive the P0
+    /// split-failure notice path in tests.
+    pub fn failing_on_content(mut self, needles: &[&str]) -> Self {
+        self.fail_if_contains = Arc::new(needles.iter().map(|s| s.to_string()).collect());
+        self
     }
 
     /// Queue an inbound message to be delivered on the next
@@ -49,6 +77,13 @@ impl Channel for MockChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+        if let Some(needle) = self
+            .fail_if_contains
+            .iter()
+            .find(|n| message.content.contains(n.as_str()))
+        {
+            anyhow::bail!("mock: simulated send failure (content contains {needle:?})");
+        }
         self.outbox.lock().await.push(message.clone());
         Ok(Some(format!("mock-{}", self.outbox.lock().await.len())))
     }
@@ -63,6 +98,10 @@ impl Channel for MockChannel {
             }
         }
         Ok(())
+    }
+
+    fn max_message_len(&self) -> Option<usize> {
+        self.max_len
     }
 }
 

@@ -22,6 +22,14 @@ use crate::transport::{Channel, ChannelMessage, SendMessage};
 /// `getUpdates` long-poll seconds.
 const POLL_TIMEOUT_SECS: u64 = 25;
 
+/// Conservative per-message ceiling in **UTF-16 code units**. Telegram's
+/// hard `sendMessage` limit is 4096 UTF-16 units; we reserve headroom for
+/// re-opened code fences and reply metadata so a split part never trips a
+/// 400. This is the *only* place the Telegram length constant lives — the
+/// gateway/daemon read it polymorphically via
+/// [`Channel::max_message_len`], keeping the split path channel-neutral.
+const MAX_MESSAGE_UTF16: usize = 3900;
+
 /// Telegram channel.
 pub struct TelegramChannel {
     bot_token: String,
@@ -252,6 +260,10 @@ impl Channel for TelegramChannel {
             Ok(r) => r.status().is_success(),
             Err(_) => false,
         }
+    }
+
+    fn max_message_len(&self) -> Option<usize> {
+        Some(MAX_MESSAGE_UTF16)
     }
 }
 
