@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>v0.8.4 IM 日常驱动 — 交互原型</title>
+<style>
+  :root{
+    --bg:#0f1620; --panel:#17212b; --ink:#e9eef3; --muted:#8a99a8;
+    --in:#182533; --out:#2b5278; --accent:#4ea1ff;
+    --b1:#7c5cff; --b2:#2ec4b6; --b3a:#ffb02e; --b3b:#ff6b6b; --good:#39d98a;
+    --wall:#0b1118;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;
+       background:var(--bg);color:var(--ink);line-height:1.5;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:1080px;margin:0 auto;padding:28px 20px 64px}
+  header h1{font-size:22px;margin:0 0 4px}
+  header p{margin:0;color:var(--muted);font-size:13px}
+  .legend{display:flex;flex-wrap:wrap;gap:10px;margin:18px 0 6px}
+  .chip{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;padding:6px 11px;border-radius:999px;
+        background:var(--panel);border:1px solid #2a3947}
+  .dot{width:9px;height:9px;border-radius:50%}
+  .grid{display:grid;grid-template-columns:1.25fr 1fr;gap:22px;margin-top:18px}
+  @media(max-width:880px){.grid{grid-template-columns:1fr}}
+
+  /* phone / chat */
+  .phone{background:var(--wall);border-radius:22px;border:1px solid #243240;overflow:hidden;
+         box-shadow:0 18px 50px rgba(0,0,0,.45)}
+  .tbar{display:flex;align-items:center;gap:10px;padding:12px 14px;background:var(--panel);border-bottom:1px solid #243240}
+  .ava{width:34px;height:34px;border-radius:50%;background:linear-gradient(135deg,#4ea1ff,#7c5cff);
+       display:flex;align-items:center;justify-content:center;font-size:15px;font-weight:700}
+  .tbar .nm{font-size:14px;font-weight:600}
+  .tbar .st{font-size:11.5px;color:var(--good)}
+  .feed{padding:16px 14px 22px;display:flex;flex-direction:column;gap:12px;
+        background:
+          radial-gradient(circle at 20% 10%,rgba(124,92,255,.06),transparent 40%),
+          radial-gradient(circle at 80% 80%,rgba(46,196,182,.06),transparent 40%),
+          var(--wall)}
+  .row{display:flex;flex-direction:column;max-width:86%}
+  .row.me{align-self:flex-end;align-items:flex-end}
+  .row.bot{align-self:flex-start;align-items:flex-start}
+  .bub{padding:9px 12px;border-radius:14px;font-size:13.5px;white-space:pre-wrap;word-break:break-word;position:relative}
+  .me .bub{background:var(--out);border-bottom-right-radius:5px}
+  .bot .bub{background:var(--in);border-bottom-left-radius:5px}
+  .who{font-size:11px;color:var(--accent);margin:0 0 3px 2px;font-weight:600}
+  .tag{position:absolute;top:-9px;right:-7px;font-size:9.5px;font-weight:700;color:#0b1118;
+       padding:2px 7px;border-radius:999px}
+  .meta{font-size:10.5px;color:var(--muted);margin-top:3px}
+  code,.mono{font-family:"SF Mono",Menlo,Consolas,monospace}
+  .codeblk{background:#0c141d;border:1px solid #243240;border-radius:9px;padding:8px 10px;margin-top:6px;
+           font-size:12px;font-family:"SF Mono",Menlo,Consolas,monospace;white-space:pre;overflow:hidden;color:#cfe3ff}
+  .codeblk .fence{color:#5c7184}
+  .part{font-size:10px;color:var(--muted);margin-bottom:4px;letter-spacing:.04em}
+  .live{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--good);margin-left:6px;
+        box-shadow:0 0 0 0 rgba(57,217,138,.6);animation:pulse 1.6s infinite}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(57,217,138,.5)}70%{box-shadow:0 0 0 7px rgba(57,217,138,0)}100%{box-shadow:0 0 0 0 rgba(57,217,138,0)}}
+  .prog{display:flex;flex-direction:column;gap:3px}
+  .prog .ln{font-size:12.5px}
+  .prog .done{color:var(--good);font-weight:600}
+  .img{width:170px;height:104px;border-radius:11px;background:
+        repeating-linear-gradient(45deg,#243240,#243240 8px,#1d2935 8px,#1d2935 16px);
+       display:flex;align-items:flex-end;justify-content:flex-start;padding:7px;color:#aebccb;font-size:11px}
+  .file{display:flex;align-items:center;gap:10px;background:#0c141d;border:1px solid #243240;border-radius:10px;padding:9px 11px}
+  .file .ic{width:34px;height:34px;border-radius:8px;background:linear-gradient(135deg,#ff6b6b,#ffb02e);
+            display:flex;align-items:center;justify-content:center;font-size:16px}
+  .file .fn{font-size:12.5px;font-weight:600}
+  .file .fs{font-size:10.5px;color:var(--muted)}
+  .ann{font-size:11px;color:var(--muted);margin:2px 4px 0;border-left:2px solid #2a3947;padding-left:8px}
+
+  /* notes column */
+  .notes h2{font-size:14px;margin:2px 0 10px;color:var(--ink)}
+  .card{background:var(--panel);border:1px solid #243240;border-radius:13px;padding:13px 14px;margin-bottom:12px}
+  .card .hd{display:flex;align-items:center;gap:8px;font-size:13.5px;font-weight:700;margin-bottom:6px}
+  .card p{margin:0;font-size:12.5px;color:#c6d2dd}
+  .ba{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px;font-size:11.5px}
+  .ba .col{background:#0e1822;border:1px solid #243240;border-radius:9px;padding:8px}
+  .ba .h{font-size:10.5px;letter-spacing:.05em;text-transform:uppercase;margin-bottom:4px}
+  .ba .bad{color:#ff9a9a}.ba .gd{color:var(--good)}
+  .pill{font-size:10px;font-weight:700;padding:2px 7px;border-radius:999px;color:#0b1118}
+  .foot{margin-top:18px;font-size:11.5px;color:var(--muted);border-top:1px solid #243240;padding-top:12px}
+  .defer{color:var(--b3b);font-weight:700}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>v0.8.4 · IM 日常驱动「最后一公里」交互原型</h1>
+    <p>目标 UX：在 Telegram 里日常开发,体验逼近 Claude/Codex TUI。下方对话演示 4 个功能点;右侧为 before/after 与合理性结论。</p>
+  </header>
+
+  <div class="legend">
+    <span class="chip"><span class="dot" style="background:var(--b1)"></span>B1 进度可见</span>
+    <span class="chip"><span class="dot" style="background:var(--b2)"></span>B2 长消息分片</span>
+    <span class="chip"><span class="dot" style="background:var(--b3a)"></span>B3a 入站图文</span>
+    <span class="chip"><span class="dot" style="background:var(--b3b)"></span>B3b 出站文件 · <span class="defer">建议后置</span></span>
+  </div>
+
+  <div class="grid">
+    <!-- ============ CHAT ============ -->
+    <div class="phone">
+      <div class="tbar">
+        <div class="ava">cu</div>
+        <div><div class="nm">@curie · ccteam</div><div class="st">在 my-app · session s1 · 在线</div></div>
+      </div>
+      <div class="feed">
+
+        <!-- user ask -->
+        <div class="row me">
+          <div class="bub">@curie 修一下登录超时的 bug,顺便把 auth 的测试跑了</div>
+          <div class="meta">11:02</div>
+        </div>
+
+        <!-- B1: live-edited status -->
+        <div class="row bot">
+          <div class="who">curie</div>
+          <div class="bub" style="border:1px solid var(--b1)">
+            <span class="tag" style="background:var(--b1);color:#fff">B1</span>
+            <div class="prog">
+              <div class="ln">⏳ 正在处理…<span class="live"></span></div>
+              <div class="ln">🧠 定位到 src/auth.rs 的超时分支</div>
+              <div class="ln">🔧 Bash · <span class="mono">cargo test auth</span></div>
+              <div class="ln">✏️ 编辑 src/auth.rs（+6 −2）</div>
+              <div class="ln done">✅ 完成 · 3 工具 · 1 文件 · 42s</div>
+            </div>
+          </div>
+          <div class="ann">同一条消息**原地刷新**(节流~1.5s),不刷屏、不再干瞪眼;顺带吃掉旧的 "submitted s1 turn…" 机器味 ack。</div>
+        </div>
+
+        <!-- B2: chunked answer with code fence continuity -->
+        <div class="row bot">
+          <div class="who">curie</div>
+          <div class="bub" style="border:1px solid var(--b2)">
+            <span class="tag" style="background:var(--b2);color:#04201d">B2</span>
+            <div class="part">1 / 2</div>超时根因:连接池在重试路径上没归还连接。改动如下:
+            <div class="codeblk"><span class="fence">```diff</span>
+- let conn = pool.get().await?;
+- do_login(conn).await
++ let conn = pool.get().await?;
++ let r = do_login(&conn).await;
++ pool.put(conn);          // 归还
+<span class="fence">```</span> <span style="color:var(--muted)">（接下页）</span></div>
+          </div>
+          <div class="meta">11:03</div>
+        </div>
+        <div class="row bot">
+          <div class="bub" style="border:1px solid var(--b2)">
+            <div class="part">2 / 2</div>
+            <div class="codeblk"><span class="fence">```diff</span>
++ r
+<span class="fence">```</span></div>
+            测试已绿:<span class="mono">test auth::timeout ... ok</span>。建议再加一条并发回归用例。
+          </div>
+          <div class="ann">超过 4096(UTF-16 单元)**自动有序分片**;代码围栏跨片**各自闭合**;绝不再静默丢失。</div>
+        </div>
+
+        <!-- B3a: inbound image -->
+        <div class="row me">
+          <div class="bub" style="border:1px solid var(--b3a)">
+            <span class="tag" style="background:var(--b3a);color:#2a1c00">B3a</span>
+            <div class="img">📷 screenshot-error.png</div>
+            <div style="margin-top:7px">线上还在报这个,你看下</div>
+          </div>
+          <div class="meta">11:05</div>
+        </div>
+        <div class="ann" style="align-self:flex-end">图片+caption 入站 → daemon 落盘 → turn 注入本地路径,agent 用 Read 看图。</div>
+
+        <!-- bot reads it -->
+        <div class="row bot">
+          <div class="who">curie</div>
+          <div class="bub">看到了:截图里是连接池**耗尽**(上一处只修了归还,池上限仍偏小)。我把 max 从 8 调到 32,并生成了一张时序图。</div>
+        </div>
+
+        <!-- B3b: outbound file -->
+        <div class="row bot">
+          <div class="bub" style="border:1px dashed var(--b3b)">
+            <span class="tag" style="background:var(--b3b);color:#2a0000">B3b</span>
+            <div class="file">
+              <div class="ic">🖼️</div>
+              <div><div class="fn">auth-flow.png</div><div class="fs">218 KB · 由 chat_send_file 发送</div></div>
+            </div>
+          </div>
+          <div class="ann"><span class="defer">建议后置</span>:agent 用 <span class="mono">chat_send_file</span> 经 sendPhoto/sendDocument 回传(本版唯一带未解设计题的一项)。</div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- ============ NOTES ============ -->
+    <div class="notes">
+      <h2>before（今天） → after（v0.8.4）</h2>
+
+      <div class="card">
+        <div class="hd"><span class="dot" style="background:var(--b2)"></span>B2 长消息分片 <span class="pill" style="background:var(--good)">必做·无争议</span></div>
+        <p>correctness bug,不是体验问题。</p>
+        <div class="ba">
+          <div class="col"><div class="h bad">今天</div>>4096 → TG 拒收 → 只 warn-log → <b>你什么都收不到</b></div>
+          <div class="col"><div class="h gd">v0.8.4</div>有序分片 (i/N),代码块各片自闭合,零丢失</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="hd"><span class="dot" style="background:var(--b1)"></span>B1 进度可见 <span class="pill" style="background:var(--b1);color:#fff">合理·建议分级</span></div>
+        <p>治"多步骤 turn 的黑盒";治不了"单个长步骤内的静默"(粒度=步骤完成)。</p>
+        <div class="ba">
+          <div class="col"><div class="h bad">今天</div>整条 turn 一片静默,末尾才冒答案</div>
+          <div class="col"><div class="h gd">v0.8.4</div>一条 live-edit status 滚动显示工具/文件/思考</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="hd"><span class="dot" style="background:var(--b3a)"></span>B3a 入站图文 <span class="pill" style="background:var(--good)">高价值·保留</span></div>
+        <p>"贴报错截图"是真实高频需求,官方插件能、ccteam 不能=退步。</p>
+        <div class="ba">
+          <div class="col"><div class="h bad">今天</div>入站只读 text,图片/文件被丢</div>
+          <div class="col"><div class="h gd">v0.8.4</div>落盘+Read 路径,agent 能看图</div>
+        </div>
+      </div>
+
+      <div class="card" style="border-color:#5a2a2a">
+        <div class="hd"><span class="dot" style="background:var(--b3b)"></span>B3b 出站文件 <span class="pill" style="background:var(--b3b);color:#fff">合理性最弱·建议后置</span></div>
+        <p>频次低(文件多写进 repo 直接看)+ 最重 + 唯一带未解设计题(MCP socket 无 live channel 句柄)。建议本版砍掉,有拉力再做。</p>
+      </div>
+
+      <div class="foot">
+        <b>合理性结论</b>:推荐本版 = P0 分片 + P1 进度(可先极简) + P2a 入站图文 + 干掉 ack 噪声;<span class="defer">P2b 出站文件后置</span>。<br>
+        体量按 <b>minor(v0.9.0 强度)</b> 规划。修完这些是"去掉让它不可用的几件事",<b>≠ 已丝滑</b> —— 仍欠:HITL 审批 / 错误回显 / setup 一键化。详见 <span class="mono">review.md</span> 与 <span class="mono">prd.md</span>。
+      </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>
