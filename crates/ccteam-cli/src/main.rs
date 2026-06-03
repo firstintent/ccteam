@@ -31,7 +31,7 @@ use ccteam_core::CcteamPaths;
 use commands::{InitMode, InitOptions, OutputFormat};
 
 /// Version string shown by `ccteam --version`: the crate version plus the
-/// git commit it was built from (e.g. `0.8.3 (66737ca)`), so a running
+/// git commit it was built from (e.g. `0.8.4 (<commit>)`), so a running
 /// binary's exact build is identifiable. `CCTEAM_GIT_COMMIT` is set by
 /// `build.rs` (falls back to "unknown" when git isn't available at build).
 const VERSION: &str = concat!(

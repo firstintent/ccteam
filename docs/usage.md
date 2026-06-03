@@ -51,7 +51,7 @@ codex plugin marketplace add firstintent/ccteam
 ```
 
 ```bash
-# 体检 + MCP 表面自检(应显示 active 27 / stubs 0)
+# 体检 + MCP 表面自检(应显示 active 28 / stubs 0)
 ccteam doctor
 ccteam doctor --verify-mcp
 ```
@@ -180,6 +180,14 @@ ccteam start > /tmp/ccteam.log 2>&1 &
 > Claude session:任意 `/x` 都按字面发给 TUI。Codex session:仅 `/compact` `/review` 走 app-server RPC,其他 `/x` 会被当普通文本。
 > gateway 先回 `submitted <session> turn <id>`,随后把 assistant / error 事件经同一条 outbound ledger 发回 IM。
 
+**turn 进行中的进度**:turn 跑的时候会有一条活的 status 消息逐步编辑,折叠显示步骤(形如 `⏳ working… · 📖 read ×5 · 🔧 bash ×3`),结束收尾成 `✅ done · n tools · m files`;最终答案单独成一条新消息(会 ping)。想关掉只发答案:daemon 起前设 `CCTEAM_IM_PROGRESS=off`(编辑节流阈值 `CCTEAM_IM_PROGRESS_THROTTLE_MS`,默认 1500ms)。
+
+**长消息自动分片**:超过 Telegram 4096(UTF-16)上限的回答会被有序切成多条发出(代码块跨片自动闭合/重开),不再截断丢数据。
+
+**发图 / 发文件给 bot**:在 TG 直接发图片或文件 + caption(如「这是报错」)→ agent 会自动 `Read` 落盘的文件(报错截图、日志都行)。>20MB 拒收。
+
+**bot 发文件回来**:agent 调 MCP 工具 `chat_send_file(path, caption?, kind?)` 即可把文件/截图发回你绑定的 chat(零寻址参数,身份取 spawn 注入的 `CCTEAM_CHAT_{SLUG,ROLE}`)。配合 `screenshot`(返回 PNG 路径)即「发效果图」。
+
 给 bot 设定固定行为走官方机制(**不靠注入**):Claude 读项目根 `CLAUDE.md`(`init` 已生成),Codex 读项目根 `AGENTS.md`(需手建);全局指令放 `~/.claude/CLAUDE.md`。
 
 ```bash
@@ -223,7 +231,7 @@ Chat 面板走 `ccteam-chat.v1` WebSocket;Terminal 面板走既有 `ccteam-pty.v
 ccteam status                  # daemon 心跳 + 每个项目 OK/warn/STUCK + 活跃 session
 ccteam sessions                # 列活的网关 chat-mode session,并标出 orphan
 ccteam doctor                  # 安装 / 依赖体检
-ccteam doctor --verify-mcp     # MCP 表面验收(active 27 / stubs 0)
+ccteam doctor --verify-mcp     # MCP 表面验收(active 28 / stubs 0)
 ccteam stop                    # 优雅停 daemon(保留 tmux session)
 ```
 
