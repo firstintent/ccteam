@@ -113,4 +113,19 @@ pub trait Channel: Send + Sync {
     fn max_message_len(&self) -> Option<usize> {
         None
     }
+
+    /// Edit a previously-sent message in place (V0.8.4 P1 — live progress
+    /// status). Returns the platform message id (usually `message_id`
+    /// unchanged). The **default degrades gracefully** to appending a new
+    /// message via [`Channel::send`], so a channel without edit support
+    /// still shows progress (just as extra messages rather than one live
+    /// status). Telegram overrides with `editMessageText`.
+    async fn edit_message(
+        &self,
+        recipient: &str,
+        _message_id: &str,
+        content: &str,
+    ) -> anyhow::Result<Option<String>> {
+        self.send(&SendMessage::new(content, recipient)).await
+    }
 }

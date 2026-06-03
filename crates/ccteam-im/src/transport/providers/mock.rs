@@ -17,6 +17,10 @@ use crate::transport::{Channel, ChannelMessage, SendMessage};
 pub struct MockChannel {
     inbox: Arc<Mutex<Vec<ChannelMessage>>>,
     outbox: Arc<Mutex<Vec<SendMessage>>>,
+    /// Edits applied via [`Channel::edit_message`], as `(message_id,
+    /// content)` — lets a test prove a status message is *edited* in
+    /// place rather than re-sent (V0.8.4 P1).
+    edits: Arc<Mutex<Vec<(String, String)>>>,
     name: String,
     /// Optional per-message UTF-16 ceiling (default `None` = unlimited),
     /// so a test can exercise the daemon's split path without a real
@@ -35,6 +39,7 @@ impl MockChannel {
         Self {
             inbox: Arc::default(),
             outbox: Arc::default(),
+            edits: Arc::default(),
             name: "mock".to_string(),
             max_len: None,
             fail_if_contains: Arc::default(),
@@ -67,6 +72,12 @@ impl MockChannel {
     /// Snapshot of every outbound send so far.
     pub async fn outbox(&self) -> Vec<SendMessage> {
         self.outbox.lock().await.clone()
+    }
+
+    /// Snapshot of every `edit_message` call so far, as `(message_id,
+    /// content)`.
+    pub async fn edits(&self) -> Vec<(String, String)> {
+        self.edits.lock().await.clone()
     }
 }
 
@@ -102,6 +113,19 @@ impl Channel for MockChannel {
 
     fn max_message_len(&self) -> Option<usize> {
         self.max_len
+    }
+
+    async fn edit_message(
+        &self,
+        _recipient: &str,
+        message_id: &str,
+        content: &str,
+    ) -> anyhow::Result<Option<String>> {
+        self.edits
+            .lock()
+            .await
+            .push((message_id.to_string(), content.to_string()));
+        Ok(Some(message_id.to_string()))
     }
 }
 
