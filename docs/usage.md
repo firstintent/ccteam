@@ -186,7 +186,7 @@ ccteam start > /tmp/ccteam.log 2>&1 &
 
 **发图 / 发文件给 bot**:在 TG 直接发图片或文件 + caption(如「这是报错」)→ agent 会自动 `Read` 落盘的文件(报错截图、日志都行)。>20MB 拒收。
 
-**bot 发文件回来**:agent 调 MCP 工具 `chat_send_file(path, caption?, kind?)` 即可把文件/截图发回你绑定的 chat(零寻址参数,身份取 spawn 注入的 `CCTEAM_CHAT_{SLUG,ROLE}`)。配合 `screenshot`(返回 PNG 路径)即「发效果图」。
+**bot 发文件回来**:agent 调 MCP 工具 `chat_send_file(path, caption?, kind?)` 即可把文件/截图发回你绑定的 chat(零寻址参数,身份取 spawn 注入的 `CCTEAM_CHAT_{SLUG,ROLE}`;图 ≤10MB / 文件 ≤50MB,超限或不存在返回结构化 error)。配合 `screenshot`(返回 PNG 路径)即「发效果图」。
 
 给 bot 设定固定行为走官方机制(**不靠注入**):Claude 读项目根 `CLAUDE.md`(`init` 已生成),Codex 读项目根 `AGENTS.md`(需手建);全局指令放 `~/.claude/CLAUDE.md`。
 

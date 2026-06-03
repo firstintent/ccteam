@@ -2278,15 +2278,20 @@ fn run_chat_send_file(
     Ok(format!("delivered: queued to {dest}"))
 }
 
-/// Pure core of `run_chat_send_file`: parse args, validate the file,
-/// resolve the home chat from `bots`, and build the `GatewayEvent`. No
-/// I/O beyond the file-existence check, so it is unit-testable without a
-/// live registry or sink.
+/// Telegram bot-send ceilings: `sendPhoto` ≤ 10 MB, `sendDocument` ≤ 50 MB.
+const OUTBOUND_PHOTO_MAX_BYTES: u64 = 10 * 1024 * 1024;
+const OUTBOUND_DOCUMENT_MAX_BYTES: u64 = 50 * 1024 * 1024;
+
+/// Pure core of `run_chat_send_file`: parse args, validate the file
+/// (exists + within the send ceiling), resolve the home chat from
+/// `bots`, and build the `GatewayEvent`. Only I/O is the file
+/// stat, so it is unit-testable without a live registry or sink.
 fn build_send_file_event(
     args: &serde_json::Value,
     bots: &[ccteam_im::BotRegistration],
     seq: u64,
 ) -> std::result::Result<ccteam_im::gateway::GatewayEvent, String> {
+    use ccteam_im::transport::OutboundFileKind;
     let path = args
         .get("path")
         .and_then(|v| v.as_str())
@@ -2305,8 +2310,19 @@ fn build_send_file_event(
         .unwrap_or_default();
     let kind = parse_outbound_kind(args.get("kind").and_then(|v| v.as_str()), path);
 
-    if !std::path::Path::new(path).exists() {
-        return Err(format!("chat_send_file: file not found: {path}"));
+    let meta =
+        std::fs::metadata(path).map_err(|_| format!("chat_send_file: file not found: {path}"))?;
+    let max = match kind {
+        OutboundFileKind::Photo => OUTBOUND_PHOTO_MAX_BYTES,
+        OutboundFileKind::Document => OUTBOUND_DOCUMENT_MAX_BYTES,
+    };
+    if meta.len() > max {
+        return Err(format!(
+            "chat_send_file: file too large ({} MB) for {:?} (limit {} MB)",
+            meta.len() / (1024 * 1024),
+            kind,
+            max / (1024 * 1024),
+        ));
     }
     let (channel, chat_id) = ccteam_im::resolve_home_chat(slug, role, bots)
         .ok_or_else(|| format!("chat_send_file: no registered chat for {slug}/{role}"))?;
@@ -2993,5 +3009,19 @@ mod chat_send_file_tests {
         });
         let err = build_send_file_event(&args, &bots, 0).unwrap_err();
         assert!(err.contains("no registered chat"), "got: {err}");
+    }
+
+    #[test]
+    fn build_send_file_event_errors_on_oversized_photo() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = tmp.path().join("huge.png");
+        let f = std::fs::File::create(&file).unwrap();
+        f.set_len(11 * 1024 * 1024).unwrap(); // 11 MB (sparse) > 10 MB photo limit
+        let bots = vec![bot("dev-foo", "lead", "telegram", "chat-42")];
+        let args = serde_json::json!({
+            "path": file.to_string_lossy(), "slug": "dev-foo", "role": "lead",
+        });
+        let err = build_send_file_event(&args, &bots, 0).unwrap_err();
+        assert!(err.contains("too large"), "got: {err}");
     }
 }
