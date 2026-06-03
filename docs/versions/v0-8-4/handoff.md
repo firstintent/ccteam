@@ -2,7 +2,7 @@
 
 > 4 phase 各一段,固定五段式:**Decided / Rejected / Risks / Files / Remaining**。
 > 设计权威 = `prd.md`;协议细节以代码为准(`tech-design.md` §12 指针表已补)。
-> baseline 进程:1764/0(起点)→ P0 1772 → P1 1784 → P2a 1792 → P2b 1799,clippy 0 / fmt 干净 全程未退。
+> baseline 进程:1764/0(起点)→ P0 1772 → P1 1784 → P2a 1792 → P2b 1800,clippy 0 / fmt 干净 全程未退。
 
 ---
 

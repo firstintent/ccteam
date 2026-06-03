@@ -30,7 +30,7 @@ Code——ccteam 网关在多项目/多 session 路由 + 双 vendor + 成本预�
 ## baseline 进程
 
 `cargo test --workspace --locked --no-fail-fast --exclude ccteam-web`:
-1764/0 起点 → P0 1772 → P1 1784 → P2a 1792 → P2b 1799。
+1764/0 起点 → P0 1772 → P1 1784 → P2a 1792 → P2b 1800。
 clippy `-D warnings` 0、`cargo fmt --all -- --check` 干净,全程未退。
 
 ## 设计 / 验收

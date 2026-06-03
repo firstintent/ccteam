@@ -29,7 +29,7 @@
 | 项 | 值 |
 |---|---|
 | Workspace version | `0.8.4` |
-| 测试 baseline | `1799/0`(`cargo test --workspace --locked --no-fail-fast --exclude ccteam-web`;`ccteam-web` ws_* 测试留 CI/专机)|
+| 测试 baseline | `1800/0`(`cargo test --workspace --locked --no-fail-fast --exclude ccteam-web`;`ccteam-web` ws_* 测试留 CI/专机)|
 | Clippy | 0 errors + 0 warnings(`cargo clippy --workspace --all-targets -- -D warnings`)|
 | 当前在做 | **v0.8.4 已落地「IM 日常驱动·最后一公里」**(长消息分片 + 进度可见 + 入站图文 + 出站文件 `chat_send_file`;PRD/handoff 见 `docs/versions/v0-8-4/`) |
 
