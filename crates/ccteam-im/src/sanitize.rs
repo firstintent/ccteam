@@ -87,6 +87,186 @@ pub fn verify_pane_not_empty(pane_capture: &str) -> bool {
     !pane_capture.trim().is_empty()
 }
 
+// ---------------------------------------------------------------------
+// Outbound message splitting (V0.8.4 P0 / B2).
+//
+// Some channels cap a single message's length (Telegram: 4096 *UTF-16
+// code units*). The gateway is channel-neutral — it asks the channel
+// for its ceiling via `Channel::max_message_len()` and, if the content
+// overflows, calls [`split_for_channel`] to fan one logical reply into
+// ordered sub-messages. The 4096 constant lives only in `telegram.rs`;
+// this module knows nothing about any specific platform.
+// ---------------------------------------------------------------------
+
+/// UTF-16 code-unit length of `s`. Telegram's message ceiling is
+/// expressed in UTF-16 units (a supplementary-plane scalar such as an
+/// emoji is a surrogate pair = 2 units), so budgeting by `chars().count()`
+/// would under-count and still trip a 400 from the Bot API.
+fn utf16_len(s: &str) -> usize {
+    s.chars().map(char::len_utf16).sum()
+}
+
+/// Units reserved when a code fence straddles a split boundary, to hold
+/// the re-open (`` ```<info>\n ``) on the next part plus the close
+/// (`` \n``` ``) on this one. Comfortably covers info strings up to
+/// ~16 units (`typescript` = 10).
+const FENCE_REOPEN_MARGIN: usize = 24;
+
+/// Split `text` into ordered chunks, each within `max_units` UTF-16 code
+/// units, for channels that cap message length. Guarantees:
+///
+/// - **Lossless for plain text**: concatenating the parts reproduces the
+///   original verbatim (no characters dropped, no separators consumed)
+///   whenever no code fence crosses a boundary.
+/// - **Balanced fences**: a `` ``` `` block that crosses a split is
+///   closed at the end of one part and re-opened (preserving the
+///   language info string) at the start of the next, so every part is
+///   valid Markdown on its own.
+/// - **Sensible break points**: prefers a paragraph break (`\n\n`), then a
+///   line break (`\n`), then whitespace, then a hard character boundary,
+///   and never splits a multi-byte char.
+///
+/// `max_units == 0` is treated as `1` to guarantee forward progress.
+pub fn split_for_channel(text: &str, max_units: usize) -> Vec<String> {
+    let max_units = max_units.max(1);
+    if utf16_len(text) <= max_units {
+        return vec![text.to_string()];
+    }
+    let has_fence = text.contains("```");
+    let budget = if has_fence {
+        max_units.saturating_sub(FENCE_REOPEN_MARGIN).max(1)
+    } else {
+        max_units
+    };
+    let raw = raw_split(text, budget);
+    if has_fence {
+        balance_fences(raw)
+    } else {
+        raw
+    }
+}
+
+/// Greedy length-budgeted split that preserves every byte (no fence
+/// awareness). Each returned chunk is `<= budget` UTF-16 units except a
+/// pathological lone char wider than `budget`, which is emitted whole to
+/// guarantee progress.
+fn raw_split(text: &str, budget: usize) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        if utf16_len(rest) <= budget {
+            parts.push(rest.to_string());
+            break;
+        }
+        let cut = pick_cut(rest, budget);
+        parts.push(rest[..cut].to_string());
+        rest = &rest[cut..];
+    }
+    parts
+}
+
+/// Byte index (always on a char boundary, always `> 0`) at which to cut
+/// `s` so the left part fits `budget` UTF-16 units, preferring the
+/// latest paragraph > line > whitespace boundary in the *second half* of
+/// the budget window (so we neither make tiny parts nor overflow).
+fn pick_cut(s: &str, budget: usize) -> usize {
+    let min_fill = budget / 2;
+    let mut units = 0usize;
+    let mut hard_cut = 0usize;
+    let mut first_char_end = 0usize;
+    let mut last_para = 0usize;
+    let mut last_line = 0usize;
+    let mut last_ws = 0usize;
+    for (i, ch) in s.char_indices() {
+        let end = i + ch.len_utf8();
+        if first_char_end == 0 {
+            first_char_end = end;
+        }
+        let w = ch.len_utf16();
+        if units + w > budget {
+            break;
+        }
+        units += w;
+        hard_cut = end;
+        if units >= min_fill {
+            if ch == '\n' {
+                last_line = end;
+                if s[..end].ends_with("\n\n") {
+                    last_para = end;
+                }
+            } else if ch.is_whitespace() {
+                last_ws = end;
+            }
+        }
+    }
+    let cut = if last_para > 0 {
+        last_para
+    } else if last_line > 0 {
+        last_line
+    } else if last_ws > 0 {
+        last_ws
+    } else {
+        hard_cut
+    };
+    // `cut == 0` only when even the first char exceeds `budget`; take it
+    // whole so we always advance.
+    if cut == 0 {
+        first_char_end
+    } else {
+        cut
+    }
+}
+
+/// Walk `parts` left-to-right; whenever a part ends inside an open code
+/// fence, append a closing `` ``` `` and re-open the fence (with its
+/// language info) at the head of the next part.
+fn balance_fences(parts: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(parts.len());
+    let mut carry: Option<String> = None;
+    for part in parts {
+        let mut s = String::new();
+        if let Some(info) = &carry {
+            s.push_str("```");
+            s.push_str(info);
+            s.push('\n');
+        }
+        s.push_str(&part);
+        let (open, info) = fence_state(&s);
+        if open {
+            if !s.ends_with('\n') {
+                s.push('\n');
+            }
+            s.push_str("```");
+            carry = Some(info);
+        } else {
+            carry = None;
+        }
+        out.push(s);
+    }
+    out
+}
+
+/// Whether `s` ends inside an open ```` ``` ```` fence, and (when open)
+/// the language info string of that fence. Only lines whose first
+/// non-whitespace run is ```` ``` ```` count as fence markers (standard
+/// Markdown), so inline back-ticks are ignored.
+fn fence_state(s: &str) -> (bool, String) {
+    let mut open = false;
+    let mut info = String::new();
+    for line in s.lines() {
+        if let Some(rest) = line.trim_start().strip_prefix("```") {
+            if open {
+                open = false;
+                info.clear();
+            } else {
+                open = true;
+                info = rest.trim().to_string();
+            }
+        }
+    }
+    (open, info)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,5 +343,99 @@ mod tests {
         assert!(!verify_pane_not_empty(""));
         assert!(!verify_pane_not_empty("   \n\t  "));
         assert!(verify_pane_not_empty("$ ccteam start"));
+    }
+
+    // ----- split_for_channel (V0.8.4 P0) ----------------------------
+
+    #[test]
+    fn split_fits_returns_single_part() {
+        let parts = split_for_channel("short message", 4096);
+        assert_eq!(parts, vec!["short message".to_string()]);
+    }
+
+    #[test]
+    fn split_plain_text_concat_equals_original() {
+        let original = "lorem ipsum dolor sit amet ".repeat(400); // ~10_800 chars
+        let parts = split_for_channel(&original, 1000);
+        assert!(
+            parts.len() >= 2,
+            "long text must split (got {})",
+            parts.len()
+        );
+        // Lossless: parts concatenate back to the verbatim original.
+        assert_eq!(parts.concat(), original);
+        // Every part is within budget (UTF-16 units).
+        for p in &parts {
+            assert!(
+                p.chars().map(char::len_utf16).sum::<usize>() <= 1000,
+                "part over budget: {:?}",
+                p
+            );
+        }
+    }
+
+    #[test]
+    fn split_budgets_by_utf16_not_char_count() {
+        // 3000 emoji: char count = 3000 (< 4096) but UTF-16 units =
+        // 6000 (> 4096). Must still split, or Telegram returns 400.
+        let original = "😀".repeat(3000);
+        assert!(original.chars().count() < 4096);
+        assert!(original.chars().map(char::len_utf16).sum::<usize>() > 4096);
+        let parts = split_for_channel(&original, 4096);
+        assert!(
+            parts.len() >= 2,
+            "emoji-heavy text must split by UTF-16 budget"
+        );
+        for p in &parts {
+            assert!(p.chars().map(char::len_utf16).sum::<usize>() <= 4096);
+        }
+        assert_eq!(parts.concat(), original);
+    }
+
+    #[test]
+    fn split_prefers_paragraph_over_line_break() {
+        // \n\n at unit 20 (past min_fill=15), a lone \n later at unit 25.
+        let text = format!(
+            "{}\n\n{}\n{}",
+            "x".repeat(18),
+            "y".repeat(4),
+            "z".repeat(60)
+        );
+        let parts = split_for_channel(&text, 30);
+        // First part should end at the paragraph boundary, not the later
+        // single newline nor a hard char cut.
+        assert!(
+            parts[0].ends_with("\n\n"),
+            "expected paragraph-boundary cut, got {:?}",
+            parts[0]
+        );
+        assert_eq!(parts.concat(), text);
+    }
+
+    #[test]
+    fn split_reopens_and_closes_code_fence() {
+        // A rust fence whose body overflows the budget.
+        let body = "let x = 1;\n".repeat(60);
+        let text = format!("intro line\n```rust\n{body}```\ntrailer");
+        let parts = split_for_channel(&text, 120);
+        assert!(parts.len() >= 2);
+        for p in &parts {
+            // Balanced: an even number of fence markers per part.
+            let fences = p
+                .lines()
+                .filter(|l| l.trim_start().starts_with("```"))
+                .count();
+            assert_eq!(fences % 2, 0, "unbalanced fence in part: {:?}", p);
+        }
+        // The language info survives on at least one re-open.
+        assert!(parts.iter().any(|p| p.contains("```rust")));
+    }
+
+    #[test]
+    fn split_makes_progress_on_tiny_budget() {
+        // Pathological: each emoji is 2 UTF-16 units, budget 1.
+        let parts = split_for_channel("😀😀😀", 1);
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts.concat(), "😀😀😀");
     }
 }

@@ -546,7 +546,72 @@ async fn send_gateway_outbound(
     channel: &(dyn Channel + Send + Sync),
     message: SendMessage,
 ) {
-    let id = format!("{inbound_id}-{seq}");
+    // Channel-neutral splitting (V0.8.4 P0 / B2): when the channel
+    // declares a per-message ceiling and the content overflows it, fan
+    // one logical reply into ordered sub-messages. `None` (most channels,
+    // incl. web `WsChannel`) keeps today's single-send path verbatim — no
+    // `4096`/`"telegram"` branch lives here.
+    let parts = match channel.max_message_len() {
+        Some(limit) => crate::sanitize::split_for_channel(&message.content, limit),
+        None => vec![message.content.clone()],
+    };
+
+    if parts.len() <= 1 {
+        // Unchanged single-message path: id = `{inbound_id}-{seq}`.
+        let id = format!("{inbound_id}-{seq}");
+        queue_and_send_durable_part(id, inbound_id, channel_name, channel, message).await;
+        return;
+    }
+
+    // Multi-part: each part is its own durable row, id =
+    // `{inbound_id}-{seq}-{part}`, sent in order (same logical message ⇒
+    // serial). The ledger keeps one Queued+Sent/Failed pair per part.
+    let total = parts.len();
+    let mut failed_parts: Vec<usize> = Vec::new();
+    for (part_idx, part) in parts.into_iter().enumerate() {
+        let id = format!("{inbound_id}-{seq}-{part_idx}");
+        let mut part_msg = message.clone();
+        part_msg.content = part;
+        let sent =
+            queue_and_send_durable_part(id, inbound_id, channel_name, channel, part_msg).await;
+        if !sent {
+            failed_parts.push(part_idx + 1); // 1-based for the user notice
+        }
+    }
+
+    // Failure visible: a partial split (some parts delivered, some not) is
+    // confusing silence today — surface one line back to the chat. Sent
+    // directly (not split / not laddered through the ledger) since it is a
+    // best-effort UX notice.
+    if !failed_parts.is_empty() {
+        let body = if failed_parts.len() == 1 {
+            format!("⚠️ 部分消息发送失败 (part {}/{total})", failed_parts[0])
+        } else {
+            format!("⚠️ 部分消息发送失败 ({}/{total} parts)", failed_parts.len())
+        };
+        let notice =
+            SendMessage::new(body, message.recipient.clone()).in_thread(message.thread_ts.clone());
+        if let Err(err) = channel.send(&notice).await {
+            tracing::warn!(
+                inbound_id,
+                channel = %channel_name,
+                error = %err,
+                "ccteam-im: failed to deliver split-failure notice"
+            );
+        }
+    }
+}
+
+/// Queue a single durable outbound row, then attempt delivery. Returns
+/// `true` when the send succeeded. Shared by the single- and multi-part
+/// branches of [`send_gateway_outbound`].
+async fn queue_and_send_durable_part(
+    id: String,
+    inbound_id: &str,
+    channel_name: &str,
+    channel: &(dyn Channel + Send + Sync),
+    message: SendMessage,
+) -> bool {
     append_durable_outbound(DurableOutboundRow {
         ts_ms: now_unix_ms_u64(),
         id: id.clone(),
@@ -557,16 +622,18 @@ async fn send_gateway_outbound(
         platform_message_id: None,
         error: None,
     });
-    finish_durable_outbound_send(id, inbound_id, channel_name, channel, message).await;
+    finish_durable_outbound_send(id, inbound_id, channel_name, channel, message).await
 }
 
+/// Send a single already-queued durable row and append its terminal
+/// (`Sent`/`Failed`) ledger entry. Returns `true` on success.
 async fn finish_durable_outbound_send(
     id: String,
     inbound_id: &str,
     channel_name: &str,
     channel: &(dyn Channel + Send + Sync),
     message: SendMessage,
-) {
+) -> bool {
     match channel.send(&message).await {
         Ok(platform_message_id) => {
             append_durable_outbound(DurableOutboundRow {
@@ -579,6 +646,7 @@ async fn finish_durable_outbound_send(
                 platform_message_id,
                 error: None,
             });
+            true
         }
         Err(err) => {
             append_durable_outbound(DurableOutboundRow {
@@ -597,6 +665,7 @@ async fn finish_durable_outbound_send(
                 error = %err,
                 "ccteam-im: gateway outbound send failed"
             );
+            false
         }
     }
 }

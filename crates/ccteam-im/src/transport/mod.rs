@@ -102,4 +102,15 @@ pub trait Channel: Send + Sync {
     async fn health_check(&self) -> bool {
         true
     }
+
+    /// Per-message length ceiling, in **UTF-16 code units**, or `None`
+    /// for no limit. When `Some(limit)`, the daemon splits an overflowing
+    /// outbound reply into ordered sub-messages via
+    /// [`crate::sanitize::split_for_channel`] before sending. The actual
+    /// constant lives in the provider (e.g. Telegram's 4096) so the
+    /// gateway/daemon stay channel-neutral — no `4096` or `"telegram"`
+    /// branch leaks up. Default `None` = single send, today's behavior.
+    fn max_message_len(&self) -> Option<usize> {
+        None
+    }
 }
