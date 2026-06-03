@@ -218,6 +218,7 @@ async fn run_scripted(script: Vec<ThreadEvent>) -> Arc<MockChannel> {
         adapter_factory: Some(adapter_factory),
         channels_override: Some(channels),
         extra_channels: None,
+        ..Default::default()
     };
     run_daemon_with_shutdown(args, async {
         futures::future::pending::<()>().await;

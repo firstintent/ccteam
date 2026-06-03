@@ -69,7 +69,9 @@ pub fn default_adapter_factory() -> AdapterFactory {
 }
 
 /// CLI arguments forwarded from `main.rs`.
-#[derive(Clone, Default)]
+///
+/// Not `Clone` — it owns a one-shot `gateway_event_rx` (V0.8.4 P2b).
+#[derive(Default)]
 pub struct DaemonArgs {
     /// Override credentials path (`None` → default).
     pub credentials: Option<PathBuf>,
@@ -93,6 +95,14 @@ pub struct DaemonArgs {
     /// uses this to add the browser web-chat transport while preserving
     /// credential-driven IM channels.
     pub extra_channels: Option<ChannelMap>,
+    /// V0.8.4 P2b — externally-created gateway-event channel. When both
+    /// halves are `Some`, the daemon uses them instead of creating its
+    /// own, so `ccteam start` can clone the sender into the `mcp.sock`
+    /// handler (`chat_send_file` reuses the same outbound funnel). `None`
+    /// (standalone `ccteam-im run`) → the daemon makes its own channel.
+    pub gateway_event_tx: Option<tokio::sync::mpsc::UnboundedSender<GatewayEvent>>,
+    /// Receiver half paired with [`Self::gateway_event_tx`].
+    pub gateway_event_rx: Option<tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>>,
 }
 
 impl std::fmt::Debug for DaemonArgs {
@@ -110,6 +120,8 @@ impl std::fmt::Debug for DaemonArgs {
                 "extra_channels",
                 &self.extra_channels.as_ref().map(|m| m.len()),
             )
+            .field("gateway_event_tx", &self.gateway_event_tx.is_some())
+            .field("gateway_event_rx", &self.gateway_event_rx.is_some())
             .finish()
     }
 }
@@ -123,7 +135,7 @@ impl std::fmt::Debug for DaemonArgs {
 /// merged `ccteam start` daemon (which folds IMD as one tokio task
 /// alongside orchestrator + web, all sharing a single
 /// `tokio::sync::watch` shutdown channel).
-pub async fn run_daemon_with_shutdown<F>(args: DaemonArgs, shutdown: F) -> Result<()>
+pub async fn run_daemon_with_shutdown<F>(mut args: DaemonArgs, shutdown: F) -> Result<()>
 where
     F: Future<Output = ()> + Send + 'static,
 {
@@ -187,8 +199,14 @@ where
         build_gateway(factory.clone(), &projects_root, &config_projects, &initial);
     gateway_inner.resume_restored_sessions().await;
     log_orphan_chat_sessions(&gateway_inner).await;
+    // V0.8.4 P2b — use the externally-supplied channel when `ccteam start`
+    // provided one (so the mcp.sock handler shares this sender); else make
+    // our own (standalone `ccteam-im run`).
     let (gateway_event_tx, gateway_event_rx) =
-        tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        match (args.gateway_event_tx.take(), args.gateway_event_rx.take()) {
+            (Some(tx), Some(rx)) => (tx, rx),
+            _ => tokio::sync::mpsc::unbounded_channel::<GatewayEvent>(),
+        };
     gateway_inner.set_event_sink(gateway_event_tx);
     let gateway = Arc::new(Mutex::new(gateway_inner));
 
@@ -528,7 +546,9 @@ fn spawn_gateway_event_consumer(
             };
             match evt.kind {
                 GatewayEventKind::Answer => {
-                    let out = SendMessage::new(evt.content, evt.chat_id).in_thread(evt.thread_ts);
+                    let out = SendMessage::new(evt.content, evt.chat_id)
+                        .in_thread(evt.thread_ts)
+                        .with_attachments(evt.attachments);
                     send_gateway_outbound(&evt.id, 0, &evt.channel, channel.as_ref(), out).await;
                 }
                 GatewayEventKind::Progress { status_key, done } => {
@@ -644,9 +664,13 @@ async fn send_gateway_outbound(
     // one logical reply into ordered sub-messages. `None` (most channels,
     // incl. web `WsChannel`) keeps today's single-send path verbatim — no
     // `4096`/`"telegram"` branch lives here.
+    // Attachment-bearing messages never split — the files + caption are
+    // one logical send (splitting would duplicate the files across parts).
     let parts = match channel.max_message_len() {
-        Some(limit) => crate::sanitize::split_for_channel(&message.content, limit),
-        None => vec![message.content.clone()],
+        Some(limit) if message.attachments.is_empty() => {
+            crate::sanitize::split_for_channel(&message.content, limit)
+        }
+        _ => vec![message.content.clone()],
     };
 
     if parts.len() <= 1 {
@@ -1100,6 +1124,7 @@ mod tests {
             adapter_factory: None,
             channels_override: None,
             extra_channels: None,
+            ..Default::default()
         };
         run_daemon(args).await.unwrap();
         restore_env("CCTEAM_HOME", old_ccteam_home);

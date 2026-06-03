@@ -36,7 +36,7 @@ dirs.workspace = true
 notify.workspace = true
 regex.workspace = true
 # HTTP client for Telegram getUpdates + Slack chat.postMessage + Discord REST.
-reqwest = { workspace = true, features = ["json"] }
+reqwest = { workspace = true, features = ["json", "multipart"] }
 # UNIX-only signalling for graceful supervisor SIGTERM (libc::kill).
 libc = "0.2"
 # Lightweight WebSocket Channel used for local/browser IM e2e validation.

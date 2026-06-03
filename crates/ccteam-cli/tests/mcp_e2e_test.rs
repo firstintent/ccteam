@@ -145,8 +145,8 @@ fn mcp_serve_tools_list_returns_full_tool_set() {
     let tools = resp["result"]["tools"].as_array().unwrap();
     assert_eq!(
         tools.len(),
-        27,
-        "M2.5 9 + V0.2.2 F38 screenshot + V0.4.0 F65 7-tool workflow surface + V0.6.0 Wave 1 (5 chat + 2 advise stubs) + V0.6.1 F128 (2 admin mutators) + V0.6.5 F146 (chat -1/+2 net +1)"
+        28,
+        "M2.5 9 + V0.2.2 F38 screenshot + V0.4.0 F65 7-tool workflow surface + V0.6.0 Wave 1 (5 chat + 2 advise stubs) + V0.6.1 F128 (2 admin mutators) + V0.6.5 F146 (chat -1/+2 net +1) + V0.8.4 P2b chat_send_file"
     );
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     for required in [

@@ -1929,12 +1929,28 @@ fn run_start(
             }))
         };
 
+        // V0.8.4 P2b — shared gateway-event channel: the IM daemon
+        // consumes it; the mcp.sock handler clones the sender so
+        // `chat_send_file` reuses the same outbound funnel. Only created
+        // when IM is enabled (no consumer ⇒ nothing to deliver to).
+        let (gw_event_tx, gw_event_rx) = if imd.disabled {
+            (None, None)
+        } else {
+            let (t, r) =
+                tokio::sync::mpsc::unbounded_channel::<ccteam_im::gateway::GatewayEvent>();
+            (Some(t), Some(r))
+        };
+
         let imd_handle = if imd.disabled {
             tracing::info!("ccteam start: --no-imd set; IM gateway task skipped");
             None
         } else {
             let mut rx = shutdown_rx.clone();
-            let mut args = ccteam_im::DaemonArgs::default();
+            let mut args = ccteam_im::DaemonArgs {
+                gateway_event_tx: gw_event_tx.clone(),
+                gateway_event_rx: gw_event_rx,
+                ..Default::default()
+            };
             if let Some(bridge) = web_chat_bridge.as_ref() {
                 let mut channels = ccteam_im::daemon::ChannelMap::new();
                 channels.insert("web".to_string(), bridge.channel.clone());
@@ -1949,8 +1965,9 @@ fn run_start(
         };
 
         let mut rx = shutdown_rx.clone();
+        let mcp_sink = gw_event_tx.clone();
         let mcp_handle = tokio::spawn(async move {
-            serve_mcp_socket(paths, async move {
+            serve_mcp_socket(paths, mcp_sink, async move {
                 let _ = rx.changed().await;
             })
             .await
@@ -2106,7 +2123,11 @@ fn run_start(
 }
 
 #[cfg(unix)]
-async fn serve_mcp_socket<F>(paths: CcteamPaths, shutdown: F) -> Result<()>
+async fn serve_mcp_socket<F>(
+    paths: CcteamPaths,
+    sink: Option<GatewayEventSink>,
+    shutdown: F,
+) -> Result<()>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
@@ -2131,8 +2152,9 @@ where
                 let (stream, _addr) = accepted
                     .with_context(|| format!("accept MCP socket {}", socket.display()))?;
                 let paths = paths.clone();
+                let sink = sink.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = handle_mcp_socket_connection(paths, stream).await {
+                    if let Err(err) = handle_mcp_socket_connection(paths, sink, stream).await {
                         tracing::warn!(error = %err, "MCP socket connection failed");
                     }
                 });
@@ -2142,7 +2164,11 @@ where
 }
 
 #[cfg(not(unix))]
-async fn serve_mcp_socket<F>(_paths: CcteamPaths, shutdown: F) -> Result<()>
+async fn serve_mcp_socket<F>(
+    _paths: CcteamPaths,
+    _sink: Option<GatewayEventSink>,
+    shutdown: F,
+) -> Result<()>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
@@ -2153,6 +2179,7 @@ where
 #[cfg(unix)]
 async fn handle_mcp_socket_connection(
     paths: CcteamPaths,
+    sink: Option<GatewayEventSink>,
     stream: tokio::net::UnixStream,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
@@ -2177,7 +2204,16 @@ async fn handle_mcp_socket_connection(
                 continue;
             }
         };
-        if let Some(response) = mcp_serve::handle_request(&paths, &req).await {
+        // V0.8.4 P2b — intercept the live `chat_send_file` tool here (we
+        // own the gateway-event sink); everything else routes to the
+        // stateless handler. Intercepting BEFORE handle_request keeps it
+        // from looping back into the stdio forward branch.
+        let response = if is_chat_send_file_call(&req) {
+            Some(execute_chat_send_file(&req, sink.as_ref()).await)
+        } else {
+            mcp_serve::handle_request(&paths, &req).await
+        };
+        if let Some(response) = response {
             let mut out = serde_json::to_string(&response)?;
             out.push('\n');
             writer.write_all(out.as_bytes()).await?;
@@ -2185,6 +2221,129 @@ async fn handle_mcp_socket_connection(
         }
     }
     Ok(())
+}
+
+/// V0.8.4 P2b — sender half of the gateway-event channel that the IM
+/// daemon consumes; `chat_send_file` clones it to reuse that outbound
+/// funnel (P0 split + durable ledger + failure echo).
+type GatewayEventSink = tokio::sync::mpsc::UnboundedSender<ccteam_im::gateway::GatewayEvent>;
+
+/// Monotonic id source so each `chat_send_file` gets a distinct durable
+/// ledger row (avoids `{id}-0` collisions in `outbound.jsonl`).
+static CHAT_SEND_FILE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn is_chat_send_file_call(req: &serde_json::Value) -> bool {
+    req.get("method").and_then(|m| m.as_str()) == Some("tools/call")
+        && req.pointer("/params/name").and_then(|n| n.as_str()) == Some("ccteam__chat_send_file")
+}
+
+/// Resolve addressing, validate the file, and enqueue a `GatewayEvent`
+/// onto the shared sink (the IM consumer does the actual `sendPhoto` /
+/// `sendDocument`). Returns a tools/call-shaped JSON-RPC response.
+async fn execute_chat_send_file(
+    req: &serde_json::Value,
+    sink: Option<&GatewayEventSink>,
+) -> serde_json::Value {
+    let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
+    let args = req
+        .pointer("/params/arguments")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let (text, is_error) = match run_chat_send_file(&args, sink) {
+        Ok(text) => (text, false),
+        Err(text) => (text, true),
+    };
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "content": [{ "type": "text", "text": text }],
+            "isError": is_error,
+        },
+    })
+}
+
+fn run_chat_send_file(
+    args: &serde_json::Value,
+    sink: Option<&GatewayEventSink>,
+) -> std::result::Result<String, String> {
+    let sink = sink.ok_or_else(|| "chat_send_file: IM gateway not running".to_string())?;
+    let bots =
+        ccteam_im::list_bots().map_err(|e| format!("chat_send_file: registry error: {e}"))?;
+    let seq = CHAT_SEND_FILE_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let event = build_send_file_event(args, &bots, seq)?;
+    let dest = format!("{}/{}", event.channel, event.chat_id);
+    sink.send(event)
+        .map_err(|_| "chat_send_file: gateway sink closed".to_string())?;
+    Ok(format!("delivered: queued to {dest}"))
+}
+
+/// Pure core of `run_chat_send_file`: parse args, validate the file,
+/// resolve the home chat from `bots`, and build the `GatewayEvent`. No
+/// I/O beyond the file-existence check, so it is unit-testable without a
+/// live registry or sink.
+fn build_send_file_event(
+    args: &serde_json::Value,
+    bots: &[ccteam_im::BotRegistration],
+    seq: u64,
+) -> std::result::Result<ccteam_im::gateway::GatewayEvent, String> {
+    let path = args
+        .get("path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "chat_send_file: missing `path`".to_string())?;
+    let caption = args
+        .get("caption")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let slug = args
+        .get("slug")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let role = args
+        .get("role")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let kind = parse_outbound_kind(args.get("kind").and_then(|v| v.as_str()), path);
+
+    if !std::path::Path::new(path).exists() {
+        return Err(format!("chat_send_file: file not found: {path}"));
+    }
+    let (channel, chat_id) = ccteam_im::resolve_home_chat(slug, role, bots)
+        .ok_or_else(|| format!("chat_send_file: no registered chat for {slug}/{role}"))?;
+    Ok(ccteam_im::gateway::GatewayEvent {
+        id: format!("chat-send-file-{slug}-{role}-{seq}"),
+        channel,
+        chat_id,
+        thread_ts: None,
+        content: String::new(),
+        kind: ccteam_im::gateway::GatewayEventKind::Answer,
+        attachments: vec![ccteam_im::transport::OutboundFile {
+            path: path.to_string(),
+            caption,
+            kind,
+        }],
+    })
+}
+
+/// `kind` arg → [`OutboundFileKind`], inferring photo from common image
+/// extensions when omitted.
+fn parse_outbound_kind(kind: Option<&str>, path: &str) -> ccteam_im::transport::OutboundFileKind {
+    use ccteam_im::transport::OutboundFileKind;
+    match kind {
+        Some("photo") => OutboundFileKind::Photo,
+        Some("document") => OutboundFileKind::Document,
+        _ => {
+            let lower = path.to_lowercase();
+            let is_image = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"]
+                .iter()
+                .any(|ext| lower.ends_with(ext));
+            if is_image {
+                OutboundFileKind::Photo
+            } else {
+                OutboundFileKind::Document
+            }
+        }
+    }
 }
 
 async fn wait_for_shutdown_signal() {
@@ -2750,4 +2909,89 @@ fn init_tracing_stderr() {
         )
         .with_writer(std::io::stderr)
         .try_init();
+}
+
+#[cfg(test)]
+mod chat_send_file_tests {
+    use super::*;
+    use ccteam_im::transport::OutboundFileKind;
+
+    fn bot(slug: &str, role: &str, platform: &str, chat: &str) -> ccteam_im::BotRegistration {
+        ccteam_im::BotRegistration {
+            workflow_slug: slug.into(),
+            role: role.into(),
+            vendor: ccteam_harness::AgentVendor::Claude,
+            persona_id: None,
+            im_platform: platform.into(),
+            im_chat_id: chat.into(),
+            chat_handle: None,
+            project_dir: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn parse_outbound_kind_infers_photo_from_extension() {
+        assert_eq!(
+            parse_outbound_kind(None, "/x/shot.PNG"),
+            OutboundFileKind::Photo
+        );
+        assert_eq!(
+            parse_outbound_kind(None, "/x/a.jpeg"),
+            OutboundFileKind::Photo
+        );
+        assert_eq!(
+            parse_outbound_kind(None, "/x/report.pdf"),
+            OutboundFileKind::Document
+        );
+        // Explicit kind overrides the extension.
+        assert_eq!(
+            parse_outbound_kind(Some("document"), "/x/shot.png"),
+            OutboundFileKind::Document
+        );
+    }
+
+    #[test]
+    fn build_send_file_event_resolves_home_chat_and_attaches() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = tmp.path().join("shot.png");
+        std::fs::write(&file, b"png").unwrap();
+        let bots = vec![bot("dev-foo", "lead", "telegram", "chat-42")];
+        let args = serde_json::json!({
+            "path": file.to_string_lossy(),
+            "caption": "the chart",
+            "slug": "dev-foo",
+            "role": "lead",
+        });
+        let evt = build_send_file_event(&args, &bots, 7).unwrap();
+        assert_eq!(evt.channel, "telegram");
+        assert_eq!(evt.chat_id, "chat-42");
+        assert_eq!(evt.attachments.len(), 1);
+        assert_eq!(evt.attachments[0].kind, OutboundFileKind::Photo);
+        assert_eq!(evt.attachments[0].caption.as_deref(), Some("the chart"));
+        assert!(evt.id.ends_with("-7"));
+    }
+
+    #[test]
+    fn build_send_file_event_errors_on_missing_file() {
+        let bots = vec![bot("dev-foo", "lead", "telegram", "chat-42")];
+        let args = serde_json::json!({
+            "path": "/nope/does-not-exist.png", "slug": "dev-foo", "role": "lead",
+        });
+        let err = build_send_file_event(&args, &bots, 0).unwrap_err();
+        assert!(err.contains("file not found"), "got: {err}");
+    }
+
+    #[test]
+    fn build_send_file_event_errors_on_unregistered_chat() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = tmp.path().join("x.txt");
+        std::fs::write(&file, b"hi").unwrap();
+        let bots = vec![bot("dev-foo", "lead", "telegram", "chat-42")];
+        let args = serde_json::json!({
+            "path": file.to_string_lossy(), "slug": "dev-foo", "role": "ghost",
+        });
+        let err = build_send_file_event(&args, &bots, 0).unwrap_err();
+        assert!(err.contains("no registered chat"), "got: {err}");
+    }
 }

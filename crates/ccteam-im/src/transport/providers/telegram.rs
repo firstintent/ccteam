@@ -16,8 +16,13 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
+use anyhow::Context as _;
+
 use crate::latency::now_unix_ms;
-use crate::transport::{AttachmentKind, Channel, ChannelAttachment, ChannelMessage, SendMessage};
+use crate::transport::{
+    AttachmentKind, Channel, ChannelAttachment, ChannelMessage, OutboundFile, OutboundFileKind,
+    SendMessage,
+};
 
 /// `getUpdates` long-poll seconds.
 const POLL_TIMEOUT_SECS: u64 = 25;
@@ -135,6 +140,83 @@ impl TelegramChannel {
             mime: pending.mime.clone(),
             size: Some(bytes.len() as u64),
         }))
+    }
+
+    /// Send each outbound file as `sendPhoto`/`sendDocument`; the caption
+    /// rides the first attachment (preferring its own caption, else the
+    /// message text). Returns the first attachment's message id.
+    async fn send_with_attachments(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+        let mut first_id = None;
+        for (i, att) in message.attachments.iter().enumerate() {
+            let caption = att.caption.clone().or_else(|| {
+                if i == 0 && !message.content.is_empty() {
+                    Some(message.content.clone())
+                } else {
+                    None
+                }
+            });
+            let id = self
+                .send_one_attachment(
+                    &message.recipient,
+                    att,
+                    caption.as_deref(),
+                    message.thread_ts.as_deref(),
+                )
+                .await?;
+            if first_id.is_none() {
+                first_id = id;
+            }
+        }
+        Ok(first_id)
+    }
+
+    async fn send_one_attachment(
+        &self,
+        recipient: &str,
+        att: &OutboundFile,
+        caption: Option<&str>,
+        reply_to: Option<&str>,
+    ) -> anyhow::Result<Option<String>> {
+        let (method, field) = match att.kind {
+            OutboundFileKind::Photo => ("sendPhoto", "photo"),
+            OutboundFileKind::Document => ("sendDocument", "document"),
+        };
+        let bytes = tokio::fs::read(&att.path)
+            .await
+            .with_context(|| format!("read outbound file {}", att.path))?;
+        let file_name = std::path::Path::new(&att.path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+        let mut form = reqwest::multipart::Form::new()
+            .text("chat_id", recipient.to_string())
+            .part(
+                field,
+                reqwest::multipart::Part::bytes(bytes).file_name(file_name),
+            );
+        if let Some(cap) = caption {
+            form = form.text("caption", cap.to_string());
+        }
+        if let Some(rt) = reply_to.and_then(|s| s.parse::<i64>().ok()) {
+            form = form.text("reply_to_message_id", rt.to_string());
+        }
+        let url = self.api_url(method);
+        let resp = self.http.post(&url).multipart(form).send().await?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("telegram {method} {recipient} → {status}: {text}");
+        }
+        let id = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| {
+                v.get("result")
+                    .and_then(|r| r.get("message_id"))
+                    .and_then(|n| n.as_i64())
+            })
+            .map(|n| n.to_string());
+        Ok(id)
     }
 }
 
@@ -280,6 +362,11 @@ impl Channel for TelegramChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+        // V0.8.4 P2b — files go via sendPhoto/sendDocument (multipart);
+        // the caption rides the first attachment.
+        if !message.attachments.is_empty() {
+            return self.send_with_attachments(message).await;
+        }
         let url = self.api_url("sendMessage");
         let body = serde_json::json!({
             "chat_id": message.recipient,

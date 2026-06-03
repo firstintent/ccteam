@@ -33,6 +33,7 @@ async fn daemon_runs_until_max_runtime() {
         adapter_factory: None,
         channels_override: None,
         extra_channels: None,
+        ..Default::default()
     };
     run_daemon(args).await.unwrap();
 }

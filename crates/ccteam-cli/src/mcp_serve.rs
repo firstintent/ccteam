@@ -519,6 +519,13 @@ async fn call_tool(paths: &CcteamPaths, params: &Value) -> Result<Vec<Value>> {
             Ok(text_content(tool_inject_decision(paths, &args)?))
         }
         "ccteam__screenshot" => Ok(text_content(tool_screenshot(paths, &args)?)),
+        // V0.8.4 P2b — `chat_send_file` is a LIVE tool: it needs the
+        // daemon's gateway-event sink (which this stdio process doesn't
+        // have). Forward it over the existing `mcp.sock` to the daemon,
+        // injecting the agent's ambient identity. (The daemon-side socket
+        // handler intercepts it before `handle_request`, so it never loops
+        // back into this branch.)
+        "ccteam__chat_send_file" => forward_chat_send_file(paths, &args).await,
         // V0.4.0 F65 — route the 7 workflow tools through the
         // dedicated dispatcher. Mutating tools (spawn / stop / signal /
         // set_parallelism / trigger_gate) gate on a reachable gateway
@@ -566,6 +573,73 @@ async fn call_tool(paths: &CcteamPaths, params: &Value) -> Result<Vec<Value>> {
             Err(anyhow!("unknown tool: {other}"))
         }
     }
+}
+
+/// V0.8.4 P2b — forward a `chat_send_file` call to the daemon's
+/// `mcp.sock`. The agent's identity is ambient (`CCTEAM_CHAT_SLUG` /
+/// `CCTEAM_CHAT_ROLE`, injected at spawn); we inject it into the args so
+/// the daemon can resolve the home chat. Returns a structured (non-fatal)
+/// error content if we're not in a chat session or the daemon is down.
+async fn forward_chat_send_file(paths: &CcteamPaths, args: &Value) -> Result<Vec<Value>> {
+    let slug = std::env::var("CCTEAM_CHAT_SLUG").unwrap_or_default();
+    let role = std::env::var("CCTEAM_CHAT_ROLE").unwrap_or_default();
+    if slug.is_empty() || role.is_empty() {
+        return Ok(text_content(
+            "chat_send_file: not in a ccteam chat session (CCTEAM_CHAT_SLUG/ROLE unset)"
+                .to_string(),
+        ));
+    }
+    let mut fwd_args = args.clone();
+    if let Some(obj) = fwd_args.as_object_mut() {
+        obj.insert("slug".to_string(), json!(slug));
+        obj.insert("role".to_string(), json!(role));
+    }
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": { "name": "ccteam__chat_send_file", "arguments": fwd_args },
+    });
+    let socket = ccteam_core::daemon_socket_path(paths);
+    match forward_to_socket(&socket, &req).await {
+        Ok(resp) => {
+            let text = resp
+                .pointer("/result/content/0/text")
+                .and_then(|t| t.as_str())
+                .unwrap_or("chat_send_file: delivered")
+                .to_string();
+            Ok(text_content(text))
+        }
+        Err(err) => Ok(text_content(format!(
+            "chat_send_file failed: daemon mcp.sock unreachable ({err})"
+        ))),
+    }
+}
+
+/// Open a one-shot connection to the daemon `mcp.sock`, send one
+/// JSON-RPC line, and read one response line back.
+#[cfg(unix)]
+async fn forward_to_socket(socket: &std::path::Path, req: &Value) -> Result<Value> {
+    use tokio::io::AsyncWriteExt as _;
+    let stream = tokio::net::UnixStream::connect(socket)
+        .await
+        .with_context(|| format!("connect {}", socket.display()))?;
+    let (reader, mut writer) = stream.into_split();
+    let mut line = serde_json::to_string(req)?;
+    line.push('\n');
+    writer.write_all(line.as_bytes()).await?;
+    writer.flush().await?;
+    let mut lines = BufReader::new(reader).lines();
+    let resp = lines
+        .next_line()
+        .await?
+        .ok_or_else(|| anyhow!("mcp.sock closed before responding"))?;
+    Ok(serde_json::from_str(&resp)?)
+}
+
+#[cfg(not(unix))]
+async fn forward_to_socket(_socket: &std::path::Path, _req: &Value) -> Result<Value> {
+    Err(anyhow!("mcp.sock forwarding is unix-only"))
 }
 
 /// Fail-loud gate for action tools that need a reachable gateway daemon.
@@ -938,8 +1012,9 @@ mod tests {
         // adds 2 admin mutators (`change_persona` + `add_tool`) → 26.
         // V0.6.5 F146 chat group net +1 (removed `chat_lifecycle`,
         // added `chat_register_bot` + `chat_unregister_bot`) → 27.
+        // V0.8.4 P2b adds `chat_send_file` → 28.
         // Bump this when a new tool lands.
-        assert_eq!(tool_definitions().len(), 27);
+        assert_eq!(tool_definitions().len(), 28);
     }
 
     #[test]
@@ -948,7 +1023,7 @@ mod tests {
         let mut names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), 27, "tool names must be unique");
+        assert_eq!(names.len(), 28, "tool names must be unique");
         for tool in &tools {
             assert!(tool["name"].as_str().unwrap().starts_with("ccteam__"));
             assert_eq!(tool["inputSchema"]["type"], "object");
@@ -1062,6 +1137,48 @@ mod tests {
         assert!(instructions.contains("<channel"));
     }
 
+    /// V0.8.4 P2b — the stdio→daemon bridge: `forward_to_socket` writes one
+    /// JSON-RPC line to a unix socket and reads one line back.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn forward_to_socket_round_trips_one_line() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let socket = tmp.path().join("mcp.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut lines = tokio::io::BufReader::new(reader).lines();
+            // Confirm the forwarded request shape, then canned-respond.
+            let req_line = lines.next_line().await.unwrap().unwrap();
+            let req: Value = serde_json::from_str(&req_line).unwrap();
+            assert_eq!(req["params"]["name"], "ccteam__chat_send_file");
+            let resp = json!({
+                "jsonrpc": "2.0", "id": 1,
+                "result": { "content": [{"type":"text","text":"delivered: queued"}], "isError": false }
+            });
+            let mut line = serde_json::to_string(&resp).unwrap();
+            line.push('\n');
+            writer.write_all(line.as_bytes()).await.unwrap();
+            writer.flush().await.unwrap();
+        });
+
+        let req = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "ccteam__chat_send_file", "arguments": { "path": "/x.png" } }
+        });
+        let resp = forward_to_socket(&socket, &req).await.unwrap();
+        assert_eq!(
+            resp.pointer("/result/content/0/text")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "delivered: queued"
+        );
+        server.await.unwrap();
+    }
+
     #[tokio::test]
     async fn handle_tools_list_returns_full_tool_set() {
         // M2.5: 9 tools. V0.2.2 F38: +1 (`ccteam__screenshot`) → 10.
@@ -1083,9 +1200,10 @@ mod tests {
         });
         let resp = handle_request(&paths, &req).await.unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 27);
+        assert_eq!(tools.len(), 28);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"ccteam__screenshot"));
+        assert!(names.contains(&"ccteam__chat_send_file"));
         // V0.4.0 F65 — spot-check one of the new tools is in the list.
         assert!(names.contains(&"ccteam__workflow_spawn_agent"));
         assert!(names.contains(&"ccteam__workflow_get_artifact_summary"));
