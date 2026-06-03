@@ -960,8 +960,16 @@ impl Gateway {
         .map_err(|_| anyhow!("submit timed out after {submit_wait:?} for {session_id}"))??;
         let mut replies = Vec::new();
         if let Some(tx) = self.event_sink.clone() {
+            // V0.8.4 P1 (F1) — production (async pump) path: the pump owns
+            // delivery. Its first progress event (the `⏳ working…` seed)
+            // is the "accepted" signal and the answer arrives as its own
+            // message, so a turn is 2 IM messages (seed + answer), not 3.
+            // Returning empty here drops the machine-ish "submitted … turn
+            // …" ack — the very noise P1 set out to fold away.
             spawn_turn_timeout_watchdog(tx, session, start_visible_events, &turn_id.0);
         } else {
+            // No sink (pure in-process tests): drain the first answer
+            // synchronously, falling back to the submit ack.
             let mut events = session.adapter.events(&session.thread);
             let wait = gateway_reply_wait_duration();
             while let Ok(Some(evt)) = tokio::time::timeout(wait, events.next()).await {
@@ -970,9 +978,9 @@ impl Gateway {
                     break;
                 }
             }
-        }
-        if replies.is_empty() {
-            replies.push(format!("submitted {session_id} turn {}", turn_id.0));
+            if replies.is_empty() {
+                replies.push(format!("submitted {session_id} turn {}", turn_id.0));
+            }
         }
         Ok(replies)
     }

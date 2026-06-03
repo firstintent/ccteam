@@ -602,18 +602,31 @@ async fn forward_chat_send_file(paths: &CcteamPaths, args: &Value) -> Result<Vec
     });
     let socket = ccteam_core::daemon_socket_path(paths);
     match forward_to_socket(&socket, &req).await {
-        Ok(resp) => {
-            let text = resp
-                .pointer("/result/content/0/text")
-                .and_then(|t| t.as_str())
-                .unwrap_or("chat_send_file: delivered")
-                .to_string();
-            Ok(text_content(text))
-        }
+        Ok(resp) => forward_outcome(&resp),
         Err(err) => Ok(text_content(format!(
             "chat_send_file failed: daemon mcp.sock unreachable ({err})"
         ))),
     }
+}
+
+/// V0.8.4 P2b (F2): map the daemon's tools/call response into the stdio
+/// tool result, **propagating `isError`** so a synchronous failure
+/// (missing / oversized / unregistered) surfaces to the agent as a tool
+/// error rather than a success carrying error text.
+fn forward_outcome(resp: &Value) -> Result<Vec<Value>> {
+    let text = resp
+        .pointer("/result/content/0/text")
+        .and_then(|t| t.as_str())
+        .unwrap_or("chat_send_file: delivered")
+        .to_string();
+    if resp
+        .pointer("/result/isError")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return Err(anyhow!(text));
+    }
+    Ok(text_content(text))
 }
 
 /// Open a one-shot connection to the daemon `mcp.sock`, send one
@@ -1177,6 +1190,19 @@ mod tests {
             "delivered: queued"
         );
         server.await.unwrap();
+    }
+
+    /// V0.8.4 P2b (F2): the daemon's `isError:true` must propagate to a
+    /// tool error (not a success carrying error text).
+    #[test]
+    fn forward_outcome_propagates_is_error() {
+        let ok =
+            json!({"result": {"content": [{"type":"text","text":"delivered"}], "isError": false}});
+        assert!(forward_outcome(&ok).is_ok());
+
+        let err = json!({"result": {"content": [{"type":"text","text":"chat_send_file: file not found: /x"}], "isError": true}});
+        let e = forward_outcome(&err).unwrap_err();
+        assert!(e.to_string().contains("file not found"), "got: {e}");
     }
 
     #[tokio::test]

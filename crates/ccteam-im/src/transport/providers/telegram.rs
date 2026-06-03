@@ -196,7 +196,10 @@ impl TelegramChannel {
                 reqwest::multipart::Part::bytes(bytes).file_name(file_name),
             );
         if let Some(cap) = caption {
-            form = form.text("caption", cap.to_string());
+            // V0.8.4 P2b (F7): caption ceiling (1024) ≠ message ceiling
+            // (4096), and attachment messages skip the splitter — truncate
+            // here so an over-long caption can't trip a 400.
+            form = form.text("caption", truncate_caption(cap));
         }
         if let Some(rt) = reply_to.and_then(|s| s.parse::<i64>().ok()) {
             form = form.text("reply_to_message_id", rt.to_string());
@@ -331,11 +334,13 @@ fn pick_attachment(m: &TgMessage) -> Option<PendingDownload> {
 
 /// Pure: strip path separators / control chars and cap length so a
 /// platform-supplied name can't traverse out of the staging dir.
+/// Also drops `" < >` (V0.8.4 P2a / F4) so the name can't break the
+/// `<channel image_path="…">` turn-text attribute (or inject into it).
 fn sanitize_attachment_name(name: &str) -> String {
     let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
     let cleaned: String = base
         .chars()
-        .filter(|c| !c.is_control() && *c != '/' && *c != '\\')
+        .filter(|c| !c.is_control() && !matches!(c, '/' | '\\' | '"' | '<' | '>'))
         .take(128)
         .collect();
     let trimmed = cleaned.trim();
@@ -344,6 +349,27 @@ fn sanitize_attachment_name(name: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+/// Telegram caption ceiling, in UTF-16 code units (separate from the
+/// 4096 message ceiling). Attachment messages skip the outbound
+/// splitter, so an over-long caption is truncated here (V0.8.4 P2b / F7).
+const MAX_CAPTION_UTF16: usize = 1024;
+
+/// Truncate `s` to at most [`MAX_CAPTION_UTF16`] UTF-16 code units (never
+/// splitting a char), so an over-long attachment caption can't trip a 400.
+fn truncate_caption(s: &str) -> String {
+    let mut units = 0usize;
+    let mut out = String::new();
+    for ch in s.chars() {
+        let w = ch.len_utf16();
+        if units + w > MAX_CAPTION_UTF16 {
+            break;
+        }
+        units += w;
+        out.push(ch);
+    }
+    out
 }
 
 /// Staging dir for downloaded inbound attachments (channel-scoped — the
@@ -480,33 +506,41 @@ impl Channel for TelegramChannel {
                     let tg_date_ms = (m.date.max(0) as u128).saturating_mul(1000);
                     let tg_age_ms = recv_ms.saturating_sub(tg_date_ms);
                     // V0.8.4 P2a — caption is the text for media messages.
-                    let mut content = m
+                    let content = m
                         .text
                         .clone()
                         .or_else(|| m.caption.clone())
                         .unwrap_or_default();
                     let mut attachments = Vec::new();
+                    let mut rejected_notice: Option<String> = None;
                     if let Some(pending) = pick_attachment(&m) {
                         match self.stage_attachment(&cid, &pending).await {
                             Ok(Some(att)) => attachments.push(att),
                             Ok(None) => {
-                                let note =
-                                    format!("[附件 {} 超过 20MB 上限,已拒收]", pending.file_name);
-                                content = if content.is_empty() {
-                                    note
-                                } else {
-                                    format!("{content}\n{note}")
-                                };
+                                rejected_notice = Some(format!(
+                                    "⚠️ 附件 {} 超过 20MB 上限,已拒收",
+                                    pending.file_name
+                                ));
                             }
                             Err(err) => {
                                 tracing::warn!(cid = %cid, error = %err, "telegram: attachment download failed");
-                                let note = format!("[附件 {} 下载失败]", pending.file_name);
-                                content = if content.is_empty() {
-                                    note
-                                } else {
-                                    format!("{content}\n{note}")
-                                };
+                                rejected_notice =
+                                    Some(format!("⚠️ 附件 {} 下载失败", pending.file_name));
                             }
+                        }
+                    }
+                    // V0.8.4 P2a (F3): deliver a rejection DIRECTLY to the
+                    // chat (like the P0 split-failure notice), not as a
+                    // turn-text note the agent must relay. With no
+                    // accompanying text there is no turn to submit.
+                    if let Some(notice) = rejected_notice {
+                        if let Err(err) =
+                            self.send(&SendMessage::new(notice, chat_id.clone())).await
+                        {
+                            tracing::warn!(cid = %cid, error = %err, "telegram: rejection notice send failed");
+                        }
+                        if content.is_empty() {
+                            continue;
                         }
                     }
                     let content_len = content.len();
@@ -657,5 +691,23 @@ mod tests {
         assert_eq!(sanitize_attachment_name("ok\u{0000}name.txt"), "okname.txt");
         assert_eq!(sanitize_attachment_name(""), "file");
         assert_eq!(sanitize_attachment_name("   "), "file");
+        // F4 — quotes/angle brackets would break the `image_path="…"` attr.
+        assert_eq!(sanitize_attachment_name("foo\"bar.pdf"), "foobar.pdf");
+        assert_eq!(sanitize_attachment_name("a<b>c.png"), "abc.png");
+    }
+
+    #[test]
+    fn truncate_caption_caps_utf16_units() {
+        // F7 — short captions pass through untouched.
+        assert_eq!(truncate_caption("hi"), "hi");
+        // Over-long captions are capped to the 1024-unit ceiling.
+        let long = "x".repeat(2000);
+        let out = truncate_caption(&long);
+        assert_eq!(out.chars().map(char::len_utf16).sum::<usize>(), 1024);
+        // Emoji (2 units each) never split mid-char.
+        let emoji = "😀".repeat(1000); // 2000 UTF-16 units
+        let out = truncate_caption(&emoji);
+        assert!(out.chars().map(char::len_utf16).sum::<usize>() <= 1024);
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
     }
 }

@@ -621,18 +621,12 @@ mod tests {
             item.session.as_deref() == Some("s2") && item.vendor.as_deref() == Some("codex")
         }));
 
+        // V0.8.4 P1 (F1): the "submitted … turn …" ack is folded away — only
+        // the answer is delivered.
         send_text(&mut socket, "codex-compact", "@api /compact").await;
-        recv_replies_containing_all(
-            &mut socket,
-            &["submitted s2 turn", "Codex echo: directive:compact"],
-        )
-        .await;
+        recv_replies_containing_all(&mut socket, &["Codex echo: directive:compact"]).await;
         send_text(&mut socket, "claude-review", "@reviewer /review").await;
-        recv_replies_containing_all(
-            &mut socket,
-            &["submitted s1 turn", "Claude echo: directive:review"],
-        )
-        .await;
+        recv_replies_containing_all(&mut socket, &["Claude echo: directive:review"]).await;
         drop(socket);
         stop_stack(first).await;
 
@@ -644,11 +638,7 @@ mod tests {
         let sessions = recv_sessions(&mut socket).await;
         assert_eq!(sessions.len(), 2);
         send_text(&mut socket, "after-restart", "@api after restart").await;
-        recv_replies_containing_all(
-            &mut socket,
-            &["submitted s2 turn", "Codex echo: after restart"],
-        )
-        .await;
+        recv_replies_containing_all(&mut socket, &["Codex echo: after restart"]).await;
         drop(socket);
         stop_stack(second).await;
 

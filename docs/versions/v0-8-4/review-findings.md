@@ -44,3 +44,18 @@
 
 ## 验收结论
 功能完整、gate 全绿、设计红线全守。**修掉 F1(必)+ F2/F3/F4(应)即可收敛发布**;F5–F9 可随后或并入。
+
+---
+
+## 修复状态(dev session,collapsed)
+
+> gate(实测):`cargo test --workspace --exclude ccteam-web` = **1802/0**;`cargo clippy --workspace --all-targets -- -D warnings` = 0;`fmt --check` 干净。
+
+- ✅ **F1**(必)— `submit_to_current` 在 `event_sink.is_some()` 时返回空 replies(ack fallback 挪回同步分支)。reconcile 了 `inbound_wiring_test.rs`(routing/timeout/WS routes/WS restart/real-ws probe)与 `web_chat_bridge.rs` 三处断言「ack 被投递」的老测试。spam 测试加「无 `submitted` 前缀 + outbox.len()==3(created+seed+answer)」断言钉死回归。
+- ✅ **F2**(应)— `forward_chat_send_file` 提取 `forward_outcome`,`isError:true` → `Err` 透传(agent 收到 tool error)。新单测 `forward_outcome_propagates_is_error`。
+- ✅ **F3**(应)— 入站超大/失败附件改 `self.send(notice)` **直发 chat**(对齐 P0 split-failure);无 caption 时 `continue` 不产空 turn。(I/O 路径,随真 bot smoke 验。)
+- ✅ **F4**(应)— `sanitize_attachment_name` 一并 strip `" < >`;测试覆盖 `foo"bar.pdf`→`foobar.pdf`、`a<b>c.png`→`abc.png`。
+- ✅ **F7**(NIT,顺手)— 出站 caption `truncate_caption` 截到 1024 UTF-16 单元(附件不分片,caption 上限≠4096),防 400;新单测。
+- ⏸ **F5**(NIT)— 跳过:Codex `CommandExecution`/`FileChange` 的 **parsing** 已有测试(`codex_exec.rs` / `codex_app_server.rs`);仅 events()-级钉死缺,真 nit,可随后补。
+- ⏸ **F6**(NIT)— 跳过:reviewer 自评「非本版回归」(单条文本答案同行为)。
+- ⏸ **F8/F9**(文档)— F8 双重余量纯注记;F9「真读图属人工 smoke」`handoff.md` 已注。

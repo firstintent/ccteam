@@ -261,6 +261,19 @@ async fn progress_edits_one_status_message_not_spam() {
         outbox.iter().any(|c| c == "done"),
         "answer not delivered as a new message: {outbox:?}"
     );
+    // V0.8.4 P1 (F1): the machine-ish "submitted … turn …" ack must be
+    // folded away — the turn yields exactly 2 NEW messages (status seed +
+    // answer) on top of the one-off `/new` reply; everything else is an
+    // edit. (Counting only `is_status` before missed the ack regression.)
+    assert!(
+        !outbox.iter().any(|c| c.starts_with("submitted")),
+        "submit ack must be folded away, got: {outbox:?}"
+    );
+    assert_eq!(
+        outbox.len(),
+        3,
+        "expected `created` + status seed + answer (no ack), got: {outbox:?}"
+    );
     // The status was edited (≥1 edit), and finalized to a ✅ summary.
     assert!(!edits.is_empty(), "status message was never edited");
     assert!(

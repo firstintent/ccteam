@@ -464,16 +464,25 @@ async fn daemon_routes_gateway_inbound_to_submit_turn_and_outbound() {
     for content in contents {
         *content_counts.entry(content).or_default() += 1;
     }
-    assert_eq!(content_counts.len(), 3);
+    // V0.8.4 P1 (F1): the "submitted … turn …" ack is folded away on the
+    // async-pump path — a turn delivers only `created session` (the /new
+    // command reply) + the answer. GatewayAdapter emits no tool events, so
+    // there is no progress seed either.
+    assert_eq!(content_counts.len(), 2, "got {content_counts:?}");
     assert_eq!(content_counts.get("created session s1"), Some(&1));
+    assert_eq!(content_counts.get("gateway echo: hello gateway"), Some(&1));
     assert_eq!(
         content_counts.get("submitted s1 turn gateway-turn"),
-        Some(&1)
+        None,
+        "machine-ish ack must be folded away"
     );
-    assert_eq!(content_counts.get("gateway echo: hello gateway"), Some(&1));
 
     let rows = read_durable_outbound_rows();
-    assert_eq!(rows.len(), 6, "queued+sent rows per outbound message");
+    assert_eq!(
+        rows.len(),
+        4,
+        "queued+sent rows per outbound message (no ack)"
+    );
     let mut state_counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut rows_by_id: BTreeMap<String, Vec<(usize, String, String)>> = BTreeMap::new();
     for (idx, row) in rows.iter().enumerate() {
@@ -486,9 +495,9 @@ async fn daemon_routes_gateway_inbound_to_submit_turn_and_outbound() {
             .or_default()
             .push((idx, state, content));
     }
-    assert_eq!(state_counts.get("queued"), Some(&3));
-    assert_eq!(state_counts.get("sent"), Some(&3));
-    assert_eq!(rows_by_id.len(), 3, "one outbound id per message");
+    assert_eq!(state_counts.get("queued"), Some(&2));
+    assert_eq!(state_counts.get("sent"), Some(&2));
+    assert_eq!(rows_by_id.len(), 2, "one outbound id per message");
     for (id, entries) in &rows_by_id {
         assert_eq!(entries.len(), 2, "outbound id {id} must have queued+sent");
         let queued = entries
@@ -939,14 +948,14 @@ async fn daemon_surfaces_turn_timeout_to_im_and_ledger() {
         .into_iter()
         .map(|message| message.content)
         .collect();
-    assert_eq!(contents.len(), 3, "created + ack + timeout");
+    // V0.8.4 P1 (F1): no folded "submitted … turn …" ack → created + timeout.
+    assert_eq!(contents.len(), 2, "created + timeout (ack folded away)");
     assert_eq!(contents[0], "created session s1");
-    assert_eq!(contents[1], "submitted s1 turn failing-stub-turn");
     assert!(
-        contents[2]
+        contents[1]
             .starts_with("gateway error: turn timed out after 50ms for s1 turn failing-stub-turn"),
         "unexpected timeout content: {:?}",
-        contents[2]
+        contents[1]
     );
     assert_eq!(adapter.starts.load(Ordering::SeqCst), 1);
     assert_eq!(adapter.submits.load(Ordering::SeqCst), 1);
@@ -1028,8 +1037,8 @@ async fn daemon_routes_ws_channel_to_gateway_over_real_socket() {
         ))
         .await
         .unwrap();
-    let ack = recv_ws_send(&mut socket).await;
-    assert_eq!(ack.content, "submitted s1 turn gateway-turn");
+    // V0.8.4 P1 (F1): no "submitted … turn …" ack — the answer is the
+    // next (and only) send.
     let reply = recv_ws_send(&mut socket).await;
     assert_eq!(reply.content, "gateway echo: hello over ws");
     assert_eq!(adapter.starts.load(Ordering::SeqCst), 1);
@@ -1060,10 +1069,7 @@ async fn daemon_restart_preserves_ws_gateway_session() {
         "created session s1"
     );
     send_ws_text(&mut first_socket, "ws-r1-msg", "before restart").await;
-    assert_eq!(
-        recv_ws_send(&mut first_socket).await.content,
-        "submitted s1 turn gateway-turn"
-    );
+    // V0.8.4 P1 (F1): ack folded away — the answer is the only send.
     assert_eq!(
         recv_ws_send(&mut first_socket).await.content,
         "gateway echo: before restart"
@@ -1078,10 +1084,7 @@ async fn daemon_restart_preserves_ws_gateway_session() {
         spawn_ws_gateway_daemon(projects_root, second_ws, Arc::clone(&adapter));
     let mut second_socket = connect_ws_with_retry(&ws_url).await;
     send_ws_text(&mut second_socket, "ws-r2-msg", "after restart").await;
-    assert_eq!(
-        recv_ws_send(&mut second_socket).await.content,
-        "submitted s1 turn gateway-turn"
-    );
+    // V0.8.4 P1 (F1): ack folded away — the answer is the only send.
     assert_eq!(
         recv_ws_send(&mut second_socket).await.content,
         "gateway echo: after restart"
@@ -1118,9 +1121,7 @@ async fn daemon_restart_preserves_ws_gateway_session() {
         sent_contents,
         vec![
             "created session s1".to_string(),
-            "submitted s1 turn gateway-turn".to_string(),
             "gateway echo: before restart".to_string(),
-            "submitted s1 turn gateway-turn".to_string(),
             "gateway echo: after restart".to_string()
         ]
     );
@@ -1267,9 +1268,13 @@ async fn real_ws_dual_harness_smoke() {
         "Claude tmux session should remain live after /new: {claude_tmux_session}"
     );
     send_ws_text(&mut socket, "real-ws-codex-compact", "@api /compact").await;
+    // V0.8.4 P1 (F1): the "submitted … turn …" ack is folded away — the
+    // first send is now a progress seed / output, so this (real-bot) probe
+    // only asserts the turn did not error out. The NL round-trips below use
+    // `recv_ws_until_contains`, which is robust to the leading seed.
     let codex = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10)).await;
     assert!(
-        codex.content.starts_with("submitted s1 turn "),
+        !codex.content.starts_with("gateway error"),
         "Codex /compact should reach app-server RPC, got {:?}",
         codex.content
     );
@@ -1288,7 +1293,7 @@ async fn real_ws_dual_harness_smoke() {
             .await;
             let codex_ack = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10)).await;
             assert!(
-                codex_ack.content.starts_with("submitted s1 turn "),
+                !codex_ack.content.starts_with("gateway error"),
                 "Codex NL prompt should be submitted, got {:?}",
                 codex_ack.content
             );
@@ -1305,7 +1310,7 @@ async fn real_ws_dual_harness_smoke() {
             .await;
             let claude_ack = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10)).await;
             assert!(
-                claude_ack.content.starts_with("submitted s2 turn "),
+                !claude_ack.content.starts_with("gateway error"),
                 "Claude NL prompt should be submitted, got {:?}",
                 claude_ack.content
             );
@@ -1347,7 +1352,7 @@ async fn real_ws_dual_harness_smoke() {
         .await;
         let codex_ack = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10)).await;
         assert!(
-            codex_ack.content.starts_with("submitted s1 turn "),
+            !codex_ack.content.starts_with("gateway error"),
             "Codex after restart should reuse s1, got {:?}",
             codex_ack.content
         );
@@ -1366,7 +1371,7 @@ async fn real_ws_dual_harness_smoke() {
         .await;
         let claude_ack = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10)).await;
         assert!(
-            claude_ack.content.starts_with("submitted s2 turn "),
+            !claude_ack.content.starts_with("gateway error"),
             "Claude after restart should reuse s2, got {:?}",
             claude_ack.content
         );
@@ -1437,7 +1442,7 @@ async fn real_ws_dual_harness_smoke() {
     send_ws_text(&mut socket, "real-ws-claude-clear", "@reviewer /clear").await;
     let claude = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10)).await;
     assert!(
-        claude.content.starts_with("submitted s2 turn "),
+        !claude.content.starts_with("gateway error"),
         "Claude /clear should reach tmux send-keys, got {:?}",
         claude.content
     );
