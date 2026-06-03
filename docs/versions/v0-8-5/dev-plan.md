@@ -36,7 +36,7 @@ D3 ChoicePrompt 传输 ─┘                       └─ (drift 快照测试)
 
 落点:
 - `ccteam-harness`:trait `handle_directive`(无 default)+ 中立类型 `Directive`/`DirectiveOutcome`/`ChoicePrompt`/`ChoiceOption`/`ChoiceSelection`(与 `ThreadEvent`/`ApprovalIR` 同层)。
-- `ccteam-im/transport`:`SendMessage.options: Vec<ChoiceOption>`(`#[serde(default)]`)+ 各 provider 渲染骨架:Telegram inline keyboard **+ `callback_query` 入站新路径** / web chat WS chips / 兜底纯文本编号 / mock。
+- `ccteam-im/transport`:`SendMessage.options: Vec<MessageOption>`(transport 本地 opaque 类型 `{data:"{token}:{idx}", label}`,**非** harness `ChoiceOption` 直入 —— 修订见 arch-refactor §4-4;`#[serde(default)]`)+ `ChannelMessage.selection` 入站归一 + 各 provider 渲染骨架:Telegram inline keyboard **+ `callback_query` 入站新路径** / 兜底纯文本编号 / mock。**web 是平行 plumbing 四件**(WebSendMessage+options / WebChannelMessage+selection / web_chat_bridge 双向映射含 attachments 既有 bug 修复 / chat_protocol chips 帧),不随 transport 自动获得(arch-refactor §2.2)。
 - `ccteam-im/gateway`:slash 文本→`Directive`→`handle_directive`→outcome 渲染;**pending-picker**(keyed by chat+session,TTL,单飞)+ 选择重入;数字短回复 / 完整 arg 形态归一为 `ChoiceSelection`。删 `turn_input_for_session` vendor 分支 + `compact|review` allowlist + `TurnInput::SystemDirective`(全量 grep caller 迁移,不留 alias)。gateway 自有命令集不变。
 - `FakeAdapter` 补 `handle_directive`;`codex_exec.rs`(bg)`handle_directive` 全拒。
 
