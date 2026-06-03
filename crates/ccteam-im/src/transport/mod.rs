@@ -21,6 +21,40 @@ use serde::{Deserialize, Serialize};
 
 pub mod providers;
 
+/// Kind of an inbound [`ChannelAttachment`] (V0.8.4 P2a).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentKind {
+    /// A photo/image the agent should `Read` to see (e.g. an error
+    /// screenshot).
+    Image,
+    /// A non-image document/file (pdf, log, …) the agent may `Read`.
+    File,
+}
+
+/// An inbound file/image carried by a [`ChannelMessage`] (V0.8.4 P2a).
+///
+/// The channel listener downloads the bytes to a staging dir and records
+/// the absolute `local_path` here; the gateway then names that path in
+/// the turn text so the agent can `Read` it. (send-keys can only carry
+/// text — there is no base64 content-block path — so attachments are
+/// always "download → give path → `Read`".)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChannelAttachment {
+    /// Image vs. generic file.
+    pub kind: AttachmentKind,
+    /// Sanitized original file name (no path separators / control chars).
+    pub file_name: String,
+    /// Absolute path on the daemon/agent **shared** filesystem.
+    pub local_path: String,
+    /// MIME type, when the platform reported one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime: Option<String>,
+    /// Size in bytes, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+}
+
 /// A message received from or sent to a channel. Trait surface lifted
 /// from `references/openhuman/src/openhuman/channels/traits.rs` with
 /// `serde` added so the daemon can persist inbound events for
@@ -41,6 +75,10 @@ pub struct ChannelMessage {
     pub timestamp: u64,
     /// Platform thread id (Slack `ts`, Discord thread, etc.).
     pub thread_ts: Option<String>,
+    /// Inbound attachments (images / files) already downloaded to disk.
+    /// Empty for text-only messages and non-Telegram channels. (P2a)
+    #[serde(default)]
+    pub attachments: Vec<ChannelAttachment>,
 }
 
 /// Message to send through a channel.

@@ -57,6 +57,7 @@ fn mk_msg(content: &str, reply_target: &str, channel: &str) -> ChannelMessage {
         channel: channel.into(),
         timestamp: 0,
         thread_ts: None,
+        attachments: Vec::new(),
     }
 }
 
@@ -293,6 +294,7 @@ async fn daemon_dm_no_at_mention_auto_routes_to_single_bot() {
         channel: "telegram".into(),
         timestamp: 0,
         thread_ts: None,
+        attachments: Vec::new(),
     })
     .await;
     let mut channels: ChannelMap = std::collections::HashMap::new();
@@ -376,6 +378,7 @@ async fn daemon_dm_multiple_bots_same_chat_id_replies_with_ambiguity_hint() {
         channel: "telegram".into(),
         timestamp: 0,
         thread_ts: None,
+        attachments: Vec::new(),
     })
     .await;
     let mut channels: ChannelMap = std::collections::HashMap::new();

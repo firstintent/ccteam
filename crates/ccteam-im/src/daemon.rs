@@ -455,7 +455,14 @@ fn spawn_inbound_consumer(
             let replies = gateway
                 .lock()
                 .await
-                .handle_text(&msg.channel, &msg.reply_target, &msg.sender, &clean_payload)
+                .handle_message(
+                    &msg.channel,
+                    &msg.reply_target,
+                    &msg.sender,
+                    &msg.id,
+                    &clean_payload,
+                    &msg.attachments,
+                )
                 .await;
             match replies {
                 Ok(replies) => {
