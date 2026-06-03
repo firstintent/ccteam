@@ -35,11 +35,14 @@
 ## P1 的一个显式前置 gate
 先写 fake-transcript 测试**钉死** `ItemCompleted{ToolCall/CommandExecution/FileChange}` 确实从 adapter `events()` 流出,再建进度状态机(别假设)。进度粒度 = 每步骤完成(transcript 不暴露 token 流),别去追流式。
 
-## P2b 唯一真·开放设计题(实现前先确认,别写死)
-agent 的 MCP 调用如何把文件寻址回**自己所在的 TG chat**?难点:daemon 的 MCP socket handler(`main.rs:handle_mcp_socket_connection`)只拿 `paths`,没有 live `Gateway`/`ChannelMap`。先 grep 确认能否拿到出站 sink/channels:
-- 拿不到 → **候选 A(推荐)**:`chat_send_file` 由 registry 解析 `(im_platform,im_chat_id)` + 写「出站文件请求」artifact,daemon 起轻量 watcher 消费 → `send_gateway_outbound`。
-- 拿得到/愿改耦合 → **候选 B**:给 socket handler 注入出站 enqueue 句柄(`GatewayEvent` 带 attachments)。
-选定后在 PR 描述记录决策。`screenshot` 工具(今天只返回 path)可叠在 `chat_send_file` 之上。
+## P2b 设计已定 = socket 路由(prd §3-P2b ④,**不要**新建 file-watcher)
+通用原语 =「agent 主动向自己绑定 chat 发一条出站消息(文字 and/or 附件)」,发截图只是 instance。3 统一 + 1 桥:
+- **统一信封**:`SendMessage`/`GatewayEvent` 加 `attachments`;Telegram `send` attachments 非空走 `sendPhoto/sendDocument`,否则 `sendMessage`。
+- **统一寻址**:`chat_send_file(path, caption?, kind?)` **零寻址参数**,身份取 `CCTEAM_CHAT_{SLUG,ROLE}` env;daemon 按 slug/role 用 registry `(im_platform,im_chat_id)` 解析"home chat"。
+- **统一出口**:构造 `GatewayEvent{attachments}` → 既有 consumer → `send_gateway_outbound`(白嫖 P0 分片 + ledger + 失败回显)。
+- **传输桥**:stdio mcp-serve 把该工具**转发到既有 `mcp.sock`**;`run_start` clone `GatewayEvent` sink 进 `serve_mcp_socket`/`handle_mcp_socket_connection`,daemon 侧解析+入队+**同步**返回 `delivered`/`failed`。理由:daemon 不再 file-watch(inbound 走内存 mpsc,inbox 文件只存档),新建 watcher = 复活已退役 file-watch + inotify 老坑。
+- **render ⊥ deliver**:`screenshot` 维持只渲染返回 path;`chat_send_file` 只投递;组合即"发效果图"。
+- **显式假设**:`path` 假设 daemon/agent 共享文件系统(remote `ProcessBackend` 会破,本版只记假设);in-turn 寻址无歧义,out-of-turn/一 bot 多 chat 用 registry 兜底。
 
 ## 收尾(最后一个 PR = ship-gate,prd §6)
 版本 bump `0.8.3→0.8.4` + CLAUDE.md §一 baseline 回填 + tech-design 协议→代码指针表 + README(英)/usage.md + 各 phase handoff(Decided/Rejected/Risks/Files/Remaining 五段)。

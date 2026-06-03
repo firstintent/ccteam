@@ -28,7 +28,7 @@ P0 分片(B2)  ──►  P1 进度(B1)  ──►  P2a 入站图文(B3-in)  ─
 - **P0**:5000 字符答案 → ≥2 条有序、拼接 == 原文;fence 跨片各自闭合;emoji-heavy(UTF-16>4096 但 char<4096)正确分片;`None` limit 行为不变;**ledger 断言 multiset+pairing 非 positional**(prd §4.2)。
 - **P1**:fake 事件序列 → status 消息出现且被 edit、答案独立成消息、新消息数=1+1 不刷屏;`CCTEAM_IM_PROGRESS=off` 只发答案;Codex delta 0 条独立消息;**显式钉死 `ItemCompleted{ToolCall/CommandExecution/FileChange}` 确从 `events()` 流出**。
 - **P2a**:图+caption → turn 含可 Read 本地路径;>20MB 拒收不崩;纯文本不变。
-- **P2b**:`chat_send_file` → 用户收到图;不存在/超限结构化 error + chat 一行;MCP `--verify-mcp` + `STUB_TOOLS` drift 不触发。**实现前先确认 MCP socket→channel 可达性,选定候选 A/B 并在 PR 记录。**
+- **P2b**:`chat_send_file`(零寻址参数,身份取 `CCTEAM_CHAT_{SLUG,ROLE}` env)→ 用户收到图;不存在/超限结构化 error + chat 一行;同步返回 `delivered`/`failed`;MCP `--verify-mcp` + `STUB_TOOLS` drift 不触发。**设计已定 = socket 路由**(prd §3-P2b ④:stdio mcp-serve 转发到既有 `mcp.sock` + `run_start` 注入 `GatewayEvent` sink;**不**新建 file-watcher)。复用 `send_gateway_outbound`(白嫖 P0 分片 + ledger)。
 
 ## 收尾(最后一个 PR,ship-gate)
 

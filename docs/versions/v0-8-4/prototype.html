@@ -93,7 +93,7 @@
     <span class="chip"><span class="dot" style="background:var(--b1)"></span>B1 进度可见</span>
     <span class="chip"><span class="dot" style="background:var(--b2)"></span>B2 长消息分片</span>
     <span class="chip"><span class="dot" style="background:var(--b3a)"></span>B3a 入站图文</span>
-    <span class="chip"><span class="dot" style="background:var(--b3b)"></span>B3b 出站文件 · <span class="defer">你拍板</span></span>
+    <span class="chip"><span class="dot" style="background:var(--b3b)"></span>B3b 出站文件 · <span class="defer">保留·最后做</span></span>
   </div>
 
   <div class="grid">
@@ -180,7 +180,7 @@
               <div><div class="fn">auth-flow.png</div><div class="fs">218 KB · 由 chat_send_file 发送</div></div>
             </div>
           </div>
-          <div class="ann"><span class="defer">建议后置</span>:agent 用 <span class="mono">chat_send_file</span> 经 sendPhoto/sendDocument 回传(本版唯一带未解设计题的一项)。</div>
+          <div class="ann"><span class="defer">保留·socket 路由</span>:agent 用 <span class="mono">chat_send_file</span>(零寻址参数,身份取 env)→ 经 mcp.sock 入队 → sendPhoto/sendDocument 回传。</div>
         </div>
 
       </div>
@@ -218,12 +218,12 @@
       </div>
 
       <div class="card" style="border-color:#5a2a2a">
-        <div class="hd"><span class="dot" style="background:var(--b3b)"></span>B3b 出站文件 <span class="pill" style="background:var(--b3b);color:#fff">唯一设计悬念·你拍板</span></div>
-        <p>最重 + 唯一带未解设计题(MCP socket 无 live channel 句柄)。你确实在用出站图,故这是取舍:砍掉换"干净可发",或保留放最后、先确认可达性。倾向砍**仅因降风险**,不因价值低。</p>
+        <div class="hd"><span class="dot" style="background:var(--b3b)"></span>B3b 出站文件 <span class="pill" style="background:var(--good)">保留 · socket 路由</span></div>
+        <p>已拍:保留。设计已定——走既有 mcp.sock 转发 + run_start 注入 GatewayEvent sink(<b>不</b>新建 file-watcher),复用出站漏斗白嫖分片+ledger,同步返回 delivered/failed。仍是最重一项 → 放最后、独立 PR。</p>
       </div>
 
       <div class="foot">
-        <b>合理性结论</b>:确定做 = P0 分片 + P1 进度(可先极简) + P2a 入站图文 + 干掉 ack 噪声;<span class="defer">P2b 出站文件 = 你拍板(砍/保留)</span>。<br>
+        <b>合理性结论</b>:本版 = P0 分片 + P1 进度(可先极简) + P2a 入站图文 + 干掉 ack 噪声 + <span class="defer">P2b 出站文件(保留·socket 路由·放最后)</span>。<br>
         体量按 <b>minor(v0.9.0 强度)</b> 规划。修完这些是"去掉让它不可用的几件事",<b>≠ 已丝滑</b> —— 仍欠:HITL 审批 / 错误回显 / setup 一键化。详见 <span class="mono">review.md</span> 与 <span class="mono">prd.md</span>。
       </div>
     </div>

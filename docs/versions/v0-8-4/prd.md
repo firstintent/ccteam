@@ -35,7 +35,7 @@
 3. **进度被丢弃**:`async_event_text`(gateway.rs:1077)/`event_text`(:1197)都只放行 `AgentMessage` + error 文本,`ToolCall/CommandExecution/FileChange/WebSearch/Reasoning` 与所有 Turn/Item 生命周期事件 `=> None`。
 4. **ack 是天然种子**:pump 模式下 sync 返回的 `"submitted s{n} turn {id}"` 会被当普通 reply 发回(daemon.rs:462-466)——它正好可改造成 B1 的初始「⏳ working…」status 消息,后续被编辑。
 5. **传输层纯文本**:`ChannelMessage`/`SendMessage`(transport/mod.rs)均无附件字段;`Channel` trait 无 `edit`、无 `max_len`;`TgMessage`(telegram.rs:78)只反序列化 `text`;出站只有 `sendMessage`。
-6. **MCP socket handler 只拿 `paths`**(main.rs:2154 `handle_mcp_socket_connection`),**没有** live `Gateway`/`ChannelMap` 句柄;`chat_send_input`(mcp_chat_tools.rs:452)是「写 `InboxEnvelope` 文件」的无状态 drop。bot 注册项带 `(im_platform, im_chat_id)`(inbound.rs:273、gateway.rs:333)。`screenshot` 工具(mcp_serve.rs:428)今天只**返回 PNG 路径**,不推送 chat。⇒ 这决定了 **B3b 出站文件的「agent 如何把文件寻址回自己 chat」是本版唯一真正的开放设计题**(见 P2b)。
+6. **MCP socket handler 只拿 `paths`**(main.rs:2154 `handle_mcp_socket_connection`),**没有** live `Gateway`/`ChannelMap` 句柄;`chat_send_input`(mcp_chat_tools.rs:452)是「写 `InboxEnvelope` 文件」的无状态 drop。bot 注册项带 `(im_platform, im_chat_id)`(inbound.rs:273、gateway.rs:333)。`screenshot` 工具(mcp_serve.rs:428)今天只**返回 PNG 路径**,不推送 chat。⇒ B3b「agent 如何把文件寻址回自己 chat」**已定方案 = socket 路由**(见 P2b ④):走既有 `mcp.sock` 转发 + `run_start` 注入 `GatewayEvent` sink,**不**新建 file-watcher。注:daemon 不再 file-watch(inbound 走内存 mpsc `inbox_tx` daemon.rs:848),故 file-drop 方案被否。
 7. **deterministic fake**:`CCTEAM_{CLAUDE,CODEX}_BIN` + `MockChannel`(in-proc 双向)+ `WsChannel`(over real socket)。pump 级测试用 fake adapter 发 `ThreadEvent`;e2e 用 `daemon_routes_*` 家族(inbound_wiring_test.rs)。
 
 ---
@@ -149,34 +149,46 @@
 
 ---
 
-### P2b —— 出站文件(B3 出站)〔最重 + 唯一真开放题〕
+### P2b —— 出站文件(B3 出站)〔最重;设计已定 = socket 路由〕
 
-**决策(部分)+ 开放设计题**
-- `SendMessage`(transport/mod.rs)增 `attachments: Vec<OutboundFile>`(`{ path, caption: Option<String>, kind: photo|document }`,`#[serde(default)]`)。
-- `TelegramChannel::send`:若 `attachments` 非空 → 对每个走 `sendPhoto`/`sendDocument`(multipart 上传),caption 放首个;否则维持 `sendMessage`。
-- 新 MCP 工具 `ccteam__chat_send_file`(归 `chat_` group;参数 `workflow_slug, role, path, caption?, kind?`)。
+> **通用原语,不是"发文件"特例**:把它想成「**agent 主动向自己绑定的 chat 发一条出站消息(文字 and/or 附件)**」;"发效果截图"只是其中一个 instance。围绕这个原语设计,3 个统一 + 1 个传输桥:
 
-> **⚠️ 开放设计题(dev session 实现前必须先确认可达性,再动手)**:
-> agent 的 MCP 调用如何把文件**寻址回自己所在的那个 TG chat**?难点(§1.6):**daemon 的 MCP socket handler 只拿 `paths`,没有 live `Gateway`/`ChannelMap` 句柄**;`chat_send_input` 是无状态文件 drop。
->
-> **候选 A(推荐,最少新耦合,贴合「文件系统是 artifact 控制面」)**:`chat_send_file` 由 registry 解析目标 `(im_platform, im_chat_id)`(注册项已有),写一条「出站文件请求」artifact(如 `~/.ccteam/imd/outbound-files/<ts>-<rand>.json`,含 channel/chat_id/path/caption/kind);daemon 起一个轻量 **outbound-file watcher**,消费后构造带 `attachments` 的 `SendMessage` → 经 `send_gateway_outbound` 投递(自动享受 ledger + 失败回显)。
->
-> **候选 B**:给 MCP socket handler 注入一个「出站 enqueue 句柄」(`Sender<GatewayEvent>` 的扩展,`GatewayEvent` 带 attachments),直达 event consumer。更干净但需把 gateway sink 传进 socket handler,耦合更大。
->
-> dev 先 grep 确认 socket handler 能否拿到 sink/channels;**拿不到就走候选 A**;别在没确认可达前把机制写死。`screenshot` 工具(返回 path)可在 `chat_send_file` 之上叠加(渲染 → send_file)。
+**① 统一信封** —— 文件 = 同一条出站消息上的附件,和文字答案**同一条路**。
+- `SendMessage`(transport/mod.rs)增 `attachments: Vec<OutboundFile>`(`{ path, caption: Option<String>, kind: photo|document }`,`#[serde(default)]`);`GatewayEvent` 同步带 attachments。attachments 空时文字路径完全不变。
+- `TelegramChannel::send`:attachments 非空 → 逐个 `sendPhoto`/`sendDocument`(multipart),caption 放首个;否则维持 `sendMessage`。
+
+**② 统一寻址** —— agent **从不写 chat_id**,只表达意图,gateway 拥有寻址。
+- 工具 `ccteam__chat_send_file(path, caption?, kind?)` —— **零 IM 寻址参数**。身份来自 spawn 注入的 `CCTEAM_CHAT_SLUG` / `CCTEAM_CHAT_ROLE` env(claude_tui.rs:200 `chat_spawn_env_owned`),stdio mcp-serve 自读。
+- daemon 端按 slug/role 解析目标 `(channel, chat_id)`:**registry `(im_platform, im_chat_id)`** 作"home chat"(filesystem,paths 即可,覆盖一 bot 一 chat 的绝大多数场景);in-turn 若要更精确可叠 gateway `reply_to`(本版可不做)。
+
+**③ 统一出口** —— 复用既有出站漏斗,不另起一条。
+- 解析出的消息构造成 `GatewayEvent{ channel, chat_id, content: caption, attachments }` → **现有 gateway event consumer**(daemon.rs:495)→ `send_gateway_outbound` → `channel.send()`。**自动白嫖** P0 分片 + 持久 ledger(`outbound.jsonl`)+ 失败回显。
+
+**④ 传输桥 = 已存在的 `mcp.sock`,不是新 watcher**(关键决策,推翻早期 candidate-A)。
+- 事实:daemon **不再 file-watch**(inbound 走内存 mpsc `inbox_tx.try_send` daemon.rs:848;inbox 文件只存档)。新建 outbox **file-watcher** = 复活已退役的 file-watch 命令面 + 本仓 inotify-instance 爆炸老坑 → **否**。
+- 走 socket:stdio mcp-serve 检测到 `chat_send_file` 这类"需 live 投递"的工具 → 连 `mcp.sock`(daemon 既有 JSON-RPC 端点,main.rs:2154)**转发**;`run_start` 把 `GatewayEvent` sink(daemon.rs:191 既有)clone 进 `serve_mcp_socket`/`handle_mcp_socket_connection`,daemon 侧 handler 解析寻址 + 入队 + **同步**返回 `delivered`/`failed:reason`,agent 可报告/重试。
+- 这是**第一条 live「MCP 工具 → daemon 内存」路径**(今天 MCP 工具只碰 filesystem state)—— 有意新增的 seam,但用的是**已存在**的 mcp.sock(`cf64dac` 已在往"socket 即 daemon RPC"方向走),比复活 file-watch 干净、且同步可报错。
+
+**⑤ render ⊥ deliver**(组合,不捆绑)。`screenshot`(mcp_serve.rs:428)维持只渲染→返回 path;`chat_send_file` 只负责投递;"发效果图" = screenshot → chat_send_file(path)。任何文件(报告/图/产物)同一条路。可选一个薄 `chat_send_screenshot` 组合二者,但保留 primitive 分离。
+
+> **显式假设/边界(不静默)**:
+> - `path` 假设 **daemon 与 agent 共享文件系统**(Claude=tmux 本地成立;**remote `ProcessBackend` 下会破** —— 本版记为假设,不现在设计掉,remote 时再加"上传字节"变体)。
+> - 寻址:in-turn 无歧义;**out-of-turn / 一 bot 多 chat** 用 registry `im_chat_id` 作"home chat"兜底,明确写清。
 
 **被否**
+- *新建 daemon outbox **file-watcher**(早期 candidate-A)*:复活已退役的 file-watch 命令面 + 多开 inotify 实例(本仓 `max_user_instances` 老坑);且 fire-and-forget 无法同步报错。✗ 走 socket。
 - *用 `FileChange` 事件路径自动发文件*:每次编辑都发,噪声爆炸;且语义错(编辑≠想发给用户)。✗ 必须 agent 显式 `chat_send_file`。
 - *sentinel 字符串(`[[ccteam:send-file …]]`)塞进答案文本被 outbound 解析*:脆弱、易误触、要解析输出(蹭红线边)。✗ MCP 工具显式、类型化。
+- *给工具加 `chat_id`/`slug`/`role` 显式寻址参数*:把 IM 寻址泄漏进 agent,一 bot 多 chat 即破。✗ 零寻址参数 + ambient env + gateway 拥有寻址。
 
-**触碰文件**:`transport/mod.rs`(`SendMessage.attachments` + `OutboundFile`)、`transport/providers/telegram.rs`(`sendPhoto/sendDocument`)、`mcp_chat_tools.rs`(`chat_send_file` dispatcher + 加进工具清单)、`mcp_serve.rs`/`mcp_tool_groups.rs`(注册 + group)、`daemon.rs`(候选 A 的 watcher 或候选 B 的 sink 注入)、`ccteam doctor --verify-mcp` 自检 + `STUB_TOOLS` drift。
+**触碰文件**:`transport/mod.rs`(`SendMessage`/`GatewayEvent` 加 attachments + `OutboundFile`)、`transport/providers/telegram.rs`(`sendPhoto/sendDocument`)、`mcp_chat_tools.rs`(`chat_send_file` dispatcher + 工具清单)、`mcp_serve.rs`(stdio 侧"live 工具"转发到 `mcp.sock`;`mcp_tool_groups.rs` 注册 + group)、`main.rs`(`serve_mcp_socket`/`handle_mcp_socket_connection` 注入 `Sender<GatewayEvent>` + live-tool 分派)、`daemon.rs`(sink clone)、`ccteam doctor --verify-mcp` + `STUB_TOOLS` drift。
 
 **AC**
 - agent 在 TG-routed session 里调 `chat_send_file(path=某png)` → 用户 TG 收到该图片(`sendPhoto`)。
 - 文件不存在/超限 → 工具返回结构化 error,chat 收到一行提示,不崩。
 - MCP 工具数 + `--verify-mcp` 自检通过(drift exit 1 不触发)。
 
-**测试**:`chat_send_file` dispatcher 单测(registry 解析 + artifact 写出 / enqueue);Telegram `send` 带 attachments 走 multipart 的请求 shape 单测(mock http);e2e(若候选 A)：写 artifact → daemon watcher → MockChannel 收到带 attachment 的 SendMessage。
+**测试**(deterministic):registry 寻址解析单测(slug/role → `(channel, chat_id)`,缺注册的 error);daemon socket handler 收到 `chat_send_file` → 入队 `GatewayEvent{attachments}` → MockChannel 收到带 attachment 的 `SendMessage` 且同步返回 `delivered`;Telegram `send` 带 attachments 的 multipart 请求 shape 单测(mock http);stdio mcp-serve 把该工具转发到一个 fake unix socket 的单测。
 
 ---
 
