@@ -15,3 +15,6 @@ pub mod slack;
 
 #[cfg(feature = "discord")]
 pub mod discord;
+
+#[cfg(feature = "lark")]
+pub mod lark;

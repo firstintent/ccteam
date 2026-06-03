@@ -146,6 +146,7 @@ where
         has_telegram = creds.telegram.is_some(),
         has_slack = creds.slack.is_some(),
         has_discord = creds.discord.is_some(),
+        has_lark = creds.lark.is_some(),
         "ccteam-im daemon starting"
     );
 
@@ -292,44 +293,141 @@ where
 /// (backpressure, not silent drop).
 const INBOUND_BUF: usize = 64;
 
-/// V0.6.1 F132 — assemble the Channel set the daemon listens on.
+/// One row of the provider table [`build_channels`] walks. The builder
+/// inspects credentials + registered bots and yields the live [`Channel`]
+/// when its credential block is present, or `None` when unconfigured.
+/// Adding a provider is one row + one `build_*` fn — the loop never
+/// names a platform.
+///
+/// Builders are stateless free fns, so `fn`-pointers (not `Box<dyn Fn>`)
+/// keep the table a zero-alloc `const` that's `#[cfg]`-gateable per-row.
+type ChannelBuilder =
+    fn(&Credentials, &[BotRegistration]) -> Option<Arc<dyn Channel + Send + Sync>>;
+
+/// The platform-agnostic provider table. Each row pairs a channel key
+/// with its builder; `#[cfg]` on const-array elements drops a row when
+/// its feature is off. This is the single place a new IM provider is
+/// registered for the daemon.
+const CHANNEL_BUILDERS: &[(&str, ChannelBuilder)] = &[
+    #[cfg(feature = "telegram")]
+    ("telegram", build_telegram_channel),
+    #[cfg(feature = "slack")]
+    ("slack", build_slack_channel),
+    #[cfg(feature = "discord")]
+    ("discord", build_discord_channel),
+    #[cfg(feature = "lark")]
+    ("lark", build_lark_channel),
+];
+
+/// Assemble the Channel set the daemon listens on.
 ///
 /// Resolution order:
-/// 1. `args.channels_override` (tests inject `MockChannel`),
-/// 2. `creds.telegram` → build a [`TelegramChannel`] with the union of
-///    the user-configured allowlist + every registered telegram bot's
-///    `im_chat_id`,
-/// 3. (slack / discord wiring).
-///
-// TODO(V0.7-im-providers): construct `SlackChannel` / `DiscordChannel`
-//   here when `creds.slack` / `creds.discord` are set. Provider modules
-//   already exist (`transport/providers/{slack,discord}.rs`) but only
-//   telegram is exercised by the V0.6.x host probe.
-// Reason deferred: bundled with V0.7 Epic C (国内 IM enablement +
-//   Slack Socket Mode / inbound HTTP) so the daemon wiring, HMAC
-//   verification, and onboarding skill ship as one wave instead of
-//   trickling per-provider half-changes through V0.6.x patch releases.
-// Tracking: docs/versions/v0-6-6/prd.md §F168 (decision row #2) +
-//   docs/dev-coupling-audit.md V0.6.6 V0.7-deferred segment.
+/// 1. `args.channels_override` (tests inject `MockChannel`) — wins,
+/// 2. each [`CHANNEL_BUILDERS`] row whose credential block is present,
+/// 3. `args.extra_channels` (web-chat WS) — merged last.
 fn build_channels(args: &DaemonArgs, creds: &Credentials, bots: &[BotRegistration]) -> ChannelMap {
     if let Some(ch) = args.channels_override.clone() {
-        return ch;
+        return ch; // test MockChannel injection still wins, unchanged
     }
     let mut out: ChannelMap = HashMap::new();
-    if let Some(tg) = creds.telegram.as_ref() {
-        let mut allowed = tg.allowed_chat_ids.clone();
-        for b in bots.iter().filter(|b| b.im_platform == "telegram") {
-            allowed.push(b.im_chat_id.clone());
+    for (name, builder) in CHANNEL_BUILDERS {
+        if let Some(ch) = builder(creds, bots) {
+            out.insert((*name).to_string(), ch);
+            tracing::info!(channel = %name, "imd: provider channel built from credentials");
         }
-        allowed.sort();
-        allowed.dedup();
-        let ch = Arc::new(TelegramChannel::new(tg.bot_token.clone(), allowed));
-        out.insert("telegram".to_string(), ch as Arc<dyn Channel + Send + Sync>);
     }
     if let Some(extra) = args.extra_channels.clone() {
-        out.extend(extra);
+        out.extend(extra); // web-chat WS merge still last, unchanged
     }
     out
+}
+
+/// Telegram: union the user-configured chat-id allowlist with every
+/// registered telegram bot's `im_chat_id` (both live in `reply_target`
+/// chat-id space, so the union authorizes those chats). Verbatim move
+/// of the previous inline logic.
+#[cfg(feature = "telegram")]
+fn build_telegram_channel(
+    creds: &Credentials,
+    bots: &[BotRegistration],
+) -> Option<Arc<dyn Channel + Send + Sync>> {
+    let tg = creds.telegram.as_ref()?;
+    let mut allowed = tg.allowed_chat_ids.clone();
+    for b in bots.iter().filter(|b| b.im_platform == "telegram") {
+        allowed.push(b.im_chat_id.clone());
+    }
+    allowed.sort();
+    allowed.dedup();
+    Some(Arc::new(TelegramChannel::new(
+        tg.bot_token.clone(),
+        allowed,
+    )))
+}
+
+/// Slack: HTTP `chat.postMessage` + channel polling. Discharges the old
+/// `TODO(V0.7-im-providers)` — the row was dark only because no creds
+/// block existed, not because the provider was missing.
+#[cfg(feature = "slack")]
+fn build_slack_channel(
+    creds: &Credentials,
+    _bots: &[BotRegistration],
+) -> Option<Arc<dyn Channel + Send + Sync>> {
+    let slack = creds.slack.as_ref()?;
+    Some(Arc::new(
+        crate::transport::providers::slack::SlackChannel::new(
+            slack.bot_token.clone(),
+            slack.poll_channels.clone(),
+        ),
+    ))
+}
+
+/// Discord: REST messages API + per-channel polling. `DiscordCreds`
+/// carries no poll list (the bound channel is discovered at runtime), so
+/// the poll set starts empty; the user-id allowlist passes through.
+#[cfg(feature = "discord")]
+fn build_discord_channel(
+    creds: &Credentials,
+    _bots: &[BotRegistration],
+) -> Option<Arc<dyn Channel + Send + Sync>> {
+    let discord = creds.discord.as_ref()?;
+    Some(Arc::new(
+        crate::transport::providers::discord::DiscordChannel::new(
+            discord.bot_token.clone(),
+            Vec::new(),
+            discord.authorized_user_ids.clone(),
+        ),
+    ))
+}
+
+/// Lark/Feishu: WSS long-connection + `im/v1/messages`.
+///
+/// ALLOWLIST-UNION SUBTLETY: telegram unions registered bot `im_chat_id`s
+/// (chat-id space) into its chat-id allowlist, which authorizes those
+/// chats. Lark's [`LarkChannel::is_user_allowed`] checks the SENDER
+/// `open_id` (`ou_…`), but `im_chat_id` is a CHAT id (`oc_…`) — a
+/// different namespace — so this union is **parity-only**: it never
+/// authorizes anyone. Real auth comes from `LarkCreds.allowed_user_ids`.
+/// The union is kept so every provider's builder is shaped identically.
+#[cfg(feature = "lark")]
+fn build_lark_channel(
+    creds: &Credentials,
+    bots: &[BotRegistration],
+) -> Option<Arc<dyn Channel + Send + Sync>> {
+    let lark = creds.lark.as_ref()?;
+    let mut allowed = lark.allowed_user_ids.clone();
+    for b in bots.iter().filter(|b| b.im_platform == "lark") {
+        allowed.push(b.im_chat_id.clone());
+    }
+    allowed.sort();
+    allowed.dedup();
+    Some(Arc::new(
+        crate::transport::providers::lark::LarkChannel::new(
+            lark.app_id.clone(),
+            lark.app_secret.clone(),
+            allowed,
+            lark.use_feishu,
+        ),
+    ))
 }
 
 fn build_gateway(
