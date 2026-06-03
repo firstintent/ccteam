@@ -376,6 +376,7 @@ mod tests {
             adapter_factory: Some(adapter_factory(adapter_state)),
             channels_override: None,
             extra_channels: Some(channels),
+            ..Default::default()
         };
         let (daemon_stop, daemon_stop_rx) = tokio::sync::oneshot::channel::<()>();
         let daemon_handle = tokio::spawn(async move {

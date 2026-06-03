@@ -129,6 +129,9 @@ pub struct GatewayEvent {
     pub content: String,
     /// Answer (new message) vs. live progress (edited status message).
     pub kind: GatewayEventKind,
+    /// Outbound file attachments (V0.8.4 P2b — `chat_send_file`). Empty
+    /// for normal text answers / progress updates.
+    pub attachments: Vec<crate::transport::OutboundFile>,
 }
 
 /// A live `ccteam-chat-*` process with no matching tracked gateway session —
@@ -780,6 +783,7 @@ impl Gateway {
                                     thread_ts: None,
                                     content: text,
                                     kind: GatewayEventKind::Answer,
+                                    attachments: Vec::new(),
                                 })
                                 .is_err()
                             {
@@ -1198,6 +1202,7 @@ fn spawn_turn_timeout_watchdog(
                 "gateway error: turn timed out after {timeout:?} for {session_id} turn {turn_id}"
             ),
             kind: GatewayEventKind::Answer,
+            attachments: Vec::new(),
         });
     });
 }
@@ -1271,6 +1276,7 @@ fn emit_progress(
         thread_ts: None,
         content: content.to_string(),
         kind: GatewayEventKind::Progress { status_key, done },
+        attachments: Vec::new(),
     })
     .is_ok()
 }

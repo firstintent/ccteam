@@ -149,6 +149,19 @@ pub fn chat_tool_definitions() -> Vec<Value> {
                 "required": ["workflow_slug", "role"],
             }),
         }),
+        json!({
+            "name": "ccteam__chat_send_file",
+            "description": "V0.8.4 P2b — send a file (image or document) from disk back to YOUR own bound chat (Telegram / web). Zero addressing params: your identity comes from the spawn-injected CCTEAM_CHAT_SLUG / CCTEAM_CHAT_ROLE env, and the daemon resolves your home chat from the registry. `path` must be on the daemon's filesystem (shared with you under tmux). `kind` is inferred from the extension when omitted (png/jpg/jpeg/gif/webp → photo, else document). To send a rendered screenshot, compose with `screenshot`: it returns a PNG path → pass that to chat_send_file. Delivery reuses the same outbound funnel as text replies (long-message split + durable ledger + failure echo).",
+            "inputSchema": json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Absolute path to the file on the daemon's filesystem." },
+                    "caption": { "type": "string", "description": "Optional caption sent with the file." },
+                    "kind": { "type": "string", "enum": ["photo", "document"], "description": "photo → sendPhoto (compressed image); document → sendDocument (any file). Inferred from the extension when omitted." }
+                },
+                "required": ["path"],
+            }),
+        }),
     ]
 }
 
@@ -706,14 +719,16 @@ mod tests {
     }
 
     #[test]
-    fn six_chat_tools_registered_with_correct_names() {
+    fn seven_chat_tools_registered_with_correct_names() {
         let tools = chat_tool_definitions();
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 7);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         // V0.6.5 F146 real tools.
         assert!(names.contains(&"ccteam__chat_register_bot"));
         assert!(names.contains(&"ccteam__chat_unregister_bot"));
         assert!(names.contains(&"ccteam__chat_list_bots"));
+        // V0.8.4 P2b — outbound file send.
+        assert!(names.contains(&"ccteam__chat_send_file"));
         // V0.6.5 F147 real tools (renamed from the V0.6.0 stub names —
         // `chat_session_reset` → `chat_reset`; `chat_show_turn_log` →
         // `chat_history`. CLAUDE.md §五 #4 forbids deprecated aliases

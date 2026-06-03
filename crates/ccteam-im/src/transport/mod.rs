@@ -81,6 +81,31 @@ pub struct ChannelMessage {
     pub attachments: Vec<ChannelAttachment>,
 }
 
+/// How an [`OutboundFile`] should be sent (V0.8.4 P2b).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OutboundFileKind {
+    /// Compressed image (Telegram `sendPhoto`).
+    Photo,
+    /// Generic file (Telegram `sendDocument`).
+    Document,
+}
+
+/// A file to send back to a chat as an attachment on an outbound message
+/// (V0.8.4 P2b). `path` is on the daemon/agent **shared** filesystem
+/// (a remote `ProcessBackend` would need an "upload bytes" variant — a
+/// recorded assumption, not designed here).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OutboundFile {
+    /// Absolute path to the file on disk.
+    pub path: String,
+    /// Optional caption (placed on the first attachment).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
+    /// Photo vs. document.
+    pub kind: OutboundFileKind,
+}
+
 /// Message to send through a channel.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SendMessage {
@@ -93,22 +118,33 @@ pub struct SendMessage {
     /// Threading id (Slack `thread_ts`); when set the platform should
     /// post as a reply.
     pub thread_ts: Option<String>,
+    /// Outbound file attachments (V0.8.4 P2b). Empty ⇒ a plain text send
+    /// (`sendMessage`); non-empty ⇒ `sendPhoto`/`sendDocument`.
+    #[serde(default)]
+    pub attachments: Vec<OutboundFile>,
 }
 
 impl SendMessage {
-    /// Helper: build a plain message with no subject / thread.
+    /// Helper: build a plain message with no subject / thread / files.
     pub fn new(content: impl Into<String>, recipient: impl Into<String>) -> Self {
         Self {
             content: content.into(),
             recipient: recipient.into(),
             subject: None,
             thread_ts: None,
+            attachments: Vec::new(),
         }
     }
 
     /// Builder-style: attach a thread id.
     pub fn in_thread(mut self, thread_ts: Option<String>) -> Self {
         self.thread_ts = thread_ts;
+        self
+    }
+
+    /// Builder-style: attach outbound files.
+    pub fn with_attachments(mut self, attachments: Vec<OutboundFile>) -> Self {
+        self.attachments = attachments;
         self
     }
 }

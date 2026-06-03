@@ -22,7 +22,7 @@
 //! `chat_register_bot` + `chat_unregister_bot` tools (no deprecated
 //! alias — CLAUDE.md §五 #4) growing the chat group 5 → 6.
 //!
-//! Total: 27 tools registered (V0.6.5). Disabling a group hides every
+//! Total: 28 tools registered (V0.8.4 adds `chat_send_file`). Disabling a group hides every
 //! tool in that group from `tools/list`; `tools/call` against a
 //! disabled tool falls through to the standard "unknown tool" error.
 

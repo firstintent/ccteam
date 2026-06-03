@@ -32,11 +32,13 @@ use ccteam_harness::{
 use ccteam_im::daemon::{
     default_adapter_factory, run_daemon_with_shutdown, AdapterFactory, ChannelMap, DaemonArgs,
 };
+use ccteam_im::gateway::{GatewayEvent, GatewayEventKind};
 use ccteam_im::register_bot;
 use ccteam_im::transport::providers::mock::MockChannel;
 use ccteam_im::transport::providers::ws::WsChannel;
 use ccteam_im::transport::{
-    AttachmentKind, Channel, ChannelAttachment, ChannelMessage, SendMessage,
+    AttachmentKind, Channel, ChannelAttachment, ChannelMessage, OutboundFile, OutboundFileKind,
+    SendMessage,
 };
 use futures::stream::BoxStream;
 use futures::{SinkExt, StreamExt};
@@ -340,6 +342,7 @@ async fn daemon_wires_mock_channel_to_supervisor_inbox() {
         adapter_factory: Some(adapter_factory),
         channels_override: Some(channels),
         extra_channels: None,
+        ..Default::default()
     };
 
     run_daemon_with_shutdown(args, async {
@@ -439,6 +442,7 @@ async fn daemon_routes_gateway_inbound_to_submit_turn_and_outbound() {
         adapter_factory: Some(adapter_factory),
         channels_override: Some(channels),
         extra_channels: None,
+        ..Default::default()
     };
 
     run_daemon_with_shutdown(args, async {
@@ -569,6 +573,7 @@ async fn daemon_splits_long_outbound_into_ordered_parts() {
         adapter_factory: Some(adapter_factory),
         channels_override: Some(channels),
         extra_channels: None,
+        ..Default::default()
     };
     run_daemon_with_shutdown(args, async {
         futures::future::pending::<()>().await;
@@ -719,6 +724,7 @@ async fn daemon_split_failure_surfaces_notice() {
         adapter_factory: Some(adapter_factory),
         channels_override: Some(channels),
         extra_channels: None,
+        ..Default::default()
     };
     run_daemon_with_shutdown(args, async {
         futures::future::pending::<()>().await;
@@ -773,6 +779,7 @@ async fn daemon_replays_queued_durable_outbound_to_mock_channel() {
         adapter_factory: Some(adapter_factory),
         channels_override: Some(channels),
         extra_channels: None,
+        ..Default::default()
     };
 
     run_daemon_with_shutdown(args, async {
@@ -981,6 +988,7 @@ async fn daemon_routes_ws_channel_to_gateway_over_real_socket() {
         adapter_factory: Some(adapter_factory),
         channels_override: Some(channels),
         extra_channels: None,
+        ..Default::default()
     };
 
     let daemon = tokio::spawn(async move {
@@ -1476,6 +1484,7 @@ fn spawn_ws_gateway_daemon(
         adapter_factory: Some(adapter_factory),
         channels_override: Some(channels),
         extra_channels: None,
+        ..Default::default()
     };
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
@@ -1506,6 +1515,7 @@ fn spawn_real_ws_gateway_daemon(
         adapter_factory: Some(default_adapter_factory()),
         channels_override: Some(channels),
         extra_channels: None,
+        ..Default::default()
     };
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
@@ -1541,6 +1551,7 @@ async fn run_mock_gateway_daemon<T>(
         adapter_factory: Some(adapter_factory),
         channels_override: Some(channels),
         extra_channels: None,
+        ..Default::default()
     };
     run_daemon_with_shutdown(args, async {
         futures::future::pending::<()>().await;
@@ -1740,6 +1751,7 @@ async fn daemon_routes_inbound_image_attachment_into_turn_text() {
         adapter_factory: Some(adapter_factory),
         channels_override: Some(channels),
         extra_channels: None,
+        ..Default::default()
     };
     run_daemon_with_shutdown(args, async {
         futures::future::pending::<()>().await;
@@ -1758,6 +1770,80 @@ async fn daemon_routes_inbound_image_attachment_into_turn_text() {
         "image path not named in turn: {turn}"
     );
     std::env::remove_var("CCTEAM_IM_PROGRESS");
+}
+
+/// V0.8.4 P2b — a `GatewayEvent` carrying an `OutboundFile` (as
+/// `chat_send_file` enqueues) flows through the gateway-event consumer to
+/// the channel as a `SendMessage` with attachments (Telegram would then
+/// `sendPhoto`). Proves the shared-sink delivery seam end to end; the
+/// `mcp.sock`/env addressing is covered by ccteam-cli unit tests.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_delivers_gateway_event_attachment_to_channel() {
+    let _g = env_lock();
+    let home = isolate_home();
+    let projects_root = home.path().join("projects");
+    std::fs::create_dir_all(&projects_root).unwrap();
+
+    let mock = Arc::new(MockChannel::new());
+    let mut channels: ChannelMap = std::collections::HashMap::new();
+    channels.insert(
+        "telegram".to_string(),
+        mock.clone() as Arc<dyn Channel + Send + Sync>,
+    );
+
+    // Shared gateway-event channel (as `ccteam start` builds it); enqueue
+    // a file-bearing event before the daemon's consumer drains it.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+    tx.send(GatewayEvent {
+        id: "csf-1".into(),
+        channel: "telegram".into(),
+        chat_id: "chat-77".into(),
+        thread_ts: None,
+        content: String::new(),
+        kind: GatewayEventKind::Answer,
+        attachments: vec![OutboundFile {
+            path: "/tmp/ccteam-out/chart.png".into(),
+            caption: Some("the chart".into()),
+            kind: OutboundFileKind::Photo,
+        }],
+    })
+    .unwrap();
+
+    let adapter = Arc::new(GatewayAdapter::default());
+    let adapter_factory: AdapterFactory = {
+        let cloned = adapter.clone();
+        Arc::new(move |_| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
+    };
+    let args = DaemonArgs {
+        credentials: None,
+        registry: Some(projects_root),
+        max_runtime: Some(Duration::from_millis(400)),
+        adapter_factory: Some(adapter_factory),
+        channels_override: Some(channels),
+        extra_channels: None,
+        gateway_event_tx: Some(tx.clone()),
+        gateway_event_rx: Some(rx),
+    };
+    run_daemon_with_shutdown(args, async {
+        futures::future::pending::<()>().await;
+    })
+    .await
+    .unwrap();
+
+    let outbox = mock.outbox().await;
+    let with_file = outbox
+        .iter()
+        .find(|m| !m.attachments.is_empty())
+        .unwrap_or_else(|| panic!("no attachment SendMessage delivered: {outbox:?}"));
+    assert_eq!(with_file.recipient, "chat-77");
+    assert_eq!(with_file.attachments.len(), 1);
+    assert_eq!(with_file.attachments[0].path, "/tmp/ccteam-out/chart.png");
+    assert_eq!(with_file.attachments[0].kind, OutboundFileKind::Photo);
+    assert_eq!(
+        with_file.attachments[0].caption.as_deref(),
+        Some("the chart")
+    );
 }
 
 fn read_durable_outbound_rows() -> Vec<serde_json::Value> {
