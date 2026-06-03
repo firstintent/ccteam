@@ -96,7 +96,8 @@
 - **live-edited status 消息**(对齐官方插件 UX):
   - `spawn_event_pump`(gateway.rs:660)改造:**区分两类事件**——
     - **答案类**(`ItemCompleted{AgentMessage}` + error)→ 走出站 = **新消息**(经 P0 分片;会 ping)。
-    - **进度类**(`ToolCall/CommandExecution/FileChange/WebSearch/Reasoning`,`ItemStarted/Updated`,`TurnStarted/Completed`)→ 维护**每 turn 一条 status 消息**:首个进度事件时发「⏳ working…」(复用 §1.4 的 ack 作为种子),之后把**滚动进度行**(cap 最近 N 行,建议 6–8;每行一条 compact 摘要,如 `🔧 Bash: cargo test`、`✏️ edit src/foo.rs`、`🔎 web: …`、`🧠 thinking…`)**编辑**进 status 消息。
+    - **进度类**(`ToolCall/CommandExecution/FileChange/WebSearch/Reasoning`,`ItemStarted/Updated`,`TurnStarted/Completed`)→ 维护**每 turn 一条 status 消息**:首个进度事件时发「⏳ working…」(复用 §1.4 的 ack 作为种子),之后把**滚动进度行编辑**进 status 消息。
+    - **分组折叠**(借鉴 claude-code,见 §7):**不逐条铺开**,同类事件**合并计数**——参 CC 的 `GroupedToolUseMessage` / `CollapsedReadSearchGroup`(types/message.ts)。形如 `📖 read ×5 · 🔧 bash ×3 · ✏️ edit ×2 · 🔎 web ×1`;最近 1–2 条展开为明细,明细的工具入参用 **`truncateForPreview`(≤200 字符,phone-sized**,借 CC channelPermissions.ts)截断,避免 `Write(5KB)` 刷屏。总行数 cap(建议 ≤8)。
   - **节流**:相邻 `edit_message` 间隔 ≥ 阈值(建议 1.5s;TG 编辑软限 ~1/s),期间合并缓冲;turn 结束把 status 收尾成 `✅ done · n tools · m files`(或失败态)。
   - **Codex delta 顺带修好**:`ItemUpdated{AgentMessage(delta)}`(Codex app-server 的流式增量)今天会被当独立答案发 → 刷屏。新规则:**只有 `ItemCompleted{AgentMessage}` 算「投递的答案」**;`ItemUpdated{AgentMessage}` delta 喂给 status 的「✍️ drafting…」,不单独发。
 - **粒度声明**:进度 = **每步骤完成**(transcript item 完成时落行);一条 2 分钟的 `cargo test` 是在它**返回后**显示「ran cargo test」,**不是**运行中逐 token。设计与测试都按此,别追流式。
@@ -131,7 +132,9 @@
 - `TgMessage`(telegram.rs:78)扩展反序列化:`photo: Vec<TgPhotoSize>`(取 `file_id` 最大尺寸)、`document: Option<TgDocument>`、`caption: Option<String>`。
 - `ChannelMessage`(transport/mod.rs)增 `attachments: Vec<ChannelAttachment>`(`{ kind: image|file, file_name, local_path, mime, size }`,`#[serde(default)]`)。
 - `TelegramChannel::listen`:遇 photo/document → `getFile` 拿 `file_path` → 从 `https://api.telegram.org/file/bot<token>/<file_path>` 下载 → 落 daemon staging 目录 `~/.ccteam/imd/attachments/inbound/<cid>-<sanitized_name>`(此刻还不知道路由到哪个 project/role,先 channel-scoped staging;`local_path` 放进 `ChannelAttachment`)。caption 进 `content`。
-- 注入 turn:`handle_text` 升级为携带 attachments(新 `handle_message(channel, chat_id, sender, text, attachments)`,旧 `handle_text` 保留为 `attachments=[]` 的薄封装——**注意**:这不是 backwards-compat shim,是同一函数的参数化;不留废弃别名)。turn 文本 = caption + 追加 `\n\n[附件:图片 /abs/path.png]` / `[附件:文件 /abs/path.pdf]`,Claude session 用 Read 工具读路径;send-keys 路径上路径即字面文本。
+- 注入 turn:`handle_text` 升级为携带 attachments(新 `handle_message(channel, chat_id, sender, text, attachments)`,旧 `handle_text` = `attachments=[]` 薄参数化封装,不留废弃别名)。**送入 pane 的文本**借鉴官方 telegram 插件**本会话实测**的入站封装(见 §7):`<channel source="telegram" chat_id=… user=… message_id=…>` 包裹 caption,附件以**属性 + 落盘路径**给出(`image_path="/abs/x.png"` / `[附件:文件 /abs/x.pdf]`)。
+- **核心约束(send-keys 只能送文本)**:无法携带 image content block,故附件一律 **落盘 → 给路径 → agent `Read(path)`**(原方案不变)。CC 的 `AttachmentMessage`/base64 content-block 机制(attachments.ts)走的是 API message 注入,**不适用** send-keys,**别照搬**。
+- **⚠️ 必需的约定落点(不是免费的)**:bare `claude` session **不会自动** Read `image_path` —— 官方插件能、是因为它**注入了 MCP server instructions** 教模型「见 image_path 就 Read」(本会话即如此,是 instructed 非 native)。故 ccteam **必须自建这条约定**:首选**经 ccteam 自己的 MCP server instructions**(daemon 的 MCP server 像 telegram 插件那样注入「入站为 `<channel>`;见 `image_path` 即 `Read` 该路径」),次选 `role.md`/`CLAUDE.md`。**dev 必须明确这条指令落在哪并实装**,否则入站图「静默没被看」。`<channel>` 标签本身是 provenance nicety,这条 Read 约定才是 load-bearing。
 - **安全**:文件名 sanitize(去路径分隔/控制符)、大小上限(Telegram bot 下载上限 20MB,超限回 chat 一行拒收)、仅 `chat_allowed` 的 chat。
 
 **被否**
@@ -141,7 +144,7 @@
 **触碰文件**:`transport/providers/telegram.rs`(解析 + getFile + 下载)、`transport/mod.rs`(`ChannelMessage.attachments` + `ChannelAttachment`)、`gateway.rs`(`handle_message` + turn 文本拼接)、`daemon.rs`(inbound consumer 透传 attachments)。
 
 **AC**
-- TG 发一张图 + caption「这是报错」→ agent turn 收到 caption + 一个可 Read 的本地 png 路径;Claude 能读到图。
+- TG 发一张图 + caption「这是报错」→ agent turn 收到 `<channel … image_path=…>` + 落盘 png;**在无人工追加提示下**,agent 主动 `Read` 该图(即 Read 约定指令已生效)——这条是验收重点,不是"路径在就行"。
 - 发 >20MB 文件 → chat 收到拒收提示,不崩。
 - 纯文本消息 → 行为与今天一致(attachments 空)。
 
@@ -218,7 +221,8 @@ P0 把 1 条变 N 条有序 send。`DurableOutboundRow`(daemon.rs:516)+ 其测�
 | 4096 是 UTF-16 单元非 char,emoji 易超 | `split_for_channel` 按 UTF-16 单元预算 + 保守 limit(3800–4000)|
 | 代码 fence 跨片破坏渲染 | 每片重开/闭合 fence,带单测 |
 | 附件下载占盘 / 超大文件 | 20MB 上限 + staging 目录定期清理(daemon 启动时清旧;本版至少不无限增长)|
-| B3b MCP→daemn 可达性未知 | 列为显式开放题;候选 A(artifact + watcher)兜底,实现前先确认 |
+| B3b 引入首条 live「MCP→daemon 内存」路径 | 走既有 `mcp.sock` 转发 + `run_start` 注入 `GatewayEvent` sink(§3-P2b ④);**不**新建 file-watcher(避免复活已退役 file-watch + inotify 老坑);同步返回 delivered/failed |
+| B3b/B2 `path` 假设共享文件系统 | Claude=tmux 本地成立;remote `ProcessBackend` 下破——记为显式假设,remote 时加「传字节」变体 |
 | Telegram 真·活体仍只 host-probe | 各 phase 用 deterministic fake + MockChannel/WsChannel 测;**最终另起一次真 bot-token 活体 round-trip smoke**(超出自动化范围,人工 gate)|
 
 ---
@@ -235,3 +239,19 @@ P0 把 1 条变 N 条有序 send。`DurableOutboundRow`(daemon.rs:516)+ 其测�
 - `docs/versions/v0-8-4/` 落各 phase handoff(Decided/Rejected/Risks/Files/Remaining 五段)。
 
 > 详细执行编排见同目录 `dev-plan.md`;派工提示词见 `dev-prompt.md`。
+
+---
+
+## 7. claude-code 源码借鉴(`references/claude-code` + 本会话实测)
+
+> 用户要求参考 `references/claude-code` 找更优雅/可靠的实现。**结论:借鉴 = 1 个框架印证 + 2 处实质细化(P1、P2a)+ 1 条 future 指针;不重构既有设计。** 取舍依据:`references/claude-code` 自述是**反编译/部分 stub** 的 CC core(其 CLAUDE.md 言明),故**入站格式以本会话亲历的官方 telegram 插件为准**,该 repo 作灵感;两者一致处引官方。
+
+**核心框架印证(借鉴①)**:CC 的「channel = 一个 MCP server:**出站**暴露工具(`send_message`)给模型调、**入站**发 `notifications/claude/channel` 通知,用 `<channel source meta>` 包裹」(`src/services/mcp/channelNotification.ts`)。映射到 ccteam:**daemon 扮演 channel**。⇒ **印证 B3b 的 socket 路由**(agent 调 `chat_send_file` = 调「channel 的出站工具」),**既有设计不改**,仅获得理论背书。`channel_context.chat_id` / 不透明 `meta` 透传 ⇒ 印证「agent 表意图、gateway 拥寻址」。
+
+**B2 不是缺口、是印证(借鉴附注)**:CC core **没有**消息分片——因为分片是 **channel/plugin-server 的职责**(官方 telegram 插件才 chunk)。这恰好**强化借鉴①**(channel 拥有"呈现/分片")。P0 设计(Telegram provider 声明 `max_message_len`、gateway 中立)不变。
+
+**P1 细化(借鉴③,已落 §3-P1)**:CC 对工具事件做**分组折叠**(`GroupedToolUseMessage` / `CollapsedReadSearchGroup`,types/message.ts)+ `truncateForPreview`(≤200 字符,channelPermissions.ts)。⇒ IM 进度**合并计数**而非逐条铺开 + 入参 phone-sized 截断。
+
+**P2a 细化 + 纠偏(借鉴②,已落 §3-P2a)**:借入站 `<channel source meta + image_path>` 封装(本会话亲历的官方插件格式)。**纠偏(motivated-mapping 自查)**:早期以为"agent 原生处理 image_path"——**错**。本会话能 Read 附件是因为插件**注入了 MCP server instructions** 教我这么做(instructed 非 native);bare `claude` session 无此指令,且 send-keys 只能送文本(无 content block)。⇒ ccteam **必须自建 Read 约定**(经自己的 MCP server instructions / role.md),否则入站图静默没被看。`AttachmentMessage`/base64 content-block 路径不适用 send-keys。
+
+**Future 指针(借鉴④,不属本版)**:CC 的 **permission-over-channel**(`channelPermissions.ts`:结构化 `{request_id, behavior}` + capability 显式 opt-in,**不**正则匹配文本;短 phone-friendly id)是 ccteam **未来 HITL 审批**的优雅范式。HITL 本版仍按红线推后,**仅作方向记录,不开工**。

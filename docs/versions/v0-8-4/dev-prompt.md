@@ -1,6 +1,6 @@
 # v0.8.4 派工提示词(粘贴到另一个 session)
 
-> 复制下面整段给负责开发的 Claude session。它自包含:指向已提交的 PRD/dev-plan,带每 phase 的 gate 与基线,点明 worktree 流程与唯一开放设计题。
+> 复制下面整段给负责开发的 Claude session。它自包含:指向已提交的 PRD/dev-plan,带每 phase 的 gate 与基线,点明 worktree 流程与 claude-code 借鉴(prd §7)。
 
 ---
 
@@ -33,7 +33,10 @@
 3. **不解析 pane / 不动 progress.jsonl schema / 不写迁移兼容分支**;新加的 trait 方法给 default impl、新结构字段给 `#[serde(default)]`,改公共结构 grep 全 impl + caller 一起改。
 
 ## P1 的一个显式前置 gate
-先写 fake-transcript 测试**钉死** `ItemCompleted{ToolCall/CommandExecution/FileChange}` 确实从 adapter `events()` 流出,再建进度状态机(别假设)。进度粒度 = 每步骤完成(transcript 不暴露 token 流),别去追流式。
+先写 fake-transcript 测试**钉死** `ItemCompleted{ToolCall/CommandExecution/FileChange}` 确实从 adapter `events()` 流出,再建进度状态机(别假设)。进度粒度 = 每步骤完成(transcript 不暴露 token 流),别去追流式。进度行**分组折叠**(借 claude-code `GroupedToolUseMessage`/`CollapsedReadSearchGroup`):合并计数 `read ×5 · bash ×3`,入参 `truncateForPreview`≤200 字符,别逐条铺开。详 prd §3-P1 / §7。
+
+## ⚠️ P2a 一个静默失败陷阱(必看)
+入站图:落盘→`<channel … image_path=…>` 注入→agent `Read`。**坑**:bare `claude` session **不会自动** Read image_path —— 本会话我能 Read 是因为 telegram 插件**注入了 MCP server instructions** 教我(instructed 非 native)。**ccteam 必须自建这条 Read 约定**(首选 daemon 自己的 MCP server instructions,次选 role.md/CLAUDE.md),并 dev 决定指令落点 + 实装。AC 验收点 = 「无人工追加提示下 agent 主动 Read 该图」。send-keys 只能送文本,CC 的 base64 content-block(`AttachmentMessage`)路径**不适用**,别照搬。详 prd §3-P2a / §7。
 
 ## P2b 设计已定 = socket 路由(prd §3-P2b ④,**不要**新建 file-watcher)
 通用原语 =「agent 主动向自己绑定 chat 发一条出站消息(文字 and/or 附件)」,发截图只是 instance。3 统一 + 1 桥:
