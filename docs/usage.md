@@ -5,7 +5,7 @@
 
 核心模型:**一个 chat 就是一台终端**。三个对象——
 
-- **chat**:Telegram 私聊/群聊或 web 控制台会话。每个 chat 有自己的当前 project、当前 session、session 列表,互相隔离。
+- **chat**:Telegram / 飞书(Lark)私聊/群聊或 web 控制台会话。每个 chat 有自己的当前 project、当前 session、session 列表,互相隔离。
 - **project**:本地一个已 `ccteam init` 的目录,用 slug 标识。
 - **session**:一个可继续上下文的 agent 会话,属于某个 chat + 某个 project。
 
@@ -87,7 +87,7 @@ ccteam ls                                        # 列已知项目
 
 ---
 
-## 3. 接入 IM(Telegram bot)
+## 3. 接入 IM(Telegram / 飞书 Lark bot)
 
 在 Telegram 找 `@BotFather` → `/newbot` 拿 token。给 bot 发一条消息(群里则把 bot 拉进去发一条),再取 chat id:
 
@@ -115,6 +115,35 @@ chmod 600 ~/.ccteam/im/credentials.json
 ```
 
 `allowed_chat_ids` 是安全边界:只有列出的 chat 能触达 daemon,**生产不留空**。改完凭证必须重启 daemon 才生效。
+
+### 飞书 / Lark bot(第二 IM 通道)
+
+Telegram 之外可同时接入飞书/Lark(同一个 `credentials.json`,与 telegram 并存)。走**原生 WebSocket 长连接**,不需要公网域名 / 回调地址。
+
+1. 开发者后台建应用 —— 飞书 `open.feishu.cn`(国内)或 Lark `open.larksuite.com`(国际)。
+2. 开「机器人」能力;**事件订阅选「长连接(WebSocket)」模式**(不是 webhook),订阅 `im.message.receive_v1`。
+3. 开通权限:`im:message`(读)+ `im:message:send_as_bot`(发)。
+4. 拿到 `App ID`(`cli_...`)+ `App Secret`。
+
+写进 `~/.ccteam/im/credentials.json` 的 `lark` 块(可与 telegram 同时存在):
+
+```json
+{
+  "telegram": { "bot_token": "123456:replace_me", "allowed_chat_ids": ["123456789"] },
+  "lark": {
+    "app_id": "cli_replace_me",
+    "app_secret": "replace_me",
+    "allowed_user_ids": ["ou_replace_me"],
+    "use_feishu": true
+  }
+}
+```
+
+- `use_feishu`:`true` = 飞书(国内 `open.feishu.cn`,默认);`false` = Lark 国际版(`open.larksuite.com`)。
+- `allowed_user_ids` 是 **open_id**(`ou_...`)白名单,且**留空 = 拒绝所有人**(fail-closed,与 telegram「空=放开」相反,默认更安全);`["*"]` 放开所有人(不建议)。
+- **怎么拿自己的 open_id**:先留个占位(或留空)启动 daemon,给 bot 发一条消息,在 daemon 日志里找这行 —— `Lark WS: ignoring ou_xxxx (not in allowed_users)`,`ou_xxxx` 就是你的 open_id;填回 `allowed_user_ids` 再重启。
+
+改完凭证同样要 `ccteam stop && ccteam start` 才生效。飞书/Lark 当前支持文本 + 富文本(post)收发;图片/文件收发是后续项。
 
 ---
 
