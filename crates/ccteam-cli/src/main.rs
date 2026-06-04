@@ -1748,7 +1748,10 @@ fn run_hook(cmd: HookCommand) -> Result<()> {
             ("progress-append", Some(event_type.as_str()), true)
         }
         HookCommand::LoadContext => ("load-context", None, true),
-        HookCommand::InterceptAsk => ("intercept-ask", None, false),
+        // v0.8.5 D6 — intercept-ask now reads the AskUserQuestion `tool_input`
+        // from stdin (the chat variant routes the question to IM); the bg
+        // variant ignores the payload and still denies.
+        HookCommand::InterceptAsk => ("intercept-ask", None, true),
         HookCommand::ChatProgress { event } => ("chat-progress", Some(event.as_str()), true),
     };
     let stdin = if needs_stdin {
@@ -1941,6 +1944,21 @@ fn run_start(
             (Some(t), Some(r))
         };
 
+        // v0.8.5 D6 — one shared pending-interaction registry handed to BOTH
+        // the gateway (resolves inbound clicks) and the mcp.sock handler
+        // (registers External-origin `interaction/ask` prompts from the
+        // AskUserQuestion hook). The shared `Arc` is the bridge across the two
+        // scopes. Only when IM is enabled (no gateway ⇒ no one to resolve).
+        let pending_registry: Option<
+            std::sync::Arc<tokio::sync::Mutex<ccteam_im::pending::PendingInteractions>>,
+        > = if imd.disabled {
+            None
+        } else {
+            Some(std::sync::Arc::new(tokio::sync::Mutex::new(
+                ccteam_im::pending::PendingInteractions::new(),
+            )))
+        };
+
         let imd_handle = if imd.disabled {
             tracing::info!("ccteam start: --no-imd set; IM gateway task skipped");
             None
@@ -1949,6 +1967,7 @@ fn run_start(
             let mut args = ccteam_im::DaemonArgs {
                 gateway_event_tx: gw_event_tx.clone(),
                 gateway_event_rx: gw_event_rx,
+                pending: pending_registry.clone(),
                 ..Default::default()
             };
             if let Some(bridge) = web_chat_bridge.as_ref() {
@@ -1966,8 +1985,9 @@ fn run_start(
 
         let mut rx = shutdown_rx.clone();
         let mcp_sink = gw_event_tx.clone();
+        let mcp_pending = pending_registry.clone();
         let mcp_handle = tokio::spawn(async move {
-            serve_mcp_socket(paths, mcp_sink, async move {
+            serve_mcp_socket(paths, mcp_sink, mcp_pending, async move {
                 let _ = rx.changed().await;
             })
             .await
@@ -2126,6 +2146,7 @@ fn run_start(
 async fn serve_mcp_socket<F>(
     paths: CcteamPaths,
     sink: Option<GatewayEventSink>,
+    pending: Option<PendingRegistry>,
     shutdown: F,
 ) -> Result<()>
 where
@@ -2153,8 +2174,11 @@ where
                     .with_context(|| format!("accept MCP socket {}", socket.display()))?;
                 let paths = paths.clone();
                 let sink = sink.clone();
+                let pending = pending.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = handle_mcp_socket_connection(paths, sink, stream).await {
+                    if let Err(err) =
+                        handle_mcp_socket_connection(paths, sink, pending, stream).await
+                    {
                         tracing::warn!(error = %err, "MCP socket connection failed");
                     }
                 });
@@ -2167,6 +2191,7 @@ where
 async fn serve_mcp_socket<F>(
     _paths: CcteamPaths,
     _sink: Option<GatewayEventSink>,
+    _pending: Option<PendingRegistry>,
     shutdown: F,
 ) -> Result<()>
 where
@@ -2180,6 +2205,7 @@ where
 async fn handle_mcp_socket_connection(
     paths: CcteamPaths,
     sink: Option<GatewayEventSink>,
+    pending: Option<PendingRegistry>,
     stream: tokio::net::UnixStream,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
@@ -2208,7 +2234,13 @@ async fn handle_mcp_socket_connection(
         // own the gateway-event sink); everything else routes to the
         // stateless handler. Intercepting BEFORE handle_request keeps it
         // from looping back into the stdio forward branch.
-        let response = if is_chat_send_file_call(&req) {
+        // v0.8.5 D6 — `interaction/ask` is intercepted the same way: it owns
+        // the shared pending registry + sink, registers an External-origin
+        // prompt, renders buttons via the sink, and blocks (no lock held) on
+        // the user's selection before responding.
+        let response = if is_interaction_ask_call(&req) {
+            Some(execute_interaction_ask(&req, sink.as_ref(), pending.as_ref()).await)
+        } else if is_chat_send_file_call(&req) {
             Some(execute_chat_send_file(&req, sink.as_ref()).await)
         } else {
             mcp_serve::handle_request(&paths, &req).await
@@ -2227,6 +2259,17 @@ async fn handle_mcp_socket_connection(
 /// daemon consumes; `chat_send_file` clones it to reuse that outbound
 /// funnel (P0 split + durable ledger + failure echo).
 type GatewayEventSink = tokio::sync::mpsc::UnboundedSender<ccteam_im::gateway::GatewayEvent>;
+
+/// v0.8.5 D6 — the shared pending-interaction registry the gateway and the
+/// mcp.sock handler both hold. The handler registers an External-origin
+/// prompt here; the gateway (handed the same `Arc` via `DaemonArgs::pending`)
+/// resolves it on the inbound option click.
+type PendingRegistry = std::sync::Arc<tokio::sync::Mutex<ccteam_im::pending::PendingInteractions>>;
+
+/// v0.8.5 D6 — how long the `interaction/ask` handler waits for the user to
+/// answer before forgetting the prompt + reporting a timeout (the hook then
+/// degrades to deny-with-reason). Matches the gateway pending TTL default.
+const INTERACTION_ASK_TIMEOUT_SECS: u64 = 600;
 
 /// Monotonic id source so each `chat_send_file` gets a distinct durable
 /// ledger row (avoids `{id}-0` collisions in `outbound.jsonl`).
@@ -2359,6 +2402,178 @@ fn parse_outbound_kind(kind: Option<&str>, path: &str) -> ccteam_im::transport::
             } else {
                 OutboundFileKind::Document
             }
+        }
+    }
+}
+
+/// v0.8.5 D6 — true when this line is the AskUserQuestion hook's
+/// `interaction/ask` RPC (raw JSON-RPC `method`, not a `tools/call`).
+fn is_interaction_ask_call(req: &serde_json::Value) -> bool {
+    req.get("method").and_then(|m| m.as_str()) == Some("interaction/ask")
+}
+
+/// v0.8.5 D6 — handle one `interaction/ask` request from the AskUserQuestion
+/// chat hook. Mint a token, build a [`ChoicePrompt`], resolve the bot's home
+/// chat, register an External-origin pending in the SHARED registry, emit a
+/// `GatewayEvent` so IM renders buttons, then block (with a TTL, holding NO
+/// lock) on the user's selection.
+///
+/// Request:  `{"jsonrpc":"2.0","id":N,"method":"interaction/ask",
+///             "params":{"slug","role","question","options":[..],"multi"}}`
+/// Response: `{"result":{"answers":{<question>:<label>}}}` on a pick,
+///           `{"result":{"timeout":true}}` on TTL lapse, or a JSON-RPC
+///           `error` when addressing / wiring is unavailable (the hook then
+///           degrades to deny-with-reason).
+async fn execute_interaction_ask(
+    req: &serde_json::Value,
+    sink: Option<&GatewayEventSink>,
+    pending: Option<&PendingRegistry>,
+) -> serde_json::Value {
+    use ccteam_harness::{ChoiceOption, ChoicePrompt, ChoiceSelection};
+    use ccteam_im::gateway::{GatewayEvent, GatewayEventKind};
+    use ccteam_im::pending::InteractionOrigin;
+    use ccteam_im::transport::MessageOption;
+
+    let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
+    let err_resp = |msg: String| {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id.clone(),
+            "error": { "code": -32000, "message": msg },
+        })
+    };
+
+    let (Some(sink), Some(pending)) = (sink, pending) else {
+        return err_resp("interaction/ask: IM gateway not running".to_string());
+    };
+    let params = req
+        .pointer("/params")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let slug = params.get("slug").and_then(|v| v.as_str()).unwrap_or("");
+    let role = params.get("role").and_then(|v| v.as_str()).unwrap_or("");
+    let question = params
+        .get("question")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let multi = params
+        .get("multi")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let options: Vec<String> = params
+        .get("options")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|o| o.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if question.is_empty() || options.is_empty() {
+        return err_resp("interaction/ask: empty question or options".to_string());
+    }
+
+    // Resolve addressing first — no point registering a pending we can't show.
+    let bots = match ccteam_im::list_bots() {
+        Ok(b) => b,
+        Err(e) => return err_resp(format!("interaction/ask: registry error: {e}")),
+    };
+    let Some((channel, chat_id)) = ccteam_im::resolve_home_chat(slug, role, &bots) else {
+        return err_resp(format!(
+            "interaction/ask: no registered chat for {slug}/{role}"
+        ));
+    };
+
+    // Mint a short token (≤16B ASCII, no `:` — the ChoicePrompt contract).
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let token = format!("h{:x}", (nanos as u64) & 0xff_ffff_ffff);
+
+    let prompt = ChoicePrompt {
+        token: token.clone(),
+        title: question.clone(),
+        options: options
+            .iter()
+            .map(|o| ChoiceOption {
+                id: o.clone(),
+                label: o.clone(),
+            })
+            .collect(),
+        multi,
+    };
+    let message_options: Vec<MessageOption> = prompt
+        .options
+        .iter()
+        .enumerate()
+        .map(|(i, opt)| MessageOption {
+            data: format!("{token}:{i}"),
+            label: opt.label.clone(),
+        })
+        .collect();
+
+    // Register the External-origin pending under the SHARED registry, keyed by
+    // the token itself (the gateway resolves token-globally via take_by_token).
+    // Release the guard BEFORE the long await (lock discipline §7-1).
+    let (tx, rx) = tokio::sync::oneshot::channel::<ChoiceSelection>();
+    let ttl = std::time::Duration::from_secs(INTERACTION_ASK_TIMEOUT_SECS);
+    {
+        let mut guard = pending.lock().await;
+        guard.register(
+            token.clone(),
+            prompt.clone(),
+            InteractionOrigin::External { reply: tx },
+            std::time::Instant::now() + ttl,
+        );
+    }
+
+    // Render the buttons in IM.
+    if sink
+        .send(GatewayEvent {
+            id: format!("interaction-{token}"),
+            channel,
+            chat_id,
+            thread_ts: None,
+            content: question.clone(),
+            kind: GatewayEventKind::Answer,
+            attachments: Vec::new(),
+            options: message_options,
+        })
+        .is_err()
+    {
+        // Sink closed: forget the pending so it can't leak.
+        pending.lock().await.take_by_token(&token);
+        return err_resp("interaction/ask: gateway sink closed".to_string());
+    }
+
+    // Block on the selection, holding NO lock. The daemon enforces the TTL.
+    match tokio::time::timeout(ttl, rx).await {
+        Ok(Ok(selection)) => {
+            // Map the resolved real id(s) back to label(s) for the hook echo.
+            let label = prompt
+                .options
+                .iter()
+                .find(|o| selection.ids.first() == Some(&o.id))
+                .map(|o| o.label.clone())
+                .or_else(|| selection.ids.first().cloned())
+                .or_else(|| selection.free_text.clone())
+                .unwrap_or_default();
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": { "answers": { question: label } },
+            })
+        }
+        _ => {
+            // Timeout or sender dropped — forget the pending (best-effort).
+            pending.lock().await.take_by_token(&token);
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": { "timeout": true },
+            })
         }
     }
 }

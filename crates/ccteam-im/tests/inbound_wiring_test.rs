@@ -1887,6 +1887,7 @@ async fn daemon_delivers_gateway_event_attachment_to_channel() {
         extra_channels: None,
         gateway_event_tx: Some(tx.clone()),
         gateway_event_rx: Some(rx),
+        pending: None,
     };
     run_daemon_with_shutdown(args, async {
         futures::future::pending::<()>().await;

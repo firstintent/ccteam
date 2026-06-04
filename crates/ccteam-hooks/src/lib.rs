@@ -24,7 +24,7 @@ pub mod load_context;
 pub mod progress;
 
 pub use chat_progress::handle_chat_progress;
-pub use intercept_ask::intercept_ask_decision;
+pub use intercept_ask::{intercept_ask_chat, intercept_ask_decision};
 pub use load_context::load_context;
 pub use progress::progress_append;
 
@@ -69,7 +69,12 @@ pub fn dispatch(
             load_context(paths, stdin)?;
             Ok(None)
         }
-        "intercept-ask" => Ok(Some(intercept_ask_decision())),
+        // v0.8.5 D6 — `intercept_ask_chat` turns an AskUserQuestion into an IM
+        // choice round-trip (over the daemon mcp.sock) when this is a chat
+        // session (`CCTEAM_CHAT_SLUG` set + daemon reachable) and answers
+        // `allow` with the user's pick; otherwise (bg / unreachable / timeout)
+        // it degrades to the deny-with-reason of `intercept_ask_decision`.
+        "intercept-ask" => Ok(Some(intercept_ask_chat(paths, stdin))),
         "chat-progress" => {
             let event =
                 action.ok_or_else(|| anyhow!("hook `chat-progress` requires an event argument"))?;

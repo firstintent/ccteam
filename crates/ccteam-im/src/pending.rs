@@ -109,6 +109,31 @@ impl PendingInteractions {
         self.map.remove(key)
     }
 
+    /// Take (remove) the pending whose prompt `token` matches, scanning all
+    /// keys (v0.8.5 D6). The D6 ingress is token-only: a hook-minted
+    /// `interaction/ask` prompt is registered under the token as its own key,
+    /// and the inbound callback `"{token}:{idx}"` resolves it globally —
+    /// gateway callbacks are unified onto this path so a click resolves by
+    /// token regardless of which (chat, session) the registration key encoded.
+    pub fn take_by_token(&mut self, token: &str) -> Option<PendingInteraction> {
+        let key = self
+            .map
+            .iter()
+            .find(|(_, p)| p.prompt.token == token)
+            .map(|(k, _)| k.clone())?;
+        self.map.remove(&key)
+    }
+
+    /// Peek the prompt whose `token` matches, scanning all keys (v0.8.5 D6).
+    /// The idx→id reverse lookup needs the option list before committing to
+    /// [`Self::take_by_token`].
+    pub fn prompt_by_token(&self, token: &str) -> Option<&ChoicePrompt> {
+        self.map
+            .values()
+            .find(|p| p.prompt.token == token)
+            .map(|p| &p.prompt)
+    }
+
     /// Remove + return every entry whose `expires_at <= now`. Returned so
     /// External origins can be denied-with-reason rather than silently
     /// dropped.

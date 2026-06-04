@@ -103,6 +103,14 @@ pub struct DaemonArgs {
     pub gateway_event_tx: Option<tokio::sync::mpsc::UnboundedSender<GatewayEvent>>,
     /// Receiver half paired with [`Self::gateway_event_tx`].
     pub gateway_event_rx: Option<tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>>,
+    /// v0.8.5 D6 — shared pending-interaction registry. When `Some`, the
+    /// daemon injects it into the gateway via [`Gateway::set_pending`] so the
+    /// gateway and the `mcp.sock` handler (which `ccteam start` hands the same
+    /// `Arc`) share one registry: the handler registers External-origin
+    /// `interaction/ask` prompts, the gateway resolves them on inbound. `None`
+    /// (standalone `ccteam-im run`, no mcp.sock) → the gateway keeps its own
+    /// fresh registry.
+    pub pending: Option<Arc<Mutex<crate::pending::PendingInteractions>>>,
 }
 
 impl std::fmt::Debug for DaemonArgs {
@@ -122,6 +130,7 @@ impl std::fmt::Debug for DaemonArgs {
             )
             .field("gateway_event_tx", &self.gateway_event_tx.is_some())
             .field("gateway_event_rx", &self.gateway_event_rx.is_some())
+            .field("pending", &self.pending.is_some())
             .finish()
     }
 }
@@ -198,6 +207,13 @@ where
     replay_durable_outbox(&channels).await;
     let mut gateway_inner =
         build_gateway(factory.clone(), &projects_root, &config_projects, &initial);
+    // v0.8.5 D6 — inject the shared pending-interaction registry when one was
+    // supplied (`ccteam start` hands the same `Arc` to the mcp.sock handler so
+    // the D6 `interaction/ask` ingress and the gateway resolve through one
+    // registry). Standalone runs leave the gateway's own fresh registry.
+    if let Some(pending) = args.pending.clone() {
+        gateway_inner.set_pending(pending);
+    }
     gateway_inner.resume_restored_sessions().await;
     log_orphan_chat_sessions(&gateway_inner).await;
     // V0.8.4 P2b — use the externally-supplied channel when `ccteam start`

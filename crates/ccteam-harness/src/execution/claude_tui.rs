@@ -61,7 +61,7 @@ use crate::{
     AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx,
     ThreadEvent, ThreadHandle, TurnId, TurnInput, CLAUDE_BIN_ENV,
 };
-use crate::{Directive, DirectiveOutcome, ThreadStatus};
+use crate::{ChoiceOption, ChoicePrompt, Directive, DirectiveOutcome, ThreadStatus};
 
 /// V0.6.0 F108 [`HarnessAdapter`] for Claude Code TUI (long-running tmux
 /// session, multi-turn with context reuse).
@@ -178,6 +178,38 @@ pub fn ensure_chat_hooks_installed(project_dir: &Path, hook_sh: &str) -> Result<
         hooks_obj.insert((*event).to_string(), entry);
     }
 
+    // v0.8.5 D6 — additive `AskUserQuestion` PreToolUse matcher: route the
+    // agent's question to the IM user (chat round-trip over the daemon
+    // mcp.sock) instead of letting it block the TUI. This is a SECOND
+    // PreToolUse array entry alongside the `"*"` chat-progress one above (the
+    // loop wrote PreToolUse as a one-element array; append, don't replace).
+    //
+    // ALWAYS the `{hook_sh} intercept-ask` wrapper form (HTTP-to-daemon fast
+    // path + CLI fallback) — NOT the W6 `mux hook-emit` daemon-bus reroute the
+    // other chat events use. `hook-emit` is fire-and-forget (frames a HookEvent
+    // to the hook.sock and exits with no stdout), but AskUserQuestion is a
+    // *blocking decision* hook: Claude Code reads the `permissionDecision`
+    // (allow + answer / deny) from this command's stdout, which only the
+    // wrapper path returns. The hook degrades to deny-with-reason when there is
+    // no chat slug or the daemon is unreachable (bg behavior preserved).
+    // `timeout` is the hook-subprocess budget (slightly above the daemon's
+    // 600s answer TTL, which is enforced out of band).
+    let _ = via_daemon; // intentionally not used for the blocking ask hook
+    let ask_entry = json!({
+        "matcher": "AskUserQuestion",
+        "hooks": [{
+            "type": "command",
+            "command": format!("{hook_sh} intercept-ask"),
+            "timeout": 660,
+        }],
+    });
+    if let Some(pre_tool_use) = hooks_obj
+        .get_mut("PreToolUse")
+        .and_then(|v| v.as_array_mut())
+    {
+        pre_tool_use.push(ask_entry);
+    }
+
     let serialized = serde_json::to_string_pretty(&root)
         .map_err(|e| HarnessError::Io(format!("serialize settings.json: {e}")))?;
     std::fs::write(&settings_path, serialized)
@@ -282,6 +314,79 @@ fn hook_via_daemon_enabled() -> bool {
     std::env::var("CCTEAM_HOOK_VIA_DAEMON")
         .map(|v| v == "1")
         .unwrap_or(false)
+}
+
+/// v0.8.5 D5 — local-jsx popup commands that apply directly when given an
+/// arg (no picker) but pop a picker when bare (model: SetModelAndClose;
+/// effort: ApplyEffortAndClose). bare → NeedsChoice; arg/choice → arg-form
+/// passthrough. Synced from references/claude-code/src/commands.
+const CLAUDE_ARG_POPUPS: &[&str] = &["model", "effort"];
+
+/// v0.8.5 D5 — local-jsx commands that open a TUI panel/picker with no
+/// chat-drivable arg form; sent bare they stick the modal + swallow input,
+/// so the gate Rejects them (never blind-send a popup). Curated
+/// (clearly-blocking subset) from references/claude-code/src/commands/*;
+/// re-sync when bumping the claude reference. `/esc` recovers a stuck one.
+const CLAUDE_PANEL_POPUPS: &[&str] = &[
+    "config",
+    "agents",
+    "permissions",
+    "mcp",
+    "hooks",
+    "plan",
+    "ide",
+    "login",
+    "logout",
+    "theme",
+    "vault",
+    "privacy-settings",
+    "output-style",
+    "terminal-setup",
+    "sandbox-toggle",
+    "rate-limit-options",
+];
+
+/// Model aliases offered for a bare `/model` choice (MODEL_ALIASES,
+/// references/claude-code/src/utils/model/aliases.ts).
+const CLAUDE_MODEL_ALIASES: &[&str] = &[
+    "opus",
+    "sonnet",
+    "haiku",
+    "best",
+    "opus[1m]",
+    "sonnet[1m]",
+    "opusplan",
+];
+
+/// Reasoning-effort levels offered for a bare `/effort` choice.
+const CLAUDE_EFFORT_LEVELS: &[&str] = &["low", "medium", "high"];
+
+/// Build the [`ChoicePrompt`] for a bare arg-applicable popup (D5). The
+/// token is a per-prompt unique id (≤16B ASCII, no `:`): the gateway
+/// resolves callbacks token-globally, so a name-based token would collide
+/// when two sessions raise the same command's picker at once.
+fn claude_popup_prompt(name: &str) -> ChoicePrompt {
+    let (title, opts): (&str, &[&str]) = match name {
+        "model" => ("Pick a model", CLAUDE_MODEL_ALIASES),
+        "effort" => ("Pick a reasoning effort", CLAUDE_EFFORT_LEVELS),
+        _ => ("Pick an option", &[]),
+    };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    ChoicePrompt {
+        token: format!("cj{:x}", (nanos as u64) & 0xff_ffff_ffff),
+        title: title.to_string(),
+        options: opts
+            .iter()
+            .map(|o| ChoiceOption {
+                id: (*o).to_string(),
+                label: (*o).to_string(),
+            })
+            .collect(),
+        multi: false,
+    }
 }
 
 #[async_trait]
@@ -675,16 +780,69 @@ impl HarnessAdapter for ClaudeTuiAdapter {
         h: &ThreadHandle,
         d: Directive,
     ) -> Result<DirectiveOutcome, HarnessError> {
-        // W1: zero-knowledge passthrough — Claude's established behavior is
-        // to forward every slash to its own TUI. W2 (D5) layers the
-        // four-channel gate on top (local-jsx bare → NeedsChoice, no-arg
-        // panels → Rejected/Redirect, AskUserQuestion → D6). Reusing
-        // `submit_turn(UserText("/..."))` keeps one send path and the
-        // zero-knowledge passthrough red line intact.
+        // D5 four-channel gate (arch-refactor §2.1 / D5; §5.1 smoke PASS →
+        // main path). Channels: (1) prompt open-set + (2) BRIDGE_SAFE local
+        // → zero-knowledge passthrough; (3) local-jsx popups: arg-applicable
+        // (model/effort) apply directly with an arg, bare → NeedsChoice
+        // (never blind-send a bare popup); panel-only → Rejected; (4) agent
+        // popups → D6 (the hook path, not here). Plus `/esc` → Escape.
+        let name = d.name.trim().trim_start_matches('/').to_ascii_lowercase();
+
+        // `/esc` escape hatch — cancel a stuck picker (write-only Escape).
+        if name == "esc" || name == "escape" {
+            default_backend()
+                .send_escape(&MuxSessionId::new(h.identity.clone()))
+                .await
+                .map_err(|e| HarnessError::SubmitFailed(format!("send Escape: {e}")))?;
+            return Ok(DirectiveOutcome::Done {
+                receipt: "sent Escape to the Claude session".to_string(),
+            });
+        }
+
+        // Channel 3a — arg-applicable popup (model / effort). A resolved
+        // choice (from a prior NeedsChoice) or inline args both apply
+        // directly with no picker (confirmed by the §5.1 smoke).
+        if CLAUDE_ARG_POPUPS.contains(&name.as_str()) {
+            let applied = d
+                .choice
+                .as_ref()
+                .and_then(|c| {
+                    c.ids
+                        .first()
+                        .cloned()
+                        .or_else(|| c.free_text.clone().filter(|s| !s.trim().is_empty()))
+                })
+                .or_else(|| {
+                    let a = d.args.trim();
+                    (!a.is_empty()).then(|| a.to_string())
+                });
+            match applied {
+                Some(arg) => {
+                    let turn = self
+                        .submit_turn(h, TurnInput::UserText(format!("/{name} {}", arg.trim())))
+                        .await?;
+                    return Ok(DirectiveOutcome::Turn(turn));
+                }
+                // bare → offer the choice; the gateway renders + re-enters.
+                None => return Ok(DirectiveOutcome::NeedsChoice(claude_popup_prompt(&name))),
+            }
+        }
+
+        // Channel 3b — panel-only popup: no chat-drivable arg form.
+        if CLAUDE_PANEL_POPUPS.contains(&name.as_str()) {
+            return Ok(DirectiveOutcome::Rejected {
+                reason: format!(
+                    "/{name} opens a Claude TUI panel that can't be driven from chat — \
+                     run it in a direct `claude` session (use /esc if a picker is stuck)."
+                ),
+            });
+        }
+
+        // Channels 1 + 2 (+ unknown) — zero-knowledge passthrough.
         let line = if d.args.trim().is_empty() {
-            format!("/{}", d.name)
+            format!("/{name}")
         } else {
-            format!("/{} {}", d.name, d.args.trim())
+            format!("/{name} {}", d.args.trim())
         };
         let turn = self.submit_turn(h, TurnInput::UserText(line)).await?;
         Ok(DirectiveOutcome::Turn(turn))

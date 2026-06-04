@@ -253,6 +253,30 @@ fn ensure_chat_hooks_creates_settings_with_all_events() {
     let s = body.as_str();
     assert!(s.contains("chat-progress session-start"));
     assert!(s.contains("chat-progress stop"));
+
+    // v0.8.5 D6 — PreToolUse must carry BOTH the `"*"` chat-progress entry and
+    // a SECOND `AskUserQuestion` matcher routing to the intercept-ask hook.
+    let pre = hooks
+        .get("PreToolUse")
+        .and_then(|v| v.as_array())
+        .expect("PreToolUse is an array");
+    assert!(
+        pre.iter()
+            .any(|e| e.get("matcher").and_then(|m| m.as_str()) == Some("*")),
+        "PreToolUse keeps the chat-progress `*` entry: {pre:?}"
+    );
+    let ask = pre
+        .iter()
+        .find(|e| e.get("matcher").and_then(|m| m.as_str()) == Some("AskUserQuestion"))
+        .expect("PreToolUse has an AskUserQuestion matcher (D6)");
+    let cmd = ask
+        .pointer("/hooks/0/command")
+        .and_then(|c| c.as_str())
+        .expect("AskUserQuestion entry has a command");
+    assert!(
+        cmd.ends_with("intercept-ask") && cmd.contains("hook.sh"),
+        "AskUserQuestion routes to the intercept-ask wrapper, got: {cmd}"
+    );
 }
 
 #[test]
@@ -278,4 +302,94 @@ fn adapter_metadata_advertises_claude_tui() {
     let a = ClaudeTuiAdapter::new();
     assert_eq!(a.name(), "claude-tui");
     assert_eq!(a.vendor(), AgentVendor::Claude);
+}
+
+// ── D5 four-channel gate classification (NeedsChoice / Rejected return
+// before any backend call, so these need no tmux). ─────────────────────
+
+fn dummy_chat_handle() -> ThreadHandle {
+    ThreadHandle {
+        vendor: AgentVendor::Claude,
+        mode: ExecutionMode::Chat,
+        identity: "ccteam-chat-demo-bot".into(),
+        started_at: chrono::Utc::now(),
+        raw_extras: serde_json::json!({}),
+    }
+}
+
+#[tokio::test]
+async fn claude_directive_bare_model_offers_choice() {
+    // D5: a bare arg-applicable popup must NeedsChoice (never blind-send).
+    let outcome = ClaudeTuiAdapter::new()
+        .handle_directive(
+            &dummy_chat_handle(),
+            Directive {
+                name: "model".into(),
+                args: String::new(),
+                choice: None,
+            },
+        )
+        .await
+        .expect("handle_directive");
+    match outcome {
+        DirectiveOutcome::NeedsChoice(p) => {
+            assert!(
+                p.token.starts_with("cj") && !p.token.contains(':') && p.token.len() <= 16,
+                "token must be a unique, colon-free, ≤16B id: {:?}",
+                p.token
+            );
+            assert!(!p.multi);
+            let ids: Vec<&str> = p.options.iter().map(|o| o.id.as_str()).collect();
+            assert!(
+                ids.contains(&"opus") && ids.contains(&"sonnet"),
+                "model aliases expected, got {ids:?}"
+            );
+        }
+        other => panic!("bare /model must NeedsChoice, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn claude_directive_bare_effort_offers_choice() {
+    let outcome = ClaudeTuiAdapter::new()
+        .handle_directive(
+            &dummy_chat_handle(),
+            Directive {
+                name: "effort".into(),
+                args: String::new(),
+                choice: None,
+            },
+        )
+        .await
+        .expect("handle_directive");
+    match outcome {
+        DirectiveOutcome::NeedsChoice(p) => {
+            let ids: Vec<&str> = p.options.iter().map(|o| o.id.as_str()).collect();
+            assert_eq!(ids, vec!["low", "medium", "high"]);
+        }
+        other => panic!("bare /effort must NeedsChoice, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn claude_directive_panel_command_rejected() {
+    // D5: panel-only popups have no chat-drivable arg form → Rejected
+    // (never blind-send a bare popup that would stick the modal).
+    for name in ["config", "agents", "permissions"] {
+        let outcome = ClaudeTuiAdapter::new()
+            .handle_directive(
+                &dummy_chat_handle(),
+                Directive {
+                    name: name.into(),
+                    args: String::new(),
+                    choice: None,
+                },
+            )
+            .await
+            .expect("handle_directive");
+        assert!(
+            matches!(outcome, DirectiveOutcome::Rejected { .. }),
+            "/{name} (panel popup) must Rejected, got {outcome:?}"
+        );
+    }
 }

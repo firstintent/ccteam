@@ -1195,17 +1195,19 @@ impl Gateway {
         }
     }
 
-    /// Resolve an inbound option click (`"{token}:{idx}"`) against the
-    /// current session's pending choice (v0.8.5 D3).
+    /// Resolve an inbound option click (`"{token}:{idx}"`) by TOKEN, scanning
+    /// the whole registry (v0.8.5 D3 + D6). Token-global so the one path
+    /// resolves both origins: a Directive prompt (registered under
+    /// `pending_key(chat, session)`) and a D6 External prompt (registered by
+    /// the mcp.sock handler under the token itself, with no gateway session).
+    /// The callback `data` (`"{token}:{idx}"`) carries the token + positional
+    /// index; the real option id is reverse-resolved from the taken prompt and
+    /// never leaves the gateway.
     async fn resolve_selection(&self, chat: &ChatKey, data: &str) -> Result<Vec<String>> {
         let Some((token, idx)) = split_callback(data) else {
             return Ok(vec!["invalid selection".to_string()]);
         };
-        let Some(session_id) = self.current_session.get(chat).cloned() else {
-            return Ok(vec!["no active selection".to_string()]);
-        };
-        let key = pending_key(chat, &session_id);
-        let taken = self.pending.lock().await.take_matching(&key, &token);
+        let taken = self.pending.lock().await.take_by_token(&token);
         let Some(p) = taken else {
             return Ok(vec!["this choice has expired".to_string()]);
         };
@@ -3062,5 +3064,153 @@ mod tests {
             "expected 2 deduped sessions: {}",
             listing[0]
         );
+    }
+
+    // ===== v0.8.5 D6 — AskUserQuestion → IM round-trip (External origin) =====
+
+    /// Build a 3-option single-select prompt with distinct real ids vs labels,
+    /// so the idx→id reverse mapping is actually exercised (a click on index 1
+    /// must resolve to id `m-sonnet`, not the label or the index).
+    fn ask_prompt(token: &str) -> ChoicePrompt {
+        ChoicePrompt {
+            token: token.to_string(),
+            title: "Which model?".to_string(),
+            options: vec![
+                ChoiceOption {
+                    id: "m-opus".into(),
+                    label: "Opus".into(),
+                },
+                ChoiceOption {
+                    id: "m-sonnet".into(),
+                    label: "Sonnet".into(),
+                },
+                ChoiceOption {
+                    id: "m-haiku".into(),
+                    label: "Haiku".into(),
+                },
+            ],
+            multi: false,
+        }
+    }
+
+    /// §8-8 D6 e2e (no live socket): the mcp.sock handler registers an
+    /// External-origin pending in the SHARED registry; an inbound option click
+    /// delivered through the gateway resolves it token-globally and the waiting
+    /// oneshot receives the resolved `ChoiceSelection` with the correct REAL
+    /// option id (idx 1 → `m-sonnet`). This is exactly the D6 ingress contract
+    /// minus the UnixStream transport.
+    #[tokio::test]
+    async fn d6_external_origin_inbound_click_resolves_oneshot() {
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+
+        // The shared registry the daemon hands to BOTH the gateway and the
+        // mcp.sock handler. Here the test plays the handler: register the
+        // External pending under the token (mcp.sock keys by token; the
+        // gateway resolves token-globally).
+        let shared = Arc::new(Mutex::new(crate::pending::PendingInteractions::new()));
+        gateway.set_pending(shared.clone());
+
+        let token = "habc123";
+        let (tx, rx) = tokio::sync::oneshot::channel::<ChoiceSelection>();
+        shared.lock().await.register(
+            token.to_string(),
+            ask_prompt(token),
+            InteractionOrigin::External { reply: tx },
+            Instant::now() + std::time::Duration::from_secs(600),
+        );
+
+        // The user clicks option index 1 ("Sonnet"). Delivered as a callback
+        // selection, never as text — note there is NO current gateway session
+        // for this chat, proving resolution is purely token-based.
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "chat-9",
+                "bob",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: format!("{token}:1"),
+                }),
+            )
+            .await
+            .unwrap();
+        // External delivery produces no chat reply (the answer flows over the
+        // oneshot back to the blocked hook, not back to the chat).
+        assert!(
+            replies.is_empty(),
+            "External resolve must not emit a chat reply: {replies:?}"
+        );
+
+        // The blocked hook task receives the resolved selection with the REAL
+        // id mapped from the positional index — not the label, not the index.
+        let got = rx.await.expect("oneshot delivered");
+        assert_eq!(got.token, token);
+        assert_eq!(got.ids, vec!["m-sonnet".to_string()]);
+        assert_eq!(got.free_text, None);
+
+        // Single-flight: the pending was removed on resolve.
+        assert!(
+            shared.lock().await.is_empty(),
+            "pending consumed on resolve"
+        );
+    }
+
+    /// A click whose token matches no live pending (expired / already-answered)
+    /// must not panic and must leave the registry untouched; the user sees a
+    /// benign "expired" notice. Mirrors the daemon timeout path where the
+    /// handler `take_by_token`s a now-absent entry.
+    #[tokio::test]
+    async fn d6_external_stale_token_click_is_benign() {
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        let shared = Arc::new(Mutex::new(crate::pending::PendingInteractions::new()));
+        gateway.set_pending(shared.clone());
+
+        // No registration — simulate a click after the pending already lapsed.
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "chat-9",
+                "bob",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "hdead:0".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replies, vec!["this choice has expired".to_string()]);
+        assert!(shared.lock().await.is_empty());
+    }
+
+    /// Timeout/drain: an External pending that lapses is returned by
+    /// `drain_expired` (so the daemon can forget it) and, once dropped, the
+    /// blocked hook's oneshot receiver observes a `RecvError` — which the
+    /// daemon maps to the `{"timeout":true}` response. Exercised at the
+    /// registry layer (the gateway holds the same `Arc`).
+    #[tokio::test]
+    async fn d6_external_pending_timeout_drops_oneshot() {
+        let shared = Arc::new(Mutex::new(crate::pending::PendingInteractions::new()));
+        let (tx, rx) = tokio::sync::oneshot::channel::<ChoiceSelection>();
+        let token = "hstale1";
+        // Register already-expired (expires_at in the past).
+        shared.lock().await.register(
+            token.to_string(),
+            ask_prompt(token),
+            InteractionOrigin::External { reply: tx },
+            Instant::now() - std::time::Duration::from_secs(1),
+        );
+        let drained = shared.lock().await.drain_expired(Instant::now());
+        assert_eq!(drained.len(), 1, "lapsed External pending is drained");
+        // Dropping the drained pending drops its sender; the blocked hook's
+        // receiver then errors (daemon → {"timeout":true}).
+        drop(drained);
+        assert!(rx.await.is_err(), "dropped sender ⇒ receiver RecvError");
+        assert!(shared.lock().await.is_empty());
     }
 }

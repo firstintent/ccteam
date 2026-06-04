@@ -260,6 +260,15 @@ pub trait ProcessBackend: Send + Sync {
         self.send_enter(id).await
     }
 
+    /// Send an Escape keystroke to cancel a TUI picker/modal (v0.8.5 D5
+    /// `/esc` escape hatch). The ESC control byte (`0x1b`) delivered as
+    /// literal input *is* Escape, so the default routes through
+    /// [`Self::send_text`] — write-only, no pane scrape. Backends without a
+    /// key channel (in-proc / mock) inherit a harmless ESC-as-text write.
+    async fn send_escape(&self, id: &MuxSessionId) -> Result<()> {
+        self.send_text(id, "\u{1b}").await
+    }
+
     /// Subscribe to the typed event stream. Stream ends when session
     /// ends. The refcount + FIFO bookkeeping (F56) is internalized
     /// inside the impl (audit delta 10).
