@@ -9,19 +9,22 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
 use ccteam_core::config::{upsert_project, ProjectEntry};
 use ccteam_core::projects::{bootstrap_project_at_dir, validate_slug_format};
 use ccteam_core::CcteamPaths;
 use ccteam_harness::{
-    chat_session_name, parse_chat_session_name, AgentSpecBrief, AgentVendor, HarnessAdapter,
-    ProcessBackend, SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails, TurnInput,
+    chat_session_name, parse_chat_session_name, AgentSpecBrief, AgentVendor, ChoicePrompt,
+    ChoiceSelection, Directive, DirectiveOutcome, HarnessAdapter, ProcessBackend, SpawnCtx,
+    ThreadEvent, ThreadHandle, ThreadItemDetails, TurnInput,
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
-use crate::transport::{AttachmentKind, ChannelAttachment};
+use crate::pending::InteractionOrigin;
+use crate::transport::{AttachmentKind, ChannelAttachment, ChoiceReply, MessageOption};
 use crate::BotRegistration;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -84,6 +87,12 @@ pub struct Gateway {
     next_session: u64,
     event_sink: Option<tokio::sync::mpsc::UnboundedSender<GatewayEvent>>,
     event_pumps: BTreeMap<String, tokio::task::JoinHandle<()>>,
+    /// Outstanding choice prompts (v0.8.5 D3/D4/D6). Its own lock — held
+    /// separately from the gateway so a long External await (D6, W2) never
+    /// blocks gateway inbound. The daemon injects a shared `Arc` (also
+    /// handed to the mcp.sock handler) via [`Gateway::set_pending`]; tests
+    /// get the default fresh registry.
+    pending: Arc<tokio::sync::Mutex<crate::pending::PendingInteractions>>,
     /// Path context for `/newproject` (scaffold + config-registry write).
     /// `None` in unit tests that don't exercise project creation; the
     /// daemon sets it via [`Gateway::enable_project_creation`].
@@ -132,6 +141,10 @@ pub struct GatewayEvent {
     /// Outbound file attachments (V0.8.4 P2b — `chat_send_file`). Empty
     /// for normal text answers / progress updates.
     pub attachments: Vec<crate::transport::OutboundFile>,
+    /// Selectable options to render as buttons / chips (v0.8.5 D3). Empty
+    /// for ordinary answers; non-empty when an adapter `NeedsChoice` (or a
+    /// D6 hook prompt, W2) is delivered asynchronously.
+    pub options: Vec<crate::transport::MessageOption>,
 }
 
 /// A live `ccteam-chat-*` process with no matching tracked gateway session —
@@ -184,6 +197,75 @@ struct SavedGatewaySession {
     thread: ThreadHandle,
 }
 
+/// A gateway-owned command (v0.8.5 P1): the single source of truth for the
+/// command names the gateway handles itself + their menu/help metadata.
+/// `is_gateway_command`, `/help`, and the channel menu registration all
+/// derive from this table — no hand-copied lists drifting apart.
+pub struct GatewayCommandSpec {
+    /// Command name including the leading `/` (e.g. `"/new"`).
+    pub name: &'static str,
+    /// Short argument hint for `/help` (e.g. `"<id>"`); `None` for zero-arg.
+    pub arg_hint: Option<&'static str>,
+    /// One-line description for `/help` and the channel menu.
+    pub help: &'static str,
+    /// Show in the channel command menu. Zero-arg commands read well in a
+    /// menu; arg-bearing ones still work but the menu only types the name.
+    pub in_menu: bool,
+}
+
+/// The gateway's own commands. Everything else `/…` is forwarded to the
+/// current session's agent via `handle_directive`.
+pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
+    GatewayCommandSpec {
+        name: "/new",
+        arg_hint: Some("[vendor] [role]"),
+        help: "start a new session",
+        in_menu: true,
+    },
+    GatewayCommandSpec {
+        name: "/use",
+        arg_hint: Some("<id>"),
+        help: "switch to a session",
+        in_menu: false,
+    },
+    GatewayCommandSpec {
+        name: "/cd",
+        arg_hint: Some("<project>"),
+        help: "switch project",
+        in_menu: false,
+    },
+    GatewayCommandSpec {
+        name: "/sessions",
+        arg_hint: None,
+        help: "list sessions + status",
+        in_menu: true,
+    },
+    GatewayCommandSpec {
+        name: "/projects",
+        arg_hint: None,
+        help: "list projects",
+        in_menu: true,
+    },
+    GatewayCommandSpec {
+        name: "/newproject",
+        arg_hint: Some("<slug> <path>"),
+        help: "scaffold + register a project",
+        in_menu: false,
+    },
+    GatewayCommandSpec {
+        name: "/pair",
+        arg_hint: Some("<code>"),
+        help: "pair this chat",
+        in_menu: false,
+    },
+    GatewayCommandSpec {
+        name: "/help",
+        arg_hint: None,
+        help: "show gateway commands",
+        in_menu: true,
+    },
+];
+
 impl Gateway {
     /// Create a gateway with one default project.
     pub fn new(
@@ -224,6 +306,9 @@ impl Gateway {
             next_session: 0,
             event_sink: None,
             event_pumps: BTreeMap::new(),
+            pending: Arc::new(tokio::sync::Mutex::new(
+                crate::pending::PendingInteractions::new(),
+            )),
             project_paths: None,
         }
     }
@@ -240,6 +325,17 @@ impl Gateway {
         for id in ids {
             self.spawn_event_pump(&id);
         }
+    }
+
+    /// Inject the shared pending-interaction registry (v0.8.5). The daemon
+    /// hands the same `Arc` to the mcp.sock handler so D6 (W2) can register
+    /// External-origin prompts there while the gateway resolves them on
+    /// inbound — a single shared registry, two wiring points.
+    pub fn set_pending(
+        &mut self,
+        pending: Arc<tokio::sync::Mutex<crate::pending::PendingInteractions>>,
+    ) {
+        self.pending = pending;
     }
 
     /// Enable `/newproject <slug> <path>` by giving the gateway the path
@@ -378,10 +474,10 @@ impl Gateway {
 
     /// True when `text` is one of the gateway-owned slash commands.
     pub fn is_gateway_command(text: &str) -> bool {
-        matches!(
-            text.split_whitespace().next(),
-            Some("/pair" | "/new" | "/use" | "/cd" | "/sessions" | "/projects" | "/newproject")
-        )
+        match text.split_whitespace().next() {
+            Some(first) => GATEWAY_COMMANDS.iter().any(|c| c.name == first),
+            None => false,
+        }
     }
 
     /// True when this chat/user already has a current gateway session.
@@ -401,7 +497,7 @@ impl Gateway {
         user_id: &str,
         text: &str,
     ) -> Result<Vec<String>> {
-        self.handle_message(channel, chat_id, user_id, "", text, &[])
+        self.handle_message(channel, chat_id, user_id, "", text, &[], None)
             .await
     }
 
@@ -411,6 +507,10 @@ impl Gateway {
     /// file's on-disk path, so the agent `Read`s it — the load-bearing
     /// Read convention is taught by the daemon's MCP server instructions
     /// (`ccteam mcp-serve` `initialize`).
+    // v0.8.5 D3 added the `selection` arg (inbound option click); the
+    // per-field inbound signature is the established shape (same as the
+    // daemon's `deliver_progress`), so allow the arg count.
+    #[allow(clippy::too_many_arguments)]
     pub async fn handle_message(
         &mut self,
         channel: &str,
@@ -419,8 +519,22 @@ impl Gateway {
         message_id: &str,
         text: &str,
         attachments: &[ChannelAttachment],
+        selection: Option<&ChoiceReply>,
     ) -> Result<Vec<String>> {
         let chat = ChatKey::new(channel, chat_id, user_id);
+        // (v0.8.5 D3) An inbound option click (Telegram callback / web chip)
+        // resolves the session's pending choice — never treated as text.
+        if let Some(reply) = selection {
+            return self.resolve_selection(&chat, &reply.data).await;
+        }
+        // (v0.8.5 D3) A bare number is a short-reply to a pending choice, but
+        // only when one is outstanding for the current session; otherwise
+        // it's ordinary text for the agent.
+        if let Some(n) = numeric_choice(text) {
+            if self.has_pending_for_current(&chat).await {
+                return self.resolve_numeric(&chat, n).await;
+            }
+        }
         // Commands parse on the raw text; attachments don't apply to them.
         if let Some(reply) = self.handle_command(&chat, text).await? {
             return Ok(vec![reply]);
@@ -546,6 +660,7 @@ impl Gateway {
             }
             "/sessions" => Ok(Some(self.render_sessions(chat))),
             "/projects" => Ok(Some(self.render_projects())),
+            "/help" => Ok(Some(render_help())),
             _ => Ok(None),
         }
     }
@@ -784,6 +899,7 @@ impl Gateway {
                                     content: text,
                                     kind: GatewayEventKind::Answer,
                                     attachments: Vec::new(),
+                                    options: Vec::new(),
                                 })
                                 .is_err()
                             {
@@ -935,41 +1051,91 @@ impl Gateway {
         let session_id = self
             .current_session
             .get(chat)
-            .ok_or_else(|| anyhow!("no current session for chat"))?;
+            .ok_or_else(|| anyhow!("no current session for chat"))?
+            .clone();
+        // (v0.8.5 D1) A single-line `/command` is a session directive — the
+        // owning adapter (the only thing that knows its vendor's command
+        // surface) interprets it. Multi-line text starting with `/` is
+        // ordinary content (a pasted path / code block), never a directive.
+        if let Some(directive) = parse_session_directive(&payload) {
+            return self.dispatch_directive(chat, &session_id, directive).await;
+        }
         let session = self
             .sessions
-            .get(session_id)
+            .get(&session_id)
             .ok_or_else(|| anyhow!("current session missing: {session_id}"))?;
-        // Option ① — replies for this turn (sync + async pump + watchdog)
-        // go back to whoever sent it, not the original creator.
+        // Option ① — replies for this turn go back to whoever sent it.
         if let Ok(mut target) = session.reply_to.lock() {
             *target = chat.clone();
         }
         let start_visible_events = session.visible_events.load(Ordering::SeqCst);
         let submit_wait = gateway_submit_timeout_duration();
-        let turn_id = tokio::time::timeout(submit_wait, async {
+        let turn_id = tokio::time::timeout(
+            submit_wait,
             session
                 .adapter
-                .submit_turn(
-                    &session.thread,
-                    turn_input_for_session(session.vendor, payload),
-                )
-                .await
-        })
+                .submit_turn(&session.thread, TurnInput::UserText(payload)),
+        )
         .await
         .map_err(|_| anyhow!("submit timed out after {submit_wait:?} for {session_id}"))??;
-        let mut replies = Vec::new();
+        self.after_turn_submitted(session, start_visible_events, &turn_id.0)
+            .await
+    }
+
+    /// Interpret a session directive through the owning adapter, then render
+    /// the [`DirectiveOutcome`] back into outbound replies (v0.8.5 D1).
+    async fn dispatch_directive(
+        &self,
+        chat: &ChatKey,
+        session_id: &str,
+        directive: Directive,
+    ) -> Result<Vec<String>> {
+        let session = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| anyhow!("current session missing: {session_id}"))?;
+        if let Ok(mut target) = session.reply_to.lock() {
+            *target = chat.clone();
+        }
+        let start_visible_events = session.visible_events.load(Ordering::SeqCst);
+        let submit_wait = gateway_submit_timeout_duration();
+        // Keep a copy so a `NeedsChoice` can re-enter with the same directive
+        // once the user picks.
+        let original = directive.clone();
+        let outcome = tokio::time::timeout(
+            submit_wait,
+            session.adapter.handle_directive(&session.thread, directive),
+        )
+        .await
+        .map_err(|_| anyhow!("directive timed out after {submit_wait:?} for {session_id}"))??;
+        match outcome {
+            DirectiveOutcome::Turn(turn_id) => {
+                self.after_turn_submitted(session, start_visible_events, &turn_id.0)
+                    .await
+            }
+            DirectiveOutcome::Done { receipt } => Ok(vec![receipt]),
+            DirectiveOutcome::Rejected { reason } => Ok(vec![reason]),
+            DirectiveOutcome::Redirect { hint } => Ok(vec![hint]),
+            DirectiveOutcome::NeedsChoice(prompt) => {
+                self.offer_choice(chat, session_id, prompt, original).await
+            }
+        }
+    }
+
+    /// Wire a freshly-submitted turn into the async pump (production) or
+    /// drain its first answer synchronously (sink-less unit tests). Shared
+    /// by the plain-text submit path and the directive `Turn` outcome.
+    async fn after_turn_submitted(
+        &self,
+        session: &GatewaySession,
+        start_visible_events: u64,
+        turn_id: &str,
+    ) -> Result<Vec<String>> {
         if let Some(tx) = self.event_sink.clone() {
-            // V0.8.4 P1 (F1) — production (async pump) path: the pump owns
-            // delivery. Its first progress event (the `⏳ working…` seed)
-            // is the "accepted" signal and the answer arrives as its own
-            // message, so a turn is 2 IM messages (seed + answer), not 3.
-            // Returning empty here drops the machine-ish "submitted … turn
-            // …" ack — the very noise P1 set out to fold away.
-            spawn_turn_timeout_watchdog(tx, session, start_visible_events, &turn_id.0);
+            spawn_turn_timeout_watchdog(tx, session, start_visible_events, turn_id);
+            Ok(Vec::new())
         } else {
-            // No sink (pure in-process tests): drain the first answer
-            // synchronously, falling back to the submit ack.
+            let mut replies = Vec::new();
             let mut events = session.adapter.events(&session.thread);
             let wait = gateway_reply_wait_duration();
             while let Ok(Some(evt)) = tokio::time::timeout(wait, events.next()).await {
@@ -979,10 +1145,142 @@ impl Gateway {
                 }
             }
             if replies.is_empty() {
-                replies.push(format!("submitted {session_id} turn {}", turn_id.0));
+                replies.push(format!("submitted turn {turn_id}"));
+            }
+            Ok(replies)
+        }
+    }
+
+    /// Register an adapter `NeedsChoice` as the session's pending interaction
+    /// and deliver the prompt: inline buttons via the async sink, or a
+    /// numbered-text fallback on the sink-less path (v0.8.5 D3/D4).
+    async fn offer_choice(
+        &self,
+        chat: &ChatKey,
+        session_id: &str,
+        prompt: ChoicePrompt,
+        original: Directive,
+    ) -> Result<Vec<String>> {
+        let key = pending_key(chat, session_id);
+        let expires_at = Instant::now() + gateway_pending_ttl();
+        // Single-flight: a new prompt for the same (chat, session) evicts the
+        // old one. (W2 resolves an evicted External origin with
+        // deny-with-reason; a Directive origin is simply dropped.)
+        let _evicted = self.pending.lock().await.register(
+            key,
+            prompt.clone(),
+            InteractionOrigin::Directive {
+                session_id: session_id.to_string(),
+                directive: original,
+            },
+            expires_at,
+        );
+        let body = render_choice_text(&prompt);
+        if let Some(tx) = self.event_sink.clone() {
+            let _ = tx.send(GatewayEvent {
+                id: format!("gateway-choice-{session_id}-{}", prompt.token),
+                channel: chat.channel.clone(),
+                chat_id: chat.chat_id.clone(),
+                thread_ts: None,
+                content: body,
+                kind: GatewayEventKind::Answer,
+                attachments: Vec::new(),
+                options: to_message_options(&prompt),
+            });
+            Ok(Vec::new())
+        } else {
+            // Sink-less (unit test) path: deliver the numbered-text form; the
+            // pending registry still holds the prompt for selection resolve.
+            Ok(vec![body])
+        }
+    }
+
+    /// Resolve an inbound option click (`"{token}:{idx}"`) against the
+    /// current session's pending choice (v0.8.5 D3).
+    async fn resolve_selection(&self, chat: &ChatKey, data: &str) -> Result<Vec<String>> {
+        let Some((token, idx)) = split_callback(data) else {
+            return Ok(vec!["invalid selection".to_string()]);
+        };
+        let Some(session_id) = self.current_session.get(chat).cloned() else {
+            return Ok(vec!["no active selection".to_string()]);
+        };
+        let key = pending_key(chat, &session_id);
+        let taken = self.pending.lock().await.take_matching(&key, &token);
+        let Some(p) = taken else {
+            return Ok(vec!["this choice has expired".to_string()]);
+        };
+        let Some(opt) = p.prompt.options.get(idx) else {
+            return Ok(vec!["invalid choice".to_string()]);
+        };
+        let selection = ChoiceSelection {
+            token,
+            ids: vec![opt.id.clone()],
+            free_text: None,
+        };
+        self.apply_pending(chat, p, selection).await
+    }
+
+    /// Resolve a numeric short-reply (1-based) against the current session's
+    /// pending choice (v0.8.5 D3).
+    async fn resolve_numeric(&self, chat: &ChatKey, n: usize) -> Result<Vec<String>> {
+        let Some(session_id) = self.current_session.get(chat).cloned() else {
+            return Ok(vec!["no choice to answer".to_string()]);
+        };
+        let key = pending_key(chat, &session_id);
+        let mut pend = self.pending.lock().await;
+        let (token, id) = {
+            let Some(prompt) = pend.prompt_for(&key) else {
+                return Ok(vec!["no choice to answer".to_string()]);
+            };
+            let Some(idx) = n.checked_sub(1) else {
+                return Ok(vec!["invalid choice".to_string()]);
+            };
+            match prompt.options.get(idx) {
+                Some(opt) => (prompt.token.clone(), opt.id.clone()),
+                None => return Ok(vec![format!("please reply 1–{}", prompt.options.len())]),
+            }
+        };
+        let p = pend.take(&key).expect("pending present under lock");
+        drop(pend);
+        let selection = ChoiceSelection {
+            token,
+            ids: vec![id],
+            free_text: None,
+        };
+        self.apply_pending(chat, p, selection).await
+    }
+
+    /// Dispatch a resolved selection per the pending interaction's origin
+    /// (v0.8.5). Directive origin re-enters `handle_directive` with the
+    /// choice; External origin (D6, W2) delivers over the oneshot.
+    async fn apply_pending(
+        &self,
+        chat: &ChatKey,
+        pending: crate::pending::PendingInteraction,
+        selection: ChoiceSelection,
+    ) -> Result<Vec<String>> {
+        match pending.origin {
+            InteractionOrigin::Directive {
+                session_id,
+                mut directive,
+            } => {
+                directive.choice = Some(selection);
+                self.dispatch_directive(chat, &session_id, directive).await
+            }
+            InteractionOrigin::External { reply } => {
+                let _ = reply.send(selection);
+                Ok(Vec::new())
             }
         }
-        Ok(replies)
+    }
+
+    /// True when the current session has an outstanding pending choice.
+    async fn has_pending_for_current(&self, chat: &ChatKey) -> bool {
+        let Some(session_id) = self.current_session.get(chat) else {
+            return false;
+        };
+        let key = pending_key(chat, session_id);
+        self.pending.lock().await.has(&key)
     }
 
     fn current_project_for(&self, chat: &ChatKey) -> String {
@@ -1211,6 +1509,7 @@ fn spawn_turn_timeout_watchdog(
             ),
             kind: GatewayEventKind::Answer,
             attachments: Vec::new(),
+            options: Vec::new(),
         });
     });
 }
@@ -1285,6 +1584,7 @@ fn emit_progress(
         content: content.to_string(),
         kind: GatewayEventKind::Progress { status_key, done },
         attachments: Vec::new(),
+        options: Vec::new(),
     })
     .is_ok()
 }
@@ -1419,15 +1719,103 @@ fn merge_thread_extras(
     serde_json::Value::Object(merged)
 }
 
-fn turn_input_for_session(vendor: AgentVendor, payload: String) -> TurnInput {
+/// Parse a single-line `/command [args]` into a neutral [`Directive`].
+/// Returns `None` for non-slash text and for multi-line input (a pasted
+/// path / code block that merely starts with `/` is ordinary content, not
+/// a command — v0.8.5 §2.1).
+fn parse_session_directive(payload: &str) -> Option<Directive> {
     let trimmed = payload.trim();
-    if let Some(command) = trimmed.strip_prefix('/') {
-        let name = command.split_whitespace().next().unwrap_or_default();
-        if vendor == AgentVendor::Claude || matches!(name, "compact" | "review") {
-            return TurnInput::SystemDirective(command.to_string());
+    if trimmed.contains('\n') {
+        return None;
+    }
+    let rest = trimmed.strip_prefix('/')?;
+    let mut it = rest.splitn(2, char::is_whitespace);
+    let name = it.next().unwrap_or("").to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let args = it.next().unwrap_or("").trim().to_string();
+    Some(Directive {
+        name,
+        args,
+        choice: None,
+    })
+}
+
+/// Compose the pending-interaction key for a (chat, session) pair. Built
+/// here (not in `pending`) so that module stays decoupled from `ChatKey`.
+fn pending_key(chat: &ChatKey, session_id: &str) -> String {
+    format!(
+        "{}\u{1}{}\u{1}{}\u{1}{}",
+        chat.channel, chat.chat_id, chat.user_id, session_id
+    )
+}
+
+/// Map a harness [`ChoicePrompt`] to channel-local [`MessageOption`]s. The
+/// callback payload is `"{token}:{idx}"` — short, opaque, within Telegram's
+/// 64-byte `callback_data` cap; the real option id never leaves the gateway
+/// (idx is reverse-resolved from the pending registry).
+fn to_message_options(prompt: &ChoicePrompt) -> Vec<MessageOption> {
+    prompt
+        .options
+        .iter()
+        .enumerate()
+        .map(|(i, opt)| MessageOption {
+            data: format!("{}:{}", prompt.token, i),
+            label: opt.label.clone(),
+        })
+        .collect()
+}
+
+/// Numbered-text rendering of a choice prompt — the universal fallback for
+/// channels without buttons, and the sink-less unit-test form.
+fn render_choice_text(prompt: &ChoicePrompt) -> String {
+    let mut s = prompt.title.clone();
+    for (i, opt) in prompt.options.iter().enumerate() {
+        s.push_str(&format!("\n{}) {}", i + 1, opt.label));
+    }
+    s
+}
+
+/// Render the `/help` body from [`GATEWAY_COMMANDS`].
+fn render_help() -> String {
+    let mut s = String::from("Gateway commands:");
+    for c in GATEWAY_COMMANDS {
+        match c.arg_hint {
+            Some(hint) => s.push_str(&format!("\n{} {} — {}", c.name, hint, c.help)),
+            None => s.push_str(&format!("\n{} — {}", c.name, c.help)),
         }
     }
-    TurnInput::UserText(payload)
+    s.push_str("\n\nAny other /command is forwarded to the current session's agent.");
+    s
+}
+
+/// Split an inbound callback payload `"{token}:{idx}"` (v0.8.5 D3).
+fn split_callback(data: &str) -> Option<(String, usize)> {
+    let (token, idx) = data.split_once(':')?;
+    let idx: usize = idx.parse().ok()?;
+    Some((token.to_string(), idx))
+}
+
+/// A bare positive integer is a candidate numeric short-reply to a pending
+/// choice (resolved only when one is actually outstanding).
+fn numeric_choice(text: &str) -> Option<usize> {
+    let t = text.trim();
+    if t.is_empty() {
+        return None;
+    }
+    t.parse::<usize>().ok().filter(|n| *n >= 1)
+}
+
+/// TTL for a pending choice prompt (v0.8.5). Shares its default with the D6
+/// hook timeout (10 min); env-overridable for tests.
+fn gateway_pending_ttl() -> std::time::Duration {
+    const DEFAULT_MS: u64 = 600_000;
+    let ms = std::env::var("CCTEAM_IM_PENDING_TTL_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MS);
+    std::time::Duration::from_millis(ms)
 }
 
 fn parse_vendor(raw: &str) -> Result<AgentVendor> {
@@ -1487,7 +1875,9 @@ fn event_text(evt: &ThreadEvent) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ccteam_harness::{ExecutionMode, HarnessError, ThreadItem, TurnId};
+    use ccteam_harness::{
+        ChoiceOption, ExecutionMode, HarnessError, ThreadItem, ThreadStatus, TurnId,
+    };
     use futures::stream::BoxStream;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1613,6 +2003,14 @@ mod tests {
         submissions: Arc<Mutex<Vec<(String, String)>>>,
         events: Arc<Mutex<VecDeque<(String, ThreadEvent)>>>,
         event_delay: std::time::Duration,
+        /// Recorded `handle_directive` calls (thread id + directive) for
+        /// routing + choice-reentry assertions (v0.8.5 D1).
+        directives: Arc<Mutex<Vec<(String, Directive)>>>,
+        /// Scripted outcomes popped in order by `handle_directive` (e.g. a
+        /// `NeedsChoice`); empty ⇒ a `Done` echo.
+        directive_script: Arc<Mutex<VecDeque<DirectiveOutcome>>>,
+        /// Status returned by `thread_status` (v0.8.5 P3).
+        status: Arc<Mutex<ThreadStatus>>,
     }
 
     impl Default for FakeAdapter {
@@ -1629,6 +2027,9 @@ mod tests {
                 submissions: Arc::new(Mutex::new(Vec::new())),
                 events: Arc::new(Mutex::new(VecDeque::new())),
                 event_delay: std::time::Duration::ZERO,
+                directives: Arc::new(Mutex::new(Vec::new())),
+                directive_script: Arc::new(Mutex::new(VecDeque::new())),
+                status: Arc::new(Mutex::new(ThreadStatus::default())),
             }
         }
 
@@ -1672,7 +2073,6 @@ mod tests {
         ) -> Result<TurnId, HarnessError> {
             let text = match input {
                 TurnInput::UserText(text) => text,
-                TurnInput::SystemDirective(directive) => format!("system:{directive}"),
                 _ => String::new(),
             };
             self.submissions
@@ -1722,6 +2122,27 @@ mod tests {
 
         async fn close_thread(&self, _h: &ThreadHandle) -> Result<(), HarnessError> {
             Ok(())
+        }
+
+        async fn handle_directive(
+            &self,
+            h: &ThreadHandle,
+            d: Directive,
+        ) -> Result<DirectiveOutcome, HarnessError> {
+            self.directives
+                .lock()
+                .await
+                .push((h.identity.clone(), d.clone()));
+            if let Some(outcome) = self.directive_script.lock().await.pop_front() {
+                return Ok(outcome);
+            }
+            Ok(DirectiveOutcome::Done {
+                receipt: format!("{} directive: {}", h.identity, d.name),
+            })
+        }
+
+        async fn thread_status(&self, _h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
+            Ok(self.status.lock().await.clone())
         }
     }
 
@@ -1917,7 +2338,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gateway_dual_vendor_sessions_route_slash_commands_by_vendor() {
+    async fn gateway_dual_vendor_sessions_route_directives_by_vendor() {
         let claude = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let codex = Arc::new(FakeAdapter::new(AgentVendor::Codex));
         let factory = {
@@ -1941,33 +2362,232 @@ mod tests {
             .await
             .unwrap();
 
+        // Directives route to the CURRENT session's adapter via
+        // `handle_directive` (no more gateway vendor branch / SystemDirective).
+        // The FakeAdapter echoes `<id> directive: <name>` as a `Done` receipt.
         let compact = gateway
             .handle_text("mock", "chat-1", "alice", "/compact")
             .await
             .unwrap();
-        assert_eq!(compact, vec!["alpha-api-s2 echo: system:compact"]);
+        assert_eq!(compact, vec!["alpha-api-s2 directive: compact"]);
         let review = gateway
             .handle_text("mock", "chat-1", "alice", "/review")
             .await
             .unwrap();
-        assert_eq!(review, vec!["alpha-api-s2 echo: system:review"]);
+        assert_eq!(review, vec!["alpha-api-s2 directive: review"]);
+        // `@reviewer /clear` explicitly routes the directive to the claude
+        // session. (The real Codex adapter would `Redirect` /clear; that is
+        // asserted in the codex adapter tests, not against this fake.)
         let claude_clear = gateway
             .handle_text("mock", "chat-1", "alice", "@reviewer /clear")
             .await
             .unwrap();
-        assert_eq!(claude_clear, vec!["alpha-reviewer-s1 echo: system:clear"]);
+        assert_eq!(claude_clear, vec!["alpha-reviewer-s1 directive: clear"]);
 
+        // Each vendor's adapter saw only its own directives (by id + name).
+        let codex_dirs: Vec<(String, String)> = codex
+            .directives
+            .lock()
+            .await
+            .iter()
+            .map(|(id, d)| (id.clone(), d.name.clone()))
+            .collect();
         assert_eq!(
-            codex.submissions.lock().await.as_slice(),
-            &[
-                ("alpha-api-s2".to_string(), "system:compact".to_string()),
-                ("alpha-api-s2".to_string(), "system:review".to_string())
+            codex_dirs,
+            vec![
+                ("alpha-api-s2".to_string(), "compact".to_string()),
+                ("alpha-api-s2".to_string(), "review".to_string()),
             ]
         );
+        let claude_dirs: Vec<(String, String)> = claude
+            .directives
+            .lock()
+            .await
+            .iter()
+            .map(|(id, d)| (id.clone(), d.name.clone()))
+            .collect();
         assert_eq!(
-            claude.submissions.lock().await.as_slice(),
-            &[("alpha-reviewer-s1".to_string(), "system:clear".to_string())]
+            claude_dirs,
+            vec![("alpha-reviewer-s1".to_string(), "clear".to_string())]
         );
+    }
+
+    /// Concept lock (arch-refactor §8 / T1): the gateway renders each
+    /// non-choice `DirectiveOutcome` straight back as the reply text.
+    #[tokio::test]
+    async fn gateway_renders_each_directive_outcome() {
+        for (outcome, expected) in [
+            (
+                DirectiveOutcome::Done {
+                    receipt: "done!".into(),
+                },
+                "done!",
+            ),
+            (
+                DirectiveOutcome::Rejected {
+                    reason: "nope".into(),
+                },
+                "nope",
+            ),
+            (
+                DirectiveOutcome::Redirect {
+                    hint: "use /new".into(),
+                },
+                "use /new",
+            ),
+        ] {
+            let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+            fake.directive_script.lock().await.push_back(outcome);
+            let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+            gateway
+                .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+                .await
+                .unwrap();
+            let reply = gateway
+                .handle_text("mock", "chat-1", "alice", "/anything")
+                .await
+                .unwrap();
+            assert_eq!(reply, vec![expected.to_string()]);
+        }
+    }
+
+    /// Concept lock (arch-refactor §8-4 + §8-5): a `NeedsChoice` registers a
+    /// pending interaction + renders numbered options; a callback
+    /// `"{token}:{idx}"` resolves to the real option id and re-enters
+    /// `handle_directive` with the choice (the Telegram-callback inbound form).
+    #[tokio::test]
+    async fn gateway_needschoice_resolves_by_callback() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        fake.directive_script
+            .lock()
+            .await
+            .push_back(DirectiveOutcome::NeedsChoice(ChoicePrompt {
+                token: "t1".into(),
+                title: "Pick a model".into(),
+                options: vec![
+                    ChoiceOption {
+                        id: "opt-a".into(),
+                        label: "Model A".into(),
+                    },
+                    ChoiceOption {
+                        id: "opt-b".into(),
+                        label: "Model B".into(),
+                    },
+                ],
+                multi: false,
+            }));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+
+        // Bare directive → NeedsChoice → numbered-text prompt (sink-less).
+        let prompt = gateway
+            .handle_text("mock", "chat-1", "alice", "/model")
+            .await
+            .unwrap();
+        assert_eq!(prompt.len(), 1);
+        assert!(prompt[0].contains("Pick a model"));
+        assert!(prompt[0].contains("1) Model A"));
+        assert!(prompt[0].contains("2) Model B"));
+
+        // Telegram callback for option index 1 (`Model B`).
+        gateway
+            .handle_message(
+                "mock",
+                "chat-1",
+                "alice",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "t1:1".into(),
+                }),
+            )
+            .await
+            .unwrap();
+
+        // The directive re-entered with the resolved real option id.
+        let dirs = fake.directives.lock().await;
+        assert_eq!(dirs.len(), 2, "first call + choice re-entry");
+        assert_eq!(dirs[0].1.choice, None);
+        assert_eq!(
+            dirs[1].1.choice,
+            Some(ChoiceSelection {
+                token: "t1".into(),
+                ids: vec!["opt-b".into()],
+                free_text: None,
+            })
+        );
+    }
+
+    /// A numeric short-reply resolves the same pending choice (1-based).
+    #[tokio::test]
+    async fn gateway_needschoice_resolves_by_numeric() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        fake.directive_script
+            .lock()
+            .await
+            .push_back(DirectiveOutcome::NeedsChoice(ChoicePrompt {
+                token: "tok".into(),
+                title: "Pick".into(),
+                options: vec![
+                    ChoiceOption {
+                        id: "first".into(),
+                        label: "First".into(),
+                    },
+                    ChoiceOption {
+                        id: "second".into(),
+                        label: "Second".into(),
+                    },
+                ],
+                multi: false,
+            }));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/personality")
+            .await
+            .unwrap();
+        // Reply "2" → the second option.
+        gateway
+            .handle_text("mock", "chat-1", "alice", "2")
+            .await
+            .unwrap();
+        let dirs = fake.directives.lock().await;
+        assert_eq!(
+            dirs.last().unwrap().1.choice,
+            Some(ChoiceSelection {
+                token: "tok".into(),
+                ids: vec!["second".into()],
+                free_text: None,
+            })
+        );
+    }
+
+    /// Concept lock (arch-refactor §8-9): a multi-line message that merely
+    /// starts with `/` is ordinary text, never a directive.
+    #[tokio::test]
+    async fn gateway_multiline_slash_is_user_text() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/path/to/file\nplease read this")
+            .await
+            .unwrap();
+        // Routed as UserText (submit_turn), not as a directive.
+        assert!(fake.directives.lock().await.is_empty());
+        let subs = fake.submissions.lock().await;
+        assert_eq!(subs.len(), 1);
+        assert!(subs[0].1.starts_with("/path/to/file"));
     }
 
     #[tokio::test]

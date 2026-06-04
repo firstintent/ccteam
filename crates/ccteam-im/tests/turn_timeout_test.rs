@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use ccteam_harness::{
-    AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx,
-    ThreadEvent, ThreadHandle, TurnId, TurnInput,
+    AgentSpecBrief, AgentVendor, Directive, DirectiveOutcome, ExecutionMode, HarnessAdapter,
+    HarnessError, SpawnCtx, ThreadEvent, ThreadHandle, ThreadStatus, TurnId, TurnInput,
 };
 use ccteam_im::supervisor::{BotSupervisor, TurnWatchdogNotice};
 use ccteam_im::BotRegistration;
@@ -72,6 +72,20 @@ impl HarnessAdapter for StuckAdapter {
     }
     async fn close_thread(&self, _h: &ThreadHandle) -> Result<(), HarnessError> {
         Ok(())
+    }
+
+    async fn handle_directive(
+        &self,
+        _h: &ThreadHandle,
+        _d: Directive,
+    ) -> Result<DirectiveOutcome, HarnessError> {
+        Ok(DirectiveOutcome::Rejected {
+            reason: "test double".to_string(),
+        })
+    }
+
+    async fn thread_status(&self, _h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
+        Ok(ThreadStatus::default())
     }
 }
 

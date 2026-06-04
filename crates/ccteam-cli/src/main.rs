@@ -2338,6 +2338,7 @@ fn build_send_file_event(
             caption,
             kind,
         }],
+        options: Vec::new(),
     })
 }
 

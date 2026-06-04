@@ -79,6 +79,11 @@ pub struct ChannelMessage {
     /// Empty for text-only messages and non-Telegram channels. (P2a)
     #[serde(default)]
     pub attachments: Vec<ChannelAttachment>,
+    /// Set when this inbound event is an option click (v0.8.5 D3) — e.g. a
+    /// Telegram `callback_query` or a web chip click — instead of free
+    /// text. `None` for ordinary messages.
+    #[serde(default)]
+    pub selection: Option<ChoiceReply>,
 }
 
 /// How an [`OutboundFile`] should be sent (V0.8.4 P2b).
@@ -106,6 +111,34 @@ pub struct OutboundFile {
     pub kind: OutboundFileKind,
 }
 
+/// A single selectable option rendered on an outbound [`SendMessage`]
+/// (v0.8.5 D3). Channel-local + deliberately opaque: `data` is whatever
+/// the gateway minted (always `"{token}:{idx}"`) and rides the platform's
+/// callback channel verbatim (Telegram `callback_data`, web chip id);
+/// `label` is the button text. The channel never interprets either — it
+/// renders `label`, returns `data` on click. Kept distinct from the
+/// harness-layer `ChoiceOption` so the channel axis never imports a
+/// harness type (two-axis decoupling discipline; not a compile barrier —
+/// `ccteam-im` already depends on `ccteam-harness`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MessageOption {
+    /// Opaque callback payload, always `"{token}:{idx}"`. MUST stay short
+    /// (≤ ~20 bytes) — Telegram caps `callback_data` at 64 bytes.
+    pub data: String,
+    /// Human-readable button label.
+    pub label: String,
+}
+
+/// An inbound option click carried on a [`ChannelMessage`] (v0.8.5 D3).
+/// `data` echoes the [`MessageOption::data`] the user clicked; the gateway
+/// splits it on the first `:` into `(token, idx)` and resolves `idx` back
+/// to the real option id.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChoiceReply {
+    /// The clicked option's opaque callback payload (`"{token}:{idx}"`).
+    pub data: String,
+}
+
 /// Message to send through a channel.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SendMessage {
@@ -122,6 +155,11 @@ pub struct SendMessage {
     /// (`sendMessage`); non-empty ⇒ `sendPhoto`/`sendDocument`.
     #[serde(default)]
     pub attachments: Vec<OutboundFile>,
+    /// Selectable options rendered as buttons / chips (v0.8.5 D3). Empty ⇒
+    /// an ordinary message (zero behavior change). Channels without native
+    /// buttons fall back to a numbered text list.
+    #[serde(default)]
+    pub options: Vec<MessageOption>,
 }
 
 impl SendMessage {
@@ -133,6 +171,7 @@ impl SendMessage {
             subject: None,
             thread_ts: None,
             attachments: Vec::new(),
+            options: Vec::new(),
         }
     }
 
@@ -147,6 +186,24 @@ impl SendMessage {
         self.attachments = attachments;
         self
     }
+
+    /// Builder-style: attach selectable options (v0.8.5 D3).
+    pub fn with_options(mut self, options: Vec<MessageOption>) -> Self {
+        self.options = options;
+        self
+    }
+}
+
+/// A gateway-owned command advertised in a channel's command menu
+/// (v0.8.5 P1). Registered once at daemon startup via
+/// [`Channel::register_commands`]; only channels with a native menu
+/// (Telegram `setMyCommands`) act on it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommandSpec {
+    /// Command name including the leading `/`.
+    pub name: String,
+    /// One-line description shown in the channel's command menu.
+    pub description: String,
 }
 
 /// Core channel trait — implement for any IM platform.
@@ -201,5 +258,14 @@ pub trait Channel: Send + Sync {
         content: &str,
     ) -> anyhow::Result<Option<String>> {
         self.send(&SendMessage::new(content, recipient)).await
+    }
+
+    /// Register the gateway's own commands in the channel's command menu
+    /// (v0.8.5 P1). **Default no-op** (same pattern as
+    /// [`Channel::max_message_len`]): only a channel with a native menu
+    /// overrides it (Telegram → `setMyCommands`). Keeps the daemon
+    /// channel-neutral — no `"telegram"` branch leaks up.
+    async fn register_commands(&self, _cmds: &[CommandSpec]) -> anyhow::Result<()> {
+        Ok(())
     }
 }

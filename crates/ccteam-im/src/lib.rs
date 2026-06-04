@@ -36,6 +36,7 @@ pub mod latency;
 pub mod nl_admin;
 pub mod outbound;
 pub mod outbound_format;
+pub mod pending;
 pub mod progress;
 pub mod rate_limit;
 pub mod router;

@@ -30,8 +30,9 @@ use ccteam_flow::artifact_watcher::{ArtifactEvent, WatchKind};
 use ccteam_flow::orchestrator::{Orchestrator, OrchestratorConfig};
 use ccteam_flow::workflow::{AgentSpec, Executor, Trigger, WorkflowSpec};
 use ccteam_harness::{
-    AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, SessionHandle,
-    SpawnCtx, ThreadEvent, ThreadHandle, TurnId, TurnInput,
+    AgentSpecBrief, AgentVendor, Directive, DirectiveOutcome, ExecutionMode, HarnessAdapter,
+    HarnessError, SessionHandle, SpawnCtx, ThreadEvent, ThreadHandle, ThreadStatus, TurnId,
+    TurnInput,
 };
 use futures::stream::{self, BoxStream};
 
@@ -155,6 +156,20 @@ impl HarnessAdapter for MockAdapter {
     async fn close_thread(&self, _h: &ThreadHandle) -> Result<(), HarnessError> {
         self.shutdown_calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
+    }
+
+    async fn handle_directive(
+        &self,
+        _h: &ThreadHandle,
+        _d: Directive,
+    ) -> Result<DirectiveOutcome, HarnessError> {
+        Ok(DirectiveOutcome::Rejected {
+            reason: "test double".to_string(),
+        })
+    }
+
+    async fn thread_status(&self, _h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
+        Ok(ThreadStatus::default())
     }
 }
 
@@ -1676,6 +1691,18 @@ async fn t35_agent_spawn_event_carries_job_id_field() {
         }
         async fn close_thread(&self, _h: &ThreadHandle) -> Result<(), HarnessError> {
             Ok(())
+        }
+        async fn handle_directive(
+            &self,
+            _h: &ThreadHandle,
+            _d: Directive,
+        ) -> Result<DirectiveOutcome, HarnessError> {
+            Ok(DirectiveOutcome::Rejected {
+                reason: "test double".to_string(),
+            })
+        }
+        async fn thread_status(&self, _h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
+            Ok(ThreadStatus::default())
         }
     }
 

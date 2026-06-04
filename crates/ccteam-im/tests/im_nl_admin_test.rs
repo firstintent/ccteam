@@ -116,6 +116,7 @@ impl Scenario {
             timestamp: 0,
             thread_ts: None,
             attachments: Vec::new(),
+            selection: None,
         };
         // Pull the live registry so ListHere / unknown-handle replies
         // see the same bots the production daemon would see.
@@ -269,6 +270,7 @@ async fn unknown_handle_inbound_replies_with_available_bots_in_chat() {
         timestamp: 0,
         thread_ts: None,
         attachments: Vec::new(),
+        selection: None,
     };
     let bots = ccteam_im::list_bots().unwrap_or_default();
     let (outcome, admin_reply) = process_inbound_admin_aware(
@@ -331,6 +333,7 @@ async fn list_here_with_zero_bots_in_chat_says_no_bots() {
         timestamp: 0,
         thread_ts: None,
         attachments: Vec::new(),
+        selection: None,
     };
     let (_, reply) = process_inbound_admin_aware(
         &msg,
@@ -429,6 +432,7 @@ async fn expired_confirm_does_not_fire() {
         timestamp: 0,
         thread_ts: None,
         attachments: Vec::new(),
+        selection: None,
     };
     let (_, reply) = process_inbound_admin_aware(
         &msg,
@@ -460,6 +464,7 @@ async fn expired_confirm_does_not_fire() {
         timestamp: 0,
         thread_ts: None,
         attachments: Vec::new(),
+        selection: None,
     };
     let (_, reply2) = process_inbound_admin_aware(
         &confirm,
@@ -506,6 +511,7 @@ async fn admin_path_does_not_consume_hop_budget() {
         timestamp: 0,
         thread_ts: None,
         attachments: Vec::new(),
+        selection: None,
     };
     // hop = 2 (legal) — admin still fires.
     let (outcome, reply) = process_inbound_admin_aware(

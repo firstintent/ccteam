@@ -12,8 +12,8 @@ use ccteam_harness::execution::claude_tui::{
     chat_session_name, ensure_chat_hooks_installed, ClaudeTuiAdapter,
 };
 use ccteam_harness::{
-    AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, SpawnCtx, ThreadHandle, TurnInput,
-    CLAUDE_BIN_ENV,
+    AgentSpecBrief, AgentVendor, Directive, DirectiveOutcome, ExecutionMode, HarnessAdapter,
+    SpawnCtx, ThreadHandle, TurnInput, CLAUDE_BIN_ENV,
 };
 use serial_test::serial;
 
@@ -110,10 +110,22 @@ async fn submit_turn_sends_literal_text_to_tmux_pane() {
         .expect("submit UserText");
     assert!(t1.0.starts_with("turn-"));
 
-    let t2 = ClaudeTuiAdapter::new()
-        .submit_turn(&handle, TurnInput::SystemDirective("compact".into()))
+    let outcome = ClaudeTuiAdapter::new()
+        .handle_directive(
+            &handle,
+            Directive {
+                name: "compact".to_string(),
+                args: String::new(),
+                choice: None,
+            },
+        )
         .await
-        .expect("submit SystemDirective");
+        .expect("handle_directive");
+    // Claude passes slash commands straight through as a turn.
+    let t2 = match outcome {
+        DirectiveOutcome::Turn(id) => id,
+        other => panic!("expected DirectiveOutcome::Turn, got {other:?}"),
+    };
     assert!(t2.0.starts_with("turn-"));
     assert_ne!(t1.0, t2.0, "turn ids must be unique per submit");
 

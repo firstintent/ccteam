@@ -145,6 +145,7 @@ mod tests {
             timestamp: 1,
             thread_ts: None,
             attachments: Vec::new(),
+            selection: None,
         })
         .await;
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);

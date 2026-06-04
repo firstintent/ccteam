@@ -192,6 +192,7 @@ impl Channel for SlackChannel {
                             .unwrap_or(0),
                         thread_ts: m.thread_ts.clone(),
                         attachments: Vec::new(),
+                        selection: None,
                     };
                     {
                         let mut map = self.last_ts.lock().await;

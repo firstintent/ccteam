@@ -21,7 +21,7 @@
 //!    vendors (orchestrator boundary correctness).
 
 use ccteam_harness::{
-    execution::{ClaudeTuiAdapter, CodexExecAdapter},
+    execution::{ClaudeTuiAdapter, CodexAppServerAdapter, CodexExecAdapter},
     parse_backgrounded_short_id, AgentSpecBrief, AgentVendor, ClaudeBgAdapter, ExecutionMode,
     HarnessAdapter, HarnessError, SessionHandle, SpawnCtx, ThreadHandle, CLAUDE_BIN_ENV,
     CLAUDE_JOBS_DIR_ENV, CODEX_BIN_ENV,
@@ -33,12 +33,15 @@ use ccteam_harness::{
 
 #[test]
 fn trait_signature_compile_time_guarantee() {
-    // If this compiles, every adapter satisfies the locked Wave 1
-    // contract: 5 async methods + name + vendor.
+    // If this compiles, every adapter satisfies the full trait contract:
+    // 5 async lifecycle + name + vendor (v0.6) PLUS the v0.8.5 no-default
+    // `handle_directive` + `thread_status`. A new vendor that forgets
+    // either fails to compile here — the anti-silent-downgrade lock.
     fn assert_trait_impl<T: HarnessAdapter>() {}
     assert_trait_impl::<ClaudeBgAdapter>();
     assert_trait_impl::<ClaudeTuiAdapter>();
     assert_trait_impl::<CodexExecAdapter>();
+    assert_trait_impl::<CodexAppServerAdapter>();
 }
 
 #[test]

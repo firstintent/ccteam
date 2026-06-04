@@ -54,6 +54,7 @@ use crate::{
     MuxSessionId, MuxSessionKind, MuxSessionSpec, SpawnCtx, ThreadEvent, ThreadHandle, TurnId,
     TurnInput, CLAUDE_BIN_ENV,
 };
+use crate::{Directive, DirectiveOutcome, ThreadStatus};
 
 /// Env flag that opts mode-2 bg spawns into the W3 foreground-in-mux
 /// path. Unset / any value other than `"1"` keeps the legacy
@@ -351,5 +352,24 @@ impl HarnessAdapter for ClaudeBgAdapter {
 
         sigterm_pid(pid)
             .map_err(|err| HarnessError::ShutdownFailed(format!("SIGTERM pid {pid}: {err}")))
+    }
+
+    async fn handle_directive(
+        &self,
+        _h: &ThreadHandle,
+        d: Directive,
+    ) -> Result<DirectiveOutcome, HarnessError> {
+        // bg / single-turn path has no interactive command surface.
+        // Explicit Rejected (a first-class answer), never Err.
+        Ok(DirectiveOutcome::Rejected {
+            reason: format!(
+                "/{} is not available on the background (claude --bg) path",
+                d.name
+            ),
+        })
+    }
+
+    async fn thread_status(&self, _h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
+        Ok(ThreadStatus::default())
     }
 }

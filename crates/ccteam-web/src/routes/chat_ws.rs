@@ -235,6 +235,7 @@ fn frame_to_messages(
                 channel: "web".to_string(),
                 timestamp: now_unix_seconds(),
                 thread_ts: None,
+                selection: None,
             }];
         }
         ClientChatFrame::Switch { project, session } => {
@@ -248,6 +249,7 @@ fn frame_to_messages(
                     channel: "web".to_string(),
                     timestamp: now_unix_seconds(),
                     thread_ts: None,
+                    selection: None,
                 });
             }
             if let Some(session) = session {
@@ -259,9 +261,23 @@ fn frame_to_messages(
                     channel: "web".to_string(),
                     timestamp: now_unix_seconds(),
                     thread_ts: None,
+                    selection: None,
                 });
             }
             return messages;
+        }
+        ClientChatFrame::Choice { data } => {
+            // A chip click is a selection, not text (v0.8.5 D3).
+            return vec![WebChannelMessage {
+                id: timestamp_id("web-in", now, &data),
+                sender: user_id.to_string(),
+                reply_target: chat_id.to_string(),
+                content: String::new(),
+                channel: "web".to_string(),
+                timestamp: now_unix_seconds(),
+                thread_ts: None,
+                selection: Some(data),
+            }];
         }
         ClientChatFrame::Attach { name, data } => format!("/attach {name}\n{data}"),
     };
@@ -273,6 +289,7 @@ fn frame_to_messages(
         channel: "web".to_string(),
         timestamp: now_unix_seconds(),
         thread_ts: None,
+        selection: None,
     }]
 }
 
@@ -291,6 +308,21 @@ async fn take_backlog_for_target(app: &AppState, target: &str) -> Vec<WebSendMes
 }
 
 fn send_message_to_frames(message: WebSendMessage) -> Vec<ServerChatFrame> {
+    // v0.8.5 D3: an options-bearing message is a choice prompt → chips. The
+    // token is shared across options (embedded in each `"{token}:{idx}"`);
+    // derive it from the first option.
+    if !message.options.is_empty() {
+        let token = message
+            .options
+            .first()
+            .and_then(|o| o.data.split_once(':').map(|(t, _)| t.to_string()))
+            .unwrap_or_default();
+        return vec![ServerChatFrame::Choice {
+            token,
+            title: message.content,
+            options: message.options,
+        }];
+    }
     let mut frames = vec![ServerChatFrame::Reply {
         content: message.content.clone(),
     }];

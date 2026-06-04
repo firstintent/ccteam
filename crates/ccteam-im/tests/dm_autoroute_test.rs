@@ -20,8 +20,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use ccteam_harness::{
-    AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx,
-    ThreadEvent, ThreadHandle, TurnId, TurnInput,
+    AgentSpecBrief, AgentVendor, Directive, DirectiveOutcome, ExecutionMode, HarnessAdapter,
+    HarnessError, SpawnCtx, ThreadEvent, ThreadHandle, ThreadStatus, TurnId, TurnInput,
 };
 use ccteam_im::daemon::{run_daemon_with_shutdown, AdapterFactory, ChannelMap, DaemonArgs};
 use ccteam_im::inbound::{
@@ -58,6 +58,7 @@ fn mk_msg(content: &str, reply_target: &str, channel: &str) -> ChannelMessage {
         timestamp: 0,
         thread_ts: None,
         attachments: Vec::new(),
+        selection: None,
     }
 }
 
@@ -262,6 +263,20 @@ impl HarnessAdapter for StubAdapter {
     async fn close_thread(&self, _h: &ThreadHandle) -> Result<(), HarnessError> {
         Ok(())
     }
+
+    async fn handle_directive(
+        &self,
+        _h: &ThreadHandle,
+        _d: Directive,
+    ) -> Result<DirectiveOutcome, HarnessError> {
+        Ok(DirectiveOutcome::Rejected {
+            reason: "test double".to_string(),
+        })
+    }
+
+    async fn thread_status(&self, _h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
+        Ok(ThreadStatus::default())
+    }
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -295,6 +310,7 @@ async fn daemon_dm_no_at_mention_auto_routes_to_single_bot() {
         timestamp: 0,
         thread_ts: None,
         attachments: Vec::new(),
+        selection: None,
     })
     .await;
     let mut channels: ChannelMap = std::collections::HashMap::new();
@@ -380,6 +396,7 @@ async fn daemon_dm_multiple_bots_same_chat_id_replies_with_ambiguity_hint() {
         timestamp: 0,
         thread_ts: None,
         attachments: Vec::new(),
+        selection: None,
     })
     .await;
     let mut channels: ChannelMap = std::collections::HashMap::new();

@@ -64,6 +64,7 @@ use crate::{
     ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails, TurnId, TurnInput,
     UnifiedTokenUsage,
 };
+use crate::{Directive, DirectiveOutcome, ThreadStatus};
 
 /// Env override for the UDS path the adapter dials. Tests set this to
 /// a tempdir socket; production resolves
@@ -385,9 +386,6 @@ impl HarnessAdapter for CodexAppServerAdapter {
                 HarnessError::SubmitFailed(format!("codex app-server fault injection: {e:#}"))
             })?;
         }
-        if let TurnInput::SystemDirective(directive) = input {
-            return submit_system_directive(&client, h, &directive).await;
-        }
         let items = turn_input_to_items(input)?;
         let params = json!({
             "threadId": h.identity,
@@ -576,52 +574,73 @@ impl HarnessAdapter for CodexAppServerAdapter {
             .await;
         Ok(())
     }
-}
 
-async fn submit_system_directive(
-    client: &CodexJsonRpcClient,
-    h: &ThreadHandle,
-    directive: &str,
-) -> Result<TurnId, HarnessError> {
-    let normalized = directive
-        .trim()
-        .trim_start_matches('/')
-        .split_whitespace()
-        .next()
-        .unwrap_or("");
-    match normalized {
-        "compact" => {
-            client
-                .call("thread/compact/start", json!({ "threadId": h.identity }))
-                .await
-                .map_err(|e| HarnessError::SubmitFailed(format!("thread/compact/start: {e:#}")))?;
-            Ok(synthetic_command_turn_id("compact", &h.identity))
+    async fn handle_directive(
+        &self,
+        h: &ThreadHandle,
+        d: Directive,
+    ) -> Result<DirectiveOutcome, HarnessError> {
+        // W1: migrate the old compact|review allowlist onto the neutral
+        // command surface, and answer the gateway-redirect cases. The full
+        // three-layer resolution + six-class mapping table + bare-popup
+        // two-step (D2/D4) lands in W3.
+        let name = d.name.trim().trim_start_matches('/').to_ascii_lowercase();
+        match name.as_str() {
+            "compact" => {
+                let client = self.client().await?;
+                client
+                    .call("thread/compact/start", json!({ "threadId": h.identity }))
+                    .await
+                    .map_err(|e| {
+                        HarnessError::SubmitFailed(format!("thread/compact/start: {e:#}"))
+                    })?;
+                Ok(DirectiveOutcome::Turn(synthetic_command_turn_id(
+                    "compact",
+                    &h.identity,
+                )))
+            }
+            "review" => {
+                // W1: uncommittedChanges only; W3 parses
+                // branch/commit/custom targets from `d.args`.
+                let client = self.client().await?;
+                let result = client
+                    .call(
+                        "review/start",
+                        json!({
+                            "threadId": h.identity,
+                            "target": { "type": "uncommittedChanges" },
+                        }),
+                    )
+                    .await
+                    .map_err(|e| HarnessError::SubmitFailed(format!("review/start: {e:#}")))?;
+                let turn_id = pluck_turn_id(&result).ok_or_else(|| {
+                    HarnessError::SubmitFailed(format!(
+                        "review/start response missing turn.id: {result}"
+                    ))
+                })?;
+                Ok(DirectiveOutcome::Turn(TurnId(turn_id)))
+            }
+            "new" | "clear" | "resume" => Ok(DirectiveOutcome::Redirect {
+                hint: "Codex has no in-thread equivalent — use the gateway's /new (fresh \
+                       session) or /use (switch session)."
+                    .to_string(),
+            }),
+            "" => Ok(DirectiveOutcome::Rejected {
+                reason: "empty command".to_string(),
+            }),
+            other => Ok(DirectiveOutcome::Rejected {
+                reason: format!(
+                    "/{other} is not yet supported on Codex (the full Codex command \
+                     surface lands in W3)"
+                ),
+            }),
         }
-        "review" => {
-            let result = client
-                .call(
-                    "review/start",
-                    json!({
-                        "threadId": h.identity,
-                        "target": { "type": "uncommittedChanges" },
-                    }),
-                )
-                .await
-                .map_err(|e| HarnessError::SubmitFailed(format!("review/start: {e:#}")))?;
-            let turn_id = pluck_turn_id(&result).ok_or_else(|| {
-                HarnessError::SubmitFailed(format!(
-                    "review/start response missing turn.id: {result}"
-                ))
-            })?;
-            Ok(TurnId(turn_id))
-        }
-        "" => Err(HarnessError::SubmitFailed(
-            "codex app-server: empty SystemDirective".to_string(),
-        )),
-        other => Err(HarnessError::SubmitFailed(format!(
-            "codex app-server: SystemDirective \"{other}\" not supported \
-             (supported: /compact, /review)"
-        ))),
+    }
+
+    async fn thread_status(&self, _h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
+        // W1 stub. P3 (W4) reads the CodexThreadTracker (W3) populated from
+        // `thread/tokenUsage/updated`.
+        Ok(ThreadStatus::default())
     }
 }
 
@@ -645,12 +664,6 @@ pub fn turn_input_to_items(input: TurnInput) -> Result<Value, HarnessError> {
             json!([
                 { "type": "text", "text": format!("<artifact path=\"{}\">\n{}\n</artifact>", path.display(), body) },
             ])
-        }
-        TurnInput::SystemDirective(d) => {
-            return Err(HarnessError::SubmitFailed(format!(
-                "codex app-server: SystemDirective \"{d}\" not supported \
-                 (codex has no slash-command surface — use turn/start with text)"
-            )))
         }
         TurnInput::Image(path) => json!([
             { "type": "localImage", "path": path.to_string_lossy() },
@@ -1294,12 +1307,6 @@ mod tests {
         let v = turn_input_to_items(TurnInput::Image(PathBuf::from("/img.png"))).unwrap();
         assert_eq!(v[0]["type"], "localImage");
         assert_eq!(v[0]["path"], "/img.png");
-    }
-
-    #[test]
-    fn turn_input_system_directive_rejected() {
-        let err = turn_input_to_items(TurnInput::SystemDirective("/compact".into())).unwrap_err();
-        assert!(matches!(err, HarnessError::SubmitFailed(_)));
     }
 
     #[test]

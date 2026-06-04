@@ -178,6 +178,7 @@ impl Channel for DiscordChannel {
                             .unwrap_or(0),
                         thread_ts: None,
                         attachments: Vec::new(),
+                        selection: None,
                     };
                     {
                         let mut map = self.last_id.lock().await;

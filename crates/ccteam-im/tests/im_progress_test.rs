@@ -21,8 +21,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use ccteam_harness::{
-    AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx,
-    ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails, TurnId, TurnInput,
+    AgentSpecBrief, AgentVendor, Directive, DirectiveOutcome, ExecutionMode, HarnessAdapter,
+    HarnessError, SpawnCtx, ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails, ThreadStatus,
+    TurnId, TurnInput,
 };
 use ccteam_im::daemon::{run_daemon_with_shutdown, AdapterFactory, ChannelMap, DaemonArgs};
 use ccteam_im::transport::providers::mock::MockChannel;
@@ -121,6 +122,20 @@ impl HarnessAdapter for ScriptedAdapter {
     async fn close_thread(&self, _h: &ThreadHandle) -> Result<(), HarnessError> {
         Ok(())
     }
+
+    async fn handle_directive(
+        &self,
+        _h: &ThreadHandle,
+        _d: Directive,
+    ) -> Result<DirectiveOutcome, HarnessError> {
+        Ok(DirectiveOutcome::Rejected {
+            reason: "test double".to_string(),
+        })
+    }
+
+    async fn thread_status(&self, _h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
+        Ok(ThreadStatus::default())
+    }
 }
 
 fn tool_started(id: &str, name: &str, args: serde_json::Value) -> ThreadEvent {
@@ -196,6 +211,7 @@ async fn run_scripted(script: Vec<ThreadEvent>) -> Arc<MockChannel> {
             timestamp: 0,
             thread_ts: None,
             attachments: Vec::new(),
+            selection: None,
         })
         .await;
     }

@@ -46,7 +46,7 @@ pub struct TurnRecord {
     /// Bot role name (also `workflow.yaml chat.bot_name`).
     pub role: String,
     /// User-side prompt text. Empty when the turn was driven by a
-    /// `SystemDirective` (e.g. `/compact`).
+    /// slash directive (e.g. `/compact`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub user: String,
     /// Assistant-side reply text (concatenation of every `text` block

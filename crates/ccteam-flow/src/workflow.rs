@@ -467,7 +467,7 @@ pub struct ChatSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bot_name: Option<String>,
     /// V0.6.0 F108: turn count after which the orchestrator issues a
-    /// `/compact` SystemDirective to the TUI session. `None` = let
+    /// `/compact` directive to the TUI session. `None` = let
     /// Claude Code auto-compact at its own threshold (default ~25%
     /// context remaining).
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -6,8 +6,8 @@
 use ccteam_harness::{
     execution::codex_exec::{build_exec_argv, render_prompt, translate_jsonl_event},
     execution::CodexExecAdapter,
-    AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, ThreadEvent, ThreadHandle, TurnId,
-    TurnInput, CODEX_BIN_ENV,
+    AgentVendor, Directive, DirectiveOutcome, ExecutionMode, HarnessAdapter, ThreadEvent,
+    ThreadHandle, TurnId, TurnInput, CODEX_BIN_ENV,
 };
 use futures::StreamExt;
 use serde_json::json;
@@ -72,14 +72,24 @@ async fn submit_turn_returns_monotonic_turn_ids() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn submit_turn_rejects_system_directive() {
+async fn handle_directive_rejected_on_bg_path() {
     let adapter = CodexExecAdapter::new();
     let h = handle();
-    let err = adapter
-        .submit_turn(&h, TurnInput::SystemDirective("/compact".into()))
+    let outcome = adapter
+        .handle_directive(
+            &h,
+            Directive {
+                name: "compact".to_string(),
+                args: String::new(),
+                choice: None,
+            },
+        )
         .await
-        .unwrap_err();
-    assert!(matches!(err, HarnessError::SubmitFailed(_)), "got {err:?}");
+        .expect("handle_directive");
+    assert!(
+        matches!(outcome, DirectiveOutcome::Rejected { .. }),
+        "got {outcome:?}"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

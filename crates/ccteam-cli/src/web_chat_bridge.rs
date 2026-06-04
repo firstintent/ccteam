@@ -8,8 +8,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::{broadcast, mpsc, Mutex};
 
-use ccteam_im::transport::{Channel, ChannelMessage, SendMessage};
-use ccteam_web::chat_protocol::{WebChannelMessage, WebSendMessage};
+use ccteam_im::transport::{Channel, ChannelMessage, ChoiceReply, SendMessage};
+use ccteam_web::chat_protocol::{WebChannelMessage, WebMessageOption, WebSendMessage};
 use ccteam_web::{ChatConns, CHAT_BACKLOG_CAP};
 
 pub(crate) struct WebChatBridge {
@@ -61,6 +61,15 @@ impl Channel for WebChatChannel {
             recipient: message.recipient.clone(),
             subject: message.subject.clone(),
             thread_ts: message.thread_ts.clone(),
+            // v0.8.5 D3: carry choice options through to the browser chips.
+            options: message
+                .options
+                .iter()
+                .map(|o| WebMessageOption {
+                    data: o.data.clone(),
+                    label: o.label.clone(),
+                })
+                .collect(),
         };
         // P1-1/P1-3: only park the message when the recipient has no live
         // socket. A connected socket receives it via the broadcast below,
@@ -115,7 +124,12 @@ fn to_im_message(message: WebChannelMessage) -> ChannelMessage {
         channel: message.channel,
         timestamp: message.timestamp,
         thread_ts: message.thread_ts,
+        // Web inbound attachments arrive text-encoded as a `/attach`
+        // pseudo-command (chat_ws `frame_to_messages`), never as structured
+        // attachments — so there are none to carry here.
         attachments: Vec::new(),
+        // v0.8.5 D3: a chip click carries its opaque "{token}:{idx}".
+        selection: message.selection.map(|data| ChoiceReply { data }),
     }
 }
 
@@ -129,8 +143,9 @@ mod tests {
 
     use ccteam_core::CcteamPaths;
     use ccteam_harness::{
-        AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx,
-        ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails, TurnId, TurnInput,
+        AgentSpecBrief, AgentVendor, Directive, DirectiveOutcome, ExecutionMode, HarnessAdapter,
+        HarnessError, SpawnCtx, ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails,
+        ThreadStatus, TurnId, TurnInput,
     };
     use ccteam_web::chat_protocol::{ServerChatFrame, SUBPROTOCOL};
     use ccteam_web::{router_with_state, AppState, AuthState};
@@ -187,6 +202,41 @@ mod tests {
             root: root.join(".ccteam"),
             projects_root: root.join("projects"),
         }
+    }
+
+    #[test]
+    fn to_im_message_maps_chip_selection() {
+        // v0.8.5 D3: a web chip click → ChannelMessage.selection.
+        let clicked = to_im_message(WebChannelMessage {
+            id: "w1".into(),
+            sender: "alice".into(),
+            reply_target: "chat-1".into(),
+            content: String::new(),
+            channel: "web".into(),
+            timestamp: 1,
+            thread_ts: None,
+            selection: Some("tok:2".into()),
+        });
+        assert_eq!(
+            clicked.selection,
+            Some(ChoiceReply {
+                data: "tok:2".into()
+            })
+        );
+        assert!(clicked.attachments.is_empty());
+        // Ordinary text carries no selection.
+        let plain = to_im_message(WebChannelMessage {
+            id: "w2".into(),
+            sender: "alice".into(),
+            reply_target: "chat-1".into(),
+            content: "hi".into(),
+            channel: "web".into(),
+            timestamp: 2,
+            thread_ts: None,
+            selection: None,
+        });
+        assert_eq!(plain.selection, None);
+        assert_eq!(plain.content, "hi");
     }
 
     #[derive(Default)]
@@ -258,7 +308,6 @@ mod tests {
             self.state.submits.fetch_add(1, Ordering::SeqCst);
             let text = match input {
                 TurnInput::UserText(text) => text,
-                TurnInput::SystemDirective(text) => format!("directive:{text}"),
                 other => format!("{other:?}"),
             };
             self.state
@@ -318,6 +367,39 @@ mod tests {
 
         async fn close_thread(&self, _h: &ThreadHandle) -> Result<(), HarnessError> {
             Ok(())
+        }
+
+        async fn handle_directive(
+            &self,
+            h: &ThreadHandle,
+            d: Directive,
+        ) -> Result<DirectiveOutcome, HarnessError> {
+            // Echo the directive the same way `submit_turn` echoes text, so
+            // the web e2e can assert routing through `handle_directive`
+            // (`<Vendor> echo: directive:<name>`), then let the pump deliver.
+            self.state
+                .event_queues
+                .lock()
+                .await
+                .entry(h.identity.clone())
+                .or_insert_with(VecDeque::new)
+                .push_back(ThreadEvent::ItemCompleted {
+                    item: ThreadItem {
+                        id: format!("directive-{}", d.name),
+                        details: ThreadItemDetails::AgentMessage(format!(
+                            "{:?} echo: directive:{}",
+                            self.vendor, d.name
+                        )),
+                    },
+                });
+            Ok(DirectiveOutcome::Turn(TurnId::new(format!(
+                "{:?}-directive-{}",
+                self.vendor, d.name
+            ))))
+        }
+
+        async fn thread_status(&self, _h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
+            Ok(ThreadStatus::default())
         }
     }
 
@@ -561,6 +643,7 @@ mod tests {
                 channel: "web".into(),
                 timestamp: 42,
                 thread_ts: Some("thread-1".into()),
+                selection: None,
             })
             .await
             .unwrap();

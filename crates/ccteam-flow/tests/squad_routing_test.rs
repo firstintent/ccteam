@@ -29,8 +29,8 @@ use ccteam_flow::workflow::{
     AgentSpec, Executor, SquadSpec, Trigger, WorkflowSpec, SQUAD_ROUTE_SENTINEL,
 };
 use ccteam_harness::{
-    AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx,
-    ThreadEvent, ThreadHandle, TurnId, TurnInput,
+    AgentSpecBrief, AgentVendor, Directive, DirectiveOutcome, ExecutionMode, HarnessAdapter,
+    HarnessError, SpawnCtx, ThreadEvent, ThreadHandle, ThreadStatus, TurnId, TurnInput,
 };
 use futures::stream::{self, BoxStream};
 
@@ -108,6 +108,20 @@ impl HarnessAdapter for MockAdapter {
 
     async fn close_thread(&self, _h: &ThreadHandle) -> Result<(), HarnessError> {
         Ok(())
+    }
+
+    async fn handle_directive(
+        &self,
+        _h: &ThreadHandle,
+        _d: Directive,
+    ) -> Result<DirectiveOutcome, HarnessError> {
+        Ok(DirectiveOutcome::Rejected {
+            reason: "test double".to_string(),
+        })
+    }
+
+    async fn thread_status(&self, _h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
+        Ok(ThreadStatus::default())
     }
 }
 

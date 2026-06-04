@@ -56,6 +56,7 @@ use ccteam_cost::{
 // zero `crate::tmux` coupling (V0.8 W2c).
 use crate::tmux_ops::session_name_for_slug;
 use crate::{default_backend, MuxSessionId, MuxSessionKind, MuxSessionSpec, PaneBackend};
+use crate::{Directive, DirectiveOutcome, ThreadStatus};
 
 /// Per-thread event broadcast buffer. Codex bursts items per turn so
 /// 256 lines of headroom is comfortable for a single subscriber.
@@ -532,6 +533,25 @@ impl HarnessAdapter for CodexExecAdapter {
         }
         Ok(())
     }
+
+    async fn handle_directive(
+        &self,
+        _h: &ThreadHandle,
+        d: Directive,
+    ) -> Result<DirectiveOutcome, HarnessError> {
+        // bg / single-turn path has no interactive command surface.
+        // Explicit Rejected (a first-class answer), never Err.
+        Ok(DirectiveOutcome::Rejected {
+            reason: format!(
+                "/{} is not available on the background (codex exec) path",
+                d.name
+            ),
+        })
+    }
+
+    async fn thread_status(&self, _h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
+        Ok(ThreadStatus::default())
+    }
 }
 
 /// Build `codex exec --json` (or `codex resume <id> --json`) argv.
@@ -563,12 +583,6 @@ pub fn render_prompt(input: &TurnInput) -> Result<String, HarnessError> {
             let body = std::fs::read_to_string(p)
                 .map_err(|e| HarnessError::SubmitFailed(format!("read artifact: {e}")))?;
             format!("<artifact path=\"{}\">\n{body}\n</artifact>", p.display())
-        }
-        TurnInput::SystemDirective(d) => {
-            return Err(HarnessError::SubmitFailed(format!(
-                "codex exec: SystemDirective '{d}' not supported (codex has no slash-command \
-                 surface; wrap as user text instead)"
-            )))
         }
         TurnInput::Image(p) => format!("[image: {}]", p.display()),
         TurnInput::ToolResult { call_id, content } => serde_json::to_string(&serde_json::json!({

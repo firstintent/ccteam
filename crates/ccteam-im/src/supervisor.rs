@@ -1670,7 +1670,10 @@ impl MarkerReporter for BotSupervisor {
 mod bot_supervisor_tests {
     use super::*;
     use async_trait::async_trait;
-    use ccteam_harness::{AgentVendor, ExecutionMode, HarnessError, ThreadEvent, ThreadHandle};
+    use ccteam_harness::{
+        AgentVendor, Directive, DirectiveOutcome, ExecutionMode, HarnessError, ThreadEvent,
+        ThreadHandle, ThreadStatus,
+    };
     use futures::stream::BoxStream;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
@@ -1730,6 +1733,20 @@ mod bot_supervisor_tests {
         async fn close_thread(&self, _h: &ThreadHandle) -> Result<(), HarnessError> {
             self.closes.fetch_add(1, Ordering::SeqCst);
             Ok(())
+        }
+
+        async fn handle_directive(
+            &self,
+            _h: &ThreadHandle,
+            _d: Directive,
+        ) -> Result<DirectiveOutcome, HarnessError> {
+            Ok(DirectiveOutcome::Rejected {
+                reason: "test double".to_string(),
+            })
+        }
+
+        async fn thread_status(&self, _h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
+            Ok(ThreadStatus::default())
         }
     }
 

@@ -278,6 +278,7 @@ fn parse_frame(frame: Message, peer: SocketAddr) -> anyhow::Result<Option<Channe
         timestamp: now,
         thread_ts: inbound.thread_ts,
         attachments: Vec::new(),
+        selection: None,
     }))
 }
 

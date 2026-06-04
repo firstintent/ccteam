@@ -31,9 +31,9 @@
 //!   capture command. All output state lives in `progress.jsonl` and
 //!   the transcript jsonl mirror.
 //!   All state lives in `progress.jsonl` + the transcript jsonl mirror.
-//! - **Slash-command passthrough**: [`HarnessAdapter::submit_turn`]
-//!   forwards `SystemDirective("foo")` as the literal string `/foo`.
-//!   ccteam never filters or rewrites these.
+//! - **Slash-command passthrough**: [`HarnessAdapter::handle_directive`]
+//!   forwards a `/foo` directive (handled via handle_directive) as the
+//!   literal string `/foo`. ccteam never filters or rewrites these.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -61,6 +61,7 @@ use crate::{
     AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx,
     ThreadEvent, ThreadHandle, TurnId, TurnInput, CLAUDE_BIN_ENV,
 };
+use crate::{Directive, DirectiveOutcome, ThreadStatus};
 
 /// V0.6.0 F108 [`HarnessAdapter`] for Claude Code TUI (long-running tmux
 /// session, multi-turn with context reuse).
@@ -521,12 +522,6 @@ impl HarnessAdapter for ClaudeTuiAdapter {
             TurnInput::Image(p) => {
                 format!("Look at the image I just placed at {}", p.display())
             }
-            TurnInput::SystemDirective(d) => {
-                // Slash-command passthrough — never filter, never rewrite.
-                // R4 red line: ccteam does not know team-specific slashes;
-                // Claude handles `/compact` / `/new` / `/clear` natively.
-                format!("/{d}")
-            }
             TurnInput::ToolResult { call_id, content } => {
                 let body = match content {
                     Value::String(s) => s,
@@ -673,6 +668,34 @@ impl HarnessAdapter for ClaudeTuiAdapter {
             .await
             .map_err(|e| HarnessError::ShutdownFailed(format!("tmux kill-session: {e}")))?;
         Ok(())
+    }
+
+    async fn handle_directive(
+        &self,
+        h: &ThreadHandle,
+        d: Directive,
+    ) -> Result<DirectiveOutcome, HarnessError> {
+        // W1: zero-knowledge passthrough — Claude's established behavior is
+        // to forward every slash to its own TUI. W2 (D5) layers the
+        // four-channel gate on top (local-jsx bare → NeedsChoice, no-arg
+        // panels → Rejected/Redirect, AskUserQuestion → D6). Reusing
+        // `submit_turn(UserText("/..."))` keeps one send path and the
+        // zero-knowledge passthrough red line intact.
+        let line = if d.args.trim().is_empty() {
+            format!("/{}", d.name)
+        } else {
+            format!("/{} {}", d.name, d.args.trim())
+        };
+        let turn = self.submit_turn(h, TurnInput::UserText(line)).await?;
+        Ok(DirectiveOutcome::Turn(turn))
+    }
+
+    async fn thread_status(&self, _h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
+        // W1 stub. P3 (W4) reads the transcript tail: model from
+        // `message.model`, context = last `message.usage` row's
+        // input+cache_creation+cache_read, window from the `[1m]` suffix
+        // (→ 1M) else the 200k baseline.
+        Ok(ThreadStatus::default())
     }
 }
 

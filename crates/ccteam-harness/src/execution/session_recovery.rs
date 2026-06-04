@@ -14,7 +14,7 @@
 //! takes the last `N` turns from that file, formats them as a
 //! `<conversation_history>...</conversation_history>` prefix prompt,
 //! and returns it for the caller to send into a freshly-spawned tmux
-//! `claude` session via `submit_turn(SystemDirective(...))`.
+//! `claude` session via `submit_turn(UserText("/..."))`.
 //!
 //! ## Why not push the recovery prompt directly?
 //!
@@ -25,7 +25,7 @@
 //!
 //! 1. Calling [`build_recovery_prompt`] to get the prefix string.
 //! 2. `start_thread` → new tmux session.
-//! 3. `submit_turn(SystemDirective(prompt))` to seed the bot.
+//! 3. `submit_turn(UserText(prompt))` to seed the bot.
 //! 4. Emitting `chat_session_reset_with_recovery` to progress.jsonl
 //!    via [`super::turns_mirror`]'s companion event helpers
 //!    (`crate::progress::build_chat_session_reset_with_recovery_event`).

@@ -20,8 +20,8 @@ use anyhow::Context as _;
 
 use crate::latency::now_unix_ms;
 use crate::transport::{
-    AttachmentKind, Channel, ChannelAttachment, ChannelMessage, OutboundFile, OutboundFileKind,
-    SendMessage,
+    AttachmentKind, Channel, ChannelAttachment, ChannelMessage, ChoiceReply, OutboundFile,
+    OutboundFileKind, SendMessage,
 };
 
 /// `getUpdates` long-poll seconds.
@@ -145,6 +145,50 @@ impl TelegramChannel {
     /// Send each outbound file as `sendPhoto`/`sendDocument`; the caption
     /// rides the first attachment (preferring its own caption, else the
     /// message text). Returns the first attachment's message id.
+    /// Handle an inline-keyboard button click (v0.8.5 D3): answer the
+    /// callback (clears the client spinner) + forward a `ChannelMessage`
+    /// carrying the opaque selection so the gateway can resolve it.
+    async fn handle_callback_query(
+        &self,
+        tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+        cb: TgCallbackQuery,
+    ) {
+        let _ = self
+            .http
+            .post(self.api_url("answerCallbackQuery"))
+            .json(&serde_json::json!({ "callback_query_id": cb.id }))
+            .send()
+            .await;
+        let Some(data) = cb.data else {
+            return;
+        };
+        let Some(msg) = cb.message else {
+            return;
+        };
+        let chat_id = msg.chat.id.to_string();
+        if !self.chat_allowed(&chat_id) {
+            return;
+        }
+        let sender = cb
+            .from
+            .as_ref()
+            .and_then(|u| u.username.clone())
+            .or_else(|| cb.from.as_ref().map(|u| u.id.to_string()))
+            .unwrap_or_else(|| "anonymous".to_string());
+        let payload = ChannelMessage {
+            id: format!("tg-cb-{}", msg.message_id),
+            sender,
+            reply_target: chat_id,
+            content: String::new(),
+            channel: "telegram".into(),
+            timestamp: (now_unix_ms() / 1000) as u64,
+            thread_ts: None,
+            attachments: Vec::new(),
+            selection: Some(ChoiceReply { data }),
+        };
+        let _ = tx.send(payload).await;
+    }
+
     async fn send_with_attachments(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
         let mut first_id = None;
         for (i, att) in message.attachments.iter().enumerate() {
@@ -235,6 +279,21 @@ struct TgUpdate {
     update_id: i64,
     #[serde(default)]
     message: Option<TgMessage>,
+    // v0.8.5 D3 — inline-keyboard button clicks.
+    #[serde(default)]
+    callback_query: Option<TgCallbackQuery>,
+}
+
+/// An inline-keyboard button click (v0.8.5 D3).
+#[derive(Debug, Deserialize)]
+struct TgCallbackQuery {
+    id: String,
+    #[serde(default)]
+    from: Option<TgUser>,
+    #[serde(default)]
+    message: Option<TgMessage>,
+    #[serde(default)]
+    data: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -394,12 +453,24 @@ impl Channel for TelegramChannel {
             return self.send_with_attachments(message).await;
         }
         let url = self.api_url("sendMessage");
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "chat_id": message.recipient,
             "text": message.content,
             // Telegram supports reply_to_message_id for in-thread replies.
             "reply_to_message_id": message.thread_ts.as_ref().and_then(|s| s.parse::<i64>().ok()),
         });
+        // v0.8.5 D3 — render choice options as an inline keyboard (one button
+        // per row); the opaque `data` ("{token}:{idx}") rides `callback_data`
+        // (≤64B). The numbered-text fallback already lives in `content`, so
+        // button-less clients still work.
+        if !message.options.is_empty() {
+            let rows: Vec<Vec<serde_json::Value>> = message
+                .options
+                .iter()
+                .map(|o| vec![serde_json::json!({ "text": o.label, "callback_data": o.data })])
+                .collect();
+            body["reply_markup"] = serde_json::json!({ "inline_keyboard": rows });
+        }
         let t0 = Instant::now();
         let resp = self.http.post(&url).json(&body).send().await?;
         let status = resp.status();
@@ -485,6 +556,10 @@ impl Channel for TelegramChannel {
                     let mut last = self.last_offset.lock().await;
                     *last = (*last).max(upd.update_id + 1);
                 }
+                if let Some(cb) = upd.callback_query {
+                    self.handle_callback_query(&tx, cb).await;
+                    continue;
+                }
                 if let Some(m) = upd.message {
                     let chat_id = m.chat.id.to_string();
                     if !self.chat_allowed(&chat_id) {
@@ -565,6 +640,7 @@ impl Channel for TelegramChannel {
                         timestamp: m.date.max(0) as u64,
                         thread_ts: None,
                         attachments,
+                        selection: None,
                     };
                     if tx.send(payload).await.is_err() {
                         return Ok(());

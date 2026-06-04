@@ -10,8 +10,8 @@ use ccteam_harness::execution::codex_app_server::{
 };
 use ccteam_harness::execution::codex_jsonrpc::Notification;
 use ccteam_harness::{
-    AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx,
-    ThreadEvent, TurnInput,
+    AgentSpecBrief, AgentVendor, Directive, DirectiveOutcome, ExecutionMode, HarnessAdapter,
+    HarnessError, SpawnCtx, ThreadEvent, TurnInput,
 };
 use serde_json::{json, Value};
 use serial_test::serial;
@@ -284,9 +284,6 @@ async fn turn_input_to_items_handles_all_variants() {
 
     let img = turn_input_to_items(TurnInput::Image(PathBuf::from("/x.png"))).unwrap();
     assert_eq!(img[0]["type"], "localImage");
-
-    let err = turn_input_to_items(TurnInput::SystemDirective("/compact".into())).unwrap_err();
-    assert!(matches!(err, HarnessError::SubmitFailed(_)));
 
     let tr = turn_input_to_items(TurnInput::ToolResult {
         call_id: "c1".into(),
@@ -761,16 +758,38 @@ async fn adapter_maps_system_directives_to_command_rpcs() {
         .unwrap();
     assert_eq!(user_turn.0, "turn-user-1");
 
-    let compact_turn = adapter
-        .submit_turn(&h, TurnInput::SystemDirective("/compact".into()))
+    let compact_turn = match adapter
+        .handle_directive(
+            &h,
+            Directive {
+                name: "compact".to_string(),
+                args: String::new(),
+                choice: None,
+            },
+        )
         .await
-        .unwrap();
+        .unwrap()
+    {
+        DirectiveOutcome::Turn(id) => id,
+        other => panic!("expected DirectiveOutcome::Turn for /compact, got {other:?}"),
+    };
     assert!(compact_turn.0.starts_with("codex-app-server-compact-"));
 
-    let review_turn = adapter
-        .submit_turn(&h, TurnInput::SystemDirective("review".into()))
+    let review_turn = match adapter
+        .handle_directive(
+            &h,
+            Directive {
+                name: "review".to_string(),
+                args: String::new(),
+                choice: None,
+            },
+        )
         .await
-        .unwrap();
+        .unwrap()
+    {
+        DirectiveOutcome::Turn(id) => id,
+        other => panic!("expected DirectiveOutcome::Turn for review, got {other:?}"),
+    };
     assert_eq!(review_turn.0, "turn-review-1");
 
     let frames = seen.lock().unwrap().clone();

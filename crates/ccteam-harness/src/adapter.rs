@@ -32,11 +32,14 @@
 //!   `ccteam session rm` (F49) — never silently.
 //! - `ccteam-core` does not know team-name literals.
 //!
-//! ## Wave 1 binding contract
+//! ## Trait binding contract
 //!
-//! The trait signature below is **locked**. Wave 2 (F108) + Wave 3
-//! (F112) adapters MUST conform to this shape exactly. Changing the
-//! signature in a later wave = Wave 1 not converged, rewind.
+//! The trait signature below is **locked per minor version**. v0.6
+//! (F107/F108/F112) settled the 5 lifecycle + 2 identifier methods;
+//! v0.8.5 deliberately extends it once with `handle_directive` +
+//! `thread_status` (both no-default — see the trait doc). Extending the
+//! surface is a planned, doc-first event; drive-by signature changes
+//! within a wave are not.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -183,10 +186,6 @@ pub enum TurnInput {
     /// File-system artifact / attachment placed in a known directory
     /// for the agent to read on the next turn.
     Artifact(PathBuf),
-    /// `/compact` / `/new` / `/clear` style slash command — adapter
-    /// translates to backend-specific operation (Claude → slash cmd
-    /// passthrough; Codex → `compact_remote` JSON-RPC).
-    SystemDirective(String),
     /// Rich-media image attachment (V0.6 Epic B).
     Image(PathBuf),
     /// External resolver feeding a tool-call result back to the agent.
@@ -278,6 +277,131 @@ pub enum ApprovalScope {
     Always,
 }
 
+// =====================================================================
+// v0.8.5 — Session command/interaction/status vocabulary (D1/D3/P3)
+//
+// These neutral types let the gateway stay a pure router: a slash
+// command becomes a `Directive`, the adapter (the only thing that knows
+// its vendor's command surface) answers with a `DirectiveOutcome`, and
+// any choice the user must make travels as a `ChoicePrompt` /
+// `ChoiceSelection` regardless of vendor or channel. `ChoicePrompt` is
+// the interaction-layer forerunner of `ApprovalIR` (the semantic/risk
+// layer): a future HITL approval translates one into the other and
+// reuses the same pending-interaction registry + back-fill path.
+// =====================================================================
+
+/// A session-directed slash command, parsed by the gateway and handed to
+/// the owning adapter's [`HarnessAdapter::handle_directive`]. The gateway
+/// has zero knowledge of what `name` / `args` mean — that is the
+/// adapter's (vendor's) sole interpretation authority.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Directive {
+    /// Command name without the leading `/` (e.g. `"compact"`, `"model"`).
+    pub name: String,
+    /// Everything after the name, verbatim. Argument semantics are the
+    /// adapter's to parse.
+    pub args: String,
+    /// Set on the re-entry call after a [`DirectiveOutcome::NeedsChoice`]
+    /// — carries the user's selection so the adapter can apply it.
+    pub choice: Option<ChoiceSelection>,
+}
+
+/// The five exhaustive answers an adapter can give to a [`Directive`].
+/// Everything a vendor command can do maps onto exactly one of these, so
+/// no slash ever silently degrades into literal model text.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DirectiveOutcome {
+    /// The command became a turn (Claude passthrough / Codex review /
+    /// init …). The gateway tracks it like any other turn.
+    Turn(TurnId),
+    /// Completed in place (RPC / in-memory override). `receipt` is shown
+    /// to the user verbatim.
+    Done { receipt: String },
+    /// The user must choose before the command can complete. The gateway
+    /// renders the prompt and re-enters `handle_directive` with the
+    /// selection carried on [`Directive::choice`].
+    NeedsChoice(ChoicePrompt),
+    /// Explicitly refused (TUI-only / unsupported / not enabled). A
+    /// first-class answer, not an error.
+    Rejected { reason: String },
+    /// Semantic redirect — the command has no in-thread equivalent; the
+    /// hint points the user at the gateway surface that does (e.g.
+    /// `/new`).
+    Redirect { hint: String },
+}
+
+/// A choice the user must make, produced either by an adapter
+/// ([`DirectiveOutcome::NeedsChoice`]) or by an agent question (the chat
+/// `AskUserQuestion` hook). Channel-neutral: each channel renders it its
+/// own way (Telegram inline keyboard / web chips / numbered text).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChoicePrompt {
+    /// Short opaque correlation id minted by the producer. MUST be ASCII,
+    /// ≤16 bytes, and contain no `:` — the transport packs
+    /// `"{token}:{idx}"` into one callback string and splits on the first
+    /// `:`.
+    pub token: String,
+    pub title: String,
+    pub options: Vec<ChoiceOption>,
+    /// `true` when more than one option may be selected.
+    pub multi: bool,
+}
+
+/// One selectable option. `id` is the real, semantic option id the
+/// producer cares about (e.g. a model id); the channel never sees it —
+/// it only round-trips the positional index, which the gateway maps back
+/// to this `id`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChoiceOption {
+    pub id: String,
+    pub label: String,
+}
+
+/// A normalized user selection — the single shape all three inbound forms
+/// (button callback / numeric short-reply / full arg-form) collapse to.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChoiceSelection {
+    /// Echoes [`ChoicePrompt::token`] so the registry can match the reply
+    /// to its pending prompt.
+    pub token: String,
+    /// Selected real option ids (resolved from indices by the gateway).
+    pub ids: Vec<String>,
+    /// Free-text answer (the "Other" path); `None` for pure selections.
+    pub free_text: Option<String>,
+}
+
+/// Context-window usage for a session, vendor-agnostic. Numerator +
+/// denominator in tokens; the percentage is derived, never stored.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct ContextUsage {
+    pub used_tokens: u64,
+    pub window_tokens: u64,
+}
+
+impl ContextUsage {
+    /// Used/window as a 0–100 percentage; `0.0` when the window is
+    /// unknown (zero) to avoid divide-by-zero.
+    pub fn pct(&self) -> f32 {
+        if self.window_tokens == 0 {
+            0.0
+        } else {
+            (self.used_tokens as f32 / self.window_tokens as f32) * 100.0
+        }
+    }
+}
+
+/// Queryable session attributes (P3): `model` + context usage are
+/// properties of the session, not a by-product of a log line. Produced
+/// by [`HarnessAdapter::thread_status`]. `Default` (all-`None`) is the
+/// explicit "this harness has no status to report" answer for bg
+/// adapters — a *default impl* on the trait method is what's forbidden,
+/// not a default *value*.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ThreadStatus {
+    pub model: Option<String>,
+    pub context: Option<ContextUsage>,
+}
+
 /// Per-turn item the adapter emits (one or more per turn). Mirrors
 /// Codex `ThreadItem`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -361,13 +485,16 @@ pub struct AgentSpecBrief {
     pub role: String,
 }
 
-/// V0.6.0 F107 [`HarnessAdapter`] trait — 5-method thread/turn shape
-/// aligned with Codex `ThreadManager::{submit, next_event}` protocol.
+/// [`HarnessAdapter`] trait — thread/turn lifecycle aligned with Codex
+/// `ThreadManager::{submit, next_event}`, plus the v0.8.5 session command
+/// + status surface.
 ///
-/// **Binding contract** (Wave 1 lock; Wave 2/3 may not change this
-/// signature): 5 async lifecycle methods + 2 sync identifier methods.
-///
-/// Concrete implementations move into this crate in the next P1 slice.
+/// **Surface** (signature locked per minor, extended doc-first): 5 async
+/// lifecycle methods + 2 sync identifier methods (v0.6), plus
+/// `handle_directive` + `thread_status` (v0.8.5). The two v0.8.5 methods
+/// have **no default impl** on purpose: a new vendor that forgets its
+/// command surface or status surface fails to compile instead of
+/// silently degrading (`/cmd` → literal text, `/sessions` → blank).
 #[async_trait::async_trait]
 pub trait HarnessAdapter: Send + Sync {
     /// Stable identifier, e.g. `"claude-bg"`, `"claude-tui"`,
@@ -397,6 +524,18 @@ pub trait HarnessAdapter: Send + Sync {
     /// `progress.jsonl` poller still drives state transitions for Wave
     /// 1; Wave 2 / Wave 3 adapters will populate this stream and the
     /// orchestrator will gradually retire the legacy poller).
+    ///
+    /// **Final-only contract (v0.8.5):** an adapter MUST emit the final
+    /// agent text for a turn exactly once, as
+    /// [`ThreadEvent::ItemCompleted`] carrying
+    /// [`ThreadItemDetails::AgentMessage`]. [`ThreadEvent::ItemUpdated`]
+    /// is delta / presentation only and consumers MAY drop it. The
+    /// gateway's text-extraction helpers rely on this; a future vendor
+    /// that put final text only in `ItemUpdated` would be silently
+    /// dropped, so the contract lives here, not as a gateway assumption.
+    /// Non-terminal observability notifications (token usage, plan,
+    /// rate-limits) MUST NOT be yielded here — they are mirrored to
+    /// `progress.jsonl` out of band and queried via [`thread_status`].
     fn events(&self, h: &ThreadHandle) -> BoxStream<'static, ThreadEvent>;
 
     /// Resume an already-existing thread by persistent id (e.g. Claude
@@ -408,6 +547,28 @@ pub trait HarnessAdapter: Send + Sync {
     /// Graceful close. Idempotent on missing PID / missing tmux
     /// session (matches V0.5.x `shutdown_session` semantics).
     async fn close_thread(&self, h: &ThreadHandle) -> Result<(), HarnessError>;
+
+    /// Interpret a session-directed [`Directive`] (a `/command`). This is
+    /// the adapter's **sole** authority over its vendor's command surface
+    /// — the gateway is a pure router and never second-guesses the
+    /// mapping. **No default impl** (aligns with the "vendor enum has no
+    /// default" red line): a new vendor MUST declare its command surface
+    /// explicitly, so "slash silently degrades to literal text" is
+    /// impossible by construction. Non-interactive adapters (bg) MUST
+    /// answer `Ok(DirectiveOutcome::Rejected { .. })` — an explicit
+    /// answer, never `Err`.
+    async fn handle_directive(
+        &self,
+        h: &ThreadHandle,
+        d: Directive,
+    ) -> Result<DirectiveOutcome, HarnessError>;
+
+    /// Report the session's queryable status (model + context usage) for
+    /// `/sessions` and Codex `/status`. **No default impl** (same
+    /// reasoning as `handle_directive`): a default would make `/sessions`
+    /// silently blank for a new vendor. bg / statusless adapters answer
+    /// `Ok(ThreadStatus::default())`.
+    async fn thread_status(&self, h: &ThreadHandle) -> Result<ThreadStatus, HarnessError>;
 }
 
 // =====================================================================

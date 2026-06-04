@@ -26,8 +26,8 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use ccteam_harness::{
-    AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx,
-    ThreadEvent, ThreadHandle, TurnId, TurnInput,
+    AgentSpecBrief, AgentVendor, Directive, DirectiveOutcome, ExecutionMode, HarnessAdapter,
+    HarnessError, SpawnCtx, ThreadEvent, ThreadHandle, ThreadStatus, TurnId, TurnInput,
 };
 use ccteam_im::supervisor::{
     BotSupervisor, MarkerHealAction, SupervisorAction, MARKER_MISSING_RESET_THRESHOLD,
@@ -87,6 +87,20 @@ impl HarnessAdapter for StubAdapter {
     async fn close_thread(&self, _h: &ThreadHandle) -> Result<(), HarnessError> {
         self.closes.fetch_add(1, Ordering::SeqCst);
         Ok(())
+    }
+
+    async fn handle_directive(
+        &self,
+        _h: &ThreadHandle,
+        _d: Directive,
+    ) -> Result<DirectiveOutcome, HarnessError> {
+        Ok(DirectiveOutcome::Rejected {
+            reason: "test double".to_string(),
+        })
+    }
+
+    async fn thread_status(&self, _h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
+        Ok(ThreadStatus::default())
     }
 }
 

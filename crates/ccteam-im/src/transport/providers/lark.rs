@@ -280,6 +280,7 @@ impl DecodedMessage {
             timestamp: self.timestamp,
             thread_ts: None,
             attachments: Vec::new(),
+            selection: None,
         }
     }
 }

@@ -16,8 +16,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ccteam_harness::{
-    AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx,
-    ThreadEvent, ThreadHandle, TurnId, TurnInput,
+    AgentSpecBrief, AgentVendor, Directive, DirectiveOutcome, ExecutionMode, HarnessAdapter,
+    HarnessError, SpawnCtx, ThreadEvent, ThreadHandle, ThreadStatus, TurnId, TurnInput,
 };
 use ccteam_im::inbound::{process_inbound, DefaultMailboxResolver, InboundOutcome};
 use ccteam_im::outbound::{forward_new_rows, read_new_rows, TailCursor};
@@ -136,6 +136,20 @@ impl HarnessAdapter for StubAdapter {
         self.closes.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
+
+    async fn handle_directive(
+        &self,
+        _h: &ThreadHandle,
+        _d: Directive,
+    ) -> Result<DirectiveOutcome, HarnessError> {
+        Ok(DirectiveOutcome::Rejected {
+            reason: "test double".to_string(),
+        })
+    }
+
+    async fn thread_status(&self, _h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
+        Ok(ThreadStatus::default())
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -166,6 +180,7 @@ fn im_msg(payload: &str) -> ChannelMessage {
         timestamp: 0,
         thread_ts: None,
         attachments: Vec::new(),
+        selection: None,
     }
 }
 
@@ -319,6 +334,20 @@ async fn restart_recovers_from_close_failure() {
                 Ok(())
             }
         }
+
+        async fn handle_directive(
+            &self,
+            _h: &ThreadHandle,
+            _d: Directive,
+        ) -> Result<DirectiveOutcome, HarnessError> {
+            Ok(DirectiveOutcome::Rejected {
+                reason: "test double".to_string(),
+            })
+        }
+
+        async fn thread_status(&self, _h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
+            Ok(ThreadStatus::default())
+        }
     }
     let tmp = TempDir::new().unwrap();
     let adapter = Arc::new(FlakyCloseAdapter::default());
@@ -464,6 +493,7 @@ async fn channel_listen_to_inbound_pipeline() {
             timestamp: 0,
             thread_ts: None,
             attachments: Vec::new(),
+            selection: None,
         })
         .await;
     }

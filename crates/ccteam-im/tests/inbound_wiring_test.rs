@@ -26,8 +26,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use ccteam_harness::{
-    AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx,
-    ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails, TurnId, TurnInput,
+    AgentSpecBrief, AgentVendor, Directive, DirectiveOutcome, ExecutionMode, HarnessAdapter,
+    HarnessError, SpawnCtx, ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails, ThreadStatus,
+    TurnId, TurnInput,
 };
 use ccteam_im::daemon::{
     default_adapter_factory, run_daemon_with_shutdown, AdapterFactory, ChannelMap, DaemonArgs,
@@ -174,6 +175,20 @@ impl HarnessAdapter for GatewayAdapter {
     async fn close_thread(&self, _h: &ThreadHandle) -> Result<(), HarnessError> {
         Ok(())
     }
+
+    async fn handle_directive(
+        &self,
+        _h: &ThreadHandle,
+        _d: Directive,
+    ) -> Result<DirectiveOutcome, HarnessError> {
+        Ok(DirectiveOutcome::Rejected {
+            reason: "test double".to_string(),
+        })
+    }
+
+    async fn thread_status(&self, _h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
+        Ok(ThreadStatus::default())
+    }
 }
 
 #[async_trait]
@@ -233,6 +248,20 @@ impl HarnessAdapter for FailingGatewayAdapter {
     async fn close_thread(&self, _h: &ThreadHandle) -> Result<(), HarnessError> {
         Ok(())
     }
+
+    async fn handle_directive(
+        &self,
+        _h: &ThreadHandle,
+        _d: Directive,
+    ) -> Result<DirectiveOutcome, HarnessError> {
+        Ok(DirectiveOutcome::Rejected {
+            reason: "test double".to_string(),
+        })
+    }
+
+    async fn thread_status(&self, _h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
+        Ok(ThreadStatus::default())
+    }
 }
 
 #[async_trait]
@@ -280,6 +309,20 @@ impl HarnessAdapter for StubAdapter {
         self.closes.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
+
+    async fn handle_directive(
+        &self,
+        _h: &ThreadHandle,
+        _d: Directive,
+    ) -> Result<DirectiveOutcome, HarnessError> {
+        Ok(DirectiveOutcome::Rejected {
+            reason: "test double".to_string(),
+        })
+    }
+
+    async fn thread_status(&self, _h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
+        Ok(ThreadStatus::default())
+    }
 }
 
 /// Smoke-test the full F132 daemon path with a MockChannel pre-seeded
@@ -316,6 +359,7 @@ async fn daemon_wires_mock_channel_to_supervisor_inbox() {
         timestamp: 0,
         thread_ts: None,
         attachments: Vec::new(),
+        selection: None,
     })
     .await;
 
@@ -409,6 +453,7 @@ async fn daemon_routes_gateway_inbound_to_submit_turn_and_outbound() {
         timestamp: 0,
         thread_ts: None,
         attachments: Vec::new(),
+        selection: None,
     })
     .await;
     mock.push(ChannelMessage {
@@ -420,6 +465,7 @@ async fn daemon_routes_gateway_inbound_to_submit_turn_and_outbound() {
         timestamp: 1,
         thread_ts: None,
         attachments: Vec::new(),
+        selection: None,
     })
     .await;
 
@@ -550,6 +596,7 @@ async fn daemon_splits_long_outbound_into_ordered_parts() {
         timestamp: 0,
         thread_ts: None,
         attachments: Vec::new(),
+        selection: None,
     })
     .await;
     mock.push(ChannelMessage {
@@ -561,6 +608,7 @@ async fn daemon_splits_long_outbound_into_ordered_parts() {
         timestamp: 1,
         thread_ts: None,
         attachments: Vec::new(),
+        selection: None,
     })
     .await;
 
@@ -702,6 +750,7 @@ async fn daemon_split_failure_surfaces_notice() {
         timestamp: 0,
         thread_ts: None,
         attachments: Vec::new(),
+        selection: None,
     })
     .await;
     mock.push(ChannelMessage {
@@ -713,6 +762,7 @@ async fn daemon_split_failure_surfaces_notice() {
         timestamp: 1,
         thread_ts: None,
         attachments: Vec::new(),
+        selection: None,
     })
     .await;
 
@@ -826,6 +876,7 @@ async fn daemon_surfaces_start_failure_to_im_and_ledger() {
         timestamp: 0,
         thread_ts: None,
         attachments: Vec::new(),
+        selection: None,
     })
     .await;
     let adapter = Arc::new(FailingGatewayAdapter::new(true, false));
@@ -867,6 +918,7 @@ async fn daemon_surfaces_submit_failure_to_im_and_ledger() {
         timestamp: 0,
         thread_ts: None,
         attachments: Vec::new(),
+        selection: None,
     })
     .await;
     mock.push(ChannelMessage {
@@ -878,6 +930,7 @@ async fn daemon_surfaces_submit_failure_to_im_and_ledger() {
         timestamp: 1,
         thread_ts: None,
         attachments: Vec::new(),
+        selection: None,
     })
     .await;
     let adapter = Arc::new(FailingGatewayAdapter::new(false, true));
@@ -925,6 +978,7 @@ async fn daemon_surfaces_turn_timeout_to_im_and_ledger() {
         timestamp: 0,
         thread_ts: None,
         attachments: Vec::new(),
+        selection: None,
     })
     .await;
     mock.push(ChannelMessage {
@@ -936,6 +990,7 @@ async fn daemon_surfaces_turn_timeout_to_im_and_ledger() {
         timestamp: 1,
         thread_ts: None,
         attachments: Vec::new(),
+        selection: None,
     })
     .await;
     let adapter = Arc::new(FailingGatewayAdapter::new(false, false));
@@ -1719,6 +1774,7 @@ async fn daemon_routes_inbound_image_attachment_into_turn_text() {
         timestamp: 0,
         thread_ts: None,
         attachments: Vec::new(),
+        selection: None,
     })
     .await;
     mock.push(ChannelMessage {
@@ -1736,6 +1792,7 @@ async fn daemon_routes_inbound_image_attachment_into_turn_text() {
             mime: Some("image/png".into()),
             size: Some(1234),
         }],
+        selection: None,
     })
     .await;
 
@@ -1812,6 +1869,7 @@ async fn daemon_delivers_gateway_event_attachment_to_channel() {
             caption: Some("the chart".into()),
             kind: OutboundFileKind::Photo,
         }],
+        options: Vec::new(),
     })
     .unwrap();
 

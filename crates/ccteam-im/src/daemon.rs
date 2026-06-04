@@ -578,6 +578,7 @@ fn spawn_inbound_consumer(
                     &msg.id,
                     &clean_payload,
                     &msg.attachments,
+                    msg.selection.as_ref(),
                 )
                 .await;
             match replies {
@@ -646,7 +647,8 @@ fn spawn_gateway_event_consumer(
                 GatewayEventKind::Answer => {
                     let out = SendMessage::new(evt.content, evt.chat_id)
                         .in_thread(evt.thread_ts)
-                        .with_attachments(evt.attachments);
+                        .with_attachments(evt.attachments)
+                        .with_options(evt.options);
                     send_gateway_outbound(&evt.id, 0, &evt.channel, channel.as_ref(), out).await;
                 }
                 GatewayEventKind::Progress { status_key, done } => {

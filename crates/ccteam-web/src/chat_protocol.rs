@@ -25,18 +25,46 @@ pub enum ClientChatFrame {
         name: String,
         data: String,
     },
+    /// A chip click answering a `Choice` prompt (v0.8.5 D3). `data` is the
+    /// opaque `"{token}:{idx}"` payload carried by the chip.
+    Choice {
+        data: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerChatFrame {
-    TurnStarted { session: String, vendor: String },
-    AssistantDelta { text: String },
-    Tool { name: String, summary: String },
-    Reply { content: String },
-    TurnDone { session: String },
-    Sessions { items: Vec<SessionItem> },
-    Lag { behind: u64 },
+    TurnStarted {
+        session: String,
+        vendor: String,
+    },
+    AssistantDelta {
+        text: String,
+    },
+    Tool {
+        name: String,
+        summary: String,
+    },
+    Reply {
+        content: String,
+    },
+    TurnDone {
+        session: String,
+    },
+    Sessions {
+        items: Vec<SessionItem>,
+    },
+    Lag {
+        behind: u64,
+    },
+    /// A choice prompt rendered as clickable chips (v0.8.5 D3). A chip click
+    /// comes back as [`ClientChatFrame::Choice`].
+    Choice {
+        token: String,
+        title: String,
+        options: Vec<WebMessageOption>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -52,6 +80,15 @@ pub struct SessionItem {
     pub current: bool,
 }
 
+/// Web-local mirror of `ccteam_im::transport::MessageOption` (v0.8.5 D3).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebMessageOption {
+    /// Opaque callback payload, `"{token}:{idx}"`.
+    pub data: String,
+    /// Button / chip label.
+    pub label: String,
+}
+
 /// Web-local mirror of `ccteam_im::transport::ChannelMessage`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WebChannelMessage {
@@ -62,6 +99,10 @@ pub struct WebChannelMessage {
     pub channel: String,
     pub timestamp: u64,
     pub thread_ts: Option<String>,
+    /// Set when this inbound event is a chip click (v0.8.5 D3): the opaque
+    /// `"{token}:{idx}"` payload. `None` for ordinary text.
+    #[serde(default)]
+    pub selection: Option<String>,
 }
 
 /// Web-local mirror of `ccteam_im::transport::SendMessage`.
@@ -71,6 +112,10 @@ pub struct WebSendMessage {
     pub recipient: String,
     pub subject: Option<String>,
     pub thread_ts: Option<String>,
+    /// Selectable options rendered as chips (v0.8.5 D3). Empty ⇒ ordinary
+    /// message.
+    #[serde(default)]
+    pub options: Vec<WebMessageOption>,
 }
 
 impl WebSendMessage {
@@ -80,6 +125,7 @@ impl WebSendMessage {
             recipient: recipient.into(),
             subject: None,
             thread_ts: None,
+            options: Vec::new(),
         }
     }
 }
@@ -132,6 +178,9 @@ mod tests {
             name: "note.txt".into(),
             data: "aGVsbG8=".into(),
         });
+        round_trip_client(ClientChatFrame::Choice {
+            data: "tok:1".into(),
+        });
     }
 
     #[test]
@@ -161,6 +210,14 @@ mod tests {
             }],
         });
         round_trip_server(ServerChatFrame::Lag { behind: 3 });
+        round_trip_server(ServerChatFrame::Choice {
+            token: "tok".into(),
+            title: "Pick".into(),
+            options: vec![WebMessageOption {
+                data: "tok:0".into(),
+                label: "A".into(),
+            }],
+        });
     }
 
     #[test]
