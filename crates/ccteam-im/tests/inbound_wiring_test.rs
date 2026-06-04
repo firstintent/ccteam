@@ -1235,7 +1235,6 @@ async fn real_ws_dual_harness_smoke() {
     let project = TempDir::new().unwrap();
     let slug = format!("real-ws-{}", std::process::id());
     let old_ccteam_home = std::env::var_os("CCTEAM_HOME");
-    let old_transport = std::env::var_os("CCTEAM_CODEX_APP_SERVER_TRANSPORT");
     let old_socket = std::env::var_os("CCTEAM_CODEX_APP_SERVER_SOCKET");
     let old_codex_fault = std::env::var_os("CCTEAM_CODEX_APP_SERVER_FAULT_KILL_BEFORE_TURN");
     let old_mux_backend = std::env::var_os("CCTEAM_MUX_BACKEND");
@@ -1244,7 +1243,8 @@ async fn real_ws_dual_harness_smoke() {
     let restart_mode = std::env::var("CCTEAM_REAL_IM_WS_RESTART").ok().as_deref() == Some("1");
     let fault_mode = std::env::var("CCTEAM_REAL_IM_WS_FAULTS").ok().as_deref() == Some("1");
     std::env::set_var("CCTEAM_HOME", ccteam_home.path());
-    std::env::set_var("CCTEAM_CODEX_APP_SERVER_TRANSPORT", "stdio");
+    // F10: stdio is the default transport — unset the socket override so
+    // the adapter spawns `codex app-server --listen stdio://` itself.
     std::env::remove_var("CCTEAM_CODEX_APP_SERVER_SOCKET");
     std::env::set_var("CCTEAM_MUX_BACKEND", "tmux");
     if let Some(bin) = workspace_ccteam_bin() {
@@ -1483,7 +1483,6 @@ async fn real_ws_dual_harness_smoke() {
         let _ = stop_tx.send(());
         daemon.await.unwrap();
         restore_env("CCTEAM_HOME", old_ccteam_home);
-        restore_env("CCTEAM_CODEX_APP_SERVER_TRANSPORT", old_transport);
         restore_env("CCTEAM_CODEX_APP_SERVER_SOCKET", old_socket);
         restore_env(
             "CCTEAM_CODEX_APP_SERVER_FAULT_KILL_BEFORE_TURN",
@@ -1511,7 +1510,6 @@ async fn real_ws_dual_harness_smoke() {
     let _ = stop_tx.send(());
     daemon.await.unwrap();
     restore_env("CCTEAM_HOME", old_ccteam_home);
-    restore_env("CCTEAM_CODEX_APP_SERVER_TRANSPORT", old_transport);
     restore_env("CCTEAM_CODEX_APP_SERVER_SOCKET", old_socket);
     restore_env(
         "CCTEAM_CODEX_APP_SERVER_FAULT_KILL_BEFORE_TURN",

@@ -64,16 +64,55 @@ use crate::{
     ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails, TurnId, TurnInput,
     UnifiedTokenUsage,
 };
-use crate::{Directive, DirectiveOutcome, ThreadStatus};
+use crate::{
+    ChoiceOption, ChoicePrompt, ChoiceSelection, ContextUsage, Directive, DirectiveOutcome,
+    ThreadStatus,
+};
 
-/// Env override for the UDS path the adapter dials. Tests set this to
-/// a tempdir socket; production resolves
-/// `$CODEX_HOME/app-server-control/app-server-control.sock`.
+/// Env override for the UDS path the adapter dials. Setting it is the
+/// explicit power-user override: it selects the [`CodexTransport::Socket`]
+/// transport and points at a self-managed `codex app-server` daemon
+/// socket (tests set this to a tempdir socket served by a scripted peer).
+/// Unset → the default [`CodexTransport::Stdio`] transport, which only
+/// needs a `codex` binary on `PATH`.
 pub const APP_SERVER_SOCKET_ENV: &str = "CCTEAM_CODEX_APP_SERVER_SOCKET";
 
-/// Env override for the transport used to reach Codex app-server.
-/// Supported values today: `uds` (default) and `stdio`.
-pub const APP_SERVER_TRANSPORT_ENV: &str = "CCTEAM_CODEX_APP_SERVER_TRANSPORT";
+/// How the adapter reaches `codex app-server`. Resolved ONCE at adapter
+/// construction (see [`resolve_codex_transport`]) and stored on
+/// [`CodexAppServerAdapter`], so `client()` is a plain `match` with no
+/// per-call env sniffing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodexTransport {
+    /// Default: spawn `codex app-server --listen stdio://` and speak
+    /// JSON-RPC over its stdio pipes. `program` is `CCTEAM_CODEX_BIN`
+    /// (or `"codex"` on `PATH`). This is the path that "just works"
+    /// once `codex` is installed — no external daemon required.
+    Stdio { program: String },
+    /// Power-user override: dial an already-running `codex app-server`
+    /// over the UDS at `path`. Selected when [`APP_SERVER_SOCKET_ENV`]
+    /// is set.
+    Socket { path: PathBuf },
+}
+
+/// Pure, single-axis transport selection.
+///
+/// - [`APP_SERVER_SOCKET_ENV`] set → [`CodexTransport::Socket`] with that
+///   path (the explicit power-user override pointing at a self-managed
+///   `codex app-server` daemon).
+/// - otherwise → [`CodexTransport::Stdio`] with `CCTEAM_CODEX_BIN` (or
+///   `"codex"`), the default that just needs `codex` on `PATH`.
+///
+/// No second axis: the old `CCTEAM_CODEX_APP_SERVER_TRANSPORT` env (which
+/// produced a 4-state matrix with two dead cells) is gone.
+pub fn resolve_codex_transport() -> CodexTransport {
+    if let Some(p) = std::env::var_os(APP_SERVER_SOCKET_ENV) {
+        return CodexTransport::Socket {
+            path: PathBuf::from(p),
+        };
+    }
+    let program = std::env::var("CCTEAM_CODEX_BIN").unwrap_or_else(|_| "codex".to_string());
+    CodexTransport::Stdio { program }
+}
 
 /// Fault-injection hook for real IM smoke tests: when set to `1`, the
 /// next `submit_turn` terminates the cached stdio Codex app-server
@@ -100,6 +139,79 @@ pub struct ProgressBridgeCtx {
     pub model: Option<String>,
 }
 
+/// v0.8.5 D2.4 — per-thread live state the harness owns directly (NOT a
+/// by-product of the `events()` stream). Maintained by the single
+/// notification dispatcher spawned once per cached client (see
+/// [`CodexAppServerAdapter::spawn_tracker_dispatcher`]).
+///
+/// `usage` comes ONLY from the `thread/tokenUsage/updated` notification
+/// (the real `turn/completed` wire has NO usage field — see
+/// `translate_notification`). `active_turn` is set on `turn/started` and
+/// cleared on `turn/completed` + terminal `error`. `model` is seeded from
+/// the spawn ctx / `thread/start` response.
+#[derive(Debug, Clone, Default)]
+pub struct ThreadLive {
+    /// Latest context usage (total tokens + model context window) from
+    /// `thread/tokenUsage/updated`.
+    pub usage: Option<ContextUsage>,
+    /// The in-flight turn id, if any. Drives steer-vs-start (D2.2) and
+    /// `/interrupt`'s `expectedTurnId`.
+    pub active_turn: Option<String>,
+    /// Model id for this thread (from spawn ctx / `thread/start`).
+    pub model: Option<String>,
+}
+
+/// v0.8.5 D2.4 — the harness-level, vendor-scoped runtime state cache.
+/// Keyed by codex `thread_id`. One per adapter instance (which is itself a
+/// per-vendor singleton, arch §1.1), fed by ONE dispatcher task per cached
+/// client — so opening multiple `events()` streams never double-counts.
+#[derive(Debug, Default)]
+pub struct CodexThreadTracker {
+    threads: HashMap<String, ThreadLive>,
+}
+
+impl CodexThreadTracker {
+    fn entry(&mut self, thread_id: &str) -> &mut ThreadLive {
+        self.threads.entry(thread_id.to_string()).or_default()
+    }
+
+    /// Snapshot the live state for `thread_id` (None if never seen).
+    pub fn snapshot(&self, thread_id: &str) -> Option<ThreadLive> {
+        self.threads.get(thread_id).cloned()
+    }
+}
+
+/// v0.8.5 D2.1 — per-session command overrides applied on the NEXT
+/// `turn/start` (model/effort/personality/collaboration mode/approval +
+/// sandbox policy). Keyed by `thread_id`, mirroring the `bridges` map
+/// pattern. Daemon-restart loss is acceptable (PRD §3-D2.1 / arch §7-2).
+#[derive(Debug, Clone, Default)]
+pub struct SessionOverride {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub personality: Option<String>,
+    pub collaboration_mode: Option<String>,
+    /// `AskForApproval` wire string (kebab-case: `on-request` / `never` /
+    /// `untrusted` / `on-failure`), `shared.rs:162`.
+    pub approval_policy: Option<String>,
+    /// `SandboxPolicy` is an internally-tagged OBJECT on the wire
+    /// (`{"type":"readOnly"}` / `{"type":"workspaceWrite",..}` /
+    /// `{"type":"dangerFullAccess"}`, `permissions.rs` `SandboxPolicy`), NOT
+    /// a bare string — so we store the full JSON value.
+    pub sandbox_policy: Option<Value>,
+}
+
+impl SessionOverride {
+    fn is_empty(&self) -> bool {
+        self.model.is_none()
+            && self.effort.is_none()
+            && self.personality.is_none()
+            && self.collaboration_mode.is_none()
+            && self.approval_policy.is_none()
+            && self.sandbox_policy.is_none()
+    }
+}
+
 /// V0.6.0 F112 [`HarnessAdapter`] that drives mode-3 codex bot sessions
 /// via `codex app-server` UDS. The adapter is stateless across threads
 /// — each `start_thread` lazily connects (and caches) a client per
@@ -111,10 +223,49 @@ pub struct ProgressBridgeCtx {
 /// `turn/completed` / `turn/failed` notifications into `agent_done`
 /// rows tagged `vendor: codex`. Without an entry the stream behaves
 /// exactly like V0.6.0 (translation only — no IO side effect).
-#[derive(Clone, Default)]
+///
+/// **v0.8.5 D2.4**: additionally holds a [`CodexThreadTracker`]
+/// (per-thread usage / active-turn / model) fed by a single dispatcher
+/// task spawned once per cached client, a per-session [`SessionOverride`]
+/// map applied on `turn/start`, and a `skills/list` cache invalidated by
+/// the `skills/changed` notification.
+#[derive(Clone)]
 pub struct CodexAppServerAdapter {
     inner: Arc<Mutex<Option<Arc<CodexJsonRpcClient>>>>,
     bridges: Arc<Mutex<HashMap<String, ProgressBridgeCtx>>>,
+    /// v0.8.5 D2.4 — harness-owned per-thread live state (usage /
+    /// active-turn / model). Fed by ONE dispatcher per cached client.
+    tracker: Arc<Mutex<CodexThreadTracker>>,
+    /// v0.8.5 D2.1 — per-session command overrides applied on `turn/start`.
+    overrides: Arc<Mutex<HashMap<String, SessionOverride>>>,
+    /// v0.8.5 D2 — cached `skills/list` result (flattened `(name, path)`),
+    /// invalidated by the `skills/changed` notification. `None` = cold.
+    skills_cache: Arc<Mutex<Option<Vec<CachedSkill>>>>,
+    /// Transport resolved ONCE at construction (see
+    /// [`resolve_codex_transport`]). `client()` matches on this — no
+    /// per-call env sniffing.
+    transport: CodexTransport,
+}
+
+/// v0.8.5 D2 — one entry of the flattened `skills/list` cache.
+#[derive(Debug, Clone)]
+pub struct CachedSkill {
+    pub name: String,
+    pub path: String,
+    pub enabled: bool,
+}
+
+impl Default for CodexAppServerAdapter {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(None)),
+            bridges: Arc::new(Mutex::new(HashMap::new())),
+            tracker: Arc::new(Mutex::new(CodexThreadTracker::default())),
+            overrides: Arc::new(Mutex::new(HashMap::new())),
+            skills_cache: Arc::new(Mutex::new(None)),
+            transport: resolve_codex_transport(),
+        }
+    }
 }
 
 impl std::fmt::Debug for CodexAppServerAdapter {
@@ -125,8 +276,26 @@ impl std::fmt::Debug for CodexAppServerAdapter {
 }
 
 impl CodexAppServerAdapter {
+    /// Construct the adapter, resolving the [`CodexTransport`] ONCE (env
+    /// is read here, never in `client()`). A single adapter therefore
+    /// memoises a single transport + a single `codex app-server` child
+    /// (stdio) for its whole lifetime.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The resolved transport, decided at construction.
+    pub fn transport(&self) -> &CodexTransport {
+        &self.transport
+    }
+
+    /// String tag for `ThreadHandle.raw_extras.transport`: `"stdio"` for
+    /// the default child-spawn path, `"socket"` for the UDS override.
+    fn transport_tag(&self) -> &'static str {
+        match self.transport {
+            CodexTransport::Stdio { .. } => "stdio",
+            CodexTransport::Socket { .. } => "socket",
+        }
     }
 
     /// Resolve the UDS path the adapter should dial. Env override wins;
@@ -156,54 +325,157 @@ impl CodexAppServerAdapter {
         if let Some(c) = guard.as_ref() {
             return Ok(Arc::clone(c));
         }
-        if std::env::var_os(APP_SERVER_SOCKET_ENV).is_none()
-            && std::env::var(APP_SERVER_TRANSPORT_ENV)
-                .map(|v| v.eq_ignore_ascii_case("stdio"))
-                .unwrap_or(false)
-        {
-            let program = std::env::var("CCTEAM_CODEX_BIN").unwrap_or_else(|_| "codex".to_string());
-            let client = CodexJsonRpcClient::connect_stdio_command(&program)
+        // F10: transport is resolved once at construction; here we just
+        // `match` on it. `Stdio` spawns a child app-server; `Socket`
+        // dials the power-user UDS override.
+        let client = match &self.transport {
+            CodexTransport::Stdio { program } => CodexJsonRpcClient::connect_stdio_command(program)
                 .await
                 .map_err(|err| {
                     HarnessError::SpawnFailed(format!(
                         "spawn codex app-server stdio ({program}): {err:#}"
                     ))
-                })?;
-            let shared = Arc::new(client);
-            Self::handshake(&shared).await?;
-            *guard = Some(Arc::clone(&shared));
-            return Ok(shared);
-        }
-
-        let path = Self::resolve_socket_path().ok_or_else(|| {
-            HarnessError::SpawnFailed(
-                "codex app-server socket path unresolved (set CODEX_HOME or \
-                 CCTEAM_CODEX_APP_SERVER_SOCKET)"
-                    .to_string(),
-            )
-        })?;
-        let client = CodexJsonRpcClient::connect_uds(&path)
-            .await
-            .map_err(|err| {
-                HarnessError::SpawnFailed(format!(
-                    "connect codex app-server at {}: {err:#}",
-                    path.display()
-                ))
-            })?;
+                })?,
+            CodexTransport::Socket { path } => {
+                CodexJsonRpcClient::connect_uds(path).await.map_err(|err| {
+                    HarnessError::SpawnFailed(format!(
+                        "connect codex app-server at {}: {err:#}",
+                        path.display()
+                    ))
+                })?
+            }
+        };
         let shared = Arc::new(client);
         // W3b catalog §7.2 defect fix: complete the `initialize` handshake
         // BEFORE returning the cached client (i.e. before the first
-        // `thread/start` or `events()` subscribe). The previous code dialed
-        // the UDS and went straight to `thread/start`, so the server kept
-        // `experimental_api = false` and silently filtered ~30% of the
+        // `thread/start` or `events()` subscribe). Without it the server
+        // keeps `experimental_api = false` and silently filters ~30% of the
         // server→client notification surface — including `turn/plan/updated`
         // (the structured plan tree V0.6.1 F124 HITL needs),
         // `thread/tokenUsage/updated`, `thread/goal/*`, and `item/plan/delta`.
         // We do this once per cached client (client() memoises), so all
         // subsequent calls reuse the negotiated capabilities.
         Self::handshake(&shared).await?;
+        // v0.8.5 D2.4 — spawn the ONE tracker dispatcher per cached client,
+        // BEFORE returning it (so it is subscribed before the first
+        // `thread/start` / `turn/start`). It owns a single broadcast
+        // subscription and is the sole writer of the tracker — opening
+        // multiple `events()` streams never double-counts (arch §1.3).
+        // The task exits when the broadcast closes (client dropped /
+        // `forget_client`); a subsequent re-dial spawns a fresh one.
+        self.spawn_tracker_dispatcher(&shared);
         *guard = Some(Arc::clone(&shared));
         Ok(shared)
+    }
+
+    /// v0.8.5 D2.4 — spawn the single per-client notification dispatcher
+    /// that feeds the [`CodexThreadTracker`] and invalidates the skills
+    /// cache. Deliberately NOT hung on `events()` (which stays a final-only
+    /// presentation translator); the progress.jsonl mirror in `events()`
+    /// is unaffected. Returns the [`JoinHandle`] (mostly for tests; the
+    /// task self-terminates on broadcast close).
+    fn spawn_tracker_dispatcher(
+        &self,
+        client: &Arc<CodexJsonRpcClient>,
+    ) -> tokio::task::JoinHandle<()> {
+        let mut rx = client.subscribe();
+        let tracker = Arc::clone(&self.tracker);
+        let skills_cache = Arc::clone(&self.skills_cache);
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(notif) => {
+                        apply_notification_to_tracker(&tracker, &notif).await;
+                        if notif.method == "skills/changed" {
+                            *skills_cache.lock().await = None;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(n, "codex tracker dispatcher lagged");
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        })
+    }
+
+    /// Test hook: seed a thread's model in the tracker (production seeds it
+    /// from `start_thread`'s spawn ctx).
+    #[doc(hidden)]
+    pub async fn tracker_seed_model_for_test(&self, thread_id: &str, model: Option<String>) {
+        self.tracker.lock().await.entry(thread_id).model = model;
+    }
+
+    /// Snapshot a thread's tracker state (test + `thread_status` use it).
+    pub async fn tracker_snapshot(&self, thread_id: &str) -> Option<ThreadLive> {
+        self.tracker.lock().await.snapshot(thread_id)
+    }
+
+    /// v0.8.5 D2.1 — fold the per-session override map for `thread_id` into a
+    /// `turn/start` params object. Each present field becomes the matching
+    /// per-turn override (`turn/start` carries them per
+    /// `app-server-protocol/src/protocol/v2/turn.rs`:
+    /// model:114, effort:126, personality:132, approval_policy:99,
+    /// sandbox_policy:106, collaboration_mode:145). Overrides "stick" on the
+    /// server for this + subsequent turns, so we only need to send them when
+    /// changed; resending every turn is harmless and idempotent.
+    async fn apply_overrides(&self, thread_id: &str, params: &mut Value) {
+        let ov = {
+            let map = self.overrides.lock().await;
+            match map.get(thread_id) {
+                Some(o) if !o.is_empty() => o.clone(),
+                _ => return,
+            }
+        };
+        // Resolve the effective model BEFORE the mutable borrow of params:
+        // override model wins, else the tracker's seeded model. Needed for
+        // the (EXPERIMENTAL) collaboration mode object whose `settings.model`
+        // is required.
+        let effective_model = match ov.model.clone() {
+            Some(m) => Some(m),
+            None => self.tracker_snapshot(thread_id).await.and_then(|t| t.model),
+        };
+        let obj = match params.as_object_mut() {
+            Some(o) => o,
+            None => return,
+        };
+        if let Some(m) = ov.model {
+            obj.insert("model".into(), Value::String(m));
+        }
+        if let Some(e) = ov.effort {
+            obj.insert("effort".into(), Value::String(e));
+        }
+        if let Some(p) = ov.personality {
+            obj.insert("personality".into(), Value::String(p));
+        }
+        if let Some(c) = ov.collaboration_mode {
+            // CollaborationMode = { mode: ModeKind, settings: { model,
+            // reasoning_effort?, developer_instructions? } } (config_types.rs:622).
+            // settings.model is REQUIRED; without an effective model we cannot
+            // build a valid object, so skip the field (degrade rather than
+            // send a malformed turn — honest partial support for this
+            // EXPERIMENTAL knob).
+            if let Some(model) = effective_model {
+                obj.insert(
+                    "collaborationMode".into(),
+                    json!({ "mode": c, "settings": { "model": model } }),
+                );
+            } else {
+                tracing::warn!(
+                    thread_id,
+                    "collaboration mode override skipped: no effective model for required \
+                     settings.model"
+                );
+            }
+        }
+        if let Some(a) = ov.approval_policy {
+            obj.insert("approvalPolicy".into(), Value::String(a));
+        }
+        if let Some(s) = ov.sandbox_policy {
+            // SandboxPolicy is an internally-tagged object, not a string.
+            obj.insert("sandboxPolicy".into(), s);
+        }
     }
 
     /// W3b catalog §4.1 — send the Codex `initialize` request (negotiating
@@ -238,7 +510,10 @@ impl CodexAppServerAdapter {
                     "windows/worldWritableWarning",
                     "windowsSandbox/setupCompleted",
                     "app/list/updated",
-                    "skills/changed",
+                    // NOTE (v0.8.5 D2): `skills/changed` is deliberately NOT
+                    // opted out — the tracker dispatcher consumes it to
+                    // invalidate the `skills/list` cache (arch §1.3). If you
+                    // re-add it here the cache goes stale-forever.
                     "fuzzyFileSearch/sessionUpdated",
                     "fuzzyFileSearch/sessionCompleted",
                     "remoteControl/status/changed"
@@ -290,6 +565,750 @@ impl CodexAppServerAdapter {
     async fn drop_bridge(&self, thread_id: &str) {
         self.bridges.lock().await.remove(thread_id);
     }
+
+    /// v0.8.5 D2.1 — the builtin command table. Returns `Ok(Some(outcome))`
+    /// for a recognised builtin (the six classes), `Ok(None)` when `name` is
+    /// not a builtin (the caller then tries the skills layer). Errors only on
+    /// transport/RPC failure (propagated verbatim, D2.1 error class).
+    ///
+    /// b2344d8 anchors for every RPC are cited inline (file:line in
+    /// `references/codex/codex-rs/`).
+    async fn builtin_directive(
+        &self,
+        h: &ThreadHandle,
+        name: &str,
+        d: &Directive,
+    ) -> Result<Option<DirectiveOutcome>, HarnessError> {
+        let tid = h.identity.as_str();
+        let args = d.args.trim();
+        let outcome = match name {
+            // ---- RPC direct-map (→ Turn unless noted) -------------------
+            // thread/compact/start — common.rs:541
+            "compact" => {
+                let client = self.client().await?;
+                client
+                    .call("thread/compact/start", json!({ "threadId": tid }))
+                    .await
+                    .map_err(|e| {
+                        HarnessError::SubmitFailed(format!("thread/compact/start: {e:#}"))
+                    })?;
+                DirectiveOutcome::Turn(synthetic_command_turn_id("compact", tid))
+            }
+            // review/start — common.rs:797; ReviewTarget — review.rs:43-65.
+            // D2 apply: `branch X` → baseBranch; `commit X` → commit;
+            // else → custom{instructions}; (a bare arg here means
+            // uncommittedChanges). D4: a BARE `/review` (no args, no choice)
+            // becomes a 4-option NeedsChoice; the `branch`/`commit` picks are
+            // 2nd-hop (they need a value), surfaced as a follow-up NeedsChoice
+            // whose free_text the user supplies (or `/review branch X` direct).
+            "review" => {
+                // D4 re-entry: a choice carrying one of the 4 ReviewTarget ids.
+                if let Some(sel) = &d.choice {
+                    return self.review_apply_choice(tid, sel).await.map(Some);
+                }
+                // D4 bare → NeedsChoice with the 4 fixed ReviewTarget options.
+                if args.is_empty() {
+                    return Ok(Some(DirectiveOutcome::NeedsChoice(choice_prompt(
+                        "What should Codex review?",
+                        review_options(),
+                    ))));
+                }
+                // D2 with-args → direct apply (unchanged).
+                let target = parse_review_target(args);
+                self.review_start(tid, target).await?
+            }
+            // turn/interrupt — common.rs:762; params {threadId, turnId}
+            // (turn.rs:188-191). Needs the active turn id from the tracker.
+            "interrupt" => {
+                let active = self.tracker_snapshot(tid).await.and_then(|t| t.active_turn);
+                match active {
+                    Some(turn_id) => {
+                        let client = self.client().await?;
+                        client
+                            .call(
+                                "turn/interrupt",
+                                json!({ "threadId": tid, "turnId": turn_id }),
+                            )
+                            .await
+                            .map_err(|e| {
+                                HarnessError::SubmitFailed(format!("turn/interrupt: {e:#}"))
+                            })?;
+                        DirectiveOutcome::Done {
+                            receipt: "interrupted the active turn.".to_string(),
+                        }
+                    }
+                    None => DirectiveOutcome::Done {
+                        receipt: "no active turn to interrupt.".to_string(),
+                    },
+                }
+            }
+            // thread/fork — common.rs:457; response thread.id (thread.rs:553).
+            // The new thread id is registered as a new gateway session by the
+            // gateway; we surface it in the receipt (wiring hook noted).
+            "fork" => {
+                let client = self.client().await?;
+                let result = client
+                    .call("thread/fork", json!({ "threadId": tid }))
+                    .await
+                    .map_err(|e| HarnessError::SubmitFailed(format!("thread/fork: {e:#}")))?;
+                let new_id = pluck_thread_id(&result).unwrap_or_default();
+                DirectiveOutcome::Done {
+                    receipt: format!("forked thread → {new_id} (use /use {new_id} to switch)."),
+                }
+            }
+            // thread/rollback — common.rs:562; params {threadId, numTurns}
+            // (thread.rs:938-947, numTurns >= 1).
+            "rollback" => {
+                let n: u32 = args.parse().unwrap_or(1).max(1);
+                let client = self.client().await?;
+                client
+                    .call("thread/rollback", json!({ "threadId": tid, "numTurns": n }))
+                    .await
+                    .map_err(|e| HarnessError::SubmitFailed(format!("thread/rollback: {e:#}")))?;
+                DirectiveOutcome::Done {
+                    receipt: format!("rolled back {n} turn(s)."),
+                }
+            }
+            // thread/name/set — common.rs:492; params {threadId, name}
+            // (thread.rs:660-663).
+            "rename" => {
+                if args.is_empty() {
+                    DirectiveOutcome::Rejected {
+                        reason: "usage: /rename <new name>".to_string(),
+                    }
+                } else {
+                    let client = self.client().await?;
+                    client
+                        .call("thread/name/set", json!({ "threadId": tid, "name": args }))
+                        .await
+                        .map_err(|e| {
+                            HarnessError::SubmitFailed(format!("thread/name/set: {e:#}"))
+                        })?;
+                    DirectiveOutcome::Done {
+                        receipt: format!("renamed thread to \"{args}\"."),
+                    }
+                }
+            }
+            // thread/goal/{set,get,clear} — common.rs:497/502/507.
+            // no args → get; "clear" → clear; else → set objective.
+            "goal" => {
+                let client = self.client().await?;
+                if args.is_empty() {
+                    let result = client
+                        .call("thread/goal/get", json!({ "threadId": tid }))
+                        .await
+                        .map_err(|e| {
+                            HarnessError::SubmitFailed(format!("thread/goal/get: {e:#}"))
+                        })?;
+                    let objective = result
+                        .get("goal")
+                        .and_then(|g| g.get("objective"))
+                        .and_then(|v| v.as_str());
+                    DirectiveOutcome::Done {
+                        receipt: match objective {
+                            Some(o) => format!("goal: {o}"),
+                            None => "no goal set.".to_string(),
+                        },
+                    }
+                } else if args.eq_ignore_ascii_case("clear") {
+                    client
+                        .call("thread/goal/clear", json!({ "threadId": tid }))
+                        .await
+                        .map_err(|e| {
+                            HarnessError::SubmitFailed(format!("thread/goal/clear: {e:#}"))
+                        })?;
+                    DirectiveOutcome::Done {
+                        receipt: "goal cleared.".to_string(),
+                    }
+                } else {
+                    client
+                        .call(
+                            "thread/goal/set",
+                            json!({ "threadId": tid, "objective": args }),
+                        )
+                        .await
+                        .map_err(|e| {
+                            HarnessError::SubmitFailed(format!("thread/goal/set: {e:#}"))
+                        })?;
+                    DirectiveOutcome::Done {
+                        receipt: format!("goal set: {args}"),
+                    }
+                }
+            }
+            // thread/backgroundTerminals/clean — common.rs:556.
+            "stop" => {
+                let client = self.client().await?;
+                client
+                    .call(
+                        "thread/backgroundTerminals/clean",
+                        json!({ "threadId": tid }),
+                    )
+                    .await
+                    .map_err(|e| {
+                        HarnessError::SubmitFailed(format!(
+                            "thread/backgroundTerminals/clean: {e:#}"
+                        ))
+                    })?;
+                DirectiveOutcome::Done {
+                    receipt: "cleaned background terminals.".to_string(),
+                }
+            }
+            // thread/memoryMode/set — common.rs:524; mode "enabled"|"disabled"
+            // (thread.rs:830-836, lowercase enum). D4: bare → NeedsChoice
+            // (enabled/disabled); a choice re-enters with the picked on/off id;
+            // with-args keeps the D2 direct apply.
+            "memories" => {
+                // D4 re-entry: fold the picked id into the args parse below.
+                let effective = match &d.choice {
+                    Some(sel) => picked_id(sel).unwrap_or_default(),
+                    None if args.is_empty() => {
+                        return Ok(Some(DirectiveOutcome::NeedsChoice(choice_prompt(
+                            "Memory mode?",
+                            memory_mode_options(),
+                        ))));
+                    }
+                    None => args.to_string(),
+                };
+                let mode = match effective.to_ascii_lowercase().as_str() {
+                    "on" | "enable" | "enabled" => Some("enabled"),
+                    "off" | "disable" | "disabled" => Some("disabled"),
+                    _ => None,
+                };
+                match mode {
+                    Some(m) => {
+                        let client = self.client().await?;
+                        client
+                            .call(
+                                "thread/memoryMode/set",
+                                json!({ "threadId": tid, "mode": m }),
+                            )
+                            .await
+                            .map_err(|e| {
+                                HarnessError::SubmitFailed(format!("thread/memoryMode/set: {e:#}"))
+                            })?;
+                        DirectiveOutcome::Done {
+                            receipt: format!("memory mode → {m}."),
+                        }
+                    }
+                    None => DirectiveOutcome::Rejected {
+                        reason: "usage: /memories <on|off>".to_string(),
+                    },
+                }
+            }
+            // command/exec — common.rs:965; params {command: [argv...]}
+            // (command_exec.rs:30-33). Run a one-off `git diff`.
+            "diff" => {
+                let client = self.client().await?;
+                let mut argv = vec!["git".to_string(), "diff".to_string()];
+                if !args.is_empty() {
+                    argv.extend(args.split_whitespace().map(|s| s.to_string()));
+                }
+                let result = client
+                    .call("command/exec", json!({ "command": argv }))
+                    .await
+                    .map_err(|e| HarnessError::SubmitFailed(format!("command/exec: {e:#}")))?;
+                let out = result
+                    .get("stdout")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                DirectiveOutcome::Done {
+                    receipt: if out.trim().is_empty() {
+                        "no changes.".to_string()
+                    } else {
+                        out
+                    },
+                }
+            }
+            // /init → a fixed-prompt turn (turn/start, common.rs:756).
+            "init" => {
+                let client = self.client().await?;
+                let prompt = "Analyze this codebase and create an AGENTS.md file \
+                    capturing build/test/lint commands, code style, and architecture \
+                    so future agents can be productive immediately.";
+                let mut params = json!({
+                    "threadId": tid,
+                    "input": [{ "type": "text", "text": prompt }],
+                });
+                self.apply_overrides(tid, &mut params).await;
+                let result = client
+                    .call("turn/start", params)
+                    .await
+                    .map_err(|e| HarnessError::SubmitFailed(format!("turn/start (init): {e:#}")))?;
+                let turn_id = pluck_turn_id(&result).ok_or_else(|| {
+                    HarnessError::SubmitFailed(format!(
+                        "turn/start (init) response missing turn.id: {result}"
+                    ))
+                })?;
+                DirectiveOutcome::Turn(TurnId(turn_id))
+            }
+            // account/login/start + account/logout — common.rs:911/931
+            // (admin-gated at the gateway; the RPC itself is unconditional).
+            "login" => {
+                let client = self.client().await?;
+                client
+                    .call("account/login/start", json!({}))
+                    .await
+                    .map_err(|e| {
+                        HarnessError::SubmitFailed(format!("account/login/start: {e:#}"))
+                    })?;
+                DirectiveOutcome::Done {
+                    receipt: "login started (follow the codex CLI prompts).".to_string(),
+                }
+            }
+            "logout" => {
+                let client = self.client().await?;
+                client
+                    .call("account/logout", Value::Null)
+                    .await
+                    .map_err(|e| HarnessError::SubmitFailed(format!("account/logout: {e:#}")))?;
+                DirectiveOutcome::Done {
+                    receipt: "logged out.".to_string(),
+                }
+            }
+
+            // ---- query-synth (→ Done{receipt}) --------------------------
+            // /status: tracker (model + ctx) — no RPC needed; D2.4.
+            "status" => {
+                let live = self.tracker_snapshot(tid).await.unwrap_or_default();
+                DirectiveOutcome::Done {
+                    receipt: render_status_receipt(&live),
+                }
+            }
+            // D4: bare /model (no args, no choice) → model/list (common.rs:803)
+            // rendered as a NeedsChoice picker (one option per model+effort).
+            // This SUPERSEDES D2's query-synth text receipt for the bare case.
+            // A `choice` re-entry (empty args + d.choice) and the `/model <id>`
+            // with-args case both fall through to the override arm below.
+            "model" if args.is_empty() && d.choice.is_none() => {
+                let client = self.client().await?;
+                let result = client
+                    .call("model/list", json!({}))
+                    .await
+                    .map_err(|e| HarnessError::SubmitFailed(format!("model/list: {e:#}")))?;
+                DirectiveOutcome::NeedsChoice(choice_prompt(
+                    "Choose a model + reasoning effort:",
+                    model_options(&result),
+                ))
+            }
+            // /skills → skills/list (common.rs:608). D4: a choice re-entry
+            // shows the picked skill's detail (minimal). Bare → NeedsChoice
+            // listing skills; with-args → the D2 text receipt (a filtered
+            // list still reads fine and avoids a useless 1-option picker).
+            "skills" => {
+                let skills = self.skills(true).await?;
+                if let Some(sel) = &d.choice {
+                    let id = picked_id(sel).unwrap_or_default();
+                    let detail = skills
+                        .iter()
+                        .find(|s| s.name.eq_ignore_ascii_case(&id))
+                        .map(|s| {
+                            format!(
+                                "/{}{}\n{}",
+                                s.name,
+                                if s.enabled { "" } else { " (disabled)" },
+                                s.path
+                            )
+                        })
+                        .unwrap_or_else(|| format!("skill not found: {id}"));
+                    DirectiveOutcome::Done { receipt: detail }
+                } else if args.is_empty() && !skills.is_empty() {
+                    let options = skills
+                        .iter()
+                        .map(|s| ChoiceOption {
+                            id: s.name.clone(),
+                            label: if s.enabled {
+                                format!("/{}", s.name)
+                            } else {
+                                format!("/{} (disabled)", s.name)
+                            },
+                        })
+                        .collect();
+                    DirectiveOutcome::NeedsChoice(choice_prompt("Skills (pick to view):", options))
+                } else {
+                    DirectiveOutcome::Done {
+                        receipt: render_skills_list(&skills),
+                    }
+                }
+            }
+            // /mcp → mcpServerStatus/list (common.rs:898).
+            "mcp" => {
+                let client = self.client().await?;
+                let result = client
+                    .call("mcpServerStatus/list", json!({}))
+                    .await
+                    .map_err(|e| {
+                        HarnessError::SubmitFailed(format!("mcpServerStatus/list: {e:#}"))
+                    })?;
+                DirectiveOutcome::Done {
+                    receipt: render_count_receipt("MCP server", &result, "data"),
+                }
+            }
+            // /hooks → hooks/list (common.rs:618).
+            "hooks" => {
+                let client = self.client().await?;
+                let result = client
+                    .call("hooks/list", json!({}))
+                    .await
+                    .map_err(|e| HarnessError::SubmitFailed(format!("hooks/list: {e:#}")))?;
+                DirectiveOutcome::Done {
+                    receipt: render_count_receipt("hook source", &result, "data"),
+                }
+            }
+            // /apps → app/list (common.rs:683).
+            "apps" => {
+                let client = self.client().await?;
+                let result = client
+                    .call("app/list", json!({}))
+                    .await
+                    .map_err(|e| HarnessError::SubmitFailed(format!("app/list: {e:#}")))?;
+                DirectiveOutcome::Done {
+                    receipt: render_count_receipt("app", &result, "data"),
+                }
+            }
+
+            // ---- per-session override (→ Done) --------------------------
+            // /model <id> [effort] — turn.rs:114/126. D4: a choice re-entry
+            // arrives with empty args + d.choice carrying the picked
+            // "<id> [effort]" id; parse that instead.
+            "model" => {
+                let picked = d.choice.as_ref().and_then(picked_id);
+                let effective = picked.as_deref().unwrap_or(args);
+                let mut parts = effective.split_whitespace();
+                let model = parts.next().map(|s| s.to_string());
+                let effort = parts.next().map(|s| s.to_ascii_lowercase());
+                self.set_override(tid, |o| {
+                    o.model = model.clone();
+                    if effort.is_some() {
+                        o.effort = effort.clone();
+                    }
+                })
+                .await;
+                DirectiveOutcome::Done {
+                    receipt: match (&model, &effort) {
+                        (Some(m), Some(e)) => {
+                            format!("model → {m} (effort {e}); applies next turn.")
+                        }
+                        (Some(m), None) => format!("model → {m}; applies next turn."),
+                        _ => "model override cleared.".to_string(),
+                    },
+                }
+            }
+            // /personality <p> — turn.rs:132 (lowercase: none/friendly/pragmatic).
+            // D4: bare → NeedsChoice (static Personality enum); a choice
+            // re-enters with the picked id; with-args keeps the D2 apply.
+            "personality" => {
+                let picked = d.choice.as_ref().and_then(picked_id);
+                let p = match (picked, args.is_empty()) {
+                    (Some(p), _) => p.to_ascii_lowercase(),
+                    (None, true) => {
+                        return Ok(Some(DirectiveOutcome::NeedsChoice(choice_prompt(
+                            "Communication style?",
+                            personality_options(),
+                        ))));
+                    }
+                    (None, false) => args.to_ascii_lowercase(),
+                };
+                self.set_override(tid, |o| o.personality = Some(p.clone()))
+                    .await;
+                DirectiveOutcome::Done {
+                    receipt: format!("personality → {p}; applies next turn."),
+                }
+            }
+            // /plan, /collab <m> — turn.rs:145 collaboration_mode (EXPERIMENTAL).
+            // `CollaborationMode` is `{mode: ModeKind, settings: {model,..}}`
+            // (config_types.rs:622) — `settings.model` is REQUIRED, so the
+            // full object is built at apply time from the effective model
+            // (see `apply_overrides`). Here we only store the `ModeKind`
+            // (snake_case: `plan` / `default`; config_types.rs:576 accepts
+            // `code`/`execute`/`custom` as aliases for `default`).
+            // D4: `/collab` (bare, no choice) → NeedsChoice from the
+            // EXPERIMENTAL `collaborationMode/list` (common.rs:864); a choice
+            // re-enters with the picked ModeKind/name; `/collab <m>` applies
+            // directly. `/plan` is a directed alias for the `plan` ModeKind —
+            // it always applies directly (no popup), matching the TUI "switch
+            // to Plan mode" semantics.
+            "collab" | "plan" => {
+                let picked = d.choice.as_ref().and_then(picked_id);
+                let kind = if name == "plan" {
+                    "plan".to_string()
+                } else if let Some(p) = picked {
+                    p.to_ascii_lowercase()
+                } else if args.is_empty() {
+                    // EXPERIMENTAL list; if the server doesn't implement it the
+                    // RPC errors → propagate as SubmitFailed (honest).
+                    let client = self.client().await?;
+                    let result = client
+                        .call("collaborationMode/list", json!({}))
+                        .await
+                        .map_err(|e| {
+                            HarnessError::SubmitFailed(format!("collaborationMode/list: {e:#}"))
+                        })?;
+                    let options = collab_options(&result);
+                    return Ok(Some(DirectiveOutcome::NeedsChoice(choice_prompt(
+                        "Collaboration mode?",
+                        options,
+                    ))));
+                } else {
+                    args.to_ascii_lowercase()
+                };
+                self.set_override(tid, |o| o.collaboration_mode = Some(kind.clone()))
+                    .await;
+                DirectiveOutcome::Done {
+                    receipt: format!("collaboration mode → {kind}; applies next turn."),
+                }
+            }
+            // /permissions <preset> — turn.rs:99 approval_policy + :106
+            // sandbox_policy (admin-gated at the gateway). We map a small set
+            // of presets to (approval_policy, sandbox_policy). D4: bare →
+            // NeedsChoice (static AskForApproval/SandboxMode presets); a choice
+            // re-enters with the picked preset id; with-args keeps D2's apply.
+            "permissions" => {
+                if d.choice.is_none() && args.is_empty() {
+                    return Ok(Some(DirectiveOutcome::NeedsChoice(choice_prompt(
+                        "What is Codex allowed to do?",
+                        permissions_options(),
+                    ))));
+                }
+                let effective = match d.choice.as_ref().and_then(picked_id) {
+                    Some(p) => p,
+                    None => args.to_string(),
+                };
+                match permissions_preset(&effective) {
+                    Some((approval, sandbox, label)) => {
+                        let a = approval.to_string();
+                        self.set_override(tid, |o| {
+                            o.approval_policy = Some(a.clone());
+                            o.sandbox_policy = Some(sandbox.clone());
+                        })
+                        .await;
+                        DirectiveOutcome::Done {
+                            receipt: format!(
+                                "permissions → {label} (approval={approval}); applies next turn."
+                            ),
+                        }
+                    }
+                    None => DirectiveOutcome::Rejected {
+                        reason: "usage: /permissions <read-only|auto|full-access>".to_string(),
+                    },
+                }
+            }
+
+            // ---- semantic redirect (→ Redirect) -------------------------
+            // Codex has no in-thread /new /clear — point at the gateway's
+            // session commands.
+            "new" | "clear" => DirectiveOutcome::Redirect {
+                hint: "Codex has no in-thread equivalent — use the gateway's /new (fresh \
+                       session) or /use (switch session)."
+                    .to_string(),
+            },
+            // D4: /resume bare → NeedsChoice from thread/list (common.rs:567);
+            // a choice re-enters with the picked thread id, surfaced as a
+            // Redirect carrying `/use <id>` (the gateway owns session switching
+            // — Codex has no in-thread resume). `/resume <id>` short-circuits
+            // straight to the same redirect.
+            "resume" => {
+                if let Some(sel) = &d.choice {
+                    let id = picked_id(sel).unwrap_or_default();
+                    return Ok(Some(resume_redirect(&id)));
+                }
+                if !args.is_empty() {
+                    return Ok(Some(resume_redirect(args)));
+                }
+                let client = self.client().await?;
+                let result = client
+                    .call("thread/list", json!({}))
+                    .await
+                    .map_err(|e| HarnessError::SubmitFailed(format!("thread/list: {e:#}")))?;
+                let options = resume_options(&result);
+                if options.is_empty() {
+                    DirectiveOutcome::Done {
+                        receipt: "no saved threads to resume.".to_string(),
+                    }
+                } else {
+                    DirectiveOutcome::NeedsChoice(choice_prompt("Resume which thread?", options))
+                }
+            }
+
+            // ---- TUI-only (→ Rejected) ----------------------------------
+            n if is_codex_tui_only(n) => DirectiveOutcome::Rejected {
+                reason: format!(
+                    "/{n} is a Codex TUI-only command with no app-server equivalent; \
+                     it cannot run from chat."
+                ),
+            },
+
+            // not a builtin → let the caller try the skills layer.
+            _ => return Ok(None),
+        };
+        Ok(Some(outcome))
+    }
+
+    /// v0.8.5 D2/D4 — fire `review/start` for a resolved [`ReviewTarget`]
+    /// (review.rs:43-65) and surface the resulting turn.
+    async fn review_start(
+        &self,
+        thread_id: &str,
+        target: Value,
+    ) -> Result<DirectiveOutcome, HarnessError> {
+        let client = self.client().await?;
+        let result = client
+            .call(
+                "review/start",
+                json!({ "threadId": thread_id, "target": target }),
+            )
+            .await
+            .map_err(|e| HarnessError::SubmitFailed(format!("review/start: {e:#}")))?;
+        let turn_id = pluck_turn_id(&result).ok_or_else(|| {
+            HarnessError::SubmitFailed(format!("review/start response missing turn.id: {result}"))
+        })?;
+        Ok(DirectiveOutcome::Turn(TurnId(turn_id)))
+    }
+
+    /// v0.8.5 D4 — apply a `/review` ChoicePrompt selection. The 4 fixed
+    /// `ReviewTarget` ids map to:
+    /// - `uncommitted` → fire `review/start` { uncommittedChanges }.
+    /// - `custom` → if `free_text` was supplied, fire { custom }; else a
+    ///   2nd-hop NeedsChoice asking for instructions (free-text answer).
+    /// - `branch` / `commit` → need a value: if `free_text` carries it, fire
+    ///   the target; else a 2nd-hop NeedsChoice prompting for the branch/sha
+    ///   (the user answers with free text — `parse_review_target` then folds
+    ///   `"branch <x>"` / `"commit <x>"`).
+    async fn review_apply_choice(
+        &self,
+        thread_id: &str,
+        sel: &ChoiceSelection,
+    ) -> Result<DirectiveOutcome, HarnessError> {
+        let id = sel.ids.first().map(|s| s.as_str()).unwrap_or("");
+        let free = sel.free_text.as_deref().map(str::trim).unwrap_or("");
+        match id {
+            "uncommitted" => {
+                self.review_start(thread_id, json!({ "type": "uncommittedChanges" }))
+                    .await
+            }
+            "branch" | "commit" if !free.is_empty() => {
+                self.review_start(thread_id, parse_review_target(&format!("{id} {free}")))
+                    .await
+            }
+            "custom" if !free.is_empty() => {
+                self.review_start(thread_id, json!({ "type": "custom", "instructions": free }))
+                    .await
+            }
+            // 2nd-hop: branch/commit/custom picked without a value yet → ask
+            // for it as a free-text follow-up (the channel renders a text
+            // prompt; the answer comes back as `free_text`).
+            "branch" | "commit" | "custom" => {
+                let title = match id {
+                    "branch" => "Which base branch? (reply with the branch name)",
+                    "commit" => "Which commit? (reply with the sha)",
+                    _ => "Review instructions? (reply with what to focus on)",
+                };
+                // A no-option prompt signals "free-text only"; the channel's
+                // numbered-text / chips fallback still accepts a typed reply,
+                // which the gateway folds back as `free_text` on re-entry.
+                Ok(DirectiveOutcome::NeedsChoice(ChoicePrompt {
+                    token: mint_choice_token(),
+                    title: title.to_string(),
+                    options: vec![ChoiceOption {
+                        id: id.to_string(),
+                        label: format!("(reply with the {id})"),
+                    }],
+                    multi: false,
+                }))
+            }
+            other => Ok(DirectiveOutcome::Rejected {
+                reason: format!("unknown review target: {other}"),
+            }),
+        }
+    }
+
+    /// v0.8.5 D2.1 — mutate (or create) the per-session override entry.
+    async fn set_override(&self, thread_id: &str, f: impl FnOnce(&mut SessionOverride)) {
+        let mut map = self.overrides.lock().await;
+        f(map.entry(thread_id.to_string()).or_default());
+    }
+
+    /// v0.8.5 D2 — return the (cached) flattened skills list, fetching from
+    /// `skills/list` (common.rs:608) on a cold cache. `force` bypasses the
+    /// cache (used by `/skills` so a manual query is always fresh; the
+    /// resolution layer uses the cache). Cache is invalidated by the
+    /// dispatcher on `skills/changed`.
+    async fn skills(&self, force: bool) -> Result<Vec<CachedSkill>, HarnessError> {
+        if !force {
+            if let Some(c) = self.skills_cache.lock().await.as_ref() {
+                return Ok(c.clone());
+            }
+        }
+        let client = self.client().await?;
+        let result = client
+            .call("skills/list", json!({}))
+            .await
+            .map_err(|e| HarnessError::SubmitFailed(format!("skills/list: {e:#}")))?;
+        let flat = flatten_skills(&result);
+        *self.skills_cache.lock().await = Some(flat.clone());
+        Ok(flat)
+    }
+
+    /// v0.8.5 D2 — case-insensitive skill lookup (resolution layer 2).
+    async fn find_skill(&self, name: &str) -> Result<Option<CachedSkill>, HarnessError> {
+        let skills = self.skills(false).await?;
+        Ok(skills
+            .into_iter()
+            .find(|s| s.name.eq_ignore_ascii_case(name)))
+    }
+
+    /// v0.8.5 D2 — up to 3 nearest skill names (substring / shared-prefix)
+    /// for a `Rejected` hint. Best-effort; an RPC failure yields no hints.
+    async fn nearest_skill_candidates(&self, name: &str) -> Vec<String> {
+        let skills = match self.skills(false).await {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let lname = name.to_ascii_lowercase();
+        let mut hits: Vec<String> = skills
+            .iter()
+            .filter(|s| {
+                let sn = s.name.to_ascii_lowercase();
+                sn.contains(&lname)
+                    || lname.contains(&sn)
+                    || sn
+                        .chars()
+                        .next()
+                        .zip(lname.chars().next())
+                        .map(|(a, b)| a == b)
+                        .unwrap_or(false)
+            })
+            .map(|s| format!("/{}", s.name))
+            .collect();
+        hits.sort();
+        hits.dedup();
+        hits.truncate(3);
+        hits
+    }
+
+    /// Test hook: read the per-session override for a thread.
+    #[doc(hidden)]
+    pub async fn override_for_test(&self, thread_id: &str) -> SessionOverride {
+        self.overrides
+            .lock()
+            .await
+            .get(thread_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Test hook: prime the skills cache directly (skips the `skills/list`
+    /// RPC) so resolution tests don't need a scripted peer for the cache.
+    #[doc(hidden)]
+    pub async fn prime_skills_cache_for_test(&self, skills: Vec<CachedSkill>) {
+        *self.skills_cache.lock().await = Some(skills);
+    }
+
+    /// Test hook: is the skills cache currently populated?
+    #[doc(hidden)]
+    pub async fn skills_cache_is_some_for_test(&self) -> bool {
+        self.skills_cache.lock().await.is_some()
+    }
 }
 
 #[async_trait]
@@ -328,6 +1347,12 @@ impl HarnessAdapter for CodexAppServerAdapter {
                 "thread/start response missing thread.thread_id: {result}"
             ))
         })?;
+        // v0.8.5 D2.4 — seed the tracker's model for this thread from the
+        // spawn ctx so `/status` + `thread_status` can report it before the
+        // first tokenUsage notification arrives.
+        if ctx.model_id.is_some() {
+            self.tracker.lock().await.entry(&thread_id).model = ctx.model_id.clone();
+        }
         // V0.6.1 F122 — register a progress bridge so the events()
         // stream can mirror turn boundaries into progress.jsonl.
         // progress path resolution honours CCTEAM_HOME so test runs land
@@ -362,8 +1387,9 @@ impl HarnessAdapter for CodexAppServerAdapter {
             started_at: Utc::now(),
             raw_extras: json!({
                 "thread_id": thread_id,
-                "transport": std::env::var(APP_SERVER_TRANSPORT_ENV)
-                    .unwrap_or_else(|_| "uds".to_string()),
+                // F10: the RESOLVED transport, not an env echo —
+                // "stdio" (default child-spawn) or "socket" (UDS override).
+                "transport": self.transport_tag(),
                 "socket": Self::resolve_socket_path()
                     .map(|p| p.display().to_string())
                     .unwrap_or_default(),
@@ -387,18 +1413,49 @@ impl HarnessAdapter for CodexAppServerAdapter {
             })?;
         }
         let items = turn_input_to_items(input)?;
-        let params = json!({
-            "threadId": h.identity,
-            "input": items,
-        });
-        let result = client
-            .call("turn/start", params)
+        // v0.8.5 D2.2 — active-turn interjection: if the tracker shows an
+        // in-flight turn for this thread, steer it (`turn/steer` with the
+        // required `expectedTurnId` precondition) rather than starting a new
+        // one. This mirrors the Claude send-keys "talk to the running turn"
+        // experience. With no active turn we fall through to `turn/start`
+        // (applying any per-session overrides, D2.1).
+        let active_turn = self
+            .tracker_snapshot(&h.identity)
             .await
-            .map_err(|e| HarnessError::SubmitFailed(format!("turn/start: {e:#}")))?;
+            .and_then(|t| t.active_turn);
+        let (method, params) = if let Some(expected) = active_turn {
+            (
+                "turn/steer",
+                json!({
+                    "threadId": h.identity,
+                    "input": items,
+                    "expectedTurnId": expected,
+                }),
+            )
+        } else {
+            let mut params = json!({
+                "threadId": h.identity,
+                "input": items,
+            });
+            self.apply_overrides(&h.identity, &mut params).await;
+            ("turn/start", params)
+        };
+        // F10 self-heal hook: if the turn RPC fails (e.g. the stdio codex
+        // child crashed — every codex session shares one child), drop the
+        // cached client so the NEXT turn re-dials a fresh app-server.
+        // Without this the dead client stays memoised and every subsequent
+        // turn fails. The error is still surfaced to the caller (the current
+        // in-flight turn is not auto-retried — crash recovery semantics,
+        // see arch §1.1).
+        let result = match client.call(method, params).await {
+            Ok(v) => v,
+            Err(e) => {
+                self.forget_client().await;
+                return Err(HarnessError::SubmitFailed(format!("{method}: {e:#}")));
+            }
+        };
         let turn_id = pluck_turn_id(&result).ok_or_else(|| {
-            HarnessError::SubmitFailed(format!(
-                "turn/start response missing turn.turn_id: {result}"
-            ))
+            HarnessError::SubmitFailed(format!("{method} response missing turn.id: {result}"))
         })?;
         Ok(TurnId(turn_id))
     }
@@ -575,72 +1632,90 @@ impl HarnessAdapter for CodexAppServerAdapter {
         Ok(())
     }
 
+    /// v0.8.5 D2 — the full Codex command surface, three-layer resolution:
+    ///
+    /// 1. builtin mapping table ([`Self::builtin_directive`]) → RPC /
+    ///    query-synth (`Done`) / per-session override (`Done`) / `Redirect` /
+    ///    `Rejected` (TUI-only).
+    /// 2. miss → `skills/list` cache (case-insensitive) → `turn/start` with
+    ///    a `Skill` input → `Turn`.
+    /// 3. still miss → `Rejected` with nearest candidates + `/skills` hint.
+    ///
+    /// Every server-side state-machine error (e.g. a thread-busy `/compact`)
+    /// propagates verbatim as `SubmitFailed` — we deliberately do NOT
+    /// reimplement the TUI's `available_during_task` guard (PRD §3-D2.1).
     async fn handle_directive(
         &self,
         h: &ThreadHandle,
         d: Directive,
     ) -> Result<DirectiveOutcome, HarnessError> {
-        // W1: migrate the old compact|review allowlist onto the neutral
-        // command surface, and answer the gateway-redirect cases. The full
-        // three-layer resolution + six-class mapping table + bare-popup
-        // two-step (D2/D4) lands in W3.
         let name = d.name.trim().trim_start_matches('/').to_ascii_lowercase();
-        match name.as_str() {
-            "compact" => {
-                let client = self.client().await?;
-                client
-                    .call("thread/compact/start", json!({ "threadId": h.identity }))
-                    .await
-                    .map_err(|e| {
-                        HarnessError::SubmitFailed(format!("thread/compact/start: {e:#}"))
-                    })?;
-                Ok(DirectiveOutcome::Turn(synthetic_command_turn_id(
-                    "compact",
-                    &h.identity,
-                )))
-            }
-            "review" => {
-                // W1: uncommittedChanges only; W3 parses
-                // branch/commit/custom targets from `d.args`.
-                let client = self.client().await?;
-                let result = client
-                    .call(
-                        "review/start",
-                        json!({
-                            "threadId": h.identity,
-                            "target": { "type": "uncommittedChanges" },
-                        }),
-                    )
-                    .await
-                    .map_err(|e| HarnessError::SubmitFailed(format!("review/start: {e:#}")))?;
-                let turn_id = pluck_turn_id(&result).ok_or_else(|| {
-                    HarnessError::SubmitFailed(format!(
-                        "review/start response missing turn.id: {result}"
-                    ))
-                })?;
-                Ok(DirectiveOutcome::Turn(TurnId(turn_id)))
-            }
-            "new" | "clear" | "resume" => Ok(DirectiveOutcome::Redirect {
-                hint: "Codex has no in-thread equivalent — use the gateway's /new (fresh \
-                       session) or /use (switch session)."
-                    .to_string(),
-            }),
-            "" => Ok(DirectiveOutcome::Rejected {
+        if name.is_empty() {
+            return Ok(DirectiveOutcome::Rejected {
                 reason: "empty command".to_string(),
-            }),
-            other => Ok(DirectiveOutcome::Rejected {
-                reason: format!(
-                    "/{other} is not yet supported on Codex (the full Codex command \
-                     surface lands in W3)"
-                ),
-            }),
+            });
         }
+        // Layer 1: builtin table. `None` = not a builtin → fall through.
+        if let Some(outcome) = self.builtin_directive(h, &name, &d).await? {
+            return Ok(outcome);
+        }
+        // Layer 2: dynamic skill match.
+        if let Some(skill) = self.find_skill(&name).await? {
+            if !skill.enabled {
+                // D2.3 — a known-but-disabled skill is a clear receipt, not a
+                // silent passthrough.
+                return Ok(DirectiveOutcome::Rejected {
+                    reason: format!(
+                        "/{name} is a skill but is not enabled — enable it then retry."
+                    ),
+                });
+            }
+            let client = self.client().await?;
+            let mut input = vec![json!({
+                "type": "skill",
+                "name": skill.name,
+                "path": skill.path,
+            })];
+            if !d.args.trim().is_empty() {
+                input.push(json!({ "type": "text", "text": d.args.trim() }));
+            }
+            let mut params = json!({ "threadId": h.identity, "input": input });
+            self.apply_overrides(&h.identity, &mut params).await;
+            let result = client
+                .call("turn/start", params)
+                .await
+                .map_err(|e| HarnessError::SubmitFailed(format!("turn/start (skill): {e:#}")))?;
+            let turn_id = pluck_turn_id(&result).ok_or_else(|| {
+                HarnessError::SubmitFailed(format!(
+                    "turn/start (skill) response missing turn.id: {result}"
+                ))
+            })?;
+            return Ok(DirectiveOutcome::Turn(TurnId(turn_id)));
+        }
+        // Layer 3: reject with nearest candidates.
+        let candidates = self.nearest_skill_candidates(&name).await;
+        let hint = if candidates.is_empty() {
+            "Use /skills to see available skills.".to_string()
+        } else {
+            format!(
+                "Did you mean: {}? Use /skills to see all.",
+                candidates.join(", ")
+            )
+        };
+        Ok(DirectiveOutcome::Rejected {
+            reason: format!("/{name} is not a Codex command or known skill. {hint}"),
+        })
     }
 
-    async fn thread_status(&self, _h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
-        // W1 stub. P3 (W4) reads the CodexThreadTracker (W3) populated from
-        // `thread/tokenUsage/updated`.
-        Ok(ThreadStatus::default())
+    async fn thread_status(&self, h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
+        // P3 (D2.4) — read the harness-owned tracker, fed by the single
+        // dispatcher from `thread/tokenUsage/updated` (usage) + spawn ctx
+        // (model). No RPC: this is a pure in-memory read.
+        let live = self.tracker_snapshot(&h.identity).await.unwrap_or_default();
+        Ok(ThreadStatus {
+            model: live.model,
+            context: live.usage,
+        })
     }
 }
 
@@ -650,6 +1725,509 @@ fn synthetic_command_turn_id(command: &str, thread_id: &str) -> TurnId {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     TurnId::new(format!("codex-app-server-{command}-{thread_id}-{nanos:x}"))
+}
+
+// =====================================================================
+// v0.8.5 D4 — Codex bare-popup → two-step `NeedsChoice`.
+//
+// For the eight popup commands a BARE invocation (no args, no choice)
+// returns `DirectiveOutcome::NeedsChoice(ChoicePrompt)` built from the
+// list source (a list RPC or a static enum); the gateway renders it,
+// the user picks, and `handle_directive` is re-entered with the same
+// (bare) name + `d.choice` set to the picked id, which the apply arm
+// folds into the D2 path (override / RPC / gateway redirect). An
+// invocation WITH args skips the list and applies directly (D2 behaviour,
+// unchanged).
+//
+// `mint_choice_token` produces the ≤16-byte ASCII, `:`-free correlation
+// id the gateway packs into `"{token}:{idx}"` (arch §D3). The gateway
+// resolves callbacks token-globally, so uniqueness is all that matters.
+// =====================================================================
+
+/// v0.8.5 D4 — mint a short opaque ChoicePrompt token. `cx` + the low 40
+/// bits of the nanosecond clock as hex → ≤12 ASCII bytes, no `:`
+/// (satisfies the `ChoicePrompt::token` contract: ASCII, ≤16 bytes, no
+/// `:`). Token globality means collisions only matter within the TTL
+/// window; 40 bits of clock entropy is ample.
+fn mint_choice_token() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("cx{:x}", (nanos as u64) & 0xff_ffff_ffff)
+}
+
+/// v0.8.5 D4 — build a single-select [`ChoicePrompt`] with a fresh token.
+fn choice_prompt(title: impl Into<String>, options: Vec<ChoiceOption>) -> ChoicePrompt {
+    ChoicePrompt {
+        token: mint_choice_token(),
+        title: title.into(),
+        options,
+        multi: false,
+    }
+}
+
+/// v0.8.5 D4 — the picked id from a re-entry selection (first id wins; we
+/// only mint single-select prompts). Falls back to `free_text` (the
+/// "Other" path) when no id was chosen.
+fn picked_id(sel: &ChoiceSelection) -> Option<String> {
+    sel.ids
+        .first()
+        .cloned()
+        .or_else(|| sel.free_text.clone().filter(|s| !s.trim().is_empty()))
+}
+
+/// v0.8.5 D4 — static `Personality` options (config_types.rs:293,
+/// `#[serde(rename_all="lowercase")]`).
+fn personality_options() -> Vec<ChoiceOption> {
+    ["none", "friendly", "pragmatic"]
+        .into_iter()
+        .map(|p| ChoiceOption {
+            id: p.to_string(),
+            label: p.to_string(),
+        })
+        .collect()
+}
+
+/// v0.8.5 D4 — static memory-mode options (`thread/memoryMode/set` mode,
+/// thread.rs:830, lowercase `enabled`/`disabled`). The option `id` is the
+/// `/memories` arg form (`on`/`off`) the apply arm already parses.
+fn memory_mode_options() -> Vec<ChoiceOption> {
+    vec![
+        ChoiceOption {
+            id: "on".to_string(),
+            label: "enabled".to_string(),
+        },
+        ChoiceOption {
+            id: "off".to_string(),
+            label: "disabled".to_string(),
+        },
+    ]
+}
+
+/// v0.8.5 D4 — static `/permissions` preset options. The option `id` is
+/// the preset name the existing `permissions_preset` parser accepts, so
+/// the apply arm is unchanged. Authorities: `AskForApproval` (shared.rs:162)
+/// + `SandboxMode` (shared.rs:292).
+fn permissions_options() -> Vec<ChoiceOption> {
+    vec![
+        ChoiceOption {
+            id: "read-only".to_string(),
+            label: "read-only (approval on-request)".to_string(),
+        },
+        ChoiceOption {
+            id: "auto".to_string(),
+            label: "workspace-write (approval on-request)".to_string(),
+        },
+        ChoiceOption {
+            id: "full-access".to_string(),
+            label: "full-access (approval never)".to_string(),
+        },
+    ]
+}
+
+/// v0.8.5 D4 — the four `ReviewTarget` fixed options (review.rs:43-65).
+/// `uncommitted` / `branch` / `commit` / `custom` map to the `/review`
+/// arg form; `branch` + `commit` are 2nd-hop (they need a branch/sha),
+/// so their ids carry the keyword the apply arm re-prompts on.
+fn review_options() -> Vec<ChoiceOption> {
+    vec![
+        ChoiceOption {
+            id: "uncommitted".to_string(),
+            label: "uncommitted changes".to_string(),
+        },
+        ChoiceOption {
+            id: "branch".to_string(),
+            label: "against a base branch…".to_string(),
+        },
+        ChoiceOption {
+            id: "commit".to_string(),
+            label: "a specific commit…".to_string(),
+        },
+        ChoiceOption {
+            id: "custom".to_string(),
+            label: "custom instructions…".to_string(),
+        },
+    ]
+}
+
+/// v0.8.5 D4 — map a `model/list` response (model.rs:90
+/// `supportedReasoningEfforts`) into `ChoiceOption`s. One option per
+/// (model, effort) so the picked id is the exact `/model <id> [effort]`
+/// arg form the override arm parses; a model with no efforts yields a
+/// single bare-id option.
+fn model_options(result: &Value) -> Vec<ChoiceOption> {
+    let mut out = Vec::new();
+    let Some(models) = result.get("data").and_then(|d| d.as_array()) else {
+        return out;
+    };
+    for m in models {
+        let Some(id) = m.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let efforts: Vec<&str> = m
+            .get("supportedReasoningEfforts")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e.get("reasoningEffort").and_then(|v| v.as_str()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if efforts.is_empty() {
+            out.push(ChoiceOption {
+                id: id.to_string(),
+                label: id.to_string(),
+            });
+        } else {
+            for e in efforts {
+                out.push(ChoiceOption {
+                    id: format!("{id} {e}"),
+                    label: format!("{id} ({e})"),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// v0.8.5 D4 — map a `collaborationMode/list` response (EXPERIMENTAL,
+/// collaboration_mode.rs:43 `CollaborationModeMask{name, mode, ..}`) into
+/// `ChoiceOption`s. The picked id is the `ModeKind` (preferred) or the
+/// preset `name`, which the `/collab <m>` override arm parses.
+fn collab_options(result: &Value) -> Vec<ChoiceOption> {
+    let mut out = Vec::new();
+    let Some(modes) = result.get("data").and_then(|d| d.as_array()) else {
+        return out;
+    };
+    for m in modes {
+        // Prefer the ModeKind (snake_case wire) as the apply id; fall back
+        // to the human `name` when `mode` is absent.
+        let mode = m.get("mode").and_then(|v| v.as_str());
+        let name = m.get("name").and_then(|v| v.as_str());
+        let (id, label) = match (mode, name) {
+            (Some(mode), Some(name)) => (mode.to_string(), format!("{name} ({mode})")),
+            (Some(mode), None) => (mode.to_string(), mode.to_string()),
+            (None, Some(name)) => (name.to_string(), name.to_string()),
+            (None, None) => continue,
+        };
+        out.push(ChoiceOption { id, label });
+    }
+    out
+}
+
+/// v0.8.5 D4 — map a `thread/list` response (thread.rs:1073
+/// `ThreadListResponse{data: Vec<Thread>}`) into `ChoiceOption`s. The
+/// picked id is the codex thread id (the gateway switches to it via
+/// `/use <id>`); the label prefers the thread `name`, else its `preview`.
+fn resume_options(result: &Value) -> Vec<ChoiceOption> {
+    let mut out = Vec::new();
+    let Some(threads) = result.get("data").and_then(|d| d.as_array()) else {
+        return out;
+    };
+    for t in threads {
+        let Some(id) = t.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let label = t
+            .get("name")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                t.get("preview")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+            })
+            .map(|s| {
+                // Keep labels short for inline-keyboard buttons.
+                if s.chars().count() > 48 {
+                    let truncated: String = s.chars().take(45).collect();
+                    format!("{truncated}…")
+                } else {
+                    s.to_string()
+                }
+            })
+            .unwrap_or_else(|| id.to_string());
+        out.push(ChoiceOption {
+            id: id.to_string(),
+            label,
+        });
+    }
+    out
+}
+
+/// v0.8.5 D4 — the `/resume` redirect: Codex has no in-thread resume, so a
+/// picked thread id is surfaced as a `Redirect` instructing the gateway's
+/// `/use <id>` session switch (the gateway owns session lifecycle).
+fn resume_redirect(thread_id: &str) -> DirectiveOutcome {
+    DirectiveOutcome::Redirect {
+        hint: format!("/use {thread_id}"),
+    }
+}
+
+/// v0.8.5 D2.1 — parse `/review` args into a `ReviewTarget` JSON value.
+/// Mirrors `ReviewTarget` (`review.rs:43-65`, `#[serde(tag="type",
+/// rename_all="camelCase")]`):
+/// - bare → `{"type":"uncommittedChanges"}`
+/// - `branch <b>` → `{"type":"baseBranch","branch":<b>}`
+/// - `commit <sha>` → `{"type":"commit","sha":<sha>,"title":null}`
+/// - anything else → `{"type":"custom","instructions":<args>}`
+pub fn parse_review_target(args: &str) -> Value {
+    let args = args.trim();
+    if args.is_empty() {
+        return json!({ "type": "uncommittedChanges" });
+    }
+    let mut parts = args.splitn(2, char::is_whitespace);
+    let head = parts.next().unwrap_or("");
+    let rest = parts.next().unwrap_or("").trim();
+    match head.to_ascii_lowercase().as_str() {
+        "branch" if !rest.is_empty() => json!({ "type": "baseBranch", "branch": rest }),
+        "commit" if !rest.is_empty() => {
+            json!({ "type": "commit", "sha": rest, "title": Value::Null })
+        }
+        _ => json!({ "type": "custom", "instructions": args }),
+    }
+}
+
+/// v0.8.5 D2.1 — map a `/permissions` preset to `(approval_policy wire
+/// string, sandbox_policy wire OBJECT, human label)`. Authorities:
+/// `AskForApproval` is kebab-case strings (`shared.rs:162`); `SandboxPolicy`
+/// is an internally-tagged `{"type":...}` object (`permissions.rs`
+/// `SandboxPolicy`, camelCase variant tags). We expose a small safe preset
+/// set rather than the full enum surface.
+fn permissions_preset(args: &str) -> Option<(&'static str, Value, &'static str)> {
+    match args.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+        "read-only" | "readonly" | "ro" => {
+            Some(("on-request", json!({ "type": "readOnly" }), "read-only"))
+        }
+        "auto" | "workspace" | "workspace-write" => Some((
+            "on-request",
+            json!({ "type": "workspaceWrite" }),
+            "workspace-write",
+        )),
+        "full-access" | "full" | "danger" => Some((
+            "never",
+            json!({ "type": "dangerFullAccess" }),
+            "full-access",
+        )),
+        _ => None,
+    }
+}
+
+/// v0.8.5 D2.1/D2.5 — the Codex TUI-only / unsupported-in-chat slash
+/// commands (no meaningful app-server line); these are explicitly
+/// `Rejected` from chat rather than passed through. Sourced from
+/// `tui/src/slash_command.rs` (the TUI `SlashCommand` enum, b2344d8) —
+/// `available_during_task()`/`supports_inline_args()` are TUI internals
+/// ccteam cannot call, so the list is held here (PRD §3-D2.5).
+///
+/// The D2.5 drift test (`codex_app_server_test.rs`) asserts every
+/// `SlashCommand` enum name is covered by EITHER this reject list OR the
+/// builtin table ([`is_builtin_command`]); a new codex command that lands
+/// in neither fails that test, forcing a classification decision here.
+///
+/// Categories rejected:
+/// - pure TUI surface (theme/vim/keymap/statusline/title/copy/raw/mention/
+///   ide/settings/realtime/quit/exit/feedback/rollout/ps/pets);
+/// - TUI session/agent navigation with no in-thread chat equivalent
+///   (agent/subagents/side/btw/archive — the gateway owns session
+///   lifecycle, so these would be misleading);
+/// - TUI config toggles (experimental/setup-default-sandbox/
+///   sandbox-add-read-dir);
+/// - the auto-review retry approval flow (approve);
+/// - plugins browser + debug-only commands (plugins/debug-config/
+///   test-approval/debug-m-drop/debug-m-update).
+fn is_codex_tui_only(name: &str) -> bool {
+    matches!(
+        name,
+        // pure TUI surface
+        "theme"
+            | "vim"
+            | "keymap"
+            | "statusline"
+            | "title"
+            | "copy"
+            | "raw"
+            | "mention"
+            | "ide"
+            | "settings"
+            | "realtime"
+            | "quit"
+            | "exit"
+            | "feedback"
+            | "rollout"
+            | "ps"
+            | "pets"
+            // TUI session/agent navigation (gateway owns session lifecycle)
+            | "agent"
+            | "subagents"
+            | "side"
+            | "btw"
+            | "archive"
+            // TUI config toggles
+            | "experimental"
+            | "setup-default-sandbox"
+            | "sandbox-add-read-dir"
+            // auto-review retry approval flow
+            | "approve"
+            // plugins browser + debug-only
+            | "plugins"
+            | "debug-config"
+            | "test-approval"
+            | "debug-m-drop"
+            | "debug-m-update"
+    )
+}
+
+/// v0.8.5 D2.5 — drift-test classifier: `true` for a command token the
+/// builtin table ([`CodexAppServerAdapter::builtin_directive`]) handles
+/// with a meaningful outcome (RPC / query-synth / override / redirect).
+/// This list MUST stay in lockstep with the `match name` arms there; the
+/// D2.5 snapshot test relies on it to prove no codex command is silently
+/// dropped. (Free fn so the test can call it without an adapter; it has no
+/// state.)
+pub fn is_builtin_command(name: &str) -> bool {
+    matches!(
+        name,
+        // RPC direct-map
+        "compact"
+            | "review"
+            | "interrupt"
+            | "fork"
+            | "rollback"
+            | "rename"
+            | "goal"
+            | "stop"
+            | "memories"
+            | "diff"
+            | "init"
+            | "login"
+            | "logout"
+            // query-synth
+            | "status"
+            | "model"
+            | "skills"
+            | "mcp"
+            | "hooks"
+            | "apps"
+            // per-session override
+            | "personality"
+            | "collab"
+            | "plan"
+            | "permissions"
+            // semantic redirect
+            | "new"
+            | "clear"
+            | "resume"
+    )
+}
+
+/// v0.8.5 D2.5 — drift-test classifier: `true` for a command token the
+/// adapter explicitly rejects from chat ([`is_codex_tui_only`]). Exposed
+/// alongside [`is_builtin_command`] so the snapshot test can assert every
+/// codex `SlashCommand` enum name lands in exactly one bucket.
+pub fn is_rejected_command(name: &str) -> bool {
+    is_codex_tui_only(name)
+}
+
+/// v0.8.5 D2 — flatten a `skills/list` response (`SkillsListResponse {
+/// data: Vec<SkillsListEntry { cwd, skills: Vec<SkillMetadata>, .. }> }`,
+/// `plugin.rs:34-36` + `:489`) into `(name, path, enabled)`. We read
+/// fields tolerantly (name/path/enabled) since `SkillMetadata`'s exact
+/// shape is not pinned here; an absent `enabled` defaults to `true`.
+pub fn flatten_skills(result: &Value) -> Vec<CachedSkill> {
+    let mut out = Vec::new();
+    let Some(entries) = result.get("data").and_then(|d| d.as_array()) else {
+        return out;
+    };
+    for entry in entries {
+        let Some(skills) = entry.get("skills").and_then(|s| s.as_array()) else {
+            continue;
+        };
+        for s in skills {
+            let name = s
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if name.is_empty() {
+                continue;
+            }
+            let path = s
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let enabled = s.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+            out.push(CachedSkill {
+                name,
+                path,
+                enabled,
+            });
+        }
+    }
+    out
+}
+
+/// v0.8.5 D2.1 — render the `/status` receipt from the tracker.
+fn render_status_receipt(live: &ThreadLive) -> String {
+    let model = live.model.as_deref().unwrap_or("(unknown)");
+    match &live.usage {
+        Some(u) if u.window_tokens > 0 => format!(
+            "model: {model}\ncontext: {} / {} ({:.0}%)",
+            human_tokens(u.used_tokens),
+            human_tokens(u.window_tokens),
+            u.pct()
+        ),
+        Some(u) => format!(
+            "model: {model}\ncontext: {} (window unknown)",
+            human_tokens(u.used_tokens)
+        ),
+        None => format!("model: {model}\ncontext: (no usage yet)"),
+    }
+}
+
+// NOTE (v0.8.5 D4): the former `render_model_list` text receipt for a bare
+// `/model` was superseded by the `NeedsChoice` picker (`model_options`); the
+// model+effort list is now rendered as inline-keyboard options, not text.
+
+/// Render the flattened skills list as a receipt (name + disabled marker).
+fn render_skills_list(skills: &[CachedSkill]) -> String {
+    if skills.is_empty() {
+        return "no skills available.".to_string();
+    }
+    let mut lines = vec!["available skills:".to_string()];
+    for s in skills {
+        if s.enabled {
+            lines.push(format!("• /{}", s.name));
+        } else {
+            lines.push(format!("• /{} (disabled)", s.name));
+        }
+    }
+    lines.join("\n")
+}
+
+/// Render a count receipt for a list-shaped query response (`/mcp`,
+/// `/hooks`, `/apps`): "<n> <label>(s) configured".
+fn render_count_receipt(label: &str, result: &Value, key: &str) -> String {
+    let n = result
+        .get(key)
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let plural = if n == 1 { "" } else { "s" };
+    format!("{n} {label}{plural} configured.")
+}
+
+/// Compact a token count: `1234` → `1.2k`, `188000` → `188k`.
+fn human_tokens(n: u64) -> String {
+    if n < 1000 {
+        n.to_string()
+    } else if n < 1_000_000 {
+        format!("{:.0}k", n as f64 / 1000.0)
+    } else {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    }
 }
 
 /// Translate a [`TurnInput`] into the codex `UserInput[]` payload
@@ -831,6 +2409,11 @@ pub fn translate_notification(notif: &Notification, wanted: &str) -> Option<Thre
         | "thread/tokenUsage/updated"
         | "thread/status/changed"
         | "account/rateLimits/updated" => None,
+        // v0.8.5 D2 — `skills/changed` is consumed by the tracker dispatcher
+        // (it invalidates the skills/list cache, arch §1.3). It carries no
+        // ThreadEvent and no progress.jsonl row; skip it silently here so it
+        // doesn't hit the unknown-method warn path.
+        "skills/changed" => None,
         // V0.6.3 F144 — forward-compat: a `codex app-server` notification
         // `method` we don't yet propagate is **skipped** (`None`) so the
         // event stream is never broken — the orchestrator's
@@ -1225,6 +2808,72 @@ pub fn build_codex_notification_progress_line(notif: &Notification, wanted: &str
             Some(build_codex_rate_limit_event(snapshot))
         }
         _ => None,
+    }
+}
+
+/// v0.8.5 D2.4 — fold a single codex notification into the
+/// [`CodexThreadTracker`]. This is the SOLE writer of the tracker (the
+/// dispatcher calls it); `events()` never touches the tracker.
+///
+/// - `turn/started` → set `active_turn` (turn id at `turn.id`, real wire).
+/// - `turn/completed` → clear `active_turn`.
+/// - `error` with `willRetry == false` (terminal) → clear `active_turn`.
+///   Retryable errors leave it set (the turn is still alive).
+/// - `thread/tokenUsage/updated` → set `usage` from `tokenUsage.total`
+///   (`total_tokens`) + `tokenUsage.modelContextWindow`. This is the ONLY
+///   source of usage — the real `turn/completed` wire carries none.
+async fn apply_notification_to_tracker(
+    tracker: &Arc<Mutex<CodexThreadTracker>>,
+    notif: &Notification,
+) {
+    // thread_id is needed to key every tracker entry; account-scoped
+    // notifications (no thread_id) are ignored by the tracker.
+    let Some(tid) = pluck_str(&notif.params, "thread_id", "threadId").map(str::to_string) else {
+        // `thread/started` carries the id nested at `thread.id` only.
+        if notif.method == "thread/started" {
+            if let Some(tid) = notif.params.get("thread").and_then(pluck_id) {
+                tracker.lock().await.entry(&tid);
+            }
+        }
+        return;
+    };
+    match notif.method.as_str() {
+        "turn/started" => {
+            let turn_id = pluck_turn_id_from_params(&notif.params);
+            tracker.lock().await.entry(&tid).active_turn = Some(turn_id);
+        }
+        "turn/completed" => {
+            tracker.lock().await.entry(&tid).active_turn = None;
+        }
+        "error" => {
+            // Terminal failures (willRetry=false) clear the active turn;
+            // retryable ones do not (the turn lives on until completion).
+            let will_retry = pluck_bool(&notif.params, "will_retry", "willRetry").unwrap_or(false);
+            if !will_retry {
+                tracker.lock().await.entry(&tid).active_turn = None;
+            }
+        }
+        "thread/tokenUsage/updated" => {
+            let usage = pluck_val(&notif.params, "token_usage", "tokenUsage")
+                .unwrap_or(Value::Object(Default::default()));
+            let used = usage
+                .get("total")
+                .and_then(|t| t.get("total_tokens").or_else(|| t.get("totalTokens")))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0)
+                .max(0) as u64;
+            let window = usage
+                .get("modelContextWindow")
+                .or_else(|| usage.get("model_context_window"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0)
+                .max(0) as u64;
+            tracker.lock().await.entry(&tid).usage = Some(ContextUsage {
+                used_tokens: used,
+                window_tokens: window,
+            });
+        }
+        _ => {}
     }
 }
 

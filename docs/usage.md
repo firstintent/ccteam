@@ -294,7 +294,9 @@ cat <project>/.ccteam/state.json           # 项目状态
 CCTEAM_HOME=...                            # 隔离 daemon state / ledger / config(默认 ~/.ccteam)
 CCTEAM_PROJECTS_ROOT=...                    # 默认项目根(默认 ~/projects)
 CCTEAM_CLAUDE_BIN=... CCTEAM_CODEX_BIN=...  # 覆盖 vendor CLI 路径
-CCTEAM_CODEX_APP_SERVER_TRANSPORT=stdio     # Codex 走 codex app-server --listen stdio://
+# Codex transport 单轴:默认走 `codex app-server --listen stdio://`(只需 PATH 上有 codex);
+# 仅当你自管一个常驻 app-server daemon 时,设此 env 指向其 UDS 走 socket 覆盖:
+CCTEAM_CODEX_APP_SERVER_SOCKET=/path/to/app-server-control.sock
 ```
 
 ---

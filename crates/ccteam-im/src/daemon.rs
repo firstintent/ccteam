@@ -57,14 +57,19 @@ pub type AdapterFactory =
 /// - `Codex` → [`CodexAppServerAdapter`] — mode-3 chat sessions use the
 ///   app-server JSON-RPC control plane so `/compact` and `/review` map to
 ///   Codex-native RPCs instead of `codex exec` subprocess turns.
+///
+/// F10: **per-vendor singleton.** Exactly ONE `ClaudeTuiAdapter` and ONE
+/// `CodexAppServerAdapter` are constructed here; every factory call
+/// `.clone()`s the matching `Arc`. Because `CodexAppServerAdapter`
+/// memoises a single `codex app-server` child (stdio transport), one
+/// shared adapter ⇒ one memoised client ⇒ one codex app-server child for
+/// the whole daemon, instead of a fresh child per chat session.
 pub fn default_adapter_factory() -> AdapterFactory {
-    Arc::new(|vendor: AgentVendor| match vendor {
-        AgentVendor::Claude => {
-            Arc::new(ClaudeTuiAdapter::new()) as Arc<dyn HarnessAdapter + Send + Sync>
-        }
-        AgentVendor::Codex => {
-            Arc::new(CodexAppServerAdapter::new()) as Arc<dyn HarnessAdapter + Send + Sync>
-        }
+    let claude: Arc<dyn HarnessAdapter + Send + Sync> = Arc::new(ClaudeTuiAdapter::new());
+    let codex: Arc<dyn HarnessAdapter + Send + Sync> = Arc::new(CodexAppServerAdapter::new());
+    Arc::new(move |vendor: AgentVendor| match vendor {
+        AgentVendor::Claude => Arc::clone(&claude),
+        AgentVendor::Codex => Arc::clone(&codex),
     })
 }
 
@@ -1265,5 +1270,25 @@ mod tests {
             "F173: codex arm must return a Codex adapter, not the Claude fallback"
         );
         assert_eq!(codex.name(), "codex-app-server");
+    }
+
+    /// F10 (arch §8-2): the factory is a **per-vendor singleton** — two
+    /// Codex-arm calls return the SAME `Arc` instance (one codex
+    /// app-server child for the whole daemon), and likewise for Claude.
+    #[test]
+    fn default_adapter_factory_is_per_vendor_singleton() {
+        let factory = default_adapter_factory();
+        let codex_a = factory(AgentVendor::Codex);
+        let codex_b = factory(AgentVendor::Codex);
+        assert!(
+            Arc::ptr_eq(&codex_a, &codex_b),
+            "F10: codex arm must memoise ONE adapter (one app-server child), got distinct Arcs"
+        );
+        let claude_a = factory(AgentVendor::Claude);
+        let claude_b = factory(AgentVendor::Claude);
+        assert!(
+            Arc::ptr_eq(&claude_a, &claude_b),
+            "F10: claude arm must also be a singleton"
+        );
     }
 }

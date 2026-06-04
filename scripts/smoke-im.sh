@@ -110,9 +110,11 @@ ensure_codex_app_server_socket() {
   local configured="${CCTEAM_CODEX_APP_SERVER_SOCKET:-}"
   local socket="${configured:-${CODEX_HOME:-$HOME/.codex}/app-server-control/app-server-control.sock}"
 
+  # F10: transport is single-axis on CCTEAM_CODEX_APP_SERVER_SOCKET —
+  # setting it selects the UDS (Socket) override; leaving it unset selects
+  # the default stdio child-spawn.
   if [[ -S "$socket" ]]; then
     export CCTEAM_CODEX_APP_SERVER_SOCKET="$socket"
-    export CCTEAM_CODEX_APP_SERVER_TRANSPORT="uds"
     return 0
   fi
 
@@ -120,17 +122,16 @@ ensure_codex_app_server_socket() {
   timeout 30 "$codex_bin" app-server daemon start >"$daemon_log" 2>&1 || true
   if [[ -S "$socket" ]]; then
     export CCTEAM_CODEX_APP_SERVER_SOCKET="$socket"
-    export CCTEAM_CODEX_APP_SERVER_TRANSPORT="uds"
     return 0
   fi
 
   if [[ -z "$configured" ]]; then
     # npm-managed Codex exposes a raw JSONL app-server on stdio. Its
     # foreground unix:// listener is not the standalone daemon control
-    # socket protocol the harness UDS client speaks, so use stdio as the
-    # real-binary fallback when the managed daemon is unavailable.
+    # socket protocol the harness UDS client speaks, so fall back to the
+    # default stdio transport (no socket env) when the managed daemon is
+    # unavailable.
     unset CCTEAM_CODEX_APP_SERVER_SOCKET
-    export CCTEAM_CODEX_APP_SERVER_TRANSPORT="stdio"
     export CCTEAM_CODEX_BIN="$codex_bin"
     return 0
   fi
@@ -163,8 +164,8 @@ run_real_preflight() {
 
   run_version_probe claude "$claude_bin"
   run_version_probe codex "$codex_bin"
-  if [[ "${CCTEAM_CODEX_APP_SERVER_TRANSPORT:-uds}" == "stdio" ]]; then
-    echo "smoke-im --real: Codex app-server transport stdio"
+  if [[ -z "${CCTEAM_CODEX_APP_SERVER_SOCKET:-}" ]]; then
+    echo "smoke-im --real: Codex app-server transport stdio (default)"
   else
     echo "smoke-im --real: Codex app-server socket $CCTEAM_CODEX_APP_SERVER_SOCKET"
   fi
