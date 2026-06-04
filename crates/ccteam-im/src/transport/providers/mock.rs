@@ -9,7 +9,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
-use crate::transport::{Channel, ChannelMessage, SendMessage};
+use crate::transport::{Channel, ChannelMessage, CommandSpec, SendMessage};
 
 /// Test-only Channel. Cheap to clone (`Arc` inside) so a test can
 /// hand one copy to the daemon and keep another for assertions.
@@ -31,6 +31,11 @@ pub struct MockChannel {
     /// split-failure notice deterministically (content-keyed, so it is
     /// immune to the sync-ack/async-echo send ordering).
     fail_if_contains: Arc<Vec<String>>,
+    /// Command menus registered via [`Channel::register_commands`] (v0.8.5
+    /// P1). Records each call's specs so a test can prove the daemon wires
+    /// the menu at startup. A real menu-less channel keeps the trait default
+    /// (no-op) — this recorder is purely an observation hook, not behavior.
+    registered_commands: Arc<Mutex<Vec<Vec<CommandSpec>>>>,
 }
 
 impl MockChannel {
@@ -43,7 +48,16 @@ impl MockChannel {
             name: "mock".to_string(),
             max_len: None,
             fail_if_contains: Arc::default(),
+            registered_commands: Arc::default(),
         }
+    }
+
+    /// Override the platform-name string (default `"mock"`). Builder-style;
+    /// used by the v0.8.5 P1 menu test to inject two distinct channels into
+    /// one `channels_override` map.
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
     }
 
     /// Declare a per-message length ceiling (UTF-16 units), making this
@@ -78,6 +92,13 @@ impl MockChannel {
     /// content)`.
     pub async fn edits(&self) -> Vec<(String, String)> {
         self.edits.lock().await.clone()
+    }
+
+    /// Snapshot of every [`Channel::register_commands`] call's specs
+    /// (v0.8.5 P1). One entry per call; empty until the daemon wires the
+    /// menu at startup.
+    pub async fn registered_commands(&self) -> Vec<Vec<CommandSpec>> {
+        self.registered_commands.lock().await.clone()
     }
 }
 
@@ -126,6 +147,14 @@ impl Channel for MockChannel {
             .await
             .push((message_id.to_string(), content.to_string()));
         Ok(Some(message_id.to_string()))
+    }
+
+    async fn register_commands(&self, cmds: &[CommandSpec]) -> anyhow::Result<()> {
+        // Menu-less channel: record the call (so a test can assert the
+        // daemon wired the menu) but take no action — the trait default's
+        // no-op semantics are preserved.
+        self.registered_commands.lock().await.push(cmds.to_vec());
+        Ok(())
     }
 }
 

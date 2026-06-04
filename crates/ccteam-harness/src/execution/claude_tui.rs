@@ -848,12 +848,65 @@ impl HarnessAdapter for ClaudeTuiAdapter {
         Ok(DirectiveOutcome::Turn(turn))
     }
 
-    async fn thread_status(&self, _h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
-        // W1 stub. P3 (W4) reads the transcript tail: model from
-        // `message.model`, context = last `message.usage` row's
-        // input+cache_creation+cache_read, window from the `[1m]` suffix
-        // (→ 1M) else the 200k baseline.
-        Ok(ThreadStatus::default())
+    async fn thread_status(&self, h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
+        // P3 — read the session transcript tail (never full-parse: it can
+        // be tens of MB). model = `message.model`; context = last
+        // `message.usage` row's input+cache_creation+cache_read; window =
+        // `[1m]` suffix → 1M else the 200k baseline (the only constant).
+        // The transcript path is resolved from `raw_extras` (cwd + role)
+        // the same way the tail loop does — marker sid first, then the
+        // most-recently-modified main-session jsonl.
+        let Some(transcript) = self.resolve_transcript_path(h) else {
+            // No project context (resumed handle / malformed extras) or no
+            // transcript on disk yet → nothing to report. `Default`, not
+            // an error (statusless is a valid answer).
+            return Ok(ThreadStatus::default());
+        };
+        let (model, context) = transcript_tail::read_status_tail(&transcript)
+            .await
+            .map_err(|e| HarnessError::SubmitFailed(format!("read transcript status: {e}")))?;
+        Ok(ThreadStatus { model, context })
+    }
+}
+
+impl ClaudeTuiAdapter {
+    /// Resolve the active transcript jsonl for a handle (P3), reusing the
+    /// tail loop's discovery: read `cwd` + `role` from `raw_extras`, prefer
+    /// the bot's `active-session-id` marker, fall back to the
+    /// most-recently-modified main-session jsonl under
+    /// `~/.claude/projects/<encoded-cwd>/`. `None` when there is no project
+    /// context (e.g. a bare resumed handle) or no transcript exists yet.
+    fn resolve_transcript_path(&self, h: &ThreadHandle) -> Option<PathBuf> {
+        let cwd = h
+            .raw_extras
+            .get("cwd")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from)?;
+        let project_dir = h
+            .raw_extras
+            .get("project_dir")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from);
+        let role = h
+            .raw_extras
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let parent_dir = anthropic_project_dir(&cwd)?;
+        // Marker sid first (deterministic per-bot target, set by the
+        // chat-progress hook); only trust it if the file actually exists.
+        if let Some(pdir) = project_dir.as_ref() {
+            if !role.is_empty() {
+                if let Some(sid) = read_marker_sid(&active_session_id_path(pdir, role)) {
+                    let p = parent_dir.join(format!("{sid}.jsonl"));
+                    if p.exists() {
+                        return Some(p);
+                    }
+                }
+            }
+        }
+        // Fall back to discovery (skips subagent jsonls).
+        transcript_tail::discover_active_session(&cwd).map(|(_, p)| p)
     }
 }
 

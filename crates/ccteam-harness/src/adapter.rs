@@ -388,6 +388,49 @@ impl ContextUsage {
             (self.used_tokens as f32 / self.window_tokens as f32) * 100.0
         }
     }
+
+    /// Render this usage as the canonical absolute-value + percent form
+    /// (P3): `"188k / 1M (19%)"`. When the window is unknown (zero), only
+    /// the used count is shown (`"188k (window unknown)"`). This is the
+    /// **single** render point so `/sessions` (gateway) and Codex
+    /// `/status` (adapter) always agree byte-for-byte.
+    pub fn render(&self) -> String {
+        if self.window_tokens == 0 {
+            format!("{} (window unknown)", format_tokens(self.used_tokens))
+        } else {
+            format!(
+                "{} / {} ({:.0}%)",
+                format_tokens(self.used_tokens),
+                format_tokens(self.window_tokens),
+                self.pct()
+            )
+        }
+    }
+}
+
+/// Humanize a token count for status display (P3). Whole-thousand /
+/// whole-million values render without a trailing `.0` so the common
+/// window sizes read cleanly: `200_000 → "200k"`, `1_000_000 → "1M"`.
+/// Non-round values keep one decimal (`1234 → "1.2k"`); under 1000 is
+/// printed verbatim (`188 → "188"`).
+pub fn format_tokens(n: u64) -> String {
+    if n < 1_000 {
+        n.to_string()
+    } else if n < 1_000_000 {
+        let k = n as f64 / 1_000.0;
+        if n % 1_000 == 0 {
+            format!("{k:.0}k")
+        } else {
+            format!("{k:.1}k")
+        }
+    } else {
+        let m = n as f64 / 1_000_000.0;
+        if n % 1_000_000 == 0 {
+            format!("{m:.0}M")
+        } else {
+            format!("{m:.1}M")
+        }
+    }
 }
 
 /// Queryable session attributes (P3): `model` + context usage are
@@ -400,6 +443,30 @@ impl ContextUsage {
 pub struct ThreadStatus {
     pub model: Option<String>,
     pub context: Option<ContextUsage>,
+}
+
+impl ThreadStatus {
+    /// Render this status as a compact one-line suffix for `/sessions`
+    /// (P3), e.g. `"claude-opus-4-8[1m] · ctx 188k / 1M (19%)"`. Returns
+    /// `None` when there is nothing to report (statusless / bg adapters,
+    /// `Default`), so the caller appends nothing and the legacy
+    /// `id:project:vendor:role` row is unchanged. Reuses
+    /// [`ContextUsage::render`] so the absolute+percent form matches Codex
+    /// `/status` exactly.
+    pub fn status_suffix(&self) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(m) = self.model.as_deref().filter(|s| !s.is_empty()) {
+            parts.push(m.to_string());
+        }
+        if let Some(ctx) = &self.context {
+            parts.push(format!("ctx {}", ctx.render()));
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" · "))
+        }
+    }
 }
 
 /// Per-turn item the adapter emits (one or more per turn). Mirrors
@@ -928,6 +995,63 @@ pub fn pluck_pct(value: &serde_json::Value, path: &[&str]) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_tokens_humanizes_round_and_fractional() {
+        // P3: whole-thousand / whole-million read without a trailing `.0`.
+        assert_eq!(format_tokens(200_000), "200k");
+        assert_eq!(format_tokens(1_000_000), "1M");
+        assert_eq!(format_tokens(188_000), "188k");
+        // Fractional keeps one decimal.
+        assert_eq!(format_tokens(1_234), "1.2k");
+        assert_eq!(format_tokens(1_500_000), "1.5M");
+        // Sub-1000 verbatim.
+        assert_eq!(format_tokens(188), "188");
+        assert_eq!(format_tokens(0), "0");
+    }
+
+    #[test]
+    fn context_usage_render_absolute_plus_percent() {
+        let u = ContextUsage {
+            used_tokens: 188_000,
+            window_tokens: 1_000_000,
+        };
+        assert_eq!(u.render(), "188k / 1M (19%)");
+        let baseline = ContextUsage {
+            used_tokens: 188_000,
+            window_tokens: 200_000,
+        };
+        assert_eq!(baseline.render(), "188k / 200k (94%)");
+        // Unknown window → no percent.
+        let unknown = ContextUsage {
+            used_tokens: 5_000,
+            window_tokens: 0,
+        };
+        assert_eq!(unknown.render(), "5k (window unknown)");
+    }
+
+    #[test]
+    fn thread_status_suffix_combines_model_and_ctx() {
+        let full = ThreadStatus {
+            model: Some("claude-opus-4-8[1m]".into()),
+            context: Some(ContextUsage {
+                used_tokens: 188_000,
+                window_tokens: 1_000_000,
+            }),
+        };
+        assert_eq!(
+            full.status_suffix().as_deref(),
+            Some("claude-opus-4-8[1m] · ctx 188k / 1M (19%)")
+        );
+        // Model only.
+        let model_only = ThreadStatus {
+            model: Some("gpt-5".into()),
+            context: None,
+        };
+        assert_eq!(model_only.status_suffix().as_deref(), Some("gpt-5"));
+        // Default (statusless) → nothing to append.
+        assert_eq!(ThreadStatus::default().status_suffix(), None);
+    }
 
     #[test]
     fn harness_snapshot_serde_round_trip() {

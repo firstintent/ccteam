@@ -541,6 +541,143 @@ pub fn parse_transcript_line(row: &Value, pending: &mut PendingTools) -> Vec<Thr
     out
 }
 
+/// Claude's only fixed context-window constant (P3): a model without the
+/// `[1m]` suffix uses the 200k baseline. The 1M window is read from the
+/// `[1m]` suffix on `message.model` in the transcript itself, NOT from a
+/// per-model table (ccteam has no access to Claude's internal capability
+/// table; see ref `utils/context.ts`).
+pub const CLAUDE_CONTEXT_WINDOW_BASELINE: u64 = 200_000;
+/// The 1M window selected when `message.model` carries a `[1m]` suffix.
+pub const CLAUDE_CONTEXT_WINDOW_1M: u64 = 1_000_000;
+
+/// How many trailing bytes of the transcript to scan for the last
+/// `message.usage` line (P3). A transcript can grow to tens of MB; the
+/// usage block lives on each assistant message, so the last few hundred
+/// KB is always enough to find the most recent one without full-parsing
+/// the file.
+const STATUS_TAIL_BYTES: u64 = 512 * 1024;
+
+/// Read the **tail** of a Claude transcript jsonl and extract the latest
+/// `(model, ContextUsage)` for `/sessions` (P3). Reads at most
+/// [`STATUS_TAIL_BYTES`] from the end (never full-parses — transcripts
+/// are large) and walks lines for the **last** one carrying
+/// `message.usage`.
+///
+/// - context_used = `input_tokens + cache_creation_input_tokens +
+///   cache_read_input_tokens` (per ref `utils/tokens.ts`).
+/// - model = `message.model`.
+/// - window = `1M` when the model id ends in `[1m]`, else the 200k
+///   baseline (the ONLY constant; the `[1m]` flag is read from the data).
+///
+/// Returns `(model, context)` where either may be `None`:
+/// - file absent / no `message.model` anywhere in the tail → `model: None`.
+/// - no `message.usage` line in the tail → `context: None`.
+pub async fn read_status_tail(
+    transcript_path: &Path,
+) -> Result<(Option<String>, Option<crate::ContextUsage>)> {
+    if !transcript_path.exists() {
+        return Ok((None, None));
+    }
+    let meta = tokio::fs::metadata(transcript_path)
+        .await
+        .with_context(|| format!("stat {}", transcript_path.display()))?;
+    let file_size = meta.len();
+    let start = file_size.saturating_sub(STATUS_TAIL_BYTES);
+
+    let mut file = tokio::fs::File::open(transcript_path)
+        .await
+        .with_context(|| format!("open {}", transcript_path.display()))?;
+    file.seek(std::io::SeekFrom::Start(start))
+        .await
+        .with_context(|| format!("seek {} -> {start}", transcript_path.display()))?;
+    let mut buf = String::new();
+    file.read_to_string(&mut buf)
+        .await
+        .with_context(|| format!("read tail {}", transcript_path.display()))?;
+
+    // When we seeked into the middle of the file the first physical line is
+    // very likely a partial record — drop everything up to the first
+    // newline so we only parse whole lines.
+    let body = if start > 0 {
+        match buf.find('\n') {
+            Some(i) => &buf[i + 1..],
+            None => "",
+        }
+    } else {
+        &buf[..]
+    };
+
+    let mut model: Option<String> = None;
+    let mut context: Option<crate::ContextUsage> = None;
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(row) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        if let Some((m, ctx)) = parse_status_row(&row) {
+            // Keep the LAST occurrence (most recent turn).
+            if let Some(m) = m {
+                model = Some(m);
+            }
+            if let Some(ctx) = ctx {
+                context = Some(ctx);
+            }
+        }
+    }
+    Ok((model, context))
+}
+
+/// Pull `(model, ContextUsage)` from one transcript row, if it carries a
+/// `message.usage`. Returns `None` for rows without usage (so the tail
+/// walker only updates on real usage lines). `model` inside the tuple may
+/// still be `None` if the row has usage but no `message.model`.
+fn parse_status_row(row: &Value) -> Option<(Option<String>, Option<crate::ContextUsage>)> {
+    let usage = row.pointer("/message/usage")?;
+    let model = row
+        .pointer("/message/model")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let input = usage
+        .get("input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let cache_create = usage
+        .get("cache_creation_input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let cache_read = usage
+        .get("cache_read_input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let used = input + cache_create + cache_read;
+    let window = model
+        .as_deref()
+        .map(context_window_for_model)
+        .unwrap_or(CLAUDE_CONTEXT_WINDOW_BASELINE);
+    Some((
+        model,
+        Some(crate::ContextUsage {
+            used_tokens: used,
+            window_tokens: window,
+        }),
+    ))
+}
+
+/// Context window for a Claude model id: `1M` iff the id ends in the
+/// `[1m]` capability suffix (e.g. `claude-opus-4-8[1m]`), else the 200k
+/// baseline. Case-insensitive on the suffix. This is the sole place the
+/// `[1m]`→1M rule lives.
+pub fn context_window_for_model(model: &str) -> u64 {
+    if model.to_ascii_lowercase().ends_with("[1m]") {
+        CLAUDE_CONTEXT_WINDOW_1M
+    } else {
+        CLAUDE_CONTEXT_WINDOW_BASELINE
+    }
+}
+
 fn thread_event_uuid(ev: &ThreadEvent) -> Option<String> {
     match ev {
         ThreadEvent::ItemStarted { item }
@@ -900,6 +1037,136 @@ mod tests {
             },
             _ => panic!("wrong event"),
         }
+    }
+
+    // ---- P3 (v0.8.5 §8-7): thread_status transcript-tail read ----------
+
+    /// Helper: write a transcript with a usage+model line, read the tail
+    /// status, and render it via the shared `ContextUsage::render` (the same
+    /// helper `/sessions` + Codex `/status` use).
+    async fn rendered_status_for(model: &str) -> (Option<String>, Option<String>) {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("t.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // A non-usage assistant line first, then the usage-bearing one.
+        writeln!(
+            f,
+            "{}",
+            json!({"type":"assistant","uuid":"u1",
+                "message":{"content":[{"type":"text","text":"hi"}]}})
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "{}",
+            json!({"type":"assistant","uuid":"u2","message":{
+                "model": model,
+                "content":[{"type":"text","text":"done"}],
+                "usage": {
+                    "input_tokens": 100_000,
+                    "cache_creation_input_tokens": 8_000,
+                    "cache_read_input_tokens": 80_000
+                    // 100k + 8k + 80k = 188k
+                }
+            }})
+        )
+        .unwrap();
+        f.flush().unwrap();
+        let (m, ctx) = read_status_tail(&path).await.unwrap();
+        (m, ctx.map(|c| c.render()))
+    }
+
+    #[tokio::test]
+    async fn status_tail_1m_model_renders_over_1m_window() {
+        let (model, rendered) = rendered_status_for("claude-opus-4-8[1m]").await;
+        assert_eq!(model.as_deref(), Some("claude-opus-4-8[1m]"));
+        // 188k / 1M → 18.8% → rounds to 19%.
+        assert_eq!(rendered.as_deref(), Some("188k / 1M (19%)"));
+    }
+
+    #[tokio::test]
+    async fn status_tail_non_1m_model_renders_over_200k_baseline() {
+        let (model, rendered) = rendered_status_for("claude-sonnet-4-5").await;
+        assert_eq!(model.as_deref(), Some("claude-sonnet-4-5"));
+        // 188k / 200k → 94%.
+        assert_eq!(rendered.as_deref(), Some("188k / 200k (94%)"));
+    }
+
+    #[tokio::test]
+    async fn status_tail_no_usage_line_yields_no_context() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("t.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                json!({"type":"user","uuid":"u1",
+                    "message":{"content":[{"type":"text","text":"hello"}]}}),
+                json!({"type":"assistant","uuid":"u2",
+                    "message":{"model":"claude-opus-4-8","content":[
+                        {"type":"text","text":"hi"}]}}),
+            ),
+        )
+        .unwrap();
+        let (model, ctx) = read_status_tail(&path).await.unwrap();
+        // model is None: it only comes from a usage-bearing row, and there
+        // is none here.
+        assert!(model.is_none());
+        assert!(ctx.is_none(), "no message.usage anywhere → context: None");
+    }
+
+    #[tokio::test]
+    async fn status_tail_picks_last_usage_line() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("t.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        for (used_in, model) in [
+            (10_000u64, "claude-sonnet-4-5"),
+            (50_000, "claude-opus-4-8"),
+        ] {
+            writeln!(
+                f,
+                "{}",
+                json!({"type":"assistant","message":{
+                    "model": model,
+                    "usage": {"input_tokens": used_in,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0}
+                }})
+            )
+            .unwrap();
+        }
+        f.flush().unwrap();
+        let (model, ctx) = read_status_tail(&path).await.unwrap();
+        assert_eq!(model.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(ctx.unwrap().used_tokens, 50_000, "must take the LAST usage");
+    }
+
+    #[tokio::test]
+    async fn status_tail_missing_file_is_empty() {
+        let tmp = TempDir::new().unwrap();
+        let (model, ctx) = read_status_tail(&tmp.path().join("nope.jsonl"))
+            .await
+            .unwrap();
+        assert!(model.is_none());
+        assert!(ctx.is_none());
+    }
+
+    #[test]
+    fn context_window_reads_1m_suffix_else_baseline() {
+        assert_eq!(
+            context_window_for_model("claude-opus-4-8[1m]"),
+            CLAUDE_CONTEXT_WINDOW_1M
+        );
+        assert_eq!(
+            context_window_for_model("claude-opus-4-8"),
+            CLAUDE_CONTEXT_WINDOW_BASELINE
+        );
+        // Case-insensitive on the suffix.
+        assert_eq!(
+            context_window_for_model("Some-Model[1M]"),
+            CLAUDE_CONTEXT_WINDOW_1M
+        );
     }
 
     #[tokio::test]

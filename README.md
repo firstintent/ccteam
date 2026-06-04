@@ -10,7 +10,7 @@ The AI runs on **your computer**: it reads your files, runs your commands, touch
 
 You talk to ccteam from three places, all backed by one daemon:
 
-- **From IM** — DM a bot to work on a project, or `@ccteam <natural language>` in a group for control (`pause`, `cost`, `list`, `stop everything`, …).
+- **From IM** — DM a bot to work on a project, or `@ccteam <natural language>` in a group for control (`pause`, `cost`, `list`, `stop everything`, …). The full slash-command surface of both agents works straight from chat (see below), and when an agent asks you a question, you answer it right there.
 - **Inside a Claude or Codex session** — `/ccteam <natural language>` is the universal entry; per-task slash commands let you skip the router when you know the path. The `mcp__ccteam__*` MCP tools are the programmatic surface.
 - **From a web console** — a local dashboard plus `/app/chat`, a browser chat surface that uses the same Gateway sessions as IM.
 
@@ -30,6 +30,8 @@ You talk to ccteam from three places, all backed by one daemon:
 - **Codex** runs via the **app-server JSON-RPC** control plane — native and documented; `/compact`, `/review`, etc. map to Codex-native RPCs.
 
 Both vendors can run concurrently inside the same chat.
+
+**Full slash-command coverage, from chat.** A slash command you type in IM (or the web console) does the right thing for whichever agent owns the session — no command silently degrades into literal text. Claude's open command set (skills, `/compact`, `/clear`, custom commands, …) passes straight through to the TUI; Codex slashes map to the matching app-server RPCs. Popup / picker commands — pick a model, choose a review target, and the like — are answered with **inline buttons** in IM (or **chips** in web chat) instead of getting stuck in a hidden TUI modal. And when an agent itself raises a question mid-task (an `AskUserQuestion`), it surfaces as the same kind of inline choice, so you can answer from your phone and the agent keeps going.
 
 **Resume-by-id, durable sessions.** Sessions are spawned on demand (first message creates one), resumed by id, and released when idle — state lives on disk, never as a shadow source of truth. They survive a daemon restart: the next `ccteam start` re-attaches your bots and replays any unsent IM replies, so upgrading or restarting ccteam doesn't lose context. If a Claude pane was killed, it is recreated with `claude --resume` for a lossless reload of the model's full context; if resume isn't possible, ccteam falls back to a fresh session and emits a visible reset event rather than silently forgetting.
 
@@ -79,8 +81,9 @@ codex plugin marketplace add firstintent/ccteam
 - **A meta AI team you drive from your phone** — assign work, get results, and intervene from IM, anywhere.
 - **Live, legible IM turns** — a turn shows folded step-by-step progress (`📖 read ×5 · 🔧 bash ×3`) in one editable status message while it works, then the answer arrives as its own message. Long replies are split into ordered chunks (code fences kept intact) instead of being truncated.
 - **Pictures both ways** — send a screenshot or file to the bot and the agent reads it; the agent can send images/files back to your chat with a `chat_send_file` tool.
-- **Multi-project, multi-session** — one chat fans out across many repos and many concurrent agent sessions, each with its own context.
-- **Two agent vendors** — Claude (tmux TUI) and Codex (app-server) side by side; ask for a cross-vendor second opinion on hard calls.
+- **Multi-project, multi-session** — one chat fans out across many repos and many concurrent agent sessions, each with its own context. `/sessions` lists them with each session's model and live context usage (e.g. `188k / 1M (19%)`), and a command menu is registered with your IM client so the gateway commands are discoverable.
+- **Full slash coverage from chat** — every agent slash command works from IM: Claude's open set passes through, Codex slashes map to native RPCs, model/review-style pickers become inline buttons, and an agent's own questions are answerable inline.
+- **Two agent vendors** — Claude (tmux TUI) and Codex (app-server) side by side; ask for a cross-vendor second opinion on hard calls. ccteam's skills install on both — Claude (`/plugin install ccteam`) and Codex (`codex plugin marketplace add firstintent/ccteam`).
 - **Durable by design** — sessions survive daemon restarts and machine reboots; nothing silently forgets.
 - **File-system source of truth** — all state is reconstructable from disk; ccteam reads hooks, transcripts, and RPC events, never scraped terminal text.
 - **Cost-aware** — per-vendor 24h budgets with a hard ceiling; long-running sessions are never killed unless a budget cap is hit.

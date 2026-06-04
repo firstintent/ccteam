@@ -85,7 +85,7 @@ ccteam gateway 把 IM / web chat 消息路由到真实 Claude/Codex session。�
 
 一个 session = `HarnessAdapter(vendor)` × `ProcessBackend(host)`。两个 vendor 都归一成中立的 `CanonicalEvent` + `ApprovalIR`(**不**抄 codex-emulation —— 每个 vendor 用自家原生通道:Claude 走 hook + transcript,Codex 走 JSON-RPC)。
 
-**`HarnessAdapter` trait**(`crates/ccteam-harness/src/adapter.rs`)—— 5 个 async 生命周期方法 + 2 个同步标识方法:
+**`HarnessAdapter` trait**(`crates/ccteam-harness/src/adapter.rs`)—— 7 个 async 生命周期/命令方法 + 2 个同步标识方法(末两个 async 方法 `handle_directive` / `thread_status` 是 v0.8.5 加的命令面 + 状态面,**无 default impl**,论证见 §2.5):
 
 ```rust
 #[async_trait::async_trait]
@@ -97,15 +97,18 @@ pub trait HarnessAdapter: Send + Sync {
     fn events(&self, h: &ThreadHandle) -> BoxStream<'static, ThreadEvent>;
     async fn resume_thread(&self, persistent_id: &str) -> Result<ThreadHandle, HarnessError>;
     async fn close_thread(&self, h: &ThreadHandle) -> Result<(), HarnessError>;
+    // v0.8.5 命令面 + 状态面(无 default impl,§2.5):
+    async fn handle_directive(&self, h: &ThreadHandle, d: Directive) -> Result<DirectiveOutcome, HarnessError>;
+    async fn thread_status(&self, h: &ThreadHandle) -> Result<ThreadStatus, HarnessError>;
 }
 
 pub enum TurnInput {
     UserText(String),            // chat DM / 群消息 / kick prompt
     Artifact(PathBuf),           // 文件系统 artifact / 附件
-    SystemDirective(String),     // /compact /new /clear → adapter 翻成 vendor-native op
     Image(PathBuf),              // rich media
     ToolResult { call_id: String, content: serde_json::Value },
 }
+// slash 命令不再是 TurnInput 变体 —— 它走独立的 handle_directive 命令面(§2.5)。
 
 pub struct ThreadHandle {
     pub vendor: AgentVendor,     // Claude | Codex
@@ -116,8 +119,8 @@ pub struct ThreadHandle {
 }
 ```
 
-- **`CanonicalEvent`** 是 `ThreadEvent` 的中立别名(`ThreadStarted` / `TurnStarted` / `TurnCompleted{usage}` / `TurnFailed` / `Item{Started,Updated,Completed}` / `Error`);schema 对齐 Codex `ThreadEvent`,两 vendor 的 emitter 1:1 映射进 gateway。
-- **`SystemDirective`** 把 `/compact` `/new` `/clear` 退化为特殊 turn:Claude → slash 透传到 TUI;Codex → JSON-RPC(`/compact`=`thread/compact/start`、`/review`=`review/start`)。统一「all chat is a turn sequence」。
+- **`CanonicalEvent`** 是 `ThreadEvent` 的中立别名(`ThreadStarted` / `TurnStarted` / `TurnCompleted{usage}` / `TurnFailed` / `Item{Started,Updated,Completed}` / `Error`);schema 对齐 Codex `ThreadEvent`,两 vendor 的 emitter 1:1 映射进 gateway。`events()` 守 **final-only 契约**(v0.8.5,rustdoc 钉死):一个 turn 的最终 agent 文本**恰好一次**经 `ItemCompleted(AgentMessage)` 吐出,`ItemUpdated` 仅 delta/presentation、consumer 可丢;token usage / plan / rate-limit 等非终态遥测**不**进此流(它们旁路镜像 `progress.jsonl`,经 `thread_status` 查询)。gateway 的取文本逻辑依赖此契约,故契约住 adapter trait,不当 gateway 假设。
+- **slash 命令面**(v0.8.5)不再走 `TurnInput`,改走中立 `handle_directive`(§2.5):`/compact` `/review` 等仍可能落成一个 turn(`DirectiveOutcome::Turn`),但路由判定 + vendor 翻译收敛进 adapter,gateway 退纯路由。
 - **resume 语义**:bg 形态每次 spawn 是 fresh 1M context,`resume_thread` 返回 `NotImplemented`(R4);chat 形态 resume-by-id —— Claude 用 deterministic session 名 lossless 续接,Codex 用 thread id app-server resume。
 - **`close_thread`** 是唯一杀长 session 的路径,只能由用户主动 `ccteam session rm` 触发,绝不静默。
 
@@ -127,12 +130,30 @@ pub struct ThreadHandle {
 
 per-adapter best-fit,不强行统一:
 
-| Vendor | Harness | 为什么 | slash 行为 |
+| Vendor | Harness | 为什么 | slash 行为(全量命令面见 §2.5) |
 |---|---|---|---|
-| Claude | tmux TUI session | 全 TUI + 耐久 + send-keys/transcript/hooks 已成熟;`-p --resume` 每 turn 冷启 cache 失效 + slash 不透传是 UX 退化 | `/compact` `/clear` 等按字面 `send-keys -l` 发给 Claude TUI |
-| Codex | app-server JSON-RPC | 原生、文档化的控制平面;`/compact` `/review` 映射到 Codex-native RPC | `/compact`→`thread/compact/start`;`/review`→`review/start` |
+| Claude | tmux TUI session | 全 TUI + 耐久 + send-keys/transcript/hooks 已成熟;`-p --resume` 每 turn 冷启 cache 失效 + slash 不透传是 UX 退化 | 开放集(skill/自定义/compact/clear/…)字面 `send-keys -l` 透传;弹窗型(model/…)bare→inline 选项、panel-only→`Rejected` |
+| Codex | app-server JSON-RPC | 原生、文档化的控制平面;每条 slash 映射 native RPC / 查询合成 / override | `/compact`→`thread/compact/start`、`/review`→`review/start` 等六类映射;`/new` `/clear`→`Redirect`;弹窗 bare→两段式 inline 选项 |
 
 两种 harness 可以在同一个 chat 并发存在。输出统一成 IM 回复:gateway 先回 `submitted <session> turn <id>`,随后把 assistant / error 事件通过同一条 outbound ledger 发回 IM。
+
+### 2.5 命令面 + 交互面 + 状态面(slash / 弹窗 / 反问 / `/sessions`)
+
+把「在 IM 里像用 TUI 一样驱动 agent」做全,需要三个跨切面:**任意 slash 命令**有意义地执行或显式回执(无静默降级)、**弹窗选择型**命令(选 model / review target / …)在 IM 可答、**agent 主动反问**(`AskUserQuestion`)在 IM 可答,外加 `/sessions` 看每个 session 的 model + 上下文用量。设计约束:后续会持续加 code agent(Gemini CLI / Amp …)与 IM channel(飞书 / 钉钉 …)—— 故 **命令面实现内聚于各 vendor adapter、交互形态内聚于各 channel,两轴经中立类型彻底解耦**(新 vendor 只实现 `handle_directive`/`thread_status` 两个方法、不感知 channel;新 channel 只实现选项渲染 + 回填归一、不感知 vendor)。
+
+**中立词汇**(住 `crates/ccteam-harness/src/adapter.rs`,与 `ThreadEvent`/`ApprovalIR` 同层):`Directive{name,args,choice?}`(一条 slash,gateway 零知识转交)→ adapter 答 `DirectiveOutcome`(穷尽 5 值:`Turn`=成为一个 turn / `Done{receipt}`=即时完成 RPC|override、receipt 回 IM / `NeedsChoice(ChoicePrompt)`=需用户选、渲染后带 `choice` 重入 / `Rejected{reason}`=显式拒绝 TUI-only|不支持、一等回执非 `Err` / `Redirect{hint}`=语义重定向指向 gateway 命令如 `/new`)。选择型走 `ChoicePrompt{token,title,options:Vec<ChoiceOption{id,label}>,multi}` → 用户回 → 归一成 `ChoiceSelection{token,ids,free_text?}`。状态面 `ThreadStatus{model?,context?:ContextUsage{used,window}}`,`ContextUsage::render()` 是绝对值+百分比的**单一渲染点**(`188k / 1M (19%)`)。`handle_directive`/`thread_status` 两个新 trait 方法**无 default impl** —— 与「vendor enum 无 default」红线同理:新 vendor 漏写命令面/状态面就**编译失败**,杜绝「slash 静默降级成模型字面文本 / `/sessions` 静默空白」。`ChoicePrompt` 是 `ApprovalIR` 的交互前身,日后 HITL 批准复用同一 pending-registry + 回填路径。
+
+**gateway 退纯路由**(`crates/ccteam-im/src/gateway.rs`):单行 slash → `Directive` → `handle_directive` → 渲染 5 outcome;gateway 自有命令(`/new /use /cd /sessions /projects /newproject /pair /help`)由单表 `GATEWAY_COMMANDS` 派生(`is_gateway_command` + `/help` 渲染 + `Channel::register_commands` 注册到 native 菜单的子集都从这张表来);`NeedsChoice` 进 `PendingInteractions`(单飞 per (chat,session) + TTL + token 守卫),回填经 `resolve_selection` **token-global** 统一处理(一条 callback 路径既解 Directive 重入、也解 D6 hook 的 External 反问)。`/sessions` 是状态面单点:逐 session 调 `thread_status` → `status_suffix()` 拼到 `id:project:vendor:role` 行尾(无状态的 bg adapter 答 `Default` → 不追加,旧行不变)。
+
+**交互面在 channel**(`crates/ccteam-im/src/pending.rs` + `transport/mod.rs`):`PendingInteractions` 用**自己的锁**(独立于 gateway 锁,让 D6 的 600s-class External await 绝不持 gateway 锁),双 origin(Directive 重入 live / External oneshot)。transport 加 `MessageOption` + `SendMessage.options` + `ChannelMessage.selection:Option<ChoiceReply>` + `Channel::register_commands`(默认 no-op),全 `#[serde(default)]` 零破坏:Telegram 渲 inline keyboard + 收 `callback_query`;web chat 渲 chips;其余 provider 走 content 内嵌编号文本兜底。
+
+**Claude 命令面**(`crates/ccteam-harness/src/execution/claude_tui.rs`,§5.1 真 binary smoke PASS → 主路):`handle_directive` 四通道 gate —— ① prompt 开放集(skill/自定义/plugin)+ ② BRIDGE_SAFE local(compact/clear/usage/…)+ 未知 → 零知识透传 send-keys(开放集红线 R3 不变);③ arg-applicable popup(model/effort)带 args 直透、bare → `NeedsChoice`(**绝不盲发 bare 弹窗** —— 否则隐藏 TUI 卡进 modal 吞后续输入);panel-only popup(config/agents/…curated)→ `Rejected`;④ agent 反问 → D6。逃生舱 `/esc` = send Escape(写不读,合规)。
+
+**Codex 命令面**(`crates/ccteam-harness/src/execution/codex_app_server.rs`):`handle_directive` 六类映射(RPC 直映射 / 查询合成→`Done` / per-session override / 语义 `Redirect` / TUI-only `Rejected` / server 错误原文传播)+ 三层 resolution(内建表 → `skills/list` 缓存动态匹配 → `Rejected` 附候选);D4 弹窗两段式(bare→list RPC/静态枚举→`NeedsChoice`→重入 apply)。`CodexThreadTracker` 是 harness 级 dispatcher,消费 `thread/tokenUsage/updated` 维护 per-thread token 缓存(`turn/completed` wire 实测无 usage),喂 Codex `/status` 与 P3 `thread_status`。transport **单轴** `resolve_codex_transport()`:有 `CCTEAM_CODEX_APP_SERVER_SOCKET` 走 UDS、否则默认 stdio(`codex app-server --listen stdio://`,根治 `/new codex` 默认连不上 socket 的 F10)。`default_adapter_factory` 是 **per-vendor 单例**(`crates/ccteam-im/src/daemon.rs`,`Arc::ptr_eq` 守)→ 每 daemon 恰好一个常驻 codex app-server 子进程跨 resume/turn 复用。
+
+**D6 agent 反问**(`AskUserQuestion`):机制是「hook IS the interaction」—— `intercept_ask` 的 chat 变体(`crates/ccteam-hooks/src/intercept_ask.rs`)在 `mode: chat` session 把 `AskUserQuestion` 转成 IM 的同一中立 `ChoicePrompt`,经 daemon `mcp.sock` 的 `interaction/ask` op(`crates/ccteam-cli/src/main.rs`)发 IM、阻塞等答案,返回 `allow + updatedInput.answers` 让 picker 完全跳过、模型直拿答案;超时/无 chat → 降级 bg deny-with-reason(老牌行为)。`ensure_chat_hooks_installed` 追加一条 matcher `AskUserQuestion` 的 PreToolUse 条目。
+
+> 协议细节(命令→RPC 映射表、Claude local-jsx 名单、Codex 53-命令 drift 快照、各 channel 渲染)一律以代码为准,见 §12 指针表新增行。
 
 ---
 
@@ -570,5 +591,13 @@ ccteam web [--bind 127.0.0.1:7331]                # 单独启动 Web UI
 | IM 附件 I/O (B3) | 入站:`transport::{ChannelAttachment,AttachmentKind}` + telegram `getFile`/下载 staging + `gateway::handle_message` 拼 `<channel … image_path=…>`;出站:`transport::{OutboundFile,OutboundFileKind}` + telegram `sendPhoto/sendDocument` + `chat_send_file`(零寻址,`resolve_home_chat` 解析)走 `mcp.sock`(`main.rs::handle_mcp_socket_connection` 注入 `GatewayEvent` sink)。**Read 约定**(load-bearing)= ccteam MCP `initialize` instructions(`mcp_serve.rs::CCTEAM_MCP_INSTRUCTIONS`) | `cargo test -p ccteam-im`;`ccteam doctor --verify-mcp` |
 | workflow.yaml schema | `ccteam-flow` / `ccteam-core` 解析代码(推后的编排层) | — |
 | HarnessAdapter / ProcessBackend | `crates/ccteam-harness/src/adapter.rs` + `lib.rs` | — |
+| 命令面中立词汇(v0.8.5) | `Directive` / `DirectiveOutcome`(5 值)/ `ChoicePrompt` / `ChoiceOption` / `ChoiceSelection` / `ContextUsage` / `ThreadStatus` + `handle_directive` / `thread_status`(无 default impl)= `crates/ccteam-harness/src/adapter.rs` | `cargo test -p ccteam-harness adapter` |
+| gateway 纯路由 + 命令菜单(v0.8.5) | slash→`Directive`→`handle_directive`→渲染 outcome + `GATEWAY_COMMANDS` 单表 + `resolve_selection`(token-global,统一 Directive 重入 + External 反问)+ `render_sessions`(逐 session `thread_status`→`status_suffix`)= `crates/ccteam-im/src/gateway.rs` | `cargo test -p ccteam-im gateway` |
+| pending interaction 注册表(v0.8.5) | `PendingInteractions`(自己的锁 / 双 origin Directive+External / 单飞 per(chat,session) / TTL / `take_by_token`)= `crates/ccteam-im/src/pending.rs` | `cargo test -p ccteam-im pending` |
+| transport 选项/回填/菜单(v0.8.5) | `MessageOption` / `ChoiceReply` / `SendMessage.options` / `ChannelMessage.selection` / `CommandSpec` / `Channel::register_commands`(全 `#[serde(default)]`)= `crates/ccteam-im/src/transport/mod.rs`;TG inline keyboard + `callback_query` + `setMyCommands` = `transport/providers/telegram.rs` | `cargo test -p ccteam-im` |
+| Claude 命令面 gate(v0.8.5 D5/D6) | 四通道 `handle_directive`(prompt 透传 / BRIDGE_SAFE local / arg-popup `NeedsChoice` / panel-only `Rejected`)+ `/esc`→Escape + `ensure_chat_hooks_installed` 追加 `AskUserQuestion` matcher = `crates/ccteam-harness/src/execution/claude_tui.rs` | `cargo test -p ccteam-harness --test claude_tui_test` |
+| Codex 命令面 + transport(v0.8.5 D2/D4/F10) | 六类映射 `handle_directive` + 三层 resolution + D4 两段式 + `CodexThreadTracker`(消费 `thread/tokenUsage/updated`)+ `resolve_codex_transport()` 单轴(socket→UDS / 默认 stdio)+ `is_builtin_command`/`is_rejected_command` drift 分类 = `crates/ccteam-harness/src/execution/codex_app_server.rs`;per-vendor 单例工厂 = `crates/ccteam-im/src/daemon.rs`(`default_adapter_factory`) | `cargo test -p ccteam-harness --test codex_app_server_test`;`cargo test -p ccteam-im default_adapter_factory` |
+| D6 反问 ingress(v0.8.5) | `intercept_ask` chat 变体(`AskUserQuestion`→`ChoicePrompt`→`mcp.sock`→`updatedInput.answers`)= `crates/ccteam-hooks/src/intercept_ask.rs`;`mcp.sock` 的 `interaction/ask` op(`is_interaction_ask_call` / `execute_interaction_ask` / External-origin 注册)= `crates/ccteam-cli/src/main.rs` | `cargo test -p ccteam-hooks intercept_ask` |
+| `/sessions` 状态:model + 上下文(v0.8.5 P3) | Claude 倒读 transcript 尾(`read_status_tail`,`[1m]`→1M / 否则 200k 基线,唯一常量)= `crates/ccteam-harness/src/execution/transcript_tail.rs`;Codex 读 `CodexThreadTracker`;gateway 单点渲染 `188k / 1M (19%)` = `ContextUsage::render` / `ThreadStatus::status_suffix`(`adapter.rs`)| `cargo test -p ccteam-harness adapter` |
 
 改协议 = 改代码 +(若新增一类协议)补本表一行。**不**再维护独立的 interfaces.md。

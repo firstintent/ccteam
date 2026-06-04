@@ -20,8 +20,8 @@ use anyhow::Context as _;
 
 use crate::latency::now_unix_ms;
 use crate::transport::{
-    AttachmentKind, Channel, ChannelAttachment, ChannelMessage, ChoiceReply, OutboundFile,
-    OutboundFileKind, SendMessage,
+    AttachmentKind, Channel, ChannelAttachment, ChannelMessage, ChoiceReply, CommandSpec,
+    OutboundFile, OutboundFileKind, SendMessage,
 };
 
 /// `getUpdates` long-poll seconds.
@@ -684,6 +684,39 @@ impl Channel for TelegramChannel {
         // stable, so echo it back for the daemon's status bookkeeping.
         Ok(Some(message_id.to_string()))
     }
+
+    /// v0.8.5 P1 — publish the gateway's command menu via `setMyCommands`.
+    /// Telegram wants **bare** command names (no leading `/`), so the body
+    /// builder strips it. An empty spec list clears the menu (Telegram's
+    /// documented behaviour for an empty `commands` array). Best-effort:
+    /// the daemon logs a warn on failure rather than aborting startup.
+    async fn register_commands(&self, cmds: &[CommandSpec]) -> anyhow::Result<()> {
+        let url = self.api_url("setMyCommands");
+        let body = set_my_commands_body(cmds);
+        let resp = self.http.post(&url).json(&body).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("telegram setMyCommands → {status}: {text}");
+        }
+        Ok(())
+    }
+}
+
+/// Build the `setMyCommands` request body (v0.8.5 P1). Pure + isolated so
+/// the bare-name stripping + JSON shape are unit-testable without a live
+/// Bot API. Telegram requires bare command names (`new`, not `/new`).
+fn set_my_commands_body(cmds: &[CommandSpec]) -> serde_json::Value {
+    let commands: Vec<serde_json::Value> = cmds
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "command": c.name.trim_start_matches('/'),
+                "description": c.description,
+            })
+        })
+        .collect();
+    serde_json::json!({ "commands": commands })
 }
 
 #[cfg(test)]
@@ -695,6 +728,40 @@ mod tests {
         let ch = TelegramChannel::new("ABC".into(), vec![]);
         let url = ch.api_url("getMe");
         assert_eq!(url, "https://api.telegram.org/botABC/getMe");
+    }
+
+    #[test]
+    fn set_my_commands_body_strips_leading_slash() {
+        // v0.8.5 P1 — Telegram wants BARE command names.
+        let specs = vec![
+            CommandSpec {
+                name: "/new".into(),
+                description: "start a new session".into(),
+            },
+            CommandSpec {
+                name: "/sessions".into(),
+                description: "list sessions + status".into(),
+            },
+        ];
+        let body = set_my_commands_body(&specs);
+        let commands = body["commands"].as_array().expect("commands array");
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0]["command"], "new");
+        assert_eq!(commands[0]["description"], "start a new session");
+        assert_eq!(commands[1]["command"], "sessions");
+        // No leading slash leaks through anywhere.
+        for c in commands {
+            assert!(
+                !c["command"].as_str().unwrap().starts_with('/'),
+                "telegram command names must be bare"
+            );
+        }
+    }
+
+    #[test]
+    fn set_my_commands_body_empty_clears_menu() {
+        let body = set_my_commands_body(&[]);
+        assert!(body["commands"].as_array().unwrap().is_empty());
     }
 
     #[test]

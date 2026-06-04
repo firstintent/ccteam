@@ -266,6 +266,24 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
     },
 ];
 
+/// The [`GATEWAY_COMMANDS`] entries flagged `in_menu`, mapped to the
+/// channel-facing [`CommandSpec`] shape (v0.8.5 P1). The daemon calls this
+/// once at startup and hands the result to each channel's
+/// [`Channel::register_commands`]. Passthrough vendor slashes (`/compact`,
+/// `/model`, …) deliberately stay out of the menu — they are vendor-relative
+/// and would mislead. `name` keeps the leading `/` (each channel strips it
+/// if its API wants bare names, e.g. Telegram `setMyCommands`).
+pub fn menu_command_specs() -> Vec<crate::transport::CommandSpec> {
+    GATEWAY_COMMANDS
+        .iter()
+        .filter(|c| c.in_menu)
+        .map(|c| crate::transport::CommandSpec {
+            name: c.name.to_string(),
+            description: c.help.to_string(),
+        })
+        .collect()
+}
+
 impl Gateway {
     /// Create a gateway with one default project.
     pub fn new(
@@ -658,7 +676,7 @@ impl Gateway {
                     .ok_or_else(|| anyhow!("用法: /newproject <slug> <项目路径>"))?;
                 self.create_project(slug, path).map(Some)
             }
-            "/sessions" => Ok(Some(self.render_sessions(chat))),
+            "/sessions" => Ok(Some(self.render_sessions(chat).await)),
             "/projects" => Ok(Some(self.render_projects())),
             "/help" => Ok(Some(render_help())),
             _ => Ok(None),
@@ -1336,21 +1354,36 @@ impl Gateway {
             .collect()
     }
 
-    fn render_sessions(&self, chat: &ChatKey) -> String {
+    async fn render_sessions(&self, chat: &ChatKey) -> String {
         // The web console is a global operator view and lists every chat
         // session (cross-entry sharing); IM channels stay scoped to their own.
         let global = chat.channel == "web";
-        let rows: Vec<String> = self
+        let visible: Vec<&GatewaySession> = self
             .sessions
             .values()
             .filter(|s| global || s.owner == *chat)
-            .map(|s| format!("{}:{}:{:?}:{}", s.id, s.project, s.vendor, s.role))
             .collect();
-        if rows.is_empty() {
-            "no sessions".to_string()
-        } else {
-            rows.join("\n")
+        if visible.is_empty() {
+            return "no sessions".to_string();
         }
+        let mut rows: Vec<String> = Vec::with_capacity(visible.len());
+        for s in visible {
+            // P3 — append model + ctx from the owning adapter's
+            // `thread_status`. Statusless adapters (bg / default) report
+            // `ThreadStatus::default()` → `status_suffix() == None` → the
+            // legacy `id:project:vendor:role` row is unchanged. Per-session
+            // failures degrade to the bare row (never break the listing).
+            let base = format!("{}:{}:{:?}:{}", s.id, s.project, s.vendor, s.role);
+            let suffix = match s.adapter.thread_status(&s.thread).await {
+                Ok(status) => status.status_suffix(),
+                Err(_) => None,
+            };
+            match suffix {
+                Some(sfx) => rows.push(format!("{base} — {sfx}")),
+                None => rows.push(base),
+            }
+        }
+        rows.join("\n")
     }
 
     fn render_projects(&self) -> String {
@@ -1878,7 +1911,7 @@ fn event_text(evt: &ThreadEvent) -> Option<String> {
 mod tests {
     use super::*;
     use ccteam_harness::{
-        ChoiceOption, ExecutionMode, HarnessError, ThreadItem, ThreadStatus, TurnId,
+        ChoiceOption, ContextUsage, ExecutionMode, HarnessError, ThreadItem, ThreadStatus, TurnId,
     };
     use futures::stream::BoxStream;
     use std::collections::VecDeque;
@@ -2035,6 +2068,11 @@ mod tests {
             }
         }
 
+        /// Set the status this fake reports from `thread_status` (P3).
+        async fn set_status(&self, status: ThreadStatus) {
+            *self.status.lock().await = status;
+        }
+
         fn new_with_event_delay(vendor: AgentVendor, event_delay: std::time::Duration) -> Self {
             Self {
                 event_delay,
@@ -2168,6 +2206,63 @@ mod tests {
         assert_eq!(
             fake.submissions.lock().await.as_slice(),
             &[("alpha-reviewer-s1".to_string(), "hi".to_string())]
+        );
+    }
+
+    /// P3 — `/sessions` appends each session's model + ctx from
+    /// `thread_status`. With a `[1m]` model the window is 1M; with no
+    /// status reported the legacy `id:project:vendor:role` row is unchanged.
+    #[tokio::test]
+    async fn gateway_sessions_shows_model_and_context() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+
+        // Default status (all-None) → no suffix, legacy row verbatim.
+        let bare = gateway
+            .handle_text("mock", "chat-1", "alice", "/sessions")
+            .await
+            .unwrap();
+        assert_eq!(bare, vec!["s1:alpha:Claude:reviewer"]);
+
+        // Now report a model + usage → suffix appears, rendered the same
+        // way Codex /status renders (shared helper).
+        fake.set_status(ThreadStatus {
+            model: Some("claude-opus-4-8[1m]".into()),
+            context: Some(ContextUsage {
+                used_tokens: 188_000,
+                window_tokens: 1_000_000,
+            }),
+        })
+        .await;
+        let with_status = gateway
+            .handle_text("mock", "chat-1", "alice", "/sessions")
+            .await
+            .unwrap();
+        assert_eq!(
+            with_status,
+            vec!["s1:alpha:Claude:reviewer — claude-opus-4-8[1m] · ctx 188k / 1M (19%)"]
+        );
+
+        // A non-[1m] model renders against the 200k baseline.
+        fake.set_status(ThreadStatus {
+            model: Some("claude-sonnet-4-5".into()),
+            context: Some(ContextUsage {
+                used_tokens: 188_000,
+                window_tokens: 200_000,
+            }),
+        })
+        .await;
+        let baseline = gateway
+            .handle_text("mock", "chat-1", "alice", "/sessions")
+            .await
+            .unwrap();
+        assert_eq!(
+            baseline,
+            vec!["s1:alpha:Claude:reviewer — claude-sonnet-4-5 · ctx 188k / 200k (94%)"]
         );
     }
 

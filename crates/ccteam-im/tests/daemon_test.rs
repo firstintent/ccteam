@@ -38,6 +38,64 @@ async fn daemon_runs_until_max_runtime() {
     run_daemon(args).await.unwrap();
 }
 
+/// v0.8.5 P1 — at startup the daemon registers the gateway's command menu
+/// (`menu_command_specs`) on **every** channel via
+/// `Channel::register_commands`. Inject two mock channels, run briefly,
+/// and assert each one recorded exactly the in-menu specs. (A real
+/// menu-less channel is a no-op; the mock records the call purely so this
+/// wiring is observable — Telegram's `setMyCommands` body shape is tested
+/// in the telegram provider unit tests.)
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "current_thread")]
+async fn daemon_registers_command_menu_per_channel() {
+    use ccteam_im::gateway::menu_command_specs;
+    use ccteam_im::transport::providers::mock::MockChannel;
+    use ccteam_im::transport::Channel;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let _g = env_lock();
+    let _tmp = isolate_home();
+
+    let ch_a = MockChannel::new().with_name("mock-a");
+    let ch_b = MockChannel::new().with_name("mock-b");
+    let mut override_map: HashMap<String, Arc<dyn Channel + Send + Sync>> = HashMap::new();
+    override_map.insert("mock-a".into(), Arc::new(ch_a.clone()));
+    override_map.insert("mock-b".into(), Arc::new(ch_b.clone()));
+
+    let args = DaemonArgs {
+        credentials: None,
+        registry: None,
+        max_runtime: Some(Duration::from_millis(150)),
+        adapter_factory: None,
+        channels_override: Some(override_map),
+        extra_channels: None,
+        ..Default::default()
+    };
+    run_daemon(args).await.unwrap();
+
+    let expected = menu_command_specs();
+    assert!(!expected.is_empty(), "there are in-menu gateway commands");
+    // Only zero-arg/menu-friendly gateway commands appear — passthrough
+    // vendor slashes must never be advertised.
+    assert!(expected.iter().any(|c| c.name == "/sessions"));
+    assert!(expected.iter().any(|c| c.name == "/help"));
+    assert!(
+        !expected.iter().any(|c| c.name == "/compact"),
+        "passthrough vendor slashes must stay out of the menu"
+    );
+
+    for ch in [&ch_a, &ch_b] {
+        let calls = ch.registered_commands().await;
+        assert_eq!(
+            calls.len(),
+            1,
+            "register_commands called exactly once per channel at startup"
+        );
+        assert_eq!(calls[0], expected, "registered the in-menu gateway specs");
+    }
+}
+
 /// Serialize env-mutating tests so concurrent `HOME` swaps in this
 /// binary don't race with each other (cargo runs integration tests
 /// within one file in parallel by default).

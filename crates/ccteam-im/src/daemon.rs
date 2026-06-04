@@ -209,6 +209,21 @@ where
     // their producers register credentials (matches the host-probe
     // shape that landed in F121).
     let channels: ChannelMap = build_channels(&args, &creds, &initial);
+    // v0.8.5 P1 — advertise the gateway's own commands in each channel's
+    // native menu (Telegram `setMyCommands`; default no-op elsewhere). Done
+    // once at startup; passthrough vendor slashes are intentionally absent.
+    {
+        let specs = crate::gateway::menu_command_specs();
+        for (name, ch) in channels.iter() {
+            if let Err(err) = ch.register_commands(&specs).await {
+                tracing::warn!(
+                    channel = %name,
+                    error = %err,
+                    "imd: register_commands (menu) failed"
+                );
+            }
+        }
+    }
     replay_durable_outbox(&channels).await;
     let mut gateway_inner =
         build_gateway(factory.clone(), &projects_root, &config_projects, &initial);

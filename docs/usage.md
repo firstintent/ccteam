@@ -9,7 +9,9 @@
 - **project**:本地一个已 `ccteam init` 的目录,用 slug 标识。
 - **session**:一个可继续上下文的 agent 会话,属于某个 chat + 某个 project。
 
-两类命令别混:**shell 里的 `ccteam <子命令>`**(运维 + 安装) vs **IM / web chat 里的网关命令 `/pair /new /use /cd /sessions /projects`、路由前缀 `@<handle>`、管理 `@ccteam`**(日常对话)。
+两类命令别混:**shell 里的 `ccteam <子命令>`**(运维 + 安装) vs **IM / web chat 里的网关命令 `/pair /new /use /cd /sessions /projects /newproject /help`、路由前缀 `@<handle>`、管理 `@ccteam`**(日常对话)。
+
+> **命令菜单**:daemon 启动时会把上面这些**网关自有命令**注册进你的 IM 客户端(Telegram 走 `setMyCommands`)—— 在聊天框敲 `/` 就能看到候选(其余透传给 agent 的 slash 不进菜单,因为它跟当前 vendor 相关、列进去会误导)。随时发 `/help` 看网关命令清单 + 「其余 `/` 命令透传给当前 agent」的说明。
 
 ---
 
@@ -193,9 +195,12 @@ ccteam start > /tmp/ccteam.log 2>&1 &
 ```text
 /use s1            切到 session s1
 /cd demo-api       当前 chat 切到 demo-api;活动 session 跟着切(无则下条消息在那新建)
-/sessions          列当前 chat 的 session
+/sessions          列当前 chat 的 session(每行带 model + 上下文用量)
 /projects          列 daemon 已知项目(= 已 init 且 daemon 已加载)
+/newproject demo   新建并 init 一个项目(team 前缀目录)
 ```
+
+`/sessions` 每行形如 `s1:demo-app:claude:reviewer  claude-opus-4-8[1m] · ctx 188k / 1M (19%)` —— 末尾是该 session 的 **model + 上下文用量**(绝对值 + 百分比;窗口 1M 来自 model id 的 `[1m]` 后缀,否则按 200k 基线)。用量是回合后值:空闲时准,turn 跑到一半偏旧。
 
 发消息 + slash 透传(`@handle` 决定路由并设为当前 session;不带 `@` 时发给当前 session):
 
@@ -204,10 +209,15 @@ ccteam start > /tmp/ccteam.log 2>&1 &
 @api /review       Codex 原生 RPC(review/start)
 @api /compact      Codex 原生 RPC(thread/compact/start)
 @reviewer /clear   Claude TUI slash 透传
+@reviewer /model   弹出 model 选项按钮,点一下即应用(bare 弹窗型)
 ```
 
-> Claude session:任意 `/x` 都按字面发给 TUI。Codex session:仅 `/compact` `/review` 走 app-server RPC,其他 `/x` 会被当普通文本。
 > gateway 先回 `submitted <session> turn <id>`,随后把 assistant / error 事件经同一条 outbound ledger 发回 IM。
+
+**slash 在 IM 里按 vendor 的行为**(没有一条会静默变成发给模型的字面文本):
+
+- **Claude session**:开放集(skill / 自定义命令 / `/compact` `/clear` `/usage` …)按字面 `send-keys` 透传给 TUI;弹窗选择型(`/model` 等)带参直接应用、不带参(bare)弹出 **inline 选项按钮**(web chat 里是 chips),点一下即应用;纯设置面板型(`/config` `/agents` 等无法用一句参数驱动的)会**显式拒绝并给提示**(不盲发、免得隐藏 TUI 卡进 modal 吞输入);万一卡住,发 `/esc` 等于按一下 Esc 把 TUI 拉回来。
+- **Codex session**:每条 slash 映射 app-server **原生 RPC** 或即时查询(`/compact` `/review` `/interrupt` `/status` `/skills` …);弹窗型(`/model` `/review` `/permissions` …)bare 先弹**选项按钮**、选了再应用(两段式);`/new` `/clear` `/resume` 这类 Codex 无 in-thread 等价的,会**重定向**提示你用网关命令(如 `/new` 建新 session、`/use` 切 session);确实不支持 / TUI-only 的命令显式回执拒绝。
 
 **turn 进行中的进度**:turn 跑的时候会有一条活的 status 消息逐步编辑,折叠显示步骤(形如 `⏳ working… · 📖 read ×5 · 🔧 bash ×3`),结束收尾成 `✅ done · n tools · m files`;最终答案单独成一条新消息(会 ping)。想关掉只发答案:daemon 起前设 `CCTEAM_IM_PROGRESS=off`(编辑节流阈值 `CCTEAM_IM_PROGRESS_THROTTLE_MS`,默认 1500ms)。
 
@@ -216,6 +226,8 @@ ccteam start > /tmp/ccteam.log 2>&1 &
 **发图 / 发文件给 bot**:在 TG 直接发图片或文件 + caption(如「这是报错」)→ agent 会自动 `Read` 落盘的文件(报错截图、日志都行)。>20MB 拒收。
 
 **bot 发文件回来**:agent 调 MCP 工具 `chat_send_file(path, caption?, kind?)` 即可把文件/截图发回你绑定的 chat(零寻址参数,身份取 spawn 注入的 `CCTEAM_CHAT_{SLUG,ROLE}`;图 ≤10MB / 文件 ≤50MB,超限或不存在返回结构化 error)。配合 `screenshot`(返回 PNG 路径)即「发效果图」。
+
+**agent 反问你**:当 agent 自己在 turn 中途要拿主意(发起 AskUserQuestion),它的问题会以**选项按钮**形式弹到你 chat 里 —— 点一下(或回数字 / 回一段自由文本)即把答案喂回 agent,它继续往下跑,不卡死。等太久没答会按兜底策略让它自决。
 
 给 bot 设定固定行为走官方机制(**不靠注入**):Claude 读项目根 `CLAUDE.md`(`init` 已生成),Codex 读项目根 `AGENTS.md`(需手建);全局指令放 `~/.claude/CLAUDE.md`。
 

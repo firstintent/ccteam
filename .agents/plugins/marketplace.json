@@ -1,0 +1,16 @@
+{
+  "name": "ccteam",
+  "interface": {
+    "displayName": "ccteam"
+  },
+  "plugins": [
+    {
+      "name": "ccteam",
+      "source": {
+        "source": "url",
+        "url": "firstintent/ccteam"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

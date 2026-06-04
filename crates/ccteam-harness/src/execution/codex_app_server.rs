@@ -2169,20 +2169,13 @@ pub fn flatten_skills(result: &Value) -> Vec<CachedSkill> {
     out
 }
 
-/// v0.8.5 D2.1 — render the `/status` receipt from the tracker.
+/// v0.8.5 D2.1 — render the `/status` receipt from the tracker. The
+/// context line goes through the shared [`ContextUsage::render`] (P3) so
+/// `/status` and `/sessions` show the same absolute+percent form.
 fn render_status_receipt(live: &ThreadLive) -> String {
     let model = live.model.as_deref().unwrap_or("(unknown)");
     match &live.usage {
-        Some(u) if u.window_tokens > 0 => format!(
-            "model: {model}\ncontext: {} / {} ({:.0}%)",
-            human_tokens(u.used_tokens),
-            human_tokens(u.window_tokens),
-            u.pct()
-        ),
-        Some(u) => format!(
-            "model: {model}\ncontext: {} (window unknown)",
-            human_tokens(u.used_tokens)
-        ),
+        Some(u) => format!("model: {model}\ncontext: {}", u.render()),
         None => format!("model: {model}\ncontext: (no usage yet)"),
     }
 }
@@ -2217,17 +2210,6 @@ fn render_count_receipt(label: &str, result: &Value, key: &str) -> String {
         .unwrap_or(0);
     let plural = if n == 1 { "" } else { "s" };
     format!("{n} {label}{plural} configured.")
-}
-
-/// Compact a token count: `1234` → `1.2k`, `188000` → `188k`.
-fn human_tokens(n: u64) -> String {
-    if n < 1000 {
-        n.to_string()
-    } else if n < 1_000_000 {
-        format!("{:.0}k", n as f64 / 1000.0)
-    } else {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    }
 }
 
 /// Translate a [`TurnInput`] into the codex `UserInput[]` payload
