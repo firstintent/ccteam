@@ -977,7 +977,7 @@ pub fn install_mcp_into(claude_json: &std::path::Path, ccteam_bin: &std::path::P
         "ccteam".into(),
         json!({
             "command": bin,
-            "args": ["mcp-serve"],
+            "args": ccteam_core::CCTEAM_MCP_SERVE_ARGS.to_vec(),
             "env": {},
         }),
     );
@@ -1075,7 +1075,12 @@ mod tests {
             v["mcpServers"]["ccteam"]["command"],
             "/usr/local/bin/ccteam"
         );
-        assert_eq!(v["mcpServers"]["ccteam"]["args"][0], "mcp-serve");
+        // Canonical argv: `ccteam internal mcp-serve` (not the deprecated bare
+        // `mcp-serve` alias that warns on every startup). v0.8.5 review fix.
+        assert_eq!(
+            v["mcpServers"]["ccteam"]["args"],
+            serde_json::json!(["internal", "mcp-serve"])
+        );
     }
 
     #[test]

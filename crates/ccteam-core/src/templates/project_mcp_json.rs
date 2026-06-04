@@ -28,6 +28,17 @@ use serde_json::{json, Map, Value};
 /// preserved (README §九 F111 decision).
 pub const CCTEAM_MCP_SERVER_KEY: &str = "ccteam";
 
+/// Canonical argv the `ccteam` MCP server is launched with:
+/// `ccteam internal mcp-serve`. The bare top-level `mcp-serve` is a
+/// DEPRECATED alias — it still runs but prints a stderr deprecation WARN
+/// on every startup — so every generated `mcpServers.ccteam` entry must
+/// use this form: both `ccteam doctor --install-mcp` (`~/.claude.json`,
+/// `mcp_serve::install_mcp_into`) and this project `.mcp.json` template
+/// (`ccteam-creator`), matching the shipped root `.mcp.json`. Sharing one
+/// const keeps the two writers from drifting from the manifest again.
+/// (v0.8.5 review fix)
+pub const CCTEAM_MCP_SERVE_ARGS: [&str; 2] = ["internal", "mcp-serve"];
+
 /// Render a fresh `.mcp.json` body that registers the ccteam server
 /// only. Used when a project has no pre-existing `.mcp.json`. The
 /// returned string is pretty-printed JSON suitable for `std::fs::write`.
@@ -86,7 +97,7 @@ pub fn merge_project_mcp_json(existing: &str, ccteam_bin: &Path) -> Result<Strin
 fn ccteam_server_entry(ccteam_bin: &Path) -> Value {
     json!({
         "command": ccteam_bin.to_string_lossy(),
-        "args": ["mcp-serve"],
+        "args": CCTEAM_MCP_SERVE_ARGS.to_vec(),
         "env": {},
     })
 }
@@ -108,7 +119,12 @@ mod tests {
             v["mcpServers"]["ccteam"]["command"],
             "/usr/local/bin/ccteam"
         );
-        assert_eq!(v["mcpServers"]["ccteam"]["args"][0], "mcp-serve");
+        // Canonical argv: `ccteam internal mcp-serve` (not the deprecated bare
+        // `mcp-serve` alias). v0.8.5 review fix.
+        assert_eq!(
+            v["mcpServers"]["ccteam"]["args"],
+            serde_json::json!(["internal", "mcp-serve"])
+        );
     }
 
     #[test]

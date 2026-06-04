@@ -250,8 +250,8 @@ pub use templates::{
     render_workflow_agents_block, render_workflow_template, write_global_helper_templates,
     write_project_settings, write_project_settings_agent_team, EnabledPluginsSetting, Language,
     ProjectKind, ProjectProbe, SettingsEnv, TeammateInfo, WorkflowAgentEntry, WorkflowPreset,
-    WorkflowTemplateCtx, WorkflowTemplateRenderError, CCTEAM_MCP_SERVER_KEY, HELPER_TEMPLATES,
-    PROJECT_SETTINGS_AGENT_TEAM_JSON, PROJECT_SETTINGS_JSON,
+    WorkflowTemplateCtx, WorkflowTemplateRenderError, CCTEAM_MCP_SERVER_KEY, CCTEAM_MCP_SERVE_ARGS,
+    HELPER_TEMPLATES, PROJECT_SETTINGS_AGENT_TEAM_JSON, PROJECT_SETTINGS_JSON,
 };
 pub use tmux::{
     capture_pane_tail, capture_pane_tail_from_session, capture_pane_with_ansi,

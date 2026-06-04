@@ -22,7 +22,7 @@ use serde_json::Value;
 // V0.6.0 F111 — per-project `.mcp.json` template + merge helper.
 pub mod project_mcp_json;
 pub use project_mcp_json::{
-    merge_project_mcp_json, render_project_mcp_json, CCTEAM_MCP_SERVER_KEY,
+    merge_project_mcp_json, render_project_mcp_json, CCTEAM_MCP_SERVER_KEY, CCTEAM_MCP_SERVE_ARGS,
 };
 
 // V0.6.0 Wave 2 F114 — `ccteam-creator` preset workflow.yaml templates.

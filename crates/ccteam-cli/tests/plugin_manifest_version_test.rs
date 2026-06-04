@@ -88,6 +88,32 @@ fn parse_marketplace_plugin_version(path: &Path) -> String {
         .unwrap_or_else(|| panic!("{} missing `plugins[0].version` string", path.display()))
 }
 
+/// (v0.8.5 review fix) Every generated `mcpServers.ccteam` entry must launch the
+/// server via the canonical `ccteam internal mcp-serve` argv — the bare
+/// `mcp-serve` is a deprecated alias that prints a stderr WARN on every startup.
+/// This pins the shipped root `.mcp.json` to that form AND to the shared
+/// `ccteam_core::CCTEAM_MCP_SERVE_ARGS` const that both runtime writers
+/// (`doctor --install-mcp` → `~/.claude.json`, and the project `.mcp.json`
+/// template) use, so the manifest and the writers can't drift apart again.
+#[test]
+fn root_mcp_json_matches_canonical_mcp_serve_args() {
+    let root = repo_root();
+    let body = std::fs::read_to_string(root.join(".mcp.json")).expect("read root .mcp.json");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("parse root .mcp.json");
+    let args = &v["mcpServers"]["ccteam"]["args"];
+    assert_eq!(
+        *args,
+        serde_json::json!(["internal", "mcp-serve"]),
+        "root .mcp.json must launch ccteam via `internal mcp-serve`"
+    );
+    let shared: Vec<&str> = ccteam_core::CCTEAM_MCP_SERVE_ARGS.to_vec();
+    assert_eq!(
+        *args,
+        serde_json::json!(shared),
+        "root .mcp.json args must equal ccteam_core::CCTEAM_MCP_SERVE_ARGS (writers share it)"
+    );
+}
+
 #[test]
 fn plugin_manifests_match_workspace_version() {
     let root = repo_root();
