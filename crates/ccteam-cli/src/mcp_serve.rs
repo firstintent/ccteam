@@ -64,17 +64,23 @@ const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 /// within one tick.
 const MCP_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
-/// No JSON-RPC traffic for this long ⇒ the parent isn't using us,
-/// suicide so we don't pile up. Defaults to 5 minutes; the
-/// `CCTEAM_MCP_IDLE_TIMEOUT_SECS` env var overrides for tests.
-const MCP_DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-
-fn mcp_idle_timeout() -> Duration {
+/// Idle timeout for mcp-serve, **disabled by default** (`None`).
+///
+/// An MCP server's liveness is connection-based, not wall-clock: it lives
+/// exactly as long as the session and is reaped by stdin-EOF (session end) +
+/// the parent-death signals (SIGTERM / `PR_SET_PDEATHSIG`) + the orphan
+/// `getppid()` check (within one [`MCP_HEALTH_CHECK_INTERVAL`] tick). A timer
+/// would wrongly kill a live-but-idle session — you left a chat open and came
+/// back — so there is no default idle exit. `CCTEAM_MCP_IDLE_TIMEOUT_SECS=N`
+/// (N>0) re-enables an opt-in backstop for pathological spawn topologies where
+/// neither EOF nor the orphan check fires (an intermediate shell that outlives
+/// the parent and keeps the stdin pipe open). `0` / unset ⇒ never idle-exit.
+fn mcp_idle_timeout() -> Option<Duration> {
     std::env::var("CCTEAM_MCP_IDLE_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n > 0)
         .map(Duration::from_secs)
-        .unwrap_or(MCP_DEFAULT_IDLE_TIMEOUT)
 }
 
 #[cfg(unix)]
@@ -117,13 +123,14 @@ looked at the file they sent.";
 /// - parent reparented (getppid changed → original parent died but
 ///   PR_SET_PDEATHSIG signal didn't reach us, e.g. when an
 ///   intermediate shell shielded it)
-/// - idle for [`MCP_DEFAULT_IDLE_TIMEOUT`] (no JSON-RPC traffic; parent
-///   is alive but stopped talking to us — a stale zombie session)
+/// - idle, **only** when the opt-in `CCTEAM_MCP_IDLE_TIMEOUT_SECS` is set
+///   (default: no idle exit — see [`mcp_idle_timeout`])
 ///
-/// The orphan and idle arms are belt-and-suspenders on top of stdin
-/// EOF + `PR_SET_PDEATHSIG`. On WSL and some claude-spawn paths
-/// neither of those fires reliably, so without these belts mcp-serve
-/// processes pile up one-per-bg-job and exhaust file descriptors.
+/// Liveness is connection-based — stdin EOF (session end), `PR_SET_PDEATHSIG`,
+/// and the orphan `getppid()` check (the reliable belt-and-suspenders for the
+/// parent-died case, since on WSL / some claude-spawn paths EOF and PDEATHSIG
+/// don't fire reliably). The idle arm is **opt-in only**: a wall-clock timer
+/// would wrongly reap a live-but-idle session, so it is disabled by default.
 ///
 /// Why `std::process::exit(0)` and not `return Ok(())`: returning
 /// drops the tokio runtime, which then tries to join every spawned
@@ -179,13 +186,15 @@ pub async fn run_mcp_serve(paths: CcteamPaths) -> Result<()> {
                         "mcp-serve: parent reparented (orphan); exiting");
                     std::process::exit(0);
                 }
-                if last_activity.elapsed() >= idle_timeout {
-                    tracing::info!(
-                        idle_secs = last_activity.elapsed().as_secs(),
-                        timeout_secs = idle_timeout.as_secs(),
-                        "mcp-serve: idle timeout reached; exiting"
-                    );
-                    std::process::exit(0);
+                if let Some(idle) = idle_timeout {
+                    if last_activity.elapsed() >= idle {
+                        tracing::info!(
+                            idle_secs = last_activity.elapsed().as_secs(),
+                            timeout_secs = idle.as_secs(),
+                            "mcp-serve: idle timeout reached (opt-in); exiting"
+                        );
+                        std::process::exit(0);
+                    }
                 }
                 continue;
             }
@@ -1506,17 +1515,20 @@ mod tests {
     }
 
     #[test]
-    fn mcp_idle_timeout_reads_env_then_falls_back_to_default() {
-        // Single test exercises both the env-override path and the
-        // default-on-missing path so the two halves don't race against
-        // each other under `cargo test`'s parallel runner. No other
-        // test touches CCTEAM_MCP_IDLE_TIMEOUT_SECS so this is the only
-        // user of the var.
+    fn mcp_idle_timeout_opt_in_only_default_disabled() {
+        // Single test exercises the env-override, the explicit-0-disables, and
+        // the default-disabled paths so they don't race against each other
+        // under `cargo test`'s parallel runner. No other test touches
+        // CCTEAM_MCP_IDLE_TIMEOUT_SECS so this is the only user of the var.
         let prev = std::env::var("CCTEAM_MCP_IDLE_TIMEOUT_SECS").ok();
         std::env::set_var("CCTEAM_MCP_IDLE_TIMEOUT_SECS", "7");
-        assert_eq!(mcp_idle_timeout(), Duration::from_secs(7));
+        assert_eq!(mcp_idle_timeout(), Some(Duration::from_secs(7)));
+        // `0` means disabled, not a 0-second timeout.
+        std::env::set_var("CCTEAM_MCP_IDLE_TIMEOUT_SECS", "0");
+        assert_eq!(mcp_idle_timeout(), None);
+        // Unset ⇒ disabled by default (liveness is EOF + orphan + PDEATHSIG).
         std::env::remove_var("CCTEAM_MCP_IDLE_TIMEOUT_SECS");
-        assert_eq!(mcp_idle_timeout(), MCP_DEFAULT_IDLE_TIMEOUT);
+        assert_eq!(mcp_idle_timeout(), None);
         if let Some(v) = prev {
             std::env::set_var("CCTEAM_MCP_IDLE_TIMEOUT_SECS", v);
         }
