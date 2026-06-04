@@ -590,10 +590,18 @@ pub async fn read_status_tail(
     file.seek(std::io::SeekFrom::Start(start))
         .await
         .with_context(|| format!("seek {} -> {start}", transcript_path.display()))?;
-    let mut buf = String::new();
-    file.read_to_string(&mut buf)
+    // (v0.8.5 S3) Read raw bytes, not a `String`: `start` is an arbitrary byte
+    // offset that can land in the middle of a multi-byte UTF-8 codepoint
+    // (common with CJK / emoji), and `read_to_string` would reject the whole
+    // tail with `InvalidData`, losing the /sessions context suffix. Decode
+    // lossily — the (very likely partial) first physical line is dropped below
+    // anyway, so any replacement char at the seek boundary never reaches a
+    // parsed record.
+    let mut raw = Vec::new();
+    file.read_to_end(&mut raw)
         .await
         .with_context(|| format!("read tail {}", transcript_path.display()))?;
+    let buf = String::from_utf8_lossy(&raw);
 
     // When we seeked into the middle of the file the first physical line is
     // very likely a partial record — drop everything up to the first
@@ -1140,6 +1148,52 @@ mod tests {
         let (model, ctx) = read_status_tail(&path).await.unwrap();
         assert_eq!(model.as_deref(), Some("claude-opus-4-8"));
         assert_eq!(ctx.unwrap().used_tokens, 50_000, "must take the LAST usage");
+    }
+
+    /// (v0.8.5 S3) On a transcript larger than the tail window whose
+    /// `size - STATUS_TAIL_BYTES` boundary splits a multi-byte UTF-8 char
+    /// (common with CJK / emoji), `read_status_tail` must still decode the tail
+    /// and find the last usage line. Before the fix `read_to_string` rejected
+    /// the whole tail with `InvalidData`, dropping the /sessions ctx suffix.
+    #[tokio::test]
+    async fn status_tail_survives_utf8_boundary_split_in_large_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("big.jsonl");
+
+        // The usage-bearing last line: 120k + 8k + 60k = 188k used.
+        let usage_line = json!({
+            "type":"assistant","uuid":"last",
+            "message":{
+                "model":"claude-sonnet-4-6",
+                "usage":{"input_tokens":120_000,
+                    "cache_creation_input_tokens":8_000,
+                    "cache_read_input_tokens":60_000}
+            }
+        })
+        .to_string();
+
+        // One long line of 3-byte CJK chars, big enough that the tail window
+        // starts inside it; then the usage line. Shift the whole file right by
+        // single ASCII bytes until the window boundary lands mid-codepoint —
+        // the exact condition that tripped the old `read_to_string`.
+        let filler = "好".repeat(STATUS_TAIL_BYTES as usize / 3 + 4096);
+        let mut content = format!("{filler}\n{usage_line}");
+        loop {
+            let start = (content.len() as u64).saturating_sub(STATUS_TAIL_BYTES) as usize;
+            assert!(start > 0, "file must exceed the tail window");
+            if !content.is_char_boundary(start) {
+                break; // boundary splits a 好 — reproduce the bug
+            }
+            content.insert(0, '#'); // shift right one byte, retry
+        }
+
+        std::fs::write(&path, content.as_bytes()).unwrap();
+
+        let (model, ctx) = read_status_tail(&path).await.unwrap();
+        assert_eq!(model.as_deref(), Some("claude-sonnet-4-6"));
+        let ctx = ctx.expect("last usage line parsed despite the boundary split");
+        assert_eq!(ctx.used_tokens, 188_000);
+        assert_eq!(ctx.window_tokens, 200_000);
     }
 
     #[tokio::test]

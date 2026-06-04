@@ -1225,7 +1225,16 @@ impl Gateway {
         let Some((token, idx)) = split_callback(data) else {
             return Ok(vec!["invalid selection".to_string()]);
         };
-        let taken = self.pending.lock().await.take_by_token(&token);
+        let taken = {
+            let mut pend = self.pending.lock().await;
+            // (v0.8.5 S2) Lapse any prompt past its TTL before resolving, so a
+            // late click on an expired choice reads as absent ("expired")
+            // instead of re-entering dispatch. Dropping a lapsed External
+            // entry's oneshot also unblocks its waiting hook (deny) — matching
+            // that path's own tokio timeout.
+            pend.drain_expired(Instant::now());
+            pend.take_by_token(&token)
+        };
         let Some(p) = taken else {
             return Ok(vec!["this choice has expired".to_string()]);
         };
@@ -1248,6 +1257,9 @@ impl Gateway {
         };
         let key = pending_key(chat, &session_id);
         let mut pend = self.pending.lock().await;
+        // (v0.8.5 S2) Drop lapsed prompts first: a number typed after the TTL
+        // is ordinary text for the agent, not a stale choice re-entry.
+        pend.drain_expired(Instant::now());
         let (token, id) = {
             let Some(prompt) = pend.prompt_for(&key) else {
                 return Ok(vec!["no choice to answer".to_string()]);
@@ -1300,7 +1312,11 @@ impl Gateway {
             return false;
         };
         let key = pending_key(chat, session_id);
-        self.pending.lock().await.has(&key)
+        let mut pend = self.pending.lock().await;
+        // (v0.8.5 S2) A lapsed prompt no longer counts as pending, so a bare
+        // number after the TTL falls through to ordinary agent text.
+        pend.drain_expired(Instant::now());
+        pend.has(&key)
     }
 
     fn current_project_for(&self, chat: &ChatKey) -> String {
@@ -3307,5 +3323,54 @@ mod tests {
         drop(drained);
         assert!(rx.await.is_err(), "dropped sender ⇒ receiver RecvError");
         assert!(shared.lock().await.is_empty());
+    }
+
+    /// (v0.8.5 S2) A click on a prompt past its TTL must be treated as absent.
+    /// `resolve_selection` drains lapsed entries first, so `take_by_token`
+    /// finds nothing and the user sees the benign "expired" notice — the
+    /// lapsed Directive is NOT re-entered into dispatch. Without the drain the
+    /// stale prompt would resolve and re-run the directive long after the TTL.
+    #[tokio::test]
+    async fn expired_pending_is_drained_before_resolve() {
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        let shared = Arc::new(Mutex::new(crate::pending::PendingInteractions::new()));
+        gateway.set_pending(shared.clone());
+
+        let token = "texpired";
+        // A Directive-origin prompt registered already past its TTL.
+        shared.lock().await.register(
+            "telegram:chat-1:bob::sess".to_string(),
+            ask_prompt(token),
+            InteractionOrigin::Directive {
+                session_id: "sess".to_string(),
+                directive: Directive {
+                    name: "model".into(),
+                    args: String::new(),
+                    choice: None,
+                },
+            },
+            Instant::now() - std::time::Duration::from_secs(1),
+        );
+
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "bob",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: format!("{token}:0"),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replies, vec!["this choice has expired".to_string()]);
+        assert!(
+            shared.lock().await.is_empty(),
+            "lapsed pending drained, not resolved"
+        );
     }
 }

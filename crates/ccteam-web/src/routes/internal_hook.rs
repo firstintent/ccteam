@@ -61,7 +61,7 @@ async fn handle_no_action(
     headers: HeaderMap,
     body: Option<Json<Value>>,
 ) -> Response {
-    dispatch(&app, &kind, None, &headers, body.map(|Json(v)| v))
+    dispatch(&app, &kind, None, &headers, body.map(|Json(v)| v)).await
 }
 
 async fn handle_with_action(
@@ -70,7 +70,7 @@ async fn handle_with_action(
     headers: HeaderMap,
     body: Option<Json<Value>>,
 ) -> Response {
-    dispatch(&app, &kind, Some(&action), &headers, body.map(|Json(v)| v))
+    dispatch(&app, &kind, Some(&action), &headers, body.map(|Json(v)| v)).await
 }
 
 /// F186 — inject `X-Ccteam-Role` / `X-Ccteam-Slug` request headers into
@@ -114,7 +114,7 @@ fn inject_headers(mut stdin: Value, headers: &HeaderMap) -> Value {
 /// Shared invocation path. `None` body is normalized to `Value::Null`
 /// so handlers that don't actually read stdin (today: `intercept-ask`)
 /// still work when the client sent zero bytes.
-fn dispatch(
+async fn dispatch(
     app: &AppState,
     kind: &str,
     action: Option<&str>,
@@ -125,13 +125,54 @@ fn dispatch(
     let stdin = inject_headers(body.unwrap_or(Value::Null), headers);
     // Try to pull session id / role from the Claude Code hook stdin
     // payload — useful for joining hook latency rows to other stages.
-    // Best-effort: any field missing → empty string.
+    // Best-effort: any field missing → empty string. Owned (not borrowed from
+    // `stdin`) so `stdin` can move into the blocking task below.
     let session_id = stdin
         .get("session_id")
         .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let cwd = stdin.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
-    match ccteam_hooks::dispatch(&app.paths, kind, action, &stdin) {
+        .unwrap_or("")
+        .to_string();
+    let cwd = stdin
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    // (v0.8.5 S1) `ccteam_hooks::dispatch` does blocking socket I/O — the
+    // `intercept-ask` hook waits up to SOCKET_READ_TIMEOUT_SECS on the daemon
+    // mcp.sock for the user's answer. Run it on the blocking pool so it never
+    // stalls the (single-threaded) daemon runtime; otherwise the mcp.sock task
+    // that writes the answer can't be scheduled and D6 self-deadlocks until
+    // timeout. (The cold CLI hook path is a short-lived subprocess that blocks
+    // harmlessly.)
+    let paths = app.paths.clone();
+    let kind_owned = kind.to_string();
+    let action_owned = action.map(str::to_string);
+    let result = match tokio::task::spawn_blocking(move || {
+        ccteam_hooks::dispatch(&paths, &kind_owned, action_owned.as_deref(), &stdin)
+    })
+    .await
+    {
+        Ok(r) => r,
+        Err(join_err) => {
+            tracing::warn!(
+                event = "latency",
+                stage = "hook.recv.err",
+                kind = %kind,
+                action = action.unwrap_or(""),
+                elapsed_ms = t0.elapsed().as_millis() as u64,
+                error = %join_err,
+                "latency hook.recv (dispatch task panicked)"
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    json!({"ok": false, "error": format!("hook dispatch task panicked: {join_err}")}),
+                ),
+            )
+                .into_response();
+        }
+    };
+    match result {
         Ok(Some(decision)) => {
             tracing::info!(
                 event = "latency",

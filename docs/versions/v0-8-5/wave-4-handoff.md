@@ -39,7 +39,7 @@
 
 - 真机 live smoke:D6 hook→IM 全链路、Codex EXPERIMENTAL collab/permissions/login、多 session 单子进程、`/fork` 自动注册(gateway 变体)。
 - PRD §3-D2.5 「67」更正为 53(已在 W3 handoff 记)。
-- D6 HTTP-fast-path worker spawn_blocking;web 出站文件 attachments;多问题 AskUserQuestion;External numeric-reply。
+- web 出站文件 attachments;多问题 AskUserQuestion;External numeric-reply。(D6 HTTP-fast-path spawn_blocking 已在下方 post-review S1 落地)
 
 ## Gate(push 前实测)
 
@@ -49,3 +49,17 @@
 - `ccteam doctor --verify-mcp` = **PASS**(28 工具 / 0 stub / 0 drift)。
 
 > ship-gate 实测捕获:`Cargo.toml` 版本 bump 后,4 个 plugin 清单的 `version` 字段仍是旧值 → `plugin_manifests_match_workspace_version` 红测;同步 bump 4 清单 + `cargo update --workspace` 刷新 `Cargo.lock`(否则 `--locked` 拒跑)后全绿。
+
+## Post-review fixes(dev,用户 review 后 — B1 blocker + S1–S4)
+
+用户 review v0.8.5 dev 分支裁定 **HOLD**,直接在 dev 修真问题(无 PR、tag 仍 held):
+
+1. **B1(blocker)**:`daemon.rs` 入站 consumer 先 `sec.evaluate(&content)`;按钮/chip 回调 `content=""` → `EmptyAfterSanitize` → 在到 `handle_message` 前被 drop,所有 D3 选项按钮 + D6 AskUserQuestion 按钮在真 daemon 失效(Telegram + web chat 都经此 consumer)。修:抽 `sec_gate_payload(outcome, has_selection)` —— 仅当带 selection 时放行 `EmptyAfterSanitize`(ACL/限流/签名拒绝在 sanitize 之前,照旧 drop,选择回调不能绕过)。
+2. **S1**:暖 daemon HTTP fast-path(`ccteam-web internal_hook`)async handler 直接调阻塞 `ccteam_hooks::dispatch`(intercept-ask 等 mcp.sock 至多 660s)→ 饿死单线程 daemon runtime,写答案的 mcp.sock task 排不上 → D6 自死锁至超时。修:`dispatch` 改 async + `spawn_blocking`(照 W6 hook-sink)。冷 CLI 子进程路径不变。
+3. **S2**:Directive pending TTL 设了不生效(`drain_expired` 0 production caller;resolve 路径忽略 `expires_at`)→ 过期 prompt 的迟到 click/数字仍重入 dispatch。修:`resolve_selection`/`resolve_numeric`/`has_pending_for_current` 持锁内先 `drain_expired(now)`(同时清掉过期 External 的 oneshot → hook deny,和其 tokio timeout 同义)。
+4. **S3**:`read_status_tail` seek 到 `size−512KB` 后 `read_to_string` 撞多字节 UTF-8 边界(CJK/emoji)→ `InvalidData` → /sessions ctx 后缀丢(仅 Claude 该 session,非硬失败)。修:读 `Vec<u8>` + `from_utf8_lossy`(partial 首行照旧丢,替换符不入解析)。
+5. **S4**:全 workspace 0 个非 None selection 的 daemon 级测试(B1 能 ship 绿之因)。补:`sec_gate_payload` 单测 + 真 `ThreeLayerSec` 选择回调测(daemon.rs)、过期 pending drain 测(gateway.rs)、>512KB UTF-8 边界切分测(transcript_tail.rs)。
+
+> 修后 gate:`cargo test --workspace --locked --no-fail-fast --exclude ccteam-web` = **1907 / 0**(1903 + 4 回归测);`cargo clippy --workspace --all-targets --locked -- -D warnings` = **0**;`cargo fmt --all --check` = **clean**。
+> 死路 `inbound.rs::process_inbound`(orchestrator-era,daemon 不调、仅测试引用)未动 —— review 未点名、不扩 scope。
+> review 提及「1903/0 不稳定可复现」:本机 WSL2/inotify 触顶会致 watcher/SSE/web e2e 偶发 502(CLAUDE.md §六 已记,属环境层,不计 baseline);canonical 命令本身确定性 1907/0。

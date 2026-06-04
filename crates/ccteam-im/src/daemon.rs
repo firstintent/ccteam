@@ -559,6 +559,25 @@ async fn log_orphan_chat_sessions(gateway: &Gateway) {
     }
 }
 
+/// Decide whether an inbound message clears the security layer, returning the
+/// text payload to forward to the gateway (or `None` to drop it).
+///
+/// `Accept` forwards its sanitized payload. An `EmptyAfterSanitize` is normally
+/// a drop, **except** for a selection callback (inline-button / chip click):
+/// those carry empty `content` by design — the real payload is the structured
+/// `selection`, resolved inside the gateway — so an empty-after-sanitize result
+/// is expected there, not hostile. ACL / rate-limit / bad-signature rejections
+/// are always dropped; because they precede the sanitize check in
+/// [`ThreeLayerSec::evaluate`], a selection callback still passes through them.
+/// (v0.8.5 B1)
+pub fn sec_gate_payload(outcome: SecOutcome, has_selection: bool) -> Option<String> {
+    match outcome {
+        SecOutcome::Accept { payload } => Some(payload),
+        SecOutcome::EmptyAfterSanitize if has_selection => Some(String::new()),
+        _ => None,
+    }
+}
+
 /// Drain the mpsc receiving from every listener and route each accepted
 /// `ChannelMessage` directly through the v8.1 gateway.
 fn spawn_inbound_consumer(
@@ -587,22 +606,28 @@ fn spawn_inbound_consumer(
                 continue;
             };
 
-            let clean_payload =
-                match sec
-                    .lock()
-                    .await
-                    .evaluate(&msg.channel, &msg.sender, &msg.content)
-                {
-                    SecOutcome::Accept { payload } => payload,
-                    other => {
-                        tracing::warn!(
-                            cid = %cid,
-                            outcome = ?other,
-                            "ccteam-im: gateway inbound rejected by security layer"
-                        );
-                        continue;
-                    }
-                };
+            // (v0.8.5 B1) A selection callback (inline-button / web-chip click)
+            // legitimately carries empty `content` — its real payload is
+            // `msg.selection`, resolved inside the gateway — so the security
+            // layer's `EmptyAfterSanitize` is expected here, not an attack.
+            // ACL + rate-limit (which run *before* the sanitize check in
+            // `evaluate`) still gate it; only the empty-text rejection is
+            // waived for a selection. Without this, every D3 option button +
+            // D6 AskUserQuestion button is silently dropped before reaching the
+            // gateway (on Telegram *and* web chat — both feed this consumer).
+            let outcome = sec
+                .lock()
+                .await
+                .evaluate(&msg.channel, &msg.sender, &msg.content);
+            let Some(clean_payload) = sec_gate_payload(outcome.clone(), msg.selection.is_some())
+            else {
+                tracing::warn!(
+                    cid = %cid,
+                    outcome = ?outcome,
+                    "ccteam-im: gateway inbound rejected by security layer"
+                );
+                continue;
+            };
 
             let replies = gateway
                 .lock()
@@ -1226,6 +1251,68 @@ pub fn _link_check(_c: &Credentials) {}
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// (v0.8.5 B1) The security gate must let a selection callback through even
+    /// though it carries empty `content` (→ `EmptyAfterSanitize`), while still
+    /// dropping ACL / rate-limit / signature rejections and genuinely-empty
+    /// *text* messages. This is the exact decision that, when it dropped
+    /// selections, killed every D3/D6 inline button in the daemon.
+    #[test]
+    fn sec_gate_payload_lets_selection_callbacks_through() {
+        // Accepted text → forwarded payload (selection flag irrelevant).
+        assert_eq!(
+            sec_gate_payload(
+                SecOutcome::Accept {
+                    payload: "hi".into()
+                },
+                false
+            ),
+            Some("hi".to_string())
+        );
+        // Button / chip click: empty content + selection → admitted with an
+        // empty text payload (the gateway resolves via `msg.selection`).
+        assert_eq!(
+            sec_gate_payload(SecOutcome::EmptyAfterSanitize, true),
+            Some(String::new())
+        );
+        // Empty text with NO selection → still dropped (a genuine empty turn).
+        assert_eq!(
+            sec_gate_payload(SecOutcome::EmptyAfterSanitize, false),
+            None
+        );
+        // ACL / rate-limit / signature denials are always dropped, even when a
+        // selection is present — they precede the sanitize check in `evaluate`,
+        // so a click can never bypass them.
+        assert_eq!(sec_gate_payload(SecOutcome::AclDenied, true), None);
+        assert_eq!(sec_gate_payload(SecOutcome::RateLimited, true), None);
+        assert_eq!(
+            sec_gate_payload(SecOutcome::BadSignature("x".into()), true),
+            None
+        );
+    }
+
+    /// (v0.8.5 S4) End-to-end through the *real* security layer: a button
+    /// callback (empty content) yields `EmptyAfterSanitize`, and the gate then
+    /// admits it because a selection is present — the composition the daemon
+    /// inbound consumer runs. (Resolving the selection is covered by the
+    /// gateway's `handle_message` selection tests.) No daemon-level test
+    /// previously fed a non-`None` selection, which is how B1 shipped green.
+    #[test]
+    fn real_security_layer_admits_empty_selection_callback() {
+        use crate::acl::AclPolicy;
+        let mut sec = ThreeLayerSec::new(AclPolicy::default());
+        // A Telegram button click: empty content, ACL-open, under rate limit.
+        let outcome = sec.evaluate("telegram", "user-1", "");
+        assert_eq!(outcome, SecOutcome::EmptyAfterSanitize);
+        // With a selection present the gate admits it (empty text payload).
+        assert_eq!(
+            sec_gate_payload(outcome.clone(), true),
+            Some(String::new()),
+            "selection callback must clear the security gate"
+        );
+        // The same outcome without a selection is a real empty turn → dropped.
+        assert_eq!(sec_gate_payload(outcome, false), None);
+    }
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         use std::sync::{Mutex as StdMutex, OnceLock};
