@@ -563,17 +563,20 @@ async fn log_orphan_chat_sessions(gateway: &Gateway) {
 /// text payload to forward to the gateway (or `None` to drop it).
 ///
 /// `Accept` forwards its sanitized payload. An `EmptyAfterSanitize` is normally
-/// a drop, **except** for a selection callback (inline-button / chip click):
-/// those carry empty `content` by design — the real payload is the structured
-/// `selection`, resolved inside the gateway — so an empty-after-sanitize result
-/// is expected there, not hostile. ACL / rate-limit / bad-signature rejections
-/// are always dropped; because they precede the sanitize check in
-/// [`ThreeLayerSec::evaluate`], a selection callback still passes through them.
-/// (v0.8.5 B1)
-pub fn sec_gate_payload(outcome: SecOutcome, has_selection: bool) -> Option<String> {
+/// a drop, **except** when the message carries a non-text payload —
+/// `has_nontext_payload` is true for a selection callback (inline-button / chip
+/// click; B1) OR an attachment-only message (a file/photo sent with no caption;
+/// B1b). Both legitimately have empty `content`: the real payload is the
+/// structured `selection` (resolved in the gateway) or the staged `attachments`
+/// (Read by the agent via the `<channel …>` tag), so an empty-after-sanitize
+/// result there is expected, not hostile. ACL / rate-limit / bad-signature
+/// rejections are always dropped; because they precede the sanitize check in
+/// [`ThreeLayerSec::evaluate`], a non-text message still passes through them.
+/// (v0.8.5 B1 / B1b)
+pub fn sec_gate_payload(outcome: SecOutcome, has_nontext_payload: bool) -> Option<String> {
     match outcome {
         SecOutcome::Accept { payload } => Some(payload),
-        SecOutcome::EmptyAfterSanitize if has_selection => Some(String::new()),
+        SecOutcome::EmptyAfterSanitize if has_nontext_payload => Some(String::new()),
         _ => None,
     }
 }
@@ -606,21 +609,23 @@ fn spawn_inbound_consumer(
                 continue;
             };
 
-            // (v0.8.5 B1) A selection callback (inline-button / web-chip click)
-            // legitimately carries empty `content` — its real payload is
-            // `msg.selection`, resolved inside the gateway — so the security
-            // layer's `EmptyAfterSanitize` is expected here, not an attack.
-            // ACL + rate-limit (which run *before* the sanitize check in
-            // `evaluate`) still gate it; only the empty-text rejection is
-            // waived for a selection. Without this, every D3 option button +
-            // D6 AskUserQuestion button is silently dropped before reaching the
-            // gateway (on Telegram *and* web chat — both feed this consumer).
+            // (v0.8.5 B1 / B1b) A non-text message legitimately carries empty
+            // `content`: a selection callback (inline-button / web-chip click —
+            // its real payload is `msg.selection`, resolved in the gateway) OR
+            // an attachment-only message (a file/photo with no caption — the
+            // staged `msg.attachments` are Read by the agent via the `<channel>`
+            // tag). The security layer's `EmptyAfterSanitize` is expected for
+            // both, not an attack. ACL + rate-limit (which run *before* the
+            // sanitize check in `evaluate`) still gate it; only the empty-text
+            // rejection is waived. Without this, every D3/D6 button AND every
+            // captionless inbound file is silently dropped here (on Telegram
+            // *and* web chat — both feed this consumer).
             let outcome = sec
                 .lock()
                 .await
                 .evaluate(&msg.channel, &msg.sender, &msg.content);
-            let Some(clean_payload) = sec_gate_payload(outcome.clone(), msg.selection.is_some())
-            else {
+            let has_nontext_payload = msg.selection.is_some() || !msg.attachments.is_empty();
+            let Some(clean_payload) = sec_gate_payload(outcome.clone(), has_nontext_payload) else {
                 tracing::warn!(
                     cid = %cid,
                     outcome = ?outcome,
@@ -1252,14 +1257,16 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// (v0.8.5 B1) The security gate must let a selection callback through even
-    /// though it carries empty `content` (→ `EmptyAfterSanitize`), while still
+    /// (v0.8.5 B1 / B1b) The security gate must let a non-text message through
+    /// even though it carries empty `content` (→ `EmptyAfterSanitize`) — a
+    /// selection callback (B1) or a captionless file/photo (B1b) — while still
     /// dropping ACL / rate-limit / signature rejections and genuinely-empty
-    /// *text* messages. This is the exact decision that, when it dropped
-    /// selections, killed every D3/D6 inline button in the daemon.
+    /// *text* messages. The bool models `has_nontext_payload` (selection OR
+    /// attachments); when it dropped these it killed every D3/D6 inline button
+    /// AND every captionless inbound file in the daemon.
     #[test]
-    fn sec_gate_payload_lets_selection_callbacks_through() {
-        // Accepted text → forwarded payload (selection flag irrelevant).
+    fn sec_gate_payload_admits_nontext_payloads() {
+        // Accepted text → forwarded payload (the flag is irrelevant).
         assert_eq!(
             sec_gate_payload(
                 SecOutcome::Accept {
@@ -1269,13 +1276,14 @@ mod tests {
             ),
             Some("hi".to_string())
         );
-        // Button / chip click: empty content + selection → admitted with an
-        // empty text payload (the gateway resolves via `msg.selection`).
+        // Non-text payload (button/chip click OR a captionless attachment):
+        // empty content + `has_nontext_payload` → admitted with an empty text
+        // payload (gateway resolves the selection / agent Reads the file).
         assert_eq!(
             sec_gate_payload(SecOutcome::EmptyAfterSanitize, true),
             Some(String::new())
         );
-        // Empty text with NO selection → still dropped (a genuine empty turn).
+        // Empty text with NO selection AND NO attachment → still dropped.
         assert_eq!(
             sec_gate_payload(SecOutcome::EmptyAfterSanitize, false),
             None
@@ -1312,6 +1320,48 @@ mod tests {
         );
         // The same outcome without a selection is a real empty turn → dropped.
         assert_eq!(sec_gate_payload(outcome, false), None);
+    }
+
+    /// (v0.8.5 B1b) A captionless inbound file/photo arrives as
+    /// `content="" + attachments=[…] + selection=None`. The consumer's gate
+    /// input `has_nontext_payload = selection.is_some() || !attachments.is_empty()`
+    /// must be true, so the security layer's `EmptyAfterSanitize` is admitted and
+    /// the agent gets the `<channel … file_path>` turn. This is the exact path
+    /// that logged `content_len=0 attachments=1 → EmptyAfterSanitize` and dropped
+    /// every captionless file before the fix.
+    #[test]
+    fn captionless_attachment_message_clears_gate() {
+        use crate::transport::{AttachmentKind, ChannelAttachment, ChannelMessage};
+        let msg = ChannelMessage {
+            id: "tg-1".into(),
+            sender: "u1".into(),
+            reply_target: "chat-1".into(),
+            content: String::new(), // no caption
+            channel: "telegram".into(),
+            timestamp: 0,
+            thread_ts: None,
+            attachments: vec![ChannelAttachment {
+                kind: AttachmentKind::File,
+                file_name: "readme.txt".into(),
+                local_path: "/tmp/stage/readme.txt".into(),
+                mime: Some("text/plain".into()),
+                size: Some(908),
+            }],
+            selection: None,
+        };
+        // The consumer's gate input: a captionless attachment counts as non-text.
+        let has_nontext = msg.selection.is_some() || !msg.attachments.is_empty();
+        assert!(has_nontext);
+        // Real security layer: empty content → EmptyAfterSanitize, then admitted
+        // because attachments are present (ACL + rate-limit already passed).
+        let mut sec = ThreeLayerSec::new(crate::acl::AclPolicy::default());
+        let outcome = sec.evaluate(&msg.channel, &msg.sender, &msg.content);
+        assert_eq!(outcome, SecOutcome::EmptyAfterSanitize);
+        assert_eq!(
+            sec_gate_payload(outcome, has_nontext),
+            Some(String::new()),
+            "captionless attachment must clear the security gate"
+        );
     }
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
