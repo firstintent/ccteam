@@ -463,6 +463,27 @@ impl Gateway {
         self.projects.insert(slug.into(), dir.into());
     }
 
+    /// Dynamically load one project from `config.yaml` into the in-memory map
+    /// if it is missing. The map is otherwise a startup-time snapshot (+ bot
+    /// templates + `/newproject`), so a project registered by `ccteam init`
+    /// *after* the daemon started would be invisible to `/cd` ("unknown
+    /// project") even though the project list reads the config registry live.
+    /// This lazily syncs the gateway with the registry — the source of truth —
+    /// on demand, so no daemon restart is needed to pick up a fresh project.
+    /// No-op when `project_paths` isn't wired (unit tests) or the slug isn't
+    /// registered.
+    fn ensure_project_loaded(&mut self, slug: &str) {
+        if self.projects.contains_key(slug) {
+            return;
+        }
+        let Some(root) = self.project_paths.as_ref().map(|p| p.root.clone()) else {
+            return;
+        };
+        if let Ok(Some(entry)) = ccteam_core::config::lookup_project(&root, slug) {
+            self.projects.insert(slug.to_string(), entry.path);
+        }
+    }
+
     /// Register a persisted bot as a spawn-on-demand gateway session template.
     pub fn register_bot_template(
         &mut self,
@@ -639,6 +660,10 @@ impl Gateway {
                 let project = parts
                     .next()
                     .ok_or_else(|| anyhow!("/cd requires a project"))?;
+                // (v0.8.5) Pick up a project registered in config.yaml after the
+                // daemon started — the in-memory map is a cache, config.yaml is
+                // the source of truth — so /cd needs no daemon restart.
+                self.ensure_project_loaded(project);
                 if !self.projects.contains_key(project) {
                     return Err(anyhow!("unknown project: {project}"));
                 }
@@ -695,6 +720,9 @@ impl Gateway {
             .clone()
             .ok_or_else(|| anyhow!("project creation is not configured on this daemon"))?;
         let slug = validate_slug_format(slug)?;
+        // (v0.8.5) Detect a slug already registered in config.yaml even if it's
+        // not yet in our in-memory cache, so /newproject can't clobber it.
+        self.ensure_project_loaded(&slug);
         if self.projects.contains_key(&slug) {
             return Err(anyhow!("project already exists: {slug}"));
         }
@@ -2891,6 +2919,50 @@ mod tests {
             .unwrap();
         assert_eq!(reply, vec!["alpha-reviewer-reviewer-s1 echo: hello"]);
         assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
+    }
+
+    /// (v0.8.5) A project registered in config.yaml AFTER the gateway started
+    /// — e.g. `ccteam init` while the daemon was already running — must be
+    /// addressable by /cd, not just the startup snapshot. Reproduces the
+    /// "gateway error: unknown project" bug.
+    #[tokio::test]
+    async fn gateway_cd_dynamically_loads_project_from_config() {
+        use ccteam_core::config::{upsert_project, ProjectEntry};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = ccteam_core::CcteamPaths {
+            root: tmp.path().join(".ccteam"),
+            projects_root: tmp.path().join("projects"),
+        };
+        std::fs::create_dir_all(&paths.root).unwrap();
+        // A project the daemon never snapshotted — written straight to the
+        // config registry, as `ccteam init` would after startup.
+        let gamma_dir = paths.projects_root.join("dev-gamma");
+        upsert_project(
+            &paths.root,
+            ProjectEntry {
+                slug: "dev-gamma".to_string(),
+                path: gamma_dir.clone(),
+                team: "dev".to_string(),
+                installed_at: chrono::Utc::now(),
+            },
+        )
+        .unwrap();
+
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        gateway.enable_project_creation(paths);
+
+        // Not pre-registered in the in-memory map; /cd must reload it from
+        // config.yaml on the miss (before the fix this returned
+        // "unknown project: dev-gamma").
+        let reply = gateway
+            .handle_text("mock", "chat-1", "alice", "/cd dev-gamma")
+            .await
+            .unwrap();
+        assert!(
+            reply.iter().any(|r| r.contains("project set to dev-gamma")),
+            "expected /cd to resolve the config-only project, got {reply:?}"
+        );
     }
 
     #[tokio::test]
