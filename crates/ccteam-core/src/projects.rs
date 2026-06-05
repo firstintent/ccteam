@@ -13,7 +13,7 @@ use crate::state::ProjectState;
 use crate::team::TeamSpec;
 use crate::team_resolver::TeamResolveContext;
 use crate::templates::{
-    write_global_helper_templates, write_project_settings, EnabledPluginsSetting,
+    write_global_helper_templates, write_project_settings, EnabledPluginsSetting, CTO_ROLE_MD,
 };
 
 /// Slugify a free-text project request: keep `[a-z0-9]`, collapse other
@@ -315,6 +315,19 @@ pub fn bootstrap_project_at_dir(
         let body = render_project_claude_md(slug, team, resolved_spec.as_ref());
         std::fs::write(&claude_md, body)
             .with_context(|| format!("write {}", claude_md.display()))?;
+    }
+
+    // v8.3 session=role: IM/chat sessions launch `claude --agent cto`
+    // by default, so the `cto` persona must exist in every project this
+    // path creates (IM `/newproject` + gateway create_project). Write
+    // only when absent so a user-edited persona survives.
+    let claude_agents_dir = project_dir.join(".claude").join("agents");
+    std::fs::create_dir_all(&claude_agents_dir)
+        .with_context(|| format!("create {}", claude_agents_dir.display()))?;
+    let cto_md = claude_agents_dir.join("cto.md");
+    if !cto_md.exists() {
+        std::fs::write(&cto_md, CTO_ROLE_MD)
+            .with_context(|| format!("write {}", cto_md.display()))?;
     }
 
     Ok(project_dir)

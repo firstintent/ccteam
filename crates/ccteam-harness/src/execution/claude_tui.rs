@@ -254,13 +254,18 @@ async fn pane_runs_claude(backend: &dyn crate::PaneBackend, id: &MuxSessionId) -
 }
 
 /// V0.8 W2c — `MuxSessionSpec` for the dead-pane recreate path: relaunch
-/// `claude --resume <session_id_name>` so Claude reloads the prior
-/// session jsonl (lossless context restore via Anthropic's own CLI).
+/// `claude --agent <role> --resume <session_id_name>` so Claude reloads the
+/// prior session jsonl (lossless context restore via Anthropic's own CLI)
+/// AND re-binds the role persona from `.claude/agents/<role>.md` — the
+/// session-is-the-role keystone (v0.8.6 W1; resume must carry `--agent`
+/// because Anthropic does not persist the agent binding into the jsonl).
 fn spec_for_resume(role: &str, slug: &str, cwd: &Path, session_id_name: &str) -> MuxSessionSpec {
     MuxSessionSpec::new(
         chat_session_name(slug, role),
         vec![
             claude_bin(),
+            "--agent".to_string(),
+            role.to_string(),
             "--dangerously-skip-permissions".to_string(),
             "--resume".to_string(),
             session_id_name.to_string(),
@@ -272,20 +277,26 @@ fn spec_for_resume(role: &str, slug: &str, cwd: &Path, session_id_name: &str) ->
 }
 
 /// V0.8 W2c — `MuxSessionSpec` for the `--resume` failure fallback: fresh
-/// `claude --name <session_id_name>` (no context carry-over; pairs with
-/// the `chat_session_reset` event the caller emits).
+/// `claude --agent <role> --name <session_id_name>` (no context carry-over;
+/// pairs with the `chat_session_reset` event the caller emits). Delegates to
+/// [`spec_for_new`], so it inherits the `--agent <role>` persona binding
+/// (v0.8.6 W1 session-is-the-role keystone).
 fn spec_for_fresh(role: &str, slug: &str, cwd: &Path, session_id_name: &str) -> MuxSessionSpec {
     spec_for_new(role, slug, cwd, session_id_name)
 }
 
 /// V0.8 W2c — `MuxSessionSpec` for the brand-new (session-absent) path:
-/// `claude --name <session_id_name>` so Anthropic files the session jsonl
-/// under a deterministic name, enabling future recreate-path `--resume`.
+/// `claude --agent <role> --name <session_id_name>` so Anthropic files the
+/// session jsonl under a deterministic name (enabling future recreate-path
+/// `--resume`) AND binds the role persona from `.claude/agents/<role>.md` —
+/// the session-is-the-role keystone (v0.8.6 W1).
 fn spec_for_new(role: &str, slug: &str, cwd: &Path, session_id_name: &str) -> MuxSessionSpec {
     MuxSessionSpec::new(
         chat_session_name(slug, role),
         vec![
             claude_bin(),
+            "--agent".to_string(),
+            role.to_string(),
             "--dangerously-skip-permissions".to_string(),
             "--name".to_string(),
             session_id_name.to_string(),

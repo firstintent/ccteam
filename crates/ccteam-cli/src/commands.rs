@@ -637,14 +637,17 @@ agents:
 
 /// Default `.claude/agents/<role>.md` scaffolds written by `ccteam init`.
 ///
-/// Source-of-truth files live in the repo's top-level `agents/` dir; we
-/// `include_str!` them at compile time so the binary is self-contained
-/// but the templates stay editable as proper agent .md files (with
-/// Anthropic frontmatter + system prompt body).
+/// v8.3 session=role: the default seed is the `cto` persona, sourced from
+/// [`ccteam_core::CTO_ROLE_MD`] (single source — the same const core
+/// `bootstrap_project_at_dir` seeds, so the CLI + IM/gateway create paths
+/// agree). IM/chat sessions launch `claude --agent cto` by default, so
+/// `cto.md` must exist in every project. Embedded `include_str!` agent
+/// `.md` files (with Anthropic frontmatter + system prompt body) keep the
+/// binary self-contained while staying editable as proper agent files.
 ///
-/// To add an agent scaffold:
-/// 1. Write `agents/<role>.md` at the repo root (proper frontmatter spec)
-/// 2. Add a `(filename, include_str!(...))` row here
+/// To change the default agent scaffold:
+/// 1. Edit the persona body (core `templates/cto_role.md` for `cto`)
+/// 2. Adjust the `(filename, body)` row here if the role changes
 /// 3. Update `DEFAULT_WORKFLOW_YAML` to declare the role if it's a
 ///    default-shipped agent
 /// 4. `cargo build --workspace` + `cargo test --workspace`
@@ -656,8 +659,7 @@ agents:
 /// `scaffold_default_agents` when `mode == AgentTeam`. `doctor
 /// --install-agents` (V0.5.x F93x) will pull it from
 /// [`AGENT_TEAM_LEAD_MD`] independently.
-pub(crate) const DEFAULT_AGENT_SCAFFOLDS: &[(&str, &str)] =
-    &[("explorer.md", include_str!("../../../agents/explorer.md"))];
+pub(crate) const DEFAULT_AGENT_SCAFFOLDS: &[(&str, &str)] = &[("cto.md", ccteam_core::CTO_ROLE_MD)];
 
 /// V0.5.0 F93b — embedded `__lead.md` body (ccteam-managed agent-team
 /// lead spec). Written into `.claude/agents/__lead.md` by
@@ -5998,12 +6000,12 @@ mod tests {
         assert!(target
             .join(".claude")
             .join("agents")
-            .join("explorer.md")
+            .join("cto.md")
             .is_file());
         assert!(target
             .join(".ccteam")
             .join("agents")
-            .join("explorer.md")
+            .join("cto.md")
             .is_file());
         assert!(target
             .join(".ccteam")
@@ -6341,7 +6343,7 @@ mod tests {
         let wf_path = target.join(".ccteam").join("workflow.yaml");
         std::fs::write(&wf_path, "USER WORKFLOW\n").unwrap();
         std::fs::write(
-            target.join(".claude").join("agents").join("explorer.md"),
+            target.join(".claude").join("agents").join("cto.md"),
             "USER AGENT\n",
         )
         .unwrap();
@@ -6360,8 +6362,7 @@ mod tests {
             "USER WORKFLOW\n"
         );
         assert_eq!(
-            std::fs::read_to_string(target.join(".claude").join("agents").join("explorer.md"))
-                .unwrap(),
+            std::fs::read_to_string(target.join(".claude").join("agents").join("cto.md")).unwrap(),
             "USER AGENT\n"
         );
     }
@@ -6417,7 +6418,7 @@ mod tests {
         let wf_path = target.join(".ccteam").join("workflow.yaml");
         std::fs::write(&wf_path, "USER WORKFLOW\n").unwrap();
         std::fs::write(
-            target.join(".claude").join("agents").join("explorer.md"),
+            target.join(".claude").join("agents").join("cto.md"),
             "USER AGENT\n",
         )
         .unwrap();
@@ -6436,8 +6437,7 @@ mod tests {
             "workflow must survive --reset-agents",
         );
         assert_ne!(
-            std::fs::read_to_string(target.join(".claude").join("agents").join("explorer.md"))
-                .unwrap(),
+            std::fs::read_to_string(target.join(".claude").join("agents").join("cto.md")).unwrap(),
             "USER AGENT\n",
             "agents must be overwritten by --reset-agents",
         );

@@ -235,6 +235,12 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
         in_menu: false,
     },
     GatewayCommandSpec {
+        name: "/role",
+        arg_hint: Some("<role>"),
+        help: "switch the current session to a fresh agent role",
+        in_menu: false,
+    },
+    GatewayCommandSpec {
         name: "/cd",
         arg_hint: Some("<project>"),
         help: "switch project",
@@ -649,13 +655,22 @@ impl Gateway {
             }
             "/new" => {
                 let vendor = parse_vendor(parts.next().unwrap_or("claude"))?;
-                let role = parts.next().unwrap_or("assistant").to_string();
+                let role = parts.next().unwrap_or("cto").to_string();
                 let project = self.current_project_for(chat);
                 let handle = role.clone();
                 let session_id = self
                     .start_session(chat.clone(), project, vendor, role, handle)
                     .await?;
                 Ok(Some(format!("created session {session_id}")))
+            }
+            "/role" => {
+                let role = parts
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| anyhow!("用法: /role <role>"))?
+                    .to_string();
+                let sid = self.switch_current_role(chat, role.clone()).await?;
+                Ok(Some(format!("switched session {sid} to role {role}")))
             }
             "/use" => {
                 let id = parts
@@ -775,7 +790,7 @@ impl Gateway {
             // A single registered bot template spawns on demand — UNLESS the
             // user explicitly `/cd`'d to a different project. An explicit `/cd`
             // target wins over the template so the project switch is honoured:
-            // fall through to a generic assistant in the requested project
+            // fall through to a default `cto` agent in the requested project
             // rather than silently dragging the message back into the bot's
             // project. (Tradeoff: the bot's role/vendor are not reused once you
             // `/cd` off its project.)
@@ -801,8 +816,8 @@ impl Gateway {
             chat.clone(),
             project,
             AgentVendor::Claude,
-            "assistant".to_string(),
-            "assistant".to_string(),
+            "cto".to_string(),
+            "cto".to_string(),
         )
         .await?;
         Ok(())
@@ -891,6 +906,84 @@ impl Gateway {
         self.persist_state()?;
         self.spawn_event_pump(&id);
         Ok(id)
+    }
+
+    /// Switch the chat's CURRENT session to run `role` (W1 `/role`). Start-time
+    /// binding: the pane is `(project, role)`, so a role change is a *different*
+    /// pane — close the old one and re-spawn a fresh `--agent <role>` thread,
+    /// reusing the SAME gateway session id so `/use <sid>` keeps resolving. No
+    /// dedup here (unlike `start_session`): the new pane never collides with the
+    /// old role's pane, and an explicit `/role` always wants a fresh agent.
+    async fn switch_current_role(&mut self, chat: &ChatKey, role: String) -> Result<String> {
+        let sid = self
+            .current_session
+            .get(chat)
+            .cloned()
+            .ok_or_else(|| anyhow!("/role 需要一个活动会话:先 /new 或发条消息再切换。"))?;
+        let old = self
+            .sessions
+            .get(&sid)
+            .ok_or_else(|| anyhow!("current session missing: {sid}"))?;
+        // Already this role → no-op (a fresh re-spawn would needlessly drop
+        // the live pane's context for no behavioral change).
+        if old.role == role {
+            return Ok(sid);
+        }
+        let project = old.project.clone();
+        let vendor = old.vendor;
+        let owner = old.owner.clone();
+        let old_thread = old.thread.clone();
+        let old_adapter = Arc::clone(&old.adapter);
+        let cwd = self
+            .projects
+            .get(&project)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown project: {project}"))?;
+
+        // Tear down the old pane + its event pump before re-spawning so the
+        // single (project, role) pane invariant holds and no stale pump keeps
+        // draining the retired transcript.
+        if let Some(pump) = self.event_pumps.remove(&sid) {
+            pump.abort();
+        }
+        let _ = old_adapter.close_thread(&old_thread).await;
+
+        let adapter = (self.adapter_factory)(vendor);
+        let thread = adapter
+            .start_thread(
+                &AgentSpecBrief { role: role.clone() },
+                &SpawnCtx {
+                    slug: project.clone(),
+                    sid: sid.clone(),
+                    cwd: cwd.clone(),
+                    project_dir: cwd,
+                    extra_args: vec![],
+                    model_id: None,
+                },
+            )
+            .await?;
+        // Replace the record in place: same sid, new role/handle/thread, fresh
+        // pane counters; replies route back to the owner (the chat that drives
+        // it), matching `start_session`.
+        self.sessions.insert(
+            sid.clone(),
+            GatewaySession {
+                id: sid.clone(),
+                owner: owner.clone(),
+                project,
+                role: role.clone(),
+                vendor,
+                handle: role,
+                thread,
+                adapter,
+                visible_events: Arc::new(AtomicU64::new(0)),
+                reply_to: Arc::new(std::sync::Mutex::new(owner)),
+            },
+        );
+        self.current_session.insert(chat.clone(), sid.clone());
+        self.persist_state()?;
+        self.spawn_event_pump(&sid);
+        Ok(sid)
     }
 
     fn spawn_event_pump(&mut self, session_id: &str) {
@@ -2369,7 +2462,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "after pair")
             .await
             .unwrap();
-        assert_eq!(reply, vec!["alpha-assistant-s1 echo: after pair"]);
+        assert_eq!(reply, vec!["alpha-cto-s1 echo: after pair"]);
         assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
     }
 
@@ -3017,16 +3110,13 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "where am i")
             .await
             .unwrap();
-        assert_eq!(reply, vec!["beta-assistant-s2 echo: where am i"]);
+        assert_eq!(reply, vec!["beta-cto-s2 echo: where am i"]);
 
         let after = gateway
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(
-            after,
-            vec!["s1:alpha:Claude:reviewer\ns2:beta:Claude:assistant"]
-        );
+        assert_eq!(after, vec!["s1:alpha:Claude:reviewer\ns2:beta:Claude:cto"]);
     }
 
     #[tokio::test]
@@ -3084,7 +3174,7 @@ mod tests {
         );
 
         // /cd to a different project than the bot's: the explicit target wins,
-        // so the next message spawns a generic assistant in beta, not the bot.
+        // so the next message spawns a default `cto` agent in beta, not the bot.
         gateway
             .handle_text("mock", "chat-1", "alice", "/cd beta")
             .await
@@ -3093,7 +3183,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "hello")
             .await
             .unwrap();
-        assert_eq!(reply, vec!["beta-assistant-s1 echo: hello"]);
+        assert_eq!(reply, vec!["beta-cto-s1 echo: hello"]);
     }
 
     #[tokio::test]
@@ -3266,6 +3356,73 @@ mod tests {
             2,
             "expected 2 deduped sessions: {}",
             listing[0]
+        );
+    }
+
+    /// W1 `/role` — switch the chat's CURRENT session to a fresh `--agent
+    /// <role>` while keeping the SAME gateway session id, so a follow-up turn
+    /// routes to the new role and `/use <sid>` still resolves. Also covers the
+    /// no-active-session error path and that `/help` advertises `/role`.
+    /// Sink-less (sync reply path), matching the other `*_echoes` tests.
+    #[tokio::test]
+    async fn gateway_role_switches_current_session_in_place() {
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+
+        // No active session yet → `/role` returns the helpful Chinese error.
+        let no_session = gateway
+            .handle_text("mock", "chat-1", "alice", "/role reviewer")
+            .await
+            .expect_err("/role with no active session should error");
+        assert!(
+            format!("{no_session:#}").contains("活动会话"),
+            "expected the no-active-session hint: {no_session:#}"
+        );
+
+        // Start a default `cto` session (s1) and confirm the role binding.
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new")
+            .await
+            .unwrap();
+        let cto_reply = gateway
+            .handle_text("mock", "chat-1", "alice", "hi")
+            .await
+            .unwrap();
+        assert_eq!(cto_reply, vec!["alpha-cto-s1 echo: hi"]);
+
+        // /role flips s1 to `reviewer` in place — same sid, fresh agent.
+        let switched = gateway
+            .handle_text("mock", "chat-1", "alice", "/role reviewer")
+            .await
+            .unwrap();
+        assert_eq!(switched, vec!["switched session s1 to role reviewer"]);
+
+        // A follow-up turn now routes to the reviewer pane under the SAME sid.
+        let after = gateway
+            .handle_text("mock", "chat-1", "alice", "still here?")
+            .await
+            .unwrap();
+        assert_eq!(after, vec!["alpha-reviewer-s1 echo: still here?"]);
+
+        // The session list shows the new role bound to the same sid (no s2).
+        let listing = gateway
+            .handle_text("mock", "chat-1", "alice", "/sessions")
+            .await
+            .unwrap();
+        assert_eq!(listing, vec!["s1:alpha:Claude:reviewer"]);
+
+        // `/use s1` still resolves the same (now-reviewer) session.
+        let used = gateway
+            .handle_text("mock", "chat-1", "alice", "/use s1")
+            .await
+            .unwrap();
+        assert_eq!(used, vec!["using session s1"]);
+
+        // /help advertises /role.
+        assert!(
+            render_help().contains("/role"),
+            "render_help should list /role: {}",
+            render_help()
         );
     }
 

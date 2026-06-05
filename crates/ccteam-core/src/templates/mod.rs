@@ -79,6 +79,13 @@ pub use squad_roster::{render_squad_roster_en, render_squad_roster_zh, TeammateI
 /// the new shape.
 pub const PROJECT_SETTINGS_JSON: &str = include_str!("settings.json");
 
+/// v8.3 session=role: the default `cto` persona seeded into every
+/// project's `.claude/agents/cto.md` by `ccteam init` + core
+/// `bootstrap_project_at_dir`. IM/chat sessions launch
+/// `claude --agent cto` by default, so this file must exist in every
+/// ccteam-created project. Single source for both seed paths.
+pub const CTO_ROLE_MD: &str = include_str!("cto_role.md");
+
 /// V0.5.0 F93b + F94 — per-project `.claude/settings.json` template for
 /// `mode: agent-team` workflows. Same shape as
 /// [`PROJECT_SETTINGS_JSON`] (`__CCTEAM_BIN__` placeholder) plus three

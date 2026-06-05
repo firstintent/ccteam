@@ -267,6 +267,10 @@ async fn fresh_spawn_argv_contains_name_flag() {
         "fresh argv must contain --name flag; got: {argv}"
     );
     assert!(
+        argv.contains(&format!("--agent {role}")),
+        "fresh argv must carry --agent <role> (session-is-the-role keystone); got: {argv}"
+    );
+    assert!(
         argv.contains(&expected_id),
         "fresh argv must contain the deterministic session id `{expected_id}`; got: {argv}"
     );
@@ -325,6 +329,10 @@ async fn recreate_dead_pane_spawn_argv_contains_resume_flag() {
     assert!(
         argv.contains("--resume"),
         "recreate argv must contain --resume flag; got: {argv}"
+    );
+    assert!(
+        argv.contains(&format!("--agent {role}")),
+        "recreate argv must carry --agent <role> (resume must re-bind persona); got: {argv}"
     );
     assert!(
         argv.contains(&expected_id),
@@ -393,8 +401,16 @@ async fn resume_failure_falls_back_to_fresh_name() {
         "first invocation must be --resume <name>; got: {first}"
     );
     assert!(
+        first.contains(&format!("--agent {role}")),
+        "first invocation (--resume) must carry --agent <role>; got: {first}"
+    );
+    assert!(
         second.contains("--name") && second.contains(&expected_id),
         "second invocation must be --name <name> (fallback); got: {second}"
+    );
+    assert!(
+        second.contains(&format!("--agent {role}")),
+        "fallback (--name) must still carry --agent <role>; got: {second}"
     );
     assert!(
         !second.contains("--resume"),
@@ -557,6 +573,15 @@ async fn cwd_collision_two_roles_distinct_names() {
         combined.contains(&id_b),
         "argv log must contain role-B id `{id_b}`; got:\n{combined}"
     );
+    // Each spawn carries its own --agent <role> binding (no crossed personas).
+    assert!(
+        combined.contains(&format!("--agent {role_a}")),
+        "argv log must carry --agent {role_a}; got:\n{combined}"
+    );
+    assert!(
+        combined.contains(&format!("--agent {role_b}")),
+        "argv log must carry --agent {role_b}; got:\n{combined}"
+    );
     assert_ne!(id_a, id_b, "the two role ids must differ");
 
     kill_session_quiet(&session_a);
@@ -656,6 +681,11 @@ async fn daemon_restart_uses_resume_route() {
         "cycle 1 spawn must use --name; got: {}",
         lines_after_first[0]
     );
+    assert!(
+        lines_after_first[0].contains(&format!("--agent {role}")),
+        "cycle 1 spawn must carry --agent <role>; got: {}",
+        lines_after_first[0]
+    );
 
     // Simulate daemon kill: kill the tmux session entirely (orphan
     // cleanup), then re-setup a dead-pane session so start_thread sees
@@ -677,6 +707,10 @@ async fn daemon_restart_uses_resume_route() {
     assert!(
         second_argv.contains("--resume") && second_argv.contains(&expected_id),
         "cycle 2 spawn must use --resume <name>; got: {second_argv}"
+    );
+    assert!(
+        second_argv.contains(&format!("--agent {role}")),
+        "cycle 2 spawn (--resume) must carry --agent <role>; got: {second_argv}"
     );
 
     kill_session_quiet(&session_name);
