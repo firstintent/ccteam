@@ -4,7 +4,8 @@
 > Scope = full v0.8.6（A 主线 + items 1/2/3/4/E/F + G 全量 API）。harness = **claude-code 先跑通**，codex best-effort，gemini-cli/grok-cli/pi/DeepSeek-Reasonix 后续 adapter（capabilities 动态加）。
 
 ## 0. 开发顺序 + 理由（给新 dev session）
-**本文档供 dev session 执行；设计/meta session 不写代码。** 起手读 `prd.md` 全文 + 本文；每 wave = 独立 worktree（`git worktree add -b v086-wN /tmp/ccteam-wN origin/main`）+ 一个 PR + `wave-N-handoff.md`（Decided/Rejected/Risks/Files/Remaining）；verify-gated：baseline ≥ 上 wave、clippy 0、`cargo fmt --all` 干净，**不过测试不算完成**。
+**本文档供 dev session 执行；设计/meta session 不写代码。** 起手读 `prd.md` 全文 + 本文；每 wave = 独立 worktree（`git worktree add -b v086-wN /tmp/ccteam-wN origin/dev` —— **从 `dev` 切**，v0.8.6 docs 在 dev 上；PR 回 dev）+ 一个 PR + `wave-N-handoff.md`（Decided/Rejected/Risks/Files/Remaining）；verify-gated：baseline ≥ 上 wave、clippy 0、`cargo fmt --all` 干净，**不过测试不算完成**。
+> 注：`CLAUDE.md` 的【架构 + 红线】部分已 stale（W6 重写），但其【纪律】部分（§五 PR 流程 / §六 实战坑 / §七 fmt）仍有效、照守。
 
 **顺序：W1 → W2 → W3 → W4 → W5 → W6。理由：**
 1. **W1 session=role 先做（de-risk + 头部价值）**：`claude --agent <role>` 在我们 tmux send-keys + resume 路径能否跑通是**第一风险**（能力官方有，接法未实证）—— 先用 smoke gate 验掉；万一不成立整个模型要改，越早越好。且 W1 完即可 IM 里跟 cto 对话 = 最快出价值。（考虑过"清理先行"，但 de-risk 基石优先级更高。）
