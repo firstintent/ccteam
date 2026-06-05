@@ -12,9 +12,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
-use ccteam_core::config::{upsert_project, ProjectEntry};
+use ccteam_core::config::{upsert_project, CcteamConfig, ProjectEntry};
 use ccteam_core::projects::{bootstrap_project_at_dir, validate_slug_format};
-use ccteam_core::CcteamPaths;
+use ccteam_core::{CcteamPaths, HotConfig};
 use ccteam_harness::{
     chat_session_name, parse_chat_session_name, AgentSpecBrief, AgentVendor, ChoicePrompt,
     ChoiceSelection, Directive, DirectiveOutcome, HarnessAdapter, ProcessBackend, SpawnCtx,
@@ -97,6 +97,12 @@ pub struct Gateway {
     /// `None` in unit tests that don't exercise project creation; the
     /// daemon sets it via [`Gateway::enable_project_creation`].
     project_paths: Option<CcteamPaths>,
+    /// Hot-reloaded view of `~/.ccteam/config.yaml` (re-parsed only on mtime
+    /// change; pull-based, no watcher). `Some` once the daemon calls
+    /// [`Gateway::enable_project_creation`]; lets `/cd` resolve a project
+    /// registered after daemon start without a restart — config.yaml is the
+    /// source of truth, `projects` is just a cache. `None` in unit tests.
+    config: Option<HotConfig<CcteamConfig>>,
 }
 
 /// How the daemon should deliver a [`GatewayEvent`] (V0.8.4 P1).
@@ -328,6 +334,7 @@ impl Gateway {
                 crate::pending::PendingInteractions::new(),
             )),
             project_paths: None,
+            config: None,
         }
     }
 
@@ -361,6 +368,15 @@ impl Gateway {
     /// wires this; unit tests that don't create projects leave it unset
     /// (the command then reports it's unavailable).
     pub fn enable_project_creation(&mut self, paths: CcteamPaths) {
+        // Build the hot-reloaded config.yaml view: stat-on-read, re-parse only
+        // when its mtime advances (pull-based; respects the "no file-watch"
+        // red line). `/cd` resolves projects through this, so a project added
+        // by `ccteam init` after startup is picked up without a daemon restart.
+        let root = paths.root.clone();
+        self.config = Some(HotConfig::new(
+            ccteam_core::config::config_path(&root),
+            move || ccteam_core::config::load(&root),
+        ));
         self.project_paths = Some(paths);
     }
 
@@ -476,11 +492,15 @@ impl Gateway {
         if self.projects.contains_key(slug) {
             return;
         }
-        let Some(root) = self.project_paths.as_ref().map(|p| p.root.clone()) else {
-            return;
+        // Read the hot-reloaded config.yaml (re-parsed only on mtime change);
+        // resolve the Arc before touching self.projects so the borrow on
+        // self.config is released first.
+        let cfg = match self.config.as_ref().map(|c| c.get()) {
+            Some(Ok(cfg)) => cfg,
+            _ => return,
         };
-        if let Ok(Some(entry)) = ccteam_core::config::lookup_project(&root, slug) {
-            self.projects.insert(slug.to_string(), entry.path);
+        if let Some(entry) = cfg.projects.iter().find(|p| p.slug == slug) {
+            self.projects.insert(slug.to_string(), entry.path.clone());
         }
     }
 

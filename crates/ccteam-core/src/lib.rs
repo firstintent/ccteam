@@ -39,6 +39,9 @@ pub mod defaults;
 pub mod execution;
 // V0.6.0 F115 — agent handoff doc mechanism (`.ccteam/handoffs/`).
 pub mod handoff;
+// v0.8.6 — generic pull-based hot-reload wrapper for on-disk config
+// (stat-on-read, mtime-cached; no file-watch).
+pub mod hot_config;
 // V0.6.1 F139 — embedded `~/.ccteam/hooks/hook.sh` dispatcher + install
 // helper. Routes Claude Code hooks through the long-running daemon's
 // HTTP server for a ~20× latency reduction.
@@ -151,6 +154,9 @@ pub use handoff::{
     WriteHandoffOptions, DEFAULT_INCLUDE_LAST_N as DEFAULT_HANDOFF_INCLUDE_LAST_N,
     HANDOFFS_DIRNAME, HANDOFF_TEMPLATE,
 };
+// v0.8.6 — generic config hot-reload wrapper (used by the IM gateway for
+// config.yaml; reusable for any future config file).
+pub use hot_config::HotConfig;
 // V0.6.1 F139 — `~/.ccteam/hooks/hook.sh` dispatcher install entry.
 pub use hooks_dispatcher::{install_hooks, InstallHooksAction, HOOK_DISPATCHER_SH};
 // V0.6.0 F115 — spawn-brief template renderer.

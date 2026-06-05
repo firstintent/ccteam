@@ -29,7 +29,7 @@
 | 项 | 值 |
 |---|---|
 | Workspace version | `0.8.5` |
-| 测试 baseline | `1910/0`(`cargo test --workspace --locked --no-fail-fast --exclude ccteam-web`;`ccteam-web` ws_* 测试留 CI/专机)|
+| 测试 baseline | `1912/0`(`cargo test --workspace --locked --no-fail-fast --exclude ccteam-web`;`ccteam-web` ws_* 测试留 CI/专机)|
 | Clippy | 0 errors + 0 warnings(`cargo clippy --workspace --all-targets -- -D warnings`)|
 | 当前在做 | **v0.8.5 已落地「IM 命令面全量覆盖 + /sessions 状态 + 菜单 + skill 双装」**(D1 中立命令面 `handle_directive`/`ChoicePrompt` + D2 Codex 全量映射 + D2.4 `CodexThreadTracker` + D3/D4 弹窗两段式 + D5 Claude 四通道 gate + D6 AskUserQuestion hook + F10 codex stdio transport 单轴 + P1 菜单 + P3 `/sessions` 状态 + P4 skill 双装;**用户 review 后修复**:B1/B1b 安全门 drop 空 content(按钮选择 + 无 caption 文件)、S1 D6 hook fast-path 死锁、S2 pending TTL、S3 /sessions UTF-8 边界、mcp-serve 用 canonical `internal mcp-serve` args + idle 默认关闭;PRD/handoff 见 `docs/versions/v0-8-5/`) |
 
