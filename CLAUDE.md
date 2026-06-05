@@ -7,7 +7,7 @@
 
 ## 〇、v0.8.3 / v8.3 当前架构红线
 
-本仓已落地 **v8.3「云 CC/Codex + IM + Web」真实路径收敛**(版本号 `0.8.3`):架构 SoT 是 `docs/tech-design.md` 与本文(**协议细节一律以代码为准**,见 tech-design 末尾「协议 → 代码位置」指针表);UX/概念原型见 `docs/im.html`(crate 拓扑以本节 + tech-design §3.1 的 `core→harness→cost` 为准)。**下文若仍有 V0.6.x / orchestrator-era 术语残留,以本节为准:**
+本仓已落地 **v8.3「云 CC/Codex + IM + Web」真实路径收敛**(版本号 `0.8.3`):架构 SoT 是 `docs/tech-design.md` 与本文(**协议细节一律以代码为准**,见 tech-design 末尾「协议 → 代码位置」指针表);UX/概念原型见 `docs/versions/v0-8-1/im.html`(crate 拓扑以本节 + tech-design §3.1 的 `core→harness→cost` 为准)。**下文若仍有 V0.6.x / orchestrator-era 术语残留,以本节为准:**
 
 - **改名/重构已收敛**:`ccteam-mux`→`ccteam-harness`、`MuxBackend`→`ProcessBackend`、`ccteam-imd`→`ccteam-im`;orchestrator 从 `ccteam-core` 抽到 `ccteam-flow`(core 瘦成 primitives leaf)。拓扑保持 `core -> harness -> cost`,不要翻成 `harness -> core`。
 - **执行层两轴**:`HarnessAdapter`(vendor 怎么驱动:Claude=tmux+send-keys+transcript+hook;Codex=app-server JSON-RPC)× `ProcessBackend`(进程跑哪:tmux/inproc/remote);tmux pane 操作只属于 `PaneBackend` 子 trait。两 vendor 归一成中立 `CanonicalEvent` + `ApprovalIR`(**不**抄 alleycat 的 codex-emulation)。
@@ -20,7 +20,7 @@
 - **vendor 选型**:Claude→tmux(全 TUI + 耐久 + 已有);Codex→app-server(原生、文档化)。per-adapter best-fit,不强行统一。
 - **progress 写入权威**:`harness/progress_bridge` 是 schema 单一权威,`core` 只 re-export。
 
-> 验证优先用确定性 fake(`CCTEAM_{CLAUDE,CODEX}_BIN`)和真实 WS smoke;不退 baseline。起手/恢复先读本文 §一 + `docs/tech-design.md`(架构 SoT);`docs/im.html` 是 UX/概念原型,按需查。
+> 验证优先用确定性 fake(`CCTEAM_{CLAUDE,CODEX}_BIN`)和真实 WS smoke;不退 baseline。起手/恢复先读本文 §一 + `docs/tech-design.md`(架构 SoT);`docs/versions/v0-8-1/im.html` 是 UX/概念原型,按需查。
 
 ---
 
@@ -55,7 +55,7 @@
 | `docs/requirements.md` | 原始需求(核心痛点 = 验收基准) | 验收基准 / PR 痛点映射 |
 | `docs/usage.md` | 用户命令手册(install→start→use→运维,纯命令) | 看怎么用 |
 
-历史版本归档 `docs/versions/v0-X-Y/README.md`(冻结、按需);探索研究 `docs/research/`(不更新、按需);UX 概念原型 `docs/im.html`、v0.8.3 原型 `docs/versions/v0-8-3/prd.html`。这些都**不**自动进上下文。
+历史版本归档 `docs/versions/v0-X-Y/README.md`(冻结、按需);探索研究 `docs/research/`(不更新、按需);UX 概念原型 `docs/versions/v0-8-1/im.html`、v0.8.3 原型 `docs/versions/v0-8-3/prd.html`。这些都**不**自动进上下文。
 
 **起手 30 秒**:`git log -1` 看 HEAD → `cargo test --workspace --exclude ccteam-web 2>&1 | awk '/^test result/{p+=$4;f+=$6}END{print p,f}'` 记基线 → 读用户诉求 → 干。
 

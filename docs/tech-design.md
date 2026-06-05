@@ -1,5 +1,7 @@
 # ccteam 技术实现方案
 
+> **⚠ v0.8.6 重写中（2026-06-05）**：架构正在大改（session=role / 默认 `cto` / harness×provider / 标准资源 API / init 不再生成 CLAUDE.md·AGENTS.md / hook→`settings.local.json` / skill→~0 / MCP 瘦身 / `project rm`·`stop`）。**开发期（W1–W5）目标架构 SoT = `docs/versions/v0-8-6/prd.md §0 + items` 与 `dev-plan.md`**；本文下方仍描述旧 v8.3 模型、部分 stale（尤其 §0 的 **R9「AGENTS.md→CLAUDE.md symlink」、R10「projects_root/<team>-<slug>」已被 v0.8.6 改写**）。**仍有效**：crate 拓扑 `core→harness→cost`、`HarnessAdapter×ProcessBackend`、gateway 不 tick、resume-by-id。本文 + 「协议→代码」指针表由 **W6（代码落地后）全量重写**。
+
 > 本文档基于 [requirements.md](./requirements.md)（已确认的用户痛点）给出 ccteam 当前的技术架构、组件分解、数据协议、扩展点映射。
 >
 > **产品定位**：「云 CC/Codex + IM + Web」—— 把一个常驻 gateway daemon 架在你机器上的真实 Claude Code / Codex 之上,让你在 IM(Telegram 等)或 web 控制台里像用一台终端一样,跨多个项目、多个 session 操作真实 agent。
