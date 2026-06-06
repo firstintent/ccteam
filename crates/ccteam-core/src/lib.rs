@@ -267,10 +267,10 @@ pub use tmux::{
 pub use tool_surface::{
     disable_tool_surface_bootstrap_for_tests, ensure_skills_placeholders,
     migrate_legacy_skill_dirs, migrate_recommended_agent_symlinks, missing_tools,
-    remove_cost_accumulate_hooks, rewrite_legacy_hook_commands, user_claude_dir,
-    CostAccumulateScrubAction, CostAccumulateScrubReport, HookCmdRewriteAction,
-    HookCmdRewriteReport, LegacySkillAction, LegacySkillReport, MigrationReport, MissingTool,
-    ToolSurfaceSnapshot, ToolsRequired, BUILTIN_SUBAGENTS,
+    remove_chat_hooks, remove_cost_accumulate_hooks, rewrite_legacy_hook_commands, user_claude_dir,
+    ChatHookScrubAction, ChatHookScrubReport, CostAccumulateScrubAction, CostAccumulateScrubReport,
+    HookCmdRewriteAction, HookCmdRewriteReport, LegacySkillAction, LegacySkillReport,
+    MigrationReport, MissingTool, ToolSurfaceSnapshot, ToolsRequired, BUILTIN_SUBAGENTS,
 };
 pub use transcript_scanner::{resolve_jsonl_path, session_cost_from_jsonl};
 pub use vendor::AgentVendor;

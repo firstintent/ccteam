@@ -1,12 +1,23 @@
-//! V0.4.6 F81 — `ccteam remove <slug>` integration tests.
+//! `ccteam remove <slug>` / `ccteam project rm|stop` integration tests.
 //!
-//! Six scenarios drawn from the dev-plan §阶段 2 test matrix:
-//!   t01_remove_dry_run_prints_only   — no fs change
-//!   t02_remove_basic_drops_config_entry
-//!   t03_purge_clears_ccteam_dir       — `.ccteam/` deleted, business code + .env intact
-//!   t04_refuses_with_active_tmux      — refusal gate fires (tmux mock unavailable in CI → skipped)
-//!   t05_refuses_with_running_claude_bg
-//!   t06_force_overrides_refusal
+//! Covers the reusable remove engine (`run_remove`) reached via both the
+//! flat `ccteam remove` alias and the v0.8.6 W3 `ccteam project` group:
+//!   t01–t02   dry-run + basic deregister (no fs change / config drop)
+//!   t03       --purge deletes ccteam footprint ONLY (W2 layout): .ccteam/
+//!             + seeded cto.md + ccteam hooks in settings.local.json; keeps
+//!             user work-roles, root workflow.yaml, CLAUDE.md, .env,
+//!             settings.json, business code
+//!   t03b/c    surgical settings.local.json hook strip / empty-file delete
+//!   t04–t06   refusal gate (tmux / claude bg / open spawn) + --force
+//!   t07–t08   daemon unroster trigger ack / timeout
+//!   t09–t11   imd/registry/<slug>/ purge semantics
+//!   t12–t13   `ccteam project rm` group routing + dry-run
+//!   t14–t15   `ccteam project stop` (no-session ok / kills matching
+//!             `ccteam-chat-<slug>-*` panes, dash-aware slug match)
+//!   t16–t17   `ccteam project rm` non-purge keeps project files /
+//!             --purge deletes footprint + provably keeps user content
+//!   t18       `ccteam project rm --dry-run` lists stop targets, acts
+//!             on nothing
 //!
 //! All tests sandbox `HOME`, `CCTEAM_HOME`, `CCTEAM_PROJECTS_ROOT`, and
 //! `CCTEAM_CLAUDE_JOBS_DIR` so they never touch the developer's real
@@ -239,20 +250,121 @@ fn t02_remove_basic_drops_config_entry() {
 }
 
 #[test]
-fn t03_purge_clears_ccteam_dir() {
+fn t03_purge_clears_ccteam_footprint_only() {
+    // v0.8.6 W3 — `--purge` deletes exactly ccteam's footprint
+    // (.ccteam/ + seeded cto.md + ccteam hooks in settings.local.json)
+    // and leaves user work-roles, root workflow.yaml, CLAUDE.md, .env,
+    // settings.json, and business code in place.
     let fx = Fixture::new("dex-ui");
     fx.seed_closed_progress();
-    // Drop a `.env` + business file so we can assert they survive.
-    std::fs::write(fx.project_dir.join(".env"), "SECRET=hunter2\n").unwrap();
-    std::fs::write(fx.project_dir.join("README.md"), "# real code\n").unwrap();
+    // .ccteam/ already exists from the fixture; drop a state.json inside
+    // so we can confirm the whole dir goes.
     std::fs::write(
-        fx.project_dir.join("workflow.yaml"),
-        "name: x\nagents: {}\n",
+        fx.project_dir.join(".ccteam").join("workflow.yaml"),
+        "name: x\n",
     )
     .unwrap();
+    // KEEP set:
+    std::fs::write(fx.project_dir.join(".env"), "SECRET=hunter2\n").unwrap();
+    std::fs::write(fx.project_dir.join("README.md"), "# real code\n").unwrap();
+    std::fs::write(fx.project_dir.join("CLAUDE.md"), "# project memory\n").unwrap();
+    // A root-level workflow.yaml is NOT ccteam's footprint post-W2 (it
+    // lives under .ccteam/) — must survive.
+    std::fs::write(fx.project_dir.join("workflow.yaml"), "user: stuff\n").unwrap();
+    // User's committed settings.json — ccteam never touches it.
     std::fs::write(
-        fx.project_dir.join(".claude").join("agents").join("foo.md"),
-        "---\n---\nbody",
+        fx.project_dir.join(".claude").join("settings.json"),
+        "{\"permissions\":{}}\n",
+    )
+    .unwrap();
+    // DELETE set: seeded cto.md. KEEP set: a user work-role beside it.
+    let agents = fx.project_dir.join(".claude").join("agents");
+    std::fs::write(agents.join("cto.md"), "---\n---\nseeded cto").unwrap();
+    std::fs::write(agents.join("reviewer.md"), "---\n---\nuser role").unwrap();
+
+    let out = fx
+        .cmd()
+        .args(["remove", &fx.slug, "--purge"])
+        .output()
+        .expect("spawn ccteam remove --purge");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "remove --purge should succeed; stderr: {stderr}; stdout: {stdout}",
+    );
+
+    // .ccteam/ gone (covers .ccteam/workflow.yaml too).
+    assert!(
+        !fx.project_dir.join(".ccteam").exists(),
+        ".ccteam/ should be purged",
+    );
+    // seeded cto.md gone …
+    assert!(
+        !agents.join("cto.md").exists(),
+        "seeded .claude/agents/cto.md should be purged",
+    );
+    // … but the agents dir + user work-role survive.
+    assert!(
+        agents.join("reviewer.md").exists(),
+        "user work-role .claude/agents/reviewer.md must survive --purge",
+    );
+    assert!(
+        agents.is_dir(),
+        ".claude/agents/ dir must survive (only cto.md is ours)",
+    );
+    // root workflow.yaml is NOT ccteam's footprint post-W2 — must survive.
+    assert!(
+        fx.project_dir.join("workflow.yaml").exists(),
+        "root workflow.yaml must survive --purge (W2: ccteam's lives under .ccteam/)",
+    );
+    // .env preserved — CLAUDE.md §三 red line.
+    assert!(
+        fx.project_dir.join(".env").exists(),
+        ".env must NEVER be deleted; still expected at {}",
+        fx.project_dir.join(".env").display(),
+    );
+    // CLAUDE.md + business code preserved.
+    assert!(
+        fx.project_dir.join("CLAUDE.md").exists(),
+        "project CLAUDE.md must survive --purge",
+    );
+    assert!(
+        fx.project_dir.join("README.md").exists(),
+        "business code must survive --purge",
+    );
+    // User's committed settings.json untouched.
+    assert!(
+        fx.project_dir
+            .join(".claude")
+            .join("settings.json")
+            .exists(),
+        "user settings.json must NEVER be touched by ccteam",
+    );
+}
+
+#[test]
+fn t03b_purge_strips_chat_hooks_surgically_keeps_other_keys() {
+    // settings.local.json holds ccteam chat hooks + an operator key.
+    // --purge must strip only the ccteam hooks and keep the rest (file
+    // survives because it still has a non-ccteam key).
+    let fx = Fixture::new("dex-hooks");
+    fx.seed_closed_progress();
+    let settings_local = fx.project_dir.join(".claude").join("settings.local.json");
+    std::fs::write(
+        &settings_local,
+        r#"{
+  "permissions": {"allow": ["Bash"]},
+  "hooks": {
+    "SessionStart": [{"matcher": "*", "hooks": [{"type": "command", "command": "/h/hook.sh chat-progress session-start"}]}],
+    "PreToolUse": [
+      {"matcher": "*", "hooks": [{"type": "command", "command": "/h/hook.sh chat-progress pre-tool-use"}]},
+      {"matcher": "AskUserQuestion", "hooks": [{"type": "command", "command": "/h/hook.sh intercept-ask", "timeout": 660}]},
+      {"matcher": "Edit", "hooks": [{"type": "command", "command": "/h/my-own-linter.sh"}]}
+    ]
+  }
+}
+"#,
     )
     .unwrap();
 
@@ -268,32 +380,468 @@ fn t03_purge_clears_ccteam_dir() {
         "remove --purge should succeed; stderr: {stderr}; stdout: {stdout}",
     );
 
-    // .ccteam/ gone.
     assert!(
-        !fx.project_dir.join(".ccteam").exists(),
-        ".ccteam/ should be purged",
+        settings_local.exists(),
+        "settings.local.json must survive (operator key + own hook remain)",
     );
-    // workflow.yaml gone.
+    let body = std::fs::read_to_string(&settings_local).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    // Operator key preserved.
     assert!(
-        !fx.project_dir.join("workflow.yaml").exists(),
-        "workflow.yaml should be purged",
+        v.get("permissions").is_some(),
+        "operator `permissions` key must survive; got: {body}",
     );
-    // .claude/agents/ gone.
+    // ccteam chat hooks gone.
     assert!(
-        !fx.project_dir.join(".claude").join("agents").exists(),
-        ".claude/agents/ should be purged",
+        !body.contains("chat-progress") && !body.contains("intercept-ask"),
+        "ccteam chat hooks must be stripped; got: {body}",
     );
-    // .env preserved — CLAUDE.md §三 red line.
+    // SessionStart event array (only had ccteam's hook) pruned entirely.
+    assert!(
+        v.get("hooks").and_then(|h| h.get("SessionStart")).is_none(),
+        "emptied SessionStart event must be pruned; got: {body}",
+    );
+    // Operator's own PreToolUse Edit hook preserved.
+    assert!(
+        body.contains("my-own-linter.sh"),
+        "operator's own PreToolUse hook must survive; got: {body}",
+    );
+}
+
+#[test]
+fn t03c_purge_deletes_settings_local_when_it_collapses_to_empty() {
+    // settings.local.json that holds ONLY ccteam chat hooks is the file
+    // ccteam created — after stripping it collapses to {} and --purge
+    // deletes the vestigial file.
+    let fx = Fixture::new("dex-empty");
+    fx.seed_closed_progress();
+    let settings_local = fx.project_dir.join(".claude").join("settings.local.json");
+    std::fs::write(
+        &settings_local,
+        r#"{
+  "hooks": {
+    "SessionStart": [{"matcher": "*", "hooks": [{"type": "command", "command": "/h/hook.sh chat-progress session-start"}]}],
+    "Stop": [{"matcher": "*", "hooks": [{"type": "command", "command": "/h/hook.sh chat-progress stop"}]}]
+  }
+}
+"#,
+    )
+    .unwrap();
+
+    let out = fx
+        .cmd()
+        .args(["remove", &fx.slug, "--purge"])
+        .output()
+        .expect("spawn ccteam remove --purge");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "remove --purge should succeed; stderr: {stderr}; stdout: {stdout}",
+    );
+    assert!(
+        !settings_local.exists(),
+        "settings.local.json that held only ccteam hooks should be deleted; stdout: {stdout}",
+    );
+    assert!(
+        stdout.contains("removed now-empty"),
+        "step list must report the now-empty file deletion; got: {stdout}",
+    );
+}
+
+/// t12 — the grouped `ccteam project rm` is the same engine as the flat
+/// `ccteam remove`: it drops the config entry and (with --purge) clears
+/// the footprint.
+#[test]
+fn t12_project_rm_alias_drops_config_entry() {
+    let fx = Fixture::new("dex-grp");
+    fx.seed_closed_progress();
+    let progress = fx.paths().progress_jsonl(&fx.slug);
+
+    let out = fx
+        .cmd()
+        .args(["project", "rm", &fx.slug])
+        .output()
+        .expect("spawn ccteam project rm");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "project rm should succeed; stderr: {stderr}; stdout: {stdout}",
+    );
+    let cfg = config::load(&fx.ccteam_home).unwrap();
+    assert!(
+        cfg.projects.iter().all(|p| p.slug != fx.slug),
+        "config.yaml::projects still contains `{}` after project rm",
+        fx.slug,
+    );
+    assert!(
+        !progress.exists(),
+        "progress.jsonl should be deleted by project rm",
+    );
+}
+
+/// t13 — `ccteam project rm --dry-run` acts on nothing.
+#[test]
+fn t13_project_rm_dry_run_acts_on_nothing() {
+    let fx = Fixture::new("dex-grp-dry");
+    let progress = fx.paths().progress_jsonl(&fx.slug);
+    std::fs::create_dir_all(progress.parent().unwrap()).unwrap();
+    std::fs::write(&progress, "{}\n").unwrap();
+
+    let out = fx
+        .cmd()
+        .args(["project", "rm", &fx.slug, "--dry-run"])
+        .output()
+        .expect("spawn ccteam project rm --dry-run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "project rm --dry-run should succeed");
+    assert!(
+        stdout.contains("[dry-run]"),
+        "dry-run header missing; got: {stdout}"
+    );
+    assert!(progress.exists(), "dry-run must not delete progress.jsonl");
+    let cfg = config::load(&fx.ccteam_home).unwrap();
+    assert_eq!(cfg.projects.len(), 1, "dry-run must keep config entry");
+}
+
+/// t14 — `ccteam project stop <slug>` with no live sessions succeeds and
+/// reports zero stopped (stop is not an error when nothing is running).
+/// This is the tmux-free baseline; t15 proves the actual kill path.
+#[test]
+fn t14_project_stop_no_sessions_is_ok() {
+    let fx = Fixture::new("dex-stop");
+    let out = fx
+        .cmd()
+        .args(["project", "stop", &fx.slug])
+        .output()
+        .expect("spawn ccteam project stop");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "project stop must succeed even with no live sessions; stderr: {stderr}",
+    );
+    assert!(
+        stdout.contains("stopped 0 chat sessions"),
+        "stop must report zero sessions stopped; got: {stdout}",
+    );
+}
+
+/// t15 — `ccteam project stop <slug>` kills the matching
+/// `ccteam-chat-<slug>-*` tmux sessions and leaves a sibling project's
+/// session (a slug that is a prefix of ours, to prove the dash-aware
+/// parse) untouched. Guarded by tmux availability.
+#[test]
+fn t15_project_stop_kills_matching_chat_sessions() {
+    use ccteam_harness::chat_session_name;
+    use ccteam_harness::tmux_ops::{tmux_available, TmuxSession};
+
+    if !tmux_available() {
+        eprintln!("skipping t15: tmux not available");
+        return;
+    }
+
+    // Pick a slug whose dash structure would alias a sibling under a
+    // naive `starts_with`: `dex-stop` vs the sibling `dex`. The CLI must
+    // stop only `dex-stop`'s sessions and leave `dex`'s alone.
+    let suffix = std::process::id();
+    let slug = format!("dexstop-{suffix}");
+    let sibling = format!("dexstop-{suffix}-extra"); // longer slug, NOT ours
+    let fx = Fixture::new(&slug);
+
+    let ours_a = chat_session_name(&slug, "cto");
+    let ours_b = chat_session_name(&slug, "reviewer");
+    // sibling's role session — note its (slug, role) parses to
+    // (`dexstop-<id>-extra`, `bob`), a DIFFERENT slug than ours.
+    let sib = chat_session_name(&sibling, "bob");
+
+    // Best-effort pre-clean in case a prior crashed run left them.
+    for name in [&ours_a, &ours_b, &sib] {
+        TmuxSession::from_name(name.clone()).kill().ok();
+    }
+
+    // Create three live detached sessions running a long-lived `sleep`.
+    for name in [&ours_a, &ours_b, &sib] {
+        let status = std::process::Command::new("tmux")
+            .args(["new-session", "-d", "-s", name, "sleep", "300"])
+            .status()
+            .expect("tmux new-session");
+        assert!(status.success(), "pre-create tmux session {name} failed");
+    }
+    assert!(TmuxSession::from_name(ours_a.clone()).exists());
+    assert!(TmuxSession::from_name(ours_b.clone()).exists());
+    assert!(TmuxSession::from_name(sib.clone()).exists());
+
+    let out = fx
+        .cmd()
+        .args(["project", "stop", &slug])
+        .output()
+        .expect("spawn ccteam project stop");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // Always clean the sibling so we don't leak it past the assertions.
+    let sib_alive_after = TmuxSession::from_name(sib.clone()).exists();
+    TmuxSession::from_name(sib.clone()).kill().ok();
+
+    assert!(
+        out.status.success(),
+        "project stop must succeed; stderr: {stderr}; stdout: {stdout}",
+    );
+    assert!(
+        !TmuxSession::from_name(ours_a.clone()).exists(),
+        "our chat session {ours_a} must be killed; stdout: {stdout}",
+    );
+    assert!(
+        !TmuxSession::from_name(ours_b.clone()).exists(),
+        "our chat session {ours_b} must be killed; stdout: {stdout}",
+    );
+    assert!(
+        sib_alive_after,
+        "sibling slug's session {sib} must NOT be killed (dash-aware slug match)",
+    );
+    assert!(
+        stdout.contains("stopped 2 chat sessions"),
+        "stop must report two sessions stopped; got: {stdout}",
+    );
+}
+
+/// t16 — `ccteam project rm` (non-purge) drops the registry + ~/.ccteam
+/// per-slug state but PROVABLY keeps the project's on-disk files
+/// (.ccteam/, seeded cto.md, user role, CLAUDE.md, .env, settings.json).
+#[test]
+fn t16_project_rm_nonpurge_keeps_project_files() {
+    let fx = Fixture::new("dex-keep");
+    fx.seed_closed_progress();
+    let progress = fx.paths().progress_jsonl(&fx.slug);
+    // Seed the ccteam footprint + user content that non-purge must keep.
+    std::fs::write(
+        fx.project_dir.join(".ccteam").join("workflow.yaml"),
+        "name: x\n",
+    )
+    .unwrap();
+    std::fs::write(fx.project_dir.join(".env"), "SECRET=hunter2\n").unwrap();
+    std::fs::write(fx.project_dir.join("CLAUDE.md"), "# memory\n").unwrap();
+    let agents = fx.project_dir.join(".claude").join("agents");
+    std::fs::write(agents.join("cto.md"), "---\n---\nseeded cto").unwrap();
+    std::fs::write(agents.join("reviewer.md"), "---\n---\nuser role").unwrap();
+    std::fs::write(
+        fx.project_dir.join(".claude").join("settings.json"),
+        "{\"permissions\":{}}\n",
+    )
+    .unwrap();
+
+    let out = fx
+        .cmd()
+        .args(["project", "rm", &fx.slug])
+        .output()
+        .expect("spawn ccteam project rm");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "project rm should succeed; stderr: {stderr}; stdout: {stdout}",
+    );
+
+    // Registry + ~/.ccteam state gone …
+    let cfg = config::load(&fx.ccteam_home).unwrap();
+    assert!(
+        cfg.projects.iter().all(|p| p.slug != fx.slug),
+        "config.yaml::projects must drop the slug under project rm",
+    );
+    assert!(
+        !progress.exists(),
+        "progress.jsonl should be deleted by project rm",
+    );
+    // … but EVERY project-dir file survives (non-purge keeps them all).
+    assert!(
+        fx.project_dir.join(".ccteam").is_dir(),
+        ".ccteam/ must survive without --purge",
+    );
+    assert!(
+        agents.join("cto.md").exists(),
+        "seeded cto.md must survive without --purge",
+    );
+    assert!(
+        agents.join("reviewer.md").exists(),
+        "user role must survive without --purge",
+    );
     assert!(
         fx.project_dir.join(".env").exists(),
-        ".env must NEVER be deleted; still expected at {}",
-        fx.project_dir.join(".env").display(),
+        ".env must survive without --purge",
     );
-    // Business code preserved.
     assert!(
-        fx.project_dir.join("README.md").exists(),
-        "business code must survive --purge",
+        fx.project_dir.join("CLAUDE.md").exists(),
+        "CLAUDE.md must survive without --purge",
     );
+    assert!(
+        fx.project_dir
+            .join(".claude")
+            .join("settings.json")
+            .exists(),
+        "user settings.json must survive without --purge",
+    );
+}
+
+/// t17 — `ccteam project rm --purge` deletes ccteam's footprint via the
+/// GROUP path (cto.md + .ccteam/ + settings.local.json hook section +
+/// config entry + ~/.ccteam/{progress,imd/registry}/<slug>) and PROVABLY
+/// keeps a user role, CLAUDE.md, .env, and the user's settings.json.
+#[test]
+fn t17_project_rm_purge_via_group() {
+    let fx = Fixture::new("dex-grp-purge");
+    fx.seed_closed_progress();
+    // imd/registry/<slug>/ — must be purged.
+    let (reg, hb) = seed_imd_registry(&fx, "helper");
+    let slug_dir = ccteam_im::registry_root_in(&fx.ccteam_home).join(&fx.slug);
+    // ccteam footprint.
+    std::fs::write(
+        fx.project_dir.join(".ccteam").join("workflow.yaml"),
+        "name: x\n",
+    )
+    .unwrap();
+    let agents = fx.project_dir.join(".claude").join("agents");
+    std::fs::write(agents.join("cto.md"), "---\n---\nseeded cto").unwrap();
+    // KEEP set.
+    std::fs::write(agents.join("reviewer.md"), "---\n---\nuser role").unwrap();
+    std::fs::write(fx.project_dir.join(".env"), "SECRET=hunter2\n").unwrap();
+    std::fs::write(fx.project_dir.join("CLAUDE.md"), "# memory\n").unwrap();
+    std::fs::write(
+        fx.project_dir.join(".claude").join("settings.json"),
+        "{\"permissions\":{}}\n",
+    )
+    .unwrap();
+    // settings.local.json with only ccteam hooks → collapses + deleted.
+    let settings_local = fx.project_dir.join(".claude").join("settings.local.json");
+    std::fs::write(
+        &settings_local,
+        r#"{
+  "hooks": {
+    "SessionStart": [{"matcher": "*", "hooks": [{"type": "command", "command": "/h/hook.sh chat-progress session-start"}]}]
+  }
+}
+"#,
+    )
+    .unwrap();
+
+    let out = fx
+        .cmd()
+        .args(["project", "rm", &fx.slug, "--purge"])
+        .output()
+        .expect("spawn ccteam project rm --purge");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "project rm --purge should succeed; stderr: {stderr}; stdout: {stdout}",
+    );
+
+    // DELETE set.
+    let cfg = config::load(&fx.ccteam_home).unwrap();
+    assert!(
+        cfg.projects.iter().all(|p| p.slug != fx.slug),
+        "config entry must be dropped",
+    );
+    assert!(
+        !fx.project_dir.join(".ccteam").exists(),
+        ".ccteam/ must be purged",
+    );
+    assert!(
+        !agents.join("cto.md").exists(),
+        "seeded cto.md must be purged"
+    );
+    assert!(
+        !settings_local.exists(),
+        "settings.local.json (only ccteam hooks) must be deleted",
+    );
+    assert!(
+        !reg.exists(),
+        "imd/registry/<slug>/helper.json must be purged"
+    );
+    assert!(!hb.exists(), "imd/registry heartbeat must be purged");
+    assert!(
+        !slug_dir.exists(),
+        "imd/registry/<slug>/ dir must be purged"
+    );
+    assert!(
+        !fx.paths().progress_jsonl(&fx.slug).exists(),
+        "progress.jsonl must be purged",
+    );
+
+    // KEEP set — provably untouched.
+    assert!(
+        agents.join("reviewer.md").exists(),
+        "user role .claude/agents/reviewer.md must survive --purge",
+    );
+    assert!(agents.is_dir(), ".claude/agents/ dir must survive");
+    assert!(
+        fx.project_dir.join(".env").exists(),
+        ".env must NEVER be deleted",
+    );
+    assert!(
+        fx.project_dir.join("CLAUDE.md").exists(),
+        "CLAUDE.md must survive --purge",
+    );
+    assert!(
+        fx.project_dir
+            .join(".claude")
+            .join("settings.json")
+            .exists(),
+        "user settings.json must NEVER be touched",
+    );
+}
+
+/// t18 — `ccteam project rm --dry-run` with a live chat session lists the
+/// session it WOULD stop and the config/state it WOULD drop, and changes
+/// nothing on disk or tmux. Guarded by tmux availability.
+#[test]
+fn t18_project_rm_dry_run_lists_stop_and_acts_on_nothing() {
+    use ccteam_harness::chat_session_name;
+    use ccteam_harness::tmux_ops::{tmux_available, TmuxSession};
+
+    if !tmux_available() {
+        eprintln!("skipping t18: tmux not available");
+        return;
+    }
+    let slug = format!("dexdry-{}", std::process::id());
+    let fx = Fixture::new(&slug);
+    let progress = fx.paths().progress_jsonl(&slug);
+    std::fs::create_dir_all(progress.parent().unwrap()).unwrap();
+    std::fs::write(&progress, "{}\n").unwrap();
+
+    let sess = chat_session_name(&slug, "cto");
+    TmuxSession::from_name(sess.clone()).kill().ok();
+    let status = std::process::Command::new("tmux")
+        .args(["new-session", "-d", "-s", &sess, "sleep", "300"])
+        .status()
+        .expect("tmux new-session");
+    assert!(status.success(), "pre-create tmux session failed");
+
+    let out = fx
+        .cmd()
+        .args(["project", "rm", &slug, "--dry-run"])
+        .output()
+        .expect("spawn ccteam project rm --dry-run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    let still_alive = TmuxSession::from_name(sess.clone()).exists();
+    TmuxSession::from_name(sess.clone()).kill().ok(); // cleanup regardless
+
+    assert!(out.status.success(), "dry-run rm should succeed");
+    assert!(
+        stdout.contains(&format!("would stop chat session `{sess}`")),
+        "dry-run must list the chat session it would stop; got: {stdout}",
+    );
+    assert!(
+        stdout.contains("[dry-run]"),
+        "dry-run header missing; got: {stdout}",
+    );
+    // Nothing acted on.
+    assert!(still_alive, "dry-run must NOT kill the chat session");
+    assert!(progress.exists(), "dry-run must not delete progress.jsonl");
+    let cfg = config::load(&fx.ccteam_home).unwrap();
+    assert_eq!(cfg.projects.len(), 1, "dry-run must keep config entry");
 }
 
 #[test]

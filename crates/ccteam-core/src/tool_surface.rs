@@ -738,6 +738,157 @@ fn hook_command_is_cost_accumulate(hook: &serde_json::Value) -> bool {
     trimmed.ends_with(" hook cost-accumulate") || trimmed.contains(" hook cost-accumulate ")
 }
 
+/// v0.8.6 W3: outcome of stripping ccteam's chat hooks from a project's
+/// `.claude/settings.local.json`. See [`remove_chat_hooks`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatHookScrubAction {
+    /// `settings.local.json` absent — nothing to do.
+    NotFound,
+    /// No ccteam chat-hook entries found. Idempotent re-run after a
+    /// successful scrub hits this branch.
+    NoChangeNeeded,
+    /// `dry_run = true` — would have removed N hook command entries.
+    WouldRemove { entries: usize },
+    /// Removed N hook command entries; the file still holds other keys
+    /// (or other hooks) so it was atomically rewritten in place.
+    Removed { entries: usize },
+    /// Removed N hook command entries and the resulting JSON collapsed
+    /// to an empty object (`{}` / only an empty `hooks` map). The caller
+    /// is told so it can delete the now-vestigial file outright.
+    RemovedNowEmpty { entries: usize },
+}
+
+/// v0.8.6 W3: per-project report for [`remove_chat_hooks`].
+#[derive(Debug, Clone)]
+pub struct ChatHookScrubReport {
+    pub target: PathBuf,
+    pub action: ChatHookScrubAction,
+}
+
+/// v0.8.6 W3: surgically strip the chat-mode hooks ccteam installs via
+/// `ccteam_harness::ensure_chat_hooks_installed` from a project's
+/// `.claude/settings.local.json` (the caller supplies the path). This is
+/// the inverse of that writer and the `project rm --purge` complement of
+/// [`remove_cost_accumulate_hooks`].
+///
+/// **Scope (red line).** Removes ONLY entries whose `command` invokes a
+/// ccteam chat hook ([`hook_command_is_chat_hook`]):
+/// - `<hook.sh> chat-progress <event>` (the 9 SessionStart/UserPromptSubmit/
+///   Stop/SubagentStop/PostToolUse/PreToolUse/SessionEnd/PreCompact/PostCompact
+///   events)
+/// - `ccteam mux hook-emit --kind chat-progress …` (the `CCTEAM_HOOK_VIA_DAEMON`
+///   variant)
+/// - `<hook.sh> intercept-ask` (the `AskUserQuestion` PreToolUse matcher)
+///
+/// Every other key (`permissions`, `env`, `enabledPlugins`, …) and any
+/// operator-authored hook survives untouched. Empty inner hook lists +
+/// top-level event arrays are pruned so the file shape stays clean, and
+/// if the whole object collapses the action is `RemovedNowEmpty` so the
+/// caller can delete the file (it was created solely by ccteam).
+///
+/// Idempotent — a re-run after a successful scrub hits `NoChangeNeeded`.
+pub fn remove_chat_hooks(settings_path: &Path, dry_run: bool) -> Result<ChatHookScrubReport> {
+    if !settings_path.exists() {
+        return Ok(ChatHookScrubReport {
+            target: settings_path.to_path_buf(),
+            action: ChatHookScrubAction::NotFound,
+        });
+    }
+
+    let body = std::fs::read_to_string(settings_path)
+        .with_context(|| format!("read {}", settings_path.display()))?;
+    let mut v: serde_json::Value = serde_json::from_str(&body)
+        .with_context(|| format!("parse {}", settings_path.display()))?;
+
+    let mut removed = 0usize;
+    if let Some(hooks) = v.get_mut("hooks").and_then(|h| h.as_object_mut()) {
+        for (_event, list) in hooks.iter_mut() {
+            let Some(arr) = list.as_array_mut() else {
+                continue;
+            };
+            for entry in arr.iter_mut() {
+                let Some(inner_hooks) = entry.get_mut("hooks").and_then(|h| h.as_array_mut())
+                else {
+                    continue;
+                };
+                let before = inner_hooks.len();
+                inner_hooks.retain(|hook| !hook_command_is_chat_hook(hook));
+                removed += before - inner_hooks.len();
+            }
+            // Drop now-empty inner hook lists (matcher entries whose hooks
+            // we just emptied).
+            arr.retain(|entry| {
+                entry
+                    .get("hooks")
+                    .and_then(|h| h.as_array())
+                    .map(|a| !a.is_empty())
+                    .unwrap_or(false)
+            });
+        }
+        // Drop now-empty top-level event arrays (e.g. SessionStart -> []).
+        hooks.retain(|_event, list| list.as_array().map(|a| !a.is_empty()).unwrap_or(false));
+    }
+
+    if removed == 0 {
+        return Ok(ChatHookScrubReport {
+            target: settings_path.to_path_buf(),
+            action: ChatHookScrubAction::NoChangeNeeded,
+        });
+    }
+
+    // Drop an emptied `hooks` map so the collapse check below treats a
+    // file that held only ccteam hooks as fully empty.
+    if let Some(obj) = v.as_object_mut() {
+        if obj
+            .get("hooks")
+            .and_then(|h| h.as_object())
+            .map(|m| m.is_empty())
+            .unwrap_or(false)
+        {
+            obj.remove("hooks");
+        }
+    }
+    let now_empty = v.as_object().map(|o| o.is_empty()).unwrap_or(false);
+
+    if dry_run {
+        return Ok(ChatHookScrubReport {
+            target: settings_path.to_path_buf(),
+            action: ChatHookScrubAction::WouldRemove { entries: removed },
+        });
+    }
+
+    let body = serde_json::to_string_pretty(&v).context("serialize updated settings.local.json")?;
+    let tmp = settings_path.with_extension("json.ccteam-chat-scrub.tmp");
+    std::fs::write(&tmp, &body).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, settings_path)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), settings_path.display()))?;
+    Ok(ChatHookScrubReport {
+        target: settings_path.to_path_buf(),
+        action: if now_empty {
+            ChatHookScrubAction::RemovedNowEmpty { entries: removed }
+        } else {
+            ChatHookScrubAction::Removed { entries: removed }
+        },
+    })
+}
+
+/// Predicate: does this `hook` JSON entry invoke one of ccteam's
+/// chat-mode hooks (the inverse target of `ensure_chat_hooks_installed`)?
+/// Matches the `chat-progress <event>` + `intercept-ask` wrapper forms
+/// and the `mux hook-emit --kind chat-progress` daemon-bus variant,
+/// independent of the leading `hook.sh` / binary path.
+fn hook_command_is_chat_hook(hook: &serde_json::Value) -> bool {
+    let Some(cmd) = hook.get("command").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    let trimmed = cmd.trim();
+    trimmed.ends_with(" chat-progress")
+        || trimmed.contains(" chat-progress ")
+        || trimmed.contains("hook-emit --kind chat-progress")
+        || trimmed.ends_with(" intercept-ask")
+        || trimmed.contains(" intercept-ask ")
+}
+
 /// V0.2.2 F44 + V0.4.6 F89 + V0.6.1 F139: rewrite one hook `command`
 /// string into the `<hook.sh> <kind> [args]` shape current installs ship.
 ///
@@ -1325,5 +1476,133 @@ mod tests {
             rewrite_one_hook_command("/usr/bin/jq .progress[]", HOOK_SH).is_none(),
             "should not touch operator-authored hooks",
         );
+    }
+
+    // ───────────────────── v0.8.6 W3 — remove_chat_hooks ─────────────────────
+
+    #[test]
+    fn remove_chat_hooks_not_found_when_file_absent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("settings.local.json");
+        let report = remove_chat_hooks(&path, false).unwrap();
+        assert_eq!(report.action, ChatHookScrubAction::NotFound);
+    }
+
+    #[test]
+    fn remove_chat_hooks_no_change_for_operator_only_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("settings.local.json");
+        let original = r#"{"permissions":{"allow":["Bash"]},"hooks":{"PreToolUse":[{"matcher":"Edit","hooks":[{"type":"command","command":"/h/my-linter.sh"}]}]}}"#;
+        std::fs::write(&path, original).unwrap();
+        let report = remove_chat_hooks(&path, false).unwrap();
+        assert_eq!(report.action, ChatHookScrubAction::NoChangeNeeded);
+        // File untouched (still parses, still has the operator hook).
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("my-linter.sh"));
+    }
+
+    #[test]
+    fn remove_chat_hooks_strips_chat_and_ask_keeps_others() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("settings.local.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "permissions": {"allow": ["Bash"]},
+              "hooks": {
+                "SessionStart": [{"matcher":"*","hooks":[{"type":"command","command":"/h/hook.sh chat-progress session-start"}]}],
+                "PreToolUse": [
+                  {"matcher":"*","hooks":[{"type":"command","command":"/h/hook.sh chat-progress pre-tool-use"}]},
+                  {"matcher":"AskUserQuestion","hooks":[{"type":"command","command":"/h/hook.sh intercept-ask","timeout":660}]},
+                  {"matcher":"Edit","hooks":[{"type":"command","command":"/h/my-linter.sh"}]}
+                ]
+              }
+            }"#,
+        )
+        .unwrap();
+        let report = remove_chat_hooks(&path, false).unwrap();
+        // 1 SessionStart + 1 PreToolUse chat-progress + 1 intercept-ask = 3.
+        assert_eq!(report.action, ChatHookScrubAction::Removed { entries: 3 });
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(v.get("permissions").is_some(), "operator key kept");
+        assert!(
+            v.get("hooks").and_then(|h| h.get("SessionStart")).is_none(),
+            "emptied SessionStart event pruned",
+        );
+        // Operator's Edit hook survives under PreToolUse.
+        let body = serde_json::to_string(&v).unwrap();
+        assert!(body.contains("my-linter.sh"));
+        assert!(!body.contains("chat-progress") && !body.contains("intercept-ask"));
+    }
+
+    #[test]
+    fn remove_chat_hooks_reports_now_empty_when_only_ccteam_hooks() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("settings.local.json");
+        std::fs::write(
+            &path,
+            r#"{"hooks":{"SessionStart":[{"matcher":"*","hooks":[{"type":"command","command":"/h/hook.sh chat-progress session-start"}]}],"Stop":[{"matcher":"*","hooks":[{"type":"command","command":"/h/hook.sh chat-progress stop"}]}]}}"#,
+        )
+        .unwrap();
+        let report = remove_chat_hooks(&path, false).unwrap();
+        assert_eq!(
+            report.action,
+            ChatHookScrubAction::RemovedNowEmpty { entries: 2 }
+        );
+        // remove_chat_hooks rewrites in place ({}) — the CALLER deletes
+        // the file on RemovedNowEmpty; here the rewritten body is empty.
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v, serde_json::json!({}));
+    }
+
+    #[test]
+    fn remove_chat_hooks_matches_daemon_bus_variant() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("settings.local.json");
+        std::fs::write(
+            &path,
+            r#"{"hooks":{"Stop":[{"matcher":"*","hooks":[{"type":"command","command":"ccteam mux hook-emit --kind chat-progress --action stop"}]}]}}"#,
+        )
+        .unwrap();
+        let report = remove_chat_hooks(&path, false).unwrap();
+        assert_eq!(
+            report.action,
+            ChatHookScrubAction::RemovedNowEmpty { entries: 1 }
+        );
+    }
+
+    #[test]
+    fn remove_chat_hooks_dry_run_does_not_write() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("settings.local.json");
+        let original = r#"{"hooks":{"SessionStart":[{"matcher":"*","hooks":[{"type":"command","command":"/h/hook.sh chat-progress session-start"}]}]}}"#;
+        std::fs::write(&path, original).unwrap();
+        let report = remove_chat_hooks(&path, true).unwrap();
+        assert_eq!(
+            report.action,
+            ChatHookScrubAction::WouldRemove { entries: 1 }
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "dry-run must not rewrite the file",
+        );
+    }
+
+    #[test]
+    fn remove_chat_hooks_idempotent_after_scrub() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("settings.local.json");
+        std::fs::write(
+            &path,
+            r#"{"permissions":{},"hooks":{"SessionStart":[{"matcher":"*","hooks":[{"type":"command","command":"/h/hook.sh chat-progress session-start"}]}]}}"#,
+        )
+        .unwrap();
+        let first = remove_chat_hooks(&path, false).unwrap();
+        assert!(matches!(first.action, ChatHookScrubAction::Removed { .. }));
+        let second = remove_chat_hooks(&path, false).unwrap();
+        assert_eq!(second.action, ChatHookScrubAction::NoChangeNeeded);
     }
 }

@@ -4851,7 +4851,9 @@ fn truncate_col(s: &str, width: usize) -> String {
 ///    it returns `Some(refusal)` and `opts.force` is false, the command
 ///    halts before any mutation. `--dry-run` still walks the rest of
 ///    the plan (reporting all steps as "would run") so the user gets a
-///    full preview.
+///    full preview. Then (v0.8.6 W3) stop-then-delete: tear down the
+///    project's live chat-mode role sessions (`ccteam-chat-<slug>-*`)
+///    before deregistering — `--dry-run` lists what it would stop.
 /// 2. Resolve project_dir via `~/.ccteam/config.yaml::projects[]` so
 ///    arbitrary-path installs (V0.4.2 F77) are honoured.
 /// 3. Drop the slug from config.yaml::projects[] (atomic via
@@ -4865,10 +4867,18 @@ fn truncate_col(s: &str, width: usize) -> String {
 ///    (or flex `~/.ccteam/progress/<slug>/` dir), then any
 ///    `~/.ccteam/inbox/<slug>/` and `~/.ccteam/control/<slug>/`
 ///    sub-trees that exist.
-/// 6. `--purge`: `rm -rf <project>/.ccteam/`,
-///    `<project>/.claude/agents/`, and `<project>/workflow.yaml`
-///    (plus F83's `.ccteam/workflow.yaml` once that lands).
-///    Never touches `<project>/.env` (CLAUDE.md §三 red line).
+/// 6. `--purge`: delete exactly ccteam's project footprint (v0.8.6 W2
+///    layout) — `rm -rf <project>/.ccteam/`, the seeded
+///    `<project>/.claude/agents/cto.md` (NOT the whole agents dir), and
+///    ccteam's hook section inside `<project>/.claude/settings.local.json`
+///    (surgically; file deleted only if it collapses to empty). See
+///    [`purge_project_managed_paths`] for the full KEEP/DELETE contract.
+///    Never touches `<project>/.env`, user work-roles, `CLAUDE.md` /
+///    `AGENTS.md`, or the user's `settings.json` (CLAUDE.md §三 red line).
+///
+/// This is the reusable remove engine: the flat `ccteam remove` and the
+/// grouped `ccteam project rm` both route here (the structured
+/// [`RemoveReport`] doubles as the dry-run plan).
 pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Result<RemoveReport> {
     let mut report = RemoveReport {
         slug: slug.to_string(),
@@ -4893,6 +4903,26 @@ pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Resul
             report
                 .steps
                 .push(format!("forced through guard: {}", r.message(slug)));
+        }
+    }
+
+    // 1b. Stop-then-delete (v0.8.6 W3): `rm` first tears down the
+    // project's live chat-mode role sessions, then proceeds with the
+    // deregister/purge below. The refusal gate above already gave the
+    // user the confirm-vs-`--force` choice; once past it, stopping the
+    // sessions is part of the explicit, user-requested removal (the
+    // allowed exception to "never PROACTIVELY kill a long session").
+    // `--dry-run` lists the sessions it would stop and kills nothing.
+    let chat_stop = stop_project_chat_sessions(slug, opts.dry_run)?;
+    if opts.dry_run {
+        for name in &chat_stop.would_stop {
+            report
+                .steps
+                .push(format!("would stop chat session `{name}`"));
+        }
+    } else {
+        for name in &chat_stop.stopped {
+            report.steps.push(format!("stopped chat session `{name}`"));
         }
     }
 
@@ -5027,6 +5057,98 @@ pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Resul
     Ok(report)
 }
 
+/// Outcome of enumerating + (optionally) killing a project's live
+/// chat-mode role sessions. Shared by `run_project_stop` (the `project
+/// stop` command) and `run_remove` (rm = stop-then-delete).
+///
+/// `stopped` carries the tmux session names that were actually killed;
+/// under `--dry-run` it is empty and `would_stop` carries the targets
+/// instead (so the dry-run preview shows the same shape it would act on).
+#[derive(Debug, Clone, Default)]
+struct ChatSessionStop {
+    /// Session names killed this run (empty under dry-run).
+    stopped: Vec<String>,
+    /// Session names that *would* be killed (only populated under dry-run).
+    would_stop: Vec<String>,
+}
+
+/// Enumerate the live tmux sessions belonging to `slug`'s chat-mode role
+/// sessions (`ccteam-chat-<slug>-<role>`) and, unless `dry_run`, kill
+/// each one.
+///
+/// Process-independent on purpose: the CLI is a separate process from
+/// the daemon, so we never consult daemon in-memory state. We list every
+/// live tmux session ([`tmux_ops::list_sessions`]) and keep the ones
+/// whose parsed slug equals `slug` — parsing via
+/// [`parse_chat_session_name`] rather than a raw `starts_with` so a slug
+/// that itself contains dashes (e.g. `dev-foo`) matches its own
+/// `ccteam-chat-dev-foo-<role>` sessions and not a sibling
+/// `ccteam-chat-dev-<role>` one.
+///
+/// **Red line.** `project stop` / `rm` are EXPLICIT user commands, the
+/// allowed exception to "never PROACTIVELY kill a long session": the
+/// teardown is user-requested and resumable (the daemon recreates the
+/// pane via `--resume` on the next interaction). The kill is idempotent
+/// ([`TmuxSession::kill`] tolerates a vanished session).
+fn stop_project_chat_sessions(slug: &str, dry_run: bool) -> Result<ChatSessionStop> {
+    use ccteam_harness::parse_chat_session_name;
+    use ccteam_harness::tmux_ops::{self, TmuxSession};
+
+    // Match + stable-sort so output / kill order is deterministic.
+    let mut matches: Vec<String> = tmux_ops::list_sessions()
+        .into_iter()
+        .filter(|name| {
+            parse_chat_session_name(name)
+                .map(|(s, _role)| s == slug)
+                .unwrap_or(false)
+        })
+        .collect();
+    matches.sort();
+
+    let mut out = ChatSessionStop::default();
+    if dry_run {
+        out.would_stop = matches;
+        return Ok(out);
+    }
+    for name in matches {
+        TmuxSession::from_name(name.clone())
+            .kill()
+            .with_context(|| format!("stop chat session `{name}`"))?;
+        out.stopped.push(name);
+    }
+    Ok(out)
+}
+
+/// v0.8.6 W3 — `ccteam project stop <slug>` handler.
+///
+/// Stops ALL of the project's live chat-mode role sessions (the
+/// `ccteam-chat-<slug>-*` tmux sessions) WITHOUT removing the project.
+/// This is an explicit, resumable user-requested stop — the project
+/// stays registered and the daemon resumes each role by id on the next
+/// interaction. `stop` is neither a delete nor a pause.
+///
+/// Returns a one-line-per-session render (and a tail count); stopping 0
+/// sessions is a success, not an error.
+pub fn run_project_stop(_paths: &CcteamPaths, slug: &str) -> Result<String> {
+    let stop = stop_project_chat_sessions(slug, false)?;
+
+    let mut out = String::new();
+    use std::fmt::Write as _;
+    writeln!(out, "ccteam project stop {slug}").ok();
+    for name in &stop.stopped {
+        writeln!(out, "  - stopped chat session `{name}` (resumable by id)").ok();
+    }
+    let n = stop.stopped.len();
+    writeln!(
+        out,
+        "stopped {n} chat session{} for `{slug}`{}",
+        if n == 1 { "" } else { "s" },
+        if n == 0 { " (none were running)" } else { "" }
+    )
+    .ok();
+    Ok(out)
+}
+
 /// V0.6.5 F151 — purge `~/.ccteam/imd/registry/<slug>/`.
 ///
 /// **Strategy:** for each registered role under the slug, call
@@ -5120,80 +5242,111 @@ fn purge_imd_registry_for_slug(
     Ok(())
 }
 
-/// Helper for `run_remove --purge` — walks each ccteam-managed path
-/// under `<project>/` and deletes it (or, under `--dry-run`, just
-/// records the planned step).
+/// Helper for `run_remove --purge` — deletes exactly ccteam's own
+/// footprint inside `<project>/` (or, under `--dry-run`, just records
+/// the planned step). Aligned to the v0.8.6 W2 layout: a project's
+/// on-disk ccteam footprint is `.ccteam/` (state.json + workflow.yaml),
+/// the seeded `.claude/agents/cto.md` persona, and ccteam's hook section
+/// inside `.claude/settings.local.json`.
 ///
-/// **Red lines** enforced here:
-/// - `<project>/.env` is **never** touched (user-controlled secrets).
-/// - Anything outside `.ccteam/`, `.claude/agents/`, and
-///   `workflow.yaml` / `.ccteam/workflow.yaml` is **never** touched
-///   (business code stays put). If the user wants the whole tree gone
-///   they can `rm -rf <project>` themselves; the `--purge` contract is
-///   strictly orchestration-only.
+/// **DELETE** (ccteam-managed only):
+/// - `<project>/.ccteam/` — state.json + workflow.yaml live here (W2).
+/// - `<project>/.claude/agents/cto.md` — the ccteam-seeded chat persona.
+///   The `.claude/agents/` dir itself is left in place so user-authored
+///   work-roles beside `cto.md` survive (only `cto.md` is ours).
+/// - ccteam's chat-progress + AskUserQuestion hook entries inside
+///   `<project>/.claude/settings.local.json` (surgically, via
+///   [`ccteam_core::remove_chat_hooks`]). If stripping them leaves the
+///   file an empty object, the now-vestigial file is deleted.
+///
+/// **KEEP (never touched):**
+/// - User work-roles `<project>/.claude/agents/*.md` other than `cto.md`.
+/// - `<project>/CLAUDE.md` / `AGENTS.md` (project knowledge = vendor-native).
+/// - `<project>/.env` (user-controlled secrets — CLAUDE.md §三 red line).
+/// - The user's `<project>/.claude/settings.json` (ccteam manages only
+///   the `settings.local.json` layer, never the committed one).
+/// - All business code. If the user wants the whole tree gone they can
+///   `rm -rf <project>` themselves; the `--purge` contract is strictly
+///   ccteam-footprint-only.
 fn purge_project_managed_paths(
     project_dir: &std::path::Path,
     dry_run: bool,
     report: &mut RemoveReport,
 ) -> Result<()> {
-    // Order: state metadata first, agent prompts next, workflow last
-    // — gives the dry-run reader a story (state → roles → topology).
+    // 1. `.ccteam/` dir (state.json + workflow.yaml). W2 moved
+    // workflow.yaml under `.ccteam/`, so this one delete covers both.
     let ccteam_dir = project_dir.join(".ccteam");
-    let agents_dir = project_dir.join(".claude").join("agents");
-    let workflow_yaml = project_dir.join("workflow.yaml");
-    // V0.4.6 F83 will move workflow.yaml into `.ccteam/`; until then
-    // `.ccteam/workflow.yaml` may exist in early-adopter projects.
-    // Deleting `.ccteam/` already covers it, but list explicitly so
-    // dry-run output names the path the user expects.
-    let workflow_yaml_in_ccteam = ccteam_dir.join("workflow.yaml");
-
-    // Safety: refuse to touch a `<project>/.env` *file*. The contract
-    // is project-managed orchestration paths only; .env stays. The
-    // explicit assertion below documents the invariant for review.
-    let env_file = project_dir.join(".env");
-    debug_assert!(
-        !ccteam_dir.starts_with(&env_file) && !agents_dir.starts_with(&env_file),
-        ".env must never be inside the purge tree"
-    );
-
-    for (label, path, is_dir) in [
-        (".ccteam/", ccteam_dir.clone(), true),
-        (".claude/agents/", agents_dir.clone(), true),
-        ("workflow.yaml", workflow_yaml.clone(), false),
-        (
-            ".ccteam/workflow.yaml (legacy F83 location)",
-            workflow_yaml_in_ccteam.clone(),
-            false,
-        ),
-    ] {
-        let exists = if is_dir {
-            path.is_dir()
-        } else {
-            path.is_file()
-        };
-        if !exists {
-            continue;
-        }
+    if ccteam_dir.is_dir() {
         if dry_run {
             report
                 .steps
-                .push(format!("would purge {label} ({})", path.display()));
-        } else if is_dir {
-            std::fs::remove_dir_all(&path).with_context(|| format!("rm -rf {}", path.display()))?;
-            report
-                .steps
-                .push(format!("purged {label} ({})", path.display()));
+                .push(format!("would purge .ccteam/ ({})", ccteam_dir.display()));
         } else {
-            std::fs::remove_file(&path).with_context(|| format!("rm {}", path.display()))?;
+            std::fs::remove_dir_all(&ccteam_dir)
+                .with_context(|| format!("rm -rf {}", ccteam_dir.display()))?;
             report
                 .steps
-                .push(format!("purged {label} ({})", path.display()));
+                .push(format!("purged .ccteam/ ({})", ccteam_dir.display()));
         }
     }
 
-    // Final assertion: confirm `.env` is still here (paranoia check
-    // — if a future refactor accidentally widens the purge tree this
-    // surfaces in tests immediately).
+    // 2. The ccteam-seeded `cto.md` persona ONLY — never the whole
+    // `.claude/agents/` dir (user work-roles live beside it and must
+    // survive).
+    let cto_md = project_dir.join(".claude").join("agents").join("cto.md");
+    if cto_md.is_file() {
+        if dry_run {
+            report.steps.push(format!(
+                "would purge .claude/agents/cto.md ({})",
+                cto_md.display()
+            ));
+        } else {
+            std::fs::remove_file(&cto_md).with_context(|| format!("rm {}", cto_md.display()))?;
+            report.steps.push(format!(
+                "purged .claude/agents/cto.md ({})",
+                cto_md.display()
+            ));
+        }
+    }
+
+    // 3. ccteam's hook section inside `.claude/settings.local.json`,
+    // removed surgically so any operator-authored keys/hooks survive.
+    // If the strip empties the file, delete the vestigial object.
+    let settings_local = project_dir.join(".claude").join("settings.local.json");
+    let scrub = ccteam_core::remove_chat_hooks(&settings_local, dry_run)?;
+    use ccteam_core::ChatHookScrubAction as A;
+    match scrub.action {
+        A::NotFound | A::NoChangeNeeded => {}
+        A::WouldRemove { entries } => {
+            report.steps.push(format!(
+                "would strip {entries} ccteam hook entr{} from .claude/settings.local.json ({})",
+                if entries == 1 { "y" } else { "ies" },
+                settings_local.display()
+            ));
+        }
+        A::Removed { entries } => {
+            report.steps.push(format!(
+                "stripped {entries} ccteam hook entr{} from .claude/settings.local.json ({})",
+                if entries == 1 { "y" } else { "ies" },
+                settings_local.display()
+            ));
+        }
+        A::RemovedNowEmpty { entries } => {
+            // The file existed only to carry ccteam's hooks — delete it.
+            std::fs::remove_file(&settings_local)
+                .with_context(|| format!("rm {}", settings_local.display()))?;
+            report.steps.push(format!(
+                "stripped {entries} ccteam hook entr{} and removed now-empty \
+                 .claude/settings.local.json ({})",
+                if entries == 1 { "y" } else { "ies" },
+                settings_local.display()
+            ));
+        }
+    }
+
+    // Paranoia: confirm `.env` survived (if a future refactor widens the
+    // purge tree this surfaces in tests immediately).
+    let env_file = project_dir.join(".env");
     if env_file.exists() {
         report
             .steps
