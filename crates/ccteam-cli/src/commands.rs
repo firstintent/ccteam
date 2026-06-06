@@ -536,8 +536,6 @@ const DEFAULT_WORKFLOW_YAML: &str = r#"# ccteam workflow.yaml.
 #   schedule                      # periodic; needs `schedule:` 5-field cron
 #   gate                          # waits for `trigger_gate` MCP / CLI call
 #   watch:.ccteam/issues/         # spawn one session per new file under the path
-#
-# Examples: examples/workflows/*.yaml
 name: default-workflow
 description: |
   Minimal starter workflow. Edit me — the manual `cto` is a safe
@@ -5129,7 +5127,8 @@ pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Resul
     // sessions is part of the explicit, user-requested removal (the
     // allowed exception to "never PROACTIVELY kill a long session").
     // `--dry-run` lists the sessions it would stop and kills nothing.
-    let chat_stop = stop_project_chat_sessions(slug, opts.dry_run)?;
+    let backend = ccteam_harness::default_process_backend();
+    let chat_stop = stop_project_chat_sessions(backend.as_ref(), slug, opts.dry_run)?;
     if opts.dry_run {
         for name in &chat_stop.would_stop {
             report
@@ -5288,34 +5287,48 @@ struct ChatSessionStop {
     would_stop: Vec<String>,
 }
 
-/// Enumerate the live tmux sessions belonging to `slug`'s chat-mode role
-/// sessions (`ccteam-chat-<slug>-<role>`) and, unless `dry_run`, kill
-/// each one.
+/// Enumerate the live chat-mode role sessions belonging to `slug`
+/// (`ccteam-chat-<slug>-<role>`) and, unless `dry_run`, kill each one.
 ///
-/// Process-independent on purpose: the CLI is a separate process from
-/// the daemon, so we never consult daemon in-memory state. We list every
-/// live tmux session ([`tmux_ops::list_sessions`]) and keep the ones
-/// whose parsed slug equals `slug` — parsing via
-/// [`parse_chat_session_name`] rather than a raw `starts_with` so a slug
-/// that itself contains dashes (e.g. `dev-foo`) matches its own
+/// Backend-agnostic: enumeration + kill both go through the injected
+/// [`ProcessBackend`] (`list_sessions` / `kill`), so the teardown sees
+/// whatever mux is live under `CCTEAM_MUX_BACKEND` — the bundled `rmux`
+/// daemon by default, or `tmux` when opted in. (The old tmux-only path
+/// shelled out to `tmux list-sessions` directly and so saw nothing under
+/// the default rmux backend.) The CLI threads `default_process_backend()`
+/// in; tests inject a deterministic [`InProcBackend`].
+///
+/// Process-independent on purpose: the CLI is a separate process from the
+/// daemon, so we never consult daemon in-memory state — only the live mux
+/// session names. We reuse [`list_chat_sessions`] (names only, never
+/// capture-pane) and keep the ones whose parsed slug equals `slug`,
+/// parsing via [`parse_chat_session_name`] rather than a raw `starts_with`
+/// so a slug that itself contains dashes (e.g. `dev-foo`) matches its own
 /// `ccteam-chat-dev-foo-<role>` sessions and not a sibling
-/// `ccteam-chat-dev-<role>` one.
+/// `ccteam-chat-dev-<role>` one. The slug is always the *first* parsed
+/// element, so this stays correct even if the trailing segment changes
+/// meaning (role → sid).
 ///
 /// **Red line.** `project stop` / `rm` are EXPLICIT user commands, the
 /// allowed exception to "never PROACTIVELY kill a long session": the
 /// teardown is user-requested and resumable (the daemon recreates the
 /// pane via `--resume` on the next interaction). The kill is idempotent
-/// ([`TmuxSession::kill`] tolerates a vanished session).
-fn stop_project_chat_sessions(slug: &str, dry_run: bool) -> Result<ChatSessionStop> {
-    use ccteam_harness::parse_chat_session_name;
-    use ccteam_harness::tmux_ops::{self, TmuxSession};
+/// ([`ProcessBackend::kill`] is `Ok(())` for a vanished session).
+fn stop_project_chat_sessions(
+    backend: &dyn ccteam_harness::ProcessBackend,
+    slug: &str,
+    dry_run: bool,
+) -> Result<ChatSessionStop> {
+    use ccteam_harness::{list_chat_sessions, parse_chat_session_name, MuxSessionId};
 
-    // Match + stable-sort so output / kill order is deterministic.
-    let mut matches: Vec<String> = tmux_ops::list_sessions()
+    // Enumerate live chat sessions via the backend, keep ours, stable-sort
+    // so output / kill order is deterministic.
+    let live = block_on_async(list_chat_sessions(backend))??;
+    let mut matches: Vec<String> = live
         .into_iter()
         .filter(|name| {
             parse_chat_session_name(name)
-                .map(|(s, _role)| s == slug)
+                .map(|(s, _last)| s == slug)
                 .unwrap_or(false)
         })
         .collect();
@@ -5327,8 +5340,7 @@ fn stop_project_chat_sessions(slug: &str, dry_run: bool) -> Result<ChatSessionSt
         return Ok(out);
     }
     for name in matches {
-        TmuxSession::from_name(name.clone())
-            .kill()
+        block_on_async(backend.kill(&MuxSessionId::new(name.clone())))?
             .with_context(|| format!("stop chat session `{name}`"))?;
         out.stopped.push(name);
     }
@@ -5346,7 +5358,8 @@ fn stop_project_chat_sessions(slug: &str, dry_run: bool) -> Result<ChatSessionSt
 /// Returns a one-line-per-session render (and a tail count); stopping 0
 /// sessions is a success, not an error.
 pub fn run_project_stop(_paths: &CcteamPaths, slug: &str) -> Result<String> {
-    let stop = stop_project_chat_sessions(slug, false)?;
+    let backend = ccteam_harness::default_process_backend();
+    let stop = stop_project_chat_sessions(backend.as_ref(), slug, false)?;
 
     let mut out = String::new();
     use std::fmt::Write as _;
@@ -5693,6 +5706,32 @@ mod tests {
             msg.contains("ccteam-meta-cto"),
             "peek should target state.tmux_session, got: {msg}",
         );
+    }
+
+    /// v0.8.8 B1 — `stop_project_chat_sessions` consults the *injected*
+    /// [`ProcessBackend`], not shell `tmux` directly. The deterministic
+    /// list+kill+absent semantics (which need a single live tokio runtime
+    /// across spawn→list→kill) are verified in the harness layer
+    /// (`ccteam_harness::stop_chat_sessions_for_slug_kills_only_that_slug`);
+    /// here we only assert the CLI bridge is wired to the backend — an empty
+    /// backend yields an empty result with no `tmux list-sessions` shell-out
+    /// and no panic (the bug was the old tmux-only path returning nothing
+    /// under the default rmux backend).
+    ///
+    /// (We can't drive the kill end-to-end here: `block_on_async` builds a
+    /// fresh current-thread runtime per call, so an `InProcBackend`'s parked
+    /// `tokio::spawn` task — its liveness signal — dies with the runtime that
+    /// spawned it. A single-runtime harness test is the right home.)
+    #[test]
+    fn stop_project_chat_sessions_consults_injected_backend() {
+        use ccteam_harness::InProcBackend;
+
+        let backend = InProcBackend::new();
+        // Empty backend → no matches, both modes, no error / no tmux shell-out.
+        let dry = stop_project_chat_sessions(&backend, "dev-foo", true).unwrap();
+        assert!(dry.would_stop.is_empty() && dry.stopped.is_empty());
+        let stop = stop_project_chat_sessions(&backend, "dev-foo", false).unwrap();
+        assert!(stop.would_stop.is_empty() && stop.stopped.is_empty());
     }
 
     #[test]

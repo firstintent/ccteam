@@ -46,6 +46,16 @@ export interface SessionHistory {
   events: SessionHistoryEvent[];
 }
 
+/** One role summary from `GET /api/v1/projects/{slug}/roles`
+ *  (`crates/ccteam-core` `RoleSummary` → `crates/ccteam-web/src/routes/roles.rs`).
+ *  `description`/`model` default to `""` server-side when absent. Drives the
+ *  new-session modal's role dropdown (real project roles, not static hints). */
+export interface RoleSummary {
+  role: string;
+  description: string;
+  model: string;
+}
+
 /** Build the per-project sessions URL (gateway `s{n}` list). */
 export function sessionsUrl(slug: string): string {
   return `/api/v1/projects/${encodeURIComponent(slug)}/sessions`;
@@ -104,6 +114,16 @@ export function listSessions(slug: string): Promise<SessionView[]> {
 /** `GET /api/v1/sessions/{sid}` — mirrored history to seed a reopened page. */
 export function getHistory(sid: string): Promise<SessionHistory> {
   return getJson<SessionHistory>(sessionUrl(sid));
+}
+
+/** `GET /api/v1/projects/{slug}/roles` — the project's real roles
+ *  (`.claude/agents/<role>.md`), used to populate the new-session role
+ *  dropdown. Empty array for a project with no agents/. 404 (unknown
+ *  project) maps to NOT_FOUND, 401 to UNAUTHENTICATED. */
+export function listProjectRoles(slug: string): Promise<RoleSummary[]> {
+  return getJson<RoleSummary[]>(
+    `/api/v1/projects/${encodeURIComponent(slug)}/roles`,
+  );
 }
 
 /** `POST /api/v1/sessions/{sid}/turn` — submit a user turn. 202

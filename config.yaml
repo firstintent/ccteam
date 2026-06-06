@@ -1,6 +1,0 @@
-projects:
-- slug: smoke-x
-  path: /tmp/ccteam-smoke-proj.KuMpaQ
-  team: dev
-  installed_at: 2026-06-06T05:33:44.024088555Z
-claude_jobs_retention_days: 7

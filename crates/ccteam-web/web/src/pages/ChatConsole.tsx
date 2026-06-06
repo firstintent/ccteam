@@ -32,16 +32,19 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 import { MessageSquare, Plus, Send, Square, Terminal } from "lucide-react";
 import { TerminalView } from "../components/TerminalView";
 import { useSessionEvents } from "../hooks/useSessionEvents";
-import { fetchDashboard } from "../lib/dashboardApi";
+import { createProject as apiCreateProject, fetchDashboard } from "../lib/dashboardApi";
 import {
   createSession as apiCreateSession,
   getHistory,
+  listProjectRoles,
   listSessions,
   resolveApproval as apiResolveApproval,
   stopSession as apiStopSession,
   submitTurn,
+  type RoleSummary,
   type SessionView,
 } from "../lib/sessionsApi";
+import { toastBus } from "../lib/toastBus";
 import { DEFAULT_ROLE, ROLE_SUGGESTIONS } from "./chatDefaults";
 import {
   appendRow,
@@ -229,26 +232,50 @@ export default function ChatConsole() {
       });
   }, [sid, pushRow, refreshSessions]);
 
-  // ---- create a new session ---------------------------------------------
+  // ---- create a new session (optionally a brand-new project first) -------
+  // `newProjectPath` present ⇒ B2: POST /projects to scaffold+register `slug`
+  // first, then feed the returned slug into the existing create-session flow.
+  // Returns `true` on success so the modal can close itself; on failure it
+  // resolves `false` so the modal stays open (input preserved) and the error
+  // is surfaced via toast (human-readable) — NOT pushed into the transcript.
   const createSession = useCallback(
-    async (slug: string, role: string, vendor: string, permissionMode: "skip" | "hitl") => {
-      setModalOpen(false);
+    async (
+      slug: string,
+      role: string,
+      vendor: string,
+      permissionMode: "skip" | "hitl",
+      newProjectPath?: string,
+    ): Promise<boolean> => {
       try {
-        const { sid: newSid } = await apiCreateSession(slug, {
+        // B2: create the project first when a path was supplied.
+        let targetSlug = slug;
+        if (newProjectPath !== undefined) {
+          const created = await apiCreateProject(slug, newProjectPath);
+          targetSlug = created.slug;
+        }
+        const { sid: newSid } = await apiCreateSession(targetSlug, {
           role,
           vendor,
           permission_mode: permissionMode,
         });
         await refreshSessions();
         navigate(`/chat/s/${encodeURIComponent(newSid)}`);
+        return true;
       } catch (e) {
-        pushRow({
-          kind: "system",
-          content: `新建 session 失败: ${e instanceof Error ? e.message : "unknown"}`,
-        });
+        if (e instanceof Error && e.message === "UNAUTHENTICATED") {
+          // global TokenEntryGate handles re-auth; don't toast/transcript.
+          return false;
+        }
+        // Surface as a human-readable toast (e.g. "项目 demo 已存在"); never
+        // leak a raw HTTP/stack into the transcript stream.
+        const detail = e instanceof Error ? e.message : "unknown";
+        toastBus.handler?.error(
+          newProjectPath !== undefined ? `新建项目失败: ${detail}` : `新建 session 失败: ${detail}`,
+        );
+        return false;
       }
     },
-    [refreshSessions, navigate, pushRow],
+    [refreshSessions, navigate],
   );
 
   const projects = useMemo(
@@ -548,7 +575,7 @@ export default function ChatConsole() {
       {modalOpen ? (
         <NewSessionModal
           projects={projects}
-          roleOptions={roleOptions}
+          fallbackRoles={roleOptions}
           defaultProject={activeView?.project ?? projects[0] ?? ""}
           onCancel={() => setModalOpen(false)}
           onCreate={createSession}
@@ -558,19 +585,62 @@ export default function ChatConsole() {
   );
 }
 
-// New-session modal: pick an EXISTING project (the gateway create endpoint
-// is per-project), code agent, role (default cto), and permission mode.
-// Brand-new project scaffolding is an operator action (`ccteam init` / the
-// dashboard) — out of scope for the per-session chat create.
+// New-session modal: pick a project (an existing one, OR scaffold a brand-new
+// one inline — B2), code agent, role, and permission mode.
+//   - B2: selecting the "＋ 新建项目…" sentinel reveals slug(name)+path fields;
+//     submit first POSTs /api/v1/projects (createProject) then feeds the
+//     returned slug into the existing create-session flow. Slug/path are
+//     validated client-side mirroring the backend (validate_slug_format +
+//     expand_project_path) so the user gets inline feedback before the round
+//     trip.
+//   - B3 / BUG-4: the role field is now a real dropdown sourced from
+//     `GET /api/v1/projects/{slug}/roles` (the project's `.claude/agents/`)
+//     for an EXISTING project, with the static ROLE_SUGGESTIONS/DEFAULT_ROLE
+//     as the fallback/seed (FIX-2). A brand-new project has no roles yet, so
+//     that branch uses the static fallback and does NOT fetch (would 404).
+//
+// Roleless (empty role) stays out of scope: effectiveRole still falls back to
+// DEFAULT_ROLE (cto).
+
+/** Sentinel project value selecting the "create a new project" branch. */
+const NEW_PROJECT = "__new";
+
+/** Mirror of the backend slug grammar (`ccteam_core::validate_slug_format`):
+ *  `[a-z0-9-]+`, ≤60, no leading/trailing `-`. */
+function slugError(slug: string): string | null {
+  if (slug.length === 0) return "项目名不能为空";
+  if (slug.length > 60) return "项目名最多 60 字符";
+  if (!/^[a-z0-9-]+$/.test(slug)) return "只允许小写字母、数字、连字符";
+  if (slug.startsWith("-") || slug.endsWith("-")) return "不能以连字符开头或结尾";
+  return null;
+}
+
+/** Mirror of the backend path rule (`expand_project_path`): non-empty after
+ *  trim and starting with `/` or `~`. */
+function pathError(path: string): string | null {
+  const p = path.trim();
+  if (p.length === 0) return "路径不能为空";
+  if (!p.startsWith("/") && !p.startsWith("~")) return "路径需以 / 或 ~ 开头";
+  return null;
+}
+
+type RoleFetchState =
+  | { kind: "idle" }
+  | { kind: "loading" }
+  | { kind: "ready"; roles: RoleSummary[] }
+  | { kind: "error" };
+
 function NewSessionModal({
   projects,
-  roleOptions,
+  fallbackRoles,
   defaultProject,
   onCancel,
   onCreate,
 }: {
   projects: string[];
-  roleOptions: string[];
+  /** Static role hints (ROLE_SUGGESTIONS ∪ live session roles) — the seed/
+   *  fallback when a project's real roles can't be / aren't fetched. */
+  fallbackRoles: string[];
   defaultProject: string;
   onCancel: () => void;
   onCreate: (
@@ -578,19 +648,115 @@ function NewSessionModal({
     role: string,
     vendor: string,
     permissionMode: "skip" | "hitl",
-  ) => void;
+    newProjectPath?: string,
+  ) => Promise<boolean>;
 }) {
   const [project, setProject] = useState(defaultProject);
+  const [newSlug, setNewSlug] = useState("");
+  const [newPath, setNewPath] = useState("");
   const [vendor, setVendor] = useState<"claude" | "codex">("claude");
   const [role, setRole] = useState("");
   const [hitl, setHitl] = useState(false);
+  const [pending, setPending] = useState(false);
+  const [roleState, setRoleState] = useState<RoleFetchState>({ kind: "idle" });
 
-  const effectiveRole = role.trim() || DEFAULT_ROLE;
-  const ready = project.length > 0;
+  const isNew = project === NEW_PROJECT;
+
+  // ---- B3: fetch the selected (existing) project's real roles ------------
+  // A brand-new project has no roles on disk yet, so we skip the fetch (it
+  // would 404) and lean on the static fallback below — `roleChoices`/
+  // `roleLoading` ignore `roleState` while `isNew`, so a stale value here is
+  // inert and we don't need a synchronous reset (which would trip
+  // react-hooks/set-state-in-effect). The async transitions (loading→ready/
+  // error) follow the same data-fetch pattern as the per-sid history seed.
+  useEffect(() => {
+    if (isNew || !project) return;
+    let cancelled = false;
+    setRoleState({ kind: "loading" });
+    listProjectRoles(project)
+      .then((roles) => {
+        if (!cancelled) setRoleState({ kind: "ready", roles });
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        if (e instanceof Error && e.message === "UNAUTHENTICATED") {
+          // global gate re-auths; just fall back silently.
+          setRoleState({ kind: "error" });
+          return;
+        }
+        toastBus.handler?.error(
+          `加载角色失败: ${e instanceof Error ? e.message : "unknown"}（回退默认角色）`,
+        );
+        setRoleState({ kind: "error" });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [project, isNew]);
+
+  // The role <select> options. For an EXISTING project with a successful,
+  // non-empty fetch we show its real roles ("role — description"); otherwise
+  // (new project / empty / error / still-loading) we fall back to the static
+  // ROLE_SUGGESTIONS-seeded list so the user always has cto + the usual hints.
+  // `isNew` shortcuts to the fallback regardless of any stale `roleState`.
+  const roleChoices: { value: string; label: string }[] = useMemo(() => {
+    if (!isNew && roleState.kind === "ready" && roleState.roles.length > 0) {
+      return roleState.roles.map((r) => ({
+        value: r.role,
+        label: r.description ? `${r.role} — ${r.description}` : r.role,
+      }));
+    }
+    return fallbackRoles.map((r) => ({ value: r, label: r }));
+  }, [isNew, roleState, fallbackRoles]);
+
+  const roleLoading = !isNew && roleState.kind === "loading";
+
+  // The role <select>'s controlled value, DERIVED (not effect-synced) so the
+  // option set changing (project switch / fetch resolve) can't desync state:
+  // honor the user's explicit pick while it's still on offer, otherwise fall
+  // back to the first choice. `role===""` means "no explicit pick yet".
+  const selectedRole =
+    role && roleChoices.some((c) => c.value === role) ? role : roleChoices[0]?.value ?? "";
+
+  const effectiveRole = selectedRole.trim() || DEFAULT_ROLE;
+
+  // ---- submit gating -----------------------------------------------------
+  const newSlugErr = isNew ? slugError(newSlug.trim()) : null;
+  const newPathErr = isNew ? pathError(newPath) : null;
+  const ready = isNew
+    ? !pending && newSlugErr === null && newPathErr === null
+    : !pending && project.length > 0;
 
   const submit = () => {
     if (!ready) return;
-    onCreate(project, effectiveRole, vendor, hitl ? "hitl" : "skip");
+    setPending(true);
+    const targetSlug = isNew ? newSlug.trim() : project;
+    void onCreate(
+      targetSlug,
+      effectiveRole,
+      vendor,
+      hitl ? "hitl" : "skip",
+      isNew ? newPath.trim() : undefined,
+    )
+      .then((ok) => {
+        // On success the parent navigates away & unmounts us. On failure it
+        // toasted the (human-readable) error; we re-enable so the user can
+        // fix the input and retry without losing what they typed.
+        if (ok) onCancel();
+        else setPending(false);
+      })
+      .catch(() => setPending(false));
+  };
+
+  // Esc closes, Enter submits (when not composing in the textarea-less modal).
+  const onKeyDown = (event: React.KeyboardEvent) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      if (!pending) onCancel();
+    } else if (event.key === "Enter") {
+      event.preventDefault();
+      submit();
+    }
   };
 
   return (
@@ -598,6 +764,7 @@ function NewSessionModal({
       <div
         className="w-full max-w-md rounded-lg bg-surface-900 border border-surface-700 shadow-xl"
         onClick={(event) => event.stopPropagation()}
+        onKeyDown={onKeyDown}
       >
         <div className="px-4 h-11 flex items-center justify-between border-b border-surface-700/50">
           <span className="text-sm font-semibold">新建 session</span>
@@ -610,15 +777,51 @@ function NewSessionModal({
           <select
             value={project}
             onChange={(event) => setProject(event.target.value)}
-            className="w-full h-9 rounded-md bg-surface-800 border border-surface-700 px-3 text-sm outline-none focus:border-amber-500"
+            disabled={pending}
+            className="w-full h-9 rounded-md bg-surface-800 border border-surface-700 px-3 text-sm outline-none focus:border-amber-500 disabled:opacity-40"
           >
-            {projects.length === 0 ? <option value="">（暂无已有项目）</option> : null}
+            {projects.length === 0 && !isNew ? (
+              <option value="">（暂无已有项目）</option>
+            ) : null}
             {projects.map((item) => (
               <option key={item} value={item}>
                 {item}
               </option>
             ))}
+            <option value={NEW_PROJECT}>＋ 新建项目…</option>
           </select>
+
+          {isNew ? (
+            <div className="space-y-3 rounded-md border border-amber-500/30 bg-amber-500/5 p-3">
+              <div>
+                <label className="block text-xs text-text-dim mb-1">项目名（slug）</label>
+                <input
+                  value={newSlug}
+                  onChange={(event) => setNewSlug(event.target.value)}
+                  disabled={pending}
+                  autoFocus
+                  placeholder="my-project"
+                  className="w-full h-9 rounded-md bg-surface-800 border border-surface-700 px-3 text-sm outline-none focus:border-amber-500 disabled:opacity-40"
+                />
+                {newSlug.length > 0 && newSlugErr ? (
+                  <div className="mt-1 text-[11px] text-red-400">{newSlugErr}</div>
+                ) : null}
+              </div>
+              <div>
+                <label className="block text-xs text-text-dim mb-1">工作目录</label>
+                <input
+                  value={newPath}
+                  onChange={(event) => setNewPath(event.target.value)}
+                  disabled={pending}
+                  placeholder="~/code/my-project 或 /abs/path"
+                  className="w-full h-9 rounded-md bg-surface-800 border border-surface-700 px-3 text-sm font-mono outline-none focus:border-amber-500 disabled:opacity-40"
+                />
+                {newPath.length > 0 && newPathErr ? (
+                  <div className="mt-1 text-[11px] text-red-400">{newPathErr}</div>
+                ) : null}
+              </div>
+            </div>
+          ) : null}
 
           <label className="block text-xs text-text-dim">Code agent</label>
           <div className="flex gap-1 rounded-md bg-surface-800 p-0.5">
@@ -626,8 +829,9 @@ function NewSessionModal({
               <button
                 key={value}
                 type="button"
+                disabled={pending}
                 onClick={() => setVendor(value)}
-                className={`flex-1 h-8 rounded text-xs ${
+                className={`flex-1 h-8 rounded text-xs disabled:opacity-40 ${
                   vendor === value ? "bg-surface-700 text-text-primary" : "text-text-dim"
                 }`}
               >
@@ -636,24 +840,30 @@ function NewSessionModal({
             ))}
           </div>
 
-          <label className="block text-xs text-text-dim">Role</label>
-          <input
-            list="ccteam-chat-roles"
-            value={role}
+          <div className="flex items-center justify-between">
+            <label className="block text-xs text-text-dim">Role</label>
+            {roleLoading ? (
+              <span className="text-[10px] text-text-dim">加载角色中…</span>
+            ) : null}
+          </div>
+          <select
+            value={selectedRole}
             onChange={(event) => setRole(event.target.value)}
-            placeholder={`${DEFAULT_ROLE} / reviewer / api …`}
-            className="w-full h-9 rounded-md bg-surface-800 border border-surface-700 px-3 text-sm outline-none focus:border-amber-500"
-          />
-          <datalist id="ccteam-chat-roles">
-            {roleOptions.map((item) => (
-              <option key={item} value={item} />
+            disabled={pending || roleLoading}
+            className="w-full h-9 rounded-md bg-surface-800 border border-surface-700 px-3 text-sm outline-none focus:border-amber-500 disabled:opacity-40"
+          >
+            {roleChoices.map((c) => (
+              <option key={c.value} value={c.value}>
+                {c.label}
+              </option>
             ))}
-          </datalist>
+          </select>
 
           <label className="flex items-center gap-2 text-xs text-text-secondary">
             <input
               type="checkbox"
               checked={hitl}
+              disabled={pending}
               onChange={(event) => setHitl(event.target.checked)}
               className="accent-amber-500"
             />
@@ -661,7 +871,16 @@ function NewSessionModal({
           </label>
 
           <div className="text-[11px] font-mono text-text-dim leading-5">
-            → <span className="text-text-secondary">POST /api/v1/projects/{project || "<project>"}/sessions</span>
+            {isNew ? (
+              <>
+                → <span className="text-text-secondary">POST /api/v1/projects</span> slug=
+                <span className="text-text-secondary">{newSlug.trim() || "<slug>"}</span>
+                <br />
+              </>
+            ) : null}
+            → <span className="text-text-secondary">
+              POST /api/v1/projects/{(isNew ? newSlug.trim() : project) || "<project>"}/sessions
+            </span>
             <br />
             → role=<span className="text-text-secondary">{effectiveRole}</span> vendor=
             <span className="text-text-secondary">{vendor}</span> mode=
@@ -672,7 +891,8 @@ function NewSessionModal({
           <button
             type="button"
             onClick={onCancel}
-            className="h-9 px-3 rounded-md text-sm text-text-dim hover:text-text-primary"
+            disabled={pending}
+            className="h-9 px-3 rounded-md text-sm text-text-dim hover:text-text-primary disabled:opacity-40"
           >
             取消
           </button>
@@ -680,9 +900,18 @@ function NewSessionModal({
             type="button"
             disabled={!ready}
             onClick={submit}
-            className="h-9 px-3 rounded-md text-sm bg-amber-500 text-surface-950 hover:bg-amber-400 disabled:opacity-40"
+            className="h-9 px-3 rounded-md text-sm bg-amber-500 text-surface-950 hover:bg-amber-400 disabled:opacity-40 flex items-center gap-1.5"
           >
-            创建并切过去
+            {pending ? (
+              <>
+                <span className="h-3 w-3 rounded-full border-2 border-surface-950/40 border-t-surface-950 animate-spin" />
+                {isNew ? "创建中…" : "切换中…"}
+              </>
+            ) : isNew ? (
+              "创建项目并开始"
+            ) : (
+              "创建并切过去"
+            )}
           </button>
         </div>
       </div>

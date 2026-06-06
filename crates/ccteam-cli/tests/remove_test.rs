@@ -632,6 +632,9 @@ fn t15_project_stop_kills_matching_chat_sessions() {
 
     let out = fx
         .cmd()
+        // This test seeds + asserts on real `tmux` sessions, so pin the CLI to
+        // the tmux backend (the default is now `rmux`, which wouldn't see them).
+        .env("CCTEAM_MUX_BACKEND", "tmux")
         .args(["project", "stop", &slug])
         .output()
         .expect("spawn ccteam project stop");
@@ -877,6 +880,9 @@ fn t18_project_rm_dry_run_lists_stop_and_acts_on_nothing() {
 
     let out = fx
         .cmd()
+        // Seeds + asserts on a real `tmux` session, so pin the CLI to the tmux
+        // backend (the default is now `rmux`, which wouldn't enumerate it).
+        .env("CCTEAM_MUX_BACKEND", "tmux")
         .args(["project", "rm", &slug, "--dry-run"])
         .output()
         .expect("spawn ccteam project rm --dry-run");

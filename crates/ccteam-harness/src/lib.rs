@@ -499,4 +499,80 @@ mod chat_session_enum_tests {
             ]
         );
     }
+
+    /// v0.8.8 B1 — exercises the exact composition the CLI's
+    /// `stop_project_chat_sessions` runs against the mux backend (so it works
+    /// under the default `rmux`, not just shell `tmux`): enumerate via
+    /// [`list_chat_sessions`], filter to a slug via [`parse_chat_session_name`]
+    /// (dash-aware — the slug is the *first* parsed element), [`kill`] each
+    /// match, then confirm the slug's sessions are gone while a dash-prefix
+    /// sibling project and a non-chat session survive. Driven on a single
+    /// [`InProcBackend`] within one runtime so spawn→list→kill stays coherent.
+    #[tokio::test]
+    async fn kill_chat_sessions_for_slug_leaves_other_slugs_and_non_chat() {
+        let backend = InProcBackend::new();
+        // `dev-foo` is ours; `dev` is a dash-PREFIX sibling slug that a naive
+        // `starts_with("ccteam-chat-dev")` would wrongly match.
+        let ours_a = chat_session_name("dev-foo", "alice");
+        let ours_b = chat_session_name("dev-foo", "bob");
+        let sibling = chat_session_name("dev", "carol"); // slug == `dev`, NOT ours
+        let non_chat = "plain-session".to_string();
+        for name in [&ours_a, &ours_b, &sibling, &non_chat] {
+            backend.spawn(spec(name)).await.unwrap();
+        }
+
+        // Enumerate + filter to our slug exactly as the CLI does.
+        let live = list_chat_sessions(&backend).await.unwrap();
+        let mut matches: Vec<String> = live
+            .into_iter()
+            .filter(|name| {
+                parse_chat_session_name(name)
+                    .map(|(s, _last)| s == "dev-foo")
+                    .unwrap_or(false)
+            })
+            .collect();
+        matches.sort();
+        assert_eq!(
+            matches,
+            vec![ours_a.clone(), ours_b.clone()],
+            "filter must match only `dev-foo`, not the `dev` sibling or non-chat",
+        );
+
+        // Kill each match (idempotent).
+        for name in &matches {
+            backend
+                .kill(&MuxSessionId::new(name.clone()))
+                .await
+                .unwrap();
+        }
+
+        // Ours are absent; sibling + non-chat survive.
+        for name in [&ours_a, &ours_b] {
+            assert!(
+                !backend
+                    .exists(&MuxSessionId::new(name.clone()))
+                    .await
+                    .unwrap(),
+                "`{name}` must be absent after kill",
+            );
+        }
+        for name in [&sibling, &non_chat] {
+            assert!(
+                backend
+                    .exists(&MuxSessionId::new(name.clone()))
+                    .await
+                    .unwrap(),
+                "`{name}` (not our slug) must survive",
+            );
+        }
+
+        // Re-kill is a no-op (kill is idempotent — the stop red line relies on
+        // this so a repeat `project stop` never errors).
+        for name in [&ours_a, &ours_b] {
+            backend
+                .kill(&MuxSessionId::new(name.clone()))
+                .await
+                .unwrap();
+        }
+    }
 }
