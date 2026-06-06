@@ -26,6 +26,7 @@ v0.8.7 的 per-session web UI 把"会话"做成了 **UI 壳独立、数据按 `(
 | **B3** | 新建弹窗 role 改下拉真实 role | bug/UX | 现手输 + 静态建议,不知有哪些 role | BUG-4 |
 | **B4** | `session ls`/`status` 显示 vendor + 修 codex 活性误报 | bug/UX | session ls 按 backend 名枚举、看不到 codex | BUG-5 |
 | **B5** | web 终端 PTY WS 修复 + "像本地终端" | bug/feature | 连上即断:路由没指向会话 pane + I/O 硬编码 tmux | BUG-6 |
+| **C1** | 代码库清理 | chore | 删根目录遗留(teams/skills/examples + 发现的 workflows/agents/根 config.yaml 等) | TG 2375 |
 
 > BUG-3(per-session 串台)**不单列修项** —— 它是 `session = role` 的症状,由 **F1 根治**。
 
@@ -90,6 +91,30 @@ v0.8.7 的 per-session web UI 把"会话"做成了 **UI 壳独立、数据按 `(
 - **设计方向**:(a) 浏览**已装**项目 role(列表 + 详情查看,API 已具备 → 纯前端页);(b) 可选:浏览 + 从 catalog 一键装(需**新增** web 路由 `GET /catalog/roles` + import,= v0.8.7 未做的 follow-on)。
 - **开放问题**:① "浏览"范围 = 仅已装,还是也含 catalog 浏览/装?② web 上 role 只读还是可编辑(PUT 已有)?③ 跟 F4 config、新建弹窗 role 下拉(B3)是否统一进一个"设置/角色"导航区?
 
+### C1 · 代码库清理(删根目录遗留 / stray)(TG 2375)
+
+**user 点名删**:根目录 `teams/`、`skills/`、`examples/`。
+
+**核实(删除安全性,代码为 SoT)**:
+
+| 目标 | 内容 | 引用核查 | 结论 |
+|---|---|---|---|
+| `teams/` | `teams/meta-agent/team.yaml`(legacy agent-team 种子) | 代码里 "teams" 全指**运行期** `~/.ccteam/teams` / `~/.claude/teams`(paths.rs:261、commands.rs:6714、team_resolver.rs:72),**非 repo-root**;无 manifest/CI/workspace 引用 | **删**(agent-team mode 已弃) |
+| `skills/` | 仅 `skills/.gitkeep` | `.claude-plugin/{marketplace,plugin}.json`、`.codex-plugin/plugin.json`、`.mcp.json` **都不引用 `skills/`**(只 `mcpServers:./.mcp.json`、`source:./`) | **删** |
+| `examples/` | `examples/workflows/`(deferred ccteam-flow 示例) | 无 manifest/CI 引用 | **删** |
+
+**额外发现(回答"还有哪些?")**:
+
+| 目标 | 内容 | 建议 |
+|---|---|---|
+| 根 `config.yaml` | **stray**:`slug: smoke-x` / `/tmp/ccteam-smoke-proj.*` / 今天的 `installed_at` —— smoke 测试误写进 repo 根**且被 commit** | **删 + 加 `.gitignore`**(config.yaml 该在 `~/.ccteam`、不进仓);顺带查 smoke 为啥往 CWD 写 |
+| `workflows/` | `dev-flow/`、`qa-autoloop/`(deferred ccteam-flow 的完整示例 workflow.yaml + agents) | **建议删**(= examples/ 的大号兄弟,同属 deferred flow;无 manifest/CI 引用)— 待确认 |
+| `agents/` | `agents/{README,__lead,explorer}.md`(repo-root legacy agent-team 角色) | **建议删**(现模型用项目级 `.claude/agents/<role>.md`,repo-root `agents/` 是旧物)— 待确认 |
+| `tests/intent-corpus.yaml` + `scripts/host-probe/intent-accuracy.sh` | 测的是**已删除**的 `skills/ccteam/SKILL.md` NL dispatcher(本版 0 bundled skills) | **建议删 / 重做**(stale,引用已删文件 :112/229/329/378)— 待确认 |
+| `.agents/plugins/marketplace.json` | codex 插件 marketplace 指针(`source:url firstintent/ccteam`) | **保留**(codex 插件发现 infra、非死物);若确认不走 codex 插件渠道再删 |
+
+**归属**:纯删除 chore;每个目标删前再 grep 确认无运行期引用(**别误删 `~/.ccteam/teams` 那个运行期目录**);`cargo test --workspace` + clippy 不退;删 `tests/` 时一并清 host-probe 里对 `skills/ccteam/SKILL.md` 的 stale 引用。
+
 ---
 
 ## 四、Bug 修(详见 `bug.md`,各条 file:line 已验证)
@@ -112,3 +137,4 @@ v0.8.7 的 per-session web UI 把"会话"做成了 **UI 壳独立、数据按 `(
 - **2026-06-06 +F3 / +B4 / +B5**:F3 status 重写(TG 2363,开放问题经 2366 确认、加 vendor);B4 session ls vendor + codex 活性(BUG-5,TG 2365);B5 web 终端 PTY WS 断开(BUG-6,TG 2367/2368)。
 - **2026-06-06 +F4 / +F5 + 结构重排**:F4 web config 模块(telegram+lark,TG 2370);F5 web role 浏览页(TG 2371);PRD 改成"功能项 = `### F*` 子节"的可扩展结构(新需求不再动顶层编号)。
 - **2026-06-06 + web UI 质量基线**:新增横切要求 §二(TG 2373:高质量、交互友好 UI),落成可验收清单(设计系统 / 四态 / 错误可读 / 响应式 / 交互细节 / 即时性 / a11y),每个 web 项验收加"UX 过关"+ web wave gate 含 UI review。
+- **2026-06-06 +C1 代码库清理**(TG 2375):点名删 `teams/`/`skills/`/`examples/`(已核实无 manifest/CI/workspace 引用、代码 "teams" 全指 ~/.ccteam 运行期);额外发现 = 根 stray `config.yaml`(smoke artifact,删+gitignore)、`workflows/`(deferred-flow)、`agents/`(root legacy)、`tests/intent-corpus.yaml`+host-probe(测已删 skill)— 待 user 确认;`.agents/plugins/marketplace.json` = codex 插件 infra,保留。
