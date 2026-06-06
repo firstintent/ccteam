@@ -73,9 +73,9 @@
 - **A · 真·独立 session**:给会话一个**持久** session id(非内存 `s{n}`;建会话时 mint 落地)→ 写进 `TurnRecord` + 历史端点按它过滤;并允许同 role 多 pane。**破** 当前 dedup invariant + `session = role` keystone。大改。**与 ENH-1(roleless)同向**——roleless 会话无 role 可作 turns key,本就需要 session 身份。
 - **B · 对齐 `session = role`**:接受"一个 `(project, role)` = 一个会话",rail 每 role 一条,历史 = 该 role 全量(= 故意的连续性)。小改(UI 诚实化:别再暗示多个独立 sid 会话),跟红线一致。
 
-**待用户澄清**:串台的是**不同 role** 之间,还是**同一个 role**(多 cto / web+IM 同角色)?按现模型不同 role 走不同 turns.jsonl、**不该**串——若不同 role 也串=另一个更严重的 bug,需再查。同 role 串=上面的 per-role 模型浮现。
+**✅ 方向已定 = A(用户澄清 2026-06-06,TG 2359)**:用户明确「聊天独立 = 跟 Claude Code 原生 session 一样,终端起多个会话互不串台,同一个 role 开两个也各聊各的」。⇒ 走 **A**(session 一等实体 + 持久 id + turns 按 session 存 + 去 dedup + role 降为 session 属性),**改 `session = role` keystone**;B 弃。仍待查:**不同 role** 之间若也串(现模型各自 turns.jsonl、**不该**串)= 另一个更严重 bug。
 
-**归属**:**设计决策(A/B)定了才动手**(用户诉求 ENH-1 倾向 A)。
+**归属**:架构级改动 → **doc-first**(先写 design:session 一等实体 + 持久 id + turns 按 session 存 + 去 dedup + 与 resume-by-id/红线对齐 + 迁移),user review 后再动代码。已向 user 提议、待 go。BUG-4 与方向无关可先做。
 
 ---
 
