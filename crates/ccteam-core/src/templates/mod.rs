@@ -229,13 +229,21 @@ fn render_settings_template(
 /// pointing at the running ccteam binary by absolute path, the
 /// effective `CCTEAM_HOME` / `CCTEAM_PROJECTS_ROOT` baked into `env`,
 /// and the spawned-session `enabledPlugins` set. Creates the parent
-/// dir if missing. Idempotent — overwrites any prior render so
-/// re-running after a ccteam upgrade refreshes paths and the
-/// plugin set.
+/// dir if missing. Idempotent — re-running after a ccteam upgrade
+/// refreshes the ccteam-managed keys (paths + plugin set) in place.
 ///
 /// v0.8.6 W2b — this targets the **local** settings layer
 /// (`settings.local.json`), not the user-committed `settings.json`, so
 /// the fresh-project ccteam base config never dirties the user's repo.
+///
+/// v0.8.6 review-fix — re-init / in-place init **merges** the rendered
+/// ccteam base config into any pre-existing `settings.local.json`
+/// instead of clobbering it. ccteam *owns* (and overwrites) the
+/// top-level `hooks` block and the specific nested keys it renders into
+/// `env` / `permissions` / `enabledPlugins`; it *preserves* every
+/// user-authored top-level key, plus any nested `env` / `permissions` /
+/// `enabledPlugins` key ccteam does not render. See
+/// [`merge_ccteam_settings`].
 pub fn write_project_settings(project_dir: &Path, enabled: &EnabledPluginsSetting) -> Result<()> {
     write_settings_template(project_dir, enabled, ProjectSettingsKind::ArtifactDriven)
 }
@@ -281,7 +289,84 @@ fn write_settings_template(
             render_project_settings_agent_team(&hook_sh, &extra, enabled)?
         }
     };
-    std::fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
+    // v0.8.6 review-fix — merge the rendered ccteam base config into the
+    // existing settings.local.json (read + merge + write), mirroring
+    // `ensure_chat_hooks_installed`, so an in-place / re-init never
+    // destroys the user's own gitignored local settings.
+    let rendered: Value = serde_json::from_str(&body)
+        .with_context(|| format!("rendered settings.local.json is not valid JSON for {kind:?}"))?;
+    let mut root: Value = if path.exists() {
+        let existing =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        // A user file that is missing or corrupt JSON degrades to a fresh
+        // object rather than aborting the init (same policy as the hook
+        // installer); ccteam-managed keys are then written on top.
+        serde_json::from_str(&existing).unwrap_or_else(|_| Value::Object(Default::default()))
+    } else {
+        Value::Object(Default::default())
+    };
+    merge_ccteam_settings(&mut root, &rendered)?;
+    let merged =
+        serde_json::to_string_pretty(&root).context("serialize merged settings.local.json")?;
+    std::fs::write(&path, merged).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+/// Top-level keys whose *nested* members ccteam renders into the
+/// settings template. For these we deep-merge — ccteam overwrites only
+/// the nested keys it produces (e.g. `env.CCTEAM_HOME`,
+/// `permissions.allow`, a given `enabledPlugins` id) and leaves every
+/// other nested key the user authored untouched. The top-level `hooks`
+/// block is *not* listed here: ccteam owns it wholesale and replaces it
+/// (matching `ensure_chat_hooks_installed`, which the chat path layers
+/// on top afterwards).
+const CCTEAM_DEEP_MERGE_KEYS: &[&str] = &["env", "permissions", "enabledPlugins"];
+
+/// Merge the freshly-`rendered` ccteam settings into `root` (the user's
+/// existing — possibly empty — `settings.local.json`) in place.
+///
+/// ccteam **owns** (overwrites): the top-level `hooks` block, plus the
+/// individual nested keys it renders under `env` / `permissions` /
+/// `enabledPlugins`. ccteam **preserves**: every user-authored top-level
+/// key not present in the template, and every nested `env` /
+/// `permissions` / `enabledPlugins` key ccteam does not render.
+fn merge_ccteam_settings(root: &mut Value, rendered: &Value) -> Result<()> {
+    let dst = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("settings.local.json root is not a JSON object"))?;
+    let src = rendered
+        .as_object()
+        .ok_or_else(|| anyhow!("rendered ccteam settings root is not a JSON object"))?;
+    for (key, src_val) in src {
+        if CCTEAM_DEEP_MERGE_KEYS.contains(&key.as_str()) {
+            // Deep-merge: copy each rendered nested key over the user's,
+            // creating the parent object if the user had none.
+            if let Some(src_obj) = src_val.as_object() {
+                let dst_entry = dst
+                    .entry(key.clone())
+                    .or_insert_with(|| Value::Object(Default::default()));
+                match dst_entry.as_object_mut() {
+                    Some(dst_obj) => {
+                        for (nested_key, nested_val) in src_obj {
+                            dst_obj.insert(nested_key.clone(), nested_val.clone());
+                        }
+                    }
+                    // User wrote a non-object under this key — ccteam
+                    // takes it over rather than silently dropping its
+                    // managed nested keys.
+                    None => {
+                        dst.insert(key.clone(), src_val.clone());
+                    }
+                }
+                continue;
+            }
+            // Rendered value is unexpectedly not an object — overwrite.
+            dst.insert(key.clone(), src_val.clone());
+        } else {
+            // ccteam owns this top-level key wholesale (e.g. `hooks`).
+            dst.insert(key.clone(), src_val.clone());
+        }
+    }
     Ok(())
 }
 
@@ -454,6 +539,85 @@ mod tests {
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(v.get("enabledPlugins").is_none());
+    }
+
+    #[test]
+    fn merge_ccteam_settings_preserves_user_keys() {
+        // Pre-seed an existing settings.local.json with user-authored
+        // top-level keys plus user-authored nested keys under the
+        // deep-merge keys ccteam touches. The merge must keep all of them
+        // while still stamping ccteam-managed config on top.
+        let existing = serde_json::json!({
+            "env": { "USER_X": "1", "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "user-was-here" },
+            "permissions": { "ask": ["Bash(rm:*)"] },
+            "model": "opus",
+            "statusLine": { "type": "command", "command": "my-status" }
+        });
+        let rendered = render_project_settings(
+            Path::new("/home/u/.ccteam/hooks/hook.sh"),
+            &SettingsEnv {
+                ccteam_home: Some("/tmp/sandbox/home".into()),
+                ccteam_projects_root: None,
+            },
+            &EnabledPluginsSetting::default(),
+        )
+        .unwrap();
+        let rendered: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+
+        let mut root = existing;
+        merge_ccteam_settings(&mut root, &rendered).unwrap();
+
+        // User-authored top-level keys ccteam does not own SURVIVE.
+        assert_eq!(root["model"], "opus");
+        assert_eq!(root["statusLine"]["command"], "my-status");
+        // User-authored nested env key SURVIVES.
+        assert_eq!(root["env"]["USER_X"], "1");
+        // User-authored nested permissions key SURVIVES.
+        assert_eq!(root["permissions"]["ask"][0], "Bash(rm:*)");
+        // ccteam-managed nested keys are present (and overwrite where they
+        // collide on a key ccteam owns).
+        assert_eq!(root["env"]["CCTEAM_HOME"], "/tmp/sandbox/home");
+        assert_eq!(
+            root["env"]["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"], "1",
+            "ccteam owns this env key and overwrites the user's stale value",
+        );
+        assert_eq!(root["permissions"]["allow"][0], "*");
+        // ccteam owns the hooks block wholesale.
+        assert!(root["hooks"]["SessionStart"].is_array());
+    }
+
+    #[test]
+    fn write_project_settings_merges_into_existing_local_file() {
+        // Full end-to-end: an in-place re-init over a project that already
+        // has a user-authored settings.local.json must NOT destroy it.
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+        let claude_dir = project.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let settings_path = claude_dir.join("settings.local.json");
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "env": { "USER_X": "1" },
+                "permissions": { "ask": ["Bash(rm:*)"] },
+                "model": "opus"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        write_project_settings(project, &EnabledPluginsSetting::default())
+            .expect("in-place write must succeed");
+
+        let body = std::fs::read_to_string(&settings_path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        // User keys SURVIVE the re-init (top-level + nested).
+        assert_eq!(v["env"]["USER_X"], "1");
+        assert_eq!(v["model"], "opus");
+        assert_eq!(v["permissions"]["ask"][0], "Bash(rm:*)");
+        // ccteam-managed keys are present.
+        assert_eq!(v["env"]["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"], "1");
+        assert!(v["hooks"]["SessionStart"].is_array());
     }
 
     #[test]

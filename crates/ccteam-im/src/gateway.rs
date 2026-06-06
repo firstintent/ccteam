@@ -1012,6 +1012,11 @@ impl Gateway {
     /// reusing the SAME gateway session id so `/use <sid>` keeps resolving. No
     /// dedup here (unlike `start_session`): the new pane never collides with the
     /// old role's pane, and an explicit `/role` always wants a fresh agent.
+    ///
+    /// The target role is validated (name charset + `.claude/agents/<role>.md`
+    /// existence under the session's project dir) BEFORE any teardown, so a bad
+    /// or missing role is rejected with the live session left untouched rather
+    /// than destroying the user's working pane on a failed re-spawn.
     async fn switch_current_role(&mut self, chat: &ChatKey, role: String) -> Result<String> {
         let sid = self
             .current_session
@@ -1037,6 +1042,21 @@ impl Gateway {
             .get(&project)
             .cloned()
             .ok_or_else(|| anyhow!("unknown project: {project}"))?;
+
+        // Validate the target role BEFORE touching the live session: a typo or
+        // a role that has no `.claude/agents/<role>.md` would otherwise tear the
+        // working pane down here and then fail to spawn `claude --agent <role>`,
+        // silently destroying the user's chat. `read_role` resolves the role
+        // file under the session's project dir (`cwd`, the same path the spawn
+        // uses) and validates the name charset ([a-z0-9_-]); it returns `Err`
+        // on a bad name (path-traversal etc.) and `Ok(None)` when the file is
+        // absent — both mean "no such role", so we bail with a clear hint and
+        // leave the session completely intact.
+        if ccteam_core::read_role(&cwd, &role).ok().flatten().is_none() {
+            return Err(anyhow!(
+                "role 不存在:.claude/agents/{role}.md 未找到;用 /role <已存在的角色>"
+            ));
+        }
 
         // Tear down the old pane + its event pump before re-spawning so the
         // single (project, role) pane invariant holds and no stale pump keeps
@@ -2321,6 +2341,19 @@ mod tests {
             id: "i1".into(),
             details: ThreadItemDetails::AgentMessage(text.into()),
         })
+    }
+
+    /// Seed a `.claude/agents/<role>.md` under `project_dir` so the `/role`
+    /// existence check (`ccteam_core::read_role`) resolves it. Minimal frontmatter
+    /// is enough; the gateway only checks the file exists, not its contents.
+    fn seed_role(project_dir: &std::path::Path, role: &str) {
+        let agents = project_dir.join(".claude").join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join(format!("{role}.md")),
+            format!("---\nname: {role}\n---\n{role} role.\n"),
+        )
+        .unwrap();
     }
 
     /// Regression: a real `codex app-server` turn emits the agent message
@@ -3735,7 +3768,12 @@ mod tests {
     #[tokio::test]
     async fn gateway_role_switches_current_session_in_place() {
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        // `/role` validates `.claude/agents/<role>.md` under the project dir
+        // before re-spawning, so point the project at a real temp dir and seed
+        // the target role there.
+        let tmp = tempfile::tempdir().unwrap();
+        seed_role(tmp.path(), "reviewer");
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
 
         // No active session yet → `/role` returns the helpful Chinese error.
         let no_session = gateway
@@ -3792,6 +3830,81 @@ mod tests {
             "render_help should list /role: {}",
             render_help()
         );
+    }
+
+    /// V0.8.6 fix #5 — `/role` to a missing role must NOT destroy the live
+    /// session: it validates `.claude/agents/<role>.md` (under the session's
+    /// project dir) before any teardown, so a typo / absent role is rejected
+    /// with a clear hint and the working pane stays intact (same sid + role,
+    /// no re-spawn). A switch to a role that DOES exist still works.
+    #[tokio::test]
+    async fn gateway_role_missing_role_keeps_session_intact() {
+        let fake = Arc::new(FakeAdapter::default());
+        let tmp = tempfile::tempdir().unwrap();
+        // `reviewer` exists; `ghost` deliberately does not.
+        seed_role(tmp.path(), "reviewer");
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+
+        // Start a default `cto` session (s1) and drive it once so the pane is
+        // demonstrably live.
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new")
+            .await
+            .unwrap();
+        let cto_reply = gateway
+            .handle_text("mock", "chat-1", "alice", "hi")
+            .await
+            .unwrap();
+        assert_eq!(cto_reply, vec!["alpha-cto-s1 echo: hi"]);
+        // One spawn so far (the `cto` start); the bad switch must not add another.
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
+
+        // `/role ghost` → Err with the missing-role hint; session UNCHANGED.
+        let err = gateway
+            .handle_text("mock", "chat-1", "alice", "/role ghost")
+            .await
+            .expect_err("/role to a missing role should error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("role 不存在") && msg.contains("ghost.md"),
+            "expected the missing-role hint naming the file: {msg}"
+        );
+        // No teardown + re-spawn happened on the bad role.
+        assert_eq!(
+            fake.starts.load(Ordering::SeqCst),
+            1,
+            "a bad /role must not re-spawn (no teardown of the live pane)"
+        );
+
+        // The session is still resolvable, still s1, still `cto`.
+        let listing = gateway
+            .handle_text("mock", "chat-1", "alice", "/sessions")
+            .await
+            .unwrap();
+        assert_eq!(listing, vec!["s1:alpha:Claude:cto"]);
+        // And a follow-up turn still routes to the SAME live `cto` pane.
+        let still_cto = gateway
+            .handle_text("mock", "chat-1", "alice", "still here?")
+            .await
+            .unwrap();
+        assert_eq!(still_cto, vec!["alpha-cto-s1 echo: still here?"]);
+
+        // A switch to a role that DOES exist still works (same sid, fresh agent).
+        let switched = gateway
+            .handle_text("mock", "chat-1", "alice", "/role reviewer")
+            .await
+            .unwrap();
+        assert_eq!(switched, vec!["switched session s1 to role reviewer"]);
+        assert_eq!(
+            fake.starts.load(Ordering::SeqCst),
+            2,
+            "a valid /role re-spawns exactly once"
+        );
+        let after = gateway
+            .handle_text("mock", "chat-1", "alice", "now?")
+            .await
+            .unwrap();
+        assert_eq!(after, vec!["alpha-reviewer-s1 echo: now?"]);
     }
 
     // ===== v0.8.5 D6 — AskUserQuestion → IM round-trip (External origin) =====
