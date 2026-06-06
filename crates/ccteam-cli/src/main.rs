@@ -3179,6 +3179,53 @@ async fn run_session_dispatch(
     .unwrap_or_else(|_| "{}".to_string()))
 }
 
+/// v0.8.7 review-fix (R-L3) — pure paging core of [`run_session_collect`],
+/// extracted so the cursor/truncation contract is unit-testable without a
+/// gateway or filesystem. Given ALL mirrored turns, an optional `since`
+/// turn-id cursor, and a page size `n`, returns `(rows, next_cursor,
+/// truncated)`:
+///
+/// - keeps only assistant-side turns AFTER `since` (or all when `since` is
+///   `None` / not found — never silently lose turns on a stale cursor),
+/// - returns the OLDEST `n` of those (so repeated polls page forward in order),
+/// - `truncated` is true when more than `n` were available → the caller polls
+///   again with `next_cursor` to fetch the remainder (the old code kept the
+///   NEWEST `n` and dropped the middle of a > `n` burst).
+fn page_collected_turns(
+    all: &[ccteam_harness::execution::turns_mirror::TurnRecord],
+    since: Option<&str>,
+    n: usize,
+) -> (Vec<serde_json::Value>, Option<String>, bool) {
+    let after: Vec<&ccteam_harness::execution::turns_mirror::TurnRecord> = match since {
+        Some(cursor) => match all.iter().position(|t| t.turn_id == cursor) {
+            Some(idx) => all.iter().skip(idx + 1).collect(),
+            // Cursor not found (rotated / typo) → return everything so the
+            // caller never silently loses turns.
+            None => all.iter().collect(),
+        },
+        None => all.iter().collect(),
+    };
+    let mut rows: Vec<serde_json::Value> = after
+        .iter()
+        .filter(|t| !t.assistant.is_empty())
+        .map(|t| {
+            serde_json::json!({
+                "turn_id": t.turn_id,
+                "ts": t.ts.to_rfc3339(),
+                "content": t.assistant,
+            })
+        })
+        .collect();
+    let truncated = rows.len() > n;
+    rows.truncate(n);
+    let last_turn_id = rows
+        .last()
+        .and_then(|r| r.get("turn_id"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    (rows, last_turn_id, truncated)
+}
+
 /// `session_collect` — tail the child's `turns.jsonl` (assistant turns).
 /// Polled MVP: resolve sid → role + project_dir under the lock, drop the
 /// guard, then read the ccteam-owned mirror. `since` is a turn_id cursor.
@@ -3210,38 +3257,9 @@ async fn run_session_collect(
     )
     .map_err(|e| format!("session_collect: read turns.jsonl for {sid}: {e}"))?;
 
-    // Apply the `since` cursor: keep only turns AFTER the named turn_id.
-    let after: Vec<&ccteam_harness::execution::turns_mirror::TurnRecord> = match &since {
-        Some(cursor) => {
-            match all.iter().position(|t| &t.turn_id == cursor) {
-                Some(idx) => all.iter().skip(idx + 1).collect(),
-                // Cursor not found (rotated / typo) → return everything so
-                // the caller never silently loses turns.
-                None => all.iter().collect(),
-            }
-        }
-        None => all.iter().collect(),
-    };
-
-    // Project to assistant-side wire rows, then tail to `n`.
-    let mut rows: Vec<serde_json::Value> = after
-        .iter()
-        .filter(|t| !t.assistant.is_empty())
-        .map(|t| {
-            serde_json::json!({
-                "turn_id": t.turn_id,
-                "ts": t.ts.to_rfc3339(),
-                "content": t.assistant,
-            })
-        })
-        .collect();
-    let start = rows.len().saturating_sub(n);
-    rows = rows.split_off(start);
-    let last_turn_id = rows
-        .last()
-        .and_then(|r| r.get("turn_id"))
-        .and_then(|v| v.as_str())
-        .map(String::from);
+    // Apply the `since` cursor + page forward (R-L3 — oldest-first, no silent
+    // drop of a > `n` burst). Pure logic in `page_collected_turns`.
+    let (rows, last_turn_id, truncated) = page_collected_turns(&all, since.as_deref(), n);
 
     Ok(serde_json::to_string_pretty(&serde_json::json!({
         "ok": true,
@@ -3249,7 +3267,11 @@ async fn run_session_collect(
         "role": resolved.role,
         "turns": rows,
         // Cursor to pass as `since` on the next poll (None when no turns yet).
+        // On truncation this is the boundary turn → poll again to get the rest.
         "cursor": last_turn_id,
+        // True when more turns than `n` were available after `since`; the caller
+        // should poll again with `cursor` to page through the remainder.
+        "truncated": truncated,
     }))
     .unwrap_or_else(|_| "{}".to_string()))
 }
@@ -4513,5 +4535,78 @@ mod session_tool_tests {
     fn emit_permission_prompt_outstanding_blank_slug_is_noop() {
         // Must not panic / must not touch the filesystem for a blank slug.
         emit_permission_prompt_outstanding("", "cto", "Bash", "rm -rf /", 120);
+    }
+
+    // ---------- v0.8.7 review-fix (R-L3) session_collect paging ----------
+
+    fn turn(id: &str) -> ccteam_harness::execution::turns_mirror::TurnRecord {
+        ccteam_harness::execution::turns_mirror::TurnRecord {
+            turn_id: id.to_string(),
+            ts: chrono::Utc::now(),
+            vendor: "claude".to_string(),
+            role: "cto".to_string(),
+            user: "q".to_string(),
+            assistant: format!("a-{id}"),
+            usage: serde_json::Value::Null,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    /// A burst of MORE than `n` turns after the cursor must NOT silently drop
+    /// the middle: `page_collected_turns` returns the OLDEST `n`, sets the
+    /// cursor to that page's boundary, and flags `truncated` so a follow-up
+    /// poll fetches the rest. Walking the cursor returns EVERY turn in order.
+    #[test]
+    fn page_collected_turns_pages_a_burst_without_loss() {
+        let all: Vec<_> = (0..25).map(|i| turn(&format!("t{i}"))).collect();
+        // First poll, no cursor, page size 10.
+        let (rows, cursor, truncated) = page_collected_turns(&all, None, 10);
+        assert_eq!(rows.len(), 10);
+        assert!(truncated, "25 > 10 ⇒ truncated");
+        assert_eq!(rows[0]["turn_id"], "t0", "oldest-first (not the newest 10)");
+        assert_eq!(rows[9]["turn_id"], "t9");
+        assert_eq!(cursor.as_deref(), Some("t9"), "cursor = boundary turn");
+
+        // Second poll from the boundary.
+        let (rows2, cursor2, truncated2) = page_collected_turns(&all, Some("t9"), 10);
+        assert_eq!(rows2.len(), 10);
+        assert!(truncated2);
+        assert_eq!(
+            rows2[0]["turn_id"], "t10",
+            "no gap — resumes right after t9"
+        );
+        assert_eq!(cursor2.as_deref(), Some("t19"));
+
+        // Third poll drains the remainder.
+        let (rows3, _c3, truncated3) = page_collected_turns(&all, Some("t19"), 10);
+        assert_eq!(rows3.len(), 5);
+        assert!(!truncated3, "final page is not truncated");
+        assert_eq!(rows3[0]["turn_id"], "t20");
+        assert_eq!(rows3[4]["turn_id"], "t24");
+
+        // The three pages reconstruct the full ordered set — zero loss.
+        let mut seen: Vec<String> = Vec::new();
+        for page in [&rows, &rows2, &rows3] {
+            for r in page {
+                seen.push(r["turn_id"].as_str().unwrap().to_string());
+            }
+        }
+        let expected: Vec<String> = (0..25).map(|i| format!("t{i}")).collect();
+        assert_eq!(seen, expected, "every turn returned exactly once, in order");
+    }
+
+    /// A short backlog (≤ `n`) returns everything, `truncated:false`, cursor =
+    /// last turn. An unknown cursor returns everything (never silently lose).
+    #[test]
+    fn page_collected_turns_short_and_unknown_cursor() {
+        let all: Vec<_> = (0..3).map(|i| turn(&format!("t{i}"))).collect();
+        let (rows, cursor, truncated) = page_collected_turns(&all, None, 20);
+        assert_eq!(rows.len(), 3);
+        assert!(!truncated);
+        assert_eq!(cursor.as_deref(), Some("t2"));
+        // Unknown cursor → all turns (defensive, no loss).
+        let (rows_u, _c, trunc_u) = page_collected_turns(&all, Some("ghost"), 20);
+        assert_eq!(rows_u.len(), 3);
+        assert!(!trunc_u);
     }
 }

@@ -29,11 +29,12 @@
 //! YAML frontmatter (`name` / `description`) was read for the human fields.
 //! As of the snapshot baked here that is **192 roles across 78 divisions**
 //! (upstream tree sha `cf6059d0…`, branch `main`, license MIT). The upstream
-//! has no semver tags, so `raw_path` resolves against `HEAD`; pin a commit
-//! sha in [`AGENCY_RAW_BASE`] if reproducible imports are needed. Refreshing
-//! the manifest is a chore: re-run the sweep and overwrite
-//! `agency_agents_catalog.json` (mirrors the `workflow_templates/`
-//! maintenance pattern).
+//! has no semver tags, so [`AGENCY_RAW_BASE`] is **pinned to that exact commit
+//! sha** (`cf6059d030bf4fe96623ae2e596d2f31e35fedc0`, R-L6) so `raw_path` ↔
+//! content stays in lockstep with this manifest and imports are reproducible.
+//! Refreshing the manifest is a chore: re-run the sweep, overwrite
+//! `agency_agents_catalog.json`, AND bump the sha in [`AGENCY_RAW_BASE`]
+//! together (mirrors the `workflow_templates/` maintenance pattern).
 //!
 //! `id` is **globally unique**: file stems collide across divisions (e.g.
 //! `backend-architect` appears in 6 divisions), so `id` is the frontmatter
@@ -47,10 +48,18 @@ use serde::{Deserialize, Serialize};
 pub const AGENCY_AGENTS_CATALOG: &str = include_str!("templates/agency_agents_catalog.json");
 
 /// Raw-content base for resolving a [`CatalogEntry::raw_path`] to a full
-/// URL. `HEAD` tracks the upstream default branch; swap in a commit sha
-/// here for reproducible imports. The importer (`ccteam-im`) may override
-/// this for deterministic tests.
-pub const AGENCY_RAW_BASE: &str = "https://raw.githubusercontent.com/wshobson/agents/HEAD";
+/// URL.
+///
+/// v0.8.7 review-fix (R-L6): **pinned to the exact commit sha the vendored
+/// manifest was swept from** (`cf6059d030bf4fe96623ae2e596d2f31e35fedc0`)
+/// instead of the mutable `HEAD`. This makes imports reproducible AND keeps
+/// `raw_path` ↔ content in lockstep with the baked manifest — `HEAD` could
+/// drift so a manifest `raw_path` 404s or fetches a renamed role. Refreshing
+/// the manifest (the documented sweep chore) means bumping BOTH the manifest
+/// JSON and this sha together. The importer (`ccteam-im`) may override this
+/// for deterministic tests.
+pub const AGENCY_RAW_BASE: &str =
+    "https://raw.githubusercontent.com/wshobson/agents/cf6059d030bf4fe96623ae2e596d2f31e35fedc0";
 
 /// One catalog entry. Carries only the metadata needed to browse + resolve
 /// a role for import; the markdown body is fetched on demand at import time.

@@ -4747,6 +4747,14 @@ pub fn run_role_add(
         "\nSwitch to it in a chat with `/role {}` (or spawn a session with that role).\n",
         result.role
     ));
+    // v0.8.7 review-fix (R-L6) — the body is third-party content (MIT
+    // agency-agents) fetched verbatim. Persona text steers an agent that runs
+    // with `--dangerously-skip-permissions`, so prompt the operator to read it
+    // before use rather than trusting it blind.
+    out.push_str(&format!(
+        "\nNote: this role .md is third-party content fetched verbatim — review {} before use.\n",
+        result.path.display()
+    ));
     Ok(out)
 }
 

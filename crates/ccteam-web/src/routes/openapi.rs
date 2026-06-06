@@ -32,6 +32,76 @@ use crate::state::AppState;
 pub const OPENAPI_JSON_PATH: &str = "/api/v1/openapi.json";
 /// Route at which the Scalar interactive UI is served (inside the auth gate).
 pub const DOCS_PATH: &str = "/api/docs";
+/// Route at which the **vendored** Scalar standalone JS is served (inside the
+/// auth gate, same-origin so the auth cookie carries). See [`SCALAR_JS`].
+pub const SCALAR_JS_PATH: &str = "/api/docs/scalar-standalone.js";
+
+/// v0.8.7 review-fix (R-M5) — the upstream `@scalar/api-reference` standalone
+/// build, **vendored** into the binary instead of pulled from
+/// `cdn.jsdelivr.net` at page load. ccteam's product target is a
+/// self-hosted / air-gapped daemon (LAN NAS, firewalled box); a third-party
+/// CDN `<script>` made `/api/docs` blank offline AND was an unpinned
+/// supply-chain + CSP liability. The file is committed under
+/// `crates/ccteam-web/assets/scalar-standalone.js` and served from
+/// [`SCALAR_JS_PATH`]; [`scalar_docs_html`] points the page `<script src>` at
+/// that local route, so the docs UI has **zero external hosts**.
+///
+/// Pinned version: **`@scalar/api-reference@1.58.0`** (`dist/browser/
+/// standalone.js`). Refresh = chore: re-fetch the pinned tarball build and
+/// overwrite the vendored file (mirrors the `workflow_templates/` /
+/// `agency_agents_catalog.json` vendoring pattern). The standalone build
+/// auto-bootstraps from the `<script id="api-reference" type="application/
+/// json">` spec block on load (`window.Scalar` self-init).
+pub const SCALAR_JS: &str = include_str!("../../assets/scalar-standalone.js");
+
+/// The pinned upstream version of the vendored Scalar build (for the
+/// `ccteam doctor` / refresh chore + a test assertion).
+pub const SCALAR_VERSION: &str = "1.58.0";
+
+/// Build the self-hosted Scalar docs HTML for [`DOCS_PATH`]. Same structure
+/// as utoipa-scalar's default template (a `<script id="api-reference"
+/// type="application/json">$spec</script>` block the standalone build
+/// auto-initializes from) EXCEPT the loader `<script src>` points at the
+/// local [`SCALAR_JS_PATH`] route — never an external CDN. The `$spec`
+/// placeholder is substituted by `Scalar::to_html` at serve time.
+fn scalar_docs_html() -> String {
+    format!(
+        r#"<!doctype html>
+<html>
+<head>
+    <title>ccteam API reference</title>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+</head>
+<body>
+<script id="api-reference" type="application/json">
+    $spec
+</script>
+<script src="{SCALAR_JS_PATH}"></script>
+</body>
+</html>
+"#
+    )
+}
+
+/// `GET {SCALAR_JS_PATH}` — serve the vendored Scalar standalone JS with a
+/// long-lived immutable cache (the bytes change only on a version bump). No
+/// external fetch; fully offline.
+async fn serve_scalar_js() -> impl IntoResponse {
+    (
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/javascript; charset=utf-8"),
+            ),
+            (
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("public, max-age=31536000, immutable"),
+            ),
+        ],
+        SCALAR_JS,
+    )
+}
 
 /// Top-level OpenAPI metadata. Operations are contributed by the
 /// per-handler `#[utoipa::path]` registrations in [`api_v1_router`]
@@ -123,7 +193,11 @@ pub fn api_v1_router() -> axum::Router<AppState> {
     let (router, api) = build_api_v1().split_for_parts();
     router
         .route(OPENAPI_JSON_PATH, axum::routing::get(serve_openapi_json))
-        .merge(Scalar::with_url(DOCS_PATH, api.clone()))
+        // v0.8.7 review-fix (R-M5) — serve the SELF-HOSTED Scalar UI: a custom
+        // HTML page whose loader `<script src>` points at the vendored JS route
+        // below, NOT `cdn.jsdelivr.net`. Works offline / air-gapped.
+        .route(SCALAR_JS_PATH, axum::routing::get(serve_scalar_js))
+        .merge(Scalar::with_url(DOCS_PATH, api.clone()).custom_html(scalar_docs_html()))
         // Stash the generated spec in an extension-free closure capture so
         // the JSON handler can serve it without rebuilding. `Scalar` already
         // owns a clone for the UI; we keep our own for the raw-JSON route.

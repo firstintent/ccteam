@@ -410,6 +410,62 @@ fn t03b_purge_strips_chat_hooks_surgically_keeps_other_keys() {
 }
 
 #[test]
+fn t03b2_purge_strips_hitl_permission_request_hook() {
+    // v0.8.7 review-fix (R-M4) — a hitl-spawned session installs the
+    // `PermissionRequest` hook (`{hook_sh} permission-request`). `project rm
+    // --purge` is the `init` inverse and MUST clear it (red line), or the
+    // deregistered project keeps a live HITL approval gate. End-to-end through
+    // the real `ccteam project rm --purge` binary, not just the predicate.
+    let fx = Fixture::new("dex-hitl");
+    fx.seed_closed_progress();
+    let settings_local = fx.project_dir.join(".claude").join("settings.local.json");
+    std::fs::write(
+        &settings_local,
+        r#"{
+  "permissions": {"allow": ["Bash"]},
+  "hooks": {
+    "SessionStart": [{"matcher": "*", "hooks": [{"type": "command", "command": "/h/hook.sh chat-progress session-start"}]}],
+    "PermissionRequest": [{"hooks": [{"type": "command", "command": "/h/hook.sh permission-request"}]}]
+  }
+}
+"#,
+    )
+    .unwrap();
+
+    let out = fx
+        .cmd()
+        .args(["project", "rm", &fx.slug, "--purge"])
+        .output()
+        .expect("spawn ccteam remove --purge");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "remove --purge should succeed; stderr: {stderr}; stdout: {stdout}",
+    );
+
+    // The file survives (operator `permissions` key remains) but the HITL hook
+    // and its now-empty PermissionRequest section are gone.
+    assert!(
+        settings_local.exists(),
+        "settings.local.json survives (operator key remains)",
+    );
+    let body = std::fs::read_to_string(&settings_local).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(v.get("permissions").is_some(), "operator key kept: {body}");
+    assert!(
+        !body.contains("permission-request"),
+        "HITL PermissionRequest hook must be purged (R-M4); got: {body}",
+    );
+    assert!(
+        v.get("hooks")
+            .and_then(|h| h.get("PermissionRequest"))
+            .is_none(),
+        "emptied PermissionRequest section must be pruned; got: {body}",
+    );
+}
+
+#[test]
 fn t03c_purge_deletes_settings_local_when_it_collapses_to_empty() {
     // settings.local.json that holds ONLY ccteam chat hooks is the file
     // ccteam created — after stripping it collapses to {} and --purge

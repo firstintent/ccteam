@@ -285,4 +285,80 @@ async fn openapi_json_and_docs_served_under_auth() {
         body.to_lowercase().contains("<!doctype html") || body.contains("<html"),
         "docs UI body should be an HTML document",
     );
+
+    // v0.8.7 review-fix (R-M5) — the docs page must be SELF-HOSTED: no external
+    // CDN <script>. Assert there is no `cdn.jsdelivr.net` (the old loader) and
+    // no scheme-relative/absolute external script host at all — the only loader
+    // is the same-origin vendored route.
+    assert!(
+        !body.contains("cdn.jsdelivr.net"),
+        "docs UI must NOT load Scalar from cdn.jsdelivr.net (R-M5); body:\n{body}",
+    );
+    assert!(
+        !body.contains("https://") && !body.contains("http://") && !body.contains("src=\"//"),
+        "docs UI must have NO external/absolute script host (air-gapped); body:\n{body}",
+    );
+    assert!(
+        body.contains("/api/docs/scalar-standalone.js"),
+        "docs UI must load the vendored same-origin Scalar JS; body:\n{body}",
+    );
+
+    // The vendored JS itself: behind auth (401 without token), 200 JS with it,
+    // and it's the real Scalar standalone build (self-init marker present).
+    let unauth_js = client
+        .get(format!("http://{addr}/api/docs/scalar-standalone.js"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        unauth_js.status(),
+        401,
+        "vendored JS is behind the auth gate"
+    );
+
+    let js = client
+        .get(format!("http://{addr}/api/docs/scalar-standalone.js"))
+        .header("Authorization", format!("Bearer ccteam:{TOKEN_HEX}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(js.status(), 200);
+    let js_ct = js
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        js_ct.contains("javascript"),
+        "vendored Scalar must be served as javascript; got {js_ct}",
+    );
+    let js_body = js.text().await.unwrap();
+    assert!(
+        js_body.len() > 100_000,
+        "vendored Scalar standalone build should be the full bundle (got {} bytes)",
+        js_body.len(),
+    );
+    assert!(
+        js_body.contains("createApiReference"),
+        "vendored bundle must be the real Scalar standalone build",
+    );
+}
+
+/// v0.8.7 review-fix (R-M5) — pure check that the generated docs HTML carries
+/// the local loader and the `$spec` placeholder Scalar substitutes, and that
+/// the pinned vendored version constant is wired (so the refresh chore has a
+/// single SoT to bump). No server needed.
+#[test]
+fn docs_html_is_self_hosted_and_version_pinned() {
+    use ccteam_web::routes::openapi::{SCALAR_JS, SCALAR_JS_PATH, SCALAR_VERSION};
+    // The vendored bundle is non-empty + the real standalone build.
+    assert!(
+        SCALAR_JS.len() > 1_000_000,
+        "vendored Scalar bundle looks truncated ({} bytes)",
+        SCALAR_JS.len(),
+    );
+    assert!(SCALAR_JS.contains("createApiReference"));
+    assert_eq!(SCALAR_VERSION, "1.58.0", "pinned Scalar version constant");
+    assert_eq!(SCALAR_JS_PATH, "/api/docs/scalar-standalone.js");
 }

@@ -162,8 +162,9 @@ pub struct CreateSessionForm {
 ///
 /// Creates (or idempotently reuses) a `(project, role)` session via the
 /// spine. 201 `{sid}` on success. 400 on a bad vendor token or empty
-/// role. 503 with no gateway. 500 if the gateway create fails (e.g.
-/// project not registered / adapter spawn error).
+/// role. 422 when the named role has no `.claude/agents/<role>.md` (a caller
+/// mistake, R-M6). 503 with no gateway. 500 if the gateway create fails for a
+/// genuine internal reason (project not registered / adapter spawn error).
 #[utoipa::path(
     post,
     path = "/api/v1/projects/{slug}/sessions",
@@ -173,8 +174,9 @@ pub struct CreateSessionForm {
     responses(
         (status = 201, description = "Created; `{sid}`", body = serde_json::Value),
         (status = 400, description = "Empty role / bad vendor / bad permission_mode"),
+        (status = 422, description = "Unknown role (no `.claude/agents/<role>.md`)"),
         (status = 503, description = "No live gateway (standalone web)"),
-        (status = 500, description = "Gateway create failed"),
+        (status = 500, description = "Gateway create failed (internal)"),
     ),
 )]
 pub(crate) async fn handle_create_session(
@@ -212,7 +214,15 @@ pub(crate) async fn handle_create_session(
     };
     match sid {
         Ok(sid) => (StatusCode::CREATED, Json(json!({"sid": sid}))).into_response(),
+        // v0.8.7 review-fix (R-M6) — distinguish a caller mistake (the named
+        // role has no `.claude/agents/<role>.md`) from a real internal failure
+        // (adapter spawn / fs error). A bad role is a client error → 422
+        // Unprocessable Entity with the clear hint, NOT a 500.
         Err(err) => {
+            if let Some(missing) = err.downcast_ref::<ccteam_im::gateway::RoleNotFound>() {
+                tracing::info!(%slug, %role, "create_session_api: unknown role -> 422");
+                return create_error(StatusCode::UNPROCESSABLE_ENTITY, missing.to_string(), mode);
+            }
             tracing::warn!(%slug, %role, %err, "create_session_api failed");
             create_error(
                 StatusCode::INTERNAL_SERVER_ERROR,

@@ -27,6 +27,19 @@ use crate::pending::InteractionOrigin;
 use crate::transport::{AttachmentKind, ChannelAttachment, ChoiceReply, MessageOption};
 use crate::BotRegistration;
 
+/// v0.8.7 review-fix (R-M6) — a typed "the named role has no
+/// `.claude/agents/<role>.md`" error so create paths can distinguish a
+/// caller mistake (bad/unseeded role ⇒ a 4xx in the web API) from a genuine
+/// internal failure (adapter spawn error, fs error ⇒ 500). `start_session`
+/// returns `anyhow::Result`, so this is surfaced via `anyhow::Error` and the
+/// web handler recovers it with `downcast_ref::<RoleNotFound>()`.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("role 不存在:.claude/agents/{role}.md 未找到;先用 /role <已存在的角色> 或 `ccteam role add {role}` 创建")]
+pub struct RoleNotFound {
+    /// The role stem that was requested but has no persona file.
+    pub role: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct ChatKey {
     channel: String,
@@ -2310,10 +2323,13 @@ fn ensure_role_exists(cwd: &std::path::Path, role: &str) -> Result<()> {
     }
     // `read_role` returns Err on a bad name (charset / traversal) and Ok(None)
     // when the file is absent — both mean "no such role" here.
+    // v0.8.7 review-fix (R-M6): surface a typed `RoleNotFound` (via anyhow) so
+    // the web create handler can map it to a 4xx instead of a blanket 500.
     if ccteam_core::read_role(cwd, role).ok().flatten().is_none() {
-        return Err(anyhow!(
-            "role 不存在:.claude/agents/{role}.md 未找到;先用 /role <已存在的角色> 或 `ccteam role add {role}` 创建"
-        ));
+        return Err(RoleNotFound {
+            role: role.to_string(),
+        }
+        .into());
     }
     Ok(())
 }
@@ -3180,6 +3196,55 @@ mod tests {
             .unwrap();
         assert_eq!(gateway.session_resolve(&sa).unwrap().project, "alpha");
         assert_eq!(gateway.session_resolve(&sb).unwrap().project, "beta");
+    }
+
+    /// v0.8.7 review-fix (R-M6) — creating a session for a role with no
+    /// `.claude/agents/<role>.md` (in a project whose agents dir DOES exist, so
+    /// the test-dir exemption doesn't apply) fails with a typed
+    /// [`RoleNotFound`], NOT a generic error. The web create handler downcasts
+    /// this to a 422 instead of a 500.
+    #[tokio::test]
+    async fn create_session_unknown_role_is_role_not_found() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Real ccteam project shape: a `.claude/agents/` dir that holds `cto`
+        // but NOT the role we'll request. The dir's existence flips
+        // `ensure_role_exists` into strict mode.
+        let agents = tmp.path().join(".claude").join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("cto.md"),
+            "---\nname: cto\ndescription: x\n---\nbody\n",
+        )
+        .unwrap();
+
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let err = gateway
+            .create_session_api(
+                "alpha".into(),
+                "no-such-role".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .expect_err("unknown role must error");
+        let typed = err.downcast_ref::<RoleNotFound>();
+        assert!(
+            typed.is_some(),
+            "error must downcast to RoleNotFound (so the web layer can 422), got: {err:#}"
+        );
+        assert_eq!(typed.unwrap().role, "no-such-role");
+        // A seeded role in the SAME project still creates fine (not a blanket
+        // reject of every create once the agents dir exists).
+        assert!(gateway
+            .create_session_api(
+                "alpha".into(),
+                "cto".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .is_ok());
     }
 
     /// V0.8.6 W5b — `create_session_api` is idempotent on (project, role):

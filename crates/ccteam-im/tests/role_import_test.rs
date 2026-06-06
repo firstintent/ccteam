@@ -208,3 +208,88 @@ async fn import_rejects_empty_body() {
         "expected EmptyBody, got {err:?}"
     );
 }
+
+/// Spawn a one-shot HTTP responder with a runtime-built body + arbitrary
+/// extra headers (the `&'static str` `spawn_oneshot_http` can't do either).
+/// Used by the R-L4 oversize + R-L5 redirect tests.
+fn spawn_oneshot_http_dyn(status_line: &str, extra_headers: &str, body: Vec<u8>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let status_line = status_line.to_string();
+    let extra_headers = extra_headers.to_string();
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let head = format!(
+                "{status_line}\r\nContent-Type: text/plain\r\n{extra_headers}\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len(),
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(&body);
+            let _ = stream.flush();
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// v0.8.7 review-fix (R-L4) — a body advertised over the ~1 MiB cap is refused
+/// (`TooLarge`) and nothing is written. The oversize body is detected via
+/// Content-Length before buffering it.
+#[tokio::test]
+async fn import_rejects_oversize_body() {
+    let tmp = TempDir::new().unwrap();
+    let entry = a_real_catalog_id();
+    // 1 MiB + 1 byte of valid markdown — one over the cap.
+    let big = vec![b'x'; ccteam_im::role_import::MAX_ROLE_BODY_BYTES + 1];
+    let base = spawn_oneshot_http_dyn("HTTP/1.1 200 OK", "", big);
+
+    let err = import_role_from_catalog_with_base(tmp.path(), &entry.id, Some("big"), false, &base)
+        .await
+        .expect_err("an over-cap body must be refused");
+    match err {
+        ImportError::TooLarge { max, .. } => {
+            assert_eq!(max, ccteam_im::role_import::MAX_ROLE_BODY_BYTES);
+        }
+        other => panic!("expected TooLarge, got {other:?}"),
+    }
+    assert!(
+        !tmp.path().join(".claude/agents/big.md").exists(),
+        "no role file should be written when the body is too large"
+    );
+}
+
+/// v0.8.7 review-fix (R-L5) — the importer does NOT follow redirects. A 302 to
+/// another host must fail (here as a `BadStatus`, since `Policy::none()` makes
+/// the 3xx a non-success status) instead of silently fetching attacker
+/// content from the redirect target.
+#[tokio::test]
+async fn import_does_not_follow_redirects() {
+    let tmp = TempDir::new().unwrap();
+    let entry = a_real_catalog_id();
+    // A 302 pointing at an unrelated host. With redirects disabled the client
+    // surfaces the 302 itself → not is_success() → BadStatus.
+    let base = spawn_oneshot_http_dyn(
+        "HTTP/1.1 302 Found",
+        "Location: http://evil.example/role.md\r\n",
+        b"redirecting".to_vec(),
+    );
+
+    let err = import_role_from_catalog_with_base(tmp.path(), &entry.id, Some("r"), false, &base)
+        .await
+        .expect_err("a redirect must NOT be followed");
+    match err {
+        ImportError::BadStatus { status, .. } => {
+            assert!(
+                (300..400).contains(&status),
+                "expected a 3xx surfaced as BadStatus (redirect not followed), got {status}"
+            );
+        }
+        other => panic!("expected BadStatus for an un-followed redirect, got {other:?}"),
+    }
+    assert!(
+        !tmp.path().join(".claude/agents/r.md").exists(),
+        "no role file should be written when a redirect is refused"
+    );
+}

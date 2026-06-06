@@ -23,6 +23,12 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+/// v0.8.7 review-fix (R-L4) — upper bound on a fetched role `.md` body. Real
+/// agency-agents personas are a few KiB; 1 MiB is two-plus orders of magnitude
+/// of headroom while still capping a misconfigured / hostile endpoint that
+/// would otherwise stream an unbounded body into memory.
+pub const MAX_ROLE_BODY_BYTES: usize = 1024 * 1024;
+
 /// Outcome of a successful import.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportRoleResult {
@@ -74,6 +80,19 @@ pub enum ImportError {
     /// fetch context).
     #[error("fetched role `{0}` is empty — refusing to write a content-less role file")]
     EmptyBody(String),
+    /// v0.8.7 review-fix (R-L4) — the fetched body exceeded
+    /// [`MAX_ROLE_BODY_BYTES`]. A role `.md` is tiny (low single-digit KiB);
+    /// a multi-MiB response is a misconfigured / hostile endpoint, not a
+    /// persona, so we refuse it rather than buffering an unbounded body.
+    #[error(
+        "fetched role `{role}` exceeds the {max} byte cap (a role .md should be a few KiB) — refusing"
+    )]
+    TooLarge {
+        /// The catalog id being fetched.
+        role: String,
+        /// The byte cap that was exceeded.
+        max: usize,
+    },
     /// The target role name (after sanitizing the override / display_name)
     /// is invalid, or `write_role` failed. Wraps the underlying message.
     #[error("{0}")]
@@ -137,14 +156,21 @@ pub async fn import_role_from_catalog_with_base(
 
     // 4. Fetch the role .md over HTTP (honest error on 404 / transport).
     let url = ccteam_core::catalog_raw_url(base_url, &entry.raw_path);
+    // v0.8.7 review-fix (R-L5) — do NOT follow redirects. The catalog raw_path
+    // resolves against a pinned `raw.githubusercontent.com` commit; a 3xx to an
+    // arbitrary host (open-redirect / typo-squat) should fail, not silently
+    // fetch+write attacker content. `Policy::none()` turns a redirect into a
+    // non-success status, which the `is_success()` check below rejects as
+    // `BadStatus`.
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|source| ImportError::Http {
             role: catalog_id.to_string(),
             source,
         })?;
-    let resp = client
+    let mut resp = client
         .get(&url)
         .send()
         .await
@@ -159,9 +185,35 @@ pub async fn import_role_from_catalog_with_base(
             url,
         });
     }
-    let body = resp.text().await.map_err(|source| ImportError::Http {
+    // v0.8.7 review-fix (R-L4) — bounded read. If the server advertises a
+    // Content-Length over the cap, reject before reading a byte; otherwise
+    // accumulate chunks and bail the moment we cross the cap (covers a lying /
+    // absent Content-Length).
+    if resp
+        .content_length()
+        .is_some_and(|n| n as usize > MAX_ROLE_BODY_BYTES)
+    {
+        return Err(ImportError::TooLarge {
+            role: catalog_id.to_string(),
+            max: MAX_ROLE_BODY_BYTES,
+        });
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|source| ImportError::Http {
         role: catalog_id.to_string(),
         source,
+    })? {
+        if buf.len() + chunk.len() > MAX_ROLE_BODY_BYTES {
+            return Err(ImportError::TooLarge {
+                role: catalog_id.to_string(),
+                max: MAX_ROLE_BODY_BYTES,
+            });
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    // A role `.md` must be valid UTF-8 (Claude-native markdown).
+    let body = String::from_utf8(buf).map_err(|_| {
+        ImportError::Write(format!("fetched role `{catalog_id}` is not valid UTF-8"))
     })?;
     if body.trim().is_empty() {
         return Err(ImportError::EmptyBody(catalog_id.to_string()));

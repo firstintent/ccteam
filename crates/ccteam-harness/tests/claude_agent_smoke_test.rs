@@ -181,6 +181,51 @@ fn make_ctx(cwd: &Path) -> SpawnCtx {
     }
 }
 
+/// v0.8.7 review-fix (verification gap) — write a `PermissionRequest` hook
+/// wrapper that returns a FIXED decision (`allow` or `deny`) to stdout, the
+/// exact `hookSpecificOutput` shape `ccteam_hooks::permission_request::decision`
+/// emits and the real claude binary consumes. Unlike `write_hook_logger`
+/// (empty stdout — only proves firing), this lets the smoke assert the
+/// CONTRACT: deny ⇒ the tool is blocked (victim survives), allow ⇒ it runs
+/// (victim deleted). Also appends `permission-request` to a log so the test
+/// can confirm the hook actually fired before judging the file state.
+fn write_decision_hook(tmp: &Path, allow: bool) -> (std::path::PathBuf, std::path::PathBuf) {
+    let log = tmp.join("decision-hook.log");
+    let script = tmp.join("decision-hook.sh");
+    // The decision JSON the real claude PermissionRequest hook reads. `allow`
+    // lets the tool run; `deny` blocks just this one tool call.
+    let decision = if allow {
+        r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#
+    } else {
+        r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"denied by smoke"}}}"#
+    };
+    // Log the firing (with argv so we see `permission-request`), then print the
+    // decision to stdout and exit 0.
+    let body = format!(
+        "#!/bin/sh\necho \"$@\" >> {log}\ncat <<'CCTEAM_EOF'\n{decision}\nCCTEAM_EOF\nexit 0\n",
+        log = log.to_str().unwrap(),
+    );
+    std::fs::write(&script, body).expect("write decision-hook.sh");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod decision-hook.sh");
+    (script, log)
+}
+
+/// Poll until `path` no longer exists, or `max` elapses. Returns true if the
+/// file is gone (i.e. the tool ran).
+fn wait_for_file_gone(path: &Path, max: Duration) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if !path.exists() {
+            return true;
+        }
+        if start.elapsed() >= max {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 fn kill_session_quiet(name: &str) {
     let _ = std::process::Command::new("tmux")
         .args(["kill-session", "-t", name])
@@ -534,5 +579,140 @@ async fn claude_agent_hitl_permission_request_fires_smoke() {
          verify the spawn dropped --dangerously-skip-permissions and the \
          settings.local.json carries the PermissionRequest hook.",
         hook_log.display()
+    );
+}
+
+// ===========================================================================
+// v0.8.7 review-fix (verification gap) — HITL allow/deny CONTRACT, real binary.
+//
+// The whole HITL safety story rests on ONE assumption: that the real `claude`
+// binary HONORS the `PermissionRequest` decision JSON ccteam returns —
+// `{behavior:"deny"}` actually blocks the tool, `{behavior:"allow"}` actually
+// lets it run. The `..._fires_smoke` test above only proves the hook FIRES; it
+// returns empty stdout and never checks the tool's effect. This test closes
+// that gap by returning a fixed decision from the hook and asserting the
+// victim file's fate: DENY ⇒ file survives, ALLOW ⇒ file deleted.
+//
+// `#[ignore]` + `#[serial]` (real claude + tmux + process-global env), like the
+// other real smokes. Run with:
+//   cargo test -p ccteam-harness --test claude_agent_smoke_test -- --ignored
+// ===========================================================================
+
+/// Run ONE HITL turn that asks the persona to `rm <victim>`, with the
+/// `PermissionRequest` hook wired to return `allow`/`deny`. Returns
+/// `(hook_fired, file_deleted)`. Self-cleaning (kills the tmux session,
+/// restores env). Each call uses a distinct slug/victim so allow + deny don't
+/// collide on the shared tmux server.
+async fn run_hitl_decision_turn(allow: bool, tag: &str) -> (bool, bool) {
+    let project = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let victim = project.path().join(format!("delete-me-{tag}.txt"));
+    std::fs::write(&victim, b"smoke").unwrap();
+    seed_hitl_persona(project.path(), &victim);
+    let (hook_sh, hook_log) = write_decision_hook(home.path(), allow);
+
+    let prior_home = std::env::var_os("CCTEAM_HOME");
+    let prior_hook = std::env::var_os("CCTEAM_HOOK_SH");
+    let prior_via = std::env::var_os("CCTEAM_HOOK_VIA_DAEMON");
+    std::env::set_var("CCTEAM_HOME", home.path());
+    std::env::set_var("CCTEAM_HOOK_SH", &hook_sh);
+    std::env::remove_var("CCTEAM_HOOK_VIA_DAEMON");
+
+    // Distinct slug per phase so the tmux pane name doesn't clash.
+    let slug = format!("agent-hitl-{tag}");
+    let session_name = chat_session_name(&slug, HITL_ROLE);
+    kill_session_quiet(&session_name);
+
+    let adapter = ClaudeTuiAdapter::new();
+    let ctx = SpawnCtx {
+        slug: slug.clone(),
+        sid: format!("s-agent-hitl-{tag}"),
+        cwd: project.path().to_path_buf(),
+        project_dir: project.path().to_path_buf(),
+        extra_args: vec![],
+        model_id: None,
+        permission_mode: ccteam_harness::PermissionMode::Hitl,
+        secret: String::new(),
+    };
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: HITL_ROLE.to_string(),
+            },
+            &ctx,
+        )
+        .await
+        .expect("start_thread (hitl) must succeed");
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    adapter
+        .submit_turn(
+            &handle,
+            TurnInput::UserText("Delete the file now.".to_string()),
+        )
+        .await
+        .expect("submit_turn must succeed");
+
+    // Wait for the hook to fire (the model has to plan + emit the tool call).
+    let hook_fired =
+        wait_for_file_contains(&hook_log, "permission-request", Duration::from_secs(120));
+    // Decide the file's fate. On allow we expect it gone; on deny it must
+    // survive. Give the tool a moment to execute after the decision.
+    let file_deleted = if allow {
+        wait_for_file_gone(&victim, Duration::from_secs(30))
+    } else {
+        // Deny: poll a fixed window; the file must STILL exist at the end.
+        std::thread::sleep(Duration::from_secs(8));
+        !victim.exists()
+    };
+
+    kill_session_quiet(&session_name);
+    if let Some(v) = prior_home {
+        std::env::set_var("CCTEAM_HOME", v);
+    } else {
+        std::env::remove_var("CCTEAM_HOME");
+    }
+    if let Some(v) = prior_hook {
+        std::env::set_var("CCTEAM_HOOK_SH", v);
+    } else {
+        std::env::remove_var("CCTEAM_HOOK_SH");
+    }
+    if let Some(v) = prior_via {
+        std::env::set_var("CCTEAM_HOOK_VIA_DAEMON", v);
+    }
+    (hook_fired, file_deleted)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+#[ignore = "real claude binary + login; HITL allow/deny contract, run with --ignored"]
+async fn claude_agent_hitl_permission_decision_contract_smoke() {
+    if skip_if_unavailable() {
+        return;
+    }
+
+    // ---- DENY: the hook returns {behavior:"deny"} → the rm must NOT run ----
+    let (deny_fired, deny_deleted) = run_hitl_decision_turn(false, "deny").await;
+    assert!(
+        deny_fired,
+        "DENY phase: the PermissionRequest hook must fire (else the contract is untested)"
+    );
+    assert!(
+        !deny_deleted,
+        "DENY contract VIOLATED: claude deleted the victim file despite a \
+         `{{behavior:\"deny\"}}` decision. HITL would NOT actually protect the user."
+    );
+
+    // ---- ALLOW: the hook returns {behavior:"allow"} → the rm MUST run ----
+    let (allow_fired, allow_deleted) = run_hitl_decision_turn(true, "allow").await;
+    assert!(
+        allow_fired,
+        "ALLOW phase: the PermissionRequest hook must fire (else the contract is untested)"
+    );
+    assert!(
+        allow_deleted,
+        "ALLOW contract VIOLATED: claude did NOT run the approved tool despite a \
+         `{{behavior:\"allow\"}}` decision (victim file still present). An approve \
+         click would not actually let the tool run."
     );
 }
