@@ -9,9 +9,7 @@ use serde_json::{Map, Value};
 
 use crate::paths::CcteamPaths;
 use crate::state::ProjectState;
-use crate::templates::{
-    write_global_helper_templates, write_project_settings, EnabledPluginsSetting, CTO_ROLE_MD,
-};
+use crate::templates::{write_project_settings, EnabledPluginsSetting, CTO_ROLE_MD};
 
 /// Slugify a free-text project request: keep `[a-z0-9]`, collapse other
 /// runs to `-`, trim, lower-case, and cap at 40 chars. When the cap
@@ -245,9 +243,9 @@ pub fn bootstrap_project(
 
 /// V0.4.2 F72: `bootstrap_project` generalized to install at an
 /// arbitrary `target_dir`. Used by `ccteam init` to bring an existing
-/// repo under management without moving files. Side effects (helper
-/// templates, trust-marking) still use `paths.root` / `paths.projects_root`,
-/// since those are global concerns.
+/// repo under management without moving files. Side effects (trust-marking)
+/// still use `paths.root` / `paths.projects_root`, since those are global
+/// concerns.
 ///
 /// `target_dir` is created if it doesn't exist. Existing files inside
 /// it are left alone — this is the **fresh-install** path. Idempotent
@@ -255,7 +253,13 @@ pub fn bootstrap_project(
 /// refresh helpers; this function assumes the caller already decided
 /// "this is a new install".
 pub fn bootstrap_project_at_dir(
-    paths: &CcteamPaths,
+    // v0.8.6 (review-fix #3): `paths` used to feed the global
+    // helper-template stamp (`write_global_helper_templates(&paths.root,
+    // …)`); that write is gone (it only ever created an empty
+    // `~/.ccteam/templates/` that tripped the doctor home-drift check),
+    // so `paths` is no longer read here. Kept in the signature for API
+    // stability so existing callers (cli / web / im / tests) don't churn.
+    _paths: &CcteamPaths,
     target_dir: &Path,
     slug: &str,
     // v0.8.6: `request` is no longer persisted (no `.ccteam/spec.md`,
@@ -284,17 +288,12 @@ pub fn bootstrap_project_at_dir(
     let enabled_plugins = EnabledPluginsSetting::default();
 
     write_project_settings(&project_dir, &enabled_plugins)?;
-    // M2.4: ensure ~/.ccteam/templates/ has the helper templates so
-    // user-authored agent / workflow markdown's `@~/.ccteam/templates/<name>.md`
-    // reference resolves. Idempotent — no-ops when files already exist,
-    // so this doesn't fight `ccteam init` if the operator ran it first.
-    if let Err(err) = write_global_helper_templates(&paths.root, false) {
-        tracing::warn!(
-            global_dir = %paths.root.display(),
-            error = %err,
-            "could not stamp helper templates into ~/.ccteam/templates/; markdown using @-references may fail",
-        );
-    }
+    // v0.8.6 (review-fix #3): no longer stamp `~/.ccteam/templates/`.
+    // `HELPER_TEMPLATES` has been empty since V0.5.0 F101, so the writer
+    // only ever created an empty `templates/` dir that is *not* in
+    // `canonical_home_dirs()` — making a fresh `ccteam init` report
+    // self-inflicted home-layout drift. init now creates exactly the
+    // canonical set; the orphaned helper-template path is gone.
     if let Err(err) = pre_trust_project(&project_dir) {
         // Failing to pre-trust is annoying (next launch shows the
         // "Trust this folder?" prompt) but not fatal — log + continue.
@@ -999,15 +998,13 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_project_creates_templates_dir() {
-        // M2.4 / V0.5.0 F101: bootstrap_project ensures
-        // ~/.ccteam/templates/ exists so phase markdown's
-        // `@~/.ccteam/templates/<name>` reference resolves even when
-        // the user skipped `ccteam init`. F101 deleted the V0.2-era
-        // helper template payloads (`review-with-user-loop.md` /
-        // `kickoff-reverse-interview.md`), leaving an empty
-        // HELPER_TEMPLATES — but the directory itself still gets
-        // created so future helpers can land alongside per-user files.
+    fn bootstrap_project_does_not_create_templates_dir() {
+        // v0.8.6 (review-fix #3): `HELPER_TEMPLATES` has been empty since
+        // V0.5.0 F101, so the old `write_global_helper_templates` call only
+        // ever produced an empty `~/.ccteam/templates/` dir that is *not*
+        // in `canonical_home_dirs()`. That made a fresh `ccteam init`
+        // report self-inflicted home-layout drift. The call is gone;
+        // bootstrap must no longer create `templates/`.
         ensure_isolation();
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = CcteamPaths {
@@ -1017,8 +1014,8 @@ mod tests {
         bootstrap_project(&paths, "demo", "demo request", "dev").unwrap();
         let templates = paths.root.join("templates");
         assert!(
-            templates.is_dir(),
-            "~/.ccteam/templates/ should exist after bootstrap; got {}",
+            !templates.exists(),
+            "~/.ccteam/templates/ must NOT be created by bootstrap (review-fix #3); got {}",
             templates.display(),
         );
     }

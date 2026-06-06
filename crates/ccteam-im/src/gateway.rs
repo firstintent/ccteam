@@ -85,7 +85,16 @@ pub struct Gateway {
     sessions: BTreeMap<String, GatewaySession>,
     templates: Vec<GatewayRouteTemplate>,
     next_session: u64,
-    event_sink: Option<tokio::sync::mpsc::UnboundedSender<GatewayEvent>>,
+    event_sink: Option<GatewayEventSink>,
+    /// Broadcast tee of every [`GatewayEvent`] the gateway emits (V0.8.6 —
+    /// fix #2). The IM delivery path stays on the mpsc `event_sink`; this
+    /// fan-out lets the web layer subscribe a per-session SSE stream
+    /// (filtered by [`GatewayEvent::sid`]) without touching that path.
+    /// Created up front (in [`new_with_factory`](Self::new_with_factory)) so
+    /// [`subscribe_events`](Self::subscribe_events) works even before a sink
+    /// is wired or on the standalone path. The pump tees through
+    /// [`GatewayEventSink`]; the held sender is the source for new receivers.
+    events_broadcast: tokio::sync::broadcast::Sender<GatewayEvent>,
     event_pumps: BTreeMap<String, tokio::task::JoinHandle<()>>,
     /// Outstanding choice prompts (v0.8.5 D3/D4/D6). Its own lock — held
     /// separately from the gateway so a long External await (D6, W2) never
@@ -160,6 +169,39 @@ pub struct GatewayEvent {
     /// The IM delivery path ignores `sid` entirely — it routes by `channel`
     /// + `chat_id` as before — so this is additive.
     pub sid: Option<String>,
+}
+
+/// The gateway's emit endpoint (V0.8.6 — fix #2). Every [`GatewayEvent`] the
+/// gateway produces (pump answers + progress, turn-timeout watchdog, choice
+/// prompts) is sent through this, which **tees** to two consumers:
+///
+/// 1. the daemon's mpsc consumer (`event_sink`) — the IM/web delivery path,
+///    routed by `channel` + `chat_id`, unchanged; and
+/// 2. a broadcast fan-out — for per-session web SSE, filtered by `sid`.
+///
+/// Send semantics follow the mpsc: [`send`](Self::send) returns `false` only
+/// when the mpsc receiver is gone (the daemon exited → the pump should stop),
+/// matching the prior raw-`UnboundedSender` `is_err()`/`is_ok()` checks. A
+/// broadcast send with no live receivers is the normal case and is ignored.
+#[derive(Clone)]
+struct GatewayEventSink {
+    /// The IM/web delivery channel (the historical sink).
+    mpsc: tokio::sync::mpsc::UnboundedSender<GatewayEvent>,
+    /// Fan-out for per-session SSE subscribers.
+    broadcast: tokio::sync::broadcast::Sender<GatewayEvent>,
+}
+
+impl GatewayEventSink {
+    /// Tee one event to the mpsc delivery path **and** the broadcast fan-out.
+    /// Returns `true` while the mpsc is live; `false` once it is closed (the
+    /// pump's stop signal). The broadcast leg never affects the return — a
+    /// lagging/absent SSE subscriber must not stop IM delivery.
+    fn send(&self, event: GatewayEvent) -> bool {
+        // Broadcast first (cheap clone); a `SendError` here just means no SSE
+        // subscriber is attached, which is normal.
+        let _ = self.broadcast.send(event.clone());
+        self.mpsc.send(event).is_ok()
+    }
 }
 
 /// A live `ccteam-chat-*` process with no matching tracked gateway session —
@@ -360,6 +402,10 @@ impl Gateway {
         let default_project = default_project.into();
         let mut projects = BTreeMap::new();
         projects.insert(default_project.clone(), default_dir.into());
+        // Capacity covers a burst of answers + progress edits for one turn; SSE
+        // subscribers that fall behind get a `Lagged` and the SSE handler emits
+        // a reconnect hint (the SPA's `EventSource` then re-subscribes).
+        let (events_broadcast, _) = tokio::sync::broadcast::channel(256);
         Self {
             adapter_factory,
             default_project,
@@ -371,6 +417,7 @@ impl Gateway {
             templates: Vec::new(),
             next_session: 0,
             event_sink: None,
+            events_broadcast,
             event_pumps: BTreeMap::new(),
             pending: Arc::new(tokio::sync::Mutex::new(
                 crate::pending::PendingInteractions::new(),
@@ -387,11 +434,26 @@ impl Gateway {
     /// this after `enable_persistence` also re-subscribes restored
     /// sessions, which is the daemon-restart path.
     pub fn set_event_sink(&mut self, tx: tokio::sync::mpsc::UnboundedSender<GatewayEvent>) {
-        self.event_sink = Some(tx);
+        // Wrap the IM/web mpsc with the always-present broadcast tee so every
+        // emitted event also reaches per-session SSE subscribers (fix #2).
+        self.event_sink = Some(GatewayEventSink {
+            mpsc: tx,
+            broadcast: self.events_broadcast.clone(),
+        });
         let ids = self.sessions.keys().cloned().collect::<Vec<_>>();
         for id in ids {
             self.spawn_event_pump(&id);
         }
+    }
+
+    /// Subscribe to the broadcast tee of every [`GatewayEvent`] this gateway
+    /// emits (V0.8.6 — fix #2). The per-session web SSE handler filters the
+    /// stream by [`GatewayEvent::sid`]. Works regardless of whether a delivery
+    /// sink has been wired ([`set_event_sink`](Self::set_event_sink)); a fresh
+    /// receiver only sees events emitted after it subscribes. Cheap: clones an
+    /// existing broadcast `Sender` and registers a new `Receiver`.
+    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<GatewayEvent> {
+        self.events_broadcast.subscribe()
     }
 
     /// Inject the shared pending-interaction registry (v0.8.5). The daemon
@@ -1085,20 +1147,19 @@ impl Gateway {
                             seq = seq.saturating_add(1);
                             session.visible_events.fetch_add(1, Ordering::SeqCst);
                             let (channel, chat_id) = pump_target(&session);
-                            if tx
-                                .send(GatewayEvent {
-                                    id: format!("gateway-event-{session_id}-{seq}"),
-                                    channel,
-                                    chat_id,
-                                    thread_ts: None,
-                                    content: text,
-                                    kind: GatewayEventKind::Answer,
-                                    attachments: Vec::new(),
-                                    options: Vec::new(),
-                                    sid: Some(session_id.clone()),
-                                })
-                                .is_err()
-                            {
+                            // `GatewayEventSink::send` returns false only when the
+                            // mpsc consumer is gone (daemon exited) → stop the pump.
+                            if !tx.send(GatewayEvent {
+                                id: format!("gateway-event-{session_id}-{seq}"),
+                                channel,
+                                chat_id,
+                                thread_ts: None,
+                                content: text,
+                                kind: GatewayEventKind::Answer,
+                                attachments: Vec::new(),
+                                options: Vec::new(),
+                                sid: Some(session_id.clone()),
+                            }) {
                                 break;
                             }
                         } else if progress_on && fold.apply(&evt) {
@@ -1837,7 +1898,7 @@ impl Drop for Gateway {
 }
 
 fn spawn_turn_timeout_watchdog(
-    tx: tokio::sync::mpsc::UnboundedSender<GatewayEvent>,
+    tx: GatewayEventSink,
     session: &GatewaySession,
     start_visible_events: u64,
     turn_id: &str,
@@ -1929,7 +1990,7 @@ fn pump_target(session: &GatewaySession) -> (String, String) {
 /// Returns `false` only if the sink is closed (pump should stop). Sync
 /// (unbounded send), so it never holds a lock across an await.
 fn emit_progress(
-    tx: &tokio::sync::mpsc::UnboundedSender<GatewayEvent>,
+    tx: &GatewayEventSink,
     session: &GatewaySession,
     session_id: &str,
     epoch: u64,
@@ -1938,6 +1999,8 @@ fn emit_progress(
 ) -> bool {
     let (channel, chat_id) = pump_target(session);
     let status_key = format!("{session_id}-{epoch}");
+    // `send` returns false only when the mpsc consumer is gone; surface that as
+    // emit_progress's "sink closed → pump should stop" signal.
     tx.send(GatewayEvent {
         id: format!("gateway-progress-{status_key}"),
         channel,
@@ -1949,7 +2012,6 @@ fn emit_progress(
         attachments: Vec::new(),
         options: Vec::new(),
     })
-    .is_ok()
 }
 
 /// Render the fold and flush it as a progress update, **skipping** a
@@ -1959,7 +2021,7 @@ fn emit_progress(
 /// closed.
 #[allow(clippy::too_many_arguments)]
 fn flush_progress(
-    tx: &tokio::sync::mpsc::UnboundedSender<GatewayEvent>,
+    tx: &GatewayEventSink,
     session: &GatewaySession,
     session_id: &str,
     epoch: u64,
@@ -2299,6 +2361,68 @@ mod tests {
             },
         };
         assert_eq!(async_event_text(&reasoning), None);
+    }
+
+    // ----- fix #2: GatewayEvent broadcast tee (per-session SSE source) -----
+
+    fn fake_event(sid: Option<&str>) -> GatewayEvent {
+        GatewayEvent {
+            id: "e1".into(),
+            channel: "web".into(),
+            chat_id: "web-api".into(),
+            thread_ts: None,
+            content: "hi".into(),
+            kind: GatewayEventKind::Answer,
+            attachments: Vec::new(),
+            options: Vec::new(),
+            sid: sid.map(str::to_string),
+        }
+    }
+
+    /// The sink tees one event to BOTH the mpsc delivery path (IM/web) and the
+    /// broadcast fan-out (per-session SSE) — neither leg is skipped.
+    #[tokio::test]
+    async fn gateway_event_sink_tees_to_mpsc_and_broadcast() {
+        let (mtx, mut mrx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        let (btx, mut brx) = tokio::sync::broadcast::channel::<GatewayEvent>(8);
+        let sink = GatewayEventSink {
+            mpsc: mtx,
+            broadcast: btx,
+        };
+        assert!(sink.send(fake_event(Some("s1"))), "mpsc live ⇒ send ok");
+        assert_eq!(mrx.recv().await.unwrap().sid.as_deref(), Some("s1"));
+        assert_eq!(brx.recv().await.unwrap().sid.as_deref(), Some("s1"));
+    }
+
+    /// A broadcast send with no live SSE subscriber must NOT stop delivery: the
+    /// mpsc leg still carries the event and `send` stays true.
+    #[tokio::test]
+    async fn gateway_event_sink_send_ok_with_no_subscriber() {
+        let (mtx, mut mrx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        let (btx, _) = tokio::sync::broadcast::channel::<GatewayEvent>(8);
+        let sink = GatewayEventSink {
+            mpsc: mtx,
+            broadcast: btx,
+        };
+        assert!(sink.send(fake_event(None)), "no SSE subscriber ⇒ still ok");
+        assert!(mrx.recv().await.is_some());
+    }
+
+    /// `subscribe_events` hands out a live receiver off the gateway's held
+    /// broadcast, so an event published through the tee reaches an SSE
+    /// subscriber. (The per-session SSE handler then filters by `sid`.)
+    #[tokio::test]
+    async fn subscribe_events_receives_emitted_event() {
+        let adapter: Arc<dyn HarnessAdapter + Send + Sync> = Arc::new(FakeAdapter::default());
+        let mut gw = Gateway::new(adapter, "demo", std::env::temp_dir());
+        let mut sub = gw.subscribe_events();
+        // Wire a delivery sink (production path); set_event_sink reuses the
+        // gateway's held broadcast, so `sub` sees what the tee publishes.
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gw.set_event_sink(tx);
+        let sink = gw.event_sink.clone().expect("sink wired");
+        assert!(sink.send(fake_event(Some("s7"))));
+        assert_eq!(sub.recv().await.unwrap().sid.as_deref(), Some("s7"));
     }
 
     // ----- P2a wrap_inbound (turn-text + attachment paths) ----------

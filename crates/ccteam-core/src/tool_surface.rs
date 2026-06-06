@@ -1166,15 +1166,15 @@ mod tests {
     fn migrate_legacy_skill_dirs_reports_not_found_when_clean() {
         // LEGACY_SKILL_NAMES tracks every bundled skill ccteam has ever
         // shipped + since retired, so an upgrade can sweep stale installs.
-        // Currently 8: 3 F39-era `cct-*`, 2 F100 deletions
-        // (`ccteam-team-author` / `ccteam-project-creator`), and the 3
-        // v0.8.6 deletions (`ccteam-control` / `ccteam-creator` /
-        // `ccteam-im-setup`). Pin the length so a future entry addition
-        // forces this test to revisit consciously.
+        // Currently 10: 3 F39-era `cct-*`, 2 F100 deletions
+        // (`ccteam-team-author` / `ccteam-project-creator`), the 3 v0.8.6
+        // W4b deletions (`ccteam-control` / `ccteam-creator` /
+        // `ccteam-im-setup`), and `ccteam-team` / `ccteam-scan`. Pin the
+        // length so a future entry addition forces a conscious revisit.
         let tmp = tempfile::TempDir::new().unwrap();
         let claude = tmp.path().join(".claude");
         let reports = migrate_legacy_skill_dirs(&claude, false).unwrap();
-        assert_eq!(reports.len(), 8);
+        assert_eq!(reports.len(), 10);
         for r in &reports {
             assert_eq!(r.action, LegacySkillAction::NotFound);
         }
@@ -1272,6 +1272,35 @@ mod tests {
             .unwrap();
         assert_eq!(pc.action, LegacySkillAction::Removed);
         assert!(!dir.exists());
+    }
+
+    #[test]
+    fn migrate_legacy_skill_dirs_removes_team_and_scan() {
+        // v0.8.6 FIX #7: `ccteam-team` / `ccteam-scan` were shipped
+        // skills too; upgraders who installed them must have the stale
+        // dirs swept by the same migration path.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let claude = tmp.path().join(".claude");
+        let team_dir = write_legacy_skill(
+            &claude,
+            "ccteam-team",
+            "<!-- ccteam-managed:skill begin -->\n---\nname: ccteam-team\n---\n",
+        );
+        let scan_dir = write_legacy_skill(
+            &claude,
+            "ccteam-scan",
+            "<!-- ccteam-managed:skill begin -->\n---\nname: ccteam-scan\n---\n",
+        );
+        let reports = migrate_legacy_skill_dirs(&claude, false).unwrap();
+        for name in ["ccteam-team", "ccteam-scan"] {
+            let r = reports
+                .iter()
+                .find(|r| r.legacy_name == name)
+                .unwrap_or_else(|| panic!("{name} must be in LEGACY_SKILL_NAMES"));
+            assert_eq!(r.action, LegacySkillAction::Removed, "{name}");
+        }
+        assert!(!team_dir.exists());
+        assert!(!scan_dir.exists());
     }
 
     #[test]

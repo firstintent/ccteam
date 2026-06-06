@@ -1648,13 +1648,13 @@ fn run_start(
     // phase machinery (F63 will reintroduce a workflow seed). Daemon
     // start no longer self-heals — operators supply their own
     // `~/.ccteam/teams/<name>/team.yaml`.
+    //
+    // v0.8.6 (review-fix #3): the old "phases dir not found; run ccteam
+    // init to unpack templates" hint was orchestrator-era dead code —
+    // `ccteam init` no longer creates `phases/` (and templates are no
+    // longer unpacked), so it printed spuriously on every clean start.
+    // Removed.
 
-    if !paths.phases_dir().exists() {
-        eprintln!(
-            "ccteam: phases dir {} not found.\n  run `ccteam init` once to unpack templates, then come back.",
-            paths.phases_dir().display()
-        );
-    }
     if !paths.projects_root.exists()
         || std::fs::read_dir(&paths.projects_root)
             .map(|mut it| it.next().is_none())

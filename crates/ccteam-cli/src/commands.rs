@@ -13,9 +13,8 @@ use ccteam_core::tmux::TmuxSession;
 use ccteam_core::{
     cost_summary, current_ccteam_bin, migrate_recommended_agent_symlinks, pricing_schema_version,
     pricing_schema_version_for, rewrite_legacy_hook_commands, session_name_for_project,
-    user_claude_dir, write_global_helper_templates, CcteamPaths, HookCmdRewriteAction,
-    HookCmdRewriteReport, MigrationReport, PhaseState, ProjectState, ToolSurfaceSnapshot, Vendor,
-    BUILTIN_SUBAGENTS,
+    user_claude_dir, CcteamPaths, HookCmdRewriteAction, HookCmdRewriteReport, MigrationReport,
+    PhaseState, ProjectState, ToolSurfaceSnapshot, Vendor, BUILTIN_SUBAGENTS,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -101,23 +100,16 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
     use std::process::Command;
 
     // -- 1. Global ~/.ccteam/ skeleton (idempotent) -------------------
-    for sub in [
-        "phases",
-        "templates",
-        "progress",
-        "inbox",
-        "control",
-        "state",
-    ] {
+    // v0.8.6 D1.1: create exactly the canonical home-layout manifest
+    // (`hooks/progress/run/state`) — the same set `ccteam doctor`'s
+    // home-drift check tolerates. The orchestrator-era subdirs
+    // (`phases/templates/inbox/control`) are no longer written: nothing
+    // reads them post-W2, and creating them made a fresh `ccteam init`
+    // immediately report self-inflicted drift.
+    for sub in ccteam_core::canonical_home_dirs() {
         let dir = paths.root.join(sub);
         std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     }
-    write_global_helper_templates(&paths.root, opts.force).with_context(|| {
-        format!(
-            "unpack helper templates to {}",
-            paths.templates_dir().display()
-        )
-    })?;
 
     // V0.6.1 F139 — materialize the per-hook dispatcher script. This
     // must run before `install_project_at` so the freshly-rendered
@@ -2265,6 +2257,12 @@ pub fn run_doctor(paths: &CcteamPaths, mut opts: DoctorOptions) -> Result<String
         out.push_str(&render_migrate_hook_commands_report(paths, opts.dry_run)?);
     }
     out.push_str(&render_daemon_health_line(paths));
+    // v0.8.6 — always-run self-heal: sweep stale `~/.claude/skills/
+    // ccteam-*` directories left by earlier versions that bundled skills.
+    // W4b deleted the only previous caller (`doctor --install-skill`), so
+    // upgraders' skill residue was no longer cleaned; rehang it here so a
+    // plain `ccteam doctor` always tidies it up. Never fails the exit code.
+    out.push_str(&render_legacy_skill_cleanup_line());
     // v0.8.6 — informational home-layout drift line. Flags any
     // orchestrator-era leftover directory under `~/.ccteam` that the
     // current architecture no longer writes. Never fails the exit code.
@@ -2334,6 +2332,74 @@ fn render_home_drift_line(paths: &CcteamPaths) -> String {
         paths.root.display(),
         unexpected.join(", "),
     )
+}
+
+/// v0.8.6 — always-run self-heal that sweeps stale
+/// `~/.claude/skills/ccteam-*` directories left by versions that bundled
+/// skills (the skill set is now empty). W4b deleted the only previous
+/// caller (`doctor --install-skill`), so this re-hooks
+/// [`ccteam_core::migrate_legacy_skill_dirs`] into the plain `ccteam
+/// doctor` run.
+///
+/// Runs non-dry — it actually removes the unedited shipped dirs; operator
+/// hand-edits (no ccteam-managed marker) are preserved and reported so
+/// the user can clear them manually. Tolerates a missing `~/.claude`
+/// (fresh install) and never fails the doctor exit code.
+///
+/// Respects `CCTEAM_DISABLE_TOOL_SURFACE_BOOTSTRAP` (the same guard the
+/// rest of the tool-surface bootstrap honors) so the unit-test binary —
+/// which resolves the *real* `~/.claude` via [`user_claude_dir`] — never
+/// mutates the developer's / CI's home skill set.
+fn render_legacy_skill_cleanup_line() -> String {
+    use ccteam_core::LegacySkillAction;
+
+    if std::env::var("CCTEAM_DISABLE_TOOL_SURFACE_BOOTSTRAP")
+        .ok()
+        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+    {
+        return String::new();
+    }
+    let Ok(claude) = user_claude_dir() else {
+        return String::new();
+    };
+    let Ok(reports) = ccteam_core::migrate_legacy_skill_dirs(&claude, false) else {
+        return String::new();
+    };
+
+    let removed: Vec<&str> = reports
+        .iter()
+        .filter(|r| r.action == LegacySkillAction::Removed)
+        .map(|r| r.legacy_name.as_str())
+        .collect();
+    let preserved: Vec<&str> = reports
+        .iter()
+        .filter(|r| r.action == LegacySkillAction::PreservedHandEdit)
+        .map(|r| r.legacy_name.as_str())
+        .collect();
+
+    if removed.is_empty() && preserved.is_empty() {
+        // The overwhelmingly common case (nothing stale) stays quiet so
+        // the doctor output isn't noisier on every run.
+        return String::new();
+    }
+    let mut line = String::new();
+    if !removed.is_empty() {
+        line.push_str(&format!(
+            "[ccteam] legacy skills: removed {} stale dir(s) under {} (bundled skills are gone): {}\n",
+            removed.len(),
+            claude.join("skills").display(),
+            removed.join(", "),
+        ));
+    }
+    if !preserved.is_empty() {
+        line.push_str(&format!(
+            "[ccteam] legacy skills: {} hand-edited dir(s) preserved under {} (remove manually): {}\n",
+            preserved.len(),
+            claude.join("skills").display(),
+            preserved.join(", "),
+        ));
+    }
+    line
 }
 
 /// V0.6.1 F121 — help text appended after the implicit pricing check
@@ -5529,19 +5595,45 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
         let report = run_init(&paths, init_opts_targeting_tmp(&tmp, "scaffold-demo")).unwrap();
-        for sub in ["phases", "templates", "progress", "inbox", "control"] {
+        // v0.8.6 D1.1: init creates exactly the canonical home-layout
+        // manifest. `hooks/` is materialized by the dispatcher install
+        // step rather than the skeleton loop, but it must still exist.
+        for sub in ccteam_core::canonical_home_dirs() {
             assert!(
                 paths.root.join(sub).is_dir(),
-                "init must create {}",
+                "init must create canonical home dir {}",
                 paths.root.join(sub).display()
             );
         }
-        // V0.5.0 F101: phase-era helper templates (review-with-user-loop,
-        // kickoff-reverse-interview) deleted; HELPER_TEMPLATES is empty,
-        // so init no longer stamps anything under ~/.ccteam/templates/
-        // beyond what other writers seed there.
+        // The orchestrator-era subdirs are no longer created by init —
+        // nothing reads them post-W2 and they used to trip the doctor
+        // home-drift check on a brand-new install.
+        for dead in ["phases", "inbox", "control"] {
+            assert!(
+                !paths.root.join(dead).exists(),
+                "init must NOT create orchestrator-era dir {}",
+                paths.root.join(dead).display()
+            );
+        }
         assert!(report.contains("ccteam init"));
         assert!(report.contains("next"));
+    }
+
+    /// v0.8.6 D1.1 regression: a brand-new `ccteam init` must not create
+    /// any directory the doctor home-drift check flags. Before D1.1, init
+    /// stamped `phases/templates/inbox/control` while the drift check only
+    /// tolerated `canonical_home_dirs()` — so a fresh install reported
+    /// four self-inflicted drift dirs on the very next `ccteam doctor`.
+    #[test]
+    fn run_init_leaves_no_home_layout_drift() {
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        run_init(&paths, init_opts_targeting_tmp(&tmp, "drift-demo")).unwrap();
+        let drift = render_home_drift_line(&paths);
+        assert!(
+            drift.is_empty(),
+            "a fresh `ccteam init` must produce zero home drift; got: {drift}",
+        );
     }
 
     #[test]
@@ -6232,6 +6324,10 @@ mod tests {
 
     #[test]
     fn run_doctor_with_no_flags_shows_help_text() {
+        // v0.8.6: `run_doctor`'s always-run legacy-skill self-heal
+        // resolves the real `~/.claude`; the bootstrap-disable guard
+        // keeps this unit test from touching the developer's home.
+        ensure_isolation();
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
         let body = run_doctor(&paths, DoctorOptions::default()).unwrap();
@@ -6246,6 +6342,10 @@ mod tests {
     /// dirs. Informational only; never affects the exit code.
     #[test]
     fn run_doctor_reports_home_layout_drift() {
+        // v0.8.6: keep the always-run legacy-skill self-heal off the
+        // developer's real `~/.claude` (see guard in
+        // `render_legacy_skill_cleanup_line`).
+        ensure_isolation();
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
         // Canonical (init-time) + runtime-lazy dirs — must NOT be flagged.
@@ -6286,6 +6386,9 @@ mod tests {
     /// home-drift line.
     #[test]
     fn run_doctor_no_home_drift_when_layout_clean() {
+        // v0.8.6: guard the always-run legacy-skill self-heal off the
+        // real `~/.claude` during this unit test.
+        ensure_isolation();
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
         for d in ccteam_core::canonical_home_dirs() {
@@ -6373,6 +6476,9 @@ mod tests {
         // ageing rate sheets without having to remember the explicit
         // flag. The help block is appended after the report so
         // first-time users still discover the opt-in mutation modes.
+        // v0.8.6: guard the always-run legacy-skill self-heal off the
+        // real `~/.claude` during this unit test.
+        ensure_isolation();
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
         let body = run_doctor(&paths, DoctorOptions::default()).unwrap();

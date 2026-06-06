@@ -23,6 +23,8 @@
 /// - `ccteam-control` / `ccteam-creator` / `ccteam-im-setup` were the
 ///   last bundled skills, removed once their functions moved to MCP
 ///   tools / the `cto` role / `ccteam config`.
+/// - `ccteam-team` / `ccteam-scan` were shipped alongside them and are
+///   likewise gone; upgraders may still carry their stale directories.
 pub const LEGACY_SKILL_NAMES: &[&str] = &[
     "cct-control",
     "cct-team-author",
@@ -32,4 +34,6 @@ pub const LEGACY_SKILL_NAMES: &[&str] = &[
     "ccteam-control",
     "ccteam-creator",
     "ccteam-im-setup",
+    "ccteam-team",
+    "ccteam-scan",
 ];

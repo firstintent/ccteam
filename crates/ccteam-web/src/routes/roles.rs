@@ -79,6 +79,22 @@ async fn handle_list_roles(State(app): State<AppState>, Path(slug): Path<String>
     }
 }
 
+/// Reject a `{role}` path param that is empty or contains anything
+/// outside `[a-z0-9_-]`. axum percent-decodes the path param before it
+/// reaches us, so a `..%2f..%2f.claude%2fCLAUDE.md` traversal arrives as
+/// literal `../../.claude/CLAUDE.md` and is caught by the `/` / `.`
+/// rejection — defense in depth alongside `ccteam_core::read_role`'s own
+/// guard, but here we can return a clean `400` instead of a `500`. Must
+/// mirror the write/PUT path validator (`admin_actions::validate_bot_name`,
+/// reused via `write_role`) so a name accepted on read is accepted on
+/// write and vice versa.
+fn role_name_is_valid(role: &str) -> bool {
+    !role.is_empty()
+        && role
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-')
+}
+
 /// `GET /api/v1/projects/{slug}/roles/{role}` → frontmatter + body or 404.
 async fn handle_get_role(
     State(app): State<AppState>,
@@ -86,6 +102,13 @@ async fn handle_get_role(
 ) -> Response {
     if let Some(resp) = reject_unknown_project(&app, &slug) {
         return resp;
+    }
+    if !role_name_is_valid(&role) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("invalid role name: {role}")})),
+        )
+            .into_response();
     }
     let project_dir = app.paths.project_dir(&slug);
     match ccteam_core::read_role(&project_dir, &role) {
@@ -96,9 +119,13 @@ async fn handle_get_role(
         )
             .into_response(),
         Err(err) => {
-            tracing::error!(slug, role, %err, "read_role failed");
+            // The early `role_name_is_valid` guard catches traversal, so a
+            // core `Err` here is a genuine read failure (or, defense in
+            // depth, a name the core guard rejects) → 400, never 500, and
+            // never leaks a path.
+            tracing::warn!(slug, role, %err, "read_role failed");
             (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"error": format!("{err}")})),
             )
                 .into_response()
@@ -196,6 +223,35 @@ async fn handle_put_role(
                     .into_response(),
                 InputMode::Form => (status, format!("write_role failed: {err}")).into_response(),
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::role_name_is_valid;
+
+    #[test]
+    fn role_name_guard_rejects_traversal_and_accepts_normal() {
+        // Normal subagent names pass.
+        for ok in ["cto", "reviewer", "code-reviewer", "bot_2", "a"] {
+            assert!(role_name_is_valid(ok), "expected `{ok}` to be valid");
+        }
+        // axum percent-decodes the path param, so these are the literal
+        // strings a percent-encoded traversal delivers to the handler.
+        for bad in [
+            "",
+            "../secret",
+            "../../etc/passwd",
+            "../../../.claude/CLAUDE.md",
+            "..\\..\\windows",
+            "/etc/passwd",
+            ".hidden",
+            "a/b",
+            "Bad Name",
+            "UPPER",
+        ] {
+            assert!(!role_name_is_valid(bad), "expected `{bad}` to be rejected");
         }
     }
 }

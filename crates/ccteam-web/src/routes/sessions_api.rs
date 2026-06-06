@@ -26,12 +26,15 @@
 //! **SSE filter key (cross-stage from the spine)**: a per-session SSE
 //! handler keeps only events whose `sid` matches its target. Every
 //! web-API session shares `chat_id == "web-api"`, so filtering MUST be on
-//! the `sid` field — never `chat_id`. The web event source here is the
-//! file-watcher [`EventBus`](crate::watcher::EventBus): each
-//! [`ProgressUpdate`](crate::watcher::ProgressUpdate) carries an optional
-//! `sid` parsed from `~/.ccteam/progress/<slug>/<sid>.jsonl`, so this
-//! mirrors [`super::sse::handle_sse_project_session`] but matches on the
-//! `sid` alone (the API addresses a session by id, not by slug).
+//! the `sid` field — never `chat_id`. The event source is the **gateway's
+//! own event stream** ([`Gateway::subscribe_events`](ccteam_im::gateway::Gateway::subscribe_events)),
+//! a broadcast tee of every [`GatewayEvent`](ccteam_im::gateway::GatewayEvent)
+//! the gateway emits (pump answers + progress, turn-timeout, choice prompts).
+//! Each event tied to a tracked session carries `sid == Some("s{n}")`, so
+//! this handler keeps the ones whose `sid` matches its target and drops the
+//! rest. (The earlier file-watcher `EventBus` source only ever saw flat
+//! `<slug>.jsonl` progress with `sid == None`, so a real session got nothing
+//! but keep-alives — fix #2.)
 //!
 //! **History**: the gateway keeps no in-memory transcript, so the history
 //! endpoint tails the per-session source on disk — the project's
@@ -53,10 +56,11 @@ use axum::{
     Json, Router,
 };
 use ccteam_harness::AgentVendor;
+use ccteam_im::gateway::GatewayEvent;
 use futures::stream::{Stream, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
-use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 
 use super::actions::{FormOrJson, InputMode};
 use crate::state::AppState;
@@ -281,46 +285,57 @@ async fn handle_session_turn(
 
 /// `GET /api/v1/sessions/{sid}/events`
 ///
-/// SSE stream for one session. Subscribes to the file-watcher
-/// [`EventBus`](crate::watcher::EventBus) and keeps only
-/// [`ProgressUpdate`](crate::watcher::ProgressUpdate)s whose `sid` matches
-/// this session id — the cross-stage filter key. Mirrors
-/// [`super::sse::handle_sse_project_session`] (15s keep-alive; lagging
-/// consumers get a synthetic `reconnect_hint` then the stream closes for
-/// the SPA's `EventSource` to auto-reconnect).
+/// SSE stream for one session. Subscribes to the gateway's event broadcast
+/// ([`Gateway::subscribe_events`](ccteam_im::gateway::Gateway::subscribe_events))
+/// and keeps only [`GatewayEvent`]s whose `sid` matches this session id —
+/// the cross-stage filter key. 15s keep-alive; a lagging consumer (broadcast
+/// `Lagged`) gets a synthetic `reconnect_hint` then the stream closes for the
+/// SPA's `EventSource` to auto-reconnect.
 ///
 /// No-gateway: a 503 here would close the `EventSource` and the SPA would
 /// retry-loop, so we instead emit a single `gateway_unavailable` SSE frame
 /// and keep an (empty) keep-alive stream open — the SPA shows "no live
 /// gateway" without hammering reconnects.
+///
+/// Unknown sid (gateway present but no session by that id) is *not* a 404
+/// here: the stream simply never matches, so only keep-alives flow. A
+/// session created concurrently then starts matching live — closing the
+/// stream on a momentarily-unknown sid would race that.
 async fn handle_session_events(
     State(app): State<AppState>,
     Path(sid): Path<String>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let rx = app.bus.subscribe();
-    let has_gateway = app.gateway.is_some();
-    let target_sid = sid.clone();
-    let stream = BroadcastStream::new(rx).filter_map(move |item| {
-        let target_sid = target_sid.clone();
-        async move {
-            match item {
-                Ok(update) if update.sid.as_deref() == Some(target_sid.as_str()) => {
-                    Some(Ok(session_event(&update)))
-                }
-                Ok(_) => None,
-                Err(err) => Some(Ok(reconnect_hint(&format!("{err}")))),
-            }
-        }
-    });
-    // Prepend a one-shot `gateway_unavailable` notice on the no-gateway
-    // path so the client learns why no session events will arrive (the
-    // file watcher still streams, but nothing is sid-tagged for it).
-    let prefix = if has_gateway {
-        futures::stream::iter(Vec::new())
-    } else {
-        futures::stream::iter(vec![Ok(gateway_unavailable_event())])
+    // Subscribe under a brief lock (subscribe_events only clones a Sender +
+    // registers a Receiver; no `.await` is held under the guard). `None`
+    // gateway keeps the standalone no-gateway contract.
+    let rx = match app.gateway.as_ref() {
+        Some(gw) => Some(gw.lock().await.subscribe_events()),
+        None => None,
     };
-    Sse::new(prefix.chain(stream)).keep_alive(KeepAlive::default().interval(KEEPALIVE_INTERVAL))
+    let target_sid = sid.clone();
+    // Unify both arms into one stream type (`Either`) so the function has a
+    // single `impl Stream` return. With a gateway: the filtered broadcast.
+    // Without: a one-shot `gateway_unavailable` notice (then only keep-alives).
+    let stream = match rx {
+        Some(rx) => BroadcastStream::new(rx)
+            .filter_map(move |item| {
+                let target_sid = target_sid.clone();
+                async move {
+                    match item {
+                        Ok(ev) if event_matches_sid(&ev, &target_sid) => {
+                            Some(Ok(session_event(&ev)))
+                        }
+                        Ok(_) => None,
+                        Err(BroadcastStreamRecvError::Lagged(n)) => {
+                            Some(Ok(reconnect_hint(&format!("lagged {n} events"))))
+                        }
+                    }
+                }
+            })
+            .left_stream(),
+        None => futures::stream::iter(vec![Ok(gateway_unavailable_event())]).right_stream(),
+    };
+    Sse::new(stream).keep_alive(KeepAlive::default().interval(KEEPALIVE_INTERVAL))
 }
 
 /// `POST /api/v1/sessions/{sid}/stop`
@@ -345,25 +360,49 @@ async fn handle_session_stop(State(app): State<AppState>, Path(sid): Path<String
     }
 }
 
-/// Build the `event: progress` SSE frame for a session update. Same wire
-/// shape as [`super::sse`]'s `progress_event` (single-line JSON object
-/// with `slug` + `sid` stitched in) so the SPA's existing parser handles
-/// it unchanged.
-fn session_event(update: &crate::watcher::ProgressUpdate) -> Event {
-    let payload = match serde_json::from_str::<serde_json::Value>(&update.event_json) {
-        Ok(serde_json::Value::Object(mut map)) => {
-            map.insert(
-                "slug".into(),
-                serde_json::Value::String(update.slug.clone()),
-            );
-            if let Some(sid) = &update.sid {
-                map.insert("sid".into(), serde_json::Value::String(sid.clone()));
-            }
-            serde_json::Value::Object(map)
-        }
-        _ => json!({ "slug": update.slug, "sid": update.sid, "raw": update.event_json }),
+/// The per-session SSE filter key (cross-stage from the spine): keep a
+/// [`GatewayEvent`] iff its `sid` is exactly `Some(target)`. Events with a
+/// different `sid` — or none at all (the `chat_send_file` MCP path, the D6
+/// `interaction/ask` hook prompt) — are dropped.
+fn event_matches_sid(ev: &GatewayEvent, target: &str) -> bool {
+    ev.sid.as_deref() == Some(target)
+}
+
+/// Build the `event: progress` SSE frame for one [`GatewayEvent`]. The
+/// payload is a single-line JSON object carrying the event `id`, its `sid`,
+/// a `kind` label (`"answer"` / `"progress"`, with `done` for a finalizing
+/// progress update), and the user-visible `content`. Choice prompts arrive
+/// as `Answer` events whose `options` are non-empty; those are surfaced too
+/// so the SPA can render them. The SSE event name stays `progress` so the
+/// SPA's existing per-session parser handles it unchanged.
+fn session_event(ev: &GatewayEvent) -> Event {
+    Event::default()
+        .event("progress")
+        .data(session_event_payload(ev).to_string())
+}
+
+/// The JSON payload [`session_event`] serializes (split out for unit tests —
+/// asserting on an `axum` `Event`'s rendered body is awkward).
+fn session_event_payload(ev: &GatewayEvent) -> serde_json::Value {
+    use ccteam_im::gateway::GatewayEventKind;
+    let (kind, done) = match &ev.kind {
+        GatewayEventKind::Answer => ("answer", false),
+        GatewayEventKind::Progress { done, .. } => ("progress", *done),
     };
-    Event::default().event("progress").data(payload.to_string())
+    let mut payload = json!({
+        "id": ev.id,
+        "sid": ev.sid,
+        "kind": kind,
+        "content": ev.content,
+    });
+    if done {
+        payload["done"] = serde_json::Value::Bool(true);
+    }
+    if !ev.options.is_empty() {
+        payload["options"] =
+            serde_json::Value::Array(ev.options.iter().map(|o| json!(o.label)).collect());
+    }
+    payload
 }
 
 /// Synthetic lag/close frame — mirrors [`super::sse`]'s `reconnect_hint`.
@@ -434,6 +473,52 @@ mod tests {
         assert_eq!(s2.len(), 1);
         let none = collect_session_progress(&app, slug, "s99");
         assert!(none.is_empty());
+    }
+
+    /// Build a minimal [`GatewayEvent`] with the given `sid` for filter tests.
+    fn gw_event(sid: Option<&str>) -> GatewayEvent {
+        use ccteam_im::gateway::GatewayEventKind;
+        GatewayEvent {
+            id: "e1".into(),
+            channel: "web".into(),
+            chat_id: "web-api".into(),
+            thread_ts: None,
+            content: "hi".into(),
+            kind: GatewayEventKind::Answer,
+            attachments: Vec::new(),
+            options: Vec::new(),
+            sid: sid.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn event_matches_sid_keeps_target_drops_others() {
+        // Target sid passes; a different sid and a None sid are dropped — the
+        // cross-stage SSE filter key.
+        assert!(event_matches_sid(&gw_event(Some("s1")), "s1"));
+        assert!(!event_matches_sid(&gw_event(Some("s2")), "s1"));
+        assert!(!event_matches_sid(&gw_event(None), "s1"));
+    }
+
+    #[test]
+    fn session_event_maps_answer_and_progress() {
+        use ccteam_im::gateway::GatewayEventKind;
+        // Answer → kind "answer", sid + content carried, no `done` key.
+        let answer = session_event_payload(&gw_event(Some("s1")));
+        assert_eq!(answer["kind"], "answer");
+        assert_eq!(answer["sid"], "s1");
+        assert_eq!(answer["content"], "hi");
+        assert!(answer.get("done").is_none());
+
+        // Finalizing progress → kind "progress" + done:true.
+        let mut prog = gw_event(Some("s1"));
+        prog.kind = GatewayEventKind::Progress {
+            status_key: "s1-0".into(),
+            done: true,
+        };
+        let prog = session_event_payload(&prog);
+        assert_eq!(prog["kind"], "progress");
+        assert_eq!(prog["done"], true);
     }
 
     #[test]

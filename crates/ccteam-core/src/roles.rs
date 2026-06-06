@@ -106,11 +106,37 @@ pub fn list_roles(project_dir: &Path) -> Result<Vec<RoleSummary>> {
     Ok(out)
 }
 
+/// Mirror of `admin_actions::validate_bot_name` (the write/PUT path
+/// validator) — kept independent here so the read-side resource API
+/// doesn't reach across modules for a few lines, and so a malicious
+/// `{role}` path param can never escape `.claude/agents/`. A `role`
+/// containing `/`, `\`, `..`, a leading `.`, or that is empty is
+/// rejected; only `[a-z0-9_-]` is allowed, which subsumes all of those
+/// (axum percent-decodes the path param before it reaches us, so a
+/// `..%2f..%2f` traversal arrives as literal `../../` and is caught by
+/// the `/` / `.` rejection). Read and write **must** agree on the
+/// accepted character set.
+fn validate_role_name(role: &str) -> Result<()> {
+    if role.is_empty() {
+        anyhow::bail!("role name must be non-empty");
+    }
+    for ch in role.chars() {
+        let ok = ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-';
+        if !ok {
+            anyhow::bail!("role name `{role}`: character `{ch}` not allowed (only [a-z0-9_-])");
+        }
+    }
+    Ok(())
+}
+
 /// Read a single role file. Returns `Ok(None)` when the file does not
 /// exist (the caller maps that to 404); `Err` only on a genuine read
-/// failure. Frontmatter parse failures fold to an empty object rather
-/// than erroring, mirroring [`list_roles`].
+/// failure (which now includes an invalid / path-traversing `role` —
+/// the web handler maps that to 400, not 404). Frontmatter parse
+/// failures fold to an empty object rather than erroring, mirroring
+/// [`list_roles`].
 pub fn read_role(project_dir: &Path, role: &str) -> Result<Option<RoleDetail>> {
+    validate_role_name(role)?;
     let path = agents_dir(project_dir).join(format!("{role}.md"));
     if !path.exists() {
         return Ok(None);
@@ -262,6 +288,37 @@ mod tests {
     fn read_role_missing_returns_none() {
         let tmp = TempDir::new().unwrap();
         assert!(read_role(tmp.path(), "ghost").unwrap().is_none());
+    }
+
+    #[test]
+    fn read_role_rejects_path_traversal() {
+        let tmp = TempDir::new().unwrap();
+        // Plant a sibling .md *outside* the project's agents/ dir that a
+        // traversal would reach if validation were missing.
+        let secret = tmp.path().join("secret.md");
+        fs::write(&secret, "---\nmodel: opus\n---\ntop secret\n").unwrap();
+        seed(tmp.path(), "cto", "---\nmodel: opus\n---\nlead body\n");
+
+        // axum percent-decodes the path param, so these are the literal
+        // values a `..%2f..%2fsecret` request would deliver to read_role.
+        for evil in [
+            "../secret",
+            "../../etc/passwd",
+            "..\\..\\windows",
+            "/etc/passwd",
+            ".hidden",
+            "",
+            "a/b",
+        ] {
+            assert!(
+                read_role(tmp.path(), evil).is_err(),
+                "expected traversal/invalid role `{evil}` to be rejected"
+            );
+        }
+        // A normal role still reads fine.
+        let detail = read_role(tmp.path(), "cto").unwrap().unwrap();
+        assert_eq!(detail.role, "cto");
+        assert_eq!(detail.frontmatter.get("model").unwrap(), "opus");
     }
 
     #[test]

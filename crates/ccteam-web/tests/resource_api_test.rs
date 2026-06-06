@@ -124,6 +124,68 @@ async fn get_single_role_unknown_role_404() {
     assert_eq!(resp.status(), 404);
 }
 
+/// v0.8.6 (review-fix #1) — full HTTP-level traversal smoke for the
+/// single-role GET. A percent-encoded `..%2f..%2f...` path param must
+/// NOT escape `<project>/.claude/agents/` and leak an out-of-tree file;
+/// it must come back 400 (handler guard) or 404 (axum path-normalization
+/// at the router), never 200 carrying the target file's bytes. A normal
+/// role on the same server still returns 200, proving the guard isn't a
+/// blanket reject. Mirrors the `read_role` + `role_name_is_valid` unit
+/// guards but exercises the real axum stack end to end.
+#[tokio::test]
+async fn get_single_role_rejects_path_traversal() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    fixture_project(&paths, "demo");
+    let project_dir = paths.project_dir("demo");
+    // Plant a real secret OUTSIDE the project's agents/ dir that a working
+    // traversal would surface (sibling .md so even `<evil>.md` resolves).
+    let secret_dir = tmp.path().join("outside");
+    std::fs::create_dir_all(&secret_dir).unwrap();
+    std::fs::write(secret_dir.join("secret.md"), "TOP-SECRET-CANARY\n").unwrap();
+    let addr = spawn(AppState::new(paths)).await;
+    let client = reqwest::Client::new();
+
+    // A normal seeded role still reads fine (guard is not a blanket deny).
+    let ok = client
+        .get(format!("http://{addr}/api/v1/projects/demo/roles/cto"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200, "normal role must still 200");
+
+    // Each of these is a percent-encoded traversal aimed at a file the
+    // server can actually read; none may return 200, and none may echo
+    // the canary or any out-of-tree file content.
+    let evil_paths = [
+        // up to /etc/passwd
+        "..%2f..%2f..%2f..%2f..%2fetc%2fpasswd",
+        // up to the user's ~/.claude/CLAUDE.md (the requirement's case)
+        "..%2f..%2f.claude%2fCLAUDE.md",
+        // at the planted sibling canary (relative to .claude/agents/)
+        "..%2f..%2f..%2foutside%2fsecret",
+        // backslash + leading-dot variants
+        "..%5c..%5csecret",
+        ".hidden",
+    ];
+    for evil in evil_paths {
+        let url = format!("http://{addr}/api/v1/projects/demo/roles/{evil}");
+        let resp = client.get(&url).send().await.unwrap();
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        assert!(
+            status == 400 || status == 404,
+            "traversal `{evil}` must be 400/404, got {status}; body={body}"
+        );
+        assert!(
+            !body.contains("TOP-SECRET-CANARY") && !body.contains("root:"),
+            "traversal `{evil}` leaked out-of-tree file content: {body}"
+        );
+    }
+    // Ensure the project's real agents/ dir is intact (no clobber).
+    assert!(project_dir.join(".claude/agents/cto.md").exists());
+}
+
 #[tokio::test]
 async fn put_role_json_writes_file() {
     let tmp = TempDir::new().unwrap();
