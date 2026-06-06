@@ -1,16 +1,16 @@
-# v0.8.8 PRD — 独立 session 模型 + 实机 bug 批修
+# v0.8.8 PRD — 独立 session 模型 + web 能力补全 + 实机 bug 批修
 
-> **状态:DRAFT,需求持续补充中**(user 边实机用边加;本文 §一 范围表 + 对应小节滚动更新)。
+> **状态:DRAFT,需求持续补充中**(user 边实机用边加;§二 功能项 + §三 Bug 滚动追加,**新需求只 append `### F*` / `### B*` 子节,不动顶层编号**)。
 > **流程:doc-first** —— 本 PRD(+ scope 冻结后的 dev-plan)是**需求收集 + 文档**产物;**实现是另一个 dev session**,user review 文档后才动代码。本文作者**只收集需求 + 写文档,不开发**。
 > **来源**:v0.8.7 ship 后实机(IM + web)讨论,2026-06-06(TG)。
-> **代码基线**:dev `e8e26a2`(v0.8.7 + review-fix B/C 已落)。
+> **代码基线**:dev `68e73d8`(v0.8.7 + review-fix B/C 已落)。
 > **bug 清单 + 根因 file:line**:见同目录 `bug.md`(SoT,持续追加)。
 
 ---
 
 ## 〇、一句话
 
-v0.8.7 的 per-session web UI 把"会话"做成了 **UI 壳独立、但数据按 `(项目, role)` 共享** —— 因为底层 keystone 是 `session = role`。v0.8.8 把 **session 升成一等实体(独立、有持久 id)**,让多个会话像 Claude Code 原生 session 一样互不串台;附带清掉 v0.8.7 遗留的几个实机 bug + 重写 `ccteam status`。
+v0.8.7 的 per-session web UI 把"会话"做成了 **UI 壳独立、数据按 `(项目, role)` 共享**(因为 keystone 是 `session = role`)。v0.8.8:(1)把 **session 升成一等实体(独立、有持久 id)**,让多会话像 Claude Code 原生 session 一样互不串台;(2)**补全 web 能力**(config 配置模块 + role 浏览页 + status 重写 + 终端修复);(3)清掉 v0.8.7 遗留的实机 bug。
 
 ## 一、范围(初版,持续加)
 
@@ -18,80 +18,81 @@ v0.8.7 的 per-session web UI 把"会话"做成了 **UI 壳独立、但数据按
 |---|---|---|---|---|
 | **F1** | 独立 session 模型 | 架构(headline) | session 一等实体 + 持久 id;改 `session = role` keystone + 去 dedup | 根治 BUG-3 |
 | **F2** | roleless session | feature | role 空 → spawn 不加 `--agent`(裸 claude) | ENH-1 |
-| **F3** | `ccteam status` 重写 | CLI/UX | 列全部项目 + 其会话;删最近事件;web token/url 两行(LAN ip) | TG 2363 |
+| **F3** | `ccteam status` 重写 | CLI/UX | 列全部项目 + 其会话(含 vendor);删最近事件;web token/url 两行(LAN ip) | TG 2363/2366 |
+| **F4** | web config 配置模块 | feature | web 上配 IM,重点 Telegram + Lark | TG 2370 |
+| **F5** | web role 浏览页面 | feature | web 浏览(已装 role,可选 catalog) | TG 2371 |
 | **B1** | `project stop` 跟 backend 走 | bug | 现 tmux-only,默认 rmux 停不掉 | BUG-1 |
 | **B2** | web「新建项目」入口恢复 | bug | v0.8.7 W4 回归删掉了 | BUG-2 |
 | **B3** | 新建弹窗 role 改下拉真实 role | bug/UX | 现手输 + 静态建议,不知有哪些 role | BUG-4 |
-| **B4** | `session ls`/`status` 显示 vendor + 修 codex 活性误报 | bug/UX | session ls 按 backend 名枚举、看不到 codex(误报 not running)、且无 vendor 列 | BUG-5 |
-| **B5** | web 终端(per-session PTY WS)修复 + "像本地终端" | bug/feature | 连上即断循环:路由没指向会话 pane(W4 遗留 TODO)+ send-keys/resize 硬编码 tmux;裸字节保真 = rmux W2b | BUG-6 |
+| **B4** | `session ls`/`status` 显示 vendor + 修 codex 活性误报 | bug/UX | session ls 按 backend 名枚举、看不到 codex | BUG-5 |
+| **B5** | web 终端 PTY WS 修复 + "像本地终端" | bug/feature | 连上即断:路由没指向会话 pane + I/O 硬编码 tmux | BUG-6 |
 
 > BUG-3(per-session 串台)**不单列修项** —— 它是 `session = role` 的症状,由 **F1 根治**。
-> 后续 user 追加的需求 append 到本表 + 新小节。
 
-## 二、F1 · 独立 session 模型(headline)
+---
 
-### 2.1 需求(user 原话)
-> "聊天独立 = 跟 Claude Code 原生 session 一样,终端起多个会话互不串台,同一个 role 开两个也各聊各的。"
+## 二、功能项
 
-### 2.2 方向(已定 = A;A/B 取舍见 `bug.md` BUG-3)
+### F1 · 独立 session 模型(headline)
+
+**需求(user 原话)**:"聊天独立 = 跟 Claude Code 原生 session 一样,终端起多个会话互不串台,同一个 role 开两个也各聊各的。"
+
+**方向(已定 = A;A/B 取舍见 `bug.md` BUG-3)**:
 - **session = 一等实体**,有**持久 id**(不是现在一重启就重置的内存 `s{n}`)。
 - **role 降级为 session 的属性**(决定用哪个 `--agent`,或不带 = F2)。
-- **去掉 `(项目, role)` dedup**(现"单 (项目,role) 一个 pane")→ 同 role 可并存多个 session,每个 = 自己的原生 claude session(UUID)+ 自己的 pane + 自己的 turns(按 **session id** 存,不是按 role)。
-- **历史 + SSE 都按 session id** 走 → 天然不串台。
+- **去掉 `(项目, role)` dedup** → 同 role 可并存多个 session,每个 = 自己的原生 claude session(UUID)+ 自己的 pane + 自己的 turns(按 **session id** 存)。
+- **历史 + SSE + 终端 + session ls/status 都按 session id** 走 → 天然不串台,且为 B4/B5 提供统一的"按 session 取数"。
 
-### 2.3 影响(动到的红线 / blast radius)
-- **改 keystone**:`session = role` → `session = 独立会话;role 是 session 的一个属性`。CLAUDE.md §〇/§三 + `tech-design.md` 相关红线要重写。
-- **改 invariant**:dedup「单 (项目,role) pane」→ 允许同 role 多 pane。
-- **保留** resume-by-id(红线),但 resume key 从 `(项目, role)` 改成 **session id**;"空闲释放 + 扛 daemon 重启"语义不变,只是粒度变细。
-- 触及面(非完整设计,只列已知):gateway session 模型 + 持久化(session id 落盘)、tmux/rmux 命名(`ccteam-chat-<slug>-<role>` → 需含 session id)、`turns_mirror`(按 session 存)、`claude_tui` 的 `spec_for_new`/`spec_for_resume`(`--agent` 变可选 + `--name` 每 session 唯一)、`/role`、web/IM 寻址(一个 chat 里多个同 role 会话怎么切)、旧数据迁移。
+**影响(动到的红线 / blast radius)**:
+- **改 keystone** `session = role` → `session = 独立会话;role 是属性`(CLAUDE.md §〇/§三 + `tech-design.md` 重写);**改 invariant**「单 (项目,role) pane」→ 允许同 role 多 pane;**保留** resume-by-id 但 key 从 `(项目,role)` 改成 **session id**。
+- 触及:gateway session 模型 + 持久化、tmux/rmux 命名(含 session id)、`turns_mirror`(按 session 存)、`claude_tui` `spec_for_new/resume`、`/role`、web/IM 寻址、`pty_ws`(B5)、`session ls`(B4)、旧数据迁移。
 
-### 2.4 开放问题(待 user 拍 / 设计深化)
-1. **session 持久 id 形态**:ccteam 自己 mint uuid?还是复用 claude 原生 session UUID(注意 `--name` 是 title 非 id,要另持有真 id)?
-2. **IM 里怎么寻址多个同 role 会话**:`/new` 给每个 session 一个 handle?`/use <handle>` 切?(现有 `/new /use /cd` 如何扩。)
-3. **`/role` 语义**:改当前 session 的 role(原地 re-spawn 换 `--agent`),还是必然开新 session?
-4. **roleless 的 turns key / 显示名**(联动 F2)。
-5. **web session list**:同 role 多会话怎么展示 + 命名(现 rail 每 `(项目,role)` 一条)。
-6. **session 生命周期**:谁能删?空闲释放策略?是否给上限(防一个 role 开爆 pane)?
+**开放问题(待 user / 设计深化)**:① session 持久 id 形态(mint uuid vs 复用 claude 原生 UUID;注意 `--name` 是 title 非 id);② IM 怎么寻址同 role 多会话(`/new` 给 handle?`/use`?);③ `/role` 语义(改属性 vs 必开新);④ roleless 的 turns key / 显示名;⑤ web session list 同 role 多会话展示;⑥ session 生命周期(删/空闲释放/上限)。
 
-## 三、F2 · roleless session(ENH-1)
-- **需求**:新建 session role 留空 → spawn **不加** `--agent`(裸 claude,brain 走项目 `CLAUDE.md` 原生自读);非空才 `--agent <role>`。
-- **依赖 F1**:roleless 没 role 当 turns key → 必须先有 session 持久 id。
-- **已知改动**:前端别把空 role 默认成 cto;create 路径"**仅非空 role 才校验存在**"(保留 FIX-2 对非空的校验,防 `--agent <未定义>` 死 pane);`spec_for_new/resume` 支持"空 role 跳过 `--agent`"。
-- **红线说明**:roleless ≠ role,是 `session=role` → `session 一等实体` 之后的自然态(session 可以没有 role)。
+### F2 · roleless session(ENH-1)
+- **需求**:新建 session role 留空 → spawn **不加** `--agent`(裸 claude,brain 走项目 `CLAUDE.md`);非空才 `--agent <role>`。
+- **依赖 F1**(roleless 无 role 当 turns key → 需 session 持久 id)。
+- **已知改动**:前端别把空 role 默认成 cto;create 路径"仅非空 role 才校验存在"(保留 FIX-2 守);`spec_for_new/resume` 空 role 跳过 `--agent`。
+- **红线说明**:roleless ≠ role,是 `session 一等实体` 后的自然态。
 
-## 四、F3 · `ccteam status` 重写(TG 2363)
-### 4.1 需求(user 原话拆解)
-1. **输出所有项目 + 每个项目下面的会话(session)**(嵌套展示,不只项目级)。
-2. **删除「recent events (last 5)」段**。
-3. **"两行"** —— web 访问信息两行:
-   - `web token: <hex>`(裸 hex,不带 `ccteam:` 前缀)
-   - `web url: http://<局域网ip>:7331/?token=ccteam:<hex>`(URL 里带 `ccteam:` 前缀;**ip 取局域网 ip**,不是 localhost/0.0.0.0)
-4. **每个会话行显示 vendor**(claude / codex)—— `status` + `session ls` 都加(TG 2365)。
+### F3 · `ccteam status` 重写(TG 2363)
+**需求**:① 列**所有项目 + 各自的 sessions**(嵌套);② **删「recent events (last 5)」**;③ web 访问**两行**:`web token: <hex>`(裸 hex)+ `web url: http://<局域网ip>:7331/?token=ccteam:<hex>`(url 带 `ccteam:` 前缀、**LAN ip**);④ **每个会话行显示 vendor**(claude/codex;status + session ls 都加,TG 2365)。
+**现状**:现 status = daemon health + 项目级(age/last-event/STUCK|OK)+ recent events + 单行 `web token:`(带前缀)、**无 web url**。
+**已定(TG 2366)**:"两行"严格按 user 实例;status 同显所有 projects + sessions。
+**开放(待 user)**:会话行除 vendor 外还显示啥(role/status/sid/last-event,建议都要);STUCK/OK 留不留(FIX-3 后是真停顿、非误报);LAN ip 多网卡怎么取。
+**归属**:CLI 输出层(`commands.rs` status + `queries.rs` 取数)+ LAN ip 探测 + web url 拼接;会话列举依赖 F1(未落则按现 gateway session 列)。
 
-> ✅ **TG 2366 确认**:① "两行" 严格按 user 实例(`web token:` 一行 + `web url:` 一行);② `status` **同时显示所有 projects 和它们的 sessions**(嵌套)。
-### 4.2 现状参考(改之前长这样)
-`ccteam status` 现含:daemon health 行 + projects(每项目 age/last-event/STUCK|OK + STUCK 时附 peek/attach 提示)+ recent events(last 5)+ `web token:` 一行(带 `ccteam:` 前缀)。**没有 web url 行**(需新增 + LAN ip 探测)。
-### 4.3 开放问题
-1. ~~"两行"指什么~~ **✅ 已定(2366)**:严格按 user 实例 = `web token:` 一行 + `web url:` 一行。
-2. ~~项目 + 会话展示~~ **✅ 已定(2366)**:`status` 同时显示所有 projects + 各自 sessions(嵌套)。**剩**:会话行除 **vendor(确定要)** 外还显示哪些(role / status / sid / last-event)?默认建议 `role + vendor + status + sid`,待 user 确认。
-3. **(待 user)STUCK/OK 留不留**:删了 recent events 后,项目级健康(STUCK/OK)是否保留?(注:FIX-3 后 STUCK 已改从 progress.jsonl 末事件取,demo2 silent 1h = 真停顿、非误报。)
-4. **(待 user)LAN ip 探测**:多网卡/容器时取哪个?(默认私网网段第一个?可配?)
-### 4.4 归属
-CLI 输出层重写(`commands.rs` status handler + `queries.rs` 取数);LAN ip 探测 + web url 拼接是新增;会话列举依赖 F1 的 session 模型(若 F1 未落,先按现 gateway session 列)。
+### F4 · web config 配置模块(TG 2370)
+- **需求**:web 上新增 config 配置模块,**重点配 Telegram + Lark**。
+- **现状**:配置能力在 CLI `ccteam config`(setup hub);IM creds 存 `crates/ccteam-im/src/credentials.rs` 的 `Credentials`(telegram/lark/slack/discord)→ JSON 文件 **mode 0600**。`TelegramCreds`(bot_token + chat_id),`LarkCreds`(app_id + app_secret + allowed_user_ids + `use_feishu` 选区 CN/intl)。校验器:`run_config_set_im_token`(telegram:验 token + 抓 chat_id,**交互式**)、`run_config_set_lark_creds`(lark:拉 WS endpoint 验,非交互)。**web 侧目前无 IM config 路由**。
+- **设计方向**:新增 web 设置页 + API(GET 状态 / PUT 写,**web-token 门后**),复用 CLI 校验逻辑(别重写验证)。
+- **🔒 安全(必须处理)**:creds 是 0600 秘密;web bind 默认 `0.0.0.0:7331`(LAN 可达)、**默认无 TLS** → 秘密走 LAN 明文有风险。要求:① 读取**绝不回显明文**(只给 masked / "已配置"状态 + 末几位);② 维持 web-token 门;③ 建议上 TLS,或至少文档明确"LAN 明文,慎用公网"。
+- **开放问题**:① Telegram 的 chat_id 抓取是**交互式**(要用户去 DM bot)——web 不能阻塞,需异步 UX(填 token → "现在去给 bot 发条消息" → 轮询抓 chat_id);Lark 非交互、直接可做。② 配完热生效(daemon reload creds)还是要重启?③ 范围:只 telegram+lark,还是顺带 slack/discord + 其它 prefs(MCP install / web-token 轮换)?
 
-## 五、Bug 修(详见 `bug.md`,各条 file:line 已验证)
+### F5 · web role 浏览页面(TG 2371)
+- **需求**:web 新增一个 role 浏览页面。
+- **现状**:项目 role API **已有** —— `GET /api/v1/projects/{slug}/roles`(列表 `[{role,description,model}]`)、`GET …/roles/{role}`(详情 frontmatter+body)、`PUT …/roles/{role}`(写)。**agency-agents catalog(192)的 web 路由不存在**(只有 CLI `ccteam role search/add/list`;v0.8.7 把 catalog web API 列为 follow-on、未做)。
+- **设计方向**:(a) 浏览**已装**项目 role(列表 + 详情查看,API 已具备 → 纯前端页);(b) 可选:浏览 + 从 catalog 一键装(需**新增** web 路由 `GET /catalog/roles` + import,= v0.8.7 未做的 follow-on)。
+- **开放问题**:① "浏览"范围 = 仅已装,还是也含 catalog 浏览/装?② web 上 role 只读还是可编辑(PUT 已有)?③ 跟 F4 config、新建弹窗 role 下拉(B3)是否统一进一个"设置/角色"导航区?
+
+---
+
+## 三、Bug 修(详见 `bug.md`,各条 file:line 已验证)
 - **B1 / BUG-1**:`stop_project_chat_sessions` 改经 `default_backend()` 枚举 + kill(去 tmux-only)。
 - **B2 / BUG-2**:web「＋ 新建」恢复「＋ 新建项目…」,走 REST `POST /api/v1/projects`。
 - **B3 / BUG-4**:新建弹窗 role 改下拉,拉 `GET /api/v1/projects/{slug}/roles`。
+- **B4 / BUG-5**:`session ls` 活性 + vendor 从 gateway session map 取(修 codex 误报"not running")+ 加 vendor 列;与 F3 同源。
+- **B5 / BUG-6**:web 终端 per-session PTY WS 按 sid 解析到对的 pane(修 W4 遗留 TODO)+ `send_keys/resize` 改 `default_backend()`;"像本地终端"完整保真需 rmux 裸字节(W2b)。
 - **BUG-3**:由 **F1 根治**,不单独修。
 
-## 六、流程 & 纪律
-- **doc-first**:本 PRD → scope 冻结 → dev-plan(waves)→ user review → **另一个 dev session 实现**。本文作者只收集需求 + 写文档,不开发。
-- **需求持续补充**:user 边用边加 → append 到 §一 表 + 新小节;dev-plan 等 scope 稳了再写。
+> **同类模式**:B1 / B4 / B5(+ BUG-3)都是 **tmux 硬编码 / 按 role 而非 session** 在默认 rmux + per-session 下露馅;**F1(gateway = session SoT)是它们的结构性修复主干**。
+
+## 四、流程 & 纪律
+- **doc-first**:本 PRD → scope 冻结 → dev-plan(waves)→ user review → **另一个 dev session 实现**。本文作者只收集需求 + 写文档,**不开发**(TG 2362)。
+- **需求持续补充**:user 边用边加 → append `### F*` / `### B*` 子节 + §一 表行;dev-plan 等 scope 稳了再写。
 - **pre-v1.0 纪律**:不做历史迁移 —— 新旧 session 数据不兼容时直接「清旧(`~/.ccteam` + 各项目 `.ccteam`)→ 重 `ccteam init`」,不写迁移/兼容分支;deprecated 直接删。
 
-## 七、变更记录
+## 五、变更记录
 - **2026-06-06 初版**:F1 独立 session(Direction A)+ F2 roleless + B1/B2/B3;BUG-3 归 F1 根治。
-- **2026-06-06 +F3**:`ccteam status` 重写(TG 2363:列项目+会话 / 删最近事件 / web token+url 两行 LAN ip)。
-- **2026-06-06 +B4 / F3 细化**:B4 = `session ls`/`status` 显示 vendor + 修 codex 活性误报(BUG-5,TG 2365);F3 开放问题 ①② 经 TG 2366 确认(两行按 user 实例 / status 同显 projects+sessions);每会话行加 vendor。
-- **2026-06-06 +B5**:web 终端 per-session PTY WS 一直断开(BUG-6,TG 2367/2368):路由退回项目级 pane、没指向 sid(W4 遗留 TODO)+ send-keys/resize 硬编码 tmux;"像本地终端"完整保真需 rmux 裸字节(W2b)。
+- **2026-06-06 +F3 / +B4 / +B5**:F3 status 重写(TG 2363,开放问题经 2366 确认、加 vendor);B4 session ls vendor + codex 活性(BUG-5,TG 2365);B5 web 终端 PTY WS 断开(BUG-6,TG 2367/2368)。
+- **2026-06-06 +F4 / +F5 + 结构重排**:F4 web config 模块(telegram+lark,TG 2370);F5 web role 浏览页(TG 2371);PRD 改成"功能项 = `### F*` 子节"的可扩展结构(新需求不再动顶层编号)。
