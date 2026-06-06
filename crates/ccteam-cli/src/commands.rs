@@ -526,7 +526,7 @@ fn scaffold_agent_team_inbox(target: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-const DEFAULT_WORKFLOW_YAML: &str = r#"# ccteam workflow.yaml (V0.4.0+ shape).
+const DEFAULT_WORKFLOW_YAML: &str = r#"# ccteam workflow.yaml.
 # Edit this file to declare your project's agent topology. Each agent
 # is a role (filename of .claude/agents/<role>.md) with a trigger that
 # decides when ccteam spawns a session for it.
@@ -537,14 +537,14 @@ const DEFAULT_WORKFLOW_YAML: &str = r#"# ccteam workflow.yaml (V0.4.0+ shape).
 #   gate                          # waits for `trigger_gate` MCP / CLI call
 #   watch:.ccteam/issues/         # spawn one session per new file under the path
 #
-# Docs: docs/versions/v0-4-0/prd.md §6, examples/workflows/*.yaml
+# Examples: examples/workflows/*.yaml
 name: default-workflow
 description: |
-  Minimal starter workflow. Edit me — the manual `explorer` is a safe
-  default that won't spawn until you call `ccteam spawn <slug> explorer`.
+  Minimal starter workflow. Edit me — the manual `cto` is a safe
+  default that won't spawn until you call `ccteam spawn <slug> cto`.
 
 agents:
-  explorer:
+  cto:
     trigger: manual
     executor: claude
 "#;

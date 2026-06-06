@@ -371,33 +371,6 @@ pub enum HarnessKind {
     Codex,
 }
 
-/// V0.3.1 F47 — one entry in `team.yaml::sessions[]`. Declares a
-/// default session the team factory should bootstrap when an operator
-/// runs `ccteam new --team <flex-team>`. Meaningful only for `kind:
-/// flex` teams; workflow / multi_workflow teams ignore the
-/// field but parse it without error so a hand-rolled flex team yaml
-/// can carry its own bootstrap defaults today even before F48 lands.
-///
-/// Fields:
-/// - `sid` — session id slug (`"claude-1"`, `"codex-1"`, …). Must be
-///   unique within the team yaml (validation lands with F49 when the
-///   field becomes load-bearing); F47 only checks the schema parses.
-/// - `harness` — which [`HarnessKind`] backs this session. Defaults
-///   to [`HarnessKind::Claude`] so a `sessions: [{sid: claude-1}]`
-///   entry without an explicit `harness:` key still parses.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DefaultSessionSpec {
-    /// Session id slug. Used by F49 to derive the tmux session name
-    /// (`ccteam-<slug>-<sid>`) and the `<harness-dir>/<slug>-<sid>.json`
-    /// dual-write target.
-    pub sid: String,
-    /// Backing harness. Defaults to [`HarnessKind::Claude`] so a
-    /// minimal `{sid: claude-1}` entry round-trips.
-    #[serde(default)]
-    pub harness: HarnessKind,
-}
-
 /// `team.yaml` — the team-level config. M3.1 shipped name /
 /// description / retro_schema; M3.2 adds the fields below so the
 /// orchestrator can route phases / ESCALATE prefixes / golden-rule
@@ -520,23 +493,6 @@ pub struct TeamSpec {
     /// `claude_md_template` still round-trips.
     #[serde(default)]
     pub claude_md_template: String,
-
-    // ---------------- V0.3.1 F47 fields ----------------
-    /// V0.3.1 F47/F48 — default session list for `kind: flex` teams.
-    /// Each entry declares a session the team
-    /// factory should bootstrap when an operator runs `ccteam new
-    /// --team <flex-team>` so the project's first attach has the
-    /// expected harnesses (claude / codex / mixed) already running.
-    ///
-    /// **Workflow teams ignore this field** — it has no effect on
-    /// `dev` / `research` / `meta-agent` / `ccteam-project-creator`
-    /// today, but parse-time tolerance lets a flex team yaml ship its
-    /// `sessions[]` defaults right now without waiting on F48 / F49.
-    ///
-    /// Defaults to empty so V0.1 / V0.2 / V0.3 / pre-F48 yamls (which
-    /// omit the field entirely) parse unchanged.
-    #[serde(default)]
-    pub sessions: Vec<DefaultSessionSpec>,
 }
 
 impl TeamSpec {
@@ -882,7 +838,6 @@ mod tests {
             evergreen: false,
             cost_policy: CostPolicy::default(),
             claude_md_template: String::new(),
-            sessions: Vec::new(),
         };
         let yaml = serde_yaml::to_string(&original).unwrap();
         let parsed = TeamSpec::parse(&yaml).unwrap();
@@ -1355,153 +1310,5 @@ mod tests {
         let multi = TeamSpec::parse("name: research\nkind: multi_workflow\n").unwrap();
         assert_eq!(workflow.kind, TeamKind::Workflow);
         assert_eq!(multi.kind, TeamKind::MultiWorkflow);
-    }
-
-    // ---------------- V0.3.1 F47 sessions[] schema ----------------
-
-    #[test]
-    fn f47_sessions_field_default_empty_when_omitted() {
-        // Back-compat invariant: every V0.1 / V0.2 / V0.3 yaml omits
-        // `sessions:`; default `Vec::new()` keeps them parsing
-        // unchanged.
-        let spec = TeamSpec::parse("name: dev\n").unwrap();
-        assert!(spec.sessions.is_empty());
-    }
-
-    #[test]
-    fn f47_sessions_field_parses_claude_harness() {
-        let src = concat!(
-            "name: my-flex\n",
-            "sessions:\n",
-            "  - sid: claude-1\n",
-            "    harness: claude\n",
-        );
-        let spec = TeamSpec::parse(src).unwrap();
-        assert_eq!(spec.sessions.len(), 1);
-        assert_eq!(spec.sessions[0].sid, "claude-1");
-        assert_eq!(spec.sessions[0].harness, HarnessKind::Claude);
-    }
-
-    #[test]
-    fn f47_sessions_field_parses_codex_harness() {
-        // Schema test: `harness: codex` parsing (F47 schema + F49
-        // runtime path, both shipped V0.4.x).
-        let src = concat!(
-            "name: my-flex\n",
-            "sessions:\n",
-            "  - sid: codex-1\n",
-            "    harness: codex\n",
-        );
-        let spec = TeamSpec::parse(src).unwrap();
-        assert_eq!(spec.sessions.len(), 1);
-        assert_eq!(spec.sessions[0].harness, HarnessKind::Codex);
-    }
-
-    #[test]
-    fn f47_sessions_field_parses_mixed_harnesses() {
-        // Mirrors PRD §4.2.2 sample — flex teams may declare a
-        // claude + codex pair as their bootstrap default.
-        let src = concat!(
-            "name: my-flex\n",
-            "sessions:\n",
-            "  - sid: claude-1\n",
-            "    harness: claude\n",
-            "  - sid: codex-1\n",
-            "    harness: codex\n",
-        );
-        let spec = TeamSpec::parse(src).unwrap();
-        assert_eq!(spec.sessions.len(), 2);
-        assert_eq!(spec.sessions[0].harness, HarnessKind::Claude);
-        assert_eq!(spec.sessions[1].harness, HarnessKind::Codex);
-    }
-
-    #[test]
-    fn f47_sessions_field_harness_defaults_to_claude_when_omitted() {
-        // `{sid: claude-1}` without an explicit `harness:` key parses
-        // and resolves to HarnessKind::Claude (matches `Default` impl).
-        let src = concat!("name: my-flex\n", "sessions:\n", "  - sid: claude-1\n",);
-        let spec = TeamSpec::parse(src).unwrap();
-        assert_eq!(spec.sessions[0].harness, HarnessKind::Claude);
-    }
-
-    #[test]
-    fn f47_sessions_field_rejects_unknown_harness() {
-        // `harness: anthropic` is not in the strict HarnessKind enum
-        // — serde must reject so a typo doesn't silently fall back to
-        // claude. Pins the strict-enum contract for V0.3.2 when the
-        // codex spawn path lands.
-        let src = concat!(
-            "name: my-flex\n",
-            "sessions:\n",
-            "  - sid: x\n",
-            "    harness: anthropic\n",
-        );
-        let err = TeamSpec::parse(src).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.to_lowercase().contains("anthropic")
-                || msg.to_lowercase().contains("variant")
-                || msg.to_lowercase().contains("harness"),
-            "expected unknown-variant error for `harness: anthropic`, got: {msg}",
-        );
-    }
-
-    #[test]
-    fn f47_sessions_field_rejects_unknown_inner_field() {
-        // `DefaultSessionSpec` is `deny_unknown_fields` — typo on
-        // `sid` (e.g. `sd:`) must fail loud rather than silently
-        // accept an empty-sid spec.
-        let src = concat!(
-            "name: my-flex\n",
-            "sessions:\n",
-            "  - sd: claude-1\n",
-            "    harness: claude\n",
-        );
-        let err = TeamSpec::parse(src).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("unknown field") || msg.contains("missing field"),
-            "expected unknown / missing field error, got: {msg}",
-        );
-    }
-
-    #[test]
-    fn f47_sessions_field_round_trip_through_yaml() {
-        // Round-trip a TeamSpec carrying both harness flavors so the
-        // serialize side honors the lowercase rename. The serialized
-        // yaml must be re-parsable.
-        let original = TeamSpec {
-            name: "my-flex".into(),
-            aliases: Vec::new(),
-            kind: TeamKind::Workflow,
-            description: String::new(),
-            retro_schema: Vec::new(),
-            critic_dimensions: Vec::new(),
-            escalate_grammar_extensions: Vec::new(),
-            golden_rules: TeamGoldenRules::default(),
-            phase_dir: "phases".into(),
-            verdict_schema: Vec::new(),
-            evergreen: false,
-            cost_policy: CostPolicy::default(),
-            claude_md_template: String::new(),
-            sessions: vec![
-                DefaultSessionSpec {
-                    sid: "claude-1".into(),
-                    harness: HarnessKind::Claude,
-                },
-                DefaultSessionSpec {
-                    sid: "codex-1".into(),
-                    harness: HarnessKind::Codex,
-                },
-            ],
-        };
-        let yaml = serde_yaml::to_string(&original).unwrap();
-        // Lowercase rename must survive serialization.
-        assert!(
-            yaml.contains("harness: claude") && yaml.contains("harness: codex"),
-            "expected lowercase harness values in serialized yaml, got:\n{yaml}",
-        );
-        let parsed = TeamSpec::parse(&yaml).unwrap();
-        assert_eq!(parsed, original);
     }
 }

@@ -24,22 +24,32 @@
 //!    same path minus the `token` query parameter,
 //! 4. subsequent GETs / SSE include the cookie automatically.
 //!
-//! ## CSRF defense (option a, per advisor)
+//! ## CSRF defense (SameSite=Strict cookie)
 //!
-//! POST `/api/...` requires the `Authorization` header *always* (even
-//! when a valid cookie is present). The browser-side template inlines
-//! the token into htmx `hx-headers` only when `auth.enabled` so
-//! same-origin htmx form-submits authenticate; cross-origin form-submit
-//! cannot inject `Authorization` (header-allowlisted by the browser),
-//! and cross-origin `fetch`/`XHR` triggers a CORS preflight which we
-//! never allow. Result: a malicious page on attacker.example **cannot**
-//! produce an authenticated POST against `/api/<slug>/btw`.
+//! CSRF is defeated by the `SameSite=Strict` attribute on the
+//! `ccteam_token` cookie (set in [`auth_layer`]). Under `Strict` the
+//! browser refuses to attach the cookie to **any** cross-site request —
+//! including mutating POST/PUT/DELETE form-submits *and* top-level
+//! navigations — so a malicious page on attacker.example cannot ride
+//! the victim's cookie. The other auth path is the `Authorization:
+//! Bearer ccteam:<hex>` header, which a cross-origin page cannot forge
+//! (it is not in the CORS "simple header" allowlist, and a custom
+//! header triggers a preflight we never permit). Either way the
+//! attacker can produce neither a valid cookie nor a valid header
+//! against `/api/<slug>/...`, so no authenticated mutating request is
+//! possible.
 //!
-//! XSS tradeoff: the token appears in an HTML attribute, not just an
-//! HttpOnly cookie. If the dashboard is XSS'd the attacker can read
-//! the token *and* fire same-origin fetches with the cookie, so
-//! cookie-only would not save us. Inlining doesn't materially worsen
-//! the threat model.
+//! Note: the middleware does **not** require the `Authorization` header
+//! on mutating methods. A same-origin request authenticated by the
+//! cookie alone is accepted for every method — `SameSite=Strict` (not
+//! per-method header enforcement) is what carries the CSRF guarantee.
+//! This keeps the cookie carry-over flow (step 3 below) working for the
+//! same-origin SPA without forcing it to echo the bearer token.
+//!
+//! Same-origin clients: the SPA stores the token and injects it via
+//! `Authorization: Bearer` on every fetch (see
+//! `web/src/lib/fetchInterceptor.ts`); the cookie is the fallback for
+//! plain navigations / SSE that cannot set a header.
 //!
 //! Architecture refs: `docs/versions/v0-3/prd.md` §6.2.4 / §6.2.5 / §9.
 

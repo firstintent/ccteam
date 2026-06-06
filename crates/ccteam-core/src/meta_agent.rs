@@ -131,7 +131,7 @@ pub fn bootstrap_meta_project(paths: &CcteamPaths) -> Result<MetaBootstrapReport
 
     let request = format!(
         "ccteam meta-agent session. \
-         Dispatch incoming requests to the right team via `ccteam new`.\n\
+         Dispatch incoming requests to the right team via `ccteam project new`.\n\
          Generated: {}",
         Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
     );

@@ -1,5 +1,8 @@
-//! V0.6.5 F147 — integration tests for the `signals/reset.signal`
-//! contract the `ccteam__chat_reset` MCP tool relies on.
+//! Integration tests for the BotSupervisor `signals/reset.signal`
+//! operator session-reset contract. (The `ccteam__chat_reset` MCP tool
+//! that once wrote this signal — and its `chat_reset_signal_path` helper
+//! — were retired; the supervisor file-signal contract remains and is
+//! covered here.)
 //!
 //! Coverage:
 //! - The supervisor's `decide()` reads `signals/reset.signal` and
@@ -106,7 +109,7 @@ fn reg() -> BotRegistration {
 }
 
 fn write_reset_signal(projects_root: &std::path::Path, r: &BotRegistration) {
-    let sig = ccteam_im::chat_reset_signal_path(projects_root, r);
+    let sig = bot_dir(projects_root, r).join("signals").join(RESET_SIGNAL);
     std::fs::create_dir_all(sig.parent().unwrap()).unwrap();
     std::fs::write(&sig, format!("{}", chrono::Utc::now().timestamp_millis())).unwrap();
 }
@@ -240,7 +243,9 @@ async fn reset_session_archives_turns_jsonl_and_clears_transcript_cursor() {
         "outbound cursor must be cleared on reset"
     );
     // Signal is unlinked so the next tick doesn't loop.
-    let sig = ccteam_im::chat_reset_signal_path(&projects_root, &r);
+    let sig = bot_dir(&projects_root, &r)
+        .join("signals")
+        .join(RESET_SIGNAL);
     assert!(!sig.exists(), "reset.signal must be consumed");
     // Adapter saw close + fresh start.
     assert_eq!(adapter.closes.load(Ordering::SeqCst), 1);
@@ -285,18 +290,9 @@ async fn apply_action_dispatches_reset_session() {
 }
 
 #[test]
-fn reset_signal_const_matches_documented_filename() {
-    // The MCP tool's `chat_reset_signal_path` helper hard-codes
-    // `signals/reset.signal`; the supervisor's `RESET_SIGNAL` const is
-    // what `signal_present` checks against. These two MUST agree, or
-    // the MCP tool writes a file the daemon never reads. Lock the
-    // contract.
+fn reset_signal_const_is_documented_filename() {
+    // `RESET_SIGNAL` is the filename `signal_present` checks under
+    // `<bot_dir>/signals/`. Lock the documented operator contract: a
+    // session reset is triggered by writing `signals/reset.signal`.
     assert_eq!(RESET_SIGNAL, "reset.signal");
-    let tmp = TempDir::new().unwrap();
-    let sig = ccteam_im::chat_reset_signal_path(tmp.path(), &reg());
-    assert!(
-        sig.ends_with("signals/reset.signal"),
-        "MCP signal path filename must match supervisor RESET_SIGNAL: {}",
-        sig.display()
-    );
 }

@@ -26,9 +26,7 @@ use std::path::PathBuf;
 use ccteam_harness::AgentVendor;
 use ccteam_im::inbound::{DefaultMailboxResolver, MailboxResolver};
 use ccteam_im::supervisor::{bot_dir, bot_dir_with_config};
-use ccteam_im::{
-    chat_inbox_dir, chat_reset_signal_path, resolve_project_dir, turns_jsonl_path, BotRegistration,
-};
+use ccteam_im::{chat_inbox_dir, resolve_project_dir, turns_jsonl_path, BotRegistration};
 
 fn mk_reg(slug: &str, role: &str, project_dir: Option<PathBuf>) -> BotRegistration {
     BotRegistration {
@@ -87,20 +85,6 @@ fn chat_inbox_dir_falls_back_when_project_dir_none() {
     assert_eq!(
         inbox,
         PathBuf::from("/home/user/projects/legacy-bot/.ccteam/chat/lead/inbox")
-    );
-}
-
-#[test]
-fn chat_reset_signal_path_honors_explicit_project_dir() {
-    let reg = mk_reg(
-        "any-slug",
-        "helper",
-        Some(PathBuf::from("/abs/path/to/project")),
-    );
-    let sig = chat_reset_signal_path(std::path::Path::new("/home/user/projects"), &reg);
-    assert_eq!(
-        sig,
-        PathBuf::from("/abs/path/to/project/.ccteam/chat/helper/signals/reset.signal")
     );
 }
 

@@ -836,7 +836,10 @@ enum HookCommand {
     /// `event_type` is the `event` field on the resulting JSONL record
     /// (e.g. "PreToolUse" / "Stop" / "session_start").
     ProgressAppend { event_type: String },
-    /// SessionStart hook: write the `<project>/.ccteam/ready` marker.
+    /// SessionStart hook: a validating no-op seam. Validates the hook
+    /// stdin `cwd` shape (fails loudly if missing) but performs no
+    /// filesystem side effects — no `.ccteam/ready` marker is written.
+    /// Kept registered for future per-session bootstrap work.
     LoadContext,
     /// V0.2 M0.19.3 PreToolUse hook for `AskUserQuestion`. Returns a
     /// `permissionDecision: deny` so the assistant routes through the

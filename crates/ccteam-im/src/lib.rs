@@ -252,16 +252,6 @@ pub fn chat_inbox_dir(projects_root: &Path, reg: &BotRegistration) -> PathBuf {
     reg.chat_dir(projects_root).join("inbox")
 }
 
-/// V0.6.5 F147 — resolve `<project>/.ccteam/chat/<role>/signals/reset.signal`
-/// for this bot. Legacy supervisor reset signal path; v8.2 daemon IM
-/// ingress routes through the gateway directly. Honors
-/// `reg.project_dir` (F185).
-pub fn chat_reset_signal_path(projects_root: &Path, reg: &BotRegistration) -> PathBuf {
-    reg.chat_dir(projects_root)
-        .join("signals")
-        .join("reset.signal")
-}
-
 /// V0.6.5 F147 — resolve `<project>/.ccteam/chat/<role>/turns.jsonl`
 /// for this bot. Source-of-truth file `chat_history` tails. Re-exports
 /// [`outbound::turns_jsonl_path`] under a top-level name so MCP /
