@@ -31,7 +31,7 @@ fn mcp_serve_stdout_is_clean_jsonrpc_under_default_tracing() {
 
     let bin = env!("CARGO_BIN_EXE_ccteam");
     let mut child = Command::new(bin)
-        .arg("mcp-serve")
+        .args(["internal", "mcp-serve"])
         .env("CCTEAM_HOME", home.path())
         .env("CCTEAM_PROJECTS_ROOT", projects.path())
         .env("CCTEAM_DISABLE_TOOL_SURFACE_BOOTSTRAP", "1")

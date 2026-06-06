@@ -1,4 +1,5 @@
-//! V0.6.6 F167 — integration test for `ccteam probe-project --json`.
+//! V0.6.6 F167 — integration test for `ccteam internal probe-project
+//! --json`.
 //!
 //! The probe heuristic lives in `ccteam_core::templates::project_probe`
 //! (covered by unit tests in that module). This binary-surface test
@@ -35,7 +36,7 @@ fn probe_project_emits_json_on_fresh_rust_single_repo() {
     fs::create_dir_all(td.path().join("tests")).unwrap();
 
     let out = Command::new(ccteam_bin())
-        .arg("probe-project")
+        .args(["internal", "probe-project"])
         .arg("--path")
         .arg(td.path())
         .arg("--json")
@@ -71,7 +72,7 @@ fn probe_project_emits_human_readable_text_without_json_flag() {
     fs::create_dir_all(td.path().join("docs")).unwrap();
 
     let out = Command::new(ccteam_bin())
-        .arg("probe-project")
+        .args(["internal", "probe-project"])
         .arg("--path")
         .arg(td.path())
         .output()
@@ -101,7 +102,7 @@ fn probe_project_detects_monorepo_rust_workspace_with_glob() {
         write(&td.path().join(format!("crates/{c}/src/lib.rs")), &body);
     }
     let out = Command::new(ccteam_bin())
-        .arg("probe-project")
+        .args(["internal", "probe-project"])
         .arg("--path")
         .arg(td.path())
         .arg("--json")
@@ -128,14 +129,14 @@ fn probe_project_detects_monorepo_rust_workspace_with_glob() {
 
 #[test]
 fn probe_project_default_path_uses_cwd() {
-    // No --path arg — `ccteam probe-project --json` should fall back
+    // No --path arg — `ccteam internal probe-project --json` should fall back
     // to `std::env::current_dir()`. We run from a fresh tempdir to
     // confirm the cwd hand-off works (would Empty-classify a bare
     // dir).
     let td = tempdir().unwrap();
     let out = Command::new(ccteam_bin())
         .current_dir(td.path())
-        .arg("probe-project")
+        .args(["internal", "probe-project"])
         .arg("--json")
         .output()
         .expect("spawn ccteam probe-project");

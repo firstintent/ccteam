@@ -1,17 +1,17 @@
-//! V0.3 M5.0 — `ccteam web` subcommand integration test.
+//! V0.3 M5.0 — `ccteam internal web` subcommand integration test.
 //!
 //! Confirms the CLI surface end-to-end:
 //!
-//! 1. `ccteam web --help` advertises the three flags (bind / no-auth /
-//!    token-file) so a typo doesn't silently drop one.
-//! 2. `ccteam web --bind 127.0.0.1:0 --no-auth` spawns, prints the
-//!    bound address on stdout, serves `GET /health` 200 + JSON, and
+//! 1. `ccteam internal web --help` advertises the three flags (bind /
+//!    no-auth / token-file) so a typo doesn't silently drop one.
+//! 2. `ccteam internal web --bind 127.0.0.1:0 --no-auth` spawns, prints
+//!    the bound address on stdout, serves `GET /health` 200 + JSON, and
 //!    can be terminated by `child.kill()`.
 //!
 //! The lib-level `serve` round-trip (in-process axum + reqwest) is
 //! covered in `crates/ccteam-web/src/lib.rs` tests; this file
-//! exercises the `ccteam web …` subprocess entry so a regression in
-//! the clap → ServeOpts → serve plumbing surfaces here.
+//! exercises the `ccteam internal web …` subprocess entry so a
+//! regression in the clap → ServeOpts → serve plumbing surfaces here.
 
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
@@ -19,18 +19,21 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[test]
-fn ccteam_web_help_advertises_flags() {
+fn ccteam_internal_web_help_advertises_flags() {
     let bin = env!("CARGO_BIN_EXE_ccteam");
     let out = Command::new(bin)
-        .args(["web", "--help"])
+        .args(["internal", "web", "--help"])
         .output()
-        .expect("spawn ccteam web --help");
-    assert!(out.status.success(), "ccteam web --help should exit 0");
+        .expect("spawn ccteam internal web --help");
+    assert!(
+        out.status.success(),
+        "ccteam internal web --help should exit 0"
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     for flag in ["--bind", "--no-auth", "--token-file"] {
         assert!(
             stdout.contains(flag),
-            "ccteam web --help should mention {flag}; got: {stdout}",
+            "ccteam internal web --help should mention {flag}; got: {stdout}",
         );
     }
 }
@@ -39,7 +42,7 @@ fn ccteam_web_help_advertises_flags() {
 fn ccteam_web_serves_health_then_exits_when_killed() {
     let bin = env!("CARGO_BIN_EXE_ccteam");
     let mut child = Command::new(bin)
-        .args(["web", "--bind", "127.0.0.1:0", "--no-auth"])
+        .args(["internal", "web", "--bind", "127.0.0.1:0", "--no-auth"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

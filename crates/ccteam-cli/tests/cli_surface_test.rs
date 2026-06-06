@@ -1,27 +1,36 @@
-//! V0.4.6 F89 — CLI surface tests for the `internal` subcommand
-//! reorganization.
+//! CLI surface tests for the command-tree shape.
 //!
-//! Tests (from `docs/versions/v0-4-6/dev-plan.md` §10):
+//! Originally V0.4.6 F89 (the `internal` subcommand reorg); updated for
+//! v0.8.6 W4a, which regrouped the top-level surface into the `project` /
+//! `session` groups and deleted the six deprecated top-level aliases
+//! outright (no back-compat shim — pre-v1.0).
 //!
-//! 1. `t01_help_user_facing_only` — `ccteam --help` lists only the
-//!    user-facing surface plus the `internal` umbrella, hiding the
-//!    deprecated top-level aliases (`hook` / `spawn` / `peek` / ...).
+//! Tests:
+//!
+//! 1. `t01_help_user_facing_only` — `ccteam --help` lists the flat
+//!    lifecycle commands plus the `project` / `session` groups; the
+//!    `internal` umbrella is hidden, and the removed/re-homed verbs
+//!    (`hook` / `spawn` / `attach` / `pause` / `new` / `web` / ...) do
+//!    not appear at the top level.
 //! 2. `t02_internal_help_lists_subcommands` — `ccteam internal --help`
-//!    enumerates all eight internal subcommands.
-//! 3. `t03_legacy_top_level_still_works_with_warn` — `ccteam hook
-//!    progress-append <ev>` still resolves (V0.4.6 one-release shim)
-//!    but emits a stderr WARN flagging the deprecated path.
+//!    enumerates the internal subcommands (hook / mcp-serve / attach /
+//!    peek / progress / resume / send / spawn) plus the W4a additions
+//!    (mux / probe-project / web).
+//! 3. `t03_deprecated_top_level_hook_alias_is_removed` — the six deleted
+//!    top-level aliases (`hook` / `mcp-serve` / `spawn` / `send` /
+//!    `peek` / `progress`) now fail clap parsing with a non-zero exit +
+//!    "unrecognized subcommand" message.
 //! 4. `t04_v03_legacy_commands_removed` — `ccteam phase show ...`,
 //!    `ccteam decisions`, and `ccteam watchdog scan` all return
 //!    non-zero with a clap "unrecognized subcommand" message; the V0.3
 //!    legacy commands are wholly gone.
 
-use std::io::Write;
 use std::process::{Command, Stdio};
 
-/// `t01` — `ccteam --help` lists the user-facing surface and the
-/// `internal` umbrella; deprecated top-level aliases (`hook`, `spawn`,
-/// `peek`, etc.) are hidden via `#[command(hide = true)]`.
+/// `t01` — `ccteam --help` lists the flat lifecycle commands plus the
+/// `project` / `session` groups. The `internal` group is hidden
+/// (`#[command(hide = true)]`); the W4a-removed/re-homed verbs (`hook`,
+/// `spawn`, `attach`, `pause`, `new`, `web`, …) are not top-level.
 #[test]
 fn t01_help_user_facing_only() {
     let bin = env!("CARGO_BIN_EXE_ccteam");
@@ -32,13 +41,13 @@ fn t01_help_user_facing_only() {
     assert!(out.status.success(), "ccteam --help should exit 0");
     let stdout = String::from_utf8_lossy(&out.stdout);
 
-    // User-facing commands must show up. `pause` / `resume` are the
-    // documented `ccteam-control` control surface (mirroring the
-    // `mcp__ccteam__workflow_{pause,resume}` tools); the `internal
-    // resume` alias stays as a hidden compat path.
+    // v0.8.6 W4a — the top-level surface is the flat lifecycle commands
+    // plus the `project` / `session` groups. `ls` / `show` / `new` now
+    // live under `project`; `attach` / `pause` / `resume` (and the chat
+    // bot register / persona / add-tool ops) under `session`; `web` and
+    // `probe-project` under the hidden `internal` group.
     for required in [
-        "init", "start", "stop", "new", "ls", "status", "show", "doctor", "web", "internal",
-        "pause", "resume",
+        "init", "start", "stop", "status", "project", "session", "doctor", "prefs",
     ] {
         assert!(
             stdout.contains(required),
@@ -46,29 +55,46 @@ fn t01_help_user_facing_only() {
         );
     }
 
-    // Deprecated top-level aliases are hidden — they still work but
-    // are no longer listed in the top-level help to keep the user
-    // surface clean (V0.4.6 F89).
-    //
-    // V0.5.0 F93b: `attach` is promoted back to user-facing because
-    // agent-team mode needs `ccteam attach <slug>` as a primary entry
-    // point (see PRD F93b §验收 5). The `internal attach` alias stays
-    // as a hidden compat path.
-    let deprecated = ["hook", "spawn", "send", "peek", "progress", "mcp-serve"];
-    for d in deprecated {
-        // Use word-boundary check: look for `  <name>  ` (with the
-        // surrounding whitespace clap uses in its commands column) so
-        // we don't match e.g. `internal` substrings.
+    // The `internal` group is `#[command(hide = true)]`, so it must NOT
+    // appear in the top-level command column.
+    assert!(
+        !stdout.contains("  internal "),
+        "ccteam --help must not list the hidden `internal` group; got: {stdout}",
+    );
+
+    // v0.8.6 W4a deleted the six top-level aliases outright (no shim) and
+    // re-homed the lifecycle verbs into the `project` / `session` groups.
+    // None of these may appear as a top-level command anymore. The
+    // matching deprecation-removal exit-code assertions are in t03.
+    let no_longer_top_level = [
+        "hook",
+        "spawn",
+        "send",
+        "peek",
+        "progress",
+        "mcp-serve",
+        "attach",
+        "pause",
+        "resume",
+        "new",
+        "web",
+    ];
+    for d in no_longer_top_level {
+        // Word-boundary check: look for `  <name>  ` (the whitespace
+        // clap uses in its command column) so we don't match e.g.
+        // `progress` inside a description line.
         let pattern = format!("  {d} ");
         assert!(
             !stdout.contains(&pattern),
-            "ccteam --help should not list deprecated `{d}` at top level; got: {stdout}",
+            "ccteam --help should not list `{d}` at top level (W4a removed/re-homed it); got: {stdout}",
         );
     }
 }
 
-/// `t02` — `ccteam internal --help` enumerates the eight subcommands
-/// that previously lived at the top level.
+/// `t02` — `ccteam internal --help` enumerates the subcommands that
+/// previously lived at the top level (hook / mcp-serve / attach / peek /
+/// progress / resume / send / spawn) plus the v0.8.6 W4a additions
+/// (mux / probe-project / web).
 #[test]
 fn t02_internal_help_lists_subcommands() {
     let bin = env!("CARGO_BIN_EXE_ccteam");
@@ -92,6 +118,11 @@ fn t02_internal_help_lists_subcommands() {
         "resume",
         "send",
         "spawn",
+        // v0.8.6 W4a folded `mux` / `probe-project` / `web` into the
+        // hidden `internal` group too.
+        "mux",
+        "probe-project",
+        "web",
     ] {
         assert!(
             stdout.contains(required),
@@ -100,52 +131,48 @@ fn t02_internal_help_lists_subcommands() {
     }
 }
 
-/// `t03` — `ccteam hook progress-append <ev>` still works for one
-/// release (V0.4.6 back-compat) but emits a stderr WARN naming the
-/// new `ccteam internal hook` path so settings.json upgrades stop
-/// silently looking healthy.
+/// `t03` — v0.8.6 W4a deleted the deprecated top-level `ccteam hook`
+/// alias outright (pre-v1.0 = no back-compat shims). It now resolves to
+/// nothing: clap rejects it with a non-zero exit and an "unrecognized
+/// subcommand" error. The live handler moved to `ccteam internal hook`
+/// (exercised elsewhere); this test only pins that the top-level alias is
+/// gone.
 #[test]
-fn t03_legacy_top_level_still_works_with_warn() {
+fn t03_deprecated_top_level_hook_alias_is_removed() {
     let bin = env!("CARGO_BIN_EXE_ccteam");
 
-    // V0.4.6 F89: spawn with a stdin pipe so the `hook progress-append`
-    // handler can finish without blocking on a missing stdin. We feed
-    // it a minimal valid JSON payload (the handler reads stdin via
-    // `parse_hook_stdin_json`); on success the handler writes a line
-    // into the per-project progress log and returns Ok(()). The exact
-    // stdout / stderr ordering of the WARN line is the contract we're
-    // asserting.
-    let mut child = Command::new(bin)
-        .args(["hook", "progress-append", "test_event"])
-        .env("CCTEAM_HOME", "/tmp/ccteam-f89-shim-test")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn ccteam hook progress-append");
-
-    {
-        let stdin = child.stdin.as_mut().expect("child stdin");
-        stdin
-            .write_all(br#"{"slug": "ghost-slug-no-project"}"#)
-            .expect("write hook stdin");
+    // The six top-level aliases W4a removed. Each must now fail clap
+    // parsing rather than dispatch (or print a deprecation WARN).
+    for args in [
+        vec!["hook", "progress-append", "test_event"],
+        vec!["mcp-serve"],
+        vec!["spawn", "some-slug", "some-role"],
+        vec!["send", "some-slug", "body"],
+        vec!["peek", "some-slug"],
+        vec!["progress", "some-slug"],
+    ] {
+        let out = Command::new(bin)
+            .args(&args)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap_or_else(|e| panic!("spawn ccteam {args:?}: {e}"));
+        assert!(
+            !out.status.success(),
+            "ccteam {args:?} must fail now that the top-level alias is removed; got exit {:?}",
+            out.status.code(),
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let subcmd = args[0];
+        let recognized_error = stderr.contains("unrecognized subcommand")
+            || stderr.contains("invalid subcommand")
+            || stderr.contains("unexpected argument")
+            || stderr.contains(&format!("'{subcmd}'"));
+        assert!(
+            recognized_error,
+            "ccteam {args:?} should print a clap unrecognized-subcommand error; \
+             got stderr: {stderr}",
+        );
     }
-
-    let out = child
-        .wait_with_output()
-        .expect("await ccteam hook progress-append");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-
-    // The deprecation WARN MUST appear regardless of whether the hook
-    // body itself succeeded (an unknown slug is fine — the handler
-    // bails on the missing project, but the WARN comes first).
-    assert!(
-        stderr.contains("ccteam hook")
-            && stderr.contains("deprecated")
-            && stderr.contains("ccteam internal hook"),
-        "expected deprecation WARN mentioning `ccteam internal hook`; \
-         got stderr: {stderr}",
-    );
 }
 
 /// `t04` — `ccteam phase`, `ccteam decisions`, `ccteam watchdog` are

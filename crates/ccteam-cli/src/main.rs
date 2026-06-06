@@ -110,18 +110,6 @@ enum Command {
         #[arg(long, value_enum, default_value_t = InitMode::ArtifactDriven)]
         mode: InitMode,
     },
-    /// **DEPRECATED** in V0.4.6 (F89) — moved to `ccteam internal hook`.
-    /// Old invocation path is preserved one release for back-compat;
-    /// emits a stderr WARN on use and will be removed in V0.5.
-    ///
-    /// Hook handlers invoked by Claude Code per project settings.json.
-    /// Each subcommand reads stdin JSON (the Claude Code hook payload)
-    /// and performs its side effect; stdout is normally empty.
-    #[command(hide = true)]
-    Hook {
-        #[command(subcommand)]
-        cmd: HookCommand,
-    },
     /// Run the v8.1 gateway daemon (IM gateway plus, by default, the
     /// web UI in the same process). Foreground is the only supported
     /// mode — `ccteam start` is enough; the `--foreground` flag is
@@ -222,27 +210,6 @@ enum Command {
         #[arg(long, default_value_t = false)]
         restart_team: bool,
     },
-    /// V0.4.2 F75: thin wrapper over `ccteam init --in
-    /// <projects_root>/<team>-<slug>` for users who prefer the "create a
-    /// new project somewhere central" mental model — it prepends the
-    /// team prefix and installs there. (`ccteam init --slug <name>` no
-    /// longer relocates: it installs in the cwd and only sets the name.)
-    /// See `ccteam init --help` for the full overwrite-strategy surface.
-    ///
-    /// The V0.4.0 free-text request + LLM-auto-slug path was dropped
-    /// in V0.4.2: `slug` is required and explicit.
-    New {
-        /// Project slug. Becomes the dir name under `projects_root`.
-        slug: String,
-        /// Team for the new install. Default `dev`.
-        #[arg(long, default_value = "dev")]
-        team: String,
-    },
-    /// List all known projects.
-    Ls {
-        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
-        format: OutputFormat,
-    },
     /// V0.4.1: one-screen aggregate health view. Reports daemon
     /// heartbeat age, every project's slug + age + recent-event time,
     /// the last N progress events merged across projects, and the
@@ -253,129 +220,12 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         tail: usize,
     },
-    /// Show one project's full state, recent events, and artifacts.
-    /// With no slug, lists every available slug + a re-run hint.
-    Show {
-        slug: Option<String>,
-        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
-        format: OutputFormat,
-    },
-    /// Attach to a project's session.
-    ///
-    /// V0.5.0 F93b: when `<slug>` points at an agent-team mode project,
-    /// reads the lead session id from
-    /// `.ccteam/team-snapshot.json::lead_session_id` and execs
-    /// `claude attach <id>`. For artifact-driven projects, falls back
-    /// to tmux session attach (V0.3.x compat) or the latest
-    /// `claude --bg` job id (V0.4.0 default).
-    Attach { slug: String },
-    /// List live gateway chat-mode bot sessions (`ccteam-chat-<slug>-<role>`).
-    ///
-    /// Read-only control-plane enumeration: lists session names from the mux
-    /// backend (never capture-pane) and reconciles them against the daemon's
-    /// persisted registry, flagging orphans (live but untracked) and registered
-    /// sessions that are not running. Attach one with
-    /// `ccteam internal attach <slug> [role]`.
-    Sessions,
-    /// **DEPRECATED** in V0.4.6 (F89) — moved to `ccteam internal peek`.
-    ///
-    /// Capture the project's pane content without attaching.
-    #[command(hide = true)]
-    Peek { slug: String },
-    /// **DEPRECATED** in V0.4.6 (F89) — moved to `ccteam internal progress`.
-    ///
-    /// Print the project's progress.jsonl, optionally tailing.
-    #[command(hide = true)]
-    Progress {
-        slug: String,
-        #[arg(long)]
-        tail: bool,
-    },
-    /// Pause auto-dispatch for one project. Sets `user_pause_pending`
-    /// so the workflow loop stops handing the project fresh work; never
-    /// kills the long-running session (CLAUDE.md §三 red line). Mirrors
-    /// the `mcp__ccteam__workflow_pause` tool — the documented
-    /// `ccteam-control` skill control surface.
-    Pause { slug: String },
-    /// Resume a paused / escalated project (re-arm phase_state=idle).
-    /// Mirrors the `mcp__ccteam__workflow_resume` tool.
-    Resume { slug: String },
-    /// **DEPRECATED** in V0.4.6 (F89) — moved to `ccteam internal send`.
-    ///
-    /// Send a free-form message to a project's inbox. Wraps the
-    /// MCP-equivalent `send_to_session` so users don't have to
-    /// hand-write the markdown frontmatter. Orchestrator auto-routes
-    /// the message to a worker (or the meta-agent in V0.4.1+) on
-    /// the next tick.
-    ///
-    /// F87: `disable_help_flag` so a literal `--help` in the body is
-    /// not intercepted by clap as the subcommand's own help. Users
-    /// who want help should run `ccteam help send` instead.
-    /// F89: hidden from top-level help (use `ccteam internal send`).
-    #[command(hide = true, disable_help_flag = true)]
-    Send {
-        /// Project slug (or meta-agent handle for meta-agent inbox).
-        slug: String,
-        /// Optional target role override (writes frontmatter
-        /// `target_role: <role>`). Otherwise routing follows the
-        /// inbox default rules.
-        #[arg(short = 'r', long)]
-        role: Option<String>,
-        /// If set, frontmatter `no_spawn: true` is added so the
-        /// message is archived for audit only (no auto-spawn).
-        #[arg(long, default_value_t = false)]
-        no_spawn: bool,
-        /// Message body. Use `-` to read from stdin. Leading hyphens
-        /// are accepted as literal text (F87) so `ccteam send <slug>
-        /// "--help"` forwards the string to the agent instead of
-        /// triggering ccteam's own help.
-        #[arg(allow_hyphen_values = true)]
-        body: String,
-    },
-    /// **DEPRECATED** in V0.4.6 (F89) — moved to `ccteam internal spawn`.
-    ///
-    /// Trigger a fresh spawn of `<role>` in `<slug>` with an optional
-    /// kick prompt. Writes a `.ccteam/spawn_requests/<role>-<ts>.json`
-    /// marker the orchestrator picks up on its next tick. CLI shortcut
-    /// for the MCP `ccteam__spawn_agent` tool.
-    ///
-    /// F87: `disable_help_flag` so a literal `--help` in the prompt is
-    /// not intercepted by clap as the subcommand's own help. Users
-    /// who want help should run `ccteam help spawn` instead.
-    /// F89: hidden from top-level help (use `ccteam internal spawn`).
-    #[command(hide = true, disable_help_flag = true)]
-    Spawn {
-        /// Project slug.
-        slug: String,
-        /// Workflow role (must exist in `<project>/workflow.yaml`).
-        role: String,
-        /// Optional initial prompt. Falls back to the default kick
-        /// prompt when omitted (let the role's `.claude/agents/<role>.md`
-        /// drive). Use `-` to read from stdin. Leading hyphens are
-        /// accepted as literal text (F87).
-        #[arg(allow_hyphen_values = true)]
-        prompt: Option<String>,
-    },
-    /// **DEPRECATED** in V0.4.6 (F89) — moved to `ccteam internal mcp-serve`.
-    ///
-    /// M2.5: run the ccteam MCP server (stdio JSON-RPC). Wired into
-    /// `~/.claude.json` `mcpServers.ccteam` by `ccteam doctor
-    /// --install-mcp` so daily-driver claude sessions and the meta
-    /// agent both see the 9-tool surface (interfaces §12).
-    #[command(hide = true)]
-    McpServe,
-    /// V0.8 rmux — mux backend utilities. Today the only subcommand is
-    /// `hook-emit`, the W6 daemon-bus hook reroute client (active only
-    /// when `CCTEAM_HOOK_VIA_DAEMON=1`; see `ccteam mux hook-emit
-    /// --help`).
-    Mux {
-        #[command(subcommand)]
-        cmd: MuxCommand,
-    },
     /// Internal commands — hook handlers + meta-agent / MCP integration
-    /// points. Not user-facing day to day; meta-agent and the
-    /// `ccteam-control` skill drive these. Run `ccteam internal --help`
-    /// for the list.
+    /// points + low-level utilities (mux hook-emit, probe-project, web).
+    /// Not user-facing day to day; meta-agent and the `ccteam-control`
+    /// skill drive these. Hidden from top-level help; run
+    /// `ccteam internal --help` for the list.
+    #[command(hide = true)]
     Internal {
         #[command(subcommand)]
         cmd: InternalCommand,
@@ -413,55 +263,29 @@ enum Command {
         #[arg(long, value_name = "SECONDS", default_value_t = 60)]
         stop_timeout: u64,
     },
-    /// V0.4.6 F81 — un-roster a project: drop the slug from
-    /// `~/.ccteam/config.yaml::projects[]`, scrub the orchestration
-    /// state (`~/.ccteam/progress/<slug>.jsonl`, `~/.ccteam/inbox/<slug>/`,
-    /// `~/.ccteam/control/<slug>/`), and ask the running daemon to
-    /// hot-unroster the loop (F82 wiring). With `--purge`, also
-    /// `rm -rf <project>/.ccteam/`, `<project>/.claude/agents/`, and
-    /// `<project>/workflow.yaml` (and `.ccteam/workflow.yaml` per F83).
+    /// Project lifecycle group: `ccteam project <ls|show|new|stop|rm>`.
     ///
-    /// **Red lines** (CLAUDE.md §三):
-    /// - Refuses when an active tmux session, claude --bg job, or
-    ///   open `agent_spawn` row points at the project. `--force`
-    ///   overrides this guard.
-    /// - **Never deletes `<project>/.env`** — user secrets stay
-    ///   regardless of `--purge`.
-    /// - **Never touches business code** — only ccteam-managed paths
-    ///   under `.ccteam/`, `.claude/agents/`, and `workflow.yaml`.
-    Remove {
-        /// Project slug as listed in `ccteam ls` / registered under
-        /// `~/.ccteam/config.yaml::projects[]`.
-        slug: String,
-        /// Also delete `<project>/.ccteam/`, `<project>/.claude/agents/`,
-        /// and `<project>/workflow.yaml` (and `.ccteam/workflow.yaml`
-        /// per F83). Default leaves the project directory contents
-        /// alone (config-only deregister, equivalent to the
-        /// "abandon" verb in the PRD).
-        #[arg(long, default_value_t = false)]
-        purge: bool,
-        /// Print every step that would change the filesystem / config /
-        /// daemon roster, but don't touch anything. Combine with
-        /// `--purge` to see the full clobber list.
-        #[arg(long, default_value_t = false)]
-        dry_run: bool,
-        /// Skip the CLAUDE.md §三 "永不主动 kill 长 session" refusal
-        /// gate (tmux / claude bg / open spawn checks). Use only when
-        /// you've already drained the project's live work and the
-        /// guard is a false positive.
-        #[arg(long, default_value_t = false)]
-        force: bool,
-    },
-    /// v0.8.6 W3 — project lifecycle group: `ccteam project <rm|stop>`.
-    ///
-    /// `rm` un-registers a project and (with `--purge`) deletes ccteam's
-    /// on-disk footprint; `stop` halts a project's live sessions without
-    /// removing it. The flat `ccteam remove` alias still works (W4 will
-    /// retire it in favour of `project rm`). Run `ccteam project --help`
-    /// for the list.
+    /// `ls`/`show` inspect registered projects; `new` scaffolds a fresh
+    /// project under `<projects_root>/<team>-<slug>/`; `stop` halts a
+    /// project's live sessions without removing it; `rm` un-registers a
+    /// project and (with `--purge`) deletes ccteam's on-disk footprint.
+    /// Run `ccteam project --help` for the list.
     Project {
         #[command(subcommand)]
         cmd: ProjectCommand,
+    },
+    /// Session group: `ccteam session
+    /// <ls|attach|pause|resume|register|unregister|persona|add-tool|role>`.
+    ///
+    /// `ls` enumerates live gateway chat sessions; `attach` reaches a
+    /// chat-mode bot session (or the project session); `pause`/`resume`
+    /// gate a project's auto-dispatch; `register`/`unregister` manage the
+    /// chat-mode bot registry; `persona`/`add-tool` edit a bot's
+    /// `.claude/agents/<bot>.md`; `role` switches a chat session's role.
+    /// Run `ccteam session --help` for the list.
+    Session {
+        #[command(subcommand)]
+        cmd: SessionCommand,
     },
     /// Health checks + tool-surface maintenance.
     Doctor {
@@ -654,28 +478,6 @@ enum Command {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// V0.3 M5.0: serve the ccteam web UI (read + restricted-write,
-    /// `docs/versions/v0-3/prd.md` §3-§6). M5.0 ships the scaffold + `/health`
-    /// endpoint only; dashboard / SSE / write actions land in M5.1-3.
-    Web {
-        /// Listen address. Default `0.0.0.0:7331` so host deployments
-        /// reach the LAN out of the box; auth is auto-enabled on
-        /// non-loopback. Use `127.0.0.1:7331` for loopback-only
-        /// (auth then disabled). M5.3 requires token auth on
-        /// non-loopback unless `--no-auth`.
-        #[arg(long, default_value = "0.0.0.0:7331")]
-        bind: String,
-        /// Disable token auth on write endpoints. DANGEROUS on
-        /// non-loopback bind — M5.3 prints a 5-second warning before
-        /// listening.
-        #[arg(long, default_value_t = false)]
-        no_auth: bool,
-        /// Custom path to read the auth token from (default
-        /// `~/.ccteam/web-token`). M5.3 consumes this; M5.0 records
-        /// it on `ServeOpts` for shape stability.
-        #[arg(long, value_name = "PATH")]
-        token_file: Option<PathBuf>,
-    },
     /// V0.6.0 Wave 3 F112 §C — read / write `~/.ccteam/preferences.toml`.
     /// Today the only user-visible knob is `fallback.on_claude_quota`
     /// (`off` | `codex`); V0.7+ will fold in additional opt-in
@@ -684,50 +486,61 @@ enum Command {
         #[command(subcommand)]
         action: Option<PrefsAction>,
     },
-    /// V0.6.1 F128 — chat-mode bot admin operations exposed as a
-    /// CLI surface for parity with the MCP tools
-    /// (`mcp__ccteam__admin_change_persona` /
-    /// `mcp__ccteam__admin_add_tool`). The `/ccteam-control` skill
-    /// is the primary user-facing entry point; this CLI form is the
-    /// scripted fallback when MCP is not registered.
-    Admin {
-        #[command(subcommand)]
-        action: AdminAction,
-    },
-    /// V0.6.6 F167 — probe a repo root and emit the detected
-    /// project kind (monorepo / single-repo / docs-only / scripts-only
-    /// / empty), the top-3 languages, a tests-present flag, and the
-    /// `probable_scope` paths the `/ccteam-creator` skill should
-    /// pre-populate into the rendered `workflow.yaml::agents.<role>.
-    /// scope` field. Pure read-only file-existence sweep — no source
-    /// parsing, no LLM calls.
-    ///
-    /// Skill use: invoked by `/ccteam-creator` Phase 3.6 before the
-    /// PROJECT PLAN render so the user sees sensible scope defaults
-    /// without having to hand-edit yaml after the install.
-    ProbeProject {
-        /// Repo root to probe. Defaults to cwd.
-        #[arg(long, value_name = "PATH")]
-        path: Option<PathBuf>,
-        /// Emit the probe as a JSON object (stable schema — see
-        /// `commands::run_probe_project` docs). Default is a
-        /// 4-line human-readable summary.
-        #[arg(long, default_value_t = false)]
-        json: bool,
-    },
 }
 
-/// V0.6.1 F128 — `ccteam admin` subcommand surface (chat-mode bot
-/// persona / tool-list editing). Mirrors
-/// `mcp__ccteam__admin_change_persona` / `mcp__ccteam__admin_add_tool`.
+/// v0.8.6 W4a — `ccteam session` subcommand surface. Folds the former
+/// flat `sessions` / `attach` / `pause` / `resume` commands and the
+/// `admin` chat-mode bot ops (register / unregister / persona / add-tool
+/// / list) into one group. The bot ops still mirror the
+/// `mcp__ccteam__admin_*` / `mcp__ccteam__chat_*` MCP tools.
 #[derive(Subcommand)]
-enum AdminAction {
+enum SessionCommand {
+    /// List live gateway chat-mode bot sessions (`ccteam-chat-<slug>-<role>`).
+    ///
+    /// Read-only control-plane enumeration: lists session names from the mux
+    /// backend (never capture-pane) and reconciles them against the daemon's
+    /// persisted registry, flagging orphans (live but untracked) and registered
+    /// sessions that are not running. Attach one with
+    /// `ccteam session attach <slug> [role]`.
+    Ls,
+    /// Attach to a session. Reaches a gateway chat-mode bot session
+    /// (`ccteam-chat-<slug>-<role>`) first; with `<slug>` alone, attaches when
+    /// the slug has exactly one live chat session, else lists them to
+    /// disambiguate. Falls back to the project session (`ccteam-<slug>`) when
+    /// no live chat session matches.
+    Attach {
+        slug: String,
+        /// Chat-mode role (the trailing segment of `ccteam-chat-<slug>-<role>`).
+        /// Omit to auto-resolve a single live chat session for `<slug>`.
+        role: Option<String>,
+    },
+    /// Pause auto-dispatch for one project. Sets `user_pause_pending`
+    /// so the workflow loop stops handing the project fresh work; never
+    /// kills the long-running session (CLAUDE.md §三 red line). Mirrors
+    /// the `mcp__ccteam__workflow_pause` tool.
+    Pause { slug: String },
+    /// Resume a paused / escalated project (re-arm phase_state=idle).
+    /// Mirrors the `mcp__ccteam__workflow_resume` tool.
+    Resume { slug: String },
+    /// V0.8.6 W1 — switch a live gateway chat session's role in place.
+    /// The IM `/role <role>` command is the primary path (it acts on the
+    /// chat's current session inside the running daemon). A one-shot CLI
+    /// process cannot mutate the daemon's in-memory session map, so this
+    /// subcommand only prints the guidance to use the IM `/role` form.
+    Role {
+        /// Project slug.
+        slug: String,
+        /// Gateway session id (as shown by `ccteam session ls`).
+        sid: String,
+        /// Target role (matches `.claude/agents/<role>.md`).
+        role: String,
+    },
     /// Replace a chat-mode bot's persona file
     /// (`<project>/.claude/agents/<bot>.md`). `new_persona_md` is the
     /// FULL replacement file content (YAML frontmatter + body); the
     /// caller is responsible for assembling it. The bot picks up the
     /// new persona on the next turn / `/clear`.
-    ChangePersona {
+    Persona {
         /// Project slug.
         slug: String,
         /// Bot persona id (matches `.claude/agents/<bot>.md`).
@@ -752,7 +565,7 @@ enum AdminAction {
     /// Mirrors the `mcp__ccteam__chat_register_bot` MCP tool. Useful as
     /// a scripted / no-daemon fallback when the MCP server isn't
     /// registered yet (first-time setup, automation, MCP-less envs).
-    RegisterBot {
+    Register {
         /// Project slug (workflow.yaml's `name` field).
         #[arg(long)]
         slug: String,
@@ -785,7 +598,7 @@ enum AdminAction {
     /// V0.6.8 F202 — unregister a chat-mode bot. Mirrors the
     /// `mcp__ccteam__chat_unregister_bot` MCP tool. Idempotent —
     /// returns `ok:true, removed:false` when no registration exists.
-    UnregisterBot {
+    Unregister {
         /// Project slug.
         #[arg(long)]
         slug: String,
@@ -795,11 +608,11 @@ enum AdminAction {
     },
     /// List registered chat-mode bots (reads the F146 registry at
     /// `~/.ccteam/imd/registry/<slug>/<role>.json`). Confirms what
-    /// `register-bot` wrote — role → @handle → platform/chat_id, plus
+    /// `register` wrote — role → @handle → platform/chat_id, plus
     /// live `running` status from the per-bot heartbeat sidecar.
-    /// Note: distinct from the MCP `admin_ls` tool, which lists
-    /// *projects*, not bot registrations.
-    ListBots {
+    /// Distinct from `session ls`, which lists *live* gateway sessions;
+    /// `bots` lists the on-disk registry.
+    Bots {
         /// Optional slug filter. Omit to list bots across all slugs.
         #[arg(long)]
         slug: Option<String>,
@@ -864,19 +677,43 @@ enum MuxCommand {
     },
 }
 
-/// v0.8.6 W3 — `ccteam project` subcommand group. Houses the project
-/// lifecycle verbs (`rm`, `stop`). W4 will fold the remaining flat
-/// project-scoped commands in here and retire their top-level aliases;
-/// for now this group lives alongside them.
+/// v0.8.6 W3/W4a — `ccteam project` subcommand group. Houses the project
+/// lifecycle verbs: `ls` / `show` inspect, `new` scaffolds, `stop` halts
+/// live sessions, `rm` un-registers (with `--purge` deletes the on-disk
+/// footprint). W4a folded the former flat `ls` / `show` / `new` commands
+/// in here.
 #[derive(Subcommand)]
 enum ProjectCommand {
+    /// List all known projects.
+    Ls {
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
+    /// Show one project's full state, recent events, and artifacts.
+    /// With no slug, lists every available slug + a re-run hint.
+    Show {
+        slug: Option<String>,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
+    /// V0.4.2 F75: scaffold a fresh project under
+    /// `<projects_root>/<team>-<slug>/` (thin wrapper over `ccteam init
+    /// --in <projects_root>/<team>-<slug>`). Prepends the team prefix and
+    /// installs there. To install in the cwd instead, use `ccteam init`.
+    New {
+        /// Project slug. Becomes the dir name under `projects_root`.
+        slug: String,
+        /// Team for the new install. Default `dev`.
+        #[arg(long, default_value = "dev")]
+        team: String,
+    },
     /// Un-register a project: drop its `~/.ccteam/config.yaml::projects[]`
     /// entry + scrub the per-slug `~/.ccteam/` state. With `--purge`,
     /// also delete ccteam's project footprint — `.ccteam/`, the seeded
     /// `.claude/agents/cto.md`, and ccteam's hooks inside
     /// `.claude/settings.local.json`. Never touches `.env`, user
     /// work-roles, `CLAUDE.md` / `AGENTS.md`, or the user's
-    /// `settings.json`. Identical engine to the flat `ccteam remove`.
+    /// `settings.json`.
     Rm {
         /// Project slug as listed in `ccteam ls` / registered under
         /// `~/.ccteam/config.yaml::projects[]`.
@@ -906,10 +743,11 @@ enum ProjectCommand {
     },
 }
 
-/// V0.4.6 F89: subcommands hidden under `ccteam internal`. Each mirrors
-/// a former top-level command 1:1 — the old top-level names stay as
-/// hidden aliases that emit a one-line stderr deprecation WARN and route
-/// to the same handler. V0.5 will retire the top-level aliases.
+/// Subcommands hidden under `ccteam internal` — hook handlers, the MCP
+/// server, low-level session utilities (peek / progress / send / spawn /
+/// resume / attach), the mux hook-emit client, the project probe, and the
+/// standalone web server. Not user-facing day to day; the meta-agent and
+/// the `ccteam-control` skill drive these.
 #[derive(Subcommand)]
 enum InternalCommand {
     /// Hook handlers invoked by Claude Code per project settings.json.
@@ -953,21 +791,84 @@ enum InternalCommand {
     /// Resume a paused / escalated project (re-arm phase_state=idle).
     Resume { slug: String },
     /// Send a free-form message to a project's inbox.
+    ///
+    /// F87: `disable_help_flag` so a literal `--help` in the message body
+    /// is not intercepted by clap as the subcommand's own help. Users who
+    /// want help should run `ccteam help internal send` instead.
+    #[command(disable_help_flag = true)]
     Send {
         slug: String,
         #[arg(short = 'r', long)]
         role: Option<String>,
         #[arg(long, default_value_t = false)]
         no_spawn: bool,
+        /// Message body. Use `-` to read from stdin. Leading hyphens are
+        /// accepted as literal text (F87) so `ccteam internal send <slug>
+        /// "--help"` forwards the string to the agent instead of
+        /// triggering ccteam's own help.
+        #[arg(allow_hyphen_values = true)]
         body: String,
     },
     /// Trigger a fresh spawn of `<role>` in `<slug>` with an optional
     /// kick prompt. Writes a `.ccteam/spawn_requests/<role>-<ts>.json`
     /// marker the orchestrator picks up on its next tick.
+    ///
+    /// F87: `disable_help_flag` so a literal `--help` in the prompt is not
+    /// intercepted by clap as the subcommand's own help.
+    #[command(disable_help_flag = true)]
     Spawn {
         slug: String,
         role: String,
+        /// Optional initial prompt. Use `-` to read from stdin. Leading
+        /// hyphens are accepted as literal text (F87).
+        #[arg(allow_hyphen_values = true)]
         prompt: Option<String>,
+    },
+    /// V0.8 rmux — mux backend utilities. Today the only subcommand is
+    /// `hook-emit`, the W6 daemon-bus hook reroute client (active only
+    /// when `CCTEAM_HOOK_VIA_DAEMON=1`; see
+    /// `ccteam internal mux hook-emit --help`).
+    Mux {
+        #[command(subcommand)]
+        cmd: MuxCommand,
+    },
+    /// V0.6.6 F167 — probe a repo root and emit the detected
+    /// project kind (monorepo / single-repo / docs-only / scripts-only
+    /// / empty), the top-3 languages, a tests-present flag, and the
+    /// `probable_scope` paths the `/ccteam-creator` skill should
+    /// pre-populate into the rendered `workflow.yaml::agents.<role>.
+    /// scope` field. Pure read-only file-existence sweep — no source
+    /// parsing, no LLM calls.
+    ProbeProject {
+        /// Repo root to probe. Defaults to cwd.
+        #[arg(long, value_name = "PATH")]
+        path: Option<PathBuf>,
+        /// Emit the probe as a JSON object (stable schema — see
+        /// `commands::run_probe_project` docs). Default is a
+        /// 4-line human-readable summary.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Serve the ccteam web UI standalone (the gateway daemon embeds
+    /// this by default; this subcommand runs it on its own bind for
+    /// headless / custom deployments).
+    Web {
+        /// Listen address. Default `0.0.0.0:7331` so host deployments
+        /// reach the LAN out of the box; auth is auto-enabled on
+        /// non-loopback. Use `127.0.0.1:7331` for loopback-only
+        /// (auth then disabled). Requires token auth on non-loopback
+        /// unless `--no-auth`.
+        #[arg(long, default_value = "0.0.0.0:7331")]
+        bind: String,
+        /// Disable token auth on write endpoints. DANGEROUS on
+        /// non-loopback bind — prints a 5-second warning before
+        /// listening.
+        #[arg(long, default_value_t = false)]
+        no_auth: bool,
+        /// Custom path to read the auth token from (default
+        /// `~/.ccteam/web-token`).
+        #[arg(long, value_name = "PATH")]
+        token_file: Option<PathBuf>,
     },
 }
 
@@ -1094,10 +995,6 @@ fn main() -> Result<()> {
             print!("{report}");
             Ok(())
         }
-        Command::Hook { cmd } => {
-            warn_deprecated_top_level("hook", "internal hook");
-            run_hook(cmd)
-        }
         Command::Start {
             slug,
             foreground: _,
@@ -1151,45 +1048,7 @@ fn main() -> Result<()> {
                 StartImdOpts { disabled: no_imd },
             ),
         },
-        Command::New { slug, team } => run_new(slug, team),
-        Command::Ls { format } => run_ls(format),
         Command::Status { tail } => run_status(tail),
-        Command::Show { slug, format } => match slug {
-            Some(s) => run_show(&s, format),
-            None => show_slug_picker(),
-        },
-        Command::Attach { slug } => run_attach(&slug),
-        Command::Sessions => commands::run_sessions(),
-        Command::Peek { slug } => {
-            warn_deprecated_top_level("peek", "internal peek");
-            run_peek(&slug)
-        }
-        Command::Progress { slug, tail } => {
-            warn_deprecated_top_level("progress", "internal progress");
-            run_progress(&slug, tail)
-        }
-        Command::Pause { slug } => run_pause(&slug),
-        Command::Resume { slug } => run_resume(&slug),
-        Command::Send {
-            slug,
-            role,
-            no_spawn,
-            body,
-        } => {
-            warn_deprecated_top_level("send", "internal send");
-            let paths = CcteamPaths::from_env()?;
-            run_send(&paths, &slug, role.as_deref(), no_spawn, &body)
-        }
-        Command::Spawn { slug, role, prompt } => {
-            warn_deprecated_top_level("spawn", "internal spawn");
-            let paths = CcteamPaths::from_env()?;
-            run_spawn(&paths, &slug, &role, prompt.as_deref())
-        }
-        Command::McpServe => {
-            warn_deprecated_top_level("mcp-serve", "internal mcp-serve");
-            run_mcp_serve()
-        }
-        Command::Mux { cmd } => run_mux(cmd),
         Command::Internal { cmd } => run_internal(cmd),
         Command::Stop { slug, stop_timeout } => match slug {
             // V0.5.0 F97 — per-slug agent-team cleanup.
@@ -1208,27 +1067,14 @@ fn main() -> Result<()> {
             // V0.4.6 daemon graceful shutdown.
             None => run_stop(),
         },
-        Command::Remove {
-            slug,
-            purge,
-            dry_run,
-            force,
-        } => {
-            let paths = CcteamPaths::from_env()?;
-            let report = commands::run_remove(
-                &paths,
-                &slug,
-                commands::RemoveOptions {
-                    purge,
-                    dry_run,
-                    force,
-                },
-            )?;
-            print!("{report}");
-            Ok(())
-        }
-        // v0.8.6 W3 — `ccteam project <rm|stop>` group.
+        // v0.8.6 W3/W4a — `ccteam project <ls|show|new|stop|rm>` group.
         Command::Project { cmd } => match cmd {
+            ProjectCommand::Ls { format } => run_ls(format),
+            ProjectCommand::Show { slug, format } => match slug {
+                Some(s) => run_show(&s, format),
+                None => show_slug_picker(),
+            },
+            ProjectCommand::New { slug, team } => run_new(slug, team),
             ProjectCommand::Rm {
                 slug,
                 purge,
@@ -1255,6 +1101,8 @@ fn main() -> Result<()> {
                 Ok(())
             }
         },
+        // v0.8.6 W4a — `ccteam session <...>` group.
+        Command::Session { cmd } => run_session(cmd),
         Command::Doctor {
             dry_run,
             force,
@@ -1339,18 +1187,6 @@ fn main() -> Result<()> {
                 verify_mcp_json: json,
             })
         }
-        Command::Web {
-            bind,
-            no_auth,
-            token_file,
-        } => {
-            init_tracing();
-            commands::run_web(commands::WebOptions {
-                bind,
-                no_auth,
-                token_file,
-            })
-        }
         Command::Prefs { action } => {
             let paths = CcteamPaths::from_env()?;
             match action {
@@ -1371,75 +1207,97 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::Admin { action } => {
+    }
+}
+
+/// v0.8.6 W4a — dispatch `ccteam session <subcmd>`. The bot-admin verbs
+/// (`persona` / `add-tool` / `register` / `unregister` / `bots`) call the
+/// same `commands::run_admin_*` handlers the retired `ccteam admin` group
+/// used; the session verbs (`ls` / `attach` / `pause` / `resume`) call the
+/// same handlers the retired flat top-level commands used. `role` is the
+/// CLI counterpart of the IM `/role` (see the handler body).
+fn run_session(cmd: SessionCommand) -> Result<()> {
+    match cmd {
+        SessionCommand::Ls => commands::run_sessions(),
+        SessionCommand::Attach { slug, role } => run_internal_attach(&slug, role.as_deref()),
+        SessionCommand::Pause { slug } => run_pause(&slug),
+        SessionCommand::Resume { slug } => run_resume(&slug),
+        SessionCommand::Role { slug, sid, role } => run_session_role(&slug, &sid, &role),
+        SessionCommand::Persona {
+            slug,
+            bot,
+            new_persona_md,
+        } => {
             let paths = CcteamPaths::from_env()?;
-            match action {
-                AdminAction::ChangePersona {
-                    slug,
-                    bot,
-                    new_persona_md,
-                } => {
-                    let body = read_inline_or_stdin(&new_persona_md)?;
-                    let out = commands::run_admin_change_persona(&paths, &slug, &bot, &body)?;
-                    println!("{out}");
-                    Ok(())
-                }
-                AdminAction::AddTool {
-                    slug,
-                    bot,
-                    tool_descriptor,
-                } => {
-                    let out = commands::run_admin_add_tool(&paths, &slug, &bot, &tool_descriptor)?;
-                    println!("{out}");
-                    Ok(())
-                }
-                AdminAction::RegisterBot {
-                    slug,
-                    role,
-                    vendor,
-                    platform,
-                    chat_id,
-                    chat_handle,
-                    project_dir,
-                } => {
-                    let out = commands::run_admin_register_bot(
-                        &paths,
-                        &slug,
-                        &role,
-                        &vendor,
-                        &platform,
-                        &chat_id,
-                        chat_handle.as_deref(),
-                        project_dir.as_deref(),
-                    )?;
-                    println!("{out}");
-                    Ok(())
-                }
-                AdminAction::UnregisterBot { slug, role } => {
-                    let out = commands::run_admin_unregister_bot(&paths, &slug, &role)?;
-                    println!("{out}");
-                    Ok(())
-                }
-                AdminAction::ListBots { slug, json } => {
-                    let out = commands::run_admin_list_bots(&paths, slug.as_deref(), json)?;
-                    println!("{out}");
-                    Ok(())
-                }
-            }
+            let body = read_inline_or_stdin(&new_persona_md)?;
+            let out = commands::run_admin_change_persona(&paths, &slug, &bot, &body)?;
+            println!("{out}");
+            Ok(())
         }
-        Command::ProbeProject { path, json } => {
-            let root = match path {
-                Some(p) => p,
-                None => std::env::current_dir().context("get cwd for probe-project")?,
-            };
-            // JSON branch already produces no trailing newline (consumers
-            // pipe to `jq` — extra newline is noise). Text branch
-            // already includes a trailing `\n`. Both safe with `print!`.
-            let out = commands::run_probe_project(&root, json)?;
-            print!("{out}");
+        SessionCommand::AddTool {
+            slug,
+            bot,
+            tool_descriptor,
+        } => {
+            let paths = CcteamPaths::from_env()?;
+            let out = commands::run_admin_add_tool(&paths, &slug, &bot, &tool_descriptor)?;
+            println!("{out}");
+            Ok(())
+        }
+        SessionCommand::Register {
+            slug,
+            role,
+            vendor,
+            platform,
+            chat_id,
+            chat_handle,
+            project_dir,
+        } => {
+            let paths = CcteamPaths::from_env()?;
+            let out = commands::run_admin_register_bot(
+                &paths,
+                &slug,
+                &role,
+                &vendor,
+                &platform,
+                &chat_id,
+                chat_handle.as_deref(),
+                project_dir.as_deref(),
+            )?;
+            println!("{out}");
+            Ok(())
+        }
+        SessionCommand::Unregister { slug, role } => {
+            let paths = CcteamPaths::from_env()?;
+            let out = commands::run_admin_unregister_bot(&paths, &slug, &role)?;
+            println!("{out}");
+            Ok(())
+        }
+        SessionCommand::Bots { slug, json } => {
+            let paths = CcteamPaths::from_env()?;
+            let out = commands::run_admin_list_bots(&paths, slug.as_deref(), json)?;
+            println!("{out}");
             Ok(())
         }
     }
+}
+
+/// v0.8.6 W4a — `ccteam session role <slug> <sid> <role>`. The W1 role
+/// switch (`/role <role>`) is a live-gateway operation: it tears down the
+/// current chat session's pane and re-spawns a fresh `--agent <role>`
+/// thread, reusing the same gateway session id, by mutating the running
+/// daemon's in-memory `current_session` / `sessions` maps
+/// (`Gateway::switch_current_role`). A one-shot CLI process has no handle
+/// on that in-memory state, so there is no behavior to delegate to from
+/// here. Rather than invent a second, divergent role-mutation path, this
+/// CLI form points the operator at the supported IM `/role` command.
+fn run_session_role(slug: &str, sid: &str, role: &str) -> Result<()> {
+    anyhow::bail!(
+        "`ccteam session role` is not a one-shot operation: switching a live \
+         chat session's role re-spawns its pane inside the running gateway. \
+         Use the IM `/role {role}` command in the chat that owns session \
+         `{sid}` (project `{slug}`) — it switches the current session in place.",
+    )
 }
 
 /// V0.6.1 F128 — `ccteam admin change-persona` accepts the persona
@@ -1459,9 +1317,9 @@ fn read_inline_or_stdin(arg: &str) -> Result<String> {
     }
 }
 
-/// V0.4.6 F89 — dispatch `ccteam internal <subcmd>`. Mirrors the
-/// old top-level commands 1:1; old top-level entry points emit a
-/// stderr deprecation WARN before reaching the same handlers.
+/// Dispatch `ccteam internal <subcmd>` — the hidden low-level surface
+/// (hook handlers, MCP server, session utilities, mux hook-emit, project
+/// probe, standalone web server).
 fn run_internal(cmd: InternalCommand) -> Result<()> {
     match cmd {
         InternalCommand::Hook { cmd } => run_hook(cmd),
@@ -1483,17 +1341,32 @@ fn run_internal(cmd: InternalCommand) -> Result<()> {
             let paths = CcteamPaths::from_env()?;
             run_spawn(&paths, &slug, &role, prompt.as_deref())
         }
+        InternalCommand::Mux { cmd } => run_mux(cmd),
+        InternalCommand::ProbeProject { path, json } => {
+            let root = match path {
+                Some(p) => p,
+                None => std::env::current_dir().context("get cwd for probe-project")?,
+            };
+            // JSON branch already produces no trailing newline (consumers
+            // pipe to `jq` — extra newline is noise). Text branch
+            // already includes a trailing `\n`. Both safe with `print!`.
+            let out = commands::run_probe_project(&root, json)?;
+            print!("{out}");
+            Ok(())
+        }
+        InternalCommand::Web {
+            bind,
+            no_auth,
+            token_file,
+        } => {
+            init_tracing();
+            commands::run_web(commands::WebOptions {
+                bind,
+                no_auth,
+                token_file,
+            })
+        }
     }
-}
-
-/// V0.4.6 F89 — print a stderr deprecation WARN when an old top-level
-/// command is used. The handler still runs; V0.5 will remove the old
-/// entry points entirely (see `docs/versions/v0-4-6/prd.md` F89).
-fn warn_deprecated_top_level(old: &str, new: &str) {
-    eprintln!(
-        "ccteam: WARN `ccteam {old}` is deprecated; use `ccteam {new}` instead. \
-         The legacy alias will be removed in V0.5.",
-    );
 }
 
 fn run_mcp_serve() -> Result<()> {
@@ -1589,12 +1462,8 @@ fn run_mux_hook_emit(
 // lifecycle = `ccteam start` / `ccteam stop` (same as orchestrator +
 // web). Status check is `ccteam doctor` (heartbeat file probe).
 
-fn run_attach(slug: &str) -> Result<()> {
-    let paths = CcteamPaths::from_env()?;
-    commands::run_attach(&paths, slug)
-}
-
-/// `ccteam internal attach <slug> [role]` — reach gateway chat-mode bot
+/// `ccteam session attach <slug> [role]` / `ccteam internal attach <slug>
+/// [role]` — reach gateway chat-mode bot
 /// sessions first (the project-oriented [`commands::run_attach`] cannot see
 /// `ccteam-chat-*`), then fall back to the project session when no live chat
 /// session matches `slug`.
@@ -3088,13 +2957,6 @@ fn run_ls(format: OutputFormat) -> Result<()> {
 fn run_show(slug: &str, format: OutputFormat) -> Result<()> {
     let paths = CcteamPaths::from_env()?;
     let body = commands::run_show(&paths, slug, format)?;
-    print!("{body}");
-    Ok(())
-}
-
-fn run_peek(slug: &str) -> Result<()> {
-    let paths = CcteamPaths::from_env()?;
-    let body = commands::run_peek(&paths, slug)?;
     print!("{body}");
     Ok(())
 }

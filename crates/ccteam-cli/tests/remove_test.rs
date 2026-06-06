@@ -1,7 +1,8 @@
-//! `ccteam remove <slug>` / `ccteam project rm|stop` integration tests.
+//! `ccteam project rm|stop` integration tests.
 //!
-//! Covers the reusable remove engine (`run_remove`) reached via both the
-//! flat `ccteam remove` alias and the v0.8.6 W3 `ccteam project` group:
+//! Covers the reusable remove engine (`run_remove`) reached via the
+//! v0.8.6 W3 `ccteam project` group (the flat `ccteam remove` alias was
+//! deleted in v0.8.6 W4a — `project rm` is the only path now):
 //!   t01–t02   dry-run + basic deregister (no fs change / config drop)
 //!   t03       --purge deletes ccteam footprint ONLY (W2 layout): .ccteam/
 //!             + seeded cto.md + ccteam hooks in settings.local.json; keeps
@@ -177,7 +178,7 @@ fn t01_remove_dry_run_prints_only() {
 
     let out = fx
         .cmd()
-        .args(["remove", &fx.slug, "--dry-run"])
+        .args(["project", "rm", &fx.slug, "--dry-run"])
         .output()
         .expect("spawn ccteam remove --dry-run");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -220,7 +221,7 @@ fn t02_remove_basic_drops_config_entry() {
 
     let out = fx
         .cmd()
-        .args(["remove", &fx.slug])
+        .args(["project", "rm", &fx.slug])
         .output()
         .expect("spawn ccteam remove");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -284,7 +285,7 @@ fn t03_purge_clears_ccteam_footprint_only() {
 
     let out = fx
         .cmd()
-        .args(["remove", &fx.slug, "--purge"])
+        .args(["project", "rm", &fx.slug, "--purge"])
         .output()
         .expect("spawn ccteam remove --purge");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -370,7 +371,7 @@ fn t03b_purge_strips_chat_hooks_surgically_keeps_other_keys() {
 
     let out = fx
         .cmd()
-        .args(["remove", &fx.slug, "--purge"])
+        .args(["project", "rm", &fx.slug, "--purge"])
         .output()
         .expect("spawn ccteam remove --purge");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -430,7 +431,7 @@ fn t03c_purge_deletes_settings_local_when_it_collapses_to_empty() {
 
     let out = fx
         .cmd()
-        .args(["remove", &fx.slug, "--purge"])
+        .args(["project", "rm", &fx.slug, "--purge"])
         .output()
         .expect("spawn ccteam remove --purge");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -860,7 +861,7 @@ fn t04_refuses_with_active_tmux() {
 
     let out = fx
         .cmd()
-        .args(["remove", &fx.slug])
+        .args(["project", "rm", &fx.slug])
         .output()
         .expect("spawn ccteam remove");
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -893,7 +894,7 @@ fn t05_refuses_with_running_claude_bg() {
 
     let out = fx
         .cmd()
-        .args(["remove", &fx.slug])
+        .args(["project", "rm", &fx.slug])
         .output()
         .expect("spawn ccteam remove");
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -960,7 +961,7 @@ fn t07_remove_writes_unroster_trigger_when_daemon_alive() {
 
     let out = fx
         .cmd()
-        .args(["remove", &fx.slug])
+        .args(["project", "rm", &fx.slug])
         .output()
         .expect("spawn ccteam remove");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -993,7 +994,7 @@ fn t08_remove_timeout_when_daemon_unresponsive() {
 
     let out = fx
         .cmd()
-        .args(["remove", &fx.slug])
+        .args(["project", "rm", &fx.slug])
         .output()
         .expect("spawn ccteam remove");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1019,7 +1020,7 @@ fn t06_force_overrides_refusal() {
 
     let out = fx
         .cmd()
-        .args(["remove", &fx.slug, "--force"])
+        .args(["project", "rm", &fx.slug, "--force"])
         .output()
         .expect("spawn ccteam remove --force");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1090,7 +1091,7 @@ fn t09_purge_cleans_imd_registry_dir() {
 
     let out = fx
         .cmd()
-        .args(["remove", &fx.slug, "--purge"])
+        .args(["project", "rm", &fx.slug, "--purge"])
         .output()
         .expect("spawn ccteam remove --purge");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1139,7 +1140,7 @@ fn t10_remove_without_purge_keeps_imd_registry() {
 
     let out = fx
         .cmd()
-        .args(["remove", &fx.slug])
+        .args(["project", "rm", &fx.slug])
         .output()
         .expect("spawn ccteam remove");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1178,7 +1179,7 @@ fn t11_purge_dry_run_reports_imd_registry_count() {
 
     let out = fx
         .cmd()
-        .args(["remove", &fx.slug, "--purge", "--dry-run"])
+        .args(["project", "rm", &fx.slug, "--purge", "--dry-run"])
         .output()
         .expect("spawn ccteam remove --purge --dry-run");
     let stdout = String::from_utf8_lossy(&out.stdout);

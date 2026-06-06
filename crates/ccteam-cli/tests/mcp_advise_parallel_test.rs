@@ -54,7 +54,7 @@ impl McpServer {
     ) -> Self {
         let bin = env!("CARGO_BIN_EXE_ccteam");
         let mut cmd = Command::new(bin);
-        cmd.arg("mcp-serve")
+        cmd.args(["internal", "mcp-serve"])
             .env("CCTEAM_HOME", home)
             .env("CCTEAM_PROJECTS_ROOT", projects)
             .env("CCTEAM_DISABLE_TOOL_SURFACE_BOOTSTRAP", "1")

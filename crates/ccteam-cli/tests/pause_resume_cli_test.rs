@@ -1,4 +1,5 @@
-//! CLI surface tests for `ccteam pause <slug>` / `ccteam resume <slug>`.
+//! CLI surface tests for `ccteam session pause <slug>` / `ccteam session
+//! resume <slug>`.
 //!
 //! These are the documented `ccteam-control` control surface
 //! (`skills/ccteam-control/SKILL.md`), mirroring the
@@ -52,9 +53,10 @@ fn pause_pending(state_path: &Path) -> bool {
     v["user_pause_pending"].as_bool().unwrap()
 }
 
-/// `ccteam pause <slug>` exits 0 and invokes `actions::pause` (sets
-/// `user_pause_pending=true`); `ccteam resume <slug>` exits 0 and clears
-/// it. Round-tripping both exercises the symmetric front doors.
+/// `ccteam session pause <slug>` exits 0 and invokes `actions::pause`
+/// (sets `user_pause_pending=true`); `ccteam session resume <slug>` exits
+/// 0 and clears it. Round-tripping both exercises the symmetric front
+/// doors.
 #[test]
 fn pause_then_resume_round_trips_through_actions() {
     let bin = env!("CARGO_BIN_EXE_ccteam");
@@ -70,7 +72,7 @@ fn pause_then_resume_round_trips_through_actions() {
 
     // pause — exit 0 + user_pause_pending flips true.
     let out = Command::new(bin)
-        .args(["pause", slug])
+        .args(["session", "pause", slug])
         .env("CCTEAM_HOME", &home)
         .env("CCTEAM_PROJECTS_ROOT", &projects)
         .output()
@@ -87,7 +89,7 @@ fn pause_then_resume_round_trips_through_actions() {
 
     // resume — exit 0 + user_pause_pending flips back false.
     let out = Command::new(bin)
-        .args(["resume", slug])
+        .args(["session", "resume", slug])
         .env("CCTEAM_HOME", &home)
         .env("CCTEAM_PROJECTS_ROOT", &projects)
         .output()

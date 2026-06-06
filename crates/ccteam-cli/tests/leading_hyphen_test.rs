@@ -1,24 +1,24 @@
-//! F87 — `ccteam send` / `ccteam spawn` accept leading-hyphen message
-//! bodies as literal text. Without `#[arg(allow_hyphen_values = true)]`
-//! clap parses `--help` (and friends) as ccteam's own flag and exits
-//! before the orchestrator ever sees the string. The two tests below
-//! only confirm clap's parse layer; the daemon side-effects are not
-//! exercised here (the daemon isn't running in `cargo test`).
+//! F87 — `ccteam internal send` / `ccteam internal spawn` accept
+//! leading-hyphen message bodies as literal text. Without
+//! `#[arg(allow_hyphen_values = true)]` clap parses `--help` (and
+//! friends) as ccteam's own flag and exits before the orchestrator ever
+//! sees the string. The two tests below only confirm clap's parse layer;
+//! the daemon side-effects are not exercised here (the daemon isn't
+//! running in `cargo test`).
 //!
 //! Failure surface we care about: if a future refactor drops the
-//! `allow_hyphen_values` attribute, `ccteam send <slug> "--help"`
-//! silently prints ccteam's top-level help and exits 0, which is
-//! indistinguishable from "message sent" from the user's POV. Both
-//! tests assert on stderr / exit code shape that only the
-//! orchestrator-rejection path produces.
+//! `allow_hyphen_values` attribute, `ccteam internal send <slug> "--help"`
+//! silently prints ccteam's help and exits 0, which is indistinguishable
+//! from "message sent" from the user's POV. Both tests assert on stderr /
+//! exit code shape that only the orchestrator-rejection path produces.
 //!
 //! - `t01_send_accepts_leading_hyphen`:
-//!   `ccteam send some-slug "--help"` must reach the daemon-connect
-//!   phase (which then fails because no daemon is running). We assert
-//!   `stdout` does NOT contain ccteam's top-level help banner.
+//!   `ccteam internal send some-slug "--help"` must reach the
+//!   daemon-connect phase (which then fails because no daemon is
+//!   running). We assert `stdout` does NOT contain ccteam's help banner.
 //! - `t02_send_dash_dash_separator_still_works`:
-//!   `ccteam send some-slug -- "--help"` (the V0.4.5 workaround) is
-//!   equivalent to the bare form. Same expectation.
+//!   `ccteam internal send some-slug -- "--help"` (the V0.4.5 workaround)
+//!   is equivalent to the bare form. Same expectation.
 
 use std::process::Command;
 
@@ -35,7 +35,7 @@ const HELP_BANNER_ANCHOR: &str = "Usage: ccteam";
 #[test]
 fn t01_send_accepts_leading_hyphen() {
     let out = Command::new(ccteam_bin())
-        .args(["send", "ccteam-cli-test-no-such-slug", "--help"])
+        .args(["internal", "send", "ccteam-cli-test-no-such-slug", "--help"])
         .output()
         .expect("spawn ccteam send");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -56,7 +56,13 @@ fn t01_send_accepts_leading_hyphen() {
 #[test]
 fn t02_send_dash_dash_separator_still_works() {
     let out = Command::new(ccteam_bin())
-        .args(["send", "ccteam-cli-test-no-such-slug", "--", "--help"])
+        .args([
+            "internal",
+            "send",
+            "ccteam-cli-test-no-such-slug",
+            "--",
+            "--help",
+        ])
         .output()
         .expect("spawn ccteam send -- --help");
     let stdout = String::from_utf8_lossy(&out.stdout);
