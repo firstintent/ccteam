@@ -47,7 +47,7 @@ fn t01_help_user_facing_only() {
     // bot register / persona / add-tool ops) under `session`; `web` and
     // `probe-project` under the hidden `internal` group.
     for required in [
-        "init", "start", "stop", "status", "project", "session", "doctor", "prefs",
+        "init", "start", "stop", "status", "project", "session", "doctor", "config",
     ] {
         assert!(
             stdout.contains(required),

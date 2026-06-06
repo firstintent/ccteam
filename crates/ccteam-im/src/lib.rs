@@ -34,6 +34,10 @@ pub mod gateway;
 pub mod inbound;
 pub mod latency;
 pub mod nl_admin;
+// v0.8.6 Item 4 — Telegram bot-token onboarding (token validation +
+// owner chat_id capture). Wrapped by `ccteam config` (the IM-token menu
+// item); the former `ccteam-im-setup` skill's job moves into the CLI.
+pub mod onboarding;
 pub mod outbound;
 pub mod outbound_format;
 pub mod pending;

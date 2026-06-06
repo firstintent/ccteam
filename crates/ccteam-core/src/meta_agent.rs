@@ -252,13 +252,14 @@ mod tests {
 
     #[test]
     fn render_role_prompt_routes_via_v050_skills() {
-        // V0.5.0 F101: the role prompt's routing tree should explicitly
-        // delegate new-project creation to the `ccteam-creator` skill.
-        // Pin it so a future edit can't silently drop the delegation arm.
+        // The role prompt's routing tree must keep an explicit new-project
+        // creation arm. The bundled `ccteam-creator` skill is gone (v0.8.6),
+        // so the meta-agent now drives creation directly via `ccteam project
+        // new`. Pin it so a future edit can't silently drop the arm.
         let body = render_meta_role_prompt();
         assert!(
-            body.contains("ccteam-creator"),
-            "role prompt must point at the ccteam-creator skill for new projects",
+            body.contains("ccteam project new"),
+            "role prompt must keep the new-project creation arm (`ccteam project new`)",
         );
         // memory_bridge_*.md is the cross-project memory contract; it
         // must survive the F101 reshape (red line).

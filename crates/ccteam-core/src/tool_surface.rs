@@ -1164,14 +1164,17 @@ mod tests {
 
     #[test]
     fn migrate_legacy_skill_dirs_reports_not_found_when_clean() {
-        // V0.5.0 F100: LEGACY_SKILL_NAMES grew to 5 (3 F39-era `cct-*`
-        // + 2 V0.5.0 F100 deletions `ccteam-team-author` /
-        // `ccteam-project-creator`). Pin the length so a future entry
-        // addition forces this test to revisit consciously.
+        // LEGACY_SKILL_NAMES tracks every bundled skill ccteam has ever
+        // shipped + since retired, so an upgrade can sweep stale installs.
+        // Currently 8: 3 F39-era `cct-*`, 2 F100 deletions
+        // (`ccteam-team-author` / `ccteam-project-creator`), and the 3
+        // v0.8.6 deletions (`ccteam-control` / `ccteam-creator` /
+        // `ccteam-im-setup`). Pin the length so a future entry addition
+        // forces this test to revisit consciously.
         let tmp = tempfile::TempDir::new().unwrap();
         let claude = tmp.path().join(".claude");
         let reports = migrate_legacy_skill_dirs(&claude, false).unwrap();
-        assert_eq!(reports.len(), 5);
+        assert_eq!(reports.len(), 8);
         for r in &reports {
             assert_eq!(r.action, LegacySkillAction::NotFound);
         }

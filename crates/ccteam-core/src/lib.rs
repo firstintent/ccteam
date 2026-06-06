@@ -18,8 +18,8 @@ pub mod admin_actions;
 // Codex one-shot advisors in parallel, optional verdict synthesis,
 // per-vendor budget ledger under `<ccteam_root>/cost-budget.json`.
 pub mod advise;
-// V0.6.0 Wave 2 F114 — scientist nickname pool used by ccteam-creator
-// when minting bot handles for new chat workflows.
+// V0.6.0 Wave 2 F114 — scientist nickname pool used when minting bot
+// handles for new chat workflows.
 pub mod agent_naming;
 pub mod auto_loop;
 // V0.4.5 F80 — Liveness probe for `claude --bg` background jobs.
@@ -52,7 +52,7 @@ pub mod meta_agent;
 // V0.4.2 F74 — one-shot migration (V0.4.1 → V0.4.2 config.yaml fold).
 pub mod migration;
 // V0.6.0 Wave 2 F114 — rule-based NL intent → ExecutionMode inferrer
-// used by the `ccteam-creator` skill's Phase 2.
+// used during project creation (mode inference for new workflows).
 pub mod mode_inferrer;
 pub mod paths;
 pub mod pending_inject;
@@ -63,8 +63,8 @@ pub mod plan_approval;
 // V0.6.0 Wave 3 F112 §C — `~/.ccteam/preferences.toml` user-opt-in
 // fallback knobs (vendor swap on Claude quota exceed).
 pub mod preferences;
-// V0.6.0 Wave 3 F112 §B — auto-critic vendor decision (used by the
-// `ccteam-creator` skill Phase 3.5).
+// V0.6.0 Wave 3 F112 §B — auto-critic vendor decision (used during
+// project creation to pick the critic vendor).
 pub mod auto_critic;
 pub mod plugin_resolution;
 pub mod progress;
@@ -227,11 +227,7 @@ pub use silence_classifier::{
     save_retry_count as save_limbo_retry_count, LastEventSummary, LimboAction, LimboRetryCount,
     SilenceClass, LIMBO_RETRY_FILE, MAX_LIMBO_RETRY,
 };
-pub use skill::{
-    install_ccteam_control_skill, install_ccteam_creator_skill, install_into as install_skill_into,
-    install_skill_body_into, InstallSkillOptions, InstallSkillReport, SkillInstallAction,
-    CCTEAM_CONTROL_SKILL_NAME, CCTEAM_CREATOR_SKILL_NAME, LEGACY_SKILL_NAMES,
-};
+pub use skill::LEGACY_SKILL_NAMES;
 pub use stall::{
     classify as classify_stall, classify_with_thresholds, silent_seconds, StallLevel,
     StallThresholds, STALL_ESCALATE_SECONDS, STALL_SUSPICIOUS_SECONDS, STALL_WARN_SECONDS,

@@ -1,7 +1,7 @@
 {
   "name": "ccteam",
   "version": "0.8.5",
-  "description": "Multi-vendor (Claude + Codex) AI dev-team orchestration: 3 skills + 20 MCP tools + IM bots + dual-LLM voting.",
+  "description": "Multi-vendor (Claude + Codex) AI dev-team orchestration: 20 MCP tools + IM bots + dual-LLM voting.",
   "author": {
     "name": "FirstIntent"
   },
@@ -17,7 +17,6 @@
     "mcp",
     "telegram"
   ],
-  "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "ccteam",

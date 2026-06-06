@@ -25,8 +25,11 @@ use crate::credentials::TelegramCreds;
 /// the on-disk [`TelegramCreds`] struct so credentials.json stays
 /// minimal (per imd's reply: "don't add bot_username to TelegramCreds
 /// because that's the on-disk schema").
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TelegramSetupResult {
+    /// The validated bot token plus the owner `chat_id` captured by the
+    /// long-poll — exactly the on-disk [`TelegramCreds`] shape, ready to
+    /// merge into the credentials document.
     pub creds: TelegramCreds,
     /// Bot handle from `getMe`, including leading `@`.
     pub bot_username: String,
@@ -38,12 +41,23 @@ pub const TELEGRAM_API_BASE: &str = "https://api.telegram.org";
 /// Errors returned by the onboarding flows.
 #[derive(Debug, Error)]
 pub enum OnboardingError {
+    /// The underlying `reqwest` HTTP call (getMe / getUpdates) failed —
+    /// DNS, TLS, connect, or read timeout.
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
+    /// Telegram returned a `200` with `ok: false`; the `String` names the
+    /// API method that was rejected (e.g. an invalid bot token on `getMe`).
     #[error("Telegram API returned `ok: false`: {0}")]
     ApiNotOk(String),
+    /// The long-poll window elapsed without the owner sending a message,
+    /// so no `chat_id` could be captured.
     #[error("polled {seconds}s with no incoming message — please DM the bot and retry")]
-    NoIncomingMessage { seconds: u64 },
+    NoIncomingMessage {
+        /// The poll budget (seconds) that was exhausted.
+        seconds: u64,
+    },
+    /// A Telegram response decoded but was missing a field the flow needs
+    /// (e.g. `getMe.result`); the `String` describes what was absent.
     #[error("malformed Telegram response: {0}")]
     BadResponse(String),
 }
@@ -83,9 +97,9 @@ pub async fn telegram_setup_with_base(
     if !me.ok {
         return Err(OnboardingError::ApiNotOk("getMe".into()));
     }
-    let bot_user = me.result.ok_or_else(|| {
-        OnboardingError::BadResponse("getMe.result missing".into())
-    })?;
+    let bot_user = me
+        .result
+        .ok_or_else(|| OnboardingError::BadResponse("getMe.result missing".into()))?;
     let bot_username = format!("@{}", bot_user.username);
 
     // Step 2: getUpdates long-poll for first chat_id.

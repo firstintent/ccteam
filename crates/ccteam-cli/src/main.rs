@@ -293,45 +293,15 @@ enum Command {
         /// filesystem.
         #[arg(long, default_value_t = false)]
         dry_run: bool,
-        /// Overwrite operator hand-edits (memory bridge / shipped team
-        /// seeds). Use cautiously.
-        #[arg(long, default_value_t = false)]
-        force: bool,
         /// Cross-check every shipped phase template's tools_required
         /// against the live tool surface (plugin pipeline + user
         /// agents/skills + MCP servers) and print a markdown report.
         #[arg(long, default_value_t = false)]
         tool_surface: bool,
-        /// Install ccteam skills under `~/.claude/skills/<name>/SKILL.md`.
-        /// M1.8 + V0.5.0 F93a. Default (no value) installs every shipped
-        /// skill (`ccteam-control` / `ccteam-creator`). Pass a single skill
-        /// name (e.g. `--install-skill ccteam-control`) to install just one.
-        /// Pass `--install-skill all` for the explicit default. Idempotent.
-        #[arg(
-            long,
-            value_name = "NAME",
-            num_args = 0..=1,
-            default_missing_value = "all",
-        )]
-        install_skill: Option<String>,
-        /// Bootstrap the canonical meta-agent project at
-        /// `~/projects/meta/` with the dispatcher role prompt +
-        /// inbox/outbox dirs. Also installs the `ccteam-control` skill.
-        /// V0.4.1: handle dropped (one ccteam install = one meta-agent).
-        #[arg(long, default_value_t = false)]
-        install_meta_agent: bool,
-        /// M2.5: register `mcpServers.ccteam` in `~/.claude.json` so
-        /// daily-driver claude + meta-agent both see the ccteam MCP
-        /// server (9 tools, interfaces §12). Idempotent — overwrites
-        /// any prior `ccteam` server entry but preserves other servers.
-        #[arg(long, default_value_t = false)]
-        install_mcp: bool,
-        /// V0.4.1: aggregate first-run setup. Equivalent to
-        /// `--install-mcp --install-skill --install-meta-agent`.
-        /// Idempotent. (Pre-V0.4.1 needed a `<HANDLE>` value;
-        /// handle was dropped — one ccteam install = one meta-agent.)
-        #[arg(long, default_value_t = false)]
-        install_all: bool,
+        // v0.8.6 Item 4 — the setup actions formerly exposed here
+        // (`--install-mcp` / `--install-skill` / `--install-meta-agent` /
+        // `--install-all`) moved to `ccteam config`. `doctor` is now
+        // diagnostics / self-check / repair only.
         /// M4.2: write `~/.claude/rules/ccteam-lessons-<team>.md`
         /// with `<!-- ccteam-managed:lessons begin/end -->` markers + `paths:`
         /// frontmatter scope. Idempotent — re-runs no-op when markers are
@@ -478,13 +448,26 @@ enum Command {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// V0.6.0 Wave 3 F112 §C — read / write `~/.ccteam/preferences.toml`.
-    /// Today the only user-visible knob is `fallback.on_claude_quota`
-    /// (`off` | `codex`); V0.7+ will fold in additional opt-in
-    /// preferences. Without args, prints the current preferences.
-    Prefs {
-        #[command(subcommand)]
-        action: Option<PrefsAction>,
+    /// v0.8.6 Item 4 — setup hub. Bare `ccteam config` opens an
+    /// interactive menu (register/refresh the ccteam MCP server, set the
+    /// IM Telegram token, show preferences). The non-interactive forms are
+    /// the headless/CI surface and wrap the preferences store
+    /// (`~/.ccteam/preferences.toml`):
+    ///
+    ///   - `ccteam config show`          print the active preferences
+    ///   - `ccteam config get <key>`     read one preference
+    ///   - `ccteam config <key> <value>` set one preference
+    ///
+    /// `config` absorbs the former `ccteam prefs` command plus the setup
+    /// actions retired from `ccteam doctor` (`--install-mcp`) and the
+    /// `ccteam-im-setup` skill (IM token onboarding).
+    Config {
+        /// Positional words. Empty → interactive menu. `show` → print
+        /// preferences. `get <key>` → read one preference. `<key> <value>`
+        /// → set one preference (the bare two-arg form). A single
+        /// non-keyword word is treated as `get <key>`.
+        #[arg(value_name = "ARGS", num_args = 0..=2)]
+        args: Vec<String>,
     },
 }
 
@@ -622,31 +605,6 @@ enum SessionCommand {
     },
 }
 
-/// V0.6.0 Wave 3 F112 §C — `ccteam prefs` subcommand surface.
-#[derive(Subcommand)]
-enum PrefsAction {
-    /// Pretty-print the active preferences (defaults shown when the
-    /// file is absent).
-    Show,
-    /// Look up a single preference by dotted key. Supported keys today:
-    ///   - `fallback.on_claude_quota`
-    Get {
-        /// Dotted preference key.
-        key: String,
-    },
-    /// Set one preference by dotted key. Writes
-    /// `~/.ccteam/preferences.toml` atomically. Supported keys today:
-    ///   - `fallback.on_claude_quota`  (values: `off` | `codex`)
-    ///   - `fallback.codex.enabled_for_roles` (comma-separated list,
-    ///     or empty string to mean "all roles")
-    Set {
-        /// Dotted preference key.
-        key: String,
-        /// New value.
-        value: String,
-    },
-}
-
 /// V0.8 rmux W6 — `ccteam mux` subcommand group.
 #[derive(Subcommand)]
 enum MuxCommand {
@@ -758,9 +716,9 @@ enum InternalCommand {
         cmd: HookCommand,
     },
     /// Run the ccteam MCP server (stdio JSON-RPC). Wired into
-    /// `~/.claude.json` `mcpServers.ccteam` by `ccteam doctor
-    /// --install-mcp` so daily-driver claude sessions and the meta
-    /// agent both see the 17-tool surface (interfaces §12).
+    /// `~/.claude.json` `mcpServers.ccteam` by `ccteam config` (the
+    /// "register the ccteam MCP server" menu item / `config mcp`) so
+    /// daily-driver claude sessions see the ccteam tool surface.
     McpServe,
     /// Attach to a session. Resolves a gateway chat-mode bot session
     /// (`ccteam-chat-<slug>-<role>`) first: `<slug> <role>` (or a full session
@@ -1105,12 +1063,7 @@ fn main() -> Result<()> {
         Command::Session { cmd } => run_session(cmd),
         Command::Doctor {
             dry_run,
-            force,
             tool_surface,
-            install_skill,
-            install_meta_agent,
-            install_mcp,
-            install_all,
             install_memory_bridge,
             reset_shipped_teams,
             validate_team,
@@ -1131,24 +1084,6 @@ fn main() -> Result<()> {
             verify_mcp,
             json,
         } => {
-            // V0.4.1 `--install-all` is sugar for the three first-run
-            // flags. Explicit flags still win where set; we OR them.
-            //
-            // V0.5.0 F93a: `install_skill` is now `Option<String>`. The
-            // flag is "passed" when `Some(_)`; we keep a derived bool
-            // so `--install-all` + `--install-meta-agent` plumbing
-            // doesn't have to chase the optional name through every
-            // call site.
-            let final_mcp = install_mcp || install_all;
-            let final_skill = install_skill.is_some() || install_all;
-            // None = caller didn't pass --install-skill at all; treat
-            // --install-all as the implicit "all". A non-"all" value
-            // narrows the selection to a single shipped skill.
-            let install_skill_only = install_skill
-                .as_deref()
-                .filter(|s| !s.eq_ignore_ascii_case("all"))
-                .map(|s| s.to_string());
-            let final_meta = install_meta_agent || install_all;
             // V0.4.6 F83 + F85: `--apply` inverts default dry-run for
             // both --migrate-workflow-to-ccteam-dir and --gc-claude-jobs
             // so users previewing safely don't accidentally mutate disk.
@@ -1160,12 +1095,7 @@ fn main() -> Result<()> {
             };
             run_doctor(commands::DoctorOptions {
                 dry_run: f83_dry_run,
-                force,
                 tool_surface,
-                install_skill: final_skill,
-                install_skill_only,
-                install_meta_agent: final_meta,
-                install_mcp: final_mcp,
                 install_memory_bridge,
                 reset_shipped_teams,
                 validate_team,
@@ -1187,26 +1117,59 @@ fn main() -> Result<()> {
                 verify_mcp_json: json,
             })
         }
-        Command::Prefs { action } => {
-            let paths = CcteamPaths::from_env()?;
-            match action {
-                None | Some(PrefsAction::Show) => {
-                    let out = commands::run_prefs_show(&paths)?;
-                    print!("{out}");
-                    Ok(())
-                }
-                Some(PrefsAction::Get { key }) => {
-                    let out = commands::run_prefs_get(&paths, &key)?;
-                    println!("{out}");
-                    Ok(())
-                }
-                Some(PrefsAction::Set { key, value }) => {
-                    let out = commands::run_prefs_set(&paths, &key, &value)?;
-                    println!("{out}");
-                    Ok(())
-                }
-            }
+        Command::Config { args } => run_config(args),
+    }
+}
+
+/// v0.8.6 Item 4 — dispatch `ccteam config`. The interactive menu and the
+/// headless forms both live in `commands`; this only routes the positional
+/// words. Forms:
+///
+/// - (no args) → interactive menu (`commands::run_config_menu`)
+/// - `mcp` → register/refresh the ccteam MCP server (headless escape hatch
+///   for the menu's item 1, so installers / CI can wire MCP without a TTY)
+/// - `show` → print preferences
+/// - `get <key>` → read one preference
+/// - `<key>` → read one preference (single non-keyword word)
+/// - `<key> <value>` → set one preference (the bare two-arg form)
+fn run_config(args: Vec<String>) -> Result<()> {
+    let paths = CcteamPaths::from_env()?;
+    match args.as_slice() {
+        [] => {
+            let out = commands::run_config_menu(&paths)?;
+            print!("{out}");
+            Ok(())
         }
+        [one] if one == "mcp" => {
+            let out = commands::run_config_install_mcp()?;
+            print!("{out}");
+            Ok(())
+        }
+        [one] if one == "show" => {
+            let out = commands::run_prefs_show(&paths)?;
+            print!("{out}");
+            Ok(())
+        }
+        [one] => {
+            // Single non-keyword word → read that preference key.
+            let out = commands::run_prefs_get(&paths, one)?;
+            println!("{out}");
+            Ok(())
+        }
+        [first, second] if first == "get" => {
+            let out = commands::run_prefs_get(&paths, second)?;
+            println!("{out}");
+            Ok(())
+        }
+        [key, value] => {
+            // Bare two-arg form `config <key> <value>` → set the pref.
+            let out = commands::run_prefs_set(&paths, key, value)?;
+            println!("{out}");
+            Ok(())
+        }
+        // clap caps this at 2 positionals (`num_args = 0..=2`), so the
+        // 3+ arm is unreachable; keep it total for the compiler.
+        _ => anyhow::bail!("ccteam config: too many arguments (expected at most `<key> <value>`)"),
     }
 }
 

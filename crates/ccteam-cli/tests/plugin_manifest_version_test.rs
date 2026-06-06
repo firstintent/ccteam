@@ -93,7 +93,7 @@ fn parse_marketplace_plugin_version(path: &Path) -> String {
 /// `mcp-serve` is a deprecated alias that prints a stderr WARN on every startup.
 /// This pins the shipped root `.mcp.json` to that form AND to the shared
 /// `ccteam_core::CCTEAM_MCP_SERVE_ARGS` const that both runtime writers
-/// (`doctor --install-mcp` → `~/.claude.json`, and the project `.mcp.json`
+/// (`config mcp` → `~/.claude.json`, and the project `.mcp.json`
 /// template) use, so the manifest and the writers can't drift apart again.
 #[test]
 fn root_mcp_json_matches_canonical_mcp_serve_args() {

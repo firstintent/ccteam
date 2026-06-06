@@ -11,14 +11,11 @@ use serde_json::{json, Map, Value};
 
 use ccteam_core::tmux::TmuxSession;
 use ccteam_core::{
-    bootstrap_meta_project, cost_summary, current_ccteam_bin, install_ccteam_control_skill,
-    install_ccteam_creator_skill, migrate_legacy_skill_dirs, migrate_recommended_agent_symlinks,
-    pricing_schema_version, pricing_schema_version_for, rewrite_legacy_hook_commands,
-    session_name_for_project, user_claude_dir, write_global_helper_templates, CcteamPaths,
-    HookCmdRewriteAction, HookCmdRewriteReport, InstallSkillOptions, LegacySkillAction,
-    LegacySkillReport, MetaBootstrapReport, MigrationReport, PhaseState, ProjectState,
-    SkillInstallAction, ToolSurfaceSnapshot, Vendor, BUILTIN_SUBAGENTS, CCTEAM_CONTROL_SKILL_NAME,
-    CCTEAM_CREATOR_SKILL_NAME,
+    cost_summary, current_ccteam_bin, migrate_recommended_agent_symlinks, pricing_schema_version,
+    pricing_schema_version_for, rewrite_legacy_hook_commands, session_name_for_project,
+    user_claude_dir, write_global_helper_templates, CcteamPaths, HookCmdRewriteAction,
+    HookCmdRewriteReport, MigrationReport, PhaseState, ProjectState, ToolSurfaceSnapshot, Vendor,
+    BUILTIN_SUBAGENTS,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -274,28 +271,12 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
         out.push_str("\nfirst-run install:\n");
         let mut did_something = false;
 
-        let do_skill = ask_yn("install ccteam skills (~/.claude/skills/)", opts.yes)?;
-        if do_skill {
-            out.push_str(&render_install_skill_report(
-                paths,
-                &DoctorOptions {
-                    install_skill: true,
-                    ..Default::default()
-                },
-            )?);
-            did_something = true;
-        }
         let do_mcp = ask_yn(
             "register ccteam MCP server in ~/.claude.json (mcpServers.ccteam)",
             opts.yes,
         )?;
         if do_mcp {
             out.push_str(&render_install_mcp_report()?);
-            did_something = true;
-        }
-        let do_meta = ask_yn("bootstrap meta-agent project (~/projects/meta/)", opts.yes)?;
-        if do_meta {
-            out.push_str(&render_install_meta_agent_report(paths)?);
             did_something = true;
         }
 
@@ -306,6 +287,7 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
 
     out.push_str("\nnext:\n");
     out.push_str("  - edit .ccteam/workflow.yaml + .claude/agents/<role>.md to your taste\n");
+    out.push_str("  - ccteam config               # register MCP / set IM token / prefs\n");
     out.push_str("  - ccteam start                # boots gateway + web\n");
     Ok(out)
 }
@@ -2079,45 +2061,21 @@ pub fn run_resume(paths: &CcteamPaths, slug: &str) -> Result<()> {
     ccteam_core::actions::resume(paths, slug)
 }
 
-/// `ccteam doctor` flags. Each mode is a separate boolean / option so
-/// they can be combined (e.g. `--install-meta-agent rob` implies
-/// `--install-skill` automatically).
+/// `ccteam doctor` flags. Each diagnostic / repair mode is a separate
+/// boolean / option so they can be combined in one invocation. (Setup
+/// actions — MCP register, IM token, prefs — live in `ccteam config`.)
 #[derive(Debug, Clone, Default)]
 pub struct DoctorOptions {
     pub dry_run: bool,
-    pub force: bool,
     pub tool_surface: bool,
-    /// M1.8: install ccteam skills under `~/.claude/skills/<name>/SKILL.md`,
-    /// plus run the V0.2.2 (F39'd) → V0.2.2 (F44'd) reverse migration
-    /// (cleanup of legacy `cct-*` skill dirs and stale settings.json
-    /// hook command paths).
-    ///
-    /// V0.5.0 F93a: pair with `install_skill_only = Some("<name>")` to
-    /// install just one named skill. Default (`install_skill_only = None`)
-    /// installs every shipped skill: `ccteam-control` and `ccteam-creator`.
-    pub install_skill: bool,
-    /// V0.5.0 F93a: when `install_skill == true` and this is `Some(name)`,
-    /// install only the named skill (one of `ccteam-control` /
-    /// `ccteam-creator` / `all`). `None` or `Some("all")` install every
-    /// shipped skill. The CLI flag is `--install-skill [NAME]` (no value =
-    /// install all, matches the V0.4.6 behavior).
-    pub install_skill_only: Option<String>,
-    /// V0.4.1: bootstrap the meta-agent project at `~/projects/meta/`.
-    /// `true` triggers `install_skill` regardless of its standalone
-    /// flag. (Pre-V0.4.1 this was `Option<String>` for a per-user handle
-    /// — handle was dropped, the meta-agent slug is now always `meta`.)
-    pub install_meta_agent: bool,
-    /// M2.5: register `mcpServers.ccteam` in `~/.claude.json`.
-    pub install_mcp: bool,
     /// M4.2: install `~/.claude/rules/ccteam-lessons-<team>.md` placeholders.
     pub install_memory_bridge: bool,
     /// V0.2 M0.16.2: re-write every shipped team
     /// (`~/.ccteam/teams/<name>/team.yaml` + `~/.ccteam/<phase_dir>/*.md`)
-    /// using the in-binary seed bundle. `force=true` overwrites operator
-    /// hand-edits; `force=false` is equivalent to the auto-seed run on
-    /// `Orchestrator::new`. Useful after a ccteam upgrade ships
-    /// schema-additive team.yaml changes (e.g. the V0.2 `evergreen` /
-    /// `cost_policy` fields landed by M0.16).
+    /// using the in-binary seed bundle. Overwrites operator hand-edits.
+    /// Useful after a ccteam upgrade ships schema-additive team.yaml
+    /// changes (e.g. the V0.2 `evergreen` / `cost_policy` fields landed
+    /// by M0.16).
     pub reset_shipped_teams: bool,
     /// V0.2 M0.18.5: load + validate one team's phase templates +
     /// `team.yaml`, including the new V0.2 inject-prompt frontmatter
@@ -2221,9 +2179,6 @@ pub struct DoctorOptions {
 /// tests don't need to capture stdout.
 pub fn run_doctor(paths: &CcteamPaths, mut opts: DoctorOptions) -> Result<String> {
     let any_mode = opts.tool_surface
-        || opts.install_skill
-        || opts.install_meta_agent
-        || opts.install_mcp
         || opts.install_memory_bridge
         || opts.reset_shipped_teams
         || opts.validate_team.is_some()
@@ -2251,18 +2206,6 @@ pub fn run_doctor(paths: &CcteamPaths, mut opts: DoctorOptions) -> Result<String
     let mut out = String::new();
     if opts.tool_surface {
         out.push_str(&render_tool_surface_report(paths)?);
-    }
-    // --install-meta-agent implies --install-skill so a fresh meta
-    // session has the dispatcher tool list immediately.
-    let install_skill_now = opts.install_skill || opts.install_meta_agent;
-    if install_skill_now {
-        out.push_str(&render_install_skill_report(paths, &opts)?);
-    }
-    if opts.install_meta_agent {
-        out.push_str(&render_install_meta_agent_report(paths)?);
-    }
-    if opts.install_mcp {
-        out.push_str(&render_install_mcp_report()?);
     }
     if opts.install_memory_bridge {
         out.push_str(&render_install_memory_bridge_report(paths, &opts)?);
@@ -2404,17 +2347,8 @@ const NO_MODE_HELP: &str = "\nccteam doctor: pass at least one mode flag for the
      --tool-surface\n      \
      cross-check phase templates' tools_required against current reachability — \
      plugin-pipeline-aware (V0.2 M0.20).\n  \
-     --install-skill [NAME] [--force]\n      \
-     write ~/.claude/skills/ccteam-{control,creator}/SKILL.md \
-     (M1.8 + V0.5.0 F93a). Pass NAME=all (or omit) for every shipped skill; pass a \
-     single skill name (`ccteam-control` / `ccteam-creator`) to install just one. \
-     Default installs run \
-     the V0.2.2 (F39'd) → V0.2.2 (F44'd) reverse migration (legacy `cct-*` skill dirs + \
-     stale settings.json hook command paths); single-skill installs skip the migration.\n  \
-     --install-meta-agent\n      \
-     bootstrap the canonical meta-agent project at ~/projects/meta/. Implies --install-skill. (V0.4.1: handle dropped — one ccteam install = one meta-agent.)\n  \
-     --install-mcp\n      \
-     register `mcpServers.ccteam` in ~/.claude.json so daily-driver claude + meta-agent see the ccteam MCP server. The exact tool count is printed by the command itself (and `ccteam doctor --verify-mcp`).\n  \
+     (setup actions — registering the ccteam MCP server, setting the IM token, and \
+     editing preferences — moved to `ccteam config`; `doctor` is diagnostics only.)\n  \
      --install-memory-bridge [--dry-run]\n      \
      write ~/.claude/rules/ccteam-lessons-<team>.md placeholders for every team with non-empty retro_schema (M4.2; V0.2 M0.16.2 — disk-driven team discovery).\n  \
      --reset-shipped-teams [--force]\n      \
@@ -2679,197 +2613,25 @@ fn render_install_mcp_report() -> Result<String> {
     Ok(render_install_mcp_body(&path))
 }
 
-/// Pure renderer for the `--install-mcp` report body, split out from the
+/// Pure renderer for the `config mcp` report body, split out from the
 /// `~/.claude.json` write so it stays unit-testable without touching the
 /// real config. The `tools surface` line interpolates the live tool count
 /// from the same `tool_definitions()` source `run_verify_mcp` introspects
 /// — never hard-code it, or the number drifts (it was stuck at "9" while
 /// the surface grew to 27).
 fn render_install_mcp_body(path: &std::path::Path) -> String {
-    let mut out = String::from("ccteam doctor --install-mcp\n\n");
+    let mut out = String::from("ccteam config: register MCP server\n\n");
     out.push_str(&format!(
         "  registered ccteam MCP server in {}\n",
         path.display()
     ));
     let total_tools = run_verify_mcp().total_tools;
     out.push_str(&format!("  tools surface : {total_tools}\n"));
-    out.push_str("  consumers     : daily-driver claude + meta-agent\n");
     out.push('\n');
     out.push_str(
         "open a new claude session to pick up the change; existing sessions need /reload-mcp.\n",
     );
     out
-}
-
-fn skill_install_label(action: &SkillInstallAction) -> String {
-    match action {
-        SkillInstallAction::Wrote => "wrote".into(),
-        SkillInstallAction::AlreadyPresent => "already-present (use --force to overwrite)".into(),
-        SkillInstallAction::Replaced => "replaced".into(),
-        SkillInstallAction::DryRun { would_write } => {
-            if *would_write {
-                "would write".into()
-            } else {
-                "no-op (already present)".into()
-            }
-        }
-    }
-}
-
-fn render_install_skill_report(paths: &CcteamPaths, opts: &DoctorOptions) -> Result<String> {
-    let install_opts = InstallSkillOptions {
-        force: opts.force,
-        dry_run: opts.dry_run,
-    };
-
-    // Classify the selector. `None` / `Some("all")` ⇒ install every
-    // shipped skill. `Some("<name>")` ⇒ install just that one and skip
-    // F44 migration because the migration touches every shipped skill
-    // name.
-    let selector = opts.install_skill_only.as_deref().unwrap_or("all");
-    let selector_lc = selector.to_ascii_lowercase();
-    let install_all = selector_lc.is_empty() || selector_lc == "all";
-
-    if !install_all {
-        // Single-skill mode — short header so the report makes it clear
-        // we deliberately skipped the other shipped skills + the F44
-        // legacy reverse migration.
-        let mut out = format!("ccteam doctor --install-skill {selector}\n\n");
-        let target = match selector_lc.as_str() {
-            CCTEAM_CONTROL_SKILL_NAME => install_ccteam_control_skill(install_opts)?,
-            CCTEAM_CREATOR_SKILL_NAME => install_ccteam_creator_skill(install_opts)?,
-            other => bail!(
-                "ccteam doctor --install-skill {other}: unknown skill name; expected one of \
-                 `all` / {ctrl} / {creator}",
-                ctrl = CCTEAM_CONTROL_SKILL_NAME,
-                creator = CCTEAM_CREATOR_SKILL_NAME,
-            ),
-        };
-        out.push_str(&format!(
-            "  {name:<22}  {label}  {}\n",
-            target.target.display(),
-            name = selector_lc,
-            label = skill_install_label(&target.action),
-        ));
-        out.push('\n');
-        return Ok(out);
-    }
-
-    let mut out = String::from("ccteam doctor --install-skill\n\n");
-
-    // 2 shipped skills. Legacy F39 `cct-*` and V0.2/V0.2.2
-    // `ccteam-team-author` + `ccteam-project-creator` are swept by the
-    // F44 reverse migration below.
-    let control = install_ccteam_control_skill(install_opts)?;
-    out.push_str(&format!(
-        "  ccteam-control          {label}  {}\n",
-        control.target.display(),
-        label = skill_install_label(&control.action),
-    ));
-    let creator = install_ccteam_creator_skill(install_opts)?;
-    out.push_str(&format!(
-        "  ccteam-creator          {label}  {}\n",
-        creator.target.display(),
-        label = skill_install_label(&creator.action),
-    ));
-    out.push('\n');
-
-    // V0.2.2 F44 reverse migration: clean up F39-era `cct-*` skill dirs
-    // and rewrite stale settings.json hook command paths so users
-    // upgrading from F39'd V0.2.2 to F44'd V0.2.2 don't end up with
-    // duplicate `cct-*` + `ccteam-*` skill directories or hook commands
-    // pointing at the F39 `cct` binary that no longer exists.
-    out.push_str(&render_f44_migration(paths, opts)?);
-
-    Ok(out)
-}
-
-/// V0.2.2 F44: detect-and-clean F39-era install artifacts so users who
-/// revert from `cct → ccteam` don't end up with both naming conventions
-/// live at once. Runs as a side effect of `--install-skill` and
-/// `--install-meta-agent`.
-fn render_f44_migration(paths: &CcteamPaths, opts: &DoctorOptions) -> Result<String> {
-    let mut out = String::new();
-    let claude = match user_claude_dir() {
-        Ok(c) => c,
-        Err(_) => {
-            // No claude dir — no F39-era install to clean up.
-            return Ok(out);
-        }
-    };
-
-    out.push_str("F44 reverse migration (V0.2.2 F39 → V0.2.2 F44 cleanup)\n\n");
-
-    // 1. Legacy `cct-*` skill dirs.
-    let skill_reports = migrate_legacy_skill_dirs(&claude, opts.dry_run)?;
-    let any_skill_action = skill_reports
-        .iter()
-        .any(|r| r.action != LegacySkillAction::NotFound);
-    if any_skill_action {
-        for r in &skill_reports {
-            out.push_str(&render_legacy_skill_line(r, opts.dry_run));
-        }
-    } else {
-        out.push_str(
-            "  legacy skills    no `~/.claude/skills/cct-*` dirs found — nothing to do.\n",
-        );
-    }
-
-    // 2. Stale settings.json hook command paths. V0.6.1 F139 — rewrite
-    // targets are now the `~/.ccteam/hooks/hook.sh` wrapper, not the
-    // bare ccteam binary, so users upgrading from V0.6.0 (or earlier)
-    // get pointed at the daemon-aware dispatcher.
-    let hook_sh = paths.hooks_script();
-    {
-        let hook_reports =
-            scan_project_settings_for_hook_rewrite(&paths.projects_root, &hook_sh, opts.dry_run)?;
-        if hook_reports.is_empty() {
-            out.push_str("  legacy hooks     no project `settings.json` files found.\n");
-        } else {
-            let mut any_rewritten = false;
-            for r in &hook_reports {
-                let line = render_hook_rewrite_line(r, opts.dry_run);
-                out.push_str(&line);
-                if matches!(
-                    r.action,
-                    HookCmdRewriteAction::Rewrote { .. }
-                        | HookCmdRewriteAction::WouldRewrite { .. }
-                ) {
-                    any_rewritten = true;
-                }
-            }
-            if !any_rewritten {
-                // All NoChangeNeeded — collapse the table to a single
-                // friendly summary instead of dumping every project.
-                out.clear();
-                out.push_str("F44 reverse migration (V0.2.2 F39 → V0.2.2 F44 cleanup)\n\n");
-                for r in &skill_reports {
-                    out.push_str(&render_legacy_skill_line(r, opts.dry_run));
-                }
-                out.push_str(&format!(
-                    "  legacy hooks     scanned {} project settings.json — no rewrites needed.\n",
-                    hook_reports.len(),
-                ));
-            }
-        }
-    }
-    out.push('\n');
-    Ok(out)
-}
-
-fn render_legacy_skill_line(r: &LegacySkillReport, dry_run: bool) -> String {
-    let label = match (&r.action, dry_run) {
-        (LegacySkillAction::NotFound, _) => "not present",
-        (LegacySkillAction::Removed, _) => "removed",
-        (LegacySkillAction::WouldRemove, _) => "would remove",
-        (LegacySkillAction::PreservedHandEdit, _) => "preserved (hand-edited)",
-    };
-    format!(
-        "  {:<28} {:<22} {}\n",
-        format!("{}/", r.legacy_name),
-        label,
-        r.target.display(),
-    )
 }
 
 fn render_hook_rewrite_line(r: &HookCmdRewriteReport, _dry_run: bool) -> String {
@@ -3860,43 +3622,6 @@ fn scan_project_settings_for_hook_rewrite(
     Ok(out)
 }
 
-fn render_install_meta_agent_report(paths: &CcteamPaths) -> Result<String> {
-    let report: MetaBootstrapReport = bootstrap_meta_project(paths)?;
-    let mut out = String::from("ccteam doctor --install-meta-agent\n\n");
-    out.push_str(&format!("  project slug     {}\n", report.slug));
-    out.push_str(&format!(
-        "  project dir      {}\n",
-        report.project_dir.display()
-    ));
-    out.push_str(&format!(
-        "  role prompt      {}\n",
-        report.claude_md.display()
-    ));
-    out.push_str(&format!(
-        "  status           {}\n",
-        if report.already_existed {
-            "refreshed"
-        } else {
-            "created"
-        },
-    ));
-    if !report.removed_stale.is_empty() {
-        out.push_str(&format!(
-            "  cleaned legacy   {} stale meta-<handle> dir(s) removed\n",
-            report.removed_stale.len()
-        ));
-        for path in &report.removed_stale {
-            out.push_str(&format!("                     - {}\n", path.display()));
-        }
-    }
-    out.push('\n');
-    let tmux_session = ccteam_core::meta_session_name();
-    out.push_str(&format!("tmux session     {tmux_session}\n"));
-    out.push_str(&format!("attach with      tmux attach -t {tmux_session}\n"));
-    out.push_str("\nrun `ccteam start` (in another terminal) to wake the meta session.\n");
-    Ok(out)
-}
-
 fn render_migrate_recommended_agents_report(opts: &DoctorOptions) -> Result<String> {
     let claude = user_claude_dir()?;
     let reports = migrate_recommended_agent_symlinks(&claude, opts.dry_run)?;
@@ -4536,6 +4261,144 @@ pub fn run_prefs_set(paths: &CcteamPaths, key: &str, value: &str) -> Result<Stri
     }
     ccteam_core::preferences::save(&paths.root, &prefs)?;
     Ok(format!("set {key} = {value}"))
+}
+
+// -------------------------------------------------------------------------
+// v0.8.6 Item 4 — `ccteam config` setup hub.
+//
+// `config` is the single setup entrypoint a fresh host runs after
+// `ccteam init`. It absorbs three formerly-scattered setup actions:
+//   (a) register/refresh the ccteam MCP server (was `doctor --install-mcp`),
+//   (b) set the IM (Telegram) bot token (was the `ccteam-im-setup` skill;
+//       backed by `ccteam_im::onboarding::telegram_setup`),
+//   (c) read/write preferences (the `prefs` get/set/show backend).
+//
+// Bare `ccteam config` opens a thin numbered-choice interactive menu;
+// each menu item dispatches to the SAME action fn the non-interactive
+// path calls, so the logic stays testable without a TTY. The
+// non-interactive form (`config <key> <value>` / `config get <key>` /
+// `config show`) is the headless/CI surface and wraps the prefs backend.
+// `preferences.toml` remains the store for the key/value knobs.
+// -------------------------------------------------------------------------
+
+/// Number of seconds the IM-token flow long-polls Telegram's
+/// `getUpdates` for the first incoming message (to capture the owner's
+/// `chat_id`). Kept short so a non-interactive misfire fails fast.
+const CONFIG_IM_POLL_SECONDS: u64 = 60;
+
+/// `config` action (a) — register / refresh `mcpServers.ccteam` in
+/// `~/.claude.json`. Thin wrapper over the same writer the retired
+/// `doctor --install-mcp` flag used (`render_install_mcp_report`), so the
+/// rendered report (incl. the live tool count) is identical.
+pub fn run_config_install_mcp() -> Result<String> {
+    render_install_mcp_report()
+}
+
+/// `config` action (b) — validate a Telegram bot token, long-poll for the
+/// owner's first message to capture the `chat_id`, and persist the
+/// resulting credentials to `~/.ccteam/im/credentials.json` (mode 0600).
+/// Wraps [`ccteam_im::onboarding::telegram_setup`]; the async call is
+/// driven on a one-shot current-thread tokio runtime so the sync CLI /
+/// menu path stays runtime-agnostic.
+///
+/// Returns the stdout body to print on success (bot handle + creds path
+/// + a "DM the bot now" hint the caller may have already surfaced).
+pub fn run_config_set_im_token(token: &str) -> Result<String> {
+    let token = token.trim();
+    if token.is_empty() {
+        bail!("config: empty Telegram bot token (paste the token from @BotFather)");
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime for IM token onboarding")?;
+    let result = runtime
+        .block_on(ccteam_im::onboarding::telegram_setup(
+            token,
+            CONFIG_IM_POLL_SECONDS,
+        ))
+        .context("Telegram onboarding (token validation + chat_id capture)")?;
+
+    // Read the display fields out before moving `creds` into the doc.
+    let bot_username = result.bot_username;
+    let owner = result
+        .creds
+        .allowed_chat_ids
+        .first()
+        .cloned()
+        .unwrap_or_default();
+
+    // Persist: merge into any existing credentials doc so a prior Slack /
+    // Discord / Lark entry survives a Telegram (re)config.
+    let creds_path = ccteam_im::credentials::default_path();
+    let mut creds = ccteam_im::credentials::load(Some(&creds_path))
+        .context("load existing IM credentials before merge")?;
+    creds.telegram = Some(result.creds);
+    ccteam_im::credentials::save(&creds_path, &creds).context("persist IM credentials")?;
+
+    Ok(format!(
+        "ccteam config: Telegram token saved\n\n  \
+         bot           {}\n  \
+         owner chat_id {}\n  \
+         credentials   {}\n\n\
+         `ccteam start` will bring the IM gateway up with these credentials.\n",
+        bot_username,
+        owner,
+        creds_path.display(),
+    ))
+}
+
+/// Bare `ccteam config` — thin numbered-choice interactive menu. Reads a
+/// single digit from stdin and dispatches to the same action fn the
+/// non-interactive path uses (so all real work stays in testable fns).
+/// On a non-TTY stdin we refuse rather than hang, pointing the operator at
+/// the non-interactive forms.
+pub fn run_config_menu(paths: &CcteamPaths) -> Result<String> {
+    use std::io::{IsTerminal, Write};
+
+    if !std::io::stdin().is_terminal() {
+        bail!(
+            "ccteam config: interactive menu needs a TTY.\n\
+             headless forms:\n  \
+             ccteam config show                 # print preferences\n  \
+             ccteam config get <key>            # read one preference\n  \
+             ccteam config <key> <value>        # set one preference\n  \
+             ccteam doctor --verify-mcp         # check the MCP wiring\n\
+             (MCP register + IM token onboarding need an interactive run.)"
+        );
+    }
+
+    println!("ccteam config — setup\n");
+    println!("  1) register / refresh the ccteam MCP server (~/.claude.json)");
+    println!("  2) set the IM (Telegram) bot token");
+    println!("  3) show preferences");
+    println!("  q) quit");
+    print!("\nchoose [1-3/q]: ");
+    std::io::stdout().flush().ok();
+
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .context("read config menu choice from stdin")?;
+
+    match line.trim() {
+        "1" => run_config_install_mcp(),
+        "2" => {
+            print!("paste the Telegram bot token (from @BotFather): ");
+            std::io::stdout().flush().ok();
+            let mut token = String::new();
+            std::io::stdin()
+                .read_line(&mut token)
+                .context("read Telegram token from stdin")?;
+            println!(
+                "validating token + waiting up to {CONFIG_IM_POLL_SECONDS}s for you to DM the bot…"
+            );
+            run_config_set_im_token(&token)
+        }
+        "3" => run_prefs_show(paths),
+        "q" | "Q" | "" => Ok("ccteam config: nothing changed.\n".to_string()),
+        other => bail!("ccteam config: unrecognized choice {other:?} (expected 1-3 or q)"),
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -6376,8 +6239,6 @@ mod tests {
         let paths = fresh_paths(&tmp);
         let body = run_doctor(&paths, DoctorOptions::default()).unwrap();
         assert!(body.contains("tool-surface"));
-        assert!(body.contains("install-skill"));
-        assert!(body.contains("install-meta-agent"));
         assert!(body.contains("install-memory-bridge"));
         assert!(body.contains("validate-team"), "got: {body}");
         assert!(body.contains("migrate-recommended-agents"), "got: {body}");
@@ -6483,66 +6344,13 @@ mod tests {
     }
 
     #[test]
-    fn run_doctor_install_meta_agent_creates_project_and_skill() {
-        // M1.0 + M1.8 combo: --install-meta-agent implies
-        // --install-skill, so a single invocation gets the user a
-        // ready-to-attach session. V0.4.1: handle dropped — one ccteam
-        // install ⇒ one meta-agent at canonical `meta/`.
-        ensure_isolation();
-        let _guard = env_lock().lock().unwrap();
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        // Redirect ~/.claude/ to the tempdir so the skill install
-        // doesn't touch the developer's real ~/.claude/.
-        std::env::set_var("CLAUDE_CONFIG_HOME", tmp.path().to_str().unwrap());
-
-        let opts = DoctorOptions {
-            install_meta_agent: true,
-            ..DoctorOptions::default()
-        };
-        let report = run_doctor(&paths, opts).unwrap();
-        assert!(
-            report.contains("install-skill"),
-            "skill install report missing"
-        );
-        assert!(
-            report.contains("install-meta-agent"),
-            "meta install report missing"
-        );
-        assert!(report.contains("meta"), "meta slug should be reported");
-
-        // Project directory exists at canonical V0.4.1 path.
-        assert!(paths.project_dir("meta").is_dir());
-        let state = ProjectState::load(&paths.project_state("meta")).unwrap();
-        assert_eq!(state.team, "meta-agent");
-        assert_eq!(state.slug, "meta");
-        assert_eq!(state.tmux_session, "ccteam-meta");
-
-        // Skill landed under the redirected ~/.claude/. Shipped set:
-        // ccteam-control / ccteam-creator.
-        let control = tmp.path().join("skills/ccteam-control/SKILL.md");
-        assert!(
-            control.is_file(),
-            "ccteam-control SKILL.md not written: {}",
-            control.display()
-        );
-        let creator = tmp.path().join("skills/ccteam-creator/SKILL.md");
-        assert!(
-            creator.is_file(),
-            "ccteam-creator SKILL.md not written: {}",
-            creator.display(),
-        );
-
-        std::env::remove_var("CLAUDE_CONFIG_HOME");
-    }
-
-    #[test]
     fn run_doctor_appends_codex_detection_line_when_any_mode_runs() {
         // V0.3.1 F47 — every successful doctor run (any_mode == true)
         // appends one informational `[ccteam] codex CLI: ...` line at
         // the end. Pure informational — never fails the report. The
         // exact path / not-found suffix depends on the host so we
-        // only pin the prefix.
+        // only pin the prefix. `tool_surface` is a read-only mode flag
+        // that flips `any_mode` true without mutating disk.
         ensure_isolation();
         let _guard = env_lock().lock().unwrap();
         let tmp = TempDir::new().unwrap();
@@ -6550,7 +6358,7 @@ mod tests {
         std::env::set_var("CLAUDE_CONFIG_HOME", tmp.path().to_str().unwrap());
 
         let opts = DoctorOptions {
-            install_skill: true,
+            tool_surface: true,
             ..DoctorOptions::default()
         };
         let report = run_doctor(&paths, opts).unwrap();
@@ -6583,100 +6391,6 @@ mod tests {
             body.contains("pass at least one mode flag"),
             "no-flag invocation must still surface the help block; got:\n{body}",
         );
-    }
-
-    #[test]
-    fn run_doctor_install_skill_only_lays_down_skill_md() {
-        ensure_isolation();
-        let _guard = env_lock().lock().unwrap();
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        std::env::set_var("CLAUDE_CONFIG_HOME", tmp.path().to_str().unwrap());
-
-        let opts = DoctorOptions {
-            install_skill: true,
-            ..DoctorOptions::default()
-        };
-        let report = run_doctor(&paths, opts).unwrap();
-        assert!(report.contains("install-skill"));
-        assert!(!report.contains("install-meta-agent"));
-
-        // V0.5.0 F100: shipped skills land under canonical ccteam-* names.
-        assert!(tmp.path().join("skills/ccteam-control/SKILL.md").is_file());
-        assert!(tmp.path().join("skills/ccteam-creator/SKILL.md").is_file());
-        std::env::remove_var("CLAUDE_CONFIG_HOME");
-    }
-
-    #[test]
-    fn run_doctor_install_skill_runs_f44_legacy_skill_cleanup() {
-        // V0.2.2 F44: --install-skill detects + removes any
-        // ~/.claude/skills/cct-{control,team-author,project-creator}/ left
-        // over from F39'd V0.2.2 installs whose body still carries the
-        // ccteam-managed marker (or canonical frontmatter).
-        ensure_isolation();
-        let _guard = env_lock().lock().unwrap();
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        std::env::set_var("CLAUDE_CONFIG_HOME", tmp.path().to_str().unwrap());
-        // Stage an F39'd install (V0.2.2 PR #1 era).
-        let legacy = tmp.path().join("skills/cct-control");
-        std::fs::create_dir_all(&legacy).unwrap();
-        std::fs::write(
-            legacy.join("SKILL.md"),
-            "---\nname: cct-control\n---\n# legacy body\n",
-        )
-        .unwrap();
-
-        let opts = DoctorOptions {
-            install_skill: true,
-            ..DoctorOptions::default()
-        };
-        let report = run_doctor(&paths, opts).unwrap();
-        assert!(
-            report.contains("F44 reverse migration"),
-            "F44 report header missing: {report}"
-        );
-        assert!(
-            report.contains("cct-control/"),
-            "legacy entry missing: {report}"
-        );
-        assert!(!legacy.exists(), "legacy cct-control dir survived");
-        // New (canonical) name still landed.
-        assert!(tmp.path().join("skills/ccteam-control/SKILL.md").is_file());
-        std::env::remove_var("CLAUDE_CONFIG_HOME");
-    }
-
-    #[test]
-    fn run_doctor_install_skill_preserves_user_hand_edited_legacy_skill() {
-        // F44: a legacy `cct-*` directory whose SKILL.md was hand-edited
-        // (no marker, no canonical frontmatter) is preserved.
-        ensure_isolation();
-        let _guard = env_lock().lock().unwrap();
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        std::env::set_var("CLAUDE_CONFIG_HOME", tmp.path().to_str().unwrap());
-        let legacy = tmp.path().join("skills/cct-team-author");
-        std::fs::create_dir_all(&legacy).unwrap();
-        std::fs::write(
-            legacy.join("SKILL.md"),
-            "---\nname: my-fork\n---\n# user wrote this\n",
-        )
-        .unwrap();
-
-        let opts = DoctorOptions {
-            install_skill: true,
-            ..DoctorOptions::default()
-        };
-        let report = run_doctor(&paths, opts).unwrap();
-        assert!(
-            report.contains("preserved"),
-            "F44 should report preserve: {report}"
-        );
-        assert!(
-            legacy.exists(),
-            "hand-edited legacy dir was unexpectedly removed"
-        );
-        std::env::remove_var("CLAUDE_CONFIG_HOME");
     }
 
     // V0.4.0 F60: shipped-team seed writer (dev / research / meta-agent
@@ -7152,8 +6866,8 @@ mod tests {
     }
 
     #[test]
-    fn install_mcp_report_renders_live_tool_count() {
-        // The `--install-mcp` report must print the live tool count from
+    fn config_mcp_report_renders_live_tool_count() {
+        // The `config mcp` report must print the live tool count from
         // `tool_definitions()`, never a hard-coded number that drifts
         // (it was stuck at "9" while the surface grew to 27). Mirrors
         // `tool_definitions_count_matches_spec` so the rendered string

@@ -2,11 +2,13 @@
 //! redirect the `.claude.json` mcpServers write away from the
 //! developer's real `~/.claude.json`.
 //!
-//! Mirrors the redirection sibling installers
-//! (`--install-skill`, `--install-memory-bridge`) get through
-//! `user_claude_dir()`. Pre-V0.2.1 `install_mcp()` went straight
-//! through `dirs::home_dir()` and ignored the env, which forced e2e
-//! suites to override `HOME` instead.
+//! v0.8.6 Item 4: the MCP-install CLI entrypoint moved from
+//! `doctor --install-mcp` to the `config` setup hub. The headless
+//! `ccteam config mcp` escape hatch drives the same `install_mcp()`
+//! writer, so this redirect coverage now runs through `config mcp`.
+//! Pre-V0.2.1 `install_mcp()` went straight through `dirs::home_dir()`
+//! and ignored the env, which forced e2e suites to override `HOME`
+//! instead.
 
 use std::process::Command;
 
@@ -34,17 +36,17 @@ fn install_mcp_writes_to_claude_config_home_when_set() {
 
     let bin = env!("CARGO_BIN_EXE_ccteam");
     let out = Command::new(bin)
-        .args(["doctor", "--install-mcp"])
+        .args(["config", "mcp"])
         .env("CLAUDE_CONFIG_HOME", &claude_dir)
         .env("HOME", &fake_home)
         .env("CCTEAM_HOME", tmp.path().join("ccteam-home"))
         .output()
-        .expect("spawn ccteam doctor --install-mcp");
+        .expect("spawn ccteam config mcp");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         out.status.success(),
-        "doctor --install-mcp should succeed; stdout={stdout}; stderr={stderr}",
+        "config mcp should succeed; stdout={stdout}; stderr={stderr}",
     );
 
     assert!(

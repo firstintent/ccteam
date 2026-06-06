@@ -13,10 +13,10 @@
 //! - **No LLM in-process** (Symphony anti-pattern, tech-design §3.1).
 //!   The MCP server is a thin protocol adapter; every tool routes to
 //!   an existing `commands.rs` function.
-//! - Two consumers: the user's daily-driver claude (`~/.claude.json`
-//!   `mcpServers` entry, written by `ccteam doctor --install-mcp`)
-//!   and the meta-agent session (project-local `.mcp.json` —
-//!   meta-agent prefers MCP, falls back to Bash).
+//! - Consumed by the user's daily-driver claude (`~/.claude.json`
+//!   `mcpServers` entry, written by `ccteam config` — the "register the
+//!   ccteam MCP server" menu item / `config mcp`) and any project-local
+//!   `.mcp.json`.
 //!
 //! Wire format: each side sends one JSON object per line, terminated
 //! by `\n`. Notifications (no `id`) get no reply. Errors follow the
@@ -922,9 +922,9 @@ async fn write_message(stdout: &mut tokio::io::Stdout, msg: &Value) -> Result<()
     Ok(())
 }
 
-/// `ccteam doctor --install-mcp`: register the ccteam MCP server in
-/// `~/.claude.json` so any new claude session can call ccteam tools
-/// without per-project setup.
+/// `ccteam config` (the "register the ccteam MCP server" menu item /
+/// `config mcp`): register the ccteam MCP server in `~/.claude.json` so
+/// any new claude session can call ccteam tools without per-project setup.
 ///
 /// Strategy: read `~/.claude.json`, ensure `mcpServers.ccteam` points
 /// at the running binary's absolute path, write back atomically. The
@@ -990,8 +990,8 @@ pub fn install_mcp_into(claude_json: &std::path::Path, ccteam_bin: &std::path::P
 ///
 /// V0.2.1 F26: honors `CLAUDE_CONFIG_HOME` via
 /// [`ccteam_core::projects::resolve_claude_json_path`] so e2e harnesses
-/// get the same redirection sibling installers (`--install-skill`,
-/// `--install-memory-bridge`) already honor through `user_claude_dir()`.
+/// get the same redirection the `--install-memory-bridge` writer already
+/// honors through `user_claude_dir()`.
 pub fn install_mcp() -> Result<std::path::PathBuf> {
     let claude_json = ccteam_core::projects::resolve_claude_json_path()?;
     let bin = ccteam_core::current_ccteam_bin()?;

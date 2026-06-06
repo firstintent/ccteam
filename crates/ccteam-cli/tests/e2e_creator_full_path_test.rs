@@ -1,34 +1,25 @@
-//! V0.6.5 F148 — end-to-end wire test for `/ccteam-creator` Phase 5.6.
+//! End-to-end wire test for `mcp__ccteam__chat_register_bot`.
 //!
-//! Background — F148 fixes the deepest root cause of the nas-box005
-//! deploy fiasco: `skills/ccteam-creator/SKILL.md` Phase 5.6 used to
-//! tell the LLM to "call `ccteam_im::register_bot(...)`" — a Rust
-//! function the LLM has no way to invoke. The result: workflow.yaml
-//! landed, .claude/agents/<role>.md landed, .mcp.json landed — but
-//! `~/.ccteam/imd/registry/<slug>/<role>.json` was never written,
-//! so the daemon's `list_bots()` returned 0 → every Telegram message
-//! got dropped without ever reaching a tmux session.
+//! Background — the deepest root cause of the nas-box005 deploy fiasco
+//! was a bot-registration that never wrote
+//! `~/.ccteam/imd/registry/<slug>/<role>.json`: workflow.yaml landed,
+//! `.claude/agents/<role>.md` landed, `.mcp.json` landed — but the
+//! daemon's `list_bots()` returned 0, so every Telegram message got
+//! dropped before reaching a session. The fix made
+//! `mcp__ccteam__chat_register_bot` a real MCP tool that lands the
+//! registry file at the path `list_bots()` reads.
 //!
-//! V0.6.5 F146 made `mcp__ccteam__chat_register_bot` a real MCP tool;
-//! F148 rewrites Phase 5.6 to tell the LLM to invoke that tool. The
-//! skill body is markdown read by the LLM, not code we can execute
-//! in a test — so these tests verify two things instead:
-//!
-//! 1. **Wire contract** — driving `ccteam mcp-serve` with the exact
-//!    JSON args the rewritten Phase 5.6 documents lands the
-//!    registration file at the path `list_bots()` reads. This catches
-//!    regressions where the MCP tool's arg names / vendor casing /
-//!    path layout drifts away from what the skill instructs.
-//!
-//! 2. **Skill text guard** — `skills/ccteam-creator/SKILL.md` Phase
-//!    5.6 mentions `mcp__ccteam__chat_register_bot` (the F148 contract)
-//!    and **not** the legacy `ccteam_im::register_bot` Rust call.
-//!    This prevents a future SKILL.md edit from reverting to the
-//!    pre-F148 stub text.
+//! This wire-contract test drives `ccteam internal mcp-serve` with the
+//! exact JSON args a caller invokes and asserts the registration file
+//! lands at the right path with the right vendor casing — catching
+//! regressions where the MCP tool's arg names / vendor casing / path
+//! layout drift. (v0.8.6 Item E removed the bundled `ccteam-creator`
+//! skill that used to document this flow; the wire contract the tool
+//! upholds is independent of any skill body, so the test stays.)
 //!
 //! These tests stub the IM provider + the claude-tui adapter (neither
-//! is exercised) — the **real** end-to-end "TG message → bot reply"
-//! verification is Wave 4 host-probe on nas-box005.
+//! is exercised); the real end-to-end "TG message → bot reply"
+//! verification is a host-probe.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -215,15 +206,13 @@ chat:
 
 // ───────────────────────────── tests ─────────────────────────────
 
-/// F148 acceptance — driving the rewritten Phase 5.6 MCP call against
-/// `ccteam mcp-serve` lands the registration JSON exactly where
-/// `list_bots()` reads from, with the lowercase vendor canonical form
-/// the daemon's `BotRegistration` deserialize requires.
+/// Wire contract — driving the `mcp__ccteam__chat_register_bot` MCP call
+/// against `ccteam internal mcp-serve` lands the registration JSON
+/// exactly where `list_bots()` reads from, with the lowercase vendor
+/// canonical form the daemon's `BotRegistration` deserialize requires.
 ///
-/// This is the wire-contract proof that the SKILL.md text (which the
-/// LLM follows) is reachable end-to-end. Stubs the IM provider + the
-/// claude-tui adapter; real "TG → bot reply" verification is the
-/// Wave 4 nas-box005 host-probe.
+/// Stubs the IM provider + the claude-tui adapter; the real
+/// "TG → bot reply" verification is a host-probe.
 #[test]
 fn t_creator_phase_5_6_mcp_call_lands_registration_with_lowercase_vendor() {
     let chat_id = "987654321";
@@ -244,7 +233,7 @@ fn t_creator_phase_5_6_mcp_call_lands_registration_with_lowercase_vendor() {
         "Phase 5.1 stub credentials.json missing"
     );
 
-    // Phase 5.6 wire call — exact arg shape the SKILL.md docs.
+    // Bot-registration wire call — the exact arg shape a caller invokes.
     let mut srv = McpServer::spawn(&fx.ccteam_home, &fx.projects_root);
     let body = srv.call_tool(
         "ccteam__chat_register_bot",
@@ -320,72 +309,4 @@ fn t_creator_phase_5_6_mcp_call_lands_registration_with_lowercase_vendor() {
     );
 
     srv.shutdown();
-}
-
-/// F148 SKILL.md text guard — `Phase 5.6` must mention the MCP tool by
-/// name and must NOT still claim the LLM should call the Rust function
-/// `ccteam_im::register_bot` (the pre-F148 stub instruction).
-///
-/// This is a regression test against doc drift — the skill body is
-/// LLM-consumed, so the only way to keep the wire contract honest is
-/// to gate the text it surfaces.
-#[test]
-fn t_creator_skill_phase_5_6_documents_mcp_tool_not_rust_function() {
-    // Locate the skill from the repo root (CARGO_MANIFEST_DIR is the
-    // crate dir; the workspace root is two levels up).
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = manifest_dir
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("ccteam-cli crate must sit two levels deep in workspace");
-    let skill_path = workspace_root
-        .join("skills")
-        .join("ccteam-creator")
-        .join("SKILL.md");
-    let body = std::fs::read_to_string(&skill_path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", skill_path.display()));
-
-    // Locate the Phase 5.6 section.
-    let phase_5_6 = body
-        .split("## 5.6")
-        .nth(1)
-        .expect("SKILL.md must have a `## 5.6` Phase 5.6 section");
-    // Section ends at the next `## ` heading.
-    let phase_5_6_body = phase_5_6.split("\n## ").next().unwrap_or(phase_5_6);
-
-    // F148 contract — must instruct invoking the MCP tool.
-    assert!(
-        phase_5_6_body.contains("mcp__ccteam__chat_register_bot"),
-        "Phase 5.6 must instruct the LLM to invoke `mcp__ccteam__chat_register_bot`; got: {phase_5_6_body}",
-    );
-    // F148 contract — must NOT still tell the LLM to call the Rust fn
-    // (the pre-F148 stub instruction the LLM physically cannot follow).
-    assert!(
-        !phase_5_6_body.contains("ccteam_im::register_bot("),
-        "Phase 5.6 must not still tell the LLM to call the Rust function `ccteam_im::register_bot(...)`; that was the pre-F148 bug. Got:\n{phase_5_6_body}",
-    );
-    // F148 contract — lowercase vendor must be called out explicitly
-    // (Bug A防线 — daemon BotRegistration deserialize trips on PascalCase).
-    assert!(
-        phase_5_6_body.contains("lowercase"),
-        "Phase 5.6 must call out the lowercase vendor requirement (Bug A); got: {phase_5_6_body}",
-    );
-    // F148 contract — error handling must distinguish already_registered
-    // (idempotent OK) from other errors (stop).
-    assert!(
-        phase_5_6_body.contains("already_registered"),
-        "Phase 5.6 must document the `already_registered` idempotent-OK branch; got: {phase_5_6_body}",
-    );
-
-    // Phase 5.8 reply template must mention the registry path so the
-    // user sees the bot actually landed somewhere.
-    let phase_5_8 = body
-        .split("## 5.8")
-        .nth(1)
-        .expect("SKILL.md must have a `## 5.8` Phase 5.8 section");
-    let phase_5_8_body = phase_5_8.split("\n## ").next().unwrap_or(phase_5_8);
-    assert!(
-        phase_5_8_body.contains("imd/registry/"),
-        "Phase 5.8 reply must mention `imd/registry/<slug>/<role>.json` so the user sees the bot was registered; got: {phase_5_8_body}",
-    );
 }
