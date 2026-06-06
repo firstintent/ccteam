@@ -109,3 +109,26 @@
 **修法**:create 路径允许空 role;空 → argv **跳过** `--agent` + turns bot 名用约定占位(联动 BUG-3 的 session 身份决策);非空 → 现行 + FIX-2 校验。也跟 `session = role` keystone 有张力(roleless ≠ role,需红线说明这是显式例外)。
 
 **归属**:跨层(harness argv + gateway create + web modal);**依赖 BUG-3 的 A/B 决策**(roleless 的 turns 身份)。
+
+---
+
+## BUG-5 · `session ls` 看不到 codex 会话(误报"registered, not running")+ 不显示 vendor
+
+**状态**:OPEN（2026-06-06 用户报告,TG 2365）
+
+**症状**:cto 用 **codex** 起的,网关 API `GET /api/v1/projects/ideas/sessions` 显示 `s7 / role=cto / vendor=codex / status=live / current=true`;但 CLI `ccteam session ls` 显示 `ideas cto ccteam-chat-ideas-cto **no** registered, not running`。同项目的 architect(claude)显示 `yes`。且 `session ls` **整列没有 vendor**。
+
+**根因(file:line 实证)= `session ls` 的活性来自 process backend 名枚举,看不到 codex(app-server)会话;真 SoT 是 gateway session map**:
+- `session ls`(`crates/ccteam-cli/src/commands.rs:1660-1734`)的 `alive = live_set.contains(name)`,`live_set` 来自 `list_chat_sessions(backend)`(`commands.rs:1661`)。
+- `list_chat_sessions`(`crates/ccteam-harness/src/lib.rs:459-467`)= `backend.list_sessions()` 过滤 `CHAT_SESSION_PREFIX` —— **只枚举 process backend(tmux/rmux)里的会话**。
+- **codex 走 app-server、不是 tmux/rmux pane** → 不在 `backend.list_sessions()` → `alive=false`;它又在 gateway state 里 tracked → NOTE 落到 `"registered, not running"`(`commands.rs:1703-1704`)= **误报**(claude/tmux 会话因为有 pane 故 `yes`,所以只 codex 中招)。
+- 真活性 + vendor + sid 的 SoT = **gateway 内存 session map**(API `GET /projects/{slug}/sessions` 用的就是它,见 `sessions_api.rs` `session_views`)。`session ls` **没查它**。
+- 另:`session ls` 的 `Row`(`commands.rs:1688-1694`)无 `vendor` 字段 → 表头(`:1722-1724` SLUG/ROLE/SESSION/ALIVE/NOTE)无 vendor 列。
+
+**影响**:codex 起的会话在 CLI 一律误报"未运行";跨 vendor 运维判断错;无 vendor 列分不清会话用 claude 还是 codex。
+
+**修法**:`session ls` 的活性 + vendor(+ sid)改从 **gateway session map** 取(像 API:经 daemon 查 / 复用 `session_views`),backend 名枚举只留作标 `orphan`(untracked live pane);加 **vendor 列**。**与 F3(status 加 vendor)同源、与 F1(gateway = session SoT)一致** —— 建议两处共用一个"列 session(含 vendor/status/sid)"的取数。
+
+**验收**:codex 起的 cto 在 `session ls` 显示 `alive=yes` + `vendor=codex`;claude 会话不变;orphan 仍能标;`status` 同样每会话带 vendor。
+
+**归属**:CLI(`session ls`)+ 跟 F3 `status` vendor 同批;依赖 gateway session 查询(`session_views`/API 已有)。属 prd.md **B4**。

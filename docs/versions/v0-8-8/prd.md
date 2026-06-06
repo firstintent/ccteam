@@ -22,6 +22,7 @@ v0.8.7 的 per-session web UI 把"会话"做成了 **UI 壳独立、但数据按
 | **B1** | `project stop` 跟 backend 走 | bug | 现 tmux-only,默认 rmux 停不掉 | BUG-1 |
 | **B2** | web「新建项目」入口恢复 | bug | v0.8.7 W4 回归删掉了 | BUG-2 |
 | **B3** | 新建弹窗 role 改下拉真实 role | bug/UX | 现手输 + 静态建议,不知有哪些 role | BUG-4 |
+| **B4** | `session ls`/`status` 显示 vendor + 修 codex 活性误报 | bug/UX | session ls 按 backend 名枚举、看不到 codex(误报 not running)、且无 vendor 列 | BUG-5 |
 
 > BUG-3(per-session 串台)**不单列修项** —— 它是 `session = role` 的症状,由 **F1 根治**。
 > 后续 user 追加的需求 append 到本表 + 新小节。
@@ -64,13 +65,16 @@ v0.8.7 的 per-session web UI 把"会话"做成了 **UI 壳独立、但数据按
 3. **"两行"** —— web 访问信息两行:
    - `web token: <hex>`(裸 hex,不带 `ccteam:` 前缀)
    - `web url: http://<局域网ip>:7331/?token=ccteam:<hex>`(URL 里带 `ccteam:` 前缀;**ip 取局域网 ip**,不是 localhost/0.0.0.0)
+4. **每个会话行显示 vendor**(claude / codex)—— `status` + `session ls` 都加(TG 2365)。
+
+> ✅ **TG 2366 确认**:① "两行" 严格按 user 实例(`web token:` 一行 + `web url:` 一行);② `status` **同时显示所有 projects 和它们的 sessions**(嵌套)。
 ### 4.2 现状参考(改之前长这样)
 `ccteam status` 现含:daemon health 行 + projects(每项目 age/last-event/STUCK|OK + STUCK 时附 peek/attach 提示)+ recent events(last 5)+ `web token:` 一行(带 `ccteam:` 前缀)。**没有 web url 行**(需新增 + LAN ip 探测)。
-### 4.3 开放问题(待 user 确认)
-1. **"两行"指什么**:我理解 = web token / web url **各一行、共两行**(下方 user 示例就是这俩);若"两行"另有所指(如整体压到两行 / 每项目两行)请确认。
-2. **项目 + 会话的展示密度**:每项目一行、会话缩进列?会话显示什么(session id / role / status / last-event)?(联动 F1 的"会话"新定义。)
-3. **STUCK/OK 留不留**:删了 recent events 后,项目级健康(STUCK/OK)是否保留?(注:FIX-3 后 STUCK 已改从 progress.jsonl 末事件取,demo2 silent 1h = 真停顿、非误报。)
-4. **LAN ip 探测**:多网卡/容器时取哪个?(默认私网网段第一个?可配?)
+### 4.3 开放问题
+1. ~~"两行"指什么~~ **✅ 已定(2366)**:严格按 user 实例 = `web token:` 一行 + `web url:` 一行。
+2. ~~项目 + 会话展示~~ **✅ 已定(2366)**:`status` 同时显示所有 projects + 各自 sessions(嵌套)。**剩**:会话行除 **vendor(确定要)** 外还显示哪些(role / status / sid / last-event)?默认建议 `role + vendor + status + sid`,待 user 确认。
+3. **(待 user)STUCK/OK 留不留**:删了 recent events 后,项目级健康(STUCK/OK)是否保留?(注:FIX-3 后 STUCK 已改从 progress.jsonl 末事件取,demo2 silent 1h = 真停顿、非误报。)
+4. **(待 user)LAN ip 探测**:多网卡/容器时取哪个?(默认私网网段第一个?可配?)
 ### 4.4 归属
 CLI 输出层重写(`commands.rs` status handler + `queries.rs` 取数);LAN ip 探测 + web url 拼接是新增;会话列举依赖 F1 的 session 模型(若 F1 未落,先按现 gateway session 列)。
 
@@ -88,3 +92,4 @@ CLI 输出层重写(`commands.rs` status handler + `queries.rs` 取数);LAN ip �
 ## 七、变更记录
 - **2026-06-06 初版**:F1 独立 session(Direction A)+ F2 roleless + B1/B2/B3;BUG-3 归 F1 根治。
 - **2026-06-06 +F3**:`ccteam status` 重写(TG 2363:列项目+会话 / 删最近事件 / web token+url 两行 LAN ip)。
+- **2026-06-06 +B4 / F3 细化**:B4 = `session ls`/`status` 显示 vendor + 修 codex 活性误报(BUG-5,TG 2365);F3 开放问题 ①② 经 TG 2366 确认(两行按 user 实例 / status 同显 projects+sessions);每会话行加 vendor。
