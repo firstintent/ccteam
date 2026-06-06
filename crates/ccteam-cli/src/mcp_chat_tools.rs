@@ -70,7 +70,7 @@ pub fn chat_tool_definitions() -> Vec<Value> {
                     },
                     "im_platform": {
                         "type": "string",
-                        "enum": ["telegram", "slack", "discord", "mock"],
+                        "enum": ["telegram", "slack", "discord", "lark", "mock"],
                         "description": "IM platform binding."
                     },
                     "im_chat_id": { "type": "string", "description": "Platform-specific chat id (string)." },
@@ -646,9 +646,9 @@ pub(crate) fn validate_slug(s: &str, field: &str) -> Result<()> {
 
 fn validate_im_platform(p: &str) -> Result<()> {
     match p {
-        "telegram" | "slack" | "discord" | "mock" => Ok(()),
+        "telegram" | "slack" | "discord" | "lark" | "mock" => Ok(()),
         other => Err(anyhow!(
-            "invalid im_platform `{other}`: expected one of `telegram`, `slack`, `discord`, `mock`"
+            "invalid im_platform `{other}`: expected one of `telegram`, `slack`, `discord`, `lark`, `mock`"
         )),
     }
 }
@@ -694,6 +694,47 @@ mod tests {
                 n.starts_with("ccteam__chat_"),
                 "chat tool name must start with ccteam__chat_: {n}"
             );
+        }
+    }
+
+    #[test]
+    fn validate_im_platform_accepts_lark_and_known_platforms() {
+        // Lark/Feishu is a first-class platform alongside the originals.
+        for p in ["telegram", "slack", "discord", "lark", "mock"] {
+            assert!(
+                validate_im_platform(p).is_ok(),
+                "`{p}` must be an accepted im_platform"
+            );
+        }
+        // Unknown platforms still fail, and the error names the closed set
+        // (now including `lark`).
+        let err = validate_im_platform("matrix").unwrap_err().to_string();
+        assert!(
+            err.contains("matrix") && err.contains("lark"),
+            "rejection must name the bad value + list `lark`; got: {err}"
+        );
+    }
+
+    #[test]
+    fn register_bot_schema_enum_lists_lark() {
+        // The MCP register_bot tool's `im_platform` enum must advertise
+        // `lark` so callers/clients see it as a legal binding.
+        let tools = chat_tool_definitions();
+        let reg = tools
+            .iter()
+            .find(|t| t["name"] == "ccteam__chat_register_bot")
+            .expect("register_bot tool must exist");
+        let variants = reg["inputSchema"]["properties"]["im_platform"]["enum"]
+            .as_array()
+            .expect("im_platform enum must be an array");
+        let values: Vec<&str> = variants.iter().filter_map(|v| v.as_str()).collect();
+        assert!(
+            values.contains(&"lark"),
+            "register_bot im_platform enum must include `lark`; got: {values:?}"
+        );
+        // Sanity — the originals are still present (no accidental clobber).
+        for p in ["telegram", "slack", "discord", "mock"] {
+            assert!(values.contains(&p), "enum must still include `{p}`");
         }
     }
 

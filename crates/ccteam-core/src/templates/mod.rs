@@ -643,4 +643,35 @@ mod tests {
         assert_eq!(map["pr-review-toolkit@claude-plugins-official"], true);
         assert_eq!(map["feature-dev@claude-plugins-official"], true);
     }
+
+    /// v0.8.7 W1 DA.3 layer 1 — the seeded `cto` role MUST grant the
+    /// `mcp__ccteam__session_*` handles in its frontmatter `tools:` line
+    /// (Claude Code's per-agent allow-list). Work-role templates do NOT, so
+    /// only the cto can drive the scheduling tools (the daemon hard-gate is
+    /// the second layer). If this drifts, the cto loses its scheduling tools.
+    #[test]
+    fn cto_role_template_grants_session_scheduling_tools() {
+        // Frontmatter is the block between the first two `---` fences.
+        let after = CTO_ROLE_MD
+            .strip_prefix("---")
+            .expect("cto_role.md starts with frontmatter fence");
+        let end = after.find("---").expect("frontmatter closing fence");
+        let frontmatter = &after[..end];
+        let tools_line = frontmatter
+            .lines()
+            .find(|l| l.trim_start().starts_with("tools:"))
+            .expect("cto_role.md frontmatter must carry a `tools:` line");
+        for handle in [
+            "mcp__ccteam__session_spawn",
+            "mcp__ccteam__session_dispatch",
+            "mcp__ccteam__session_collect",
+            "mcp__ccteam__session_list",
+            "mcp__ccteam__session_stop",
+        ] {
+            assert!(
+                tools_line.contains(handle),
+                "cto `tools:` must grant `{handle}`, got: {tools_line}"
+            );
+        }
+    }
 }

@@ -36,6 +36,36 @@ echo "STDIN-END" >> "$CCTEAM_STUB_LOG"
 exit 0
 "#;
 
+/// Spawn a freshly-written executable, retrying the handful of kernel
+/// races that show up only under heavy parallel test load. When many
+/// test threads write + exec scripts at once we intermittently see
+/// `ETXTBSY` (os error 26, "text file busy" — the file is still open
+/// for write somewhere) or `EAGAIN` (os error 11, transient fork/exec
+/// resource pressure). Both are retryable: a tiny sleep lets the writer
+/// `close(2)` land or the resource free up. This is test-harness
+/// hardening only — it does NOT change what the test asserts, only how
+/// resilient the `spawn()` itself is to the parallel-load flake that
+/// has truncated the gate before. Any other error fails immediately.
+fn spawn_with_retry(cmd: &mut Command) -> std::process::Child {
+    use std::io::ErrorKind;
+    for attempt in 0..10 {
+        match cmd.spawn() {
+            Ok(child) => return child,
+            Err(e) => {
+                let raw = e.raw_os_error();
+                let retryable =
+                    e.kind() == ErrorKind::WouldBlock || matches!(raw, Some(26) | Some(11)); // ETXTBSY | EAGAIN
+                if retryable && attempt < 9 {
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+                panic!("spawn hook.sh failed (attempt {attempt}): {e}");
+            }
+        }
+    }
+    unreachable!("spawn_with_retry exhausted loop without returning")
+}
+
 fn write_stub_ccteam(dir: &std::path::Path) -> std::path::PathBuf {
     std::fs::create_dir_all(dir).unwrap();
     let path = dir.join("ccteam");
@@ -67,8 +97,8 @@ fn hook_sh_falls_back_to_ccteam_internal_hook_when_no_token() {
 
     // No token file ⇒ script must take the "no token" branch and exec
     // `ccteam internal hook ...` directly.
-    let mut child = Command::new(&hook_sh)
-        .arg("progress-append")
+    let mut cmd = Command::new(&hook_sh);
+    cmd.arg("progress-append")
         .arg("Stop")
         .env("HOME", tmp.path())
         .env("CCTEAM_HOME", tmp.path().join(".ccteam"))
@@ -81,9 +111,8 @@ fn hook_sh_falls_back_to_ccteam_internal_hook_when_no_token() {
         .env("PATH", format!("{}:/usr/bin:/bin", stub_dir.display()))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn hook.sh");
+        .stderr(Stdio::piped());
+    let mut child = spawn_with_retry(&mut cmd);
     child
         .stdin
         .as_mut()
@@ -115,8 +144,8 @@ fn hook_sh_with_action_routes_kind_and_action_to_cli() {
     let log = tmp.path().join("stub.log");
     let hook_sh = write_hook_sh(&tmp.path().join(".ccteam/hooks"));
 
-    let mut child = Command::new(&hook_sh)
-        .arg("chat-progress")
+    let mut cmd = Command::new(&hook_sh);
+    cmd.arg("chat-progress")
         .arg("user-prompt")
         .env("HOME", tmp.path())
         .env("CCTEAM_HOME", tmp.path().join(".ccteam"))
@@ -128,9 +157,8 @@ fn hook_sh_with_action_routes_kind_and_action_to_cli() {
         .env("PATH", format!("{}:/usr/bin:/bin", stub_dir.display()))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::piped());
+    let mut child = spawn_with_retry(&mut cmd);
     child
         .stdin
         .as_mut()
@@ -210,8 +238,8 @@ fn hook_sh_forwards_chat_role_and_slug_headers_on_http_path() {
         tx.send(captured).expect("send captured bytes");
     });
 
-    let mut child = Command::new(&hook_sh)
-        .arg("chat-progress")
+    let mut cmd = Command::new(&hook_sh);
+    cmd.arg("chat-progress")
         .arg("session-start")
         .env("HOME", tmp.path())
         .env("CCTEAM_HOME", &ccteam_home)
@@ -225,9 +253,8 @@ fn hook_sh_forwards_chat_role_and_slug_headers_on_http_path() {
         .env("PATH", "/usr/bin:/bin")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn hook.sh");
+        .stderr(Stdio::piped());
+    let mut child = spawn_with_retry(&mut cmd);
     child
         .stdin
         .as_mut()

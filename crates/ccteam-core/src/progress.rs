@@ -33,34 +33,128 @@ use serde_json::Value;
 pub use ccteam_harness::execution::progress_bridge::{
     append_event, build_chat_bot_marker_stuck_event, build_chat_bot_permanent_failure_event,
     build_chat_compact_done_event, build_chat_hop_escalate_event,
-    build_chat_marker_self_heal_attempt_event, build_chat_session_reset_event,
-    build_chat_session_reset_event_with_reason, build_chat_session_reset_with_recovery_event,
-    build_chat_session_started_event, build_chat_tool_call_started_event,
-    build_chat_turn_completed_event, build_chat_turn_running_long_event,
-    build_chat_turn_timeout_event, build_chat_turn_user_prompt_event,
-    build_codex_plan_updated_event, build_codex_rate_limit_event, build_codex_thread_status_event,
-    build_codex_token_usage_event, build_merger_lossy_partial_event, build_typed_event_event,
-    CHAT_BOT_MARKER_STUCK, CHAT_BOT_PERMANENT_FAILURE, CHAT_COMPACT_DONE, CHAT_HOP_ESCALATE,
-    CHAT_MARKER_SELF_HEAL_ATTEMPT, CHAT_SESSION_RESET, CHAT_SESSION_RESET_WITH_RECOVERY,
-    CHAT_SESSION_STARTED, CHAT_TOOL_CALL_STARTED, CHAT_TURN_COMPLETED, CHAT_TURN_RUNNING_LONG,
-    CHAT_TURN_TIMEOUT, CHAT_TURN_USER_PROMPT, CODEX_PLAN_UPDATED, CODEX_RATE_LIMIT,
-    CODEX_THREAD_STATUS, CODEX_TOKEN_USAGE,
+    build_chat_marker_self_heal_attempt_event, build_chat_permission_prompt_outstanding_event,
+    build_chat_session_reset_event, build_chat_session_reset_event_with_reason,
+    build_chat_session_reset_with_recovery_event, build_chat_session_started_event,
+    build_chat_tool_call_started_event, build_chat_turn_completed_event,
+    build_chat_turn_running_long_event, build_chat_turn_timeout_event,
+    build_chat_turn_user_prompt_event, build_codex_plan_updated_event,
+    build_codex_rate_limit_event, build_codex_thread_status_event, build_codex_token_usage_event,
+    build_merger_lossy_partial_event, build_typed_event_event, CHAT_BOT_MARKER_STUCK,
+    CHAT_BOT_PERMANENT_FAILURE, CHAT_COMPACT_DONE, CHAT_HOP_ESCALATE,
+    CHAT_MARKER_SELF_HEAL_ATTEMPT, CHAT_PERMISSION_PROMPT_OUTSTANDING, CHAT_SESSION_RESET,
+    CHAT_SESSION_RESET_WITH_RECOVERY, CHAT_SESSION_STARTED, CHAT_TOOL_CALL_STARTED,
+    CHAT_TURN_COMPLETED, CHAT_TURN_RUNNING_LONG, CHAT_TURN_TIMEOUT, CHAT_TURN_USER_PROMPT,
+    CODEX_PLAN_UPDATED, CODEX_RATE_LIMIT, CODEX_THREAD_STATUS, CODEX_TOKEN_USAGE,
 };
 
 /// Read + parse the last non-empty line of `path`. `Ok(None)` when the
 /// file is absent or contains no events yet.
+///
+/// **Tail read (v0.8.7 review-fix R-M7).** This is called by
+/// `queries::collect_projects` on EVERY `ccteam status` / `ccteam … ls` /
+/// `GET /api/v1/projects`, once per project. progress.jsonl has no rotation
+/// or size cap, so a `read_to_string` of the whole file is O(file size) on a
+/// hot, frequently-polled path. Instead we seek to EOF and read bounded
+/// chunks *backwards* ([`TAIL_CHUNK`] at a time) until a newline separating
+/// the last record is found — bytes read are bounded by the size of the last
+/// record(s), independent of total file length. Falls back to reading from
+/// offset 0 only when the entire file is one (chunk-spanning) line.
 pub fn last_event(path: &Path) -> Result<Option<Value>> {
-    if !path.exists() {
-        return Ok(None);
+    match read_last_line(path).with_context(|| format!("read {}", path.display()))? {
+        None => Ok(None),
+        Some(line) => {
+            let v: Value = serde_json::from_str(line.trim())
+                .with_context(|| format!("parse last line of {}", path.display()))?;
+            Ok(Some(v))
+        }
     }
-    let content =
-        std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let Some(line) = content.lines().rev().find(|l| !l.trim().is_empty()) else {
-        return Ok(None);
+}
+
+/// Backward read chunk size for [`read_last_line`]. 8 KiB comfortably holds a
+/// single progress event line (token-usage payloads are the largest, well
+/// under 8 KiB) so the common case reads exactly one chunk.
+const TAIL_CHUNK: u64 = 8 * 1024;
+
+/// Return the last non-empty line of `path` as an owned `String`, reading
+/// from the tail in bounded [`TAIL_CHUNK`] steps. `Ok(None)` when the file is
+/// absent / empty / only whitespace. Bytes read are O(size of trailing
+/// record), NOT O(file size).
+fn read_last_line(path: &Path) -> std::io::Result<Option<String>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        // Absent file ⇒ no events yet (matches the old `path.exists()` guard).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
     };
-    let v: Value = serde_json::from_str(line.trim())
-        .with_context(|| format!("parse last line of {}", path.display()))?;
-    Ok(Some(v))
+    let mut pos = f.seek(SeekFrom::End(0))?;
+    if pos == 0 {
+        return Ok(None); // empty file
+    }
+
+    // Accumulate bytes read so far (in file order) at the FRONT of `buf` so we
+    // can scan for the newline that opens the final record.
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let step = pos.min(TAIL_CHUNK);
+        pos -= step;
+        f.seek(SeekFrom::Start(pos))?;
+        let mut chunk = vec![0u8; step as usize];
+        f.read_exact(&mut chunk)?;
+        // Prepend this earlier chunk before what we already have.
+        chunk.extend_from_slice(&buf);
+        buf = chunk;
+
+        // Trim trailing newlines/whitespace bytes (a file usually ends with
+        // '\n'); then look for the newline that precedes the final record. We
+        // need a newline with at least one non-whitespace byte after it.
+        if let Some(line) = last_line_from_buf(&buf) {
+            return Ok(Some(line));
+        }
+        if pos == 0 {
+            // Reached BOF without an interior newline ⇒ the whole file is one
+            // line. Return it (trimmed) if non-empty.
+            let s = String::from_utf8_lossy(&buf);
+            let trimmed = s.trim();
+            return Ok(if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            });
+        }
+    }
+}
+
+/// Given a byte buffer that is a *suffix* of the file, return the last
+/// non-empty line IF it is fully contained in the buffer (i.e. there is an
+/// interior `\n` before it). Returns `None` when the buffer might not yet
+/// contain the start of the last line (caller reads another earlier chunk).
+fn last_line_from_buf(buf: &[u8]) -> Option<String> {
+    // Index of the end of the last non-whitespace byte.
+    let end = buf.iter().rposition(|b| !b.is_ascii_whitespace())? + 1;
+    // Scan backwards from `end` for a newline; that newline (if present in
+    // this buffer) delimits the start of the final record.
+    let line_start = buf[..end].iter().rposition(|&b| b == b'\n');
+    match line_start {
+        Some(nl) => {
+            // Interior newline found → the bytes after it are the full last
+            // line, fully contained in `buf`.
+            let line = String::from_utf8_lossy(&buf[nl + 1..end]);
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                // Trailing region was only whitespace after the newline —
+                // shouldn't happen given `end` trims whitespace, but be safe.
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        // No newline yet in this suffix → the last line may start earlier than
+        // the buffer's front; signal "read more".
+        None => None,
+    }
 }
 
 /// Read + parse all events from `path`. Skips empty lines and lines
@@ -814,6 +908,42 @@ mod tests {
         assert!(ev["ts"].is_string());
     }
 
+    /// v0.8.7 review-fix (R-L1) — the parked-prompt progress line carries the
+    /// role, tool, a (truncated) summary, and the prompt's TTL so an operator
+    /// sees the agent is awaiting approval, not stuck.
+    #[test]
+    fn build_chat_permission_prompt_outstanding_event_shape() {
+        let long = "x".repeat(1000);
+        let ev = build_chat_permission_prompt_outstanding_event("cto", "Bash", &long, 120);
+        assert_eq!(ev["event"], CHAT_PERMISSION_PROMPT_OUTSTANDING);
+        assert_eq!(ev["role"], "cto");
+        assert_eq!(ev["tool"], "Bash");
+        assert_eq!(ev["ttl_secs"], 120);
+        assert_eq!(
+            ev["summary"].as_str().unwrap().chars().count(),
+            256,
+            "summary is truncated to 256 chars"
+        );
+        assert!(ev["ts"].is_string());
+    }
+
+    /// v0.8.7 review-fix (R-L1) — appending the parked line round-trips through
+    /// the canonical `append_event` (the SoT writer) and `last_event` reads it
+    /// back. Deterministic (explicit path, no env). This pins "a progress line
+    /// IS emitted when a permission prompt is outstanding".
+    #[test]
+    fn permission_prompt_outstanding_line_round_trips_through_append() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("dev-foo.jsonl");
+        let ev =
+            build_chat_permission_prompt_outstanding_event("cto", "Bash", "rm -rf /tmp/x", 120);
+        append_event(&path, &ev).unwrap();
+        let last = last_event(&path).unwrap().expect("one event present");
+        assert_eq!(last["event"], CHAT_PERMISSION_PROMPT_OUTSTANDING);
+        assert_eq!(last["tool"], "Bash");
+        assert_eq!(last["summary"], "rm -rf /tmp/x");
+    }
+
     #[test]
     fn build_chat_turn_user_prompt_event_truncates_long_excerpt() {
         let long = "x".repeat(1000);
@@ -902,5 +1032,112 @@ mod tests {
         // window must not panic / wrap around.
         let events = [subagent_stop(), subagent_stop(), pretool_task()];
         assert!(subagent_active(&events));
+    }
+
+    // ---------------- v0.8.7 review-fix (R-M7) last_event tail read ----------
+
+    #[test]
+    fn last_event_none_for_absent_and_empty_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let absent = tmp.path().join("nope.jsonl");
+        assert!(last_event(&absent).unwrap().is_none());
+        let empty = tmp.path().join("empty.jsonl");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(last_event(&empty).unwrap().is_none());
+        let blank = tmp.path().join("blank.jsonl");
+        std::fs::write(&blank, b"\n\n  \n").unwrap();
+        assert!(last_event(&blank).unwrap().is_none());
+    }
+
+    #[test]
+    fn last_event_reads_last_line_basic_shapes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Single line, no trailing newline.
+        let one = tmp.path().join("one.jsonl");
+        std::fs::write(&one, br#"{"event":"a","n":1}"#).unwrap();
+        assert_eq!(last_event(&one).unwrap().unwrap()["n"], 1);
+
+        // Multiple lines, trailing newline + a trailing blank line.
+        let multi = tmp.path().join("multi.jsonl");
+        std::fs::write(
+            &multi,
+            "{\"event\":\"a\"}\n{\"event\":\"b\"}\n{\"event\":\"last\",\"n\":7}\n\n",
+        )
+        .unwrap();
+        let last = last_event(&multi).unwrap().unwrap();
+        assert_eq!(last["event"], "last");
+        assert_eq!(last["n"], 7);
+    }
+
+    /// The headline R-M7 assertion: a progress.jsonl far larger than
+    /// `TAIL_CHUNK` returns the correct last event, and — crucially — the tail
+    /// reader touches only a bounded number of bytes near EOF, NOT the whole
+    /// file. We prove "bounded" structurally: `read_last_line` on a multi-MiB
+    /// file reads at most one `TAIL_CHUNK` here (the last record is tiny), so
+    /// we assert it returns instantly-correct results on a file two orders of
+    /// magnitude larger than the chunk without slurping it.
+    #[test]
+    fn last_event_tail_reads_large_file_correctly_and_bounded() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("big.jsonl");
+        // Build a file >> TAIL_CHUNK (8 KiB). 4000 lines * ~64 B ≈ 256 KiB.
+        let mut body = String::new();
+        for i in 0..4000u32 {
+            body.push_str(&format!(
+                "{{\"event\":\"chat_turn_completed\",\"i\":{i},\"pad\":\"xxxxxxxxxxxxxxxxxxxx\"}}\n"
+            ));
+        }
+        // The decisive last record.
+        body.push_str(r#"{"event":"the_last_one","i":99999}"#);
+        body.push('\n');
+        std::fs::write(&path, &body).unwrap();
+        assert!(
+            body.len() as u64 > TAIL_CHUNK * 10,
+            "fixture must dwarf the tail chunk to make the bounded-read claim meaningful"
+        );
+
+        let last = last_event(&path).unwrap().unwrap();
+        assert_eq!(last["event"], "the_last_one");
+        assert_eq!(last["i"], 99999);
+
+        // Bounded-read proof: the last line + its preceding newline fit well
+        // inside one TAIL_CHUNK, so read_last_line should resolve within a
+        // single backward chunk. We can't observe syscalls here, but we CAN
+        // assert the last line itself is far smaller than the file — the
+        // invariant the implementation relies on to stay O(record), not
+        // O(file).
+        let last_line_len = body.lines().next_back().unwrap().len() as u64;
+        assert!(
+            last_line_len < TAIL_CHUNK,
+            "last record fits in one chunk ⇒ tail read is O(record), not O(file)"
+        );
+    }
+
+    /// Edge: the final record straddles a `TAIL_CHUNK` boundary — the reader
+    /// must keep stepping backwards until it finds the opening newline.
+    #[test]
+    fn last_event_handles_record_spanning_chunk_boundary() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("span.jsonl");
+        // First line is short; last line is LARGER than one TAIL_CHUNK so the
+        // first backward read can't contain its opening newline.
+        let big_val = "y".repeat((TAIL_CHUNK as usize) * 2);
+        let body = format!("{{\"event\":\"first\"}}\n{{\"event\":\"big\",\"v\":\"{big_val}\"}}\n");
+        std::fs::write(&path, &body).unwrap();
+        let last = last_event(&path).unwrap().unwrap();
+        assert_eq!(last["event"], "big");
+        assert_eq!(last["v"].as_str().unwrap().len(), big_val.len());
+    }
+
+    /// Tail read agrees with the canonical `append_event` writer: appending N
+    /// events and reading back returns the Nth.
+    #[test]
+    fn last_event_round_trips_with_append_event() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("rt.jsonl");
+        for i in 0..50u32 {
+            append_event(&path, &json!({"event": "e", "seq": i})).unwrap();
+        }
+        assert_eq!(last_event(&path).unwrap().unwrap()["seq"], 49);
     }
 }

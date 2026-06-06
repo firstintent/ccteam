@@ -22,8 +22,9 @@
 //! `WorkflowSummary` in `api_v1::ProjectSummary` / consumed by F68).
 
 use serde::Serialize;
+use utoipa::ToSchema;
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct DashboardRow {
     pub slug: String,
     pub team: String,
@@ -34,7 +35,7 @@ pub struct DashboardRow {
     pub cost_label: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct HarnessSnapshotView {
     pub model: String,
     pub context_used_pct: String,
@@ -43,7 +44,7 @@ pub struct HarnessSnapshotView {
     pub captured_at: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct EventRow {
     pub ts: String,
     pub event: String,
@@ -59,7 +60,7 @@ pub struct EventRow {
     pub file_path: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct OutboxRow {
     pub filename: String,
     pub kind: String,

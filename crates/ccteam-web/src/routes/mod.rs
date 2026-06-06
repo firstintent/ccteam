@@ -25,6 +25,10 @@ pub mod health;
 // V0.6.1 F139 — `POST /internal/hook/:kind[/:action]` daemon-side hook
 // dispatcher (replaces per-hook `ccteam internal hook ...` cold spawn).
 pub mod internal_hook;
+// v0.8.7 W5 (Item E) — OpenAPI auto-docs. Aggregates every `/api/v1`
+// handler into one `OpenApiRouter` (single source with the route table)
+// + serves the spec (`/api/v1/openapi.json`) and Scalar UI (`/api/docs`).
+pub mod openapi;
 pub mod pane_snapshot;
 pub mod project;
 // v0.8.6 W5b ResDisk — resource API: project lifecycle (POST/DELETE) +
@@ -59,23 +63,17 @@ pub fn stateful_router() -> Router<AppState> {
         .merge(screenshot::router())
         .merge(actions::router())
         .merge(internal_hook::router())
-        .merge(api_v1::router())
-        // v0.8.6 W5b ResDisk — resource API. `projects` adds POST/DELETE
-        // on the same `/api/v1/projects[/{slug}]` paths api_v1 serves GET
-        // on (axum merges distinct methods); `roles` + `capabilities` are
-        // new paths.
-        .merge(projects::router())
-        .merge(roles::router())
-        .merge(capabilities::router())
-        // v0.8.6 W5b ResSessions — session lifecycle over the gateway spine
-        // (`/api/v1/projects/{slug}/sessions` + `/api/v1/sessions/{sid}/*`).
-        // New paths; 503 when no gateway is attached.
-        .merge(sessions_api::router())
+        // v0.8.7 W5 (Item E) — the ENTIRE `/api/v1` resource surface
+        // (capabilities · projects GET/POST/DELETE · roles GET/PUT ·
+        // sessions GET/POST + {sid}/{turn,events,stop} · workflow panels ·
+        // teams + SSE) is now aggregated by `openapi::api_v1_router()` into
+        // one `OpenApiRouter` so the spec is generated from the same route
+        // registrations (single source, anti-drift). It also mounts the
+        // spec at `/api/v1/openapi.json` and the Scalar UI at `/api/docs`,
+        // both inside this auth-gated stateful router.
+        .merge(openapi::api_v1_router())
         .merge(chat_ws::router())
         .merge(pty_ws::router())
-        // V0.5.0 F96 — Agent Teams surface.
-        .merge(teams_api::router())
-        .merge(teams_sse::router())
 }
 
 /// Stateless routers (currently just `/health`). M5.3 keeps `/health`

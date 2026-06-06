@@ -26,6 +26,11 @@ pub const CHAT_MARKER_SELF_HEAL_ATTEMPT: &str = "chat_marker_self_heal_attempt";
 pub const CHAT_BOT_MARKER_STUCK: &str = "chat_bot_marker_stuck";
 pub const CHAT_TURN_RUNNING_LONG: &str = "chat_turn_running_long";
 pub const CHAT_TURN_TIMEOUT: &str = "chat_turn_timeout";
+/// v0.8.7 review-fix (R-L1) — a HITL session is PARKED awaiting a human
+/// approve/deny on a non-allowlist tool call. Emitted when the permission
+/// prompt is outstanding so an operator (status / dashboard / `progress`)
+/// sees the agent is blocked, not stuck.
+pub const CHAT_PERMISSION_PROMPT_OUTSTANDING: &str = "chat_permission_prompt_outstanding";
 pub const CODEX_PLAN_UPDATED: &str = "codex_plan_updated";
 pub const CODEX_TOKEN_USAGE: &str = "codex_token_usage";
 pub const CODEX_THREAD_STATUS: &str = "codex_thread_status";
@@ -59,6 +64,28 @@ pub fn build_chat_tool_call_started_event(role: &str, tool: &str) -> Value {
         "event": CHAT_TOOL_CALL_STARTED,
         "role": role,
         "tool": tool,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
+/// v0.8.7 review-fix (R-L1) — a HITL permission prompt is OUTSTANDING: the
+/// session is parked awaiting a human approve/deny for `tool` (`summary` is
+/// the one-line tool-call preview). Lets an operator see a parked agent
+/// instead of mistaking the silence for a stuck/dead session. `ttl_secs` is
+/// the prompt's deadline (deny on lapse — fail-safe).
+pub fn build_chat_permission_prompt_outstanding_event(
+    role: &str,
+    tool: &str,
+    summary: &str,
+    ttl_secs: u64,
+) -> Value {
+    let trimmed: String = summary.chars().take(256).collect();
+    json!({
+        "event": CHAT_PERMISSION_PROMPT_OUTSTANDING,
+        "role": role,
+        "tool": tool,
+        "summary": trimmed,
+        "ttl_secs": ttl_secs,
         "ts": Utc::now().to_rfc3339(),
     })
 }

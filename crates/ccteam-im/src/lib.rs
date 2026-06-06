@@ -43,6 +43,11 @@ pub mod outbound_format;
 pub mod pending;
 pub mod progress;
 pub mod rate_limit;
+// v0.8.7 W3 DC.2 — network import of an agency-agents role into a project's
+// `.claude/agents/`. The offline catalog (browse/search) lives in
+// `ccteam-core`; the HTTP fetch lives here (next to `onboarding`) so the
+// primitives leaf stays free of an async HTTP dependency.
+pub mod role_import;
 pub mod router;
 pub mod sanitize;
 pub mod supervisor;

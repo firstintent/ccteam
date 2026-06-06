@@ -24,8 +24,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::get,
-    Json, Router,
+    Json,
 };
 use ccteam_core::{
     cost_history_buckets, cost_summary, ActiveSessionInfo, ArtifactQueueEntry, CostHistoryBucket,
@@ -33,6 +32,7 @@ use ccteam_core::{
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use crate::queries::{
     events_to_rows, outbox_rows, recent_event_summary, slug_recent_events, DEFAULT_OUTBOX_LIMIT,
@@ -41,43 +41,6 @@ use crate::queries::{
 use crate::state::AppState;
 use crate::status::status_badge;
 use crate::views::{DashboardRow, EventRow, HarnessSnapshotView, OutboxRow};
-
-pub fn router() -> Router<AppState> {
-    Router::new()
-        .route("/api/v1/projects", get(handle_projects))
-        .route("/api/v1/projects/{slug}", get(handle_project))
-        .route(
-            "/api/v1/projects/{slug}/sessions/{sid}",
-            get(handle_session),
-        )
-        .route("/api/v1/auth/token", get(handle_auth_token))
-        // V0.4.6 F90 — WorkflowView panel endpoints.
-        .route(
-            "/api/v1/projects/{slug}/artifact_queue",
-            get(handle_artifact_queue),
-        )
-        .route(
-            "/api/v1/projects/{slug}/artifact_status",
-            get(handle_artifact_status),
-        )
-        .route(
-            "/api/v1/projects/{slug}/cost_history",
-            get(handle_cost_history),
-        )
-        .route(
-            "/api/v1/projects/{slug}/sessions/active",
-            get(handle_active_sessions),
-        )
-        .route(
-            "/api/v1/projects/{slug}/jobs/{job_id}/log",
-            get(handle_job_log),
-        )
-        // V0.5.1 F103a — aggregate active sessions across every project.
-        .route(
-            "/api/v1/sessions/active",
-            get(handle_active_sessions_aggregate),
-        )
-}
 
 /// JSON returned by `GET /api/v1/projects/{slug}`.
 ///
@@ -148,12 +111,22 @@ pub struct SessionDetail {
 /// when the server runs with auth disabled (loopback default /
 /// `--no-auth`). The SPA uses this to decide whether the token-entry
 /// flow is required before fetching protected resources.
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct AuthToken {
     pub wire_token: Option<String>,
 }
 
-async fn handle_projects(State(app): State<AppState>) -> impl IntoResponse {
+/// `GET /api/v1/projects` → dashboard rows.
+#[utoipa::path(
+    get,
+    path = "/api/v1/projects",
+    tag = "projects",
+    responses(
+        (status = 200, description = "Registered projects (dashboard rows)", body = Vec<DashboardRow>),
+        (status = 500, description = "Project collect failed"),
+    ),
+)]
+pub(crate) async fn handle_projects(State(app): State<AppState>) -> impl IntoResponse {
     match build_projects(&app) {
         Ok(rows) => Json(rows).into_response(),
         Err(err) => {
@@ -202,7 +175,19 @@ fn build_projects(app: &AppState) -> anyhow::Result<Vec<DashboardRow>> {
     Ok(rows)
 }
 
-async fn handle_project(
+/// `GET /api/v1/projects/{slug}` → project detail summary.
+#[utoipa::path(
+    get,
+    path = "/api/v1/projects/{slug}",
+    tag = "projects",
+    params(("slug" = String, Path, description = "Project slug")),
+    responses(
+        (status = 200, description = "Project summary `{slug, team, kind, state, events, outbox, workflow_summary, ...}`", body = serde_json::Value),
+        (status = 404, description = "Unknown project"),
+        (status = 500, description = "state.json load failed"),
+    ),
+)]
+pub(crate) async fn handle_project(
     State(app): State<AppState>,
     Path(slug): Path<String>,
 ) -> impl IntoResponse {
@@ -282,7 +267,22 @@ async fn handle_project(
     Json(summary).into_response()
 }
 
-async fn handle_session(
+/// `GET /api/v1/projects/{slug}/sessions/{sid}` → workflow session detail.
+#[utoipa::path(
+    get,
+    path = "/api/v1/projects/{slug}/sessions/{sid}",
+    tag = "projects",
+    params(
+        ("slug" = String, Path, description = "Project slug"),
+        ("sid" = String, Path, description = "Workflow session id (from `agent_spawn`)"),
+    ),
+    responses(
+        (status = 200, description = "Session detail `{slug, sid, harness, events, outbox, ...}`", body = serde_json::Value),
+        (status = 404, description = "Unknown project or session"),
+        (status = 500, description = "progress.jsonl read failed"),
+    ),
+)]
+pub(crate) async fn handle_session(
     State(app): State<AppState>,
     Path((slug, sid)): Path<(String, String)>,
 ) -> impl IntoResponse {
@@ -453,7 +453,14 @@ fn build_workflow_session_detail(
     Json(detail).into_response()
 }
 
-async fn handle_auth_token(State(app): State<AppState>) -> impl IntoResponse {
+/// `GET /api/v1/auth/token` → the wire token (or null when auth is off).
+#[utoipa::path(
+    get,
+    path = "/api/v1/auth/token",
+    tag = "auth",
+    responses((status = 200, description = "`{wire_token: \"ccteam:<hex>\" | null}`", body = AuthToken)),
+)]
+pub(crate) async fn handle_auth_token(State(app): State<AppState>) -> impl IntoResponse {
     Json(AuthToken {
         wire_token: app.auth.wire_token(),
     })
@@ -493,7 +500,18 @@ fn harness_class(harness: HarnessKind) -> &'static str {
 /// `Trigger::Watch(<path>)` declared in `workflow.yaml`. Returns an
 /// empty array (200 OK) for legacy projects or workflows without
 /// watch triggers.
-async fn handle_artifact_queue(
+#[utoipa::path(
+    get,
+    path = "/api/v1/projects/{slug}/artifact_queue",
+    tag = "workflow",
+    params(("slug" = String, Path, description = "Project slug")),
+    responses(
+        (status = 200, description = "Watch-trigger artifact queue entries", body = serde_json::Value),
+        (status = 404, description = "Unknown project"),
+        (status = 500, description = "Build failed"),
+    ),
+)]
+pub(crate) async fn handle_artifact_queue(
     State(app): State<AppState>,
     Path(slug): Path<String>,
 ) -> impl IntoResponse {
@@ -523,7 +541,18 @@ async fn handle_artifact_queue(
 /// subdir of `<project>/.ccteam/` containing `*.json` files with a
 /// top-level string `.status` field. Counts are grouped by status
 /// value. Empty result is valid (200 OK).
-async fn handle_artifact_status(
+#[utoipa::path(
+    get,
+    path = "/api/v1/projects/{slug}/artifact_status",
+    tag = "workflow",
+    params(("slug" = String, Path, description = "Project slug")),
+    responses(
+        (status = 200, description = "Artifact status groups (counts by `.status`)", body = serde_json::Value),
+        (status = 404, description = "Unknown project"),
+        (status = 500, description = "Build failed"),
+    ),
+)]
+pub(crate) async fn handle_artifact_status(
     State(app): State<AppState>,
     Path(slug): Path<String>,
 ) -> impl IntoResponse {
@@ -549,7 +578,7 @@ async fn handle_artifact_status(
 
 /// Query parameters for `cost_history`. `window=24h` (default) or
 /// `window=7d` per PRD §F90. Anything else falls back to `24h`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub struct CostHistoryQuery {
     #[serde(default)]
     pub window: Option<String>,
@@ -567,7 +596,21 @@ pub struct CostHistoryResponse {
 /// Returns hour-bucketed `agent_done.cost_usd` totals for the given
 /// rolling window. Bucket count = `window_hours`; sparse hours appear
 /// with `cost_usd = 0.0` so the SPA sparkline has even x-axis spacing.
-async fn handle_cost_history(
+#[utoipa::path(
+    get,
+    path = "/api/v1/projects/{slug}/cost_history",
+    tag = "workflow",
+    params(
+        ("slug" = String, Path, description = "Project slug"),
+        CostHistoryQuery,
+    ),
+    responses(
+        (status = 200, description = "Hour-bucketed cost `{window, buckets[]}`", body = serde_json::Value),
+        (status = 404, description = "Unknown project"),
+        (status = 500, description = "Build failed"),
+    ),
+)]
+pub(crate) async fn handle_cost_history(
     State(app): State<AppState>,
     Path(slug): Path<String>,
     Query(q): Query<CostHistoryQuery>,
@@ -605,7 +648,18 @@ async fn handle_cost_history(
 ///
 /// Returns one entry per still-open `agent_spawn` (no matching
 /// `agent_done`), decorated with `state.json` live data (cwd, cost).
-async fn handle_active_sessions(
+#[utoipa::path(
+    get,
+    path = "/api/v1/projects/{slug}/sessions/active",
+    tag = "workflow",
+    params(("slug" = String, Path, description = "Project slug")),
+    responses(
+        (status = 200, description = "Still-open `agent_spawn` sessions (live cost/cwd)", body = serde_json::Value),
+        (status = 404, description = "Unknown project"),
+        (status = 500, description = "Build failed"),
+    ),
+)]
+pub(crate) async fn handle_active_sessions(
     State(app): State<AppState>,
     Path(slug): Path<String>,
 ) -> impl IntoResponse {
@@ -649,7 +703,18 @@ pub struct ActiveSessionWithSlug {
 /// fetches. Per-project errors are logged (`tracing::warn`) but do
 /// not fail the request — the response carries every project's rows
 /// that loaded successfully.
-async fn handle_active_sessions_aggregate(State(app): State<AppState>) -> impl IntoResponse {
+#[utoipa::path(
+    get,
+    path = "/api/v1/sessions/active",
+    tag = "sessions",
+    responses(
+        (status = 200, description = "Active sessions across every project, each carrying its `slug`", body = serde_json::Value),
+        (status = 500, description = "collect_projects failed"),
+    ),
+)]
+pub(crate) async fn handle_active_sessions_aggregate(
+    State(app): State<AppState>,
+) -> impl IntoResponse {
     let summaries = match ccteam_core::collect_projects(&app.paths) {
         Ok(v) => v,
         Err(err) => {
@@ -687,14 +752,14 @@ async fn handle_active_sessions_aggregate(State(app): State<AppState>) -> impl I
 
 /// Query parameters for `jobs/<job_id>/log`. `tail` is the line count;
 /// clamped to `[1, 5000]` server-side. Default 200.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub struct JobLogQuery {
     #[serde(default)]
     pub tail: Option<u32>,
 }
 
 /// JSON payload returned by `GET /api/v1/projects/<slug>/jobs/<job_id>/log`.
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct JobLogResponse {
     pub job_id: String,
     /// Total line count in `output.log` (so the SPA can render
@@ -713,7 +778,23 @@ pub struct JobLogResponse {
 /// state.json holds the cwd, but probing it adds I/O for no gain);
 /// the `<slug>` in the URL is used only for the 404 short-circuit on
 /// unknown projects.
-async fn handle_job_log(
+#[utoipa::path(
+    get,
+    path = "/api/v1/projects/{slug}/jobs/{job_id}/log",
+    tag = "workflow",
+    params(
+        ("slug" = String, Path, description = "Project slug"),
+        ("job_id" = String, Path, description = "Claude bg job id"),
+        JobLogQuery,
+    ),
+    responses(
+        (status = 200, description = "Job log tail `{job_id, total_lines, tail}`", body = JobLogResponse),
+        (status = 400, description = "Invalid job_id"),
+        (status = 404, description = "Unknown project"),
+        (status = 500, description = "Log read failed"),
+    ),
+)]
+pub(crate) async fn handle_job_log(
     State(app): State<AppState>,
     Path((slug, job_id)): Path<(String, String)>,
     Query(q): Query<JobLogQuery>,

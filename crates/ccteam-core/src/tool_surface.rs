@@ -779,6 +779,8 @@ pub struct ChatHookScrubReport {
 /// - `ccteam mux hook-emit --kind chat-progress …` (the `CCTEAM_HOOK_VIA_DAEMON`
 ///   variant)
 /// - `<hook.sh> intercept-ask` (the `AskUserQuestion` PreToolUse matcher)
+/// - `<hook.sh> permission-request` (the HITL `PermissionRequest` hook;
+///   R-M4 — a hitl-spawned session installs it, so purge must clear it)
 ///
 /// Every other key (`permissions`, `env`, `enabledPlugins`, …) and any
 /// operator-authored hook survives untouched. Empty inner hook lists +
@@ -874,9 +876,17 @@ pub fn remove_chat_hooks(settings_path: &Path, dry_run: bool) -> Result<ChatHook
 
 /// Predicate: does this `hook` JSON entry invoke one of ccteam's
 /// chat-mode hooks (the inverse target of `ensure_chat_hooks_installed`)?
-/// Matches the `chat-progress <event>` + `intercept-ask` wrapper forms
-/// and the `mux hook-emit --kind chat-progress` daemon-bus variant,
-/// independent of the leading `hook.sh` / binary path.
+/// Matches the `chat-progress <event>` + `intercept-ask` +
+/// `permission-request` wrapper forms and the `mux hook-emit --kind
+/// chat-progress` daemon-bus variant, independent of the leading
+/// `hook.sh` / binary path.
+///
+/// v0.8.7 review-fix (R-M4): the HITL `PermissionRequest` hook
+/// (`{hook_sh} permission-request`, installed by `claude_tui` for a hitl
+/// session) is a ccteam-managed hook too, so `project rm --purge` (which
+/// scrubs these entries — purge = `init` inverse, red line) must also
+/// recognize it; otherwise a hitl-spawned project leaves a residual
+/// `PermissionRequest` hook in `settings.local.json` after purge.
 fn hook_command_is_chat_hook(hook: &serde_json::Value) -> bool {
     let Some(cmd) = hook.get("command").and_then(|v| v.as_str()) else {
         return false;
@@ -887,6 +897,8 @@ fn hook_command_is_chat_hook(hook: &serde_json::Value) -> bool {
         || trimmed.contains("hook-emit --kind chat-progress")
         || trimmed.ends_with(" intercept-ask")
         || trimmed.contains(" intercept-ask ")
+        || trimmed.ends_with(" permission-request")
+        || trimmed.contains(" permission-request ")
 }
 
 /// V0.2.2 F44 + V0.4.6 F89 + V0.6.1 F139: rewrite one hook `command`
@@ -1603,6 +1615,78 @@ mod tests {
             report.action,
             ChatHookScrubAction::RemovedNowEmpty { entries: 1 }
         );
+    }
+
+    /// v0.8.7 review-fix (R-M4) — a hitl session installs the
+    /// `PermissionRequest` hook (`{hook_sh} permission-request`, see
+    /// `claude_tui::ensure_chat_hooks_installed`). `project rm --purge`
+    /// (which runs `remove_chat_hooks`) is the `init` inverse and MUST clear
+    /// it; otherwise the project keeps a live HITL gate after deregistration.
+    /// This pins both: the entry is counted/removed AND its now-empty
+    /// `PermissionRequest` event section is pruned, while an operator hook
+    /// under the same section survives.
+    #[test]
+    fn remove_chat_hooks_strips_permission_request_keeps_operator() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("settings.local.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "hooks": {
+                "SessionStart": [{"matcher":"*","hooks":[{"type":"command","command":"/h/hook.sh chat-progress session-start"}]}],
+                "PermissionRequest": [
+                  {"hooks":[{"type":"command","command":"/h/hook.sh permission-request"}]},
+                  {"matcher":"Bash","hooks":[{"type":"command","command":"/h/operator-gate.sh"}]}
+                ]
+              }
+            }"#,
+        )
+        .unwrap();
+        let report = remove_chat_hooks(&path, false).unwrap();
+        // 1 SessionStart chat-progress + 1 PermissionRequest ccteam hook = 2.
+        assert_eq!(report.action, ChatHookScrubAction::Removed { entries: 2 });
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let body = serde_json::to_string(&v).unwrap();
+        assert!(
+            !body.contains("permission-request"),
+            "ccteam PermissionRequest hook must be purged (R-M4): {body}"
+        );
+        // The operator's own PermissionRequest gate survives; the section is
+        // NOT pruned because it still has a non-ccteam entry.
+        assert!(body.contains("operator-gate.sh"), "operator hook kept");
+        assert!(
+            v.get("hooks")
+                .and_then(|h| h.get("PermissionRequest"))
+                .is_some(),
+            "PermissionRequest section kept (operator entry remains)"
+        );
+        assert!(
+            v.get("hooks").and_then(|h| h.get("SessionStart")).is_none(),
+            "emptied SessionStart pruned"
+        );
+    }
+
+    /// v0.8.7 review-fix (R-M4) — a hitl-only file (just chat hooks + the
+    /// `PermissionRequest` HITL hook, no operator content) collapses to empty
+    /// on purge so the caller deletes it (true `init` inverse).
+    #[test]
+    fn remove_chat_hooks_now_empty_includes_permission_request() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("settings.local.json");
+        std::fs::write(
+            &path,
+            r#"{"hooks":{"Stop":[{"matcher":"*","hooks":[{"type":"command","command":"/h/hook.sh chat-progress stop"}]}],"PermissionRequest":[{"hooks":[{"type":"command","command":"/h/hook.sh permission-request"}]}]}}"#,
+        )
+        .unwrap();
+        let report = remove_chat_hooks(&path, false).unwrap();
+        assert_eq!(
+            report.action,
+            ChatHookScrubAction::RemovedNowEmpty { entries: 2 }
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v, serde_json::json!({}));
     }
 
     #[test]

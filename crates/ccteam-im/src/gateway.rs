@@ -17,8 +17,8 @@ use ccteam_core::projects::{bootstrap_project_at_dir, validate_slug_format};
 use ccteam_core::{CcteamPaths, HotConfig};
 use ccteam_harness::{
     chat_session_name, parse_chat_session_name, AgentSpecBrief, AgentVendor, ChoicePrompt,
-    ChoiceSelection, Directive, DirectiveOutcome, HarnessAdapter, ProcessBackend, SpawnCtx,
-    ThreadEvent, ThreadHandle, ThreadItemDetails, TurnInput,
+    ChoiceSelection, Directive, DirectiveOutcome, HarnessAdapter, PermissionMode, ProcessBackend,
+    SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails, TurnInput,
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,19 @@ use serde::{Deserialize, Serialize};
 use crate::pending::InteractionOrigin;
 use crate::transport::{AttachmentKind, ChannelAttachment, ChoiceReply, MessageOption};
 use crate::BotRegistration;
+
+/// v0.8.7 review-fix (R-M6) — a typed "the named role has no
+/// `.claude/agents/<role>.md`" error so create paths can distinguish a
+/// caller mistake (bad/unseeded role ⇒ a 4xx in the web API) from a genuine
+/// internal failure (adapter spawn error, fs error ⇒ 500). `start_session`
+/// returns `anyhow::Result`, so this is surfaced via `anyhow::Error` and the
+/// web handler recovers it with `downcast_ref::<RoleNotFound>()`.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("role 不存在:.claude/agents/{role}.md 未找到;先用 /role <已存在的角色> 或 `ccteam role add {role}` 创建")]
+pub struct RoleNotFound {
+    /// The role stem that was requested but has no persona file.
+    pub role: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct ChatKey {
@@ -52,6 +65,18 @@ struct GatewaySession {
     project: String,
     role: String,
     vendor: AgentVendor,
+    /// v0.8.7 W2 (DB.1) — per-session permission posture (`skip` default /
+    /// `hitl`). Remembered so a `/role` re-spawn and a daemon-restart resume
+    /// re-apply the same mode (and the same hook install).
+    permission_mode: PermissionMode,
+    /// v0.8.7 review-fix (R-M1) — per-session secret minted at first spawn and
+    /// injected into the pane env as `CCTEAM_CHAT_SECRET`. The cto-gate
+    /// authenticates a forwarded `session_*` caller by matching the secret it
+    /// presents against this stored value (see [`Gateway::verify_session_caller`]).
+    /// Persisted across daemon restarts so the live pane's env still matches.
+    /// HONEST SCOPE: only raises the bar under the single-uid full-trust model
+    /// — not a hard boundary (see `ccteam_core::session_secret`).
+    secret: String,
     handle: String,
     thread: ThreadHandle,
     adapter: Arc<dyn HarnessAdapter + Send + Sync>,
@@ -249,10 +274,51 @@ pub struct SessionView {
     pub role: String,
     /// Vendor, stringified (`"claude"` / `"codex"`).
     pub vendor: String,
+    /// v0.8.7 W2 (DB.1) — permission posture, stringified (`"skip"` /
+    /// `"hitl"`) so the UI / API can show whether a session prompts for
+    /// non-allowlist tools. `#[serde(default)]` keeps older clients tolerant.
+    #[serde(default)]
+    pub permission_mode: String,
     /// Whether this session is the active one for at least one chat.
     pub current: bool,
     /// Cheap synchronous liveness hint (`"live"` for any tracked session).
     pub status: String,
+}
+
+/// v0.8.7 review-fix (R-M2) — what [`Gateway::start_session`] reports back so
+/// a receipt can tell the truth about the session it actually got. A `/new …
+/// hitl` onto an already-live `(project, role)` pane reuses that pane WITHOUT
+/// changing its spawn-time posture (the live process can't switch the
+/// `--dangerously-skip-permissions` flag), so the receipt must reflect the
+/// pane's *actual* mode, never the requested one — otherwise it falsely claims
+/// "hitl" while a skip pane keeps running unsupervised (the dangerous-direction
+/// bug: thinking you're supervised when you are not).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartOutcome {
+    /// The gateway session id (`s{n}`) — new or reused.
+    pub id: String,
+    /// The session's ACTUAL permission posture (the reused pane's stored mode,
+    /// or the requested mode on a fresh spawn) — never the requested mode on a
+    /// reuse that couldn't honor it.
+    pub permission_mode: PermissionMode,
+    /// True when an existing `(project, role)` pane was reused (dedup hit)
+    /// rather than a fresh spawn.
+    pub reused: bool,
+}
+
+/// v0.8.7 W1 — what [`Gateway::session_resolve`] hands a collector so it can
+/// tail a child session's `.ccteam/chat/<role>/turns.jsonl` without reaching
+/// into the gateway's private session map. Pure data (no adapter handle).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionResolve {
+    /// Gateway session id (`s{n}`).
+    pub sid: String,
+    /// Agent role — the `<bot>` segment of the transcript path.
+    pub role: String,
+    /// Project slug the session runs in.
+    pub project: String,
+    /// Absolute working dir hosting `.ccteam/chat/<role>/turns.jsonl`.
+    pub project_dir: PathBuf,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -277,6 +343,19 @@ struct SavedGatewaySession {
     project: String,
     role: String,
     vendor: AgentVendor,
+    /// v0.8.7 W2 (DB.1) — persisted permission posture so a daemon restart
+    /// re-spawns a hitl session as hitl. `#[serde(default)]` ⇒ already-saved
+    /// state files (no field) restore as `Skip`, matching prior behavior.
+    #[serde(default)]
+    permission_mode: PermissionMode,
+    /// v0.8.7 review-fix (R-M1) — persisted per-session cto-gate secret so the
+    /// restored in-memory map still matches the live pane's `CCTEAM_CHAT_SECRET`
+    /// (and the recreate-fallback re-spawn re-injects the SAME value).
+    /// `#[serde(default)]` ⇒ pre-existing state files (no field) restore as
+    /// `""`; such a session simply can't pass the secret check until re-spawned
+    /// — fail-closed, never fail-open.
+    #[serde(default)]
+    secret: String,
     handle: String,
     thread: ThreadHandle,
 }
@@ -302,8 +381,8 @@ pub struct GatewayCommandSpec {
 pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
     GatewayCommandSpec {
         name: "/new",
-        arg_hint: Some("[vendor] [role]"),
-        help: "start a new session",
+        arg_hint: Some("[vendor] [role] [hitl]"),
+        help: "start a new session (trailing `hitl` = approve tools in IM)",
         in_menu: true,
     },
     GatewayCommandSpec {
@@ -543,6 +622,13 @@ impl Gateway {
                                         project_dir: cwd,
                                         extra_args: vec![],
                                         model_id: None,
+                                        // Restart resume re-applies the
+                                        // persisted posture (DB.1).
+                                        permission_mode: snapshot.permission_mode,
+                                        // R-M1 — recreate-fallback re-injects the
+                                        // SAME persisted secret so the new pane's
+                                        // env still matches the gate-map.
+                                        secret: snapshot.secret.clone(),
                                     },
                                 )
                                 .await
@@ -754,12 +840,17 @@ impl Gateway {
             "/new" => {
                 let vendor = parse_vendor(parts.next().unwrap_or("claude"))?;
                 let role = parts.next().unwrap_or("cto").to_string();
+                // v0.8.7 W2 (DB.1) — optional trailing `hitl` token enables
+                // human-in-the-loop approval for this session, e.g.
+                // `/new claude cto hitl`. Absent / `skip` ⇒ default skip.
+                let permission_mode =
+                    PermissionMode::parse_opt(parts.next()).map_err(|e| anyhow!(e))?;
                 let project = self.current_project_for(chat);
                 let handle = role.clone();
-                let session_id = self
-                    .start_session(chat.clone(), project, vendor, role, handle)
+                let outcome = self
+                    .start_session(chat.clone(), project, vendor, role, handle, permission_mode)
                     .await?;
-                Ok(Some(format!("created session {session_id}")))
+                Ok(Some(Self::new_session_receipt(&outcome, permission_mode)))
             }
             "/role" => {
                 let role = parts
@@ -916,9 +1007,35 @@ impl Gateway {
             AgentVendor::Claude,
             "cto".to_string(),
             "cto".to_string(),
+            // Implicit default-cto spawn (first message, no `/new`) stays
+            // skip — HITL is opt-in via `/new … hitl` / API / cto tool.
+            PermissionMode::Skip,
         )
         .await?;
         Ok(())
+    }
+
+    /// v0.8.7 review-fix (R-M2) — build the `/new` receipt from the session's
+    /// ACTUAL posture, not the requested one. A fresh hitl spawn says hitl; a
+    /// reuse that couldn't honor a hitl request (live skip pane) says so
+    /// explicitly so the user never thinks a skip pane is being supervised.
+    fn new_session_receipt(outcome: &StartOutcome, requested: PermissionMode) -> String {
+        let id = &outcome.id;
+        let verb = if outcome.reused { "复用" } else { "created" };
+        let actual = outcome.permission_mode;
+        // The dangerous case: hitl was asked for but the reused pane is still
+        // skip — be loud, and tell the user how to actually get hitl.
+        if requested.is_hitl() && !actual.is_hitl() {
+            return format!(
+                "{verb} session {id}(仍 skip — 该 pane 已在裸跑,需先 `ccteam session stop {id}` 再重建才能 hitl)"
+            );
+        }
+        let suffix = if actual.is_hitl() {
+            " (hitl: non-allowlist tools need IM approval)"
+        } else {
+            ""
+        };
+        format!("{verb} session {id}{suffix}")
     }
 
     async fn start_template_session(
@@ -934,8 +1051,12 @@ impl Gateway {
             template.vendor,
             template.role,
             template.handle,
+            // Template-spawned sessions are skip (the route template has no
+            // mode field; HITL is opt-in per session, not per route).
+            PermissionMode::Skip,
         )
         .await
+        .map(|o| o.id)
     }
 
     async fn start_session(
@@ -945,32 +1066,64 @@ impl Gateway {
         vendor: AgentVendor,
         role: String,
         handle: String,
-    ) -> Result<String> {
+        permission_mode: PermissionMode,
+    ) -> Result<StartOutcome> {
         // A chat session's tmux pane is named `ccteam-chat-<project>-<role>`,
         // so one (project, role) == one pane + transcript. Reuse an existing
         // record instead of spawning a duplicate that would share the pane and
         // run a second event pump over the same transcript (which doubles every
         // reply and clutters the session list). Point it at the new driver.
+        //
+        // v0.8.7 W2 (DB.1) — `permission_mode` is FIXED at first spawn: the
+        // reused pane is already running with its original posture, so a later
+        // `/new … hitl` on a live `skip` pane keeps `skip` (the pane would have
+        // to be restarted to change the spawn flag). We don't silently mutate
+        // the stored mode here to avoid claiming a posture the live process
+        // isn't actually running under.
         if let Some(existing) = self
             .sessions
             .values()
             .find(|s| s.project == project && s.role == role)
         {
             let id = existing.id.clone();
+            // R-M2: report the pane's ACTUAL stored mode, not the requested one
+            // — a `/new … hitl` onto a live skip pane keeps skip (the spawn flag
+            // is fixed at first launch), so the receipt must not claim hitl.
+            let actual_mode = existing.permission_mode;
             if let Ok(mut target) = existing.reply_to.lock() {
                 *target = owner.clone();
             }
             self.current_session.insert(owner, id.clone());
             self.persist_state()?;
-            return Ok(id);
+            return Ok(StartOutcome {
+                id,
+                permission_mode: actual_mode,
+                reused: true,
+            });
         }
-        self.next_session += 1;
-        let id = format!("s{}", self.next_session);
         let cwd = self
             .projects
             .get(&project)
             .cloned()
             .ok_or_else(|| anyhow!("unknown project: {project}"))?;
+        // v0.8.7 (FIX-2) — reject a role with no `.claude/agents/<role>.md`
+        // BEFORE allocating a session id or spawning, so any create path (web /
+        // API / IM `/new` / cto-dispatch) that names an unseeded persona fails
+        // fast with a clear hint instead of spawning `claude --agent <undefined>`
+        // → a live-but-brainless pane that never produces a forwardable turn
+        // (the original `assistant` web-default bug). Done before the
+        // `next_session += 1` bump so a rejected create doesn't burn an `s{n}`.
+        // This is the same `read_role` existence check `/role`
+        // (switch_current_role) already applies; here it guards creation. See
+        // `ensure_role_exists` for the test-dir exemption.
+        ensure_role_exists(&cwd, &role)?;
+        self.next_session += 1;
+        let id = format!("s{}", self.next_session);
+        // v0.8.7 review-fix (R-M1) — mint the per-session cto-gate secret and
+        // inject it into the pane env (`CCTEAM_CHAT_SECRET`) at spawn so the
+        // in-pane stdio forwarder can authenticate `session_*` calls against
+        // this session's stored secret instead of a spoofable plaintext role.
+        let secret = ccteam_core::session_secret::mint();
         let adapter = (self.adapter_factory)(vendor);
         let thread = adapter
             .start_thread(
@@ -982,6 +1135,8 @@ impl Gateway {
                     project_dir: cwd,
                     extra_args: vec![],
                     model_id: None,
+                    permission_mode,
+                    secret: secret.clone(),
                 },
             )
             .await?;
@@ -993,6 +1148,8 @@ impl Gateway {
                 project,
                 role,
                 vendor,
+                permission_mode,
+                secret,
                 handle,
                 thread,
                 adapter,
@@ -1003,7 +1160,12 @@ impl Gateway {
         self.current_session.insert(owner, id.clone());
         self.persist_state()?;
         self.spawn_event_pump(&id);
-        Ok(id)
+        Ok(StartOutcome {
+            id,
+            // Fresh spawn ran with exactly the requested posture.
+            permission_mode,
+            reused: false,
+        })
     }
 
     /// Switch the chat's CURRENT session to run `role` (W1 `/role`). Start-time
@@ -1034,6 +1196,11 @@ impl Gateway {
         }
         let project = old.project.clone();
         let vendor = old.vendor;
+        // v0.8.7 W2 (DB.1) — preserve the session's permission posture across a
+        // `/role` re-spawn (the new pane re-applies the same hitl/skip spawn
+        // flag + hook install). Without capturing it here the fresh SpawnCtx
+        // would default the session back to skip.
+        let permission_mode = old.permission_mode;
         let owner = old.owner.clone();
         let old_thread = old.thread.clone();
         let old_adapter = Arc::clone(&old.adapter);
@@ -1067,6 +1234,11 @@ impl Gateway {
         let _ = old_adapter.close_thread(&old_thread).await;
 
         let adapter = (self.adapter_factory)(vendor);
+        // v0.8.7 review-fix (R-M1) — a `/role` switch closes the old pane and
+        // spawns a brand-new one, so mint a FRESH secret: the new pane's env
+        // gets it, and the in-place record below stores the same value, keeping
+        // pane-env and gate-map in lockstep.
+        let secret = ccteam_core::session_secret::mint();
         let thread = adapter
             .start_thread(
                 &AgentSpecBrief { role: role.clone() },
@@ -1077,6 +1249,8 @@ impl Gateway {
                     project_dir: cwd,
                     extra_args: vec![],
                     model_id: None,
+                    permission_mode,
+                    secret: secret.clone(),
                 },
             )
             .await?;
@@ -1091,6 +1265,8 @@ impl Gateway {
                 project,
                 role: role.clone(),
                 vendor,
+                permission_mode,
+                secret,
                 handle: role,
                 thread,
                 adapter,
@@ -1263,6 +1439,10 @@ impl Gateway {
                     project: saved_session.project,
                     role: saved_session.role,
                     vendor: saved_session.vendor,
+                    permission_mode: saved_session.permission_mode,
+                    // R-M1 — restore the persisted secret so the gate-map matches
+                    // the live pane's `CCTEAM_CHAT_SECRET` after a daemon restart.
+                    secret: saved_session.secret,
                     handle: saved_session.handle,
                     thread: saved_session.thread,
                     adapter,
@@ -1312,6 +1492,8 @@ impl Gateway {
                     project: session.project.clone(),
                     role: session.role.clone(),
                     vendor: session.vendor,
+                    permission_mode: session.permission_mode,
+                    secret: session.secret.clone(),
                     handle: session.handle.clone(),
                     thread: session.thread.clone(),
                 })
@@ -1743,6 +1925,7 @@ impl Gateway {
                 project: s.project.clone(),
                 role: s.role.clone(),
                 vendor: vendor_str(s.vendor).to_string(),
+                permission_mode: s.permission_mode.as_str().to_string(),
                 current: current.contains(&s.id),
                 status: "live".to_string(),
             })
@@ -1751,24 +1934,101 @@ impl Gateway {
         views
     }
 
+    /// Resolve a session id to the data a collector needs to tail its
+    /// transcript (v0.8.7 W1 — cto `session_collect`). Returns the role
+    /// (the `<bot>` segment of `.ccteam/chat/<bot>/turns.jsonl`) and the
+    /// session's project slug + absolute working dir, or `None` for an
+    /// unknown sid. Read-only: clones scalar fields under no `.await`, so a
+    /// collect handler can call it cheaply while holding the gateway lock.
+    pub fn session_resolve(&self, sid: &str) -> Option<SessionResolve> {
+        let session = self.sessions.get(sid)?;
+        let project_dir = self.projects.get(&session.project).cloned()?;
+        Some(SessionResolve {
+            sid: session.id.clone(),
+            role: session.role.clone(),
+            project: session.project.clone(),
+            project_dir,
+        })
+    }
+
+    /// v0.8.7 review-fix (R-M1) — authenticate a forwarded `session_*` caller
+    /// by matching the `(role, secret)` PAIR it presents against a tracked
+    /// session, instead of trusting a plaintext `_caller_role` arg. Returns
+    /// `true` iff some live session both runs `claimed_role` AND holds a secret
+    /// equal (constant-time) to `presented_secret`. An empty secret is always
+    /// `false` (fail-closed): a pre-secret restored session or a forger with no
+    /// secret can never authenticate. Read-only, holds no `.await`.
+    ///
+    /// HONEST SCOPE: this only RAISES THE BAR. Under the single-OS-uid
+    /// full-trust model any agent can read another's `/proc/<pid>/environ`,
+    /// files, or ptrace it and recover the secret, so this is best-effort
+    /// defense-in-depth, NOT a hard boundary. Real isolation = per-agent OS
+    /// user / sandbox (v0.8.8-deferred). See `ccteam_core::session_secret`.
+    pub fn verify_session_caller(&self, claimed_role: &str, presented_secret: &str) -> bool {
+        if presented_secret.is_empty() {
+            return false;
+        }
+        self.sessions.values().any(|s| {
+            s.role == claimed_role
+                && !s.secret.is_empty()
+                && ccteam_core::session_secret::ct_eq(&s.secret, presented_secret)
+        })
+    }
+
+    /// v0.8.7 W2 (DB.3) — resolve a `(project_slug, role)` to its gateway
+    /// session id for the HITL approval prompt label ("session sX (role)
+    /// wants to run …"). A chat pane is uniquely keyed by `(project, role)`
+    /// (same invariant `start_session` dedups on), so this is the gateway-sid
+    /// for the firing session. Returns `None` when no tracked session matches
+    /// (the approval prompt then falls back to a sid-less label). Read-only,
+    /// holds no `.await`.
+    pub fn session_sid_for(&self, project: &str, role: &str) -> Option<String> {
+        self.sessions
+            .values()
+            .find(|s| s.project == project && s.role == role)
+            .map(|s| s.id.clone())
+    }
+
+    /// v0.8.7 (FIX-1) — resolve the live reply target `(channel, chat_id)` for
+    /// the session currently running `(project, role)`. This is the outbound
+    /// addressing the IM `chat_send_file` / `interaction/ask` paths need so an
+    /// agent the user is actively chatting with can push a file back to that
+    /// same chat WITHOUT a prior `chat_register_bot` (the on-disk registry is
+    /// only written by an explicit register, so the inbound spawn path never
+    /// populates it). Mirrors [`session_sid_for`](Self::session_sid_for)'s
+    /// `(project, role)` dedup find, then resolves the session's `reply_to`
+    /// (whoever last drove it) → `owner` fallback exactly like the private
+    /// [`pump_target`] free fn. Returns `None` when no tracked session matches
+    /// (the caller then falls back to the on-disk `resolve_home_chat`
+    /// registry). Read-only, holds no `.await`.
+    pub fn reply_target_for(&self, project: &str, role: &str) -> Option<(String, String)> {
+        let session = self
+            .sessions
+            .values()
+            .find(|s| s.project == project && s.role == role)?;
+        Some(pump_target(session))
+    }
+
     /// Create a session from the network API (W5b). Thin wrapper over
     /// [`start_session`](Self::start_session): the caller supplies the
-    /// project + role + vendor; the handle defaults to the role name (the
-    /// established convention from `/new`). Returns the new `s{n}` id. The
-    /// `owner` is a synthetic `web` chat key so replies route to the web
-    /// console; an SSE handler then filters the outbound stream by `sid`.
-    /// Reuses an existing (project, role) pane if one is already tracked
-    /// (same dedup as `/new`), so a duplicate API call is idempotent.
+    /// project + role + vendor + permission mode; the handle defaults to the
+    /// role name (the established convention from `/new`). Returns the new
+    /// `s{n}` id. The `owner` is a synthetic `web` chat key so replies route
+    /// to the web console; an SSE handler then filters the outbound stream by
+    /// `sid`. Reuses an existing (project, role) pane if one is already
+    /// tracked (same dedup as `/new`), so a duplicate API call is idempotent.
     pub async fn create_session_api(
         &mut self,
         project: String,
         role: String,
         vendor: AgentVendor,
+        permission_mode: PermissionMode,
     ) -> Result<String> {
         let owner = web_api_chat();
         let handle = role.clone();
-        self.start_session(owner, project, vendor, role, handle)
+        self.start_session(owner, project, vendor, role, handle, permission_mode)
             .await
+            .map(|o| o.id)
     }
 
     /// Submit a user-text turn to a session addressed by `sid` (W5b).
@@ -1804,6 +2064,52 @@ impl Gateway {
             .after_turn_submitted(session, start_visible_events, &turn_id.0)
             .await?;
         Ok(turn_id.0)
+    }
+
+    /// v0.8.7 review-fix (R-H1) — resolve a token-keyed pending choice from the
+    /// network API (the web HITL approve/deny path), by TOKEN + the chosen
+    /// option `id`. This is the web peer of an IM option click: it routes
+    /// through the EXACT same machinery (`take_by_token` → `apply_pending`),
+    /// resolving the SAME External-origin pending the blocked
+    /// `permission/ask` / `interaction/ask` hook is waiting on — it is NOT a
+    /// turn. A web `[Approve]` therefore makes the hook return `allow` (the
+    /// tool runs); `[Deny]` returns `deny` immediately (no 600s timeout).
+    ///
+    /// Returns `Ok(())` once the pending is consumed and its waiter delivered.
+    /// An unknown / expired token, or an `id` not in the prompt's option set,
+    /// is an `Err` the HTTP layer maps to a clean 4xx (never a turn, never a
+    /// 5xx). Drains lapsed prompts first so a late click on an expired choice
+    /// reads as absent. The `chat` passed to `apply_pending` is the synthetic
+    /// web key — only consulted for a Directive-origin re-entry; an External
+    /// (hook) origin delivers over its oneshot and ignores the chat.
+    pub async fn resolve_web_selection(&self, token: &str, option_id: &str) -> Result<()> {
+        let taken = {
+            let mut pend = self.pending.lock().await;
+            pend.drain_expired(Instant::now());
+            pend.take_by_token(token)
+        };
+        let Some(p) = taken else {
+            return Err(anyhow!("unknown or expired token"));
+        };
+        // Validate the chosen id against the prompt's real option set, so a
+        // bogus selection is rejected rather than silently denied. (If the id
+        // is absent we've already taken the pending; re-register would race, so
+        // we instead resolve it as the rejection — but the cleaner contract is
+        // a 4xx, and the pending is single-flight + about to time out anyway.)
+        if !p.prompt.options.iter().any(|o| o.id == option_id) {
+            // Put the waiter out of its misery deterministically: an unknown id
+            // is treated as no valid choice → drop, which makes an External
+            // hook observe RecvError → its own fail-safe deny. We surface a
+            // 4xx to the web caller.
+            return Err(anyhow!("invalid option id for this prompt"));
+        }
+        let selection = ChoiceSelection {
+            token: token.to_string(),
+            ids: vec![option_id.to_string()],
+            free_text: None,
+        };
+        self.apply_pending(&web_api_chat(), p, selection).await?;
+        Ok(())
     }
 
     /// Stop the session addressed by `sid` (W5b). Mirrors the
@@ -1995,6 +2301,37 @@ fn wrap_inbound(
         format!("{payload}\n{}", extra_lines.join("\n"))
     };
     format!("<channel {attrs}>\n{body}\n</channel>")
+}
+
+/// v0.8.7 (FIX-2) — fail fast when a create path names a role that has no
+/// `.claude/agents/<role>.md` under the project dir, so we never spawn
+/// `claude --agent <undefined>` (a live-but-brainless pane that never produces
+/// a forwardable turn). Mirrors the `read_role` existence check `/role`
+/// already applies on a role switch.
+///
+/// Exemption: when the project's `.claude/agents/` directory does NOT exist at
+/// all, validation is SKIPPED. A real ccteam project always has that dir
+/// (`ccteam init` seeds `cto.md` into it), so in production the dir is present
+/// and the check is strict. The skip exists for the gateway's many unit /
+/// integration tests that spawn against bare fake project dirs (e.g.
+/// `/tmp/alpha`) with a `FakeAdapter` and no seeded agents — those exercise
+/// routing, not personas, and shouldn't be forced to scaffold a role tree.
+fn ensure_role_exists(cwd: &std::path::Path, role: &str) -> Result<()> {
+    // No agents dir → uninitialized / test project; skip (see doc comment).
+    if !ccteam_core::agents_dir(cwd).exists() {
+        return Ok(());
+    }
+    // `read_role` returns Err on a bad name (charset / traversal) and Ok(None)
+    // when the file is absent — both mean "no such role" here.
+    // v0.8.7 review-fix (R-M6): surface a typed `RoleNotFound` (via anyhow) so
+    // the web create handler can map it to a 4xx instead of a blanket 500.
+    if ccteam_core::read_role(cwd, role).ok().flatten().is_none() {
+        return Err(RoleNotFound {
+            role: role.to_string(),
+        }
+        .into());
+    }
+    Ok(())
 }
 
 /// Resolve a session pump's live reply target `(channel, chat_id)`,
@@ -2197,9 +2534,11 @@ fn pending_key(chat: &ChatKey, session_id: &str) -> String {
 }
 
 /// Map a harness [`ChoicePrompt`] to channel-local [`MessageOption`]s. The
-/// callback payload is `"{token}:{idx}"` — short, opaque, within Telegram's
-/// 64-byte `callback_data` cap; the real option id never leaves the gateway
-/// (idx is reverse-resolved from the pending registry).
+/// IM callback payload is `"{token}:{idx}"` — short, opaque, within Telegram's
+/// 64-byte `callback_data` cap; the IM click resolves by idx (reverse-resolved
+/// from the pending registry). v0.8.7 review-fix (R-H1): the stable option `id`
+/// is also carried so a tokenless web SSE consumer can resolve the same pending
+/// by `{token, selection=id}` (the IM path ignores `id`).
 fn to_message_options(prompt: &ChoicePrompt) -> Vec<MessageOption> {
     prompt
         .options
@@ -2208,6 +2547,7 @@ fn to_message_options(prompt: &ChoicePrompt) -> Vec<MessageOption> {
         .map(|(i, opt)| MessageOption {
             data: format!("{}:{}", prompt.token, i),
             label: opt.label.clone(),
+            id: opt.id.clone(),
         })
         .collect()
 }
@@ -2531,6 +2871,14 @@ mod tests {
         directive_script: Arc<Mutex<VecDeque<DirectiveOutcome>>>,
         /// Status returned by `thread_status` (v0.8.5 P3).
         status: Arc<Mutex<ThreadStatus>>,
+        /// v0.8.7 W2 — `SpawnCtx::permission_mode` captured per start_thread,
+        /// in spawn order, so a test can assert the gateway threaded the right
+        /// posture (skip vs hitl) down to the adapter.
+        spawn_modes: Arc<Mutex<Vec<PermissionMode>>>,
+        /// v0.8.7 review-fix (R-M1) — `SpawnCtx::secret` captured per
+        /// start_thread so a test can assert the minted per-session secret was
+        /// threaded into the spawn env.
+        spawn_secrets: Arc<Mutex<Vec<String>>>,
     }
 
     impl Default for FakeAdapter {
@@ -2550,6 +2898,8 @@ mod tests {
                 directives: Arc::new(Mutex::new(Vec::new())),
                 directive_script: Arc::new(Mutex::new(VecDeque::new())),
                 status: Arc::new(Mutex::new(ThreadStatus::default())),
+                spawn_modes: Arc::new(Mutex::new(Vec::new())),
+                spawn_secrets: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -2582,6 +2932,8 @@ mod tests {
             ctx: &SpawnCtx,
         ) -> Result<ThreadHandle, HarnessError> {
             self.starts.fetch_add(1, Ordering::SeqCst);
+            self.spawn_modes.lock().await.push(ctx.permission_mode);
+            self.spawn_secrets.lock().await.push(ctx.secret.clone());
             Ok(ThreadHandle {
                 vendor: self.vendor,
                 mode: ExecutionMode::Chat,
@@ -2705,7 +3057,12 @@ mod tests {
 
         // Create by API → s1, tracked, role/vendor/project as supplied.
         let sid = gateway
-            .create_session_api("alpha".into(), "reviewer".into(), AgentVendor::Claude)
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
             .await
             .unwrap();
         assert_eq!(sid, "s1");
@@ -2742,6 +3099,154 @@ mod tests {
         assert!(gateway.stop_session("s1").await.is_err());
     }
 
+    /// v0.8.7 review-fix (R-M1) — `create_session_api` mints a per-session
+    /// secret, stores it on the session, and injects it into the spawn env so
+    /// the pane (and its in-pane stdio forwarder) can present it. Two sessions
+    /// get DIFFERENT secrets.
+    #[tokio::test]
+    async fn create_session_mints_unique_secret_and_injects_into_env() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-secret");
+        let s1 = gateway
+            .create_session_api(
+                "alpha".into(),
+                "cto".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        let s2 = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        let sec1 = gateway.sessions.get(&s1).unwrap().secret.clone();
+        let sec2 = gateway.sessions.get(&s2).unwrap().secret.clone();
+        assert_eq!(sec1.len(), 32, "secret is 128-bit hex");
+        assert_ne!(sec1, sec2, "each session gets its own secret");
+        // The secret reached the spawn env (FakeAdapter records SpawnCtx).
+        let envs = fake.spawn_secrets.lock().await;
+        assert!(
+            envs.contains(&sec1) && envs.contains(&sec2),
+            "both minted secrets must have been injected into the spawn ctx: {envs:?}"
+        );
+    }
+
+    /// v0.8.7 review-fix (R-M1) — the gate authenticates the `(role, secret)`
+    /// PAIR, not a plaintext role. Right pair → ok; wrong/empty secret, or the
+    /// right secret with a non-cto claimed role, → reject (fail-closed).
+    #[tokio::test]
+    async fn verify_session_caller_requires_matching_role_and_secret() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-verify");
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "cto".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        let secret = gateway.sessions.get(&sid).unwrap().secret.clone();
+
+        // Correct (role, secret) pair authenticates.
+        assert!(gateway.verify_session_caller("cto", &secret));
+        // Wrong secret → reject.
+        assert!(!gateway.verify_session_caller("cto", "deadbeefdeadbeefdeadbeefdeadbeef"));
+        // Empty secret → reject (fail-closed; never fall-open).
+        assert!(!gateway.verify_session_caller("cto", ""));
+        // Right secret but a role no session runs → reject (pair must match).
+        assert!(!gateway.verify_session_caller("reviewer", &secret));
+        // A role that is not even spawned → reject.
+        assert!(!gateway.verify_session_caller("ghost", &secret));
+    }
+
+    /// v0.8.7 review-fix (R-M3) — `session_resolve(sid).project` is the value
+    /// the daemon gate uses to enforce same-project scope. Confirm it reports
+    /// the project a session was created in (so a project-A caller can be told
+    /// a project-B sid is out of scope).
+    #[tokio::test]
+    async fn session_resolve_reports_owning_project_for_scope_check() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-scope");
+        gateway.register_project("beta", "/tmp/beta-scope");
+        let sa = gateway
+            .create_session_api(
+                "alpha".into(),
+                "cto".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        let sb = gateway
+            .create_session_api(
+                "beta".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        assert_eq!(gateway.session_resolve(&sa).unwrap().project, "alpha");
+        assert_eq!(gateway.session_resolve(&sb).unwrap().project, "beta");
+    }
+
+    /// v0.8.7 review-fix (R-M6) — creating a session for a role with no
+    /// `.claude/agents/<role>.md` (in a project whose agents dir DOES exist, so
+    /// the test-dir exemption doesn't apply) fails with a typed
+    /// [`RoleNotFound`], NOT a generic error. The web create handler downcasts
+    /// this to a 422 instead of a 500.
+    #[tokio::test]
+    async fn create_session_unknown_role_is_role_not_found() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Real ccteam project shape: a `.claude/agents/` dir that holds `cto`
+        // but NOT the role we'll request. The dir's existence flips
+        // `ensure_role_exists` into strict mode.
+        let agents = tmp.path().join(".claude").join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("cto.md"),
+            "---\nname: cto\ndescription: x\n---\nbody\n",
+        )
+        .unwrap();
+
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let err = gateway
+            .create_session_api(
+                "alpha".into(),
+                "no-such-role".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .expect_err("unknown role must error");
+        let typed = err.downcast_ref::<RoleNotFound>();
+        assert!(
+            typed.is_some(),
+            "error must downcast to RoleNotFound (so the web layer can 422), got: {err:#}"
+        );
+        assert_eq!(typed.unwrap().role, "no-such-role");
+        // A seeded role in the SAME project still creates fine (not a blanket
+        // reject of every create once the agents dir exists).
+        assert!(gateway
+            .create_session_api(
+                "alpha".into(),
+                "cto".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .is_ok());
+    }
+
     /// V0.8.6 W5b — `create_session_api` is idempotent on (project, role):
     /// a duplicate call reuses the existing pane / session id rather than
     /// spawning a second thread over the same transcript (same dedup `/new`
@@ -2751,11 +3256,21 @@ mod tests {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
         let a = gateway
-            .create_session_api("alpha".into(), "reviewer".into(), AgentVendor::Claude)
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
             .await
             .unwrap();
         let b = gateway
-            .create_session_api("alpha".into(), "reviewer".into(), AgentVendor::Claude)
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
             .await
             .unwrap();
         assert_eq!(a, b, "same (project, role) reuses the session id");
@@ -2765,6 +3280,396 @@ mod tests {
             1,
             "the pane is started exactly once"
         );
+    }
+
+    /// v0.8.7 W2 (DB.1) — `/new claude reviewer hitl` parses the trailing
+    /// token and threads `PermissionMode::Hitl` all the way to the adapter's
+    /// SpawnCtx; the SessionView reports `hitl`. A plain `/new` stays skip.
+    #[tokio::test]
+    async fn new_command_parses_hitl_token_and_threads_mode() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+
+        let created = gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer hitl")
+            .await
+            .unwrap();
+        assert_eq!(created.len(), 1);
+        assert!(
+            created[0].contains("hitl"),
+            "the /new receipt should mention hitl, got: {created:?}"
+        );
+
+        // The SpawnCtx that reached the adapter carried Hitl.
+        assert_eq!(
+            fake.spawn_modes.lock().await.as_slice(),
+            &[PermissionMode::Hitl]
+        );
+        // The view reports the posture.
+        let views = gateway.session_views();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].permission_mode, "hitl");
+    }
+
+    /// v0.8.7 review-fix (R-M2) — `/new claude cto hitl` onto an already-live
+    /// skip cto pane must NOT claim hitl in the receipt. The first plain
+    /// message auto-spawns a skip cto; the subsequent `/new … hitl` hits the
+    /// dedup branch (same (project, cto) pane), which CANNOT change the live
+    /// process's spawn flag — so the receipt must say it's still skip, never
+    /// falsely report hitl (the dangerous "you think it's supervised but it
+    /// isn't" direction). Only ONE spawn happened, and it was skip.
+    #[tokio::test]
+    async fn new_hitl_onto_live_skip_pane_receipt_does_not_claim_hitl() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-rm2");
+
+        // First message auto-spawns the default cto in SKIP mode.
+        gateway
+            .handle_text("mock", "chat-1", "alice", "hello")
+            .await
+            .unwrap();
+
+        // Now ask for hitl on the same (project, cto) — reuses the skip pane.
+        let receipt = gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude cto hitl")
+            .await
+            .unwrap();
+        assert_eq!(receipt.len(), 1);
+        assert!(
+            !receipt[0].contains("non-allowlist tools need IM approval"),
+            "must NOT falsely promise hitl supervision on a reused skip pane: {receipt:?}"
+        );
+        assert!(
+            receipt[0].contains("skip"),
+            "receipt must tell the truth that the pane is still skip: {receipt:?}"
+        );
+
+        // Exactly one spawn, and it was skip — the hitl request did not (and
+        // could not) restart the pane with the hitl flag.
+        assert_eq!(
+            fake.spawn_modes.lock().await.as_slice(),
+            &[PermissionMode::Skip],
+            "no second spawn; the live skip pane was reused as-is"
+        );
+        let views = gateway.session_views();
+        assert_eq!(views.len(), 1, "one (project, cto) session, reused");
+        assert_eq!(
+            views[0].permission_mode, "skip",
+            "the live posture is still skip"
+        );
+    }
+
+    /// v0.8.7 review-fix (R-M2) — the inverse honest case: a FRESH `/new …
+    /// hitl` (no prior pane) does spawn hitl and the receipt says so. Guards
+    /// against the fix over-correcting into never reporting hitl.
+    #[tokio::test]
+    async fn new_hitl_fresh_spawn_receipt_reports_hitl() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-rm2b");
+        let receipt = gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude cto hitl")
+            .await
+            .unwrap();
+        assert!(
+            receipt[0].contains("non-allowlist tools need IM approval"),
+            "a fresh hitl spawn must report hitl: {receipt:?}"
+        );
+        assert_eq!(
+            fake.spawn_modes.lock().await.as_slice(),
+            &[PermissionMode::Hitl]
+        );
+    }
+
+    #[tokio::test]
+    async fn new_command_defaults_to_skip() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        assert_eq!(
+            fake.spawn_modes.lock().await.as_slice(),
+            &[PermissionMode::Skip],
+            "absent trailing token ⇒ skip"
+        );
+        assert_eq!(gateway.session_views()[0].permission_mode, "skip");
+    }
+
+    #[tokio::test]
+    async fn new_command_rejects_bad_permission_token() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        // A bad trailing token is a command error (surfaces the typo); no
+        // session is spawned.
+        let res = gateway
+            .handle_command(
+                &ChatKey::new("mock", "chat-1", "alice"),
+                "/new claude reviewer bogus",
+            )
+            .await;
+        assert!(res.is_err(), "a bad permission token must be rejected");
+        assert_eq!(
+            fake.starts.load(Ordering::SeqCst),
+            0,
+            "no spawn on bad token"
+        );
+    }
+
+    /// v0.8.7 W2 (DB.1) — a `/role` re-spawn preserves the session's hitl
+    /// posture (the new pane re-applies the same spawn flag + hook install).
+    #[tokio::test]
+    async fn role_switch_preserves_hitl_mode() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        // The role validation reads `.claude/agents/<role>.md` under the
+        // project dir, so seed a target role on disk in a tempdir project.
+        let proj = tempfile::TempDir::new().unwrap();
+        let agents = proj.path().join(".claude/agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(agents.join("cto.md"), "---\nname: cto\n---\nx").unwrap();
+        std::fs::write(agents.join("builder.md"), "---\nname: builder\n---\nx").unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
+
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude cto hitl")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/role builder")
+            .await
+            .unwrap();
+
+        // Two spawns: the cto (hitl) + the builder re-spawn — both hitl.
+        assert_eq!(
+            fake.spawn_modes.lock().await.as_slice(),
+            &[PermissionMode::Hitl, PermissionMode::Hitl],
+            "/role must preserve the hitl posture across the re-spawn"
+        );
+        // Same sid, still hitl in the view.
+        let views = gateway.session_views();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].role, "builder");
+        assert_eq!(views[0].permission_mode, "hitl");
+    }
+
+    /// v0.8.7 W2 (DB.3) — `session_sid_for(slug, role)` maps a firing
+    /// session's (project, role) back to its gateway sid (for the HITL
+    /// approval prompt label).
+    #[tokio::test]
+    async fn session_sid_for_maps_project_role_to_sid() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Hitl,
+            )
+            .await
+            .unwrap();
+        assert_eq!(gateway.session_sid_for("alpha", "reviewer"), Some(sid));
+        assert_eq!(gateway.session_sid_for("alpha", "ghost"), None);
+        assert_eq!(gateway.session_sid_for("other", "reviewer"), None);
+    }
+
+    /// v0.8.7 (FIX-1) — `reply_target_for(project, role)` resolves a live
+    /// session's reply target from the in-memory map, with NO on-disk registry
+    /// involved. After a `/new` + a driving message the session's `reply_to`
+    /// points at the chat that last drove it, so an outbound `chat_send_file`
+    /// can deliver back to that chat without a prior `chat_register_bot`.
+    #[tokio::test]
+    async fn reply_target_for_resolves_live_session_without_registry() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-fix1");
+        // Create + drive a session from a specific chat (sets reply_to → chat).
+        gateway
+            .handle_text("telegram", "chat-99", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("telegram", "chat-99", "alice", "hello")
+            .await
+            .unwrap();
+        // The live target is the driving chat — resolved purely from memory.
+        assert_eq!(
+            gateway.reply_target_for("alpha", "reviewer"),
+            Some(("telegram".to_string(), "chat-99".to_string()))
+        );
+        // No tracked session for these → None (caller falls back to registry).
+        assert_eq!(gateway.reply_target_for("alpha", "ghost"), None);
+        assert_eq!(gateway.reply_target_for("other", "reviewer"), None);
+    }
+
+    /// v0.8.7 (FIX-2) — when the project HAS a `.claude/agents/` dir, a create
+    /// path that names a role with no `<role>.md` is rejected fast (no session
+    /// created, no dead pane), while a seeded role succeeds. This is the web
+    /// `assistant`-default bug: an undefined agent must never spawn.
+    #[tokio::test]
+    async fn create_session_rejects_unseeded_role_when_agents_dir_present() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        // Real project dir WITH an agents dir → strict validation applies.
+        let proj = tempfile::TempDir::new().unwrap();
+        seed_role(proj.path(), "cto");
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
+
+        // Unseeded role → fail fast, nothing spawned, no session tracked.
+        let err = gateway
+            .create_session_api(
+                "alpha".into(),
+                "assistant".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("assistant.md"),
+            "clear hint expected; got: {msg}"
+        );
+        assert_eq!(
+            fake.starts.load(Ordering::SeqCst),
+            0,
+            "no spawn on bad role"
+        );
+        assert!(
+            gateway.session_views().is_empty(),
+            "rejected role must not appear in session ls"
+        );
+
+        // Seeded role → ok.
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "cto".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        assert_eq!(sid, "s1");
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
+    }
+
+    /// v0.8.7 (FIX-2) — the test-dir exemption: a bare project dir with NO
+    /// `.claude/agents/` dir (the gateway's many fake-adapter tests) skips
+    /// persona validation so routing tests don't have to scaffold a role tree.
+    #[tokio::test]
+    async fn create_session_skips_validation_without_agents_dir() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-no-agents");
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "anything".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        assert_eq!(sid, "s1");
+    }
+
+    /// v0.8.7 W2 (DB.1) — a hitl session's mode survives a daemon restart:
+    /// persist → reload → the restored session reports hitl. Uses a state file
+    /// so the SavedGatewaySession serde round-trip is exercised.
+    #[tokio::test]
+    async fn hitl_mode_persists_across_reload() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = tmp.path().join("gateway-state.json");
+        {
+            let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+            let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+            gateway.enable_persistence(&state).unwrap();
+            gateway
+                .create_session_api(
+                    "alpha".into(),
+                    "reviewer".into(),
+                    AgentVendor::Claude,
+                    PermissionMode::Hitl,
+                )
+                .await
+                .unwrap();
+        }
+        // Fresh gateway loading the same state file.
+        let fake2 = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gw2 = Gateway::new(fake2.clone(), "alpha", "/tmp/alpha");
+        gw2.enable_persistence(&state).unwrap();
+        let views = gw2.session_views();
+        assert_eq!(views.len(), 1, "the session restored from disk");
+        assert_eq!(
+            views[0].permission_mode, "hitl",
+            "the hitl posture must survive the persist/reload round-trip"
+        );
+    }
+
+    /// v0.8.7 W1 — `session_resolve` is the collect-side accessor: it maps a
+    /// gateway sid to the role + absolute project_dir a collector tails for
+    /// `.ccteam/chat/<role>/turns.jsonl`. End-to-end with the real fake: spawn
+    /// a session, submit a turn, then resolve the sid and read back the child's
+    /// answer from a turns.jsonl mirror (the exact pipeline `session_collect`
+    /// runs daemon-side). Unknown sid → None (→ tool error at the edge).
+    #[tokio::test]
+    async fn gateway_session_resolve_then_collect_child_turns() {
+        use ccteam_harness::execution::turns_mirror::{append_turn, read_all_turns, TurnRecord};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        // The default project "alpha" points at the sandbox dir so the
+        // collect-side turns.jsonl write stays inside the tempdir.
+        let mut gateway = Gateway::new(fake.clone(), "alpha", project_dir.clone());
+
+        // cto spawns a work-role session + dispatches a task (gateway-driven
+        // half of session_spawn / session_dispatch).
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        assert_eq!(sid, "s1");
+        let _turn = gateway
+            .submit_to_sid(&sid, "review the diff".into())
+            .await
+            .unwrap();
+
+        // session_collect resolves the sid → role + project_dir, then tails
+        // the ccteam-owned mirror. Unknown sid is None.
+        assert!(gateway.session_resolve("s99").is_none());
+        let resolved = gateway.session_resolve(&sid).expect("known sid resolves");
+        assert_eq!(resolved.sid, "s1");
+        assert_eq!(resolved.role, "reviewer");
+        assert_eq!(resolved.project, "alpha");
+        assert_eq!(resolved.project_dir, project_dir);
+
+        // Simulate the child's answer being mirrored to turns.jsonl (in
+        // production the event pump + turns_mirror consumer write this; the
+        // collect tool only READS it).
+        append_turn(
+            &resolved.project_dir,
+            &resolved.role,
+            &TurnRecord {
+                turn_id: "t1".into(),
+                ts: chrono::Utc::now(),
+                vendor: "claude".into(),
+                role: resolved.role.clone(),
+                user: "review the diff".into(),
+                assistant: "LGTM, two nits inline.".into(),
+                usage: serde_json::Value::Null,
+                tool_calls: vec![],
+            },
+        )
+        .unwrap();
+
+        let turns = read_all_turns(&resolved.project_dir, &resolved.role).unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].assistant, "LGTM, two nits inline.");
+        assert_eq!(turns[0].turn_id, "t1");
     }
 
     /// P3 — `/sessions` appends each session's model + ctx from
@@ -3286,6 +4191,7 @@ mod tests {
         let state_path = tmp.path().join("gateway-state.json");
         let fake = Arc::new(FakeAdapter::default());
 
+        let original_secret;
         {
             let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
             gateway.register_project("beta", "/tmp/beta");
@@ -3298,11 +4204,22 @@ mod tests {
                 .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
                 .await
                 .unwrap();
+            // R-M1 — the minted secret is non-empty and will be persisted.
+            original_secret = gateway.sessions.get("s1").unwrap().secret.clone();
+            assert_eq!(original_secret.len(), 32);
         }
 
         let mut restored = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
         restored.register_project("beta", "/tmp/beta");
         restored.enable_persistence(&state_path).unwrap();
+
+        // R-M1 — the per-session secret survives the daemon restart so the gate
+        // map still matches the live pane's `CCTEAM_CHAT_SECRET`.
+        assert_eq!(
+            restored.sessions.get("s1").unwrap().secret,
+            original_secret,
+            "the cto-gate secret must round-trip through persisted state"
+        );
 
         let sessions = restored
             .handle_text("mock", "chat-1", "alice", "/sessions")
@@ -3734,12 +4651,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(first, vec!["created session s1"]);
-        // Same project + role → reuse s1, not a new sid.
+        // Same project + role → reuse s1, not a new sid. v0.8.7 review-fix
+        // (R-M2): the receipt now truthfully says it REUSED the pane (both
+        // requests are skip, so no false-hitl concern here).
         let again = gateway
             .handle_text("mock", "chat-1", "alice", "/new claude assistant")
             .await
             .unwrap();
-        assert_eq!(again, vec!["created session s1"]);
+        assert_eq!(again, vec!["复用 session s1"]);
         // A different role → a genuinely distinct pane/session.
         let other_role = gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
@@ -3770,8 +4689,10 @@ mod tests {
         let fake = Arc::new(FakeAdapter::default());
         // `/role` validates `.claude/agents/<role>.md` under the project dir
         // before re-spawning, so point the project at a real temp dir and seed
-        // the target role there.
+        // the target role there. v0.8.7 (FIX-2): the create path now validates
+        // too, so the default `cto` (spawned by `/new`) must also be seeded.
         let tmp = tempfile::tempdir().unwrap();
+        seed_role(tmp.path(), "cto");
         seed_role(tmp.path(), "reviewer");
         let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
 
@@ -3841,7 +4762,10 @@ mod tests {
     async fn gateway_role_missing_role_keeps_session_intact() {
         let fake = Arc::new(FakeAdapter::default());
         let tmp = tempfile::tempdir().unwrap();
-        // `reviewer` exists; `ghost` deliberately does not.
+        // `cto` (the `/new` default) + `reviewer` exist; `ghost` deliberately
+        // does not. v0.8.7 (FIX-2): the create path validates the persona, so
+        // the default `cto` must be seeded for `/new` to succeed.
+        seed_role(tmp.path(), "cto");
         seed_role(tmp.path(), "reviewer");
         let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
 
@@ -4027,6 +4951,131 @@ mod tests {
             .unwrap();
         assert_eq!(replies, vec!["this choice has expired".to_string()]);
         assert!(shared.lock().await.is_empty());
+    }
+
+    /// A HITL approve/deny ChoicePrompt (the exact 2-option shape the daemon's
+    /// `permission/ask` handler mints): ids are the decision wire values.
+    fn permission_prompt(token: &str) -> ChoicePrompt {
+        ChoicePrompt {
+            token: token.to_string(),
+            title: "session s1 (cto) wants to run: Bash rm -rf /".to_string(),
+            options: vec![
+                ChoiceOption {
+                    id: "allow".into(),
+                    label: "✅ Approve".into(),
+                },
+                ChoiceOption {
+                    id: "deny".into(),
+                    label: "⛔ Deny".into(),
+                },
+            ],
+            multi: false,
+        }
+    }
+
+    /// v0.8.7 review-fix (R-H1) — the web HITL APPROVE path: the daemon's
+    /// `permission/ask` handler registers a token-keyed External pending in the
+    /// SHARED registry and blocks on its oneshot; the web `/resolve` endpoint
+    /// calls `Gateway::resolve_web_selection(token, "allow")`, which routes
+    /// through the SAME `take_by_token` → `apply_pending` machinery an IM click
+    /// uses. The blocked hook then receives `allow` over the oneshot (→ the tool
+    /// runs). This is NOT a turn; there is no gateway session for the chat,
+    /// proving resolution is purely token-based. Single-flight: the pending is
+    /// consumed.
+    #[tokio::test]
+    async fn web_resolve_approve_delivers_allow_over_oneshot() {
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        let shared = Arc::new(Mutex::new(crate::pending::PendingInteractions::new()));
+        gateway.set_pending(shared.clone());
+
+        let token = "pcafef00d";
+        let (tx, rx) = tokio::sync::oneshot::channel::<ChoiceSelection>();
+        shared.lock().await.register(
+            token.to_string(),
+            permission_prompt(token),
+            InteractionOrigin::External { reply: tx },
+            Instant::now() + std::time::Duration::from_secs(600),
+        );
+
+        // The web user clicks [Approve] → POST /resolve {token, selection:"allow"}.
+        gateway
+            .resolve_web_selection(token, "allow")
+            .await
+            .expect("approve resolves cleanly");
+
+        // The blocked permission hook receives the decision (→ {behavior:allow}).
+        let got = rx.await.expect("oneshot delivered");
+        assert_eq!(got.ids, vec!["allow".to_string()]);
+        assert_eq!(got.token, token);
+        // Single-flight: pending consumed.
+        assert!(
+            shared.lock().await.is_empty(),
+            "pending consumed on resolve"
+        );
+    }
+
+    /// v0.8.7 review-fix (R-H1) — the web HITL DENY path: `[Deny]` resolves
+    /// immediately to `deny` over the oneshot (no 600s timeout). Same machinery.
+    #[tokio::test]
+    async fn web_resolve_deny_delivers_deny_over_oneshot() {
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        let shared = Arc::new(Mutex::new(crate::pending::PendingInteractions::new()));
+        gateway.set_pending(shared.clone());
+
+        let token = "pf00dbabe";
+        let (tx, rx) = tokio::sync::oneshot::channel::<ChoiceSelection>();
+        shared.lock().await.register(
+            token.to_string(),
+            permission_prompt(token),
+            InteractionOrigin::External { reply: tx },
+            Instant::now() + std::time::Duration::from_secs(600),
+        );
+
+        gateway
+            .resolve_web_selection(token, "deny")
+            .await
+            .expect("deny resolves cleanly");
+
+        let got = rx.await.expect("oneshot delivered");
+        assert_eq!(got.ids, vec!["deny".to_string()]);
+        assert!(shared.lock().await.is_empty());
+    }
+
+    /// v0.8.7 review-fix (R-H1) — an unknown/expired token is a clean `Err`
+    /// (the HTTP layer maps it to a 4xx), NOT a turn and NOT a panic; the
+    /// registry is left untouched. Likewise a valid token with an option id
+    /// that isn't in the prompt is rejected (and does NOT silently resolve).
+    #[tokio::test]
+    async fn web_resolve_unknown_token_and_bad_option_are_errors() {
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        let shared = Arc::new(Mutex::new(crate::pending::PendingInteractions::new()));
+        gateway.set_pending(shared.clone());
+
+        // Unknown token → Err, registry untouched (it's empty here).
+        assert!(
+            gateway
+                .resolve_web_selection("nope", "allow")
+                .await
+                .is_err(),
+            "unknown token must be an Err (→ 4xx), never a turn"
+        );
+
+        // Register a real pending, then send a bogus option id → Err.
+        let token = "pdeadbeef";
+        let (tx, _rx) = tokio::sync::oneshot::channel::<ChoiceSelection>();
+        shared.lock().await.register(
+            token.to_string(),
+            permission_prompt(token),
+            InteractionOrigin::External { reply: tx },
+            Instant::now() + std::time::Duration::from_secs(600),
+        );
+        assert!(
+            gateway.resolve_web_selection(token, "maybe").await.is_err(),
+            "an option id not in the prompt must be an Err"
+        );
     }
 
     /// Timeout/drain: an External pending that lapses is returned by

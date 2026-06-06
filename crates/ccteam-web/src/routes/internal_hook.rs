@@ -6,16 +6,19 @@
 //! sluggishness). The wire shape is intentionally narrow: the script in
 //! `~/.ccteam/hooks/hook.sh` packages the Claude Code hook stdin as the
 //! POST body and forwards the subcommand `<kind>` (`progress-append` /
-//! `load-context` / `intercept-ask` / `chat-progress`) + the optional
-//! `<action>` (the event-type arg for `progress-append` /
-//! `chat-progress`) through the path. The handler calls
-//! `ccteam_hooks::dispatch` — the same library entry the CLI uses —
+//! `load-context` / `intercept-ask` / `permission-request` /
+//! `chat-progress`) + the optional `<action>` (the event-type arg for
+//! `progress-append` / `chat-progress`) through the path. The handler
+//! calls `ccteam_hooks::dispatch` — the same library entry the CLI uses —
 //! and returns:
 //!
 //! - `{}` for fire-and-forget hooks (Claude Code treats empty / `{}`
 //!   stdout as "allow with no notes"),
 //! - the structured decision JSON for `intercept-ask` (the assistant
-//!   sees the deny reason inline).
+//!   sees the deny reason inline) and `permission-request` (the HITL
+//!   allow/deny decision — this one blocks on the mcp.sock for up to the
+//!   daemon's ~600s approval TTL, which is why the dispatch runs on the
+//!   blocking pool below).
 //!
 //! Auth: this router sits under the same `auth_layer` middleware as the
 //! rest of the stateful router. Loopback bind defaults to no auth (the

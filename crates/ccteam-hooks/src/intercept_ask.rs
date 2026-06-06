@@ -174,15 +174,19 @@ fn try_intercept_ask_chat(paths: &CcteamPaths, stdin: &Value) -> Option<Value> {
 }
 
 /// `std::env::var` filtered to a non-empty value.
-fn non_empty_env(key: &str) -> Option<String> {
+pub(crate) fn non_empty_env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.is_empty())
 }
 
 /// Send one newline-framed JSON-RPC request to the daemon `mcp.sock` and read
 /// one newline-framed JSON-RPC response. Blocking (the hook is a short-lived
 /// subprocess). `None` on any IO / parse failure → the caller denies.
+///
+/// v0.8.7 W2 — `pub(crate)` so the `permission_request` hook can reuse the
+/// exact same long-held (≤660s client guard, daemon owns the real TTL)
+/// round-trip rather than duplicating the socket plumbing.
 #[cfg(unix)]
-fn mcp_socket_roundtrip(socket: &std::path::Path, request: &Value) -> Option<Value> {
+pub(crate) fn mcp_socket_roundtrip(socket: &std::path::Path, request: &Value) -> Option<Value> {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
 
@@ -207,7 +211,7 @@ fn mcp_socket_roundtrip(socket: &std::path::Path, request: &Value) -> Option<Val
 }
 
 #[cfg(not(unix))]
-fn mcp_socket_roundtrip(_socket: &std::path::Path, _request: &Value) -> Option<Value> {
+pub(crate) fn mcp_socket_roundtrip(_socket: &std::path::Path, _request: &Value) -> Option<Value> {
     None
 }
 

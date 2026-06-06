@@ -39,7 +39,9 @@ use crate::commands::collect_projects;
 // CCTEAM_DISABLE_TOOLS group filter. Wave 2/3 fills the chat / advise
 // dispatch handlers; Wave 1 lands stubs so the tool surface shape +
 // group disable env are usable end-to-end.
-use crate::{mcp_admin_tools, mcp_advise_tools, mcp_chat_tools, mcp_tool_groups};
+use crate::{
+    mcp_admin_tools, mcp_advise_tools, mcp_chat_tools, mcp_session_tools, mcp_tool_groups,
+};
 
 /// Stable MCP protocol version this server speaks. Newer client versions
 /// downgrade gracefully because we never advertise capabilities we don't
@@ -340,11 +342,11 @@ fn tools_list_response() -> Value {
 }
 
 /// Single source of truth for the MCP tool surface. admin has 3 (`ls` +
-/// `change_persona` + `add_tool`); chat has 6; advise has 2;
-/// `ccteam__screenshot` is its own single-member group → **12 total**.
-/// All tools carry a group sub-prefix (`admin_`, `chat_`, `advise_`)
-/// except `ccteam__screenshot` which keeps its single-member-group name
-/// for V0.5 muscle memory.
+/// `change_persona` + `add_tool`); chat has 6; advise has 2; session has 5
+/// (v0.8.7 W1 cto scheduling); `ccteam__screenshot` is its own
+/// single-member group → **17 total**. All tools carry a group sub-prefix
+/// (`admin_`, `chat_`, `advise_`, `session_`) except `ccteam__screenshot`
+/// which keeps its single-member-group name for V0.5 muscle memory.
 pub(crate) fn tool_definitions() -> Vec<Value> {
     let mut tools: Vec<Value> = vec![
         // Read-only inspection.
@@ -379,6 +381,10 @@ pub(crate) fn tool_definitions() -> Vec<Value> {
     // per-vendor budget ledger).
     tools.extend(mcp_chat_tools::chat_tool_definitions());
     tools.extend(mcp_advise_tools::advise_tool_definitions());
+    // v0.8.7 W1 — session group (5): spawn / dispatch / collect / list /
+    // stop. cto-only scheduling over the gateway session map; stdio side
+    // forwards to the daemon.
+    tools.extend(mcp_session_tools::session_tool_definitions());
     // V0.6.1 F128 — `admin_change_persona` + `admin_add_tool` real
     // tools land here. The pre-existing `admin_ls` stays inline above
     // (it's the V0.5 read-only entry; the two F128 mutators move the
@@ -437,6 +443,14 @@ async fn call_tool(paths: &CcteamPaths, params: &Value) -> Result<Vec<Value>> {
             if let Some(body) = mcp_chat_tools::dispatch(paths, other, &args)? {
                 return Ok(text_content(body));
             }
+            // v0.8.7 W1 — session group (cto scheduling). The stdio
+            // dispatcher injects the ambient caller identity and forwards
+            // to the daemon over mcp.sock (the daemon owns the gateway +
+            // enforces the cto-only gate). Returns Ok(None) for foreign
+            // tools so the fall-through is preserved.
+            if let Some(body) = mcp_session_tools::dispatch(paths, other, &args).await? {
+                return Ok(text_content(body));
+            }
             // V0.6.5 F152 + F153 — advise group: real `advise_vote` +
             // `advise_parallel` (Claude + Codex parallel one-shot
             // advisors + verdict synthesis / N-of-N). Async dispatch
@@ -493,7 +507,7 @@ async fn forward_chat_send_file(paths: &CcteamPaths, args: &Value) -> Result<Vec
 /// tool result, **propagating `isError`** so a synchronous failure
 /// (missing / oversized / unregistered) surfaces to the agent as a tool
 /// error rather than a success carrying error text.
-fn forward_outcome(resp: &Value) -> Result<Vec<Value>> {
+pub(crate) fn forward_outcome(resp: &Value) -> Result<Vec<Value>> {
     let text = resp
         .pointer("/result/content/0/text")
         .and_then(|t| t.as_str())
@@ -512,7 +526,7 @@ fn forward_outcome(resp: &Value) -> Result<Vec<Value>> {
 /// Open a one-shot connection to the daemon `mcp.sock`, send one
 /// JSON-RPC line, and read one response line back.
 #[cfg(unix)]
-async fn forward_to_socket(socket: &std::path::Path, req: &Value) -> Result<Value> {
+pub(crate) async fn forward_to_socket(socket: &std::path::Path, req: &Value) -> Result<Value> {
     use tokio::io::AsyncWriteExt as _;
     let stream = tokio::net::UnixStream::connect(socket)
         .await
@@ -531,7 +545,7 @@ async fn forward_to_socket(socket: &std::path::Path, req: &Value) -> Result<Valu
 }
 
 #[cfg(not(unix))]
-async fn forward_to_socket(_socket: &std::path::Path, _req: &Value) -> Result<Value> {
+pub(crate) async fn forward_to_socket(_socket: &std::path::Path, _req: &Value) -> Result<Value> {
     Err(anyhow!("mcp.sock forwarding is unix-only"))
 }
 
@@ -750,9 +764,9 @@ mod tests {
 
     #[test]
     fn tool_definitions_count_matches_spec() {
-        // admin 3 + screenshot 1 + chat 6 + advise 2 = 12.
+        // admin 3 + screenshot 1 + chat 6 + advise 2 + session 5 = 17.
         // Bump this when a new tool lands.
-        assert_eq!(tool_definitions().len(), 12);
+        assert_eq!(tool_definitions().len(), 17);
     }
 
     #[test]
@@ -761,7 +775,7 @@ mod tests {
         let mut names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), 12, "tool names must be unique");
+        assert_eq!(names.len(), 17, "tool names must be unique");
         for tool in &tools {
             assert!(tool["name"].as_str().unwrap().starts_with("ccteam__"));
             assert_eq!(tool["inputSchema"]["type"], "object");
@@ -926,7 +940,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_tools_list_returns_full_tool_set() {
-        // admin 3 + screenshot 1 + chat 6 + advise 2 = 12.
+        // admin 3 + screenshot 1 + chat 6 + advise 2 + session 5 = 17.
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = CcteamPaths {
             root: tmp.path().join("home"),
@@ -940,7 +954,7 @@ mod tests {
         });
         let resp = handle_request(&paths, &req).await.unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 12);
+        assert_eq!(tools.len(), 17);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"ccteam__admin_ls"));
         assert!(names.contains(&"ccteam__screenshot"));
@@ -948,6 +962,12 @@ mod tests {
         // V0.6.0 Wave 1 — chat / advise stubs present.
         assert!(names.contains(&"ccteam__chat_send_input"));
         assert!(names.contains(&"ccteam__advise_vote"));
+        // v0.8.7 W1 — session group (cto scheduling).
+        assert!(names.contains(&"ccteam__session_spawn"));
+        assert!(names.contains(&"ccteam__session_dispatch"));
+        assert!(names.contains(&"ccteam__session_collect"));
+        assert!(names.contains(&"ccteam__session_list"));
+        assert!(names.contains(&"ccteam__session_stop"));
         // V0.6.5 F146 — chat register / unregister land here, and the
         // old `chat_lifecycle` is gone (no deprecated alias).
         assert!(names.contains(&"ccteam__chat_register_bot"));

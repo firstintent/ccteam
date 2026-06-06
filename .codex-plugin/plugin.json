@@ -1,7 +1,7 @@
 {
   "name": "ccteam",
-  "version": "0.8.6",
-  "description": "Multi-vendor (Claude + Codex) AI dev-team orchestration: 20 MCP tools + IM bots + dual-LLM voting.",
+  "version": "0.8.7",
+  "description": "Multi-vendor (Claude + Codex) AI dev-team orchestration: 17 MCP tools + IM bots + dual-LLM voting.",
   "author": {
     "name": "FirstIntent"
   },

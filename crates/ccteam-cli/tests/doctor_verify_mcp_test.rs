@@ -8,7 +8,7 @@
 //! must not regress.
 //!
 //! Tests cover:
-//!   - active tool count matches the spec (12, see
+//!   - active tool count matches the spec (17, see
 //!     `mcp_serve::tool_definitions_count_matches_spec`)
 //!   - `STUB_TOOLS` is empty after V0.6.5 ship (asserted via the
 //!     `stub_count: 0` line + empty `unexpected_stubs` array)
@@ -45,16 +45,16 @@ fn run_doctor_verify_mcp(extra_args: &[&str]) -> (String, String, i32) {
 }
 
 #[test]
-fn active_count_is_12_and_stub_count_is_0_on_clean_tree() {
-    // admin 3 + screenshot 1 + chat 6 + advise 2 = 12. The STUB
-    // allow-list (`mcp_tool_groups::STUB_TOOLS`) is empty. F171 is the
+fn active_count_is_17_and_stub_count_is_0_on_clean_tree() {
+    // admin 3 + screenshot 1 + chat 6 + advise 2 + session 5 = 17. The
+    // STUB allow-list (`mcp_tool_groups::STUB_TOOLS`) is empty. F171 is the
     // automated assertion.
     let (stdout, stderr, code) = run_doctor_verify_mcp(&["--json"]);
     assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     let v: Value = serde_json::from_str(&stdout).expect("stdout is JSON");
     assert_eq!(v["ok"], Value::Bool(true), "{v}");
-    assert_eq!(v["total_tools"], Value::Number(12.into()), "{v}");
-    assert_eq!(v["active_count"], Value::Number(12.into()), "{v}");
+    assert_eq!(v["total_tools"], Value::Number(17.into()), "{v}");
+    assert_eq!(v["active_count"], Value::Number(17.into()), "{v}");
     assert_eq!(v["stub_count"], Value::Number(0.into()), "{v}");
     assert!(v["unexpected_stubs"].as_array().unwrap().is_empty(), "{v}");
 }
@@ -79,7 +79,7 @@ fn json_output_schema_includes_per_group_and_tool_list() {
     // Every shipped group with ≥1 tool is represented with `active` +
     // `stub` keys. (The `workflow` group was retired — 0 members — so it
     // no longer appears in `per_group`, which is built from live tools.)
-    for group in ["admin", "screenshot", "chat", "advise"] {
+    for group in ["admin", "screenshot", "chat", "advise", "session"] {
         let g = v["per_group"].get(group).unwrap_or_else(|| {
             panic!("per_group missing `{group}` in {v}");
         });
@@ -104,6 +104,7 @@ fn json_output_schema_includes_per_group_and_tool_list() {
     assert!(names.contains(&"ccteam__screenshot"));
     assert!(names.contains(&"ccteam__chat_send_input"));
     assert!(names.contains(&"ccteam__advise_vote"));
+    assert!(names.contains(&"ccteam__session_spawn"));
     // The retired workflow tools are gone from the live surface.
     assert!(!names.contains(&"ccteam__workflow_show"));
 }
@@ -120,8 +121,8 @@ fn human_readable_output_contains_verdict_pass_and_breakdown() {
         stdout.contains("V0.6.6 F171"),
         "header must carry F171 marker for traceability: {stdout}",
     );
-    assert!(stdout.contains("total tools:    12"), "got: {stdout}");
-    assert!(stdout.contains("active:         12"), "got: {stdout}");
+    assert!(stdout.contains("total tools:    17"), "got: {stdout}");
+    assert!(stdout.contains("active:         17"), "got: {stdout}");
     assert!(stdout.contains("stubs:          0"), "got: {stdout}");
     assert!(stdout.contains("per-group breakdown:"), "got: {stdout}");
     // Verdict line on clean tree.
@@ -185,6 +186,7 @@ fn human_mode_lists_every_shipped_group_with_active_count() {
         ("screenshot:", 1),
         ("chat:", 6),
         ("advise:", 2),
+        ("session:", 5),
     ] {
         let needle = format!("{group}    {active} active / 0 stub");
         // Allow extra padding on either side — exact spacing depends

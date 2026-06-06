@@ -58,8 +58,8 @@ use crate::execution::transcript_tail::{
 use crate::execution::turns_mirror;
 use crate::{default_backend, MuxSessionId, MuxSessionKind, MuxSessionSpec};
 use crate::{
-    AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx,
-    ThreadEvent, ThreadHandle, TurnId, TurnInput, CLAUDE_BIN_ENV,
+    AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, PermissionMode,
+    SpawnCtx, ThreadEvent, ThreadHandle, TurnId, TurnInput, CLAUDE_BIN_ENV,
 };
 use crate::{ChoiceOption, ChoicePrompt, Directive, DirectiveOutcome, ThreadStatus};
 
@@ -121,10 +121,26 @@ pub fn chat_session_id_name(slug: &str, role: &str) -> String {
 /// write. When the flag is unset (the default) the command string is
 /// byte-for-byte the pre-W6 `{hook_sh} chat-progress {arg}` form.
 ///
+/// v0.8.7 W2 (DB.2) — `permission_mode` controls whether the
+/// `PermissionRequest` hook is installed. `Hitl` adds a `PermissionRequest`
+/// entry (no `matcher` = all tools, NO `timeout` field so a long human
+/// approval is not killed) that routes to `{hook_sh} permission-request`;
+/// `Skip` installs no such entry (and the spawn keeps
+/// `--dangerously-skip-permissions`, so the ask-path never fires anyway).
+/// SMOKE-GATE GROUND TRUTH: the hook fires only when the per-tool decision
+/// is "ask"; allowlist / auto-allowed tools fire no hook — so a non-hitl
+/// session must NOT carry this entry.
+///
 /// Idempotent: existing hooks for other events (and any other keys already
 /// in settings.local.json) are preserved; existing chat-progress +
-/// AskUserQuestion entries are replaced.
-pub fn ensure_chat_hooks_installed(project_dir: &Path, hook_sh: &str) -> Result<(), HarnessError> {
+/// AskUserQuestion entries are replaced. The `PermissionRequest` entry is
+/// removed when `permission_mode` is `Skip` (so toggling a session back to
+/// skip on the next spawn cleans it up).
+pub fn ensure_chat_hooks_installed(
+    project_dir: &Path,
+    hook_sh: &str,
+    permission_mode: PermissionMode,
+) -> Result<(), HarnessError> {
     let settings_dir = project_dir.join(".claude");
     std::fs::create_dir_all(&settings_dir)
         .map_err(|e| HarnessError::Io(format!("create {}: {e}", settings_dir.display())))?;
@@ -214,6 +230,34 @@ pub fn ensure_chat_hooks_installed(project_dir: &Path, hook_sh: &str) -> Result<
         pre_tool_use.push(ask_entry);
     }
 
+    // v0.8.7 W2 (DB.2/DB.3) — HITL: install the `PermissionRequest` hook for
+    // a hitl session only. SMOKE-GATE GROUND TRUTH: this hook fires ONLY when
+    // a tool's permission decision is "ask" (non-allowlist); allowlist /
+    // auto-allowed tools fire no hook. The handler (`{hook_sh}
+    // permission-request`) blocks on an IM approve/deny round-trip over the
+    // daemon mcp.sock and prints the `{behavior:allow|deny}` decision to
+    // stdout. NO `timeout` field: the human approval can take up to ~600s
+    // (the daemon enforces the real TTL), so a Claude-Code-side hook timeout
+    // would kill it before the user answers. `matcher` omitted = all tools.
+    // For a non-hitl (skip) session we REMOVE any stale entry so the next
+    // spawn matches the spawn's flag (`--dangerously-skip-permissions`).
+    match permission_mode {
+        PermissionMode::Hitl => {
+            hooks_obj.insert(
+                "PermissionRequest".to_string(),
+                json!([{
+                    "hooks": [{
+                        "type": "command",
+                        "command": format!("{hook_sh} permission-request"),
+                    }],
+                }]),
+            );
+        }
+        PermissionMode::Skip => {
+            hooks_obj.remove("PermissionRequest");
+        }
+    }
+
     let serialized = serde_json::to_string_pretty(&root)
         .map_err(|e| HarnessError::Io(format!("serialize settings.local.json: {e}")))?;
     std::fs::write(&settings_path, serialized)
@@ -234,11 +278,21 @@ fn claude_bin() -> String {
 /// V0.8 W2c — returns owned `(String, String)` pairs to feed
 /// [`MuxSessionSpec::env`] directly (the trait spec owns its env, no
 /// borrow plumbing).
-fn chat_spawn_env_owned(role: &str, slug: &str) -> Vec<(String, String)> {
-    vec![
+///
+/// v0.8.7 review-fix (R-M1) — also forwards `CCTEAM_CHAT_SECRET` when a
+/// non-empty per-session secret is supplied, so the in-pane stdio MCP
+/// forwarder can authenticate `session_*` calls to the daemon's
+/// `sid -> {role, secret}` map. An empty secret (tests / legacy) omits the
+/// var entirely, preserving prior spawn env exactly.
+fn chat_spawn_env_owned(role: &str, slug: &str, secret: &str) -> Vec<(String, String)> {
+    let mut env = vec![
         ("CCTEAM_CHAT_ROLE".to_string(), role.to_string()),
         ("CCTEAM_CHAT_SLUG".to_string(), slug.to_string()),
-    ]
+    ];
+    if !secret.is_empty() {
+        env.push(("CCTEAM_CHAT_SECRET".to_string(), secret.to_string()));
+    }
+    env
 }
 
 /// F164 — Probe whether a chat session's pane process looks like a
@@ -263,21 +317,40 @@ async fn pane_runs_claude(backend: &dyn crate::PaneBackend, id: &MuxSessionId) -
 /// AND re-binds the role persona from `.claude/agents/<role>.md` — the
 /// session-is-the-role keystone (v0.8.6 W1; resume must carry `--agent`
 /// because Anthropic does not persist the agent binding into the jsonl).
-fn spec_for_resume(role: &str, slug: &str, cwd: &Path, session_id_name: &str) -> MuxSessionSpec {
-    MuxSessionSpec::new(
-        chat_session_name(slug, role),
-        vec![
-            claude_bin(),
-            "--agent".to_string(),
-            role.to_string(),
-            "--dangerously-skip-permissions".to_string(),
-            "--resume".to_string(),
-            session_id_name.to_string(),
-        ],
-        cwd.to_path_buf(),
-    )
-    .with_env(chat_spawn_env_owned(role, slug))
-    .with_kind(MuxSessionKind::LongLived)
+/// v0.8.7 W2 (DB.2) — the permission-posture argv segment for a chat spawn.
+///
+/// - `Skip` (default) → `["--dangerously-skip-permissions"]`: today's
+///   behavior, every tool runs without prompting.
+/// - `Hitl` → `["--permission-mode", "default"]` and DROP the skip flag, so
+///   Claude's native permission ask-path stays alive. SMOKE-GATE GROUND
+///   TRUTH: passing `--permission-mode default` is MANDATORY because a
+///   user-global `defaultMode: "auto"` would otherwise mask prompts and the
+///   `PermissionRequest` hook would never fire.
+///
+/// Sits between the `--agent <role>` pair and the `--name`/`--resume` pair
+/// in the argv. Returned as a `Vec` so it can be one or two elements.
+fn permission_args(mode: PermissionMode) -> Vec<String> {
+    match mode {
+        PermissionMode::Skip => vec!["--dangerously-skip-permissions".to_string()],
+        PermissionMode::Hitl => vec!["--permission-mode".to_string(), "default".to_string()],
+    }
+}
+
+fn spec_for_resume(
+    role: &str,
+    slug: &str,
+    cwd: &Path,
+    session_id_name: &str,
+    permission_mode: PermissionMode,
+    secret: &str,
+) -> MuxSessionSpec {
+    let mut argv = vec![claude_bin(), "--agent".to_string(), role.to_string()];
+    argv.extend(permission_args(permission_mode));
+    argv.push("--resume".to_string());
+    argv.push(session_id_name.to_string());
+    MuxSessionSpec::new(chat_session_name(slug, role), argv, cwd.to_path_buf())
+        .with_env(chat_spawn_env_owned(role, slug, secret))
+        .with_kind(MuxSessionKind::LongLived)
 }
 
 /// V0.8 W2c — `MuxSessionSpec` for the `--resume` failure fallback: fresh
@@ -285,8 +358,15 @@ fn spec_for_resume(role: &str, slug: &str, cwd: &Path, session_id_name: &str) ->
 /// pairs with the `chat_session_reset` event the caller emits). Delegates to
 /// [`spec_for_new`], so it inherits the `--agent <role>` persona binding
 /// (v0.8.6 W1 session-is-the-role keystone).
-fn spec_for_fresh(role: &str, slug: &str, cwd: &Path, session_id_name: &str) -> MuxSessionSpec {
-    spec_for_new(role, slug, cwd, session_id_name)
+fn spec_for_fresh(
+    role: &str,
+    slug: &str,
+    cwd: &Path,
+    session_id_name: &str,
+    permission_mode: PermissionMode,
+    secret: &str,
+) -> MuxSessionSpec {
+    spec_for_new(role, slug, cwd, session_id_name, permission_mode, secret)
 }
 
 /// V0.8 W2c — `MuxSessionSpec` for the brand-new (session-absent) path:
@@ -294,21 +374,21 @@ fn spec_for_fresh(role: &str, slug: &str, cwd: &Path, session_id_name: &str) -> 
 /// session jsonl under a deterministic name (enabling future recreate-path
 /// `--resume`) AND binds the role persona from `.claude/agents/<role>.md` —
 /// the session-is-the-role keystone (v0.8.6 W1).
-fn spec_for_new(role: &str, slug: &str, cwd: &Path, session_id_name: &str) -> MuxSessionSpec {
-    MuxSessionSpec::new(
-        chat_session_name(slug, role),
-        vec![
-            claude_bin(),
-            "--agent".to_string(),
-            role.to_string(),
-            "--dangerously-skip-permissions".to_string(),
-            "--name".to_string(),
-            session_id_name.to_string(),
-        ],
-        cwd.to_path_buf(),
-    )
-    .with_env(chat_spawn_env_owned(role, slug))
-    .with_kind(MuxSessionKind::LongLived)
+fn spec_for_new(
+    role: &str,
+    slug: &str,
+    cwd: &Path,
+    session_id_name: &str,
+    permission_mode: PermissionMode,
+    secret: &str,
+) -> MuxSessionSpec {
+    let mut argv = vec![claude_bin(), "--agent".to_string(), role.to_string()];
+    argv.extend(permission_args(permission_mode));
+    argv.push("--name".to_string());
+    argv.push(session_id_name.to_string());
+    MuxSessionSpec::new(chat_session_name(slug, role), argv, cwd.to_path_buf())
+        .with_env(chat_spawn_env_owned(role, slug, secret))
+        .with_kind(MuxSessionKind::LongLived)
 }
 
 fn ccteam_bin_for_hooks() -> String {
@@ -427,7 +507,11 @@ impl HarnessAdapter for ClaudeTuiAdapter {
         // 1. Install chat-progress hooks into
         //    <project>/.claude/settings.local.json (ccteam-managed local
         //    layer; never dirties the user's committed settings.json).
-        ensure_chat_hooks_installed(&ctx.project_dir, &ccteam_bin_for_hooks())?;
+        ensure_chat_hooks_installed(
+            &ctx.project_dir,
+            &ccteam_bin_for_hooks(),
+            ctx.permission_mode,
+        )?;
         // 2. Make sure the bot's chat dir exists (turns.jsonl + cursor).
         turns_mirror::ensure_dir(&ctx.project_dir, &spec.role)
             .map_err(|e| HarnessError::Io(e.to_string()))?;
@@ -506,6 +590,8 @@ impl HarnessAdapter for ClaudeTuiAdapter {
                         &ctx.slug,
                         &ctx.cwd,
                         &session_id_name,
+                        ctx.permission_mode,
+                        &ctx.secret,
                     ))
                     .await
                     .map_err(|e| HarnessError::SpawnFailed(format!("mux spawn resume: {e}")))?;
@@ -535,6 +621,8 @@ impl HarnessAdapter for ClaudeTuiAdapter {
                             &ctx.slug,
                             &ctx.cwd,
                             &session_id_name,
+                            ctx.permission_mode,
+                            &ctx.secret,
                         ))
                         .await
                         .map_err(|e| HarnessError::SpawnFailed(format!("mux spawn fresh: {e}")))?;
@@ -569,6 +657,8 @@ impl HarnessAdapter for ClaudeTuiAdapter {
                     &ctx.slug,
                     &ctx.cwd,
                     &session_id_name,
+                    ctx.permission_mode,
+                    &ctx.secret,
                 ))
                 .await
                 .map_err(|e| HarnessError::SpawnFailed(format!("mux spawn new: {e}")))?;
@@ -1456,6 +1546,94 @@ pub use crate::execution::transcript_tail::anthropic_project_dir as resolve_anth
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permission_args_skip_is_the_skip_flag() {
+        // Default (skip) → exactly the single skip flag, unchanged behavior.
+        assert_eq!(
+            permission_args(PermissionMode::Skip),
+            vec!["--dangerously-skip-permissions".to_string()]
+        );
+    }
+
+    #[test]
+    fn permission_args_hitl_drops_skip_for_permission_mode_default() {
+        // Hitl → `--permission-mode default` (two elements) and NO skip flag.
+        let args = permission_args(PermissionMode::Hitl);
+        assert_eq!(
+            args,
+            vec!["--permission-mode".to_string(), "default".to_string()]
+        );
+        assert!(!args.contains(&"--dangerously-skip-permissions".to_string()));
+    }
+
+    #[test]
+    fn spec_for_new_argv_reflects_permission_mode() {
+        let cwd = std::path::Path::new("/tmp/cc-permmode");
+        // Skip: carries the skip flag, not --permission-mode.
+        let skip = spec_for_new("dev", "slug", cwd, "sid-1", PermissionMode::Skip, "");
+        assert!(skip
+            .argv
+            .iter()
+            .any(|a| a == "--dangerously-skip-permissions"));
+        assert!(!skip.argv.iter().any(|a| a == "--permission-mode"));
+        // Still the keystone --agent + --name.
+        assert!(skip.argv.iter().any(|a| a == "--agent"));
+        assert!(skip.argv.iter().any(|a| a == "--name"));
+        // Hitl: drops the skip flag, carries --permission-mode default.
+        let hitl = spec_for_new("dev", "slug", cwd, "sid-1", PermissionMode::Hitl, "");
+        assert!(!hitl
+            .argv
+            .iter()
+            .any(|a| a == "--dangerously-skip-permissions"));
+        assert!(hitl.argv.iter().any(|a| a == "--permission-mode"));
+        assert!(hitl.argv.iter().any(|a| a == "default"));
+        assert!(hitl.argv.iter().any(|a| a == "--name"));
+    }
+
+    #[test]
+    fn spec_for_resume_argv_reflects_permission_mode() {
+        let cwd = std::path::Path::new("/tmp/cc-permmode");
+        let hitl = spec_for_resume("dev", "slug", cwd, "sid-1", PermissionMode::Hitl, "");
+        assert!(!hitl
+            .argv
+            .iter()
+            .any(|a| a == "--dangerously-skip-permissions"));
+        assert!(hitl.argv.iter().any(|a| a == "--permission-mode"));
+        // Resume path keeps --resume (not --name).
+        assert!(hitl.argv.iter().any(|a| a == "--resume"));
+    }
+
+    /// v0.8.7 review-fix (R-M1) — a non-empty per-session secret is injected
+    /// into the pane env as `CCTEAM_CHAT_SECRET`; an empty secret omits the var
+    /// entirely (preserving prior spawn env for tests / legacy callers).
+    #[test]
+    fn spec_env_carries_secret_only_when_present() {
+        let cwd = std::path::Path::new("/tmp/cc-secret");
+        let with = spec_for_new(
+            "dev",
+            "slug",
+            cwd,
+            "sid-1",
+            PermissionMode::Skip,
+            "deadbeef",
+        );
+        let pairs: std::collections::HashMap<&str, &str> = with
+            .env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(pairs.get("CCTEAM_CHAT_SECRET"), Some(&"deadbeef"));
+        assert_eq!(pairs.get("CCTEAM_CHAT_ROLE"), Some(&"dev"));
+        assert_eq!(pairs.get("CCTEAM_CHAT_SLUG"), Some(&"slug"));
+
+        let without = spec_for_new("dev", "slug", cwd, "sid-1", PermissionMode::Skip, "");
+        assert!(
+            !without.env.iter().any(|(k, _)| k == "CCTEAM_CHAT_SECRET"),
+            "empty secret must omit CCTEAM_CHAT_SECRET, got: {:?}",
+            without.env
+        );
+    }
 
     #[test]
     fn chat_session_name_uses_chat_prefix() {

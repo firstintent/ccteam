@@ -141,13 +141,22 @@ export default function App() {
  *  `ChatConsole` full-screen WITHOUT the dashboard chrome (TopBar /
  *  PrimaryTabs / Projects sidebar). Every other route keeps the
  *  dashboard shell. `ChatConsole` carries its own app bar with a
- *  `Dashboard ↗` link back. */
+ *  `Dashboard ↗` link back.
+ *
+ *  v0.8.7 W4 — the per-session deep link `/chat/s/:sid` is nested in a
+ *  small `<Routes>` here so `ChatConsole` can read `:sid` via `useParams`
+ *  and key its transcript / SSE on that one gateway `s{n}` session (no
+ *  cross-session mixing). `/chat` (no sid) renders the switcher with no
+ *  session selected. */
 function AppShell() {
   const location = useLocation();
   if (location.pathname === "/chat" || location.pathname.startsWith("/chat/")) {
     return (
       <div className="h-dvh flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset">
-        <ChatConsole />
+        <Routes>
+          <Route path="/chat" element={<ChatConsole />} />
+          <Route path="/chat/s/:sid" element={<ChatConsole />} />
+        </Routes>
       </div>
     );
   }

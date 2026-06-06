@@ -135,6 +135,60 @@ pub enum ExecutionMode {
     Chat,
 }
 
+/// v0.8.7 W2 (DB.1) — per-session permission posture for a chat session.
+///
+/// - `Skip` (default) — spawn `claude --dangerously-skip-permissions`
+///   (today's behavior): every tool runs without prompting. Unchanged for
+///   every existing session.
+/// - `Hitl` (human-in-the-loop) — spawn with `--permission-mode default`
+///   and DROP the skip flag so Claude's native permission ask-path stays
+///   alive. A non-allowlist tool call then fires the `PermissionRequest`
+///   hook, which ccteam turns into an IM approve/deny prompt. Allowlist /
+///   auto-allowed tools never prompt (we leverage Claude's own allow-list).
+///
+/// Carried on [`SpawnCtx`] so it threads through every spawn path; stored
+/// on the gateway session record so a resume re-applies it. Lives in
+/// `ccteam-harness` (not `ccteam-core`) because the dependency direction is
+/// `core → harness`; `ccteam-core` re-exports it next to [`AgentVendor`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PermissionMode {
+    /// `--dangerously-skip-permissions` (default; no prompts).
+    #[default]
+    Skip,
+    /// `--permission-mode default`; non-allowlist tools prompt via hook.
+    Hitl,
+}
+
+impl PermissionMode {
+    /// Parse an optional wire token (`"skip"` / `"hitl"`, case-insensitive).
+    /// `None` / empty ⇒ [`PermissionMode::Skip`] (the default everywhere).
+    /// An unrecognized non-empty token is an `Err` so a typo surfaces
+    /// instead of silently downgrading to skip.
+    pub fn parse_opt(raw: Option<&str>) -> Result<Self, String> {
+        match raw.map(str::trim).unwrap_or("") {
+            "" | "skip" => Ok(PermissionMode::Skip),
+            "hitl" => Ok(PermissionMode::Hitl),
+            other => Err(format!(
+                "invalid permission mode `{other}`: expected `skip` or `hitl`"
+            )),
+        }
+    }
+
+    /// Lowercase wire string (`"skip"` / `"hitl"`) for API / view shapes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PermissionMode::Skip => "skip",
+            PermissionMode::Hitl => "hitl",
+        }
+    }
+
+    /// True for [`PermissionMode::Hitl`] — the spawn drops the skip flag.
+    pub fn is_hitl(self) -> bool {
+        matches!(self, PermissionMode::Hitl)
+    }
+}
+
 /// Cross-vendor thread handle, returned from
 /// [`HarnessAdapter::start_thread`] and consumed by every other trait
 /// method. Replaces the V0.5.x [`SessionHandle`] on the adapter surface
@@ -519,7 +573,7 @@ pub struct ThreadErrorEvent {
 /// instead of the vendor's fallback model.  `None` means "use the
 /// vendor's default" (legacy V0.5 callers + tests that don't care about
 /// per-model cost accuracy).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SpawnCtx {
     pub slug: String,
     pub sid: String,
@@ -532,6 +586,20 @@ pub struct SpawnCtx {
     /// for per-model pricing instead of falling back to the vendor's
     /// `fallback_model`.
     pub model_id: Option<String>,
+    /// v0.8.7 W2 (DB.1) — per-session permission posture. `Skip` (default)
+    /// keeps today's `--dangerously-skip-permissions` spawn; `Hitl` drops
+    /// that flag, spawns `--permission-mode default`, and installs the
+    /// `PermissionRequest` hook so non-allowlist tools prompt the IM user.
+    /// Claude-only lever today (codex uses its own sandbox model).
+    pub permission_mode: PermissionMode,
+    /// v0.8.7 review-fix (R-M1) — per-session secret for the cto scheduling
+    /// gate, injected into the pane env as `CCTEAM_CHAT_SECRET` at spawn so
+    /// the forwarded `session_*` call can be authenticated against the
+    /// gateway's `sid -> {role, secret}` map instead of a plaintext role arg.
+    /// Empty `""` = no secret (tests / codex / legacy callers); the env var
+    /// is then omitted, matching prior behavior. NOT a hard boundary — see
+    /// `ccteam_core::session_secret` for the single-uid threat-model scope.
+    pub secret: String,
 }
 
 /// V0.6.0 F107 — canonical [`UnifiedTokenUsage`] lives in `ccteam-cost`
@@ -995,6 +1063,65 @@ pub fn pluck_pct(value: &serde_json::Value, path: &[&str]) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permission_mode_default_is_skip() {
+        // The default everywhere is skip (preserves today's behavior).
+        assert_eq!(PermissionMode::default(), PermissionMode::Skip);
+        assert!(!PermissionMode::default().is_hitl());
+    }
+
+    #[test]
+    fn permission_mode_parse_opt_covers_all_cases() {
+        // None / empty / "skip" → Skip.
+        assert_eq!(PermissionMode::parse_opt(None), Ok(PermissionMode::Skip));
+        assert_eq!(
+            PermissionMode::parse_opt(Some("")),
+            Ok(PermissionMode::Skip)
+        );
+        assert_eq!(
+            PermissionMode::parse_opt(Some("  ")),
+            Ok(PermissionMode::Skip)
+        );
+        assert_eq!(
+            PermissionMode::parse_opt(Some("skip")),
+            Ok(PermissionMode::Skip)
+        );
+        // "hitl" (with whitespace) → Hitl.
+        assert_eq!(
+            PermissionMode::parse_opt(Some("hitl")),
+            Ok(PermissionMode::Hitl)
+        );
+        assert_eq!(
+            PermissionMode::parse_opt(Some(" hitl ")),
+            Ok(PermissionMode::Hitl)
+        );
+        // A bad token is an Err (a typo surfaces, not a silent downgrade).
+        assert!(PermissionMode::parse_opt(Some("bogus")).is_err());
+        assert!(PermissionMode::parse_opt(Some("auto")).is_err());
+    }
+
+    #[test]
+    fn permission_mode_serde_is_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&PermissionMode::Skip).unwrap(),
+            "\"skip\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PermissionMode::Hitl).unwrap(),
+            "\"hitl\""
+        );
+        assert_eq!(PermissionMode::Hitl.as_str(), "hitl");
+        let back: PermissionMode = serde_json::from_str("\"hitl\"").unwrap();
+        assert_eq!(back, PermissionMode::Hitl);
+    }
+
+    #[test]
+    fn spawn_ctx_default_permission_mode_is_skip() {
+        // `..Default::default()` on a SpawnCtx literal must leave skip.
+        let ctx = SpawnCtx::default();
+        assert_eq!(ctx.permission_mode, PermissionMode::Skip);
+    }
 
     #[test]
     fn format_tokens_humanizes_round_and_fractional() {

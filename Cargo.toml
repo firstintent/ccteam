@@ -18,7 +18,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.8.6"
+version = "0.8.7"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
@@ -88,8 +88,25 @@ askama = "0.12"
 # M5.0 so `ServeOpts::token_file` can carry the knob without dep
 # manifest churn when the auth middleware actually lands.
 subtle = "2.5"
+# v0.8.7 review-fix (R-M1) — OS CSPRNG for the per-session cto-gate secret
+# (`ccteam_core::session_secret::mint`). Already in the tree transitively
+# via `rand 0.8`; pinned at 0.2 (the widely-vendored line) and consumed
+# directly so the secret never relies on a weak time-only token.
+getrandom = "0.2"
 # HTTP client used by ccteam-web integration tests (lib + subprocess).
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+# v0.8.7 W5 (Item E) — OpenAPI auto-docs for the `/api/v1` resource API.
+# `utoipa` 5.x derives `ToSchema` / `#[utoipa::path]`; `utoipa-axum`
+# 0.2.x is the axum-0.8 binding (the 0.1.x line pinned axum 0.7 and will
+# not compile here) and provides `OpenApiRouter` so the spec is generated
+# from the same route registrations (single source of truth, anti-drift);
+# `utoipa-scalar` 0.3.x serves the Scalar interactive UI. The `axum`
+# feature on utoipa(-extras) wires the `Path`/`Query`/`Json` extractors
+# into the derive; `chrono` teaches the schema layer about `DateTime`.
+utoipa = { version = "5", features = ["axum_extras", "chrono"] }
+utoipa-axum = "0.2"
+utoipa-scalar = { version = "0.3", features = ["axum"] }
 
 [profile.release]
 lto = true

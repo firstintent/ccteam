@@ -127,6 +127,8 @@ async fn claude_bg_start_thread_parses_backgrounded_marker() {
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec!["initial prompt".into()],
         model_id: None,
+        permission_mode: ccteam_harness::PermissionMode::Skip,
+        secret: String::new(),
     };
 
     let handle = ClaudeBgAdapter::new()
@@ -157,6 +159,8 @@ async fn claude_bg_start_thread_rejects_empty_role() {
         project_dir: std::env::temp_dir(),
         extra_args: vec![],
         model_id: None,
+        permission_mode: ccteam_harness::PermissionMode::Skip,
+        secret: String::new(),
     };
     let err = ClaudeBgAdapter::new()
         .start_thread(&brief, &ctx)
@@ -273,6 +277,8 @@ async fn claude_bg_via_mux_spawns_ephemeral_session_and_close_reaps_it() {
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec!["do the thing".into()],
         model_id: None,
+        permission_mode: ccteam_harness::PermissionMode::Skip,
+        secret: String::new(),
     };
 
     let adapter = ClaudeBgAdapter::new();
@@ -453,6 +459,8 @@ mod codex_tmux {
             project_dir: tmp.path().to_path_buf(),
             extra_args: vec![],
             model_id: None,
+            permission_mode: ccteam_harness::PermissionMode::Skip,
+            secret: String::new(),
         };
 
         let adapter = CodexExecAdapter::new();
@@ -549,6 +557,8 @@ async fn claude_tui_rejects_empty_role() {
         project_dir: std::env::temp_dir(),
         extra_args: vec![],
         model_id: None,
+        permission_mode: ccteam_harness::PermissionMode::Skip,
+        secret: String::new(),
     };
     let err = ClaudeTuiAdapter::new()
         .start_thread(&brief, &ctx)

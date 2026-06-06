@@ -1,423 +1,278 @@
-// v0.8.3 — standalone web chat console.
+// v0.8.7 W4 (DD.1) — per-session web chat console.
 //
-// Re-planned from the embedded dashboard `/chat` panel into a chat-first
-// app shell (App.tsx renders this route without the dashboard chrome):
+// Rewired from the v0.8.3 single global WS + flat session-mixing
+// transcript into a PER-SESSION console keyed by the gateway `s{n}` id:
 //
-//   N1 standalone shell  — own app bar (status + cost link + Dashboard ↗),
-//                          no Projects/Teams/Sessions nav.
-//   N2 all sessions      — left rail lists every project's sessions
-//                          (vendor·role·sid), grouped, active highlighted.
-//   N3 new session       — modal picks project + code agent + role and
-//                          submits `/cd <p>` + `/new <vendor> <role>`.
-//   N4 continuous stream — one timeline; switching focus inserts a marker
-//                          instead of clearing; transcript persists in
-//                          localStorage so refresh/reconnect keep history.
-//   N5 vendor terminal   — the terminal tab is enabled only for a Claude
-//                          (tmux) session; Codex (app-server) has no PTY.
-//   P1-4 reconnect       — the chat socket auto-reconnects with backoff.
+//   - ROUTE  `/chat/s/:sid` (nested in App.tsx) — `useParams` gives the
+//            one session this view drives; `/chat` (no sid) is the
+//            switcher with nothing selected.
+//   - DATA   drives `/api/v1` exclusively (sessionsApi): listSessions for
+//            the switcher, getHistory to seed a reopened page, submitTurn
+//            to send, stopSession to stop, createSession for new sessions.
+//   - STREAM live events via `useSessionEvents(sid)` (the W2-tagged
+//            per-sid SSE at `/api/v1/sessions/{sid}/events`).
+//   - STORE  each sid owns its OWN transcript (per-sid localStorage key via
+//            `chatTranscript`), so switching sessions NEVER mixes streams.
+//   - APPROVE W2 ChoicePrompt events (tagged with sid + options + token)
+//            render as "session sX wants to run … [option chips]"; clicking
+//            POSTs {token, selection=id} to /resolve (R-H1) — the SAME
+//            gateway pending machinery an IM click uses, NOT a turn — so the
+//            blocked tool actually runs on Approve / denies on Deny.
 //
-// Red lines: the chat view reads structured turn frames (never scrapes a
-// pane); the terminal view is the existing `ccteam-pty.v1` byte relay.
+// Red lines: reads structured turn/SSE frames (never scrapes a pane); the
+// terminal view is the existing `ccteam-pty.v1` byte relay; the new-session
+// default role stays `cto` (chatDefaults.DEFAULT_ROLE, FIX-2).
+//
+// LEGACY (unrepointed): SessionsListPage / SessionDetail + `/sessions/active`
+// remain the operator/bg view in the `claude-N`/`codex-N` namespace — this
+// per-session chat is the additive `s{n}` surface.
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { Link } from "react-router-dom";
-import { MessageSquare, Plus, Send, Terminal } from "lucide-react";
+import { Link, useNavigate, useParams } from "react-router-dom";
+import { MessageSquare, Plus, Send, Square, Terminal } from "lucide-react";
 import { TerminalView } from "../components/TerminalView";
-import { CHAT_SUBPROTOCOL, chatUrlFor } from "../lib/terminalConfig";
+import { useSessionEvents } from "../hooks/useSessionEvents";
+import { fetchDashboard } from "../lib/dashboardApi";
+import {
+  createSession as apiCreateSession,
+  getHistory,
+  listSessions,
+  resolveApproval as apiResolveApproval,
+  stopSession as apiStopSession,
+  submitTurn,
+  type SessionView,
+} from "../lib/sessionsApi";
+import { DEFAULT_ROLE, ROLE_SUGGESTIONS } from "./chatDefaults";
+import {
+  appendRow,
+  eventToRow,
+  historyToRows,
+  loadRows,
+  nextRowId,
+  saveRows,
+  type TranscriptRow,
+} from "./chatTranscript";
 
-type SessionItem = {
-  project: string;
-  session: string | null;
-  vendor: string | null;
-  role: string | null;
-  current: boolean;
-};
-
-type ServerFrame =
-  | { type: "turn_started"; session: string; vendor: string }
-  | { type: "assistant_delta"; text: string }
-  | { type: "tool"; name: string; summary: string }
-  | { type: "reply"; content: string }
-  | { type: "turn_done"; session: string }
-  | { type: "sessions"; items: SessionItem[] }
-  | { type: "lag"; behind: number };
-
-type ClientFrame =
-  | { type: "text"; content: string; id?: string }
-  | { type: "switch"; project?: string; session?: string };
-
-type RowKind = "user" | "assistant" | "tool" | "system" | "marker";
-type TranscriptRow = { id: string; kind: RowKind; content: string; from?: string };
-
-type Focus = {
-  project: string;
-  session: string | null;
-  vendor: string | null;
-  role: string | null;
-};
-
-type CreateRequest =
-  | { kind: "existing"; project: string; vendor: string; role: string }
-  | { kind: "new"; slug: string; path: string; vendor: string; role: string };
-
-// All tabs share one chat id so they observe the same conversation; the
-// backend broadcasts each outbound reply to every matching socket.
-const WEB_CHAT_ID = "web-chat";
-const WEB_USER_ID = "web-user";
-
-const ROWS_KEY = "ccteam.chat.rows.v1";
-const FOCUS_KEY = "ccteam.chat.focus.v1";
-const ROWS_CAP = 400;
-const ROLE_SUGGESTIONS = ["assistant", "reviewer", "api", "ui", "qa", "docs"];
-
-function nextId(prefix: string) {
-  return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-}
-
-function loadRows(): TranscriptRow[] {
-  try {
-    const parsed = JSON.parse(localStorage.getItem(ROWS_KEY) ?? "[]");
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
-function loadFocus(): Focus | null {
-  try {
-    return JSON.parse(localStorage.getItem(FOCUS_KEY) ?? "null");
-  } catch {
-    return null;
-  }
-}
-
-function focusLabel(focus: Focus | null): string | undefined {
-  if (!focus) return undefined;
-  const parts = [focus.vendor, focus.role].filter(Boolean);
-  return parts.length ? parts.join(" · ") : focus.project;
-}
-
-function focusOf(item: SessionItem): Focus {
-  return {
-    project: item.project,
-    session: item.session,
-    vendor: item.vendor,
-    role: item.role,
-  };
-}
+/** A switcher entry — one live gateway session, grouped under its project. */
+type RailSession = SessionView;
 
 export default function ChatConsole() {
-  const wsRef = useRef<WebSocket | null>(null);
-  const [connected, setConnected] = useState(false);
-  const [reconnectAttempt, setReconnectAttempt] = useState(0);
-  const [sessions, setSessions] = useState<SessionItem[]>([]);
-  const [rows, setRows] = useState<TranscriptRow[]>(() => {
-    const stored = loadRows();
-    return stored.length
-      ? stored
-      : [
-          {
-            id: nextId("system"),
-            kind: "system",
-            content: "— 会话开始 · 历史在本机保留,刷新/重连不清屏 —",
-          },
-        ];
-  });
-  const [focus, setFocus] = useState<Focus | null>(() => loadFocus());
+  const { sid: routeSid } = useParams<{ sid: string }>();
+  const sid = routeSid ?? null;
+  const navigate = useNavigate();
+
+  // The switcher's session list (gateway `s{n}`), fanned out across every
+  // project from /api/v1/projects → /api/v1/projects/{slug}/sessions.
+  const [railSessions, setRailSessions] = useState<RailSession[]>([]);
+  const [railError, setRailError] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
   const [view, setView] = useState<"chat" | "terminal">("chat");
   const [modalOpen, setModalOpen] = useState(false);
 
-  // Refs so the long-lived socket handler reads current values.
-  const focusRef = useRef<Focus | null>(focus);
-  const pendingCreateRef = useRef<Focus | null>(null);
-  // A new-project create in flight: we wait for /newproject to succeed before
-  // sending /cd + /new, so a failed scaffold doesn't cascade into a confusing
-  // "unknown project" from /cd.
-  const pendingNewProjectRef = useRef<{ slug: string; vendor: string; role: string } | null>(null);
-  // Lets handleFrame (defined before sendText) send follow-up commands without
-  // a definition-order / dependency cycle.
-  const sendTextRef = useRef<((content: string, echo: boolean) => boolean) | null>(null);
-  useEffect(() => {
-    focusRef.current = focus;
-  }, [focus]);
+  // Per-sid transcript. Seeded from localStorage on sid change, then from
+  // mirrored history, then live-appended from SSE. Keying on sid is THE
+  // fix: two sessions never share one buffer.
+  const [rows, setRows] = useState<TranscriptRow[]>([]);
 
-  // Persist transcript + focus so a refresh resumes where we left off.
-  useEffect(() => {
-    try {
-      localStorage.setItem(ROWS_KEY, JSON.stringify(rows.slice(-ROWS_CAP)));
-    } catch {
-      // storage full / disabled — in-memory transcript still works.
-    }
-  }, [rows]);
-  useEffect(() => {
-    try {
-      localStorage.setItem(FOCUS_KEY, JSON.stringify(focus));
-    } catch {
-      // ignore
-    }
-  }, [focus]);
+  const { events, connected, lastError, gatewayUnavailable } = useSessionEvents(sid);
 
-  const pushRow = useCallback((row: Omit<TranscriptRow, "id">) => {
-    setRows((current) => [...current, { ...row, id: nextId(row.kind) }]);
+  // The active session's view (vendor/role/project) for the crumb + terminal
+  // gating — read from the rail list.
+  const activeView = useMemo(
+    () => railSessions.find((s) => s.sid === sid) ?? null,
+    [railSessions, sid],
+  );
+
+  // ---- switcher list (cross-project fan-out) -----------------------------
+  const refreshSessions = useCallback(async () => {
+    try {
+      const projects = await fetchDashboard();
+      const lists = await Promise.all(
+        projects.map((p) =>
+          listSessions(p.slug).catch(() => [] as SessionView[]),
+        ),
+      );
+      setRailSessions(lists.flat());
+      setRailError(null);
+    } catch (e) {
+      if (e instanceof Error && e.message === "UNAUTHENTICATED") {
+        // global TokenEntryGate handles re-auth; don't double-report.
+        return;
+      }
+      setRailError(e instanceof Error ? e.message : "failed to load sessions");
+    }
   }, []);
 
+  useEffect(() => {
+    void refreshSessions();
+  }, [refreshSessions]);
+
+  // ---- per-sid transcript: seed on sid change ----------------------------
+  useEffect(() => {
+    if (!sid) {
+      setRows([]);
+      return;
+    }
+    // 1) instant: persisted rows for this sid (refresh/reopen continuity).
+    setRows(loadRows(sid));
+    // 2) authoritative: mirrored history seeds (or replaces an empty) buffer.
+    let cancelled = false;
+    getHistory(sid)
+      .then((h) => {
+        if (cancelled) return;
+        const seeded = historyToRows(h.events);
+        if (seeded.length > 0) setRows(seeded);
+      })
+      .catch(() => {
+        // best-effort — keep the localStorage rows (or empty) on error.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [sid]);
+
+  // ---- live SSE → append into the active sid's transcript ----------------
+  // We track how many events we've folded so a re-render doesn't re-append.
+  const foldedRef = useRef(0);
+  useEffect(() => {
+    foldedRef.current = 0;
+  }, [sid]);
+  useEffect(() => {
+    if (!sid) return;
+    if (events.length <= foldedRef.current) return;
+    const fresh = events.slice(foldedRef.current);
+    foldedRef.current = events.length;
+    setRows((current) => {
+      let next = current;
+      for (const ev of fresh) {
+        const row = eventToRow(ev);
+        if (row) next = appendRow(next, row);
+      }
+      return next;
+    });
+  }, [events, sid]);
+
+  // ---- persist the active sid's transcript -------------------------------
+  useEffect(() => {
+    if (sid) saveRows(sid, rows);
+  }, [sid, rows]);
+
+  const pushRow = useCallback((row: Omit<TranscriptRow, "id">) => {
+    setRows((current) => appendRow(current, { ...row, id: nextRowId(row.kind) }));
+  }, []);
+
+  // ---- send a turn -------------------------------------------------------
+  const submit = useCallback(() => {
+    const content = draft.trim();
+    if (!content || !sid) return;
+    pushRow({ kind: "user", content });
+    setDraft("");
+    submitTurn(sid, content).catch((e) => {
+      pushRow({
+        kind: "system",
+        content: `发送失败: ${e instanceof Error ? e.message : "unknown"}`,
+      });
+    });
+  }, [draft, sid, pushRow]);
+
+  // ---- resolve a W2 approval prompt (R-H1) -------------------------------
+  // The per-sid SSE tags the ChoicePrompt with sid + each option's {label,id}
+  // + the pending-resolution token. Clicking POSTs {token, selection=id} to
+  // `/resolve`, which routes through the gateway's SAME pending machinery an
+  // IM click uses (take_by_token → apply_pending) — NOT a turn. So [Approve]
+  // makes the blocked tool actually run and [Deny] denies immediately (no
+  // 600s timeout). A row with no token (or a chosen option with no id) can't
+  // be resolved this way; we surface that rather than misfire a fake turn.
+  const resolveApproval = useCallback(
+    (row: TranscriptRow, optionIndex: number) => {
+      if (!sid) return;
+      const option = row.options?.[optionIndex];
+      if (!row.token || !option?.id) {
+        pushRow({
+          kind: "system",
+          content: "无法批准: 该提示缺少 token/选项 id(请在 IM 批准,或重开会话)",
+        });
+        return;
+      }
+      // mark the row resolved so the chips disable.
+      setRows((current) =>
+        current.map((r) => (r.id === row.id ? { ...r, resolved: true } : r)),
+      );
+      pushRow({ kind: "user", content: `→ ${option.label}` });
+      apiResolveApproval(sid, row.token, option.id).catch((e) => {
+        // Re-enable the chips so the user can retry on a transient failure.
+        setRows((current) =>
+          current.map((r) => (r.id === row.id ? { ...r, resolved: false } : r)),
+        );
+        pushRow({
+          kind: "system",
+          content: `批准提交失败: ${e instanceof Error ? e.message : "unknown"}`,
+        });
+      });
+    },
+    [sid, pushRow],
+  );
+
+  // ---- stop the session --------------------------------------------------
+  const stopActive = useCallback(() => {
+    if (!sid) return;
+    apiStopSession(sid)
+      .then(() => {
+        pushRow({ kind: "system", content: "会话已停止" });
+        void refreshSessions();
+      })
+      .catch((e) => {
+        pushRow({
+          kind: "system",
+          content: `停止失败: ${e instanceof Error ? e.message : "unknown"}`,
+        });
+      });
+  }, [sid, pushRow, refreshSessions]);
+
+  // ---- create a new session ---------------------------------------------
+  const createSession = useCallback(
+    async (slug: string, role: string, vendor: string, permissionMode: "skip" | "hitl") => {
+      setModalOpen(false);
+      try {
+        const { sid: newSid } = await apiCreateSession(slug, {
+          role,
+          vendor,
+          permission_mode: permissionMode,
+        });
+        await refreshSessions();
+        navigate(`/chat/s/${encodeURIComponent(newSid)}`);
+      } catch (e) {
+        pushRow({
+          kind: "system",
+          content: `新建 session 失败: ${e instanceof Error ? e.message : "unknown"}`,
+        });
+      }
+    },
+    [refreshSessions, navigate, pushRow],
+  );
+
   const projects = useMemo(
-    () => Array.from(new Set(sessions.map((item) => item.project))).sort(),
-    [sessions],
+    () => Array.from(new Set(railSessions.map((s) => s.project))).sort(),
+    [railSessions],
   );
   const roleOptions = useMemo(() => {
     const seen = new Set(ROLE_SUGGESTIONS);
-    sessions.forEach((item) => item.role && seen.add(item.role));
+    railSessions.forEach((s) => s.role && seen.add(s.role));
     return Array.from(seen);
-  }, [sessions]);
+  }, [railSessions]);
 
-  const handleFrame = useCallback(
-    (frame: ServerFrame) => {
-      switch (frame.type) {
-        case "sessions": {
-          // Merge frames: the disk frame carries all projects (as markers),
-          // the gateway `/sessions` frame carries all chat sessions (cross-
-          // entry). Chat sessions (with an id) win and are deduped; a project
-          // marker is kept only when that project has no session.
-          setSessions((prev) => {
-            const merged: SessionItem[] = [];
-            const seenSession = new Set<string>();
-            for (const item of [...frame.items, ...prev]) {
-              if (!item.session) continue;
-              const key = `${item.project}:${item.session}`;
-              if (seenSession.has(key)) continue;
-              seenSession.add(key);
-              merged.push(item);
-            }
-            const withSession = new Set(merged.map((s) => s.project));
-            const seenMarker = new Set<string>();
-            for (const item of [...frame.items, ...prev]) {
-              if (item.session) continue;
-              if (withSession.has(item.project) || seenMarker.has(item.project)) continue;
-              seenMarker.add(item.project);
-              merged.push(item);
-            }
-            return merged;
-          });
-          // Adopt a default focus once we know the sessions, but never
-          // clobber a focus the user already chose.
-          setFocus((current) => {
-            if (current) return current;
-            const first = frame.items.find((item) => item.session);
-            const next = first ? focusOf(first) : null;
-            focusRef.current = next;
-            return next;
-          });
-          break;
-        }
-        case "reply": {
-          // New-project sequencing: once the project is scaffolded, cd in +
-          // spawn the session. On failure, drop the pending create (the error
-          // bubble already shows) so /cd never runs against a missing project.
-          const np = pendingNewProjectRef.current;
-          if (np) {
-            const created = new RegExp(`created project ${np.slug}\\b`).test(frame.content);
-            const failed = /^gateway error/.test(frame.content);
-            if (created) {
-              pendingNewProjectRef.current = null;
-              pendingCreateRef.current = {
-                project: np.slug,
-                session: null,
-                vendor: np.vendor,
-                role: np.role,
-              };
-              sendTextRef.current?.(`/cd ${np.slug}`, true);
-              sendTextRef.current?.(`/new ${np.vendor} ${np.role}`, true);
-              sendTextRef.current?.("/sessions", false);
-            } else if (failed) {
-              pendingNewProjectRef.current = null;
-            }
-          }
-          const sid = /created session (s\d+)/.exec(frame.content)?.[1];
-          const pending = pendingCreateRef.current;
-          if (sid && pending) {
-            pendingCreateRef.current = null;
-            const next: Focus = { ...pending, session: sid };
-            setFocus(next);
-            focusRef.current = next;
-            pushRow({
-              kind: "marker",
-              content: `→ 新建 ${next.vendor} · ${next.role} (${sid}) · /cd ${next.project} · 焦点已切到这里`,
-            });
-          }
-          pushRow({ kind: "assistant", content: frame.content, from: focusLabel(focusRef.current) });
-          break;
-        }
-        case "assistant_delta":
-          pushRow({ kind: "assistant", content: frame.text, from: focusLabel(focusRef.current) });
-          break;
-        case "tool":
-          pushRow({ kind: "tool", content: `${frame.name}: ${frame.summary}` });
-          break;
-        case "lag":
-          pushRow({ kind: "system", content: `滞后 ${frame.behind} 帧(已跳到最新)` });
-          break;
-        case "turn_started":
-        case "turn_done":
-          // Reserved streaming frames — not surfaced as timeline noise.
-          break;
-      }
-    },
-    [pushRow],
-  );
-
-  // Reconnecting chat socket (P1-4). Lives for the component's lifetime;
-  // closes only on unmount. Backoff caps at 8s, retries indefinitely.
-  useEffect(() => {
-    let disposed = false;
-    let attempt = 0;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-
-    const connect = () => {
-      if (disposed) return;
-      const ws = new WebSocket(chatUrlFor(WEB_CHAT_ID, WEB_USER_ID), [CHAT_SUBPROTOCOL]);
-      wsRef.current = ws;
-      ws.onopen = () => {
-        if (disposed) return;
-        attempt = 0;
-        setReconnectAttempt(0);
-        setConnected(true);
-        // Pull the gateway's global session list (cross-entry); the disk
-        // frame the server sends on connect doesn't include chat sessions.
-        try {
-          ws.send(JSON.stringify({ type: "text", content: "/sessions", id: nextId("sys") }));
-        } catch {
-          // socket raced closed — the reconnect path will retry.
-        }
-      };
-      ws.onmessage = (event) => {
-        if (typeof event.data !== "string") return;
-        try {
-          handleFrame(JSON.parse(event.data) as ServerFrame);
-        } catch {
-          // ignore unparseable server frame
-        }
-      };
-      ws.onclose = () => {
-        if (disposed) return;
-        setConnected(false);
-        attempt += 1;
-        setReconnectAttempt(attempt);
-        const delay = Math.min(8000, 1000 * 1.5 ** (attempt - 1));
-        timer = setTimeout(connect, delay);
-      };
-      ws.onerror = () => {
-        // onclose follows and owns the reconnect schedule.
-        ws.close();
-      };
-    };
-
-    connect();
-    return () => {
-      disposed = true;
-      if (timer) clearTimeout(timer);
-      wsRef.current?.close();
-      wsRef.current = null;
-    };
-  }, [handleFrame]);
-
-  const sendFrame = useCallback((frame: ClientFrame) => {
-    const ws = wsRef.current;
-    if (ws?.readyState !== WebSocket.OPEN) return false;
-    ws.send(JSON.stringify(frame));
-    return true;
-  }, []);
-
-  const sendText = useCallback(
-    (content: string, echo: boolean) => {
-      const ok = sendFrame({ type: "text", content, id: nextId("client") });
-      if (ok && echo) pushRow({ kind: "user", content });
-      return ok;
-    },
-    [pushRow, sendFrame],
-  );
-  useEffect(() => {
-    sendTextRef.current = sendText;
-  }, [sendText]);
-
-  const submit = useCallback(() => {
-    const content = draft.trim();
-    if (!content) return;
-    if (sendText(content, true)) setDraft("");
-  }, [draft, sendText]);
-
-  // Switch focus WITHOUT clearing the timeline — drop a marker and keep
-  // the same continuous conversation (N4).
   const switchTo = useCallback(
-    (item: SessionItem) => {
-      const next = focusOf(item);
-      setFocus(next);
-      focusRef.current = next;
-      sendFrame({
-        type: "switch",
-        project: item.project,
-        ...(item.session ? { session: item.session } : {}),
-      });
-      const who = [item.vendor, item.role].filter(Boolean).join(" · ") || item.project;
-      const sid = item.session ? ` (${item.session})` : "";
-      pushRow({
-        kind: "marker",
-        content: `→ 焦点切到 ${who}${sid} · /cd ${item.project} · 会话流不清屏`,
-      });
+    (s: RailSession) => {
+      navigate(`/chat/s/${encodeURIComponent(s.sid)}`);
+      setView("chat");
     },
-    [pushRow, sendFrame],
+    [navigate],
   );
 
-  // Focus a project itself (no specific session) — clicking a project
-  // header /cd's into it; the next message spawns a session there. This
-  // is the entry point for projects that have no chat session yet.
-  const switchToProject = useCallback(
-    (project: string) => {
-      const next: Focus = { project, session: null, vendor: null, role: null };
-      setFocus(next);
-      focusRef.current = next;
-      sendFrame({ type: "switch", project });
-      pushRow({
-        kind: "marker",
-        content: `→ 焦点切到项目 ${project} · /cd ${project} · 发消息会在此自动起 session`,
-      });
-    },
-    [pushRow, sendFrame],
-  );
-
-  const createSession = useCallback(
-    (req: CreateRequest) => {
-      if (req.kind === "new") {
-        // Scaffold + register the project first. Only cd + spawn once
-        // /newproject confirms (handled in the reply case), so a bad path /
-        // name doesn't cascade into "unknown project" from a premature /cd.
-        pendingNewProjectRef.current = { slug: req.slug, vendor: req.vendor, role: req.role };
-        sendText(`/newproject ${req.slug} ${req.path}`, true);
-      } else {
-        pendingCreateRef.current = {
-          project: req.project,
-          session: null,
-          vendor: req.vendor,
-          role: req.role,
-        };
-        sendText(`/cd ${req.project}`, true);
-        sendText(`/new ${req.vendor} ${req.role}`, true);
-        sendText("/sessions", false);
-      }
-      setModalOpen(false);
-    },
-    [sendText],
-  );
-
-  const canTerminal = focus?.vendor === "claude" && !!focus.session;
-  // Derive (don't store) the active pane: a remembered "terminal" choice
-  // falls back to chat whenever the focus can't host a PTY (e.g. Codex,
-  // or no session) without an extra render-triggering effect.
+  const canTerminal = activeView?.vendor === "claude" && !!sid;
   const showTerminal = view === "terminal" && canTerminal;
 
-  // Auto-scroll the transcript to the newest message — but only when the user
-  // is already near the bottom, so reading scrollback isn't interrupted.
+  // Auto-scroll to the newest message only when already near the bottom.
   const scrollRef = useRef<HTMLDivElement>(null);
   const atBottomRef = useRef(true);
   const onTranscriptScroll = useCallback(() => {
@@ -430,20 +285,34 @@ export default function ChatConsole() {
     }
   }, [rows, showTerminal]);
 
+  const statusText = gatewayUnavailable
+    ? "无可用 gateway"
+    : connected
+      ? "已连接"
+      : lastError
+        ? "连接失败"
+        : sid
+          ? "连接中…"
+          : "未选择 session";
+
   return (
     <div className="h-full min-h-0 flex flex-col bg-surface-900 text-text-primary">
-      {/* N1 — standalone app bar */}
+      {/* standalone app bar */}
       <header className="h-12 shrink-0 border-b border-surface-700/40 px-4 flex items-center gap-3">
         <MessageSquare className="h-4 w-4 text-amber-400 shrink-0" />
         <span className="text-sm font-semibold">
           ccteam <span className="text-amber-400">chat</span>
         </span>
         <span className="hidden sm:inline text-[11px] font-mono text-text-dim px-1.5 py-0.5 rounded bg-surface-800">
-          独立应用 · ccteam-chat.v1
+          per-session · /api/v1
         </span>
         <span className="flex items-center gap-1.5 text-xs text-text-dim">
-          <span className={`h-2 w-2 rounded-full ${connected ? "bg-green-400" : "bg-amber-500"}`} />
-          {connected ? "已连接" : reconnectAttempt > 0 ? `重连中… (${reconnectAttempt})` : "连接中…"}
+          <span
+            className={`h-2 w-2 rounded-full ${
+              connected ? "bg-green-400" : gatewayUnavailable || lastError ? "bg-red-500" : "bg-amber-500"
+            }`}
+          />
+          {statusText}
         </span>
         <span className="flex-1" />
         <Link to="/" className="text-xs text-text-dim hover:text-text-primary transition-colors">
@@ -452,7 +321,7 @@ export default function ChatConsole() {
       </header>
 
       <div className="flex flex-1 min-h-0">
-        {/* N2 — all sessions, grouped by project */}
+        {/* left rail — every project's gateway sessions, grouped */}
         <aside className="w-60 shrink-0 border-r border-surface-700/40 flex flex-col">
           <div className="h-10 shrink-0 px-3 flex items-center justify-between border-b border-surface-700/30">
             <span className="text-xs font-mono uppercase text-text-dim">所有 session</span>
@@ -467,37 +336,19 @@ export default function ChatConsole() {
           </div>
           <div className="flex-1 overflow-y-auto p-2 space-y-2">
             {projects.map((project) => {
-              const items = sessions.filter(
-                (item) => item.project === project && item.session,
-              );
-              const projectActive = focus?.project === project && !focus?.session;
+              const items = railSessions.filter((s) => s.project === project);
               return (
                 <div key={project}>
-                  <button
-                    type="button"
-                    onClick={() => switchToProject(project)}
-                    title={`聚焦项目 ${project}(/cd;发消息自动起 session)`}
-                    className={`w-full text-left px-1.5 py-1 rounded text-[11px] font-mono flex items-center gap-1 ${
-                      projectActive
-                        ? "bg-surface-800 text-text-primary"
-                        : "text-text-dim hover:bg-surface-800/60 hover:text-text-secondary"
-                    }`}
-                  >
-                    {project}
-                    {items.length === 0 ? (
-                      <span className="text-text-dim/60">· 无 session,点此聚焦</span>
-                    ) : null}
-                  </button>
+                  <div className="px-1.5 py-1 text-[11px] font-mono text-text-dim">{project}</div>
                   <div className="space-y-0.5">
-                    {items.map((item) => {
-                      const active =
-                        focus?.project === item.project && focus?.session === item.session;
-                      const isClaude = item.vendor === "claude";
+                    {items.map((s) => {
+                      const active = s.sid === sid;
+                      const isClaude = s.vendor === "claude";
                       return (
                         <button
-                          key={`${item.project}:${item.session}`}
+                          key={s.sid}
                           type="button"
-                          onClick={() => switchTo(item)}
+                          onClick={() => switchTo(s)}
                           className={`w-full text-left px-2 py-1.5 rounded-md flex items-center gap-2 text-xs ${
                             active
                               ? "bg-surface-700 text-text-primary"
@@ -511,50 +362,69 @@ export default function ChatConsole() {
                           />
                           <span
                             className={`font-mono px-1 rounded text-[10px] ${
-                              isClaude
-                                ? "bg-amber-500/15 text-amber-300"
-                                : "bg-sky-500/15 text-sky-300"
+                              isClaude ? "bg-amber-500/15 text-amber-300" : "bg-sky-500/15 text-sky-300"
                             }`}
                           >
-                            {item.vendor ?? "?"}
+                            {s.vendor}
                           </span>
-                          <span className="truncate flex-1">{item.role ?? "—"}</span>
-                          <span className="text-text-dim font-mono">{item.session}</span>
+                          <span className="truncate flex-1">{s.role}</span>
+                          {s.permission_mode === "hitl" ? (
+                            <span
+                              className="font-mono text-[9px] text-amber-300/90"
+                              title="HITL: 非 allowlist 工具需批准"
+                            >
+                              hitl
+                            </span>
+                          ) : null}
+                          <span className="text-text-dim font-mono">{s.sid}</span>
                         </button>
                       );
                     })}
+                    {items.length === 0 ? (
+                      <div className="px-2 py-1 text-[10px] text-text-dim/60">无 session</div>
+                    ) : null}
                   </div>
                 </div>
               );
             })}
             {projects.length === 0 ? (
               <div className="px-2 py-3 text-xs text-text-dim leading-5">
-                还没有 session。点「＋ 新建」选 项目 / code agent / role 创建。
+                {railError ? `加载失败: ${railError}` : "还没有 session。点「＋ 新建」创建。"}
               </div>
             ) : null}
           </div>
         </aside>
 
-        {/* main: focus crumb + view toggle + transcript/terminal + composer */}
+        {/* main: crumb + view toggle + transcript/terminal + composer */}
         <main className="flex-1 min-w-0 min-h-0 flex flex-col">
           <div className="h-10 shrink-0 px-4 flex items-center gap-3 border-b border-surface-700/30">
-            <span className="text-xs text-text-dim shrink-0">对话焦点 →</span>
-            {focus ? (
+            <span className="text-xs text-text-dim shrink-0">会话 →</span>
+            {activeView ? (
               <span className="flex items-center gap-2 text-xs min-w-0">
                 <span className="text-green-400">●</span>
-                <span className="font-semibold truncate">{focus.project}</span>
+                <span className="font-semibold truncate">{activeView.project}</span>
                 <span className="text-text-dim">/</span>
-                <span className={focus.vendor === "claude" ? "text-amber-300" : "text-sky-300"}>
-                  {[focus.vendor, focus.role].filter(Boolean).join(" · ") || "—"}
+                <span className={activeView.vendor === "claude" ? "text-amber-300" : "text-sky-300"}>
+                  {[activeView.vendor, activeView.role].filter(Boolean).join(" · ")}
                 </span>
-                {focus.session ? (
-                  <span className="font-mono text-text-dim">{focus.session}</span>
-                ) : null}
+                <span className="font-mono text-text-dim">{activeView.sid}</span>
               </span>
+            ) : sid ? (
+              <span className="text-xs text-text-dim font-mono">{sid}</span>
             ) : (
-              <span className="text-xs text-text-dim">未选择 session</span>
+              <span className="text-xs text-text-dim">从左侧选一个 session</span>
             )}
             <span className="flex-1" />
+            {sid ? (
+              <button
+                type="button"
+                onClick={stopActive}
+                title="停止会话"
+                className="h-7 px-2 rounded text-xs flex items-center gap-1 text-text-dim hover:text-red-300 hover:bg-surface-800"
+              >
+                <Square className="h-3.5 w-3.5" /> 停止
+              </button>
+            ) : null}
             <div className="flex items-center gap-1 rounded-md bg-surface-800 p-0.5">
               <button
                 type="button"
@@ -579,8 +449,8 @@ export default function ChatConsole() {
             </div>
           </div>
 
-          {showTerminal && focus?.session ? (
-            <TerminalView slug={focus.project} sid={focus.session} className="flex-1 min-h-0" />
+          {showTerminal && activeView?.project && sid ? (
+            <TerminalView slug={activeView.project} sid={sid} className="flex-1 min-h-0" />
           ) : (
             <>
               <div
@@ -588,41 +458,61 @@ export default function ChatConsole() {
                 onScroll={onTranscriptScroll}
                 className="flex-1 min-h-0 overflow-y-auto p-4 space-y-3"
               >
-                {rows.map((row) => {
-                  if (row.kind === "marker") {
-                    return (
-                      <div key={row.id} className="flex justify-center">
-                        <span className="text-[11px] font-mono text-sky-300 bg-surface-800 border border-surface-700/60 rounded-full px-3 py-1">
+                {!sid ? (
+                  <div className="h-full grid place-items-center text-xs text-text-dim">
+                    选一个 session 或点「＋ 新建」开始。
+                  </div>
+                ) : (
+                  rows.map((row) => {
+                    if (row.kind === "approval") {
+                      return (
+                        <div
+                          key={row.id}
+                          className="max-w-[760px] rounded-md px-3 py-2.5 text-sm bg-amber-500/10 border border-amber-500/30"
+                        >
+                          <div className="text-amber-200 mb-2">{row.content}</div>
+                          <div className="flex flex-wrap gap-2">
+                            {(row.options ?? []).map((opt, i) => (
+                              <button
+                                key={`${row.id}-${i}`}
+                                type="button"
+                                disabled={row.resolved}
+                                onClick={() => resolveApproval(row, i)}
+                                className="h-7 px-3 rounded-md text-xs bg-amber-500 text-surface-950 hover:bg-amber-400 disabled:opacity-40"
+                              >
+                                {opt.label}
+                              </button>
+                            ))}
+                          </div>
+                          {row.resolved ? (
+                            <div className="mt-1.5 text-[10px] text-text-dim">已回应</div>
+                          ) : null}
+                        </div>
+                      );
+                    }
+                    if (row.kind === "system") {
+                      return (
+                        <div key={row.id} className="text-center text-[11px] text-text-dim">
                           {row.content}
-                        </span>
-                      </div>
-                    );
-                  }
-                  if (row.kind === "system") {
+                        </div>
+                      );
+                    }
                     return (
-                      <div key={row.id} className="text-center text-[11px] text-text-dim">
+                      <div
+                        key={row.id}
+                        className={`max-w-[760px] rounded-md px-3 py-2 text-sm leading-6 whitespace-pre-wrap break-words ${
+                          row.kind === "user"
+                            ? "ml-auto bg-amber-500/15 border border-amber-500/20"
+                            : row.kind === "tool"
+                              ? "bg-surface-800/70 border border-surface-700/50 text-text-secondary font-mono text-xs"
+                              : "bg-surface-800 border border-surface-700/40"
+                        }`}
+                      >
                         {row.content}
                       </div>
                     );
-                  }
-                  return (
-                    <div
-                      key={row.id}
-                      className={`max-w-[760px] rounded-md px-3 py-2 text-sm leading-6 whitespace-pre-wrap break-words ${
-                        row.kind === "user"
-                          ? "ml-auto bg-amber-500/15 border border-amber-500/20"
-                          : row.kind === "tool"
-                            ? "bg-surface-800/70 border border-surface-700/50 text-text-secondary font-mono text-xs"
-                            : "bg-surface-800 border border-surface-700/40"
-                      }`}
-                    >
-                      {row.kind === "assistant" && row.from ? (
-                        <div className="text-[10px] font-mono text-text-dim mb-1">{row.from}</div>
-                      ) : null}
-                      {row.content}
-                    </div>
-                  );
-                })}
+                  })
+                )}
               </div>
               <div className="border-t border-surface-700/40 p-3">
                 <div className="flex gap-2">
@@ -635,15 +525,16 @@ export default function ChatConsole() {
                         submit();
                       }
                     }}
-                    className="min-h-11 max-h-32 flex-1 resize-y rounded-md bg-surface-800 border border-surface-700 px-3 py-2 text-sm outline-none focus:border-amber-500"
-                    placeholder="发消息 / @bot / 命令(/new /use /cd /compact /review)…"
+                    disabled={!sid}
+                    className="min-h-11 max-h-32 flex-1 resize-y rounded-md bg-surface-800 border border-surface-700 px-3 py-2 text-sm outline-none focus:border-amber-500 disabled:opacity-40"
+                    placeholder={sid ? "发消息 / 命令(/compact /clear …)…" : "先选一个 session"}
                   />
                   <button
                     type="button"
                     onClick={submit}
-                    disabled={!connected}
+                    disabled={!sid}
                     className="h-11 w-11 shrink-0 rounded-md bg-amber-500 text-surface-950 hover:bg-amber-400 disabled:opacity-40 grid place-items-center"
-                    title={connected ? "发送" : "未连接"}
+                    title={sid ? "发送" : "未选择 session"}
                   >
                     <Send className="h-4 w-4" />
                   </button>
@@ -658,11 +549,7 @@ export default function ChatConsole() {
         <NewSessionModal
           projects={projects}
           roleOptions={roleOptions}
-          defaultProject={
-            focus?.project && projects.includes(focus.project)
-              ? focus.project
-              : (projects[0] ?? "__new")
-          }
+          defaultProject={activeView?.project ?? projects[0] ?? ""}
           onCancel={() => setModalOpen(false)}
           onCreate={createSession}
         />
@@ -671,11 +558,10 @@ export default function ChatConsole() {
   );
 }
 
-// N3 + new-project: a real <select> for the project (existing ones +
-// "＋ 新建项目…"), code agent, and role. Choosing "＋ 新建项目…" reveals a
-// name + path so a brand-new project can be scaffolded at any directory.
-const NEW_PROJECT = "__new";
-
+// New-session modal: pick an EXISTING project (the gateway create endpoint
+// is per-project), code agent, role (default cto), and permission mode.
+// Brand-new project scaffolding is an operator action (`ccteam init` / the
+// dashboard) — out of scope for the per-session chat create.
 function NewSessionModal({
   projects,
   roleOptions,
@@ -687,31 +573,24 @@ function NewSessionModal({
   roleOptions: string[];
   defaultProject: string;
   onCancel: () => void;
-  onCreate: (req: CreateRequest) => void;
+  onCreate: (
+    slug: string,
+    role: string,
+    vendor: string,
+    permissionMode: "skip" | "hitl",
+  ) => void;
 }) {
   const [project, setProject] = useState(defaultProject);
-  const [newName, setNewName] = useState("");
-  const [newPath, setNewPath] = useState("");
   const [vendor, setVendor] = useState<"claude" | "codex">("claude");
   const [role, setRole] = useState("");
+  const [hitl, setHitl] = useState(false);
 
-  const isNew = project === NEW_PROJECT;
-  const effectiveRole = role.trim() || "assistant";
-  const slug = newName.trim();
-  const path = newPath.trim();
-  // The gateway requires an absolute (or ~) path; validate here so a bad path
-  // can't be submitted (which the backend would reject after the fact).
-  const pathOk = path.startsWith("/") || path.startsWith("~");
-  const slugOk = /^[a-z0-9-]+$/.test(slug);
-  const ready = isNew ? slugOk && pathOk : project.length > 0;
+  const effectiveRole = role.trim() || DEFAULT_ROLE;
+  const ready = project.length > 0;
 
   const submit = () => {
     if (!ready) return;
-    if (isNew) {
-      onCreate({ kind: "new", slug, path, vendor, role: effectiveRole });
-    } else {
-      onCreate({ kind: "existing", project, vendor, role: effectiveRole });
-    }
+    onCreate(project, effectiveRole, vendor, hitl ? "hitl" : "skip");
   };
 
   return (
@@ -739,45 +618,7 @@ function NewSessionModal({
                 {item}
               </option>
             ))}
-            <option value={NEW_PROJECT}>＋ 新建项目…</option>
           </select>
-
-          {isNew ? (
-            <div className="space-y-3 rounded-md border border-surface-700/60 bg-surface-800/40 p-3">
-              <div>
-                <label className="block text-xs text-text-dim mb-1">新项目名 (slug)</label>
-                <input
-                  value={newName}
-                  onChange={(event) => setNewName(event.target.value)}
-                  placeholder="payments-core(小写、数字、连字符)"
-                  className="w-full h-9 rounded-md bg-surface-800 border border-surface-700 px-3 text-sm outline-none focus:border-amber-500"
-                />
-                {slug.length > 0 && !slugOk ? (
-                  <div className="mt-1 text-[10px] text-red-400 leading-4">
-                    只能用小写字母、数字、连字符。
-                  </div>
-                ) : null}
-              </div>
-              <div>
-                <label className="block text-xs text-text-dim mb-1">项目路径</label>
-                <input
-                  value={newPath}
-                  onChange={(event) => setNewPath(event.target.value)}
-                  placeholder="/home/you/code/myrepo 或 ~/code/myrepo"
-                  className="w-full h-9 rounded-md bg-surface-800 border border-surface-700 px-3 text-sm font-mono outline-none focus:border-amber-500"
-                />
-                <div
-                  className={`mt-1 text-[10px] leading-4 ${
-                    path.length > 0 && !pathOk ? "text-red-400" : "text-text-dim"
-                  }`}
-                >
-                  {path.length > 0 && !pathOk
-                    ? "路径必须以 / 或 ~ 开头(绝对路径)。"
-                    : "已有仓库就地接管(不动你的代码);空目录会被创建。需绝对路径或 ~ 开头。"}
-                </div>
-              </div>
-            </div>
-          ) : null}
 
           <label className="block text-xs text-text-dim">Code agent</label>
           <div className="flex gap-1 rounded-md bg-surface-800 p-0.5">
@@ -800,7 +641,7 @@ function NewSessionModal({
             list="ccteam-chat-roles"
             value={role}
             onChange={(event) => setRole(event.target.value)}
-            placeholder="reviewer / api / payments-core …"
+            placeholder={`${DEFAULT_ROLE} / reviewer / api …`}
             className="w-full h-9 rounded-md bg-surface-800 border border-surface-700 px-3 text-sm outline-none focus:border-amber-500"
           />
           <datalist id="ccteam-chat-roles">
@@ -809,24 +650,22 @@ function NewSessionModal({
             ))}
           </datalist>
 
+          <label className="flex items-center gap-2 text-xs text-text-secondary">
+            <input
+              type="checkbox"
+              checked={hitl}
+              onChange={(event) => setHitl(event.target.checked)}
+              className="accent-amber-500"
+            />
+            HITL 批准（非 allowlist 工具需在此点同意/拒绝）
+          </label>
+
           <div className="text-[11px] font-mono text-text-dim leading-5">
-            {isNew ? (
-              <>
-                → <span className="text-text-secondary">/newproject {slug || "<slug>"} {path || "<path>"}</span>
-                <br />→{" "}
-                <span className="text-text-secondary">
-                  /cd {slug || "<slug>"} + /new {vendor} {effectiveRole}
-                </span>
-              </>
-            ) : (
-              <>
-                → <span className="text-text-secondary">/cd {project || "<project>"}</span>
-                {" + "}
-                <span className="text-text-secondary">
-                  /new {vendor} {effectiveRole}
-                </span>
-              </>
-            )}
+            → <span className="text-text-secondary">POST /api/v1/projects/{project || "<project>"}/sessions</span>
+            <br />
+            → role=<span className="text-text-secondary">{effectiveRole}</span> vendor=
+            <span className="text-text-secondary">{vendor}</span> mode=
+            <span className="text-text-secondary">{hitl ? "hitl" : "skip"}</span>
           </div>
         </div>
         <div className="px-4 py-3 flex justify-end gap-2 border-t border-surface-700/50">

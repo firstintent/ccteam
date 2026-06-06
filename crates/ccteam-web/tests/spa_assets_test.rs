@@ -101,6 +101,37 @@ async fn get_app_unknown_path_falls_back_to_index_html() {
     );
 }
 
+/// v0.8.7 W4 (DD.1) — the per-session chat deep link `/app/chat/s/{sid}`
+/// (the new gateway `s{n}` route ChatConsole reads via `useParams`) must
+/// also resolve to the SPA `index.html` (react-router renders the route
+/// client-side). Extends the v032-spa fallback coverage to the new shape.
+#[tokio::test]
+async fn get_app_chat_session_deep_link_falls_back_to_index_html() {
+    let addr = spawn_server().await;
+    let url = format!("http://{addr}/app/chat/s/s2");
+    let resp = reqwest::get(&url).await.expect("GET /app/chat/s/s2");
+    assert_eq!(
+        resp.status(),
+        200,
+        "per-session chat deep link must SPA-fallback to 200",
+    );
+    let ctype = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        ctype.contains("text/html"),
+        "fallback must be HTML, got: {ctype}"
+    );
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("<html") || body.to_lowercase().contains("<!doctype html"),
+        "fallback body must look like HTML; got: {body}",
+    );
+}
+
 #[tokio::test]
 async fn get_assets_spa_unknown_returns_404() {
     let addr = spawn_server().await;

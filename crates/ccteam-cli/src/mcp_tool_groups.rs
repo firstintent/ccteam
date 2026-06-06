@@ -15,8 +15,10 @@
 //! - 1 screenshot tool
 //! - 6 chat tools
 //! - 2 advise tools
+//! - 5 session tools (v0.8.7 W1 — cto scheduling: spawn / dispatch /
+//!   collect / list / stop)
 //!
-//! Total: 12 tools registered. Disabling a group hides every tool in
+//! Total: 17 tools registered. Disabling a group hides every tool in
 //! that group from `tools/list`; `tools/call` against a disabled tool
 //! falls through to the standard "unknown tool" error.
 
@@ -50,6 +52,9 @@ pub enum ToolGroup {
     Chat,
     /// Codex + Claude parallel advisor (2 tools).
     Advise,
+    /// cto scheduling over the gateway session map (5 tools, v0.8.7 W1):
+    /// spawn / dispatch / collect / list / stop.
+    Session,
 }
 
 impl ToolGroup {
@@ -63,6 +68,7 @@ impl ToolGroup {
             ToolGroup::Screenshot => "screenshot",
             ToolGroup::Chat => "chat",
             ToolGroup::Advise => "advise",
+            ToolGroup::Session => "session",
         }
     }
 
@@ -76,6 +82,7 @@ impl ToolGroup {
             "screenshot" => Some(Self::Screenshot),
             "chat" => Some(Self::Chat),
             "advise" => Some(Self::Advise),
+            "session" => Some(Self::Session),
             _ => None,
         }
     }
@@ -137,6 +144,9 @@ pub fn group_for_tool(name: &str) -> Option<ToolGroup> {
     }
     if bare.strip_prefix("advise_").is_some() {
         return Some(ToolGroup::Advise);
+    }
+    if bare.strip_prefix("session_").is_some() {
+        return Some(ToolGroup::Session);
     }
     None
 }
@@ -214,6 +224,10 @@ mod tests {
             group_for_tool("ccteam__advise_vote"),
             Some(ToolGroup::Advise)
         );
+        assert_eq!(
+            group_for_tool("ccteam__session_spawn"),
+            Some(ToolGroup::Session)
+        );
         assert_eq!(group_for_tool("ccteam__bogus"), None);
         assert_eq!(group_for_tool("not-a-ccteam-tool"), None);
     }
@@ -260,6 +274,7 @@ mod tests {
             ToolGroup::Screenshot,
             ToolGroup::Chat,
             ToolGroup::Advise,
+            ToolGroup::Session,
         ] {
             assert_eq!(ToolGroup::parse(g.as_str()), Some(g));
             // Case insensitive.
