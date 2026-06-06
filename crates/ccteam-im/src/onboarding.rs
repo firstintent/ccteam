@@ -18,7 +18,7 @@
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::credentials::TelegramCreds;
+use crate::credentials::{LarkCreds, TelegramCreds};
 
 /// Wrapper around [`TelegramCreds`] that carries the `bot_username`
 /// returned by `getMe` for the skill UX ("在 TG 找 @xxx"). Kept off
@@ -186,4 +186,115 @@ struct Message {
 #[derive(Debug, Deserialize)]
 struct Chat {
     id: i64,
+}
+
+// --- Lark / Feishu onboarding ----------------------------------------
+//
+// Unlike Telegram there is no `chat_id` long-poll: the Lark provider keys
+// its allowlist on the operator-supplied `open_id` list (fail-closed) and
+// the daemon opens an *outbound* WS long-connection, so the only thing to
+// confirm at setup time is that `(app_id, app_secret)` are valid app
+// credentials. We do that by fetching a `tenant_access_token` — the same
+// `auth/v3/tenant_access_token/internal` call the live channel makes
+// (`transport::providers::lark::LarkChannel::get_tenant_access_token`).
+// A bad app_id / secret surfaces as an honest network/API error rather
+// than persisting dead credentials.
+
+/// Default Lark/Feishu open-platform API roots. `use_feishu = true`
+/// (CN) → `open.feishu.cn`; `false` (intl) → `open.larksuite.com`.
+/// Mirrors the constants in `transport::providers::lark`.
+pub const FEISHU_API_BASE: &str = "https://open.feishu.cn/open-apis";
+/// Lark international open-platform API root.
+pub const LARK_API_BASE: &str = "https://open.larksuite.com/open-apis";
+
+/// Result of a successful Lark/Feishu credential check: the on-disk
+/// [`LarkCreds`] record ready to merge into the credentials document.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LarkSetupResult {
+    /// Validated credentials (app id/secret + provider allowlist + region).
+    pub creds: LarkCreds,
+}
+
+/// Validate Lark/Feishu app credentials and return the on-disk record.
+///
+/// `allowed_user_ids` is the provider-layer `open_id` (`ou_…`) allowlist —
+/// **fail-closed**: an empty list means the bot answers no one (the
+/// opposite of Telegram, where an empty allowlist is open). `use_feishu`
+/// selects the region (`true` = Feishu/CN, `false` = Lark international).
+pub async fn lark_setup(
+    app_id: &str,
+    app_secret: &str,
+    allowed_user_ids: Vec<String>,
+    use_feishu: bool,
+) -> Result<LarkSetupResult, OnboardingError> {
+    let api_base = if use_feishu {
+        FEISHU_API_BASE
+    } else {
+        LARK_API_BASE
+    };
+    lark_setup_with_base(app_id, app_secret, allowed_user_ids, use_feishu, api_base).await
+}
+
+/// Test-friendly variant that lets callers override the API base (point a
+/// deterministic mock server at it — no real Feishu/Lark call required for
+/// `cargo test`). Mirrors [`telegram_setup_with_base`].
+pub async fn lark_setup_with_base(
+    app_id: &str,
+    app_secret: &str,
+    allowed_user_ids: Vec<String>,
+    use_feishu: bool,
+    api_base: &str,
+) -> Result<LarkSetupResult, OnboardingError> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+
+    // tenant_access_token/internal — same body the live channel posts.
+    let url = format!("{api_base}/auth/v3/tenant_access_token/internal");
+    let resp: TenantTokenResponse = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "app_id": app_id,
+            "app_secret": app_secret,
+        }))
+        .send()
+        .await?
+        .json()
+        .await?;
+
+    // Feishu wraps errors in a `200` with a non-zero `code` (mirrors the
+    // channel's `get_tenant_access_token` check) — treat that as "bad
+    // credentials" so the operator gets an honest failure, not a saved
+    // dead token.
+    if resp.code != 0 {
+        let msg = resp.msg.unwrap_or_else(|| "unknown error".into());
+        return Err(OnboardingError::ApiNotOk(format!(
+            "tenant_access_token (code={}): {msg}",
+            resp.code
+        )));
+    }
+    if resp.tenant_access_token.unwrap_or_default().is_empty() {
+        return Err(OnboardingError::BadResponse(
+            "tenant_access_token missing from response".into(),
+        ));
+    }
+
+    Ok(LarkSetupResult {
+        creds: LarkCreds {
+            app_id: app_id.into(),
+            app_secret: app_secret.into(),
+            allowed_user_ids,
+            use_feishu,
+        },
+    })
+}
+
+/// `auth/v3/tenant_access_token/internal` response (minimal subset).
+#[derive(Debug, Deserialize)]
+struct TenantTokenResponse {
+    code: i64,
+    #[serde(default)]
+    msg: Option<String>,
+    #[serde(default)]
+    tenant_access_token: Option<String>,
 }

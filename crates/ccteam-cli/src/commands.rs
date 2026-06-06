@@ -4411,6 +4411,109 @@ pub fn run_config_set_im_token(token: &str) -> Result<String> {
     ))
 }
 
+/// `config` action — validate Lark/Feishu app credentials (by fetching a
+/// `tenant_access_token`) and persist them to
+/// `~/.ccteam/im/credentials.json` (mode 0600). Mirrors
+/// [`run_config_set_im_token`] but for the WS-long-connection Lark
+/// provider: there is no `chat_id` to poll — the provider keys its
+/// allowlist on operator-supplied `open_id`s.
+///
+/// `allowed_user_ids` is **fail-closed**: an empty list means the bot
+/// answers no one (the opposite of Telegram's empty=open). `use_feishu`
+/// selects the region (`true` = Feishu/CN, `false` = Lark international).
+pub fn run_config_set_lark_creds(
+    app_id: &str,
+    app_secret: &str,
+    allowed_user_ids: Vec<String>,
+    use_feishu: bool,
+) -> Result<String> {
+    let api_base = if use_feishu {
+        ccteam_im::onboarding::FEISHU_API_BASE
+    } else {
+        ccteam_im::onboarding::LARK_API_BASE
+    };
+    run_config_set_lark_creds_with_base(
+        app_id,
+        app_secret,
+        allowed_user_ids,
+        use_feishu,
+        api_base,
+        None,
+    )
+}
+
+/// Test seam for [`run_config_set_lark_creds`]: lets callers override the
+/// Lark API base (point a deterministic mock server at it) and the
+/// credentials-file path (sandbox `~/.ccteam/im/credentials.json` into a
+/// tempdir). Production callers go through [`run_config_set_lark_creds`],
+/// which passes the real region base + the default creds path. Mirrors the
+/// `_with_base` convention in `ccteam_im::onboarding`.
+pub fn run_config_set_lark_creds_with_base(
+    app_id: &str,
+    app_secret: &str,
+    allowed_user_ids: Vec<String>,
+    use_feishu: bool,
+    api_base: &str,
+    creds_path_override: Option<&std::path::Path>,
+) -> Result<String> {
+    let app_id = app_id.trim();
+    let app_secret = app_secret.trim();
+    if app_id.is_empty() || app_secret.is_empty() {
+        bail!("config: Lark app_id and app_secret are both required");
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime for Lark credential onboarding")?;
+    let result = runtime
+        .block_on(ccteam_im::onboarding::lark_setup_with_base(
+            app_id,
+            app_secret,
+            allowed_user_ids,
+            use_feishu,
+            api_base,
+        ))
+        .context("Lark onboarding (app credential validation via tenant_access_token)")?;
+
+    // Persist: merge into any existing credentials doc so a prior
+    // Telegram / Slack / Discord entry survives a Lark (re)config.
+    let creds_path = match creds_path_override {
+        Some(p) => p.to_path_buf(),
+        None => ccteam_im::credentials::default_path(),
+    };
+    let mut creds = ccteam_im::credentials::load(Some(&creds_path))
+        .context("load existing IM credentials before merge")?;
+    let allow_count = result.creds.allowed_user_ids.len();
+    let region = if result.creds.use_feishu {
+        "Feishu (CN, open.feishu.cn)"
+    } else {
+        "Lark (intl, open.larksuite.com)"
+    };
+    creds.lark = Some(result.creds);
+    ccteam_im::credentials::save(&creds_path, &creds).context("persist IM credentials")?;
+
+    let allow_note = if allow_count == 0 {
+        "  allowlist     EMPTY — fail-closed: the bot answers NO ONE.\n  \
+         add open_ids (ou_…) to allowed_user_ids to let users in.\n"
+            .to_string()
+    } else {
+        format!("  allowlist     {allow_count} open_id(s) allowed\n")
+    };
+
+    Ok(format!(
+        "ccteam config: Lark/Feishu credentials saved\n\n  \
+         app_id        {}\n  \
+         region        {}\n\
+         {}  \
+         credentials   {}\n\n\
+         `ccteam start` will bring the IM gateway up with these credentials.\n",
+        app_id,
+        region,
+        allow_note,
+        creds_path.display(),
+    ))
+}
+
 /// Bare `ccteam config` — thin numbered-choice interactive menu. Reads a
 /// single digit from stdin and dispatches to the same action fn the
 /// non-interactive path uses (so all real work stays in testable fns).
@@ -4434,9 +4537,10 @@ pub fn run_config_menu(paths: &CcteamPaths) -> Result<String> {
     println!("ccteam config — setup\n");
     println!("  1) register / refresh the ccteam MCP server (~/.claude.json)");
     println!("  2) set the IM (Telegram) bot token");
-    println!("  3) show preferences");
+    println!("  3) set Lark/Feishu app credentials");
+    println!("  4) show preferences");
     println!("  q) quit");
-    print!("\nchoose [1-3/q]: ");
+    print!("\nchoose [1-4/q]: ");
     std::io::stdout().flush().ok();
 
     let mut line = String::new();
@@ -4458,10 +4562,58 @@ pub fn run_config_menu(paths: &CcteamPaths) -> Result<String> {
             );
             run_config_set_im_token(&token)
         }
-        "3" => run_prefs_show(paths),
+        "3" => run_config_lark_menu(),
+        "4" => run_prefs_show(paths),
         "q" | "Q" | "" => Ok("ccteam config: nothing changed.\n".to_string()),
-        other => bail!("ccteam config: unrecognized choice {other:?} (expected 1-3 or q)"),
+        other => bail!("ccteam config: unrecognized choice {other:?} (expected 1-4 or q)"),
     }
+}
+
+/// Interactive prompt for the menu's Lark/Feishu item: collect
+/// `app_id` / `app_secret`, the region (Feishu/CN default vs Lark intl),
+/// and the optional `open_id` allowlist, then hand off to
+/// [`run_config_set_lark_creds`] (which validates + persists). Kept
+/// separate from [`run_config_menu`] so the stdin reads stay linear and
+/// the persistence logic remains unit-testable without a TTY.
+fn run_config_lark_menu() -> Result<String> {
+    use std::io::Write;
+
+    fn prompt_line(label: &str) -> Result<String> {
+        print!("{label}");
+        std::io::stdout().flush().ok();
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_line(&mut buf)
+            .with_context(|| format!("read {label:?} from stdin"))?;
+        Ok(buf.trim().to_string())
+    }
+
+    println!(
+        "\nLark/Feishu app credentials (from the developer console → app → Credentials & Basic Info)."
+    );
+    let app_id = prompt_line("app_id (cli_…): ")?;
+    let app_secret = prompt_line("app_secret: ")?;
+
+    // Region: default Feishu/CN (Enter accepts the default).
+    let region = prompt_line("region — [F]eishu CN (default) / [L]ark intl: ")?;
+    let use_feishu = !matches!(region.to_ascii_lowercase().as_str(), "l" | "lark" | "intl");
+
+    // Provider allowlist is FAIL-CLOSED — make that loud.
+    println!(
+        "\nallowed_user_ids = the open_ids (ou_…) allowed to drive the bot.\n  \
+         FAIL-CLOSED: leaving this EMPTY means the bot answers NO ONE\n  \
+         (the opposite of Telegram, where empty = open). Use `*` to allow everyone."
+    );
+    let allow_raw = prompt_line("allowed open_ids (comma/space separated, or blank): ")?;
+    let allowed_user_ids: Vec<String> = allow_raw
+        .split([',', ' ', '\t'])
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    println!("validating app credentials (fetching a tenant_access_token)…");
+    run_config_set_lark_creds(&app_id, &app_secret, allowed_user_ids, use_feishu)
 }
 
 // -------------------------------------------------------------------------
@@ -4581,10 +4733,10 @@ pub fn run_admin_register_bot(
 
     // IM platform: same enum the MCP dispatcher uses.
     match platform_raw {
-        "telegram" | "slack" | "discord" | "mock" => {}
+        "telegram" | "slack" | "discord" | "lark" | "mock" => {}
         other => {
             return Err(anyhow::anyhow!(
-                "invalid platform `{other}`: expected one of `telegram`, `slack`, `discord`, `mock`"
+                "invalid platform `{other}`: expected one of `telegram`, `slack`, `discord`, `lark`, `mock`"
             ));
         }
     }
@@ -7044,6 +7196,169 @@ mod tests {
         assert_eq!(
             unexpected[0],
             Value::String("ccteam__advise_synth_stub".into())
+        );
+    }
+
+    // --- Lark/Feishu config (run_config_set_lark_creds) ---------------
+    //
+    // Deterministic: a one-shot std TCP listener stands in for the Feishu
+    // `tenant_access_token/internal` endpoint, so the credential validate
+    // makes a real HTTP round-trip without touching the network. No env
+    // mutation and the creds path is a tempdir, so this is safe in a lib
+    // `#[cfg(test)]` module (CLAUDE.md §六).
+
+    /// Spawn a single-shot HTTP/1.1 responder on `127.0.0.1:0` that replies
+    /// to the first connection with `body` (status 200, JSON) and exits.
+    /// Returns `http://127.0.0.1:<port>` (a Lark `api_base`).
+    fn spawn_oneshot_http(body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                // Drain the request headers (reqwest sends a small POST);
+                // we don't need to parse them for the canned reply.
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn lark_creds_persist_and_preserve_existing_telegram() {
+        let tmp = TempDir::new().unwrap();
+        let creds_path = tmp.path().join("im/credentials.json");
+
+        // Seed an existing Telegram entry that must survive the Lark write.
+        let seed = ccteam_im::credentials::Credentials {
+            telegram: Some(ccteam_im::credentials::TelegramCreds {
+                bot_token: "tg-seed-token".into(),
+                allowed_chat_ids: vec!["111".into()],
+            }),
+            ..Default::default()
+        };
+        ccteam_im::credentials::save(&creds_path, &seed).unwrap();
+
+        // Mock the tenant_access_token success shape (code=0 + a token).
+        let base = spawn_oneshot_http(
+            r#"{"code":0,"msg":"ok","tenant_access_token":"t-tok","expire":7200}"#,
+        );
+
+        let out = run_config_set_lark_creds_with_base(
+            "cli_app_42",
+            "secret_42",
+            vec!["ou_alice".into(), "ou_bob".into()],
+            true, // Feishu / CN
+            &base,
+            Some(&creds_path),
+        )
+        .expect("lark creds validate + persist must succeed against the mock");
+        assert!(
+            out.contains("Lark/Feishu credentials saved") && out.contains("2 open_id(s) allowed"),
+            "summary must confirm the save + allowlist count; got: {out}"
+        );
+
+        // Reload and assert the lark block landed with the right fields …
+        let reloaded = ccteam_im::credentials::load(Some(&creds_path)).unwrap();
+        let lark = reloaded.lark.expect("lark creds must be persisted");
+        assert_eq!(lark.app_id, "cli_app_42");
+        assert_eq!(lark.app_secret, "secret_42");
+        assert_eq!(lark.allowed_user_ids, vec!["ou_alice", "ou_bob"]);
+        assert!(lark.use_feishu, "use_feishu must round-trip true");
+
+        // … and that the pre-existing Telegram entry was preserved (the
+        // merge must not clobber sibling platforms).
+        let tg = reloaded.telegram.expect("telegram must survive the merge");
+        assert_eq!(tg.bot_token, "tg-seed-token");
+        assert_eq!(tg.allowed_chat_ids, vec!["111"]);
+    }
+
+    #[test]
+    fn lark_creds_empty_allowlist_warns_fail_closed() {
+        let tmp = TempDir::new().unwrap();
+        let creds_path = tmp.path().join("im/credentials.json");
+        let base = spawn_oneshot_http(r#"{"code":0,"msg":"ok","tenant_access_token":"t-tok"}"#);
+
+        // Empty allowlist + Lark international region.
+        let out = run_config_set_lark_creds_with_base(
+            "cli_x",
+            "secret_x",
+            vec![],
+            false,
+            &base,
+            Some(&creds_path),
+        )
+        .expect("empty allowlist still persists (it is a valid, if locked-down, config)");
+        assert!(
+            out.contains("fail-closed") && out.contains("NO ONE"),
+            "empty allowlist must surface the fail-closed warning; got: {out}"
+        );
+        assert!(
+            out.contains("Lark (intl"),
+            "region note must reflect use_feishu=false; got: {out}"
+        );
+        let reloaded = ccteam_im::credentials::load(Some(&creds_path)).unwrap();
+        let lark = reloaded.lark.unwrap();
+        assert!(lark.allowed_user_ids.is_empty());
+        assert!(!lark.use_feishu);
+    }
+
+    #[test]
+    fn lark_creds_bad_app_creds_error_no_persist() {
+        let tmp = TempDir::new().unwrap();
+        let creds_path = tmp.path().join("im/credentials.json");
+        // Feishu signals bad credentials as a 200 with a non-zero `code`.
+        let base = spawn_oneshot_http(r#"{"code":10003,"msg":"invalid app_secret"}"#);
+
+        let err = run_config_set_lark_creds_with_base(
+            "cli_bad",
+            "wrong_secret",
+            vec!["ou_a".into()],
+            true,
+            &base,
+            Some(&creds_path),
+        )
+        .expect_err("a non-zero Feishu code must surface as an error, not a saved token");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("invalid app_secret") || msg.contains("10003"),
+            "error must carry the upstream Feishu reason; got: {msg}"
+        );
+        // Nothing should have been written on the validate failure.
+        assert!(
+            !creds_path.exists(),
+            "credentials file must not be created when validation fails"
+        );
+    }
+
+    #[test]
+    fn lark_creds_empty_app_id_rejected_before_network() {
+        // Guard: both app_id + app_secret are required; we never even
+        // reach the validate call (a deliberately-unreachable base URL).
+        let tmp = TempDir::new().unwrap();
+        let creds_path = tmp.path().join("im/credentials.json");
+        let err = run_config_set_lark_creds_with_base(
+            "   ",
+            "secret",
+            vec![],
+            true,
+            "http://127.0.0.1:1", // would refuse-connect if reached
+            Some(&creds_path),
+        )
+        .expect_err("blank app_id must be rejected up front");
+        assert!(
+            err.to_string()
+                .contains("app_id and app_secret are both required"),
+            "must name the missing-field guard; got: {err}"
         );
     }
 }

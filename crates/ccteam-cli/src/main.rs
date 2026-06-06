@@ -562,7 +562,7 @@ enum SessionCommand {
         /// Harness vendor — `claude` or `codex`.
         #[arg(long, default_value = "claude")]
         vendor: String,
-        /// IM platform — `telegram`, `slack`, `discord`, or `mock`.
+        /// IM platform — `telegram`, `slack`, `discord`, `lark`, or `mock`.
         #[arg(long, default_value = "telegram")]
         platform: String,
         /// Platform chat id (Telegram chat_id, Slack channel id, etc.).
