@@ -70,6 +70,10 @@ pub mod plugin_resolution;
 pub mod progress;
 pub mod projects;
 pub mod queries;
+// v0.8.7 W3 DC.1 — offline, vendored agency-agents role catalog (manifest
+// parse + search + find). Pure data, no network: the HTTP importer lives in
+// `ccteam-im` so this leaf crate stays free of an async HTTP dependency.
+pub mod role_catalog;
 // v0.8.6 W5b ResDisk — read-side reader for project-scoped agent roles
 // (`.claude/agents/<role>.md`). Write side lives in `admin_actions`.
 pub mod roles;
@@ -223,6 +227,12 @@ pub use queries::{
     count_agent_spawns_within, job_log_tail, workflow_summary, ActiveSessionInfo, AgentStatus,
     ArtifactQueueEntry, ArtifactStatusGroup, CostHistoryBucket, CostSummary, ProjectSummary,
     WorkflowSummary,
+};
+// v0.8.7 W3 DC.1 — offline agency-agents catalog browse/resolve.
+pub use role_catalog::{
+    all as catalog_all, find_by_id as catalog_find_by_id, raw_url as catalog_raw_url,
+    sanitize_role_stem, search as catalog_search, CatalogEntry, AGENCY_AGENTS_CATALOG,
+    AGENCY_RAW_BASE,
 };
 pub use roles::{agents_dir, list_roles, read_role, RoleDetail, RoleSummary};
 pub use screenshot::{

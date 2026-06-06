@@ -291,6 +291,18 @@ enum Command {
         #[command(subcommand)]
         cmd: SessionCommand,
     },
+    /// Role catalog group: `ccteam role <search|add|list>`.
+    ///
+    /// Browse the bundled agency-agents role catalog (`search`, offline —
+    /// no network), one-shot install a role into the project's
+    /// `.claude/agents/` (`add <id>`, fetches the role `.md` over HTTP), or
+    /// list the roles already installed in a project (`list`, wraps the
+    /// resource-API reader). This is a different noun from `session role`
+    /// (which switches a *live* chat session's role inside the daemon).
+    Role {
+        #[command(subcommand)]
+        cmd: RoleCommand,
+    },
     /// Health checks + tool-surface maintenance.
     Doctor {
         /// Print + return what would happen without touching the
@@ -705,6 +717,54 @@ enum ProjectCommand {
     },
 }
 
+/// v0.8.7 W3 (DC.3) — `ccteam role` subcommand group. Browse the bundled
+/// agency-agents catalog and one-shot install a role into a project's
+/// `.claude/agents/`. Distinct from `session role` (the live in-daemon role
+/// switch): these are one-shot project-file catalog/import operations.
+#[derive(Subcommand)]
+enum RoleCommand {
+    /// Search the bundled agency-agents catalog (offline — no network).
+    /// Matches the query (case-insensitive) against id / division /
+    /// name / description. An empty query lists the whole catalog. Each
+    /// row prints the catalog `id` to pass to `ccteam role add <id>`.
+    Search {
+        /// Substring query. Omit (or pass "") to list everything.
+        #[arg(default_value = "")]
+        query: String,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
+    /// Install a catalog role into a project's `.claude/agents/`. Fetches
+    /// the role `.md` from the upstream raw host and writes it verbatim
+    /// (the file is already Claude-native — no conversion). On success,
+    /// prints a hint to `/role <role>` to switch to it in a chat.
+    Add {
+        /// Catalog id (as shown by `ccteam role search`).
+        id: String,
+        /// Rename the installed role (file stem). Default: the catalog
+        /// entry's name. Sanitized to `[a-z0-9_-]`.
+        #[arg(long = "as", value_name = "ROLE")]
+        as_role: Option<String>,
+        /// Target project slug (resolved via `~/.ccteam/config.yaml`).
+        /// Default: the current working directory.
+        #[arg(long, value_name = "SLUG")]
+        project: Option<String>,
+        /// Overwrite an existing role file of the same name.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
+    /// List the roles already installed in a project's `.claude/agents/`
+    /// (wraps the resource-API role reader). Default project = the current
+    /// working directory.
+    List {
+        /// Target project slug. Default: the current working directory.
+        #[arg(long, value_name = "SLUG")]
+        project: Option<String>,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
+}
+
 /// Subcommands hidden under `ccteam internal` — hook handlers, the MCP
 /// server, low-level session utilities (peek / progress / send / spawn /
 /// resume / attach), the mux hook-emit client, the project probe, and the
@@ -1073,6 +1133,8 @@ fn main() -> Result<()> {
         },
         // v0.8.6 W4a — `ccteam session <...>` group.
         Command::Session { cmd } => run_session(cmd),
+        // v0.8.7 W3 — `ccteam role <search|add|list>` group.
+        Command::Role { cmd } => run_role(cmd),
         Command::Doctor {
             dry_run,
             tool_surface,
@@ -1273,6 +1335,37 @@ fn run_session_role(slug: &str, sid: &str, role: &str) -> Result<()> {
          Use the IM `/role {role}` command in the chat that owns session \
          `{sid}` (project `{slug}`) — it switches the current session in place.",
     )
+}
+
+/// v0.8.7 W3 — `ccteam role <search|add|list>` dispatcher. `search` is
+/// offline (no project / no network); `add` / `list` resolve a project dir
+/// from `--project <slug>` (or the cwd) and call into the commands layer.
+fn run_role(cmd: RoleCommand) -> Result<()> {
+    match cmd {
+        RoleCommand::Search { query, format } => {
+            let out = commands::run_role_search(&query, format)?;
+            print!("{out}");
+            Ok(())
+        }
+        RoleCommand::Add {
+            id,
+            as_role,
+            project,
+            force,
+        } => {
+            let paths = CcteamPaths::from_env()?;
+            let out =
+                commands::run_role_add(&paths, &id, as_role.as_deref(), project.as_deref(), force)?;
+            print!("{out}");
+            Ok(())
+        }
+        RoleCommand::List { project, format } => {
+            let paths = CcteamPaths::from_env()?;
+            let out = commands::run_role_list(&paths, project.as_deref(), format)?;
+            print!("{out}");
+            Ok(())
+        }
+    }
 }
 
 /// V0.6.1 F128 — `ccteam admin change-persona` accepts the persona

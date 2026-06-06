@@ -4656,6 +4656,136 @@ pub fn run_admin_change_persona(
     }))?)
 }
 
+/// v0.8.7 W3 (DC.3) — resolve a `--project <slug>` (or, when `None`, the
+/// current working directory canonicalized) to an existing project dir.
+/// Used by `ccteam role add` / `ccteam role list`. A `slug` that isn't a
+/// registered project (or a cwd that doesn't exist) is a loud error.
+fn resolve_project_dir(paths: &CcteamPaths, slug: Option<&str>) -> Result<std::path::PathBuf> {
+    let dir = match slug {
+        Some(s) => {
+            let d = paths.project_dir(s);
+            if !d.exists() {
+                bail!("no project named `{s}` (looked under {})", d.display());
+            }
+            d
+        }
+        None => std::env::current_dir().context("read cwd as the default --project target")?,
+    };
+    std::fs::canonicalize(&dir)
+        .with_context(|| format!("canonicalize project dir `{}`", dir.display()))
+}
+
+/// v0.8.7 W3 (DC.3) — `ccteam role search <q>`. Offline substring search
+/// over the bundled agency-agents catalog (no network). Empty query lists
+/// the whole catalog. Text output prints `id` + division + description so
+/// the user can copy an `id` into `ccteam role add`.
+pub fn run_role_search(query: &str, format: OutputFormat) -> Result<String> {
+    let hits = ccteam_core::catalog_search(query)?;
+    Ok(match format {
+        OutputFormat::Json => serde_json::to_string_pretty(&hits)?,
+        OutputFormat::Text => {
+            if hits.is_empty() {
+                format!("no catalog roles match `{query}`.\n")
+            } else {
+                let mut out = format!(
+                    "{} role(s) in the agency-agents catalog{}:\n\n",
+                    hits.len(),
+                    if query.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!(" matching `{query}`")
+                    }
+                );
+                for e in &hits {
+                    out.push_str(&format!("  {}  [{}]\n", e.id, e.division));
+                    if !e.description.is_empty() {
+                        // One-line, truncated description for the list view.
+                        let desc: String = e.description.chars().take(96).collect();
+                        out.push_str(&format!("      {desc}\n"));
+                    }
+                }
+                out.push_str(
+                    "\nInstall one: ccteam role add <id> [--as <role>] [--project <slug>]\n",
+                );
+                out
+            }
+        }
+    })
+}
+
+/// v0.8.7 W3 (DC.3) — `ccteam role add <id> [--as <role>] [--project <slug>]
+/// [--force]`. Imports a catalog role into the project's `.claude/agents/`
+/// (fetch over HTTP → verbatim write) and prints a `/role <role>` hint.
+/// The async fetch is driven on a throwaway current-thread runtime
+/// ([`block_on_async`]) since `main()` is sync.
+pub fn run_role_add(
+    paths: &CcteamPaths,
+    id: &str,
+    as_role: Option<&str>,
+    project: Option<&str>,
+    force: bool,
+) -> Result<String> {
+    let project_dir = resolve_project_dir(paths, project)?;
+    let result = block_on_async(ccteam_im::role_import::import_role_from_catalog(
+        &project_dir,
+        id,
+        as_role,
+        force,
+    ))??;
+    let mut out = format!(
+        "Installed role `{}` from catalog `{}`{}.\n  {}\n",
+        result.role,
+        result.catalog_id,
+        if result.overwrote {
+            " (overwrote existing)"
+        } else {
+            ""
+        },
+        result.path.display(),
+    );
+    out.push_str(&format!(
+        "\nSwitch to it in a chat with `/role {}` (or spawn a session with that role).\n",
+        result.role
+    ));
+    Ok(out)
+}
+
+/// v0.8.7 W3 (DC.3) — `ccteam role list [--project <slug>]`. Wraps
+/// [`ccteam_core::list_roles`] to show the roles already installed in the
+/// project's `.claude/agents/`. An uninitialized project (no `agents/` dir)
+/// is a normal "no roles yet" result, not an error.
+pub fn run_role_list(
+    paths: &CcteamPaths,
+    project: Option<&str>,
+    format: OutputFormat,
+) -> Result<String> {
+    let project_dir = resolve_project_dir(paths, project)?;
+    let roles = ccteam_core::list_roles(&project_dir)?;
+    Ok(match format {
+        OutputFormat::Json => serde_json::to_string_pretty(&roles)?,
+        OutputFormat::Text => {
+            if roles.is_empty() {
+                format!(
+                    "no roles installed in {} (.claude/agents/ is empty or absent).\n\
+                     Browse the catalog: ccteam role search <q>\n",
+                    project_dir.display()
+                )
+            } else {
+                let mut out = format!("{} role(s) in {}:\n\n", roles.len(), project_dir.display());
+                for r in &roles {
+                    out.push_str(&format!("  {}", r.role));
+                    if !r.description.is_empty() {
+                        let desc: String = r.description.chars().take(80).collect();
+                        out.push_str(&format!("  — {desc}"));
+                    }
+                    out.push('\n');
+                }
+                out
+            }
+        }
+    })
+}
+
 /// V0.6.1 F128 — append `tool_descriptor` to the bot's
 /// `.claude/agents/<bot>.md` frontmatter `tools:` CSV and emit a
 /// `tool_added` event. Idempotent — re-adding sets
