@@ -91,6 +91,18 @@ subtle = "2.5"
 # HTTP client used by ccteam-web integration tests (lib + subprocess).
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
+# v0.8.7 W5 (Item E) — OpenAPI auto-docs for the `/api/v1` resource API.
+# `utoipa` 5.x derives `ToSchema` / `#[utoipa::path]`; `utoipa-axum`
+# 0.2.x is the axum-0.8 binding (the 0.1.x line pinned axum 0.7 and will
+# not compile here) and provides `OpenApiRouter` so the spec is generated
+# from the same route registrations (single source of truth, anti-drift);
+# `utoipa-scalar` 0.3.x serves the Scalar interactive UI. The `axum`
+# feature on utoipa(-extras) wires the `Path`/`Query`/`Json` extractors
+# into the derive; `chrono` teaches the schema layer about `DateTime`.
+utoipa = { version = "5", features = ["axum_extras", "chrono"] }
+utoipa-axum = "0.2"
+utoipa-scalar = { version = "0.3", features = ["axum"] }
+
 [profile.release]
 lto = true
 codegen-units = 1

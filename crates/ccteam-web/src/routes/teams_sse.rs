@@ -25,8 +25,6 @@ use std::time::Duration;
 use axum::{
     extract::{Path, State},
     response::sse::{Event, KeepAlive, Sse},
-    routing::get,
-    Router,
 };
 use futures::stream::Stream;
 use serde_json::Value;
@@ -36,11 +34,21 @@ use crate::state::AppState;
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-pub fn router() -> Router<AppState> {
-    Router::new().route("/api/v1/teams/{name}/events", get(handle_team_events))
-}
-
-async fn handle_team_events(
+/// `GET /api/v1/teams/{name}/events`
+///
+/// OpenAPI note: a **Server-Sent Events** stream (`text/event-stream`),
+/// which OpenAPI cannot fully model. Each `event: progress` frame's
+/// `data` is a JSON team-progress line filtered to `team_name == {name}`.
+#[utoipa::path(
+    get,
+    path = "/api/v1/teams/{name}/events",
+    tag = "teams",
+    params(("name" = String, Path, description = "Team name")),
+    responses(
+        (status = 200, description = "SSE stream (text/event-stream) of team-progress events for this team.", content_type = "text/event-stream"),
+    ),
+)]
+pub(crate) async fn handle_team_events(
     State(app): State<AppState>,
     Path(name): Path<String>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {

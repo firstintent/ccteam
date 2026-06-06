@@ -28,24 +28,21 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{delete, post},
-    Json, Router,
+    Json,
 };
 use ccteam_core::ProjectEntry;
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use super::actions::{FormOrJson, InputMode};
 use crate::state::AppState;
 
-pub fn router() -> Router<AppState> {
-    Router::new()
-        .route("/api/v1/projects", post(handle_create_project))
-        .route("/api/v1/projects/{slug}", delete(handle_delete_project))
-}
-
 /// POST body — `slug` (required), `path` (required, absolute or
 /// `~`-relative working-tree dir), `team` (optional, defaults `dev`).
-#[derive(Debug, Deserialize)]
+///
+/// Wire note: accepted as either `application/json` or
+/// `application/x-www-form-urlencoded` (the [`FormOrJson`] extractor).
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateProjectForm {
     pub slug: String,
     pub path: String,
@@ -54,7 +51,7 @@ pub struct CreateProjectForm {
 }
 
 /// 201 response body for a created project.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct CreatedProject {
     pub slug: String,
     pub path: String,
@@ -68,7 +65,19 @@ pub struct CreatedProject {
 /// work. When a gateway *is* attached, a later `POST .../sessions` call
 /// will lazily load the freshly-registered project (`/cd`-style), so we
 /// don't need to push it into the in-memory roster here.
-async fn handle_create_project(
+#[utoipa::path(
+    post,
+    path = "/api/v1/projects",
+    tag = "projects",
+    request_body(content = CreateProjectForm, description = "Project to create (JSON or x-www-form-urlencoded)"),
+    responses(
+        (status = 201, description = "Project created + registered", body = CreatedProject),
+        (status = 400, description = "Invalid slug or path"),
+        (status = 409, description = "Slug already registered"),
+        (status = 500, description = "Scaffold or registry write failed"),
+    ),
+)]
+pub(crate) async fn handle_create_project(
     State(app): State<AppState>,
     FormOrJson(form, mode): FormOrJson<CreateProjectForm>,
 ) -> Response {
@@ -183,7 +192,21 @@ async fn handle_create_project(
 /// gateway is attached) stop every live session belonging to that
 /// project via the spine. 404 when the slug is not registered. Never
 /// file-purges. Returns `{ "removed": true }` on success.
-async fn handle_delete_project(State(app): State<AppState>, Path(slug): Path<String>) -> Response {
+#[utoipa::path(
+    delete,
+    path = "/api/v1/projects/{slug}",
+    tag = "projects",
+    params(("slug" = String, Path, description = "Project slug to deregister")),
+    responses(
+        (status = 200, description = "Deregistered; `{removed, sessions_stopped[]}`", body = serde_json::Value),
+        (status = 404, description = "Slug not registered"),
+        (status = 500, description = "Deregister failed"),
+    ),
+)]
+pub(crate) async fn handle_delete_project(
+    State(app): State<AppState>,
+    Path(slug): Path<String>,
+) -> Response {
     // 1. Deregister from config.yaml. `false` = slug wasn't present → 404.
     match ccteam_core::remove_project_from_config(&app.paths.root, &slug) {
         Ok(true) => {}

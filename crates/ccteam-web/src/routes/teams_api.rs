@@ -25,8 +25,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::get,
-    Json, Router,
+    Json,
 };
 use serde::{Deserialize, Serialize};
 
@@ -36,19 +35,7 @@ use crate::teams::inbox::{filter_since, load_all_inboxes, load_inbox, recent_pre
 use crate::teams::subagent_resolver::{resolve_definition, AgentDefinition};
 use crate::teams::tasks::{load_tasks, TaskCounts};
 
-pub fn router() -> Router<AppState> {
-    Router::new()
-        .route("/api/v1/teams", get(handle_list))
-        .route("/api/v1/teams/{name}", get(handle_detail))
-        .route("/api/v1/teams/{name}/tasks", get(handle_tasks))
-        .route("/api/v1/teams/{name}/inbox", get(handle_inbox))
-        .route(
-            "/api/v1/teams/{name}/member/{teammate}/definition",
-            get(handle_definition),
-        )
-}
-
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub struct InboxQuery {
     #[serde(default)]
     pub teammate: Option<String>,
@@ -76,7 +63,17 @@ pub struct DefinitionResponse {
     pub definition_missing: bool,
 }
 
-async fn handle_list(State(app): State<AppState>) -> impl IntoResponse {
+/// `GET /api/v1/teams`
+#[utoipa::path(
+    get,
+    path = "/api/v1/teams",
+    tag = "teams",
+    responses(
+        (status = 200, description = "Every team dir under `<claude_home>/teams/`", body = serde_json::Value),
+        (status = 500, description = "Discovery read failed"),
+    ),
+)]
+pub(crate) async fn handle_list(State(app): State<AppState>) -> impl IntoResponse {
     match discover_teams(&app.claude_home) {
         Ok(entries) => Json(entries).into_response(),
         Err(err) => {
@@ -90,7 +87,22 @@ async fn handle_list(State(app): State<AppState>) -> impl IntoResponse {
     }
 }
 
-async fn handle_detail(State(app): State<AppState>, Path(name): Path<String>) -> impl IntoResponse {
+/// `GET /api/v1/teams/{name}`
+#[utoipa::path(
+    get,
+    path = "/api/v1/teams/{name}",
+    tag = "teams",
+    params(("name" = String, Path, description = "Team name")),
+    responses(
+        (status = 200, description = "Team detail `{config, task_count, recent_messages}`", body = serde_json::Value),
+        (status = 404, description = "Unknown team"),
+        (status = 500, description = "Team load failed"),
+    ),
+)]
+pub(crate) async fn handle_detail(
+    State(app): State<AppState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
     let cfg = match load_team_config(&app.claude_home, &name) {
         Ok(c) => c,
         Err(err) => {
@@ -109,7 +121,22 @@ async fn handle_detail(State(app): State<AppState>, Path(name): Path<String>) ->
     .into_response()
 }
 
-async fn handle_tasks(State(app): State<AppState>, Path(name): Path<String>) -> impl IntoResponse {
+/// `GET /api/v1/teams/{name}/tasks`
+#[utoipa::path(
+    get,
+    path = "/api/v1/teams/{name}/tasks",
+    tag = "teams",
+    params(("name" = String, Path, description = "Team name")),
+    responses(
+        (status = 200, description = "Kanban task records", body = serde_json::Value),
+        (status = 404, description = "Unknown team"),
+        (status = 500, description = "Task load failed"),
+    ),
+)]
+pub(crate) async fn handle_tasks(
+    State(app): State<AppState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
     // 404 only when neither config nor tasks dir exists — a team with
     // zero tasks is valid.
     let team_dir = app.claude_home.join("teams").join(&name);
@@ -129,7 +156,22 @@ async fn handle_tasks(State(app): State<AppState>, Path(name): Path<String>) -> 
     }
 }
 
-async fn handle_inbox(
+/// `GET /api/v1/teams/{name}/inbox`
+#[utoipa::path(
+    get,
+    path = "/api/v1/teams/{name}/inbox",
+    tag = "teams",
+    params(
+        ("name" = String, Path, description = "Team name"),
+        InboxQuery,
+    ),
+    responses(
+        (status = 200, description = "Messages (merged across inboxes when `teammate` omitted)", body = serde_json::Value),
+        (status = 404, description = "Unknown team"),
+        (status = 500, description = "Inbox load failed"),
+    ),
+)]
+pub(crate) async fn handle_inbox(
     State(app): State<AppState>,
     Path(name): Path<String>,
     Query(q): Query<InboxQuery>,
@@ -155,7 +197,22 @@ async fn handle_inbox(
     }
 }
 
-async fn handle_definition(
+/// `GET /api/v1/teams/{name}/member/{teammate}/definition`
+#[utoipa::path(
+    get,
+    path = "/api/v1/teams/{name}/member/{teammate}/definition",
+    tag = "teams",
+    params(
+        ("name" = String, Path, description = "Team name"),
+        ("teammate" = String, Path, description = "Teammate name"),
+    ),
+    responses(
+        (status = 200, description = "`{agent_type, teammate, definition, definition_missing}`", body = serde_json::Value),
+        (status = 404, description = "Unknown team/teammate, or ad-hoc (no `.md`)"),
+        (status = 500, description = "Team load failed"),
+    ),
+)]
+pub(crate) async fn handle_definition(
     State(app): State<AppState>,
     Path((name, teammate)): Path<(String, String)>,
 ) -> impl IntoResponse {

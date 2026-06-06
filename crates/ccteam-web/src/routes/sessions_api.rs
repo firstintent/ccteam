@@ -58,8 +58,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
-    routing::{get, post},
-    Json, Router,
+    Json,
 };
 use ccteam_harness::execution::turns_mirror::{read_all_turns, TurnRecord};
 use ccteam_harness::{AgentVendor, PermissionMode};
@@ -68,6 +67,7 @@ use futures::stream::{Stream, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
+use utoipa::ToSchema;
 
 use super::actions::{FormOrJson, InputMode};
 use crate::state::AppState;
@@ -76,18 +76,6 @@ use crate::state::AppState;
 /// [`super::sse`]'s 15s contract (its constant is private; we restate it
 /// to keep the same reverse-proxy idle-timeout defeat).
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
-
-pub fn router() -> Router<AppState> {
-    Router::new()
-        .route(
-            "/api/v1/projects/{slug}/sessions",
-            get(handle_list_sessions).post(handle_create_session),
-        )
-        .route("/api/v1/sessions/{sid}", get(handle_session_history))
-        .route("/api/v1/sessions/{sid}/turn", post(handle_session_turn))
-        .route("/api/v1/sessions/{sid}/events", get(handle_session_events))
-        .route("/api/v1/sessions/{sid}/stop", post(handle_session_stop))
-}
 
 /// 503 body for the no-gateway (standalone internal-web) path. Returned
 /// by every session endpoint when [`AppState::gateway`] is `None`.
@@ -127,7 +115,20 @@ fn parse_vendor(raw: &str) -> Result<AgentVendor, String> {
 /// [`SessionView`](ccteam_im::gateway::SessionView)s filtered to this
 /// project. Empty array when the project has no live sessions. 503 with no
 /// gateway.
-async fn handle_list_sessions(State(app): State<AppState>, Path(slug): Path<String>) -> Response {
+#[utoipa::path(
+    get,
+    path = "/api/v1/projects/{slug}/sessions",
+    tag = "sessions",
+    params(("slug" = String, Path, description = "Project slug")),
+    responses(
+        (status = 200, description = "Live sessions `[{sid, project, role, vendor, permission_mode, current, status}]`", body = serde_json::Value),
+        (status = 503, description = "No live gateway (standalone web)"),
+    ),
+)]
+pub(crate) async fn handle_list_sessions(
+    State(app): State<AppState>,
+    Path(slug): Path<String>,
+) -> Response {
     let Some(gw) = app.gateway.as_ref() else {
         return no_gateway();
     };
@@ -146,7 +147,7 @@ async fn handle_list_sessions(State(app): State<AppState>, Path(slug): Path<Stri
 /// POST body for session creation — `role` (required), `vendor` (optional,
 /// defaults `claude`), `permission_mode` (optional, `skip` default / `hitl`).
 /// Accepts form or JSON via [`FormOrJson`].
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateSessionForm {
     pub role: String,
     #[serde(default)]
@@ -163,7 +164,20 @@ pub struct CreateSessionForm {
 /// spine. 201 `{sid}` on success. 400 on a bad vendor token or empty
 /// role. 503 with no gateway. 500 if the gateway create fails (e.g.
 /// project not registered / adapter spawn error).
-async fn handle_create_session(
+#[utoipa::path(
+    post,
+    path = "/api/v1/projects/{slug}/sessions",
+    tag = "sessions",
+    params(("slug" = String, Path, description = "Project slug")),
+    request_body(content = CreateSessionForm, description = "Session to create (JSON or x-www-form-urlencoded)"),
+    responses(
+        (status = 201, description = "Created; `{sid}`", body = serde_json::Value),
+        (status = 400, description = "Empty role / bad vendor / bad permission_mode"),
+        (status = 503, description = "No live gateway (standalone web)"),
+        (status = 500, description = "Gateway create failed"),
+    ),
+)]
+pub(crate) async fn handle_create_session(
     State(app): State<AppState>,
     Path(slug): Path<String>,
     FormOrJson(form, mode): FormOrJson<CreateSessionForm>,
@@ -223,7 +237,21 @@ async fn handle_create_session(
 /// Lock discipline: `session_resolve` is sync (no `.await`) and only clones
 /// scalar fields, so we run it under the gateway guard, then **drop the
 /// guard** before the blocking `read_all_turns` fs read.
-async fn handle_session_history(State(app): State<AppState>, Path(sid): Path<String>) -> Response {
+#[utoipa::path(
+    get,
+    path = "/api/v1/sessions/{sid}",
+    tag = "sessions",
+    params(("sid" = String, Path, description = "Gateway session id (`s{n}`)")),
+    responses(
+        (status = 200, description = "History `{sid, events:[{turn_id, ts, role, user, assistant}]}`", body = serde_json::Value),
+        (status = 404, description = "Unknown session"),
+        (status = 503, description = "No live gateway (standalone web)"),
+    ),
+)]
+pub(crate) async fn handle_session_history(
+    State(app): State<AppState>,
+    Path(sid): Path<String>,
+) -> Response {
     let Some(gw) = app.gateway.as_ref() else {
         return no_gateway();
     };
@@ -270,7 +298,7 @@ fn turn_to_event(turn: &TurnRecord) -> serde_json::Value {
 }
 
 /// POST body for a turn submission — `text` (required). Form or JSON.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct TurnForm {
     pub text: String,
 }
@@ -282,7 +310,20 @@ pub struct TurnForm {
 /// `GET /api/v1/sessions/{sid}/events` — so success is 202
 /// `{accepted:true}`. 404 for an unknown sid (the gateway returns `Err`),
 /// 503 with no gateway, 400 on empty text.
-async fn handle_session_turn(
+#[utoipa::path(
+    post,
+    path = "/api/v1/sessions/{sid}/turn",
+    tag = "sessions",
+    params(("sid" = String, Path, description = "Gateway session id (`s{n}`)")),
+    request_body(content = TurnForm, description = "Turn text (JSON or x-www-form-urlencoded)"),
+    responses(
+        (status = 202, description = "Accepted; reply/progress arrive over `/events`. `{accepted:true}`", body = serde_json::Value),
+        (status = 400, description = "Empty text"),
+        (status = 404, description = "Unknown session"),
+        (status = 503, description = "No live gateway (standalone web)"),
+    ),
+)]
+pub(crate) async fn handle_session_turn(
     State(app): State<AppState>,
     Path(sid): Path<String>,
     FormOrJson(form, mode): FormOrJson<TurnForm>,
@@ -332,7 +373,21 @@ async fn handle_session_turn(
 /// here: the stream simply never matches, so only keep-alives flow. A
 /// session created concurrently then starts matching live — closing the
 /// stream on a momentarily-unknown sid would race that.
-async fn handle_session_events(
+///
+/// OpenAPI note: this is a **Server-Sent Events** stream, which OpenAPI
+/// cannot fully model as a JSON response body. The response is declared
+/// as `text/event-stream`; each `event: progress` frame's `data` is a
+/// JSON line `{id, sid, kind:"answer"|"progress", content, done?, options?}`.
+#[utoipa::path(
+    get,
+    path = "/api/v1/sessions/{sid}/events",
+    tag = "sessions",
+    params(("sid" = String, Path, description = "Gateway session id (`s{n}`)")),
+    responses(
+        (status = 200, description = "SSE stream (text/event-stream). Frames: `event: progress` with `data` = `{id, sid, kind, content, done?, options?}`. Never 503 — a no-gateway path emits one `gateway_unavailable` frame then keep-alives.", content_type = "text/event-stream"),
+    ),
+)]
+pub(crate) async fn handle_session_events(
     State(app): State<AppState>,
     Path(sid): Path<String>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
@@ -374,7 +429,21 @@ async fn handle_session_events(
 /// Stops (deregisters) the session via the spine. 200 `{stopped:true}`.
 /// 404 for an unknown sid. 503 with no gateway. Never file-purges — the
 /// spine's `stop_session` is deregister-only.
-async fn handle_session_stop(State(app): State<AppState>, Path(sid): Path<String>) -> Response {
+#[utoipa::path(
+    post,
+    path = "/api/v1/sessions/{sid}/stop",
+    tag = "sessions",
+    params(("sid" = String, Path, description = "Gateway session id (`s{n}`)")),
+    responses(
+        (status = 200, description = "Stopped (deregistered). `{stopped:true}`", body = serde_json::Value),
+        (status = 404, description = "Unknown session"),
+        (status = 503, description = "No live gateway (standalone web)"),
+    ),
+)]
+pub(crate) async fn handle_session_stop(
+    State(app): State<AppState>,
+    Path(sid): Path<String>,
+) -> Response {
     let Some(gw) = app.gateway.as_ref() else {
         return no_gateway();
     };

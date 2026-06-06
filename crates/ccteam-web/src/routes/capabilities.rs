@@ -32,18 +32,13 @@ use std::collections::HashMap;
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
-use axum::{response::IntoResponse, routing::get, Json, Router};
+use axum::{response::IntoResponse, Json};
 use ccteam_harness::{CLAUDE_BIN_ENV, CODEX_BIN_ENV};
 use serde::Serialize;
-
-use crate::state::AppState;
-
-pub fn router() -> Router<AppState> {
-    Router::new().route("/api/v1/capabilities", get(handle_capabilities))
-}
+use utoipa::ToSchema;
 
 /// One harness entry in the capabilities response.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct HarnessCapability {
     /// Stable harness id (`claude-code` / `codex`).
     pub id: &'static str,
@@ -58,12 +53,20 @@ pub struct HarnessCapability {
     pub providers: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CapabilitiesResponse {
     pub harnesses: Vec<HarnessCapability>,
 }
 
-async fn handle_capabilities() -> impl IntoResponse {
+/// List the harness vendors ccteam can drive, each flagged `available`
+/// from a PATH probe of the vendor binary. `providers` is reserved.
+#[utoipa::path(
+    get,
+    path = "/api/v1/capabilities",
+    tag = "capabilities",
+    responses((status = 200, description = "Harness capability matrix", body = CapabilitiesResponse)),
+)]
+pub(crate) async fn handle_capabilities() -> impl IntoResponse {
     // Two cheap blocking probes; run them off the async runtime. Each is
     // cached, so the common case never spawns a child at all.
     let claude_bin = claude_bin();

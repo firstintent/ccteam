@@ -23,10 +23,10 @@ use axum::{
     extract::{FromRequest, Path, Request, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
-    Json, Router,
+    Json,
 };
 use serde::Deserialize;
+use utoipa::ToSchema;
 
 use super::actions::{FormOrJson, InputMode};
 use crate::state::AppState;
@@ -35,15 +35,6 @@ use crate::state::AppState;
 /// a small YAML frontmatter; 256 KiB is generous headroom while bounding
 /// the request.
 const ROLE_BODY_LIMIT: usize = 256 * 1024;
-
-pub fn router() -> Router<AppState> {
-    Router::new()
-        .route("/api/v1/projects/{slug}/roles", get(handle_list_roles))
-        .route(
-            "/api/v1/projects/{slug}/roles/{role}",
-            get(handle_get_role).put(handle_put_role),
-        )
-}
 
 /// Reject an unknown project with a 404 JSON body. Returns `Some(resp)`
 /// when the project is unknown so callers can `return` it directly.
@@ -61,7 +52,21 @@ fn reject_unknown_project(app: &AppState, slug: &str) -> Option<Response> {
 }
 
 /// `GET /api/v1/projects/{slug}/roles`
-async fn handle_list_roles(State(app): State<AppState>, Path(slug): Path<String>) -> Response {
+#[utoipa::path(
+    get,
+    path = "/api/v1/projects/{slug}/roles",
+    tag = "roles",
+    params(("slug" = String, Path, description = "Project slug")),
+    responses(
+        (status = 200, description = "Role summaries `[{role, description, model}]`", body = serde_json::Value),
+        (status = 404, description = "Unknown project"),
+        (status = 500, description = "Role read failed"),
+    ),
+)]
+pub(crate) async fn handle_list_roles(
+    State(app): State<AppState>,
+    Path(slug): Path<String>,
+) -> Response {
     if let Some(resp) = reject_unknown_project(&app, &slug) {
         return resp;
     }
@@ -96,7 +101,21 @@ fn role_name_is_valid(role: &str) -> bool {
 }
 
 /// `GET /api/v1/projects/{slug}/roles/{role}` → frontmatter + body or 404.
-async fn handle_get_role(
+#[utoipa::path(
+    get,
+    path = "/api/v1/projects/{slug}/roles/{role}",
+    tag = "roles",
+    params(
+        ("slug" = String, Path, description = "Project slug"),
+        ("role" = String, Path, description = "Role name ([a-z0-9_-]+)"),
+    ),
+    responses(
+        (status = 200, description = "Role `{role, frontmatter, body}`", body = serde_json::Value),
+        (status = 400, description = "Invalid role name"),
+        (status = 404, description = "Unknown project or role"),
+    ),
+)]
+pub(crate) async fn handle_get_role(
     State(app): State<AppState>,
     Path((slug, role)): Path<(String, String)>,
 ) -> Response {
@@ -134,7 +153,7 @@ async fn handle_get_role(
 }
 
 /// JSON / form PUT body shape: `{"content": "..."}` / `content=...`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct RoleContentForm {
     pub content: String,
 }
@@ -144,7 +163,7 @@ pub struct RoleContentForm {
 /// success-shape convention — Form / raw ⇒ `200 OK` (empty), JSON ⇒
 /// `{ "ok": true }`. We surface raw as [`InputMode::Form`] so a `curl`
 /// `--data-binary @role.md` gets a plain 200.
-struct RoleBody {
+pub(crate) struct RoleBody {
     content: String,
     mode: InputMode,
 }
@@ -196,7 +215,28 @@ where
 
 /// `PUT /api/v1/projects/{slug}/roles/{role}` — create-or-replace the
 /// role's `.md`. Body via [`RoleBody`] (JSON `{content}` / form / raw).
-async fn handle_put_role(
+///
+/// Wire note: the request body is **tri-modal** — `application/json`
+/// `{content}`, `application/x-www-form-urlencoded` `content=...`, or a
+/// raw `text/markdown` body taken verbatim (256 KiB cap). The schema
+/// below documents the structured `{content}` form; a raw markdown PUT
+/// is accepted with the same effect.
+#[utoipa::path(
+    put,
+    path = "/api/v1/projects/{slug}/roles/{role}",
+    tag = "roles",
+    params(
+        ("slug" = String, Path, description = "Project slug"),
+        ("role" = String, Path, description = "Role name ([a-z0-9_-]+)"),
+    ),
+    request_body(content = RoleContentForm, description = "Role markdown (JSON `{content}` / form / or raw text/markdown body)"),
+    responses(
+        (status = 200, description = "Role written (`{ok:true}` for JSON, empty 200 for form/raw)"),
+        (status = 400, description = "Write failed / invalid role name / bad body"),
+        (status = 404, description = "Unknown project"),
+    ),
+)]
+pub(crate) async fn handle_put_role(
     State(app): State<AppState>,
     Path((slug, role)): Path<(String, String)>,
     body: RoleBody,
