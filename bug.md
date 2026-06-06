@@ -52,3 +52,59 @@
 **验收**:web chat「＋ 新建」可在任意目录 scaffold 全新项目并在其中起 session;重复 slug → 409 友好提示;坏路径前端拦截;vitest 覆盖新选项分支。
 
 **归属**:前端为主(后端 `POST /api/v1/projects` 已具备);标记为 v0.8.7 W4 回归。
+
+---
+
+## BUG-3 · per-session web UI:历史按 (project,role) 共享、无 session 维度 → 同角色会话串台
+
+**状态**:OPEN（2026-06-06 用户报告,且明确"还是没解决"）
+
+**症状**:per-session UI 的**壳**是独立的(每 sid 一个视图/路由),但点进去每个会话显示的**聊天历史是串的**——共享同一 `(project, role)` 的会话能看到彼此(及同角色 IM 聊天)的全部历史。
+
+**根因(file:line 实证)= 持久层无 session 维度,历史按 `(project, role)` 存,与 per-sid UI 不匹配**:
+- **LIVE 侧是对的(已隔离)**:`useSessionEvents(sid)`(`crates/ccteam-web/web/src/hooks/useSessionEvents.ts`)按 sid 订阅 `/sessions/{sid}/events`、切 sid `setEvents([])`、不跨 sid 合并;前端 transcript 也是 **per-sid localStorage**(`loadRows(sid)`/`saveRows(sid)`,`ChatConsole.tsx:117/157`)。
+- **HISTORY 侧串台(根因)**:`GET /sessions/{sid}`(`crates/ccteam-web/src/routes/sessions_api.rs:261 handle_session_history`)把 sid resolve 成 `(role, project_dir)` 后读**整份** `<project_dir>/.ccteam/chat/<role>/turns.jsonl`(`collect_session_turns`→`read_all_turns`,`sessions_api.rs:277/289`),**无任何 sid 过滤**。
+- **数据模型本身没有 session id**:`TurnRecord`(`crates/ccteam-harness/src/execution/turns_mirror.rs:39-47`)只有 `turn_id/ts/vendor/role`,**无 session id**;turns.jsonl 路径按 `(project, role)`(`turns_jsonl_path` `turns_mirror.rs:79`)。gateway `s{n}` 是内存计数器(daemon 重启重置)、**从不写进 mirror**。
+- **⇒ 串台机制**:前端一进会话,`getHistory(sid)` 一回来就用整份 per-role 历史 **REPLACE** 掉 transcript(`ChatConsole.tsx:123-124`)。任何共享 `(project, role)` 的会话——多次新建/stop 后重建、daemon 重启换 sid、**web+IM 同角色**——都被 seed 成同一份全量历史。per-sid localStorage 只在历史返回前给一瞬"独立"的假象。
+
+**深层张力(这是为什么必须先决策、不能闷头修)**:per-role 一份历史其实**与架构 keystone `session = role` + dedup「单 (project,role) pane」+ 红线「chat 复用 context 是 feature」一致**。W4 的 per-sid UI 却暗示"多个独立会话",但持久层没给 session 一个身份。所以这不是"代码写错",是**模型缺一个 session 维度** vs **keystone 是 role**——两者要选一个对齐。
+
+**修法(设计分叉,二选一)**:
+- **A · 真·独立 session**:给会话一个**持久** session id(非内存 `s{n}`;建会话时 mint 落地)→ 写进 `TurnRecord` + 历史端点按它过滤;并允许同 role 多 pane。**破** 当前 dedup invariant + `session = role` keystone。大改。**与 ENH-1(roleless)同向**——roleless 会话无 role 可作 turns key,本就需要 session 身份。
+- **B · 对齐 `session = role`**:接受"一个 `(project, role)` = 一个会话",rail 每 role 一条,历史 = 该 role 全量(= 故意的连续性)。小改(UI 诚实化:别再暗示多个独立 sid 会话),跟红线一致。
+
+**待用户澄清**:串台的是**不同 role** 之间,还是**同一个 role**(多 cto / web+IM 同角色)?按现模型不同 role 走不同 turns.jsonl、**不该**串——若不同 role 也串=另一个更严重的 bug,需再查。同 role 串=上面的 per-role 模型浮现。
+
+**归属**:**设计决策(A/B)定了才动手**(用户诉求 ENH-1 倾向 A)。
+
+---
+
+## BUG-4 · 新建 session 弹窗 role 要手输、无项目真实 role 列表(用户不知道有哪些 role)
+
+**状态**:OPEN（2026-06-06 用户报告）
+
+**症状**:web「＋ 新建」的 role 是手输文本框,用户不知道项目里到底有哪些 `.claude/agents/*.md` role 名。
+
+**根因(file:line)**:`NewSessionModal`(`crates/ccteam-web/web/src/pages/ChatConsole.tsx:565`)的 role 是 `<input>`(`:640-644`)+ `<datalist>` 取 `roleOptions`,而 `roleOptions` 来自**静态** `ROLE_SUGGESTIONS`(`chatDefaults.ts`,`ChatConsole.tsx:258-259`),**不是**项目真实 role。后端**已有**列表 API:`GET /api/v1/projects/{slug}/roles` → `[{role, description, model}]`(`crates/ccteam-web/src/routes/roles.rs:54-66`)。
+
+**修法**:modal 拉 `GET /projects/{slug}/roles` 填下拉(展示 role + description),保留手输/自定义;"空 role"项见 ENH-1。
+
+**归属**:前端为主(后端 roles API 已具备)。
+
+---
+
+## ENH-1 · 新建 session role 为空时,不加 `--agent`(roleless vanilla session)
+
+**状态**:OPEN feature（2026-06-06 用户要求）
+
+**诉求**:role 留空 → spawn **不带** `--agent`(= 裸 claude,brain 走项目 `CLAUDE.md` 原生自读;即 v0.8.6 之前的 no-`--agent` 模式);非空才 `--agent <role>`。
+
+**现状/影响(file:line)**:
+- 前端 `effectiveRole = role.trim() || DEFAULT_ROLE`(`ChatConsole.tsx:588`)→ 空被默认成 cto,永远非空。
+- `spec_for_new`(`claude_tui.rs:385`)/ `spec_for_resume`(`:347`)**无条件** `push("--agent")` + role(`session = role` keystone)。
+- FIX-2 给 create 路径加了"role 必须存在"校验(防 `--agent <未定义>` 死 pane)——roleless 要把校验改成"**仅非空** role 才校验"。
+- turns.jsonl 按 role 命名(`turns_mirror.rs:79`)→ roleless 用什么 bot 名(`default`/`claude`?)**未定**,且回到 BUG-3 的 session 身份问题(roleless 同项目会互相串)。
+
+**修法**:create 路径允许空 role;空 → argv **跳过** `--agent` + turns bot 名用约定占位(联动 BUG-3 的 session 身份决策);非空 → 现行 + FIX-2 校验。也跟 `session = role` keystone 有张力(roleless ≠ role,需红线说明这是显式例外)。
+
+**归属**:跨层(harness argv + gateway create + web modal);**依赖 BUG-3 的 A/B 决策**(roleless 的 turns 身份)。
