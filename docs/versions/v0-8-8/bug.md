@@ -1,5 +1,6 @@
-# bug.md — 实机使用滚动 bug 记录(持续追加,待批量一起修)
+# bug.md — v0.8.8 实机 bug 记录(持续追加,归入 v0.8.8 批修)
 
+> **归属 v0.8.8**:本 log 的修项收进 v0.8.8(scope + 设计见同目录 `prd.md`;BUG-3 由 prd.md F1「独立 session 模型」根治)。实现是另一个 dev session,**本文只记录 + 验证根因,不开发**。
 > 用途:实机(IM + web)用着用着发现的 bug / gap,**持续追加**到这里,攒一批一起修。
 > 格式(沿用 `docs/versions/v0-8-7/fix.md`):症状 / 根因(**file:line,代码为 SoT**)/ 影响 / 修法 / 验收 / 归属。
 > 每条修完就地标 `✅ FIXED in <commit>`,不删(留追溯)。
