@@ -32,11 +32,6 @@ pub mod sse;
 // V0.5.0 F96 — Agent Teams JSON API + SSE channel.
 pub mod teams_api;
 pub mod teams_sse;
-// Per-project webhook secret helper (`generate_or_load_secret`),
-// surfaced by the CLI's `ccteam show` so the operator can see the
-// webhook URL. The HTTP ingress route itself is re-introduced by the
-// flow engine later.
-pub mod webhook;
 
 /// Compose every M5.x sub-router available at the current ship state.
 /// `health` is state-less (M5.0 contract) so it merges in without an

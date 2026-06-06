@@ -101,10 +101,13 @@ pub fn chat_session_id_name(slug: &str, role: &str) -> String {
     chat_session_name(slug, role)
 }
 
-/// V0.6.0 F108 / V0.6.1 F139 — write / merge the chat-progress hooks
-/// into `<project>/.claude/settings.json`. As of F139 the hook command
-/// invokes the per-host `~/.ccteam/hooks/hook.sh` wrapper (HTTP-to-
-/// daemon fast path + CLI fallback) instead of the cold-spawn
+/// v0.8.6 W2b — write / merge the chat-progress hooks into
+/// `<project>/.claude/settings.local.json`. ccteam writes its managed
+/// hooks to the **local** settings layer so it never dirties the user's
+/// committed `.claude/settings.json` (Claude Code reads + fires hooks
+/// from settings.local.json the same as settings.json). The hook command
+/// invokes the per-host `~/.ccteam/hooks/hook.sh` wrapper (HTTP-to-daemon
+/// fast path + CLI fallback) instead of the cold-spawn
 /// `<bin> internal hook chat-progress <event>` form.
 ///
 /// `hook_sh` is the absolute path to the dispatcher
@@ -118,13 +121,14 @@ pub fn chat_session_id_name(slug: &str, role: &str) -> String {
 /// write. When the flag is unset (the default) the command string is
 /// byte-for-byte the pre-W6 `{hook_sh} chat-progress {arg}` form.
 ///
-/// Idempotent: existing hooks for other events are preserved; existing
-/// chat-progress entries are replaced.
+/// Idempotent: existing hooks for other events (and any other keys already
+/// in settings.local.json) are preserved; existing chat-progress +
+/// AskUserQuestion entries are replaced.
 pub fn ensure_chat_hooks_installed(project_dir: &Path, hook_sh: &str) -> Result<(), HarnessError> {
     let settings_dir = project_dir.join(".claude");
     std::fs::create_dir_all(&settings_dir)
         .map_err(|e| HarnessError::Io(format!("create {}: {e}", settings_dir.display())))?;
-    let settings_path = settings_dir.join("settings.json");
+    let settings_path = settings_dir.join("settings.local.json");
     let mut root: Value = if settings_path.exists() {
         let body = std::fs::read_to_string(&settings_path)
             .map_err(|e| HarnessError::Io(format!("read {}: {e}", settings_path.display())))?;
@@ -138,9 +142,9 @@ pub fn ensure_chat_hooks_installed(project_dir: &Path, hook_sh: &str) -> Result<
         .expect("root was forced to an object above")
         .entry("hooks")
         .or_insert_with(|| json!({}));
-    let hooks_obj = hooks
-        .as_object_mut()
-        .ok_or_else(|| HarnessError::Io("settings.json `hooks` field is not an object".into()))?;
+    let hooks_obj = hooks.as_object_mut().ok_or_else(|| {
+        HarnessError::Io("settings.local.json `hooks` field is not an object".into())
+    })?;
 
     // (event_name, chat-progress arg)
     let chat_events: &[(&str, &str)] = &[
@@ -211,7 +215,7 @@ pub fn ensure_chat_hooks_installed(project_dir: &Path, hook_sh: &str) -> Result<
     }
 
     let serialized = serde_json::to_string_pretty(&root)
-        .map_err(|e| HarnessError::Io(format!("serialize settings.json: {e}")))?;
+        .map_err(|e| HarnessError::Io(format!("serialize settings.local.json: {e}")))?;
     std::fs::write(&settings_path, serialized)
         .map_err(|e| HarnessError::Io(format!("write {}: {e}", settings_path.display())))?;
     Ok(())
@@ -420,7 +424,9 @@ impl HarnessAdapter for ClaudeTuiAdapter {
                 "claude-tui requires a non-empty role (AgentSpecBrief::role)".into(),
             ));
         }
-        // 1. Install chat-progress hooks into <project>/.claude/settings.json.
+        // 1. Install chat-progress hooks into
+        //    <project>/.claude/settings.local.json (ccteam-managed local
+        //    layer; never dirties the user's committed settings.json).
         ensure_chat_hooks_installed(&ctx.project_dir, &ccteam_bin_for_hooks())?;
         // 2. Make sure the bot's chat dir exists (turns.jsonl + cursor).
         turns_mirror::ensure_dir(&ctx.project_dir, &spec.role)

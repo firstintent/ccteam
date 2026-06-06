@@ -7,9 +7,11 @@
 //! against the new `workflow.yaml` schema.
 //!
 //! What survives F60:
-//! - the per-project `.claude/settings.json` template + render helper —
-//!   produced-project hook plumbing has not changed shape, so we still
-//!   ship the same settings.json scaffold;
+//! - the per-project settings template + render helper — produced-project
+//!   hook plumbing has not changed shape, so we still ship the same
+//!   scaffold; as of v0.8.6 W2b the render is written to the **local**
+//!   layer `.claude/settings.local.json` so it never dirties the user's
+//!   committed `.claude/settings.json`;
 //! - the helper-template writer (`write_global_helper_templates`) —
 //!   helper markdown is referenced by user-authored agent prompts via
 //!   `@~/.ccteam/templates/<name>` and is not coupled to phases.
@@ -63,7 +65,13 @@ pub use project_probe::{probe as probe_project, Language, ProjectKind, ProjectPr
 pub mod squad_roster;
 pub use squad_roster::{render_squad_roster_en, render_squad_roster_zh, TeammateInfo};
 
-/// Per-project `.claude/settings.json` template.
+/// Per-project ccteam settings template.
+///
+/// v0.8.6 W2b: rendered output is written to the **local** settings layer
+/// `<project>/.claude/settings.local.json` (see [`write_project_settings`])
+/// so it never dirties the user's committed `.claude/settings.json`. The
+/// `include_str!` source below is still the in-crate `settings.json`
+/// scaffold file (template payload, not an output path).
 ///
 /// V0.6.1 F139: hook commands route through a single shell wrapper
 /// (`__CCTEAM_HOOK_SH__`, materialized at `~/.ccteam/hooks/hook.sh` by
@@ -86,12 +94,12 @@ pub const PROJECT_SETTINGS_JSON: &str = include_str!("settings.json");
 /// ccteam-created project. Single source for both seed paths.
 pub const CTO_ROLE_MD: &str = include_str!("cto_role.md");
 
-/// V0.5.0 F93b + F94 — per-project `.claude/settings.json` template for
-/// `mode: agent-team` workflows. Same shape as
-/// [`PROJECT_SETTINGS_JSON`] (`__CCTEAM_BIN__` placeholder) plus three
-/// new hook entries: `TeammateIdle`, `TaskCreated`, `TaskCompleted`.
-/// Used only by `ccteam init --mode agent-team` (per PRD F94 红线:
-/// advanced path only).
+/// V0.5.0 F93b + F94 — per-project settings template for
+/// `mode: agent-team` workflows (rendered output lands in the
+/// `.claude/settings.local.json` local layer, v0.8.6 W2b). Same shape
+/// as [`PROJECT_SETTINGS_JSON`] plus three new hook entries:
+/// `TeammateIdle`, `TaskCreated`, `TaskCompleted`. Used only by
+/// `ccteam init --mode agent-team` (per PRD F94 红线: advanced path only).
 pub const PROJECT_SETTINGS_AGENT_TEAM_JSON: &str = include_str!("settings.agent-team.json");
 
 /// M2.4: helper templates that user-authored agent / workflow markdown
@@ -217,13 +225,17 @@ fn render_settings_template(
     serde_json::to_string_pretty(&v).context("serialize rendered settings.json")
 }
 
-/// Write `<project_dir>/.claude/settings.json` with hook commands
+/// Write `<project_dir>/.claude/settings.local.json` with hook commands
 /// pointing at the running ccteam binary by absolute path, the
 /// effective `CCTEAM_HOME` / `CCTEAM_PROJECTS_ROOT` baked into `env`,
 /// and the spawned-session `enabledPlugins` set. Creates the parent
 /// dir if missing. Idempotent — overwrites any prior render so
 /// re-running after a ccteam upgrade refreshes paths and the
 /// plugin set.
+///
+/// v0.8.6 W2b — this targets the **local** settings layer
+/// (`settings.local.json`), not the user-committed `settings.json`, so
+/// the fresh-project ccteam base config never dirties the user's repo.
 pub fn write_project_settings(project_dir: &Path, enabled: &EnabledPluginsSetting) -> Result<()> {
     write_settings_template(project_dir, enabled, ProjectSettingsKind::ArtifactDriven)
 }
@@ -254,7 +266,10 @@ fn write_settings_template(
 ) -> Result<()> {
     let dir = project_dir.join(".claude");
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    let path = dir.join("settings.json");
+    // v0.8.6 W2b — ccteam writes its fresh-project base config to the
+    // **local** settings layer so the user's committed
+    // `.claude/settings.json` is never touched.
+    let path = dir.join("settings.local.json");
     let hook_sh = effective_hook_sh_path()?;
     let extra = SettingsEnv {
         ccteam_home: std::env::var("CCTEAM_HOME").ok(),
@@ -272,8 +287,8 @@ fn write_settings_template(
 
 /// V0.6.1 F139 — resolve the absolute path to `~/.ccteam/hooks/hook.sh`
 /// honouring `CCTEAM_HOME` (test seam + ops override). Used by
-/// [`write_project_settings`] so freshly-rendered settings.json files
-/// point at the dispatcher actually materialized on disk by
+/// [`write_project_settings`] so freshly-rendered settings.local.json
+/// files point at the dispatcher actually materialized on disk by
 /// `ccteam init` / `ccteam doctor --install-hooks`.
 fn effective_hook_sh_path() -> Result<std::path::PathBuf> {
     let paths = crate::CcteamPaths::from_env()?;

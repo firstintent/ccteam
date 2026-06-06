@@ -519,13 +519,14 @@ pub struct TeamSpec {
     #[serde(default)]
     pub cost_policy: CostPolicy,
 
-    /// Auto-managed `<project>/CLAUDE.md` body. Replaces the hardcoded
-    /// `match team` in `projects::render_project_claude_md` (§6.2
-    /// candidate 2). `{slug}` and `{team}` placeholders are substituted
-    /// at bootstrap time; everything else lands verbatim.
+    /// team.yaml-declared `<project>/CLAUDE.md` body template. `{slug}`
+    /// and `{team}` placeholders are substituted when a consumer renders
+    /// it; everything else lands verbatim. (v0.8.6 W2b removed the
+    /// built-in project-CLAUDE.md bootstrap writer, so this field is now
+    /// schema-only — retained for team.yaml round-trip + future use.)
     ///
-    /// Empty string keeps a generic fallback body so a team.yaml
-    /// without `claude_md_template` still bootstraps.
+    /// Empty string is the default so a team.yaml without
+    /// `claude_md_template` still round-trips.
     #[serde(default)]
     pub claude_md_template: String,
 

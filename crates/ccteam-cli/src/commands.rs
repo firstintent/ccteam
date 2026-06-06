@@ -238,11 +238,6 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
         project_report.workflow_action,
     ));
     out.push_str(&format!(
-        "  ccteam layout    {} ({})\n",
-        target.join(".ccteam").display(),
-        project_report.ccteam_layout_action,
-    ));
-    out.push_str(&format!(
         "  agents dir       {} ({})\n",
         target.join(".claude").join("agents").display(),
         project_report.agents_action,
@@ -377,7 +372,6 @@ struct ProjectInstallReport {
     state_action: &'static str,
     workflow_action: &'static str,
     agents_action: &'static str,
-    ccteam_layout_action: &'static str,
 }
 
 impl ProjectInstallReport {
@@ -405,7 +399,6 @@ fn install_project_at(
     let state_action: &'static str;
     let workflow_action: &'static str;
     let agents_action: &'static str;
-    let ccteam_layout_action: &'static str;
     let final_team: String;
 
     if fresh {
@@ -417,7 +410,6 @@ fn install_project_at(
             team,
         )?;
         scaffold_workflow_yaml(target, false, opts.mode)?;
-        scaffold_v81_project_layout(target, false, opts.mode)?;
         let agent_count = scaffold_default_agents(target, false, opts.mode)?;
         if matches!(opts.mode, InitMode::AgentTeam) {
             scaffold_agent_team_inbox(target)?;
@@ -433,7 +425,6 @@ fn install_project_at(
         }
         state_action = "created";
         workflow_action = "scaffolded";
-        ccteam_layout_action = "scaffolded";
         agents_action = if agent_count > 0 {
             "scaffolded"
         } else {
@@ -456,14 +447,6 @@ fn install_project_at(
             scaffold_workflow_yaml(target, true, opts.mode)?;
             "overwritten (--force)"
         } else {
-            "preserved"
-        };
-
-        ccteam_layout_action = if opts.force {
-            scaffold_v81_project_layout(target, true, opts.mode)?;
-            "overwritten (--force)"
-        } else {
-            scaffold_v81_project_layout(target, false, opts.mode)?;
             "preserved"
         };
 
@@ -495,7 +478,6 @@ fn install_project_at(
         state_action,
         workflow_action,
         agents_action,
-        ccteam_layout_action,
     })
 }
 
@@ -521,44 +503,6 @@ fn scaffold_workflow_yaml(target: &std::path::Path, force: bool, mode: InitMode)
         InitMode::AgentTeam => DEFAULT_AGENT_TEAM_WORKFLOW_YAML,
     };
     std::fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
-    Ok(())
-}
-
-/// Write the v8.1 project-owned asset layout. Claude Code still reads
-/// `.claude/agents`; `.ccteam/agents` is the neutral ccteam copy used by
-/// IM/session onboarding and future non-Claude adapters.
-fn scaffold_v81_project_layout(
-    target: &std::path::Path,
-    force: bool,
-    mode: InitMode,
-) -> Result<()> {
-    let ccteam_dir = target.join(".ccteam");
-    let agents_dir = ccteam_dir.join("agents");
-    let skills_dir = ccteam_dir.join("skills");
-    std::fs::create_dir_all(&agents_dir)
-        .with_context(|| format!("create {}", agents_dir.display()))?;
-    std::fs::create_dir_all(&skills_dir)
-        .with_context(|| format!("create {}", skills_dir.display()))?;
-
-    for (name, body) in DEFAULT_AGENT_SCAFFOLDS {
-        let path = agents_dir.join(name);
-        if path.exists() && !force {
-            continue;
-        }
-        std::fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
-    }
-    if matches!(mode, InitMode::AgentTeam) {
-        let path = agents_dir.join("__lead.md");
-        if !path.exists() || force {
-            std::fs::write(&path, AGENT_TEAM_LEAD_MD)
-                .with_context(|| format!("write {}", path.display()))?;
-        }
-    }
-
-    let sentinel = skills_dir.join(".gitkeep");
-    if !sentinel.exists() || force {
-        std::fs::write(&sentinel, b"").with_context(|| format!("write {}", sentinel.display()))?;
-    }
     Ok(())
 }
 
@@ -730,34 +674,10 @@ pub fn run_show(paths: &CcteamPaths, slug: &str, format: OutputFormat) -> Result
     let cost = cost_summary(slug, &progress_path, paths)?;
     let sessions = ccteam_core::active_sessions(slug, paths).unwrap_or_default();
 
-    // V0.6.3 F143 — webhook ingress path. The relative URL is stable
-    // (`/webhook/<slug>/<secret>`); the operator prepends their own
-    // `http(s)://<host>:<port>` (external reachability is a deployment
-    // concern, not ccteam's). The secret is generated-or-loaded here so
-    // a fresh `ccteam show` surfaces a usable URL before the first POST.
-    let webhook = resolve_webhook_info(paths, slug);
-
     Ok(match format {
-        OutputFormat::Text => {
-            render_show_text(&state, &cost, &recent, &artifacts, &sessions, &webhook)
-        }
-        OutputFormat::Json => {
-            render_show_json(&state, &cost, &recent, &artifacts, &sessions, &webhook)?
-        }
+        OutputFormat::Text => render_show_text(&state, &cost, &recent, &artifacts, &sessions),
+        OutputFormat::Json => render_show_json(&state, &cost, &recent, &artifacts, &sessions)?,
     })
-}
-
-/// V0.6.3 F143 — `(relative_url, secret)` for the project's webhook
-/// ingress, or `None` if the secret could not be generated/read.
-fn resolve_webhook_info(paths: &CcteamPaths, slug: &str) -> Option<(String, String)> {
-    let token_path = paths.project_webhook_token(slug);
-    match ccteam_web::routes::webhook::generate_or_load_secret(&token_path) {
-        Ok(secret) => Some((format!("/webhook/{slug}/{secret}"), secret)),
-        Err(err) => {
-            eprintln!("ccteam show: could not resolve webhook secret: {err}");
-            None
-        }
-    }
 }
 
 /// V0.5.0 F93b — `ccteam start <slug>` flags. Drives the
@@ -2405,6 +2325,10 @@ pub fn run_doctor(paths: &CcteamPaths, mut opts: DoctorOptions) -> Result<String
         out.push_str(&render_migrate_hook_commands_report(paths, opts.dry_run)?);
     }
     out.push_str(&render_daemon_health_line(paths));
+    // v0.8.6 — informational home-layout drift line. Flags any
+    // orchestrator-era leftover directory under `~/.ccteam` that the
+    // current architecture no longer writes. Never fails the exit code.
+    out.push_str(&render_home_drift_line(paths));
     // V0.3.1 F47 — informational codex CLI detection. Appends one line
     // to every successful doctor run (any_mode == true) so operators
     // see whether the codex binary is on PATH ahead of V0.3.2's real
@@ -2423,6 +2347,53 @@ pub fn run_doctor(paths: &CcteamPaths, mut opts: DoctorOptions) -> Result<String
 fn render_daemon_health_line(paths: &CcteamPaths) -> String {
     let health = ccteam_core::check_daemon_health(paths);
     format!("[ccteam] daemon: {}\n", health.describe())
+}
+
+/// v0.8.6 — informational `~/.ccteam` home-layout drift check.
+///
+/// Anchored on [`ccteam_core::canonical_home_dirs`] (the init-time
+/// directory manifest), extended with the directories the resident
+/// daemon creates lazily at runtime (`pty`, `harness`, `imd`) and the
+/// shipped team-template root (`teams`). Any *other* top-level
+/// directory under `~/.ccteam` is an orchestrator-era leftover
+/// (`phases/`, `queue/`, `control/`, `memory/`, `templates/`, `inbox/`,
+/// …) and is reported on a single line so operators can `rm -rf` it.
+///
+/// Purely informational — never fails the doctor exit code, and tolerates
+/// a missing/unreadable root (fresh install) by reporting nothing.
+fn render_home_drift_line(paths: &CcteamPaths) -> String {
+    // Directories that are legitimate under the current architecture but
+    // are intentionally *not* in the init-time canonical set (they are
+    // created lazily by the daemon / bot registration / team seeding).
+    const RUNTIME_LAZY_DIRS: &[&str] = &["pty", "harness", "imd", "teams"];
+
+    let Ok(entries) = std::fs::read_dir(&paths.root) else {
+        return String::new();
+    };
+    let mut unexpected: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if ccteam_core::canonical_home_dirs().contains(&name) || RUNTIME_LAZY_DIRS.contains(&name) {
+            continue;
+        }
+        unexpected.push(name.to_string());
+    }
+    if unexpected.is_empty() {
+        return String::new();
+    }
+    unexpected.sort();
+    format!(
+        "[ccteam] home drift: {} unexpected dir(s) under {} (orchestrator-era leftovers; safe to `rm -rf`): {}\n",
+        unexpected.len(),
+        paths.root.display(),
+        unexpected.join(", "),
+    )
 }
 
 /// V0.6.1 F121 — help text appended after the implicit pricing check
@@ -4222,7 +4193,6 @@ fn render_show_text(
     recent: &[Value],
     artifacts: &Map<String, Value>,
     sessions: &[ccteam_core::ActiveSessionInfo],
-    webhook: &Option<(String, String)>,
 ) -> String {
     let mut out = String::new();
     out.push_str(&format!("# {} ({})\n\n", state.slug, state.tmux_session));
@@ -4299,15 +4269,6 @@ fn render_show_text(
         out.push_str("\n  tip: `claude attach <id>` to take over a session live\n");
     }
 
-    // V0.6.3 F143 — webhook ingress URL (relative; operator prepends
-    // their own scheme+host). Treat the secret like the web token —
-    // print it so the operator can wire CI / monitors against it.
-    if let Some((url, _)) = webhook {
-        out.push_str("\nwebhook ingress:\n");
-        out.push_str(&format!("  POST <host>{url}\n"));
-        out.push_str("  (HTTP→file entry point; agent watches .ccteam/webhooks/)\n");
-    }
-
     out.push_str(&format!("\nrecent events ({}):\n", recent.len()));
     for e in recent {
         let ts = e.get("ts").and_then(|s| s.as_str()).unwrap_or("???");
@@ -4323,12 +4284,7 @@ fn render_show_json(
     recent: &[Value],
     artifacts: &Map<String, Value>,
     sessions: &[ccteam_core::ActiveSessionInfo],
-    webhook: &Option<(String, String)>,
 ) -> Result<String> {
-    let webhook_json = match webhook {
-        Some((url, secret)) => json!({ "url_path": url, "secret": secret }),
-        None => Value::Null,
-    };
     let v = json!({
         "state": serde_json::to_value(state)?,
         "phase_history": serde_json::to_value(&state.phase_history)?,
@@ -4336,7 +4292,6 @@ fn render_show_json(
         "recent_events": recent,
         "artifacts": Value::Object(artifacts.clone()),
         "active_sessions": serde_json::to_value(sessions)?,
-        "webhook": webhook_json,
         "stall": {
             "level": "ok",
             "silent_seconds": 0,
@@ -5506,12 +5461,13 @@ mod tests {
         let body = run_show(&paths, &slug, OutputFormat::Json).unwrap();
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["state"]["slug"], slug);
-        assert_eq!(v["artifacts"]["spec"], ".ccteam/spec.md");
-        // V0.6.3 F143 — `webhook` block carries the relative ingress
-        // URL + the generated per-project secret.
-        let url = v["webhook"]["url_path"].as_str().unwrap();
-        assert!(url.starts_with(&format!("/webhook/{slug}/")), "got {url}");
-        assert_eq!(v["webhook"]["secret"].as_str().unwrap().len(), 64);
+        // v0.8.6: `.ccteam/` keeps only state.json + workflow.yaml, so
+        // there is no `spec` artifact to surface.
+        assert!(
+            v["artifacts"].as_object().unwrap().is_empty(),
+            "v0.8.6: no .ccteam/*.md artifacts; got: {}",
+            v["artifacts"],
+        );
     }
 
     #[test]
@@ -5636,16 +5592,17 @@ mod tests {
             .join("agents")
             .join("cto.md")
             .is_file());
-        assert!(target
-            .join(".ccteam")
-            .join("agents")
-            .join("cto.md")
-            .is_file());
-        assert!(target
-            .join(".ccteam")
-            .join("skills")
-            .join(".gitkeep")
-            .is_file());
+        // v0.8.6: init no longer writes the `.ccteam/agents` neutral copy
+        // nor the `.ccteam/skills` placeholder layout — `.ccteam/` holds
+        // only state.json + workflow.yaml.
+        assert!(
+            !target.join(".ccteam").join("agents").exists(),
+            "v0.8.6: .ccteam/agents neutral copy must NOT be written",
+        );
+        assert!(
+            !target.join(".ccteam").join("skills").exists(),
+            "v0.8.6: .ccteam/skills placeholder must NOT be written",
+        );
 
         let cfg = ccteam_core::load_ccteam_config(&paths.root).unwrap();
         assert_eq!(cfg.projects.len(), 1);
@@ -5704,14 +5661,17 @@ mod tests {
         let cfg = ccteam_core::load_ccteam_config(&paths.root).unwrap();
         assert_eq!(cfg.projects.len(), 1);
         assert_eq!(cfg.projects[0].slug, "my-debate");
-        // 5. F94: settings.agent-team.json template wrote 3 hooks
-        let settings_path = target.join(".claude").join("settings.json");
+        // 5. F94: settings.agent-team.json template wrote 3 hooks.
+        // v0.8.6 W2b — ccteam writes its managed base/hooks to the
+        // local layer (settings.local.json), never the user-committed
+        // settings.json.
+        let settings_path = target.join(".claude").join("settings.local.json");
         assert!(settings_path.is_file());
         let settings_body = std::fs::read_to_string(&settings_path).unwrap();
         for hook in ["TeammateIdle", "TaskCreated", "TaskCompleted"] {
             assert!(
                 settings_body.contains(hook),
-                "settings.json (agent-team) must include `{hook}` hook; got: {settings_body}",
+                "settings.local.json (agent-team) must include `{hook}` hook; got: {settings_body}",
             );
         }
     }
@@ -5743,12 +5703,13 @@ mod tests {
             !body.contains("mode: agent-team"),
             "default workflow.yaml must NOT declare agent-team mode",
         );
-        // No F94 hooks in default settings.json.
+        // No F94 hooks in the default (managed) settings layer. v0.8.6
+        // W2b — ccteam writes to settings.local.json, not settings.json.
         let settings_body =
-            std::fs::read_to_string(target.join(".claude").join("settings.json")).unwrap();
+            std::fs::read_to_string(target.join(".claude").join("settings.local.json")).unwrap();
         assert!(
             !settings_body.contains("TeammateIdle"),
-            "default settings.json must NOT include team_* hooks",
+            "default settings.local.json must NOT include team_* hooks",
         );
     }
 
@@ -6267,6 +6228,63 @@ mod tests {
         assert!(body.contains("install-memory-bridge"));
         assert!(body.contains("validate-team"), "got: {body}");
         assert!(body.contains("migrate-recommended-agents"), "got: {body}");
+    }
+
+    /// v0.8.6 — `ccteam doctor` flags orchestrator-era leftover dirs
+    /// under `~/.ccteam` but stays silent on canonical / runtime-lazy
+    /// dirs. Informational only; never affects the exit code.
+    #[test]
+    fn run_doctor_reports_home_layout_drift() {
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        // Canonical (init-time) + runtime-lazy dirs — must NOT be flagged.
+        for d in [
+            "hooks", "progress", "run", "state", "pty", "harness", "imd", "teams",
+        ] {
+            std::fs::create_dir_all(paths.root.join(d)).unwrap();
+        }
+        // Orchestrator-era leftovers — must be flagged.
+        for d in ["phases", "control", "queue"] {
+            std::fs::create_dir_all(paths.root.join(d)).unwrap();
+        }
+        let body = run_doctor(&paths, DoctorOptions::default()).unwrap();
+        assert!(
+            body.contains("home drift"),
+            "expected a home-drift line; got: {body}",
+        );
+        for leftover in ["phases", "control", "queue"] {
+            assert!(
+                body.contains(leftover),
+                "drift line must name `{leftover}`; got: {body}",
+            );
+        }
+        // Legitimate dirs must not be reported on the drift line.
+        let drift_line = body
+            .lines()
+            .find(|l| l.contains("home drift"))
+            .unwrap_or("");
+        for ok in ["hooks", "pty", "harness", "imd", "teams"] {
+            assert!(
+                !drift_line.contains(ok),
+                "`{ok}` is legitimate and must not appear in the drift line; got: {drift_line}",
+            );
+        }
+    }
+
+    /// v0.8.6 — a clean `~/.ccteam` (only canonical dirs) emits no
+    /// home-drift line.
+    #[test]
+    fn run_doctor_no_home_drift_when_layout_clean() {
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        for d in ccteam_core::canonical_home_dirs() {
+            std::fs::create_dir_all(paths.root.join(d)).unwrap();
+        }
+        let body = run_doctor(&paths, DoctorOptions::default()).unwrap();
+        assert!(
+            !body.contains("home drift"),
+            "clean layout must not produce a drift line; got: {body}",
+        );
     }
 
     #[test]

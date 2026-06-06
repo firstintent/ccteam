@@ -5,9 +5,11 @@
 //! V0.2 M0.20 (candidate 7) replaces the M0.5 `RECOMMENDED_AGENTS`
 //! ln -sf protocol with Claude Code's in-memory plugin pipeline:
 //! `bootstrap_project` writes `enabledPlugins` into the spawned
-//! project's `.claude/settings.json`, Claude Code namespaces plugin
-//! agents as `<plugin>:<name>` automatically, and ccteam-core no
-//! longer touches `~/.claude/agents/`. The reachability check here
+//! project's `.claude/settings.local.json` (v0.8.6 W2b — the
+//! ccteam-managed local layer, never the user-committed
+//! `settings.json`), Claude Code namespaces plugin agents as
+//! `<plugin>:<name>` automatically, and ccteam-core no longer touches
+//! `~/.claude/agents/`. The reachability check here
 //! walks the plugin pipeline (via [`plugin_resolution`]) plus
 //! `~/.claude/agents/` (operator's user-authored customs) plus
 //! `~/.claude/skills/` (user skills) plus plugin-shipped skills.
@@ -491,7 +493,7 @@ pub fn migrate_legacy_skill_dirs(
     Ok(out)
 }
 
-/// V0.2.2 F44: outcome of a single project's settings.json hook
+/// V0.2.2 F44: outcome of a single project's settings.local.json hook
 /// command rewrite (legacy `… cct hook …` → `<current_exe> hook …`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookCmdRewriteAction {
@@ -507,7 +509,8 @@ pub enum HookCmdRewriteAction {
     Rewrote { entries: usize },
 }
 
-/// V0.2.2 F44: report for one `~/projects/<slug>/.claude/settings.json`.
+/// V0.2.2 F44: report for one `~/projects/<slug>/.claude/settings.local.json`
+/// (v0.8.6 W2b — ccteam manages the local settings layer).
 #[derive(Debug, Clone)]
 pub struct HookCmdRewriteReport {
     pub target: PathBuf,
@@ -515,9 +518,10 @@ pub struct HookCmdRewriteReport {
 }
 
 /// V0.2.2 F44 + V0.4.6 F89 + V0.6.1 F139: rewrite legacy hook command
-/// forms in a project's `.claude/settings.json` so they invoke the
-/// current `~/.ccteam/hooks/hook.sh` wrapper. Idempotent — re-runs
-/// after success hit `NoChangeNeeded`.
+/// forms in a project's `.claude/settings.local.json` (v0.8.6 W2b — the
+/// ccteam-managed local settings layer; the caller supplies the path) so
+/// they invoke the current `~/.ccteam/hooks/hook.sh` wrapper. Idempotent
+/// — re-runs after success hit `NoChangeNeeded`.
 ///
 /// Migration paths handled (oldest → newest):
 /// - F39: `…/cct hook <kind> [args]` / bare `cct hook <kind> [args]`
@@ -614,7 +618,7 @@ pub fn rewrite_legacy_hook_commands(
 /// scrub. See [`remove_cost_accumulate_hooks`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CostAccumulateScrubAction {
-    /// `settings.json` absent — nothing to do.
+    /// `settings.local.json` absent — nothing to do.
     NotFound,
     /// No `cost-accumulate` hook entries found. Idempotent re-run after
     /// success hits this branch.
@@ -633,11 +637,12 @@ pub struct CostAccumulateScrubReport {
 }
 
 /// V0.4.6 F91: strip the legacy `ccteam hook cost-accumulate` hook entry
-/// from a project's `.claude/settings.json`. F91 retired the
-/// PostToolUse cost-accumulator (Claude itself reports cost on each
-/// `agent_done` event into `progress.jsonl`); existing projects need
-/// their settings.json cleaned so Claude Code doesn't keep firing the
-/// now-missing subcommand.
+/// from a project's `.claude/settings.local.json` (v0.8.6 W2b — the
+/// ccteam-managed local settings layer; the caller supplies the path).
+/// F91 retired the PostToolUse cost-accumulator (Claude itself reports
+/// cost on each `agent_done` event into `progress.jsonl`); existing
+/// projects need their settings cleaned so Claude Code doesn't keep
+/// firing the now-missing subcommand.
 ///
 /// Detection rule: any `command` string ending with `hook cost-accumulate`
 /// (binary path prefix can be anything — `/usr/local/bin/ccteam hook
@@ -1158,7 +1163,7 @@ mod tests {
     fn rewrite_legacy_hook_commands_swaps_f39_cct_path() {
         // V0.6.1 F139: F44/F89 rewriter now lands on the hook.sh form.
         let tmp = tempfile::TempDir::new().unwrap();
-        let path = tmp.path().join("settings.json");
+        let path = tmp.path().join("settings.local.json");
         std::fs::write(&path, legacy_settings_json("/home/u/.cargo/bin/cct")).unwrap();
         let new_hook = PathBuf::from(HOOK_SH);
         let rep = rewrite_legacy_hook_commands(&path, &new_hook, false).unwrap();
@@ -1174,7 +1179,7 @@ mod tests {
     #[test]
     fn rewrite_legacy_hook_commands_dry_run_does_not_write() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let path = tmp.path().join("settings.json");
+        let path = tmp.path().join("settings.local.json");
         let original = legacy_settings_json("/home/u/.cargo/bin/cct");
         std::fs::write(&path, &original).unwrap();
         let new_hook = PathBuf::from(HOOK_SH);
@@ -1189,10 +1194,10 @@ mod tests {
 
     #[test]
     fn rewrite_legacy_hook_commands_idempotent_when_already_hook_sh() {
-        // V0.6.1 F139: a settings.json already pointing at the hook.sh
-        // wrapper must be a no-op the second pass.
+        // V0.6.1 F139: a settings.local.json already pointing at the
+        // hook.sh wrapper must be a no-op the second pass.
         let tmp = tempfile::TempDir::new().unwrap();
-        let path = tmp.path().join("settings.json");
+        let path = tmp.path().join("settings.local.json");
         let already_migrated = format!(
             r#"{{
   "hooks": {{
@@ -1219,7 +1224,7 @@ mod tests {
         // V0.6.1 F139: V0.4.6/V0.6.0 `<bin> internal hook ...` form
         // rewrites to `<hook.sh> ...`. Catches user upgrades from F89.
         let tmp = tempfile::TempDir::new().unwrap();
-        let path = tmp.path().join("settings.json");
+        let path = tmp.path().join("settings.local.json");
         let v060_settings = r#"{
   "hooks": {
     "SessionStart": [
@@ -1250,10 +1255,10 @@ mod tests {
 
     #[test]
     fn rewrite_legacy_hook_commands_migrates_v045_ccteam_hook_to_hook_sh() {
-        // V0.4.5 settings.json with `<bin> hook …` (no `internal`
+        // V0.4.5 settings.local.json with `<bin> hook …` (no `internal`
         // segment) rewrites to the F139 form too.
         let tmp = tempfile::TempDir::new().unwrap();
-        let path = tmp.path().join("settings.json");
+        let path = tmp.path().join("settings.local.json");
         std::fs::write(&path, legacy_settings_json("/home/u/.cargo/bin/ccteam")).unwrap();
         let new_hook = PathBuf::from(HOOK_SH);
         let rep = rewrite_legacy_hook_commands(&path, &new_hook, false).unwrap();
@@ -1272,7 +1277,7 @@ mod tests {
     #[test]
     fn rewrite_legacy_hook_commands_handles_missing_file() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let path = tmp.path().join("settings.json");
+        let path = tmp.path().join("settings.local.json");
         let new_hook = PathBuf::from(HOOK_SH);
         let rep = rewrite_legacy_hook_commands(&path, &new_hook, false).unwrap();
         assert_eq!(rep.action, HookCmdRewriteAction::NotFound);

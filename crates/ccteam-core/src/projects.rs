@@ -5,13 +5,10 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
-use chrono::{SecondsFormat, Utc};
 use serde_json::{Map, Value};
 
 use crate::paths::CcteamPaths;
 use crate::state::ProjectState;
-use crate::team::TeamSpec;
-use crate::team_resolver::TeamResolveContext;
 use crate::templates::{
     write_global_helper_templates, write_project_settings, EnabledPluginsSetting, CTO_ROLE_MD,
 };
@@ -52,14 +49,6 @@ pub fn slugify(input: &str) -> String {
         _ => head,
     };
     trimmed_head.trim_end_matches('-').to_string()
-}
-
-/// 4-char hex suffix derived from the current sub-second wallclock.
-/// Good enough for collision avoidance under interactive use; the
-/// caller can retry on collision.
-pub fn random_suffix() -> String {
-    let nanos = Utc::now().timestamp_subsec_nanos();
-    format!("{:04x}", nanos & 0xFFFF)
 }
 
 /// V0.2.2 F34 Tier 4: token-aware deterministic slug generator. Used
@@ -132,8 +121,8 @@ pub fn slugify_brief(input: &str) -> String {
 /// `paths:` frontmatter (`~/projects/<team>-*`) actually matches the
 /// project directory at session start (M4 main path; F22 fix, 2026-05-06).
 ///
-/// Tries `<team>-<base>` first, then `<team>-<base>-<suffix>` with up
-/// to 16 retries on collision.
+/// Tries `<team>-<base>` first, then appends an incrementing integer
+/// (`<team>-<base>2`, `<team>-<base>3`, …) on collision.
 ///
 /// V0.2.2 F34: the `base` argument is a free-text request — it gets
 /// run through `slugify_brief` (token-aware) so `<team>-<base>` stays
@@ -189,7 +178,8 @@ pub fn validate_slug_format(slug: &str) -> Result<String> {
 /// - Validate `[a-z0-9-]+`, length ≤ 60, no leading / trailing dash.
 /// - B2 prefix semantics: if `slug` already starts with `<team>-`
 ///   keep it verbatim; otherwise prepend `<team>-`.
-/// - Collision retry via `-{4hex}` suffix (same as `pick_unused_slug`).
+/// - Collision retry via an incrementing numeric suffix (same as
+///   `pick_unused_slug`): `base`, `base2`, `base3`, …
 pub fn pick_unused_slug_verbatim(paths: &CcteamPaths, slug: &str, team: &str) -> Result<String> {
     let trimmed = validate_slug_format(slug)?;
     let team_prefix = format!("{team}-");
@@ -202,36 +192,46 @@ pub fn pick_unused_slug_verbatim(paths: &CcteamPaths, slug: &str, team: &str) ->
 }
 
 /// Internal helper: takes an already-prefixed slug, returns the same
-/// or a `-{4hex}` retry on collision. Shared between the verbatim
-/// (`--slug`) and brief-derived paths.
+/// or a numerically-accumulated retry on collision. Shared between the
+/// verbatim (`--slug`) and brief-derived paths.
 fn pick_unused_under_team_prefix(paths: &CcteamPaths, base: &str, team: &str) -> Result<String> {
     let prefixed = format!("{team}-{base}");
     pick_unused_with_prefixed(paths, &prefixed)
 }
 
+/// Return `prefixed` if its directory is free, otherwise append an
+/// incrementing integer until an unused slug is found: `prefixed`,
+/// `prefixed2`, `prefixed3`, … (D2.6 — replaces the old random `-{4hex}`
+/// suffix so repeated `demo` creates land on the readable `demo2` /
+/// `demo3` rather than `demo-3f9a`).
 fn pick_unused_with_prefixed(paths: &CcteamPaths, prefixed: &str) -> Result<String> {
     if !paths.project_dir(prefixed).exists() {
         return Ok(prefixed.to_string());
     }
-    for _ in 0..16 {
-        let candidate = format!("{prefixed}-{}", random_suffix());
+    // Start at 2 so the first collision yields `<base>2` (human-friendly:
+    // the original is the implicit "1").
+    for n in 2.. {
+        let candidate = format!("{prefixed}{n}");
         if !paths.project_dir(&candidate).exists() {
             return Ok(candidate);
         }
     }
-    Err(anyhow!(
-        "could not pick an unused slug after 16 attempts (base: {prefixed})",
-    ))
+    unreachable!("integer accumulation always finds a free slug")
 }
 
 /// Write the bootstrap files for a fresh project:
-/// - `<project>/.ccteam/spec.md` ← `request`
 /// - `<project>/.ccteam/state.json` ← `ProjectState::initial_for_team(slug, team)`
-/// - `<project>/.claude/settings.json` ← M0.4 template
-/// - `<project>/CLAUDE.md` ← header + spec link
+/// - `<project>/.claude/settings.local.json` ← managed hooks + base
+/// - `<project>/.claude/agents/cto.md` ← default IM/chat persona
 ///
-/// `team` lands in state.json so the orchestrator can route this
-/// project through the matching phase set (M3.1 F12/F13).
+/// v0.8.6: ccteam no longer generates a project `CLAUDE.md` /
+/// `AGENTS.md` (project knowledge is vendor-native, owned by the
+/// project) nor a `.ccteam/spec.md`; `.ccteam/` keeps only `state.json`
+/// (+ `workflow.yaml`, written elsewhere). `request` is retained for
+/// API stability but no longer persisted.
+///
+/// `team` lands in state.json so downstream routing can pick the
+/// matching workflow.
 ///
 /// Returns the full project directory path.
 pub fn bootstrap_project(
@@ -258,21 +258,16 @@ pub fn bootstrap_project_at_dir(
     paths: &CcteamPaths,
     target_dir: &Path,
     slug: &str,
-    request: &str,
+    // v0.8.6: `request` is no longer persisted (no `.ccteam/spec.md`,
+    // no generated `CLAUDE.md`); kept in the signature for API
+    // stability so existing callers don't churn.
+    _request: &str,
     team: &str,
 ) -> Result<PathBuf> {
     let project_dir = target_dir.to_path_buf();
     let ccteam_dir = project_dir.join(".ccteam");
     std::fs::create_dir_all(&ccteam_dir)
         .with_context(|| format!("create {}", ccteam_dir.display()))?;
-
-    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-    let spec_path = ccteam_dir.join("spec.md");
-    let spec_body = format!(
-        "---\nslug: {slug}\ncreated_at: {now}\nteam: {team}\n---\n\n# 用户需求\n\n{request}\n",
-    );
-    std::fs::write(&spec_path, spec_body)
-        .with_context(|| format!("write {}", spec_path.display()))?;
 
     let state = ProjectState::initial_for_team(slug.to_string(), team.to_string());
     state.save(&CcteamPaths::project_state_in(&project_dir))?;
@@ -282,10 +277,10 @@ pub fn bootstrap_project_at_dir(
     // was deleted with the rest of the phase machinery. F66 will
     // reintroduce the plugin enablement set computed from
     // `workflow.yaml::agents.<role>.executor`. For now we lay down
-    // settings.json with an empty plugin set so the project bootstraps
-    // cleanly; user-authored agent prompts still resolve their plugin
-    // surface via the global `~/.claude/agents/` layer.
-    let resolved_spec = resolve_project_team_spec(paths, team);
+    // managed settings (`.claude/settings.local.json`) with an empty
+    // plugin set so the project bootstraps cleanly; user-authored agent
+    // prompts still resolve their plugin surface via the global
+    // `~/.claude/agents/` layer.
     let enabled_plugins = EnabledPluginsSetting::default();
 
     write_project_settings(&project_dir, &enabled_plugins)?;
@@ -310,13 +305,6 @@ pub fn bootstrap_project_at_dir(
         );
     }
 
-    let claude_md = project_dir.join("CLAUDE.md");
-    if !claude_md.exists() {
-        let body = render_project_claude_md(slug, team, resolved_spec.as_ref());
-        std::fs::write(&claude_md, body)
-            .with_context(|| format!("write {}", claude_md.display()))?;
-    }
-
     // v8.3 session=role: IM/chat sessions launch `claude --agent cto`
     // by default, so the `cto` persona must exist in every project this
     // path creates (IM `/newproject` + gateway create_project). Write
@@ -331,51 +319,6 @@ pub fn bootstrap_project_at_dir(
     }
 
     Ok(project_dir)
-}
-
-fn resolve_project_team_spec(paths: &CcteamPaths, team: &str) -> Option<TeamSpec> {
-    let user_staging = crate::team_resolver::default_user_staging_dir();
-    let ctx = TeamResolveContext::for_orchestrator(&paths.root, &user_staging);
-    crate::team_resolver::resolve_team(team, &ctx).ok()
-}
-
-/// Build the `<project>/CLAUDE.md` body for `team`. The per-team body
-/// lives in `team.yaml.claude_md_template`; templates contain the
-/// literal placeholders `{slug}` / `{team}`, substituted here.
-///
-/// Lookup precedence:
-/// 1. The resolved `TeamSpec`'s `claude_md_template` (for user-authored
-///    teams resolved via `team_resolver`).
-/// 2. A generic body that doesn't bake in dev / research assumptions —
-///    used for unknown teams (user-authored without a template).
-///
-/// V0.4.0 F60: the shipped `TEAM_BUNDLES` fallback was deleted with the
-/// rest of the phase machinery; user-authored teams must carry their
-/// own `claude_md_template`, otherwise the generic body is rendered.
-fn render_project_claude_md(slug: &str, team: &str, resolved_spec: Option<&TeamSpec>) -> String {
-    let template = resolved_spec
-        .filter(|spec| !spec.claude_md_template.trim().is_empty())
-        .map(|spec| spec.claude_md_template.clone());
-    let body = match template {
-        Some(t) => t,
-        None => generic_claude_md_template().to_string(),
-    };
-    body.replace("{slug}", slug).replace("{team}", team)
-}
-
-/// Fallback body for teams without an explicit `claude_md_template`.
-/// Carries no team-specific contract — phase markdown owns that.
-fn generic_claude_md_template() -> &'static str {
-    "# CLAUDE.md (auto-managed by ccteam)\n\
-     \n\
-     ## 项目上下文\n\
-     - slug: {slug}\n\
-     - team: {team}\n\
-     - 用户原始需求: 见 .ccteam/spec.md\n\
-     \n\
-     ## 工作约定\n\
-     - 跟随该 team 的 workflow.yaml / agent 指示。\n\
-     - 不要修改 .ccteam/ 之外的元数据。\n"
 }
 
 /// Pre-mark `project_dir` as trusted in `~/.claude.json` so the first
@@ -763,15 +706,15 @@ mod tests {
     fn pick_unused_slug_appends_suffix_on_collision_under_team_prefix() {
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = pick_paths(&tmp);
-        // Pre-create the bare prefixed slug directory so the next pick
-        // must fall back to a `<team>-<base>-<suffix>` form.
+        // D2.6: a collision accumulates an incrementing integer, so the
+        // first retry is `<team>-<base>2`, the next `<team>-<base>3`, …
         std::fs::create_dir_all(paths.project_dir("dev-todo-cli")).unwrap();
         let s = pick_unused_slug(&paths, "todo cli", "dev").unwrap();
-        assert!(
-            s.starts_with("dev-todo-cli-"),
-            "expected suffix retry, got {s}"
-        );
-        assert_ne!(s, "dev-todo-cli");
+        assert_eq!(s, "dev-todo-cli2");
+        // Pre-create `dev-todo-cli2` too; next pick must roll to `3`.
+        std::fs::create_dir_all(paths.project_dir("dev-todo-cli2")).unwrap();
+        let s3 = pick_unused_slug(&paths, "todo cli", "dev").unwrap();
+        assert_eq!(s3, "dev-todo-cli3");
     }
 
     #[test]
@@ -920,9 +863,9 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = pick_paths(&tmp);
         std::fs::create_dir_all(paths.project_dir("dev-x")).unwrap();
+        // D2.6: numeric accumulation — first collision yields `dev-x2`.
         let s = pick_unused_slug_verbatim(&paths, "x", "dev").unwrap();
-        assert!(s.starts_with("dev-x-"), "expected suffix retry, got {s}");
-        assert_ne!(s, "dev-x");
+        assert_eq!(s, "dev-x2");
     }
 
     #[test]
@@ -1080,57 +1023,15 @@ mod tests {
         );
     }
 
-    // ---------------- V0.2 M0.16.3: claude_md_template ----------------
-
-    #[test]
-    fn render_project_claude_md_falls_back_to_generic_when_no_resolved_spec() {
-        // V0.4.0 F60: the shipped TEAM_BUNDLES fallback was deleted with
-        // the phase machinery. With no resolved_spec, every team gets
-        // the generic body — substitution still applies.
-        let body = render_project_claude_md("dev-build-todo", "dev", None);
-        assert!(body.contains("# CLAUDE.md (auto-managed by ccteam)"));
-        assert!(body.contains("- slug: dev-build-todo"));
-        assert!(body.contains("- team: dev"));
-        assert!(body.contains("workflow.yaml"));
-    }
-
-    #[test]
-    fn render_project_claude_md_falls_back_to_generic_for_unknown_team() {
-        let body = render_project_claude_md("custom-foo-1", "custom-team", None);
-        assert!(body.contains("- slug: custom-foo-1"));
-        assert!(body.contains("- team: custom-team"));
-        assert!(body.contains("workflow.yaml"));
-    }
-
-    #[test]
-    fn render_project_claude_md_prefers_resolved_team_template() {
-        let spec = TeamSpec::parse(
-            "name: custom-flex\n\
-             kind: flex\n\
-             claude_md_template: \"custom flex template for {slug} / {team}\"\n",
-        )
-        .unwrap();
-        let body = render_project_claude_md("custom-flex-demo", "custom-flex", Some(&spec));
-        assert!(body.contains("custom flex template for custom-flex-demo / custom-flex"));
-    }
-
-    #[test]
-    fn render_project_claude_md_falls_back_to_generic_when_template_field_empty() {
-        // meta-agent ships with an empty `claude_md_template` (the role
-        // prompt overwrites the file via a different path), so the
-        // generic body is the right fallback. This guards against
-        // accidentally writing "" as the body.
-        let body = render_project_claude_md("meta-rob", "meta-agent", None);
-        assert!(!body.is_empty());
-        assert!(body.contains("- slug: meta-rob"));
-        assert!(body.contains("- team: meta-agent"));
-    }
-
     #[test]
     fn bootstrap_project_settings_routes_through_hook_sh() {
-        // V0.6.1 F139: fresh settings.json renders route hook commands
+        // V0.6.1 F139: fresh managed settings render route hook commands
         // through `~/.ccteam/hooks/hook.sh` (the daemon-aware wrapper)
         // instead of cold-spawning `ccteam internal hook ...`.
+        //
+        // v0.8.6: managed settings land in `.claude/settings.local.json`
+        // (NOT the user-committed `settings.json`) so ccteam never
+        // dirties the project's checked-in settings.
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = CcteamPaths {
             root: tmp.path().join("home"),
@@ -1144,7 +1045,9 @@ mod tests {
         std::env::remove_var("CCTEAM_HOME");
         result.unwrap();
 
-        let settings = paths.project_dir("demo").join(".claude/settings.json");
+        let settings = paths
+            .project_dir("demo")
+            .join(".claude/settings.local.json");
         let body = std::fs::read_to_string(&settings).unwrap();
         let v: Value = serde_json::from_str(&body).unwrap();
         let cmd = v["hooks"]["SessionStart"][0]["hooks"][0]["command"]
@@ -1152,16 +1055,16 @@ mod tests {
             .unwrap();
         assert!(
             cmd.starts_with('/'),
-            "settings.json hook command must be an absolute path, got: {cmd}",
+            "settings.local.json hook command must be an absolute path, got: {cmd}",
         );
         assert!(
             cmd.contains(expected_hook.to_str().unwrap()),
-            "settings.json hook should invoke {}, got: {cmd}",
+            "settings.local.json hook should invoke {}, got: {cmd}",
             expected_hook.display(),
         );
         assert!(
             cmd.ends_with(" load-context"),
-            "settings.json SessionStart[0] should pass `load-context`, got: {cmd}",
+            "settings.local.json SessionStart[0] should pass `load-context`, got: {cmd}",
         );
         assert!(
             !cmd.contains("__CCTEAM_HOOK_SH__"),

@@ -321,8 +321,10 @@ fn write_project_settings_agent_team_lands_on_disk() {
         &ccteam_core::EnabledPluginsSetting::default(),
     )
     .expect("write must succeed");
-    let path = project.join(".claude").join("settings.json");
-    assert!(path.exists(), "settings.json must be written");
+    // v0.8.6 W2b — managed base/hooks land on the local settings layer
+    // (settings.local.json), never the user-committed settings.json.
+    let path = project.join(".claude").join("settings.local.json");
+    assert!(path.exists(), "settings.local.json must be written");
     let body = std::fs::read_to_string(&path).unwrap();
     assert!(body.contains("TeammateIdle"));
     assert!(body.contains("TaskCreated"));
