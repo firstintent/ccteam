@@ -397,6 +397,7 @@ dependencies = [
  "croner",
  "dirs",
  "futures",
+ "getrandom 0.2.17",
  "image",
  "imageproc",
  "libc",

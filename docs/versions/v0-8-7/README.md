@@ -14,7 +14,7 @@ v0.8.7 是 **v0.8.6「IM 通用模式 + session=role」模型上的能力补全*
 
 | 批次 | 主题 | 交付 |
 |---|---|---|
-| **W1** | cto 调度(B 档) | 5 个 `session_*` MCP 工具(`spawn`/`dispatch`/`collect`/`list`/`stop`,新 `session_` ToolGroup;MCP 12→17)走 gateway session map(**不**碰 deprecated registry/supervisor);**daemon `role==cto` 硬门**(据 spawn-env 注入的 ambient `_caller_role`、防伪;门先于 gateway 执行);新 `pub Gateway::session_resolve`;collect = polled MVP(tail 子 `turns.jsonl` + `since` 游标)。`shared_gateway`(同一 `Arc<Mutex<Gateway>>`)穿进 mcp.sock handler。|
+| **W1** | cto 调度(B 档) | 5 个 `session_*` MCP 工具(`spawn`/`dispatch`/`collect`/`list`/`stop`,新 `session_` ToolGroup;MCP 12→17)走 gateway session map(**不**碰 deprecated registry/supervisor);daemon cto 门(据 spawn-env 注入的 ambient `_caller_role`;门先于 gateway 执行)— **review-fix(R-M1/R-M3)抬门槛**:改校验 per-session secret(`(role,secret)` 对)+ project 维度,best-effort defense-in-depth 非硬边界;新 `pub Gateway::session_resolve`;collect = polled MVP(tail 子 `turns.jsonl` + `since` 游标)。`shared_gateway`(同一 `Arc<Mutex<Gateway>>`)穿进 mcp.sock handler。|
 | **W2** | per-session HITL 批准 | `PermissionMode { Skip(默认), Hitl }`(`ccteam-harness/adapter.rs` + `SpawnCtx`)穿所有创建路径(IM `/new claude cto hitl` 尾 token、web `POST /sessions` `permission_mode`、cto `session_spawn` param;`/role`/重启保留)。hitl spawn 走 `--permission-mode default`(**绝不** skip)+ 注入 vendor 原生 `PermissionRequest` hook → `ccteam-hooks/permission_request.rs` 经 `permission/ask` JSON-RPC → daemon `execute_permission_ask` 建 Approve/Deny ChoicePrompt 弹 IM。FAIL-SAFE=deny;deny 只挡该工具、**无 `interrupt`**、不 kill turn。先 smoke-gate(真 claude 2.1.167 实证:非 allowlist 工具触发、allowlist 不触发、必须 default 不能 skip)。|
 | **W3** | role picker / import | `ccteam role search/add/list`:离线浏览 + 一键装 agency-agents(wshobson/agents,MIT)role 进 `.claude/agents/`。catalog = vendored 全量 **192 entries / 78 divisions**(`agency_agents_catalog.json` `include_str!`)。拓扑分层:纯 catalog(parse/search,**零 reqwest**)留 `ccteam-core`(leaf);网络 import(`import_role_from_catalog{,_with_base}`)落 `ccteam-im`。`role add` = `reqwest GET` raw → `write_role` **verbatim**(零 frontmatter 转换)。|
 | **W4** | per-session web UI | 每 gateway session(`s{n}`)独立页 `/chat/s/:sid` + 历史 + 干净切换(不混流):后端 `GET /api/v1/sessions/{sid}` 重写为 `session_resolve` → 读 `<project_dir>/.ccteam/chat/<role>/turns.jsonl`(弃永不匹配的 `session_id==s{n}` progress 过滤);per-sid SSE tap(fix-round 已落)。前端整套 rewire(`ChatConsole.tsx` 按 sid keyed + per-sid localStorage + `sessionsApi.ts` + `useSessionEvents.ts`);HITL 审批 per-session 渲染。|
@@ -39,7 +39,7 @@ v0.8.7 是 **v0.8.6「IM 通用模式 + session=role」模型上的能力补全*
 保留全部 v0.8.6 红线(no prompt injection、`progress.jsonl` state SoT、不 scrape pane、resume-by-id、永不**主动** kill、`ccteam-core` 零 team 名、crate 拓扑、README 英文无版本进展、skill 自洽、不 vendor 二进制)。本版**新增两条就地红线**(已并入 CLAUDE.md §三):
 
 - **HITL 批准边界 = `PermissionRequest` hook**:批准门走 vendor 原生 hook(不注入 system prompt)；hitl spawn 走 `--permission-mode default`(绝不 skip,否则白嫖批准);deny 只挡该工具、不 kill turn(守「永不主动 kill」)。
-- **cto 调度边界 = daemon `role==cto` 硬门**:`session_*` 特权据 spawn-env 注入的 caller role 硬门(防伪),只用 gateway session map;`dispatch`/`stop` 是显式调度,非主动 kill。
+- **cto 调度门 = daemon 校验 per-session secret(best-effort,非硬边界)**:`session_*` 特权据 spawn-mint 的 per-session secret 校验 `(role,secret)` 对 + project 维度(review-fix R-M1/R-M3;单 uid 全信任下只抬门槛,真隔离 = per-agent OS user/sandbox v0.8.8 deferred),只用 gateway session map;`dispatch`/`stop` 是显式调度,非主动 kill。
 
 ## 推后 / Deferred
 

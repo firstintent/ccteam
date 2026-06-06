@@ -26,7 +26,7 @@ v0.8.6 搭好骨架（session=role + cto + 标准资源 API + 清理）。v0.8.7
 **决策**：
 - **DA.1 新 MCP 工具** `session_spawn{project?,role,vendor?}` / `session_dispatch{sid,task}` / `session_collect{sid,since?}`（+可选 `session_list`/`session_stop`）：新 `mcp_session_tools.rs` + group 前缀 `session_`（mirror `chat_`/`advise_`）；并入 `tool_definitions()`；`STUB_TOOLS` + `doctor --verify-mcp` 同步。
 - **DA.2 wire**：把 `shared_gateway`（`Arc<Mutex<Gateway>>`，composition root main.rs:1727）传进 `serve_mcp_socket`（main.rs:1851）+ `handle_mcp_socket_connection`；spawn/dispatch 走 **`chat_send_file` 的 forwarder 模式**（stdio → mcp.sock → daemon handler，ambient `CCTEAM_CHAT_{SLUG,ROLE}`）；`collect` 可 stdio 侧直接 tail 子 session `turns.jsonl`（reuse `read_all_turns`）。
-- **DA.3 权限分层**：① `cto_role.md` 加 `tools:` 行授予 session_*（work-role 模板不给 → Claude allow-list 强制）；② daemon handler **硬门**：caller role（ambient `CCTEAM_CHAT_ROLE`）== `cto`（或可配特权集）否则 isError —— 双保险。
+- **DA.3 权限分层**：① `cto_role.md` 加 `tools:` 行授予 session_*（work-role 模板不给 → Claude allow-list 强制）；② daemon handler 校验 caller role（ambient `CCTEAM_CHAT_ROLE`）== `cto`（或可配特权集）否则 isError —— 双层。〔review-fix R-M1/R-M3 校正：原称"硬门"过度声称；已改校验 per-session secret + project 维度，但单 OS-uid 全信任下仍 best-effort 非硬边界，真隔离 = per-agent OS user/sandbox v0.8.8 deferred。〕
 - **DA.4 结果回收 = polled collect（MVP）**：子 session 自跑，answer 已 mirror 到其 `turns.jsonl`；cto 调 `session_collect` 读回。push-back-as-turn（子结果直灌 cto context，需新 GatewayEvent 路由模式）= **v0.8.8**。
 - **红线**：这是 **gateway session map**，**不碰** deprecated registry/supervisor（`chat_*` 工具那套）—— 别混。dispatch/stop = cto 显式命令，不违永不主动 kill。
 

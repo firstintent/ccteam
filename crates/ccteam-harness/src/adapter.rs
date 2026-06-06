@@ -592,6 +592,14 @@ pub struct SpawnCtx {
     /// `PermissionRequest` hook so non-allowlist tools prompt the IM user.
     /// Claude-only lever today (codex uses its own sandbox model).
     pub permission_mode: PermissionMode,
+    /// v0.8.7 review-fix (R-M1) — per-session secret for the cto scheduling
+    /// gate, injected into the pane env as `CCTEAM_CHAT_SECRET` at spawn so
+    /// the forwarded `session_*` call can be authenticated against the
+    /// gateway's `sid -> {role, secret}` map instead of a plaintext role arg.
+    /// Empty `""` = no secret (tests / codex / legacy callers); the env var
+    /// is then omitted, matching prior behavior. NOT a hard boundary — see
+    /// `ccteam_core::session_secret` for the single-uid threat-model scope.
+    pub secret: String,
 }
 
 /// V0.6.0 F107 — canonical [`UnifiedTokenUsage`] lives in `ccteam-cost`

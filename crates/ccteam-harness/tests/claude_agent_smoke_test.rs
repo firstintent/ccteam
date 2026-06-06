@@ -177,6 +177,7 @@ fn make_ctx(cwd: &Path) -> SpawnCtx {
         extra_args: vec![],
         model_id: None,
         permission_mode: ccteam_harness::PermissionMode::Skip,
+        secret: String::new(),
     }
 }
 
@@ -452,6 +453,7 @@ fn make_ctx_hitl(cwd: &Path) -> SpawnCtx {
         extra_args: vec![],
         model_id: None,
         permission_mode: ccteam_harness::PermissionMode::Hitl,
+        secret: String::new(),
     }
 }
 

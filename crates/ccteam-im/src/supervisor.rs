@@ -913,6 +913,9 @@ impl BotSupervisor {
             // v0.8.7 W2 — the (deprecated) supervisor path is bg/workflow,
             // not the gateway chat ask-path; keep it skip.
             permission_mode: ccteam_harness::PermissionMode::Skip,
+            // v0.8.7 review-fix (R-M1) — the supervisor path is not the gateway
+            // cto-gate chat session; no per-session secret applies here.
+            secret: String::new(),
         };
         let start_result = self
             .adapter

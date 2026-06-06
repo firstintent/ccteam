@@ -114,6 +114,7 @@ async fn via_mux_bg_spawn_routes_through_rmux_daemon() {
         extra_args: vec!["do the thing".into()],
         model_id: None,
         permission_mode: ccteam_harness::PermissionMode::Skip,
+        secret: String::new(),
     };
 
     let adapter = ClaudeBgAdapter::new();

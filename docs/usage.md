@@ -294,7 +294,7 @@ $EDITOR ~/projects/demo-app/CLAUDE.md                     # 项目知识(Claude 
 @cto 起一个 backend-architect,让它评审 src/ 的接口设计,把结论汇总给我
 ```
 
-cto 背后用的是 5 个 `mcp__ccteam__session_*` 工具:`session_spawn`(建子 session)· `session_dispatch`(派一个 turn)· `session_collect`(取子 session 的回复,polled)· `session_list` · `session_stop`。这组工具是 cto **专属**(daemon 按调用方 role 硬门,只有 `cto` 能用;work-role 调不到),且只走 gateway session map。
+cto 背后用的是 5 个 `mcp__ccteam__session_*` 工具:`session_spawn`(建子 session)· `session_dispatch`(派一个 turn)· `session_collect`(取子 session 的回复,polled)· `session_list` · `session_stop`。这组工具是 cto **专属**:daemon 校验每个 session 启动时注入的 secret(只有 `cto` session 持有有效 `(role, secret)`,且只能操作自己项目里的 session),work-role 调不到;只走 gateway session map。**注**:所有 agent 同 OS 用户运行,这道门是 best-effort(抬高门槛),**不是**硬隔离 —— 真正的进程隔离需要 per-agent OS 用户 / sandbox(未来版本)。
 
 ---
 

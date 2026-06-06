@@ -134,6 +134,7 @@ fn make_ctx(slug: &str, tmp: &tempfile::TempDir) -> SpawnCtx {
         extra_args: vec![],
         model_id: None,
         permission_mode: ccteam_harness::PermissionMode::Skip,
+        secret: String::new(),
     }
 }
 
@@ -148,6 +149,7 @@ fn make_ctx_hitl(slug: &str, tmp: &tempfile::TempDir) -> SpawnCtx {
         extra_args: vec![],
         model_id: None,
         permission_mode: ccteam_harness::PermissionMode::Hitl,
+        secret: String::new(),
     }
 }
 

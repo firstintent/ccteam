@@ -36,6 +36,11 @@ thiserror.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 
+# v0.8.7 review-fix (R-M1) — OS CSPRNG for the per-session cto-gate secret
+# (`session_secret::mint`). Direct dep so the secret never relies on a weak
+# time-only token; already in the tree via `rand 0.8` so no new download.
+getrandom.workspace = true
+
 # V0.4.0 F61 — `libc::kill(pid, SIGTERM)` for ClaudeCodeAdapter's
 # shutdown_session path. Replaces the V0.3.1 tmux `kill-session`
 # flow now that ClaudeCodeAdapter no longer owns a tmux session.

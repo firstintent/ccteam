@@ -27,7 +27,7 @@
 | Workspace version | `0.8.7` |
 | 测试 baseline | `1942/0`(`cargo test --workspace --exclude ccteam-web`);`ccteam-web` = 230+ pass / 5 env-gated `ws_*`(pipe-pane PTY,留 CI/专机)+ vitest 108/108(SPA)|
 | Clippy | 0 errors + 0 warnings(`cargo clippy --workspace --all-targets -- -D warnings`,含 `ccteam-web`)|
-| 当前在做 | **v0.8.7 已落地(IM 通用模式 + session=role 的能力补全)**:cto 调度(5 个 `session_*` MCP 工具 spawn/dispatch/collect/list/stop,daemon `role==cto` 硬门;MCP 12→17)· per-session HITL(`skip`(默认)\|`hitl`;hitl 注入 `PermissionRequest` hook + daemon `permission/ask` + IM `[✅同意][⛔拒绝]`,hitl spawn 走 `--permission-mode default` **非** skip)· role picker(`ccteam role search/add/list` 从 agency-agents catalog 192 entries 装 role)· per-session web UI(`/chat/s/:sid` 历史从 `turns.jsonl` + 按 sid 过滤 SSE)· OpenAPI 自动文档(`/api/docs` Scalar + `/api/v1/openapi.json`,单源 `OpenApiRouter`)· Lark/Feishu 接入 `ccteam config` + fix.md 实机 bug 三修;PRD/handoff/归档见 `docs/versions/v0-8-7/` |
+| 当前在做 | **v0.8.7 已落地(IM 通用模式 + session=role 的能力补全)**:cto 调度(5 个 `session_*` MCP 工具 spawn/dispatch/collect/list/stop,daemon 校验 per-session secret + project 维度,best-effort 非硬边界;MCP 12→17)· per-session HITL(`skip`(默认)\|`hitl`;hitl 注入 `PermissionRequest` hook + daemon `permission/ask` + IM `[✅同意][⛔拒绝]`,hitl spawn 走 `--permission-mode default` **非** skip)· role picker(`ccteam role search/add/list` 从 agency-agents catalog 192 entries 装 role)· per-session web UI(`/chat/s/:sid` 历史从 `turns.jsonl` + 按 sid 过滤 SSE)· OpenAPI 自动文档(`/api/docs` Scalar + `/api/v1/openapi.json`,单源 `OpenApiRouter`)· Lark/Feishu 接入 `ccteam config` + fix.md 实机 bug 三修;PRD/handoff/归档见 `docs/versions/v0-8-7/` |
 
 > 主分支 HEAD 以 `git rev-parse origin/dev` 为准(v0.8.7 在 dev 上);历史里程碑见 `docs/versions/v0-X-Y/README.md`(冻结归档)。
 
@@ -68,7 +68,7 @@
 | **不解析终端输出** | 读 transcript jsonl + 官方 hooks fast event;**不 scrape pane**(`tmux capture-pane` 仅 dev 调试 + screenshot tool 只读)|
 | **永不主动 kill 长 session** | `budgets.{claude,codex}.max_cost_usd_per_24h` 触顶 auto-disable 是预算例外;`project stop` / `project rm --force` 是**用户显式命令**(非主动 kill,合法);`/compact /new` 是合法 turn |
 | **HITL 批准边界 = `PermissionRequest` hook**(per-session,默认 `skip`) | hitl session 的批准门走 vendor 原生 `PermissionRequest` hook（**不**注入 system prompt/不 scrape）→ daemon `permission/ask` → IM `[同意][拒绝]`;hitl spawn 走 `--permission-mode default`(**绝不** skip,否则白嫖批准),skip session 仍 `--dangerously-skip-permissions`;deny **只挡该次工具、不 kill turn**(守「永不主动 kill」) |
-| **cto 调度边界 = daemon `role==cto` 硬门** | 5 个 `session_*` 工具(spawn/dispatch/collect/list/stop)的特权由 daemon 据 ambient `_caller_role`(spawn env 注入,**绝不**取 caller args 防伪)硬门,门先于 gateway 执行;`session_*` 只用 gateway session map,**不**碰 deprecated registry/supervisor;`dispatch`/`stop` 是显式调度(非主动 kill 长 session) |
+| **cto 调度门 = daemon 校验 per-session secret(best-effort,非硬边界)** | 5 个 `session_*` 工具(spawn/dispatch/collect/list/stop)的特权由 daemon 校验:spawn 时 mint per-session secret 注入 pane env(`CCTEAM_CHAT_SECRET`),daemon 存 `sid→{role,secret}`,forwarder 转发,门校验 `(role,secret)` 对(**非**信明文 role)+ project 维度(只能操作自己 slug 的 sid);`session_*` 只用 gateway session map,**不**碰 deprecated registry/supervisor;`dispatch`/`stop` 是显式调度(非主动 kill 长 session)。**诚实范围**:单 OS-uid 全信任模型下 agent 之间**无硬边界**(同 uid 可读他进程 `/proc/<pid>/environ`/文件/ptrace → 拿到 secret),secret 只**抬高门槛**(defense-in-depth),**不 close**;真隔离 = per-agent OS user / sandbox(v0.8.8 deferred) |
 | **会话 = resume-by-id** | spawn-on-demand + 按 id resume + 空闲释放 + 扛 daemon 重启,**非**常驻吊着;chat 复用 context 是 feature |
 | **ccteam 不生成/桥接项目 `CLAUDE.md`/`AGENTS.md`** | 项目知识层归 vendor 原生(Claude 读 `CLAUDE.md`、Codex 读 `AGENTS.md`)+ 项目自己;ccteam 唯一管的指令面 = `.claude/agents/<role>.md`(role 库) |
 | **`ccteam-core` 零 team 名字面量** | core = primitives leaf,team 名不入 core |
@@ -93,7 +93,7 @@
 |---|---|
 | **role 库**(`.claude/agents/<role>.md`)| ccteam 唯一管的指令面;`ccteam init` 种默认 `cto`(管家);work-role 用户自建 / 从 agency-agents(Claude 原生 .md,MIT)选 —— `ccteam role search/add/list`(catalog 192 entries,`role add` verbatim 写入 `.claude/agents/`)或手动丢入,`/role <role>` 原地换(daemon 内存态) |
 | **CLAUDE.md / AGENTS.md** | 项目 / 用户级持久指令,**vendor 原生**(ccteam 只读,不生成)|
-| **MCP** | `ccteam` **17 工具**,0 STUB(`STUB_TOOLS` const + `ccteam doctor --verify-mcp` 自检,drift exit 1):admin 3(`ls`/`change_persona`/`add_tool`)· chat 6(`register_bot`/`unregister_bot`/`list_bots`/`send_input`/`history`/`send_file`)· advise 2(`vote`/`parallel`)· **session 5**(cto 调度:`session_spawn`/`dispatch`/`collect`/`list`/`stop`,daemon `role==cto` 硬门)· screenshot 1;前缀 `mcp__ccteam__*`;wire 纪律:`mcp-serve` stdout 纯 JSON-RPC、tracing→stderr |
+| **MCP** | `ccteam` **17 工具**,0 STUB(`STUB_TOOLS` const + `ccteam doctor --verify-mcp` 自检,drift exit 1):admin 3(`ls`/`change_persona`/`add_tool`)· chat 6(`register_bot`/`unregister_bot`/`list_bots`/`send_input`/`history`/`send_file`)· advise 2(`vote`/`parallel`)· **session 5**(cto 调度:`session_spawn`/`dispatch`/`collect`/`list`/`stop`,daemon 校验 per-session secret + project 维度)· screenshot 1;前缀 `mcp__ccteam__*`;wire 纪律:`mcp-serve` stdout 纯 JSON-RPC、tracing→stderr |
 | **Skills**(repo 根 `skills/`)| **0 个 ccteam 自带**(原 skill 功能落 MCP 工具 + cto role + work-role + `config` CLI);留 `skills/.gitkeep` 作**项目自有** skill 扩展位 |
 | **Subagents** | agent 内 `Task(subagent_type=...)` ad-hoc 节流(work-role 可自带)|
 | **Hooks** | `ccteam internal hook progress-append / load-context` 等(隐藏);写 `.claude/settings.local.json` 的 ccteam hook 段 |

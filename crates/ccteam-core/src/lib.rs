@@ -78,6 +78,8 @@ pub mod role_catalog;
 // (`.claude/agents/<role>.md`). Write side lives in `admin_actions`.
 pub mod roles;
 pub mod screenshot;
+// v0.8.7 review-fix (R-M1) — per-session cto-gate secret (mint + ct_eq).
+pub mod session_secret;
 pub mod silence_classifier;
 pub mod skill;
 // V0.6.0 F115 — spawn-brief template renderer

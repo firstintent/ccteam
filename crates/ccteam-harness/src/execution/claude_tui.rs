@@ -278,11 +278,21 @@ fn claude_bin() -> String {
 /// V0.8 W2c — returns owned `(String, String)` pairs to feed
 /// [`MuxSessionSpec::env`] directly (the trait spec owns its env, no
 /// borrow plumbing).
-fn chat_spawn_env_owned(role: &str, slug: &str) -> Vec<(String, String)> {
-    vec![
+///
+/// v0.8.7 review-fix (R-M1) — also forwards `CCTEAM_CHAT_SECRET` when a
+/// non-empty per-session secret is supplied, so the in-pane stdio MCP
+/// forwarder can authenticate `session_*` calls to the daemon's
+/// `sid -> {role, secret}` map. An empty secret (tests / legacy) omits the
+/// var entirely, preserving prior spawn env exactly.
+fn chat_spawn_env_owned(role: &str, slug: &str, secret: &str) -> Vec<(String, String)> {
+    let mut env = vec![
         ("CCTEAM_CHAT_ROLE".to_string(), role.to_string()),
         ("CCTEAM_CHAT_SLUG".to_string(), slug.to_string()),
-    ]
+    ];
+    if !secret.is_empty() {
+        env.push(("CCTEAM_CHAT_SECRET".to_string(), secret.to_string()));
+    }
+    env
 }
 
 /// F164 — Probe whether a chat session's pane process looks like a
@@ -332,13 +342,14 @@ fn spec_for_resume(
     cwd: &Path,
     session_id_name: &str,
     permission_mode: PermissionMode,
+    secret: &str,
 ) -> MuxSessionSpec {
     let mut argv = vec![claude_bin(), "--agent".to_string(), role.to_string()];
     argv.extend(permission_args(permission_mode));
     argv.push("--resume".to_string());
     argv.push(session_id_name.to_string());
     MuxSessionSpec::new(chat_session_name(slug, role), argv, cwd.to_path_buf())
-        .with_env(chat_spawn_env_owned(role, slug))
+        .with_env(chat_spawn_env_owned(role, slug, secret))
         .with_kind(MuxSessionKind::LongLived)
 }
 
@@ -353,8 +364,9 @@ fn spec_for_fresh(
     cwd: &Path,
     session_id_name: &str,
     permission_mode: PermissionMode,
+    secret: &str,
 ) -> MuxSessionSpec {
-    spec_for_new(role, slug, cwd, session_id_name, permission_mode)
+    spec_for_new(role, slug, cwd, session_id_name, permission_mode, secret)
 }
 
 /// V0.8 W2c — `MuxSessionSpec` for the brand-new (session-absent) path:
@@ -368,13 +380,14 @@ fn spec_for_new(
     cwd: &Path,
     session_id_name: &str,
     permission_mode: PermissionMode,
+    secret: &str,
 ) -> MuxSessionSpec {
     let mut argv = vec![claude_bin(), "--agent".to_string(), role.to_string()];
     argv.extend(permission_args(permission_mode));
     argv.push("--name".to_string());
     argv.push(session_id_name.to_string());
     MuxSessionSpec::new(chat_session_name(slug, role), argv, cwd.to_path_buf())
-        .with_env(chat_spawn_env_owned(role, slug))
+        .with_env(chat_spawn_env_owned(role, slug, secret))
         .with_kind(MuxSessionKind::LongLived)
 }
 
@@ -578,6 +591,7 @@ impl HarnessAdapter for ClaudeTuiAdapter {
                         &ctx.cwd,
                         &session_id_name,
                         ctx.permission_mode,
+                        &ctx.secret,
                     ))
                     .await
                     .map_err(|e| HarnessError::SpawnFailed(format!("mux spawn resume: {e}")))?;
@@ -608,6 +622,7 @@ impl HarnessAdapter for ClaudeTuiAdapter {
                             &ctx.cwd,
                             &session_id_name,
                             ctx.permission_mode,
+                            &ctx.secret,
                         ))
                         .await
                         .map_err(|e| HarnessError::SpawnFailed(format!("mux spawn fresh: {e}")))?;
@@ -643,6 +658,7 @@ impl HarnessAdapter for ClaudeTuiAdapter {
                     &ctx.cwd,
                     &session_id_name,
                     ctx.permission_mode,
+                    &ctx.secret,
                 ))
                 .await
                 .map_err(|e| HarnessError::SpawnFailed(format!("mux spawn new: {e}")))?;
@@ -1555,7 +1571,7 @@ mod tests {
     fn spec_for_new_argv_reflects_permission_mode() {
         let cwd = std::path::Path::new("/tmp/cc-permmode");
         // Skip: carries the skip flag, not --permission-mode.
-        let skip = spec_for_new("dev", "slug", cwd, "sid-1", PermissionMode::Skip);
+        let skip = spec_for_new("dev", "slug", cwd, "sid-1", PermissionMode::Skip, "");
         assert!(skip
             .argv
             .iter()
@@ -1565,7 +1581,7 @@ mod tests {
         assert!(skip.argv.iter().any(|a| a == "--agent"));
         assert!(skip.argv.iter().any(|a| a == "--name"));
         // Hitl: drops the skip flag, carries --permission-mode default.
-        let hitl = spec_for_new("dev", "slug", cwd, "sid-1", PermissionMode::Hitl);
+        let hitl = spec_for_new("dev", "slug", cwd, "sid-1", PermissionMode::Hitl, "");
         assert!(!hitl
             .argv
             .iter()
@@ -1578,7 +1594,7 @@ mod tests {
     #[test]
     fn spec_for_resume_argv_reflects_permission_mode() {
         let cwd = std::path::Path::new("/tmp/cc-permmode");
-        let hitl = spec_for_resume("dev", "slug", cwd, "sid-1", PermissionMode::Hitl);
+        let hitl = spec_for_resume("dev", "slug", cwd, "sid-1", PermissionMode::Hitl, "");
         assert!(!hitl
             .argv
             .iter()
@@ -1586,6 +1602,37 @@ mod tests {
         assert!(hitl.argv.iter().any(|a| a == "--permission-mode"));
         // Resume path keeps --resume (not --name).
         assert!(hitl.argv.iter().any(|a| a == "--resume"));
+    }
+
+    /// v0.8.7 review-fix (R-M1) — a non-empty per-session secret is injected
+    /// into the pane env as `CCTEAM_CHAT_SECRET`; an empty secret omits the var
+    /// entirely (preserving prior spawn env for tests / legacy callers).
+    #[test]
+    fn spec_env_carries_secret_only_when_present() {
+        let cwd = std::path::Path::new("/tmp/cc-secret");
+        let with = spec_for_new(
+            "dev",
+            "slug",
+            cwd,
+            "sid-1",
+            PermissionMode::Skip,
+            "deadbeef",
+        );
+        let pairs: std::collections::HashMap<&str, &str> = with
+            .env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(pairs.get("CCTEAM_CHAT_SECRET"), Some(&"deadbeef"));
+        assert_eq!(pairs.get("CCTEAM_CHAT_ROLE"), Some(&"dev"));
+        assert_eq!(pairs.get("CCTEAM_CHAT_SLUG"), Some(&"slug"));
+
+        let without = spec_for_new("dev", "slug", cwd, "sid-1", PermissionMode::Skip, "");
+        assert!(
+            !without.env.iter().any(|(k, _)| k == "CCTEAM_CHAT_SECRET"),
+            "empty secret must omit CCTEAM_CHAT_SECRET, got: {:?}",
+            without.env
+        );
     }
 
     #[test]

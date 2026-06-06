@@ -56,6 +56,14 @@ struct GatewaySession {
     /// `hitl`). Remembered so a `/role` re-spawn and a daemon-restart resume
     /// re-apply the same mode (and the same hook install).
     permission_mode: PermissionMode,
+    /// v0.8.7 review-fix (R-M1) — per-session secret minted at first spawn and
+    /// injected into the pane env as `CCTEAM_CHAT_SECRET`. The cto-gate
+    /// authenticates a forwarded `session_*` caller by matching the secret it
+    /// presents against this stored value (see [`Gateway::verify_session_caller`]).
+    /// Persisted across daemon restarts so the live pane's env still matches.
+    /// HONEST SCOPE: only raises the bar under the single-uid full-trust model
+    /// — not a hard boundary (see `ccteam_core::session_secret`).
+    secret: String,
     handle: String,
     thread: ThreadHandle,
     adapter: Arc<dyn HarnessAdapter + Send + Sync>,
@@ -327,6 +335,14 @@ struct SavedGatewaySession {
     /// state files (no field) restore as `Skip`, matching prior behavior.
     #[serde(default)]
     permission_mode: PermissionMode,
+    /// v0.8.7 review-fix (R-M1) — persisted per-session cto-gate secret so the
+    /// restored in-memory map still matches the live pane's `CCTEAM_CHAT_SECRET`
+    /// (and the recreate-fallback re-spawn re-injects the SAME value).
+    /// `#[serde(default)]` ⇒ pre-existing state files (no field) restore as
+    /// `""`; such a session simply can't pass the secret check until re-spawned
+    /// — fail-closed, never fail-open.
+    #[serde(default)]
+    secret: String,
     handle: String,
     thread: ThreadHandle,
 }
@@ -596,6 +612,10 @@ impl Gateway {
                                         // Restart resume re-applies the
                                         // persisted posture (DB.1).
                                         permission_mode: snapshot.permission_mode,
+                                        // R-M1 — recreate-fallback re-injects the
+                                        // SAME persisted secret so the new pane's
+                                        // env still matches the gate-map.
+                                        secret: snapshot.secret.clone(),
                                     },
                                 )
                                 .await
@@ -1086,6 +1106,11 @@ impl Gateway {
         ensure_role_exists(&cwd, &role)?;
         self.next_session += 1;
         let id = format!("s{}", self.next_session);
+        // v0.8.7 review-fix (R-M1) — mint the per-session cto-gate secret and
+        // inject it into the pane env (`CCTEAM_CHAT_SECRET`) at spawn so the
+        // in-pane stdio forwarder can authenticate `session_*` calls against
+        // this session's stored secret instead of a spoofable plaintext role.
+        let secret = ccteam_core::session_secret::mint();
         let adapter = (self.adapter_factory)(vendor);
         let thread = adapter
             .start_thread(
@@ -1098,6 +1123,7 @@ impl Gateway {
                     extra_args: vec![],
                     model_id: None,
                     permission_mode,
+                    secret: secret.clone(),
                 },
             )
             .await?;
@@ -1110,6 +1136,7 @@ impl Gateway {
                 role,
                 vendor,
                 permission_mode,
+                secret,
                 handle,
                 thread,
                 adapter,
@@ -1194,6 +1221,11 @@ impl Gateway {
         let _ = old_adapter.close_thread(&old_thread).await;
 
         let adapter = (self.adapter_factory)(vendor);
+        // v0.8.7 review-fix (R-M1) — a `/role` switch closes the old pane and
+        // spawns a brand-new one, so mint a FRESH secret: the new pane's env
+        // gets it, and the in-place record below stores the same value, keeping
+        // pane-env and gate-map in lockstep.
+        let secret = ccteam_core::session_secret::mint();
         let thread = adapter
             .start_thread(
                 &AgentSpecBrief { role: role.clone() },
@@ -1205,6 +1237,7 @@ impl Gateway {
                     extra_args: vec![],
                     model_id: None,
                     permission_mode,
+                    secret: secret.clone(),
                 },
             )
             .await?;
@@ -1220,6 +1253,7 @@ impl Gateway {
                 role: role.clone(),
                 vendor,
                 permission_mode,
+                secret,
                 handle: role,
                 thread,
                 adapter,
@@ -1393,6 +1427,9 @@ impl Gateway {
                     role: saved_session.role,
                     vendor: saved_session.vendor,
                     permission_mode: saved_session.permission_mode,
+                    // R-M1 — restore the persisted secret so the gate-map matches
+                    // the live pane's `CCTEAM_CHAT_SECRET` after a daemon restart.
+                    secret: saved_session.secret,
                     handle: saved_session.handle,
                     thread: saved_session.thread,
                     adapter,
@@ -1443,6 +1480,7 @@ impl Gateway {
                     role: session.role.clone(),
                     vendor: session.vendor,
                     permission_mode: session.permission_mode,
+                    secret: session.secret.clone(),
                     handle: session.handle.clone(),
                     thread: session.thread.clone(),
                 })
@@ -1897,6 +1935,30 @@ impl Gateway {
             role: session.role.clone(),
             project: session.project.clone(),
             project_dir,
+        })
+    }
+
+    /// v0.8.7 review-fix (R-M1) — authenticate a forwarded `session_*` caller
+    /// by matching the `(role, secret)` PAIR it presents against a tracked
+    /// session, instead of trusting a plaintext `_caller_role` arg. Returns
+    /// `true` iff some live session both runs `claimed_role` AND holds a secret
+    /// equal (constant-time) to `presented_secret`. An empty secret is always
+    /// `false` (fail-closed): a pre-secret restored session or a forger with no
+    /// secret can never authenticate. Read-only, holds no `.await`.
+    ///
+    /// HONEST SCOPE: this only RAISES THE BAR. Under the single-OS-uid
+    /// full-trust model any agent can read another's `/proc/<pid>/environ`,
+    /// files, or ptrace it and recover the secret, so this is best-effort
+    /// defense-in-depth, NOT a hard boundary. Real isolation = per-agent OS
+    /// user / sandbox (v0.8.8-deferred). See `ccteam_core::session_secret`.
+    pub fn verify_session_caller(&self, claimed_role: &str, presented_secret: &str) -> bool {
+        if presented_secret.is_empty() {
+            return false;
+        }
+        self.sessions.values().any(|s| {
+            s.role == claimed_role
+                && !s.secret.is_empty()
+                && ccteam_core::session_secret::ct_eq(&s.secret, presented_secret)
         })
     }
 
@@ -2797,6 +2859,10 @@ mod tests {
         /// in spawn order, so a test can assert the gateway threaded the right
         /// posture (skip vs hitl) down to the adapter.
         spawn_modes: Arc<Mutex<Vec<PermissionMode>>>,
+        /// v0.8.7 review-fix (R-M1) — `SpawnCtx::secret` captured per
+        /// start_thread so a test can assert the minted per-session secret was
+        /// threaded into the spawn env.
+        spawn_secrets: Arc<Mutex<Vec<String>>>,
     }
 
     impl Default for FakeAdapter {
@@ -2817,6 +2883,7 @@ mod tests {
                 directive_script: Arc::new(Mutex::new(VecDeque::new())),
                 status: Arc::new(Mutex::new(ThreadStatus::default())),
                 spawn_modes: Arc::new(Mutex::new(Vec::new())),
+                spawn_secrets: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -2850,6 +2917,7 @@ mod tests {
         ) -> Result<ThreadHandle, HarnessError> {
             self.starts.fetch_add(1, Ordering::SeqCst);
             self.spawn_modes.lock().await.push(ctx.permission_mode);
+            self.spawn_secrets.lock().await.push(ctx.secret.clone());
             Ok(ThreadHandle {
                 vendor: self.vendor,
                 mode: ExecutionMode::Chat,
@@ -3013,6 +3081,105 @@ mod tests {
         gateway.stop_session("s1").await.unwrap();
         assert!(gateway.session_views().is_empty());
         assert!(gateway.stop_session("s1").await.is_err());
+    }
+
+    /// v0.8.7 review-fix (R-M1) — `create_session_api` mints a per-session
+    /// secret, stores it on the session, and injects it into the spawn env so
+    /// the pane (and its in-pane stdio forwarder) can present it. Two sessions
+    /// get DIFFERENT secrets.
+    #[tokio::test]
+    async fn create_session_mints_unique_secret_and_injects_into_env() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-secret");
+        let s1 = gateway
+            .create_session_api(
+                "alpha".into(),
+                "cto".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        let s2 = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        let sec1 = gateway.sessions.get(&s1).unwrap().secret.clone();
+        let sec2 = gateway.sessions.get(&s2).unwrap().secret.clone();
+        assert_eq!(sec1.len(), 32, "secret is 128-bit hex");
+        assert_ne!(sec1, sec2, "each session gets its own secret");
+        // The secret reached the spawn env (FakeAdapter records SpawnCtx).
+        let envs = fake.spawn_secrets.lock().await;
+        assert!(
+            envs.contains(&sec1) && envs.contains(&sec2),
+            "both minted secrets must have been injected into the spawn ctx: {envs:?}"
+        );
+    }
+
+    /// v0.8.7 review-fix (R-M1) — the gate authenticates the `(role, secret)`
+    /// PAIR, not a plaintext role. Right pair → ok; wrong/empty secret, or the
+    /// right secret with a non-cto claimed role, → reject (fail-closed).
+    #[tokio::test]
+    async fn verify_session_caller_requires_matching_role_and_secret() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-verify");
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "cto".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        let secret = gateway.sessions.get(&sid).unwrap().secret.clone();
+
+        // Correct (role, secret) pair authenticates.
+        assert!(gateway.verify_session_caller("cto", &secret));
+        // Wrong secret → reject.
+        assert!(!gateway.verify_session_caller("cto", "deadbeefdeadbeefdeadbeefdeadbeef"));
+        // Empty secret → reject (fail-closed; never fall-open).
+        assert!(!gateway.verify_session_caller("cto", ""));
+        // Right secret but a role no session runs → reject (pair must match).
+        assert!(!gateway.verify_session_caller("reviewer", &secret));
+        // A role that is not even spawned → reject.
+        assert!(!gateway.verify_session_caller("ghost", &secret));
+    }
+
+    /// v0.8.7 review-fix (R-M3) — `session_resolve(sid).project` is the value
+    /// the daemon gate uses to enforce same-project scope. Confirm it reports
+    /// the project a session was created in (so a project-A caller can be told
+    /// a project-B sid is out of scope).
+    #[tokio::test]
+    async fn session_resolve_reports_owning_project_for_scope_check() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-scope");
+        gateway.register_project("beta", "/tmp/beta-scope");
+        let sa = gateway
+            .create_session_api(
+                "alpha".into(),
+                "cto".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        let sb = gateway
+            .create_session_api(
+                "beta".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        assert_eq!(gateway.session_resolve(&sa).unwrap().project, "alpha");
+        assert_eq!(gateway.session_resolve(&sb).unwrap().project, "beta");
     }
 
     /// V0.8.6 W5b — `create_session_api` is idempotent on (project, role):
@@ -3959,6 +4126,7 @@ mod tests {
         let state_path = tmp.path().join("gateway-state.json");
         let fake = Arc::new(FakeAdapter::default());
 
+        let original_secret;
         {
             let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
             gateway.register_project("beta", "/tmp/beta");
@@ -3971,11 +4139,22 @@ mod tests {
                 .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
                 .await
                 .unwrap();
+            // R-M1 — the minted secret is non-empty and will be persisted.
+            original_secret = gateway.sessions.get("s1").unwrap().secret.clone();
+            assert_eq!(original_secret.len(), 32);
         }
 
         let mut restored = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
         restored.register_project("beta", "/tmp/beta");
         restored.enable_persistence(&state_path).unwrap();
+
+        // R-M1 — the per-session secret survives the daemon restart so the gate
+        // map still matches the live pane's `CCTEAM_CHAT_SECRET`.
+        assert_eq!(
+            restored.sessions.get("s1").unwrap().secret,
+            original_secret,
+            "the cto-gate secret must round-trip through persisted state"
+        );
 
         let sessions = restored
             .handle_text("mock", "chat-1", "alice", "/sessions")

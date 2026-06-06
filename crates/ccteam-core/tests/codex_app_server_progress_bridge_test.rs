@@ -265,6 +265,7 @@ async fn end_to_end_turn_completed_writes_progress_jsonl_with_vendor_codex() {
         extra_args: vec![],
         model_id: Some("gpt-5-codex".into()),
         permission_mode: ccteam_harness::PermissionMode::Skip,
+        secret: String::new(),
     };
     let h = adapter
         .start_thread(&spec, &ctx)

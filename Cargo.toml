@@ -88,6 +88,11 @@ askama = "0.12"
 # M5.0 so `ServeOpts::token_file` can carry the knob without dep
 # manifest churn when the auth middleware actually lands.
 subtle = "2.5"
+# v0.8.7 review-fix (R-M1) — OS CSPRNG for the per-session cto-gate secret
+# (`ccteam_core::session_secret::mint`). Already in the tree transitively
+# via `rand 0.8`; pinned at 0.2 (the widely-vendored line) and consumed
+# directly so the secret never relies on a weak time-only token.
+getrandom = "0.2"
 # HTTP client used by ccteam-web integration tests (lib + subprocess).
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 

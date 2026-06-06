@@ -3000,14 +3000,24 @@ async fn execute_session_tool(
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
 
-    // DA.3 layer 2 — HARD gate on the ambient caller role FIRST (a security
-    // boundary: deny a non-privileged caller before touching any state). The
-    // stdio side injects `_caller_role` from the trusted spawn env, never from
-    // caller-supplied args, so it can't be spoofed.
+    // The stdio forwarder injects `_caller_role` / `_caller_secret` from the
+    // spawn-time pane env (`CCTEAM_CHAT_ROLE` / `CCTEAM_CHAT_SECRET`), not from
+    // caller-supplied tool args. We treat both as UNTRUSTED until the secret is
+    // checked against the gateway's `sid -> {role, secret}` map below.
     let caller_role = args
         .get("_caller_role")
         .and_then(|v| v.as_str())
         .unwrap_or("");
+    let caller_secret = args
+        .get("_caller_secret")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    // Layer 1 (CHEAP PRE-FILTER, *not* the security boundary): reject an
+    // obviously non-privileged role before touching any state, so a non-cto
+    // caller is denied even when the gateway is unavailable. This is NOT a
+    // trust boundary on its own — a plaintext role arg is forgeable; the real
+    // authentication is the layer-2 secret check below.
     if !session_caller_authorized(caller_role) {
         let who = if caller_role.is_empty() {
             "<unknown>"
@@ -3024,7 +3034,10 @@ async fn execute_session_tool(
     }
 
     // The gateway must be running (web + IM both up). Mirror chat_send_file's
-    // "IM gateway not running" structured error rather than panicking.
+    // "IM gateway not running" structured error rather than panicking. It is
+    // also REQUIRED to authenticate the caller (the secret map lives there), so
+    // a missing gateway is a hard stop — never a fall-through that would skip
+    // the secret check.
     let Some(gateway) = gateway else {
         return session_tool_response(
             id,
@@ -3033,15 +3046,36 @@ async fn execute_session_tool(
         );
     };
 
+    // Layer 2 (THE SECURITY-RELEVANT CHECK, best-effort defense-in-depth):
+    // authenticate the caller by matching the `(role, secret)` PAIR it presents
+    // against a tracked session, instead of trusting the plaintext role. A
+    // missing / wrong secret fails closed. HONEST SCOPE: under the single-uid
+    // full-trust model this only RAISES THE BAR (a same-uid process can read
+    // another pane's env and recover the secret); it is NOT a hard boundary.
+    // Real isolation = per-agent OS user / sandbox (v0.8.8-deferred).
+    {
+        let gw = gateway.lock().await;
+        if !gw.verify_session_caller(caller_role, caller_secret) {
+            return session_tool_response(
+                id,
+                format!(
+                    "{name}: permission denied — caller could not be authenticated (no live `{caller_role}` session holds the presented secret)"
+                ),
+                true,
+            );
+        }
+    }
+
     match run_session_tool(&name, &args, gateway).await {
         Ok(text) => session_tool_response(id, text, false),
         Err(text) => session_tool_response(id, text, true),
     }
 }
 
-/// v0.8.7 W1 — pure privilege check: is `caller_role` allowed to call the
-/// `session_*` scheduling tools? Extracted so the gate is unit-testable
-/// without standing up a gateway.
+/// v0.8.7 W1 — layer-1 privilege PRE-FILTER (not the security boundary): is
+/// `caller_role` in the privileged set? Cheap + unit-testable without a
+/// gateway. The authoritative check is [`Gateway::verify_session_caller`],
+/// which matches the secret; this only short-circuits the obvious non-cto case.
 fn session_caller_authorized(caller_role: &str) -> bool {
     SESSION_TOOL_PRIVILEGED_ROLES.contains(&caller_role)
 }
@@ -3064,8 +3098,13 @@ async fn run_session_tool(
 }
 
 /// `session_spawn` — create (or reuse) a work-role session in the caller's
-/// bound project. The project is the ambient `_caller_slug` (the cto's
-/// project); `project`/`vendor` args are honored where they make sense.
+/// bound project. The project is ALWAYS the ambient `_caller_slug` (the cto's
+/// project); `vendor` is honored where it makes sense.
+///
+/// v0.8.7 review-fix (R-M3) — the spawnable project is pinned to the caller's
+/// own slug, so a cto bound to project A can never spawn into project B. The
+/// previously-informational `project` arg is gone (it was a cross-project
+/// foot-gun); the gateway resolves the slug → cwd from its own project map.
 async fn run_session_spawn(
     args: &serde_json::Value,
     gateway: &GatewayHandle,
@@ -3076,20 +3115,13 @@ async fn run_session_spawn(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "session_spawn: missing `role`".to_string())?
         .to_string();
-    // The session is created in the cto's bound project (ambient slug). An
-    // explicit `project` arg is accepted but defaults to the caller's slug;
-    // the gateway resolves the slug → cwd from its own project map.
+    // The session is always created in the cto's bound project (ambient slug),
+    // never a caller-named project — project-scoping the gate (R-M3).
     let project = args
-        .get("project")
+        .get("_caller_slug")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(String::from)
-        .or_else(|| {
-            args.get("_caller_slug")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-        })
         .ok_or_else(|| "session_spawn: no project (ambient slug unset)".to_string())?;
     let vendor = parse_session_vendor(args)?;
     // v0.8.7 W2 (DB.1) — optional `permission_mode` arg (`skip` default /
@@ -3129,6 +3161,8 @@ async fn run_session_dispatch(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "session_dispatch: missing `task`".to_string())?
         .to_string();
+    // R-M3 — only operate sessions in the caller's own project.
+    assert_caller_owns_session("session_dispatch", args, gateway, &sid).await?;
 
     let mut gw = gateway.lock().await;
     let turn_id = gw
@@ -3159,6 +3193,8 @@ async fn run_session_collect(
         .and_then(|v| v.as_u64())
         .map(|x| x as usize)
         .unwrap_or(SESSION_COLLECT_DEFAULT_N);
+    // R-M3 — only collect from sessions in the caller's own project.
+    assert_caller_owns_session("session_collect", args, gateway, &sid).await?;
 
     // Resolve under the lock (sync), then DROP the guard before the fs read.
     let resolved = {
@@ -3250,6 +3286,9 @@ async fn run_session_stop(
     gateway: &GatewayHandle,
 ) -> std::result::Result<String, String> {
     let sid = arg_session_sid(args)?;
+    // R-M3 — only stop sessions in the caller's own project (explicit command,
+    // never a proactive kill; the scope check just prevents cross-project stop).
+    assert_caller_owns_session("session_stop", args, gateway, &sid).await?;
     let mut gw = gateway.lock().await;
     gw.stop_session(&sid)
         .await
@@ -3270,6 +3309,40 @@ fn arg_session_sid(args: &serde_json::Value) -> std::result::Result<String, Stri
         .filter(|s| !s.is_empty())
         .map(String::from)
         .ok_or_else(|| "missing required `sid`".to_string())
+}
+
+/// v0.8.7 review-fix (R-M3) — project-scope a sid-addressed `session_*` call:
+/// the caller may only dispatch/collect/stop a session that runs in the
+/// caller's OWN bound project (`_caller_slug`). Resolves the sid under the
+/// gateway lock (sync `session_resolve`, no `.await` held), drops the guard,
+/// then compares the session's project to the ambient slug. An unknown sid, an
+/// unset ambient slug, or a project mismatch all reject — so a cto bound to
+/// project A can never operate a project-B sid (even one another chat created).
+/// Meaningful now that R-M1 gives the caller a verified identity.
+async fn assert_caller_owns_session(
+    name: &str,
+    args: &serde_json::Value,
+    gateway: &GatewayHandle,
+    sid: &str,
+) -> std::result::Result<(), String> {
+    let caller_slug = args
+        .get("_caller_slug")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("{name}: no project scope (ambient slug unset)"))?
+        .to_string();
+    let resolved = {
+        let gw = gateway.lock().await;
+        gw.session_resolve(sid)
+    };
+    let resolved = resolved.ok_or_else(|| format!("{name}: unknown session: {sid}"))?;
+    if resolved.project != caller_slug {
+        return Err(format!(
+            "{name}: permission denied — session {sid} runs in project `{}`, but the caller is bound to project `{caller_slug}`",
+            resolved.project
+        ));
+    }
+    Ok(())
 }
 
 /// Parse the optional `vendor` arg (default `claude`), lowercasing first so a
@@ -3996,6 +4069,242 @@ mod session_tool_tests {
             "method": "tools/call",
             "params": { "name": name, "arguments": args },
         })
+    }
+
+    // v0.8.7 review-fix (R-M1/R-M3) — a no-process stub adapter so a real
+    // `Gateway` can mint per-session secrets + track project scope without
+    // spawning a `claude` pane. `start_thread` records the `(sid, secret)` the
+    // gateway minted so the test can present the real secret to the gate.
+    #[derive(Clone, Default)]
+    struct StubAdapter {
+        spawns: std::sync::Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ccteam_harness::HarnessAdapter for StubAdapter {
+        fn name(&self) -> &'static str {
+            "stub-gate-test"
+        }
+        fn vendor(&self) -> ccteam_harness::AgentVendor {
+            ccteam_harness::AgentVendor::Claude
+        }
+        async fn start_thread(
+            &self,
+            spec: &ccteam_harness::AgentSpecBrief,
+            ctx: &ccteam_harness::SpawnCtx,
+        ) -> std::result::Result<ccteam_harness::ThreadHandle, ccteam_harness::HarnessError>
+        {
+            self.spawns
+                .lock()
+                .await
+                .push((ctx.sid.clone(), ctx.secret.clone()));
+            Ok(ccteam_harness::ThreadHandle {
+                vendor: ccteam_harness::AgentVendor::Claude,
+                mode: ccteam_harness::ExecutionMode::Chat,
+                identity: format!("{}-{}-{}", ctx.slug, spec.role, ctx.sid),
+                started_at: chrono::Utc::now(),
+                raw_extras: json!({}),
+            })
+        }
+        async fn submit_turn(
+            &self,
+            h: &ccteam_harness::ThreadHandle,
+            _input: ccteam_harness::TurnInput,
+        ) -> std::result::Result<ccteam_harness::TurnId, ccteam_harness::HarnessError> {
+            Ok(ccteam_harness::TurnId::new(format!("turn-{}", h.identity)))
+        }
+        fn events(
+            &self,
+            _h: &ccteam_harness::ThreadHandle,
+        ) -> futures::stream::BoxStream<'static, ccteam_harness::ThreadEvent> {
+            Box::pin(futures::stream::empty())
+        }
+        async fn resume_thread(
+            &self,
+            _persistent_id: &str,
+        ) -> std::result::Result<ccteam_harness::ThreadHandle, ccteam_harness::HarnessError>
+        {
+            Err(ccteam_harness::HarnessError::NotImplemented {
+                reason: "stub".to_string(),
+            })
+        }
+        async fn close_thread(
+            &self,
+            _h: &ccteam_harness::ThreadHandle,
+        ) -> std::result::Result<(), ccteam_harness::HarnessError> {
+            Ok(())
+        }
+        async fn handle_directive(
+            &self,
+            _h: &ccteam_harness::ThreadHandle,
+            _d: ccteam_harness::Directive,
+        ) -> std::result::Result<ccteam_harness::DirectiveOutcome, ccteam_harness::HarnessError>
+        {
+            Ok(ccteam_harness::DirectiveOutcome::Rejected {
+                reason: "stub".to_string(),
+            })
+        }
+        async fn thread_status(
+            &self,
+            _h: &ccteam_harness::ThreadHandle,
+        ) -> std::result::Result<ccteam_harness::ThreadStatus, ccteam_harness::HarnessError>
+        {
+            Ok(ccteam_harness::ThreadStatus::default())
+        }
+    }
+
+    /// Build a real `Gateway` (stub adapter) with a cto session in `alpha` and
+    /// a reviewer session in `beta`, returning the handle + the cto's minted
+    /// secret so an end-to-end gate test can present a real `(role, secret)`.
+    /// The secret is read back from the stub adapter's spawn recording (the
+    /// gateway minted + injected it into the spawn ctx).
+    async fn gateway_with_cto_and_cross_project() -> (GatewayHandle, String, String, String) {
+        let stub = StubAdapter::default();
+        let stub_for_factory = stub.clone();
+        let factory: std::sync::Arc<
+            dyn Fn(
+                    ccteam_harness::AgentVendor,
+                )
+                    -> std::sync::Arc<dyn ccteam_harness::HarnessAdapter + Send + Sync>
+                + Send
+                + Sync,
+        > = std::sync::Arc::new(move |_| {
+            std::sync::Arc::new(stub_for_factory.clone())
+                as std::sync::Arc<dyn ccteam_harness::HarnessAdapter + Send + Sync>
+        });
+        let mut gw =
+            ccteam_im::gateway::Gateway::new_with_factory(factory, "alpha", "/tmp/cc-gate-alpha");
+        gw.register_project("beta", "/tmp/cc-gate-beta");
+        let cto_sid = gw
+            .create_session_api(
+                "alpha".into(),
+                "cto".into(),
+                ccteam_harness::AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        let beta_sid = gw
+            .create_session_api(
+                "beta".into(),
+                "reviewer".into(),
+                ccteam_harness::AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        let cto_secret = stub
+            .spawns
+            .lock()
+            .await
+            .iter()
+            .find(|(sid, _)| sid == &cto_sid)
+            .map(|(_, secret)| secret.clone())
+            .expect("stub recorded the cto session's minted secret");
+        assert_eq!(cto_secret.len(), 32, "the minted secret is 128-bit hex");
+        (
+            std::sync::Arc::new(tokio::sync::Mutex::new(gw)),
+            cto_sid,
+            beta_sid,
+            cto_secret,
+        )
+    }
+
+    /// v0.8.7 review-fix (R-M1) — end-to-end: a cto presenting the WRONG secret
+    /// is rejected by `execute_session_tool` even though its plaintext role is
+    /// `cto` (the secret is the authoritative check, not the role arg).
+    #[tokio::test]
+    async fn execute_session_tool_rejects_cto_with_wrong_secret() {
+        let (gw, _cto_sid, _beta_sid, _cto_secret) = gateway_with_cto_and_cross_project().await;
+        let req = call(
+            "ccteam__session_list",
+            json!({
+                "_caller_role": "cto",
+                "_caller_slug": "alpha",
+                "_caller_secret": "ffffffffffffffffffffffffffffffff",
+            }),
+        );
+        let resp = execute_session_tool(&req, Some(&gw)).await;
+        assert_eq!(resp["result"]["isError"], true);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("could not be authenticated"),
+            "wrong secret must fail auth, got: {text}"
+        );
+    }
+
+    /// v0.8.7 review-fix (R-M1) — end-to-end: the CORRECT cto `(role, secret)`
+    /// pair passes the gate and the call reaches the gateway (session_list
+    /// returns the live sessions).
+    #[tokio::test]
+    async fn execute_session_tool_allows_cto_with_correct_secret() {
+        let (gw, _cto_sid, _beta_sid, cto_secret) = gateway_with_cto_and_cross_project().await;
+        let req = call(
+            "ccteam__session_list",
+            json!({
+                "_caller_role": "cto",
+                "_caller_slug": "alpha",
+                "_caller_secret": cto_secret,
+            }),
+        );
+        let resp = execute_session_tool(&req, Some(&gw)).await;
+        assert_eq!(resp["result"]["isError"], false, "correct secret passes");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("\"sessions\""), "got: {text}");
+    }
+
+    /// v0.8.7 review-fix (R-M3) — end-to-end: a cto authenticated for project
+    /// `alpha` is REJECTED when it tries to dispatch/collect/stop a `beta` sid
+    /// (cross-project operation), with the correct secret.
+    #[tokio::test]
+    async fn execute_session_tool_rejects_cross_project_sid() {
+        let (gw, _cto_sid, beta_sid, cto_secret) = gateway_with_cto_and_cross_project().await;
+        for tool in [
+            "ccteam__session_dispatch",
+            "ccteam__session_collect",
+            "ccteam__session_stop",
+        ] {
+            let mut args = json!({
+                "_caller_role": "cto",
+                "_caller_slug": "alpha",
+                "_caller_secret": cto_secret.clone(),
+                "sid": beta_sid.clone(),
+            });
+            if tool == "ccteam__session_dispatch" {
+                args["task"] = json!("do something");
+            }
+            let resp = execute_session_tool(&call(tool, args), Some(&gw)).await;
+            assert_eq!(resp["result"]["isError"], true, "{tool} must reject");
+            let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(
+                text.contains("permission denied") && text.contains("bound to project `alpha`"),
+                "{tool}: cross-project must be denied with a clear reason, got: {text}"
+            );
+        }
+    }
+
+    /// v0.8.7 review-fix (R-M3) — the positive control: the SAME cto operating
+    /// its OWN `alpha` sid is allowed (so the scope check isn't blanket-deny).
+    #[tokio::test]
+    async fn execute_session_tool_allows_same_project_sid() {
+        let (gw, cto_sid, _beta_sid, cto_secret) = gateway_with_cto_and_cross_project().await;
+        let resp = execute_session_tool(
+            &call(
+                "ccteam__session_collect",
+                json!({
+                    "_caller_role": "cto",
+                    "_caller_slug": "alpha",
+                    "_caller_secret": cto_secret,
+                    "sid": cto_sid,
+                }),
+            ),
+            Some(&gw),
+        )
+        .await;
+        assert_eq!(
+            resp["result"]["isError"], false,
+            "same-project collect must be allowed: {resp}"
+        );
     }
 
     #[test]

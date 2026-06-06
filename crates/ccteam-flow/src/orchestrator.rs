@@ -2003,6 +2003,9 @@ impl Orchestrator {
             // v0.8.7 W2 — workflow/bg spawn is not the gateway chat ask-path;
             // HITL is a gateway-chat feature, so this stays skip.
             permission_mode: ccteam_harness::PermissionMode::Skip,
+            // v0.8.7 review-fix (R-M1) — the orchestrator/bg path is not the
+            // gateway cto-gate chat session; no per-session secret applies.
+            secret: String::new(),
         };
 
         // Atomic check-and-spawn: hold the `running` lock from the

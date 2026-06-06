@@ -5,14 +5,15 @@
 > 对应 PRD §1(Item A)/ dev-plan W1。
 
 ## 概要
-cto 现在能 **spawn work-role session → dispatch task → collect 结果**(MVP = polled collect)。5 个新 MCP 工具 `session_spawn/dispatch/collect/list/stop`(MCP 12→17),走 gateway session map(**不碰** deprecated registry/supervisor),daemon 侧 **role==cto 硬门**(双保险)。
+cto 现在能 **spawn work-role session → dispatch task → collect 结果**(MVP = polled collect)。5 个新 MCP 工具 `session_spawn/dispatch/collect/list/stop`(MCP 12→17),走 gateway session map(**不碰** deprecated registry/supervisor),daemon 侧 cto 门(双层)— **review-fix(R-M1/R-M3)已抬门槛**:改校验 per-session secret + project 维度,best-effort defense-in-depth 非硬边界(详下 review-fix 校正)。
 
 ## Decided
 - **5 工具落新文件** `crates/ccteam-cli/src/mcp_session_tools.rs`,新 `session_` ToolGroup(mirror `chat_`/`advise_`);MCP 12→17,所有 drift 点同步(mcp_serve 3 处 + doctor_verify_mcp_test + mcp_e2e + mcp_disable_groups + mcp_subprefix + commands verify_mcp);`doctor --verify-mcp` = 17/17 active、session 5/0、0 stub。
 - **5 工具全部 daemon-side 路由**(经 mcp.sock forwarder,复用 `forward_to_socket`/`forward_outcome`),**非**只 spawn/dispatch。理由:只有 daemon 持 gateway 的 `sid→role+project_dir` 映射,collect 无 daemon 做不了;5 工具同走 daemon 把权限门收在**一处**,且永不触碰 deprecated `chat_*`/registry/supervisor。
 - **shared_gateway 穿线**:`Arc<Mutex<Gateway>>`(composition root main.rs ~1745)→ `serve_mcp_socket` + `handle_mcp_socket_connection`(新增 `Option<GatewayHandle>` 参数 + per-conn clone),复用 sink/pending 的 clone 模式;与 web AppState / DaemonArgs.gateway **同一 Arc**(廉价、无环、不起第二个 gateway)。
 - **新 `pub Gateway::session_resolve(sid) -> Option<SessionResolve{sid,role,project,project_dir}>`**(只读、同步):collect 据此 tail 子 session `.ccteam/chat/<role>/turns.jsonl`(`read_all_turns`);collect **只在 resolve 时持锁,blocking fs 读前 DROP guard**(lock-across-await 纪律)。
-- **权限门 DA.3 双层**:① `cto_role.md` frontmatter `tools:` 行授予 5 个 `mcp__ccteam__session_*`(+ cto 内建工具);work-role 模板不列 → Claude allow-list 第一道。② **硬门**:daemon `execute_session_tool` 据 ambient `_caller_role`(由 spawn env `CCTEAM_CHAT_ROLE` 注入,**绝不**取 caller args — 防伪)经纯函数 `session_caller_authorized(role)` 查 `SESSION_TOOL_PRIVILEGED_ROLES=["cto"]`;**门先于 gateway 使用执行**(gateway down 也拒非 cto),非 cto/空 caller 返回 MCP `isError`。
+- **权限门 DA.3 双层**:① `cto_role.md` frontmatter `tools:` 行授予 5 个 `mcp__ccteam__session_*`(+ cto 内建工具);work-role 模板不列 → Claude allow-list 第一道。② daemon `execute_session_tool` 据 ambient `_caller_role`(由 spawn env `CCTEAM_CHAT_ROLE` 注入)经纯函数 `session_caller_authorized(role)` 查 `SESSION_TOOL_PRIVILEGED_ROLES=["cto"]`;门先于 gateway 使用执行(gateway down 也拒非 cto),非 cto/空 caller 返回 MCP `isError`。
+  > **review-fix 校正(R-M1)**:本 wave 把第二层称"硬门 / 防伪"是**过度声称** —— 当时第二层只信明文 `_caller_role`,同 uid 进程可直连 mcp.sock 伪造。review-fix 已抬门槛:spawn mint per-session secret 注入 pane env,daemon 校验 `(role,secret)` 对而非明文 role(详 §三 cto 红线 + tech-design §6.4)。**仍非硬边界**:单 OS-uid 全信任下同 uid 可读他 pane 的 env 拿到 secret,secret 只 defense-in-depth;真隔离 = per-agent OS user / sandbox(v0.8.8 deferred)。
 - **collect = polled MVP**:返回 assistant 侧 turns,支持 `since` turn_id 游标 + `n` 上限(默认 20),回吐 `cursor`;游标找不到时返回全部(永不静默丢 turn)。push-back-as-turn → v0.8.8。
 - spawn 在 cto 绑定项目内建 session(ambient `_caller_slug`);`project` arg 接受但默认 caller slug(gateway 对 (project,role) 幂等)。
 
@@ -23,8 +24,8 @@ cto 现在能 **spawn work-role session → dispatch task → collect 结果**(M
 - **不**起第二个 gateway 实例 — 复用既有 shared Arc。
 
 ## Risks
-- **Vendor 语义**:references/claude-code 2.2.1 中 MCP 工具**绕过** per-agent `tools:` allow-list(`agentToolUtils.ts:83` `name.startsWith('mcp__') → true`)→ DA.3 **第一层非硬边界**,真正边界是 **daemon role 门(第二层,稳)**。"work-role 连调都调不了"取决于 vendor 版本 → **W2 真 binary smoke 时一并验证 allow-list/PermissionRequest 行为**。
-- `session_spawn` 暂忽略显式 `project`(只默认 caller slug);跨项目 dispatch(cto 在 A 项目 spawn 进 B)未接(gateway projects map 需登记)。PRD 称 project 为 informational,可接受;跨项目调度是 follow-up。
+- **Vendor 语义**:references/claude-code 2.2.1 中 MCP 工具**绕过** per-agent `tools:` allow-list(`agentToolUtils.ts:83` `name.startsWith('mcp__') → true`)→ DA.3 第一层 best-effort、非承重。second 层(daemon)是安全相关的那道 —— **但仍非硬边界**(见上 review-fix 校正:secret 只抬门槛,同 uid 可绕)。"work-role 连调都调不了"取决于 vendor 版本 → W2 真 binary smoke 时一并验证 allow-list/PermissionRequest 行为。
+- ~~`session_spawn` 暂忽略显式 `project`;跨项目 dispatch 未接~~ → **review-fix(R-M3)已修**:`session_spawn` 删 project 参数(只在 caller 自己 slug 建),`dispatch`/`collect`/`stop` 先校验 `session_resolve(sid).project == _caller_slug`,跨项目 sid 拒。
 - spawn/dispatch/list/stop 在 gateway 方法 `.await` 期间持 gateway async Mutex(gateway 即锁目标,同 ccteam-web 模式)→ 串行化并发 session_* 调用;cto-scale(一 cto 驱动几个子)无碍,非高并发设计。
 - **无**经真 mcp.sock forwarder→daemon→gateway 的 live e2e(需跑 daemon);改以(a)FakeAdapter gateway happy-path、(b)daemon handler gate/parse/shape 单测(gateway=None)、(c)stdio forwarder soft-degrade 覆盖;三者衔接 by-inspection(镜像已 e2e 的 chat_send_file)。
 - 重并发负载下两个**既有**环境 flake(`hook_script_test` spawn、`cost_summary_test` t09 mtime-memoize)— 隔离跑均过,与本改无关。首跑亦见一次 1822/2 的并行 race(3 次复跑稳定 1877/0,详 gate 报告)。
