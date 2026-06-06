@@ -168,6 +168,11 @@ async fn session_btw_posts_to_project_inbox() {
     entries.sort();
     assert_eq!(entries.len(), 1);
     let body = fs::read_to_string(&entries[0]).unwrap();
-    assert!(body.contains("source: ccteam-web"), "body=\n{body}");
+    // W5: the session-scoped `/btw` delegates to the project-level
+    // `actions::send_to_session` engine (the old flex per-session inbox
+    // writer that stamped `source: ccteam-web` is gone). The engine uses
+    // `SendOptions::default()`, so the inbox front-matter carries the
+    // `ccteam-core` default source.
+    assert!(body.contains("source: ccteam-core"), "body=\n{body}");
     assert!(body.contains("hello session"), "body=\n{body}");
 }

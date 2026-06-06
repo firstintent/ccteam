@@ -29,17 +29,6 @@ export type OutboxRow = {
   preview: string;
 };
 
-export type SessionCard = {
-  sid: string;
-  harness: string;
-  harness_class: string;
-  status_class: string;
-  status_label: string;
-  started_at?: string | null;
-  cost_label?: string | null;
-  [key: string]: unknown;
-};
-
 export type HarnessSnapshotView = {
   model?: string | null;
   context_used_pct?: string | null;
@@ -89,13 +78,11 @@ export interface WorkflowSummary {
 export type ProjectSummary = {
   slug: string;
   team: string;
-  kind: "workflow" | "multi_workflow" | "flex" | string;
-  is_flex: boolean;
+  kind: "workflow" | "multi_workflow" | string;
   badge_class: string;
   badge_label: string;
   cost_label: string;
   created_at: string;
-  sessions: SessionCard[];
   state: unknown; // serde_json::Value — SPA decides how to render.
   events: ProgressEventRow[];
   outbox: OutboxRow[];

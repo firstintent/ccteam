@@ -9,9 +9,11 @@
 //! - V0.4.0 project (workflow.yaml in `.ccteam/`): `workflow_summary`
 //!   carries the parsed name + every role from the spec as an agent
 //!   card stub + `gate_states[role] == "waiting"` for each Gate role.
-//! - Progress events flow through: an `agent_spawn` event without a
-//!   matching `agent_done` shows up as `running_count = 1`; a paired
-//!   `agent_done` adds `cost_usd` to `total_cost_usd`.
+//! - Progress events flow through: a paired `agent_spawn` / `agent_done`
+//!   adds `cost_usd` to `total_cost_usd`, and an `agent_spawn` with no
+//!   live backing job (no `job_id` / `state.json`) is demoted out of
+//!   `running_count` by the F80 liveness-aware accounting rather than
+//!   counted as still-open.
 //! - F67 regression guard (re-asserted at this level): the legacy
 //!   `current_phase` / `decision_candidates` fields are NOT present on
 //!   the response, no matter what the project shape is.
@@ -171,7 +173,14 @@ agents:
 ",
     );
 
-    // Older running session (still open) — spawn-only, no agent_done.
+    // Older spawn-only session (no agent_done, no `job_id`). Under the
+    // F80 liveness-aware accounting that `workflow_summary` wires in
+    // (`current_agent_sessions_with_liveness` -> `probe_job`), an
+    // `agent_spawn` whose `job_id` does not resolve to a live
+    // `~/.claude/jobs/<id>/state.json` is a phantom row (a daemon
+    // casualty that died without writing `agent_done`). `probe_job(None)`
+    // returns `Terminal { killed }`, so this row is demoted out of
+    // `running_count` instead of being counted as still-open.
     append_event(
         &paths,
         "team-b",
@@ -220,7 +229,13 @@ agents:
         .iter()
         .find(|a| a["role"] == "coder")
         .expect("coder agent");
-    assert_eq!(coder["running_count"], 1, "one session still open");
+    // F80: the spawn-only `coder-000` row has no live backing job, so
+    // it is demoted as a phantom rather than counted as running. Both
+    // sessions are therefore terminal from the summary's point of view.
+    assert_eq!(
+        coder["running_count"], 0,
+        "spawn-only row with no live job is demoted (F80 phantom cleanup)"
+    );
     let cost = coder["total_cost_usd"].as_f64().unwrap();
     assert!(
         (cost - 0.42).abs() < 1e-6,

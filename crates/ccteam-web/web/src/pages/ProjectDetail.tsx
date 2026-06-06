@@ -9,7 +9,6 @@
 //   - middle: WorkflowView (F68 — agent cards + artifact counts +
 //             gate chips), driven by ProjectSummary.workflow_summary
 //   - right:  EventsLive (scope=project) + BtwForm (F58) + OutboxList
-//   - bottom: flex-only session tab strip (is_flex && sessions.length)
 //
 // V0.4.0 F68: the phase chip + InjectDecisionForm section are gone
 // (phase machinery retired in F60). The workflow view replaces the
@@ -17,12 +16,11 @@
 // F65 MCP tools (`ccteam__trigger_gate` etc.).
 
 import { useEffect, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { useParams } from "react-router-dom";
 import {
   fetchProject,
   type ProjectSummary,
   type OutboxRow,
-  type SessionCard,
 } from "../lib/detailApi";
 import { BtwForm } from "../components/BtwForm";
 import { PauseResumeButtons } from "../components/PauseResumeButtons";
@@ -100,23 +98,6 @@ function OutboxList({ rows }: { rows: OutboxRow[] }) {
         ))}
       </ol>
     </section>
-  );
-}
-
-function SessionTab({ slug, card }: { slug: string; card: SessionCard }) {
-  return (
-    <Link
-      to={`/p/${encodeURIComponent(slug)}/s/${encodeURIComponent(card.sid)}`}
-      className="flex items-center gap-2 px-3 py-1.5 border border-surface-700/40 rounded-md bg-surface-800 hover:bg-surface-700/50 transition-colors text-xs"
-    >
-      <span className="font-mono text-text-primary">{card.sid}</span>
-      <StatusBadge cls={card.status_class} label={card.status_label} />
-      {card.harness && (
-        <span className="text-text-dim text-[10px] uppercase">
-          {card.harness}
-        </span>
-      )}
-    </Link>
   );
 }
 
@@ -203,15 +184,6 @@ export default function ProjectDetail() {
           onSuccess={triggerReload}
         />
       </header>
-
-      {/* Flex-only session tabs */}
-      {summary.is_flex && summary.sessions.length > 0 && (
-        <nav className="flex flex-wrap gap-2">
-          {summary.sessions.map((s) => (
-            <SessionTab key={s.sid} slug={summary.slug} card={s} />
-          ))}
-        </nav>
-      )}
 
       {/* Row 1 — Cost Trend, full width. Sparkline benefits the most
           from horizontal space. */}
