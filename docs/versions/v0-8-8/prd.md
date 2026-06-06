@@ -138,3 +138,4 @@ v0.8.7 的 per-session web UI 把"会话"做成了 **UI 壳独立、数据按 `(
 - **2026-06-06 +F4 / +F5 + 结构重排**:F4 web config 模块(telegram+lark,TG 2370);F5 web role 浏览页(TG 2371);PRD 改成"功能项 = `### F*` 子节"的可扩展结构(新需求不再动顶层编号)。
 - **2026-06-06 + web UI 质量基线**:新增横切要求 §二(TG 2373:高质量、交互友好 UI),落成可验收清单(设计系统 / 四态 / 错误可读 / 响应式 / 交互细节 / 即时性 / a11y),每个 web 项验收加"UX 过关"+ web wave gate 含 UI review。
 - **2026-06-06 +C1 代码库清理**(TG 2375):点名删 `teams/`/`skills/`/`examples/`(已核实无 manifest/CI/workspace 引用、代码 "teams" 全指 ~/.ccteam 运行期);额外发现 = 根 stray `config.yaml`(smoke artifact,删+gitignore)、`workflows/`(deferred-flow)、`agents/`(root legacy)、`tests/intent-corpus.yaml`+host-probe(测已删 skill)— 待 user 确认;`.agents/plugins/marketplace.json` = codex 插件 infra,保留。
+- **2026-06-06 + dev-prompt.md**(TG 2377):写了 dev-session 执行 briefing(`dev-prompt.md`)—— workflow + opus subagents、dev 直推不 PR、一口气跑完;5 阶段(清理+独立bug → F1 主干 → 建于 F1 → web+NFR → 文档+版本)+ 每阶段 verify+review gate;开放问题给了默认决策(可 launch 前改)。
