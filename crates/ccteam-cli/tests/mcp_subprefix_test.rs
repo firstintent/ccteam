@@ -140,10 +140,11 @@ fn every_tool_carries_group_subprefix_or_is_screenshot() {
             || bare.starts_with("admin_")
             || bare.starts_with("workflow_")
             || bare.starts_with("chat_")
-            || bare.starts_with("advise_");
+            || bare.starts_with("advise_")
+            || bare.starts_with("session_");
         assert!(
             ok,
-            "tool {n:?} is missing a V0.6.0 group sub-prefix (admin_/workflow_/chat_/advise_/screenshot)",
+            "tool {n:?} is missing a group sub-prefix (admin_/workflow_/chat_/advise_/session_/screenshot)",
         );
     }
 }

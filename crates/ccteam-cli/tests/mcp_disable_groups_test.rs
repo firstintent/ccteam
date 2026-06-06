@@ -125,6 +125,8 @@ fn group_set(names: &[String]) -> HashSet<&'static str> {
             out.insert("chat");
         } else if bare.starts_with("advise_") {
             out.insert("advise");
+        } else if bare.starts_with("session_") {
+            out.insert("session");
         }
     }
     out
@@ -138,7 +140,7 @@ fn disable_unset_returns_all_visible_groups() {
     // empty set). The visible surface is the four remaining groups.
     let names = names_with_disable(None);
     let groups = group_set(&names);
-    for g in ["admin", "screenshot", "chat", "advise"] {
+    for g in ["admin", "screenshot", "chat", "advise", "session"] {
         assert!(
             groups.contains(g),
             "default tools/list should contain group `{g}`; got groups {:?}",
@@ -181,7 +183,14 @@ fn disable_chat_and_screenshot_combines() {
 fn disable_each_group_individually() {
     // One spawn per group; confirms the enum parser covers every
     // documented value. (Cheap — each spawn is ~200ms.)
-    for g in ["admin", "workflow", "screenshot", "chat", "advise"] {
+    for g in [
+        "admin",
+        "workflow",
+        "screenshot",
+        "chat",
+        "advise",
+        "session",
+    ] {
         let names = names_with_disable(Some(g));
         let groups = group_set(&names);
         assert!(
@@ -206,7 +215,7 @@ fn disable_unknown_token_is_silently_ignored() {
 
 #[test]
 fn disable_all_groups_returns_empty_list() {
-    let names = names_with_disable(Some("admin,workflow,screenshot,chat,advise"));
+    let names = names_with_disable(Some("admin,workflow,screenshot,chat,advise,session"));
     assert!(
         names.is_empty(),
         "disabling every group should hide the entire surface; got {:?}",

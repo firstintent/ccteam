@@ -255,6 +255,21 @@ pub struct SessionView {
     pub status: String,
 }
 
+/// v0.8.7 W1 — what [`Gateway::session_resolve`] hands a collector so it can
+/// tail a child session's `.ccteam/chat/<role>/turns.jsonl` without reaching
+/// into the gateway's private session map. Pure data (no adapter handle).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionResolve {
+    /// Gateway session id (`s{n}`).
+    pub sid: String,
+    /// Agent role — the `<bot>` segment of the transcript path.
+    pub role: String,
+    /// Project slug the session runs in.
+    pub project: String,
+    /// Absolute working dir hosting `.ccteam/chat/<role>/turns.jsonl`.
+    pub project_dir: PathBuf,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct SavedGatewayState {
     default_project: String,
@@ -1751,6 +1766,23 @@ impl Gateway {
         views
     }
 
+    /// Resolve a session id to the data a collector needs to tail its
+    /// transcript (v0.8.7 W1 — cto `session_collect`). Returns the role
+    /// (the `<bot>` segment of `.ccteam/chat/<bot>/turns.jsonl`) and the
+    /// session's project slug + absolute working dir, or `None` for an
+    /// unknown sid. Read-only: clones scalar fields under no `.await`, so a
+    /// collect handler can call it cheaply while holding the gateway lock.
+    pub fn session_resolve(&self, sid: &str) -> Option<SessionResolve> {
+        let session = self.sessions.get(sid)?;
+        let project_dir = self.projects.get(&session.project).cloned()?;
+        Some(SessionResolve {
+            sid: session.id.clone(),
+            role: session.role.clone(),
+            project: session.project.clone(),
+            project_dir,
+        })
+    }
+
     /// Create a session from the network API (W5b). Thin wrapper over
     /// [`start_session`](Self::start_session): the caller supplies the
     /// project + role + vendor; the handle defaults to the role name (the
@@ -2765,6 +2797,69 @@ mod tests {
             1,
             "the pane is started exactly once"
         );
+    }
+
+    /// v0.8.7 W1 — `session_resolve` is the collect-side accessor: it maps a
+    /// gateway sid to the role + absolute project_dir a collector tails for
+    /// `.ccteam/chat/<role>/turns.jsonl`. End-to-end with the real fake: spawn
+    /// a session, submit a turn, then resolve the sid and read back the child's
+    /// answer from a turns.jsonl mirror (the exact pipeline `session_collect`
+    /// runs daemon-side). Unknown sid → None (→ tool error at the edge).
+    #[tokio::test]
+    async fn gateway_session_resolve_then_collect_child_turns() {
+        use ccteam_harness::execution::turns_mirror::{append_turn, read_all_turns, TurnRecord};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        // The default project "alpha" points at the sandbox dir so the
+        // collect-side turns.jsonl write stays inside the tempdir.
+        let mut gateway = Gateway::new(fake.clone(), "alpha", project_dir.clone());
+
+        // cto spawns a work-role session + dispatches a task (gateway-driven
+        // half of session_spawn / session_dispatch).
+        let sid = gateway
+            .create_session_api("alpha".into(), "reviewer".into(), AgentVendor::Claude)
+            .await
+            .unwrap();
+        assert_eq!(sid, "s1");
+        let _turn = gateway
+            .submit_to_sid(&sid, "review the diff".into())
+            .await
+            .unwrap();
+
+        // session_collect resolves the sid → role + project_dir, then tails
+        // the ccteam-owned mirror. Unknown sid is None.
+        assert!(gateway.session_resolve("s99").is_none());
+        let resolved = gateway.session_resolve(&sid).expect("known sid resolves");
+        assert_eq!(resolved.sid, "s1");
+        assert_eq!(resolved.role, "reviewer");
+        assert_eq!(resolved.project, "alpha");
+        assert_eq!(resolved.project_dir, project_dir);
+
+        // Simulate the child's answer being mirrored to turns.jsonl (in
+        // production the event pump + turns_mirror consumer write this; the
+        // collect tool only READS it).
+        append_turn(
+            &resolved.project_dir,
+            &resolved.role,
+            &TurnRecord {
+                turn_id: "t1".into(),
+                ts: chrono::Utc::now(),
+                vendor: "claude".into(),
+                role: resolved.role.clone(),
+                user: "review the diff".into(),
+                assistant: "LGTM, two nits inline.".into(),
+                usage: serde_json::Value::Null,
+                tool_calls: vec![],
+            },
+        )
+        .unwrap();
+
+        let turns = read_all_turns(&resolved.project_dir, &resolved.role).unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].assistant, "LGTM, two nits inline.");
+        assert_eq!(turns[0].turn_id, "t1");
     }
 
     /// P3 — `/sessions` appends each session's model + ctx from

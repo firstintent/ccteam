@@ -8,6 +8,10 @@ mod mcp_serve;
 // chat / advise dispatch handlers.
 mod mcp_advise_tools;
 mod mcp_chat_tools;
+// v0.8.7 W1 — `ccteam__session_*` tools (cto scheduling). Stdio side
+// forwards to the daemon over mcp.sock; the daemon-side handler
+// (`execute_session_tool`) holds the gateway + enforces the cto gate.
+mod mcp_session_tools;
 mod mcp_tool_groups;
 // V0.6.1 F128 — `ccteam__admin_change_persona` +
 // `ccteam__admin_add_tool` real implementations (mutate
@@ -1853,8 +1857,14 @@ fn run_start(
         let mut rx = shutdown_rx.clone();
         let mcp_sink = gw_event_tx.clone();
         let mcp_pending = pending_registry.clone();
+        // v0.8.7 W1 — hand the SAME shared gateway Arc to the mcp.sock handler
+        // so the cto's `session_*` tools drive the daemon's session map
+        // directly (cloning an Arc is cheap + acyclic; the daemon and web
+        // already hold the same handle). `None` when web/IM is off → the
+        // session tools then report "gateway not running".
+        let mcp_gateway = shared_gateway.clone();
         let mcp_handle = tokio::spawn(async move {
-            serve_mcp_socket(paths, mcp_sink, mcp_pending, async move {
+            serve_mcp_socket(paths, mcp_sink, mcp_pending, mcp_gateway, async move {
                 let _ = rx.changed().await;
             })
             .await
@@ -2014,6 +2024,7 @@ async fn serve_mcp_socket<F>(
     paths: CcteamPaths,
     sink: Option<GatewayEventSink>,
     pending: Option<PendingRegistry>,
+    gateway: Option<GatewayHandle>,
     shutdown: F,
 ) -> Result<()>
 where
@@ -2042,9 +2053,10 @@ where
                 let paths = paths.clone();
                 let sink = sink.clone();
                 let pending = pending.clone();
+                let gateway = gateway.clone();
                 tokio::spawn(async move {
                     if let Err(err) =
-                        handle_mcp_socket_connection(paths, sink, pending, stream).await
+                        handle_mcp_socket_connection(paths, sink, pending, gateway, stream).await
                     {
                         tracing::warn!(error = %err, "MCP socket connection failed");
                     }
@@ -2059,6 +2071,7 @@ async fn serve_mcp_socket<F>(
     _paths: CcteamPaths,
     _sink: Option<GatewayEventSink>,
     _pending: Option<PendingRegistry>,
+    _gateway: Option<GatewayHandle>,
     shutdown: F,
 ) -> Result<()>
 where
@@ -2073,6 +2086,7 @@ async fn handle_mcp_socket_connection(
     paths: CcteamPaths,
     sink: Option<GatewayEventSink>,
     pending: Option<PendingRegistry>,
+    gateway: Option<GatewayHandle>,
     stream: tokio::net::UnixStream,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
@@ -2109,6 +2123,12 @@ async fn handle_mcp_socket_connection(
             Some(execute_interaction_ask(&req, sink.as_ref(), pending.as_ref()).await)
         } else if is_chat_send_file_call(&req) {
             Some(execute_chat_send_file(&req, sink.as_ref()).await)
+        } else if is_session_tool_call(&req) {
+            // v0.8.7 W1 — cto scheduling. We own the gateway handle here;
+            // enforce the cto-only gate + drive the session map. Intercept
+            // BEFORE handle_request so it never loops back into the stdio
+            // forward branch (same pattern as chat_send_file).
+            Some(execute_session_tool(&req, gateway.as_ref()).await)
         } else {
             mcp_serve::handle_request(&paths, &req).await
         };
@@ -2132,6 +2152,23 @@ type GatewayEventSink = tokio::sync::mpsc::UnboundedSender<ccteam_im::gateway::G
 /// prompt here; the gateway (handed the same `Arc` via `DaemonArgs::pending`)
 /// resolves it on the inbound option click.
 type PendingRegistry = std::sync::Arc<tokio::sync::Mutex<ccteam_im::pending::PendingInteractions>>;
+
+/// v0.8.7 W1 — the shared gateway handle the mcp.sock handler holds so the
+/// cto's `session_*` tools drive the daemon's in-memory session map. Same
+/// `Arc` the web `AppState` + `DaemonArgs::gateway` already share (cheap +
+/// acyclic clone; the daemon owns the map, this is just a third holder).
+type GatewayHandle = std::sync::Arc<tokio::sync::Mutex<ccteam_im::gateway::Gateway>>;
+
+/// v0.8.7 W1 — roles allowed to call the `session_*` scheduling tools. The
+/// cto is the chat-first manager; work-roles are blocked (defense-in-depth
+/// behind the per-agent tool allow-list). A hard daemon gate so a work-role
+/// with a hand-edited allow-list still can't drive the session map.
+const SESSION_TOOL_PRIVILEGED_ROLES: &[&str] = &["cto"];
+
+/// v0.8.7 W1 — cap on how many child turns `session_collect` returns when the
+/// caller doesn't pass `n`. Keeps a runaway transcript from flooding the
+/// cto's context in one poll.
+const SESSION_COLLECT_DEFAULT_N: usize = 20;
 
 /// v0.8.5 D6 — how long the `interaction/ask` handler waits for the user to
 /// answer before forgetting the prompt + reporting a timeout (the hook then
@@ -2446,6 +2483,342 @@ async fn execute_interaction_ask(
                 "result": { "timeout": true },
             })
         }
+    }
+}
+
+// =====================================================================
+// v0.8.7 W1 — cto scheduling: daemon-side `session_*` tool handlers.
+//
+// The stdio MCP server forwards `ccteam__session_*` calls here (it doesn't
+// own the gateway). This is where we (a) enforce the cto-only privilege
+// gate on the ambient `_caller_role`, and (b) drive the gateway session map
+// (spawn / dispatch / list / stop) or tail a child's transcript (collect).
+//
+// Lock discipline (CLAUDE.md §6): spawn/dispatch/list/stop call the
+// gateway's own async methods, so we hold the gateway lock across their
+// `.await` (the gateway IS the lock target — the same pattern ccteam-web's
+// AppState uses over HTTP). `collect` only needs a synchronous
+// `session_resolve`, so we copy out the role + project_dir and DROP the
+// guard BEFORE the (blocking) `read_all_turns` fs read.
+// =====================================================================
+
+/// True for a `tools/call` whose tool name is in the `session_` group.
+fn is_session_tool_call(req: &serde_json::Value) -> bool {
+    req.get("method").and_then(|m| m.as_str()) == Some("tools/call")
+        && req
+            .pointer("/params/name")
+            .and_then(|n| n.as_str())
+            .is_some_and(|n| n.starts_with("ccteam__session_"))
+}
+
+/// Build a tools/call-shaped JSON-RPC response carrying one text block.
+fn session_tool_response(id: serde_json::Value, text: String, is_error: bool) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "content": [{ "type": "text", "text": text }],
+            "isError": is_error,
+        },
+    })
+}
+
+/// v0.8.7 W1 — handle one forwarded `ccteam__session_*` call. Enforces the
+/// privilege gate, then dispatches to the gateway. Returns a JSON-RPC
+/// response (the stdio side propagates `isError` to the agent).
+async fn execute_session_tool(
+    req: &serde_json::Value,
+    gateway: Option<&GatewayHandle>,
+) -> serde_json::Value {
+    let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
+    let name = req
+        .pointer("/params/name")
+        .and_then(|n| n.as_str())
+        .unwrap_or("")
+        .to_string();
+    let args = req
+        .pointer("/params/arguments")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    // DA.3 layer 2 — HARD gate on the ambient caller role FIRST (a security
+    // boundary: deny a non-privileged caller before touching any state). The
+    // stdio side injects `_caller_role` from the trusted spawn env, never from
+    // caller-supplied args, so it can't be spoofed.
+    let caller_role = args
+        .get("_caller_role")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if !session_caller_authorized(caller_role) {
+        let who = if caller_role.is_empty() {
+            "<unknown>"
+        } else {
+            caller_role
+        };
+        return session_tool_response(
+            id,
+            format!(
+                "{name}: permission denied — session scheduling tools are restricted to the {SESSION_TOOL_PRIVILEGED_ROLES:?} role(s); caller role is `{who}`"
+            ),
+            true,
+        );
+    }
+
+    // The gateway must be running (web + IM both up). Mirror chat_send_file's
+    // "IM gateway not running" structured error rather than panicking.
+    let Some(gateway) = gateway else {
+        return session_tool_response(
+            id,
+            format!("{name}: gateway not running (start ccteam with web + IM enabled)"),
+            true,
+        );
+    };
+
+    match run_session_tool(&name, &args, gateway).await {
+        Ok(text) => session_tool_response(id, text, false),
+        Err(text) => session_tool_response(id, text, true),
+    }
+}
+
+/// v0.8.7 W1 — pure privilege check: is `caller_role` allowed to call the
+/// `session_*` scheduling tools? Extracted so the gate is unit-testable
+/// without standing up a gateway.
+fn session_caller_authorized(caller_role: &str) -> bool {
+    SESSION_TOOL_PRIVILEGED_ROLES.contains(&caller_role)
+}
+
+/// Dispatch a privileged `session_*` call to the gateway. Returns `Ok(body)`
+/// (a pretty JSON string) on success, `Err(msg)` on a tool-level error.
+async fn run_session_tool(
+    name: &str,
+    args: &serde_json::Value,
+    gateway: &GatewayHandle,
+) -> std::result::Result<String, String> {
+    match name {
+        "ccteam__session_spawn" => run_session_spawn(args, gateway).await,
+        "ccteam__session_dispatch" => run_session_dispatch(args, gateway).await,
+        "ccteam__session_collect" => run_session_collect(args, gateway).await,
+        "ccteam__session_list" => run_session_list(gateway).await,
+        "ccteam__session_stop" => run_session_stop(args, gateway).await,
+        other => Err(format!("unknown session tool: {other}")),
+    }
+}
+
+/// `session_spawn` — create (or reuse) a work-role session in the caller's
+/// bound project. The project is the ambient `_caller_slug` (the cto's
+/// project); `project`/`vendor` args are honored where they make sense.
+async fn run_session_spawn(
+    args: &serde_json::Value,
+    gateway: &GatewayHandle,
+) -> std::result::Result<String, String> {
+    let role = args
+        .get("role")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "session_spawn: missing `role`".to_string())?
+        .to_string();
+    // The session is created in the cto's bound project (ambient slug). An
+    // explicit `project` arg is accepted but defaults to the caller's slug;
+    // the gateway resolves the slug → cwd from its own project map.
+    let project = args
+        .get("project")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .or_else(|| {
+            args.get("_caller_slug")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+        })
+        .ok_or_else(|| "session_spawn: no project (ambient slug unset)".to_string())?;
+    let vendor = parse_session_vendor(args)?;
+
+    let mut gw = gateway.lock().await;
+    let sid = gw
+        .create_session_api(project.clone(), role.clone(), vendor)
+        .await
+        .map_err(|e| format!("session_spawn failed: {e}"))?;
+    drop(gw);
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "ok": true,
+        "sid": sid,
+        "project": project,
+        "role": role,
+        "hint": "dispatch a task with session_dispatch{sid, task}, then poll session_collect{sid}.",
+    }))
+    .unwrap_or_else(|_| "{}".to_string()))
+}
+
+/// `session_dispatch` — forward a task as a user turn to a session by sid.
+async fn run_session_dispatch(
+    args: &serde_json::Value,
+    gateway: &GatewayHandle,
+) -> std::result::Result<String, String> {
+    let sid = arg_session_sid(args)?;
+    let task = args
+        .get("task")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "session_dispatch: missing `task`".to_string())?
+        .to_string();
+
+    let mut gw = gateway.lock().await;
+    let turn_id = gw
+        .submit_to_sid(&sid, task)
+        .await
+        .map_err(|e| format!("session_dispatch failed: {e}"))?;
+    drop(gw);
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "ok": true,
+        "sid": sid,
+        "turn_id": turn_id,
+        "hint": "the child runs asynchronously; poll session_collect{sid, since: turn_id} for its answer.",
+    }))
+    .unwrap_or_else(|_| "{}".to_string()))
+}
+
+/// `session_collect` — tail the child's `turns.jsonl` (assistant turns).
+/// Polled MVP: resolve sid → role + project_dir under the lock, drop the
+/// guard, then read the ccteam-owned mirror. `since` is a turn_id cursor.
+async fn run_session_collect(
+    args: &serde_json::Value,
+    gateway: &GatewayHandle,
+) -> std::result::Result<String, String> {
+    let sid = arg_session_sid(args)?;
+    let since = args.get("since").and_then(|v| v.as_str()).map(String::from);
+    let n = args
+        .get("n")
+        .and_then(|v| v.as_u64())
+        .map(|x| x as usize)
+        .unwrap_or(SESSION_COLLECT_DEFAULT_N);
+
+    // Resolve under the lock (sync), then DROP the guard before the fs read.
+    let resolved = {
+        let gw = gateway.lock().await;
+        gw.session_resolve(&sid)
+    };
+    let resolved = resolved.ok_or_else(|| format!("session_collect: unknown session: {sid}"))?;
+
+    // Tail the ccteam-owned transcript mirror (same source as chat_history).
+    let all = ccteam_harness::execution::turns_mirror::read_all_turns(
+        &resolved.project_dir,
+        &resolved.role,
+    )
+    .map_err(|e| format!("session_collect: read turns.jsonl for {sid}: {e}"))?;
+
+    // Apply the `since` cursor: keep only turns AFTER the named turn_id.
+    let after: Vec<&ccteam_harness::execution::turns_mirror::TurnRecord> = match &since {
+        Some(cursor) => {
+            match all.iter().position(|t| &t.turn_id == cursor) {
+                Some(idx) => all.iter().skip(idx + 1).collect(),
+                // Cursor not found (rotated / typo) → return everything so
+                // the caller never silently loses turns.
+                None => all.iter().collect(),
+            }
+        }
+        None => all.iter().collect(),
+    };
+
+    // Project to assistant-side wire rows, then tail to `n`.
+    let mut rows: Vec<serde_json::Value> = after
+        .iter()
+        .filter(|t| !t.assistant.is_empty())
+        .map(|t| {
+            serde_json::json!({
+                "turn_id": t.turn_id,
+                "ts": t.ts.to_rfc3339(),
+                "content": t.assistant,
+            })
+        })
+        .collect();
+    let start = rows.len().saturating_sub(n);
+    rows = rows.split_off(start);
+    let last_turn_id = rows
+        .last()
+        .and_then(|r| r.get("turn_id"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "ok": true,
+        "sid": sid,
+        "role": resolved.role,
+        "turns": rows,
+        // Cursor to pass as `since` on the next poll (None when no turns yet).
+        "cursor": last_turn_id,
+    }))
+    .unwrap_or_else(|_| "{}".to_string()))
+}
+
+/// `session_list` — snapshot the gateway's live sessions.
+async fn run_session_list(gateway: &GatewayHandle) -> std::result::Result<String, String> {
+    let views = {
+        let gw = gateway.lock().await;
+        gw.session_views()
+    };
+    let rows: Vec<serde_json::Value> = views
+        .iter()
+        .map(|v| {
+            serde_json::json!({
+                "sid": v.sid,
+                "project": v.project,
+                "role": v.role,
+                "vendor": v.vendor,
+                "current": v.current,
+                "status": v.status,
+            })
+        })
+        .collect();
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "ok": true,
+        "sessions": rows,
+    }))
+    .unwrap_or_else(|_| "{}".to_string()))
+}
+
+/// `session_stop` — deregister + close a session by sid (explicit command).
+async fn run_session_stop(
+    args: &serde_json::Value,
+    gateway: &GatewayHandle,
+) -> std::result::Result<String, String> {
+    let sid = arg_session_sid(args)?;
+    let mut gw = gateway.lock().await;
+    gw.stop_session(&sid)
+        .await
+        .map_err(|e| format!("session_stop failed: {e}"))?;
+    drop(gw);
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "ok": true,
+        "sid": sid,
+        "stopped": true,
+    }))
+    .unwrap_or_else(|_| "{}".to_string()))
+}
+
+/// Pull a required `sid` arg (the gateway `s{n}` id).
+fn arg_session_sid(args: &serde_json::Value) -> std::result::Result<String, String> {
+    args.get("sid")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .ok_or_else(|| "missing required `sid`".to_string())
+}
+
+/// Parse the optional `vendor` arg (default `claude`), lowercasing first so a
+/// stray `"Claude"` still lands in the right variant (Bug A defense).
+fn parse_session_vendor(
+    args: &serde_json::Value,
+) -> std::result::Result<ccteam_harness::AgentVendor, String> {
+    match args.get("vendor").and_then(|v| v.as_str()) {
+        None => Ok(ccteam_harness::AgentVendor::Claude),
+        Some(raw) => match raw.to_lowercase().as_str() {
+            "" | "claude" => Ok(ccteam_harness::AgentVendor::Claude),
+            "codex" => Ok(ccteam_harness::AgentVendor::Codex),
+            other => Err(format!(
+                "session_spawn: invalid vendor `{other}`: expected `claude` or `codex`"
+            )),
+        },
     }
 }
 
@@ -3103,5 +3476,136 @@ mod chat_send_file_tests {
         });
         let err = build_send_file_event(&args, &bots, 0).unwrap_err();
         assert!(err.contains("too large"), "got: {err}");
+    }
+}
+
+#[cfg(test)]
+mod session_tool_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn call(name: &str, args: serde_json::Value) -> serde_json::Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": name, "arguments": args },
+        })
+    }
+
+    #[test]
+    fn is_session_tool_call_matches_only_session_tools_calls() {
+        assert!(is_session_tool_call(&call(
+            "ccteam__session_spawn",
+            json!({})
+        )));
+        assert!(is_session_tool_call(&call(
+            "ccteam__session_collect",
+            json!({ "sid": "s1" })
+        )));
+        // Foreign tool name.
+        assert!(!is_session_tool_call(&call(
+            "ccteam__chat_send_input",
+            json!({})
+        )));
+        // Right name, wrong method.
+        assert!(!is_session_tool_call(&json!({
+            "method": "tools/list",
+            "params": { "name": "ccteam__session_spawn" }
+        })));
+    }
+
+    #[test]
+    fn gate_allows_cto_and_rejects_everyone_else() {
+        assert!(session_caller_authorized("cto"));
+        assert!(!session_caller_authorized("reviewer"));
+        assert!(!session_caller_authorized("helper"));
+        assert!(
+            !session_caller_authorized(""),
+            "empty role is not privileged"
+        );
+    }
+
+    /// DA.3 layer 2 — a non-cto caller is REJECTED with isError, and the gate
+    /// fires BEFORE any gateway use (so denial holds even with gateway None).
+    #[tokio::test]
+    async fn execute_session_tool_rejects_non_cto_caller() {
+        let req = call(
+            "ccteam__session_spawn",
+            json!({ "role": "reviewer", "_caller_role": "reviewer", "_caller_slug": "demo" }),
+        );
+        let resp = execute_session_tool(&req, None).await;
+        assert_eq!(resp["result"]["isError"], true);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("permission denied"),
+            "non-cto must be denied, got: {text}"
+        );
+    }
+
+    /// A missing ambient identity (no `_caller_role`) is treated as
+    /// unprivileged — denied, never defaulting to allow.
+    #[tokio::test]
+    async fn execute_session_tool_denies_when_caller_role_absent() {
+        let req = call("ccteam__session_list", json!({}));
+        let resp = execute_session_tool(&req, None).await;
+        assert_eq!(resp["result"]["isError"], true);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("permission denied"), "got: {text}");
+    }
+
+    /// DA.3 — a cto caller PASSES the gate. With no gateway wired the next
+    /// failure is the structured "gateway not running" (not a permission
+    /// denial), proving the gate let the cto through.
+    #[tokio::test]
+    async fn execute_session_tool_allows_cto_then_reports_gateway_down() {
+        let req = call(
+            "ccteam__session_list",
+            json!({ "_caller_role": "cto", "_caller_slug": "demo" }),
+        );
+        let resp = execute_session_tool(&req, None).await;
+        assert_eq!(resp["result"]["isError"], true);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            !text.contains("permission denied"),
+            "cto must pass the gate, got: {text}"
+        );
+        assert!(
+            text.contains("gateway not running"),
+            "expected gateway-down error after the gate, got: {text}"
+        );
+    }
+
+    #[test]
+    fn parse_session_vendor_defaults_to_claude_and_lowercases() {
+        assert_eq!(
+            parse_session_vendor(&json!({})).unwrap(),
+            ccteam_harness::AgentVendor::Claude
+        );
+        assert_eq!(
+            parse_session_vendor(&json!({ "vendor": "Claude" })).unwrap(),
+            ccteam_harness::AgentVendor::Claude
+        );
+        assert_eq!(
+            parse_session_vendor(&json!({ "vendor": "codex" })).unwrap(),
+            ccteam_harness::AgentVendor::Codex
+        );
+        assert!(parse_session_vendor(&json!({ "vendor": "gpt" })).is_err());
+    }
+
+    #[test]
+    fn arg_session_sid_requires_non_empty() {
+        assert_eq!(arg_session_sid(&json!({ "sid": "s3" })).unwrap(), "s3");
+        assert!(arg_session_sid(&json!({})).is_err());
+        assert!(arg_session_sid(&json!({ "sid": "" })).is_err());
+    }
+
+    #[test]
+    fn session_tool_response_shapes_content_and_is_error() {
+        let ok = session_tool_response(json!(1), "done".into(), false);
+        assert_eq!(ok["result"]["isError"], false);
+        assert_eq!(ok["result"]["content"][0]["text"], "done");
+        let err = session_tool_response(json!(2), "boom".into(), true);
+        assert_eq!(err["result"]["isError"], true);
     }
 }

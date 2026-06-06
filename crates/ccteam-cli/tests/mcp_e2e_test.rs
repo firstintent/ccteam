@@ -131,8 +131,8 @@ fn mcp_serve_tools_list_returns_full_tool_set() {
     let tools = resp["result"]["tools"].as_array().unwrap();
     assert_eq!(
         tools.len(),
-        12,
-        "admin 3 + screenshot 1 + chat 6 + advise 2 = 12"
+        17,
+        "admin 3 + screenshot 1 + chat 6 + advise 2 + session 5 = 17"
     );
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     for required in [
@@ -152,6 +152,12 @@ fn mcp_serve_tools_list_returns_full_tool_set() {
         // Advise.
         "ccteam__advise_vote",
         "ccteam__advise_parallel",
+        // Session (v0.8.7 W1 — cto scheduling).
+        "ccteam__session_spawn",
+        "ccteam__session_dispatch",
+        "ccteam__session_collect",
+        "ccteam__session_list",
+        "ccteam__session_stop",
     ] {
         assert!(names.contains(&required), "missing tool: {required}");
     }
